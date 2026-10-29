@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:net"
 import "core:sync"
 import "core:time"
+import "elodin:config"
 import "elodin:logx"
 import "elodin:metrics"
 
@@ -481,12 +482,15 @@ sets are disjoint, so the total is their sum:
   - the connection table, which is a promise to hold that many client sockets;
   - the idle upstream pools, `upstream.max_idle` per configured server, routes
     included;
-  - the worker pools, since a worker doing an upstream exchange holds a socket
-    for the round trip and a socket checked out of a pool is not in it - so
-    `workers` and `upstream_workers` are in-flight upstream sockets that the
-    pools do not account for;
+  - the queries in flight, `server.max_pending`, since a query doing an upstream
+    exchange holds a socket for the round trip and a socket checked out of a
+    pool is not in it;
+  - the race legs, `server.max_pending` per member of the widest racing group,
+    a socket each while their query waits and after it has gone (see
+    `upstream.Racer_Budget`);
   - the UDP readers, one socket each, which is up to `MAX_UDP_READERS` (64) when
-    an operator sets the figure rather than the eight a derivation will pick.
+    an operator sets the figure rather than the eight a derivation will pick;
+  - the event loops, an epoll descriptor and an eventfd each.
 
 `DESCRIPTOR_RESERVE` covers what is left - four listening sockets, the metrics
 socket, the log, and the list files while they load - and is a cushion rather
@@ -498,20 +502,81 @@ A ceiling on what the configuration permits, not a reading of what is held.
 DESCRIPTOR_RESERVE :: 32
 
 Descriptor_Demand :: struct {
-	max_connections:  int,
-	pooled_upstream:  int,
-	workers:          int,
-	upstream_workers: int,
-	udp_readers:      int,
+	max_connections: int,
+	pooled_upstream: int,
+	// `server.max_pending`: each query in flight may hold an upstream socket.
+	in_flight:       int,
+	// Race legs, a socket each, while their query waits and after; see
+	// `upstream.Racer_Budget`.
+	racers:          int,
+	udp_readers:     int,
+	// One epoll descriptor and one eventfd per loop.
+	loops:           int,
+}
+
+/*
+The most race legs one query can start: the servers of the widest group that
+races, default or route, or zero when none does. A query racing that group holds
+a socket per leg while it waits, and its losers go on holding theirs after it has
+its answer; see `upstream.Racer_Budget`.
+*/
+race_width :: proc(cfg: config.Upstream_Config) -> int {
+	width := 0
+	if cfg.strategy == .Race {
+		width = len(cfg.servers)
+	}
+	for zone in cfg.zones {
+		if zone.upstream.strategy == .Race {
+			width = max(width, len(zone.upstream.servers))
+		}
+	}
+	return width
+}
+
+/*
+Memory mappings one fiber costs while it holds a query whose scratch fits one
+block, which an ordinary one's does: its stack and the guard page under it,
+which `mprotect` splits in two, and that block. A query taking more scratch maps
+one more per further block (`loop.SCRATCH_FIRST_BLOCK`, 16 KiB), so this is the figure for a
+server under ordinary load, not a ceiling.
+*/
+MAPPINGS_PER_FIBER :: 3
+
+// Mappings left for everything else: the binary, its libraries, the heap.
+MAPPING_RESERVE :: 2048
+
+/*
+Said at startup when `vm.max_map_count` cannot hold every fiber this
+configuration may run at once - each query in flight, each race leg, each
+connection, each reader - which the derived figures can pass on a large machine
+racing a wide group. Past it no stack can be mapped: a query is dropped or shed,
+a connection refused as `conn_failed=`. Quiet otherwise, and when the limit
+cannot be read.
+*/
+map_count_line :: proc(limit: int, d: Descriptor_Demand) -> (line: string, short: bool) {
+	fibers := d.max_connections + d.in_flight + d.racers + d.udp_readers + d.loops
+	wanted := fibers * MAPPINGS_PER_FIBER + MAPPING_RESERVE
+	if limit <= 0 || limit >= wanted {
+		return "", false
+	}
+	return fmt.tprintf(
+		"memory mappings: vm.max_map_count is %d, short of the %d this configuration can want (%d fibers - queries in flight, race legs, connections and readers - at %d each, and %d over). Past it a fiber cannot be started, so a query is dropped or shed and a connection refused as conn_failed=; raise vm.max_map_count (sysctl) or lower server.max_pending",
+		limit,
+		wanted,
+		fibers,
+		MAPPINGS_PER_FIBER,
+		MAPPING_RESERVE,
+	), true
 }
 
 descriptors_wanted :: proc(d: Descriptor_Demand) -> int {
 	return(
 		d.max_connections +
 		d.pooled_upstream +
-		d.workers +
-		d.upstream_workers +
+		d.in_flight +
+		d.racers +
 		d.udp_readers +
+		2 * d.loops +
 		DESCRIPTOR_RESERVE \
 	)
 }
@@ -553,13 +618,15 @@ descriptor_limit_line :: proc(soft_limit: int, d: Descriptor_Demand) -> (line: s
 		table = "no connection table, every stream listener being off"
 	}
 	return fmt.tprintf(
-		"descriptors: the limit is %d, short of the %d this configuration can want (%s, %d pooled upstream connections, %d worker threads that hold one for a round trip, %d UDP readers, and %d over). Past it, accepts fail and the listeners wait between attempts, counted as accept_backoff=; raise RLIMIT_NOFILE (LimitNOFILE= in the systemd unit)",
+		"descriptors: the limit is %d, short of the %d this configuration can want (%s, %d pooled upstream connections, %d queries in flight that may hold one each for a round trip, %d race legs, %d UDP readers, %d for the event loops, and %d over). Past it, accepts fail and the listeners wait between attempts, counted as accept_backoff=; raise RLIMIT_NOFILE (LimitNOFILE= in the systemd unit)",
 		soft_limit,
 		wanted,
 		table,
 		d.pooled_upstream,
-		d.workers + d.upstream_workers,
+		d.in_flight,
+		d.racers,
 		d.udp_readers,
+		2 * d.loops,
 		DESCRIPTOR_RESERVE,
 	), true
 }

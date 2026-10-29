@@ -3,7 +3,7 @@ package server
 import "core:mem"
 import "core:sync"
 import "core:time"
-import "elodin:pool"
+import "elodin:loop"
 
 /*
 Identical questions in flight at once go to the upstream once (issue #311).
@@ -29,7 +29,7 @@ DNSSEC rewrite, which writes the whole OPT record, that is most of them; without
 it the payload size and the OPT flags stay the client's, so it is the clients
 that ask alike. A follower given a failure takes the expired entry or SERVFAIL as the
 leader did, rather than wait a second full exchange for the same nothing, which
-in an outage is every pool worker held twice as long.
+in an outage is every query in flight held twice as long.
 
 A follower that cannot use what the leader landed with forwards on its own, which
 is what every query does without coalescing - except where the leader stored a verdict
@@ -46,11 +46,12 @@ verdict already evicted - outside the table, since it is past its turn to join
 one, which on a cache under that much pressure costs a burst its coalescing.
 
 The leader waits for its followers to take their copies before it lets go, which
-is what lets the `Flight` live in its stack frame and the answer in its arena:
+is what lets the `Flight` live in its stack frame and the answer in its scratch:
 nothing here is allocated, and a `Server` built as a literal needs nothing
-initialised.
+initialised. The frame is on the leader's fiber, whose stack stays mapped while
+it waits, so a follower on another loop reads it as one on the same loop does.
 
-No deadlock: a thread leads at most one flight - the rewrite chase and the stale
+No deadlock: a fiber leads at most one flight - the rewrite chase and the stale
 refresh, the only nested `resolve_query` calls, both start from a query that
 returned before it could join - and a leader waits on nothing a follower holds.
 */
@@ -69,7 +70,7 @@ INFLIGHT_SLOTS :: 256
 Inflight_Table :: struct {
 	mu:        sync.Mutex,
 	slots:     [INFLIGHT_SLOTS]^Flight,
-	// Followers waiting on a worker of the shared pool; see `follower_ceiling`.
+	// Followers waiting on a leader; see `follower_ceiling`.
 	followers: int,
 }
 
@@ -100,7 +101,7 @@ Flight :: struct {
 	// The leader's own key, which outlives the flight: the leader lands before
 	// its frame goes.
 	key:           string,
-	cond:          sync.Cond,
+	cond:          loop.Cond,
 	waiters:       int,
 	landed:        bool,
 	// Where this flight sits in the table, so landing need not look for it.
@@ -118,25 +119,27 @@ Stored_Verdict :: enum u8 {
 }
 
 /*
-How many followers may wait on workers of the shared pool at once: a quarter,
-the same share `refresh_ceiling` gives the stale refreshes.
+How many followers counted in `server.max_pending` may wait on leaders at once:
+a quarter of it, the share `refresh_ceiling` gives the stale refreshes.
 
-A follower holds its worker for as long as the leader takes, up to its
+A follower holds its place in flight for as long as the leader takes, up to its
 `flight_patience`, about four of its longest group's timeouts - and a leader
 validating a slow chain holds one of `dnssec.max_chain_walks` - so without a
-ceiling, one flood of a single cold signed name would park every worker behind
-one walk, which is the exhaustion that bound exists to prevent (issue #356).
-Past the ceiling a query forwards on its own and meets that bound like any
-other. Queries on a connection's own thread are bounded by `max_connections`
-instead, and are not counted. No pool - a `Server` built as a literal - is no
-ceiling.
+ceiling, one flood of a single cold signed name would park everything in flight
+behind one walk, which is the exhaustion that bound exists to prevent (issue
+#356). Past the ceiling a query forwards on its own and meets that bound like
+any other. Queries answered on a connection's fiber are not counted:
+`max_connections` bounds them, one at a time per connection, and a share of
+`max_pending` that they could fill would leave the datagrams for a hot name to
+forward on their own. No bound - a `Server` built as a literal - is no ceiling.
 */
 @(private)
 follower_ceiling :: proc(s: ^Server) -> int {
-	if s.handler_pool == nil {
+	limit := live(s).cfg.server.max_pending
+	if limit <= 0 {
 		return 0
 	}
-	return max(pool.worker_count(s.handler_pool) / 4, 1)
+	return max(limit / 4, 1)
 }
 
 /*
@@ -156,7 +159,7 @@ storing, which no deadline covers. A leader past that is validating a long
 chain or stuck, and the follower gains nothing by waiting on: its own forward,
 once patience runs out, finds the deadline spent and asks nobody. The old
 figure - every server for every attempt, twice for a truncated reply, plus the
-sweep - was sized for a forward nothing bounded, and held a worker ten timeouts
+sweep - was sized for a forward nothing bounded, and held a query ten timeouts
 for a group of two.
 */
 @(private)
@@ -169,15 +172,16 @@ Join the flight for `key`, leading it if there is none.
 
 `own` back: the caller leads, and must `flight_land` it. Another flight: the
 caller follows, and must `flight_follow` it, passing back `counted`. Nil: the
-table is full, or `shared` and the followers on the shared pool are at `ceiling`
-(zero is none), and the caller forwards on its own.
+table is full, or `counted_query` and the followers counted in `max_pending` are
+at `ceiling` (zero is none), and the caller forwards on its own.
 */
 @(private)
 flight_join :: proc(
 	s: ^Server,
 	key: string,
 	own: ^Flight,
-	shared := false,
+	// Whether the caller is a query counted against `max_pending`; see `follower_ceiling`.
+	counted_query := false,
 	ceiling := 0,
 ) -> (
 	flight: ^Flight,
@@ -192,7 +196,7 @@ flight_join :: proc(
 				free_slot = i
 			}
 		} else if f.key == key {
-			if shared && ceiling > 0 {
+			if counted_query && ceiling > 0 {
 				if s.inflight.followers >= ceiling {
 					return nil, false
 				}
@@ -236,7 +240,6 @@ flight_follow :: proc(
 	landed: bool,
 	same: bool,
 ) {
-	pool.blocking_begin()
 	sync.mutex_lock(&s.inflight.mu)
 	start := time.tick_now()
 	for !f.landed {
@@ -244,14 +247,13 @@ flight_follow :: proc(
 		if left <= 0 {
 			break
 		}
-		_ = sync.cond_wait_with_timeout(&f.cond, &s.inflight.mu, left)
+		_ = loop.cond_wait_with_timeout(&f.cond, &s.inflight.mu, left)
 	}
 	landed = f.landed
 	if landed {
 		result = f.landing
 	}
 	sync.mutex_unlock(&s.inflight.mu)
-	pool.blocking_end()
 
 	// Copied outside the lock, which every miss on the server takes: the bytes
 	// cannot change while this follower is still counted, since the leader waits
@@ -276,7 +278,7 @@ flight_follow :: proc(
 	// The leader waits for exactly this, and nothing else sleeps on the cond
 	// once it has landed.
 	if f.landed && f.waiters == 0 {
-		sync.cond_signal(&f.cond)
+		loop.cond_signal(&f.cond)
 	}
 	sync.mutex_unlock(&s.inflight.mu)
 	return
@@ -292,8 +294,8 @@ flight_land :: proc(s: ^Server, f: ^Flight) {
 	defer sync.mutex_unlock(&s.inflight.mu)
 	s.inflight.slots[f.slot] = nil
 	f.landed = true
-	sync.cond_broadcast(&f.cond)
+	loop.cond_broadcast(&f.cond)
 	for f.waiters > 0 {
-		sync.cond_wait(&f.cond, &s.inflight.mu)
+		loop.cond_wait(&f.cond, &s.inflight.mu)
 	}
 }

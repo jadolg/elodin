@@ -7,6 +7,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 A TCP responder that answers nothing until two queries have arrived on one
@@ -262,6 +263,8 @@ Silent_Mock :: struct {
 	stop:     bool,
 	threads:  [dynamic]^thread.Thread,
 	mu:       sync.Mutex,
+	// Reads that brought bytes, across every connection.
+	got:      int,
 }
 
 @(private = "file")
@@ -304,6 +307,7 @@ silent_conn_loop :: proc(conn: ^Silent_Conn) {
 		if err != nil || n <= 0 {
 			return
 		}
+		sync.atomic_add(&conn.mock.got, 1)
 	}
 }
 
@@ -2367,4 +2371,112 @@ test_a_truncated_pipelined_reply_is_not_a_hang_up :: proc(t: ^testing.T) {
 	testing.expectf(t, err == .IO_Error, "a truncated reply was reported as %v", err)
 	testing.expect(t, sync.atomic_load(&m.conns) >= 1, "the upstream never connected")
 	free_all(context.temp_allocator)
+}
+
+/*
+A connection carries as many queries as the server can have asking at once, so
+a busy server never reaches the per-query dial past it: the in-flight bound and
+the connection table together, never below the floor the worker threads set, and
+never near the 16-bit ID space.
+*/
+@(test)
+test_pipeline_outstanding_covers_everything_that_can_ask :: proc(t: ^testing.T) {
+	testing.expect_value(t, pipeline_outstanding(3000, 512), 3512)
+	testing.expect_value(t, pipeline_outstanding(64, 8), PIPELINE_MAX_OUTSTANDING)
+	testing.expect_value(t, pipeline_outstanding(100_000, 512), PIPELINE_OUTSTANDING_CEILING)
+	testing.expect(t, PIPELINE_OUTSTANDING_CEILING < 1 << 16, "the ceiling leaves no IDs to spare")
+}
+
+/*
+A cancelled caller that takes the reading gives up, rather than spinning on it.
+
+At shutdown the loops cancel what is left on them, a race's losers among them,
+and a cancelled fiber's every read ends at once as a timeout. A caller reading
+the connection for everyone goes round again on a timeout that consumed nothing,
+so one that kept doing so after the cancel would never park: its loop would spin
+until the caller's own deadline - ten seconds here - and could not stop before
+it. The upstream answers nothing, so the reading is what the caller is doing when
+the cancel arrives.
+*/
+@(test)
+test_a_cancelled_reader_does_not_spin_on_its_loop :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+		return
+	}
+	bound, _ := net.bound_endpoint(listener)
+	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+	m := Silent_Mock {
+		listener = listener,
+		threads  = make([dynamic]^thread.Thread, 0, 1),
+	}
+	acceptor := thread.create_and_start_with_poly_data(&m, silent_mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(acceptor)
+		thread.destroy(acceptor)
+		for th in m.threads {
+			thread.join(th)
+			thread.destroy(th)
+		}
+		delete(m.threads)
+		net.close(listener)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "cancelled", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	l, made := loop.make_loop()
+	if !testing.expect(t, made, "no loop") {
+		return
+	}
+	th := loop.spawn_thread(l, loop.run, context)
+	leg := Pipe_Leg {
+		u       = u,
+		name    = "cancelled.invalid.",
+		id      = 0x4343,
+		timeout = 10 * time.Second,
+	}
+	_, _ = loop.spawn(l, proc(data: rawptr) {pipe_leg((^Pipe_Leg)(data))}, &leg)
+	// The premise: the query is on the wire, so the caller is past its dial and
+	// waiting on the reply.
+	for start := time.tick_now(); sync.atomic_load(&m.got) == 0 && time.tick_since(start) < 5 * time.Second; {
+		time.sleep(time.Millisecond)
+	}
+	testing.expect(t, sync.atomic_load(&m.got) > 0, "the query never reached the upstream")
+
+	Stopper :: struct {
+		l:    ^loop.Loop,
+		th:   ^thread.Thread,
+		done: sync.Sema,
+	}
+	stopper := Stopper {
+		l  = l,
+		th = th,
+	}
+	waiter := thread.create_and_start_with_poly_data(&stopper, proc(s: ^Stopper) {
+		loop.stop(s.l)
+		loop.cancel_all(s.l)
+		thread.join(s.th)
+		sync.sema_post(&s.done)
+	})
+	// Well short of the caller's ten seconds, and well past what a loop with
+	// nothing to spin on takes to stop.
+	stopped := sync.sema_wait_with_timeout(&stopper.done, 3 * time.Second)
+	testing.expect(t, stopped, "the loop did not stop: the cancelled caller is still reading")
+	if !stopped {
+		_ = sync.sema_wait_with_timeout(&stopper.done, 15 * time.Second)
+	}
+	thread.join(waiter)
+	thread.destroy(waiter)
+	thread.destroy(th)
+	loop.destroy(l)
+	testing.expectf(t, leg.err == .Timeout, "the cancelled caller ended as %v, expected a timeout", leg.err)
 }

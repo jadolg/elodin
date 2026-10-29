@@ -173,7 +173,7 @@ exchange_doh_h1 :: proc(
 	/*
 	One deadline for both attempts, for the reason `exchange_pipelined` gives:
 	a retry that starts a clock of its own costs the caller twice the timeout
-	it was promised, with an upstream worker held for all of it. Widening which
+	it was promised, with a query in flight held for all of it. Widening which
 	failures reach the second attempt is what makes that reachable here.
 
 	A `Tick` rather than a `Time`, because it is a bound on waiting rather than

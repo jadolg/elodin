@@ -1,5 +1,5 @@
 #+build linux
-package pool
+package loop
 
 import "core:sys/linux"
 

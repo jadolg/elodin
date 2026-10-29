@@ -28,10 +28,10 @@ the attack.
   default: behind one, elodin would serve the ISP's other customers.
 
 The check runs before the message is parsed, before the rate limiter and before
-the query is queued:
+the query is started:
 
 - **UDP**: the datagram is dropped (a REFUSED would itself be a reflection).
-- **TCP, DoT, DoH**: the connection is closed on accept, before a thread or TLS
+- **TCP, DoT, DoH**: the connection is closed on accept, before a fiber or TLS
   handshake, so refused sources cannot use up `max_connections`.
 - Counted as `refused=`: one per datagram on UDP, one per connection on streams.
 - A UDP source no reply could reach — port 0, this server's own endpoint, a

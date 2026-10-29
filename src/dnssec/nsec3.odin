@@ -2,6 +2,7 @@ package dnssec
 
 import "core:mem"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 NSEC3, RFC 5155.
@@ -320,9 +321,23 @@ spend_nsec3_rounds :: proc(budget: ^Nsec3_Budget, rr: Nsec3, name: string) -> bo
 		budget.spent += 1
 		return false
 	}
+	// A turn for the loop at every `NSEC3_ROUNDS_PER_TURN` crossed, as for
+	// signature checks (`VERIFICATIONS_PER_TURN`).
+	crossed := (budget.rounds + cost) / NSEC3_ROUNDS_PER_TURN != budget.rounds / NSEC3_ROUNDS_PER_TURN
 	budget.rounds += cost
+	if crossed {
+		loop.yield()
+	}
 	return true
 }
+
+/*
+SHA-1 blocks a query hashes between giving its loop to the other fibers on it:
+about 100 us here, where the whole of `MAX_NSEC3_ROUNDS_PER_QUERY` is 0.8 ms
+held at once. A hash of the iteration count RFC 9276 asks for, zero, is a
+block or two, so an ordinary proof never reaches one.
+*/
+NSEC3_ROUNDS_PER_TURN :: 1024
 
 /*
 Whether a record is one this package may read at all.

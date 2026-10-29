@@ -1,5 +1,6 @@
 package config
 
+import "core:strings"
 import "core:testing"
 
 @(private = "file")
@@ -8,124 +9,86 @@ GIB :: i64(1024 * 1024 * 1024)
 MIB :: i64(1024 * 1024)
 
 /*
-The pool is as wide as the memory allows, whatever the CPU count: a cache miss
-parks its worker for an upstream round trip, so two cores need as many workers
-as thirty-two to carry the same miss rate (issue #493).
+What may be in flight is sized by memory alone: a query waiting on an upstream
+costs no CPU, so two cores carry as many as thirty-two - what binds is what each
+can come to hold (`QUERY_MEMORY_BYTES`), against an eighth of memory.
 */
 @(test)
-test_derive_workers_does_not_scale_with_cpus :: proc(t: ^testing.T) {
-	// A two-core box gets the whole pool: 128 against a 20 ms upstream is some
-	// six thousand misses a second.
-	testing.expect_value(t, derive_workers(Machine{cpus = 2, memory = 8 * GIB}), MAX_DERIVED_WORKERS)
-	testing.expect_value(t, derive_workers(Machine{cpus = 1, memory = 4 * GIB}), MAX_DERIVED_WORKERS)
-	testing.expect_value(t, derive_workers(Machine{cpus = 128, memory = 256 * GIB}), MAX_DERIVED_WORKERS)
+test_derive_max_pending_is_sized_by_memory :: proc(t: ^testing.T) {
+	// A 1 GiB VPS: 128 MiB over 320 KiB.
+	testing.expect_value(t, derive_max_pending(Machine{cpus = 2, memory = GIB}), 409)
+	testing.expect_value(t, derive_max_pending(Machine{cpus = 64, memory = GIB}), 409)
+	// A small container on a large host.
+	testing.expect_value(t, derive_max_pending(Machine{cpus = 16, memory = 256 * MIB}), 102)
+	// Small enough that the share buys almost nothing: the floor answers
+	// instead, since a resolver that has stopped answering saved nobody memory.
+	testing.expect_value(t, derive_max_pending(Machine{cpus = 1, memory = 16 * MIB}), MIN_DERIVED_PENDING)
+	// And the ceiling, which is descriptors as much as memory.
+	testing.expect_value(t, derive_max_pending(Machine{cpus = 4, memory = 64 * GIB}), MAX_DERIVED_PENDING)
 }
 
 /*
-A term the machine did not report is left out rather than guessed.
-
-An unreadable `/proc` on a large host should not size it like a Raspberry Pi,
-so with nothing known at all the answer is the number elodin has always
-shipped.
+A term the machine did not report is left out rather than guessed: an unreadable
+`/proc` on a large host should not size it like a Raspberry Pi, so with no memory
+figure the answer is the bound the worker pools shipped with.
 */
 @(test)
-test_derive_workers_ignores_what_it_cannot_measure :: proc(t: ^testing.T) {
-	testing.expect_value(t, derive_workers(Machine{}), MAX_DERIVED_WORKERS)
-	testing.expect_value(t, derive_workers(Machine{cpus = 4}), MAX_DERIVED_WORKERS)
-	testing.expect_value(t, derive_workers(Machine{memory = 64 * GIB}), MAX_DERIVED_WORKERS)
+test_derive_max_pending_ignores_what_it_cannot_measure :: proc(t: ^testing.T) {
+	testing.expect_value(t, derive_max_pending(Machine{}), DEFAULT_MAX_PENDING)
+	testing.expect_value(t, derive_max_pending(Machine{cpus = 4}), DEFAULT_MAX_PENDING)
 }
 
 /*
-Memory binds where it should and nowhere else.
-
-The interesting case is a small container on a large host: plenty of CPUs in
-the mask, a few hundred megabytes to live in, and a thread floor that would
-otherwise be a visible fraction of the whole allowance.
+The heavy decode slots take a thirty-second of memory at the whole decode budget
+each, which is the share the worker threads were held to: never fewer than two,
+never more than the 128 workers there ever were, and 16 where memory is unknown.
 */
 @(test)
-test_derive_workers_is_capped_by_memory :: proc(t: ^testing.T) {
-	// 256 MiB / 32 = 8 MiB of thread budget, or 16 threads at 512 KiB each,
-	// which buys 10 handlers and the 5 racers that come with them.
-	testing.expect_value(t, derive_workers(Machine{cpus = 16, memory = 256 * MIB}), 10)
-	// A 1 GiB VPS: 64 threads' worth, so 42 handlers and 21 racers.
-	testing.expect_value(t, derive_workers(Machine{cpus = 2, memory = GIB}), 42)
-	// Small enough that the budget buys nothing: the floor answers instead,
-	// because a resolver that has stopped answering has saved nobody memory.
-	testing.expect_value(t, derive_workers(Machine{cpus = 16, memory = 16 * MIB}), MIN_MEMORY_WORKERS)
-	// 3 GiB is where the whole pool and its racers fit.
-	testing.expect_value(t, derive_workers(Machine{cpus = 4, memory = 3 * GIB}), MAX_DERIVED_WORKERS)
-}
-
-/*
-The running limit follows the cores, not the pool: two per usable CPU, never
-more than the pool, and the whole pool - no limit - where the CPUs could not be
-counted, rather than a small guess that would cap a large host's hit rate.
-*/
-@(test)
-test_derive_running_workers_is_two_per_cpu :: proc(t: ^testing.T) {
-	testing.expect_value(t, derive_running_workers(Machine{cpus = 2}, 128), 4)
-	testing.expect_value(t, derive_running_workers(Machine{cpus = 1, memory = GIB}, 42), 2)
-	testing.expect_value(t, derive_running_workers(Machine{cpus = 96}, 128), 128)
-	testing.expect_value(t, derive_running_workers(Machine{cpus = 4}, 6), 6)
-	testing.expect_value(t, derive_running_workers(Machine{memory = GIB}, 42), 42)
+test_derive_heavy_decodes_is_sized_by_memory :: proc(t: ^testing.T) {
+	testing.expect_value(t, derive_heavy_decodes(Machine{memory = GIB}), 4)
+	testing.expect_value(t, derive_heavy_decodes(Machine{memory = 8 * GIB}), 32)
+	testing.expect_value(t, derive_heavy_decodes(Machine{memory = 256 * MIB}), MIN_DERIVED_HEAVY_DECODES)
+	testing.expect_value(t, derive_heavy_decodes(Machine{memory = 1024 * GIB}), MAX_DERIVED_HEAVY_DECODES)
+	testing.expect_value(t, derive_heavy_decodes(Machine{cpus = 4}), DEFAULT_HEAVY_DECODES)
 }
 
 @(test)
 test_derive_chain_walks_reserves_a_quarter :: proc(t: ^testing.T) {
 	// Everything but a reserved quarter, which is the whole of the shape: the
-	// bound exists to keep workers free, not to cap what the resolver validates.
+	// bound exists to keep queries turning over, not to cap what the resolver
+	// validates.
 	testing.expect_value(t, derive_chain_walks(128), 96)
 	testing.expect_value(t, derive_chain_walks(16), 12)
-	// The floor on the reservation binds on a small pool, where a quarter would
-	// be one worker or none and the resolver would stop answering while it
+	// The floor on the reservation binds on a small bound, where a quarter would
+	// be one query or none and the resolver would stop answering while it
 	// walked.
 	testing.expect_value(t, derive_chain_walks(8), 6)
 	testing.expect_value(t, derive_chain_walks(4), 2)
-	// And a pool too small to reserve from still walks: the bound is on walks at
-	// once, so zero would be a resolver that validates nothing.
+	// And a bound too small to reserve from still walks: the bound is on walks
+	// at once, so zero would be a resolver that validates nothing.
 	testing.expect_value(t, derive_chain_walks(2), 1)
 	testing.expect_value(t, derive_chain_walks(1), 1)
 }
 
 @(test)
 test_chain_walks_are_derived_at_load :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 16\n", context.temp_allocator)
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  max_pending: 16\n", context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
-	// Derived at load rather than at start-up, so `--check` and the run that
-	// follows it name the same number.
+	// From the bound on queries in flight, derived at load rather than at
+	// start-up, so `--check` and the run that follows it name the same number.
 	testing.expect_value(t, cfg.dnssec.max_chain_walks, derive_chain_walks(16))
+	// And the connections' own, from theirs.
+	testing.expect_value(t, cfg.dnssec.max_connection_walks, derive_chain_walks(cfg.server.max_connections))
+	testing.expect(t, cfg.server.sizing.derived_connection_walks, "a derived connection bound was not marked so")
+	testing.expect(t, cfg.server.sizing.derived_chain_walks, "a derived bound was not marked so")
 
 	// A number in the file wins, as everywhere else in this file.
 	set, serr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 16\ndnssec:\n  max_chain_walks: 3\n",
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_pending: 16\ndnssec:\n  max_chain_walks: 3\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, serr == nil, "expected a clean load")
 	testing.expect_value(t, set.dnssec.max_chain_walks, 3)
-	free_all(context.temp_allocator)
-}
-
-@(test)
-test_connection_walks_are_derived_from_the_connection_limit :: proc(t: ^testing.T) {
-	// Sized from the threads the stream transports actually have, which is
-	// `max_connections` and not the handler pool - two numbers an order of
-	// magnitude apart, so one figure would be wrong at both ends.
-	cfg, err := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 16\n  max_connections: 512\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, err == nil, "expected a clean load")
-	testing.expect_value(t, cfg.dnssec.max_chain_walks, derive_chain_walks(16))
-	testing.expect_value(t, cfg.dnssec.max_connection_walks, derive_chain_walks(512))
-
-	// And it is a setting, because `max_connections` is the wrong lever: it
-	// would cut how many clients may connect at all.
-	set, serr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: 24\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, serr == nil, "expected a clean load")
-	testing.expect_value(t, set.dnssec.max_connection_walks, 24)
 	free_all(context.temp_allocator)
 }
 
@@ -139,21 +102,39 @@ test_a_negative_chain_walk_bound_is_refused :: proc(t: ^testing.T) {
 		context.temp_allocator,
 	)
 	testing.expect(t, err != nil, "a negative chain-walk bound should be refused")
-
-	_, cerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: -1\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, cerr != nil, "a negative connection-walk bound should be refused")
 	free_all(context.temp_allocator)
 }
 
+/*
+The keys #547 retired are accepted for one release, each recorded so it can be
+named - a file that was correct before the upgrade still starts - and read as the
+integers they always were, so a typo in one is still caught.
+*/
 @(test)
-test_derive_upstream_workers_is_half :: proc(t: ^testing.T) {
-	testing.expect_value(t, derive_upstream_workers(128), 64)
-	testing.expect_value(t, derive_upstream_workers(16), 8)
-	// Never zero: a race with no racers is a strategy that cannot run.
-	testing.expect_value(t, derive_upstream_workers(1), 1)
+test_retired_keys_are_accepted_and_recorded :: proc(t: ^testing.T) {
+	cfg, err := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 8\n  upstream_workers: 1\n  running_workers: 4\ndnssec:\n  max_connection_walks: 24\n",
+		context.temp_allocator,
+	)
+	testing.expect(t, err == nil, "a file naming the retired keys was refused")
+	testing.expect_value(t, cfg.retired, Retired_Keys{.Workers, .Upstream_Workers, .Running_Workers})
+	// Not retired: the connections keep a walk bound of their own.
+	testing.expect_value(t, cfg.dnssec.max_connection_walks, 24)
+
+	plain, perr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	testing.expect(t, perr == nil, "expected a clean load")
+	testing.expect_value(t, plain.retired, Retired_Keys{})
+
+	_, terr := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: lots\n", context.temp_allocator)
+	testing.expect(t, terr != nil, "a retired key that is not an integer was accepted")
+
+	// Each warning names its own key and the release that refuses it.
+	for key in Retired_Key {
+		line := retired_warning(key)
+		testing.expectf(t, strings.contains(line, RETIRED_KEYS_REFUSED_IN), "%v: %q names no release", key, line)
+	}
+	testing.expect(t, strings.contains(retired_warning(.Workers), "server.workers"))
+	free_all(context.temp_allocator)
 }
 
 /*
@@ -302,98 +283,53 @@ test_read_small_file_refuses_a_truncated_read :: proc(t: ^testing.T) {
 }
 
 /*
-The machine this test is running on, whatever it is, has to produce a usable
-pair. The exact numbers are not the assertion - they are the machine's - but
+The machine this test is running on, whatever it is, has to produce usable
+sizes. The exact numbers are not the assertion - they are the machine's - but
 the bounds are.
 */
 @(test)
-test_probe_machine_produces_a_usable_pool :: proc(t: ^testing.T) {
+test_probe_machine_produces_usable_sizes :: proc(t: ^testing.T) {
 	m := probe_machine()
 	testing.expect(t, m.cpus >= 0, "a negative CPU count would size nothing sensibly")
 	testing.expect(t, m.memory >= 0, "a negative memory figure would size nothing sensibly")
-
-	workers := derive_workers(m)
-	testing.expect(t, workers >= MIN_MEMORY_WORKERS, "the derivation should never leave a pool too narrow to answer")
-	testing.expect(t, workers <= MAX_DERIVED_WORKERS, "the derivation should never exceed the ceiling")
-	testing.expect(t, derive_upstream_workers(workers) >= 1, "there should always be a racer")
+	pending := derive_max_pending(m)
+	testing.expect(t, pending >= MIN_DERIVED_PENDING && pending <= MAX_DERIVED_PENDING, "max_pending out of its bounds")
+	heavy := derive_heavy_decodes(m)
+	testing.expect(t, heavy >= MIN_DERIVED_HEAVY_DECODES && heavy <= MAX_DERIVED_HEAVY_DECODES, "heavy decodes out of their bounds")
 }
 
 /*
-An unset worker count is the derived one, and it is recorded as derived: an
-operator reading the log needs to know the number came from the machine rather
-than from a file they have not found yet.
+Unset sizes are the derived ones, and recorded as derived: an operator reading
+the log needs to know a number came from the machine rather than from a file they
+have not found yet. The loop count is derived with UDP off as well, since every
+listener runs on the loops.
 */
 @(test)
-test_unset_workers_are_derived_at_load :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
-	testing.expect(t, err == nil, "expected a clean load")
-	testing.expect(t, cfg.server.sizing.derived_workers, "workers should be marked as derived")
-	testing.expect(t, cfg.server.sizing.derived_upstream_workers, "upstream_workers should be marked as derived")
-	testing.expect_value(t, cfg.server.workers, derive_workers(cfg.server.sizing.machine))
-	testing.expect_value(t, cfg.server.upstream_workers, derive_upstream_workers(cfg.server.workers))
-	testing.expect(t, cfg.server.sizing.derived_running_workers, "running_workers should be marked as derived")
-	testing.expect_value(
-		t,
-		cfg.server.running_workers,
-		derive_running_workers(cfg.server.sizing.machine, cfg.server.workers),
-	)
-	// The queue bound follows the derived count rather than the old default.
-	testing.expect_value(t, cfg.server.max_pending, cfg.server.workers * 8)
-	free_all(context.temp_allocator)
-}
-
-/*
-A number in the file wins, and half of it is still a sensible racer count - so
-the two can be set independently without the file having to name both.
-*/
-@(test)
-test_configured_workers_win :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 40\n"
-	cfg, err := load_string(src, context.temp_allocator)
-	testing.expect(t, err == nil, "expected a clean load")
-	testing.expect_value(t, cfg.server.workers, 40)
-	testing.expect(t, !cfg.server.sizing.derived_workers, "a configured count is not a derived one")
-	testing.expect_value(t, cfg.server.upstream_workers, 20)
-	testing.expect(t, cfg.server.sizing.derived_upstream_workers, "the unset half should be derived from the set one")
-	// The machine here is measured for the UDP reader count, which is derived
-	// and says so; what it must not be is reported as though the worker counts
-	// had come from it, which `derived_workers` above is what decides.
-	testing.expect(t, cfg.server.sizing.derived_udp_readers, "the reader count was left underived")
-
-	// With nothing left to derive, nothing is measured at all: half of 40 is
-	// the file's doing, not the hardware's, and a machine nobody consulted must
-	// not appear in the line that explains where the numbers came from.
-	quiet, qerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 40\n  upstream_workers: 20\n  running_workers: 3\nlisteners:\n  udp: { enabled: false }\n",
+test_unset_sizes_are_derived_at_load :: proc(t: ^testing.T) {
+	cfg, err := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp: { enabled: false }\n",
 		context.temp_allocator,
 	)
-	testing.expect(t, qerr == nil, "expected a clean load")
-	testing.expect_value(t, quiet.server.sizing.machine, Machine{})
-	testing.expect_value(t, quiet.server.running_workers, 3)
-	testing.expect(t, !quiet.server.sizing.derived_running_workers, "a configured limit is not a derived one")
-
-	// The running limit is the machine's to say however the pool was sized, so
-	// a configured `workers` still has it read off the CPUs.
-	testing.expect(t, cfg.server.sizing.derived_running_workers, "the running limit was left underived")
-	testing.expect_value(t, cfg.server.running_workers, derive_running_workers(cfg.server.sizing.machine, 40))
-
-	both := "upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 40\n  upstream_workers: 40\n"
-	pair, perr := load_string(both, context.temp_allocator)
-	testing.expect(t, perr == nil, "expected a clean load")
-	testing.expect_value(t, pair.server.workers, 40)
-	testing.expect_value(t, pair.server.upstream_workers, 40)
-	testing.expect(t, !pair.server.sizing.derived_upstream_workers, "nothing should have been derived")
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect(t, cfg.server.sizing.derived_max_pending, "max_pending should be marked as derived")
+	testing.expect_value(t, cfg.server.max_pending, derive_max_pending(cfg.server.sizing.machine))
+	testing.expect_value(t, cfg.server.heavy_decodes, derive_heavy_decodes(cfg.server.sizing.machine))
+	testing.expect(t, cfg.server.sizing.derived_udp_readers, "the loop count should be marked as derived")
+	testing.expect_value(t, cfg.listeners.udp.readers, derive_udp_readers(cfg.server.sizing.machine))
 	free_all(context.temp_allocator)
 }
 
-// Zero means "work it out"; below zero means nothing at all.
+// A number in the file wins, and what is derived from it follows it.
 @(test)
-test_negative_worker_counts_are_refused :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: -1\n  upstream_workers: -4\n  running_workers: -2\n"
-	_, err := load_string(src, context.temp_allocator)
-	e, has := err.?
-	testing.expect(t, has, "a negative worker count should be refused")
-	testing.expect_value(t, len(e.messages), 3)
+test_configured_max_pending_wins :: proc(t: ^testing.T) {
+	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  max_pending: 40\n", context.temp_allocator)
+	testing.expect(t, err == nil, "expected a clean load")
+	testing.expect_value(t, cfg.server.max_pending, 40)
+	testing.expect(t, !cfg.server.sizing.derived_max_pending, "a configured bound is not a derived one")
+	testing.expect_value(t, cfg.dnssec.max_chain_walks, derive_chain_walks(40))
+
+	_, nerr := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  max_pending: -1\n", context.temp_allocator)
+	testing.expect(t, nerr != nil, "a negative max_pending should be refused")
 	free_all(context.temp_allocator)
 }
 

@@ -6,6 +6,7 @@ import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:loop"
 import "elodin:tlsx"
 
 /*
@@ -28,11 +29,12 @@ their caller by ID, in whatever order they arrive - section 7 recommends
 servers answer out of order, so nothing here may assume FIFO.
 
 What reads the socket is the difference from `h2client.odin`, and it is the
-laziness this file is worth: there is no reader thread. Whichever caller finds
-nobody reading does the reading, for everyone, until its own reply turns up;
-the others wait on `cond`. A connection with nothing outstanding therefore has
-nobody blocked on it and needs no poll interval, no stopping flag and no thread
-to join - the whole of `H2_Conn`'s lifecycle problem does not arise.
+laziness this file is worth: there is no reader of its own. Whichever caller
+finds nobody reading does the reading, for everyone, until its own reply turns
+up; the others wait on `cond`, on whichever loop they are. A connection with
+nothing outstanding therefore has nobody waiting on it and needs no poll
+interval, no stopping flag and no reader to wait for - the whole of `H2_Conn`'s
+lifecycle problem does not arise.
 
 Two properties matter besides. A pooled connection found dead is retried once on
 a fresh one, which is what makes an upstream closing an idle connection
@@ -43,7 +45,7 @@ and the caller's is put back on the answer before it is returned.
 */
 
 /*
-How many queries may be outstanding on one connection at once.
+How many queries may be outstanding on one connection at once, at least.
 
 A backstop, and deliberately not a throughput limit. Past it a caller dials a
 connection for its own query and closes it again afterwards, which is a fresh
@@ -51,19 +53,49 @@ handshake per query and worse churn than the pool this replaced - so the figure
 has to sit above every number of callers the server can actually put in
 `exchange` at once, or the fix becomes the bug.
 
-That number is the handlers, not the racers: `resolve_sequential` - failover and
-round_robin, so the default - calls `exchange` on the handler thread itself, and
-only a race group hands the work to `upstream_workers`. `derive_workers` stops
-at `MAX_DERIVED_WORKERS`, 128, and brings half its count again in racers, so a
-derived configuration tops out near 192 callers per upstream. 256 clears that.
+That number is what may be in flight: every query a fiber of its own runs
+(`server.max_pending`) and every connection's (`server.max_connections`), all of
+which may be calling `exchange` on the same upstream at once, and under a race
+every leg the racer budget allows, `max_pending` per member of the widest racing
+group, each of which may be the one left asking a slow member after its query has
+gone. So the figure is derived from those (`pipeline_outstanding`), and this is
+its floor.
 
 Which leaves the bound doing what it was asked to do and nothing else: a server
 that has stopped answering cannot pile up waiters without limit, and one that
-is merely busy never reaches it. A hand-configured `server.workers` above this
-would, and would pay the churn; `Upstream.max_outstanding` is where that would
-be derived from the configuration if it ever needs to be.
+is merely busy never reaches it.
 */
 PIPELINE_MAX_OUTSTANDING :: 256
+
+/*
+The most a connection's 16-bit IDs allow with room to spare: a reply arriving
+after its caller gave up must not be taken for a later query that reused its ID
+(`pipe_take_id`), so the figure stays well short of 65,536.
+*/
+PIPELINE_OUTSTANDING_CEILING :: 1 << 15
+
+/*
+`Upstream.max_outstanding` for a server that may have `in_flight` queries and
+`connections` connections asking at once; see `PIPELINE_MAX_OUTSTANDING`.
+*/
+pipeline_outstanding :: proc(in_flight, connections: int) -> int {
+	return clamp(in_flight + connections, PIPELINE_MAX_OUTSTANDING, PIPELINE_OUTSTANDING_CEILING)
+}
+
+/*
+Move what each of `g`'s pipelined connections may carry, for a reload that keeps
+the group - and with it its connections, health and learned idle ceilings - but
+changes what may be in flight. A connection already carrying more drains to the
+new figure as its replies come in.
+*/
+set_max_outstanding :: proc(g: ^Group, n: int) {
+	if g == nil {
+		return
+	}
+	for u in g.servers {
+		sync.atomic_store(&u.max_outstanding, n)
+	}
+}
 
 /*
 Callers in a row that have to run out of time on a silent connection before it
@@ -135,7 +167,7 @@ Pipe_Waiter :: struct {
 	The query as it went out, under the ID this connection gave it.
 
 	Read by whichever caller is reading the socket, which is not the caller
-	that owns these bytes and may not be on this thread's arena. Safe because
+	that owns these bytes and may not be in this fiber's scratch. Safe because
 	it is only ever reached through `Pipe_Conn.waiters` under `Pipe_Conn.mu`,
 	and a caller takes itself out of that map before it returns.
 	*/
@@ -149,6 +181,22 @@ Pipe_Waiter :: struct {
 	// that runs out of time can tell "my reply never came" from "nothing at
 	// all is coming". See `pipe_wait`.
 	seen:  u64,
+	/*
+	What this waiter parks on, under `Pipe_Conn.mu`: signalled when its reply
+	lands, when the reading is handed to it, and when the connection dies. One
+	per waiter rather than one for the connection, so a reply wakes the caller
+	it is for and not every caller on the connection - thousands of them, at
+	`pipeline_outstanding` - each to take the lock and park again.
+	*/
+	cond:   loop.Cond,
+	/*
+	Whether this waiter is parked on `cond` in `pipe_wait`, under `Pipe_Conn.mu`.
+	A waiter still writing its query is in `waiters` too, but nobody is on its
+	`cond` to hear a hand-on, and its write may fail and leave without reading;
+	`pipe_hand_on` passes it over, and it looks at `reading` itself when it
+	arrives in `pipe_wait`.
+	*/
+	parked: bool,
 }
 
 @(private)
@@ -156,10 +204,9 @@ Pipe_Conn :: struct {
 	stream:    Stream,
 	// Held for the whole of one message going out, so two queries written at
 	// once cannot interleave their bytes on the wire.
-	wmu:       sync.Mutex,
+	wmu:       loop.Mutex,
 
 	mu:        sync.Mutex,
-	cond:      sync.Cond,
 	waiters:   map[u16]^Pipe_Waiter,
 	// Whether some caller is reading the socket on everyone's behalf.
 	reading:   bool,
@@ -359,6 +406,27 @@ pipe_kill :: proc(c: ^Pipe_Conn, err: Error) {
 	}
 	c.dead = true
 	c.err = err
+	// Everybody on it, which is the one time everybody is woken.
+	for _, w in c.waiters {
+		loop.cond_signal(&w.cond)
+	}
+}
+
+/*
+Under `c.mu`, as a reader leaves: wake one parked waiter, so that somebody takes
+the reading on. One rather than all: the rest are not needed for it, and whoever
+is woken and finds the reading taken again parks again. `self` is skipped; it is
+awake. A waiter not yet parked is skipped too (see `Pipe_Waiter.parked`); with
+none parked nobody needs waking, since each takes the reading on arrival.
+*/
+@(private)
+pipe_hand_on :: proc(c: ^Pipe_Conn, self: ^Pipe_Waiter) {
+	for _, w in c.waiters {
+		if w != self && w.parked {
+			loop.cond_signal(&w.cond)
+			return
+		}
+	}
 }
 
 /*
@@ -444,7 +512,7 @@ get_pipe :: proc(
 		Unbounded, the caller that was waiting for it then starts a dial of its
 		own with the next one waiting behind that, so a burst of N callers
 		dials N times end to end and the last of them returns at N times the
-		budget it was given - holding an upstream worker for all of it, long
+		budget it was given - holding a query in flight for all of it, long
 		past the point its own caller stopped waiting. Guarding only the wait
 		would leave the same queue one dial shorter, and guarding only the
 		shared dial would still spend a connect on every caller that came out
@@ -460,7 +528,7 @@ get_pipe :: proc(
 			return nil, .Timeout
 		}
 		if u.pipe != nil {
-			switch pipe_state(u.pipe, pipe_idle_ceiling_locked(u), u.max_outstanding) {
+			switch pipe_state(u.pipe, pipe_idle_ceiling_locked(u), sync.atomic_load(&u.max_outstanding)) {
 			case .Ready:
 				c = u.pipe
 				pipe_ref(c)
@@ -479,7 +547,7 @@ get_pipe :: proc(
 		if !u.connecting {
 			break
 		}
-		sync.cond_wait_with_timeout(&u.conn_cond, &u.mu, remaining)
+		loop.cond_wait_with_timeout(&u.conn_cond, &u.mu, remaining)
 	}
 
 	u.connecting = true
@@ -495,14 +563,14 @@ get_pipe :: proc(
 	sync.mutex_lock(&u.mu)
 	u.connecting = false
 	if derr != .None {
-		sync.cond_broadcast(&u.conn_cond)
+		loop.cond_broadcast(&u.conn_cond)
 		sync.mutex_unlock(&u.mu)
 		return nil, derr
 	}
 	// This caller's, on top of the upstream's.
 	pipe_ref(dialled)
 	u.pipe = dialled
-	sync.cond_broadcast(&u.conn_cond)
+	loop.cond_broadcast(&u.conn_cond)
 	sync.mutex_unlock(&u.mu)
 	return dialled, .None
 }
@@ -536,13 +604,13 @@ exchange_pipelined :: proc(
 	One deadline for the whole of this, set by `exchange` and handed to every
 	stage. Waiting for somebody else's dial, dialling, asking, writing and
 retrying each starting a clock of its own would let a query cost several
-times the timeout its caller was promised - with an upstream worker held for
+times the timeout its caller was promised - with a query in flight held for
 all of it.
 
 	A `Tick` rather than a `Time`, for the reason `tlsx.wait_ready` gives: this
 	is a bound on waiting rather than a moment anyone reads off a clock, and
 	the wall clock steps. An NTP correction backwards extends every deadline in
-	flight by the size of the step - here that is workers parked past their
+	flight by the size of the step - here that is queries parked past their
 	timeout, and, through `pipe_framing_deadline`, a bound whose blast radius
 	is the shared connection rather than one query.
 	*/
@@ -696,8 +764,8 @@ pipe_take_id :: proc(c: ^Pipe_Conn) -> (id: u16, ok: bool) {
 			return id, true
 		}
 	}
-	// Unreachable under `Upstream.max_outstanding`, which is orders of
-	// magnitude below the number of IDs.
+	// Unreachable under `Upstream.max_outstanding`, which is held to half the
+	// number of IDs; see `PIPELINE_OUTSTANDING_CEILING`.
 	return 0, false
 }
 
@@ -705,16 +773,27 @@ pipe_take_id :: proc(c: ^Pipe_Conn) -> (id: u16, ok: bool) {
 Wait for this caller's reply, reading the socket for everyone if nobody is.
 
 The caller that finds `reading` clear takes it, reads one message off the wire,
-hands it to whichever waiter it belongs to and goes round again - so the thread
+hands it to whichever waiter it belongs to and goes round again - so the fiber
 doing the reading is always one that is waiting anyway, and a connection with
 nothing outstanding has nobody on it. Every other waiter parks on `cond` until
-its own reply lands, the connection dies, or its own deadline passes, whichever
-comes first.
+its own reply lands, the reading is handed to it, the connection dies, or its own
+deadline passes, whichever comes first - each on a cond of its own (see
+`Pipe_Waiter.cond`).
 */
 @(private)
 pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Tick) -> Error {
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
+	/*
+	Whatever this caller leaves with - its reply, its deadline, a cancel - the
+	reading must not leave with it: a caller handed the reading that goes instead
+	would leave the rest parked until their own deadlines, with their replies
+	sitting unread on the socket. Under the lock, which the defer above releases
+	after this.
+	*/
+	defer if !c.reading && !c.dead {
+		pipe_hand_on(c, w)
+	}
 	for {
 		// Ahead of `dead`: a reply that landed before the connection went is
 		// still this caller's answer.
@@ -783,18 +862,32 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Tick) 
 				c.silent += 1
 				if c.silent >= PIPE_SILENT_TIMEOUTS {
 					pipe_kill(c, .Timeout)
-					sync.cond_broadcast(&c.cond)
 				}
 			}
 			return .Timeout
 		}
 		if c.reading {
-			sync.cond_wait_with_timeout(&c.cond, &c.mu, remaining)
+			w.parked = true
+			loop.cond_wait_with_timeout(&w.cond, &c.mu, remaining)
+			w.parked = false
 			continue
+		}
+		/*
+		A cancelled fiber - the server stopping - has every read end at once as a
+		timeout, which consumes nothing, so taking the reading would go round here
+		without ever parking until the deadline, holding its loop the whole time.
+		It gives up instead, as a caller out of time does.
+		*/
+		if loop.cancelled() {
+			delete_key(&c.waiters, id)
+			return .Timeout
 		}
 
 		c.reading = true
 		sync.mutex_unlock(&c.mu)
+		// Replies for the others arriving back to back never let this caller
+		// park; the reads yield between them (`loop.take_turn`), still marked as
+		// the reader, so nobody takes the reading over meanwhile.
 		rerr := pipe_read_one(c, remaining)
 		sync.mutex_lock(&c.mu)
 		c.reading = false
@@ -804,7 +897,8 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Tick) 
 		if rerr != .None && rerr != .Timeout {
 			pipe_kill(c, rerr)
 		}
-		sync.cond_broadcast(&c.cond)
+		// Round again: this caller takes the reading back unless it leaves, and
+		// the defer above hands it on when it does.
 	}
 }
 
@@ -891,8 +985,8 @@ pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 	}
 
 	// The connection's allocator rather than any caller's: this is read before
-	// it is known whose it is, and the waiter it goes to may be on a thread
-	// whose arena this one has no business allocating from.
+	// it is known whose it is, and the waiter it goes to may be on another loop,
+	// with scratch this one has no business allocating from.
 	msg := make([]u8, length, c.allocator)
 	if _, merr := pipe_read_full(c, msg, framing); merr != .None {
 		delete(msg, c.allocator)
@@ -931,10 +1025,12 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 		delete(msg, c.allocator)
 		w.err = .Bad_Response
 		w.done = true
+		loop.cond_signal(&w.cond)
 		return
 	}
 	w.reply = msg
 	w.done = true
+	loop.cond_signal(&w.cond)
 }
 
 /*
@@ -969,7 +1065,7 @@ pipe_read_full :: proc(c: ^Pipe_Conn, buf: []u8, deadline: time.Tick) -> (n: int
 			n += got
 			continue
 		}
-		got, nerr := net.recv_tcp(c.stream.socket, buf[n:])
+		got, nerr := loop.recv_tcp(c.stream.socket, buf[n:])
 		if nerr != nil {
 			// SO_RCVTIMEO expiring on a blocking recv() is EAGAIN on Linux,
 			// which core:net reports as .Would_Block rather than .Timeout -
@@ -1020,8 +1116,8 @@ pipe_write :: proc(c: ^Pipe_Conn, query: []u8, deadline: time.Tick) -> Error {
 	framed[1] = u8(len(query))
 	copy(framed[2:], query)
 
-	sync.mutex_lock(&c.wmu)
-	defer sync.mutex_unlock(&c.wmu)
+	loop.lock(&c.wmu)
+	defer loop.unlock(&c.wmu)
 	/*
 	Whoever was ahead of this in the queue may have found the connection gone
 	while this one waited, and a write to a connection that is finished is a
@@ -1071,7 +1167,6 @@ pipe_write :: proc(c: ^Pipe_Conn, query: []u8, deadline: time.Tick) -> Error {
 		*/
 		sync.mutex_lock(&c.mu)
 		pipe_kill(c, err)
-		sync.cond_broadcast(&c.cond)
 		sync.mutex_unlock(&c.mu)
 	}
 	return err
@@ -1124,7 +1219,7 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 			return sent, .Timeout
 		}
 		pipe_set_write_timeout(c, remaining)
-		n, werr := net.send_tcp(c.stream.socket, framed[sent:])
+		n, werr := loop.send_tcp(c.stream.socket, framed[sent:])
 		if werr != nil {
 			// A send timeout is the peer not reading, which is a different
 			// thing from the peer closing and is counted as such; see
@@ -1158,7 +1253,7 @@ close_pipe :: proc(u: ^Upstream, all: bool) -> (closed: int) {
 	if u.pipe == nil {
 		return 0
 	}
-	if !all && pipe_state(u.pipe, pipe_idle_ceiling_locked(u), u.max_outstanding) != .Gone {
+	if !all && pipe_state(u.pipe, pipe_idle_ceiling_locked(u), sync.atomic_load(&u.max_outstanding)) != .Gone {
 		return 0
 	}
 	c := u.pipe

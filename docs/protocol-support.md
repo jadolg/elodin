@@ -35,12 +35,11 @@ RFC 6761 and RFC 7686 answered here instead of forwarded.
 
 - Where the host's crypto policy forbids SHA-1, zones signed only with RSA/SHA-1 (algorithms 5 and 7) validate as insecure delegations; see [DNSSEC](dnssec.md#watch-out).
 - [Rebinding protection](rebinding.md#dns-rebinding-protection) covers A, AAAA, ANY, SVCB and HTTPS questions only.
-- TCP, DoT and DoH use a thread per connection, capped by `server.max_connections` and per prefix by `server.max_connections_per_prefix` (UDP uses reader threads and holds no per-client state); see [sizing](sizing.md#transports).
+- TCP, DoT and DoH hold a fiber per connection, capped by `server.max_connections` and per prefix by `server.max_connections_per_prefix` (UDP holds no per-client state); see [sizing](sizing.md#transports).
 - Past what the UDP readers can drain, the kernel drops datagrams before any budget sees them; see [how fast datagrams can be read](connections.md#how-fast-datagrams-can-be-read).
 - The handshake bound is per /24 and /64, and a refusal is cheap rather than free; see [a connection rate limit in front](public-resolver.md#a-connection-rate-limit-in-front).
-- Upstream I/O is synchronous: a worker is held for each round trip; see [sizing](sizing.md#sizing).
 - Upstream cookies go only on queries that carry an OPT record, so a non-EDNS client gets none unless DNSSEC validation is on (the default); cookie secrets are never rotated, so a restart costs each peer one round trip. See [DNS cookies](edns.md#dns-cookies).
 - elodin does not advertise its own DoT/DoH over DDR: `resolver.arpa` is answered NODATA ([resolver.arpa](dnssec.md#resolverarpa)). Point clients at the encrypted listeners by configuration, the [Apple profile](doh.md#apple-devices-ios-ipados-macos), or a `rewrites` rule.
 - EDNS Client Subnet is not implemented: a client's option is dropped upstream and cannot be forwarded, since the cache is not keyed per network (RFC 7871 section 7.3).
 - No per-client rules, query log database, or web/API surface; statistics go to the [log](logging.md#stats) and [metrics](metrics.md#metrics).
-- `SIGHUP` reloads the configuration and the certificates, except the listeners, the metrics endpoint, the pool and connection-table sizes, `server.user`/`group` and `blocking.cache_dir`, which need a restart ([signals](install.md#signals)).
+- `SIGHUP` reloads the configuration and the certificates, except the listeners, the metrics endpoint, the loop count and connection-table sizes, `server.user`/`group` and `blocking.cache_dir`, which need a restart ([signals](install.md#signals)).

@@ -47,7 +47,7 @@ resolver](public-resolver.md#connection-table-share).
 ```yaml
 listeners:
   udp:
-    readers: 0                # threads reading the socket; 0 derives one per usable CPU, to 8
+    readers: 0                # event loops, one socket each; 0 derives one per usable CPU, to 8
     receive_buffer: 1MiB      # what each reader asks the kernel to hold for it
 ```
 
@@ -58,7 +58,7 @@ $ elodin --check
 
 Everything a datagram costs before the rate limiter sees it — the `recvfrom`, the
 [allow-list](access-control.md#who-may-ask) compare, the hash of the source
-prefix — happens on the reader thread. Past what the readers can drain, the
+prefix — happens on the loop that read it. Past what the readers can drain, the
 kernel's receive queue overflows and drops datagrams, so no budget or setting in
 elodin applies to them. The drain rate and drop figures are under [running a
 public resolver](public-resolver.md#datagrams-the-readers-can-drain).
@@ -68,7 +68,7 @@ public resolver](public-resolver.md#datagrams-the-readers-can-drain).
   4-tuple. A flood from one source port lands on one reader; one from many ports
   spreads over all of them.
 - `0` derives one reader per usable CPU, up to eight, the same reading as the
-  [worker counts](sizing.md#sizing). The number is in the startup line and
+  [rest of the sizing](sizing.md#sizing). The number is in the startup line and
   `--check`.
 - The listener takes the port with an ordinary bind before the readers share it,
   so a port somebody else already holds — including a second elodin — is refused

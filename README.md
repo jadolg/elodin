@@ -109,7 +109,7 @@ tasks, the layout of the source and how it is tested.
 | [Reserved names](docs/reserved-names.md) | `localhost`, `.onion`, `home.arpa`, the private reverse zones |
 | [Metrics](docs/metrics.md) | the Prometheus endpoint and the Grafana dashboard |
 | [Running a public resolver](docs/public-resolver.md) | the checklist for `allow_from: []`, and the packet filter in front |
-| [Sizing](docs/sizing.md) | worker counts, memory, transports, what the benchmarks say |
+| [Sizing](docs/sizing.md) | event loops, queries in flight, memory, transports, what the benchmarks say |
 | [What is implemented, and what is not](docs/protocol-support.md) | protocol coverage and known limitations |
 
 The reasoning behind each default lives in the source beside the code it governs

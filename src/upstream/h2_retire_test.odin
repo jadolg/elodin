@@ -6,11 +6,12 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:config"
+import "elodin:loop"
 import "elodin:tlsx"
 
 /*
-Replacing a dead shared HTTP/2 connection used to join its reader thread on
-the caller's time (#454). The reader only notices `stopping` once its poll
+Replacing a dead shared HTTP/2 connection must not wait for its reader on the
+caller's time (#454). The reader only notices `stopping` once its poll
 ticks, so the query that found the connection dead waited up to
 H2_POLL_INTERVAL before it could dial, outside the deadline `exchange` is
 held to.
@@ -65,7 +66,6 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 	u.proto = .H2
 	hc := start_h2_conn(u, Stream{socket = socket})
 	u.h2 = hc
-	reader := u.h2_readers[len(u.h2_readers) - 1]
 	sync.mutex_unlock(&u.mu)
 
 	if reader_gone {
@@ -73,7 +73,7 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 		// is then closed before anyone retires it, and the last reference is
 		// the caller's rather than the reader's.
 		_ = net.shutdown(socket, .Receive)
-		for !thread.is_done(reader) {
+		for h2_readers_running(u) > 0 {
 			time.sleep(time.Millisecond)
 		}
 	} else {
@@ -82,10 +82,10 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 		// Given time to get there first: a reader not yet in its read sees
 		// `stopping` straight away, and the join cost nothing.
 		time.sleep(50 * time.Millisecond)
-		sync.mutex_lock(&hc.client.mu)
+		loop.lock(&hc.client.mu)
 		hc.client.closed = true
-		sync.mutex_unlock(&hc.client.mu)
-		testing.expect(t, !thread.is_done(reader), "the premise: the reader is still polling")
+		loop.unlock(&hc.client.mu)
+		testing.expect(t, h2_readers_running(u) > 0, "the premise: the reader is still polling")
 	}
 
 	start := time.tick_now()
@@ -102,13 +102,13 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 	sync.mutex_unlock(&u.mu)
 
 	// Nor does the retired reader sit out its poll: with no join to throttle
-	// replacements, each reader left polling would hold a thread and a socket
+	// replacements, each reader left polling would hold a fiber and a socket
 	// for up to H2_POLL_INTERVAL, as many as the upstream can be dialled in
 	// that time.
-	for !thread.is_done(reader) && time.tick_since(start) < H2_POLL_INTERVAL / 2 {
+	for h2_readers_running(u) > 0 && time.tick_since(start) < H2_POLL_INTERVAL / 2 {
 		time.sleep(time.Millisecond)
 	}
-	testing.expectf(t, thread.is_done(reader), "the retired reader was still polling after %v", time.tick_since(start))
+	testing.expectf(t, h2_readers_running(u) == 0, "the retired reader was still polling after %v", time.tick_since(start))
 }
 
 @(test)
@@ -121,8 +121,14 @@ test_replacing_an_h2_conn_whose_reader_has_gone_frees_it :: proc(t: ^testing.T) 
 	replace_dead_h2(t, reader_gone = true)
 }
 
+/*
+A reader that has left is not counted any more, whichever way it left: retired
+by the next connection, or ending on its own when the peer hangs up. A count
+that only grew would hold `teardown_h2` - and with it a reload's release of the
+group - for good.
+*/
 @(test)
-test_finished_h2_readers_are_reaped_by_the_next_conn :: proc(t: ^testing.T) {
+test_finished_h2_readers_leave_no_count_behind :: proc(t: ^testing.T) {
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
 		return
@@ -139,8 +145,6 @@ test_finished_h2_readers_are_reaped_by_the_next_conn :: proc(t: ^testing.T) {
 	}
 	defer destroy(u)
 
-	// Each connection's reader leaves on its own; without reaping, every
-	// connection the upstream ever had would keep a thread handle here.
 	for _ in 0 ..< 4 {
 		socket, derr := dial_tcp_timeout(bound, time.Second)
 		if !testing.expectf(t, derr == .None, "cannot dial the listener: %v", derr) {
@@ -149,19 +153,24 @@ test_finished_h2_readers_are_reaped_by_the_next_conn :: proc(t: ^testing.T) {
 		sync.mutex_lock(&u.mu)
 		old := u.h2
 		u.h2 = start_h2_conn(u, Stream{socket = socket})
-		reader := u.h2_readers[len(u.h2_readers) - 1]
 		sync.mutex_unlock(&u.mu)
 		if old != nil {
 			retire_h2_conn(old)
 		}
 		_ = net.shutdown(socket, .Receive)
-		for !thread.is_done(reader) {
+		start := time.tick_now()
+		for h2_readers_running(u) > 0 && time.tick_since(start) < 3 * time.Second {
 			time.sleep(time.Millisecond)
 		}
 	}
+	testing.expect_value(t, h2_readers_running(u), 0)
+}
+
+// Readers counted against `u` and not yet gone.
+h2_readers_running :: proc(u: ^Upstream) -> int {
 	sync.mutex_lock(&u.mu)
-	testing.expect_value(t, len(u.h2_readers), 1)
-	sync.mutex_unlock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	return u.h2_readers
 }
 
 @(private = "file")
@@ -261,7 +270,6 @@ test_retiring_a_tls_h2_conn_sends_close_notify :: proc(t: ^testing.T) {
 	tlsx.set_timeouts(stream.tls, H2_POLL_INTERVAL, time.Second)
 	sync.mutex_lock(&u.mu)
 	hc := start_h2_conn(u, stream)
-	reader := u.h2_readers[len(u.h2_readers) - 1]
 	sync.mutex_unlock(&u.mu)
 
 	// In its poll, as in `replace_dead_h2`.
@@ -269,7 +277,102 @@ test_retiring_a_tls_h2_conn_sends_close_notify :: proc(t: ^testing.T) {
 	retire_h2_conn(hc)
 	thread.join(peer_thread)
 	testing.expect_value(t, peer.ended, tlsx.Error.Closed)
-	for !thread.is_done(reader) {
+	for h2_readers_running(u) > 0 {
 		time.sleep(time.Millisecond)
 	}
+}
+
+/*
+A reader on a loop that is told to stop leaves, rather than spinning.
+
+Its read waits `H2_POLL_INTERVAL` and goes round again on a timeout, which is how
+a long-lived connection sits through quiet. A cancelled fiber's every wait
+returns at once, as a timeout does, so a reader that went round on that too
+would spin on its loop for ever and the loop - waiting for its last fiber - would
+never stop. The loop is stopped the way the server stops it, with
+`loop.cancel_all`; the wait for it to finish is bounded only so a failing run
+reports rather than hangs.
+*/
+@(test)
+test_a_cancelled_h2_reader_leaves_its_loop :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	defer net.close(listener)
+	bound, _ := net.bound_endpoint(listener)
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "cancelled", kind = .TCP, address = "127.0.0.1", port = bound.port, hostname = "doh.invalid", path = "/dns-query"},
+		8,
+		30 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+
+	l, made := loop.make_loop()
+	if !testing.expect(t, made, "no loop") {
+		return
+	}
+	th := loop.spawn_thread(l, loop.run, context)
+	Start :: struct {
+		u:       ^Upstream,
+		port:    int,
+		started: sync.Sema,
+		ok:      bool,
+	}
+	st := Start {
+		u    = u,
+		port = bound.port,
+	}
+	// Started from a fiber of the loop, so the reader is one of its fibers.
+	_, _ = loop.spawn(l, proc(data: rawptr) {
+		st := (^Start)(data)
+		defer sync.sema_post(&st.started)
+		socket, derr := dial_tcp_timeout(net.Endpoint{address = net.IP4_Loopback, port = st.port}, time.Second)
+		if derr != .None {
+			return
+		}
+		_ = net.set_option(socket, .Receive_Timeout, H2_POLL_INTERVAL)
+		sync.mutex_lock(&st.u.mu)
+		st.u.proto = .H2
+		st.u.h2 = start_h2_conn(st.u, Stream{socket = socket})
+		sync.mutex_unlock(&st.u.mu)
+		st.ok = true
+	}, &st)
+	testing.expect(t, sync.sema_wait_with_timeout(&st.started, 5 * time.Second), "the dial never ran")
+	if !testing.expect(t, st.ok, "could not start the connection") {
+		loop.stop(l)
+		thread.join(th)
+		thread.destroy(th)
+		loop.destroy(l)
+		return
+	}
+	// The premise: a reader on the loop, waiting in its read.
+	testing.expect(t, h2_readers_running(u) == 1, "no reader is running on the loop")
+
+	Stopper :: struct {
+		l:    ^loop.Loop,
+		th:   ^thread.Thread,
+		done: sync.Sema,
+	}
+	stopper := Stopper {
+		l  = l,
+		th = th,
+	}
+	waiter := thread.create_and_start_with_poly_data(&stopper, proc(s: ^Stopper) {
+		loop.cancel_all(s.l)
+		loop.stop(s.l)
+		thread.join(s.th)
+		sync.sema_post(&s.done)
+	})
+	if !testing.expect(t, sync.sema_wait_with_timeout(&stopper.done, 5 * time.Second), "the loop never stopped: its reader is still running") {
+		return
+	}
+	thread.join(waiter)
+	thread.destroy(waiter)
+	thread.destroy(th)
+	loop.destroy(l)
+	testing.expect_value(t, h2_readers_running(u), 0)
 }

@@ -23,10 +23,10 @@ test_derive_udp_readers_scales_with_cpus :: proc(t: ^testing.T) {
 /*
 A machine that could not be counted gets one reader, not a guess.
 
-The opposite of `derive_workers`, which answers its ceiling to the same unknown,
-and the asymmetry is the point: a worker that turns out to be unnecessary is
-memory, while a reader with no core to run on is a thread contending for the
-core the reader beside it is using.
+The opposite of `derive_max_pending`, which answers a default bound to the same
+unknown, and the asymmetry is the point: a query slot that turns out to be
+unnecessary is memory nobody touched, while a loop with no core to run on is a
+thread contending for the core the loop beside it is using.
 */
 @(test)
 test_derive_udp_readers_does_not_guess :: proc(t: ^testing.T) {
@@ -59,15 +59,15 @@ test_unset_udp_readers_are_derived :: proc(t: ^testing.T) {
 		cfg.listeners.udp.readers <= MAX_DERIVED_UDP_READERS,
 		"the derived reader count is outside its own bounds",
 	)
-	// The listener that is off has no readers to derive, and no reader count of
-	// its own is meaningful for it either.
+	// With the UDP listener off the count is derived all the same: it is the
+	// number of event loops, and the stream listeners run on them (#547).
 	off, oerr := load_string(
 		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp: { enabled: false }\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, oerr == nil, "expected a clean load")
-	testing.expect_value(t, off.listeners.udp.readers, 0)
-	testing.expect(t, !off.server.sizing.derived_udp_readers, "a listener that is off derived a reader count")
+	testing.expect_value(t, off.listeners.udp.readers, cfg.listeners.udp.readers)
+	testing.expect(t, off.server.sizing.derived_udp_readers, "the loop count was left underived with UDP off")
 	free_all(context.temp_allocator)
 }
 

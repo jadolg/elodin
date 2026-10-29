@@ -123,35 +123,31 @@ start_validator :: proc(s: ^Server, l: ^Live) -> bool {
 
 	/*
 	A number that leaves no reservation is the bound switched off, and #356 with
-	it: the walks are what hold the workers, so allowing as many walks as there
-	are workers allows a client to hold all of them.
+	it: the walks are what hold the queries in flight, so allowing as many walks
+	as there may be queries in flight allows a client to hold all of them.
 
-	Only for a figure somebody wrote. On a one-worker configuration the
-	derivation has nowhere to reserve from and returns one, and a server warning
-	about the number it chose for itself is a warning nobody can act on or
-	silence.
+	Only for a figure somebody wrote. With a bound of one or two the derivation
+	has nowhere to reserve from and returns one, and a server warning about the
+	number it chose for itself is a warning nobody can act on or silence.
 
 	Said rather than refused or held down, which is this file's rule for a
 	configured number everywhere else: an operator who names a figure gets it. A
 	resolver that will not start, or one quietly running at a number nobody
-	chose, is worse than one that says what it is doing. The comparison is
-	against the handler pool because that is what the bound protects - see
-	`handle_query`'s `shared_worker`.
+	chose, is worse than one that says what it is doing.
 	*/
-	if !l.cfg.server.sizing.derived_chain_walks && l.cfg.dnssec.max_chain_walks >= l.cfg.server.workers {
+	if !l.cfg.server.sizing.derived_chain_walks && l.cfg.dnssec.max_chain_walks >= l.cfg.server.max_pending {
 		logx.warnf(
-			"dnssec: max_chain_walks %d leaves none of the %d workers reserved, so a flood of fresh names can hold them all; see issue #356",
+			"dnssec: max_chain_walks %d leaves none of the %d queries server.max_pending allows in flight reserved, so a flood of fresh names can hold them all; see issue #356",
 			l.cfg.dnssec.max_chain_walks,
-			l.cfg.server.workers,
+			l.cfg.server.max_pending,
 		)
 	}
-	// The same for the other pool, and said the same way. A bound that allows as
-	// many walks as there are connection threads is that bound switched off, and
-	// nothing else in the configuration would tell an operator so.
+	// The same for the connections, and said the same way: a bound that allows as
+	// many walks as there may be connections is that bound switched off.
 	if !l.cfg.server.sizing.derived_connection_walks &&
 	   l.cfg.dnssec.max_connection_walks >= l.cfg.server.max_connections {
 		logx.warnf(
-			"dnssec: max_connection_walks %d leaves none of the %d connection threads reserved, so a flood of fresh names can hold them all; see issue #356",
+			"dnssec: max_connection_walks %d leaves none of the %d connections reserved, so a flood of fresh names can hold them all; see issue #356",
 			l.cfg.dnssec.max_connection_walks,
 			l.cfg.server.max_connections,
 		)
@@ -167,7 +163,7 @@ start_validator :: proc(s: ^Server, l: ^Live) -> bool {
 	is going to work out from docs/dnssec.md while editing a config file.
 
 	Said rather than refused or held down, which is this file's rule for a
-	configured number everywhere else - see the two warnings above. There is no
+	configured number everywhere else - see the warning above. There is no
 	ceiling that is right for every machine, so refusing one would be this
 	server inventing a limit on the operator's own memory, and a resolver that
 	will not start is worse than one that says what it is doing.
@@ -189,8 +185,6 @@ start_validator :: proc(s: ^Server, l: ^Live) -> bool {
 			anchors = anchors,
 			max_nsec3_iterations = l.cfg.dnssec.max_nsec3_iterations,
 			max_chain_walks = l.cfg.dnssec.max_chain_walks,
-			// The connection transports get their own, sized from the threads
-			// they actually have. See `Dnssec_Config.max_connection_walks`.
 			max_connection_walks = l.cfg.dnssec.max_connection_walks,
 			// The one dial on how much memory validation may hold. Zero here
 			// takes the validator's own default, as everywhere else.
@@ -206,7 +200,7 @@ start_validator :: proc(s: ^Server, l: ^Live) -> bool {
 	// default, and a log line naming a number nothing is using is worse than no
 	// line at all.
 	logx.infof(
-		"dnssec: validating against %d trust anchor(s), at most %d chain walks upstream at once on the handler pool and %d on connection threads",
+		"dnssec: validating against %d trust anchor(s), at most %d chain walks upstream at once for queries in flight and %d for queries on connections",
 		len(anchors) if len(anchors) > 0 else len(dnssec.root_anchors()),
 		dnssec.chain_walk_limit(l.validator, .Shared),
 		dnssec.chain_walk_limit(l.validator, .Connection),
@@ -246,21 +240,19 @@ sweep_validator :: proc(s: ^Server) -> int {
 /*
 Fetch a DS or DNSKEY set for the validator.
 
-Runs on the handler thread that is already answering a client, so it borrows
-that request's arena and blocks on the same upstream group. Racing upstreams
-submit to their own pool, so there is no way for this to wait on a worker it is
-occupying.
+Runs on the fiber that is already answering a client, so it borrows that
+request's arena and waits on the same upstream group, parked while it does.
 
-It is still a worker held for a round trip, and a chain walk makes one of these
-per label of a name the client chose. What stops a client choosing how many
-workers are held that way is `dnssec.max_chain_walks`, which
-`config.derive_chain_walks` sets to everything but a reserved quarter of the
-pool: that quarter cannot be inside a walk, so it turns over in a round trip
-rather than in thirty of them, whatever a flood is doing. Free of the walk
-rather than idle - a reserved worker may still be parked on its own upstream
-forward, which is not bounded here. A walk past the bound reads the caches and gives up where it would
-have called this, which the client sees as the SERVFAIL an unreachable authority
-produces.
+It is still a query held in flight for a round trip, and a chain walk makes one
+of these per label of a name the client chose. What stops a client choosing how
+many queries are held that way is `dnssec.max_chain_walks`, which
+`config.derive_chain_walks` sets to everything but a reserved quarter of
+`server.max_pending`: that quarter cannot be inside a walk, so it turns over in a
+round trip rather than in thirty of them, whatever a flood is doing. Free of the
+walk rather than idle - a reserved query may still be waiting on its own upstream
+forward, which is not bounded here. A walk past the bound reads the caches and
+gives up where it would have called this, which the client sees as the SERVFAIL
+an unreachable authority produces.
 
 Not only the flood's own names, and the difference is worth knowing before
 setting the number: a walk needs a DS lookup at every label below the deepest
@@ -268,11 +260,9 @@ zone it has cached, and it cannot call a zone unsigned without one either - so
 while every slot is held, what still answers is what the caches hold, and every
 other cold name is SERVFAIL, signed or not.
 
-Which is why only a query on a pool worker spends a slot. The bound is there to
-keep these workers free; a question answered on its own connection thread is
-bounded by `max_connections` instead and is never turned away. See
-`handle_query`'s `shared_worker`, `Validator.walks`, `dnssec.max_chain_walks`
-and issue #356.
+A query answered on a connection's fiber is held to `dnssec.max_connection_walks`
+instead, a share of `server.max_connections`, so a flood on one population cannot
+spend the other's walks. See `Validator.walks`, `dnssec.Walk_Pool` and issue #356.
 */
 @(private)
 validator_query :: proc(

@@ -262,7 +262,7 @@ test_a_chased_target_that_cannot_be_read_back_is_servfail :: proc(t: ^testing.T)
 		time.now(),
 		&spent,
 		context.temp_allocator,
-		false,
+		.Shared,
 	)
 	resp, derr := dns.decode_message(out, context.temp_allocator)
 	if !testing.expect_value(t, derr, dns.Decode_Error.None) {

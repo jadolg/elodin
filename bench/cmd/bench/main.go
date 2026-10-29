@@ -24,11 +24,15 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 var (
-	binary      = flag.String("binary", "", "elodin binary (default: ../bin/elodin)")
+	binary      = flag.String("binary", "", "elodin binary (default: ../bin/elodin); point it at a thread-model release for before/after rows")
+	unboundBin  = flag.String("unbound", "unbound", "Unbound binary for the comparison rows, looked up on PATH")
+	servers     = flag.String("servers", "elodin,unbound", "servers the comparison sections run against, comma-separated: elodin, unbound")
+	held        = flag.Int("held", 20000, "most connections the connections section holds open; lower it for a thread-model release, which spends a thread on each")
 	only        = flag.String("only", "", "run only scenarios whose name contains this")
 	duration    = flag.Duration("duration", 10*time.Second, "measured length of each run")
 	warmup      = flag.Duration("warmup", 2*time.Second, "unmeasured length before each run")
@@ -55,6 +59,15 @@ func main() {
 		log.Fatalf("bench: %s is not there — run `mise run release` first", *binary)
 	}
 
+	// The held-connection rows open twenty thousand sockets in the generator
+	// and as many in the server. Go raises its own soft limit but hands
+	// children the original one; setting it here is what the children inherit.
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err == nil && lim.Cur < lim.Max {
+		lim.Cur = lim.Max
+		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim)
+	}
+
 	dir := *workdir
 	if dir == "" {
 		dir, err = os.MkdirTemp("", "elodin-bench-*")
@@ -68,6 +81,24 @@ func main() {
 	log.Printf("bench: work dir %s", dir)
 
 	h := &harness{root: root, dir: dir, binary: *binary}
+	for k := range strings.SplitSeq(*servers, ",") {
+		switch k = strings.TrimSpace(k); k {
+		case "elodin":
+			h.kinds = append(h.kinds, k)
+		case "unbound":
+			// A machine without Unbound still gets elodin's rows; the report
+			// names what was left out and why rather than dropping it quietly.
+			if path, err := exec.LookPath(*unboundBin); err == nil {
+				h.unbound = path
+				h.kinds = append(h.kinds, k)
+			} else {
+				h.skipped = append(h.skipped, fmt.Sprintf("Unbound rows are skipped: `%s` is not on PATH.", *unboundBin))
+			}
+		case "":
+		default:
+			log.Fatalf("bench: -servers: unknown server %q", k)
+		}
+	}
 	if err := h.setup(); err != nil {
 		log.Fatalf("bench: %v", err)
 	}
@@ -80,6 +111,9 @@ func main() {
 		report, err = h.runAll(*only)
 	}
 	if err != nil {
+		// log.Fatalf skips the deferred teardown, which would leave the mocks
+		// running and holding their ports.
+		h.teardown()
 		log.Fatalf("bench: %v", err)
 	}
 
@@ -106,11 +140,17 @@ func repoRoot() (string, error) {
 }
 
 type harness struct {
-	root     string
-	dir      string
-	binary   string
+	root    string
+	dir     string
+	binary  string
+	unbound string
+	// kinds are the servers the comparison sections run against, and skipped
+	// says why any asked for are missing.
+	kinds    []string
+	skipped  []string
 	loadgen  string
-	mock     *exec.Cmd
+	mockdns  string
+	mocks    []*exec.Cmd
 	mockAddr string
 }
 
@@ -127,6 +167,8 @@ func (h *harness) setup() error {
 		}
 		if cmd == "loadgen" {
 			h.loadgen = bin
+		} else {
+			h.mockdns = bin
 		}
 	}
 
@@ -134,25 +176,34 @@ func (h *harness) setup() error {
 		return err
 	}
 
+	addr, err := h.startMock(*upstreamRTT)
+	h.mockAddr = addr
+	return err
+}
+
+// startMock starts an upstream answering after delay and returns its address.
+// The harness keeps one at -upstream-rtt for most rows; the rows that vary
+// the delay start their own, and every one lives until teardown.
+func (h *harness) startMock(delay time.Duration) (string, error) {
 	port, err := freePort()
 	if err != nil {
-		return err
+		return "", err
 	}
-	h.mockAddr = fmt.Sprintf("127.0.0.1:%d", port)
-	h.mock = exec.Command(filepath.Join(h.dir, "mockdns"),
-		"-addr", h.mockAddr, "-delay", upstreamRTT.String())
-	h.mock.Stderr = nil
-	if err := h.mock.Start(); err != nil {
-		return fmt.Errorf("starting mockdns: %w", err)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	mock := exec.Command(h.mockdns, "-addr", addr, "-delay", delay.String())
+	mock.Stderr = nil
+	if err := mock.Start(); err != nil {
+		return "", fmt.Errorf("starting mockdns: %w", err)
 	}
+	h.mocks = append(h.mocks, mock)
 	time.Sleep(300 * time.Millisecond)
-	return nil
+	return addr, nil
 }
 
 func (h *harness) teardown() {
-	if h.mock != nil && h.mock.Process != nil {
-		_ = h.mock.Process.Kill()
-		_ = h.mock.Wait()
+	for _, m := range h.mocks {
+		_ = m.Process.Kill()
+		_ = m.Wait()
 	}
 }
 
@@ -221,6 +272,24 @@ func describeMachine() string {
 	}
 	return fmt.Sprintf("Measured on %s (%d logical cores%s%s), %s.",
 		model, runtime.NumCPU(), mem, kernel, version)
+}
+
+// serverLabel names a server in a row by the version it reports, so a run
+// against a thread-model release and one against the event loop produce rows
+// that cannot be mistaken for each other.
+func (h *harness) serverLabel(kind string) string {
+	if kind == "unbound" {
+		// `unbound -V` prints "Version 1.24.2" first, then how it was built.
+		if outb, err := exec.Command(h.unbound, "-V").Output(); err == nil {
+			first, _, _ := strings.Cut(string(outb), "\n")
+			return "Unbound " + strings.TrimSpace(strings.TrimPrefix(first, "Version"))
+		}
+		return "Unbound"
+	}
+	if outb, err := exec.Command(h.binary, "--version").Output(); err == nil {
+		return strings.TrimSpace(string(outb))
+	}
+	return "elodin"
 }
 
 // avgMHz reports the mean clock across all cores right now. A laptop part

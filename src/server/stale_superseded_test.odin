@@ -9,7 +9,6 @@ import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
-import "elodin:pool"
 import "elodin:upstream"
 
 /*
@@ -26,7 +25,7 @@ A failure is the other side: SERVFAIL and REFUSED are what RFC 8767 keeps the
 copy for, so they leave it where it was.
 
 Both roads a refresh takes: detached on the pool, answering after the client was
-lent the copy, and on the client's own thread where there is no pool.
+lent the copy, and on the client's own thread where there is no loop.
 */
 @(private = "file")
 Superseded_Case :: struct {
@@ -154,7 +153,7 @@ run_superseded :: proc(t: ^testing.T, c: Superseded_Case, detached: bool) {
 	cfg.cache.stale_timeout = 100 * time.Millisecond
 	cfg.upstream.servers = blackhole_servers(bound.port)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -172,14 +171,12 @@ run_superseded :: proc(t: ^testing.T, c: Superseded_Case, detached: bool) {
 	defer if s.filters != nil {
 		filter.engine_destroy(s.filters)
 	}
-	workers: ^pool.Pool
+	workers: Test_Loop
 	if detached {
-		workers = pool.make_pool(2)
-		s.handler_pool = workers
+		start_test_loop(&workers)
+		s.loops = workers.loops[:]
 	}
-	defer if workers != nil {
-		pool.destroy(workers)
-	}
+	defer stop_test_loop(&workers)
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -206,9 +203,8 @@ run_superseded :: proc(t: ^testing.T, c: Superseded_Case, detached: bool) {
 	if detached {
 		testing.expectf(t, outcome == .Cached, "%s: the client was not lent the copy (%v)", c.name, outcome)
 		// Joined, not slept on: the store happens on the refresh's way out.
-		pool.destroy(workers)
-		workers = nil
-		s.handler_pool = nil
+		stop_test_loop(&workers)
+		s.loops = nil
 	}
 
 	kb: [cache.KEY_MAX]u8
@@ -320,7 +316,7 @@ run_truncated :: proc(t: ^testing.T, reply: []u8, rebind: bool) {
 	servers := blackhole_servers(bound.port)
 	servers[0].kind = .TCP
 	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}

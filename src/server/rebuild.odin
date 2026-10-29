@@ -5,7 +5,7 @@ import "core:mem/virtual"
 import "core:strings"
 import "core:thread"
 import "elodin:config"
-import "elodin:pool"
+import "elodin:loop"
 
 /*
 A rebuild of the rule sets, on a thread of its own (#416).
@@ -21,7 +21,7 @@ generations it replaces are released as ever, and the rebuild it asks for
 follows.
 
 Like every thread, it starts with the signals `main` acts on blocked, so the
-kernel hands them to a thread that is not downloading; see `pool.spawn`.
+kernel hands them to a thread that is not downloading; see `loop.spawn_thread`.
 */
 Rebuild :: struct {
 	s:       ^Server,
@@ -50,8 +50,8 @@ rebuild_start :: proc(r: ^Rebuild, s: ^Server, network: bool) -> (started: bool)
 	}
 	r.cfg = rebuild_snapshot(live_config(s), virtual.arena_allocator(&r.arena))
 	// The caller's allocators, as the sets and `lists_loaded` built there are
-	// freed by the caller's thread; `pool.spawn` gives it a temp allocator of its own.
-	r.thread = pool.spawn(r, rebuild_thread, context)
+	// freed by the caller's thread; `loop.spawn_thread` gives it a temp allocator of its own.
+	r.thread = loop.spawn_thread(r, rebuild_thread, context)
 	if r.thread == nil {
 		virtual.arena_destroy(&r.arena)
 		r^ = {}

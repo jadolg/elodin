@@ -228,8 +228,8 @@ main :: proc() {
 	section(&r, "udp readers")
 	run_udp_reader_cases(&r)
 
-	section(&r, "running workers")
-	run_running_worker_cases(&r, cert_ok)
+	section(&r, "one loop")
+	run_one_loop_cases(&r, cert_ok)
 
 	section(&r, "cache")
 	run_cache_cases(&r)

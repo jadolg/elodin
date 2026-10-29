@@ -134,6 +134,13 @@ run_metrics_cases :: proc(r: ^Runner) {
 						strings.contains(page, "elodin_upstream_queries_total{upstream="),
 						"the upstream family is missing from the scrape",
 					)
+					// The loops and what is in flight on them (#547). Nothing is
+					// in flight once the four were answered, and the bound is the
+					// one the file derived.
+					check(r, metric_value(page, "elodin_loops") >= 1, "elodin_loops is missing or zero")
+					check(r, strings.contains(page, `elodin_fibers{loop="0"}`), "elodin_fibers is missing from the scrape")
+					check_metric(r, page, "elodin_queries_inflight", 0)
+					check(r, metric_value(page, "elodin_queries_inflight_max") >= 64, "elodin_queries_inflight_max is missing or below the derived floor")
 				}
 
 				// Anything but the configured path is a 404, and anything that

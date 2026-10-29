@@ -92,7 +92,7 @@ wording stays free to change.
 test_a_spawn_failure_names_its_own_cause :: proc(t: ^testing.T) {
 	limit := spawn_failure_words(.Limit_Reached)
 	share := spawn_failure_words(.Prefix_Limit_Reached)
-	failed := spawn_failure_words(.Thread_Failed)
+	failed := spawn_failure_words(.Spawn_Failed)
 
 	testing.expect(
 		t,
@@ -126,16 +126,16 @@ test_a_spawn_failure_names_its_own_cause :: proc(t: ^testing.T) {
 	testing.expect(
 		t,
 		strings.contains(failed.line, "will not help"),
-		"a refused thread was blamed on the connection limit",
+		"a refused stack was blamed on the connection limit",
 	)
 	testing.expect(
 		t,
-		strings.contains(failed.hint, "RLIMIT_NPROC"),
-		"a refused thread does not say where the actual limit is",
+		strings.contains(failed.hint, "memory.max"),
+		"a refused stack does not say where the actual limit is",
 	)
 	// Each counts into the field it names, and the stats line spells them this way.
 	testing.expect(t, strings.contains(limit.hint, "conn_refused="), "the limit's line names the wrong counter")
-	testing.expect(t, strings.contains(failed.hint, "conn_failed="), "the thread failure's line names the wrong counter")
+	testing.expect(t, strings.contains(failed.hint, "conn_failed="), "the stack failure's line names the wrong counter")
 
 	/*
 	And a separate flag each.
@@ -169,7 +169,7 @@ test_a_spawn_failure_names_the_limit_that_refused_it :: proc(t: ^testing.T) {
 	testing.expect_value(t, spawn_failure_limit(.Prefix_Limit_Reached, &cm), 256)
 	// A thread the OS would not start happened below the table, so the table is
 	// the figure that says "below": see the line it prints.
-	testing.expect_value(t, spawn_failure_limit(.Thread_Failed, &cm), 512)
+	testing.expect_value(t, spawn_failure_limit(.Spawn_Failed, &cm), 512)
 }
 
 /*

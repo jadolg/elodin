@@ -302,7 +302,7 @@ exchange_with_cookie :: proc(
 
 	On the arena paths freeing it is a no-op — the per-request scratch arena
 	reclaims it on `free_all` regardless. But on the race path `allocator` is the
-	process heap (a race worker can outlive the caller's arena), and there
+	process heap (a racer can outlive the caller's arena), and there
 	nothing else ever frees it: left behind, it leaks one buffer per forwarded
 	query for the life of the process. Deleted before `return`, not on a defer:
 	`response` is a named result, so `return stripped` would rebind it and a

@@ -55,11 +55,10 @@ listeners:
   tcp: %s
 server:
   # Pinned rather than derived from whatever machine the suite is running on:
-  # the flood below has to fit inside max_pending, which is workers * 8, for
-  # the unlimited run to be the baseline it claims to be. Otherwise the case
-  # measures this machine's shed threshold instead of the limiter.
-  workers: 32
-  upstream_workers: 8
+  # the flood below has to fit inside max_pending for the unlimited run to be
+  # the baseline it claims to be. Otherwise the case measures this machine's
+  # shed threshold instead of the limiter.
+  max_pending: 256
   rate_limit: {{ %s }}
 upstream:
   timeout: 3s

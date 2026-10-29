@@ -136,6 +136,7 @@ func (h *harness) loadOnce(s *server, o loadOpts) (Result, sample, error) {
 		"-qname", o.qname,
 		"-duration", o.duration.String(),
 		"-warmup", warmup.String(),
+		"-ca", s.caPath,
 	}
 	if o.rate > 0 {
 		args = append(args, "-rate", strconv.Itoa(o.rate))
@@ -191,7 +192,11 @@ func (h *harness) runAll(filter string) (string, error) {
 		{"handshake", h.handshakes},
 		{"memory", h.memory},
 		{"shedding", h.shedding},
-		{"sizing", h.sizing},
+		{"loops", h.loops},
+		{"misses", h.misses},
+		{"connections", h.connections},
+		{"inflight", h.inflight},
+		{"latency", h.latency},
 		{"logging", h.loggingCost},
 	}
 
@@ -213,6 +218,16 @@ func (h *harness) runAll(filter string) (string, error) {
 	fmt.Fprintf(&sb, "Mock upstream held at %s. DNSSEC off. Each run %s measured after %s of warmup, "+
 		"median of %d, %s idle between runs.\n\n",
 		*upstreamRTT, *duration, *warmup, *repeat, *cooldown)
+	if len(h.kinds) > 0 {
+		names := make([]string, len(h.kinds))
+		for i, k := range h.kinds {
+			names[i] = h.serverLabel(k)
+		}
+		fmt.Fprintf(&sb, "Sections that compare servers ran against: %s.\n\n", strings.Join(names, ", "))
+	}
+	for _, sk := range h.skipped {
+		fmt.Fprintf(&sb, "%s\n\n", sk)
+	}
 	fmt.Fprintf(&sb, "Cores were averaging %.0f MHz when the run finished. This is a 15 W laptop part "+
 		"that cannot hold its boost clock through the whole matrix, so treat the absolute figures as "+
 		"the shape of the thing rather than a specification.\n\n", avgMHz())
@@ -272,9 +287,9 @@ func (h *harness) workloads() (section, error) {
 	}
 	row(&sb, "light mixed load (20 in flight)", rl, sml.PeakRSS)
 
-	// Held at the worker count: this row is the sustained rate, and offering
-	// more than the workers can carry would report queueing delay as if it were
-	// the cost of a miss.
+	// 128 in flight: a steady miss load well inside what the server carries,
+	// so the row is the cost of a miss rather than of queueing. The misses
+	// section is the one that pushes misses to the server's ceiling.
 	rm, smm, err := h.load(s, loadOpts{transport: "udp", clients: 128, qmode: "unique"})
 	if err != nil {
 		return section{}, err
@@ -287,51 +302,258 @@ func (h *harness) workloads() (section, error) {
 	return section{title: "Workloads", body: sb.String()}, nil
 }
 
-// sizing is what the pool's width costs cache hits, with and without the
-// running limit, on a two-core server: the case the derived sizing is for,
-// since a pool sized for misses on two cores is far wider than the cores.
-func (h *harness) sizing() (section, error) {
+// loops is what the number of event loops does to misses and hits on a
+// two-core server: the small machine the derived figure has to suit, and the
+// case where one loop more than the cores is contention rather than help.
+func (h *harness) loops() (section, error) {
+	const title = "Event loops on two cores"
 	if runtime.NumCPU() < 4 {
-		return section{title: "Pool width and the running limit", body: "Skipped: needs four CPUs, two for the server and two for the generator.\n"}, nil
+		return section{title: title, body: "Skipped: needs four CPUs, two for the server and two for the generator.\n"}, nil
 	}
 	if _, err := exec.LookPath("taskset"); err != nil {
-		return section{title: "Pool width and the running limit", body: "Skipped: needs taskset to pin the server and the generator.\n"}, nil
+		return section{title: title, body: "Skipped: needs taskset to pin the server and the generator.\n"}, nil
 	}
+	const clients = 1000
 	var sb strings.Builder
-	sb.WriteString("Server pinned to CPUs 0-1, generator to 2-3, 128 clients over UDP, `max_pending` 1024 throughout.\n\n")
-	sb.WriteString("| workers / running_workers | cache misses | miss p99 | cache hits | hit p99 |\n|---|---|---|---|---|\n")
-	rows := []struct {
-		label            string
-		workers, running int
-	}{
-		{"16 / 16 (no limit)", 16, 16},
-		{"128 / 128 (no limit)", 128, 128},
-		{"128 / derived (4)", 128, 0},
+	fmt.Fprintf(&sb, "Server pinned to CPUs 0-1, generator to 2-3, %s clients over UDP, `max_pending` 4096. "+
+		"elodin's loops are `listeners.udp.readers`; Unbound's are `num-threads`. "+
+		"A thread-model release takes `readers` as its UDP reader count only.\n\n", thousands(clients))
+	sb.WriteString("| server | loops | cache misses | miss p99 | cache hits | hit p99 |\n|---|---|---|---|---|---|\n")
+	for _, kind := range h.kinds {
+		// Past the two cores, but within the 64 readers elodin's loader accepts.
+		for _, loops := range []int{1, 2, min(runtime.NumCPU(), 64)} {
+			s, err := h.start(serverOpts{
+				name: "loops", kind: kind, cache: true, loops: loops, maxPending: 4096, cpus: "0-1",
+			})
+			if err != nil {
+				return section{}, err
+			}
+			miss, _, err := h.load(s, loadOpts{transport: "udp", clients: clients, qmode: "unique", cpus: "2-3"})
+			if err == nil {
+				err = expectRcode(miss, "noerror")
+			}
+			var hit Result
+			if err == nil {
+				hit, _, err = h.load(s, loadOpts{transport: "udp", clients: clients, cpus: "2-3"})
+			}
+			s.stop()
+			if err != nil {
+				return section{}, fmt.Errorf("%s at %d loops: %w", kind, loops, err)
+			}
+			fmt.Fprintf(&sb, "| %s | %d | %s qps | %s | %s qps | %s |\n", h.serverLabel(kind), loops,
+				thousands(miss.QPS), ms(miss.P99ms), thousands(hit.QPS), ms(hit.P99ms))
+		}
 	}
-	for _, rw := range rows {
-		s, err := h.start(serverOpts{
-			name: "sizing", cache: true, workers: rw.workers, runningWorkers: rw.running,
-			maxPending: 1024, cpus: "0-1",
-		})
+	return section{title: title, body: sb.String()}, nil
+}
+
+// misses is the cache-miss ceiling at two upstream delays. Under the thread
+// model a miss held a worker for the whole round trip, so the ceiling was the
+// worker count over the delay; on the event loop a waiting miss holds no
+// thread, and the ceiling is the CPU or max_pending over the delay.
+func (h *harness) misses() (section, error) {
+	// Enough clients that the generator is not the bound: each keeps one
+	// question outstanding, so they can ask at most clients/RTT, and that
+	// ceiling is printed beside each row so a row near it reads as the
+	// generator's limit rather than the server's.
+	const clients = 2000
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s clients over UDP, every name unique, `max_pending` 4096.\n\n", thousands(clients))
+	sb.WriteString("| server | upstream delay | cache misses | p50 | p99 | timed out | generator ceiling |\n|---|---|---|---|---|---|---|\n")
+	for _, rtt := range []time.Duration{20 * time.Millisecond, 5 * time.Millisecond} {
+		mock, err := h.startMock(rtt)
 		if err != nil {
 			return section{}, err
 		}
-		miss, _, err := h.load(s, loadOpts{transport: "udp", clients: 128, qmode: "unique", cpus: "2-3"})
-		if err == nil {
-			err = expectRcode(miss, "noerror")
+		for _, kind := range h.kinds {
+			s, err := h.start(serverOpts{
+				name: "misses", kind: kind, cache: true, maxPending: 4096, upstreamAddr: mock,
+			})
+			if err != nil {
+				return section{}, err
+			}
+			r, _, err := h.load(s, loadOpts{transport: "udp", clients: clients, qmode: "unique"})
+			s.stop()
+			if err == nil {
+				err = expectRcode(r, "noerror")
+			}
+			if err != nil {
+				return section{}, fmt.Errorf("%s at %s: %w", kind, rtt, err)
+			}
+			fmt.Fprintf(&sb, "| %s | %s | %s qps | %s | %s | %s | %s qps |\n", h.serverLabel(kind), rtt,
+				thousands(r.QPS), ms(r.P50ms), ms(r.P99ms), thousands(float64(r.Errors)),
+				thousands(float64(clients)/rtt.Seconds()))
 		}
-		var hit Result
-		if err == nil {
-			hit, _, err = h.load(s, loadOpts{transport: "udp", clients: 128, cpus: "2-3"})
+	}
+	return section{title: "Cache misses against the upstream delay", body: sb.String()}, nil
+}
+
+// unboundHeld is the most connections Unbound is asked to hold. It allocates a
+// 64 KiB buffer for every TCP handler it is configured with, and the rows give
+// it three times its even share per thread, so 20,000 is several GiB before a
+// connection is opened.
+const unboundHeld = 5000
+
+// connections is what an idle connection costs the server: N clients connect,
+// ask one question each, and stay connected while the server's resident memory
+// is read. The thread model spent a thread on each; the event loop spends a
+// fiber's stack while a query runs and its buffers in between.
+func (h *harness) connections() (section, error) {
+	var sb strings.Builder
+	sb.WriteString("Each client asks one cached name and then holds its connection idle. The figure is " +
+		"(RSS with every connection held − RSS before the first) ÷ N. `max_connections` and its per-prefix " +
+		"share are N + 64 (Unbound: `incoming-num-tcp`), and the idle timeout 120 s.\n\n")
+	sb.WriteString("| server | transport | connections | answered | RSS before | RSS held | per idle connection |\n|---|---|---|---|---|---|---|\n")
+	for _, kind := range h.kinds {
+		for _, t := range []string{"tcp", "dot", "doh2"} {
+			for _, n := range []int{1000, 5000, 20000} {
+				if n > *held || (kind == "unbound" && n > unboundHeld) {
+					continue
+				}
+				s, err := h.start(serverOpts{
+					name: "conns", kind: kind, cache: true,
+					maxConnections: n + 64, clientTimeout: 120 * time.Second,
+				})
+				if err != nil {
+					return section{}, err
+				}
+				time.Sleep(time.Second)
+				before := s.rss()
+				r, held, _, err := h.once(s, t, n, "fixed")
+				s.stop()
+				if err != nil {
+					return section{}, fmt.Errorf("%s %s at %d: %w", kind, t, n, err)
+				}
+				fmt.Fprintf(&sb, "| %s | %s | %s | %s | %s | %s | %s |\n", h.serverLabel(kind), label(t),
+					thousands(float64(n)), answeredOf(r, n), mib(before), mib(held), perItem(held-before, n))
+			}
+		}
+	}
+	return section{title: "Memory per idle connection", body: sb.String()}, nil
+}
+
+// inflight is what a query waiting on its upstream costs the server. The mock
+// answers after three seconds, so every question the generator asks is in
+// flight at once, and the peak resident memory over that window, less the
+// idle figure, is spread over them.
+func (h *harness) inflight() (section, error) {
+	const delay = 3 * time.Second
+	mock, err := h.startMock(delay)
+	if err != nil {
+		return section{}, err
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Upstream answering after %s, every name unique, cache off, `max_pending` N + 256 "+
+		"(Unbound: `num-queries-per-thread` 4096). The figure is (peak RSS − idle RSS) ÷ N.\n\n", delay)
+	sb.WriteString("| server | in flight | answered | idle RSS | peak RSS | per query in flight |\n|---|---|---|---|---|---|\n")
+	for _, kind := range h.kinds {
+		for _, n := range []int{1000, 3000} {
+			s, err := h.start(serverOpts{
+				name: "inflight", kind: kind, maxPending: n + 256, upstreamAddr: mock,
+			})
+			if err != nil {
+				return section{}, err
+			}
+			time.Sleep(time.Second)
+			idle := s.rss()
+			r, _, peak, err := h.once(s, "udp", n, "unique")
+			s.stop()
+			if err != nil {
+				return section{}, fmt.Errorf("%s at %d: %w", kind, n, err)
+			}
+			fmt.Fprintf(&sb, "| %s | %s | %s | %s | %s | %s |\n", h.serverLabel(kind),
+				thousands(float64(n)), answeredOf(r, n), mib(idle), mib(peak), perItem(peak-idle, n))
+		}
+	}
+	sb.WriteString("\nA thread-model release carries only as many as it has workers at once and queues the " +
+		"rest, so behind a three-second upstream most of its queries outlive the generator's five-second wait.\n")
+	return section{title: "Memory per query in flight", body: sb.String()}, nil
+}
+
+// latency is the cache-hit latency a light, steady load sees, over the two
+// transports nearly every client uses.
+func (h *harness) latency() (section, error) {
+	var sb strings.Builder
+	sb.WriteString("100 clients, each holding its connection, every answer from the cache.\n\n")
+	sb.WriteString("| server | transport | throughput | p50 | p99 |\n|---|---|---|---|---|\n")
+	for _, kind := range h.kinds {
+		s, err := h.start(serverOpts{name: "latency", kind: kind, cache: true})
+		if err != nil {
+			return section{}, err
+		}
+		for _, t := range []string{"udp", "tcp"} {
+			r, _, err := h.load(s, loadOpts{transport: t, clients: 100})
+			if err == nil {
+				err = expectRcode(r, "noerror")
+			}
+			if err != nil {
+				s.stop()
+				return section{}, fmt.Errorf("%s %s: %w", kind, t, err)
+			}
+			fmt.Fprintf(&sb, "| %s | %s | %s qps | %s | %s |\n",
+				h.serverLabel(kind), label(t), thousands(r.QPS), ms(r.P50ms), ms(r.P99ms))
 		}
 		s.stop()
-		if err != nil {
-			return section{}, fmt.Errorf("%s: %w", rw.label, err)
-		}
-		fmt.Fprintf(&sb, "| %s | %s qps | %s | %s qps | %s |\n",
-			rw.label, thousands(miss.QPS), ms(miss.P99ms), thousands(hit.QPS), ms(hit.P99ms))
 	}
-	return section{title: "Pool width and the running limit", body: sb.String()}, nil
+	return section{title: "Cache-hit latency", body: sb.String()}, nil
+}
+
+// once runs the generator's one-question mode against s and reads the server
+// while every connection is still held: the resident memory a second after
+// the last answer, and the peak while the questions were outstanding.
+func (h *harness) once(s *server, transport string, n int, qmode string) (Result, int64, int64, error) {
+	cmd := exec.Command(h.loadgen,
+		"-server", s.addrFor(transport), "-transport", transport,
+		"-clients", strconv.Itoa(n), "-qmode", qmode, "-once", "-ca", s.caPath)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return Result{}, 0, 0, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return Result{}, 0, 0, err
+	}
+	cmd.Stderr = os.Stderr
+	sampler := procstat.NewSampler(s.pid)
+	sampler.Start()
+	if err := cmd.Start(); err != nil {
+		sampler.Stop()
+		return Result{}, 0, 0, err
+	}
+	var r Result
+	err = json.NewDecoder(stdout).Decode(&r)
+	var held int64
+	if err == nil {
+		// Let whatever the last answers left behind be freed or settle.
+		time.Sleep(time.Second)
+		held = s.rss()
+	}
+	sampler.Stop()
+	// Closing stdin is the generator's signal to let the connections go.
+	stdin.Close()
+	if werr := cmd.Wait(); err == nil && werr != nil {
+		err = fmt.Errorf("loadgen -once: %w", werr)
+	}
+	return r, held, sampler.PeakRSS, err
+}
+
+// answeredOf marks a row where not every client was answered, so a server
+// that refused or dropped some cannot pass for one that held them all.
+func answeredOf(r Result, n int) string {
+	if r.Answered == int64(n) {
+		return "all"
+	}
+	return fmt.Sprintf("**%s of %s**", thousands(float64(r.Answered)), thousands(float64(n)))
+}
+
+// perItem is a memory difference spread over n things, in the unit that
+// reads best for it.
+func perItem(delta int64, n int) string {
+	per := float64(delta) / float64(n)
+	if per < 10*1024 {
+		return fmt.Sprintf("%.1f KB", per/1024)
+	}
+	return fmt.Sprintf("%.0f KB", per/1024)
 }
 
 // transports is the second table of a run: every listener, each client holding
@@ -395,22 +617,28 @@ func (h *harness) h1VersusH2() (section, error) {
 
 // cpuPerQuery measures the server process alone while it is saturated.
 func (h *harness) cpuPerQuery() (section, error) {
-	s, err := h.start(serverOpts{name: "cpu", cache: true})
-	if err != nil {
-		return section{}, err
-	}
-	defer s.stop()
-
 	var sb strings.Builder
-	sb.WriteString("| transport | CPU per query | at 5,000 qps |\n|---|---|---|\n")
-	for _, t := range []string{"tcp", "udp", "dot", "doh1", "doh2"} {
-		r, sm, err := h.load(s, loadOpts{transport: t, clients: 100})
+	sb.WriteString("| server | transport | CPU per query | at 5,000 qps |\n|---|---|---|---|\n")
+	for _, kind := range h.kinds {
+		s, err := h.start(serverOpts{name: "cpu", kind: kind, cache: true})
 		if err != nil {
 			return section{}, err
 		}
-		per := sm.CPUPerQuery(r.Answered)
-		cores := per.Seconds() * 5000
-		fmt.Fprintf(&sb, "| %s | %d µs | %.2f core |\n", label(t), per.Microseconds(), cores)
+		for _, t := range []string{"tcp", "udp", "dot", "doh1", "doh2"} {
+			if kind == "unbound" && t == "doh1" {
+				fmt.Fprintf(&sb, "| %s | %s | — (serves DoH over HTTP/2 only) | |\n", h.serverLabel(kind), label(t))
+				continue
+			}
+			r, sm, err := h.load(s, loadOpts{transport: t, clients: 100})
+			if err != nil {
+				s.stop()
+				return section{}, fmt.Errorf("%s %s: %w", kind, t, err)
+			}
+			per := sm.CPUPerQuery(r.Answered)
+			cores := per.Seconds() * 5000
+			fmt.Fprintf(&sb, "| %s | %s | %d µs | %.2f core |\n", h.serverLabel(kind), label(t), per.Microseconds(), cores)
+		}
+		s.stop()
 	}
 	return section{title: "CPU per query", body: sb.String()}, nil
 }
@@ -449,21 +677,6 @@ func (h *harness) memory() (section, error) {
 		return section{}, err
 	}
 	fmt.Fprintf(&sb, "| idle, no lists | %s |\n", mib(idle))
-
-	// Worker arenas: the only difference between these two is the worker count,
-	// and the arena is allocated per worker on first use, so they have to be
-	// put to work before the difference shows.
-	small, err := h.loadedRSS(serverOpts{name: "mem-w8", cache: true, workers: 8})
-	if err != nil {
-		return section{}, err
-	}
-	big, err := h.loadedRSS(serverOpts{name: "mem-w128", cache: true, workers: 128})
-	if err != nil {
-		return section{}, err
-	}
-	perWorker := float64(big-small) / 120
-	fmt.Fprintf(&sb, "| worker scratch arenas | %.2f MB per worker (%s at 128) |\n",
-		perWorker/(1<<20), mib(int64(perWorker*128)))
 
 	const rules = listRules
 	withList, err := h.idleRSS(serverOpts{name: "mem-lists", cache: true, blockRules: rules})
@@ -510,19 +723,6 @@ func (h *harness) idleRSS(o serverOpts) (int64, error) {
 	return s.rss(), nil
 }
 
-func (h *harness) loadedRSS(o serverOpts) (int64, error) {
-	s, err := h.start(o)
-	if err != nil {
-		return 0, err
-	}
-	defer s.stop()
-	_, sm, err := h.load(s, loadOpts{transport: "udp", clients: 100, duration: 5 * time.Second})
-	if err != nil {
-		return 0, err
-	}
-	return sm.PeakRSS, nil
-}
-
 type cacheFill struct {
 	entries int64
 	delta   int64
@@ -552,27 +752,21 @@ func (h *harness) cacheFilledRSS(o serverOpts) (cacheFill, error) {
 
 // shedding is what happens past capacity: the server drops rather than queues.
 func (h *harness) shedding() (section, error) {
-	// The offered load has to exceed what the workers can carry by enough that
-	// the queue, not the client count, is what bounds it: 6000 queries
-	// outstanding against 128 workers is about fifty times the concurrency the
-	// pool has, so an unbounded queue has room to become the latency.
+	// The offered load has to exceed max_pending by enough that the bound, not
+	// the client count, decides what is served: 6000 questions outstanding
+	// against 1024 is six times what the server will hold, and against 8192 it
+	// all fits, so the second row is the same load with nothing shed.
 	const clients = 6000
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Cache misses from %s clients at once, against a worker pool that can carry about %.0f/s.\n\n",
-		thousands(clients), float64(128)/upstreamRTT.Seconds())
+	fmt.Fprintf(&sb, "Cache misses from %s clients at once, against an upstream answering after %s. "+
+		"With N queries in flight at that delay, nothing can be served faster than N ÷ delay.\n\n",
+		thousands(clients), *upstreamRTT)
 	sb.WriteString("| max_pending | served | p50 | p99 | dropped |\n|---|---|---|---|---|\n")
 
-	for _, mp := range []struct {
-		name  string
-		label string
-		value int
-	}{
-		{"default", "default (workers × 8)", 0},
-		{"unbounded", "effectively unbounded", 1000000},
-	} {
+	for _, mp := range []int{1024, 8192} {
 		s, err := h.start(serverOpts{
-			name: "shed-" + mp.name, cache: true, maxPending: mp.value,
+			name: fmt.Sprintf("shed-%d", mp), cache: true, maxPending: mp,
 		})
 		if err != nil {
 			return section{}, err
@@ -584,10 +778,12 @@ func (h *harness) shedding() (section, error) {
 		if err != nil {
 			return section{}, err
 		}
-		fmt.Fprintf(&sb, "| %s | %s qps | %s | %s | %s |\n",
-			mp.label, thousands(r.QPS), ms(r.P50ms), ms(r.P99ms), thousands(float64(r.Errors)))
+		fmt.Fprintf(&sb, "| %s (at most %s qps) | %s qps | %s | %s | %s |\n",
+			thousands(float64(mp)), thousands(float64(mp)/upstreamRTT.Seconds()),
+			thousands(r.QPS), ms(r.P50ms), ms(r.P99ms), thousands(float64(r.Errors)))
 	}
-	sb.WriteString("\nA dropped query gets no answer at all, so it shows up as a client timeout rather than an error code.\n")
+	sb.WriteString("\nA dropped query gets no answer at all, so it shows up as a client timeout rather than an error code. " +
+		"A thread-model release queues what its workers cannot carry, so for one of those the second row is the unbounded queue.\n")
 	return section{title: "Past capacity", body: sb.String()}, nil
 }
 

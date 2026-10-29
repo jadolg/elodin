@@ -2,18 +2,24 @@ package upstream
 
 import "core:c"
 import "core:net"
+import "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
+import "elodin:loop"
 import "elodin:tlsx"
 
 /*
 Connect with a deadline.
 
 core:net's dial has no timeout, and SO_SNDTIMEO does not apply to connect(), so
-a black-holed upstream would tie up a worker for the kernel's full SYN retry
+a black-holed upstream would tie up the query for the kernel's full SYN retry
 budget (over two minutes on Linux). That defeats the point of having fallback
-upstreams, so the connect is done by hand: non-blocking connect, poll, then back
-to blocking mode for the rest of the session.
+upstreams, so the connect is done by hand: non-blocking connect, then a wait for
+the socket to become writable - a park on a loop, `poll` anywhere else.
+
+The socket stays non-blocking for the rest of the session. Every read and write
+on it goes through `loop`'s socket calls or `tlsx`, both of which wait where a
+blocking socket would have, for as long as its SO_RCVTIMEO or SO_SNDTIMEO says.
 */
 dial_tcp_timeout :: proc(endpoint: net.Endpoint, timeout: time.Duration) -> (socket: net.TCP_Socket, err: Error) {
 	family: posix.AF
@@ -52,21 +58,14 @@ dial_tcp_timeout :: proc(endpoint: net.Endpoint, timeout: time.Duration) -> (soc
 		if posix.errno() != .EINPROGRESS {
 			return 0, .Dial_Failed
 		}
-		fds := [1]posix.pollfd{{fd = fd, events = {.OUT}}}
-		ms := c.int(timeout / time.Millisecond)
-		if ms <= 0 {
-			ms = 1
-		}
-		n := posix.poll(raw_data(fds[:]), 1, ms)
-		if n == 0 {
+		deadline := time.tick_add(time.tick_now(), max(timeout, time.Millisecond))
+		switch loop.wait_fd(linux.Fd(fd), {.Out}, deadline) {
+		case .Ready:
+		case .Timeout, .Cancelled:
 			return 0, .Timeout
-		}
-		if n < 0 {
+		case .Failed:
 			return 0, .Dial_Failed
 		}
-
-		// poll() reporting writability does not mean the connect succeeded;
-		// SO_ERROR carries the verdict.
 		so_err: c.int
 		so_len := posix.socklen_t(size_of(so_err))
 		if posix.getsockopt(fd, posix.SOL_SOCKET, .ERROR, &so_err, &so_len) != .OK {
@@ -82,10 +81,6 @@ dial_tcp_timeout :: proc(endpoint: net.Endpoint, timeout: time.Duration) -> (soc
 			}
 			return 0, .Dial_Failed
 		}
-	}
-
-	if posix.fcntl(fd, .SETFL, flags) < 0 {
-		return 0, .Dial_Failed
 	}
 
 	ok = true

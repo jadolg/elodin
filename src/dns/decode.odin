@@ -1,6 +1,8 @@
 package dns
 
 import "core:mem"
+import "core:sync"
+import "elodin:loop"
 
 Decode_Error :: enum u8 {
 	None,
@@ -109,19 +111,152 @@ A DoH response is read once more, for its `Cache-Control` (`server.doh_max_age`)
 and one this budget can no longer afford goes out with `max-age=0` rather than
 refused.
 
-Against the pool rather than against one query is where the figure is worth
-checking: `config` derives 16 to 128 workers and charges each
-`WORKER_MEMORY_BYTES` of ordinary use, so a flood holding every worker inside a
-request of this shape is 128 MB on the small box the issue was filed from, where
-the three lines above were gigabytes. Lowering this is the lever if that is
-still too much; what it costs is the headroom above, and what it must not go
-under is the answer path's three readings.
+Against the server rather than against one query is where the figure is worth
+checking, and that is what `REQUEST_ORDINARY_DECODE` and the heavy slots below are
+for: a request may hold this much only while it holds one of the few slots the
+process has, so what a flood can hold is the slots at this figure and every other
+query in flight at the ordinary allowance - on a 1 GiB box, four of its 409
+queries at this figure and the rest at the allowance, 133 MiB, about the eighth
+of memory `config.QUERY_MEMORY_SHARE` gives them. Lowering this is the lever if that is still too
+much; what it costs is the headroom above, and what it must not go under is the
+answer path's three readings.
 
 A reading passed no counter keeps `NAME_BUDGET` alone and nothing else, which is
 every caller outside a request: the fuzz target, the bootstrap resolver, the
 tests.
 */
 REQUEST_DECODE_BUDGET :: 8 * 1024 * 1024
+
+/*
+What every request may take without asking, and how many may take more at once.
+
+`REQUEST_DECODE_BUDGET` is a ceiling per request, and a ceiling per request is
+only a ceiling on memory when the requests are few. The queries in flight are
+counted by `server.max_pending` - thousands on a large box - and thousands of
+requests each allowed eight megabytes is a ceiling on nothing. So the budget is
+split where the amplification is.
+
+Every request may take `REQUEST_ORDINARY_DECODE` freely. Ordinary traffic lives
+well inside it: a reply read the three times the answer path reads one is a few
+kilobytes, and a chain walk's DNSKEY sets a few dozen more. A request that goes
+past it - a full-length answer built to expand, or the longest honest chain -
+takes one of `heavy` slots, process-wide, and holds it until it ends
+(`request_release`); with every slot taken, the charge that would have crossed
+is refused as the budget refuses one, and the reading fails the same way. So
+what an attacker steering answers can hold is `heavy` requests at the whole
+budget and every other request at the allowance - both flat, both counted
+against memory where they are derived (`config.derive_heavy_decodes`,
+`config.derive_max_pending`) - rather than every request at the whole budget.
+
+256 KiB, which is a fifth of the heaviest honest request measured above: that
+one takes a slot, and an ordinary query never comes near one.
+*/
+REQUEST_ORDINARY_DECODE :: 256 * 1024
+
+/*
+How much a request may decode between turns of its loop.
+
+Decoding is CPU that never waits, and a fiber is never preempted: a reading of
+an answer built to expand - thousands of records whose names are two-byte
+pointers to a long one - holds its loop for the whole of it, every other query
+on the loop behind it, cache hits included. Measured here at 0.44 µs per KiB
+charged (release build), one reading of such an answer is ~280 µs at
+`NAME_BUDGET` and the several readings one answer gets came to ~2 ms. This many
+bytes is ~28 µs, against ~1 µs a turn costs, the same order as DNSSEC's
+`VERIFICATIONS_PER_TURN`. An ordinary answer decodes a few KiB and never gets
+here.
+*/
+DECODE_BYTES_PER_TURN :: 64 * 1024
+
+/*
+Requests past `REQUEST_ORDINARY_DECODE` that may be in flight at once, and how
+many are; a `limit` of zero is none, which is every process that never sets one
+- the tests, the fuzz targets. The process keeps one of these (`heavy`), set
+once at startup by `set_heavy_decodes`; a test keeps its own.
+*/
+Heavy_Slots :: struct {
+	limit: int,
+	held:  int,
+}
+
+@(private)
+heavy: Heavy_Slots
+
+/*
+How many requests may decode past `REQUEST_ORDINARY_DECODE` at once. Set before
+any request runs; zero lifts the limit.
+*/
+set_heavy_decodes :: proc(n: int) {
+	sync.atomic_store(&heavy.limit, max(n, 0))
+}
+
+/*
+Charge `n` bytes to a request's running total, `spent` being nil for a reading
+nobody counts. False when the request may not have them: past the whole budget,
+or crossing the ordinary allowance with no slot to be had - in which case the
+charge is not made, so the total stays at or under the allowance and still says
+truthfully that the request holds no slot.
+
+The one place a request's total moves, so the decoder and the validator's
+scratch refuse on the same byte and every slot taken is one `request_release`
+gives back.
+*/
+request_charge :: proc(spent: ^int, n: int) -> bool {
+	return charge_against(&heavy, spent, n)
+}
+
+/*
+The end of a request: give back its slot if it took one. Called by whatever owns
+the total, once, when nothing will read on its behalf again.
+*/
+request_release :: proc(spent: ^int) {
+	release_against(&heavy, spent)
+}
+
+// Requests holding a heavy slot now, and how many may, for the metrics endpoint.
+heavy_decodes :: proc() -> (held: int, limit: int) {
+	return sync.atomic_load(&heavy.held), sync.atomic_load(&heavy.limit)
+}
+
+@(private)
+charge_against :: proc(h: ^Heavy_Slots, spent: ^int, n: int) -> bool {
+	if spent == nil {
+		return true
+	}
+	before := spent^
+	after := before + n
+	if before <= REQUEST_ORDINARY_DECODE && after > REQUEST_ORDINARY_DECODE && !take_heavy(h) {
+		return false
+	}
+	spent^ = after
+	// Crossing a step is a turn for the rest of the loop; see
+	// `DECODE_BYTES_PER_TURN`. Off a fiber it does nothing.
+	if after / DECODE_BYTES_PER_TURN != before / DECODE_BYTES_PER_TURN {
+		loop.yield()
+	}
+	return after <= REQUEST_DECODE_BUDGET
+}
+
+@(private)
+release_against :: proc(h: ^Heavy_Slots, spent: ^int) {
+	if spent != nil && spent^ > REQUEST_ORDINARY_DECODE {
+		sync.atomic_sub(&h.held, 1)
+	}
+}
+
+@(private)
+take_heavy :: proc(h: ^Heavy_Slots) -> bool {
+	limit := sync.atomic_load(&h.limit)
+	for {
+		held := sync.atomic_load(&h.held)
+		if limit > 0 && held >= limit {
+			return false
+		}
+		if _, ok := sync.atomic_compare_exchange_weak(&h.held, held, held + 1); ok {
+			return true
+		}
+	}
+}
 
 @(private)
 Reader :: struct {
@@ -153,8 +288,8 @@ charged ahead of itself, because that one is known before it is taken.
 @(private)
 charge_name :: proc(r: ^Reader, n: int) -> Decode_Error {
 	r.name_bytes += n
-	if r.spent != nil {
-		r.spent^ += n
+	if !request_charge(r.spent, n) {
+		return .Request_Budget
 	}
 	return budget_spent(r)
 }
@@ -202,11 +337,7 @@ because names are not. What was unbounded is the number of readings; see
 */
 @(private)
 charge_bytes :: proc(r: ^Reader, n: int) -> Decode_Error {
-	if r.spent == nil {
-		return .None
-	}
-	r.spent^ += n
-	return .Request_Budget if over_request_budget(r.spent) else .None
+	return .None if request_charge(r.spent, n) else .Request_Budget
 }
 
 @(private)

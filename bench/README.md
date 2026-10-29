@@ -31,22 +31,23 @@ Throughput figures are worth nothing without the conditions attached, so the
 harness owns all of them rather than inheriting them from the machine:
 
 - **Its own upstream.** `cmd/mockdns` answers every query after a fixed delay,
-  20 ms by default. That delay is the point: a worker is occupied for a whole
-  upstream round trip, so it is what decides how many queries the pool can carry.
-  An upstream answering instantly would measure a server nobody runs.
+  20 ms by default. That delay is the point: a cache miss is in flight for a
+  whole upstream round trip, so it is what decides how many misses a second
+  `max_pending` allows. An upstream answering instantly would measure a server
+  nobody runs. The rows that vary the delay start mocks of their own.
 - **Its own configuration.** Each scenario writes the config it needs. Most keys
   are left at the shipped default, but four are not, for every scenario:
   validation is off (see below), rate limiting is off (the generator is one
   address asking as fast as it can, which is what the limiter exists to stop),
-  `server.workers` / `server.upstream_workers` are pinned at 128 / 64 rather than
-  derived from the machine (`server.running_workers` is left to derive, except
-  in `sizing`, which varies it), and `upstream.attempts` is 1 so a failure reads as
-  one rather than as a slower success. `cmd/bench/server.go` is where that
-  template lives.
+  `max_connections_per_prefix` is the whole table (every client is 127.0.0.1),
+  and `upstream.attempts` is 1 so a failure reads as one rather than as a slower
+  success. The template names no key a thread-model release would refuse, so
+  `-binary` can point at one of those and run the same matrix for before/after
+  rows. `cmd/bench/server.go` is where that template lives.
 - **Its own certificates.** ECDSA P-256 and RSA-2048, generated per run, so the
   handshake comparison is not at the mercy of whatever is in `certs/`.
-- **The server process alone.** RSS and CPU come from `/proc/<pid>` for elodin
-  only. The generator and the mock share this machine, and anything taken from
+- **The server process alone.** RSS and CPU come from `/proc/<pid>` for the
+  server under test only. The generator and the mock share this machine, and anything taken from
   the whole system would be mostly them.
 
 **DNSSEC is off throughout.** The mock serves an unsigned zone with no chain to
@@ -54,6 +55,25 @@ the root, so with validation on every answer would be SERVFAIL and the tables
 would describe a failing resolver. What validation costs is a separate question
 from what the transports cost — as is what rate limiting costs, which is the
 other setting held away from its shipped value for the same kind of reason.
+
+## Against Unbound
+
+`cpu`, `loops`, `misses`, `connections`, `inflight` and `latency` run each row
+against Unbound as well, given the same listeners, certificate, upstream, thread
+count and limits (`unboundConfig` in `cmd/bench/server.go` says how each maps).
+`-servers elodin` leaves it out; a machine without `unbound` on `PATH` gets
+elodin's rows and a line saying Unbound's were skipped.
+
+```sh
+go run ./cmd/bench -only misses                                 # elodin and Unbound
+go run ./cmd/bench -only misses -binary /path/to/elodin-0.9.0   # a release, for before/after
+go run ./cmd/bench -only misses -unbound /path/to/unbound       # an Unbound not on PATH
+```
+
+Ubuntu's AppArmor profile confines `/usr/sbin/unbound` to reading `/etc/unbound`,
+so it refuses the harness's configuration in the work directory. Copy the binary
+elsewhere (`cp /usr/sbin/unbound /tmp/unbound`) and pass the copy with
+`-unbound`; the profile is attached by path, so the copy runs unconfined.
 
 ## Why the load generator is its own thing
 
@@ -89,10 +109,14 @@ That control is how the query-logging result was confirmed rather than assumed.
 | `h1h2` | HTTP/1.1 against HTTP/2 under 8 concurrent requests per client |
 | `cpu` | CPU per query per transport |
 | `handshake` | fresh TLS handshakes, ECDSA against RSA |
-| `memory` | idle, worker arenas, per blocklist rule, per cache entry |
-| `shedding` | behaviour past capacity, bounded against unbounded queueing |
+| `memory` | idle, per blocklist rule, per cache entry |
+| `shedding` | behaviour past capacity at two `max_pending` figures |
+| `loops` | misses and hits at 1, 2 and every-CPU loops, the server pinned to two cores (needs four) |
+| `misses` | the cache-miss ceiling against a 20 ms and a 5 ms upstream |
+| `connections` | resident memory per idle TCP, DoT and DoH/2 connection, at 1,000 to 20,000 held |
+| `inflight` | resident memory per query waiting on a three-second upstream |
+| `latency` | cache-hit latency under a light, steady load |
 | `logging` | what `log.queries` costs and what it writes |
-| `sizing` | misses and hits at 16 and 128 workers, with and without the running limit, the server pinned to two cores (needs four) |
 
 Rows that depend on the server doing a particular thing assert it: the blocked
 row fails unless the answers are NXDOMAIN, so a rule that stopped matching shows

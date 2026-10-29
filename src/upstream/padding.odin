@@ -70,8 +70,8 @@ exchange_padded :: proc(
 	/*
 	Working memory, from the scratch arena rather than from `allocator`: on the
 	race path `allocator` is the process heap and nothing there would ever
-	reclaim a padded copy of a query. The arena is reset per job by the worker
-	that owns it, the same way `exchange_with_cookie` builds its query.
+	reclaim a padded copy of a query. The scratch is freed when the fiber that
+	owns it returns, the same way `exchange_with_cookie` builds its query.
 	*/
 	asked, padded := dns.pad_query(query, dns.PAD_QUERY_BLOCK, dns.MAX_MESSAGE, context.temp_allocator)
 	if !padded {

@@ -302,7 +302,7 @@ test_an_extended_rcode_is_not_forwarded_to_the_client :: proc(t: ^testing.T) {
 	specs[0] = spec
 	cfg := forwarding_config(specs)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -396,7 +396,7 @@ test_an_extended_rcode_with_a_nonzero_nibble_is_not_forwarded_either :: proc(t: 
 	specs[0] = spec
 	cfg := forwarding_config(specs)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -485,7 +485,7 @@ test_a_broken_upstream_is_asked_past_for_an_extended_rcode :: proc(t: ^testing.T
 	specs[1] = good_spec
 	cfg := forwarding_config(specs)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -575,7 +575,7 @@ test_a_readable_rcode_is_still_the_clients_answer :: proc(t: ^testing.T) {
 	specs[1] = second_spec
 	cfg := forwarding_config(specs)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -636,7 +636,7 @@ test_a_group_with_a_spare_is_asked_past_a_servfail :: proc(t: ^testing.T) {
 		specs[1] = good_spec
 		cfg := forwarding_config(specs)
 
-		group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+		group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 		if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 			return
 		}
@@ -709,7 +709,7 @@ test_an_unnamed_extended_rcode_is_reported_as_a_number :: proc(t: ^testing.T) {
 	specs[0] = spec
 	cfg := forwarding_config(specs)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -777,7 +777,7 @@ test_a_clients_extended_rcode_byte_is_not_forwarded :: proc(t: ^testing.T) {
 	specs[0] = spec
 	cfg := forwarding_config(specs)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}

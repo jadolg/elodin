@@ -416,7 +416,10 @@ charge_scratch :: proc(scratch: ^Signing_Scratch, n: int) -> bool {
 	if scratch.budget == nil || scratch.budget.spent == nil {
 		return true
 	}
-	scratch.budget.spent^ += n
+	if !dns.request_charge(scratch.budget.spent, n) {
+		scratch_refuse(scratch)
+		return false
+	}
 	return !scratch_over_budget(scratch)
 }
 
@@ -427,9 +430,16 @@ scratch_over_budget :: proc(scratch: ^Signing_Scratch) -> bool {
 	if scratch.budget == nil || !dns.over_request_budget(scratch.budget.spent) {
 		return false
 	}
+	scratch_refuse(scratch)
+	return true
+}
+
+// Refuse from here on, and say why in the budget - over it, or refused a heavy
+// slot, which the validator reports the same way (see `dns.request_charge`).
+@(private)
+scratch_refuse :: proc(scratch: ^Signing_Scratch) {
 	scratch.over_budget = true
 	scratch.budget.ran_out = READING_OVER_BUDGET
-	return true
 }
 
 /*

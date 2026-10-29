@@ -770,7 +770,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Six different problems, kept apart on purpose. Rising drops means server.workers is too low; rising refusals means a client is not on server.allow_from; refused connections means max_connections is full or one client prefix has filled its share of it (the log line says which); rate-limited connections means a prefix is opening them faster than server.rate_limit.responses_per_second allows, which is arrival rather than occupancy and is the only series a handshake flood shows up on; failed connections means the OS would not start a thread, which happens below the limit and is not fixed by raising it. Accept backoffs are the odd one out: not connections at all, but times a listener waited before retrying an accept it could not complete. It climbs while a listener cannot accept - about once a second per listener out of file descriptors, about twenty times for one meeting a stream of per-connection errors - and sits at zero otherwise, so read a rising line rather than a level one. If it stops reporting altogether during a descriptor shortage, that is the scrape failing rather than the trouble ending: this endpoint accepts through a loop of its own and is subject to the same shortage. The msg=stats log line is the reading that survives it.",
+      "description": "Six different problems, kept apart on purpose. Rising drops means server.max_pending is reached; rising refusals means a client is not on server.allow_from; refused connections means max_connections is full or one client prefix has filled its share of it (the log line says which); rate-limited connections means a prefix is opening them faster than server.rate_limit.responses_per_second allows, which is arrival rather than occupancy and is the only series a handshake flood shows up on; failed connections means the OS would not map a stack for one, which happens below the limit and is not fixed by raising it. Accept backoffs are the odd one out: not connections at all, but times a listener waited before retrying an accept it could not complete. It climbs while a listener cannot accept - about once a second per listener out of file descriptors, about twenty times for one meeting a stream of per-connection errors - and sits at zero otherwise, so read a rising line rather than a level one. If it stops reporting altogether during a descriptor shortage, that is the scrape failing rather than the trouble ending: this endpoint accepts through a loop of its own and is subject to the same shortage. The msg=stats log line is the reading that survives it.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -885,7 +885,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "connections failed (no thread)"
+              "options": "connections failed (no stack)"
             },
             "properties": [
               {
@@ -944,7 +944,7 @@
           },
           "editorMode": "code",
           "expr": "sum(rate(elodin_queries_dropped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "dropped (backlog full)",
+          "legendFormat": "dropped (max_pending reached)",
           "range": true,
           "instant": false,
           "refId": "A"
@@ -992,7 +992,7 @@
           },
           "editorMode": "code",
           "expr": "sum(rate(elodin_connections_failed_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "connections failed (no thread)",
+          "legendFormat": "connections failed (no stack)",
           "range": true,
           "instant": false,
           "refId": "E"
@@ -3272,7 +3272,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "The descriptor limit is not plotted here: it is five orders of magnitude larger and would flatten both lines. It is the headroom stat below. Descriptors climbing while the connection count sits still is a leak rather than load.",
+      "description": "Fibers are what each event loop is running - queries in flight, connections, racers and upstream readers - and loops far apart are load the kernel's UDP hash or the round-robin accept spread unevenly. Threads (blue, right-hand axis) are the loops plus a handful of service threads, and stay close to flat. The descriptor limit is not plotted here: it is five orders of magnitude larger and would flatten both lines. It is the headroom stat below. Descriptors climbing while the connection count sits still is a leak rather than load.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3337,6 +3337,10 @@
                   "mode": "fixed",
                   "fixedColor": "#3987e5"
                 }
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
               }
             ]
           },
@@ -3403,9 +3407,21 @@
           "range": true,
           "instant": false,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "range": true,
+          "instant": false,
+          "expr": "elodin_fibers{job=~\"$job\", instance=~\"$instance\"}",
+          "legendFormat": "fibers, loop {{loop}}",
+          "refId": "C"
         }
       ],
-      "title": "Threads and descriptors",
+      "title": "Threads, fibers and descriptors",
       "type": "timeseries"
     },
     {
@@ -3413,7 +3429,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "The one number that says whether this server is keeping up. Queries queue when every worker is inside an upstream round trip; a backlog that does not return to zero is server.workers set too low, and it turns into dropped queries once max_pending is reached.",
+      "description": "The one number that says whether this server is keeping up. Every UDP query, DoH/2 request and cache refresh is in flight from arrival to answer; one sitting at max_pending (dashed) is the server turning queries away, which elodin_queries_dropped_total then counts. Raise server.max_pending only when it does. Heavy decodes are requests reading past the ordinary allowance against the slots there are for them; at the maximum, answers built to expand are being refused as over budget. Heavy decodes (orange) are on the right-hand axis: a few dozen slots against thousands in flight.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3469,7 +3485,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "query pending"
+              "options": "in flight"
             },
             "properties": [
               {
@@ -3484,7 +3500,22 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "upstream pending"
+              "options": "max_pending"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "heavy decodes"
             },
             "properties": [
               {
@@ -3493,43 +3524,36 @@
                   "mode": "fixed",
                   "fixedColor": "#d95926"
                 }
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "query workers"
+              "options": "heavy decode slots"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
-                  "fixedColor": "#199e70",
-                  "mode": "fixed"
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
                 }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "upstream workers"
-            },
-            "properties": [
+              },
               {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#c98500",
-                  "mode": "fixed"
-                }
+                "id": "custom.axisPlacement",
+                "value": "right"
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "query workers"
+              "options": "max_pending"
             },
             "properties": [
               {
@@ -3551,7 +3575,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "upstream workers"
+              "options": "heavy decode slots"
             },
             "properties": [
               {
@@ -3601,10 +3625,10 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "elodin_pool_pending{job=~\"$job\", instance=~\"$instance\", pool=\"query\"}",
-          "legendFormat": "query pending",
           "range": true,
           "instant": false,
+          "expr": "sum(elodin_queries_inflight{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "in flight",
           "refId": "A"
         },
         {
@@ -3613,10 +3637,10 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "elodin_pool_pending{job=~\"$job\", instance=~\"$instance\", pool=\"upstream\"}",
-          "legendFormat": "upstream pending",
           "range": true,
           "instant": false,
+          "expr": "sum(elodin_queries_inflight_max{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "max_pending",
           "refId": "B"
         },
         {
@@ -3625,10 +3649,10 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "elodin_pool_workers{job=~\"$job\", instance=~\"$instance\", pool=\"query\"}",
-          "instant": false,
-          "legendFormat": "query workers",
           "range": true,
+          "instant": false,
+          "expr": "sum(elodin_decode_heavy_requests{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "heavy decodes",
           "refId": "C"
         },
         {
@@ -3637,14 +3661,14 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "elodin_pool_workers{job=~\"$job\", instance=~\"$instance\", pool=\"upstream\"}",
-          "instant": false,
-          "legendFormat": "upstream workers",
           "range": true,
+          "instant": false,
+          "expr": "sum(elodin_decode_heavy_requests_max{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "heavy decode slots",
           "refId": "D"
         }
       ],
-      "title": "Worker pool backlog",
+      "title": "Queries in flight",
       "type": "timeseries"
     },
     {
@@ -3652,7 +3676,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "TCP, DoT and DoH connections each hold a thread. The dashed line is server.max_connections.",
+      "description": "TCP, DoT and DoH connections being served, one fiber each on the event loops. The dashed line is server.max_connections.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3864,7 +3888,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Address space reserved, which is mostly thread stacks and is not memory in use.",
+      "description": "Address space reserved, which is mostly the stacks of fibers and threads, mapped whole and resident only where touched, and is not memory in use.",
       "fieldConfig": {
         "defaults": {
           "color": {

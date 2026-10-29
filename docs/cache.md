@@ -64,7 +64,7 @@ the entry is refreshed in the background (Unbound's `prefetch` rule).
   be above `max_ttl`.
 - RD=0 queries are answered from the entry without starting a refresh.
 - **Bounds.** A refresh shares `serve_stale`'s slots: one per name at a time, and
-  at most a quarter of the query pool (and 64) at once. With none free, the entry is left
+  at most a quarter of `server.max_pending` (and 64) at once. With none free, the entry is left
   to expire.
 - **Counting.** A prefetch is not a client query: it is in neither
   `elodin_answers_total`, the cache hit and miss counts nor the query log. It
@@ -91,8 +91,9 @@ go to the upstream once. The first forwards and the rest wait for it:
 - **A cached refusal** (a DNSSEC failure, or a CNAME into a blocked name) refuses
   the waiters without asking. Exceptions: a list reload during the wait that
   lifted the listing serves the answer; an entry evicted meanwhile makes them ask.
-- **Cap.** A query arriving when a quarter of the query pool is already waiting
-  asks for itself.
+- **Cap.** A query counted in `server.max_pending` arriving when a quarter of it
+  is already waiting asks for itself. Queries on a connection are not counted:
+  `server.max_connections` bounds them.
 - **Logging.** Queries given the first one's outcome, or refused from its cached
   refusal, count in `elodin_answers_coalesced_total`; those that asked do not.
   The query log shows `outcome=cached detail=coalesced` for a shared answer,

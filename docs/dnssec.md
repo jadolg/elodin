@@ -4,7 +4,7 @@
 dnssec:
   enabled: true
   max_nsec3_iterations: 100
-  max_chain_walks: 0      # 0 is server.workers less a reserved quarter
+  max_chain_walks: 0      # 0 is server.max_pending less a reserved quarter
   max_connection_walks: 0 # the same, from server.max_connections
   max_cached_zones: 0     # 0 is 4096
   trust_anchors: []       # empty uses the built-in root keys
@@ -130,17 +130,18 @@ saying so, rather than refused.
 ## max_chain_walks and max_connection_walks
 
 How many chain-of-trust walks may be waiting on an upstream at once. A walk costs
-one blocking DS lookup per label, on the worker answering the client, and the
-client chooses the labels; the bound keeps a flood of fresh names from holding
-every worker for a whole walk. A large enough flood still fills the pool, since
-the reserved workers can be busy on the query's own forward, but each comes back
+one DS lookup per label, waited for on behalf of the query being validated, and
+the client chooses the labels; the bound keeps a flood of fresh names from
+holding every query the server may have in flight for a whole walk. A large
+enough flood still fills [`server.max_pending`](sizing.md#queries-in-flight),
+since the reserved queries can be busy on their own forward, but each comes back
 in one round trip rather than thirty. A cached apex is not a cached name: a name
 below one still costs a DS lookup per label.
 
 | setting | covers | default (0) |
 |---|---|---|
-| `max_chain_walks` | the shared handler pool: UDP and DoH over HTTP/2 | `server.workers` less a reserved quarter (at least two): 96 of 128 workers |
-| `max_connection_walks` | per-connection threads: TCP, DoT and DoH over HTTP/1.1 | the same from `server.max_connections`: 384 of 512 connections |
+| `max_chain_walks` | queries counted in `server.max_pending`: UDP, DoH over HTTP/2, cache refreshes | `server.max_pending` less a reserved quarter (at least two): 307 of 409 on a 1 GiB machine |
+| `max_connection_walks` | queries on a connection: TCP, DoT and DoH over HTTP/1.1 | the same from `server.max_connections`: 384 of 512 connections |
 
 The two are counted separately, so a flood on one transport cannot spend the
 other's allowance, and lowering one does nothing for the other. To cap the
@@ -161,20 +162,14 @@ the same. If upstream latency is normal and the load is yours, raise the number.
 The client's extended error does not say which limit stopped the walk; the log
 and the counter do.
 
-`--check` and the startup log name both numbers in use. Startup warns when a
-configured value leaves nothing reserved in its pool, which switches the bound
-off:
+`--check` prints both as `chain_walks=` and `connection_walks=`, and the startup
+log names them. Startup warns when a configured value leaves nothing reserved of
+what it covers, which switches the bound off:
 
 ```
-dnssec: max_chain_walks <n> leaves none of the <n> workers reserved, so a flood of fresh names can hold them all; see issue #356
-dnssec: max_connection_walks <n> leaves none of the <n> connection threads reserved, so a flood of fresh names can hold them all; see issue #356
+dnssec: max_chain_walks <n> leaves none of the <n> queries server.max_pending allows in flight reserved, so a flood of fresh names can hold them all; see issue #356
+dnssec: max_connection_walks <n> leaves none of the <n> connections reserved, so a flood of fresh names can hold them all; see issue #356
 ```
-
-With `strategy: race`, a waiting walk also holds one racer job per upstream in the
-group (`server.upstream_workers`), so handler threads the reservation keeps free
-can still queue there. Raise `upstream_workers` with the number of upstreams if
-that matters more than the memory. `failover` and `round_robin` resolve on the
-calling thread and are unaffected.
 
 ## max_cached_zones
 

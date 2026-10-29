@@ -505,7 +505,7 @@ test_a_client_keepalive_does_not_reach_the_upstream :: proc(t: ^testing.T) {
 
 	// No cookie towards the upstream: it would add an option of its own to the
 	// outgoing query, which has nothing to do with the one under test.
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}

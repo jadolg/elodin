@@ -14,16 +14,11 @@ of that setting worth reporting. Both go through `setsockopt` directly, which is
 what `core:net` does underneath in any case.
 
 `SO_REUSEPORT` is not in `core:sys/posix` either, since POSIX does not define
-it. The numbers are the platform's own and are stable ABI: changing one would
-break every compiled program on the system.
+it. The number is Linux's, the only platform the event loops run on, and is
+stable ABI: changing it would break every compiled program on the system.
 */
-when ODIN_OS == .Linux {
-	@(private)
-	SO_REUSEPORT :: 15
-} else when ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .NetBSD || ODIN_OS == .OpenBSD {
-	@(private)
-	SO_REUSEPORT :: 0x0200
-}
+@(private)
+SO_REUSEPORT :: 15
 
 /*
 Let this socket share its port with the other readers'.
@@ -94,9 +89,6 @@ set_receive_buffer :: proc(socket: net.UDP_Socket, bytes: int) -> (granted: int)
 	if got <= 0 {
 		return 0
 	}
-	when ODIN_OS == .Linux {
-		return int(got / 2)
-	} else {
-		return int(got)
-	}
+	// Linux reports twice what it grants, the other half being its bookkeeping (socket(7)).
+	return int(got / 2)
 }

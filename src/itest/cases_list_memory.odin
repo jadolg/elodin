@@ -281,21 +281,24 @@ run_list_memory_cases :: proc(r: ^Runner) {
 }
 
 /*
-A connection's memory is given back when it closes (#526).
+A connection costs a fiber and not a thread, and its memory is given back when it
+closes (#526, #547).
 
-Every TCP connection answers on a thread of its own, and that thread's scratch
-arena is mapped by elodin and unmapped when the thread exits; left to libc it is
-a 256 KiB `calloc` that glibc memsets in full and keeps after the thread, some
-275 KB per connection that answered a query. elodin also turns transparent
-huge pages off for itself, which keeps the heaps glibc makes for those threads
-off them, each of which would otherwise cost 2 MB once touched (only where the
-kernel has them on).
+Every TCP connection answers on a fiber of one of the server's loops, so holding
+CONN_BURST of them adds no threads at all - the premise of everything else here,
+read off `/proc/<pid>/status` - and costs what the fiber touched of its stack and
+its scratch. Both are mapped by elodin rather than taken from libc, whose 256 KiB
+`calloc` per arena glibc memsets in full and keeps; elodin also turns transparent
+huge pages off for itself, which would otherwise back a touched page of either
+with 2 MB (only where the kernel has them on).
 
 The case holds CONN_BURST connections open with one query answered on each,
-then closes them and waits for their threads to exit, reading the server's
-VmRSS at each step. Both figures are held to a few times what was measured
-here (~25 KB a held connection, ~20 KB of each left behind: the stacks glibc
-caches for reuse) and well under the 275 KB of each the calloc costs.
+counted by the server's own descriptors, then closes them and waits for those to
+go, reading the server's VmRSS at each step. Both figures are held to a few times
+what was measured here (~29 KB a held connection, ~5 KB of each left behind) and
+well under the 275 KB of each the calloc costs. What stays after the close is
+the few stacks each loop keeps warm through a quiet spell
+(`loop.WARM_IDLE_KEEP`), which is a figure per loop rather than per connection.
 */
 @(private = "file")
 CONN_BURST :: 200
@@ -305,6 +308,21 @@ HELD_KIB_PER_CONN :: 64
 KEPT_KIB_PER_CONN :: 32
 @(private = "file")
 KEPT_HUGE_KIB :: 2048
+
+// Descriptors the process holds open, counted off /proc/<pid>/fd.
+@(private = "file")
+open_descriptors :: proc(pid: int) -> (n: int, ok: bool) {
+	dir, err := os.open(fmt.tprintf("/proc/%d/fd", pid))
+	if err != nil {
+		return 0, false
+	}
+	defer os.close(dir)
+	entries, rerr := os.read_dir(dir, -1, context.temp_allocator)
+	if rerr != nil {
+		return 0, false
+	}
+	return len(entries), true
+}
 
 // The process's huge pages in KiB, summed over its mappings by the kernel.
 @(private = "file")
@@ -365,7 +383,8 @@ blocking: {{ enabled: false }}
 	}
 	base, bok := proc_status_int(pid, "VmRSS")
 	threads0, tok := proc_status_int(pid, "Threads")
-	if !check(r, bok && tok, "cannot read the server's status") {
+	fds0, fok := open_descriptors(pid)
+	if !check(r, bok && tok && fok, "cannot read the server's status") {
 		return
 	}
 
@@ -393,9 +412,15 @@ blocking: {{ enabled: false }}
 	}
 	held, hok := proc_status_int(pid, "VmRSS")
 	threads1, _ := proc_status_int(pid, "Threads")
-	// The premise: each connection held a thread of its own. One short, as the
-	// thread of `wait_tcp`'s probe may still have been in the first reading.
-	if !check(r, hok && threads1 >= threads0 + CONN_BURST - 1, "threads went %d -> %d holding %d connections", threads0, threads1, CONN_BURST) {
+	fds1, _ := open_descriptors(pid)
+	// The premise: the server is holding every connection - one descriptor
+	// each. One short, as `wait_tcp`'s probe may still have been in the first
+	// reading.
+	if !check(r, hok && fds1 >= fds0 + CONN_BURST - 1, "descriptors went %d -> %d holding %d connections", fds0, fds1, CONN_BURST) {
+		return
+	}
+	// And held on the loops' threads, not on threads of their own.
+	if !check(r, threads1 <= threads0, "threads went %d -> %d holding %d connections", threads0, threads1, CONN_BURST) {
 		return
 	}
 
@@ -403,17 +428,27 @@ blocking: {{ enabled: false }}
 		net.close(s)
 	}
 	clear(&sockets)
-	// Until the threads have exited, which is when their arenas are unmapped.
-	// The bound only ends a failing run.
-	threads2 := threads1
-	for start := time.tick_now(); threads2 > threads0 && time.tick_since(start) < 10 * time.Second; {
+	// Until the server has closed its ends, which is when the fibers have
+	// returned and their scratch is unmapped. The bound only ends a failing run.
+	fds2 := fds1
+	for start := time.tick_now(); fds2 > fds0 && time.tick_since(start) < 10 * time.Second; {
 		time.sleep(20 * time.Millisecond)
-		threads2, _ = proc_status_int(pid, "Threads")
+		fds2, _ = open_descriptors(pid)
 	}
-	if !check(r, threads2 <= threads0, "threads still at %d (from %d) after the connections closed", threads2, threads0) {
+	if !check(r, fds2 <= fds0, "descriptors still at %d (from %d) after the connections closed", fds2, fds0) {
 		return
 	}
+	/*
+	And until the loops have given back the stacks they kept warm, which they do
+	after a second with nothing to do (`loop.TRIM_AFTER`). Read until the figure
+	is inside the bound; the deadline only ends a failing run, which then reports
+	the last reading.
+	*/
 	after, aok := proc_status_int(pid, "VmRSS")
+	for start := time.tick_now(); aok && after - base > CONN_BURST * KEPT_KIB_PER_CONN && time.tick_since(start) < 5 * time.Second; {
+		time.sleep(100 * time.Millisecond)
+		after, aok = proc_status_int(pid, "VmRSS")
+	}
 	huge, sok := anon_huge_kib(pid)
 	if !check(r, aok && sok, "cannot read the server's VmRSS or smaps") {
 		return

@@ -117,7 +117,7 @@ test_a_public_name_is_not_answered_with_a_private_address :: proc(t: ^testing.T)
 		servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
 		cfg.upstream.servers = servers
 
-		group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+		group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 		if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 			return
 		}
@@ -287,7 +287,7 @@ ask_raw :: proc(
 	cfg.upstream.attempts = 1
 	cfg.upstream.timeout = 3 * time.Second
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return nil, .Failed, false
 	}

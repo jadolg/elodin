@@ -148,7 +148,7 @@ exchange_once :: proc(
 	}
 	cfg.upstream.servers = servers
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return nil, .Failed, false
 	}

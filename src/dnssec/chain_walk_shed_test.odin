@@ -477,21 +477,20 @@ test_a_shed_walk_cannot_tell_an_unsigned_zone_from_a_signed_one :: proc(t: ^test
 }
 
 /*
-A question on a connection thread is held to its own bound, not the pool's.
+A question on a connection is held to its own bound, not the shared one.
 
-TCP, DoT and HTTP/1.1 answer on the connection's thread rather than on a worker
-of the shared pool, and there are `max_connections` of those against a handful of
-workers - so one number for both is wrong whichever way it is set. Sized for the
-pool it refuses ordinary stream traffic on a resolver nobody is attacking; left
-off altogether it leaves #356 open on every transport but two, since a flood that
-holds every connection thread in a walk is a flood that gets no new connection
-accepted.
+TCP, DoT and HTTP/1.1 answer on the connection's fiber and are not counted among
+the server's queries in flight, which are sized by memory where the connections
+are sized by `max_connections` - so one number for both is wrong whichever way it
+is set. A share of the queries in flight lets the connections spend every walk;
+a share of both together leaves the queries in flight no reserve. Left off for
+the connections altogether, it leaves #356 open on every transport but two.
 
 So the two are counted apart. Here the shared allowance is spent down to nothing
-and a question on a connection thread walks anyway.
+and a question on a connection walks anyway.
 */
 @(test)
-test_a_connection_thread_is_held_to_its_own_bound :: proc(t: ^testing.T) {
+test_a_connection_is_held_to_its_own_bound :: proc(t: ^testing.T) {
 	up := Slow_Upstream{}
 	v := make_validator(slow_query, &up, Options{max_chain_walks = 1, max_connection_walks = 1})
 	defer destroy_validator(v)
@@ -524,7 +523,7 @@ test_a_connection_thread_is_held_to_its_own_bound :: proc(t: ^testing.T) {
 And it is a bound, not an exemption: spend that one too and the walk stops.
 */
 @(test)
-test_a_connection_thread_is_still_bounded :: proc(t: ^testing.T) {
+test_a_connection_is_still_bounded :: proc(t: ^testing.T) {
 	up := Slow_Upstream{}
 	v := make_validator(slow_query, &up, Options{max_chain_walks = 1, max_connection_walks = 1})
 	defer destroy_validator(v)

@@ -10,6 +10,7 @@ import "elodin:cache"
 import "elodin:config"
 import "elodin:dnssec"
 import "elodin:logx"
+import "elodin:loop"
 import "elodin:upstream"
 
 /*
@@ -146,23 +147,35 @@ Pin :: struct {
 }
 
 /*
-The generation this thread's request is running under.
+The generation this fiber's request is running under.
 
-Per thread rather than passed along, because the request reaches its
+Per request rather than passed along, because the request reaches its
 configuration through some two hundred reads in a few dozen procedures that all
 take the `Server` and nothing else; threading a second argument through every
 one of them would be the same guarantee bought with a much larger change. What
-makes it safe is that a request runs start to finish on one thread: the work it
-hands to another thread - a race worker, a refresh - is either given everything
-it needs up front, or pins for itself when it starts.
+makes it safe is that a request runs start to finish on one fiber, which keeps
+its own copy of this across every wait (`register_pinned`): the work it hands to
+another fiber - a racer, a refresh - is either given everything it needs up
+front, or pins for itself when it starts.
 */
 @(private, thread_local)
 pinned: Pin
 
 /*
+Per fiber on a loop thread, where many requests take turns and each holds its
+own generation across the waits in it: the pin is saved when the request's fiber
+parks and put back when it runs. See `loop.register_local`.
+*/
+@(private, init)
+register_pinned :: proc "contextless" () {
+	context = {}
+	loop.register_local(proc "contextless" () -> rawptr {return &pinned}, size_of(pinned))
+}
+
+/*
 Take a reference to the current generation for the rest of this request.
 
-Nests: an inner `pin` of the server already pinned by this thread keeps the outer
+Nests: an inner `pin` of the server already pinned by this request keeps the outer
 one's generation, so a procedure can pin without knowing whether its caller did.
 A server with no generations - one built as a literal - is pinned to nothing,
 and `live` hands back its own `Live`.
@@ -172,7 +185,7 @@ pin :: proc(s: ^Server) {
 		pinned.depth += 1
 		return
 	}
-	assert(pinned.server == nil, "a thread pins one server at a time")
+	assert(pinned.server == nil, "a request pins one server at a time")
 	sync.rw_mutex_shared_lock(&s.gens.mu)
 	g := s.gens.current
 	if g != nil {
@@ -183,7 +196,7 @@ pin :: proc(s: ^Server) {
 }
 
 unpin :: proc(s: ^Server) {
-	assert(pinned.server == s, "unpinning a server this thread has not pinned")
+	assert(pinned.server == s, "unpinning a server this request has not pinned")
 	pinned.depth -= 1
 	if pinned.depth > 0 {
 		return
@@ -205,7 +218,7 @@ What this request reads its configuration and everything built from it through.
 
 A server with generations must be pinned first. Reading one unpinned would race
 a reload that frees what was read, which is why it stops the process rather
-than guessing: every thread that serves anything pins on the way in, and a path
+than guessing: every fiber that serves anything pins on the way in, and a path
 that does not is a bug the test suites are there to find.
 */
 live :: proc(s: ^Server) -> ^Live {
@@ -218,7 +231,7 @@ live :: proc(s: ^Server) -> ^Live {
 
 /*
 The configuration the process started with, which is where every key a reload
-cannot change is read: the listeners, the metrics endpoint, the pool sizes and
+cannot change is read: the listeners, the metrics endpoint, the loop count and
 the connection table (see `keep_restart_only`). It never changes and lives as
 long as the server, so it needs no pin and its strings can be kept.
 */
@@ -244,7 +257,7 @@ live_config :: proc(s: ^Server) -> ^config.Config {
 }
 
 /*
-`server.client_timeout`, for a connection thread between requests.
+`server.client_timeout`, for a connection's fiber between requests.
 
 Pinned for the one reading and let go at once: the wait it bounds is the
 client's to stretch, and a connection holding a generation across it would hold
@@ -269,7 +282,7 @@ narrows it has to cut off the connections already held as well: a client kept
 on one would otherwise be answered for as long as it kept asking.
 
 Logged at debug rather than through `report_refusal`, which releases the
-calling thread's temp arena - one a connection thread is still reading its
+calling fiber's scratch - one a connection's fiber is still reading its
 request out of here.
 */
 stream_source_allowed :: proc(s: ^Server, peer: net.Endpoint, proto: Protocol) -> bool {
@@ -311,6 +324,21 @@ cache_options :: proc(c: config.Cache_Config) -> cache.Options {
 }
 
 /*
+What one pipelined upstream connection may carry under `cfg`.
+
+A race's losers run on after their query has gone and its place in `max_pending`
+has been taken by another, so where any group races, its racers - up to the
+budget `build_live` sets, `max_pending` legs per member of the widest racing
+group - may be asking one upstream beside the queries that are: a member slow to
+answer is the one whose legs every race leaves behind.
+*/
+@(private)
+connection_outstanding :: proc(cfg: ^config.Config) -> int {
+	in_flight := cfg.server.max_pending * (1 + race_width(cfg.upstream))
+	return upstream.pipeline_outstanding(in_flight, cfg.server.max_connections)
+}
+
+/*
 The default group and one per `upstream.zones` entry.
 
 A route whose servers are all unusable fails the whole build rather than being
@@ -323,14 +351,26 @@ replies rather than failing.
 @(private)
 build_upstreams :: proc(s: ^Server, l: ^Live) -> bool {
 	cfg := l.cfg
-	group, gerr := upstream.make_group(cfg.upstream, s.race_pool, cookies = cfg.cookies.upstream)
+	outstanding := connection_outstanding(cfg)
+	// The budget's figure is set by `build_live` once the whole generation is built.
+	group, gerr := upstream.make_group(
+		cfg.upstream,
+		cookies = cfg.cookies.upstream,
+		outstanding = outstanding,
+		racers = &s.racers,
+	)
 	if gerr != .None {
 		logx.errorf("no usable upstream servers")
 		return false
 	}
 	routes := make([]Zone_Route, len(cfg.upstream.zones))
 	for zone, i in cfg.upstream.zones {
-		zg, zerr := upstream.make_group(zone.upstream, s.race_pool, cookies = cfg.cookies.upstream)
+		zg, zerr := upstream.make_group(
+			zone.upstream,
+			cookies = cfg.cookies.upstream,
+			outstanding = outstanding,
+			racers = &s.racers,
+		)
 		if zerr != .None {
 			logx.errorf("upstream.zones[%d]: no usable servers for %s", i, zone.domains[0])
 			// The routes built so far and the slice under them, which this
@@ -492,6 +532,28 @@ build_live :: proc(s: ^Server, l: ^Live, prev: ^Live) -> (built, carried: Parts,
 			l.policy += 1
 		}
 	}
+	/*
+	Every race leg is counted, while its query waits and after it has gone, so
+	the figure is every query in flight racing the widest group at once: `max_pending`
+	legs per member. That is what the descriptor estimate allows them
+	(`Descriptor_Demand.racers`), and losers left behind by queries that have
+	moved on take room a new race then does not get. One budget for every group,
+	so routes do not each get another. Set here, where nothing can fail any more,
+	so a reload refused above leaves it at the figure in effect.
+	*/
+	sync.atomic_store(&s.racers.limit, cfg.server.max_pending * max(race_width(cfg.upstream), 1))
+	/*
+	Groups kept from the last generation keep their connections, health and
+	learned ceilings; what each connection may carry follows `max_pending`, set
+	here for the same reason as the budget above.
+	*/
+	if .Upstreams in carried {
+		outstanding := connection_outstanding(cfg)
+		upstream.set_max_outstanding(l.group, outstanding)
+		for r in l.routes {
+			upstream.set_max_outstanding(r.group, outstanding)
+		}
+	}
 	return built, carried, true
 }
 
@@ -634,7 +696,7 @@ one generation to the next, so a newer generation can own something an older one
 is still reading, and releasing it first would free that under the older one's
 requests.
 
-In use means a request still pinned to it, or a race worker still asking one of
+In use means a request still pinned to it, or a racer still asking one of
 its upstreams - those outlive the request that started them. No new pin can
 reach a retired generation, so a count that reads zero here stays zero.
 */
@@ -649,7 +711,7 @@ reap_generations :: proc(s: ^Server) -> (released: int) {
 		released += 1
 	}
 	/*
-	What is left is held by a request or a race worker still running, which may
+	What is left is held by a request or a racer still running, which may
 	go on for a while. The idle connections of the groups those generations own
 	are closed now rather than then: no new request can reach a retired group,
 	so they are only sockets held open to servers the file may no longer name.

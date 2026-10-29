@@ -5,9 +5,9 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 import "elodin:dns"
+import "elodin:dnssec"
 import "elodin:h2"
 import "elodin:logx"
-import "elodin:pool"
 import "elodin:tlsx"
 
 /*
@@ -18,14 +18,15 @@ DoH resolver. It accepts the same two request forms as the HTTP/1.1 endpoint,
 POST with an application/dns-message body and GET with a base64url `dns`
 parameter.
 
-Each request is handed to the query worker pool rather than answered on the
-connection's reader thread, so the two lookups a browser issues for one name run
-at the same time instead of one behind the other. Responses are written back
-under the connection's write lock and may complete in any order.
+Each request is answered on a fiber of its own rather than on the connection's
+reader fiber, so the two lookups a browser issues for one name run at the same
+time instead of one behind the other. Responses are written back under the
+connection's write lock and may complete in any order.
 
-Being the only transport that queues its work, it is also the only one that has
-to shed: past `server.max_pending` a request is answered 503 here instead of
-joining a backlog it would sit out. See `h2_handler`.
+Being the only stream transport that starts a query of its own per request, it is
+also the only one that has to shed: past `server.max_pending` a request is
+answered 503 here instead of adding to the queries the server is already behind
+on. See `h2_handler`.
 */
 
 @(private)
@@ -47,7 +48,7 @@ H2_Context :: struct {
 	whole of `client_timeout`, as it was when the socket option was the only bound.
 	What it ends is the peer that trickles one byte inside every wait and so is
 	never waited out at all, which before any stream exists - over the preface, or
-	a frame header - held a connection and a thread with no request ever made.
+	a frame header - held a connection with no request ever made.
 
 	It is what one frame may take and not what one connection may. A peer that
 	keeps completing frames would keep its connection, and a frame is not charged
@@ -60,11 +61,11 @@ H2_Context :: struct {
 	When this connection last asked a question or had one answered - or opened,
 	before it has - for `doh_question_overdue`. Stamped once more when the answer
 	is written, as over HTTP/1.1: the time a question takes is not time the
-	connection asked nothing. A pool worker writes it too, hence atomic.
+	connection asked nothing. The requests' fibers write it too, hence atomic.
 	*/
 	last_question: time.Tick,
-	// Questions handed to the pool and not yet answered. A connection waiting on
-	// one is not asking nothing, however slow the upstream.
+	// Questions started on fibers of their own and not yet answered. A connection
+	// waiting on one is not asking nothing, however slow the upstream.
 	pending:       int,
 }
 
@@ -73,16 +74,6 @@ H2_Job :: struct {
 	ctx:       ^H2_Context,
 	h2conn:    ^h2.Conn,
 	req:       ^h2.Request,
-	/*
-	Whether this job is going to run on a worker of the shared pool.
-
-	Normally it is - that is what makes HTTP/2 the one stream transport the
-	DNSSEC chain-walk bound counts against the pool. The shutdown path below
-	answers inline on the connection's reader thread instead, and a query there
-	holds no pool worker, so it must not spend a pool slot. See
-	`handle_query`'s `shared_worker`.
-	*/
-	on_pool:   bool,
 	// Counted in `H2_Context.pending`, and stamps `last_question` once answered.
 	asked:     bool,
 }
@@ -100,7 +91,7 @@ h2_begin :: proc(user: rawptr, starts_frame: bool) {
 	// read this begins fails and `h2.serve` ends the connection. Only where a
 	// frame starts: a payload whose header is already read may be the question
 	// that would have kept the connection, and cutting it there loses it.
-	// `pending` first: the worker stamps before it lets go of it.
+	// `pending` first: the request's fiber stamps before it lets go of it.
 	if !starts_frame || sync.atomic_load(&ctx.pending) != 0 {
 		return
 	}
@@ -143,7 +134,7 @@ serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string, peer: net.Endpo
 	hc := h2.make_conn(io, h2_handler, &ctx)
 	// A response waits no longer for flow-control credit than the connection
 	// waits for anything else, so a client that stops reading cannot hold a
-	// query worker past its welcome.
+	// query in flight past its welcome.
 	hc.write_timeout = client_timeout(s)
 
 	h2.serve(hc)
@@ -166,9 +157,9 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	}
 
 	/*
-	Charged before the request is queued, which is the order the UDP loop charges
-	in and for the same reason: a request that is not going to be answered is work
-	not worth doing, and queueing is work.
+	Charged before the request's query is started, which is the order the UDP
+	loop charges in and for the same reason: a request that is not going to be
+	answered is work not worth doing, and starting it is work.
 
 	Only requests that are questions, as `h2_shed`'s counter is: the budget is
 	denominated in answers to questions, and a .mobileconfig download, a scanner's
@@ -179,7 +170,7 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	The limiter is looked at before `h2_charged` is asked, rather than left to
 	`stream_rate_check` to shrug off: deciding whether a request is a query means
 	decoding a GET's `dns` parameter, and with the budget switched off that is a
-	base64 decode per request, on the connection's reader thread, for an answer
+	base64 decode per request, on the connection's reader fiber, for an answer
 	nothing then reads.
 
 	A question is also what keeps the connection - see `doh_question_overdue` -
@@ -192,9 +183,9 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	max_pending: int
 	{
 		/*
-		Pinned for the charge and the backlog figure, and let go before anything
+		Pinned for the charge and the in-flight bound, and let go before anything
 		below writes to the client. A 429 or a 503 is a HEADERS frame written on
-		this thread, which waits on a client that is not reading for up to the
+		this fiber, which waits on a client that is not reading for up to the
 		write timeout, and a generation pinned across that wait is one a reload
 		cannot release - for as long as the client keeps it up.
 		*/
@@ -216,32 +207,29 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	job.ctx = ctx
 	job.h2conn = hc
 	job.req = req
-	// Cleared again in the `.Stopped` arm below, which is the one path that
-	// answers without a pool worker.
-	job.on_pool = true
 	job.asked = asked
 	if asked {
 		sync.atomic_add(&ctx.pending, 1)
 	}
 
-	// The job outlives this call, so it needs its own reference; the pool may
-	// still be running it after the reader thread has gone.
+	// The job outlives this call, so it needs its own reference; its fiber may
+	// still be running it after the reader has gone.
 	h2.conn_ref(hc)
 	/*
-	Shed rather than queue once the backlog is past what the workers can work
-	through, the same bound the UDP read loop applies before it queues.
+	Shed rather than start once `max_pending` queries are in flight, the same
+	bound the UDP read loop applies before it starts one.
 
-	This is the only transport that hands its work to the pool - the others
-	answer on their own connection thread, so `max_connections` is what bounds
-	them. Without this the operator's backlog limit sheds UDP at a few hundred
-	while HTTP/2 queues up to `max_connections` x `MAX_HELD_STREAMS` streams, each
-	holding its buffered body, in front of it.
+	This is the only stream transport that starts a query of its own per request
+	- the others answer on their connection's own fiber, one at a time, so
+	`max_connections` is what bounds them. Without this the operator's bound
+	sheds UDP at a few hundred while HTTP/2 runs up to `max_connections` x
+	`MAX_HELD_STREAMS` queries, each holding its buffered body, beside it.
 
-	`try_submit` rather than `pending` and then `submit`: there is a reader
-	thread per connection here, and a gap between the two is one all of them can
-	pass through at once.
+	`submit_query` decides and counts in one step: there is a reader per
+	connection here, on every loop, and a check followed by a start is a gap all
+	of them can pass through at once.
 	*/
-	switch pool.try_submit(ctx.server.handler_pool, h2_job, job, max_pending) {
+	switch submit_query(ctx.server, h2_job, job, max_pending) {
 	case .Accepted:
 	case .Full:
 		if asked {
@@ -251,15 +239,33 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 		free(job)
 		h2_shed(ctx, hc, req, max_pending)
 	case .Stopped:
-		// Shutting down: answer inline rather than dropping the stream - on this
-		// reader thread rather than a pool worker, which is what `on_pool` says.
-		job.on_pool = false
-		h2_answer(job)
+		if can_detach(ctx.server) {
+			/*
+			A server with loops stops its connections before its loops, so what
+			refused this start is a stack that could not be mapped. Shed, as at
+			`max_pending`: answered here instead, the reader would stop reading
+			for an upstream round trip, and a body past the client's window would
+			park on a WINDOW_UPDATE only this reader could read.
+			*/
+			if asked {
+				sync.atomic_sub(&ctx.pending, 1)
+			}
+			h2.conn_unref(hc)
+			free(job)
+			h2_shed(ctx, hc, req, max_pending, spawn_failed = true)
+			report_query_spawn_failure(.DoH)
+			return
+		}
+		// No loop to start it on - a `Server` built as a literal, driven from a
+		// test's own thread: answered inline, on the connection's own fiber, as a
+		// query `max_pending` does not count, and so one of the connections' for
+		// the chain-walk bound too.
+		h2_answer(job, .Connection)
 	}
 }
 
 /*
-Turn one request away, on the connection's reader thread.
+Turn one request away, on the connection's reader fiber.
 
 Answered rather than dropped: unlike a datagram, the stream is a client sitting
 on an open connection, and a status tells it to come back later instead of
@@ -267,9 +273,9 @@ leaving it to time out.
 
 Answered with no body, which is the part that matters. A body goes out through
 `h2.write_body`, which parks on flow-control credit until the write timeout when
-the client is not reading - and this is the thread that would have read the
+the client is not reading - and this is the fiber that would have read the
 WINDOW_UPDATE releasing it. Parking here stops the connection reading anything,
-including the WINDOW_UPDATEs that release pool workers already writing to it, so
+including the WINDOW_UPDATEs that release the requests already writing to it, so
 a shed that can stall the reader deepens the overload it exists to relieve.
 HEADERS are not flow-controlled, so a status on its own cannot park.
 
@@ -277,7 +283,15 @@ Nothing is freed here beyond the request: this runs on the arena `h2.serve` is
 still working through, which is also why it is not reached through `h2_job`.
 */
 @(private)
-h2_shed :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request, max_pending: int) {
+h2_shed :: proc(
+	ctx: ^H2_Context,
+	hc: ^h2.Conn,
+	req: ^h2.Request,
+	max_pending: int,
+	// Whether the bound was not what refused it: a stack that could not be
+	// mapped, which raising `max_pending` would only make more of.
+	spawn_failed := false,
+) {
 	// Counted as a query the server dropped only when it was going to be one. A
 	// request for some other path was never going to reach the resolver, and
 	// `dropped` counts refused queries rather than turned-away streams.
@@ -288,17 +302,25 @@ h2_shed :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request, max_pending: i
 	/*
 	Logged whatever the path, which the counter above is not: dropped= is a
 	figure about queries, and this is the line that says a 503 came from the
-	backlog rather than from a broken endpoint. Without it a shed off the DoH
-	path leaves no trace anywhere at all.
+	in-flight bound, or from a stack the OS would not map, rather than from a
+	broken endpoint - and which, since the two want opposite remedies. Without it
+	a shed off the DoH path leaves no trace anywhere at all.
 
 	Nothing is released after it: `h2.serve` resets this arena between frames,
-	which is the same reason `h2_error` can format on this thread.
+	which is the same reason `h2_error` can format on this fiber.
 	*/
-	logx.debugf(
-		"doh/h2: shedding a request from %s, server.max_pending (%d) is reached",
-		ctx.client,
-		max_pending,
-	)
+	if spawn_failed {
+		logx.debugf(
+			"doh/h2: shedding a request from %s, the OS would not map a stack for it; check the memory limits and vm.max_map_count",
+			ctx.client,
+		)
+	} else {
+		logx.debugf(
+			"doh/h2: shedding a request from %s, server.max_pending (%d) is reached",
+			ctx.client,
+			max_pending,
+		)
+	}
 	h2.respond(hc, req.stream_id, h2.Response{status = 503})
 	h2.request_destroy(hc, req)
 }
@@ -307,8 +329,8 @@ h2_shed :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request, max_pending: i
 Turn one request away for being over the response budget.
 
 The shape is `h2_shed`'s and for the same reasons: on the connection's reader
-thread, a status and no body. A body goes out through `h2.write_body`, which parks
-on flow-control credit that this thread is the one that would read the
+fiber, a status and no body. A body goes out through `h2.write_body`, which parks
+on flow-control credit that this fiber is the one that would read the
 WINDOW_UPDATE for - and this path is reached by precisely the client that is
 sending faster than it is being answered, so a refusal that can stall the reader
 would deepen what it exists to relieve.
@@ -346,8 +368,12 @@ h2_rate_limited :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request) {
 
 @(private)
 h2_job :: proc(data: rawptr) {
-	// On a pool worker the arena is ours for the length of the job.
-	defer free_all(context.temp_allocator)
+	s := (^H2_Job)(data).ctx.server
+	// The fiber's own scratch, and the query's count, both for exactly this job.
+	defer {
+		free_all(context.temp_allocator)
+		query_done(s)
+	}
 	h2_answer(data)
 }
 
@@ -355,11 +381,11 @@ h2_job :: proc(data: rawptr) {
 Answer one request.
 
 Split from `h2_job` because the shutdown path above runs it inline on the
-connection's reader thread, whose arena holds the frame `h2.serve` is still
+connection's reader fiber, whose scratch holds the frame `h2.serve` is still
 working through — resetting it there would free the ground from under it.
 */
 @(private)
-h2_answer :: proc(data: rawptr) {
+h2_answer :: proc(data: rawptr, pool := dnssec.Walk_Pool.Shared) {
 	job := cast(^H2_Job)data
 	hc := job.h2conn
 	req := job.req
@@ -375,22 +401,20 @@ h2_answer :: proc(data: rawptr) {
 		free(job)
 	}
 
-	resp, ok := build_h2_response(ctx, req, job.on_pool)
+	resp, ok := build_h2_response(ctx, req, pool)
 	if !ok {
 		return
 	}
-	// A body waits on the client's flow-control credit, up to the write
-	// timeout, and a client that stops reading is one anybody can open many
-	// of: that wait must not hold one of the pool's running slots.
-	pool.blocking_begin()
+	// A body waits on the client's flow-control credit, up to the write timeout,
+	// parked: a client that stops reading holds this query in flight and its
+	// fiber, and nothing else.
 	h2.respond(hc, req.stream_id, resp)
-	pool.blocking_end()
 }
 
 /*
 Whether this request is one the response budget is denominated in.
 
-Answered on the connection's reader thread, because that is where the charge is,
+Answered on the connection's reader fiber, because that is where the charge is,
 and answerable there because none of it is a lookup: the endpoint is a string
 compare and the rest is the request as it arrived. Without it the budget was spent
 by anything at all addressed to the DNS path - a POST with the wrong content type,
@@ -398,7 +422,7 @@ a `dns` parameter that is not base64, twelve bytes short of a header - none of
 which reach the resolver, the cache or an upstream, and all of which could
 therefore starve the clients sharing their prefix while costing this server
 nothing it needed a budget for. The HTTP/1.1 endpoint has always charged after
-these same checks; this is that, one thread earlier.
+these same checks; this is that, one fiber earlier.
 */
 @(private)
 h2_charged :: proc(ctx: ^H2_Context, req: ^h2.Request) -> bool {
@@ -415,7 +439,7 @@ The DNS message a request to the DoH endpoint is asking about, or the status tha
 says it was not asking about one.
 
 Split out of `build_h2_response` because `h2_charged` needs the question it
-answers - is this a query? - a thread before the message itself is wanted, and
+answers - is this a query? - a fiber before the message itself is wanted, and
 the two must agree: a request charged here and refused there would spend a budget
 on a 400, and one refused here and charged there would let the same 400 through
 for free.
@@ -423,8 +447,9 @@ for free.
 Called twice per query as a result, once for the verdict and once for the
 message. What the second call costs is a base64 decode of a `:path` that HPACK's
 `MAX_HEADER_LIST` already bounds at 32 KiB, which is cheaper than the alternative:
-the decode lands in `context.temp_allocator`, and on the reader thread that is the
-arena `h2.serve` resets between frames, so carrying it across to the worker would
+the decode lands in `context.temp_allocator`, and on the reader fiber that is the
+scratch `h2.serve` resets between frames, so carrying it across to the request's
+fiber would
 mean copying every message out to the heap - a cost on every query, to save a
 decode on the ones a browser sends by GET.
 */
@@ -468,7 +493,8 @@ h2_query_message :: proc(
 build_h2_response :: proc(
 	ctx: ^H2_Context,
 	req: ^h2.Request,
-	on_pool := true,
+	// Which queries this one is among; see `handle_query`'s `pool`.
+	pool := dnssec.Walk_Pool.Shared,
 ) -> (
 	resp: h2.Response,
 	ok: bool,
@@ -484,8 +510,8 @@ build_h2_response :: proc(
 	}
 
 	// The status is built here rather than by the check, so that the refusal is
-	// logged and formatted once - on the worker, by the call that wants the message
-	// - and not again by `h2_charged` on the reader thread.
+	// logged and formatted once - on the request's fiber, by the call that wants
+	// the message - and not again by `h2_charged` on the reader fiber.
 	message, status, why, is_query := h2_query_message(req)
 	if !is_query {
 		return h2_error(status, why), true
@@ -498,7 +524,7 @@ build_h2_response :: proc(
 		.DoH,
 		ctx.client,
 		context.temp_allocator,
-		shared_worker = on_pool,
+		pool = pool,
 		max_age = &max_age,
 	)
 	if !handled || len(answer) == 0 {

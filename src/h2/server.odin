@@ -2,16 +2,16 @@ package h2
 
 import "core:mem"
 import "core:strings"
-import "core:sync"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 import "elodin:netx"
 
 /*
 A server-side HTTP/2 connection, scoped to what a DoH endpoint needs.
 
 Requests are delivered to a handler which may answer inline or hand the work to
-another thread and call `respond` later; the connection is reference counted so
+another fiber and call `respond` later; the connection is reference counted so
 a late responder cannot outlive it. Writes are serialised, so responses may be
 produced concurrently and interleave on the wire in any order — which is the
 point of running HTTP/2 at all, since a browser resolving a name sends its A and
@@ -29,7 +29,7 @@ Transport, so this package does not depend on the TLS layer.
 preface, a frame header, a frame payload - and is what lets the transport bound
 one of those as a whole rather than bounding each read of it. Without it a peer
 trickling a byte at a time restarts the transport's wait with every byte and is
-never given up on, which on a DoH server is a connection and a thread held for
+never given up on, which on a DoH server is a connection and its fiber held for
 nothing before any stream exists. Optional: a transport with nothing to bound
 leaves it nil.
 
@@ -89,7 +89,7 @@ this many held. Every refusal is charged to MAX_CONTROL_FRAMES_PER_SECOND:
 - Charging only on the peer's count would leave a free RST_STREAM per HEADERS
   for as long as a peer kept MAX_CONCURRENT reset queries running; this cap is
   what stops that, and a peer past it is refused on the budget like any other.
-The work behind the extra slots is bounded where it is queued, by the pool's
+The work behind the extra slots is bounded where it is started, by the server's
 max_pending, and their bytes by MAX_CONN_REQUEST.
 */
 MAX_HELD_STREAMS :: 2 * MAX_CONCURRENT
@@ -115,8 +115,8 @@ How long a response may wait for the peer to open its flow-control window.
 
 A client that advertises a zero window and then goes quiet is otherwise
 indistinguishable from a slow one, and waiting on it forever hands over a
-handler thread per stream. Long enough that a genuinely slow reader is not cut
-off, short enough that a deliberate one cannot accumulate workers.
+query in flight per stream. Long enough that a genuinely slow reader is not cut
+off, short enough that a deliberate one cannot accumulate them.
 */
 DEFAULT_WRITE_TIMEOUT :: 10 * time.Second
 // Advertised receive window. Generous, so a client streaming request bodies is
@@ -177,8 +177,8 @@ Conn :: struct {
 	handler:             Handler,
 	user:                rawptr,
 
-	mu:                  sync.Mutex,
-	cond:                sync.Cond,
+	mu:                  loop.Mutex,
+	cond:                loop.Cond,
 	refs:                int,
 	closed:              bool,
 
@@ -239,7 +239,7 @@ Conn :: struct {
 	write_timeout:       time.Duration,
 	// Answered control frames and stream errors; see Control_Budget.
 	control:             Control_Budget,
-	// Connection credit not yet returned; see CREDIT_BATCH. Reader thread only.
+	// Connection credit not yet returned; see CREDIT_BATCH. Reader only.
 	credit_owed:         int,
 	// Streams in `streams` marked Closed, which the peer no longer counts; see
 	// MAX_HELD_STREAMS and set_state.
@@ -265,18 +265,18 @@ make_conn :: proc(io: IO, handler: Handler, user: rawptr, allocator := context.a
 
 // Take a reference before handing the connection to another thread.
 conn_ref :: proc(c: ^Conn) {
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	c.refs += 1
-	sync.mutex_unlock(&c.mu)
+	loop.unlock(&c.mu)
 }
 
 conn_unref :: proc(c: ^Conn) {
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	c.refs -= 1
 	last := c.refs == 0
 	// Wakes anyone in conn_wait_idle.
-	sync.cond_broadcast(&c.cond)
-	sync.mutex_unlock(&c.mu)
+	loop.cond_broadcast(&c.cond)
+	loop.unlock(&c.mu)
 	if !last {
 		return
 	}
@@ -302,21 +302,21 @@ stream_destroy :: proc(c: ^Conn, s: ^Stream) {
 }
 
 /*
-Block until every handler has finished, leaving only the caller's reference.
+Wait until every handler has finished, leaving only the caller's reference.
 
 Serving code calls this after `serve` returns and before dropping its own
-reference, so a handler still running on another thread cannot reach for a
+reference, so a handler still running on another fiber cannot reach for a
 transport its owner has already torn down. Handlers waiting on flow control are
 released by the close that `serve` performs on its way out, and give up on their
 own deadline in any case, so this cannot wait indefinitely on a peer that has
 stopped reading.
 */
 conn_wait_idle :: proc(c: ^Conn) {
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	for c.refs > 1 {
-		sync.cond_wait(&c.cond, &c.mu)
+		loop.cond_wait(&c.cond, &c.mu)
 	}
-	sync.mutex_unlock(&c.mu)
+	loop.unlock(&c.mu)
 }
 
 /*
@@ -327,10 +327,10 @@ running; they hold their own references.
 */
 serve :: proc(c: ^Conn) {
 	defer {
-		sync.mutex_lock(&c.mu)
+		loop.lock(&c.mu)
 		c.closed = true
-		sync.cond_broadcast(&c.cond)
-		sync.mutex_unlock(&c.mu)
+		loop.cond_broadcast(&c.cond)
+		loop.unlock(&c.mu)
 	}
 
 	if !read_preface(c) {
@@ -341,7 +341,12 @@ serve :: proc(c: ^Conn) {
 	}
 
 	header: [FRAME_HEADER_SIZE]u8
+	// A peer that keeps the socket readable never lets this reader park, and the
+	// handlers it starts on the same loop would wait behind it: counted per frame
+	// as well as per socket call, since `IO` need not be a socket (the tests',
+	// read from memory). See `loop.take_turn`.
 	for {
+		loop.take_turn()
 		if !read_exact(c, header[:]) {
 			return
 		}
@@ -409,8 +414,8 @@ read_exact :: proc(c: ^Conn, buf: []u8, starts_frame := true) -> bool {
 
 @(private)
 write_all :: proc(c: ^Conn, buf: []u8) -> bool {
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
+	loop.lock(&c.mu)
+	defer loop.unlock(&c.mu)
 	if c.closed {
 		return false
 	}
@@ -482,7 +487,7 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			goaway(c, .Protocol_Error if h.stream_id == 0 else .Frame_Size_Error)
 			return false
 		}
-		sync.mutex_lock(&c.mu)
+		loop.lock(&c.mu)
 		orphaned := false
 		if s, found := c.streams[h.stream_id]; found {
 			s.cancelled = true
@@ -495,12 +500,12 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			// there is no stream here for an unmatched id to have parked anyone
 			// on, so broadcasting for one would only wake every other handler on
 			// the connection to recheck a state that has not changed for them.
-			sync.cond_broadcast(&c.cond)
+			loop.cond_broadcast(&c.cond)
 		} else {
 			// Over for the peer too, so nothing more is in flight on it.
 			was_reset_here(c, h.stream_id, forget = true)
 		}
-		sync.mutex_unlock(&c.mu)
+		loop.unlock(&c.mu)
 		if orphaned {
 			close_stream(c, h.stream_id)
 		}
@@ -527,7 +532,7 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 Frames a peer drew out of this end, held to MAX_CONTROL_FRAMES_PER_SECOND plus
 whatever it has earned: `frames` counts the second starting at `window`, and
 `earned` is frames paid for by work this end asked for (the client's answers;
-the server earns nothing). One per connection; reader thread only.
+the server earns nothing). One per connection; reader only.
 
 `earned` is not reset with the window. A PING may trail the answer that paid
 for it by any lag, across a second boundary, and a busy pooled connection
@@ -604,21 +609,21 @@ handle_settings :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return false
 	}
 
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	for i := 0; i + 6 <= len(payload); i += 6 {
 		id := Setting(read_u16(payload[i:]))
 		value := read_u32(payload[i + 2:])
 		#partial switch id {
 		case .Max_Frame_Size:
 			if value < DEFAULT_MAX_FRAME || value > 16777215 {
-				sync.mutex_unlock(&c.mu)
+				loop.unlock(&c.mu)
 				goaway(c, .Protocol_Error)
 				return false
 			}
 			c.peer_max_frame = int(value)
 		case .Initial_Window_Size:
 			if value > MAX_WINDOW {
-				sync.mutex_unlock(&c.mu)
+				loop.unlock(&c.mu)
 				goaway(c, .Flow_Control_Error)
 				return false
 			}
@@ -637,15 +642,15 @@ handle_settings :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 				s.send_window += delta
 				overflow ||= s.send_window > MAX_WINDOW
 			}
-			sync.cond_broadcast(&c.cond)
+			loop.cond_broadcast(&c.cond)
 			if overflow {
-				sync.mutex_unlock(&c.mu)
+				loop.unlock(&c.mu)
 				goaway(c, .Flow_Control_Error)
 				return false
 			}
 		}
 	}
-	sync.mutex_unlock(&c.mu)
+	loop.unlock(&c.mu)
 
 	out := make([dynamic]u8, 0, FRAME_HEADER_SIZE, context.temp_allocator)
 	write_frame_header(&out, 0, .Settings, FLAG_ACK, 0)
@@ -664,7 +669,7 @@ handle_window_update :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return false
 	}
 
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	overflow := false
 	if h.stream_id == 0 {
 		c.send_window += increment
@@ -673,8 +678,8 @@ handle_window_update :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		s.send_window += increment
 		overflow = s.send_window > MAX_WINDOW
 	}
-	sync.cond_broadcast(&c.cond)
-	sync.mutex_unlock(&c.mu)
+	loop.cond_broadcast(&c.cond)
+	loop.unlock(&c.mu)
 
 	if overflow {
 		goaway(c, .Flow_Control_Error)
@@ -705,7 +710,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return false
 	}
 
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	/*
 	An id at or below `last_stream_id` is already in use or closed, which is a
 	connection error - except on a stream this end reset and retired while the
@@ -719,7 +724,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	if h.stream_id <= c.last_stream_id {
 		// Trailers end the stream (RFC 9113 8.1); a block that does not is an id reused.
 		if !was_reset_here(c, h.stream_id, forget = true) || h.flags & FLAG_END_STREAM == 0 {
-			sync.mutex_unlock(&c.mu)
+			loop.unlock(&c.mu)
 			goaway(c, .Protocol_Error)
 			return false
 		}
@@ -752,7 +757,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	append(&s.header_block, ..block)
 	s.end_stream = h.flags & FLAG_END_STREAM != 0
 	c.streams[h.stream_id] = s
-	sync.mutex_unlock(&c.mu)
+	loop.unlock(&c.mu)
 
 	if h.flags & FLAG_END_HEADERS == 0 {
 		c.continuation_on = h.stream_id
@@ -773,7 +778,7 @@ handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 	The size cap below is no cap against frames that carry nothing: an empty
 	CONTINUATION never advances `len(s.header_block)`, so a peer sending them
-	holds the block open and this thread reading nine-byte frames for as long as
+	holds the block open and this reader reading nine-byte frames for as long as
 	it likes. Nothing accrues, which is why the cap is generous - a legitimate
 	block is MAX_HEADER_LIST at the outside and arrives in a handful of frames,
 	so anything near this many is a peer with something else in mind.
@@ -783,7 +788,7 @@ handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		goaway(c, .Enhance_Your_Calm)
 		return false
 	}
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	s, found := c.streams[h.stream_id]
 	/*
 	Bounded as it accumulates, not once it is whole. Neither HEADERS nor
@@ -796,7 +801,7 @@ handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	if found && !oversized {
 		append(&s.header_block, ..payload)
 	}
-	sync.mutex_unlock(&c.mu)
+	loop.unlock(&c.mu)
 	if oversized {
 		goaway(c, .Compression_Error)
 		return false
@@ -1182,7 +1187,7 @@ Decode a completed header block and, if the request is already complete,
 dispatch it.
 
 HPACK state is per connection and order-dependent, so the block must be decoded
-here on the reader thread even when the request body has yet to arrive.
+here on the reader even when the request body has yet to arrive.
 */
 @(private)
 finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
@@ -1264,7 +1269,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	// long as it holds the body, and a :path near MAX_HEADER_LIST on every
 	// stream pins as much as the bodies MAX_CONN_REQUEST exists to bound.
 	fields := len(req.method) + len(req.path) + len(req.authority) + len(req.scheme) + len(req.content_type) + len(req.accept)
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	over := c.request_bytes + fields > MAX_CONN_REQUEST
 	if !over {
 		s.charged = fields
@@ -1272,7 +1277,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 		set_state(c, s, .Half_Closed_Remote if s.end_stream else .Open)
 	}
 	complete := s.end_stream
-	sync.mutex_unlock(&c.mu)
+	loop.unlock(&c.mu)
 	if over {
 		request_destroy(c, req)
 		sent := stream_error(c, s.id, .Refused_Stream)
@@ -1301,7 +1306,7 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return false
 	}
 
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	/*
 	RFC 9113 5.1: a stream id past the highest one this connection has ever
 	opened is idle, and idle only accepts HEADERS or PRIORITY - DATA on one
@@ -1316,7 +1321,7 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	as a stream error, and one that spent the closed-stream budget doing it.
 	*/
 	if h.stream_id > c.last_stream_id || h.stream_id % 2 == 0 {
-		sync.mutex_unlock(&c.mu)
+		loop.unlock(&c.mu)
 		goaway(c, .Protocol_Error)
 		return false
 	}
@@ -1377,7 +1382,7 @@ ignored.
 		set_state(c, s, .Closed)
 		// Wakes a handler parked in write_body's no-credit wait; without this it
 		// sleeps out the full write_timeout on a stream already known dead.
-		sync.cond_broadcast(&c.cond)
+		loop.cond_broadcast(&c.cond)
 	}
 	if found && !already_ended {
 		// Checked before appending, so an oversized body is refused rather than
@@ -1397,7 +1402,7 @@ ignored.
 			grow = min(max(need, 2 * cap(s.body)), MAX_BODY) - cap(s.body)
 		}
 		if oversized || c.request_bytes + grow > MAX_CONN_REQUEST {
-			sync.mutex_unlock(&c.mu)
+			loop.unlock(&c.mu)
 			// No handler behind this reset either, so it is budgeted like a refused
 			// HEADERS: see stream_error.
 			sent := stream_error(c, h.stream_id, oversized ? .Enhance_Your_Calm : .Refused_Stream)
@@ -1418,7 +1423,7 @@ ignored.
 		s.charged += grow
 		c.request_bytes += grow
 	}
-	sync.mutex_unlock(&c.mu)
+	loop.unlock(&c.mu)
 
 	if already_ended {
 		sent := true
@@ -1453,16 +1458,16 @@ ignored.
 	DATA on a stream it has already ended, which is all it takes to be here at
 	the same moment as the handler.
 	*/
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	live, still_open := c.streams[h.stream_id]
 	if !still_open {
-		sync.mutex_unlock(&c.mu)
+		loop.unlock(&c.mu)
 		return true
 	}
 	set_state(c, live, .Half_Closed_Remote)
 	req := live.pending
 	live.pending = nil
-	sync.mutex_unlock(&c.mu)
+	loop.unlock(&c.mu)
 
 	if req == nil {
 		// DATA before HEADERS completed.
@@ -1485,9 +1490,9 @@ dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
 	// Marked before the handler runs, not after: it may answer inline and retire
 	// the stream, and a reset arriving for an answered stream must not be read
 	// as one nobody was ever given.
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	s.dispatched = true
-	sync.mutex_unlock(&c.mu)
+	loop.unlock(&c.mu)
 	c.handler(c, req)
 	return true
 }
@@ -1592,14 +1597,14 @@ was_reset_here :: proc(c: ^Conn, stream_id: u32, forget := false) -> bool {
 
 @(private)
 goaway :: proc(c: ^Conn, code: Error_Code) {
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	if c.goaway_sent {
-		sync.mutex_unlock(&c.mu)
+		loop.unlock(&c.mu)
 		return
 	}
 	c.goaway_sent = true
 	last := c.last_stream_id
-	sync.mutex_unlock(&c.mu)
+	loop.unlock(&c.mu)
 
 	out := make([dynamic]u8, 0, 17, context.temp_allocator)
 	write_frame_header(&out, 8, .Goaway, 0, 0)
@@ -1615,14 +1620,14 @@ Safe to call from any thread. Blocks while the peer's flow-control window has no
 room, waking when a WINDOW_UPDATE arrives or the connection closes.
 */
 respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
-	sync.mutex_lock(&c.mu)
+	loop.lock(&c.mu)
 	s, found := c.streams[stream_id]
 	cancelled := found && s.cancelled
 	if found && len(resp.body) == 0 {
 		// Its END_STREAM rides on the HEADERS below; see MAX_HELD_STREAMS.
 		set_state(c, s, .Closed)
 	}
-	sync.mutex_unlock(&c.mu)
+	loop.unlock(&c.mu)
 	if cancelled {
 		close_stream(c, stream_id)
 		return true
@@ -1668,16 +1673,16 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 	for sent < len(body) {
 		remaining := len(body) - sent
 
-		sync.mutex_lock(&c.mu)
+		loop.lock(&c.mu)
 		chunk := 0
 		for {
 			if c.closed {
-				sync.mutex_unlock(&c.mu)
+				loop.unlock(&c.mu)
 				return false
 			}
 			s, found := c.streams[stream_id]
 			if !found || s.cancelled {
-				sync.mutex_unlock(&c.mu)
+				loop.unlock(&c.mu)
 				return true
 			}
 			available := min(c.send_window, s.send_window)
@@ -1697,8 +1702,8 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 			No credit. A WINDOW_UPDATE or a close will wake us; the deadline is
 			what handles the peer that sends neither. Its reader stays perfectly
 			healthy, so nothing else would ever mark this connection dead, and
-			the wait would keep a handler thread for as long as the peer felt
-			like holding it.
+			the wait would keep the query and its fiber for as long as the peer
+			felt like holding it.
 			*/
 			left := time.diff(time.now(), deadline)
 			if left <= 0 {
@@ -1709,14 +1714,14 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 				// dead, not send a second RST_STREAM onto one this end just reset.
 				s.cancelled = true
 				set_state(c, s, .Closed)
-				sync.cond_broadcast(&c.cond)
-				sync.mutex_unlock(&c.mu)
+				loop.cond_broadcast(&c.cond)
+				loop.unlock(&c.mu)
 				rst_stream(c, stream_id, .Cancel)
 				return false
 			}
-			sync.cond_wait_with_timeout(&c.cond, &c.mu, left)
+			loop.cond_wait_with_timeout(&c.cond, &c.mu, left)
 		}
-		sync.mutex_unlock(&c.mu)
+		loop.unlock(&c.mu)
 
 		last := sent + chunk >= len(body)
 		out := make([dynamic]u8, 0, chunk + FRAME_HEADER_SIZE, context.temp_allocator)
@@ -1733,7 +1738,7 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 /*
 Retire a stream and release it.
 
-The free happens under the lock, not after it. The reader thread looks streams
+The free happens under the lock, not after it. The reader looks streams
 up while holding `c.mu` and acts on what it finds; releasing one outside the
 lock would let this run between that lookup and the use, leaving the reader
 writing into memory that has already gone back to the allocator. Nothing here
@@ -1741,8 +1746,8 @@ does I/O or takes another lock, so holding `c.mu` across it costs nothing.
 */
 @(private)
 close_stream :: proc(c: ^Conn, stream_id: u32, peer_sending := false) {
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
+	loop.lock(&c.mu)
+	defer loop.unlock(&c.mu)
 	s, found := c.streams[stream_id]
 	if !found {
 		return

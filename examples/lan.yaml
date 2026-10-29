@@ -46,11 +46,11 @@ server:
 
   # Left to derive from the machine. A resolver for a household or an office
   # floor is not throughput-bound - a busy home network is a few dozen queries
-  # a second, most of them cache hits - and the derivation (128, fewer on a
-  # machine under 3 GiB) is already generous for that. Set a number only if
-  # you have measured a need: `target_qps * upstream_rtt` is the shape of it,
-  # so 2,000 queries a second of cache misses against a 20 ms upstream wants 40.
-  workers: 0
+  # a second, most of them cache hits - and the derivation (an eighth of memory
+  # over 320 KiB a query: 409 on a 1 GiB machine) is already generous for that.
+  # It bounds queries in flight, not queries a second: 2,000 a second of cache
+  # misses against a 20 ms upstream is 40 in flight.
+  max_pending: 0
 
   # The whole table, and all of it available to one prefix.
   #
@@ -113,11 +113,12 @@ listeners:
     # listening on the public side at all.
     address: "0.0.0.0"
     port: 53
-    # Left to derive: one reader thread per usable CPU, to eight. A reader is
-    # the rate at which this server can hear at all, and one of them drains 2.3
-    # million datagrams a second where that was measured - orders of magnitude
-    # past a LAN. `elodin_udp_receive_drops_total` is what would say otherwise;
-    # if it is zero, this number is already too high rather than too low.
+    # Left to derive: one reader - one event loop - per usable CPU, to eight. A
+    # reader is the rate at which this server can hear at all, and one of them
+    # drains 2.3 million datagrams a second where that was measured - orders of
+    # magnitude past a LAN. `elodin_udp_receive_drops_total` is what would say
+    # otherwise; if it is zero, this number is already too high rather than too
+    # low.
     readers: 0
   tcp:
     enabled: true

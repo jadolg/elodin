@@ -536,6 +536,8 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 	defer delete(r.buf)
 
 	last_question := time.tick_now()
+	// A client pipelining requests the cache answers never lets this fiber park;
+	// its reads and writes step aside between them (`loop.take_turn`).
 	for {
 		// Nothing to free: the round before this one reset the arena on its way out.
 		if doh_question_overdue(s, last_question, time.tick_now()) {
@@ -726,12 +728,13 @@ serve_doh_request :: proc(
 		return send_http_error(conn, "doh", 429, "too many requests", req.keep_alive)
 	}
 
-	// HTTP/1.1, which answers on the connection's own thread rather than on a
-	// worker of the shared pool. Cache-Control mirrors the smallest TTL, or a
+	// HTTP/1.1, which answers on the connection's own fiber rather than on one
+	// of its own. Cache-Control mirrors the smallest TTL, or a
 	// denial's SOA figure, so intermediaries expire the answer at the same time
 	// the DNS data does - the bounded TTL, see `doh_max_age`.
 	max_age: u32
-	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator, shared_worker = false, max_age = &max_age)
+	// Answered on the connection's fiber, outside `max_pending`; see `handle_query`'s `pool`.
+	response, _, ok := handle_query(s, query, .DoH, client, context.temp_allocator, pool = .Connection, max_age = &max_age)
 	if !ok || len(response) == 0 {
 		return send_http_error(conn, "doh", 500, "no response", req.keep_alive)
 	}

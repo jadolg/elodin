@@ -232,7 +232,7 @@ fixture_start :: proc(t: ^testing.T, f: ^Fixture, answer_keys: bool, serve_stale
 	}
 	f.cfg.upstream.servers = servers
 
-	g, gerr := upstream.make_group(f.cfg.upstream, nil)
+	g, gerr := upstream.make_group(f.cfg.upstream)
 	if gerr != .None {
 		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
 		net.close(socket)

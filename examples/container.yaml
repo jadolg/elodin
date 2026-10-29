@@ -50,18 +50,15 @@ server:
 
   # Left to derive, and in a container that is the point rather than a default
   # nobody changed. "Usable" is what this process may have: the affinity mask
-  # and the cgroup limits, so `resources.limits` sizes the pool and
-  # `--check` reports what it settled on. The rule is 128 workers, lowered
-  # whenever the threads that implies would take more than a thirty-second of
-  # usable memory - so a pod limited to 512 MiB derives 21 workers, at 256 MiB
-  # 10, and at 128 MiB 5 - and twice the usable CPUs of them running at once,
-  # which is 2 for a pod limited to one CPU.
+  # and the cgroup limits, so `resources.limits` sizes the server and `--check`
+  # reports what it settled on. The rule is an eighth of usable memory over
+  # 320 KiB a query, 64 to 4096 - so a pod limited to 512 MiB derives 204
+  # queries in flight, at 256 MiB 102, and at 128 MiB the floor of 64.
   #
-  # If you pin a number here, pin the limits too: a 128-worker pool in a pod
-  # limited to 256 MiB is about 34 MB of scratch arenas out of that budget,
-  # once a burst has reached every worker.
-  workers: 0
-  upstream_workers: 0
+  # If you pin a number here, pin the limits too: what a query can come to hold
+  # is a fixed figure, and 4096 of them in a pod limited to 256 MiB is past the
+  # limit at their worst.
+  max_pending: 0
 
   # A cluster's clients are pods, which is a lot of addresses but few
   # connections each - and per-prefix means per /24, which on most CNIs is one
@@ -93,10 +90,10 @@ listeners:
     # decides who is answered.
     address: "0.0.0.0"
     port: 53
-    # Derived like the worker counts, and from the same reading of the cgroup:
-    # one reader thread per usable CPU, to eight, so a pod limited to one CPU
-    # gets one reader rather than one per core of the node it landed on. That
-    # is the whole reason to leave it unset here.
+    # Derived like max_pending, and from the same reading of the cgroup: one
+    # reader - one event loop - per usable CPU, to eight, so a pod limited to
+    # one CPU gets one reader rather than one per core of the node it landed on.
+    # That is the whole reason to leave it unset here.
     readers: 0
   tcp:
     enabled: true

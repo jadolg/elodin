@@ -152,7 +152,7 @@ into the wrong group, which is the one mistake this package exists to avoid, and
 one that leaves no trace of having happened. It has already shown up as a test
 failing on a parallel runner and passing everywhere else.
 
-elodin resolves once at startup, before any worker exists, so nothing in the
+elodin resolves once at startup, before any event loop exists, so nothing in the
 running server races here today. The `_r` forms cost a stack buffer and remove
 the possibility, rather than leaving it resting on the order the startup path
 happens to run in.

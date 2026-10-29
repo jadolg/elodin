@@ -69,7 +69,7 @@ at the DS, which is a larger change than a vector.
 /*
 Bits set for algorithms and digests the probe found the library would not run.
 
-Read from every validating worker and written once, so both go through
+Read from every validating query and written once, so both go through
 `sync.atomic_load`. Zero until `probe_algorithms` has run, which means an
 unprobed build reports exactly the table it implements.
 */

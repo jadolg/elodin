@@ -10,7 +10,6 @@ import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
-import "elodin:pool"
 import "elodin:upstream"
 
 /*
@@ -172,7 +171,7 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	}
 	cfg.upstream.servers = servers
 
-	g, gerr := upstream.make_group(cfg.upstream, nil)
+	g, gerr := upstream.make_group(cfg.upstream)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -227,14 +226,15 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	/*
 	And once the entry has expired, through both ways `cache.stale_timeout`
 	answers: the refresh arriving in time, and the expired bytes when it does
-	not. Declared last so it is torn down first: `pool.destroy` joins a refresh
+	not. Declared last so it is torn down first: `stop_test_loop` waits out a refresh
 	still waiting on the silent upstream.
 	*/
 	cfg.cache.serve_stale = true
 	cfg.cache.stale_timeout = 2 * time.Second
-	workers := pool.make_pool(2)
-	defer pool.destroy(workers)
-	s.handler_pool = workers
+	workers: Test_Loop
+	start_test_loop(&workers)
+	defer stop_test_loop(&workers)
+	s.loops = workers.loops[:]
 	expire :: proc(answers: ^cache.Cache) {
 		for _, e in answers.entries {
 			e.expires = time.time_add(time.now(), -1 * time.Second)
@@ -324,7 +324,7 @@ test_a_cname_rewrite_to_an_answer_over_the_ceiling_keeps_ede_27 :: proc(t: ^test
 	rules[1] = config.Rewrite{domain = "hop.lan.", answers = last_hop, ttl = 60}
 	cfg.rewrites = rules
 
-	g, gerr := upstream.make_group(cfg.upstream, nil)
+	g, gerr := upstream.make_group(cfg.upstream)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -403,7 +403,7 @@ test_the_chain_lookups_spend_what_is_left_of_the_query_budget :: proc(t: ^testin
 	servers[1] = config.Upstream_Spec{name = "chain", kind = .UDP, address = "127.0.0.1", port = bound.port}
 	cfg.upstream.servers = servers
 
-	g, gerr := upstream.make_group(cfg.upstream, nil)
+	g, gerr := upstream.make_group(cfg.upstream)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}

@@ -7,7 +7,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
-import "elodin:pool"
+import "elodin:loop"
 
 /*
 A set of upstreams plus the policy for choosing between them.
@@ -22,39 +22,85 @@ Group :: struct {
 	timeout:    time.Duration,
 	attempts:   int,
 	cursor:     u64,
-	race_pool:  ^pool.Pool,
 	allocator:  mem.Allocator,
 	/*
-	Race workers still running against this group's servers.
+	Racers still running against this group's servers.
 
-	A race worker outlives the caller that started it - see `Race_State` - so a
+	A racer outlives the caller that started it - see `Race_State` - so a
 	group the caller is done with is not yet a group nothing is using. A
 	configuration reload that replaces the group reads this before destroying
 	it; see `busy`.
 	*/
 	racing:     int,
+	// The budget every racer this group starts is counted in; nil is none.
+	racers:     ^Racer_Budget,
+}
+
+/*
+Race legs in flight across every group that shares it, and how many there may be.
+
+Every leg is counted from its start to its end: while its query waits, and after,
+since a race's losers run on to their own timeout once the query has its answer
+(see `Race_State`), each holding a socket while the query that started them is no
+longer counted against `server.max_pending`. The server sizes it at every query
+in flight racing its widest group (`server.race_width`), so ordinary load never
+reaches it; what does is losers piling up behind a member that does not answer.
+Past it a race starts as many legs as there is room for, and with no room at all
+asks its members in turn instead (`resolve_sequential`).
+*/
+Racer_Budget :: struct {
+	in_flight: int,
+	// Zero or less is none.
+	limit:     int,
+}
+
+@(private)
+take_racer :: proc(b: ^Racer_Budget) -> bool {
+	if b == nil {
+		return true
+	}
+	for {
+		n := sync.atomic_load(&b.in_flight)
+		limit := sync.atomic_load(&b.limit)
+		if limit > 0 && n >= limit {
+			return false
+		}
+		if _, taken := sync.atomic_compare_exchange_weak(&b.in_flight, n, n + 1); taken {
+			return true
+		}
+	}
+}
+
+@(private)
+release_racer :: proc(b: ^Racer_Budget) {
+	if b != nil {
+		sync.atomic_sub(&b.in_flight, 1)
+	}
 }
 
 make_group :: proc(
 	cfg: config.Upstream_Config,
-	race_pool: ^pool.Pool,
 	allocator := context.allocator,
 	// Whether plain upstreams are asked with a DNS cookie; see upstream/cookie.odin.
 	cookies := false,
+	// Queries one pipelined connection may carry at once; see `pipeline_outstanding`.
+	outstanding := 0,
+	// What the group's racers are counted in; see `Racer_Budget`.
+	racers: ^Racer_Budget = nil,
 ) -> (
 	g: ^Group,
 	err: Error,
 ) {
 	g = new(Group, allocator)
+	g.racers = racers
 	g.strategy = cfg.strategy
 	g.timeout = cfg.timeout
 	g.attempts = max(cfg.attempts, 1)
-	g.race_pool = race_pool
 	g.allocator = allocator
 
 	servers := make([dynamic]^Upstream, 0, len(cfg.servers), allocator)
 	for spec in cfg.servers {
-		u, uerr := make_upstream(spec, cfg.max_idle, cfg.idle_timeout, allocator, cookies)
+		u, uerr := make_upstream(spec, cfg.max_idle, cfg.idle_timeout, allocator, cookies, outstanding)
 		if uerr != .None {
 			logx.errorf("upstream %s: not usable (%v)", spec.name, uerr)
 			continue
@@ -73,7 +119,7 @@ make_group :: proc(
 }
 
 /*
-Whether a race worker is still using one of this group's servers.
+Whether a racer is still using one of this group's servers.
 
 Nothing new can start once every caller is done with the group, so a group
 that reads idle here after that stays idle and is safe to destroy.
@@ -270,8 +316,8 @@ resolve_insisting :: proc(
 	make several of these calls - a DNSSEC chain walk makes up to
 	`MAX_LOOKUPS_PER_QUERY`, an apex `DS` on a zone route asks two groups, a
 	rewrite alias forwards its target - and each would otherwise wait up to
-	`query_budget` of its own, so a degraded group held a query worker for the
-	sum of them.
+	`query_budget` of its own, so a degraded group held a query in flight for
+	the sum of them.
 
 	The caller owns the deadline and sets it; this only spends it. Every call
 	gets the lesser of its own `query_budget` and what is left, and a call that
@@ -295,8 +341,8 @@ resolve_insisting :: proc(
 		budget = min(budget, left)
 	}
 
-	// Scratch, on the request's own thread, whose arena the caller resets - and
-	// only ever as long as the group.
+	// Scratch, in the request's own, which the caller resets - and only ever as
+	// long as the group.
 	// No capacity asked for: the fast path is a first reply the caller can use,
 	// where nothing is ever appended and this stays an empty header.
 	unreachable: [dynamic]^Upstream
@@ -363,7 +409,7 @@ resolve_insisting :: proc(
 	rather than a SERVFAIL. Taking the first *acceptable* reply inside the race
 	instead would spend nothing at all, and wants its own change: it means
 	teaching `Race_State` to keep a reply it will not return yet, on the one
-	path where a worker can outlive the caller.
+	path where a racer can outlive the caller.
 
 	Since #309 that cost is worth reading twice, because a racing group has a
 	way of paying it on every query. `resolve_race` returns the first reply to
@@ -430,8 +476,8 @@ resolve_insisting :: proc(
 	What that bounds is the group of several spares none of which can be
 	reached. At the full timeout apiece a group of four spends three of them -
 	fifteen seconds as elodin ships - to hand back the reply it had in the first
-	millisecond, holding one of a bounded set of query workers for the whole
-	wait; a client repeating one such name is then a way to empty the pool.
+	millisecond, holding one of `server.max_pending` queries in flight for the
+	whole wait; a client repeating one such name is then a way to fill it.
 
 	Waiting, and not attempts, because the two are not the same thing at all.
 	`exchange` refuses an upstream whose hostname it cannot resolve before it
@@ -588,7 +634,7 @@ has never issued one, which is what a spoofed datagram would send.
 A copy, because `query` is the caller's buffer and is sent again after this
 returns - `resolve_query` re-sends it to the route, and `attach_cookie` reads it
 per upstream. Scratch space, as `exchange` itself uses for the cookie copy: the
-sweep runs on the request's own thread, whose arena the caller resets.
+sweep runs in the request's own scratch, which the caller resets.
 
 A message too short to hold a header is handed on untouched. `exchange` is where
 that is refused; inventing bytes for it here would only hide it.
@@ -837,8 +883,8 @@ resolve_sequential :: proc(
 	Two timeouts of waiting per query, however many members and attempts there
 	are (issue #327). Without it this is `attempts` rounds over every member at
 	the full timeout each - twenty seconds as elodin ships, with two members
-	black-holing a name - holding one of a bounded set of query workers for four
-	times what a stub waits, so a client repeating such names empties the pool.
+	black-holing a name - holding one of `server.max_pending` queries in flight
+	for four times what a stub waits, so a client repeating such names fills it.
 	dnsmasq and Unbound bound a forward near one query timeout.
 
 	Two rather than one so that failover still happens inside the query: a dead
@@ -924,18 +970,18 @@ resolve_sequential :: proc(
 }
 
 /*
-Racing state, shared between the caller and the workers it spawned.
+Racing state, shared between the caller and the racers it started.
 
-Everything a worker touches is heap-allocated and reference counted. A worker
-can outlive the caller — the caller gives up at the group timeout while a
-worker sits in its own socket timeout — so nothing here may live in the
+Everything a racer touches is heap-allocated and reference counted. A racer can
+outlive the caller — the caller gives up at the group timeout while a racer
+sits in its own socket timeout — so nothing here may live in the
 caller's per-request arena, including the query bytes and the response buffers.
 The last reference to leave frees the block.
 */
 @(private)
 Race_State :: struct {
 	mu:          sync.Mutex,
-	sema:        sync.Sema,
+	sema:        loop.Sema,
 	refs:        int,
 	// Set once a winner is recorded; later arrivals discard their answers.
 	done:        bool,
@@ -946,7 +992,7 @@ Race_State :: struct {
 	query:       []u8,
 	timeout:     time.Duration,
 	jobs:        []Race_Job,
-	// Whose `racing` each worker is counted in until it is done.
+	// Whose `racing` each racer is counted in until it is done.
 	group:       ^Group,
 }
 
@@ -975,10 +1021,8 @@ race_state_release :: proc(st: ^Race_State) {
 
 @(private)
 race_worker :: proc(data: rawptr) {
-	// A race-pool worker runs for the life of the process and `exchange` below
-	// takes scratch space for every query it makes. Nothing else resets this
-	// thread's arena, and the arena chains a new block rather than reusing the
-	// old one, so without this it grows for as long as the server runs.
+	// The scratch `exchange` takes is this racer's own, and goes with it - a
+	// fiber's when on a loop, a thread's otherwise.
 	defer free_all(context.temp_allocator)
 
 	job := cast(^Race_Job)data
@@ -1005,12 +1049,14 @@ race_worker :: proc(data: rawptr) {
 		delete(resp)
 	}
 	if won || last_one {
-		sync.sema_post(&st.sema)
+		loop.sema_post(&st.sema)
 	}
-	// Last, after the worker's final touch of `job.upstream`: a reload may
+	// Last, after the racer's final touch of `job.upstream`: a reload may
 	// destroy the group the moment this reaches zero.
 	group := st.group
 	race_state_release(st)
+	// The budget outlives every group; the group may not outlive the next line.
+	release_racer(group.racers)
 	sync.atomic_sub(&group.racing, 1)
 }
 
@@ -1060,6 +1106,9 @@ resolve_race :: proc(
 
 	submitted := 0
 	for u, i in candidates {
+		if !take_racer(g.racers) {
+			break
+		}
 		st.jobs[i] = Race_Job {
 			upstream = u,
 			state    = st,
@@ -1070,12 +1119,17 @@ resolve_race :: proc(
 		sync.mutex_unlock(&st.mu)
 		sync.atomic_add(&g.racing, 1)
 
-		if !pool.submit(g.race_pool, race_worker, &st.jobs[i]) {
-			// The pool is shutting down; undo this leg's bookkeeping.
+		/*
+		A fiber beside the caller's on its loop: the racers wait on the network
+		while the caller waits on them, and none of them holds a thread.
+		*/
+		if !loop.go(race_worker, &st.jobs[i]) {
+			// The loop is shutting down; undo this leg's bookkeeping.
 			sync.mutex_lock(&st.mu)
 			st.refs -= 1
 			st.outstanding -= 1
 			sync.mutex_unlock(&st.mu)
+			release_racer(g.racers)
 			sync.atomic_sub(&g.racing, 1)
 			continue
 		}
@@ -1085,9 +1139,7 @@ resolve_race :: proc(
 		return resolve_sequential(g, query, 0, budget, allocator, unreachable)
 	}
 
-	pool.blocking_begin()
-	answered := sync.sema_wait_with_timeout(&st.sema, g.timeout)
-	pool.blocking_end()
+	answered := loop.sema_wait_with_timeout(&st.sema, g.timeout)
 	if !answered {
 		// Nobody answered in time. Workers still running will see `done` and
 		// throw their answers away rather than writing into a dead frame.
@@ -1103,7 +1155,7 @@ resolve_race :: proc(
 		return nil, nil, st.last_err
 	}
 	// Hand the caller a copy in its own allocator; the shared buffer is freed
-	// with the state once the last worker has let go of it.
+	// with the state once the last racer has let go of it.
 	out := make([]u8, len(st.response), allocator)
 	copy(out, st.response)
 	return out, st.winner, .None

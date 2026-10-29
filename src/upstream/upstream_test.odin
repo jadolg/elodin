@@ -13,6 +13,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 import "elodin:tlsx"
 
 /*
@@ -28,6 +29,8 @@ the arena is back to empty after each one.
 Mock :: struct {
 	socket: net.UDP_Socket,
 	stop:   bool,
+	// Queries answered so far.
+	asked:  int,
 }
 
 /*
@@ -49,6 +52,7 @@ mock_loop :: proc(m: ^Mock) {
 			continue
 		}
 		buf[2] |= 0x80
+		sync.atomic_add(&m.asked, 1)
 		_, _ = net.send_udp(m.socket, buf[:n], client)
 	}
 }
@@ -67,11 +71,102 @@ temp_arena :: proc() -> ^runtime.Arena {
 	return &data.arena
 }
 
+/*
+A race starts only the legs its budget has room for. A loser runs on after its
+query has the answer, so the budget, not the query, is what bounds them: with no
+room the members are asked in turn, with room for one only one is asked, and with
+no budget every member is.
+*/
+@(test)
+test_a_race_starts_only_the_legs_its_budget_has_room_for :: proc(t: ^testing.T) {
+	m := Mock{}
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if serr != nil {
+		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
+		return
+	}
+	m.socket = socket
+	set_socket_timeouts(socket, 50 * time.Millisecond)
+	bound, berr := net.bound_endpoint(socket)
+	if berr != nil {
+		net.close(socket)
+		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
+		return
+	}
+	responder := thread.create_and_start_with_poly_data(&m, mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(socket)
+	}
+
+	cfg := config.Upstream_Config {
+		strategy = .Race,
+		timeout  = 2 * time.Second,
+		attempts = 1,
+		servers  = []config.Upstream_Spec {
+			{name = "a", kind = .UDP, address = "127.0.0.1", port = bound.port},
+			{name = "b", kind = .UDP, address = "127.0.0.1", port = bound.port},
+		},
+	}
+	query := dns.Message {
+		id       = 0x2B2B,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc_err == .None, "cannot encode the query: %v", enc_err) {
+		return
+	}
+
+	Case :: struct {
+		name:   string,
+		budget: ^Racer_Budget,
+		asked:  int,
+	}
+	full := Racer_Budget{in_flight = 1, limit = 1}
+	room := Racer_Budget{limit = 1}
+	cases := []Case {
+		{"no room", &full, 1},
+		{"room for one", &room, 1},
+		{"no budget", nil, 2},
+	}
+	for c in cases {
+		g, gerr := make_group(cfg, racers = c.budget)
+		if !testing.expectf(t, gerr == .None, "%s: cannot build the group: %v", c.name, gerr) {
+			return
+		}
+		before := sync.atomic_load(&m.asked)
+		_, _, err := resolve_race(g, wire, 2 * time.Second, context.temp_allocator)
+		testing.expectf(t, err == .None, "%s: the race was not answered: %v", c.name, err)
+		// Every leg has let go of the group once it is not busy, and a leg that
+		// has let go has had its answer.
+		for deadline := time.tick_now(); busy(g) && time.tick_since(deadline) < 5 * time.Second; {
+			time.sleep(time.Millisecond)
+		}
+		testing.expectf(t, !busy(g), "%s: a leg never finished", c.name)
+		testing.expectf(
+			t,
+			sync.atomic_load(&m.asked) - before == c.asked,
+			"%s: %d members asked, want %d",
+			c.name,
+			sync.atomic_load(&m.asked) - before,
+			c.asked,
+		)
+		if c.budget != nil {
+			want := 1 if c.budget == &full else 0
+			testing.expectf(t, sync.atomic_load(&c.budget.in_flight) == want, "%s: the budget was not given back", c.name)
+		}
+		destroy_group(g)
+	}
+	free_all(context.temp_allocator)
+}
+
 // A group with no usable server is refused with nothing left allocated: a reload
 // that cannot build one keeps running, so a leak here is one per SIGHUP.
 @(test)
 test_a_group_with_no_usable_server_releases_what_it_took :: proc(t: ^testing.T) {
-	g, err := make_group(config.Upstream_Config{}, nil)
+	g, err := make_group(config.Upstream_Config{})
 	testing.expect(t, g == nil, "a group with no servers was built")
 	testing.expect_value(t, err, Error.Not_Resolved)
 }
@@ -3167,7 +3262,7 @@ release_connecting :: proc(r: ^Releaser) {
 	time.sleep(r.after)
 	sync.mutex_lock(&r.u.mu)
 	r.u.connecting = false
-	sync.cond_broadcast(&r.u.conn_cond)
+	loop.cond_broadcast(&r.u.conn_cond)
 	sync.mutex_unlock(&r.u.mu)
 }
 
@@ -4192,7 +4287,9 @@ test_a_zero_socket_timeout_is_still_no_timeout :: proc(t: ^testing.T) {
 	defer net.close(socket)
 	set_socket_timeouts(socket, 0)
 	buf: [16]u8
-	n, rerr := net.recv_tcp(socket, buf[:])
+	// Through the call every transport reads with: the socket is non-blocking,
+	// and this is what waits on it for as long as its timeout says.
+	n, rerr := loop.recv_tcp(socket, buf[:])
 	testing.expectf(t, rerr == nil && n == 1, "a read with no timeout gave %d bytes, %v", n, rerr)
 }
 

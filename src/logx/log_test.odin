@@ -1,9 +1,11 @@
 package logx
 
+import "base:runtime"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:testing"
+import "core:unicode/utf8"
 
 /*
 One test proc, on purpose.
@@ -71,6 +73,129 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 	// is asked for, and not on the warn a window, which is written regardless.
 	testing.expect_value(t, after_stamp(t, lines[9]), `level=warn msg="query a.example failed"`)
 	testing.expect_value(t, after_stamp(t, lines[10]), `level=debug msg="query b.example failed" client=192.0.2.1:53000`)
+
+	/*
+	A line still goes out when there is no memory to render it in. That is the
+	moment the lines about memory are written - the OS refusing a fiber's stack
+	is also the OS refusing the scratch the line would be formatted out of - and
+	most of them are said once (`report_once`), so one lost is lost for good.
+	*/
+	{
+		context.temp_allocator = refusing_allocator()
+		warnf("refusing a connection, the OS would not map a stack for it - %s", "check RLIMIT_AS")
+	}
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 12, "%d lines written once memory ran out, want 12", len(lines)) {
+		return
+	}
+	testing.expect_value(
+		t,
+		after_stamp(t, lines[11]),
+		`level=warn msg="refusing a connection, the OS would not map a stack for it - check RLIMIT_AS"`,
+	)
+
+	// Past the stack buffers a line is rendered whole on the temp allocator, and
+	// with nothing to allocate it is cut short but still one record.
+	long := strings.repeat("x", 2 * LINE_BUFFER, context.temp_allocator)
+	warnf("%s", long)
+	{
+		context.temp_allocator = refusing_allocator()
+		warnf("%s", long)
+	}
+	warnf("after")
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 15, "%d lines after the long ones, want 15", len(lines)) {
+		return
+	}
+	testing.expect_value(t, after_stamp(t, lines[12]), strings.concatenate({"level=warn msg=", long}, context.temp_allocator))
+	testing.expect(t, strings.has_prefix(after_stamp(t, lines[13]), "level=warn msg=xxxx"), "the cut-short line lost its record")
+	testing.expectf(t, len(lines[13]) < LINE_BUFFER, "the cut-short line is %d bytes, past the stack buffer", len(lines[13]))
+	testing.expect_value(t, after_stamp(t, lines[14]), "level=warn msg=after")
+
+	// A quoted message cut short keeps its closing quote: a line that ends inside
+	// a quoted value is no record to a logfmt reader. Control bytes render four
+	// bytes each, so even the message `render` cut to its buffer is past the line's.
+	{
+		escaped := strings.repeat("\x01", LINE_BUFFER, context.temp_allocator)
+		context.temp_allocator = refusing_allocator()
+		warnf("%s", escaped)
+	}
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 16, "%d lines after the quoted one, want 16", len(lines)) {
+		return
+	}
+	cut := after_stamp(t, lines[15])
+	testing.expect(t, strings.has_prefix(cut, `level=warn msg="\x01\x01`), "the cut-short quoted line lost its record")
+	testing.expect(t, strings.has_suffix(cut, `\x01"`), "the cut-short line ends inside its quoted message")
+
+	// Both cuts land on a rune boundary. Five bytes a unit, so neither the
+	// message buffer (1024) nor the cut-short record (`CUT_MESSAGE`) ends on one
+	// by accident, and the escapes push the record past the line buffer.
+	{
+		runes := strings.repeat("\x01\x01€", 400, context.temp_allocator)
+		context.temp_allocator = refusing_allocator()
+		warnf("%s", runes)
+	}
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 17, "%d lines after the multibyte one, want 17", len(lines)) {
+		return
+	}
+	testing.expect(t, utf8.valid_string(lines[16]), "a cut-short line split a rune")
+	testing.expect(t, strings.has_suffix(lines[16], `"`), "the cut-short multibyte line ends inside its quoted message")
+
+	// A record that exactly fills the line buffer is whole, and keeps its fields.
+	eventf(.Info, "exact", "pad=%s", "x")
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 18, "%d lines after the probe, want 18", len(lines)) {
+		return
+	}
+	// The probe's length less its one-byte pad, and one for the newline.
+	pad := strings.repeat("x", LINE_BUFFER - (len(lines[17]) - 1) - 1, context.temp_allocator)
+	eventf(.Info, "exact", "pad=%s", pad)
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 19, "%d lines after the exact one, want 19", len(lines)) {
+		return
+	}
+	testing.expect_value(t, len(lines[18]) + 1, LINE_BUFFER)
+	testing.expect_value(t, after_stamp(t, lines[18]), strings.concatenate({"level=info msg=exact pad=", pad}, context.temp_allocator))
+
+	// Fields cut short for want of memory are left off, as on the cut-short
+	// record: cut, they would end inside their quoted value.
+	{
+		quoted := strings.concatenate({`"`, strings.repeat("y", 2 * PART_BUFFER, context.temp_allocator), `"`}, context.temp_allocator)
+		context.temp_allocator = refusing_allocator()
+		eventf(.Info, "cut", "name=%s", quoted)
+	}
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 20, "%d lines after the cut fields, want 20", len(lines)) {
+		return
+	}
+	testing.expect_value(t, after_stamp(t, lines[19]), "level=info msg=cut")
+}
+
+// An allocator with nothing to give, as a fiber's scratch is once the OS will
+// map no more blocks for it.
+@(private = "file")
+refusing_allocator :: proc() -> runtime.Allocator {
+	return runtime.Allocator {
+		procedure = proc(
+			_: rawptr,
+			mode: runtime.Allocator_Mode,
+			_, _: int,
+			_: rawptr,
+			_: int,
+			_ := #caller_location,
+		) -> (
+			[]byte,
+			runtime.Allocator_Error,
+		) {
+			#partial switch mode {
+			case .Free, .Free_All:
+				return nil, nil
+			}
+			return nil, .Out_Of_Memory
+		},
+	}
 }
 
 @(private = "file")

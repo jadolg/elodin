@@ -32,32 +32,37 @@ StateDirectory=elodin
 CacheDirectory=elodin
 ConfigurationDirectory=elodin
 
-# With the server worker counts left unset, elodin sizes its thread pools from
-# what this unit may use rather than from what the machine has: MemoryMax=
-# lowers server.workers, CPUQuota= lowers server.running_workers. Neither is
-# set by default; both are worth having on a machine elodin shares.
+# With its sizes left unset, elodin sizes itself from what this unit may use
+# rather than from what the machine has: MemoryMax= lowers server.max_pending,
+# the queries it holds in flight, and CPUQuota= lowers the number of event
+# loops (listeners.udp.readers). Neither is set by default; both are worth
+# having on a machine elodin shares.
 # CPUQuota=50%
 # MemoryMax=256M
 
 # Every connection elodin holds is a descriptor, and systemd leaves the soft
-# limit at 1024 otherwise. The shipped server.max_connections (512) fits under
-# it, but not by as much as the table alone suggests: the worker pools (192
-# threads where memory allows the derived 128 handlers), the upstream pools and
-# the readers want a couple of hundred more between them, so a 1024 limit is
-# short somewhere above 750 rather than above 1000. Past the limit the
+# limit at 1024 otherwise. Every query in flight may hold an upstream socket as
+# well, and server.max_pending derives to thousands on a machine with a few GB,
+# so the connection table, the queries in flight, the upstream pools and the
+# loops together are past 1024 on most machines - and under strategy: race each
+# query may hold a socket per server it races. Past the limit the
 # accept loop cannot take a connection at all: it waits between attempts,
 # escalating to a second, warns once naming this setting, and counts each wait
-# as accept_backoff=. 8192 leaves room to raise max_connections into the thousands without editing the unit;
-# past that, raise this with it.
-LimitNOFILE=8192
+# as accept_backoff=. 65536 covers the largest derived figures racing a dozen
+# servers (4096 in flight, 4096 race queries per server, 512 connections) and
+# leaves room to raise max_connections into the thousands without editing the
+# unit; past that, raise this with it. A descriptor limit costs nothing until it
+# is used.
+LimitNOFILE=65536
 
 # A blocklist refresh builds new rule tables, tens of MB at a few hundred
 # thousand rules, and frees the old ones. Each free of a block that large raises
 # glibc's mmap threshold to its size, so the next refresh's tables come from the
 # heap, which does not give freed memory back: resident memory settles at a
 # refresh's peak, about twice what the rules need. A fixed threshold keeps them
-# mmap'd and returned on free. Per-query allocations stay below it; a thread's
-# scratch arena is mapped by elodin itself and unmapped when the thread exits.
+# mmap'd and returned on free. Per-query allocations stay below it; a fiber's
+# stack and scratch are mapped by elodin itself and given back when an idle
+# loop trims them.
 # The transport benchmarks stayed within their noise (#513). musl ignores it.
 # For glibc's default, put UnsetEnvironment=MALLOC_MMAP_THRESHOLD_ in a drop-in.
 Environment=MALLOC_MMAP_THRESHOLD_=131072

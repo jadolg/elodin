@@ -237,7 +237,7 @@ harness_start :: proc(t: ^testing.T, h: ^Harness, caching := true) -> bool {
 	}
 	h.cfg.upstream.servers = servers
 
-	group, gerr := upstream.make_group(h.cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(h.cfg.upstream, context.allocator, false)
 	if gerr != .None {
 		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
 		return false

@@ -7,6 +7,7 @@ import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "elodin:loop"
 
 /*
 HPACK tests built on the worked examples in RFC 7541 appendix C, so the codec is
@@ -1795,10 +1796,10 @@ test_response_gives_up_when_no_window_is_granted :: proc(t: ^testing.T) {
 
 	if !finished {
 		// Release it so the suite can finish rather than hang on the join.
-		sync.mutex_lock(&c.mu)
+		loop.lock(&c.mu)
 		c.closed = true
-		sync.cond_broadcast(&c.cond)
-		sync.mutex_unlock(&c.mu)
+		loop.cond_broadcast(&c.cond)
+		loop.unlock(&c.mu)
 	}
 	thread.join(worker)
 	thread.destroy(worker)
@@ -1858,10 +1859,10 @@ test_data_after_end_stream_wakes_a_parked_responder :: proc(t: ^testing.T) {
 	testing.expect(t, finished, "the parked responder was not woken by the violation that cancelled its stream")
 
 	if !finished {
-		sync.mutex_lock(&c.mu)
+		loop.lock(&c.mu)
 		c.closed = true
-		sync.cond_broadcast(&c.cond)
-		sync.mutex_unlock(&c.mu)
+		loop.cond_broadcast(&c.cond)
+		loop.unlock(&c.mu)
 	}
 	thread.join(worker)
 	thread.destroy(worker)

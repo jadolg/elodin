@@ -895,7 +895,7 @@ test_unvalidated_answer_is_not_cached_with_ad :: proc(t: ^testing.T) {
 	}
 	cfg.upstream.servers = servers
 
-	g, gerr := upstream.make_group(cfg.upstream, nil)
+	g, gerr := upstream.make_group(cfg.upstream)
 	if gerr != .None {
 		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
 		return

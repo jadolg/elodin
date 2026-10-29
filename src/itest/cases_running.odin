@@ -7,19 +7,19 @@ import "core:time"
 import "elodin:dns"
 
 /*
-The running limit, against the running binary.
+Waits overlap on one event loop, against the running binary (#547).
 
-`server.running_workers` caps how many of the pool's workers are on the CPU at
-once, and a worker waiting on the network or on another query does not count
-against it. What a client can see of that is the second half: with one running
-worker, queries that each wait on a slow upstream still overlap, and the cases
-here hold a single slot while something waits in each of the places a handler
-waits - an upstream round trip, a coalesced follower, a DoH reply parked on the
-client's flow-control window. A wait the pool did not know about would show as
-the other queries arriving one round trip, or one write timeout, late.
+Every query runs on a fiber, and a fiber waiting on the network or on another
+query parks while the loop runs the others. What a client can see of that is
+that one loop - one thread - still overlaps queries that each wait on a slow
+upstream, and the cases here run a single loop while something waits in each of
+the places a query waits: an upstream round trip, a coalesced follower, a DoH
+reply parked on the client's flow-control window, its racers, a stale refresh. A
+wait that blocked the loop thread instead of parking would show as the other
+queries arriving one round trip, or one write timeout, late.
 
 The upstream answers after `DELAY`, and each bound sits half a delay past one
-round trip: what a missed wait costs is a whole round trip more, at least.
+round trip: what a blocked wait costs is a whole round trip more, at least.
 */
 
 @(private = "file")
@@ -29,7 +29,7 @@ DELAY :: 600 * time.Millisecond
 WITHIN :: DELAY + DELAY / 2
 
 @(private = "file")
-config_running :: proc(r: ^Runner, udp_port, doh_port, upstream_port: int, server: string) -> string {
+config_running :: proc(r: ^Runner, udp_port, doh_port, upstream_port: int, server: string, readers := 1) -> string {
 	doh := "doh: { enabled: false }"
 	if doh_port > 0 {
 		doh = fmt.tprintf(
@@ -44,7 +44,7 @@ config_running :: proc(r: ^Runner, udp_port, doh_port, upstream_port: int, serve
 server:
 %s
 listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d, readers: %d }}
   tcp: {{ enabled: false }}
   %s
 upstream:
@@ -56,6 +56,7 @@ blocking: {{ enabled: false }}
 `,
 		server,
 		udp_port,
+		readers,
 		doh,
 		upstream_port,
 	)
@@ -121,14 +122,14 @@ burst_queries :: proc(prefix: string, n: int, first_id: u16) -> [][]u8 {
 	return queries
 }
 
-run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
+run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 	upstream_port := next_port(r)
 	mock := mock_make("running", upstream_port)
 	// No payload: an empty NOERROR for whatever was asked, so every name is
 	// its own question and its own round trip.
 	mock_delay_all(mock, DELAY, nil)
 	if !mock_start(mock) {
-		skip_case(r, "server.running_workers", "cannot start the mock upstream")
+		skip_case(r, "one loop", "cannot start the mock upstream")
 		return
 	}
 	defer mock_stop(mock)
@@ -143,7 +144,7 @@ run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
 				udp_port,
 				doh_port,
 				upstream_port,
-				"  workers: 8\n  running_workers: 1\n  client_timeout: 5s\n  rate_limit: { enabled: false }",
+				"  client_timeout: 5s\n  rate_limit: { enabled: false }",
 			),
 			udp_port = udp_port,
 			doh_port = doh_port,
@@ -151,17 +152,17 @@ run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
 		},
 	)
 	if !ok {
-		skip_case(r, "server.running_workers", "server did not start")
+		skip_case(r, "one loop", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
 
-	start_case(r, "running_workers: one running worker still overlaps queries waiting on the upstream")
+	start_case(r, "one loop: queries waiting on the upstream overlap")
 	{
 		check(
 			r,
-			log_contains(&srv, "running_workers=1"),
-			"the sizing line does not report the configured limit; log:\n%s",
+			log_contains(&srv, "loops=1"),
+			"the sizing line does not report the one loop; log:\n%s",
 			read_log(&srv),
 		)
 		answered, elapsed := udp_burst(udp_port, burst_queries("overlap", 8, 0x5100))
@@ -170,19 +171,19 @@ run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
 		check(
 			r,
 			elapsed < WITHIN,
-			"8 queries against a %v upstream took %v on one running worker: the round trips did not overlap",
+			"8 queries against a %v upstream took %v on one loop: the round trips did not overlap",
 			DELAY,
 			elapsed,
 		)
 	}
 	end_case(r)
 
-	start_case(r, "running_workers: a coalesced follower does not hold the running slot")
+	start_case(r, "one loop: a coalesced follower does not hold the loop")
 	{
 		/*
 		One name three times, then four of their own. The first is the leader
 		and waits on the upstream; the next two wait on the leader, which is
-		the wait under test. Held, the slot keeps the four behind it until the
+		the wait under test. Blocking, it keeps the four behind it until the
 		leader lands, and they reach the upstream a round trip late.
 		*/
 		same := build_query("coalesced.example.", u16(dns.Type.A), id = 0x5200, allocator = context.temp_allocator)
@@ -204,7 +205,7 @@ run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
 	end_case(r)
 
 	if cert_ok {
-		start_case(r, "running_workers: a DoH reply parked on flow control does not hold the running slot")
+		start_case(r, "one loop: a DoH reply parked on flow control does not hold the loop")
 		{
 			// A one-byte window: the reply's first DATA frame carries one byte
 			// and the rest waits on credit this client never gives, up to the
@@ -242,11 +243,10 @@ run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
 	}
 
 	/*
-	A handler under `strategy: race` waits on its racers rather than on a
-	socket. Racers run on a pool of their own, sized here so that it is not
-	what holds the queries back.
+	A query under `strategy: race` waits on its racers rather than on a socket,
+	and the racers are fibers of the same loop.
 	*/
-	start_case(r, "running_workers: a handler waiting on its racers does not hold the running slot")
+	start_case(r, "one loop: a query waiting on its racers does not hold the loop")
 	{
 		second_port := next_port(r)
 		second := mock_make("running-race", second_port)
@@ -260,7 +260,7 @@ run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
 					race_port,
 					0,
 					upstream_port,
-					"  workers: 8\n  running_workers: 1\n  upstream_workers: 16\n  rate_limit: { enabled: false }",
+					"  rate_limit: { enabled: false }",
 				),
 				fmt.tprintf("  servers: [\"127.0.0.1:%d\"]", upstream_port),
 				fmt.tprintf(
@@ -279,7 +279,7 @@ run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
 				check(
 					r,
 					elapsed < WITHIN,
-					"4 raced queries against %v upstreams took %v on one running worker",
+					"4 raced queries against %v upstreams took %v on one loop",
 					DELAY,
 					elapsed,
 				)
@@ -290,12 +290,12 @@ run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
 
 	/*
 	A client served from an expired entry waits up to `stale_timeout` for the
-	refresh it started, and the refresh runs on this same pool. Held, the slot
-	would leave the refresh queued behind the very worker waiting for it, and
-	the client would get the stale answer at the timer rather than the fresh
-	one a round trip in.
+	refresh it started, and the refresh runs on this same loop. Blocking, the
+	wait would leave the refresh unrun behind the very query waiting for it, and
+	the client would get the stale answer at the timer rather than the fresh one
+	a round trip in.
 	*/
-	start_case(r, "running_workers: a client waiting on its stale refresh does not hold the running slot")
+	start_case(r, "one loop: a client waiting on its stale refresh does not hold the loop")
 	{
 		qname := "stale-slot.example."
 		stale_port := next_port(r)
@@ -305,7 +305,7 @@ run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
 			defer mock_stop(stale_mock)
 			udp := next_port(r)
 			stale_config, _ := strings.replace(
-				config_running(r, udp, 0, stale_port, "  workers: 8\n  running_workers: 1\n  rate_limit: { enabled: false }"),
+				config_running(r, udp, 0, stale_port, "  rate_limit: { enabled: false }"),
 				"cache: { enabled: false }",
 				"cache: { enabled: true, max_entries: 100, max_ttl: 1, serve_stale: true, stale_timeout: 2s }",
 				1,
@@ -335,18 +335,15 @@ run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
 	end_case(r)
 
 	/*
-	The derived sizing, which is what an installation that names no number
-	gets: a pool as wide as the memory allows, whatever the core count, so a
-	burst of misses wider than the cores still overlaps its round trips.
+	What is in flight is not a thread count. One loop, and `max_pending` left to
+	the machine, carries a burst of 500 misses at once, all on one thread.
 
 	Read off the upstream rather than a clock: a mock of its own holds every
-	reply until all 64 questions are waiting on it, which only a pool with all
-	64 in flight at once can bring about. A pool that ran fewer would leave the
-	hold unreached and the burst unanswered. A bound on the elapsed time was
-	this case's first form, and an AddressSanitizer build on four cores spends
-	the half-delay of slack in it on its own.
+	reply until all 500 questions are waiting on it, which only a server with all
+	of them in flight at once can bring about. One that ran fewer would leave the
+	hold unreached and the burst unanswered.
 	*/
-	start_case(r, "running_workers: the derived pool carries a burst of 64 misses at once")
+	start_case(r, "one loop: carries a burst of 500 misses at once")
 	{
 		derived_mock := mock_make("running-derived", next_port(r))
 		mock_delay_all(derived_mock, 0, nil)
@@ -356,23 +353,17 @@ run_running_worker_cases :: proc(r: ^Runner, cert_ok: bool) {
 			dsrv, dok := start_server(
 				r,
 				Server_Options {
-					config = config_running(r, derived_port, 0, derived_mock.port, "  rate_limit: { enabled: false }"),
+					config = config_running(r, derived_port, 0, derived_mock.port, "  max_pending: 1024\n  rate_limit: { enabled: false }"),
 					udp_port = derived_port,
 					warmup = DELAY,
 				},
 			)
 			if check(r, dok, "server did not start") {
 				defer stop_server(&dsrv)
-				check(
-					r,
-					log_contains(&dsrv, "running_workers="),
-					"the sizing line does not report the running limit; log:\n%s",
-					read_log(&dsrv),
-				)
-				mock_hold_until(derived_mock, 64)
-				answered, _ := udp_burst(derived_port, burst_queries("derived", 64, 0x5400))
-				check(r, mock_held(derived_mock) >= 64, "only %d of 64 misses reached the upstream at once", mock_held(derived_mock))
-				check_eq_int(r, answered, 64, "queries answered")
+				mock_hold_until(derived_mock, 500)
+				answered, _ := udp_burst(derived_port, burst_queries("derived", 500, 0x5400))
+				check(r, mock_held(derived_mock) >= 500, "only %d of 500 misses reached the upstream at once", mock_held(derived_mock))
+				check_eq_int(r, answered, 500, "queries answered")
 			}
 		}
 	}

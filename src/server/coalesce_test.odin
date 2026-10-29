@@ -291,7 +291,7 @@ run_burst :: proc(
 		port    = bound.port,
 	}
 	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return -1
 	}
@@ -601,28 +601,43 @@ test_a_follower_is_told_whether_its_message_was_the_leaders :: proc(t: ^testing.
 	testing.expect(t, !follow(leader, nil), "no message was the same")
 }
 
-// Followers on the shared pool stop at the ceiling, and the count comes back
-// down as they leave.
+// A quarter of `max_pending`, the queries a follower's place is counted among.
 @(test)
-test_followers_on_the_shared_pool_stop_at_the_ceiling :: proc(t: ^testing.T) {
+test_the_follower_ceiling_is_a_quarter_of_max_pending :: proc(t: ^testing.T) {
+	cfg: config.Config
+	cfg.server.max_pending = 16
+	cfg.server.max_connections = 48
+	s := Server{cfg = &cfg}
+	testing.expect_value(t, follower_ceiling(&s), 4)
+	cfg.server.max_pending = 0
+	testing.expect_value(t, follower_ceiling(&s), 0)
+}
+
+/*
+Followers counted in `max_pending` stop at the ceiling, and the count comes back
+down as they leave. A query on a connection follows uncounted: `max_connections`
+bounds those, and counting them here would let a client holding connections fill
+the ceiling and leave every datagram for a hot name to forward on its own.
+*/
+@(test)
+test_counted_followers_stop_at_the_ceiling :: proc(t: ^testing.T) {
 	s: Server
 	lead: Flight
-	first, _ := flight_join(&s, "k", &lead, shared = true, ceiling = 2)
+	first, _ := flight_join(&s, "k", &lead, counted_query = true, ceiling = 2)
 	testing.expect(t, first == &lead, "the first query did not lead")
 	a, b, c: Flight
-	fa, ca := flight_join(&s, "k", &a, shared = true, ceiling = 2)
-	fb, cb := flight_join(&s, "k", &b, shared = true, ceiling = 2)
-	fc, _ := flight_join(&s, "k", &c, shared = true, ceiling = 2)
+	fa, ca := flight_join(&s, "k", &a, counted_query = true, ceiling = 2)
+	fb, cb := flight_join(&s, "k", &b, counted_query = true, ceiling = 2)
+	fc, _ := flight_join(&s, "k", &c, counted_query = true, ceiling = 2)
 	testing.expect(t, fa == &lead && fb == &lead, "a follower under the ceiling was turned away")
 	testing.expect(t, fc == nil, "a follower past the ceiling was let in")
-	// A connection's own thread is not the pool's to protect.
 	d: Flight
-	fd, cd := flight_join(&s, "k", &d, shared = false, ceiling = 2)
-	testing.expect(t, fd == &lead && !cd, "a follower off the shared pool was turned away or counted")
+	fd, cd := flight_join(&s, "k", &d, counted_query = false, ceiling = 2)
+	testing.expect(t, fd == &lead && !cd, "a follower on a connection was turned away or counted")
 
 	_, _, _ = flight_follow(&s, fa, 0, context.temp_allocator, ca)
 	testing.expect_value(t, s.inflight.followers, 1)
-	fe, ce := flight_join(&s, "k", &c, shared = true, ceiling = 2)
+	fe, ce := flight_join(&s, "k", &c, counted_query = true, ceiling = 2)
 	testing.expect(t, fe == &lead, "the slot a follower left was not free again")
 	_, _, _ = flight_follow(&s, fb, 0, context.temp_allocator, cb)
 	_, _, _ = flight_follow(&s, fe, 0, context.temp_allocator, ce)
@@ -735,7 +750,7 @@ test_a_follower_waits_no_longer_than_its_deadline_allows :: proc(t: ^testing.T) 
 	cfg.upstream.attempts = 2
 	cfg.upstream.timeout = TIMEOUT
 	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -821,7 +836,7 @@ test_a_follower_still_takes_an_answer_landing_just_past_its_deadline :: proc(t: 
 	cfg.upstream.timeout = TIMEOUT
 	servers := []config.Upstream_Spec{{name = "silent", kind = .UDP, address = "127.0.0.1", port = bound.port}}
 	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}

@@ -426,3 +426,47 @@ test_a_raw_expansion_the_request_cannot_pay_for_is_not_the_record_s_fault :: pro
 	_, over := decode_message(msg[:], a, &spent)
 	testing.expect_value(t, over, Decode_Error.Request_Budget)
 }
+
+/*
+Past the ordinary allowance a request needs one of the process's heavy slots
+(#547). With every slot taken, the charge that would have crossed is refused and
+not made - the total stays where it was, at or under the allowance - so the
+request's total still says truthfully that it holds none, and its end gives back
+nothing it did not take. Driven on a slot table of its own, since the process's
+is shared with every other test.
+*/
+@(test)
+test_a_request_past_the_allowance_needs_a_heavy_slot :: proc(t: ^testing.T) {
+	h := Heavy_Slots {
+		limit = 1,
+	}
+	first, second: int
+	// Inside the allowance: no slot asked for.
+	testing.expect(t, charge_against(&h, &first, REQUEST_ORDINARY_DECODE), "the allowance itself was refused")
+	testing.expect_value(t, h.held, 0)
+	// Across it: the one slot.
+	testing.expect(t, charge_against(&h, &first, 1), "the first heavy request found no slot")
+	testing.expect_value(t, h.held, 1)
+	// A second request across it finds none, and is not charged.
+	second = REQUEST_ORDINARY_DECODE - 10
+	testing.expect(t, !charge_against(&h, &second, 100), "a second heavy request was let past a full table")
+	testing.expect_value(t, second, REQUEST_ORDINARY_DECODE - 10)
+	release_against(&h, &second)
+	testing.expect_value(t, h.held, 1)
+	// The first ends and gives its slot back; the second may now cross.
+	release_against(&h, &first)
+	testing.expect_value(t, h.held, 0)
+	testing.expect(t, charge_against(&h, &second, 100), "the slot given back was not free")
+	testing.expect_value(t, h.held, 1)
+	// And the whole budget still binds a request that holds a slot.
+	testing.expect(t, !charge_against(&h, &second, REQUEST_DECODE_BUDGET), "a request ran past the whole budget")
+	release_against(&h, &second)
+	testing.expect_value(t, h.held, 0)
+
+	// No limit: every request may cross, and each is still counted.
+	free_table := Heavy_Slots{}
+	a, b: int
+	testing.expect(t, charge_against(&free_table, &a, REQUEST_ORDINARY_DECODE + 1))
+	testing.expect(t, charge_against(&free_table, &b, REQUEST_ORDINARY_DECODE + 1))
+	testing.expect_value(t, free_table.held, 2)
+}

@@ -8,33 +8,35 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
-import "elodin:pool"
+import "elodin:loop"
 import "elodin:tlsx"
 
 /*
 Shutdown has to release the loops' contexts after the work that holds them, not
 when the loops themselves stop.
 
-A read loop hands its context to every job it queues, and `pool.destroy` runs
-what is queued before it joins its workers - so a job submitted a moment before
-the socket closed still reads that context well after the loop has gone.
+A read loop hands its context to every query it starts, and the server drains
+those before it releases anything - so a query admitted a moment before the
+socket closed still reads that context well after the loop has gone.
 */
 
 @(private = "file")
 Barrier :: struct {
 	go:      bool,
 	started: bool,
+	server:  ^Server,
 }
 
-// Occupies the pool's only worker until released, so a job queued behind it
-// stays queued and the test can look at the world in between.
+// Holds a query in flight until released, so the test can look at the world in
+// between, as a query waiting on its upstream would hold it.
 @(private = "file")
 barrier_job :: proc(data: rawptr) {
 	b := cast(^Barrier)data
 	sync.atomic_store(&b.started, true)
 	for !sync.atomic_load(&b.go) {
-		time.sleep(time.Millisecond)
+		_ = loop.sleep(time.Millisecond)
 	}
+	query_done(b.server)
 }
 
 @(private = "file")
@@ -49,16 +51,11 @@ wait_until :: proc(predicate: proc(data: rawptr) -> bool, data: rawptr, within: 
 	return false
 }
 
+// Whether the first reader has taken a datagram off its socket.
 @(private = "file")
-Pending_Probe :: struct {
-	handler_pool: ^pool.Pool,
-	want:         int,
-}
-
-@(private = "file")
-pending_reached :: proc(data: rawptr) -> bool {
-	p := cast(^Pending_Probe)data
-	return pool.pending(p.handler_pool) >= p.want
+datagram_read :: proc(data: rawptr) -> bool {
+	l := cast(^Listeners)data
+	return len(l.udp) > 0 && sync.atomic_load(&l.udp[0].received) >= 1
 }
 
 @(private = "file")
@@ -93,28 +90,30 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	cfg.server.max_connections = 8
 	cfg.server.max_pending = 0
 
-	// One worker, so a single occupied job is the whole pool.
-	handler_pool := pool.make_pool(1)
+	handler_pool: Test_Loop
+	start_test_loop(&handler_pool)
 	s := Server {
 		cfg          = &cfg,
-		handler_pool = handler_pool,
+		loops        = handler_pool.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		testing.expect(t, false, "could not start the UDP listener")
 		return
 	}
 
-	barrier := Barrier{}
-	testing.expect(t, pool.submit(handler_pool, barrier_job, &barrier), "could not occupy the worker")
+	barrier := Barrier {
+		server = &s,
+	}
+	testing.expect(t, submit_query(&s, barrier_job, &barrier, 0) == .Accepted, "could not start the held query")
 	if !wait_until(barrier_started, &barrier, time.Second) {
 		sync.atomic_store(&barrier.go, true)
 		stop_listeners(&l)
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		destroy_listeners(&l)
-		testing.expect(t, false, "the worker never picked up the barrier job")
+		testing.expect(t, false, "the held query never started")
 		return
 	}
 
@@ -122,15 +121,15 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	if berr != nil {
 		sync.atomic_store(&barrier.go, true)
 		stop_listeners(&l)
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		destroy_listeners(&l)
 		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
 		return
 	}
 
 	/*
-	A bare header with no question. It reaches the read loop, is queued, and is
-	answered with FORMERR — which is all this needs, and it keeps the job off
+	A bare header with no question. It reaches the read loop, is admitted, and is
+	answered with FORMERR — which is all this needs, and it keeps the query off
 	the cache, the filters and the upstream group, none of which are wired up
 	here.
 	*/
@@ -139,11 +138,7 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	query: [dns.HEADER_SIZE]u8
 	_, _ = net.send_udp(client, query[:], bound)
 
-	probe := Pending_Probe {
-		handler_pool = handler_pool,
-		want         = 2, // the barrier, plus the query behind it
-	}
-	queued := wait_until(pending_reached, &probe, 2 * time.Second)
+	queued := wait_until(datagram_read, &l, 2 * time.Second)
 	net.close(client)
 
 	// Sockets closed, read loop joined. Anything it releases, it has released.
@@ -160,11 +155,11 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 			"the read loop released a context a queued job still holds: the allocator handed it straight back",
 		)
 	}
-	testing.expect(t, queued, "the query never reached the pool, so nothing was held across the shutdown")
+	testing.expect(t, queued, "the query never reached the read loop, so nothing was held across the shutdown")
 
-	// Draining runs the queued job, which reads through that context.
+	// Draining lets the held query finish.
 	sync.atomic_store(&barrier.go, true)
-	pool.destroy(handler_pool)
+	stop_test_loop(&handler_pool)
 
 	destroy_listeners(&l)
 	testing.expect(t, l.udp == nil, "destroy_listeners left the readers behind")
@@ -221,21 +216,22 @@ test_a_connection_past_the_limit_is_counted :: proc(t: ^testing.T) {
 	// second arrives, without leaving a stuck thread behind if it is not.
 	cfg.server.client_timeout = 5 * time.Second
 
-	handler_pool := pool.make_pool(1)
+	handler_pool: Test_Loop
+	start_test_loop(&handler_pool)
 	s := Server {
 		cfg          = &cfg,
-		handler_pool = handler_pool,
+		loops        = handler_pool.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		testing.expect(t, false, "could not start the TCP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		destroy_listeners(&l)
 	}
 
@@ -317,21 +313,22 @@ test_a_connection_over_its_prefix_share_is_refused :: proc(t: ^testing.T) {
 	cfg.server.max_connections_per_prefix = 1
 	cfg.server.client_timeout = 5 * time.Second
 
-	handler_pool := pool.make_pool(1)
+	handler_pool: Test_Loop
+	start_test_loop(&handler_pool)
 	s := Server {
 		cfg          = &cfg,
-		handler_pool = handler_pool,
+		loops        = handler_pool.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		testing.expect(t, false, "could not start the TCP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		destroy_listeners(&l)
 	}
 
@@ -404,21 +401,22 @@ test_a_connection_accepted_during_shutdown_is_dropped :: proc(t: ^testing.T) {
 	// the read below gives up, so EOF can only be the accept loop closing it.
 	cfg.server.client_timeout = 5 * time.Second
 
-	handler_pool := pool.make_pool(1)
+	handler_pool: Test_Loop
+	start_test_loop(&handler_pool)
 	s := Server {
 		cfg          = &cfg,
-		handler_pool = handler_pool,
+		loops        = handler_pool.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		testing.expect(t, false, "could not start the TCP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		destroy_listeners(&l)
 	}
 
@@ -851,21 +849,22 @@ test_a_drip_fed_message_is_reclaimed_at_the_deadline :: proc(t: ^testing.T) {
 	cfg.server.client_timeout = 400 * time.Millisecond
 	DRIP :: 150 * time.Millisecond
 
-	handler_pool := pool.make_pool(1)
+	handler_pool: Test_Loop
+	start_test_loop(&handler_pool)
 	s := Server {
 		cfg          = &cfg,
-		handler_pool = handler_pool,
+		loops        = handler_pool.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		testing.expect(t, false, "could not start the TCP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		destroy_listeners(&l)
 	}
 

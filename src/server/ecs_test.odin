@@ -221,7 +221,7 @@ fixture_start :: proc(t: ^testing.T, f: ^Fixture, validating := false) -> bool {
 
 	// No cookie towards the upstream: it would add an option of its own to the
 	// outgoing query, which has nothing to do with the one under test.
-	group, gerr := upstream.make_group(f.cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(f.cfg.upstream, context.allocator, false)
 	if gerr != .None {
 		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
 		return false

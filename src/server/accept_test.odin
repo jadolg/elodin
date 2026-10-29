@@ -4,6 +4,8 @@ import "core:net"
 import "core:strings"
 import "core:testing"
 import "core:time"
+import "elodin:config"
+import "elodin:metrics"
 
 /*
 Every `net.Accept_Error`, against a table written out by hand.
@@ -117,13 +119,14 @@ test_the_accept_failure_words_send_a_shortage_to_the_descriptor_limit :: proc(t:
 @(test)
 test_descriptors_wanted_counts_everything_that_holds_one :: proc(t: ^testing.T) {
 	d := Descriptor_Demand {
-		max_connections  = 512,
-		pooled_upstream  = 16,
-		workers          = 128,
-		upstream_workers = 64,
-		udp_readers      = 4,
+		max_connections = 512,
+		pooled_upstream = 16,
+		in_flight       = 1024,
+		racers          = 1024,
+		udp_readers     = 4,
+		loops           = 4,
 	}
-	testing.expect_value(t, descriptors_wanted(d), 512 + 16 + 128 + 64 + 4 + DESCRIPTOR_RESERVE)
+	testing.expect_value(t, descriptors_wanted(d), 512 + 16 + 1024 + 1024 + 4 + 2 * 4 + DESCRIPTOR_RESERVE)
 
 	// The readers are a term of their own because an operator may set 64 of
 	// them, which would otherwise eat a reserve sized for eight.
@@ -137,7 +140,7 @@ test_the_descriptor_line_is_silent_unless_the_limit_is_short :: proc(t: ^testing
 	d := Descriptor_Demand {
 		max_connections = 512,
 		pooled_upstream = 16,
-		workers         = 128,
+		in_flight       = 1024,
 	}
 	wanted := descriptors_wanted(d)
 
@@ -164,6 +167,11 @@ test_the_descriptor_line_is_silent_unless_the_limit_is_short :: proc(t: ^testing
 		strings.contains(line, "accept_backoff="),
 		"the counter has to be named, since the warn is said once and the counter goes on",
 	)
+
+	// Every term of the total is itemised, the race legs among them, so the
+	// figures the line lists add up to the one it says is wanted.
+	racing, _ := descriptor_limit_line(1, Descriptor_Demand{racers = 7777})
+	testing.expect(t, strings.contains(racing, "7777 race legs"), "the race legs have to be named")
 }
 
 /*
@@ -657,4 +665,54 @@ test_a_dead_socket_waits_as_long_as_a_shortage :: proc(t: ^testing.T) {
 			err,
 		)
 	}
+}
+
+/*
+The widest group that races, default or route: what one query can hold a socket
+per server for, and so what the racer budget and the descriptor estimate are
+sized by. A group that does not race adds nothing however wide it is.
+*/
+@(test)
+test_race_width_is_the_widest_racing_group :: proc(t: ^testing.T) {
+	servers :: proc(n: int) -> []config.Upstream_Spec {
+		return make([]config.Upstream_Spec, n, context.temp_allocator)
+	}
+	cfg: config.Upstream_Config
+	cfg.servers = servers(6)
+	testing.expect_value(t, race_width(cfg), 0)
+	cfg.strategy = .Race
+	cfg.servers = servers(3)
+	testing.expect_value(t, race_width(cfg), 3)
+	zones := make([]config.Zone_Route, 2, context.temp_allocator)
+	zones[0].upstream = config.Upstream_Config{strategy = .Race, servers = servers(5)}
+	zones[1].upstream = config.Upstream_Config{strategy = .Failover, servers = servers(9)}
+	cfg.zones = zones
+	testing.expect_value(t, race_width(cfg), 5)
+	free_all(context.temp_allocator)
+}
+
+/*
+The mapping count is said only when it cannot hold every fiber the
+configuration may run - three mappings each - and is read off this machine, where
+procfs has it.
+*/
+@(test)
+test_the_map_count_line_is_silent_unless_the_limit_is_short :: proc(t: ^testing.T) {
+	d := Descriptor_Demand {
+		max_connections = 512,
+		in_flight       = 4096,
+		racers          = 4096 * 12,
+		udp_readers     = 8,
+		loops           = 8,
+	}
+	fibers := 512 + 4096 + 4096 * 12 + 8 + 8
+	wanted := fibers * MAPPINGS_PER_FIBER + MAPPING_RESERVE
+	line, short := map_count_line(65530, d)
+	testing.expect(t, short, "the default limit covers a dozen-wide race at the largest derived figures")
+	testing.expect(t, strings.contains(line, "vm.max_map_count"), "the line does not name the setting")
+	_, enough := map_count_line(wanted, d)
+	testing.expect(t, !enough, "a limit that exactly covers the fibers is short")
+	_, unread := map_count_line(0, d)
+	testing.expect(t, !unread, "an unreadable limit is called short")
+	testing.expect(t, metrics.map_count_limit() > 0, "vm.max_map_count could not be read here")
 }

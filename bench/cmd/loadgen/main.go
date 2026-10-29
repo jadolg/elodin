@@ -5,11 +5,16 @@
 // per-transport numbers are meant to describe: the cost of answering on an
 // established connection, not the cost of establishing one. Handshake cost is
 // measured separately, by -transport=handshake.
+//
+// -once is the other shape: every client asks one question and then holds its
+// connection idle, which is what the server's memory per connection and per
+// query in flight are read against.
 package main
 
 import (
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +43,8 @@ type config struct {
 	qname       string
 	path        string
 	rate        int
+	once        bool
+	roots       *x509.CertPool
 }
 
 // Result is the JSON the orchestrator reads back.
@@ -67,11 +75,34 @@ func main() {
 	flag.StringVar(&c.qname, "qname", "cached.bench.test", "name to ask about in fixed mode")
 	flag.StringVar(&c.path, "path", "/dns-query", "DoH path")
 	flag.IntVar(&c.rate, "rate", 0, "total queries per second to offer; 0 is as fast as possible")
+	flag.BoolVar(&c.once, "once", false, "each client asks one question, the result is printed, and the connections are held until stdin closes")
+	ca := flag.String("ca", "", "PEM certificate DoT trusts: the one the server under test presents")
 	flag.Parse()
+
+	if c.transport == "dot" || c.transport == "handshake" {
+		pem, err := os.ReadFile(*ca)
+		c.roots = x509.NewCertPool()
+		if err != nil || !c.roots.AppendCertsFromPEM(pem) {
+			fmt.Fprintf(os.Stderr, "loadgen: %s needs -ca, the server's certificate in PEM\n", c.transport)
+			os.Exit(2)
+		}
+	}
 
 	if c.concurrency > 1 && c.transport != "doh1" && c.transport != "doh2" {
 		fmt.Fprintln(os.Stderr, "loadgen: concurrency above 1 needs doh1 or doh2; raise -clients instead")
 		os.Exit(2)
+	}
+
+	if c.once {
+		res, held := runOnce(c)
+		_ = json.NewEncoder(os.Stdout).Encode(res)
+		// The orchestrator reads the server while the connections are held and
+		// closes stdin when it is done with them.
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		// A net.Conn nothing refers to is closed by its finalizer, which would
+		// let the held connections go before the server was read.
+		runtime.KeepAlive(held)
+		return
 	}
 
 	res, err := run(c)
@@ -82,6 +113,74 @@ func main() {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(res)
+}
+
+// runOnce opens c.clients connections, asks one question on each, and returns
+// once every one is answered or has failed, with the connections still open.
+//
+// The questions are not paced: with a slow upstream every one of them is in
+// flight at once, which is the point of the in-flight rows. Only the dials are
+// held to a few hundred at a time, because twenty thousand SYNs at once
+// overflow the listen backlog and the retransmits would be measured instead.
+// A dial or query that fails is counted, not fatal: whether all N were
+// answered is part of what the held-connection rows report.
+func runOnce(c config) (Result, []client) {
+	rec := hist.New(c.clients)
+	var answered, errs atomic.Int64
+	var rcodeMu sync.Mutex
+	rcodes := map[string]int64{}
+	held := make([]client, c.clients)
+	// Unique names from one run must not be answered from the cache another
+	// run filled.
+	nonce := rand.Uint32()
+
+	dials := make(chan struct{}, 256)
+	var wg sync.WaitGroup
+	runStart := time.Now()
+	for i := range c.clients {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			dials <- struct{}{}
+			cl, err := dial(c)
+			<-dials
+			if err != nil {
+				errs.Add(1)
+				return
+			}
+			held[id] = cl
+			name := c.qname
+			if c.qmode == "unique" {
+				name = fmt.Sprintf("o-%d-%d.bench.test", nonce, id)
+			}
+			t0 := time.Now()
+			rc, err := cl.Query(name)
+			if err != nil {
+				errs.Add(1)
+				return
+			}
+			rec.AddBatch([]time.Duration{time.Since(t0)})
+			answered.Add(1)
+			rcodeMu.Lock()
+			rcodes[rcodeName(rc)]++
+			rcodeMu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+	elapsed := time.Since(runStart)
+
+	ps := rec.Percentiles(0.50, 0.99)
+	return Result{
+		Transport: c.transport,
+		Clients:   c.clients,
+		Answered:  answered.Load(),
+		Errors:    errs.Load(),
+		Rcodes:    rcodes,
+		Seconds:   elapsed.Seconds(),
+		QPS:       float64(answered.Load()) / elapsed.Seconds(),
+		P50ms:     float64(ps[0].Microseconds()) / 1000,
+		P99ms:     float64(ps[1].Microseconds()) / 1000,
+	}, held
 }
 
 func run(c config) (Result, error) {
@@ -102,6 +201,10 @@ func run(c config) (Result, error) {
 		ticker = time.NewTicker(time.Second / time.Duration(c.rate))
 		defer ticker.Stop()
 	}
+
+	// Unique names carry the run's own nonce: the repeats of a row share one
+	// server, and a name an earlier run asked would be a cache hit in this one.
+	nonce := rand.Uint32()
 
 	start := make(chan struct{})
 	measureFrom := time.Now()
@@ -138,7 +241,7 @@ func run(c config) (Result, error) {
 						}
 						name := c.qname
 						if c.qmode == "unique" {
-							name = fmt.Sprintf("q-%d-%d-%d.bench.test", id, slot, counter)
+							name = fmt.Sprintf("q-%d-%d-%d-%d.bench.test", nonce, id, slot, counter)
 						}
 						counter++
 
@@ -303,7 +406,7 @@ type streamClient struct {
 }
 
 func dialTCP(c config) (client, error) {
-	conn, err := net.Dial("tcp", c.server)
+	conn, err := net.DialTimeout("tcp", c.server, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -311,9 +414,13 @@ func dialTCP(c config) (client, error) {
 }
 
 func dialDoT(c config) (client, error) {
-	conn, err := tls.Dial("tcp", c.server, &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"dot"},
+	// Bounded, handshake included: a server at its connection cap can leave a
+	// connection accepted by the kernel and never handshake on it, and an
+	// unbounded dial would wait on that forever.
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", c.server, &tls.Config{
+		RootCAs:    c.roots,
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"dot"},
 	})
 	if err != nil {
 		return nil, err
@@ -462,9 +569,14 @@ func runHandshake(c config) (Result, error) {
 			local := make([]time.Duration, 0, 1<<10)
 			for time.Now().Before(deadline) {
 				t0 := time.Now()
-				conn, err := tls.Dial("tcp", c.server, &tls.Config{
-					InsecureSkipVerify: true,
-					NextProtos:         []string{"dot"},
+				// Bounded for the reason `dialDoT` gives: a server at its cap can
+				// accept and never handshake, and the phase would never end.
+				// Checked as `dialDoT` checks it: verifying is the client's CPU,
+				// not the server's, and the handshake under test is the same.
+				conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", c.server, &tls.Config{
+					RootCAs:    c.roots,
+					MinVersion: tls.VersionTLS12,
+					NextProtos: []string{"dot"},
 					// A resumed session would measure the wrong thing.
 					ClientSessionCache: nil,
 				})

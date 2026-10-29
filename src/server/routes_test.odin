@@ -357,7 +357,7 @@ mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, port: int) -> ^up
 	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = port}
 	one.servers = servers
-	group, gerr := upstream.make_group(one, nil, context.allocator, false)
+	group, gerr := upstream.make_group(one, context.allocator, false)
 	testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr)
 	return group
 }
@@ -376,7 +376,7 @@ mock_group_pair :: proc(t: ^testing.T, cfg: config.Upstream_Config, first, secon
 	servers[0] = config.Upstream_Spec{name = "mock-a", kind = .UDP, address = "127.0.0.1", port = first}
 	servers[1] = config.Upstream_Spec{name = "mock-b", kind = .UDP, address = "127.0.0.1", port = second}
 	two.servers = servers
-	group, gerr := upstream.make_group(two, nil, context.allocator, false)
+	group, gerr := upstream.make_group(two, context.allocator, false)
 	testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr)
 	return group
 }
@@ -2850,19 +2850,19 @@ test_routed_upstreams_are_reported_once_each :: proc(t: ^testing.T) {
 	routed_cfg := cfg.upstream
 	routed_cfg.servers = only
 
-	group, gerr := upstream.make_group(base, nil, context.allocator, false)
+	group, gerr := upstream.make_group(base, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the default group: %v", gerr) {
 		return
 	}
 	defer upstream.destroy_group(group)
 	// The same server again, in a route of its own: one operator writing down
 	// one fact twice, which is the arrangement the de-duplication is for.
-	again, aerr := upstream.make_group(base, nil, context.allocator, false)
+	again, aerr := upstream.make_group(base, context.allocator, false)
 	if !testing.expectf(t, aerr == .None, "cannot build the duplicate group: %v", aerr) {
 		return
 	}
 	defer upstream.destroy_group(again)
-	routed, rerr := upstream.make_group(routed_cfg, nil, context.allocator, false)
+	routed, rerr := upstream.make_group(routed_cfg, context.allocator, false)
 	if !testing.expectf(t, rerr == .None, "cannot build the routed group: %v", rerr) {
 		return
 	}
@@ -2920,12 +2920,12 @@ test_two_upstreams_of_one_name_have_their_figures_added :: proc(t: ^testing.T) {
 	spec.attempts = 1
 	spec.timeout = 200 * time.Millisecond
 
-	failing, ferr := upstream.make_group(spec, nil, context.allocator, false)
+	failing, ferr := upstream.make_group(spec, context.allocator, false)
 	if !testing.expectf(t, ferr == .None, "cannot build the failing group: %v", ferr) {
 		return
 	}
 	defer upstream.destroy_group(failing)
-	idle, ierr := upstream.make_group(spec, nil, context.allocator, false)
+	idle, ierr := upstream.make_group(spec, context.allocator, false)
 	if !testing.expectf(t, ierr == .None, "cannot build the idle group: %v", ierr) {
 		return
 	}

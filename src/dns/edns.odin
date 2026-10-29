@@ -646,7 +646,7 @@ arena and only the answer is taken from `allocator`.
 Not a detail of taste. Every caller on the client-facing side hands in a
 per-request arena, where a scratch allocation left behind is reclaimed with
 everything else and costs nothing, which is what makes the mistake easy to
-miss. The race strategy is the exception: a race worker can outlive the
+miss. The race strategy is the exception: a racer can outlive the
 caller's arena, so `upstream.exchange` and everything under it - including
 `exchange_with_cookie`, which strips the server cookie out of every reply through
 here - is given the process heap instead. Nothing ever reclaims that, so a reply

@@ -29,11 +29,12 @@ ELODIN_LDFLAGS = "--sysroot=/ -B/usr/bin"
 # were never fetched, and a tree with no .git at all still builds.
 ELODIN_VERSION = "{{ exec(command='echo ${ELODIN_VERSION:-$(git describe --tags --exact-match 2>/dev/null || echo dev-$(git rev-parse --short HEAD 2>/dev/null || echo unknown))}') }}"
 
-# Each worker thread keeps its own scratch arena, and Odin sizes those at 4 MB
-# by default. A query needs a few kilobytes at most, so that costs ~4 MB per
-# worker — half a gigabyte at the default worker count — for nothing. 256 KB
-# measures identically on throughput and cuts resident memory by an order of
-# magnitude; the arena still grows if a request ever needs more.
+# Every thread keeps its own scratch arena, and Odin sizes those at 4 MB by
+# default. Queries run on fibers, whose scratch is their own (see
+# src/loop/fiber.odin); what is left on a thread's arena - the main and
+# maintenance threads, the metrics endpoint, a blocklist rebuild - needs a few
+# kilobytes at a time, so 256 KB is ample, and the arena still grows if a call
+# ever needs more.
 ELODIN_DEFINES = "-define:DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE=262144 -define:ELODIN_VERSION={{ env.ELODIN_VERSION }}"
 
 # `odin test` already wraps each test in a tracking allocator and prints what it
@@ -54,7 +55,12 @@ ELODIN_TEST_DEFINES = "-define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true"
 # linker is asked to write there.
 [tasks.prepare]
 hide = true
-run = "mkdir -p bin"
+# The fiber switch, as an object src/loop/fiber.odin links; see the comment there.
+run = """
+mkdir -p bin
+arch=$(uname -m); case $arch in aarch64) arch=arm64;; x86_64) arch=amd64;; esac
+clang -c src/loop/switch_$arch.S -o bin/elodin_switch.o
+"""
 
 [tasks.build]
 description = "Build elodin (debug symbols, unoptimised)"
@@ -130,14 +136,24 @@ run = [
 # Every directory under src/fuzz but the shared harness is a target, so a new one
 # is built and replayed without being listed here. FUZZ_TARGETS narrows it to the
 # ones named, which is how the nightly job builds only the target it runs.
+#
+# The fiber switch is an object `prepare` assembles and `fiber.odin` names with a
+# foreign import, which an IR build does not link, so it is assembled here and
+# linked into every target - the ones that never reach `elodin:loop` leave it
+# unreferenced. And every
+# allocation a fiber's scratch makes is a heap allocation of its own
+# (`ELODIN_SCRATCH_DEBUG`), so ASan sees a pointer kept past a reset as the
+# use-after-free it is rather than a read of reused arena.
 [tasks.fuzz]
 description = "Build every fuzz target in src/fuzz (bin/fuzz_*)"
 depends = ["prepare"]
 run = """
+arch=$(uname -m); case $arch in aarch64) arch=arm64;; x86_64) arch=amd64;; esac
 for t in ${FUZZ_TARGETS:-$(cd src/fuzz && ls -d */ | tr -d / | grep -vx harness)}; do
   rm -rf bin/fuzz-ir/$t && mkdir -p bin/fuzz-ir/$t &&
-  odin build src/fuzz/$t -collection:elodin=src -build-mode:llvm-ir -no-entry-point -sanitize:address -out:bin/fuzz-ir/$t/ $ELODIN_DEFINES &&
-  clang -fsanitize=fuzzer,address -Wno-override-module -Wno-backend-plugin -o bin/fuzz_$t bin/fuzz-ir/$t/*.ll $ELODIN_LDFLAGS -lssl -lcrypto -lm || exit 1
+  odin build src/fuzz/$t -collection:elodin=src -build-mode:llvm-ir -no-entry-point -sanitize:address -define:ELODIN_SCRATCH_DEBUG=true -out:bin/fuzz-ir/$t/ $ELODIN_DEFINES &&
+  clang -c src/loop/switch_$arch.S -o bin/fuzz-ir/$t/switch.o &&
+  clang -fsanitize=fuzzer,address -Wno-override-module -Wno-backend-plugin -o bin/fuzz_$t bin/fuzz-ir/$t/*.ll bin/fuzz-ir/$t/switch.o $ELODIN_LDFLAGS -lssl -lcrypto -lm || exit 1
 done
 """
 
@@ -184,7 +200,7 @@ run = [
   "odin test src/metrics  -collection:elodin=src -out:bin/test_metrics -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/privdrop -collection:elodin=src -out:bin/test_privdrop -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/cache    -collection:elodin=src -out:bin/test_cache -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
-  "odin test src/pool     -collection:elodin=src -out:bin/test_pool -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/loop     -collection:elodin=src -out:bin/test_loop -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/dnssec   -collection:elodin=src -out:bin/test_dnssec -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/tlsx     -collection:elodin=src -out:bin/test_tlsx -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/upstream -collection:elodin=src -out:bin/test_upstream -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",

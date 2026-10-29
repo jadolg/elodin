@@ -9,6 +9,7 @@ import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:loop"
 
 /*
 The chain of trust.
@@ -72,9 +73,10 @@ Options :: struct {
 	// Iteration counts above this make a proof unusable rather than trusted.
 	max_nsec3_iterations: int,
 	max_cached_zones:     int,
-	// Chain walks that may be making upstream lookups at once, on a worker of
-	// the caller's shared pool and on a thread belonging to one connection.
-	// Zero takes `DEFAULT_MAX_CHAIN_WALKS`; see `Validator.walks`.
+	// Chain walks that may be making upstream lookups at once, for questions
+	// counted among the caller's queries in flight and for questions on a
+	// connection of their own. Zero takes `DEFAULT_MAX_CHAIN_WALKS`; see
+	// `Validator.walks`.
 	max_chain_walks:      int,
 	max_connection_walks: int,
 }
@@ -146,8 +148,8 @@ Validator :: struct {
 	/*
 	Chain walks in flight, and the most there may be at once.
 
-	The walk is the one thing in this package that blocks the thread already
-	answering a client, and it blocks it once per label: `zone_trust` descends
+	The walk is the one thing in this package that waits on the network on behalf
+	of the query it is validating, and it waits once per label: `zone_trust` descends
 	from the apex asking a DS per step, and each step that misses both caches is
 	an upstream round trip taken in line. Thirty-two of those - what
 	`MAX_LOOKUPS_PER_QUERY` allows - is the better part of a second at ordinary
@@ -156,16 +158,16 @@ Validator :: struct {
 	`MAX_CACHED_NON_CUTS` says why, and #356 is the record of it.
 
 	So the bound is not on the walk but on how many of them may be doing this at
-	once - two bounds, one per `Walk_Pool`, because the shared handler pool and
-	the connection threads are sized by different things and a flood on one must
-	not spend the other's allowance. Past `max_chain_walks`, a walk runs against the caches alone and
+	once - two bounds, one per `Walk_Pool`, because the queries counted in flight
+	and the connections are sized by different things and a flood on one must
+	not spend the other's allowance. Past the bound, a walk runs against the caches alone and
 	answers `Indeterminate` where it would have gone upstream - the same verdict,
 	and the same extended error, that an upstream which did not answer produces.
-	The flood then holds a fixed number of threads *for a walk* rather than all of
-	them: the rest may still be busy with their own upstream forward, which
-	nothing here bounds, but they come back in a round trip instead of in the
-	thirty a walk may take. That is the difference between a resolver degraded
-	and one down.
+	The flood then holds a fixed number of queries in flight *for a walk* rather
+	than all of them: the rest may still be busy with their own upstream forward,
+	which nothing here bounds, but they come back in a round trip instead of in
+	the thirty a walk may take. That is the difference between a resolver
+	degraded and one down.
 
 	A slot is taken at the first lookup that would go upstream, not on the way
 	into the walk, so a walk both caches can answer never asks for one and a
@@ -195,10 +197,9 @@ Validator :: struct {
 	one. So while every slot is held, what still answers is what both caches
 	hold, and nothing else.
 
-	That is why the bound is a reservation rather than a ceiling, and why it is
-	spent only by queries holding a worker somebody else is waiting for - see
-	`Walk_Pool`, which counts a connection's own thread apart from a shared worker. It is still the trade #356 asks for, the alternative
-	being every thread held and nothing answered at all, and it is why
+	That is why the bound is a reservation rather than a ceiling, kept for each
+	`Walk_Pool` apart. It is still the trade #356 asks for, the alternative being
+	every query in flight held and nothing answered at all, and it is why
 	`max_chain_walks` is an operator's number rather than only ours.
 	*/
 	walks:                [Walk_Pool]int,
@@ -225,22 +226,23 @@ Validator :: struct {
 }
 
 /*
-Which set of threads a question is spending, and so which bound it is held to.
+Which queries a question is one of, and so which bound it is held to.
 
-Two, because a resolver has two and they are sized by different things. A
-question on the shared pool competes with every other question for a worker, and
-the pool is small; one answered on its own connection thread competes with the
-other connections, and there are `max_connections` of those. One number for both
-is wrong whichever way it is set - sized for the pool it refuses ordinary stream
-traffic, sized for the connections it bounds the pool at nothing.
+Two, because a server bounds two populations by different things. A query on a
+fiber of its own - a datagram, an HTTP/2 request, a refresh - is counted against
+the server's bound on queries in flight; one answered on its connection's fiber
+is not, since the connection answers one at a time and `max_connections` bounds
+those. A walk bound that is a share of one of them is wrong for the other:
+a share of the queries in flight lets the connections take every walk, and a
+share of both leaves the queries in flight with no reserve at all.
 
 Counted apart rather than together for the same reason: a flood on one transport
 must not spend the other's allowance.
 */
 Walk_Pool :: enum u8 {
-	// A worker of the server's handler pool: UDP and HTTP/2.
+	// Counted among the server's queries in flight: UDP, HTTP/2, refreshes.
 	Shared,
-	// A thread belonging to one connection: TCP, DoT and HTTP/1.1.
+	// Answered on its connection's fiber: TCP, DoT and HTTP/1.1.
 	Connection,
 }
 
@@ -283,8 +285,8 @@ DS and DNSKEY lookups one client question may provoke, in total.
 The chain depth alone does not bound the work: a response is free to carry
 records under many different owner names, each naming a different signer, and
 validating every one of them would have the resolver walk a chain apiece. That
-turns one question into hundreds of upstream queries, with a worker held for all
-of them. Real answers need a handful, so a response that needs more than this is
+turns one question into hundreds of upstream queries, with a query held in flight
+for all of them. Real answers need a handful, so a response that needs more than this is
 answered with SERVFAIL rather than chased.
 */
 MAX_LOOKUPS_PER_QUERY :: 32
@@ -454,15 +456,15 @@ Budget :: struct {
 	turned away and the traffic thrown out - the whole answer is SERVFAIL either
 	way. Holding it across the query costs no extra round trips, since
 	`MAX_LOOKUPS_PER_QUERY` bounds those whatever the slot does, and it makes the
-	slot mean what the bound is about: a handler thread inside a validation that
-	has gone upstream.
+	slot mean what the bound is about: a query inside a validation that has gone
+	upstream.
 
 	Left unset by a caller that walks on its own - the tests do - so each walk
 	there gives its slot back on the way out and nothing has to be released by
 	hand.
 	*/
 	keep_slot:     bool,
-	// Which set of threads this question is spending, and so which of
+	// Which queries this question is one of, and so which of
 	// `Validator.max_walks` bounds it. See `Walk_Pool`.
 	pool:          Walk_Pool,
 	// The hashing a denial proved with NSEC3 may spend, which no count of
@@ -635,6 +637,18 @@ unsafe - that is unbounded verification on a message an attacker wrote.
 MAX_VERIFICATIONS_PER_QUERY :: 64
 
 /*
+Signature checks a query makes between giving its loop to the other fibers on it.
+
+A check is CPU and never waits, so a walk that reaches the budget without a
+lookup in between would hold its loop for all of them - 64 checks at the 40 us an
+Ed25519 one takes here is 2.6 ms - while every other query on the loop, cache
+hits included, waits behind it. Threads had the kernel's scheduler for this.
+Four is at most ~160 us between turns; a turn costs about a microsecond, which
+before every check would be a tenth of the cheapest one (RSA-2048, 8 us).
+*/
+VERIFICATIONS_PER_TURN :: 4
+
+/*
 Whether a signature could verify at all, decided without doing any crypto.
 
 Every signature reaching a verification is one an attacker may have written, so
@@ -673,6 +687,9 @@ spend_verification :: proc(budget: ^Budget) -> bool {
 		return false
 	}
 	budget.verifications += 1
+	if budget.verifications % VERIFICATIONS_PER_TURN == 0 {
+		loop.yield()
+	}
 	return true
 }
 
@@ -816,16 +833,17 @@ the only thing that would, and there is no bound that separates the two cases: a
 customer's reverse zone can sit fifteen empty non-terminals below its provider's
 under `ip6.arpa.`, which is deeper than the walk an attacker needs. So what is
 left bounding one question is `MAX_LOOKUPS_PER_QUERY`, as before, and what would
-change it is not caching but not holding a handler thread for the walk.
+change it is not caching but not holding a query in flight for the walk.
 */
 
 /*
 Chain walks allowed upstream at once when the caller names no figure.
 
-The server derives its own from the handler pool - all of it but a reserved
-quarter, so some threads are always free to answer what needs no walk - and this
-is for every other caller, the tests among them. Eight is well past what a single
-thread can want, since a walk is entered and left on one thread and never nested,
+The server derives its own from `server.max_pending` and `server.max_connections`
+- all of each but a reserved quarter, so some queries are always free to answer
+what needs no walk - and this is for every other caller, the tests among them.
+Eight is well past what a single caller can want, since a walk is entered and
+left on one fiber and never nested,
 so nothing sequential ever meets it.
 */
 DEFAULT_MAX_CHAIN_WALKS :: 8
@@ -1061,16 +1079,15 @@ validate :: proc(
 	now: time.Time,
 	allocator := context.temp_allocator,
 	/*
-	False for a question answered on a thread of its own, which is every
-	transport but UDP and HTTP/2. It picks which of the two bounds applies - see
-	`Walk_Pool` - not whether one does: a connection thread is a finite resource
-	too, and a flood that holds every one of them is `max_connections` worth of
-	chain walks and no new connection accepted.
+	Which queries this question is one of. It picks which of the two bounds
+	applies - see `Walk_Pool` - not whether one does: a connection is a finite
+	resource too, and a flood that holds every one of them in a walk is
+	`max_connections` worth of chain walks and no new question answered on one.
 
 	Defaulted to the shared reading, which is the smaller allowance, so a caller
 	that has not thought about it gets the tighter guard.
 	*/
-	shared_worker := true,
+	pool := Walk_Pool.Shared,
 	/*
 	What the request has taken out of `allocator` so far, against
 	`dns.REQUEST_DECODE_BUDGET`, from the caller that owns it.
@@ -1110,7 +1127,7 @@ validate :: proc(
 	at all, so a slot can never outlive the question that took it.
 	*/
 	budget.keep_slot = true
-	budget.pool = .Shared if shared_worker else .Connection
+	budget.pool = pool
 	budget.spent = spent
 	budget.deadline = deadline
 	defer end_walk(v, &budget)
@@ -2621,7 +2638,7 @@ validate_rrset :: proc(
 	would be the thing an attacker could multiply: a padded answer carrying two
 	thousand RRSIGs whose signer merely names an ancestor of the owner would buy
 	two thousand walks, thousands of acquisitions of a lock every validating
-	worker shares, and megabytes of arena, for one question.
+	query shares, and megabytes of arena, for one question.
 
 	Memoised by signer, which bounds it by the number of ancestors a name has
 	rather than by the number of records somebody wrote. Distinct signers are
@@ -3397,7 +3414,7 @@ verified_rrset :: proc(
 // ---------------------------------------------------------------------------
 
 /*
-Take a slot for a lookup that is about to block, or report that there is none.
+Take a slot for a lookup that is about to go upstream, or report that there is none.
 
 Exact rather than optimistic. Adding first and backing off when the answer turns
 out to be no is a line shorter, but every loser inflates the count while it does
@@ -4002,8 +4019,8 @@ zone_step :: proc(
 		trip and the answer holds until the records it came from expire.
 
 		A non-cut is the expensive one. The walk has to keep going past it - the
-		cut may be below - so a run of them is a blocking DS lookup per label on
-		the thread already answering the client, and uncached every question
+		cut may be below - so a run of them is a DS lookup per label waited on
+		by the query already answering the client, and uncached every question
 		under the name pays the whole run again. That is issue #330: a zone with
 		twenty empty non-terminals turned each question into twenty sequential
 		upstream queries, and the same shape is what a legitimate deep hierarchy

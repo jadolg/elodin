@@ -11,8 +11,9 @@
 #      185,090 rules and about 5 MB resident, about twice that while a
 #      refresh builds the new copy beside the old.
 #   2. The answer cache, at ~463 bytes an entry.
-#   3. Worker threads, at ~0.26 MB each of scratch arena, held from a
-#      worker's first query onward rather than only under load.
+#   3. Queries in flight and connections held, at a few tens of kilobytes
+#      each of stack and scratch while they last - and the few stacks the
+#      event loop keeps warm for the next query once a burst is over.
 #   4. TLS handshakes, which are orders of magnitude more CPU than answering
 #      on an established connection - which is why no DoT or DoH listener is
 #      enabled below.
@@ -39,42 +40,31 @@ server:
     - 192.168.1.0/24
     - fe80::/10
 
-  # Four workers, pinned rather than derived. A worker is busy for a whole
-  # upstream round trip, so four is about 200 cache misses a second against a
-  # 20 ms upstream, and a household's steady rate is a couple of queries a
-  # second with peaks in the tens. Every worker fewer is ~0.26 MB of scratch
-  # arena not allocated.
+  # Thirty-two queries in flight at once, pinned rather than derived. A query
+  # waiting on the upstream holds no thread, so thirty-two is about 1,600 cache
+  # misses a second against a 20 ms upstream, and a household's steady rate is
+  # a couple of queries a second with peaks in the tens. Past it a datagram is
+  # dropped and the client retries.
   #
-  # Left unset, the derivation would land somewhere between 4 and 128 here
-  # depending on what it can measure - 128, lowered when the threads that
-  # implies would take more than a thirty-second of memory, which on a small
-  # board is the term that binds: measured, a 64 MiB limit derives 4 workers,
-  # 128 MiB derives 5 and 256 MiB derives 10. A number
-  # written here is the same number whether or not the box's kernel reports a
-  # limit at all, which on embedded firmware is not a given.
-  #
-  # This is the one number here to raise if the LAN feels slow rather than the
-  # box feels full: every query shares this pool, so a shortage delays cache
-  # hits as much as misses. `max_pending` follows it at 8x (32 here), which is
-  # the backlog past which queries are dropped instead of queued.
-  workers: 4
-  # One thread rather than the two this would derive. The racer pool is created
-  # whatever the strategy and `failover` below submits nothing to it, so this
-  # is a stack rather than an arena - but on a small box that is still worth
-  # not paying. Raise it with the strategy if you ever set `race`.
-  upstream_workers: 1
+  # Left unset, the derivation reads memory - an eighth of it over 320 KiB a
+  # query, never fewer than 64 - and on a small board it lands on the floor. A
+  # number written here is the same number whether or not the box's kernel
+  # reports a limit at all, which on embedded firmware is not a given, and it
+  # bounds what a burst can hold: thirty-two queries at their worst is about
+  # 10 MB, most of it what a flood of answers built to expand could make them
+  # decode.
+  max_pending: 32
 
-  # Every TCP, DoT or DoH connection is a thread, so this figure is a claim
-  # about what the box can hold. 64 is generous for a household - a client
-  # opens one and reuses it - and the per-prefix share below derives half of
-  # it, which is fine here because the whole LAN is one /24 and there is
-  # nobody hostile inside the allow list.
+  # Every TCP, DoT or DoH connection is a fiber, about 21 KB held (72 KB with
+  # TLS), so this figure is a claim about what the box can hold. 64 is generous
+  # for a household - a client opens one and reuses it - and the per-prefix
+  # share below derives half of it, which is fine here because the whole LAN is
+  # one /24 and there is nobody hostile inside the allow list.
   max_connections: 64
 
   # The shipped budget, unchanged: 500 answers a second per client prefix, and
   # the whole LAN is one prefix. On a household that is never reached; on a
-  # box this size the pool above would be the bottleneck long before the
-  # limiter was.
+  # box this size the CPU would be the bottleneck long before the limiter was.
   rate_limit:
     enabled: true
     responses_per_second: 500
@@ -89,9 +79,10 @@ listeners:
     # nothing since the clients are all on this side.
     address: "192.168.1.1"
     port: 53
-    # One reader rather than one per core. Each is a thread and a kernel
-    # receive buffer, and what they buy is drain rate under a flood - one
-    # reader was measured draining 2.3 million datagrams a second, which no LAN
+    # One reader, which is one event loop - one thread for everything this
+    # server answers - rather than one per core. Each is a thread and a kernel
+    # receive buffer, and what more of them buy is throughput under load - one
+    # loop was measured draining 2.3 million datagrams a second, which no LAN
     # will offer and this box's cores could not keep up with anyway.
     readers: 1
     # Down from the 1 MiB default, since this is kernel memory per reader on a
@@ -118,12 +109,13 @@ listeners:
 upstream:
   # Failover, not round_robin and certainly not race. One warm pooled TLS
   # connection to one upstream is the cheapest arrangement there is; race would
-  # ask every server for every miss and want a thread pool to do it.
+  # ask every server for every miss.
   strategy: failover
   timeout: 5s
   attempts: 2
   # Fewer pooled connections than the shipped 8. Each is a socket and a TLS
-  # session's state, and four workers cannot use eight of them at once.
+  # session's state, and a household's handful of misses at once cannot use
+  # eight of them.
   max_idle: 2
   idle_timeout: 30s
   servers:

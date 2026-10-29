@@ -40,22 +40,17 @@ server:
     - ::1/128
 
   # Sized for one client rather than for a network. Left unset, the derivation
-  # lands at 128 on any machine with a few GB of memory, and every worker a
-  # burst reaches holds a 256 KiB scratch arena from then on, about 0.26 MB
-  # resident each, measured. Eight is still 400 cache misses a second against
-  # a 20 ms upstream, which is more than a desktop's whole browsing session
-  # asks for in a burst.
-  workers: 8
-  # The racer pool is created whatever the strategy, and with `failover` below
-  # nothing is ever submitted to it. One thread rather than the four this
-  # would derive; what that saves is stacks, since a thread that never takes a
-  # job never fills a scratch arena. Raise it with the strategy if you ever set
-  # `race`.
-  upstream_workers: 1
+  # reads the machine's memory and lands in the thousands on a desktop - room a
+  # single client never fills, and that costs nothing until something does.
+  # Sixty-four is still 3,200 cache misses a second against a 20 ms upstream,
+  # more than a desktop's whole browsing session asks for in a burst, and it is
+  # a bound on what anything misbehaving on this machine can make the resolver
+  # hold.
+  max_pending: 64
 
   # Nothing off this machine can connect, so the connection table is bounding
   # this host's own `dig +tcp` and any local client that speaks DoT or DoH to
-  # loopback. 64 threads is plenty for that, and each connection is a thread.
+  # loopback. 64 is plenty for that, at about 21 KB a connection held.
   max_connections: 64
 
   rate_limit:
@@ -85,13 +80,13 @@ listeners:
     # arrives as ::ffff:127.0.0.1 and is compared as 127.0.0.1.
     address: "127.0.0.1"
     port: 53
-    # One reader thread rather than the one per usable CPU this would derive.
-    # Readers are how fast the server can hear - everything a datagram costs
-    # before the rate limiter sees it happens on the thread that read it - and
-    # that only matters when something is arriving faster than one core can
-    # drain, which was measured at 2.3 million datagrams a second. The only
-    # sender here is this machine. Each one saved is a thread and a receive
-    # buffer.
+    # One reader - one event loop, one thread for everything - rather than the
+    # one per usable CPU this would derive. Loops are how fast the server can
+    # hear and answer - everything a datagram costs before the rate limiter sees
+    # it happens on the loop that read it - and that only matters when something
+    # is arriving faster than one core can drain, which was measured at 2.3
+    # million datagrams a second. The only sender here is this machine. Each one
+    # saved is a thread and a receive buffer.
     readers: 1
   tcp:
     enabled: true

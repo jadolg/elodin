@@ -8,7 +8,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
-import "elodin:pool"
+import "elodin:loop"
 
 /*
 Several readers, one port.
@@ -95,21 +95,22 @@ machine has.
 test_every_reader_binds_the_same_port :: proc(t: ^testing.T) {
 	cfg: config.Config
 	fixture(&cfg, READERS)
-	handler_pool := pool.make_pool(2)
+	handler_pool: Test_Loop
+	start_test_loop(&handler_pool)
 	s := Server {
 		cfg          = &cfg,
-		handler_pool = handler_pool,
+		loops        = handler_pool.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		testing.expect(t, false, "could not start the UDP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		destroy_listeners(&l)
 	}
 
@@ -160,21 +161,22 @@ reaching the cache, the filters or an upstream, none of which are wired up here.
 test_the_kernel_spreads_datagrams_over_the_readers :: proc(t: ^testing.T) {
 	cfg: config.Config
 	fixture(&cfg, READERS)
-	handler_pool := pool.make_pool(4)
+	handler_pool: Test_Loop
+	start_test_loop(&handler_pool)
 	s := Server {
 		cfg          = &cfg,
-		handler_pool = handler_pool,
+		loops        = handler_pool.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		testing.expect(t, false, "could not start the UDP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		destroy_listeners(&l)
 	}
 
@@ -250,21 +252,22 @@ worked only in a plural is one nobody would notice was broken until they set
 test_one_reader_is_a_whole_listener :: proc(t: ^testing.T) {
 	cfg: config.Config
 	fixture(&cfg, 1)
-	handler_pool := pool.make_pool(2)
+	handler_pool: Test_Loop
+	start_test_loop(&handler_pool)
 	s := Server {
 		cfg          = &cfg,
-		handler_pool = handler_pool,
+		loops        = handler_pool.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		testing.expect(t, false, "could not start the UDP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		destroy_listeners(&l)
 	}
 
@@ -289,6 +292,84 @@ test_one_reader_is_a_whole_listener :: proc(t: ^testing.T) {
 	testing.expectf(t, rerr == nil, "the lone reader did not answer: %v", rerr)
 	testing.expect(t, n >= dns.HEADER_SIZE, "the answer is not a DNS message")
 	testing.expect_value(t, sync.atomic_load(&l.udp[0].received), u64(1))
+}
+
+@(private = "file")
+Reader_Probe :: struct {
+	server:    ^Server,
+	listeners: ^Listeners,
+	received:  u64,
+	dropped:   u64,
+}
+
+@(private = "file")
+reader_counts_reached :: proc(data: rawptr) -> bool {
+	p := cast(^Reader_Probe)data
+	return(
+		sync.atomic_load(&p.listeners.udp[0].received) >= p.received &&
+		sync.atomic_load(&p.server.stats.dropped) >= p.dropped \
+	)
+}
+
+/*
+A query the loop will not start - no stack to be had - costs that datagram and
+not the reader. The loop is told to stop, which refuses every start the same
+way an `mmap` that fails does, while the listener itself is not stopping: the
+reader drops the first datagram and is still there to read the second.
+*/
+@(test)
+test_a_refused_start_drops_the_datagram_and_keeps_the_reader :: proc(t: ^testing.T) {
+	cfg: config.Config
+	fixture(&cfg, 1)
+	tl: Test_Loop
+	if !testing.expect(t, start_test_loop(&tl), "no loop") {
+		return
+	}
+	s := Server {
+		cfg   = &cfg,
+		loops = tl.loops[:],
+	}
+	l: Listeners
+	if !start_listeners(&s, &l) {
+		stop_test_loop(&tl)
+		testing.expect(t, false, "could not start the UDP listener")
+		return
+	}
+	defer {
+		stop_listeners(&l)
+		stop_test_loop(&tl)
+		destroy_listeners(&l)
+	}
+	// Every start from here on is refused; the reader, already running, runs on.
+	loop.stop(tl.loops[0])
+
+	client, cerr := net.make_unbound_udp_socket(.IP4)
+	if !testing.expectf(t, cerr == nil, "no client socket: %v", cerr) {
+		return
+	}
+	defer net.close(client)
+	query: [dns.HEADER_SIZE]u8
+	probe := Reader_Probe {
+		server    = &s,
+		listeners = &l,
+	}
+	for i in 1 ..= 2 {
+		_, _ = net.send_udp(client, query[:], l.udp_bound)
+		probe.received, probe.dropped = u64(i), u64(i)
+		if !testing.expectf(
+			t,
+			wait_for(reader_counts_reached, &probe, 5 * time.Second),
+			"datagram %d: received %d, dropped %d",
+			i,
+			sync.atomic_load(&l.udp[0].received),
+			sync.atomic_load(&s.stats.dropped),
+		) {
+			return
+		}
+	}
+	// And said, once, at warn: dropped= alone reads as the in-flight bound, whose
+	// remedy - raising max_pending - is the wrong one here.
+	testing.expect(t, sync.atomic_load(&query_spawn_reported), "a query refused a stack was not reported")
 }
 
 /*
@@ -364,22 +445,23 @@ test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
 	cfg: config.Config
 	fixture(&cfg, READERS)
 	cfg.listeners.udp.port = bound.port
-	handler_pool := pool.make_pool(2)
+	handler_pool: Test_Loop
+	start_test_loop(&handler_pool)
 	s := Server {
 		cfg          = &cfg,
-		handler_pool = handler_pool,
+		loops        = handler_pool.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
 		// The port was taken between the probe and here, which is nobody's bug.
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		logx.infof("the free port %d was taken before the listener could bind it", bound.port)
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		pool.destroy(handler_pool)
+		stop_test_loop(&handler_pool)
 		destroy_listeners(&l)
 	}
 	testing.expect_value(t, len(l.udp), READERS)
@@ -389,10 +471,11 @@ test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
 	second_cfg: config.Config
 	fixture(&second_cfg, READERS)
 	second_cfg.listeners.udp.port = bound.port
-	second_pool := pool.make_pool(2)
+	second_pool: Test_Loop
+	start_test_loop(&second_pool)
 	second := Server {
 		cfg          = &second_cfg,
-		handler_pool = second_pool,
+		loops        = second_pool.loops[:],
 	}
 	second_l: Listeners
 	started := start_listeners(&second, &second_l)
@@ -400,7 +483,157 @@ test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
 	// manager before it binds anything, and `stop_listeners` is what gives it
 	// back.
 	stop_listeners(&second_l)
-	pool.destroy(second_pool)
+	stop_test_loop(&second_pool)
 	destroy_listeners(&second_l)
 	testing.expect(t, !started, "a second listener joined the running one's port and took a share of its datagrams")
+}
+
+/*
+A reader steps aside for the queries it started, so a backlog in its socket is
+answered as it is read rather than all read first (`loop.TURN_BATCH`).
+
+A reader whose socket always has the next datagram never waits, and a loop runs
+a fiber until it does. So without the step aside, a queue of datagrams is read
+end to end before any query it started has run - all of them in flight at once,
+and every one past `max_pending` dropped although the server is answering as
+fast as it can. The loop is held while the queue builds, which is the moment a
+flood leaves it in, and then let go; with the reader stepping aside every batch
+nothing is in flight beyond a batch, and nothing is dropped.
+*/
+@(test)
+test_a_reader_lets_its_queries_run_between_batches :: proc(t: ^testing.T) {
+	cfg: config.Config
+	fixture(&cfg, 1)
+	LIMIT :: 80
+	SENT :: 150
+	cfg.server.max_pending = LIMIT
+	tl: Test_Loop
+	if !testing.expect(t, start_test_loop(&tl), "no loop") {
+		return
+	}
+	s := Server {
+		cfg   = &cfg,
+		loops = tl.loops[:],
+	}
+
+	// The loop, held: the fiber blocks the thread itself until the queue is
+	// built, which nothing on a loop is allowed to do outside a test.
+	Gate :: struct {
+		started, go: sync.Sema,
+	}
+	gate: Gate
+	_, _ = loop.spawn(tl.loops[0], proc(data: rawptr) {
+		g := (^Gate)(data)
+		sync.sema_post(&g.started)
+		sync.sema_wait(&g.go)
+	}, &gate)
+	if !testing.expect(t, sync.sema_wait_with_timeout(&gate.started, 5 * time.Second), "the loop never ran") {
+		sync.sema_post(&gate.go)
+		stop_test_loop(&tl)
+		return
+	}
+
+	l: Listeners
+	if !start_listeners(&s, &l) {
+		sync.sema_post(&gate.go)
+		stop_test_loop(&tl)
+		testing.expect(t, false, "could not start the UDP listener")
+		return
+	}
+	defer {
+		stop_listeners(&l)
+		stop_test_loop(&tl)
+		destroy_listeners(&l)
+	}
+
+	client, cerr := net.make_unbound_udp_socket(.IP4)
+	if !testing.expectf(t, cerr == nil, "no client socket: %v", cerr) {
+		sync.sema_post(&gate.go)
+		return
+	}
+	defer net.close(client)
+	// A header and no question, answered FORMERR without a lookup.
+	query: [dns.HEADER_SIZE]u8
+	for _ in 0 ..< SENT {
+		_, _ = net.send_udp(client, query[:], l.udp_bound)
+	}
+	sync.sema_post(&gate.go)
+
+	// Until the reader has taken everything the kernel kept and every query it
+	// started has been answered.
+	start := time.tick_now()
+	last := u64(0)
+	steady := time.tick_now()
+	for time.tick_since(start) < 5 * time.Second {
+		got := sync.atomic_load(&l.udp[0].received)
+		if got != last {
+			last = got
+			steady = time.tick_now()
+		} else if queries_pending(&s) == 0 && time.tick_since(steady) > 200 * time.Millisecond {
+			break
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	// The premise: more arrived than may be in flight, so reading them all before
+	// answering any would have had to drop some.
+	testing.expectf(t, last > LIMIT, "only %d of %d datagrams reached the reader; the case needs more than %d", last, SENT, LIMIT)
+	testing.expect_value(t, sync.atomic_load(&s.stats.dropped), 0)
+}
+
+/*
+A UDP socket closes when nothing will read or answer on it any more: at once
+when its reader stops with no query of its own in flight, and otherwise when the
+last such query lets go - not after every client connection has drained, which
+left the port bound and unread, and not before, which would hand the number to
+the next socket opened while an answer was still to be written to it.
+
+Whether the port is still held is read the way a client would meet it: a plain
+bind to it, which a socket still open there refuses.
+*/
+@(test)
+test_a_udp_socket_closes_with_its_last_user :: proc(t: ^testing.T) {
+	cfg: config.Config
+	fixture(&cfg, 1)
+	tl: Test_Loop
+	if !testing.expect(t, start_test_loop(&tl), "no loop") {
+		return
+	}
+	s := Server {
+		cfg   = &cfg,
+		loops = tl.loops[:],
+	}
+	l: Listeners
+	if !start_listeners(&s, &l) {
+		stop_test_loop(&tl)
+		testing.expect(t, false, "could not start the UDP listener")
+		return
+	}
+	stopped := false
+	defer {
+		if !stopped {
+			stop_listeners(&l)
+		}
+		stop_test_loop(&tl)
+		destroy_listeners(&l)
+	}
+	held :: proc(at: net.Endpoint) -> bool {
+		probe, err := net.make_bound_udp_socket(at.address, at.port)
+		if err != nil {
+			return true
+		}
+		net.close(probe)
+		return false
+	}
+	testing.expect(t, held(l.udp_bound), "the port is not held while the reader runs")
+
+	// A query in flight, as `udp_loop` counts one.
+	sync.atomic_add(&l.udp[0].holds, 1)
+	stop_listeners(&l)
+	stopped = true
+	testing.expect(t, held(l.udp_bound), "the socket closed under a query still to answer on it")
+
+	// The query answers and lets go: the socket goes with it.
+	release_udp_reader(&l.udp[0])
+	testing.expect_value(t, sync.atomic_load(&l.udp[0].holds), 0)
+	testing.expect(t, !held(l.udp_bound), "the socket is still open with nobody left to use it")
 }

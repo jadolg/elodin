@@ -322,17 +322,45 @@ server: {{ user: root }}
 		res := new_check(r, "examples/elodin.yaml", "check-example")
 		check_eq_int(r, res.exit_code, 0, "exit code for examples/elodin.yaml")
 		/*
-		The shipped file leaves both worker counts unset, so the numbers only
-		exist once a machine has been measured. `--check` is where an operator
-		looks before restarting a resolver, and a pool size that appears in no
-		file and no output is one nobody can argue with.
+		The shipped file leaves the loop count and the in-flight bound unset, so
+		the numbers only exist once a machine has been measured. `--check` is
+		where an operator looks before restarting a resolver, and a size that
+		appears in no file and no output is one nobody can argue with.
 		*/
 		check(
 			r,
-			strings.contains(res.output, "workers=") && strings.contains(res.output, "derived from"),
-			"the derived worker counts were not reported: %q",
+			strings.contains(res.output, "loops=") &&
+			strings.contains(res.output, "max_pending=") &&
+			strings.contains(res.output, "derived from"),
+			"the derived sizes were not reported: %q",
 			res.output,
 		)
+	}
+	end_case(r)
+
+	/*
+	A file that names the keys #547 retired still passes `--check`, as it still
+	starts, and each one is named with what replaced it: refused outright, a
+	configuration that was correct before the upgrade would stop the resolver
+	the moment the package was updated.
+	*/
+	start_case(r, "cli: --check accepts the retired worker keys and names each")
+	{
+		path := filepath.join({r.work_dir, "retired-keys.yaml"}, context.temp_allocator) or_else ""
+		_ = os.write_entire_file(
+			path,
+			transmute([]u8)string(
+				"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 8\n  upstream_workers: 2\n  running_workers: 4\ndnssec:\n  max_connection_walks: 24\n",
+			),
+		)
+		res := new_check(r, path, "check-retired-keys")
+		check_eq_int(r, res.exit_code, 0, "exit code for a file naming the retired keys")
+		for key in ([]string{"server.workers", "server.upstream_workers", "server.running_workers"}) {
+			check(r, strings.contains(res.output, fmt.tprintf("warning: %s is no longer used", key)), "%s was not named: %q", key, res.output)
+		}
+		// Still a setting: the connections keep a walk bound of their own.
+		check(r, !strings.contains(res.output, "max_connection_walks is no longer used"), "max_connection_walks was called retired: %q", res.output)
+		check(r, strings.contains(res.output, "connection_walks=24"), "the configured connection walk bound was not printed: %q", res.output)
 	}
 	end_case(r)
 
@@ -467,7 +495,7 @@ The kernel hands a process-directed signal to any thread that has it unblocked,
 and one taken in a timed socket read fails that read with EINTR: a list
 download, or an upstream read and the query behind it. Only the main thread,
 whose reads are none of those, is to take them, so every other is started with
-them blocked (`pool.spawn`). Read from each thread's SigBlk, the mask the kernel
+them blocked (`loop.spawn_thread`). Read from each thread's SigBlk, the mask the kernel
 consults.
 */
 @(private = "file")

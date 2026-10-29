@@ -1841,7 +1841,7 @@ test_doh_a_slow_answer_does_not_count_against_the_connection :: proc(t: ^testing
 		port    = upstream_bound.port,
 	}
 	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}

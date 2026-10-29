@@ -17,14 +17,14 @@ changes, with a comment on why; anything they leave out is the shipped default.
 ./bin/elodin --config examples/lan.yaml --check
 ```
 
-`--check` shows what a file means on your machine: the derived worker counts,
+`--check` shows what a file means on your machine: the derived sizes,
 who may ask, the connection table and its per-client share, and a warning for
 anything a route gives up. `public.yaml` fails it until the certificate and key
 it names exist.
 
 **`local-only.yaml`** binds `127.0.0.1`, so nothing off the machine can reach
-it. It cuts the worker pool to 8, the
-[UDP readers](connections.md#how-fast-datagrams-can-be-read) to 1 and the cache
+it. It cuts the queries in flight to 64, the
+[UDP readers](connections.md#how-fast-datagrams-can-be-read) - one event loop - to 1 and the cache
 to 5,000 entries, sized for one client. It is the only file that turns
 [rate limiting](rate-limiting.md#rate-limiting) off: on loopback, the only
 possible victim is this machine. `serve_stale` is on, for a laptop whose
@@ -38,8 +38,8 @@ one prefix's budget and the allow list already bounds the clients. It turns
 network's own names from `rewrites`, and turns `special_use.home_arpa` on so
 those names stop leaking to the public DNS.
 
-**`small-device.yaml`** is the LAN setup sized for memory. It pins 4 workers, 1
-racer and 1 reader with a 256 KiB receive buffer, and carries one blocklist
+**`small-device.yaml`** is the LAN setup sized for memory. It pins 32 queries in
+flight and 1 reader - one event loop - with a 256 KiB receive buffer, and carries one blocklist
 instead of four (the four in `lan.yaml`, 350,929 rules, measured 12 MB resident;
 one list about 3 MB). The blocklist cache is on tmpfs so a refresh does not
 write to flash. DoT and DoH are off: a TLS handshake costs about 1,100 µs of CPU
@@ -58,9 +58,9 @@ what has to hold around it:
   since a public resolver is nobody's local authority
 - filtering narrowed to malware
 
-**`container.yaml`** leaves worker counts to the derivation, which reads the
-container's cgroup limits: a pod limited to one CPU and 512 MiB derives 21
-workers with 2 running, at 256 MiB 10. It routes `cluster.local` and the
+**`container.yaml`** leaves the sizes to the derivation, which reads the
+container's cgroup limits: a pod limited to one CPU and 512 MiB derives one loop
+and 204 queries in flight, at 256 MiB 102. It routes `cluster.local` and the
 reverse zone to kube-dns and forwards everything else over DoT. It writes nothing to disk
 (blocking off, so no list cache). It is the only file that binds the metrics
 endpoint wide, because the scraper is outside the pod.

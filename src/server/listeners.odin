@@ -9,14 +9,14 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:loop"
 import "elodin:metrics"
 import "elodin:netx"
-import "elodin:pool"
 import "elodin:tlsx"
 
 Listeners :: struct {
 	/*
-	The UDP readers, one per thread, each with a socket of its own.
+	The UDP readers, one per event loop, each with a socket of its own.
 
 	Empty when UDP is off, and one entry long unless `listeners.udp.readers`
 	says otherwise. Allocated once at startup and never resized, because each
@@ -46,10 +46,10 @@ Listeners :: struct {
 	/*
 	Guards the two above against the reload that replaces them.
 
-	`reload_tls` frees the context it displaces, and a connection thread that
+	`reload_tls` frees the context it displaces, and a connection's fiber that
 	has read the pointer but not yet started its session is holding a pointer to
 	exactly that. The two are not otherwise ordered - the reload runs on the
-	maintenance loop and the read on a thread per connection - so an atomic on
+	maintenance thread and the read on whichever loop the connection is on - so an atomic on
 	the pointer settles which context a connection gets and says nothing about
 	whether the one it got is still there. See `accept_tls`.
 	*/
@@ -63,10 +63,10 @@ Listeners :: struct {
 	What the read and accept loops were given, held here rather than by the
 	loops themselves.
 
-	A loop hands its context to every job it queues and every connection thread
-	it starts, and those outlive it: a queued query still runs while the pool
-	drains, and a connection thread sits in a client read for as long as its
-	timeout allows. A loop that released its own context on the way out would
+	A loop hands its context to every query it starts and every connection it
+	accepts, and those outlive it: a query in flight still runs while the server
+	drains, and a connection sits in a client read for as long as its timeout
+	allows. A loop that released its own context on the way out would
 	pull the ground from under both. `destroy_listeners` releases them instead,
 	once there is nothing left that could be holding one.
 
@@ -75,22 +75,25 @@ Listeners :: struct {
 	*/
 	stream_loop_ctx:  [dynamic]^Stream_Context,
 	metrics_loop_ctx: ^Metrics_Context,
-	// Not routed through `conns` like every other loop: `conn_manager_shutdown`
-	// joins everything on that list and this one must outlive the join, not sit
-	// in the middle of it. See `stop_metrics`.
+	// A thread of its own rather than a fiber, and not routed through `conns`
+	// like every other loop: `conn_manager_shutdown` waits on everything on that
+	// list and this one must outlive the wait, not sit in the middle of it. See
+	// `stop_metrics`.
 	metrics_thread:   ^thread.Thread,
 }
 
 /*
-How long a loop may sit in a blocking call before it gets a chance to notice
-that it has been told to stop.
+How long a read or accept loop may wait before it gets a chance to notice that
+it has been told to stop.
 
-Closing a socket does not reliably wake a thread already blocked reading or
-accepting on it - the same reason `upstream/h2client.odin` polls rather than
-trusting close to cut a read short - so the loops carry a timeout and come up
-for air instead. Without it `conn_manager_shutdown` joins a thread that is
-never going to return. One wakeup a second per listener costs nothing next to
-the queries going through them.
+On an event loop the stop cancels the loop's fiber, which ends its wait at once
+(`conn_manager_stop_permanent`); this is for the same loops run on threads of
+their own, which is the tests. Closing a socket does not reliably wake a thread
+already blocked reading or accepting on it - the same reason
+`upstream/h2client.odin` polls rather than trusting close to cut a read short -
+so the loops carry a timeout and come up for air instead. One wakeup a second
+per listener costs nothing next to the queries going through them, and an event
+loop does not count it as work (see `loop.trim_idle`).
 */
 @(private)
 LISTENER_POLL :: time.Second
@@ -150,25 +153,28 @@ start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 	endpoint is an accept loop like any other - it meets the same shortage and
 	waits in the same place - so a UDP-only configuration with `metrics.enabled`
 	is a configuration this has something to say about. The demand is counted
-	whatever the listeners are: the worker pools and the upstream pools hold
-	descriptors in every configuration.
+	whatever the listeners are: the queries in flight, the loops and the upstream
+	pools hold descriptors in every configuration.
 
 	Startup only - `--check` reads a different process's limit. See
 	`descriptor_limit_line`.
 	*/
+	demand := Descriptor_Demand {
+		max_connections = cfg.server.max_connections if streams else 0,
+		pooled_upstream = config.pooled_upstream_connections(cfg.upstream),
+		in_flight       = cfg.server.max_pending,
+		racers          = cfg.server.max_pending * race_width(cfg.upstream),
+		udp_readers     = cfg.listeners.udp.readers if cfg.listeners.udp.enabled else 0,
+		loops           = len(s.loops),
+	}
 	if streams || cfg.metrics.enabled {
-		if line, short := descriptor_limit_line(
-			descriptor_limit(),
-			Descriptor_Demand {
-				max_connections = cfg.server.max_connections if streams else 0,
-				pooled_upstream = config.pooled_upstream_connections(cfg.upstream),
-				workers = cfg.server.workers,
-				upstream_workers = cfg.server.upstream_workers,
-				udp_readers = cfg.listeners.udp.readers if cfg.listeners.udp.enabled else 0,
-			},
-		); short {
+		if line, short := descriptor_limit_line(descriptor_limit(), demand); short {
 			logx.warnf("%s", line)
 		}
+	}
+	// The same figures, as fibers; see `map_count_line`.
+	if line, short := map_count_line(metrics.map_count_limit(), demand); short {
+		logx.warnf("%s", line)
 	}
 
 	if cfg.listeners.udp.enabled {
@@ -204,8 +210,13 @@ start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 
 stop_listeners :: proc(l: ^Listeners) {
 	sync.atomic_store(&l.stop, true)
-	for reader in l.udp {
-		net.close(reader.socket)
+	// The read and accept loops first, and their sockets only once nothing is
+	// waiting on them; see `conn_manager_stop_permanent`. A UDP socket closes
+	// when the last query its reader admitted has answered on it, which may be
+	// now or during the drain that follows; see `Udp_Reader.holds`.
+	conn_manager_stop_permanent(&l.conns)
+	for &reader in l.udp {
+		release_udp_reader(&reader)
 	}
 	if l.tcp_open {
 		net.close(l.tcp_socket)
@@ -234,11 +245,11 @@ watching `elodin_connections_active` fall to zero during that stretch is
 watching the shutdown succeed; one watching a gap where the endpoint used to be
 cannot tell a slow stop from a stuck one.
 
-Called before either `pool.destroy`, not after both - unlike everything else
-this endpoint reads, `handler_pool` and `race_pool` are not freed by a defer
-later in `run`, they are freed by `pool.destroy` itself, right here, and
-`render_pool_metrics` takes no lock on the way in. Keeping the endpoint open
-across that call would be reading through a free the moment it landed.
+Called before the event loops are stopped - unlike everything else this
+endpoint reads, they are not freed by a defer later in `run`, they are freed by
+`stop_loops` right after the drain, and `render_loop_metrics` takes no lock on the
+way in. Keeping the endpoint open across that call would be reading through a
+free the moment it landed.
 */
 stop_metrics :: proc(l: ^Listeners) {
 	if !l.metrics_open {
@@ -254,15 +265,20 @@ stop_metrics :: proc(l: ^Listeners) {
 }
 
 /*
-Release what the loops were given.
+Release what the loops were given, and close the UDP sockets.
 
 Separate from `stop_listeners` because stopping is not the same as being
-finished with: a query queued before the sockets closed still runs while the
-worker pool drains, and it reads the context of the loop that queued it. The
-caller drains the pools between the two.
+finished with: a query admitted before the listeners stopped still runs while
+the server drains, reads the context of the reader that admitted it, and answers
+on that reader's socket. The caller drains the queries between the two.
 */
 destroy_listeners :: proc(l: ^Listeners) {
 	for &reader in l.udp {
+		// Closed already unless `stop_listeners` never ran, as when startup
+		// failed after the bind; the queries are drained by now either way.
+		if sync.atomic_load(&reader.holds) > 0 {
+			net.close(reader.socket)
+		}
 		if reader.ctx != nil {
 			free(reader.ctx)
 			reader.ctx = nil
@@ -284,10 +300,10 @@ destroy_listeners :: proc(l: ^Listeners) {
 // --- UDP ------------------------------------------------------------------
 
 /*
-One reader: a socket, the thread that drains it, and what it has drained.
+One reader: a socket, the event loop that drains it, and what it has drained.
 
 They exist because everything a datagram costs before the rate limiter sees it
-happens on the thread that read it, so a single reader is one core's worth of
+happens on the loop that read it, so a single reader is one core's worth of
 drain rate for the whole server, and past that rate the kernel drops datagrams
 in the receive queue - where no configuration and no budget can reach them. See
 `listeners.udp.readers`, and the measurement it points at.
@@ -310,6 +326,30 @@ Udp_Reader :: struct {
 	// The context handed to the loop. Released by `destroy_listeners`, not by
 	// the loop, for the reason the field comment on `stream_loop_ctx` gives.
 	ctx:      ^Udp_Context,
+	/*
+	Who still uses `socket`: the reader itself, until `stop_listeners` lets go of
+	it, and one for each query it started, until that query has answered. The
+	one that takes it to zero closes the socket (`release_udp_reader`).
+
+	So the socket closes as soon as nothing will read or answer on it - at
+	shutdown, once the reader has stopped and its last query has answered,
+	rather than after every client connection has drained, which would leave the
+	port bound and unread for up to `client_timeout` and clients waiting out their
+	own timeouts where a closed port refuses them at once. And never
+	before: a query answers on the socket its datagram came in on, and a number
+	closed under it goes to the next socket opened.
+	*/
+	holds:    int,
+}
+
+/*
+Let go of one use of `r.socket`, closing it with the last. See `Udp_Reader.holds`.
+*/
+@(private)
+release_udp_reader :: proc(r: ^Udp_Reader) {
+	if sync.atomic_sub(&r.holds, 1) == 1 {
+		net.close(r.socket)
+	}
 }
 
 @(private)
@@ -384,7 +424,7 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 	Bound into a list of their own before `l.udp` exists.
 
 	So that a bind that fails halfway leaves `l.udp` empty rather than half
-	filled: `stop_listeners` closes every socket it finds there, and a reader
+	filled: `destroy_listeners` closes every socket it finds there, and a reader
 	that was never bound holds a zero, which is descriptor 0 and somebody else's.
 	Nothing is published to the listener until every socket is open.
 	*/
@@ -450,6 +490,8 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 	for socket, i in sockets {
 		l.udp[i].socket = socket
 		l.udp[i].inode = metrics.socket_inode(int(socket))
+		// The reader's own; see `Udp_Reader.holds`.
+		l.udp[i].holds = 1
 	}
 
 	for i in 0 ..< len(l.udp) {
@@ -457,16 +499,19 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 		ctx.server = s
 		ctx.listeners = l
 		ctx.reader = &l.udp[i]
-		if conn_spawn(&l.conns, ctx, udp_loop, counted = false) != .Started {
+		/*
+		One reader to a loop, so each loop drains a socket of its own and the
+		queries it reads are answered there - the kernel's hash of the 4-tuple
+		spreads the datagrams, and the loops take them in parallel.
+		*/
+		if conn_spawn(&l.conns, ctx, udp_loop, counted = false, on = server_loop(s, i)) != .Started {
 			logx.errorf("listeners.udp: cannot start read loop %d of %d", i + 1, len(l.udp))
 			// Nothing was ever handed this one, so it is ours to release. The
-			// loops already started are holding their own, and are left to
-			// `stop_listeners`, which is also what closes the sockets: closing
-			// them here would leave it closing descriptors this process has
-			// already given back. The flag is what those loops come out on,
-			// within one `LISTENER_POLL`.
+			// readers already started are holding their own, and are left to
+			// `stop_listeners`, which is also what closes the sockets once they
+			// have gone: closing them here would leave it closing descriptors
+			// this process has already given back.
 			free(ctx)
-			sync.atomic_store(&l.stop, true)
 			return false
 		}
 		l.udp[i].ctx = ctx
@@ -522,12 +567,17 @@ bind_udp_reader :: proc(
 		// whose bind failed.
 		return {}, 0, net.Bind_Error.Unknown
 	}
-	// A large receive buffer absorbs query bursts that arrive while every
-	// worker is busy. What the kernel actually granted is reported at startup:
+	// A large receive buffer absorbs query bursts that arrive while the loop is
+	// busy. What the kernel actually granted is reported at startup:
 	// it clamps this to `net.core.rmem_max`, which is 208 KiB by default.
 	granted = set_receive_buffer(socket, buffer)
 	// So the read loop wakes up now and then and can see `stop`.
 	_ = net.set_option(socket, .Receive_Timeout, LISTENER_POLL)
+	// Read on a loop, which a blocking socket would put to sleep.
+	if net.set_blocking(socket, false) != nil {
+		net.close(socket)
+		return {}, 0, net.Bind_Error.Unknown
+	}
 	if berr := net.bind(socket, {address, port}); berr != nil {
 		net.close(socket)
 		return {}, 0, berr
@@ -625,10 +675,16 @@ udp_loop :: proc(data: rawptr) {
 
 	// Labelled for the submit below, whose `break` would otherwise leave only
 	// the switch it sits in.
-	loop: for !sync.atomic_load(&l.stop) {
-		n, client, err := net.recv_udp(socket, buf)
+	/*
+	A reader under a flood never waits - its socket always has the next datagram -
+	so it would read for ever with every query it started queued behind it on the
+	same loop. `loop.recv_udp` steps aside every `loop.TURN_BATCH` calls that did
+	not wait, which bounds how far reading can get ahead of answering.
+	*/
+	reading: for !sync.atomic_load(&l.stop) {
+		n, client, err := loop.recv_udp(socket, buf)
 		if err != nil {
-			if sync.atomic_load(&l.stop) {
+			if sync.atomic_load(&l.stop) || loop.cancelled() {
 				break
 			}
 			continue
@@ -642,7 +698,7 @@ udp_loop :: proc(data: rawptr) {
 		operator watching one reader's count climb while the others sit still is
 		looking at that, and no other counter in this process can show it -
 		everything else is charged after the datagram has been read, by whichever
-		thread read it.
+		loop read it.
 		*/
 		sync.atomic_add(&ctx.reader.received, 1)
 		if n < dns.HEADER_SIZE {
@@ -666,7 +722,7 @@ udp_loop :: proc(data: rawptr) {
 		pin_scope(ctx.server)
 
 		/*
-		Before the message is parsed, before the limiter and before the queue:
+		Before the message is parsed, before the limiter and before a query is started:
 		a source this server does not answer should cost a prefix compare and
 		nothing else.
 
@@ -702,7 +758,7 @@ udp_loop :: proc(data: rawptr) {
 		case .Allow:
 		case .Truncate:
 			if tc, built := dns.truncated_response(buf[:n], context.temp_allocator); built {
-				_, _ = net.send_udp(socket, tc, client)
+				_, _ = loop.send_udp(socket, tc, client)
 			}
 			free_all(context.temp_allocator)
 			continue
@@ -711,17 +767,17 @@ udp_loop :: proc(data: rawptr) {
 		}
 
 		/*
-		Shed rather than queue once the backlog is past what the workers can
-		work through. A query added here would be answered long after its client
-		stopped waiting, and the effort spent on it is taken from queries that
-		could still have been answered in time.
+		Shed rather than start once `max_pending` queries are in flight. A query
+		added here would be answered long after its client stopped waiting, and
+		the effort spent on it is taken from queries that could still have been
+		answered in time.
 
 		Asked here as well as at the submit below, which is where it is decided:
 		this loop is what a flood arrives at, and the copy of the datagram the
-		job needs is worth not making for a query about to be shed.
+		query needs is worth not making for a query about to be shed.
 		*/
 		limit := live(ctx.server).cfg.server.max_pending
-		if limit > 0 && pool.pending(ctx.server.handler_pool) >= limit {
+		if limit > 0 && queries_pending(ctx.server) >= limit {
 			sync.atomic_add(&ctx.server.stats.dropped, 1)
 			report_shed(client, limit)
 			continue
@@ -734,11 +790,17 @@ udp_loop :: proc(data: rawptr) {
 		job.data = make([]u8, n)
 		copy(job.data, buf[:n])
 
-		switch pool.try_submit(ctx.server.handler_pool, udp_job, job, limit) {
+		// The query's use of the socket, given back once it has answered on it.
+		sync.atomic_add(&ctx.reader.holds, 1)
+		result := submit_query(ctx.server, udp_job, job, limit)
+		if result != .Accepted {
+			release_udp_reader(ctx.reader)
+		}
+		switch result {
 		case .Accepted:
 		case .Full:
-			// The backlog filled up between the check above and here, from this
-			// loop's own last datagram or from a DoH connection's reader.
+			// The bound was reached between the check above and here, by another
+			// loop's reader or a DoH connection's.
 			sync.atomic_add(&ctx.server.stats.dropped, 1)
 			report_shed(client, limit)
 			delete(job.data)
@@ -746,11 +808,22 @@ udp_loop :: proc(data: rawptr) {
 		case .Stopped:
 			delete(job.data)
 			free(job)
-			break loop
+			/*
+			Not the server stopping unless `stop` says so: the readers are gone
+			before the loops stop, so what refused this start is a stack that
+			could not be mapped - memory, or the process's mapping count. That
+			datagram is dropped as a shed one is, and the reader reads on;
+			leaving here would take the loop off UDP until the next restart.
+			*/
+			if sync.atomic_load(&l.stop) {
+				break reading
+			}
+			sync.atomic_add(&ctx.server.stats.dropped, 1)
+			report_query_spawn_failure(.UDP)
 		}
 	}
-	// `ctx` is not released here: jobs queued above still hold it, and they run
-	// on while the pool drains. `destroy_listeners` has it.
+	// `ctx` is not released here: queries started above still hold it, and they
+	// run on while the server drains. `destroy_listeners` has it.
 }
 
 /*
@@ -824,18 +897,19 @@ report_refusal :: proc(client: net.Endpoint, proto: Protocol) {
 	The line itself is what has to be paid for, and it is paid for here.
 
 	`logx` formats through `fmt.tprintf`, so a line costs a few hundred bytes of
-	the calling thread's temp arena - and the two callers are the UDP read loop
-	and the accept loops, neither of which resets one. The read loop's arena is
-	not the one a query is answered from; that belongs to the worker the job is
-	handed to. The accept loop's is untouched from start to shutdown. At `debug`,
-	where every refusal is logged, that would be an arena a refused source grows
-	for as long as it keeps sending - which is the level an operator turns on to
-	find out why their clients are being refused, so it is the level this must
-	not misbehave at.
+	the calling fiber's scratch - and the two callers are the UDP read loop and
+	the accept loops, neither of which resets one. The read loop's scratch is not
+	the one a query is answered from; that belongs to the fiber the query is
+	started on. The accept loop's is untouched from start to shutdown. At
+	`debug`, where every refusal is logged, that would be scratch a refused source
+	grows for as long as it keeps sending - which is the level an operator turns
+	on to find out why their clients are being refused, so it is the level this
+	must not misbehave at.
 
 	Released where the garbage is made rather than at the call sites, and safe
 	because both of them hold nothing in the temp allocator across this: the
-	check runs before a datagram is parsed and before a connection is queued.
+	check runs before a datagram is parsed and before a connection is spread to
+	a loop.
 	*/
 	defer free_all(context.temp_allocator)
 
@@ -864,7 +938,7 @@ report_refusal :: proc(client: net.Endpoint, proto: Protocol) {
 }
 
 /*
-Say which client a full backlog turned away.
+Say which client `max_pending` turned away.
 
 Debug only, and not through `report_once`: unlike a refusal, a shed is already
 counted as dropped= in the stats line, so an operator watching for it has a
@@ -872,7 +946,7 @@ figure that a flood cannot make them miss. This is for the question that figure
 raises next - which clients are being turned away - and it is asked by turning
 debug on.
 
-The line is formatted out of the read loop's temp arena, which that loop resets
+The line is formatted out of the read loop's scratch, which that loop resets
 only where it has something to reset, so it is released here as `report_refusal`
 does. Safe for the same reason: both call sites are about to `continue`, and
 neither holds anything in the temp allocator across this.
@@ -880,7 +954,7 @@ neither holds anything in the temp allocator across this.
 @(private)
 report_shed :: proc(client: net.Endpoint, limit: int) {
 	// Before the address is formatted, not after: this is reached once per
-	// datagram of exactly the flood that fills the backlog, so with debug off it
+	// datagram of exactly the flood that fills `max_pending`, so with debug off it
 	// has to cost the load and nothing else.
 	if !logx.enabled(.Debug) {
 		return
@@ -961,7 +1035,7 @@ connection_limits_line :: proc(limit, prefix_limit: int) -> string {
 }
 
 /*
-Say why a connection could not be given a thread, once, and then quietly.
+Say why a connection could not be given a fiber, once, and then quietly.
 
 The same reasoning as `report_refusal`, and reached the same way: a peer opening
 connections past the limit wrote one line per attempt otherwise, at `warn`, so it
@@ -971,7 +1045,7 @@ slot and one refused for want of an allow-list entry look identical from the
 client's side.
 
 The three causes are told apart because they ask for different things. Naming
-`max_connections` at a host that ran out of threads sends an operator to raise a
+`max_connections` at a host that ran out of memory for a stack sends an operator to raise a
 limit that was never the bound, and the raise makes it worse; naming it at a
 client that has filled its own share sends them to raise the table, which hands
 that same client more of it and still refuses the next connection from it. Each
@@ -1028,13 +1102,13 @@ spawn_failure_words :: proc(why: Spawn_Result) -> Spawn_Failure_Words {
 			line = "%s: refusing a connection, this client's /24 or /64 already holds server.max_connections_per_prefix (%d) of them",
 			hint = "raise server.max_connections_per_prefix if one client network should be able to hold more of server.max_connections at once, or set it to max_connections to let any one of them hold the table; these are counted as conn_refused= in the stats line, and further ones are logged at debug level",
 		}
-	case .Started, .Thread_Failed, .Stopped:
+	case .Started, .Spawn_Failed, .Stopped:
 	}
 	return Spawn_Failure_Words {
 		reported = &conn_failed_reported,
-		brief = "%s: refusing a connection, the OS would not start a thread for it, below the limit of %d",
-		line = "%s: refusing a connection, the OS would not start a thread for it - this is below server.max_connections (%d), so raising that will not help",
-		hint = "check the process thread and memory limits (RLIMIT_NPROC, cgroup pids.max); these are counted as conn_failed= in the stats line, and further ones are logged at debug level",
+		brief = "%s: refusing a connection, the OS would not map a stack for it, below the limit of %d",
+		line = "%s: refusing a connection, the OS would not map a stack for it - this is below server.max_connections (%d), so raising that will not help",
+		hint = "check the process memory limits (RLIMIT_AS, cgroup memory.max, MemoryMax=) and the mapping count (vm.max_map_count, two mappings per fiber stack); these are counted as conn_failed= in the stats line, and further ones are logged at debug level",
 	}
 }
 
@@ -1055,6 +1129,36 @@ spawn_failure_limit :: proc(why: Spawn_Result, cm: ^Conn_Manager) -> int {
 }
 
 @(private)
+query_spawn_reported: bool
+
+/*
+Say, once, that a query could not be given a fiber of its own.
+
+The query-side twin of `report_spawn_failure`'s third cause: a UDP datagram or an
+HTTP/2 request that `submit_query` could not start because the OS would not map
+a stack. Counted as dropped=, which is also what `max_pending` shedding counts,
+and the two want opposite remedies - so the first one is said at `warn`, naming
+what to check. Once per process: the per-client detail is the debug lines' job.
+Formats nothing out of the scratch, since the HTTP/2 caller's holds the frame
+`h2.serve` is still working through.
+*/
+@(private)
+report_query_spawn_failure :: proc(proto: Protocol) {
+	// `first`, not `say`: readers on several loops fail together, and only the
+	// one that turned the flag may speak.
+	if _, first := report_once(&query_spawn_reported, false); !first {
+		return
+	}
+	logx.warnf(
+		"%s: dropping a query, the OS would not map a stack for it - this is below server.max_pending, so raising that will not help",
+		proto_name(proto),
+	)
+	logx.warnf(
+		"check the process memory limits (RLIMIT_AS, cgroup memory.max, MemoryMax=) and the mapping count (vm.max_map_count); these are counted as dropped= in the stats line",
+	)
+}
+
+@(private)
 report_spawn_failure :: proc(proto: Protocol, why: Spawn_Result, cm: ^Conn_Manager) {
 	limit := spawn_failure_limit(why, cm)
 	words := spawn_failure_words(why)
@@ -1063,7 +1167,7 @@ report_spawn_failure :: proc(proto: Protocol, why: Spawn_Result, cm: ^Conn_Manag
 		return
 	}
 	// As in `report_refusal`: the accept loop is the one place that never resets
-	// its own temp arena, and the line was formatted out of it.
+	// its own scratch, and the line was formatted out of it.
 	defer free_all(context.temp_allocator)
 
 	transport := proto_name(proto)
@@ -1112,7 +1216,7 @@ report_conn_rate_limit :: proc(client: net.Endpoint, proto: Protocol, rate: int)
 	if !say {
 		return
 	}
-	// As in `report_refusal`: the accept loop never resets its own temp arena,
+	// As in `report_refusal`: the accept loop never resets its own scratch,
 	// and the line was formatted out of it.
 	defer free_all(context.temp_allocator)
 
@@ -1232,13 +1336,17 @@ is_unicast :: proc(a: net.Address) -> bool {
 @(private)
 udp_job :: proc(data: rawptr) {
 	job := cast(^Udp_Job)data
+	s := job.ctx.server
+	reader := job.ctx.reader
 	defer {
 		delete(job.data)
 		free(job)
 		free_all(context.temp_allocator)
+		// After the send, which is the last use of the socket.
+		release_udp_reader(reader)
+		query_done(s)
 	}
 
-	s := job.ctx.server
 	// Across the answer and the charge for it, so both are this generation's.
 	pin_scope(s)
 	client := net.endpoint_to_string(job.client, context.temp_allocator)
@@ -1263,7 +1371,7 @@ udp_job :: proc(data: rawptr) {
 	this is a compare and a return.
 	*/
 	rate_charge_response(live(s).limiter, job.client, len(response), time.tick_now())
-	_, _ = net.send_udp(job.socket, response, job.client)
+	_, _ = loop.send_udp(job.socket, response, job.client)
 }
 
 // --- TCP and DoT ----------------------------------------------------------
@@ -1316,12 +1424,25 @@ start_stream_listener :: proc(
 	_ = net.set_option(sock, .Receive_Timeout, LISTENER_POLL)
 	socket^ = sock
 	open^ = true
+	// Accepted on a loop, which a blocking socket would put to sleep.
+	if net.set_blocking(sock, false) != nil {
+		logx.errorf("listeners.%s: cannot make the listening socket non-blocking", name)
+		return false
+	}
 
 	ctx := new(Stream_Context)
 	ctx.server = s
 	ctx.listeners = l
 	ctx.proto = proto
-	if conn_spawn(&l.conns, ctx, accept_loop, counted = false) != .Started {
+	/*
+	One accept loop per listener, each listener on a loop of its own in turn, so
+	that a UDP flood landing on one loop's reader holds up the accepts of at most
+	one listener. Accepting is a system call and a few checks per connection,
+	and the connections it accepts are spread over every loop from there - see
+	`next_loop` - which is where their TLS handshakes and their queries run.
+	*/
+	at := server_loop(s, len(l.stream_loop_ctx))
+	if conn_spawn(&l.conns, ctx, accept_loop, counted = false, on = at) != .Started {
 		logx.errorf("listeners.%s: cannot start the accept loop", name)
 		// Nothing was ever handed it, so it is ours to release.
 		free(ctx)
@@ -1406,9 +1527,9 @@ open connection's `SSL` holds stays valid after the swap: OpenSSL reference
 counts an `SSL_CTX` from `SSL_new` on, so freeing the displaced one here only
 releases it once the last connection still using it closes.
 
-Called from the maintenance loop on SIGHUP, one listener at a time; nothing
-else running concurrently writes `dot_ctx` or `doh_ctx`, but `accept_loop`'s
-connection threads read them for every new connection, hence `l.tls_mu`.
+Called from the maintenance thread on SIGHUP, one listener at a time; nothing
+else running concurrently writes `dot_ctx` or `doh_ctx`, but every connection's
+fiber reads them as it starts, on whichever loop it is on, hence `l.tls_mu`.
 */
 reload_tls :: proc(s: ^Server, l: ^Listeners) -> bool {
 	ok := true
@@ -1450,7 +1571,7 @@ reload_tls_ctx :: proc(
 	/*
 	Swapped and released inside the exclusive lock rather than around it.
 
-	Holding it is what says no connection thread is between reading the pointer
+	Holding it is what says no connection is between reading the pointer
 	and taking its reference on the `SSL_CTX` - see `accept_tls` - so the
 	displaced context can be freed knowing nobody is about to dereference it.
 	Released here and not later because there is nothing to wait for: an open
@@ -1533,9 +1654,11 @@ accept_loop :: proc(data: rawptr) {
 	// The run of consecutive failures, reset by anything that is not one - an
 	// accepted connection, or the poll tick. See `accept_failed`.
 	run: Accept_Run
+	// Under a connection storm the backlog always has the next one, and
+	// `loop.accept_tcp` steps aside between them; see `loop.take_turn`.
 	for !sync.atomic_load(&l.stop) {
-		client_socket, client, err := net.accept_tcp(listener)
-		if err != nil && sync.atomic_load(&l.stop) {
+		client_socket, client, err := loop.accept_tcp(listener)
+		if err != nil && (sync.atomic_load(&l.stop) || loop.cancelled()) {
 			break
 		}
 		/*
@@ -1573,17 +1696,17 @@ accept_loop :: proc(data: rawptr) {
 				if act.report {
 					report_accept_failure(proto_name(ctx.proto), act.run, err, &ctx.accept_reported)
 				}
-				time.sleep(act.wait)
+				_ = loop.sleep(act.wait)
 			}
 			continue
 		}
 
 		/*
-		Closed here rather than handed a thread that would answer REFUSED.
+		Closed here rather than handed a fiber that would answer REFUSED.
 
 		A refusal a client can read is the friendlier of the two, and it is what
 		BIND and Unbound send - but it has to be written on a connection, and a
-		connection is a thread out of `max_connections` plus, for DoT and DoH, a
+		connection is a fiber out of `max_connections` plus, for DoT and DoH, a
 		TLS handshake. That would make the allow list a way to exhaust the
 		connection limit rather than a defence: a source we have already decided
 		not to serve would cost more than one we do. Closing on accept costs a
@@ -1618,10 +1741,10 @@ accept_loop :: proc(data: rawptr) {
 		decided not to serve is closed above without spending anything, so a
 		narrowed list cannot become a way to empty the budget of the prefix beside
 		it. Before everything else, because a refusal here costs an accept and a
-		close, and every step past it - a thread, a TLS handshake - is the cost
+		close, and every step past it - a fiber, a TLS handshake - is the cost
 		being bounded. `conn_spawn` below is the other way round for the same
-		reason: it walks its thread list and asks the OS about each entry, so the
-		cheaper bound goes first.
+		reason: it walks its table to count the prefix's share, so the cheaper
+		bound goes first.
 
 		Closed rather than answered, for the reason the allow list's refusal is:
 		writing a reason takes a connection, and a connection is what is being
@@ -1650,11 +1773,16 @@ accept_loop :: proc(data: rawptr) {
 		against its own share of the table as well as against the total. It is
 		read here, from the address the accept returned, rather than anywhere
 		further in: this is the only place that sees a connection before it costs
-		a thread, and a share checked after the thread exists would be a limit on
+		a fiber, and a share checked after the fiber exists would be a limit on
 		nothing.
 		*/
-		if spawned := conn_spawn(&l.conns, job, stream_job, client_prefix(client.address));
-		   spawned != .Started {
+		if spawned := conn_spawn(
+			&l.conns,
+			job,
+			stream_job,
+			client_prefix(client.address),
+			on = next_loop(ctx.server),
+		); spawned != .Started {
 			/*
 			Counted first, and logged only once.
 
@@ -1671,19 +1799,19 @@ accept_loop :: proc(data: rawptr) {
 			are `conn_refused=` and an operator watching the counter sees a client
 			being turned away either way; the `warn` under it says which figure
 			did it, because raising the wrong one of the two makes the other
-			worse. A host that cannot give this process another thread is not a
-			limit doing its job at all - it happens below both, and it is counted
+			worse. A host that cannot give this process the memory for another
+			fiber's stack is not a limit doing its job at all - it happens below both, and it is counted
 			apart as `conn_failed=` so that raising nothing is the advice.
 
-			`report_spawn_failure` releases the temp arena the line was formatted
-			out of: this loop is the one place that never resets it, and nothing
-			here outlives the iteration.
+			`report_spawn_failure` releases the scratch the line was formatted out
+			of: this loop is the one place that never resets it, and nothing here
+			outlives the iteration.
 			*/
 			// `.Stopped` is a connection accepted as shutdown began: not this
 			// server refusing a client it could serve, so neither counted nor
 			// logged, since either would name a setting with nothing to do with it.
 			if spawned != .Stopped {
-				if spawned == .Thread_Failed {
+				if spawned == .Spawn_Failed {
 					sync.atomic_add(&ctx.server.stats.conn_failed, 1)
 				} else {
 					sync.atomic_add(&ctx.server.stats.conn_refused, 1)
@@ -1694,7 +1822,7 @@ accept_loop :: proc(data: rawptr) {
 			free(job)
 		}
 	}
-	// `ctx` is not released here: every connection thread started above holds
+	// `ctx` is not released here: every connection fiber started above holds
 	// it for as long as its client keeps the connection open, and this loop
 	// exits first. `destroy_listeners` has it.
 }
@@ -1777,6 +1905,8 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 	// Whether this connection has anything the close could take back, which is
 	// what decides whether the refusal below drains first - see `stream_linger`.
 	answered := false
+	// A client pipelining queries the cache answers never lets this fiber park;
+	// its reads and writes step aside between them (`loop.take_turn`).
 	for {
 		/*
 		One budget for the length prefix and the body behind it, taken fresh per
@@ -1832,7 +1962,7 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		The connection ends rather than this query being skipped. Skipping it
 		leaves a client that framed a correct query waiting for an answer that is
 		never coming, until `client_timeout` closes the connection anyway, and
-		leaves this thread reading the rest of the flood in the meantime; closing
+		leaves this fiber reading the rest of the flood in the meantime; closing
 		says so now and hands the slot back to `max_connections`. RFC 7766 6.2.3
 		has a server free to hold connections open for no time at all when it is
 		under heavy load or attack, which is the case this is, and a client that
@@ -1862,9 +1992,10 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 			return
 		}
 
-		// TCP and DoT: this is the connection's own thread, so a slow answer
-		// here costs nobody but this client.
-		response, _, ok := handle_query(s, query, proto, client, context.temp_allocator, shared_worker = false)
+		// TCP and DoT: this is the connection's own fiber, so an answer waiting on
+		// the network here costs nobody but this client. On the connection's fiber,
+		// outside `max_pending`; see `handle_query`'s `pool`.
+		response, _, ok := handle_query(s, query, proto, client, context.temp_allocator, pool = .Connection)
 		if !ok || len(response) == 0 {
 			free_all(context.temp_allocator)
 			continue
@@ -2000,7 +2131,7 @@ conn_read :: proc(c: Conn, buf: []u8) -> (n: int, ok: bool) {
 		got, err := tlsx.read(c.tls, buf)
 		return got, err == .None && got > 0
 	}
-	got, err := net.recv_tcp(c.socket, buf)
+	got, err := loop.recv_tcp(c.socket, buf)
 	return got, err == nil && got > 0
 }
 
@@ -2144,15 +2275,9 @@ conn_write_all :: proc(c: Conn, buf: []u8) -> bool {
 		_, err := tlsx.write(c.tls, buf)
 		return err == .None
 	}
-	sent := 0
-	for sent < len(buf) {
-		n, err := net.send_tcp(c.socket, buf[sent:])
-		if err != nil || n <= 0 {
-			return false
-		}
-		sent += n
-	}
-	return true
+	// `loop.send_tcp` writes the whole buffer or says why not.
+	n, err := loop.send_tcp(c.socket, buf)
+	return err == nil && n == len(buf)
 }
 
 @(private)

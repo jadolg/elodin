@@ -8,7 +8,6 @@ import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
-import "elodin:pool"
 import "elodin:upstream"
 
 /*
@@ -398,7 +397,7 @@ test_a_stale_copy_is_not_served_past_its_rrsig_after_the_wait :: proc(t: ^testin
 		port    = bound.port,
 	}
 	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -456,15 +455,16 @@ test_a_lapsed_stale_copy_waits_for_the_refresh :: proc(t: ^testing.T) {
 	cfg.upstream.timeout = 5 * time.Second
 	cfg.cache.stale_timeout = 100 * time.Millisecond
 	cfg.upstream.servers = blackhole_servers(bound.port)
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
 	defer upstream.destroy_group(group)
 	s.group = group
-	workers := pool.make_pool(2)
-	defer pool.destroy(workers)
-	s.handler_pool = workers
+	workers: Test_Loop
+	start_test_loop(&workers)
+	defer stop_test_loop(&workers)
+	s.loops = workers.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -547,7 +547,7 @@ test_a_live_upstream_beats_a_stale_entry :: proc(t: ^testing.T) {
 	}
 	cfg.upstream.servers = servers
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -633,7 +633,7 @@ test_a_referral_falls_back_on_a_stale_entry :: proc(t: ^testing.T) {
 		port    = bound.port,
 	}
 	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -829,7 +829,7 @@ test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T)
 	cfg.cache.stale_timeout = 150 * time.Millisecond
 	cfg.upstream.servers = blackhole_servers(bound.port)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -837,13 +837,14 @@ test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T)
 	s.group = group
 
 	/*
-	Declared last so that it is torn down first: `pool.destroy` joins the
+	Declared last so that it is torn down first: `stop_test_loop` waits out the
 	refresh, which is still inside its two-second upstream budget when this
 	returns and which writes to the cache and the group when it comes out.
 	*/
-	workers := pool.make_pool(2)
-	defer pool.destroy(workers)
-	s.handler_pool = workers
+	workers: Test_Loop
+	start_test_loop(&workers)
+	defer stop_test_loop(&workers)
+	s.loops = workers.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -927,20 +928,21 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 	cfg.cache.stale_timeout = 100 * time.Millisecond
 	cfg.upstream.servers = blackhole_servers(bound.port)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
 	defer upstream.destroy_group(group)
 	s.group = group
-	workers := pool.make_pool(4)
+	workers: Test_Loop
+	start_test_loop(&workers)
 	// Joined in the middle of the case rather than at the end of it; the drain
 	// below says why. The flag is what keeps an early return from leaking it.
 	joined := false
 	defer if !joined {
-		pool.destroy(workers)
+		stop_test_loop(&workers)
 	}
-	s.handler_pool = workers
+	s.loops = workers.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -972,13 +974,13 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 	than reading one, and a runner slow enough to lose that race would report a
 	missing refresh as a failure of the single-flight this case is about.
 
-	`pool.destroy` joins the worker, so the job has returned and its one attempt
-	is on the socket or was never going to be. That is a fact about this
+	`stop_test_loop` waits out the loop, so the refresh has returned and its one
+	attempt is on the socket or was never going to be. That is a fact about this
 	process rather than a delay long enough to hope.
 	*/
-	pool.destroy(workers)
+	stop_test_loop(&workers)
 	joined = true
-	s.handler_pool = nil
+	s.loops = nil
 
 	testing.expect_value(t, drain_datagrams(hole), 1)
 	free_all(context.temp_allocator)
@@ -1022,21 +1024,22 @@ test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
 	cfg.cache.stale_timeout = 100 * time.Millisecond
 	cfg.upstream.servers = blackhole_servers(bound.port)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
 	defer upstream.destroy_group(group)
 	s.group = group
-	workers := pool.make_pool(2)
+	workers: Test_Loop
+	start_test_loop(&workers)
 	// Joined in the middle of the case rather than at the end of it, since the
 	// store this is about happens on the refresh's way out. The flag is what
 	// keeps an early return from leaking the pool all the same.
 	joined := false
 	defer if !joined {
-		pool.destroy(workers)
+		stop_test_loop(&workers)
 	}
-	s.handler_pool = workers
+	s.loops = workers.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -1068,9 +1071,9 @@ test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
 
 	// The refresh is joined rather than slept on: the store happens on its way
 	// out, so the pool going quiet is what says the entry is final.
-	pool.destroy(workers)
+	stop_test_loop(&workers)
 	joined = true
-	s.handler_pool = nil
+	s.loops = nil
 
 	kb: [cache.KEY_MAX]u8
 	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
@@ -1127,15 +1130,16 @@ test_a_refresh_that_beats_the_timer_answers_the_client :: proc(t: ^testing.T) {
 	cfg.cache.stale_timeout = 5 * time.Second
 	cfg.upstream.servers = blackhole_servers(bound.port)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
 	defer upstream.destroy_group(group)
 	s.group = group
-	workers := pool.make_pool(2)
-	defer pool.destroy(workers)
-	s.handler_pool = workers
+	workers: Test_Loop
+	start_test_loop(&workers)
+	defer stop_test_loop(&workers)
+	s.loops = workers.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -1218,19 +1222,20 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 	cfg.cache.stale_timeout = 0
 	cfg.upstream.servers = blackhole_servers(bound.port)
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
 	defer upstream.destroy_group(group)
 	s.group = group
 
-	workers := pool.make_pool(2)
+	workers: Test_Loop
+	start_test_loop(&workers)
 	joined := false
 	defer if !joined {
-		pool.destroy(workers)
+		stop_test_loop(&workers)
 	}
-	s.handler_pool = workers
+	s.loops = workers.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -1271,9 +1276,9 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 
 	// Nothing was ever submitted, so this joins an idle pool; the count behind
 	// it is the one attempt this thread made for itself.
-	pool.destroy(workers)
+	stop_test_loop(&workers)
 	joined = true
-	s.handler_pool = nil
+	s.loops = nil
 	testing.expect_value(t, drain_datagrams(hole), 1)
 	free_all(context.temp_allocator)
 }

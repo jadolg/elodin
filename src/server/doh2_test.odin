@@ -8,7 +8,7 @@ import "core:testing"
 import "core:time"
 import "elodin:config"
 import "elodin:h2"
-import "elodin:pool"
+import "elodin:loop"
 
 /*
 A scripted peer: hands `input` to the connection a read at a time and keeps
@@ -125,15 +125,18 @@ wrote_a_body :: proc(out: []u8) -> bool {
 
 @(private = "file")
 Gate :: struct {
-	open: bool,
+	open:   bool,
+	server: ^Server,
 }
 
+// Holds one of `max_pending` until opened, as a query waiting on an upstream would.
 @(private = "file")
 gate_job :: proc(data: rawptr) {
 	g := cast(^Gate)data
 	for !sync.atomic_load(&g.open) {
-		time.sleep(time.Millisecond)
+		_ = loop.sleep(time.Millisecond)
 	}
+	query_done(g.server)
 }
 
 @(private = "file")
@@ -141,7 +144,7 @@ Result :: struct {
 	// Everything the connection wrote. The caller owns it.
 	output:  [dynamic]u8,
 	dropped: u64,
-	// Requests that reached the pool, the job occupying it not counted.
+	// Requests in flight, the job occupying the bound not counted.
 	queued:  int,
 	// Whether the request counted as a question for `doh_question_overdue`.
 	asked:   bool,
@@ -165,9 +168,8 @@ H2_PEER := net.Endpoint {
 Serve one GET for `path` over a whole HTTP/2 connection and report what came of
 it.
 
-`occupy` fills the worker with a job that will not finish, which is what puts
-the backlog at the limit. The pool is one worker throughout, so `max_pending` of
-1 and an occupied worker is a full backlog.
+`occupy` holds one query in flight that will not finish until the gate opens,
+so `max_pending` of 1 is reached before the request arrives.
 
 `limiter` is nil unless the case is about the response budget, which is what every
 other transport's absent one means too.
@@ -179,17 +181,25 @@ serve_one :: proc(
 	await: string,
 	occupy: bool,
 	limiter: ^Rate_Limiter = nil,
+	// Stop the loop first, so every start is refused while the server still
+	// has loops: what a stack that cannot be mapped looks like.
+	refuse_starts := false,
 ) -> Result {
-	handler_pool := pool.make_pool(1)
+	handler_pool: Test_Loop
+	start_test_loop(&handler_pool)
+	if refuse_starts {
+		loop.stop(handler_pool.loops[0])
+	}
 	s := Server {
 		cfg          = cfg,
-		handler_pool = handler_pool,
+		loops        = handler_pool.loops[:],
 		limiter      = limiter,
 	}
 
 	gate := Gate{}
 	if occupy {
-		pool.submit(handler_pool, gate_job, &gate)
+		gate.server = &s
+		submit_query(&s, gate_job, &gate, 0)
 	}
 
 	input := one_get_request(path)
@@ -217,7 +227,7 @@ serve_one :: proc(
 
 	// Read before the gate opens: once the worker is free the pool drains, and
 	// a job that was queued would no longer be pending to find.
-	queued := pool.pending(handler_pool)
+	queued := queries_pending(&s)
 	if occupy {
 		queued -= 1
 	}
@@ -226,7 +236,7 @@ serve_one :: proc(
 	sync.atomic_store(&gate.open, true)
 	h2.conn_wait_idle(hc)
 	h2.conn_unref(hc)
-	pool.destroy(handler_pool)
+	stop_test_loop(&handler_pool)
 
 	return Result {
 		output = script.output,
@@ -236,6 +246,30 @@ serve_one :: proc(
 		pending = ctx.pending,
 		stamped_after_gate = time.tick_diff(opened, ctx.last_question) > 0,
 	}
+}
+
+/*
+A request whose fiber cannot be started on a running server is shed as at
+`max_pending`, not answered on the reader: answering there stops the connection
+reading for an upstream round trip, and a body past the client's window would
+park on a WINDOW_UPDATE only that reader could read.
+*/
+@(test)
+test_doh2_sheds_a_request_it_cannot_start :: proc(t: ^testing.T) {
+	context.allocator = runtime.heap_allocator()
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	cfg.server.max_pending = 8
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+
+	got := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = false, refuse_starts = true)
+	defer delete(got.output)
+
+	testing.expect(t, strings.contains(string(got.output[:]), "503"), "the request was not shed")
+	testing.expect(t, !wrote_a_body(got.output[:]), "the shed answer carried a body")
+	testing.expect_value(t, got.dropped, u64(1))
 }
 
 /*

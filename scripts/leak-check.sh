@@ -31,12 +31,17 @@ rm -rf "$REPORTS"
 mkdir -p "$REPORTS" bin
 
 echo "==> building $BIN with -sanitize:address"
+# Every allocation a fiber's scratch makes is a heap allocation of its own
+# (ELODIN_SCRATCH_DEBUG): an arena reset and refilled hands out the same
+# addresses again, so a pointer kept past the reset would read plausible data
+# and nothing here would see it. Freed one by one, each is poisoned.
 # shellcheck disable=SC2086
 odin build src/main \
 	-out:"$BIN" \
 	-collection:elodin=src \
 	-debug \
 	-sanitize:address \
+	-define:ELODIN_SCRATCH_DEBUG=true \
 	-extra-linker-flags:"$ELODIN_LDFLAGS" \
 	$ELODIN_DEFINES
 

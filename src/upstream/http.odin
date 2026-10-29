@@ -7,6 +7,7 @@ import "core:time"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
+import "elodin:loop"
 import "elodin:tlsx"
 
 /*
@@ -36,7 +37,7 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 		}
 		return got, .None
 	}
-	got, nerr := net.recv_tcp(s.socket, buf)
+	got, nerr := loop.recv_tcp(s.socket, buf)
 	if nerr != nil {
 		// SO_RCVTIMEO expiring is EAGAIN, which core:net calls .Would_Block.
 		if nerr == .Timeout || nerr == .Would_Block {
@@ -70,7 +71,7 @@ stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}, idle := tim
 	}
 	sent := 0
 	for sent < len(buf) {
-		n, err := net.send_tcp(s.socket, buf[sent:])
+		n, err := loop.send_tcp(s.socket, buf[sent:])
 		if err == .Timeout || err == .Would_Block {
 			return .Timeout
 		}

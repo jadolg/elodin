@@ -180,7 +180,7 @@ opt_fixture_start :: proc(t: ^testing.T, f: ^Opt_Fixture) -> bool {
 
 	// No cookie of this server's own towards the upstream: the only cookie
 	// these cases are about is the client's.
-	group, gerr := upstream.make_group(f.cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(f.cfg.upstream, context.allocator, false)
 	if gerr != .None {
 		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
 		return false

@@ -218,7 +218,7 @@ harness_start :: proc(t: ^testing.T, h: ^Harness, validating := false) -> bool {
 
 	// Cookies towards the upstream are a separate mechanism and would add an
 	// option to the outgoing query; they have nothing to do with the ID.
-	group, gerr := upstream.make_group(h.cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(h.cfg.upstream, context.allocator, false)
 	if gerr != .None {
 		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
 		return false

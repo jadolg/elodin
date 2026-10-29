@@ -6,6 +6,7 @@ import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:loop"
 import "elodin:netx"
 
 /*
@@ -206,9 +207,13 @@ bootstrap_query :: proc(
 		return nil, false
 	}
 	defer net.close(socket)
+	// Non-blocking, so a wait for the answer parks a fiber rather than a loop.
+	if net.set_blocking(socket, false) != nil {
+		return nil, false
+	}
 	set_socket_timeouts(socket, timeout)
 
-	if _, send_err := net.send_udp(socket, wire, endpoint); send_err != nil {
+	if _, send_err := loop.send_udp(socket, wire, endpoint); send_err != nil {
 		return nil, false
 	}
 
@@ -225,8 +230,10 @@ bootstrap_query :: proc(
 	buf := make([]u8, 4096, context.temp_allocator)
 	deadline := time.tick_add(time.tick_now(), timeout)
 
+	// As in `exchange_udp`: datagrams passed over back to back never park, and
+	// `loop.recv_udp` yields between them.
 	for arm_receive(socket, deadline) {
-		n, remote, recv_err := net.recv_udp(socket, buf)
+		n, remote, recv_err := loop.recv_udp(socket, buf)
 		if recv_err != nil {
 			return nil, false
 		}

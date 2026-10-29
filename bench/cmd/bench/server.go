@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -18,13 +19,23 @@ import (
 // here is left at the shipped default, so the numbers describe the defaults.
 type serverOpts struct {
 	name string
+	// kind is the server under test: "elodin" (the default, -binary) or
+	// "unbound". Both are given the same listeners, certificate, upstream and
+	// limits, so a row differs between them in the server and nothing else.
+	kind string
 
-	workers         int
-	upstreamWorkers int
-	// runningWorkers is written as given, so 0 is the derived limit.
-	runningWorkers int
-	maxConnections int
+	// loops is `listeners.udp.readers`, which is also the number of event loops;
+	// Unbound gets it as `num-threads`. 0 lets elodin derive it (one per usable
+	// CPU, to eight), and Unbound is given that same figure.
+	loops int
+	// maxPending is `server.max_pending`, written as given, so 0 is the figure
+	// derived from memory.
 	maxPending     int
+	maxConnections int
+	// clientTimeout is how long an idle client connection is held. The rows
+	// that hold thousands of idle connections raise it, so the first connection
+	// opened is still there when the last one has been answered.
+	clientTimeout time.Duration
 	// cpus pins the server to these CPUs with taskset, in its -c syntax, so a
 	// run can describe a small machine on a large one.
 	cpus string
@@ -47,8 +58,8 @@ type serverOpts struct {
 	// an unsigned zone with no chain to the root, so every answer would be
 	// SERVFAIL and the tables would describe a failing resolver.
 	dnssec bool
-	// upstreamAddr replaces the mock with a real resolver, which validation
-	// needs since it has to fetch DS and DNSKEY records for itself.
+	// upstreamAddr replaces the harness's mock, with a real resolver for the
+	// survey or with a mock at another delay for the rows that vary it.
 	upstreamAddr string
 	// attempts per query. The benchmarks want 1 so a failure shows up as one
 	// rather than being retried into a slower success; the survey wants the
@@ -62,19 +73,21 @@ type server struct {
 	dnsAddr string
 	dotAddr string
 	dohAddr string
+	// caPath is the certificate the server presents, which the generator trusts.
+	caPath  string
 	logPath string
 	pid     int
 }
 
 func (h *harness) start(o serverOpts) (*server, error) {
-	if o.workers == 0 {
-		o.workers = 128
-	}
-	if o.upstreamWorkers == 0 {
-		o.upstreamWorkers = 64
+	if o.kind == "" {
+		o.kind = "elodin"
 	}
 	if o.maxConnections == 0 {
 		o.maxConnections = 512
+	}
+	if o.clientTimeout == 0 {
+		o.clientTimeout = 10 * time.Second
 	}
 	if o.cacheEntries == 0 {
 		o.cacheEntries = 10000
@@ -117,7 +130,65 @@ func (h *harness) start(o serverOpts) (*server, error) {
 		upstream = fmt.Sprintf("127.0.0.1:%d", p)
 	}
 	host, portStr, _ := net.SplitHostPort(upstream)
+	p := ports{dns: dnsPort, dot: dotPort, doh: dohPort, upHost: host, upPort: portStr}
 
+	s := &server{
+		dnsAddr: fmt.Sprintf("127.0.0.1:%d", dnsPort),
+		dotAddr: fmt.Sprintf("127.0.0.1:%d", dotPort),
+		dohAddr: fmt.Sprintf("127.0.0.1:%d", dohPort),
+		caPath:  filepath.Join(h.dir, o.certKind+"-cert.pem"),
+		logPath: filepath.Join(h.dir, o.name+"-"+o.kind+".log"),
+	}
+	var argv []string
+	switch o.kind {
+	case "elodin":
+		argv, err = h.elodinConfig(o, p, s.logPath)
+	case "unbound":
+		argv, err = h.unboundConfig(o, p, s.logPath)
+	default:
+		err = fmt.Errorf("unknown server kind %q", o.kind)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if o.cpus != "" {
+		// taskset execs the server in its own place, so the pid sampled below
+		// is still the server's.
+		argv = append([]string{"taskset", "-c", o.cpus}, argv...)
+	}
+	s.cmd = exec.Command(argv[0], argv[1:]...)
+	// What a server says before its own log is open - a config it refuses, a
+	// file it may not read - goes here, and into the error if it never answers.
+	stderr, err := os.Create(filepath.Join(h.dir, o.name+"-"+o.kind+".stderr"))
+	if err != nil {
+		return nil, err
+	}
+	defer stderr.Close()
+	s.cmd.Stdout = nil
+	s.cmd.Stderr = stderr
+	if err := s.cmd.Start(); err != nil {
+		return nil, err
+	}
+	s.pid = s.cmd.Process.Pid
+
+	if err := waitReady(s.dnsAddr, 15*time.Second); err != nil {
+		s.stop()
+		said, _ := os.ReadFile(stderr.Name())
+		return nil, fmt.Errorf("%s (%s) did not come up: %w\n%s", o.name, o.kind, err, strings.TrimSpace(string(said)))
+	}
+	return s, nil
+}
+
+// ports is where a server listens and where its upstream is.
+type ports struct {
+	dns, dot, doh  int
+	upHost, upPort string
+}
+
+// elodinConfig writes elodin's configuration and returns the command that
+// runs it. The template names only keys the thread-model releases also
+// accept, so -binary can point at one of them and run the same matrix.
+func (h *harness) elodinConfig(o serverOpts, p ports, logPath string) ([]string, error) {
 	blockPath := filepath.Join(h.dir, o.name+"-block.txt")
 	if o.blockRules > 0 {
 		var sb strings.Builder
@@ -130,82 +201,14 @@ func (h *harness) start(o serverOpts) (*server, error) {
 		}
 	}
 
-	cfg := fmt.Sprintf(`log:
-  level: %s
-  queries: %t
-  file: %s
-
-server:
-  workers: %d
-  upstream_workers: %d
-  running_workers: %d
-  max_connections: %d
-  # The whole table to one prefix, for the same reason the limiter is off below:
-  # every client here is 127.0.0.1, so all of them are one client to a per-prefix
-  # share, and the shipped default of half the table would refuse the second half
-  # of the 500-connection TCP row rather than measure it. A real deployment keeps
-  # the share; see bench/results/2026-09-03-connection-table-share.md.
-  max_connections_per_prefix: %d
-  max_pending: %d
-  client_timeout: 10s
-  # The load generator is one address sending as fast as it can, which is
-  # exactly the shape response rate limiting exists to stop. Measuring the
-  # server's ceiling means taking that limit off; a real deployment keeps it.
-  rate_limit:
-    enabled: false
-
-listeners:
-  udp:
-    enabled: true
-    address: "127.0.0.1"
-    port: %d
-  tcp:
-    enabled: true
-    address: "127.0.0.1"
-    port: %d
-  dot:
-    enabled: true
-    address: "127.0.0.1"
-    port: %d
-    cert_file: %s
-    key_file: %s
-  doh:
-    enabled: true
-    address: "127.0.0.1"
-    port: %d
-    path: /dns-query
-    cert_file: %s
-    key_file: %s
-
-upstream:
-  strategy: failover
-  timeout: 5s
-  attempts: %d
-  bootstrap: [127.0.0.1]
-  servers:
-    - name: mock
-      type: udp
-      address: %s
-      port: %s
-
-cache:
-  enabled: %t
-  max_entries: %d
-
-dnssec:
-  enabled: %t
-
-rewrites:
-  - domain: rewritten.bench.test
-    answer: 192.0.2.10
-`,
-		o.logLevel, o.logQueries, filepath.Join(h.dir, o.name+".log"),
-		o.workers, o.upstreamWorkers, o.runningWorkers, o.maxConnections, o.maxConnections, o.maxPending,
-		dnsPort, dnsPort, dotPort,
+	cfg := fmt.Sprintf(elodinTemplate,
+		o.logLevel, o.logQueries, logPath,
+		o.maxConnections, o.maxConnections, o.maxPending, o.clientTimeout,
+		p.dns, o.loops, p.dns, p.dot,
 		filepath.Join(h.dir, o.certKind+"-cert.pem"), filepath.Join(h.dir, o.certKind+"-key.pem"),
-		dohPort,
+		p.doh,
 		filepath.Join(h.dir, o.certKind+"-cert.pem"), filepath.Join(h.dir, o.certKind+"-key.pem"),
-		o.attempts, host, portStr,
+		o.attempts, p.upHost, p.upPort,
 		o.cache, o.cacheEntries, o.dnssec)
 
 	if o.blockRules > 0 {
@@ -228,31 +231,63 @@ blocking:
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		return nil, err
 	}
+	return []string{h.binary, "--config", cfgPath, "--no-fetch"}, nil
+}
 
-	s := &server{
-		dnsAddr: fmt.Sprintf("127.0.0.1:%d", dnsPort),
-		dotAddr: fmt.Sprintf("127.0.0.1:%d", dotPort),
-		dohAddr: fmt.Sprintf("127.0.0.1:%d", dohPort),
-		logPath: filepath.Join(h.dir, o.name+".log"),
+// unboundThreads is what elodin derives its loop count as when it is left
+// unset, so the two servers get the same number of threads unless a row says
+// otherwise.
+func unboundThreads(loops int) int {
+	if loops > 0 {
+		return loops
 	}
-	s.cmd = exec.Command(h.binary, "--config", cfgPath, "--no-fetch")
-	if o.cpus != "" {
-		// taskset execs the server in its own place, so the pid sampled below
-		// is still elodin's.
-		s.cmd = exec.Command("taskset", "-c", o.cpus, h.binary, "--config", cfgPath, "--no-fetch")
+	return min(runtime.NumCPU(), 8)
+}
+
+// unboundConfig writes an unbound.conf equivalent to elodin's configuration as
+// far as the two overlap, and returns the command that runs it in the
+// foreground.
+func (h *harness) unboundConfig(o serverOpts, p ports, logPath string) ([]string, error) {
+	if o.blockRules > 0 || o.dnssec || o.noUpstream {
+		// Each of these would need Unbound configured in a way the rows that
+		// use them do not compare, so a row asking for one is a mistake.
+		return nil, fmt.Errorf("%s: blocklists, validation and a dead upstream are elodin-only rows", o.name)
 	}
-	s.cmd.Stdout = nil
-	s.cmd.Stderr = nil
-	if err := s.cmd.Start(); err != nil {
+	threads := unboundThreads(o.loops)
+	// Unbound allocates its TCP handlers per thread, a message buffer each, and
+	// starts closing idle connections early once fewer than half of a thread's
+	// handlers are free. SO_REUSEPORT spreads connections across the threads
+	// unevenly, so each thread gets three times its even share: enough that no
+	// thread passes half, and the held-connection rows measure holding rather
+	// than Unbound's busy-time idle cut.
+	perThreadTCP := 3*((o.maxConnections+threads-1)/threads) + 64
+	// num-queries-per-thread is Unbound's bound on queries in flight, the
+	// counterpart of max_pending. It is per thread and Unbound's own default is
+	// 1024 or 512, so it is raised past anything a row puts in flight.
+	inflight := max(4096, o.maxPending)
+	maxTTL := ""
+	if !o.cache {
+		// Unbound has no switch for the cache; a zero ceiling on what it keeps
+		// is the nearest thing.
+		maxTTL = "  cache-max-ttl: 0\n"
+	}
+	logQueries := "no"
+	if o.logQueries {
+		logQueries = "yes"
+	}
+	cert := filepath.Join(h.dir, o.certKind+"-cert.pem")
+	key := filepath.Join(h.dir, o.certKind+"-key.pem")
+
+	cfg := fmt.Sprintf(unboundTemplate,
+		threads, p.dns, p.dot, p.doh, p.dns, p.dot, p.doh, key, cert,
+		maxTTL, inflight, 2*inflight, perThreadTCP, o.clientTimeout.Milliseconds(),
+		h.dir, logPath, logQueries, p.upHost, p.upPort)
+
+	cfgPath := filepath.Join(h.dir, o.name+"-unbound.conf")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		return nil, err
 	}
-	s.pid = s.cmd.Process.Pid
-
-	if err := waitReady(s.dnsAddr, 10*time.Second); err != nil {
-		s.stop()
-		return nil, fmt.Errorf("%s did not come up: %w", o.name, err)
-	}
-	return s, nil
+	return []string{h.unbound, "-d", "-c", cfgPath}, nil
 }
 
 // waitReady polls until a query is answered, so a run never starts against a
@@ -268,7 +303,10 @@ func waitReady(addr string, within time.Duration) error {
 			continue
 		}
 		q := dnswire.Query(1, "ready.bench.test", dnswire.TypeA, 0)
-		_ = conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		// Long enough for the slowest mock a row starts (three seconds): a
+		// server that coalesces answers a later probe from the first one's
+		// question, but one that does not answers only the probe that asked.
+		_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
 		if _, err := conn.Write(q); err != nil {
 			last = err
 			conn.Close()
@@ -329,3 +367,135 @@ func (s *server) rss() int64 {
 	}
 	return v
 }
+
+// elodinTemplate is the configuration elodinConfig fills in, kept out of the
+// function so the function reads as what varies.
+const elodinTemplate = `log:
+  level: %s
+  queries: %t
+  file: %s
+
+server:
+  max_connections: %d
+  # The whole table to one prefix, for the same reason the limiter is off below:
+  # every client here is 127.0.0.1, so all of them are one client to a per-prefix
+  # share, and the shipped default of half the table would refuse the second half
+  # of the 500-connection TCP row rather than measure it. A real deployment keeps
+  # the share; see bench/results/2026-09-03-connection-table-share.md.
+  max_connections_per_prefix: %d
+  max_pending: %d
+  client_timeout: %s
+  # The load generator is one address sending as fast as it can, which is
+  # exactly the shape response rate limiting exists to stop. Measuring the
+  # server's ceiling means taking that limit off; a real deployment keeps it.
+  rate_limit:
+    enabled: false
+
+listeners:
+  udp:
+    enabled: true
+    address: "127.0.0.1"
+    port: %d
+    readers: %d
+  tcp:
+    enabled: true
+    address: "127.0.0.1"
+    port: %d
+  dot:
+    enabled: true
+    address: "127.0.0.1"
+    port: %d
+    cert_file: %s
+    key_file: %s
+  doh:
+    enabled: true
+    address: "127.0.0.1"
+    port: %d
+    path: /dns-query
+    cert_file: %s
+    key_file: %s
+
+upstream:
+  strategy: failover
+  timeout: 5s
+  attempts: %d
+  bootstrap: [127.0.0.1]
+  servers:
+    - name: mock
+      type: udp
+      address: %s
+      port: %s
+
+cache:
+  enabled: %t
+  max_entries: %d
+
+dnssec:
+  enabled: %t
+
+rewrites:
+  - domain: rewritten.bench.test
+    answer: 192.0.2.10
+`
+
+// unboundTemplate is the unbound.conf unboundConfig fills in; see there.
+const unboundTemplate = `server:
+  verbosity: 0
+  num-threads: %d
+  so-reuseport: yes
+  interface: 127.0.0.1@%d
+  interface: 127.0.0.1@%d
+  interface: 127.0.0.1@%d
+  port: %d
+  tls-port: %d
+  https-port: %d
+  http-endpoint: "/dns-query"
+  tls-service-key: %s
+  tls-service-pem: %s
+  do-ip6: no
+  access-control: 127.0.0.0/8 allow
+  # The mock is on loopback, which Unbound refuses to forward to by default.
+  do-not-query-localhost: no
+  # Unbound answers test. itself (RFC 6761 section 6.2), NXDOMAIN for every
+  # name; the mock's zone is under it, so it has to be forwarded instead.
+  local-zone: "test." nodefault
+  # DNSSEC off, as for elodin: the mock's zone has no chain to the root.
+  module-config: "iterator"
+  qname-minimisation: no
+  # No rate limiting, for the reason elodin's is off: every client is one
+  # address asking as fast as it can.
+  ratelimit: 0
+  ip-ratelimit: 0
+  # Room for elodin's 10,000 cached answers several times over, so the cache
+  # is never what separates the two.
+  msg-cache-size: 32m
+  rrset-cache-size: 64m
+%s  num-queries-per-thread: %d
+  outgoing-range: %d
+  outgoing-num-tcp: 64
+  incoming-num-tcp: %d
+  tcp-idle-timeout: %d
+  # Unbound times out an upstream it has no round-trip figure for after 376 ms
+  # and retransmits, which against the long-delay mock would turn one query
+  # into four. elodin waits upstream.timeout (5s) for one attempt; so does this.
+  unknown-server-time-limit: 5000
+  # Unbound drops the reply to a client that has waited past this (1,900 ms by
+  # default) on the view that it has retried by now; the generator does not
+  # retry, and the in-flight rows hold queries for three seconds.
+  discard-timeout: 0
+  infra-cache-min-rtt: 5000
+  username: ""
+  chroot: ""
+  directory: %s
+  pidfile: ""
+  use-syslog: no
+  logfile: %s
+  log-queries: %s
+
+remote-control:
+  control-enable: no
+
+forward-zone:
+  name: "."
+  forward-addr: %s@%s
+`

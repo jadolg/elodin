@@ -12,7 +12,7 @@ import "elodin:dnssec"
 import "elodin:filter"
 import "elodin:logx"
 import "elodin:netx"
-import "elodin:pool"
+import "elodin:loop"
 import "elodin:upstream"
 
 Protocol :: enum u8 {
@@ -220,8 +220,19 @@ Server :: struct {
 	identity instead. See `profile.odin`.
 	*/
 	profiles:     ^Profile_Signer,
-	handler_pool: ^pool.Pool,
-	race_pool:    ^pool.Pool,
+	/*
+	The event loops the server runs on, one thread each. Set once before the
+	listeners start and never changed; a `Server` built as a literal - the tests -
+	has none, or the one its test started. See `queries.odin`.
+	*/
+	loops:        []^loop.Loop,
+	// Queries in flight on fibers of their own, against `max_pending`. See
+	// `submit_query`.
+	pending:      int,
+	// Where the next accepted connection goes; see `next_loop`.
+	next_loop:    uint,
+	// Race legs in flight in every group, against `max_pending`; see `build_upstreams`.
+	racers:       upstream.Racer_Budget,
 	/*
 	The expired entries being refreshed right now, one slot per cache key.
 
@@ -260,19 +271,17 @@ handle_query :: proc(
 	client: string,
 	allocator := context.allocator,
 	/*
-	Whether this call is running on a worker of the shared pool.
+	Which queries this one is among: `.Shared` for those counted against
+	`server.max_pending` - UDP and HTTP/2, which `submit_query` starts on fibers
+	of their own - and `.Connection` for TCP, DoT and HTTP/1.1, which answer on
+	the connection's fiber and are bounded by `max_connections` instead. Read by
+	the DNSSEC chain-walk bound and the follower ceiling, each of which keeps a
+	reserve per population; see `dnssec.Walk_Pool`.
 
-	True for UDP and for HTTP/2, which hand their work to `handler_pool`; false
-	for TCP, DoT and HTTP/1.1, which answer on the connection's own thread and
-	are bounded by `max_connections` instead. The only thing that reads it is
-	the DNSSEC chain-walk bound, which exists to keep pool workers free and has
-	no business turning away a query that holds a thread nobody is waiting for.
-	See `dnssec.Validator.walks`.
-
-	Defaulted to the pooled reading so that a caller which has not thought about
-	it gets the guard; the four that have say so.
+	Defaulted to the counted reading so that a caller which has not thought
+	about it gets the tighter guard; the two that answer on a connection say so.
 	*/
-	shared_worker := true,
+	pool := dnssec.Walk_Pool.Shared,
 	/*
 	Where a DoH caller wants the `Cache-Control: max-age` for the answer: see
 	`doh_max_age`. Worked out here, off the bytes about to leave, because this
@@ -307,8 +316,12 @@ handle_query :: proc(
 	length of the message it reads, and a request holds about thirty-five, so
 	without this the bound is the reading's and the arena's is thirty-five times
 	larger. See `dns.REQUEST_DECODE_BUDGET` and issue #354.
+
+	A request that read past the ordinary allowance holds one of the process's
+	heavy slots until it is answered; see `dns.REQUEST_ORDINARY_DECODE`.
 	*/
 	spent: int
+	defer dns.request_release(&spent)
 
 	msg, derr := dns.decode_message(query, allocator, &spent)
 	limit := response_limit(s, msg, proto)
@@ -419,8 +432,8 @@ handle_query :: proc(
 			started,
 			&spent,
 			allocator,
-			shared_worker,
 			ede = &ede,
+			pool = pool,
 		)
 	}
 	if ok {
@@ -1095,16 +1108,13 @@ resolve_query :: proc(
 	// `handle_query`, which owns that arena. See `dns.REQUEST_DECODE_BUDGET`.
 	spent: ^int,
 	allocator: mem.Allocator,
-	// See `handle_query`: whether a worker of the shared pool is what this is
-	// holding.
-	shared_worker: bool,
 	/*
 	Non-nil when this call *is* a detached refresh of an expired entry, rather
 	than a client's own query.
 
 	Two things turn on it, and both are about who owns the expired bytes. A
 	refresh does not start another one, which is what keeps `serve_stale` from
-	recursing a worker at a time; and where the upstream produces nothing, it
+	recursing a query at a time; and where the upstream produces nothing, it
 	reports that here instead of reaching for the entry and counting a client
 	answer against it - the request that started the refresh is holding those
 	bytes and serves them itself. See `refresh.odin`.
@@ -1117,6 +1127,8 @@ resolve_query :: proc(
 	it; see `ceiling_ede`.
 	*/
 	ede: ^u16 = nil,
+	// See `handle_query`. A refresh is counted in `max_pending`, which is the default.
+	pool := dnssec.Walk_Pool.Shared,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -1188,7 +1200,7 @@ resolve_query :: proc(
 				started,
 				spent,
 				allocator,
-				shared_worker,
+				pool,
 			)
 		}
 		if !counted {
@@ -1505,7 +1517,7 @@ resolve_query :: proc(
 	upstream that is unreachable rather than answering (issue #164).
 
 	RFC 8767 section 5 asks for the other shape, and this is it: the refresh
-	runs on a worker of its own and the client waits for it with a deadline,
+	runs on a fiber of its own and the client waits for it with a deadline,
 	`cache.stale_timeout`, after which the held bytes go out and the refresh
 	carries on into the cache without it. `refresh.odin` is where the mechanism
 	is set out, including why a query that finds a refresh already running for
@@ -1526,7 +1538,7 @@ resolve_query :: proc(
 
 	Those three are the only ways out of this block. Every other reason
 	`start_refresh` declines - a refresh for this key already running, the
-	ceiling reached, the pool's backlog full or the pool shutting down - serves
+	ceiling reached, `max_pending` reached or the server shutting down - serves
 	the expired bytes here and now. Each of them says the same thing, which is
 	that this query is not the one to spend an upstream round trip on, and none
 	of them leaves the entry unrefreshed for longer than the refresh that is
@@ -1535,7 +1547,7 @@ resolve_query :: proc(
 	if unanswered == nil &&
 	   stale_hit.wire != nil &&
 	   live(s).cfg.cache.stale_timeout > 0 &&
-	   s.handler_pool != nil {
+	   can_detach(s) {
 		if r := start_refresh(s, key, query, proto, client, limit, started); r != nil {
 			defer refresh_release(r)
 			if out, refreshed, code, taken := refresh_take(r, live(s).cfg.cache.stale_timeout, allocator);
@@ -1909,7 +1921,7 @@ resolve_query :: proc(
 	flight: ^Flight
 	if unanswered == nil {
 		ceiling := follower_ceiling(s)
-		joined, counted := flight_join(s, key, &own_flight, shared_worker, ceiling)
+		joined, counted := flight_join(s, key, &own_flight, pool == .Shared, ceiling)
 		if joined == &own_flight {
 			flight = joined
 			flight.forwarded = forwarded
@@ -2538,7 +2550,7 @@ resolve_query :: proc(
 			resp,
 			time.now(),
 			allocator,
-			shared_worker = shared_worker,
+			pool = pool,
 			spent = spent,
 			deadline = &deadline,
 		)
@@ -4382,7 +4394,7 @@ chase_rewrite_alias :: proc(
 	started: time.Time,
 	spent: ^int,
 	allocator: mem.Allocator,
-	shared_worker: bool,
+	pool: dnssec.Walk_Pool,
 ) -> (
 	response: []u8,
 	// Whether the target's lookup counted this query under its own outcome, as
@@ -4435,8 +4447,8 @@ chase_rewrite_alias :: proc(
 				started,
 				spent,
 				allocator,
-				shared_worker,
 				ede = &code,
+				pool = pool,
 			)
 			// A refusal counts nowhere in that family, the RD gate's included,
 			// and nor does a special-use name, so the chain either leaves as the

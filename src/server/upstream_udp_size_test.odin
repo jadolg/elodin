@@ -165,7 +165,7 @@ forwarding_server :: proc(
 	cfg.upstream.timeout = 3 * time.Second
 	cfg.upstream.servers = specs
 
-	group, gerr := upstream.make_group(cfg.upstream, nil, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		net.close(socket)
 		return {}, nil, nil, false

@@ -27,8 +27,6 @@ listeners:
   udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
   tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
 server:
-  workers: 8
-  upstream_workers: 4
   %s
 upstream:
   timeout: 3s

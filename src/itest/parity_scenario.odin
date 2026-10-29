@@ -347,8 +347,6 @@ PARITY_CONFIG_HEAD :: `log:
   level: warn
 
 server:
-  workers: 8
-  upstream_workers: 4
   client_timeout: 10s
   # Pinned rather than left at the shipped default, because the comparison has
   # to know it: an answer larger than this is cut down and marked whatever the

@@ -3,10 +3,10 @@ package upstream
 import "core:net"
 import "core:sync"
 import "core:testing"
-import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:h2"
+import "elodin:loop"
 
 /*
 `close_idle` retires the shared HTTP/2 connection the way it does every other
@@ -23,7 +23,6 @@ H2_Idle_Fixture :: struct {
 	u:        ^Upstream,
 	hc:       ^H2_Conn,
 	socket:   net.TCP_Socket,
-	reader:   ^thread.Thread,
 }
 
 @(private = "file")
@@ -55,12 +54,9 @@ h2_idle_setup :: proc(t: ^testing.T, f: ^H2_Idle_Fixture) -> bool {
 	u.proto = .H2
 	f.hc = start_h2_conn(u, Stream{socket = socket})
 	u.h2 = f.hc
-	started := len(u.h2_readers) > 0
-	if started {
-		f.reader = u.h2_readers[len(u.h2_readers) - 1]
-	}
+	started := u.h2_readers > 0
 	sync.mutex_unlock(&u.mu)
-	if !testing.expect(t, started, "no thread for the connection's reader") {
+	if !testing.expect(t, started, "no reader for the connection") {
 		h2_idle_teardown(f)
 		return false
 	}
@@ -76,9 +72,9 @@ h2_idle_teardown :: proc(f: ^H2_Idle_Fixture) {
 // Moves the last use back, as if the connection had sat unused that long.
 @(private = "file")
 h2_idle_age :: proc(hc: ^H2_Conn, by: time.Duration) {
-	sync.mutex_lock(&hc.client.mu)
+	loop.lock(&hc.client.mu)
 	hc.client.released = time.tick_add(hc.client.released, -by)
-	sync.mutex_unlock(&hc.client.mu)
+	loop.unlock(&hc.client.mu)
 }
 
 @(private = "file")
@@ -89,12 +85,12 @@ h2_idle_kept :: proc(f: ^H2_Idle_Fixture) -> bool {
 }
 
 @(private = "file")
-h2_idle_reader_left :: proc(t: ^testing.T, reader: ^thread.Thread) -> bool {
+h2_idle_reader_left :: proc(t: ^testing.T, u: ^Upstream) -> bool {
 	start := time.tick_now()
-	for !thread.is_done(reader) && time.tick_since(start) < 3 * time.Second {
+	for h2_readers_running(u) > 0 && time.tick_since(start) < 3 * time.Second {
 		time.sleep(time.Millisecond)
 	}
-	return testing.expect(t, thread.is_done(reader), "the connection's reader is still polling")
+	return testing.expect(t, h2_readers_running(u) == 0, "the connection's reader is still polling")
 }
 
 @(test)
@@ -107,7 +103,7 @@ test_close_idle_retires_an_h2_conn_the_peer_closed :: proc(t: ^testing.T) {
 
 	// The reader's way out when the peer hangs up.
 	_ = net.shutdown(f.socket, .Receive)
-	if !h2_idle_reader_left(t, f.reader) {
+	if !h2_idle_reader_left(t, f.u) {
 		return
 	}
 	testing.expect(t, h2.client_closed(f.hc.client), "the premise: the client is closed")
@@ -117,7 +113,7 @@ test_close_idle_retires_an_h2_conn_the_peer_closed :: proc(t: ^testing.T) {
 	testing.expect_value(t, closed, 1)
 	sync.mutex_lock(&f.u.mu)
 	testing.expect(t, f.u.h2 == nil, "a closed h2 connection survived the sweep")
-	testing.expect_value(t, len(f.u.h2_readers), 0)
+	testing.expect_value(t, f.u.h2_readers, 0)
 	sync.mutex_unlock(&f.u.mu)
 }
 
@@ -137,11 +133,9 @@ test_close_idle_retires_an_h2_conn_idle_past_the_timeout :: proc(t: ^testing.T) 
 	h2_idle_age(f.hc, 5 * time.Second)
 	testing.expect_value(t, close_idle(f.u), 1)
 	testing.expect(t, !h2_idle_kept(&f), "an h2 connection idle past the timeout survived the sweep")
-	h2_idle_reader_left(t, f.reader)
-	// Reaped by the sweep after it, not only at the next dial.
-	_ = close_idle(f.u)
+	h2_idle_reader_left(t, f.u)
 	sync.mutex_lock(&f.u.mu)
-	testing.expect_value(t, len(f.u.h2_readers), 0)
+	testing.expect_value(t, f.u.h2_readers, 0)
 	sync.mutex_unlock(&f.u.mu)
 
 	// The connection a healthy peer saw ends in GOAWAY(NO_ERROR), RFC 9113
@@ -190,7 +184,7 @@ test_close_idle_leaves_an_h2_conn_in_use :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, close_idle(f.u, all = true), 1)
 	testing.expect(t, !h2_idle_kept(&f), "`all` left an idle h2 connection")
-	h2_idle_reader_left(t, f.reader)
+	h2_idle_reader_left(t, f.u)
 }
 
 // The pooled HTTP/1.1 half of the same sweep: the expired connection goes, the

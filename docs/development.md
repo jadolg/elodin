@@ -39,7 +39,7 @@ mise run clean            # remove bin/
 src/main/      entry point: arguments, startup order, signals, maintenance loop
 src/dns/       message codec: names, compression, records, EDNS, TTL patching
 src/yaml/      YAML subset parser and typed accessors
-src/config/    configuration schema, loading, validation and worker sizing
+src/config/    configuration schema, loading, validation and sizing
 src/filter/    sink-list matching and list-format parsers
 src/cache/     LRU answer cache
 src/dnssec/    validation: canonical form, signatures, NSEC/NSEC3, chain of trust
@@ -47,7 +47,7 @@ src/upstream/  transports (UDP/TCP/DoT/DoH), pooling, strategies, cookies, HTTP/
 src/server/    resolver, listeners, DoH endpoint, cookies, local zones, list refresh
 src/h2/        HTTP/2 framing, HPACK, and the server connection state machine
 src/tlsx/      OpenSSL bindings and a small TLS wrapper
-src/pool/      worker pool
+src/loop/      event loops: fibers, epoll, timers, waits that park, socket calls
 src/logx/      logging, in logfmt
 src/netx/      core:net's address parsers, held to what an address and a port are; `check`
                refuses core:net's own outside the tests, itest and fuzz
@@ -69,16 +69,28 @@ examples/      the annotated reference configuration, one per deployment (local-
 packaging/     systemd unit and the .deb build script
 ```
 
-There are two worker pools: one answers queries, one races upstreams. A race job
-is submitted and waited on by a query handler, so a single pool could deadlock
-with every worker waiting on jobs no worker is free to run.
+Everything that waits on the network runs on the event loops in `src/loop`: one
+thread each, and on them fibers - a query, a connection, a racer, an upstream
+reader - that park where they wait and are resumed by epoll or a timer. Code on
+a loop waits only through `loop`'s calls (`wait_fd`, `sleep`, `Mutex`, `Cond`,
+`Sema`, and the socket wrappers): a `core:sync` wait or a blocking socket there
+puts every fiber on the loop to sleep, and a `sync.Mutex` held across a park is a
+deadlock as soon as another fiber on the same loop asks for it. Off a loop - the
+tests, the blocklist rebuild - the same calls block the thread as before.
+
+A fiber's `context.temp_allocator` is a scratch arena of its own, freed when its
+job returns; a few thread-locals (the pinned generation, the prefetch flag, the
+handshake errno) are saved and restored with it (`loop.register_local`).
 
 ## Testing
 
 `mise run verify` runs the type check, unit and integration tests. Leak checking
 and fuzz regression run in CI; `mise run bench` measures rather than asserts.
 
-**Unit tests** (`mise run test`) run per package, so a failure names one. They
+**Unit tests** (`mise run test`) run per package, so a failure names one. One
+test on its own is `odin test src/<pkg> -collection:elodin=src
+-define:ODIN_TEST_NAMES=<pkg>.<test>`, after `mise run prepare` has assembled
+the fiber switch into `bin/elodin_switch.o`, which every build links. They
 cover:
 
 - the message codec: round trips for every modelled RDATA type, compression,
@@ -150,14 +162,17 @@ elodin's own encoder would let a codec bug agree with itself.
 - `odin test` wraps each test in a tracking allocator, and
   `ODIN_TEST_FAIL_ON_BAD_MEMORY` (set by `mise run test`) makes a finding fail
   the test. This only catches a procedure that keeps memory it was lent: the
-  query path allocates from a per-request arena reset whole, and the rest
+  query path allocates from its fiber's scratch, freed whole, and the rest
   belongs to the running server, not to anything a unit test calls.
 - `mise run leakcheck` builds the binary with `-sanitize:address` and runs the
   integration suite against it, asking each server to exit rather than killing
   it, since ASan reports on exit. This reaches the configuration, the listeners'
-  TLS contexts, and the answers a race worker allocates on the heap because they
-  may outlive the caller's arena. Being ASan, it also catches use-after-free. It
-  is not part of `mise run verify`; CI runs it on every change.
+  TLS contexts, and the answers a racer allocates on the heap because they may
+  outlive the caller's scratch. Being ASan, it also catches use-after-free, and
+  it builds with `-define:ELODIN_SCRATCH_DEBUG=true`, which makes every scratch
+  allocation a heap allocation of its own so that a pointer kept past a fiber's
+  reset is reported rather than read out of reused arena. It is not part of
+  `mise run verify`; CI runs it on every change.
 
 **Fuzzing** covers the parsers that read untrusted bytes, one libFuzzer target
 each under `src/fuzz/`:
@@ -178,8 +193,9 @@ The two HTTP readers take a socket, so their targets feed them one end of a
 socket pair holding the input.
 
 Odin has no `-fsanitize=fuzzer`, so `mise run fuzz` emits LLVM IR per target and
-has clang instrument and link it into `bin/fuzz_*`, with ASan on and bounds
-checks kept.
+has clang instrument and link it into `bin/fuzz_*`, with ASan on, bounds checks
+kept and `ELODIN_SCRATCH_DEBUG` set. The fiber switch is assembly that `odin build`
+would assemble itself; the task assembles and links it for IR.
 
 - `.github/workflows/fuzz.yml` fuzzes nightly against a corpus cached between
   runs; `workflow_dispatch` runs it on demand after a parser changes.

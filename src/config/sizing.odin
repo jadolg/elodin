@@ -6,75 +6,91 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import si "core:sys/info"
+import "elodin:dns"
 
 /*
-Worker counts derived from the machine elodin is starting on.
+What the server's size is derived from where the file leaves it unset: the
+machine it is starting on.
 
-The pool is wide wherever the machine can hold it: a cache miss parks a worker
-for an upstream round trip, so the miss rate a server can carry is its worker
-count over the upstream's RTT, and a pool sized by cores caps a two-core box at
-a few hundred misses a second. Width costs the hit path nothing, because only
-`running_workers` of the pool run at once (see `pool.make_pool`), and costs
-memory only as far as the load reaches: a worker holds a scratch arena from its
-first query onward - 256 KiB here, since the build defines
-`DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE`, resident as far as its queries touched it
-(`pool.spawn` maps it) - and Odin's `arena_free_all` keeps the first block,
-zeroing what was used of it, rather than returning it, but the pool wakes the worker
-that went idle last, so a household resolver answering a few queries a second
-touches the arenas of a few workers and no more.
+The event loops are sized by the cores, one per usable CPU to eight
+(`derive_udp_readers`), since a loop is a thread that is either running or
+waiting in `epoll_wait` and one past the core count adds contention rather than
+throughput. What is in flight is sized by memory instead: a query that waits on
+an upstream parks its fiber and costs nothing on the CPU, so how many may wait
+at once is a question of what they can come to hold (`derive_max_pending`), and
+how many may hold the most a request can (`derive_heavy_decodes`).
 
-What the machine does decide is the ceiling on that memory: a burst that
-reaches every worker leaves every arena resident for the life of the process,
-so the count is held to a share of RAM (`WORKER_MEMORY_SHARE`), and the running
-limit is read off the CPUs. Both only when the file leaves them unset. An
-operator who names a number gets that number; nothing here overrides a
-configured value or second-guesses it.
+Both only when the file leaves them unset. An operator who names a number gets
+that number; nothing here overrides a configured value or second-guesses it.
 */
 
 /*
-The widest derived pool, and the size it takes wherever memory allows.
+What one query in flight can come to hold, when checking `max_pending` against
+memory.
 
-Workers are sized for cache misses rather than for the CPUs: a miss parks its
-worker for an upstream round trip, so how many misses a second the server can
-carry is `workers / upstream_rtt` whatever the core count, and the load a box is
-asked to carry has nothing to do with how many cores it has. 128 against a
-20 ms upstream is some six thousand misses a second, the order every comparable
-resolver carries on two cores (issue #493). Hits do not pay for the width: the
-pool runs only `running_workers` at once, and a worker that is never woken never
-touches its scratch arena, so the threads past what the load needs cost a stack
-and a scheduler entry rather than a quarter of a megabyte each.
+The stack its fiber touched - measured at 7 KB for a cache hit and 21 KB for a
+miss that walks a DNSSEC chain, release build - and its scratch, whose first
+block is 16 KiB, rounded up to 64 KiB; and on top of that what its readings may
+decode without asking for a heavy slot, `dns.REQUEST_ORDINARY_DECODE`. An
+ordinary query holds a small fraction of this. The figure is the ceiling an
+attacker steering answers can push every query in flight to, and it is that
+ceiling that has to fit.
 */
-MAX_DERIVED_WORKERS :: 128
+QUERY_MEMORY_BYTES :: 64 * 1024 + dns.REQUEST_ORDINARY_DECODE
 
 /*
-Workers allowed on the CPU at once, per usable CPU.
+The share of memory the queries in flight may come to.
 
-Two rather than one, at a hit rate indistinguishable from one's on two cores:
-the hooks in `pool.blocking_begin` cover every wait a handler makes on the
-network or on another query, and the second slot per core is headroom for the
-short waits nothing hooks (a page fault, a log write, a contended lock) so that
-one of them does not leave a core idle with work queued.
+An eighth: the cache and the blocklists are what an operator sizes elodin's
+memory for, and the queries in flight are the third thing, at their worst.
 */
-RUNNING_WORKERS_PER_CPU :: 2
+QUERY_MEMORY_SHARE :: 8
 
 /*
-Memory charged to each thread when checking the derivation against RAM.
+The bounds of the derived `max_pending`.
 
-Measured resident cost is ~0.26-0.35 MB per worker under `mise run bench`'s
-load, most of it the part of the scratch arena those queries touched; this
-rounds up to cover the stack pages a query touches and the allocator's own
-per-thread retention.
+The floor is what keeps a small machine answering while one upstream is slow:
+sixty-four queries waiting on a stalled upstream still leave room for others.
+
+The ceiling is descriptors as much as memory. Each query in flight may hold an
+upstream socket - under `strategy: race` one per server it races
+(`Descriptor_Demand.racers`) - and 4096 of them, racing a dozen servers, with the
+default connection table fit inside the `LimitNOFILE=65536` the shipped unit sets.
+4096 against a 20 ms upstream is two hundred thousand cache misses a
+second, more than eight loops answer.
+
+Where memory could not be measured, `DEFAULT_MAX_PENDING`: a figure small
+enough to fit any machine elodin runs on and large enough to ride out a slow
+upstream.
 */
-WORKER_MEMORY_BYTES :: 512 * 1024
+MIN_DERIVED_PENDING :: 64
+MAX_DERIVED_PENDING :: 4096
+DEFAULT_MAX_PENDING :: 1024
+
+/*
+The share of memory requests decoding past their ordinary allowance may hold,
+at `dns.REQUEST_DECODE_BUDGET` each, and the bounds of the derived figure.
+
+A thirty-second (#493): the heavy slots are what a flood of steered answers
+reaches for, so a flood holding all of them holds that share and no more. Never
+fewer than two, so a request that honestly needs the whole budget - the longest
+chain walk measured - is not refused for want of company; never more than 128.
+Where memory could not be measured, 16.
+*/
+HEAVY_DECODE_SHARE :: 32
+MIN_DERIVED_HEAVY_DECODES :: 2
+MAX_DERIVED_HEAVY_DECODES :: 128
+DEFAULT_HEAVY_DECODES :: 16
 
 /*
 Memory charged to each connection `server.max_connections` lets the server hold.
 
-Every TCP, DoT and DoH/1.1 connection has a thread of its own. With 200 held
-open after one query each, a TCP connection measured ~25 KB resident and a DoT
-one ~95 KB, nearly all of that OpenSSL's session; this rounds up for DoH/1.1
-and the stack a query touches (#526). The scratch a query uses past that is held
-until its connection closes and unmapped when it does (see `pool.spawn`).
+Every TCP, DoT and DoH connection has a fiber of its own. Held open after one
+query each, a TCP connection measured ~21 KB resident in a release build - the
+stack its fiber touched and its scratch - and a DoT or DoH/2 one ~72 KB, most of
+it OpenSSL's session (bench/results/2026-10-26-event-loop.md); this rounds up
+for the stack a query touches (#526, #547). The scratch a query uses past that is held until its connection
+closes and unmapped when it does.
 */
 CONNECTION_MEMORY_BYTES :: 128 * 1024
 
@@ -115,24 +131,6 @@ connection_memory_warning :: proc(max_connections: int, m: Machine, allocator :=
 }
 
 /*
-The share of memory the thread floor is allowed to take.
-
-A thirty-second of RAM is generous for something that is neither the cache nor
-the blocklists - the two things an operator sizes elodin's memory for. It binds
-below about 3 GB, where the full 128 handlers and their racers would be past it:
-a 1 GiB machine gets 42.
-*/
-WORKER_MEMORY_SHARE :: 32
-
-/*
-Where the derivation stops when memory is what binds.
-
-Below this the pool is too narrow to keep answering while a single upstream is
-slow, and a resolver that stops answering has not saved anybody any memory.
-*/
-MIN_MEMORY_WORKERS :: 4
-
-/*
 What the machine has, as far as this process can see it.
 
 Zero means "could not tell", and the derivation then leaves that term out
@@ -148,16 +146,13 @@ Machine :: struct {
 }
 
 /*
-Whether the worker counts came from the machine or from the file.
+Whether the sizes came from the machine or from the file.
 
 Kept so that startup and `--check` can say where the numbers came from. A
 derived number that nobody can see is one an operator cannot argue with.
 */
 Sizing :: struct {
-	machine:                  Machine,
-	derived_workers:          bool,
-	derived_upstream_workers: bool,
-	derived_running_workers:  bool,
+	machine:             Machine,
 	derived_chain_walks:      bool,
 	derived_connection_walks: bool,
 	derived_udp_readers:      bool,
@@ -169,17 +164,16 @@ Sizing :: struct {
 /*
 The most UDP readers the machine will be taken to want, and the fewest.
 
-Readers are sized by parallelism rather than by load, which is the opposite of
-the worker counts above: a reader spends its time in `recvfrom` and in hashing
-the source prefix, so it is on a core rather than parked on an upstream, and one
-past the core count adds contention rather than drain rate. Hence one per usable
-CPU rather than a multiple of it.
+Readers are sized by parallelism rather than by load, and a reader is an event
+loop (#547): one thread that reads its socket, answers what it read and serves
+its share of the connections. It is on a core whenever it has work, so one past
+the core count adds contention rather than throughput. Hence one per usable CPU
+rather than a multiple of it.
 
-Eight is where the derivation stops. A reader drains on the order of a million
+Eight is where the derivation stops. A loop drains on the order of a million
 datagrams a second on the hardware this was measured on, so eight is past what a
-10 GbE link delivers in query-sized packets, and the next bound past that is the
-worker pool rather than the socket. An operator on larger hardware can name a
-figure; nothing here refuses one up to `MAX_UDP_READERS`.
+10 GbE link delivers in query-sized packets. An operator on larger hardware can
+name a figure; nothing here refuses one up to `MAX_UDP_READERS`.
 */
 MIN_DERIVED_UDP_READERS :: 1
 MAX_DERIVED_UDP_READERS :: 8
@@ -188,11 +182,8 @@ MAX_DERIVED_UDP_READERS :: 8
 Readers for a machine.
 
 A machine whose CPUs could not be counted gets one, which is what elodin had
-before this setting existed. That is the opposite of what `derive_workers` does
-with the same unknown, and deliberately: too few workers is throughput an
-operator can see and raise, while a reader that has no core to run on buys
-nothing and costs a thread and a receive buffer. Guessing wide is the safe
-direction for the first and not for the second.
+before this setting existed: a loop that has no core to run on buys nothing and
+costs a thread and a receive buffer, so guessing narrow is the safe direction.
 */
 derive_udp_readers :: proc(m: Machine) -> int {
 	if m.cpus <= 0 {
@@ -201,89 +192,67 @@ derive_udp_readers :: proc(m: Machine) -> int {
 	return clamp(m.cpus, MIN_DERIVED_UDP_READERS, MAX_DERIVED_UDP_READERS)
 }
 
-// Handlers for a machine, ignoring any term the machine did not report.
-derive_workers :: proc(m: Machine) -> int {
-	workers := MAX_DERIVED_WORKERS
-	if m.memory > 0 {
-		threads := (m.memory / WORKER_MEMORY_SHARE) / WORKER_MEMORY_BYTES
-		// The handlers bring `workers / 2` racers with them, so a budget of
-		// threads buys two thirds of itself in handlers.
-		affordable := int(min(threads * 2 / 3, i64(MAX_DERIVED_WORKERS)))
-		workers = min(workers, max(affordable, MIN_MEMORY_WORKERS))
-	}
-	return workers
-}
-
 /*
-Handlers that may run at once, for a machine and a pool of `workers`.
-
-A machine whose CPUs could not be counted gets the whole pool, which is no
-limit at all: guessing a small number there would cap the hit rate of a large
-host at a figure picked for a small one. Never more than the pool, where a
-limit would mean nothing.
+`server.max_pending` for a machine: an eighth of its memory over what a query
+in flight can come to hold, between the bounds.
 */
-derive_running_workers :: proc(m: Machine, workers: int) -> int {
-	if m.cpus <= 0 {
-		return workers
+derive_max_pending :: proc(m: Machine) -> int {
+	if m.memory <= 0 {
+		return DEFAULT_MAX_PENDING
 	}
-	return min(m.cpus * RUNNING_WORKERS_PER_CPU, workers)
+	return int(clamp(m.memory / QUERY_MEMORY_SHARE / QUERY_MEMORY_BYTES, MIN_DERIVED_PENDING, MAX_DERIVED_PENDING))
+}
+
+// The heavy decode slots for a machine; see `HEAVY_DECODE_SHARE`.
+derive_heavy_decodes :: proc(m: Machine) -> int {
+	if m.memory <= 0 {
+		return DEFAULT_HEAVY_DECODES
+	}
+	return int(
+		clamp(
+			m.memory / HEAVY_DECODE_SHARE / dns.REQUEST_DECODE_BUDGET,
+			MIN_DERIVED_HEAVY_DECODES,
+			MAX_DERIVED_HEAVY_DECODES,
+		),
+	)
 }
 
 /*
-Racers to go with a given handler count.
+Queries in flight kept back from the chain walk.
 
-Half, which is the ratio the old pair of defaults had. They are a separate pool
-because a race job is submitted by a handler and waited on by it, so the two
-sharing one pool could deadlock; the count only has to be enough that a burst of
-races does not queue behind itself.
-*/
-derive_upstream_workers :: proc(workers: int) -> int {
-	return max(workers / 2, 1)
-}
-
-/*
-Handlers kept back from the chain walk.
-
-The chain walk blocks the worker answering the client, once per label of a name
-the client chose, so without a bound a flood of fresh names holds every worker
-and the resolver stops answering anything at all (issue #356). This is called twice, with the size
-of each pool a query can be answered on: `workers` for the shared one, which is
-UDP and HTTP/2, and `max_connections` for the thread-per-connection transports.
-Two bounds rather than one because the numbers differ by an order of magnitude
-and a single figure is wrong at both ends - and counted apart so a flood on one
-transport cannot spend the other's allowance. What has to be
-guaranteed is that most of the pool keeps *turning over* - and that is a
-*reservation* rather than a ceiling.
+The chain walk waits on the network once per label of a name the client chose,
+so without a bound a flood of fresh names holds every query the server may have
+in flight, each for up to thirty round trips, and the resolver stops answering
+anything at all (issue #356). What has to be guaranteed is that most of what may
+be in flight keeps *turning over* - and that is a *reservation* rather than a
+ceiling.
 
 Turning over, not idle, and the difference is worth stating because the wrong
-reading oversells this. The reserved workers are free of the *walk*, not free of
-work: one may be parked on the query's own upstream forward, which takes no slot
-and is not bounded here. What the reservation buys is that at most
-`max_chain_walks` of them can be inside a chain walk, and a walk is up to
-`MAX_LOOKUPS_PER_QUERY` round trips against a forward's one - so the rest come
-back in a round trip rather than in a second, and the pool keeps draining its
-queue instead of standing still. Enough of a flood will still fill every worker
-and shed at `try_submit`; what it can no longer do is hold them for thirty round
-trips apiece, which is the whole of #356.
+reading oversells this. The reserved queries are free of the *walk*, not free of
+work: one may be waiting on its own upstream forward, which takes no slot and is
+not bounded here. What the reservation buys is that at most `max_chain_walks` of
+them can be inside a chain walk, and a walk is up to `MAX_LOOKUPS_PER_QUERY` round
+trips against a forward's one - so the rest come back in a round trip rather than
+in a second, and new queries keep being admitted instead of shed. Enough of a
+flood will still fill `max_pending` and shed; what it can no longer do is hold
+it for thirty round trips apiece, which is the whole of #356.
 
-Stated this way round on purpose. A ceiling of half the pool also caps honest
+Stated this way round on purpose. A ceiling of half the bound also caps honest
 throughput at half, and the walks past it are answered SERVFAIL: every
 cache-missing name that is not in the non-cut memo needs a slot, so a resolver
 that is merely busy - a restart with real traffic pointed at it, where nearly
 every query is a cold walk - would refuse validated answers that resolved fine
 before. Reserving instead leaves the honest load nearly untouched and still
-denies an attacker the last worker.
+denies an attacker the last slot.
 
-A quarter, and never fewer than two. The reserved workers serve what needs no
-walk, which is mostly cache hits at tens of microseconds but also ordinary
-forwarding at an upstream round trip, so the number has to be enough to keep
-that moving rather than merely non-zero: a quarter of the derived 128 is
-thirty-two, some fifteen hundred forwards a second, and the floor of two is
-what a pool memory has cut to `MIN_MEMORY_WORKERS` keeps.
+A quarter, and never fewer than two. The reserved queries serve what needs no
+walk, which is mostly cache hits but also ordinary forwarding at an upstream
+round trip, so the number has to be enough to keep that moving rather than
+merely non-zero.
 
 What this does not bound tightly is upstream volume - #356's other cost - since
-nearly the whole pool may still be walking. That is the trade the issue asks for
-in as many words: worker starvation traded for upstream volume, which is the
+nearly everything in flight may still be walking. That is the trade the issue
+asks for in as many words: starvation traded for upstream volume, which is the
 difference between a resolver degraded and one down. An operator who would
 rather cap the volume has `dnssec.max_chain_walks` to name a smaller number
 with.
@@ -292,30 +261,12 @@ RESERVED_HANDLERS_SHARE :: 4
 MIN_RESERVED_HANDLERS :: 2
 
 /*
-Chain-of-trust walks that may be waiting on an upstream at once.
-
-Everything but the reservation above. At least one whatever the arithmetic says:
-a one-worker configuration still has to be able to walk a chain, since the bound
-is on walks at once rather than on walks.
-
-Deliberately not clamped to `upstream_workers`. A walk waiting on an upstream
-holds a racer job per candidate server under `strategy: race`, so the racer pool
-is a second resource this can exhaust - but the clamp cannot be right: the
-candidate count is not known here, so it is too loose for a group of three
-upstreams and, worse, it binds on the strategies that use no racer at all.
-`failover` and `round_robin` resolve on the calling thread, so an operator
-trimming `upstream_workers` on one of those would have silently cut the chain
-walks with it. The racer interaction is in docs/dnssec.md, where the number of
-upstreams is known.
+Chain-of-trust walks that may be waiting on an upstream at once, for a bound of
+`in_flight` queries: everything but the reservation above. At least one whatever
+the arithmetic says, since the bound is on walks at once rather than on walks.
 */
-derive_chain_walks :: proc(threads: int) -> int {
-	return max(threads - max(threads / RESERVED_HANDLERS_SHARE, MIN_RESERVED_HANDLERS), 1)
-}
-
-// `server.max_pending` where the file leaves it unset: eight queued queries per
-// handler worker.
-derive_max_pending :: proc(workers: int) -> int {
-	return workers * 8
+derive_chain_walks :: proc(in_flight: int) -> int {
+	return max(in_flight - max(in_flight / RESERVED_HANDLERS_SHARE, MIN_RESERVED_HANDLERS), 1)
 }
 
 // What this process can see of the machine, at the moment it asks.
@@ -368,7 +319,7 @@ The CPU allowance of the cgroup this process is in, in whole CPUs.
 Worth reading because affinity does not see it: `docker run --cpus 0.5` and
 systemd's `CPUQuota=` both leave every CPU in the mask and throttle instead, so
 without this a container limited to half a core would size itself for the host.
-Rounded up - half a CPU is still a machine that can run one worker's worth of
+Rounded up - half a CPU is still a machine that can run one loop's worth of
 work - and read from the process's own cgroup path rather than the hierarchy
 root, for the reason `cgroup_file` gives.
 */
@@ -413,7 +364,7 @@ not, so `/sys/fs/cgroup/memory/memory.limit_in_bytes` there is the root group's
 Only this process's own cgroup, not the ancestors it inherits limits from. Every
 case above puts the limit on the leaf, and reading the whole chain to catch a
 hand-built hierarchy is more machinery than a default is worth: what it would
-miss is a limit an operator can still name a worker count under.
+miss is a limit an operator can still name a loop count under.
 */
 @(private)
 cgroup_file :: proc(buf: []u8, cgroups, mount, controller, leaf: string) -> (path: string, ok: bool) {
@@ -515,7 +466,7 @@ Same reasoning as the CPU quota, and it matters more: `/proc/meminfo` inside a
 container reports the host's RAM, so a 128 MB container would otherwise size
 itself against tens of gigabytes it cannot touch. `MemoryMax=` in the systemd
 unit lands here too, which makes it a way to say how large elodin should
-consider itself without naming a worker count.
+consider itself without naming a `max_pending`.
 */
 @(private)
 cgroup_memory :: proc(cgroups: string) -> (bytes: i64, ok: bool) {
@@ -619,7 +570,8 @@ generous for two of the four transports is still a ceiling.
 **Idle sockets only, which is not every socket this server holds upstream.** A
 connection checked out of a pool for a round trip is not in the pool, and one
 dialled when the pool is empty was never in it - so in-flight exchanges are
-bounded by the worker pools rather than by `max_idle`, and are counted there.
+bounded by `server.max_pending` rather than by `max_idle`, and are counted there.
+Pipelined and HTTP/2 connections are one per upstream, shared by every loop.
 This is a ceiling on the pools and not on upstream sockets: what it names is what
 can be held open while nothing is being asked.
 */

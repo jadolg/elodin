@@ -1,6 +1,7 @@
 package config
 
 import "core:encoding/hex"
+import "core:fmt"
 import "core:time"
 
 Log_Level :: enum u8 {
@@ -260,8 +261,8 @@ Cache_Config :: struct {
 	the refresh to answer this client itself; lowering it serves expired data
 	sooner and more often.
 
-	The refresh is not cancelled when the timer fires. It carries on under a
-	worker of the query pool and writes whatever it gets to the cache, so the
+	The refresh is not cancelled when the timer fires. It carries on on a fiber
+	of its own and writes whatever it gets to the cache, so the
 	entry is refreshed even though this client was answered from it - which is
 	the other half of what section 5 asks for. One refresh per cache key is in
 	flight at a time, so a popular expired name does not put an upstream query
@@ -354,50 +355,48 @@ Dnssec_Config :: struct {
 	/*
 	Chain-of-trust walks that may be waiting on an upstream at once.
 
-	The chain walk is the one part of validation that blocks the worker already
-	answering a client, and it blocks it once per label of the name being walked.
-	Nothing about the name is this server's to choose, so without a bound a
-	client picking names whose upper labels are fresh holds every worker there
-	(issue #356). Past this many, a walk reads the caches and answers SERVFAIL
-	where it would have gone upstream, which is what an upstream that did not
-	answer already produces - and that covers every cold name while it binds,
-	unsigned ones included, since a zone cannot be known to be unsigned without
-	the DS lookup that shows it.
+	The chain walk is the one part of validation that waits on the network on
+	behalf of the query it is validating, once per label of the name being
+	walked. Nothing about the name is this server's to choose, so without a
+	bound a client picking names whose upper labels are fresh holds every query
+	it may have in flight there, each for up to thirty round trips (issue #356).
+	Past this many, a walk reads the caches and answers SERVFAIL where it would
+	have gone upstream, which is what an upstream that did not answer already
+	produces - and that covers every cold name while it binds, unsigned ones
+	included, since a zone cannot be known to be unsigned without the DS lookup
+	that shows it.
 
-	This is the bound for the shared handler pool, which is UDP and HTTP/2. The
-	connection transports have one of their own, derived the same way from
-	`server.max_connections` and counted apart, so a flood on one cannot spend
-	the other's allowance. Not a second setting: what sizes it is
-	`server.max_connections`, which already is one.
+	For the queries counted in `server.max_pending` - UDP, DoH over HTTP/2 and
+	cache refreshes; the connections have `max_connection_walks`.
 
-	Zero, the default, is `server.workers` less a reserved quarter of them, so
+	Zero, the default, is `server.max_pending` less a reserved quarter of it, so
 	that quarter cannot be held inside a walk - it turns over in a round trip
-	rather than in the thirty a walk may take. Free of the walk rather than idle:
-	a reserved worker may still be parked on the query's own upstream forward,
-	which nothing here bounds. It is exposed because the cost of the number
-	being too small is real - a resolver whose honest cache-miss load is above
-	it turns the surplus into SERVFAIL - and it is not a number anybody here
-	can know. `elodin_dnssec_queries_shed_total` says the bound was reached -
-	not why, since an attack and honest saturation are the same from
-	in here - and is how an operator finds out they may need a bigger one. A
-	smaller one is how they cap the upstream volume a flood can provoke, which
-	the reservation does not.
+	rather than in the thirty a walk may take. It is exposed because the cost of
+	the number being too small is real - a resolver whose honest cache-miss load
+	is above it turns the surplus into SERVFAIL - and it is not a number anybody
+	here can know. `elodin_dnssec_queries_shed_total` says the bound was reached
+	- not why, since an attack and honest saturation are the same from in here -
+	and is how an operator finds out they may need a bigger one. A smaller one is
+	how they cap the upstream volume a flood can provoke, which the reservation
+	does not.
 	*/
 	max_chain_walks:      int,
 	/*
-	The same, for the transports answered on a thread of their own: TCP, DoT and
-	HTTP/1.1.
+	The same, for the queries answered on their connection's fiber: TCP, DoT and
+	DoH over HTTP/1.1.
 
-	A setting of its own because the two are sized by different things and the
-	numbers differ by an order of magnitude - zero derives it from
-	`server.max_connections` the same way `max_chain_walks` is derived from
-	`server.workers`, so the default is 384 against 512 connections where the
-	other is 96 against 128 workers.
+	A bound of its own because those queries are not counted in
+	`server.max_pending` - a connection answers one at a time, so
+	`max_connections` bounds them - and a share of either figure is wrong for the
+	other: a share of `max_pending` lets the connections take every walk, and a
+	share of both together leaves the queries in flight no reserve. Zero derives
+	it from `server.max_connections` the way `max_chain_walks` is derived from
+	`max_pending`: 384 against the default 512 connections.
 
 	It exists because `server.max_connections` is the wrong lever for the job an
 	operator would reach for it to do. Lowering `max_chain_walks` caps the
-	upstream volume a flood can provoke through the shared pool; without this,
-	the only way to cap the same thing on the stream transports was to cut how
+	upstream volume a flood can provoke over UDP and HTTP/2; without this, the
+	only way to cap the same thing on the stream transports would be to cut how
 	many clients may connect at all, which is a price for legitimate traffic
 	that has nothing to do with DNSSEC.
 	*/
@@ -569,42 +568,6 @@ Rewrite :: struct {
 
 Server_Config :: struct {
 	/*
-	Worker threads that run query handling.
-
-	A worker is occupied for the whole of an upstream round trip, so sustained
-	throughput on cache misses is roughly `workers / upstream_rtt`. With a
-	typical 20 ms upstream that is about 50 queries per second per worker.
-	Size it as `target_qps * upstream_rtt`, with headroom: 5000 qps against a
-	20 ms upstream wants at least 100.
-
-	Zero derives it at startup - see `sizing.odin` - as 128, or fewer where
-	the memory those workers can come to hold would be past a thirty-second of
-	the machine's.
-	*/
-	workers:                    int,
-	/*
-	Worker threads dedicated to racing upstreams, kept separate so a burst of
-	races cannot starve the handlers that submitted them.
-
-	Zero derives it as half of `workers`, whether that came from the file or
-	from the machine.
-	*/
-	upstream_workers:           int,
-	/*
-	Workers of the shared pool (UDP and DoH over HTTP/2) that may be on the
-	CPU at once. A worker waiting on an upstream or on another query's answer
-	is not counted, so this bounds the pool's threads competing for the cores
-	rather than its queries in flight: a cache hit is answered by a worker that
-	is already awake rather than by waking one of its own, which is where a
-	wide pool's hit rate would otherwise go. TCP, DoT and DoH over HTTP/1.1
-	answer on their connection's own thread and are bounded by
-	`max_connections` instead.
-
-	Zero derives it as twice the usable CPUs, or the whole pool where the CPUs
-	could not be counted.
-	*/
-	running_workers:            int,
-	/*
 	Per-connection read timeout for TCP, DoT and DoH clients.
 
 	Also what a TCP or DoT client that sends edns-tcp-keepalive is told, since it
@@ -660,24 +623,36 @@ Server_Config :: struct {
 	*/
 	max_connections_per_prefix: int,
 	/*
-	Queries allowed to be queued or in flight before new ones are dropped.
+	Queries that may be in flight at once before new ones are turned away.
 
-	Past this point the server is behind and queueing only adds latency to
-	answers whose clients have already given up. DNS clients retry, so shedding
-	is the better failure: it keeps latency bounded for the queries that are
-	still being served instead of making every one of them slow.
+	A query is counted from the moment it is admitted until it is answered, the
+	whole of the time it holds memory: its fiber's stack and scratch, and the
+	buffers its answers are read into. Past this point the server is behind,
+	and taking more only adds latency to answers whose clients have already
+	given up. DNS clients retry, so shedding is the better failure: it keeps
+	latency bounded for the queries that are still being served instead of
+	making every one of them slow.
 
-	Zero derives it as `workers * 8`, which is about eight upstream round trips
-	of backlog whatever the worker count, so the queue stays a bounded delay
-	rather than a growing one.
+	Zero derives it from memory: an eighth of what this process may use,
+	divided by what one query can come to hold (`QUERY_MEMORY_BYTES`), between
+	`MIN_DERIVED_PENDING` and `MAX_DERIVED_PENDING`. That is some four hundred on
+	a 1 GiB machine and three thousand on 8 GiB - against a 20 ms upstream,
+	twenty thousand and a hundred and fifty thousand cache misses a second.
 
-	It bounds the two transports that queue: UDP, whose read loop drops the
-	datagram, and DoH over HTTP/2, whose stream is answered 503 rather than
-	dropped - there is a client on an open connection there to tell. TCP, DoT
-	and HTTP/1.1 DoH answer on their own connection thread and are bounded by
-	`max_connections` instead.
+	It bounds what runs on a fiber of its own: a UDP query, whose datagram is
+	dropped past it, an HTTP/2 DoH request, which is answered 503 - there is a
+	client on an open connection there to tell - and a refresh. TCP, DoT and
+	HTTP/1.1 DoH answer on their connection's own fiber, one query at a time
+	per connection, and are bounded by `max_connections` instead.
 	*/
 	max_pending:                int,
+	/*
+	Requests that may decode past `dns.REQUEST_ORDINARY_DECODE` at once,
+	process-wide. Not a key: derived at load from memory
+	(`derive_heavy_decodes`), held for the life of the process, and printed in
+	the sizing line so it can be read. See `dns.REQUEST_ORDINARY_DECODE`.
+	*/
+	heavy_decodes:              int,
 	/*
 	Account the process switches to once the listeners have bound.
 
@@ -722,8 +697,8 @@ Server_Config :: struct {
 	*/
 	max_udp_response:           int,
 	rate_limit:                 Rate_Limit_Config,
-	// What the two worker counts were derived from, when they were. Not a
-	// setting: filled in at load so startup and `--check` can report it.
+	// What the derived sizes were derived from, when they were. Not a setting:
+	// filled in at load so startup and `--check` can report it.
 	sizing:                     Sizing,
 }
 
@@ -1095,7 +1070,59 @@ Special_Use_Config :: struct {
 	private_reverse: bool,
 }
 
+/*
+Keys a file may still name although nothing reads them any more.
+
+The worker pools these sized went with #547: queries and connections run on
+fibers of the event loops, and what the pools bounded is bounded by
+`server.max_pending`, `server.max_connections` and `listeners.udp.readers`
+instead. Refusing a key is how this loader treats an unknown one (see
+`check_keys`), and a file that named one of these was correct the day before
+the upgrade - so for one release each is accepted, read as an integer, ignored,
+and said once at startup, at every reload and under `--check` (`retired_warning`).
+After that they are unknown keys like any other.
+*/
+Retired_Key :: enum u8 {
+	Workers,
+	Upstream_Workers,
+	Running_Workers,
+}
+
+Retired_Keys :: bit_set[Retired_Key]
+
+// The release in which the retired keys become unknown ones, and are refused:
+// the one after the release that retires them, 0.25.0.
+RETIRED_KEYS_REFUSED_IN :: "0.26.0"
+
+/*
+What a retired key was, and what decides what it decided now. One place, so
+startup, a reload and `--check` say it in the same words.
+*/
+retired_warning :: proc(key: Retired_Key, allocator := context.temp_allocator) -> string {
+	name, instead: string
+	switch key {
+	case .Workers:
+		name = "server.workers"
+		instead = "queries no longer wait on threads; server.max_pending bounds how many are in flight"
+	case .Upstream_Workers:
+		name = "server.upstream_workers"
+		instead = "racers run beside the query that started them; server.max_pending bounds the queries"
+	case .Running_Workers:
+		name = "server.running_workers"
+		instead = "listeners.udp.readers is how many event loops, and so how many cores, the server uses"
+	}
+	return fmt.aprintf(
+		"%s is no longer used and is ignored: %s. Remove it; from release %s it is refused",
+		name,
+		instead,
+		RETIRED_KEYS_REFUSED_IN,
+		allocator = allocator,
+	)
+}
+
 Config :: struct {
+	// The retired keys the file named; see `Retired_Key`.
+	retired:     Retired_Keys,
 	log:         Log_Config,
 	server:      Server_Config,
 	listeners:   Listeners,
@@ -1117,17 +1144,13 @@ default_config :: proc() -> Config {
 		queries = false,
 	}
 	c.server = Server_Config {
-		// All zero: worked out at load from the CPUs and memory this machine
-		// actually has.
-		workers                    = 0,
-		upstream_workers           = 0,
-		running_workers            = 0,
 		client_timeout             = 10 * time.Second,
 		max_connections            = 512,
 		// Zero, and worked out from `max_connections` at load: an operator who
 		// raises the table expects one client's share to move with it, and a
 		// figure written here would stay at half of the default table for ever.
 		max_connections_per_prefix = 0,
+		// Zero, worked out at load from the memory this machine actually has.
 		max_pending                = 0,
 		// The local networks, and nothing else: a resolver that has not been
 		// configured must not be an open one. See `DEFAULT_ALLOW_FROM`.
@@ -1154,8 +1177,8 @@ default_config :: proc() -> Config {
 		enabled        = true,
 		address        = "0.0.0.0",
 		port           = 53,
-		// Zero, and worked out from the machine at load, for the reason the
-		// worker counts are: one reader per usable CPU is a property of the
+		// Zero, and worked out from the machine at load, for the reason
+		// `max_pending` is: one reader per usable CPU is a property of the
 		// box rather than a number anybody wants to maintain, and a figure
 		// written here would be one on every machine that installs this.
 		readers        = 0,
@@ -1214,8 +1237,7 @@ default_config :: proc() -> Config {
 	c.dnssec = Dnssec_Config {
 		enabled              = true,
 		max_nsec3_iterations = 100,
-		// Derived from `server.workers` and `server.max_connections` at load;
-		// see the fields.
+		// Derived from `server.max_pending` at load; see the field.
 		max_chain_walks      = 0,
 		max_connection_walks = 0,
 		// Zero takes `dnssec.DEFAULT_MAX_CACHED_ZONES`; see the field.

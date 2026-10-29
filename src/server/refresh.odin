@@ -6,7 +6,7 @@ import "core:sync"
 import "core:time"
 import "elodin:cache"
 import "elodin:dns"
-import "elodin:pool"
+import "elodin:loop"
 
 /*
 The refresh of an expired entry, running clear of the client that asked for it.
@@ -19,9 +19,9 @@ query. Tying the two together is what issue #164 is about - the fallback was
 reached only after `upstream.resolve` had given up on every server for every
 attempt, which is ten seconds with the defaults and a stub that gave up at five.
 
-So the refresh is moved off the client's thread and the client waits on it with
-a deadline. A worker of the query pool runs `resolve_query` over a copy of the
-client's own query, which is what makes this cheap to be sure of: it is the
+So the refresh is moved off the client's fiber and the client waits on it with
+a deadline. A fiber of its own runs `resolve_query` over a copy of the client's
+own query, which is what makes this cheap to be sure of: it is the
 same procedure, on the same bytes, reaching the same validator, the same
 blocking walk and the same store. There is no second forwarding path to keep in
 step with the first, which for a store that a later client is served from is
@@ -63,7 +63,7 @@ as one - see `prefetching`.
 */
 
 /*
-Set while this thread runs a prefetch, which is a refresh nobody asked for.
+Set while this fiber runs a prefetch, which is a refresh nobody asked for.
 
 Its answer reaches the cache and no client, so it is not one of the queries an
 operator reads `elodin_answers_total` and the query log for - the client whose
@@ -73,13 +73,20 @@ the lookup of the entry the refresh is there to replace. What the refresh cost
 still shows where the work is counted: `elodin_cache_prefetches_total`, and the
 upstream and DNSSEC series its exchange moves like any other.
 
-Per thread rather than a parameter because every one of those readers is some
-calls deep in `resolve_query`, and the refresh runs on one worker from start to
+Per fiber rather than a parameter because every one of those readers is some
+calls deep in `resolve_query`, and the refresh runs on one fiber from start to
 finish; `refresh_job` sets and clears it around that one call.
 */
 @(private)
 @(thread_local)
 prefetching: bool
+
+// Per fiber, for the reason `register_pinned` gives.
+@(private, init)
+register_prefetching :: proc "contextless" () {
+	context = {}
+	loop.register_local(proc "contextless" () -> rawptr {return &prefetching}, size_of(prefetching))
+}
 
 // Count an answer this server gave a client, which a prefetch is not.
 @(private)
@@ -94,19 +101,16 @@ Refreshes that may be in flight at once, for the whole server.
 
 A ceiling rather than a table that grows, because what decides how many
 distinct expired names are being asked for at once is whoever is asking. Each
-refresh holds a worker of the query pool for as long as the upstream takes to
+refresh holds one of `server.max_pending` for as long as the upstream takes to
 fail, which with a blackholed upstream is the group's whole budget of two
-`timeout`s - so an unbounded number of them is the query pool spent on refreshes
-while the clients they were started for are already being answered from the
-cache.
+`timeout`s - so an unbounded number of them is the queries in flight spent on
+refreshes while the clients they were started for are already being answered
+from the cache.
 
-Which of the two bounds binds depends on the pool. `server.workers` derives to
-at most `MAX_DERIVED_WORKERS`, so on any machine that sized itself
-`refresh_ceiling` is the smaller figure and this never comes near - a 128-worker
-pool refreshes 32 names at once. It binds only where an operator has written a
-worker count of their own past 256, and there it is deliberately the harder
-ceiling of the two: a pool sized for a rack does not need a quarter of itself
-parked on upstreams that are not answering.
+Which of the two bounds binds depends on `max_pending`: a quarter of it is the
+smaller figure below 256, and past that this is - deliberately the harder
+ceiling of the two, since a server sized for a rack does not need a quarter of
+what it may have in flight parked on upstreams that are not answering.
 
 A fixed array rather than a table that grows, so that a `Server` built as a
 literal - which the tests do - needs nothing initialised, and so that the memory
@@ -139,12 +143,12 @@ Refresh :: struct {
 	limit:      int,
 	/*
 	What every allocation above and the answer below were taken from, carried
-	so that whichever thread lets go last frees them where they came from.
+	so that whichever fiber lets go last frees them where they came from.
 
 	A refresh is allocated by the request that started it and may be freed by
-	the worker that ran it, or the other way round, and a pool worker runs with
-	the default context rather than the one that submitted the job - so the
-	ambient `context.allocator` is not the same allocator at the two ends. In a
+	the fiber that ran it, or the other way round, and a fiber runs with its
+	loop's context rather than the one that started the job - so the ambient
+	`context.allocator` is not the same allocator at the two ends. In a
 	running server both are the heap and nothing would show; under the test
 	runner's tracking allocator the mismatch is a free of a pointer it never
 	handed out.
@@ -163,10 +167,10 @@ Refresh :: struct {
 	policy:     u64,
 	cache_id:   u64,
 	mu:         sync.Mutex,
-	sema:       sync.Sema,
+	sema:       loop.Sema,
 	/*
 	The waiter's, the table's and the job's. The last one to let go frees it,
-	which is how a refresh that outlives its client is cleaned up by the worker
+	which is how a refresh that outlives its client is cleaned up by the fiber
 	that was still running it.
 	*/
 	refs:       int,
@@ -196,13 +200,13 @@ Refresh :: struct {
 /*
 How many refreshes this server will run at once.
 
-A quarter of the query pool, and the figure is about a burst rather than a
-steady state. A refresh holds a worker for as long as the upstream takes to
-fail, which against a blackholed one is the group's whole budget of two
-`timeout`s; the client that started it holds a second worker for up to
+A quarter of `server.max_pending`, and the figure is about a burst rather than a
+steady state. A refresh holds a query in flight for as long as the upstream
+takes to fail, which against a blackholed one is the group's whole budget of two
+`timeout`s; the client that started it holds a second for up to
 `cache.stale_timeout`. So a burst of queries for that many distinct expired
-names at once costs twice the ceiling in workers, and a quarter leaves half the
-pool for the clients that are not waiting on any of this.
+names at once costs twice the ceiling in flight, and a quarter leaves half the
+bound for the clients that are not waiting on any of this.
 
 Well above what a healthy upstream needs, which is the case that decides whether
 the fraction is too small: a refresh against a resolver that is answering is
@@ -210,16 +214,22 @@ over in milliseconds, so the slots turn over hundreds of times a second and a
 query finds one free. It is the unhealthy case that holds them, and holding
 fewer of them is the point.
 
-Never zero, so a single-worker pool still refreshes one name at a time rather
-than serving expired data for as long as the entry is kept.
+Never zero, so a server allowed a handful in flight still refreshes one name at
+a time rather than serving expired data for as long as the entry is kept; and
+`REFRESH_SLOTS` where `max_pending` sets no bound, which is a `Server` built as a
+literal.
 
-`ponytail: a flat fraction of the workers. A figure worth deriving from the
-upstream timeout and the deadline - how many refreshes one worker retires per
-second - only once somebody has a pool this starves.`
+`ponytail: a flat fraction of the queries in flight. A figure worth deriving
+from the upstream timeout and the deadline - how many refreshes one slot retires
+per second - only once somebody has a server this starves.`
 */
 @(private)
 refresh_ceiling :: proc(s: ^Server) -> int {
-	return clamp(pool.worker_count(s.handler_pool) / 4, 1, REFRESH_SLOTS)
+	limit := live(s).cfg.server.max_pending
+	if limit <= 0 {
+		return REFRESH_SLOTS
+	}
+	return clamp(limit / 4, 1, REFRESH_SLOTS)
 }
 
 /*
@@ -227,9 +237,10 @@ Start a refresh for `key`, or report that this query is not the one to run it.
 
 Nil is returned for every reason a client should stop waiting and take the
 expired bytes it is holding: a refresh for this key is already running, the
-ceiling is reached, the pool has no room for the job or is shutting down, or
-there is no pool at all - which is a `Server` built as a literal, where the
-only honest thing left to do is what this server did before the timer existed.
+ceiling is reached, `max_pending` is reached or the server is shutting down, or
+there is nowhere to run one at all - which is a `Server` built as a literal and
+driven from a test's own thread, where the only honest thing left to do is what
+this server did before the timer existed.
 
 The caller owns the reference that comes back and releases it with
 `refresh_release`, whether or not it waited for the answer.
@@ -246,7 +257,7 @@ start_refresh :: proc(
 	prefetch := false,
 	serial: u64 = 0,
 ) -> ^Refresh {
-	if s.handler_pool == nil {
+	if !can_detach(s) {
 		return nil
 	}
 	ceiling := refresh_ceiling(s)
@@ -294,9 +305,10 @@ start_refresh :: proc(
 	s.refreshes.slots[free_slot] = r
 	sync.mutex_unlock(&s.refreshes.mu)
 
-	if pool.try_submit(s.handler_pool, refresh_job, r, live(s).cfg.server.max_pending) != .Accepted {
+	if submit_query(s, refresh_job, r, live(s).cfg.server.max_pending) != .Accepted {
 		/*
-		The backlog is full or the pool is stopping, so nothing will run this.
+		The server has as many queries in flight as it takes, or is stopping, so
+		nothing will run this.
 		The table's reference, the job's and the caller's all go here - the
 		caller is handed nil and has nothing left to release.
 		*/
@@ -314,7 +326,7 @@ waiting on the answer.
 
 The caller has the entry's claim (`cache.Hit.prefetch`) and is serving its bytes
 now. Every reason `start_refresh` declines - a refresh for this key already
-running, the ceiling reached, the pool full or stopping - leaves the entry to
+running, the ceiling reached, `max_pending` reached or stopping - leaves the entry to
 expire as it would have without prefetching, which is also what a failed
 prefetch comes to: the claim is spent either way, so neither is tried again for
 this entry.
@@ -401,9 +413,7 @@ refresh_take :: proc(
 	finished := r.done
 	sync.mutex_unlock(&r.mu)
 	if !finished {
-		pool.blocking_begin()
-		finished = sync.sema_wait_with_timeout(&r.sema, timeout)
-		pool.blocking_end()
+		finished = loop.sema_wait_with_timeout(&r.sema, timeout)
 	}
 	if !finished {
 		return nil, .Failed, 0, false
@@ -423,13 +433,14 @@ refresh_take :: proc(
 refresh_job :: proc(data: rawptr) {
 	r := cast(^Refresh)data
 	/*
-	The same arena discipline as `udp_job` and `race_worker`: a pool worker runs
-	for the life of the process, every decode below takes scratch out of this
-	thread's arena, and the arena chains a new block rather than reusing the old
-	one. The answer is copied onto the heap before this runs, since the waiter
-	may read it after the frame this was built in is gone.
+	The same scratch discipline as `udp_job` and `race_worker`: every decode
+	below takes scratch out of this fiber's, which is freed as it returns. The
+	answer is copied onto the heap before then, since the waiter may read it
+	after the frame this was built in is gone.
 	*/
 	s := r.server
+	// Last of all, after the refresh has let go of everything it held.
+	defer query_done(s)
 	// Before the deferred block below, so it is still pinned when that runs.
 	pin_scope(s)
 	prefetching = r.prefetch
@@ -467,6 +478,8 @@ refresh_job :: proc(data: rawptr) {
 	so the reading taken from them is too.
 	*/
 	spent: int
+	// Its heavy slot, if it took one, as `handle_query` gives back its own.
+	defer dns.request_release(&spent)
 	msg, derr := dns.decode_message(r.query, context.temp_allocator, &spent)
 	if derr != .None || msg.flags.qr || len(msg.question) != 1 {
 		return
@@ -475,7 +488,7 @@ refresh_job :: proc(data: rawptr) {
 	And the cookie is inspected again, against the same client address and the
 	same bytes, so a server with `cookies.require` on reaches the same verdict
 	here that it reached for the client. Carrying the verdict over instead would
-	be a value read on one thread and used on another for no gain; this is a
+	be a value read on one fiber and used on another for no gain; this is a
 	hash of eight bytes.
 	*/
 	cookie := inspect_cookie(live(s).cookies, msg, r.client)
@@ -493,7 +506,6 @@ refresh_job :: proc(data: rawptr) {
 		r.started,
 		&spent,
 		context.temp_allocator,
-		true,
 		&unanswered,
 		&ede,
 	)
@@ -527,6 +539,6 @@ finish_refresh :: proc(r: ^Refresh) {
 	sync.mutex_lock(&r.mu)
 	r.done = true
 	sync.mutex_unlock(&r.mu)
-	sync.sema_post(&r.sema)
+	loop.sema_post(&r.sema)
 	refresh_release(r)
 }

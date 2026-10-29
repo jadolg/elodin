@@ -188,6 +188,21 @@ opt_int :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^int, path: string)
 }
 
 /*
+A key that is accepted for one release and then refused (see `Retired_Key`): read
+as the integer it always was, so a file with a typo in one still fails here, and
+otherwise only noted, for the warning that names it.
+*/
+@(private)
+retired_int :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node, key: string, which: Retired_Key, path: string) {
+	if yaml.is_null(yaml.get(n, key)) {
+		return
+	}
+	ignored: int
+	opt_int(l, n, key, &ignored, path)
+	cfg.retired += {which}
+}
+
+/*
 A TTL, which RFC 2181 section 8 makes 0 to 2^31-1 seconds: a receiver treats one
 with the top bit set as zero, so a figure past it is not the long TTL it was
 written as but none at all.
@@ -340,9 +355,9 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 		"allow_from",
 		"rate_limit",
 	)
-	opt_int(l, n, "workers", &cfg.server.workers, "server")
-	opt_int(l, n, "upstream_workers", &cfg.server.upstream_workers, "server")
-	opt_int(l, n, "running_workers", &cfg.server.running_workers, "server")
+	retired_int(l, cfg, n, "workers", .Workers, "server")
+	retired_int(l, cfg, n, "upstream_workers", .Upstream_Workers, "server")
+	retired_int(l, cfg, n, "running_workers", .Running_Workers, "server")
 	opt_int(l, n, "max_connections", &cfg.server.max_connections, "server")
 	opt_int(l, n, "max_connections_per_prefix", &cfg.server.max_connections_per_prefix, "server")
 	opt_int(l, n, "max_pending", &cfg.server.max_pending, "server")
@@ -2777,66 +2792,17 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.cache.stale_timeout < 0 {
 		errorf(l, "cache.stale_timeout must not be negative; 0 waits for the upstream instead")
 	}
-	if cfg.server.workers < 0 {
-		errorf(l, "server.workers must not be negative")
-	}
-	if cfg.server.upstream_workers < 0 {
-		errorf(l, "server.upstream_workers must not be negative")
-	}
-	if cfg.server.running_workers < 0 {
-		errorf(l, "server.running_workers must not be negative")
-	}
 	/*
-	Sized before `max_pending` is derived, since that is a multiple of the
-	worker count and would otherwise be derived from a zero.
+	What this machine has, measured once whether or not anything below is left
+	to it: the heavy decode slots are derived from its memory every time, since
+	they are not a key a file can set.
 
 	Done here rather than at startup so that `--check` and the run that follows
 	it agree by construction, and so an operator can see on the machine itself
 	what the file leaves unsaid.
-
-	The machine is measured only when a number left unset needs it: `workers`,
-	`running_workers` or the UDP readers. A racer count derived from a
-	configured `workers` owes nothing to the CPUs or the RAM, and reporting a
-	machine it never consulted would tell an operator their own number came
-	from the hardware.
 	*/
-	if cfg.server.workers == 0 {
-		cfg.server.sizing.machine = probe_machine()
-		cfg.server.workers = derive_workers(cfg.server.sizing.machine)
-		cfg.server.sizing.derived_workers = true
-	}
-	if cfg.server.upstream_workers == 0 {
-		cfg.server.upstream_workers = derive_upstream_workers(cfg.server.workers)
-		cfg.server.sizing.derived_upstream_workers = true
-	}
-	// From the CPUs whether `workers` was derived or not: how many threads the
-	// cores can run is the machine's to say however wide the pool is.
-	if cfg.server.running_workers == 0 {
-		if !cfg.server.sizing.derived_workers {
-			cfg.server.sizing.machine = probe_machine()
-		}
-		cfg.server.running_workers = derive_running_workers(cfg.server.sizing.machine, cfg.server.workers)
-		cfg.server.sizing.derived_running_workers = true
-	}
-	/*
-	And the chain-walk bound, here rather than at start-up for the reason above:
-	`--check` and the run that follows it have to agree, and an operator told to
-	raise a number has to be able to see what it currently is.
-
-	The worker count is settled by now, which is why it is derived after it. See
-	`derive_chain_walks`.
-	*/
-	if cfg.dnssec.max_chain_walks == 0 {
-		cfg.dnssec.max_chain_walks = derive_chain_walks(cfg.server.workers)
-		cfg.server.sizing.derived_chain_walks = true
-	}
-	// The connection transports have threads of their own and as many of them
-	// as `max_connections` allows, so their bound comes from that rather than
-	// from the pool. See `Dnssec_Config.max_connection_walks`.
-	if cfg.dnssec.max_connection_walks == 0 {
-		cfg.dnssec.max_connection_walks = derive_chain_walks(cfg.server.max_connections)
-		cfg.server.sizing.derived_connection_walks = true
-	}
+	cfg.server.sizing.machine = probe_machine()
+	cfg.server.heavy_decodes = derive_heavy_decodes(cfg.server.sizing.machine)
 	/*
 	The UDP readers, sized the same way and reported the same way.
 
@@ -2847,10 +2813,8 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	a mistyped figure under a listener that is off is still a mistake, and one
 	that would surface only when somebody turned the listener on.
 
-	Derived only when it is going to be used, and it measures the machine only
-	if the worker derivation above has not already: a probe whose answer nothing
-	reads would show up in the sizing line as a machine that was consulted about
-	numbers an operator wrote themselves.
+	Derived whether or not UDP is on, since the readers' count is the event
+	loops' count and every listener runs on them.
 	*/
 	if cfg.listeners.udp.readers < 0 {
 		errorf(l, "listeners.udp.readers must not be negative")
@@ -2875,10 +2839,7 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			DEFAULT_UDP_RECEIVE_BUFFER,
 		)
 	}
-	if cfg.listeners.udp.enabled && cfg.listeners.udp.readers == 0 {
-		if !cfg.server.sizing.derived_workers && !cfg.server.sizing.derived_running_workers {
-			cfg.server.sizing.machine = probe_machine()
-		}
+	if cfg.listeners.udp.readers == 0 {
 		cfg.listeners.udp.readers = derive_udp_readers(cfg.server.sizing.machine)
 		cfg.server.sizing.derived_udp_readers = true
 	}
@@ -2974,8 +2935,24 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		)
 	}
 	if cfg.server.max_pending == 0 {
-		cfg.server.max_pending = derive_max_pending(cfg.server.workers)
+		cfg.server.max_pending = derive_max_pending(cfg.server.sizing.machine)
 		cfg.server.sizing.derived_max_pending = true
+	}
+	/*
+	The chain-walk bound, after the figure it is a share of, here rather than
+	at start-up for the reason above: `--check` and the run that follows it have
+	to agree, and an operator told to raise a number has to be able to see what
+	it currently is. See `derive_chain_walks`.
+	*/
+	if cfg.dnssec.max_chain_walks == 0 {
+		cfg.dnssec.max_chain_walks = derive_chain_walks(cfg.server.max_pending)
+		cfg.server.sizing.derived_chain_walks = true
+	}
+	// The connections answer their queries outside `max_pending`, so their bound
+	// comes from `max_connections`. See `Dnssec_Config.max_connection_walks`.
+	if cfg.dnssec.max_connection_walks == 0 {
+		cfg.dnssec.max_connection_walks = derive_chain_walks(cfg.server.max_connections)
+		cfg.server.sizing.derived_connection_walks = true
 	}
 	/*
 	The table itself, refused rather than clamped.
@@ -3034,11 +3011,11 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.dnssec.max_nsec3_iterations < 0 {
 		errorf(l, "dnssec.max_nsec3_iterations must not be negative")
 	}
-	// Zero derives it from `server.workers`. Negative is not "no limit" - the
+	// Zero derives it from `server.max_pending`. Negative is not "no limit" - the
 	// limit is a denial-of-service guard - so it is a mistake worth reporting
 	// rather than reading as one more way of asking for the default.
 	if cfg.dnssec.max_chain_walks < 0 {
-		errorf(l, "dnssec.max_chain_walks must not be negative; 0 derives it from server.workers")
+		errorf(l, "dnssec.max_chain_walks must not be negative; 0 derives it from server.max_pending")
 	}
 	if cfg.dnssec.max_connection_walks < 0 {
 		errorf(

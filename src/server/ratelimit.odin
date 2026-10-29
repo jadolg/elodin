@@ -71,7 +71,7 @@ those four cores, while taking a sixth of the answers from a DoT client in anoth
 prefix that was running its one connection at capacity - with every counter this
 server published reading zero. `bench/results/2026-09-03-handshake-floods.md` is
 that run. So arriving is charged too, one token per accepted connection, spent in
-the accept loop before a thread exists and before `accept_tls` runs, where a
+the accept loop before a fiber exists and before `accept_tls` runs, where a
 refusal costs a prefix compare and a close.
 
 What is still not charged here is *occupancy*: how long a connection is held once
@@ -153,7 +153,7 @@ named, where the same configuration's 500 responses/s implies 0.58 MB/s. Byte fo
 byte that is a loss for the sender, so it is not amplification and never was the
 reason to keep the slip. It is this server made a source of traffic proportional
 to an attack, at an address that never asked, on a figure its operator set to
-500 - and half a million writes a second taken from the one thread reading the UDP
+500 - and half a million writes a second taken from the one loop reading the UDP
 socket, which is what dropped a bystander in an unrelated prefix from 99% of its
 queries answered to 55%. `bench/results/2026-09-03-rate-limit-bystander.md` is
 where both were measured, and `2026-09-03-slip-budget.md` is the same arms with
@@ -294,7 +294,7 @@ handshake settled where the client is and what the budget bounds is work: the
 upstream round trips and the cache churn behind an answer.
 
 `Connection` is the connection itself, one token per accepted arrival, spent in
-the accept loop before a thread exists and before any TLS handshake. What it
+the accept loop before a fiber exists and before any TLS handshake. What it
 bounds is the cost of *getting here*, which is the one load on this server that
 neither of the two above charges and the cheapest one to mount: a client that
 dials, handshakes and hangs up asks nothing, so it spends nothing out of
@@ -303,7 +303,7 @@ dials, handshakes and hangs up asks nothing, so it spends nothing out of
 `Slip` is the truncated answer an over-limit datagram is given instead of nothing,
 which is neither a transport nor an answer: what it bounds is how much traffic an
 attack can have this server aim at the address it named, and how many writes that
-costs the thread reading the UDP socket. It is spent only once `Datagram` is
+costs the loop reading the UDP socket. It is spent only once `Datagram` is
 empty - that is the precondition for a slip at all - so no reply is ever charged
 to both.
 */
@@ -437,13 +437,13 @@ Rate_Limiter :: struct {
 	The bucket table, which has as many callers as there are connections, plus
 	the loops.
 
-	One thread reads the UDP socket, but every TCP, DoT and DoH connection is
-	served on a thread of its own and charges the queries it reads from there, and
-	each of the three accept loops charges the connections it accepts - so a
-	single-reader assumption does not hold for this table.
+	Every event loop reads a UDP socket of its own and serves connections of its
+	own, each of which charges the queries it reads, and the accept loops charge
+	the connections they accept - so a single-reader assumption does not hold
+	for this table.
 	Unlocked, what that costs is not a crash but a limiter that under-counts at
 	exactly the moment it is counting something: `tokens` read, decremented and
-	written back by two threads at once loses one of the two decrements, and
+	written back by two loops at once loses one of the two decrements, and
 	`over` loses slips the same way.
 
 	One mutex for the table rather than one per bucket, or an atomic bucket. The
@@ -659,8 +659,8 @@ rate_bucket :: proc(r: ^Rate_Limiter, client: net.Endpoint, now_ns: i64) -> ^Rat
 Charge one datagram to `client`'s prefix and say what to do with it.
 
 Called from the UDP read loop. `stream_rate_check` is the other half, charging the
-other pool, and the two run from as many threads as there are connections, which is
-why the table is locked - see `lock`.
+other pool, and the two run on every event loop at once, which is why the table
+is locked - see `lock`.
 
 `now` is passed in rather than read here so a test can run a bucket through an
 hour in a few microseconds. Monotonic, because a wall clock stepped backwards by
@@ -746,7 +746,7 @@ prefix already in debt is exactly the one that needs it. See
 The debt is carried in full, with no floor under it, and what that costs is worth
 being plain about. The charge lands after the admission rather than with it, so a
 prefix that had a full bucket can have `capacity` large answers admitted before
-the first of them is billed - the read loop is faster than the workers - and the
+the first of them is billed - the read loop is faster than the answers - and the
 bill for all of them arrives afterwards. The bucket then owes several seconds,
 and the prefix hears nothing until it has paid - longer than the burst itself
 took.
@@ -855,7 +855,7 @@ stream_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick
 /*
 Charge one accepted connection to `client`'s prefix and say whether to serve it.
 
-Called from the accept loop, once per connection, before a thread is created and
+Called from the accept loop, once per connection, before a fiber is started and
 before `accept_tls` runs a handshake. That is the whole point of it: a handshake is
 the expensive part and a refusal at the accept is a prefix compare and a close, so
 the token has to be spent while a refusal is still cheap. A budget checked further
@@ -870,7 +870,7 @@ both.
 What is charged is *arriving*, not being served. A connection this returns `true`
 for and that `conn_spawn` then refuses for want of a slot has still spent its
 token: it arrived, it cost an accept, and the alternative is asking the connection
-table - which walks its thread list and asks the OS about each entry - before the
+table - which walks its whole list to count the prefix's share - before the
 cheaper of the two bounds. Nothing is given back either, since there is nothing to
 give back to: a bucket refills on time and not on outcomes.
 

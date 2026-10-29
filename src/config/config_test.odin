@@ -1065,7 +1065,7 @@ test_allow_from_with_no_value_is_an_error :: proc(t: ^testing.T) {
 		// Last key in the mapping, and with another key after it: the same node
 		// either way, but both are what people actually write.
 		"upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from:\n",
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from:\n  workers: 4\n",
+		"upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from:\n  max_pending: 4\n",
 	}
 	for src in sources {
 		cfg, err := load_string(src, context.temp_allocator)

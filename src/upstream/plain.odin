@@ -4,6 +4,7 @@ import "core:mem"
 import "core:net"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 import "elodin:netx"
 import "elodin:tlsx"
 
@@ -32,9 +33,13 @@ exchange_udp :: proc(
 		return nil, .Dial_Failed
 	}
 	defer net.close(socket)
+	// Non-blocking, so a wait for the answer parks a fiber rather than a loop.
+	if net.set_blocking(socket, false) != nil {
+		return nil, .Dial_Failed
+	}
 	set_socket_timeouts(socket, timeout)
 
-	if _, send_err := net.send_udp(socket, query, endpoint); send_err != nil {
+	if _, send_err := loop.send_udp(socket, query, endpoint); send_err != nil {
 		return nil, .IO_Error
 	}
 
@@ -76,8 +81,11 @@ exchange_udp :: proc(
 	*/
 	rejected := false
 
+	// Datagrams passed over arriving back to back - a spoofed flood at this port -
+	// never let this query park; `loop.recv_udp` yields between them (see
+	// `loop.take_turn`).
 	for arm_receive(socket, deadline) {
-		n, remote, recv_err := net.recv_udp(socket, buf)
+		n, remote, recv_err := loop.recv_udp(socket, buf)
 		if recv_err != nil {
 			// The datagram was larger than the room the query offered, so what
 			// arrived is a prefix of an answer. TCP is where the whole one is.
@@ -139,7 +147,7 @@ arm_receive :: proc(socket: net.UDP_Socket, deadline: time.Tick) -> bool {
 write_all_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> Error {
 	sent := 0
 	for sent < len(buf) {
-		n, err := net.send_tcp(socket, buf[sent:])
+		n, err := loop.send_tcp(socket, buf[sent:])
 		if err != nil || n <= 0 {
 			return .IO_Error
 		}
@@ -152,7 +160,7 @@ write_all_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> Error {
 read_full_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> Error {
 	got := 0
 	for got < len(buf) {
-		n, err := net.recv_tcp(socket, buf[got:])
+		n, err := loop.recv_tcp(socket, buf[got:])
 		if err != nil || n <= 0 {
 			return .IO_Error
 		}

@@ -11,28 +11,6 @@ log:
   file: ""             # empty means stderr
 
 server:
-  # A worker is busy for the whole of an upstream round trip, so throughput on
-  # cache misses is about `workers / upstream_rtt` — roughly 50 qps per worker
-  # against a 20 ms upstream. Every query shares this pool, so too few workers
-  # also delays answers that would have come from the cache. Size it as
-  # `target_qps * upstream_rtt` with headroom, and budget ~0.3 MB of resident
-  # memory per worker a burst reaches — paid from the worker's first query
-  # onward, and kept.
-  #
-  # 0 works it out at startup from the memory this machine has: 128, and
-  # fewer if that many threads would be past a thirty-second of it (42 on a
-  # 1 GiB machine). A container or systemd memory limit counts for more than
-  # what the host has. The numbers it settled on are in the first lines of the
-  # log and in `--check`.
-  workers: 0
-  # How many workers (the pool answering UDP and DoH over HTTP/2) may be on
-  # the CPU at once. A worker waiting on an upstream or on another query is
-  # not counted, so this is about cores, not queries in flight: it keeps cache
-  # hits on a few warm threads instead of waking one per query. 0 is twice
-  # the usable CPUs (the affinity mask and any cgroup CPU limit), or no limit
-  # where they cannot be counted. Raise `workers` for misses, not this.
-  running_workers: 0
-  upstream_workers: 0 # threads used by the "race" strategy; 0 is half of `workers`
   max_connections: 512 # concurrent TCP / DoT / DoH connections
   # How many of those one client may hold. 0 derives half of max_connections,
   # which leaves the rest of the table for everybody else; anything at or above
@@ -50,9 +28,14 @@ server:
   max_connections_per_prefix: 0
   # How long an idle client connection is held; 1ms to 24h.
   client_timeout: 10s
-  # Queries queued or in flight before new ones are dropped. 0 derives it as
-  # `workers * 8`, which keeps the backlog to about eight upstream round trips
-  # whatever the worker count.
+  # Queries in flight at once - every UDP query and DoH/2 request from arrival
+  # to answer - before new ones are dropped (DoH/2: answered 503). A query
+  # waiting on an upstream holds no thread, so this is about memory, not cores:
+  # 0 works it out at startup as an eighth of the memory this machine has over
+  # what one query can come to hold, 64 to 4096 (409 on a 1 GiB machine). A
+  # container or systemd memory limit counts for more than what the host has.
+  # Against a 20 ms upstream, 1000 in flight is 50,000 cache misses a second.
+  # The number it settled on is in the first lines of the log and in `--check`.
   max_pending: 0
   # Account to switch to once the listeners have bound. Binding port 53 is the
   # only privileged thing elodin does; everything after it parses data that came
@@ -134,7 +117,7 @@ server:
   # in N of however much arrives. Uncharged, their number was a fraction of the
   # attack rate with nothing capping it: a flood of two million datagrams a
   # second had this server send half a million truncated answers a second at the
-  # address the flood named, and each of those writes came off the thread reading
+  # address the flood named, and each of those writes came off the loop reading
   # the UDP socket, at every other client's expense. An eighth rather than the
   # whole figure because a truncated answer is an invitation, not an answer: a
   # client that takes it moves to a connection, whose budget a datagram flood
@@ -201,22 +184,25 @@ listeners:
     enabled: true
     address: "0.0.0.0"
     port: 53
-    # Threads reading the socket, each with a socket of its own on this port
-    # (SO_REUSEPORT) and a receive queue of its own. Everything a datagram costs
-    # before the rate limiter sees it happens on the thread that read it, so one
-    # reader is one core's worth of drain rate for the whole server - and past
+    # Event loops, one thread each, and how many sockets read this port: each
+    # loop has a socket of its own (SO_REUSEPORT) with a receive queue of its own,
+    # and serves its share of the TCP, DoT and DoH connections. Everything a
+    # datagram costs before the rate limiter sees it happens on the loop that
+    # read it, so one reader is one core's worth of drain rate for the whole
+    # server - and past
     # that rate the kernel drops datagrams in the receive queue, where no budget
     # here can reach them. Measured on four cores: one reader drains 2.3M
     # datagrams a second, and a flood of two million still cost 4% of arrivals
     # to the queue - see bench/results/2026-09-03-udp-readers.md.
     #
-    # 0 derives one per usable CPU, to eight. It is headroom rather than a
+    # 0 derives one per usable CPU, to eight, and is derived with UDP off as
+    # well, since every listener runs on the loops. It is headroom rather than a
     # defence - a publicly reachable resolver wants a packet filter in front of
     # it - and what the kernel dropped anyway is counted in
     # elodin_udp_receive_drops_total and reported in the log.
     readers: 0
     # What each reader asks the kernel to hold for it: the burst that can arrive
-    # while every reader is busy and still be answered. Linux clamps this to
+    # while every loop is busy and still be answered. Linux clamps this to
     # net.core.rmem_max, 208KiB on an untuned machine, and the startup line says
     # what was actually granted.
     receive_buffer: 1MiB
@@ -469,22 +455,21 @@ dnssec:
   max_nsec3_iterations: 100
 
   # Chain-of-trust walks that may be waiting on an upstream at once. The walk
-  # blocks the worker answering the client, once per label of the name being
-  # walked, and how many labels there are is the client's to choose — so without
-  # a bound a flood of fresh names holds every worker. Past this many, a walk
-  # reads the caches and answers SERVFAIL where it would have gone upstream,
-  # which is what an upstream that did not answer already produces.
+  # waits once per label of the name being walked, on behalf of the query it
+  # validates, and how many labels there are is the client's to choose — so
+  # without a bound a flood of fresh names holds every query in flight. Past
+  # this many, a walk reads the caches and answers SERVFAIL where it would have
+  # gone upstream, which is what an upstream that did not answer already
+  # produces.
   #
-  # 0 is server.workers less a reserved quarter of them: the point is to keep
+  # 0 is server.max_pending less a reserved quarter of it: the point is to keep
   # that quarter out of the walk, so it comes back in a round trip rather than
   # in the thirty a walk may take, not to cap what this resolver validates.
   #
-  # This is the bound for UDP and DoH/2, which share the handler pool. TCP, DoT
-  # and DoH/1.1 answer on the connection's own thread and get
-  # max_connection_walks below, counted apart so a flood on one transport
-  # cannot spend the other's allowance. The two defaults differ by an order of
-  # magnitude because the thread counts do, so lowering one does nothing for
-  # the other.
+  # This is the bound for UDP, DoH/2 and cache refreshes, the queries counted in
+  # max_pending. TCP, DoT and DoH/1.1 answer on their connection, outside
+  # max_pending, and get max_connection_walks below, counted apart so a flood on
+  # one transport cannot spend the other's allowance.
   #
   # While it binds, every cold name is SERVFAIL — including names in unsigned
   # zones, since a zone cannot be known to be unsigned without the DS lookup
@@ -492,16 +477,14 @@ dnssec:
   # but not why — a flood, a cold cache after a restart and one black-holing
   # upstream all look the same from in here — so check upstream latency first
   # and raise this if the load turns out to be yours. Lower it to cap the
-  # upstream volume a flood can provoke, which the reservation does not. With strategy: race
-  # a walk also holds one racer job per candidate server, so raise
-  # upstream_workers with the number of upstreams.
+  # upstream volume a flood can provoke, which the reservation does not.
   # max_chain_walks: 0
 
-  # The same for TCP, DoT and DoH/1.1, which answer on the connection's own
-  # thread. 0 is server.max_connections less a reserved quarter — 384 at the
-  # default 512. Set this rather than cutting max_connections when what you want
-  # is less upstream volume: max_connections decides how many clients may
-  # connect at all, which is a price legitimate traffic pays for nothing.
+  # The same for TCP, DoT and DoH/1.1. 0 is server.max_connections less a
+  # reserved quarter — 384 at the default 512. Set this rather than cutting
+  # max_connections when what you want is less upstream volume: max_connections
+  # decides how many clients may connect at all, which is a price legitimate
+  # traffic pays for nothing.
   # max_connection_walks: 0
 
 cookies:

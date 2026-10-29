@@ -1,5 +1,5 @@
 #+build linux
-package pool
+package loop
 
 import "base:runtime"
 import "core:sys/linux"
@@ -37,7 +37,7 @@ test_a_spawned_threads_scratch_is_unmapped_when_it_exits :: proc(t: ^testing.T) 
 	disable_huge_pages()
 	for with_context in ([]bool{false, true}) {
 		probe: Scratch_Probe
-		th := spawn(&probe, use_scratch, context) if with_context else spawn(&probe, use_scratch)
+		th := spawn_thread(&probe, use_scratch, context) if with_context else spawn_thread(&probe, use_scratch)
 		if !testing.expect(t, th != nil, "no thread") {
 			return
 		}

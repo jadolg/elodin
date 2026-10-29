@@ -92,7 +92,7 @@ Entry :: struct {
 	Which entry this is, counted up once per insert and never reused.
 
 	`note_checked` writes to an entry a caller read some microseconds earlier, and
-	between the two the key may have been replaced by another worker's answer.
+	between the two the key may have been replaced by another query's answer.
 	Without something to tell the two apart, that write would put one answer's
 	verdict on another answer's bytes - and if the replacement was stored under
 	older rules than the writer's, the entry would then be trusted under rules
@@ -734,7 +734,7 @@ credited to the set that replaced it while the caller was busy.
 
 `serial` is the one `get` handed back with the bytes, and nothing is written
 unless the entry under this key is still that one. The key alone would not do:
-another worker may have replaced the answer in between, and stamping its bytes
+another query may have replaced the answer in between, and stamping its bytes
 with a verdict reached on the bytes they displaced is how an answer nobody
 matched comes to look as though somebody had.
 */
@@ -754,12 +754,12 @@ note_checked :: proc(c: ^Cache, key: string, serial: u64, checked: u64, refused:
 	A caller reads its number, spends some microseconds deciding, and writes it
 	back here. Two of them can interleave: the one that read the older number can
 	be the one that writes last, and it would then put the stamp back to a number
-	another worker has already moved past - re-arming `recheck` for every hit
+	another query has already moved past - re-arming `recheck` for every hit
 	until somebody walks the entry again and wins the race. It settles itself on
 	the next hit, so what this costs is work rather than correctness, but the
 	guard is a comparison.
 
-	Equality is not an update either: two workers stamping the same number agree
+	Equality is not an update either: two queries stamping the same number agree
 	about the verdict by construction, having decided under the same rules.
 	*/
 	if checked <= e.checked {
@@ -773,7 +773,7 @@ note_checked :: proc(c: ^Cache, key: string, serial: u64, checked: u64, refused:
 Drop an entry a caller has decided is of no use to it.
 
 Guarded by `serial` for the same reason `note_checked` is: between the caller
-reading the bytes and reaching this, another worker's answer may have taken the
+reading the bytes and reaching this, another query's answer may have taken the
 key, and dropping that one would throw away a good entry on the strength of a
 verdict about bytes it has nothing to do with.
 
