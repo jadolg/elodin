@@ -236,6 +236,14 @@ description = "Run the integration suite against an AddressSanitizer build and f
 depends = ["prepare"]
 run = "scripts/leak-check.sh"
 
+# Not a benchmark: does the optimised binary survive sustained load on every
+# transport, give its memory back and shut down cleanly? CI runs it on every
+# architecture it builds for; see the script for what fails it.
+[tasks.load-smoke]
+description = "Put the release build under load on every transport and fail if it breaks"
+depends = ["release"]
+run = "scripts/load-smoke.sh"
+
 [tasks.verify]
 description = "Everything: type-check, unit tests, integration tests"
 depends = ["check", "test", "itest"]

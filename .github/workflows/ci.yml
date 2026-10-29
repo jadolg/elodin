@@ -104,6 +104,39 @@ jobs:
           cache: true
       - run: mise run parity-regression
 
+  load:
+    name: Load (${{ matrix.arch }})
+    # The optimised binary under sustained load on every transport, on every
+    # architecture a release ships for: a server that stops answering, leaks,
+    # spins when idle or cannot stop fails here rather than in production. The
+    # thresholds are loose on purpose (see scripts/load-smoke.sh).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install OpenSSL headers and jq
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev jq
+      - uses: jdx/mise-action@v5
+        with:
+          install: true
+          cache: true
+      - run: mise run load-smoke
+        env:
+          LOAD_WORK: ${{ runner.temp }}/load-smoke
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: load-smoke-${{ matrix.arch }}
+          path: ${{ runner.temp }}/load-smoke
+
   build:
     name: Build (${{ matrix.arch }})
     strategy:
