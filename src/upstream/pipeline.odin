@@ -456,9 +456,10 @@ answers a second this keeps 62% of them answered against 37% with no gate, and
 at twenty 19% against 3.5%; all of what is left rather than half kept fewer
 answered than half did.
 
-Only on replies fresh enough to describe the queue now, the newest no older
-than the connection's timeout, and never for a query with no time left, which
-goes on and fails as the timeout it is.
+Only on replies fresh enough to describe the queue now: the newest no older
+than the connection's timeout, and none of them before a gap that long, since
+`pipe_note_wait` starts the window afresh after one. Never for a query with no
+time left, which goes on and fails as the timeout it is.
 */
 @(private)
 pipe_backlogged :: proc(c: ^Pipe_Conn, left: time.Duration) -> bool {
@@ -505,10 +506,16 @@ pipe_admit :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, left: time.Duration)
 Note how long the reply just read waited, `answered` when its caller was still
 there to take it. Called with `c.mu`. Only an answered one can lower the floor:
 one nobody waits for is sampled as the whole timeout, not as what it took.
+
+A window whose newest reply is older than the timeout describes a queue long
+gone, so it is emptied first: one slow name after a quiet spell is not eight.
 */
 @(private)
 pipe_note_wait :: proc(c: ^Pipe_Conn, waited: time.Duration, answered: bool) {
 	b := &c.backlog
+	if time.tick_since(b.at) >= c.timeout {
+		b.waited = {}
+	}
 	b.waited[b.next] = waited
 	b.next = (b.next + 1) % PIPE_BACKLOG_SAMPLES
 	b.at = time.tick_now()
@@ -1140,13 +1147,17 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 	c.silent = 0
 
 	w, waiting := c.waiters[id]
+	matches := waiting && response_matches(w.query, msg)
 	// One nobody is waiting for any more waited longer than its caller had,
-	// and the connection's whole timeout stands for that.
+	// and the connection's whole timeout stands for that. One that does not
+	// answer its query is sampled but sets no floor: a server answering the
+	// wrong question quickly says nothing about how fast it answers the right
+	// one.
 	waited := c.timeout
 	if waiting {
 		waited = time.tick_since(w.asked)
 	}
-	pipe_note_wait(c, waited, waiting)
+	pipe_note_wait(c, waited, matches)
 	if !waiting {
 		// Nobody is on this ID: an answer to a query that has already given
 		// up, or one nobody asked. Dropped rather than treated as a failure -
@@ -1156,7 +1167,7 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 		return
 	}
 	delete_key(&c.waiters, id)
-	if !response_matches(w.query, msg) {
+	if !matches {
 		// The refusal of a reply that did not answer the query it was sent: on a
 		// stream there is no off-path packet to pass over, so this is the server
 		// contradicting itself.

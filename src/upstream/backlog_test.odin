@@ -75,11 +75,17 @@ test_a_backlog_is_judged_on_every_recent_reply :: proc(t: ^testing.T) {
 	defer free_conn(s.c)
 	s.c.backlog.at = time.tick_add(time.tick_now(), -s.c.timeout)
 	testing.expect(t, !pipe_backlogged(s.c, left), "a stale backlog shut the gate")
+	// Nor do they once one fresh slow reply lands among them: a slow name
+	// after a quiet spell is one name, not a queue.
+	pipe_note_wait(s.c, left, true)
+	testing.expect(t, !pipe_backlogged(s.c, left), "one fresh slow reply among stale ones shut the gate")
 
-	// Fewer slow replies than the window are not a queue.
+	// Fewer slow replies than the window are not a queue, above a floor they
+	// are well clear of.
 	f := new(Pipe_Conn)
 	defer free_conn(f)
 	f.timeout = time.Second
+	f.backlog.floor = floor
 	f.waiters = make(map[u16]^Pipe_Waiter)
 	for _ in 0 ..< PIPE_BACKLOG_SAMPLES - 1 {
 		pipe_note_wait(f, left, true)
@@ -152,12 +158,31 @@ test_a_reply_nobody_waits_for_counts_as_the_whole_timeout :: proc(t: ^testing.T)
 	testing.expect_value(t, c.backlog.waited[newest], c.timeout)
 	testing.expect_value(t, c.backlog.floor, time.Duration(0))
 
+	// A reply that answers some other question, however quickly, sets no
+	// floor: it is sampled, and the caller gets `Bad_Response`.
+	asked := make([]u8, dns.HEADER_SIZE)
+	defer delete(asked)
+	asked[0], asked[1] = 0x00, 0x66
+	wrong := Pipe_Waiter {
+		query = asked,
+		asked = time.tick_now(),
+	}
+	c.waiters[0x66] = &wrong
+	unanswered := make([]u8, dns.HEADER_SIZE)
+	// No QR bit: not a response at all.
+	unanswered[0], unanswered[1] = 0x00, 0x66
+	pipe_deliver(c, unanswered)
+	testing.expect_value(t, wrong.err, Error.Bad_Response)
+	testing.expect_value(t, c.backlog.floor, time.Duration(0))
+
+	asked[0], asked[1] = 0x00, 0x55
 	w := Pipe_Waiter {
+		query = asked,
 		asked = time.tick_add(time.tick_now(), -200 * time.Millisecond),
 	}
 	c.waiters[0x55] = &w
 	mine := make([]u8, dns.HEADER_SIZE)
-	mine[0], mine[1] = 0x00, 0x55
+	mine[0], mine[1], mine[2] = 0x00, 0x55, 0x80
 	pipe_deliver(c, mine)
 	newest = (c.backlog.next + PIPE_BACKLOG_SAMPLES - 1) % PIPE_BACKLOG_SAMPLES
 	got := c.backlog.waited[newest]
