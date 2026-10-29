@@ -304,7 +304,6 @@ special_use: {{private_reverse: false}}
 	}
 	end_case(r)
 
-	start_case(r, "dnssec: the walk passes a name owning a CNAME its parent signed")
 	{
 		/*
 		Issue #552: `seed.bitcoin.sipa.be.` and its like. The walk's DS question
@@ -314,33 +313,22 @@ special_use: {{private_reverse: false}}
 		A CNAME the parent did not sign proves nothing, so the same walk through
 		those is still DNSSEC Bogus.
 		*/
+		name :: "dnssec: the walk passes a name owning a CNAME its parent signed"
 		cut_port := next_port(r)
 		cut_mock := mock_make("dnssec-cname-cut", cut_port)
 		for f in CNAME_CUT_FIXTURES {
 			mock_reply(cut_mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
 		}
-		for name in ([]string{"seed.alias.cntest.", "x.bare.cntest.", "x.wild.cntest.", "x.stray.cntest."}) {
-			mock_synth(cut_mock, name, u16(dns.Type.A), {192, 0, 2, 1})
+		for qname in ([]string{"seed.alias.cntest.", "x.bare.cntest.", "x.wild.cntest.", "x.stray.cntest."}) {
+			mock_synth(cut_mock, qname, u16(dns.Type.A), {192, 0, 2, 1})
 		}
-		if mock_start(cut_mock) {
+		if !mock_start(cut_mock) {
+			skip_case(r, name, "cannot start the mock upstream")
+		} else {
 			defer mock_stop(cut_mock)
+			start_case(r, name)
 			cut_udp := next_port(r)
-			config := fmt.tprintf(
-				`listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  servers: [udp://127.0.0.1:%d]
-cache: {{enabled: false}}
-blocking: {{enabled: false}}
-dnssec:
-  enabled: true
-  trust_anchors: [%q]
-`,
-				cut_udp,
-				cut_port,
-				CNAME_CUT_ANCHOR,
-			)
+			config := dnssec_config(r, cut_udp, cut_port, fmt.tprintf("  trust_anchors: [%q]\n", CNAME_CUT_ANCHOR))
 			cut, started := start_server(r, Server_Options{config = config, udp_port = cut_udp})
 			if started {
 				defer stop_server(&cut)
@@ -363,11 +351,9 @@ dnssec:
 					}
 				}
 			}
-		} else {
-			check(r, false, "cannot start the mock upstream")
+			end_case(r)
 		}
 	}
-	end_case(r)
 
 	start_case(r, "dnssec: a refused answer carries an extended DNS error")
 	{

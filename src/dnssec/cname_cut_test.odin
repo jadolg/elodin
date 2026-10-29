@@ -12,8 +12,8 @@ The walk asks for a DS at every label down to the queried name, and a name that
 owns a CNAME answers that question with the CNAME - followed, by a resolver, to
 its target, so the authority section carries the target's proof and says
 nothing about the name asked for. `bitcoin.sipa.be.`, `dnsseed.bluematt.me.`,
-`ing.ingdirect.es.` and `outlook.office.com.` all answer this way, and every
-name at or under them came back Bogus.
+`ing.ingdirect.es.` and `outlook.office.com.` all answer this way, and the
+parent's signature over the CNAME is what says the name is no cut.
 
 Generated - `testdata/gen/sign_fixtures.py`, scenario
 `ds_question_answered_by_cname`. Ed25519 throughout, root replaced by a trust
