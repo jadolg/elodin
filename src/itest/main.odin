@@ -280,6 +280,7 @@ main :: proc() {
 	run_upstream_transport_cases(&r)
 	run_upstream_header_cases(&r)
 	run_stale_connection_cases(&r)
+	run_tc_backlog_cases(&r)
 	run_query_id_cases(&r)
 
 	if cert_ok {

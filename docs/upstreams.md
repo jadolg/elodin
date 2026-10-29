@@ -127,7 +127,16 @@ that; `cookies.upstream: false` is the test, and the fix if it is.
 ## Connections
 
 - `tcp://` and `tls://` upstreams pipeline every query onto one shared
-  connection (RFC 7766 section 6.2.1.1).
+  connection (RFC 7766 section 6.2.1.1), and so does a `udp://` upstream's TCP
+  retry of a truncated answer.
+- When the last eight replies on that connection all waited at least half of
+  what a new query has left of its `timeout`, the query is not put on it and
+  fails at once as `backlogged`. That happens when the path is
+  slower than the answers asked for, most often large answers over a lossy
+  link. Queued queries would only time out, and the answers to them would still
+  take up the connection. With nothing outstanding, a query always goes. A
+  `backlogged` failure does not count towards the cooldown, and the group moves
+  on to its next member as for any other failure.
 - `https://` picks HTTP/2 or HTTP/1.1 by ALPN, preferring h2, and remembers the
   choice from the first connection. h2 multiplexes onto one connection; HTTP/1.1
   pools up to `max_idle` idle connections.

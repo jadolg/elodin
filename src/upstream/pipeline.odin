@@ -161,6 +161,26 @@ an hour rather than to the uptime.
 */
 PIPE_IDLE_RELEARN :: time.Hour
 
+/*
+How many of a connection's latest replies `pipe_backlogged` judges it by.
+
+A queue on a byte stream holds up every message behind it, so a standing one
+shows in every reply; a slow name holds up only its own, since a server may
+answer out of order (RFC 7766 section 7). Eight in a row all slow is a queue,
+and one is a name.
+*/
+PIPE_BACKLOG_SAMPLES :: 8
+
+// How long a connection's latest replies waited, newest at `next - 1`.
+@(private)
+Pipe_Backlog :: struct {
+	waited: [PIPE_BACKLOG_SAMPLES]time.Duration,
+	next:   int,
+	taken:  int,
+	// When the newest was taken.
+	at:     time.Tick,
+}
+
 @(private)
 Pipe_Waiter :: struct {
 	/*
@@ -181,6 +201,8 @@ Pipe_Waiter :: struct {
 	// that runs out of time can tell "my reply never came" from "nothing at
 	// all is coming". See `pipe_wait`.
 	seen:  u64,
+	// When it joined the connection, for `Pipe_Backlog`.
+	asked: time.Tick,
 	/*
 	What this waiter parks on, under `Pipe_Conn.mu`: signalled when its reply
 	lands, when the reading is handed to it, and when the connection dies. One
@@ -227,6 +249,7 @@ Pipe_Conn :: struct {
 	// Callers in a row that ran out of time on a connection that had nothing
 	// to say to anybody. Back to zero the moment anything is read off it.
 	silent:    int,
+	backlog:   Pipe_Backlog,
 	/*
 	What this connection was dialled with, and the budget a message half read
 	is finished on.
@@ -389,6 +412,56 @@ pipe_state :: proc(c: ^Pipe_Conn, idle_timeout: time.Duration, limit: int) -> Pi
 		return .Full
 	}
 	return .Ready
+}
+
+/*
+Whether a query with `left` to wait would only join a queue it cannot get to
+the front of in time. Called with `c.mu`.
+
+One connection carries a server's queries (RFC 7766 section 6.2.2), and on a
+lossy path its window shrinks to a few segments, so the answers it can carry
+a second can fall below the answers asked for (issue #551). Past that point
+everything put on it waits behind everything before it. A caller that gives up
+does not take its answer off the stream - the server sends it anyway - so a
+queue longer than the timeout spends the connection on answers nobody reads,
+and nearly every query fails, where turning the excess away keeps the rest
+answered.
+
+So a query is not put on a connection whose last `PIPE_BACKLOG_SAMPLES`
+replies all waited at least half of what it has left. Half rather than all of
+it, because those replies describe the queue as it stood when they were asked,
+and under too much load it has grown since; the other half is room for that
+growth and for a stall of the stream, where one retransmission holds up every
+message behind it. On the path #551 was measured on, at ten truncated answers a
+second, half keeps 43-62% of them answered, all of it 32%, and no limit 22%.
+
+Judged only while something is on it - with nothing outstanding there is no
+queue to wait behind, and that query is the probe whose answer says whether
+the queue has gone - and only on replies fresh enough to describe the queue
+now: the newest no older than the connection's timeout.
+*/
+@(private)
+pipe_backlogged :: proc(c: ^Pipe_Conn, left: time.Duration) -> bool {
+	b := &c.backlog
+	if len(c.waiters) == 0 || b.taken < PIPE_BACKLOG_SAMPLES || time.tick_since(b.at) >= c.timeout {
+		return false
+	}
+	for waited in b.waited {
+		if waited < left / 2 {
+			return false
+		}
+	}
+	return true
+}
+
+// Note how long the reply just read waited. Called with `c.mu`.
+@(private)
+pipe_note_wait :: proc(c: ^Pipe_Conn, waited: time.Duration) {
+	b := &c.backlog
+	b.waited[b.next] = waited
+	b.next = (b.next + 1) % PIPE_BACKLOG_SAMPLES
+	b.taken = min(b.taken + 1, PIPE_BACKLOG_SAMPLES)
+	b.at = time.tick_now()
 }
 
 @(private)
@@ -711,6 +784,10 @@ pipe_query :: proc(
 		sync.mutex_unlock(&c.mu)
 		return nil, err
 	}
+	if pipe_backlogged(c, time.tick_diff(time.tick_now(), deadline)) {
+		sync.mutex_unlock(&c.mu)
+		return nil, .Backlogged
+	}
 	id, taken := pipe_take_id(c)
 	if !taken {
 		sync.mutex_unlock(&c.mu)
@@ -718,6 +795,7 @@ pipe_query :: proc(
 	}
 	dns.set_id_in_place(asked, id)
 	w.seen = c.replies
+	w.asked = time.tick_now()
 	c.waiters[id] = &w
 	sync.mutex_unlock(&c.mu)
 
@@ -1009,6 +1087,13 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 	c.silent = 0
 
 	w, waiting := c.waiters[id]
+	// One nobody is waiting for any more waited longer than its caller had,
+	// and the connection's whole timeout stands for that.
+	waited := c.timeout
+	if waiting {
+		waited = time.tick_since(w.asked)
+	}
+	pipe_note_wait(c, waited)
 	if !waiting {
 		// Nobody is on this ID: an answer to a query that has already given
 		// up, or one nobody asked. Dropped rather than treated as a failure -
