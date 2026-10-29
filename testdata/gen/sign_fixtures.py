@@ -1505,6 +1505,58 @@ def cname_denial():
 
 
 @scenario
+def ds_question_answered_by_cname():
+    """Cover a walk whose DS question lands on a CNAME the parent signed."""
+    # Issue #552. `alias.cntest.` owns a CNAME, so the walk's DS question for it
+    # comes back as that CNAME and, behind it, the proof for its target - which
+    # is the shape `bitcoin.sipa.be.` and `outlook.office.com.` really send. A
+    # CNAME owner holds no NS (RFC 1034 section 3.6.2, RFC 2181 section 10.1) and
+    # a parent signs nothing at a cut but DS and NSEC (RFC 4035 section 2.2), so
+    # the parent's signature over it says the name is no cut. `seed.alias.cntest.`
+    # under it is an unsigned delegation, as `seed.bitcoin.sipa.be.` is. The
+    # others are the CNAMEs that must not say so: unsigned, signed as a wildcard
+    # expansion, and signed by a key the parent never published.
+    root = Key(".", "cn-root")
+    zone = Key("cntest.", "cn-zone")
+    stranger = Key("cntest.", "cn-stranger")
+
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("cn_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+    ds_set = [RR("cntest.", DS, zone.ds())]
+    emit("cn_ds", "cntest.", "DS", message("cntest.", DS, ds_set + [sign(ds_set, root)]))
+    keys = [RR("cntest.", DNSKEY, zone.rdata)]
+    emit("cn_dnskey", "cntest.", "DNSKEY", message("cntest.", DNSKEY, keys + [sign(keys, zone)]))
+
+    # The resolver follows the CNAME, so the proof in the authority section is
+    # the target's NODATA and says nothing about `alias.cntest.` itself.
+    target_nodata = cd_soa(zone) + cd_nsec(zone, "zps.cntest.", "cntest.", [A, RRSIG, NSEC])
+    emit("cn_alias_ds", "alias.cntest.", "DS",
+         message("alias.cntest.", DS, cd_cname(zone, "alias.cntest.", "zps.cntest."), target_nodata))
+
+    # `ing.ingdirect.es.`'s shape: the chain ends in an unsigned zone, so all the
+    # authority section holds is that zone's SOA and nothing the parent signed.
+    emit("cn_lone_ds", "lone.cntest.", "DS",
+         message("lone.cntest.", DS, cd_cname(zone, "lone.cntest.", "edge.example."),
+                 [soa_rr("example.")]))
+
+    seed_nsec = cd_nsec(zone, "seed.alias.cntest.", "zps.cntest.", [NS, RRSIG, NSEC])
+    emit("cn_seed_ds", "seed.alias.cntest.", "DS",
+         message("seed.alias.cntest.", DS, [], cd_soa(zone) + seed_nsec))
+    emit("cn_seed_answer", "seed.alias.cntest.", "A",
+         message("seed.alias.cntest.", A, [a_rr("seed.alias.cntest.", "192.0.2.1")]))
+
+    bare = [RR("bare.cntest.", CNAME, wire_name("zps.cntest."))]
+    emit("cn_bare_ds", "bare.cntest.", "DS", message("bare.cntest.", DS, bare, target_nodata))
+    wild = [RR("wild.cntest.", CNAME, wire_name("zps.cntest."))]
+    emit("cn_wild_ds", "wild.cntest.", "DS",
+         message("wild.cntest.", DS, wild + [sign(wild, zone, labels=1)], target_nodata))
+    stray = [RR("stray.cntest.", CNAME, wire_name("zps.cntest."))]
+    emit("cn_stray_ds", "stray.cntest.", "DS",
+         message("stray.cntest.", DS, stray + [sign(stray, stranger)], target_nodata))
+
+
+@scenario
 def anchor_below_the_root():
     """Cover an internally signed zone trusted through an anchor of its own."""
     # Issue #226. `corp.` is signed with a key the parent never vouched for: the

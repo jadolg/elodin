@@ -3938,6 +3938,30 @@ zone_step :: proc(
 		return .Secure, child_keys
 	}
 
+	/*
+	No DS, but a CNAME at the name itself, which is how a name that owns one
+	answers every type it does not hold (issue #552). A CNAME owner holds no NS
+	(RFC 1034 section 3.6.2, RFC 2181 section 10.1), and a parent signs nothing
+	at a cut but the DS and NSEC it is authoritative for (RFC 4035 section 2.2),
+	so the parent's own signature over it, made at this name and not expanded
+	from a wildcard, says the name is data in the parent's zone: no DS, no cut.
+	The authority section is no help here - a resolver follows the CNAME, so
+	the proof it carries is the target's. Unbound reads it the same way
+	(`ds_response_to_ke`), and refuses the CNAME `verified_rrset` refuses.
+
+	A replayed CNAME from before a delegation existed can only keep the walk on
+	the parent's keys, which the child's signatures then fail: Bogus, never
+	Insecure.
+	*/
+	cname, _, cname_sig, cname_ok, cname_spent := verified_rrset(budget, msg.answer, child, .CNAME, class, parent, parent_keys, unix, allocator)
+	if cname_spent {
+		return walk_gave_up(budget, exhausted_reason(budget)), nil
+	}
+	if cname_ok {
+		non_cut_remember(v, child, min(rrset_ttl(cname), cname_sig.original_ttl), now, sig_lapses(cname_sig, unix))
+		return .No_Cut, nil
+	}
+
 	// No DS in the answer. The authority section has to say why, and say it in
 	// a form the parent signed.
 	// Nothing here reaches a client - this is our own DS lookup - so which
