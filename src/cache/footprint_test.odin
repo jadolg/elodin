@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:sync"
+import "core:sys/posix"
 import "core:testing"
 import "core:time"
 import "elodin:loop"
@@ -36,6 +37,16 @@ resident_allocator :: proc(r: ^Resident) -> mem.Allocator {
 	return {procedure = resident_proc, data = r}
 }
 
+// What the block at `p`, from Odin's heap allocator, takes from the C heap.
+@(private = "file")
+chunk :: proc(p: rawptr) -> int {
+	if p == nil {
+		return 0
+	}
+	start := ([^]rawptr)(p)[-1]
+	return int(malloc_usable_size(start)) + size_of(uint)
+}
+
 @(private)
 resident_proc :: proc(
 	data: rawptr,
@@ -48,13 +59,6 @@ resident_proc :: proc(
 	[]byte,
 	mem.Allocator_Error,
 ) {
-	chunk :: proc(p: rawptr) -> int {
-		if p == nil {
-			return 0
-		}
-		start := ([^]rawptr)(p)[-1]
-		return int(malloc_usable_size(start)) + size_of(uint)
-	}
 	r := (^Resident)(data)
 	#partial switch mode {
 	case .Free, .Resize, .Resize_Non_Zeroed:
@@ -84,8 +88,8 @@ fill :: proc(c: ^Cache, n: int, edns := false) -> (stored: int) {
 }
 
 /*
-`max_bytes` is what the cache holds, with the smallest entries a flood of
-distinct names leaves behind (issue #531).
+`max_bytes` is what the cache holds, give or take glibc's slack, with the
+smallest entries a flood of distinct names leaves behind (issue #531).
 
 An NXDOMAIN with one SOA is a few dozen bytes of wire, so what it costs is
 mostly the five allocations an entry is and its slot in the map - and the count
@@ -109,17 +113,35 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	testing.expectf(t, len_entries(c) < INSERTS, "all %d entries fit in the budget", INSERTS)
 
 	// The Cache itself is the only allocation the count leaves out.
-	held := r.held - (size_of(Cache) + 64)
+	held := r.held - chunk(c)
 	used := bytes_used(c)
-	testing.expectf(t, held <= BUDGET, "the cache holds %d bytes against a %d byte budget", held, BUDGET)
+	/*
+	The budget binds the count, exactly, and eviction stops near it rather than
+	well short. The heap is held to the count rather than to the budget: it is
+	what glibc made of the allocations, which differs run to run by a few hundred
+	bytes either side of the budget, while the count does not. An
+	undercount is what would put the heap past the budget, so it gets a tighter
+	bound than the 2% the count may overstate by: 0.5%, which a count short by
+	8 bytes an entry exceeds, plus a page for the table, which glibc mmaps and
+	rounds up to one - up to 64 KiB on arm64 - and `heap_block` does not model.
+	*/
 	testing.expectf(
 		t,
-		abs(held - used) <= held / 50,
+		used <= BUDGET && used >= BUDGET * 3 / 4,
+		"the cache counts %d bytes against a %d byte budget",
+		used,
+		BUDGET,
+	)
+	testing.expectf(
+		t,
+		used - held <= held / 50,
 		"the cache counts %d bytes and holds %d over %d entries",
 		used,
 		held,
 		len_entries(c),
 	)
+	page := int(posix.sysconf(._PAGESIZE))
+	testing.expectf(t, held - used <= held / 200 + page, "the cache undercounts: %d counted, %d held", used, held)
 }
 
 // An empty cache holds next to nothing, whatever count it is allowed.
@@ -148,7 +170,7 @@ test_reconfigure_shrinks_the_table :: proc(t: ^testing.T) {
 	testing.expectf(t, r.held <= 16 * 1024, "%d bytes held for 10 entries, %d before", r.held, full)
 	testing.expectf(
 		t,
-		abs(r.held - size_of(Cache) - 64 - bytes_used(c)) <= 256,
+		abs(r.held - chunk(c) - bytes_used(c)) <= 256,
 		"the cache counts %d bytes and holds %d",
 		bytes_used(c),
 		r.held,
