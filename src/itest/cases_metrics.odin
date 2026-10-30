@@ -139,7 +139,23 @@ run_metrics_cases :: proc(r: ^Runner) {
 					// one the file derived.
 					check(r, metric_value(page, "elodin_loops") >= 1, "elodin_loops is missing or zero")
 					check(r, strings.contains(page, `elodin_fibers{loop="0"}`), "elodin_fibers is missing from the scrape")
-					check_metric(r, page, "elodin_queries_inflight", 0)
+					/*
+					Waited for rather than read off this scrape: a query's fiber
+					sends the answer and only then counts itself done (`udp_job`),
+					so the scrape can land between the two with the last of the
+					four still counted. Every counter above is settled before the
+					send; this gauge alone is not.
+					*/
+					inflight := -1
+					deadline := time.tick_add(time.tick_now(), 5 * time.Second)
+					for time.tick_diff(time.tick_now(), deadline) > 0 {
+						scrape := http_request(metrics_port, "GET", "/metrics", context.temp_allocator)
+						if inflight = metric_value(string(scrape.body), "elodin_queries_inflight"); inflight == 0 {
+							break
+						}
+						time.sleep(10 * time.Millisecond)
+					}
+					check_eq_int(r, inflight, 0, "elodin_queries_inflight once the four were answered")
 					check(r, metric_value(page, "elodin_queries_inflight_max") >= 64, "elodin_queries_inflight_max is missing or below the derived floor")
 				}
 
