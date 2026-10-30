@@ -1,5 +1,6 @@
 package dns
 
+import "base:runtime"
 import "core:bytes"
 import "core:fmt"
 import "core:hash"
@@ -394,6 +395,58 @@ test_scan_ttl_offsets_returns_no_slack :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(offsets), 1)
 	testing.expect_value(t, track.current_memory_allocated, i64(len(offsets) * size_of(int)))
 	delete(offsets, mem.tracking_allocator(&track))
+}
+
+/*
+When the exact-size copy cannot be had, the list the walk built is returned as
+it is. Nil would read as a message with no TTLs, and the cache would store the
+answer with nothing to count them down.
+*/
+@(test)
+test_scan_ttl_offsets_keeps_its_list_when_the_copy_fails :: proc(t: ^testing.T) {
+	// Lets the first allocation through, the walk's list, and refuses the rest.
+	Second_Fails :: struct {
+		allocs: int,
+	}
+	second_fails :: proc(
+		data: rawptr,
+		mode: mem.Allocator_Mode,
+		size, alignment: int,
+		old_memory: rawptr,
+		old_size: int,
+		loc := #caller_location,
+	) -> (
+		[]byte,
+		mem.Allocator_Error,
+	) {
+		s := (^Second_Fails)(data)
+		if mode == .Alloc || mode == .Alloc_Non_Zeroed {
+			s.allocs += 1
+			if s.allocs > 1 {
+				return nil, .Out_Of_Memory
+			}
+		}
+		return runtime.heap_allocator_proc(nil, mode, size, alignment, old_memory, old_size, loc)
+	}
+
+	m := Message {
+		id         = 9,
+		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
+		answer     = []Record{{name = "example.com.", type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {1, 2, 3, 4}}}},
+		additional = []Record{make_opt(1232, false)},
+	}
+	m.flags.qr = true
+	wire, _, err := encode_message(m, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	testing.expect_value(t, err, Encode_Error.None)
+
+	state: Second_Fails
+	failing := mem.Allocator{procedure = second_fails, data = &state}
+	offsets, ok := scan_ttl_offsets(wire, failing)
+	testing.expect(t, ok, "ttl scan failed")
+	testing.expect_value(t, state.allocs, 2)
+	testing.expect_value(t, len(offsets), 1)
+	delete(offsets, failing)
 }
 
 /*

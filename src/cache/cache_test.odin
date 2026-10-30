@@ -530,14 +530,14 @@ test_cache_holds_to_its_byte_budget :: proc(t: ^testing.T) {
 	)
 
 	/*
-	And the memory itself. The allowance over the budget is what the cache holds
-	that entries do not: the Cache, the map's table, and the slack in the
-	allocations behind each entry.
+	And the memory itself. The budget charges each block as the heap rounds it
+	and the table whole, so what was asked for fits inside it; the Cache itself
+	is the one allocation it leaves out.
 	*/
 	held := track.current_memory_allocated
 	testing.expectf(
 		t,
-		held <= BUDGET + BUDGET / 2,
+		held <= BUDGET + size_of(Cache),
 		"the cache is holding %d bytes of allocations against a %d byte budget",
 		held,
 		BUDGET,

@@ -68,6 +68,21 @@ resident_proc :: proc(
 	return res, err
 }
 
+// Stores NXDOMAINs for `n0.example.` up to `n` and counts how many `put` took.
+@(private = "file")
+fill :: proc(c: ^Cache, n: int, edns := false) -> (stored: int) {
+	kb: [KEY_MAX]u8
+	for i in 0 ..< n {
+		name := fmt.tprintf("n%d.example.", i)
+		wire, msg := build_nxdomain(name, 300, context.temp_allocator, edns = edns)
+		if put(c, key_for(kb[:], name), wire, msg) {
+			stored += 1
+		}
+		free_all(context.temp_allocator)
+	}
+	return
+}
+
 /*
 `max_bytes` is what the cache holds, with the smallest entries a flood of
 distinct names leaves behind (issue #531).
@@ -87,16 +102,8 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 1_000_000, max_bytes = BUDGET, max_ttl = 3600}, resident_allocator(&r))
 	defer destroy(c)
 
-	kb: [KEY_MAX]u8
-	for i in 0 ..< INSERTS {
-		name := fmt.tprintf("n%d.example.", i)
-		wire, msg := build_nxdomain(name, 300, context.temp_allocator, edns = true)
-		testing.expectf(t, put(c, key_for(kb[:], name), wire, msg), "put %d failed", i)
-		if i % 1000 == 0 {
-			free_all(context.temp_allocator)
-		}
-	}
-	free_all(context.temp_allocator)
+	stored := fill(c, INSERTS, edns = true)
+	testing.expect_value(t, stored, INSERTS)
 
 	// The premise: the budget binds, not the count.
 	testing.expectf(t, len_entries(c) < INSERTS, "all %d entries fit in the budget", INSERTS)
@@ -132,16 +139,7 @@ test_reconfigure_shrinks_the_table :: proc(t: ^testing.T) {
 	c := make_cache(opts, resident_allocator(&r))
 	defer destroy(c)
 
-	kb: [KEY_MAX]u8
-	for i in 0 ..< 20_000 {
-		name := fmt.tprintf("n%d.example.", i)
-		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
-		put(c, key_for(kb[:], name), wire, msg)
-		if i % 1000 == 0 {
-			free_all(context.temp_allocator)
-		}
-	}
-	free_all(context.temp_allocator)
+	fill(c, 20_000)
 	full := r.held
 
 	opts.max_entries = 10
@@ -164,16 +162,7 @@ test_sweep_shrinks_the_table :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 1_000_000, max_ttl = 3600}, resident_allocator(&r))
 	defer destroy(c)
 
-	kb: [KEY_MAX]u8
-	for i in 0 ..< 20_000 {
-		name := fmt.tprintf("n%d.example.", i)
-		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
-		put(c, key_for(kb[:], name), wire, msg)
-		if i % 1000 == 0 {
-			free_all(context.temp_allocator)
-		}
-	}
-	free_all(context.temp_allocator)
+	fill(c, 20_000)
 
 	gone := loop.moment_add(loop.moment_now(), -time.Second)
 	for _, e in c.entries {
@@ -226,13 +215,8 @@ test_sweep_shrinks_only_a_mostly_empty_table :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 1_000_000, max_ttl = 3600})
 	defer destroy(c)
 
+	fill(c, ENTRIES)
 	kb: [KEY_MAX]u8
-	for i in 0 ..< ENTRIES {
-		name := fmt.tprintf("n%d.example.", i)
-		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
-		put(c, key_for(kb[:], name), wire, msg)
-		free_all(context.temp_allocator)
-	}
 	full := cap(c.entries)
 
 	// Each dropped by `get` on meeting it expired, so no sweep removes them.
@@ -266,13 +250,7 @@ test_clear_all_shrinks_the_table :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 1_000_000, max_ttl = 3600}, resident_allocator(&r))
 	defer destroy(c)
 
-	kb: [KEY_MAX]u8
-	for i in 0 ..< 20_000 {
-		name := fmt.tprintf("n%d.example.", i)
-		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
-		put(c, key_for(kb[:], name), wire, msg)
-		free_all(context.temp_allocator)
-	}
+	fill(c, 20_000)
 	clear_all(c)
 	testing.expectf(t, r.held <= 4096, "a cleared cache holds %d bytes", r.held)
 }

@@ -21,7 +21,8 @@ rewritten in place on each hit.
   is (up to 64 KiB over a stream transport). Passing either evicts the least
   recently used entries. `max_bytes` is heap: each entry's allocations as the
   allocator rounds them, and the table that indexes them, which grows as entries
-  arrive and is given back by the periodic sweep and by a reload. The smallest
+  arrive and is given back by the periodic sweep and by a reload once it is
+  under a quarter full. The smallest
   entries, an NXDOMAIN for a name nobody asks twice, take close to 500 bytes each,
   so a raised `max_entries` costs nothing until it fills. `cache_bytes=` in the
   stats line and `elodin_cache_bytes` report the same figure.

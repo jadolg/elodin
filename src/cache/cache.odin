@@ -1311,7 +1311,9 @@ thing in both directions.
 // The caller holds `c.mu`.
 @(private)
 evict_over_limits :: proc(c: ^Cache, keep: ^Entry = nil) {
-	for (len(c.entries) > c.max_entries || c.bytes + table_bytes(c) > c.max_bytes) && c.tail != nil && c.tail != keep {
+	// Fixed for the loop: removing a key never resizes the table.
+	table := table_bytes(c)
+	for (len(c.entries) > c.max_entries || c.bytes + table > c.max_bytes) && c.tail != nil && c.tail != keep {
 		remove_entry(c, c.tail)
 		c.stats.evictions += 1
 	}
