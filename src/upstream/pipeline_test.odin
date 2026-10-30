@@ -2230,7 +2230,7 @@ test_a_learned_idle_ceiling_is_forgotten_and_learned_again :: proc(t: ^testing.T
 	// on. Poked rather than waited for, which is the only part of this a test
 	// cannot have for real.
 	sync.mutex_lock(&u.mu)
-	u.idle_learned = time.time_add(u.idle_learned, -(PIPE_IDLE_RELEARN + time.Second))
+	u.idle_learned = time.tick_add(u.idle_learned, -(PIPE_IDLE_RELEARN + time.Second))
 	sync.mutex_unlock(&u.mu)
 
 	_ = close_idle(u)

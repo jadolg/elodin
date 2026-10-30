@@ -118,7 +118,7 @@ get_h2_conn :: proc(
 	ok: bool,
 	err: Error,
 ) {
-	deadline := time.time_add(time.now(), budget)
+	deadline := time.tick_add(time.tick_now(), budget)
 	sync.mutex_lock(&u.mu)
 	for {
 		if u.proto == .H1 {
@@ -137,7 +137,7 @@ get_h2_conn :: proc(
 		// dial one after another and the last returns at a multiple of the
 		// budget it was given. Above the break as well as the wait, since a
 		// caller that wakes to a finished dial goes on to start one of its own.
-		remaining := time.diff(time.now(), deadline)
+		remaining := time.tick_diff(time.tick_now(), deadline)
 		if remaining <= 0 {
 			sync.mutex_unlock(&u.mu)
 			return nil, false, .Timeout
@@ -165,7 +165,7 @@ get_h2_conn :: proc(
 	// already spent waiting for the one in front of it. `dial_pipe` splits the
 	// two for the same reason. Floored, so a caller that is only just inside
 	// its deadline still makes one bounded attempt.
-	stream, proto, derr := negotiate_https(u, max(time.diff(time.now(), deadline), time.Millisecond))
+	stream, proto, derr := negotiate_https(u, max(time.tick_diff(time.tick_now(), deadline), time.Millisecond))
 
 	/*
 	An h2 connection is built here, before `u.mu` is taken again: building it
