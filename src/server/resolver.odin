@@ -1119,8 +1119,8 @@ resolve_query :: proc(
 	refresh does not start another one, which is what keeps `serve_stale` from
 	recursing a query at a time; and where the upstream produces nothing, it
 	reports that here instead of reaching for the entry and counting a client
-	answer against it - the request that started the refresh is holding those
-	bytes and serves them itself. See `refresh.odin`.
+	answer against it - the request that started the refresh is holding that
+	entry and serves it itself. See `refresh.odin`.
 	*/
 	unanswered: ^bool = nil,
 	/*
@@ -1406,12 +1406,12 @@ resolve_query :: proc(
 	RFC 8767 section 5 has a resolver try the refresh first and use expired data
 	only once that attempt has failed, which is what the setting says it does:
 	answer from an expired entry *if the upstream is down*. So a stale hit falls
-	through to the forwarding path exactly as a miss would, and these bytes come
+	through to the forwarding path exactly as a miss would, and the entry comes
 	out below only if that path cannot produce an answer at all.
 
-	They stay valid for as long as they are needed: `cache.get` copies the entry
-	into the per-request arena, which outlives the upstream call and is released
-	only once the response has gone out.
+	Held as the lookup's flags and no bytes: `lend_stale` copies the entry only
+	where it is about to be served, since while the upstream is healthy a copy
+	taken here is up to 64 KB per query that nothing reads.
 	*/
 	stale_hit: Cached_Answer
 
@@ -1462,8 +1462,8 @@ resolve_query :: proc(
 	`log.queries` is on.
 	*/
 	if !msg.flags.rd {
-		if stale_hit.wire != nil {
-			return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+		if lent, found := lend_stale(s, stale_hit, allocator); found {
+			return serve_from_cache(s, lent, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 		}
 		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
 		log_query(s, client, proto, q, .Refused, "rd", started)
@@ -1537,7 +1537,7 @@ resolve_query :: proc(
 	off - or where there is no pool to run the refresh
 	on, which is a `Server` built as a literal. The fall-through is the ordinary
 	forwarding path, expired entry in hand, exactly as it was: the client waits
-	the upstream out and is served what it is holding only once that has failed.
+	the upstream out and is served that entry only once that has failed.
 
 	Those three are the only ways out of this block. Every other reason
 	`start_refresh` declines - a refresh for this key already running, the
@@ -1548,7 +1548,7 @@ resolve_query :: proc(
 	already in flight or the load that is shedding them.
 	*/
 	if unanswered == nil &&
-	   stale_hit.wire != nil &&
+	   stale_hit.stale &&
 	   live(s).cfg.cache.stale_timeout > 0 &&
 	   can_detach(s) {
 		if r := start_refresh(s, key, query, proto, client, limit, started); r != nil {
@@ -2451,7 +2451,7 @@ resolve_query :: proc(
 			/*
 			Unless this call is the detached refresh, which holds nothing and
 			has no client of its own. The request that started it is holding the
-			expired bytes and serves them itself, so saying so is the whole of
+			expired entry and serves it itself, so saying so is the whole of
 			what is left to do here - and the counter and the query-log line go
 			with the answer that client actually gets, rather than being made
 			twice for one query. See `refresh.odin`.
@@ -3030,6 +3030,9 @@ stored_answer :: proc(
 	// Whether this caller starts the refresh `stored.prefetch` hands it; see
 	// `cache.get`.
 	prefetch := false,
+	// The stale fallback being read for serving, which the query's own lookup
+	// already counted; see `lend_stale`.
+	lending := false,
 ) -> (
 	stored: Cached_Answer,
 	found: bool,
@@ -3037,7 +3040,21 @@ stored_answer :: proc(
 	if !live(s).cfg.cache.enabled {
 		return
 	}
-	wire, hit, got := cache.get(live(s).answers, key, allocator, checked_against = generation, prefetch = prefetch)
+	/*
+	No bytes for an expired entry unless they are being lent, nor for one
+	`serve_from_cache` refuses from its flags; see `cache.get`. A copy lacking
+	them is refused there whatever `cloak_refusal_stands` says by then.
+	*/
+	wire, hit, got := cache.get(
+		live(s).answers,
+		key,
+		allocator,
+		checked_against = generation,
+		probe = lending,
+		prefetch = prefetch,
+		copy_stale = lending,
+		copy_refused = !cloak_refusal_stands(s),
+	)
 	if !got {
 		return
 	}
@@ -3054,6 +3071,23 @@ stored_answer :: proc(
 		signed_until = hit.signed_until,
 	}
 	return stored, true
+}
+
+/*
+The expired entry `stale_hit` stands for, copied now that it is to be served.
+
+Read again rather than kept from the lookup, so the copy is taken only by a
+query that serves it. What comes back is the entry as it stands: refreshed in
+the meantime, it is the fresh answer; evicted or past `cache.deadline`, there is
+no fallback, as there would have been none at the lookup. Matched against the
+rule sets as they stand now, since the wait can outlast a list reload.
+*/
+@(private)
+lend_stale :: proc(s: ^Server, stale_hit: Cached_Answer, allocator: mem.Allocator) -> (lent: Cached_Answer, found: bool) {
+	if !stale_hit.stale {
+		return
+	}
+	return stored_answer(s, stale_hit.key, rules_generation(s), allocator, lending = true)
 }
 
 // A live Bogus verdict under `verdict_key`, looked up as a `probe` - see where
@@ -3088,10 +3122,10 @@ No answer from the upstream at all: the expired entry if one is held, SERVFAIL
 if not. Shared by the exchange that failed, the followers of one and the client
 whose `stale_timeout` ran out.
 
-The expired entry was read before the wait, which can outlast its first RRSIG:
-`cache.get` holds a stale copy inside its signatures only at the moment it hands
-it over. So it is read against them again here, and goes out told no more than
-they have left, or not at all once they have lapsed (RFC 4034 section 3.1.5).
+The expired entry is copied here, after the wait, which can outlast its first
+RRSIG: `cache.get` tells the copy no more than its signatures have left and
+`cache.deadline` drops it once they have lapsed, and the copy is read against
+them once more on the way out (RFC 4034 section 3.1.5).
 */
 @(private)
 upstream_failed :: proc(
@@ -3115,11 +3149,8 @@ upstream_failed :: proc(
 	Outcome,
 	bool,
 ) {
-	if stale_hit.wire != nil && stale_usable(stale_hit) {
-		if stale_hit.signed_until != 0 {
-			dns.cap_ttls(stale_hit.wire, cache.signature_left(stale_hit.signed_until, loop.moment_now()))
-		}
-		return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+	if lent, found := lend_stale(s, stale_hit, allocator); found && stale_usable(lent) {
+		return serve_from_cache(s, lent, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 	}
 	count_answer(&s.stats.failed)
 	out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
@@ -3448,7 +3479,9 @@ bytes came out of - needs all seven at once.
 */
 @(private)
 Cached_Answer :: struct {
-	// The stored response, already copied into this request's arena.
+	// The stored response, already copied into this request's arena. Nil for
+	// an expired entry not yet lent and for a refusal that stands; see
+	// `stored_answer`.
 	wire:      []u8,
 	// What the entry is stored under, and which entry it was, so the stamp goes
 	// back on the answer that was looked at rather than on whatever has replaced
@@ -3721,7 +3754,7 @@ serve_from_cache :: proc(
 	names an attacker is interested in. With the verdict recorded, a refused
 	entry costs one walk per reload like any other.
 	*/
-	if !hit.recheck && cloak_refusal_stands(s) {
+	if !hit.recheck && (hit.wire == nil || cloak_refusal_stands(s)) {
 		if verdict := Cloak_Verdict(hit.refused); verdict != .Clear {
 			/*
 			No target, because the entry does not carry one. The name that
