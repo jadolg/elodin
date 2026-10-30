@@ -2,10 +2,12 @@ package server
 
 import "core:mem"
 import "core:testing"
+import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
+import "elodin:loop"
 
 /*
 The answer path copies an entry only where it serves it (issue #532).
@@ -35,6 +37,56 @@ test_a_stale_lookup_copies_nothing_until_it_is_lent :: proc(t: ^testing.T) {
 	testing.expect(t, lfound && lent.stale && lent.wire != nil, "the expired entry was not lent once asked for")
 	// The query's own lookup counted the miss; the lend is not a second one.
 	testing.expect_value(t, cache.stats(answers).misses, u64(1))
+	free_all(context.temp_allocator)
+}
+
+/*
+The lend is matched against the rule sets in force when it is served, not when
+the lookup ran: the wait for the upstream can outlast a list reload, and an
+entry stamped under the old rules would otherwise go out without the re-walk.
+*/
+@(test)
+test_a_stale_lend_reads_the_rules_in_force :: proc(t: ^testing.T) {
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer cache.destroy(answers)
+	cfg: config.Config
+	group := down_upstream()
+	s := stale_server(&cfg, answers, &group)
+	cfg.blocking.enabled = true
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	filter.engine_swap(engine, filter.set_make(), filter.set_make())
+	s.filters = engine
+
+	m := dns.Message {
+		question = []dns.Question{{name = STALE_NAME, type = .A, class = .IN}},
+		answer   = []dns.Record {
+			{name = STALE_NAME, type = .CNAME, class = .IN, ttl = 300, data = dns.Rdata_Name{name = "cdn.example.net."}},
+			{name = "cdn.example.net.", type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {192, 0, 2, 1}}},
+		},
+	}
+	m.flags.qr = true
+	m.flags.ra = true
+	wire, _, enc := dns.encode_message(m, context.temp_allocator)
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
+	kb: [cache.KEY_MAX]u8
+	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
+	before := rules_generation(&s)
+	if !testing.expect(t, enc == .None && derr == .None && cache.put(answers, key, wire, decoded, before), "the answer was not cached") {
+		return
+	}
+	if e, found := answers.entries[key]; found {
+		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
+	}
+
+	held, found := stored_answer(&s, key, before, context.temp_allocator)
+	testing.expect(t, found && held.stale && !held.recheck, "the lookup under the rules it was stored with asked for a re-walk")
+
+	old_block, old_allow := filter.engine_swap(engine, filter.set_make(), filter.set_make())
+	filter.set_destroy(old_block)
+	filter.set_destroy(old_allow)
+	lent, lfound := lend_stale(&s, held, context.temp_allocator)
+	testing.expect(t, lfound && lent.recheck && lent.checked == rules_generation(&s), "the lend was not matched against the reloaded rules")
 	free_all(context.temp_allocator)
 }
 

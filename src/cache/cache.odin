@@ -487,9 +487,9 @@ not act on it leaves it off, since the claim is the entry's one chance.
 `copy_stale` and `copy_refused` say which hits the caller will not read the
 bytes of: an expired entry it forwards past and reads only if the upstream
 fails, and an entry whose recorded refusal is current (`refused` set, no
-`recheck`) that it refuses from the flags alone. Either comes back found, with
-`hit` filled in and `wire` nil. The copy is up to 64 KB taken under `c.mu`, so a
-lookup that throws it away costs every other lookup the wait.
+`recheck`) that it refuses from the flags alone, expired or not. Either comes
+back found, with `hit` filled in and `wire` nil. The copy is up to 64 KB taken
+under `c.mu`, so a lookup that throws it away costs every other lookup the wait.
 */
 get :: proc(
 	c: ^Cache,
@@ -535,7 +535,7 @@ get :: proc(
 	hit.signed_until = e.signed_until
 
 	stale := now > e.expires
-	copies := copy_stale if stale else copy_refused || hit.recheck || e.refused == 0
+	copies := (copy_stale || !stale) && (copy_refused || hit.recheck || e.refused == 0)
 	elapsed := u32(max(0, time.duration_seconds(time.Duration(now - e.inserted))))
 	out: []u8
 	if copies {

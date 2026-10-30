@@ -3079,14 +3079,15 @@ The expired entry `stale_hit` stands for, copied now that it is to be served.
 Read again rather than kept from the lookup, so the copy is taken only by a
 query that serves it. What comes back is the entry as it stands: refreshed in
 the meantime, it is the fresh answer; evicted or past `cache.deadline`, there is
-no fallback, as there would have been none at the lookup.
+no fallback, as there would have been none at the lookup. Matched against the
+rule sets as they stand now, since the wait can outlast a list reload.
 */
 @(private)
 lend_stale :: proc(s: ^Server, stale_hit: Cached_Answer, allocator: mem.Allocator) -> (lent: Cached_Answer, found: bool) {
 	if !stale_hit.stale {
 		return
 	}
-	return stored_answer(s, stale_hit.key, stale_hit.checked, allocator, lending = true)
+	return stored_answer(s, stale_hit.key, rules_generation(s), allocator, lending = true)
 }
 
 // A live Bogus verdict under `verdict_key`, looked up as a `probe` - see where
@@ -3478,7 +3479,9 @@ bytes came out of - needs all seven at once.
 */
 @(private)
 Cached_Answer :: struct {
-	// The stored response, already copied into this request's arena.
+	// The stored response, already copied into this request's arena. Nil for
+	// an expired entry not yet lent and for a refusal that stands; see
+	// `stored_answer`.
 	wire:      []u8,
 	// What the entry is stored under, and which entry it was, so the stamp goes
 	// back on the answer that was looked at rather than on whatever has replaced

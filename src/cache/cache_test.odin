@@ -905,6 +905,10 @@ test_a_lookup_that_will_not_read_the_bytes_takes_no_copy :: proc(t: ^testing.T) 
 	held, stale, sok := get(c, key, none, checked_against = 2, copy_stale = false)
 	testing.expect(t, sok && held == nil && stale.stale, "an expired entry came back without its flag or with bytes")
 
+	// Lent while its refusal stands, an expired entry is refused from the flags too.
+	barred, still, bok := get(c, key, none, checked_against = 2, copy_refused = false)
+	testing.expect(t, bok && barred == nil && still.stale && still.refused == 1, "an expired standing refusal was copied when lent")
+
 	// Asked for, the stale copy is still made, with the short TTL.
 	lent, lend, lok := get(c, key, context.temp_allocator, checked_against = 2)
 	testing.expect(t, lok && lend.stale && len(lent) == len(wire), "the stale copy was not lent")
