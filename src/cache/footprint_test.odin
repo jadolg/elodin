@@ -37,7 +37,7 @@ resident_allocator :: proc(r: ^Resident) -> mem.Allocator {
 }
 
 // What the block at `p`, from Odin's heap allocator, takes from the C heap.
-@(private)
+@(private = "file")
 chunk :: proc(p: rawptr) -> int {
 	if p == nil {
 		return 0
@@ -87,8 +87,8 @@ fill :: proc(c: ^Cache, n: int, edns := false) -> (stored: int) {
 }
 
 /*
-`max_bytes` is what the cache holds, with the smallest entries a flood of
-distinct names leaves behind (issue #531).
+`max_bytes` is what the cache holds, give or take glibc's slack, with the
+smallest entries a flood of distinct names leaves behind (issue #531).
 
 An NXDOMAIN with one SOA is a few dozen bytes of wire, so what it costs is
 mostly the five allocations an entry is and its slot in the map - and the count
@@ -116,10 +116,12 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	used := bytes_used(c)
 	/*
 	The budget binds the count, exactly, and eviction stops near it rather than
-	well short; the heap agrees with the count to 2%. `held` is not held to the
-	budget itself: it is what glibc made of the allocations, which differs run to
-	run on arm64 CI (8 bytes over the budget once, under it on the rerun) while
-	the count does not.
+	well short. The heap is held to the count rather than to the budget: it is
+	what glibc made of the allocations, which differs run to run on arm64 CI by a
+	few hundred bytes either side of the budget, while the count does not. An
+	undercount is what would put the heap past the budget, so it gets a tighter
+	bound than the 2% the count may overstate by: 0.5%, which a count short by
+	8 bytes an entry exceeds.
 	*/
 	testing.expectf(
 		t,
@@ -136,6 +138,7 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 		held,
 		len_entries(c),
 	)
+	testing.expectf(t, held - used <= held / 200, "the cache undercounts: %d counted, %d held", used, held)
 }
 
 // An empty cache holds next to nothing, whatever count it is allowed.
