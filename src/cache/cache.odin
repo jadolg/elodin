@@ -273,8 +273,8 @@ The end of that is the resolver being killed for the memory it took, which on a
 box where elodin is the system resolver takes name resolution with it.
 
 64 MiB is far above what a working set of ordinary answers needs - the default
-ten thousand entries measure about 4.6 MB in practice - and far below what the
-count alone would allow.
+ten thousand entries take a few megabytes in practice, table included - and far
+below what the count alone would allow.
 */
 DEFAULT_MAX_BYTES :: 64 * 1024 * 1024
 
@@ -1311,15 +1311,13 @@ thing in both directions.
 // The caller holds `c.mu`.
 @(private)
 evict_over_limits :: proc(c: ^Cache, keep: ^Entry = nil) {
-	table := table_bytes(c)
-	for (len(c.entries) > c.max_entries || c.bytes + table > c.max_bytes) && c.tail != nil && c.tail != keep {
+	for (len(c.entries) > c.max_entries || c.bytes + table_bytes(c) > c.max_bytes) && c.tail != nil && c.tail != keep {
 		remove_entry(c, c.tail)
 		c.stats.evictions += 1
 		// Removing a key never resizes the table, so it is charged at its peak
 		// until it is shrunk. A reload that lowers `max_bytes` below the table
 		// the old budget grew would otherwise evict every entry to pay for it.
 		shrink_table(c)
-		table = table_bytes(c)
 	}
 }
 
@@ -1506,9 +1504,11 @@ allocator, which is what the cache's allocator is outside tests.
 
 Odin asks malloc for `align - 1` more bytes and a pointer to align the block
 and find its start again; glibc adds its own size word and rounds the chunk to
-16 bytes, with 32 the least it hands out. A block past the mmap threshold is
-rounded to a page instead, which this does not model - under 3% of a block that
-size. Nothing is allocated for nothing.
+16 bytes, with 32 the least it hands out. A block past the mmap threshold - the
+table, from about four thousand slots under the 128 KiB the service file pins -
+is rounded to a page instead, which this does not model: under 3% of a block
+that size with 4 KiB pages, up to half on a 64 KiB-page kernel. Nothing is
+allocated for nothing.
 */
 @(private)
 heap_block :: proc(n: int, align := 8) -> int {
