@@ -164,7 +164,7 @@ Mc_Session :: struct {
 
 @(private = "file")
 run_serve_doh_mc :: proc(d: ^Mc_Session) {
-	serve_doh(d.server, d.conn, "test")
+	serve_doh(d.server, d.conn, "/dns-query")
 }
 
 /*
@@ -406,5 +406,57 @@ test_serve_doh_profile_head_refusal_has_no_body :: proc(t: ^testing.T) {
 	// RFC 9110 8.6: no Content-Length unless it is what GET would have sent.
 	testing.expectf(t, !strings.contains(reply, "Content-Length"), "a reply to HEAD should carry no Content-Length: %q", reply)
 	testing.expect(t, strings.contains(reply, "\r\nAllow: GET\r\n"), "the 405 to HEAD should carry Allow: GET")
+	free_all(context.temp_allocator)
+}
+
+/*
+HEADs refused on the DoH path and off it are headers alone, on a held connection.
+
+The 405 and the 404 are the two refusals a HEAD reaches there that keep the
+connection, so text after either one is read as the next reply (RFC 9112 6.3).
+Pipelined, so the second reply is read exactly where a client reads it.
+*/
+@(test)
+test_serve_doh_head_refusals_have_no_body :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	s := Server {
+		cfg = &cfg,
+	}
+	reply, ok := mc_roundtrip(
+		t,
+		&s,
+		"HEAD /dns-query HTTP/1.1\r\nHost: elodin.local\r\n\r\n" +
+		"HEAD /nope HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\n\r\n",
+	)
+	if !ok {
+		return
+	}
+	head_405, _, head_404 := strings.partition(reply, "HTTP/1.1 404")
+	testing.expectf(t, strings.has_prefix(head_405, "HTTP/1.1 405"), "a HEAD to the DoH path should be a 405: %q", reply)
+	testing.expectf(t, strings.has_suffix(head_405, "\r\n\r\n"), "the 405 to HEAD should end at its fields: %q", reply)
+	testing.expect(t, strings.contains(head_405, "\r\nAllow: GET, POST\r\n"), "the 405 to HEAD should carry Allow: GET, POST")
+	testing.expectf(t, strings.has_suffix(head_404, "\r\n\r\n"), "the 404 to HEAD should end at its fields: %q", reply)
+	testing.expectf(t, !strings.contains(reply, "Content-Length"), "a reply to HEAD should carry no Content-Length: %q", reply)
+	free_all(context.temp_allocator)
+}
+
+/*
+A HEAD the request reader refuses - here for want of a Host (RFC 9112 3.2) - is
+answered with headers alone as well: the reader hands back the method with the
+refusal, so its 400 is not the one place a HEAD still gets content.
+*/
+@(test)
+test_serve_doh_head_reader_refusal_has_no_body :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	s := Server {
+		cfg = &cfg,
+	}
+	reply, ok := mc_roundtrip(t, &s, "HEAD /dns-query HTTP/1.1\r\n\r\n")
+	if !ok {
+		return
+	}
+	testing.expectf(t, strings.has_prefix(reply, "HTTP/1.1 400"), "a HEAD without a Host should be a 400: %q", reply)
+	testing.expectf(t, strings.has_suffix(reply, "\r\n\r\n"), "the 400 to HEAD should end at its fields: %q", reply)
+	testing.expectf(t, !strings.contains(reply, "Content-Length"), "a reply to HEAD should carry no Content-Length: %q", reply)
 	free_all(context.temp_allocator)
 }

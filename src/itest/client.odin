@@ -658,7 +658,8 @@ header_value :: proc(head: string, name: string) -> string {
 		if colon < 0 {
 			return ""
 		}
-		if strings.equal_fold(rest[:colon], name) {
+		// ASCII case only: `strings.equal_fold` folds Unicode, where U+017F is an `s`.
+		if dns.name_equal_fold(rest[:colon], name) {
 			line_end := strings.index(rest, "\r\n")
 			value := rest[colon + 1:] if line_end < 0 else rest[colon + 1:line_end]
 			return strings.trim_space(value)

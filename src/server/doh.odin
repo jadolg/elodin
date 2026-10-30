@@ -289,6 +289,9 @@ answering, and drains what the client had already sent before it does, so that
 the answer is not lost to the RST that closing on unread bytes would send - see
 `http_linger`.
 
+A refusal after the request line is read hands back the method alone, so that
+the refusal to a HEAD can go without content (RFC 9110 9.3.2).
+
 Everything kept in the result but the body is copied out of the reader's buffer
 rather than pointed into it. `http_line` and `http_exact` return views, and every
 read after one of them may grow that buffer - which, past its capacity, means a
@@ -435,7 +438,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			// 400, as Host's is, rather than a media type picked for the check.
 			content_types += 1
 			if content_types > 1 {
-				return {}, 400, false
+				return {method = req.method}, 400, false
 			}
 			req.content_type = hold(value)
 		case dns.name_equal_fold(name, "host"):
@@ -449,12 +452,12 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			*/
 			hosts += 1
 			if hosts > 1 {
-				return {}, 400, false
+				return {method = req.method}, 400, false
 			}
 			// And an invalid one is a 400 too (RFC 9112 3.2): held to what a
 			// host may hold, as `:authority` is on HTTP/2 (#438).
 			if !h2.authority_is_valid(value) {
-				return {}, 400, false
+				return {method = req.method}, 400, false
 			}
 			req.host = hold(value)
 		case dns.name_equal_fold(name, "transfer-encoding"):
@@ -468,7 +471,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	// so an HTTP/1.1 request without one is a 400. HTTP/1.0 predates the field
 	// and is allowed to leave it out.
 	if hosts == 0 && !http_1_0 {
-		return {}, 400, false
+		return {method = req.method}, 400, false
 	}
 
 	if content_length > 0 {
@@ -561,7 +564,14 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 			// place. A `status` of 0 is a request that is not answered at all -
 			// see `read_http_request`.
 			if status != 0 {
-				_ = send_http_error(conn, "doh", status, http_refusal_message(status), false)
+				_ = send_http_error(
+					conn,
+					"doh",
+					status,
+					http_refusal_message(status),
+					false,
+					head = req.method == "HEAD",
+				)
 				// The refused request may have declared a body that was never read,
 				// and the close below would take the answer with it. That body may
 				// also still be arriving, which is what picks the longer of the two
