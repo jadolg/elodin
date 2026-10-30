@@ -15,7 +15,8 @@ Hostname resolution that does not go through the system resolver.
 On a machine where elodin is the system resolver, asking libc to resolve an
 upstream's hostname during startup would come straight back to a server that is
 not listening yet. Bootstrap addresses are queried directly over plain UDP
-instead, and results are cached for BOOTSTRAP_TTL.
+instead, and results are cached for BOOTSTRAP_TTL, at most
+BOOTSTRAP_MAX_ENTRIES names at once.
 */
 
 BOOTSTRAP_TTL :: 1 * time.Hour
@@ -71,7 +72,10 @@ bootstrap_resolve :: proc(
 	}
 
 	sync.mutex_lock(&bootstrap_cache.mu)
-	if entry, found := bootstrap_cache.entries[hostname]; found {
+	// Keyed by the canonical name, which is the name asked: `Hop.example` and
+	// `hop.example.` are one entry, not two of `BOOTSTRAP_MAX_ENTRIES`.
+	key := dns.name_canonical(hostname, context.temp_allocator)
+	if entry, found := bootstrap_cache.entries[key]; found {
 		if loop.moment_since(entry.expires) < 0 {
 			sync.mutex_unlock(&bootstrap_cache.mu)
 			return entry.address, true
@@ -125,8 +129,8 @@ bootstrap_resolve :: proc(
 			// Storing under a key the map already holds keeps the key it has, so
 			// cloning unconditionally would orphan a string every time an expired
 			// entry is refreshed.
-			if hostname in bootstrap_cache.entries {
-				bootstrap_cache.entries[hostname] = entry
+			if key in bootstrap_cache.entries {
+				bootstrap_cache.entries[key] = entry
 			} else if bootstrap_prune(); len(bootstrap_cache.entries) < BOOTSTRAP_MAX_ENTRIES {
 				/*
 				A new key sweeps out the expired ones first, so the map holds
@@ -135,7 +139,7 @@ bootstrap_resolve :: proc(
 				redirect a blocklist download follows is resolved here, under
 				names the list host picks.
 				*/
-				bootstrap_cache.entries[strings.clone(hostname, bootstrap_cache.entries.allocator)] = entry
+				bootstrap_cache.entries[strings.clone(key, bootstrap_cache.entries.allocator)] = entry
 			}
 			sync.mutex_unlock(&bootstrap_cache.mu)
 			return result, true

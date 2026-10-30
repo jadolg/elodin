@@ -1000,9 +1000,9 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	// Expire the entry so the next call takes the refresh path rather than
 	// returning the cached address.
 	sync.mutex_lock(&bootstrap_cache.mu)
-	entry := bootstrap_cache.entries[HOST]
+	entry := bootstrap_cache.entries[HOST + "."]
 	entry.expires = loop.moment_add(loop.moment_now(), -time.Minute)
-	bootstrap_cache.entries[HOST] = entry
+	bootstrap_cache.entries[HOST + "."] = entry
 	sync.mutex_unlock(&bootstrap_cache.mu)
 
 	addr2, ok2 := bootstrap_resolve(servers, HOST)
@@ -1046,12 +1046,18 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	_, ok4 := bootstrap_resolve(servers, "hop3.invalid")
 	testing.expect(t, ok4, "hop3.invalid did not resolve")
 	testing.expect_value(t, len(bootstrap_cache.entries), 1)
-	testing.expect(t, "hop3.invalid" in bootstrap_cache.entries, "the new hostname was swept with the expired")
+	testing.expect(t, "hop3.invalid." in bootstrap_cache.entries, "the new hostname was swept with the expired")
+	// Another spelling of the same name is the same entry.
+	_, ok5 := bootstrap_resolve(servers, "HOP3.Invalid.")
+	testing.expect(t, ok5, "HOP3.Invalid. did not resolve")
+	testing.expect_value(t, len(bootstrap_cache.entries), 1)
 	testing.expect_value(t, len(track.allocation_map), settled)
 
 	// Within the TTL the sweep frees nothing, so the count is capped too: a
 	// name resolved while the map is full is answered and not kept.
-	for i := 1; len(bootstrap_cache.entries) < BOOTSTRAP_MAX_ENTRIES; i += 1 {
+	// Bounded by the cap, so a sweep that drops live entries fails the count
+	// below rather than spinning here.
+	for i := 1; i <= BOOTSTRAP_MAX_ENTRIES && len(bootstrap_cache.entries) < BOOTSTRAP_MAX_ENTRIES; i += 1 {
 		name := fmt.tprintf("fill%d.invalid", i)
 		if _, fill_ok := bootstrap_resolve(servers, name); !testing.expectf(t, fill_ok, "%s did not resolve", name) {
 			break
@@ -1060,7 +1066,7 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	_, over_ok := bootstrap_resolve(servers, "over.invalid")
 	testing.expect(t, over_ok, "a name past the cap was not answered")
 	testing.expect_value(t, len(bootstrap_cache.entries), BOOTSTRAP_MAX_ENTRIES)
-	testing.expect(t, !("over.invalid" in bootstrap_cache.entries), "a name past the cap was kept")
+	testing.expect(t, !("over.invalid." in bootstrap_cache.entries), "a name past the cap was kept")
 
 	// The cache is a package global that outlives this test, and its keys point
 	// into the tracking allocator that is about to go away. Destroying it hands
