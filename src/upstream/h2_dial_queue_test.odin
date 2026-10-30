@@ -73,15 +73,17 @@ drain_dials :: proc(t: ^testing.T, listener: net.TCP_Socket) -> (dials: int) {
 
 @(private = "file")
 Dial_Caller :: struct {
-	u:      ^Upstream,
-	budget: time.Duration,
-	took:   time.Duration,
-	err:    Error,
+	u:       ^Upstream,
+	budget:  time.Duration,
+	took:    time.Duration,
+	err:     Error,
+	started: bool,
 }
 
 @(private = "file")
 dial_caller :: proc(c: ^Dial_Caller) {
 	start := time.tick_now()
+	sync.atomic_store(&c.started, true)
 	conn, ok, err := get_h2_conn(c.u, 30 * time.Second, c.budget)
 	c.took = time.tick_since(start)
 	c.err = err
@@ -98,7 +100,9 @@ of its own.
 The dial in front of them is `u.connecting` set by hand rather than a real one,
 and it ends only once every caller has returned: whenever each of them started,
 a bounded caller has nothing left to dial with by then. The cap is what ends it
-for callers that are not bounded, so that they fail rather than hang.
+for callers that are not bounded, so that they fail rather than hang. It counts
+from the moment the last caller started, so a caller the scheduler started late
+still finds the dial in flight.
 */
 @(test)
 test_callers_queued_behind_a_doh_dial_keep_their_own_budget :: proc(t: ^testing.T) {
@@ -126,8 +130,13 @@ test_callers_queued_behind_a_doh_dial_keep_their_own_budget :: proc(t: ^testing.
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&waiters[i], dial_caller)
 	}
-	cap := time.tick_add(time.tick_now(), DIAL)
-	for time.tick_diff(time.tick_now(), cap) > 0 {
+	for &w in waiters {
+		for !sync.atomic_load(&w.started) {
+			time.sleep(time.Millisecond)
+		}
+	}
+	until := time.tick_add(time.tick_now(), DIAL)
+	for time.tick_diff(time.tick_now(), until) > 0 {
 		done := 0
 		for th in threads {
 			done += int(thread.is_done(th))
@@ -148,6 +157,7 @@ test_callers_queued_behind_a_doh_dial_keep_their_own_budget :: proc(t: ^testing.
 
 	for w, i in waiters {
 		testing.expectf(t, w.err == .Timeout, "waiter %d ended as %v, expected a timeout", i, w.err)
+		testing.expectf(t, w.took >= WAIT, "waiter %d with a budget of %v gave up after %v; it never waited", i, WAIT, w.took)
 		testing.expectf(t, w.took < DIAL, "waiter %d with a budget of %v took %v; it waited the dial out", i, WAIT, w.took)
 	}
 	dials := drain_dials(t, listener)
@@ -159,6 +169,9 @@ A caller that wakes to a finished dial with its deadline already behind it
 returns rather than starting a dial of its own: the bound sits above the
 `connecting` check, not only on the wait below it. A spent budget puts the
 caller in that state without a race.
+
+A caller with budget left then dials once, so a counter that sees nothing
+cannot pass either test.
 */
 @(test)
 test_a_caller_past_its_deadline_starts_no_doh_dial :: proc(t: ^testing.T) {
@@ -173,4 +186,9 @@ test_a_caller_past_its_deadline_starts_no_doh_dial :: proc(t: ^testing.T) {
 	testing.expectf(t, !got && err == .Timeout, "a spent budget got a connection (%v) or ended as %v", got, err)
 	dials := drain_dials(t, listener)
 	testing.expectf(t, dials == 0, "a caller past its deadline made %d dials", dials)
+
+	_, got, err = get_h2_conn(u, 30 * time.Second, 100 * time.Millisecond)
+	testing.expectf(t, !got && err == .Timeout, "a mute peer gave a connection (%v) or ended as %v", got, err)
+	dials = drain_dials(t, listener)
+	testing.expectf(t, dials == 1, "a caller with budget left made %d dials, expected 1", dials)
 }
