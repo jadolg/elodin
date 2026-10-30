@@ -70,9 +70,9 @@ Error :: enum u8 {
 Idle_Conn :: struct {
 	socket: net.TCP_Socket,
 	tls:    ^tlsx.Conn,
-	// A `Moment`, which neither steps nor stops while the machine sleeps; see
-	// there.
-	since:  Moment,
+	// A `loop.Moment`, which neither steps nor stops while the machine sleeps; see
+	// `loop.Moment` for why.
+	since:  loop.Moment,
 }
 
 // Which protocol an HTTPS upstream turned out to speak, discovered from ALPN
@@ -126,7 +126,7 @@ Upstream :: struct {
 	idle_died:    time.Duration,
 	// When that figure was last learned, so it can be forgotten and learned
 	// again; see `pipe_relearn_idle_locked`. Under `mu`.
-	idle_learned: Moment,
+	idle_learned: loop.Moment,
 	// Consecutive exchanges that ended in `Peer_Closed` after the retry had
 	// also been hung up on; see `record_failure`. Under `mu`.
 	closed_run:   int,
@@ -171,9 +171,9 @@ Upstream :: struct {
 	// Consecutive failures; a run of them parks the upstream for a cooldown so
 	// a dead server stops costing every query a full timeout.
 	failures:     u32,
-	// A `Moment`, so a step of the wall clock neither holds a member parked
+	// A `loop.Moment`, so a step of the wall clock neither holds a member parked
 	// for the length of the step nor lets it out early.
-	down_until:   Moment,
+	down_until:   loop.Moment,
 	// One gate per kind of failure, so each is said at `warn` once a window and
 	// left to `debug` between; see `record_failure`.
 	reported:     [Error]logx.Gate,
@@ -396,7 +396,7 @@ healthy :: proc(u: ^Upstream) -> bool {
 	if u.failures < FAILURE_THRESHOLD {
 		return true
 	}
-	return moment_since(u.down_until) >= 0
+	return loop.moment_since(u.down_until) >= 0
 }
 
 @(private)
@@ -550,7 +550,7 @@ record_failure :: proc(
 	}
 	u.failures += 1
 	if u.failures >= FAILURE_THRESHOLD {
-		u.down_until = moment_add(moment_now(), COOLDOWN)
+		u.down_until = loop.moment_add(loop.moment_now(), COOLDOWN)
 		// A server that stopped sending cookies is a server whose every reply is
 		// now discarded for the want of one, and that arrives here looking like
 		// any other outage. Let the cooldown decide what it does rather than
@@ -858,7 +858,7 @@ take_idle :: proc(u: ^Upstream) -> (conn: Idle_Conn, ok: bool) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 
-	now := moment_now()
+	now := loop.moment_now()
 	for len(u.idle) > 0 {
 		conn = pop(&u.idle)
 		if time.Duration(now - conn.since) < u.idle_timeout {
@@ -878,7 +878,7 @@ put_idle :: proc(u: ^Upstream, conn: Idle_Conn) {
 		return
 	}
 	c := conn
-	c.since = moment_now()
+	c.since = loop.moment_now()
 	append(&u.idle, c)
 	sync.mutex_unlock(&u.mu)
 }
@@ -898,7 +898,7 @@ close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 	pipe_relearn_idle_locked(u)
 	closed += close_pipe(u, all)
 
-	now := moment_now()
+	now := loop.moment_now()
 	stale := make([dynamic]Idle_Conn, 0, len(u.idle), context.temp_allocator)
 	kept := 0
 	for conn in u.idle {

@@ -9,6 +9,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 A failover or round-robin query waits out a bounded budget, not every member for
@@ -263,7 +264,7 @@ test_a_retry_round_asks_a_parked_member_before_a_failed_one :: proc(t: ^testing.
 	defer stop_echo_mock(&back, bu, bw)
 	// Parked by what it did a moment ago, and answering again now.
 	bu.failures = FAILURE_THRESHOLD
-	bu.down_until = moment_add(moment_now(), COOLDOWN)
+	bu.down_until = loop.moment_add(loop.moment_now(), COOLDOWN)
 
 	servers := []^Upstream{qu, bu}
 	g := Group {
@@ -305,7 +306,7 @@ test_a_member_parked_by_this_query_is_not_asked_again_first :: proc(t: ^testing.
 	defer stop_echo_mock(&back, bu, bw)
 	qu.failures = FAILURE_THRESHOLD - 1
 	bu.failures = FAILURE_THRESHOLD
-	bu.down_until = moment_add(moment_now(), COOLDOWN)
+	bu.down_until = loop.moment_add(loop.moment_now(), COOLDOWN)
 
 	servers := []^Upstream{qu, bu}
 	g := Group {
