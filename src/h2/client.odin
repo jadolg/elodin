@@ -389,13 +389,12 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 			return false
 		}
 		loop.lock(&c.mu)
-		s, found := c.streams[h.stream_id]
-		if !found && client_stream_is_idle(c, h.stream_id) {
+		if client_stream_is_idle(c, h.stream_id) {
 			loop.unlock(&c.mu)
 			client_goaway(c, .Protocol_Error)
 			return false
 		}
-		if found {
+		if s, found := c.streams[h.stream_id]; found {
 			s.reset = true
 			s.refused = Error_Code(read_u32(payload)) == .Refused_Stream
 			loop.cond_broadcast(&c.cond)
@@ -423,8 +422,8 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 RFC 9113 5.1: an id this client never allocated is idle - at or past
 `next_stream_id`, or even, since this end allocates odd ids and refuses push.
 Idle accepts only HEADERS and PRIORITY; anything else on one is a connection
-error of type PROTOCOL_ERROR. Only meaningful for an id not in c.streams, which
-callers check first. Caller holds c.mu.
+error of type PROTOCOL_ERROR. A tracked stream is never idle: every id in
+c.streams is odd and below `next_stream_id`. Caller holds c.mu.
 */
 @(private)
 client_stream_is_idle :: proc(c: ^Client, stream_id: u32) -> bool {

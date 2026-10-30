@@ -37,10 +37,10 @@ H2_Field :: struct {
 }
 
 H2_Client :: struct {
-	conn:      Test_Conn,
-	read_buf:  [dynamic]u8,
-	decoder:   h2.Dynamic_Table,
-	results:   map[u32]^H2_Stream_Result,
+	conn:        Test_Conn,
+	read_buf:    [dynamic]u8,
+	decoder:     h2.Dynamic_Table,
+	results:     map[u32]^H2_Stream_Result,
 	pings:       int,
 	goaway:      bool,
 	goaway_code: h2.Error_Code,
