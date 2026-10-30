@@ -655,7 +655,9 @@ encoder, or every header block after it would fail to decode too.
 */
 @(private)
 client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
-	headers, err := decode(&c.decoder, c.header_scratch[:], c.allocator)
+	// Into the reader's per-frame arena: `:status` is all that is read of it,
+	// and that is parsed before the frame ends.
+	headers, err := decode(&c.decoder, c.header_scratch[:], context.temp_allocator)
 	clear(&c.header_scratch)
 	if err != .None {
 		client_goaway(c, .Compression_Error)
@@ -704,8 +706,6 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 		}
 	}
 	loop.unlock(&c.mu)
-
-	free_headers(headers, c.allocator)
 
 	if need_rst {
 		return client_rst_stream(c, stream_id, .Stream_Closed)

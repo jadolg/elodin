@@ -1,5 +1,6 @@
 package server
 
+import "core:mem"
 import "core:net"
 import "core:strconv"
 import "core:sync"
@@ -1124,4 +1125,29 @@ test_parse_bind_refuses_a_stray_bracket :: proc(t: ^testing.T) {
 	}
 	ep, ok := parse_bind("::1", 53)
 	testing.expect(t, ok && ep.port == 53, "an IPv6 address binds")
+}
+
+/*
+#533: a datagram's job and its bytes are one heap block, so the reader makes one
+allocation per datagram and the worker one `free`, which crosses back to the
+reader's malloc arena.
+*/
+@(test)
+test_udp_job_is_one_allocation :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	context.allocator = mem.tracking_allocator(&track)
+
+	datagram := []u8{0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0}
+	job := new_udp_job(datagram)
+	testing.expect_value(t, track.total_allocation_count, 1)
+	testing.expect_value(t, string(job.data), string(datagram))
+	testing.expect(t, job.ctx == nil, "the block was not zeroed")
+	// The bytes sit past the struct, inside the one block.
+	testing.expect(t, uintptr(raw_data(job.data)) == uintptr(job) + size_of(Udp_Job), "the datagram is not in the job's block")
+
+	free(job)
+	testing.expect_value(t, track.total_free_count, 1)
+	testing.expect_value(t, len(track.allocation_map), 0)
 }

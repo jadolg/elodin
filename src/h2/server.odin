@@ -1221,7 +1221,13 @@ here on the reader even when the request body has yet to arrive.
 */
 @(private)
 finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
-	headers, err := decode(&c.decoder, s.header_block[:], c.allocator)
+	/*
+	Into the reader's per-frame arena, which `serve` resets after this frame:
+	up to MAX_HEADER_COUNT fields are decoded and a request keeps six of them,
+	so those six are cloned out below (`take`) and the rest go with the arena
+	rather than one heap allocation and free apiece.
+	*/
+	headers, err := decode(&c.decoder, s.header_block[:], context.temp_allocator)
 	if err != .None {
 		goaway(c, .Compression_Error)
 		return false
@@ -1236,7 +1242,6 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	// `discard` one already was) and let it go without ever handing it to a
 	// handler.
 	if s.refused || s.discard {
-		free_headers(headers, c.allocator)
 		sent := s.discard || stream_error(c, s.id, .Refused_Stream)
 		close_stream(c, s.id, peer_sending = !s.end_stream)
 		return sent
@@ -1252,7 +1257,6 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	below before anyone above could see it.
 	*/
 	if request_is_malformed(headers) {
-		free_headers(headers, c.allocator)
 		sent := stream_error(c, s.id, .Protocol_Error)
 		close_stream(c, s.id, peer_sending = !s.end_stream)
 		return sent
@@ -1261,14 +1265,13 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	req := new(Request, c.allocator)
 	req.stream_id = s.id
 	req.allocator = c.allocator
-	// A repeated field would otherwise orphan the value it replaces, which a
-	// peer could exploit to make the connection hold memory without limit.
+	// The first of a repeated field is the one kept, and only it is cloned, so
+	// a peer repeating one holds no more of the connection's memory than one.
 	take :: proc(dst: ^string, value: string, allocator: mem.Allocator) {
 		if dst^ != "" {
-			delete(value, allocator)
 			return
 		}
-		dst^ = value
+		dst^ = strings.clone(value, allocator)
 	}
 
 	for f in headers {
@@ -1288,12 +1291,8 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 			take(&req.content_type, f.value, c.allocator)
 		case "accept":
 			take(&req.accept, f.value, c.allocator)
-		case:
-			delete(f.value, c.allocator)
 		}
-		delete(f.name, c.allocator)
 	}
-	delete(headers, c.allocator)
 
 	// Charged like body bytes: a stream parked for its body holds its fields as
 	// long as it holds the body, and a :path near MAX_HEADER_LIST on every

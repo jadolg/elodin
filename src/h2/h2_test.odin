@@ -1,6 +1,7 @@
 package h2
 
 import "core:encoding/hex"
+import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
@@ -3476,4 +3477,61 @@ test_idle_stream_and_enable_push_protocol_errors :: proc(t: ^testing.T) {
 		conn_unref(c)
 		free_all(context.temp_allocator)
 	}
+}
+
+/*
+#533: a request's header block is decoded into the reader's per-frame arena, and
+only the six fields a request keeps reach the connection's allocator, rather
+than every field - up to MAX_HEADER_COUNT of them, each name and value its own
+allocation and free on the reader thread.
+*/
+@(test)
+test_headers_reach_the_connection_allocator_only_for_kept_fields :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
+
+	block := make([dynamic]u8, 0, 4096, context.temp_allocator)
+	encode_header(&block, ":method", "POST")
+	encode_header(&block, ":scheme", "https")
+	encode_header(&block, ":path", "/dns-query")
+	encode_header(&block, ":authority", "example.com")
+	encode_header(&block, "content-type", "application/dns-message")
+	encode_header(&block, "accept", "application/dns-message")
+	for i in 0 ..< 100 {
+		encode_header(&block, fmt.tprintf("x-pad-%d", i), "padding")
+	}
+
+	before := track.total_allocation_count
+	// Without END_STREAM, so the request is parked on the stream to be read back.
+	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block[:])
+	testing.expect(t, ok, "handle_headers failed")
+	made := track.total_allocation_count - before
+	// The stream, its request, the six fields, and the block and map growth
+	// around them; one per decoded field would be over two hundred.
+	testing.expectf(t, made < 32, "%d allocations from the connection's allocator for one request", made)
+
+	s, found := c.streams[1]
+	testing.expect(t, found && s.pending != nil, "no request was parked on the stream")
+	if found && s.pending != nil {
+		req := s.pending
+		testing.expect_value(t, req.method, "POST")
+		testing.expect_value(t, req.path, "/dns-query")
+		testing.expect_value(t, req.authority, "example.com")
+		testing.expect_value(t, req.scheme, "https")
+		testing.expect_value(t, req.content_type, "application/dns-message")
+		testing.expect_value(t, req.accept, "application/dns-message")
+	}
+
+	// The fields outlive the arena they were decoded into.
+	free_all(context.temp_allocator)
+	if found && s.pending != nil {
+		testing.expect_value(t, s.pending.path, "/dns-query")
+	}
+
+	conn_unref(c)
+	expect_no_leaks(t, &track, "kept header fields")
 }

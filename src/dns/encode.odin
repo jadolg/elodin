@@ -1,7 +1,7 @@
 package dns
 
+import "core:hash"
 import "core:mem"
-import "core:strings"
 
 /*
 Message writer with RFC 1035 name compression.
@@ -18,7 +18,15 @@ grounds that failing to answer is recoverable and answering wrongly is not.
 */
 Writer :: struct {
 	buf:       [dynamic]u8,
-	comp:      map[string]u16,
+	/*
+	Compression targets, keyed by a hash of the case-folded suffix rather than
+	by the suffix itself, so recording one allocates nothing per name. A hit is
+	only a candidate: `w_name_at` checks it against the bytes at the target
+	before a pointer is written. A suffix whose hash collides with one already
+	recorded is never recorded itself, so every later name ending in it is
+	written without that part compressed: a larger message, never a wrong name.
+	*/
+	comp:      map[u64]u16,
 	compress:  bool,
 	allocator: mem.Allocator,
 	// Scratch reused across names so encoding a message stays allocation-light.
@@ -33,7 +41,7 @@ writer_init :: proc(w: ^Writer, allocator := context.allocator, compress := true
 	w.buf = make([dynamic]u8, 0, 512, allocator)
 	w.offsets = make([dynamic]int, 0, 16, allocator)
 	if compress {
-		w.comp = make(map[string]u16, 32, allocator)
+		w.comp = make(map[u64]u16, 32, allocator)
 	}
 }
 
@@ -46,30 +54,12 @@ writer_destroy :: proc(w: ^Writer) {
 Release everything the writer allocated except its output buffer.
 
 Split out because `encode_message` hands that buffer to its caller and has to let
-go of the rest. The compression map's keys are cloned (see `w_name`), and the
-map's own storage does not own them, so dropping the map alone would leave a
-string per distinct name suffix behind.
+go of the rest.
 */
 @(private)
 writer_release_scratch :: proc(w: ^Writer) {
 	delete(w.offsets)
-	writer_free_comp_keys(w)
 	delete(w.comp)
-}
-
-/*
-Free the cloned key strings the compression map holds (see `w_name`).
-
-The map's own storage does not own its keys, so both dropping the map
-(`writer_release_scratch`) and clearing it to invalidate stale targets
-(`encode_message`'s truncation path) have to free them first, or a string
-per distinct name suffix leaks.
-*/
-@(private)
-writer_free_comp_keys :: proc(w: ^Writer) {
-	for key in w.comp {
-		delete(key, w.allocator)
-	}
 }
 
 @(private)
@@ -121,20 +111,67 @@ w_name :: proc(w: ^Writer, name: string, compress := true) -> Encode_Error {
 			c := suffix[k]
 			w.fold_buf[k] = c + 32 if c >= 'A' && c <= 'Z' else c
 		}
-		key := string(w.fold_buf[:len(suffix)])
+		folded := w.fold_buf[:len(suffix)]
+		key := hash.fnv64a(folded)
 
 		if target, found := w.comp[key]; found {
-			w_bytes(w, tmp[:off])
-			w_u16(w, 0xc000 | target)
-			return .None
+			if w_name_at(w, int(target), folded) {
+				w_bytes(w, tmp[:off])
+				w_u16(w, 0xc000 | target)
+				return .None
+			}
+			// A collision: the first suffix keeps the slot.
+			continue
 		}
 		if base + off < 0x4000 {
-			w.comp[strings.clone(key, w.allocator)] = u16(base + off)
+			w.comp[key] = u16(base + off)
 		}
 	}
 
 	w_bytes(w, tmp)
 	return .None
+}
+
+/*
+Whether the name written at `at` is `folded`, an uncompressed wire name already
+folded to lower case, compared without regard to ASCII case (RFC 4343) and
+following the pointers `w_name` left in it.
+
+Every pointer this writer emits points back at a name it wrote earlier, so the
+walk always moves backward and ends; the hop bound is for a buffer that says
+otherwise, which then fails the match rather than looping.
+*/
+@(private)
+w_name_at :: proc(w: ^Writer, at: int, folded: []u8) -> bool {
+	pos, i := at, 0
+	for hops := 0; hops <= MAX_NAME_WIRE / 2; {
+		if pos >= len(w.buf) || i >= len(folded) {
+			return false
+		}
+		b := w.buf[pos]
+		if b & 0xc0 == 0xc0 {
+			if pos + 1 >= len(w.buf) {
+				return false
+			}
+			pos = int(b & 0x3f) << 8 | int(w.buf[pos + 1])
+			hops += 1
+			continue
+		}
+		n := int(b)
+		// The length octet is under 64, so folding leaves it alone.
+		if folded[i] != b || i + 1 + n > len(folded) || pos + 1 + n > len(w.buf) {
+			return false
+		}
+		if n == 0 {
+			return i + 1 == len(folded)
+		}
+		if !name_equal_fold(string(w.buf[pos + 1:][:n]), string(folded[i + 1:][:n])) {
+			return false
+		}
+		pos += 1 + n
+		i += 1 + n
+	}
+	return false
 }
 
 // Types whose RDATA name may be compressed. Anything newer must not be
@@ -319,10 +356,7 @@ does not fit.
 Compression targets recorded for the dropped bytes are stale by the time this
 runs, so nothing written here may reference them: the map is cleared and the
 writer put into uncompressed mode, which an OPT record does not need anyway -
-its owner is the root and its RDATA holds no name. The keys are cloned, so they
-are freed before `clear` drops the entries, or the later
-`writer_release_scratch` finds an empty map and one string per distinct suffix
-leaks.
+its owner is the root and its RDATA holds no name.
 
 `rcode_lost` is the one thing a caller cannot work out for itself: an rcode of
 16 or more lives half in the header and half in this record's TTL (RFC 6891
@@ -345,7 +379,6 @@ w_readd_opt :: proc(
 	rcode_lost: bool,
 	err: Encode_Error,
 ) {
-	writer_free_comp_keys(w)
 	clear(&w.comp)
 	w.compress = false
 
@@ -562,18 +595,17 @@ encode_message :: proc(
 
 				Once, and then compression is off for the rest of the message.
 				The targets recorded for the bytes just dropped are stale, so
-				the map has to go - keys freed first, since its storage does not
-				own them - and every record tried after that would otherwise
-				clone a key per distinct suffix into an allocator that is a
-				per-request arena, where the frees are no-ops. A reply carrying
-				thousands of small additional records against a small ceiling
-				would grow that arena by all of them for records none of which
-				are sent. What it costs is the odd byte on the records behind
-				the drop, which go out with their names in full.
+				the map has to go, and every record tried after that would
+				otherwise grow it by an entry per distinct suffix in an
+				allocator that is a per-request arena, where the frees are
+				no-ops. A reply carrying thousands of small additional records
+				against a small ceiling would grow that arena by all of them for
+				records none of which are sent. What it costs is the odd byte on
+				the records behind the drop, which go out with their names in
+				full.
 				*/
 				if !additional_dropped {
 					additional_dropped = true
-					writer_free_comp_keys(&w)
 					clear(&w.comp)
 					w.compress = false
 				}

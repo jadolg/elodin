@@ -2,6 +2,7 @@ package dns
 
 import "core:bytes"
 import "core:fmt"
+import "core:hash"
 import "core:mem"
 import "core:testing"
 
@@ -1387,5 +1388,77 @@ test_rdata_cut_off_inside_a_pointer_is_kept_and_not_written :: proc(t: ^testing.
 		_, _, eerr := encode_message(msg, context.temp_allocator)
 		testing.expectf(t, eerr == .Bad_Rdata, "%v kept raw with its pointer: encoded with %v", c.type, eerr)
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+#533: recording a compression target allocates nothing per name. A map keyed by
+a cloned suffix makes one allocation per distinct suffix: thousands for an
+answer of two thousand distinct names, encoded two or three times a request.
+*/
+@(test)
+test_encode_message_compression_allocates_nothing_per_name :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	allocator := mem.tracking_allocator(&track)
+
+	answer := make([]Record, 2000, context.temp_allocator)
+	for &rec, i in answer {
+		// Mixed case, so the matches the map makes are case-insensitive ones.
+		name := fmt.tprintf("h%d.Example.COM.", i)
+		rec = Record{name = name, type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {192, 0, 2, u8(i)}}}
+	}
+	m := Message {
+		id       = 0x1234,
+		question = []Question{{name = "example.com.", type = .A, class = .IN}},
+		answer   = answer,
+	}
+	m.flags.qr = true
+
+	wire, _, err := encode_message(m, allocator)
+	testing.expect_value(t, err, Encode_Error.None)
+	// The buffer and the map growing, logarithmically; a clone per name would be
+	// over two thousand.
+	testing.expectf(t, track.total_allocation_count < 64, "%d allocations to encode one message", track.total_allocation_count)
+
+	got, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect_value(t, len(got.answer), len(answer))
+	if len(got.answer) == len(answer) {
+		testing.expect(t, name_equal_fold(got.answer[1999].name, answer[1999].name), "the last name did not survive compression")
+	}
+	// Every name points into the question's `example.com`, so the answer is far
+	// smaller than one with its names in full.
+	testing.expectf(t, len(wire) < 2000 * 26, "%d bytes: names were not compressed", len(wire))
+
+	delete(wire, allocator)
+	free_all(context.temp_allocator)
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left held, allocated at %v", entry.size, entry.location)
+	}
+}
+
+/*
+A target the map hands back is checked against the name written there before a
+pointer is emitted: the map is keyed by a hash, and two suffixes that share one
+would otherwise point the second name at the first. The collision is planted,
+since one of FNV-1a's is not something to search for in a test.
+*/
+@(test)
+test_w_name_does_not_point_at_a_colliding_suffix :: proc(t: ^testing.T) {
+	w: Writer
+	writer_init(&w, context.temp_allocator)
+
+	testing.expect_value(t, w_name(&w, "a.example."), Encode_Error.None)
+	// `b.example.`'s key, mapped to where `a.example.` was written.
+	folded := []u8{1, 'b', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0}
+	w.comp[hash.fnv64a(folded)] = 0
+	testing.expect_value(t, w_name(&w, "b.example."), Encode_Error.None)
+
+	second := w.buf[11:]
+	testing.expectf(t, len(second) >= 2 && second[0] == 1 && second[1] == 'b', "b.example. was written as %v", second)
+	// `example.` itself still compresses, against the real target.
+	testing.expectf(t, len(second) == 4 && second[2] == 0xc0 && second[3] == 2, "b.example. was written as %v", second)
 	free_all(context.temp_allocator)
 }
