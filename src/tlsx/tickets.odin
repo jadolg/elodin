@@ -3,8 +3,8 @@ package tlsx
 import "core:c"
 import "core:c/libc"
 import "core:sync"
-import "core:sys/linux"
 import "core:time"
+import "elodin:loop"
 
 /*
 How long a session-ticket key seals new tickets. It then opens the tickets it
@@ -15,9 +15,9 @@ to negate the benefits of forward secrecy", and "session ticket validity MUST be
 limited to a reasonable duration (e.g., half as long as ticket-encryption key
 validity)". A key lives two intervals and a ticket one (`server_context` sets the
 session timeout to it), so every ticket is still opened for the whole lifetime it
-was issued with, and nothing that opens a ticket stays in memory past two
-intervals. Two hours is the session timeout OpenSSL already used, so clients
-resume exactly as long as they did before rotation.
+was issued with, and a key is erased within one maintenance tick of turning two
+intervals old. Two hours is OpenSSL's default session timeout, so rotation
+shortens no ticket's life.
 
 What a stolen key exposes differs by version. A TLS 1.2 ticket carries the master
 secret, so its key decrypts the recorded session that issued it and every one
@@ -27,23 +27,14 @@ data), so a stolen key opens tickets but not the traffic after them.
 */
 TICKET_KEY_INTERVAL :: 2 * time.Hour
 
-/*
-The clock a key's age is measured on: CLOCK_BOOTTIME, which counts the time a
-host spends suspended or a VM spends paused. `time.tick_now` reads
-CLOCK_MONOTONIC_RAW, which stops while suspended, so a key would outlive its two
-intervals by the length of every pause.
-*/
-ticket_now :: proc "contextless" () -> time.Tick {
-	ts, _ := linux.clock_gettime(.BOOTTIME)
-	return time.Tick{_nsec = i64(ts.time_sec) * 1e9 + i64(ts.time_nsec)}
-}
-
 @(private)
 Ticket_Key :: struct {
 	name: [TLSEXT_KEYNAME_LENGTH]u8,
 	aes:  [32]u8,
 	hmac: [32]u8,
-	born: time.Tick,
+	// On CLOCK_BOOTTIME, so a suspend or a paused VM ages the key; see
+	// `loop.Moment`.
+	born: loop.Moment,
 	live: bool,
 }
 
@@ -59,10 +50,10 @@ every ticket outstanding stops resuming when a certificate is renewed.
 `mu` because the callback runs on every loop thread's handshakes and the
 maintenance thread rotates the keys under them.
 
-`retired` once a reload has displaced the context (`retire_ticket_keys`): both
-keys are erased then and none is drawn again, because the maintenance tick only
-reaches the contexts in the listener slots, while an open connection can hold a
-displaced one for as long as it stays open.
+`retired` once `context_destroy` has dropped the context (`retire_ticket_keys`):
+both keys are erased then and none is drawn again, because the maintenance tick
+only reaches the contexts in the listener slots, while an open connection can
+hold a displaced one for as long as it stays open.
 */
 @(private)
 Ticket_Keys :: struct {
@@ -91,7 +82,7 @@ erase_ticket_key :: proc "contextless" (key: ^Ticket_Key) {
 // A failed draw leaves the key erased and not live: no ticket is sealed until a
 // later draw succeeds, rather than one sealed under a key that is not random.
 @(private)
-draw_ticket_key :: proc "contextless" (key: ^Ticket_Key, now: time.Tick) {
+draw_ticket_key :: proc "contextless" (key: ^Ticket_Key, now: loop.Moment) {
 	erase_ticket_key(key)
 	if RAND_priv_bytes(raw_data(key.name[:]), size_of(key.name)) != 1 ||
 	   RAND_priv_bytes(raw_data(key.aes[:]), size_of(key.aes)) != 1 ||
@@ -112,13 +103,13 @@ handshake never uses a key past its time however late the tick runs, and an idle
 listener still erases its keys on schedule.
 */
 @(private)
-advance_ticket_keys :: proc "contextless" (k: ^Ticket_Keys, now: time.Tick) {
-	if k.current.live && time.tick_diff(k.current.born, now) >= TICKET_KEY_INTERVAL {
+advance_ticket_keys :: proc "contextless" (k: ^Ticket_Keys, now: loop.Moment) {
+	if k.current.live && time.Duration(now - k.current.born) >= TICKET_KEY_INTERVAL {
 		erase_ticket_key(&k.previous)
 		k.previous = k.current
 		erase_ticket_key(&k.current)
 	}
-	if k.previous.live && time.tick_diff(k.previous.born, now) >= 2 * TICKET_KEY_INTERVAL {
+	if k.previous.live && time.Duration(now - k.previous.born) >= 2 * TICKET_KEY_INTERVAL {
 		erase_ticket_key(&k.previous)
 	}
 	if !k.current.live && !k.retired {
@@ -142,7 +133,7 @@ install_ticket_keys :: proc(ptr: ^SSL_CTX) -> bool {
 	if k == nil {
 		return false
 	}
-	draw_ticket_key(&k.current, ticket_now())
+	draw_ticket_key(&k.current, loop.moment_now())
 	if !k.current.live {
 		libc.free(k)
 		return false
@@ -165,12 +156,12 @@ ticket_keys_of :: proc "contextless" (ptr: ^SSL_CTX) -> ^Ticket_Keys {
 
 /*
 Rotate and erase a server context's ticket keys on schedule, as of `now`
-(`ticket_now()` outside tests).
+(`loop.moment_now()` outside tests).
 
 For the maintenance tick, so a listener nobody connects to still erases its
 keys; the callback does the same on every ticket. Nothing on a client context.
 */
-rotate_ticket_keys :: proc(ctx: ^Context, now: time.Tick) {
+rotate_ticket_keys :: proc(ctx: ^Context, now: loop.Moment) {
 	if ctx == nil {
 		return
 	}
@@ -184,13 +175,14 @@ rotate_ticket_keys :: proc(ctx: ^Context, now: time.Tick) {
 }
 
 /*
-Erase a server context's ticket keys for good, as a reload displaces it.
+Erase a server context's ticket keys for good, as `context_destroy` drops the
+wrapper's reference: a reload displacing it, or shutdown.
 
-The context that replaces it has keys of its own, so no ticket under these is
-opened again; but an open connection keeps the displaced `SSL_CTX` alive, and
-with it these keys, for as long as it stays open, out of the maintenance tick's
-reach.
+Nothing seals or opens a ticket under these again; but an open connection keeps
+the `SSL_CTX` alive, and with it these keys, for as long as it stays open, out
+of the maintenance tick's reach.
 */
+@(private)
 retire_ticket_keys :: proc(ctx: ^Context) {
 	k := ticket_keys_of(ctx.ptr) if ctx != nil else nil
 	if k == nil {
@@ -236,7 +228,7 @@ ticket_key_cb :: proc "c" (
 	defer erase_ticket_key(&key)
 	renew := false
 	sync.mutex_lock(&k.mu)
-	advance_ticket_keys(k, ticket_now())
+	advance_ticket_keys(k, loop.moment_now())
 	if enc == 1 {
 		key = k.current
 	} else {
@@ -266,7 +258,7 @@ ticket_key_cb :: proc "c" (
 			key = "digest",
 			data_type = OSSL_PARAM_UTF8_STRING,
 			data = rawptr(digest),
-			data_size = len("SHA256"),
+			data_size = len(digest),
 			return_size = OSSL_PARAM_UNMODIFIED,
 		},
 		{},

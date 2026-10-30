@@ -1605,8 +1605,7 @@ reload_tls_ctx :: proc(
 	sync.rw_mutex_lock(&l.tls_mu)
 	old := slot^
 	slot^ = fresh
-	// An open connection keeps `old` alive past this, out of the tick's reach.
-	tlsx.retire_ticket_keys(old)
+	// Erases `old`'s ticket keys, which an open connection would keep alive.
 	tlsx.context_destroy(old)
 	sync.rw_mutex_unlock(&l.tls_mu)
 	/*
@@ -1633,7 +1632,7 @@ share the maintenance thread, so nothing frees a context under this today; the
 shared lock is the one every reader of the two slots takes, and keeps that true
 wherever the call moves.
 */
-rotate_ticket_keys :: proc(l: ^Listeners, now: time.Tick) {
+rotate_ticket_keys :: proc(l: ^Listeners, now: loop.Moment) {
 	sync.rw_mutex_shared_lock(&l.tls_mu)
 	defer sync.rw_mutex_shared_unlock(&l.tls_mu)
 	tlsx.rotate_ticket_keys(l.dot_ctx, now)

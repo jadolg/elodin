@@ -6,6 +6,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:config"
+import "elodin:loop"
 import "elodin:tlsx"
 
 /*
@@ -278,7 +279,7 @@ test_rotate_ticket_keys_reaches_dot_and_doh :: proc(t: ^testing.T) {
 	dot_before, _ := tlsx.ticket_key_name(dot)
 	doh_before, _ := tlsx.ticket_key_name(doh)
 
-	rotate_ticket_keys(&l, time.tick_add(tlsx.ticket_now(), tlsx.TICKET_KEY_INTERVAL))
+	rotate_ticket_keys(&l, loop.moment_add(loop.moment_now(), tlsx.TICKET_KEY_INTERVAL))
 	dot_after, dok := tlsx.ticket_key_name(dot)
 	doh_after, hok := tlsx.ticket_key_name(doh)
 	testing.expect(t, dok && dot_after != dot_before, "the DoT ticket key did not rotate")

@@ -10,6 +10,7 @@ import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "elodin:loop"
 
 /*
 Tests run a real TLS session over loopback against a self-signed pair. Nothing
@@ -1506,7 +1507,7 @@ test_ticket_keys_rotate_and_old_tickets_stop_resuming :: proc(t: ^testing.T) {
 		// Runs before the join: a client that never dialled would otherwise
 		// leave the worker in accept, and the test hung rather than failed.
 		defer posix.shutdown(posix.FD(net.Socket(listener)), .RDWR)
-		start := ticket_now()
+		start := loop.moment_now()
 
 		_, first, ok := resume_client(t, cctx.ptr, ep, nil)
 		defer if first != nil {SSL_SESSION_free(first)}
@@ -1514,7 +1515,7 @@ test_ticket_keys_rotate_and_old_tickets_stop_resuming :: proc(t: ^testing.T) {
 		name, has := ticket_name(first)
 		testing.expectf(t, ok && has && name == sealed.name, "%x: the first ticket is not under the context's key", version)
 
-		rotate_ticket_keys(sctx, time.tick_add(start, TICKET_KEY_INTERVAL))
+		rotate_ticket_keys(sctx, loop.moment_add(start, TICKET_KEY_INTERVAL))
 		renewed := current_ticket_key(k)
 		testing.expectf(t, renewed.name != sealed.name, "%x: the key did not rotate after an interval", version)
 		reused, second, ok2 := resume_client(t, cctx.ptr, ep, first)
@@ -1523,14 +1524,15 @@ test_ticket_keys_rotate_and_old_tickets_stop_resuming :: proc(t: ^testing.T) {
 		name, has = ticket_name(second)
 		testing.expectf(t, has && name == renewed.name, "%x: resuming on the retired key brought no ticket under the new one", version)
 
-		rotate_ticket_keys(sctx, time.tick_add(start, 3 * TICKET_KEY_INTERVAL))
-		reused, _, ok = resume_client(t, cctx.ptr, ep, second)
-		testing.expectf(t, ok && !reused, "%x: a ticket resumed two intervals after its key was retired", version)
+		rotate_ticket_keys(sctx, loop.moment_add(start, 3 * TICKET_KEY_INTERVAL))
+		resumed, expired, ok4 := resume_client(t, cctx.ptr, ep, second)
+		defer if expired != nil {SSL_SESSION_free(expired)}
+		testing.expectf(t, ok4 && !resumed, "%x: a ticket resumed two intervals after its key was retired", version)
 
 		// No tick this time: the sealing key is made an interval old where it
 		// is, and the handshake itself must retire it before sealing.
 		sync.mutex_lock(&k.mu)
-		k.current.born = time.tick_add(ticket_now(), -TICKET_KEY_INTERVAL)
+		k.current.born = loop.moment_add(loop.moment_now(), -TICKET_KEY_INTERVAL)
 		stale := k.current.name
 		sync.mutex_unlock(&k.mu)
 		_, third, ok3 := resume_client(t, cctx.ptr, ep, nil)
@@ -1550,32 +1552,32 @@ test_ticket_keys_advance_on_their_interval :: proc(t: ^testing.T) {
 	plain := SSL_CTX_new(TLS_server_method())
 	testing.expectf(t, SSL_CTX_get_timeout(plain) == c.long(I / time.Second), "OpenSSL's default session timeout is %ds", SSL_CTX_get_timeout(plain))
 	SSL_CTX_free(plain)
-	t0 := ticket_now()
+	t0 := loop.moment_now()
 	k: Ticket_Keys
 	advance_ticket_keys(&k, t0)
 	testing.expect(t, k.current.live && !k.previous.live, "no sealing key was drawn")
 	first := k.current
 
-	advance_ticket_keys(&k, time.tick_add(t0, I - 1))
+	advance_ticket_keys(&k, loop.moment_add(t0, I - 1))
 	testing.expect(t, k.current.name == first.name, "the key rotated before its interval was up")
 
 	// Retired by a tick that ran late: the key it retires still dies two
 	// intervals after it was drawn, not two after the late tick.
 	late :: I / 2
-	advance_ticket_keys(&k, time.tick_add(t0, I + late))
+	advance_ticket_keys(&k, loop.moment_add(t0, I + late))
 	testing.expect(t, k.current.live && k.current.name != first.name, "the key did not rotate at its interval")
 	testing.expect(t, k.previous.live && k.previous.name == first.name, "the retired key cannot open its tickets")
 	second := k.current
 
-	advance_ticket_keys(&k, time.tick_add(t0, 2 * I - 1))
+	advance_ticket_keys(&k, loop.moment_add(t0, 2 * I - 1))
 	testing.expect(t, k.previous.live && k.previous.name == first.name, "the retired key was erased early")
 
-	advance_ticket_keys(&k, time.tick_add(t0, 2 * I))
+	advance_ticket_keys(&k, loop.moment_add(t0, 2 * I))
 	testing.expect(t, !k.previous.live && k.previous.name == {}, "a key outlived two intervals")
 	testing.expect(t, k.current.name == second.name, "the sealing key rotated before its interval was up")
 
 	// A listener left idle for longer than both lifetimes keeps neither.
-	advance_ticket_keys(&k, time.tick_add(t0, 10 * I))
+	advance_ticket_keys(&k, loop.moment_add(t0, 10 * I))
 	testing.expect(t, k.current.live && k.current.name != second.name, "an idle context kept sealing under an old key")
 	testing.expect(t, !k.previous.live && k.previous.name == {}, "an idle context kept a key past two intervals")
 }
@@ -1642,10 +1644,11 @@ test_retired_ticket_keys_are_erased_and_never_redrawn :: proc(t: ^testing.T) {
 		_, has := ticket_name(second)
 		testing.expectf(t, ok2 && !has, "%x: a handshake on a retired context completed %v, got a ticket %v", version, ok2, has)
 
-		reused, _, ok3 := resume_client(t, cctx.ptr, ep, first)
+		reused, third, ok3 := resume_client(t, cctx.ptr, ep, first)
+		defer if third != nil {SSL_SESSION_free(third)}
 		testing.expectf(t, ok3 && !reused, "%x: a ticket resumed on a retired context", version)
 
-		rotate_ticket_keys(sctx, time.tick_add(ticket_now(), 10 * TICKET_KEY_INTERVAL))
+		rotate_ticket_keys(sctx, loop.moment_add(loop.moment_now(), 10 * TICKET_KEY_INTERVAL))
 		sync.mutex_lock(&k.mu)
 		redrawn := k.current.live || k.previous.live
 		sync.mutex_unlock(&k.mu)

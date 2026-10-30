@@ -16,7 +16,6 @@ import "elodin:logx"
 import "elodin:loop"
 import "elodin:privdrop"
 import "elodin:server"
-import "elodin:tlsx"
 import "elodin:upstream"
 
 USAGE :: `elodin - a filtering DNS forwarder
@@ -1129,7 +1128,7 @@ tick :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m: 
 	if dropped := server.sweep_validator(s); dropped > 0 {
 		logx.debugf("dnssec: dropped %d expired zone keys", dropped)
 	}
-	server.rotate_ticket_keys(listeners, tlsx.ticket_now())
+	server.rotate_ticket_keys(listeners, loop.moment_now())
 
 	refreshing := cfg.blocking.enabled && !opts.no_fetch && cfg.blocking.refresh > 0
 	if !server.rebuild_busy(m.rebuild) {

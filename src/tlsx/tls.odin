@@ -544,6 +544,8 @@ context_destroy :: proc(ctx: ^Context) {
 		return
 	}
 	if ctx.ptr != nil {
+		// An open connection may keep the `SSL_CTX` alive past this.
+		retire_ticket_keys(ctx)
 		SSL_CTX_free(ctx.ptr)
 	}
 	free(ctx, ctx.allocator)
