@@ -16,9 +16,9 @@ CLOCK_BOOTTIME (issue #548).
 cooldown, an idle connection's age or a learned idle timeout timed on either
 would be wrong by the length of a step or of a suspend. Neither can be made from
 a test, so this asserts what rules them out: each stamp lies between two
-readings of `loop.moment_now`, which `loop` tests against CLOCK_BOOTTIME. A stamp off either other clock is seconds or
-more away from that window. `mise run check` holds the rest of the package off
-the wall clock by grep.
+readings of `loop.moment_now`, which `loop` tests against CLOCK_BOOTTIME. A
+stamp off either other clock is seconds or more away from that window.
+`mise run check` holds the rest of the package off the wall clock by grep.
 */
 @(private = "file")
 on_moment_clock :: proc(t: ^testing.T, what: string, stamp, before, after: loop.Moment) {

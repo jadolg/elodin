@@ -805,7 +805,7 @@ test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testin
 	delete(resp, context.allocator)
 
 	// One timeout and a datagram, against a threshold of two: the exact signal
-	// is the counter below, and this is the wall clock saying what it buys.
+	// is the counter below, and this is the elapsed time saying what it buys.
 	testing.expectf(
 		t,
 		spent < 2 * TIMEOUT,
@@ -941,7 +941,7 @@ shipped five seconds, ten of them for a reply the group had in its first
 millisecond, with a query worker held for the whole of it. Bounded, the first
 spare is asked and the second is not, because by then the budget is gone.
 
-The assertion is the wall clock, against a threshold between one timeout and
+The assertion is the elapsed time, against a threshold between one timeout and
 two: a fixture cannot see an exchange that was never made, only the wait it
 would have cost. The dead ports are bound and closed, which on UDP is a timeout
 rather than a refusal - `exchange_udp` does not connect its socket, so no ICMP
