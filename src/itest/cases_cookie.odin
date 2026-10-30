@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:slice"
 import "core:time"
 import "elodin:dns"
 
@@ -40,6 +41,49 @@ cookies:
 @(private = "file")
 CLIENT_COOKIE := []u8{0x24, 0x64, 0xc4, 0xab, 0xcf, 0x10, 0xc9, 0x57}
 
+/*
+The RFC 7873 section 5.4 priming shape: a QUERY with no question and an OPT
+record carrying nothing but a COOKIE option.
+*/
+@(private = "file")
+priming_query :: proc(cookie: []u8, id: u16 = 0x5151) -> []u8 {
+	options := make([]dns.EDNS_Option, 1, context.temp_allocator)
+	options[0] = dns.EDNS_Option {
+		code = u16(dns.EDNS_Option_Code.Cookie),
+		data = cookie,
+	}
+	opt := dns.make_opt(1232, false)
+	opt.data = dns.Rdata_OPT{options = options}
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = opt
+	m := dns.Message{id = id, additional = additional}
+	m.flags.rd = true
+	wire, _, _ := dns.encode_message(m, context.temp_allocator)
+	return wire
+}
+
+// The answer to a priming query: `rcode`, nothing in it, and a cookie that is
+// the client's eight bytes and a server cookie behind them.
+@(private = "file")
+check_primed :: proc(r: ^Runner, res: Query_Result, rcode: dns.Rcode) -> (issued: []u8) {
+	if !check(r, res.ok, "no response") {
+		return nil
+	}
+	// Decoded rather than read off the header: BADCOOKIE's top bits are in the
+	// OPT record.
+	msg, err := dns.decode_message(res.wire, context.temp_allocator)
+	if check(r, err == .None, "the response does not decode") {
+		check_eq_int(r, int(dns.rcode_of(msg)), int(rcode), "rcode")
+		check_eq_int(r, len(msg.question) + len(msg.answer) + len(msg.authority), 0, "question, answer and authority records")
+	}
+	got, found := find_cookie(r, res.wire)
+	if check(r, found, "the priming answer carries no COOKIE option") {
+		check_eq_int(r, len(got), 24, "cookie length")
+		check(r, bytes_equal(got[:8], CLIENT_COOKIE), "the client cookie was not echoed")
+	}
+	return got
+}
+
 run_cookie_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("cookie", upstream_port)
@@ -52,7 +96,7 @@ run_cookie_cases :: proc(r: ^Runner) {
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	srv, ok := start_server(r, Server_Options{config = config_cookies(udp_port, upstream_port, false), udp_port = udp_port})
+	srv, ok := start_server(r, Server_Options{config = config_cookies(udp_port, upstream_port, false), udp_port = udp_port, tcp_port = udp_port})
 	if !ok {
 		skip_case(r, "cookies", "server did not start")
 		return
@@ -146,6 +190,22 @@ run_cookie_cases :: proc(r: ^Runner) {
 			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.Form_Err), "rcode for a malformed cookie")
 		}
+	}
+	end_case(r)
+
+	start_case(r, "cookies: a query with no question primes a server cookie")
+	{
+		// RFC 7873 section 5.4: NOERROR for a client cookie alone or a valid
+		// server cookie, BADCOOKIE for one that does not check out.
+		issued := check_primed(r, query_udp(udp_port, priming_query(CLIENT_COOKIE)), .No_Error)
+		if issued != nil {
+			check_primed(r, query_udp(udp_port, priming_query(issued, id = 0x5152)), .No_Error)
+			forged := slice.clone(issued, context.temp_allocator)
+			forged[23] ~= 0xff
+			check_primed(r, query_udp(udp_port, priming_query(forged, id = 0x5153)), .Bad_Cookie)
+		}
+		// Over TCP as well; the transport makes no difference to section 5.4.
+		check_primed(r, query_tcp(udp_port, priming_query(CLIENT_COOKIE, id = 0x5154)), .No_Error)
 	}
 	end_case(r)
 
@@ -494,6 +554,14 @@ run_cookie_require_cases :: proc(r: ^Runner, mock: ^Mock, upstream_port: int) {
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode")
 			check(r, h.ancount > 0, "a client without cookies was not answered")
 		}
+	}
+	end_case(r)
+
+	start_case(r, "cookies: require still primes a cookie for a query with no question")
+	{
+		// Nothing is looked up, so `require` has nothing to protect, and section
+		// 5.4 answers a client cookie alone NOERROR.
+		check_primed(r, query_udp(udp_port, priming_query(CLIENT_COOKIE)), .No_Error)
 	}
 	end_case(r)
 

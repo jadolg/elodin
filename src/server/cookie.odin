@@ -205,6 +205,38 @@ cookie_must_be_refused :: proc(k: ^Cookie_Keeper, req: Cookie_Request, proto: Pr
 }
 
 /*
+The rcode for a query with no question, and whether it is a request for a server
+cookie and nothing else.
+
+RFC 7873 section 5.4 extends QUERY, on a server with cookies enabled, to a
+message with an empty question section and a COOKIE option. It is answered with
+no records and a valid server cookie - which `attach_cookie` adds as it does to
+every answer - and NOERROR when the query held a client cookie alone or a valid
+server cookie, BADCOOKIE when the server cookie it held is not one of ours. Both
+are SHALLs, so the second is kept although BIND answers it NOERROR too.
+
+Ahead of `cookies.require` and not subject to it, as in BIND: nothing is looked
+up, so there is nothing for it to protect, and the answer is a header, an OPT
+record and the cookie, no larger than the BADCOOKIE `require` would send.
+
+Anything else without exactly one question stays FORMERR: a server with cookies
+off and a client whose address no cookie can be bound to have none to give, and
+a malformed cookie was refused before this was asked.
+*/
+cookie_priming_rcode :: proc(msg: dns.Message, req: Cookie_Request) -> (rcode: dns.Rcode, priming: bool) {
+	if len(msg.question) != 0 || (req.verdict != .Unproven && req.verdict != .Valid) {
+		return .Form_Err, false
+	}
+	// `.Unproven` is a client cookie alone as well as a server cookie that did
+	// not check out, and only the second is BADCOOKIE.
+	raw, _ := dns.find_edns_option(msg, .Cookie)
+	if req.verdict == .Unproven && len(raw) > COOKIE_CLIENT_LEN {
+		return .Bad_Cookie, true
+	}
+	return .No_Error, true
+}
+
+/*
 Put this server's cookie into an answer that is already encoded.
 
 Every response to a client that sent a cookie carries a fresh one. RFC 9018

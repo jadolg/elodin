@@ -1142,8 +1142,14 @@ resolve_query :: proc(
 		return out, .Refused, built
 	}
 	if len(msg.question) != 1 {
-		out, built := dns.error_response(query, msg, .Form_Err, allocator, limit)
-		return out, .Failed, built
+		rcode, priming := cookie_priming_rcode(msg, cookie)
+		out, built := dns.error_response(query, msg, rcode, allocator, limit)
+		if !priming {
+			return out, .Failed, built
+		}
+		primed := Outcome.Local if rcode == .No_Error else Outcome.Refused
+		log_query(s, client, proto, {}, primed, "cookie", started)
+		return out, primed, built
 	}
 
 	q := msg.question[0]
