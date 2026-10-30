@@ -3,12 +3,14 @@ package server
 import "core:fmt"
 import "core:net"
 import "core:reflect"
+import "core:strconv"
 import "core:strings"
 import "core:testing"
 import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 import "elodin:tlsx"
 import "elodin:upstream"
 
@@ -504,4 +506,32 @@ test_profile_counters_reach_the_endpoint :: proc(t: ^testing.T) {
 	expect_line(t, page, "elodin_mobileconfig_signed_total 1")
 	expect_line(t, page, "elodin_mobileconfig_refused_total 1")
 	expect_line(t, page, "elodin_mobileconfig_unknown_host_total 1")
+}
+
+/*
+Uptime is measured on the moment clock from `up_since`, not on the wall clock
+from `started` (issue #557): `started` is an epoch time for
+`process_start_time_seconds`, and a step of the wall clock would move a duration
+read off it. The two are set a thousand days apart here, so a gauge read from
+the wrong one is off by that much.
+*/
+@(test)
+test_uptime_is_measured_on_the_moment_clock :: proc(t: ^testing.T) {
+	s, cfg := metrics_fixture({})
+	s.cfg = &cfg
+	s.started = time.time_add(time.now(), -1000 * 24 * time.Hour)
+	s.up_since = loop.moment_add(loop.moment_now(), -5 * time.Second)
+	listeners: Listeners
+	out := render_metrics(&s, &listeners, context.temp_allocator)
+
+	PREFIX :: "\nelodin_uptime_seconds "
+	at := strings.index(out, PREFIX)
+	if !testing.expect(t, at >= 0, "no elodin_uptime_seconds sample") {
+		return
+	}
+	line := out[at + len(PREFIX):]
+	line = line[:strings.index_byte(line, '\n')]
+	up, parsed := strconv.parse_f64(line)
+	testing.expectf(t, parsed && up >= 5 && up < 60, "uptime read %q, want five seconds and change", line)
+	free_all(context.temp_allocator)
 }

@@ -275,9 +275,9 @@ ss_answer :: proc(signatures: int, spent: ^int) -> (used: int, status: Status, r
 	now := time.unix(SS_NOW, 0)
 	v := make_validator(ss_no_query, nil, Options{})
 	defer destroy_validator(v)
-	cache_put(v, ".", .Secure, nil, MAX_ZONE_TTL, now)
-	cache_put(v, "com.", .Secure, nil, MAX_ZONE_TTL, now)
-	cache_put(v, "example.com.", .Secure, ss_key(), MAX_ZONE_TTL, now)
+	cache_put(v, ".", .Secure, nil, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, "com.", .Secure, nil, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, "example.com.", .Secure, ss_key(), MAX_ZONE_TTL, fixture_moment(now))
 
 	records := ss_big_txt()
 	sigs := make([]Rrsig, signatures, context.temp_allocator)

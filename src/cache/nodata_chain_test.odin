@@ -109,7 +109,7 @@ held_for :: proc(c: ^Cache, ch: Chain) -> (time.Duration, bool) {
 		return 0, false
 	}
 	e := c.entries[key]
-	return time.diff(e.inserted, e.expires), true
+	return time.Duration(e.expires - e.inserted), true
 }
 
 @(test)

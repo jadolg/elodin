@@ -5,6 +5,7 @@ import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 2026-08-02T10:00:00Z, which falls inside the validity period of every signature
@@ -17,6 +18,17 @@ FIXTURE_TIME :: 1785664800
 @(private = "file")
 fixture_now :: proc() -> time.Time {
 	return time.unix(FIXTURE_TIME, 0)
+}
+
+/*
+A fixture's instant on the zone cache's clock, for a test that seeds or reads the
+cache by hand. `FIXTURE_TIME` is the moment of the call, so an entry seeded at it
+lies on the same clock as one a walk stores: live to any walk until its lifetime
+has run on the real clock, however long the test binary had run before seeding
+it. A test moving its own clock forward still expires it.
+*/
+fixture_moment :: proc(t: time.Time) -> loop.Moment {
+	return loop.moment_add(loop.moment_now(), time.diff(fixture_now(), t))
 }
 
 @(private = "file")
@@ -272,6 +284,31 @@ counting_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem
 	return fixture_query(nil, name, type, allocator, nil)
 }
 
+/*
+A walk reads the zone cache at its own instant, `Budget.began` (issue #557): every
+zone it settled stays settled for the rest of it, at each step down the chain as
+well as at the anchor, however far the real clock has run past the entries'
+lifetimes. Began two hours ago, past `MAX_ZONE_TTL`, so a read at the real clock
+misses every one and walks the chain again.
+*/
+@(test)
+test_a_walk_sees_the_zones_it_settled :: proc(t: ^testing.T) {
+	counter := Counting_Ctx{}
+	v := make_validator(counting_query, &counter, Options{})
+	defer destroy_validator(v)
+
+	budget := query_budget(v)
+	budget.began = loop.moment_add(budget.began, -2 * time.Hour)
+	status, _, _ := zone_trust(v, &budget, "example.com.", fixture_now(), context.temp_allocator)
+	testing.expect_value(t, status, Status.Secure)
+	cold := counter.queries
+	again, _, _ := zone_trust(v, &budget, "example.com.", fixture_now(), context.temp_allocator)
+	end_walk(v, &budget)
+	testing.expect_value(t, again, Status.Secure)
+	testing.expectf(t, counter.queries == cold, "the walk asked %d more times for zones it had settled", counter.queries - cold)
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_zone_keys_are_cached :: proc(t: ^testing.T) {
 	// Walking a chain costs a DS and a DNSKEY per label. Doing that again for
@@ -294,7 +331,7 @@ test_zone_keys_are_cached :: proc(t: ^testing.T) {
 
 	// Nothing has run out of time yet, so a sweep should take nothing away and
 	// the walk after it should still be free.
-	testing.expect_value(t, sweep(v, fixture_now()), 0)
+	testing.expect_value(t, sweep(v), 0)
 	third, _, _ := trust(v, "example.com.")
 	testing.expect_value(t, third, Status.Secure)
 	testing.expect_value(t, counter.queries, cold)
@@ -1112,7 +1149,7 @@ test_cached_key_set_holds_no_gaps :: proc(t: ^testing.T) {
 	bad := Dnskey {
 		rdata = []u8{1, 1},
 	}
-	cache_put(v, "example.com.", .Secure, []Dnskey{good, bad}, 300, fixture_now())
+	cache_put(v, "example.com.", .Secure, []Dnskey{good, bad}, 300, fixture_moment(fixture_now()))
 
 	entry, found := v.zones["example.com."]
 	testing.expect(t, found, "the zone should have been cached")
@@ -1239,8 +1276,8 @@ validator_with_zone :: proc(zone: string, status: Status) -> (^Validator, []Dnsk
 	keys := make([]Dnskey, 1, context.temp_allocator)
 	keys[0] = unsupported_key()
 
-	cache_put(v, ".", .Secure, nil, MAX_ZONE_TTL, fixture_now())
-	cache_put(v, zone, status, keys if status == .Secure else nil, MAX_ZONE_TTL, fixture_now())
+	cache_put(v, ".", .Secure, nil, MAX_ZONE_TTL, fixture_moment(fixture_now()))
+	cache_put(v, zone, status, keys if status == .Secure else nil, MAX_ZONE_TTL, fixture_moment(fixture_now()))
 	return v, keys
 }
 

@@ -8,6 +8,7 @@ import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 import "elodin:upstream"
 
 /*
@@ -21,8 +22,8 @@ age_to :: proc(answers: ^cache.Cache, left: time.Duration) {
 	kb: [cache.KEY_MAX]u8
 	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
 	if e, found := answers.entries[key]; found {
-		e.expires = time.time_add(time.now(), left)
-		e.inserted = time.time_add(e.expires, -300 * time.Second)
+		e.expires = loop.moment_add(loop.moment_now(), left)
+		e.inserted = loop.moment_add(e.expires, -300 * time.Second)
 	}
 }
 
@@ -255,12 +256,12 @@ test_a_prefetch_does_not_count_a_replayed_verdict :: proc(t: ^testing.T) {
 	copy(hit.wire, query)
 
 	prefetching = true
-	serve_bogus_verdict(&s, hit, query, msg, msg.question[0], .UDP, "127.0.0.1:5555", time.now())
+	serve_bogus_verdict(&s, hit, query, msg, msg.question[0], .UDP, "127.0.0.1:5555", time.tick_now())
 	prefetching = false
 	testing.expect_value(t, s.stats.bogus, 0)
 	testing.expect_value(t, s.stats.failed, 0)
 
-	serve_bogus_verdict(&s, hit, query, msg, msg.question[0], .UDP, "127.0.0.1:5555", time.now())
+	serve_bogus_verdict(&s, hit, query, msg, msg.question[0], .UDP, "127.0.0.1:5555", time.tick_now())
 	testing.expect_value(t, s.stats.bogus, 1)
 	testing.expect_value(t, s.stats.failed, 1)
 	free_all(context.temp_allocator)

@@ -5,6 +5,7 @@ import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 
 @(private)
 build_answer :: proc(name: string, ttl: u32, allocator := context.allocator) -> ([]u8, dns.Message) {
@@ -188,7 +189,7 @@ test_a_bogus_verdict_is_kept_for_its_own_minute :: proc(t: ^testing.T) {
 	if !testing.expect(t, e != nil, "the entry went in under another key") {
 		return
 	}
-	testing.expect_value(t, time.diff(e.inserted, e.expires), time.Duration(BOGUS_TTL) * time.Second)
+	testing.expect_value(t, time.Duration(e.expires - e.inserted), time.Duration(BOGUS_TTL) * time.Second)
 
 	_, _, found := get(c, key, context.temp_allocator)
 	testing.expect(t, found, "the verdict was stored and then not found")
@@ -636,8 +637,8 @@ test_byte_accounting_comes_back_to_zero :: proc(t: ^testing.T) {
 @(private = "file")
 sync_expire :: proc(c: ^Cache, key: string, ago := 1 * time.Second) {
 	if e, ok := c.entries[key]; ok {
-		e.expires = time.time_add(time.now(), -ago)
-		e.inserted = time.time_add(time.now(), -ago - 3600 * time.Second)
+		e.expires = loop.moment_add(loop.moment_now(), -ago)
+		e.inserted = loop.moment_add(loop.moment_now(), -ago - 3600 * time.Second)
 	}
 }
 

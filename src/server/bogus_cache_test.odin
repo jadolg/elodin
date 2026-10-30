@@ -9,6 +9,7 @@ import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 import "elodin:dnssec"
 import "elodin:upstream"
 
@@ -464,8 +465,8 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 		return
 	}
 	if e, in_cache := f.answers.entries[f.key]; in_cache {
-		e.expires = time.time_add(time.now(), -1 * time.Second)
-		e.inserted = time.time_add(time.now(), -3600 * time.Second)
+		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
+		e.inserted = loop.moment_add(loop.moment_now(), -3600 * time.Second)
 	} else {
 		testing.expect(t, false, "the answer went in under another key")
 		return

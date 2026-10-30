@@ -747,6 +747,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		filters      = filters,
 		loops        = loops,
 		started      = time.now(),
+		up_since     = loop.moment_now(),
 		running      = true,
 	}
 
@@ -999,7 +1000,10 @@ Maintenance :: struct {
 	rebuild_again:  bool,
 	// On the wall clock, as the cached copies' ages are by their mtime: a
 	// monotonic clock stops while the machine is suspended, and a day's
-	// refresh would wait for a day awake.
+	// refresh would wait for a day awake. The moment clock would not stop, but
+	// `fetch_list` judges a copy fresh by its mtime against the wall clock, so
+	// after a step back a timer on any other clock would find the copy fresh,
+	// skip the download and wait a whole further period.
 	last_refresh:   time.Time,
 	// Zero while the lists are current; otherwise the wait before the next
 	// attempt, which `refresh_retry` stretches on each failure (#411).

@@ -219,9 +219,9 @@ test_a_shed_walk_still_answers_from_the_cache :: proc(t: ^testing.T) {
 	now := time.unix(FIXTURE_TIME, 0)
 	// A chain already in the cache, put there the way a first question would.
 	keys := []Dnskey{}
-	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, now)
-	cache_put(v, "com.", .Secure, keys, MAX_ZONE_TTL, now)
-	cache_put(v, "example.com.", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, "com.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, "example.com.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
 
 	testing.expect(t, take_walk_slot(v), "the one slot should be free")
 	defer drop_walk_slot(v)
@@ -262,9 +262,9 @@ test_a_shed_walk_below_a_warm_apex_still_stops :: proc(t: ^testing.T) {
 
 	now := time.unix(FIXTURE_TIME, 0)
 	keys := []Dnskey{}
-	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, now)
-	cache_put(v, "com.", .Secure, keys, MAX_ZONE_TTL, now)
-	cache_put(v, "example.com.", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, "com.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, "example.com.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
 
 	testing.expect(t, take_walk_slot(v), "the one slot should be free")
 	defer drop_walk_slot(v)

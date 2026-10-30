@@ -156,7 +156,7 @@ Refresh :: struct {
 	allocator:  mem.Allocator,
 	// The client's own start time, so the refresh's query-log line reports the
 	// latency that client saw rather than the fraction of it this job ran for.
-	started:    time.Time,
+	started:    time.Tick,
 	// Started ahead of the expiry rather than after it, and the entry it was
 	// started for; see `start_prefetch`.
 	prefetch:   bool,
@@ -253,7 +253,7 @@ start_refresh :: proc(
 	proto: Protocol,
 	client: string,
 	limit: int,
-	started: time.Time,
+	started: time.Tick,
 	prefetch := false,
 	serial: u64 = 0,
 ) -> ^Refresh {
@@ -343,7 +343,7 @@ start_prefetch :: proc(
 ) {
 	// Counted by the job itself, ahead of any failure it counts, so a scrape
 	// never sees more failures than prefetches.
-	if r := start_refresh(s, key, query, proto, client, limit, time.now(), prefetch = true, serial = serial);
+	if r := start_refresh(s, key, query, proto, client, limit, time.tick_now(), prefetch = true, serial = serial);
 	   r != nil {
 		refresh_release(r)
 	}

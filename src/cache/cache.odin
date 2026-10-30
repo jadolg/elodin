@@ -5,6 +5,7 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 An LRU answer cache.
@@ -20,14 +21,24 @@ Entry :: struct {
 	wire:        []u8,
 	ttl_offsets: []int,
 	ttls:        []u32,
-	inserted:    time.Time,
-	expires:     time.Time,
+	/*
+	On the moment clock, not the wall clock (issue #557): a TTL is a duration,
+	and a step of the wall clock would otherwise expire the whole cache at once
+	or serve every answer past its TTL for the length of the step.
+	*/
+	inserted:    loop.Moment,
+	expires:     loop.Moment,
 	/*
 	When the first RRSIG in the message stops verifying, or zero for a message
 	that carries none. Neither the entry nor its stale window outlives it: see
 	`signatures_lapse` and `deadline`.
+
+	A moment too: what the expiration leaves is read off the wall clock once, at
+	insert, and held as a duration from then on - the TTL RFC 4035 section 5.3.3
+	has a validator set, "the difference of the RRSIG RR's Signature Expiration
+	time and the current time" at the time it accepts the RRset.
 	*/
-	signed_until: time.Time,
+	signed_until: loop.Moment,
 	/*
 	Whether the answer section redirects anywhere: it holds a CNAME. A DNAME
 	always arrives with one, so is not looked for separately - see `redirects`.
@@ -148,7 +159,7 @@ Hit :: struct {
 	// The entry's `signed_until`. A caller that holds a stale copy while it
 	// waits on an upstream reads it again before handing the copy out, since
 	// the wait can outlast the signature.
-	signed_until: time.Time,
+	signed_until: loop.Moment,
 }
 
 Stats :: struct {
@@ -491,8 +502,8 @@ get :: proc(
 		return nil, {}, false
 	}
 
-	now := time.now()
-	if time.diff(deadline(c, e), now) > 0 {
+	now := loop.moment_now()
+	if now > deadline(c, e) {
 		remove_entry(c, e)
 		if !probe {
 			c.stats.misses += 1
@@ -506,11 +517,11 @@ get :: proc(
 	hit.ede = e.ede
 	hit.signed_until = e.signed_until
 
-	elapsed := u32(max(0, time.duration_seconds(time.diff(e.inserted, now))))
+	elapsed := u32(max(0, time.duration_seconds(time.Duration(now - e.inserted))))
 	out := make([]u8, len(e.wire), allocator)
 	copy(out, e.wire)
 
-	if time.diff(e.expires, now) > 0 {
+	if now > e.expires {
 		// A stale answer goes out with a short fixed TTL rather than a
 		// counted-down one, which would already have reached zero. Bounded by
 		// `max_ttl` like everything else this cache hands out: an operator who
@@ -868,12 +879,12 @@ the point of it. And once per entry: see `Entry.prefetched`.
 The caller holds the lock.
 */
 @(private)
-claim_prefetch :: proc(c: ^Cache, e: ^Entry, now: time.Time) -> bool {
+claim_prefetch :: proc(c: ^Cache, e: ^Entry, now: loop.Moment) -> bool {
 	if !c.prefetch || e.prefetched || e.bogus {
 		return false
 	}
-	lifetime := time.diff(e.inserted, e.expires)
-	if lifetime < c.prefetch_min || time.diff(now, e.expires) > lifetime / 10 {
+	lifetime := time.Duration(e.expires - e.inserted)
+	if lifetime < c.prefetch_min || time.Duration(e.expires - now) > lifetime / 10 {
 		return false
 	}
 	e.prefetched = true
@@ -1084,8 +1095,12 @@ the same shape stopped one layer further out, on the paths no validator
 	// Asked only when there is a copy to forget: most stores name none.
 	stale := supersedes if supersedes != 0 && concerns_question(msg) else 0
 
-	now := time.now()
-	now_unix := time.time_to_unix(now)
+	// The wall clock is read here only, for the signatures' absolute
+	// expiration; everything the entry stores is on the moment clock. The
+	// moment is read first, so the expiration it carries is never late.
+	now := loop.moment_now()
+	wall := time.now()
+	now_unix := time.time_to_unix(wall)
 	signed_left, signed := dns.signatures_lapse(wire, u32(now_unix))
 	// A message whose signature has already lapsed is not stored at all, past
 	// `min_ttl`, which is a floor on what records claim and not on what their
@@ -1239,12 +1254,13 @@ thing in both directions.
 	e.refused = refused
 	e.ede = ede
 	e.inserted = now
-	e.expires = time.time_add(now, time.Duration(effective) * time.Second)
+	e.expires = loop.moment_add(now, time.Duration(effective) * time.Second)
 	if signed {
-		// The expiration second itself, which `now` is a fraction past the
+		// The expiration second itself, which `wall` is a fraction past the
 		// whole second `signed_left` counts from.
-		e.signed_until = time.unix(now_unix + i64(signed_left), 0)
-		if time.diff(e.signed_until, e.expires) > 0 {
+		past_second := time.diff(time.unix(now_unix, 0), wall)
+		e.signed_until = loop.moment_add(now, time.Duration(signed_left) * time.Second - past_second)
+		if e.expires > e.signed_until {
 			e.expires = e.signed_until
 		}
 	}
@@ -1264,7 +1280,7 @@ thing in both directions.
 		as the prefetch that did not help. A second's slack for the whole seconds
 		a TTL is counted in.
 		*/
-		if old.prefetched && time.diff(old.expires, e.expires) <= time.Second {
+		if old.prefetched && time.Duration(e.expires - old.expires) <= time.Second {
 			e.prefetched = true
 		}
 		remove_entry(c, old)
@@ -1325,11 +1341,11 @@ sweep :: proc(c: ^Cache) -> (removed: int) {
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
 
-	now := time.now()
+	now := loop.moment_now()
 	e := c.tail
 	for e != nil {
 		prev := e.prev
-		if time.diff(deadline(c, e), now) > 0 {
+		if now > deadline(c, e) {
 			remove_entry(c, e)
 			removed += 1
 		}
@@ -1368,11 +1384,11 @@ stats :: proc(c: ^Cache) -> Stats {
 
 // Whole seconds before `signed_until` - an entry's, or a hit's - or no bound
 // for one that is zero, an entry that carries no RRSIG.
-signature_left :: proc(signed_until, now: time.Time) -> u32 {
-	if signed_until == {} {
+signature_left :: proc(signed_until, now: loop.Moment) -> u32 {
+	if signed_until == 0 {
 		return max(u32)
 	}
-	return u32(max(0, time.duration_seconds(time.diff(now, signed_until))))
+	return u32(max(0, time.duration_seconds(time.Duration(signed_until - now))))
 }
 
 /*
@@ -1396,14 +1412,14 @@ behind.
 The caller holds the lock.
 */
 @(private)
-deadline :: proc(c: ^Cache, e: ^Entry) -> time.Time {
+deadline :: proc(c: ^Cache, e: ^Entry) -> loop.Moment {
 	if !c.serve_stale || e.bogus {
 		return e.expires
 	}
 	// The stale window is for an upstream outage, not for signatures that no
 	// longer verify: it ends where they do (RFC 4034 section 3.1.5).
-	stale := time.time_add(e.expires, MAX_STALE)
-	if e.signed_until != {} && time.diff(e.signed_until, stale) > 0 {
+	stale := loop.moment_add(e.expires, MAX_STALE)
+	if e.signed_until != 0 && stale > e.signed_until {
 		return e.signed_until
 	}
 	return stale

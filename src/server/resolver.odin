@@ -246,11 +246,14 @@ Server :: struct {
 	// nothing in flight.
 	inflight:     Inflight_Table,
 	stats:        Stats,
-	// When this process began serving. Not a setting and not a counter: the
-	// metrics endpoint reports uptime from it, and Prometheus's
-	// `process_start_time_seconds` is what every client library calls the same
-	// thing.
+	// When this process began serving, as an epoch time. Not a setting and not
+	// a counter: the metrics endpoint reports it as Prometheus's
+	// `process_start_time_seconds`, which is what every client library calls
+	// the same thing.
 	started:      time.Time,
+	// The same instant on the moment clock, which uptime is measured on so a
+	// step of the wall clock does not move it (issue #557).
+	up_since:     loop.Moment,
 	running:      bool,
 }
 
@@ -298,7 +301,7 @@ handle_query :: proc(
 	// One generation from the first read of the configuration to the last,
 	// whatever transport brought the query; see `generation.odin`.
 	pin_scope(s)
-	started := time.now()
+	started := time.tick_now()
 	sync.atomic_add(&s.stats.queries, 1)
 
 	if len(query) < dns.HEADER_SIZE {
@@ -1103,7 +1106,7 @@ resolve_query :: proc(
 	client: string,
 	limit: int,
 	cookie: Cookie_Request,
-	started: time.Time,
+	started: time.Tick,
 	// What this request has taken out of its arena reading messages, owned by
 	// `handle_query`, which owns that arena. See `dns.REQUEST_DECODE_BUDGET`.
 	spent: ^int,
@@ -3077,7 +3080,7 @@ stored_verdict :: proc(
 // Whether a held copy's signatures, if it carries any, still verify now.
 @(private)
 stale_usable :: proc(hit: Cached_Answer) -> bool {
-	return hit.signed_until == {} || time.diff(time.now(), hit.signed_until) > 0
+	return hit.signed_until == 0 || hit.signed_until > loop.moment_now()
 }
 
 /*
@@ -3101,7 +3104,7 @@ upstream_failed :: proc(
 	client: string,
 	limit: int,
 	validating: bool,
-	started: time.Time,
+	started: time.Tick,
 	spent: ^int,
 	allocator: mem.Allocator,
 	ede: ^u16,
@@ -3113,8 +3116,8 @@ upstream_failed :: proc(
 	bool,
 ) {
 	if stale_hit.wire != nil && stale_usable(stale_hit) {
-		if stale_hit.signed_until != {} {
-			dns.cap_ttls(stale_hit.wire, cache.signature_left(stale_hit.signed_until, time.now()))
+		if stale_hit.signed_until != 0 {
+			dns.cap_ttls(stale_hit.wire, cache.signature_left(stale_hit.signed_until, loop.moment_now()))
 		}
 		return serve_from_cache(s, stale_hit, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
 	}
@@ -3469,8 +3472,8 @@ Cached_Answer :: struct {
 	// This lookup is the one to refresh the entry before it expires.
 	prefetch:  bool,
 	// When the entry's first RRSIG expires, zero for one that carries none; see
-	// `upstream_failed`.
-	signed_until: time.Time,
+	// `upstream_failed`. On `cache.Entry.signed_until`'s clock.
+	signed_until: loop.Moment,
 }
 
 /*
@@ -3614,7 +3617,7 @@ serve_bogus_verdict :: proc(
 	q: dns.Question,
 	proto: Protocol,
 	client: string,
-	started: time.Time,
+	started: time.Tick,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -3668,7 +3671,7 @@ serve_from_cache :: proc(
 	client: string,
 	limit: int,
 	validating: bool,
-	started: time.Time,
+	started: time.Tick,
 	// The request's name counter; the entry is decoded again here. See
 	// `dns.REQUEST_DECODE_BUDGET`.
 	spent: ^int,
@@ -4391,7 +4394,7 @@ chase_rewrite_alias :: proc(
 	client: string,
 	limit: int,
 	cookie: Cookie_Request,
-	started: time.Time,
+	started: time.Tick,
 	spent: ^int,
 	allocator: mem.Allocator,
 	pool: dnssec.Walk_Pool,
@@ -4645,13 +4648,13 @@ log_query :: proc(
 	q: dns.Question,
 	outcome: Outcome,
 	detail: string,
-	started: time.Time,
+	started: time.Tick,
 ) {
 	// A prefetch is not a query anybody sent; see `prefetching`.
 	if !live(s).cfg.log.queries || prefetching {
 		return
 	}
-	elapsed := time.diff(started, time.now())
+	elapsed := time.tick_since(started)
 	/*
 	The source address and the port it sent from are two fields, not one.
 

@@ -4,6 +4,7 @@ import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 A walk whose DS question lands on a CNAME the parent signed (issue #552).
@@ -208,7 +209,7 @@ test_a_cname_the_parent_signed_is_no_cut :: proc(t: ^testing.T) {
 		testing.expectf(t, status == .Secure, "%s: got %v (%q)", name, status, budget.broken)
 		testing.expect_value(t, zone, "cntest.")
 		testing.expectf(t, len(keys) > 0, "%s: the zone should publish a key", name)
-		_, _, non_cut := cache_get(v, name, now, context.temp_allocator)
+		_, _, non_cut := cache_get(v, name, loop.moment_now(), context.temp_allocator)
 		testing.expectf(t, non_cut, "%s: the non-cut should be remembered", name)
 	}
 	free_all(context.temp_allocator)
@@ -247,7 +248,7 @@ test_a_cname_that_does_not_speak_for_its_owner_is_no_proof :: proc(t: ^testing.T
 		budget := query_budget(v)
 		status, _, _ := zone_trust(v, &budget, name, now, context.temp_allocator)
 		testing.expectf(t, status == .Bogus, "%s: got %v", name, status)
-		_, _, non_cut := cache_get(v, name, now, context.temp_allocator)
+		_, _, non_cut := cache_get(v, name, loop.moment_now(), context.temp_allocator)
 		testing.expectf(t, !non_cut, "%s: should not be remembered as a non-cut", name)
 	}
 	free_all(context.temp_allocator)
@@ -272,7 +273,7 @@ test_a_cname_step_out_of_verifications_is_undecided :: proc(t: ^testing.T) {
 	step, _ := zone_step(v, &budget, "cntest.", keys, "lone.cntest.", now, context.temp_allocator)
 	end_walk(v, &budget)
 	testing.expect_value(t, step, Step.Indeterminate)
-	_, _, non_cut := cache_get(v, "lone.cntest.", now, context.temp_allocator)
+	_, _, non_cut := cache_get(v, "lone.cntest.", loop.moment_now(), context.temp_allocator)
 	testing.expect(t, !non_cut, "an unread CNAME should not be remembered as a non-cut")
 	free_all(context.temp_allocator)
 }

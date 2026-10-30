@@ -11,6 +11,7 @@ import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:loop"
 import "elodin:upstream"
 
 /*
@@ -3098,4 +3099,34 @@ test_the_question_span_is_the_longest_group_budget :: proc(t: ^testing.T) {
 	s.anchor_zones = []string{"corp.example."}
 	testing.expect_value(t, question_span(&s, "example.com.", .A), 400 * time.Millisecond)
 	free_all(context.temp_allocator)
+}
+
+/*
+The apex memory's window is on `loop.Moment`, as the cooldown it stands in for
+is (issue #557). On the wall clock a step forward would forget every unhelpful
+parent at once, and a step back would hold one for the length of the step. A step
+cannot be made from a test, so this asserts what rules one out: the window a
+reply opens ends `upstream.COOLDOWN` past a moment read between two readings of
+`loop.moment_now`.
+*/
+@(test)
+test_the_apex_memory_is_timed_on_the_moment_clock :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	routed := upstream.Group{}
+	domains := []string{"memo.example."}
+	routes := []Zone_Route{{domains = domains, group = &routed}}
+	s := Server {
+		cfg    = &cfg,
+		routes = routes,
+	}
+	before := loop.moment_now()
+	remember_apex_ds_parent(&s, domains[0], true, false)
+	after := loop.moment_now()
+
+	slot := live(&s).apex_memo.slots[0]
+	if !testing.expect_value(t, slot.name, domains[0]) {
+		return
+	}
+	opened := loop.moment_add(slot.until, -upstream.COOLDOWN)
+	testing.expectf(t, before <= opened && opened <= after, "the window opened at %d, outside the moment clock's [%d, %d]", opened, before, after)
 }

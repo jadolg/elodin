@@ -259,7 +259,7 @@ test_a_chased_target_that_cannot_be_read_back_is_servfail :: proc(t: ^testing.T)
 		"127.0.0.1:5555",
 		512,
 		Cookie_Request{},
-		time.now(),
+		time.tick_now(),
 		&spent,
 		context.temp_allocator,
 		.Shared,

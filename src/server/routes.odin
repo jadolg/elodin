@@ -5,6 +5,7 @@ import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:dnssec"
+import "elodin:loop"
 import "elodin:upstream"
 
 /*
@@ -685,8 +686,9 @@ Apex_Memo_Slot :: struct {
 	name:    string,
 	// When this stops being remembered, and until when the count below stays
 	// consecutive. The zero value is in the past, which is what makes a cleared
-	// slot read as no memory at all.
-	until:   time.Time,
+	// slot read as no memory at all. On the moment clock, as the cooldown it
+	// stands in for is (issue #557).
+	until:   loop.Moment,
 	// Unsettled replies in a row inside the window, against
 	// `upstream.FAILURE_THRESHOLD`. See `apex_ds_parent_unsettled`.
 	strikes: int,
@@ -769,12 +771,12 @@ shows the rate matters.
 */
 @(private)
 apex_ds_parent_unsettled :: proc(s: ^Server, name: string) -> bool {
-	now := time.now()
+	now := loop.moment_now()
 	sync.mutex_lock(&live(s).apex_memo.mu)
 	defer sync.mutex_unlock(&live(s).apex_memo.mu)
 	for slot in live(s).apex_memo.slots {
 		if slot.name != "" && dns.name_equal_fold(slot.name, name) {
-			return slot.strikes >= upstream.FAILURE_THRESHOLD && time.diff(now, slot.until) > 0
+			return slot.strikes >= upstream.FAILURE_THRESHOLD && slot.until > now
 		}
 	}
 	return false
@@ -815,7 +817,7 @@ remember_apex_ds_parent :: proc(s: ^Server, name: string, reached, settled: bool
 	if !found || covered_by_local_anchor(s, apex) {
 		return
 	}
-	now := time.now()
+	now := loop.moment_now()
 	sync.mutex_lock(&live(s).apex_memo.mu)
 	defer sync.mutex_unlock(&live(s).apex_memo.mu)
 	victim := -1
@@ -839,7 +841,7 @@ remember_apex_ds_parent :: proc(s: ^Server, name: string, reached, settled: bool
 		free; where none is, this apex is one of the ones the ceiling leaves out
 		and it pays what every apex pays without this memory.
 		*/
-		if victim < 0 && time.diff(now, slot.until) <= 0 {
+		if victim < 0 && slot.until <= now {
 			victim = i
 		}
 	}
@@ -853,12 +855,12 @@ remember_apex_ds_parent :: proc(s: ^Server, name: string, reached, settled: bool
 	// Consecutive means inside the window: a slot whose own has run out is a
 	// count that expired with it, and this reply is the first of the next one.
 	strikes := 1
-	if live(s).apex_memo.slots[victim].name == apex && time.diff(now, live(s).apex_memo.slots[victim].until) > 0 {
+	if live(s).apex_memo.slots[victim].name == apex && live(s).apex_memo.slots[victim].until > now {
 		strikes = live(s).apex_memo.slots[victim].strikes + 1
 	}
 	live(s).apex_memo.slots[victim] = {
 		name    = apex,
-		until   = time.time_add(now, upstream.COOLDOWN),
+		until   = loop.moment_add(now, upstream.COOLDOWN),
 		strikes = strikes,
 	}
 }
