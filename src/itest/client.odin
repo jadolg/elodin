@@ -1,5 +1,6 @@
 package itest
 
+import "core:c"
 import "core:encoding/base64"
 import "core:mem"
 import "core:net"
@@ -810,4 +811,54 @@ wildcard_flood :: proc(udp_port: int, query: []u8, count: int, drain := 700 * ti
 		res.v6_answered = true
 	}
 	return res
+}
+
+/*
+Two TLS handshakes on `port` at `version`, the second offering the session the
+first was given, each writing `request` and reading a reply before it closes.
+The read is what brings in a TLS 1.3 server's tickets, which follow the
+handshake. Driven on the raw `SSL`, because `tlsx.client_connect` never resumes.
+*/
+@(private)
+tls_resumes :: proc(port: int, version: int, alpn: []string, request: []u8) -> (reused, ok: bool) {
+	ctx, cerr := tlsx.client_context(false, "", alpn, context.temp_allocator)
+	if cerr != .None {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	if !tlsx.ssl_ctx_set_max_proto_version(ctx.ptr, c.long(version)) {
+		return
+	}
+	session: ^tlsx.SSL_SESSION
+	defer if session != nil {tlsx.SSL_SESSION_free(session)}
+	for round in 0 ..< 2 {
+		socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
+		if err != nil {
+			return
+		}
+		defer net.close(socket)
+		_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
+		_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
+		ssl := tlsx.SSL_new(ctx.ptr)
+		if ssl == nil {
+			return
+		}
+		defer tlsx.SSL_free(ssl)
+		if tlsx.SSL_set_fd(ssl, c.int(net.Socket(socket))) != 1 ||
+		   (session != nil && tlsx.SSL_set_session(ssl, session) != 1) ||
+		   tlsx.SSL_connect(ssl) != 1 ||
+		   tlsx.SSL_write(ssl, raw_data(request), c.int(len(request))) != c.int(len(request)) {
+			return
+		}
+		b: [1]u8
+		if tlsx.SSL_read(ssl, &b, 1) != 1 {
+			return
+		}
+		reused = tlsx.SSL_session_reused(ssl) == 1
+		if round == 0 {
+			session = tlsx.SSL_get1_session(ssl)
+		}
+		tlsx.SSL_shutdown(ssl)
+	}
+	return reused, true
 }

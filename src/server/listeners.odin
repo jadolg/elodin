@@ -1622,6 +1622,21 @@ reload_tls_ctx :: proc(
 }
 
 /*
+Rotate the DoT and DoH session-ticket keys on schedule (see
+`tlsx.TICKET_KEY_INTERVAL`), as of `now`.
+
+From the maintenance tick, so a listener nobody connects to still erases a key
+two intervals old; a handshake rotates them as well. Under the shared lock, so
+the reload cannot free a context while its keys are being rotated.
+*/
+rotate_ticket_keys :: proc(l: ^Listeners, now: time.Tick) {
+	sync.rw_mutex_shared_lock(&l.tls_mu)
+	defer sync.rw_mutex_shared_unlock(&l.tls_mu)
+	tlsx.rotate_ticket_keys(l.dot_ctx, now)
+	tlsx.rotate_ticket_keys(l.doh_ctx, now)
+}
+
+/*
 Accept a TLS connection on `proto`, taking the certificate context under the
 lock the reload replaces it under.
 

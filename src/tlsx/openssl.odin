@@ -14,6 +14,44 @@ SSL :: struct {}
 SSL_METHOD :: struct {}
 SSL_SESSION :: struct {}
 
+// What a session-ticket key is used through; see `tickets.odin`.
+EVP_CIPHER :: struct {}
+EVP_CIPHER_CTX :: struct {}
+EVP_MAC_CTX :: struct {}
+
+// `struct ossl_param_st` from <openssl/core.h>, built by hand rather than with
+// the `OSSL_PARAM_construct_*` helpers, which return it by value.
+OSSL_PARAM :: struct {
+	key:         cstring,
+	data_type:   c.uint,
+	data:        rawptr,
+	data_size:   c.size_t,
+	return_size: c.size_t,
+}
+
+OSSL_PARAM_UTF8_STRING :: 4
+OSSL_PARAM_OCTET_STRING :: 5
+OSSL_PARAM_UNMODIFIED :: max(c.size_t)
+
+// `TLSEXT_KEYNAME_LENGTH` and the IV `EVP_aes_256_cbc` takes.
+TLSEXT_KEYNAME_LENGTH :: 16
+AES_256_CBC_IV_LENGTH :: 16
+
+/*
+OpenSSL's session-ticket key callback. `enc` is 1 to seal a new ticket and 0 to
+open one: sealing answers 1, or 0 to issue no ticket; opening answers 1, 2 to
+open it and issue a fresh one, or 0 for a ticket no key here opens, which is a
+full handshake.
+*/
+Ticket_Key_Cb :: #type proc "c" (
+	ssl: ^SSL,
+	key_name: [^]u8,
+	iv: [^]u8,
+	cctx: ^EVP_CIPHER_CTX,
+	hctx: ^EVP_MAC_CTX,
+	enc: c.int,
+) -> c.int
+
 // Only what signing an Apple configuration profile needs: the certificate and
 // key a server context already holds, and the CMS structure they are wrapped in.
 X509 :: struct {}
@@ -131,6 +169,12 @@ foreign libssl {
 	SSL_CTX_set_alpn_protos :: proc(ctx: ^SSL_CTX, protos: [^]u8, len: c.uint) -> c.int ---
 	SSL_CTX_set_alpn_select_cb :: proc(ctx: ^SSL_CTX, cb: ALPN_Select_Cb, arg: rawptr) ---
 	SSL_CTX_set_ex_data :: proc(ctx: ^SSL_CTX, idx: c.int, data: rawptr) -> c.int ---
+	SSL_CTX_get_ex_data :: proc(ctx: ^SSL_CTX, idx: c.int) -> rawptr ---
+	SSL_CTX_set_tlsext_ticket_key_evp_cb :: proc(ctx: ^SSL_CTX, cb: Ticket_Key_Cb) -> c.int ---
+	// Seconds; how long a session, and so a ticket, stays resumable.
+	SSL_CTX_set_timeout :: proc(ctx: ^SSL_CTX, t: c.long) -> c.long ---
+	SSL_CTX_get_timeout :: proc(ctx: ^SSL_CTX) -> c.long ---
+	SSL_get_SSL_CTX :: proc(ssl: ^SSL) -> ^SSL_CTX ---
 
 	SSL_new :: proc(ctx: ^SSL_CTX) -> ^SSL ---
 	SSL_free :: proc(ssl: ^SSL) ---
@@ -153,6 +197,7 @@ foreign libssl {
 	SSL_SESSION_free :: proc(session: ^SSL_SESSION) ---
 	SSL_session_reused :: proc(ssl: ^SSL) -> c.int ---
 	SSL_CTX_set_options :: proc(ctx: ^SSL_CTX, op: u64) -> u64 ---
+	SSL_SESSION_get0_ticket :: proc(s: ^SSL_SESSION, tick: ^[^]u8, len: ^c.size_t) ---
 
 	// The material a context was loaded with, borrowed back out of it. `get0`
 	// means no reference is taken; see `signer_of`.
@@ -165,6 +210,14 @@ foreign libcrypto {
 	CRYPTO_get_ex_new_index :: proc(class_index: c.int, argl: c.long, argp: rawptr, new_func: rawptr, dup_func: rawptr, free_func: CRYPTO_EX_Free) -> c.int ---
 
 	ERR_get_error :: proc() -> c.ulong ---
+
+	RAND_bytes :: proc(buf: [^]u8, num: c.int) -> c.int ---
+	RAND_priv_bytes :: proc(buf: [^]u8, num: c.int) -> c.int ---
+	OPENSSL_cleanse :: proc(ptr: rawptr, len: c.size_t) ---
+	EVP_aes_256_cbc :: proc() -> ^EVP_CIPHER ---
+	EVP_EncryptInit_ex :: proc(ctx: ^EVP_CIPHER_CTX, cipher: ^EVP_CIPHER, impl: rawptr, key: [^]u8, iv: [^]u8) -> c.int ---
+	EVP_DecryptInit_ex :: proc(ctx: ^EVP_CIPHER_CTX, cipher: ^EVP_CIPHER, impl: rawptr, key: [^]u8, iv: [^]u8) -> c.int ---
+	EVP_MAC_CTX_set_params :: proc(ctx: ^EVP_MAC_CTX, params: [^]OSSL_PARAM) -> c.int ---
 	ERR_clear_error :: proc() ---
 	ERR_error_string_n :: proc(e: c.ulong, buf: [^]u8, len: c.size_t) ---
 

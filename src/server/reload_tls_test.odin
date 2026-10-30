@@ -248,3 +248,30 @@ test_reload_tls_waits_for_a_connection_holding_the_context :: proc(t: ^testing.T
 	testing.expect(t, sync.atomic_load(&race.finished), "reload_tls never finished after the connection let go")
 	testing.expect(t, l.dot_ctx != first, "reload_tls did not swap the context in once it could")
 }
+
+// The maintenance tick's rotation reaches both encrypted listeners' keys.
+@(test)
+test_rotate_ticket_keys_reaches_dot_and_doh :: proc(t: ^testing.T) {
+	cert, key, ok := ensure_cert()
+	if !ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+	l := Listeners{}
+	dot, derr := tlsx.server_context(cert, key, DOT_ALPN)
+	doh, herr := tlsx.server_context(cert, key, DOH_ALPN)
+	defer tlsx.context_destroy(dot)
+	defer tlsx.context_destroy(doh)
+	if !testing.expect(t, derr == .None && herr == .None, "server_context failed") {
+		return
+	}
+	l.dot_ctx, l.doh_ctx = dot, doh
+	dot_before, _ := tlsx.ticket_key_name(dot)
+	doh_before, _ := tlsx.ticket_key_name(doh)
+
+	rotate_ticket_keys(&l, time.tick_add(time.tick_now(), tlsx.TICKET_KEY_INTERVAL))
+	dot_after, dok := tlsx.ticket_key_name(dot)
+	doh_after, hok := tlsx.ticket_key_name(doh)
+	testing.expect(t, dok && dot_after != dot_before, "the DoT ticket key did not rotate")
+	testing.expect(t, hok && doh_after != doh_before, "the DoH ticket key did not rotate")
+}

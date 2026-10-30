@@ -125,6 +125,7 @@ init_once: sync.Once
 do_init :: proc() {
 	OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, nil)
 	alpn_ex_index = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL_CTX, 0, nil, nil, nil, alpn_ex_free)
+	tickets_ex_index = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL_CTX, 0, nil, nil, nil, tickets_ex_free)
 }
 
 // Safe to call from any thread and any number of times.
@@ -489,6 +490,12 @@ server_context :: proc(
 	refuses them does a full handshake each time.
 	*/
 	ssl_ctx_set_session_cache_mode(ptr, SSL_SESS_CACHE_OFF)
+	// Rotated, rather than OpenSSL's one key for the life of the context; see
+	// `TICKET_KEY_INTERVAL`.
+	if !install_ticket_keys(ptr) {
+		SSL_CTX_free(ptr)
+		return nil, .Context_Failed
+	}
 
 	ccert := strings.clone_to_cstring(cert_file, context.temp_allocator)
 	ckey := strings.clone_to_cstring(key_file, context.temp_allocator)
