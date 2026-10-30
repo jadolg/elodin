@@ -725,7 +725,8 @@ test_cookie_priming_needs_a_cookie_and_no_question :: proc(t: ^testing.T) {
 	for c, i in cases {
 		out, ok := roundtrip(t, c)
 		if testing.expectf(t, ok, "case %d: no response", i) {
-			testing.expectf(t, response_rcode(out) == .Form_Err, "case %d: rcode %v", i, response_rcode(out))
+			rcode := response_rcode(out)
+			testing.expectf(t, rcode == .Form_Err, "case %d: rcode %v", i, rcode)
 		}
 	}
 	free_all(context.temp_allocator)

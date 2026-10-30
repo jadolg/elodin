@@ -72,11 +72,12 @@ check_primed :: proc(r: ^Runner, res: Query_Result, rcode: dns.Rcode) -> (issued
 	// Decoded rather than read off the header: BADCOOKIE's top bits are in the
 	// OPT record.
 	msg, err := dns.decode_message(res.wire, context.temp_allocator)
-	if check(r, err == .None, "the response does not decode") {
-		check_eq_int(r, int(dns.rcode_of(msg)), int(rcode), "rcode")
-		check_eq_int(r, len(msg.question) + len(msg.answer) + len(msg.authority), 0, "question, answer and authority records")
+	if !check(r, err == .None, "the response does not decode") {
+		return nil
 	}
-	got, found := find_cookie(r, res.wire)
+	check_eq_int(r, int(dns.rcode_of(msg)), int(rcode), "rcode")
+	check_eq_int(r, len(msg.question) + len(msg.answer) + len(msg.authority), 0, "question, answer and authority records")
+	got, found := dns.find_edns_option(msg, .Cookie)
 	if !check(r, found, "the priming answer carries no COOKIE option") || !check_eq_int(r, len(got), 24, "cookie length") {
 		return nil
 	}
