@@ -219,6 +219,9 @@ Pipe_Waiter :: struct {
 	seen:  u64,
 	// When it joined the connection, for `Pipe_Backlog`.
 	asked: time.Tick,
+	// When its caller stops waiting: the exchange's own, handed down unchanged
+	// from `exchange` so every stage spends the one timeout (issue #449).
+	deadline: time.Tick,
 	/*
 	What this waiter parks on, under `Pipe_Conn.mu`: signalled when its reply
 	lands, when the reading is handed to it, and when the connection dies. One
@@ -835,7 +838,8 @@ pipe_query :: proc(
 	asked := make([]u8, len(query), context.temp_allocator)
 	copy(asked, query)
 	w := Pipe_Waiter {
-		query = asked,
+		query    = asked,
+		deadline = deadline,
 	}
 
 	sync.mutex_lock(&c.mu)
@@ -869,7 +873,7 @@ pipe_query :: proc(
 		return nil, werr
 	}
 
-	if werr := pipe_wait(c, &w, id, deadline); werr != .None {
+	if werr := pipe_wait(c, &w, id); werr != .None {
 		return nil, werr
 	}
 
@@ -919,7 +923,7 @@ deadline passes, whichever comes first - each on a cond of its own (see
 `Pipe_Waiter.cond`).
 */
 @(private)
-pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Tick) -> Error {
+pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16) -> Error {
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
 	/*
@@ -943,7 +947,7 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, deadline: time.Tick) 
 			delete_key(&c.waiters, id)
 			return c.err
 		}
-		remaining := time.tick_diff(time.tick_now(), deadline)
+		remaining := time.tick_diff(time.tick_now(), w.deadline)
 		if remaining <= 0 {
 			delete_key(&c.waiters, id)
 			c.last = time.now()

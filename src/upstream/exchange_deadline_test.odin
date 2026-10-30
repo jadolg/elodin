@@ -21,18 +21,35 @@ TCP, and a cookie retry after BADCOOKIE (in cookie_test.odin).
 @(private = "file")
 X_TIMEOUT :: 200 * time.Millisecond
 
-// Answers over UDP with TC set after `delay`, and over TCP - once - after
-// `delay` again, so an exchange that gives the retry a timeout of its own gets
-// its answer, and one that shares the timeout does not.
+/*
+Answers over UDP with TC set, `TC_DELAY` after noting when the query came in,
+and over TCP never: once the retry's query is in, it reads the deadline the
+retry is parked on and holds the connection open until told to stop.
+
+What is compared is two moments on the tick clock, not how long anything took.
+`exchange` takes its deadline before it sends, so a retry sharing it waits
+until no later than `udp_seen + timeout`; a retry starting a clock of its own
+does so after the TC reply went out, so no earlier than
+`udp_seen + TC_DELAY + timeout`. A stalled scheduler moves neither moment
+across that line, and a TCP side that never answers leaves the exchange
+nothing to end with but a timeout (issue #555).
+*/
 @(private = "file")
 Truncating_Mock :: struct {
-	udp:       net.UDP_Socket,
-	listener:  net.TCP_Socket,
-	delay:     time.Duration,
-	// The TCP answer's own delay, when it differs.
-	tcp_delay: time.Duration,
-	stop:      bool,
+	udp:      net.UDP_Socket,
+	listener: net.TCP_Socket,
+	u:        ^Upstream,
+	stop:     bool,
+	udp_seen: time.Tick,
+	// Zero until the retry's query was read and its waiter found.
+	parked:   time.Tick,
+	// Posted once `parked` is written, so the test reads it after the mock is
+	// done with it rather than racing a mock thread that ran late.
+	scanned:  sync.Sema,
 }
+
+@(private = "file")
+TC_DELAY :: 5 * time.Millisecond
 
 @(private = "file")
 truncating_udp_loop :: proc(m: ^Truncating_Mock) {
@@ -42,7 +59,10 @@ truncating_udp_loop :: proc(m: ^Truncating_Mock) {
 		if err != nil || n < dns.HEADER_SIZE {
 			continue
 		}
-		time.sleep(m.delay)
+		if m.udp_seen == {} {
+			m.udp_seen = time.tick_now()
+		}
+		time.sleep(TC_DELAY)
 		buf[2] |= 0x80 | 0x02 // QR, TC
 		_, _ = net.send_udp(m.udp, buf[:n], client)
 	}
@@ -64,12 +84,23 @@ truncating_tcp_once :: proc(m: ^Truncating_Mock) {
 	if n < dns.HEADER_SIZE || n > len(query) || read_full_tcp(client, query[:n]) != .None {
 		return
 	}
-	time.sleep(m.tcp_delay if m.tcp_delay > 0 else m.delay)
-	out: [2 + 512]u8
-	out[0], out[1] = length[0], length[1]
-	copy(out[2:], query[:n])
-	out[4] |= 0x80 // QR
-	_ = write_all_tcp(client, out[:2 + n])
+	// The waiter is registered before its query is written and leaves only
+	// under `c.mu`, at its deadline: read before then, it is there.
+	sync.mutex_lock(&m.u.mu)
+	c := m.u.pipe
+	sync.mutex_unlock(&m.u.mu)
+	if c != nil {
+		sync.mutex_lock(&c.mu)
+		for _, w in c.waiters {
+			m.parked = w.deadline
+		}
+		sync.mutex_unlock(&c.mu)
+	}
+	sync.sema_post(&m.scanned)
+	// Open and silent: a closed connection would end the retry early.
+	for !sync.atomic_load(&m.stop) {
+		time.sleep(10 * time.Millisecond)
+	}
 }
 
 @(test)
@@ -89,23 +120,22 @@ test_a_truncated_replys_tcp_retry_shares_the_exchange_timeout :: proc(t: ^testin
 	m := Truncating_Mock {
 		udp      = udp,
 		listener = listener,
-		// Early enough that the retry is always made, even on a loaded
-		// runner; the TCP answer too late for what is left.
-		delay     = X_TIMEOUT / 2,
-		tcp_delay = X_TIMEOUT * 7 / 10,
 	}
-	udp_thread := thread.create_and_start_with_poly_data(&m, truncating_udp_loop)
-	tcp_thread := thread.create_and_start_with_poly_data(&m, truncating_tcp_once)
 	u, berr := make_upstream(
 		config.Upstream_Spec{name = "truncating", kind = .UDP, address = "127.0.0.1", port = bound.port},
 		0,
 		X_TIMEOUT,
 		context.allocator,
 	)
+	if !testing.expectf(t, berr == .None, "cannot build the upstream: %v", berr) {
+		net.close(listener)
+		net.close(udp)
+		return
+	}
+	m.u = u
+	udp_thread := thread.create_and_start_with_poly_data(&m, truncating_udp_loop)
+	tcp_thread := thread.create_and_start_with_poly_data(&m, truncating_tcp_once)
 	defer {
-		if u != nil {
-			destroy(u)
-		}
 		sync.atomic_store(&m.stop, true)
 		// Wakes the accept if the retry never came.
 		net.close(listener)
@@ -113,10 +143,8 @@ test_a_truncated_replys_tcp_retry_shares_the_exchange_timeout :: proc(t: ^testin
 		thread.destroy(udp_thread)
 		thread.join(tcp_thread)
 		thread.destroy(tcp_thread)
+		destroy(u)
 		net.close(udp)
-	}
-	if !testing.expectf(t, berr == .None, "cannot build the upstream: %v", berr) {
-		return
 	}
 
 	query := dns.Message {
@@ -126,14 +154,27 @@ test_a_truncated_replys_tcp_retry_shares_the_exchange_timeout :: proc(t: ^testin
 	}
 	query.flags.rd = true
 	wire, _, _ := dns.encode_message(query, context.temp_allocator)
-	started := time.tick_now()
+	before := time.tick_now()
 	resp, xerr := exchange(u, wire, X_TIMEOUT, context.temp_allocator)
-	spent := time.tick_since(started)
 
-	// The TC arrived at half the timeout, leaving half for a retry the server
-	// answers after 0.7: a retry on its own clock answered at 1.2.
-	testing.expectf(t, xerr == .Timeout, "the retry ended %v, where it should time out (%d bytes)", xerr, len(resp))
-	testing.expectf(t, spent < X_TIMEOUT * 5 / 4, "the exchange waited %v, where its timeout is %v", spent, X_TIMEOUT)
+	testing.expectf(t, xerr == .Timeout, "the retry ended %v, where nothing answers it (%d bytes)", xerr, len(resp))
+	// `udp_seen` was written before the TC went out, so before the exchange
+	// returned; `parked` is read only once the mock says it is written.
+	if !testing.expect(t, sync.sema_wait_with_timeout(&m.scanned, 10 * X_TIMEOUT), "the truncated reply was not retried over TCP") {
+		return
+	}
+	if !testing.expect(t, m.parked != {}, "the retry's waiter was gone before the mock could read its deadline") {
+		return
+	}
+	earliest := time.tick_add(before, X_TIMEOUT)
+	latest := time.tick_add(m.udp_seen, X_TIMEOUT)
+	testing.expectf(
+		t,
+		time.tick_diff(earliest, m.parked) >= 0 && time.tick_diff(m.parked, latest) >= 0,
+		"the retry waited until %v after the exchange began, where its deadline is %v after it",
+		time.tick_diff(before, m.parked),
+		X_TIMEOUT,
+	)
 	// And the connection the retry dialled keeps the upstream's own timeout,
 	// not the sliver this exchange had left: it is every later query's too.
 	sync.mutex_lock(&u.mu)
