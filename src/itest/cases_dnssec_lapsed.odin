@@ -282,27 +282,6 @@ LP_FIXTURES := []Fixture{
 	},
 }
 
-// The extra text of the extended error a response carries, or "".
-@(private = "file")
-extended_error_text :: proc(r: ^Runner, wire: []u8) -> string {
-	msg, ok := decode_reply(r, wire)
-	if !ok {
-		return ""
-	}
-	for rec in msg.additional {
-		opt, is_opt := rec.data.(dns.Rdata_OPT)
-		if !is_opt {
-			continue
-		}
-		for option in opt.options {
-			if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
-				return string(option.data[2:])
-			}
-		}
-	}
-	return ""
-}
-
 @(private = "file")
 lp_config :: proc(udp_port, upstream_port: int) -> string {
 	return fmt.tprintf(
@@ -371,8 +350,8 @@ run_dnssec_lapsed_cases :: proc(r: ^Runner) {
 			if check(r, err == .None, "the answer does not decode") {
 				check_eq_int(r, int(dns.rcode_of(msg)), int(c.rcode), "rcode")
 				check(r, msg.flags.ad == (c.rcode == .No_Error), "AD is %v", msg.flags.ad)
-				check_eq_int(r, extended_error(r, res.wire), c.code, "extended error")
-				text := extended_error_text(r, res.wire)
+				code, text := extended_error_with_text(r, res.wire)
+				check_eq_int(r, code, c.code, "extended error")
 				check(r, text == c.text, "extra text %q, want %q", text, c.text)
 			}
 		}

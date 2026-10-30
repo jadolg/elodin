@@ -1,6 +1,7 @@
 package dnssec
 
 import "core:mem"
+import "core:strings"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
@@ -11,10 +12,10 @@ Issue #360: a signature outside its validity window is reported by its window.
 RFC 8914 has a code for each side of it - 7, Signature Expired (section 4.8),
 and 8, Signature Not Yet Valid (section 4.9) - for when "no signatures are
 presently valid". It is the one DNSSEC failure whose cause is usually this
-server's clock, and it used to reach the client as code 6 and "broken chain of
-trust", the words a forged zone gets: a box running two hours slow refused
-every unsigned delegation under .org, because the proof that `mozilla.org` had
-no DS was signed in its future, and said the zone was broken.
+server's clock, so it is not reported as code 6 and "broken chain of trust",
+the words a forged zone gets: a box running two hours slow refuses every
+unsigned delegation under .org whose DS denial is signed in its future, and
+the operator has to be pointed at the clock rather than the zone.
 
 Each road a signature is checked on gets one step lapsed and every other step
 current, so a verdict naming the window could only have come from that road.
@@ -332,6 +333,13 @@ lp_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Alloc
 
 @(private = "file")
 lp_validate :: proc(key, qname: string, now := i64(FIXTURE_TIME)) -> Result {
+	return lp_validate_with(key, qname, "", "", now)
+}
+
+// `lp_validate` with `old` replaced by `new` in the fixture's hex, which is how
+// a test alters one signature without a fixture of its own.
+@(private = "file")
+lp_validate_with :: proc(key, qname, old, new: string, now := i64(FIXTURE_TIME)) -> Result {
 	anchor, parsed := parse_trust_anchor(LP_ANCHOR, context.temp_allocator)
 	if !parsed {
 		return {status = .Indeterminate, reason = "the anchor did not parse"}
@@ -342,7 +350,11 @@ lp_validate :: proc(key, qname: string, now := i64(FIXTURE_TIME)) -> Result {
 	defer destroy_validator(v)
 	for f in LP_FIXTURES {
 		if f.key == key {
-			wire, _ := decode_hex(f.wire, context.temp_allocator)
+			hex := f.wire
+			if old != "" {
+				hex, _ = strings.replace(hex, old, new, 1, context.temp_allocator)
+			}
+			wire, _ := decode_hex(hex, context.temp_allocator)
 			return validate(v, qname, .A, wire, time.unix(now, 0))
 		}
 	}
@@ -396,6 +408,24 @@ test_a_lapsed_step_still_names_the_step :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// Away from the chain there is no step, so the check that failed is the
+// detail: the answer's signature, an NXDOMAIN's proof, a wildcard's.
+@(test)
+test_a_lapsed_check_off_the_chain_is_named_in_the_detail :: proc(t: ^testing.T) {
+	cases := []struct {
+		key, qname, detail: string,
+	} {
+		{"lp_late_a", "late.lt.", "no valid signature"},
+		{"lp_nope_nxdomain", "nope.lt.", "denial of existence not proven"},
+		{"lp_x_a", "x.wl.", "wildcard expansion not proven"},
+	}
+	for c in cases {
+		result := lp_validate(c.key, c.qname)
+		testing.expectf(t, result.detail == c.detail, "%s: the detail should name %q, got %q", c.qname, c.detail, result.detail)
+	}
+	free_all(context.temp_allocator)
+}
+
 /*
 The window is what the verdict rests on, or it is not mentioned.
 
@@ -433,7 +463,7 @@ test_signature_window_sides :: proc(t: ^testing.T) {
 		{NOW - 10, NOW, .Current},
 		{NOW - 20, NOW - 10, .Expired},
 		{NOW + SIG_INCEPTION_SKEW + 1, NOW + 100_000, .Not_Yet_Valid},
-		// Inside the skew: accepted, as `signature_current` always did.
+		// Inside the skew: accepted, as `signature_current` accepts it.
 		{NOW + SIG_INCEPTION_SKEW, NOW + 100_000, .Current},
 		// Inside the skew, but ending before it starts: not yet valid, and never
 		// will be.
@@ -446,4 +476,47 @@ test_signature_window_sides :: proc(t: ^testing.T) {
 		got := signature_window(Rrsig{inception = c.inception, expiration = c.expiration}, now)
 		testing.expectf(t, got == c.want, "inception %d expiration %d at %d: want %v, got %v", c.inception, c.expiration, now, c.want, got)
 	}
+}
+
+// A window that ends before it starts is a signature no clock makes current, so
+// it does not verify - code 6 - and is not reported as a lapse.
+@(test)
+test_an_inverted_window_is_no_lapse :: proc(t: ^testing.T) {
+	NOW :: u32(1_000_000)
+	key := Dnskey {
+		flags     = DNSKEY_FLAG_ZONE,
+		protocol  = 3,
+		algorithm = 15,
+		tag       = 7,
+	}
+	keys := []Dnskey{key}
+	lapsed: Lapsed
+	// Inside the skew, ending before it starts.
+	note_lapsed(&lapsed, Rrsig{algorithm = 15, key_tag = 7, inception = NOW + 100, expiration = NOW + 50}, keys, NOW)
+	// Wholly in the past, ending before it starts.
+	note_lapsed(&lapsed, Rrsig{algorithm = 15, key_tag = 7, inception = NOW - 10, expiration = NOW - 20}, keys, NOW)
+	testing.expectf(t, lapsed.window == .Current, "an inverted window should be no lapse, got %v", lapsed.window)
+	note_lapsed(&lapsed, Rrsig{algorithm = 15, key_tag = 7, inception = NOW - 20, expiration = NOW - 10}, keys, NOW)
+	testing.expectf(t, lapsed == Lapsed{window = .Expired, at = NOW - 10}, "the control should lapse, got %v", lapsed)
+}
+
+/*
+A denial proof missing a set whose signature inside its window failed rests on
+that signature, whatever lapsed beside it: code 6, as for an answer RRset.
+
+The NXDOMAIN for `nope.lt.` has its cover signed in the future and the apex
+NSEC current; the apex NSEC's signature is altered here so it fails.
+*/
+@(test)
+test_a_denial_with_a_failed_current_signature_is_not_a_lapse :: proc(t: ^testing.T) {
+	result := lp_validate_with("lp_nope_nxdomain", "nope.lt.", "8bde0c3110e6b0a4", "8bde0c3110e6b0a5")
+	testing.expectf(
+		t,
+		result.status == .Bogus && result.lapsed.window == .Current && result.reason == "no denial of existence",
+		"a proof missing a set that failed in its window is a forgery, got %v %v %q",
+		result.status,
+		result.lapsed.window,
+		result.reason,
+	)
+	free_all(context.temp_allocator)
 }

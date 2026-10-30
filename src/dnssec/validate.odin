@@ -617,7 +617,11 @@ that is code 6 whatever lapsed beside it.
 Lapsed :: struct {
 	window: Sig_Window,
 	// The expiration of an expired signature, the inception of one not yet valid.
-	at:     u32,
+	at:      u32,
+	// Set by `verified_rrset` on a set whose signature inside its window was
+	// tried and failed, so a proof missing that set rests on a signature that
+	// does not verify rather than on a window. `window` is then `.Current`.
+	refuted: bool,
 }
 
 /*
@@ -626,18 +630,18 @@ Note `sig` in `lapsed` if it is one: outside its window, and naming one of `keys
 Not yet valid is kept over expired when a set carries both. RFC 8914 fits either
 code to that set, and a signature from the future is the one that says a clock
 is behind - which is the reading an operator can act on.
+
+A window that ends before it starts is no lapse: no clock makes that signature
+current, so it is one that does not verify, which is code 6.
 */
 @(private)
 note_lapsed :: proc(lapsed: ^Lapsed, sig: Rrsig, keys: []Dnskey, unix: u32) {
 	window := signature_window(sig, unix)
-	if !lapse_outranks(window, lapsed.window) {
+	if !lapse_outranks(window, lapsed.window) || !serial_ge(sig.expiration, sig.inception) {
 		return
 	}
-	for key in keys {
-		if key.algorithm == sig.algorithm && key.tag == sig.key_tag && key_usable(key) {
-			lapsed^ = {window, sig.inception if window == .Not_Yet_Valid else sig.expiration}
-			return
-		}
+	if names_usable_key(sig, keys) {
+		lapsed^ = {window = window, at = sig.inception if window == .Not_Yet_Valid else sig.expiration}
 	}
 }
 
@@ -777,9 +781,12 @@ more expensively.
 */
 @(private)
 signature_worth_trying :: proc(sig: Rrsig, keys: []Dnskey, unix: u32) -> bool {
-	if !signature_current(sig, unix) {
-		return false
-	}
+	return signature_current(sig, unix) && names_usable_key(sig, keys)
+}
+
+// Does `sig` name one of `keys` that may sign: same tag, same algorithm, usable?
+@(private)
+names_usable_key :: proc(sig: Rrsig, keys: []Dnskey) -> bool {
 	for key in keys {
 		if key.algorithm == sig.algorithm && key.tag == sig.key_tag && key_usable(key) {
 			return true
@@ -1042,7 +1049,9 @@ Result :: struct {
 	and the step, in words. Set only on a `Bogus` verdict whose reason is
 	`BROKEN_CHAIN`, which is the one a chain-of-trust step produced; empty on
 	every other, including ones that failed for a reason local to the message or
-	that a step's `Bogus` was turned into something else for.
+	that a step's `Bogus` was turned into something else for. The exception is a
+	verdict `lapsed` names the window of: the check that failed is kept here
+	when nothing else is, since `reason` then names the window instead.
 	*/
 	detail:    string,
 	/*
@@ -1364,6 +1373,10 @@ name_the_window :: proc(result: Result, now: time.Time, allocator: mem.Allocator
 	if out.status != .Bogus || out.lapsed.window == .Current {
 		out.lapsed = {}
 		return out
+	}
+	// The check that failed stays in the log, beside the window that failed it.
+	if out.detail == "" {
+		out.detail = out.reason
 	}
 	out.reason = lapsed_reason(out.lapsed, now, allocator)
 	return out
@@ -3410,9 +3423,11 @@ validated_denial_records :: proc(
 	// "we stopped looking". `exhausted_reason` says which.
 	exhausted: bool,
 	// The window of a set dropped for its signatures' validity period alone,
-	// for a caller whose proof then fails. See `Lapsed`.
+	// for a caller whose proof then fails - none when another set was dropped
+	// for a signature inside its window that failed. See `Lapsed`.
 	lapsed: Lapsed,
 ) {
+	refuted := false
 	out_nsec := make([dynamic]Nsec_Rr, 0, 4, allocator)
 	out_nsec3 := make([dynamic]Nsec3_Rr, 0, 4, allocator)
 	out_verified := make([dynamic]Authenticated_Set, 0, 4, allocator)
@@ -3449,6 +3464,7 @@ validated_denial_records :: proc(
 			// that verified is sound whatever else came along, and refusing the
 			// lot would let one junk record added to a response deny every name
 			// the real records were about to prove.
+			refuted ||= dropped.refuted
 			keep_lapse(&lapsed, dropped)
 			continue
 		}
@@ -3468,7 +3484,7 @@ validated_denial_records :: proc(
 			append_denial_record(r, &out_nsec, &out_nsec3, allocator)
 		}
 	}
-	return out_nsec[:], out_nsec3[:], out_verified[:], exhausted, lapsed
+	return out_nsec[:], out_nsec3[:], out_verified[:], exhausted, Lapsed{} if refuted else lapsed
 }
 
 /*
@@ -3508,7 +3524,8 @@ verified_rrset :: proc(
 	// not about the records.
 	exhausted: bool,
 	// The window its signatures fell outside, on a set that did not verify for
-	// that alone. See `Lapsed`.
+	// that alone; `refuted` on one whose signature inside its window failed.
+	// See `Lapsed`.
 	lapsed: Lapsed,
 ) {
 	records = records_of(section, owner, type, class, allocator)
@@ -3588,7 +3605,7 @@ verified_rrset :: proc(
 			return records, sig.signer, sig, true, false, {}
 		}
 	}
-	return nil, "", {}, false, false, Lapsed{} if tried else lapsed
+	return nil, "", {}, false, false, Lapsed{refuted = true} if tried else lapsed
 }
 
 // ---------------------------------------------------------------------------
@@ -4141,7 +4158,7 @@ zone_step :: proc(
 	the parent's keys, which the child's signatures then fail: Bogus, never
 	Insecure.
 	*/
-	cname, _, cname_sig, cname_ok, cname_spent, _ := verified_rrset(budget, msg.answer, child, .CNAME, class, parent, parent_keys, unix, allocator)
+	cname, _, cname_sig, cname_ok, cname_spent, cname_lapsed := verified_rrset(budget, msg.answer, child, .CNAME, class, parent, parent_keys, unix, allocator)
 	if cname_spent {
 		return walk_gave_up(budget, exhausted_reason(budget)), nil
 	}
@@ -4169,6 +4186,13 @@ zone_step :: proc(
 		drops it for not being the parent's, and both slices are empty.
 		*/
 		forget_skipped_non_cut(v, parent, child)
+		// A CNAME the parent signed outside its window is the other thing
+		// this reply could have held; one whose current signature failed
+		// rules the window out, as a denial set's does.
+		if cname_lapsed.refuted {
+			ds_lapsed = {}
+		}
+		keep_lapse(&ds_lapsed, cname_lapsed)
 		broke_at(budget, child, "the reply to the DS question held neither a DS nor a denial signed by the parent", allocator, ds_lapsed)
 		return .Bogus, nil
 	}

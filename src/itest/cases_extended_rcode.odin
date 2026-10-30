@@ -53,9 +53,16 @@ dnssec: {{ enabled: false }}
 // it has none.
 @(private)
 extended_error :: proc(r: ^Runner, wire: []u8) -> int {
+	code, _ := extended_error_with_text(r, wire)
+	return code
+}
+
+// The extended error a response carries, info-code and extra text, or -1 and "".
+@(private)
+extended_error_with_text :: proc(r: ^Runner, wire: []u8) -> (code: int, text: string) {
 	msg, ok := decode_reply(r, wire)
 	if !ok {
-		return -1
+		return -1, ""
 	}
 	for rec in msg.additional {
 		opt, is_opt := rec.data.(dns.Rdata_OPT)
@@ -64,11 +71,11 @@ extended_error :: proc(r: ^Runner, wire: []u8) -> int {
 		}
 		for option in opt.options {
 			if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
-				return int(option.data[0]) << 8 | int(option.data[1])
+				return int(option.data[0]) << 8 | int(option.data[1]), string(option.data[2:])
 			}
 		}
 	}
-	return -1
+	return -1, ""
 }
 
 // The certificate association a DANE client is asking for. Raw RDATA because
