@@ -1015,26 +1015,43 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(bootstrap_cache.entries), 1)
 
 	// A reload that replaces the bootstrap servers forgets what the old ones
-	// said: the entry is expired, not served, and asking again refreshes it in
-	// place. Checked here because this test owns the package-global cache.
+	// said: the entry is removed, its key freed, and asking again resolves it
+	// afresh. Checked here because this test owns the package-global cache.
 	bootstrap_forget()
-	sync.mutex_lock(&bootstrap_cache.mu)
-	forgotten := loop.moment_since(bootstrap_cache.entries[HOST].expires) >= 0
-	sync.mutex_unlock(&bootstrap_cache.mu)
-	testing.expect(t, forgotten, "a forgotten entry would still be served")
+	testing.expect_value(t, len(bootstrap_cache.entries), 0)
+	testing.expect_value(t, len(track.allocation_map), settled - 1)
 	_, ok3 := bootstrap_resolve(servers, HOST)
 	testing.expect(t, ok3, "the lookup after forgetting failed")
 	testing.expect_value(t, len(track.allocation_map), settled)
 
-	// The cache is a package global that outlives this test, and its keys point
-	// into the tracking allocator that is about to go away.
-	sync.mutex_lock(&bootstrap_cache.mu)
-	for k in bootstrap_cache.entries {
-		delete(k, context.allocator)
+	/*
+	A new hostname sweeps out the expired ones (#530). A blocklist's redirect
+	hops are resolved here too, under names the list host picks, so a map that
+	kept every key grew by one per hop for the life of the process.
+	*/
+	HOPS :: []string{"hop1.invalid", "hop2.invalid"}
+	for hop in HOPS {
+		_, hop_ok := bootstrap_resolve(servers, hop)
+		testing.expectf(t, hop_ok, "%s did not resolve", hop)
 	}
-	delete(bootstrap_cache.entries)
-	bootstrap_cache.entries = nil
+	testing.expect_value(t, len(bootstrap_cache.entries), 1 + len(HOPS))
+	sync.mutex_lock(&bootstrap_cache.mu)
+	for _, &e in bootstrap_cache.entries {
+		e.expires = loop.moment_add(loop.moment_now(), -time.Minute)
+	}
 	sync.mutex_unlock(&bootstrap_cache.mu)
+	_, ok4 := bootstrap_resolve(servers, "hop3.invalid")
+	testing.expect(t, ok4, "hop3.invalid did not resolve")
+	testing.expect_value(t, len(bootstrap_cache.entries), 1)
+	testing.expect(t, "hop3.invalid" in bootstrap_cache.entries, "the new hostname was swept with the expired")
+	testing.expect_value(t, len(track.allocation_map), settled)
+
+	// The cache is a package global that outlives this test, and its keys point
+	// into the tracking allocator that is about to go away. Destroying it hands
+	// back the one key and the map's storage.
+	bootstrap_destroy()
+	testing.expect(t, bootstrap_cache.entries == nil, "the map survived its destroy")
+	testing.expect_value(t, len(track.allocation_map), settled - 2)
 
 	free_all(context.temp_allocator)
 }

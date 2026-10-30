@@ -118,7 +118,16 @@ bootstrap_resolve :: proc(
 			if hostname in bootstrap_cache.entries {
 				bootstrap_cache.entries[hostname] = entry
 			} else {
-				bootstrap_cache.entries[strings.clone(hostname)] = entry
+				/*
+				A new key sweeps out the expired ones first. The hostnames are
+				not only the configured upstreams': every redirect a blocklist
+				download follows is resolved here, and the list host picks those
+				names, so a map that only ever grew kept one key per name a
+				remote host chose for the life of the process (#530). Swept, it
+				holds what was resolved within the last `BOOTSTRAP_TTL`.
+				*/
+				bootstrap_prune()
+				bootstrap_cache.entries[strings.clone(hostname, bootstrap_cache.entries.allocator)] = entry
 			}
 			sync.mutex_unlock(&bootstrap_cache.mu)
 			return result, true
@@ -128,19 +137,42 @@ bootstrap_resolve :: proc(
 }
 
 /*
-Treat every hostname resolved so far as expired, so the next lookup asks the
-bootstrap servers configured now.
+Drop every hostname resolved so far, so the next lookup asks the bootstrap
+servers configured now.
 
 For a configuration reload that changes which upstreams are asked: the answer
 cache is emptied for that, and an address an earlier bootstrap gave for an
-upstream's hostname is the same kind of answer. Expired rather than removed, so
-the keys stay with the map that allocated them.
+upstream's hostname is the same kind of answer.
 */
 bootstrap_forget :: proc() {
 	sync.mutex_lock(&bootstrap_cache.mu)
 	defer sync.mutex_unlock(&bootstrap_cache.mu)
-	for _, &entry in bootstrap_cache.entries {
-		entry.expires = {}
+	for key in bootstrap_cache.entries {
+		delete(key, bootstrap_cache.entries.allocator)
+	}
+	clear(&bootstrap_cache.entries)
+}
+
+// Release the cache, at shutdown, once nothing can resolve through it.
+bootstrap_destroy :: proc() {
+	bootstrap_forget()
+	sync.mutex_lock(&bootstrap_cache.mu)
+	defer sync.mutex_unlock(&bootstrap_cache.mu)
+	delete(bootstrap_cache.entries)
+	bootstrap_cache.entries = nil
+}
+
+/*
+Remove the expired entries. Under `mu`. Keys are freed with the map's allocator,
+which is the one they were cloned with, whichever thread asks.
+*/
+@(private)
+bootstrap_prune :: proc() {
+	for key, entry in bootstrap_cache.entries {
+		if loop.moment_since(entry.expires) >= 0 {
+			delete_key(&bootstrap_cache.entries, key)
+			delete(key, bootstrap_cache.entries.allocator)
+		}
 	}
 }
 
