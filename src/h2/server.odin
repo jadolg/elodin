@@ -1668,7 +1668,9 @@ Write a response body, honouring flow control and the peer's frame size limit.
 */
 @(private)
 write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
-	deadline := time.time_add(time.now(), c.write_timeout)
+	// On the tick clock: a step of the wall clock must not cut every pending
+	// write off at once, nor hold a fiber for the length of the step.
+	deadline := time.tick_add(time.tick_now(), c.write_timeout)
 	sent := 0
 	for sent < len(body) {
 		remaining := len(body) - sent
@@ -1705,7 +1707,7 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 			the wait would keep the query and its fiber for as long as the peer
 			felt like holding it.
 			*/
-			left := time.diff(time.now(), deadline)
+			left := time.tick_diff(time.tick_now(), deadline)
 			if left <= 0 {
 				// Marked here, under the same lock, for the same reason
 				// handle_data's already_ended path marks it before sending its

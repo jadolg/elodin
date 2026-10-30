@@ -26,7 +26,8 @@ BOOTSTRAP_TIMEOUT :: 3 * time.Second
 @(private)
 Bootstrap_Entry :: struct {
 	address: net.Address,
-	expires: time.Time,
+	// A `loop.Moment`; see `loop.Moment` for why.
+	expires: loop.Moment,
 }
 
 @(private)
@@ -61,7 +62,7 @@ bootstrap_resolve :: proc(
 
 	sync.mutex_lock(&bootstrap_cache.mu)
 	if entry, found := bootstrap_cache.entries[hostname]; found {
-		if time.diff(entry.expires, time.now()) < 0 {
+		if loop.moment_since(entry.expires) < 0 {
 			sync.mutex_unlock(&bootstrap_cache.mu)
 			return entry.address, true
 		}
@@ -105,7 +106,7 @@ bootstrap_resolve :: proc(
 			}
 			entry := Bootstrap_Entry {
 				address = result,
-				expires = time.time_add(time.now(), BOOTSTRAP_TTL),
+				expires = loop.moment_add(loop.moment_now(), BOOTSTRAP_TTL),
 			}
 			sync.mutex_lock(&bootstrap_cache.mu)
 			if bootstrap_cache.entries == nil {

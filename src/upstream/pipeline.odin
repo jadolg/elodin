@@ -257,11 +257,8 @@ Pipe_Conn :: struct {
 	err:       Error,
 	next_id:   u16,
 	// When the last query on this connection finished, for the idle reaper.
-	// The wall clock rather than the monotonic one the deadlines use, and
-	// deliberately: this is a moment read off a clock and compared with an
-	// idle timeout, not a bound on anybody waiting. A step of it reaps a
-	// connection early or late and costs a redial.
-	last:      time.Time,
+	// A `loop.Moment`; see `loop.Moment` for why.
+	last:      loop.Moment,
 	// Messages read off this connection, for anyone at all. What a caller that
 	// timed out compares against its own `Pipe_Waiter.seen`.
 	replies:   u64,
@@ -337,7 +334,7 @@ pipe_idle_for :: proc(c: ^Pipe_Conn) -> time.Duration {
 	if len(c.waiters) != 0 {
 		return 0
 	}
-	d := time.diff(c.last, time.now())
+	d := loop.moment_since(c.last)
 	return d if d > 0 else 0
 }
 
@@ -359,9 +356,10 @@ taking the ceiling down there would have the reaper closing connections faster
 than they can be used.
 
 Deliberately one-way. A peer that shortens its timeout is followed; one that
-lengthens it is not, and holds a ceiling lower than it needs until the process
-restarts. The asymmetry is the cheap direction to be wrong in: too low costs a
-dial that would not have been needed, too high costs a query.
+lengthens it is not, and holds a ceiling lower than it needs until
+`PIPE_IDLE_RELEARN` forgets it. The asymmetry is the cheap direction to be
+wrong in: too low costs a dial that would not have been needed, too high costs
+a query.
 */
 @(private)
 note_idle_death :: proc(u: ^Upstream, idled: time.Duration) {
@@ -372,7 +370,7 @@ note_idle_death :: proc(u: ^Upstream, idled: time.Duration) {
 	defer sync.mutex_unlock(&u.mu)
 	if u.idle_died == 0 || idled < u.idle_died {
 		u.idle_died = idled
-		u.idle_learned = time.now()
+		u.idle_learned = loop.moment_now()
 		logx.debugf(
 			"upstream %s: hung up after %v idle, reaping its connection at %v from now on",
 			u.spec.name,
@@ -406,7 +404,7 @@ pipe_relearn_idle_locked :: proc(u: ^Upstream) {
 	if u.idle_died == 0 {
 		return
 	}
-	if time.diff(u.idle_learned, time.now()) < PIPE_IDLE_RELEARN {
+	if loop.moment_since(u.idle_learned) < PIPE_IDLE_RELEARN {
 		return
 	}
 	logx.debugf(
@@ -424,7 +422,7 @@ pipe_state :: proc(c: ^Pipe_Conn, idle_timeout: time.Duration, limit: int) -> Pi
 	if c.dead {
 		return .Gone
 	}
-	if len(c.waiters) == 0 && time.diff(c.last, time.now()) >= idle_timeout {
+	if len(c.waiters) == 0 && loop.moment_since(c.last) >= idle_timeout {
 		return .Gone
 	}
 	if len(c.waiters) >= limit {
@@ -613,7 +611,7 @@ dial_pipe :: proc(u: ^Upstream, timeout, budget: time.Duration) -> (c: ^Pipe_Con
 	// that two queries in flight differ.
 	c.next_id = dns.random_id()
 	c.waiters = make(map[u16]^Pipe_Waiter, 16, u.allocator)
-	c.last = time.now()
+	c.last = loop.moment_now()
 	c.timeout = timeout
 	return c, .None
 }
@@ -940,7 +938,7 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16) -> Error {
 		// Ahead of `dead`: a reply that landed before the connection went is
 		// still this caller's answer.
 		if w.done {
-			c.last = time.now()
+			c.last = loop.moment_now()
 			return w.err
 		}
 		if c.dead {
@@ -950,7 +948,7 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16) -> Error {
 		remaining := time.tick_diff(time.tick_now(), w.deadline)
 		if remaining <= 0 {
 			delete_key(&c.waiters, id)
-			c.last = time.now()
+			c.last = loop.moment_now()
 			/*
 			Nobody is left on this connection and nothing came back on it for
 			anybody while this caller waited. Evidence the connection has

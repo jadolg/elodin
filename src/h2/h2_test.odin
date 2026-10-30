@@ -1787,8 +1787,8 @@ test_response_gives_up_when_no_window_is_granted :: proc(t: ^testing.T) {
 	worker := thread.create_and_start_with_poly_data(&r, respond_worker)
 
 	// Generously past the timeout above, and still far short of forever.
-	deadline := time.time_add(time.now(), 5 * time.Second)
-	for !sync.atomic_load(&r.done) && time.diff(time.now(), deadline) > 0 {
+	deadline := time.tick_add(time.tick_now(), 5 * time.Second)
+	for !sync.atomic_load(&r.done) && time.tick_diff(time.tick_now(), deadline) > 0 {
 		time.sleep(10 * time.Millisecond)
 	}
 	finished := sync.atomic_load(&r.done)
@@ -1851,8 +1851,8 @@ test_data_after_end_stream_wakes_a_parked_responder :: proc(t: ^testing.T) {
 
 	// Well short of write_timeout: a broadcast wakes it in microseconds, so
 	// anything past a few hundred milliseconds means nothing woke it at all.
-	deadline := time.time_add(time.now(), 1 * time.Second)
-	for !sync.atomic_load(&r.done) && time.diff(time.now(), deadline) > 0 {
+	deadline := time.tick_add(time.tick_now(), 1 * time.Second)
+	for !sync.atomic_load(&r.done) && time.tick_diff(time.tick_now(), deadline) > 0 {
 		time.sleep(10 * time.Millisecond)
 	}
 	finished := sync.atomic_load(&r.done)

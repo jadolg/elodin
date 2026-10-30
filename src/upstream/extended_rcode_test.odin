@@ -795,9 +795,9 @@ test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testin
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
 
-	started := time.now()
+	started := time.tick_now()
 	resp, winner, err := resolve_readable(&g, wire, context.allocator)
-	spent := time.since(started)
+	spent := time.tick_since(started)
 
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, winner, ref)
@@ -805,7 +805,7 @@ test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testin
 	delete(resp, context.allocator)
 
 	// One timeout and a datagram, against a threshold of two: the exact signal
-	// is the counter below, and this is the wall clock saying what it buys.
+	// is the counter below, and this is the elapsed time saying what it buys.
 	testing.expectf(
 		t,
 		spent < 2 * TIMEOUT,
@@ -941,7 +941,7 @@ shipped five seconds, ten of them for a reply the group had in its first
 millisecond, with a query worker held for the whole of it. Bounded, the first
 spare is asked and the second is not, because by then the budget is gone.
 
-The assertion is the wall clock, against a threshold between one timeout and
+The assertion is the elapsed time, against a threshold between one timeout and
 two: a fixture cannot see an exchange that was never made, only the wait it
 would have cost. The dead ports are bound and closed, which on UDP is a timeout
 rather than a refusal - `exchange_udp` does not connect its socket, so no ICMP
@@ -1013,9 +1013,9 @@ test_the_sweep_spends_one_timeout_on_the_members_it_has_left :: proc(t: ^testing
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
 
-	started := time.now()
+	started := time.tick_now()
 	resp, winner, err := resolve_readable(&g, wire, context.allocator)
-	spent := time.since(started)
+	spent := time.tick_since(started)
 
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, winner, ref)
@@ -1296,9 +1296,9 @@ test_the_budget_counts_a_slow_refusal_as_time_spent :: proc(t: ^testing.T) {
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
 
-	begin := time.now()
+	begin := time.tick_now()
 	resp, winner, err := resolve_readable(&g, wire, context.allocator)
-	spent := time.since(begin)
+	spent := time.tick_since(begin)
 
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, winner, ref)

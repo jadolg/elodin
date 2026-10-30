@@ -46,9 +46,10 @@ Client :: struct {
 	refs:      int,
 	closed:    bool,
 	// When a reference was last let go of, which is when a request on the
-	// connection last ended; see `client_idle_for`. Monotonic, so a step of
-	// the wall clock neither keeps an idle connection nor retires a fresh one.
-	released:  time.Tick,
+	// connection last ended; see `client_idle_for`. A `loop.Moment`, so neither
+	// a step of the wall clock nor a suspend keeps an idle connection or
+	// retires a fresh one.
+	released:  loop.Moment,
 
 	next_stream_id:      u32,
 	peer_max_frame:      int,
@@ -158,7 +159,7 @@ client_make :: proc(io: IO, allocator := context.allocator) -> ^Client {
 	c.io = io
 	c.allocator = allocator
 	c.refs = 1
-	c.released = time.tick_now()
+	c.released = loop.moment_now()
 	c.next_stream_id = 1
 	c.peer_max_frame = DEFAULT_MAX_FRAME
 	c.peer_initial_window = DEFAULT_WINDOW
@@ -189,7 +190,7 @@ client_ref :: proc(c: ^Client) {
 client_unref :: proc(c: ^Client) {
 	// The time before the count, so a reader that sees the count drop sees the
 	// time it dropped at; see `client_idle_for`.
-	sync.atomic_store(&c.released._nsec, time.tick_now()._nsec)
+	sync.atomic_store(&c.released, loop.moment_now())
 	last := sync.atomic_sub(&c.refs, 1) == 1
 	if !last {
 		return
@@ -223,7 +224,7 @@ request, so a connection is only idle once all of them have let go.
 */
 client_idle_for :: proc(c: ^Client) -> (idle: time.Duration, busy: bool) {
 	busy = sync.atomic_load(&c.refs) > 1
-	idle = time.tick_since(time.Tick{_nsec = sync.atomic_load(&c.released._nsec)})
+	idle = loop.moment_since(sync.atomic_load(&c.released))
 	return
 }
 

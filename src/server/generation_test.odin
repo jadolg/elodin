@@ -14,6 +14,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
 import "elodin:upstream"
+import "elodin:loop"
 
 /*
 A server booted from one configuration, reloadable from a file of its own.
@@ -915,7 +916,8 @@ test_a_retired_group_still_in_use_closes_its_idle_connections :: proc(t: ^testin
 	socket, serr := net.create_socket(.IP4, .TCP)
 	if testing.expectf(t, serr == nil, "cannot make a socket: %v", serr) {
 		u := old.group.servers[0]
-		append(&u.idle, {socket = socket.(net.TCP_Socket), since = time.now()})
+		// Fresh, so only the retirement can be what closes it.
+		append(&u.idle, {socket = socket.(net.TCP_Socket), since = loop.moment_now()})
 	}
 	testing.expect_value(t, reap_generations(&f.s), 0)
 	testing.expect_value(t, len(old.group.servers[0].idle), 0)

@@ -470,8 +470,7 @@ resolve_insisting :: proc(
 	an NTP step backwards between two readings of it - routine enough on the
 	machines this runs on - gives a negative interval, which would leave the
 	total short of the budget for as long as the sweep ran and take away the
-	bound exactly when it is doing its job. `exchange` may keep its wall-clock
-	latency figure: a statistic that goes strange once is not a guard.
+	bound exactly when it is doing its job.
 
 	What that bounds is the group of several spares none of which can be
 	reached. At the full timeout apiece a group of four spends three of them -

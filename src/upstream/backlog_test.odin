@@ -5,6 +5,7 @@ import "core:testing"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 A connection, not dialled, whose quickest reply took `floor` and whose last
@@ -28,7 +29,7 @@ make_backlogged :: proc(b: ^Backlogged, waited: time.Duration, floor := 10 * tim
 	c := new(Pipe_Conn)
 	c.stream.socket = net.TCP_Socket(-1)
 	c.timeout = time.Hour
-	c.last = time.now()
+	c.last = loop.moment_now()
 	c.refs = 1
 	c.waiters = make(map[u16]^Pipe_Waiter)
 	pipe_note_wait(c, floor, true)
