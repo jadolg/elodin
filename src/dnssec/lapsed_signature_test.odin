@@ -419,6 +419,60 @@ LP_FIXTURES := []Fixture{
 		wire  = "1234858000010001000000000377777702636e026c7400000100010377777702636e026c74000001000100000e100004" +
 			"c0000208",
 	},
+	{
+		key   = "lp_dname_ds",
+		name  = "www.late.lt.",
+		type  = .DS,
+		rcode = 3,
+		wire  = "12348583000100000006000003777777046c617465026c7400002b0001046c617465026c7400002f000100000e100012" +
+			"056d69786564026c74000006400000000003046c617465026c7400002e000100000e100056002f0f0200000e107d3b18" +
+			"206a47882003a1026c7400395f58050813beebab1e21b4a73062b080bf9ecb08fa6dc9bbba7413e0f232e203063abbd3" +
+			"4cfc1075f5aa79d689cd8f40ff3cbd0c1190d934a55465a57b4c0b026c7400002f000100000e10001204626f7468026c" +
+			"7400000722000000000380026c7400002e000100000e100056002f0f0100000e107d3b18206a47882003a1026c74008b" +
+			"de0c3110e6b0a41e60506ded3c5a8abe94c16fe2a254e80afe8339696d9511709bbdb7aa16fe96aebe5096822a25c725" +
+			"8021f7fdd28bf1c11ebacafe041702026c74000006000100000e10002a026e73026c74000a686f73746d617374657202" +
+			"6c74000000000100000e100000038400093a800000012c026c7400002e000100000e10005600060f0100000e107d3b18" +
+			"206a47882003a1026c74002f2f61631826be86c19f8e55a637879c4d48f1da45d0807197585e5a291ec399890ff4a37c" +
+			"df25d934525cb253730b5fe4cb8590de4b73ddfc4f849c3f3cff0f",
+	},
+	{
+		key   = "lp_dname_a",
+		name  = "www.late.lt.",
+		type  = .A,
+		rcode = 0,
+		wire  = "12348580000100030000000003777777046c617465026c740000010001046c617465026c74000027000100000e100009" +
+			"04626f7468026c7400046c617465026c7400002e000100000e10005600270f0200000e106a4788206a1ffb2003a1026c" +
+			"74001147a3808504239369c8f6758ca8d16ea505a3ed9aab674088c2ed93532038f7e096e1ec58364c2f0e891449395d" +
+			"edba4c8ac0b31c17ae75f29608c3879caf0503777777046c617465026c74000005000100000e10000d0377777704626f" +
+			"7468026c7400",
+	},
+	{
+		key   = "lp_cn2_ds",
+		name  = "cn2.lt.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "12348580000100020006000003636e32026c7400002b000103636e32026c74000005000100000e10000904626f746802" +
+			"6c740003636e32026c7400002e000100000e10005600050f0200000e107d3b18206a47882003a1026c74005c66be3606" +
+			"91f46ea0a1e798b2cccfab9ee00fed430f0feb726d4a94212adccf2f4d069cbca8afbed2e0b048563415e326e34d4121" +
+			"9bb6aca9610bf310e5970c056561726c79026c7400002f000100000e100011046c617465026c74000006400000000003" +
+			"056561726c79026c7400002e000100000e100056002f0f0200000e107d3b18206a47882003a1026c74002e5017068694" +
+			"88cc9e37e714e1c9c25a6e828af724547eb50dedd9d6c9b2907289a37aa5560661ec8c61b084ac25fafaaf9d257db839" +
+			"d22aa0d94e0d342aeb0e04626f7468026c7400002f000100000e100012056561726c79026c7400000640000000000304" +
+			"626f7468026c7400002e000100000e100056002f0f0200000e10a2d31e2090071b2003a1026c74001fa9aae63a0c483e" +
+			"5c07463e7367d0a5b5085c1253ee65ba375b81bf0d329d0f643c690824b2460ed473b74b7bf1b81746e22b6f9d31eb4c" +
+			"f8c91c4bc13dae06026c74000006000100000e10002a026e73026c74000a686f73746d6173746572026c740000000001" +
+			"00000e100000038400093a800000012c026c7400002e000100000e10005600060f0100000e107d3b18206a47882003a1" +
+			"026c74002f2f61631826be86c19f8e55a637879c4d48f1da45d0807197585e5a291ec399890ff4a37cdf25d934525cb2" +
+			"53730b5fe4cb8590de4b73ddfc4f849c3f3cff0f",
+	},
+	{
+		key   = "lp_cn2_www",
+		name  = "www.cn2.lt.",
+		type  = .A,
+		rcode = 0,
+		wire  = "1234858000010001000000000377777703636e32026c7400000100010377777703636e32026c74000001000100000e10" +
+			"0004c0000209",
+	},
 }
 
 @(private = "file")
@@ -476,6 +530,7 @@ test_a_signature_outside_its_window_is_named_on_every_road :: proc(t: ^testing.T
 		{"lp_insecure_a", "www.unsigned.lt.", .Not_Yet_Valid, LP_NOT_YET, "the parent's denial of a DS"},
 		{"lp_nope_nxdomain", "nope.lt.", .Not_Yet_Valid, LP_NOT_YET, "the NSEC an NXDOMAIN rests on"},
 		{"lp_x_a", "x.wl.", .Expired, LP_EXPIRED, "the NSEC a wildcard expansion rests on"},
+		{"lp_dname_a", "www.late.lt.", .Expired, LP_EXPIRED, "a DNAME and the unsigned CNAME it synthesized"},
 	}
 	for c in cases {
 		result := lp_validate(c.key, c.qname)
@@ -645,6 +700,11 @@ test_a_lapse_names_the_instant_nearest_now :: proc(t: ^testing.T) {
 	keep_lapse(&across, Lapsed{window = .Expired, at = NOW - 10})
 	keep_lapse(&across, Lapsed{window = .Expired, at = NOW - 30})
 	testing.expectf(t, across == Lapsed{window = .Expired, at = NOW - 10}, "across sets, the latest expiration should be kept, got %v", across)
+
+	// A refuted set rules the window out whichever side of it it arrives on.
+	keep_lapse(&across, Lapsed{refuted = true})
+	keep_lapse(&across, Lapsed{window = .Not_Yet_Valid, at = NOW + SKEW + 10})
+	testing.expectf(t, across == Lapsed{refuted = true}, "a refuted set should stay refuted, got %v", across)
 }
 
 // A forgery and a lapse in one message is a forgery, whichever came first:
@@ -675,6 +735,7 @@ test_a_forgery_beside_a_lapse_is_a_forgery_end_to_end :: proc(t: ^testing.T) {
 		{"lp_pair_forgery_first", "late.lt.", "no valid signature", "a forged A before a lapsed CNAME"},
 		{"lp_two_wildcards", "x.wl.", "wildcard expansion not proven", "a lapsed wildcard proof before a refuted one"},
 		{"lp_cn_www", "www.cn.lt.", BROKEN_CHAIN, "a lapsed CNAME at a DS question beside a refuted denial"},
+		{"lp_cn2_www", "www.cn2.lt.", BROKEN_CHAIN, "a refuted CNAME at a DS question beside a lapsed denial that proves nothing"},
 	}
 	for c in cases {
 		result := lp_validate(c.key, c.qname)

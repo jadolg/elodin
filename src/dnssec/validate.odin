@@ -653,9 +653,14 @@ note_lapsed :: proc(lapsed: ^Lapsed, sig: Rrsig, keys: []Dnskey, unix: u32) {
 }
 
 // Keep the one of two lapses `note_lapsed` would, across the sets of one proof.
+// A refuted set rules the window out for the whole proof, so `refuted` sticks.
 @(private)
 keep_lapse :: proc(lapsed: ^Lapsed, other: Lapsed) {
-	if lapse_outranks(other, lapsed^) {
+	switch {
+	case lapsed.refuted:
+	case other.refuted:
+		lapsed^ = {refuted = true}
+	case lapse_outranks(other, lapsed^):
 		lapsed^ = other
 	}
 }
@@ -2203,8 +2208,10 @@ validate_answer :: proc(
 			// No signature of its own, so the DNAME's sets its ceiling.
 			ceiling = max(u32)
 			for r in records {
-				ok, by := dname_covered(v, budget, msg, r, class, unix, now, allocator)
+				ok, by, dname_lapsed := dname_covered(v, budget, msg, r, class, unix, now, allocator)
 				if !ok {
+					// Unsigned because its DNAME lapsed: the window is why.
+					keep_lapse(&why_lapsed, dname_lapsed)
 					covered = false
 					break
 				}
@@ -3460,7 +3467,6 @@ validated_denial_records :: proc(
 	// was dropped for a signature inside its window that failed. See `Lapsed`.
 	lapsed: Lapsed,
 ) {
-	refuted := false
 	out_nsec := make([dynamic]Nsec_Rr, 0, 4, allocator)
 	out_nsec3 := make([dynamic]Nsec3_Rr, 0, 4, allocator)
 	out_verified := make([dynamic]Authenticated_Set, 0, 4, allocator)
@@ -3497,7 +3503,6 @@ validated_denial_records :: proc(
 			// that verified is sound whatever else came along, and refusing the
 			// lot would let one junk record added to a response deny every name
 			// the real records were about to prove.
-			refuted ||= dropped.refuted
 			keep_lapse(&lapsed, dropped)
 			continue
 		}
@@ -3517,7 +3522,7 @@ validated_denial_records :: proc(
 			append_denial_record(r, &out_nsec, &out_nsec3, allocator)
 		}
 	}
-	return out_nsec[:], out_nsec3[:], out_verified[:], exhausted, Lapsed{refuted = true} if refuted else lapsed
+	return out_nsec[:], out_nsec3[:], out_verified[:], exhausted, lapsed
 }
 
 /*
@@ -4210,6 +4215,10 @@ zone_step :: proc(
 	if ds_spent {
 		return walk_gave_up(budget, exhausted_reason(budget)), nil
 	}
+	// A CNAME the parent signed outside its window is the other thing this
+	// reply could have held; one whose current signature failed rules the
+	// window out, as a denial set's does. Both broken steps below read this.
+	keep_lapse(&ds_lapsed, cname_lapsed)
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
 		/*
 		Nothing to read, and the likeliest reason is the one worth acting on: a
@@ -4219,14 +4228,6 @@ zone_step :: proc(
 		drops it for not being the parent's, and both slices are empty.
 		*/
 		forget_skipped_non_cut(v, parent, child)
-		// A CNAME the parent signed outside its window is the other thing
-		// this reply could have held; one whose current signature failed
-		// rules the window out, as a denial set's does.
-		if cname_lapsed.refuted || ds_lapsed.refuted {
-			ds_lapsed = {}
-		} else {
-			keep_lapse(&ds_lapsed, cname_lapsed)
-		}
 		broke_at(budget, child, "the reply to the DS question held neither a DS nor a denial signed by the parent", allocator, ds_lapsed)
 		return .Bogus, nil
 	}
@@ -5165,10 +5166,12 @@ dname_covered :: proc(
 	// The DNAME's verified signature, which bounds the CNAME's TTL as it does
 	// the DNAME's own (RFC 4035 section 5.3.3).
 	vouched: Rrsig,
+	// The window of a synthesizing DNAME refused for it alone, when none holds.
+	lapsed: Lapsed,
 ) {
 	target, is_name := cname.data.(dns.Rdata_Name)
 	if !is_name {
-		return false, {}
+		return false, {}, {}
 	}
 
 	seen := make([dynamic]dns.Question, 0, 2, allocator)
@@ -5203,12 +5206,13 @@ dname_covered :: proc(
 		*/
 		records := records_of(msg.answer, rec.name, .DNAME, class, allocator)
 		sigs := sigs_covering(msg.answer, rec.name, .DNAME, class, allocator)
-		status, _, _, _, sig, _ := validate_rrset(v, budget, rec.name, .DNAME, class, records, sigs, unix, now, allocator)
+		status, _, _, _, sig, why_lapsed := validate_rrset(v, budget, rec.name, .DNAME, class, records, sigs, unix, now, allocator)
 		if status == .Secure {
-			return true, sig
+			return true, sig, {}
 		}
+		keep_lapse(&lapsed, why_lapsed)
 	}
-	return false, {}
+	return false, {}, lapsed
 }
 
 /*

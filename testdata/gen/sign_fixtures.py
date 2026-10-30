@@ -1763,6 +1763,34 @@ def lapsed_signatures():
     unsigned = [a_rr("www.cn.lt.", "192.0.2.8")]
     emit("lp_cn_www", "www.cn.lt.", "A", message("www.cn.lt.", A, unsigned))
 
+    # A DNAME whose only signature expired, and the CNAME it synthesized, which
+    # is unsigned as RFC 6672 section 3.4.1 has it: the CNAME lacks a signature
+    # only because the DNAME lapsed, so the window is the verdict. `late.lt.`'s
+    # NSEC covers `www.late.lt.`, so the walk to the CNAME's owner ends there.
+    emit("lp_dname_ds", "www.late.lt.", "DS",
+         message("www.late.lt.", DS, [],
+                 nsec["late.lt."] + [sign(nsec["late.lt."], lt)]
+                 + nsec["lt."] + [sign(nsec["lt."], lt)] + lt_soa + [lt_soa_sig],
+                 rcode=3), rcode=3)
+    dname = [RR("late.lt.", DNAME, wire_name("both.lt."))]
+    synthesized = [RR("www.late.lt.", CNAME, wire_name("www.both.lt."))]
+    emit("lp_dname_a", "www.late.lt.", "A",
+         message("www.late.lt.", A, dname + [sign(dname, lt, window=EXPIRED)] + synthesized))
+
+    # The DS question at `cn2.lt.` answered by a CNAME whose current signature
+    # is made over other data, beside a denial that proves nothing: the NSEC
+    # that would cover the name is signed in the future, and the one that
+    # verifies covers another span. A forgery beside a lapse: code 6.
+    cn2 = [RR("cn2.lt.", CNAME, wire_name("both.lt."))]
+    cn2_forged = sign([RR("cn2.lt.", CNAME, wire_name("early.lt."))], lt)
+    emit("lp_cn2_ds", "cn2.lt.", "DS",
+         message("cn2.lt.", DS, cn2 + [cn2_forged],
+                 nsec["early.lt."] + [sign(nsec["early.lt."], lt)]
+                 + nsec["both.lt."] + [sign(nsec["both.lt."], lt, window=NOT_YET)]
+                 + lt_soa + [lt_soa_sig]))
+    unsigned2 = [a_rr("www.cn2.lt.", "192.0.2.9")]
+    emit("lp_cn2_www", "www.cn2.lt.", "A", message("www.cn2.lt.", A, unsigned2))
+
 
 @scenario
 def anchored_internal_zones():
