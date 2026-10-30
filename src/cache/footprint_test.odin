@@ -36,6 +36,16 @@ resident_allocator :: proc(r: ^Resident) -> mem.Allocator {
 	return {procedure = resident_proc, data = r}
 }
 
+// What the block at `p`, from Odin's heap allocator, takes from the C heap.
+@(private)
+chunk :: proc(p: rawptr) -> int {
+	if p == nil {
+		return 0
+	}
+	start := ([^]rawptr)(p)[-1]
+	return int(malloc_usable_size(start)) + size_of(uint)
+}
+
 @(private)
 resident_proc :: proc(
 	data: rawptr,
@@ -48,13 +58,6 @@ resident_proc :: proc(
 	[]byte,
 	mem.Allocator_Error,
 ) {
-	chunk :: proc(p: rawptr) -> int {
-		if p == nil {
-			return 0
-		}
-		start := ([^]rawptr)(p)[-1]
-		return int(malloc_usable_size(start)) + size_of(uint)
-	}
 	r := (^Resident)(data)
 	#partial switch mode {
 	case .Free, .Resize, .Resize_Non_Zeroed:
@@ -109,16 +112,22 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	testing.expectf(t, len_entries(c) < INSERTS, "all %d entries fit in the budget", INSERTS)
 
 	// The Cache itself is the only allocation the count leaves out.
-	held := r.held - (size_of(Cache) + 64)
+	held := r.held - chunk(c)
 	used := bytes_used(c)
 	/*
-	The budget binds the count, exactly; the heap agrees with the count to 2%.
-	`held` is not held to the budget itself: glibc hands back a free chunk whole
-	when what is left over would be under its minimum, so the slack an
-	allocation carries depends on what earlier tests on the same thread freed,
-	and a run near the budget lands either side of it.
+	The budget binds the count, exactly, and eviction stops near it rather than
+	well short; the heap agrees with the count to 2%. `held` is not held to the
+	budget itself: it is what glibc made of the allocations, which differs run to
+	run on arm64 CI (8 bytes over the budget once, under it on the rerun) while
+	the count does not.
 	*/
-	testing.expectf(t, used <= BUDGET, "the cache counts %d bytes against a %d byte budget", used, BUDGET)
+	testing.expectf(
+		t,
+		used <= BUDGET && used >= BUDGET * 3 / 4,
+		"the cache counts %d bytes against a %d byte budget",
+		used,
+		BUDGET,
+	)
 	testing.expectf(
 		t,
 		abs(held - used) <= held / 50,
@@ -155,7 +164,7 @@ test_reconfigure_shrinks_the_table :: proc(t: ^testing.T) {
 	testing.expectf(t, r.held <= 16 * 1024, "%d bytes held for 10 entries, %d before", r.held, full)
 	testing.expectf(
 		t,
-		abs(r.held - size_of(Cache) - 64 - bytes_used(c)) <= 256,
+		abs(r.held - chunk(c) - bytes_used(c)) <= 256,
 		"the cache counts %d bytes and holds %d",
 		bytes_used(c),
 		r.held,
