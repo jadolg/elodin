@@ -1130,7 +1130,7 @@ test_parse_bind_refuses_a_stray_bracket :: proc(t: ^testing.T) {
 /*
 #533: a datagram's job and its bytes are one heap block, so the reader makes one
 allocation per datagram and the worker one `free`, which crosses back to the
-reader's malloc arena. They were two of each.
+reader's malloc arena.
 */
 @(test)
 test_udp_job_is_one_allocation :: proc(t: ^testing.T) {

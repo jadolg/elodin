@@ -22,8 +22,9 @@ Writer :: struct {
 	Compression targets, keyed by a hash of the case-folded suffix rather than
 	by the suffix itself, so recording one allocates nothing per name. A hit is
 	only a candidate: `w_name_at` checks it against the bytes at the target
-	before a pointer is written, so a collision costs a byte of compression and
-	never a wrong name.
+	before a pointer is written. A suffix whose hash collides with one already
+	recorded is never recorded itself, so every later name ending in it is
+	written without that part compressed: a larger message, never a wrong name.
 	*/
 	comp:      map[u64]u16,
 	compress:  bool,
@@ -164,11 +165,8 @@ w_name_at :: proc(w: ^Writer, at: int, folded: []u8) -> bool {
 		if n == 0 {
 			return i + 1 == len(folded)
 		}
-		for k in 1 ..= n {
-			c := w.buf[pos + k]
-			if (c + 32 if c >= 'A' && c <= 'Z' else c) != folded[i + k] {
-				return false
-			}
+		if !name_equal_fold(string(w.buf[pos + 1:][:n]), string(folded[i + 1:][:n])) {
+			return false
 		}
 		pos += 1 + n
 		i += 1 + n
@@ -602,8 +600,9 @@ encode_message :: proc(
 				allocator that is a per-request arena, where the frees are
 				no-ops. A reply carrying thousands of small additional records
 				against a small ceiling would grow that arena by all of them for
-				records none of which are sent. What it costs is the odd byte on the records behind
-				the drop, which go out with their names in full.
+				records none of which are sent. What it costs is the odd byte on
+				the records behind the drop, which go out with their names in
+				full.
 				*/
 				if !additional_dropped {
 					additional_dropped = true

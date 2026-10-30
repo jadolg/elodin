@@ -3481,9 +3481,9 @@ test_idle_stream_and_enable_push_protocol_errors :: proc(t: ^testing.T) {
 
 /*
 #533: a request's header block is decoded into the reader's per-frame arena, and
-only the six fields a request keeps reach the connection's allocator. Every
-field went to it before - up to MAX_HEADER_COUNT of them, each name and value
-its own allocation and free on the reader thread.
+only the six fields a request keeps reach the connection's allocator, rather
+than every field - up to MAX_HEADER_COUNT of them, each name and value its own
+allocation and free on the reader thread.
 */
 @(test)
 test_headers_reach_the_connection_allocator_only_for_kept_fields :: proc(t: ^testing.T) {

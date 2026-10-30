@@ -1392,8 +1392,8 @@ test_rdata_cut_off_inside_a_pointer_is_kept_and_not_written :: proc(t: ^testing.
 }
 
 /*
-#533: recording a compression target allocates nothing per name. The map was
-keyed by a cloned suffix, one allocation per distinct suffix: thousands for an
+#533: recording a compression target allocates nothing per name. A map keyed by
+a cloned suffix makes one allocation per distinct suffix: thousands for an
 answer of two thousand distinct names, encoded two or three times a request.
 */
 @(test)

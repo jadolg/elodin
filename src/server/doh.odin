@@ -112,6 +112,8 @@ Http_Request_In :: struct {
 	method:       string,
 	path:         string,
 	query:        string,
+	// A view into `Http_Reader.buf`, unlike the fields above: it ends at the
+	// next `http_compact`, so callers compact only once they are done with it.
 	body:         []u8,
 	keep_alive:   bool,
 	content_type: string,
