@@ -164,7 +164,7 @@ Mc_Session :: struct {
 
 @(private = "file")
 run_serve_doh_mc :: proc(d: ^Mc_Session) {
-	serve_doh(d.server, d.conn, "/dns-query")
+	serve_doh(d.server, d.conn, "test")
 }
 
 /*
@@ -443,7 +443,7 @@ test_serve_doh_head_refusals_have_no_body :: proc(t: ^testing.T) {
 /*
 A HEAD the request reader refuses - here for want of a Host (RFC 9112 3.2) - is
 answered with headers alone as well: the reader hands back the method with the
-refusal, so its 400 is not the one place a HEAD still gets content.
+refusal, so its 400 to a HEAD carries no content either.
 */
 @(test)
 test_serve_doh_head_reader_refusal_has_no_body :: proc(t: ^testing.T) {
