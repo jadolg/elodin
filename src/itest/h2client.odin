@@ -41,14 +41,17 @@ H2_Client :: struct {
 	read_buf:  [dynamic]u8,
 	decoder:   h2.Dynamic_Table,
 	results:   map[u32]^H2_Stream_Result,
-	pings:     int,
-	goaway:    bool,
-	allocator: mem.Allocator,
+	pings:       int,
+	goaway:      bool,
+	goaway_code: h2.Error_Code,
+	allocator:   mem.Allocator,
 }
 
 H2_Settings :: struct {
 	initial_window: int,
 	max_frame:      int,
+	// Sent when above 0; 0 and 1 are the legal values.
+	enable_push:    int,
 }
 
 h2_connect :: proc(port: int, settings: H2_Settings = {}, allocator := context.temp_allocator) -> (c: ^H2_Client, ok: bool) {
@@ -76,6 +79,10 @@ h2_connect :: proc(port: int, settings: H2_Settings = {}, allocator := context.t
 	if settings.max_frame > 0 {
 		append(&payload, 0, u8(h2.Setting.Max_Frame_Size))
 		h2.append_u32(&payload, u32(settings.max_frame))
+	}
+	if settings.enable_push > 0 {
+		append(&payload, 0, u8(h2.Setting.Enable_Push))
+		h2.append_u32(&payload, u32(settings.enable_push))
 	}
 	out := make([dynamic]u8, 0, 32, allocator)
 	h2.write_frame_header(&out, len(payload), .Settings, 0, 0)
@@ -338,6 +345,9 @@ h2_handle :: proc(c: ^H2_Client, header: h2.Frame_Header, payload: []u8) -> bool
 
 	case .Goaway:
 		c.goaway = true
+		if len(payload) >= 8 {
+			c.goaway_code = h2.Error_Code(h2.read_u32(payload[4:]))
+		}
 
 	case .Rst_Stream:
 		r := h2_result(c, header.stream_id)

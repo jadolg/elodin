@@ -192,6 +192,39 @@ run_h2_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	/*
+	RFC 9113 6.5.2 makes an ENABLE_PUSH other than 0 or 1 a PROTOCOL_ERROR, and
+	5.1 makes a WINDOW_UPDATE or RST_STREAM on an idle stream one too. Stream 1
+	is served first, so what each row shows is the frame refused, not a
+	connection that never worked.
+	*/
+	for tc in ([]struct {
+			what:   string,
+			push:   int,
+			window: bool,
+		}{{"ENABLE_PUSH=2", 2, false}, {"WINDOW_UPDATE on an idle stream", 0, true}, {"RST_STREAM on an idle stream", 0, false}}) {
+		start_case(r, fmt.tprintf("h2: %s is a PROTOCOL_ERROR", tc.what))
+		c, cok := h2_connect(doh_port, {enable_push = tc.push})
+		if check(r, cok, "cannot open an h2 connection") {
+			defer h2_close(c)
+			if tc.push == 0 {
+				check(r, h2_send_request(c, 1, "POST", "/dns-query", query), "cannot send")
+				if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
+					if tc.window {
+						check(r, h2_send_window_update(c, 5, 1024), "cannot send a window update")
+					} else {
+						check(r, h2_send_rst(c, 5), "cannot send a reset")
+					}
+				}
+			}
+			// The connection ends, so this returns as soon as the read fails.
+			deadline := time.time_add(time.now(), 3 * time.Second)
+			for !c.goaway && time.diff(deadline, time.now()) < 0 && h2_pump(c) {}
+			check(r, c.goaway && c.goaway_code == .Protocol_Error, "goaway=%v (%v), want PROTOCOL_ERROR", c.goaway, c.goaway_code)
+		}
+		end_case(r)
+	}
+
+	/*
 	RFC 7541 6.3: a dynamic table size update may not exceed the limit the
 	protocol set, which here is the 4096 of SETTINGS_HEADER_TABLE_SIZE. A larger
 	one is a decoding error (4.2), and a decoding error on a connection whose

@@ -1069,8 +1069,9 @@ test_client_serve_takes_turns :: proc(t: ^testing.T) {
 		if f.frames >= FRAMES {
 			return 0, false
 		}
-		// A WINDOW_UPDATE of one on a stream nobody opened, which changes nothing.
-		frame := [FRAME_HEADER_SIZE + 4]u8{0, 0, 4, u8(Frame_Type.Window_Update), 0, 0, 0, 0, 1, 0, 0, 0, 1}
+		// A connection WINDOW_UPDATE of one, which nothing is waiting on. Not
+		// one on a stream: no stream is open, so that is an idle-stream error.
+		frame := [FRAME_HEADER_SIZE + 4]u8{0, 0, 4, u8(Frame_Type.Window_Update), 0, 0, 0, 0, 0, 0, 0, 0, 1}
 		n = copy(buf, frame[f.sent:])
 		f.sent += n
 		if f.sent == len(frame) {
@@ -2877,4 +2878,60 @@ test_client_state_is_read_without_the_connection_lock :: proc(t: ^testing.T) {
 	testing.expect(t, !p.closed, "a fresh connection read as closed")
 	testing.expect(t, p.busy, "a second reference did not make the connection busy")
 	free_all(context.temp_allocator)
+}
+
+/*
+The client's side of the server's idle-stream and ENABLE_PUSH rules. RFC 9113
+6.5.2 holds a server to ENABLE_PUSH 0 and has a client treat 1 as a
+PROTOCOL_ERROR, so anything but 0 is refused here. Idle is an id this client
+never allocated: at or past `next_stream_id`, or even.
+*/
+@(test)
+test_client_idle_stream_and_enable_push_protocol_errors :: proc(t: ^testing.T) {
+	cases := []struct {
+		what:     string,
+		h:        Frame_Header,
+		payload:  []u8,
+		accepted: bool,
+	} {
+		{"ENABLE_PUSH=1", {length = 6, type = .Settings}, {0, u8(Setting.Enable_Push), 0, 0, 0, 1}, false},
+		{"ENABLE_PUSH=2", {length = 6, type = .Settings}, {0, u8(Setting.Enable_Push), 0, 0, 0, 2}, false},
+		{"WINDOW_UPDATE on idle stream 5", {length = 4, type = .Window_Update, stream_id = 5}, {0, 0, 0x10, 0}, false},
+		{"WINDOW_UPDATE on even stream 2", {length = 4, type = .Window_Update, stream_id = 2}, {0, 0, 0x10, 0}, false},
+		{"RST_STREAM on idle stream 5", {length = 4, type = .Rst_Stream, stream_id = 5}, {0, 0, 0, 8}, false},
+		{"RST_STREAM on even stream 2", {length = 4, type = .Rst_Stream, stream_id = 2}, {0, 0, 0, 8}, false},
+		{"ENABLE_PUSH=0", {length = 6, type = .Settings}, {0, u8(Setting.Enable_Push), 0, 0, 0, 0}, true},
+		{"WINDOW_UPDATE on closed stream 3", {length = 4, type = .Window_Update, stream_id = 3}, {0, 0, 0x10, 0}, true},
+		{"RST_STREAM on closed stream 3", {length = 4, type = .Rst_Stream, stream_id = 3}, {0, 0, 0, 8}, true},
+		{"WINDOW_UPDATE on the connection", {length = 4, type = .Window_Update}, {0, 0, 0x10, 0}, true},
+	}
+	for tc in cases {
+		log := Client_Frame_Log {
+			frames = make([dynamic]Frame_Header, 0, 8),
+		}
+		c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+		// Stream 3 was allocated and has finished.
+		c.next_stream_id = 5
+		ok := client_handle_frame(c, tc.h, tc.payload)
+		saw_goaway := false
+		for f in log.frames {
+			saw_goaway ||= f.type == .Goaway
+		}
+		if tc.accepted {
+			testing.expectf(t, ok && !saw_goaway, "%s: accepted=%v goaway=%v, want accepted", tc.what, ok, saw_goaway)
+		} else {
+			testing.expectf(
+				t,
+				!ok && saw_goaway && log.goaway_code == .Protocol_Error,
+				"%s: accepted=%v goaway=%v (%v), want PROTOCOL_ERROR",
+				tc.what,
+				ok,
+				saw_goaway,
+				log.goaway_code,
+			)
+		}
+		delete(log.frames)
+		client_unref(c)
+		free_all(context.temp_allocator)
+	}
 }

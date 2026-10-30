@@ -389,7 +389,13 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 			return false
 		}
 		loop.lock(&c.mu)
-		if s, found := c.streams[h.stream_id]; found {
+		s, found := c.streams[h.stream_id]
+		if !found && client_stream_is_idle(c, h.stream_id) {
+			loop.unlock(&c.mu)
+			client_goaway(c, .Protocol_Error)
+			return false
+		}
+		if found {
 			s.reset = true
 			s.refused = Error_Code(read_u32(payload)) == .Refused_Stream
 			loop.cond_broadcast(&c.cond)
@@ -413,6 +419,18 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 	return true
 }
 
+/*
+RFC 9113 5.1: an id this client never allocated is idle - at or past
+`next_stream_id`, or even, since this end allocates odd ids and refuses push.
+Idle accepts only HEADERS and PRIORITY; anything else on one is a connection
+error of type PROTOCOL_ERROR. Only meaningful for an id not in c.streams, which
+callers check first. Caller holds c.mu.
+*/
+@(private)
+client_stream_is_idle :: proc(c: ^Client, stream_id: u32) -> bool {
+	return stream_id >= c.next_stream_id || stream_id % 2 == 0
+}
+
 @(private)
 client_handle_settings :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	if h.flags & FLAG_ACK != 0 {
@@ -428,6 +446,14 @@ client_handle_settings :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bo
 		id := Setting(read_u16(payload[i:]))
 		value := read_u32(payload[i + 2:])
 		#partial switch id {
+		case .Enable_Push:
+			// RFC 9113 6.5.2: a server MUST NOT set it to 1, and a client
+			// treats 1 as a PROTOCOL_ERROR - as it does any value but 0 or 1.
+			if value != 0 {
+				loop.unlock(&c.mu)
+				client_goaway(c, .Protocol_Error)
+				return false
+			}
 		case .Max_Frame_Size:
 			if value < DEFAULT_MAX_FRAME || value > 16777215 {
 				loop.unlock(&c.mu)
@@ -489,6 +515,10 @@ client_handle_window_update :: proc(c: ^Client, h: Frame_Header, payload: []u8) 
 	} else if s, found := c.streams[h.stream_id]; found {
 		s.send_window += increment
 		overflow = s.send_window > MAX_WINDOW
+	} else if client_stream_is_idle(c, h.stream_id) {
+		loop.unlock(&c.mu)
+		client_goaway(c, .Protocol_Error)
+		return false
 	}
 	loop.cond_broadcast(&c.cond)
 	loop.unlock(&c.mu)
@@ -515,7 +545,7 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 	*/
 	loop.lock(&c.mu)
 	_, tracked := c.streams[h.stream_id]
-	idle := !tracked && (h.stream_id >= c.next_stream_id || h.stream_id % 2 == 0)
+	idle := !tracked && client_stream_is_idle(c, h.stream_id)
 	loop.unlock(&c.mu)
 	if idle {
 		client_goaway(c, .Protocol_Error)
@@ -715,7 +745,7 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	`>= next_stream_id` half alone would miss stream 2 once a single request
 	has moved that bound past it.
 	*/
-	if !found && (h.stream_id >= c.next_stream_id || h.stream_id % 2 == 0) {
+	if !found && client_stream_is_idle(c, h.stream_id) {
 		loop.unlock(&c.mu)
 		client_goaway(c, .Protocol_Error)
 		return false

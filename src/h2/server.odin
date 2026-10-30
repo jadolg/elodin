@@ -488,6 +488,11 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			return false
 		}
 		loop.lock(&c.mu)
+		if stream_is_idle(c, h.stream_id) {
+			loop.unlock(&c.mu)
+			goaway(c, .Protocol_Error)
+			return false
+		}
 		orphaned := false
 		if s, found := c.streams[h.stream_id]; found {
 			s.cancelled = true
@@ -599,6 +604,18 @@ set_state :: proc(c: ^Conn, s: ^Stream, state: Stream_State) {
 	s.state = state
 }
 
+/*
+RFC 9113 5.1: a stream id past the highest the peer has opened is idle, and so
+is any even one, which only a push could open and this end never pushes. Idle
+accepts only HEADERS and PRIORITY; anything else on one is a connection error
+of type PROTOCOL_ERROR. Caller holds c.mu; stream 0 is the connection, not a
+stream, and is the caller's to rule out.
+*/
+@(private)
+stream_is_idle :: proc(c: ^Conn, stream_id: u32) -> bool {
+	return stream_id > c.last_stream_id || stream_id % 2 == 0
+}
+
 @(private)
 handle_settings :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	if h.flags & FLAG_ACK != 0 {
@@ -614,6 +631,14 @@ handle_settings :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		id := Setting(read_u16(payload[i:]))
 		value := read_u32(payload[i + 2:])
 		#partial switch id {
+		case .Enable_Push:
+			// RFC 9113 6.5.2: anything but 0 or 1 is a PROTOCOL_ERROR. This
+			// end never pushes, so a legal value changes nothing.
+			if value > 1 {
+				loop.unlock(&c.mu)
+				goaway(c, .Protocol_Error)
+				return false
+			}
 		case .Max_Frame_Size:
 			if value < DEFAULT_MAX_FRAME || value > 16777215 {
 				loop.unlock(&c.mu)
@@ -670,6 +695,11 @@ handle_window_update :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	}
 
 	loop.lock(&c.mu)
+	if h.stream_id != 0 && stream_is_idle(c, h.stream_id) {
+		loop.unlock(&c.mu)
+		goaway(c, .Protocol_Error)
+		return false
+	}
 	overflow := false
 	if h.stream_id == 0 {
 		c.send_window += increment
@@ -1320,7 +1350,7 @@ handle_data :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	through to the closed-stream path instead - a connection error misanswered
 	as a stream error, and one that spent the closed-stream budget doing it.
 	*/
-	if h.stream_id > c.last_stream_id || h.stream_id % 2 == 0 {
+	if stream_is_idle(c, h.stream_id) {
 		loop.unlock(&c.mu)
 		goaway(c, .Protocol_Error)
 		return false
