@@ -22,13 +22,23 @@ fixture_now :: proc() -> time.Time {
 
 /*
 A fixture's instant on the zone cache's clock, for a test that seeds or reads the
-cache by hand. The cache is timed on `loop.Moment`, which counts from boot, so a
-wall-clock instant read as one lies decades past anything the walk reads off
-the clock: an entry seeded at it is as live to a walk as it was when both read
-the same fixture time, and a test moving its clock forward still expires it.
+cache by hand. `FIXTURE_TIME` is the moment the test binary started, so an entry
+seeded at it lies on the same clock as one a walk stores, and is as live to that
+walk as it was when both read the same fixture time. A test moving its own clock
+forward still expires it.
 */
 fixture_moment :: proc(t: time.Time) -> loop.Moment {
-	return loop.Moment(time.to_unix_nanoseconds(t))
+	return loop.moment_add(fixture_start, time.diff(fixture_now(), t))
+}
+
+// Read once, before any test runs, and never written again: the tests run in
+// parallel and all read it.
+@(private = "file")
+fixture_start: loop.Moment
+
+@(init, private = "file")
+read_fixture_start :: proc "contextless" () {
+	fixture_start = loop.moment_now()
 }
 
 @(private = "file")

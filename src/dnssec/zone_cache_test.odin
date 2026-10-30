@@ -27,10 +27,6 @@ no_upstream :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Al
 	return nil, false
 }
 
-@(private = "file")
-cache_now :: proc() -> loop.Moment {
-	return loop.moment_now()
-}
 
 // A DNSKEY whose RDATA is `size` bytes, usable unless `flags` says otherwise.
 // Nothing about it verifies anything; these tests are about what the cache
@@ -87,7 +83,7 @@ test_one_zone_cannot_fill_the_cache_by_itself :: proc(t: ^testing.T) {
 	for _ in 0 ..< MAX_KEYS_PER_ZONE {
 		append(&huge, sized_key(4 + MAX_MODULUS_BYTES + MAX_EXPONENT_BYTES))
 	}
-	cache_put(v, "flood.example.", .Secure, huge[:], MAX_ZONE_TTL, cache_now())
+	cache_put(v, "flood.example.", .Secure, huge[:], MAX_ZONE_TTL, loop.moment_now())
 
 	held := cached_key_bytes(v, "flood.example.")
 	testing.expectf(
@@ -112,7 +108,7 @@ test_an_ordinary_apex_is_still_cached_whole :: proc(t: ^testing.T) {
 	for _ in 0 ..< 4 {
 		append(&ordinary, sized_key(4 + 256 + 3))
 	}
-	cache_put(v, "example.com.", .Secure, ordinary[:], MAX_ZONE_TTL, cache_now())
+	cache_put(v, "example.com.", .Secure, ordinary[:], MAX_ZONE_TTL, loop.moment_now())
 
 	entry, found := v.zones["example.com."]
 	testing.expect(t, found, "an ordinary apex should be cached")
@@ -146,7 +142,7 @@ test_the_cache_keeps_only_keys_that_could_sign :: proc(t: ^testing.T) {
 		// Protocol is fixed at 3; anything else is not a DNSSEC key.
 		sized_key(4 + 256, protocol = 4),
 	}
-	cache_put(v, "example.com.", .Secure, set, MAX_ZONE_TTL, cache_now())
+	cache_put(v, "example.com.", .Secure, set, MAX_ZONE_TTL, loop.moment_now())
 
 	entry, found := v.zones["example.com."]
 	testing.expect(t, found, "the zone should have been cached")
@@ -177,7 +173,7 @@ test_a_flood_of_fresh_zones_does_not_evict_the_root :: proc(t: ^testing.T) {
 	v := make_validator(no_upstream, nil, Options{max_cached_zones = 16})
 	defer destroy_validator(v)
 
-	now := cache_now()
+	now := loop.moment_now()
 	root_keys := []Dnskey{sized_key(4 + 256)}
 	cache_put(v, ".", .Secure, root_keys, MAX_ZONE_TTL, now)
 
@@ -210,7 +206,7 @@ test_a_full_cache_evicts_the_least_recently_used_zone :: proc(t: ^testing.T) {
 	v := make_validator(no_upstream, nil, Options{max_cached_zones = 3})
 	defer destroy_validator(v)
 
-	now := cache_now()
+	now := loop.moment_now()
 	keys := []Dnskey{sized_key(4 + 256)}
 	for zone in ([]string{"a.example.", "b.example.", "c.example."}) {
 		cache_put(v, zone, .Secure, keys, MAX_ZONE_TTL, now)
@@ -247,7 +243,7 @@ test_refreshing_a_zone_keeps_the_cache_consistent :: proc(t: ^testing.T) {
 	v := make_validator(no_upstream, nil, Options{max_cached_zones = 4})
 	defer destroy_validator(v)
 
-	now := cache_now()
+	now := loop.moment_now()
 	keys := []Dnskey{sized_key(4 + 256)}
 	for _ in 0 ..< 10 {
 		cache_put(v, "example.com.", .Secure, keys, MAX_ZONE_TTL, now)
@@ -280,7 +276,7 @@ test_sweeping_an_expired_zone_leaves_the_eviction_order_intact :: proc(t: ^testi
 	v := make_validator(no_upstream, nil, Options{max_cached_zones = 4})
 	defer destroy_validator(v)
 
-	now := cache_now()
+	now := loop.moment_now()
 	keys := []Dnskey{sized_key(4 + 256)}
 	cache_put(v, "a.example.", .Secure, keys, MIN_ZONE_TTL, now)
 	cache_put(v, "b.example.", .Secure, keys, MIN_ZONE_TTL, now)
@@ -320,7 +316,7 @@ test_an_oversized_key_set_does_not_drop_the_one_already_held :: proc(t: ^testing
 	v := make_validator(no_upstream, nil, Options{})
 	defer destroy_validator(v)
 
-	now := cache_now()
+	now := loop.moment_now()
 	good := []Dnskey{sized_key(4 + 256)}
 	cache_put(v, "example.com.", .Secure, good, MAX_ZONE_TTL, now)
 
@@ -355,7 +351,7 @@ test_an_oversized_key_set_still_settles_the_name :: proc(t: ^testing.T) {
 	v := make_validator(no_upstream, nil, Options{})
 	defer destroy_validator(v)
 
-	now := cache_now()
+	now := loop.moment_now()
 	non_cut_remember(v, "example.com.", MIN_ZONE_TTL, now)
 	_, _, remembered := cache_get(v, "example.com.", now, context.temp_allocator)
 	testing.expect(t, remembered, "the memo should hold the name to begin with")
@@ -411,7 +407,7 @@ test_a_cache_of_one_zone_holds_exactly_one :: proc(t: ^testing.T) {
 	v := make_validator(no_upstream, nil, Options{max_cached_zones = 1})
 	defer destroy_validator(v)
 
-	now := cache_now()
+	now := loop.moment_now()
 	keys := []Dnskey{sized_key(4 + 256)}
 	for i in 0 ..< 8 {
 		cache_put(v, fmt.tprintf("z%d.example.", i), .Secure, keys, MAX_ZONE_TTL, now)
@@ -452,11 +448,11 @@ test_a_refused_key_set_is_counted :: proc(t: ^testing.T) {
 	for _ in 0 ..< MAX_KEYS_PER_ZONE {
 		append(&huge, sized_key(4 + MAX_MODULUS_BYTES + MAX_EXPONENT_BYTES))
 	}
-	cache_put(v, "flood.example.", .Secure, huge[:], MAX_ZONE_TTL, cache_now())
+	cache_put(v, "flood.example.", .Secure, huge[:], MAX_ZONE_TTL, loop.moment_now())
 	testing.expect_value(t, oversized_key_sets(v), 1)
 
 	// An ordinary set does not touch it.
-	cache_put(v, "example.com.", .Secure, []Dnskey{sized_key(4 + 256)}, MAX_ZONE_TTL, cache_now())
+	cache_put(v, "example.com.", .Secure, []Dnskey{sized_key(4 + 256)}, MAX_ZONE_TTL, loop.moment_now())
 	testing.expect_value(t, oversized_key_sets(v), 1)
 	free_all(context.temp_allocator)
 }

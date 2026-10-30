@@ -501,6 +501,20 @@ readings is bounded only by its own length. Borrowed from the caller
 	verifications, and the two would read the same.
 	*/
 	ran_out:       string,
+	/*
+	The walk's `now` on the zone cache's clock: `query_budget` reads it, and
+	`validate` sets it back to the whole second `now` falls in. A signature's
+	lapse is counted from that second, so an entry is timed from the same
+	instant: timed from when its step finished, it would outlive the signature
+	by however long the walk had run by then.
+	*/
+	began:         loop.Moment,
+}
+
+// `Budget.began`, or the clock for a budget built without one.
+@(private)
+walk_began :: proc(budget: ^Budget) -> loop.Moment {
+	return budget.began if budget.began != 0 else loop.moment_now()
 }
 
 /*
@@ -594,7 +608,7 @@ rather than quietly validating at a number nobody chose.
 */
 @(private)
 query_budget :: proc(v: ^Validator) -> Budget {
-	return {nsec3 = {max_iterations = v.max_nsec3_iterations}}
+	return {nsec3 = {max_iterations = v.max_nsec3_iterations}, began = loop.moment_now()}
 }
 
 /*
@@ -1127,6 +1141,12 @@ validate :: proc(
 	class := msg.question[0].class if len(msg.question) > 0 else dns.Class.IN
 	unix := u32(time.to_unix_seconds(now))
 	budget := query_budget(v)
+	/*
+	Every signature's lapse is counted from the whole second `unix`, which `now`
+	is a fraction past. The zone cache is timed from that second too, or an entry
+	would outlive its signatures by the fraction (RFC 4035 section 5.3.1).
+	*/
+	budget.began = loop.moment_add(budget.began, -time.diff(time.unix(i64(unix), 0), now))
 	/*
 	The slot is this question's rather than each walk's - see `keep_slot` - so
 	the walks below hand it on to one another and it is given back here, once,
@@ -3904,14 +3924,14 @@ zone_step :: proc(
 			// Every DS names an algorithm or a digest we cannot check, which
 			// RFC 6840 section 5.2 makes an insecure delegation rather than a
 			// broken one.
-			cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), loop.moment_now(), sig_lapses(ds_sig, unix))
+			cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), walk_began(budget), sig_lapses(ds_sig, unix))
 			return .Insecure, nil
 		}
 
 		child_keys, kstatus, keys_sig, keys_ttl := fetch_keys(v, budget, child, set[:], unix, allocator)
 		if kstatus != .Secure {
 			if kstatus == .Insecure {
-				cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), loop.moment_now(), sig_lapses(ds_sig, unix))
+				cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), walk_began(budget), sig_lapses(ds_sig, unix))
 				return .Insecure, nil
 			}
 			if kstatus == .Bogus {
@@ -3941,7 +3961,7 @@ zone_step :: proc(
 		// Held to both RRsets the keys rest on and the signatures over them:
 		// the parent's over the DS and the zone's own over its DNSKEY set.
 		ttl := min(rrset_ttl(ds_records), ds_sig.original_ttl, keys_ttl, keys_sig.original_ttl)
-		cache_put(v, child, .Secure, child_keys, ttl, loop.moment_now(), min(sig_lapses(ds_sig, unix), sig_lapses(keys_sig, unix)))
+		cache_put(v, child, .Secure, child_keys, ttl, walk_began(budget), min(sig_lapses(ds_sig, unix), sig_lapses(keys_sig, unix)))
 		return .Secure, child_keys
 	}
 
@@ -3965,7 +3985,7 @@ zone_step :: proc(
 		return walk_gave_up(budget, exhausted_reason(budget)), nil
 	}
 	if cname_ok {
-		non_cut_remember(v, child, min(rrset_ttl(cname), cname_sig.original_ttl), loop.moment_now(), sig_lapses(cname_sig, unix))
+		non_cut_remember(v, child, min(rrset_ttl(cname), cname_sig.original_ttl), walk_began(budget), sig_lapses(cname_sig, unix))
 		return .No_Cut, nil
 	}
 
@@ -4041,7 +4061,7 @@ zone_step :: proc(
 	}
 	switch step {
 	case .Insecure:
-		cache_put(v, child, .Insecure, nil, min(negative_ttl(msg), sets_original_ttl(proved)), loop.moment_now(), sets_lapse(proved, unix))
+		cache_put(v, child, .Insecure, nil, min(negative_ttl(msg), sets_original_ttl(proved)), walk_began(budget), sets_lapse(proved, unix))
 	case .No_Cut:
 		/*
 		Remembered for the denial's own negative TTL, held to the Original TTL
@@ -4066,7 +4086,7 @@ zone_step :: proc(
 		is nothing to win: the answer cache holds the NXDOMAIN, so the same
 		question does not come back here anyway.
 		*/
-		non_cut_remember(v, child, min(negative_ttl(msg), sets_original_ttl(proved)), loop.moment_now(), sets_lapse(proved, unix))
+		non_cut_remember(v, child, min(negative_ttl(msg), sets_original_ttl(proved)), walk_began(budget), sets_lapse(proved, unix))
 	case .Secure, .Absent, .Bogus, .Indeterminate:
 	}
 	return step, nil
@@ -4446,7 +4466,7 @@ zone_keys :: proc(
 	if fstatus != .Secure {
 		return fstatus, nil
 	}
-	cache_put(v, zone, .Secure, fetched, min(keys_ttl, vouched.original_ttl), loop.moment_now(), sig_lapses(vouched, unix))
+	cache_put(v, zone, .Secure, fetched, min(keys_ttl, vouched.original_ttl), walk_began(budget), sig_lapses(vouched, unix))
 	return .Secure, fetched
 }
 

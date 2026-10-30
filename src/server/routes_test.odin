@@ -3103,8 +3103,8 @@ test_the_question_span_is_the_longest_group_budget :: proc(t: ^testing.T) {
 
 /*
 The apex memory's window is on `loop.Moment`, as the cooldown it stands in for
-is (issue #557). On the wall clock a step forward forgot every unhelpful parent
-at once, and a step back held one remembered for the length of the step. A step
+is (issue #557). On the wall clock a step forward would forget every unhelpful
+parent at once, and a step back would hold one for the length of the step. A step
 cannot be made from a test, so this asserts what rules one out: the window a
 reply opens ends `upstream.COOLDOWN` past a moment read between two readings of
 `loop.moment_now`.

@@ -237,8 +237,8 @@ test_a_stale_copy_is_told_no_more_than_the_rrsig_allows :: proc(t: ^testing.T) {
 /*
 An entry's lifetime is timed on `loop.Moment`, CLOCK_BOOTTIME (issue #557).
 
-On the wall clock a step of it (NTP, `chronyc makestep`, a VM resume) expired the
-whole cache at once, or served every answer past its TTL for the length of the
+On the wall clock a step of it (NTP, `chronyc makestep`, a VM resume) would expire
+the whole cache at once, or serve every answer past its TTL for the length of the
 step with the TTL counted down to zero. A step cannot be made from a test, so this
 asserts what rules one out: each stamp lies between two readings of
 `loop.moment_now`, which `loop` tests against CLOCK_BOOTTIME. A stamp off the

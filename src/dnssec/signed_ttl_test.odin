@@ -162,6 +162,38 @@ test_served_ttl_under_the_ceiling_is_kept :: proc(t: ^testing.T) {
 }
 
 /*
+A question asked a fraction of a second past a whole one: every signature's lapse
+is counted in whole seconds from the one `now` falls in, so the zone cache is
+timed from that second as well, and no key outlives its signature by the
+fraction. The same walk at the whole second is the yardstick: the one 0.9 s past
+it must hold `example.com.`'s keys 0.9 s less.
+*/
+@(test)
+test_zone_keys_are_timed_from_the_whole_second :: proc(t: ^testing.T) {
+	// How long the entry is held, bounded both ways by the moments either
+	// side of the walk.
+	held :: proc(t: ^testing.T, now: time.Time) -> (least, most: time.Duration, ok: bool) {
+		v := make_validator(st_query, nil, Options{})
+		defer destroy_validator(v)
+		before := loop.moment_now()
+		result := validate(v, "www.example.com.", .A, st_fixture("example_a"), now)
+		after := loop.moment_now()
+		testing.expect_value(t, result.status, Status.Secure)
+		entry, found := v.zones["example.com."]
+		if !testing.expect(t, found, "example.com. was not cached") {
+			return
+		}
+		return time.Duration(entry.expires - after), time.Duration(entry.expires - before), true
+	}
+	_, whole, whole_ok := held(t, time.unix(FIXTURE_TIME, 0))
+	part, _, part_ok := held(t, time.unix(FIXTURE_TIME, i64(900 * time.Millisecond)))
+	if whole_ok && part_ok {
+		testing.expectf(t, part <= whole - 900 * time.Millisecond, "held %v from 0.9 s past the second, %v from the second itself", part, whole)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
 The same section, for the records the chain walk keeps: a zone's keys are held
 no longer than the DS and DNSKEY signatures that vouched for them. Each zone is
 walked to a hundred seconds before the first of those lapses - the root's own
@@ -179,18 +211,18 @@ test_zone_keys_do_not_outlive_their_signatures :: proc(t: ^testing.T) {
 		defer destroy_validator(v)
 		last := first_sig(c.bound).expiration
 		budget := query_budget(v)
-		// The cache counts from when it stored the entry, on its own clock,
-		// which lies inside this; see `fixture_moment`.
-		before := loop.moment_now()
+		// The walk's `now` read fifty seconds before its steps store anything,
+		// as a walk held up on its upstreams has: the entry is timed from that
+		// instant, not from when the step that stored it finished.
+		budget.began = loop.moment_add(budget.began, -50 * time.Second)
 		status, _, _ := zone_trust(v, &budget, c.zone, time.unix(i64(last) - 100, 0), context.temp_allocator)
 		end_walk(v, &budget)
 		testing.expectf(t, status == .Secure, "%s walked to %v", c.zone, status)
 		entry, found := v.zones[c.zone]
 		testing.expectf(t, found, "%s was not cached", c.zone)
 		if found {
-			// The walk ran 100 s before the signature lapses; a second of slack
-			// for the moment the entry was stored after `before`.
-			over := time.Duration(entry.expires - loop.moment_add(before, 101 * time.Second))
+			// The walk ran 100 s before the signature lapses.
+			over := time.Duration(entry.expires - loop.moment_add(budget.began, 100 * time.Second))
 			testing.expectf(t, over <= 0, "%s is kept %v past its signature", c.zone, over)
 		}
 	}
