@@ -1622,17 +1622,25 @@ def lapsed_signatures():
     #   both.lt.            an expired signature beside a current one: Secure
     #   mixed.lt.           an expired one beside a current one that does not
     #                       verify: a forgery still, code 6
+    #   late.lt. CNAME      a lapsed set and a forged one in one answer, in
+    #                       either order: code 6, the forgery's
+    #   x.wl. CNAME y.wm.   two wildcard expansions, one proof lapsed and one
+    #                       refuted: code 6
+    #   www.cn.lt.          a DS question answered by a CNAME the parent signed
+    #                       in the future, beside a denial whose current
+    #                       signature fails: code 6
     root = Key(".", "lapse-root")
     dsx = Key("dsx.", "lapse-dsx")
     dkx = Key("dkx.", "lapse-dkx")
     lt = Key("lt.", "lapse-lt")
     wl = Key("wl.", "lapse-wl")
+    wm = Key("wm.", "lapse-wm")
 
     root_keys = [RR(".", DNSKEY, root.rdata)]
     print("// anchor: %s" % root.ds_text())
     emit("lp_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
 
-    for tag, zone in (("dsx", dsx), ("dkx", dkx), ("lt", lt), ("wl", wl)):
+    for tag, zone in (("dsx", dsx), ("dkx", dkx), ("lt", lt), ("wl", wl), ("wm", wm)):
         ds_set = [RR(zone.zone, DS, zone.ds())]
         ds_window = EXPIRED if zone is dsx else None
         emit("lp_%s_ds" % tag, zone.zone, "DS",
@@ -1714,6 +1722,46 @@ def lapsed_signatures():
     emit("lp_x_a", "x.wl.", "A",
          message("x.wl.", A, expanded + [sign(expanded, wl, labels=1)],
                  wild_nsec + [sign(wild_nsec, wl, window=EXPIRED)]))
+
+    # A lapsed set and a forged one in the same answer: the CNAME's only
+    # signature expired, the A's current signature is made over other data.
+    # Served both ways round, since which comes first is the sender's choice.
+    cname = [RR("late.lt.", CNAME, wire_name("mixed.lt."))]
+    cname_sig = sign(cname, lt, window=EXPIRED)
+    forged = [a_rr("mixed.lt.", "192.0.2.4")]
+    forged_sig = sign([a_rr("mixed.lt.", "198.51.100.4")], lt)
+    emit("lp_pair_lapse_first", "late.lt.", "A",
+         message("late.lt.", A, cname + [cname_sig] + forged + [forged_sig]))
+    emit("lp_pair_forgery_first", "late.lt.", "A",
+         message("late.lt.", A, forged + [forged_sig] + cname + [cname_sig]))
+
+    # Two wildcard expansions, `x.wl. CNAME y.wm.` from `*.wl.` and `y.wm. A`
+    # from `*.wm.`, whose proofs fail differently: `*.wl.`'s NSEC expired,
+    # `*.wm.`'s carries a current signature made over other data.
+    wm_soa = [soa_rr("wm.")]
+    wm_soa_sig = sign(wm_soa, wm)
+    wm_nsec = [RR("*.wm.", NSEC, nsec_rdata("wm.", [A, RRSIG, NSEC]))]
+    emit("lp_y_ds", "y.wm.", "DS",
+         message("y.wm.", DS, [], wm_nsec + [sign(wm_nsec, wm)] + wm_soa + [wm_soa_sig]))
+    wm_nsec_forged = sign([RR("*.wm.", NSEC, nsec_rdata("wm.", [A, TXT, RRSIG, NSEC]))], wm)
+    hop = [RR("x.wl.", CNAME, wire_name("y.wm."))]
+    target = [a_rr("y.wm.", "192.0.2.7")]
+    emit("lp_two_wildcards", "x.wl.", "A",
+         message("x.wl.", A,
+                 hop + [sign(hop, wl, labels=1)] + target + [sign(target, wm, labels=1)],
+                 wild_nsec + [sign(wild_nsec, wl, window=EXPIRED)] + wm_nsec + [wm_nsec_forged]))
+
+    # The DS question at `cn.lt.` answered by a CNAME `lt.` signed in the
+    # future, beside the NSEC that would deny a DS there, whose current
+    # signature is made over other data.
+    cn = [RR("cn.lt.", CNAME, wire_name("both.lt."))]
+    cn_nsec = [RR("both.lt.", NSEC, nsec_rdata("early.lt.", [A, RRSIG, NSEC]))]
+    cn_nsec_forged = sign([RR("both.lt.", NSEC, nsec_rdata("early.lt.", [A, TXT, RRSIG, NSEC]))], lt)
+    emit("lp_cn_ds", "cn.lt.", "DS",
+         message("cn.lt.", DS, cn + [sign(cn, lt, window=NOT_YET)],
+                 cn_nsec + [cn_nsec_forged] + lt_soa + [lt_soa_sig]))
+    unsigned = [a_rr("www.cn.lt.", "192.0.2.8")]
+    emit("lp_cn_www", "www.cn.lt.", "A", message("www.cn.lt.", A, unsigned))
 
 
 @scenario

@@ -126,6 +126,26 @@ LP_FIXTURES := []Fixture{
 			"bd439a54419078f9ec731e8d711af03fe6155f857db102f22c07",
 	},
 	{
+		key   = "lp_wm_ds",
+		name  = "wm.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "12348580000100020000000002776d00002b000102776d00002b000100000e100024d13d0f0206cd099045f981474c00" +
+			"a41ddf6f1f88d0123519bdd2f4730434f4f85cef768502776d00002e000100000e100053002b0f0100000e107d3b1820" +
+			"6a478820e2b30003802f682089ae949f06fad9f98abed6d83f632c1f717cde4b171c1992a70f00ce9e7d7bd9b6b183e9" +
+			"a1a3f01386e61b3dbad471adb358c24761f6b053a1a604",
+	},
+	{
+		key   = "lp_wm_dnskey",
+		name  = "wm.",
+		type  = .DNSKEY,
+		rcode = 0,
+		wire  = "12348580000100020000000002776d000030000102776d000030000100000e1000240101030f7f026e69e0c673ea935a" +
+			"d14c76692eb7aca7f0c85dc4e9cd2ce87841cf5e27bd02776d00002e000100000e10005600300f0100000e107d3b1820" +
+			"6a478820d13d02776d00fd24f1958165d41734b83dfbafd789920bbd6edd1f564b1d56a7f1685eecc150cdb72b5cf29b" +
+			"dc9e514f4dea1eb332f13327b54122c854940bd2d03e4b0f2207",
+	},
+	{
 		key   = "lp_dsx_www",
 		name  = "www.dsx.",
 		type  = .A,
@@ -318,6 +338,86 @@ LP_FIXTURES := []Fixture{
 			"012a02776c00002f000100000e10000c02776c000006400000000003012a02776c00002e000100000e100056002f0f01" +
 			"00000e106a4788206a1ffb20abed02776c006809b084cdc11b601d3bb50fba7bd0c1c532b5c1d9d612816d6bb1406839" +
 			"3f5c5881e2634b13e13050bec2f823355728862071ec3c21c7d310999d648ba82909",
+	},
+	{
+		key   = "lp_pair_lapse_first",
+		name  = "late.lt.",
+		type  = .A,
+		rcode = 0,
+		wire  = "123485800001000400000000046c617465026c740000010001046c617465026c74000005000100000e10000a056d6978" +
+			"6564026c7400046c617465026c7400002e000100000e10005600050f0200000e106a4788206a1ffb2003a1026c7400d6" +
+			"1d9e09f7701c8fa404b5617bc20f1b73ae3b2697a7100ba23071d3ead30a13e1f8955f9bce00e6b39075f132a38d5c6c" +
+			"cd71e489bdadd996bfa734adb92d01056d69786564026c74000001000100000e100004c0000204056d69786564026c74" +
+			"00002e000100000e10005600010f0200000e107d3b18206a47882003a1026c7400e29bba1dd3015f2cdd38369bd8afd8" +
+			"69b50b1ca838d1a495faa061137a1c324c4b2eb6eaf0b1a51febe75e739141428df7f6f09b260e1183325576eb160b04" +
+			"09",
+	},
+	{
+		key   = "lp_pair_forgery_first",
+		name  = "late.lt.",
+		type  = .A,
+		rcode = 0,
+		wire  = "123485800001000400000000046c617465026c740000010001056d69786564026c74000001000100000e100004c00002" +
+			"04056d69786564026c7400002e000100000e10005600010f0200000e107d3b18206a47882003a1026c7400e29bba1dd3" +
+			"015f2cdd38369bd8afd869b50b1ca838d1a495faa061137a1c324c4b2eb6eaf0b1a51febe75e739141428df7f6f09b26" +
+			"0e1183325576eb160b0409046c617465026c74000005000100000e10000a056d69786564026c7400046c617465026c74" +
+			"00002e000100000e10005600050f0200000e106a4788206a1ffb2003a1026c7400d61d9e09f7701c8fa404b5617bc20f" +
+			"1b73ae3b2697a7100ba23071d3ead30a13e1f8955f9bce00e6b39075f132a38d5c6ccd71e489bdadd996bfa734adb92d" +
+			"01",
+	},
+	{
+		key   = "lp_y_ds",
+		name  = "y.wm.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "123485800001000000040000017902776d00002b0001012a02776d00002f000100000e10000c02776d00000640000000" +
+			"0003012a02776d00002e000100000e100056002f0f0100000e107d3b18206a478820d13d02776d00be4a684b40579a4a" +
+			"34d37d36e069f1965cf9a0d44deea6703bb3d2f27995f7b741b2757bf5ef8157ad5d67cd936ec218b805242613e57dc5" +
+			"a9f3e573bb9ba90902776d000006000100000e10002a026e7302776d000a686f73746d617374657202776d0000000001" +
+			"00000e100000038400093a800000012c02776d00002e000100000e10005600060f0100000e107d3b18206a478820d13d" +
+			"02776d0032548d68306c20dbb0a613583cb2ef2b456daf4468a35c62ef6b78556b32a35a572860f860bf634e9a7d2617" +
+			"c6c76681c90459ab4eef146889b59159f55e000d",
+	},
+	{
+		key   = "lp_two_wildcards",
+		name  = "x.wl.",
+		type  = .A,
+		rcode = 0,
+		wire  = "123485800001000400040000017802776c0000010001017802776c000005000100000e100006017902776d0001780277" +
+			"6c00002e000100000e10005600050f0100000e107d3b18206a478820abed02776c0019331a588f3bfdb27c99121543e5" +
+			"e75ec2e255a2f0284a6fbc3142ea14f4d71f3833b91472cef1405c1c2c1c25791869495dd8b9f3ae3c9beedfde0c6c93" +
+			"e60f017902776d000001000100000e100004c0000207017902776d00002e000100000e10005600010f0100000e107d3b" +
+			"18206a478820d13d02776d00eefbce88ccb427fab994fb76699422378691509cd6e09a68e8054cfa0c226231c6bfea4b" +
+			"886a58a4af63d238c95d79626fd8bd8d59b5c9564d9c63ea9233100b012a02776c00002f000100000e10000c02776c00" +
+			"0006400000000003012a02776c00002e000100000e100056002f0f0100000e106a4788206a1ffb20abed02776c006809" +
+			"b084cdc11b601d3bb50fba7bd0c1c532b5c1d9d612816d6bb14068393f5c5881e2634b13e13050bec2f8233557288620" +
+			"71ec3c21c7d310999d648ba82909012a02776d00002f000100000e10000c02776d000006400000000003012a02776d00" +
+			"002e000100000e100056002f0f0100000e107d3b18206a478820d13d02776d0070d7da921baf41929c12501078dfe823" +
+			"24b3214597c16603a31affe0c1fd132a82ef7ce31a030806f9c75bf24feb26652f0fd2bce92f71f214cb4e7d5e982609",
+	},
+	{
+		key   = "lp_cn_ds",
+		name  = "cn.lt.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "12348580000100020004000002636e026c7400002b000102636e026c74000005000100000e10000904626f7468026c74" +
+			"0002636e026c7400002e000100000e10005600050f0200000e10a2d31e2090071b2003a1026c740037965c601979d88a" +
+			"fdb706c010a13e2e76dc3e3623aecc93ba398e4a46463bf9c400dc349d0c9de4ca9912da8d6b4d0da8f28165e6bbf477" +
+			"bd2a27687644240504626f7468026c7400002f000100000e100012056561726c79026c7400000640000000000304626f" +
+			"7468026c7400002e000100000e100056002f0f0200000e107d3b18206a47882003a1026c7400bb560aebab2d2ce23b29" +
+			"6aab3e7241876be3d955be7b56a357c5b1fb269cd02cc6d2d5383a770289c02b7c5b2bc650f68b35c80d921908cd7ea1" +
+			"e731b4708d09026c74000006000100000e10002a026e73026c74000a686f73746d6173746572026c7400000000010000" +
+			"0e100000038400093a800000012c026c7400002e000100000e10005600060f0100000e107d3b18206a47882003a1026c" +
+			"74002f2f61631826be86c19f8e55a637879c4d48f1da45d0807197585e5a291ec399890ff4a37cdf25d934525cb25373" +
+			"0b5fe4cb8590de4b73ddfc4f849c3f3cff0f",
+	},
+	{
+		key   = "lp_cn_www",
+		name  = "www.cn.lt.",
+		type  = .A,
+		rcode = 0,
+		wire  = "1234858000010001000000000377777702636e026c7400000100010377777702636e026c74000001000100000e100004" +
+			"c0000208",
 	},
 }
 
@@ -518,5 +618,76 @@ test_a_denial_with_a_failed_current_signature_is_not_a_lapse :: proc(t: ^testing
 		result.lapsed.window,
 		result.reason,
 	)
+	free_all(context.temp_allocator)
+}
+
+// Several lapsed signatures on one side: the instant named is the one nearest
+// `now` - the latest expiration, the earliest inception - in whatever order the
+// signatures, or the sets of one proof, arrive.
+@(test)
+test_a_lapse_names_the_instant_nearest_now :: proc(t: ^testing.T) {
+	NOW :: u32(1_000_000)
+	SKEW :: u32(SIG_INCEPTION_SKEW)
+	keys := []Dnskey{{flags = DNSKEY_FLAG_ZONE, protocol = 3, algorithm = 15, tag = 7}}
+	expired: Lapsed
+	note_lapsed(&expired, Rrsig{algorithm = 15, key_tag = 7, inception = NOW - 90, expiration = NOW - 50}, keys, NOW)
+	note_lapsed(&expired, Rrsig{algorithm = 15, key_tag = 7, inception = NOW - 90, expiration = NOW - 10}, keys, NOW)
+	note_lapsed(&expired, Rrsig{algorithm = 15, key_tag = 7, inception = NOW - 90, expiration = NOW - 30}, keys, NOW)
+	testing.expectf(t, expired == Lapsed{window = .Expired, at = NOW - 10}, "the latest expiration should be named, got %v", expired)
+
+	early: Lapsed
+	note_lapsed(&early, Rrsig{algorithm = 15, key_tag = 7, inception = NOW + SKEW + 50, expiration = NOW + 900_000}, keys, NOW)
+	note_lapsed(&early, Rrsig{algorithm = 15, key_tag = 7, inception = NOW + SKEW + 10, expiration = NOW + 900_000}, keys, NOW)
+	note_lapsed(&early, Rrsig{algorithm = 15, key_tag = 7, inception = NOW + SKEW + 30, expiration = NOW + 900_000}, keys, NOW)
+	testing.expectf(t, early == Lapsed{window = .Not_Yet_Valid, at = NOW + SKEW + 10}, "the earliest inception should be named, got %v", early)
+
+	across := Lapsed{window = .Expired, at = NOW - 50}
+	keep_lapse(&across, Lapsed{window = .Expired, at = NOW - 10})
+	keep_lapse(&across, Lapsed{window = .Expired, at = NOW - 30})
+	testing.expectf(t, across == Lapsed{window = .Expired, at = NOW - 10}, "across sets, the latest expiration should be kept, got %v", across)
+}
+
+// A forgery and a lapse in one message is a forgery, whichever came first:
+// codes 7 and 8 are for when no signature is presently valid.
+@(test)
+test_a_forgery_beside_a_lapse_takes_the_reason :: proc(t: ^testing.T) {
+	lapse := Lapsed{window = .Expired, at = 1}
+	testing.expect(t, takes_reason(.Bogus, .Bogus, lapse, {}), "a forgery after a lapse should take the reason")
+	testing.expect(t, takes_reason(.Bogus, .Bogus, lapse, {refuted = true}), "a refuted set after a lapse should take the reason")
+	testing.expect(t, !takes_reason(.Bogus, .Bogus, {}, lapse), "a lapse after a forgery should not take the reason")
+	testing.expect(t, !takes_reason(.Bogus, .Bogus, lapse, lapse), "a second lapse should not take the reason")
+	testing.expect(t, takes_reason(.Insecure, .Bogus, {}, lapse), "a worse verdict should take the reason")
+	testing.expect(t, !takes_reason(.Bogus, .Indeterminate, lapse, {}), "a better verdict should not take the reason")
+}
+
+/*
+A forgery anywhere in the message is code 6, whatever lapsed beside it and in
+whichever order: RFC 8914 codes 7 and 8 are for when "no signatures are
+presently valid". One shape per place the verdict's reason is chosen - two
+answer RRsets, two wildcard proofs, and the DS question a CNAME answered.
+*/
+@(test)
+test_a_forgery_beside_a_lapse_is_a_forgery_end_to_end :: proc(t: ^testing.T) {
+	cases := []struct {
+		key, qname, reason, shape: string,
+	} {
+		{"lp_pair_lapse_first", "late.lt.", "no valid signature", "a lapsed CNAME before a forged A"},
+		{"lp_pair_forgery_first", "late.lt.", "no valid signature", "a forged A before a lapsed CNAME"},
+		{"lp_two_wildcards", "x.wl.", "wildcard expansion not proven", "a lapsed wildcard proof before a refuted one"},
+		{"lp_cn_www", "www.cn.lt.", BROKEN_CHAIN, "a lapsed CNAME at a DS question beside a refuted denial"},
+	}
+	for c in cases {
+		result := lp_validate(c.key, c.qname)
+		testing.expectf(
+			t,
+			result.status == .Bogus && result.lapsed.window == .Current && result.reason == c.reason,
+			"%s should be refused as a forgery, %q: got %v %v %q",
+			c.shape,
+			c.reason,
+			result.status,
+			result.lapsed.window,
+			result.reason,
+		)
+	}
 	free_all(context.temp_allocator)
 }

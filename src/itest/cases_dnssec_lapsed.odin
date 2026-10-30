@@ -328,21 +328,25 @@ run_dnssec_lapsed_cases :: proc(r: ^Runner) {
 		rcode: dns.Rcode,
 		code:  int,
 		text:  string,
+		// Asked before, so it has to come from the remembered verdict.
+		cached: bool,
 	} {
-		{"dnssec: a DS signed by its parent past its expiration is code 7", "www.dsx.", .Serv_Fail, 7, EXPIRED},
-		{"dnssec: a DNSKEY set signed before its inception is code 8", "www.dkx.", .Serv_Fail, 8, NOT_YET},
-		{"dnssec: an answer signed past its expiration is code 7", "late.lt.", .Serv_Fail, 7, EXPIRED},
-		{"dnssec: an answer signed before its inception is code 8", "early.lt.", .Serv_Fail, 8, NOT_YET},
-		{"dnssec: the cached refusal of that answer is code 8 too", "early.lt.", .Serv_Fail, 8, NOT_YET},
-		{"dnssec: an unsigned delegation whose DS denial is not yet valid is code 8", "www.unsigned.lt.", .Serv_Fail, 8, NOT_YET},
-		{"dnssec: an expired signature beside a current one still validates", "both.lt.", .No_Error, -1, ""},
-		{"dnssec: a current signature that fails beside an expired one is code 6", "mixed.lt.", .Serv_Fail, 6, "no valid signature"},
+		{"dnssec: a DS signed by its parent past its expiration is code 7", "www.dsx.", .Serv_Fail, 7, EXPIRED, false},
+		{"dnssec: a DNSKEY set signed before its inception is code 8", "www.dkx.", .Serv_Fail, 8, NOT_YET, false},
+		{"dnssec: an answer signed past its expiration is code 7", "late.lt.", .Serv_Fail, 7, EXPIRED, false},
+		{"dnssec: an answer signed before its inception is code 8", "early.lt.", .Serv_Fail, 8, NOT_YET, false},
+		{"dnssec: the cached refusal of that answer is code 8 too", "early.lt.", .Serv_Fail, 8, NOT_YET, true},
+		{"dnssec: an unsigned delegation whose DS denial is not yet valid is code 8", "www.unsigned.lt.", .Serv_Fail, 8, NOT_YET, false},
+		{"dnssec: an NXDOMAIN whose cover is not yet valid is code 8", "nope.lt.", .Serv_Fail, 8, NOT_YET, false},
+		{"dnssec: a wildcard answer whose cover expired is code 7", "x.wl.", .Serv_Fail, 7, EXPIRED, false},
+		{"dnssec: an expired signature beside a current one still validates", "both.lt.", .No_Error, -1, "", false},
+		{"dnssec: a current signature that fails beside an expired one is code 6", "mixed.lt.", .Serv_Fail, 6, "no valid signature", false},
 	}
-	for c, i in cases {
+	for c in cases {
 		start_case(r, c.name)
 		asked := mock_total(mock)
 		res := query_udp(udp_port, build_query(c.qname, u16(dns.Type.A), edns_size = 1232, dnssec_ok = true))
-		if i == 4 {
+		if c.cached {
 			check(r, mock_total(mock) == asked, "the repeated question went upstream rather than to the remembered verdict")
 		}
 		if check(r, res.ok, "no response") {

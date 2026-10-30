@@ -619,8 +619,9 @@ Lapsed :: struct {
 	// The expiration of an expired signature, the inception of one not yet valid.
 	at:      u32,
 	// Set by `verified_rrset` on a set whose signature inside its window was
-	// tried and failed, so a proof missing that set rests on a signature that
-	// does not verify rather than on a window. `window` is then `.Current`.
+	// tried and failed, and passed on by `validated_denial_records`, so a
+	// proof missing that set rests on a signature that does not verify rather
+	// than on a window. `window` is then `.Current`.
 	refuted: bool,
 }
 
@@ -629,7 +630,9 @@ Note `sig` in `lapsed` if it is one: outside its window, and naming one of `keys
 
 Not yet valid is kept over expired when a set carries both. RFC 8914 fits either
 code to that set, and a signature from the future is the one that says a clock
-is behind - which is the reading an operator can act on.
+is behind - which is the reading an operator can act on. On one side, the
+instant nearest `now` is kept: the latest expiration, the earliest inception,
+which is when the set would be current again.
 
 A window that ends before it starts is no lapse: no clock makes that signature
 current, so it is one that does not verify, which is code 6.
@@ -637,25 +640,53 @@ current, so it is one that does not verify, which is code 6.
 @(private)
 note_lapsed :: proc(lapsed: ^Lapsed, sig: Rrsig, keys: []Dnskey, unix: u32) {
 	window := signature_window(sig, unix)
-	if !lapse_outranks(window, lapsed.window) || !serial_ge(sig.expiration, sig.inception) {
+	this := Lapsed {
+		window = window,
+		at     = sig.inception if window == .Not_Yet_Valid else sig.expiration,
+	}
+	if !lapse_outranks(this, lapsed^) || !serial_ge(sig.expiration, sig.inception) {
 		return
 	}
 	if names_usable_key(sig, keys) {
-		lapsed^ = {window = window, at = sig.inception if window == .Not_Yet_Valid else sig.expiration}
+		lapsed^ = this
 	}
 }
 
 // Keep the one of two lapses `note_lapsed` would, across the sets of one proof.
 @(private)
 keep_lapse :: proc(lapsed: ^Lapsed, other: Lapsed) {
-	if lapse_outranks(other.window, lapsed.window) {
+	if lapse_outranks(other, lapsed^) {
 		lapsed^ = other
 	}
 }
 
 @(private)
-lapse_outranks :: proc(window, over: Sig_Window) -> bool {
-	return window != .Current && over != .Not_Yet_Valid && window != over
+lapse_outranks :: proc(this, over: Lapsed) -> bool {
+	switch {
+	case this.window == .Current:
+		return false
+	case this.window != over.window:
+		return over.window != .Not_Yet_Valid
+	case this.window == .Expired:
+		return !serial_ge(over.at, this.at)
+	}
+	return !serial_ge(this.at, over.at)
+}
+
+/*
+Whether a verdict of `status` takes the reason from the one standing at `worst`.
+
+A worse verdict always does. At `Bogus` beside `Bogus`, one resting on no window
+takes it from one resting on a window: RFC 8914 codes 7 and 8 are for when "no
+signatures are presently valid", and a set whose signature inside its window
+failed is a forgery in the same message, whichever came first in it.
+*/
+@(private)
+takes_reason :: proc(worst, status: Status, held, offered: Lapsed) -> bool {
+	if worse(worst, status) != worst {
+		return true
+	}
+	return worst == .Bogus && status == .Bogus && held.window != .Current && offered.window == .Current
 }
 
 /*
@@ -2233,13 +2264,14 @@ validate_answer :: proc(
 		checked += 1
 		if status != .Secure {
 			// The reason belongs to the verdict that is being returned, so it
-			// moves only when the verdict does - the same rule the wildcard
-			// proofs below follow. `Insecure` ranks under `Indeterminate`, so
+			// moves only when the verdict does, or when a forgery joins a lapse
+			// (`takes_reason`) - the same rule the wildcard proofs below
+			// follow. `Insecure` ranks under `Indeterminate`, so
 			// a later unsigned RRset would otherwise leave "unsigned zone"
 			// standing beside a verdict reached because a chain could not be
 			// walked: the benign reason reported, in the log and in the
 			// client's extended error, for a refusal that was anything but.
-			if worse(worst, status) != worst {
+			if takes_reason(worst, status, lapsed, why_lapsed) {
 				reason = why
 				detail = broken if why == BROKEN_CHAIN else ""
 				lapsed = why_lapsed if status == .Bogus else {}
@@ -2410,8 +2442,9 @@ validate_answer :: proc(
 		for e in expansions {
 			proof, records, why, why_lapsed := validate_wildcard_proof(v, budget, msg, e.owner, e.encloser, class, &denials, unix, now, allocator)
 			// The reason belongs to the verdict that is being returned, so it
-			// moves only when the verdict does.
-			if worse(worst, proof) != worst {
+			// moves only when the verdict does, or when a forgery joins a
+			// lapse (`takes_reason`).
+			if takes_reason(worst, proof, proof_lapsed, why_lapsed) {
 				proof_reason = why
 				proof_detail = budget.broken if why == BROKEN_CHAIN else ""
 				proof_lapsed = why_lapsed
@@ -3423,8 +3456,8 @@ validated_denial_records :: proc(
 	// "we stopped looking". `exhausted_reason` says which.
 	exhausted: bool,
 	// The window of a set dropped for its signatures' validity period alone,
-	// for a caller whose proof then fails - none when another set was dropped
-	// for a signature inside its window that failed. See `Lapsed`.
+	// for a caller whose proof then fails - `refuted` instead when another set
+	// was dropped for a signature inside its window that failed. See `Lapsed`.
 	lapsed: Lapsed,
 ) {
 	refuted := false
@@ -3484,7 +3517,7 @@ validated_denial_records :: proc(
 			append_denial_record(r, &out_nsec, &out_nsec3, allocator)
 		}
 	}
-	return out_nsec[:], out_nsec3[:], out_verified[:], exhausted, Lapsed{} if refuted else lapsed
+	return out_nsec[:], out_nsec3[:], out_verified[:], exhausted, Lapsed{refuted = true} if refuted else lapsed
 }
 
 /*
@@ -4189,10 +4222,11 @@ zone_step :: proc(
 		// A CNAME the parent signed outside its window is the other thing
 		// this reply could have held; one whose current signature failed
 		// rules the window out, as a denial set's does.
-		if cname_lapsed.refuted {
+		if cname_lapsed.refuted || ds_lapsed.refuted {
 			ds_lapsed = {}
+		} else {
+			keep_lapse(&ds_lapsed, cname_lapsed)
 		}
-		keep_lapse(&ds_lapsed, cname_lapsed)
 		broke_at(budget, child, "the reply to the DS question held neither a DS nor a denial signed by the parent", allocator, ds_lapsed)
 		return .Bogus, nil
 	}
