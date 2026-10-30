@@ -507,6 +507,10 @@ readings is bounded only by its own length. Borrowed from the caller
 	lapse is counted from that second, so an entry is timed from the same
 	instant: timed from when its step finished, it would outlive the signature
 	by however long the walk had run by then.
+
+	The walk reads the cache at this instant too, as it checks every signature
+	at `now`: an entry it stored is live for the rest of the walk, however short
+	its lifetime, rather than missed and walked for again by the next proof.
 	*/
 	began:         loop.Moment,
 }
@@ -3775,7 +3779,7 @@ zone_step :: proc(
 	step: Step,
 	keys: []Dnskey,
 ) {
-	cached, found, non_cut := cache_get(v, child, loop.moment_now(), allocator)
+	cached, found, non_cut := cache_get(v, child, walk_began(budget), allocator)
 	if found {
 		switch cached.status {
 		case .Secure:
@@ -4449,7 +4453,7 @@ zone_keys :: proc(
 	status: Status,
 	keys: []Dnskey,
 ) {
-	if cached, found, _ := cache_get(v, zone, loop.moment_now(), allocator); found {
+	if cached, found, _ := cache_get(v, zone, walk_began(budget), allocator); found {
 		return cached.status, cached.keys
 	}
 
@@ -4691,8 +4695,9 @@ clear_non_cuts :: proc(v: ^Validator) {
 }
 
 // `now` is on the moment clock `cache_get` and `sweep` read: the walk's
-// `Budget.began`, the instant `lapses` is counted from. It is in the past, so an
-// entry whose lifetime the walk has already outrun is stored expired.
+// `Budget.began`, the instant `lapses` is counted from and the walk reads the
+// cache at. It is in the past, so an entry whose lifetime the walk has already
+// outrun is stored expired to every later walk and to `sweep`.
 @(private)
 cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, ttl: u32, now: loop.Moment, lapses := max(u32)) {
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8

@@ -246,10 +246,10 @@ Server :: struct {
 	// nothing in flight.
 	inflight:     Inflight_Table,
 	stats:        Stats,
-	// When this process began serving. Not a setting and not a counter: the
-	// metrics endpoint reports uptime from it, and Prometheus's
-	// `process_start_time_seconds` is what every client library calls the same
-	// thing.
+	// When this process began serving, as an epoch time. Not a setting and not
+	// a counter: the metrics endpoint reports it as Prometheus's
+	// `process_start_time_seconds`, which is what every client library calls
+	// the same thing.
 	started:      time.Time,
 	// The same instant on the moment clock, which uptime is measured on so a
 	// step of the wall clock does not move it (issue #557).

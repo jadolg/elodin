@@ -284,6 +284,31 @@ counting_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem
 	return fixture_query(nil, name, type, allocator, nil)
 }
 
+/*
+A walk reads the zone cache at its own instant, `Budget.began` (issue #557): every
+zone it settled stays settled for the rest of it, at each step down the chain as
+well as at the anchor, however far the real clock has run past the entries'
+lifetimes. Began two hours ago, past `MAX_ZONE_TTL`, so a read at the real clock
+misses every one and walks the chain again.
+*/
+@(test)
+test_a_walk_sees_the_zones_it_settled :: proc(t: ^testing.T) {
+	counter := Counting_Ctx{}
+	v := make_validator(counting_query, &counter, Options{})
+	defer destroy_validator(v)
+
+	budget := query_budget(v)
+	budget.began = loop.moment_add(budget.began, -2 * time.Hour)
+	status, _, _ := zone_trust(v, &budget, "example.com.", fixture_now(), context.temp_allocator)
+	testing.expect_value(t, status, Status.Secure)
+	cold := counter.queries
+	again, _, _ := zone_trust(v, &budget, "example.com.", fixture_now(), context.temp_allocator)
+	end_walk(v, &budget)
+	testing.expect_value(t, again, Status.Secure)
+	testing.expectf(t, counter.queries == cold, "the walk asked %d more times for zones it had settled", counter.queries - cold)
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_zone_keys_are_cached :: proc(t: ^testing.T) {
 	// Walking a chain costs a DS and a DNSKEY per label. Doing that again for

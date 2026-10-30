@@ -491,3 +491,31 @@ test_what_an_entry_costs_is_what_the_parts_come_to :: proc(t: ^testing.T) {
 	mb := (DEFAULT_MAX_CACHED_ZONES * MAX_CACHED_ZONE_BYTES) / (1024 * 1024)
 	testing.expectf(t, mb >= 45 && mb <= 51, "the default cache ceiling is %d MB; the documentation says about 48", mb)
 }
+
+/*
+A walk reads the zone cache at its own instant, `Budget.began`, as it checks every
+signature at its own `now` (issue #557). An entry it stored with a few seconds
+left on its signatures stays live for the rest of that walk, however long the
+walk runs, rather than being missed and walked for again by the next proof.
+*/
+@(test)
+test_a_walk_reads_the_zone_cache_at_its_own_instant :: proc(t: ^testing.T) {
+	v := make_validator(no_upstream, nil, Options{})
+	defer destroy_validator(v)
+
+	budget := query_budget(v)
+	// Began ten seconds ago and stored keys good for five: past on the clock,
+	// live to the walk that stored them.
+	budget.began = loop.moment_add(budget.began, -10 * time.Second)
+	cache_put(v, "example.com.", .Secure, []Dnskey{sized_key(4 + 256)}, MAX_ZONE_TTL, budget.began, 5)
+
+	status, keys := zone_keys(v, &budget, "example.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	end_walk(v, &budget)
+	testing.expect_value(t, status, Status.Secure)
+	testing.expect_value(t, len(keys), 1)
+
+	// Every other walk, and the sweep, read the clock.
+	_, found, _ := cache_get(v, "example.com.", loop.moment_now(), context.temp_allocator)
+	testing.expect(t, !found, "the entry should have expired for a walk that begins now")
+	free_all(context.temp_allocator)
+}
