@@ -334,7 +334,7 @@ pipe_idle_for :: proc(c: ^Pipe_Conn) -> time.Duration {
 	if len(c.waiters) != 0 {
 		return 0
 	}
-	d := time.tick_diff(c.last, time.tick_now())
+	d := time.tick_since(c.last)
 	return d if d > 0 else 0
 }
 
@@ -403,7 +403,7 @@ pipe_relearn_idle_locked :: proc(u: ^Upstream) {
 	if u.idle_died == 0 {
 		return
 	}
-	if time.tick_diff(u.idle_learned, time.tick_now()) < PIPE_IDLE_RELEARN {
+	if time.tick_since(u.idle_learned) < PIPE_IDLE_RELEARN {
 		return
 	}
 	logx.debugf(
@@ -421,7 +421,7 @@ pipe_state :: proc(c: ^Pipe_Conn, idle_timeout: time.Duration, limit: int) -> Pi
 	if c.dead {
 		return .Gone
 	}
-	if len(c.waiters) == 0 && time.tick_diff(c.last, time.tick_now()) >= idle_timeout {
+	if len(c.waiters) == 0 && time.tick_since(c.last) >= idle_timeout {
 		return .Gone
 	}
 	if len(c.waiters) >= limit {

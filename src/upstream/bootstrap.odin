@@ -62,7 +62,7 @@ bootstrap_resolve :: proc(
 
 	sync.mutex_lock(&bootstrap_cache.mu)
 	if entry, found := bootstrap_cache.entries[hostname]; found {
-		if time.tick_diff(entry.expires, time.tick_now()) < 0 {
+		if time.tick_since(entry.expires) < 0 {
 			sync.mutex_unlock(&bootstrap_cache.mu)
 			return entry.address, true
 		}

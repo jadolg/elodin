@@ -9,13 +9,13 @@ import "elodin:config"
 Every moment this package measures a duration from is read off the tick clock
 (issue #548).
 
-`time.now` is `CLOCK_REALTIME`, which NTP, `chronyc makestep` or a VM resume
-can step. A cooldown, an idle connection's age or a learned idle timeout timed
-on it would end early or run for the length of the step. A step cannot be made
-from a test, so this asserts what rules it out: each stamp lies between two
-readings of the tick clock. Compared as `_nsec`, the one field the two clocks'
-types share, so a stamp taken off the wall clock is caught rather than just
-failing to compile.
+`time.now` is `CLOCK_REALTIME`, which NTP or `chronyc makestep` can step. A
+cooldown, an idle connection's age or a learned idle timeout timed on it would
+end early or run for the length of the step. A step cannot be made from a test,
+so this asserts what rules it out: each stamp lies between two readings of the
+tick clock. Compared as `_nsec`, the one field the two clocks' types share, so a
+stamp taken off the wall clock is caught rather than just failing to compile.
+`mise run check` holds the rest of the package to the tick clock by grep.
 */
 @(private = "file")
 on_tick_clock :: proc(t: ^testing.T, what: string, stamp: i64, before, after: time.Tick) {

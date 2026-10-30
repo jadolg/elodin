@@ -71,8 +71,10 @@ Idle_Conn :: struct {
 	socket: net.TCP_Socket,
 	tls:    ^tlsx.Conn,
 	// On the tick clock, as is every moment this package measures a duration
-	// from: a step of the wall clock (NTP, a VM resume) would otherwise reap
-	// every pooled connection at once, or keep them for the length of the step.
+	// from: a step of the wall clock (NTP, `chronyc makestep`) would otherwise
+	// reap every pooled connection at once, or keep them for the length of the
+	// step. The tick clock stops while the machine is suspended, so a connection
+	// the peer closed meanwhile is found dead on use and retried, as any is.
 	since:  time.Tick,
 }
 
@@ -397,7 +399,7 @@ healthy :: proc(u: ^Upstream) -> bool {
 	if u.failures < FAILURE_THRESHOLD {
 		return true
 	}
-	return time.tick_diff(u.down_until, time.tick_now()) >= 0
+	return time.tick_since(u.down_until) >= 0
 }
 
 @(private)
