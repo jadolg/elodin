@@ -277,3 +277,31 @@ test_a_cname_step_out_of_verifications_is_undecided :: proc(t: ^testing.T) {
 	testing.expect(t, !non_cut, "an unread CNAME should not be remembered as a non-cut")
 	free_all(context.temp_allocator)
 }
+
+// A CNAME the parent signed outside its window is what that reply held, so the
+// broken step carries its window rather than code 6 (issue #360).
+@(test)
+test_a_lapsed_cname_at_a_ds_question_names_its_window :: proc(t: ^testing.T) {
+	v := cn_validator()
+	testing.expect(t, v != nil, "the anchor should parse")
+	defer destroy_validator(v)
+
+	budget := query_budget(v)
+	status, keys, _ := zone_trust(v, &budget, "cntest.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	testing.expect_value(t, status, Status.Secure)
+
+	// A month and a day early: the CNAME's inception is thirty days before
+	// `FIXTURE_TIME`, past the skew.
+	early := time.unix(FIXTURE_TIME - 86400 * 31, 0)
+	step, _ := zone_step(v, &budget, "cntest.", keys, "lone.cntest.", early, context.temp_allocator)
+	end_walk(v, &budget)
+	testing.expect_value(t, step, Step.Bogus)
+	testing.expectf(
+		t,
+		budget.broken_lapsed == Lapsed{window = .Not_Yet_Valid, at = u32(FIXTURE_TIME - 86400 * 30)},
+		"the step should carry the CNAME's window, got %v (%q)",
+		budget.broken_lapsed,
+		budget.broken,
+	)
+	free_all(context.temp_allocator)
+}

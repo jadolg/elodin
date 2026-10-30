@@ -863,6 +863,18 @@ test_a_dnssec_refusal_names_which_refusal_it_was :: proc(t: ^testing.T) {
 		what:   string,
 	} {
 		{{status = .Bogus, reason = "denial of existence not proven"}, EDE_DNSSEC_BOGUS, "a forgery"},
+		// RFC 8914 sections 4.8 and 4.9: a forgery verdict that rests on a
+		// signature's validity period says which side of it (issue #360).
+		{
+			{status = .Bogus, reason = "signature expired at 2026-07-03T10:00:00Z", lapsed = {window = .Expired}},
+			EDE_SIGNATURE_EXPIRED,
+			"a signature past its expiration",
+		},
+		{
+			{status = .Bogus, reason = "signature not yet valid until 2026-08-03T10:00:00Z", lapsed = {window = .Not_Yet_Valid}},
+			EDE_SIGNATURE_NOT_YET_VALID,
+			"a signature short of its inception",
+		},
 		{{status = .Indeterminate, reason = "chain of trust unavailable"}, EDE_NO_REACHABLE_AUTHORITY, "a chain this server could not walk"},
 		{
 			{status = .Indeterminate, reason = dnssec.NSEC3_OVER_CEILING},

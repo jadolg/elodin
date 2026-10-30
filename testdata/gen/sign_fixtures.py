@@ -152,11 +152,13 @@ def signing_owner(owner, labels):
     return "*." + ".".join(parts[len(parts) - labels:]) + "."
 
 
-def sign(rrset, key, signer=None, labels=None, covered=None):
+def sign(rrset, key, signer=None, labels=None, covered=None, window=None):
     """Build an RRSIG over `rrset`, which is one owner name and one type."""
-    # The validity window and the TTLs come from the module constants: no scenario
-    # has needed to vary them, and a signature outside the window is a case the
-    # Odin tests reach by moving the clock rather than by signing differently.
+    # The validity window comes from the module constants unless `window` names
+    # an (inception, expiration) pair. Moving the clock lapses every signature
+    # in a chain at once; a scenario that needs one step out of its window and
+    # the rest inside signs that step differently. The TTLs are always the
+    # module's.
     #
     # `signer` and `labels` default to the truthful values and are overridable
     # because two tests need a signature that is internally consistent with an
@@ -170,7 +172,7 @@ def sign(rrset, key, signer=None, labels=None, covered=None):
         labels = signed_label_count(owner)
     prefix = (
         struct.pack("!HBBI", rtype, key.algorithm, labels, TTL)
-        + struct.pack("!II", EXPIRATION, INCEPTION)
+        + struct.pack("!II", *(reversed(window) if window else (EXPIRATION, INCEPTION)))
         + struct.pack("!H", key.tag)
         + canonical_name(signer)
     )
@@ -1590,6 +1592,243 @@ def anchor_below_the_root():
     # settles on `corp.` and that verdict is Bogus rather than unavailable.
     no_cut = [RR("www.corp.", NSEC, nsec_rdata("corp.", [A, RRSIG, NSEC]))]
     emit("ba_www_ds", "www.corp.", "DS", message("www.corp.", DS, [], no_cut + [sign(no_cut, corp)]))
+
+
+# Windows that `FIXTURE_TIME` falls outside: one that ended thirty days before
+# it, and one that starts twenty years after it. `src/itest` serves these to a
+# server on the real clock, so the second has to stay in the future for as long
+# as the rest of the fixtures stay valid; both ends sit well inside the 2^31
+# seconds RFC 1982 serial arithmetic can compare.
+EXPIRED = (FIXTURE_TIME - 86400 * 60, FIXTURE_TIME - 86400 * 30)
+NOT_YET = (FIXTURE_TIME + 86400 * 365 * 20, FIXTURE_TIME + 86400 * 365 * 30)
+
+
+@scenario
+def lapsed_signatures():
+    """Cover one step of a chain signed outside its validity window, at each step."""
+    # Issue #360: a signature outside its window is reported by its window
+    # (RFC 8914 codes 7 and 8), not as a broken chain. Each road the validator
+    # checks a signature on gets one step lapsed here and every other step
+    # current, so the test can tell which road named the window:
+    #
+    #   www.dsx.            the root's signature over the DS of `dsx.` expired
+    #   www.dkx.            `dkx.`'s signature over its own DNSKEY set not yet valid
+    #   late.lt. / early.lt.  the answer's own signature, expired / not yet valid
+    #   www.unsigned.lt.    the parent's NSEC denying a DS at an unsigned
+    #                       delegation, not yet valid - the shape that hid a
+    #                       slow clock behind every unsigned name under .org
+    #   nope.lt.            the NSEC an NXDOMAIN needs, not yet valid
+    #   x.wl.               the NSEC a wildcard expansion needs, expired
+    #   both.lt.            an expired signature beside a current one: Secure
+    #   mixed.lt.           an expired one beside a current one that does not
+    #                       verify: a forgery still, code 6
+    #   late.lt. CNAME      a lapsed set and a forged one in one answer, in
+    #                       either order: code 6, the forgery's
+    #   x.wl. CNAME y.wm.   two wildcard expansions, one proof lapsed and one
+    #                       refuted: code 6
+    #   www.cn.lt.          a DS question answered by a CNAME the parent signed
+    #                       in the future, beside a denial whose current
+    #                       signature fails: code 6
+    lt, wl, wm = lapse_zones()
+    nsec, lt_soa = lapse_lt(lt)
+    wild_nsec, wl_soa = lapse_wl(wl)
+    lapse_pair(lt)
+    lapse_wm(wl, wm, wild_nsec, wl_soa)
+    lapse_ds_questions(lt, nsec, lt_soa)
+
+
+def lapse_zones():
+    """The root, its anchor, and the five zones below it, one step lapsed in two."""
+    root = Key(".", "lapse-root")
+    dsx = Key("dsx.", "lapse-dsx")
+    dkx = Key("dkx.", "lapse-dkx")
+    lt = Key("lt.", "lapse-lt")
+    wl = Key("wl.", "lapse-wl")
+    wm = Key("wm.", "lapse-wm")
+
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("lp_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+
+    for tag, zone in (("dsx", dsx), ("dkx", dkx), ("lt", lt), ("wl", wl), ("wm", wm)):
+        ds_set = [RR(zone.zone, DS, zone.ds())]
+        ds_window = EXPIRED if zone is dsx else None
+        emit("lp_%s_ds" % tag, zone.zone, "DS",
+             message(zone.zone, DS, ds_set + [sign(ds_set, root, window=ds_window)]))
+        keys = [RR(zone.zone, DNSKEY, zone.rdata)]
+        key_window = NOT_YET if zone is dkx else None
+        emit("lp_%s_dnskey" % tag, zone.zone, "DNSKEY",
+             message(zone.zone, DNSKEY, keys + [sign(keys, zone, window=key_window)]))
+
+    for tag, zone in (("dsx", dsx), ("dkx", dkx)):
+        www = [a_rr("www." + zone.zone, "192.0.2.1")]
+        emit("lp_%s_www" % tag, "www." + zone.zone, "A", message("www." + zone.zone, A, www + [sign(www, zone)]))
+    return lt, wl, wm
+
+
+def lapse_lt(lt):
+    """Inside `lt.`: an answer per window, the controls, an unsigned delegation, an NXDOMAIN."""
+    # `lt.` in canonical order: lt. both. early. late. mixed. unsigned.
+    lt_soa = [soa_rr("lt.")]
+    lt_soa_sig = sign(lt_soa, lt)
+    chain = [
+        ("lt.", "both.lt.", [NS, SOA, RRSIG, NSEC, DNSKEY]),
+        ("both.lt.", "early.lt.", [A, RRSIG, NSEC]),
+        ("early.lt.", "late.lt.", [A, RRSIG, NSEC]),
+        ("late.lt.", "mixed.lt.", [A, RRSIG, NSEC]),
+        ("mixed.lt.", "unsigned.lt.", [A, RRSIG, NSEC]),
+        ("unsigned.lt.", "lt.", [NS, NSEC]),
+    ]
+    nsec = {owner: [RR(owner, NSEC, nsec_rdata(nxt, types))] for owner, nxt, types in chain}
+
+    # The walk asks for a DS at each name on the way to an answer; these are
+    # ordinary names, so their own NSEC says no DS and no cut.
+    for owner in ("both.lt.", "early.lt.", "late.lt.", "mixed.lt."):
+        emit("lp_%s_ds" % owner.split(".")[0], owner, "DS",
+             message(owner, DS, [], nsec[owner] + [sign(nsec[owner], lt)] + lt_soa + [lt_soa_sig]))
+
+    for owner, window in (("late.lt.", EXPIRED), ("early.lt.", NOT_YET)):
+        answer = [a_rr(owner, "192.0.2.2")]
+        emit("lp_%s_a" % owner.split(".")[0], owner, "A",
+             message(owner, A, answer + [sign(answer, lt, window=window)]))
+
+    both = [a_rr("both.lt.", "192.0.2.3")]
+    emit("lp_both_a", "both.lt.", "A",
+         message("both.lt.", A, both + [sign(both, lt, window=EXPIRED), sign(both, lt)]))
+
+    # The current signature is made over other data, so it names the key, sits
+    # inside its window and fails.
+    mixed = [a_rr("mixed.lt.", "192.0.2.4")]
+    other = [a_rr("mixed.lt.", "198.51.100.4")]
+    emit("lp_mixed_a", "mixed.lt.", "A",
+         message("mixed.lt.", A, mixed + [sign(mixed, lt, window=EXPIRED), sign(other, lt)]))
+
+    # The DS denial for an unsigned delegation, signed in the future.
+    emit("lp_unsigned_ds", "unsigned.lt.", "DS",
+         message("unsigned.lt.", DS, [],
+                 nsec["unsigned.lt."] + [sign(nsec["unsigned.lt."], lt, window=NOT_YET)] + lt_soa + [lt_soa_sig]))
+    insecure = [a_rr("www.unsigned.lt.", "192.0.2.5")]
+    emit("lp_insecure_a", "www.unsigned.lt.", "A", message("www.unsigned.lt.", A, insecure))
+
+    # NXDOMAIN for `nope.lt.`: `mixed.lt.` covers the name and the apex record
+    # covers `*.lt.`. Current in the DS denial the walk reads on its way to the
+    # name; the cover is signed in the future in the answer.
+    emit("lp_nope_ds", "nope.lt.", "DS",
+         message("nope.lt.", DS, [],
+                 nsec["mixed.lt."] + [sign(nsec["mixed.lt."], lt)]
+                 + nsec["lt."] + [sign(nsec["lt."], lt)] + lt_soa + [lt_soa_sig],
+                 rcode=3), rcode=3)
+    emit("lp_nope_nxdomain", "nope.lt.", "A",
+         message("nope.lt.", A, [],
+                 nsec["mixed.lt."] + [sign(nsec["mixed.lt."], lt, window=NOT_YET)]
+                 + nsec["lt."] + [sign(nsec["lt."], lt)] + lt_soa + [lt_soa_sig],
+                 rcode=3), rcode=3)
+    return nsec, lt_soa + [lt_soa_sig]
+
+
+def lapse_wl(wl):
+    """A wildcard answer in `wl.` whose proof expired."""
+    # `wl.` holds a wildcard and nothing else: wl. -> *.wl. -> wl. The wildcard's
+    # NSEC wraps and so covers `x.wl.`, which the expansion has to be proven
+    # against. Current in the DS denial the walk reads, expired in the answer.
+    wl_soa = [soa_rr("wl.")]
+    wl_soa_sig = sign(wl_soa, wl)
+    wild_nsec = [RR("*.wl.", NSEC, nsec_rdata("wl.", [A, RRSIG, NSEC]))]
+    emit("lp_x_ds", "x.wl.", "DS",
+         message("x.wl.", DS, [], wild_nsec + [sign(wild_nsec, wl)] + wl_soa + [wl_soa_sig]))
+    expanded = [a_rr("x.wl.", "192.0.2.6")]
+    emit("lp_x_a", "x.wl.", "A",
+         message("x.wl.", A, expanded + [sign(expanded, wl, labels=1)],
+                 wild_nsec + [sign(wild_nsec, wl, window=EXPIRED)]))
+    return wild_nsec, wl_soa + [wl_soa_sig]
+
+
+def lapse_pair(lt):
+    """A lapsed CNAME and a forged A in one answer, both ways round."""
+    # A lapsed set and a forged one in the same answer: the CNAME's only
+    # signature expired, the A's current signature is made over other data.
+    # Served both ways round, since which comes first is the sender's choice.
+    cname = [RR("late.lt.", CNAME, wire_name("mixed.lt."))]
+    cname_sig = sign(cname, lt, window=EXPIRED)
+    forged = [a_rr("mixed.lt.", "192.0.2.4")]
+    forged_sig = sign([a_rr("mixed.lt.", "198.51.100.4")], lt)
+    emit("lp_pair_lapse_first", "late.lt.", "A",
+         message("late.lt.", A, cname + [cname_sig] + forged + [forged_sig]))
+    emit("lp_pair_forgery_first", "late.lt.", "A",
+         message("late.lt.", A, forged + [forged_sig] + cname + [cname_sig]))
+
+
+def lapse_wm(wl, wm, wild_nsec, wl_soa):
+    """Two wildcard proofs failing differently, and a wildcard CNAME at a DS question."""
+    # Two wildcard expansions, `x.wl. CNAME y.wm.` from `*.wl.` and `y.wm. A`
+    # from `*.wm.`, whose proofs fail differently: `*.wl.`'s NSEC expired,
+    # `*.wm.`'s carries a current signature made over other data.
+    wm_soa = [soa_rr("wm.")]
+    wm_soa_sig = sign(wm_soa, wm)
+    wm_nsec = [RR("*.wm.", NSEC, nsec_rdata("wm.", [A, RRSIG, NSEC]))]
+    emit("lp_y_ds", "y.wm.", "DS",
+         message("y.wm.", DS, [], wm_nsec + [sign(wm_nsec, wm)] + wm_soa + [wm_soa_sig]))
+    wm_nsec_forged = sign([RR("*.wm.", NSEC, nsec_rdata("wm.", [A, TXT, RRSIG, NSEC]))], wm)
+    hop = [RR("x.wl.", CNAME, wire_name("y.wm."))]
+    target = [a_rr("y.wm.", "192.0.2.7")]
+    emit("lp_two_wildcards", "x.wl.", "A",
+         message("x.wl.", A,
+                 hop + [sign(hop, wl, labels=1)] + target + [sign(target, wm, labels=1)],
+                 wild_nsec + [sign(wild_nsec, wl, window=EXPIRED)] + wm_nsec + [wm_nsec_forged]))
+
+    # The DS question at `z.wl.` answered by a CNAME synthesized from `*.wl.`,
+    # its signature current and verifying, beside the wildcard's NSEC signed in
+    # the future. An expansion is no answer to a DS question, but it is no
+    # failed signature either: the window is what is left, code 8.
+    wc_cn = [RR("z.wl.", CNAME, wire_name("y.wm."))]
+    emit("lp_wc_cn_ds", "z.wl.", "DS",
+         message("z.wl.", DS, wc_cn + [sign(wc_cn, wl, labels=1)],
+                 wild_nsec + [sign(wild_nsec, wl, window=NOT_YET)] + wl_soa))
+    wc_www = [a_rr("www.z.wl.", "192.0.2.9")]
+    emit("lp_wc_cn_www", "www.z.wl.", "A", message("www.z.wl.", A, wc_www))
+
+
+def lapse_ds_questions(lt, nsec, lt_soa):
+    """DS questions answered by a CNAME, and a DNAME whose signature lapsed."""
+    # The DS question at `cn.lt.` answered by a CNAME `lt.` signed in the
+    # future, beside the NSEC that would deny a DS there, whose current
+    # signature is made over other data.
+    cn = [RR("cn.lt.", CNAME, wire_name("both.lt."))]
+    cn_nsec = [RR("both.lt.", NSEC, nsec_rdata("early.lt.", [A, RRSIG, NSEC]))]
+    cn_nsec_forged = sign([RR("both.lt.", NSEC, nsec_rdata("early.lt.", [A, TXT, RRSIG, NSEC]))], lt)
+    emit("lp_cn_ds", "cn.lt.", "DS",
+         message("cn.lt.", DS, cn + [sign(cn, lt, window=NOT_YET)],
+                 cn_nsec + [cn_nsec_forged] + lt_soa))
+    unsigned = [a_rr("www.cn.lt.", "192.0.2.8")]
+    emit("lp_cn_www", "www.cn.lt.", "A", message("www.cn.lt.", A, unsigned))
+
+    # A DNAME whose only signature expired, and the CNAME it synthesized, which
+    # is unsigned as RFC 6672 section 3.4.1 has it: the CNAME lacks a signature
+    # only because the DNAME lapsed, so the window is the verdict. `late.lt.`'s
+    # NSEC covers `www.late.lt.`, so the walk to the CNAME's owner ends there.
+    emit("lp_dname_ds", "www.late.lt.", "DS",
+         message("www.late.lt.", DS, [],
+                 nsec["late.lt."] + [sign(nsec["late.lt."], lt)]
+                 + nsec["lt."] + [sign(nsec["lt."], lt)] + lt_soa,
+                 rcode=3), rcode=3)
+    dname = [RR("late.lt.", DNAME, wire_name("both.lt."))]
+    synthesized = [RR("www.late.lt.", CNAME, wire_name("www.both.lt."))]
+    emit("lp_dname_a", "www.late.lt.", "A",
+         message("www.late.lt.", A, dname + [sign(dname, lt, window=EXPIRED)] + synthesized))
+
+    # The DS question at `cn2.lt.` answered by a CNAME whose current signature
+    # is made over other data, beside a denial that proves nothing: the NSEC
+    # that would cover the name is signed in the future, and the one that
+    # verifies covers another span. A forgery beside a lapse: code 6.
+    cn2 = [RR("cn2.lt.", CNAME, wire_name("both.lt."))]
+    cn2_forged = sign([RR("cn2.lt.", CNAME, wire_name("early.lt."))], lt)
+    emit("lp_cn2_ds", "cn2.lt.", "DS",
+         message("cn2.lt.", DS, cn2 + [cn2_forged],
+                 nsec["early.lt."] + [sign(nsec["early.lt."], lt)]
+                 + nsec["both.lt."] + [sign(nsec["both.lt."], lt, window=NOT_YET)]
+                 + lt_soa))
+    unsigned2 = [a_rr("www.cn2.lt.", "192.0.2.9")]
+    emit("lp_cn2_www", "www.cn2.lt.", "A", message("www.cn2.lt.", A, unsigned2))
 
 
 @scenario

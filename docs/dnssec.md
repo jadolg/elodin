@@ -44,7 +44,7 @@ first query into a zone.
 | a DS set naming nothing we can check | an insecure delegation, whether the algorithm is unimplemented here or refused by the host's crypto policy (RFC 6840 section 5.2) |
 | a DS set naming something we can check | that path has to hold up: a DNSKEY set it does not lead to is bogus, however many uncheckable DS records sit beside it |
 | bad signature, broken chain, missing proof | SERVFAIL, with an extended DNS error saying which |
-| signature validity | inception up to 1 hour in this server's future is accepted, for a signer whose clock runs ahead; expiration is exact (RFC 4035 section 5.3.1) |
+| signature validity | inception up to 1 hour in this server's future is accepted, for a signer whose clock runs ahead; expiration is exact (RFC 4035 section 5.3.1). When the only signatures naming the zone's keys are outside their window, the SERVFAIL carries extended error 7 (Signature Expired) or 8 (Signature Not Yet Valid) instead of 6, with the instant as its text: `signature expired at 2026-07-03T10:00:00Z` or `signature not yet valid until 2026-08-03T10:00:00Z`. Either usually means this server's clock is wrong, so check it first. A set with a signature inside its window that does not verify is still 6 |
 | TTLs | a validated RRset and its RRSIGs are served with no more than the RRSIG's original TTL or the time left before it expires, whichever is less (RFC 4035 section 5.3.3); zone keys and unsigned-delegation facts are kept no longer than the original TTL (with a 60 s floor) and never past the expiration of the signatures that proved them |
 
 An answer that gets AD is first cut down to the records that earned it (RFC 4035
@@ -72,6 +72,8 @@ refusal's query line carries `outcome=failed detail=dnssec:<upstream>`, or
 ```
 ts=2026-08-07T09:12:52Z level=warn msg="dnssec: A xc.example.com did not validate: Bogus (broken chain of trust: example.com: the reply to the DS question held neither a DS nor a denial signed by the parent); answer came from quad9-dot"
 ts=2026-08-07T09:12:52Z level=info msg=query client=192.0.2.10 port=44188 proto=udp qtype=A qname=xc.example.com outcome=failed detail=dnssec:quad9-dot ms=126.5
+ts=2026-08-07T09:13:05Z level=warn msg="dnssec: A www.mozilla.org did not validate: Bogus (signature not yet valid until 2026-08-07T11:37:52Z: mozilla.org: the reply to the DS question held neither a DS nor a denial signed by the parent); answer came from quad9-dot"
+ts=2026-08-07T09:13:05Z level=info msg=query client=192.0.2.10 port=44190 proto=udp qtype=A qname=www.mozilla.org outcome=failed detail=dnssec:quad9-dot ms=88.1
 ```
 
 The upstream is named because members of one group can disagree about a zone: the

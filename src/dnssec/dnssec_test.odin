@@ -1317,7 +1317,7 @@ downgrade_status :: proc(zone_status: Status) -> Status {
 
 	records, sigs := unsupported_rrset(ZONE, keys[0])
 	budget := query_budget(v)
-	status, _, _, _, _ := validate_rrset(
+	status, _, _, _, _, _ := validate_rrset(
 		v,
 		&budget,
 		ZONE,
@@ -1522,5 +1522,39 @@ test_reason_belongs_to_the_returned_verdict :: proc(t: ^testing.T) {
 	result := validate(v, "a.example.com.", .A, wire, fixture_now())
 	testing.expect_value(t, result.status, Status.Indeterminate)
 	testing.expect_value(t, result.reason, "chain of trust unavailable")
+	free_all(context.temp_allocator)
+}
+
+/*
+The issue's own reproduction: the captured `example_a` chain a year either side
+of `FIXTURE_TIME`. Every signature lapses together, so the first step of the
+walk - the root's DNSKEY set, under its trust anchor - is the one named.
+*/
+@(test)
+test_a_captured_chain_out_of_its_window_names_the_window :: proc(t: ^testing.T) {
+	v := test_validator()
+	defer destroy_validator(v)
+	f := fixture("example_a")
+	wire, _ := decode_hex(f.wire, context.temp_allocator)
+	late := validate(v, "www.example.com.", .A, wire, time.unix(FIXTURE_TIME + 365 * 24 * 3600, 0))
+	early := validate(v, "www.example.com.", .A, wire, time.unix(FIXTURE_TIME - 365 * 24 * 3600, 0))
+	testing.expectf(
+		t,
+		late.status == .Bogus && late.lapsed.window == .Expired && late.reason == "signature expired at 2026-08-21T00:00:00Z",
+		"a year late: %v %v %q",
+		late.status,
+		late.lapsed.window,
+		late.reason,
+	)
+	testing.expectf(
+		t,
+		early.status == .Bogus &&
+		early.lapsed.window == .Not_Yet_Valid &&
+		early.reason == "signature not yet valid until 2026-07-31T00:00:00Z",
+		"a year early: %v %v %q",
+		early.status,
+		early.lapsed.window,
+		early.reason,
+	)
 	free_all(context.temp_allocator)
 }

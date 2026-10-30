@@ -647,7 +647,7 @@ test_a_wildcard_hint_is_dropped :: proc(t: ^testing.T) {
 	unix := u32(FIXTURE_TIME)
 	records := records_of(msg.additional, "wild.hinttest.", .A, .IN, context.temp_allocator)
 	sigs := sigs_covering(msg.additional, "wild.hinttest.", .A, .IN, context.temp_allocator)
-	status, encloser, _, _, _ := validate_rrset(
+	status, encloser, _, _, _, _ := validate_rrset(
 		v,
 		&budget,
 		"wild.hinttest.",

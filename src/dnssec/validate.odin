@@ -408,6 +408,9 @@ Budget :: struct {
 	one that matters - what is tried after it is a consequence.
 	*/
 	broken:        string,
+	// The window the signatures of the step in `broken` fell outside, if that
+	// is why it broke. Written and cleared with it.
+	broken_lapsed: Lapsed,
 	/*
 	This walk kept a parent's keys past a DS denial it could not read, because
 	every NSEC3 record in it was above the iteration ceiling (issue #331).
@@ -583,13 +586,140 @@ BROKEN_CHAIN :: "broken chain of trust"
 
 // Say which step of the walk broke, for the log only: the first call in a walk
 // wins, since what is tried after the step that broke is a consequence of it.
+// `lapsed` is the window its signatures fell outside, when that is why.
 @(private)
-broke_at :: proc(budget: ^Budget, zone, why: string, allocator: mem.Allocator) {
+broke_at :: proc(budget: ^Budget, zone, why: string, allocator: mem.Allocator, lapsed := Lapsed{}) {
 	if budget.broken != "" {
 		return
 	}
 	shown := dns.name_trim_root(zone)
 	budget.broken = strings.concatenate({shown if shown != "" else ".", ": ", why}, allocator)
+	budget.broken_lapsed = lapsed
+}
+
+/*
+A signature that would have been tried but for its validity period.
+
+RFC 8914 has a code for each side of it - 7, Signature Expired, and 8, Signature
+Not Yet Valid - for when "no signatures are presently valid" and some lapsed or
+have yet to start. That is the one DNSSEC failure whose cause is usually this
+side of the wire: a resolver whose clock is wrong refuses every signature minted
+inside the drift, and an operator told "broken chain of trust" has no reason to
+look at the clock. So the instant is kept, and the reason names it.
+
+Only a signature naming a key its zone published counts - one `signature_worth_
+trying` would otherwise have spent a verification on - so noise in the RRSIGs
+of a response cannot put a window on a set it did not otherwise touch. And it
+is reported only for a set that nothing in its window was tried for: a set that
+had a current signature and failed it is a signature that does not verify, and
+that is code 6 whatever lapsed beside it.
+*/
+Lapsed :: struct {
+	window: Sig_Window,
+	// The expiration of an expired signature, the inception of one not yet valid.
+	at:      u32,
+	// Set by `verified_rrset` on a set whose signature inside its window was
+	// tried and failed, and passed on by `validated_denial_records`, so a
+	// proof missing that set rests on a signature that does not verify rather
+	// than on a window. `window` is then `.Current`.
+	refuted: bool,
+}
+
+/*
+Note `sig` in `lapsed` if it is one: outside its window, and naming one of `keys`.
+
+Not yet valid is kept over expired when a set carries both. RFC 8914 fits either
+code to that set, and a signature from the future is the one that says a clock
+is behind - which is the reading an operator can act on. On one side, the
+instant nearest `now` is kept: the latest expiration, the earliest inception,
+which is when the set would be current again.
+
+A window that ends before it starts is no lapse: no clock makes that signature
+current, so it is one that does not verify, which is code 6.
+*/
+@(private)
+note_lapsed :: proc(lapsed: ^Lapsed, sig: Rrsig, keys: []Dnskey, unix: u32) {
+	window := signature_window(sig, unix)
+	this := Lapsed {
+		window = window,
+		at     = sig.inception if window == .Not_Yet_Valid else sig.expiration,
+	}
+	if !lapse_outranks(this, lapsed^) || !serial_ge(sig.expiration, sig.inception) {
+		return
+	}
+	if names_usable_key(sig, keys) {
+		lapsed^ = this
+	}
+}
+
+// Keep the one of two lapses `note_lapsed` would, across the sets of one proof.
+// A refuted set rules the window out for the whole proof, so `refuted` sticks.
+@(private)
+keep_lapse :: proc(lapsed: ^Lapsed, other: Lapsed) {
+	switch {
+	case lapsed.refuted:
+	case other.refuted:
+		lapsed^ = {refuted = true}
+	case lapse_outranks(other, lapsed^):
+		lapsed^ = other
+	}
+}
+
+@(private)
+lapse_outranks :: proc(this, over: Lapsed) -> bool {
+	switch {
+	case this.window == .Current:
+		return false
+	case this.window != over.window:
+		return over.window != .Not_Yet_Valid
+	case this.window == .Expired:
+		return !serial_ge(over.at, this.at)
+	}
+	return !serial_ge(this.at, over.at)
+}
+
+/*
+Whether a verdict of `status` takes the reason from the one standing at `worst`.
+
+A worse verdict always does. At `Bogus` beside `Bogus`, one resting on no window
+takes it from one resting on a window: RFC 8914 codes 7 and 8 are for when "no
+signatures are presently valid", and a set whose signature inside its window
+failed is a forgery in the same message, whichever came first in it. Between
+two lapses the one `note_lapsed` would keep takes it, so the code and the
+instant do not depend on the order the sender chose either.
+*/
+@(private)
+takes_reason :: proc(worst, status: Status, held, offered: Lapsed) -> bool {
+	if worse(worst, status) != worst {
+		return true
+	}
+	return(
+		worst == .Bogus &&
+		status == .Bogus &&
+		held.window != .Current &&
+		(offered.window == .Current || lapse_outranks(offered, held)) \
+	)
+}
+
+/*
+The reason a verdict resting on `lapsed` is given, naming the instant.
+
+The RRSIG fields are serial numbers (RFC 4034 section 3.1.5), so the instant is
+the one nearest `now` that they name.
+*/
+@(private)
+lapsed_reason :: proc(lapsed: Lapsed, now: time.Time, allocator: mem.Allocator) -> string {
+	unix := time.to_unix_seconds(now)
+	at := time.unix(unix + i64(i32(lapsed.at - u32(unix))), 0)
+	stamp, _ := time.time_to_rfc3339(at, 0, false, allocator)
+	switch lapsed.window {
+	case .Expired:
+		return strings.concatenate({"signature expired at ", stamp}, allocator)
+	case .Not_Yet_Valid:
+		return strings.concatenate({"signature not yet valid until ", stamp}, allocator)
+	case .Current:
+	}
+	return ""
 }
 
 // Give up on a step, saying why. The words reach the client as an extended
@@ -694,9 +824,12 @@ more expensively.
 */
 @(private)
 signature_worth_trying :: proc(sig: Rrsig, keys: []Dnskey, unix: u32) -> bool {
-	if !signature_current(sig, unix) {
-		return false
-	}
+	return signature_current(sig, unix) && names_usable_key(sig, keys)
+}
+
+// Does `sig` name one of `keys` that may sign: same tag, same algorithm, usable?
+@(private)
+names_usable_key :: proc(sig: Rrsig, keys: []Dnskey) -> bool {
 	for key in keys {
 		if key.algorithm == sig.algorithm && key.tag == sig.key_tag && key_usable(key) {
 			return true
@@ -959,9 +1092,17 @@ Result :: struct {
 	and the step, in words. Set only on a `Bogus` verdict whose reason is
 	`BROKEN_CHAIN`, which is the one a chain-of-trust step produced; empty on
 	every other, including ones that failed for a reason local to the message or
-	that a step's `Bogus` was turned into something else for.
+	that a step's `Bogus` was turned into something else for. The exception is a
+	verdict `lapsed` names the window of: the check that failed is kept here
+	when nothing else is, since `reason` then names the window instead.
 	*/
 	detail:    string,
+	/*
+	The validity window a `Bogus` verdict's signatures fell outside, when that
+	is what it rests on: `reason` then names the instant, and the server picks
+	RFC 8914 code 7 or 8 from this rather than 6. See `Lapsed`.
+	*/
+	lapsed:    Lapsed,
 	/*
 	Whether this verdict *is* the shedding: a walk of this question was turned
 	away for want of a slot, and that is what the status and reason report.
@@ -1240,7 +1381,7 @@ validate :: proc(
 		}
 	}
 	if answerable > 0 {
-		out := validate_answer(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+		out := name_the_window(validate_answer(v, &budget, msg, qname, qtype, class, unix, now, allocator), now, allocator)
 		out.shed = shed_verdict(&budget, out)
 		count_shed(v, out)
 		return out
@@ -1254,10 +1395,34 @@ validate :: proc(
 	if qtype == .RRSIG && len(msg.answer) > 0 {
 		return {status = .Insecure, reason = "nothing to authenticate"}
 	}
-	denied := validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator)
+	denied := name_the_window(validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator), now, allocator)
 	denied.shed = shed_verdict(&budget, denied)
 	count_shed(v, denied)
 	return denied
+}
+
+/*
+Say so when a forgery verdict rests on a signature's validity period.
+
+Done once, here, rather than where each verdict is reached: inside the package
+the reasons are the constants the paths compare against - `BROKEN_CHAIN` is how
+`detail` is kept - and only what leaves it names the instant. Anything but
+`Bogus` keeps its own reason and no window, since only that verdict accuses the
+zone of what the window may explain.
+*/
+@(private)
+name_the_window :: proc(result: Result, now: time.Time, allocator: mem.Allocator) -> Result {
+	out := result
+	if out.status != .Bogus || out.lapsed.window == .Current {
+		out.lapsed = {}
+		return out
+	}
+	// The check that failed stays in the log, beside the window that failed it.
+	if out.detail == "" {
+		out.detail = out.reason
+	}
+	out.reason = lapsed_reason(out.lapsed, now, allocator)
+	return out
 }
 
 /*
@@ -1940,7 +2105,7 @@ validated_hints :: proc(
 
 		records := records_of(msg.additional, rec.name, rec.type, class, allocator)
 		sigs := sigs_covering(msg.additional, rec.name, rec.type, class, allocator)
-		status, encloser, _, signer, carried := validate_rrset(
+		status, encloser, _, signer, carried, _ := validate_rrset(
 			v,
 			budget,
 			rec.name,
@@ -1987,6 +2152,8 @@ validate_answer :: proc(
 	// The step behind `reason`, when that is `BROKEN_CHAIN`. Read as the RRset's
 	// walk ends, since any later walk clears it.
 	detail: string
+	// The window behind `reason`, when it rests on one; it moves with `reason`.
+	lapsed: Lapsed
 	expansions := make([dynamic]Wildcard_Expansion, 0, 1, allocator)
 	checked := 0
 
@@ -2007,7 +2174,7 @@ validate_answer :: proc(
 		records := records_of(msg.answer, rec.name, rec.type, class, allocator)
 		sigs := sigs_covering(msg.answer, rec.name, rec.type, class, allocator)
 
-		status, encloser, why, signer, carried := validate_rrset(
+		status, encloser, why, signer, carried, why_lapsed := validate_rrset(
 			v,
 			budget,
 			rec.name,
@@ -2048,8 +2215,10 @@ validate_answer :: proc(
 			// No signature of its own, so the DNAME's sets its ceiling.
 			ceiling = max(u32)
 			for r in records {
-				ok, by := dname_covered(v, budget, msg, r, class, unix, now, allocator)
+				ok, by, dname_lapsed := dname_covered(v, budget, msg, r, class, unix, now, allocator)
 				if !ok {
+					// Unsigned because its DNAME lapsed: the window is why.
+					keep_lapse(&why_lapsed, dname_lapsed)
 					covered = false
 					break
 				}
@@ -2109,15 +2278,17 @@ validate_answer :: proc(
 		checked += 1
 		if status != .Secure {
 			// The reason belongs to the verdict that is being returned, so it
-			// moves only when the verdict does - the same rule the wildcard
-			// proofs below follow. `Insecure` ranks under `Indeterminate`, so
+			// moves only when the verdict does, or when a forgery joins a lapse
+			// (`takes_reason`) - the same rule the wildcard proofs below
+			// follow. `Insecure` ranks under `Indeterminate`, so
 			// a later unsigned RRset would otherwise leave "unsigned zone"
 			// standing beside a verdict reached because a chain could not be
 			// walked: the benign reason reported, in the log and in the
 			// client's extended error, for a refusal that was anything but.
-			if worse(worst, status) != worst {
+			if takes_reason(worst, status, lapsed, why_lapsed) {
 				reason = why
 				detail = broken if why == BROKEN_CHAIN else ""
+				lapsed = why_lapsed if status == .Bogus else {}
 			}
 			worst = worse(worst, status)
 			continue
@@ -2281,25 +2452,28 @@ validate_answer :: proc(
 		// first in the answer section is the sender's choice.
 		before := worst
 		proof_reason, proof_detail: string
+		proof_lapsed: Lapsed
 		for e in expansions {
-			proof, records, why := validate_wildcard_proof(v, budget, msg, e.owner, e.encloser, class, &denials, unix, now, allocator)
+			proof, records, why, why_lapsed := validate_wildcard_proof(v, budget, msg, e.owner, e.encloser, class, &denials, unix, now, allocator)
 			// The reason belongs to the verdict that is being returned, so it
-			// moves only when the verdict does.
-			if worse(worst, proof) != worst {
+			// moves only when the verdict does, or when a forgery joins a
+			// lapse (`takes_reason`).
+			if takes_reason(worst, proof, proof_lapsed, why_lapsed) {
 				proof_reason = why
 				proof_detail = budget.broken if why == BROKEN_CHAIN else ""
+				proof_lapsed = why_lapsed
 			}
 			worst = worse(worst, proof)
 			name_once(&proved, records)
 		}
 		if worst != before {
-			reason, detail = proof_reason, proof_detail
+			reason, detail, lapsed = proof_reason, proof_detail, proof_lapsed
 			// An expansion proven only through an opt-out span is insecure,
 			// and that is no more an excuse for the denial below than an
 			// unsigned RRset is: it carries on to be asked, and the reason
 			// stands.
 			if worst != .Insecure {
-				return {status = worst, reason = reason, detail = detail}
+				return {status = worst, reason = reason, detail = detail, lapsed = lapsed}
 			}
 		}
 	}
@@ -2371,7 +2545,7 @@ validate_answer :: proc(
 	records from an answer nobody is vouching for anyway.
 	*/
 	if worst != .Secure {
-		return {status = worst, reason = reason, detail = detail}
+		return {status = worst, reason = reason, detail = detail, lapsed = lapsed}
 	}
 	/*
 	Last, and after the verdict is settled. The hints spend what the answer and
@@ -2445,7 +2619,7 @@ validate_denial :: proc(
 	case .Insecure:
 		return {status = .Insecure, reason = "unsigned zone"}
 	case .Bogus:
-		return {status = .Bogus, reason = BROKEN_CHAIN, detail = budget.broken}
+		return {status = .Bogus, reason = BROKEN_CHAIN, detail = budget.broken, lapsed = budget.broken_lapsed}
 	case .Indeterminate:
 		return {status = .Indeterminate, reason = walk_reason(budget)}
 	}
@@ -2489,7 +2663,7 @@ validate_denial :: proc(
 		if budget.walk_past_ceiling {
 			return {status = .Indeterminate, reason = NSEC3_OVER_CEILING}
 		}
-		return {status = .Bogus, reason = "no denial of existence"}
+		return {status = .Bogus, reason = "no denial of existence", lapsed = records.lapsed}
 	}
 
 	rcode := dns.rcode_of(msg)
@@ -2551,9 +2725,9 @@ validate_denial :: proc(
 		if budget.walk_past_ceiling {
 			return {status = .Indeterminate, reason = NSEC3_OVER_CEILING}
 		}
-		return {status = .Bogus, reason = "denial of existence not proven"}
+		return {status = .Bogus, reason = "denial of existence not proven", lapsed = records.lapsed}
 	}
-	return {status = .Bogus, reason = "denial of existence not proven"}
+	return {status = .Bogus, reason = "denial of existence not proven", lapsed = records.lapsed}
 }
 
 /*
@@ -2598,7 +2772,7 @@ proved_denial :: proc(
 ) -> []Authenticated_Set {
 	out := make([dynamic]Authenticated_Set, 0, len(proved) + 1, allocator)
 	append(&out, ..proved)
-	_, signer, carried, ok, _ := verified_rrset(budget, msg.authority, zone, .SOA, class, zone, keys, unix, allocator)
+	_, signer, carried, ok, _, _ := verified_rrset(budget, msg.authority, zone, .SOA, class, zone, keys, unix, allocator)
 	if ok {
 		append(
 			&out,
@@ -2643,6 +2817,9 @@ validate_rrset :: proc(
 	// Which signature carried the set, for `Authenticated_Set`.
 	signer: string,
 	rrsig: Rrsig,
+	// The window this set's signatures fell outside, on a `Bogus` that rests on
+	// it; `refuted` on one whose signature inside its window failed.
+	lapsed: Lapsed,
 ) {
 	/*
 	Each signature names the zone that claims the data, and each is judged
@@ -2659,6 +2836,9 @@ validate_rrset :: proc(
 	unsupported := false
 	exhausted := false
 	skipped_for_shed := false
+	// Whether a signature inside its window named a key and was tried, which
+	// keeps a lapsed one beside it from being what the verdict is put down to.
+	tried := false
 	scratch := Signing_Scratch {
 		budget = budget,
 	}
@@ -2767,6 +2947,7 @@ validate_rrset :: proc(
 		if !signature_worth_trying(sig, keys, unix) {
 			continue
 		}
+		tried = true
 		/*
 		A third free reject, and one only the policy table can make: this
 		signature names a key the zone published, of an algorithm the library
@@ -2795,7 +2976,7 @@ validate_rrset :: proc(
 		}
 		#partial switch result {
 		case .Ok:
-			return .Secure, expanded_from, "", sig.signer, sig
+			return .Secure, expanded_from, "", sig.signer, sig, {}
 		case .Unsupported, .Refused:
 			/*
 			The same thing to say about this RRset. One is an algorithm this
@@ -2828,7 +3009,7 @@ validate_rrset :: proc(
 	worth knowing before reading that gauge as a forgery count.
 	*/
 	if exhausted {
-		return .Indeterminate, "", exhausted_reason(budget), "", {}
+		return .Indeterminate, "", exhausted_reason(budget), "", {}, {}
 	}
 
 	missing := "signature missing" if len(sigs) == 0 else "no valid signature"
@@ -2836,7 +3017,7 @@ validate_rrset :: proc(
 	// owner would stop at the parent's proof that an unsigned delegation has no
 	// DS, and serve a forged DS set there as merely insecure.
 	holder := zone_holding(owner, type)
-	owner_status, _, owner_zone := zone_trust(v, budget, holder, now, allocator)
+	owner_status, owner_keys, owner_zone := zone_trust(v, budget, holder, now, allocator)
 	// The walk held up and stopped above the holder, and nothing here verified:
 	// one reason is a delegation at a name the table still calls no cut, which
 	// for an *unsigned* one leaves this the only verdict that can notice. The
@@ -2846,11 +3027,13 @@ validate_rrset :: proc(
 	}
 	switch owner_status {
 	case .Insecure:
-		return .Insecure, "", "unsigned zone", "", {}
+		return .Insecure, "", "unsigned zone", "", {}, {}
 	case .Indeterminate:
-		return .Indeterminate, "", walk_reason(budget), "", {}
+		return .Indeterminate, "", walk_reason(budget), "", {}, {}
 	case .Bogus:
-		return .Bogus, "", BROKEN_CHAIN, "", {}
+		// A signature of this set tried and failed is a forgery beside the
+		// chain's lapse, which is code 6 (`takes_reason`).
+		return .Bogus, "", BROKEN_CHAIN, "", {}, Lapsed{refuted = true} if tried else budget.broken_lapsed
 	case .Secure:
 	}
 
@@ -2879,14 +3062,14 @@ validate_rrset :: proc(
 	no signature, and no walk of ours changes that.
 	*/
 	if skipped_for_shed {
-		return .Indeterminate, "", WALKS_IN_FLIGHT, "", {}
+		return .Indeterminate, "", WALKS_IN_FLIGHT, "", {}, {}
 	}
 	// Unsigned, below a DS denial nobody could read: an unsigned delegation or
 	// a forgery, and nothing here says which. See `Budget.walk_past_ceiling`.
 	// After the shed check, so a signature that went untried is still counted
 	// as shed rather than blamed on the zone.
 	if budget.walk_past_ceiling {
-		return .Indeterminate, "", NSEC3_OVER_CEILING, "", {}
+		return .Indeterminate, "", NSEC3_OVER_CEILING, "", {}, {}
 	}
 
 	/*
@@ -2911,10 +3094,27 @@ validate_rrset :: proc(
 	zone that publishes only that algorithm has no usable DS and goes insecure
 	in front of this loop rather than through it.
 	*/
+	// `unsupported` is set only on a signature that was tried, so the set is
+	// `refuted`, as on every other return that tried one.
 	if unsupported {
-		return .Bogus, "", "no signature this build can verify", "", {}
+		return .Bogus, "", "no signature this build can verify", "", {}, {refuted = true}
 	}
-	return .Bogus, "", missing, "", {}
+	/*
+	Whether that was the window. A lapsed signature never reaches the loop - it
+	is turned away before its signer is walked - so the zone's keys are read
+	here, off the walk that just established the holder, and checking a
+	signature against them is a comparison of two fields apiece. A set that had
+	one tried is `refuted`, as in `verified_rrset`.
+	*/
+	if tried {
+		return .Bogus, "", missing, "", {}, {refuted = true}
+	}
+	for sig in sigs {
+		if dns.name_equal_fold(sig.signer, owner_zone) {
+			note_lapsed(&lapsed, sig, owner_keys, unix)
+		}
+	}
+	return .Bogus, "", missing, "", {}, lapsed
 }
 
 /*
@@ -3087,6 +3287,7 @@ Verified_Denial :: struct {
 	nsec3s:    []Nsec3_Rr,
 	verified:  []Authenticated_Set,
 	exhausted: bool,
+	lapsed:    Lapsed,
 }
 
 // The records for `zone`, verifying them if this message has not needed them yet.
@@ -3108,7 +3309,7 @@ denial_records_for :: proc(
 			return entry
 		}
 	}
-	nsecs, nsec3s, verified, exhausted := validated_denial_records(
+	nsecs, nsec3s, verified, exhausted, lapsed := validated_denial_records(
 		v,
 		budget,
 		authority,
@@ -3125,6 +3326,7 @@ denial_records_for :: proc(
 		nsec3s    = nsec3s,
 		verified  = verified,
 		exhausted = exhausted,
+		lapsed    = lapsed,
 	}
 	append(seen, entry)
 	return entry
@@ -3164,6 +3366,8 @@ validate_wildcard_proof :: proc(
 	status: Status,
 	proved: []Authenticated_Set,
 	reason: string,
+	// The window behind a `Bogus` reason, when it rests on one. See `Lapsed`.
+	lapsed: Lapsed,
 ) {
 	// Established from the expanded name, for the same reason as the denial path.
 	trust, keys, established := zone_trust(v, budget, owner, now, allocator)
@@ -3173,16 +3377,16 @@ validate_wildcard_proof :: proc(
 		// the same thing.
 		switch trust {
 		case .Indeterminate:
-			return trust, nil, walk_reason(budget)
+			return trust, nil, walk_reason(budget), {}
 		case .Bogus:
-			return trust, nil, BROKEN_CHAIN
+			return trust, nil, BROKEN_CHAIN, budget.broken_lapsed
 		case .Insecure:
 			// The expanded name's zone is unsigned, or sits in an opt-out span:
 			// nothing to prove, and nothing forged.
-			return trust, nil, "unsigned zone"
+			return trust, nil, "unsigned zone", {}
 		case .Secure:
 		}
-		return trust, nil, "wildcard expansion not proven"
+		return trust, nil, "wildcard expansion not proven", {}
 	}
 	next_closer := name_drop_labels(owner, label_count(owner) - label_count(encloser) - 1)
 	// The denial records were verified against `established`, so a name outside
@@ -3190,7 +3394,7 @@ validate_wildcard_proof :: proc(
 	// zone would say nothing at all.
 	if !name_in_zone(next_closer, established) {
 		forget_unreached_non_cut(v, owner, established)
-		return .Bogus, nil, "wildcard expansion not proven"
+		return .Bogus, nil, "wildcard expansion not proven", {}
 	}
 	denial := denial_records_for(v, budget, seen, msg.authority, established, class, keys, unix, now, allocator)
 	/*
@@ -3200,11 +3404,11 @@ validate_wildcard_proof :: proc(
 	takes care not to say.
 	*/
 	if denial.exhausted {
-		return .Indeterminate, nil, exhausted_reason(budget)
+		return .Indeterminate, nil, exhausted_reason(budget), {}
 	}
 	if len(denial.nsecs) > 0 {
 		if _, covered := nsec_covering(denial.nsecs, next_closer); covered {
-			return .Secure, denial.verified, ""
+			return .Secure, denial.verified, "", {}
 		}
 	}
 	before := nsec3_refusals(&budget.nsec3)
@@ -3214,9 +3418,9 @@ validate_wildcard_proof :: proc(
 			// the span may be hiding an unsigned delegation, so the next closer
 			// name is not proven absent and the wildcard may not have applied.
 			if cover.rr.flags & NSEC3_FLAG_OPT_OUT != 0 {
-				return .Insecure, nil, "opt-out span"
+				return .Insecure, nil, "opt-out span", {}
 			}
-			return .Secure, denial.verified, ""
+			return .Secure, denial.verified, "", {}
 		}
 	}
 	/*
@@ -3235,12 +3439,12 @@ validate_wildcard_proof :: proc(
 	*/
 	if declined, why := nsec3_declined(&budget.nsec3, before); declined {
 		logx.debugf("dnssec: the wildcard proof for %s was not read to the end: %s", dns.name_trim_root(owner), why)
-		return .Indeterminate, nil, why
+		return .Indeterminate, nil, why, {}
 	}
 	// As on the denial path: a proof that speaks for nothing may be one the
 	// walk stopped above. See `forget_unreached_non_cut`.
 	forget_unreached_non_cut(v, owner, established)
-	return .Bogus, nil, "wildcard expansion not proven"
+	return .Bogus, nil, "wildcard expansion not proven", denial.lapsed
 }
 
 /*
@@ -3272,6 +3476,10 @@ validated_denial_records :: proc(
 	// out partway through, so that a caller can tell "nothing proved this" from
 	// "we stopped looking". `exhausted_reason` says which.
 	exhausted: bool,
+	// The window of a set dropped for its signatures' validity period alone,
+	// for a caller whose proof then fails - `refuted` instead when another set
+	// was dropped for a signature inside its window that failed. See `Lapsed`.
+	lapsed: Lapsed,
 ) {
 	out_nsec := make([dynamic]Nsec_Rr, 0, 4, allocator)
 	out_nsec3 := make([dynamic]Nsec3_Rr, 0, 4, allocator)
@@ -3287,7 +3495,7 @@ validated_denial_records :: proc(
 		}
 		append(&seen, dns.Question{name = rec.name, type = rec.type})
 
-		records, signer, carried, ok, spent := verified_rrset(
+		records, signer, carried, ok, spent, dropped := verified_rrset(
 			budget,
 			authority,
 			rec.name,
@@ -3309,6 +3517,7 @@ validated_denial_records :: proc(
 			// that verified is sound whatever else came along, and refusing the
 			// lot would let one junk record added to a response deny every name
 			// the real records were about to prove.
+			keep_lapse(&lapsed, dropped)
 			continue
 		}
 		append(
@@ -3327,7 +3536,7 @@ validated_denial_records :: proc(
 			append_denial_record(r, &out_nsec, &out_nsec3, allocator)
 		}
 	}
-	return out_nsec[:], out_nsec3[:], out_verified[:], exhausted
+	return out_nsec[:], out_nsec3[:], out_verified[:], exhausted, lapsed
 }
 
 /*
@@ -3366,11 +3575,19 @@ verified_rrset :: proc(
 	// out before a signature held, which is a statement about this server and
 	// not about the records.
 	exhausted: bool,
+	// The window its signatures fell outside, on a set that did not verify for
+	// that alone; `refuted` on one whose signature inside its window failed.
+	// See `Lapsed`.
+	lapsed: Lapsed,
 ) {
 	records = records_of(section, owner, type, class, allocator)
 	if len(records) == 0 {
-		return nil, "", {}, false, false
+		return nil, "", {}, false, false, {}
 	}
+	// As in `validate_rrset`: a set with a signature in its window that failed
+	// is not put down to one that lapsed. One that verified and was turned
+	// away for expanding a wildcard did not fail, and leaves the window open.
+	refuted := false
 	scratch := Signing_Scratch {
 		budget = budget,
 	}
@@ -3381,6 +3598,7 @@ verified_rrset :: proc(
 		// Free rejects first, so the budget is spent on signatures that could
 		// actually verify rather than on whatever was written in front of them.
 		if !signature_worth_trying(sig, keys, unix) {
+			note_lapsed(&lapsed, sig, keys, unix)
 			continue
 		}
 		// Bounded across the question rather than per RRset; see
@@ -3397,7 +3615,7 @@ verified_rrset :: proc(
 				dns.type_name(type),
 				dns.name_trim_root(owner),
 			)
-			return nil, "", {}, false, true
+			return nil, "", {}, false, true, {}
 		}
 		/*
 		The encloser is what the caller does not get to discard here. A short
@@ -3421,7 +3639,7 @@ verified_rrset :: proc(
 				dns.type_name(type),
 				dns.name_trim_root(owner),
 			)
-			return nil, "", {}, false, true
+			return nil, "", {}, false, true, {}
 		}
 		if result == .Ok && encloser != "" {
 			// Said out loud, because the two ways to reach it look identical
@@ -3436,10 +3654,11 @@ verified_rrset :: proc(
 			)
 		}
 		if result == .Ok && encloser == "" {
-			return records, sig.signer, sig, true, false
+			return records, sig.signer, sig, true, false, {}
 		}
+		refuted ||= result != .Ok
 	}
-	return nil, "", {}, false, false
+	return nil, "", {}, false, false, Lapsed{refuted = true} if refuted else lapsed
 }
 
 // ---------------------------------------------------------------------------
@@ -3611,6 +3830,7 @@ zone_trust :: proc(
 	budget.walk_stopped = ""
 	budget.walk_past_ceiling = false
 	budget.broken = ""
+	budget.broken_lapsed = {}
 	/*
 	The walk asks for a slot at its first upstream lookup and gives it back
 	here. One that never needs a lookup never takes one, so a flood holding
@@ -3847,6 +4067,8 @@ zone_step :: proc(
 		verified := false
 		exhausted := false
 		ds_sig: Rrsig
+		lapsed: Lapsed
+		tried := false
 		scratch := Signing_Scratch {
 			budget = budget,
 		}
@@ -3857,8 +4079,10 @@ zone_step :: proc(
 			// Free rejects first, so a padded DS set spends the budget only on
 			// signatures that could actually verify.
 			if !signature_worth_trying(sig, parent_keys, unix) {
+				note_lapsed(&lapsed, sig, parent_keys, unix)
 				continue
 			}
+			tried = true
 			if !spend_verification(budget) {
 				logx.debugf(
 					"dnssec: DS %s ran out of verifications before a signature held; the step is undecided",
@@ -3902,6 +4126,7 @@ zone_step :: proc(
 				child,
 				"the DS set is not signed by any key of its parent, or its signature expanded a wildcard",
 				allocator,
+				Lapsed{} if tried else lapsed,
 			)
 			return .Bogus, nil
 		}
@@ -3986,7 +4211,7 @@ zone_step :: proc(
 	the parent's keys, which the child's signatures then fail: Bogus, never
 	Insecure.
 	*/
-	cname, _, cname_sig, cname_ok, cname_spent := verified_rrset(budget, msg.answer, child, .CNAME, class, parent, parent_keys, unix, allocator)
+	cname, _, cname_sig, cname_ok, cname_spent, cname_lapsed := verified_rrset(budget, msg.answer, child, .CNAME, class, parent, parent_keys, unix, allocator)
 	if cname_spent {
 		return walk_gave_up(budget, exhausted_reason(budget)), nil
 	}
@@ -3999,12 +4224,16 @@ zone_step :: proc(
 	// a form the parent signed.
 	// Nothing here reaches a client - this is our own DS lookup - so which
 	// RRsets verified is of no interest beyond the proof they carry.
-	nsecs, nsec3s, proved, ds_spent := validated_denial_records(v, budget, msg.authority, parent, class, parent_keys, unix, now, allocator)
+	nsecs, nsec3s, proved, ds_spent, ds_lapsed := validated_denial_records(v, budget, msg.authority, parent, class, parent_keys, unix, now, allocator)
 	// A chain step this server ran out of allowance on is one it did not read,
 	// which is `Indeterminate` territory rather than a broken delegation.
 	if ds_spent {
 		return walk_gave_up(budget, exhausted_reason(budget)), nil
 	}
+	// A CNAME the parent signed outside its window is the other thing this
+	// reply could have held; one whose current signature failed rules the
+	// window out, as a denial set's does. Both broken steps below read this.
+	keep_lapse(&ds_lapsed, cname_lapsed)
 	if len(nsecs) == 0 && len(nsec3s) == 0 {
 		/*
 		Nothing to read, and the likeliest reason is the one worth acting on: a
@@ -4014,7 +4243,7 @@ zone_step :: proc(
 		drops it for not being the parent's, and both slices are empty.
 		*/
 		forget_skipped_non_cut(v, parent, child)
-		broke_at(budget, child, "the reply to the DS question held neither a DS nor a denial signed by the parent", allocator)
+		broke_at(budget, child, "the reply to the DS question held neither a DS nor a denial signed by the parent", allocator, ds_lapsed)
 		return .Bogus, nil
 	}
 
@@ -4063,7 +4292,7 @@ zone_step :: proc(
 	}
 	if step == .Bogus {
 		forget_skipped_non_cut(v, parent, child)
-		broke_at(budget, child, "the signed denial of a DS proves neither an unsigned delegation nor a name that is not a cut", allocator)
+		broke_at(budget, child, "the signed denial of a DS proves neither an unsigned delegation nor a name that is not a cut", allocator, ds_lapsed)
 	}
 	switch step {
 	case .Insecure:
@@ -4306,6 +4535,8 @@ fetch_keys :: proc(
 	}
 
 	exhausted := false
+	lapsed: Lapsed
+	tried := false
 	// One for the DNSKEY set, however many DS records and keys it is tried
 	// under: the set is the same every time.
 	scratch := Signing_Scratch {
@@ -4344,8 +4575,10 @@ fetch_keys :: proc(
 				// cannot verify, and finding that out costs nothing where
 				// canonicalising the DNSKEY set for it does not.
 				if !signature_worth_trying(sig, attested[:], unix) {
+					note_lapsed(&lapsed, sig, attested[:], unix)
 					continue
 				}
+				tried = true
 				/*
 				Charged against the query, and charged inside all three loops
 				rather than around them: the count here is the DS records that
@@ -4402,7 +4635,7 @@ fetch_keys :: proc(
 		if dns.name_equal_fold(closest_anchor(v.anchors, zone), zone) {
 			why = "no DNSKEY both matches a trust anchor and signs the DNSKEY set"
 		}
-		broke_at(budget, zone, why, allocator)
+		broke_at(budget, zone, why, allocator, Lapsed{} if tried else lapsed)
 		return nil, .Bogus, {}, 0
 	}
 	return nil, .Insecure, {}, 0
@@ -4948,10 +5181,12 @@ dname_covered :: proc(
 	// The DNAME's verified signature, which bounds the CNAME's TTL as it does
 	// the DNAME's own (RFC 4035 section 5.3.3).
 	vouched: Rrsig,
+	// The window of a synthesizing DNAME refused for it alone, when none holds.
+	lapsed: Lapsed,
 ) {
 	target, is_name := cname.data.(dns.Rdata_Name)
 	if !is_name {
-		return false, {}
+		return false, {}, {}
 	}
 
 	seen := make([dynamic]dns.Question, 0, 2, allocator)
@@ -4986,12 +5221,13 @@ dname_covered :: proc(
 		*/
 		records := records_of(msg.answer, rec.name, .DNAME, class, allocator)
 		sigs := sigs_covering(msg.answer, rec.name, .DNAME, class, allocator)
-		status, _, _, _, sig := validate_rrset(v, budget, rec.name, .DNAME, class, records, sigs, unix, now, allocator)
+		status, _, _, _, sig, why_lapsed := validate_rrset(v, budget, rec.name, .DNAME, class, records, sigs, unix, now, allocator)
 		if status == .Secure {
-			return true, sig
+			return true, sig, {}
 		}
+		keep_lapse(&lapsed, why_lapsed)
 	}
-	return false, {}
+	return false, {}, lapsed
 }
 
 /*
