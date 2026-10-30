@@ -870,3 +870,43 @@ test_a_cache_made_where_another_was_is_not_that_cache :: proc(t: ^testing.T) {
 	testing.expect(t, identity(b) != first, "a new cache took an old one's identity")
 	testing.expect_value(t, identity(nil), u64(0))
 }
+
+/*
+A lookup that will not read the bytes takes no copy of them (issue #532).
+
+The copy is up to 64 KB made under `c.mu`. An expired entry is forwarded past
+while the upstream is healthy, and an entry whose refusal is current is refused
+from its flags, so a copy for either is thrown away. The panic allocator is the
+assertion: a copy made anyway fails the test.
+*/
+@(test)
+test_a_lookup_that_will_not_read_the_bytes_takes_no_copy :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer destroy(c)
+
+	wire, msg := build_cname_answer("www.example.com.", "cdn.example.net.", 300, context.temp_allocator)
+	kb: [KEY_MAX]u8
+	key := make_key(kb[:], "www.example.com.", .A, .IN, false)
+	testing.expect(t, put(c, key, wire, msg, 1), "the entry was not stored")
+	_, first, _ := get(c, key, context.temp_allocator, checked_against = 1)
+	note_checked(c, key, first.serial, 2, 1)
+
+	none := mem.panic_allocator()
+	out, refused, ok := get(c, key, none, checked_against = 2, copy_refused = false)
+	testing.expect(t, ok && out == nil && refused.refused == 1, "a refusal that stands came back without its flags or with bytes")
+
+	// Owed a look under rules that moved on, the bytes are what the look reads.
+	moved, owed, _ := get(c, key, context.temp_allocator, checked_against = 3, copy_refused = false)
+	testing.expect(t, owed.recheck && len(moved) == len(wire), "an entry owed a re-walk came back without its bytes")
+
+	if e, found := c.entries[key]; found {
+		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
+	}
+	held, stale, sok := get(c, key, none, checked_against = 2, copy_stale = false)
+	testing.expect(t, sok && held == nil && stale.stale, "an expired entry came back without its flag or with bytes")
+
+	// Asked for, the stale copy is still made, with the short TTL.
+	lent, lend, lok := get(c, key, context.temp_allocator, checked_against = 2)
+	testing.expect(t, lok && lend.stale && len(lent) == len(wire), "the stale copy was not lent")
+	free_all(context.temp_allocator)
+}

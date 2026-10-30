@@ -157,9 +157,9 @@ Hit :: struct {
 	// The entry is near its expiry and this caller is the one to refresh it.
 	// See `claim_prefetch`.
 	prefetch: bool,
-	// The entry's `signed_until`. A caller that holds a stale copy while it
-	// waits on an upstream reads it again before handing the copy out, since
-	// the wait can outlast the signature.
+	// The entry's `signed_until`. A caller that holds a stale hit while it
+	// waits on an upstream reads it again before serving it, since the wait can
+	// outlast the signature.
 	signed_until: loop.Moment,
 }
 
@@ -459,8 +459,8 @@ had; callers set the ID and re-case the question themselves.
 not an answer to send on sight: RFC 8767 section 5 has the refresh attempted
 first and expired data used only once that attempt has failed, which is also
 what the setting promises the operator - an answer from an expired entry if the
-upstream is down. The caller carries on as it would for a miss and falls back on
-what it was lent, calling `note_stale_served` if it does.
+upstream is down. The caller carries on as it would for a miss, asks again for
+the bytes once that has failed, and calls `note_stale_served` if it serves them.
 
 `checked_against` is the caller's number for whatever it decides about answers
 before storing them - see `put`. An entry stored under a different one, and with
@@ -483,6 +483,13 @@ this cache served.
 `prefetch` is the caller saying it will refresh the entry if told to, and it is
 what `hit.prefetch` is claimed with - see `claim_prefetch`. A caller that would
 not act on it leaves it off, since the claim is the entry's one chance.
+
+`copy_stale` and `copy_refused` say which hits the caller will not read the
+bytes of: an expired entry it forwards past and reads only if the upstream
+fails, and an entry whose recorded refusal is current (`refused` set, no
+`recheck`) that it refuses from the flags alone. Either comes back found, with
+`hit` filled in and `wire` nil. The copy is up to 64 KB taken under `c.mu`, so a
+lookup that throws it away costs every other lookup the wait.
 */
 get :: proc(
 	c: ^Cache,
@@ -491,6 +498,8 @@ get :: proc(
 	checked_against: u64 = 0,
 	probe := false,
 	prefetch := false,
+	copy_stale := true,
+	copy_refused := true,
 ) -> (
 	wire: []u8,
 	hit: Hit,
@@ -525,11 +534,16 @@ get :: proc(
 	hit.ede = e.ede
 	hit.signed_until = e.signed_until
 
+	stale := now > e.expires
+	copies := copy_stale if stale else copy_refused || hit.recheck || e.refused == 0
 	elapsed := u32(max(0, time.duration_seconds(time.Duration(now - e.inserted))))
-	out := make([]u8, len(e.wire), allocator)
-	copy(out, e.wire)
+	out: []u8
+	if copies {
+		out = make([]u8, len(e.wire), allocator)
+		copy(out, e.wire)
+	}
 
-	if now > e.expires {
+	if stale {
 		// A stale answer goes out with a short fixed TTL rather than a
 		// counted-down one, which would already have reached zero. Bounded by
 		// `max_ttl` like everything else this cache hands out: an operator who
@@ -540,8 +554,10 @@ get :: proc(
 		// stale window inside them, and the figure a copy carries stays there
 		// too (RFC 4034 section 3.1.5).
 		stale_ttl = min(stale_ttl, signature_left(e.signed_until, now))
-		for off in e.ttl_offsets {
-			dns.write_ttl_at(out, off, stale_ttl)
+		if copies {
+			for off in e.ttl_offsets {
+				dns.write_ttl_at(out, off, stale_ttl)
+			}
 		}
 		/*
 		A miss, because that is what it is to the caller: the lookup was not
@@ -558,7 +574,9 @@ get :: proc(
 	} else {
 		// `min_ttl` floors what records claim, not what their signatures allow
 		// (RFC 4034 section 3.1.5): no copy is told to hold one past it.
-		dns.patch_ttls(out, e.ttl_offsets, e.ttls, elapsed, min(c.min_ttl, signature_left(e.signed_until, now)))
+		if copies {
+			dns.patch_ttls(out, e.ttl_offsets, e.ttls, elapsed, min(c.min_ttl, signature_left(e.signed_until, now)))
+		}
 		if !probe {
 			c.stats.hits += 1
 		}
