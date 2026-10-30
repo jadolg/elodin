@@ -221,6 +221,10 @@ Roundtrip :: struct {
 	proto:    Protocol,
 	disabled: bool,
 	require:  bool,
+	// How many copies of the question the query carries; nil is the usual one.
+	// Zero is the RFC 7873 section 5.4 priming shape.
+	questions: Maybe(int),
+	id:        Maybe(u16),
 }
 
 /*
@@ -259,6 +263,16 @@ roundtrip :: proc(t: ^testing.T, c: Roundtrip) -> (out: []u8, ok: bool) {
 
 	query := query_with_cookie(c.cookie)
 	query.flags.rd = true
+	if n, set := c.questions.?; set {
+		qs := make([]dns.Question, n, context.temp_allocator)
+		for &q in qs {
+			q = question[0]
+		}
+		query.question = qs
+	}
+	if id, set := c.id.?; set {
+		query.id = id
+	}
 	query_wire, _, qenc := dns.encode_message(query, context.temp_allocator)
 	testing.expect_value(t, qenc, dns.Encode_Error.None)
 
@@ -309,7 +323,9 @@ response_cookie :: proc(wire: []u8) -> (data: []u8, found: bool) {
 response_rcode :: proc(wire: []u8) -> dns.Rcode {
 	m, err := dns.decode_message(wire, context.temp_allocator)
 	if err != .None {
-		return .Form_Err
+		// No rcode at all, so that a reply that does not decode can never pass
+		// for the FORMERR a case expects.
+		return dns.Rcode(max(u16))
 	}
 	return dns.rcode_of(m)
 }
@@ -620,5 +636,98 @@ test_a_cookie_is_bound_to_the_address_as_reported :: proc(t: ^testing.T) {
 		!verify_cookie(&k, issued[:], unmapped, 1559731985),
 		"the two forms hash alike, so something here is undoing the mapping after all",
 	)
+	free_all(context.temp_allocator)
+}
+
+/*
+RFC 7873 section 5.4: a QUERY with no question and a COOKIE option asks for a
+server cookie and nothing else. A client cookie alone, or one with a valid
+server cookie behind it, SHALL be answered NOERROR; one with a server cookie
+that does not check out SHALL be answered BADCOOKIE. Either way the answer is
+empty and carries a fresh cookie.
+*/
+@(private = "file")
+expect_primed :: proc(t: ^testing.T, out: []u8, rcode: dns.Rcode, client: string, loc := #caller_location) {
+	m, derr := dns.decode_message(out, context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None, loc) {
+		return
+	}
+	testing.expect_value(t, dns.rcode_of(m), rcode, loc)
+	testing.expect_value(t, len(m.question), 0, loc)
+	testing.expect_value(t, len(m.answer), 0, loc)
+	testing.expect_value(t, len(m.authority), 0, loc)
+	got, found := dns.find_edns_option(m, .Cookie)
+	if !testing.expect(t, found, "a priming answer carries no cookie", loc = loc) {
+		return
+	}
+	testing.expect_value(t, len(got), COOKIE_REPLY_LEN, loc)
+	k := keeper("e5e973e5a6b2a43f48e7dc849e37bfcf")
+	testing.expect(t, verify_cookie(&k, got, request("2464c4abcf10c957", client), cookie_now()), "the primed cookie does not verify", loc = loc)
+}
+
+@(test)
+test_cookie_priming_query :: proc(t: ^testing.T) {
+	client := "198.51.100.100:9999"
+	sent := unhex("2464c4abcf10c957")
+
+	out, ok := roundtrip(t, Roundtrip{cookie = sent, client = client, proto = .UDP, questions = 0})
+	if testing.expect(t, ok, "no response") {
+		expect_primed(t, out, .No_Error, client)
+	}
+
+	// `require` has nothing to protect when nothing is looked up, and the SHALL
+	// above leaves no room for BADCOOKIE on a client cookie alone.
+	required, required_ok := roundtrip(t, Roundtrip{cookie = sent, client = client, proto = .UDP, questions = 0, require = true})
+	if testing.expect(t, required_ok, "no response under require") {
+		expect_primed(t, required, .No_Error, client)
+	}
+
+	// An id of zero takes `error_response` down its header-only fallback, which
+	// has no OPT record for the cookie to go into until one is made for it.
+	zero, zero_ok := roundtrip(t, Roundtrip{cookie = sent, client = client, proto = .UDP, questions = 0, id = 0})
+	if testing.expect(t, zero_ok, "no response to id 0") {
+		expect_primed(t, zero, .No_Error, client)
+	}
+
+	// Confirming a server cookie already held.
+	k := keeper("e5e973e5a6b2a43f48e7dc849e37bfcf")
+	issued := make_cookie(&k, request("2464c4abcf10c957", client), cookie_now())
+	valid, valid_ok := roundtrip(t, Roundtrip{cookie = issued[:], client = client, proto = .UDP, questions = 0})
+	if testing.expect(t, valid_ok, "no response to a valid cookie") {
+		expect_primed(t, valid, .No_Error, client)
+	}
+
+	forged := make([]u8, COOKIE_REPLY_LEN, context.temp_allocator)
+	copy(forged, issued[:])
+	forged[23] ~= 0xff
+	bad, bad_ok := roundtrip(t, Roundtrip{cookie = forged, client = client, proto = .UDP, questions = 0})
+	if testing.expect(t, bad_ok, "no response to a forged cookie") {
+		expect_primed(t, bad, .Bad_Cookie, client)
+	}
+
+	free_all(context.temp_allocator)
+}
+
+// Section 5.4 extends QUERY for a cookie and nothing else: any other question
+// count, or no cookie to give - cookies off, or a client address none can be
+// bound to - is still FORMERR.
+@(test)
+test_cookie_priming_needs_a_cookie_and_no_question :: proc(t: ^testing.T) {
+	client := "198.51.100.100:9999"
+	sent := unhex("2464c4abcf10c957")
+	cases := []Roundtrip {
+		{client = client, proto = .UDP, questions = 0},
+		{cookie = sent, client = client, proto = .UDP, questions = 0, disabled = true},
+		{cookie = sent, client = client, proto = .UDP, questions = 2},
+		{cookie = make([]u8, 9, context.temp_allocator), client = client, proto = .UDP, questions = 0},
+		{cookie = sent, client = "not-an-address", proto = .UDP, questions = 0},
+	}
+	for c, i in cases {
+		out, ok := roundtrip(t, c)
+		if testing.expectf(t, ok, "case %d: no response", i) {
+			rcode := response_rcode(out)
+			testing.expectf(t, rcode == .Form_Err, "case %d: rcode %v", i, rcode)
+		}
+	}
 	free_all(context.temp_allocator)
 }

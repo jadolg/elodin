@@ -34,6 +34,13 @@ section 5.2.2).
   query never gets an answer sent to its victim. It costs honest clients one
   extra round trip on first contact, so keep it for an attack under way (as RFC
   7873 intends). Queries with no cookie, and TCP, DoT and DoH, are unaffected.
+- A query with no question and a COOKIE option asks for a server cookie alone
+  (RFC 7873 section 5.4). It is answered with no records and a fresh cookie:
+  NOERROR for a client cookie alone or a valid server cookie, BADCOOKIE for a
+  server cookie that does not check out, on every transport and whatever
+  `require` says. It is logged as `detail=cookie`. With `enabled: false`,
+  without a COOKIE option, with one of an impossible length, or from a client
+  address no cookie can be bound to, a query with no question is FORMERR.
 - `require: true` with `enabled: false` is rejected at startup.
 - Set `secret` when several elodin instances answer on one address; otherwise
   each rejects the cookies the others issued.
