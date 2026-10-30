@@ -38,6 +38,11 @@ mute_listener :: proc(t: ^testing.T, kind: config.Upstream_Kind) -> (listener: n
 		net.close(listener)
 		return
 	}
+	serr := net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+	if !testing.expectf(t, serr == nil, "cannot bound the accept: %v", serr) {
+		net.close(listener)
+		return
+	}
 	uerr: Error
 	u, uerr = make_upstream(
 		config.Upstream_Spec {
@@ -62,14 +67,11 @@ mute_listener :: proc(t: ^testing.T, kind: config.Upstream_Kind) -> (listener: n
 Every connection the kernel completed, all of them in the backlog by the time
 the callers that made them returned. One closed while it sat there was a dial
 all the same, and a signal is not the end of the backlog; anything else that
-ends the drain early would undercount, so it fails the test instead.
+ends the drain early would undercount, so it fails the test instead, and the
+count so far is what the caller reports.
 */
 @(private = "file")
 drain_dials :: proc(t: ^testing.T, listener: net.TCP_Socket) -> (dials: int) {
-	serr := net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
-	if !testing.expectf(t, serr == nil, "cannot bound the accept: %v", serr) {
-		return -1
-	}
 	for {
 		c, _, err := net.accept_tcp(listener)
 		#partial switch err {
@@ -83,7 +85,7 @@ drain_dials :: proc(t: ^testing.T, listener: net.TCP_Socket) -> (dials: int) {
 			return
 		case:
 			testing.expectf(t, false, "cannot drain the backlog: %v", err)
-			return -1
+			return
 		}
 	}
 }
@@ -110,6 +112,7 @@ Dial_Caller :: struct {
 	took:    time.Duration,
 	err:     Error,
 	started: bool,
+	done:    ^sync.Wait_Group,
 }
 
 @(private = "file")
@@ -118,6 +121,7 @@ dial_caller :: proc(c: ^Dial_Caller) {
 	sync.atomic_store(&c.started, true)
 	c.err = queue_once(c.u, c.budget)
 	c.took = time.tick_since(start)
+	sync.wait_group_done(c.done)
 }
 
 /*
@@ -156,12 +160,15 @@ callers_queued_behind_a_dial_keep_their_own_budget :: proc(t: ^testing.T, kind: 
 	u.connecting = true
 	sync.mutex_unlock(&u.mu)
 
+	done: sync.Wait_Group
+	sync.wait_group_add(&done, WAITERS)
 	waiters: [WAITERS]Dial_Caller
 	threads: [WAITERS]^thread.Thread
 	for i in 0 ..< WAITERS {
 		waiters[i] = Dial_Caller {
 			u      = u,
 			budget = WAIT,
+			done   = &done,
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&waiters[i], dial_caller)
 	}
@@ -170,17 +177,7 @@ callers_queued_behind_a_dial_keep_their_own_budget :: proc(t: ^testing.T, kind: 
 			time.sleep(time.Millisecond)
 		}
 	}
-	until := time.tick_add(time.tick_now(), DIAL)
-	for time.tick_diff(time.tick_now(), until) > 0 {
-		done := 0
-		for th in threads {
-			done += int(thread.is_done(th))
-		}
-		if done == WAITERS {
-			break
-		}
-		time.sleep(10 * time.Millisecond)
-	}
+	_ = sync.wait_group_wait_with_timeout(&done, DIAL)
 	sync.mutex_lock(&u.mu)
 	u.connecting = false
 	loop.cond_broadcast(&u.conn_cond)
