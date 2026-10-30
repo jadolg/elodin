@@ -84,8 +84,8 @@ truncating_tcp_once :: proc(m: ^Truncating_Mock) {
 	if n < dns.HEADER_SIZE || n > len(query) || read_full_tcp(client, query[:n]) != .None {
 		return
 	}
-	// The waiter is registered before its query is written, and leaves only
-	// under `c.mu`, so it is there to be read.
+	// The waiter is registered before its query is written and leaves only
+	// under `c.mu`, at its deadline: read before then, it is there.
 	sync.mutex_lock(&m.u.mu)
 	c := m.u.pipe
 	sync.mutex_unlock(&m.u.mu)
