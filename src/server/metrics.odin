@@ -688,7 +688,7 @@ entries does the cache hold".
 render_cache_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	cs := cache.stats(live(s).answers)
 	metrics.scalar(b, "elodin_cache_entries", .Gauge, "Answers held in the cache.", i64(cache.len_entries(live(s).answers)))
-	metrics.scalar(b, "elodin_cache_bytes", .Gauge, "Bytes the cached answers occupy.", i64(cache.bytes_used(live(s).answers)))
+	metrics.scalar(b, "elodin_cache_bytes", .Gauge, "Heap the cache holds, as max_bytes counts it.", i64(cache.bytes_used(live(s).answers)))
 	metrics.scalar(b, "elodin_cache_hits_total", .Counter, "Lookups answered from the cache.", cs.hits)
 	metrics.scalar(b, "elodin_cache_misses_total", .Counter, "Lookups the cache could not answer.", cs.misses)
 	metrics.scalar(

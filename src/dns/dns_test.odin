@@ -368,6 +368,35 @@ test_scan_ttl_offsets_releases_on_bad_name :: proc(t: ^testing.T) {
 }
 
 /*
+The list `scan_ttl_offsets` returns is the whole of its block. The cache charges
+an entry by the list's length (issue #531), and the block is sized for every
+record the header counts, the OPT record included, before the walk drops it.
+*/
+@(test)
+test_scan_ttl_offsets_returns_no_slack :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+
+	m := Message {
+		id         = 9,
+		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
+		answer     = []Record{{name = "example.com.", type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {1, 2, 3, 4}}}},
+		additional = []Record{make_opt(1232, false)},
+	}
+	m.flags.qr = true
+	wire, _, err := encode_message(m, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	testing.expect_value(t, err, Encode_Error.None)
+
+	offsets, ok := scan_ttl_offsets(wire, mem.tracking_allocator(&track))
+	testing.expect(t, ok, "ttl scan failed")
+	testing.expect_value(t, len(offsets), 1)
+	testing.expect_value(t, track.current_memory_allocated, i64(len(offsets) * size_of(int)))
+	delete(offsets, mem.tracking_allocator(&track))
+}
+
+/*
 `encode_message` hands the caller its output buffer and abandons everything else
 the writer allocated: the label-offset list, the compression map, and a cloned
 string per distinct name suffix recorded in it.

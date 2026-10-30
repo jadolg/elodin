@@ -1,5 +1,6 @@
 package cache
 
+import "base:runtime"
 import "core:mem"
 import "core:strings"
 import "core:sync"
@@ -40,6 +41,24 @@ Entry :: struct {
 	*/
 	signed_until: loop.Moment,
 	/*
+	What the caller had decided about this answer when it stored it, in whatever
+	numbering the caller keeps - see `put` and `get`. Zero for a caller that does
+	not keep one, which reads as "decided under nothing you would recognise" and
+	so is never mistaken for current.
+	*/
+	checked:     u64,
+	/*
+	Which entry this is, counted up once per insert and never reused.
+
+	`note_checked` writes to an entry a caller read some microseconds earlier, and
+	between the two the key may have been replaced by another query's answer.
+	Without something to tell the two apart, that write would put one answer's
+	verdict on another answer's bytes - and if the replacement was stored under
+	older rules than the writer's, the entry would then be trusted under rules
+	nothing had matched it against.
+	*/
+	serial:      u64,
+	/*
 	Whether the answer section redirects anywhere: it holds a CNAME. A DNAME
 	always arrives with one, so is not looked for separately - see `redirects`.
 
@@ -62,13 +81,6 @@ Entry :: struct {
 	refuses it the stale window an answer gets.
 	*/
 	bogus:       bool,
-	/*
-	What the caller had decided about this answer when it stored it, in whatever
-	numbering the caller keeps - see `put` and `get`. Zero for a caller that does
-	not keep one, which reads as "decided under nothing you would recognise" and
-	so is never mistaken for current.
-	*/
-	checked:     u64,
 	/*
 	What the caller decided when it last looked, under the number in `checked`.
 
@@ -99,17 +111,6 @@ Entry :: struct {
 	has to say it as the answer that filled the entry did.
 	*/
 	ede:         u16,
-	/*
-	Which entry this is, counted up once per insert and never reused.
-
-	`note_checked` writes to an entry a caller read some microseconds earlier, and
-	between the two the key may have been replaced by another query's answer.
-	Without something to tell the two apart, that write would put one answer's
-	verdict on another answer's bytes - and if the replacement was stored under
-	older rules than the writer's, the entry would then be trusted under rules
-	nothing had matched it against.
-	*/
-	serial:      u64,
 	/*
 	A hit near expiry has already been handed this entry's prefetch; see
 	`claim_prefetch`.
@@ -298,7 +299,13 @@ make_cache :: proc(opts: Options, allocator := context.allocator) -> ^Cache {
 	c.allocator = allocator
 	c.id = sync.atomic_add(&caches_made, 1) + 1
 	apply_options(c, opts)
-	c.entries = make(map[string]^Entry, max(opts.max_entries, 16), allocator)
+	/*
+	Not reserved at `max_entries`: a slot is 32 bytes, so a count raised until
+	`max_bytes` binds - a million is 32 MiB of table - would be paid for in full
+	at startup whether the cache ever filled. It grows in steps as entries arrive
+	and is charged to the budget as it does - see `table_bytes`.
+	*/
+	c.entries = make(map[string]^Entry, allocator = allocator)
 	return c
 }
 
@@ -330,6 +337,7 @@ reconfigure :: proc(c: ^Cache, opts: Options) {
 	defer sync.mutex_unlock(&c.mu)
 	apply_options(c, opts)
 	evict_over_limits(c)
+	shrink_table(c)
 }
 
 @(private)
@@ -1293,19 +1301,33 @@ thing in both directions.
 	c.stats.inserts += 1
 
 	// Both bounds, because the count alone is not one: see DEFAULT_MAX_BYTES. The
-	// entry just inserted is at the head and was refused above if it could not
-	// fit by itself, so this cannot come round to evicting it.
-	evict_over_limits(c)
+	// entry just inserted was refused above if it could not fit by itself, and
+	// is kept here in case the table it just grew is what tips the total over.
+	evict_over_limits(c, e)
 	return true
 }
 
-// Evict from the tail until both bounds hold. The caller holds `c.mu`.
+// Evict from the tail until both bounds hold, or `keep` is all that is left.
+// The caller holds `c.mu`.
 @(private)
-evict_over_limits :: proc(c: ^Cache) {
-	for (len(c.entries) > c.max_entries || c.bytes > c.max_bytes) && c.tail != nil {
+evict_over_limits :: proc(c: ^Cache, keep: ^Entry = nil) {
+	for (len(c.entries) > c.max_entries || c.bytes + table_bytes(c) > c.max_bytes) && c.tail != nil && c.tail != keep {
 		remove_entry(c, c.tail)
 		c.stats.evictions += 1
 	}
+}
+
+/*
+Give back what the table grew to hold entries that have since gone.
+
+A map only ever grows on insert, so without this a cache that filled once would
+keep the table for its peak for the life of the process. Called where many
+entries can go at once: a sweep, a reload. A no-op unless the table can halve.
+The caller holds `c.mu`.
+*/
+@(private)
+shrink_table :: proc(c: ^Cache) {
+	_, _ = shrink(&c.entries)
 }
 
 // Drop everything, e.g. after a configuration reload.
@@ -1319,6 +1341,7 @@ clear_all :: proc(c: ^Cache) {
 		free_entry(c, e)
 	}
 	clear(&c.entries)
+	shrink_table(c)
 	c.head, c.tail = nil, nil
 	c.bytes = 0
 }
@@ -1351,6 +1374,9 @@ sweep :: proc(c: ^Cache) -> (removed: int) {
 		}
 		e = prev
 	}
+	if removed > 0 {
+		shrink_table(c)
+	}
 	return
 }
 
@@ -1363,14 +1389,14 @@ len_entries :: proc(c: ^Cache) -> int {
 	return len(c.entries)
 }
 
-// What the entries hold, counted the way the bound counts it.
+// What the entries and the table hold, counted the way the bound counts it.
 bytes_used :: proc(c: ^Cache) -> int {
 	if c == nil {
 		return 0
 	}
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
-	return c.bytes
+	return c.bytes + table_bytes(c)
 }
 
 stats :: proc(c: ^Cache) -> Stats {
@@ -1426,17 +1452,57 @@ deadline :: proc(c: ^Cache, e: ^Entry) -> loop.Moment {
 }
 
 /*
-What one entry costs the process, near enough to bound it by.
+What one entry takes from the heap.
 
 The response as it arrived, an offset and a TTL for every record in it, the key,
-and the entry itself. What is left out is the map's own slot, which is a pointer
-and a hash in a table that grows in steps rather than per entry - a few tens of
-bytes against a mean entry of several hundred, and not something an attacker can
-inflate on its own.
+and the entry itself - five allocations, each charged as the heap sizes it
+rather than as asked for. On a small entry that is near a third of the cost:
+an NXDOMAIN with one SOA asks for about three hundred bytes and takes over four
+hundred, and a flood of distinct names leaves nothing but those (issue #531).
+The entry's slot in the map is charged with the table, in `table_bytes`.
 */
 @(private)
 sizeof_entry :: proc(key: string, wire: []u8, offsets: []int, ttls: []u32) -> int {
-	return size_of(Entry) + len(key) + len(wire) + len(offsets) * size_of(int) + len(ttls) * size_of(u32)
+	return(
+		heap_block(size_of(Entry)) +
+		heap_block(len(key)) +
+		heap_block(len(wire)) +
+		heap_block(len(offsets) * size_of(int)) +
+		heap_block(len(ttls) * size_of(u32)) \
+	)
+}
+
+/*
+What the map's table takes from the heap: all of it, used or not, because it
+grows by doubling and is the same allocation whether a slot is filled. That is
+a key, a value and a hash per slot, at most three quarters full - over forty
+bytes an entry, a tenth of what the smallest entries cost.
+*/
+@(private)
+table_bytes :: proc(c: ^Cache) -> int {
+	if cap(c.entries) == 0 {
+		return 0
+	}
+	return heap_block(int(runtime.map_total_allocation_size_from_value(c.entries)), runtime.MAP_CACHE_LINE_SIZE)
+}
+
+/*
+What a block of `n` bytes at `align` takes from the C heap through Odin's heap
+allocator, which is what the cache's allocator is outside tests.
+
+Odin asks malloc for `align - 1` more bytes and a pointer to align the block
+and find its start again; glibc adds its own size word and rounds the chunk to
+16 bytes, with 32 the least it hands out. A block past the mmap threshold is
+rounded to a page instead, which this does not model - under 3% of a block that
+size. Nothing is allocated for nothing.
+*/
+@(private)
+heap_block :: proc(n: int, align := 8) -> int {
+	if n == 0 {
+		return 0
+	}
+	asked := n + max(align, size_of(rawptr)) - 1 + size_of(rawptr)
+	return max(32, (asked + size_of(uint) + 15) &~ 15)
 }
 
 @(private)

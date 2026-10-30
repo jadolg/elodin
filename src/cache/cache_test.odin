@@ -29,7 +29,7 @@ build_answer :: proc(name: string, ttl: u32, allocator := context.allocator) -> 
 	return wire, decoded
 }
 
-@(private = "file")
+@(private)
 build_nxdomain :: proc(name: string, soa_min: u32, allocator := context.allocator) -> ([]u8, dns.Message) {
 	m := dns.Message {
 		id        = 0x2222,
@@ -63,7 +63,7 @@ build_nxdomain :: proc(name: string, soa_min: u32, allocator := context.allocato
 	return wire, decoded
 }
 
-@(private = "file")
+@(private)
 key_for :: proc(buf: []u8, name: string) -> string {
 	return make_key(buf, name, .A, .IN, false)
 }
@@ -570,7 +570,7 @@ test_an_entry_larger_than_the_budget_is_refused :: proc(t: ^testing.T) {
 }
 
 /*
-The byte total has to come back to zero by every route out of the cache.
+The byte total has to come back to the table's by every route out of the cache.
 
 A total that only ever goes up is a cache that stops accepting entries once it
 has seen enough of them, and a total that goes down too far is a bound that
@@ -602,13 +602,14 @@ test_byte_accounting_comes_back_to_zero :: proc(t: ^testing.T) {
 	// Dropped by `get`, which is what an expired entry meets first.
 	sync_expire(c, key_for(kb[:], "a.example."))
 	_, _, _ = get(c, key_for(kb[:], "a.example."), context.temp_allocator)
-	testing.expect_value(t, bytes_used(c), 0)
+	// The table stays, at its least, and is all that is counted.
+	testing.expect_value(t, bytes_used(c), table_bytes(c))
 
 	// Dropped by `sweep`.
 	put_one(c, kb[:], "b.example.")
 	sync_expire(c, key_for(kb[:], "b.example."))
 	testing.expect_value(t, sweep(c), 1)
-	testing.expect_value(t, bytes_used(c), 0)
+	testing.expect_value(t, bytes_used(c), table_bytes(c))
 
 	// Dropped by eviction, with the count as the bound this time.
 	small := make_cache(Options{max_entries = 1, max_ttl = 3600}, mem.tracking_allocator(&track))
@@ -622,7 +623,7 @@ test_byte_accounting_comes_back_to_zero :: proc(t: ^testing.T) {
 	// Dropped by `clear_all`, as a reload does it.
 	put_one(c, kb[:], "e.example.")
 	clear_all(c)
-	testing.expect_value(t, bytes_used(c), 0)
+	testing.expect_value(t, bytes_used(c), table_bytes(c))
 
 	destroy(c)
 	free_all(context.temp_allocator)

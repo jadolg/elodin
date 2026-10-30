@@ -1,0 +1,210 @@
+package cache
+
+import "base:runtime"
+import "core:fmt"
+import "core:mem"
+import "core:sync"
+import "core:testing"
+import "core:time"
+import "elodin:loop"
+
+foreign import libc "system:c"
+
+@(private)
+@(default_calling_convention = "c")
+foreign libc {
+	malloc_usable_size :: proc(p: rawptr) -> uint ---
+}
+
+/*
+What the cache's allocations take from the C heap, read off the heap itself.
+
+A tracking allocator counts what was asked for. What a budget in bytes has to
+answer for is what was taken: glibc's chunk header and rounding, and the
+pointer and padding Odin's heap allocator puts in front of each block to align
+it. So this goes to the platform for each block's size - the start of the block
+Odin keeps just before the pointer it returns, and the chunk's usable size plus
+its header - rather than to a model of it that the code under test also uses.
+*/
+@(private)
+Resident :: struct {
+	held: int,
+}
+
+@(private)
+resident_allocator :: proc(r: ^Resident) -> mem.Allocator {
+	return {procedure = resident_proc, data = r}
+}
+
+@(private)
+resident_proc :: proc(
+	data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	loc := #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	chunk :: proc(p: rawptr) -> int {
+		if p == nil {
+			return 0
+		}
+		start := ([^]rawptr)(p)[-1]
+		return int(malloc_usable_size(start)) + size_of(uint)
+	}
+	r := (^Resident)(data)
+	#partial switch mode {
+	case .Free, .Resize, .Resize_Non_Zeroed:
+		r.held -= chunk(old_memory)
+	}
+	res, err := runtime.heap_allocator_proc(nil, mode, size, alignment, old_memory, old_size, loc)
+	#partial switch mode {
+	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
+		r.held += chunk(raw_data(res))
+	}
+	return res, err
+}
+
+/*
+`max_bytes` is what the cache holds, with the smallest entries a flood of
+distinct names leaves behind (issue #531).
+
+An NXDOMAIN with one SOA is a few dozen bytes of wire, so what it costs is
+mostly the five allocations an entry is and its slot in the map - and the count
+has been raised so far that the byte budget is what binds, which is the setting
+under which those have to be counted.
+*/
+@(test)
+test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
+	BUDGET :: 4 * 1024 * 1024
+	INSERTS :: 40_000
+
+	r: Resident
+	c := make_cache(Options{max_entries = 1_000_000, max_bytes = BUDGET, max_ttl = 3600}, resident_allocator(&r))
+	defer destroy(c)
+
+	kb: [KEY_MAX]u8
+	for i in 0 ..< INSERTS {
+		name := fmt.tprintf("n%d.example.", i)
+		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
+		testing.expectf(t, put(c, key_for(kb[:], name), wire, msg), "put %d failed", i)
+		if i % 1000 == 0 {
+			free_all(context.temp_allocator)
+		}
+	}
+	free_all(context.temp_allocator)
+
+	// The premise: the budget binds, not the count.
+	testing.expectf(t, len_entries(c) < INSERTS, "all %d entries fit in the budget", INSERTS)
+
+	// The Cache itself is the only allocation the count leaves out.
+	held := r.held - (size_of(Cache) + 64)
+	used := bytes_used(c)
+	testing.expectf(t, held <= BUDGET, "the cache holds %d bytes against a %d byte budget", held, BUDGET)
+	testing.expectf(
+		t,
+		abs(held - used) <= held / 50,
+		"the cache counts %d bytes and holds %d over %d entries",
+		used,
+		held,
+		len_entries(c),
+	)
+}
+
+// An empty cache holds next to nothing, whatever count it is allowed.
+@(test)
+test_an_empty_cache_reserves_no_table :: proc(t: ^testing.T) {
+	r: Resident
+	c := make_cache(Options{max_entries = 1_000_000, max_ttl = 3600}, resident_allocator(&r))
+	defer destroy(c)
+	testing.expectf(t, r.held <= 4096, "an empty cache holds %d bytes", r.held)
+}
+
+// A smaller limit gives back the table the larger one grew, not only the entries.
+@(test)
+test_reconfigure_shrinks_the_table :: proc(t: ^testing.T) {
+	r: Resident
+	opts := Options{max_entries = 1_000_000, max_ttl = 3600}
+	c := make_cache(opts, resident_allocator(&r))
+	defer destroy(c)
+
+	kb: [KEY_MAX]u8
+	for i in 0 ..< 20_000 {
+		name := fmt.tprintf("n%d.example.", i)
+		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
+		put(c, key_for(kb[:], name), wire, msg)
+		if i % 1000 == 0 {
+			free_all(context.temp_allocator)
+		}
+	}
+	free_all(context.temp_allocator)
+	full := r.held
+
+	opts.max_entries = 10
+	reconfigure(c, opts)
+	testing.expect_value(t, len_entries(c), 10)
+	testing.expectf(t, r.held <= 16 * 1024, "%d bytes held for 10 entries, %d before", r.held, full)
+	testing.expectf(
+		t,
+		abs(r.held - size_of(Cache) - 64 - bytes_used(c)) <= 256,
+		"the cache counts %d bytes and holds %d",
+		bytes_used(c),
+		r.held,
+	)
+}
+
+// A cache that stops being queried gives back the table along with the entries.
+@(test)
+test_sweep_shrinks_the_table :: proc(t: ^testing.T) {
+	r: Resident
+	c := make_cache(Options{max_entries = 1_000_000, max_ttl = 3600}, resident_allocator(&r))
+	defer destroy(c)
+
+	kb: [KEY_MAX]u8
+	for i in 0 ..< 20_000 {
+		name := fmt.tprintf("n%d.example.", i)
+		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
+		put(c, key_for(kb[:], name), wire, msg)
+		if i % 1000 == 0 {
+			free_all(context.temp_allocator)
+		}
+	}
+	free_all(context.temp_allocator)
+
+	gone := loop.moment_add(loop.moment_now(), -time.Second)
+	for _, e in c.entries {
+		e.expires = gone
+	}
+	testing.expect_value(t, sweep(c), 20_000)
+	testing.expectf(t, r.held <= 4096, "an emptied cache holds %d bytes", r.held)
+}
+
+/*
+The table an insert grows is charged to the budget, so an entry that only just
+fits can tip the total over with its slot. What gets evicted for that is
+something else: `put` reports the entry stored, and it is.
+*/
+@(test)
+test_put_keeps_the_entry_its_table_tipped_over :: proc(t: ^testing.T) {
+	kb: [KEY_MAX]u8
+	wire, msg := build_nxdomain("tipped.example.", 300, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	key := key_for(kb[:], "tipped.example.")
+
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600})
+	defer destroy(c)
+	testing.expect(t, put(c, key, wire, msg), "the answer was refused with the default budget")
+	size := c.bytes
+
+	// Room for the entry and none for the table.
+	clear_all(c)
+	sync.atomic_store(&c.max_bytes, size)
+	testing.expect(t, put(c, key, wire, msg), "an entry that fits was refused")
+	testing.expect_value(t, len_entries(c), 1)
+	testing.expectf(t, bytes_used(c) > size, "the table is not counted: %d for an entry of %d", bytes_used(c), size)
+	_, _, ok := get(c, key, context.temp_allocator)
+	testing.expect(t, ok, "put reported an entry stored that it had evicted")
+}

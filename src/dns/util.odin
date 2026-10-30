@@ -337,6 +337,11 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 			return nil, false
 		}
 	}
+	// The OPT record's slot given back, so the block is what the slice says it
+	// is: the cache charges an entry by its length (issue #531).
+	if len(out) < cap(out) {
+		shrink(&out)
+	}
 	return out[:], true
 }
 
