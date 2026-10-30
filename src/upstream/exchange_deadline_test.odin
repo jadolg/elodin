@@ -36,15 +36,16 @@ nothing to end with but a timeout (issue #555).
 */
 @(private = "file")
 Truncating_Mock :: struct {
-	udp:         net.UDP_Socket,
-	listener:    net.TCP_Socket,
-	u:           ^Upstream,
-	stop:        bool,
-	udp_seen:    time.Tick,
-	udp_queries: int,
+	udp:      net.UDP_Socket,
+	listener: net.TCP_Socket,
+	u:        ^Upstream,
+	stop:     bool,
+	udp_seen: time.Tick,
 	// Zero until the retry's query was read and its waiter found.
-	parked:      time.Tick,
-	retried:     bool,
+	parked:   time.Tick,
+	// Posted once `parked` is written, so the test reads it after the mock is
+	// done with it rather than racing a mock thread that ran late.
+	scanned:  sync.Sema,
 }
 
 @(private = "file")
@@ -58,10 +59,9 @@ truncating_udp_loop :: proc(m: ^Truncating_Mock) {
 		if err != nil || n < dns.HEADER_SIZE {
 			continue
 		}
-		if m.udp_queries == 0 {
+		if m.udp_seen == {} {
 			m.udp_seen = time.tick_now()
 		}
-		m.udp_queries += 1
 		time.sleep(TC_DELAY)
 		buf[2] |= 0x80 | 0x02 // QR, TC
 		_, _ = net.send_udp(m.udp, buf[:n], client)
@@ -96,7 +96,7 @@ truncating_tcp_once :: proc(m: ^Truncating_Mock) {
 		}
 		sync.mutex_unlock(&c.mu)
 	}
-	sync.atomic_store(&m.retried, true)
+	sync.sema_post(&m.scanned)
 	// Open and silent: a closed connection would end the retry early.
 	for !sync.atomic_load(&m.stop) {
 		time.sleep(10 * time.Millisecond)
@@ -158,15 +158,19 @@ test_a_truncated_replys_tcp_retry_shares_the_exchange_timeout :: proc(t: ^testin
 	resp, xerr := exchange(u, wire, X_TIMEOUT, context.temp_allocator)
 
 	testing.expectf(t, xerr == .Timeout, "the retry ended %v, where nothing answers it (%d bytes)", xerr, len(resp))
-	if !testing.expect(t, sync.atomic_load(&m.retried), "the truncated reply was not retried over TCP") {
+	// `udp_seen` was written before the TC went out, so before the exchange
+	// returned; `parked` is read only once the mock says it is written.
+	if !testing.expect(t, sync.sema_wait_with_timeout(&m.scanned, 10 * X_TIMEOUT), "the truncated reply was not retried over TCP") {
 		return
 	}
-	// Read after the exchange returned, so after the mock threads wrote them.
+	if !testing.expect(t, m.parked != {}, "the retry's waiter was gone before the mock could read its deadline") {
+		return
+	}
 	earliest := time.tick_add(before, X_TIMEOUT)
 	latest := time.tick_add(m.udp_seen, X_TIMEOUT)
 	testing.expectf(
 		t,
-		m.parked != {} && time.tick_diff(earliest, m.parked) >= 0 && time.tick_diff(m.parked, latest) >= 0,
+		time.tick_diff(earliest, m.parked) >= 0 && time.tick_diff(m.parked, latest) >= 0,
 		"the retry waited until %v after the exchange began, where its deadline is %v after it",
 		time.tick_diff(before, m.parked),
 		X_TIMEOUT,
