@@ -56,9 +56,10 @@ test_upstream_durations_are_measured_on_the_tick_clock :: proc(t: ^testing.T) {
 	// Taken as the reader's, so the waiter leaving hands the reading to nobody.
 	c.reading = true
 	w := Pipe_Waiter {
-		done = true,
+		done     = true,
+		deadline = time.tick_now(),
 	}
-	_ = pipe_wait(c, &w, 1, time.tick_now())
+	_ = pipe_wait(c, &w, 1)
 	after := time.tick_now()
 
 	if testing.expect_value(t, len(u.idle), 1) {
