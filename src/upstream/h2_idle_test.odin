@@ -205,7 +205,7 @@ test_close_idle_keeps_only_fresh_pooled_conns :: proc(t: ^testing.T) {
 	put_idle(f.u, Idle_Conn{socket = stale})
 	put_idle(f.u, Idle_Conn{socket = fresh})
 	sync.mutex_lock(&f.u.mu)
-	f.u.idle[0].since = time.tick_add(f.u.idle[0].since, -2 * f.u.idle_timeout)
+	f.u.idle[0].since = moment_add(f.u.idle[0].since, -2 * f.u.idle_timeout)
 	sync.mutex_unlock(&f.u.mu)
 
 	testing.expect_value(t, close_idle(f.u), 1)

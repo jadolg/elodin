@@ -998,7 +998,7 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	// returning the cached address.
 	sync.mutex_lock(&bootstrap_cache.mu)
 	entry := bootstrap_cache.entries[HOST]
-	entry.expires = time.tick_add(time.tick_now(), -time.Minute)
+	entry.expires = moment_add(moment_now(), -time.Minute)
 	bootstrap_cache.entries[HOST] = entry
 	sync.mutex_unlock(&bootstrap_cache.mu)
 
@@ -1019,7 +1019,7 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	// place. Checked here because this test owns the package-global cache.
 	bootstrap_forget()
 	sync.mutex_lock(&bootstrap_cache.mu)
-	forgotten := time.tick_since(bootstrap_cache.entries[HOST].expires) >= 0
+	forgotten := moment_since(bootstrap_cache.entries[HOST].expires) >= 0
 	sync.mutex_unlock(&bootstrap_cache.mu)
 	testing.expect(t, forgotten, "a forgotten entry would still be served")
 	_, ok3 := bootstrap_resolve(servers, HOST)
@@ -2449,7 +2449,7 @@ test_the_sweep_leaves_a_parked_upstream_alone :: proc(t: ^testing.T) {
 	}
 
 	good.failures = FAILURE_THRESHOLD
-	good.down_until = time.tick_add(time.tick_now(), COOLDOWN)
+	good.down_until = moment_add(moment_now(), COOLDOWN)
 
 	servers := make([]^Upstream, 2, context.allocator)
 	defer delete(servers, context.allocator)

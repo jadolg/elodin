@@ -26,8 +26,8 @@ BOOTSTRAP_TIMEOUT :: 3 * time.Second
 @(private)
 Bootstrap_Entry :: struct {
 	address: net.Address,
-	// On the tick clock, for the reason `Idle_Conn.since` gives.
-	expires: time.Tick,
+	// A `Moment`, for the reason `Idle_Conn.since` gives.
+	expires: Moment,
 }
 
 @(private)
@@ -62,7 +62,7 @@ bootstrap_resolve :: proc(
 
 	sync.mutex_lock(&bootstrap_cache.mu)
 	if entry, found := bootstrap_cache.entries[hostname]; found {
-		if time.tick_since(entry.expires) < 0 {
+		if moment_since(entry.expires) < 0 {
 			sync.mutex_unlock(&bootstrap_cache.mu)
 			return entry.address, true
 		}
@@ -106,7 +106,7 @@ bootstrap_resolve :: proc(
 			}
 			entry := Bootstrap_Entry {
 				address = result,
-				expires = time.tick_add(time.tick_now(), BOOTSTRAP_TTL),
+				expires = moment_add(moment_now(), BOOTSTRAP_TTL),
 			}
 			sync.mutex_lock(&bootstrap_cache.mu)
 			if bootstrap_cache.entries == nil {
