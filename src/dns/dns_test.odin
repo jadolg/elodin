@@ -368,6 +368,21 @@ test_scan_ttl_offsets_releases_on_bad_name :: proc(t: ^testing.T) {
 	}
 }
 
+// One A record and an OPT, in the temp allocator.
+@(private = "file")
+a_reply_with_opt :: proc(t: ^testing.T) -> []u8 {
+	m := Message {
+		id         = 9,
+		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
+		answer     = []Record{{name = "example.com.", type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {1, 2, 3, 4}}}},
+		additional = []Record{make_opt(1232, false)},
+	}
+	m.flags.qr = true
+	wire, _, err := encode_message(m, context.temp_allocator)
+	testing.expect_value(t, err, Encode_Error.None)
+	return wire
+}
+
 /*
 The list `scan_ttl_offsets` returns is the whole of its block. The cache charges
 an entry by the list's length (issue #531), and the block is sized for every
@@ -379,16 +394,8 @@ test_scan_ttl_offsets_returns_no_slack :: proc(t: ^testing.T) {
 	mem.tracking_allocator_init(&track, context.allocator)
 	defer mem.tracking_allocator_destroy(&track)
 
-	m := Message {
-		id         = 9,
-		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
-		answer     = []Record{{name = "example.com.", type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {1, 2, 3, 4}}}},
-		additional = []Record{make_opt(1232, false)},
-	}
-	m.flags.qr = true
-	wire, _, err := encode_message(m, context.temp_allocator)
+	wire := a_reply_with_opt(t)
 	defer free_all(context.temp_allocator)
-	testing.expect_value(t, err, Encode_Error.None)
 
 	offsets, ok := scan_ttl_offsets(wire, mem.tracking_allocator(&track))
 	testing.expect(t, ok, "ttl scan failed")
@@ -429,16 +436,8 @@ test_scan_ttl_offsets_keeps_its_list_when_the_copy_fails :: proc(t: ^testing.T) 
 		return runtime.heap_allocator_proc(nil, mode, size, alignment, old_memory, old_size, loc)
 	}
 
-	m := Message {
-		id         = 9,
-		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
-		answer     = []Record{{name = "example.com.", type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {1, 2, 3, 4}}}},
-		additional = []Record{make_opt(1232, false)},
-	}
-	m.flags.qr = true
-	wire, _, err := encode_message(m, context.temp_allocator)
+	wire := a_reply_with_opt(t)
 	defer free_all(context.temp_allocator)
-	testing.expect_value(t, err, Encode_Error.None)
 
 	state: Second_Fails
 	failing := mem.Allocator{procedure = second_fails, data = &state}

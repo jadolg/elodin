@@ -173,8 +173,8 @@ test_sweep_shrinks_the_table :: proc(t: ^testing.T) {
 }
 
 /*
-The table an insert grows is charged to the budget, so an entry that only just
-fits can tip the total over with its slot. What gets evicted for that is
+The table is charged to the budget, so an entry that only just fits can tip the
+total over with the table it is indexed in. What gets evicted for that is
 something else: `put` reports the entry stored, and it is.
 */
 @(test)
@@ -253,4 +253,53 @@ test_clear_all_shrinks_the_table :: proc(t: ^testing.T) {
 	fill(c, 20_000)
 	clear_all(c)
 	testing.expectf(t, r.held <= 4096, "a cleared cache holds %d bytes", r.held)
+}
+
+/*
+A reload that lowers `max_bytes` below the table the old budget grew keeps what
+the new budget holds. Evicting against the table at its peak would empty the
+cache for room that shrinking the table gives back.
+*/
+@(test)
+test_reconfigure_to_a_smaller_budget_keeps_what_fits :: proc(t: ^testing.T) {
+	BUDGET :: 1024 * 1024
+	opts := Options{max_entries = 1_000_000, max_bytes = 8 * BUDGET, max_ttl = 3600}
+	c := make_cache(opts)
+	defer destroy(c)
+
+	fill(c, 40_000, edns = true)
+	testing.expectf(t, table_bytes(c) >= BUDGET, "the premise: a table of %d bytes", table_bytes(c))
+
+	opts.max_bytes = BUDGET
+	reconfigure(c, opts)
+	used := bytes_used(c)
+	testing.expectf(t, used <= BUDGET && used >= BUDGET * 3 / 4, "%d bytes kept of a %d byte budget, %d entries", used, BUDGET, len_entries(c))
+}
+
+/*
+A reload gives back a table its entries have already left, when it has nothing
+to evict. Here `get` dropped them on meeting them expired, so neither a sweep
+nor an eviction has looked at the table since.
+*/
+@(test)
+test_reconfigure_shrinks_a_table_with_nothing_to_evict :: proc(t: ^testing.T) {
+	opts := Options{max_entries = 1_000_000, max_ttl = 3600}
+	c := make_cache(opts)
+	defer destroy(c)
+
+	fill(c, 3000)
+	full := cap(c.entries)
+	kb: [KEY_MAX]u8
+	gone := loop.moment_add(loop.moment_now(), -time.Second)
+	for i in 0 ..< 2900 {
+		key := key_for(kb[:], fmt.tprintf("n%d.example.", i))
+		c.entries[key].expires = gone
+		_, _, _ = get(c, key, context.temp_allocator)
+		free_all(context.temp_allocator)
+	}
+	testing.expect_value(t, cap(c.entries), full)
+
+	reconfigure(c, opts)
+	testing.expect_value(t, len_entries(c), 100)
+	testing.expectf(t, cap(c.entries) < full, "a reload left %d slots for %d entries", cap(c.entries), len(c.entries))
 }

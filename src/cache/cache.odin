@@ -1311,11 +1311,15 @@ thing in both directions.
 // The caller holds `c.mu`.
 @(private)
 evict_over_limits :: proc(c: ^Cache, keep: ^Entry = nil) {
-	// Fixed for the loop: removing a key never resizes the table.
 	table := table_bytes(c)
 	for (len(c.entries) > c.max_entries || c.bytes + table > c.max_bytes) && c.tail != nil && c.tail != keep {
 		remove_entry(c, c.tail)
 		c.stats.evictions += 1
+		// Removing a key never resizes the table, so it is charged at its peak
+		// until it is shrunk. A reload that lowers `max_bytes` below the table
+		// the old budget grew would otherwise evict every entry to pay for it.
+		shrink_table(c)
+		table = table_bytes(c)
 	}
 }
 
@@ -1324,7 +1328,7 @@ Give back what the table grew to hold entries that have since gone.
 
 A map only ever grows on insert, so without this a cache that filled once would
 keep the table for its peak for the life of the process. Called where many
-entries can go at once: a sweep, a reload.
+entries can go at once: a sweep, a reload, an eviction that drains it.
 
 Only once the table is under a quarter full. Odin would halve it below three
 eighths, and that is where a table at the byte budget sits after the doubling
