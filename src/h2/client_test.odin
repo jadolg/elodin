@@ -720,13 +720,13 @@ test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^te
 		elapsed: time.Duration,
 	}
 	wait_for_a :: proc(w: ^Waiter) {
-		started := time.now()
+		started := time.tick_now()
 		_, w.err = client_request(
 			w.c,
 			Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
 			4 * time.Second,
 		)
-		w.elapsed = time.diff(started, time.now())
+		w.elapsed = time.tick_since(started)
 	}
 	w := Waiter{c = c}
 	a := thread.create_and_start_with_poly_data(&w, wait_for_a)
@@ -904,13 +904,13 @@ test_client_request_times_out_on_silence :: proc(t: ^testing.T) {
 		client_unref(c)
 	}
 
-	started := time.now()
+	started := time.tick_now()
 	_, err := client_request(
 		c,
 		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
 		200 * time.Millisecond,
 	)
-	elapsed := time.diff(started, time.now())
+	elapsed := time.tick_since(started)
 	testing.expect_value(t, err, Client_Error.Timeout)
 	testing.expect(t, elapsed < time.Second, "the request took far longer than its own timeout")
 	free_all(context.temp_allocator)

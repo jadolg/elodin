@@ -1019,7 +1019,7 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	// place. Checked here because this test owns the package-global cache.
 	bootstrap_forget()
 	sync.mutex_lock(&bootstrap_cache.mu)
-	forgotten := time.tick_diff(bootstrap_cache.entries[HOST].expires, time.tick_now()) >= 0
+	forgotten := time.tick_since(bootstrap_cache.entries[HOST].expires) >= 0
 	sync.mutex_unlock(&bootstrap_cache.mu)
 	testing.expect(t, forgotten, "a forgotten entry would still be served")
 	_, ok3 := bootstrap_resolve(servers, HOST)

@@ -795,9 +795,9 @@ test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testin
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
 
-	started := time.now()
+	started := time.tick_now()
 	resp, winner, err := resolve_readable(&g, wire, context.allocator)
-	spent := time.since(started)
+	spent := time.tick_since(started)
 
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, winner, ref)
@@ -1013,9 +1013,9 @@ test_the_sweep_spends_one_timeout_on_the_members_it_has_left :: proc(t: ^testing
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
 
-	started := time.now()
+	started := time.tick_now()
 	resp, winner, err := resolve_readable(&g, wire, context.allocator)
-	spent := time.since(started)
+	spent := time.tick_since(started)
 
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, winner, ref)
@@ -1296,9 +1296,9 @@ test_the_budget_counts_a_slow_refusal_as_time_spent :: proc(t: ^testing.T) {
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
 
-	begin := time.now()
+	begin := time.tick_now()
 	resp, winner, err := resolve_readable(&g, wire, context.allocator)
-	spent := time.since(begin)
+	spent := time.tick_since(begin)
 
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, winner, ref)

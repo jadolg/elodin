@@ -571,13 +571,13 @@ test_a_caller_that_gives_up_hands_on_the_reading :: proc(t: ^testing.T) {
 	}
 	first := thread.create_and_start_with_poly_data(&quitter, pipe_leg)
 	time.sleep(50 * time.Millisecond)
-	start := time.now()
+	start := time.tick_now()
 	second := thread.create_and_start_with_poly_data(&patient, pipe_leg)
 	for th in ([]^thread.Thread{first, second}) {
 		thread.join(th)
 		thread.destroy(th)
 	}
-	took := time.diff(start, time.now())
+	took := time.tick_since(start)
 
 	testing.expectf(t, quitter.err == .Timeout, "the impatient caller ended as %v, expected a timeout", quitter.err)
 	testing.expectf(t, patient.err == .None, "the patient caller failed: %v", patient.err)
@@ -875,7 +875,7 @@ split_mock_loop :: proc(m: ^Split_Mock) {
 	}
 	defer delete(second)
 
-	start := time.now()
+	start := time.tick_now()
 	time.sleep(m.prefix_at)
 	prefix := [2]u8{u8(len(second) >> 8), u8(len(second))}
 	early := prefix[:1] if m.split_prefix else prefix[:]
@@ -884,7 +884,7 @@ split_mock_loop :: proc(m: ^Split_Mock) {
 	}
 	// Measured from the start so the gap is the one configured rather than the
 	// sum of two sleeps.
-	time.sleep(m.body_at - time.diff(start, time.now()))
+	time.sleep(m.body_at - time.tick_since(start))
 	if m.split_prefix {
 		if write_all_tcp(client, prefix[1:]) != .None {
 			return
@@ -1183,7 +1183,7 @@ test_waiting_for_a_dial_is_bounded_by_the_callers_own_timeout :: proc(t: ^testin
 
 	legs: [LEGS]Pipe_Leg
 	threads: [LEGS]^thread.Thread
-	start := time.now()
+	start := time.tick_now()
 	for i in 0 ..< LEGS {
 		legs[i] = Pipe_Leg {
 			u       = u,
@@ -1197,7 +1197,7 @@ test_waiting_for_a_dial_is_bounded_by_the_callers_own_timeout :: proc(t: ^testin
 		thread.join(th)
 		thread.destroy(th)
 	}
-	took := time.diff(start, time.now())
+	took := time.tick_since(start)
 
 	for leg, i in legs {
 		testing.expectf(t, leg.err != .None, "leg %d was answered by a responder that never speaks", i)
@@ -1329,11 +1329,11 @@ test_one_send_costs_one_timeout :: proc(t: ^testing.T) {
 		id      = 0xaaaa,
 		timeout = BUDGET,
 	}
-	start := time.now()
+	start := time.tick_now()
 	second := thread.create_and_start_with_poly_data(&quiet, pipe_leg)
 	thread.join(second)
 	thread.destroy(second)
-	took := time.diff(start, time.now())
+	took := time.tick_since(start)
 
 	testing.expectf(t, quiet.err == .Timeout, "the query to the quiet connection ended as %v", quiet.err)
 	testing.expectf(
@@ -1531,11 +1531,11 @@ test_a_half_read_message_gets_one_budget :: proc(t: ^testing.T) {
 		id      = 0xcccc,
 		timeout = BUDGET,
 	}
-	start := time.now()
+	start := time.tick_now()
 	th := thread.create_and_start_with_poly_data(&stalled, pipe_leg)
 	thread.join(th)
 	thread.destroy(th)
-	took := time.diff(start, time.now())
+	took := time.tick_since(start)
 
 	testing.expectf(t, stalled.err != .None, "a message that never arrived was answered")
 	testing.expectf(
@@ -1638,11 +1638,11 @@ test_a_late_reader_overruns_by_the_grace_not_the_timeout :: proc(t: ^testing.T) 
 		id      = 0xeeee,
 		timeout = BUDGET,
 	}
-	start := time.now()
+	start := time.tick_now()
 	th := thread.create_and_start_with_poly_data(&late, pipe_leg)
 	thread.join(th)
 	thread.destroy(th)
-	took := time.diff(start, time.now())
+	took := time.tick_since(start)
 
 	testing.expectf(t, late.err != .None, "a message that never arrived was answered")
 	testing.expectf(
