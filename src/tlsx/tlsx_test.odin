@@ -1502,9 +1502,11 @@ test_ticket_keys_rotate_and_old_tickets_stop_resuming :: proc(t: ^testing.T) {
 			rounds   = 4,
 		}
 		worker := thread.create_and_start_with_poly_data(&srv, resume_server_worker)
-		defer thread.join(worker)
 		defer thread.destroy(worker)
-		start := time.tick_now()
+		// Runs before the join: a client that never dialled would otherwise
+		// leave the worker in accept, and the test hung rather than failed.
+		defer posix.shutdown(posix.FD(net.Socket(listener)), .RDWR)
+		start := ticket_now()
 
 		_, first, ok := resume_client(t, cctx.ptr, ep, nil)
 		defer if first != nil {SSL_SESSION_free(first)}
@@ -1528,7 +1530,7 @@ test_ticket_keys_rotate_and_old_tickets_stop_resuming :: proc(t: ^testing.T) {
 		// No tick this time: the sealing key is made an interval old where it
 		// is, and the handshake itself must retire it before sealing.
 		sync.mutex_lock(&k.mu)
-		k.current.born = time.tick_add(time.tick_now(), -TICKET_KEY_INTERVAL)
+		k.current.born = time.tick_add(ticket_now(), -TICKET_KEY_INTERVAL)
 		stale := k.current.name
 		sync.mutex_unlock(&k.mu)
 		_, third, ok3 := resume_client(t, cctx.ptr, ep, nil)
@@ -1548,7 +1550,7 @@ test_ticket_keys_advance_on_their_interval :: proc(t: ^testing.T) {
 	plain := SSL_CTX_new(TLS_server_method())
 	testing.expectf(t, SSL_CTX_get_timeout(plain) == c.long(I / time.Second), "OpenSSL's default session timeout is %ds", SSL_CTX_get_timeout(plain))
 	SSL_CTX_free(plain)
-	t0 := time.tick_now()
+	t0 := ticket_now()
 	k: Ticket_Keys
 	advance_ticket_keys(&k, t0)
 	testing.expect(t, k.current.live && !k.previous.live, "no sealing key was drawn")

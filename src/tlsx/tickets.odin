@@ -3,6 +3,7 @@ package tlsx
 import "core:c"
 import "core:c/libc"
 import "core:sync"
+import "core:sys/linux"
 import "core:time"
 
 /*
@@ -25,6 +26,17 @@ resumed from it. TLS 1.3 resumption here always runs a fresh (EC)DHE exchange
 data), so a stolen key opens tickets but not the traffic after them.
 */
 TICKET_KEY_INTERVAL :: 2 * time.Hour
+
+/*
+The clock a key's age is measured on: CLOCK_BOOTTIME, which counts the time a
+host spends suspended or a VM spends paused. `time.tick_now` reads
+CLOCK_MONOTONIC_RAW, which stops while suspended, so a key would outlive its two
+intervals by the length of every pause.
+*/
+ticket_now :: proc "contextless" () -> time.Tick {
+	ts, _ := linux.clock_gettime(.BOOTTIME)
+	return time.Tick{_nsec = i64(ts.time_sec) * 1e9 + i64(ts.time_nsec)}
+}
 
 @(private)
 Ticket_Key :: struct {
@@ -124,7 +136,7 @@ install_ticket_keys :: proc(ptr: ^SSL_CTX) -> bool {
 	if k == nil {
 		return false
 	}
-	draw_ticket_key(&k.current, time.tick_now())
+	draw_ticket_key(&k.current, ticket_now())
 	if !k.current.live {
 		libc.free(k)
 		return false
@@ -147,7 +159,7 @@ ticket_keys_of :: proc "contextless" (ptr: ^SSL_CTX) -> ^Ticket_Keys {
 
 /*
 Rotate and erase a server context's ticket keys on schedule, as of `now`
-(`time.tick_now()` outside tests).
+(`ticket_now()` outside tests).
 
 For the maintenance tick, so a listener nobody connects to still erases its
 keys; the callback does the same on every ticket. Nothing on a client context.
@@ -169,10 +181,13 @@ rotate_ticket_keys :: proc(ctx: ^Context, now: time.Tick) {
 Seal or open one ticket.
 
 The key is copied out under the lock and erased from the stack after use, so the
-lock is held for a copy and never across OpenSSL. A ticket under the retired key
-is opened and answered with 2, which has OpenSSL issue a fresh one under the
-current key, so a client resuming at least once an interval keeps resuming. Any
-failure answers 0: no ticket sealed, or a full handshake for the one offered.
+lock is held for the copy and, once an interval, a fresh key's draw, and never
+across the cipher and MAC setup. A ticket under the retired key is opened and
+answered with 2, which has OpenSSL issue a fresh one under the current key. The
+fresh ticket keeps the session's original time, so it does not extend the
+session: a session resumes for one interval from its full handshake, in TLS 1.2
+and 1.3 alike. Any failure answers 0: no ticket sealed, or a full handshake for
+the one offered.
 */
 @(private)
 ticket_key_cb :: proc "c" (
@@ -192,7 +207,7 @@ ticket_key_cb :: proc "c" (
 	defer erase_ticket_key(&key)
 	renew := false
 	sync.mutex_lock(&k.mu)
-	advance_ticket_keys(k, time.tick_now())
+	advance_ticket_keys(k, ticket_now())
 	if enc == 1 {
 		key = k.current
 	} else {

@@ -1626,8 +1626,10 @@ Rotate the DoT and DoH session-ticket keys on schedule (see
 `tlsx.TICKET_KEY_INTERVAL`), as of `now`.
 
 From the maintenance tick, so a listener nobody connects to still erases a key
-two intervals old; a handshake rotates them as well. Under the shared lock, so
-the reload cannot free a context while its keys are being rotated.
+two intervals old; a handshake rotates them as well. The tick and `reload_tls`
+share the maintenance thread, so nothing frees a context under this today; the
+shared lock is the one every reader of the two slots takes, and keeps that true
+wherever the call moves.
 */
 rotate_ticket_keys :: proc(l: ^Listeners, now: time.Tick) {
 	sync.rw_mutex_shared_lock(&l.tls_mu)
