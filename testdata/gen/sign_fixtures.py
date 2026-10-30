@@ -1629,7 +1629,7 @@ def lapsed_signatures():
     #   www.cn.lt.          a DS question answered by a CNAME the parent signed
     #                       in the future, beside a denial whose current
     #                       signature fails: code 6
-    dsx, dkx, lt, wl, wm = lapse_zones()
+    lt, wl, wm = lapse_zones()
     nsec, lt_soa = lapse_lt(lt)
     wild_nsec, wl_soa = lapse_wl(wl)
     lapse_pair(lt)
@@ -1663,7 +1663,7 @@ def lapse_zones():
     for tag, zone in (("dsx", dsx), ("dkx", dkx)):
         www = [a_rr("www." + zone.zone, "192.0.2.1")]
         emit("lp_%s_www" % tag, "www." + zone.zone, "A", message("www." + zone.zone, A, www + [sign(www, zone)]))
-    return dsx, dkx, lt, wl, wm
+    return lt, wl, wm
 
 
 def lapse_lt(lt):
