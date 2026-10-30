@@ -849,13 +849,13 @@ pipe_query :: proc(
 		sync.mutex_unlock(&c.mu)
 		return nil, .IO_Error
 	}
-	if !pipe_admit(c, &w, id, time.tick_diff(time.tick_now(), deadline)) {
+	w.asked = time.tick_now()
+	if !pipe_admit(c, &w, id, time.tick_diff(w.asked, deadline)) {
 		sync.mutex_unlock(&c.mu)
 		return nil, .Backlogged
 	}
 	dns.set_id_in_place(asked, id)
 	w.seen = c.replies
-	w.asked = time.tick_now()
 	c.waiters[id] = &w
 	sync.mutex_unlock(&c.mu)
 
@@ -1153,11 +1153,7 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 	// answer its query is sampled but sets no floor: a server answering the
 	// wrong question quickly says nothing about how fast it answers the right
 	// one.
-	waited := c.timeout
-	if waiting {
-		waited = time.tick_since(w.asked)
-	}
-	pipe_note_wait(c, waited, matches)
+	pipe_note_wait(c, time.tick_since(w.asked) if waiting else c.timeout, matches)
 	if !waiting {
 		// Nobody is on this ID: an answer to a query that has already given
 		// up, or one nobody asked. Dropped rather than treated as a failure -
