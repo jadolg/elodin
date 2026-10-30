@@ -71,10 +71,10 @@ bootstrap_resolve :: proc(
 		return literal, true
 	}
 
-	sync.mutex_lock(&bootstrap_cache.mu)
 	// Keyed by the canonical name, which is the name asked: `Hop.example` and
 	// `hop.example.` are one entry, not two of `BOOTSTRAP_MAX_ENTRIES`.
 	key := dns.name_canonical(hostname, context.temp_allocator)
+	sync.mutex_lock(&bootstrap_cache.mu)
 	if entry, found := bootstrap_cache.entries[key]; found {
 		if loop.moment_since(entry.expires) < 0 {
 			sync.mutex_unlock(&bootstrap_cache.mu)
@@ -131,7 +131,7 @@ bootstrap_resolve :: proc(
 			// entry is refreshed.
 			if key in bootstrap_cache.entries {
 				bootstrap_cache.entries[key] = entry
-			} else if bootstrap_prune(); len(bootstrap_cache.entries) < BOOTSTRAP_MAX_ENTRIES {
+			} else {
 				/*
 				A new key sweeps out the expired ones first, so the map holds
 				only what was resolved within the last `BOOTSTRAP_TTL` (#530).
@@ -139,7 +139,10 @@ bootstrap_resolve :: proc(
 				redirect a blocklist download follows is resolved here, under
 				names the list host picks.
 				*/
-				bootstrap_cache.entries[strings.clone(key, bootstrap_cache.entries.allocator)] = entry
+				bootstrap_prune()
+				if len(bootstrap_cache.entries) < BOOTSTRAP_MAX_ENTRIES {
+					bootstrap_cache.entries[strings.clone(key, bootstrap_cache.entries.allocator)] = entry
+				}
 			}
 			sync.mutex_unlock(&bootstrap_cache.mu)
 			return result, true
