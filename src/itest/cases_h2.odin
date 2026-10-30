@@ -517,9 +517,23 @@ run_h2_cases :: proc(r: ^Runner) {
 		if check(r, cok, "cannot open an h2 connection") {
 			defer h2_close(c)
 			check(r, h2_send_request(c, 1, "PUT", "/dns-query", query), "cannot send")
-			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
+			check(r, h2_send_request(c, 3, "PUT", "/apple-doh.mobileconfig", nil), "cannot send")
+			check(r, h2_send_request(c, 5, "HEAD", "/dns-query", nil), "cannot send")
+			if check(r, h2_collect(c, []u32{1, 3, 5}), "a stream never completed") {
+				// RFC 9110 15.5.6: a 405 MUST carry Allow.
 				res, _ := h2_stream(c, 1)
 				check_eq_int(r, res.status, 405, "status")
+				check_eq_str(r, h2_header_value(res, "allow"), "GET, POST", "allow")
+				res, _ = h2_stream(c, 3)
+				check_eq_int(r, res.status, 405, "profile status")
+				check_eq_str(r, h2_header_value(res, "allow"), "GET", "profile allow")
+				// RFC 9110 9.3.2: a reply to HEAD carries no content.
+				res, _ = h2_stream(c, 5)
+				check_eq_int(r, res.status, 405, "HEAD status")
+				check_eq_int(r, res.data_frames, 0, "DATA frames on the HEAD reply")
+				// RFC 9110 8.6: no content-length unless it is what GET would send.
+				check_eq_str(r, h2_header_value(res, "content-length"), "", "content-length on the HEAD reply")
+				check_eq_str(r, h2_header_value(res, "allow"), "GET, POST", "allow on the HEAD reply")
 			}
 		}
 	}

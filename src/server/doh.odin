@@ -24,6 +24,8 @@ refused rather than upgraded.
 */
 
 DOH_CONTENT_TYPE :: "application/dns-message"
+// The Allow of a 405 (RFC 9110 15.5.6): RFC 8484 4.1 defines GET and POST.
+DOH_METHODS :: "GET, POST"
 MAX_HEADER_BYTES :: 16 * 1024
 // RFC 8484 6: application/dns-message is at most 65535 bytes.
 MAX_DOH_BODY :: dns.MAX_MESSAGE
@@ -287,6 +289,9 @@ answering, and drains what the client had already sent before it does, so that
 the answer is not lost to the RST that closing on unread bytes would send - see
 `http_linger`.
 
+A refusal after the request line is read hands back the method alone, so that
+the refusal to a HEAD can go without content (RFC 9110 9.3.2).
+
 Everything kept in the result but the body is copied out of the reader's buffer
 rather than pointed into it. `http_line` and `http_exact` return views, and every
 read after one of them may grow that buffer - which, past its capacity, means a
@@ -433,7 +438,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			// 400, as Host's is, rather than a media type picked for the check.
 			content_types += 1
 			if content_types > 1 {
-				return {}, 400, false
+				return {method = req.method}, 400, false
 			}
 			req.content_type = hold(value)
 		case dns.name_equal_fold(name, "host"):
@@ -447,12 +452,12 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			*/
 			hosts += 1
 			if hosts > 1 {
-				return {}, 400, false
+				return {method = req.method}, 400, false
 			}
 			// And an invalid one is a 400 too (RFC 9112 3.2): held to what a
 			// host may hold, as `:authority` is on HTTP/2 (#438).
 			if !h2.authority_is_valid(value) {
-				return {}, 400, false
+				return {method = req.method}, 400, false
 			}
 			req.host = hold(value)
 		case dns.name_equal_fold(name, "transfer-encoding"):
@@ -466,7 +471,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	// so an HTTP/1.1 request without one is a 400. HTTP/1.0 predates the field
 	// and is allowed to leave it out.
 	if hosts == 0 && !http_1_0 {
-		return {}, 400, false
+		return {method = req.method}, 400, false
 	}
 
 	if content_length > 0 {
@@ -559,7 +564,14 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 			// place. A `status` of 0 is a request that is not answered at all -
 			// see `read_http_request`.
 			if status != 0 {
-				_ = send_http_error(conn, "doh", status, http_refusal_message(status), false)
+				_ = send_http_error(
+					conn,
+					"doh",
+					status,
+					http_refusal_message(status),
+					false,
+					head = req.method == "HEAD",
+				)
 				// The refused request may have declared a body that was never read,
 				// and the close below would take the answer with it. That body may
 				// also still be arriving, which is what picks the longer of the two
@@ -644,14 +656,14 @@ serve_doh_request :: proc(
 	// a held connection's network leaves it in the same place. Closed after the
 	// answer, as the accept loop would have.
 	if !stream_source_allowed(s, conn.peer, .DoH) {
-		return send_http_error(conn, "doh", 403, "forbidden", false)
+		return send_http_error(conn, "doh", 403, "forbidden", false, head = req.method == "HEAD")
 	}
 	mc_path := startup_config(s).listeners.doh.mobileconfig_path
 	if mc_path != "" && req.path == mc_path {
 		return serve_doh_mobileconfig(s, conn, req)
 	}
 	if req.path != path {
-		return send_http_error(conn, "doh", 404, "not found", req.keep_alive)
+		return send_http_error(conn, "doh", 404, "not found", req.keep_alive, head = req.method == "HEAD")
 	}
 
 	query: []u8
@@ -672,7 +684,7 @@ serve_doh_request :: proc(
 		}
 		query = decoded
 	case:
-		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive)
+		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive, DOH_METHODS, req.method == "HEAD")
 	}
 
 	if len(query) < dns.HEADER_SIZE {
@@ -782,7 +794,15 @@ them about.
 @(private)
 serve_doh_mobileconfig :: proc(s: ^Server, conn: Conn, req: Http_Request_In) -> bool {
 	if req.method != "GET" {
-		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive)
+		return send_http_error(
+			conn,
+			"doh",
+			405,
+			"method not allowed",
+			req.keep_alive,
+			MOBILECONFIG_METHODS,
+			req.method == "HEAD",
+		)
 	}
 	// Cheap syntax first: a Host with a byte no authority may contain is turned
 	// away without the certificate being consulted about it.
@@ -982,21 +1002,42 @@ http_linger :: proc(conn: Conn, idle: time.Duration) {
 
 // `who` names the endpoint in the debug line. Both HTTP endpoints this server
 // has - DoH and the metrics one - refuse requests the same way, and a log line
-// that named only one of them would send an operator to the wrong port.
+// that named only one of them would send an operator to the wrong port. `allow`
+// is the target's methods, which RFC 9110 15.5.6 requires on a 405. A reply to
+// `head` is its fields alone (RFC 9112 6.3): text after them would be read as
+// the start of the next reply on the connection. It carries no Content-Length
+// either, which RFC 9110 8.6 allows only when it is what GET would have sent.
 @(private)
-send_http_error :: proc(conn: Conn, who: string, status: int, message: string, keep_alive: bool) -> bool {
+send_http_error :: proc(
+	conn: Conn,
+	who: string,
+	status: int,
+	message: string,
+	keep_alive: bool,
+	allow := "",
+	head := false,
+) -> bool {
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, "HTTP/1.1 ")
 	strings.write_int(&b, status)
 	strings.write_byte(&b, ' ')
 	strings.write_string(&b, message)
-	strings.write_string(&b, "\r\nContent-Type: text/plain\r\nContent-Length: ")
-	strings.write_int(&b, len(message) + 1)
+	strings.write_string(&b, "\r\nContent-Type: text/plain")
+	if !head {
+		strings.write_string(&b, "\r\nContent-Length: ")
+		strings.write_int(&b, len(message) + 1)
+	}
 	strings.write_string(&b, "\r\nConnection: ")
 	strings.write_string(&b, "keep-alive" if keep_alive else "close")
+	if allow != "" {
+		strings.write_string(&b, "\r\nAllow: ")
+		strings.write_string(&b, allow)
+	}
 	strings.write_string(&b, "\r\n\r\n")
-	strings.write_string(&b, message)
-	strings.write_byte(&b, '\n')
+	if !head {
+		strings.write_string(&b, message)
+		strings.write_byte(&b, '\n')
+	}
 
 	logx.debugf("%s: replying %d %s", who, status, message)
 	return conn_write_all(conn, transmute([]u8)strings.to_string(b)) && keep_alive

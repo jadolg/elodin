@@ -405,6 +405,7 @@ h2_answer :: proc(data: rawptr, pool := dnssec.Walk_Pool.Shared) {
 	if !ok {
 		return
 	}
+	resp.head = req.method == "HEAD"
 	// A body waits on the client's flow-control credit, up to the write timeout,
 	// parked: a client that stops reading holds this query in flight and its
 	// fiber, and nothing else.
@@ -514,7 +515,7 @@ build_h2_response :: proc(
 	// the message - and not again by `h2_charged` on the reader fiber.
 	message, status, why, is_query := h2_query_message(req)
 	if !is_query {
-		return h2_error(status, why), true
+		return h2_error(status, why, DOH_METHODS if status == 405 else ""), true
 	}
 
 	max_age: u32
@@ -553,7 +554,7 @@ profile is signed, and refused rather than served unsigned; see
 @(private)
 build_h2_mobileconfig :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Response, ok: bool) {
 	if req.method != "GET" {
-		return h2_error(405, "method not allowed"), true
+		return h2_error(405, "method not allowed", MOBILECONFIG_METHODS), true
 	}
 	if !valid_mobileconfig_host(req.authority) {
 		return h2_error(400, "missing or invalid :authority"), true
@@ -597,10 +598,10 @@ h2_cache_control :: proc(max_age: u32) -> string {
 }
 
 @(private)
-h2_error :: proc(status: int, message: string) -> h2.Response {
+h2_error :: proc(status: int, message: string, allow := "") -> h2.Response {
 	logx.debugf("doh/h2: replying %d %s", status, message)
 	body := make([]u8, len(message) + 1, context.temp_allocator)
 	copy(body, transmute([]u8)message)
 	body[len(message)] = '\n'
-	return h2.Response{status = status, content_type = "text/plain", body = body}
+	return h2.Response{status = status, content_type = "text/plain", allow = allow, body = body}
 }

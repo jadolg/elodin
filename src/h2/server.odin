@@ -67,6 +67,11 @@ Response :: struct {
 	status:        int,
 	content_type:  string,
 	cache_control: string,
+	// The methods the target supports, which RFC 9110 15.5.6 requires on a 405.
+	allow:         string,
+	// A reply to HEAD: no content (RFC 9110 9.3.2), and no content-length,
+	// which RFC 9110 8.6 allows only when it is what GET would have sent.
+	head:          bool,
 	body:          []u8,
 }
 
@@ -1649,6 +1654,10 @@ Safe to call from any thread. Blocks while the peer's flow-control window has no
 room, waking when a WINDOW_UPDATE arrives or the connection closes.
 */
 respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
+	resp := resp
+	if resp.head {
+		resp.body = nil
+	}
 	loop.lock(&c.mu)
 	s, found := c.streams[stream_id]
 	cancelled := found && s.cancelled
@@ -1670,7 +1679,12 @@ respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
 	if resp.cache_control != "" {
 		encode_header(&block, "cache-control", resp.cache_control)
 	}
-	encode_header(&block, "content-length", int_to_string(len(resp.body), context.temp_allocator))
+	if resp.allow != "" {
+		encode_header(&block, "allow", resp.allow)
+	}
+	if !resp.head {
+		encode_header(&block, "content-length", int_to_string(len(resp.body), context.temp_allocator))
+	}
 	encode_header(&block, "server", "elodin")
 
 	out := make([dynamic]u8, 0, len(block) + 32, context.temp_allocator)

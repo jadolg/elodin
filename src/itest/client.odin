@@ -641,22 +641,28 @@ parse_status_line :: proc(head: string) -> (status: int, ok: bool) {
 
 @(private)
 header_int :: proc(head: string, name: string) -> int {
+	v, ok := strconv.parse_int(header_value(head, name))
+	return v if ok else 0
+}
+
+// The first field called `name`, trimmed; "" when there is none.
+header_value :: proc(head: string, name: string) -> string {
 	rest := head
 	for {
 		idx := strings.index(rest, "\r\n")
 		if idx < 0 {
-			return 0
+			return ""
 		}
 		rest = rest[idx + 2:]
 		colon := strings.index_byte(rest, ':')
 		if colon < 0 {
-			return 0
+			return ""
 		}
-		if strings.equal_fold(rest[:colon], name) {
+		// ASCII case only: `strings.equal_fold` folds Unicode, where U+017F is an `s`.
+		if dns.name_equal_fold(rest[:colon], name) {
 			line_end := strings.index(rest, "\r\n")
 			value := rest[colon + 1:] if line_end < 0 else rest[colon + 1:line_end]
-			v, ok := strconv.parse_int(strings.trim_space(value))
-			return v if ok else 0
+			return strings.trim_space(value)
 		}
 	}
 }

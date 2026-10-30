@@ -167,12 +167,15 @@ run_metrics_cases :: proc(r: ^Runner) {
 					404,
 					"a request off the metrics path",
 				)
-				check_eq_int(
-					r,
-					http_request(metrics_port, "POST", "/metrics", context.temp_allocator).status,
-					405,
-					"a POST to the metrics path",
-				)
+				refused := http_request(metrics_port, "POST", "/metrics", context.temp_allocator)
+				check_eq_int(r, refused.status, 405, "a POST to the metrics path")
+				// RFC 9110 15.5.6: a 405 MUST carry Allow.
+				check_eq_str(r, header_value(refused.headers, "allow"), "GET, HEAD", "allow on the 405")
+				// RFC 9110 9.3.2 and 8.6: a refusal to HEAD has no content, and so no
+				// Content-Length that GET would not have sent.
+				missing := http_request(metrics_port, "HEAD", "/", context.temp_allocator)
+				check_eq_int(r, missing.status, 404, "a HEAD off the metrics path")
+				check_eq_str(r, header_value(missing.headers, "content-length"), "", "content-length on the 404 to HEAD")
 			}
 		}
 	}

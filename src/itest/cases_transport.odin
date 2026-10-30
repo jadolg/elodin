@@ -492,11 +492,26 @@ run_transport_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
-	start_case(r, "doh: unsupported method is 405")
+	// RFC 9110 15.5.6: the origin server MUST generate an Allow header field in
+	// a 405, and 10.2.1 makes it the methods the target supports.
+	start_case(r, "doh: unsupported method is 405 with Allow")
 	{
 		res := doh_raw(doh_port, "PUT /dns-query HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\n\r\n")
 		check(r, res.ok, "no HTTP response")
 		check_eq_int(r, res.status, 405, "status")
+		check_eq_str(r, header_value(res.headers, "allow"), "GET, POST", "allow")
+	}
+	end_case(r)
+
+	start_case(r, "doh: the Apple profile refuses a POST with Allow: GET")
+	{
+		res := doh_raw(
+			doh_port,
+			"POST /apple-doh.mobileconfig HTTP/1.1\r\nHost: elodin.local\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+		)
+		check(r, res.ok, "no HTTP response")
+		check_eq_int(r, res.status, 405, "status")
+		check_eq_str(r, header_value(res.headers, "allow"), "GET", "allow")
 	}
 	end_case(r)
 
