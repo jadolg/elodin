@@ -197,8 +197,9 @@ run_h2_cases :: proc(r: ^Runner) {
 	is served before the frame, so a refusal is the frame's and not a connection
 	that never worked; the accepted rows then serve stream 3, so a server that
 	refused too much fails them. A row refused by its preface's ENABLE_PUSH
-	sends nothing after it: a write to the connection the server has closed
-	draws a TCP reset, which discards the GOAWAY before it is read.
+	writes nothing after it, not even the SETTINGS ACK: a write to the
+	connection the server has closed draws a TCP reset, which can discard the
+	GOAWAY before it is read.
 	*/
 	H2_Probe :: enum {
 		None,
@@ -223,9 +224,14 @@ run_h2_cases :: proc(r: ^Runner) {
 		c, cok := h2_connect(doh_port, {enable_push = tc.push})
 		if check(r, cok, "cannot open an h2 connection") {
 			defer h2_close(c)
-			if !tc.refused || tc.probe != .None {
+			c.no_ack = tc.refused && tc.probe == .None
+			if !c.no_ack {
 				check(r, h2_send_request(c, 1, "POST", "/dns-query", query), "cannot send")
-				check(r, h2_collect(c, []u32{1}, 3 * time.Second), "stream 1 never completed")
+				// A reset counts as completed too, and is not being served.
+				if check(r, h2_collect(c, []u32{1}, 3 * time.Second), "stream 1 never completed") {
+					res, _ := h2_stream(c, 1)
+					check_eq_int(r, res.status, 200, "status of stream 1 before the frame")
+				}
 			}
 			switch tc.probe {
 			case .None:

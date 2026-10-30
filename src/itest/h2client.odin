@@ -44,6 +44,9 @@ H2_Client :: struct {
 	pings:       int,
 	goaway:      bool,
 	goaway_code: h2.Error_Code,
+	// Leaves the server's SETTINGS unacknowledged, for a connection the
+	// server is expected to close: the ACK would be a write into its reset.
+	no_ack:      bool,
 	allocator:   mem.Allocator,
 }
 
@@ -332,7 +335,7 @@ h2_result :: proc(c: ^H2_Client, stream_id: u32) -> ^H2_Stream_Result {
 h2_handle :: proc(c: ^H2_Client, header: h2.Frame_Header, payload: []u8) -> bool {
 	#partial switch header.type {
 	case .Settings:
-		if header.flags & h2.FLAG_ACK == 0 {
+		if header.flags & h2.FLAG_ACK == 0 && !c.no_ack {
 			out := make([dynamic]u8, 0, h2.FRAME_HEADER_SIZE, context.temp_allocator)
 			h2.write_frame_header(&out, 0, .Settings, h2.FLAG_ACK, 0)
 			return conn_write(&c.conn, out[:])
