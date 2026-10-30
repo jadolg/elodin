@@ -30,6 +30,8 @@ actually used.
 // What a device's profile installer expects; anything else and Safari offers to
 // download the file rather than open it as a profile.
 DOH_MOBILECONFIG_CONTENT_TYPE :: "application/x-apple-aspen-config"
+// The Allow of a 405 (RFC 9110 15.5.6): a device downloads the profile by GET.
+MOBILECONFIG_METHODS :: "GET"
 
 // The reverse-DNS prefix Apple asks payload identifiers to be built from. Ours
 // carries the per-URL UUID so two elodin profiles on one device do not collide.

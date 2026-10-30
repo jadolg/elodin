@@ -302,7 +302,7 @@ serve_metrics :: proc(s: ^Server, l: ^Listeners, socket: net.TCP_Socket, client:
 		return
 	}
 	if req.method != "GET" && req.method != "HEAD" {
-		_ = send_http_error(conn, "metrics", 405, "method not allowed", false)
+		_ = send_http_error(conn, "metrics", 405, "method not allowed", false, "GET, HEAD")
 		return
 	}
 

@@ -17,6 +17,8 @@ listeners:
   client offering neither fails the handshake.
 - **Both RFC 8484 forms**, on either version: `POST` with an
   `application/dns-message` body, and `GET` with a base64url `dns` parameter.
+  Any other method gets a **405** with `Allow: GET, POST`; on
+  `mobileconfig_path` it is `Allow: GET`.
 - Requests on one HTTP/2 connection are answered in parallel, each on a fiber of
   its own counted against `server.max_pending`, so a browser's A and AAAA
   lookups run at the same time.

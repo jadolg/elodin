@@ -24,6 +24,8 @@ refused rather than upgraded.
 */
 
 DOH_CONTENT_TYPE :: "application/dns-message"
+// The Allow of a 405 (RFC 9110 15.5.6): RFC 8484 4.1 defines GET and POST.
+DOH_METHODS :: "GET, POST"
 MAX_HEADER_BYTES :: 16 * 1024
 // RFC 8484 6: application/dns-message is at most 65535 bytes.
 MAX_DOH_BODY :: dns.MAX_MESSAGE
@@ -672,7 +674,7 @@ serve_doh_request :: proc(
 		}
 		query = decoded
 	case:
-		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive)
+		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive, DOH_METHODS)
 	}
 
 	if len(query) < dns.HEADER_SIZE {
@@ -782,7 +784,7 @@ them about.
 @(private)
 serve_doh_mobileconfig :: proc(s: ^Server, conn: Conn, req: Http_Request_In) -> bool {
 	if req.method != "GET" {
-		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive)
+		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive, MOBILECONFIG_METHODS)
 	}
 	// Cheap syntax first: a Host with a byte no authority may contain is turned
 	// away without the certificate being consulted about it.
@@ -982,9 +984,10 @@ http_linger :: proc(conn: Conn, idle: time.Duration) {
 
 // `who` names the endpoint in the debug line. Both HTTP endpoints this server
 // has - DoH and the metrics one - refuse requests the same way, and a log line
-// that named only one of them would send an operator to the wrong port.
+// that named only one of them would send an operator to the wrong port. `allow`
+// is the target's methods, which RFC 9110 15.5.6 requires on a 405.
 @(private)
-send_http_error :: proc(conn: Conn, who: string, status: int, message: string, keep_alive: bool) -> bool {
+send_http_error :: proc(conn: Conn, who: string, status: int, message: string, keep_alive: bool, allow := "") -> bool {
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, "HTTP/1.1 ")
 	strings.write_int(&b, status)
@@ -994,6 +997,10 @@ send_http_error :: proc(conn: Conn, who: string, status: int, message: string, k
 	strings.write_int(&b, len(message) + 1)
 	strings.write_string(&b, "\r\nConnection: ")
 	strings.write_string(&b, "keep-alive" if keep_alive else "close")
+	if allow != "" {
+		strings.write_string(&b, "\r\nAllow: ")
+		strings.write_string(&b, allow)
+	}
 	strings.write_string(&b, "\r\n\r\n")
 	strings.write_string(&b, message)
 	strings.write_byte(&b, '\n')

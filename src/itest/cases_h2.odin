@@ -517,9 +517,15 @@ run_h2_cases :: proc(r: ^Runner) {
 		if check(r, cok, "cannot open an h2 connection") {
 			defer h2_close(c)
 			check(r, h2_send_request(c, 1, "PUT", "/dns-query", query), "cannot send")
-			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
+			check(r, h2_send_request(c, 3, "PUT", "/apple-doh.mobileconfig", nil), "cannot send")
+			if check(r, h2_collect(c, []u32{1, 3}), "a stream never completed") {
+				// RFC 9110 15.5.6: a 405 MUST carry Allow.
 				res, _ := h2_stream(c, 1)
 				check_eq_int(r, res.status, 405, "status")
+				check_eq_str(r, h2_header_value(res, "allow"), "GET, POST", "allow")
+				res, _ = h2_stream(c, 3)
+				check_eq_int(r, res.status, 405, "profile status")
+				check_eq_str(r, h2_header_value(res, "allow"), "GET", "profile allow")
 			}
 		}
 	}

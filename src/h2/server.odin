@@ -67,6 +67,8 @@ Response :: struct {
 	status:        int,
 	content_type:  string,
 	cache_control: string,
+	// The methods the target supports, which RFC 9110 15.5.6 requires on a 405.
+	allow:         string,
 	body:          []u8,
 }
 
@@ -1669,6 +1671,9 @@ respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
 	}
 	if resp.cache_control != "" {
 		encode_header(&block, "cache-control", resp.cache_control)
+	}
+	if resp.allow != "" {
+		encode_header(&block, "allow", resp.allow)
 	}
 	encode_header(&block, "content-length", int_to_string(len(resp.body), context.temp_allocator))
 	encode_header(&block, "server", "elodin")
