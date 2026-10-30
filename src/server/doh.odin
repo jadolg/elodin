@@ -646,14 +646,14 @@ serve_doh_request :: proc(
 	// a held connection's network leaves it in the same place. Closed after the
 	// answer, as the accept loop would have.
 	if !stream_source_allowed(s, conn.peer, .DoH) {
-		return send_http_error(conn, "doh", 403, "forbidden", false)
+		return send_http_error(conn, "doh", 403, "forbidden", false, head = req.method == "HEAD")
 	}
 	mc_path := startup_config(s).listeners.doh.mobileconfig_path
 	if mc_path != "" && req.path == mc_path {
 		return serve_doh_mobileconfig(s, conn, req)
 	}
 	if req.path != path {
-		return send_http_error(conn, "doh", 404, "not found", req.keep_alive)
+		return send_http_error(conn, "doh", 404, "not found", req.keep_alive, head = req.method == "HEAD")
 	}
 
 	query: []u8
@@ -674,7 +674,7 @@ serve_doh_request :: proc(
 		}
 		query = decoded
 	case:
-		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive, DOH_METHODS)
+		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive, DOH_METHODS, req.method == "HEAD")
 	}
 
 	if len(query) < dns.HEADER_SIZE {
@@ -784,7 +784,15 @@ them about.
 @(private)
 serve_doh_mobileconfig :: proc(s: ^Server, conn: Conn, req: Http_Request_In) -> bool {
 	if req.method != "GET" {
-		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive, MOBILECONFIG_METHODS)
+		return send_http_error(
+			conn,
+			"doh",
+			405,
+			"method not allowed",
+			req.keep_alive,
+			MOBILECONFIG_METHODS,
+			req.method == "HEAD",
+		)
 	}
 	// Cheap syntax first: a Host with a byte no authority may contain is turned
 	// away without the certificate being consulted about it.
@@ -985,16 +993,30 @@ http_linger :: proc(conn: Conn, idle: time.Duration) {
 // `who` names the endpoint in the debug line. Both HTTP endpoints this server
 // has - DoH and the metrics one - refuse requests the same way, and a log line
 // that named only one of them would send an operator to the wrong port. `allow`
-// is the target's methods, which RFC 9110 15.5.6 requires on a 405.
+// is the target's methods, which RFC 9110 15.5.6 requires on a 405. A reply to
+// `head` is its fields alone (RFC 9112 6.3): text after them would be read as
+// the start of the next reply on the connection. It carries no Content-Length
+// either, which RFC 9110 8.6 allows only when it is what GET would have sent.
 @(private)
-send_http_error :: proc(conn: Conn, who: string, status: int, message: string, keep_alive: bool, allow := "") -> bool {
+send_http_error :: proc(
+	conn: Conn,
+	who: string,
+	status: int,
+	message: string,
+	keep_alive: bool,
+	allow := "",
+	head := false,
+) -> bool {
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, "HTTP/1.1 ")
 	strings.write_int(&b, status)
 	strings.write_byte(&b, ' ')
 	strings.write_string(&b, message)
-	strings.write_string(&b, "\r\nContent-Type: text/plain\r\nContent-Length: ")
-	strings.write_int(&b, len(message) + 1)
+	strings.write_string(&b, "\r\nContent-Type: text/plain")
+	if !head {
+		strings.write_string(&b, "\r\nContent-Length: ")
+		strings.write_int(&b, len(message) + 1)
+	}
 	strings.write_string(&b, "\r\nConnection: ")
 	strings.write_string(&b, "keep-alive" if keep_alive else "close")
 	if allow != "" {
@@ -1002,8 +1024,10 @@ send_http_error :: proc(conn: Conn, who: string, status: int, message: string, k
 		strings.write_string(&b, allow)
 	}
 	strings.write_string(&b, "\r\n\r\n")
-	strings.write_string(&b, message)
-	strings.write_byte(&b, '\n')
+	if !head {
+		strings.write_string(&b, message)
+		strings.write_byte(&b, '\n')
+	}
 
 	logx.debugf("%s: replying %d %s", who, status, message)
 	return conn_write_all(conn, transmute([]u8)strings.to_string(b)) && keep_alive

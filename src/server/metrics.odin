@@ -146,6 +146,8 @@ METRICS_TIMEOUT :: 5 * time.Second
 // A scrape is a request line and a handful of short headers.
 @(private)
 METRICS_REQUEST_BUF :: 2048
+// The Allow of a 405 (RFC 9110 15.5.6): the methods `serve_metrics` answers.
+METRICS_METHODS :: "GET, HEAD"
 
 @(private)
 start_metrics :: proc(s: ^Server, l: ^Listeners) -> bool {
@@ -298,11 +300,11 @@ serve_metrics :: proc(s: ^Server, l: ^Listeners, socket: net.TCP_Socket, client:
 	file.
 	*/
 	if req.path != startup_config(s).metrics.path {
-		_ = send_http_error(conn, "metrics", 404, "not found", false)
+		_ = send_http_error(conn, "metrics", 404, "not found", false, head = req.method == "HEAD")
 		return
 	}
 	if req.method != "GET" && req.method != "HEAD" {
-		_ = send_http_error(conn, "metrics", 405, "method not allowed", false, "GET, HEAD")
+		_ = send_http_error(conn, "metrics", 405, "method not allowed", false, METRICS_METHODS)
 		return
 	}
 

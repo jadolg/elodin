@@ -405,6 +405,7 @@ h2_answer :: proc(data: rawptr, pool := dnssec.Walk_Pool.Shared) {
 	if !ok {
 		return
 	}
+	resp.head = req.method == "HEAD"
 	// A body waits on the client's flow-control credit, up to the write timeout,
 	// parked: a client that stops reading holds this query in flight and its
 	// fiber, and nothing else.

@@ -378,5 +378,33 @@ test_serve_doh_profile_rejects_post :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect(t, strings.contains(reply, "HTTP/1.1 405"), "a POST to the profile path should be a 405")
+	// RFC 9110 15.5.6: a 405 MUST carry Allow.
+	testing.expect(t, strings.contains(reply, "\r\nAllow: GET\r\n"), "the 405 should carry Allow: GET")
+	free_all(context.temp_allocator)
+}
+
+/*
+A HEAD refused on a held connection is headers alone.
+
+RFC 9112 6.3: a response to HEAD ends at the blank line after its fields, so a
+client reads any bytes after it as the start of the next response. The refusal's
+text sent after a 405 to HEAD desynchronises every reply that follows on the
+connection.
+*/
+@(test)
+test_serve_doh_profile_head_refusal_has_no_body :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	s := Server {
+		cfg = &cfg,
+	}
+	reply, ok := mc_roundtrip(t, &s, "HEAD /apple-doh.mobileconfig HTTP/1.1\r\nHost: elodin.local\r\n\r\n")
+	if !ok {
+		return
+	}
+	testing.expect(t, strings.contains(reply, "HTTP/1.1 405"), "a HEAD to the profile path should be a 405")
+	testing.expectf(t, strings.has_suffix(reply, "\r\n\r\n"), "a reply to HEAD should end at its fields: %q", reply)
+	// RFC 9110 8.6: no Content-Length unless it is what GET would have sent.
+	testing.expectf(t, !strings.contains(reply, "Content-Length"), "a reply to HEAD should carry no Content-Length: %q", reply)
+	testing.expect(t, strings.contains(reply, "\r\nAllow: GET\r\n"), "the 405 to HEAD should carry Allow: GET")
 	free_all(context.temp_allocator)
 }
