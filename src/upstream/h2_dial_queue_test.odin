@@ -7,6 +7,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:h2"
+import "elodin:loop"
 
 /*
 The DoH dial queue in `get_h2_conn` is bounded by each caller's own deadline,
@@ -55,8 +56,11 @@ mute_listener :: proc(t: ^testing.T) -> (listener: net.TCP_Socket, u: ^Upstream,
 // Every connection the kernel completed, all of them in the backlog by the
 // time the callers that made them returned.
 @(private = "file")
-drain_dials :: proc(listener: net.TCP_Socket) -> (dials: int) {
-	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+drain_dials :: proc(t: ^testing.T, listener: net.TCP_Socket) -> (dials: int) {
+	serr := net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
+	if !testing.expectf(t, serr == nil, "cannot bound the accept: %v", serr) {
+		return -1
+	}
 	for {
 		c, _, err := net.accept_tcp(listener)
 		if err != nil {
@@ -88,8 +92,13 @@ dial_caller :: proc(c: ^Dial_Caller) {
 
 /*
 Callers queued behind a dial that outlasts them give up at their own deadline
-and dial nothing: one connection for the dialler, none for the three behind it.
-Unbounded, each of them waits the dial out and then makes one of its own.
+and dial nothing. Unbounded, each of them waits the dial out and then makes one
+of its own.
+
+The dial in front of them is `u.connecting` set by hand rather than a real one,
+and it ends only once every caller has returned: whenever each of them started,
+a bounded caller has nothing left to dial with by then. The cap is what ends it
+for callers that are not bounded, so that they fail rather than hang.
 */
 @(test)
 test_callers_queued_behind_a_doh_dial_keep_their_own_budget :: proc(t: ^testing.T) {
@@ -104,22 +113,10 @@ test_callers_queued_behind_a_doh_dial_keep_their_own_budget :: proc(t: ^testing.
 	defer net.close(listener)
 	defer destroy(u)
 
-	dialler := Dial_Caller {
-		u      = u,
-		budget = DIAL,
-	}
-	dt := thread.create_and_start_with_poly_data(&dialler, dial_caller)
-	// Queued only once the dial is under way, so each waiter's deadline falls
-	// inside it.
-	for {
-		sync.mutex_lock(&u.mu)
-		connecting := u.connecting
-		sync.mutex_unlock(&u.mu)
-		if connecting {
-			break
-		}
-		thread.yield()
-	}
+	sync.mutex_lock(&u.mu)
+	u.connecting = true
+	sync.mutex_unlock(&u.mu)
+
 	waiters: [WAITERS]Dial_Caller
 	threads: [WAITERS]^thread.Thread
 	for i in 0 ..< WAITERS {
@@ -129,20 +126,32 @@ test_callers_queued_behind_a_doh_dial_keep_their_own_budget :: proc(t: ^testing.
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&waiters[i], dial_caller)
 	}
+	cap := time.tick_add(time.tick_now(), DIAL)
+	for time.tick_diff(time.tick_now(), cap) > 0 {
+		done := 0
+		for th in threads {
+			done += int(thread.is_done(th))
+		}
+		if done == WAITERS {
+			break
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	sync.mutex_lock(&u.mu)
+	u.connecting = false
+	loop.cond_broadcast(&u.conn_cond)
+	sync.mutex_unlock(&u.mu)
 	for th in threads {
 		thread.join(th)
 		thread.destroy(th)
 	}
-	thread.join(dt)
-	thread.destroy(dt)
 
-	testing.expectf(t, dialler.err != .None, "the dial to a peer that never speaks ended as %v", dialler.err)
 	for w, i in waiters {
 		testing.expectf(t, w.err == .Timeout, "waiter %d ended as %v, expected a timeout", i, w.err)
 		testing.expectf(t, w.took < DIAL, "waiter %d with a budget of %v took %v; it waited the dial out", i, WAIT, w.took)
 	}
-	dials := drain_dials(listener)
-	testing.expectf(t, dials == 1, "%d dials for one dialler and %d callers queued behind it", dials, WAITERS)
+	dials := drain_dials(t, listener)
+	testing.expectf(t, dials == 0, "%d callers queued behind a dial made %d of their own", WAITERS, dials)
 }
 
 /*
@@ -162,6 +171,6 @@ test_a_caller_past_its_deadline_starts_no_doh_dial :: proc(t: ^testing.T) {
 
 	_, got, err := get_h2_conn(u, 30 * time.Second, 0)
 	testing.expectf(t, !got && err == .Timeout, "a spent budget got a connection (%v) or ended as %v", got, err)
-	dials := drain_dials(listener)
+	dials := drain_dials(t, listener)
 	testing.expectf(t, dials == 0, "a caller past its deadline made %d dials", dials)
 }
