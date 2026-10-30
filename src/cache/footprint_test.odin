@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:sync"
+import "core:sys/posix"
 import "core:testing"
 import "core:time"
 import "elodin:loop"
@@ -117,11 +118,12 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	/*
 	The budget binds the count, exactly, and eviction stops near it rather than
 	well short. The heap is held to the count rather than to the budget: it is
-	what glibc made of the allocations, which differs run to run on arm64 CI by a
-	few hundred bytes either side of the budget, while the count does not. An
+	what glibc made of the allocations, which differs run to run by a few hundred
+	bytes either side of the budget, while the count does not. An
 	undercount is what would put the heap past the budget, so it gets a tighter
 	bound than the 2% the count may overstate by: 0.5%, which a count short by
-	8 bytes an entry exceeds.
+	8 bytes an entry exceeds, plus a page for the table, which glibc mmaps and
+	rounds up to one - up to 64 KiB on arm64 - and `heap_block` does not model.
 	*/
 	testing.expectf(
 		t,
@@ -132,13 +134,14 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	)
 	testing.expectf(
 		t,
-		abs(held - used) <= held / 50,
+		used - held <= held / 50,
 		"the cache counts %d bytes and holds %d over %d entries",
 		used,
 		held,
 		len_entries(c),
 	)
-	testing.expectf(t, held - used <= held / 200, "the cache undercounts: %d counted, %d held", used, held)
+	page := int(posix.sysconf(._PAGESIZE))
+	testing.expectf(t, held - used <= held / 200 + page, "the cache undercounts: %d counted, %d held", used, held)
 }
 
 // An empty cache holds next to nothing, whatever count it is allowed.
