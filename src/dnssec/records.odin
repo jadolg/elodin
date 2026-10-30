@@ -322,14 +322,31 @@ window for a signature the zone has withdrawn. An hour is Unbound's floor.
 */
 SIG_INCEPTION_SKEW :: 3600
 
+// Where `now` falls against a signature's validity period.
+Sig_Window :: enum u8 {
+	Current,
+	Expired,
+	Not_Yet_Valid,
+}
+
+// Which side of its validity period `now` is on, inception skew allowed.
+signature_window :: proc "contextless" (sig: Rrsig, now: u32) -> Sig_Window {
+	switch {
+	case !serial_ge(now + SIG_INCEPTION_SKEW, sig.inception):
+		return .Not_Yet_Valid
+	case !serial_ge(sig.expiration, now):
+		return .Expired
+	// The skew must not admit a window that ends before it starts. `now` is
+	// then inside the skew, short of the inception itself.
+	case !serial_ge(sig.expiration, sig.inception):
+		return .Not_Yet_Valid
+	}
+	return .Current
+}
+
 // Is `now` inside the signature's validity period, inception skew allowed?
 signature_current :: proc "contextless" (sig: Rrsig, now: u32) -> bool {
-	return(
-		serial_ge(now + SIG_INCEPTION_SKEW, sig.inception) &&
-		serial_ge(sig.expiration, now) &&
-		// The skew must not admit a window that ends before it starts.
-		serial_ge(sig.expiration, sig.inception) \
-	)
+	return signature_window(sig, now) == .Current
 }
 
 /*

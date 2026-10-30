@@ -21,6 +21,8 @@ client that never asked for DNSSEC records has them taken back out.
 // Extended DNS error codes, RFC 8914. Sent only to clients that use EDNS0,
 // which is the only place there is to put them.
 EDE_DNSSEC_BOGUS :: 6
+EDE_SIGNATURE_EXPIRED :: 7
+EDE_SIGNATURE_NOT_YET_VALID :: 8
 EDE_NO_REACHABLE_AUTHORITY :: 22
 EDE_UNSUPPORTED_NSEC3_ITERATIONS :: 27
 
@@ -864,6 +866,10 @@ The third has a code of its own (RFC 8914 section 4.28) and is worth using:
 "no reachable authority" over a zone whose NSEC3 iteration count is past the
 ceiling sends whoever is debugging it to look at connectivity, which is the one
 thing that is fine.
+
+So does a forgery verdict resting on signatures outside their validity period
+(sections 4.8 and 4.9): that is usually this server's clock rather than the
+zone, and "DNSSEC bogus" points the other way. See `dnssec.Lapsed`.
 */
 @(private)
 dnssec_failure_response :: proc(
@@ -877,6 +883,10 @@ dnssec_failure_response :: proc(
 ) {
 	code := u16(EDE_NO_REACHABLE_AUTHORITY)
 	switch {
+	case result.status == .Bogus && result.lapsed.window == .Expired:
+		code = u16(EDE_SIGNATURE_EXPIRED)
+	case result.status == .Bogus && result.lapsed.window == .Not_Yet_Valid:
+		code = u16(EDE_SIGNATURE_NOT_YET_VALID)
 	case result.status == .Bogus:
 		code = u16(EDE_DNSSEC_BOGUS)
 	case result.reason == dnssec.NSEC3_OVER_CEILING:

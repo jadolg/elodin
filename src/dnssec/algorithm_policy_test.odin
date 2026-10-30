@@ -823,7 +823,7 @@ test_refused_signatures_cannot_spend_the_verification_budget :: proc(t: ^testing
 		defer destroy_validator(v)
 		plain := make([]Rrsig, 1, context.temp_allocator)
 		plain[0] = sig_of(MIGRATING_A_SIG_13)
-		status, _, reason, _, _ := validate_rrset(
+		status, _, reason, _, _, _ := validate_rrset(
 			v,
 			&baseline,
 			"migrating.",
@@ -849,7 +849,7 @@ test_refused_signatures_cannot_spend_the_verification_budget :: proc(t: ^testing
 	v := chain_validator(context.temp_allocator)
 	defer destroy_validator(v)
 	budget := query_budget(v)
-	status, _, reason, _, _ := validate_rrset(
+	status, _, reason, _, _, _ := validate_rrset(
 		v,
 		&budget,
 		"migrating.",

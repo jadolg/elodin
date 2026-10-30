@@ -409,7 +409,7 @@ test_a_shed_elsewhere_does_not_excuse_a_forgery :: proc(t: ^testing.T) {
 		},
 	}
 
-	status, _, reason, _, _ := validate_rrset(
+	status, _, reason, _, _, _ := validate_rrset(
 		v,
 		&budget,
 		"cloudflare.com.",

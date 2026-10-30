@@ -104,7 +104,7 @@ test_signature_attempts_render_the_rrset_once :: proc(t: ^testing.T) {
 		section := ss_section(signatures)
 		budget: Budget
 		before := arena_used()
-		_, _, _, ok, exhausted := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, SS_NOW, context.temp_allocator)
+		_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, SS_NOW, context.temp_allocator)
 		used[i] = arena_used() - before
 		// The premise: every forgery reached a verification.
 		testing.expect(t, !ok && !exhausted)
@@ -135,7 +135,7 @@ test_signing_input_is_charged_to_the_request :: proc(t: ^testing.T) {
 	budget := Budget {
 		spent = &spent,
 	}
-	_, _, _, ok, exhausted := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, SS_NOW, context.temp_allocator)
+	_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, SS_NOW, context.temp_allocator)
 	testing.expect(t, !ok)
 	testing.expect(t, exhausted, "a render past the request's budget was paid for")
 	testing.expect_value(t, budget.verifications, 1)
@@ -150,7 +150,7 @@ test_signing_input_is_charged_to_the_request :: proc(t: ^testing.T) {
 		budget = Budget {
 			spent = &spent,
 		}
-		_, _, _, ok, exhausted = verified_rrset(&budget, section[:230 + signatures], SS_OWNER, .TXT, .IN, "example.com.", keys, SS_NOW, context.temp_allocator)
+		_, _, _, ok, exhausted, _ = verified_rrset(&budget, section[:230 + signatures], SS_OWNER, .TXT, .IN, "example.com.", keys, SS_NOW, context.temp_allocator)
 		testing.expect(t, !ok && !exhausted)
 		testing.expect_value(t, budget.verifications, signatures)
 		testing.expect_value(t, exhausted_reason(&budget), "verification budget spent")
@@ -297,7 +297,7 @@ ss_answer :: proc(signatures: int, spent: ^int) -> (used: int, status: Status, r
 	budget := query_budget(v)
 	budget.spent = spent
 	before := arena_used()
-	status, _, reason, _, _ = validate_rrset(v, &budget, SS_OWNER, .TXT, .IN, records, sigs, SS_NOW, now, context.temp_allocator)
+	status, _, reason, _, _, _ = validate_rrset(v, &budget, SS_OWNER, .TXT, .IN, records, sigs, SS_NOW, now, context.temp_allocator)
 	return arena_used() - before, status, reason, budget.verifications
 }
 
@@ -383,7 +383,7 @@ test_the_reason_is_what_stopped_the_loop :: proc(t: ^testing.T) {
 		spent         = &spent,
 		verifications = MAX_VERIFICATIONS_PER_QUERY,
 	}
-	_, _, _, ok, exhausted := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ss_key(), SS_NOW, context.temp_allocator)
+	_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ss_key(), SS_NOW, context.temp_allocator)
 	testing.expect(t, !ok && exhausted)
 	testing.expect_value(t, exhausted_reason(&budget), VERIFICATIONS_SPENT)
 
@@ -393,11 +393,11 @@ test_the_reason_is_what_stopped_the_loop :: proc(t: ^testing.T) {
 	budget = Budget {
 		spent = &spent,
 	}
-	_, _, _, ok, exhausted = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ss_key(), SS_NOW, context.temp_allocator)
+	_, _, _, ok, exhausted, _ = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ss_key(), SS_NOW, context.temp_allocator)
 	testing.expect(t, !ok && exhausted)
 	testing.expect_value(t, exhausted_reason(&budget), READING_OVER_BUDGET)
 	budget.verifications = MAX_VERIFICATIONS_PER_QUERY
-	_, _, _, ok, exhausted = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ss_key(), SS_NOW, context.temp_allocator)
+	_, _, _, ok, exhausted, _ = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ss_key(), SS_NOW, context.temp_allocator)
 	testing.expect(t, !ok && exhausted)
 	testing.expect_value(t, exhausted_reason(&budget), VERIFICATIONS_SPENT)
 	free_all(context.temp_allocator)
