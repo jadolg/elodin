@@ -37,6 +37,17 @@ test_a_stale_lookup_copies_nothing_until_it_is_lent :: proc(t: ^testing.T) {
 	testing.expect(t, lfound && lent.stale && lent.wire != nil, "the expired entry was not lent once asked for")
 	// The query's own lookup counted the miss; the lend is not a second one.
 	testing.expect_value(t, cache.stats(answers).misses, u64(1))
+
+	// Read as the entry stands at the lend: refreshed meanwhile, it is the fresh
+	// answer; gone, there is no fallback.
+	if !testing.expect(t, cache_an_answer(answers, expired = false), "the refresh was not cached") {
+		return
+	}
+	fresh, ffound := lend_stale(&s, held, context.temp_allocator)
+	testing.expect(t, ffound && !fresh.stale && fresh.wire != nil, "a lend after a refresh did not read the fresh answer")
+	cache.forget(answers, key, fresh.serial)
+	_, gone := lend_stale(&s, held, context.temp_allocator)
+	testing.expect(t, !gone, "a lend of a forgotten entry found something")
 	free_all(context.temp_allocator)
 }
 

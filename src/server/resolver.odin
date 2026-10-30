@@ -1119,8 +1119,8 @@ resolve_query :: proc(
 	refresh does not start another one, which is what keeps `serve_stale` from
 	recursing a query at a time; and where the upstream produces nothing, it
 	reports that here instead of reaching for the entry and counting a client
-	answer against it - the request that started the refresh is holding those
-	bytes and serves them itself. See `refresh.odin`.
+	answer against it - the request that started the refresh is holding that
+	entry and serves it itself. See `refresh.odin`.
 	*/
 	unanswered: ^bool = nil,
 	/*
@@ -1537,7 +1537,7 @@ resolve_query :: proc(
 	off - or where there is no pool to run the refresh
 	on, which is a `Server` built as a literal. The fall-through is the ordinary
 	forwarding path, expired entry in hand, exactly as it was: the client waits
-	the upstream out and is served what it is holding only once that has failed.
+	the upstream out and is served that entry only once that has failed.
 
 	Those three are the only ways out of this block. Every other reason
 	`start_refresh` declines - a refresh for this key already running, the
@@ -2451,7 +2451,7 @@ resolve_query :: proc(
 			/*
 			Unless this call is the detached refresh, which holds nothing and
 			has no client of its own. The request that started it is holding the
-			expired bytes and serves them itself, so saying so is the whole of
+			expired entry and serves it itself, so saying so is the whole of
 			what is left to do here - and the counter and the query-log line go
 			with the answer that client actually gets, rather than being made
 			twice for one query. See `refresh.odin`.

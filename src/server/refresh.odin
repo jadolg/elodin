@@ -236,7 +236,7 @@ refresh_ceiling :: proc(s: ^Server) -> int {
 Start a refresh for `key`, or report that this query is not the one to run it.
 
 Nil is returned for every reason a client should stop waiting and take the
-expired bytes it is holding: a refresh for this key is already running, the
+expired entry it is holding: a refresh for this key is already running, the
 ceiling is reached, `max_pending` is reached or the server is shutting down, or
 there is nowhere to run one at all - which is a `Server` built as a literal and
 driven from a test's own thread, where the only honest thing left to do is what
@@ -387,7 +387,7 @@ refresh_release :: proc(r: ^Refresh) {
 /*
 Wait out the client response timer, and take the refresh's answer if it beat it.
 
-`taken` is false wherever the client is better served by the expired bytes it is
+`taken` is false wherever the client is better served by the expired entry it is
 holding: the timer fired with the refresh still running, or the refresh finished
 having got nothing at all out of the upstream. Everything else the refresh
 reached is this client's answer, including the refusals - a Bogus verdict, an

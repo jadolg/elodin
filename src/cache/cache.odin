@@ -451,7 +451,8 @@ make_key :: proc(
 /*
 Look a response up.
 
-On a hit the returned bytes are a fresh copy owned by `allocator`, with TTLs
+On a hit the returned bytes, unless `copy_stale` or `copy_refused` withheld
+them (below), are a fresh copy owned by `allocator`, with TTLs
 already counted down and the transaction ID left at whatever the cached message
 had; callers set the ID and re-case the question themselves.
 
