@@ -337,6 +337,21 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 			return nil, false
 		}
 	}
+	/*
+	The OPT record's slot given back, so the block is what the slice says it
+	is: the cache charges an entry by its length (issue #531). A copy, not
+	`shrink`: glibc's realloc keeps a chunk whole when what it would split off
+	is under 32 bytes, and one slot is 8, so a shrunk block holds what it did.
+	A failed copy keeps the list it has: a nil one would store the answer with
+	nothing to count its TTLs down.
+	*/
+	if len(out) < cap(out) {
+		if exact, err := make([]int, len(out), allocator); err == nil {
+			copy(exact, out[:])
+			delete(out)
+			return exact, true
+		}
+	}
 	return out[:], true
 }
 

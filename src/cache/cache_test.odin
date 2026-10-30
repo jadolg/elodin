@@ -29,8 +29,9 @@ build_answer :: proc(name: string, ttl: u32, allocator := context.allocator) -> 
 	return wire, decoded
 }
 
-@(private = "file")
-build_nxdomain :: proc(name: string, soa_min: u32, allocator := context.allocator) -> ([]u8, dns.Message) {
+@(private)
+build_nxdomain :: proc(name: string, soa_min: u32, allocator := context.allocator, edns := false) -> ([]u8, dns.Message) {
+	opt := []dns.Record{dns.make_opt(1232, false)}
 	m := dns.Message {
 		id        = 0x2222,
 		question  = []dns.Question{{name = name, type = .A, class = .IN}},
@@ -55,6 +56,9 @@ build_nxdomain :: proc(name: string, soa_min: u32, allocator := context.allocato
 	m.flags.qr = true
 	m.flags.ra = true
 	m.flags.rcode = u8(dns.Rcode.NX_Domain)
+	if edns {
+		m.additional = opt
+	}
 	wire, _, err := dns.encode_message(m, allocator)
 	if err != .None {
 		panic("failed to encode test nxdomain")
@@ -63,7 +67,7 @@ build_nxdomain :: proc(name: string, soa_min: u32, allocator := context.allocato
 	return wire, decoded
 }
 
-@(private = "file")
+@(private)
 key_for :: proc(buf: []u8, name: string) -> string {
 	return make_key(buf, name, .A, .IN, false)
 }
@@ -526,14 +530,14 @@ test_cache_holds_to_its_byte_budget :: proc(t: ^testing.T) {
 	)
 
 	/*
-	And the memory itself. The allowance over the budget is what the cache holds
-	that entries do not: the Cache, the map's table, and the slack in the
-	allocations behind each entry.
+	And the memory itself. The budget charges each block as the heap rounds it
+	and the table whole, so what was asked for fits inside it; the Cache itself
+	is the one allocation it leaves out.
 	*/
 	held := track.current_memory_allocated
 	testing.expectf(
 		t,
-		held <= BUDGET + BUDGET / 2,
+		held <= BUDGET + size_of(Cache),
 		"the cache is holding %d bytes of allocations against a %d byte budget",
 		held,
 		BUDGET,
@@ -570,7 +574,7 @@ test_an_entry_larger_than_the_budget_is_refused :: proc(t: ^testing.T) {
 }
 
 /*
-The byte total has to come back to zero by every route out of the cache.
+The byte total has to come back to the table's by every route out of the cache.
 
 A total that only ever goes up is a cache that stops accepting entries once it
 has seen enough of them, and a total that goes down too far is a bound that
@@ -579,7 +583,7 @@ expired one, `put` over a key already held, `sweep`, `clear_all` - and each is
 its own opportunity to forget.
 */
 @(test)
-test_byte_accounting_comes_back_to_zero :: proc(t: ^testing.T) {
+test_byte_accounting_comes_back_to_the_table :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
 	defer mem.tracking_allocator_destroy(&track)
@@ -602,13 +606,14 @@ test_byte_accounting_comes_back_to_zero :: proc(t: ^testing.T) {
 	// Dropped by `get`, which is what an expired entry meets first.
 	sync_expire(c, key_for(kb[:], "a.example."))
 	_, _, _ = get(c, key_for(kb[:], "a.example."), context.temp_allocator)
-	testing.expect_value(t, bytes_used(c), 0)
+	// The table stays, at its least, and is all that is counted.
+	testing.expect_value(t, bytes_used(c), table_bytes(c))
 
 	// Dropped by `sweep`.
 	put_one(c, kb[:], "b.example.")
 	sync_expire(c, key_for(kb[:], "b.example."))
 	testing.expect_value(t, sweep(c), 1)
-	testing.expect_value(t, bytes_used(c), 0)
+	testing.expect_value(t, bytes_used(c), table_bytes(c))
 
 	// Dropped by eviction, with the count as the bound this time.
 	small := make_cache(Options{max_entries = 1, max_ttl = 3600}, mem.tracking_allocator(&track))
@@ -622,7 +627,7 @@ test_byte_accounting_comes_back_to_zero :: proc(t: ^testing.T) {
 	// Dropped by `clear_all`, as a reload does it.
 	put_one(c, kb[:], "e.example.")
 	clear_all(c)
-	testing.expect_value(t, bytes_used(c), 0)
+	testing.expect_value(t, bytes_used(c), table_bytes(c))
 
 	destroy(c)
 	free_all(context.temp_allocator)
