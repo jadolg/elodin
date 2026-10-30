@@ -4690,8 +4690,9 @@ clear_non_cuts :: proc(v: ^Validator) {
 	}
 }
 
-// `now` is the moment clock `cache_get` and `sweep` read, so an entry cannot be
-// written with an expiry the reader considers already past.
+// `now` is on the moment clock `cache_get` and `sweep` read: the walk's
+// `Budget.began`, the instant `lapses` is counted from. It is in the past, so an
+// entry whose lifetime the walk has already outrun is stored expired.
 @(private)
 cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, ttl: u32, now: loop.Moment, lapses := max(u32)) {
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8

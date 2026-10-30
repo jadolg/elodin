@@ -955,7 +955,7 @@ maintenance_loop :: proc(
 	m := Maintenance {
 		rebuild      = rebuild,
 		next_tick    = time.tick_add(time.tick_now(), TICK),
-		last_refresh = loop.moment_now(),
+		last_refresh = time.now(),
 		last_report  = time.tick_now(),
 	}
 	refresh := server.live_config(s).blocking.refresh
@@ -998,10 +998,13 @@ Maintenance :: struct {
 	// before it, or when no thread could be had: another follows once that one
 	// is over, or at the next tick.
 	rebuild_again:  bool,
-	// On the moment clock: the tick clock stops while the machine is
-	// suspended, so a day's refresh would wait for a day awake, and a step of
-	// the wall clock would start one early or hold it back (issue #557).
-	last_refresh:   loop.Moment,
+	// On the wall clock, as the cached copies' ages are by their mtime: a
+	// monotonic clock stops while the machine is suspended, and a day's
+	// refresh would wait for a day awake. The moment clock would not stop, but
+	// `fetch_list` judges a copy fresh by its mtime against the wall clock, so
+	// after a step back a timer on any other clock would find the copy fresh,
+	// skip the download and wait a whole further period.
+	last_refresh:   time.Time,
 	// Zero while the lists are current; otherwise the wait before the next
 	// attempt, which `refresh_retry` stretches on each failure (#411).
 	retry:          time.Duration,
@@ -1073,7 +1076,7 @@ collect :: proc(s: ^server.Server, opts: Options, m: ^Maintenance) {
 		start_rebuild(s, opts, m, after_reload = true)
 		return
 	}
-	m.last_refresh = loop.moment_now()
+	m.last_refresh = time.now()
 	refresh := server.live_config(s).blocking.refresh
 	switch {
 	case current || opts.no_fetch || refresh <= 0:
@@ -1127,7 +1130,7 @@ tick :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m: 
 		switch {
 		case m.rebuild_again:
 			start_rebuild(s, opts, m, after_reload = true)
-		case refreshing && loop.moment_since(m.last_refresh) >= server.refresh_wait(m.retry, cfg.blocking.refresh):
+		case refreshing && time.since(m.last_refresh) >= server.refresh_wait(m.retry, cfg.blocking.refresh):
 			logx.infof("refreshing blocklists")
 			start_rebuild(s, opts, m, after_reload = false)
 		}
