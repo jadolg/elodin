@@ -15,13 +15,24 @@ Hostname resolution that does not go through the system resolver.
 On a machine where elodin is the system resolver, asking libc to resolve an
 upstream's hostname during startup would come straight back to a server that is
 not listening yet. Bootstrap addresses are queried directly over plain UDP
-instead, and results are cached for BOOTSTRAP_TTL.
+instead, and results are cached for BOOTSTRAP_TTL, at most
+BOOTSTRAP_MAX_ENTRIES names at once.
 */
 
 BOOTSTRAP_TTL :: 1 * time.Hour
 
 @(private)
 BOOTSTRAP_TIMEOUT :: 3 * time.Second
+
+/*
+At most this many hostnames cached at once. The sweep holds the map to what was
+resolved within `BOOTSTRAP_TTL`, but a short `blocking.refresh` fetches many
+times an hour, and each redirect is a name the list host chooses. A name
+resolved while the map is full is answered and not kept: an upstream publishes
+its endpoint once, and a list is fetched again a refresh later.
+*/
+@(private)
+BOOTSTRAP_MAX_ENTRIES :: 256
 
 @(private)
 Bootstrap_Entry :: struct {
@@ -60,8 +71,11 @@ bootstrap_resolve :: proc(
 		return literal, true
 	}
 
+	// Keyed by the canonical name, which is the name asked: `Hop.example` and
+	// `hop.example.` are one entry, not two of `BOOTSTRAP_MAX_ENTRIES`.
+	key := dns.name_canonical(hostname, context.temp_allocator)
 	sync.mutex_lock(&bootstrap_cache.mu)
-	if entry, found := bootstrap_cache.entries[hostname]; found {
+	if entry, found := bootstrap_cache.entries[key]; found {
 		if loop.moment_since(entry.expires) < 0 {
 			sync.mutex_unlock(&bootstrap_cache.mu)
 			return entry.address, true
@@ -115,10 +129,20 @@ bootstrap_resolve :: proc(
 			// Storing under a key the map already holds keeps the key it has, so
 			// cloning unconditionally would orphan a string every time an expired
 			// entry is refreshed.
-			if hostname in bootstrap_cache.entries {
-				bootstrap_cache.entries[hostname] = entry
+			if key in bootstrap_cache.entries {
+				bootstrap_cache.entries[key] = entry
 			} else {
-				bootstrap_cache.entries[strings.clone(hostname)] = entry
+				/*
+				A new key sweeps out the expired ones first, so the map holds
+				only what was resolved within the last `BOOTSTRAP_TTL` (#530).
+				The hostnames are not only the configured upstreams': every
+				redirect a blocklist download follows is resolved here, under
+				names the list host picks.
+				*/
+				bootstrap_prune()
+				if len(bootstrap_cache.entries) < BOOTSTRAP_MAX_ENTRIES {
+					bootstrap_cache.entries[strings.clone(key, bootstrap_cache.entries.allocator)] = entry
+				}
 			}
 			sync.mutex_unlock(&bootstrap_cache.mu)
 			return result, true
@@ -128,19 +152,48 @@ bootstrap_resolve :: proc(
 }
 
 /*
-Treat every hostname resolved so far as expired, so the next lookup asks the
-bootstrap servers configured now.
+Drop every hostname resolved so far, so the next lookup asks the bootstrap
+servers configured now.
 
 For a configuration reload that changes which upstreams are asked: the answer
 cache is emptied for that, and an address an earlier bootstrap gave for an
-upstream's hostname is the same kind of answer. Expired rather than removed, so
-the keys stay with the map that allocated them.
+upstream's hostname is the same kind of answer.
 */
 bootstrap_forget :: proc() {
 	sync.mutex_lock(&bootstrap_cache.mu)
 	defer sync.mutex_unlock(&bootstrap_cache.mu)
-	for _, &entry in bootstrap_cache.entries {
-		entry.expires = {}
+	bootstrap_clear()
+}
+
+// Release the cache, at shutdown, once nothing can resolve through it.
+bootstrap_destroy :: proc() {
+	sync.mutex_lock(&bootstrap_cache.mu)
+	defer sync.mutex_unlock(&bootstrap_cache.mu)
+	bootstrap_clear()
+	delete(bootstrap_cache.entries)
+	bootstrap_cache.entries = nil
+}
+
+// Remove every entry. Under `mu`.
+@(private)
+bootstrap_clear :: proc() {
+	for key in bootstrap_cache.entries {
+		delete(key, bootstrap_cache.entries.allocator)
+	}
+	clear(&bootstrap_cache.entries)
+}
+
+/*
+Remove the expired entries. Under `mu`. Keys are freed with the map's allocator,
+which is the one they were cloned with, whichever thread asks.
+*/
+@(private)
+bootstrap_prune :: proc() {
+	for key, entry in bootstrap_cache.entries {
+		if loop.moment_since(entry.expires) >= 0 {
+			delete_key(&bootstrap_cache.entries, key)
+			delete(key, bootstrap_cache.entries.allocator)
+		}
 	}
 }
 
