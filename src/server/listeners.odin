@@ -1605,6 +1605,8 @@ reload_tls_ctx :: proc(
 	sync.rw_mutex_lock(&l.tls_mu)
 	old := slot^
 	slot^ = fresh
+	// An open connection keeps `old` alive past this, out of the tick's reach.
+	tlsx.retire_ticket_keys(old)
 	tlsx.context_destroy(old)
 	sync.rw_mutex_unlock(&l.tls_mu)
 	/*

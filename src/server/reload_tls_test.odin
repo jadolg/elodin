@@ -110,6 +110,9 @@ test_reload_tls_swaps_in_a_fresh_context :: proc(t: ^testing.T) {
 	l.dot_open = true
 	s := Server{cfg = &cfg}
 	defer tlsx.context_destroy(l.dot_ctx)
+	// An open connection, holding the displaced `SSL_CTX` past the reload.
+	open := tlsx.SSL_new(first.ptr)
+	defer tlsx.SSL_free(open)
 
 	testing.expect(t, reload_tls(&s, &l), "reload_tls reported failure against a certificate that loads fine")
 	testing.expect(
@@ -117,6 +120,12 @@ test_reload_tls_swaps_in_a_fresh_context :: proc(t: ^testing.T) {
 		l.dot_ctx != first,
 		"reload_tls left the old context in place instead of swapping in a freshly loaded one",
 	)
+	displaced := tlsx.Context {
+		ptr       = tlsx.SSL_get_SSL_CTX(open),
+		is_server = true,
+	}
+	_, live := tlsx.ticket_key_name(&displaced)
+	testing.expect(t, !live, "the displaced context kept a ticket key for its open connection")
 }
 
 @(test)

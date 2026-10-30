@@ -58,12 +58,18 @@ every ticket outstanding stops resuming when a certificate is renewed.
 
 `mu` because the callback runs on every loop thread's handshakes and the
 maintenance thread rotates the keys under them.
+
+`retired` once a reload has displaced the context (`retire_ticket_keys`): both
+keys are erased then and none is drawn again, because the maintenance tick only
+reaches the contexts in the listener slots, while an open connection can hold a
+displaced one for as long as it stays open.
 */
 @(private)
 Ticket_Keys :: struct {
 	mu:       sync.Mutex,
 	current:  Ticket_Key,
 	previous: Ticket_Key,
+	retired:  bool,
 }
 
 @(private)
@@ -115,7 +121,7 @@ advance_ticket_keys :: proc "contextless" (k: ^Ticket_Keys, now: time.Tick) {
 	if k.previous.live && time.tick_diff(k.previous.born, now) >= 2 * TICKET_KEY_INTERVAL {
 		erase_ticket_key(&k.previous)
 	}
-	if !k.current.live {
+	if !k.current.live && !k.retired {
 		draw_ticket_key(&k.current, now)
 	}
 }
@@ -178,6 +184,26 @@ rotate_ticket_keys :: proc(ctx: ^Context, now: time.Tick) {
 }
 
 /*
+Erase a server context's ticket keys for good, as a reload displaces it.
+
+The context that replaces it has keys of its own, so no ticket under these is
+opened again; but an open connection keeps the displaced `SSL_CTX` alive, and
+with it these keys, for as long as it stays open, out of the maintenance tick's
+reach.
+*/
+retire_ticket_keys :: proc(ctx: ^Context) {
+	k := ticket_keys_of(ctx.ptr) if ctx != nil else nil
+	if k == nil {
+		return
+	}
+	sync.mutex_lock(&k.mu)
+	defer sync.mutex_unlock(&k.mu)
+	erase_ticket_key(&k.current)
+	erase_ticket_key(&k.previous)
+	k.retired = true
+}
+
+/*
 Seal or open one ticket.
 
 The key is copied out under the lock and erased from the stack after use, so the
@@ -187,7 +213,10 @@ answered with 2, which has OpenSSL issue a fresh one under the current key. The
 fresh ticket keeps the session's original time, so it does not extend the
 session: a session resumes for one interval from its full handshake, in TLS 1.2
 and 1.3 alike. Any failure answers 0: no ticket sealed, or a full handshake for
-the one offered.
+the one offered. On sealing, OpenSSL answers 0 in TLS 1.3 by sending no
+NewSessionTicket, and in TLS 1.2 by sending the empty ticket RFC 5077 §3.3
+allows; both since 3.0. A handshake still running on a retired context gets no
+ticket that way.
 */
 @(private)
 ticket_key_cb :: proc "c" (

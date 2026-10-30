@@ -1579,3 +1579,76 @@ test_ticket_keys_advance_on_their_interval :: proc(t: ^testing.T) {
 	testing.expect(t, k.current.live && k.current.name != second.name, "an idle context kept sealing under an old key")
 	testing.expect(t, !k.previous.live && k.previous.name == {}, "an idle context kept a key past two intervals")
 }
+
+/*
+A context a reload displaced keeps no ticket key, however long a connection
+keeps it alive: retiring it erases both keys and no handshake draws one again.
+A handshake still running on it completes without a ticket, which is how OpenSSL
+answers a callback that seals nothing, in TLS 1.2 and 1.3 alike.
+*/
+@(test)
+test_retired_ticket_keys_are_erased_and_never_redrawn :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+	cert, key, have := ensure_certs()
+	if !have {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+
+	for version in ([]c.long{TLS1_2_VERSION, TLS1_3_VERSION}) {
+		listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+		if lerr != nil {
+			testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+			return
+		}
+		defer net.close(listener)
+		ep, _ := net.bound_endpoint(listener)
+
+		sctx, serr := server_context(cert, key)
+		if serr != .None {
+			testing.expectf(t, false, "server_context: %v", serr)
+			return
+		}
+		defer context_destroy(sctx)
+		k := ticket_keys_of(sctx.ptr)
+		if !testing.expect(t, k != nil, "the server context has no ticket keys of its own") {
+			return
+		}
+		cctx, _ := client_context(false)
+		defer context_destroy(cctx)
+		ssl_ctx_set_max_proto_version(cctx.ptr, version)
+
+		srv := Resume_Server {
+			listener = listener,
+			ctx      = sctx,
+			rounds   = 3,
+		}
+		worker := thread.create_and_start_with_poly_data(&srv, resume_server_worker)
+		defer thread.destroy(worker)
+		defer posix.shutdown(posix.FD(net.Socket(listener)), .RDWR)
+
+		_, first, ok := resume_client(t, cctx.ptr, ep, nil)
+		defer if first != nil {SSL_SESSION_free(first)}
+		testing.expectf(t, ok && first != nil, "%x: the first handshake failed", version)
+
+		retire_ticket_keys(sctx)
+		sync.mutex_lock(&k.mu)
+		erased := !k.current.live && !k.previous.live && k.current.name == {} && k.previous.name == {}
+		sync.mutex_unlock(&k.mu)
+		testing.expectf(t, erased, "%x: retiring left a ticket key in memory", version)
+
+		_, second, ok2 := resume_client(t, cctx.ptr, ep, nil)
+		defer if second != nil {SSL_SESSION_free(second)}
+		_, has := ticket_name(second)
+		testing.expectf(t, ok2 && !has, "%x: a handshake on a retired context completed %v, got a ticket %v", version, ok2, has)
+
+		reused, _, ok3 := resume_client(t, cctx.ptr, ep, first)
+		testing.expectf(t, ok3 && !reused, "%x: a ticket resumed on a retired context", version)
+
+		rotate_ticket_keys(sctx, time.tick_add(ticket_now(), 10 * TICKET_KEY_INTERVAL))
+		sync.mutex_lock(&k.mu)
+		redrawn := k.current.live || k.previous.live
+		sync.mutex_unlock(&k.mu)
+		testing.expectf(t, !redrawn, "%x: a retired context drew a ticket key again", version)
+	}
+}
