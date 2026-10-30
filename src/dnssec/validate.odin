@@ -684,14 +684,21 @@ Whether a verdict of `status` takes the reason from the one standing at `worst`.
 A worse verdict always does. At `Bogus` beside `Bogus`, one resting on no window
 takes it from one resting on a window: RFC 8914 codes 7 and 8 are for when "no
 signatures are presently valid", and a set whose signature inside its window
-failed is a forgery in the same message, whichever came first in it.
+failed is a forgery in the same message, whichever came first in it. Between
+two lapses the one `note_lapsed` would keep takes it, so the code and the
+instant do not depend on the order the sender chose either.
 */
 @(private)
 takes_reason :: proc(worst, status: Status, held, offered: Lapsed) -> bool {
 	if worse(worst, status) != worst {
 		return true
 	}
-	return worst == .Bogus && status == .Bogus && held.window != .Current && offered.window == .Current
+	return(
+		worst == .Bogus &&
+		status == .Bogus &&
+		held.window != .Current &&
+		(offered.window == .Current || lapse_outranks(offered, held)) \
+	)
 }
 
 /*
@@ -2810,7 +2817,8 @@ validate_rrset :: proc(
 	// Which signature carried the set, for `Authenticated_Set`.
 	signer: string,
 	rrsig: Rrsig,
-	// The window this set's signatures fell outside, on a `Bogus` that rests on it.
+	// The window this set's signatures fell outside, on a `Bogus` that rests on
+	// it; `refuted` on one whose signature inside its window failed.
 	lapsed: Lapsed,
 ) {
 	/*
@@ -3023,7 +3031,9 @@ validate_rrset :: proc(
 	case .Indeterminate:
 		return .Indeterminate, "", walk_reason(budget), "", {}, {}
 	case .Bogus:
-		return .Bogus, "", BROKEN_CHAIN, "", {}, budget.broken_lapsed
+		// A signature of this set tried and failed is a forgery beside the
+		// chain's lapse, which is code 6 (`takes_reason`).
+		return .Bogus, "", BROKEN_CHAIN, "", {}, Lapsed{refuted = true} if tried else budget.broken_lapsed
 	case .Secure:
 	}
 
@@ -3091,13 +3101,15 @@ validate_rrset :: proc(
 	Whether that was the window. A lapsed signature never reaches the loop - it
 	is turned away before its signer is walked - so the zone's keys are read
 	here, off the walk that just established the holder, and checking a
-	signature against them is a comparison of two fields apiece.
+	signature against them is a comparison of two fields apiece. A set that had
+	one tried is `refuted`, as in `verified_rrset`.
 	*/
-	if !tried {
-		for sig in sigs {
-			if dns.name_equal_fold(sig.signer, owner_zone) {
-				note_lapsed(&lapsed, sig, owner_keys, unix)
-			}
+	if tried {
+		return .Bogus, "", missing, "", {}, {refuted = true}
+	}
+	for sig in sigs {
+		if dns.name_equal_fold(sig.signer, owner_zone) {
+			note_lapsed(&lapsed, sig, owner_keys, unix)
 		}
 	}
 	return .Bogus, "", missing, "", {}, lapsed

@@ -71,8 +71,8 @@ refusal's query line carries `outcome=failed detail=dnssec:<upstream>`, or
 
 ```
 ts=2026-08-07T09:12:52Z level=warn msg="dnssec: A xc.example.com did not validate: Bogus (broken chain of trust: example.com: the reply to the DS question held neither a DS nor a denial signed by the parent); answer came from quad9-dot"
-ts=2026-08-07T09:13:05Z level=warn msg="dnssec: A www.mozilla.org did not validate: Bogus (signature not yet valid until 2026-08-07T11:37:52Z: mozilla.org: the reply to the DS question held neither a DS nor a denial signed by the parent); answer came from quad9-dot"
 ts=2026-08-07T09:12:52Z level=info msg=query client=192.0.2.10 port=44188 proto=udp qtype=A qname=xc.example.com outcome=failed detail=dnssec:quad9-dot ms=126.5
+ts=2026-08-07T09:13:05Z level=warn msg="dnssec: A www.mozilla.org did not validate: Bogus (signature not yet valid until 2026-08-07T11:37:52Z: mozilla.org: the reply to the DS question held neither a DS nor a denial signed by the parent); answer came from quad9-dot"
 ```
 
 The upstream is named because members of one group can disagree about a zone: the

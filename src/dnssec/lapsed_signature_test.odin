@@ -716,6 +716,13 @@ test_a_forgery_beside_a_lapse_takes_the_reason :: proc(t: ^testing.T) {
 	testing.expect(t, takes_reason(.Bogus, .Bogus, lapse, {refuted = true}), "a refuted set after a lapse should take the reason")
 	testing.expect(t, !takes_reason(.Bogus, .Bogus, {}, lapse), "a lapse after a forgery should not take the reason")
 	testing.expect(t, !takes_reason(.Bogus, .Bogus, lapse, lapse), "a second lapse should not take the reason")
+	// Between two lapses, in either order, the one `note_lapsed` keeps.
+	not_yet := Lapsed{window = .Not_Yet_Valid, at = 9}
+	later := Lapsed{window = .Expired, at = 5}
+	testing.expect(t, takes_reason(.Bogus, .Bogus, lapse, not_yet), "not yet valid after expired should take the reason")
+	testing.expect(t, !takes_reason(.Bogus, .Bogus, not_yet, lapse), "expired after not yet valid should not take the reason")
+	testing.expect(t, takes_reason(.Bogus, .Bogus, lapse, later), "a later expiration should take the reason")
+	testing.expect(t, !takes_reason(.Bogus, .Bogus, later, lapse), "an earlier expiration should not take the reason")
 	testing.expect(t, takes_reason(.Insecure, .Bogus, {}, lapse), "a worse verdict should take the reason")
 	testing.expect(t, !takes_reason(.Bogus, .Indeterminate, lapse, {}), "a better verdict should not take the reason")
 }
@@ -750,5 +757,30 @@ test_a_forgery_beside_a_lapse_is_a_forgery_end_to_end :: proc(t: ^testing.T) {
 			result.reason,
 		)
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A signature tried inside its window and failed is a forgery even when the chain
+to the set's zone broke on a window: code 6. `www.dsx.` sits below a DS whose
+signature expired; its own signature is rewritten here to name the root, whose
+chain holds, so it is tried against the root's key and fails.
+*/
+@(test)
+test_a_failed_signature_over_a_lapsed_chain_is_a_forgery :: proc(t: ^testing.T) {
+	result := lp_validate_with(
+		"lp_dsx_www",
+		"www.dsx.",
+		"005700010f0200000e107d3b18206a478820e2700364737800",
+		"005300010f0200000e107d3b18206a478820e2b300",
+	)
+	testing.expectf(
+		t,
+		result.status == .Bogus && result.lapsed.window == .Current && result.reason == BROKEN_CHAIN,
+		"a failed signature beside a lapsed chain should be a forgery, got %v %v %q",
+		result.status,
+		result.lapsed.window,
+		result.reason,
+	)
 	free_all(context.temp_allocator)
 }
