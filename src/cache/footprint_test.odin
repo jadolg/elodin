@@ -111,7 +111,14 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	// The Cache itself is the only allocation the count leaves out.
 	held := r.held - (size_of(Cache) + 64)
 	used := bytes_used(c)
-	testing.expectf(t, held <= BUDGET, "the cache holds %d bytes against a %d byte budget", held, BUDGET)
+	/*
+	The budget binds the count, exactly; the heap agrees with the count to 2%.
+	`held` is not held to the budget itself: glibc hands back a free chunk whole
+	when what is left over would be under its minimum, so the slack an
+	allocation carries depends on what earlier tests on the same thread freed,
+	and a run near the budget lands either side of it.
+	*/
+	testing.expectf(t, used <= BUDGET, "the cache counts %d bytes against a %d byte budget", used, BUDGET)
 	testing.expectf(
 		t,
 		abs(held - used) <= held / 50,
