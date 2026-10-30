@@ -30,7 +30,8 @@ build_answer :: proc(name: string, ttl: u32, allocator := context.allocator) -> 
 }
 
 @(private)
-build_nxdomain :: proc(name: string, soa_min: u32, allocator := context.allocator) -> ([]u8, dns.Message) {
+build_nxdomain :: proc(name: string, soa_min: u32, allocator := context.allocator, edns := false) -> ([]u8, dns.Message) {
+	opt := []dns.Record{dns.make_opt(1232, false)}
 	m := dns.Message {
 		id        = 0x2222,
 		question  = []dns.Question{{name = name, type = .A, class = .IN}},
@@ -55,6 +56,9 @@ build_nxdomain :: proc(name: string, soa_min: u32, allocator := context.allocato
 	m.flags.qr = true
 	m.flags.ra = true
 	m.flags.rcode = u8(dns.Rcode.NX_Domain)
+	if edns {
+		m.additional = opt
+	}
 	wire, _, err := dns.encode_message(m, allocator)
 	if err != .None {
 		panic("failed to encode test nxdomain")
@@ -579,7 +583,7 @@ expired one, `put` over a key already held, `sweep`, `clear_all` - and each is
 its own opportunity to forget.
 */
 @(test)
-test_byte_accounting_comes_back_to_zero :: proc(t: ^testing.T) {
+test_byte_accounting_comes_back_to_the_table :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
 	defer mem.tracking_allocator_destroy(&track)

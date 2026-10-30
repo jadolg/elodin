@@ -75,7 +75,8 @@ distinct names leaves behind (issue #531).
 An NXDOMAIN with one SOA is a few dozen bytes of wire, so what it costs is
 mostly the five allocations an entry is and its slot in the map - and the count
 has been raised so far that the byte budget is what binds, which is the setting
-under which those have to be counted.
+under which those have to be counted. With an OPT record, as an upstream asked
+over EDNS sends it, whose slot `scan_ttl_offsets` sizes for and then drops.
 */
 @(test)
 test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
@@ -89,7 +90,7 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	kb: [KEY_MAX]u8
 	for i in 0 ..< INSERTS {
 		name := fmt.tprintf("n%d.example.", i)
-		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
+		wire, msg := build_nxdomain(name, 300, context.temp_allocator, edns = true)
 		testing.expectf(t, put(c, key_for(kb[:], name), wire, msg), "put %d failed", i)
 		if i % 1000 == 0 {
 			free_all(context.temp_allocator)
@@ -207,4 +208,71 @@ test_put_keeps_the_entry_its_table_tipped_over :: proc(t: ^testing.T) {
 	testing.expectf(t, bytes_used(c) > size, "the table is not counted: %d for an entry of %d", bytes_used(c), size)
 	_, _, ok := get(c, key, context.temp_allocator)
 	testing.expect(t, ok, "put reported an entry stored that it had evicted")
+}
+
+/*
+A sweep gives the table back once it is under a quarter full, and not before.
+
+Odin would halve it below three eighths, which is where a table at the byte
+budget sits after an insert doubled it and evictions paid for that: halved by
+one sweep and regrown by the next inserts, every sweep would rehash the cache
+twice under its lock. And the entries need not have left through the sweep
+itself - `get` drops an expired entry it meets first - so a sweep that removes
+nothing still looks.
+*/
+@(test)
+test_sweep_shrinks_only_a_mostly_empty_table :: proc(t: ^testing.T) {
+	ENTRIES :: 3000
+	c := make_cache(Options{max_entries = 1_000_000, max_ttl = 3600})
+	defer destroy(c)
+
+	kb: [KEY_MAX]u8
+	for i in 0 ..< ENTRIES {
+		name := fmt.tprintf("n%d.example.", i)
+		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
+		put(c, key_for(kb[:], name), wire, msg)
+		free_all(context.temp_allocator)
+	}
+	full := cap(c.entries)
+
+	// Each dropped by `get` on meeting it expired, so no sweep removes them.
+	gone := loop.moment_add(loop.moment_now(), -time.Second)
+	drop_until :: proc(c: ^Cache, kb: []u8, from, to: int, gone: loop.Moment) {
+		for i in from ..< to {
+			key := key_for(kb, fmt.tprintf("n%d.example.", i))
+			c.entries[key].expires = gone
+			_, _, _ = get(c, key, context.temp_allocator)
+			free_all(context.temp_allocator)
+		}
+	}
+
+	// Under three eighths, which Odin would halve, and over a quarter.
+	drop_until(c, kb[:], 0, 1800, gone)
+	testing.expectf(t, len(c.entries) * 8 < full * 3 && len(c.entries) * 4 >= full, "the premise: %d entries in %d slots", len(c.entries), full)
+	testing.expect_value(t, sweep(c), 0)
+	testing.expect_value(t, cap(c.entries), full)
+
+	// Under a quarter.
+	drop_until(c, kb[:], 1800, 2200, gone)
+	testing.expectf(t, len(c.entries) * 4 < full, "the premise: %d entries in %d slots", len(c.entries), full)
+	testing.expect_value(t, sweep(c), 0)
+	testing.expectf(t, cap(c.entries) < full, "a sweep left %d slots for %d entries", cap(c.entries), len(c.entries))
+}
+
+// A reload that drops everything gives back the table too.
+@(test)
+test_clear_all_shrinks_the_table :: proc(t: ^testing.T) {
+	r: Resident
+	c := make_cache(Options{max_entries = 1_000_000, max_ttl = 3600}, resident_allocator(&r))
+	defer destroy(c)
+
+	kb: [KEY_MAX]u8
+	for i in 0 ..< 20_000 {
+		name := fmt.tprintf("n%d.example.", i)
+		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
+		put(c, key_for(kb[:], name), wire, msg)
+		free_all(context.temp_allocator)
+	}
+	clear_all(c)
+	testing.expectf(t, r.held <= 4096, "a cleared cache holds %d bytes", r.held)
 }

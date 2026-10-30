@@ -1322,11 +1322,19 @@ Give back what the table grew to hold entries that have since gone.
 
 A map only ever grows on insert, so without this a cache that filled once would
 keep the table for its peak for the life of the process. Called where many
-entries can go at once: a sweep, a reload. A no-op unless the table can halve.
-The caller holds `c.mu`.
+entries can go at once: a sweep, a reload.
+
+Only once the table is under a quarter full. Odin would halve it below three
+eighths, and that is where a table at the byte budget sits after the doubling
+an insert made and the eviction that paid for it: halved by one sweep, it is
+regrown by the next few inserts, so every sweep would rehash the cache under
+its lock twice and evict to pay for the table again. The caller holds `c.mu`.
 */
 @(private)
 shrink_table :: proc(c: ^Cache) {
+	if len(c.entries) * 4 >= cap(c.entries) {
+		return
+	}
 	_, _ = shrink(&c.entries)
 }
 
@@ -1374,9 +1382,9 @@ sweep :: proc(c: ^Cache) -> (removed: int) {
 		}
 		e = prev
 	}
-	if removed > 0 {
-		shrink_table(c)
-	}
+	// Whether or not this sweep removed anything: `get` drops an expired entry
+	// it meets first, and `forget` takes entries too.
+	shrink_table(c)
 	return
 }
 
