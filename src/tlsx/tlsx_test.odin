@@ -1441,13 +1441,6 @@ ticket_name :: proc(s: ^SSL_SESSION) -> (name: [TLSEXT_KEYNAME_LENGTH]u8, ok: bo
 	return name, true
 }
 
-@(private = "file")
-current_ticket_key :: proc(k: ^Ticket_Keys) -> Ticket_Key {
-	sync.mutex_lock(&k.mu)
-	defer sync.mutex_unlock(&k.mu)
-	return k.current
-}
-
 /*
 A server context's ticket keys rotate (RFC 9325 §3.4), and a ticket resumes for
 one interval past its key's retirement and not after.
@@ -1511,18 +1504,18 @@ test_ticket_keys_rotate_and_old_tickets_stop_resuming :: proc(t: ^testing.T) {
 
 		_, first, ok := resume_client(t, cctx.ptr, ep, nil)
 		defer if first != nil {SSL_SESSION_free(first)}
-		sealed := current_ticket_key(k)
+		sealed, _ := ticket_key_name(sctx)
 		name, has := ticket_name(first)
-		testing.expectf(t, ok && has && name == sealed.name, "%x: the first ticket is not under the context's key", version)
+		testing.expectf(t, ok && has && name == sealed, "%x: the first ticket is not under the context's key", version)
 
 		rotate_ticket_keys(sctx, loop.moment_add(start, TICKET_KEY_INTERVAL))
-		renewed := current_ticket_key(k)
-		testing.expectf(t, renewed.name != sealed.name, "%x: the key did not rotate after an interval", version)
+		renewed, _ := ticket_key_name(sctx)
+		testing.expectf(t, renewed != sealed, "%x: the key did not rotate after an interval", version)
 		reused, second, ok2 := resume_client(t, cctx.ptr, ep, first)
 		defer if second != nil {SSL_SESSION_free(second)}
 		testing.expectf(t, ok2 && reused, "%x: a ticket under the retired key did not resume", version)
 		name, has = ticket_name(second)
-		testing.expectf(t, has && name == renewed.name, "%x: resuming on the retired key brought no ticket under the new one", version)
+		testing.expectf(t, has && name == renewed, "%x: resuming on the retired key brought no ticket under the new one", version)
 
 		rotate_ticket_keys(sctx, loop.moment_add(start, 3 * TICKET_KEY_INTERVAL))
 		resumed, expired, ok4 := resume_client(t, cctx.ptr, ep, second)
@@ -1550,6 +1543,9 @@ test_ticket_keys_advance_on_their_interval :: proc(t: ^testing.T) {
 	// The interval keeps the session timeout OpenSSL gives a server by default,
 	// so rotating shortens no ticket's life.
 	plain := SSL_CTX_new(TLS_server_method())
+	if !testing.expect(t, plain != nil, "SSL_CTX_new failed") {
+		return
+	}
 	testing.expectf(t, SSL_CTX_get_timeout(plain) == c.long(I / time.Second), "OpenSSL's default session timeout is %ds", SSL_CTX_get_timeout(plain))
 	SSL_CTX_free(plain)
 	t0 := loop.moment_now()

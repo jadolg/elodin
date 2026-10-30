@@ -537,7 +537,9 @@ Nothing else here has the wrapper's lifetime, which is the point: `SSL_CTX_free`
 is a reference count decrement, and a connection accepted before this call still
 holds one. Anything freed alongside it that a handshake can still reach would be
 freed too early, which is why the ALPN preference list belongs to the
-`SSL_CTX` rather than to the wrapper.
+`SSL_CTX` rather than to the wrapper. The ticket keys are the one deliberate
+exception: they are erased here (`retire_ticket_keys`), so a handshake still
+running on this `SSL_CTX` completes without a ticket.
 */
 context_destroy :: proc(ctx: ^Context) {
 	if ctx == nil {

@@ -113,6 +113,9 @@ test_reload_tls_swaps_in_a_fresh_context :: proc(t: ^testing.T) {
 	defer tlsx.context_destroy(l.dot_ctx)
 	// An open connection, holding the displaced `SSL_CTX` past the reload.
 	open := tlsx.SSL_new(first.ptr)
+	if !testing.expect(t, open != nil, "SSL_new failed") {
+		return
+	}
 	defer tlsx.SSL_free(open)
 
 	testing.expect(t, reload_tls(&s, &l), "reload_tls reported failure against a certificate that loads fine")

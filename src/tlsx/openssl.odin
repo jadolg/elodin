@@ -19,8 +19,8 @@ EVP_CIPHER :: struct {}
 EVP_CIPHER_CTX :: struct {}
 EVP_MAC_CTX :: struct {}
 
-// `struct ossl_param_st` from <openssl/core.h>, built by hand rather than with
-// the `OSSL_PARAM_construct_*` helpers, which return it by value.
+// `struct ossl_param_st` from <openssl/core.h>. The ticket callback fills a
+// literal array of these on its stack, which needs no call per parameter.
 OSSL_PARAM :: struct {
 	key:         cstring,
 	data_type:   c.uint,
