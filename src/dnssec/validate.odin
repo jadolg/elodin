@@ -3094,8 +3094,10 @@ validate_rrset :: proc(
 	zone that publishes only that algorithm has no usable DS and goes insecure
 	in front of this loop rather than through it.
 	*/
+	// `unsupported` is set only on a signature that was tried, so the set is
+	// `refuted`, as on every other return that tried one.
 	if unsupported {
-		return .Bogus, "", "no signature this build can verify", "", {}, {}
+		return .Bogus, "", "no signature this build can verify", "", {}, {refuted = true}
 	}
 	/*
 	Whether that was the window. A lapsed signature never reaches the loop - it
@@ -3582,9 +3584,10 @@ verified_rrset :: proc(
 	if len(records) == 0 {
 		return nil, "", {}, false, false, {}
 	}
-	// As in `validate_rrset`: a set that had a signature in its window tried is
-	// not put down to one that lapsed.
-	tried := false
+	// As in `validate_rrset`: a set with a signature in its window that failed
+	// is not put down to one that lapsed. One that verified and was turned
+	// away for expanding a wildcard did not fail, and leaves the window open.
+	refuted := false
 	scratch := Signing_Scratch {
 		budget = budget,
 	}
@@ -3598,7 +3601,6 @@ verified_rrset :: proc(
 			note_lapsed(&lapsed, sig, keys, unix)
 			continue
 		}
-		tried = true
 		// Bounded across the question rather than per RRset; see
 		// `MAX_VERIFICATIONS_PER_QUERY` for why the difference matters.
 		if !spend_verification(budget) {
@@ -3654,8 +3656,9 @@ verified_rrset :: proc(
 		if result == .Ok && encloser == "" {
 			return records, sig.signer, sig, true, false, {}
 		}
+		refuted ||= result != .Ok
 	}
-	return nil, "", {}, false, false, Lapsed{refuted = true} if tried else lapsed
+	return nil, "", {}, false, false, Lapsed{refuted = true} if refuted else lapsed
 }
 
 // ---------------------------------------------------------------------------

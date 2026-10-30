@@ -396,6 +396,29 @@ LP_FIXTURES := []Fixture{
 			"24b3214597c16603a31affe0c1fd132a82ef7ce31a030806f9c75bf24feb26652f0fd2bce92f71f214cb4e7d5e982609",
 	},
 	{
+		key   = "lp_wc_cn_ds",
+		name  = "z.wl.",
+		type  = .DS,
+		rcode = 0,
+		wire  = "123485800001000200040000017a02776c00002b0001017a02776c000005000100000e100006017902776d00017a0277" +
+			"6c00002e000100000e10005600050f0100000e107d3b18206a478820abed02776c0019331a588f3bfdb27c99121543e5" +
+			"e75ec2e255a2f0284a6fbc3142ea14f4d71f3833b91472cef1405c1c2c1c25791869495dd8b9f3ae3c9beedfde0c6c93" +
+			"e60f012a02776c00002f000100000e10000c02776c000006400000000003012a02776c00002e000100000e100056002f" +
+			"0f0100000e10a2d31e2090071b20abed02776c009feff2810b5b959ec1813e59b226fc9f2f65ec7dda26d32f8b4160b3" +
+			"7177521ad388d7fe4974d41e1acedf1a892770a29c9b2c1730aa1ea4ce59bac650be2a0202776c000006000100000e10" +
+			"002a026e7302776c000a686f73746d617374657202776c000000000100000e100000038400093a800000012c02776c00" +
+			"002e000100000e10005600060f0100000e107d3b18206a478820abed02776c00b207c3bcb872cca93e83f41e2d27eb03" +
+			"25a38a5e107ab07b73942fd476d1357b357a394eaf3b2bc45e61a13cc5753837474d255ac8743be8968caf3381891f02",
+	},
+	{
+		key   = "lp_wc_cn_www",
+		name  = "www.z.wl.",
+		type  = .A,
+		rcode = 0,
+		wire  = "12348580000100010000000003777777017a02776c000001000103777777017a02776c000001000100000e100004c000" +
+			"0209",
+	},
+	{
 		key   = "lp_cn_ds",
 		name  = "cn.lt.",
 		type  = .DS,
@@ -530,6 +553,7 @@ test_a_signature_outside_its_window_is_named_on_every_road :: proc(t: ^testing.T
 		{"lp_insecure_a", "www.unsigned.lt.", .Not_Yet_Valid, LP_NOT_YET, "the parent's denial of a DS"},
 		{"lp_nope_nxdomain", "nope.lt.", .Not_Yet_Valid, LP_NOT_YET, "the NSEC an NXDOMAIN rests on"},
 		{"lp_x_a", "x.wl.", .Expired, LP_EXPIRED, "the NSEC a wildcard expansion rests on"},
+		{"lp_wc_cn_www", "www.z.wl.", .Not_Yet_Valid, LP_NOT_YET, "a DS denial beside a wildcard CNAME that verified"},
 		{"lp_dname_a", "www.late.lt.", .Expired, LP_EXPIRED, "a DNAME and the unsigned CNAME it synthesized"},
 	}
 	for c in cases {

@@ -1751,6 +1751,17 @@ def lapsed_signatures():
                  hop + [sign(hop, wl, labels=1)] + target + [sign(target, wm, labels=1)],
                  wild_nsec + [sign(wild_nsec, wl, window=EXPIRED)] + wm_nsec + [wm_nsec_forged]))
 
+    # The DS question at `z.wl.` answered by a CNAME synthesized from `*.wl.`,
+    # its signature current and verifying, beside the wildcard's NSEC signed in
+    # the future. An expansion is no answer to a DS question, but it is no
+    # failed signature either: the window is what is left, code 8.
+    wc_cn = [RR("z.wl.", CNAME, wire_name("y.wm."))]
+    emit("lp_wc_cn_ds", "z.wl.", "DS",
+         message("z.wl.", DS, wc_cn + [sign(wc_cn, wl, labels=1)],
+                 wild_nsec + [sign(wild_nsec, wl, window=NOT_YET)] + wl_soa + [wl_soa_sig]))
+    wc_www = [a_rr("www.z.wl.", "192.0.2.9")]
+    emit("lp_wc_cn_www", "www.z.wl.", "A", message("www.z.wl.", A, wc_www))
+
     # The DS question at `cn.lt.` answered by a CNAME `lt.` signed in the
     # future, beside the NSEC that would deny a DS there, whose current
     # signature is made over other data.
