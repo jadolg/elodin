@@ -27,7 +27,6 @@ no_upstream :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Al
 	return nil, false
 }
 
-
 // A DNSKEY whose RDATA is `size` bytes, usable unless `flags` says otherwise.
 // Nothing about it verifies anything; these tests are about what the cache
 // keeps, not about what validates.

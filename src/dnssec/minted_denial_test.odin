@@ -655,18 +655,18 @@ test_the_memo_is_believed_for_less_time_than_a_zone :: proc(t: ^testing.T) {
 	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
-	non_cut_remember(v, "long.drtest.", MAX_ZONE_TTL, fixture_moment(now))
+	// One reading of the clock for every step, so the second either side of
+	// the ceiling is not eaten by the test's own running time.
+	base := loop.moment_now()
+	non_cut_remember(v, "long.drtest.", MAX_ZONE_TTL, base)
 
-	within := time.time_add(now, time.Duration(MAX_NON_CUT_TTL - 1) * time.Second)
-	testing.expect(t, dr_remembered(v, "long.drtest.", within), "it should hold up to its own ceiling")
+	within := loop.moment_add(base, time.Duration(MAX_NON_CUT_TTL - 1) * time.Second)
+	_, _, remembered := cache_get(v, "long.drtest.", within, context.temp_allocator)
+	testing.expect(t, remembered, "it should hold up to its own ceiling")
 
-	past := time.time_add(now, time.Duration(MAX_NON_CUT_TTL + 1) * time.Second)
-	testing.expect(
-		t,
-		!dr_remembered(v, "long.drtest.", past),
-		"a denial offering an hour should still be forgotten at the memo's own ceiling",
-	)
+	past := loop.moment_add(base, time.Duration(MAX_NON_CUT_TTL + 1) * time.Second)
+	_, _, remembered = cache_get(v, "long.drtest.", past, context.temp_allocator)
+	testing.expect(t, !remembered, "a denial offering an hour should still be forgotten at the memo's own ceiling")
 	free_all(context.temp_allocator)
 }
 
@@ -897,17 +897,18 @@ test_a_non_cut_is_not_remembered_past_its_signature :: proc(t: ^testing.T) {
 test_a_zone_entry_does_not_outlive_its_signature_ceiling :: proc(t: ^testing.T) {
 	v := make_validator(dr_query, nil, Options{})
 	defer destroy_validator(v)
-	now := time.unix(FIXTURE_TIME, 0)
-	cache_put(v, "unsigned.drtest.", .Insecure, nil, MAX_ZONE_TTL, fixture_moment(now), 10)
-	_, found, _ := cache_get(v, "unsigned.drtest.", fixture_moment(time.unix(FIXTURE_TIME + 9, 0)), context.temp_allocator)
+	// One reading of the clock for every step; see the test above.
+	base := loop.moment_now()
+	cache_put(v, "unsigned.drtest.", .Insecure, nil, MAX_ZONE_TTL, base, 10)
+	_, found, _ := cache_get(v, "unsigned.drtest.", loop.moment_add(base, 9 * time.Second), context.temp_allocator)
 	testing.expect(t, found, "the entry went before its ceiling")
-	_, found, _ = cache_get(v, "unsigned.drtest.", fixture_moment(time.unix(FIXTURE_TIME + 11, 0)), context.temp_allocator)
+	_, found, _ = cache_get(v, "unsigned.drtest.", loop.moment_add(base, 11 * time.Second), context.temp_allocator)
 	testing.expect(t, !found, "the entry outlived its signatures, below MIN_ZONE_TTL")
 
 	// A zone whose owner signed its records with an Original TTL of zero, an
 	// hour before they lapse: held for the floor, or every question walks it.
-	cache_put(v, "zero.drtest.", .Insecure, nil, 0, fixture_moment(now), 3600)
-	_, found, _ = cache_get(v, "zero.drtest.", fixture_moment(time.unix(FIXTURE_TIME + MIN_ZONE_TTL - 1, 0)), context.temp_allocator)
+	cache_put(v, "zero.drtest.", .Insecure, nil, 0, base, 3600)
+	_, found, _ = cache_get(v, "zero.drtest.", loop.moment_add(base, (MIN_ZONE_TTL - 1) * time.Second), context.temp_allocator)
 	testing.expect(t, found, "an Original TTL of zero beat the floor")
 	free_all(context.temp_allocator)
 }

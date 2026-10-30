@@ -292,9 +292,9 @@ test_zone_keys_do_not_outlive_their_dnskey_ttl :: proc(t: ^testing.T) {
 		entry, found := v.zones[zone]
 		testing.expectf(t, found, "%s was not cached", zone)
 		if found {
-			// A second of slack for the moment the entry was stored after `before`.
+			// Timed from `budget.began`, read before `before`.
 			held := time.Duration(entry.expires - before)
-			testing.expectf(t, held <= 121 * time.Second, "%s's keys are kept %v over a DNSKEY TTL of 120 s", zone, held)
+			testing.expectf(t, held <= 120 * time.Second, "%s's keys are kept %v over a DNSKEY TTL of 120 s", zone, held)
 		}
 	}
 	free_all(context.temp_allocator)

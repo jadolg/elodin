@@ -1123,6 +1123,9 @@ validate :: proc(
 	// The client question's upstream deadline, for the lookups; see `Query_Proc`.
 	deadline: ^time.Tick = nil,
 ) -> Result {
+	// Read before the decode, so the walk's moment trails `now` by as little
+	// as it can; see `Budget.began`.
+	budget := query_budget(v)
 	msg, derr := dns.decode_message(wire, allocator, spent)
 	if derr != .None {
 		/*
@@ -1140,7 +1143,6 @@ validate :: proc(
 	}
 	class := msg.question[0].class if len(msg.question) > 0 else dns.Class.IN
 	unix := u32(time.to_unix_seconds(now))
-	budget := query_budget(v)
 	/*
 	Every signature's lapse is counted from the whole second `unix`, which `now`
 	is a fraction past. The zone cache is timed from that second too, or an entry
