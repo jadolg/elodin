@@ -77,10 +77,10 @@ check_primed :: proc(r: ^Runner, res: Query_Result, rcode: dns.Rcode) -> (issued
 		check_eq_int(r, len(msg.question) + len(msg.answer) + len(msg.authority), 0, "question, answer and authority records")
 	}
 	got, found := find_cookie(r, res.wire)
-	if check(r, found, "the priming answer carries no COOKIE option") {
-		check_eq_int(r, len(got), 24, "cookie length")
-		check(r, bytes_equal(got[:8], CLIENT_COOKIE), "the client cookie was not echoed")
+	if !check(r, found, "the priming answer carries no COOKIE option") || !check_eq_int(r, len(got), 24, "cookie length") {
+		return nil
 	}
+	check(r, bytes_equal(got[:8], CLIENT_COOKIE), "the client cookie was not echoed")
 	return got
 }
 

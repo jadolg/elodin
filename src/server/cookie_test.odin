@@ -323,7 +323,9 @@ response_cookie :: proc(wire: []u8) -> (data: []u8, found: bool) {
 response_rcode :: proc(wire: []u8) -> dns.Rcode {
 	m, err := dns.decode_message(wire, context.temp_allocator)
 	if err != .None {
-		return .Form_Err
+		// No rcode at all, so that a reply that does not decode can never pass
+		// for the FORMERR a case expects.
+		return dns.Rcode(max(u16))
 	}
 	return dns.rcode_of(m)
 }
@@ -707,7 +709,8 @@ test_cookie_priming_query :: proc(t: ^testing.T) {
 }
 
 // Section 5.4 extends QUERY for a cookie and nothing else: any other question
-// count, or no cookie to give, is still FORMERR.
+// count, or no cookie to give - cookies off, or a client address none can be
+// bound to - is still FORMERR.
 @(test)
 test_cookie_priming_needs_a_cookie_and_no_question :: proc(t: ^testing.T) {
 	client := "198.51.100.100:9999"
@@ -717,6 +720,7 @@ test_cookie_priming_needs_a_cookie_and_no_question :: proc(t: ^testing.T) {
 		{cookie = sent, client = client, proto = .UDP, questions = 0, disabled = true},
 		{cookie = sent, client = client, proto = .UDP, questions = 2},
 		{cookie = make([]u8, 9, context.temp_allocator), client = client, proto = .UDP, questions = 0},
+		{cookie = sent, client = "not-an-address", proto = .UDP, questions = 0},
 	}
 	for c, i in cases {
 		out, ok := roundtrip(t, c)
