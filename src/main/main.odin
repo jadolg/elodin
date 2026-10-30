@@ -765,7 +765,8 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	// Released last of all, once nothing can be using any generation: the
 	// block below drains the queries and stops the loops before this runs.
 	defer server.destroy_generations(&s)
-	// After the drain and a finished rebuild's join, the last that resolve.
+	// Runs after the drain and a finished rebuild's join, once nothing can
+	// resolve a hostname through it.
 	defer upstream.bootstrap_destroy()
 
 	// The main thread reads the configuration through `server.live` like any

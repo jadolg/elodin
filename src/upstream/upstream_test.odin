@@ -989,6 +989,9 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	HOST :: "mock.invalid"
 	servers := []string{net.endpoint_to_string(bound, context.temp_allocator)}
 
+	// What the test holds before the cache allocates anything, which is what
+	// `bootstrap_destroy` must bring it back to.
+	baseline := len(track.allocation_map)
 	addr, ok := bootstrap_resolve(servers, HOST)
 	testing.expect(t, ok, "the first lookup failed")
 	testing.expect(t, addr != nil, "the first lookup returned no address")
@@ -1026,8 +1029,8 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 
 	/*
 	A new hostname sweeps out the expired ones (#530). A blocklist's redirect
-	hops are resolved here too, under names the list host picks, so a map that
-	kept every key grew by one per hop for the life of the process.
+	hops are resolved here too, under names the list host picks; unswept, the
+	map would keep one key per hop for the life of the process.
 	*/
 	HOPS :: []string{"hop1.invalid", "hop2.invalid"}
 	for hop in HOPS {
@@ -1046,12 +1049,25 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	testing.expect(t, "hop3.invalid" in bootstrap_cache.entries, "the new hostname was swept with the expired")
 	testing.expect_value(t, len(track.allocation_map), settled)
 
+	// Within the TTL the sweep frees nothing, so the count is capped too: a
+	// name resolved while the map is full is answered and not kept.
+	for i := 1; len(bootstrap_cache.entries) < BOOTSTRAP_MAX_ENTRIES; i += 1 {
+		name := fmt.tprintf("fill%d.invalid", i)
+		if _, fill_ok := bootstrap_resolve(servers, name); !testing.expectf(t, fill_ok, "%s did not resolve", name) {
+			break
+		}
+	}
+	_, over_ok := bootstrap_resolve(servers, "over.invalid")
+	testing.expect(t, over_ok, "a name past the cap was not answered")
+	testing.expect_value(t, len(bootstrap_cache.entries), BOOTSTRAP_MAX_ENTRIES)
+	testing.expect(t, !("over.invalid" in bootstrap_cache.entries), "a name past the cap was kept")
+
 	// The cache is a package global that outlives this test, and its keys point
 	// into the tracking allocator that is about to go away. Destroying it hands
-	// back the one key and the map's storage.
+	// back every key and the map's storage.
 	bootstrap_destroy()
 	testing.expect(t, bootstrap_cache.entries == nil, "the map survived its destroy")
-	testing.expect_value(t, len(track.allocation_map), settled - 2)
+	testing.expect_value(t, len(track.allocation_map), baseline)
 
 	free_all(context.temp_allocator)
 }

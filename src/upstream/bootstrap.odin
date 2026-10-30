@@ -23,6 +23,16 @@ BOOTSTRAP_TTL :: 1 * time.Hour
 @(private)
 BOOTSTRAP_TIMEOUT :: 3 * time.Second
 
+/*
+At most this many hostnames cached at once. The sweep holds the map to what was
+resolved within `BOOTSTRAP_TTL`, but a short `blocking.refresh` fetches many
+times an hour, and each redirect is a name the list host chooses. A name
+resolved while the map is full is answered and not kept: an upstream publishes
+its endpoint once, and a list is fetched again a refresh later.
+*/
+@(private)
+BOOTSTRAP_MAX_ENTRIES :: 256
+
 @(private)
 Bootstrap_Entry :: struct {
 	address: net.Address,
@@ -117,16 +127,14 @@ bootstrap_resolve :: proc(
 			// entry is refreshed.
 			if hostname in bootstrap_cache.entries {
 				bootstrap_cache.entries[hostname] = entry
-			} else {
+			} else if bootstrap_prune(); len(bootstrap_cache.entries) < BOOTSTRAP_MAX_ENTRIES {
 				/*
-				A new key sweeps out the expired ones first. The hostnames are
-				not only the configured upstreams': every redirect a blocklist
-				download follows is resolved here, and the list host picks those
-				names, so a map that only ever grew kept one key per name a
-				remote host chose for the life of the process (#530). Swept, it
-				holds what was resolved within the last `BOOTSTRAP_TTL`.
+				A new key sweeps out the expired ones first, so the map holds
+				only what was resolved within the last `BOOTSTRAP_TTL` (#530).
+				The hostnames are not only the configured upstreams': every
+				redirect a blocklist download follows is resolved here, under
+				names the list host picks.
 				*/
-				bootstrap_prune()
 				bootstrap_cache.entries[strings.clone(hostname, bootstrap_cache.entries.allocator)] = entry
 			}
 			sync.mutex_unlock(&bootstrap_cache.mu)
@@ -147,19 +155,25 @@ upstream's hostname is the same kind of answer.
 bootstrap_forget :: proc() {
 	sync.mutex_lock(&bootstrap_cache.mu)
 	defer sync.mutex_unlock(&bootstrap_cache.mu)
-	for key in bootstrap_cache.entries {
-		delete(key, bootstrap_cache.entries.allocator)
-	}
-	clear(&bootstrap_cache.entries)
+	bootstrap_clear()
 }
 
 // Release the cache, at shutdown, once nothing can resolve through it.
 bootstrap_destroy :: proc() {
-	bootstrap_forget()
 	sync.mutex_lock(&bootstrap_cache.mu)
 	defer sync.mutex_unlock(&bootstrap_cache.mu)
+	bootstrap_clear()
 	delete(bootstrap_cache.entries)
 	bootstrap_cache.entries = nil
+}
+
+// Remove every entry. Under `mu`.
+@(private)
+bootstrap_clear :: proc() {
+	for key in bootstrap_cache.entries {
+		delete(key, bootstrap_cache.entries.allocator)
+	}
+	clear(&bootstrap_cache.entries)
 }
 
 /*
