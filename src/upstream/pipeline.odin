@@ -161,6 +161,42 @@ an hour rather than to the uptime.
 */
 PIPE_IDLE_RELEARN :: time.Hour
 
+/*
+How many of a connection's latest replies `pipe_backlogged` judges it by.
+
+A queue on a byte stream holds up every message behind it, so a standing one
+shows in every reply; a slow name holds up only its own, since a server may
+answer out of order (RFC 7766 section 7). Eight in a row all slow is a queue,
+and one is a name.
+*/
+PIPE_BACKLOG_SAMPLES :: 8
+
+// How long a connection's latest replies waited, newest at `next - 1`.
+@(private)
+Pipe_Backlog :: struct {
+	waited:   [PIPE_BACKLOG_SAMPLES]time.Duration,
+	next:     int,
+	// When the newest was taken.
+	at:       time.Tick,
+	/*
+	The shortest wait of any reply this connection has handed to its caller:
+	the round trip and the server's quickest answer, with nobody queued in
+	front. What a reply waited beyond it is what the queue cost it.
+
+	ponytail: the lowest for the connection's life, so a route that gets
+	slower for good reads as a queue of the difference until the connection is
+	redialled; a floor taken per window is the upgrade if that ever shows.
+	*/
+	floor:    time.Duration,
+	/*
+	The query let on past a shut gate, while it is still on the connection
+	(`pipe_admit`). Only compared with `Pipe_Conn.waiters`, never followed: it
+	is the caller's, and gone once that caller returns.
+	*/
+	probe:    ^Pipe_Waiter,
+	probe_id: u16,
+}
+
 @(private)
 Pipe_Waiter :: struct {
 	/*
@@ -181,6 +217,8 @@ Pipe_Waiter :: struct {
 	// that runs out of time can tell "my reply never came" from "nothing at
 	// all is coming". See `pipe_wait`.
 	seen:  u64,
+	// When it joined the connection, for `Pipe_Backlog`.
+	asked: time.Tick,
 	/*
 	What this waiter parks on, under `Pipe_Conn.mu`: signalled when its reply
 	lands, when the reading is handed to it, and when the connection dies. One
@@ -227,6 +265,7 @@ Pipe_Conn :: struct {
 	// Callers in a row that ran out of time on a connection that had nothing
 	// to say to anybody. Back to zero the moment anything is read off it.
 	silent:    int,
+	backlog:   Pipe_Backlog,
 	/*
 	What this connection was dialled with, and the budget a message half read
 	is finished on.
@@ -389,6 +428,100 @@ pipe_state :: proc(c: ^Pipe_Conn, idle_timeout: time.Duration, limit: int) -> Pi
 		return .Full
 	}
 	return .Ready
+}
+
+/*
+Whether a query with `left` to wait would only join a queue it cannot get to
+the front of in time. Called with `c.mu`.
+
+One connection carries a server's queries (RFC 7766 section 6.2.2), and on a
+lossy path its window shrinks to a few segments, so the answers it can carry
+a second can fall below the answers asked for (issue #551). Past that point
+everything put on it waits behind everything before it. A caller that gives up
+does not take its answer off the stream - the server sends it anyway - so a
+queue longer than the timeout spends the connection on answers nobody reads,
+and nearly every query fails, where turning the excess away keeps the rest
+answered.
+
+So the gate shuts when the last `PIPE_BACKLOG_SAMPLES` replies all waited at
+least half of what the query has left *beyond the connection's floor* - the
+quickest reply it has delivered, which is the round trip and the server's own
+time with nobody in front. A path that is merely far away, or a server that is
+merely slow, waits that long with no queue at all, and is not one. Half rather
+than all of it, because those replies describe the queue as it stood when they
+were asked, and under too much load it has grown since; the other half is room
+for that growth and for a stall of the stream, where one retransmission holds
+up every message behind it. On the path #551 was measured on, at ten truncated
+answers a second this keeps 62% of them answered against 37% with no gate, and
+at twenty 19% against 3.5%; all of what is left rather than half kept fewer
+answered than half did.
+
+Only on replies fresh enough to describe the queue now: the newest no older
+than the connection's timeout, and none of them before a gap that long, since
+`pipe_note_wait` starts the window afresh after one. Never for a query with no
+time left, which goes on and fails as the timeout it is.
+*/
+@(private)
+pipe_backlogged :: proc(c: ^Pipe_Conn, left: time.Duration) -> bool {
+	b := &c.backlog
+	if left <= 0 || time.tick_since(b.at) >= c.timeout {
+		return false
+	}
+	// A slot never written holds zero, which is below any floor: a connection
+	// with fewer replies than the window has not shown a queue.
+	for waited in b.waited {
+		if waited - b.floor < left / 2 {
+			return false
+		}
+	}
+	return true
+}
+
+/*
+Whether the query about to go on as `id` may, and if the gate is shut, make it
+the probe. Called with `c.mu`.
+
+A shut gate lets one query through at a time. The gate opens only on a reply
+that waited less, and a query turned away is never asked, so without one the
+gate would stay shut as long as anything was on the connection - a run of slow
+names answered out of order (RFC 7766 section 7) would shut out every quick
+one behind them. One at a time rather than one per reply, because a probe
+waits behind the whole queue: admitting as fast as replies come would hold the
+queue where it is rather than let it drain.
+*/
+@(private)
+pipe_admit :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16, left: time.Duration) -> bool {
+	if !pipe_backlogged(c, left) {
+		return true
+	}
+	b := &c.backlog
+	if b.probe != nil && c.waiters[b.probe_id] == b.probe {
+		return false
+	}
+	b.probe, b.probe_id = w, id
+	return true
+}
+
+/*
+Note how long the reply just read waited, `answered` when its caller was still
+there to take it. Called with `c.mu`. Only an answered one can lower the floor:
+one nobody waits for is sampled as the whole timeout, not as what it took.
+
+A window whose newest reply is older than the timeout describes a queue long
+gone, so it is emptied first: one slow name after a quiet spell is not eight.
+*/
+@(private)
+pipe_note_wait :: proc(c: ^Pipe_Conn, waited: time.Duration, answered: bool) {
+	b := &c.backlog
+	if time.tick_since(b.at) >= c.timeout {
+		b.waited = {}
+	}
+	b.waited[b.next] = waited
+	b.next = (b.next + 1) % PIPE_BACKLOG_SAMPLES
+	b.at = time.tick_now()
+	if answered && (b.floor == 0 || waited < b.floor) {
+		b.floor = waited
+	}
 }
 
 @(private)
@@ -716,6 +849,11 @@ pipe_query :: proc(
 		sync.mutex_unlock(&c.mu)
 		return nil, .IO_Error
 	}
+	w.asked = time.tick_now()
+	if !pipe_admit(c, &w, id, time.tick_diff(w.asked, deadline)) {
+		sync.mutex_unlock(&c.mu)
+		return nil, .Backlogged
+	}
 	dns.set_id_in_place(asked, id)
 	w.seen = c.replies
 	c.waiters[id] = &w
@@ -1009,6 +1147,13 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 	c.silent = 0
 
 	w, waiting := c.waiters[id]
+	matches := waiting && response_matches(w.query, msg)
+	// One nobody is waiting for any more waited longer than its caller had,
+	// and the connection's whole timeout stands for that. One that does not
+	// answer its query is sampled but sets no floor: a server answering the
+	// wrong question quickly says nothing about how fast it answers the right
+	// one.
+	pipe_note_wait(c, time.tick_since(w.asked) if waiting else c.timeout, matches)
 	if !waiting {
 		// Nobody is on this ID: an answer to a query that has already given
 		// up, or one nobody asked. Dropped rather than treated as a failure -
@@ -1018,7 +1163,7 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 		return
 	}
 	delete_key(&c.waiters, id)
-	if !response_matches(w.query, msg) {
+	if !matches {
 		// The refusal of a reply that did not answer the query it was sent: on a
 		// stream there is no off-path packet to pass over, so this is the server
 		// contradicting itself.

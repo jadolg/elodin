@@ -55,6 +55,15 @@ Error :: enum u8 {
 	exchange was made, and nothing is recorded against a member for it.
 	*/
 	Deadline,
+	/*
+	The pipelined connection's recent replies all queued for at least half of
+	what this query had left, so it was not put on it (issue #551; see
+	`pipe_backlogged`).
+	A statement about the path to the upstream rather than the upstream, and
+	not charged towards its cooldown: a `udp` member's datagram answers are
+	still arriving.
+	*/
+	Backlogged,
 }
 
 @(private)
@@ -669,6 +678,8 @@ error_label :: proc(e: Error) -> string {
 		return "unhealthy"
 	case .Deadline:
 		return "deadline"
+	case .Backlogged:
+		return "backlogged"
 	}
 	return "unknown"
 }
@@ -746,7 +757,7 @@ servers to ask the refusal costs nothing, and is left unrecorded.
 		then held and every later exchange gives the member its whole timeout
 		and judges it on that. Still counted, so the figures show the query.
 		*/
-		record_failure(u, err, charge = !(resolving && err == .Timeout))
+		record_failure(u, err, charge = !(resolving && err == .Timeout) && err != .Backlogged)
 		logx.debugf(
 			"upstream %s (%v %s:%d) failed after %v: %v",
 			u.spec.name,

@@ -25,7 +25,9 @@ Mock_Behaviour :: enum u8 {
 	// Wait `delay` before replying. Used to exercise racing.
 	Delayed,
 	// Reply with TC=1 and no records over UDP, in full over TCP. This is what
-	// a real resolver does when an answer will not fit in a datagram.
+	// a real resolver does when an answer will not fit in a datagram. `delay`
+	// holds each TCP answer, and a connection is answered one query at a time,
+	// so it is also a stream that carries so many answers a second.
 	Truncate_UDP,
 	// Reply with the given rcode and no records.
 	Rcode_Only,
@@ -219,8 +221,11 @@ mock_synth :: proc(m: ^Mock, qname: string, qtype: u16, addr: [4]u8, ttl: u32 = 
 	)
 }
 
-mock_truncate_udp :: proc(m: ^Mock, qname: string, qtype: u16, payload: []u8) {
-	append(&m.rules, Mock_Rule{qname = qname, qtype = qtype, behaviour = .Truncate_UDP, payload = payload})
+mock_truncate_udp :: proc(m: ^Mock, qname: string, qtype: u16, payload: []u8, tcp_delay := time.Duration(0)) {
+	append(
+		&m.rules,
+		Mock_Rule{qname = qname, qtype = qtype, behaviour = .Truncate_UDP, payload = payload, delay = tcp_delay},
+	)
 }
 
 mock_counts :: proc(m: ^Mock) -> (udp, tcp, tls: int) {
@@ -563,6 +568,11 @@ build_answer :: proc(
 
 	case .Truncate_UDP:
 		if over_tcp {
+			time.sleep(rule.delay)
+			// Without a payload, any name: an empty answer to whatever was asked.
+			if rule.payload == nil {
+				return build_rcode_reply(query, .No_Error, allocator), true
+			}
 			return clone_with_id(rule.payload, query, allocator), true
 		}
 		out := build_rcode_reply(query, .No_Error, allocator)
