@@ -223,10 +223,9 @@ run_h2_cases :: proc(r: ^Runner) {
 		c, cok := h2_connect(doh_port, {enable_push = tc.push})
 		if check(r, cok, "cannot open an h2 connection") {
 			defer h2_close(c)
-			served := false
 			if !tc.refused || tc.probe != .None {
 				check(r, h2_send_request(c, 1, "POST", "/dns-query", query), "cannot send")
-				served = h2_collect(c, []u32{1}, 3 * time.Second)
+				check(r, h2_collect(c, []u32{1}, 3 * time.Second), "stream 1 never completed")
 			}
 			switch tc.probe {
 			case .None:
@@ -240,9 +239,12 @@ run_h2_cases :: proc(r: ^Runner) {
 				for start := time.tick_now(); !c.goaway && time.tick_since(start) < 3 * time.Second && h2_pump(c); {}
 				check(r, c.goaway && c.goaway_code == .Protocol_Error, "goaway=%v (%v), want PROTOCOL_ERROR", c.goaway, c.goaway_code)
 			} else {
-				check(r, served, "stream 1 never completed")
 				check(r, h2_send_request(c, 3, "POST", "/dns-query", query), "cannot send stream 3")
-				check(r, h2_collect(c, []u32{3}), "stream 3 never completed after the frame")
+				if check(r, h2_collect(c, []u32{3}), "stream 3 never completed after the frame") {
+					// A reset counts as completed too, and is not being served.
+					res, _ := h2_stream(c, 3)
+					check_eq_int(r, res.status, 200, "status of stream 3 after the frame")
+				}
 				check(r, !c.goaway, "GOAWAY (%v) for a frame the server must accept", c.goaway_code)
 			}
 		}

@@ -543,8 +543,7 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 	the decoder still in step with the peer's encoder.
 	*/
 	loop.lock(&c.mu)
-	_, tracked := c.streams[h.stream_id]
-	idle := !tracked && client_stream_is_idle(c, h.stream_id)
+	idle := client_stream_is_idle(c, h.stream_id)
 	loop.unlock(&c.mu)
 	if idle {
 		client_goaway(c, .Protocol_Error)
