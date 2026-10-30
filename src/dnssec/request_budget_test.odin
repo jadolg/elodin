@@ -81,7 +81,7 @@ test_a_chain_step_past_the_request_budget_stops_the_walk :: proc(t: ^testing.T) 
 	defer destroy_validator(v)
 
 	now := time.unix(FIXTURE_TIME, 0)
-	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, now)
+	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
 	spent := spent_counter()
 	budget := query_budget(v)
@@ -109,7 +109,7 @@ test_a_chain_step_within_the_request_budget_reads_the_reply :: proc(t: ^testing.
 	defer destroy_validator(v)
 
 	now := time.unix(FIXTURE_TIME, 0)
-	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, now)
+	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
 	spent := 0
 	budget := query_budget(v)

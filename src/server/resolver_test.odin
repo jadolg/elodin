@@ -8,6 +8,7 @@ import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 import "elodin:upstream"
 
 /*
@@ -215,8 +216,8 @@ cache_an_answer :: proc(answers: ^cache.Cache, expired: bool) -> bool {
 	}
 	if expired {
 		if e, found := answers.entries[key]; found {
-			e.expires = time.time_add(time.now(), -1 * time.Second)
-			e.inserted = time.time_add(time.now(), -3600 * time.Second)
+			e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
+			e.inserted = loop.moment_add(loop.moment_now(), -3600 * time.Second)
 		}
 	}
 	return true
@@ -411,7 +412,7 @@ test_a_stale_copy_is_not_served_past_its_rrsig_after_the_wait :: proc(t: ^testin
 	kb: [cache.KEY_MAX]u8
 	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
 	if e, found := answers.entries[key]; found {
-		e.signed_until = time.time_add(time.now(), 50 * time.Millisecond)
+		e.signed_until = loop.moment_add(loop.moment_now(), 50 * time.Millisecond)
 	}
 
 	out, _, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
@@ -472,7 +473,7 @@ test_a_lapsed_stale_copy_waits_for_the_refresh :: proc(t: ^testing.T) {
 	kb: [cache.KEY_MAX]u8
 	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
 	if e, found := answers.entries[key]; found {
-		e.signed_until = time.time_add(time.now(), 50 * time.Millisecond)
+		e.signed_until = loop.moment_add(loop.moment_now(), 50 * time.Millisecond)
 	}
 
 	x := Stale_Exchange {

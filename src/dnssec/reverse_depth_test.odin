@@ -87,7 +87,7 @@ test_an_ipv6_reverse_name_reaches_the_chain :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	now := time.unix(FIXTURE_TIME, 0)
-	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, now)
+	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
 	budget := query_budget(v)
 	zone_trust(v, &budget, IP6_PTR, now, context.temp_allocator)
@@ -125,17 +125,17 @@ test_an_ipv6_reverse_walk_settles_on_the_deepest_cached_zone :: proc(t: ^testing
 
 	now := time.unix(FIXTURE_TIME, 0)
 	keys := []Dnskey{}
-	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, now)
-	cache_put(v, "arpa.", .Secure, keys, MAX_ZONE_TTL, now)
-	cache_put(v, "ip6.arpa.", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, "arpa.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, "ip6.arpa.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
 	// Every empty non-terminal between `ip6.arpa.` and the apex is a name the
 	// walk has to rule out, and a cached non-cut is how it does that for free.
 	for i in 1 ..= 11 {
-		non_cut_remember(v, name_drop_labels(IP6_PTR, 34 - 2 - i), MAX_ZONE_TTL, now)
+		non_cut_remember(v, name_drop_labels(IP6_PTR, 34 - 2 - i), MAX_ZONE_TTL, fixture_moment(now))
 	}
 	apex := name_drop_labels(IP6_PTR, 34 - 14)
 	testing.expect_value(t, apex, "0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa.")
-	cache_put(v, apex, .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, apex, .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
 
 	budget := query_budget(v)
 	status, _, established := zone_trust(v, &budget, IP6_PTR, now, context.temp_allocator)
@@ -167,13 +167,13 @@ test_a_hierarchy_deeper_than_the_bound_is_still_refused :: proc(t: ^testing.T) {
 
 	now := time.unix(FIXTURE_TIME, 0)
 	keys := []Dnskey{}
-	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
 
 	// One cut per label, `MAX_CHAIN_DEPTH` of them and then one more.
 	name := "."
 	for i in 0 ..< MAX_CHAIN_DEPTH + 1 {
 		name = fmt.tprintf("z%d.%s", i, name if name != "." else "")
-		cache_put(v, name, .Secure, keys, MAX_ZONE_TTL, now)
+		cache_put(v, name, .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
 	}
 	testing.expect_value(t, label_count(name), MAX_CHAIN_DEPTH + 1)
 
@@ -218,7 +218,7 @@ test_the_longest_name_the_wire_allows_is_walked_to_the_end :: proc(t: ^testing.T
 	defer destroy_validator(v)
 
 	now := time.unix(FIXTURE_TIME, 0)
-	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, now)
+	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
 	b := strings.builder_make(context.temp_allocator)
 	for _ in 0 ..< 127 {
@@ -230,7 +230,7 @@ test_the_longest_name_the_wire_allows_is_walked_to_the_end :: proc(t: ^testing.T
 	testing.expect_value(t, len(longest) + 1, dns.MAX_NAME_WIRE)
 
 	for i in 0 ..< 127 {
-		non_cut_remember(v, name_drop_labels(longest, i), MAX_ZONE_TTL, now)
+		non_cut_remember(v, name_drop_labels(longest, i), MAX_ZONE_TTL, fixture_moment(now))
 	}
 
 	budget := query_budget(v)

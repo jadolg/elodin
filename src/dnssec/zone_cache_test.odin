@@ -5,6 +5,7 @@ import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 Issue #336: the zone-key cache was bounded by entry count alone, kept whatever a
@@ -27,8 +28,8 @@ no_upstream :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Al
 }
 
 @(private = "file")
-cache_now :: proc() -> time.Time {
-	return time.unix(FIXTURE_TIME, 0)
+cache_now :: proc() -> loop.Moment {
+	return loop.moment_now()
 }
 
 // A DNSKEY whose RDATA is `size` bytes, usable unless `flags` says otherwise.
@@ -284,8 +285,8 @@ test_sweeping_an_expired_zone_leaves_the_eviction_order_intact :: proc(t: ^testi
 	cache_put(v, "a.example.", .Secure, keys, MIN_ZONE_TTL, now)
 	cache_put(v, "b.example.", .Secure, keys, MIN_ZONE_TTL, now)
 
-	later := time.time_add(now, time.Duration(MIN_ZONE_TTL + 1) * time.Second)
-	removed := sweep(v, later)
+	later := loop.moment_add(now, time.Duration(MIN_ZONE_TTL + 1) * time.Second)
+	removed := sweep_at(v, later)
 	testing.expectf(t, removed == 2, "swept %d of 2 expired zones", removed)
 
 	count := 0

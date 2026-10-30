@@ -352,7 +352,7 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		"elodin_uptime_seconds",
 		.Gauge,
 		"Seconds since this process finished starting up.",
-		time.duration_seconds(time.since(s.started)),
+		time.duration_seconds(loop.moment_since(s.up_since)),
 	)
 
 	st := stats_of(s)

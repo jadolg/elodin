@@ -246,7 +246,7 @@ test_a_wildcard_proof_past_the_ceiling_is_refused :: proc(t: ^testing.T) {
 	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 	v.max_nsec3_iterations = -1
-	non_cut_remember(v, "sub.wildcardtest.", MAX_ZONE_TTL, time.unix(FIXTURE_TIME, 0))
+	non_cut_remember(v, "sub.wildcardtest.", MAX_ZONE_TTL, fixture_moment(time.unix(FIXTURE_TIME, 0)))
 
 	result := validate(v, "sub.wildcardtest.", .A, wildcard_fixture("wc_wildcard_answer"), time.unix(FIXTURE_TIME, 0))
 	testing.expectf(t, result.status == .Indeterminate, "got %v (%q)", result.status, result.reason)

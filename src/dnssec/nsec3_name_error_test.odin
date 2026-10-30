@@ -320,7 +320,7 @@ test_the_configured_iteration_ceiling_reaches_the_proof :: proc(t: ^testing.T) {
 	// a denial past the ceiling cannot tell a delegation from a name nobody
 	// holds, so remembering it is one entry per name a client makes up.
 	for name in ([]string{"deep.n3test.", N3_QNAME}) {
-		_, cached, non_cut := cache_get(strict, name, time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+		_, cached, non_cut := cache_get(strict, name, fixture_moment(time.unix(FIXTURE_TIME, 0)), context.temp_allocator)
 		testing.expectf(t, !cached && !non_cut, "%s should not be remembered from a denial past the ceiling", name)
 	}
 
@@ -329,8 +329,8 @@ test_the_configured_iteration_ceiling_reaches_the_proof :: proc(t: ^testing.T) {
 	// remembered as non-cuts, the way an earlier walk would leave them.
 	unwalked := make_validator(n3_query, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
 	defer destroy_validator(unwalked)
-	non_cut_remember(unwalked, "deep.n3test.", MAX_ZONE_TTL, time.unix(FIXTURE_TIME, 0))
-	non_cut_remember(unwalked, N3_QNAME, MAX_ZONE_TTL, time.unix(FIXTURE_TIME, 0))
+	non_cut_remember(unwalked, "deep.n3test.", MAX_ZONE_TTL, fixture_moment(time.unix(FIXTURE_TIME, 0)))
+	non_cut_remember(unwalked, N3_QNAME, MAX_ZONE_TTL, fixture_moment(time.unix(FIXTURE_TIME, 0)))
 	read := query_budget(unwalked)
 	denied := validate_denial(unwalked, &read, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expectf(t, denied.status == .Insecure, "a denial past the ceiling is insecure, got %v (%q)", denied.status, denied.reason)

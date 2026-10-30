@@ -5,6 +5,7 @@ import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 2026-08-02T10:00:00Z, which falls inside the validity period of every signature
@@ -17,6 +18,17 @@ FIXTURE_TIME :: 1785664800
 @(private = "file")
 fixture_now :: proc() -> time.Time {
 	return time.unix(FIXTURE_TIME, 0)
+}
+
+/*
+A fixture's instant on the zone cache's clock, for a test that seeds or reads the
+cache by hand. The cache is timed on `loop.Moment`, which counts from boot, so a
+wall-clock instant read as one lies decades past anything the walk reads off
+the clock: an entry seeded at it is as live to a walk as it was when both read
+the same fixture time, and a test moving its clock forward still expires it.
+*/
+fixture_moment :: proc(t: time.Time) -> loop.Moment {
+	return loop.Moment(time.to_unix_nanoseconds(t))
 }
 
 @(private = "file")
@@ -294,7 +306,7 @@ test_zone_keys_are_cached :: proc(t: ^testing.T) {
 
 	// Nothing has run out of time yet, so a sweep should take nothing away and
 	// the walk after it should still be free.
-	testing.expect_value(t, sweep(v, fixture_now()), 0)
+	testing.expect_value(t, sweep(v), 0)
 	third, _, _ := trust(v, "example.com.")
 	testing.expect_value(t, third, Status.Secure)
 	testing.expect_value(t, counter.queries, cold)
@@ -1112,7 +1124,7 @@ test_cached_key_set_holds_no_gaps :: proc(t: ^testing.T) {
 	bad := Dnskey {
 		rdata = []u8{1, 1},
 	}
-	cache_put(v, "example.com.", .Secure, []Dnskey{good, bad}, 300, fixture_now())
+	cache_put(v, "example.com.", .Secure, []Dnskey{good, bad}, 300, fixture_moment(fixture_now()))
 
 	entry, found := v.zones["example.com."]
 	testing.expect(t, found, "the zone should have been cached")
@@ -1239,8 +1251,8 @@ validator_with_zone :: proc(zone: string, status: Status) -> (^Validator, []Dnsk
 	keys := make([]Dnskey, 1, context.temp_allocator)
 	keys[0] = unsupported_key()
 
-	cache_put(v, ".", .Secure, nil, MAX_ZONE_TTL, fixture_now())
-	cache_put(v, zone, status, keys if status == .Secure else nil, MAX_ZONE_TTL, fixture_now())
+	cache_put(v, ".", .Secure, nil, MAX_ZONE_TTL, fixture_moment(fixture_now()))
+	cache_put(v, zone, status, keys if status == .Secure else nil, MAX_ZONE_TTL, fixture_moment(fixture_now()))
 	return v, keys
 }
 

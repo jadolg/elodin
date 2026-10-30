@@ -4,6 +4,7 @@ import "core:slice"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 
 // Issue #165: an entry carrying signatures is not kept, or served stale, past
 // the moment the first of them stops verifying (RFC 4034 section 3.1.5).
@@ -65,13 +66,13 @@ test_a_signed_entry_does_not_outlive_its_rrsig :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	sig_expiry := time.unix(i64(now) + 60, 0)
-	testing.expectf(t, time.diff(sig_expiry, e.expires) <= 0, "entry expires %v after its RRSIG does", time.diff(sig_expiry, e.expires))
+	sig_expiry := loop.moment_add(e.inserted, 60 * time.Second)
+	testing.expectf(t, time.Duration(e.expires - sig_expiry) <= 0, "entry expires %v after its RRSIG does", time.Duration(e.expires - sig_expiry))
 	testing.expectf(
 		t,
-		time.diff(sig_expiry, deadline(c, e)) <= 0,
+		time.Duration(deadline(c, e) - sig_expiry) <= 0,
 		"with serve_stale the entry is kept %v after its RRSIG expires",
-		time.diff(sig_expiry, deadline(c, e)),
+		time.Duration(deadline(c, e) - sig_expiry),
 	)
 	free_all(context.temp_allocator)
 }
@@ -88,9 +89,9 @@ test_a_signature_with_time_left_leaves_the_entry_alone :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	held := time.diff(e.inserted, e.expires)
+	held := time.Duration(e.expires - e.inserted)
 	testing.expectf(t, held == 3600 * time.Second, "held %v, want the hour max_ttl allows", held)
-	stale := time.diff(e.expires, deadline(c, e))
+	stale := time.Duration(deadline(c, e) - e.expires)
 	testing.expectf(t, stale == MAX_STALE, "stale window %v, want MAX_STALE", stale)
 	free_all(context.temp_allocator)
 }
@@ -107,9 +108,9 @@ test_the_stale_window_ends_at_the_rrsig :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	testing.expectf(t, time.diff(e.inserted, e.expires) == 300 * time.Second, "held %v, want 300 s", time.diff(e.inserted, e.expires))
-	sig_expiry := time.unix(i64(now) + 3600, 0)
-	testing.expectf(t, time.diff(sig_expiry, deadline(c, e)) <= 0, "stale until %v past the RRSIG", time.diff(sig_expiry, deadline(c, e)))
+	testing.expectf(t, time.Duration(e.expires - e.inserted) == 300 * time.Second, "held %v, want 300 s", time.Duration(e.expires - e.inserted))
+	sig_expiry := loop.moment_add(e.inserted, 3600 * time.Second)
+	testing.expectf(t, time.Duration(deadline(c, e) - sig_expiry) <= 0, "stale until %v past the RRSIG", time.Duration(deadline(c, e) - sig_expiry))
 	free_all(context.temp_allocator)
 }
 
@@ -136,8 +137,8 @@ test_min_ttl_does_not_hold_an_entry_past_its_rrsig :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	sig_expiry := time.unix(i64(now) + 60, 0)
-	testing.expectf(t, time.diff(sig_expiry, e.expires) <= 0, "min_ttl kept the entry %v past its RRSIG", time.diff(sig_expiry, e.expires))
+	sig_expiry := loop.moment_add(e.inserted, 60 * time.Second)
+	testing.expectf(t, time.Duration(e.expires - sig_expiry) <= 0, "min_ttl kept the entry %v past its RRSIG", time.Duration(e.expires - sig_expiry))
 	// Nor does it raise what a copy is told past the signature.
 	wire, _, hit := get(c, e.key, context.temp_allocator)
 	testing.expect(t, hit, "the entry was not served")
@@ -180,9 +181,9 @@ test_a_signed_denial_does_not_outlive_its_nsec_rrsig :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	sig_expiry := time.unix(i64(now) + 30, 0)
-	testing.expectf(t, time.diff(sig_expiry, e.expires) <= 0, "the denial is kept %v past its NSEC's RRSIG", time.diff(sig_expiry, e.expires))
-	testing.expectf(t, time.diff(sig_expiry, deadline(c, e)) <= 0, "and served stale %v past it", time.diff(sig_expiry, deadline(c, e)))
+	sig_expiry := loop.moment_add(e.inserted, 30 * time.Second)
+	testing.expectf(t, time.Duration(e.expires - sig_expiry) <= 0, "the denial is kept %v past its NSEC's RRSIG", time.Duration(e.expires - sig_expiry))
+	testing.expectf(t, time.Duration(deadline(c, e) - sig_expiry) <= 0, "and served stale %v past it", time.Duration(deadline(c, e) - sig_expiry))
 	free_all(context.temp_allocator)
 }
 
@@ -223,12 +224,52 @@ test_a_stale_copy_is_told_no_more_than_the_rrsig_allows :: proc(t: ^testing.T) {
 		return
 	}
 	// Expired, with the signature still ten seconds from lapsing.
-	e.expires = time.time_add(time.now(), -time.Second)
+	e.expires = loop.moment_add(loop.moment_now(), -time.Second)
 	wire, hit, served := get(c, e.key, context.temp_allocator)
 	testing.expect(t, served && hit.stale, "the expired entry was not served stale")
 	msg, _ := dns.decode_message(wire, context.temp_allocator)
 	for rec in msg.answer {
 		testing.expectf(t, rec.ttl <= 10, "%v went out stale with TTL %d, its RRSIG has 10 s left", rec.type, rec.ttl)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An entry's lifetime is timed on `loop.Moment`, CLOCK_BOOTTIME (issue #557).
+
+On the wall clock a step of it (NTP, `chronyc makestep`, a VM resume) expired the
+whole cache at once, or served every answer past its TTL for the length of the
+step with the TTL counted down to zero. A step cannot be made from a test, so this
+asserts what rules one out: each stamp lies between two readings of
+`loop.moment_now`, which `loop` tests against CLOCK_BOOTTIME. A stamp off the
+wall clock is decades away from that window.
+
+The signature's expiration is an absolute time, read off the wall clock once at
+insert (RFC 4035 section 5.3.3), and stored as what it leaves from then on.
+*/
+@(test)
+test_an_entry_is_timed_on_the_moment_clock :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 300})
+	defer destroy(c)
+	wall := u32(time.time_to_unix(time.now()))
+	before := loop.moment_now()
+	e, ok := stored(c, signed_answer(wall + 3600), .A)
+	after := loop.moment_now()
+	if !testing.expect(t, ok, "put should succeed") {
+		return
+	}
+	within :: proc(t: ^testing.T, what: string, stamp, before, after: loop.Moment) {
+		testing.expectf(t, before <= stamp && stamp <= after, "%s is %d, outside the moment clock's [%d, %d]", what, stamp, before, after)
+	}
+	within(t, "the insert", e.inserted, before, after)
+	within(t, "the expiry less its 300 s", loop.moment_add(e.expires, -300 * time.Second), before, after)
+	// An hour from `wall`, which the insert read at or up to a second past.
+	within(t, "the signature's lapse less an hour", loop.moment_add(e.signed_until, -3600 * time.Second), loop.moment_add(before, -2 * time.Second), after)
+
+	// And what `get` hands a caller is on the same clock.
+	_, hit, got := get(c, e.key, context.temp_allocator)
+	if testing.expect(t, got, "the entry was not served") {
+		testing.expect_value(t, hit.signed_until, e.signed_until)
 	}
 	free_all(context.temp_allocator)
 }

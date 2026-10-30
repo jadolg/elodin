@@ -251,7 +251,7 @@ Walk_Pool :: enum u8 {
 @(private)
 Non_Cut :: struct {
 	name:    string,
-	expires: time.Time,
+	expires: loop.Moment,
 }
 
 @(private)
@@ -261,7 +261,14 @@ Zone_Entry :: struct {
 	zone:       string,
 	status:     Status,
 	keys:       []Dnskey,
-	expires:    time.Time,
+	/*
+	On the moment clock rather than the wall clock the walk checks signatures
+	against (issue #557): a step of the wall clock would otherwise expire every
+	zone at once, or keep keys and DS past their TTL for the length of the step.
+	The signatures' own lapse is read off the wall clock once, when they are
+	accepted, and arrives here as a duration - see `cache_put`.
+	*/
+	expires:    loop.Moment,
 	// This entry's place in the eviction order `Validator.lru_head` heads.
 	// Every removal from `zones` goes through `drop_zone`, so the list and the
 	// map cannot come to disagree about what is held.
@@ -3746,7 +3753,7 @@ zone_step :: proc(
 	step: Step,
 	keys: []Dnskey,
 ) {
-	cached, found, non_cut := cache_get(v, child, now, allocator)
+	cached, found, non_cut := cache_get(v, child, loop.moment_now(), allocator)
 	if found {
 		switch cached.status {
 		case .Secure:
@@ -3897,14 +3904,14 @@ zone_step :: proc(
 			// Every DS names an algorithm or a digest we cannot check, which
 			// RFC 6840 section 5.2 makes an insecure delegation rather than a
 			// broken one.
-			cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), now, sig_lapses(ds_sig, unix))
+			cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), loop.moment_now(), sig_lapses(ds_sig, unix))
 			return .Insecure, nil
 		}
 
 		child_keys, kstatus, keys_sig, keys_ttl := fetch_keys(v, budget, child, set[:], unix, allocator)
 		if kstatus != .Secure {
 			if kstatus == .Insecure {
-				cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), now, sig_lapses(ds_sig, unix))
+				cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), loop.moment_now(), sig_lapses(ds_sig, unix))
 				return .Insecure, nil
 			}
 			if kstatus == .Bogus {
@@ -3934,7 +3941,7 @@ zone_step :: proc(
 		// Held to both RRsets the keys rest on and the signatures over them:
 		// the parent's over the DS and the zone's own over its DNSKEY set.
 		ttl := min(rrset_ttl(ds_records), ds_sig.original_ttl, keys_ttl, keys_sig.original_ttl)
-		cache_put(v, child, .Secure, child_keys, ttl, now, min(sig_lapses(ds_sig, unix), sig_lapses(keys_sig, unix)))
+		cache_put(v, child, .Secure, child_keys, ttl, loop.moment_now(), min(sig_lapses(ds_sig, unix), sig_lapses(keys_sig, unix)))
 		return .Secure, child_keys
 	}
 
@@ -3958,7 +3965,7 @@ zone_step :: proc(
 		return walk_gave_up(budget, exhausted_reason(budget)), nil
 	}
 	if cname_ok {
-		non_cut_remember(v, child, min(rrset_ttl(cname), cname_sig.original_ttl), now, sig_lapses(cname_sig, unix))
+		non_cut_remember(v, child, min(rrset_ttl(cname), cname_sig.original_ttl), loop.moment_now(), sig_lapses(cname_sig, unix))
 		return .No_Cut, nil
 	}
 
@@ -4034,7 +4041,7 @@ zone_step :: proc(
 	}
 	switch step {
 	case .Insecure:
-		cache_put(v, child, .Insecure, nil, min(negative_ttl(msg), sets_original_ttl(proved)), now, sets_lapse(proved, unix))
+		cache_put(v, child, .Insecure, nil, min(negative_ttl(msg), sets_original_ttl(proved)), loop.moment_now(), sets_lapse(proved, unix))
 	case .No_Cut:
 		/*
 		Remembered for the denial's own negative TTL, held to the Original TTL
@@ -4059,7 +4066,7 @@ zone_step :: proc(
 		is nothing to win: the answer cache holds the NXDOMAIN, so the same
 		question does not come back here anyway.
 		*/
-		non_cut_remember(v, child, min(negative_ttl(msg), sets_original_ttl(proved)), now, sets_lapse(proved, unix))
+		non_cut_remember(v, child, min(negative_ttl(msg), sets_original_ttl(proved)), loop.moment_now(), sets_lapse(proved, unix))
 	case .Secure, .Absent, .Bogus, .Indeterminate:
 	}
 	return step, nil
@@ -4420,7 +4427,7 @@ zone_keys :: proc(
 	status: Status,
 	keys: []Dnskey,
 ) {
-	if cached, found, _ := cache_get(v, zone, now, allocator); found {
+	if cached, found, _ := cache_get(v, zone, loop.moment_now(), allocator); found {
 		return cached.status, cached.keys
 	}
 
@@ -4439,7 +4446,7 @@ zone_keys :: proc(
 	if fstatus != .Secure {
 		return fstatus, nil
 	}
-	cache_put(v, zone, .Secure, fetched, min(keys_ttl, vouched.original_ttl), now, sig_lapses(vouched, unix))
+	cache_put(v, zone, .Secure, fetched, min(keys_ttl, vouched.original_ttl), loop.moment_now(), sig_lapses(vouched, unix))
 	return .Secure, fetched
 }
 
@@ -4451,7 +4458,7 @@ zone_keys :: proc(
 cache_get :: proc(
 	v: ^Validator,
 	zone: string,
-	now: time.Time,
+	now: loop.Moment,
 	allocator: mem.Allocator,
 ) -> (
 	entry: Zone_Entry,
@@ -4482,9 +4489,9 @@ cache_get :: proc(
 	cached, in_map := v.zones[key]
 	if !in_map {
 		slot := v.non_cuts[non_cut_slot(v, key)]
-		return {}, false, slot.name == key && time.diff(slot.expires, now) <= 0
+		return {}, false, slot.name == key && now <= slot.expires
 	}
-	if time.diff(cached.expires, now) > 0 {
+	if now > cached.expires {
 		return {}, false, false
 	}
 	// A hit is what keeps an entry alive when the cache overflows. The root, or
@@ -4607,14 +4614,14 @@ non_cut_drop :: proc(v: ^Validator, key: string) {
 // a year is not believed for one. The name in the slot gives way, which is the
 // whole of the replacement policy; see `Validator.non_cuts`.
 @(private)
-non_cut_remember :: proc(v: ^Validator, name: string, ttl: u32, now: time.Time, lapses := max(u32)) {
+non_cut_remember :: proc(v: ^Validator, name: string, ttl: u32, now: loop.Moment, lapses := max(u32)) {
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
 	key, key_ok := fold_into(name, fold_buf[:])
 	if !key_ok {
 		return
 	}
 	lifetime := min(clamp(ttl, MIN_ZONE_TTL, MAX_NON_CUT_TTL), lapses)
-	expires := time.time_add(now, time.Duration(lifetime) * time.Second)
+	expires := loop.moment_add(now, time.Duration(lifetime) * time.Second)
 
 	sync.mutex_lock(&v.mu)
 	defer sync.mutex_unlock(&v.mu)
@@ -4632,7 +4639,7 @@ non_cut_remember :: proc(v: ^Validator, name: string, ttl: u32, now: time.Time, 
 	zone makes is then refused, and no lookup can put it right because the memo
 	answers before the question is asked.
 	*/
-	if zone, settled := v.zones[key]; settled && time.diff(zone.expires, now) <= 0 {
+	if zone, settled := v.zones[key]; settled && now <= zone.expires {
 		return
 	}
 
@@ -4661,10 +4668,10 @@ clear_non_cuts :: proc(v: ^Validator) {
 	}
 }
 
-// `now` is the same clock the lookups use rather than the wall clock, so an
-// entry cannot be written with an expiry the reader considers already past.
+// `now` is the moment clock `cache_get` and `sweep` read, so an entry cannot be
+// written with an expiry the reader considers already past.
 @(private)
-cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, ttl: u32, now: time.Time, lapses := max(u32)) {
+cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, ttl: u32, now: loop.Moment, lapses := max(u32)) {
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
 	key, key_ok := fold_into(zone, fold_buf[:])
 	if !key_ok {
@@ -4681,7 +4688,7 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 
 	entry := new(Zone_Entry, v.allocator)
 	entry.status = status
-	entry.expires = time.time_add(now, time.Duration(lifetime) * time.Second)
+	entry.expires = loop.moment_add(now, time.Duration(lifetime) * time.Second)
 	oversized := false
 	if len(keys) > 0 {
 		// Appended rather than written by index: skipping a key that will not
@@ -4828,22 +4835,25 @@ zone_touch :: proc(v: ^Validator, e: ^Zone_Entry) {
 	zone_push_front(v, e)
 }
 
-// Drop entries whose lifetime has run out. A zero `now` reads the wall clock;
-// tests pass the same fixed clock the walk itself was made to trust, so an
-// entry timed against fixture signatures is not judged against real time.
-sweep :: proc(v: ^Validator, now: time.Time = {}) -> (removed: int) {
+// Drop entries whose lifetime has run out.
+sweep :: proc(v: ^Validator) -> (removed: int) {
+	return sweep_at(v, loop.moment_now())
+}
+
+// `sweep` as of `clock`, which a test moves past an entry's expiry.
+@(private)
+sweep_at :: proc(v: ^Validator, clock: loop.Moment) -> (removed: int) {
 	if v == nil {
 		return 0
 	}
 	sync.mutex_lock(&v.mu)
 	defer sync.mutex_unlock(&v.mu)
 
-	clock := now if now != {} else time.now()
 	// Collected first: deleting from a map while walking it is not something to
 	// rely on.
 	expired := make([dynamic]^Zone_Entry, 0, 16, context.temp_allocator)
 	for _, entry in v.zones {
-		if time.diff(entry.expires, clock) > 0 {
+		if clock > entry.expires {
 			append(&expired, entry)
 		}
 	}
@@ -4858,7 +4868,7 @@ sweep :: proc(v: ^Validator, now: time.Time = {}) -> (removed: int) {
 	// that number overstate key-cache churn to whoever is reading it to decide
 	// whether the zone cache is thrashing.
 	for &slot in v.non_cuts {
-		if slot.name != "" && time.diff(slot.expires, clock) > 0 {
+		if slot.name != "" && clock > slot.expires {
 			delete(slot.name, v.allocator)
 			slot = {}
 		}

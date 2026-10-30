@@ -3,6 +3,7 @@ package cache
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 What the client is told a record is good for.
@@ -133,8 +134,8 @@ test_a_zeroed_ttl_is_still_raised_by_min_ttl :: proc(t: ^testing.T) {
 @(private = "file")
 expire_entry :: proc(c: ^Cache, key: string) {
 	if e, found := c.entries[key]; found {
-		e.expires = time.time_add(time.now(), -1 * time.Second)
-		e.inserted = time.time_add(time.now(), -3601 * time.Second)
+		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
+		e.inserted = loop.moment_add(loop.moment_now(), -3601 * time.Second)
 	}
 }
 

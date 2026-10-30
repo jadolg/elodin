@@ -2,6 +2,7 @@ package cache
 
 import "core:testing"
 import "core:time"
+import "elodin:loop"
 
 /*
 Put an entry stored with `lifetime` seconds of TTL, `left` of which remain.
@@ -16,8 +17,8 @@ age_into :: proc(c: ^Cache, key: string, lifetime: u32, left: time.Duration) -> 
 		return false
 	}
 	e := c.entries[key]
-	e.expires = time.time_add(time.now(), left)
-	e.inserted = time.time_add(e.expires, -time.Duration(lifetime) * time.Second)
+	e.expires = loop.moment_add(loop.moment_now(), left)
+	e.inserted = loop.moment_add(e.expires, -time.Duration(lifetime) * time.Second)
 	return true
 }
 
@@ -165,8 +166,8 @@ test_a_renewal_that_ends_no_later_keeps_the_spent_claim :: proc(t: ^testing.T) {
 	wire, msg := build_answer("prefetch.example.", 30, context.temp_allocator)
 	testing.expect(t, put(c, "k", wire, msg), "the renewal was not stored")
 	testing.expect(t, !renewed(c, "k", claimed.serial), "a renewal ending at the old expiry reads as renewed")
-	c.entries["k"].inserted = time.time_add(time.now(), -28 * time.Second)
-	c.entries["k"].expires = time.time_add(time.now(), 2 * time.Second)
+	c.entries["k"].inserted = loop.moment_add(loop.moment_now(), -28 * time.Second)
+	c.entries["k"].expires = loop.moment_add(loop.moment_now(), 2 * time.Second)
 	_, again, _ := get(c, "k", context.temp_allocator, prefetch = true)
 	testing.expect(t, !again.prefetch, "a renewal that did not extend the entry was handed another refresh")
 

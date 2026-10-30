@@ -369,7 +369,7 @@ block_cloaked_answer :: proc(
 	proto: Protocol,
 	client: string,
 	limit: int,
-	started: time.Time,
+	started: time.Tick,
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
@@ -401,7 +401,7 @@ refuse_cloaked :: proc(
 	proto: Protocol,
 	client: string,
 	limit: int,
-	started: time.Time,
+	started: time.Tick,
 	allocator: mem.Allocator,
 ) -> []u8 {
 	/*

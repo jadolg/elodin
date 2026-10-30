@@ -4,6 +4,7 @@ import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 
 // Issue #337: a signature's validity allows for a signer whose clock runs ahead
 // of ours, and an RRset it verified is never served or kept longer than it says.
@@ -178,13 +179,18 @@ test_zone_keys_do_not_outlive_their_signatures :: proc(t: ^testing.T) {
 		defer destroy_validator(v)
 		last := first_sig(c.bound).expiration
 		budget := query_budget(v)
+		// The cache counts from when it stored the entry, on its own clock,
+		// which lies inside this; see `fixture_moment`.
+		before := loop.moment_now()
 		status, _, _ := zone_trust(v, &budget, c.zone, time.unix(i64(last) - 100, 0), context.temp_allocator)
 		end_walk(v, &budget)
 		testing.expectf(t, status == .Secure, "%s walked to %v", c.zone, status)
 		entry, found := v.zones[c.zone]
 		testing.expectf(t, found, "%s was not cached", c.zone)
 		if found {
-			over := time.diff(time.unix(i64(last), 0), entry.expires)
+			// The walk ran 100 s before the signature lapses; a second of slack
+			// for the moment the entry was stored after `before`.
+			over := time.Duration(entry.expires - loop.moment_add(before, 101 * time.Second))
 			testing.expectf(t, over <= 0, "%s is kept %v past its signature", c.zone, over)
 		}
 	}
@@ -244,6 +250,7 @@ test_zone_keys_do_not_outlive_their_dnskey_ttl :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 	now := time.unix(FIXTURE_TIME, 0)
 	budget := query_budget(v)
+	before := loop.moment_now()
 	status, _, _ := zone_trust(v, &budget, "com.", now, context.temp_allocator)
 	end_walk(v, &budget)
 	testing.expectf(t, status == .Secure, "com. walked to %v", status)
@@ -253,8 +260,9 @@ test_zone_keys_do_not_outlive_their_dnskey_ttl :: proc(t: ^testing.T) {
 		entry, found := v.zones[zone]
 		testing.expectf(t, found, "%s was not cached", zone)
 		if found {
-			held := time.diff(now, entry.expires)
-			testing.expectf(t, held <= 120 * time.Second, "%s's keys are kept %v over a DNSKEY TTL of 120 s", zone, held)
+			// A second of slack for the moment the entry was stored after `before`.
+			held := time.Duration(entry.expires - before)
+			testing.expectf(t, held <= 121 * time.Second, "%s's keys are kept %v over a DNSKEY TTL of 120 s", zone, held)
 		}
 	}
 	free_all(context.temp_allocator)

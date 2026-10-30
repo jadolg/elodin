@@ -9,6 +9,7 @@ import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 import "elodin:dnssec"
 import "elodin:upstream"
 
@@ -237,7 +238,7 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	s.loops = workers.loops[:]
 	expire :: proc(answers: ^cache.Cache) {
 		for _, e in answers.entries {
-			e.expires = time.time_add(time.now(), -1 * time.Second)
+			e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
 		}
 	}
 
