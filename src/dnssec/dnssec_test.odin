@@ -23,9 +23,9 @@ fixture_now :: proc() -> time.Time {
 /*
 A fixture's instant on the zone cache's clock, for a test that seeds or reads the
 cache by hand. `FIXTURE_TIME` is the moment of the call, so an entry seeded at it
-lies on the same clock as one a walk stores, and is as live to that walk as it
-was when both read the same fixture time, however long the test binary has run.
-A test moving its own clock forward still expires it.
+lies on the same clock as one a walk stores: live to any walk until its lifetime
+has run on the real clock, however long the test binary had run before seeding
+it. A test moving its own clock forward still expires it.
 */
 fixture_moment :: proc(t: time.Time) -> loop.Moment {
 	return loop.moment_add(loop.moment_now(), time.diff(fixture_now(), t))
