@@ -1948,7 +1948,9 @@ test_write_body_deadline_marks_the_stream_cancelled :: proc(t: ^testing.T) {
 Frame_Log :: struct {
 	frames: [dynamic]Frame_Header,
 	// Sum of the connection WINDOW_UPDATE increments written.
-	credit: int,
+	credit:      int,
+	// Error code of the last GOAWAY written.
+	goaway_code: Error_Code,
 }
 
 @(private = "file")
@@ -1966,6 +1968,9 @@ log_write :: proc(user: rawptr, buf: []u8) -> bool {
 		append(&log.frames, h)
 		if h.type == .Window_Update && h.stream_id == 0 && h.length == 4 && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
 			log.credit += int(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
+		}
+		if h.type == .Goaway && pos + FRAME_HEADER_SIZE + 8 <= len(buf) {
+			log.goaway_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE + 4:]))
 		}
 		pos += FRAME_HEADER_SIZE + h.length
 	}
@@ -3412,4 +3417,63 @@ test_http1_version_is_eight_bytes :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, trim_ows(" \t a b \t "), "a b")
 	testing.expect_value(t, trim_ows("a "), "a ")
+}
+
+/*
+RFC 9113 6.5.2 makes an ENABLE_PUSH other than 0 or 1 a PROTOCOL_ERROR, and 5.1
+makes any frame but HEADERS or PRIORITY on an idle stream one too. Idle here is
+past `last_stream_id`, or even: this server never opens an even id. The
+accepted rows pin what must still pass: both legal ENABLE_PUSH values, and
+WINDOW_UPDATE or RST_STREAM on a stream that was opened and has closed, which
+RFC 9113 5.1 has tolerated as in flight.
+*/
+@(test)
+test_idle_stream_and_enable_push_protocol_errors :: proc(t: ^testing.T) {
+	cases := []struct {
+		what:     string,
+		h:        Frame_Header,
+		payload:  []u8,
+		accepted: bool,
+	} {
+		{"ENABLE_PUSH=2", {length = 6, type = .Settings}, {0, u8(Setting.Enable_Push), 0, 0, 0, 2}, false},
+		{"ENABLE_PUSH=2^32-1", {length = 6, type = .Settings}, {0, u8(Setting.Enable_Push), 0xff, 0xff, 0xff, 0xff}, false},
+		{"WINDOW_UPDATE on idle stream 5", {length = 4, type = .Window_Update, stream_id = 5}, {0, 0, 0x10, 0}, false},
+		{"WINDOW_UPDATE on even stream 2", {length = 4, type = .Window_Update, stream_id = 2}, {0, 0, 0x10, 0}, false},
+		{"RST_STREAM on idle stream 5", {length = 4, type = .Rst_Stream, stream_id = 5}, {0, 0, 0, 8}, false},
+		{"RST_STREAM on even stream 2", {length = 4, type = .Rst_Stream, stream_id = 2}, {0, 0, 0, 8}, false},
+		{"ENABLE_PUSH=0", {length = 6, type = .Settings}, {0, u8(Setting.Enable_Push), 0, 0, 0, 0}, true},
+		{"ENABLE_PUSH=1", {length = 6, type = .Settings}, {0, u8(Setting.Enable_Push), 0, 0, 0, 1}, true},
+		{"WINDOW_UPDATE on closed stream 3", {length = 4, type = .Window_Update, stream_id = 3}, {0, 0, 0x10, 0}, true},
+		{"RST_STREAM on closed stream 3", {length = 4, type = .Rst_Stream, stream_id = 3}, {0, 0, 0, 8}, true},
+		{"WINDOW_UPDATE on the connection", {length = 4, type = .Window_Update}, {0, 0, 0x10, 0}, true},
+	}
+	for tc in cases {
+		log := Frame_Log {
+			frames = make([dynamic]Frame_Header, 0, 8),
+		}
+		c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil)
+		// Stream 3 was opened and has closed.
+		c.last_stream_id = 3
+		ok := handle_frame(c, tc.h, tc.payload)
+		saw_goaway := false
+		for f in log.frames {
+			saw_goaway ||= f.type == .Goaway
+		}
+		if tc.accepted {
+			testing.expectf(t, ok && !saw_goaway, "%s: accepted=%v goaway=%v, want accepted", tc.what, ok, saw_goaway)
+		} else {
+			testing.expectf(
+				t,
+				!ok && saw_goaway && log.goaway_code == .Protocol_Error,
+				"%s: accepted=%v goaway=%v (%v), want PROTOCOL_ERROR",
+				tc.what,
+				ok,
+				saw_goaway,
+				log.goaway_code,
+			)
+		}
+		delete(log.frames)
+		conn_unref(c)
+		free_all(context.temp_allocator)
+	}
 }

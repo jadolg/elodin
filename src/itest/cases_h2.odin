@@ -192,6 +192,72 @@ run_h2_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	/*
+	RFC 9113 6.5.2 makes an ENABLE_PUSH other than 0 or 1 a PROTOCOL_ERROR, and
+	5.1 makes a WINDOW_UPDATE or RST_STREAM on an idle stream one too. Stream 1
+	is served before the frame, so a refusal is the frame's and not a connection
+	that never worked; the accepted rows then serve stream 3, so a server that
+	refused too much fails them. A row refused by its preface's ENABLE_PUSH
+	writes nothing after it, not even the SETTINGS ACK: a write to the
+	connection the server has closed draws a TCP reset, which can discard the
+	GOAWAY before it is read.
+	*/
+	H2_Probe :: enum {
+		None,
+		Window_Update,
+		Rst_Stream,
+	}
+	for tc in ([]struct {
+			what:    string,
+			push:    int,
+			probe:   H2_Probe,
+			stream:  u32,
+			refused: bool,
+		} {
+			{"ENABLE_PUSH=2", 2, .None, 0, true},
+			{"WINDOW_UPDATE on an idle stream", 0, .Window_Update, 5, true},
+			{"RST_STREAM on an idle stream", 0, .Rst_Stream, 5, true},
+			{"ENABLE_PUSH=1", 1, .None, 0, false},
+			{"WINDOW_UPDATE on a closed stream", 0, .Window_Update, 1, false},
+			{"RST_STREAM on a closed stream", 0, .Rst_Stream, 1, false},
+		}) {
+		start_case(r, fmt.tprintf("h2: %s is %s", tc.what, "a PROTOCOL_ERROR" if tc.refused else "accepted"))
+		c, cok := h2_connect(doh_port, {enable_push = tc.push})
+		if check(r, cok, "cannot open an h2 connection") {
+			defer h2_close(c)
+			c.no_ack = tc.refused && tc.probe == .None
+			if !c.no_ack {
+				check(r, h2_send_request(c, 1, "POST", "/dns-query", query), "cannot send")
+				// A reset counts as completed too, and is not being served.
+				if check(r, h2_collect(c, []u32{1}, 3 * time.Second), "stream 1 never completed") {
+					res, _ := h2_stream(c, 1)
+					check_eq_int(r, res.status, 200, "status of stream 1 before the frame")
+				}
+			}
+			switch tc.probe {
+			case .None:
+			case .Window_Update:
+				check(r, h2_send_window_update(c, tc.stream, 1024), "cannot send a window update")
+			case .Rst_Stream:
+				check(r, h2_send_rst(c, tc.stream), "cannot send a reset")
+			}
+			if tc.refused {
+				// The connection ends, so this returns as soon as the read fails.
+				for start := time.tick_now(); !c.goaway && time.tick_since(start) < 3 * time.Second && h2_pump(c); {}
+				check(r, c.goaway && c.goaway_code == .Protocol_Error, "goaway=%v (%v), want PROTOCOL_ERROR", c.goaway, c.goaway_code)
+			} else {
+				check(r, h2_send_request(c, 3, "POST", "/dns-query", query), "cannot send stream 3")
+				if check(r, h2_collect(c, []u32{3}), "stream 3 never completed after the frame") {
+					// A reset counts as completed too, and is not being served.
+					res, _ := h2_stream(c, 3)
+					check_eq_int(r, res.status, 200, "status of stream 3 after the frame")
+				}
+				check(r, !c.goaway, "GOAWAY (%v) for a frame the server must accept", c.goaway_code)
+			}
+		}
+		end_case(r)
+	}
+
+	/*
 	RFC 7541 6.3: a dynamic table size update may not exceed the limit the
 	protocol set, which here is the 4096 of SETTINGS_HEADER_TABLE_SIZE. A larger
 	one is a decoding error (4.2), and a decoding error on a connection whose
