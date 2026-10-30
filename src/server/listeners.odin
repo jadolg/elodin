@@ -1,6 +1,7 @@
 package server
 
 import "core:fmt"
+import "core:mem"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -372,6 +373,27 @@ Udp_Job :: struct {
 	// any of them would put the same thing on the wire; replying on the one
 	// that received keeps a query's send queue and its receive queue together.
 	socket: net.UDP_Socket,
+}
+
+/*
+A job and its datagram in one block, the bytes trailing the struct, so the
+reader makes one heap allocation per datagram and the worker one `free`.
+
+The reader and the worker are different threads, and glibc hands a chunk back
+to the arena it came from, so every `free` here takes the reader's arena lock
+from the worker; one block is one of those per query rather than two. `data` is
+a view into the block and dies with it - a plain `free(job)` releases both.
+*/
+@(private)
+new_udp_job :: proc(datagram: []u8) -> ^Udp_Job {
+	raw, err := mem.alloc(size_of(Udp_Job) + len(datagram), align_of(Udp_Job))
+	if err != .None {
+		return nil
+	}
+	job := cast(^Udp_Job)raw
+	job.data = ([^]u8)(raw)[size_of(Udp_Job):][:len(datagram)]
+	copy(job.data, datagram)
+	return job
 }
 
 @(private)
@@ -783,12 +805,14 @@ udp_loop :: proc(data: rawptr) {
 			continue
 		}
 
-		job := new(Udp_Job)
+		job := new_udp_job(buf[:n])
+		if job == nil {
+			sync.atomic_add(&ctx.server.stats.dropped, 1)
+			continue
+		}
 		job.ctx = ctx
 		job.client = client
 		job.socket = socket
-		job.data = make([]u8, n)
-		copy(job.data, buf[:n])
 
 		// The query's use of the socket, given back once it has answered on it.
 		sync.atomic_add(&ctx.reader.holds, 1)
@@ -803,10 +827,8 @@ udp_loop :: proc(data: rawptr) {
 			// loop's reader or a DoH connection's.
 			sync.atomic_add(&ctx.server.stats.dropped, 1)
 			report_shed(client, limit)
-			delete(job.data)
 			free(job)
 		case .Stopped:
-			delete(job.data)
 			free(job)
 			/*
 			Not the server stopping unless `stop` says so: the readers are gone
@@ -1339,7 +1361,6 @@ udp_job :: proc(data: rawptr) {
 	s := job.ctx.server
 	reader := job.ctx.reader
 	defer {
-		delete(job.data)
 		free(job)
 		free_all(context.temp_allocator)
 		// After the send, which is the last use of the socket.

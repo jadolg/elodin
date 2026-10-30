@@ -198,6 +198,10 @@ test_doh_request_survives_a_buffer_that_grows :: proc(t: ^testing.T) {
 	testing.expect_value(t, req.path, "/dns-query")
 	testing.expect_value(t, req.content_type, "application/dns-message")
 	testing.expect_value(t, string(req.body), "abcd")
+	// A view into the reader's buffer rather than a copy of up to MAX_DOH_BODY
+	// (#533), which is what has the callers compact only after serving.
+	start := uintptr(raw_data(r.buf))
+	testing.expect(t, uintptr(raw_data(req.body)) >= start && uintptr(raw_data(req.body)) < start + uintptr(len(r.buf)), "the body was copied out of the reader's buffer")
 }
 
 /*

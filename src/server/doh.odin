@@ -285,10 +285,10 @@ answering, and drains what the client had already sent before it does, so that
 the answer is not lost to the RST that closing on unread bytes would send - see
 `http_linger`.
 
-Everything kept in the result is copied out of the reader's buffer rather than
-pointed into it. `http_line` and `http_exact` return views, and every read after
-one of them may grow that buffer - which, past its capacity, means a different
-block. The arena behind `context.temp_allocator` happens to carry the old
+Everything kept in the result but the body is copied out of the reader's buffer
+rather than pointed into it. `http_line` and `http_exact` return views, and every
+read after one of them may grow that buffer - which, past its capacity, means a
+different block. The arena behind `context.temp_allocator` happens to carry the old
 contents forward and hold onto the block until `free_all`, so views into it kept
 reading correctly, but nothing here should depend on which allocator it was
 handed. The copies live in the same scratch space and go the same way.
@@ -468,10 +468,10 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	}
 
 	if content_length > 0 {
-		body := http_exact(r, content_length) or_return
-		owned := make([]u8, len(body), context.temp_allocator)
-		copy(owned, body)
-		req.body = owned
+		// A view, where everything above is a copy: the body is the last thing
+		// read, so nothing grows the buffer under it before the caller's
+		// `http_compact`, which is what ends it.
+		req.body = http_exact(r, content_length) or_return
 	}
 	return req, 0, true
 }
@@ -495,10 +495,10 @@ fuzz_http_requests :: proc(conn: Conn) {
 		if !ok {
 			return
 		}
-		http_compact(&r)
 		if param, found := query_param(req.query, "dns"); found {
 			_, _ = decode_dns_param(param)
 		}
+		http_compact(&r)
 		// As `serve_doh` does between requests, so nothing the next one reads can
 		// lean on this one's scratch.
 		free_all(context.temp_allocator)
@@ -567,13 +567,13 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 			free_all(context.temp_allocator)
 			return
 		}
-		// Before the answer, so that what the reader carries into the next round
-		// is the next request and nothing before it.
-		http_compact(&r)
-
 		keep_alive := req.keep_alive
 		asked := false
 		handled := serve_doh_request(s, conn, req, path, client, &asked)
+		// After the answer, since `req.body` is a view into the reader's buffer,
+		// and before the next round, so that what the reader carries into it is
+		// the next request and nothing before it.
+		http_compact(&r)
 		free_all(context.temp_allocator)
 		// Once it is answered rather than when it was charged, as a TCP client's
 		// idle wait starts once its answer is written: the time the question takes
