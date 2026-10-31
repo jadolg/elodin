@@ -770,7 +770,7 @@ datagram_rate_check :: proc(
 	proven: bool,
 ) {
 	// With cookies off nothing can be proven, so the flood path takes the table
-	// lock once, as it does without this.
+	// lock once.
 	if r == nil || k == nil {
 		return rate_check(r, client, now), false
 	}
@@ -1149,6 +1149,18 @@ start_rate_limiter :: proc(l: ^Live) -> bool {
 		cfg.overrides,
 		cfg.response_size_estimate,
 	)
+	report_rate_limiter(l)
+	return true
+}
+
+/*
+Say what the limiter's budgets are, at startup and again on a reload that keeps
+the limiter but turns cookies on or off: what is said depends on
+`cookies.enabled`, and the operator reads the latest of these lines as what is
+in force.
+*/
+report_rate_limiter :: proc(l: ^Live) {
+	cfg := l.cfg.server.rate_limit
 	// The budgets are named in the line rather than left to the documentation: an
 	// operator reading `500` needs to know it is 500 datagrams, 500 queries on
 	// connections and 500 connections opened, not 500 between them - and that the
@@ -1225,7 +1237,6 @@ start_rate_limiter :: proc(l: ^Live) -> bool {
 	) {
 		logx.infof("%s", line)
 	}
-	return true
 }
 
 // The byte figure again for the cookie rescue pool, which is weighed the same way.

@@ -142,12 +142,14 @@ server:
   # in the stats line, apart from conn_refused=, which is the table being full.
   #
   # They are charged to budgets of their own: each prefix gets the figure below
-  # for datagrams, again for queries read off a connection, and again for
-  # connections opened. Not one shared budget, and not to be made into one - a UDP
-  # source address is written by whoever sent the datagram, so a single budget let
-  # a spoofed flood naming your /24 close the connections of the clients in it,
-  # and would let it stop them connecting at all. The cost is that a client using
-  # every way in can draw three times the figure.
+  # for datagrams, again for queries read off a connection, again for
+  # connections opened, and again, with cookies.enabled, for datagrams a valid
+  # server cookie rescues once the datagram budget is empty. Not one shared
+  # budget, and not to be made into one - a UDP source address is written by
+  # whoever sent the datagram, so a single budget let a spoofed flood naming your
+  # /24 close the connections of the clients in it, and would let it stop them
+  # connecting at all. The cost is that a client using every way in can draw four
+  # times the figure.
   #
   # And note what none of it can do: every budget here is per /24 and per /64, so
   # an actor with addresses in several prefixes has several copies of each. If this
