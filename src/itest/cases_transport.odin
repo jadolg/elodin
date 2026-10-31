@@ -4,6 +4,7 @@ import "core:encoding/base64"
 import "core:fmt"
 import "core:strings"
 import "elodin:dns"
+import "elodin:tlsx"
 
 /*
 Listener-side coverage: the four ways a client can reach elodin, plus the DoH
@@ -131,6 +132,26 @@ run_transport_cases :: proc(r: ^Runner) {
 			h := parse_header(r, res.wire)
 			check_eq_int(r, h.ancount, fix.ancount, "answer count")
 			check(r, h.id == 0x1111, "transaction ID not echoed")
+		}
+	}
+	end_case(r)
+
+	/*
+	Resumption is by the server's own rotating ticket keys (#262), sealed and
+	opened through the callback the server installs; a callback that seals
+	nothing or opens nothing turns every one of these into a full handshake.
+	*/
+	start_case(r, "dot, doh: a client resumes its session by ticket, TLS 1.2 and 1.3 (#262)")
+	{
+		framed := make([]u8, 2 + len(query), context.temp_allocator)
+		framed[0], framed[1] = u8(len(query) >> 8), u8(len(query))
+		copy(framed[2:], query)
+		post := build_http_request("POST", "/dns-query", "application/dns-message", query)
+		for version in ([]int{tlsx.TLS1_2_VERSION, tlsx.TLS1_3_VERSION}) {
+			dot_reused, dot_ok := tls_resumes(dot_port, version, nil, framed)
+			check(r, dot_ok && dot_reused, "dot %x: handshakes completed %v, resumed %v", version, dot_ok, dot_reused)
+			doh_reused, doh_ok := tls_resumes(doh_port, version, []string{"http/1.1"}, post)
+			check(r, doh_ok && doh_reused, "doh %x: handshakes completed %v, resumed %v", version, doh_ok, doh_reused)
 		}
 	}
 	end_case(r)

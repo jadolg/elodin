@@ -10,6 +10,7 @@ import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "elodin:loop"
 
 /*
 Tests run a real TLS session over loopback against a self-signed pair. Nothing
@@ -1420,5 +1421,233 @@ test_the_server_keeps_no_session_and_clients_still_resume :: proc(t: ^testing.T)
 	control, creused, cok := resume_twice(t, TLS1_2_VERSION, true, c.long(SSL_SESS_CACHE_SERVER))
 	if cok {
 		testing.expectf(t, control > 0 && creused, "OpenSSL's default cache mode held %d sessions, resumed: %v", control, creused)
+	}
+}
+
+// The name of the key that sealed `s`'s ticket: the first 16 bytes of an
+// OpenSSL ticket. Empty when the session carries none.
+@(private = "file")
+ticket_name :: proc(s: ^SSL_SESSION) -> (name: [TLSEXT_KEYNAME_LENGTH]u8, ok: bool) {
+	if s == nil {
+		return
+	}
+	tick: [^]u8
+	n: c.size_t
+	SSL_SESSION_get0_ticket(s, &tick, &n)
+	if tick == nil || n < TLSEXT_KEYNAME_LENGTH {
+		return
+	}
+	copy(name[:], tick[:TLSEXT_KEYNAME_LENGTH])
+	return name, true
+}
+
+/*
+A server context's ticket keys rotate (RFC 9325 §3.4), and a ticket resumes for
+one interval past its key's retirement and not after.
+
+The first ticket is sealed under the context's own key, which is the premise:
+OpenSSL's built-in key would carry another name and never change. After one
+interval the client still resumes on it and is handed a ticket under the new
+key; after two more, the key that sealed that one is gone and the client does a
+full handshake. The rotation is driven by the maintenance tick's entry point on
+a clock moved ahead, as an idle listener's would be.
+*/
+@(test)
+test_ticket_keys_rotate_and_old_tickets_stop_resuming :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+	cert, key, have := ensure_certs()
+	if !have {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+
+	for version in ([]c.long{TLS1_2_VERSION, TLS1_3_VERSION}) {
+		listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+		if lerr != nil {
+			testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+			return
+		}
+		defer net.close(listener)
+		ep, _ := net.bound_endpoint(listener)
+
+		sctx, serr := server_context(cert, key)
+		if serr != .None {
+			testing.expectf(t, false, "server_context: %v", serr)
+			return
+		}
+		defer context_destroy(sctx)
+		k := ticket_keys_of(sctx.ptr)
+		if !testing.expect(t, k != nil, "the server context has no ticket keys of its own") {
+			return
+		}
+		testing.expectf(
+			t,
+			SSL_CTX_get_timeout(sctx.ptr) == c.long(TICKET_KEY_INTERVAL / time.Second),
+			"a ticket lasts %ds, not one key interval",
+			SSL_CTX_get_timeout(sctx.ptr),
+		)
+		cctx, _ := client_context(false)
+		defer context_destroy(cctx)
+		ssl_ctx_set_max_proto_version(cctx.ptr, version)
+
+		srv := Resume_Server {
+			listener = listener,
+			ctx      = sctx,
+			rounds   = 4,
+		}
+		worker := thread.create_and_start_with_poly_data(&srv, resume_server_worker)
+		defer thread.destroy(worker)
+		// Runs before the join: a client that never dialled would otherwise
+		// leave the worker in accept, and the test hung rather than failed.
+		defer posix.shutdown(posix.FD(net.Socket(listener)), .RDWR)
+		start := loop.moment_now()
+
+		_, first, ok := resume_client(t, cctx.ptr, ep, nil)
+		defer if first != nil {SSL_SESSION_free(first)}
+		sealed, _ := ticket_key_name(sctx)
+		name, has := ticket_name(first)
+		testing.expectf(t, ok && has && name == sealed, "%x: the first ticket is not under the context's key", version)
+
+		rotate_ticket_keys(sctx, loop.moment_add(start, TICKET_KEY_INTERVAL))
+		renewed, _ := ticket_key_name(sctx)
+		testing.expectf(t, renewed != sealed, "%x: the key did not rotate after an interval", version)
+		reused, second, ok2 := resume_client(t, cctx.ptr, ep, first)
+		defer if second != nil {SSL_SESSION_free(second)}
+		testing.expectf(t, ok2 && reused, "%x: a ticket under the retired key did not resume", version)
+		name, has = ticket_name(second)
+		testing.expectf(t, has && name == renewed, "%x: resuming on the retired key brought no ticket under the new one", version)
+
+		rotate_ticket_keys(sctx, loop.moment_add(start, 3 * TICKET_KEY_INTERVAL))
+		resumed, expired, ok4 := resume_client(t, cctx.ptr, ep, second)
+		defer if expired != nil {SSL_SESSION_free(expired)}
+		testing.expectf(t, ok4 && !resumed, "%x: a ticket resumed two intervals after its key was retired", version)
+
+		// No tick this time: the sealing key is made an interval old where it
+		// is, and the handshake itself must retire it before sealing.
+		sync.mutex_lock(&k.mu)
+		k.current.born = loop.moment_add(loop.moment_now(), -TICKET_KEY_INTERVAL)
+		stale := k.current.name
+		sync.mutex_unlock(&k.mu)
+		_, third, ok3 := resume_client(t, cctx.ptr, ep, nil)
+		defer if third != nil {SSL_SESSION_free(third)}
+		name, has = ticket_name(third)
+		testing.expectf(t, ok3 && has && name != stale, "%x: a handshake sealed under a key past its interval", version)
+	}
+}
+
+// When each key seals, opens and is erased, on a clock the test moves.
+@(test)
+test_ticket_keys_advance_on_their_interval :: proc(t: ^testing.T) {
+	init()
+	I :: TICKET_KEY_INTERVAL
+	// The interval keeps the session timeout OpenSSL gives a server by default,
+	// so rotating shortens no ticket's life.
+	plain := SSL_CTX_new(TLS_server_method())
+	if !testing.expect(t, plain != nil, "SSL_CTX_new failed") {
+		return
+	}
+	testing.expectf(t, SSL_CTX_get_timeout(plain) == c.long(I / time.Second), "OpenSSL's default session timeout is %ds", SSL_CTX_get_timeout(plain))
+	SSL_CTX_free(plain)
+	t0 := loop.moment_now()
+	k: Ticket_Keys
+	advance_ticket_keys(&k, t0)
+	testing.expect(t, k.current.live && !k.previous.live, "no sealing key was drawn")
+	first := k.current
+
+	advance_ticket_keys(&k, loop.moment_add(t0, I - 1))
+	testing.expect(t, k.current.name == first.name, "the key rotated before its interval was up")
+
+	// Retired by a tick that ran late: the key it retires still dies two
+	// intervals after it was drawn, not two after the late tick.
+	late :: I / 2
+	advance_ticket_keys(&k, loop.moment_add(t0, I + late))
+	testing.expect(t, k.current.live && k.current.name != first.name, "the key did not rotate at its interval")
+	testing.expect(t, k.previous.live && k.previous.name == first.name, "the retired key cannot open its tickets")
+	second := k.current
+
+	advance_ticket_keys(&k, loop.moment_add(t0, 2 * I - 1))
+	testing.expect(t, k.previous.live && k.previous.name == first.name, "the retired key was erased early")
+
+	advance_ticket_keys(&k, loop.moment_add(t0, 2 * I))
+	testing.expect(t, !k.previous.live && k.previous.name == {}, "a key outlived two intervals")
+	testing.expect(t, k.current.name == second.name, "the sealing key rotated before its interval was up")
+
+	// A listener left idle for longer than both lifetimes keeps neither.
+	advance_ticket_keys(&k, loop.moment_add(t0, 10 * I))
+	testing.expect(t, k.current.live && k.current.name != second.name, "an idle context kept sealing under an old key")
+	testing.expect(t, !k.previous.live && k.previous.name == {}, "an idle context kept a key past two intervals")
+}
+
+/*
+A context a reload displaced keeps no ticket key, however long a connection
+keeps it alive: retiring it erases both keys and no handshake draws one again.
+A handshake still running on it completes without a ticket, which is how OpenSSL
+answers a callback that seals nothing, in TLS 1.2 and 1.3 alike.
+*/
+@(test)
+test_retired_ticket_keys_are_erased_and_never_redrawn :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+	cert, key, have := ensure_certs()
+	if !have {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+
+	for version in ([]c.long{TLS1_2_VERSION, TLS1_3_VERSION}) {
+		listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+		if lerr != nil {
+			testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+			return
+		}
+		defer net.close(listener)
+		ep, _ := net.bound_endpoint(listener)
+
+		sctx, serr := server_context(cert, key)
+		if serr != .None {
+			testing.expectf(t, false, "server_context: %v", serr)
+			return
+		}
+		defer context_destroy(sctx)
+		k := ticket_keys_of(sctx.ptr)
+		if !testing.expect(t, k != nil, "the server context has no ticket keys of its own") {
+			return
+		}
+		cctx, _ := client_context(false)
+		defer context_destroy(cctx)
+		ssl_ctx_set_max_proto_version(cctx.ptr, version)
+
+		srv := Resume_Server {
+			listener = listener,
+			ctx      = sctx,
+			rounds   = 3,
+		}
+		worker := thread.create_and_start_with_poly_data(&srv, resume_server_worker)
+		defer thread.destroy(worker)
+		defer posix.shutdown(posix.FD(net.Socket(listener)), .RDWR)
+
+		_, first, ok := resume_client(t, cctx.ptr, ep, nil)
+		defer if first != nil {SSL_SESSION_free(first)}
+		testing.expectf(t, ok && first != nil, "%x: the first handshake failed", version)
+
+		retire_ticket_keys(sctx)
+		sync.mutex_lock(&k.mu)
+		erased := !k.current.live && !k.previous.live && k.current.name == {} && k.previous.name == {}
+		sync.mutex_unlock(&k.mu)
+		testing.expectf(t, erased, "%x: retiring left a ticket key in memory", version)
+
+		_, second, ok2 := resume_client(t, cctx.ptr, ep, nil)
+		defer if second != nil {SSL_SESSION_free(second)}
+		_, has := ticket_name(second)
+		testing.expectf(t, ok2 && !has, "%x: a handshake on a retired context completed %v, got a ticket %v", version, ok2, has)
+
+		reused, third, ok3 := resume_client(t, cctx.ptr, ep, first)
+		defer if third != nil {SSL_SESSION_free(third)}
+		testing.expectf(t, ok3 && !reused, "%x: a ticket resumed on a retired context", version)
+
+		rotate_ticket_keys(sctx, loop.moment_add(loop.moment_now(), 10 * TICKET_KEY_INTERVAL))
+		sync.mutex_lock(&k.mu)
+		redrawn := k.current.live || k.previous.live
+		sync.mutex_unlock(&k.mu)
+		testing.expectf(t, !redrawn, "%x: a retired context drew a ticket key again", version)
 	}
 }

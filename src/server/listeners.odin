@@ -1605,6 +1605,7 @@ reload_tls_ctx :: proc(
 	sync.rw_mutex_lock(&l.tls_mu)
 	old := slot^
 	slot^ = fresh
+	// Erases `old`'s ticket keys, which an open connection would keep alive.
 	tlsx.context_destroy(old)
 	sync.rw_mutex_unlock(&l.tls_mu)
 	/*
@@ -1619,6 +1620,23 @@ reload_tls_ctx :: proc(
 	profile_signer_adopt(profiles, fresh)
 	logx.infof("listeners.%s: reloaded the certificate from %s", name, cfg.cert_file)
 	return true
+}
+
+/*
+Rotate the DoT and DoH session-ticket keys on schedule (see
+`tlsx.TICKET_KEY_INTERVAL`), as of `now`.
+
+From the maintenance tick, so a listener nobody connects to still erases a key
+two intervals old; a handshake rotates them as well. The tick and `reload_tls`
+share the maintenance thread, so nothing frees a context under this today; the
+shared lock is the one every reader of the two slots takes, and keeps that true
+wherever the call moves.
+*/
+rotate_ticket_keys :: proc(l: ^Listeners, now: loop.Moment) {
+	sync.rw_mutex_shared_lock(&l.tls_mu)
+	defer sync.rw_mutex_shared_unlock(&l.tls_mu)
+	tlsx.rotate_ticket_keys(l.dot_ctx, now)
+	tlsx.rotate_ticket_keys(l.doh_ctx, now)
 }
 
 /*

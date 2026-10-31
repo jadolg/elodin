@@ -158,6 +158,17 @@ default would hold up to 20,480 sessions per DoT and DoH listener, about 10 MB
 each, for clients that refuse tickets. Those clients do a full handshake every
 time instead.
 
+A session resumes for two hours from its full handshake; a ticket renewed on
+resumption does not extend that. Each DoT and DoH listener seals its tickets
+under a key of its own that it replaces every two hours, and it keeps the
+replaced key for two hours more to open the tickets it sealed (RFC 9325 §3.4).
+A key is erased within a maintenance tick (30 seconds) of turning four hours
+old, suspended time included, so a key read out of the process's memory opens
+only the tickets of the last four hours. A client that resumes on the replaced
+key gets a new ticket under the current one. A `SIGHUP` builds new keys with the
+reloaded certificate and erases the old ones, so every client holding a ticket
+does one full handshake after a reload.
+
 Opening a connection is charged to the prefix's [rate
 limit](rate-limiting.md#rate-limiting), per /24 and /64 only, and a refusal is
 cheap rather than free. **If you expose DoT or DoH to the internet, rate-limit new

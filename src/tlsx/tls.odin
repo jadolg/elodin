@@ -125,6 +125,7 @@ init_once: sync.Once
 do_init :: proc() {
 	OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, nil)
 	alpn_ex_index = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL_CTX, 0, nil, nil, nil, alpn_ex_free)
+	tickets_ex_index = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL_CTX, 0, nil, nil, nil, tickets_ex_free)
 }
 
 // Safe to call from any thread and any number of times.
@@ -489,6 +490,12 @@ server_context :: proc(
 	refuses them does a full handshake each time.
 	*/
 	ssl_ctx_set_session_cache_mode(ptr, SSL_SESS_CACHE_OFF)
+	// Rotated, rather than OpenSSL's one key for the life of the context; see
+	// `TICKET_KEY_INTERVAL`.
+	if !install_ticket_keys(ptr) {
+		SSL_CTX_free(ptr)
+		return nil, .Context_Failed
+	}
 
 	ccert := strings.clone_to_cstring(cert_file, context.temp_allocator)
 	ckey := strings.clone_to_cstring(key_file, context.temp_allocator)
@@ -530,13 +537,17 @@ Nothing else here has the wrapper's lifetime, which is the point: `SSL_CTX_free`
 is a reference count decrement, and a connection accepted before this call still
 holds one. Anything freed alongside it that a handshake can still reach would be
 freed too early, which is why the ALPN preference list belongs to the
-`SSL_CTX` rather than to the wrapper.
+`SSL_CTX` rather than to the wrapper. The ticket keys are the one deliberate
+exception: they are erased here (`retire_ticket_keys`), so a handshake still
+running on this `SSL_CTX` completes without a ticket.
 */
 context_destroy :: proc(ctx: ^Context) {
 	if ctx == nil {
 		return
 	}
 	if ctx.ptr != nil {
+		// An open connection may keep the `SSL_CTX` alive past this.
+		retire_ticket_keys(ctx)
 		SSL_CTX_free(ctx.ptr)
 	}
 	free(ctx, ctx.allocator)
