@@ -44,10 +44,10 @@ shapes.
 A request body is at most 65535 bytes, the most RFC 8484 section 6 allows a DNS
 message. Past it, HTTP/2 resets the stream with ENHANCE_YOUR_CALM, and HTTP/1.1
 answers a `Content-Length` that declares more with **413** and closes the
-connection, first discarding at most 80 KiB of the body for up to a second so
-that the 413 is not lost to a reset. A `Content-Length` that is not plain decimal,
-or one beside a second `Content-Length` or a `Transfer-Encoding`, gets no answer
-at all unless a header before those was already refused with a 400.
+connection, first discarding about 80 KiB of the body for up to a second so that
+the 413 is not lost to a reset. A `Content-Length` that is not plain decimal, or
+one beside a second `Content-Length` or a `Transfer-Encoding`, gets no answer at
+all, whatever else is wrong with the request.
 
 ## Apple devices (iOS, iPadOS, macOS)
 

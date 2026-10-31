@@ -246,7 +246,7 @@ run_transport_cases :: proc(r: ^Runner) {
 				strings.repeat("x", OVER, context.temp_allocator),
 			),
 		)
-		if check(r, res.ok, "no HTTP response; the request was closed on unanswered") {
+		if check(r, res.ok, "no HTTP response; the request was closed unanswered") {
 			check_eq_int(r, res.status, 413, "status")
 		}
 		after := doh_post(doh_port, "/dns-query", query)

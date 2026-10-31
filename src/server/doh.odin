@@ -73,7 +73,7 @@ next segment of it is a round trip away rather than in the queue: a wait of
 only the time a queued byte takes to arrive drains the first congestion window,
 gives up on a body that is still coming, and closes over the remainder, which is
 the RST this drain exists to avoid and leaves the client reading ECONNRESET
-instead of the 400. So it is a round trip's worth. It is provokable - a request
+instead of the refusal. So it is a round trip's worth. It is provokable - a request
 line this reader will not read costs a client no more than a query does - which
 is why it is a quarter of a second rather than a second, that being the bound
 `stream_linger` accepts against the same abuse.
@@ -284,7 +284,8 @@ end may attribute to the next request on it.
 
 The rest are framed the way both hops read them, so the refusals the RFC asks
 for are safe to send: a request line is either read whole or not read at all, a
-missing or repeated `Host` - refused with the headers only half read - has no
+missing, repeated or invalid `Host` or a repeated `Content-Type` - refused once
+the header block is read, so that framing anywhere in it still decides - has no
 bearing on where the body ends, and a `Content-Length` over `MAX_DOH_BODY` says
 exactly where it ends, only too far away. Each of those closes the connection
 after answering, and drains what the client had already sent before it does, so
@@ -375,6 +376,13 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	// client sent, and a second one has to be told from it.
 	hosts := 0
 	content_types := 0
+	/*
+	A 400 earned inside the header block is answered only once the block is
+	read, as the 413 below is: a `Transfer-Encoding` or a second
+	`Content-Length` further down makes the framing what is wrong, and that is
+	answered with nothing wherever in the block it appears.
+	*/
+	malformed := false
 	for {
 		header := http_line(r) or_return
 		if header == "" {
@@ -442,7 +450,8 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			// 400, as Host's is, rather than a media type picked for the check.
 			content_types += 1
 			if content_types > 1 {
-				return {method = req.method}, 400, false
+				malformed = true
+				continue
 			}
 			req.content_type = hold(value)
 		case dns.name_equal_fold(name, "host"):
@@ -456,12 +465,14 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			*/
 			hosts += 1
 			if hosts > 1 {
-				return {method = req.method}, 400, false
+				malformed = true
+				continue
 			}
 			// And an invalid one is a 400 too (RFC 9112 3.2): held to what a
 			// host may hold, as `:authority` is on HTTP/2 (#438).
 			if !h2.authority_is_valid(value) {
-				return {method = req.method}, 400, false
+				malformed = true
+				continue
 			}
 			req.host = hold(value)
 		case dns.name_equal_fold(name, "transfer-encoding"):
@@ -474,7 +485,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	// RFC 9112 3.2 again: Host carries the authority for an origin-form target,
 	// so an HTTP/1.1 request without one is a 400. HTTP/1.0 predates the field
 	// and is allowed to leave it out.
-	if hosts == 0 && !http_1_0 {
+	if malformed || (hosts == 0 && !http_1_0) {
 		return {method = req.method}, 400, false
 	}
 
@@ -983,8 +994,8 @@ written to it is not lost to the close that follows.
 A refused request is answered and the connection then closes, and the request that
 earned the refusal may carry bytes this server never read: `read_http_request`
 turns down a bad request line before reading the headers that would say how long
-the body is, a repeated `Host` before the end of them, and a body over the limit
-not at all. Closing a socket whose receive queue still holds bytes does not send
+the body is, and a bad header block or a body over the limit before reading the
+body. Closing a socket whose receive queue still holds bytes does not send
 a FIN but an RST (RFC 1122 4.2.2.13), and an RST arriving at a client that has
 not read yet has its kernel discard what is already in its receive buffer - so
 the status this endpoint went to the trouble of writing is thrown away and the
