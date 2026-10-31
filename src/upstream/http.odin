@@ -50,11 +50,9 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 
 /*
 `deadline`, when set, bounds the write, and `idle` any one write under it, as
-`reader_fill` does for reads: on TLS the whole call waits for what is left, as
-`tlsx.write` holds a call to one timeout. On a plain socket it is
-the timeout on each `send` - core:net retries a short one with a fresh wait - so
-it bounds only a write that fits the socket buffer, which is what the plain-HTTP
-caller sends: a list download's GET. DoH is HTTPS only.
+`reader_fill` does for reads. Either way the whole call waits for what is left:
+`tlsx.write` holds a call to one timeout, and so does `loop.send_tcp`, whose
+clock runs from the call and does not restart when a short send makes progress.
 */
 stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}, idle := time.Duration(0)) -> Error {
 	if wait, bounded := next_wait(deadline, idle); bounded {
