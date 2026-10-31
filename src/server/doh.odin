@@ -464,13 +464,9 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			not necessarily the one the front end routed the request by.
 			*/
 			hosts += 1
-			if hosts > 1 {
-				malformed = true
-				continue
-			}
 			// And an invalid one is a 400 too (RFC 9112 3.2): held to what a
 			// host may hold, as `:authority` is on HTTP/2 (#438).
-			if !h2.authority_is_valid(value) {
+			if hosts > 1 || !h2.authority_is_valid(value) {
 				malformed = true
 				continue
 			}
