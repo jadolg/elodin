@@ -237,9 +237,9 @@ can disagree about it (issue #245). A routed apex's `DS` is that question: the
 parent's NODATA proof is what it was sent for, and an NXDOMAIN or a `DS` RRset
 from one member says nothing about whether the member beside it publishes the
 proof. Two upstreams disagreeing about an empty non-terminal - one NXDOMAIN, one
-NODATA, the RFC 8020 violation common in the field - is how that arises, and
-stopping at the first answerable reply left `Race` and `Round_Robin` answering
-from whichever member they reached.
+NODATA, the RFC 8020 violation common in the field - is how that arises, and a
+sweep that stops at the first answerable reply has `Race` and `Round_Robin`
+answering from whichever member they reach.
 
 So the sweep goes on past an answerable reply that is not the proof, under the
 same rules and the same budget as every other sweep. Where no member proves
@@ -249,6 +249,8 @@ everybody. The first exchange still decides the ordinary case: a reply that is
 the proof returns from it and none of the sweep runs.
 
 `data` is handed to `proves` untouched, being what it needs beyond the reply.
+`proves` sees each reply `acceptable` takes, once and in the order they arrive,
+so the first reply it sees is the one that stands where none proves anything.
 */
 resolve_proving :: proc(
 	g: ^Group,
@@ -391,7 +393,13 @@ resolve_insisting :: proc(
 
 	started := time.tick_now()
 	response, winner, err = resolve_within(g, query, budget, allocator, &unreachable)
-	if err != .None || wanted(acceptable, proves, data, response) {
+	if err != .None {
+		return response, winner, err
+	}
+	// Whether the reply in hand is one the caller can use, kept rather than
+	// read again: `takes` walks the whole reply for its OPT records.
+	in_hand := takes(acceptable, response)
+	if in_hand && (proves == nil || proves(response, data)) {
 		return response, winner, err
 	}
 
@@ -486,7 +494,7 @@ resolve_insisting :: proc(
 	that member answered, and an NXDOMAIN its neighbour contradicts is the
 	group disagreeing, not a member failing its group.
 	*/
-	if !takes(acceptable, response) {
+	if !in_hand {
 		note_swept_rcode(winner)
 	}
 
@@ -586,6 +594,29 @@ resolve_insisting :: proc(
 			logx.debugf("upstream %s is in its cooldown, not asked again for this one", u.spec.name)
 			continue
 		}
+		/*
+		And with a usable reply already in hand, only a member known to be
+		answering is asked for the proof. The caller holds out for it to get a
+		better answer, not to get one at all, so the wait on a dead member that
+		has not yet parked - a failover spare nobody asks, a fresh start, the
+		two timeouts before the third - is spent on a client that was already
+		answered. For a routed private zone under a public parent that is every
+		query: each member answers NXDOMAIN and none holds a proof, so one dead
+		spare would put `g.timeout` in front of every cache miss, past a
+		validating stub's patience - issue #227's failure, arriving through the
+		sweep meant to prevent its cousin.
+
+		What it costs is the proof held only by a member that is not known to
+		be answering, which is the reply the caller had before it held out: a
+		failover spare is asked for nothing else and so is never swept for the
+		proof. A group whose members disagree under `race` or `round_robin`,
+		where issue #245's flap lives, asks every member and so knows which
+		ones answer.
+		*/
+		if in_hand && !answering(u) {
+			logx.debugf("upstream %s is not known to be answering, not held out for", u.spec.name)
+			continue
+		}
 		before := time.tick_now()
 		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
 		// Charged whatever the exchange did, because what is being bounded is
@@ -597,8 +628,9 @@ resolve_insisting :: proc(
 		if xerr != .None {
 			continue
 		}
-		if wanted(acceptable, proves, data, resp) {
-			if takes(acceptable, response) {
+		taken := takes(acceptable, resp)
+		if taken && (proves == nil || proves(resp, data)) {
+			if in_hand {
 				logx.debugf("upstream %s's reply was not the one this question holds out for, swept past it to %s", winner.spec.name, u.spec.name)
 			} else {
 				report_swept(winner, response, u)
@@ -615,10 +647,10 @@ resolve_insisting :: proc(
 		it cannot - so a group where nobody proves anything still leaves the
 		caller what `resolve_answerable` would have, and not the first reply.
 		*/
-		if !takes(acceptable, response) && takes(acceptable, resp) {
+		if taken && !in_hand {
 			report_swept(winner, response, u)
 			_ = delete(response, allocator)
-			response, winner = resp, u
+			response, winner, in_hand = resp, u, true
 			continue
 		}
 		_ = delete(resp, allocator)
@@ -650,18 +682,6 @@ report_swept :: proc(winner: ^Upstream, response: []u8, u: ^Upstream) {
 		" (an OPT record it cannot account for)" if logx.enabled(.Debug) && dns.peek_opt_unreadable(response) else "",
 		u.spec.name,
 	)
-}
-
-// Whether the sweep is over with this reply: `acceptable` takes it and,
-// where the caller holds out for more, `proves` does too.
-@(private)
-wanted :: proc(
-	acceptable: proc(response: []u8) -> bool,
-	proves: proc(response: []u8, data: rawptr) -> bool,
-	data: rawptr,
-	response: []u8,
-) -> bool {
-	return takes(acceptable, response) && (proves == nil || proves(response, data))
 }
 
 /*

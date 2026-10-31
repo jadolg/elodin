@@ -531,12 +531,15 @@ rebind: {{enabled: false}}
 		answers NXDOMAIN for one apex and a `DS` RRset for another, the second
 		answers both with the NODATA proof - an empty non-terminal one upstream
 		denies against RFC 8020 is how that arises. Each reply from the first is
-		answerable, and the sweep used to stop there and hand the question to
-		the route, while the group held the proof all along.
+		answerable, and a sweep that stops there hands the question to the
+		route while the group holds the proof.
 
-		`failover`, so the dissenting member is asked first every time rather
-		than on the queries a round robin happens to start there. The assertion
-		is the route never being asked: the proof came from the second member.
+		`round_robin`, where the flap lives, and two warm-up queries first so
+		that each member has answered once: the sweep holds out for a proof
+		only from a member known to be answering (`upstream.answering`). Each
+		apex is then asked twice, so one of the two starts at the dissenting
+		member. The assertion is the route never being asked: the proof came
+		from the second member every time.
 		*/
 		dissent_port := next_port(r)
 		dissent := mock_make("dissent", dissent_port)
@@ -556,7 +559,7 @@ listeners:
 upstream:
   timeout: 2s
   attempts: 1
-  strategy: failover
+  strategy: round_robin
   servers:
     - udp://127.0.0.1:%d
     - udp://127.0.0.1:%d
@@ -577,23 +580,100 @@ rebind: {{enabled: false}}
 			split, started := start_server(r, Server_Options{config = config, udp_port = split_port})
 			if started {
 				defer stop_server(&split)
+				// One query starting at each member: the dissent's fallback
+				// answers NXDOMAIN, the public mock an address.
+				mock_reset_counts(public)
+				for _ in 0 ..< 2 {
+					warm := query_udp(split_port, build_query("warm.example.", u16(dns.Type.A)))
+					check(r, warm.ok, "no response to the warm-up query")
+				}
+				check(r, mock_total(dissent) == 1 && mock_total(public) == 1, "the warm-up did not reach each member once")
 				for apex in ([]string{"split.example.", "split-signed.example."}) {
 					mock_reset_counts(dissent)
 					mock_reset_counts(public)
 					mock_reset_counts(internal)
-					res := query_udp(split_port, build_query(apex, u16(dns.Type.DS)))
-					if check(r, res.ok, "no response for %s", apex) {
-						h := parse_header(r, res.wire)
-						check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), fmt.tprintf("rcode for %s", apex))
-						check(r, !answer_has_type(r, res.wire, u16(dns.Type.DS)), "the dissenting member's DS reached the client for %s", apex)
+					for _ in 0 ..< 2 {
+						res := query_udp(split_port, build_query(apex, u16(dns.Type.DS)))
+						if check(r, res.ok, "no response for %s", apex) {
+							h := parse_header(r, res.wire)
+							check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), fmt.tprintf("rcode for %s", apex))
+							check(r, !answer_has_type(r, res.wire, u16(dns.Type.DS)), "the dissenting member's DS reached the client for %s", apex)
+						}
 					}
-					// The premise: the dissenting member was asked first, and answered.
+					// The premise: the dissenting member was asked, and answered.
 					check(r, mock_total(dissent) > 0, "the dissenting member was not asked for %s", apex)
 					check(r, mock_total(public) > 0, "the member holding the proof was not asked for %s", apex)
 					check(r, mock_total(internal) == 0, "the route answered %s while the parent's group held the proof", apex)
 				}
 			} else {
 				skip_case(r, "upstream.zones: dissenting parent", "server did not start")
+			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "upstream.zones: a dead parent spare is not waited on past a denial")
+	{
+		/*
+		The other side of the case above. A routed private zone under a public
+		parent that denies it - `denied.example.`, answered NXDOMAIN - with a
+		failover spare behind the public upstream that has gone silent. The
+		NXDOMAIN is not the proof, so the sweep would hold out past it; but the
+		spare has never answered, and waiting `g.timeout` on it puts a dead
+		upstream in front of every query for a zone whose authority answers in
+		milliseconds. Asserted on the spare's query count, not the clock.
+		*/
+		silent_port := next_port(r)
+		silent := mock_make("silent", silent_port)
+		mock_silent(silent)
+		if !mock_start(silent) {
+			skip_case(r, "upstream.zones: dead parent spare", "cannot start the silent mock")
+		} else {
+			defer mock_stop(silent)
+			spare_port := next_port(r)
+			config := fmt.tprintf(
+				`log:
+  level: info
+listeners:
+  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
+  tcp: {{enabled: false}}
+upstream:
+  timeout: 2s
+  attempts: 1
+  strategy: failover
+  servers:
+    - udp://127.0.0.1:%d
+    - udp://127.0.0.1:%d
+  zones:
+    - domains: [denied.example]
+      servers:
+        - udp://127.0.0.1:%d
+cache: {{enabled: false}}
+blocking: {{enabled: false}}
+dnssec: {{enabled: false}}
+rebind: {{enabled: false}}
+`,
+				spare_port,
+				public_port,
+				silent_port,
+				internal_port,
+			)
+			spare, started := start_server(r, Server_Options{config = config, udp_port = spare_port})
+			if started {
+				defer stop_server(&spare)
+				mock_reset_counts(public)
+				mock_reset_counts(internal)
+				res := query_udp(spare_port, build_query("denied.example.", u16(dns.Type.DS)))
+				if check(r, res.ok, "no response") {
+					h := parse_header(r, res.wire)
+					check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode after the parent denied the zone")
+				}
+				// The premise: the public member was asked and denied the zone.
+				check(r, mock_total(public) > 0, "the parent's live member was not asked")
+				check(r, mock_total(silent) == 0, "the sweep waited on a spare that has never answered")
+				check(r, mock_total(internal) > 0, "the denied apex DS was not put back on the route")
+			} else {
+				skip_case(r, "upstream.zones: dead parent spare", "server did not start")
 			}
 		}
 	}

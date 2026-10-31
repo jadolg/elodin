@@ -331,7 +331,9 @@ withholding only this server's copy would never have reached it.
 Deciding it on the answer rather than at load is what the issue left open as
 "cannot be known at load". It cannot - but it can be read off the reply, at the
 cost of one extra query for a routed apex whose parent says anything else, and
-only for `DS`.
+only for `DS` - and, where the parent's group has several members and the first
+does not give the proof, one more per member the sweep reaches
+(`resolve_apex_ds_parent`).
 */
 @(private)
 apex_ds_off_route :: proc(s: ^Server, name: string, type: dns.Type) -> bool {
@@ -480,12 +482,17 @@ Ask the parent's group for a routed apex's `DS`, holding out for the proof.
 (issue #245): a member's NXDOMAIN or `DS` RRset is answerable, but it is not
 the proof, and the member beside it may publish the proof all the same - one
 upstream answering NXDOMAIN for an empty non-terminal and its neighbour NODATA
-is an RFC 8020 violation common in the field. Stopping at the first answerable
-reply made the client's answer, and the cache entry `settled` keeps for it,
-turn on which member `Race` or `Round_Robin` happened to reach.
+is an RFC 8020 violation common in the field. Sweeping on past it keeps the
+client's answer, and the cache entry `settled` keeps for it, from turning on
+which member `Race` or `Round_Robin` happens to reach.
 
-Where no member proves anything, the first answerable reply comes back and is
-read exactly as before, so `settled` still turns on what the group could say.
+Where no member proves anything, the first answerable reply comes back, so
+`settled` turns on what the group could say.
+
+`proved` and `settled` are `parent_answers_apex_ds`'s over the reply returned,
+taken from the reading the sweep already made of it: a second reading would
+decode it, and hash its NSEC3 records, again against the request's `spent`,
+after the other members' replies have drawn on it.
 */
 @(private)
 resolve_apex_ds_parent :: proc(
@@ -500,20 +507,49 @@ resolve_apex_ds_parent :: proc(
 	response: []u8,
 	winner: ^upstream.Upstream,
 	err: upstream.Error,
+	proved: bool,
+	settled: bool,
 ) {
 	Probe :: struct {
 		name:                 string,
 		spent:                ^int,
 		max_nsec3_iterations: int,
 		allocator:            mem.Allocator,
+		// The first reply `proves` was shown, which is the one that stands
+		// where nobody proves anything, and how it read.
+		first:                []u8,
+		first_settled:        bool,
+		proved:               bool,
 	}
-	probe := Probe{name, spent, max_nsec3_iterations, allocator}
+	probe := Probe {
+		name                 = name,
+		spent                = spent,
+		max_nsec3_iterations = max_nsec3_iterations,
+		allocator            = allocator,
+	}
 	proves :: proc(response: []u8, data: rawptr) -> bool {
 		p := (^Probe)(data)
-		proved, _ := parent_answers_apex_ds(response, p.name, true, p.spent, p.max_nsec3_iterations, p.allocator)
+		proved, settled := parent_answers_apex_ds(response, p.name, true, p.spent, p.max_nsec3_iterations, p.allocator)
+		if p.first == nil {
+			p.first, p.first_settled = response, settled
+		}
+		p.proved = proved
 		return proved
 	}
-	return upstream.resolve_proving(g, query, proves, &probe, allocator, deadline)
+	response, winner, err = upstream.resolve_proving(g, query, proves, &probe, allocator, deadline)
+	switch {
+	case err != .None:
+		return response, winner, err, false, false
+	case probe.proved:
+		// The proof is `settled` too.
+		return response, winner, err, true, true
+	case probe.first != nil && raw_data(probe.first) == raw_data(response):
+		return response, winner, err, false, probe.first_settled
+	}
+	// A reply `proves` never saw - an rcode or OPT record the sweep would not
+	// take - which reads without being decoded.
+	proved, settled = parent_answers_apex_ds(response, name, true, spent, max_nsec3_iterations, allocator)
+	return
 }
 
 /*

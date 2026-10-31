@@ -2141,6 +2141,9 @@ resolve_query :: proc(
 	resp: []u8
 	winner: ^upstream.Upstream
 	uerr: upstream.Error
+	// `parent_answers_apex_ds` over the parent's reply, read by the sweep that
+	// fetched it.
+	parent_proved, parent_settled: bool
 	if apex_ds && own != asked {
 		/*
 		The parent's group is asked the way `validator_query` asks the lookups
@@ -2171,7 +2174,7 @@ resolve_query :: proc(
 		`resolve_apex_ds_parent`'s business: a member's NXDOMAIN does not say
 		the member beside it has no proof to give (issue #245).
 		*/
-		resp, winner, uerr = resolve_apex_ds_parent(asked, forwarded, q.name, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator, &deadline)
+		resp, winner, uerr, parent_proved, parent_settled = resolve_apex_ds_parent(asked, forwarded, q.name, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator, &deadline)
 	} else {
 		resp, winner, uerr = upstream.resolve_readable(asked, forwarded, allocator, &deadline)
 	}
@@ -2219,7 +2222,7 @@ resolve_query :: proc(
 		`settled` is the second half of the same reading, and it decides only
 		whether the route's answer is kept: see the store below.
 		*/
-		proved, settled := parent_answers_apex_ds(resp, q.name, uerr == .None, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator)
+		proved, settled := parent_proved, parent_settled
 		/*
 		And what it managed to say is remembered, for the next query rather than
 		for this one. Settled or not is the whole of it - no answer is kept, and
@@ -2353,8 +2356,7 @@ resolve_query :: proc(
 		route_proved, _ := parent_answers_apex_ds(resp, q.name, uerr == .None, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator)
 		if !route_proved {
 			dns.set_id_in_place(forwarded, dns.random_id())
-			again, second, perr := resolve_apex_ds_parent(memoised_parent, forwarded, q.name, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator, &deadline)
-			proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator)
+			again, second, perr, proved, settled := resolve_apex_ds_parent(memoised_parent, forwarded, q.name, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator, &deadline)
 			remember_apex_ds_parent(s, q.name, perr == .None, settled)
 			/*
 			And whether what is served from here is kept turns on what the parent

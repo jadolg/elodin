@@ -399,6 +399,23 @@ healthy :: proc(u: ^Upstream) -> bool {
 	return loop.moment_since(u.down_until) >= 0
 }
 
+/*
+Whether `u` is known to be answering: it has answered at least once, and no
+exchange has failed since its last answer.
+
+Stricter than `healthy`, which is true of a member nobody has asked yet and of
+one with two timeouts behind it. `resolve_insisting` asks it of a member before
+holding out for a proof past a reply the caller can already use, where waiting
+`g.timeout` on a dead member costs a client that already has an answer; see
+there.
+*/
+@(private)
+answering :: proc(u: ^Upstream) -> bool {
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	return u.failures == 0 && u.stats.queries > u.stats.failures
+}
+
 @(private)
 record_success :: proc(u: ^Upstream, elapsed: time.Duration) {
 	sync.mutex_lock(&u.mu)

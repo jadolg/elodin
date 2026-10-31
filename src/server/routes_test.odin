@@ -3130,3 +3130,99 @@ test_the_apex_memory_is_timed_on_the_moment_clock :: proc(t: ^testing.T) {
 	opened := loop.moment_add(slot.until, -upstream.COOLDOWN)
 	testing.expectf(t, before <= opened && opened <= after, "the window opened at %d, outside the moment clock's [%d, %d]", opened, before, after)
 }
+
+/*
+The memo's fallback holds out for the parent's proof as the first exchange does
+(issue #245).
+
+The memory sends the apex `DS` to the route first; where the route has nothing,
+the parent's group is asked after all. Its first member answers NXDOMAIN and its
+second the proof, and an NXDOMAIN is answerable without being the proof, so a
+fallback that stops at it hands the client the route's SERVFAIL while the group
+holds the answer. The memory is written the way
+`test_the_memo_still_asks_the_parent_unless_the_route_answered_the_nodata`
+writes it - the parent's group settling nothing, every member answering SERVFAIL
+- which also has the second member answer, so it is known to be answering when
+the fallback sweeps for it.
+*/
+@(test)
+test_the_memo_fallback_holds_out_for_the_parents_proof :: proc(t: ^testing.T) {
+	sockets: [3]net.UDP_Socket
+	ports: [3]int
+	bound_count := 0
+	defer for socket in sockets[:bound_count] {
+		net.close(socket)
+	}
+	for i in 0 ..< 3 {
+		socket, err := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+		if !testing.expectf(t, err == nil, "cannot bind mock %d: %v", i, err) {
+			return
+		}
+		sockets[i] = socket
+		bound_count += 1
+		_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+		bound, _ := net.bound_endpoint(socket)
+		ports[i] = bound.port
+	}
+
+	cfg := forwarding_config()
+	cfg.upstream.timeout = 200 * time.Millisecond
+
+	group := mock_group_pair(t, cfg.upstream, ports[0], ports[1])
+	defer upstream.destroy_group(group)
+	routed := mock_group(t, cfg.upstream, ports[2])
+	defer upstream.destroy_group(routed)
+
+	s := Server {
+		cfg    = &cfg,
+		group  = group,
+		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+	}
+
+	// The queries that write the memory: both members SERVFAIL, the route
+	// answers in their place.
+	for _ in 0 ..< upstream.FAILURE_THRESHOLD {
+		first := Route_Mock{socket = sockets[0], reply = route_reply_nodata("corp.example.", .DS, .Serv_Fail), want = "corp.example."}
+		second := Route_Mock{socket = sockets[1], reply = route_reply_nodata("corp.example.", .DS, .Serv_Fail), want = "corp.example."}
+		route := Route_Mock{socket = sockets[2], reply = route_reply_nodata("corp.example.", .DS), want = "corp.example."}
+		_, ok := serve_corp_ds(&s, {&first, &second, &route})
+		if !testing.expect(t, ok, "nothing came back for a query that writes the memory") {
+			return
+		}
+		if !testing.expect(t, first.asked && second.asked, "the parent's group was not swept while the memory was being written") {
+			return
+		}
+	}
+
+	denier := Route_Mock{socket = sockets[0], reply = route_reply_nodata("corp.example.", .DS, .NX_Domain), want = "corp.example."}
+	prover := Route_Mock{socket = sockets[1], reply = route_reply_nodata("corp.example.", .DS), want = "corp.example."}
+	failing := Route_Mock{socket = sockets[2], reply = route_reply_nodata("corp.example.", .DS, .Serv_Fail), want = "corp.example."}
+	out, ok := serve_corp_ds(&s, {&denier, &prover, &failing})
+	if !testing.expect(t, ok, "nothing came back at all") {
+		return
+	}
+	// The premise: the memory sent the question to the route first, and the
+	// route had nothing.
+	testing.expect(t, failing.asked, "the memory did not send the question to the route")
+	testing.expect(t, denier.asked, "the parent's first member was not asked after the route failed")
+	testing.expect(t, prover.asked, "the fallback stopped at the NXDOMAIN, short of the member holding the proof")
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
+	free_all(context.temp_allocator)
+}
+
+// One apex `DS` query for `corp.example.`, with a mock thread per member asked.
+@(private = "file")
+serve_corp_ds :: proc(s: ^Server, mocks: []^Route_Mock) -> (out: []u8, ok: bool) {
+	threads := make([]^thread.Thread, len(mocks), context.temp_allocator)
+	for m, i in mocks {
+		threads[i] = thread.create_and_start_with_poly_data(m, serve_route)
+	}
+	out, _, ok = handle_query(s, route_query("corp.example.", .DS), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	return
+}

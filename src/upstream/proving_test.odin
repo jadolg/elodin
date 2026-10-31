@@ -11,8 +11,9 @@ import "elodin:dns"
 /*
 Issue #245: `resolve_proving` sweeps past an answerable reply that is not the
 one its caller holds out for. A routed apex's `DS` is the caller - one member's
-NXDOMAIN beside another's NODATA proof - and stopping at the first answerable
-reply left which of the two the client got to the member the group reached.
+NXDOMAIN beside another's NODATA proof - and a sweep that stops at the first
+answerable reply leaves which of the two the client gets to the member the
+group reaches.
 */
 
 // Answers every query with `rcode` and nothing else.
@@ -105,6 +106,20 @@ fixed_query :: proc() -> []u8 {
 	return wire
 }
 
+// One exchange with each member, so that each is known to be answering: the
+// sweep holds out for a proof only from those (see `answering`).
+@(private = "file")
+warm :: proc(t: ^testing.T, fg: ^Fixed_Group) {
+	for u in fg.servers[:fg.started] {
+		resp, err := exchange(u, fixed_query(), time.Second, context.allocator)
+		testing.expectf(t, err == .None, "warming %s: %v", u.spec.name, err)
+		delete(resp, context.allocator)
+	}
+	for &m in fg.mocks[:fg.started] {
+		sync.atomic_store(&m.hits, 0)
+	}
+}
+
 // The proof as these tests have it: a NOERROR.
 @(private = "file")
 proves_noerror :: proc(response: []u8, _: rawptr) -> bool {
@@ -123,6 +138,7 @@ test_an_answerable_reply_that_is_not_the_proof_does_not_end_the_sweep :: proc(t:
 	if !start_fixed(t, &fg, {.NX_Domain, .No_Error}) {
 		return
 	}
+	warm(t, &fg)
 	g := Group {
 		servers   = fg.servers[:2],
 		strategy  = .Failover,
@@ -132,7 +148,8 @@ test_an_answerable_reply_that_is_not_the_proof_does_not_end_the_sweep :: proc(t:
 	}
 	wire := fixed_query()
 
-	// The premise: the sweep `resolve_query` used to make stops at the NXDOMAIN.
+	// The premise: `resolve_answerable`, which takes any answerable reply,
+	// stops at the NXDOMAIN.
 	first, first_winner, first_err := resolve_answerable(&g, wire, context.allocator)
 	testing.expect_value(t, first_err, Error.None)
 	testing.expect(t, first_winner == fg.servers[0], "resolve_answerable did not stop at the NXDOMAIN")
@@ -183,6 +200,7 @@ test_a_sweep_with_no_proof_keeps_the_first_answerable_reply :: proc(t: ^testing.
 	if !start_fixed(t, &fg, {.Serv_Fail, .NX_Domain, .No_Error}) {
 		return
 	}
+	warm(t, &fg)
 	g := Group {
 		servers   = fg.servers[:3],
 		strategy  = .Failover,
@@ -197,6 +215,46 @@ test_a_sweep_with_no_proof_keeps_the_first_answerable_reply :: proc(t: ^testing.
 	testing.expect(t, sync.atomic_load(&fg.mocks[2].hits) > 0, "the sweep stopped before the last member")
 	// The SERVFAIL is what sent the group looking, and is counted as always.
 	testing.expect_value(t, fg.servers[0].stats.swept_rcode, 1)
+	delete(resp, context.allocator)
+	free_all(context.temp_allocator)
+}
+
+/*
+And a member not known to be answering is not held out for: with an answer
+already in hand, waiting `g.timeout` on a dead spare costs a client that has
+one. Neither a member never yet asked nor one whose last exchange failed.
+*/
+@(test)
+test_a_member_not_known_to_be_answering_is_not_held_out_for :: proc(t: ^testing.T) {
+	fg: Fixed_Group
+	defer stop_fixed(&fg)
+	if !start_fixed(t, &fg, {.NX_Domain, .No_Error}) {
+		return
+	}
+	g := Group {
+		servers   = fg.servers[:2],
+		strategy  = .Failover,
+		timeout   = time.Second,
+		attempts  = 1,
+		allocator = context.allocator,
+	}
+
+	// Never asked: a failover spare, or a fresh start.
+	resp, winner, err := resolve_proving(&g, fixed_query(), proves_noerror, nil, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect(t, winner == fg.servers[0], "the NXDOMAIN in hand did not stand")
+	testing.expect_value(t, sync.atomic_load(&fg.mocks[1].hits), 0)
+	delete(resp, context.allocator)
+
+	// Answered once, then failed: the member is still `healthy`, short of the
+	// three failures that park it, and still not held out for.
+	warm(t, &fg)
+	record_failure(fg.servers[1], .Timeout)
+	testing.expect(t, healthy(fg.servers[1]), "one failure parked the member")
+	resp, winner, err = resolve_proving(&g, fixed_query(), proves_noerror, nil, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect(t, winner == fg.servers[0], "the NXDOMAIN in hand did not stand")
+	testing.expect_value(t, sync.atomic_load(&fg.mocks[1].hits), 0)
 	delete(resp, context.allocator)
 	free_all(context.temp_allocator)
 }
