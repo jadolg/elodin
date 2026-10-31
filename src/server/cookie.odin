@@ -186,6 +186,36 @@ inspect_cookie :: proc(k: ^Cookie_Keeper, m: dns.Message, client: string) -> (re
 }
 
 /*
+Whether a datagram carries a server cookie this server issued to its source
+address, read off the wire ahead of any parse.
+
+A valid one is proof that the sender received a datagram this server sent to
+that address, so an answer to it is going to whoever asked and cannot be part of
+a reflection attack. That is what the UDP read loop asks this for: such a
+datagram is charged to the stream pool, as a query over a handshake is, and not
+to the datagram pool a spoofed flood naming the same prefix is emptying. See
+`datagram_rate_check`.
+
+Only a full 24-byte cookie can be valid, and everything short of the hash is
+checked before the hash is taken, so a datagram with none costs an OPT walk and
+one with a forged one costs a SipHash over at most 32 bytes. `handle_query`
+reads the same option again through `inspect_cookie`, which is what decides what
+the answer carries; this decides only which budget pays for it.
+*/
+cookie_proves_source :: proc(k: ^Cookie_Keeper, datagram: []u8, client: net.Endpoint) -> bool {
+	if k == nil {
+		return false
+	}
+	raw := dns.peek_edns_option(datagram, .Cookie) or_return
+	if len(raw) != COOKIE_REPLY_LEN {
+		return false
+	}
+	req: Cookie_Request
+	req.ip_len = cookie_address_bytes(client.address, req.ip[:]) or_return
+	return verify_cookie(k, raw, req, cookie_now())
+}
+
+/*
 Whether a query has to be turned away with BADCOOKIE before the name is looked
 up at all.
 
@@ -410,7 +440,18 @@ it is not worth doing for tidiness.
 @(private)
 cookie_client_ip :: proc(client: string, out: []u8) -> (n: int, ok: bool) {
 	endpoint := netx.parse_endpoint(client) or_return
-	switch addr in endpoint.address {
+	return cookie_address_bytes(endpoint.address, out)
+}
+
+/*
+`cookie_client_ip` for an address the caller already holds, which is what the
+UDP read loop has: the source as `recv_udp` reported it, before anything has
+turned it into a string. The same bytes whichever way in, or a cookie issued on
+one path would not verify on the other.
+*/
+@(private)
+cookie_address_bytes :: proc(address: net.Address, out: []u8) -> (n: int, ok: bool) {
+	switch addr in address {
 	case net.IP4_Address:
 		bytes := addr
 		copy(out[:4], bytes[:])

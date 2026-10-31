@@ -373,6 +373,9 @@ Udp_Job :: struct {
 	// any of them would put the same thing on the wire; replying on the one
 	// that received keeps a query's send queue and its receive queue together.
 	socket: net.UDP_Socket,
+	// Admitted on the stream pool for a valid server cookie, so its answer's
+	// size is not the datagram pool's to bill. See `datagram_rate_check`.
+	proven: bool,
 }
 
 /*
@@ -775,8 +778,20 @@ udp_loop :: proc(data: rawptr) {
 		the damage as the traffic. It costs a strictly conservative limiter: the
 		reply that never gets built is charged for anyway, and a query that turns
 		out to be answerable from cache costs the same as one that is not.
+
+		The server cookie is read here and not left to the worker, because which
+		budget pays depends on it: a datagram that proves its source is charged
+		to the stream pool, out of reach of a flood spoofing the same prefix.
+		See `datagram_rate_check`.
 		*/
-		switch rate_check(live(ctx.server).limiter, client, time.tick_now()) {
+		verdict, proven := datagram_rate_check(
+			live(ctx.server).limiter,
+			live(ctx.server).cookies,
+			buf[:n],
+			client,
+			time.tick_now(),
+		)
+		switch verdict {
 		case .Allow:
 		case .Truncate:
 			if tc, built := dns.truncated_response(buf[:n], context.temp_allocator); built {
@@ -813,6 +828,7 @@ udp_loop :: proc(data: rawptr) {
 		job.ctx = ctx
 		job.client = client
 		job.socket = socket
+		job.proven = proven
 
 		// The query's use of the socket, given back once it has answered on it.
 		sync.atomic_add(&ctx.reader.holds, 1)
@@ -1391,7 +1407,9 @@ udp_job :: proc(data: rawptr) {
 	configuration that does not set one resolves to: no answer exceeds it, so
 	this is a compare and a return.
 	*/
-	rate_charge_response(live(s).limiter, job.client, len(response), time.tick_now())
+	if !job.proven {
+		rate_charge_response(live(s).limiter, job.client, len(response), time.tick_now())
+	}
 	_, _ = loop.send_udp(job.socket, response, job.client)
 }
 

@@ -49,11 +49,14 @@ spent from another:
 | budget | charged for |
 |---|---|
 | datagrams | each UDP answer |
-| stream queries | each query read off a TCP, DoT or DoH connection |
+| stream queries | each query read off a TCP, DoT or DoH connection, and each UDP query carrying a valid server [cookie](edns.md#dns-cookies) |
 | connections | each connection opened |
 
 They are separate so a spoofed UDP flood naming a prefix cannot close or block
-the connections of the clients who really live there. A client using every way
+the connections of the clients who really live there. A UDP query with a valid
+server cookie has proven its address the same way, so it is charged to the
+stream budget and keeps being answered through such a flood; it is never
+answered truncated, and its size is not charged. This needs `cookies.enabled`. A client using every way
 in can therefore draw three times the figure, two thirds of it over handshakes
 from a real address.
 

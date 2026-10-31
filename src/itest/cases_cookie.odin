@@ -15,9 +15,16 @@ that a client turned away with BADCOOKIE can get past it with what it was given.
 */
 
 @(private = "file")
-config_cookies :: proc(udp_port, upstream_port: int, require: bool) -> string {
+config_cookies :: proc(
+	udp_port, upstream_port: int,
+	require: bool,
+	// The `server.rate_limit` mapping, for the case that needs the budget small.
+	rate_limit := "enabled: false",
+) -> string {
 	return fmt.tprintf(
 		`log: {{ level: warn }}
+server:
+  rate_limit: {{ %s }}
 listeners:
   udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
   tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
@@ -31,6 +38,7 @@ cookies:
   require: %v
   secret: e5e973e5a6b2a43f48e7dc849e37bfcf
 `,
+		rate_limit,
 		udp_port,
 		udp_port,
 		upstream_port,
@@ -211,6 +219,55 @@ run_cookie_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	run_cookie_require_cases(r, mock, upstream_port)
+	run_cookie_rate_limit_cases(r, upstream_port)
+}
+
+/*
+A client holding a valid server cookie has proven it receives at its address, so
+it is charged to the stream pool and a flood emptying its prefix's datagram pool
+does not take it down too (issue #296). The flood here is from the client's own
+address, which is the prefix's datagram pool emptied all the same.
+*/
+@(private = "file")
+run_cookie_rate_limit_cases :: proc(r: ^Runner, upstream_port: int) {
+	// One a second, and a flood drained for a twentieth of one, so nothing
+	// refills between the flood and the plain probe to let it through by luck.
+	RATE :: 1
+	udp_port := next_port(r)
+	cfg := config_cookies(udp_port, upstream_port, false, fmt.tprintf("enabled: true, responses_per_second: %d, slip: 0", RATE))
+	srv, ok := start_server(r, Server_Options{config = cfg, udp_port = udp_port, tcp_port = udp_port})
+	if !ok {
+		skip_case(r, "cookies: rate limit", "server did not start")
+		return
+	}
+	defer stop_server(&srv)
+
+	f := fixture("a")
+
+	start_case(r, "cookies: a client with a valid server cookie is answered while its prefix is over the budget")
+	{
+		first := query_udp(udp_port, build_query(f.qname, f.qtype, edns_size = 1232, cookie = CLIENT_COOKIE))
+		issued: []u8
+		found: bool
+		if check(r, first.ok, "no response to the first query") {
+			issued, found = find_cookie(r, first.wire)
+		}
+		if check(r, found, "the first answer carries no cookie") {
+			udp_flood(udp_port, build_query(f.qname, f.qtype, edns_size = 1232), 20, drain = 50 * time.Millisecond)
+			plain := build_query(f.qname, f.qtype, id = 0x4245, edns_size = 1232)
+			// The premise: the prefix is over its datagram budget.
+			check(r, expect_no_udp_reply(udp_port, plain), "a query without a cookie was answered, so the budget is not spent")
+
+			proven := build_query(f.qname, f.qtype, id = 0x4246, edns_size = 1232, cookie = issued)
+			res := query_udp(udp_port, proven, timeout = 2 * time.Second)
+			if check(r, res.ok, "a client with a valid server cookie was dropped with the flood") {
+				h := parse_header(r, res.wire)
+				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode")
+				check(r, h.ancount > 0, "the cookie client was not answered")
+			}
+		}
+	}
+	end_case(r)
 }
 
 @(private = "file")

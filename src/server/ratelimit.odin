@@ -703,6 +703,47 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 }
 
 /*
+Charge a datagram to the pool its source has earned, and say what to do with it.
+
+A datagram carrying a valid server cookie (`cookie_proves_source`) comes from an
+address that has received what this server sent it, which is what a handshake
+establishes for a connection, so it is charged as a query over one is: to the
+stream pool, refused rather than slipped, and never billed for its size. A
+spoofed flood naming the same prefix spends the datagram pool and cannot reach
+this one, so a client holding a cookie is answered through it - which it was
+not when the cookie was only read on the worker, after the datagram pool had
+already turned it away. Every other datagram goes to `rate_check` as before.
+
+Exempted from the datagram pool rather than from limiting, unlike BIND and
+Knot, which skip RRL for a valid cookie altogether. Their limiter bounds
+reflection and nothing else; this one bounds the work behind an answer too,
+and a client that has proven its address is still one whose queries cost
+upstream round trips. The stream pool is where that is already charged for
+every other proven client.
+
+`proven` tells the caller which budget paid, so `udp_job` knows not to bill
+the answer's size to the datagram pool on top.
+*/
+datagram_rate_check :: proc(
+	r: ^Rate_Limiter,
+	k: ^Cookie_Keeper,
+	datagram: []u8,
+	client: net.Endpoint,
+	now: time.Tick,
+) -> (
+	verdict: Rate_Verdict,
+	proven: bool,
+) {
+	if r == nil {
+		return .Allow, false
+	}
+	if cookie_proves_source(k, datagram, client) {
+		return .Allow if stream_rate_check(r, client, now) else .Drop, true
+	}
+	return rate_check(r, client, now), false
+}
+
+/*
 Charge what the answer turned out to weigh, once it has been packed.
 
 `rate_check` admits a datagram on one token, before there is an answer to
