@@ -42,8 +42,14 @@ PROTOCOL_ERROR; a conformant `CONNECT` gets a 404. HTTP/1.1 refuses the same
 shapes.
 
 A request body is at most 65535 bytes, the most RFC 8484 section 6 allows a DNS
-message. Past it, HTTP/2 resets the stream with ENHANCE_YOUR_CALM and HTTP/1.1
-closes the connection unanswered.
+message. Past it, HTTP/2 resets the stream with ENHANCE_YOUR_CALM, and HTTP/1.1
+answers a `Content-Length` that declares more with **413** and closes the
+connection, first discarding about 80 KiB of the body for up to a second so that
+the 413 is not lost to a reset. A client that streams more than that without
+`Expect: 100-continue` can still see the reset instead. A missing, repeated or
+invalid `Host`, or a repeated `Content-Type`, is answered 400 ahead of the 413. A `Content-Length` that is not
+plain decimal, or one beside a second `Content-Length` or a `Transfer-Encoding`,
+gets no answer at all, whatever else is wrong with the request.
 
 ## Apple devices (iOS, iPadOS, macOS)
 

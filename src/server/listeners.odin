@@ -2122,7 +2122,7 @@ declined to read, and the client's `recv` fails where it would have returned
 those answers and then the end of the stream. Cutting a flood short is the point
 of the close; taking back what was already answered is not. The DoH endpoint
 drains before the refusals that close for the same reason - see `http_linger`,
-where what would be lost is the 400 or 505 `read_http_request` hands back.
+where what would be lost is the 400, 413 or 505 `read_http_request` hands back.
 
 Discarded rather than framed and answered: the budget is spent, and what these
 bytes ask is the thing being refused. Past either bound the close goes ahead and

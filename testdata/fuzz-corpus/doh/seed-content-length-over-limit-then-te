@@ -1,0 +1,8 @@
+POST /dns-query HTTP/1.1
+Host: dns.example
+Content-Length: 100000
+Transfer-Encoding: chunked
+
+GET /dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE HTTP/1.1
+Host: dns.example
+
