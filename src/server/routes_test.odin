@@ -3226,3 +3226,38 @@ serve_corp_ds :: proc(s: ^Server, mocks: []^Route_Mock) -> (out: []u8, ok: bool)
 	}
 	return
 }
+
+/*
+Past the first reply, a NOERROR with an answer section is turned away on its
+header, not decoded: the sweep can hand `apex_ds_proves` one reply per member,
+and each reading is charged to the request's `spent`. The first reply is read in
+full, its `settled` being the one that stands where nobody proves anything - and
+a later NODATA is read in full, being a candidate proof.
+*/
+@(test)
+test_a_later_reply_with_answers_is_not_read_for_the_proof :: proc(t: ^testing.T) {
+	spent := 0
+	defer dns.request_release(&spent)
+	probe := Apex_DS_Probe {
+		name                 = "corp.example.",
+		spent                = &spent,
+		max_nsec3_iterations = 100,
+		allocator            = context.temp_allocator,
+	}
+	signed := route_reply_ds("corp.example.")
+
+	// The first reply is read, and its `settled` kept: a DS RRset settles.
+	testing.expect(t, !apex_ds_proves(signed, &probe), "a DS RRset was taken as the proof")
+	testing.expect(t, probe.first_settled, "the first reply's DS RRset was not read as settled")
+	read_first := spent
+	testing.expect(t, read_first > 0, "the first reply was not read at all")
+
+	// The same reply later in the sweep costs nothing.
+	testing.expect(t, !apex_ds_proves(signed, &probe), "a DS RRset was taken as the proof")
+	testing.expect_value(t, spent, read_first)
+
+	// And a NODATA after it is read, and is the proof.
+	testing.expect(t, apex_ds_proves(route_reply_nodata("corp.example.", .DS), &probe), "a later NODATA was not taken as the proof")
+	testing.expect(t, spent > read_first, "a later NODATA was not read")
+	free_all(context.temp_allocator)
+}

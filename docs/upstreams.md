@@ -319,10 +319,10 @@ That query names only the zone, so it is all the public upstream learns.
 Members of the parent's group are asked in turn (skipping any in their
 cooldown, within the group's timeout budget) until one answers the "no data"
 that is kept below, so one member's NXDOMAIN or DS does not hide another
-member's proof. Once some member has answered NXDOMAIN or a DS, the rest are
-asked only if they have answered before and their last query did not fail, so
-a dead spare (a `failover` backup that is never otherwise asked, say) does not
-delay the answer. Each member asked learns the zone's name. The table below is
+member's proof. Once some member has answered NXDOMAIN, or a NOERROR that is
+not the proof, the rest are asked only if they have answered before and have
+not timed out or failed since, so a dead spare (a `failover` backup that is
+never otherwise asked, say) does not delay the answer. Each member asked learns the zone's name. The table below is
 read over the best reply the group gave: the first NXDOMAIN or NOERROR that is
 not a referral, or failing that the first reply.
 

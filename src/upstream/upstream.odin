@@ -401,7 +401,12 @@ healthy :: proc(u: ^Upstream) -> bool {
 
 /*
 Whether `u` is known to be answering: it has answered at least once, and no
-exchange has failed since its last answer.
+failure that counts toward its cooldown has come since its last answer.
+
+The ones that do not count are not the repeated wait this guards against: a
+hang-up below `record_failure`'s run and a dial refused for a full queue fail at
+once, and a timeout on the exchange that first looked the hostname up happens
+once - every exchange after it is judged on the whole timeout, and counts.
 
 Stricter than `healthy`, which is true of a member nobody has asked yet and of
 one with two timeouts behind it. `resolve_insisting` asks it of a member before

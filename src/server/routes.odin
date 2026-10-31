@@ -79,8 +79,10 @@ group past every reply that is not the proof - a SERVFAIL or REFUSED, and an
 answerable one too: an NXDOMAIN, a `DS` RRset, a rewritten NOERROR (issue #245)
 - so the proof is found wherever the group holds it, and the route answers only
 where no reachable member could give it. What is left is a member out of reach
-for this one query - parked, or outside the sweep's budget - while another
-holds the proof. The route's answer is then stored where the group's best reply
+for this one query - parked, outside the sweep's budget, or not known to be
+answering once an answerable reply is in hand (a `failover` spare that is never
+otherwise asked, say; see `upstream.answering`) - while another holds the
+proof. The route's answer is then stored where the group's best reply
 settled the question, for at most `cache.negative_ttl`, which is the behaviour
 the zone had before the carve-out existed: an unsigned NODATA for the apex
 `DS`, served for the entry's lifetime.
@@ -510,33 +512,13 @@ resolve_apex_ds_parent :: proc(
 	proved: bool,
 	settled: bool,
 ) {
-	Probe :: struct {
-		name:                 string,
-		spent:                ^int,
-		max_nsec3_iterations: int,
-		allocator:            mem.Allocator,
-		// The first reply `proves` was shown, which is the one that stands
-		// where nobody proves anything, and how it read.
-		first:                []u8,
-		first_settled:        bool,
-		proved:               bool,
-	}
-	probe := Probe {
+	probe := Apex_DS_Probe {
 		name                 = name,
 		spent                = spent,
 		max_nsec3_iterations = max_nsec3_iterations,
 		allocator            = allocator,
 	}
-	proves :: proc(response: []u8, data: rawptr) -> bool {
-		p := (^Probe)(data)
-		proved, settled := parent_answers_apex_ds(response, p.name, true, p.spent, p.max_nsec3_iterations, p.allocator)
-		if p.first == nil {
-			p.first, p.first_settled = response, settled
-		}
-		p.proved = proved
-		return proved
-	}
-	response, winner, err = upstream.resolve_proving(g, query, proves, &probe, allocator, deadline)
+	response, winner, err = upstream.resolve_proving(g, query, apex_ds_proves, &probe, allocator, deadline)
 	switch {
 	case err != .None:
 		return response, winner, err, false, false
@@ -550,6 +532,45 @@ resolve_apex_ds_parent :: proc(
 	// take - which reads without being decoded.
 	proved, settled = parent_answers_apex_ds(response, name, true, spent, max_nsec3_iterations, allocator)
 	return
+}
+
+// What `apex_ds_proves` needs beyond the reply, and what it learned.
+@(private)
+Apex_DS_Probe :: struct {
+	name:                 string,
+	spent:                ^int,
+	max_nsec3_iterations: int,
+	allocator:            mem.Allocator,
+	// The first reply `apex_ds_proves` was shown, which is the one that stands
+	// where nobody proves anything, and how it read.
+	first:                []u8,
+	first_settled:        bool,
+	proved:               bool,
+}
+
+// `resolve_apex_ds_parent`'s test of each answerable reply the sweep is handed.
+@(private)
+apex_ds_proves :: proc(response: []u8, data: rawptr) -> bool {
+	p := (^Apex_DS_Probe)(data)
+	/*
+	Past the first reply only the proof matters, and a NOERROR with anything in
+	its answer section is not it: the header says so without a decode. Each
+	reading is charged to the request's `spent`, and the sweep can hand this one
+	reply per member of the group, so a member answering a large `DS` RRset, or
+	a reply built to expand, is not read for a verdict its header already gives.
+	The first reply is read in full, being the one whose `settled` stands where
+	nobody proves anything.
+	*/
+	if p.first != nil && len(response) >= dns.HEADER_SIZE && (response[6] != 0 || response[7] != 0) {
+		p.proved = false
+		return false
+	}
+	proved, settled := parent_answers_apex_ds(response, p.name, true, p.spent, p.max_nsec3_iterations, p.allocator)
+	if p.first == nil {
+		p.first, p.first_settled = response, settled
+	}
+	p.proved = proved
+	return proved
 }
 
 /*

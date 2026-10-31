@@ -559,12 +559,15 @@ resolve_insisting :: proc(
 	*/
 	budget = min(g.timeout, budget - time.tick_since(started))
 	spent: time.Duration
+	// The member that gave the first reply, which `winner` stops naming once a
+	// later reply takes its place in hand.
+	first := winner
 	for u in g.servers {
 		if spent >= budget {
 			logx.debugf("this query has waited %v on its upstreams, leaving the rest of the group unswept", time.tick_since(started))
 			break
 		}
-		if u == winner {
+		if u == first {
 			continue
 		}
 		/*

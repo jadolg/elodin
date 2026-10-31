@@ -220,6 +220,35 @@ test_a_sweep_with_no_proof_keeps_the_first_answerable_reply :: proc(t: ^testing.
 }
 
 /*
+And the member whose reply sent the group looking is not asked again, even once
+a later member's answerable reply has taken its place in hand: under
+`round_robin` it can sit after that member in `g.servers`.
+*/
+@(test)
+test_the_member_that_sent_the_group_looking_is_not_asked_again :: proc(t: ^testing.T) {
+	fg: Fixed_Group
+	defer stop_fixed(&fg)
+	if !start_fixed(t, &fg, {.NX_Domain, .Serv_Fail}) {
+		return
+	}
+	warm(t, &fg)
+	g := Group {
+		servers   = fg.servers[:2],
+		strategy  = .Round_Robin,
+		timeout   = time.Second,
+		attempts  = 1,
+		cursor    = 1,
+		allocator = context.allocator,
+	}
+	resp, winner, err := resolve_proving(&g, fixed_query(), proves_noerror, nil, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect(t, winner == fg.servers[0], "the NXDOMAIN did not take the SERVFAIL's place")
+	testing.expect_value(t, sync.atomic_load(&fg.mocks[1].hits), 1)
+	delete(resp, context.allocator)
+	free_all(context.temp_allocator)
+}
+
+/*
 And a member not known to be answering is not held out for: with an answer
 already in hand, waiting `g.timeout` on a dead spare costs a client that has
 one. Neither a member never yet asked nor one whose last exchange failed.
