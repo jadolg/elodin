@@ -179,7 +179,7 @@ each under `src/fuzz/`:
 
 | target | parser |
 |---|---|
-| `dns` | `dns.decode_message`, and its re-encode under a size limit (`encode_message`'s truncation walk, as `fit_response` runs it), checked to stay within the limit, decode again and set TC exactly when it cut; `dns.truncated_response`, which the UDP read loop calls on a rate-limited query without decoding it; and the walkers and in-place editors the server runs on an upstream's raw answer (EDNS, TTL, rcode and question-case) |
+| `dns` | `dns.decode_message`, and its re-encode under a size limit (`encode_message`'s truncation walk, as `fit_response` runs it), checked to stay within the limit, decode again, and keep every answer and authority record unless it sets TC; `dns.truncated_response`, which the UDP read loop calls on a rate-limited query without decoding it; and the walkers and in-place editors the server runs on an upstream's raw answer (EDNS, TTL, rcode and question-case) |
 | `h2` | the HPACK decoder |
 | `yaml` | the configuration file parser |
 | `http` | the HTTP/1.1 response reader used for list downloads and DoH upstreams |
