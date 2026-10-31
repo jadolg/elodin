@@ -6,10 +6,10 @@ import "core:testing"
 A message carrying two OPT records goes out with one: the first, which is the
 record `find_opt` reads and the encoder measures and puts back behind a cut.
 
-RFC 6891 section 6.1.1 allows a message one OPT record. Writing whichever of two
-happened to fit let the second stand in for the first after the first was
-dropped for size, and the first is where an rcode of 16 or more keeps its upper
-bits (section 6.1.3): BADVERS went out as NOERROR, without TC.
+RFC 6891 section 6.1.1 allows a message one OPT record. A second one is never
+written in place of a first dropped for size, because the first is where an
+rcode of 16 or more keeps its upper bits (section 6.1.3): written, the second
+would state BADVERS as NOERROR, without TC.
 */
 
 @(private = "file")
@@ -79,10 +79,39 @@ second_opt_record_does_not_stand_in_for_a_dropped_first :: proc(t: ^testing.T) {
 }
 
 /*
+An option editor that has to rebuild a message refuses one carrying a second OPT
+record rather than handing it back with one. The encoder writes only the first,
+so the rebuilt reply would pass `peek_opt_unreadable`, which the original fails:
+an upstream reply with a cookie in the first of two OPT records would be accepted
+once `upstream.exchange_with_cookie` had stripped the cookie (issue #353).
+*/
+@(test)
+an_option_rebuild_refuses_a_second_opt_record :: proc(t: ^testing.T) {
+	m := two_opts(0)
+	cookie := make([]EDNS_Option, 1, context.temp_allocator)
+	cookie[0] = EDNS_Option {
+		code = u16(EDNS_Option_Code.Cookie),
+		data = make([]u8, 24, context.temp_allocator),
+	}
+	m.additional[0].data = Rdata_OPT{options = cookie}
+	wire, _, err := encode_with_every_opt(m, context.temp_allocator)
+	if !testing.expect_value(t, err, Encode_Error.None) {
+		return
+	}
+	testing.expect(t, peek_opt_unreadable(wire), "the reply does not carry two OPT records")
+
+	_, removed := remove_edns_option(wire, .Cookie, context.temp_allocator)
+	testing.expect(t, !removed, "the cookie strip handed back the reply with one OPT record")
+	_, set := set_edns_option(wire, .Padding, {0, 0}, context.temp_allocator)
+	testing.expect(t, !set, "an option was written into the reply with one OPT record")
+}
+
+/*
 `encode_message`, but writing every OPT record the additional section holds,
 for the tests whose subject is a message carrying a second one - a shape the
 encoder will not produce and a peer still can. Each record past the first is
-appended to the end, written as the encoder writes one.
+appended to the end, written as the encoder writes one. The server's tests build
+their two-OPT queries and replies with it too.
 */
 encode_with_every_opt :: proc(
 	m: Message,
@@ -108,7 +137,7 @@ encode_with_every_opt :: proc(
 	first := m
 	first.additional = kept[:]
 	wire: []u8
-	wire, truncated, err = encode_message(first, allocator)
+	wire, truncated, err = encode_message(first, context.temp_allocator)
 	if err != .None {
 		return
 	}

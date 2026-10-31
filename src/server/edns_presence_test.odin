@@ -565,7 +565,7 @@ test_an_upstream_opt_this_server_cannot_account_for_is_refused :: proc(t: ^testi
 	}{{"opt in the answer", in_answer}, {"opt in authority", in_authority}, {"two opt records", doubled}, {"unparsed options", unparsed}}
 
 	for shape in shapes {
-		wire, _, err := encode_with_every_opt(shape.msg, context.temp_allocator)
+		wire, _, err := dns.encode_with_every_opt(shape.msg, context.temp_allocator)
 		if !testing.expectf(t, err == .None, "%s: cannot encode the reply: %v", shape.label, err) {
 			continue
 		}

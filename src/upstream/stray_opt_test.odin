@@ -24,6 +24,9 @@ Opt_Mock :: struct {
 	// Where set, the reply's OPT record in the additional section is owned by
 	// this name rather than the root.
 	owner:  string,
+	// Where set, the reply carries two OPT records, the first holding the
+	// query's client cookie back with a server cookie behind it.
+	doubled: bool,
 }
 
 // Answers with an A record, with an OPT record in the answer section beside it
@@ -61,14 +64,36 @@ opt_loop :: proc(m: ^Opt_Mock) {
 		reply.flags.qr = true
 		reply.flags.rd = q.flags.rd
 		reply.flags.ra = true
-		wire, _, _ := dns.encode_message(reply, context.temp_allocator)
+		if m.doubled {
+			reply.additional = doubled_cookie_opts(buf[:n])
+		}
+		wire, _, _ := dns.encode_with_every_opt(reply, context.temp_allocator)
 		_, _ = net.send_udp(m.socket, wire, client)
 		free_all(context.temp_allocator)
 	}
 }
 
+// The query's client cookie with a server cookie behind it, in the first of two
+// OPT records.
 @(private = "file")
-start_mock :: proc(t: ^testing.T, m: ^Opt_Mock, name: string) -> (^Upstream, ^thread.Thread, bool) {
+doubled_cookie_opts :: proc(query: []u8) -> []dns.Record {
+	client, asked := dns.peek_edns_option(query, .Cookie)
+	cookie := make([]u8, COOKIE_CLIENT_LEN + 8, context.temp_allocator)
+	if asked && len(client) >= COOKIE_CLIENT_LEN {
+		copy(cookie, client[:COOKIE_CLIENT_LEN])
+	}
+	options := make([]dns.EDNS_Option, 1, context.temp_allocator)
+	options[0] = dns.EDNS_Option{code = u16(dns.EDNS_Option_Code.Cookie), data = cookie}
+	first := dns.make_opt(4096, false)
+	first.data = dns.Rdata_OPT{options = options}
+	opts := make([]dns.Record, 2, context.temp_allocator)
+	opts[0] = first
+	opts[1] = dns.make_opt(4096, false)
+	return opts
+}
+
+@(private = "file")
+start_mock :: proc(t: ^testing.T, m: ^Opt_Mock, name: string, cookies := false) -> (^Upstream, ^thread.Thread, bool) {
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if !testing.expectf(t, serr == nil, "bind: %v", serr) {
 		return nil, nil, false
@@ -85,6 +110,7 @@ start_mock :: proc(t: ^testing.T, m: ^Opt_Mock, name: string) -> (^Upstream, ^th
 		0,
 		time.Second,
 		context.allocator,
+		cookies,
 	)
 	if !testing.expectf(t, uerr == .None, "upstream: %v", uerr) {
 		net.close(socket)
@@ -109,14 +135,28 @@ test_an_opt_owned_by_a_name_other_than_root_is_swept_past :: proc(t: ^testing.T)
 	expect_swept_past(t, &owned)
 }
 
+/*
+A reply with a cookie in the first of two OPT records is swept past like any
+other second OPT record, after the cookie strip as before it: the strip has to
+rebuild the message to take the cookie out, and a rebuild that kept only the
+first record would hand on a reply the check above no longer sees.
+*/
+@(test)
+test_a_second_opt_record_survives_the_cookie_strip :: proc(t: ^testing.T) {
+	doubled := Opt_Mock {
+		doubled = true,
+	}
+	expect_swept_past(t, &doubled, cookies = true)
+}
+
 // A group of `stray`'s member first and a plain one behind it settles on the
 // plain one, for a client's question and for the chain walk.
 @(private = "file")
-expect_swept_past :: proc(t: ^testing.T, stray: ^Opt_Mock) {
+expect_swept_past :: proc(t: ^testing.T, stray: ^Opt_Mock, cookies := false) {
 	plain: Opt_Mock
 	// Neither started means neither closed: a zero socket here is fd 0, which
 	// under `odin test` is another test's.
-	bad, bad_thread, bad_ok := start_mock(t, stray, "stray")
+	bad, bad_thread, bad_ok := start_mock(t, stray, "stray", cookies)
 	if !bad_ok {
 		return
 	}
@@ -151,6 +191,10 @@ expect_swept_past :: proc(t: ^testing.T, stray: ^Opt_Mock) {
 	}
 	query := dns.Message{id = 0x3530, question = []dns.Question{{name = "www.example.com.", type = .A, class = .IN}}}
 	query.flags.rd = true
+	// An OPT record for the cookie to be attached to, where one is.
+	if cookies {
+		query.additional = {dns.make_opt(1232, false)}
+	}
 	wire, _, _ := dns.encode_message(query, context.temp_allocator)
 
 	// A client's own question.

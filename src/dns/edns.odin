@@ -673,6 +673,22 @@ rebuild_edns_option :: proc(
 	if derr != .None {
 		return nil, false
 	}
+	/*
+	A second OPT record is refused rather than rebuilt away. The encoder writes
+	only the first (RFC 6891 section 6.1.1), so the rebuilt message would pass
+	`peek_opt_unreadable` where this one fails it, and an upstream reply carrying
+	two is to be refused whole (issue #353), not accepted for having had a cookie
+	or padding taken out of it.
+	*/
+	opts := 0
+	for rec in m.additional {
+		if rec.type == .OPT {
+			opts += 1
+		}
+	}
+	if opts > 1 {
+		return nil, false
+	}
 	for &rec in m.additional {
 		if rec.type != .OPT {
 			continue

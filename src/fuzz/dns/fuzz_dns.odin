@@ -41,8 +41,8 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 The road `fit_response` takes with an upstream's answer that is over a client's
 limit: decode it, then encode it again with the truncation walk. The limit is the
 input's own ID, wrapped into the range from 512 - the size RFC 1035 section
-4.2.1 promises every UDP client - up to the input's length, so nearly every ID
-puts the cut somewhere inside the message.
+4.2.1 promises every UDP client - to one byte short of the input's length, so
+every ID puts the cut somewhere inside the message.
 
 A name the decoder wrote and the encoder will not read back is a disagreement
 between the two, and `fit_response` turns it into an empty TC answer; so is a
@@ -55,7 +55,7 @@ reencode :: proc(raw: []u8) {
 	if err != .None {
 		return
 	}
-	limit := 512 + int(m.id) % max(1, len(raw) - 511)
+	limit := 512 + int(m.id) % max(1, len(raw) - 512)
 	out, truncated, enc_err := dns.encode_message(m, max_size = limit)
 	#partial switch enc_err {
 	case .None:
@@ -95,9 +95,8 @@ check_cut :: proc(m, again: dns.Message, truncated: bool, limit: int) {
 		}
 		return
 	}
-	if m.flags.tc {
-		return
-	}
+	// `truncated` is the encoder's own report and the counts are the messages',
+	// so an input that already carried TC is judged like any other.
 	if records_kept(again) >= records_kept(m) {
 		panic("TC on an answer nothing was cut from")
 	}

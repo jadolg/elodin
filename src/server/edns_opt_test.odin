@@ -101,7 +101,7 @@ opt_query :: proc(name: string, additional: []dns.Record) -> []u8 {
 	questions[0] = dns.Question{name = name, type = .A, class = .IN}
 	msg := dns.Message{id = 0x4242, question = questions, additional = additional}
 	msg.flags.rd = true
-	wire, _, err := encode_with_every_opt(msg, context.temp_allocator)
+	wire, _, err := dns.encode_with_every_opt(msg, context.temp_allocator)
 	if err != .None {
 		return nil
 	}
@@ -395,54 +395,4 @@ test_a_second_opt_record_is_refused_whatever_the_cache_holds :: proc(t: ^testing
 		testing.expect_value(t, len(m.answer), 0)
 	}
 	free_all(context.temp_allocator)
-}
-
-/*
-`dns.encode_message`, but writing every OPT record the additional section holds,
-for the tests whose subject is a message carrying a second one - a shape the
-encoder will not produce (RFC 6891 section 6.1.1) and a peer still can. Each
-record past the first is appended to the end, written as the encoder writes one.
-*/
-encode_with_every_opt :: proc(
-	m: dns.Message,
-	allocator := context.allocator,
-) -> (
-	out: []u8,
-	truncated: bool,
-	err: dns.Encode_Error,
-) {
-	kept := make([dynamic]dns.Record, 0, len(m.additional), context.temp_allocator)
-	extra := make([dynamic]dns.Record, 0, 1, context.temp_allocator)
-	seen := false
-	for rec in m.additional {
-		if rec.type == .OPT {
-			if seen {
-				append(&extra, rec)
-				continue
-			}
-			seen = true
-		}
-		append(&kept, rec)
-	}
-	first := m
-	first.additional = kept[:]
-	wire: []u8
-	wire, truncated, err = dns.encode_message(first, allocator)
-	if err != .None {
-		return
-	}
-	buf := make([dynamic]u8, 0, len(wire), allocator)
-	append(&buf, ..wire)
-	arcount := int(wire[10]) << 8 | int(wire[11])
-	for rec in extra {
-		lone, _, lone_err := dns.encode_message(dns.Message{additional = {rec}}, context.temp_allocator, compress = false)
-		if lone_err != .None {
-			return nil, false, lone_err
-		}
-		append(&buf, ..lone[dns.HEADER_SIZE:])
-		arcount += 1
-	}
-	buf[10] = u8(arcount >> 8)
-	buf[11] = u8(arcount)
-	return buf[:], truncated, .None
 }
