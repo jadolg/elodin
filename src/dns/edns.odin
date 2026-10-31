@@ -696,7 +696,9 @@ rebuild_edns_option :: proc(
 		}
 		rec.data = Rdata_OPT{options = options[:]}
 
-		encoded, _, eerr := encode_message(m, scratch, MAX_MESSAGE)
+		// Every OPT record the message arrived with, so a second one is still
+		// there for `peek_opt_unreadable` to refuse the reply over.
+		encoded, _, eerr := encode_with_every_opt(m, scratch)
 		if eerr != .None {
 			return nil, false
 		}
@@ -885,4 +887,62 @@ set_edns_version_and_flags :: proc(msg: []u8, version: u8, do_bit: bool) -> bool
 	msg[span.rdlen_pos - 2] = 0x80 if do_bit else 0
 	msg[span.rdlen_pos - 1] = 0
 	return true
+}
+
+/*
+`encode_message`, but writing every OPT record the additional section holds.
+
+For a message being rewritten rather than composed: an upstream's reply that an
+option is taken out of or put into, and the tests whose subject is a message
+carrying a second OPT record. `encode_message` writes one, as RFC 6891 section
+6.1.1 has a sender do; a rewrite that did the same would hand on a reply with
+the second record gone, which `peek_opt_unreadable` passes where it refuses the
+reply as it arrived (issue #353). Each record past the first is appended to the
+end, written as the encoder writes one.
+
+The encoder leaves those records out of the message itself, and its limit is
+`MAX_MESSAGE` less the room they take, so the message with them appended is
+still one a length prefix can state. A re-encode can outgrow the reply it was
+read from: a name compressed inside RDATA the encoder does not compress, such as
+an SRV target, comes back written in full.
+*/
+encode_with_every_opt :: proc(
+	m: Message,
+	allocator := context.allocator,
+) -> (
+	out: []u8,
+	truncated: bool,
+	err: Encode_Error,
+) {
+	extra := make([dynamic]u8, 0, context.temp_allocator)
+	extras := 0
+	seen := false
+	for rec in m.additional {
+		if rec.type != .OPT {
+			continue
+		}
+		if !seen {
+			seen = true
+			continue
+		}
+		lone: []u8
+		lone, _, err = encode_message(Message{additional = {rec}}, context.temp_allocator, compress = false)
+		if err != .None {
+			return
+		}
+		append(&extra, ..lone[HEADER_SIZE:])
+		extras += 1
+	}
+	wire: []u8
+	wire, truncated, err = encode_message(m, context.temp_allocator, MAX_MESSAGE - len(extra))
+	if err != .None {
+		return
+	}
+	out = make([]u8, len(wire) + len(extra), allocator)
+	copy(out, wire)
+	copy(out[len(wire):], extra[:])
+	arcount := (int(wire[10]) << 8 | int(wire[11])) + extras
+	out[10] = u8(arcount >> 8)
+	out[11] = u8(arcount)
+	return out, truncated, .None
 }

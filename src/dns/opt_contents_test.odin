@@ -295,7 +295,7 @@ test_strip_edns_options_drops_a_second_opt_record :: proc(t: ^testing.T) {
 	additional[0] = first
 	additional[1] = second
 
-	wire, _, err := encode_message(
+	wire, _, err := encode_with_every_opt(
 		Message{id = 7, question = questions, answer = answer, additional = additional},
 		context.temp_allocator,
 	)
@@ -372,7 +372,7 @@ test_strip_edns_options_drops_a_second_opt_behind_an_empty_first :: proc(t: ^tes
 	additional[0] = first
 	additional[1] = second
 
-	wire, _, err := encode_message(
+	wire, _, err := encode_with_every_opt(
 		Message{id = 11, question = questions, answer = answer, additional = additional},
 		context.temp_allocator,
 	)

@@ -101,7 +101,7 @@ opt_query :: proc(name: string, additional: []dns.Record) -> []u8 {
 	questions[0] = dns.Question{name = name, type = .A, class = .IN}
 	msg := dns.Message{id = 0x4242, question = questions, additional = additional}
 	msg.flags.rd = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	wire, _, err := dns.encode_with_every_opt(msg, context.temp_allocator)
 	if err != .None {
 		return nil
 	}

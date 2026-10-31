@@ -551,8 +551,26 @@ encode_message :: proc(
 	additional_dropped := false
 	opt_written := false
 
+	// Whether the additional section's first OPT record has been reached, which
+	// is the message's own. See the skip below.
+	opt_seen := false
+
 	outer: for section, si in sections {
 		for rec in section {
+			/*
+			One OPT record per message (RFC 6891 section 6.1.1), and it is the
+			first: the record `find_opt` reads, `opt_wire_len` measures and
+			`w_readd_opt` puts back. A later one is not written, whether or not
+			the first was. Written in its place it would state its own payload
+			size and extended rcode, and the first is where an rcode of 16 or
+			more keeps its upper bits (section 6.1.3).
+			*/
+			if si == 2 && rec.type == .OPT {
+				if opt_seen {
+					continue
+				}
+				opt_seen = true
+			}
 			/*
 			The additional section keeps the OPT record's room as it fills.
 

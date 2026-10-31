@@ -278,16 +278,6 @@ EDNS_Option_Code :: enum u16 {
 	Ext_Error     = 15,
 }
 
-// Name types that may legally appear compressed inside RDATA. New types are
-// forbidden from using compression (RFC 3597), so we keep this list closed.
-rdata_has_compressible_name :: proc "contextless" (t: Type) -> bool {
-	#partial switch t {
-	case .NS, .MD, .MF, .CNAME, .SOA, .MB, .MG, .MR, .PTR, .MINFO, .MX, .RP, .AFSDB, .RT, .PX, .NXT, .SIG, .NAPTR, .KX, .SRV, .A6, .DNAME:
-		return true
-	}
-	return false
-}
-
 type_name :: proc(t: Type) -> string {
 	#partial switch t {
 	case .A:     return "A"
