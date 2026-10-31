@@ -1,6 +1,8 @@
 package filter
 
+import "core:sync"
 import "core:testing"
+import "core:thread"
 
 @(private = "file")
 build :: proc(text: string, format: Format) -> (^Set, ^Set) {
@@ -140,18 +142,53 @@ test_swap_returns_old_sets :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.block_rules, 1)
 }
 
+/*
+Matches on several threads while the sets are swapped and the old ones freed at
+once, as `server.reload_filters_from` does: every match still answers from a
+whole set, and neither side starves the other. That the swap waits for a match
+in flight is `brlock`'s test; a freed set reads back unchanged here, so it
+cannot be told.
+*/
 @(test)
-test_stats_counted :: proc(t: ^testing.T) {
-	block, allow := build("blocked.example\n", .Domains)
-	e := engine_make()
-	defer engine_destroy(e)
-	engine_swap(e, block, allow)
+test_swap_waits_for_matches_on_other_threads :: proc(t: ^testing.T) {
+	Shared :: struct {
+		e:       ^Engine,
+		stop:    bool,
+		started: int,
+		wrong:   int,
+	}
+	sh := new(Shared)
+	defer free(sh)
+	sh.e = engine_make()
+	defer engine_destroy(sh.e)
+	b, a := build("blocked.example\n", .Domains)
+	engine_swap(sh.e, b, a)
 
-	engine_match(e, "blocked.example.", .A)
-	engine_match(e, "fine.example.", .A)
-	engine_match(e, "blocked.example.", .A)
-
-	s := engine_stats(e)
-	testing.expect_value(t, s.queries, u64(3))
-	testing.expect_value(t, s.blocked, u64(2))
+	readers: [3]^thread.Thread
+	for &r in readers {
+		r = thread.create_and_start_with_data(sh, proc(data: rawptr) {
+			sh := (^Shared)(data)
+			sync.atomic_add(&sh.started, 1)
+			for !sync.atomic_load(&sh.stop) {
+				if engine_match(sh.e, "www.blocked.example.", .A) != .Blocked {
+					sync.atomic_add(&sh.wrong, 1)
+				}
+			}
+		})
+	}
+	for sync.atomic_load(&sh.started) < len(readers) {
+		thread.yield()
+	}
+	for _ in 0 ..< 2000 {
+		nb, na := build("blocked.example\n", .Domains)
+		ob, oa := engine_swap(sh.e, nb, na)
+		set_destroy(ob)
+		set_destroy(oa)
+	}
+	sync.atomic_store(&sh.stop, true)
+	for r in readers {
+		thread.join(r)
+		thread.destroy(r)
+	}
+	testing.expect_value(t, sync.atomic_load(&sh.wrong), 0)
 }

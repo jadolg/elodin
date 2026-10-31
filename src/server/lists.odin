@@ -672,7 +672,7 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 	answers nothing was wrong with.
 	*/
 
-	// In-flight queries hold a shared lock across their match, which the swap
+	// In-flight queries hold a read lock across their match, which the swap
 	// waited on, so nothing can still be reading the displaced sets.
 	filter.set_destroy(old_block)
 	filter.set_destroy(old_allow)

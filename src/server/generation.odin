@@ -6,6 +6,7 @@ import "core:reflect"
 import "core:strings"
 import "core:sync"
 import "core:time"
+import "elodin:brlock"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dnssec"
@@ -121,16 +122,22 @@ Generation :: struct {
 	them is rebuilt by a reload.
 	*/
 	arena:      ^virtual.Arena,
-	// Requests that pinned this generation and have not let go of it yet.
-	refs:       int,
+	/*
+	Requests that pinned this generation and have not let go of it yet, counted
+	on the stripe of the thread that pinned: one count on one line would be
+	written by every loop on every request. Only the sum means anything; see
+	`reap_generations`.
+	*/
+	refs:       [brlock.STRIPES]brlock.Count,
 	owns:       Parts,
 	// The next newer retired generation, once this one is retired.
 	next:       ^Generation,
 }
 
 Generations :: struct {
-	// Held shared by `pin` while it takes a reference, exclusively by the swap.
-	mu:      sync.RW_Mutex,
+	// Read-locked by `pin` while it takes a reference, write-locked by the swap.
+	// Striped for the reason `refs` is.
+	lock:    brlock.Lock,
 	current: ^Generation,
 	// The configuration the process started with, which is what every
 	// restart-only key is held to.
@@ -144,6 +151,8 @@ Pin :: struct {
 	server: ^Server,
 	gen:    ^Generation,
 	depth:  int,
+	// Which of `gen.refs` this pin counted on, which `unpin` takes back.
+	stripe: int,
 }
 
 /*
@@ -186,13 +195,13 @@ pin :: proc(s: ^Server) {
 		return
 	}
 	assert(pinned.server == nil, "a request pins one server at a time")
-	sync.rw_mutex_shared_lock(&s.gens.mu)
+	stripe := brlock.read_lock(&s.gens.lock)
 	g := s.gens.current
 	if g != nil {
-		sync.atomic_add(&g.refs, 1)
+		sync.atomic_add(&g.refs[stripe].n, 1)
 	}
-	sync.rw_mutex_shared_unlock(&s.gens.mu)
-	pinned = Pin{s, g, 1}
+	brlock.read_unlock(&s.gens.lock, stripe)
+	pinned = Pin{s, g, 1, stripe}
 }
 
 unpin :: proc(s: ^Server) {
@@ -202,7 +211,7 @@ unpin :: proc(s: ^Server) {
 		return
 	}
 	if pinned.gen != nil {
-		sync.atomic_sub(&pinned.gen.refs, 1)
+		sync.atomic_sub(&pinned.gen.refs[pinned.stripe].n, 1)
 	}
 	pinned = {}
 }
@@ -678,10 +687,10 @@ first (`reap_generations`).
 */
 @(private)
 swap_generation :: proc(s: ^Server, g: ^Generation, carried: Parts) {
-	sync.rw_mutex_lock(&s.gens.mu)
+	brlock.write_lock(&s.gens.lock)
 	old := s.gens.current
 	sync.atomic_store(&s.gens.current, g)
-	sync.rw_mutex_unlock(&s.gens.mu)
+	brlock.write_unlock(&s.gens.lock)
 
 	g.owns += old.owns & carried
 	old.owns -= carried
@@ -703,12 +712,14 @@ requests.
 
 In use means a request still pinned to it, or a racer still asking one of
 its upstreams - those outlive the request that started them. No new pin can
-reach a retired generation, so a count that reads zero here stays zero.
+reach a retired generation, so a count that reads zero here stays zero: each
+stripe only falls, and on the stripe it was raised on, so one read as zero is
+still zero when the next is read.
 */
 reap_generations :: proc(s: ^Server) -> (released: int) {
 	for s.gens.retired != nil {
 		g := s.gens.retired
-		if sync.atomic_load(&g.refs) > 0 || generation_racing(g) {
+		if brlock.total(g.refs[:]) > 0 || generation_racing(g) {
 			break
 		}
 		s.gens.retired = g.next

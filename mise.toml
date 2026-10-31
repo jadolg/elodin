@@ -208,6 +208,7 @@ run = [
   "odin test src/yaml     -collection:elodin=src -out:bin/test_yaml -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/config   -collection:elodin=src -out:bin/test_config -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/filter   -collection:elodin=src -out:bin/test_filter -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  "odin test src/brlock   -collection:elodin=src -out:bin/test_brlock -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/netx     -collection:elodin=src -out:bin/test_netx -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/logx     -collection:elodin=src -out:bin/test_logx -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/metrics  -collection:elodin=src -out:bin/test_metrics -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",

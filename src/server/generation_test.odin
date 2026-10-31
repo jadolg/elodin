@@ -451,6 +451,9 @@ test_a_retired_generation_waits_for_its_requests_and_goes_oldest_first :: proc(t
 	started under, and holds back not only that generation but the one after it,
 	which may own something the first is still reading. Once it lets go both go,
 	oldest first.
+
+	Two requests, on two threads, which count on two stripes of `refs`: the first
+	to let go leaves the other's count, and the generation stays.
 	*/
 	f, ok := boot_fixture(t, "reap", BASE)
 	if !ok {
@@ -459,27 +462,32 @@ test_a_retired_generation_waits_for_its_requests_and_goes_oldest_first :: proc(t
 	defer close_fixture(f)
 	first := f.s.gens.current
 
-	h := Holder {
-		s = &f.s,
+	hs := [2]Holder{{s = &f.s}, {s = &f.s}}
+	holders: [2]^thread.Thread
+	for &h, i in hs {
+		holders[i] = thread.create_and_start_with_poly_data(&h, hold_a_request)
+		sync.sema_wait(&h.pinned)
 	}
-	holder := thread.create_and_start_with_poly_data(&h, hold_a_request)
-	sync.sema_wait(&h.pinned)
 
 	reload_from(t, f, BASE + "rewrites:\n  - { domain: one.test, answer: 192.0.2.1 }\n")
 	reload_from(t, f, swap(BASE, "127.0.0.1:1", "127.0.0.1:2"))
 	testing.expect(t, f.s.gens.current != first, "no reload landed")
 
-	sync.sema_post(&h.go_read)
-	sync.sema_wait(&h.saw_late)
-	testing.expect(t, h.saw == first.cfg, "a pinned request moved to a newer configuration mid-flight")
+	for &h in hs {
+		sync.sema_post(&h.go_read)
+		sync.sema_wait(&h.saw_late)
+		testing.expect(t, h.saw == first.cfg, "a pinned request moved to a newer configuration mid-flight")
+	}
 
 	testing.expect_value(t, reap_generations(&f.s), 0)
 	testing.expect(t, f.s.gens.retired == first, "the oldest retired generation is not at the head")
 
-	sync.sema_post(&h.release)
-	thread.join(holder)
-	thread.destroy(holder)
-	testing.expect_value(t, reap_generations(&f.s), 2)
+	for &h, i in hs {
+		sync.sema_post(&h.release)
+		thread.join(holders[i])
+		thread.destroy(holders[i])
+		testing.expect_value(t, reap_generations(&f.s), 2 if i == len(hs) - 1 else 0)
+	}
 	testing.expect(t, f.s.gens.retired == nil, "a released generation is still listed")
 }
 

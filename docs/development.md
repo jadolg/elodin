@@ -41,6 +41,7 @@ src/dns/       message codec: names, compression, records, EDNS, TTL patching
 src/yaml/      YAML subset parser and typed accessors
 src/config/    configuration schema, loading, validation and sizing
 src/filter/    sink-list matching and list-format parsers
+src/brlock/    a reader-writer lock whose readers each count on a cache line of their own
 src/cache/     LRU answer cache
 src/dnssec/    validation: canonical form, signatures, NSEC/NSEC3, chain of trust
 src/upstream/  transports (UDP/TCP/DoT/DoH), pooling, strategies, cookies, HTTP/1.1 and h2 clients
