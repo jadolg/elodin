@@ -1136,6 +1136,57 @@ test_content_length_is_strict_decimal :: proc(t: ^testing.T) {
 }
 
 /*
+A `Content-Length` that is well formed but over `MAX_DOH_BODY` is a 413 (RFC 9110
+15.5.14), not the silent close an unreadable one gets.
+
+The digits frame the request the same way to every hop, so the refusal cannot be
+attributed to some other request; only once the rest of the headers are read,
+though, since a `Transfer-Encoding` or a second `Content-Length` after it makes
+the framing what is wrong after all, and that is still answered with nothing.
+*/
+@(test)
+test_content_length_over_the_limit_is_a_413 :: proc(t: ^testing.T) {
+	Case :: struct {
+		method:  string,
+		host:    string,
+		headers: string, // after Host and before the blank line
+		status:  int,
+		what:    string,
+	}
+
+	HOST :: "Host: dns.example\r\n"
+	OVER :: "Content-Length: 100000\r\n"
+
+	CASES := []Case {
+		{"POST", HOST, OVER, 413, "a length well past the limit"},
+		{"POST", HOST, "Content-Length: 65536\r\n", 413, "one byte past the limit"},
+		// 2^64 + 4, which a wrapping parser reads as 4: still digits, still too large.
+		{"POST", HOST, "Content-Length: 18446744073709551620\r\n", 413, "a length past 64 bits"},
+		{"HEAD", HOST, OVER, 413, "a HEAD, which keeps its method for the reply"},
+		{"POST", HOST, "Content-Length: 0x100000\r\n", 0, "an over-limit length that is not decimal"},
+		{"POST", HOST, OVER + "Transfer-Encoding: chunked\r\n", 0, "chunked framing after it"},
+		{"POST", HOST, OVER + "Content-Length: 4\r\n", 0, "a second Content-Length after it"},
+		{"POST", HOST, OVER + "X-Fold: one\r\n two\r\n", 0, "a folded line after it"},
+		{"POST", "", OVER, 400, "1.1 with no Host, which is malformed before it is large"},
+	}
+
+	for c in CASES {
+		raw := fmt.tprintf("%s /dns-query HTTP/1.1\r\n%s%s\r\n", c.method, c.host, c.headers)
+		req, status, parsed, ok := read_request_over_loopback(t, raw, c.what)
+		if !ok {
+			return
+		}
+		testing.expectf(t, !parsed, "%s was accepted", c.what)
+		testing.expectf(t, status == c.status, "%s: answered %d, expected %d", c.what, status, c.status)
+		if c.status == 413 {
+			testing.expectf(t, req.method == c.method, "%s: method came back as %q", c.what, req.method)
+		}
+		free_all(context.temp_allocator)
+	}
+	testing.expect_value(t, http_refusal_message(413), "content too large")
+}
+
+/*
 A refusal reaches the client even when the request that earned it went on past
 what the reader read.
 

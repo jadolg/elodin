@@ -65,8 +65,8 @@ serving one would have.
 
 The idle wait applies per read. `HTTP_LINGER_BODY_IDLE` is what every drain here
 passes, because every refusal that drains is one `read_http_request` handed back,
-decided on the request line or on a repeated `Host` - before the body those
-headers declared has been read. What is unread there is not something the client
+decided on the request line, on a repeated `Host` or on a `Content-Length` over
+the limit - before the body those headers declared has been read. What is unread there is not something the client
 has already put on the wire but a body still on its way, and over any distance
 the next segment of it is a round trip away rather than in the queue: a wait of
 only the time a queued byte takes to arrive drains the first congestion window,
@@ -282,9 +282,10 @@ connection whose next byte this server cannot place would be a reply the front
 end may attribute to the next request on it.
 
 The rest are framed the way both hops read them, so the refusals the RFC asks
-for are safe to send: a request line is either read whole or not read at all, and
-a missing or repeated `Host` - refused with the headers only half read - has no
-bearing on where the body ends. Each of those closes the connection after
+for are safe to send: a request line is either read whole or not read at all, a
+missing or repeated `Host` - refused with the headers only half read - has no
+bearing on where the body ends, and a `Content-Length` over `MAX_DOH_BODY` says
+exactly where it ends, only too far away. Each of those closes the connection after
 answering, and drains what the client had already sent before it does, so that
 the answer is not lost to the RST that closing on unread bytes would send - see
 `http_linger`.
@@ -423,8 +424,10 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			if content_length >= 0 {
 				return {}, 0, false
 			}
+			// Too large is not refused here but after the headers: see the 413
+			// below. Not a length at all is framing, and answered with nothing.
 			v, vok := h2.parse_content_length(value, MAX_DOH_BODY)
-			if !vok || v > MAX_DOH_BODY {
+			if !vok {
 				return {}, 0, false
 			}
 			content_length = v
@@ -472,6 +475,19 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	// and is allowed to leave it out.
 	if hosts == 0 && !http_1_0 {
 		return {method = req.method}, 400, false
+	}
+
+	/*
+	RFC 9110 15.5.14: a body larger than the server will process is a 413. Digits
+	frame the request the same way to every hop - `parse_content_length` has
+	checked all of them, and too many is no ambiguity about where it ends - so this
+	is safe to answer, where an unreadable length is not. Only once every header is
+	read, though: a `Transfer-Encoding` or a second `Content-Length` further down
+	makes the framing what is wrong after all, and those are still closed on
+	unanswered. The body is not read, and the caller closes after the answer.
+	*/
+	if content_length > MAX_DOH_BODY {
+		return {method = req.method}, 413, false
 	}
 
 	if content_length > 0 {
@@ -950,7 +966,10 @@ callers of the reader map it here so the two answer alike.
 */
 @(private)
 http_refusal_message :: proc(status: int) -> string {
-	if status == 505 {
+	switch status {
+	case 413:
+		return "content too large"
+	case 505:
 		return "http version not supported"
 	}
 	return "bad request"
@@ -963,7 +982,8 @@ written to it is not lost to the close that follows.
 A refused request is answered and the connection then closes, and the request that
 earned the refusal may carry bytes this server never read: `read_http_request`
 turns down a bad request line before reading the headers that would say how long
-the body is, and a repeated `Host` before the end of them. Closing a socket whose
+the body is, a repeated `Host` before the end of them, and a body over the limit
+not at all. Closing a socket whose
 receive queue still holds bytes does not send a FIN but an RST (RFC 1122
 4.2.2.13), and an RST arriving at a client that has not read yet has its kernel
 discard what is already in its receive buffer - so the status this endpoint went

@@ -42,8 +42,11 @@ PROTOCOL_ERROR; a conformant `CONNECT` gets a 404. HTTP/1.1 refuses the same
 shapes.
 
 A request body is at most 65535 bytes, the most RFC 8484 section 6 allows a DNS
-message. Past it, HTTP/2 resets the stream with ENHANCE_YOUR_CALM and HTTP/1.1
-closes the connection unanswered.
+message. Past it, HTTP/2 resets the stream with ENHANCE_YOUR_CALM, and HTTP/1.1
+answers a `Content-Length` that declares more with **413** and closes the
+connection without reading the body. A `Content-Length` that is not plain
+decimal, or one beside a second `Content-Length` or a `Transfer-Encoding`, is
+closed on unanswered.
 
 ## Apple devices (iOS, iPadOS, macOS)
 
