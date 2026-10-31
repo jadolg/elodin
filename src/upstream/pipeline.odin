@@ -865,10 +865,11 @@ pipe_query :: proc(
 		sync.mutex_lock(&c.mu)
 		delete_key(&c.waiters, id)
 		sync.mutex_unlock(&c.mu)
-		// A write that put bytes on the wire has already killed the
-		// connection: a half-written query leaves the stream out of frame,
-		// and `pipe_write` kills it before it lets the next writer take its
-		// turn. One that sent nothing leaves it standing.
+		// A write that put bytes on the wire, or found the socket broken, has
+		// already killed the connection: a half-written query leaves the
+		// stream out of frame, and `pipe_write` kills it before it lets the
+		// next writer take its turn. One that timed out having sent nothing
+		// leaves it standing.
 		return nil, werr
 	}
 
@@ -1288,12 +1289,14 @@ pipe_write :: proc(c: ^Pipe_Conn, query: []u8, deadline: time.Tick) -> Error {
 		return werr
 	}
 	sent, err := pipe_write_framed(c, framed, deadline)
-	if err != .None && sent > 0 {
+	if err != .None && (sent > 0 || err != .Timeout) {
 		/*
-		Only when something went out, which is the rule the read path has
-		followed from the start: a transfer that moved nothing left the stream
-		in frame, so what happened is one caller's timeout and not everybody's
-		failure.
+		A timeout only when something went out, which is the rule the read path
+		has followed from the start: a transfer that moved nothing left the
+		stream in frame, so what happened is one caller's timeout and not
+		everybody's failure. Any other failure is the socket's - a reset or a
+		broken pipe fails every write after it the same way - and
+		`exchange_pipelined` retries a query only on a connection it finds dead.
 
 		It bites hardest here. The caller that reaches this with no budget left
 		is one that came out of the dial queue on a sliver - `get_pipe` lets it
@@ -1361,7 +1364,8 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 	out the bound it was set to or was never let wait: a cancelled fiber's every
 	wait ends at once (`loop.cancel`), and so does one the loop failed to
 	register. Round again on either and the loop spins until the bound instead
-	of parking - a whole framing budget of a loop thread, for a race's loser.
+	of parking - a whole framing budget of a loop thread, for a fiber that
+	shutdown has cancelled.
 	*/
 	bound := deadline
 	for sent < len(framed) {
@@ -1380,9 +1384,7 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 		}
 		sent += max(n, 0)
 		if werr == nil {
-			if n <= 0 {
-				return sent, .IO_Error
-			}
+			// `send_tcp` without an error wrote all of it.
 			continue
 		}
 		// A send timeout is the peer not reading, which is a different thing

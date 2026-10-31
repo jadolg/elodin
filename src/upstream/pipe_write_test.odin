@@ -191,8 +191,8 @@ stall_rig :: proc(t: ^testing.T, r: ^Stall_Rig, mode: Stall_Mode, drain_at, time
 Shrink a socket buffer to the kernel's floor, and say whether it took.
 
 Through `setsockopt` rather than `net.set_option`, which on this toolchain
-leaves `SO_SNDBUF` at megabytes whatever it is asked for - and a buffer that
-size is how earlier attempts at this test found no `send` that ever waited.
+leaves `SO_SNDBUF` at megabytes whatever it is asked for - and with a buffer
+that size no `send` here ever waits.
 Read back for the same reason: a setting that did not take reads as a test
 that passes with nothing blocked.
 */
@@ -252,8 +252,12 @@ stall_fill :: proc(c: ^Pipe_Conn) -> bool {
 			for {
 				n, err := net.send_tcp(c.stream.socket, junk[:size])
 				total += n
-				if err != nil {
+				// Only a full buffer is quiet; a broken socket is not full.
+				if err == .Would_Block {
 					break
+				}
+				if err != nil {
+					return false
 				}
 			}
 		}
@@ -554,4 +558,65 @@ stall_queued :: proc(c: ^Pipe_Conn) -> int {
 		return 0
 	}
 	return int(n)
+}
+
+/*
+A write the peer has already reset takes the connection down, though nothing went
+out. The stream is not out of frame, but it is not a stream any more either: every
+later write fails the same way, and `exchange_pipelined` retries a query only on a
+connection it finds dead.
+*/
+@(test)
+test_a_write_to_a_reset_connection_takes_it_down :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	defer net.close(listener)
+	bound, _ := net.bound_endpoint(listener)
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "reset", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		8,
+		5 * time.Second,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+	c, derr := dial_pipe(u, 5 * time.Second, 5 * time.Second)
+	if !testing.expectf(t, derr == .None, "cannot dial: %v", derr) {
+		return
+	}
+	defer _ = pipe_unref(c)
+
+	// SO_LINGER at zero makes the close a RST.
+	peer, _, aerr := net.accept_tcp(listener)
+	if !testing.expectf(t, aerr == nil, "cannot accept: %v", aerr) {
+		return
+	}
+	lg := posix.linger {
+		l_onoff  = 1,
+		l_linger = 0,
+	}
+	posix.setsockopt(posix.FD(peer), posix.SOL_SOCKET, .LINGER, &lg, posix.socklen_t(size_of(lg)))
+	net.close(peer)
+	// The premise: the reset has landed, which a read of the pipe's socket reports.
+	buf: [1]u8
+	reset := false
+	for start := time.tick_now(); !reset && time.tick_since(start) < 5 * time.Second; {
+		_, rerr := net.recv_tcp(c.stream.socket, buf[:])
+		reset = rerr != nil && rerr != .Would_Block
+		if !reset {
+			time.sleep(time.Millisecond)
+		}
+	}
+	if !testing.expect(t, reset, "the peer's reset never reached the pipe") {
+		return
+	}
+
+	query: [64]u8
+	werr := pipe_write(c, query[:], time.tick_add(time.tick_now(), time.Second))
+	_, dead := pipe_dead(c)
+	testing.expectf(t, werr == .IO_Error, "a write to a reset connection reported %v", werr)
+	testing.expect(t, dead, "a write to a reset connection left it standing")
 }

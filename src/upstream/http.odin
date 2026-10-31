@@ -67,16 +67,13 @@ stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}, idle := tim
 		}
 		return .None
 	}
-	sent := 0
-	for sent < len(buf) {
-		n, err := loop.send_tcp(s.socket, buf[sent:])
-		if err == .Timeout || err == .Would_Block {
-			return .Timeout
-		}
-		if err != nil || n <= 0 {
-			return .IO_Error
-		}
-		sent += n
+	// One call: `loop.send_tcp` writes the whole buffer or says why not.
+	_, err := loop.send_tcp(s.socket, buf)
+	if err == .Timeout || err == .Would_Block {
+		return .Timeout
+	}
+	if err != nil {
+		return .IO_Error
 	}
 	return .None
 }
