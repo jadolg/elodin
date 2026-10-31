@@ -97,7 +97,8 @@ stall_peer_loop :: proc(p: ^Stall_Peer) {
 				first = false
 			}
 			if n > 0 {
-				p.received += n
+				// Atomic: the test watches it to know the message is in.
+				sync.atomic_add(&p.received, n)
 			} else {
 				time.sleep(time.Millisecond)
 			}
@@ -343,10 +344,12 @@ test_a_started_write_is_finished_past_the_callers_deadline :: proc(t: ^testing.T
 	werr := pipe_write(r.c, query, time.tick_add(start, BUDGET))
 	end := time.tick_now()
 	_, dead := pipe_dead(r.c)
-	// Past the drain whatever the write did, so the peer has looked. Never a
-	// negative sleep: `time.sleep` converts it to an unsigned `timespec`.
-	if left := DRAIN_AT + 200 * time.Millisecond - time.tick_since(start); left > 0 {
-		time.sleep(left)
+	// Until the peer has the whole message, or long past the drain whatever
+	// the write did, so the peer has looked. Not a fixed sleep: a write that
+	// ends late on a busy box, which the framing budget allows, would have
+	// the peer stopped with the tail still in flight.
+	for sync.atomic_load(&r.peer.received) < 2 + STALL_QUERY_SIZE && time.tick_since(start) < DRAIN_AT + 3 * time.Second {
+		time.sleep(time.Millisecond)
 	}
 	sync.atomic_store(&r.peer.stop, true)
 	thread.join(r.th)
@@ -579,7 +582,10 @@ test_a_write_to_a_reset_connection_takes_it_down :: proc(t: ^testing.T) {
 		return
 	}
 	defer net.close(listener)
-	bound, _ := net.bound_endpoint(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
 	u, uerr := make_upstream(
 		config.Upstream_Spec{name = "reset", kind = .TCP, address = "127.0.0.1", port = bound.port},
 		8,
@@ -604,7 +610,11 @@ test_a_write_to_a_reset_connection_takes_it_down :: proc(t: ^testing.T) {
 		l_onoff  = 1,
 		l_linger = 0,
 	}
-	posix.setsockopt(posix.FD(peer), posix.SOL_SOCKET, .LINGER, &lg, posix.socklen_t(size_of(lg)))
+	if posix.setsockopt(posix.FD(peer), posix.SOL_SOCKET, .LINGER, &lg, posix.socklen_t(size_of(lg))) != .OK {
+		net.close(peer)
+		testing.expect(t, false, "cannot set SO_LINGER, so the close would not be a reset")
+		return
+	}
 	net.close(peer)
 	// The premise: the reset has landed, which a read of the pipe's socket reports.
 	buf: [1]u8
