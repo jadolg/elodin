@@ -304,7 +304,7 @@ test_peek_opt_unreadable_names_each_shape :: proc(t: ^testing.T) {
 			additional = c.additional,
 		}
 		m.flags.qr = true
-		wire, _, err := encode_message(m, context.temp_allocator)
+		wire, _, err := encode_with_every_opt(m, context.temp_allocator)
 		if !testing.expectf(t, err == .None, "%s: encode: %v", c.label, err) {
 			continue
 		}

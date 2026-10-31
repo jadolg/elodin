@@ -11,7 +11,8 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	context = harness.setup(&f)
 	defer harness.teardown(&f)
 
-	_, _ = dns.decode_message(data[:size])
+	// `decode_message`, and the re-encode `fit_response` runs on what it read.
+	reencode(data[:size])
 	// Reached from the UDP read loop for a rate-limited query, on the bytes as
 	// they arrived and without decoding them first, so it is its own parser of
 	// hostile input and gets its own turn here.
@@ -32,7 +33,6 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	// Every forwarded and cached answer is read for its RRSIGs' expirations on
 	// the raw bytes, before anything decodes them (issue #165).
 	_, _ = dns.signatures_lapse(data[:size], 0)
-	reencode(data[:size])
 	edit_in_place(data[:size])
 	return 0
 }
@@ -40,31 +40,27 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 /*
 The road `fit_response` takes with an upstream's answer that is over a client's
 limit: decode it, then encode it again with the truncation walk. The limit is the
-input's own ID, wrapped into 512 - the size RFC 1035 section 4.2.1 promises
-every UDP client - up to libFuzzer's default 4096-byte input cap, so every ID
-puts the cut somewhere an input can reach.
-
-What comes back is checked for the two things the server sends on: it is within
-the limit, and it is a message - one the decoder reads, whose TC bit says what
-the encoder reported, and which, without TC, has every answer and authority
-record it started with.
+input's own ID, wrapped into the range from 512 - the size RFC 1035 section
+4.2.1 promises every UDP client - up to the input's length, so nearly every ID
+puts the cut somewhere inside the message.
 
 A name the decoder wrote and the encoder will not read back is a disagreement
-between the two, and `fit_response` turns it into an empty TC answer. The other
-encode errors are refusals the encoder makes on purpose (raw RDATA holding a
-pointer, a question over the limit) and are not checked.
+between the two, and `fit_response` turns it into an empty TC answer; so is a
+character-string over 255 bytes, which a one-byte length cannot have read. The
+other encode errors are refusals the encoder makes on purpose (raw RDATA holding
+a pointer, a question over the limit) and are not checked.
 */
 reencode :: proc(raw: []u8) {
 	m, err := dns.decode_message(raw)
 	if err != .None {
 		return
 	}
-	limit := 512 + int(m.id) % (4096 - 512 + 1)
+	limit := 512 + int(m.id) % max(1, len(raw) - 511)
 	out, truncated, enc_err := dns.encode_message(m, max_size = limit)
 	#partial switch enc_err {
 	case .None:
-	case .Bad_Escape, .Bad_Name, .Label_Too_Long, .Name_Too_Long:
-		panic("a decoded name does not encode")
+	case .Bad_Escape, .Bad_Name, .Label_Too_Long, .Name_Too_Long, .Too_Large:
+		panic("a decoded message does not encode")
 	case:
 		return
 	}
@@ -78,9 +74,61 @@ reencode :: proc(raw: []u8) {
 	if truncated != again.flags.tc && !m.flags.tc {
 		panic("the TC bit disagrees with the cut")
 	}
-	if !truncated && (len(again.answer) != len(m.answer) || len(again.authority) != len(m.authority)) {
-		panic("records were cut without TC")
+	check_cut(m, again, truncated, limit)
+}
+
+/*
+What the encoder promises about a cut, checked from the two messages rather than
+from what it reported. Without TC the answer and authority sections come back
+whole and the rcode the same, upper bits and all (RFC 6891 section 6.1.3). With
+TC something was left out, and the OPT record is still there wherever the
+question and the record fit on their own, since it carries the payload size,
+cookie and extended error the client asks again with.
+*/
+check_cut :: proc(m, again: dns.Message, truncated: bool, limit: int) {
+	if !truncated {
+		if len(again.answer) != len(m.answer) || len(again.authority) != len(m.authority) {
+			panic("records were cut without TC")
+		}
+		if dns.rcode_of(again) != dns.rcode_of(m) {
+			panic("the rcode changed without TC")
+		}
+		return
 	}
+	if m.flags.tc {
+		return
+	}
+	if records_kept(again) >= records_kept(m) {
+		panic("TC on an answer nothing was cut from")
+	}
+	opt, found := dns.find_opt(m)
+	if !found || opt.name != "." {
+		return
+	}
+	if _, raw_rdata := opt.data.(dns.Rdata_Raw); raw_rdata {
+		return
+	}
+	alone := dns.Message{id = m.id, flags = m.flags, question = m.question, additional = {opt}}
+	if fits, _, e := dns.encode_message(alone); e == .None && len(fits) <= limit && !dns.edns_present(again) {
+		panic("a cut lost the OPT record it had room for")
+	}
+}
+
+// Records a message carries once encoded: every one, but a second OPT record,
+// which RFC 6891 section 6.1.1 forbids and the encoder leaves out.
+records_kept :: proc(m: dns.Message) -> int {
+	n := len(m.answer) + len(m.authority)
+	opt_seen := false
+	for rec in m.additional {
+		if rec.type == .OPT {
+			if opt_seen {
+				continue
+			}
+			opt_seen = true
+		}
+		n += 1
+	}
+	return n
 }
 
 /*
@@ -93,13 +141,21 @@ edit_in_place :: proc(raw: []u8) {
 	_ = dns.peek_udp_size(raw)
 	_, _ = dns.peek_question(raw)
 	_, _ = dns.peek_alias_target(raw)
-	_, _ = dns.peek_edns_option(raw, .Cookie)
 	_, _ = dns.strip_edns_options(raw)
 	_, _ = dns.remove_opt(raw)
 	// The per-client options the server takes out of a forwarded answer and
-	// puts into one on its way back (cookie, extended error, keepalive).
-	_, _ = dns.remove_edns_option(raw, .Cookie)
-	_, _ = dns.ensure_edns_option(raw, .Ext_Error, {0, 0}, 1232)
+	// puts into one on its way back (cookie, extended error, keepalive), each
+	// checked for having done it.
+	if out, ok := dns.remove_edns_option(raw, .Cookie); ok {
+		if _, found := dns.peek_edns_option(out, .Cookie); found {
+			panic("a removed option is still there")
+		}
+	}
+	if out, ok := dns.ensure_edns_option(raw, .Ext_Error, {0, 0}, 1232); ok {
+		if _, found := dns.peek_edns_option(out, .Ext_Error); !found {
+			panic("an ensured option is not there")
+		}
+	}
 
 	// The cache's walk: where the TTLs are, what they say, and the rewrite of
 	// each one as the entry ages.
