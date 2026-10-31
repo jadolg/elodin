@@ -139,10 +139,11 @@ stall_listener :: proc() -> (listener: net.TCP_Socket, port: int, ok: bool) {
 
 @(private = "file")
 Stall_Rig :: struct {
-	peer: Stall_Peer,
-	th:   ^thread.Thread,
-	u:    ^Upstream,
-	c:    ^Pipe_Conn,
+	peer:      Stall_Peer,
+	listening: bool,
+	th:        ^thread.Thread,
+	u:         ^Upstream,
+	c:         ^Pipe_Conn,
 }
 
 /*
@@ -161,6 +162,7 @@ stall_rig :: proc(t: ^testing.T, r: ^Stall_Rig, mode: Stall_Mode, drain_at, time
 		mode     = mode,
 		drain_at = drain_at,
 	}
+	r.listening = true
 	r.th = thread.create_and_start_with_poly_data(&r.peer, stall_peer_loop)
 	u, uerr := make_upstream(
 		config.Upstream_Spec{name = "stalled", kind = .TCP, address = "127.0.0.1", port = port},
@@ -219,7 +221,11 @@ stall_rig_destroy :: proc(r: ^Stall_Rig) {
 		thread.join(r.th)
 		thread.destroy(r.th)
 	}
-	net.close(r.peer.listener)
+	// Only a rig that got as far as its listener has one: a zero handle closed
+	// here would be fd 0, another test's socket under `odin test`.
+	if r.listening {
+		net.close(r.peer.listener)
+	}
 	if r.u != nil {
 		destroy(r.u)
 	}
@@ -327,8 +333,11 @@ test_a_started_write_is_finished_past_the_callers_deadline :: proc(t: ^testing.T
 	werr := pipe_write(r.c, query, time.tick_add(start, BUDGET))
 	took := time.tick_since(start)
 	_, dead := pipe_dead(r.c)
-	// Past the drain whatever the write did, so the peer has looked.
-	time.sleep(DRAIN_AT + 200 * time.Millisecond - time.tick_since(start))
+	// Past the drain whatever the write did, so the peer has looked. Never a
+	// negative sleep: `time.sleep` converts it to an unsigned `timespec`.
+	if left := DRAIN_AT + 200 * time.Millisecond - time.tick_since(start); left > 0 {
+		time.sleep(left)
+	}
 	sync.atomic_store(&r.peer.stop, true)
 	thread.join(r.th)
 	thread.destroy(r.th)
@@ -354,8 +363,9 @@ A peer that takes a few bytes at a time cannot keep the write going.
 
 Each of its reads opens the window a little and lets one more `send` through,
 so a bound that restarted on progress would never fire. The framing budget
-runs from the first byte away and covers the whole message; when it is gone the
-message is half written, and the connection with it.
+starts when the send that put the first bytes out returns - here at the
+caller's deadline, a moment after them - and covers the rest of the message;
+when it is gone the message is half written, and the connection with it.
 */
 @(test)
 test_a_dribbling_peer_cannot_hold_a_write_past_the_framing_budget :: proc(t: ^testing.T) {
@@ -483,10 +493,17 @@ test_a_cancelled_writer_does_not_spin_on_its_loop :: proc(t: ^testing.T) {
 		query = make([]u8, STALL_QUERY_SIZE),
 	}
 	defer delete(w.query)
-	_, _ = loop.spawn(l, proc(data: rawptr) {
+	_, spawned := loop.spawn(l, proc(data: rawptr) {
 		w := (^Write)(data)
 		w.err = pipe_write(w.c, w.query, time.tick_add(time.tick_now(), TIMEOUT))
 	}, &w)
+	if !testing.expect(t, spawned, "cannot spawn the writer") {
+		loop.stop(l)
+		thread.join(th)
+		thread.destroy(th)
+		loop.destroy(l)
+		return
+	}
 
 	// The premise: part of the message is queued on the socket and the rest
 	// is not, so the writer is parked partway through it.

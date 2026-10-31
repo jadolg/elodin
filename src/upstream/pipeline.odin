@@ -865,9 +865,10 @@ pipe_query :: proc(
 		sync.mutex_lock(&c.mu)
 		delete_key(&c.waiters, id)
 		sync.mutex_unlock(&c.mu)
-		// The connection is already dead: a half-written query leaves the
-		// stream out of frame, and `pipe_write` kills it before it lets the
-		// next writer take its turn.
+		// A write that put bytes on the wire has already killed the
+		// connection: a half-written query leaves the stream out of frame,
+		// and `pipe_write` kills it before it lets the next writer take its
+		// turn. One that sent nothing leaves it standing.
 		return nil, werr
 	}
 
