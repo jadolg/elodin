@@ -123,6 +123,12 @@ main :: proc() {
 		os.exit(2)
 	}
 
+	base_port, slot_ok := claim_port_slot()
+	if !slot_ok {
+		fmt.eprintfln("itest: all %d port slots are taken by other runs", SLOTS)
+		os.exit(2)
+	}
+
 	work_dir := make_work_dir()
 	defer if !keep {
 		remove_work_dir(work_dir)
@@ -131,7 +137,8 @@ main :: proc() {
 	r := Runner {
 		binary        = absolute(binary),
 		work_dir      = work_dir,
-		next_port     = BASE_PORT,
+		next_port     = base_port,
+		port_limit    = base_port + SLOT_PORTS - 1,
 		failures      = make([dynamic]string, 0, 16),
 		verbose       = verbose,
 		graceful_stop = graceful_stop,
@@ -144,6 +151,7 @@ main :: proc() {
 	fmt.printfln("elodin integration tests")
 	fmt.printfln("  binary:    %s", r.binary)
 	fmt.printfln("  work dir:  %s", work_dir)
+	fmt.printfln("  ports:     %d-%d", base_port, r.port_limit - 1)
 	if !cert_ok {
 		fmt.println("  note:      no certificate available, TLS cases will be skipped")
 	}
@@ -354,6 +362,7 @@ report :: proc(r: ^Runner, elapsed: time.Duration) {
 		fmt.println()
 	}
 	fmt.println()
+	fmt.printfln("ports used: %d of %d", r.next_port - (r.port_limit - SLOT_PORTS + 1), SLOT_PORTS - 1)
 
 	problems := 0
 	for line in r.failures {
