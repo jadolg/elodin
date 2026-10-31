@@ -232,12 +232,19 @@ run_transport_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	// Digits that frame the request the same way to every hop, only too many of
-	// them: a 413 (RFC 9110 15.5.14) rather than a bare close (#306).
+	// them: a 413 (RFC 9110 15.5.14) rather than a bare close (#306). The body
+	// is sent, as a client not using `Expect: 100-continue` would, so the 413
+	// has to survive the drain and close that follow it.
 	start_case(r, "doh: a Content-Length over the limit is a 413")
 	{
+		OVER :: 70000
 		res := doh_raw(
 			doh_port,
-			"POST /dns-query HTTP/1.1\r\nHost: elodin.local\r\nContent-Type: application/dns-message\r\nContent-Length: 100000\r\n\r\n",
+			fmt.tprintf(
+				"POST /dns-query HTTP/1.1\r\nHost: elodin.local\r\nContent-Type: application/dns-message\r\nContent-Length: %d\r\n\r\n%s",
+				OVER,
+				strings.repeat("x", OVER, context.temp_allocator),
+			),
 		)
 		if check(r, res.ok, "no HTTP response; the request was closed on unanswered") {
 			check_eq_int(r, res.status, 413, "status")
