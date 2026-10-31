@@ -419,16 +419,20 @@ test_a_full_connection_does_not_shut_callers_out :: proc(t: ^testing.T) {
 }
 
 /*
-A responder that reads two queries, waits, and then answers only the second.
+A responder that reads two queries, waits for the test's word, and then sends a
+reply nobody asked for followed by the answer to the second.
 
-The first caller is left to run out of time while the second's answer is still
-coming, which is what puts the reading in the hands of a caller that is about
-to give up.
+The stray reply is what wakes the reader once the test has put it past its
+deadline: a reader blocked on the socket notices nothing until a message
+arrives, and one nobody is waiting for is dropped without answering anyone.
 */
 @(private = "file")
 Handoff_Mock :: struct {
 	listener: net.TCP_Socket,
-	delay:    time.Duration,
+	// Both queries are in.
+	got_both: bool,
+	// The test has put the reader past its deadline.
+	go:       bool,
 	stop:     bool,
 }
 
@@ -441,8 +445,10 @@ handoff_mock_loop :: proc(m: ^Handoff_Mock) {
 	defer net.close(client)
 	_ = net.set_option(client, .Receive_Timeout, 200 * time.Millisecond)
 
-	second: []u8
-	defer delete(second)
+	queries: [2][]u8
+	defer for q in queries {
+		delete(q)
+	}
 	for i in 0 ..< 2 {
 		length_buf: [2]u8
 		got := 0
@@ -463,38 +469,78 @@ handoff_mock_loop :: proc(m: ^Handoff_Mock) {
 		if length < dns.HEADER_SIZE || length > dns.MAX_MESSAGE {
 			return
 		}
-		q := make([]u8, length)
+		queries[i] = make([]u8, length)
 		got = 0
 		for got < length {
-			n, err := net.recv_tcp(client, q[got:])
+			n, err := net.recv_tcp(client, queries[i][got:])
 			if err == .Timeout || err == .Would_Block {
 				continue
 			}
 			if err != nil || n <= 0 {
-				delete(q)
 				return
 			}
 			got += n
 		}
-		if i == 1 {
-			second = q
-		} else {
-			delete(q)
+	}
+	sync.atomic_store(&m.got_both, true)
+	for !sync.atomic_load(&m.go) {
+		if sync.atomic_load(&m.stop) {
+			return
 		}
+		time.sleep(time.Millisecond)
 	}
 
-	time.sleep(m.delay)
-	framed := make([]u8, 2 + len(second))
+	second := queries[1]
+	framed := make([]u8, 2 * (2 + len(second)))
 	defer delete(framed)
-	framed[0] = u8(len(second) >> 8)
-	framed[1] = u8(len(second))
-	copy(framed[2:], second)
-	framed[4] |= 0x80
+	for half in 0 ..< 2 {
+		f := framed[half * (2 + len(second)):][:2 + len(second)]
+		f[0] = u8(len(second) >> 8)
+		f[1] = u8(len(second))
+		copy(f[2:], second)
+		f[4] |= 0x80
+	}
+	// The first copy goes out on an ID neither query is on.
+	ids := [2]u16{u16(queries[0][0]) << 8 | u16(queries[0][1]), u16(second[0]) << 8 | u16(second[1])}
+	stray := ids[1] + 1
+	for stray == ids[0] || stray == ids[1] {
+		stray += 1
+	}
+	framed[2] = u8(stray >> 8)
+	framed[3] = u8(stray)
 	_ = write_all_tcp(client, framed)
 
 	for !sync.atomic_load(&m.stop) {
 		time.sleep(10 * time.Millisecond)
 	}
+}
+
+/*
+The upstream's connection, once `ready` says its waiters are what the test
+needs and `also`, when given, is set - or nil if that never happens. Polled rather than timed, so a loaded box
+changes how long the test takes and not what it proves.
+*/
+@(private = "file")
+handoff_await :: proc(u: ^Upstream, ready: proc(c: ^Pipe_Conn) -> bool, also: ^bool = nil) -> ^Pipe_Conn {
+	for _ in 0 ..< 10_000 {
+		if also != nil && !sync.atomic_load(also) {
+			time.sleep(time.Millisecond)
+			continue
+		}
+		sync.mutex_lock(&u.mu)
+		c := u.pipe
+		sync.mutex_unlock(&u.mu)
+		if c != nil {
+			sync.mutex_lock(&c.mu)
+			ok := ready(c)
+			sync.mutex_unlock(&c.mu)
+			if ok {
+				return c
+			}
+		}
+		time.sleep(time.Millisecond)
+	}
+	return nil
 }
 
 /*
@@ -507,17 +553,16 @@ and nothing else will read their replies off the wire - they would each sit
 until their own deadline with the answer already in the socket, which turns one
 slow query into everybody's timeout.
 
-The margin is what makes this a check rather than a coincidence: the answer is
-on the wire at `DELAY` and the waiter's own deadline is an order of magnitude
-past it, so a run that only notices when its own wait expires is unmistakable.
+Every step waits on the one before it rather than on a clock: the quitter is
+reading before the patient asks, the patient is parked before the quitter's
+deadline passes, and the deadline passes because the test moves it. Left to the
+wall clock, a quitter that ran out of time before its query was even written
+left the mock waiting for a second query and the patient timing out.
 */
 @(test)
 test_a_caller_that_gives_up_hands_on_the_reading :: proc(t: ^testing.T) {
-	DELAY :: 400 * time.Millisecond
-	// Long enough that returning at the deadline instead of at the answer is
-	// not something a loaded box could produce.
+	// Only ever reached by a patient caller nobody handed the reading to.
 	PATIENT :: 8 * time.Second
-	LIMIT :: 3 * time.Second
 
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 	if lerr != nil {
@@ -534,7 +579,6 @@ test_a_caller_that_gives_up_hands_on_the_reading :: proc(t: ^testing.T) {
 
 	m := Handoff_Mock {
 		listener = listener,
-		delay    = DELAY,
 	}
 	responder := thread.create_and_start_with_poly_data(&m, handoff_mock_loop)
 	defer {
@@ -555,13 +599,11 @@ test_a_caller_that_gives_up_hands_on_the_reading :: proc(t: ^testing.T) {
 	}
 	defer destroy(u)
 
-	// The impatient one first, and given a head start, so it is the one that
-	// takes on the reading and the one that then walks away from it.
 	quitter := Pipe_Leg {
 		u       = u,
 		name    = "quitter.invalid.",
 		id      = 0x1111,
-		timeout = DELAY / 2,
+		timeout = PATIENT,
 	}
 	patient := Pipe_Leg {
 		u       = u,
@@ -570,19 +612,39 @@ test_a_caller_that_gives_up_hands_on_the_reading :: proc(t: ^testing.T) {
 		timeout = PATIENT,
 	}
 	first := thread.create_and_start_with_poly_data(&quitter, pipe_leg)
-	time.sleep(50 * time.Millisecond)
-	start := time.tick_now()
-	second := thread.create_and_start_with_poly_data(&patient, pipe_leg)
-	for th in ([]^thread.Thread{first, second}) {
-		thread.join(th)
-		thread.destroy(th)
+	reading := handoff_await(u, proc(c: ^Pipe_Conn) -> bool {return c.reading && len(c.waiters) == 1})
+	second: ^thread.Thread
+	c: ^Pipe_Conn
+	if testing.expect(t, reading != nil, "the first caller never took the reading") {
+		second = thread.create_and_start_with_poly_data(&patient, pipe_leg)
+		c = handoff_await(u, proc(c: ^Pipe_Conn) -> bool {
+			parked := 0
+			for _, w in c.waiters {
+				parked += int(w.parked)
+			}
+			return c.reading && len(c.waiters) == 2 && parked == 1
+		}, &m.got_both)
 	}
-	took := time.tick_since(start)
+	if testing.expect(t, c != nil, "the second caller never parked behind the reader") {
+		sync.mutex_lock(&c.mu)
+		for _, w in c.waiters {
+			if !w.parked {
+				w.deadline = time.tick_now()
+			}
+		}
+		sync.mutex_unlock(&c.mu)
+	}
+	sync.atomic_store(&m.go, true)
+	thread.join(first)
+	thread.destroy(first)
+	if second != nil {
+		thread.join(second)
+		thread.destroy(second)
+	}
 
 	testing.expectf(t, quitter.err == .Timeout, "the impatient caller ended as %v, expected a timeout", quitter.err)
 	testing.expectf(t, patient.err == .None, "the patient caller failed: %v", patient.err)
 	testing.expectf(t, patient.own_question, "the patient caller was answered somebody else's question")
-	testing.expectf(t, took < LIMIT, "the patient caller waited %v for an answer that was on the wire at %v", took, DELAY)
 }
 
 /*
