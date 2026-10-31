@@ -2,6 +2,7 @@ package itest
 
 import "core:encoding/hex"
 import "core:fmt"
+import "core:net"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -23,6 +24,8 @@ Runner :: struct {
 	cert_file: string,
 	key_file:  string,
 	next_port: int,
+	// The slot's claim port. See `claim_port_slot`.
+	port_limit: int,
 	passed:    int,
 	failed:    int,
 	skipped:   int,
@@ -45,9 +48,30 @@ Runner :: struct {
 	graceful_stop: bool,
 }
 
-// Ports are handed out from a high range unlikely to collide with anything the
-// developer's machine is already running.
-BASE_PORT :: 24000
+/*
+Ports are handed out from a slot of SLOT_PORTS, so that runs from several
+worktrees can go side by side without taking each other's ports.
+
+A run claims the first free slot by listening on its last port, which
+`next_port` never hands out, and holds that listener until it exits. The
+kernel drops the claim when the run ends however it ends, so a killed run
+leaves no lock behind to clean up. The slots sit below the ephemeral range,
+which starts at 32768, so the kernel never hands a slot port to an outgoing
+connection.
+*/
+FIRST_SLOT_PORT :: 20000
+SLOT_PORTS      :: 1000
+SLOTS           :: 12
+
+claim_port_slot :: proc() -> (base: int, ok: bool) {
+	for slot in 0 ..< SLOTS {
+		base = FIRST_SLOT_PORT + slot * SLOT_PORTS
+		if _, err := net.listen_tcp(net.Endpoint{net.IP4_Loopback, base + SLOT_PORTS - 1}); err == nil {
+			return base, true
+		}
+	}
+	return 0, false
+}
 
 /*
 How long `--graceful-stop` waits for a server to go before killing it.
@@ -72,9 +96,34 @@ Server :: struct {
 }
 
 next_port :: proc(r: ^Runner) -> int {
-	p := r.next_port
-	r.next_port += 1
-	return p
+	for {
+		p := r.next_port
+		if p >= r.port_limit {
+			fmt.eprintfln("itest: the run used up its %d ports; raise SLOT_PORTS", SLOT_PORTS)
+			os.exit(2)
+		}
+		r.next_port += 1
+		if port_is_free(p) {
+			return p
+		}
+	}
+}
+
+// The slot keeps other itest runs out, not everything else on the machine: a
+// soak harness or a stray server can be listening inside it, so a port in use
+// on either transport is skipped.
+port_is_free :: proc(port: int) -> bool {
+	tcp, terr := net.listen_tcp(net.Endpoint{net.IP4_Loopback, port})
+	if terr != nil {
+		return false
+	}
+	net.close(tcp)
+	udp, uerr := net.make_bound_udp_socket(net.IP4_Loopback, port)
+	if uerr != nil {
+		return false
+	}
+	net.close(udp)
+	return true
 }
 
 // --- case bookkeeping ------------------------------------------------------
