@@ -40,22 +40,32 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 /*
 The road `fit_response` takes with an upstream's answer that is over a client's
 limit: decode it, then encode it again with the truncation walk. The limit is the
-input's own ID, floored at the 512 bytes RFC 1035 section 4.2.1 promises every
-UDP client, so the fuzzer steers where the cut lands.
+input's own ID, wrapped into 512 - the size RFC 1035 section 4.2.1 promises
+every UDP client - up to libFuzzer's default 4096-byte input cap, so every ID
+puts the cut somewhere an input can reach.
 
 What comes back is checked for the two things the server sends on: it is within
-the limit, and it is a message - one the decoder reads, with the TC bit set
-exactly when a record was cut from the answer or authority section.
+the limit, and it is a message - one the decoder reads, whose TC bit says what
+the encoder reported, and which, without TC, has every answer and authority
+record it started with.
+
+A name the decoder wrote and the encoder will not read back is a disagreement
+between the two, and `fit_response` turns it into an empty TC answer. The other
+encode errors are refusals the encoder makes on purpose (raw RDATA holding a
+pointer, a question over the limit) and are not checked.
 */
 reencode :: proc(raw: []u8) {
 	m, err := dns.decode_message(raw)
 	if err != .None {
 		return
 	}
-	id, _ := dns.peek_id(raw)
-	limit := max(512, int(id))
+	limit := 512 + int(m.id) % (4096 - 512 + 1)
 	out, truncated, enc_err := dns.encode_message(m, max_size = limit)
-	if enc_err != .None {
+	#partial switch enc_err {
+	case .None:
+	case .Bad_Escape, .Bad_Name, .Label_Too_Long, .Name_Too_Long:
+		panic("a decoded name does not encode")
+	case:
 		return
 	}
 	if len(out) > limit {
@@ -67,6 +77,9 @@ reencode :: proc(raw: []u8) {
 	}
 	if truncated != again.flags.tc && !m.flags.tc {
 		panic("the TC bit disagrees with the cut")
+	}
+	if !truncated && (len(again.answer) != len(m.answer) || len(again.authority) != len(m.authority)) {
+		panic("records were cut without TC")
 	}
 }
 
@@ -83,6 +96,10 @@ edit_in_place :: proc(raw: []u8) {
 	_, _ = dns.peek_edns_option(raw, .Cookie)
 	_, _ = dns.strip_edns_options(raw)
 	_, _ = dns.remove_opt(raw)
+	// The per-client options the server takes out of a forwarded answer and
+	// puts into one on its way back (cookie, extended error, keepalive).
+	_, _ = dns.remove_edns_option(raw, .Cookie)
+	_, _ = dns.ensure_edns_option(raw, .Ext_Error, {0, 0}, 1232)
 
 	// The cache's walk: where the TTLs are, what they say, and the rewrite of
 	// each one as the entry ages.
@@ -91,8 +108,10 @@ edit_in_place :: proc(raw: []u8) {
 		dns.patch_ttls(dns.clone_message_bytes(raw), offsets, ttls, 60, 5)
 	}
 	dns.cap_ttls(dns.clone_message_bytes(raw), 300)
-	// Against the input itself, so the question names match and the copy runs.
+	// Against the input itself, so the question names match and the copy runs,
+	// and against its second half, a different query as the cache meets one.
 	dns.copy_question_case(dns.clone_message_bytes(raw), raw)
+	dns.copy_question_case(dns.clone_message_bytes(raw), raw[len(raw) / 2:])
 	_ = dns.set_edns_udp_size(dns.clone_message_bytes(raw), 1232)
 	_ = dns.clear_edns_extended_rcode(dns.clone_message_bytes(raw))
 	_ = dns.set_edns_version_and_flags(dns.clone_message_bytes(raw), 0, true)
