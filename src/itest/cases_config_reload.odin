@@ -251,6 +251,7 @@ run_config_reload_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	run_log_reopen_case(r, a_port)
+	run_cookie_limit_reload_case(r, a_port)
 }
 
 /*
@@ -292,6 +293,44 @@ run_log_reopen_case :: proc(r: ^Runner, upstream_port: int) {
 			}
 			check(r, reopened, "nothing was written to the log file's name after the rotation")
 		}
+	}
+	end_case(r)
+}
+
+/*
+The startup line names the cookie rescue pool only with cookies on, so a reload
+that turns them on says it again, though the limiter itself is kept and no
+budget is refilled.
+*/
+@(private = "file")
+run_cookie_limit_reload_case :: proc(r: ^Runner, upstream_port: int) {
+	udp_port := next_port(r)
+	text :: proc(udp_port, upstream_port: int, cookies: bool) -> string {
+		base, _ := strings.replace(
+			config_reload_text(udp_port, upstream_port, fmt.tprintf("cookies: {{ enabled: %v }}\n", cookies)),
+			"rate_limit: { enabled: false }",
+			"rate_limit: { enabled: true }",
+			1,
+			context.temp_allocator,
+		)
+		return base
+	}
+	srv, ok := start_server(r, Server_Options{config = text(udp_port, upstream_port, false), udp_port = udp_port})
+	if !ok {
+		skip_case(r, "config reload: the rate limit line follows cookies", "server did not start")
+		return
+	}
+	defer stop_server(&srv)
+
+	start_case(r, "config reload: turning cookies on names the rescue pool in the rate limit line")
+	{
+		RESCUE :: "for datagrams a server cookie rescues"
+		check(r, !log_contains(&srv, RESCUE), "the rescue pool was named with cookies off")
+		check(
+			r,
+			reload_to(r, &srv, text(udp_port, upstream_port, true), RESCUE),
+			"a reload that turned cookies on left the rate limit line as it was",
+		)
 	}
 	end_case(r)
 }

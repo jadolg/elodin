@@ -373,6 +373,9 @@ Udp_Job :: struct {
 	// any of them would put the same thing on the wire; replying on the one
 	// that received keeps a query's send queue and its receive queue together.
 	socket: net.UDP_Socket,
+	// Admitted on the `Proven` pool for a valid server cookie, so its answer's
+	// size is billed there. See `datagram_rate_check`.
+	proven: bool,
 }
 
 /*
@@ -775,8 +778,20 @@ udp_loop :: proc(data: rawptr) {
 		the damage as the traffic. It costs a strictly conservative limiter: the
 		reply that never gets built is charged for anyway, and a query that turns
 		out to be answerable from cache costs the same as one that is not.
+
+		The server cookie is read here and not left to the worker, because which
+		budget pays can depend on it: a datagram the datagram pool would refuse
+		is charged to a pool of its own if it proves its source, out of reach of
+		a flood spoofing the same prefix. See `datagram_rate_check`.
 		*/
-		switch rate_check(live(ctx.server).limiter, client, time.tick_now()) {
+		verdict, proven := datagram_rate_check(
+			live(ctx.server).limiter,
+			live(ctx.server).cookies,
+			buf[:n],
+			client,
+			time.tick_now(),
+		)
+		switch verdict {
 		case .Allow:
 		case .Truncate:
 			if tc, built := dns.truncated_response(buf[:n], context.temp_allocator); built {
@@ -813,6 +828,7 @@ udp_loop :: proc(data: rawptr) {
 		job.ctx = ctx
 		job.client = client
 		job.socket = socket
+		job.proven = proven
 
 		// The query's use of the socket, given back once it has answered on it.
 		sync.atomic_add(&ctx.reader.holds, 1)
@@ -1378,9 +1394,10 @@ udp_job :: proc(data: rawptr) {
 	/*
 	Charged before the send rather than after it.
 
-	`rate_check` in the read loop admitted this datagram on one token, before
-	there was an answer to weigh; this is what the answer turned out to cost
-	beyond that, and the next query from the prefix is what pays it - see
+	`datagram_rate_check` in the read loop admitted this datagram on one token
+	of the pool `job.proven` names, before there was an answer to weigh; this
+	is what the answer turned out to cost beyond that, and the next query from
+	the prefix is what pays it - see
 	`rate_charge_response`. Before the send because the send is attempted either
 	way: a datagram the socket would not take is one this server built and
 	handed to the kernel, and a budget that only counted the writes that
@@ -1391,7 +1408,13 @@ udp_job :: proc(data: rawptr) {
 	configuration that does not set one resolves to: no answer exceeds it, so
 	this is a compare and a return.
 	*/
-	rate_charge_response(live(s).limiter, job.client, len(response), time.tick_now())
+	rate_charge_response(
+		live(s).limiter,
+		job.client,
+		len(response),
+		time.tick_now(),
+		.Proven if job.proven else .Datagram,
+	)
 	_, _ = loop.send_udp(job.socket, response, job.client)
 }
 

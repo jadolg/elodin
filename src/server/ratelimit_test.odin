@@ -1027,7 +1027,7 @@ test_an_oversized_answer_is_paid_for_by_the_next_query :: proc(t: ^testing.T) {
 }
 
 /*
-The other three pools are not charged for a datagram's size.
+The other pools are not charged for a datagram's size.
 
 The separation the top of `ratelimit.odin` argues for, asked of the new charge:
 a prefix whose answers are large must not thereby lose the connections it may
@@ -1085,6 +1085,20 @@ test_the_size_charge_is_the_datagram_pool_alone :: proc(t: ^testing.T) {
 		opened,
 		RATE * RRL_BURST_SECONDS,
 	)
+
+	rescued := 0
+	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
+		if spend_token(r, client, at(0), .Proven) {
+			rescued += 1
+		}
+	}
+	testing.expectf(
+		t,
+		rescued == RATE * RRL_BURST_SECONDS,
+		"large datagram answers took %d of the %d rescues the prefix's cookie clients were owed",
+		rescued,
+		RATE * RRL_BURST_SECONDS,
+	)
 }
 
 /*
@@ -1098,8 +1112,8 @@ charged for a datagram's size would close that door exactly when a flood of larg
 answers had opened the debt - the clients who need the invitation are the ones
 whose prefix is deepest overdrawn.
 
-Nothing charges it, because `rate_charge_response` touches `Datagram` and no
-other pool. Asserted against a bucket that is not merely empty but owing: a full
+Nothing charges it, because `rate_charge_response` touches the pool that admitted
+the datagram, `Datagram` or `Proven`, and no other. Asserted against a bucket that is not merely empty but owing: a full
 bucket admitted and then billed, which is the burst the read loop lets through
 before the first answer is weighed.
 */

@@ -87,7 +87,8 @@ connections at a time.
 Charged to a budget of their own, though - all of them. A prefix's datagrams are
 spent out of one pool, the queries it asks over connections out of another, and the
 connections themselves out of a third, and none is a way to spend another. There is
-a fourth, for the truncated answers, further down. See `Rate_Class`.
+a fourth, for the truncated answers, further down, and a fifth for the datagrams
+a server cookie rescues once their own pool is empty. See `Rate_Class`.
 
 One shared budget is what this began as, and it was wrong - which is worth writing
 down, because the argument for sharing is the one that reads better. It goes: what
@@ -117,7 +118,11 @@ The property to keep is that neither pool can be spent from the other side: a
 change that charges one class against the other's pool, or lends a token across
 when the first runs dry, hands the flood back its authority over the connections.
 `test_the_stream_budget_is_not_the_datagram_one` is the test that says so, and the
-reason it is worth more than it looks.
+reason it is worth more than it looks. A datagram carrying a valid server cookie
+does not spend it either, though it has proven its address: a cookie is good for
+`COOKIE_MAX_AGE`, so whoever saw one issued to an address - on the path, or as
+the address's previous holder - can replay it from anywhere. Such datagrams have
+a pool of their own; see `datagram_rate_check`.
 
 The connection pool is separate for the same reason and more sharply. A datagram
 that could spend it would be a way to stop a stranger's clients from *connecting*,
@@ -221,8 +226,8 @@ The table is fixed at construction and never grows.
 
 A cache of buckets that allocated per source would be a memory bound written in
 terms of how many distinct addresses an attacker cares to name, which is not a
-bound. Sixteen thousand buckets is 896 KB - a bucket carries a budget per pool,
-so the figure moves with `Rate_Class`; charging arrivals took it from 768 KB -
+bound. Sixteen thousand buckets is 1 MiB - a bucket carries a budget per pool,
+so the figure moves with `Rate_Class`, at 8 bytes per pool per bucket -
 and more prefixes than a resolver serves; what collides shares a budget, which is
 a limit that is too strict on rare occasions rather than a limit that fails.
 */
@@ -280,7 +285,7 @@ RRL_MAX_OVERRIDES :: config.MAX_RATE_LIMIT_OVERRIDES
 #assert(RRL_MAX_OVERRIDES <= int(max(u8)))
 
 /*
-Which of a prefix's four budgets something is charged to.
+Which of a prefix's five budgets something is charged to.
 
 The separation is the point, and the note at the top of this file is where the
 reasoning for it lives: under one budget a spoofed datagram flood could empty the
@@ -306,6 +311,10 @@ attack can have this server aim at the address it named, and how many writes tha
 costs the loop reading the UDP socket. It is spent only once `Datagram` is
 empty - that is the precondition for a slip at all - so no reply is ever charged
 to both.
+
+`Proven` is a datagram with a valid server cookie that `Datagram` turned away.
+Its own pool because a cookie can be replayed from anywhere for as long as it
+stays valid, so it must not reach `Stream`; see `datagram_rate_check`.
 */
 @(private)
 Rate_Class :: enum u8 {
@@ -313,6 +322,7 @@ Rate_Class :: enum u8 {
 	Stream,
 	Connection,
 	Slip,
+	Proven,
 }
 
 @(private)
@@ -353,9 +363,9 @@ Rate_Bucket :: struct {
 	key, and a takeover re-resolves it for the prefix taking over.
 
 	Free in this struct's padding. `key`, `tokens`, `last_ns` and `over` come to
-	52 bytes and the alignment rounds to 56 either way, so the table is the same
-	896 KB it was before there were tiers - which is the reason this is an index
-	rather than a copy of the figures.
+	60 bytes and the alignment rounds to 64 either way, so the table is the same
+	1 MiB it would be without tiers - which is the reason this is an index rather
+	than a copy of the figures.
 
 	A collision therefore shares a tier as well as a budget: two prefixes in one
 	bucket are accounted against whichever of them claimed it. That is the same
@@ -366,6 +376,8 @@ Rate_Bucket :: struct {
 	*/
 	tier:    u8,
 }
+// The figure `RRL_BUCKETS` and `Rate_Bucket.tier` quote.
+#assert(size_of(Rate_Bucket) == 64)
 
 /*
 One set of figures, and everything derived from it.
@@ -383,10 +395,12 @@ Rate_Tier :: struct {
 	/*
 	Tokens per second, and the most that may be banked, one of each per pool.
 
-	`Datagram`, `Stream` and `Connection` all get this tier's
-	`responses_per_second` - the multiplication the file's note accepts, and the
+	`Datagram`, `Stream`, `Connection` and `Proven` all get this tier's
+	`responses_per_second` - the multiplication the file's note accepts, the
 	whole figure for `Connection` because a connection is what a query is asked
-	over; `Slip` gets a fraction of it, for the reason in `RRL_SLIP_SHARE`.
+	over, and for `Proven` because a cookie client in a flooded prefix is owed
+	the budget it would have had without the flood; `Slip` gets a fraction of
+	it, for the reason in `RRL_SLIP_SHARE`.
 	*/
 	rate:     [Rate_Class]f64,
 	capacity: [Rate_Class]f64,
@@ -505,6 +519,7 @@ make_rate_tier :: proc(responses_per_second: int, slip: int) -> (t: Rate_Tier) {
 	t.rate[.Datagram] = rps
 	t.rate[.Stream] = rps
 	t.rate[.Connection] = rps
+	t.rate[.Proven] = rps
 	// Divided as integers, so the slip pool refills at the whole number the
 	// startup line prints and the documentation quotes rather than at a figure
 	// an eighth of a token above it.
@@ -673,9 +688,12 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 	}
 	sync.mutex_lock(&r.lock)
 	defer sync.mutex_unlock(&r.lock)
+	return judge_datagram(r, rate_bucket(r, client, now._nsec))
+}
 
-	b := rate_bucket(r, client, now._nsec)
-
+// `rate_check` on a bucket already brought forward, with the table lock held.
+@(private)
+judge_datagram :: proc(r: ^Rate_Limiter, b: ^Rate_Bucket) -> Rate_Verdict {
 	if b.tokens[.Datagram] >= 1 {
 		b.tokens[.Datagram] -= 1
 		b.over = 0
@@ -703,6 +721,97 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 }
 
 /*
+Charge a datagram to `client`'s prefix and say what to do with it, letting one
+that proves its source fall back on a pool of its own.
+
+The datagram pool is asked first, for every datagram. A datagram carrying a
+valid server cookie (`cookie_proves_source`) comes from an address that has
+received what this server sent it, so its answer cannot be reflected; once the
+datagram pool is empty it is charged to `Proven` instead. A spoofed flood naming
+the prefix empties the datagram pool and cannot reach `Proven`, so the client
+holding a cookie is answered through the flood.
+
+The datagram pool first, rather than `Proven` for every cookie, so a cookie
+costs a client nothing it had: a busy prefix behind a NAT keeps the datagram
+budget and the slip's TCP invitation it has without one. It is also what keeps
+the cookie off the hot path: the option is read and hashed only for a datagram
+the budget would refuse and `Proven` could pay for, so a flood replaying a
+cookie past an empty `Proven` costs one lock and no hash. A flood datagram that
+`Proven` could still pay for costs an OPT walk and a second lock, and a hash only
+if it carries a 24-byte cookie.
+
+`Proven` and not the stream pool, though a cookie proves an address as a
+handshake does, because it proves it for longer. A cookie is good for
+`COOKIE_MAX_AGE`, so the address's previous holder, or anyone who saw the cookie
+on the path, can replay it from anywhere within that hour. Charged to the stream
+pool, that replay would refuse the prefix's TCP, DoT and DoH - the authority over
+a stranger's connections the top of this file keeps from datagrams. Charged here,
+the most it can spend is the rescue of the prefix's other cookie clients, which
+leaves them where they were without one.
+
+Rescued rather than exempted, unlike BIND and Knot, which skip RRL for a valid
+cookie altogether. Their limiter bounds reflection and nothing else; this one
+bounds the work behind an answer too, and an address that has proven itself is
+still one whose queries cost upstream round trips.
+
+Both pools empty, the datagram pool's verdict stands, slip and all.
+
+`proven` says `Proven` paid, so `udp_job` bills the answer's size there: a
+replayed cookie aims no more bytes at the address it names than a datagram can.
+*/
+datagram_rate_check :: proc(
+	r: ^Rate_Limiter,
+	k: ^Cookie_Keeper,
+	datagram: []u8,
+	client: net.Endpoint,
+	now: time.Tick,
+) -> (
+	verdict: Rate_Verdict,
+	proven: bool,
+) {
+	// With cookies off nothing can be proven, so the flood path takes the table
+	// lock once.
+	if r == nil || k == nil {
+		return rate_check(r, client, now), false
+	}
+	// Judged under this one lock unless a rescue could follow: either the
+	// datagram pool pays, or `Proven` has nothing to pay with and the cookie is
+	// not worth reading. Let go before the cookie is hashed, so no reader waits
+	// on another's SipHash.
+	sync.mutex_lock(&r.lock)
+	b := rate_bucket(r, client, now._nsec)
+	if b.tokens[.Datagram] >= 1 || b.tokens[.Proven] < 1 {
+		verdict = judge_datagram(r, b)
+		sync.mutex_unlock(&r.lock)
+		return verdict, false
+	}
+	sync.mutex_unlock(&r.lock)
+	if cookie_proves_source(k, datagram, client) && spend_token(r, client, now, .Proven) {
+		return .Allow, true
+	}
+	// Asked again rather than judged from the two above: it is what counts the
+	// datagram as limited and decides the slip, and the pool may have refilled.
+	return rate_check(r, client, now), false
+}
+
+/*
+Take one token from `client`'s `class` pool if it has one, counting nothing when
+it has not; the callers decide what an empty pool means.
+*/
+@(private)
+spend_token :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick, class: Rate_Class) -> bool {
+	sync.mutex_lock(&r.lock)
+	defer sync.mutex_unlock(&r.lock)
+
+	b := rate_bucket(r, client, now._nsec)
+	if b.tokens[class] < 1 {
+		return false
+	}
+	b.tokens[class] -= 1
+	return true
+}
+
+/*
 Charge what the answer turned out to weigh, once it has been packed.
 
 `rate_check` admits a datagram on one token, before there is an answer to
@@ -726,8 +835,11 @@ check before the answer forces, and it is the right way round: the bucket carrie
 the overspend forward, so a prefix being fed large answers runs dry sooner and
 one asking small questions is charged nothing extra.
 
-`Datagram` alone. The stream pool bounds work behind an answer rather than
-traffic toward an address - the handshake settled where the client is - and
+`Datagram`, or `Proven` for a datagram a server cookie rescued. A query over a
+connection is not weighed: the handshake settled where the client is, and it
+holds that address for as long as the answer takes. A cookie is weaker proof -
+good for `COOKIE_MAX_AGE`, so it outlives a dynamic address it was issued to -
+and the bytes it can aim at an address are bounded as a datagram's are.
 `Connection` has no size at all.
 
 `Slip` is not charged either, and unlike the other two that is worth a figure
@@ -785,7 +897,15 @@ Nothing is charged when there is no estimate, or when the answer fits inside one
 the common case, since the configured default is the largest datagram this server
 sends, and it costs a compare rather than the table lock.
 */
-rate_charge_response :: proc(r: ^Rate_Limiter, client: net.Endpoint, size: int, now: time.Tick) {
+rate_charge_response :: proc(
+	r: ^Rate_Limiter,
+	client: net.Endpoint,
+	size: int,
+	now: time.Tick,
+	// The pool that admitted the datagram: `.Proven` for one a server cookie
+	// rescued, see `datagram_rate_check`.
+	class := Rate_Class.Datagram,
+) {
 	if r == nil || r.estimate <= 0 || size <= r.estimate {
 		return
 	}
@@ -810,7 +930,7 @@ rate_charge_response :: proc(r: ^Rate_Limiter, client: net.Endpoint, size: int, 
 	budget.
 	*/
 	b := rate_bucket(r, client, now._nsec)
-	b.tokens[.Datagram] -= extra
+	b.tokens[class] -= extra
 }
 
 /*
@@ -838,16 +958,9 @@ stream_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick
 	if r == nil {
 		return true
 	}
-	sync.mutex_lock(&r.lock)
-	defer sync.mutex_unlock(&r.lock)
-
-	b := rate_bucket(r, client, now._nsec)
-
-	if b.tokens[.Stream] >= 1 {
-		b.tokens[.Stream] -= 1
+	if spend_token(r, client, now, .Stream) {
 		return true
 	}
-
 	sync.atomic_add(&r.limited, 1)
 	return false
 }
@@ -883,16 +996,9 @@ conn_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) 
 	if r == nil {
 		return true
 	}
-	sync.mutex_lock(&r.lock)
-	defer sync.mutex_unlock(&r.lock)
-
-	b := rate_bucket(r, client, now._nsec)
-
-	if b.tokens[.Connection] >= 1 {
-		b.tokens[.Connection] -= 1
+	if spend_token(r, client, now, .Connection) {
 		return true
 	}
-
 	sync.atomic_add(&r.conn_limited, 1)
 	return false
 }
@@ -901,8 +1007,8 @@ conn_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) 
 What every pool has accrued between `last_ns` and `now_ns`, one figure per class.
 
 The elapsed time is converted once and each pool's rate multiplied through it: the
-pools differ only in rate, so a division per pool would be the same division four
-times - on the path every datagram takes, under the table lock.
+pools differ only in rate, so a division per pool would repeat one division for
+every pool - on the path every datagram takes, under the table lock.
 */
 @(private)
 elapsed_tokens :: proc(tier: ^Rate_Tier, last_ns, now_ns: i64) -> (gained: [Rate_Class]f64) {
@@ -1043,22 +1149,38 @@ start_rate_limiter :: proc(l: ^Live) -> bool {
 		cfg.overrides,
 		cfg.response_size_estimate,
 	)
+	report_rate_limiter(l)
+	return true
+}
+
+/*
+Say what the limiter's budgets are, at startup and again on a reload that keeps
+the limiter but turns cookies on or off: what is said depends on
+`cookies.enabled`, and the operator reads the latest of these lines as what is
+in force.
+*/
+report_rate_limiter :: proc(l: ^Live) {
+	cfg := l.cfg.server.rate_limit
 	// The budgets are named in the line rather than left to the documentation: an
 	// operator reading `500` needs to know it is 500 datagrams, 500 queries on
 	// connections and 500 connections opened, not 500 between them - and that the
 	// truncated answers have a figure of their own, since it is the one thing here
-	// they did not write.
+	// they did not write. With cookies on, the datagrams a server cookie rescues
+	// are a fourth 500.
+	rescued := ", and for datagrams a server cookie rescues" if l.cfg.cookies.enabled else ""
 	if cfg.slip > 0 {
 		logx.infof(
-			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened; 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s, and over a connection nothing is",
+			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened%s; 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s, and over a connection nothing is",
 			cfg.responses_per_second,
+			rescued,
 			cfg.slip,
 			int(l.limiter.tiers[0].rate[.Slip]),
 		)
 	} else {
 		logx.infof(
-			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened; anything over that dropped",
+			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened%s; anything over that dropped",
 			cfg.responses_per_second,
+			rescued,
 		)
 	}
 	/*
@@ -1090,6 +1212,7 @@ start_rate_limiter :: proc(l: ^Live) -> bool {
 		cfg.response_size_estimate,
 		l.cfg.server.max_udp_response,
 		context.temp_allocator,
+		l.cfg.cookies.enabled,
 	); say {
 		logx.infof("%s", text)
 	} else if warning, warn := response_size_estimate_warning(
@@ -1110,11 +1233,15 @@ start_rate_limiter :: proc(l: ^Live) -> bool {
 		cfg.response_size_estimate,
 		l.cfg.server.max_udp_response,
 		context.temp_allocator,
+		l.cfg.cookies.enabled,
 	) {
 		logx.infof("%s", line)
 	}
-	return true
 }
+
+// The byte figure again for the cookie rescue pool, which is weighed the same way.
+@(private)
+COOKIE_RESCUE_BYTES :: ", and as much again in answers a server cookie rescues"
 
 /*
 What `responses_per_second` and `response_size_estimate` multiply out to, which
@@ -1152,15 +1279,19 @@ rate_limit_denomination_line :: proc(
 	estimate: int,
 	ceiling: int,
 	allocator := context.allocator,
+	// `cookies.enabled`: answers a server cookie rescues are weighed against a
+	// pool of their own, so the figure holds twice over. See `datagram_rate_check`.
+	cookies := false,
 ) -> (text: string, say: bool) {
 	if estimate <= 0 || estimate >= ceiling {
 		return "", false
 	}
 	return fmt.aprintf(
-		"rate limit: an answer over %d bytes is charged as several datagrams, so %d responses/s is about %.1M/s of answers at one prefix however large they are",
+		"rate limit: an answer over %d bytes is charged as several datagrams, so %d responses/s is about %.1M/s of answers at one prefix however large they are%s",
 		estimate,
 		responses_per_second,
 		responses_per_second * estimate,
+		COOKIE_RESCUE_BYTES if cookies else "",
 		allocator = allocator,
 	), true
 }
@@ -1243,6 +1374,8 @@ rate_limit_override_lines :: proc(
 	estimate: int = 0,
 	ceiling: int = 0,
 	allocator := context.allocator,
+	// As in `rate_limit_denomination_line`.
+	cookies := false,
 ) -> []string {
 	if len(overrides) == 0 {
 		return nil
@@ -1283,8 +1416,9 @@ rate_limit_override_lines :: proc(
 		budget := ""
 		if estimate > 0 && ceiling > 0 && estimate < ceiling {
 			budget = fmt.aprintf(
-				", about %.1M/s of answers however large they are",
+				", about %.1M/s of answers however large they are%s",
 				int(tier.rate[.Datagram]) * estimate,
+				COOKIE_RESCUE_BYTES if cookies else "",
 				allocator = allocator,
 			)
 		}

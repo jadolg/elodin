@@ -43,7 +43,7 @@ The budget is on what elodin sends *to one place*, since a spoofed sender has
 nothing of its own to measure. It is kept per destination prefix — /24 for IPv4,
 /64 for IPv6 — in a fixed table allocated once.
 
-**Each prefix gets three budgets of `responses_per_second`**, and none can be
+**Each prefix gets four budgets of `responses_per_second`**, and none can be
 spent from another:
 
 | budget | charged for |
@@ -51,11 +51,20 @@ spent from another:
 | datagrams | each UDP answer |
 | stream queries | each query read off a TCP, DoT or DoH connection |
 | connections | each connection opened |
+| cookie rescues | each UDP answer to a query with a valid server [cookie](edns.md#dns-cookies) that the datagram budget turned away |
 
 They are separate so a spoofed UDP flood naming a prefix cannot close or block
-the connections of the clients who really live there. A client using every way
-in can therefore draw three times the figure, two thirds of it over handshakes
-from a real address.
+the connections of the clients who really live there. A UDP query with a valid
+server cookie has proven its address, so once the datagram budget is empty it is
+charged to the cookie budget, size included, and keeps being answered through
+such a flood. Not to the stream budget: a cookie stays valid for an hour, so
+whoever held the address before can replay it, and that must not be able to
+refuse the prefix's connections. With both empty it is treated like any other
+datagram over budget. This needs `cookies.enabled`.
+
+A client using every way in can therefore draw four times the figure: half of it
+over handshakes from a real address, and a quarter only with a cookie while its
+datagram budget is spent.
 
 Opening a connection is charged because a client that handshakes and hangs up
 asks nothing, so no query budget sees it; it gets the whole figure because a
@@ -119,6 +128,9 @@ into bytes. An answer larger than the estimate is charged
   leaving it out.
 - Connections are not weighed, and neither are truncated replies (30 to 271
   bytes), so the slip pool's 62 a second comes on top of the byte bound.
+- Answers rescued by a valid server cookie are weighed the same way against the
+  cookie budget, so a prefix holding a cookie can receive the byte bound twice
+  over: once on datagrams and once on rescues.
 - The charge comes after the answer is sent, so a burst is admitted and then
   paid off: the prefix hears nothing for about
   `2 × (ceil(max_udp_response ÷ response_size_estimate) − 1)` seconds (18 at an
@@ -126,7 +138,8 @@ into bytes. An answer larger than the estimate is charged
   can move to TCP.
 
 When the estimate bites, `--check` and the startup line print the byte rate it
-works out to (`62.5KiB/s`), as does each override's line. An estimate above
+works out to (`62.5KiB/s`), as does each override's line; with cookies on, both
+add that rescued answers get as much again. An estimate above
 `max_udp_response`, which can never bite, is called out too.
 
 ### When a /24 is not a household

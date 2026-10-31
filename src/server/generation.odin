@@ -513,6 +513,11 @@ build_live :: proc(s: ^Server, l: ^Live, prev: ^Live) -> (built, carried: Parts,
 		} else {
 			l.limiter = prev.limiter
 			carried += {.Limiter}
+			// Kept, but the lines describing it name the cookie rescue pool or
+			// not, so they are said again when that changes.
+			if prev.cfg.cookies.enabled != cfg.cookies.enabled {
+				report_rate_limiter(l)
+			}
 		}
 	}
 
