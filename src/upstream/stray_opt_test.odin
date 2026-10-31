@@ -137,9 +137,10 @@ test_an_opt_owned_by_a_name_other_than_root_is_swept_past :: proc(t: ^testing.T)
 
 /*
 A reply with a cookie in the first of two OPT records is swept past like any
-other second OPT record, after the cookie strip as before it: the strip has to
-rebuild the message to take the cookie out, and a rebuild that kept only the
-first record would hand on a reply the check above no longer sees.
+other second OPT record: the cookie strip has to rebuild the message to take the
+cookie out, and the rebuild keeps both records, so the group still sees the
+shape it refuses - rather than accepting a reply cleaned of it, or failing the
+exchange and charging the member for it.
 */
 @(test)
 test_a_second_opt_record_survives_the_cookie_strip :: proc(t: ^testing.T) {
@@ -211,5 +212,11 @@ expect_swept_past :: proc(t: ^testing.T, stray: ^Opt_Mock, cookies := false) {
 	delete(chain, context.allocator)
 
 	testing.expect(t, sync.atomic_load(&stray.hits) >= 2, "the stray member was not asked first each time")
+	// Swept past by the group, not failed by the exchange: the reply is
+	// malformed, the member is not down, and a failure here would park it.
+	sync.mutex_lock(&bad.mu)
+	failures := bad.failures
+	sync.mutex_unlock(&bad.mu)
+	testing.expect_value(t, failures, u32(0))
 	free_all(context.temp_allocator)
 }

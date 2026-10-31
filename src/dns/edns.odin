@@ -673,22 +673,6 @@ rebuild_edns_option :: proc(
 	if derr != .None {
 		return nil, false
 	}
-	/*
-	A second OPT record is refused rather than rebuilt away. The encoder writes
-	only the first (RFC 6891 section 6.1.1), so the rebuilt message would pass
-	`peek_opt_unreadable` where this one fails it, and an upstream reply carrying
-	two is to be refused whole (issue #353), not accepted for having had a cookie
-	or padding taken out of it.
-	*/
-	opts := 0
-	for rec in m.additional {
-		if rec.type == .OPT {
-			opts += 1
-		}
-	}
-	if opts > 1 {
-		return nil, false
-	}
 	for &rec in m.additional {
 		if rec.type != .OPT {
 			continue
@@ -712,7 +696,9 @@ rebuild_edns_option :: proc(
 		}
 		rec.data = Rdata_OPT{options = options[:]}
 
-		encoded, _, eerr := encode_message(m, scratch, MAX_MESSAGE)
+		// Every OPT record the message arrived with, so a second one is still
+		// there for `peek_opt_unreadable` to refuse the reply over.
+		encoded, _, eerr := encode_with_every_opt(m, scratch)
 		if eerr != .None {
 			return nil, false
 		}
@@ -901,4 +887,60 @@ set_edns_version_and_flags :: proc(msg: []u8, version: u8, do_bit: bool) -> bool
 	msg[span.rdlen_pos - 2] = 0x80 if do_bit else 0
 	msg[span.rdlen_pos - 1] = 0
 	return true
+}
+
+/*
+`encode_message`, but writing every OPT record the additional section holds.
+
+For a message being rewritten rather than composed: an upstream's reply that an
+option is taken out of or put into, and the tests whose subject is a message
+carrying a second OPT record. `encode_message` writes one, as RFC 6891 section
+6.1.1 has a sender do; a rewrite that did the same would hand on a reply with
+the second record gone, which `peek_opt_unreadable` passes where it refuses the
+reply as it arrived (issue #353). Each record past the first is appended to the
+end, written as the encoder writes one.
+*/
+encode_with_every_opt :: proc(
+	m: Message,
+	allocator := context.allocator,
+) -> (
+	out: []u8,
+	truncated: bool,
+	err: Encode_Error,
+) {
+	kept := make([dynamic]Record, 0, len(m.additional), context.temp_allocator)
+	extra := make([dynamic]Record, 0, 1, context.temp_allocator)
+	seen := false
+	for rec in m.additional {
+		if rec.type == .OPT {
+			if seen {
+				append(&extra, rec)
+				continue
+			}
+			seen = true
+		}
+		append(&kept, rec)
+	}
+	first := m
+	first.additional = kept[:]
+	wire: []u8
+	wire, truncated, err = encode_message(first, context.temp_allocator)
+	if err != .None {
+		return
+	}
+	buf := make([dynamic]u8, 0, len(wire), allocator)
+	append(&buf, ..wire)
+	arcount := int(wire[10]) << 8 | int(wire[11])
+	for rec in extra {
+		lone, _, lone_err := encode_message(Message{additional = {rec}}, context.temp_allocator, compress = false)
+		if lone_err != .None {
+			delete(buf)
+			return nil, false, lone_err
+		}
+		append(&buf, ..lone[HEADER_SIZE:])
+		arcount += 1
+	}
+	buf[10] = u8(arcount >> 8)
+	buf[11] = u8(arcount)
+	return buf[:], truncated, .None
 }

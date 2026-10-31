@@ -79,14 +79,14 @@ second_opt_record_does_not_stand_in_for_a_dropped_first :: proc(t: ^testing.T) {
 }
 
 /*
-An option editor that has to rebuild a message refuses one carrying a second OPT
-record rather than handing it back with one. The encoder writes only the first,
-so the rebuilt reply would pass `peek_opt_unreadable`, which the original fails:
-an upstream reply with a cookie in the first of two OPT records would be accepted
-once `upstream.exchange_with_cookie` had stripped the cookie (issue #353).
+An option editor that has to rebuild a message keeps a second OPT record, so the
+rewritten reply still fails `peek_opt_unreadable` as the one that arrived does.
+The encoder writes only the first, and a rebuild through it would hand on a
+reply with a cookie in the first of two OPT records as an acceptable one once
+`upstream.exchange_with_cookie` had stripped the cookie (issue #353).
 */
 @(test)
-an_option_rebuild_refuses_a_second_opt_record :: proc(t: ^testing.T) {
+an_option_rebuild_keeps_a_second_opt_record :: proc(t: ^testing.T) {
 	m := two_opts(0)
 	cookie := make([]EDNS_Option, 1, context.temp_allocator)
 	cookie[0] = EDNS_Option {
@@ -100,59 +100,14 @@ an_option_rebuild_refuses_a_second_opt_record :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, peek_opt_unreadable(wire), "the reply does not carry two OPT records")
 
-	_, removed := remove_edns_option(wire, .Cookie, context.temp_allocator)
-	testing.expect(t, !removed, "the cookie strip handed back the reply with one OPT record")
-	_, set := set_edns_option(wire, .Padding, {0, 0}, context.temp_allocator)
-	testing.expect(t, !set, "an option was written into the reply with one OPT record")
-}
-
-/*
-`encode_message`, but writing every OPT record the additional section holds,
-for the tests whose subject is a message carrying a second one - a shape the
-encoder will not produce and a peer still can. Each record past the first is
-appended to the end, written as the encoder writes one. The server's tests build
-their two-OPT queries and replies with it too.
-*/
-encode_with_every_opt :: proc(
-	m: Message,
-	allocator := context.allocator,
-) -> (
-	out: []u8,
-	truncated: bool,
-	err: Encode_Error,
-) {
-	kept := make([dynamic]Record, 0, len(m.additional), context.temp_allocator)
-	extra := make([dynamic]Record, 0, 1, context.temp_allocator)
-	seen := false
-	for rec in m.additional {
-		if rec.type == .OPT {
-			if seen {
-				append(&extra, rec)
-				continue
-			}
-			seen = true
-		}
-		append(&kept, rec)
+	stripped, removed := remove_edns_option(wire, .Cookie, context.temp_allocator)
+	if testing.expect(t, removed, "the cookie strip failed") {
+		_, still := peek_edns_option(stripped, .Cookie)
+		testing.expect(t, !still, "the cookie is still there")
+		testing.expect(t, peek_opt_unreadable(stripped), "the cookie strip handed back the reply with one OPT record")
 	}
-	first := m
-	first.additional = kept[:]
-	wire: []u8
-	wire, truncated, err = encode_message(first, context.temp_allocator)
-	if err != .None {
-		return
+	padded, set := set_edns_option(wire, .Padding, {0, 0}, context.temp_allocator)
+	if testing.expect(t, set, "the padding write failed") {
+		testing.expect(t, peek_opt_unreadable(padded), "the padding write handed back the reply with one OPT record")
 	}
-	buf := make([dynamic]u8, 0, len(wire), allocator)
-	append(&buf, ..wire)
-	arcount := int(wire[10]) << 8 | int(wire[11])
-	for rec in extra {
-		lone, _, lone_err := encode_message(Message{additional = {rec}}, context.temp_allocator, compress = false)
-		if lone_err != .None {
-			return nil, false, lone_err
-		}
-		append(&buf, ..lone[HEADER_SIZE:])
-		arcount += 1
-	}
-	buf[10] = u8(arcount >> 8)
-	buf[11] = u8(arcount)
-	return buf[:], truncated, .None
 }

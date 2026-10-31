@@ -41,8 +41,12 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 The road `fit_response` takes with an upstream's answer that is over a client's
 limit: decode it, then encode it again with the truncation walk. The limit is the
 input's own ID, wrapped into the range from 512 - the size RFC 1035 section
-4.2.1 promises every UDP client - to one byte short of the input's length, so
-every ID puts the cut somewhere inside the message.
+4.2.1 promises every UDP client - to one byte short of the message's own encoded
+length, so every ID of a message over 512 bytes puts the cut somewhere inside it.
+The encoded length rather than the input's: the decoder ignores bytes past the
+last record, and the encoder may compress harder than the input did or leave a
+second OPT record out, so the input's length can be well past anything a limit
+below it would cut.
 
 A name the decoder wrote and the encoder will not read back is a disagreement
 between the two, and `fit_response` turns it into an empty TC answer; so is a
@@ -55,7 +59,13 @@ reencode :: proc(raw: []u8) {
 	if err != .None {
 		return
 	}
-	limit := 512 + int(m.id) % max(1, len(raw) - 512)
+	// Where the whole message will not encode, the limited encode below meets the
+	// same error and judges it.
+	size := len(raw)
+	if whole, _, whole_err := dns.encode_message(m); whole_err == .None {
+		size = len(whole)
+	}
+	limit := 512 + int(m.id) % max(1, size - 512)
 	out, truncated, enc_err := dns.encode_message(m, max_size = limit)
 	#partial switch enc_err {
 	case .None:
@@ -140,8 +150,22 @@ edit_in_place :: proc(raw: []u8) {
 	_ = dns.peek_udp_size(raw)
 	_, _ = dns.peek_question(raw)
 	_, _ = dns.peek_alias_target(raw)
-	_, _ = dns.strip_edns_options(raw)
-	_, _ = dns.remove_opt(raw)
+	// The two normalisations a client's answer goes through, checked for having
+	// left no option behind and no OPT record at all.
+	if out, ok := dns.strip_edns_options(raw); ok {
+		if m, err := dns.decode_message(out); err == .None {
+			for rec in m.additional {
+				if opt, is_opt := rec.data.(dns.Rdata_OPT); is_opt && rec.type == .OPT && len(opt.options) > 0 {
+					panic("a stripped OPT record still carries an option")
+				}
+			}
+		}
+	}
+	if out, ok := dns.remove_opt(raw); ok {
+		if m, err := dns.decode_message(out); err == .None && dns.edns_present(m) {
+			panic("a removed OPT record is still there")
+		}
+	}
 	// The per-client options the server takes out of a forwarded answer and
 	// puts into one on its way back (cookie, extended error, keepalive), each
 	// checked for having done it.
