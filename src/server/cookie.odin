@@ -192,8 +192,8 @@ address, read off the wire ahead of any parse.
 A valid one is proof that the sender received a datagram this server sent to
 that address, so an answer to it is going to whoever asked and cannot be part of
 a reflection attack. That is what the UDP read loop asks this for: a datagram
-the datagram pool would refuse is charged to the stream pool instead, as a query
-over a handshake is, if it proves its source. See `datagram_rate_check`.
+the datagram pool would refuse is charged to a pool of its own instead if it
+proves its source. See `datagram_rate_check`.
 
 Only a full 24-byte cookie can be valid, and everything short of the hash is
 checked before the hash is taken, so a datagram with none costs an OPT walk and
@@ -206,9 +206,6 @@ cookie_proves_source :: proc(k: ^Cookie_Keeper, datagram: []u8, client: net.Endp
 		return false
 	}
 	raw := dns.peek_edns_option(datagram, .Cookie) or_return
-	if len(raw) != COOKIE_REPLY_LEN {
-		return false
-	}
 	req: Cookie_Request
 	req.ip_len = cookie_address_bytes(client.address, req.ip[:]) or_return
 	return verify_cookie(k, raw, req, cookie_now())

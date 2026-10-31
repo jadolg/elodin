@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:net"
 import "core:slice"
 import "core:time"
 import "elodin:dns"
@@ -257,8 +258,22 @@ run_cookie_rate_limit_cases :: proc(r: ^Runner, upstream_port: int) {
 		if check(r, found, "the first answer carries no cookie") {
 			udp_flood(udp_port, build_query(f.qname, f.qtype, edns_size = 1232), 20, drain = 50 * time.Millisecond)
 
-			// Straight after the flood, so the datagram pool has refilled by a
-			// twentieth of a token and only the stream pool can pay for it.
+			/*
+			Both straight after the flood, the plain one first, so the datagram
+			pool has refilled by a twentieth of a token and only the cookie's own
+			pool can pay. The plain one is the premise: sent ahead of the cookie
+			query and answered with nothing, it says the datagram pool was empty
+			when the cookie query arrived, however long the answer then takes.
+			*/
+			probe, serr := net.make_unbound_udp_socket(.IP4)
+			if !check(r, serr == nil, "cannot open the probe socket") {
+				end_case(r)
+				return
+			}
+			defer net.close(probe)
+			plain := build_query(f.qname, f.qtype, id = 0x4245, edns_size = 1232)
+			_, _ = net.send_udp(probe, plain, net.Endpoint{address = net.IP4_Loopback, port = udp_port})
+
 			proven := build_query(f.qname, f.qtype, id = 0x4246, edns_size = 1232, cookie = issued)
 			res := query_udp(udp_port, proven, timeout = 2 * time.Second)
 			if check(r, res.ok, "a client with a valid server cookie was dropped with the flood") {
@@ -267,9 +282,10 @@ run_cookie_rate_limit_cases :: proc(r: ^Runner, upstream_port: int) {
 				check(r, h.ancount > 0, "the cookie client was not answered")
 			}
 
-			// The premise: the prefix is over its datagram budget.
-			plain := build_query(f.qname, f.qtype, id = 0x4245, edns_size = 1232)
-			check(r, expect_no_udp_reply(udp_port, plain), "a query without a cookie was answered, so the budget is not spent")
+			_ = net.set_option(probe, .Receive_Timeout, 400 * time.Millisecond)
+			buf: [512]u8
+			_, _, rerr := net.recv_udp(probe, buf[:])
+			check(r, rerr != nil, "a query without a cookie was answered, so the budget is not spent")
 		}
 	}
 	end_case(r)

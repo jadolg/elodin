@@ -87,7 +87,8 @@ connections at a time.
 Charged to a budget of their own, though - all of them. A prefix's datagrams are
 spent out of one pool, the queries it asks over connections out of another, and the
 connections themselves out of a third, and none is a way to spend another. There is
-a fourth, for the truncated answers, further down. See `Rate_Class`.
+a fourth, for the truncated answers, further down, and a fifth for the datagrams
+a server cookie rescues once their own pool is empty. See `Rate_Class`.
 
 One shared budget is what this began as, and it was wrong - which is worth writing
 down, because the argument for sharing is the one that reads better. It goes: what
@@ -118,8 +119,10 @@ change that charges one class against the other's pool, or lends a token across
 when the first runs dry, hands the flood back its authority over the connections.
 `test_the_stream_budget_is_not_the_datagram_one` is the test that says so, and the
 reason it is worth more than it looks. A datagram carrying a valid server cookie
-may spend the stream pool once its own is empty: it has proven its address as a
-handshake does, and a spoofed one cannot carry it. See `datagram_rate_check`.
+does not spend it either, though it has proven its address: a cookie is good for
+`COOKIE_MAX_AGE`, so whoever saw one issued to an address - on the path, or as
+the address's previous holder - can replay it from anywhere. Such datagrams have
+a pool of their own; see `datagram_rate_check`.
 
 The connection pool is separate for the same reason and more sharply. A datagram
 that could spend it would be a way to stop a stranger's clients from *connecting*,
@@ -282,7 +285,7 @@ RRL_MAX_OVERRIDES :: config.MAX_RATE_LIMIT_OVERRIDES
 #assert(RRL_MAX_OVERRIDES <= int(max(u8)))
 
 /*
-Which of a prefix's four budgets something is charged to.
+Which of a prefix's five budgets something is charged to.
 
 The separation is the point, and the note at the top of this file is where the
 reasoning for it lives: under one budget a spoofed datagram flood could empty the
@@ -308,6 +311,10 @@ attack can have this server aim at the address it named, and how many writes tha
 costs the loop reading the UDP socket. It is spent only once `Datagram` is
 empty - that is the precondition for a slip at all - so no reply is ever charged
 to both.
+
+`Proven` is a datagram with a valid server cookie that `Datagram` turned away.
+Its own pool because a cookie can be replayed from anywhere for as long as it
+stays valid, so it must not reach `Stream`; see `datagram_rate_check`.
 */
 @(private)
 Rate_Class :: enum u8 {
@@ -315,6 +322,7 @@ Rate_Class :: enum u8 {
 	Stream,
 	Connection,
 	Slip,
+	Proven,
 }
 
 @(private)
@@ -385,10 +393,12 @@ Rate_Tier :: struct {
 	/*
 	Tokens per second, and the most that may be banked, one of each per pool.
 
-	`Datagram`, `Stream` and `Connection` all get this tier's
-	`responses_per_second` - the multiplication the file's note accepts, and the
+	`Datagram`, `Stream`, `Connection` and `Proven` all get this tier's
+	`responses_per_second` - the multiplication the file's note accepts, the
 	whole figure for `Connection` because a connection is what a query is asked
-	over; `Slip` gets a fraction of it, for the reason in `RRL_SLIP_SHARE`.
+	over, and for `Proven` because a cookie client in a flooded prefix is owed
+	the budget it would have had without the flood; `Slip` gets a fraction of
+	it, for the reason in `RRL_SLIP_SHARE`.
 	*/
 	rate:     [Rate_Class]f64,
 	capacity: [Rate_Class]f64,
@@ -507,6 +517,7 @@ make_rate_tier :: proc(responses_per_second: int, slip: int) -> (t: Rate_Tier) {
 	t.rate[.Datagram] = rps
 	t.rate[.Stream] = rps
 	t.rate[.Connection] = rps
+	t.rate[.Proven] = rps
 	// Divided as integers, so the slip pool refills at the whole number the
 	// startup line prints and the documentation quotes rather than at a figure
 	// an eighth of a token above it.
@@ -706,26 +717,29 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 
 /*
 Charge a datagram to `client`'s prefix and say what to do with it, letting one
-that proves its source fall back on the stream pool.
+that proves its source fall back on a pool of its own.
 
 The datagram pool is asked first, for every datagram. A datagram carrying a
 valid server cookie (`cookie_proves_source`) comes from an address that has
-received what this server sent it, which is what a handshake establishes for a
-connection, so once the datagram pool is empty it is charged as a query over one
-is: to the stream pool. A spoofed flood naming the prefix empties the datagram
-pool and cannot reach the stream one, so the client holding a cookie is answered
-through the flood.
+received what this server sent it, so its answer cannot be reflected; once the
+datagram pool is empty it is charged to `Proven` instead. A spoofed flood naming
+the prefix empties the datagram pool and cannot reach `Proven`, so the client
+holding a cookie is answered through the flood.
 
-The datagram pool first, rather than the stream pool for every proven datagram,
-so a cookie costs a client nothing it had: a busy prefix behind a NAT keeps the
-datagram budget and the slip's TCP invitation it has without one, and the stream
-pool its connections are charged to is spent only on what the datagram pool
-turned away. It is also what keeps the cookie off the hot path: the option is
-read and hashed only for a datagram the budget would refuse.
+The datagram pool first, rather than `Proven` for every cookie, so a cookie
+costs a client nothing it had: a busy prefix behind a NAT keeps the datagram
+budget and the slip's TCP invitation it has without one. It is also what keeps
+the cookie off the hot path: the option is read and hashed only for a datagram
+the budget would refuse.
 
-Only a proven datagram reaches the stream pool, so this is not the lending
-across pools the top of this file rules out: a spoofed one cannot carry a valid
-cookie, and so cannot spend what the prefix's connections are charged to.
+`Proven` and not the stream pool, though a cookie proves an address as a
+handshake does, because it proves it for longer. A cookie is good for
+`COOKIE_MAX_AGE`, so the address's previous holder, or anyone who saw the cookie
+on the path, can replay it from anywhere within that hour. Charged to the stream
+pool, that replay would refuse the prefix's TCP, DoT and DoH - the authority over
+a stranger's connections the top of this file keeps from datagrams. Charged here,
+the most it can spend is the rescue of the prefix's other cookie clients, which
+leaves them where they were without one.
 
 Rescued rather than exempted, unlike BIND and Knot, which skip RRL for a valid
 cookie altogether. Their limiter bounds reflection and nothing else; this one
@@ -734,9 +748,8 @@ still one whose queries cost upstream round trips.
 
 Both pools empty, the datagram pool's verdict stands, slip and all.
 
-`proven` says the stream pool paid, so `udp_job` bills the answer's size there:
-a cookie is good for `COOKIE_MAX_AGE`, and whoever held the address when it was
-issued can spend it after the address has moved on.
+`proven` says `Proven` paid, so `udp_job` bills the answer's size there: a
+replayed cookie aims no more bytes at the address it names than a datagram can.
 */
 datagram_rate_check :: proc(
 	r: ^Rate_Limiter,
@@ -756,7 +769,7 @@ datagram_rate_check :: proc(
 	if spend_token(r, client, now, .Datagram) {
 		return .Allow, false
 	}
-	if cookie_proves_source(k, datagram, client) && spend_token(r, client, now, .Stream) {
+	if cookie_proves_source(k, datagram, client) && spend_token(r, client, now, .Proven) {
 		return .Allow, true
 	}
 	// Asked again rather than judged from the two above: it is what counts the
@@ -810,12 +823,12 @@ check before the answer forces, and it is the right way round: the bucket carrie
 the overspend forward, so a prefix being fed large answers runs dry sooner and
 one asking small questions is charged nothing extra.
 
-`Datagram`, and `Stream` only for a datagram a server cookie rescued. A query
-over a connection is not weighed: the handshake settled where the client is,
-and it holds that address for as long as the answer takes. A cookie is weaker
-proof - good for `COOKIE_MAX_AGE`, so it outlives a dynamic address it was
-issued to - and the bytes it can aim at an address are bounded as a datagram's
-are. `Connection` has no size at all.
+`Datagram`, or `Proven` for a datagram a server cookie rescued. A query over a
+connection is not weighed: the handshake settled where the client is, and it
+holds that address for as long as the answer takes. A cookie is weaker proof -
+good for `COOKIE_MAX_AGE`, so it outlives a dynamic address it was issued to -
+and the bytes it can aim at an address are bounded as a datagram's are.
+`Connection` has no size at all.
 
 `Slip` is not charged either, and unlike the other two that is worth a figure
 rather than a reason. A truncated reply is a header and the question echoed back,
@@ -877,7 +890,7 @@ rate_charge_response :: proc(
 	client: net.Endpoint,
 	size: int,
 	now: time.Tick,
-	// The pool that admitted the datagram: `.Stream` for one a server cookie
+	// The pool that admitted the datagram: `.Proven` for one a server cookie
 	// rescued, see `datagram_rate_check`.
 	class := Rate_Class.Datagram,
 ) {

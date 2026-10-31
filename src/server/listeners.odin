@@ -373,7 +373,7 @@ Udp_Job :: struct {
 	// any of them would put the same thing on the wire; replying on the one
 	// that received keeps a query's send queue and its receive queue together.
 	socket: net.UDP_Socket,
-	// Admitted on the stream pool for a valid server cookie, so its answer's
+	// Admitted on the `Proven` pool for a valid server cookie, so its answer's
 	// size is billed there. See `datagram_rate_check`.
 	proven: bool,
 }
@@ -781,8 +781,8 @@ udp_loop :: proc(data: rawptr) {
 
 		The server cookie is read here and not left to the worker, because which
 		budget pays can depend on it: a datagram the datagram pool would refuse
-		is charged to the stream pool if it proves its source, out of reach of a
-		flood spoofing the same prefix. See `datagram_rate_check`.
+		is charged to a pool of its own if it proves its source, out of reach of
+		a flood spoofing the same prefix. See `datagram_rate_check`.
 		*/
 		verdict, proven := datagram_rate_check(
 			live(ctx.server).limiter,
@@ -1412,7 +1412,7 @@ udp_job :: proc(data: rawptr) {
 		job.client,
 		len(response),
 		time.tick_now(),
-		.Stream if job.proven else .Datagram,
+		.Proven if job.proven else .Datagram,
 	)
 	_, _ = loop.send_udp(job.socket, response, job.client)
 }
