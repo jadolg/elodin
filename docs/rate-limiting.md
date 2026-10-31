@@ -57,8 +57,10 @@ the connections of the clients who really live there. A UDP query with a valid
 server cookie has proven its address the same way, so once the datagram budget
 is empty it is charged to the stream budget, size included, and keeps being
 answered through such a flood. With both empty it is treated like any other
-datagram over budget. This needs `cookies.enabled`. A client using every way in can therefore draw
-three times the figure, two thirds of it over handshakes from a real address.
+datagram over budget. This needs `cookies.enabled`.
+
+A client using every way in can therefore draw three times the figure, two
+thirds of it over handshakes from a real address.
 
 Opening a connection is charged because a client that handshakes and hangs up
 asks nothing, so no query budget sees it; it gets the whole figure because a
@@ -82,10 +84,10 @@ a refused source use up the budget of the clients in its /24.
 
 - **UDP.** At most every `slip`th over-budget query gets back a header and the
   question with TC set: too small to be worth reflecting, and it tells a real
-  client to retry over TCP. `slip: 0` drops them all. These truncated
-  answers have their own budget, an eighth of `responses_per_second` per prefix
-  (62 a second by default), so a flood cannot make elodin send one per two
-  datagrams it receives.
+  client to retry over TCP. `slip: 0` drops them all. These truncated answers
+  have their own budget, an eighth of `responses_per_second` per prefix (62 a
+  second by default), so a flood cannot make elodin send one per two datagrams
+  it receives.
 - **TCP and DoT.** The connection is closed. One that had already been sent
   answers is drained briefly first, so the client's kernel does not discard
   them; one refused on its first query is closed at once.

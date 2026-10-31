@@ -748,8 +748,10 @@ datagram_rate_check :: proc(
 	verdict: Rate_Verdict,
 	proven: bool,
 ) {
-	if r == nil {
-		return .Allow, false
+	// With cookies off nothing can be proven, so the flood path takes the table
+	// lock once, as it does without this.
+	if r == nil || k == nil {
+		return rate_check(r, client, now), false
 	}
 	if spend_token(r, client, now, .Datagram) {
 		return .Allow, false
@@ -931,16 +933,9 @@ stream_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick
 	if r == nil {
 		return true
 	}
-	sync.mutex_lock(&r.lock)
-	defer sync.mutex_unlock(&r.lock)
-
-	b := rate_bucket(r, client, now._nsec)
-
-	if b.tokens[.Stream] >= 1 {
-		b.tokens[.Stream] -= 1
+	if spend_token(r, client, now, .Stream) {
 		return true
 	}
-
 	sync.atomic_add(&r.limited, 1)
 	return false
 }

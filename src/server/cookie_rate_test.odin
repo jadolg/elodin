@@ -7,7 +7,8 @@ import "elodin:dns"
 
 /*
 A datagram that proves its source with a server cookie is charged to the stream
-pool, so a flood spoofing its prefix cannot have it dropped (issue #296).
+pool once the datagram pool turns it away, so a flood spoofing its prefix cannot
+have it dropped (issue #296).
 */
 
 @(private = "file")
@@ -118,7 +119,7 @@ test_a_cookie_client_spends_the_datagram_pool_first :: proc(t: ^testing.T) {
 		if proven {
 			on_stream += 1
 		} else {
-			testing.expectf(t, on_stream == 0, "the datagram pool paid after the stream pool had")
+			testing.expect(t, on_stream == 0, "the datagram pool paid after the stream pool had")
 			on_datagram += 1
 		}
 	}

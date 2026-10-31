@@ -256,10 +256,9 @@ run_cookie_rate_limit_cases :: proc(r: ^Runner, upstream_port: int) {
 		}
 		if check(r, found, "the first answer carries no cookie") {
 			udp_flood(udp_port, build_query(f.qname, f.qtype, edns_size = 1232), 20, drain = 50 * time.Millisecond)
-			plain := build_query(f.qname, f.qtype, id = 0x4245, edns_size = 1232)
-			// The premise: the prefix is over its datagram budget.
-			check(r, expect_no_udp_reply(udp_port, plain), "a query without a cookie was answered, so the budget is not spent")
 
+			// Straight after the flood, so the datagram pool has refilled by a
+			// twentieth of a token and only the stream pool can pay for it.
 			proven := build_query(f.qname, f.qtype, id = 0x4246, edns_size = 1232, cookie = issued)
 			res := query_udp(udp_port, proven, timeout = 2 * time.Second)
 			if check(r, res.ok, "a client with a valid server cookie was dropped with the flood") {
@@ -267,6 +266,10 @@ run_cookie_rate_limit_cases :: proc(r: ^Runner, upstream_port: int) {
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode")
 				check(r, h.ancount > 0, "the cookie client was not answered")
 			}
+
+			// The premise: the prefix is over its datagram budget.
+			plain := build_query(f.qname, f.qtype, id = 0x4245, edns_size = 1232)
+			check(r, expect_no_udp_reply(udp_port, plain), "a query without a cookie was answered, so the budget is not spent")
 		}
 	}
 	end_case(r)
