@@ -713,16 +713,17 @@ it, which tells a real client to come back over TCP where the handshake proves
 the address an answer would go to; 0 drops them all. At most, because those
 answers have a budget of their own - see below.
 
-The figure is charged three times over, not once: each prefix gets it for
-datagrams, again for queries read off a connection, and again for the connections
-it opens - and no budget can be spent from another's side. Deliberately, and not
-to be quietly consolidated - a UDP source address is written by whoever sent the
-datagram, so one shared budget let a spoofed flood naming a prefix close the TCP,
-DoT and DoH connections of the clients who live in it, and would let the same
-flood stop them opening one. `ratelimit.odin` is where that is argued out. The
-cost is that a client using every way in can draw three times the figure, two
-thirds of it only over a completed handshake from an address that is therefore
-real.
+The figure is charged four times over, not once: each prefix gets it for
+datagrams, again for queries read off a connection, again for the connections it
+opens, and again for datagrams a valid server cookie rescues once the datagram
+budget is empty - and no budget can be spent from another's side. Deliberately,
+and not to be quietly consolidated - a UDP source address is written by whoever
+sent the datagram, so one shared budget let a spoofed flood naming a prefix close
+the TCP, DoT and DoH connections of the clients who live in it, and would let the
+same flood stop them opening one. `ratelimit.odin` is where that is argued out. The
+cost is that a client using every way in can draw four times the figure, half
+of it only over a completed handshake from an address that is therefore real,
+and a quarter only with a valid server cookie.
 
 The third of those is what bounds a client that asks nothing at all. Opening a
 connection costs this server a TLS handshake on DoT and DoH - 205 µs of CPU on the
@@ -806,9 +807,11 @@ Rate_Limit_Config :: struct {
 	AdGuard DNS's `response_size_estimate` is the same setting with the same
 	arithmetic, and 1KB is what it ships.
 
-	UDP only, and the datagram pool only. A connection has no size worth
-	charging - the handshake already settled where the client is, so what its
-	budget bounds is the work behind an answer rather than the traffic - and a
+	UDP only: the datagram pool, and the cookie rescue pool for an answer a
+	valid server cookie admitted, so a prefix holding a cookie can receive the
+	figure above twice over. A connection has no size worth charging - the
+	handshake already settled where the client is, so what its budget bounds is
+	the work behind an answer rather than the traffic - and a
 	truncated slip reply is never weighed at all, since it is sent from the read
 	loop before there is an answer to weigh. It is a header and the question
 	echoed back - 30-odd bytes for an ordinary name, 271 for a maximal one - and

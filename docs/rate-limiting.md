@@ -128,6 +128,9 @@ into bytes. An answer larger than the estimate is charged
   leaving it out.
 - Connections are not weighed, and neither are truncated replies (30 to 271
   bytes), so the slip pool's 62 a second comes on top of the byte bound.
+- Answers rescued by a valid server cookie are weighed the same way against the
+  cookie budget, so a prefix holding a cookie can receive the byte bound twice
+  over: once on datagrams and once on rescues.
 - The charge comes after the answer is sent, so a burst is admitted and then
   paid off: the prefix hears nothing for about
   `2 × (ceil(max_udp_response ÷ response_size_estimate) − 1)` seconds (18 at an

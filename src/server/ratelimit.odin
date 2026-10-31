@@ -226,8 +226,9 @@ The table is fixed at construction and never grows.
 
 A cache of buckets that allocated per source would be a memory bound written in
 terms of how many distinct addresses an attacker cares to name, which is not a
-bound. Sixteen thousand buckets is 896 KB - a bucket carries a budget per pool,
-so the figure moves with `Rate_Class`; charging arrivals took it from 768 KB -
+bound. Sixteen thousand buckets is 1 MiB - a bucket carries a budget per pool,
+so the figure moves with `Rate_Class`; charging arrivals took it from 768 KB to
+896 KB, and the cookie rescue pool to 1 MiB -
 and more prefixes than a resolver serves; what collides shares a budget, which is
 a limit that is too strict on rare occasions rather than a limit that fails.
 */
@@ -363,9 +364,9 @@ Rate_Bucket :: struct {
 	key, and a takeover re-resolves it for the prefix taking over.
 
 	Free in this struct's padding. `key`, `tokens`, `last_ns` and `over` come to
-	52 bytes and the alignment rounds to 56 either way, so the table is the same
-	896 KB it was before there were tiers - which is the reason this is an index
-	rather than a copy of the figures.
+	60 bytes and the alignment rounds to 64 either way, so the table is the same
+	1 MiB it would be without tiers - which is the reason this is an index rather
+	than a copy of the figures.
 
 	A collision therefore shares a tier as well as a budget: two prefixes in one
 	bucket are accounted against whichever of them claimed it. That is the same
@@ -376,6 +377,8 @@ Rate_Bucket :: struct {
 	*/
 	tier:    u8,
 }
+// The figure `RRL_BUCKETS` and `Rate_Bucket.tier` quote.
+#assert(size_of(Rate_Bucket) == 64)
 
 /*
 One set of figures, and everything derived from it.
@@ -686,9 +689,12 @@ rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) -> Ra
 	}
 	sync.mutex_lock(&r.lock)
 	defer sync.mutex_unlock(&r.lock)
+	return judge_datagram(r, rate_bucket(r, client, now._nsec))
+}
 
-	b := rate_bucket(r, client, now._nsec)
-
+// `rate_check` on a bucket already brought forward, with the table lock held.
+@(private)
+judge_datagram :: proc(r: ^Rate_Limiter, b: ^Rate_Bucket) -> Rate_Verdict {
 	if b.tokens[.Datagram] >= 1 {
 		b.tokens[.Datagram] -= 1
 		b.over = 0
@@ -730,7 +736,8 @@ The datagram pool first, rather than `Proven` for every cookie, so a cookie
 costs a client nothing it had: a busy prefix behind a NAT keeps the datagram
 budget and the slip's TCP invitation it has without one. It is also what keeps
 the cookie off the hot path: the option is read and hashed only for a datagram
-the budget would refuse.
+the budget would refuse and `Proven` could pay for, so a flood replaying a
+cookie past an empty `Proven` costs one lock and no hash, as any other does.
 
 `Proven` and not the stream pool, though a cookie proves an address as a
 handshake does, because it proves it for longer. A cookie is good for
@@ -766,9 +773,18 @@ datagram_rate_check :: proc(
 	if r == nil || k == nil {
 		return rate_check(r, client, now), false
 	}
-	if spend_token(r, client, now, .Datagram) {
-		return .Allow, false
+	// Judged under this one lock unless a rescue could follow: either the
+	// datagram pool pays, or `Proven` has nothing to pay with and the cookie is
+	// not worth reading. Let go before the cookie is hashed, so no reader waits
+	// on another's SipHash.
+	sync.mutex_lock(&r.lock)
+	b := rate_bucket(r, client, now._nsec)
+	if b.tokens[.Datagram] >= 1 || b.tokens[.Proven] < 1 {
+		verdict = judge_datagram(r, b)
+		sync.mutex_unlock(&r.lock)
+		return verdict, false
 	}
+	sync.mutex_unlock(&r.lock)
 	if cookie_proves_source(k, datagram, client) && spend_token(r, client, now, .Proven) {
 		return .Allow, true
 	}
@@ -791,11 +807,6 @@ spend_token :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick, clas
 		return false
 	}
 	b.tokens[class] -= 1
-	if class == .Datagram {
-		// As `rate_check` does on an admission: the run of over-limit datagrams
-		// the slip counts is over.
-		b.over = 0
-	}
 	return true
 }
 

@@ -1394,9 +1394,10 @@ udp_job :: proc(data: rawptr) {
 	/*
 	Charged before the send rather than after it.
 
-	`rate_check` in the read loop admitted this datagram on one token, before
-	there was an answer to weigh; this is what the answer turned out to cost
-	beyond that, and the next query from the prefix is what pays it - see
+	`datagram_rate_check` in the read loop admitted this datagram on one token
+	of the pool `job.proven` names, before there was an answer to weigh; this
+	is what the answer turned out to cost beyond that, and the next query from
+	the prefix is what pays it - see
 	`rate_charge_response`. Before the send because the send is attempted either
 	way: a datagram the socket would not take is one this server built and
 	handed to the kernel, and a budget that only counted the writes that

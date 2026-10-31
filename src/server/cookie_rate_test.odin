@@ -97,7 +97,7 @@ test_a_cookie_client_is_not_dropped_with_a_flood_naming_its_prefix :: proc(t: ^t
 
 /*
 A cookie costs a client nothing it had: the datagram pool pays first and keeps
-the slip, the stream pool is spent only on what it turned away, and with both
+the slip, the `Proven` pool is spent only on what it turned away, and with both
 empty the slip's verdict stands.
 */
 @(test)
@@ -112,19 +112,19 @@ test_a_cookie_client_spends_the_datagram_pool_first :: proc(t: ^testing.T) {
 	cookie := issued_to(&k, client)
 	query := cookie_query(cookie[:])
 
-	on_datagram, on_stream := 0, 0
+	on_datagram, on_proven := 0, 0
 	for _ in 0 ..< BURST * 2 {
 		v, proven := datagram_rate_check(r, &k, query, client, tick(0))
 		testing.expect_value(t, v, Rate_Verdict.Allow)
 		if proven {
-			on_stream += 1
+			on_proven += 1
 		} else {
-			testing.expect(t, on_stream == 0, "the datagram pool paid after the stream pool had")
+			testing.expect(t, on_proven == 0, "the datagram pool paid after the proven pool had")
 			on_datagram += 1
 		}
 	}
 	testing.expect_value(t, on_datagram, BURST)
-	testing.expect_value(t, on_stream, BURST)
+	testing.expect_value(t, on_proven, BURST)
 	// Never the stream pool, which a replayed cookie must not reach.
 	streamed := 0
 	for _ in 0 ..< BURST {
@@ -139,7 +139,7 @@ test_a_cookie_client_spends_the_datagram_pool_first :: proc(t: ^testing.T) {
 	for _ in 0 ..< 4 {
 		if v, proven := datagram_rate_check(r, &k, query, client, tick(0)); v == .Truncate {
 			truncated += 1
-			testing.expect(t, !proven, "a slip was reported as paid by the stream pool")
+			testing.expect(t, !proven, "a slip was reported as paid by the proven pool")
 		}
 	}
 	testing.expect_value(t, truncated, 2)

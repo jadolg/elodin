@@ -227,9 +227,10 @@ run_cookie_cases :: proc(r: ^Runner) {
 
 /*
 A client holding a valid server cookie has proven it receives at its address, so
-it is charged to the stream pool and a flood emptying its prefix's datagram pool
-does not take it down too (issue #296). The flood here is from the client's own
-address, which is the prefix's datagram pool emptied all the same.
+once its prefix's datagram pool is empty it is charged to a rescue pool of its
+own, and a flood emptying the datagram pool does not take it down too (issue
+#296). The flood here is from the client's own address, which is the prefix's
+datagram pool emptied all the same.
 */
 @(private = "file")
 run_cookie_rate_limit_cases :: proc(r: ^Runner, upstream_port: int) {
@@ -249,7 +250,10 @@ run_cookie_rate_limit_cases :: proc(r: ^Runner, upstream_port: int) {
 
 	start_case(r, "cookies: a client with a valid server cookie is answered while its prefix is over the budget")
 	{
-		first := query_udp(udp_port, build_query(f.qname, f.qtype, edns_size = 1232, cookie = CLIENT_COOKIE))
+		// Over TCP, so the cookie costs no datagram token: at a capacity of two,
+		// readiness probes the harness had to retry could already have spent
+		// both, and a dropped first query would fail the case for nothing.
+		first := query_tcp(udp_port, build_query(f.qname, f.qtype, edns_size = 1232, cookie = CLIENT_COOKIE))
 		issued: []u8
 		found: bool
 		if check(r, first.ok, "no response to the first query") {
