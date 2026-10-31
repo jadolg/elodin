@@ -74,24 +74,18 @@ group already parked - `resolve_query` serves the route's answer and stores
 nothing, so the entry is never the stand-in for a fact nobody checked. What is
 left is a parent *group* whose members disagree about the zone, where the entry
 can be the parent's proof on one query and the route's own NODATA on the next.
-Most of that is closed rather than merely narrow: a member that rewrites the
-rcode to SERVFAIL or REFUSED is passed over, `resolve_query` asking the group
-through `upstream.resolve_answerable`, so the proof is found wherever the group
-holds it. What survives is a member whose reply is answerable without being the
-proof, since that one stops the sweep before the member holding the proof is
-reached: a NOERROR with something in the answer section, an NXDOMAIN, or a `DS`
-RRset. The first of those keeps nothing - `parent_answers_apex_ds` leaves it
-unsettled, so `resolve_query` serves the route's answer and stores none of it,
-and the next query is free to reach the member that can prove the delegation.
-The other two are settled by design, being statements about the public tree, so
-the route's answer does go into the entry - if it carries a SOA, for that SOA's
-figure capped by `cache.negative_ttl` - while another member of the same group
-was publishing the proof all along - one upstream answering NXDOMAIN for an
-empty non-terminal that its neighbour answers NODATA for, against RFC 8020, is
-how that actually arises. That is the worst this carve-out can do to the cache,
-and it is the behaviour the zone had before
-the carve-out existed: an unsigned NODATA for the apex `DS`, served for the
-entry's lifetime.
+That is closed rather than merely narrow: `resolve_apex_ds_parent` sweeps the
+group past every reply that is not the proof - a SERVFAIL or REFUSED, and an
+answerable one too: an NXDOMAIN, a `DS` RRset, a rewritten NOERROR (issue #245)
+- so the proof is found wherever the group holds it, and the route answers only
+where no reachable member could give it. What is left is a member out of reach
+for this one query - parked, outside the sweep's budget, or not known to be
+answering once an answerable reply is in hand (a `failover` spare that is never
+otherwise asked, say; see `upstream.answering`) - while another holds the
+proof. The route's answer is then stored where the group's best reply
+settled the question, for at most `cache.negative_ttl`, which is the behaviour
+the zone had before the carve-out existed: an unsigned NODATA for the apex
+`DS`, served for the entry's lifetime.
 */
 Zone_Route :: struct {
 	// Canonical, lowercase, root-dotted, as `config.Zone_Route` left them.
@@ -291,7 +285,7 @@ client that the route cannot. Every other reply goes back on the route -
     rcode that is neither NOERROR nor NXDOMAIN. An upstream with an ACL, or a
     CPE resolver that mangles every `DS` it meets, is not a statement about this
     delegation, so `resolve_query` asks the parent's group through
-    `upstream.resolve_answerable` - the group's other members first, and the
+    `resolve_apex_ds_parent` - the group's other members first, and the
     route only once none of them will say anything. `parent_answers_apex_ds`
     sets out why that is the reading here rather than the way an ordinary client
     question is read.
@@ -339,7 +333,9 @@ withholding only this server's copy would never have reached it.
 Deciding it on the answer rather than at load is what the issue left open as
 "cannot be known at load". It cannot - but it can be read off the reply, at the
 cost of one extra query for a routed apex whose parent says anything else, and
-only for `DS`.
+only for `DS` - and, where the parent's group has several members and the first
+does not give the proof, one more per member the sweep reaches
+(`resolve_apex_ds_parent`).
 */
 @(private)
 apex_ds_off_route :: proc(s: ^Server, name: string, type: dns.Type) -> bool {
@@ -392,7 +388,8 @@ for the reason it gives at the store.
 
 SERVFAIL and REFUSED being no statement at all is the reading
 `upstream.resolve_answerable` already takes, and `resolve_query` asks the
-parent's group through it rather than through `resolve` for that reason: what
+parent's group through its sibling `resolve_apex_ds_parent` rather than through
+`resolve` for that reason: what
 that procedure says about *why* - "NOERROR and NXDOMAIN are the only rcodes that
 say anything about a delegation" - is the rule here too, and this question,
 though the client's, is about a delegation. Being about the delegation is the
@@ -478,6 +475,102 @@ parent_answers_apex_ds :: proc(
 		return false, absent
 	}
 	return true, true
+}
+
+/*
+Ask the parent's group for a routed apex's `DS`, holding out for the proof.
+
+`upstream.resolve_proving` with `parent_answers_apex_ds`'s `proved` as the test
+(issue #245): a member's NXDOMAIN or `DS` RRset is answerable, but it is not
+the proof, and the member beside it may publish the proof all the same - one
+upstream answering NXDOMAIN for an empty non-terminal and its neighbour NODATA
+is an RFC 8020 violation common in the field. Sweeping on past it keeps the
+client's answer, and the cache entry `settled` keeps for it, from turning on
+which member `Race` or `Round_Robin` happens to reach.
+
+Where no member proves anything, the first answerable reply comes back, so
+`settled` turns on what the group could say.
+
+`proved` and `settled` are `parent_answers_apex_ds`'s over the reply returned,
+taken from the reading the sweep already made of it: a second reading would
+decode it, and hash its NSEC3 records, again against the request's `spent`,
+after the other members' replies have drawn on it.
+*/
+@(private)
+resolve_apex_ds_parent :: proc(
+	g: ^upstream.Group,
+	query: []u8,
+	name: string,
+	spent: ^int,
+	max_nsec3_iterations: int,
+	allocator: mem.Allocator,
+	deadline: ^time.Tick,
+) -> (
+	response: []u8,
+	winner: ^upstream.Upstream,
+	err: upstream.Error,
+	proved: bool,
+	settled: bool,
+) {
+	probe := Apex_DS_Probe {
+		name                 = name,
+		spent                = spent,
+		max_nsec3_iterations = max_nsec3_iterations,
+		allocator            = allocator,
+	}
+	response, winner, err = upstream.resolve_proving(g, query, apex_ds_proves, &probe, allocator, deadline)
+	switch {
+	case err != .None:
+		return response, winner, err, false, false
+	case probe.proved:
+		// The proof is `settled` too.
+		return response, winner, err, true, true
+	case probe.first != nil && raw_data(probe.first) == raw_data(response):
+		return response, winner, err, false, probe.first_settled
+	}
+	// A reply `proves` never saw - an rcode or OPT record the sweep would not
+	// take - which reads without being decoded.
+	proved, settled = parent_answers_apex_ds(response, name, true, spent, max_nsec3_iterations, allocator)
+	return
+}
+
+// What `apex_ds_proves` needs beyond the reply, and what it learned.
+@(private)
+Apex_DS_Probe :: struct {
+	name:                 string,
+	spent:                ^int,
+	max_nsec3_iterations: int,
+	allocator:            mem.Allocator,
+	// The first reply `apex_ds_proves` was shown, which is the one that stands
+	// where nobody proves anything, and how it read.
+	first:                []u8,
+	first_settled:        bool,
+	proved:               bool,
+}
+
+// `resolve_apex_ds_parent`'s test of each answerable reply the sweep is handed.
+@(private)
+apex_ds_proves :: proc(response: []u8, data: rawptr) -> bool {
+	p := (^Apex_DS_Probe)(data)
+	/*
+	Past the first reply only the proof matters, and a NOERROR with anything in
+	its answer section is not it: the header says so without a decode. Each
+	reading is charged to the request's `spent`, and the sweep can hand this one
+	reply per member of the group, so a member answering a large `DS` RRset, or
+	a reply built to expand, is not read for a verdict its header already gives.
+	The first reply is read in full, being the one whose `settled` stands where
+	nobody proves anything.
+	*/
+	if p.first != nil && len(response) >= dns.HEADER_SIZE && (response[6] != 0 || response[7] != 0) {
+		p.proved = false
+		return false
+	}
+	proved, settled := parent_answers_apex_ds(response, p.name, true, p.spent, p.max_nsec3_iterations, p.allocator)
+	if p.first == nil {
+		p.first, p.first_settled = response, settled
+	}
+	p.proved = proved
+	return proved
 }
 
 /*
