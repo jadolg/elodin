@@ -230,6 +230,43 @@ resolve_answerable :: proc(
 }
 
 /*
+`resolve_answerable`, holding out for the one answerable reply `proves` will have.
+
+For a question where one particular answer is wanted and the group's members
+can disagree about it (issue #245). A routed apex's `DS` is that question: the
+parent's NODATA proof is what it was sent for, and an NXDOMAIN or a `DS` RRset
+from one member says nothing about whether the member beside it publishes the
+proof. Two upstreams disagreeing about an empty non-terminal - one NXDOMAIN, one
+NODATA, the RFC 8020 violation common in the field - is how that arises, and
+stopping at the first answerable reply left `Race` and `Round_Robin` answering
+from whichever member they reached.
+
+So the sweep goes on past an answerable reply that is not the proof, under the
+same rules and the same budget as every other sweep. Where no member proves
+anything, the first answerable reply stands, and failing that the first reply:
+what the caller would have had from `resolve_answerable`, reached by asking
+everybody. The first exchange still decides the ordinary case: a reply that is
+the proof returns from it and none of the sweep runs.
+
+`data` is handed to `proves` untouched, being what it needs beyond the reply.
+*/
+resolve_proving :: proc(
+	g: ^Group,
+	query: []u8,
+	proves: proc(response: []u8, data: rawptr) -> bool,
+	data: rawptr,
+	allocator := context.allocator,
+	// As `resolve_answerable`'s.
+	deadline: ^time.Tick = nil,
+) -> (
+	response: []u8,
+	winner: ^Upstream,
+	err: Error,
+) {
+	return resolve_insisting(g, query, answerable, allocator, deadline, proves, data)
+}
+
+/*
 Resolve `query`, insisting on a reply the client's own question can be answered
 with: an rcode it can read, and one that says something about the name.
 
@@ -306,6 +343,10 @@ resolve_insisting :: proc(
 	acceptable: proc(response: []u8) -> bool,
 	allocator: mem.Allocator,
 	deadline: ^time.Tick,
+	// What the sweep holds out for, past an acceptable reply; see
+	// `resolve_proving`. Nil holds out for nothing more than `acceptable`.
+	proves: proc(response: []u8, data: rawptr) -> bool = nil,
+	data: rawptr = nil,
 ) -> (
 	response: []u8,
 	winner: ^Upstream,
@@ -350,7 +391,7 @@ resolve_insisting :: proc(
 
 	started := time.tick_now()
 	response, winner, err = resolve_within(g, query, budget, allocator, &unreachable)
-	if err != .None || takes(acceptable, response) {
+	if err != .None || wanted(acceptable, proves, data, response) {
 		return response, winner, err
 	}
 
@@ -440,8 +481,14 @@ resolve_insisting :: proc(
 	server takes, while `failures` and `up` both report it well. What the sweep
 	spends is a different question, and `elodin_upstream_queries_total` per
 	member is where it is already answered.
+
+	Not where the reply was acceptable and only `proves` sent the group on:
+	that member answered, and an NXDOMAIN its neighbour contradicts is the
+	group disagreeing, not a member failing its group.
 	*/
-	note_swept_rcode(winner)
+	if !takes(acceptable, response) {
+		note_swept_rcode(winner)
+	}
 
 	/*
 	And the sweep has at most one `g.timeout` of waiting to spend, and never
@@ -547,38 +594,74 @@ resolve_insisting :: proc(
 		// has cost this query exactly what a member that said nothing did.
 		spent += time.tick_since(before)
 		// A failed exchange is left to `exchange`, which says why.
-		if xerr == .None && takes(acceptable, resp) {
-			// Said here rather than above, because what makes a filtering
-			// member's block bypassed is another member *answering* - a second
-			// REFUSED from behind the same ACL bypasses nothing, and warning
-			// about it would spend the one-shot line on it.
-			report_swept_refusal(winner, response)
-			// The rcode as a number: 4080 of the 4096 composed values have no
-			// name, and `%v` renders one of those as a placeholder - the same
-			// reading `unreadable_rcode_refusal` gives its own line.
-			logx.debugf(
-				"upstream %s answered rcode %d%s%s, swept past it to %s",
-				winner.spec.name,
-				u16(dns.peek_rcode(response)),
-				// Gated: arguments are evaluated whether or not the line is written.
-				" (a referral)" if logx.enabled(.Debug) && dns.peek_referral(response) else "",
-				" (an OPT record it cannot account for)" if logx.enabled(.Debug) && dns.peek_opt_unreadable(response) else "",
-				u.spec.name,
-			)
-			// The first reply is superseded. It came from the caller's
+		if xerr != .None {
+			continue
+		}
+		if wanted(acceptable, proves, data, resp) {
+			if takes(acceptable, response) {
+				logx.debugf("upstream %s's reply was not the one this question holds out for, swept past it to %s", winner.spec.name, u.spec.name)
+			} else {
+				report_swept(winner, response, u)
+			}
+			// The reply in hand is superseded. It came from the caller's
 			// allocator, which is an arena per request on the query path,
 			// where this is a no-op; it matters where one is not.
 			_ = delete(response, allocator)
 			return resp, u, .None
-		} else if xerr == .None {
-			_ = delete(resp, allocator)
 		}
+		/*
+		Only where `proves` holds out for more than `acceptable`: a reply the
+		caller can use, though not the one it is holding out for, replaces one
+		it cannot - so a group where nobody proves anything still leaves the
+		caller what `resolve_answerable` would have, and not the first reply.
+		*/
+		if !takes(acceptable, response) && takes(acceptable, resp) {
+			report_swept(winner, response, u)
+			_ = delete(response, allocator)
+			response, winner = resp, u
+			continue
+		}
+		_ = delete(resp, allocator)
 	}
 
-	// Nobody could answer. The first reply stands, rcode and all: the caller
-	// reads it and decides, and turning one verdict into another is not this
-	// procedure's business.
+	// Nobody could answer, or prove. The best reply stands, rcode and all: the
+	// caller reads it and decides, and turning one verdict into another is not
+	// this procedure's business.
 	return response, winner, .None
+}
+
+// What the sweep took in place of `response`, a reply its caller could not use.
+@(private)
+report_swept :: proc(winner: ^Upstream, response: []u8, u: ^Upstream) {
+	// Said here rather than before the sweep, because what makes a filtering
+	// member's block bypassed is another member *answering* - a second
+	// REFUSED from behind the same ACL bypasses nothing, and warning about it
+	// would spend the one-shot line on it.
+	report_swept_refusal(winner, response)
+	// The rcode as a number: 4080 of the 4096 composed values have no name,
+	// and `%v` renders one of those as a placeholder - the same reading
+	// `unreadable_rcode_refusal` gives its own line.
+	logx.debugf(
+		"upstream %s answered rcode %d%s%s, swept past it to %s",
+		winner.spec.name,
+		u16(dns.peek_rcode(response)),
+		// Gated: arguments are evaluated whether or not the line is written.
+		" (a referral)" if logx.enabled(.Debug) && dns.peek_referral(response) else "",
+		" (an OPT record it cannot account for)" if logx.enabled(.Debug) && dns.peek_opt_unreadable(response) else "",
+		u.spec.name,
+	)
+}
+
+// Whether the sweep is over with this reply: `acceptable` takes it and,
+// where the caller holds out for more, `proves` does too.
+@(private)
+wanted :: proc(
+	acceptable: proc(response: []u8) -> bool,
+	proves: proc(response: []u8, data: rawptr) -> bool,
+	data: rawptr,
+	response: []u8,
+) -> bool {
+	return takes(acceptable, response) && (proves == nil || proves(response, data))
 }
 
 /*

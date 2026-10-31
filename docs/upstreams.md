@@ -316,6 +316,12 @@ validating client below elodin needs it; RFC 8375 section 4 item 4.B requires
 forwarding it. Names below the apex, and the apex `DNSKEY`, stay on the route.
 That query names only the zone, so it is all the public upstream learns.
 
+Members of the parent's group are asked in turn (skipping any in their
+cooldown, within the group's timeout budget) until one answers "no data", so one
+member's NXDOMAIN or DS does not hide another member's proof. The table below
+is read over the best reply the group gave: the first NOERROR or NXDOMAIN, or
+failing that the first reply.
+
 The parent's answer is kept only if it is "no data" — the delegation exists and
 has no DS. Anything else goes to the route:
 

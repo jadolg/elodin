@@ -524,6 +524,81 @@ rebind: {{enabled: false}}
 	}
 	end_case(r)
 
+	start_case(r, "upstream.zones: one parent member's denial does not hide another's proof")
+	{
+		/*
+		Issue #245. The parent's group has two members that disagree: the first
+		answers NXDOMAIN for one apex and a `DS` RRset for another, the second
+		answers both with the NODATA proof - an empty non-terminal one upstream
+		denies against RFC 8020 is how that arises. Each reply from the first is
+		answerable, and the sweep used to stop there and hand the question to
+		the route, while the group held the proof all along.
+
+		`failover`, so the dissenting member is asked first every time rather
+		than on the queries a round robin happens to start there. The assertion
+		is the route never being asked: the proof came from the second member.
+		*/
+		dissent_port := next_port(r)
+		dissent := mock_make("dissent", dissent_port)
+		mock_rcode(dissent, "split.example.", u16(dns.Type.DS), .NX_Domain)
+		mock_reply(dissent, "split-signed.example.", u16(dns.Type.DS), signed_delegation_reply("split-signed.example."))
+		if !mock_start(dissent) {
+			skip_case(r, "upstream.zones: dissenting parent", "cannot start the dissenting mock")
+		} else {
+			defer mock_stop(dissent)
+			split_port := next_port(r)
+			config := fmt.tprintf(
+				`log:
+  level: info
+listeners:
+  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
+  tcp: {{enabled: false}}
+upstream:
+  timeout: 2s
+  attempts: 1
+  strategy: failover
+  servers:
+    - udp://127.0.0.1:%d
+    - udp://127.0.0.1:%d
+  zones:
+    - domains: [split.example, split-signed.example]
+      servers:
+        - udp://127.0.0.1:%d
+cache: {{enabled: false}}
+blocking: {{enabled: false}}
+dnssec: {{enabled: false}}
+rebind: {{enabled: false}}
+`,
+				split_port,
+				dissent_port,
+				public_port,
+				internal_port,
+			)
+			split, started := start_server(r, Server_Options{config = config, udp_port = split_port})
+			if started {
+				defer stop_server(&split)
+				for apex in ([]string{"split.example.", "split-signed.example."}) {
+					mock_reset_counts(dissent)
+					mock_reset_counts(public)
+					mock_reset_counts(internal)
+					res := query_udp(split_port, build_query(apex, u16(dns.Type.DS)))
+					if check(r, res.ok, "no response for %s", apex) {
+						h := parse_header(r, res.wire)
+						check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), fmt.tprintf("rcode for %s", apex))
+						check(r, !answer_has_type(r, res.wire, u16(dns.Type.DS)), "the dissenting member's DS reached the client for %s", apex)
+					}
+					// The premise: the dissenting member was asked first, and answered.
+					check(r, mock_total(dissent) > 0, "the dissenting member was not asked for %s", apex)
+					check(r, mock_total(public) > 0, "the member holding the proof was not asked for %s", apex)
+					check(r, mock_total(internal) == 0, "the route answered %s while the parent's group held the proof", apex)
+				}
+			} else {
+				skip_case(r, "upstream.zones: dissenting parent", "server did not start")
+			}
+		}
+	}
+	end_case(r)
+
 	start_case(r, "upstream.zones: an apex DS for a name the parent holds goes back to the route")
 	{
 		/*

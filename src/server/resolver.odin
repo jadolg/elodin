@@ -2153,9 +2153,9 @@ resolve_query :: proc(
 		publishing the proof beside a CPE resolver that mangles every `DS` it
 		meets - answering from whichever one it happened to reach: the parent's
 		proof on one query and the route's own unsigned NODATA on the next, which
-		is the residual cache flap `routes.odin` names as the worst this carve-out
-		can do. An answerable reply returns from the first exchange and none of
-		the sweep runs, so `home.arpa.`'s NODATA costs exactly what it did.
+		is the cache flap `routes.odin` describes. The proof returns from the
+		first exchange and none of the sweep runs, so `home.arpa.`'s NODATA
+		costs exactly what it did.
 
 		The route's own exchange below stays on `resolve_readable`, as the
 		ordinary path does: whatever it says is the client's answer, rcode and
@@ -2166,8 +2166,12 @@ resolve_query :: proc(
 		that the rcode is not one of the two which say nothing about the name at
 		all, SERVFAIL and REFUSED, where another member of the group is asked
 		instead (issue #309) - as it is past a referral (issue #410).
+
+		And past an answerable reply that is not the proof, which is
+		`resolve_apex_ds_parent`'s business: a member's NXDOMAIN does not say
+		the member beside it has no proof to give (issue #245).
 		*/
-		resp, winner, uerr = upstream.resolve_answerable(asked, forwarded, allocator, &deadline)
+		resp, winner, uerr = resolve_apex_ds_parent(asked, forwarded, q.name, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator, &deadline)
 	} else {
 		resp, winner, uerr = upstream.resolve_readable(asked, forwarded, allocator, &deadline)
 	}
@@ -2349,7 +2353,7 @@ resolve_query :: proc(
 		route_proved, _ := parent_answers_apex_ds(resp, q.name, uerr == .None, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator)
 		if !route_proved {
 			dns.set_id_in_place(forwarded, dns.random_id())
-			again, second, perr := upstream.resolve_answerable(memoised_parent, forwarded, allocator, &deadline)
+			again, second, perr := resolve_apex_ds_parent(memoised_parent, forwarded, q.name, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator, &deadline)
 			proved, settled := parent_answers_apex_ds(again, q.name, perr == .None, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator)
 			remember_apex_ds_parent(s, q.name, perr == .None, settled)
 			/*

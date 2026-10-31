@@ -74,24 +74,16 @@ group already parked - `resolve_query` serves the route's answer and stores
 nothing, so the entry is never the stand-in for a fact nobody checked. What is
 left is a parent *group* whose members disagree about the zone, where the entry
 can be the parent's proof on one query and the route's own NODATA on the next.
-Most of that is closed rather than merely narrow: a member that rewrites the
-rcode to SERVFAIL or REFUSED is passed over, `resolve_query` asking the group
-through `upstream.resolve_answerable`, so the proof is found wherever the group
-holds it. What survives is a member whose reply is answerable without being the
-proof, since that one stops the sweep before the member holding the proof is
-reached: a NOERROR with something in the answer section, an NXDOMAIN, or a `DS`
-RRset. The first of those keeps nothing - `parent_answers_apex_ds` leaves it
-unsettled, so `resolve_query` serves the route's answer and stores none of it,
-and the next query is free to reach the member that can prove the delegation.
-The other two are settled by design, being statements about the public tree, so
-the route's answer does go into the entry - if it carries a SOA, for that SOA's
-figure capped by `cache.negative_ttl` - while another member of the same group
-was publishing the proof all along - one upstream answering NXDOMAIN for an
-empty non-terminal that its neighbour answers NODATA for, against RFC 8020, is
-how that actually arises. That is the worst this carve-out can do to the cache,
-and it is the behaviour the zone had before
-the carve-out existed: an unsigned NODATA for the apex `DS`, served for the
-entry's lifetime.
+That is closed rather than merely narrow: `resolve_apex_ds_parent` sweeps the
+group past every reply that is not the proof - a SERVFAIL or REFUSED, and an
+answerable one too: an NXDOMAIN, a `DS` RRset, a rewritten NOERROR (issue #245)
+- so the proof is found wherever the group holds it, and the route answers only
+where no reachable member could give it. What is left is a member out of reach
+for this one query - parked, or outside the sweep's budget - while another
+holds the proof. The route's answer is then stored where the group's best reply
+settled the question, for at most `cache.negative_ttl`, which is the behaviour
+the zone had before the carve-out existed: an unsigned NODATA for the apex
+`DS`, served for the entry's lifetime.
 */
 Zone_Route :: struct {
 	// Canonical, lowercase, root-dotted, as `config.Zone_Route` left them.
@@ -291,7 +283,7 @@ client that the route cannot. Every other reply goes back on the route -
     rcode that is neither NOERROR nor NXDOMAIN. An upstream with an ACL, or a
     CPE resolver that mangles every `DS` it meets, is not a statement about this
     delegation, so `resolve_query` asks the parent's group through
-    `upstream.resolve_answerable` - the group's other members first, and the
+    `resolve_apex_ds_parent` - the group's other members first, and the
     route only once none of them will say anything. `parent_answers_apex_ds`
     sets out why that is the reading here rather than the way an ordinary client
     question is read.
@@ -392,7 +384,8 @@ for the reason it gives at the store.
 
 SERVFAIL and REFUSED being no statement at all is the reading
 `upstream.resolve_answerable` already takes, and `resolve_query` asks the
-parent's group through it rather than through `resolve` for that reason: what
+parent's group through its sibling `resolve_apex_ds_parent` rather than through
+`resolve` for that reason: what
 that procedure says about *why* - "NOERROR and NXDOMAIN are the only rcodes that
 say anything about a delegation" - is the rule here too, and this question,
 though the client's, is about a delegation. Being about the delegation is the
@@ -478,6 +471,49 @@ parent_answers_apex_ds :: proc(
 		return false, absent
 	}
 	return true, true
+}
+
+/*
+Ask the parent's group for a routed apex's `DS`, holding out for the proof.
+
+`upstream.resolve_proving` with `parent_answers_apex_ds`'s `proved` as the test
+(issue #245): a member's NXDOMAIN or `DS` RRset is answerable, but it is not
+the proof, and the member beside it may publish the proof all the same - one
+upstream answering NXDOMAIN for an empty non-terminal and its neighbour NODATA
+is an RFC 8020 violation common in the field. Stopping at the first answerable
+reply made the client's answer, and the cache entry `settled` keeps for it,
+turn on which member `Race` or `Round_Robin` happened to reach.
+
+Where no member proves anything, the first answerable reply comes back and is
+read exactly as before, so `settled` still turns on what the group could say.
+*/
+@(private)
+resolve_apex_ds_parent :: proc(
+	g: ^upstream.Group,
+	query: []u8,
+	name: string,
+	spent: ^int,
+	max_nsec3_iterations: int,
+	allocator: mem.Allocator,
+	deadline: ^time.Tick,
+) -> (
+	response: []u8,
+	winner: ^upstream.Upstream,
+	err: upstream.Error,
+) {
+	Probe :: struct {
+		name:                 string,
+		spent:                ^int,
+		max_nsec3_iterations: int,
+		allocator:            mem.Allocator,
+	}
+	probe := Probe{name, spent, max_nsec3_iterations, allocator}
+	proves :: proc(response: []u8, data: rawptr) -> bool {
+		p := (^Probe)(data)
+		proved, _ := parent_answers_apex_ds(response, p.name, true, p.spent, p.max_nsec3_iterations, p.allocator)
+		return proved
+	}
+	return upstream.resolve_proving(g, query, proves, &probe, allocator, deadline)
 }
 
 /*
