@@ -54,6 +54,9 @@ Stall_Peer :: struct {
 	// What the peer found waiting at `drain_at`, before it read anything.
 	// Stored once, by the peer thread, and read after the join.
 	standing:  int,
+	// When the peer began reading, on the writer's clock rather than one
+	// started at `accept`, which ran before the test's.
+	drained:   time.Tick,
 	received:  int,
 }
 
@@ -84,6 +87,9 @@ stall_peer_loop :: proc(p: ^Stall_Peer) {
 			if time.tick_since(start) < p.drain_at {
 				time.sleep(time.Millisecond)
 				continue
+			}
+			if first {
+				p.drained = time.tick_now()
 			}
 			n, _ := net.recv_tcp(client, buf[:])
 			if first {
@@ -335,7 +341,7 @@ test_a_started_write_is_finished_past_the_callers_deadline :: proc(t: ^testing.T
 	defer delete(query)
 	start := time.tick_now()
 	werr := pipe_write(r.c, query, time.tick_add(start, BUDGET))
-	took := time.tick_since(start)
+	end := time.tick_now()
 	_, dead := pipe_dead(r.c)
 	// Past the drain whatever the write did, so the peer has looked. Never a
 	// negative sleep: `time.sleep` converts it to an unsigned `timespec`.
@@ -347,17 +353,17 @@ test_a_started_write_is_finished_past_the_callers_deadline :: proc(t: ^testing.T
 	thread.destroy(r.th)
 	r.th = nil
 
-	// The premise: when the caller's budget ran out, part of the message was
-	// out and part was not. What the peer found waiting when it started reading
-	// is the part that was out.
+	// The premise: part of the message was out before the peer read anything.
+	// That the rest was not is the buffers: a window and a send buffer of a few
+	// KB, both read back, against a message of sixty.
+	testing.expectf(t, r.peer.standing > 0, "the peer found nothing waiting, so no write had started")
+	testing.expectf(t, werr == .None, "a write that had started gave up with %v", werr)
 	testing.expectf(
 		t,
-		r.peer.standing > 0 && r.peer.standing < 2 + STALL_QUERY_SIZE,
-		"the peer found %v bytes waiting, so the write was not standing half done",
-		r.peer.standing,
+		r.peer.drained != {} && time.tick_diff(r.peer.drained, end) >= 0,
+		"the write finished after %v, before the peer read anything",
+		time.tick_diff(start, end),
 	)
-	testing.expectf(t, werr == .None, "a write that had started gave up with %v", werr)
-	testing.expectf(t, took >= DRAIN_AT, "the write finished after %v, before the peer read anything", took)
 	testing.expectf(t, !dead, "a write that went through took the connection down")
 	testing.expectf(t, r.peer.received == 2 + STALL_QUERY_SIZE, "the peer received %v of %v bytes", r.peer.received, 2 + STALL_QUERY_SIZE)
 }

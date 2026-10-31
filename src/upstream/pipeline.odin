@@ -1379,13 +1379,10 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 		}
 		pipe_set_write_timeout(c, remaining)
 		n, werr := loop.send_tcp(c.stream.socket, framed[sent:])
-		if n > 0 && sent == 0 {
-			bound = pipe_framing_deadline(c, deadline)
-		}
-		sent += max(n, 0)
+		sent += n
 		if werr == nil {
 			// `send_tcp` without an error wrote all of it.
-			continue
+			break
 		}
 		// A send timeout is the peer not reading, which is a different thing
 		// from the peer closing and is counted as such; see `pipe_read_full`
@@ -1395,6 +1392,11 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 		}
 		if n <= 0 {
 			return sent, .Timeout
+		}
+		// The first bytes are away: the rest is owed on the framing budget.
+		// Once, so a send that moved nothing never moves the bound.
+		if n > 0 && sent == n {
+			bound = pipe_framing_deadline(c, deadline)
 		}
 	}
 	return sent, .None
