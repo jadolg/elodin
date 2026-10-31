@@ -197,9 +197,10 @@ stall_rig :: proc(t: ^testing.T, r: ^Stall_Rig, mode: Stall_Mode, drain_at, time
 /*
 Shrink a socket buffer to the kernel's floor, and say whether it took.
 
-Through `setsockopt` rather than `net.set_option`, which on this toolchain
-leaves `SO_SNDBUF` at megabytes whatever it is asked for - and with a buffer
-that size no `send` here ever waits.
+Through `setsockopt` rather than `net.set_option`, whose buffer-size option
+binds the value in a `case` listing several types, where it stays an `any`,
+and hands the kernel the `any`'s data pointer as the size - megabytes, with
+which no `send` here ever waits.
 Read back for the same reason: a setting that did not take reads as a test
 that passes with nothing blocked.
 */

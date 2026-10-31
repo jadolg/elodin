@@ -6,6 +6,7 @@ import "core:mem"
 import "core:net"
 import "core:strconv"
 import "core:strings"
+import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
 import "elodin:tlsx"
@@ -258,7 +259,7 @@ udp_flood :: proc(udp_port: int, query: []u8, count: int, drain := 700 * time.Mi
 	defer net.close(socket)
 	_ = net.set_option(socket, .Receive_Timeout, 50 * time.Millisecond)
 	_ = net.set_option(socket, .Send_Timeout, time.Second)
-	_ = net.set_option(socket, .Receive_Buffer_Size, 4 << 20)
+	set_receive_buffer(socket, 4 << 20)
 
 	endpoint := net.Endpoint {
 		address = net.IP4_Loopback,
@@ -765,7 +766,7 @@ wildcard_flood :: proc(udp_port: int, query: []u8, count: int, drain := 700 * ti
 	for socket in ([]net.UDP_Socket{v4, v6}) {
 		_ = net.set_option(socket, .Receive_Timeout, 50 * time.Millisecond)
 		_ = net.set_option(socket, .Send_Timeout, time.Second)
-		_ = net.set_option(socket, .Receive_Buffer_Size, 4 << 20)
+		set_receive_buffer(socket, 4 << 20)
 	}
 
 	out := make([]u8, len(query), context.temp_allocator)
@@ -861,4 +862,17 @@ tls_resumes :: proc(port: int, version: int, alpn: []string, request: []u8) -> (
 		tlsx.SSL_shutdown(ssl)
 	}
 	return reused, true
+}
+
+/*
+Ask for a receive buffer of `bytes`, which the kernel caps at `rmem_max`.
+
+Through `setsockopt` rather than `net.set_option`: core:net's buffer-size
+option binds the value in a `case` listing several types, where it stays an
+`any`, and hands the kernel the `any`'s data pointer as the size.
+*/
+@(private = "file")
+set_receive_buffer :: proc(socket: net.UDP_Socket, bytes: int) {
+	want := i32(bytes)
+	posix.setsockopt(posix.FD(socket), i32(posix.SOL_SOCKET), .RCVBUF, &want, posix.socklen_t(size_of(want)))
 }

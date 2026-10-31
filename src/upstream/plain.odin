@@ -145,13 +145,9 @@ arm_receive :: proc(socket: net.UDP_Socket, deadline: time.Tick) -> bool {
 
 @(private)
 write_all_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> Error {
-	sent := 0
-	for sent < len(buf) {
-		n, err := loop.send_tcp(socket, buf[sent:])
-		if err != nil || n <= 0 {
-			return .IO_Error
-		}
-		sent += n
+	// One call: `loop.send_tcp` writes the whole buffer or says why not.
+	if _, err := loop.send_tcp(socket, buf); err != nil {
+		return .IO_Error
 	}
 	return .None
 }
