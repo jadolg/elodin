@@ -899,6 +899,12 @@ carrying a second OPT record. `encode_message` writes one, as RFC 6891 section
 the second record gone, which `peek_opt_unreadable` passes where it refuses the
 reply as it arrived (issue #353). Each record past the first is appended to the
 end, written as the encoder writes one.
+
+The encoder leaves those records out of the message itself, and its limit is
+`MAX_MESSAGE` less the room they take, so the message with them appended is
+still one a length prefix can state. A re-encode can outgrow the reply it was
+read from: a name compressed inside RDATA the encoder does not compress, such as
+an SRV target, comes back written in full.
 */
 encode_with_every_opt :: proc(
 	m: Message,
@@ -908,39 +914,35 @@ encode_with_every_opt :: proc(
 	truncated: bool,
 	err: Encode_Error,
 ) {
-	kept := make([dynamic]Record, 0, len(m.additional), context.temp_allocator)
-	extra := make([dynamic]Record, 0, 1, context.temp_allocator)
+	extra := make([dynamic]u8, 0, context.temp_allocator)
+	extras := 0
 	seen := false
 	for rec in m.additional {
-		if rec.type == .OPT {
-			if seen {
-				append(&extra, rec)
-				continue
-			}
-			seen = true
+		if rec.type != .OPT {
+			continue
 		}
-		append(&kept, rec)
+		if !seen {
+			seen = true
+			continue
+		}
+		lone: []u8
+		lone, _, err = encode_message(Message{additional = {rec}}, context.temp_allocator, compress = false)
+		if err != .None {
+			return
+		}
+		append(&extra, ..lone[HEADER_SIZE:])
+		extras += 1
 	}
-	first := m
-	first.additional = kept[:]
 	wire: []u8
-	wire, truncated, err = encode_message(first, context.temp_allocator)
+	wire, truncated, err = encode_message(m, context.temp_allocator, MAX_MESSAGE - len(extra))
 	if err != .None {
 		return
 	}
-	buf := make([dynamic]u8, 0, len(wire), allocator)
-	append(&buf, ..wire)
-	arcount := int(wire[10]) << 8 | int(wire[11])
-	for rec in extra {
-		lone, _, lone_err := encode_message(Message{additional = {rec}}, context.temp_allocator, compress = false)
-		if lone_err != .None {
-			delete(buf)
-			return nil, false, lone_err
-		}
-		append(&buf, ..lone[HEADER_SIZE:])
-		arcount += 1
-	}
-	buf[10] = u8(arcount >> 8)
-	buf[11] = u8(arcount)
-	return buf[:], truncated, .None
+	out = make([]u8, len(wire) + len(extra), allocator)
+	copy(out, wire)
+	copy(out[len(wire):], extra[:])
+	arcount := (int(wire[10]) << 8 | int(wire[11])) + extras
+	out[10] = u8(arcount >> 8)
+	out[11] = u8(arcount)
+	return out, truncated, .None
 }

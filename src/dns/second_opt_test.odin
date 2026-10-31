@@ -111,3 +111,46 @@ an_option_rebuild_keeps_a_second_opt_record :: proc(t: ^testing.T) {
 		testing.expect(t, peek_opt_unreadable(padded), "the padding write handed back the reply with one OPT record")
 	}
 }
+
+/*
+The records a rebuild appends behind the encoder's message fit inside
+`MAX_MESSAGE` with it: the encoder is held back by their room, so a message
+that filled the limit on its own is cut instead of outgrowing it.
+*/
+@(test)
+the_records_every_opt_appends_stay_within_the_limit :: proc(t: ^testing.T) {
+	m := two_opts(0)
+	long := make([]u8, 255, context.temp_allocator)
+	for &b in long {
+		b = 'x'
+	}
+	// 244 TXT records of 268 bytes and one of 103 bring the message, with the
+	// first OPT record, to 65535 bytes exactly.
+	answer := make([]Record, 245, context.temp_allocator)
+	for &rec, i in answer {
+		text := string(long) if i < 244 else string(long[:90])
+		strings := make([]string, 1, context.temp_allocator)
+		strings[0] = text
+		rec = Record {
+			name  = "example.com.",
+			type  = .TXT,
+			class = .IN,
+			ttl   = 60,
+			data  = Rdata_TXT{strings = strings},
+		}
+	}
+	m.answer = answer
+	alone, _, alone_err := encode_message(m, context.temp_allocator)
+	if !testing.expect_value(t, alone_err, Encode_Error.None) {
+		return
+	}
+	testing.expect_value(t, len(alone), MAX_MESSAGE)
+
+	wire, truncated, err := encode_with_every_opt(m, context.temp_allocator)
+	if !testing.expect_value(t, err, Encode_Error.None) {
+		return
+	}
+	testing.expectf(t, len(wire) <= MAX_MESSAGE, "%d bytes, over MAX_MESSAGE", len(wire))
+	testing.expect(t, truncated, "a message cut for the second record's room did not say so")
+	testing.expect(t, peek_opt_unreadable(wire), "the second OPT record is gone")
+}
