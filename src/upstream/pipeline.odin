@@ -865,9 +865,11 @@ pipe_query :: proc(
 		sync.mutex_lock(&c.mu)
 		delete_key(&c.waiters, id)
 		sync.mutex_unlock(&c.mu)
-		// The connection is already dead: a half-written query leaves the
+		// A write that put bytes on the wire, or found the socket broken, has
+		// already killed the connection: a half-written query leaves the
 		// stream out of frame, and `pipe_write` kills it before it lets the
-		// next writer take its turn.
+		// next writer take its turn. One that timed out having sent nothing
+		// leaves it standing.
 		return nil, werr
 	}
 
@@ -1280,25 +1282,21 @@ pipe_write :: proc(c: ^Pipe_Conn, query: []u8, deadline: time.Tick) -> Error {
 	ponytail: the writers still serialize while the first one blocks, which is
 	the price of one connection carrying every query. Per-caller send deadlines
 	would bound the wait for a turn if a peer that stops reading ever turns out
-	to be common enough to matter; what is bounded here is the turn itself.
-
-	ponytail: and the bound below has no test that can fail. A peer that blocks
-	a writer needs its receive window shut and the sender's buffer full, and on
-	loopback the kernel absorbed several megabytes across dozens of concurrent
-	64 KB queries without one `send` ever waiting - so every attempt measured
-	the read that followed instead. What holds it is the argument and the read
-	path, which follows the same rule and is covered three ways.
+	to be common enough to matter; what is bounded here is the turn itself, and
+	pipe_write_test.odin measures the queue against a peer that blocks writers.
 	*/
 	if werr, dead := pipe_dead(c); dead {
 		return werr
 	}
 	sent, err := pipe_write_framed(c, framed, deadline)
-	if err != .None && sent > 0 {
+	if err != .None && (sent > 0 || err != .Timeout) {
 		/*
-		Only when something went out, which is the rule the read path has
-		followed from the start: a transfer that moved nothing left the stream
-		in frame, so what happened is one caller's timeout and not everybody's
-		failure.
+		A timeout only when something went out, which is the rule the read path
+		has followed from the start: a transfer that moved nothing left the
+		stream in frame, so what happened is one caller's timeout and not
+		everybody's failure. Any other failure is the socket's - a reset or a
+		broken pipe fails every write after it the same way - and
+		`exchange_pipelined` retries a query only on a connection it finds dead.
 
 		It bites hardest here. The caller that reaches this with no budget left
 		is one that came out of the dial queue on a sliver - `get_pipe` lets it
@@ -1354,6 +1352,20 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 	is the caller's until something is on the wire, because until then it owes
 	the connection nothing; after that it is `pipe_framing_deadline`, the same
 	rule the reader follows and for the same reason.
+
+	`loop.send_tcp` writes everything or fails, and counts in `n` what it wrote
+	before failing. That count is what moves the bound, and it goes into `sent`
+	whatever the error, because `pipe_write` judges from `sent` whether the
+	stream is still in frame. The common way to block is partway - the window
+	shuts with part of the message through - so a send that timed out having
+	moved the bound goes round again on the new one.
+
+	Only one that wrote something, though. A send that moved nothing either ran
+	out the bound it was set to or was never let wait: a cancelled fiber's every
+	wait ends at once (`loop.cancel`), and so does one the loop failed to
+	register. Round again on either and the loop spins until the bound instead
+	of parking - a whole framing budget of a loop thread, for a fiber that
+	shutdown has cancelled.
 	*/
 	bound := deadline
 	for sent < len(framed) {
@@ -1367,22 +1379,25 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 		}
 		pipe_set_write_timeout(c, remaining)
 		n, werr := loop.send_tcp(c.stream.socket, framed[sent:])
-		if werr != nil {
-			// A send timeout is the peer not reading, which is a different
-			// thing from the peer closing and is counted as such; see
-			// `pipe_read_full` for why Linux reports it as a would-block.
-			if werr == .Timeout || werr == .Would_Block {
-				return sent, .Timeout
-			}
+		sent += n
+		if werr == nil {
+			// `send_tcp` without an error wrote all of it.
+			break
+		}
+		// A send timeout is the peer not reading, which is a different thing
+		// from the peer closing and is counted as such; see `pipe_read_full`
+		// for why Linux reports it as a would-block.
+		if werr != .Timeout && werr != .Would_Block {
 			return sent, .IO_Error
 		}
 		if n <= 0 {
-			return sent, .IO_Error
+			return sent, .Timeout
 		}
-		if sent == 0 {
+		// The first bytes are away: the rest is owed on the framing budget.
+		// Once, so a send that moved nothing never moves the bound.
+		if n > 0 && sent == n {
 			bound = pipe_framing_deadline(c, deadline)
 		}
-		sent += n
 	}
 	return sent, .None
 }
