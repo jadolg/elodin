@@ -32,5 +32,68 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	// Every forwarded and cached answer is read for its RRSIGs' expirations on
 	// the raw bytes, before anything decodes them (issue #165).
 	_, _ = dns.signatures_lapse(data[:size], 0)
+	reencode(data[:size])
+	edit_in_place(data[:size])
 	return 0
+}
+
+/*
+The road `fit_response` takes with an upstream's answer that is over a client's
+limit: decode it, then encode it again with the truncation walk. The limit is the
+input's own ID, floored at the 512 bytes RFC 1035 section 4.2.1 promises every
+UDP client, so the fuzzer steers where the cut lands.
+
+What comes back is checked for the two things the server sends on: it is within
+the limit, and it is a message - one the decoder reads, with the TC bit set
+exactly when a record was cut from the answer or authority section.
+*/
+reencode :: proc(raw: []u8) {
+	m, err := dns.decode_message(raw)
+	if err != .None {
+		return
+	}
+	id, _ := dns.peek_id(raw)
+	limit := max(512, int(id))
+	out, truncated, enc_err := dns.encode_message(m, max_size = limit)
+	if enc_err != .None {
+		return
+	}
+	if len(out) > limit {
+		panic("a re-encoded message outgrew its limit")
+	}
+	again, dec_err := dns.decode_message(out)
+	if dec_err != .None {
+		panic("a re-encoded message does not decode")
+	}
+	if truncated != again.flags.tc && !m.flags.tc {
+		panic("the TC bit disagrees with the cut")
+	}
+}
+
+/*
+The walkers the server runs on an upstream's answer as raw bytes, without
+decoding it first. The ones that write in place get a copy, since libFuzzer's
+input is read-only.
+*/
+edit_in_place :: proc(raw: []u8) {
+	_ = dns.peek_rcode(raw)
+	_ = dns.peek_udp_size(raw)
+	_, _ = dns.peek_question(raw)
+	_, _ = dns.peek_alias_target(raw)
+	_, _ = dns.peek_edns_option(raw, .Cookie)
+	_, _ = dns.strip_edns_options(raw)
+	_, _ = dns.remove_opt(raw)
+
+	// The cache's walk: where the TTLs are, what they say, and the rewrite of
+	// each one as the entry ages.
+	if offsets, ok := dns.scan_ttl_offsets(raw); ok {
+		ttls := dns.read_ttls(raw, offsets)
+		dns.patch_ttls(dns.clone_message_bytes(raw), offsets, ttls, 60, 5)
+	}
+	dns.cap_ttls(dns.clone_message_bytes(raw), 300)
+	// Against the input itself, so the question names match and the copy runs.
+	dns.copy_question_case(dns.clone_message_bytes(raw), raw)
+	_ = dns.set_edns_udp_size(dns.clone_message_bytes(raw), 1232)
+	_ = dns.clear_edns_extended_rcode(dns.clone_message_bytes(raw))
+	_ = dns.set_edns_version_and_flags(dns.clone_message_bytes(raw), 0, true)
 }
