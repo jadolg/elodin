@@ -30,9 +30,10 @@ Readers must not wait on anything inside: the writer waits for them, spinning,
 and a reader that parks holds every writer up for as long as it is parked.
 */
 
-// More than any loop count (`listeners.udp.readers` is at most 8), so the loop
-// threads each have one. A thread past them shares, which is still correct.
-STRIPES :: 16
+// As many as the most loops (`config.MAX_UDP_READERS`, which `server` asserts),
+// so the loop threads each have one. A thread past them shares, which is still
+// correct, only contended.
+STRIPES :: 64
 
 // A count on a cache line of its own. Also what a structure holding a count per
 // stripe - `server.Generation`'s references - is made of.
@@ -58,9 +59,11 @@ assigned: int
 /*
 This thread's stripe, the same one every time it asks.
 
-Handed out in order of first use, so the loop threads, started together, take
-the first few. A thread rather than a fiber: a reader cannot park inside, so a
-fiber never carries a read lock from one thread to another.
+Handed out in order of first use. `loop.run` asks before its first round, so
+the loop threads, started together, take consecutive stripes rather than
+whichever come up when each first answers a query. A thread rather than a fiber:
+a reader cannot park inside, so a fiber never carries a read lock from one
+thread to another.
 */
 stripe :: proc "contextless" () -> int {
 	if mine == 0 {

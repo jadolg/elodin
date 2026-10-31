@@ -146,6 +146,9 @@ Generations :: struct {
 	retired: ^Generation,
 }
 
+// A loop thread per stripe, or two loops share one and contend on it.
+#assert(brlock.STRIPES >= config.MAX_UDP_READERS)
+
 @(private)
 Pin :: struct {
 	server: ^Server,

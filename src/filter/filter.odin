@@ -4,8 +4,8 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
-import "elodin:brlock"
 import "core:unicode"
+import "elodin:brlock"
 import "elodin:dns"
 
 /*

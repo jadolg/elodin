@@ -5,6 +5,7 @@ import "base:runtime"
 import "core:sync"
 import "core:sys/linux"
 import "core:time"
+import "elodin:brlock"
 
 /*
 An event loop: one thread, one epoll instance, and the fibers that take turns on
@@ -207,6 +208,8 @@ replaced per fiber; the loop's thread-local addresses are read here because only
 here is the thread known.
 */
 run :: proc(l: ^Loop) {
+	// Before any query takes one at first use, so each loop has a stripe of its own.
+	brlock.stripe()
 	tl_loop = l
 	defer tl_loop = nil
 	l.ctx = context
