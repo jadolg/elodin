@@ -1,8 +1,10 @@
 package server
 
 import "core:net"
+import "core:strings"
 import "core:testing"
 import "core:time"
+import "elodin:config"
 import "elodin:dns"
 
 /*
@@ -219,5 +221,21 @@ test_a_replayed_cookie_cannot_refuse_the_prefix_connections :: proc(t: ^testing.
 	}
 	testing.expect_value(t, streamed, BURST)
 	testing.expect(t, conn_rate_check(r, neighbour, tick(0)), "the replay spent the connection pool")
+	free_all(context.temp_allocator)
+}
+
+// With cookies on, the byte figure an operator is shown holds twice over, since
+// rescued answers are weighed against a pool of their own; the lines say so.
+@(test)
+test_the_byte_figure_says_a_cookie_doubles_it :: proc(t: ^testing.T) {
+	line, said := rate_limit_denomination_line(500, 128, 1232, context.temp_allocator, cookies = true)
+	testing.expect(t, said && strings.contains(line, COOKIE_RESCUE_BYTES), "the startup line hides the rescue pool's bytes")
+	line, _ = rate_limit_denomination_line(500, 128, 1232, context.temp_allocator)
+	testing.expect(t, !strings.contains(line, COOKIE_RESCUE_BYTES), "the rescue pool was named with cookies off")
+
+	prefix, _ := config.parse_prefix("198.51.100.0/24")
+	overrides := []config.Rate_Limit_Override{{prefix = prefix, responses_per_second = 4000, slip = 2}}
+	lines := rate_limit_override_lines(overrides, 128, 1232, context.temp_allocator, cookies = true)
+	testing.expect(t, len(lines) == 2 && strings.contains(lines[1], COOKIE_RESCUE_BYTES), "an override's line hides the rescue pool's bytes")
 	free_all(context.temp_allocator)
 }

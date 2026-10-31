@@ -227,8 +227,7 @@ The table is fixed at construction and never grows.
 A cache of buckets that allocated per source would be a memory bound written in
 terms of how many distinct addresses an attacker cares to name, which is not a
 bound. Sixteen thousand buckets is 1 MiB - a bucket carries a budget per pool,
-so the figure moves with `Rate_Class`; charging arrivals took it from 768 KB to
-896 KB, and the cookie rescue pool to 1 MiB -
+so the figure moves with `Rate_Class`, at 8 bytes per pool per bucket -
 and more prefixes than a resolver serves; what collides shares a budget, which is
 a limit that is too strict on rare occasions rather than a limit that fails.
 */
@@ -737,7 +736,9 @@ costs a client nothing it had: a busy prefix behind a NAT keeps the datagram
 budget and the slip's TCP invitation it has without one. It is also what keeps
 the cookie off the hot path: the option is read and hashed only for a datagram
 the budget would refuse and `Proven` could pay for, so a flood replaying a
-cookie past an empty `Proven` costs one lock and no hash, as any other does.
+cookie past an empty `Proven` costs one lock and no hash. A flood datagram that
+`Proven` could still pay for costs an OPT walk and a second lock, and a hash only
+if it carries a 24-byte cookie.
 
 `Proven` and not the stream pool, though a cookie proves an address as a
 handshake does, because it proves it for longer. A cookie is good for
@@ -995,16 +996,9 @@ conn_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) 
 	if r == nil {
 		return true
 	}
-	sync.mutex_lock(&r.lock)
-	defer sync.mutex_unlock(&r.lock)
-
-	b := rate_bucket(r, client, now._nsec)
-
-	if b.tokens[.Connection] >= 1 {
-		b.tokens[.Connection] -= 1
+	if spend_token(r, client, now, .Connection) {
 		return true
 	}
-
 	sync.atomic_add(&r.conn_limited, 1)
 	return false
 }
@@ -1013,8 +1007,8 @@ conn_rate_check :: proc(r: ^Rate_Limiter, client: net.Endpoint, now: time.Tick) 
 What every pool has accrued between `last_ns` and `now_ns`, one figure per class.
 
 The elapsed time is converted once and each pool's rate multiplied through it: the
-pools differ only in rate, so a division per pool would be the same division four
-times - on the path every datagram takes, under the table lock.
+pools differ only in rate, so a division per pool would repeat one division for
+every pool - on the path every datagram takes, under the table lock.
 */
 @(private)
 elapsed_tokens :: proc(tier: ^Rate_Tier, last_ns, now_ns: i64) -> (gained: [Rate_Class]f64) {
@@ -1159,18 +1153,22 @@ start_rate_limiter :: proc(l: ^Live) -> bool {
 	// operator reading `500` needs to know it is 500 datagrams, 500 queries on
 	// connections and 500 connections opened, not 500 between them - and that the
 	// truncated answers have a figure of their own, since it is the one thing here
-	// they did not write.
+	// they did not write. With cookies on, the datagrams a server cookie rescues
+	// are a fourth 500.
+	rescued := ", and for datagrams a server cookie rescues" if l.cfg.cookies.enabled else ""
 	if cfg.slip > 0 {
 		logx.infof(
-			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened; 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s, and over a connection nothing is",
+			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened%s; 1 in %d over the datagram budget answered truncated, up to %d truncated answers/s, and over a connection nothing is",
 			cfg.responses_per_second,
+			rescued,
 			cfg.slip,
 			int(l.limiter.tiers[0].rate[.Slip]),
 		)
 	} else {
 		logx.infof(
-			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened; anything over that dropped",
+			"rate limit: %d responses/s per client prefix (/24, /64), counted separately for datagrams, for queries on a connection and for connections opened%s; anything over that dropped",
 			cfg.responses_per_second,
+			rescued,
 		)
 	}
 	/*
@@ -1202,6 +1200,7 @@ start_rate_limiter :: proc(l: ^Live) -> bool {
 		cfg.response_size_estimate,
 		l.cfg.server.max_udp_response,
 		context.temp_allocator,
+		l.cfg.cookies.enabled,
 	); say {
 		logx.infof("%s", text)
 	} else if warning, warn := response_size_estimate_warning(
@@ -1222,11 +1221,16 @@ start_rate_limiter :: proc(l: ^Live) -> bool {
 		cfg.response_size_estimate,
 		l.cfg.server.max_udp_response,
 		context.temp_allocator,
+		l.cfg.cookies.enabled,
 	) {
 		logx.infof("%s", line)
 	}
 	return true
 }
+
+// The byte figure again for the cookie rescue pool, which is weighed the same way.
+@(private)
+COOKIE_RESCUE_BYTES :: ", and as much again in answers a server cookie rescues"
 
 /*
 What `responses_per_second` and `response_size_estimate` multiply out to, which
@@ -1264,15 +1268,19 @@ rate_limit_denomination_line :: proc(
 	estimate: int,
 	ceiling: int,
 	allocator := context.allocator,
+	// `cookies.enabled`: answers a server cookie rescues are weighed against a
+	// pool of their own, so the figure holds twice over. See `datagram_rate_check`.
+	cookies := false,
 ) -> (text: string, say: bool) {
 	if estimate <= 0 || estimate >= ceiling {
 		return "", false
 	}
 	return fmt.aprintf(
-		"rate limit: an answer over %d bytes is charged as several datagrams, so %d responses/s is about %.1M/s of answers at one prefix however large they are",
+		"rate limit: an answer over %d bytes is charged as several datagrams, so %d responses/s is about %.1M/s of answers at one prefix however large they are%s",
 		estimate,
 		responses_per_second,
 		responses_per_second * estimate,
+		COOKIE_RESCUE_BYTES if cookies else "",
 		allocator = allocator,
 	), true
 }
@@ -1355,6 +1363,8 @@ rate_limit_override_lines :: proc(
 	estimate: int = 0,
 	ceiling: int = 0,
 	allocator := context.allocator,
+	// As in `rate_limit_denomination_line`.
+	cookies := false,
 ) -> []string {
 	if len(overrides) == 0 {
 		return nil
@@ -1395,8 +1405,9 @@ rate_limit_override_lines :: proc(
 		budget := ""
 		if estimate > 0 && ceiling > 0 && estimate < ceiling {
 			budget = fmt.aprintf(
-				", about %.1M/s of answers however large they are",
+				", about %.1M/s of answers however large they are%s",
 				int(tier.rate[.Datagram]) * estimate,
+				COOKIE_RESCUE_BYTES if cookies else "",
 				allocator = allocator,
 			)
 		}

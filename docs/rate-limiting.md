@@ -138,7 +138,8 @@ into bytes. An answer larger than the estimate is charged
   can move to TCP.
 
 When the estimate bites, `--check` and the startup line print the byte rate it
-works out to (`62.5KiB/s`), as does each override's line. An estimate above
+works out to (`62.5KiB/s`), as does each override's line; with cookies on, both
+add that rescued answers get as much again. An estimate above
 `max_udp_response`, which can never bite, is called out too.
 
 ### When a /24 is not a household

@@ -265,9 +265,10 @@ run_cookie_rate_limit_cases :: proc(r: ^Runner, upstream_port: int) {
 			/*
 			Both straight after the flood, the plain one first, so the datagram
 			pool has refilled by a twentieth of a token and only the cookie's own
-			pool can pay. The plain one is the premise: sent ahead of the cookie
-			query and answered with nothing, it says the datagram pool was empty
-			when the cookie query arrived, however long the answer then takes.
+			pool can pay. The plain one is the premise: answered with nothing, it
+			says the datagram pool was empty when the cookie query arrived,
+			however long the answer then takes. From one socket, so `SO_REUSEPORT`
+			hands both to the same reader in the order they were sent.
 			*/
 			probe, serr := net.make_unbound_udp_socket(.IP4)
 			if !check(r, serr == nil, "cannot open the probe socket") {
@@ -275,21 +276,41 @@ run_cookie_rate_limit_cases :: proc(r: ^Runner, upstream_port: int) {
 				return
 			}
 			defer net.close(probe)
-			plain := build_query(f.qname, f.qtype, id = 0x4245, edns_size = 1232)
-			_, _ = net.send_udp(probe, plain, net.Endpoint{address = net.IP4_Loopback, port = udp_port})
+			_ = net.set_option(probe, .Receive_Timeout, 400 * time.Millisecond)
+			to := net.Endpoint{address = net.IP4_Loopback, port = udp_port}
+			_, _ = net.send_udp(probe, build_query(f.qname, f.qtype, id = 0x4245, edns_size = 1232), to)
+			_, _ = net.send_udp(probe, build_query(f.qname, f.qtype, id = 0x4246, edns_size = 1232, cookie = issued), to)
 
-			proven := build_query(f.qname, f.qtype, id = 0x4246, edns_size = 1232, cookie = issued)
-			res := query_udp(udp_port, proven, timeout = 2 * time.Second)
-			if check(r, res.ok, "a client with a valid server cookie was dropped with the flood") {
-				h := parse_header(r, res.wire)
+			// Until the cookie query is answered and the socket has gone quiet
+			// after it, so a plain answer arriving either side of it is seen.
+			answer: []u8
+			plain_answered := false
+			buf: [4096]u8
+			deadline := time.time_add(time.now(), 2 * time.Second)
+			for time.diff(time.now(), deadline) > 0 {
+				n, _, rerr := net.recv_udp(probe, buf[:])
+				if rerr != nil {
+					if answer != nil {
+						break
+					}
+					continue
+				}
+				if n < dns.HEADER_SIZE {
+					continue
+				}
+				switch u16(buf[0]) << 8 | u16(buf[1]) {
+				case 0x4245:
+					plain_answered = true
+				case 0x4246:
+					answer = slice.clone(buf[:n], context.temp_allocator)
+				}
+			}
+			if check(r, answer != nil, "a client with a valid server cookie was dropped with the flood") {
+				h := parse_header(r, answer)
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode")
 				check(r, h.ancount > 0, "the cookie client was not answered")
 			}
-
-			_ = net.set_option(probe, .Receive_Timeout, 400 * time.Millisecond)
-			buf: [512]u8
-			_, _, rerr := net.recv_udp(probe, buf[:])
-			check(r, rerr != nil, "a query without a cookie was answered, so the budget is not spent")
+			check(r, !plain_answered, "a query without a cookie was answered, so the budget is not spent")
 		}
 	}
 	end_case(r)

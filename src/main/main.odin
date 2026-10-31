@@ -550,6 +550,7 @@ main :: proc() {
 				cfg.server.rate_limit.response_size_estimate,
 				cfg.server.max_udp_response,
 				context.temp_allocator,
+				cfg.cookies.enabled,
 			); say {
 				fmt.printfln("  %s", text)
 			}
@@ -565,6 +566,7 @@ main :: proc() {
 				cfg.server.rate_limit.response_size_estimate,
 				cfg.server.max_udp_response,
 				context.temp_allocator,
+				cfg.cookies.enabled,
 			) {
 				fmt.printfln("  %s", line)
 			}
