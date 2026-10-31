@@ -155,6 +155,7 @@ test_swap_waits_for_matches_on_other_threads :: proc(t: ^testing.T) {
 		e:       ^Engine,
 		stop:    bool,
 		started: int,
+		matched: int,
 		wrong:   int,
 	}
 	sh := new(Shared)
@@ -173,13 +174,17 @@ test_swap_waits_for_matches_on_other_threads :: proc(t: ^testing.T) {
 				if engine_match(sh.e, "www.blocked.example.", .A) != .Blocked {
 					sync.atomic_add(&sh.wrong, 1)
 				}
+				sync.atomic_add(&sh.matched, 1)
 			}
 		})
 	}
 	for sync.atomic_load(&sh.started) < len(readers) {
 		thread.yield()
 	}
-	for _ in 0 ..< 2000 {
+	// Until the readers have matched against the swaps, however the threads
+	// are scheduled, rather than for a number of swaps they might all sleep through.
+	before := sync.atomic_load(&sh.matched)
+	for swaps := 0; swaps < 2000 || sync.atomic_load(&sh.matched) - before < 1000; swaps += 1 {
 		nb, na := build("blocked.example\n", .Domains)
 		ob, oa := engine_swap(sh.e, nb, na)
 		set_destroy(ob)
