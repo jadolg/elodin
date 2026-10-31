@@ -19,7 +19,9 @@ config_cookies :: proc(
 	udp_port, upstream_port: int,
 	require: bool,
 	// The `server.rate_limit` mapping, for the case that needs the budget small.
-	rate_limit := "enabled: false",
+	// On by default, as shipped, so every case runs through the read loop's
+	// cookie check ahead of the limiter.
+	rate_limit := "enabled: true",
 ) -> string {
 	return fmt.tprintf(
 		`log: {{ level: warn }}

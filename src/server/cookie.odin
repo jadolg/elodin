@@ -191,10 +191,9 @@ address, read off the wire ahead of any parse.
 
 A valid one is proof that the sender received a datagram this server sent to
 that address, so an answer to it is going to whoever asked and cannot be part of
-a reflection attack. That is what the UDP read loop asks this for: such a
-datagram is charged to the stream pool, as a query over a handshake is, and not
-to the datagram pool a spoofed flood naming the same prefix is emptying. See
-`datagram_rate_check`.
+a reflection attack. That is what the UDP read loop asks this for: a datagram
+the datagram pool would refuse is charged to the stream pool instead, as a query
+over a handshake is, if it proves its source. See `datagram_rate_check`.
 
 Only a full 24-byte cookie can be valid, and everything short of the hash is
 checked before the hash is taken, so a datagram with none costs an OPT walk and

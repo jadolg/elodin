@@ -94,11 +94,15 @@ test_a_cookie_client_is_not_dropped_with_a_flood_naming_its_prefix :: proc(t: ^t
 	free_all(context.temp_allocator)
 }
 
-// Exempt from the datagram pool, not from limiting: the stream pool bounds a
-// cookie client as it bounds one on a connection, and an empty one drops.
+/*
+A cookie costs a client nothing it had: the datagram pool pays first and keeps
+the slip, the stream pool is spent only on what it turned away, and with both
+empty the slip's verdict stands.
+*/
 @(test)
-test_a_cookie_client_is_bounded_by_the_stream_pool :: proc(t: ^testing.T) {
+test_a_cookie_client_spends_the_datagram_pool_first :: proc(t: ^testing.T) {
 	RATE :: 10
+	BURST :: RATE * RRL_BURST_SECONDS
 	r := make_rate_limiter(RATE, 2)
 	defer destroy_rate_limiter(r)
 	k := Cookie_Keeper{secret = SECRET}
@@ -107,21 +111,56 @@ test_a_cookie_client_is_bounded_by_the_stream_pool :: proc(t: ^testing.T) {
 	cookie := issued_to(&k, client)
 	query := cookie_query(cookie[:])
 
-	allowed := 0
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS * 4 {
-		if v, _ := datagram_rate_check(r, &k, query, client, tick(0)); v == .Allow {
-			allowed += 1
+	on_datagram, on_stream := 0, 0
+	for _ in 0 ..< BURST * 2 {
+		v, proven := datagram_rate_check(r, &k, query, client, tick(0))
+		testing.expect_value(t, v, Rate_Verdict.Allow)
+		if proven {
+			on_stream += 1
+		} else {
+			testing.expectf(t, on_stream == 0, "the datagram pool paid after the stream pool had")
+			on_datagram += 1
 		}
 	}
-	testing.expect_value(t, allowed, RATE * RRL_BURST_SECONDS)
-	// Over it, refused with no slip: a TC bit would send the client to TCP,
-	// which is charged to the pool it has just emptied.
-	v, _ := datagram_rate_check(r, &k, query, client, tick(0))
-	testing.expect_value(t, v, Rate_Verdict.Drop)
-	// And the datagram pool was not touched.
-	testing.expect(t, stream_rate_check(r, client, tick(0)) == false, "the stream pool was not the one charged")
-	testing.expect_value(t, rate_check(r, client, tick(0)), Rate_Verdict.Allow)
+	testing.expect_value(t, on_datagram, BURST)
+	testing.expect_value(t, on_stream, BURST)
+	testing.expect(t, !stream_rate_check(r, client, tick(0)), "the stream pool was not the one that paid second")
+
+	// Both empty: the datagram pool's slip still offers TCP.
+	truncated := 0
+	for _ in 0 ..< 4 {
+		if v, proven := datagram_rate_check(r, &k, query, client, tick(0)); v == .Truncate {
+			truncated += 1
+			testing.expect(t, !proven, "a slip was reported as paid by the stream pool")
+		}
+	}
+	testing.expect_value(t, truncated, 2)
 	free_all(context.temp_allocator)
+}
+
+// What a rescued answer weighs is billed to the pool that admitted it, so a
+// cookie that outlived its address aims no more bytes at it than a datagram.
+@(test)
+test_a_rescued_answer_is_billed_to_the_stream_pool :: proc(t: ^testing.T) {
+	RATE :: 10
+	BURST :: RATE * RRL_BURST_SECONDS
+	r := make_rate_limiter(RATE, 0, response_size_estimate = 100)
+	defer destroy_rate_limiter(r)
+	client := net.Endpoint{address = net.IP4_Address{192, 0, 2, 5}, port = 30000}
+
+	// Ten tokens' worth, nine beyond the one the admission took.
+	rate_charge_response(r, client, 1000, tick(0), .Stream)
+	streamed, datagrams := 0, 0
+	for _ in 0 ..< BURST {
+		if stream_rate_check(r, client, tick(0)) {
+			streamed += 1
+		}
+		if rate_check(r, client, tick(0)) == .Allow {
+			datagrams += 1
+		}
+	}
+	testing.expect_value(t, streamed, BURST - 9)
+	testing.expect_value(t, datagrams, BURST)
 }
 
 // `::ffff:a.b.c.d` hashes as the sixteen bytes it arrived as on both paths, so

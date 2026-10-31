@@ -41,10 +41,10 @@ section 5.2.2).
   `require` says. It is logged as `detail=cookie`. With `enabled: false`,
   without a COOKIE option, with one of an impossible length, or from a client
   address no cookie can be bound to, a query with no question is FORMERR.
-- A UDP query with a valid server cookie is charged to the [rate
-  limiter's](rate-limiting.md#rate-limiting) stream budget rather than its
-  datagram budget, as BIND and Knot exempt it from RRL, so a flood spoofing the
-  client's prefix does not get it dropped.
+- A UDP query with a valid server cookie that the [rate
+  limiter's](rate-limiting.md#rate-limiting) datagram budget would refuse is
+  charged to its stream budget instead, so a flood spoofing the client's prefix
+  does not get it dropped. BIND and Knot exempt such a query from RRL entirely.
 - `require: true` with `enabled: false` is rejected at startup.
 - Set `secret` when several elodin instances answer on one address; otherwise
   each rejects the cookies the others issued.
