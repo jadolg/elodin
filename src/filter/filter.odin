@@ -5,6 +5,7 @@ import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
 import "core:unicode"
+import "elodin:brlock"
 import "elodin:dns"
 
 /*
@@ -85,7 +86,9 @@ Set :: struct {
 }
 
 Engine :: struct {
-	mu:         sync.RW_Mutex,
+	// Taken by every match, so a striped lock rather than an `RW_Mutex`: see
+	// `brlock` for what one word all the readers write costs.
+	lock:       brlock.Lock,
 	block:      ^Set,
 	allow:      ^Set,
 	/*
@@ -104,15 +107,15 @@ Engine :: struct {
 	lists it was matched against are gone.
 	*/
 	generation: u64,
-	// Rule counts, and the running query and block totals.
+	// Rule counts. What was asked and what was blocked is the server's to
+	// count, once per query, and a shared counter here would be written by every
+	// thread on every match.
 	stats:      Stats,
 }
 
 Stats :: struct {
 	block_rules: int,
 	allow_rules: int,
-	queries:     u64,
-	blocked:     u64,
 }
 
 set_make :: proc() -> ^Set {
@@ -369,12 +372,12 @@ engine_swap :: proc(e: ^Engine, block, allow: ^Set) -> (old_block, old_allow: ^S
 	if allow != nil {
 		table_trim(&allow.names)
 	}
-	sync.rw_mutex_lock(&e.mu)
-	defer sync.rw_mutex_unlock(&e.mu)
+	brlock.write_lock(&e.lock)
+	defer brlock.write_unlock(&e.lock)
 	old_block, old_allow = e.block, e.allow
 	e.block, e.allow = block, allow
 	// An atomic read-modify-write, not a plain read and an atomic store: the
-	// exclusive lock keeps other *writers* out and says nothing about the
+	// write lock keeps other *writers* out and says nothing about the
 	// lock-free readers in `engine_generation`, so a plain load here would be
 	// one half of a race with them.
 	sync.atomic_add(&e.generation, 1)
@@ -390,7 +393,7 @@ A caller that takes this number before matching, and stamps it onto what it
 stores, cannot credit its result to a set that arrived after the match began: it
 stamps the older number and is told to match again, which is the harmless
 direction. `engine_swap` publishes the sets before it moves the number, both
-under the exclusive lock, so a reader that has seen the new number is matching
+under the write lock, so a reader that has seen the new number is matching
 against the new sets.
 
 Read without taking the lock; see below for why the write side makes that safe.
@@ -401,14 +404,14 @@ engine_generation :: proc(e: ^Engine) -> u64 {
 	}
 	/*
 	Read without the lock, which the write side makes safe: `generation` is only
-	ever moved inside `engine_swap`, under the exclusive lock, by one store. So
+	ever moved inside `engine_swap`, under the write lock, by one store. So
 	an atomic load sees either the number before that store or the number after
-	it, which is exactly what the shared lock guaranteed and is all a caller
+	it, which is exactly what the read lock guarantees and is all a caller
 	needs - the stamp it then writes is compared for equality, never ordered
 	against another reader's.
 
 	Worth the paragraph because this is on the hot path: it runs once per query
-	on top of the shared lock `engine_match` takes for the question and one more
+	on top of the read lock `engine_match` takes for the question and one more
 	per name in the chain, and it was a second lock round trip for a number that
 	changes when a list is reloaded and at no other time.
 	*/
@@ -440,10 +443,9 @@ engine_match :: proc(e: ^Engine, name: string, qtype: dns.Type, typed_only: ^boo
 		return .None
 	}
 
-	sync.rw_mutex_shared_lock(&e.mu)
-	defer sync.rw_mutex_shared_unlock(&e.mu)
+	stripe := brlock.read_lock(&e.lock)
+	defer brlock.read_unlock(&e.lock, stripe)
 
-	sync.atomic_add(&e.stats.queries, 1)
 	if set_cover(e.allow, key, qtype) != .None {
 		return .Allowed
 	}
@@ -459,7 +461,6 @@ engine_match :: proc(e: ^Engine, name: string, qtype: dns.Type, typed_only: ^boo
 	if listed == .None {
 		return .None
 	}
-	sync.atomic_add(&e.stats.blocked, 1)
 	if typed_only != nil {
 		// The zero filter alone in `filters`: the allow set holds no `$dnstype`
 		// rule (`type_keep`), and most never do.
@@ -473,14 +474,9 @@ engine_match :: proc(e: ^Engine, name: string, qtype: dns.Type, typed_only: ^boo
 }
 
 engine_stats :: proc(e: ^Engine) -> Stats {
-	sync.rw_mutex_shared_lock(&e.mu)
-	defer sync.rw_mutex_shared_unlock(&e.mu)
-	return Stats {
-		block_rules = e.stats.block_rules,
-		allow_rules = e.stats.allow_rules,
-		queries = sync.atomic_load(&e.stats.queries),
-		blocked = sync.atomic_load(&e.stats.blocked),
-	}
+	stripe := brlock.read_lock(&e.lock)
+	defer brlock.read_unlock(&e.lock, stripe)
+	return e.stats
 }
 
 // A query spells a control or non-ASCII byte as \DDD, so a rule holding one raw
