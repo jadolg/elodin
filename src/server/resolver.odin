@@ -1259,8 +1259,8 @@ resolve_query :: proc(
 
 	One rule for everything this server answers for itself, and this is it:
 	below the rewrites and the block lists, above the cache and the RD gate. The
-	rewrites so an operator who wants to designate this server's own DoT or DoH
-	endpoints can say so and be obeyed; the block lists so that an entry an
+	rewrites so that a rule an operator wrote for a name in `resolver.arpa` is
+	obeyed over the `ddr.name` designation; the block lists so that an entry an
 	operator wrote down wins and is counted as blocked, rather than a table
 	answering first and leaving the list looking like it did nothing.
 

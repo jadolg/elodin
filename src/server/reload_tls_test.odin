@@ -362,8 +362,11 @@ test_ddr_check_reads_the_certificate_only_and_stays_offline :: proc(t: ^testing.
 	testing.expectf(t, len(warnings) == 0, "warned with no rewrite to judge: %v", warnings)
 
 	cfg.ddr.name = "not-on-the-certificate.example."
-	problems, _ = ddr_check(&cfg, context.temp_allocator)
-	testing.expectf(t, len(problems) == 1 && strings.contains(problems[0], "does not cover"), "an uncovered name: %v", problems)
+	// The server serves this certificate and designates nothing through it, so
+	// it is a warning: an error would say the server does not start.
+	problems, warnings = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(problems) == 0, "an uncovered name was called unusable: %v", problems)
+	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "is not designated"), "an uncovered name: %v", warnings)
 
 	cfg.ddr.name = "elodin.local."
 	cfg.listeners.dot.cert_file = "/nonexistent/cert.pem"
@@ -380,7 +383,9 @@ test_ddr_check_reads_the_certificate_only_and_stays_offline :: proc(t: ^testing.
 	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "192.0.2.1"), "an address off this machine: %v", warnings)
 	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {127, 0, 0, 1}}}}}
 	_, warnings = ddr_check(&cfg, context.temp_allocator)
-	testing.expectf(t, len(warnings) == 0, "loopback, which the 0.0.0.0 listener takes: %v", warnings)
+	// Bound, since the 0.0.0.0 listener takes it, but loopback: only this
+	// machine reaches it, which the address in the designation says to LAN clients.
+	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "on loopback"), "loopback: %v", warnings)
 	// The unspecified address binds, but a client sent to it reaches itself.
 	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {0, 0, 0, 0}}}}}
 	_, warnings = ddr_check(&cfg, context.temp_allocator)
@@ -393,5 +398,11 @@ test_ddr_check_reads_the_certificate_only_and_stays_offline :: proc(t: ^testing.
 	cfg.listeners.doh.address = "127.0.0.2"
 	cfg.listeners.doh.cert_file = cert
 	_, warnings = ddr_check(&cfg, context.temp_allocator)
-	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "listeners.doh"), "a DoH listener off the address: %v", warnings)
+	// The loopback warning, and one naming DoH and not DoT.
+	testing.expectf(
+		t,
+		len(warnings) == 2 && strings.contains(warnings[1], "listeners.doh") && !strings.contains(warnings[1], "listeners.dot"),
+		"a DoH listener off the address: %v",
+		warnings,
+	)
 }

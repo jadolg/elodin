@@ -270,14 +270,20 @@ machine's resolver may be this server, stopped: the certificates are read, the
 keys are not - a key only the service account can read is no fault of the file -
 and no name is looked up.
 
-`problems` are what the listeners would refuse to start on: a certificate that
-does not cover the name, or cannot be read. `warnings` are about the addresses
-this server hands a client for the name, which are those of its `rewrites` rule
-(`ddr_addresses`): a rule that sinks the name, or addresses none of which a
-designated listener on this machine is bound to, judged per listener. The second is not refused, since
-a port forwarded from elsewhere is a reason it may be right, but a client
-following it reaches some other host. A name with no rule resolves wherever its
-public DNS says, which nothing offline can judge.
+`problems` are what the server would not start on: a certificate that cannot be
+read. Everything else is a warning, since the server starts on it:
+
+- a certificate that does not cover the name, whose listener the server serves
+  but does not designate (see `ddr_designate`);
+- a rewrite that sinks the name;
+- a rewrite address on loopback, which only clients on this machine can reach;
+- rewrite addresses none of which a listener is bound to, judged per listener.
+  A port forwarded from elsewhere can make that right, but otherwise a client
+  following the designation reaches some other host.
+
+The addresses are those this server hands a client for the name: its `rewrites`
+rule (`ddr_addresses`). A name with no rule resolves wherever its public DNS
+says, which nothing offline can judge.
 */
 ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (problems: []string, warnings: []string) {
 	if cfg.ddr.name == "" {
@@ -300,9 +306,9 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 			append(&bad, fmt.aprintf("listeners.%s.cert_file: %q holds no certificate that can be read", l.key, l.ln.cert_file, allocator = allocator))
 		} else if !covered {
 			append(
-				&bad,
+				&warn,
 				fmt.aprintf(
-					"ddr.name: the certificate of listeners.%s (%s) does not cover %s, so it cannot be designated",
+					"ddr.name: the certificate of listeners.%s (%s) does not cover %s, so it is not designated",
 					l.key,
 					l.ln.cert_file,
 					host,
@@ -327,15 +333,36 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 	if len(addresses) == 0 {
 		return bad[:], warn[:]
 	}
+	// Asked of the kernel once per address, not once per listener as well.
+	local := make([dynamic]net.Address, context.temp_allocator)
+	list := make([dynamic]string, context.temp_allocator)
+	loopback := make([dynamic]string, context.temp_allocator)
+	for a in addresses {
+		text := net.address_to_string(a, context.temp_allocator)
+		append(&list, text)
+		if is_loopback(a) {
+			append(&loopback, text)
+		}
+		if is_local_address(a) {
+			append(&local, a)
+		}
+	}
+	if len(loopback) > 0 {
+		append(
+			&warn,
+			fmt.aprintf(
+				"ddr.name: the rewrite for %s gives %s, on loopback, which only clients on this machine can reach",
+				host,
+				strings.join(loopback[:], ", ", context.temp_allocator),
+				allocator = allocator,
+			),
+		)
+	}
 	v6only := bindv6only()
 	// Each listener is designated on its own, so each is judged on its own.
 	for l in listeners {
-		if !l.ln.enabled || ddr_reaches_listener(l.ln, addresses[:], v6only) {
+		if !l.ln.enabled || ddr_reaches_listener(l.ln, local[:], v6only) {
 			continue
-		}
-		list := make([dynamic]string, context.temp_allocator)
-		for a in addresses {
-			append(&list, net.address_to_string(a, context.temp_allocator))
 		}
 		append(
 			&warn,
@@ -351,14 +378,14 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 	return bad[:], warn[:]
 }
 
-// Whether any of `addresses` is one of this machine's own that `ln` is bound to,
+// Whether `ln` is bound to any of `local`, this machine's own addresses,
 // directly or through the wildcard of its family. `::` takes IPv4 too unless
 // `v6only`: the sockets leave IPV6_V6ONLY at the kernel's default, which is
 // `net.ipv6.bindv6only`.
 @(private)
-ddr_reaches_listener :: proc(ln: config.Listener, addresses: []net.Address, v6only: bool) -> bool {
-	for a in addresses {
-		if is_local_address(a) && ddr_bound_to(ln, a, v6only) {
+ddr_reaches_listener :: proc(ln: config.Listener, local: []net.Address, v6only: bool) -> bool {
+	for a in local {
+		if ddr_bound_to(ln, a, v6only) {
 			return true
 		}
 	}

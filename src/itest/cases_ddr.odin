@@ -11,7 +11,7 @@ import "elodin:tlsx"
 Discovery of Designated Resolvers from the shipped binary (#218): with `ddr.name`
 set, `_dns.resolver.arpa` SVCB names this server's own DoT and DoH listeners
 (RFC 9462 section 4, SvcParams per RFC 9461), and a name the certificate does
-not cover is refused by `--check` and left undesignated at startup.
+not cover is warned about by `--check` and left undesignated by the server.
 */
 
 @(private = "file")
@@ -71,31 +71,36 @@ run_ddr_cases :: proc(r: ^Runner) {
 			msg, err := dns.decode_message(res.wire, context.temp_allocator)
 			if check(r, res.ok && err == .None, "no answer to the DDR probe") &&
 			   check(r, len(msg.answer) == 2, "%d SVCB records, want one per encrypted listener", len(msg.answer)) {
-				dot := msg.answer[0].data.(dns.Rdata_SVCB)
-				doh := msg.answer[1].data.(dns.Rdata_SVCB)
-				check(r, dot.target == "elodin.local." && doh.target == "elodin.local.", "targets %q %q", dot.target, doh.target)
-				check(r, string(dot.params) == svc_wire("\x03dot", dot_port, ""), "DoT params % x", dot.params)
-				check(r, string(doh.params) == svc_wire("\x02h2\x08http/1.1", doh_port, "/dns-query{?dns}"), "DoH params % x", doh.params)
-				check(
-					r,
-					len(msg.additional) == 1 && msg.additional[0].data.(dns.Rdata_A).addr == [4]u8{127, 0, 0, 1},
-					"the rewrite's address is not in the additional section: %v",
-					msg.additional,
-				)
+				// Checked, not asserted: a record of the wrong type fails this case,
+				// not the whole run.
+				dot, dot_ok := msg.answer[0].data.(dns.Rdata_SVCB)
+				doh, doh_ok := msg.answer[1].data.(dns.Rdata_SVCB)
+				if check(r, dot_ok && doh_ok, "the answers are not SVCB: %v", msg.answer) {
+					check(r, dot.target == "elodin.local." && doh.target == "elodin.local.", "targets %q %q", dot.target, doh.target)
+					check(r, string(dot.params) == svc_wire("\x03dot", dot_port, ""), "DoT params % x", dot.params)
+					check(r, string(doh.params) == svc_wire("\x02h2\x08http/1.1", doh_port, "/dns-query{?dns}"), "DoH params % x", doh.params)
+				}
+				glue_ok := false
+				if len(msg.additional) == 1 {
+					glue, is_a := msg.additional[0].data.(dns.Rdata_A)
+					glue_ok = is_a && glue.addr == [4]u8{127, 0, 0, 1}
+				}
+				check(r, glue_ok, "the rewrite's address is not in the additional section: %v", msg.additional)
 			}
 		}
 	}
 	end_case(r)
 
-	start_case(r, "ddr: a name the certificate does not cover is refused by --check and not designated at startup (#218)")
+	start_case(r, "ddr: a name the certificate does not cover is warned by --check and not designated (#218)")
 	{
 		udp_port, dot_port, doh_port := next_port(r), next_port(r), next_port(r)
 		config := ddr_config(r, udp_port, dot_port, doh_port, "not-on-the-certificate.example")
 		path := filepath.join({r.work_dir, "ddr-uncovered.yaml"}, context.temp_allocator) or_else ""
 		_ = os.write_entire_file(path, transmute([]u8)config)
 		res := run_binary(r, []string{"--config", path, "--check"}, "ddr-uncovered")
-		check(r, res.ok && res.exit_code != 0, "--check passed a designation the certificate does not cover")
-		check(r, strings.contains(res.output, "does not cover not-on-the-certificate.example"), "--check did not say why: %q", res.output)
+		// A warning, not a failure: the server starts on this file, as below.
+		check(r, res.ok && res.exit_code == 0, "--check failed a file the server starts on: %q", res.output)
+		check(r, strings.contains(res.output, "warning: ddr.name: the certificate of listeners.dot") && strings.contains(res.output, "is not designated"), "--check did not warn: %q", res.output)
 
 		/*
 		Startup serves the certificate and designates nothing, as a reload does

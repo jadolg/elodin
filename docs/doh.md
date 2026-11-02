@@ -72,18 +72,23 @@ ddr:
   `resolver.arpa`, and needs DoT or DoH enabled. With DoH it also needs a `path`
   a URI template takes as written: none of ``"'<>\^`{|}``, spaces, or a `%` that does not start a
   `%XX` escape.
-- `--check` refuses a listener whose certificate does not cover `name`,
-  matching a DNS SAN only: a whole-label wildcard counts, while a partial one
-  (`d*.example.com`) or the subject CN does not (RFC 9525 section 6.3). It reads
-  the certificate only, not the key, and looks nothing up.
-- The server itself still serves such a certificate, at startup or after a
-  reload, and logs `ddr.name: the certificate of listeners.<dot|doh> does not
-  cover <name>` (`no longer covers` after a reload). That listener is not
-  designated until a certificate that covers `name` is loaded.
-- `--check` warns when the `rewrites` rule for `name` sinks it, or gives only
-  addresses that a designated DoT or DoH listener on this machine is not bound to (a `::`
-  listener takes IPv4 unless `net.ipv6.bindv6only` is 1). Without a rule there
-  is nothing local to judge.
+- A listener is designated only while its certificate covers `name` through a
+  DNS SAN. A whole-label wildcard counts. A partial wildcard (`d*.example.com`)
+  or the subject CN does not (RFC 9525 section 6.3).
+- A listener whose certificate does not cover `name` is still served, at startup
+  or after a reload, and is not designated. The server logs `ddr.name: the
+  certificate of listeners.<dot|doh> does not cover <name>` (`no longer covers`
+  after a reload), and `--check` warns. `--check` reads the certificate only,
+  not the key, and looks nothing up.
+- `--check` fails on a certificate it cannot read. It warns when the
+  `rewrites` rule for `name` does any of these:
+  - sinks it;
+  - gives a loopback address, which only this machine reaches;
+  - gives only addresses that a DoT or DoH listener here is not bound to. Each
+    listener is judged on its own, and a `::` listener takes IPv4 unless
+    `net.ipv6.bindv6only` is 1.
+
+  Without a rule there is nothing local to judge.
 - `ddr` needs a restart to change.
 - A `rewrites` rule for `_dns.resolver.arpa` wins over this.
 
@@ -107,8 +112,9 @@ Device Management**; the device then sends all its DNS here over HTTPS.
 - The profile's `ServerURL` is built from the authority the request arrived on.
   A listener answering on several names hands each device a profile for the one
   it used.
-- That authority must be one the listener can be reached at: a host its
-  certificate covers, with no port, port 443, or `listeners.doh.port`, written in
+- That authority must be one the listener can be reached at: a host a DNS SAN
+  of its certificate covers (a whole-label wildcard counts; the subject CN and
+  a partial wildcard such as `d*.example.com` do not), with no port, port 443, or `listeners.doh.port`, written in
   plain decimal with no leading zero. Anything else gets a **400**. So behind a
   NAT forwarding a public port that is neither 443 nor the bound port (8443 to
   9443, say), bind elodin to the public port or have devices reach it on 443.
