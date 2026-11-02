@@ -186,6 +186,27 @@ test_reverse_rewrite_answers_a_configured_address :: proc(t: ^testing.T) {
 }
 
 /*
+The reverse walks the rules as the forward answer does: a wildcard alias below
+a rule holding records for the name cannot answer it, so the address rule after
+the alias is what `A host.lan` gets, and the PTR for that address names it.
+*/
+@(test)
+test_reverse_rewrite_walks_past_an_alias_as_the_forward_answer_does :: proc(t: ^testing.T) {
+	rules := make([]config.Rewrite, 3, context.temp_allocator)
+	rules[0] = config.Rewrite{domain = "host.lan.", answers = answers_of({kind = .MX, name = "mx.lan.", preference = 10}), ttl = 60}
+	rules[1] = config.Rewrite{domain = "lan.", wildcard = true, answers = answers_of({kind = .CNAME, name = "elsewhere.example."}), ttl = 60}
+	rules[2] = config.Rewrite{domain = "host.lan.", answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}), ttl = 60, ptr = true}
+
+	i, found := rewrite_rule_for(rules, "host.lan.", .A)
+	testing.expect(t, found && i == 2, "the forward answer is not the address rule")
+	domain, _, ptr_found := reverse_rewrite_target(rules, "50.1.168.192.in-addr.arpa.")
+	testing.expect(t, ptr_found, "the address the forward answer gives has no reverse")
+	testing.expect_value(t, domain, "host.lan.")
+
+	free_all(context.temp_allocator)
+}
+
+/*
 Two names for one address is legal, so one of them has to be chosen, and the
 choice is the one an operator can predict: the first rule in the file, which is
 the precedence `find_rewrite` gives the forward direction.

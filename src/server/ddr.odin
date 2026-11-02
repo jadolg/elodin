@@ -403,12 +403,14 @@ is_local_address :: proc(a: net.Address) -> bool {
 	if a == net.IP4_Any || a == net.IP6_Any {
 		return false
 	}
-	socket, err := net.make_bound_udp_socket(a, 0)
+	// Created and bound in two steps: `make_bound_udp_socket` hands back the
+	// socket it could not bind still open, and that is the usual case here.
+	socket, err := net.make_unbound_udp_socket(net.family_from_address(a))
 	if err != nil {
 		return false
 	}
-	net.close(socket)
-	return true
+	defer net.close(socket)
+	return net.bind(socket, {a, 0}) == .None
 }
 
 // Whether the listener `ln` accepts connections to `a`, as bound.

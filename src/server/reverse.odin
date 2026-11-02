@@ -284,17 +284,11 @@ rewrite_naming_address :: proc(
 /*
 The rule that answers an address query for `name` with `want`, if one does.
 
-This is `apply_rewrite`'s search written for one question, and it has to stay
-that search: a PTR asserts what an address is called, and the assertion is only
-true if asking that name for its address really does come back with this
-address.
-
-Three ways a rule ends the walk. It hands out `want`, and the assertion holds.
-It claims the name without handing out `want` - an address of its own, an alias,
-`block` - and the name resolves to something else, or to nothing. Or there are
-no more matching rules, and the name is the upstream's business. A rule that
-claims nothing and holds no address of this family answers a different question
-entirely, so the walk goes past it exactly as the forward direction does.
+It is `rewrite_rule_for`, the search `apply_rewrite` answers by, and it has to
+be: a PTR asserts what an address is called, and the assertion is only true if
+asking that name for its address really does come back with this address. The
+rule that answers the address question either hands out `want` or the name
+resolves to something else, or to nothing.
 */
 @(private)
 answering_rule :: proc(
@@ -305,20 +299,8 @@ answering_rule :: proc(
 	index: int,
 	found: bool,
 ) {
-	from := 0
-	for {
-		i, matched := find_rewrite_index(rules, name, from)
-		if !matched {
-			return 0, false
-		}
-		if rule_hands_out(rules[i], want) {
-			return i, true
-		}
-		if rule_claims_name(rules[i]) {
-			return 0, false
-		}
-		from = i + 1
-	}
+	i := rewrite_rule_for(rules, name, .A if want.kind == .A else .AAAA) or_return
+	return i, rule_hands_out(rules[i], want)
 }
 
 // Whether `r` gives out `want` to a client that asks for its name: it lists the
