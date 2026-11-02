@@ -222,10 +222,12 @@ These are served without AD, because there is no chain to walk:
 
 ## resolver.arpa
 
-`resolver.arpa` is answered NODATA rather than forwarded (RFC 9462 section 6.1).
-Forwarded, it would return the upstream's designated resolvers, and a client that
-used them would bypass the block lists, rewrites and query log. A `rewrites` rule
-for the name still wins, to advertise this server's own endpoints.
+`resolver.arpa` is answered here rather than forwarded (RFC 9462 section 6.1):
+NODATA, or this server's own DoT/DoH endpoints when `ddr.name` is set (see
+[discovery by clients](doh.md#discovery-by-clients-ddr)). Forwarded, it would
+return the upstream's designated resolvers, and a client that used them would
+bypass the block lists, rewrites and query log. A `rewrites` rule for the name
+still wins.
 
 ## Watch out
 

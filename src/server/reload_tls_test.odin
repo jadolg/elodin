@@ -1,6 +1,7 @@
 package server
 
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -61,6 +62,9 @@ generate_cert :: proc() {
 				"2",
 				"-subj",
 				"/CN=elodin.local",
+				// The DDR tests need the name in a SAN; a CN covers nothing.
+				"-addext",
+				"subjectAltName=DNS:elodin.local,DNS:localhost,IP:127.0.0.1",
 			},
 		},
 	)
@@ -287,4 +291,118 @@ test_rotate_ticket_keys_reaches_dot_and_doh :: proc(t: ^testing.T) {
 	doh_after, hok := tlsx.ticket_key_name(doh)
 	testing.expect(t, dok && dot_after != dot_before, "the DoT ticket key did not rotate")
 	testing.expect(t, hok && doh_after != doh_before, "the DoH ticket key did not rotate")
+}
+
+/*
+A designation follows the certificate the listener serves (RFC 9462 section 4.2:
+the client holds the designated name to it). One that covers `ddr.name` is
+designated; a renewal that drops the name is still swapped in - refusing it would
+leave an expiring certificate serving every client - but stops the designation.
+*/
+@(test)
+test_reload_tls_designates_only_while_the_certificate_covers_ddr_name :: proc(t: ^testing.T) {
+	cert, key, ok := ensure_cert()
+	if !ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+	first, ferr := tlsx.server_context(cert, key, DOT_ALPN)
+	if ferr != .None {
+		testing.expectf(t, false, "server_context: %v", ferr)
+		return
+	}
+
+	cfg := config.default_config()
+	cfg.listeners.dot.cert_file = cert
+	cfg.listeners.dot.key_file = key
+	l := Listeners{}
+	l.dot_ctx = first
+	l.dot_open = true
+	s := Server{cfg = &cfg}
+	defer tlsx.context_destroy(l.dot_ctx)
+
+	cfg.ddr.name = "elodin.local."
+	testing.expect(t, ddr_designate(&s, .DoT, first), "a certificate for elodin.local was said not to cover it")
+	testing.expect(t, s.ddr.dot, "a covered name left the DoT listener undesignated")
+
+	cfg.ddr.name = "not-on-the-certificate.example."
+	before := l.dot_ctx
+	testing.expect(t, reload_tls(&s, &l), "a certificate that loads was refused for not covering ddr.name")
+	testing.expect(t, l.dot_ctx != before, "the renewed certificate was not swapped in")
+	testing.expect(t, !s.ddr.dot, "the DoT listener is still designated under a certificate that does not cover the name")
+	testing.expect(t, !ddr_designate(&s, .DoT, l.dot_ctx), "an uncovered name was reported as fine")
+
+	cfg.ddr.name = ""
+	testing.expect(t, ddr_designate(&s, .DoT, l.dot_ctx), "no name at all was reported as a problem")
+	testing.expect(t, !s.ddr.dot, "the DoT listener is designated with no name to designate")
+}
+
+/*
+`--check` on `ddr.name` reads the certificates and not the keys, and looks no
+name up: a package install runs it while this server, the machine's resolver,
+may be stopped, and a key only the service account can read is no fault of the
+configuration.
+*/
+@(test)
+test_ddr_check_reads_the_certificate_only_and_stays_offline :: proc(t: ^testing.T) {
+	cert, _, ok := ensure_cert()
+	if !ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+	cfg := config.default_config()
+	cfg.listeners.dot.enabled = true
+	cfg.listeners.dot.cert_file = cert
+	cfg.listeners.dot.key_file = "/nonexistent/key.pem"
+
+	cfg.ddr.name = "elodin.local."
+	problems, warnings := ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(problems) == 0, "a covered name with an unreadable key: %v", problems)
+	// No rewrite, so nothing local to judge, and nothing is looked up.
+	testing.expectf(t, len(warnings) == 0, "warned with no rewrite to judge: %v", warnings)
+
+	cfg.ddr.name = "not-on-the-certificate.example."
+	// The server serves this certificate and designates nothing through it, so
+	// it is a warning: an error would say the server does not start.
+	problems, warnings = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(problems) == 0, "an uncovered name was called unusable: %v", problems)
+	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "is not designated"), "an uncovered name: %v", warnings)
+
+	cfg.ddr.name = "elodin.local."
+	cfg.listeners.dot.cert_file = "/nonexistent/cert.pem"
+	problems, _ = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(problems) == 1 && strings.contains(problems[0], "cert_file"), "an unreadable certificate: %v", problems)
+	cfg.listeners.dot.cert_file = cert
+
+	// A rewrite that sinks the name, and one that sends it off this machine.
+	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .Block}}}}
+	_, warnings = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "sinks"), "a sunk name: %v", warnings)
+	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {192, 0, 2, 1}}}}}
+	_, warnings = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "192.0.2.1"), "an address off this machine: %v", warnings)
+	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {127, 0, 0, 1}}}}}
+	_, warnings = ddr_check(&cfg, context.temp_allocator)
+	// Bound, since the 0.0.0.0 listener takes it, but loopback: only this
+	// machine reaches it, which the address in the designation says to LAN clients.
+	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "on loopback"), "loopback: %v", warnings)
+	// The unspecified address binds, but a client sent to it reaches itself.
+	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {0, 0, 0, 0}}}}}
+	_, warnings = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "0.0.0.0"), "the unspecified address: %v", warnings)
+	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {127, 0, 0, 1}}}}}
+
+	// Each designated listener is judged on its own: the DoT listener taking the
+	// address does not make the DoH designation reachable there.
+	cfg.listeners.doh.enabled = true
+	cfg.listeners.doh.address = "127.0.0.2"
+	cfg.listeners.doh.cert_file = cert
+	_, warnings = ddr_check(&cfg, context.temp_allocator)
+	// The loopback warning, and one naming DoH and not DoT.
+	testing.expectf(
+		t,
+		len(warnings) == 2 && strings.contains(warnings[1], "listeners.doh") && !strings.contains(warnings[1], "listeners.dot"),
+		"a DoH listener off the address: %v",
+		warnings,
+	)
 }

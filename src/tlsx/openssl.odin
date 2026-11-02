@@ -103,6 +103,10 @@ is what makes the signed file a replacement for the unsigned one rather than a
 signature alongside it.
 */
 CMS_BINARY :: 0x80
+// x509v3.h: a `*` only as a whole leftmost label, never inside one.
+X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS :: 0x4
+// x509v3.h: a name is matched against the DNS SANs only, never the subject's CN.
+X509_CHECK_FLAG_NEVER_CHECK_SUBJECT :: 0x20
 CMS_NOSMIMECAP :: 0x200
 
 TLSEXT_NAMETYPE_host_name :: 0
@@ -244,6 +248,7 @@ foreign libcrypto {
 	BIO_s_mem :: proc() -> ^BIO_METHOD ---
 	BIO_ctrl :: proc(bp: ^BIO, cmd: c.int, larg: c.long, parg: rawptr) -> c.long ---
 	BIO_free :: proc(a: ^BIO) -> c.int ---
+	PEM_read_bio_X509 :: proc(bp: ^BIO, x: ^^X509, cb: rawptr, u: rawptr) -> ^X509 ---
 
 	CMS_sign :: proc(signcert: ^X509, pkey: ^EVP_PKEY, certs: ^OPENSSL_STACK, data: ^BIO, flags: c.uint) -> ^CMS_ContentInfo ---
 	CMS_ContentInfo_free :: proc(cms: ^CMS_ContentInfo) ---

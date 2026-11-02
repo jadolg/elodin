@@ -82,6 +82,7 @@ load_string :: proc(src: string, allocator := context.allocator, tls_files := tr
 		"blocking",
 		"dnssec",
 		"cookies",
+		"ddr",
 		"rebind",
 		"special_use",
 		"metrics",
@@ -95,6 +96,7 @@ load_string :: proc(src: string, allocator := context.allocator, tls_files := tr
 	load_blocking(&l, &cfg)
 	load_dnssec(&l, &cfg)
 	load_cookies(&l, &cfg)
+	load_ddr(&l, &cfg)
 	load_rebind(&l, &cfg)
 	load_special_use(&l, &cfg)
 	load_metrics(&l, &cfg)
@@ -1876,6 +1878,118 @@ load_cookies :: proc(l: ^Loader, cfg: ^Config) {
 	opt_string(l, n, "secret", &cfg.cookies.secret, "cookies")
 }
 
+@(private)
+load_ddr :: proc(l: ^Loader, cfg: ^Config) {
+	n := yaml.get(l.root, "ddr")
+	if n == nil {
+		return
+	}
+	check_keys(l, n, "ddr", "name")
+	written: string
+	opt_string(l, n, "name", &written, "ddr")
+	// Refused as written: `canonical_domain` trims Unicode space, so a trailing
+	// no-break space would otherwise reach `check_ddr` already gone.
+	for c in transmute([]u8)written {
+		if c <= ' ' || c >= 0x7f {
+			errorf(l, "ddr.name: %q must be a hostname, the one the certificate of the DoT or DoH listener covers", written)
+			return
+		}
+	}
+	if written != "" {
+		cfg.ddr.name = canonical_domain(written, l.allocator)
+	}
+}
+
+/*
+What `ddr.name` must be to stand as a designation.
+
+A hostname, because it is the SVCB TargetName a client resolves and the name it
+holds the encrypted listener's certificate to; an address is neither. Not the
+root nor anything in `resolver.arpa`, which RFC 9462 section 4 says a TargetName
+MUST NOT be. And something to designate: a name with no DoT or DoH listener
+enabled would be answered NODATA all the same, from a file that looks as if it
+said otherwise.
+
+Whether the certificate covers the name is checked where the certificate is
+read - `--check` and the listeners - since the loader does not open it.
+*/
+@(private)
+check_ddr :: proc(l: ^Loader, cfg: ^Config) {
+	name := cfg.ddr.name
+	if name == "" {
+		return
+	}
+	bare := strings.trim_suffix(name, ".")
+	if bare == "" || domain_at_or_below(name, "resolver.arpa.") {
+		errorf(l, "ddr.name: %q cannot be designated: RFC 9462 section 4 forbids the root and resolver.arpa as the target", name)
+		return
+	}
+	if !is_ldh_hostname(bare) {
+		errorf(l, "ddr.name: %q must be a hostname, the one the certificate of the DoT or DoH listener covers", name)
+		return
+	}
+	if !name_fits_the_wire(l, name, "ddr.name") {
+		return
+	}
+	if !cfg.listeners.dot.enabled && !cfg.listeners.doh.enabled {
+		errorf(l, "ddr.name: nothing to designate: neither listeners.dot nor listeners.doh is enabled")
+	}
+	/*
+	The `dohpath` is the DoH path with `{?dns}` after it (RFC 9461 section 5),
+	and a URI template takes a literal only outside the characters RFC 6570
+	section 2.1 reserves for its own syntax, and a `%` only as a pct-encoding.
+	*/
+	if cfg.listeners.doh.enabled && !uri_template_literal(cfg.listeners.doh.path) {
+		errorf(
+			l,
+			"ddr.name: listeners.doh.path %q cannot be written as a dohpath (RFC 9461 section 5): it holds a character a URI template does not take as written",
+			cfg.listeners.doh.path,
+		)
+	}
+}
+
+// Letters, digits and hyphens in labels of 1 to 63 bytes, none starting or
+// ending with a hyphen (RFC 1123 section 2.1), and not numeric at the end.
+@(private)
+is_ldh_hostname :: proc(s: string) -> bool {
+	if netx.is_numeric_name(s) {
+		return false
+	}
+	for label in strings.split(s, ".", context.temp_allocator) {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label) - 1] == '-' {
+			return false
+		}
+		for c in transmute([]u8)label {
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// Whether `s` is all literals of an RFC 6570 URI template (section 2.1).
+@(private)
+uri_template_literal :: proc(s: string) -> bool {
+	for i := 0; i < len(s); i += 1 {
+		switch s[i] {
+		case 0 ..= ' ', 0x7f ..= 0xff, '"', '\'', '<', '>', '\\', '^', '`', '{', '|', '}':
+			return false
+		case '%':
+			if i + 2 >= len(s) || !is_hex(s[i + 1]) || !is_hex(s[i + 2]) {
+				return false
+			}
+			i += 2
+		}
+	}
+	return true
+}
+
+@(private)
+is_hex :: proc(c: u8) -> bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
 /*
 Read the `rebind` section.
 
@@ -2697,6 +2811,8 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			errorf(l, "listeners.doh.mobileconfig_path: must not be the same as listeners.doh.path")
 		}
 	}
+
+	check_ddr(l, cfg)
 
 	if cfg.metrics.enabled {
 		if !strings.has_prefix(cfg.metrics.path, "/") {

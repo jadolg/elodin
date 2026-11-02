@@ -485,6 +485,15 @@ main :: proc() {
 	misrouted := route_shaped_rules(&cfg, context.temp_allocator)
 
 	if opts.check_only {
+		// The certificates are read here, which the loader does not do.
+		ddr_problems, ddr_warnings := server.ddr_check(&cfg, context.temp_allocator)
+		if len(ddr_problems) > 0 {
+			fmt.eprintfln("elodin: %s is not usable:", opts.config_path)
+			for msg in ddr_problems {
+				fmt.eprintfln("  - %s", msg)
+			}
+			os.exit(1)
+		}
 		fmt.printfln("%s is valid: %d upstreams, %d zone routes, %d blocklists, %d rewrites",
 			opts.config_path,
 			len(cfg.upstream.servers),
@@ -587,6 +596,9 @@ main :: proc() {
 		}
 		for key in cfg.retired {
 			fmt.printfln("  warning: %s", config.retired_warning(key))
+		}
+		for text in ddr_warnings {
+			fmt.printfln("  warning: %s", text)
 		}
 		return
 	}

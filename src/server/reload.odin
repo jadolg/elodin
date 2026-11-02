@@ -211,6 +211,9 @@ keep_restart_only :: proc(boot, cfg: ^config.Config, allocator := context.alloca
 	hold(&changed, "listeners.dot", boot.listeners.dot, &cfg.listeners.dot)
 	hold(&changed, "listeners.doh", boot.listeners.doh, &cfg.listeners.doh)
 	hold(&changed, "metrics", boot.metrics, &cfg.metrics)
+	// It names what the listeners above serve, and their certificates were
+	// checked against it when they were loaded.
+	hold(&changed, "ddr", boot.ddr, &cfg.ddr)
 	/*
 	Not keys, and nothing a reload changes: the heavy decode slots are set once,
 	process-wide, and the retired keys do nothing whatever the file says about

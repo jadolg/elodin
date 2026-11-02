@@ -1524,6 +1524,8 @@ start_dot :: proc(s: ^Server, l: ^Listeners) -> bool {
 		return false
 	}
 	l.dot_ctx = ctx
+	// Not designated, rather than not started: see `ddr_designate`.
+	ddr_designate(s, .DoT, ctx)
 	if !start_stream_listener(s, l, cfg, .DoT, &l.dot_socket, &l.dot_open) {
 		return false
 	}
@@ -1540,6 +1542,8 @@ start_doh :: proc(s: ^Server, l: ^Listeners) -> bool {
 		return false
 	}
 	l.doh_ctx = ctx
+	// Not designated, rather than not started: see `ddr_designate`.
+	ddr_designate(s, .DoH, ctx)
 	if cfg.mobileconfig_path != "" {
 		s.profiles = make_profile_signer(ctx, cfg.path, cfg.port)
 		warn_unsigned_profiles(s.profiles)
@@ -1578,12 +1582,12 @@ fiber reads them as it starts, on whichever loop it is on, hence `l.tls_mu`.
 reload_tls :: proc(s: ^Server, l: ^Listeners) -> bool {
 	ok := true
 	if l.dot_open {
-		if !reload_tls_ctx(l, &l.dot_ctx, startup_config(s).listeners.dot, DOT_ALPN, "dot", nil) {
+		if !reload_tls_ctx(s, l, .DoT, &l.dot_ctx, startup_config(s).listeners.dot, DOT_ALPN, "dot", nil) {
 			ok = false
 		}
 	}
 	if l.doh_open {
-		if !reload_tls_ctx(l, &l.doh_ctx, startup_config(s).listeners.doh, DOH_ALPN, "doh", s.profiles) {
+		if !reload_tls_ctx(s, l, .DoH, &l.doh_ctx, startup_config(s).listeners.doh, DOH_ALPN, "doh", s.profiles) {
 			ok = false
 		}
 	}
@@ -1592,7 +1596,9 @@ reload_tls :: proc(s: ^Server, l: ^Listeners) -> bool {
 
 @(private)
 reload_tls_ctx :: proc(
+	s: ^Server,
 	l: ^Listeners,
+	listener: Protocol,
 	slot: ^^tlsx.Context,
 	cfg: config.Listener,
 	alpn: []string,
@@ -1642,6 +1648,8 @@ reload_tls_ctx :: proc(
 	*/
 	profile_signer_adopt(profiles, fresh)
 	logx.infof("listeners.%s: reloaded the certificate from %s", name, cfg.cert_file)
+	// Kept even when it no longer covers `ddr.name`: see `ddr_designate`.
+	ddr_designate(s, listener, fresh, reloaded = true)
 	return true
 }
 

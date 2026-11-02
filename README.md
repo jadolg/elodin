@@ -21,6 +21,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
   EDNS(0) padding on DoT and DoH — all on by default
 - DNS rebinding protection, off by default so split horizon keeps working
 - A `.mobileconfig` profile that points Apple devices at the DoH endpoint
+- Discovery of its own DoT/DoH endpoints over DDR (RFC 9462), off by default
 - A Prometheus endpoint, off by default
 - Configuration reloads on `SIGHUP`, keeping the cache, cookies and connections
 - Ships as a systemd service or a `.deb`, with optional system-resolver takeover
@@ -98,7 +99,7 @@ tasks, the layout of the source and how it is tested.
 | [Upstreams](docs/upstreams.md) | strategies, timeouts, failover, bootstrap, and per-domain routes |
 | [Sink lists](docs/blocking.md) | list formats, allow rules, CNAME inspection |
 | [Cache](docs/cache.md) | bounds, TTL handling, prefetching, coalescing, serve-stale |
-| [DNS-over-HTTPS](docs/doh.md) | the DoH endpoint and the Apple `.mobileconfig` profile |
+| [DNS-over-HTTPS](docs/doh.md) | the DoH endpoint, DDR discovery and the Apple `.mobileconfig` profile |
 | [DNSSEC](docs/dnssec.md) | validation, its bounds, trust anchors, names served insecure |
 | [Who may ask](docs/access-control.md) | the client allow list and the RD bit |
 | [Rate limiting and answer size](docs/rate-limiting.md) | the UDP answer ceiling, per-prefix budgets, overrides |
