@@ -175,9 +175,12 @@ cert_covers_host :: proc(cert: ^X509, host: string) -> bool {
 	// name that is checked to a prefix of the name that gets served. A wildcard
 	// matches only as the whole leftmost label, as the clients that check this
 	// certificate hold it (RFC 9525 section 6.3); OpenSSL alone would also let
-	// `d*.example.com` cover `dns.example.com`.
+	// `d*.example.com` cover `dns.example.com`. Only a DNS SAN covers a name:
+	// those clients never read the subject's CN (RFC 9525 section 6.3), which
+	// OpenSSL alone falls back to on a certificate with no DNS SAN.
 	bytes := transmute([]u8)host
-	return X509_check_host(cert, raw_data(bytes), c.size_t(len(bytes)), X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, nil) == 1
+	flags := c.uint(X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS | X509_CHECK_FLAG_NEVER_CHECK_SUBJECT)
+	return X509_check_host(cert, raw_data(bytes), c.size_t(len(bytes)), flags, nil) == 1
 }
 
 /*

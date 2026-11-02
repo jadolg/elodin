@@ -380,3 +380,38 @@ test_a_partial_wildcard_covers_nothing :: proc(t: ^testing.T) {
 	_, read = cert_file_covers_host(key, "a.whole.test")
 	testing.expect(t, !read, "a key file read as a certificate")
 }
+
+// A name in the subject's CN and in no DNS SAN covers nothing: the clients that
+// check the certificate read only the SANs (RFC 9525 section 6.3).
+@(test)
+test_a_common_name_covers_nothing :: proc(t: ^testing.T) {
+	if !os.exists(CERT_DIR) {
+		_ = os.make_directory(CERT_DIR)
+	}
+	cert, key := CERT_DIR + "/cn-only.pem", CERT_DIR + "/cn-only-key.pem"
+	code, ok := run_openssl(
+		{
+			"req",
+			"-x509",
+			"-newkey",
+			"ec",
+			"-pkeyopt",
+			"ec_paramgen_curve:prime256v1",
+			"-nodes",
+			"-keyout",
+			key,
+			"-out",
+			cert,
+			"-days",
+			"2",
+			"-subj",
+			"/CN=dns.example.test",
+		},
+	)
+	if !testing.expect(t, ok && code == 0, "openssl could not make the certificate") {
+		return
+	}
+	covered, read := cert_file_covers_host(cert, "dns.example.test")
+	testing.expect(t, read, "the certificate did not read")
+	testing.expect(t, !covered, "a CN with no DNS SAN covered the name")
+}

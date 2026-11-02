@@ -4190,23 +4190,23 @@ apply_rewrite :: proc(
 		return nil, false, nil
 	}
 	rule := live(s).cfg.rewrites[i]
+	if rule_blocks(rule) {
+		return build_block_response(s, query, q, allocator, limit), true, nil
+	}
 
 	answers := make([dynamic]dns.Record, 0, len(rule.answers), allocator)
-	blocked := false
-
 	for a in rule.answers {
 		switch a.kind {
 		case .Block:
-			blocked = true
 		case .A:
-			if q.type == .A || q.type == .ANY {
+			if kind_answers(a.kind, q.type) {
 				append(
 					&answers,
 					dns.Record{name = q.name, type = .A, class = .IN, ttl = rule.ttl, data = dns.Rdata_A{addr = a.v4}},
 				)
 			}
 		case .AAAA:
-			if q.type == .AAAA || q.type == .ANY {
+			if kind_answers(a.kind, q.type) {
 				append(
 					&answers,
 					dns.Record {
@@ -4231,7 +4231,7 @@ apply_rewrite :: proc(
 				},
 			)
 		case .MX:
-			if q.type == .MX || q.type == .ANY {
+			if kind_answers(a.kind, q.type) {
 				append(
 					&answers,
 					dns.Record {
@@ -4244,7 +4244,7 @@ apply_rewrite :: proc(
 				)
 			}
 		case .TXT:
-			if q.type == .TXT || q.type == .ANY {
+			if kind_answers(a.kind, q.type) {
 				append(
 					&answers,
 					dns.Record {
@@ -4257,7 +4257,7 @@ apply_rewrite :: proc(
 				)
 			}
 		case .SRV:
-			if q.type == .SRV || q.type == .ANY {
+			if kind_answers(a.kind, q.type) {
 				append(
 					&answers,
 					dns.Record {
@@ -4287,12 +4287,6 @@ apply_rewrite :: proc(
 	upstream. A client that needs the address asks for it, which is what every
 	client already does when a real server declines to glue.
 	*/
-
-	if blocked {
-		return build_block_response(s, query, q, allocator, limit), true, nil
-	}
-
-
 
 	resp := dns.make_response(query, .No_Error, allocator)
 	resp.answer = answers[:]
@@ -4584,25 +4578,39 @@ rule_blocks :: proc(rule: config.Rewrite) -> bool {
 }
 
 // Whether the rule has a record `apply_rewrite` would put in the answer to a
-// `qtype` question: one of that type, any for ANY, and a CNAME for every type.
+// `qtype` question.
 @(private)
 rule_answers_type :: proc(rule: config.Rewrite, qtype: dns.Type) -> bool {
 	for a in rule.answers {
-		switch a.kind {
-		case .CNAME:
+		if kind_answers(a.kind, qtype) {
 			return true
-		case .Block:
-		case .A:
-			if qtype == .A || qtype == .ANY {return true}
-		case .AAAA:
-			if qtype == .AAAA || qtype == .ANY {return true}
-		case .MX:
-			if qtype == .MX || qtype == .ANY {return true}
-		case .TXT:
-			if qtype == .TXT || qtype == .ANY {return true}
-		case .SRV:
-			if qtype == .SRV || qtype == .ANY {return true}
 		}
+	}
+	return false
+}
+
+/*
+Whether an answer of `kind` goes into the answer to a `qtype` question: one of
+that type, any for ANY, and a CNAME for every type. The one rule both
+`apply_rewrite` building an answer and `rewrite_rule_for` choosing a rule go by.
+*/
+@(private)
+kind_answers :: proc(kind: config.Rewrite_Kind, qtype: dns.Type) -> bool {
+	switch kind {
+	case .CNAME:
+		return true
+	case .Block:
+		return false
+	case .A:
+		return qtype == .A || qtype == .ANY
+	case .AAAA:
+		return qtype == .AAAA || qtype == .ANY
+	case .MX:
+		return qtype == .MX || qtype == .ANY
+	case .TXT:
+		return qtype == .TXT || qtype == .ANY
+	case .SRV:
+		return qtype == .SRV || qtype == .ANY
 	}
 	return false
 }

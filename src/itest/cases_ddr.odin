@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
-import "core:time"
 import "elodin:dns"
 import "elodin:tlsx"
 
@@ -12,7 +11,7 @@ import "elodin:tlsx"
 Discovery of Designated Resolvers from the shipped binary (#218): with `ddr.name`
 set, `_dns.resolver.arpa` SVCB names this server's own DoT and DoH listeners
 (RFC 9462 section 4, SvcParams per RFC 9461), and a name the certificate does
-not cover is refused by `--check` and at startup.
+not cover is refused by `--check` and left undesignated at startup.
 */
 
 @(private = "file")
@@ -88,7 +87,7 @@ run_ddr_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
-	start_case(r, "ddr: a name the certificate does not cover is refused by --check and at startup (#218)")
+	start_case(r, "ddr: a name the certificate does not cover is refused by --check and not designated at startup (#218)")
 	{
 		udp_port, dot_port, doh_port := next_port(r), next_port(r), next_port(r)
 		config := ddr_config(r, udp_port, dot_port, doh_port, "not-on-the-certificate.example")
@@ -98,14 +97,19 @@ run_ddr_cases :: proc(r: ^Runner) {
 		check(r, res.ok && res.exit_code != 0, "--check passed a designation the certificate does not cover")
 		check(r, strings.contains(res.output, "does not cover not-on-the-certificate.example"), "--check did not say why: %q", res.output)
 
-		srv, started := start_server_raw(r, config, udp_port)
-		if check(r, started, "cannot start the binary") {
+		/*
+		Startup serves the certificate and designates nothing, as a reload does
+		with a renewal that drops the name: refusing it here would turn the next
+		restart after such a renewal into no resolver at all.
+		*/
+		srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, dot_port = dot_port, doh_port = doh_port})
+		if check(r, ok, "the server did not start on a certificate that does not cover ddr.name") {
 			defer stop_server(&srv)
-			state, werr := os.process_wait(srv.process, 10 * time.Second)
-			if check(r, werr == nil && state.exited, "the server started designating a name its certificate does not cover") {
-				srv.running = false
-				check(r, state.exit_code != 0, "the refusal exited 0")
-				check(r, log_contains(&srv, "does not cover not-on-the-certificate.example"), "the refusal does not name the name:\n%s", read_log(&srv))
+			check(r, log_contains(&srv, "does not cover not-on-the-certificate.example"), "startup did not say why nothing is designated:\n%s", read_log(&srv))
+			res := query_udp(udp_port, build_query("_dns.resolver.arpa.", u16(dns.Type.SVCB), allocator = context.temp_allocator))
+			msg, err := dns.decode_message(res.wire, context.temp_allocator)
+			if check(r, res.ok && err == .None, "no answer to the DDR probe") {
+				check(r, len(msg.answer) == 0 && len(msg.authority) == 1, "an uncovered listener was designated: %v", msg.answer)
 			}
 		}
 	}

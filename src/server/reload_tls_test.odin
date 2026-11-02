@@ -62,6 +62,9 @@ generate_cert :: proc() {
 				"2",
 				"-subj",
 				"/CN=elodin.local",
+				// The DDR tests need the name in a SAN; a CN covers nothing.
+				"-addext",
+				"subjectAltName=DNS:elodin.local,DNS:localhost,IP:127.0.0.1",
 			},
 		},
 	)
@@ -378,6 +381,11 @@ test_ddr_check_reads_the_certificate_only_and_stays_offline :: proc(t: ^testing.
 	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {127, 0, 0, 1}}}}}
 	_, warnings = ddr_check(&cfg, context.temp_allocator)
 	testing.expectf(t, len(warnings) == 0, "loopback, which the 0.0.0.0 listener takes: %v", warnings)
+	// The unspecified address binds, but a client sent to it reaches itself.
+	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {0, 0, 0, 0}}}}}
+	_, warnings = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "0.0.0.0"), "the unspecified address: %v", warnings)
+	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {127, 0, 0, 1}}}}}
 
 	// Each designated listener is judged on its own: the DoT listener taking the
 	// address does not make the DoH designation reachable there.

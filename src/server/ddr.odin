@@ -51,9 +51,8 @@ only where it is not the protocol's default - the key is automatically
 mandatory, so a client that does not support it drops the record - and, for DoH,
 `dohpath`. It is unsigned under a signed `arpa`, the same shape as the NODATA, and
 is never cached or forwarded. A listener is designated only while its
-certificate covers `ddr.name`: the listener refuses to start on one that does
-not, and a renewal that drops the name stops that listener's designation rather
-than send clients to a certificate they cannot verify. See `ddr_designate`.
+certificate covers `ddr.name`, rather than send clients to a certificate they
+cannot verify. See `ddr_designate`.
 
 `rewrites` are applied ahead of all this, and a rule for the name wins, in the
 same spirit as a trust anchor overriding the locally-served bypass.
@@ -86,6 +85,13 @@ Called when a DoT or DoH listener loads its certificate, at startup and on every
 reload. Returns false when a name is set and not covered, for the caller to say
 so; nothing is designated through that listener until a certificate that covers
 it is loaded.
+
+The listener serves the certificate either way, at startup as on a reload. A
+renewal that drops the name is kept by a reload, since refusing it would leave
+an expiring certificate serving every client; a startup that refused the same
+certificate would turn the next restart after that renewal into a resolver that
+does not come up at all, Do53 included. Losing the designation costs only the
+upgrade; `--check` is where the mismatch is an error, before a restart.
 */
 ddr_designate :: proc(s: ^Server, listener: Protocol, ctx: ^tlsx.Context) -> bool {
 	name := strings.trim_suffix(startup_config(s).ddr.name, ".")
@@ -362,10 +368,14 @@ ddr_reaches_listener :: proc(ln: config.Listener, addresses: []net.Address, v6on
 /*
 Whether `a` is one of this machine's own addresses: the kernel binds a socket only
 to those. Asked of the kernel rather than read from an interface listing, which
-`core:net` returns empty on Linux.
+`core:net` returns empty on Linux. The unspecified address binds too, but it is
+no address of this machine: a client sent to it connects to itself.
 */
 @(private)
 is_local_address :: proc(a: net.Address) -> bool {
+	if a == net.IP4_Any || a == net.IP6_Any {
+		return false
+	}
 	socket, err := net.make_bound_udp_socket(a, 0)
 	if err != nil {
 		return false

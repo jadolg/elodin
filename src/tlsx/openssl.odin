@@ -105,6 +105,8 @@ signature alongside it.
 CMS_BINARY :: 0x80
 // x509v3.h: a `*` only as a whole leftmost label, never inside one.
 X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS :: 0x4
+// x509v3.h: a name is matched against the DNS SANs only, never the subject's CN.
+X509_CHECK_FLAG_NEVER_CHECK_SUBJECT :: 0x20
 CMS_NOSMIMECAP :: 0x200
 
 TLSEXT_NAMETYPE_host_name :: 0
