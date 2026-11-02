@@ -78,7 +78,7 @@ ddr:
   `ddr.name: the certificate of listeners.<dot|doh> no longer covers <name>`, and
   stops that listener being designated until one that does is loaded.
 - `--check` warns when the `rewrites` rule for `name` sinks it, or gives only
-  addresses that no encrypted listener on this machine is bound to (a `::`
+  addresses that a designated DoT or DoH listener on this machine is not bound to (a `::`
   listener takes IPv4 unless `net.ipv6.bindv6only` is 1). Without a rule there
   is nothing local to judge.
 - `ddr` needs a restart to change.

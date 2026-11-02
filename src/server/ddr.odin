@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "elodin:config"
@@ -143,7 +144,9 @@ build_resolver_arpa_response :: proc(
 	if len(resp.answer) == 0 {
 		resp.authority = synth_soa_for_zone(RESOLVER_ARPA, RESOLVER_ARPA_TTL, allocator)
 	} else {
-		resp.additional = ddr_addresses(live(s).cfg, allocator)
+		// Behind the client's OPT record rather than over it, so the encoder keeps
+		// that record's room as the addresses fill the section.
+		resp.additional = slice.concatenate([][]dns.Record{resp.additional, ddr_addresses(live(s).cfg, allocator)}, allocator)
 	}
 
 	// Addresses that do not fit are dropped by the encoder without TC: they only
@@ -264,8 +267,8 @@ and no name is looked up.
 `problems` are what the listeners would refuse to start on: a certificate that
 does not cover the name, or cannot be read. `warnings` are about the addresses
 this server hands a client for the name, which are those of its `rewrites` rule
-(`ddr_addresses`): a rule that sinks the name, or addresses none of which an
-encrypted listener on this machine is bound to. The second is not refused, since
+(`ddr_addresses`): a rule that sinks the name, or addresses none of which a
+designated listener on this machine is bound to, judged per listener. The second is not refused, since
 a port forwarded from elsewhere is a reason it may be right, but a client
 following it reaches some other host. A name with no rule resolves wherever its
 public DNS says, which nothing offline can judge.
@@ -315,7 +318,15 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 			append(&addresses, transmute(net.IP6_Address)d.addr)
 		}
 	}
-	if len(addresses) > 0 && !ddr_reaches_listener(cfg, addresses[:], bindv6only()) {
+	if len(addresses) == 0 {
+		return bad[:], warn[:]
+	}
+	v6only := bindv6only()
+	// Each listener is designated on its own, so each is judged on its own.
+	for l in listeners {
+		if !l.ln.enabled || ddr_reaches_listener(l.ln, addresses[:], v6only) {
+			continue
+		}
 		list := make([dynamic]string, context.temp_allocator)
 		for a in addresses {
 			append(&list, net.address_to_string(a, context.temp_allocator))
@@ -323,9 +334,10 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 		append(
 			&warn,
 			fmt.aprintf(
-				"ddr.name: the rewrite for %s gives %s, which no DoT or DoH listener on this machine is bound to; unless it is forwarded here, a client following the designation reaches some other host",
+				"ddr.name: the rewrite for %s gives %s, none of which listeners.%s on this machine is bound to; unless it is forwarded here, a client following that designation reaches some other host",
 				host,
 				strings.join(list[:], ", ", context.temp_allocator),
+				l.key,
 				allocator = allocator,
 			),
 		)
@@ -333,14 +345,14 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 	return bad[:], warn[:]
 }
 
-// Whether any of `addresses` is one of this machine's own that an enabled DoT or
-// DoH listener is bound to, directly or through the wildcard of its family. `::`
-// takes IPv4 too unless `v6only`: the sockets leave IPV6_V6ONLY at the kernel's
-// default, which is `net.ipv6.bindv6only`.
+// Whether any of `addresses` is one of this machine's own that `ln` is bound to,
+// directly or through the wildcard of its family. `::` takes IPv4 too unless
+// `v6only`: the sockets leave IPV6_V6ONLY at the kernel's default, which is
+// `net.ipv6.bindv6only`.
 @(private)
-ddr_reaches_listener :: proc(cfg: ^config.Config, addresses: []net.Address, v6only: bool) -> bool {
+ddr_reaches_listener :: proc(ln: config.Listener, addresses: []net.Address, v6only: bool) -> bool {
 	for a in addresses {
-		if is_local_address(a) && ddr_bound_to(cfg, a, v6only) {
+		if is_local_address(a) && ddr_bound_to(ln, a, v6only) {
 			return true
 		}
 	}
@@ -362,25 +374,16 @@ is_local_address :: proc(a: net.Address) -> bool {
 	return true
 }
 
-// Whether an enabled DoT or DoH listener accepts connections to `a`, as bound.
+// Whether the listener `ln` accepts connections to `a`, as bound.
 @(private)
-ddr_bound_to :: proc(cfg: ^config.Config, a: net.Address, v6only: bool) -> bool {
+ddr_bound_to :: proc(ln: config.Listener, a: net.Address, v6only: bool) -> bool {
 	_, is_v4 := a.(net.IP4_Address)
-	for ln in ([2]config.Listener{cfg.listeners.dot, cfg.listeners.doh}) {
-		if !ln.enabled {
-			continue
-		}
-		bound := netx.parse_address(ln.address)
-		switch b in bound {
-		case net.IP4_Address:
-			if is_v4 && (b == net.IP4_Any || bound == a) {
-				return true
-			}
-		case net.IP6_Address:
-			if b == net.IP6_Any && (!is_v4 || !v6only) || bound == a {
-				return true
-			}
-		}
+	bound := netx.parse_address(ln.address)
+	switch b in bound {
+	case net.IP4_Address:
+		return is_v4 && (b == net.IP4_Any || bound == a)
+	case net.IP6_Address:
+		return b == net.IP6_Any && (!is_v4 || !v6only) || bound == a
 	}
 	return false
 }

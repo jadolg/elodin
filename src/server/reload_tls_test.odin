@@ -378,4 +378,12 @@ test_ddr_check_reads_the_certificate_only_and_stays_offline :: proc(t: ^testing.
 	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {127, 0, 0, 1}}}}}
 	_, warnings = ddr_check(&cfg, context.temp_allocator)
 	testing.expectf(t, len(warnings) == 0, "loopback, which the 0.0.0.0 listener takes: %v", warnings)
+
+	// Each designated listener is judged on its own: the DoT listener taking the
+	// address does not make the DoH designation reachable there.
+	cfg.listeners.doh.enabled = true
+	cfg.listeners.doh.address = "127.0.0.2"
+	cfg.listeners.doh.cert_file = cert
+	_, warnings = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "listeners.doh"), "a DoH listener off the address: %v", warnings)
 }

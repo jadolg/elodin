@@ -336,3 +336,47 @@ test_split_host_port_unwraps_only_address_literals :: proc(t: ^testing.T) {
 		testing.expectf(t, port == c.port, "%q: port %q, wanted %q", c.authority, port, c.port)
 	}
 }
+
+/*
+A wildcard covers a name only as the whole leftmost label (RFC 9525 section 6.3),
+which is how the devices and stubs that check the certificate read it: `d*` in a
+label is a name no client will verify against, so it covers nothing here either.
+*/
+@(test)
+test_a_partial_wildcard_covers_nothing :: proc(t: ^testing.T) {
+	if !os.exists(CERT_DIR) {
+		_ = os.make_directory(CERT_DIR)
+	}
+	cert, key := CERT_DIR + "/partial-wild.pem", CERT_DIR + "/partial-wild-key.pem"
+	code, ok := run_openssl(
+		{
+			"req",
+			"-x509",
+			"-newkey",
+			"ec",
+			"-pkeyopt",
+			"ec_paramgen_curve:prime256v1",
+			"-nodes",
+			"-keyout",
+			key,
+			"-out",
+			cert,
+			"-days",
+			"2",
+			"-subj",
+			"/CN=wild",
+			"-addext",
+			"subjectAltName=DNS:d*.example.test,DNS:*.whole.test",
+		},
+	)
+	if !testing.expect(t, ok && code == 0, "openssl could not make the certificate") {
+		return
+	}
+	covered, read := cert_file_covers_host(cert, "dns.example.test")
+	testing.expect(t, read, "the certificate did not read")
+	testing.expect(t, !covered, "a partial wildcard covered a name")
+	covered, _ = cert_file_covers_host(cert, "a.whole.test")
+	testing.expect(t, covered, "a whole-label wildcard did not cover a name")
+	_, read = cert_file_covers_host(key, "a.whole.test")
+	testing.expect(t, !read, "a key file read as a certificate")
+}

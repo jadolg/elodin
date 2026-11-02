@@ -172,9 +172,12 @@ cert_covers_host :: proc(cert: ^X509, host: string) -> bool {
 		return X509_check_ip_asc(cert, strings.clone_to_cstring(host, context.temp_allocator), 0) == 1
 	}
 	// Passed with an explicit length, so an embedded NUL cannot truncate the
-	// name that is checked to a prefix of the name that gets served.
+	// name that is checked to a prefix of the name that gets served. A wildcard
+	// matches only as the whole leftmost label, as the clients that check this
+	// certificate hold it (RFC 9525 section 6.3); OpenSSL alone would also let
+	// `d*.example.com` cover `dns.example.com`.
 	bytes := transmute([]u8)host
-	return X509_check_host(cert, raw_data(bytes), c.size_t(len(bytes)), 0, nil) == 1
+	return X509_check_host(cert, raw_data(bytes), c.size_t(len(bytes)), X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, nil) == 1
 }
 
 /*
@@ -197,6 +200,9 @@ cert_file_covers_host :: proc(path: string, host: string) -> (covered: bool, ok:
 	defer BIO_free(bio)
 	cert := PEM_read_bio_X509(bio, nil, nil, nil)
 	if cert == nil {
+		// What the failed read queued is nothing the next OpenSSL caller on this
+		// thread should find.
+		ERR_clear_error()
 		return false, false
 	}
 	defer X509_free(cert)

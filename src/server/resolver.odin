@@ -1270,7 +1270,7 @@ resolve_query :: proc(
 	two orderings for. One place to reason about is worth more than the case it
 	gives up, which is this: a list broad enough to match `resolver.arpa`, which
 	means a rule over `arpa` itself, blocks a DDR probe instead of having it
-	answered NODATA. Such a list is already breaking every reverse lookup on the
+	answered here. Such a list is already breaking every reverse lookup on the
 	machine, so it is not a configuration this ordering has to protect.
 	*/
 	if is_resolver_arpa(q.name) {

@@ -202,9 +202,42 @@ test_ddr_wildcard_v6_listener_takes_v4_unless_v6only :: proc(t: ^testing.T) {
 	cfg.listeners.dot.enabled = true
 	cfg.listeners.dot.address = "::"
 	v4 := net.Address(net.IP4_Address{192, 168, 1, 2})
-	testing.expect(t, ddr_bound_to(&cfg, v4, v6only = false), "a dual-stack :: listener does not take IPv4")
-	testing.expect(t, !ddr_bound_to(&cfg, v4, v6only = true), "a v6only :: listener was said to take IPv4")
-	testing.expect(t, ddr_bound_to(&cfg, net.IP6_Loopback, v6only = true), ":: does not take IPv6")
+	testing.expect(t, ddr_bound_to(cfg.listeners.dot, v4, v6only = false), "a dual-stack :: listener does not take IPv4")
+	testing.expect(t, !ddr_bound_to(cfg.listeners.dot, v4, v6only = true), "a v6only :: listener was said to take IPv4")
+	testing.expect(t, ddr_bound_to(cfg.listeners.dot, net.IP6_Loopback, v6only = true), ":: does not take IPv6")
 	cfg.listeners.dot.address = "10.0.0.1"
-	testing.expect(t, !ddr_bound_to(&cfg, v4, v6only = false), "a listener on another address was said to take this one")
+	testing.expect(t, !ddr_bound_to(cfg.listeners.dot, v4, v6only = false), "a listener on another address was said to take this one")
+}
+
+/*
+The addresses go in behind the client's OPT record, not over it, so the encoder
+keeps that record's room as it fills the section: a client that asked with EDNS
+gets its OPT record back however many addresses the rewrite holds.
+*/
+@(test)
+test_ddr_addresses_keep_the_opt_record :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := designating_server(&cfg)
+	many := make([]config.Rewrite_Answer, 40, context.temp_allocator)
+	for &a, i in many {
+		a = {kind = .AAAA, v6 = {0 = 0xfd, 15 = u8(i)}}
+	}
+	cfg.rewrites = []config.Rewrite{{domain = "dns.example.", ttl = 60, answers = many}}
+
+	questions := make([]dns.Question, 1, context.temp_allocator)
+	questions[0] = dns.Question{name = "_dns.resolver.arpa.", type = .SVCB, class = .IN}
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = dns.make_opt(1232, false)
+	msg := dns.Message{id = 0x4243, question = questions, additional = additional}
+	msg.flags.rd = true
+	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+	out, _, _ := handle_query(&s, wire, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	resp, _ := dns.decode_message(out, context.temp_allocator)
+
+	testing.expect_value(t, len(resp.answer), 2)
+	testing.expect(t, dns.edns_present(resp), "the addresses took the OPT record's place")
+	testing.expect(t, len(resp.additional) > 1, "no address came back")
+	testing.expect(t, !resp.flags.tc, "the designation came back truncated")
+
+	free_all(context.temp_allocator)
 }
