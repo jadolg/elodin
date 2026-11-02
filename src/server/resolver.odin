@@ -4184,220 +4184,129 @@ apply_rewrite :: proc(
 	// restart the lookup at. See `chase_rewrite_alias`.
 	alias: Maybe(dns.Record),
 ) {
-	/*
-	The rules are walked rather than the first match taken, because a rule that
-	only adds records to a name may have nothing to say about the type being
-	asked for - see the fall-through below, and `rule_claims_name`.
+	// Which rule answers is `rewrite_rule_for`'s question; this builds its answer.
+	i, found := rewrite_rule_for(live(s).cfg.rewrites, q.name, q.type)
+	if !found {
+		return nil, false, nil
+	}
+	rule := live(s).cfg.rewrites[i]
 
-	Stopping at the first match was what the search did while every rule
-	answered for the whole of its name. It cannot now: with
+	answers := make([dynamic]dns.Record, 0, len(rule.answers), allocator)
+	blocked := false
 
-	    - domain: mail.lan
-	      answers: ["MX 10 mx.lan"]
-	    - domain: "*.lan"
-	      answers: [192.168.1.10]
-
-	written in the order anybody writes it, specific before general, an `A`
-	query for `mail.lan` matches the MX rule, finds nothing of its own type, and
-	would leave for the upstream with the wildcard below never consulted - the
-	internal name out of the building and a public answer coming back for it.
-	So the search resumes at the rule after the one that had nothing, and the
-	first rule with something to say is the one that answers.
-
-	What it does not do is gather records from several rules into one answer. The
-	first rule that answers is the whole of the answer, which is the precedence
-	`rewrites` has always had; a name wanting an address and an MX wants them in
-	one rule, and that is the rule the operator writes.
-	*/
-	from := 0
-	records_held := false
-	search: for {
-		i, found := find_rewrite_index(live(s).cfg.rewrites, q.name, from)
-		if !found {
-			return nil, false, nil
-		}
-		rule := live(s).cfg.rewrites[i]
-
-		answers := make([dynamic]dns.Record, 0, len(rule.answers), allocator)
-		blocked := false
-
-		for a in rule.answers {
-			switch a.kind {
-			case .Block:
-				blocked = true
-			case .A:
-				if q.type == .A || q.type == .ANY {
-					append(
-						&answers,
-						dns.Record{name = q.name, type = .A, class = .IN, ttl = rule.ttl, data = dns.Rdata_A{addr = a.v4}},
-					)
-				}
-			case .AAAA:
-				if q.type == .AAAA || q.type == .ANY {
-					append(
-						&answers,
-						dns.Record {
-							name = q.name,
-							type = .AAAA,
-							class = .IN,
-							ttl = rule.ttl,
-							data = dns.Rdata_AAAA{addr = a.v6},
-						},
-					)
-				}
-			case .CNAME:
-				// A CNAME answers every type; `chase_rewrite_alias` follows it.
+	for a in rule.answers {
+		switch a.kind {
+		case .Block:
+			blocked = true
+		case .A:
+			if q.type == .A || q.type == .ANY {
+				append(
+					&answers,
+					dns.Record{name = q.name, type = .A, class = .IN, ttl = rule.ttl, data = dns.Rdata_A{addr = a.v4}},
+				)
+			}
+		case .AAAA:
+			if q.type == .AAAA || q.type == .ANY {
 				append(
 					&answers,
 					dns.Record {
 						name = q.name,
-						type = .CNAME,
+						type = .AAAA,
 						class = .IN,
 						ttl = rule.ttl,
-						data = dns.Rdata_Name{name = a.name},
+						data = dns.Rdata_AAAA{addr = a.v6},
 					},
 				)
-			case .MX:
-				if q.type == .MX || q.type == .ANY {
-					append(
-						&answers,
-						dns.Record {
-							name = q.name,
-							type = .MX,
-							class = .IN,
-							ttl = rule.ttl,
-							data = dns.Rdata_MX{preference = a.preference, exchange = a.name},
+			}
+		case .CNAME:
+			// A CNAME answers every type; `chase_rewrite_alias` follows it.
+			append(
+				&answers,
+				dns.Record {
+					name = q.name,
+					type = .CNAME,
+					class = .IN,
+					ttl = rule.ttl,
+					data = dns.Rdata_Name{name = a.name},
+				},
+			)
+		case .MX:
+			if q.type == .MX || q.type == .ANY {
+				append(
+					&answers,
+					dns.Record {
+						name = q.name,
+						type = .MX,
+						class = .IN,
+						ttl = rule.ttl,
+						data = dns.Rdata_MX{preference = a.preference, exchange = a.name},
+					},
+				)
+			}
+		case .TXT:
+			if q.type == .TXT || q.type == .ANY {
+				append(
+					&answers,
+					dns.Record {
+						name = q.name,
+						type = .TXT,
+						class = .IN,
+						ttl = rule.ttl,
+						data = dns.Rdata_TXT{strings = a.strings},
+					},
+				)
+			}
+		case .SRV:
+			if q.type == .SRV || q.type == .ANY {
+				append(
+					&answers,
+					dns.Record {
+						name = q.name,
+						type = .SRV,
+						class = .IN,
+						ttl = rule.ttl,
+						data = dns.Rdata_SRV {
+							priority = a.priority,
+							weight = a.weight,
+							port = a.port,
+							target = a.name,
 						},
-					)
-				}
-			case .TXT:
-				if q.type == .TXT || q.type == .ANY {
-					append(
-						&answers,
-						dns.Record {
-							name = q.name,
-							type = .TXT,
-							class = .IN,
-							ttl = rule.ttl,
-							data = dns.Rdata_TXT{strings = a.strings},
-						},
-					)
-				}
-			case .SRV:
-				if q.type == .SRV || q.type == .ANY {
-					append(
-						&answers,
-						dns.Record {
-							name = q.name,
-							type = .SRV,
-							class = .IN,
-							ttl = rule.ttl,
-							data = dns.Rdata_SRV {
-								priority = a.priority,
-								weight = a.weight,
-								port = a.port,
-								target = a.name,
-							},
-						},
-					)
-				}
+					},
+				)
 			}
 		}
-
-		/*
-		No additional section, for the MX exchange or the SRV target.
-
-		A zone's own server would put the target's address there and save the client
-		a round trip, and this cannot: the target is a name in some other zone as
-		often as not, and the only way to learn its address is to resolve it -
-		upstream, from inside the procedure that exists to answer without going
-		upstream. A client that needs the address asks for it, which is what every
-		client already does when a real server declines to glue.
-		*/
-
-		if blocked {
-			return build_block_response(s, query, q, allocator, limit), true, nil
-		}
-
-		/*
-		An alias cannot answer a name that some rule above it holds records for.
-
-		The walk is what makes this reachable, and it is the same rule
-		`answers_agree` enforces inside one rule (RFC 2181 section 10.1) meeting
-		the case that spans two of them:
-
-		    - domain: mail.lan
-		      answers: ["MX 10 mx.lan"]
-		    - domain: "*.lan"
-		      answer: host.example.com
-
-		An `A mail.lan` query walks past the MX rule and reaches the wildcard,
-		and answering it with that CNAME would make `mail.lan` an alias and the
-		holder of an MX at once - a client following the alias resolves the MX
-		somewhere else and gets a different answer than this server just gave.
-		By the time the walk has stepped past records, an alias is the one thing
-		the rules below cannot say, so the rule is skipped whole: `answers_agree`
-		has already established that a rule with a CNAME holds nothing else, so
-		there is nothing else in it to lose.
-
-		`block` is looked at first, above, and keeps its precedence: a rule that
-		sinks the name is not making a claim about records at all.
-		*/
-		if records_held && rule_holds_alias(rule) {
-			from = i + 1
-			continue search
-		}
-
-		/*
-		A rule that only adds records to a name does not get to answer for the rest
-		of it.
-
-		Most rules say where a name points - an address, an alias, or the
-		sink - so a rule matching at all means the name is this configuration's,
-		and NODATA for a type it has no record of is the truthful answer: the name
-		exists, here is everything there is. `MX`, `TXT` and `SRV` break that
-		assumption, because the ordinary reason to write one is a name whose address
-		is somebody else's business. `example.com` with two MX records and an SPF
-		`TXT` is a real domain that resolves on the public Internet, and answering
-		its `A` query NODATA out of this rule would take the website away from every
-		client behind this server - with an SOA on it, so they would remember the
-		denial for the rule's TTL.
-
-		So a rule holding only these kinds is additive: the types it has are answered
-		here and the rest are forwarded, which is what `--mx-host` and
-		`--txt-record` do in dnsmasq, and what the operator meant by writing down one
-		record rather than a name's whole existence. Add an address, an alias or
-		`block` to the same rule and the old reading is back, deliberately: those are
-		the answers that say the name is ours.
-
-		`matched = false` is how the forwarding happens, so such a query is not
-		counted as rewritten and not logged as one either. That is the honest
-		accounting - nothing was rewritten - and it costs the operator the one signal
-		that the rule was consulted at all. The alternative was a third outcome for
-		the query log, which is a lot of machinery for a rule that did nothing.
-		*/
-		if len(answers) == 0 && !rule_claims_name(rule) {
-			from = i + 1
-			if len(rule.answers) > 0 {
-				records_held = true
-			}
-			continue search
-		}
-
-		resp := dns.make_response(query, .No_Error, allocator)
-		resp.answer = answers[:]
-		if len(answers) == 0 {
-			resp.authority = synth_soa(q.name, rule.ttl, allocator)
-		}
-		out, _, err := dns.encode_message(resp, allocator, limit)
-		if err != .None {
-			return nil, false, nil
-		}
-		if rule_holds_alias(rule) {
-			alias = answers[0]
-		}
-		return out, true, alias
 	}
+
+	/*
+	No additional section, for the MX exchange or the SRV target.
+
+	A zone's own server would put the target's address there and save the client
+	a round trip, and this cannot: the target is a name in some other zone as
+	often as not, and the only way to learn its address is to resolve it -
+	upstream, from inside the procedure that exists to answer without going
+	upstream. A client that needs the address asks for it, which is what every
+	client already does when a real server declines to glue.
+	*/
+
+	if blocked {
+		return build_block_response(s, query, q, allocator, limit), true, nil
+	}
+
+
+
+	resp := dns.make_response(query, .No_Error, allocator)
+	resp.answer = answers[:]
+	if len(answers) == 0 {
+		resp.authority = synth_soa(q.name, rule.ttl, allocator)
+	}
+	out, _, err := dns.encode_message(resp, allocator, limit)
+	if err != .None {
+		return nil, false, nil
+	}
+	if rule_holds_alias(rule) {
+		alias = answers[0]
+	}
+	return out, true, alias
 }
 
 /*
@@ -4552,6 +4461,150 @@ chase_rewrite_alias :: proc(
 		return plain, counted
 	}
 	return wire, counted
+}
+
+/*
+The rule in `rules` that answers a `qtype` question for `name`, by the precedence
+`apply_rewrite` serves and `ddr_addresses` reads the designated name's addresses
+by. One walk, so the two cannot disagree about which rule a name has.
+
+The rules are walked rather than the first match taken, because a rule that
+only adds records to a name may have nothing to say about the type being
+asked for - see the fall-through below, and `rule_claims_name`.
+
+Stopping at the first match was what the search did while every rule
+answered for the whole of its name. It cannot now: with
+
+    - domain: mail.lan
+      answers: ["MX 10 mx.lan"]
+    - domain: "*.lan"
+      answers: [192.168.1.10]
+
+written in the order anybody writes it, specific before general, an `A`
+query for `mail.lan` matches the MX rule, finds nothing of its own type, and
+would leave for the upstream with the wildcard below never consulted - the
+internal name out of the building and a public answer coming back for it.
+So the search resumes at the rule after the one that had nothing, and the
+first rule with something to say is the one that answers.
+
+What it does not do is gather records from several rules into one answer. The
+first rule that answers is the whole of the answer, which is the precedence
+`rewrites` has always had; a name wanting an address and an MX wants them in
+one rule, and that is the rule the operator writes.
+*/
+@(private)
+rewrite_rule_for :: proc(rules: []config.Rewrite, name: string, qtype: dns.Type) -> (index: int, found: bool) {
+	from := 0
+	records_held := false
+	for {
+		i := find_rewrite_index(rules, name, from) or_return
+		rule := rules[i]
+		// `block` sinks the name whatever else the rule holds, so it answers
+		// ahead of both of the skips below.
+		if rule_blocks(rule) {
+			return i, true
+		}
+
+		/*
+		An alias cannot answer a name that some rule above it holds records for.
+
+		The walk is what makes this reachable, and it is the same rule
+		`answers_agree` enforces inside one rule (RFC 2181 section 10.1) meeting
+		the case that spans two of them:
+
+		    - domain: mail.lan
+		      answers: ["MX 10 mx.lan"]
+		    - domain: "*.lan"
+		      answer: host.example.com
+
+		An `A mail.lan` query walks past the MX rule and reaches the wildcard,
+		and answering it with that CNAME would make `mail.lan` an alias and the
+		holder of an MX at once - a client following the alias resolves the MX
+		somewhere else and gets a different answer than this server just gave.
+		By the time the walk has stepped past records, an alias is the one thing
+		the rules below cannot say, so the rule is skipped whole: `answers_agree`
+		has already established that a rule with a CNAME holds nothing else, so
+		there is nothing else in it to lose.
+
+		`block` is looked at first, above, and keeps its precedence: a rule that
+		sinks the name is not making a claim about records at all.
+		*/
+		if records_held && rule_holds_alias(rule) {
+			from = i + 1
+			continue
+		}
+
+		/*
+		A rule that only adds records to a name does not get to answer for the rest
+		of it.
+
+		Most rules say where a name points - an address, an alias, or the
+		sink - so a rule matching at all means the name is this configuration's,
+		and NODATA for a type it has no record of is the truthful answer: the name
+		exists, here is everything there is. `MX`, `TXT` and `SRV` break that
+		assumption, because the ordinary reason to write one is a name whose address
+		is somebody else's business. `example.com` with two MX records and an SPF
+		`TXT` is a real domain that resolves on the public Internet, and answering
+		its `A` query NODATA out of this rule would take the website away from every
+		client behind this server - with an SOA on it, so they would remember the
+		denial for the rule's TTL.
+
+		So a rule holding only these kinds is additive: the types it has are answered
+		here and the rest are forwarded, which is what `--mx-host` and
+		`--txt-record` do in dnsmasq, and what the operator meant by writing down one
+		record rather than a name's whole existence. Add an address, an alias or
+		`block` to the same rule and the old reading is back, deliberately: those are
+		the answers that say the name is ours.
+
+		`apply_rewrite` reporting no match is how the forwarding happens, so such a
+		query is not counted as rewritten and not logged as one either. That is the honest
+		accounting - nothing was rewritten - and it costs the operator the one signal
+		that the rule was consulted at all. The alternative was a third outcome for
+		the query log, which is a lot of machinery for a rule that did nothing.
+		*/
+		if !rule_answers_type(rule, qtype) && !rule_claims_name(rule) {
+			from = i + 1
+			if len(rule.answers) > 0 {
+				records_held = true
+			}
+			continue
+		}
+		return i, true
+	}
+}
+
+@(private)
+rule_blocks :: proc(rule: config.Rewrite) -> bool {
+	for a in rule.answers {
+		if a.kind == .Block {
+			return true
+		}
+	}
+	return false
+}
+
+// Whether the rule has a record `apply_rewrite` would put in the answer to a
+// `qtype` question: one of that type, any for ANY, and a CNAME for every type.
+@(private)
+rule_answers_type :: proc(rule: config.Rewrite, qtype: dns.Type) -> bool {
+	for a in rule.answers {
+		switch a.kind {
+		case .CNAME:
+			return true
+		case .Block:
+		case .A:
+			if qtype == .A || qtype == .ANY {return true}
+		case .AAAA:
+			if qtype == .AAAA || qtype == .ANY {return true}
+		case .MX:
+			if qtype == .MX || qtype == .ANY {return true}
+		case .TXT:
+			if qtype == .TXT || qtype == .ANY {return true}
+		case .SRV:
+			if qtype == .SRV || qtype == .ANY {return true}
+		}
+	}
+	return false
 }
 
 /*

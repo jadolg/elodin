@@ -2,6 +2,7 @@ package tlsx
 
 import "core:c"
 import "core:net"
+import "core:os"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
@@ -156,16 +157,50 @@ is a different call.
 `split_host_port` for where that is peeled off.
 */
 signer_covers_host :: proc(s: Signer, host: string) -> bool {
-	if !signer_present(s) || host == "" {
+	if !signer_present(s) {
+		return false
+	}
+	return cert_covers_host(s.cert, host)
+}
+
+@(private)
+cert_covers_host :: proc(cert: ^X509, host: string) -> bool {
+	if host == "" {
 		return false
 	}
 	if netx.parse_address(host) != nil {
-		return X509_check_ip_asc(s.cert, strings.clone_to_cstring(host, context.temp_allocator), 0) == 1
+		return X509_check_ip_asc(cert, strings.clone_to_cstring(host, context.temp_allocator), 0) == 1
 	}
 	// Passed with an explicit length, so an embedded NUL cannot truncate the
 	// name that is checked to a prefix of the name that gets served.
 	bytes := transmute([]u8)host
-	return X509_check_host(s.cert, raw_data(bytes), c.size_t(len(bytes)), 0, nil) == 1
+	return X509_check_host(cert, raw_data(bytes), c.size_t(len(bytes)), 0, nil) == 1
+}
+
+/*
+The same question of the first certificate in a PEM file, without the key.
+
+For `--check`, which reads the configuration and not the secrets: a key that only
+the service account can read is a reason the check cannot load a server context,
+not a reason the configuration is wrong. `ok` is false when there is no
+certificate to read.
+*/
+cert_file_covers_host :: proc(path: string, host: string) -> (covered: bool, ok: bool) {
+	data, err := os.read_entire_file(path, context.temp_allocator)
+	if err != nil || len(data) == 0 {
+		return false, false
+	}
+	bio := BIO_new_mem_buf(raw_data(data), c.int(len(data)))
+	if bio == nil {
+		return false, false
+	}
+	defer BIO_free(bio)
+	cert := PEM_read_bio_X509(bio, nil, nil, nil)
+	if cert == nil {
+		return false, false
+	}
+	defer X509_free(cert)
+	return cert_covers_host(cert, host), true
 }
 
 /*

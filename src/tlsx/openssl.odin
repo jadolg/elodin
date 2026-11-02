@@ -244,6 +244,7 @@ foreign libcrypto {
 	BIO_s_mem :: proc() -> ^BIO_METHOD ---
 	BIO_ctrl :: proc(bp: ^BIO, cmd: c.int, larg: c.long, parg: rawptr) -> c.long ---
 	BIO_free :: proc(a: ^BIO) -> c.int ---
+	PEM_read_bio_X509 :: proc(bp: ^BIO, x: ^^X509, cb: rawptr, u: rawptr) -> ^X509 ---
 
 	CMS_sign :: proc(signcert: ^X509, pkey: ^EVP_PKEY, certs: ^OPENSSL_STACK, data: ^BIO, flags: c.uint) -> ^CMS_ContentInfo ---
 	CMS_ContentInfo_free :: proc(cms: ^CMS_ContentInfo) ---

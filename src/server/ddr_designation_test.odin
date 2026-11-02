@@ -1,6 +1,7 @@
 package server
 
 import "core:testing"
+import "core:net"
 import "elodin:config"
 import "elodin:dns"
 
@@ -157,4 +158,53 @@ test_ddr_drops_the_addresses_before_the_designation :: proc(t: ^testing.T) {
 	testing.expect(t, !resp.flags.tc, "the designation came back truncated")
 
 	free_all(context.temp_allocator)
+}
+
+/*
+The addresses are read through the same walk `apply_rewrite` answers by, so a
+client is not handed one address in the designation and another when it asks:
+the MX-only rule is passed over, the wildcard alias cannot answer a name a rule
+above held records for, and the wildcard address is what an A query gets.
+*/
+@(test)
+test_ddr_addresses_follow_the_rewrite_precedence :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := designating_server(&cfg)
+	cfg.ddr.name = "dns.lan."
+	cfg.rewrites = []config.Rewrite {
+		{domain = "dns.lan.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .MX, name = "mx.lan.", preference = 10}}},
+		{domain = "lan.", wildcard = true, ttl = 60, answers = []config.Rewrite_Answer{{kind = .CNAME, name = "elsewhere.example."}}},
+		{domain = "lan.", wildcard = true, ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {10, 0, 0, 5}}}},
+	}
+
+	direct := ask(&s, "dns.lan.", .A)
+	if !testing.expect_value(t, len(direct.answer), 1) {
+		return
+	}
+	resp := ask(&s, "_dns.resolver.arpa.", .SVCB)
+	if testing.expect_value(t, len(resp.additional), 1) {
+		testing.expect_value(t, resp.additional[0].data.(dns.Rdata_A).addr, direct.answer[0].data.(dns.Rdata_A).addr)
+	}
+
+	// A rule that sinks the name has no address of the resolver to give.
+	cfg.rewrites = []config.Rewrite{{domain = "dns.lan.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .Block}}}}
+	resp = ask(&s, "_dns.resolver.arpa.", .SVCB)
+	testing.expect_value(t, len(resp.additional), 0)
+	testing.expect_value(t, len(resp.answer), 2)
+
+	free_all(context.temp_allocator)
+}
+
+// `::` takes IPv4 only while `net.ipv6.bindv6only` is off.
+@(test)
+test_ddr_wildcard_v6_listener_takes_v4_unless_v6only :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.listeners.dot.enabled = true
+	cfg.listeners.dot.address = "::"
+	v4 := net.Address(net.IP4_Address{192, 168, 1, 2})
+	testing.expect(t, ddr_bound_to(&cfg, v4, v6only = false), "a dual-stack :: listener does not take IPv4")
+	testing.expect(t, !ddr_bound_to(&cfg, v4, v6only = true), "a v6only :: listener was said to take IPv4")
+	testing.expect(t, ddr_bound_to(&cfg, net.IP6_Loopback, v6only = true), ":: does not take IPv6")
+	cfg.listeners.dot.address = "10.0.0.1"
+	testing.expect(t, !ddr_bound_to(&cfg, v4, v6only = false), "a listener on another address was said to take this one")
 }

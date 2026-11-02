@@ -73,11 +73,14 @@ ddr:
   a URI template takes as written: none of `"'<>\^`{|}`, spaces, or a `%` that does not start a
   `%XX` escape.
 - `--check` and startup refuse a listener whose certificate does not cover
-  `name`. A renewed certificate that no longer covers it is still loaded, logs
+  `name`. `--check` reads the certificate only, not the key, and looks nothing
+  up. A renewed certificate that no longer covers it is still loaded, logs
   `ddr.name: the certificate of listeners.<dot|doh> no longer covers <name>`, and
   stops that listener being designated until one that does is loaded.
-- `--check` warns when `name` (through its rewrite, or as it resolves from the
-  machine) leads to no address an encrypted listener here is bound to.
+- `--check` warns when the `rewrites` rule for `name` sinks it, or gives only
+  addresses that no encrypted listener on this machine is bound to (a `::`
+  listener takes IPv4 unless `net.ipv6.bindv6only` is 1). Without a rule there
+  is nothing local to judge.
 - `ddr` needs a restart to change.
 - A `rewrites` rule for `_dns.resolver.arpa` wins over this.
 

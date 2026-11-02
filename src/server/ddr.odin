@@ -3,6 +3,7 @@ package server
 import "core:fmt"
 import "core:mem"
 import "core:net"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "elodin:config"
@@ -96,6 +97,7 @@ ddr_designate :: proc(s: ^Server, listener: Protocol, ctx: ^tlsx.Context) -> boo
 	}
 	return name == "" || covered
 }
+
 @(private)
 RESOLVER_ARPA :: "resolver.arpa."
 
@@ -222,49 +224,51 @@ The A and AAAA records for the designated name, for the Additional section,
 which RFC 9462 section 4 says the answer SHOULD carry.
 
 Only what this server answers for the name itself without forwarding - the
-`rewrites` rule that claims it, with the precedence `apply_rewrite` gives it -
-since that is where an operator writes the local address of a name whose public
-one is elsewhere, and so the address that lets a client on the LAN use the
-designation opportunistically (RFC 9462 section 4.3). With no such rule there
-is nothing local to say, and the client asks for the name the ordinary way.
+`rewrites` rule `rewrite_rule_for` picks for an A and for an AAAA question, which
+is the one `apply_rewrite` answers from - since that is where an operator writes
+the local address of a name whose public one is elsewhere, and so the address
+that lets a client on the LAN use the designation opportunistically (RFC 9462
+section 4.3). A rule that sinks the name or aliases it has no address of the
+designated resolver to give, and with no rule there is nothing local to say:
+either way the client asks for the name the ordinary way.
 */
 @(private)
 ddr_addresses :: proc(cfg: ^config.Config, allocator: mem.Allocator) -> []dns.Record {
-	from := 0
-	for {
-		i, found := find_rewrite_index(cfg.rewrites, cfg.ddr.name, from)
-		if !found {
-			return nil
-		}
-		rule := cfg.rewrites[i]
-		if !rule_claims_name(rule) {
-			from = i + 1
+	records := make([dynamic]dns.Record, 0, 4, allocator)
+	for qtype in ([2]dns.Type{.A, .AAAA}) {
+		i, found := rewrite_rule_for(cfg.rewrites, cfg.ddr.name, qtype)
+		if !found || rule_blocks(cfg.rewrites[i]) || rule_holds_alias(cfg.rewrites[i]) {
 			continue
 		}
-		records := make([dynamic]dns.Record, 0, len(rule.answers), allocator)
+		rule := cfg.rewrites[i]
 		for a in rule.answers {
-			#partial switch a.kind {
-			case .A:
+			if a.kind == .A && qtype == .A {
 				append(&records, dns.Record{name = cfg.ddr.name, type = .A, class = .IN, ttl = rule.ttl, data = dns.Rdata_A{addr = a.v4}})
-			case .AAAA:
+			} else if a.kind == .AAAA && qtype == .AAAA {
 				append(&records, dns.Record{name = cfg.ddr.name, type = .AAAA, class = .IN, ttl = rule.ttl, data = dns.Rdata_AAAA{addr = a.v6}})
 			}
 		}
-		return records[:]
 	}
+	return records[:]
 }
 
 /*
-What `--check` says about `ddr.name`, which the loader cannot: it does not open
-the certificates, and it does not look names up.
+What `--check` says about `ddr.name`, which the loader cannot, since it does not
+open the certificates.
 
-`problems` are what the listeners would refuse to start on - a certificate that
-does not cover the name, or does not load. `warnings` are about where the name
-leads: the addresses a client is handed for it - the `rewrites` rule that claims
-it, as `ddr_addresses` puts in the answer, or else what it resolves to from here
-- should include one an encrypted listener on this machine is bound to. One that
-does not is not refused, since a port forwarded from elsewhere is a reason it
-may be right, but a client following it reaches some other host.
+Offline, like the rest of `--check`, which a package install runs while the
+machine's resolver may be this server, stopped: the certificates are read, the
+keys are not - a key only the service account can read is no fault of the file -
+and no name is looked up.
+
+`problems` are what the listeners would refuse to start on: a certificate that
+does not cover the name, or cannot be read. `warnings` are about the addresses
+this server hands a client for the name, which are those of its `rewrites` rule
+(`ddr_addresses`): a rule that sinks the name, or addresses none of which an
+encrypted listener on this machine is bound to. The second is not refused, since
+a port forwarded from elsewhere is a reason it may be right, but a client
+following it reaches some other host. A name with no rule resolves wherever its
+public DNS says, which nothing offline can judge.
 */
 ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (problems: []string, warnings: []string) {
 	if cfg.ddr.name == "" {
@@ -282,12 +286,10 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 		if !l.ln.enabled {
 			continue
 		}
-		ctx, err := tlsx.server_context(l.ln.cert_file, l.ln.key_file, nil)
-		if err != .None {
-			append(&bad, fmt.aprintf("listeners.%s: %s", l.key, tlsx.describe_error(err, context.temp_allocator), allocator = allocator))
-			continue
-		}
-		if !tlsx.signer_covers_host(ctx.signer, host) {
+		covered, read := tlsx.cert_file_covers_host(l.ln.cert_file, host)
+		if !read {
+			append(&bad, fmt.aprintf("listeners.%s.cert_file: %q holds no certificate that can be read", l.key, l.ln.cert_file, allocator = allocator))
+		} else if !covered {
 			append(
 				&bad,
 				fmt.aprintf(
@@ -299,9 +301,11 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 				),
 			)
 		}
-		tlsx.context_destroy(ctx)
 	}
 
+	if i, found := rewrite_rule_for(cfg.rewrites, cfg.ddr.name, .A); found && rule_blocks(cfg.rewrites[i]) {
+		append(&warn, fmt.aprintf("ddr.name: a rewrite sinks %s, so a client that looks it up here cannot reach the designation", host, allocator = allocator))
+	}
 	addresses := make([dynamic]net.Address, context.temp_allocator)
 	for r in ddr_addresses(cfg, context.temp_allocator) {
 		#partial switch d in r.data {
@@ -311,17 +315,7 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 			append(&addresses, transmute(net.IP6_Address)d.addr)
 		}
 	}
-	if len(addresses) == 0 {
-		ep4, ep6, _ := netx.resolve(host)
-		for ep in ([2]net.Endpoint{ep4, ep6}) {
-			if ep.address != nil {
-				append(&addresses, ep.address)
-			}
-		}
-	}
-	if len(addresses) == 0 {
-		append(&warn, fmt.aprintf("ddr.name: %s does not resolve from here, and no rewrite gives it an address, so a client cannot reach the designation", host, allocator = allocator))
-	} else if !ddr_reaches_listener(cfg, addresses[:]) {
+	if len(addresses) > 0 && !ddr_reaches_listener(cfg, addresses[:], bindv6only()) {
 		list := make([dynamic]string, context.temp_allocator)
 		for a in addresses {
 			append(&list, net.address_to_string(a, context.temp_allocator))
@@ -329,7 +323,7 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 		append(
 			&warn,
 			fmt.aprintf(
-				"ddr.name: %s leads to %s, which no DoT or DoH listener on this machine is bound to; unless it is forwarded here, a client following the designation reaches some other host",
+				"ddr.name: the rewrite for %s gives %s, which no DoT or DoH listener on this machine is bound to; unless it is forwarded here, a client following the designation reaches some other host",
 				host,
 				strings.join(list[:], ", ", context.temp_allocator),
 				allocator = allocator,
@@ -340,42 +334,60 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 }
 
 // Whether any of `addresses` is one of this machine's own that an enabled DoT or
-// DoH listener is bound to, directly or through the wildcard of its family.
+// DoH listener is bound to, directly or through the wildcard of its family. `::`
+// takes IPv4 too unless `v6only`: the sockets leave IPV6_V6ONLY at the kernel's
+// default, which is `net.ipv6.bindv6only`.
 @(private)
-ddr_reaches_listener :: proc(cfg: ^config.Config, addresses: []net.Address) -> bool {
-	interfaces, err := net.enumerate_interfaces(context.temp_allocator)
-	if err != nil {
-		return true // nothing to judge by, so nothing to warn about
-	}
-	defer net.destroy_interfaces(interfaces, context.temp_allocator)
+ddr_reaches_listener :: proc(cfg: ^config.Config, addresses: []net.Address, v6only: bool) -> bool {
 	for a in addresses {
-		local := false
-		for iface in interfaces {
-			for lease in iface.unicast {
-				local ||= lease.address == a
-			}
+		if is_local_address(a) && ddr_bound_to(cfg, a, v6only) {
+			return true
 		}
-		if !local {
+	}
+	return false
+}
+
+/*
+Whether `a` is one of this machine's own addresses: the kernel binds a socket only
+to those. Asked of the kernel rather than read from an interface listing, which
+`core:net` returns empty on Linux.
+*/
+@(private)
+is_local_address :: proc(a: net.Address) -> bool {
+	socket, err := net.make_bound_udp_socket(a, 0)
+	if err != nil {
+		return false
+	}
+	net.close(socket)
+	return true
+}
+
+// Whether an enabled DoT or DoH listener accepts connections to `a`, as bound.
+@(private)
+ddr_bound_to :: proc(cfg: ^config.Config, a: net.Address, v6only: bool) -> bool {
+	_, is_v4 := a.(net.IP4_Address)
+	for ln in ([2]config.Listener{cfg.listeners.dot, cfg.listeners.doh}) {
+		if !ln.enabled {
 			continue
 		}
-		for ln in ([2]config.Listener{cfg.listeners.dot, cfg.listeners.doh}) {
-			if !ln.enabled {
-				continue
+		bound := netx.parse_address(ln.address)
+		switch b in bound {
+		case net.IP4_Address:
+			if is_v4 && (b == net.IP4_Any || bound == a) {
+				return true
 			}
-			bound := netx.parse_address(ln.address)
-			switch b in bound {
-			case net.IP4_Address:
-				if _, v4 := a.(net.IP4_Address); v4 && (b == net.IP4_Any || bound == a) {
-					return true
-				}
-			case net.IP6_Address:
-				// `::` takes IPv4 too: the sockets leave IPV6_V6ONLY at the
-				// kernel's default, which is off.
-				if b == net.IP6_Any || bound == a {
-					return true
-				}
+		case net.IP6_Address:
+			if b == net.IP6_Any && (!is_v4 || !v6only) || bound == a {
+				return true
 			}
 		}
 	}
 	return false
+}
+
+// The kernel's default for IPV6_V6ONLY. Unreadable is the usual default, off.
+@(private)
+bindv6only :: proc() -> bool {
+	data, err := os.read_entire_file("/proc/sys/net/ipv6/bindv6only", context.temp_allocator)
+	return err == nil && len(data) > 0 && data[0] == '1'
 }

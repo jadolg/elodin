@@ -1,6 +1,7 @@
 package server
 
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -331,4 +332,50 @@ test_reload_tls_designates_only_while_the_certificate_covers_ddr_name :: proc(t:
 	cfg.ddr.name = ""
 	testing.expect(t, ddr_designate(&s, .DoT, l.dot_ctx), "no name at all was reported as a problem")
 	testing.expect(t, !s.ddr.dot, "the DoT listener is designated with no name to designate")
+}
+
+/*
+`--check` on `ddr.name` reads the certificates and not the keys, and looks no
+name up: a package install runs it while this server, the machine's resolver,
+may be stopped, and a key only the service account can read is no fault of the
+configuration.
+*/
+@(test)
+test_ddr_check_reads_the_certificate_only_and_stays_offline :: proc(t: ^testing.T) {
+	cert, _, ok := ensure_cert()
+	if !ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+	cfg := config.default_config()
+	cfg.listeners.dot.enabled = true
+	cfg.listeners.dot.cert_file = cert
+	cfg.listeners.dot.key_file = "/nonexistent/key.pem"
+
+	cfg.ddr.name = "elodin.local."
+	problems, warnings := ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(problems) == 0, "a covered name with an unreadable key: %v", problems)
+	// No rewrite, so nothing local to judge, and nothing is looked up.
+	testing.expectf(t, len(warnings) == 0, "warned with no rewrite to judge: %v", warnings)
+
+	cfg.ddr.name = "not-on-the-certificate.example."
+	problems, _ = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(problems) == 1 && strings.contains(problems[0], "does not cover"), "an uncovered name: %v", problems)
+
+	cfg.ddr.name = "elodin.local."
+	cfg.listeners.dot.cert_file = "/nonexistent/cert.pem"
+	problems, _ = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(problems) == 1 && strings.contains(problems[0], "cert_file"), "an unreadable certificate: %v", problems)
+	cfg.listeners.dot.cert_file = cert
+
+	// A rewrite that sinks the name, and one that sends it off this machine.
+	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .Block}}}}
+	_, warnings = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "sinks"), "a sunk name: %v", warnings)
+	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {192, 0, 2, 1}}}}}
+	_, warnings = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(warnings) == 1 && strings.contains(warnings[0], "192.0.2.1"), "an address off this machine: %v", warnings)
+	cfg.rewrites = []config.Rewrite{{domain = "elodin.local.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {127, 0, 0, 1}}}}}
+	_, warnings = ddr_check(&cfg, context.temp_allocator)
+	testing.expectf(t, len(warnings) == 0, "loopback, which the 0.0.0.0 listener takes: %v", warnings)
 }
