@@ -421,6 +421,23 @@ Dnssec_Config :: struct {
 	max_cached_zones:     int,
 }
 
+/*
+Discovery of Designated Resolvers (RFC 9462): what this server answers when a
+client asks `_dns.resolver.arpa` for an encrypted endpoint to move to.
+
+`name` is the hostname a client is to connect to and check the certificate of -
+the SVCB TargetName - and empty, the default, designates nothing, so the probe
+is answered NODATA and the client stays on Do53. Off by default because only the
+operator knows which name their certificate covers, and a designation the
+certificate does not cover moves a client to an endpoint it cannot verify, which
+is worse than designating nothing. Each enabled DoT and DoH listener whose
+certificate covers the name is designated; see `server.ddr.odin`.
+*/
+DDR_Config :: struct {
+	// Canonical, lowercase, trailing dot.
+	name: string,
+}
+
 Cookie_Config :: struct {
 	/*
 	Whether clients that send a DNS cookie get one back (RFC 7873).
@@ -1134,6 +1151,7 @@ Config :: struct {
 	blocking:    Blocking_Config,
 	dnssec:      Dnssec_Config,
 	cookies:     Cookie_Config,
+	ddr:         DDR_Config,
 	rebind:      Rebind_Config,
 	metrics:     Metrics_Config,
 	rewrites:    []Rewrite,

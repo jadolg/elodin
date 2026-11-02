@@ -288,3 +288,47 @@ test_rotate_ticket_keys_reaches_dot_and_doh :: proc(t: ^testing.T) {
 	testing.expect(t, dok && dot_after != dot_before, "the DoT ticket key did not rotate")
 	testing.expect(t, hok && doh_after != doh_before, "the DoH ticket key did not rotate")
 }
+
+/*
+A designation follows the certificate the listener serves (RFC 9462 section 4.2:
+the client holds the designated name to it). One that covers `ddr.name` is
+designated; a renewal that drops the name is still swapped in - refusing it would
+leave an expiring certificate serving every client - but stops the designation.
+*/
+@(test)
+test_reload_tls_designates_only_while_the_certificate_covers_ddr_name :: proc(t: ^testing.T) {
+	cert, key, ok := ensure_cert()
+	if !ok {
+		testing.expect(t, false, "no certificate available and openssl could not make one")
+		return
+	}
+	first, ferr := tlsx.server_context(cert, key, DOT_ALPN)
+	if ferr != .None {
+		testing.expectf(t, false, "server_context: %v", ferr)
+		return
+	}
+
+	cfg := config.default_config()
+	cfg.listeners.dot.cert_file = cert
+	cfg.listeners.dot.key_file = key
+	l := Listeners{}
+	l.dot_ctx = first
+	l.dot_open = true
+	s := Server{cfg = &cfg}
+	defer tlsx.context_destroy(l.dot_ctx)
+
+	cfg.ddr.name = "elodin.local."
+	testing.expect(t, ddr_designate(&s, .DoT, first), "a certificate for elodin.local was said not to cover it")
+	testing.expect(t, s.ddr.dot, "a covered name left the DoT listener undesignated")
+
+	cfg.ddr.name = "not-on-the-certificate.example."
+	before := l.dot_ctx
+	testing.expect(t, reload_tls(&s, &l), "a certificate that loads was refused for not covering ddr.name")
+	testing.expect(t, l.dot_ctx != before, "the renewed certificate was not swapped in")
+	testing.expect(t, !s.ddr.dot, "the DoT listener is still designated under a certificate that does not cover the name")
+	testing.expect(t, !ddr_designate(&s, .DoT, l.dot_ctx), "an uncovered name was reported as fine")
+
+	cfg.ddr.name = ""
+	testing.expect(t, ddr_designate(&s, .DoT, l.dot_ctx), "no name at all was reported as a problem")
+	testing.expect(t, !s.ddr.dot, "the DoT listener is designated with no name to designate")
+}

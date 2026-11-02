@@ -255,6 +255,8 @@ Server :: struct {
 	// step of the wall clock does not move it (issue #557).
 	up_since:     loop.Moment,
 	running:      bool,
+	// Which encrypted listeners `_dns.resolver.arpa` designates. See `ddr.odin`.
+	ddr:          DDR_Designation,
 }
 
 /*
@@ -1272,7 +1274,7 @@ resolve_query :: proc(
 	machine, so it is not a configuration this ordering has to protect.
 	*/
 	if is_resolver_arpa(q.name) {
-		out := build_resolver_arpa_response(msg, q, allocator, limit)
+		out := build_resolver_arpa_response(s, msg, q, allocator, limit)
 		log_query(s, client, proto, q, .Local, "ddr", started)
 		return out, .Local, true
 	}

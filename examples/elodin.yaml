@@ -235,6 +235,16 @@ listeners:
     # above. Set it to "" to withhold the profile.
     mobileconfig_path: /apple-doh.mobileconfig
 
+# Discovery of Designated Resolvers (RFC 9462). A client that knows only this
+# server's plain-DNS address asks `_dns.resolver.arpa` for an encrypted endpoint
+# and is told the DoT and DoH listeners above, under this name. Off ("") by
+# default: the name must be one the listeners' certificate covers, which
+# --check and startup verify, since a designation the client cannot verify is
+# worse than none. On a LAN, a rewrite mapping the name to this server's LAN
+# address lets clients use it (and is sent alongside). Needs a restart to change.
+ddr:
+  name: ""
+
 upstream:
   # failover     try servers in order, move on when one fails
   # round_robin  the same, but the starting point rotates per query

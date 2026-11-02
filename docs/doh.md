@@ -51,6 +51,44 @@ invalid `Host`, or a repeated `Content-Type`, is answered 400 ahead of the 413. 
 plain decimal, or one beside a second `Content-Length` or a `Transfer-Encoding`,
 gets no answer at all, whatever else is wrong with the request.
 
+## Discovery by clients (DDR)
+
+A client that knows only this server's Do53 address can ask it for an encrypted
+endpoint to move to: the SVCB record at `_dns.resolver.arpa` (RFC 9462). Off by
+default; name the host the DoT/DoH certificate covers:
+
+```yaml
+ddr:
+  name: dns.example.com
+```
+
+- The answer has one SVCB record per enabled DoT and DoH listener, priority 1,
+  target `name`, TTL 300: `alpn=dot` for DoT; `alpn=h2,http/1.1` and
+  `dohpath=<listeners.doh.path>{?dns}` for DoH; `port` only when it is not 853 or
+  443. Every other question in `resolver.arpa` is NODATA.
+- The additional section carries the A/AAAA records of the `rewrites` rule for
+  `name`, if there is one. Otherwise the client looks the name up itself.
+- `name` must be a hostname, not an address, not the root and not in
+  `resolver.arpa`, and needs DoT or DoH enabled. With DoH it also needs a `path`
+  a URI template takes as written: none of `"'<>\^`{|}`, spaces, or a `%` that does not start a
+  `%XX` escape.
+- `--check` and startup refuse a listener whose certificate does not cover
+  `name`. A renewed certificate that no longer covers it is still loaded, logs
+  `ddr.name: the certificate of listeners.<dot|doh> no longer covers <name>`, and
+  stops that listener being designated until one that does is loaded.
+- `--check` warns when `name` (through its rewrite, or as it resolves from the
+  machine) leads to no address an encrypted listener here is bound to.
+- `ddr` needs a restart to change.
+- A `rewrites` rule for `_dns.resolver.arpa` wins over this.
+
+Clients use a designation only after checking it (RFC 9462 sections 4.2 and 4.3):
+
+- **Verified:** the certificate covers `name` and has the Do53 address the client
+  asked as an IP SAN.
+- **Opportunistic:** for a server on a private or link-local address, `name`
+  resolves to that same address. A `rewrites` rule mapping `name` to the LAN
+  address does this and also fills the additional section.
+
 ## Apple devices (iOS, iPadOS, macOS)
 
 iOS 14 / macOS 11 and later take encrypted DNS from a configuration profile, and

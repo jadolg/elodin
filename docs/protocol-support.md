@@ -27,8 +27,9 @@ directions, [EDNS(0) padding](edns.md#edns-padding) in both directions on DoT an
 on neither of the clear transports, the
 [connection idle timeout](edns.md#telling-a-client-how-long-its-connection-is-held) told
 to a TCP or DoT client that asks for it, truncation with the TC bit and the
-UDP→TCP retry, `version.bind`/`hostname.bind` in the CHAOS class, local NODATA answers
-for `resolver.arpa`, refusal of zone-transfer requests, and the reserved names of
+UDP→TCP retry, `version.bind`/`hostname.bind` in the CHAOS class, local answers for
+`resolver.arpa`, with this server's own DoT/DoH endpoints designated over
+[DDR](doh.md#discovery-by-clients-ddr) when `ddr.name` is set, refusal of zone-transfer requests, and the reserved names of
 RFC 6761 and RFC 7686 answered here instead of forwarded.
 
 ## Known limitations
@@ -39,7 +40,7 @@ RFC 6761 and RFC 7686 answered here instead of forwarded.
 - Past what the UDP readers can drain, the kernel drops datagrams before any budget sees them; see [how fast datagrams can be read](connections.md#how-fast-datagrams-can-be-read).
 - The handshake bound is per /24 and /64, and a refusal is cheap rather than free; see [a connection rate limit in front](public-resolver.md#a-connection-rate-limit-in-front).
 - Upstream cookies go only on queries that carry an OPT record, so a non-EDNS client gets none unless DNSSEC validation is on (the default); cookie secrets are never rotated, so a restart costs each peer one round trip. See [DNS cookies](edns.md#dns-cookies).
-- elodin does not advertise its own DoT/DoH over DDR: `resolver.arpa` is answered NODATA ([resolver.arpa](dnssec.md#resolverarpa)). Point clients at the encrypted listeners by configuration, the [Apple profile](doh.md#apple-devices-ios-ipados-macos), or a `rewrites` rule.
+- [DDR](doh.md#discovery-by-clients-ddr) designates one name, and clients only use it automatically if the certificate has the Do53 address as an IP SAN, or the server is on a private address that `ddr.name` resolves to. Otherwise point clients at the encrypted listeners by configuration or the [Apple profile](doh.md#apple-devices-ios-ipados-macos).
 - EDNS Client Subnet is not implemented: a client's option is dropped upstream and cannot be forwarded, since the cache is not keyed per network (RFC 7871 section 7.3).
 - No per-client rules, query log database, or web/API surface; statistics go to the [log](logging.md#stats) and [metrics](metrics.md#metrics).
 - `SIGHUP` reloads the configuration and the certificates, except the listeners, the metrics endpoint, the loop count and connection-table sizes, `server.user`/`group` and `blocking.cache_dir`, which need a restart ([signals](install.md#signals)).
