@@ -4196,85 +4196,28 @@ apply_rewrite :: proc(
 
 	answers := make([dynamic]dns.Record, 0, len(rule.answers), allocator)
 	for a in rule.answers {
+		// A CNAME answers every type; `chase_rewrite_alias` follows it.
+		if !kind_answers(a.kind, q.type) {
+			continue
+		}
+		rec := dns.Record{name = q.name, class = .IN, ttl = rule.ttl}
 		switch a.kind {
 		case .Block:
+			continue
 		case .A:
-			if kind_answers(a.kind, q.type) {
-				append(
-					&answers,
-					dns.Record{name = q.name, type = .A, class = .IN, ttl = rule.ttl, data = dns.Rdata_A{addr = a.v4}},
-				)
-			}
+			rec.type, rec.data = .A, dns.Rdata_A{addr = a.v4}
 		case .AAAA:
-			if kind_answers(a.kind, q.type) {
-				append(
-					&answers,
-					dns.Record {
-						name = q.name,
-						type = .AAAA,
-						class = .IN,
-						ttl = rule.ttl,
-						data = dns.Rdata_AAAA{addr = a.v6},
-					},
-				)
-			}
+			rec.type, rec.data = .AAAA, dns.Rdata_AAAA{addr = a.v6}
 		case .CNAME:
-			// A CNAME answers every type; `chase_rewrite_alias` follows it.
-			append(
-				&answers,
-				dns.Record {
-					name = q.name,
-					type = .CNAME,
-					class = .IN,
-					ttl = rule.ttl,
-					data = dns.Rdata_Name{name = a.name},
-				},
-			)
+			rec.type, rec.data = .CNAME, dns.Rdata_Name{name = a.name}
 		case .MX:
-			if kind_answers(a.kind, q.type) {
-				append(
-					&answers,
-					dns.Record {
-						name = q.name,
-						type = .MX,
-						class = .IN,
-						ttl = rule.ttl,
-						data = dns.Rdata_MX{preference = a.preference, exchange = a.name},
-					},
-				)
-			}
+			rec.type, rec.data = .MX, dns.Rdata_MX{preference = a.preference, exchange = a.name}
 		case .TXT:
-			if kind_answers(a.kind, q.type) {
-				append(
-					&answers,
-					dns.Record {
-						name = q.name,
-						type = .TXT,
-						class = .IN,
-						ttl = rule.ttl,
-						data = dns.Rdata_TXT{strings = a.strings},
-					},
-				)
-			}
+			rec.type, rec.data = .TXT, dns.Rdata_TXT{strings = a.strings}
 		case .SRV:
-			if kind_answers(a.kind, q.type) {
-				append(
-					&answers,
-					dns.Record {
-						name = q.name,
-						type = .SRV,
-						class = .IN,
-						ttl = rule.ttl,
-						data = dns.Rdata_SRV {
-							priority = a.priority,
-							weight = a.weight,
-							port = a.port,
-							target = a.name,
-						},
-					},
-				)
-			}
+			rec.type, rec.data = .SRV, dns.Rdata_SRV{priority = a.priority, weight = a.weight, port = a.port, target = a.name}
 		}
+		append(&answers, rec)
 	}
 
 	/*
@@ -4466,8 +4409,7 @@ The rules are walked rather than the first match taken, because a rule that
 only adds records to a name may have nothing to say about the type being
 asked for - see the fall-through below, and `rule_claims_name`.
 
-Stopping at the first match was what the search did while every rule
-answered for the whole of its name. It cannot now: with
+With
 
     - domain: mail.lan
       answers: ["MX 10 mx.lan"]
@@ -4475,16 +4417,15 @@ answered for the whole of its name. It cannot now: with
       answers: [192.168.1.10]
 
 written in the order anybody writes it, specific before general, an `A`
-query for `mail.lan` matches the MX rule, finds nothing of its own type, and
-would leave for the upstream with the wildcard below never consulted - the
-internal name out of the building and a public answer coming back for it.
+query for `mail.lan` matches the MX rule and finds nothing of its own type;
+stopping there would send it upstream with the wildcard below never consulted -
+the internal name out of the building and a public answer coming back for it.
 So the search resumes at the rule after the one that had nothing, and the
 first rule with something to say is the one that answers.
 
 What it does not do is gather records from several rules into one answer. The
-first rule that answers is the whole of the answer, which is the precedence
-`rewrites` has always had; a name wanting an address and an MX wants them in
-one rule, and that is the rule the operator writes.
+first rule that answers is the whole of the answer; a name wanting an address
+and an MX wants them in one rule, and that is the rule the operator writes.
 */
 @(private)
 rewrite_rule_for :: proc(rules: []config.Rewrite, name: string, qtype: dns.Type) -> (index: int, found: bool) {

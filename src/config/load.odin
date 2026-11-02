@@ -1887,6 +1887,14 @@ load_ddr :: proc(l: ^Loader, cfg: ^Config) {
 	check_keys(l, n, "ddr", "name")
 	written: string
 	opt_string(l, n, "name", &written, "ddr")
+	// Refused as written: `canonical_domain` trims Unicode space, so a trailing
+	// no-break space would otherwise reach `check_ddr` already gone.
+	for c in transmute([]u8)written {
+		if c <= ' ' || c >= 0x7f {
+			errorf(l, "ddr.name: %q must be a hostname, the one the certificate of the DoT or DoH listener covers", written)
+			return
+		}
+	}
 	if written != "" {
 		cfg.ddr.name = canonical_domain(written, l.allocator)
 	}

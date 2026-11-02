@@ -1525,9 +1525,7 @@ start_dot :: proc(s: ^Server, l: ^Listeners) -> bool {
 	}
 	l.dot_ctx = ctx
 	// Not designated, rather than not started: see `ddr_designate`.
-	if !ddr_designate(s, .DoT, ctx) {
-		logx.errorf("ddr.name: the certificate of listeners.dot does not cover %s, so _dns.resolver.arpa does not designate it", startup_config(s).ddr.name)
-	}
+	ddr_designate(s, .DoT, ctx)
 	if !start_stream_listener(s, l, cfg, .DoT, &l.dot_socket, &l.dot_open) {
 		return false
 	}
@@ -1545,9 +1543,7 @@ start_doh :: proc(s: ^Server, l: ^Listeners) -> bool {
 	}
 	l.doh_ctx = ctx
 	// Not designated, rather than not started: see `ddr_designate`.
-	if !ddr_designate(s, .DoH, ctx) {
-		logx.errorf("ddr.name: the certificate of listeners.doh does not cover %s, so _dns.resolver.arpa does not designate it", startup_config(s).ddr.name)
-	}
+	ddr_designate(s, .DoH, ctx)
 	if cfg.mobileconfig_path != "" {
 		s.profiles = make_profile_signer(ctx, cfg.path, cfg.port)
 		warn_unsigned_profiles(s.profiles)
@@ -1653,13 +1649,7 @@ reload_tls_ctx :: proc(
 	profile_signer_adopt(profiles, fresh)
 	logx.infof("listeners.%s: reloaded the certificate from %s", name, cfg.cert_file)
 	// Kept even when it no longer covers `ddr.name`: see `ddr_designate`.
-	if !ddr_designate(s, listener, fresh) {
-		logx.errorf(
-			"ddr.name: the certificate of listeners.%s no longer covers %s, so _dns.resolver.arpa stops designating it",
-			name,
-			startup_config(s).ddr.name,
-		)
-	}
+	ddr_designate(s, listener, fresh, reloaded = true)
 	return true
 }
 

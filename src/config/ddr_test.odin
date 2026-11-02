@@ -39,7 +39,7 @@ test_ddr_name_is_canonical :: proc(t: ^testing.T) {
 // outside letters, digits and hyphens.
 @(test)
 test_ddr_name_must_be_a_hostname_outside_resolver_arpa :: proc(t: ^testing.T) {
-	for name in ([]string{".", "resolver.arpa", "_dns.resolver.arpa.", "192.168.1.1", "::1", "dns_1.example", "-a.example", "a..example", "*.example", "dns.example.123"}) {
+	for name in ([]string{".", "resolver.arpa", "_dns.resolver.arpa.", "192.168.1.1", "::1", "dns_1.example", "-a.example", "a..example", "*.example", "dns.example.123", "Key.example", "dns.example "}) {
 		_, msg := ddr_load(name)
 		testing.expectf(t, strings.contains(msg, "ddr.name"), "%q was accepted: %q", name, msg)
 	}

@@ -9,6 +9,7 @@ import "core:strings"
 import "core:sync"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:logx"
 import "elodin:netx"
 import "elodin:tlsx"
 
@@ -82,27 +83,37 @@ SVC_KEY_DOHPATH :: u16(7)
 Record whether `ctx`, the certificate `listener` now serves, covers `ddr.name`.
 
 Called when a DoT or DoH listener loads its certificate, at startup and on every
-reload. Returns false when a name is set and not covered, for the caller to say
-so; nothing is designated through that listener until a certificate that covers
-it is loaded.
+reload. Returns false, and logs why, when a name is set and not covered; nothing
+is designated through that listener until a certificate that covers it is
+loaded.
 
 The listener serves the certificate either way, at startup as on a reload. A
 renewal that drops the name is kept by a reload, since refusing it would leave
 an expiring certificate serving every client; a startup that refused the same
 certificate would turn the next restart after that renewal into a resolver that
 does not come up at all, Do53 included. Losing the designation costs only the
-upgrade; `--check` is where the mismatch is an error, before a restart.
+upgrade; `--check` warns about the mismatch before a restart.
 */
-ddr_designate :: proc(s: ^Server, listener: Protocol, ctx: ^tlsx.Context) -> bool {
+ddr_designate :: proc(s: ^Server, listener: Protocol, ctx: ^tlsx.Context, reloaded := false) -> bool {
 	name := strings.trim_suffix(startup_config(s).ddr.name, ".")
 	covered := name != "" && ctx != nil && tlsx.signer_covers_host(ctx.signer, name)
+	key := "dot"
 	#partial switch listener {
 	case .DoT:
 		sync.atomic_store(&s.ddr.dot, covered)
 	case .DoH:
 		sync.atomic_store(&s.ddr.doh, covered)
+		key = "doh"
 	}
-	return name == "" || covered
+	if name == "" || covered {
+		return true
+	}
+	if reloaded {
+		logx.errorf("ddr.name: the certificate of listeners.%s no longer covers %s, so _dns.resolver.arpa stops designating it", key, name)
+	} else {
+		logx.errorf("ddr.name: the certificate of listeners.%s does not cover %s, so _dns.resolver.arpa does not designate it", key, name)
+	}
+	return false
 }
 
 @(private)
