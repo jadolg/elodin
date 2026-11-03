@@ -1941,6 +1941,18 @@ resolve_query :: proc(
 		this query forwards as any miss would.
 		*/
 		for rejoined := false; ; rejoined = true {
+			/*
+			Going round, the deadline starts again, here before the join as the
+			first one was: the leader it waited on did land with something it
+			could use, which the cache then lost, and what that wait left may be
+			nothing. Kept, a follower that leads the next exchange would ask
+			nobody and hand its followers that failure, and one that follows
+			would hold its patience against a leader that may have joined the
+			first flight after it.
+			*/
+			if rejoined {
+				deadline = time.tick_add(time.tick_now(), span)
+			}
 			joined, counted := flight_join(s, key, &own_flight, pool == .Shared, ceiling)
 			if joined == &own_flight {
 				flight = joined

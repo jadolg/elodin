@@ -291,6 +291,8 @@ run_burst :: proc(
 	// And lead the exchange its followers go round for by hand too, landing it
 	// the same way.
 	evicted_twice := false,
+	// How long the hand-made leader holds its followers before it lands.
+	land_after: time.Duration = 0,
 ) -> int {
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
@@ -396,6 +398,7 @@ run_burst :: proc(
 			time.sleep(time.Millisecond)
 		}
 		testing.expect_value(t, waiting_on(&srv), clients_asking)
+		time.sleep(land_after)
 		leaders[round].stored = evicted
 		if evicted_twice && round == 0 {
 			land_into(&srv, &leaders[0], &leaders[1])
@@ -786,6 +789,26 @@ test_followers_of_an_evicted_verdict_rejoin_the_flight :: proc(t: ^testing.T) {
 }
 
 /*
+A follower going round leads with a deadline of its own from that moment, not
+with what its first wait left (issue #428): one that waited out its deadline on
+the evicted leader would otherwise lead on nothing, ask nobody, and hand that
+failure to every query following it.
+
+The hand-made leader lands at three timeouts, past the followers' deadline of
+two and inside their patience of four.
+*/
+@(test)
+test_a_follower_going_round_leads_on_a_deadline_of_its_own :: proc(t: ^testing.T) {
+	TIMEOUT :: 250 * time.Millisecond
+	clients: [CLIENTS]Client
+	queries := run_burst(t, &clients, timeout = TIMEOUT, evicted = .Bogus, land_after = 3 * TIMEOUT)
+	testing.expectf(t, queries == 1, "the upstream saw the question %d times for %d clients, want 1", queries, CLIENTS)
+	for c, i in clients {
+		testing.expectf(t, c.ok && c.rcode == .No_Error, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
+	}
+}
+
+/*
 Once only: a second leader's verdict gone as fast as the first's is a cache that
 holds nothing, and each follower forwards on its own rather than going round
 again (issue #428).
@@ -793,7 +816,8 @@ again (issue #428).
 @(test)
 test_followers_rejoin_an_evicted_verdict_once_only :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, evicted = .Bogus, evicted_twice = true)
+	// Nobody follows the forwards at the end, so the mock holds none of them.
+	queries := run_burst(t, &clients, evicted = .Bogus, evicted_twice = true, hold_for = 0)
 	testing.expectf(t, queries == CLIENTS, "the upstream saw the question %d times for %d clients, want one each", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .No_Error, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
