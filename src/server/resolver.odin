@@ -426,20 +426,8 @@ handle_query :: proc(
 		log_query(s, client, proto, q, .Refused, "edns", started)
 		response, outcome, ok = out, .Refused, built
 	} else {
-		response, outcome, ok = resolve_query(
-			s,
-			query,
-			msg,
-			proto,
-			client,
-			limit,
-			cookie,
-			started,
-			&spent,
-			allocator,
-			ede = &ede,
-			pool = pool,
-		)
+		r := resolve_query(s, query, msg, proto, client, limit, cookie, started, &spent, allocator, pool = pool)
+		response, outcome, ok, ede = r.response, r.outcome, r.ok, r.ede
 	}
 	if ok {
 		/*
@@ -1099,6 +1087,121 @@ edns_option_sent :: proc(msg: dns.Message, code: dns.EDNS_Option_Code) -> bool {
 @(private)
 query_failed_reported: [upstream.Error]logx.Gate
 
+/*
+What `resolve_query` hands back for one question.
+*/
+@(private)
+Resolution :: struct {
+	response: []u8,
+	outcome:  Outcome,
+	ok:       bool,
+	/*
+	The extended error the answer is served with, for `handle_query` to attach
+	once the answer's OPT record is this server's own. Only an answer served as
+	it arrived - forwarded, or out of the cache - sets it; see `ceiling_ede`.
+	*/
+	ede:      u16,
+	/*
+	Set only by a detached refresh, where the upstream produced nothing. The
+	request that started the refresh is holding the expired entry and serves it
+	itself, so this reports the failure instead of counting a client answer
+	against it. See `refresh.odin`.
+	*/
+	unanswered: bool,
+}
+
+/*
+One question on its way through `resolve_query`: the request it came in as,
+what each stage has worked out for the stages after it, and the answer once a
+stage has one.
+
+Lives in `resolve_query`'s frame and is handed down by pointer, which two of its
+fields rely on: `key` is a slice of `key_buf`, and a leader's `own_flight` sits
+in the in-flight table until it lands, both for as long as that frame does.
+*/
+@(private)
+Query_State :: struct {
+	// The request, as `resolve_query` was called with it.
+	s:                ^Server,
+	query:            []u8,
+	msg:              dns.Message,
+	q:                dns.Question,
+	proto:            Protocol,
+	client:           string,
+	limit:            int,
+	cookie:           Cookie_Request,
+	started:          time.Tick,
+	// What this request has taken out of its arena reading messages, owned by
+	// `handle_query`, which owns that arena. See `dns.REQUEST_DECODE_BUDGET`.
+	spent:            ^int,
+	allocator:        mem.Allocator,
+	/*
+	This call *is* a detached refresh of an expired entry, rather than a
+	client's own query.
+
+	Two things turn on it, and both are about who owns the expired bytes. A
+	refresh does not start another one, which is what keeps `serve_stale` from
+	recursing a query at a time; and where the upstream produces nothing, it
+	reports that in `unanswered` instead of reaching for the entry and counting a
+	client answer against it.
+	*/
+	refresh:          bool,
+	pool:             dnssec.Walk_Pool,
+
+	// Settled by `answer_from_cache`.
+	validating:       bool,
+	key_buf:          [cache.KEY_MAX]u8,
+	key:              string,
+	verdict_buf:      [cache.KEY_MAX]u8,
+	verdict_key:      string,
+	generation:       u64,
+	stale_hit:        Cached_Answer,
+	// Built by `shape_forwarded`.
+	forwarded:        []u8,
+	// Started by `join_flight`.
+	span:             time.Duration,
+	deadline:         time.Tick,
+	own_flight:       Flight,
+	flight:           ^Flight,
+	// What `exchange_upstream` got back.
+	resp:             []u8,
+	winner:           ^upstream.Upstream,
+	uerr:             upstream.Error,
+	unproven_apex_ds: bool,
+	// The validator's extended error, which the store keeps with the answer.
+	answer_ede:       u16,
+
+	// The answer, once a stage has one; see `Resolution`.
+	response:         []u8,
+	outcome:          Outcome,
+	ok:               bool,
+	ede:              u16,
+	unanswered:       bool,
+}
+
+/*
+Answer one question, which `handle_query` has already found well formed.
+
+The order of the stages below is the server's central invariant. Each one
+answers the question or hands it on, and each comment block inside them argues
+why it sits where it does:
+
+- `answer_locally`: the opcode, question count, cookie, class and XFR gates,
+  then the rewrites, the block lists, the DDR zone and the special-use table -
+  everything this server answers without looking anything up;
+- `answer_from_cache`: a fresh hit, the RD=0 gate, a remembered Bogus verdict
+  and the `serve_stale` refresh - everything that answers without an upstream;
+- `shape_forwarded`: the outgoing query, with what is the client's taken out
+  and what is ours put in;
+- `join_flight`: one exchange for every identical question in flight;
+- `exchange_upstream`: the zone's route, and the apex `DS` carve-out;
+- `judge_reply`: a reply that is no answer, or that the client cannot read;
+- `validate_reply`: DNSSEC;
+- `finish_answer`: the TTL bounds, the rebinding and cloaking checks, the store.
+
+A new rule goes into the stage it belongs to, and the stage's own order says
+where inside it.
+*/
 @(private)
 resolve_query :: proc(
 	s: ^Server,
@@ -1109,52 +1212,77 @@ resolve_query :: proc(
 	limit: int,
 	cookie: Cookie_Request,
 	started: time.Tick,
-	// What this request has taken out of its arena reading messages, owned by
-	// `handle_query`, which owns that arena. See `dns.REQUEST_DECODE_BUDGET`.
 	spent: ^int,
 	allocator: mem.Allocator,
-	/*
-	Non-nil when this call *is* a detached refresh of an expired entry, rather
-	than a client's own query.
-
-	Two things turn on it, and both are about who owns the expired bytes. A
-	refresh does not start another one, which is what keeps `serve_stale` from
-	recursing a query at a time; and where the upstream produces nothing, it
-	reports that here instead of reaching for the entry and counting a client
-	answer against it - the request that started the refresh is holding that
-	entry and serves it itself. See `refresh.odin`.
-	*/
-	unanswered: ^bool = nil,
-	/*
-	Where the extended error an answer is served with is written, for
-	`handle_query` to attach once the answer's OPT record is this server's own.
-	Only an answer served as it arrived - forwarded, or out of the cache - sets
-	it; see `ceiling_ede`.
-	*/
-	ede: ^u16 = nil,
+	// See `Query_State.refresh`.
+	refresh := false,
 	// See `handle_query`. A refresh is counted in `max_pending`, which is the default.
 	pool := dnssec.Walk_Pool.Shared,
-) -> (
-	response: []u8,
-	outcome: Outcome,
-	ok: bool,
-) {
-	if msg.flags.opcode != .Query {
-		out, built := dns.error_response(query, msg, .Not_Impl, allocator, limit)
-		return out, .Refused, built
+) -> Resolution {
+	st := Query_State {
+		s         = s,
+		query     = query,
+		msg       = msg,
+		proto     = proto,
+		client    = client,
+		limit     = limit,
+		cookie    = cookie,
+		started   = started,
+		spent     = spent,
+		allocator = allocator,
+		refresh   = refresh,
+		pool      = pool,
 	}
-	if len(msg.question) != 1 {
-		rcode, priming := cookie_priming_rcode(msg, cookie)
-		out, built := dns.error_response(query, msg, rcode, allocator, limit)
+	resolve_stages(&st)
+	return {st.response, st.outcome, st.ok, st.ede, st.unanswered}
+}
+
+@(private)
+resolve_stages :: proc(st: ^Query_State) {
+	if answer_locally(st) || answer_from_cache(st) || shape_forwarded(st) || join_flight(st) {
+		return
+	}
+	defer if st.flight != nil {
+		flight_land(st.s, st.flight)
+	}
+	exchange_upstream(st)
+	if judge_reply(st) || validate_reply(st) {
+		return
+	}
+	finish_answer(st)
+}
+
+// The answer a stage settled on, and `true` for the stage to return: the
+// question goes no further.
+@(private)
+answered :: proc(st: ^Query_State, response: []u8, outcome: Outcome, ok: bool) -> bool {
+	st.response, st.outcome, st.ok = response, outcome, ok
+	return true
+}
+
+/*
+Everything this server answers for itself, without a cache lookup or an
+upstream: the request-shape gates, then the operator's rewrites and block lists,
+then the tables. See `resolve_query` for where this sits.
+*/
+@(private)
+answer_locally :: proc(st: ^Query_State) -> bool {
+	if st.msg.flags.opcode != .Query {
+		out, built := dns.error_response(st.query, st.msg, .Not_Impl, st.allocator, st.limit)
+		return answered(st, out, .Refused, built)
+	}
+	if len(st.msg.question) != 1 {
+		rcode, priming := cookie_priming_rcode(st.msg, st.cookie)
+		out, built := dns.error_response(st.query, st.msg, rcode, st.allocator, st.limit)
 		if !priming {
-			return out, .Failed, built
+			return answered(st, out, .Failed, built)
 		}
 		primed := Outcome.Local if rcode == .No_Error else Outcome.Refused
-		log_query(s, client, proto, {}, primed, "cookie", started)
-		return out, primed, built
+		log_query(st.s, st.client, st.proto, {}, primed, "cookie", st.started)
+		return answered(st, out, primed, built)
 	}
 
-	q := msg.question[0]
+	st.q = st.msg.question[0]
 
 	/*
 	A client that cannot show a cookie we issued is turned away before any work
@@ -1168,57 +1296,57 @@ resolve_query :: proc(
 	and meant for use while an attack is actually happening (RFC 7873 section
 	5.2.3).
 	*/
-	if cookie_must_be_refused(live(s).cookies, cookie, proto) {
-		out, built := dns.error_response(query, msg, .Bad_Cookie, allocator, limit)
-		log_query(s, client, proto, q, .Refused, "cookie", started)
-		return out, .Refused, built
+	if cookie_must_be_refused(live(st.s).cookies, st.cookie, st.proto) {
+		out, built := dns.error_response(st.query, st.msg, .Bad_Cookie, st.allocator, st.limit)
+		log_query(st.s, st.client, st.proto, st.q, .Refused, "cookie", st.started)
+		return answered(st, out, .Refused, built)
 	}
 
-	if q.class == .CH {
-		if out, handled := answer_chaos(s, msg, q, allocator, limit); handled {
-			log_query(s, client, proto, q, .Local, "chaos", started)
-			return out, .Local, true
+	if st.q.class == .CH {
+		if out, handled := answer_chaos(st.s, st.msg, st.q, st.allocator, st.limit); handled {
+			log_query(st.s, st.client, st.proto, st.q, .Local, "chaos", st.started)
+			return answered(st, out, .Local, true)
 		}
 	}
-	if q.class != .IN && q.class != .ANY {
-		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
-		log_query(s, client, proto, q, .Refused, "class", started)
-		return out, .Refused, built
+	if st.q.class != .IN && st.q.class != .ANY {
+		out, built := dns.error_response(st.query, st.msg, .Refused, st.allocator, st.limit)
+		log_query(st.s, st.client, st.proto, st.q, .Refused, "class", st.started)
+		return answered(st, out, .Refused, built)
 	}
 
 	// Zone transfers make no sense against a forwarder.
-	#partial switch q.type {
+	#partial switch st.q.type {
 	case .AXFR, .IXFR:
-		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
-		log_query(s, client, proto, q, .Refused, "xfr", started)
-		return out, .Refused, built
+		out, built := dns.error_response(st.query, st.msg, .Refused, st.allocator, st.limit)
+		log_query(st.s, st.client, st.proto, st.q, .Refused, "xfr", st.started)
+		return answered(st, out, .Refused, built)
 	}
 
-	if out, matched, alias := apply_rewrite(s, msg, q, allocator, limit); matched {
+	if out, matched, alias := apply_rewrite(st.s, st.msg, st.q, st.allocator, st.limit); matched {
 		counted := false
 		// Not in a detached refresh, whose answer is neither served nor - being
 		// a rewrite - stored, and which must not start another one.
-		if cname, is_alias := alias.?; is_alias && unanswered == nil {
+		if cname, is_alias := alias.?; is_alias && !st.refresh {
 			out, counted = chase_rewrite_alias(
-				s,
+				st.s,
 				out,
 				cname,
-				msg,
-				proto,
-				client,
-				limit,
-				cookie,
-				started,
-				spent,
-				allocator,
-				pool,
+				st.msg,
+				st.proto,
+				st.client,
+				st.limit,
+				st.cookie,
+				st.started,
+				st.spent,
+				st.allocator,
+				st.pool,
 			)
 		}
 		if !counted {
-			count_answer(&s.stats.rewritten)
+			count_answer(&st.s.stats.rewritten)
 		}
-		log_query(s, client, proto, q, .Rewritten, "rewrite", started)
-		return out, .Rewritten, true
+		log_query(st.s, st.client, st.proto, st.q, .Rewritten, "rewrite", st.started)
+		return answered(st, out, .Rewritten, true)
 	}
 
 	/*
@@ -1236,19 +1364,19 @@ resolve_query :: proc(
 	`detail=rewrite-ptr` is what tells an operator debugging a reverse lookup
 	that this server answered it out of a forward rule rather than forwarding it.
 	*/
-	if out, matched := apply_reverse_rewrite(s, msg, q, allocator, limit); matched {
-		count_answer(&s.stats.rewritten)
-		log_query(s, client, proto, q, .Rewritten, "rewrite-ptr", started)
-		return out, .Rewritten, true
+	if out, matched := apply_reverse_rewrite(st.s, st.msg, st.q, st.allocator, st.limit); matched {
+		count_answer(&st.s.stats.rewritten)
+		log_query(st.s, st.client, st.proto, st.q, .Rewritten, "rewrite-ptr", st.started)
+		return answered(st, out, .Rewritten, true)
 	}
 
-	if live(s).cfg.blocking.enabled && s.filters != nil {
+	if live(st.s).cfg.blocking.enabled && st.s.filters != nil {
 		typed_only: bool
-		if filter.engine_match(s.filters, q.name, q.type, &typed_only) == .Blocked {
-			count_answer(&s.stats.blocked)
-			out := build_block_response(s, msg, q, allocator, limit, typed_only)
-			log_query(s, client, proto, q, .Blocked, "list", started)
-			return out, .Blocked, true
+		if filter.engine_match(st.s.filters, st.q.name, st.q.type, &typed_only) == .Blocked {
+			count_answer(&st.s.stats.blocked)
+			out := build_block_response(st.s, st.msg, st.q, st.allocator, st.limit, typed_only)
+			log_query(st.s, st.client, st.proto, st.q, .Blocked, "list", st.started)
+			return answered(st, out, .Blocked, true)
 		}
 	}
 
@@ -1273,10 +1401,10 @@ resolve_query :: proc(
 	answered here. Such a list is already breaking every reverse lookup on the
 	machine, so it is not a configuration this ordering has to protect.
 	*/
-	if is_resolver_arpa(q.name) {
-		out := build_resolver_arpa_response(s, msg, q, allocator, limit)
-		log_query(s, client, proto, q, .Local, "ddr", started)
-		return out, .Local, true
+	if is_resolver_arpa(st.q.name) {
+		out := build_resolver_arpa_response(st.s, st.msg, st.q, st.allocator, st.limit)
+		log_query(st.s, st.client, st.proto, st.q, .Local, "ddr", st.started)
+		return answered(st, out, .Local, true)
 	}
 
 	/*
@@ -1322,21 +1450,31 @@ resolve_query :: proc(
 	one thing here an operator has a reason to watch, and the counter is the only
 	way to see it without running the query log.
 	*/
-	if zone, kind := special_use_zone(s, q.name, q.type); kind != .None {
-		out := answer_special_use(msg, q, zone, kind, allocator, limit)
+	if zone, kind := special_use_zone(st.s, st.q.name, st.q.type); kind != .None {
+		out := answer_special_use(st.msg, st.q, zone, kind, st.allocator, st.limit)
 		// A private reverse zone is not counted: every LAN PTR lands there, and
 		// folded in it would drown the `.onion` and `localhost.` signal the
 		// counter exists for. The query log still tells them apart.
 		private_reverse := kind == .Empty_Nonterminal || (kind == .Empty_Zone && zone != "home.arpa.")
 		if private_reverse {
-			log_query(s, client, proto, q, .Local, "private-reverse", started)
+			log_query(st.s, st.client, st.proto, st.q, .Local, "private-reverse", st.started)
 		} else {
-			sync.atomic_add(&s.stats.special_use, 1)
-			log_query(s, client, proto, q, .Local, "special-use", started)
+			sync.atomic_add(&st.s.stats.special_use, 1)
+			log_query(st.s, st.client, st.proto, st.q, .Local, "special-use", st.started)
 		}
-		return out, .Local, true
+		return answered(st, out, .Local, true)
 	}
+	return false
+}
 
+/*
+Everything that answers without an upstream once the tables have had their turn:
+a fresh cache hit, the RD=0 gate, a remembered Bogus verdict, and the wait on
+an expired entry's refresh. Settles the cache keys and `validating` for the
+stages after it.
+*/
+@(private)
+answer_from_cache :: proc(st: ^Query_State) -> bool {
 	// A client that sets CD is asking for the upstream's answer whatever we
 	// think of it, so validation is skipped - and the answer is kept apart in
 	// the cache so it cannot be served to a client that did want it checked.
@@ -1363,29 +1501,27 @@ resolve_query :: proc(
 	// this zone is answered by a local authority, whose unsigned data sits
 	// under a signed public parent that delegates nothing to it. The same
 	// anchor escape hatch applies, and for the same reason. See `routes.odin`.
-	validating :=
-		live(s).validator != nil &&
-		!msg.flags.cd &&
-		q.class == .IN &&
-		!served_locally(s, q.name) &&
-		!special_use_deferred(s, q.name)
+	st.validating =
+		live(st.s).validator != nil &&
+		!st.msg.flags.cd &&
+		st.q.class == .IN &&
+		!served_locally(st.s, st.q.name) &&
+		!special_use_deferred(st.s, st.q.name)
 
 	// Under this generation's policy number, so an answer judged by rules a
 	// reload has since replaced is never found here; see `Live.policy`.
-	policy := live(s).policy
-	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], q.name, q.type, q.class, dns.edns_do(msg), msg.flags.cd, policy = policy)
+	policy := live(st.s).policy
+	st.key = cache.make_key(st.key_buf[:], st.q.name, st.q.type, st.q.class, dns.edns_do(st.msg), st.msg.flags.cd, policy = policy)
 	// Where a `Bogus` verdict for this question is remembered, if one was
 	// reached. A key of its own so that the memory costs the answer under the
 	// question's own key nothing; see `remember_bogus_verdict`.
-	verdict_buf: [cache.KEY_MAX]u8
-	verdict_key := cache.make_key(
-		verdict_buf[:],
-		q.name,
-		q.type,
-		q.class,
-		dns.edns_do(msg),
-		msg.flags.cd,
+	st.verdict_key = cache.make_key(
+		st.verdict_buf[:],
+		st.q.name,
+		st.q.type,
+		st.q.class,
+		dns.edns_do(st.msg),
+		st.msg.flags.cd,
 		verdict = true,
 		policy = policy,
 	)
@@ -1406,7 +1542,7 @@ resolve_query :: proc(
 	value nothing reads. With blocking off there are no rules to have matched an
 	entry against, so the number would date nothing.
 	*/
-	generation := rules_generation(s)
+	st.generation = rules_generation(st.s)
 
 	/*
 	An expired entry that `serve_stale` kept, held back rather than served.
@@ -1421,7 +1557,6 @@ resolve_query :: proc(
 	where it is about to be served, since while the upstream is healthy a copy
 	taken here is up to 64 KB per query that nothing reads.
 	*/
-	stale_hit: Cached_Answer
 
 	/*
 	A fresh hit near its expiry also refreshes the entry behind the client, so
@@ -1434,15 +1569,15 @@ resolve_query :: proc(
 	replace it, and a hit on it would serve the very bytes it came to renew.
 	*/
 	if !prefetching {
-		wants_prefetch := unanswered == nil && msg.flags.rd
-		if stored, found := stored_answer(s, key, generation, allocator, wants_prefetch); found {
+		wants_prefetch := !st.refresh && st.msg.flags.rd
+		if stored, found := stored_answer(st.s, st.key, st.generation, st.allocator, wants_prefetch); found {
 			if !stored.stale {
 				if stored.prefetch {
-					start_prefetch(s, key, query, proto, client, limit, stored.serial)
+					start_prefetch(st.s, st.key, st.query, st.proto, st.client, st.limit, stored.serial)
 				}
-				return serve_from_cache(s, stored, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+				return answered(st, serve_from_cache(st, stored))
 			}
-			stale_hit = stored
+			st.stale_hit = stored
 		}
 	}
 
@@ -1469,13 +1604,13 @@ resolve_query :: proc(
 	query log is where this one shows, as `outcome=refused detail=rd`, when
 	`log.queries` is on.
 	*/
-	if !msg.flags.rd {
-		if lent, found := lend_stale(s, stale_hit, allocator); found {
-			return serve_from_cache(s, lent, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+	if !st.msg.flags.rd {
+		if lent, found := lend_stale(st.s, st.stale_hit, st.allocator); found {
+			return answered(st, serve_from_cache(st, lent))
 		}
-		out, built := dns.error_response(query, msg, .Refused, allocator, limit)
-		log_query(s, client, proto, q, .Refused, "rd", started)
-		return out, .Refused, built
+		out, built := dns.error_response(st.query, st.msg, .Refused, st.allocator, st.limit)
+		log_query(st.s, st.client, st.proto, st.q, .Refused, "rd", st.started)
+		return answered(st, out, .Refused, built)
 	}
 
 	/*
@@ -1509,9 +1644,9 @@ resolve_query :: proc(
 	gives a verdict no stale window for that reason, so this asks a question the
 	cache has already answered - and asks it anyway rather than resting on it.
 	*/
-	if validating {
-		if remembered, found := stored_verdict(s, verdict_key, allocator); found {
-			return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
+	if st.validating {
+		if remembered, found := stored_verdict(st.s, st.verdict_key, st.allocator); found {
+			return answered(st, serve_bogus_verdict(st.s, remembered, st.query, st.msg, st.q, st.proto, st.client, st.started))
 		}
 	}
 
@@ -1555,18 +1690,16 @@ resolve_query :: proc(
 	of them leaves the entry unrefreshed for longer than the refresh that is
 	already in flight or the load that is shedding them.
 	*/
-	if unanswered == nil &&
-	   stale_hit.stale &&
-	   live(s).cfg.cache.stale_timeout > 0 &&
-	   can_detach(s) {
-		if r := start_refresh(s, key, query, proto, client, limit, started); r != nil {
+	if !st.refresh &&
+	   st.stale_hit.stale &&
+	   live(st.s).cfg.cache.stale_timeout > 0 &&
+	   can_detach(st.s) {
+		if r := start_refresh(st.s, st.key, st.query, st.proto, st.client, st.limit, st.started); r != nil {
 			defer refresh_release(r)
-			if out, refreshed, code, taken := refresh_take(r, live(s).cfg.cache.stale_timeout, allocator);
+			if out, refreshed, code, taken := refresh_take(r, live(st.s).cfg.cache.stale_timeout, st.allocator);
 			   taken {
-				if ede != nil {
-					ede^ = code
-				}
-				return out, refreshed, true
+				st.ede = code
+				return answered(st, out, refreshed, true)
 			}
 			/*
 			A held copy whose signatures lapsed while the timer ran is no
@@ -1575,41 +1708,33 @@ resolve_query :: proc(
 			answer is not settled yet, and the client waits the refresh out
 			rather than being failed at the timer.
 			*/
-			if !stale_usable(stale_hit) {
-				wait := question_span(s, q.name, q.type) - live(s).cfg.cache.stale_timeout
-				if out, refreshed, code, taken := refresh_take(r, max(wait, 0), allocator); taken {
-					if ede != nil {
-						ede^ = code
-					}
-					return out, refreshed, true
+			if !stale_usable(st.stale_hit) {
+				wait := question_span(st.s, st.q.name, st.q.type) - live(st.s).cfg.cache.stale_timeout
+				if out, refreshed, code, taken := refresh_take(r, max(wait, 0), st.allocator); taken {
+					st.ede = code
+					return answered(st, out, refreshed, true)
 				}
 			}
 		}
-		return upstream_failed(
-			s,
-			stale_hit,
-			query,
-			msg,
-			q,
-			proto,
-			client,
-			limit,
-			validating,
-			started,
-			spent,
-			allocator,
-			ede,
-		)
+		return answered(st, upstream_failed(st))
 	}
+	return false
+}
 
+/*
+The query as it goes to the upstream, in `st.forwarded`: what is the client's
+taken out, and what is ours put in. Answers only where a strip fails closed.
+*/
+@(private)
+shape_forwarded :: proc(st: ^Query_State) -> bool {
 	// Validation needs the signatures, so the question goes out again with DO
 	// and CD set rather than as the client wrote it.
-	forwarded := query
-	if validating {
-		if rewritten, built := dnssec_upstream_query(msg, allocator); built {
-			forwarded = rewritten
+	st.forwarded = st.query
+	if st.validating {
+		if rewritten, built := dnssec_upstream_query(st.msg, st.allocator); built {
+			st.forwarded = rewritten
 		} else {
-			validating = false
+			st.validating = false
 		}
 	}
 
@@ -1632,8 +1757,8 @@ resolve_query :: proc(
 	client's cookie travel whenever both were turned off, and to DoT and DoH
 	upstreams, which never carry a cookie of ours, whenever the first one was.
 	*/
-	if cookie.sent {
-		stripped, done := dns.remove_edns_option(forwarded, .Cookie, allocator, spent)
+	if st.cookie.sent {
+		stripped, done := dns.remove_edns_option(st.forwarded, .Cookie, st.allocator, st.spent)
 		if !done {
 			/*
 			Failing closed. A query this server cannot take the cookie back out
@@ -1642,18 +1767,18 @@ resolve_query :: proc(
 			block exists to prevent. Losing the answer is the cheaper mistake,
 			and the client is told so rather than left waiting.
 			*/
-			count_answer(&s.stats.failed)
-			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+			count_answer(&st.s.stats.failed)
+			out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
 			logx.warnf(
 				"could not strip the client cookie from %s %s from %s; not forwarding",
-				dns.type_name(q.type),
-				dns.name_trim_root(q.name),
-				client,
+				dns.type_name(st.q.type),
+				dns.name_trim_root(st.q.name),
+				st.client,
 			)
-			log_query(s, client, proto, q, .Failed, "cookie", started)
-			return out, .Failed, built
+			log_query(st.s, st.client, st.proto, st.q, .Failed, "cookie", st.started)
+			return answered(st, out, .Failed, built)
 		}
-		forwarded = stripped
+		st.forwarded = stripped
 	}
 
 	/*
@@ -1708,8 +1833,8 @@ resolve_query :: proc(
 	whose RDATA is not a well-formed option list. Both would have survived a
 	removal that reported success; see `edns_opt_readable`.
 	*/
-	if edns_option_sent(msg, .Client_Subnet) {
-		stripped, done := dns.remove_edns_option(forwarded, .Client_Subnet, allocator, spent)
+	if edns_option_sent(st.msg, .Client_Subnet) {
+		stripped, done := dns.remove_edns_option(st.forwarded, .Client_Subnet, st.allocator, st.spent)
 		if !done {
 			/*
 			Failing closed, as the cookie above does, and for a reason that
@@ -1721,18 +1846,18 @@ resolve_query :: proc(
 			it. Nobody else's queries are affected by the refusal, and the
 			client is told rather than left waiting.
 			*/
-			count_answer(&s.stats.failed)
-			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+			count_answer(&st.s.stats.failed)
+			out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
 			logx.warnf(
 				"could not strip the client subnet from %s %s from %s; not forwarding",
-				dns.type_name(q.type),
-				dns.name_trim_root(q.name),
-				client,
+				dns.type_name(st.q.type),
+				dns.name_trim_root(st.q.name),
+				st.client,
 			)
-			log_query(s, client, proto, q, .Failed, "ecs", started)
-			return out, .Failed, built
+			log_query(st.s, st.client, st.proto, st.q, .Failed, "ecs", st.started)
+			return answered(st, out, .Failed, built)
 		}
-		forwarded = stripped
+		st.forwarded = stripped
 	}
 
 	/*
@@ -1771,8 +1896,8 @@ resolve_query :: proc(
 	upstream wrote, so an upstream's keepalive cannot reach a client whether or
 	not this strip runs.
 	*/
-	if edns_option_sent(msg, .TCP_Keepalive) {
-		stripped, done := dns.remove_edns_option(forwarded, .TCP_Keepalive, allocator, spent)
+	if edns_option_sent(st.msg, .TCP_Keepalive) {
+		stripped, done := dns.remove_edns_option(st.forwarded, .TCP_Keepalive, st.allocator, st.spent)
 		if !done {
 			/*
 			Failing closed, as both strips above do, and deliberately out of
@@ -1789,18 +1914,18 @@ resolve_query :: proc(
 			list stays one rule rather than three, and a fourth strip added
 			later is read off a list that agrees with itself.
 			*/
-			count_answer(&s.stats.failed)
-			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+			count_answer(&st.s.stats.failed)
+			out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
 			logx.warnf(
 				"could not strip the client keepalive from %s %s from %s; not forwarding",
-				dns.type_name(q.type),
-				dns.name_trim_root(q.name),
-				client,
+				dns.type_name(st.q.type),
+				dns.name_trim_root(st.q.name),
+				st.client,
 			)
-			log_query(s, client, proto, q, .Failed, "keepalive", started)
-			return out, .Failed, built
+			log_query(st.s, st.client, st.proto, st.q, .Failed, "keepalive", st.started)
+			return answered(st, out, .Failed, built)
 		}
-		forwarded = stripped
+		st.forwarded = stripped
 	}
 
 	/*
@@ -1826,10 +1951,10 @@ resolve_query :: proc(
 	back the message unchanged when there was no option to remove, so a buffer
 	arriving here can be the client's own either way.
 	*/
-	if raw_data(forwarded) == raw_data(query) {
-		forwarded = dns.clone_message_bytes(forwarded, allocator)
+	if raw_data(st.forwarded) == raw_data(st.query) {
+		st.forwarded = dns.clone_message_bytes(st.forwarded, st.allocator)
 	}
-	dns.set_id_in_place(forwarded, dns.random_id())
+	dns.set_id_in_place(st.forwarded, dns.random_id())
 	/*
 	And the client's own EXTENDED-RCODE byte does not go out with it.
 
@@ -1848,7 +1973,7 @@ resolve_query :: proc(
 
 	Best-effort by design: a query with no OPT record has no field to clear.
 	*/
-	_ = dns.clear_edns_extended_rcode(forwarded)
+	_ = dns.clear_edns_extended_rcode(st.forwarded)
 
 	/*
 	And the payload size the upstream is told is ours, not the client's.
@@ -1903,10 +2028,19 @@ resolve_query :: proc(
 	while writing it to another would let that decoy choose what is written.
 	*/
 	_ = dns.set_edns_udp_size(
-		forwarded,
-		u16(clamp(int(dns.peek_udp_size(forwarded)), dns.MAX_UDP_SIZE, UPSTREAM_UDP_SIZE)),
+		st.forwarded,
+		u16(clamp(int(dns.peek_udp_size(st.forwarded)), dns.MAX_UDP_SIZE, UPSTREAM_UDP_SIZE)),
 	)
+	return false
+}
 
+/*
+Starts the question's upstream deadline and joins the flight for its key, which
+either makes this query the leader, in `st.flight`, or hands it what the leader
+landed with. See `inflight.odin`.
+*/
+@(private)
+join_flight :: proc(st: ^Query_State) -> bool {
 	/*
 	One upstream exchange for every identical question in flight at once, which
 	`inflight.odin` argues. Not for a detached refresh, which `refresh.odin`
@@ -1926,12 +2060,10 @@ resolve_query :: proc(
 	before this point is reached, so its nested call starts its own. See
 	`question_span`.
 	*/
-	span := question_span(s, q.name, q.type)
-	deadline := time.tick_add(time.tick_now(), span)
-	own_flight: Flight
-	flight: ^Flight
-	if unanswered == nil {
-		ceiling := follower_ceiling(s)
+	st.span = question_span(st.s, st.q.name, st.q.type)
+	st.deadline = time.tick_add(time.tick_now(), st.span)
+	if !st.refresh {
+		ceiling := follower_ceiling(st.s)
 		/*
 		Round once more when the leader's stored verdict is gone by the time this
 		follower reads it - evicted from a cache at its bounds, or expired - so the
@@ -1951,41 +2083,27 @@ resolve_query :: proc(
 			first flight after it.
 			*/
 			if rejoined {
-				deadline = time.tick_add(time.tick_now(), span)
+				st.deadline = time.tick_add(time.tick_now(), st.span)
 			}
-			joined, counted := flight_join(s, key, &own_flight, pool == .Shared, ceiling)
-			if joined == &own_flight {
-				flight = joined
-				flight.forwarded = forwarded
+			joined, counted := flight_join(st.s, st.key, &st.own_flight, st.pool == .Shared, ceiling)
+			if joined == &st.own_flight {
+				st.flight = joined
+				st.flight.forwarded = st.forwarded
 			} else if joined != nil {
-				patience := flight_patience(deadline, span)
-				landed_with, _, same := flight_follow(s, joined, patience, allocator, counted, forwarded)
+				patience := flight_patience(st.deadline, st.span)
+				landed_with, _, same := flight_follow(st.s, joined, patience, st.allocator, counted, st.forwarded)
 				// A NOERROR or NXDOMAIN is shared as the cache shares it - so not with
 				// the cache off, where nothing is shared between two messages - and any
 				// other rcode may be about the leader's own bytes, unless they were these.
 				if landed_with.answer != nil {
 					rcode := dns.peek_rcode(landed_with.answer)
-					if same || (live(s).cfg.cache.enabled && (rcode == .No_Error || rcode == .NX_Domain)) {
+					if same || (live(st.s).cfg.cache.enabled && (rcode == .No_Error || rcode == .NX_Domain)) {
 						shared := Cached_Answer {
 							wire      = landed_with.answer,
 							ede       = landed_with.ede,
 							coalesced = true,
 						}
-						return serve_from_cache(
-							s,
-							shared,
-							query,
-							msg,
-							q,
-							proto,
-							client,
-							limit,
-							validating,
-							started,
-							spent,
-							allocator,
-							ede,
-						)
+						return answered(st, serve_from_cache(st, shared))
 					}
 				}
 				/*
@@ -1994,23 +2112,8 @@ resolve_query :: proc(
 				failure branch below, without the wait.
 				*/
 				if landed_with.failed && same {
-					sync.atomic_add(&s.stats.coalesced, 1)
-					return upstream_failed(
-						s,
-						stale_hit,
-						query,
-						msg,
-						q,
-						proto,
-						client,
-						limit,
-						validating,
-						started,
-						spent,
-						allocator,
-						ede,
-						"upstream-coalesced",
-					)
+					sync.atomic_add(&st.s.stats.coalesced, 1)
+					return answered(st, upstream_failed(st, "upstream-coalesced"))
 				}
 				/*
 				The leader stored a verdict, which the cache now answers with: a
@@ -2023,42 +2126,28 @@ resolve_query :: proc(
 				*/
 				#partial switch landed_with.stored {
 				case .Cloak:
-					stored, found := stored_answer(s, key, rules_generation(s), allocator)
+					stored, found := stored_answer(st.s, st.key, rules_generation(st.s), st.allocator)
 					if found && stored.stale {
 						// Expired already: the fallback for this query's own forward.
-						stale_hit = stored
+						st.stale_hit = stored
 					} else if found {
 						// Counted here only where the entry is refused or unreadable:
 						// served, `serve_from_cache` counts it as the coalesced answer
 						// its log line then says it is.
 						stored.coalesced = true
-						out, served, built := serve_from_cache(
-							s,
-							stored,
-							query,
-							msg,
-							q,
-							proto,
-							client,
-							limit,
-							validating,
-							started,
-							spent,
-							allocator,
-							ede,
-						)
+						out, served, built := serve_from_cache(st, stored)
 						if served != .Cached {
-							sync.atomic_add(&s.stats.coalesced, 1)
+							sync.atomic_add(&st.s.stats.coalesced, 1)
 						}
-						return out, served, built
+						return answered(st, out, served, built)
 					}
 				case .Bogus:
 					// Not gated on `validating`: the leader reached this verdict for
 					// the same key, and this query's own rewrite failing is no reason
 					// to forward what was just proved Bogus.
-					if remembered, found := stored_verdict(s, verdict_key, allocator); found {
-						sync.atomic_add(&s.stats.coalesced, 1)
-						return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
+					if remembered, found := stored_verdict(st.s, st.verdict_key, st.allocator); found {
+						sync.atomic_add(&st.s.stats.coalesced, 1)
+						return answered(st, serve_bogus_verdict(st.s, remembered, st.query, st.msg, st.q, st.proto, st.client, st.started))
 					}
 				}
 				if landed_with.stored != .None && !rejoined {
@@ -2068,10 +2157,16 @@ resolve_query :: proc(
 			break
 		}
 	}
-	defer if flight != nil {
-		flight_land(s, flight)
-	}
+	return false
+}
 
+/*
+The exchange itself, down the zone's route, with the apex `DS` carve-out's
+second and third exchanges. Leaves the reply in `st.resp`, or its failure in
+`st.uerr`; never answers on its own.
+*/
+@(private)
+exchange_upstream :: proc(st: ^Query_State) {
 	/*
 	Down the zone's own route when it has one, and to the default group when it
 	does not. The client's question is the only thing that follows a route: the
@@ -2082,7 +2177,7 @@ resolve_query :: proc(
 	follow the route either - a `DS` at the route's own apex, which only the
 	zone's parent can prove and which `route_group` sends there.
 	*/
-	asked := route_group(s, q.name, q.type)
+	asked := route_group(st.s, st.q.name, st.q.type)
 	/*
 	And the zone's own group beside it, which for that one question is not where
 	the question just went.
@@ -2096,8 +2191,8 @@ resolve_query :: proc(
 	`route_group` has already returned the zone's own group, so the two are the
 	same group and `own != asked` is false wherever it is tested below.
 	*/
-	apex_ds := apex_ds_off_route(s, q.name, q.type)
-	own := zone_route_group(s, q.name) if apex_ds else asked
+	apex_ds := apex_ds_off_route(st.s, st.q.name, st.q.type)
+	own := zone_route_group(st.s, st.q.name) if apex_ds else asked
 	/*
 	Unless that group is parked, in which case the apex `DS` skips it.
 
@@ -2125,7 +2220,6 @@ resolve_query :: proc(
 	spent either way; this only chooses not to spend it on a group whose answer is
 	already covered.
 	*/
-	unproven_apex_ds := false
 	/*
 	The parent's group when the memory below is what sent this question to the
 	route, and nil in every other arrangement.
@@ -2154,22 +2248,19 @@ resolve_query :: proc(
 		parent is asked after all.
 		*/
 		if !group_reachable(asked) {
-			logx.debugf("query DS %s: the parent's group is parked, asking the route instead", q.name)
+			logx.debugf("query DS %s: the parent's group is parked, asking the route instead", st.q.name)
 			asked = own
-			unproven_apex_ds = true
-		} else if apex_ds_memo_applies(s, q.name) {
+			st.unproven_apex_ds = true
+		} else if apex_ds_memo_applies(st.s, st.q.name) {
 			logx.debugf(
 				"query DS %s: the parent's group settled nothing for this apex inside the last cooldown, asking the route instead",
-				q.name,
+				st.q.name,
 			)
 			memoised_parent = asked
 			asked = own
-			unproven_apex_ds = true
+			st.unproven_apex_ds = true
 		}
 	}
-	resp: []u8
-	winner: ^upstream.Upstream
-	uerr: upstream.Error
 	// `parent_answers_apex_ds` over the parent's reply, read by the sweep that
 	// fetched it.
 	parent_proved, parent_settled: bool
@@ -2203,9 +2294,9 @@ resolve_query :: proc(
 		`resolve_apex_ds_parent`'s business: a member's NXDOMAIN does not say
 		the member beside it has no proof to give (issue #245).
 		*/
-		resp, winner, uerr, parent_proved, parent_settled = resolve_apex_ds_parent(asked, forwarded, q.name, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator, &deadline)
+		st.resp, st.winner, st.uerr, parent_proved, parent_settled = resolve_apex_ds_parent(asked, st.forwarded, st.q.name, st.spent, live(st.s).cfg.dnssec.max_nsec3_iterations, st.allocator, &st.deadline)
 	} else {
-		resp, winner, uerr = upstream.resolve_readable(asked, forwarded, allocator, &deadline)
+		st.resp, st.winner, st.uerr = upstream.resolve_readable(asked, st.forwarded, st.allocator, &st.deadline)
 	}
 	/*
 	And back on the route unless the parent answered the one thing the parent was
@@ -2258,7 +2349,7 @@ resolve_query :: proc(
 		the memory only decides whether the next client's apex `DS` waits on this
 		group again inside the cooldown. See `Apex_Memo`.
 		*/
-		remember_apex_ds_parent(s, q.name, uerr == .None, settled)
+		remember_apex_ds_parent(st.s, st.q.name, st.uerr == .None, settled)
 		if !proved {
 			/*
 			Two lines rather than one with both fields, because there is no
@@ -2266,22 +2357,22 @@ resolve_query :: proc(
 			the error read as the parent having answered NOERROR, which is the
 			one thing this branch has established it did not.
 			*/
-			if uerr == .None {
+			if st.uerr == .None {
 				logx.debugf(
 					"query DS %s: the parent's group answered %s%s rather than proving the delegation carries no DS, so the route is asked instead",
-					q.name,
-					rcode_text(dns.peek_rcode(resp)),
-					" (a referral)" if logx.enabled(.Debug) && dns.peek_referral(resp) else "",
+					st.q.name,
+					rcode_text(dns.peek_rcode(st.resp)),
+					" (a referral)" if logx.enabled(.Debug) && dns.peek_referral(st.resp) else "",
 				)
 			} else {
 				logx.debugf(
 					"query DS %s: the parent's group did not answer (%v), so the route is asked instead",
-					q.name,
-					uerr,
+					st.q.name,
+					st.uerr,
 				)
 			}
-			dns.set_id_in_place(forwarded, dns.random_id())
-			again, second, aerr := upstream.resolve_readable(own, forwarded, allocator, &deadline)
+			dns.set_id_in_place(st.forwarded, dns.random_id())
+			again, second, aerr := upstream.resolve_readable(own, st.forwarded, st.allocator, &st.deadline)
 			/*
 			And the route's answer is the only one that can be served from here.
 
@@ -2307,20 +2398,20 @@ resolve_query :: proc(
 			the moment its authority does.
 			*/
 			if aerr == .None {
-				resp, winner, uerr = again, second, .None
+				st.resp, st.winner, st.uerr = again, second, .None
 				/*
 				And whether that answer is one to keep turns on what the parent
 				managed to say, not on the route having answered. See the store.
 				*/
-				unproven_apex_ds = !settled
+				st.unproven_apex_ds = !settled
 			} else {
 				logx.debugf(
 					"query DS %s: the route %s (%v); the delegation is unestablished",
-					q.name,
+					st.q.name,
 					"was not asked, the query's deadline having passed" if aerr == .Deadline else "did not answer either",
 					aerr,
 				)
-				uerr = aerr
+				st.uerr = aerr
 			}
 		}
 	}
@@ -2382,11 +2473,11 @@ resolve_query :: proc(
 	were answered - at four timeouts, twenty seconds, long after the stub left.
 	*/
 	if memoised_parent != nil {
-		route_proved, _ := parent_answers_apex_ds(resp, q.name, uerr == .None, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator)
+		route_proved, _ := parent_answers_apex_ds(st.resp, st.q.name, st.uerr == .None, st.spent, live(st.s).cfg.dnssec.max_nsec3_iterations, st.allocator)
 		if !route_proved {
-			dns.set_id_in_place(forwarded, dns.random_id())
-			again, second, perr, proved, settled := resolve_apex_ds_parent(memoised_parent, forwarded, q.name, spent, live(s).cfg.dnssec.max_nsec3_iterations, allocator, &deadline)
-			remember_apex_ds_parent(s, q.name, perr == .None, settled)
+			dns.set_id_in_place(st.forwarded, dns.random_id())
+			again, second, perr, proved, settled := resolve_apex_ds_parent(memoised_parent, st.forwarded, st.q.name, st.spent, live(st.s).cfg.dnssec.max_nsec3_iterations, st.allocator, &st.deadline)
+			remember_apex_ds_parent(st.s, st.q.name, perr == .None, settled)
 			/*
 			And whether what is served from here is kept turns on what the parent
 			managed to say, exactly as it does when the parent is asked first: the
@@ -2395,16 +2486,25 @@ resolve_query :: proc(
 			changes, and standing in for nothing established is what the store
 			refuses. Read once for both replies, the proof being `settled` too.
 			*/
-			unproven_apex_ds = !settled
+			st.unproven_apex_ds = !settled
 			if proved {
 				logx.debugf(
 					"query DS %s: the route had no answer, and the parent proved the delegation carries no DS after all",
-					q.name,
+					st.q.name,
 				)
-				resp, winner, uerr = again, second, .None
+				st.resp, st.winner, st.uerr = again, second, .None
 			}
 		}
 	}
+}
+
+/*
+The reply turned down before anything reads it: a failure or a referral, which
+the stale fallback covers, and an rcode or an OPT record the client cannot read.
+Puts the client's ID back on what passes.
+*/
+@(private)
+judge_reply :: proc(st: ^Query_State) -> bool {
 	/*
 	And a referral is no answer at all (issue #410): a member that does not
 	recurse for the name said who else to ask, and a client handed that reads
@@ -2417,7 +2517,7 @@ resolve_query :: proc(
 	Here rather than beside the rcode guard below, so the refresh path and the
 	stale fallback read it as the outage it is. See `dns.peek_referral`.
 	*/
-	referral := uerr == .None && dns.peek_referral(resp)
+	referral := st.uerr == .None && dns.peek_referral(st.resp)
 	/*
 	Except a referral past a CNAME whose target this server sends somewhere
 	else. Routes `corp.` and `lab.corp.` to two authorities, and the first
@@ -2430,15 +2530,15 @@ resolve_query :: proc(
 	group has already said it cannot, and the refusal stands.
 	*/
 	if referral {
-		if target, aliased := dns.peek_alias_target(resp); aliased {
-			back := route_group(s, target, q.type)
-			if !slice.contains(back.servers, winner) {
+		if target, aliased := dns.peek_alias_target(st.resp); aliased {
+			back := route_group(st.s, target, st.q.type)
+			if !slice.contains(back.servers, st.winner) {
 				logx.debugf(
 					"query %s %s from %s: upstream %s referred past a CNAME to %s, which is asked elsewhere; handing it on",
-					dns.type_name(q.type),
-					q.name,
-					client,
-					answering_upstream(winner),
+					dns.type_name(st.q.type),
+					st.q.name,
+					st.client,
+					answering_upstream(st.winner),
 					target,
 				)
 				referral = false
@@ -2448,12 +2548,12 @@ resolve_query :: proc(
 	if referral {
 		logx.debugf(
 			"query %s %s from %s: upstream %s answered with a referral rather than recursing",
-			dns.type_name(q.type),
-			q.name,
-			client,
-			answering_upstream(winner),
+			dns.type_name(st.q.type),
+			st.q.name,
+			st.client,
+			answering_upstream(st.winner),
 		)
-	} else if uerr != .None {
+	} else if st.uerr != .None {
 		/*
 		The only line that says why a query answered `outcome=failed
 		detail=upstream`, which names no cause of its own. Once a window per
@@ -2465,17 +2565,17 @@ resolve_query :: proc(
 		window there would leave a client's own failure of the same kind as a
 		`held=` count. The upstream's own line for the kind says it failed.
 		*/
-		if unanswered != nil {
-			logx.debugf("refresh of %s %s failed: %v", dns.type_name(q.type), dns.name_trim_root(q.name), uerr)
+		if st.refresh {
+			logx.debugf("refresh of %s %s failed: %v", dns.type_name(st.q.type), dns.name_trim_root(st.q.name), st.uerr)
 		} else {
-			logx.gated_warnf_from(&query_failed_reported[uerr], client, "query %s %s failed: %v", dns.type_name(q.type), dns.name_trim_root(q.name), uerr)
+			logx.gated_warnf_from(&query_failed_reported[st.uerr], st.client, "query %s %s failed: %v", dns.type_name(st.q.type), dns.name_trim_root(st.q.name), st.uerr)
 		}
 	}
 	// Not by setting `uerr`: every value it has names a transport failure, and
 	// `.Not_Resolved` is an upstream hostname that would not resolve.
-	if uerr != .None || referral {
-		if flight != nil {
-			flight.failed = true
+	if st.uerr != .None || referral {
+		if st.flight != nil {
+			st.flight.failed = true
 		}
 		/*
 		The condition `cache.serve_stale` was always documented by: the refresh
@@ -2488,7 +2588,7 @@ resolve_query :: proc(
 		past a verdict rather than covering an outage. RFC 8767 section 5 leaves
 		both open; neither is decided here.
 		*/
-		if unanswered != nil {
+		if st.refresh {
 			/*
 			Unless this call is the detached refresh, which holds nothing and
 			has no client of its own. The request that started it is holding the
@@ -2501,26 +2601,11 @@ resolve_query :: proc(
 			reads `unanswered` before it reads these bytes, and one that has
 			already timed out throws them away with the rest of the refresh.
 			*/
-			unanswered^ = true
-			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
-			return out, .Failed, built
+			st.unanswered = true
+			out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
+			return answered(st, out, .Failed, built)
 		}
-		return upstream_failed(
-			s,
-			stale_hit,
-			query,
-			msg,
-			q,
-			proto,
-			client,
-			limit,
-			validating,
-			started,
-			spent,
-			allocator,
-			ede,
-			"referral" if referral else "upstream",
-		)
+		return answered(st, upstream_failed(st, "referral" if referral else "upstream"))
 	}
 
 	/*
@@ -2535,18 +2620,18 @@ resolve_query :: proc(
 	through a path this procedure grows later.
 	*/
 	if out, detail, refused, built := unreadable_rcode_refusal(
-		s,
-		query,
-		msg,
-		q,
-		resp,
-		winner,
-		client,
-		limit,
-		allocator,
+		st.s,
+		st.query,
+		st.msg,
+		st.q,
+		st.resp,
+		st.winner,
+		st.client,
+		st.limit,
+		st.allocator,
 	); refused {
-		log_query(s, client, proto, q, .Failed, detail, started)
-		return out, .Failed, built
+		log_query(st.s, st.client, st.proto, st.q, .Failed, detail, st.started)
+		return answered(st, out, .Failed, built)
 	}
 
 	/*
@@ -2565,38 +2650,45 @@ resolve_query :: proc(
 	gives. Once a window per upstream at warn: the shape is one an upstream, or
 	anyone who can write into its replies, chooses.
 	*/
-	if dns.peek_opt_unreadable(resp) {
-		from := answering_upstream(winner)
+	if dns.peek_opt_unreadable(st.resp) {
+		from := answering_upstream(st.winner)
 		logx.gated_warnf_from(
-			&winner.stray_opt if winner != nil else &unreadable_opt_reported,
-			client,
+			&st.winner.stray_opt if st.winner != nil else &unreadable_opt_reported,
+			st.client,
 			"upstream %s answered %s %s with an OPT record outside the additional section, a second one, one not owned by the root, or options that do not parse; answering SERVFAIL",
 			from,
-			dns.type_name(q.type),
-			dns.name_trim_root(q.name),
+			dns.type_name(st.q.type),
+			dns.name_trim_root(st.q.name),
 		)
-		count_answer(&s.stats.failed)
-		log_query(s, client, proto, q, .Failed, fmt.tprintf("opt:%s", from), started)
-		out, built := upstream_refusal(query, msg, "upstream OPT record malformed", limit, allocator)
-		return out, .Failed, built
+		count_answer(&st.s.stats.failed)
+		log_query(st.s, st.client, st.proto, st.q, .Failed, fmt.tprintf("opt:%s", from), st.started)
+		out, built := upstream_refusal(st.query, st.msg, "upstream OPT record malformed", st.limit, st.allocator)
+		return answered(st, out, .Failed, built)
 	}
 
 	// The answer carries the ID we forwarded with, which is not the client's and
 	// on a DoH upstream is zero. The client is waiting on its own.
-	dns.set_id_in_place(resp, msg.id)
+	dns.set_id_in_place(st.resp, st.msg.id)
+	return false
+}
 
-	answer_ede: u16
-	if validating {
+/*
+DNSSEC validation of the reply, when this query is validating. Answers only to
+refuse a Bogus or Indeterminate one.
+*/
+@(private)
+validate_reply :: proc(st: ^Query_State) -> bool {
+	if st.validating {
 		result := dnssec.validate(
-			live(s).validator,
-			q.name,
-			q.type,
-			resp,
+			live(st.s).validator,
+			st.q.name,
+			st.q.type,
+			st.resp,
 			time.now(),
-			allocator,
-			pool = pool,
-			spent = spent,
-			deadline = &deadline,
+			st.allocator,
+			pool = st.pool,
+			spent = st.spent,
+			deadline = &st.deadline,
 		)
 		#partial switch result.status {
 		case .Bogus, .Indeterminate:
@@ -2636,28 +2728,34 @@ resolve_query :: proc(
 			that says how often this was us.
 			*/
 			if !shed {
-				sync.atomic_add(&s.stats.bogus, 1)
+				sync.atomic_add(&st.s.stats.bogus, 1)
 			}
-			count_answer(&s.stats.failed)
-			from := answering_upstream(winner)
-			report_bogus(q, client, result, from, shed)
-			out, built := dnssec_failure_response(msg, result, allocator, limit)
-			if remember_bogus_verdict(s, verdict_key, msg, result, unproven_apex_ds, spent, allocator) &&
-			   flight != nil {
-				flight.stored = .Bogus
+			count_answer(&st.s.stats.failed)
+			from := answering_upstream(st.winner)
+			report_bogus(st.q, st.client, result, from, shed)
+			out, built := dnssec_failure_response(st.msg, result, st.allocator, st.limit)
+			if remember_bogus_verdict(st.s, st.verdict_key, st.msg, result, st.unproven_apex_ds, st.spent, st.allocator) &&
+			   st.flight != nil {
+				st.flight.stored = .Bogus
 			}
-			log_query(s, client, proto, q, .Failed, fmt.tprintf("dnssec:%s", from), started)
-			return out, .Failed, built
+			log_query(st.s, st.client, st.proto, st.q, .Failed, fmt.tprintf("dnssec:%s", from), st.started)
+			return answered(st, out, .Failed, built)
 		case .Secure:
-			sync.atomic_add(&s.stats.secure, 1)
+			sync.atomic_add(&st.s.stats.secure, 1)
 		}
-		resp = present_response(resp, msg, q.type, result, spent, allocator)
-		answer_ede = ceiling_ede(result)
-		if ede != nil {
-			ede^ = answer_ede
-		}
+		st.resp = present_response(st.resp, st.msg, st.q.type, result, st.spent, st.allocator)
+		st.answer_ede = ceiling_ede(result)
+		st.ede = st.answer_ede
 	}
+	return false
+}
 
+/*
+The last of the answer path: the TTL bounds, the rebinding and cloaking checks,
+the store and the flight's landing. Always answers.
+*/
+@(private)
+finish_answer :: proc(st: ^Query_State) {
 	/*
 	The TTLs bounded once, here, so the client's copy and the entry's are the
 	same bytes.
@@ -2725,8 +2823,8 @@ resolve_query :: proc(
 	validated - CD, or validation off - is held to it only here.
 	*/
 	// `signatures_lapse` reads no bound at all for a message that carries none.
-	signed_left, signed := dns.signatures_lapse(resp, u32(time.time_to_unix(time.now())))
-	dns.cap_ttls(resp, min(cache.ttl_ceiling(live(s).answers), signed_left))
+	signed_left, signed := dns.signatures_lapse(st.resp, u32(time.time_to_unix(time.now())))
+	dns.cap_ttls(st.resp, min(cache.ttl_ceiling(live(st.s).answers), signed_left))
 
 	/*
 	Decoded once for the three things below that read it: the rebinding check
@@ -2742,11 +2840,11 @@ resolve_query :: proc(
 	use one. With the cache the only reader, a message that would not decode in
 	full is simply not stored, and a second attempt at it buys nothing.
 	*/
-	checking_rebind := rebind_reads_answer(s, q)
-	walking := live(s).cfg.blocking.enabled && s.filters != nil
+	checking_rebind := rebind_reads_answer(st.s, st.q)
+	walking := live(st.s).cfg.blocking.enabled && st.s.filters != nil
 	decoded: Decoded_Answer
-	if live(s).cfg.cache.enabled || walking || checking_rebind {
-		decoded = decode_answer(resp, walking || checking_rebind, spent, allocator)
+	if live(st.s).cfg.cache.enabled || walking || checking_rebind {
+		decoded = decode_answer(st.resp, walking || checking_rebind, st.spent, st.allocator)
 	}
 
 	/*
@@ -2767,17 +2865,18 @@ resolve_query :: proc(
 	name (`cache.concerns_question`).
 	*/
 	if checking_rebind {
-		if out, detail, blocked := rebind_refusal(s, msg, q, decoded, limit, allocator); blocked {
+		if out, detail, blocked := rebind_refusal(st.s, st.msg, st.q, decoded, st.limit, st.allocator); blocked {
 			if detail == "rebind" &&
 			   decoded.full &&
 			   !decoded.msg.flags.tc &&
 			   !(signed && signed_left == 0) &&
 			   dns.rcode_of(decoded.msg) == .No_Error &&
 			   cache.concerns_question(decoded.msg) {
-				cache.forget(live(s).answers, key, stale_hit.serial)
+				cache.forget(live(st.s).answers, st.key, st.stale_hit.serial)
 			}
-			log_query(s, client, proto, q, .Blocked, detail, started)
-			return out, .Blocked, true
+			log_query(st.s, st.client, st.proto, st.q, .Blocked, detail, st.started)
+			answered(st, out, .Blocked, true)
+			return
 		}
 	}
 
@@ -2837,7 +2936,7 @@ resolve_query :: proc(
 	failure says so in the query log rather than passing something through
 	unchecked.
 	*/
-	if walking && !walkable && filter.engine_match(s.filters, q.name, q.type) != .Allowed {
+	if walking && !walkable && filter.engine_match(st.s.filters, st.q.name, st.q.type) != .Allowed {
 		/*
 		No stale fallback, deliberately, and it had one for a round.
 
@@ -2851,10 +2950,11 @@ resolve_query :: proc(
 		and a climbing `elodin_cache_stale_total` say the upstream is down while
 		it is answering perfectly well.
 		*/
-		count_answer(&s.stats.failed)
-		out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
-		log_query(s, client, proto, q, .Failed, "answer-unreadable", started)
-		return out, .Failed, built
+		count_answer(&st.s.stats.failed)
+		out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
+		log_query(st.s, st.client, st.proto, st.q, .Failed, "answer-unreadable", st.started)
+		answered(st, out, .Failed, built)
+		return
 	}
 
 	/*
@@ -2895,21 +2995,21 @@ resolve_query :: proc(
 	intact. One statement above both is what stops a third store being written
 	without it.
 	*/
-	if !validating {
-		set_ad_bit(resp, false)
+	if !st.validating {
+		set_ad_bit(st.resp, false)
 	}
 
 	if walkable {
 		if out, verdict := block_cloaked_answer(
-			s,
+			st.s,
 			walk_answer,
-			msg,
-			q,
-			proto,
-			client,
-			limit,
-			started,
-			allocator,
+			st.msg,
+			st.q,
+			st.proto,
+			st.client,
+			st.limit,
+			st.started,
+			st.allocator,
 		); verdict != .Clear {
 			/*
 			`decoded.full`, not `walkable`. The two part company for an answer
@@ -2967,27 +3067,28 @@ resolve_query :: proc(
 			routed zone is also not the case the memoisation above was written
 			for.
 			*/
-			if live(s).cfg.cache.enabled &&
+			if live(st.s).cfg.cache.enabled &&
 			   decoded.full &&
-			   !unproven_apex_ds &&
+			   !st.unproven_apex_ds &&
 			   cloak_verdict_worth_keeping(verdict) {
 				// `supersedes`: an answer refused here still replaces the
 				// expired copy (issue #419); see `cache.put`.
 				kept := cache.put(
-					live(s).answers,
-					key,
-					resp,
+					live(st.s).answers,
+					st.key,
+					st.resp,
 					decoded.msg,
-					generation,
+					st.generation,
 					u8(verdict),
-					ede = answer_ede,
-					supersedes = stale_hit.serial,
+					ede = st.answer_ede,
+					supersedes = st.stale_hit.serial,
 				)
-				if flight != nil && kept {
-					flight.stored = .Cloak
+				if st.flight != nil && kept {
+					st.flight.stored = .Cloak
 				}
 			}
-			return out, cloak_outcome(verdict), true
+			answered(st, out, cloak_outcome(verdict), true)
+			return
 		}
 	}
 
@@ -3019,23 +3120,23 @@ resolve_query :: proc(
 	happened before any of this was memoised, and the one that reaches a parent
 	willing to speak stores what it said.
 	*/
-	if live(s).cfg.cache.enabled && decoded.full && !unproven_apex_ds {
+	if live(st.s).cfg.cache.enabled && decoded.full && !st.unproven_apex_ds {
 		// `supersedes`: an answer that cannot be kept still replaces the
 		// expired copy (issue #419); see `cache.put`.
-		cache.put(live(s).answers, key, resp, decoded.msg, generation, ede = answer_ede, supersedes = stale_hit.serial)
+		cache.put(live(st.s).answers, st.key, st.resp, decoded.msg, st.generation, ede = st.answer_ede, supersedes = st.stale_hit.serial)
 	}
 	/*
 	What was just stored, or would have been, handed over and landed before
 	`settle_header` below writes into it - each follower settles its own copy,
 	and decides for itself whether the rcode is one it may take.
 	*/
-	if flight != nil {
-		flight.answer, flight.ede = resp, answer_ede
-		flight_land(s, flight)
-		flight = nil
+	if st.flight != nil {
+		st.flight.answer, st.flight.ede = st.resp, st.answer_ede
+		flight_land(st.s, st.flight)
+		st.flight = nil
 	}
 
-	count_answer(&s.stats.forwarded)
+	count_answer(&st.s.stats.forwarded)
 	/*
 	Handed back as the upstream sent it, over the client's limit if that is what
 	it is: the OPT record is the upstream's until `match_client_opt` has settled
@@ -3044,9 +3145,9 @@ resolve_query :: proc(
 	it once the record is this server's own, which is the one shape the encoder's
 	reservation is right about. See `match_client_opt`.
 	*/
-	settle_header(resp, msg, validating)
-	log_query(s, client, proto, q, .Forwarded, answering_upstream(winner), started)
-	return resp, .Forwarded, true
+	settle_header(st.resp, st.msg, st.validating)
+	log_query(st.s, st.client, st.proto, st.q, .Forwarded, answering_upstream(st.winner), st.started)
+	answered(st, st.resp, .Forwarded, true)
 }
 
 /*
@@ -3170,19 +3271,7 @@ them once more on the way out (RFC 4034 section 3.1.5).
 */
 @(private)
 upstream_failed :: proc(
-	s: ^Server,
-	stale_hit: Cached_Answer,
-	query: []u8,
-	msg: dns.Message,
-	q: dns.Question,
-	proto: Protocol,
-	client: string,
-	limit: int,
-	validating: bool,
-	started: time.Tick,
-	spent: ^int,
-	allocator: mem.Allocator,
-	ede: ^u16,
+	st: ^Query_State,
 	// The query-log detail, which says whether this query asked at all.
 	detail := "upstream",
 ) -> (
@@ -3190,12 +3279,12 @@ upstream_failed :: proc(
 	Outcome,
 	bool,
 ) {
-	if lent, found := lend_stale(s, stale_hit, allocator); found && stale_usable(lent) {
-		return serve_from_cache(s, lent, query, msg, q, proto, client, limit, validating, started, spent, allocator, ede)
+	if lent, found := lend_stale(st.s, st.stale_hit, st.allocator); found && stale_usable(lent) {
+		return serve_from_cache(st, lent)
 	}
-	count_answer(&s.stats.failed)
-	out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
-	log_query(s, client, proto, q, .Failed, detail, started)
+	count_answer(&st.s.stats.failed)
+	out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
+	log_query(st.s, st.client, st.proto, st.q, .Failed, detail, st.started)
 	return out, .Failed, built
 }
 
@@ -3736,22 +3825,11 @@ it is.
 */
 @(private)
 serve_from_cache :: proc(
-	s: ^Server,
+	// The question, its request's name counter - the entry is decoded again
+	// here, see `dns.REQUEST_DECODE_BUDGET` - and `validating`, as settled by
+	// `answer_from_cache`. The entry's extended error is handed back in `ede`.
+	st: ^Query_State,
 	hit: Cached_Answer,
-	query: []u8,
-	msg: dns.Message,
-	q: dns.Question,
-	proto: Protocol,
-	client: string,
-	limit: int,
-	validating: bool,
-	started: time.Tick,
-	// The request's name counter; the entry is decoded again here. See
-	// `dns.REQUEST_DECODE_BUDGET`.
-	spent: ^int,
-	allocator: mem.Allocator,
-	// Where the entry's extended error is handed back; see `resolve_query`.
-	ede: ^u16 = nil,
 ) -> (
 	response: []u8,
 	outcome: Outcome,
@@ -3795,7 +3873,7 @@ serve_from_cache :: proc(
 	names an attacker is interested in. With the verdict recorded, a refused
 	entry costs one walk per reload like any other.
 	*/
-	if !hit.recheck && (hit.wire == nil || cloak_refusal_stands(s)) {
+	if !hit.recheck && (hit.wire == nil || cloak_refusal_stands(st.s)) {
 		if verdict := Cloak_Verdict(hit.refused); verdict != .Clear {
 			/*
 			No target, because the entry does not carry one. The name that
@@ -3805,8 +3883,8 @@ serve_from_cache :: proc(
 			of the two refusals it was, so the query log says the same thing for
 			this hit as it said for the walk that decided it.
 			*/
-			cache.note_withheld(live(s).answers)
-			out := refuse_cloaked(s, "", verdict, msg, q, proto, client, limit, started, allocator)
+			cache.note_withheld(live(st.s).answers)
+			out := refuse_cloaked(st.s, "", verdict, st.msg, st.q, st.proto, st.client, st.limit, st.started, st.allocator)
 			return out, cloak_outcome(verdict), true
 		}
 	}
@@ -3817,17 +3895,17 @@ serve_from_cache :: proc(
 		// `cache.put` checks: `put` never decodes, it takes an already-decoded
 		// message and trusts it to describe the bytes beside it. A third store
 		// written without that guard would break this quietly.
-		if stored, derr := dns.decode_message(hit.wire, allocator, spent); derr == .None {
+		if stored, derr := dns.decode_message(hit.wire, st.allocator, st.spent); derr == .None {
 			if out, verdict := block_cloaked_answer(
-				s,
+				st.s,
 				stored.answer,
-				msg,
-				q,
-				proto,
-				client,
-				limit,
-				started,
-				allocator,
+				st.msg,
+				st.q,
+				st.proto,
+				st.client,
+				st.limit,
+				st.started,
+				st.allocator,
 			); verdict != .Clear {
 				/*
 				A verdict not worth keeping takes the entry with it. Stamping it
@@ -3844,11 +3922,11 @@ serve_from_cache :: proc(
 				the upstream never asked again.
 				*/
 				if cloak_verdict_worth_keeping(verdict) {
-					cache.note_checked(live(s).answers, hit.key, hit.serial, hit.checked, u8(verdict))
+					cache.note_checked(live(st.s).answers, hit.key, hit.serial, hit.checked, u8(verdict))
 				} else {
-					cache.forget(live(s).answers, hit.key, hit.serial)
+					cache.forget(live(st.s).answers, hit.key, hit.serial)
 				}
-				cache.note_withheld(live(s).answers)
+				cache.note_withheld(live(st.s).answers)
 				return out, cloak_outcome(verdict), true
 			}
 			// Inside the decode, not after it. An entry nothing could read has
@@ -3856,7 +3934,7 @@ serve_from_cache :: proc(
 			// is the one way this mechanism could come to skip a walk it owed.
 			// Unreachable as things stand, because both stores are guarded on
 			// `decoded.full`, and not a thing to leave resting on that.
-			cache.note_checked(live(s).answers, hit.key, hit.serial, hit.checked, u8(Cloak_Verdict.Clear))
+			cache.note_checked(live(st.s).answers, hit.key, hit.serial, hit.checked, u8(Cloak_Verdict.Clear))
 		} else {
 			/*
 			The stored bytes would not decode, so the walk it is owed cannot be
@@ -3874,39 +3952,39 @@ serve_from_cache :: proc(
 			as it lived; dropping it sends the next query upstream for an answer
 			that can be read.
 			*/
-			cache.forget(live(s).answers, hit.key, hit.serial)
-			cache.note_withheld(live(s).answers)
-			count_answer(&s.stats.failed)
-			out, built := dns.error_response(query, msg, .Serv_Fail, allocator, limit)
-			log_query(s, client, proto, q, .Failed, "cache-unreadable", started)
+			cache.forget(live(st.s).answers, hit.key, hit.serial)
+			cache.note_withheld(live(st.s).answers)
+			count_answer(&st.s.stats.failed)
+			out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
+			log_query(st.s, st.client, st.proto, st.q, .Failed, "cache-unreadable", st.started)
 			return out, .Failed, built
 		}
 	}
 
 	wire := hit.wire
-	dns.set_id_in_place(wire, msg.id)
-	dns.copy_question_case(wire, query)
+	dns.set_id_in_place(wire, st.msg.id)
+	dns.copy_question_case(wire, st.query)
 	// The stored answer carries the verdict; whether this client gets to hear it
 	// is a separate question.
-	settle_header(wire, msg, validating)
+	settle_header(wire, st.msg, st.validating)
 	// And the extended error that goes with the verdict, under the same
 	// condition: one reached while validating is not this request's to repeat.
-	if ede != nil && validating {
-		ede^ = hit.ede
+	if st.validating {
+		st.ede = hit.ede
 	}
 	if hit.stale {
-		cache.note_stale_served(live(s).answers)
+		cache.note_stale_served(live(st.s).answers)
 	}
-	count_answer(&s.stats.cached)
+	count_answer(&st.s.stats.cached)
 	if hit.coalesced {
-		sync.atomic_add(&s.stats.coalesced, 1)
+		sync.atomic_add(&st.s.stats.coalesced, 1)
 	}
 	// Over this client's limit where the entry was stored for a client with a
 	// larger buffer, and left that way: `handle_query` fits it once
 	// `match_client_opt` has settled the OPT record, for the reason the
 	// forwarded path gives.
 	detail := "stale" if hit.stale else "coalesced" if hit.coalesced else "cache"
-	log_query(s, client, proto, q, .Cached, detail, started)
+	log_query(st.s, st.client, st.proto, st.q, .Cached, detail, st.started)
 	return wire, .Cached, true
 }
 
@@ -4359,20 +4437,8 @@ chase_rewrite_alias :: proc(
 			if enc != .None {
 				break walk
 			}
-			out, outcome, _ = resolve_query(
-				s,
-				wire,
-				next,
-				proto,
-				client,
-				limit,
-				cookie,
-				started,
-				spent,
-				allocator,
-				ede = &code,
-				pool = pool,
-			)
+			r := resolve_query(s, wire, next, proto, client, limit, cookie, started, spent, allocator, pool = pool)
+			out, outcome, code = r.response, r.outcome, r.ede
 			// A refusal counts nowhere in that family, the RD gate's included,
 			// and nor does a special-use name, so the chain either leaves as the
 			// answer is counted as the rewrite it is. A block list answering
