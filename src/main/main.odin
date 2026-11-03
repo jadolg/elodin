@@ -465,7 +465,18 @@ main :: proc() {
 	if !logx.init(logx.Level(cfg.log.level), log_file) {
 		fmt.eprintfln("elodin: cannot open the log file %q, logging to stderr instead", cfg.log.file)
 	}
-	logx.warn_if_readable(log_file)
+	// `--check` opens no log, but says what a start would find: a file it cannot
+	// open, or a directory that is not there.
+	if opts.check_only && cfg.log.file != "" {
+		parent := os.dir(cfg.log.file)
+		openable := os.is_dir(parent if parent != "" else ".")
+		if os.exists(cfg.log.file) {
+			openable = privdrop.can_reopen(cfg.log.file, true)
+		}
+		if !openable {
+			fmt.eprintfln("elodin: cannot open the log file %q; a start would log to stderr instead", cfg.log.file)
+		}
+	}
 	defer logx.shutdown()
 
 	/*
@@ -953,7 +964,9 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 		}
 	}
 
-	if !logx.hand_over(service.uid, service.gid) {
+	// Only root can give a file away; an account that is neither root nor the
+	// service fails at `apply` below.
+	if privdrop.is_root() && !logx.hand_over(service.uid, service.gid) {
 		logx.warnf("could not give the log file %q to %s; a SIGHUP after a rotation will not open it again", cfg.log.file, cfg.server.user)
 	}
 

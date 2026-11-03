@@ -43,19 +43,24 @@ stderr rather than being silently lost.
 */
 init :: proc(level: Level, path: string = "") -> bool {
 	sync.mutex_lock(&state.mu)
-	defer sync.mutex_unlock(&state.mu)
-
 	state.level = level
-	if path == "" {
-		return true
+	err: os.Error
+	if path != "" {
+		f: ^os.File
+		created: bool
+		f, created, err = open_log(path)
+		if err == nil {
+			state.file = f
+			state.to_file = true
+			state.created = created
+		}
 	}
-	f, created, err := open_log(path)
+	sync.mutex_unlock(&state.mu)
+
 	if err != nil {
 		return false
 	}
-	state.file = f
-	state.to_file = true
-	state.created = created
+	warn_if_readable(path)
 	return true
 }
 
@@ -175,11 +180,12 @@ A log file `open_log` creates is owner-only, but one already there keeps its
 mode - an upgrade from a release that created it 0644, or logrotate's
 `create 0644`. With `log.queries` on it names every client, so a mode that lets
 every account read it is said at each open rather than changed: the file is the
-operator's. `reopen` calls it itself; `init` holds the lock, so its caller does.
+operator's. `init` and `reopen` call it once the lock is released.
 */
+@(private)
 warn_if_readable :: proc(path: string) {
 	if readable_by_others() {
-		warnf("log.file: %q is readable by every user on this host; 'chmod o-r' it, or set logrotate's create mode", path)
+		warnf("log.file: %q can be read by any account that can reach its directory; 'chmod o-r' it, or set logrotate's create mode", path)
 	}
 }
 

@@ -187,6 +187,15 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect(t, strings.contains(lines[20], `level=warn msg="log.file:`), "a reopen of a 0644 log did not warn")
+
+	// And so does a start on one, without its caller having to ask.
+	shutdown()
+	testing.expect(t, init(.Info, path), "cannot open the log again")
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 22, "%d lines after the second start, want 22", len(lines)) {
+		return
+	}
+	testing.expect(t, strings.contains(lines[21], `level=warn msg="log.file:`), "a start on a 0644 log did not warn")
 }
 
 /*
@@ -196,14 +205,8 @@ asked for. Uses `open_log` alone, so it shares no state with the test above.
 */
 @(test)
 test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
-	tmp, terr := os.temp_directory(context.temp_allocator)
-	if !testing.expectf(t, terr == nil, "no temporary directory: %v", terr) {
-		return
-	}
-	// The pid keeps a run in another checkout from removing this one's file.
-	dir, _ := filepath.join({tmp, fmt.tprintf("elodin-logx-mode-test-%d", posix.getpid())}, context.temp_allocator)
-	os.remove_all(dir)
-	if !testing.expect(t, os.make_directory(dir) == nil, "cannot create the scratch directory") {
+	dir, ok := scratch_dir(t, "elodin-logx-mode-test")
+	if !ok {
 		return
 	}
 	defer os.remove_all(dir)
@@ -256,17 +259,7 @@ refusing_allocator :: proc() -> runtime.Allocator {
 
 @(private = "file")
 open_scratch_log :: proc(t: ^testing.T) -> (dir: string, path: string, ok: bool) {
-	tmp, terr := os.temp_directory(context.temp_allocator)
-	if terr != nil {
-		testing.expectf(t, false, "no temporary directory: %v", terr)
-		return
-	}
-	dir, _ = filepath.join({tmp, "elodin-logx-test"}, context.temp_allocator)
-	os.remove_all(dir)
-	if err := os.make_directory(dir); err != nil {
-		testing.expectf(t, false, "cannot create %s: %v", dir, err)
-		return
-	}
+	dir = scratch_dir(t, "elodin-logx-test") or_return
 	path, _ = filepath.join({dir, "elodin.log"}, context.temp_allocator)
 	if !init(.Info, path) {
 		testing.expectf(t, false, "cannot open %s for logging", path)
@@ -274,6 +267,23 @@ open_scratch_log :: proc(t: ^testing.T) -> (dir: string, path: string, ok: bool)
 		return
 	}
 	return dir, path, true
+}
+
+// The pid keeps a run in another checkout from removing this one's files.
+@(private = "file")
+scratch_dir :: proc(t: ^testing.T, name: string) -> (dir: string, ok: bool) {
+	tmp, terr := os.temp_directory(context.temp_allocator)
+	if terr != nil {
+		testing.expectf(t, false, "no temporary directory: %v", terr)
+		return
+	}
+	dir, _ = filepath.join({tmp, fmt.tprintf("%s-%d", name, posix.getpid())}, context.temp_allocator)
+	os.remove_all(dir)
+	if err := os.make_directory(dir); err != nil {
+		testing.expectf(t, false, "cannot create %s: %v", dir, err)
+		return
+	}
+	return dir, true
 }
 
 @(private = "file")

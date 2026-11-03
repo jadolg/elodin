@@ -276,6 +276,17 @@ run_cli_cases :: proc(r: ^Runner) {
 		res := new_check(r, path, "check-nolog")
 		check(r, res.exit_code == 0, "--check with a log file exited %d: %q", res.exit_code, res.output)
 		check(r, !os.exists(log_path), "--check created the log file")
+		check(r, !strings.contains(res.output, "cannot open the log file"), "--check warned about a log file it can create: %q", res.output)
+
+		// One the start could not open is still said, though nothing is opened.
+		missing := filepath.join({r.work_dir, "no-such-dir", "check.log"}, context.temp_allocator) or_else ""
+		_ = os.write_entire_file(
+			path,
+			transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", missing),
+		)
+		res = new_check(r, path, "check-nolog-dir")
+		check(r, res.exit_code == 0, "--check with a log file in a missing directory exited %d: %q", res.exit_code, res.output)
+		check(r, strings.contains(res.output, "cannot open the log file"), "--check did not say the log file cannot be opened: %q", res.output)
 	}
 	end_case(r)
 

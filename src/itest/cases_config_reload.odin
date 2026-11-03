@@ -312,7 +312,7 @@ check_log_mode :: proc(r: ^Runner, path: string) {
 	st: posix.stat_t
 	if check(r, posix.stat(strings.clone_to_cstring(path, context.temp_allocator), &st) == .OK, "cannot stat the log file") {
 		mode := transmute(u32)st.st_mode & 0o777
-		check(r, mode == 0o600, fmt.tprintf("the log file is %o, want 600", mode))
+		check(r, mode == 0o600, "the log file is %o, want 600", mode)
 	}
 }
 

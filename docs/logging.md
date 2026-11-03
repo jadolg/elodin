@@ -22,8 +22,8 @@ With `log.file` set, elodin creates the file readable and writable by its
 owner only (`0600`), since with `log.queries` on it names every client and every
 name looked up. A file that already exists keeps its mode, so a shipper's group
 is given access the usual way, e.g. logrotate's `create 0640 elodin adm`; one
-every account can read is named in a `warn` at startup and at each reopen
-(`log.file: "..." is readable by every user on this host`).
+with the other-read bit set is named in a `warn` at startup and at each reopen
+(`log.file: "..." can be read by any account that can reach its directory`).
 
 Under `server.user` the file is opened again on `SIGHUP` as that account
 ([Privileges](install.md#privileges)). A file elodin created at startup changes
