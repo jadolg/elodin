@@ -7,6 +7,7 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 import "elodin:h2"
+import "elodin:loop"
 import "elodin:tlsx"
 
 /*
@@ -49,6 +50,10 @@ Doh2_Mock :: struct {
 	// Over HTTP/1.1, stretch each 200's body to this many bytes with zeros after
 	// the real reply, so it still answers the query's header and question.
 	pad:        int,
+	// Over h2, answer with this `:status` and end the stream with a trailer
+	// section of `trailers` after the body (RFC 9113 8.1). Zero for none.
+	trailer_head: int,
+	trailers:     []h2.Header_Field,
 }
 
 doh2_mock_make :: proc(port: int, path: string, payload: []u8) -> ^Doh2_Mock {
@@ -243,7 +248,38 @@ doh2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	sync.mutex_unlock(&m.mu)
 
 	body := doh2_reply_body(m, req.body, context.temp_allocator)
+	if m.trailer_head != 0 {
+		doh2_respond_with_trailers(hc, req.stream_id, m.trailer_head, body, m.trailers)
+		return
+	}
 	h2.respond(hc, req.stream_id, h2.Response{status = 200, content_type = "application/dns-message", body = body})
+}
+
+/*
+A response with a trailer section, which `h2.respond` never sends, written as
+raw frames under the connection's lock as `respond` writes its own. Literals
+without indexing, so the client's HPACK table is left as the server's encoder
+expects. The stream stays in the mock's table until the connection goes.
+*/
+@(private = "file")
+doh2_respond_with_trailers :: proc(hc: ^h2.Conn, stream_id: u32, status: int, body: []u8, trailers: []h2.Header_Field) {
+	head := make([dynamic]u8, 0, 64, context.temp_allocator)
+	h2.encode_header(&head, ":status", fmt.tprint(status))
+	h2.encode_header(&head, "content-type", "application/dns-message")
+	tail := make([dynamic]u8, 0, 64, context.temp_allocator)
+	for f in trailers {
+		h2.encode_header(&tail, f.name, f.value)
+	}
+	out := make([dynamic]u8, 0, len(head) + len(body) + len(tail) + 27, context.temp_allocator)
+	h2.write_frame_header(&out, len(head), .Headers, h2.FLAG_END_HEADERS, stream_id)
+	append(&out, ..head[:])
+	h2.write_frame_header(&out, len(body), .Data, 0, stream_id)
+	append(&out, ..body)
+	h2.write_frame_header(&out, len(tail), .Headers, h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM, stream_id)
+	append(&out, ..tail[:])
+	loop.lock(&hc.mu)
+	hc.io.write(hc.io.user, out[:])
+	loop.unlock(&hc.mu)
 }
 
 // --- HTTP/1.1 ------------------------------------------------------------

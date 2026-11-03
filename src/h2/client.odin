@@ -106,6 +106,9 @@ Client_Stream :: struct {
 	refunded:    bool,
 	// This end reset the stream for sending too much; see Client_Error.Too_Large.
 	oversized:   bool,
+	// A final (non-1xx) header section has been taken, so the next block is
+	// the trailers; see client_finish_headers.
+	final:       bool,
 }
 
 Client_Request :: struct {
@@ -681,12 +684,39 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 	if already_ended {
 		s.rst_sent = true
 	}
+	/*
+	RFC 9113 8.1: after any number of interim (1xx) responses comes one final
+	one, and a block after that is the trailers, which end the stream and carry
+	no pseudo-header field; an interim response does not end it. Anything else
+	is malformed, which 8.1.1 makes a stream error of type PROTOCOL_ERROR, and a
+	client MUST NOT accept it - so it fails like a stream this end reset, rather
+	than a trailer's `:status` being read as the answer's.
+	*/
+	malformed := false
 	if found && !already_ended {
-		for f in headers {
-			if f.name == ":status" {
-				s.status = parse_status(f.value)
+		if s.final {
+			malformed = !s.end_stream
+			for f in headers {
+				if len(f.name) > 0 && f.name[0] == ':' {
+					malformed = true
+				}
 			}
+		} else {
+			for f in headers {
+				if f.name == ":status" {
+					s.status = parse_status(f.value)
+				}
+			}
+			// A malformed `:status` reads as 0, which is no interim response.
+			s.final = s.status < 100 || s.status > 199
+			malformed = !s.final && s.end_stream
 		}
+		if malformed {
+			s.reset = true
+			loop.cond_broadcast(&c.cond)
+		}
+	}
+	if found && !already_ended && !malformed {
 		/*
 		An upstream may PING about as often as it answers - keepalive, or
 		probing bandwidth - and one busy pooled connection answers far more
@@ -707,6 +737,9 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 	}
 	loop.unlock(&c.mu)
 
+	if malformed {
+		return client_rst_stream(c, stream_id, .Protocol_Error)
+	}
 	if need_rst {
 		return client_rst_stream(c, stream_id, .Stream_Closed)
 	}

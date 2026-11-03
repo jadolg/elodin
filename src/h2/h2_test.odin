@@ -358,9 +358,9 @@ test_parked_bodies_are_bounded_per_connection :: proc(t: ^testing.T) {
 		// What is allocated, not what is used: a buffer grown by doubling holds
 		// more than its length.
 		held += cap(s.body)
-		// A parked stream's decoded header block is not held beside its body.
-		testing.expect_value(t, cap(s.header_block), 0)
 	}
+	// A parked stream's decoded header block is not held beside its body.
+	testing.expect_value(t, cap(c.header_block), 0)
 	testing.expectf(t, held <= MAX_CONN_REQUEST, "one connection holds %d body bytes, over %d", held, MAX_CONN_REQUEST)
 
 	// Refused as safe to retry, since none of them reached a handler.
@@ -413,9 +413,8 @@ test_parked_fields_are_bounded_per_connection :: proc(t: ^testing.T) {
 		testing.expect(t, ok, "handle_headers failed")
 	}
 
-	held := 0
+	held := cap(c.header_block)
 	for _, s in c.streams {
-		held += cap(s.header_block)
 		if s.pending != nil {
 			held += len(s.pending.path) + len(s.pending.method) + len(s.pending.authority) + len(s.pending.scheme) + len(s.pending.content_type) + len(s.pending.accept)
 		}
@@ -1029,13 +1028,14 @@ test_a_stream_refused_on_its_end_stream_is_not_remembered :: proc(t: ^testing.T)
 }
 
 /*
-Only a stream this end reset and forgot takes a block quietly. One still in the
-table - here reset for DATA after END_STREAM, while its handler holds it - was
-already ended by the peer, so nothing on it can be in flight; and a placeholder
-put in its place would overwrite the stream the handler is answering.
+A stream still in the table - here reset for DATA after END_STREAM, while its
+handler holds it - takes no more blocks, but RFC 9113 5.1 makes a frame on it a
+stream error, not a connection error, and this end already sent its reset: the
+block is decoded, so HPACK stays in step, and ignored. It is carried by the
+connection, so the stream the handler is answering is not replaced.
 */
 @(test)
-test_headers_on_a_reset_stream_still_being_answered_is_a_connection_error :: proc(t: ^testing.T) {
+test_headers_on_a_reset_stream_still_being_answered_are_ignored :: proc(t: ^testing.T) {
 	log := Frame_Log {
 		frames = make([dynamic]Frame_Header, 0, 8),
 	}
@@ -1051,7 +1051,8 @@ test_headers_on_a_reset_stream_still_being_answered_is_a_connection_error :: pro
 	s := c.streams[1]
 
 	ok := handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82})
-	testing.expect(t, !ok, "HEADERS on a stream still being answered was accepted")
+	testing.expect(t, ok, "HEADERS on a stream still being answered dropped the connection")
+	testing.expect_value(t, count_rst(&log, 1), 1)
 	testing.expect(t, c.streams[1] == s, "the stream being answered was replaced")
 	free_all(context.temp_allocator)
 }
@@ -1474,15 +1475,13 @@ test_continuation_flood_is_refused :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, refused, "a header block was allowed to grow without limit")
 
-	if s, found := c.streams[1]; found {
-		testing.expectf(
-			t,
-			len(s.header_block) <= MAX_HEADER_LIST,
-			"the block reached %d bytes, past the %d limit",
-			len(s.header_block),
-			MAX_HEADER_LIST,
-		)
-	}
+	testing.expectf(
+		t,
+		len(c.header_block) <= MAX_HEADER_LIST,
+		"the block reached %d bytes, past the %d limit",
+		len(c.header_block),
+		MAX_HEADER_LIST,
+	)
 
 	conn_unref(c)
 	free_all(context.temp_allocator)
@@ -1493,7 +1492,7 @@ test_continuation_flood_is_refused :: proc(t: ^testing.T) {
 The same flood with nothing in the frames.
 
 A byte cap is no cap at all against a peer that sends no bytes: an empty
-CONTINUATION never advances `len(s.header_block)`, so the block stays open and
+CONTINUATION never advances `len(c.header_block)`, so the block stays open and
 the frames keep coming. Nothing accrues, which is why this is small, but the
 reader thread reads and dispatches nine-byte frames for as long as the peer
 cares to send them and the block it is waiting on never ends.
@@ -2365,6 +2364,7 @@ Request_Log :: struct {
 	dispatched: int,
 	// The last dispatched request's, cloned onto the temporary allocator.
 	authority:  string,
+	body:       string,
 }
 
 @(private = "file")
@@ -2400,6 +2400,7 @@ counting_handler :: proc(conn: ^Conn, req: ^Request) {
 	if log != nil {
 		log.dispatched += 1
 		log.authority = strings.clone(req.authority, context.temp_allocator)
+		log.body = strings.clone(string(req.body), context.temp_allocator)
 	}
 	request_destroy(conn, req)
 }
@@ -3534,4 +3535,182 @@ test_headers_reach_the_connection_allocator_only_for_kept_fields :: proc(t: ^tes
 
 	conn_unref(c)
 	expect_no_leaks(t, &track, "kept header fields")
+}
+
+// ---------------------------------------------------------------------------
+// Trailers (RFC 9113 8.1)
+// ---------------------------------------------------------------------------
+
+// x-t: 1, a literal with incremental indexing: it becomes dynamic index 62, so
+// a decoder that skipped it falls out of step with the peer's encoder.
+@(private = "file")
+TRAILER := [?]u8{0x40, 0x03, 'x', '-', 't', 0x01, '1'}
+
+/*
+Send `block` on `id` as HEADERS with `flags`, split across a CONTINUATION when
+`split` is set: the trailer section is a field block like any other, and may
+span frames (RFC 9113 8.1).
+*/
+@(private = "file")
+send_block :: proc(c: ^Conn, id: u32, block: []u8, flags: u8, split: bool) -> bool {
+	if !split {
+		return handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = flags | FLAG_END_HEADERS, stream_id = id}, block)
+	}
+	half := len(block) / 2
+	return(
+		handle_headers(c, Frame_Header{length = half, type = .Headers, flags = flags, stream_id = id}, block[:half]) &&
+		handle_continuation(c, Frame_Header{length = len(block) - half, type = .Continuation, flags = FLAG_END_HEADERS, stream_id = id}, block[half:]) \
+	)
+}
+
+/*
+A request may end with a trailer section after its body (RFC 9113 8.1). The
+block is decoded - the HPACK table takes its entry - and ends the request,
+which is dispatched with its body, and the connection carries on. Before #457
+any block on a live stream id was a connection error, which dropped every
+stream on it.
+*/
+@(test)
+test_trailers_end_a_parked_request :: proc(t: ^testing.T) {
+	for split in ([]bool{false, true}) {
+		for body in ([]string{"xy", ""}) {
+			track: mem.Tracking_Allocator
+			mem.tracking_allocator_init(&track, context.allocator)
+			allocator := mem.tracking_allocator(&track)
+
+			log: Request_Log
+			c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, counting_handler, &log, allocator)
+			block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+			handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+			if len(body) > 0 {
+				handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, transmute([]u8)body)
+			}
+			testing.expect_value(t, log.dispatched, 0)
+
+			trailer := TRAILER
+			ok := send_block(c, 1, trailer[:], FLAG_END_STREAM, split)
+			testing.expectf(t, ok, "split=%v body=%q: trailers on a live request stream dropped the connection", split, body)
+			testing.expectf(t, !log.goaway, "split=%v body=%q: GOAWAY sent for trailers", split, body)
+			testing.expectf(t, log.rsts == 0, "split=%v body=%q: %d RST_STREAM for trailers", split, body, log.rsts)
+			testing.expectf(t, log.dispatched == 1, "split=%v body=%q: dispatched %d, want 1", split, body, log.dispatched)
+			testing.expectf(t, log.body == body, "split=%v: body %q, want %q", split, log.body, body)
+			// REQUEST_BLOCK indexes one field; the trailer is the second.
+			testing.expectf(t, len(c.decoder.entries) == 2, "split=%v body=%q: %d table entries, want 2", split, body, len(c.decoder.entries))
+			s, found := c.streams[1]
+			testing.expectf(t, found && s.state == .Half_Closed_Remote, "split=%v body=%q: the stream is not half-closed (remote)", split, body)
+
+			// The connection carries on: the next request is served.
+			handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 3}, block)
+			testing.expectf(t, log.dispatched == 2, "split=%v body=%q: the next stream was not served", split, body)
+
+			conn_unref(c)
+			free_all(context.temp_allocator)
+			expect_no_leaks(t, &track, "trailers on a parked request")
+			mem.tracking_allocator_destroy(&track)
+		}
+	}
+}
+
+/*
+RFC 9113 8.1: trailers carry END_STREAM and no pseudo-header field, and a
+request whose do not is malformed; so is one whose trailers carry a field 8.2
+refuses anywhere. 8.1.1 makes each a stream error of type PROTOCOL_ERROR: the
+request is reset rather than served, and the connection survives. The block is
+decoded all the same, so HPACK stays in step.
+*/
+@(test)
+test_malformed_trailers_are_a_stream_error :: proc(t: ^testing.T) {
+	Case :: struct {
+		what:  string,
+		field: Field,
+		flags: u8,
+	}
+	cases := []Case {
+		{"no END_STREAM", {"x-t", "1"}, 0},
+		{"a pseudo-header", {":path", "/"}, FLAG_END_STREAM},
+		{"a connection-specific field", {"connection", "close"}, FLAG_END_STREAM},
+		{"an uppercase name", {"X-T", "1"}, FLAG_END_STREAM},
+		{"a bad value", {"x-t", "a\r\nb"}, FLAG_END_STREAM},
+	}
+	for tc in cases {
+		for split in ([]bool{false, true}) {
+			track: mem.Tracking_Allocator
+			mem.tracking_allocator_init(&track, context.allocator)
+			allocator := mem.tracking_allocator(&track)
+
+			log: Request_Log
+			c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, counting_handler, &log, allocator)
+			block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+			handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+			body := []u8{'x'}
+			handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+
+			trailer := make([dynamic]u8, 0, 32, context.temp_allocator)
+			append(&trailer, ..TRAILER[:])
+			put_field(&trailer, tc.field.name, tc.field.value)
+			ok := send_block(c, 1, trailer[:], tc.flags, split)
+			testing.expectf(t, ok && !log.goaway, "%s split=%v: malformed trailers dropped the connection", tc.what, split)
+			testing.expectf(t, log.rsts == 1 && log.rst_code == .Protocol_Error, "%s split=%v: %d RST_STREAM, last %v; want one PROTOCOL_ERROR", tc.what, split, log.rsts, log.rst_code)
+			testing.expectf(t, log.dispatched == 0, "%s split=%v: a malformed request was served", tc.what, split)
+			testing.expectf(t, len(c.streams) == 0, "%s split=%v: the stream was not retired", tc.what, split)
+			testing.expectf(t, len(c.decoder.entries) == 2, "%s split=%v: %d table entries, want 2", tc.what, split, len(c.decoder.entries))
+			if tc.flags & FLAG_END_STREAM == 0 {
+				// Still sending when it was reset, so what follows is in flight.
+				ok = handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
+				testing.expectf(t, ok && log.rsts == 1, "%s split=%v: DATA behind the reset was not ignored", tc.what, split)
+			}
+
+			conn_unref(c)
+			free_all(context.temp_allocator)
+			expect_no_leaks(t, &track, "malformed trailers")
+			mem.tracking_allocator_destroy(&track)
+		}
+	}
+}
+
+/*
+RFC 9113 5.1: a stream the peer has ended is half-closed (remote), and a HEADERS
+on it is a stream error of type STREAM_CLOSED, not a connection error - drawn
+once, as DATA there is. The handler still holds the stream, and may retire it
+while the block is open across CONTINUATION, so the block is carried by the
+connection and still decoded.
+*/
+@(test)
+test_headers_after_end_stream_is_a_stream_error :: proc(t: ^testing.T) {
+	for retire_midway in ([]bool{false, true}) {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		allocator := mem.tracking_allocator(&track)
+
+		log: Request_Log
+		// Takes the request and never answers: the stream stays its to retire.
+		c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, destroying_handler, &log, allocator)
+		block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+		s := c.streams[1]
+
+		trailer := TRAILER
+		half := len(trailer) / 2
+		ok := handle_headers(c, Frame_Header{length = half, type = .Headers, flags = FLAG_END_STREAM, stream_id = 1}, trailer[:half])
+		if retire_midway {
+			// The handler answers and retires the stream while the block is open.
+			close_stream(c, 1)
+		}
+		ok = ok && handle_continuation(c, Frame_Header{length = len(trailer) - half, type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 1}, trailer[half:])
+		testing.expectf(t, ok && !log.goaway, "retire_midway=%v: HEADERS after END_STREAM dropped the connection", retire_midway)
+		testing.expectf(t, log.rsts == 1 && log.rst_code == .Stream_Closed, "retire_midway=%v: %d RST_STREAM, last %v; want one STREAM_CLOSED", retire_midway, log.rsts, log.rst_code)
+		testing.expectf(t, len(c.decoder.entries) == 2, "retire_midway=%v: %d table entries, want 2", retire_midway, len(c.decoder.entries))
+		if !retire_midway {
+			testing.expect(t, c.streams[1] == s && s.cancelled, "the stream being answered was replaced or left live")
+			// One reset is enough: a second block on it is decoded and ignored.
+			ok = handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82})
+			testing.expect(t, ok && log.rsts == 1, "a second block drew another RST_STREAM")
+			close_stream(c, 1)
+		}
+
+		conn_unref(c)
+		free_all(context.temp_allocator)
+		expect_no_leaks(t, &track, "headers after end stream")
+		mem.tracking_allocator_destroy(&track)
+	}
 }

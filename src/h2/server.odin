@@ -145,7 +145,6 @@ Stream_State :: enum u8 {
 Stream :: struct {
 	id:           u32,
 	state:        Stream_State,
-	header_block: [dynamic]u8,
 	body:         [dynamic]u8,
 	end_stream:   bool,
 	// Set when the peer resets the stream, so a response in flight is dropped.
@@ -154,10 +153,8 @@ Stream :: struct {
 	// decoded to keep HPACK in step, then the stream is reset without being
 	// served. See `handle_headers`.
 	refused:      bool,
-	// A HEADERS block on a stream this end had already reset and forgotten -
-	// trailers sent before the reset reached the peer. Decoded like a refused
-	// one, then dropped without a reset of its own. See `handle_headers`.
-	discard:      bool,
+	// The open block is this parked request's trailers. See `handle_headers`.
+	trailers:     bool,
 	send_window:  int,
 	// Request parked between its headers and the end of its body.
 	pending:      ^Request,
@@ -235,6 +232,16 @@ Conn :: struct {
 	request_bytes:            int,
 
 	allocator:           mem.Allocator,
+	/*
+	The header block being read, held here rather than on its stream: nothing
+	may come between a HEADERS and its CONTINUATION frames (RFC 9113 6.10), so
+	there is one at a time, and a block on a stream past taking one still has
+	to be decoded after a handler may have retired the stream. Freed once
+	decoded. `block_stream` is the stream it opens or ends, nil for one decoded
+	only to keep HPACK in step; see `handle_headers`.
+	*/
+	header_block:        [dynamic]u8,
+	block_stream:        ^Stream,
 	// The stream whose header block is open across CONTINUATION frames, or 0.
 	continuation_on:     u32,
 	// How many of them have arrived for the block currently open.
@@ -290,6 +297,7 @@ conn_unref :: proc(c: ^Conn) {
 		stream_destroy(c, s)
 	}
 	delete(c.streams)
+	delete(c.header_block)
 	dynamic_table_destroy(&c.decoder)
 	free(c, c.allocator)
 }
@@ -300,7 +308,6 @@ stream_destroy :: proc(c: ^Conn, s: ^Stream) {
 	// owned by the stream, not by a handler; only a dispatched one is released
 	// by whoever answered it.
 	request_destroy(c, s.pending)
-	delete(s.header_block)
 	c.request_bytes -= s.charged
 	delete(s.body)
 	free(s, c.allocator)
@@ -746,60 +753,91 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	}
 
 	loop.lock(&c.mu)
-	/*
-	An id at or below `last_stream_id` is already in use or closed, which is a
-	connection error - except on a stream this end reset and retired while the
-	peer was still sending (Conn.reset_ids). Trailers the peer sent before it
-	saw that reset are in flight, which RFC 9113 5.1 has ignored, not punished
-	(#390); but a header block always changes HPACK state, so it is carried and
-	decoded like a refused one, then dropped. Once: trailers end the stream, so
-	the id is struck off, and a second block is a connection error again.
-	*/
-	discard := false
+	delete(c.header_block)
+	c.header_block = make([dynamic]u8, 0, len(block), c.allocator)
+	append(&c.header_block, ..block)
+	c.block_stream = nil
+	stream_closed := false
 	if h.stream_id <= c.last_stream_id {
-		// Trailers end the stream (RFC 9113 8.1); a block that does not is an id reused.
-		if !was_reset_here(c, h.stream_id, forget = true) || h.flags & FLAG_END_STREAM == 0 {
+		s, found := c.streams[h.stream_id]
+		switch {
+		case found && s.state == .Open && s.pending != nil:
+			/*
+			RFC 9113 8.1: a request may end with a trailer section, a block on
+			the stream it opened, after the body. Nothing is done with the fields,
+			but the block is decoded, checked and only then ends the request; see
+			`finish_trailers`. A parked request has no handler, so nothing but
+			this reader can retire the stream while the block is open.
+			*/
+			s.trailers = true
+			s.end_stream = h.flags & FLAG_END_STREAM != 0
+			c.block_stream = s
+		case found:
+			/*
+			RFC 9113 5.1: the peer has ended this stream, or one end has reset it,
+			so it takes no more blocks: a stream error of type STREAM_CLOSED,
+			answered once and skipped on one the peer reset itself (5.4.2), as
+			DATA is in `handle_data`. The stream stays its handler's to retire,
+			so the block is decoded on its own.
+			*/
+			stream_closed = !s.cancelled
+			s.cancelled = true
+			set_state(c, s, .Closed)
+			// Wakes a handler parked in write_body's no-credit wait.
+			loop.cond_broadcast(&c.cond)
+		case was_reset_here(c, h.stream_id, forget = true) && h.flags & FLAG_END_STREAM != 0:
+		/*
+		A stream this end reset and retired while the peer was still sending
+		(Conn.reset_ids): trailers the peer sent before it saw that reset are in
+		flight, which RFC 9113 5.1 has ignored, not punished (#390). Decoded on
+		its own, then dropped. Once: trailers end the stream, so the id is
+		struck off, and a second block is a connection error again.
+		*/
+		case:
+			// Already in use or closed, which is a connection error. Trailers end
+			// the stream (RFC 9113 8.1); a block that does not is an id reused.
 			loop.unlock(&c.mu)
 			goaway(c, .Protocol_Error)
 			return false
 		}
-		discard = true
+	} else {
+		c.last_stream_id = h.stream_id
+
+		/*
+		A stream over the concurrency limit is refused, but not here. HPACK
+		state is per connection and order-dependent, so the block must still be
+		decoded to keep the decoder in step with the peer's encoder - RFC 9113
+		4.3 makes a block left undecoded a COMPRESSION_ERROR, whatever the
+		stream's fate. The stream is carried like any other through the block
+		(and its CONTINUATION frames), then reset in `finish_headers` instead of
+		served. Advancing `last_stream_id` above and setting `continuation_on`
+		below both happen on this path exactly as on the accepted one.
+		*/
+		// See MAX_HELD_STREAMS.
+		refused := len(c.streams) - c.closed_held >= MAX_CONCURRENT || len(c.streams) >= MAX_HELD_STREAMS
+
+		s := new(Stream, c.allocator)
+		s.id = h.stream_id
+		s.state = .Open
+		s.refused = refused
+		s.send_window = c.peer_initial_window
+		// Nothing allocated until DATA arrives, where `handle_data` charges it.
+		s.body = make([dynamic]u8, 0, 0, c.allocator)
+		s.end_stream = h.flags & FLAG_END_STREAM != 0
+		c.streams[h.stream_id] = s
+		c.block_stream = s
 	}
-	c.last_stream_id = max(c.last_stream_id, h.stream_id)
-
-	/*
-	A stream over the concurrency limit is refused, but not here. HPACK state is
-	per connection and order-dependent, so the block must still be decoded to
-	keep the decoder in step with the peer's encoder - RFC 9113 4.3 makes a
-	block left undecoded a COMPRESSION_ERROR, whatever the stream's fate. The
-	stream is carried like any other through the block (and its CONTINUATION
-	frames), then reset in `finish_headers` instead of served. Advancing
-	`last_stream_id` above and setting `continuation_on` below both happen on
-	this path exactly as on the accepted one.
-	*/
-	// See MAX_HELD_STREAMS.
-	refused := len(c.streams) - c.closed_held >= MAX_CONCURRENT || len(c.streams) >= MAX_HELD_STREAMS
-
-	s := new(Stream, c.allocator)
-	s.id = h.stream_id
-	s.state = .Open
-	s.refused = refused
-	s.discard = discard
-	s.send_window = c.peer_initial_window
-	s.header_block = make([dynamic]u8, 0, len(block), c.allocator)
-	// Nothing allocated until DATA arrives, where `handle_data` charges it.
-	s.body = make([dynamic]u8, 0, 0, c.allocator)
-	append(&s.header_block, ..block)
-	s.end_stream = h.flags & FLAG_END_STREAM != 0
-	c.streams[h.stream_id] = s
 	loop.unlock(&c.mu)
 
+	if stream_closed && !stream_error(c, h.stream_id, .Stream_Closed) {
+		return false
+	}
 	if h.flags & FLAG_END_HEADERS == 0 {
 		c.continuation_on = h.stream_id
 		c.continuation_frames = 0
 		return true
 	}
-	return finish_headers(c, s)
+	return finish_headers(c, c.block_stream)
 }
 
 @(private)
@@ -812,7 +850,7 @@ handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	Counted as well as measured.
 
 	The size cap below is no cap against frames that carry nothing: an empty
-	CONTINUATION never advances `len(s.header_block)`, so a peer sending them
+	CONTINUATION never advances `len(c.header_block)`, so a peer sending them
 	holds the block open and this reader reading nine-byte frames for as long as
 	it likes. Nothing accrues, which is why the cap is generous - a legitimate
 	block is MAX_HEADER_LIST at the outside and arrives in a handful of frames,
@@ -823,8 +861,6 @@ handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		goaway(c, .Enhance_Your_Calm)
 		return false
 	}
-	loop.lock(&c.mu)
-	s, found := c.streams[h.stream_id]
 	/*
 	Bounded as it accumulates, not once it is whole. Neither HEADERS nor
 	CONTINUATION is flow-controlled, so nothing slows a peer sending these, and
@@ -832,25 +868,17 @@ handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	END_HEADERS never arrives. Without a cap here one connection can make us
 	hold as much as it cares to send.
 	*/
-	oversized := found && len(s.header_block) + len(payload) > MAX_HEADER_LIST
-	if found && !oversized {
-		append(&s.header_block, ..payload)
-	}
-	loop.unlock(&c.mu)
-	if oversized {
+	if len(c.header_block) + len(payload) > MAX_HEADER_LIST {
 		goaway(c, .Compression_Error)
 		return false
 	}
-	if !found {
-		goaway(c, .Protocol_Error)
-		return false
-	}
+	append(&c.header_block, ..payload)
 
 	if h.flags & FLAG_END_HEADERS == 0 {
 		return true
 	}
 	c.continuation_on = 0
-	return finish_headers(c, s)
+	return finish_headers(c, c.block_stream)
 }
 
 /*
@@ -928,14 +956,10 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 		}
 
 		seen_regular = true
-		if !field_name_is_valid(f.name) {
+		if field_is_malformed(f) {
 			return true
 		}
 		switch f.name {
-		case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
-			// 8.2.2: connection-specific fields have no meaning in HTTP/2, where
-			// the connection is shared by every stream on it.
-			return true
 		case "host":
 			// 8.3.1 lets a request carry `Host` in place of `:authority`, and an
 			// h2-to-h1 hop writes it out as the one it gets: the same rule (#438).
@@ -944,11 +968,6 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 				return true
 			}
 			have_host, host = true, f.value
-		case "te":
-			// The one exception 8.2.2 makes, and only for this value.
-			if f.value != "trailers" {
-				return true
-			}
 		case "content-type":
 			/*
 			RFC 9110 5.3: a singleton field, and a recipient may treat a repeat
@@ -1044,6 +1063,27 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 		if len(path) == 0 || path[0] != '/' {
 			return true
 		}
+	}
+	return false
+}
+
+/*
+What makes an ordinary field malformed wherever it is, in a request's header
+section or its trailers: a name or value RFC 9113 8.2.1 refuses, or one of the
+connection-specific fields 8.2.2 does, which have no meaning in HTTP/2, where
+the connection is shared by every stream on it.
+*/
+@(private)
+field_is_malformed :: proc(f: Header_Field) -> bool {
+	if !field_name_is_valid(f.name) || !field_value_is_valid(f.value) {
+		return true
+	}
+	switch f.name {
+	case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
+		return true
+	case "te":
+		// The one exception 8.2.2 makes, and only for this value.
+		return f.value != "trailers"
 	}
 	return false
 }
@@ -1232,24 +1272,32 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 	so those six are cloned out below (`take`) and the rest go with the arena
 	rather than one heap allocation and free apiece.
 	*/
-	headers, err := decode(&c.decoder, s.header_block[:], context.temp_allocator)
+	headers, err := decode(&c.decoder, c.header_block[:], context.temp_allocator)
+	// The block is decoded; keep only the fields. Freed rather than cleared, or
+	// a connection keeps up to MAX_HEADER_LIST of buffer for as long as it lasts
+	// (#303).
+	delete(c.header_block)
+	c.header_block = nil
+	c.block_stream = nil
 	if err != .None {
 		goaway(c, .Compression_Error)
 		return false
 	}
-	// The block is decoded; keep only the fields. Freed rather than cleared, or
-	// a stream parked for its body keeps up to MAX_HEADER_LIST of buffer (#303).
-	delete(s.header_block)
-	s.header_block = nil
 
+	// A block decoded only for its HPACK side effects; see `handle_headers`.
+	if s == nil {
+		return true
+	}
 	// A refused stream has had its HPACK side effects applied by the decode
-	// above, which is the whole reason it was carried this far. Reset it (a
-	// `discard` one already was) and let it go without ever handing it to a
-	// handler.
-	if s.refused || s.discard {
-		sent := s.discard || stream_error(c, s.id, .Refused_Stream)
+	// above, which is the whole reason it was carried this far. Reset it and let
+	// it go without ever handing it to a handler.
+	if s.refused {
+		sent := stream_error(c, s.id, .Refused_Stream)
 		close_stream(c, s.id, peer_sending = !s.end_stream)
 		return sent
+	}
+	if s.trailers {
+		return finish_trailers(c, s, headers)
 	}
 
 	/*
@@ -1324,6 +1372,36 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 		s.pending = req
 		return true
 	}
+	return dispatch(c, s, req)
+}
+
+/*
+End a parked request with its trailers. RFC 9113 8.1: they carry END_STREAM and
+no pseudo-header field, and a request whose do not is malformed - as is one
+whose trailers carry a field 8.2 refuses anywhere - which 8.1.1 makes a stream
+error of type PROTOCOL_ERROR. The fields themselves are dropped: nothing this
+end serves reads a trailer.
+*/
+@(private)
+finish_trailers :: proc(c: ^Conn, s: ^Stream, trailers: []Header_Field) -> bool {
+	malformed := !s.end_stream
+	for f in trailers {
+		// A pseudo-header's name is no token, so this refuses those too.
+		if field_is_malformed(f) {
+			malformed = true
+		}
+	}
+	if malformed {
+		sent := stream_error(c, s.id, .Protocol_Error)
+		close_stream(c, s.id, peer_sending = !s.end_stream)
+		return sent
+	}
+	// Parked, so no handler holds it and the pointer is still good.
+	loop.lock(&c.mu)
+	set_state(c, s, .Half_Closed_Remote)
+	req := s.pending
+	s.pending = nil
+	loop.unlock(&c.mu)
 	return dispatch(c, s, req)
 }
 

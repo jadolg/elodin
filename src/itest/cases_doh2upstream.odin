@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:time"
+import "elodin:h2"
 
 /*
 elodin as a DoH client: ALPN decides between HTTP/2 and HTTP/1.1 against the
@@ -237,6 +238,72 @@ blocking: {{ enabled: false }}
 			} else {
 				skip_case(r, "upstream: doh h1 oversized reply", "server did not start")
 			}
+		}
+	}
+
+	// --- an h2 response that ends with trailers ---
+	/*
+	RFC 9113 8.1: a response may end with a trailer section, which carries no
+	pseudo-header field; one that does is malformed, and a client MUST NOT
+	accept it (8.1.1). So trailers on a 200 leave the answer standing, and a
+	`:status` in them is no answer at all - here a 500 that a trailing 200 was
+	read as overriding (#457).
+	*/
+	{
+		Trailer_Case :: struct {
+			what:     string,
+			head:     int,
+			trailers: []h2.Header_Field,
+			rcode:    int,
+		}
+		trailer_cases := []Trailer_Case {
+			{"upstream: an h2 answer that ends with trailers is taken", 200, {{name = "x-t", value = "1"}}, 0},
+			{"upstream: a :status in an h2 answer's trailers is no answer", 500, {{name = ":status", value = "200"}}, 2},
+		}
+		for tc, i in trailer_cases {
+			upstream_port := next_port(r)
+			mock := doh2_mock_make(upstream_port, "/dns-query", payload)
+			mock.trailer_head = tc.head
+			mock.trailers = tc.trailers
+			if !doh2_mock_start(mock, r.cert_file, r.key_file, {"h2"}) {
+				skip_case(r, tc.what, "cannot start the mock")
+				doh2_mock_stop(mock)
+				continue
+			}
+			udp_port := next_port(r)
+			config := fmt.tprintf(
+				`log: {{ level: warn }}
+listeners:
+  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
+  tcp: {{ enabled: false }}
+upstream:
+  timeout: 5s
+  servers:
+    - {{ name: trailers, type: https, url: "https://127.0.0.1:%d/dns-query", verify: false }}
+cache: {{ enabled: false }}
+blocking: {{ enabled: false }}
+`,
+				udp_port,
+				upstream_port,
+			)
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+			if ok {
+				start_case(r, tc.what)
+				{
+					res := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = u16(0x5260 + i)))
+					if check(r, res.ok, "no response") {
+						h := parse_header(r, res.wire)
+						check_eq_int(r, h.rcode, tc.rcode, "rcode")
+					}
+					h2_hits, _ := doh2_mock_counts(mock)
+					check(r, h2_hits >= 1, "the upstream was not reached over h2")
+				}
+				end_case(r)
+				stop_server(&srv)
+			} else {
+				skip_case(r, tc.what, "server did not start")
+			}
+			doh2_mock_stop(mock)
 		}
 	}
 

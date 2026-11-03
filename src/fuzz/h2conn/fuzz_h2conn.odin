@@ -48,6 +48,15 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 		h2.conn_unref(c)
 	} else {
 		c := h2.client_make(io, heap)
+		// Stream 1 is a request in flight, so a response on it reaches the
+		// response path rather than stopping at the idle-stream check; the
+		// client frees it with the rest of its table.
+		s := new(h2.Client_Stream, heap)
+		s.id = 1
+		s.send_window = c.peer_initial_window
+		s.body = make([dynamic]u8, 0, 0, heap)
+		c.streams[1] = s
+		c.next_stream_id = 3
 		h2.client_serve(c)
 		h2.client_unref(c)
 	}

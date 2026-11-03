@@ -1171,6 +1171,8 @@ Client_Frame_Log :: struct {
 	credit:      int,
 	// Error code of the last GOAWAY written.
 	goaway_code: Error_Code,
+	// Error code of the last RST_STREAM written.
+	rst_code:    Error_Code,
 }
 
 @(private = "file")
@@ -1195,6 +1197,9 @@ client_log_write :: proc(user: rawptr, buf: []u8) -> bool {
 		}
 		if h.type == .Goaway && pos + FRAME_HEADER_SIZE + 8 <= len(buf) {
 			log.goaway_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE + 4:]))
+		}
+		if h.type == .Rst_Stream && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
+			log.rst_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
 		}
 		pos += FRAME_HEADER_SIZE + h.length
 	}
@@ -2933,5 +2938,92 @@ test_client_idle_stream_and_enable_push_protocol_errors :: proc(t: ^testing.T) {
 		delete(log.frames)
 		client_unref(c)
 		free_all(context.temp_allocator)
+	}
+}
+
+/*
+RFC 9113 8.1: a response is any number of interim (1xx) header sections, one
+final one, the body, and optionally trailers, which end the stream and carry no
+pseudo-header field. A response that breaks that is malformed, a stream error
+of type PROTOCOL_ERROR (8.1.1) that a client MUST NOT accept: the request fails
+as reset. Before #457 a trailer's `:status` was read as the answer's, and a
+block after the final one was taken whatever it carried.
+*/
+@(test)
+test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
+	Block :: struct {
+		status:     string,
+		end_stream: bool,
+	}
+	Case :: struct {
+		what:      string,
+		blocks:    []Block,
+		malformed: bool,
+		status:    int,
+	}
+	// A block with no status is a trailer section; DATA goes after the first.
+	cases := []Case {
+		{"trailers end the response", {{"200", false}, {"", true}}, false, 200},
+		{"interim responses come first", {{"103", false}, {"200", false}, {"", true}}, false, 200},
+		{"a trailer with :status", {{"200", false}, {"500", true}}, true, 200},
+		{"trailers without END_STREAM", {{"200", false}, {"", false}}, true, 200},
+		{"an interim response with END_STREAM", {{"100", true}}, true, 100},
+	}
+	for tc in cases {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		allocator := mem.tracking_allocator(&track)
+
+		log := Client_Frame_Log {
+			frames = make([dynamic]Frame_Header, 0, 8, allocator),
+		}
+		c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+		c.next_stream_id = 3
+		s := new(Client_Stream, allocator)
+		s.id = 1
+		s.send_window = c.peer_initial_window
+		s.body = make([dynamic]u8, 0, 8, allocator)
+		c.streams[1] = s
+
+		ok := true
+		for b, i in tc.blocks {
+			block := make([dynamic]u8, 0, 64, context.temp_allocator)
+			if b.status != "" {
+				encode_header(&block, ":status", b.status)
+			} else {
+				encode_header(&block, "x-t", "1")
+			}
+			flags := u8(FLAG_END_HEADERS) | (u8(FLAG_END_STREAM) if b.end_stream else 0)
+			ok = ok && client_handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = flags, stream_id = 1}, block[:])
+			if i == 0 && !b.end_stream && !s.reset {
+				body := []u8{'x'}
+				ok = ok && client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+			}
+		}
+		testing.expectf(t, ok, "%s: the connection was dropped", tc.what)
+		testing.expectf(t, s.status == tc.status, "%s: status %d, want %d", tc.what, s.status, tc.status)
+		testing.expectf(t, s.reset == tc.malformed, "%s: reset %v, want %v", tc.what, s.reset, tc.malformed)
+		testing.expectf(t, s.done == !tc.malformed, "%s: done %v, want %v", tc.what, s.done, !tc.malformed)
+		rsts := 0
+		for f in log.frames {
+			if f.type == .Rst_Stream {
+				rsts += 1
+			}
+		}
+		if tc.malformed {
+			testing.expectf(t, rsts == 1 && log.rst_code == .Protocol_Error, "%s: %d RST_STREAM, last %v; want one PROTOCOL_ERROR", tc.what, rsts, log.rst_code)
+		} else {
+			testing.expectf(t, rsts == 0, "%s: %d RST_STREAM", tc.what, rsts)
+		}
+
+		delete(log.frames)
+		client_stream_destroy(c, s)
+		delete_key(&c.streams, u32(1))
+		client_unref(c)
+		free_all(context.temp_allocator)
+		for _, entry in track.allocation_map {
+			testing.expectf(t, false, "%s: %d bytes leaked at %v", tc.what, entry.size, entry.location)
+		}
+		mem.tracking_allocator_destroy(&track)
 	}
 }
