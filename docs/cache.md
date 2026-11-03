@@ -92,7 +92,8 @@ go to the upstream once. The first forwards and the rest wait for it:
   upstream message was byte for byte the first one's, ID aside. elodin builds
   that message from the question alone ([What reaches the
   upstream](edns.md#what-reaches-the-upstream)), so every waiter matches unless
-  a reload changed the DNSSEC settings in between; those ask for themselves.
+  a reload in between changed whether the question is validated (DNSSEC
+  settings, trust anchors, zone routes); those ask for themselves.
 - **A cached refusal** (a DNSSEC failure, or a CNAME into a blocked name) refuses
   the waiters without asking. Exceptions: a list reload during the wait that
   lifted the listing serves the answer; an entry evicted or expired meanwhile

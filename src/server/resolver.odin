@@ -1012,9 +1012,9 @@ records and are not counted here.
 The fourth is an OPT record owned by a name other than the root. RFC 6891
 section 6.1.2 says NAME MUST be 0, and Unbound (`parse_edns_from_query_pkt`) and
 BIND (`dns_message_parse`) answer such a query FORMERR. Read as the query's EDNS
-record it is answered with EDNS from the cache, a block or a local zone, and
-forwarded on a miss to an upstream that refuses it. The decoder writes the root
-as ".", whether it arrived as a zero octet or as a pointer to one.
+record it is answered with EDNS from the cache, a block or a local zone. The
+decoder writes the root as ".", whether it arrived as a zero octet or as a
+pointer to one.
 */
 @(private)
 edns_opt_readable :: proc(msg: dns.Message) -> bool {
@@ -1149,8 +1149,8 @@ why it sits where it does:
   everything this server answers without looking anything up;
 - `answer_from_cache`: a fresh hit, the RD=0 gate, a remembered Bogus verdict
   and the `serve_stale` refresh - everything that answers without an upstream;
-- `shape_forwarded`: the outgoing query, with what is the client's taken out
-  and what is ours put in;
+- `shape_forwarded`: the outgoing query, built from the cache key rather than
+  the client's message;
 - `join_flight`: one exchange for every identical question in flight;
 - `exchange_upstream`: the zone's route, and the apex `DS` carve-out;
 - `judge_reply`: a reply that is no answer, or that the client cannot read;
@@ -1867,8 +1867,8 @@ join_flight :: proc(st: ^Query_State) -> bool {
 					}
 				case .Bogus:
 					// Not gated on `validating`: the leader reached this verdict for
-					// the same key, and this query's own rewrite failing is no reason
-					// to forward what was just proved Bogus.
+					// the same key, and a reload that has since turned this query's
+					// validation off is no reason to forward what was just proved Bogus.
 					if remembered, found := stored_verdict(st.s, st.verdict_key, st.allocator); found {
 						sync.atomic_add(&st.s.stats.coalesced, 1)
 						return answered(st, serve_bogus_verdict(st.s, remembered, st.query, st.msg, st.q, st.proto, st.client, st.started))

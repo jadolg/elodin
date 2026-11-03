@@ -206,9 +206,9 @@ opt_fixture_stop :: proc(f: ^Opt_Fixture) {
 A cookie in a second OPT record does not reach the upstream.
 
 `inspect_cookie` reads the first OPT record and no other, so a cookie in a
-second one is a cookie this server never notices it was sent - the strip in
-`resolve_query` is asked for only when `cookie.sent`, and it edits the first
-record anyway. Forwarded, that hands a secret shared between the client and this
+second one is a cookie this server never notices it was sent. `upstream_query`
+forwards none of the client's options, and the gate turns the shape away before
+that. Forwarded, it would hand a secret shared between the client and this
 server to a third party that cannot check it and did not need it, which is the
 whole of what the cookie strip exists to prevent.
 

@@ -82,17 +82,6 @@ Cookie_Verdict :: enum u8 {
 
 Cookie_Request :: struct {
 	verdict: Cookie_Verdict,
-	/*
-	Whether the query carried a COOKIE option at all.
-
-	Separate from `verdict`, because it is answered even with the client-facing
-	side turned off, where there is no secret to judge one against and every
-	verdict is `.Absent`. What it decides is not whether to give the client a
-	cookie but whether to take one off the query before forwarding it, and that
-	has to happen either way: the client's cookie is no more the upstream's
-	business when this server is not issuing cookies than when it is.
-	*/
-	sent:    bool,
 	client:  [COOKIE_CLIENT_LEN]u8,
 	// The client address, in the 4 or 16 bytes the hash is taken over.
 	ip:      [16]u8,
@@ -154,18 +143,11 @@ changes from one query to the next, so only the host goes into the hash.
 */
 inspect_cookie :: proc(k: ^Cookie_Keeper, m: dns.Message, client: string) -> (req: Cookie_Request) {
 	raw, found := dns.find_edns_option(m, .Cookie)
-	if !found {
+	if !found || k == nil {
 		return {}
 	}
-	// Recorded before anything else, since the forwarding path needs it whatever
-	// the verdict turns out to be - including with the keeper off, where there is
-	// no verdict to reach.
-	req.sent = true
-	if k == nil {
-		return req
-	}
 	if len(raw) != COOKIE_CLIENT_LEN && (len(raw) < COOKIE_MIN_LEN || len(raw) > COOKIE_MAX_LEN) {
-		return Cookie_Request{verdict = .Malformed, sent = true}
+		return Cookie_Request{verdict = .Malformed}
 	}
 
 	n, parsed := cookie_client_ip(client, req.ip[:])
@@ -174,7 +156,7 @@ inspect_cookie :: proc(k: ^Cookie_Keeper, m: dns.Message, client: string) -> (re
 		// client did send one, and `require` has to turn that away rather than
 		// wave it through for want of an address to check it against.
 		logx.debugf("cookies: %q is not an address a cookie can be bound to", client)
-		return Cookie_Request{verdict = .Unbindable, sent = true}
+		return Cookie_Request{verdict = .Unbindable}
 	}
 	req.ip_len = n
 	copy(req.client[:], raw[:COOKIE_CLIENT_LEN])

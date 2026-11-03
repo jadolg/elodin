@@ -26,9 +26,10 @@ where a lost datagram is retried - is shared only with a follower whose outgoing
 message is the leader's, byte for byte bar the ID. `upstream_query` builds that
 message from the key and nothing of the client's (issue #423), so it is every
 follower bar one whose query was shaped under different settings - a reload
-that turned validation on or off between the two. A follower given a failure
-takes the expired entry or SERVFAIL as the
-leader did, rather than wait a second full exchange for the same nothing, which
+between the two that changed whether the question is validated: the validator,
+a trust anchor, an `upstream.zones` route or the special-use table. A follower
+given a failure takes the expired entry or SERVFAIL as the leader did, rather
+than wait a second full exchange for the same nothing, which
 in an outage is every query in flight held twice as long.
 
 A follower that cannot use what the leader landed with forwards on its own, which

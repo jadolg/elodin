@@ -510,7 +510,8 @@ test_two_queries_for_one_key_reach_the_upstream_as_one_message :: proc(t: ^testi
 	if testing.expect_value(t, len(asked.additional), 1) {
 		testing.expect_value(t, asked.additional[0].ttl, u32(0))
 		testing.expect_value(t, u16(asked.additional[0].class), u16(1232))
-		if rdata, is_opt := asked.additional[0].data.(dns.Rdata_OPT); is_opt {
+		rdata, is_opt := asked.additional[0].data.(dns.Rdata_OPT)
+		if testing.expect(t, is_opt, "the one additional record is not an OPT record") {
 			testing.expect_value(t, len(rdata.options), 0)
 		}
 	}
