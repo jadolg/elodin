@@ -925,26 +925,6 @@ copy_question_case :: proc(resp: []u8, query: []u8) {
 	copy(resp[HEADER_SIZE:r_end], query[HEADER_SIZE:q_end])
 }
 
-/*
-Fold the question name of `wire` to ASCII lower case, in place (RFC 4343 section
-3: only A-Z fold). A length octet is at most 63, below 'A', so the whole name can
-be walked byte by byte.
-*/
-lower_question_case :: proc(wire: []u8) {
-	if len(wire) < HEADER_SIZE || (wire[4] == 0 && wire[5] == 0) {
-		return
-	}
-	end, ok := skip_name(wire, HEADER_SIZE)
-	if !ok {
-		return
-	}
-	for &c in wire[HEADER_SIZE:end] {
-		if c >= 'A' && c <= 'Z' {
-			c += 32
-		}
-	}
-}
-
 clone_message_bytes :: proc(src: []u8, allocator := context.allocator) -> []u8 {
 	dst := make([]u8, len(src), allocator)
 	copy(dst, src)

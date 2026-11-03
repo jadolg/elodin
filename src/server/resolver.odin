@@ -1739,14 +1739,13 @@ back in the client's case before it goes out (`dns.copy_question_case`).
 */
 @(private)
 upstream_query :: proc(q: dns.Question, dnssec_ok, checking_disabled: bool, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
-	question := make([]dns.Question, 1, allocator)
-	question[0] = q
-	additional := make([]dns.Record, 1, allocator)
-	additional[0] = dns.make_opt(UPSTREAM_UDP_SIZE, dnssec_ok)
+	question := [1]dns.Question{q}
+	question[0].name = dns.name_fold(q.name, allocator)
+	additional := [1]dns.Record{dns.make_opt(UPSTREAM_UDP_SIZE, dnssec_ok)}
 	m := dns.Message {
 		id         = dns.random_id(),
-		question   = question,
-		additional = additional,
+		question   = question[:],
+		additional = additional[:],
 	}
 	m.flags.rd = true
 	m.flags.cd = checking_disabled
@@ -1754,7 +1753,6 @@ upstream_query :: proc(q: dns.Question, dnssec_ok, checking_disabled: bool, allo
 	if err != .None {
 		return nil, false
 	}
-	dns.lower_question_case(encoded)
 	return encoded, true
 }
 

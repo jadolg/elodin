@@ -293,21 +293,19 @@ test_the_validating_query_advertises_the_flag_day_size :: proc(t: ^testing.T) {
 }
 
 /*
-And it cannot push the figure below 512 either.
+And it cannot push the figure down either.
 
-RFC 6891 section 6.2.3 has a responder treat anything under 512 as 512, so a
-smaller number buys a client nothing on the receiving end - but written out it is
-the cap's lever pointed the other way: zero advertised, and every upstream answer
-over 512 bytes comes back truncated and is re-fetched over TCP. One unsigned
-datagram in, an upstream connection out, for as long as the client cares to send
-them.
+Written out, a client's small figure would be a lever: zero advertised, and every
+upstream answer over 512 bytes comes back truncated and is re-fetched over TCP.
+One unsigned datagram in, an upstream connection out, for as long as the client
+cares to send them.
 
 Zero rather than some other small number because it is the figure the lever is
 worth most at, and because an OPT record is entitled to carry it: the field is
 two bytes wide and nothing about the wire forbids it.
 */
 @(test)
-test_a_client_cannot_push_the_upstream_payload_size_below_512 :: proc(t: ^testing.T) {
+test_a_client_cannot_push_the_upstream_payload_size_down :: proc(t: ^testing.T) {
 	query := client_query(0, edns = true)
 	if !testing.expect(t, len(query) > dns.HEADER_SIZE, "the query did not encode") {
 		return

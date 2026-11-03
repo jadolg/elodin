@@ -3,6 +3,7 @@ package itest
 import "core:fmt"
 import "core:strings"
 import "core:time"
+import "elodin:dns"
 
 /*
 Parity: does elodin hand the client what its upstream handed elodin?
@@ -465,6 +466,8 @@ upstream_also_says :: proc(
 	about a pool neither side used.
 	*/
 	forwarded := q
+	// The name in the key's case: the generator flips it as a 0x20 stub does.
+	forwarded.name = transmute([]u8)dns.name_fold(string(q.name), context.temp_allocator)
 	forwarded.rd = true
 	forwarded.ad = false
 	forwarded.edns = true
