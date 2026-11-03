@@ -21,9 +21,16 @@ sentence in `msg`. In Loki, `| logfmt` is all it takes:
 With `log.file` set, elodin creates the file readable and writable by its
 owner only (`0600`), since with `log.queries` on it names every client and every
 name looked up. A file that already exists keeps its mode, so a shipper's group
-is given access the usual way, e.g. logrotate's `create 0640 elodin adm`. Under
-`server.user` the file is opened again on `SIGHUP` as that account
-([Privileges](install.md#privileges)).
+is given access the usual way, e.g. logrotate's `create 0640 elodin adm`; one
+every account can read is named in a `warn` at startup and at each reopen
+(`log.file: "..." is readable by every user on this host`).
+
+Under `server.user` the file is opened again on `SIGHUP` as that account
+([Privileges](install.md#privileges)). A file elodin created at startup changes
+owner along with the process; one that was there already is left as it is, and
+the account must be able to write it. After a rotation the name must be
+creatable by the account too, so give logrotate `create <mode> <user> <group>`
+naming it, or a directory it can write.
 
 With `log.file` set, each line is one write to the file, not followed by a
 sync: `tail` and a shipper see it at once and a killed process loses none of

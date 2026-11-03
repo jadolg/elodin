@@ -1,6 +1,7 @@
 package logx
 
 import "base:runtime"
+import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -24,6 +25,11 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 	}
 	defer os.remove_all(dir)
 	defer shutdown()
+
+	// Created owner-only, so nobody else reads it; widened by hand, it is said.
+	testing.expect(t, !readable_by_others(), "a log this process created is readable by others")
+	testing.expect(t, os.chmod(path, os.Permissions_Read_All + {.Write_User}) == nil, "cannot widen the log's mode")
+	testing.expect(t, readable_by_others(), "a 0644 log is not reported as readable by others")
 
 	infof("elodin %s starting", "1.2.3")
 	debugf("this one is below the level")
@@ -185,7 +191,8 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 	if !testing.expectf(t, terr == nil, "no temporary directory: %v", terr) {
 		return
 	}
-	dir, _ := filepath.join({tmp, "elodin-logx-mode-test"}, context.temp_allocator)
+	// The pid keeps a run in another checkout from removing this one's file.
+	dir, _ := filepath.join({tmp, fmt.tprintf("elodin-logx-mode-test-%d", posix.getpid())}, context.temp_allocator)
 	os.remove_all(dir)
 	if !testing.expect(t, os.make_directory(dir) == nil, "cannot create the scratch directory") {
 		return
@@ -193,11 +200,19 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 	defer os.remove_all(dir)
 	path, _ := filepath.join({dir, "elodin.log"}, context.temp_allocator)
 
-	f, err := open_log(path)
+	f, created, err := open_log(path)
 	if !testing.expectf(t, err == nil, "cannot open %s: %v", path, err) {
 		return
 	}
 	os.close(f)
+	testing.expect(t, created, "a new log file was not reported as created")
+
+	// Opened again, it is appended to, and not this open's to hand over.
+	again, created_again, err_again := open_log(path)
+	if testing.expectf(t, err_again == nil, "cannot open %s again: %v", path, err_again) {
+		os.close(again)
+		testing.expect(t, !created_again, "an existing log file was reported as created")
+	}
 	st: posix.stat_t
 	if !testing.expect(t, posix.stat(strings.clone_to_cstring(path, context.temp_allocator), &st) == .OK, "cannot stat the log") {
 		return

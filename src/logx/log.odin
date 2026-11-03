@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import "core:sys/posix"
 import "core:time"
 
 /*
@@ -24,6 +25,9 @@ State :: struct {
 	level:   Level,
 	file:    ^os.File,
 	to_file: bool,
+	// This process created `file` rather than appending to one already there;
+	// see `hand_over`.
+	created: bool,
 }
 
 @(private)
@@ -45,12 +49,13 @@ init :: proc(level: Level, path: string = "") -> bool {
 	if path == "" {
 		return true
 	}
-	f, err := open_log(path)
+	f, created, err := open_log(path)
 	if err != nil {
 		return false
 	}
 	state.file = f
 	state.to_file = true
+	state.created = created
 	return true
 }
 
@@ -70,9 +75,10 @@ still working.
 */
 reopen :: proc(path: string) -> bool {
 	f: ^os.File
+	created: bool
 	if path != "" {
 		err: os.Error
-		f, err = open_log(path)
+		f, created, err = open_log(path)
 		if err != nil {
 			return false
 		}
@@ -82,6 +88,7 @@ reopen :: proc(path: string) -> bool {
 	old := state.file if state.to_file else nil
 	state.file = f
 	state.to_file = f != nil
+	state.created = created
 	sync.mutex_unlock(&state.mu)
 
 	if old != nil {
@@ -95,11 +102,64 @@ Created readable and writable by its owner only. With `log.queries` on, the file
 names every client and every name it looked up, which is nobody else's business
 on the host; a group that ships the log is given it by the operator (logrotate's
 `create 0640 <user> <group>`), not by default. A file that already exists keeps
-the mode it has.
+the mode it has; `readable_by_others` says when that mode is too wide.
+
+`created` says the open made the file, which O_EXCL decides in the kernel: a
+file or symlink already at the name fails it and is appended to as it is.
 */
 @(private)
-open_log :: proc(path: string) -> (^os.File, os.Error) {
-	return os.open(path, {.Write, .Create, .Append}, {.Read_User, .Write_User})
+open_log :: proc(path: string) -> (f: ^os.File, created: bool, err: os.Error) {
+	OWNER_ONLY :: os.Permissions{.Read_User, .Write_User}
+	f, err = os.open(path, {.Write, .Create, .Excl, .Append}, OWNER_ONLY)
+	if err == nil {
+		return f, true, nil
+	}
+	if err != .Exist {
+		return nil, false, err
+	}
+	f, err = os.open(path, {.Write, .Create, .Append}, OWNER_ONLY)
+	return f, false, err
+}
+
+/*
+Give the log file to the account the process is about to become, when this
+process created it.
+
+Started as root, `init` creates the file as root, and the dropped process could
+then never open its name again: every SIGHUP after a rotation would log on into
+the renamed file. A file this process made is its own output, like the
+blocklist cache, so it goes over with the process. One that was there already is
+the operator's - possibly a shared system log - and is left as it is (Unbound
+declines to chown its log file for the same reason). By descriptor, so the file
+changed is the one being written, whatever the name points at by now.
+
+True when there was nothing to hand over.
+*/
+hand_over :: proc(uid: posix.uid_t, gid: posix.gid_t) -> bool {
+	sync.mutex_lock(&state.mu)
+	defer sync.mutex_unlock(&state.mu)
+	if !state.to_file || !state.created {
+		return true
+	}
+	return posix.fchown(posix.FD(os.fd(state.file)), uid, gid) == .OK
+}
+
+/*
+Whether the log file in use can be read by every account on the host: a file
+an older elodin, or someone else, created with a wider mode than `open_log`
+does. False when logging to stderr or when it cannot tell.
+*/
+readable_by_others :: proc() -> bool {
+	sync.mutex_lock(&state.mu)
+	defer sync.mutex_unlock(&state.mu)
+	if !state.to_file {
+		return false
+	}
+	st: posix.stat_t
+	if posix.fstat(posix.FD(os.fd(state.file)), &st) != .OK {
+		return false
+	}
+	return .IROTH in st.st_mode
 }
 
 shutdown :: proc() {
@@ -108,6 +168,7 @@ shutdown :: proc() {
 	if state.to_file && state.file != nil {
 		os.close(state.file)
 		state.file = nil
+		state.created = false
 		state.to_file = false
 	}
 }

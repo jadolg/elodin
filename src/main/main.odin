@@ -459,6 +459,7 @@ main :: proc() {
 	if !logx.init(logx.Level(cfg.log.level), cfg.log.file) {
 		fmt.eprintfln("elodin: cannot open the log file %q, logging to stderr instead", cfg.log.file)
 	}
+	warn_log_readable(cfg.log.file)
 	defer logx.shutdown()
 
 	/*
@@ -908,10 +909,12 @@ everything from here on is parsing whatever arrives on those sockets. The
 sockets themselves are already open, so the process keeps serving on them
 whoever it becomes.
 
-The blocklist cache goes over first. It is the one path still opened by name
-afterwards - the lists were downloaded above, as root, and a refresh some hours
-later reopens them - so without this the cache would silently stop being
-written the moment its owner changed. Only with blocking on, so a directory
+The blocklist cache goes over first. It is the one path elodin writes and owns
+that is still opened by name afterwards - the lists were downloaded above, as
+root, and a refresh some hours later reopens them - so without this the cache
+would silently stop being written the moment its owner changed. The files the
+operator names are not taken over; `warn_out_of_reach` names those the new
+account cannot open. Only with blocking on, so a directory
 that is not elodin's - a shared one, named but unused - is not taken over for
 nothing. A reload that turns blocking on later finds it as it is; see
 `docs/install.md`.
@@ -944,12 +947,29 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 		}
 	}
 
+	if !logx.hand_over(service.uid, service.gid) {
+		logx.warnf("could not give the log file %q to %s; a SIGHUP after a rotation will not open it again", cfg.log.file, cfg.server.user)
+	}
+
 	if err := privdrop.apply(service); err != .None {
 		logx.errorf("cannot drop privileges to %s: %s", cfg.server.user, privdrop.explain(err))
 		os.exit(1)
 	}
 	logx.infof("running as %s (uid=%d gid=%d)", cfg.server.user, service.uid, service.gid)
 	warn_out_of_reach(cfg, config_path)
+}
+
+/*
+A log file elodin creates is owner-only, but one already there keeps its mode -
+an upgrade from a release that created it 0644, or logrotate's `create 0644`.
+With `log.queries` on it names every client, so a mode that lets every account
+read it is said at each open rather than changed: the file is the operator's.
+*/
+@(private)
+warn_log_readable :: proc(path: string) {
+	if logx.readable_by_others() {
+		logx.warnf("log.file: %q is readable by every user on this host; 'chmod o-r' it, or set logrotate's create mode", path)
+	}
 }
 
 /*
@@ -963,18 +983,21 @@ log goes on into the file logrotate renamed. Said here, at the start, where the
 operator is looking, rather than at the first reload weeks later. Not an error:
 the process serves correctly as it is, and a reload logs its own failure too.
 
-Lists only with blocking on; one turned on later by a reload says so itself.
+Lists only with blocking on; one turned on later by a reload says so itself. A
+`file:` list is read again by every rebuild, a scheduled refresh as well as a
+SIGHUP, and one it cannot read has its rules lifted rather than kept (see
+`reload_filters`), so that is what its warning says.
 */
 @(private)
 warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
 	warn :: proc(cfg: ^config.Config, setting, path, what: string) {
-		logx.warnf("%s: %s cannot open %q, so a SIGHUP will %s", setting, cfg.server.user, path, what)
+		logx.warnf("%s: %s cannot open %q, so %s", setting, cfg.server.user, path, what)
 	}
 	if !privdrop.can_reopen(config_path, false) {
-		warn(cfg, "configuration", config_path, "not reload the configuration")
+		warn(cfg, "configuration", config_path, "a SIGHUP will not reload the configuration")
 	}
 	if cfg.log.file != "" && !privdrop.can_reopen(cfg.log.file, true) {
-		warn(cfg, "log.file", cfg.log.file, "keep logging to the file already open, renamed or not")
+		warn(cfg, "log.file", cfg.log.file, "a SIGHUP will keep logging to the file already open, renamed or not")
 	}
 	tls := [?]struct {
 		name: string,
@@ -985,17 +1008,17 @@ warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
 			continue
 		}
 		if !privdrop.can_reopen(l.ln.cert_file, false) {
-			warn(cfg, fmt.tprintf("listeners.%s.cert_file", l.name), l.ln.cert_file, "keep the certificate loaded now")
+			warn(cfg, fmt.tprintf("listeners.%s.cert_file", l.name), l.ln.cert_file, "a SIGHUP will keep the certificate loaded now")
 		}
 		if !privdrop.can_reopen(l.ln.key_file, false) {
-			warn(cfg, fmt.tprintf("listeners.%s.key_file", l.name), l.ln.key_file, "keep the certificate loaded now")
+			warn(cfg, fmt.tprintf("listeners.%s.key_file", l.name), l.ln.key_file, "a SIGHUP will keep the certificate loaded now")
 		}
 	}
 	if cfg.blocking.enabled {
 		for set in ([?][]config.Block_List{cfg.blocking.lists, cfg.blocking.allow_lists}) {
 			for list in set {
 				if list.enabled && list.file != "" && !privdrop.can_reopen(list.file, false) {
-					warn(cfg, fmt.tprintf("list %s", list.name), list.file, "keep the rules built from it now")
+					warn(cfg, fmt.tprintf("list %s", list.name), list.file, "the next refresh or SIGHUP will drop the rules built from it")
 				}
 			}
 		}
@@ -1106,6 +1129,8 @@ reload :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m
 	logx.infof("SIGHUP received, reloading the configuration and the TLS certificates")
 	if !reopened {
 		logx.warnf("cannot open the log file %q again; logging where it was", file)
+	} else {
+		warn_log_readable(file)
 	}
 
 	out := server.reload_config(s, opts.config_path)

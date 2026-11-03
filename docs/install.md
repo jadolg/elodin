@@ -106,10 +106,13 @@ root; the first arrangement avoids it.
 
 The files a [`SIGHUP`](#signals) opens again by name are opened as that account,
 not as root: the configuration file, the DoT/DoH `cert_file` and `key_file`,
-`file:` lists and `log.file` (for writing). Startup reads them as root, so a
+`file:` lists and `log.file` (for writing; a log file elodin itself created
+changes owner with the process, see [Logs](logging.md)). Startup reads them as root, so a
 root-only file — certbot's `privkey.pem` is root's and `0600` — starts fine and
 then fails at every reload: the certificate is not renewed in place, and the
-listener goes on serving the old one until it expires. elodin does not take
+listener goes on serving the old one until it expires. A `file:` list is read
+again by every scheduled refresh as well, and one the account cannot read has
+its rules lifted then. elodin does not take
 these files over. Give the account read access, for example
 `setfacl -m u:elodin:r /etc/letsencrypt/live/<name>/privkey.pem` (and `x` on
 `/etc/letsencrypt/live` and `/etc/letsencrypt/archive`, which certbot makes
