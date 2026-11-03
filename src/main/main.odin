@@ -456,10 +456,16 @@ main :: proc() {
 		os.exit(1)
 	}
 
-	if !logx.init(logx.Level(cfg.log.level), cfg.log.file) {
+	/*
+	Not under `--check`, which only reads: it would create the file, as root
+	when run with sudo, and the start after it would then find a file it did not
+	make and leave it root's (`logx.hand_over`). Its lines go to stderr.
+	*/
+	log_file := "" if opts.check_only else cfg.log.file
+	if !logx.init(logx.Level(cfg.log.level), log_file) {
 		fmt.eprintfln("elodin: cannot open the log file %q, logging to stderr instead", cfg.log.file)
 	}
-	warn_log_readable(cfg.log.file)
+	logx.warn_if_readable(log_file)
 	defer logx.shutdown()
 
 	/*
@@ -960,19 +966,6 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 }
 
 /*
-A log file elodin creates is owner-only, but one already there keeps its mode -
-an upgrade from a release that created it 0644, or logrotate's `create 0644`.
-With `log.queries` on it names every client, so a mode that lets every account
-read it is said at each open rather than changed: the file is the operator's.
-*/
-@(private)
-warn_log_readable :: proc(path: string) {
-	if logx.readable_by_others() {
-		logx.warnf("log.file: %q is readable by every user on this host; 'chmod o-r' it, or set logrotate's create mode", path)
-	}
-}
-
-/*
 Name each file a SIGHUP opens again by name that the process, now dropped,
 cannot open.
 
@@ -996,7 +989,8 @@ warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
 	if !privdrop.can_reopen(config_path, false) {
 		warn(cfg, "configuration", config_path, "a SIGHUP will not reload the configuration")
 	}
-	if cfg.log.file != "" && !privdrop.can_reopen(cfg.log.file, true) {
+	// Only a file in use: one that failed at startup is already said, on stderr.
+	if logx.writing_to_file() && !privdrop.can_reopen(cfg.log.file, true) {
 		warn(cfg, "log.file", cfg.log.file, "a SIGHUP will keep logging to the file already open, renamed or not")
 	}
 	tls := [?]struct {
@@ -1129,8 +1123,6 @@ reload :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m
 	logx.infof("SIGHUP received, reloading the configuration and the TLS certificates")
 	if !reopened {
 		logx.warnf("cannot open the log file %q again; logging where it was", file)
-	} else {
-		warn_log_readable(file)
 	}
 
 	out := server.reload_config(s, opts.config_path)

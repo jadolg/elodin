@@ -94,6 +94,7 @@ reopen :: proc(path: string) -> bool {
 	if old != nil {
 		os.close(old)
 	}
+	warn_if_readable(path)
 	return true
 }
 
@@ -144,6 +145,13 @@ hand_over :: proc(uid: posix.uid_t, gid: posix.gid_t) -> bool {
 	return posix.fchown(posix.FD(os.fd(state.file)), uid, gid) == .OK
 }
 
+// Whether lines go to a file rather than stderr.
+writing_to_file :: proc() -> bool {
+	sync.mutex_lock(&state.mu)
+	defer sync.mutex_unlock(&state.mu)
+	return state.to_file
+}
+
 /*
 Whether the log file in use can be read by every account on the host: a file
 an older elodin, or someone else, created with a wider mode than `open_log`
@@ -160,6 +168,19 @@ readable_by_others :: proc() -> bool {
 		return false
 	}
 	return .IROTH in st.st_mode
+}
+
+/*
+A log file `open_log` creates is owner-only, but one already there keeps its
+mode - an upgrade from a release that created it 0644, or logrotate's
+`create 0644`. With `log.queries` on it names every client, so a mode that lets
+every account read it is said at each open rather than changed: the file is the
+operator's. `reopen` calls it itself; `init` holds the lock, so its caller does.
+*/
+warn_if_readable :: proc(path: string) {
+	if readable_by_others() {
+		warnf("log.file: %q is readable by every user on this host; 'chmod o-r' it, or set logrotate's create mode", path)
+	}
 }
 
 shutdown :: proc() {

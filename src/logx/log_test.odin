@@ -178,6 +178,15 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, after_stamp(t, lines[19]), "level=info msg=cut")
+
+	// Every reopen says so too - a SIGHUP and a reload that moves `log.file`
+	// alike - since the file opened may not be the one that was checked.
+	testing.expect(t, reopen(path), "cannot reopen the log")
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 21, "%d lines after the reopen, want 21", len(lines)) {
+		return
+	}
+	testing.expect(t, strings.contains(lines[20], `level=warn msg="log.file:`), "a reopen of a 0644 log did not warn")
 }
 
 /*
