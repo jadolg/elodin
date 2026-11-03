@@ -397,7 +397,10 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 			client_goaway(c, .Protocol_Error)
 			return false
 		}
-		if s, found := c.streams[h.stream_id]; found {
+		// A stream already reset, by either end, keeps the reason it was: a
+		// REFUSED_STREAM behind this end's own reset is no word that the request
+		// went unprocessed and may be retried.
+		if s, found := c.streams[h.stream_id]; found && !s.reset {
 			s.reset = true
 			s.refused = Error_Code(read_u32(payload)) == .Refused_Stream
 			loop.cond_broadcast(&c.cond)
@@ -695,22 +698,20 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 	malformed := false
 	if found && !already_ended {
 		if s.final {
-			malformed = !s.end_stream
-			for f in headers {
-				// What the server refuses in a request's trailers, a
-				// pseudo-header included: its name is no token.
-				if field_is_malformed(f) {
-					malformed = true
-				}
-			}
+			// What the server refuses in a request's trailers.
+			malformed = trailers_are_malformed(headers, s.end_stream)
 		} else {
+			// Each section carries its own `:status`: one missing after an
+			// interim response is not that response's again.
+			s.status = 0
 			for f in headers {
 				if f.name == ":status" {
 					s.status = parse_status(f.value)
 				}
 			}
-			// A malformed `:status` reads as 0, which is no interim response.
-			s.final = s.status < 100 || s.status > 199
+			// A missing or malformed `:status` reads as 0, which is no interim
+			// response; nor is a 101, which HTTP/2 has no use for (8.6).
+			s.final = s.status < 100 || s.status > 199 || s.status == 101
 			malformed = !s.final && s.end_stream
 		}
 		if malformed {

@@ -775,11 +775,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			DATA is in `handle_data`. The stream stays its handler's to retire,
 			so the block is decoded on its own.
 			*/
-			stream_closed = !s.cancelled
-			s.cancelled = true
-			set_state(c, s, .Closed)
-			// Wakes a handler parked in write_body's no-credit wait.
-			loop.cond_broadcast(&c.cond)
+			stream_closed = mark_stream_closed(c, s)
 		case was_reset_here(c, h.stream_id, forget = true) && h.flags & FLAG_END_STREAM != 0:
 		/*
 		A stream this end reset and retired while the peer was still sending
@@ -1092,6 +1088,25 @@ field_is_malformed :: proc(f: Header_Field) -> bool {
 }
 
 /*
+RFC 9113 8.1: a trailer section ends its stream and carries no pseudo-header
+field, and 8.2 refuses in it what it refuses anywhere; a section that breaks
+either is malformed, a request's or a response's. A pseudo-header's name is no
+token, so `field_is_malformed` refuses those too.
+*/
+@(private)
+trailers_are_malformed :: proc(trailers: []Header_Field, end_stream: bool) -> bool {
+	if !end_stream {
+		return true
+	}
+	for f in trailers {
+		if field_is_malformed(f) {
+			return true
+		}
+	}
+	return false
+}
+
+/*
 RFC 9110 5.6.2: a token, which is what a field name is on either version of the
 protocol. ASCII only, so a name outside it cannot be one a Unicode case fold in
 some other hop reads as a field this one knows by another spelling.
@@ -1388,14 +1403,7 @@ end serves reads a trailer.
 */
 @(private)
 finish_trailers :: proc(c: ^Conn, s: ^Stream, trailers: []Header_Field) -> bool {
-	malformed := !s.end_stream
-	for f in trailers {
-		// A pseudo-header's name is no token, so this refuses those too.
-		if field_is_malformed(f) {
-			malformed = true
-		}
-	}
-	if malformed {
+	if trailers_are_malformed(trailers, s.end_stream) {
 		sent := stream_error(c, s.id, .Protocol_Error)
 		close_stream(c, s.id, peer_sending = !s.end_stream)
 		return sent
@@ -1491,15 +1499,7 @@ ignored.
 	on a stream we reset first just draws its credit back without a second one.
 	*/
 	already_ended := found && (s.state == .Half_Closed_Remote || s.state == .Closed)
-	need_rst := already_ended && !s.cancelled
-	if already_ended {
-		s.cancelled = true
-		// Reset below, so over for the peer too; see MAX_HELD_STREAMS.
-		set_state(c, s, .Closed)
-		// Wakes a handler parked in write_body's no-credit wait; without this it
-		// sleeps out the full write_timeout on a stream already known dead.
-		loop.cond_broadcast(&c.cond)
-	}
+	need_rst := already_ended && mark_stream_closed(c, s)
 	if found && !already_ended {
 		// Checked before appending, so an oversized body is refused rather than
 		// buffered first. Over the connection's share rather than the stream's,
@@ -1593,6 +1593,25 @@ ignored.
 	// Safe to use outside the lock: a parked request means no handler has been
 	// given this stream yet, so nothing else is in a position to retire it.
 	return dispatch(c, live, req)
+}
+
+/*
+A frame the peer may not send on `s` any more, a stream it has ended or one end
+has reset (RFC 9113 5.1): the stream is cancelled, and Closed since it is reset
+for the peer too (see MAX_HELD_STREAMS), but stays its handler's to retire.
+Returns whether a STREAM_CLOSED is still owed: not on a stream already
+cancelled, so one the peer reset draws none (5.4.2) and a repeat draws no
+second. Caller holds c.mu.
+*/
+@(private)
+mark_stream_closed :: proc(c: ^Conn, s: ^Stream) -> (need_rst: bool) {
+	need_rst = !s.cancelled
+	s.cancelled = true
+	set_state(c, s, .Closed)
+	// Wakes a handler parked in write_body's no-credit wait; without this it
+	// sleeps out the full write_timeout on a stream already known dead.
+	loop.cond_broadcast(&c.cond)
+	return
 }
 
 @(private)

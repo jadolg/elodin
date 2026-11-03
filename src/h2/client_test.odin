@@ -2975,6 +2975,9 @@ test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
 		{"an interim response with END_STREAM", {{"100", true}}, 0, true, 100},
 		{"DATA behind an interim response", {{"103", false}, {"200", true}}, 0, true, 103},
 		{"a trailer field 8.2 refuses", {{"200", false}, {"connection", true}}, 0, true, 200},
+		// No `:status` is no response; the interim one's is not carried over.
+		{"a section without :status after an interim one", {{"103", false}, {"", false}, {"200", true}}, 3, true, 0},
+		{"a 101, which HTTP/2 has no use for", {{"101", false}, {"200", true}}, 2, true, 101},
 	}
 	for tc in cases {
 		track: mem.Tracking_Allocator
@@ -3022,6 +3025,11 @@ test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
 		}
 		if tc.malformed {
 			testing.expectf(t, rsts == 1 && log.rst_code == .Protocol_Error, "%s: %d RST_STREAM, last %v; want one PROTOCOL_ERROR", tc.what, rsts, log.rst_code)
+			// A REFUSED_STREAM in flight behind this end's reset does not make the
+			// request one to retry.
+			code := []u8{0, 0, 0, u8(Error_Code.Refused_Stream)}
+			ok = client_handle_frame(c, Frame_Header{length = 4, type = .Rst_Stream, stream_id = 1}, code)
+			testing.expectf(t, ok && !s.refused, "%s: a later REFUSED_STREAM made the reset retryable", tc.what)
 		} else {
 			testing.expectf(t, rsts == 0, "%s: %d RST_STREAM", tc.what, rsts)
 		}
