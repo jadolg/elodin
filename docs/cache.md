@@ -96,7 +96,8 @@ go to the upstream once. The first forwards and the rest wait for it:
   themselves.
 - **A cached refusal** (a DNSSEC failure, or a CNAME into a blocked name) refuses
   the waiters without asking. Exceptions: a list reload during the wait that
-  lifted the listing serves the answer; an entry evicted meanwhile makes them ask.
+  lifted the listing serves the answer; an entry evicted or expired meanwhile
+  makes them ask once more, coalesced among themselves and on a fresh budget.
 - **Cap.** A query counted in `server.max_pending` arriving when a quarter of it
   is already waiting asks for itself. Queries on a connection are not counted:
   `server.max_connections` bounds them.

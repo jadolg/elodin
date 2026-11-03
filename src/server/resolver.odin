@@ -1932,113 +1932,140 @@ resolve_query :: proc(
 	flight: ^Flight
 	if unanswered == nil {
 		ceiling := follower_ceiling(s)
-		joined, counted := flight_join(s, key, &own_flight, pool == .Shared, ceiling)
-		if joined == &own_flight {
-			flight = joined
-			flight.forwarded = forwarded
-		} else if joined != nil {
-			patience := flight_patience(deadline, span)
-			landed_with, _, same := flight_follow(s, joined, patience, allocator, counted, forwarded)
-			// A NOERROR or NXDOMAIN is shared as the cache shares it - so not with
-			// the cache off, where nothing is shared between two messages - and any
-			// other rcode may be about the leader's own bytes, unless they were these.
-			if landed_with.answer != nil {
-				rcode := dns.peek_rcode(landed_with.answer)
-				if same || (live(s).cfg.cache.enabled && (rcode == .No_Error || rcode == .NX_Domain)) {
-					shared := Cached_Answer {
-						wire      = landed_with.answer,
-						ede       = landed_with.ede,
-						coalesced = true,
-					}
-					return serve_from_cache(
-						s,
-						shared,
-						query,
-						msg,
-						q,
-						proto,
-						client,
-						limit,
-						validating,
-						started,
-						spent,
-						allocator,
-						ede,
-					)
-				}
-			}
+		/*
+		Round once more when the leader's stored verdict is gone by the time this
+		follower reads it - evicted from a cache at its bounds, or expired - so the
+		followers it leaves behind lead and follow the next exchange between
+		them rather than each forwarding on its own (issue #428). Once only: a
+		second leader's verdict gone as fast is a cache that holds nothing, and
+		this query forwards as any miss would.
+		*/
+		for rejoined := false; ; rejoined = true {
 			/*
-			The upstream gave the leader nothing after every attempt, and would
-			give this query the same - its message is the same bytes - so the
-			failure branch below, without the wait.
+			Going round, the deadline starts again, here before the join as the
+			first one was: the leader it waited on did land with something it
+			could use, which the cache then lost, and what that wait left may be
+			nothing. Kept, a follower that leads the next exchange would ask
+			nobody and hand its followers that failure, and one that follows
+			would hold its patience against a leader that may have joined the
+			first flight after it.
 			*/
-			if landed_with.failed && same {
-				sync.atomic_add(&s.stats.coalesced, 1)
-				return upstream_failed(
-					s,
-					stale_hit,
-					query,
-					msg,
-					q,
-					proto,
-					client,
-					limit,
-					validating,
-					started,
-					spent,
-					allocator,
-					ede,
-					"upstream-coalesced",
-				)
+			if rejoined {
+				deadline = time.tick_add(time.tick_now(), span)
 			}
-			/*
-			The leader stored a verdict, which the cache now answers with: a
-			cloaking refusal under the question's own key, which `serve_from_cache`
-			refuses from the entry - against the rule sets as they stand after the
-			wait, so a reload during it re-walks the chain - or a Bogus one under
-			its verdict key. Evicted or expired already, and this query forwards
-			on its own.
-			*/
-			#partial switch landed_with.stored {
-			case .Cloak:
-				stored, found := stored_answer(s, key, rules_generation(s), allocator)
-				if found && stored.stale {
-					// Expired already: the fallback for this query's own forward.
-					stale_hit = stored
-				} else if found {
-					// Counted here only where the entry is refused or unreadable:
-					// served, `serve_from_cache` counts it as the coalesced answer
-					// its log line then says it is.
-					stored.coalesced = true
-					out, served, built := serve_from_cache(
-						s,
-						stored,
-						query,
-						msg,
-						q,
-						proto,
-						client,
-						limit,
-						validating,
-						started,
-						spent,
-						allocator,
-						ede,
-					)
-					if served != .Cached {
-						sync.atomic_add(&s.stats.coalesced, 1)
+			joined, counted := flight_join(s, key, &own_flight, pool == .Shared, ceiling)
+			if joined == &own_flight {
+				flight = joined
+				flight.forwarded = forwarded
+			} else if joined != nil {
+				patience := flight_patience(deadline, span)
+				landed_with, _, same := flight_follow(s, joined, patience, allocator, counted, forwarded)
+				// A NOERROR or NXDOMAIN is shared as the cache shares it - so not with
+				// the cache off, where nothing is shared between two messages - and any
+				// other rcode may be about the leader's own bytes, unless they were these.
+				if landed_with.answer != nil {
+					rcode := dns.peek_rcode(landed_with.answer)
+					if same || (live(s).cfg.cache.enabled && (rcode == .No_Error || rcode == .NX_Domain)) {
+						shared := Cached_Answer {
+							wire      = landed_with.answer,
+							ede       = landed_with.ede,
+							coalesced = true,
+						}
+						return serve_from_cache(
+							s,
+							shared,
+							query,
+							msg,
+							q,
+							proto,
+							client,
+							limit,
+							validating,
+							started,
+							spent,
+							allocator,
+							ede,
+						)
 					}
-					return out, served, built
 				}
-			case .Bogus:
-				// Not gated on `validating`: the leader reached this verdict for
-				// the same key, and this query's own rewrite failing is no reason
-				// to forward what was just proved Bogus.
-				if remembered, found := stored_verdict(s, verdict_key, allocator); found {
+				/*
+				The upstream gave the leader nothing after every attempt, and would
+				give this query the same - its message is the same bytes - so the
+				failure branch below, without the wait.
+				*/
+				if landed_with.failed && same {
 					sync.atomic_add(&s.stats.coalesced, 1)
-					return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
+					return upstream_failed(
+						s,
+						stale_hit,
+						query,
+						msg,
+						q,
+						proto,
+						client,
+						limit,
+						validating,
+						started,
+						spent,
+						allocator,
+						ede,
+						"upstream-coalesced",
+					)
+				}
+				/*
+				The leader stored a verdict, which the cache now answers with: a
+				cloaking refusal under the question's own key, which `serve_from_cache`
+				refuses from the entry - against the rule sets as they stand after the
+				wait, so a reload during it re-walks the chain - or a Bogus one under
+				its verdict key. Evicted or expired already, and this query goes
+				round to the table again, above - or, the second time, forwards
+				on its own.
+				*/
+				#partial switch landed_with.stored {
+				case .Cloak:
+					stored, found := stored_answer(s, key, rules_generation(s), allocator)
+					if found && stored.stale {
+						// Expired already: the fallback for this query's own forward.
+						stale_hit = stored
+					} else if found {
+						// Counted here only where the entry is refused or unreadable:
+						// served, `serve_from_cache` counts it as the coalesced answer
+						// its log line then says it is.
+						stored.coalesced = true
+						out, served, built := serve_from_cache(
+							s,
+							stored,
+							query,
+							msg,
+							q,
+							proto,
+							client,
+							limit,
+							validating,
+							started,
+							spent,
+							allocator,
+							ede,
+						)
+						if served != .Cached {
+							sync.atomic_add(&s.stats.coalesced, 1)
+						}
+						return out, served, built
+					}
+				case .Bogus:
+					// Not gated on `validating`: the leader reached this verdict for
+					// the same key, and this query's own rewrite failing is no reason
+					// to forward what was just proved Bogus.
+					if remembered, found := stored_verdict(s, verdict_key, allocator); found {
+						sync.atomic_add(&s.stats.coalesced, 1)
+						return serve_bogus_verdict(s, remembered, query, msg, q, proto, client, started)
+					}
+				}
+				if landed_with.stored != .None && !rejoined {
+					continue
 				}
 			}
+			break
 		}
 	}
 	defer if flight != nil {

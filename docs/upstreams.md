@@ -75,7 +75,9 @@ Within it, a dead first server hands over to the second, which gets its full
 the query on to the rest of the group (see [rcodes](#rcodes-and-the-rest-of-the-group)).
 A query waiting on an identical one already in flight waits for what is left of
 the budget plus one more span, and a forward of its own after that gets only
-what is left.
+what is left. The exception is a waiter whose first query's cached refusal was
+evicted or expired before it could be read (see [identical queries in flight](cache.md#identical-queries-in-flight)): it joins once
+more with a fresh budget, so it can wait about twice as long.
 
 One exchange with one server takes its `timeout`, whatever it does inside:
 connecting and the TLS handshake, however slowly the server sends it, resolving

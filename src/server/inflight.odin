@@ -37,13 +37,14 @@ is what every query does without coalescing - except where the leader stored a v
 straight out of the cache and is refused from it - or, for a cloaking refusal a
 list reload lifted during the wait, answered from it. The cloaking lookup is a
 counted one, so that follower's query shows as a miss and then a hit, or as two
-misses where the entry was evicted in between; the Bogus one is a probe, as it
-is on the way in, and counts nothing. A follower whose
+misses where the entry was evicted in between, and once more for a follower
+that goes round (below); the Bogus one is a probe, as it is on the way in, and
+counts nothing. A follower whose
 patience ran out forwards on its own too - on a deadline that is spent by then,
 so it asks nobody and takes the expired entry or SERVFAIL (see
-`flight_patience`) - and so does one that finds the
-verdict already evicted - outside the table, since it is past its turn to join
-one, which on a cache under that much pressure costs a burst its coalescing.
+`flight_patience`). One that finds the verdict already evicted or expired joins
+the table once more, so the burst leads and follows a second exchange between
+them (issue #428); a second verdict gone as fast, and it forwards on its own.
 
 The leader waits for its followers to take their copies before it lets go, which
 is what lets the `Flight` live in its stack frame and the answer in its scratch:
@@ -123,7 +124,8 @@ How many followers counted in `server.max_pending` may wait on leaders at once:
 a quarter of it, the share `refresh_ceiling` gives the stale refreshes.
 
 A follower holds its place in flight for as long as the leader takes, up to its
-`flight_patience`, about four of its longest group's timeouts - and a leader
+`flight_patience`, about four of its longest group's timeouts, twice over for
+one that goes round after an evicted verdict (issue #428) - and a leader
 validating a slow chain holds one of `dnssec.max_chain_walks` - so without a
 ceiling, one flood of a single cold signed name would park everything in flight
 behind one walk, which is the exhaustion that bound exists to prevent (issue
