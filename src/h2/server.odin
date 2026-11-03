@@ -153,8 +153,6 @@ Stream :: struct {
 	// decoded to keep HPACK in step, then the stream is reset without being
 	// served. See `handle_headers`.
 	refused:      bool,
-	// The open block is this parked request's trailers. See `handle_headers`.
-	trailers:     bool,
 	send_window:  int,
 	// Request parked between its headers and the end of its body.
 	pending:      ^Request,
@@ -233,12 +231,13 @@ Conn :: struct {
 
 	allocator:           mem.Allocator,
 	/*
-	The header block being read, held here rather than on its stream: nothing
-	may come between a HEADERS and its CONTINUATION frames (RFC 9113 6.10), so
-	there is one at a time, and a block on a stream past taking one still has
-	to be decoded after a handler may have retired the stream. Freed once
-	decoded. `block_stream` is the stream it opens or ends, nil for one decoded
-	only to keep HPACK in step; see `handle_headers`.
+	A header block open across CONTINUATION frames, held here rather than on
+	its stream: nothing may come between a HEADERS and its CONTINUATION frames
+	(RFC 9113 6.10), so there is one at a time, and a block on a stream past
+	taking one still has to be decoded after a handler may have retired the
+	stream. Freed once decoded; a block whole in its HEADERS frame is decoded
+	from the frame and never held. `block_stream` is the stream it opens or
+	ends, nil for one decoded only to keep HPACK in step; see `handle_headers`.
 	*/
 	header_block:        [dynamic]u8,
 	block_stream:        ^Stream,
@@ -753,9 +752,6 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	}
 
 	loop.lock(&c.mu)
-	delete(c.header_block)
-	c.header_block = make([dynamic]u8, 0, len(block), c.allocator)
-	append(&c.header_block, ..block)
 	c.block_stream = nil
 	stream_closed := false
 	if h.stream_id <= c.last_stream_id {
@@ -769,7 +765,6 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			`finish_trailers`. A parked request has no handler, so nothing but
 			this reader can retire the stream while the block is open.
 			*/
-			s.trailers = true
 			s.end_stream = h.flags & FLAG_END_STREAM != 0
 			c.block_stream = s
 		case found:
@@ -833,11 +828,15 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return false
 	}
 	if h.flags & FLAG_END_HEADERS == 0 {
+		// Held for the CONTINUATION frames that bring the rest of it.
+		delete(c.header_block)
+		c.header_block = make([dynamic]u8, 0, len(block), c.allocator)
+		append(&c.header_block, ..block)
 		c.continuation_on = h.stream_id
 		c.continuation_frames = 0
 		return true
 	}
-	return finish_headers(c, c.block_stream)
+	return finish_headers(c, c.block_stream, block)
 }
 
 @(private)
@@ -878,7 +877,7 @@ handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return true
 	}
 	c.continuation_on = 0
-	return finish_headers(c, c.block_stream)
+	return finish_headers(c, c.block_stream, c.header_block[:])
 }
 
 /*
@@ -908,11 +907,15 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	have_host: bool
 
 	for f in headers {
-		if len(f.name) == 0 || !field_value_is_valid(f.value) {
+		if len(f.name) == 0 {
 			return true
 		}
 
 		if f.name[0] == ':' {
+			// An ordinary field's value is `field_is_malformed`'s to check.
+			if !field_value_is_valid(f.value) {
+				return true
+			}
 			// 8.3: every pseudo-header comes before the ordinary fields.
 			if seen_regular {
 				return true
@@ -1265,14 +1268,14 @@ HPACK state is per connection and order-dependent, so the block must be decoded
 here on the reader even when the request body has yet to arrive.
 */
 @(private)
-finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
+finish_headers :: proc(c: ^Conn, s: ^Stream, block: []u8) -> bool {
 	/*
 	Into the reader's per-frame arena, which `serve` resets after this frame:
 	up to MAX_HEADER_COUNT fields are decoded and a request keeps six of them,
 	so those six are cloned out below (`take`) and the rest go with the arena
 	rather than one heap allocation and free apiece.
 	*/
-	headers, err := decode(&c.decoder, c.header_block[:], context.temp_allocator)
+	headers, err := decode(&c.decoder, block, context.temp_allocator)
 	// The block is decoded; keep only the fields. Freed rather than cleared, or
 	// a connection keeps up to MAX_HEADER_LIST of buffer for as long as it lasts
 	// (#303).
@@ -1296,7 +1299,8 @@ finish_headers :: proc(c: ^Conn, s: ^Stream) -> bool {
 		close_stream(c, s.id, peer_sending = !s.end_stream)
 		return sent
 	}
-	if s.trailers {
+	// Only a request parked for its body has one, so this block is its trailers.
+	if s.pending != nil {
 		return finish_trailers(c, s, headers)
 	}
 

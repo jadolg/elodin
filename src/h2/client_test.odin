@@ -2394,6 +2394,8 @@ test_client_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 
 	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
 	s := open_test_stream(c, 1, allocator)
+	// Its response headers are in, so DATA is its body.
+	s.final = true
 
 	// One byte of body in 257 bytes of window, each.
 	frame := make([]u8, 257, context.temp_allocator)
@@ -2946,8 +2948,8 @@ RFC 9113 8.1: a response is any number of interim (1xx) header sections, one
 final one, the body, and optionally trailers, which end the stream and carry no
 pseudo-header field. A response that breaks that is malformed, a stream error
 of type PROTOCOL_ERROR (8.1.1) that a client MUST NOT accept: the request fails
-as reset. Before #457 a trailer's `:status` was read as the answer's, and a
-block after the final one was taken whatever it carried.
+as reset, so neither a trailer's `:status` nor DATA ahead of the final
+section is taken for the answer's (#457).
 */
 @(test)
 test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
@@ -2958,16 +2960,21 @@ test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
 	Case :: struct {
 		what:      string,
 		blocks:    []Block,
+		// The block DATA goes after.
+		data_at:   int,
 		malformed: bool,
 		status:    int,
 	}
-	// A block with no status is a trailer section; DATA goes after the first.
+	// A block with no status is a trailer section, of `x-t`, or of the field
+	// named in place of one.
 	cases := []Case {
-		{"trailers end the response", {{"200", false}, {"", true}}, false, 200},
-		{"interim responses come first", {{"103", false}, {"200", false}, {"", true}}, false, 200},
-		{"a trailer with :status", {{"200", false}, {"500", true}}, true, 200},
-		{"trailers without END_STREAM", {{"200", false}, {"", false}}, true, 200},
-		{"an interim response with END_STREAM", {{"100", true}}, true, 100},
+		{"trailers end the response", {{"200", false}, {"", true}}, 0, false, 200},
+		{"interim responses come first", {{"103", false}, {"200", false}, {"", true}}, 1, false, 200},
+		{"a trailer with :status", {{"200", false}, {"500", true}}, 0, true, 200},
+		{"trailers without END_STREAM", {{"200", false}, {"", false}}, 0, true, 200},
+		{"an interim response with END_STREAM", {{"100", true}}, 0, true, 100},
+		{"DATA behind an interim response", {{"103", false}, {"200", true}}, 0, true, 103},
+		{"a trailer field 8.2 refuses", {{"200", false}, {"connection", true}}, 0, true, 200},
 	}
 	for tc in cases {
 		track: mem.Tracking_Allocator
@@ -2988,14 +2995,17 @@ test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
 		ok := true
 		for b, i in tc.blocks {
 			block := make([dynamic]u8, 0, 64, context.temp_allocator)
-			if b.status != "" {
-				encode_header(&block, ":status", b.status)
-			} else {
+			switch {
+			case b.status == "":
 				encode_header(&block, "x-t", "1")
+			case b.status[0] >= '0' && b.status[0] <= '9':
+				encode_header(&block, ":status", b.status)
+			case:
+				encode_header(&block, b.status, "1")
 			}
 			flags := u8(FLAG_END_HEADERS) | (u8(FLAG_END_STREAM) if b.end_stream else 0)
 			ok = ok && client_handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = flags, stream_id = 1}, block[:])
-			if i == 0 && !b.end_stream && !s.reset {
+			if i == tc.data_at && !b.end_stream && !s.reset {
 				body := []u8{'x'}
 				ok = ok && client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 			}

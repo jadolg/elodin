@@ -3566,9 +3566,8 @@ send_block :: proc(c: ^Conn, id: u32, block: []u8, flags: u8, split: bool) -> bo
 /*
 A request may end with a trailer section after its body (RFC 9113 8.1). The
 block is decoded - the HPACK table takes its entry - and ends the request,
-which is dispatched with its body, and the connection carries on. Before #457
-any block on a live stream id was a connection error, which dropped every
-stream on it.
+which is dispatched with its body, and the connection carries on rather than
+dropping every stream on it (#457).
 */
 @(test)
 test_trailers_end_a_parked_request :: proc(t: ^testing.T) {

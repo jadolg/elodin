@@ -246,8 +246,8 @@ blocking: {{ enabled: false }}
 	RFC 9113 8.1: a response may end with a trailer section, which carries no
 	pseudo-header field; one that does is malformed, and a client MUST NOT
 	accept it (8.1.1). So trailers on a 200 leave the answer standing, and a
-	`:status` in them is no answer at all - here a 500 that a trailing 200 was
-	read as overriding (#457).
+	`:status` in them is no answer at all - here a 500 that a trailing 200 does
+	not override (#457).
 	*/
 	{
 		Trailer_Case :: struct {

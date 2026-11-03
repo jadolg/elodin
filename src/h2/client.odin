@@ -697,7 +697,9 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 		if s.final {
 			malformed = !s.end_stream
 			for f in headers {
-				if len(f.name) > 0 && f.name[0] == ':' {
+				// What the server refuses in a request's trailers, a
+				// pseudo-header included: its name is no token.
+				if field_is_malformed(f) {
 					malformed = true
 				}
 			}
@@ -800,7 +802,15 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 		s.rst_sent = true
 	}
 	oversized := false
-	if found && !already_ended {
+	// RFC 9113 8.1: DATA follows the final header section, so DATA ahead of it -
+	// before any response, or behind an interim (1xx) one - is malformed, a
+	// stream error of type PROTOCOL_ERROR the client MUST NOT accept.
+	early := found && !already_ended && !s.final
+	if early {
+		s.reset = true
+		loop.cond_broadcast(&c.cond)
+	}
+	if found && !already_ended && !early {
 		s.received += len(payload)
 		// The second bound is on the window, not the body: see CLIENT_RECV_WINDOW.
 		if len(s.body) + len(data) > CLIENT_MAX_BODY || s.received > CLIENT_RECV_WINDOW / 2 {
@@ -821,6 +831,9 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	}
 	loop.unlock(&c.mu)
 
+	if early {
+		return client_rst_stream(c, h.stream_id, .Protocol_Error) && client_give_connection_credit(c, len(payload))
+	}
 	if oversized {
 		/*
 		The stream is over as far as we are concerned; no point reading more of
