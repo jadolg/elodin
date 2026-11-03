@@ -41,9 +41,9 @@ misses where the entry was evicted in between; the Bogus one is a probe, as it
 is on the way in, and counts nothing. A follower whose
 patience ran out forwards on its own too - on a deadline that is spent by then,
 so it asks nobody and takes the expired entry or SERVFAIL (see
-`flight_patience`) - and so does one that finds the
-verdict already evicted - outside the table, since it is past its turn to join
-one, which on a cache under that much pressure costs a burst its coalescing.
+`flight_patience`). One that finds the verdict already evicted or expired joins
+the table once more, so the burst leads and follows a second exchange between
+them (issue #428); a second verdict gone as fast, and it forwards on its own.
 
 The leader waits for its followers to take their copies before it lets go, which
 is what lets the `Flight` live in its stack frame and the answer in its scratch:

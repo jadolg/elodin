@@ -2006,7 +2006,8 @@ resolve_query :: proc(
 				refuses from the entry - against the rule sets as they stand after the
 				wait, so a reload during it re-walks the chain - or a Bogus one under
 				its verdict key. Evicted or expired already, and this query goes
-				round to the table again, above.
+				round to the table again, above - or, the second time, forwards
+				on its own.
 				*/
 				#partial switch landed_with.stored {
 				case .Cloak:

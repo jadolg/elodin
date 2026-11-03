@@ -11,6 +11,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:filter"
+import "elodin:loop"
 import "elodin:upstream"
 
 /*
@@ -80,6 +81,26 @@ waiting_on :: proc(s: ^Server) -> int {
 		}
 	}
 	return n
+}
+
+/*
+`flight_land` for `from`, with `to` leading its key's next flight from the same
+moment, so the followers going round again follow `to` rather than lead.
+*/
+@(private = "file")
+land_into :: proc(s: ^Server, from, to: ^Flight) {
+	sync.mutex_lock(&s.inflight.mu)
+	defer sync.mutex_unlock(&s.inflight.mu)
+	to^ = Flight {
+		key  = from.key,
+		slot = from.slot,
+	}
+	s.inflight.slots[from.slot] = to
+	from.landed = true
+	loop.cond_broadcast(&from.cond)
+	for from.waiters > 0 {
+		loop.cond_wait(&from.cond, &s.inflight.mu)
+	}
 }
 
 @(private = "file")
@@ -267,6 +288,9 @@ run_burst :: proc(
 	// cache does not hold: evicted between the leader's store and its
 	// followers' reads.
 	evicted: Stored_Verdict = .None,
+	// And lead the exchange its followers go round for by hand too, landing it
+	// the same way.
+	evicted_twice := false,
 ) -> int {
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
@@ -338,11 +362,12 @@ run_burst :: proc(
 	}
 	mock := thread.create_and_start_with_poly_data(&m, serve_mock)
 	key_buf: [cache.KEY_MAX]u8
-	leader: Flight
+	leaders: [2]Flight
+	leading := false
 	if evicted != .None {
 		key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
-		joined, _ := flight_join(&srv, key, &leader)
-		testing.expect(t, joined == &leader, "the hand-made leader did not get the flight")
+		joined, _ := flight_join(&srv, key, &leaders[0])
+		leading = testing.expect(t, joined == &leaders[0], "the hand-made leader did not get the flight")
 	}
 	threads: [CLIENTS]^thread.Thread
 	for i in 0 ..< clients_asking {
@@ -360,7 +385,10 @@ run_burst :: proc(
 			time.sleep(time.Millisecond)
 		}
 	}
-	if evicted != .None {
+	for round in 0 ..< (2 if evicted_twice else 1) {
+		if !leading {
+			break
+		}
 		for start := time.tick_now(); waiting_on(&srv) < clients_asking; {
 			if time.tick_since(start) > HOLD_LIMIT {
 				break
@@ -368,8 +396,12 @@ run_burst :: proc(
 			time.sleep(time.Millisecond)
 		}
 		testing.expect_value(t, waiting_on(&srv), clients_asking)
-		leader.stored = evicted
-		flight_land(&srv, &leader)
+		leaders[round].stored = evicted
+		if evicted_twice && round == 0 {
+			land_into(&srv, &leaders[0], &leaders[1])
+		} else {
+			flight_land(&srv, &leaders[round])
+		}
 	}
 	for th in threads[:clients_asking] {
 		thread.join(th)
@@ -750,6 +782,21 @@ test_followers_of_an_evicted_verdict_rejoin_the_flight :: proc(t: ^testing.T) {
 		for c, i in clients {
 			testing.expectf(t, c.ok && c.rcode == .No_Error, "%v: client %d: ok=%v rcode=%v", verdict, i, c.ok, c.rcode)
 		}
+	}
+}
+
+/*
+Once only: a second leader's verdict gone as fast as the first's is a cache that
+holds nothing, and each follower forwards on its own rather than going round
+again (issue #428).
+*/
+@(test)
+test_followers_rejoin_an_evicted_verdict_once_only :: proc(t: ^testing.T) {
+	clients: [CLIENTS]Client
+	queries := run_burst(t, &clients, evicted = .Bogus, evicted_twice = true)
+	testing.expectf(t, queries == CLIENTS, "the upstream saw the question %d times for %d clients, want one each", queries, CLIENTS)
+	for c, i in clients {
+		testing.expectf(t, c.ok && c.rcode == .No_Error, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
 	}
 }
 
