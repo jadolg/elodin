@@ -45,7 +45,7 @@ init :: proc(level: Level, path: string = "") -> bool {
 	if path == "" {
 		return true
 	}
-	f, err := os.open(path, {.Write, .Create, .Append}, os.Permissions_Read_All + {.Write_User})
+	f, err := open_log(path)
 	if err != nil {
 		return false
 	}
@@ -72,7 +72,7 @@ reopen :: proc(path: string) -> bool {
 	f: ^os.File
 	if path != "" {
 		err: os.Error
-		f, err = os.open(path, {.Write, .Create, .Append}, os.Permissions_Read_All + {.Write_User})
+		f, err = open_log(path)
 		if err != nil {
 			return false
 		}
@@ -88,6 +88,18 @@ reopen :: proc(path: string) -> bool {
 		os.close(old)
 	}
 	return true
+}
+
+/*
+Created readable and writable by its owner only. With `log.queries` on, the file
+names every client and every name it looked up, which is nobody else's business
+on the host; a group that ships the log is given it by the operator (logrotate's
+`create 0640 <user> <group>`), not by default. A file that already exists keeps
+the mode it has.
+*/
+@(private)
+open_log :: proc(path: string) -> (^os.File, os.Error) {
+	return os.open(path, {.Write, .Create, .Append}, {.Read_User, .Write_User})
 }
 
 shutdown :: proc() {

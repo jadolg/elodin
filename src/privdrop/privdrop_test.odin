@@ -165,3 +165,43 @@ test_hand_over_ignores_a_path_that_is_not_there :: proc(t: ^testing.T) {
 	// the process makes it itself on the next refresh, under its own account.
 	testing.expect(t, hand_over("/nonexistent/elodin-cache", self), "a missing path should not be an error")
 }
+
+/*
+A file the process cannot open is out of reach, whichever way it is asked for,
+and one it can is not. Mode 0 stands in for a root-owned 0600 key, which an
+unprivileged process cannot open either; root opens anything, so the case is
+skipped there.
+*/
+@(test)
+test_can_reopen :: proc(t: ^testing.T) {
+	if skip_when_root() {
+		return
+	}
+	tmp, terr := os.temp_directory(context.temp_allocator)
+	if !testing.expectf(t, terr == nil, "no temporary directory: %v", terr) {
+		return
+	}
+	dir, _ := filepath.join({tmp, fmt.tprintf("elodin-privdrop-reopen-%d", posix.getpid())}, context.temp_allocator)
+	os.remove_all(dir)
+	if !testing.expect(t, os.make_directory(dir) == nil, "cannot create the scratch directory") {
+		return
+	}
+	defer os.remove_all(dir)
+
+	open_one, _ := filepath.join({dir, "open"}, context.temp_allocator)
+	shut, _ := filepath.join({dir, "shut"}, context.temp_allocator)
+	read_only, _ := filepath.join({dir, "read-only"}, context.temp_allocator)
+	missing, _ := filepath.join({dir, "missing"}, context.temp_allocator)
+	testing.expect(t, os.write_entire_file(open_one, []byte{}, {.Read_User, .Write_User}) == nil, "cannot write the open file")
+	testing.expect(t, os.write_entire_file(shut, []byte{}, {}) == nil, "cannot write the shut file")
+	testing.expect(t, os.write_entire_file(read_only, []byte{}, {.Read_User}) == nil, "cannot write the read-only file")
+
+	testing.expect(t, can_reopen(open_one, false), "a readable file is out of reach")
+	testing.expect(t, can_reopen(open_one, true), "a writable file is out of reach")
+	testing.expect(t, !can_reopen(shut, false), "a file with no permissions is in reach for reading")
+	testing.expect(t, !can_reopen(shut, true), "a file with no permissions is in reach for writing")
+	testing.expect(t, can_reopen(read_only, false), "a read-only file is out of reach for reading")
+	testing.expect(t, !can_reopen(read_only, true), "a read-only file is in reach for writing")
+	testing.expect(t, !can_reopen(missing, false), "a missing file is in reach")
+	testing.expect(t, !os.exists(missing), "checking a missing file created it")
+}

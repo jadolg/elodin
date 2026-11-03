@@ -8,7 +8,7 @@
 log:
   level: info          # debug | info | warn | error
   queries: false       # log one line per query
-  file: ""             # empty means stderr
+  file: ""             # empty means stderr; a file is created 0600
 
 server:
   max_connections: 512 # concurrent TCP / DoT / DoH connections
@@ -213,6 +213,8 @@ listeners:
     address: "0.0.0.0"
     port: 53
   # DNS-over-TLS. Needs a certificate; `mise run certs` makes a self-signed one.
+  # With server.user set, SIGHUP reads it again as that user, so it must be
+  # readable by it (docs/install.md, Privileges).
   dot:
     enabled: false
     address: "0.0.0.0"

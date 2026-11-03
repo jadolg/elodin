@@ -877,7 +877,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		server.stop_profile_signer(&s)
 	}
 
-	drop_privileges(cfg, service)
+	drop_privileges(cfg, service, opts.config_path)
 
 	logx.eventf(
 		.Info,
@@ -921,7 +921,7 @@ would leave it as root while the log said otherwise, which is worse than not
 starting.
 */
 @(private)
-drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity) {
+drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_path: string) {
 	if cfg.server.user == "" {
 		if privdrop.is_root() {
 			logx.warnf(
@@ -949,6 +949,57 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity) {
 		os.exit(1)
 	}
 	logx.infof("running as %s (uid=%d gid=%d)", cfg.server.user, service.uid, service.gid)
+	warn_out_of_reach(cfg, config_path)
+}
+
+/*
+Name each file a SIGHUP opens again by name that the process, now dropped,
+cannot open.
+
+Startup read them as root, so a root-only file - certbot's 0600 key, a 0600
+configuration - works until the first reload and then fails on every one: the
+certificate is never renewed in place, the configuration is never reloaded, the
+log goes on into the file logrotate renamed. Said here, at the start, where the
+operator is looking, rather than at the first reload weeks later. Not an error:
+the process serves correctly as it is, and a reload logs its own failure too.
+
+Lists only with blocking on; one turned on later by a reload says so itself.
+*/
+@(private)
+warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
+	warn :: proc(cfg: ^config.Config, setting, path, what: string) {
+		logx.warnf("%s: %s cannot open %q, so a SIGHUP will %s", setting, cfg.server.user, path, what)
+	}
+	if !privdrop.can_reopen(config_path, false) {
+		warn(cfg, "configuration", config_path, "not reload the configuration")
+	}
+	if cfg.log.file != "" && !privdrop.can_reopen(cfg.log.file, true) {
+		warn(cfg, "log.file", cfg.log.file, "keep logging to the file already open, renamed or not")
+	}
+	tls := [?]struct {
+		name: string,
+		ln:   config.Listener,
+	}{{"dot", cfg.listeners.dot}, {"doh", cfg.listeners.doh}}
+	for l in tls {
+		if !l.ln.enabled {
+			continue
+		}
+		if !privdrop.can_reopen(l.ln.cert_file, false) {
+			warn(cfg, fmt.tprintf("listeners.%s.cert_file", l.name), l.ln.cert_file, "keep the certificate loaded now")
+		}
+		if !privdrop.can_reopen(l.ln.key_file, false) {
+			warn(cfg, fmt.tprintf("listeners.%s.key_file", l.name), l.ln.key_file, "keep the certificate loaded now")
+		}
+	}
+	if cfg.blocking.enabled {
+		for set in ([?][]config.Block_List{cfg.blocking.lists, cfg.blocking.allow_lists}) {
+			for list in set {
+				if list.enabled && list.file != "" && !privdrop.can_reopen(list.file, false) {
+					warn(cfg, fmt.tprintf("list %s", list.name), list.file, "keep the rules built from it now")
+				}
+			}
+		}
+	}
 }
 
 /*

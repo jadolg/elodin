@@ -18,6 +18,13 @@ sentence in `msg`. In Loki, `| logfmt` is all it takes:
 {job="elodin"} | logfmt | msg="stats" | unwrap cache_hits
 ```
 
+With `log.file` set, elodin creates the file readable and writable by its
+owner only (`0600`), since with `log.queries` on it names every client and every
+name looked up. A file that already exists keeps its mode, so a shipper's group
+is given access the usual way, e.g. logrotate's `create 0640 elodin adm`. Under
+`server.user` the file is opened again on `SIGHUP` as that account
+([Privileges](install.md#privileges)).
+
 With `log.file` set, each line is one write to the file, not followed by a
 sync: `tail` and a shipper see it at once and a killed process loses none of
 it, but a host crash or power loss can lose the last lines the kernel had not

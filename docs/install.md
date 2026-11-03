@@ -104,6 +104,26 @@ process, since a refresh hours later has to reopen it. Started this way, elodin
 downloads and parses the blocklists before it binds, so that much happens as
 root; the first arrangement avoids it.
 
+The files a [`SIGHUP`](#signals) opens again by name are opened as that account,
+not as root: the configuration file, the DoT/DoH `cert_file` and `key_file`,
+`file:` lists and `log.file` (for writing). Startup reads them as root, so a
+root-only file — certbot's `privkey.pem` is root's and `0600` — starts fine and
+then fails at every reload: the certificate is not renewed in place, and the
+listener goes on serving the old one until it expires. elodin does not take
+these files over. Give the account read access, for example
+`setfacl -m u:elodin:r /etc/letsencrypt/live/<name>/privkey.pem` (and `x` on
+`/etc/letsencrypt/live` and `/etc/letsencrypt/archive`, which certbot makes
+`0700`), or a certbot deploy hook that
+copies the pair somewhere the account can read. Each file out of reach is named
+in a `warn` right after the drop:
+
+```
+ts=2026-11-03T15:41:14Z level=warn msg="listeners.dot.key_file: elodin cannot open \"/etc/letsencrypt/live/dns.example/privkey.pem\", so a SIGHUP will keep the certificate loaded now"
+```
+
+The [systemd unit](#from-source-as-a-service) never starts as root, so it reads them as its own
+account from the start, and a key it cannot read fails the start instead.
+
 ## Signals
 
 `SIGTERM` and `SIGINT` stop the listeners and let the queries in flight finish. An idle
@@ -129,7 +149,8 @@ cached answer it has no reason to, in this order:
    afterwards on the blocklists' own thread, once any rebuild in progress is
    over (`reload: the rules are rebuilt once the rebuild in progress is over`).
 3. The DoT/DoH certificate and key are read again from the paths the process
-   started with, whether or not the file loaded. A session in progress keeps the
+   started with, whether or not the file loaded, as the account the process
+   runs as ([Privileges](#privileges)). A session in progress keeps the
    certificate it handshook with; one that fails to load is logged and the
    listener keeps serving what it had.
 

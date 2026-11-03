@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:sys/posix"
 import "core:testing"
 import "core:unicode/utf8"
 
@@ -171,6 +172,37 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, after_stamp(t, lines[19]), "level=info msg=cut")
+}
+
+/*
+The log is created owner-only, whatever the umask lets through: with query
+logging on it names every client. Read back from the kernel, not from what was
+asked for. Uses `open_log` alone, so it shares no state with the test above.
+*/
+@(test)
+test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
+	tmp, terr := os.temp_directory(context.temp_allocator)
+	if !testing.expectf(t, terr == nil, "no temporary directory: %v", terr) {
+		return
+	}
+	dir, _ := filepath.join({tmp, "elodin-logx-mode-test"}, context.temp_allocator)
+	os.remove_all(dir)
+	if !testing.expect(t, os.make_directory(dir) == nil, "cannot create the scratch directory") {
+		return
+	}
+	defer os.remove_all(dir)
+	path, _ := filepath.join({dir, "elodin.log"}, context.temp_allocator)
+
+	f, err := open_log(path)
+	if !testing.expectf(t, err == nil, "cannot open %s: %v", path, err) {
+		return
+	}
+	os.close(f)
+	st: posix.stat_t
+	if !testing.expect(t, posix.stat(strings.clone_to_cstring(path, context.temp_allocator), &st) == .OK, "cannot stat the log") {
+		return
+	}
+	testing.expectf(t, transmute(u32)st.st_mode & 0o777 == 0o600, "the log was created %o, want 600", transmute(u32)st.st_mode & 0o777)
 }
 
 // An allocator with nothing to give, as a fiber's scratch is once the OS will
