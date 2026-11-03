@@ -794,14 +794,16 @@ with what its first wait left (issue #428): one that waited out its deadline on
 the evicted leader would otherwise lead on nothing, ask nobody, and hand that
 failure to every query following it.
 
-The hand-made leader lands at three timeouts, past the followers' deadline of
-two and inside their patience of four.
+The hand-made leader lands two timeouts and a little after the last follower
+joined, so every follower's deadline - armed before its join - has passed, and
+well inside their patience of four: the clients may start up to about two
+timeouts apart before the first one gives up.
 */
 @(test)
 test_a_follower_going_round_leads_on_a_deadline_of_its_own :: proc(t: ^testing.T) {
 	TIMEOUT :: 250 * time.Millisecond
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, timeout = TIMEOUT, evicted = .Bogus, land_after = 3 * TIMEOUT)
+	queries := run_burst(t, &clients, timeout = TIMEOUT, evicted = .Bogus, land_after = 2 * TIMEOUT + 20 * time.Millisecond)
 	testing.expectf(t, queries == 1, "the upstream saw the question %d times for %d clients, want 1", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .No_Error, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
