@@ -192,7 +192,7 @@ Refresh :: struct {
 	here instead and the waiter - which does hold the bytes - serves them. The
 	distinction matters: a refusal this server reached on purpose, a Bogus
 	verdict or an answer the chain walk could not read, is not an outage and
-	does not get the fallback. See the `uerr != .None` branch in `resolve_query`.
+	does not get the fallback. See the `uerr != .None` branch in `judge_reply`.
 	*/
 	unanswered: bool,
 }
@@ -493,9 +493,7 @@ refresh_job :: proc(data: rawptr) {
 	*/
 	cookie := inspect_cookie(live(s).cookies, msg, r.client)
 
-	unanswered: bool
-	ede: u16
-	resp, outcome, ok := resolve_query(
+	got := resolve_query(
 		s,
 		r.query,
 		msg,
@@ -506,21 +504,20 @@ refresh_job :: proc(data: rawptr) {
 		r.started,
 		&spent,
 		context.temp_allocator,
-		&unanswered,
-		&ede,
+		refresh = true,
 	)
 
 	heap: []u8
-	if ok && len(resp) > 0 {
-		heap = make([]u8, len(resp), r.allocator)
-		copy(heap, resp)
+	if got.ok && len(got.response) > 0 {
+		heap = make([]u8, len(got.response), r.allocator)
+		copy(heap, got.response)
 	}
 	sync.mutex_lock(&r.mu)
 	r.response = heap
-	r.outcome = outcome
-	r.ok = ok
-	r.unanswered = unanswered
-	r.ede = ede
+	r.outcome = got.outcome
+	r.ok = got.ok
+	r.unanswered = got.unanswered
+	r.ede = got.ede
 	sync.mutex_unlock(&r.mu)
 }
 

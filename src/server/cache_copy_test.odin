@@ -137,7 +137,18 @@ test_a_standing_refusal_copies_nothing :: proc(t: ^testing.T) {
 	cfg.blocking.enabled = false
 	msg, _ := dns.decode_message(stale_query(true), context.temp_allocator)
 	spent: int
-	_, outcome, ok := serve_from_cache(&s, held, stale_query(true), msg, msg.question[0], .UDP, "127.0.0.1:5555", 512, false, {}, &spent, context.temp_allocator)
+	st := Query_State {
+		s         = &s,
+		query     = stale_query(true),
+		msg       = msg,
+		q         = msg.question[0],
+		proto     = .UDP,
+		client    = "127.0.0.1:5555",
+		limit     = 512,
+		spent     = &spent,
+		allocator = context.temp_allocator,
+	}
+	_, outcome, ok := serve_from_cache(&st, held)
 	testing.expect(t, ok, "nothing came back at all")
 	testing.expect_value(t, outcome, Outcome.Blocked)
 	free_all(context.temp_allocator)
