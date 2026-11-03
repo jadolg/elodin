@@ -784,11 +784,9 @@ that data here whichever member of the group supplied it. What this covers is
 the deployment that turned validation off and left a mixed group behind - and it
 covers as much of it as the upstream is willing to say.
 
-With validation off the question goes out as the client wrote it, which adds a
-precondition of its own: a client that asked without EDNS gets a reply that
-cannot legally carry an OPT record, so it cannot carry an extended error either,
-and the sweep goes on. A stub that asks with EDNS - which most resolvers and
-every DNSSEC-aware client do - is what this can protect.
+The question goes out with an OPT record whatever the client sent
+(`server.upstream_query`), so the reply can carry an extended error for a
+client that asked without EDNS as well.
 
 Only the first extended error in a reply is read, which is what
 `peek_edns_option` returns. RFC 8914 section 2 permits several, and a reply

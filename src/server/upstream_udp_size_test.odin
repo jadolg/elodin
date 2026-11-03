@@ -125,8 +125,7 @@ answer_reply :: proc() -> []u8 {
 }
 
 // A forwarding server with nothing between the client and the upstream, and no
-// validator: `dnssec_upstream_query` is not what rewrites the size here, and a
-// query with CD=1 or a routed zone would not reach it even with one running.
+// validator, so the query is the plain path's.
 @(private = "file")
 forwarding_server :: proc(
 	t: ^testing.T,
@@ -175,30 +174,39 @@ forwarding_server :: proc(
 	return Server{cfg = cfg, group = group}, cfg, x, true
 }
 
-// Forward one query and hand back the payload size the upstream was asked with.
+// Forward one query and hand back what the upstream was asked, and the answer.
 @(private = "file")
-forward_and_read_size :: proc(t: ^testing.T, query: []u8) -> (advertised: u16, ok: bool) {
+forward_and_see :: proc(t: ^testing.T, query: []u8) -> (seen: []u8, out: []u8, ok: bool) {
 	s, _, x, built := forwarding_server(t)
 	if !built {
-		return 0, false
+		return nil, nil, false
 	}
 	defer net.close(x.socket)
 	defer upstream.destroy_group(s.group)
 
 	mock := thread.create_and_start_with_poly_data(x, serve_one)
-	out, outcome, answered := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	reply, outcome, answered := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
 
 	if !testing.expect(t, x.got, "the upstream was never asked") {
-		return 0, false
+		return nil, nil, false
 	}
-	// The exchange has to have worked, or the size below is the size of a query
-	// that went nowhere.
+	// The exchange has to have worked, or what was seen is a query that went
+	// nowhere.
 	testing.expect(t, answered, "nothing came back at all")
 	testing.expect_value(t, outcome, Outcome.Forwarded)
-	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.No_Error)
-	return dns.peek_udp_size(x.seen[:x.seen_len]), true
+	testing.expect_value(t, dns.peek_rcode(reply), dns.Rcode.No_Error)
+	seen = make([]u8, x.seen_len, context.temp_allocator)
+	copy(seen, x.seen[:x.seen_len])
+	return seen, reply, true
+}
+
+// Forward one query and hand back the payload size the upstream was asked with.
+@(private = "file")
+forward_and_read_size :: proc(t: ^testing.T, query: []u8) -> (advertised: u16, ok: bool) {
+	seen, _ := forward_and_see(t, query) or_return
+	return dns.peek_udp_size(seen), true
 }
 
 /*
@@ -236,54 +244,35 @@ test_a_clients_edns_payload_size_is_not_forwarded_upstream :: proc(t: ^testing.T
 }
 
 /*
-And a client that asked for less is not overruled upward.
-
-The rewrite is a ceiling, not a number this server insists on: there is nothing
-to gain from asking an upstream for more room than the answer going back to the
-client may use, and a stub advertising 512 is often one behind a path that could
-not carry more. 512 also happens to be what a query carrying no OPT record at
-all is held to, and this is the same case reached with a field to read.
+And a client that asked for less, or without EDNS at all, is asked for with the
+same figure: it says what this server can receive (RFC 6891 section 6.2.5), and
+the answer is fitted to the client on the way back as a cached one is. Asking
+for 512 instead turns every answer over it into a TC=1 and a TCP retry upstream.
 */
 @(test)
-test_a_smaller_client_payload_size_is_left_alone :: proc(t: ^testing.T) {
-	query := client_query(512)
-	if !testing.expect(t, len(query) > dns.HEADER_SIZE, "the query did not encode") {
-		return
+test_a_smaller_client_payload_size_is_asked_for_with_ours :: proc(t: ^testing.T) {
+	for query in ([][]u8{client_query(512), client_query(0, edns = false)}) {
+		if !testing.expect(t, len(query) > dns.HEADER_SIZE, "the query did not encode") {
+			return
+		}
+		advertised, ok := forward_and_read_size(t, query)
+		if !ok {
+			return
+		}
+		testing.expectf(t, advertised == 1232, "the upstream was told it could send %d bytes rather than 1232", advertised)
 	}
-	testing.expect_value(t, dns.peek_udp_size(query), u16(512))
-
-	advertised, ok := forward_and_read_size(t, query)
-	if !ok {
-		return
-	}
-	testing.expectf(
-		t,
-		advertised == 512,
-		"the upstream was told it could send %d bytes to answer a query that asked for 512",
-		advertised,
-	)
 
 	free_all(context.temp_allocator)
 }
 
 /*
-The validating path writes the same figure.
-
-`dnssec_upstream_query` builds its own OPT record rather than passing the
-client's on, so it never depended on the rewrite above - and before this it was
-the one path that was safe, at 4096, which is still past the flag-day figure and
-still fragments on an ordinary 1500-byte path.
+The validating query writes the same figure, with DO and CD set and the
+question intact.
 */
 @(test)
-test_the_validating_rewrite_advertises_the_flag_day_size :: proc(t: ^testing.T) {
-	query := client_query(65000)
-	msg, derr := dns.decode_message(query, context.temp_allocator)
-	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
-		return
-	}
-
-	wire, ok := dnssec_upstream_query(msg, context.temp_allocator)
-	if !testing.expect(t, ok, "the validating rewrite did not encode") {
+test_the_validating_query_advertises_the_flag_day_size :: proc(t: ^testing.T) {
+	wire, ok := upstream_query({name = QNAME, type = .A, class = .IN}, true, true, context.temp_allocator)
+	if !testing.expect(t, ok, "the validating query did not encode") {
 		return
 	}
 	testing.expectf(
@@ -292,12 +281,11 @@ test_the_validating_rewrite_advertises_the_flag_day_size :: proc(t: ^testing.T) 
 		"the validating path advertises %d bytes upstream rather than the flag-day 1232",
 		dns.peek_udp_size(wire),
 	)
-	// And it is still the query it was: DO and CD set, the question intact.
 	out, oerr := dns.decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, oerr, dns.Decode_Error.None)
-	testing.expect(t, out.flags.cd, "the validating rewrite lost CD")
-	testing.expect(t, dns.edns_do(out), "the validating rewrite lost DO")
-	if testing.expect(t, len(out.question) == 1, "the validating rewrite lost the question") {
+	testing.expect(t, out.flags.cd, "the validating query lost CD")
+	testing.expect(t, dns.edns_do(out), "the validating query lost DO")
+	if testing.expect(t, len(out.question) == 1, "the validating query lost the question") {
 		testing.expect(t, dns.name_equal_fold(out.question[0].name, QNAME), "the question changed")
 	}
 
@@ -337,8 +325,8 @@ test_a_client_cannot_push_the_upstream_payload_size_below_512 :: proc(t: ^testin
 	}
 	testing.expectf(
 		t,
-		advertised == 512,
-		"the upstream was told it could send %d bytes, which is the client's figure below the floor",
+		advertised == 1232,
+		"the upstream was told it could send %d bytes, which is the client's figure rather than ours",
 		advertised,
 	)
 
@@ -420,6 +408,116 @@ test_a_query_carrying_an_opt_outside_the_additional_section_is_refused :: proc(t
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect_value(t, decoded.id, CLIENT_ID)
+
+	free_all(context.temp_allocator)
+}
+
+/*
+Two queries for one cache key reach the upstream as one message, bar the ID
+(issue #423).
+
+Each is as odd as the gates let through, and the two odd in different ways: one
+without EDNS, in upper case, with TC, AA, AD and Z set and a record in its
+authority section; the other with a 65000-byte OPT record carrying NSID, EXPIRE
+and an unknown option and a reserved flag, a second additional record, and bytes
+past the last record. The key is the question, DO and CD, which both share, so
+the upstream is asked one question - and anything else of the client's that
+reached it would be one client choosing what the next is answered with.
+*/
+@(test)
+test_two_queries_for_one_key_reach_the_upstream_as_one_message :: proc(t: ^testing.T) {
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question {
+		name  = "WWW.Example.",
+		type  = .A,
+		class = .IN,
+	}
+	extra := make([]dns.Record, 1, context.temp_allocator)
+	extra[0] = dns.Record {
+		name  = QNAME,
+		type  = .A,
+		class = .IN,
+		ttl   = 60,
+		data  = dns.Rdata_A{addr = {198, 51, 100, 1}},
+	}
+	plain := dns.Message {
+		id        = CLIENT_ID,
+		question  = question,
+		authority = extra,
+	}
+	plain.flags.rd = true
+	plain.flags.tc = true
+	plain.flags.aa = true
+	plain.flags.ad = true
+	plain.flags.z = true
+	first, _, ferr := dns.encode_message(plain, context.temp_allocator)
+	if !testing.expect_value(t, ferr, dns.Encode_Error.None) {
+		return
+	}
+
+	options := make([]dns.EDNS_Option, 3, context.temp_allocator)
+	options[0] = {code = u16(dns.EDNS_Option_Code.NSID)}
+	options[1] = {code = u16(dns.EDNS_Option_Code.Expire)}
+	options[2] = {code = 65001, data = {1, 2, 3}}
+	opt := dns.make_opt(65000, false)
+	opt.ttl |= 0x0001 // a reserved OPT flag
+	opt.data = dns.Rdata_OPT{options = options}
+	lower := make([]dns.Question, 1, context.temp_allocator)
+	lower[0] = {name = QNAME, type = .A, class = .IN}
+	additional := make([]dns.Record, 2, context.temp_allocator)
+	additional[0] = extra[0]
+	additional[1] = opt
+	edns := dns.Message {
+		id         = CLIENT_ID + 1,
+		question   = lower,
+		additional = additional,
+	}
+	edns.flags.rd = true
+	encoded, _, eerr := dns.encode_message(edns, context.temp_allocator)
+	if !testing.expect_value(t, eerr, dns.Encode_Error.None) {
+		return
+	}
+	second := make([]u8, len(encoded) + 3, context.temp_allocator)
+	copy(second, encoded)
+
+	// The premise: one key, two messages that differ past the ID.
+	testing.expect(t, string(first[2:]) != string(second[2:]), "the fixtures are one message")
+
+	seen_first, answer, ok := forward_and_see(t, first)
+	if !ok {
+		return
+	}
+	seen_second, _, ok2 := forward_and_see(t, second)
+	if !ok2 {
+		return
+	}
+	testing.expect(t, string(seen_first[2:]) == string(seen_second[2:]), "the upstream was asked two different messages for one key")
+
+	// And the one message is the key's: the question in lower case, RD alone of
+	// the flags, one OPT record of ours with no options, nothing else.
+	asked, derr := dns.decode_message(seen_second, context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
+	want := asked
+	want.flags = {}
+	want.flags.rd = true
+	testing.expect_value(t, asked.flags, want.flags)
+	testing.expect_value(t, len(asked.answer) + len(asked.authority), 0)
+	if testing.expect_value(t, len(asked.question), 1) {
+		testing.expect_value(t, asked.question[0].name, QNAME)
+	}
+	if testing.expect_value(t, len(asked.additional), 1) {
+		testing.expect_value(t, asked.additional[0].ttl, u32(0))
+		testing.expect_value(t, u16(asked.additional[0].class), u16(1232))
+		if rdata, is_opt := asked.additional[0].data.(dns.Rdata_OPT); is_opt {
+			testing.expect_value(t, len(rdata.options), 0)
+		}
+	}
+
+	// The client in upper case reads its own question back, byte for byte.
+	end := dns.HEADER_SIZE + len("\x03WWW\x07Example\x00")
+	testing.expect(t, string(answer[dns.HEADER_SIZE:end]) == string(first[dns.HEADER_SIZE:end]), "the answer's question lost the client's case")
 
 	free_all(context.temp_allocator)
 }

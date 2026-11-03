@@ -203,7 +203,7 @@ Client :: struct {
 	srv:     ^Server,
 	id:      u16,
 	// Ask with an OPT record at `UPSTREAM_UDP_SIZE`, or without one as an old
-	// stub does, which is a different message to the upstream.
+	// stub does - the same message to the upstream (issue #423).
 	edns:    bool,
 	rcode:   dns.Rcode,
 	addr:    [4]u8,
@@ -266,8 +266,14 @@ run_burst :: proc(
 	attempts := 1,
 	edns := true,
 	// Client 0 asks as `edns` says and leads; the rest ask the other way and
-	// follow it, so the leader's message is not theirs.
+	// follow it.
 	mixed := false,
+	/*
+	Lead the burst by hand with a message no client sends, which a reload that
+	changed the DNSSEC settings between a leader and its followers is the one way
+	to reach, and land it with `first` for an answer - or with nothing, `silent`.
+	*/
+	other_message := false,
 	cache_on := true,
 	// A real validator, which the mock's empty key sets turn into a Bogus
 	// verdict for the unsigned answer.
@@ -366,10 +372,18 @@ run_burst :: proc(
 	key_buf: [cache.KEY_MAX]u8
 	leaders: [2]Flight
 	leading := false
-	if evicted != .None {
+	if evicted != .None || other_message {
 		key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
 		joined, _ := flight_join(&srv, key, &leaders[0])
 		leading = testing.expect(t, joined == &leaders[0], "the hand-made leader did not get the flight")
+	}
+	if other_message {
+		leaders[0].forwarded = []u8{0, 0, 0xff}
+		if silent {
+			leaders[0].failed = true
+		} else {
+			leaders[0].answer = coalesce_reply(0, 0, ttl, first)
+		}
 	}
 	threads: [CLIENTS]^thread.Thread
 	for i in 0 ..< clients_asking {
@@ -486,24 +500,30 @@ test_a_lost_datagram_is_retried_for_the_followers_too :: proc(t: ^testing.T) {
 }
 
 /*
-A leader whose message was not theirs - an old stub's, with no OPT record - may
-have failed over those bytes rather than the question, so its followers ask for
-themselves rather than take its failure.
+Clients that ask one question differently - an old stub without EDNS behind an
+EDNS leader - send the upstream one message (issue #423), so the followers take
+the leader's failure rather than each wait out the same nothing again.
+*/
+@(test)
+test_followers_that_asked_another_way_share_the_leaders_failure :: proc(t: ^testing.T) {
+	clients: [CLIENTS]Client
+	queries := run_burst(t, &clients, silent = true, timeout = 1 * time.Second, mixed = true)
+	testing.expectf(t, queries == 1, "the upstream saw %d queries for %d clients, want 1", queries, CLIENTS)
+	for c, i in clients {
+		testing.expectf(t, c.ok && c.rcode == .Serv_Fail, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
+	}
+}
+
+/*
+A leader whose message was not theirs may have failed over those bytes rather
+than the question, so its followers ask for themselves rather than take its
+failure.
 */
 @(test)
 test_followers_of_another_message_ask_for_themselves :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, drop_first = true, timeout = 1 * time.Second, edns = false, mixed = true)
+	queries := run_burst(t, &clients, other_message = true, silent = true, timeout = 1 * time.Second, hold_for = 0, land_after = 50 * time.Millisecond)
 	testing.expectf(t, queries == CLIENTS, "the upstream saw %d queries for %d clients, want %d", queries, CLIENTS, CLIENTS)
-	failed, answered := 0, 0
-	for c in clients {
-		if c.ok && c.rcode == .Serv_Fail {
-			failed += 1
-		} else if c.ok && c.rcode == .No_Error && c.addr == {192, 0, 2, 7} {
-			answered += 1
-		}
-	}
-	testing.expectf(t, failed == 1 && answered == CLIENTS - 1, "%d clients failed and %d were answered, want 1 and %d", failed, answered, CLIENTS - 1)
 }
 
 /*
@@ -511,15 +531,14 @@ A follower's wait on the leader is its question's first exchange, and spends its
 deadline (issue #439). One whose message was not the leader's forwards on its
 own once the leader lands with nothing - and used to do it on a fresh deadline,
 so against a silent upstream it waited the leader's two timeouts and then two
-more of its own. It now asks with what the wait left, which is at most the
-moment between the leader's arrival and its own, so it is done within one more
-timeout of the leader, the exchange that crosses the line.
+more of its own. It now asks with what the wait left, so it is done within one
+more timeout of the leader, the exchange that crosses the line.
 */
 @(test)
 test_a_follower_forwards_on_what_its_wait_left_of_the_deadline :: proc(t: ^testing.T) {
 	TIMEOUT :: 400 * time.Millisecond
 	clients: [CLIENTS]Client
-	run_burst(t, &clients, silent = true, timeout = TIMEOUT, attempts = 2, mixed = true)
+	run_burst(t, &clients, silent = true, timeout = TIMEOUT, attempts = 2, other_message = true, hold_for = 0, land_after = 2 * TIMEOUT)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .Serv_Fail, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
 		// The leader's two timeouts and the one that crosses the line, with
@@ -529,28 +548,11 @@ test_a_follower_forwards_on_what_its_wait_left_of_the_deadline :: proc(t: ^testi
 }
 
 /*
-And the other way round: an EDNS leader's failure or FORMERR is the upstream
-reading its message, which the followers' own, without EDNS, are not.
-*/
-@(test)
-test_a_leaders_failure_is_not_handed_to_other_messages :: proc(t: ^testing.T) {
-	down: [CLIENTS]Client
-	queries := run_burst(t, &down, silent = true, timeout = 1 * time.Second, mixed = true)
-	testing.expectf(t, queries == CLIENTS, "down: the upstream saw %d queries, want %d", queries, CLIENTS)
-
-	refused: [CLIENTS]Client
-	run_burst(t, &refused, first = .Form_Err, mixed = true)
-	testing.expectf(t, refused[0].rcode == .Form_Err, "the leader was answered %v, want its FORMERR", refused[0].rcode)
-	for c, i in refused[1:] {
-		testing.expectf(t, c.ok && c.addr == {192, 0, 2, 7}, "follower %d: ok=%v rcode=%v", i + 1, c.ok, c.rcode)
-	}
-}
-
-/*
-And an rcode is shared or not on the same terms. From a leader whose message was
-the follower's, a FORMERR or a REFUSED is the upstream's word on that message;
-from one whose was not, it may be a refusal of bytes no follower sent, and only
-the rcodes the cache itself keeps are handed on.
+An rcode is shared or not on the same terms. From a leader whose message was the
+follower's - which clients asking with and without EDNS now both are - a FORMERR
+or a REFUSED is the upstream's word on that message; from one whose was not, it
+may be a refusal of bytes no follower sent, and only the rcodes the cache itself
+keeps are handed on.
 */
 @(test)
 test_a_refusal_is_shared_only_between_identical_messages :: proc(t: ^testing.T) {
@@ -566,16 +568,18 @@ test_a_refusal_is_shared_only_between_identical_messages :: proc(t: ^testing.T) 
 	}
 
 	for rcode in ([]dns.Rcode{.Form_Err, .Refused}) {
-		own: [CLIENTS]Client
-		run_burst(t, &own, first = rcode, edns = false, mixed = true)
-		refused, answered := count(own, rcode)
-		testing.expectf(t, refused == 1 && answered == CLIENTS - 1, "%v without EDNS: %d clients got the leader's refusal and %d an answer, want 1 and %d", rcode, refused, answered, CLIENTS - 1)
-	}
+		mixed: [CLIENTS]Client
+		queries := run_burst(t, &mixed, first = rcode, edns = false, mixed = true)
+		refused, answered := count(mixed, rcode)
+		testing.expectf(t, queries == 1 && refused == CLIENTS, "%v asked both ways: %d queries and %d refusals, want 1 and %d", rcode, queries, refused, CLIENTS)
 
-	shared: [CLIENTS]Client
-	queries := run_burst(t, &shared, first = .Form_Err)
-	refused, _ := count(shared, .Form_Err)
-	testing.expectf(t, queries == 1 && refused == CLIENTS, "with EDNS, %d queries and %d FORMERRs, want 1 and %d", queries, refused, CLIENTS)
+		other: [CLIENTS]Client
+		queries = run_burst(t, &other, first = rcode, other_message = true, hold_for = 0, land_after = 50 * time.Millisecond)
+		// The mock answers the first query to reach it with `rcode` too: one
+		// follower's own, not the leader's handed on.
+		refused, answered = count(other, rcode)
+		testing.expectf(t, queries == CLIENTS && refused == 1 && answered == CLIENTS - 1, "%v for another message: %d queries, %d refusals and %d answers, want %d, 1 and %d", rcode, queries, refused, answered, CLIENTS, CLIENTS - 1)
+	}
 }
 
 // A follower whose leader never lands stops waiting at its patience, and the
@@ -706,15 +710,15 @@ test_counted_followers_stop_at_the_ceiling :: proc(t: ^testing.T) {
 /*
 With the cache off, nothing was ever shared between two clients' messages, and
 coalescing does not start: only a follower whose message was the leader's takes
-its answer.
+its answer - which clients asking with and without EDNS both are.
 */
 @(test)
 test_with_the_cache_off_only_identical_messages_share_an_answer :: proc(t: ^testing.T) {
 	alike: [CLIENTS]Client
-	queries := run_burst(t, &alike, cache_on = false)
+	queries := run_burst(t, &alike, cache_on = false, mixed = true)
 	testing.expectf(t, queries == 1, "identical: the upstream saw %d queries, want 1", queries)
 	apart: [CLIENTS]Client
-	queries = run_burst(t, &apart, cache_on = false, mixed = true)
+	queries = run_burst(t, &apart, cache_on = false, other_message = true, hold_for = 0, land_after = 50 * time.Millisecond)
 	testing.expectf(t, queries == CLIENTS, "different: the upstream saw %d queries, want %d", queries, CLIENTS)
 	for c, i in apart {
 		testing.expectf(t, c.ok && c.addr == {192, 0, 2, 7}, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)

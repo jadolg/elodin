@@ -982,16 +982,14 @@ later edit to one depends on.
 Four shapes cannot be accounted for. The first two are the same defect read
 from either end. A second OPT record is one RFC 6891 section 6.1.1 forbids outright,
 and every reader here - `find_opt` on the decoded message, `find_opt_span` on
-the wire, and so both the cookie strip and the subnet strip - takes the first
-one and looks no further, so an option sitting in the second travels upstream
-untouched past a removal that reported success. An OPT whose RDATA is not a
+the wire, and so the cookie check and the version gate - takes the first one
+and looks no further, so an option sitting in the second is one this server
+answers as though it were not there. An OPT whose RDATA is not a
 well-formed option list is the other: `decode_record` keeps RDATA it cannot
 parse as raw bytes rather than rejecting the message, so a list ending in three
 bytes of a fourth option header arrives as an OPT record holding `Rdata_Raw`,
 and every option in front of that stump reads as absent to anything asking the
-decoded message - `find_edns_option` included. Absent to this server, that is,
-and not to the upstream, which walks the same bytes and stops where this decoder
-stopped.
+decoded message - `find_edns_option` included.
 
 Asked of the message rather than of one option, because the answer is the same
 for every option in it and asking per option is what went wrong before: the
@@ -1004,10 +1002,9 @@ answer or authority section is not the message's EDNS record, and a client can
 put one there for the asking.
 
 Which is the third shape, and the same defect once more: a record this server
-does not read is one it cannot strip a cookie from or rewrite a payload size in,
-and it is forwarded as it stands to an upstream that may well read it - taking
-the first OPT it meets whatever section that is in, which is what this server's
-own `peek_udp_size` did until #325. A query has no answer or authority section
+does not read is one the client may mean as its EDNS, to a reader taking the
+first OPT it meets whatever section that is in, which is what this server's own
+`peek_udp_size` did until #325. A query has no answer or authority section
 to begin with, so nothing legitimate is being turned away: the records that do
 belong in one, a prerequisite in an UPDATE or the SOA of an IXFR, are not OPT
 records and are not counted here.
@@ -1045,41 +1042,6 @@ edns_opt_readable :: proc(msg: dns.Message) -> bool {
 		}
 	}
 	return true
-}
-
-/*
-Whether the client asked with a given EDNS option - which is the question each
-of the strips below opens with.
-
-Read off the decoded message, which is the whole of what it takes by the time
-this is asked: `handle_query` has already turned away the two shapes that could
-hide an option from this decoder - a second OPT record, and an OPT whose RDATA
-is not a well-formed option list - so an option that is not in the list here is
-not in the message either, and the one that is can be taken back out.
-
-Every OPT record is walked rather than the first one `find_edns_option` stops
-at. That is the same answer here, for the reason above, and it is the answer
-that stays right if the gate above is ever loosened: a reader that stops where
-the decoder stopped is exactly how an option can be absent to this server and
-present to the upstream.
-*/
-@(private)
-edns_option_sent :: proc(msg: dns.Message, code: dns.EDNS_Option_Code) -> bool {
-	for rec in msg.additional {
-		if rec.type != .OPT {
-			continue
-		}
-		rdata, is_opt := rec.data.(dns.Rdata_OPT)
-		if !is_opt {
-			continue
-		}
-		for o in rdata.options {
-			if o.code == u16(code) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // Opens once a window per kind of error for a query that got no answer from its
@@ -1718,316 +1680,82 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 }
 
 /*
-The query as it goes to the upstream, in `st.forwarded`: what is the client's
-taken out, and what is ours put in. Answers only where a strip fails closed.
+The query as it goes to the upstream, in `st.forwarded`. Answers only where it
+cannot be built.
+
+Built from the cache key rather than patched out of the client's message
+(issue #423): the question, folded to the key's case, and whether this query
+wants DO and CD - both forced on when validating. Nothing else of the client's
+goes out, so two queries for one key reach the upstream as one message bar the
+ID, and the upstream's answer, or its failure, is about the question rather than
+about one client's spelling of it. That is what the cache already assumes when it
+hands one client's answer to another, and what lets a follower share its
+leader's outcome (`inflight.odin`).
+
+What is dropped by that: the client's EDNS options - its cookie, a shared secret
+with this server that an upstream would answer BADCOOKIE to (RFC 7873 section
+5.2); its client-subnet option, which RFC 7871 section 7.5 forbids forwarding
+without the per-network caching of section 7.3 that this server's key does not
+have; its keepalive request, which RFC 7828 section 3.2.1 forbids on UDP and
+which is about the client's own connection anyway - and every other option,
+whose reply `normalise_client_opt` takes back out on the way to the client in
+any case. Its header bits, which `settle_header` overwrites in the answer:
+AD stays clear, as RFC 6840 section 5.7 reads it in a query as a request for an
+AD bit this server never reads. Its extended-rcode byte, which RFC 6891
+section 6.1.3 requires to be zero. Any record outside the question, and any
+bytes past the last.
+
+And its payload size, for this server's own: RFC 6891 section 6.2.5 makes the
+field a statement by the sender, and the sender here is elodin. A client's 65000
+would otherwise choose a fragmented reply arriving here, the precondition of
+fragment poisoning, and a client's zero a TC=1 and a TCP retry for every answer
+over 512 bytes. A client that asked without EDNS, or with a smaller figure, is
+asked for with `UPSTREAM_UDP_SIZE` too, as Unbound and BIND do: the answer is
+fitted to the client afterwards by `match_client_opt`, as a cached one is, so
+asking for less only costs a TCP retry upstream.
 */
 @(private)
 shape_forwarded :: proc(st: ^Query_State) -> bool {
-	// Validation needs the signatures, so the question goes out again with DO
-	// and CD set rather than as the client wrote it.
-	st.forwarded = st.query
-	if st.validating {
-		if rewritten, built := dnssec_upstream_query(st.msg, st.allocator); built {
-			st.forwarded = rewritten
-		} else {
-			st.validating = false
-		}
+	wire, built := upstream_query(st.q, st.validating || dns.edns_do(st.msg), st.validating || st.msg.flags.cd, st.allocator)
+	if !built {
+		// The question decoded, so its encoding failing is not a shape a client
+		// can send; failing closed rather than forwarding its bytes as they stand.
+		count_answer(&st.s.stats.failed)
+		out, ok := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
+		log_query(st.s, st.client, st.proto, st.q, .Failed, "query", st.started)
+		return answered(st, out, .Failed, ok)
 	}
-
-	/*
-	The client's cookie stops here.
-
-	It is a shared secret between that client and this server, so an upstream
-	has no business seeing it - a stable identifier for the client, handed to
-	somebody who cannot check it and did not need it. And the server half of it
-	is one we minted: an upstream that implements cookies would hash it against
-	its own secret, decide it is a forgery and answer BADCOOKIE instead of
-	answering the question. Cookies towards the upstream are a separate exchange
-	of our own - `cookies.upstream`, in `src/upstream/cookie.odin` - which puts
-	its own client cookie on the query after this strip has run.
-
-	Asked as "the query carried one" rather than as anything about this server's
-	own cookie settings. With `cookies.enabled` off there is no verdict to reach
-	and every query looks cookie-less, and with `cookies.upstream` off nothing
-	replaces the option on the way out - so reading the verdict here let the
-	client's cookie travel whenever both were turned off, and to DoT and DoH
-	upstreams, which never carry a cookie of ours, whenever the first one was.
-	*/
-	if st.cookie.sent {
-		stripped, done := dns.remove_edns_option(st.forwarded, .Cookie, st.allocator, st.spent)
-		if !done {
-			/*
-			Failing closed. A query this server cannot take the cookie back out
-			of is not one to send on: forwarding it anyway would hand the
-			client's secret to the upstream, which is the one outcome this whole
-			block exists to prevent. Losing the answer is the cheaper mistake,
-			and the client is told so rather than left waiting.
-			*/
-			count_answer(&st.s.stats.failed)
-			out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
-			logx.warnf(
-				"could not strip the client cookie from %s %s from %s; not forwarding",
-				dns.type_name(st.q.type),
-				dns.name_trim_root(st.q.name),
-				st.client,
-			)
-			log_query(st.s, st.client, st.proto, st.q, .Failed, "cookie", st.started)
-			return answered(st, out, .Failed, built)
-		}
-		st.forwarded = stripped
-	}
-
-	/*
-	The client's subnet stops here as well.
-
-	RFC 7871 section 7.5 puts no condition on this: an intermediate nameserver
-	that forwards ECS options received from its clients "MUST fully implement
-	the caching behavior described in Section 7.3", and this server does not.
-	Its key is the question plus DO and CD and nothing else (`cache.make_key`),
-	so an answer tailored to whatever network a client named would be filed
-	under the bare question and handed to every other client behind this
-	resolver until it expired - section 7.3.1's requirement that a cached answer
-	be tied to the network it was scoped to, absent. One well-formed query from
-	anyone `server.allow_from` lets in, and the whole network gets the CDN edge
-	that client chose.
-
-	The leak is the other half, and it holds with the cache switched off:
-	`server.allow_from` decides who may ask here, not what they may claim about
-	themselves, so a client can have this server tell a public upstream that its
-	users are somewhere they are not (section 11.1).
-
-	Stripped rather than refused. Section 7.5 does offer REFUSED for an option
-	an intermediate does not want to use, but a stub that sends ECS is asking
-	for a nearer CDN edge and not committing an offence, and refusing it teaches
-	the client to route around this resolver. Dropping the option leaves the
-	upstream scoping on this server's own address, which is the answer everyone
-	behind it should be getting, and the reply then carries no ECS option back -
-	which section 7.3 reads as "suitable for all client addresses", true here
-	rather than the false tailoring claim that section warns about.
-
-	Nothing is put in its place. Section 7.1.2 gives SOURCE PREFIX-LENGTH 0 to a
-	stub that wants no scoping at all and section 7.1.3 says a forwarder looks
-	like a stub, but sending it would forbid the upstream from scoping on *our*
-	address too - every client behind this resolver losing the locality it has
-	today, to fix a leak that is already fixed by the option being gone. That is
-	an operator's decision and a larger one than this. An absent option says
-	this server does not do ECS, which is the truth.
-
-	No setting to turn it back on, either. Forwarding ECS is only correct
-	together with the section 7.3 caching, and until the cache can hold a scope
-	per network the key would either be a lie or be the client's own bytes -
-	which is the cache pollution section 11.3 is about, an attacker sitting on
-	one name and evicting the table with a fresh subnet each time. The option
-	belongs with that work, not ahead of it.
-
-	Placed after the DNSSEC rewrite for the reason the cookie is: that path
-	copies the client's OPT data across wholesale, so this is the point where
-	both ways of building the outgoing query have converged.
-
-	The strip below is trusted to reach the option because `handle_query` has
-	already refused the two shapes it could not - a second OPT record, and an OPT
-	whose RDATA is not a well-formed option list. Both would have survived a
-	removal that reported success; see `edns_opt_readable`.
-	*/
-	if edns_option_sent(st.msg, .Client_Subnet) {
-		stripped, done := dns.remove_edns_option(st.forwarded, .Client_Subnet, st.allocator, st.spent)
-		if !done {
-			/*
-			Failing closed, as the cookie above does, and for a reason that
-			survives the objection that a cookie is a secret and a subnet is
-			only a hint. It is a hint that steers a shared cache: forwarding one
-			this server could not account for is what lets a single client pick
-			the answer the rest of them get, which no amount of "it is only a
-			hint" makes cheaper than one lost answer for the client that sent
-			it. Nobody else's queries are affected by the refusal, and the
-			client is told rather than left waiting.
-			*/
-			count_answer(&st.s.stats.failed)
-			out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
-			logx.warnf(
-				"could not strip the client subnet from %s %s from %s; not forwarding",
-				dns.type_name(st.q.type),
-				dns.name_trim_root(st.q.name),
-				st.client,
-			)
-			log_query(st.s, st.client, st.proto, st.q, .Failed, "ecs", st.started)
-			return answered(st, out, .Failed, built)
-		}
-		st.forwarded = stripped
-	}
-
-	/*
-	And the client's keepalive request stops here, on every transport and under
-	every setting.
-
-	edns-tcp-keepalive is hop by hop. RFC 7828 defines it over "the TCP session"
-	the two ends of it share, and the session a client named is the one it holds
-	with this server - a statement about that connection has nothing to say to
-	an upstream one hop further on, which would at best ignore it.
-
-	At worst this server is the one committing the offence. Section 3.2.1: "DNS
-	clients MUST NOT include the edns-tcp-keepalive option in queries sent using
-	UDP transport." On the way to a UDP upstream the client sending that query
-	is elodin, and a client's option relayed untouched is this server issuing
-	the exact shape that sentence forbids - from a query where it was legal,
-	over a transport where it is not.
-
-	Unconditional, which the two above only look like. Each of the three asks
-	whether the client sent the option and nothing else, but for those two that
-	is an argument that had to be made - the cookie's strip could have read this
-	server's own cookie settings and did, which let a client's secret travel
-	whenever they were off, and the subnet's could have been a refusal or a
-	rewrite instead. Here there is nothing to weigh: no transport on which
-	relaying it is correct, no setting under which it becomes so, and no
-	substitute worth putting in its place. The only question is whether the
-	option is there.
-
-	Nothing is put back. This server answers the client's question itself, on
-	the transports where it means anything - see `attach_keepalive` - and what
-	it answers is its own idle timeout, which is not a number any upstream has
-	an opinion about.
-
-	The reply direction needs nothing: `normalise_client_opt` mints this
-	server's own OPT record and `dns.strip_edns_options` drops whatever the
-	upstream wrote, so an upstream's keepalive cannot reach a client whether or
-	not this strip runs.
-	*/
-	if edns_option_sent(st.msg, .TCP_Keepalive) {
-		stripped, done := dns.remove_edns_option(st.forwarded, .TCP_Keepalive, st.allocator, st.spent)
-		if !done {
-			/*
-			Failing closed, as both strips above do, and deliberately out of
-			proportion to what this option is worth.
-
-			On its own merits it would not earn a lost answer: a keepalive
-			option that reached an upstream is one every real resolver ignores,
-			which is a smaller harm than the client's secret or the shared
-			cache. What it is not worth is a third strip that fails a different
-			way from the two beside it. `edns_opt_readable` is what makes all
-			three reachable - the message shapes that could hide an option from
-			a removal are refused long before this - so this branch is
-			unreachable in practice, and the value of writing it is that the
-			list stays one rule rather than three, and a fourth strip added
-			later is read off a list that agrees with itself.
-			*/
-			count_answer(&st.s.stats.failed)
-			out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
-			logx.warnf(
-				"could not strip the client keepalive from %s %s from %s; not forwarding",
-				dns.type_name(st.q.type),
-				dns.name_trim_root(st.q.name),
-				st.client,
-			)
-			log_query(st.s, st.client, st.proto, st.q, .Failed, "keepalive", st.started)
-			return answered(st, out, .Failed, built)
-		}
-		st.forwarded = stripped
-	}
-
-	/*
-	The transaction ID on the way out is ours.
-
-	The client chose the one on the query coming in, and forwarding it means an
-	attacker that can reach this listener picks the ID this server will then
-	accept from the upstream - half of what RFC 5452 section 9.2 asks an
-	off-path attacker to guess, handed over for the asking. What is left is the
-	ephemeral source port, and a search space of 2^16 is minutes of packets on a
-	fast link rather than the 2^31 it should be. A win is cached and served to
-	every client behind this resolver for the whole TTL.
-
-	Placed here rather than in the procedures above because all three ways the
-	outgoing buffer comes about pass through this point: the client's message
-	forwarded as it stands, the DNSSEC rewrite, and the one with the client's
-	cookie taken back out. The reply's ID is put back to the client's below,
-	which the DoH path already relied on.
-
-	Cloned first when the buffer is still the caller's. `query` is needed intact
-	afterwards - `error_response` answers from it, and on the UDP listener it is
-	a receive buffer this thread does not own - and `remove_edns_option` hands
-	back the message unchanged when there was no option to remove, so a buffer
-	arriving here can be the client's own either way.
-	*/
-	if raw_data(st.forwarded) == raw_data(st.query) {
-		st.forwarded = dns.clone_message_bytes(st.forwarded, st.allocator)
-	}
-	dns.set_id_in_place(st.forwarded, dns.random_id())
-	/*
-	And the client's own EXTENDED-RCODE byte does not go out with it.
-
-	RFC 6891 section 6.1.3 requires that byte to be zero in a request, and the
-	version gate in `handle_query` reads the two bytes below it rather than this
-	one - so a client can set it to anything and have it forwarded verbatim. An
-	upstream that echoes the query's OPT TTL instead of building its own, which
-	lazy forwarders and plenty of CPE do, then answers every query from that
-	client with a composed rcode of 16 or more: unusable, so the group is swept
-	for a reply that is not, and the query is a SERVFAIL either way. One
-	client's byte, and the whole group pays for it.
-
-	Here rather than at the gate because here the buffer is certainly this
-	server's own - the clone above is what makes it so - and because all three
-	ways the outgoing message comes about pass through this point.
-
-	Best-effort by design: a query with no OPT record has no field to clear.
-	*/
-	_ = dns.clear_edns_extended_rcode(st.forwarded)
-
-	/*
-	And the payload size the upstream is told is ours, not the client's.
-
-	The number in that field decides how large a datagram the upstream may send
-	*this server*, so forwarding the client's figure lets an anonymous client
-	choose it: 65535 advertised is a multi-fragment UDP answer arriving here,
-	and the second fragment carries neither the transaction ID nor the port, so
-	an off-path attacker needs only the IP header's 16-bit fragment ID to graft
-	its own records onto a genuine reply - which then lands in the shared cache,
-	under the CD=1 key any client can ask for. Nothing about the client's own
-	message is a statement about what this server can reassemble.
-
-	A clamp rather than a plain write: a client that advertised less than the
-	ceiling, or that asked without EDNS at all, is not overruled upward. There
-	is nothing to gain from asking for more room than the answer we may send
-	back can use, and a stub that advertised 512 is often one behind a path that
-	could not carry more.
-
-	Floored at 512 for the other end of the same argument. RFC 6891 section
-	6.2.3 has a responder treat anything under 512 as 512, so a smaller figure
-	buys a client nothing there - but written out it is a lever pointed the
-	other way: one datagram advertising zero and every answer over 512 bytes
-	comes back truncated and is re-fetched over TCP, a UDP query in and an
-	upstream connection out. `exchange_udp` floors its own buffer at 512 for the
-	same reason, so there was never anything below it to gain.
-
-	Here with the ID and the extended rcode because the three want the same
-	thing: the one point all the ways the outgoing message comes about pass
-	through, with the buffer certainly this server's own. The DNSSEC rewrite
-	arrives having already written `UPSTREAM_UDP_SIZE`, so this leaves it as it
-	is; `validator_query`, which does not come this way at all, writes the same
-	constant itself.
-
-	Written whatever transport the group's members speak, rather than only for
-	the `udp://` ones the fragments are a hazard on. Which member answers is not
-	known here - a failover group can hold a `udp://` and a `tls://` server and
-	move between them - so scoping it would mean a copy of the query per member
-	instead of one buffer for the group, and the field bounds nothing on a
-	stream: RFC 7766 section 6.2.1.1 says not to apply the requestor's payload
-	size there, and an upstream that did would already be truncating for every
-	client that advertised 512, which is every client that asked without EDNS at
-	all. What it would cost against such a server is a TC=1 that only
-	`exchange_udp` knows how to retry.
-
-	Best-effort, like the clear above: a query with no OPT record has no field
-	to write into, and 512 is what a responder assumes without one.
-
-	Read with `peek_udp_size`, which looks in the additional section alone, the
-	same place `set_edns_udp_size` writes: a client may put a record of type OPT
-	in its answer section for the asking, and reading the figure from one place
-	while writing it to another would let that decoy choose what is written.
-	*/
-	_ = dns.set_edns_udp_size(
-		st.forwarded,
-		u16(clamp(int(dns.peek_udp_size(st.forwarded)), dns.MAX_UDP_SIZE, UPSTREAM_UDP_SIZE)),
-	)
+	st.forwarded = wire
 	return false
+}
+
+/*
+A query this server sends upstream on its own account: `q` and nothing of anyone
+else's, RD set, a fresh transaction ID (RFC 5452 section 9.2), and one OPT record
+at `UPSTREAM_UDP_SIZE` with no options - the upstream cookie and the padding are
+put on by `src/upstream`. The name is folded to lower case as the cache key is,
+so the bytes depend on the key and not the client; the answer's question is put
+back in the client's case before it goes out (`dns.copy_question_case`).
+*/
+@(private)
+upstream_query :: proc(q: dns.Question, dnssec_ok, checking_disabled: bool, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+	question := make([]dns.Question, 1, allocator)
+	question[0] = q
+	additional := make([]dns.Record, 1, allocator)
+	additional[0] = dns.make_opt(UPSTREAM_UDP_SIZE, dnssec_ok)
+	m := dns.Message {
+		id         = dns.random_id(),
+		question   = question,
+		additional = additional,
+	}
+	m.flags.rd = true
+	m.flags.cd = checking_disabled
+	encoded, _, err := dns.encode_message(m, allocator)
+	if err != .None {
+		return nil, false
+	}
+	dns.lower_question_case(encoded)
+	return encoded, true
 }
 
 /*
@@ -2663,8 +2391,10 @@ judge_reply :: proc(st: ^Query_State) -> bool {
 	}
 
 	// The answer carries the ID we forwarded with, which is not the client's and
-	// on a DoH upstream is zero. The client is waiting on its own.
+	// on a DoH upstream is zero, and the question in the lower case it was asked
+	// in (`upstream_query`). The client is waiting on its own of both.
 	dns.set_id_in_place(st.resp, st.msg.id)
+	dns.copy_question_case(st.resp, st.query)
 	return false
 }
 

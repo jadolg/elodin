@@ -344,11 +344,11 @@ run_wire_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
-	start_case(r, "edns: the client's OPT record is carried to the upstream")
+	start_case(r, "edns: the upstream is asked with an OPT record and the client's DO")
 	{
-		// elodin forwards the query as it arrived, so EDNS parameters are
-		// negotiated end to end rather than rewritten in the middle. What
-		// matters is therefore what the upstream received.
+		// elodin builds the query it forwards from the question, DO and CD
+		// (issue #423), with an OPT record of its own. What matters is
+		// therefore what the upstream received.
 		f := fixture("a")
 		query := build_query(f.qname, f.qtype, edns_size = 1232, dnssec_ok = true)
 		res := query_udp(udp_port, query)
@@ -366,19 +366,27 @@ run_wire_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
-	start_case(r, "the query reaches the upstream with its case intact (0x20 clients)")
+	start_case(r, "a 0x20 client reads its own case back, and the upstream is asked in the key's")
 	{
+		// Every client asking the name sends the upstream one message, so the
+		// name goes out folded as the cache key folds it (issue #423), and the
+		// answer's question is put back in the client's case.
 		query := build_query("ExAmPle.CoM.", u16(dns.Type.A))
 		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
+			// The question starts right after the 12-byte header and is never
+			// compressed, so the bytes can be compared directly.
+			check(
+				r,
+				len(res.wire) >= 25 && bytes_equal(res.wire[12:25], query[12:25]),
+				"the answer's question is not the client's byte for byte",
+			)
 			seen := mock_last_query(mock)
 			if check(r, seen != nil, "the upstream saw no query") {
-				// The question starts right after the 12-byte header and is
-				// never compressed, so the bytes can be compared directly.
 				check(
 					r,
-					len(seen) >= 25 && bytes_equal(seen[12:25], query[12:25]),
-					"the question was not forwarded byte for byte",
+					len(seen) >= 25 && bytes_equal(seen[12:25], []u8{7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}),
+					"the question was not forwarded in lower case",
 				)
 			}
 		}

@@ -23,11 +23,11 @@ A NOERROR or NXDOMAIN answer is shared with every follower, which is what the
 cache does with one - and so, with the cache off, only as the rest below is. What else the leader lands with - any other rcode, or the
 upstream giving it nothing after `upstream.attempts` rounds over every server,
 where a lost datagram is retried - is shared only with a follower whose outgoing
-message is the leader's, byte for byte bar the ID, so that what came back is
-about that message rather than about one client's spelling of it. Under the
-DNSSEC rewrite, which writes the whole OPT record, that is most of them; without
-it the payload size and the OPT flags stay the client's, so it is the clients
-that ask alike. A follower given a failure takes the expired entry or SERVFAIL as the
+message is the leader's, byte for byte bar the ID. `upstream_query` builds that
+message from the key and nothing of the client's (issue #423), so it is every
+follower bar one whose query was shaped under different settings - a reload
+that turned validation on or off between the two. A follower given a failure
+takes the expired entry or SERVFAIL as the
 leader did, rather than wait a second full exchange for the same nothing, which
 in an outage is every query in flight held twice as long.
 

@@ -280,25 +280,8 @@ validator_query :: proc(
 ) {
 	s := cast(^Server)ctx
 
-	question := make([]dns.Question, 1, allocator)
-	question[0] = dns.Question {
-		name  = name,
-		type  = type,
-		class = .IN,
-	}
-	additional := make([]dns.Record, 1, allocator)
-	additional[0] = dns.make_opt(UPSTREAM_UDP_SIZE, true)
-
-	q := dns.Message {
-		id         = dns.random_id(),
-		question   = question,
-		additional = additional,
-	}
-	q.flags.rd = true
-	q.flags.cd = true
-
-	asked, _, err := dns.encode_message(q, allocator)
-	if err != .None {
+	asked, built := upstream_query({name = name, type = type, class = .IN}, true, true, allocator)
+	if !built {
 		return nil, false
 	}
 	/*
@@ -406,38 +389,6 @@ report_chain_fetch_failed :: proc(type: dns.Type, name: string, uerr: upstream.E
 	} else {
 		logx.gated_warnf(g, "dnssec: %s %s could not be fetched: %v", dns.type_name(type), shown, uerr)
 	}
-}
-
-/*
-Re-ask the client's question with DO and CD set.
-
-The client's own EDNS options ride along, but the payload size and the DO bit
-are ours. The three an upstream has no business seeing - its cookie, its
-client-subnet option and its keepalive request - are taken back out further
-down, and its transaction ID replaced, once this and the plain forwarding path
-have converged.
-*/
-@(private)
-dnssec_upstream_query :: proc(query: dns.Message, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
-	out := query
-	out.flags.cd = true
-
-	opt := dns.make_opt(UPSTREAM_UDP_SIZE, true)
-	if client_opt, had := dns.find_opt(query); had {
-		opt.data = client_opt.data
-	}
-
-	additional := make([dynamic]dns.Record, 0, len(query.additional) + 1, allocator)
-	for rec in query.additional {
-		if rec.type != .OPT {
-			append(&additional, rec)
-		}
-	}
-	append(&additional, opt)
-	out.additional = additional[:]
-
-	encoded, _, err := dns.encode_message(out, allocator)
-	return encoded, err == .None
 }
 
 /*

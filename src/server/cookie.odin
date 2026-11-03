@@ -25,8 +25,9 @@ clients costs nothing and there is no table for a flood of them to fill. The
 timestamp bounds how long a cookie stays usable if it does leak.
 
 Cookies on the upstream side are a separate matter and are not done here; a
-client's cookie is stripped before its query is forwarded, since it belongs to
-the client and this server, and would fail against anyone else's secret.
+client's cookie is never forwarded - `upstream_query` carries none of the
+client's options - since it belongs to the client and this server, and would
+fail against anyone else's secret.
 */
 
 // Defined with the setting it is read from, so `--check` and startup cannot
