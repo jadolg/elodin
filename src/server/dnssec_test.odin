@@ -649,33 +649,6 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-@(test)
-test_upstream_query_asks_for_signatures :: proc(t: ^testing.T) {
-	query := client_query(false)
-	wire, ok := dnssec_upstream_query(query, context.temp_allocator)
-	testing.expect(t, ok, "the upstream query should build")
-
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, err, dns.Decode_Error.None)
-	testing.expect(t, msg.flags.cd, "CD should be set so the upstream's verdict is not inherited")
-	testing.expect(t, dns.edns_do(msg), "DO should be set so signatures come back")
-	testing.expect_value(t, dns.edns_udp_size(msg), u16(UPSTREAM_UDP_SIZE))
-
-	testing.expect_value(t, len(msg.question), 1)
-	testing.expect_value(t, msg.question[0].name, "www.example.com.")
-	testing.expect_value(t, msg.question[0].type, dns.Type.A)
-
-	/*
-	Nothing is asserted about the transaction ID here on purpose. This procedure
-	leaves it as the client wrote it, and `resolve_query` replaces it with a
-	fresh one once this path and the plain forwarding path have converged - so
-	the ID a client chose surviving this far is expected, and the ID reaching an
-	upstream is what has to be checked. `query_id_test.odin` checks it, through
-	the whole server.
-	*/
-	free_all(context.temp_allocator)
-}
-
 /*
 An answer we did not check ourselves must not claim to have been checked.
 

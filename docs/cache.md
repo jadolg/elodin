@@ -89,11 +89,11 @@ go to the upstream once. The first forwards and the rest wait for it:
   point.
 - **Any other outcome** (another rcode, or no answer from any server after every
   attempt, which gives the expired copy or SERVFAIL) goes only to waiters whose
-  upstream message was byte for byte the first one's, ID aside. Under DNSSEC
-  validation, which rewrites the whole OPT record, most are. Without it the
-  payload size and OPT flags stay the client's, so only clients that ask alike
-  match; different name spellings or EDNS options never do. The rest ask for
-  themselves.
+  upstream message was byte for byte the first one's, ID aside. elodin builds
+  that message from the question alone ([What reaches the
+  upstream](edns.md#what-reaches-the-upstream)), so every waiter matches unless
+  a reload in between changed whether the question is validated (DNSSEC
+  settings, trust anchors, zone routes); those ask for themselves.
 - **A cached refusal** (a DNSSEC failure, or a CNAME into a blocked name) refuses
   the waiters without asking. Exceptions: a list reload during the wait that
   lifted the listing serves the answer; an entry evicted or expired meanwhile

@@ -222,8 +222,10 @@ DNSSEC chain lookup answered this way is a lookup that could not be made.
 
 ## What a forwarded query carries
 
-- The EDNS payload size is the client's figure held between 512 and 1232 bytes
-  (RFC 9715), so no client can have the upstream send it fragmented UDP.
+- The query is elodin's own, built from the question: see [What reaches the
+  upstream](edns.md#what-reaches-the-upstream). Its EDNS payload size is 1232
+  bytes (RFC 9715) whatever the client advertised, so no client can have the
+  upstream send fragmented UDP.
 - On `udp://`, an answer that does not fit comes back truncated and is fetched
   again over TCP. Over streams the figure bounds nothing (RFC 7766 section
   6.2.1.1); an upstream that truncates a stream reply anyway has it passed on as

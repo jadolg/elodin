@@ -59,9 +59,9 @@ cookie that server last issued.
   supporting cookies.
 - A BADCOOKIE reply carries a fresh server cookie, and the query is retried once
   with it.
-- Only queries that already carry an OPT record get a cookie, so elodin never
-  negotiates EDNS for a client that did not. With DNSSEC validation on (the
-  default) every forwarded query carries one.
+- Every forwarded query carries an OPT record of elodin's own (see
+  [What reaches the upstream](#what-reaches-the-upstream)), so every one gets a
+  cookie.
 - DoT and DoH upstreams get none; the certificate already proves more.
 
 Neither side's cookie crosses over: a client's stops at elodin whatever the cookie settings, and an
@@ -85,8 +85,7 @@ only:
   and on UDP the bytes would enlarge the datagrams the [UDP answer
   ceiling](rate-limiting.md#how-large-a-udp-answer-may-be) bounds.
 - A client that did not send the option gets no padding (RFC 7830 §4).
-- Upstream, only queries that already carry an OPT record are padded, as with
-  cookies.
+- Upstream, every forwarded query is padded: each carries an OPT record.
 
 ## Telling a client how long its connection is held
 
@@ -106,5 +105,24 @@ The option is sent only when:
 - `client_timeout` is at least 100ms. Under that the figure rounds to 0, which
   means "close now" (§3.4).
 
-The option is hop-by-hop: a client's is removed from the query before it is
+The option is hop-by-hop, and like every other client option it is not
 forwarded.
+
+## What reaches the upstream
+
+elodin builds the query it forwards from the cache key, not from the client's
+message, so every client asking the same question sends the upstream the same
+bytes, bar the transaction ID:
+
+- the question, with the name in lower case. The answer's question is put back
+  in the client's case.
+- RD set. CD and DO as the client set them; both are set when elodin validates.
+  AD, TC, AA and Z are clear.
+- one OPT record, version 0, with a payload size of 1232 (RFC 9715) whatever
+  the client advertised, and with EDNS even for a client that asked without it.
+  The answer is fitted to the client on the way back, with TC set if it does
+  not fit.
+- no EDNS options of the client's: not its cookie, client subnet (RFC 7871
+  §7.5), keepalive, NSID, padding or any other. The upstream cookie and padding
+  above are elodin's own.
+- no other records, and a fresh random transaction ID (RFC 5452 §9.2).

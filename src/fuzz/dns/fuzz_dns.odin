@@ -192,6 +192,5 @@ edit_in_place :: proc(raw: []u8) {
 	dns.copy_question_case(dns.clone_message_bytes(raw), raw)
 	dns.copy_question_case(dns.clone_message_bytes(raw), raw[len(raw) / 2:])
 	_ = dns.set_edns_udp_size(dns.clone_message_bytes(raw), 1232)
-	_ = dns.clear_edns_extended_rcode(dns.clone_message_bytes(raw))
 	_ = dns.set_edns_version_and_flags(dns.clone_message_bytes(raw), 0, true)
 }

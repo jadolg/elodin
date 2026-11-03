@@ -3,6 +3,7 @@ package itest
 import "core:fmt"
 import "core:strings"
 import "core:time"
+import "elodin:dns"
 
 /*
 Parity: does elodin hand the client what its upstream handed elodin?
@@ -455,29 +456,28 @@ upstream_also_says :: proc(
 		return false
 	}
 	/*
-	Built from the question rather than by flipping a bit in it, because the
-	forwarded query differs from the client's in more than CD.
-	`server.dnssec_upstream_query` puts an OPT record on it carrying DO and
-	`server.UPSTREAM_UDP_SIZE`, whatever the client sent - and DO is as much a
-	part of what a resolver answers from as CD is, which elodin's own cache says
-	out loud by keying on both. The generator sets DO on well under half the
-	queries it makes, so a probe that only set CD would still be asking in the
-	other half about a pool neither side used.
-
-	The client's own options go no further than elodin sends them: the cookie
-	and any ECS are stripped before forwarding, so a probe carrying them would
-	be asking a question this server never asks.
+	Built as `server.upstream_query` builds the forwarded query, because it
+	differs from the client's in more than CD: RD, one OPT record at
+	`server.UPSTREAM_UDP_SIZE` with no options whatever the client sent, and DO
+	and CD forced on when validating - and DO is as much a part of what a
+	resolver answers from as CD is, which elodin's own cache says out loud by
+	keying on both. The generator sets DO on well under half the queries it
+	makes, so a probe that only set CD would still be asking in the other half
+	about a pool neither side used.
 	*/
 	forwarded := q
+	// The name in the key's case: the generator flips it as a 0x20 stub does.
+	forwarded.name = transmute([]u8)dns.name_fold(string(q.name), context.temp_allocator)
+	forwarded.rd = true
+	forwarded.ad = false
+	forwarded.edns = true
+	// `server.UPSTREAM_UDP_SIZE`, which is not this package's to import.
+	forwarded.udp_size = 1232
+	forwarded.version = 0
 	if policy.dnssec_validation {
 		forwarded.cd = true
-		forwarded.edns = true
 		forwarded.do_bit = true
-		// `server.UPSTREAM_UDP_SIZE`, which is not this package's to import.
-		forwarded.udp_size = 1232
 	}
-	// Without validation the question goes out as the client wrote it, less
-	// the same options (`dnssec_upstream_query` is not on that path at all).
 	forwarded.options = nil
 	asked := pg_encode(forwarded, context.temp_allocator)
 	seen := make([dynamic][]u8, 0, 5, context.temp_allocator)

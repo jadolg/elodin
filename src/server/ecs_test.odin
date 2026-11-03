@@ -28,10 +28,8 @@ would have travelled to a public upstream under this server's name (section
 another when it is not, which makes the two halves visible at once - what the
 upstream was told, and which of the two answers the next client is given.
 
-Both ways of building the outgoing query are covered, because they differ:
-`dnssec_upstream_query` rebuilds the message and copies the client's OPT data
-across wholesale, where the plain path forwards the client's bytes as they
-stand.
+Both the validating and the plain path are covered: `upstream_query` builds
+the outgoing query for each, with DO and CD forced on for the first.
 */
 
 // The address the mock serves when it is told a subnet, and the one it serves
@@ -410,7 +408,7 @@ test_a_client_subnet_does_not_survive_the_dnssec_rewrite :: proc(t: ^testing.T) 
 	x := Ecs_Mock{socket = f.socket, name = "cdn.example."}
 	mock := thread.create_and_start_with_poly_data(&x, serve_ecs)
 	// CD is left clear and the validator is in place, so the question is asked
-	// again through `dnssec_upstream_query` rather than forwarded as it stands.
+	// with DO and CD set.
 	handle_query(
 		&f.srv,
 		ecs_query("cdn.example.", {198, 51, 100, 0}, true),
@@ -476,7 +474,8 @@ test_a_client_subnet_is_stripped_from_an_opt_that_is_not_last :: proc(t: ^testin
 
 	decoded, derr := dns.decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
-	testing.expect(t, edns_option_sent(decoded, .Client_Subnet), "the subnet was not noticed at all")
+	_, noticed := dns.find_edns_option(decoded, .Client_Subnet)
+	testing.expect(t, noticed, "the subnet was not noticed at all")
 
 	out, ok := dns.remove_edns_option(wire, .Client_Subnet, context.temp_allocator)
 	if !testing.expect(t, ok, "the strip failed on an OPT that is not last") {
@@ -510,7 +509,8 @@ test_a_repeated_client_subnet_in_one_opt_is_stripped_whole :: proc(t: ^testing.T
 
 	decoded, derr := dns.decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
-	testing.expect(t, edns_option_sent(decoded, .Client_Subnet), "the repeated subnet was not noticed")
+	_, noticed := dns.find_edns_option(decoded, .Client_Subnet)
+	testing.expect(t, noticed, "the repeated subnet was not noticed")
 
 	out, ok := dns.remove_edns_option(wire, .Client_Subnet, context.temp_allocator)
 	if !testing.expect(t, ok, "the strip failed on a repeated option") {
@@ -519,6 +519,5 @@ test_a_repeated_client_subnet_in_one_opt_is_stripped_whole :: proc(t: ^testing.T
 	after, _ := dns.decode_message(out, context.temp_allocator)
 	_, survived := dns.find_edns_option(after, .Client_Subnet)
 	testing.expect(t, !survived, "a second copy of the subnet survived the strip")
-	testing.expect(t, !edns_option_sent(after, .Client_Subnet), "the stripped query still reports a subnet")
 	free_all(context.temp_allocator)
 }

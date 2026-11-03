@@ -404,14 +404,19 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 		}
 		end_case(r)
 
-		start_case(r, "cookies: a query with no EDNS goes upstream without one")
+		start_case(r, "cookies: a query with no EDNS goes upstream with one, and the client gets no OPT")
 		{
-			// Adding an OPT record would negotiate EDNS for a client that never
-			// asked, and change what may come back.
+			// The query upstream is elodin's own, with an OPT record whatever the
+			// client sent (issue #423), so it carries elodin's cookie; the
+			// answer is fitted back to a client that asked without EDNS.
 			res := query_udp(udp_port, build_query("plain.example.", u16(dns.Type.A), id = 0x4247))
 			if check(r, res.ok, "no response") {
 				_, found := find_cookie(r, mock_last_query(mock))
-				check(r, !found, "a cookie was added to a query with no OPT record")
+				check(r, found, "the query upstream carried no cookie")
+				msg, err := dns.decode_message(res.wire, context.temp_allocator)
+				if check(r, err == .None, "cannot decode") {
+					check(r, !dns.edns_present(msg), "a client that asked without EDNS was answered with an OPT record")
+				}
 			}
 		}
 		end_case(r)

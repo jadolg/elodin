@@ -23,8 +23,7 @@ paid again for want of two bytes in a record this server is minting anyway.
 
 A MAY rather than a SHOULD - section 3.3.2 - and RFC 7858 section 3.4 declines
 to require it of DoT at all, so nothing here is a conformance fix. The half that
-is one is in `resolve_query`, where the client's own option is taken back out of
-the query before it is forwarded.
+is one is in `upstream_query`, which forwards none of the client's options.
 */
 
 /*

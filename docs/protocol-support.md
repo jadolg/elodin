@@ -17,12 +17,12 @@ flags that describe this server rather than the data: AA and the reserved Z bit
 are cleared, RA is set, and RD and CD are the client's own (RFC 1035 section
 4.1.1, RFC 4035 section 3.2.2). The AD bit is covered under [DNSSEC](dnssec.md).
 
-Also handled: EDNS0 — the client's OPT record is forwarded upstream so payload
-sizes are negotiated end to end, minus its cookie, its client-subnet option and
-its keepalive request, which all stop here; a query with two OPT records, one
-outside the additional section, one owned by a name other than the root, or one
-whose options cannot be read, is answered FORMERR rather than forwarded, no such
-message being one they can be taken back out of. Then DNS cookies in both
+Also handled: EDNS0 — elodin forwards a query of its own built from the
+question, with an OPT record at 1232 bytes and none of the client's options, and
+fits the answer to the client's payload size on the way back (see [What reaches
+the upstream](edns.md#what-reaches-the-upstream)); a query with two OPT records,
+one outside the additional section, one owned by a name other than the root, or
+one whose options cannot be read, is answered FORMERR. Then DNS cookies in both
 directions, [EDNS(0) padding](edns.md#edns-padding) in both directions on DoT and DoH and
 on neither of the clear transports, the
 [connection idle timeout](edns.md#telling-a-client-how-long-its-connection-is-held) told
@@ -39,7 +39,7 @@ RFC 6761 and RFC 7686 answered here instead of forwarded.
 - TCP, DoT and DoH hold a fiber per connection, capped by `server.max_connections` and per prefix by `server.max_connections_per_prefix` (UDP holds no per-client state); see [sizing](sizing.md#transports).
 - Past what the UDP readers can drain, the kernel drops datagrams before any budget sees them; see [how fast datagrams can be read](connections.md#how-fast-datagrams-can-be-read).
 - The handshake bound is per /24 and /64, and a refusal is cheap rather than free; see [a connection rate limit in front](public-resolver.md#a-connection-rate-limit-in-front).
-- Upstream cookies go only on queries that carry an OPT record, so a non-EDNS client gets none unless DNSSEC validation is on (the default); cookie secrets are never rotated, so a restart costs each peer one round trip. See [DNS cookies](edns.md#dns-cookies).
+- Upstream cookie secrets are never rotated, so a restart costs each peer one round trip. See [DNS cookies](edns.md#dns-cookies).
 - [DDR](doh.md#discovery-by-clients-ddr) designates one name, and clients only use it automatically if the certificate has the Do53 address as an IP SAN, or the server is on a private address that `ddr.name` resolves to. Otherwise point clients at the encrypted listeners by configuration or the [Apple profile](doh.md#apple-devices-ios-ipados-macos).
 - EDNS Client Subnet is not implemented: a client's option is dropped upstream and cannot be forwarded, since the cache is not keyed per network (RFC 7871 section 7.3).
 - No per-client rules, query log database, or web/API surface; statistics go to the [log](logging.md#stats) and [metrics](metrics.md#metrics).
