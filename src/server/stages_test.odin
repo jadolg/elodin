@@ -12,7 +12,7 @@ each hands on what it does not answer.
 An ordinary RD=0 question: `answer_locally` has nothing for it and passes it
 on with the question settled, and `answer_from_cache`, with no cache, refuses
 it at the RD gate (RFC 1035 section 4.1.1) having settled the cache key on the
-way. No upstream is configured, so a stage that forwarded would panic.
+way. `resolve_query`, running the stages in order, hands back that refusal.
 */
 @(test)
 test_stages_hand_on_what_they_do_not_answer :: proc(t: ^testing.T) {
@@ -53,6 +53,10 @@ test_stages_hand_on_what_they_do_not_answer :: proc(t: ^testing.T) {
 	testing.expect(t, st.ok, "the RD gate's refusal was not built")
 	testing.expect_value(t, st.outcome, Outcome.Refused)
 	testing.expect_value(t, dns.peek_rcode(st.response), dns.Rcode.Refused)
+
+	got := resolve_query(&s, wire, msg, .UDP, "127.0.0.1:5555", 512, {}, time.tick_now(), &spent, context.temp_allocator)
+	testing.expect(t, got.ok, "resolve_query built no answer")
+	testing.expect_value(t, got.outcome, Outcome.Refused)
 
 	free_all(context.temp_allocator)
 }

@@ -192,7 +192,7 @@ Refresh :: struct {
 	here instead and the waiter - which does hold the bytes - serves them. The
 	distinction matters: a refusal this server reached on purpose, a Bogus
 	verdict or an answer the chain walk could not read, is not an outage and
-	does not get the fallback. See the `uerr != .None` branch in `resolve_query`.
+	does not get the fallback. See the `uerr != .None` branch in `judge_reply`.
 	*/
 	unanswered: bool,
 }

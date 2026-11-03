@@ -1171,12 +1171,8 @@ Query_State :: struct {
 	// The validator's extended error, which the store keeps with the answer.
 	answer_ede:       u16,
 
-	// The answer, once a stage has one; see `Resolution`.
-	response:         []u8,
-	outcome:          Outcome,
-	ok:               bool,
-	ede:              u16,
-	unanswered:       bool,
+	// The answer, once a stage has one.
+	using result:     Resolution,
 }
 
 /*
@@ -1234,7 +1230,7 @@ resolve_query :: proc(
 		pool      = pool,
 	}
 	resolve_stages(&st)
-	return {st.response, st.outcome, st.ok, st.ede, st.unanswered}
+	return st.result
 }
 
 @(private)
@@ -2109,7 +2105,7 @@ join_flight :: proc(st: ^Query_State) -> bool {
 				/*
 				The upstream gave the leader nothing after every attempt, and would
 				give this query the same - its message is the same bytes - so the
-				failure branch below, without the wait.
+				failure branch in `judge_reply`, without the wait.
 				*/
 				if landed_with.failed && same {
 					sync.atomic_add(&st.s.stats.coalesced, 1)
