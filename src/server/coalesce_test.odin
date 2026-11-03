@@ -263,6 +263,10 @@ run_burst :: proc(
 	cache_stats: ^cache.Stats = nil,
 	// The server's counters once the burst is over.
 	stats: ^Stats = nil,
+	// Lead the burst by hand and land it with this verdict stored, which the
+	// cache does not hold: evicted between the leader's store and its
+	// followers' reads.
+	evicted: Stored_Verdict = .None,
 ) -> int {
 	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
@@ -333,6 +337,13 @@ run_burst :: proc(
 		others     = validating,
 	}
 	mock := thread.create_and_start_with_poly_data(&m, serve_mock)
+	key_buf: [cache.KEY_MAX]u8
+	leader: Flight
+	if evicted != .None {
+		key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
+		joined, _ := flight_join(&srv, key, &leader)
+		testing.expect(t, joined == &leader, "the hand-made leader did not get the flight")
+	}
 	threads: [CLIENTS]^thread.Thread
 	for i in 0 ..< clients_asking {
 		clients[i] = Client {
@@ -348,6 +359,17 @@ run_burst :: proc(
 			}
 			time.sleep(time.Millisecond)
 		}
+	}
+	if evicted != .None {
+		for start := time.tick_now(); waiting_on(&srv) < clients_asking; {
+			if time.tick_since(start) > HOLD_LIMIT {
+				break
+			}
+			time.sleep(time.Millisecond)
+		}
+		testing.expect_value(t, waiting_on(&srv), clients_asking)
+		leader.stored = evicted
+		flight_land(&srv, &leader)
 	}
 	for th in threads[:clients_asking] {
 		thread.join(th)
@@ -711,6 +733,24 @@ test_followers_of_a_cloaked_leader_are_blocked_from_its_verdict :: proc(t: ^test
 	testing.expect_value(t, cs.hits, u64(CLIENTS - 1))
 	testing.expect_value(t, cs.withheld, u64(CLIENTS - 1))
 	testing.expect_value(t, st.coalesced, u64(CLIENTS - 1))
+}
+
+/*
+A leader's stored verdict gone by the time its followers read it - evicted from
+a cache at its bounds - sends them back to the flight table once, where one
+leads the next exchange and the rest follow it, rather than every one of them
+forwarding on its own (issue #428).
+*/
+@(test)
+test_followers_of_an_evicted_verdict_rejoin_the_flight :: proc(t: ^testing.T) {
+	for verdict in ([]Stored_Verdict{.Bogus, .Cloak}) {
+		clients: [CLIENTS]Client
+		queries := run_burst(t, &clients, evicted = verdict)
+		testing.expectf(t, queries == 1, "%v: the upstream saw the question %d times for %d clients, want 1", verdict, queries, CLIENTS)
+		for c, i in clients {
+			testing.expectf(t, c.ok && c.rcode == .No_Error, "%v: client %d: ok=%v rcode=%v", verdict, i, c.ok, c.rcode)
+		}
+	}
 }
 
 /*
