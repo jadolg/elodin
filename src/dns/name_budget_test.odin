@@ -326,7 +326,7 @@ test_a_refused_name_does_not_become_a_raw_record :: proc(t: ^testing.T) {
 /*
 A message this codebase rebuilds still decodes afterwards.
 
-`add_opt_record`, `strip_dnssec_records` and their neighbours all decode a reply
+`rebuild_with_opt`, `strip_dnssec_records` and their neighbours all decode a reply
 and encode it again, and RDLENGTH grows when a compressed RDATA name is written
 back out in full - a two-byte pointer becomes up to 255 octets. A budget that
 counted RDLENGTH would therefore rise on the rebuild, and a reply that decoded

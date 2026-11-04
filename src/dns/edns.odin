@@ -106,7 +106,7 @@ ensure_edns_option :: proc(
 		return out, true
 	}
 
-	// The list is scratch: `add_opt_record` reads it while encoding and keeps
+	// The list is scratch: `add_opt_record` reads it while writing and keeps
 	// nothing, and only the answer comes out of the caller's allocator.
 	options := make([]EDNS_Option, 1, context.temp_allocator)
 	options[0] = EDNS_Option {
@@ -133,10 +133,10 @@ says: the fields in it are set by `set_edns_udp_size` and the option writers
 above, and inventing a second record here would leave two for a reader to
 disagree over.
 
-Fails where a message with no reachable OPT record will not decode, will not
-encode again, or turns out to have one after all - the last of which is the two
-readers disagreeing, and all three of which are a message this server would not
-have got this far with.
+Fails where a message with no reachable OPT record turns out to have one after
+all, which is the two readers disagreeing, or where one that cannot simply be
+appended to will not decode or encode again - see `add_opt_record`. All of these
+are a message this server would not have got this far with.
 */
 ensure_opt :: proc(
 	msg: []u8,
@@ -158,11 +158,28 @@ ensure_opt :: proc(
 
 /*
 Add an OPT record advertising `udp_size` and carrying `options`, to a message
-that has none.
+that has none, by writing it onto the end of the bytes.
 
-The slow path by construction - a record cannot be spliced into a message that
-has nowhere to splice it - so it decodes and encodes again, out of the temp arena
-for the reason `rebuild_edns_option` gives.
+The additional section is the last section of a message and RFC 6891 section
+6.1.1 puts the OPT record there without fixing its place within it, so a record
+appended behind everything else and counted in ARCOUNT is a valid message. Its
+owner is the root and its RDATA an option list, so it holds no name and moves no
+offset a compression pointer could be aimed at, which is what lets the bytes
+ahead of it go out as they arrived: a cache entry or an upstream's reply keeps
+its own compression, and nothing is decoded on the way. This is the path every
+cache hit for an EDNS client takes (issue #598). The one record that has to
+come last in the section is a TSIG (RFC 8945 section 5.1), which this server
+neither sends nor asks for, and the rebuild below puts the record in the same
+place.
+
+Appended only to a message that walks to exactly its last byte with no OPT
+record in its additional section, and whose result fits `MAX_MESSAGE`. Anything
+else goes to `rebuild_with_opt`, which answers it as it always has: a message
+with trailing bytes loses them, one that does not decode fails, one that turns
+out to have an OPT record fails, and one too long to grow is cut by the encoder.
+The size check also covers the two fields that could otherwise wrap: an option
+list longer than RDLENGTH can state, and an ARCOUNT of 65535, which no message
+that walks inside `MAX_MESSAGE` can carry (a record is at least 11 bytes).
 
 DO stays clear, which is the only reading available here: this has the message
 and not the request it answers, and RFC 3225 section 3 makes the bit in a
@@ -174,12 +191,109 @@ for padding, keeps the clear bit this writes; nothing reaches those with the
 answer still lacking an OPT record and room to add one, and if something ever
 does, the copy is the caller's to write there too.
 
-Fails when the message will not decode, will not encode again, or turns out to
-have an OPT record after all - the last of which is the caller's own check
-having failed, and not something to hand back half-changed.
+Fails when the message has an OPT record in its additional section after all -
+the caller's own check having failed, and not something to hand back
+half-changed - or where the rebuild fails.
 */
 @(private)
 add_opt_record :: proc(
+	msg: []u8,
+	udp_size: u16,
+	options: []EDNS_Option,
+	allocator: mem.Allocator,
+	spent: ^int,
+) -> (
+	out: []u8,
+	ok: bool,
+) {
+	end, has_opt := walk_to_end(msg)
+	if has_opt {
+		return nil, false
+	}
+	rdlen := 0
+	for o in options {
+		rdlen += 4 + len(o.data)
+	}
+	// Root owner, TYPE, CLASS, TTL, RDLENGTH.
+	size := len(msg) + 11 + rdlen
+	if end != len(msg) || size > MAX_MESSAGE {
+		return rebuild_with_opt(msg, udp_size, options, allocator, spent)
+	}
+
+	out = make([]u8, size, allocator)
+	copy(out, msg)
+	arcount := int(u16(msg[10]) << 8 | u16(msg[11])) + 1
+	out[10] = u8(arcount >> 8)
+	out[11] = u8(arcount)
+
+	p := len(msg)
+	// The root owner, then TYPE 41. CLASS is the payload size and the TTL -
+	// extended rcode, version and flags - is all zero, which is `make_opt`'s
+	// record with DO clear; `out` is zeroed, so only the set bytes are written.
+	out[p + 2] = u8(Type.OPT)
+	out[p + 3] = u8(udp_size >> 8)
+	out[p + 4] = u8(udp_size)
+	out[p + 9] = u8(rdlen >> 8)
+	out[p + 10] = u8(rdlen)
+	p += 11
+	for o in options {
+		out[p] = u8(o.code >> 8)
+		out[p + 1] = u8(o.code)
+		out[p + 2] = u8(len(o.data) >> 8)
+		out[p + 3] = u8(len(o.data))
+		copy(out[p + 4:], o.data)
+		p += 4 + len(o.data)
+	}
+	return out, true
+}
+
+/*
+Where a walk of every section of `msg` ends, and whether it met an OPT record in
+the additional section on the way. `end` is -1 where the message cannot be walked
+to its end, which `add_opt_record` reads as "not one to append to". An OPT record
+is reported wherever it is reached, so a message that turns out to have one is
+refused however much of it is left.
+*/
+@(private)
+walk_to_end :: proc(msg: []u8) -> (end: int, has_opt: bool) {
+	if len(msg) < HEADER_SIZE {
+		return -1, false
+	}
+	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
+	before := int(u16(msg[6]) << 8 | u16(msg[7])) + int(u16(msg[8]) << 8 | u16(msg[9]))
+	arcount := int(u16(msg[10]) << 8 | u16(msg[11]))
+
+	pos := HEADER_SIZE
+	for _ in 0 ..< qdcount {
+		next, ok := skip_name(msg, pos)
+		if !ok || next + 4 > len(msg) {
+			return -1, false
+		}
+		pos = next + 4
+	}
+	for i in 0 ..< before + arcount {
+		type, next, ok := skip_record(msg, pos)
+		if !ok {
+			return -1, false
+		}
+		if type == .OPT && i >= before {
+			return next, true
+		}
+		pos = next
+	}
+	return pos, false
+}
+
+/*
+The slow path for `add_opt_record`: decode, add the record, encode again, out of
+the temp arena for the reason `rebuild_edns_option` gives. For a message that
+cannot simply be appended to; see there.
+
+Fails when the message will not decode, will not encode again, or turns out to
+have an OPT record after all.
+*/
+@(private)
+rebuild_with_opt :: proc(
 	msg: []u8,
 	udp_size: u16,
 	options: []EDNS_Option,

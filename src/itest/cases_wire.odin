@@ -111,6 +111,30 @@ name_bomb_answer :: proc(query: []u8, allocator := context.allocator) -> []u8 {
 }
 
 @(private = "file")
+FLAT_QNAME :: "flat.wire.test."
+
+// An answer with no OPT record and no name compression, as an upstream that
+// does neither sends one.
+@(private = "file")
+flat_answer :: proc(allocator := context.allocator) -> []u8 {
+	m := dns.Message {
+		question = []dns.Question{{name = FLAT_QNAME, type = .A, class = .IN}},
+		answer   = []dns.Record {
+			{name = FLAT_QNAME, type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {192, 0, 2, 7}}},
+			{name = FLAT_QNAME, type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {192, 0, 2, 8}}},
+		},
+	}
+	m.flags.qr = true
+	m.flags.rd = true
+	m.flags.ra = true
+	wire, _, err := dns.encode_message(m, allocator, compress = false)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+@(private = "file")
 config_passthrough :: proc(udp_port, upstream_port: int) -> string {
 	return fmt.tprintf(
 		`log: {{ level: warn }}
@@ -197,6 +221,14 @@ run_wire_cases :: proc(r: ^Runner) {
 		return
 	}
 	mock_reply(mock, "namebomb.wire.test.", u16(dns.Type.MX), name_bomb)
+
+	flat := flat_answer(context.allocator)
+	defer delete(flat)
+	if flat == nil {
+		skip_case(r, "wire", "cannot build the uncompressed answer")
+		return
+	}
+	mock_reply(mock, FLAT_QNAME, u16(dns.Type.A), flat)
 
 	if !mock_start(mock) {
 		skip_case(r, "wire", "cannot start the mock upstream")
@@ -388,6 +420,38 @@ run_wire_cases :: proc(r: ^Runner) {
 					len(seen) >= 25 && bytes_equal(seen[12:25], []u8{7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}),
 					"the question was not forwarded in lower case",
 				)
+			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "edns: an OPT record minted for an EDNS client is appended to the upstream's bytes")
+	{
+		/*
+		Issue #598. An answer with no OPT record going back to a client that
+		asked with one gets a record minted, and the record is written onto the
+		end of the bytes: everything ahead of it is what the upstream sent. The
+		upstream here writes its names in full, which a decode and re-encode
+		would have compressed - shorter, and not the upstream's bytes. The same
+		`match_client_opt` call serves a cache hit, which is where the decode
+		used to cost every EDNS client.
+		*/
+		query := build_query(FLAT_QNAME, u16(dns.Type.A), edns_size = 1232)
+		res := query_udp(udp_port, query)
+		if check(r, res.ok, "no response") {
+			want := flat
+			want[3] &~= 0x20
+			if check(r, len(res.wire) == len(flat) + 11, "length: got %d, want %d", len(res.wire), len(flat) + 11) {
+				check(
+					r,
+					bytes_equal(res.wire[2:10], want[2:10]) && bytes_equal(res.wire[12:len(flat)], want[12:]),
+					"the bytes ahead of the minted record are not the upstream's",
+				)
+				check_eq_int(r, int(res.wire[11]), int(flat[11]) + 1, "ARCOUNT")
+			}
+			msg, err := dns.decode_message(res.wire, context.temp_allocator)
+			if check(r, err == .None, "the response does not decode: %v", err) {
+				check(r, dns.edns_present(msg), "no OPT record went back to an EDNS client")
 			}
 		}
 	}
