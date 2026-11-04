@@ -1,6 +1,8 @@
 package cache
 
 import "base:runtime"
+import "core:crypto"
+import "core:hash/xxhash"
 import "core:mem"
 import "core:strings"
 import "core:sync"
@@ -186,14 +188,57 @@ Stats :: struct {
 	prefetch_failures: u64,
 }
 
+/*
+One lock's worth of the cache: its own table, its own LRU list, and its own
+share of the limits (issue #582).
+
+Every lookup takes a lock, and with one for the whole cache that lock's line
+moved between cores on every query, so adding loop threads lowered the total
+rate. A key always lands in the same shard (`shard_for`), and two lookups in
+different shards share no line - which is what the alignment is for.
+
+The limits are split, not shared, which is Unbound's slabhash (`msg-cache-slabs`,
+each slab given `maxmem / slabs`): a shard evicts only its own least recently
+used entry, and needs no word with the others to do it. The shares add up to
+exactly `max_entries` and `max_bytes` (`split`), so the bound an operator set is
+still the bound on the whole. What the split gives up is a single LRU order:
+the entry evicted is the oldest of its shard, not of the cache. The shard is
+picked by a keyed hash, so a flood of names lands evenly and the shards fill
+together; nobody outside can aim names at one shard to empty it faster than
+the flood empties the whole cache.
+
+`max_entries` and `max_bytes` are written atomically, under the lock, and read
+by `put` before it takes the lock.
+*/
+Shard :: struct #align(64) {
+	mu:          sync.Mutex,
+	entries:     map[string]^Entry,
+	head, tail:  ^Entry,
+	max_entries: int,
+	max_bytes:   int,
+	// What the entries currently hold, by `entry_bytes`.
+	bytes:       int,
+	// This shard's part of `Stats`; `stats` adds them up.
+	hits:        u64,
+	misses:      u64,
+	inserts:     u64,
+	evictions:   u64,
+}
+
 Cache :: struct {
-	mu:           sync.Mutex,
-	entries:      map[string]^Entry,
-	head, tail:   ^Entry,
+	// Fixed for the life of the cache; see `shard_count`.
+	shards:       []Shard,
+	// log2 of `len(shards)`, for `shard_for`.
+	shard_bits:   uint,
+	// Keys `shard_for`'s hash.
+	seed:         u64,
+	/*
+	The whole cache's limits, as configured; each shard holds its share. The
+	TTLs and flags below are written by `reconfigure` with every shard locked,
+	so a reader holding any one shard's lock sees them settled.
+	*/
 	max_entries:  int,
 	max_bytes:    int,
-	// What the entries currently hold, by `entry_bytes`.
-	bytes:        int,
 	min_ttl:      u32,
 	max_ttl:      u32,
 	negative_ttl: u32,
@@ -202,9 +247,14 @@ Cache :: struct {
 	prefetch:     bool,
 	prefetch_min: time.Duration,
 	// Last number handed to an entry; see `Entry.serial`. Never reset, so an
-	// entry's identity is not reused within the life of the process.
+	// entry's identity is not reused within the life of the process. Atomic:
+	// entries are numbered in every shard.
 	serials:      u64,
 	allocator:    mem.Allocator,
+	/*
+	The counters only callers bump, atomically and outside any shard: `stale`,
+	`withheld`, `prefetches` and `prefetch_failures`. The rest are the shards'.
+	*/
 	stats:        Stats,
 	// Which cache this is, never reused within the process; see `identity`.
 	id:           u64,
@@ -294,19 +344,107 @@ Options :: struct {
 	prefetch_min_ttl: u32,
 }
 
+/*
+How many shards a cache gets, and the least each one is given.
+
+The most a 64-byte line per shard is worth: past the number of loop threads a
+box like this runs, more shards only fragment the budget. Unbound's default is
+four slabs; a power of two either way, so a hash picks one with a shift.
+*/
+MAX_SHARDS :: 16
+/*
+A shard is only worth having if its share is a working cache on its own, so a
+small cache stays one shard and keeps one LRU order, which is all its size
+needs. A few hundred entries keep a shard's eviction close to the whole
+cache's, and the default ten thousand still comes to sixteen shards; a
+megabyte holds the largest entry a response can make (64 KiB of wire plus its
+offsets and TTLs) several times over, so the split never refuses an answer the
+whole budget would have taken.
+*/
+MIN_SHARD_ENTRIES :: 256
+MIN_SHARD_BYTES :: 1024 * 1024
+
+// The largest power of two up to `MAX_SHARDS` that leaves every shard its
+// minimum share of both limits.
+@(private)
+shard_count :: proc(max_entries, max_bytes: int) -> int {
+	n := MAX_SHARDS
+	for n > 1 && (max_entries / n < MIN_SHARD_ENTRIES || max_bytes / n < MIN_SHARD_BYTES) {
+		n /= 2
+	}
+	return n
+}
+
 make_cache :: proc(opts: Options, allocator := context.allocator) -> ^Cache {
 	c := new(Cache, allocator)
 	c.allocator = allocator
 	c.id = sync.atomic_add(&caches_made, 1) + 1
-	apply_options(c, opts)
 	/*
-	Not reserved at `max_entries`: a slot is 32 bytes, so a count raised until
-	`max_bytes` binds - a million is 32 MiB of table - would be paid for in full
-	at startup whether the cache ever filled. It grows in steps as entries arrive
-	and is charged to the budget as it does - see `table_bytes`.
+	Counted from the limits the cache starts with and kept for its life. A
+	reload that changes them changes the shares (`reconfigure`) and not the
+	number: moving every entry to another shard under every lock would stall
+	the whole server for the length of a reload, for a lock that was already
+	enough before it.
 	*/
-	c.entries = make(map[string]^Entry, allocator = allocator)
+	n := shard_count(max(opts.max_entries, 1), opts.max_bytes if opts.max_bytes > 0 else DEFAULT_MAX_BYTES)
+	c.shards = make([]Shard, n, allocator)
+	for n > 1 << c.shard_bits {
+		c.shard_bits += 1
+	}
+	crypto.rand_bytes(mem.ptr_to_bytes(&c.seed))
+	for &s in c.shards {
+		/*
+		Not reserved at `max_entries`: a slot is 32 bytes, so a count raised
+		until `max_bytes` binds - a million is 32 MiB of table - would be paid
+		for in full at startup whether the cache ever filled. It grows in steps
+		as entries arrive and is charged to the budget as it does - see
+		`table_bytes`. Not made at all until the first insert, so an empty
+		cache of sixteen shards holds no tables.
+		*/
+		s.entries.allocator = allocator
+	}
+	apply_options(c, opts)
 	return c
+}
+
+/*
+The shard `key` lives in. The hash is keyed with `Cache.seed`, which is random
+per cache, so which names share a shard is not something a client can work out
+and aim at.
+*/
+@(private)
+shard_for :: proc(c: ^Cache, key: string) -> ^Shard {
+	if c.shard_bits == 0 {
+		return &c.shards[0]
+	}
+	h := xxhash.XXH3_64_with_seed(transmute([]u8)key, c.seed)
+	return &c.shards[h >> (64 - c.shard_bits)]
+}
+
+/*
+Shard `i`'s part of `total` across `n`: the floor, and one more for the first
+`total % n`, so the parts add up to exactly `total`. A part can be zero once a
+reload has set a limit below the number of shards; such a shard stores nothing
+(see `put`), which keeps the whole at the limit rather than at one per shard.
+*/
+@(private)
+split :: proc(total, n, i: int) -> int {
+	return total / n + (1 if i < total % n else 0)
+}
+
+@(private)
+lock_all :: proc(c: ^Cache) {
+	// Always in index order, and only here: no other path holds two at once.
+	for &s in c.shards {
+		sync.mutex_lock(&s.mu)
+	}
+}
+
+@(private)
+unlock_all :: proc(c: ^Cache) {
+	for &s in c.shards {
+		sync.mutex_unlock(&s.mu)
+	}
 }
 
 /*
@@ -333,19 +471,26 @@ reconfigure :: proc(c: ^Cache, opts: Options) {
 	if c == nil {
 		return
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
+	lock_all(c)
+	defer unlock_all(c)
 	apply_options(c, opts)
-	evict_over_limits(c)
-	shrink_table(c)
+	for &s in c.shards {
+		evict_over_limits(c, &s)
+		shrink_table(&s)
+	}
 }
 
+// Every shard is locked, or none is shared yet.
 @(private)
 apply_options :: proc(c: ^Cache, opts: Options) {
 	c.max_entries = max(opts.max_entries, 1)
-	sync.atomic_store(&c.max_bytes, opts.max_bytes if opts.max_bytes > 0 else DEFAULT_MAX_BYTES)
-	// The three lifetimes and the byte budget atomically: `put` reads them
-	// before it takes the lock, and `ttl_ceiling` without it.
+	c.max_bytes = opts.max_bytes if opts.max_bytes > 0 else DEFAULT_MAX_BYTES
+	for &s, i in c.shards {
+		sync.atomic_store(&s.max_entries, split(c.max_entries, len(c.shards), i))
+		sync.atomic_store(&s.max_bytes, split(c.max_bytes, len(c.shards), i))
+	}
+	// The three lifetimes atomically: `put` reads them before it takes a
+	// lock, and `ttl_ceiling` without one.
 	sync.atomic_store(&c.min_ttl, opts.min_ttl)
 	sync.atomic_store(&c.max_ttl, opts.max_ttl if opts.max_ttl > 0 else 86400)
 	sync.atomic_store(&c.negative_ttl, opts.negative_ttl)
@@ -358,10 +503,13 @@ destroy :: proc(c: ^Cache) {
 	if c == nil {
 		return
 	}
-	for _, e in c.entries {
-		free_entry(c, e)
+	for &s in c.shards {
+		for _, e in s.entries {
+			free_entry(c, e)
+		}
+		delete(s.entries)
 	}
-	delete(c.entries)
+	delete(c.shards, c.allocator)
 	free(c, c.allocator)
 }
 
@@ -479,7 +627,8 @@ bytes of: an expired entry it forwards past and reads only if the upstream
 fails, and an entry whose recorded refusal is current (`refused` set, no
 `recheck`) that it refuses from the flags alone, expired or not. Either comes
 back found, with `hit` filled in and `wire` nil. The copy is up to 64 KB taken
-under `c.mu`, so a lookup that throws it away costs every other lookup the wait.
+under the shard's lock, so a lookup that throws it away costs every other
+lookup in that shard the wait.
 */
 get :: proc(
 	c: ^Cache,
@@ -498,22 +647,23 @@ get :: proc(
 	if c == nil {
 		return nil, {}, false
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
+	s := shard_for(c, key)
+	sync.mutex_lock(&s.mu)
+	defer sync.mutex_unlock(&s.mu)
 
-	e, found := c.entries[key]
+	e, found := s.entries[key]
 	if !found {
 		if !probe {
-			c.stats.misses += 1
+			s.misses += 1
 		}
 		return nil, {}, false
 	}
 
 	now := loop.moment_now()
 	if now > deadline(c, e) {
-		remove_entry(c, e)
+		remove_entry(c, s, e)
 		if !probe {
-			c.stats.misses += 1
+			s.misses += 1
 		}
 		return nil, {}, false
 	}
@@ -558,7 +708,7 @@ get :: proc(
 		one package away.
 		*/
 		if !probe {
-			c.stats.misses += 1
+			s.misses += 1
 		}
 		hit.stale = true
 	} else {
@@ -568,7 +718,7 @@ get :: proc(
 			dns.patch_ttls(out, e.ttl_offsets, e.ttls, elapsed, min(c.min_ttl, signature_left(e.signed_until, now)))
 		}
 		if !probe {
-			c.stats.hits += 1
+			s.hits += 1
 		}
 		hit.prefetch = prefetch && claim_prefetch(c, e, now)
 	}
@@ -577,7 +727,7 @@ get :: proc(
 	// is asking for this name, so it is the last thing to drop when the cache
 	// has to make room - and if the upstream for it is down, it is also the only
 	// answer for that name there is.
-	move_to_front(c, e)
+	move_to_front(s, e)
 	return out, hit, true
 }
 
@@ -769,9 +919,10 @@ note_checked :: proc(c: ^Cache, key: string, serial: u64, checked: u64, refused:
 	if c == nil {
 		return
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-	e, found := c.entries[key]
+	s := shard_for(c, key)
+	sync.mutex_lock(&s.mu)
+	defer sync.mutex_unlock(&s.mu)
+	e, found := s.entries[key]
 	if !found || e.serial != serial {
 		return
 	}
@@ -814,10 +965,11 @@ forget :: proc(c: ^Cache, key: string, serial: u64) {
 	if c == nil || serial == 0 {
 		return
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-	if e, found := c.entries[key]; found && e.serial == serial {
-		remove_entry(c, e)
+	s := shard_for(c, key)
+	sync.mutex_lock(&s.mu)
+	defer sync.mutex_unlock(&s.mu)
+	if e, found := s.entries[key]; found && e.serial == serial {
+		remove_entry(c, s, e)
 	}
 }
 
@@ -847,9 +999,7 @@ note_withheld :: proc(c: ^Cache) {
 	if c == nil {
 		return
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-	c.stats.withheld += 1
+	sync.atomic_add(&c.stats.withheld, 1)
 }
 
 /*
@@ -892,7 +1042,7 @@ the one this cache gave the entry, after `min_ttl`, `max_ttl` and
 Never for a verdict, which is looked up only as a probe and whose one minute is
 the point of it. And once per entry: see `Entry.prefetched`.
 
-The caller holds the lock.
+The caller holds the entry's shard's lock.
 */
 @(private)
 claim_prefetch :: proc(c: ^Cache, e: ^Entry, now: loop.Moment) -> bool {
@@ -918,18 +1068,14 @@ note_prefetch :: proc(c: ^Cache) {
 	if c == nil {
 		return
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-	c.stats.prefetches += 1
+	sync.atomic_add(&c.stats.prefetches, 1)
 }
 
 note_prefetch_failed :: proc(c: ^Cache) {
 	if c == nil {
 		return
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-	c.stats.prefetch_failures += 1
+	sync.atomic_add(&c.stats.prefetch_failures, 1)
 }
 
 /*
@@ -947,9 +1093,10 @@ renewed :: proc(c: ^Cache, key: string, serial: u64) -> bool {
 	if c == nil {
 		return false
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-	e, found := c.entries[key]
+	s := shard_for(c, key)
+	sync.mutex_lock(&s.mu)
+	defer sync.mutex_unlock(&s.mu)
+	e, found := s.entries[key]
 	return found && e.serial != serial && !e.prefetched
 }
 
@@ -958,9 +1105,7 @@ note_stale_served :: proc(c: ^Cache) {
 	if c == nil {
 		return
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-	c.stats.stale += 1
+	sync.atomic_add(&c.stats.stale, 1)
 }
 
 /*
@@ -1248,10 +1393,13 @@ thing in both directions.
 	have, so the cache would empty itself for one answer and then drop that too.
 	Nothing an operator can set makes this reachable with real answers: the
 	smallest budget worth configuring is orders of magnitude past the 64 KiB a
-	response can be.
+	response can be. "On its own" is in its shard's share, which `shard_count`
+	keeps at a megabyte or more - or nothing, in a shard a reload left no part
+	of a limit set below the number of shards.
 	*/
 	size := sizeof_entry(key, wire, offsets, ttls)
-	if size > sync.atomic_load(&c.max_bytes) {
+	s := shard_for(c, key)
+	if sync.atomic_load(&s.max_entries) == 0 || size > sync.atomic_load(&s.max_bytes) {
 		delete(offsets, c.allocator)
 		delete(ttls, c.allocator)
 		forget(c, key, stale)
@@ -1281,10 +1429,10 @@ thing in both directions.
 		}
 	}
 
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
+	sync.mutex_lock(&s.mu)
+	defer sync.mutex_unlock(&s.mu)
 
-	if old, exists := c.entries[key]; exists {
+	if old, exists := s.entries[key]; exists {
 		/*
 		A replacement that ends no later than what it replaces inherits a spent
 		prefetch claim. That is what a prefetch gets back from an upstream that
@@ -1299,33 +1447,32 @@ thing in both directions.
 		if old.prefetched && time.Duration(e.expires - old.expires) <= time.Second {
 			e.prefetched = true
 		}
-		remove_entry(c, old)
+		remove_entry(c, s, old)
 	}
-	c.serials += 1
-	e.serial = c.serials
-	c.entries[e.key] = e
-	push_front(c, e)
-	c.bytes += size
-	c.stats.inserts += 1
+	e.serial = sync.atomic_add(&c.serials, 1) + 1
+	s.entries[e.key] = e
+	push_front(s, e)
+	s.bytes += size
+	s.inserts += 1
 
 	// Both bounds, because the count alone is not one: see DEFAULT_MAX_BYTES. The
 	// entry just inserted was refused above if it could not fit by itself, and
 	// is kept here in case the table it just grew is what tips the total over.
-	evict_over_limits(c, e)
+	evict_over_limits(c, s, e)
 	return true
 }
 
-// Evict from the tail until both bounds hold, or `keep` is all that is left.
-// The caller holds `c.mu`.
+// Evict from the shard's tail until both its bounds hold, or `keep` is all that
+// is left. The caller holds `s.mu`.
 @(private)
-evict_over_limits :: proc(c: ^Cache, keep: ^Entry = nil) {
-	for (len(c.entries) > c.max_entries || c.bytes + table_bytes(c) > c.max_bytes) && c.tail != nil && c.tail != keep {
-		remove_entry(c, c.tail)
-		c.stats.evictions += 1
+evict_over_limits :: proc(c: ^Cache, s: ^Shard, keep: ^Entry = nil) {
+	for (len(s.entries) > s.max_entries || s.bytes + table_bytes(s) > s.max_bytes) && s.tail != nil && s.tail != keep {
+		remove_entry(c, s, s.tail)
+		s.evictions += 1
 		// Removing a key never resizes the table, so it is charged at its peak
 		// until it is shrunk. A reload that lowers `max_bytes` below the table
 		// the old budget grew would otherwise evict every entry to pay for it.
-		shrink_table(c)
+		shrink_table(s)
 	}
 }
 
@@ -1339,15 +1486,24 @@ entries can go at once: a sweep, a reload, an eviction that drains it.
 Only once the table is under a quarter full. Odin would halve it below three
 eighths, and that is where a table at the byte budget sits after the doubling
 an insert made and the eviction that paid for it: halved by one sweep, it is
-regrown by the next few inserts, so every sweep would rehash the cache under
-its lock twice and evict to pay for the table again. The caller holds `c.mu`.
+regrown by the next few inserts, so every sweep would rehash the shard under
+its lock twice and evict to pay for the table again. The caller holds `s.mu`.
 */
 @(private)
-shrink_table :: proc(c: ^Cache) {
-	if len(c.entries) * 4 >= cap(c.entries) {
+shrink_table :: proc(s: ^Shard) {
+	if len(s.entries) * 4 >= cap(s.entries) {
 		return
 	}
-	_, _ = shrink(&c.entries)
+	// An empty shard gives the table back whole, which `shrink` would keep at
+	// its smallest: a few hundred bytes, times sixteen shards, for nothing.
+	if len(s.entries) == 0 {
+		allocator := s.entries.allocator
+		delete(s.entries)
+		s.entries = nil
+		s.entries.allocator = allocator
+		return
+	}
+	_, _ = shrink(&s.entries)
 }
 
 // Drop everything, e.g. after a configuration reload.
@@ -1355,15 +1511,17 @@ clear_all :: proc(c: ^Cache) {
 	if c == nil {
 		return
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-	for _, e in c.entries {
-		free_entry(c, e)
+	for &s in c.shards {
+		sync.mutex_lock(&s.mu)
+		for _, e in s.entries {
+			free_entry(c, e)
+		}
+		clear(&s.entries)
+		shrink_table(&s)
+		s.head, s.tail = nil, nil
+		s.bytes = 0
+		sync.mutex_unlock(&s.mu)
 	}
-	clear(&c.entries)
-	shrink_table(c)
-	c.head, c.tail = nil, nil
-	c.bytes = 0
 }
 
 /*
@@ -1381,51 +1539,69 @@ sweep :: proc(c: ^Cache) -> (removed: int) {
 	if c == nil {
 		return 0
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-
-	now := loop.moment_now()
-	e := c.tail
-	for e != nil {
-		prev := e.prev
-		if now > deadline(c, e) {
-			remove_entry(c, e)
-			removed += 1
+	// A shard at a time, so lookups in the others carry on meanwhile.
+	for &s in c.shards {
+		sync.mutex_lock(&s.mu)
+		now := loop.moment_now()
+		e := s.tail
+		for e != nil {
+			prev := e.prev
+			if now > deadline(c, e) {
+				remove_entry(c, &s, e)
+				removed += 1
+			}
+			e = prev
 		}
-		e = prev
+		// Whether or not this sweep removed anything: `get` drops an expired
+		// entry it meets first, and `forget` takes entries too.
+		shrink_table(&s)
+		sync.mutex_unlock(&s.mu)
 	}
-	// Whether or not this sweep removed anything: `get` drops an expired entry
-	// it meets first, and `forget` takes entries too.
-	shrink_table(c)
 	return
 }
 
-len_entries :: proc(c: ^Cache) -> int {
+len_entries :: proc(c: ^Cache) -> (n: int) {
 	if c == nil {
 		return 0
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-	return len(c.entries)
+	for &s in c.shards {
+		sync.mutex_lock(&s.mu)
+		n += len(s.entries)
+		sync.mutex_unlock(&s.mu)
+	}
+	return
 }
 
-// What the entries and the table hold, counted the way the bound counts it.
-bytes_used :: proc(c: ^Cache) -> int {
+// What the entries and the tables hold, counted the way the bound counts it.
+bytes_used :: proc(c: ^Cache) -> (n: int) {
 	if c == nil {
 		return 0
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-	return c.bytes + table_bytes(c)
+	for &s in c.shards {
+		sync.mutex_lock(&s.mu)
+		n += s.bytes + table_bytes(&s)
+		sync.mutex_unlock(&s.mu)
+	}
+	return
 }
 
-stats :: proc(c: ^Cache) -> Stats {
+stats :: proc(c: ^Cache) -> (out: Stats) {
 	if c == nil {
 		return {}
 	}
-	sync.mutex_lock(&c.mu)
-	defer sync.mutex_unlock(&c.mu)
-	return c.stats
+	out.stale = sync.atomic_load(&c.stats.stale)
+	out.withheld = sync.atomic_load(&c.stats.withheld)
+	out.prefetches = sync.atomic_load(&c.stats.prefetches)
+	out.prefetch_failures = sync.atomic_load(&c.stats.prefetch_failures)
+	for &s in c.shards {
+		sync.mutex_lock(&s.mu)
+		out.hits += s.hits
+		out.misses += s.misses
+		out.inserts += s.inserts
+		out.evictions += s.evictions
+		sync.mutex_unlock(&s.mu)
+	}
+	return
 }
 
 // Whole seconds before `signed_until` - an entry's, or a hit's - or no bound
@@ -1455,7 +1631,7 @@ nothing can ever be served from, holding a slot and its bytes against the
 answers that can. Every name somebody breaks for a minute would leave one
 behind.
 
-The caller holds the lock.
+The caller holds the entry's shard's lock.
 */
 @(private)
 deadline :: proc(c: ^Cache, e: ^Entry) -> loop.Moment {
@@ -1499,11 +1675,11 @@ a key, a value and a hash per slot, at most three quarters full - over forty
 bytes an entry, a tenth of what the smallest entries cost.
 */
 @(private)
-table_bytes :: proc(c: ^Cache) -> int {
-	if cap(c.entries) == 0 {
+table_bytes :: proc(s: ^Shard) -> int {
+	if cap(s.entries) == 0 {
 		return 0
 	}
-	return heap_block(int(runtime.map_total_allocation_size_from_value(c.entries)), runtime.MAP_CACHE_LINE_SIZE)
+	return heap_block(int(runtime.map_total_allocation_size_from_value(s.entries)), runtime.MAP_CACHE_LINE_SIZE)
 }
 
 /*
@@ -1540,14 +1716,14 @@ Every removal goes through here. Doing it by hand at each call site
 is how a byte total drifts from what is actually held, and a bound computed from
 a drifting total is not a bound.
 
-The caller holds the lock.
+The caller holds `s.mu`.
 */
 @(private)
-remove_entry :: proc(c: ^Cache, e: ^Entry) {
-	unlink(c, e)
+remove_entry :: proc(c: ^Cache, s: ^Shard, e: ^Entry) {
+	unlink(s, e)
 	// Before `free_entry`, which frees the string the map is keyed on.
-	delete_key(&c.entries, e.key)
-	c.bytes -= entry_bytes(e)
+	delete_key(&s.entries, e.key)
+	s.bytes -= entry_bytes(e)
 	free_entry(c, e)
 }
 
@@ -1561,38 +1737,38 @@ free_entry :: proc(c: ^Cache, e: ^Entry) {
 }
 
 @(private)
-push_front :: proc(c: ^Cache, e: ^Entry) {
+push_front :: proc(s: ^Shard, e: ^Entry) {
 	e.prev = nil
-	e.next = c.head
-	if c.head != nil {
-		c.head.prev = e
+	e.next = s.head
+	if s.head != nil {
+		s.head.prev = e
 	}
-	c.head = e
-	if c.tail == nil {
-		c.tail = e
+	s.head = e
+	if s.tail == nil {
+		s.tail = e
 	}
 }
 
 @(private)
-unlink :: proc(c: ^Cache, e: ^Entry) {
+unlink :: proc(s: ^Shard, e: ^Entry) {
 	if e.prev != nil {
 		e.prev.next = e.next
-	} else if c.head == e {
-		c.head = e.next
+	} else if s.head == e {
+		s.head = e.next
 	}
 	if e.next != nil {
 		e.next.prev = e.prev
-	} else if c.tail == e {
-		c.tail = e.prev
+	} else if s.tail == e {
+		s.tail = e.prev
 	}
 	e.prev, e.next = nil, nil
 }
 
 @(private)
-move_to_front :: proc(c: ^Cache, e: ^Entry) {
-	if c.head == e {
+move_to_front :: proc(s: ^Shard, e: ^Entry) {
+	if s.head == e {
 		return
 	}
-	unlink(c, e)
-	push_front(c, e)
+	unlink(s, e)
+	push_front(s, e)
 }

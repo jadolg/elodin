@@ -83,9 +83,9 @@ test_a_refused_answer_forgets_the_entry_it_supersedes :: proc(t: ^testing.T) {
 		if !testing.expectf(t, put(answers, key, held_wire, held), "%s: the held answer was not stored", c.name) {
 			continue
 		}
-		serial := answers.entries[key].serial
+		serial := answers.shards[0].entries[key].serial
 		if c.tiny {
-			sync.atomic_store(&answers.max_bytes, 1)
+			sync.atomic_store(&answers.shards[0].max_bytes, 1)
 		}
 
 		wire, _, err := dns.encode_message(c.msg, context.temp_allocator)
@@ -94,7 +94,7 @@ test_a_refused_answer_forgets_the_entry_it_supersedes :: proc(t: ^testing.T) {
 			continue
 		}
 		testing.expectf(t, !put(answers, key, wire, msg, supersedes = serial + c.off), "%s: the candidate was stored", c.name)
-		e, found := answers.entries[key]
+		e, found := answers.shards[0].entries[key]
 		if c.forgotten {
 			testing.expectf(t, !found, "%s: the entry it supersedes is still there", c.name)
 		} else {

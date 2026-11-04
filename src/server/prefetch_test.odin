@@ -21,7 +21,7 @@ Move `STALE_NAME`'s entry into the last `left` of a 300-second lifetime.
 age_to :: proc(answers: ^cache.Cache, left: time.Duration) {
 	kb: [cache.KEY_MAX]u8
 	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	if e, found := answers.entries[key]; found {
+	if e, found := answers.shards[0].entries[key]; found {
 		e.expires = loop.moment_add(loop.moment_now(), left)
 		e.inserted = loop.moment_add(e.expires, -300 * time.Second)
 	}

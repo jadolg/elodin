@@ -215,7 +215,7 @@ cache_an_answer :: proc(answers: ^cache.Cache, expired: bool) -> bool {
 		return false
 	}
 	if expired {
-		if e, found := answers.entries[key]; found {
+		if e, found := answers.shards[0].entries[key]; found {
 			e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
 			e.inserted = loop.moment_add(loop.moment_now(), -3600 * time.Second)
 		}
@@ -411,7 +411,7 @@ test_a_stale_copy_is_not_served_past_its_rrsig_after_the_wait :: proc(t: ^testin
 	// Live when `get` reads it, lapsed long before the upstream times out.
 	kb: [cache.KEY_MAX]u8
 	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	if e, found := answers.entries[key]; found {
+	if e, found := answers.shards[0].entries[key]; found {
 		e.signed_until = loop.moment_add(loop.moment_now(), 50 * time.Millisecond)
 	}
 
@@ -472,7 +472,7 @@ test_a_lapsed_stale_copy_waits_for_the_refresh :: proc(t: ^testing.T) {
 	}
 	kb: [cache.KEY_MAX]u8
 	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	if e, found := answers.entries[key]; found {
+	if e, found := answers.shards[0].entries[key]; found {
 		e.signed_until = loop.moment_add(loop.moment_now(), 50 * time.Millisecond)
 	}
 

@@ -133,7 +133,7 @@ test_a_zeroed_ttl_is_still_raised_by_min_ttl :: proc(t: ^testing.T) {
 // what is under test, not the clock that gets there.
 @(private = "file")
 expire_entry :: proc(c: ^Cache, key: string) {
-	if e, found := c.entries[key]; found {
+	if e, found := c.shards[0].entries[key]; found {
 		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
 		e.inserted = loop.moment_add(loop.moment_now(), -3601 * time.Second)
 	}

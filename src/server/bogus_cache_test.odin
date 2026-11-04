@@ -464,7 +464,7 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 	if !testing.expect(t, cache.put(f.answers, f.key, wire, decoded), "the answer was not cached") {
 		return
 	}
-	if e, in_cache := f.answers.entries[f.key]; in_cache {
+	if e, in_cache := f.answers.shards[0].entries[f.key]; in_cache {
 		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
 		e.inserted = loop.moment_add(loop.moment_now(), -3600 * time.Second)
 	} else {
@@ -480,7 +480,7 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 	kept, hit, found := cache.get(f.answers, f.key, context.temp_allocator)
 	if testing.expect(t, found, "the expired answer was dropped when the verdict was written down") {
 		testing.expect(t, hit.stale, "the entry under the question's key is no longer the expired answer")
-		if e, still_there := f.answers.entries[f.key]; still_there {
+		if e, still_there := f.answers.shards[0].entries[f.key]; still_there {
 			testing.expect(t, !e.bogus, "the verdict replaced the answer being kept for an outage")
 		}
 		testing.expect(
@@ -494,7 +494,7 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 	// giving way to the expired answer would have cost.
 	verdict, _, remembered := cache.get(f.answers, f.vkey, context.temp_allocator)
 	if testing.expect(t, remembered, "the verdict was not remembered beside the expired answer") {
-		if e, in_cache := f.answers.entries[f.vkey]; testing.expect(t, in_cache, "the verdict went in elsewhere") {
+		if e, in_cache := f.answers.shards[0].entries[f.vkey]; testing.expect(t, in_cache, "the verdict went in elsewhere") {
 			testing.expect(t, e.bogus, "what is under the verdict key is not a verdict")
 		}
 		testing.expect(t, is_servfail(verdict), "the verdict is not a refusal")

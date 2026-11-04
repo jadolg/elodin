@@ -844,7 +844,7 @@ test_a_refused_answer_is_not_cached_with_the_upstream_ad_bit :: proc(t: ^testing
 
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], "www.brand.example.", .A, .IN, false, false)
-	entry, found := answers.entries[key]
+	entry, found := answers.shards[0].entries[key]
 	if !testing.expect(t, found, "the refused answer was not stored, so nothing can re-walk it later") {
 		return
 	}
