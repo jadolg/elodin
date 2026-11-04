@@ -456,11 +456,6 @@ main :: proc() {
 		os.exit(1)
 	}
 
-	if !logx.init(logx.Level(cfg.log.level), cfg.log.file) {
-		fmt.eprintfln("elodin: cannot open the log file %q, logging to stderr instead", cfg.log.file)
-	}
-	defer logx.shutdown()
-
 	/*
 	Resolved here rather than where it is used, so a name nobody has an account
 	for is a startup error instead of a process that comes up, takes port 53 and
@@ -481,6 +476,32 @@ main :: proc() {
 			os.exit(1)
 		}
 	}
+
+	/*
+	Not under `--check`, which only reads: it would create the file, as root
+	when run with sudo, and the start after it would then find a file it did not
+	make and leave it root's (`logx.init`'s owner). Its lines go to stderr.
+	*/
+	log_file := "" if opts.check_only else cfg.log.file
+	// Only a start that will really drop: root, to an account that is not.
+	log_owner: Maybe(logx.Owner)
+	if privdrop.is_root() && service.uid != 0 {
+		log_owner = logx.Owner{service.uid, service.gid}
+	}
+	if err := logx.init(logx.Level(cfg.log.level), log_file, log_owner); err != nil {
+		fmt.eprintfln(
+			"elodin: cannot open the log file %q (%s)%s, logging to stderr instead",
+			cfg.log.file,
+			os.error_string(err),
+			logx.guard_hint(err),
+		)
+	}
+	if opts.check_only && cfg.log.file != "" {
+		if openable, hint := log_file_openable(cfg.log.file, log_owner != nil); !openable {
+			fmt.eprintfln("elodin: cannot open the log file %q%s; a start would log to stderr instead", cfg.log.file, hint)
+		}
+	}
+	defer logx.shutdown()
 
 	misrouted := route_shaped_rules(&cfg, context.temp_allocator)
 
@@ -621,6 +642,24 @@ main :: proc() {
 	// process-wide and a reload does not move them.
 	dns.set_heavy_decodes(cfg.server.heavy_decodes)
 	run(&cfg, opts, service)
+}
+
+/*
+For `--check`, which opens no log: whether a start could, as this account - the
+file there for appending, or its directory to create one in. A `guarded` start
+refuses what `logx.guard_refuses` names, and `hint` says so only for those.
+*/
+@(private)
+log_file_openable :: proc(path: string, guarded: bool) -> (ok: bool, hint: string) {
+	if guarded && logx.guard_refuses(path) {
+		return false, logx.GUARD_HINT
+	}
+	if os.exists(path) {
+		return privdrop.can_reopen(path, true), ""
+	}
+	parent := os.dir(path)
+	cparent := strings.clone_to_cstring(parent if parent != "" else ".", context.temp_allocator)
+	return posix.access(cparent, {.W_OK, .X_OK}) == .OK, ""
 }
 
 /*
@@ -877,7 +916,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		server.stop_profile_signer(&s)
 	}
 
-	drop_privileges(cfg, service)
+	drop_privileges(cfg, service, opts.config_path)
 
 	logx.eventf(
 		.Info,
@@ -908,12 +947,14 @@ everything from here on is parsing whatever arrives on those sockets. The
 sockets themselves are already open, so the process keeps serving on them
 whoever it becomes.
 
-The blocklist cache goes over first. It is the one path still opened by name
-afterwards - the lists were downloaded above, as root, and a refresh some hours
-later reopens them - so without this the cache would silently stop being
-written the moment its owner changed. Only with blocking on, so a directory
-that is not elodin's - a shared one, named but unused - is not taken over for
-nothing. A reload that turns blocking on later finds it as it is; see
+The blocklist cache goes over first: it is elodin's own output and opened by
+name afterwards - the lists were downloaded above, as root, and a refresh some
+hours later reopens them - so without this the cache would silently stop being
+written the moment its owner changed. A log file this process created was given
+to the account when it was made (`logx.init`). Files that were there already
+are not taken over; `warn_out_of_reach` names those the new account cannot
+open. The cache only with blocking on, so a directory that is not elodin's - a
+shared one, named but unused - is not taken over for nothing. A reload that turns blocking on later finds it as it is; see
 `docs/install.md`.
 
 A drop that was asked for and did not happen ends the process. Carrying on
@@ -921,7 +962,7 @@ would leave it as root while the log said otherwise, which is worse than not
 starting.
 */
 @(private)
-drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity) {
+drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_path: string) {
 	if cfg.server.user == "" {
 		if privdrop.is_root() {
 			logx.warnf(
@@ -949,6 +990,61 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity) {
 		os.exit(1)
 	}
 	logx.infof("running as %s (uid=%d gid=%d)", cfg.server.user, service.uid, service.gid)
+	warn_out_of_reach(cfg, config_path)
+}
+
+/*
+Name each file a SIGHUP opens again by name that the process, now dropped,
+cannot open.
+
+Startup read them as root, so a root-only file - certbot's 0600 key, a 0600
+configuration - works until the first reload and then fails on every one: the
+certificate is never renewed in place, the configuration is never reloaded, the
+log goes on into the file logrotate renamed. Said here, at the start, where the
+operator is looking, rather than at the first reload weeks later. Not an error:
+the process serves correctly as it is, and a reload logs its own failure too.
+
+Lists only with blocking on; one turned on later by a reload says so itself. A
+`file:` list is read again by every rebuild, a scheduled refresh as well as a
+SIGHUP, and one it cannot read has its rules lifted rather than kept (see
+`reload_filters`), so that is what its warning says.
+*/
+@(private)
+warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
+	warn :: proc(cfg: ^config.Config, setting, path, what: string) {
+		logx.warnf("%s: %s cannot open %q, so %s", setting, cfg.server.user, path, what)
+	}
+	if !privdrop.can_reopen(config_path, false) {
+		warn(cfg, "configuration", config_path, "a SIGHUP will not reload the configuration")
+	}
+	// Only a file in use: one that failed at startup is already said, on stderr.
+	if logx.writing_to_file() && !privdrop.can_reopen(cfg.log.file, true) {
+		warn(cfg, "log.file", cfg.log.file, "a SIGHUP will keep logging to the file already open, renamed or not")
+	}
+	tls := [?]struct {
+		name: string,
+		ln:   config.Listener,
+	}{{"dot", cfg.listeners.dot}, {"doh", cfg.listeners.doh}}
+	for l in tls {
+		if !l.ln.enabled {
+			continue
+		}
+		if !privdrop.can_reopen(l.ln.cert_file, false) {
+			warn(cfg, fmt.tprintf("listeners.%s.cert_file", l.name), l.ln.cert_file, "a SIGHUP will keep the certificate loaded now")
+		}
+		if !privdrop.can_reopen(l.ln.key_file, false) {
+			warn(cfg, fmt.tprintf("listeners.%s.key_file", l.name), l.ln.key_file, "a SIGHUP will keep the certificate loaded now")
+		}
+	}
+	if cfg.blocking.enabled {
+		for set in ([?][]config.Block_List{cfg.blocking.lists, cfg.blocking.allow_lists}) {
+			for list in set {
+				if list.enabled && list.file != "" && !privdrop.can_reopen(list.file, false) {
+					warn(cfg, fmt.tprintf("list %s", list.name), list.file, "the next refresh or SIGHUP will drop the rules built from it")
+				}
+			}
+		}
+	}
 }
 
 /*
@@ -1051,10 +1147,10 @@ asks for starts once that is over; see `collect`.
 @(private)
 reload :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m: ^Maintenance) {
 	file := server.live_config(s).log.file
-	reopened := logx.reopen(file)
+	reopen_err := logx.reopen(file)
 	logx.infof("SIGHUP received, reloading the configuration and the TLS certificates")
-	if !reopened {
-		logx.warnf("cannot open the log file %q again; logging where it was", file)
+	if reopen_err != nil {
+		logx.warnf("cannot open the log file %q again (%s)%s; logging where it was", file, os.error_string(reopen_err), logx.guard_hint(reopen_err))
 	}
 
 	out := server.reload_config(s, opts.config_path)

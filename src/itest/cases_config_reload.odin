@@ -6,6 +6,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:sync"
+import "core:sys/posix"
 import "core:thread"
 import "core:time"
 import "elodin:dns"
@@ -278,6 +279,12 @@ run_log_reopen_case :: proc(r: ^Runner, upstream_port: int) {
 	}
 	defer stop_server(&srv)
 
+	// Owner-only, both as the server created it and as the reload did: with
+	// `log.queries` on it names every client.
+	start_case(r, "log: the file is created readable by its owner only")
+	check_log_mode(r, log_file)
+	end_case(r)
+
 	start_case(r, "config reload: SIGHUP opens the log file again after it was rotated away")
 	{
 		rotated := strings.concatenate({log_file, ".1"}, context.temp_allocator)
@@ -292,9 +299,21 @@ run_log_reopen_case :: proc(r: ^Runner, upstream_port: int) {
 				}
 			}
 			check(r, reopened, "nothing was written to the log file's name after the rotation")
+			if reopened {
+				check_log_mode(r, log_file)
+			}
 		}
 	}
 	end_case(r)
+}
+
+@(private = "file")
+check_log_mode :: proc(r: ^Runner, path: string) {
+	st: posix.stat_t
+	if check(r, posix.stat(strings.clone_to_cstring(path, context.temp_allocator), &st) == .OK, "cannot stat the log file") {
+		mode := transmute(u32)st.st_mode & 0o777
+		check(r, mode == 0o600, "the log file is %o, want 600", mode)
+	}
 }
 
 /*

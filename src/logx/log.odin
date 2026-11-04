@@ -4,6 +4,8 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import "core:sys/linux"
+import "core:sys/posix"
 import "core:time"
 
 /*
@@ -24,6 +26,8 @@ State :: struct {
 	level:   Level,
 	file:    ^os.File,
 	to_file: bool,
+	// See `init`.
+	guarded: bool,
 }
 
 @(private)
@@ -34,24 +38,58 @@ state := State {
 /*
 Point logging at a file, or at stderr when `path` is empty.
 
-Returns false if the file cannot be opened, in which case logging stays on
+`owner`: the process is root and will drop to this account, which may own the
+log's directory (the docs allow it). A file `init` creates is given to it at
+once, by descriptor: it is the process's own output, like the blocklist cache,
+and the dropped process has to open its name again after a rotation. At once,
+not at the drop, so a start that fails in between (port 53 taken) leaves a file
+the next start can still use, not a root-owned one it did not create and so
+leaves alone. A file already there is the operator's - possibly a shared system
+log - and keeps its owner (Unbound declines to chown its log file for the same
+reason); `warn_out_of_reach` in main names one the account cannot open.
+
+With an owner, the start is guarded. A process taken over under that account
+could leave a symlink on the path for the next root start to append to - or
+create - whatever file it names, a hard link to append to one of root's, or a
+FIFO to hang it - with no reader, or a reader that stops reading. So a symlink
+on the path is refused, and so is anything at the name but a regular file with
+one link, then and on every reopen. Without a drop there is no such account,
+and a root-owned symlink such as /var/run is followed as before.
+
+Returns the error if the file cannot be opened, in which case logging stays on
 stderr rather than being silently lost.
 */
-init :: proc(level: Level, path: string = "") -> bool {
-	sync.mutex_lock(&state.mu)
-	defer sync.mutex_unlock(&state.mu)
+Owner :: struct {
+	uid: posix.uid_t,
+	gid: posix.gid_t,
+}
 
+init :: proc(level: Level, path: string = "", owner: Maybe(Owner) = nil) -> os.Error {
+	guarded := owner != nil
+	sync.mutex_lock(&state.mu)
 	state.level = level
-	if path == "" {
-		return true
+	sync.atomic_store(&state.guarded, guarded)
+	err: os.Error
+	if path != "" {
+		f: ^os.File
+		created: bool
+		f, created, err = open_log(path, guarded)
+		if err == nil {
+			state.file = f
+			state.to_file = true
+			if o, has := owner.?; has && created {
+				// A failure leaves it root's; see `owner` above.
+				posix.fchown(posix.FD(os.fd(f)), o.uid, o.gid)
+			}
+		}
 	}
-	f, err := os.open(path, {.Write, .Create, .Append}, os.Permissions_Read_All + {.Write_User})
+	sync.mutex_unlock(&state.mu)
+
 	if err != nil {
-		return false
+		return err
 	}
-	state.file = f
-	state.to_file = true
-	return true
+	warn_if_readable(path)
+	return nil
 }
 
 /*
@@ -63,18 +101,18 @@ what logrotate's default `create` arrangement relies on - it renames the file an
 sends the signal, and the process goes on appending to the renamed one until it
 opens the name again.
 
-Returns false, leaving the log where it was, when the file cannot be opened -
+Returns the error, leaving the log where it was, when the file cannot be opened -
 most likely because privileges were dropped after the old one was opened as
-root. Nothing is lost that way, and the caller says so through the log that is
-still working.
+root, or a `guarded` refusal (see `init`). Nothing is lost that way, and the
+caller says so through the log that is still working.
 */
-reopen :: proc(path: string) -> bool {
+reopen :: proc(path: string) -> os.Error {
 	f: ^os.File
 	if path != "" {
 		err: os.Error
-		f, err = os.open(path, {.Write, .Create, .Append}, os.Permissions_Read_All + {.Write_User})
+		f, _, err = open_log(path, sync.atomic_load(&state.guarded))
 		if err != nil {
-			return false
+			return err
 		}
 	}
 
@@ -87,7 +125,241 @@ reopen :: proc(path: string) -> bool {
 	if old != nil {
 		os.close(old)
 	}
-	return true
+	warn_if_readable(path)
+	return nil
+}
+
+/*
+Created readable and writable by its owner only. With `log.queries` on, the file
+names every client and every name it looked up, which is nobody else's business
+on the host; a group that ships the log is given it by the operator (logrotate's
+`create 0640 <user> <group>`), not by default. A file that already exists keeps
+the mode it has; `readable_by_others` says when that mode is too wide.
+
+`created` says the open made the file, which O_EXCL decides in the kernel: a
+file or symlink already at the name fails it and is appended to as it is.
+*/
+@(private)
+open_log :: proc(path: string, guarded: bool) -> (f: ^os.File, created: bool, err: os.Error) {
+	cpath := strings.clone_to_cstring(path, context.temp_allocator)
+	// NOCTTY as `os.open` sets it: a tty named here would otherwise become the
+	// controlling terminal of a session leader such as a systemd service, and
+	// its ^C or hangup would reach the process.
+	base: linux.Open_Flags = {.WRONLY, .APPEND, .CREAT, .CLOEXEC, .NOCTTY}
+	if guarded {
+		// Not to wait at a FIFO for a reader that never comes; cleared below.
+		base += {.NONBLOCK}
+	}
+	owner_only: linux.Mode = {.IRUSR, .IWUSR}
+	fd, errno := open_resolved(cpath, base + {.EXCL}, owner_only, guarded)
+	created = errno == .NONE
+	if !created {
+		if errno != .EEXIST {
+			return nil, false, os.Platform_Error(errno)
+		}
+		// Guarded, not created here: a file removed since the O_EXCL open would
+		// otherwise be made now, as root, by an open that does not hand it over.
+		fd, errno = open_resolved(cpath, base - {.CREAT} if guarded else base, owner_only, guarded)
+		if errno != .NONE {
+			return nil, false, os.Platform_Error(errno)
+		}
+		if guarded {
+			if errno = refused_at_name(fd); errno != .NONE {
+				linux.close(fd)
+				return nil, false, os.Platform_Error(errno)
+			}
+		}
+	}
+	if guarded {
+		if errno = linux.fcntl(fd, linux.F_SETFL, linux.Open_Flags{.APPEND}); errno != .NONE {
+			linux.close(fd)
+			return nil, false, os.Platform_Error(errno)
+		}
+	}
+	// `os.new_file` panics where it cannot name the descriptor through
+	// /proc/self/fd (no /proc in a chroot), which `os.open` returns as an error.
+	first: [1]u8
+	if _, rerr := linux.readlink(fmt.ctprintf("/proc/self/fd/%d", fd), first[:]); rerr != .NONE {
+		linux.close(fd)
+		return nil, false, os.Platform_Error(rerr)
+	}
+	return os.new_file(uintptr(fd), path), created, nil
+}
+
+/*
+`open`, or with `no_symlinks` an `openat2` that refuses a symlink anywhere on
+the path (RESOLVE_NO_SYMLINKS): O_NOFOLLOW alone covers the last component, and
+the account that may own the file's directory may own one above it too. Where
+the kernel predates openat2 (5.6), or a seccomp filter that does not know it
+answers EPERM (older container runtimes' default profiles), it falls back to
+O_NOFOLLOW.
+
+`core:sys/linux`, not `core:sys/posix`: the latter's O_NOFOLLOW is the x86 value
+on every Linux, which on arm64 is O_LARGEFILE - the flag would be silently
+dropped there. It has no openat2 wrapper, hence the system call by hand.
+*/
+@(private)
+open_resolved :: proc(cpath: cstring, flags: linux.Open_Flags, mode: linux.Mode, no_symlinks: bool) -> (linux.Fd, linux.Errno) {
+	if !no_symlinks {
+		return linux.open(cpath, flags, mode)
+	}
+	RESOLVE_NO_SYMLINKS :: 0x04
+	ret := openat2(cpath, flags, mode, RESOLVE_NO_SYMLINKS)
+	if ret == -int(linux.Errno.ENOSYS) || (ret == -int(linux.Errno.EPERM) && !openat2_allowed()) {
+		return linux.open(cpath, flags + {.NOFOLLOW}, mode)
+	}
+	if ret < 0 {
+		return -1, linux.Errno(-ret)
+	}
+	return linux.Fd(ret), .NONE
+}
+
+// The raw system call, which `core:sys/linux` does not wrap: a descriptor, or a
+// negated errno.
+@(private)
+openat2 :: proc(cpath: cstring, flags: linux.Open_Flags, mode: linux.Mode, resolve: u64) -> int {
+	how := struct {
+		flags, mode, resolve: u64,
+	} {
+		flags   = u64(transmute(u32)flags),
+		// openat2 refuses a mode without O_CREAT.
+		mode    = u64(transmute(u32)mode) if .CREAT in flags else 0,
+		resolve = resolve,
+	}
+	return linux.syscall(linux.SYS_openat2, linux.AT_FDCWD, transmute(uintptr)cpath, &how, size_of(how))
+}
+
+/*
+Whether openat2 runs at all here. A seccomp filter written before it refuses it
+with EPERM for every path, "/" included; an EPERM for one path while "/" opens
+is that path's own (a FUSE mount, say) and is not taken as a reason to walk the
+path again with only O_NOFOLLOW, where a directory on it could be swapped for a
+symlink in between.
+*/
+@(private)
+openat2_allowed :: proc() -> bool {
+	ret := openat2("/", {.PATH, .CLOEXEC}, {}, 0)
+	if ret >= 0 {
+		linux.close(linux.Fd(ret))
+		return true
+	}
+	return ret != -int(linux.Errno.EPERM) && ret != -int(linux.Errno.ENOSYS)
+}
+
+/*
+What a guarded open (see `init`) refuses at the name. A hard link is a
+symlink's twin: where fs.protected_hardlinks is off, the account that may own
+the directory can link the name to a file of root's for the start to append to
+(EMLINK). Anything but a regular file or a character device is refused too
+(ENXIO): a FIFO whose reader stops reading would block every line, under the
+log's lock, once its buffer fills.
+*/
+@(private)
+refused_at_name :: proc(fd: linux.Fd) -> linux.Errno {
+	st: linux.Stat
+	if errno := linux.fstat(fd, &st); errno != .NONE {
+		return errno
+	}
+	// A character device (/dev/null, a console) is let through: making one
+	// takes CAP_MKNOD, which the account does not have, and a symlink to one
+	// is refused on the path already.
+	if linux.S_ISCHR(st.mode) {
+		return .NONE
+	}
+	if !linux.S_ISREG(st.mode) {
+		return .ENXIO
+	}
+	if st.nlink > 1 {
+		return .EMLINK
+	}
+	return .NONE
+}
+
+/*
+For `--check`, which creates nothing: whether a `guarded` start (see `init`)
+would refuse `path` - a symlink on the way to it, or at the name what
+`refused_at_name` refuses; when there is no file yet, a symlink on the way to
+its directory.
+*/
+guard_refuses :: proc(path: string) -> bool {
+	probe :: proc(p: string, file: bool) -> linux.Errno {
+		fd, errno := open_resolved(strings.clone_to_cstring(p, context.temp_allocator), {.PATH, .CLOEXEC}, {}, true)
+		if errno != .NONE {
+			return errno
+		}
+		defer linux.close(fd)
+		// The O_NOFOLLOW fallback opens a symlink itself under O_PATH rather
+		// than failing; it is not a regular file, so it is refused here as the
+		// start's open refuses it - at the file only: that start follows a
+		// symlinked directory.
+		return refused_at_name(fd) if file else .NONE
+	}
+	errno := probe(path, true)
+	if errno == .ENOENT {
+		errno = probe(os.dir(path), false)
+	}
+	return is_guard_refusal(os.Platform_Error(errno))
+}
+
+// Said after a log file the guard refused (see `init`), so the errno is not left to explain it.
+GUARD_HINT :: "; started as root with server.user set, a symlink anywhere on its path, a hard-linked file, a FIFO or a socket is refused, see docs/logging.md"
+
+/*
+`GUARD_HINT` when `err`, from `init` or `reopen`, is the guard's refusal: ELOOP
+a symlink, EMLINK a hard link, ENXIO not a regular file. Empty otherwise.
+*/
+guard_hint :: proc(err: os.Error) -> string {
+	return GUARD_HINT if sync.atomic_load(&state.guarded) && is_guard_refusal(err) else ""
+}
+
+@(private)
+is_guard_refusal :: proc(err: os.Error) -> bool {
+	return(
+		err == os.Platform_Error(linux.Errno.ELOOP) ||
+		err == os.Platform_Error(linux.Errno.EMLINK) ||
+		err == os.Platform_Error(linux.Errno.ENXIO) \
+	)
+}
+
+// Whether lines go to a file rather than stderr.
+writing_to_file :: proc() -> bool {
+	sync.mutex_lock(&state.mu)
+	defer sync.mutex_unlock(&state.mu)
+	return state.to_file
+}
+
+/*
+Whether the log file in use can be read by every account on the host: a file
+an older elodin, or someone else, created with a wider mode than `open_log`
+does. False when logging to stderr or when it cannot tell.
+*/
+@(private)
+readable_by_others :: proc() -> bool {
+	sync.mutex_lock(&state.mu)
+	defer sync.mutex_unlock(&state.mu)
+	if !state.to_file {
+		return false
+	}
+	st: posix.stat_t
+	if posix.fstat(posix.FD(os.fd(state.file)), &st) != .OK {
+		return false
+	}
+	// A device such as /dev/null is 0666 by design and holds nothing.
+	return posix.S_ISREG(st.st_mode) && .IROTH in st.st_mode
+}
+
+/*
+A log file `open_log` creates is owner-only, but one already there keeps its
+mode - an upgrade from a release that created it 0644, or logrotate's
+`create 0644`. With `log.queries` on it names every client, so a mode that lets
+every account read it is said at each open rather than changed: the file is the
+operator's. `init` and `reopen` call it once the lock is released.
+*/
+@(private)
+warn_if_readable :: proc(path: string) {
+	if readable_by_others() {
+		warnf("log.file: %q can be read by any account that can reach its directory; 'chmod o-r' it, or set logrotate's create mode", path)
+	}
 }
 
 shutdown :: proc() {

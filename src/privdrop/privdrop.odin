@@ -250,10 +250,12 @@ already :: proc(id: Identity) -> bool {
 /*
 Hand a directory the process keeps writing to over to `id`.
 
-The blocklist cache is the one path still opened by name after the drop: the
-lists are downloaded before the listeners bind, so the files land under whoever
-started the process, and a refresh hours later would then fail on every one of
-them. Ownership moves with the process.
+The blocklist cache is elodin's own output and opened by name after the drop:
+the lists are downloaded before the listeners bind, so the files land under
+whoever started the process, and a refresh hours later would then fail on every
+one of them. Ownership moves with the process; a log file the process creates is
+the account's from the start (`logx.init`). The files an operator names and SIGHUP reads again are
+not taken over; see `can_reopen`.
 
 One level deep, because that is the shape of the directory - a flat set of
 `.list` files - and a recursive chown as root over a path an operator supplied
@@ -283,4 +285,31 @@ hand_over :: proc(path: string, id: Identity) -> bool {
 take :: proc(path: string, id: Identity) -> bool {
 	cpath := strings.clone_to_cstring(path, context.temp_allocator)
 	return posix.lchown(cpath, id.uid, id.gid) == .OK
+}
+
+/*
+Whether the process, as it now is, can open `path` again: for reading, or for
+appending with `write`. Opened for real and closed, not judged from the mode
+bits, so ACLs, groups and a parent directory it cannot search all count.
+
+For after the drop. A SIGHUP reads the configuration, the certificates and
+`file:` lists again by name, and opens the log again, as the account the process
+became - while startup read them as root. Those files belong to the operator (a
+certbot key is root's, 0600) and are shared with whatever else uses them, so
+they are not handed over as the blocklist cache is; the caller says which ones
+are out of reach instead, at startup rather than at the first reload. Not
+created when missing, and O_NONBLOCK so a FIFO named by mistake does not hang
+the start.
+*/
+can_reopen :: proc(path: string, write: bool) -> bool {
+	cpath := strings.clone_to_cstring(path, context.temp_allocator)
+	// NOCTTY as `logx.open_log` sets it: a tty opened here by a session leader
+	// would become its controlling terminal, and closing it does not undo that.
+	flags: posix.O_Flags = {.NONBLOCK, .CLOEXEC, .NOCTTY}
+	fd := posix.open(cpath, flags + ({.WRONLY, .APPEND} if write else {}))
+	if fd < 0 {
+		return false
+	}
+	posix.close(fd)
+	return true
 }

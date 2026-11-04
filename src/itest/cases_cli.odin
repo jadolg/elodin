@@ -260,6 +260,52 @@ run_cli_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	`--check` opens no log file. Run as root it would otherwise create the file
+	as root, and the real start after it would find it already there and leave
+	it root's instead of handing it to `server.user`.
+	*/
+	start_case(r, "cli: --check does not create the log file")
+	{
+		log_path := filepath.join({r.work_dir, "check-nolog.log"}, context.temp_allocator) or_else ""
+		path := filepath.join({r.work_dir, "nolog.yaml"}, context.temp_allocator) or_else ""
+		_ = os.write_entire_file(
+			path,
+			transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", log_path),
+		)
+		res := new_check(r, path, "check-nolog")
+		check(r, res.exit_code == 0, "--check with a log file exited %d: %q", res.exit_code, res.output)
+		check(r, !os.exists(log_path), "--check created the log file")
+		check(r, !strings.contains(res.output, "cannot open the log file"), "--check warned about a log file it can create: %q", res.output)
+
+		// One the start could not open is still said, though nothing is opened.
+		missing := filepath.join({r.work_dir, "no-such-dir", "check.log"}, context.temp_allocator) or_else ""
+		_ = os.write_entire_file(
+			path,
+			transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", missing),
+		)
+		res = new_check(r, path, "check-nolog-dir")
+		check(r, res.exit_code == 0, "--check with a log file in a missing directory exited %d: %q", res.exit_code, res.output)
+		check(r, strings.contains(res.output, "cannot open the log file"), "--check did not say the log file cannot be opened: %q", res.output)
+
+		// Nor in a directory the account cannot write; root writes any.
+		if posix.geteuid() != 0 {
+			ro := filepath.join({r.work_dir, "read-only-dir"}, context.temp_allocator) or_else ""
+			_ = os.make_directory(ro)
+			_ = os.chmod(ro, {.Read_User, .Execute_User})
+			defer _ = os.chmod(ro, {.Read_User, .Write_User, .Execute_User})
+			in_ro := filepath.join({ro, "check.log"}, context.temp_allocator) or_else ""
+			_ = os.write_entire_file(
+				path,
+				transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", in_ro),
+			)
+			res = new_check(r, path, "check-nolog-ro")
+			check(r, res.exit_code == 0, "--check with a log file in a read-only directory exited %d: %q", res.exit_code, res.output)
+			check(r, strings.contains(res.output, "cannot open the log file"), "--check did not say a log file in a read-only directory cannot be created: %q", res.output)
+		}
+	}
+	end_case(r)
+
 	start_case(r, "cli: --check rejects a group with no user")
 	{
 		path := filepath.join({r.work_dir, "groupalone.yaml"}, context.temp_allocator) or_else ""

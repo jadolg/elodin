@@ -1,19 +1,23 @@
 package logx
 
 import "base:runtime"
+import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:sys/linux"
+import "core:sys/posix"
 import "core:testing"
 import "core:unicode/utf8"
 
 /*
-One test proc, on purpose.
+One test proc for the logger's state, on purpose.
 
 The logger is process-wide state - a level, a mutex, one file handle - and the
 test runner gives each `@(test)` proc a thread of its own. Two of them here
 would interleave their lines in the same file and race the level, so everything
-this package has to say is said in sequence below.
+that goes through `init`, `reopen` or the lines is said in sequence below. The
+other tests call `open_log` and the probes alone, which touch no state.
 */
 @(test)
 test_every_line_is_logfmt :: proc(t: ^testing.T) {
@@ -23,6 +27,11 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 	}
 	defer os.remove_all(dir)
 	defer shutdown()
+
+	// Created owner-only, so nobody else reads it; widened by hand, it is said.
+	testing.expect(t, !readable_by_others(), "a log this process created is readable by others")
+	testing.expect(t, os.chmod(path, os.Permissions_Read_All + {.Write_User}) == nil, "cannot widen the log's mode")
+	testing.expect(t, readable_by_others(), "a 0644 log is not reported as readable by others")
 
 	infof("elodin %s starting", "1.2.3")
 	debugf("this one is below the level")
@@ -171,6 +180,145 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, after_stamp(t, lines[19]), "level=info msg=cut")
+
+	// Every reopen says so too - a SIGHUP and a reload that moves `log.file`
+	// alike - since the file opened may not be the one that was checked.
+	testing.expect(t, reopen(path) == nil, "cannot reopen the log")
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 21, "%d lines after the reopen, want 21", len(lines)) {
+		return
+	}
+	testing.expect(t, strings.contains(lines[20], `level=warn msg="log.file:`), "a reopen of a 0644 log did not warn")
+
+	// And so does a start on one, without its caller having to ask.
+	shutdown()
+	testing.expect(t, init(.Info, path) == nil, "cannot open the log again")
+	lines = log_lines(t, path)
+	if !testing.expectf(t, len(lines) == 22, "%d lines after the second start, want 22", len(lines)) {
+		return
+	}
+	testing.expect(t, strings.contains(lines[21], `level=warn msg="log.file:`), "a start on a 0644 log did not warn")
+
+	// A refusal is explained only where the guard is on, and only a refusal.
+	symlinked := os.Platform_Error(linux.Errno.ELOOP)
+	testing.expect_value(t, guard_hint(symlinked), "")
+	shutdown()
+	testing.expect(t, init(.Info, path, Owner{posix.getuid(), posix.getgid()}) == nil, "cannot open the log guarded")
+	testing.expect_value(t, guard_hint(symlinked), GUARD_HINT)
+	testing.expect_value(t, guard_hint(os.Platform_Error(linux.Errno.EACCES)), "")
+}
+
+/*
+The log is created owner-only, whatever the umask lets through: with query
+logging on it names every client. Read back from the kernel, not from what was
+asked for. Uses `open_log` alone, so it shares no state with the test above.
+*/
+@(test)
+test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
+	dir, ok := scratch_dir(t, "elodin-logx-mode-test")
+	if !ok {
+		return
+	}
+	defer os.remove_all(dir)
+	path, _ := filepath.join({dir, "elodin.log"}, context.temp_allocator)
+
+	f, created, err := open_log(path, false)
+	if !testing.expectf(t, err == nil, "cannot open %s: %v", path, err) {
+		return
+	}
+	os.close(f)
+	testing.expect(t, created, "a new log file was not reported as created")
+
+	// Opened again, it is appended to, and not this open's to hand over.
+	again, created_again, err_again := open_log(path, false)
+	if testing.expectf(t, err_again == nil, "cannot open %s again: %v", path, err_again) {
+		os.close(again)
+		testing.expect(t, !created_again, "an existing log file was reported as created")
+	}
+
+	// A symlink at the name is refused when asked to be - what a root start
+	// asks - and the file it names is neither created nor appended to.
+	target, _ := filepath.join({dir, "target"}, context.temp_allocator)
+	link, _ := filepath.join({dir, "link.log"}, context.temp_allocator)
+	if testing.expect(t, os.symlink(target, link) == nil, "cannot make the symlink") {
+		_, _, lerr := open_log(link, true)
+		testing.expect(t, lerr != nil, "a symlinked log was opened with symlinks refused")
+		testing.expect(t, !os.exists(target), "refusing a symlinked log created its target")
+		// `--check` says what the start refuses, and passes what it opens.
+		testing.expect(t, guard_refuses(link), "--check passes a symlinked log")
+		testing.expect(t, !guard_refuses(path), "--check refuses a plain log")
+		missing, _ := filepath.join({dir, "missing.log"}, context.temp_allocator)
+		testing.expect(t, !guard_refuses(missing), "--check refuses a log still to be created")
+		// Nor through a symlinked directory above it, which O_NOFOLLOW alone
+		// would follow.
+		real_dir, _ := filepath.join({dir, "real"}, context.temp_allocator)
+		dir_link, _ := filepath.join({dir, "dirlink"}, context.temp_allocator)
+		through, _ := filepath.join({dir_link, "elodin.log"}, context.temp_allocator)
+		if testing.expect(t, os.make_directory(real_dir) == nil && os.symlink(real_dir, dir_link) == nil, "cannot make the directory symlink") {
+			_, _, derr := open_log(through, true)
+			testing.expect(t, derr != nil, "a log under a symlinked directory was opened with symlinks refused")
+			inside, _ := filepath.join({real_dir, "elodin.log"}, context.temp_allocator)
+			testing.expect(t, !os.exists(inside), "refusing a symlinked directory created the log in its target")
+			testing.expect(t, guard_refuses(through), "--check passes a log to be created under a symlinked directory")
+		}
+
+		// The descriptor a refusing open hands back blocks again: a full pipe
+		// to a shipper would otherwise drop lines.
+		if nf, _, nerr := open_log(path, true); testing.expectf(t, nerr == nil, "cannot open %s refusing symlinks: %v", path, nerr) {
+			fl, _ := linux.fcntl(linux.Fd(os.fd(nf)), linux.F_GETFL)
+			testing.expect(t, .NONBLOCK not_in fl, "the log was left non-blocking")
+			os.close(nf)
+		}
+
+		// openat2 runs here, so a path's own EPERM would not be taken for a
+		// seccomp filter and walked again with only O_NOFOLLOW.
+		testing.expect(t, openat2_allowed(), "openat2 is reported unavailable on a kernel and sandbox that allow it")
+
+		// A character device is let through: the account cannot make one.
+		if nf, _, nerr := open_log("/dev/null", true); testing.expectf(t, nerr == nil, "/dev/null was refused under the guard: %v", nerr) {
+			os.close(nf)
+		}
+		testing.expect(t, !guard_refuses("/dev/null"), "--check refuses /dev/null under the guard")
+
+		// A FIFO with no reader is refused at once rather than waited on.
+		fifo, _ := filepath.join({dir, "fifo.log"}, context.temp_allocator)
+		if testing.expect(t, posix.mkfifo(strings.clone_to_cstring(fifo, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {
+			_, _, ferr := open_log(fifo, true)
+			testing.expect(t, ferr != nil, "a FIFO with no reader was opened")
+			testing.expect(t, guard_refuses(fifo), "--check passes a FIFO")
+
+			// Nor with one: a reader that stops reading would block every line.
+			rd := posix.open(strings.clone_to_cstring(fifo, context.temp_allocator), {.NONBLOCK})
+			if testing.expect(t, rd >= 0, "cannot open the FIFO's read end") {
+				_, _, rerr := open_log(fifo, true)
+				testing.expect(t, rerr != nil, "a FIFO with a reader was opened with the guard on")
+				posix.close(rd)
+			}
+		}
+
+		// Nor a file with a second hard link, the symlink's twin; followed, it
+		// is appended to as before.
+		linked, _ := filepath.join({dir, "linked.log"}, context.temp_allocator)
+		twin, _ := filepath.join({dir, "twin"}, context.temp_allocator)
+		if testing.expect(t, os.write_entire_file(linked, []byte{}) == nil && posix.link(strings.clone_to_cstring(linked, context.temp_allocator), strings.clone_to_cstring(twin, context.temp_allocator)) == .OK, "cannot make the hard link") {
+			_, _, herr := open_log(linked, true)
+			testing.expectf(t, herr == os.Platform_Error(linux.Errno.EMLINK), "a hard-linked log was not refused with symlinks refused: %v", herr)
+			testing.expect(t, guard_refuses(linked), "--check passes a hard-linked log")
+			if hf, _, hferr := open_log(linked, false); testing.expectf(t, hferr == nil, "a hard-linked log was refused when links are followed: %v", hferr) {
+				os.close(hf)
+			}
+		}
+
+		lf, _, ferr := open_log(link, false)
+		if testing.expectf(t, ferr == nil, "a symlinked log was refused when symlinks are followed: %v", ferr) {
+			os.close(lf)
+		}
+	}
+	st: posix.stat_t
+	if !testing.expect(t, posix.stat(strings.clone_to_cstring(path, context.temp_allocator), &st) == .OK, "cannot stat the log") {
+		return
+	}
+	testing.expectf(t, transmute(u32)st.st_mode & 0o777 == 0o600, "the log was created %o, want 600", transmute(u32)st.st_mode & 0o777)
 }
 
 // An allocator with nothing to give, as a fiber's scratch is once the OS will
@@ -200,24 +348,36 @@ refusing_allocator :: proc() -> runtime.Allocator {
 
 @(private = "file")
 open_scratch_log :: proc(t: ^testing.T) -> (dir: string, path: string, ok: bool) {
-	tmp, terr := os.temp_directory(context.temp_allocator)
-	if terr != nil {
-		testing.expectf(t, false, "no temporary directory: %v", terr)
-		return
-	}
-	dir, _ = filepath.join({tmp, "elodin-logx-test"}, context.temp_allocator)
-	os.remove_all(dir)
-	if err := os.make_directory(dir); err != nil {
-		testing.expectf(t, false, "cannot create %s: %v", dir, err)
-		return
-	}
+	dir = scratch_dir(t, "elodin-logx-test") or_return
 	path, _ = filepath.join({dir, "elodin.log"}, context.temp_allocator)
-	if !init(.Info, path) {
+	if init(.Info, path) != nil {
 		testing.expectf(t, false, "cannot open %s for logging", path)
 		os.remove_all(dir)
 		return
 	}
 	return dir, path, true
+}
+
+// The pid keeps a run in another checkout from removing this one's files.
+@(private = "file")
+scratch_dir :: proc(t: ^testing.T, name: string) -> (dir: string, ok: bool) {
+	tmp, terr := os.temp_directory(context.temp_allocator)
+	if terr != nil {
+		testing.expectf(t, false, "no temporary directory: %v", terr)
+		return
+	}
+	// Resolved: the guarded opens refuse a symlink anywhere on the path, and
+	// $TMPDIR may hold one.
+	if real, rerr := os.get_absolute_path(tmp, context.temp_allocator); rerr == nil {
+		tmp = real
+	}
+	dir, _ = filepath.join({tmp, fmt.tprintf("%s-%d", name, posix.getpid())}, context.temp_allocator)
+	os.remove_all(dir)
+	if err := os.make_directory(dir); err != nil {
+		testing.expectf(t, false, "cannot create %s: %v", dir, err)
+		return
+	}
+	return dir, true
 }
 
 @(private = "file")

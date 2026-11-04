@@ -18,6 +18,27 @@ sentence in `msg`. In Loki, `| logfmt` is all it takes:
 {job="elodin"} | logfmt | msg="stats" | unwrap cache_hits
 ```
 
+With `log.file` set, elodin creates the file readable and writable by its
+owner only (`0600`), since with `log.queries` on it names every client and every
+name looked up. A file that already exists keeps its mode, so a shipper's group
+is given access the usual way, e.g. logrotate's `create 0640 elodin adm`; one
+with the other-read bit set is named in a `warn` at startup and at each reopen
+(`log.file: "..." can be read by any account that can reach its directory`).
+
+Under `server.user` the file is opened again on `SIGHUP` as that account
+([Privileges](install.md#privileges)). A file elodin creates at startup is given
+to that account as it is made; one that was there already is left as it is, and
+the account must be able to write it. After a rotation the name must be
+creatable by the account too, so give logrotate `create <mode> <user> <group>`
+naming it, or a directory it can write. Started as root with `server.user` set,
+elodin refuses a `log.file` with a symlink anywhere on its path, a file with
+more than one hard link, or anything but a regular file or a character device
+(`/dev/null` is fine; a FIFO is not), and logs to stderr instead (`--check` says
+so too): a directory the service account can write would otherwise let it point
+the next root start at any file, or hang it. Name the real path (`/run/...`, not
+`/var/run/...`). On kernels before 5.6, or under a seccomp profile that does not
+allow `openat2`, only a symlink at the file itself is refused.
+
 With `log.file` set, each line is one write to the file, not followed by a
 sync: `tail` and a shipper see it at once and a killed process loses none of
 it, but a host crash or power loss can lose the last lines the kernel had not
