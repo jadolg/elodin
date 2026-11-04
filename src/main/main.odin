@@ -485,7 +485,7 @@ main :: proc() {
 	log_file := "" if opts.check_only else cfg.log.file
 	// Only a start that will really drop: root, to an account that is not.
 	log_owner: Maybe(logx.Owner)
-	if privdrop.is_root() && cfg.server.user != "" && service.uid != 0 {
+	if privdrop.is_root() && service.uid != 0 {
 		log_owner = logx.Owner{service.uid, service.gid}
 	}
 	if err := logx.init(logx.Level(cfg.log.level), log_file, log_owner); err != nil {

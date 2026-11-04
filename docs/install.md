@@ -106,8 +106,8 @@ root; the first arrangement avoids it.
 
 The files a [`SIGHUP`](#signals) opens again by name are opened as that account,
 not as root: the configuration file, the DoT/DoH `cert_file` and `key_file`,
-`file:` lists and `log.file` (for writing; a log file elodin itself created
-changes owner with the process, see [Logs](logging.md)). Startup reads them as root, so a
+`file:` lists and `log.file` (for writing; a log file elodin creates is
+given to the account as it is made, see [Logs](logging.md)). Startup reads them as root, so a
 root-only file — certbot's `privkey.pem` is root's and `0600` — starts fine and
 then fails at every reload: the certificate is not renewed in place, and the
 listener goes on serving the old one until it expires. A `file:` list is read

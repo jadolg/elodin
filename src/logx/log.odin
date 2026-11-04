@@ -140,18 +140,18 @@ the mode it has; `readable_by_others` says when that mode is too wide.
 file or symlink already at the name fails it and is appended to as it is.
 */
 @(private)
-open_log :: proc(path: string, no_follow: bool) -> (f: ^os.File, created: bool, err: os.Error) {
+open_log :: proc(path: string, guarded: bool) -> (f: ^os.File, created: bool, err: os.Error) {
 	cpath := strings.clone_to_cstring(path, context.temp_allocator)
 	// NOCTTY as `os.open` sets it: a tty named here would otherwise become the
 	// controlling terminal of a session leader such as a systemd service, and
 	// its ^C or hangup would reach the process.
 	base: linux.Open_Flags = {.WRONLY, .APPEND, .CREAT, .CLOEXEC, .NOCTTY}
-	if no_follow {
+	if guarded {
 		// Not to wait at a FIFO for a reader that never comes; cleared below.
 		base += {.NONBLOCK}
 	}
 	owner_only: linux.Mode = {.IRUSR, .IWUSR}
-	fd, errno := open_resolved(cpath, base + {.EXCL}, owner_only, no_follow)
+	fd, errno := open_resolved(cpath, base + {.EXCL}, owner_only, guarded)
 	created = errno == .NONE
 	if !created {
 		if errno != .EEXIST {
@@ -159,18 +159,18 @@ open_log :: proc(path: string, no_follow: bool) -> (f: ^os.File, created: bool, 
 		}
 		// Guarded, not created here: a file removed since the O_EXCL open would
 		// otherwise be made now, as root, by an open that does not hand it over.
-		fd, errno = open_resolved(cpath, base - {.CREAT} if no_follow else base, owner_only, no_follow)
+		fd, errno = open_resolved(cpath, base - {.CREAT} if guarded else base, owner_only, guarded)
 		if errno != .NONE {
 			return nil, false, os.Platform_Error(errno)
 		}
-		if no_follow {
+		if guarded {
 			if errno = refused_at_name(fd); errno != .NONE {
 				linux.close(fd)
 				return nil, false, os.Platform_Error(errno)
 			}
 		}
 	}
-	if no_follow {
+	if guarded {
 		if errno = linux.fcntl(fd, linux.F_SETFL, linux.Open_Flags{.APPEND}); errno != .NONE {
 			linux.close(fd)
 			return nil, false, os.Platform_Error(errno)
@@ -250,15 +250,21 @@ openat2_allowed :: proc() -> bool {
 What a guarded open (see `init`) refuses at the name. A hard link is a
 symlink's twin: where fs.protected_hardlinks is off, the account that may own
 the directory can link the name to a file of root's for the start to append to
-(EMLINK). Anything but a regular file is refused too (ENXIO): a FIFO whose
-reader stops reading would block every line, under the log's lock, once its
-buffer fills.
+(EMLINK). Anything but a regular file or a character device is refused too
+(ENXIO): a FIFO whose reader stops reading would block every line, under the
+log's lock, once its buffer fills.
 */
 @(private)
 refused_at_name :: proc(fd: linux.Fd) -> linux.Errno {
 	st: linux.Stat
 	if errno := linux.fstat(fd, &st); errno != .NONE {
 		return errno
+	}
+	// A character device (/dev/null, a console) is let through: making one
+	// takes CAP_MKNOD, which the account does not have, and a symlink to one
+	// is refused on the path already.
+	if linux.S_ISCHR(st.mode) {
+		return .NONE
 	}
 	if !linux.S_ISREG(st.mode) {
 		return .ENXIO
@@ -271,7 +277,7 @@ refused_at_name :: proc(fd: linux.Fd) -> linux.Errno {
 
 /*
 For `--check`, which creates nothing: whether a `guarded` start (see `init`)
-would refuse `path` - a symlink on the way to it, or at the name anything
+would refuse `path` - a symlink on the way to it, or at the name what
 `refused_at_name` refuses; when there is no file yet, a symlink on the way to
 its directory.
 */
@@ -296,7 +302,7 @@ guard_refuses :: proc(path: string) -> bool {
 }
 
 // Said after a log file the guard refused (see `init`), so the errno is not left to explain it.
-GUARD_HINT :: "; started as root with server.user set, a symlink anywhere on its path, a hard-linked file or anything but a regular file is refused, see docs/logging.md"
+GUARD_HINT :: "; started as root with server.user set, a symlink anywhere on its path, a hard-linked file, a FIFO or a socket is refused, see docs/logging.md"
 
 /*
 `GUARD_HINT` when `err`, from `init` or `reopen`, is the guard's refusal: ELOOP

@@ -274,6 +274,12 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 		// seccomp filter and walked again with only O_NOFOLLOW.
 		testing.expect(t, openat2_allowed(), "openat2 is reported unavailable on a kernel and sandbox that allow it")
 
+		// A character device is let through: the account cannot make one.
+		if nf, _, nerr := open_log("/dev/null", true); testing.expectf(t, nerr == nil, "/dev/null was refused under the guard: %v", nerr) {
+			os.close(nf)
+		}
+		testing.expect(t, !guard_refuses("/dev/null"), "--check refuses /dev/null under the guard")
+
 		// A FIFO with no reader is refused at once rather than waited on.
 		fifo, _ := filepath.join({dir, "fifo.log"}, context.temp_allocator)
 		if testing.expect(t, posix.mkfifo(strings.clone_to_cstring(fifo, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {
@@ -359,6 +365,11 @@ scratch_dir :: proc(t: ^testing.T, name: string) -> (dir: string, ok: bool) {
 	if terr != nil {
 		testing.expectf(t, false, "no temporary directory: %v", terr)
 		return
+	}
+	// Resolved: the guarded opens refuse a symlink anywhere on the path, and
+	// $TMPDIR may hold one.
+	if real, rerr := os.get_absolute_path(tmp, context.temp_allocator); rerr == nil {
+		tmp = real
 	}
 	dir, _ = filepath.join({tmp, fmt.tprintf("%s-%d", name, posix.getpid())}, context.temp_allocator)
 	os.remove_all(dir)
