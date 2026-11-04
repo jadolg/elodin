@@ -44,7 +44,8 @@ parity (see cases_parity.odin):
                           and passing it back reproduces that run exactly
       --parity-upstream <host:port>
                           compare against this resolver rather than against a
-                          synthetic upstream. Needs the network
+                          synthetic upstream. Needs the network, and refuses
+                          to run on a clock chronyc puts over a minute off
       --parity-scenario <name|all>
                           the configuration to compare under (default
                           baseline, or live with --parity-upstream); all runs
@@ -322,6 +323,9 @@ main :: proc() {
 	// seed to reach.
 	section(&r, "response parity: shapes a run found")
 	run_parity_fixed_cases(&r)
+
+	section(&r, "response parity: the live run's clock check")
+	run_parity_clock_cases(&r)
 
 	elapsed := time.diff(started, time.now())
 	report(&r, elapsed)
