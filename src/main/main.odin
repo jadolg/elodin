@@ -458,31 +458,6 @@ main :: proc() {
 	}
 
 	/*
-	Not under `--check`, which only reads: it would create the file, as root
-	when run with sudo, and the start after it would then find a file it did not
-	make and leave it root's (`logx.hand_over`). Its lines go to stderr.
-	*/
-	log_file := "" if opts.check_only else cfg.log.file
-	log_guarded := privdrop.is_root() && cfg.server.user != ""
-	if err := logx.init(logx.Level(cfg.log.level), log_file, log_guarded); err != nil {
-		fmt.eprintfln(
-			"elodin: cannot open the log file %q (%s)%s, logging to stderr instead",
-			cfg.log.file,
-			os.error_string(err),
-			// ELOOP is a symlink refused, ENXIO a FIFO with no reader.
-			LOG_GUARDED_HINT if log_guarded && (err == os.Platform_Error(linux.Errno.ELOOP) || err == os.Platform_Error(linux.Errno.ENXIO)) else "",
-		)
-	}
-	if opts.check_only && cfg.log.file != "" && !log_file_openable(cfg.log.file, log_guarded) {
-		fmt.eprintfln(
-			"elodin: cannot open the log file %q%s; a start would log to stderr instead",
-			cfg.log.file,
-			LOG_GUARDED_HINT if log_guarded else "",
-		)
-	}
-	defer logx.shutdown()
-
-	/*
 	Resolved here rather than where it is used, so a name nobody has an account
 	for is a startup error instead of a process that comes up, takes port 53 and
 	only then finds it has nowhere to go. It also puts the account under
@@ -502,6 +477,34 @@ main :: proc() {
 			os.exit(1)
 		}
 	}
+
+	/*
+	Not under `--check`, which only reads: it would create the file, as root
+	when run with sudo, and the start after it would then find a file it did not
+	make and leave it root's (`logx.init`'s owner). Its lines go to stderr.
+	*/
+	log_file := "" if opts.check_only else cfg.log.file
+	// Only a start that will really drop: root, to an account that is not.
+	log_owner: Maybe(logx.Owner)
+	if privdrop.is_root() && cfg.server.user != "" && service.uid != 0 {
+		log_owner = logx.Owner{service.uid, service.gid}
+	}
+	log_guarded := log_owner != nil
+	if err := logx.init(logx.Level(cfg.log.level), log_file, log_owner); err != nil {
+		fmt.eprintfln(
+			"elodin: cannot open the log file %q (%s)%s, logging to stderr instead",
+			cfg.log.file,
+			os.error_string(err),
+			// ELOOP is a symlink refused, ENXIO a FIFO with no reader.
+			LOG_GUARDED_HINT if log_guarded && (err == os.Platform_Error(linux.Errno.ELOOP) || err == os.Platform_Error(linux.Errno.ENXIO)) else "",
+		)
+	}
+	if opts.check_only && cfg.log.file != "" {
+		if openable, hint := log_file_openable(cfg.log.file, log_guarded); !openable {
+			fmt.eprintfln("elodin: cannot open the log file %q%s; a start would log to stderr instead", cfg.log.file, hint)
+		}
+	}
+	defer logx.shutdown()
 
 	misrouted := route_shaped_rules(&cfg, context.temp_allocator)
 
@@ -652,19 +655,24 @@ LOG_GUARDED_HINT :: "; started as root with server.user set, a symlink anywhere 
 /*
 For `--check`, which opens no log: whether a start could, as this account - the
 file there for appending, or its directory to create one in. A `guarded` start
-refuses a symlink on the path (`logx.symlink_refused`).
+refuses a symlink on the path (`logx.symlink_refused`) and a FIFO nothing reads,
+and `hint` says so only for those.
 */
 @(private)
-log_file_openable :: proc(path: string, guarded: bool) -> bool {
+log_file_openable :: proc(path: string, guarded: bool) -> (ok: bool, hint: string) {
 	if guarded && logx.symlink_refused(path) {
-		return false
+		return false, LOG_GUARDED_HINT
 	}
 	if os.exists(path) {
-		return privdrop.can_reopen(path, true)
+		if privdrop.can_reopen(path, true) {
+			return true, ""
+		}
+		// ENXIO, from the open `can_reopen` failed: a FIFO with no reader.
+		return false, LOG_GUARDED_HINT if guarded && posix.errno() == .ENXIO else ""
 	}
 	parent := os.dir(path)
 	cparent := strings.clone_to_cstring(parent if parent != "" else ".", context.temp_allocator)
-	return posix.access(cparent, {.W_OK, .X_OK}) == .OK
+	return posix.access(cparent, {.W_OK, .X_OK}) == .OK, ""
 }
 
 /*
@@ -952,11 +960,11 @@ everything from here on is parsing whatever arrives on those sockets. The
 sockets themselves are already open, so the process keeps serving on them
 whoever it becomes.
 
-The blocklist cache goes over first, then a log file this process created
-(`logx.hand_over`): both are elodin's own output and opened by name afterwards -
-the lists were downloaded above, as root, and a refresh some hours later reopens
-them - so without this the cache would silently stop being written the moment
-its owner changed. Files that were there already are not taken over;
+The blocklist cache goes over first: it is elodin's own output and opened by
+name afterwards - the lists were downloaded above, as root, and a refresh some
+hours later reopens them - so without this the cache would silently stop being
+written the moment its owner changed. A log file this process created was given
+to the account when it was made (`logx.init`). Files that were there already are not taken over;
 `warn_out_of_reach` names those the new account cannot open. The cache only with
 blocking on, so a directory
 that is not elodin's - a shared one, named but unused - is not taken over for
@@ -989,13 +997,6 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 				cfg.server.user,
 			)
 		}
-	}
-
-	// Only root can give a file away; an account that is neither root nor the
-	// service fails at `apply` below. One that stays root's is named by
-	// `warn_out_of_reach`, since the service account cannot open it.
-	if privdrop.is_root() {
-		logx.hand_over(service.uid, service.gid)
 	}
 
 	if err := privdrop.apply(service); err != .None {
@@ -1160,10 +1161,10 @@ asks for starts once that is over; see `collect`.
 @(private)
 reload :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m: ^Maintenance) {
 	file := server.live_config(s).log.file
-	reopened := logx.reopen(file)
+	reopen_err := logx.reopen(file)
 	logx.infof("SIGHUP received, reloading the configuration and the TLS certificates")
-	if !reopened {
-		logx.warnf("cannot open the log file %q again; logging where it was", file)
+	if reopen_err != nil {
+		logx.warnf("cannot open the log file %q again (%s); logging where it was", file, os.error_string(reopen_err))
 	}
 
 	out := server.reload_config(s, opts.config_path)

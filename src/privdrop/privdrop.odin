@@ -303,7 +303,9 @@ the start.
 */
 can_reopen :: proc(path: string, write: bool) -> bool {
 	cpath := strings.clone_to_cstring(path, context.temp_allocator)
-	flags: posix.O_Flags = {.NONBLOCK, .CLOEXEC}
+	// NOCTTY as `logx.open_log` sets it: a tty opened here by a session leader
+	// would become its controlling terminal, and closing it does not undo that.
+	flags: posix.O_Flags = {.NONBLOCK, .CLOEXEC, .NOCTTY}
 	fd := posix.open(cpath, flags + ({.WRONLY, .APPEND} if write else {}))
 	if fd < 0 {
 		return false

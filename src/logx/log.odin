@@ -26,9 +26,6 @@ State :: struct {
 	level:   Level,
 	file:    ^os.File,
 	to_file: bool,
-	// This process created `file` rather than appending to one already there;
-	// see `hand_over`.
-	created: bool,
 	// See `init`.
 	guarded: bool,
 }
@@ -41,8 +38,17 @@ state := State {
 /*
 Point logging at a file, or at stderr when `path` is empty.
 
-`guarded`: the process is root and will drop to an account that may own the
-log's directory (the docs allow it). A process taken over under that account
+`owner`: the process is root and will drop to this account, which may own the
+log's directory (the docs allow it). A file `init` creates is given to it at
+once, by descriptor: it is the process's own output, like the blocklist cache,
+and the dropped process has to open its name again after a rotation. At once,
+not at the drop, so a start that fails in between (port 53 taken) leaves a file
+the next start can still use, not a root-owned one it did not create and so
+leaves alone. A file already there is the operator's - possibly a shared system
+log - and keeps its owner (Unbound declines to chown its log file for the same
+reason); `warn_out_of_reach` in main names one the account cannot open.
+
+With an owner, the start is guarded. A process taken over under that account
 could leave a symlink on the path for the next root start to append to - or
 create - whatever file it names, or a FIFO to hang it, so both are refused, then
 and on every reopen. Without a drop there is no such account, and a root-owned
@@ -51,7 +57,13 @@ symlink such as /var/run is followed as before.
 Returns the error if the file cannot be opened, in which case logging stays on
 stderr rather than being silently lost.
 */
-init :: proc(level: Level, path: string = "", guarded := false) -> os.Error {
+Owner :: struct {
+	uid: posix.uid_t,
+	gid: posix.gid_t,
+}
+
+init :: proc(level: Level, path: string = "", owner: Maybe(Owner) = nil) -> os.Error {
+	guarded := owner != nil
 	sync.mutex_lock(&state.mu)
 	state.level = level
 	sync.atomic_store(&state.guarded, guarded)
@@ -63,7 +75,10 @@ init :: proc(level: Level, path: string = "", guarded := false) -> os.Error {
 		if err == nil {
 			state.file = f
 			state.to_file = true
-			state.created = created
+			if o, has := owner.?; has && created {
+				// A failure leaves it root's; see `owner` above.
+				posix.fchown(posix.FD(os.fd(f)), o.uid, o.gid)
+			}
 		}
 	}
 	sync.mutex_unlock(&state.mu)
@@ -84,19 +99,18 @@ what logrotate's default `create` arrangement relies on - it renames the file an
 sends the signal, and the process goes on appending to the renamed one until it
 opens the name again.
 
-Returns false, leaving the log where it was, when the file cannot be opened -
+Returns the error, leaving the log where it was, when the file cannot be opened -
 most likely because privileges were dropped after the old one was opened as
-root. Nothing is lost that way, and the caller says so through the log that is
-still working.
+root, or a `guarded` refusal (see `init`). Nothing is lost that way, and the
+caller says so through the log that is still working.
 */
-reopen :: proc(path: string) -> bool {
+reopen :: proc(path: string) -> os.Error {
 	f: ^os.File
-	created: bool
 	if path != "" {
 		err: os.Error
-		f, created, err = open_log(path, sync.atomic_load(&state.guarded))
+		f, _, err = open_log(path, sync.atomic_load(&state.guarded))
 		if err != nil {
-			return false
+			return err
 		}
 	}
 
@@ -104,14 +118,13 @@ reopen :: proc(path: string) -> bool {
 	old := state.file if state.to_file else nil
 	state.file = f
 	state.to_file = f != nil
-	state.created = created
 	sync.mutex_unlock(&state.mu)
 
 	if old != nil {
 		os.close(old)
 	}
 	warn_if_readable(path)
-	return true
+	return nil
 }
 
 /*
@@ -180,19 +193,8 @@ open_resolved :: proc(cpath: cstring, flags: linux.Open_Flags, mode: linux.Mode,
 	if !no_symlinks {
 		return linux.open(cpath, flags, mode)
 	}
-	Open_How :: struct {
-		flags:   u64,
-		mode:    u64,
-		resolve: u64,
-	}
 	RESOLVE_NO_SYMLINKS :: 0x04
-	how := Open_How {
-		flags   = u64(transmute(u32)flags),
-		// openat2 refuses a mode without O_CREAT.
-		mode    = u64(transmute(u32)mode) if .CREAT in flags else 0,
-		resolve = RESOLVE_NO_SYMLINKS,
-	}
-	ret := linux.syscall(linux.SYS_openat2, linux.AT_FDCWD, transmute(uintptr)cpath, &how, size_of(how))
+	ret := openat2(cpath, flags, mode, RESOLVE_NO_SYMLINKS)
 	if ret == -int(linux.Errno.ENOSYS) || (ret == -int(linux.Errno.EPERM) && !openat2_allowed()) {
 		return linux.open(cpath, flags + {.NOFOLLOW}, mode)
 	}
@@ -200,6 +202,21 @@ open_resolved :: proc(cpath: cstring, flags: linux.Open_Flags, mode: linux.Mode,
 		return -1, linux.Errno(-ret)
 	}
 	return linux.Fd(ret), .NONE
+}
+
+// The raw system call, which `core:sys/linux` does not wrap: a descriptor, or a
+// negated errno.
+@(private)
+openat2 :: proc(cpath: cstring, flags: linux.Open_Flags, mode: linux.Mode, resolve: u64) -> int {
+	how := struct {
+		flags, mode, resolve: u64,
+	} {
+		flags   = u64(transmute(u32)flags),
+		// openat2 refuses a mode without O_CREAT.
+		mode    = u64(transmute(u32)mode) if .CREAT in flags else 0,
+		resolve = resolve,
+	}
+	return linux.syscall(linux.SYS_openat2, linux.AT_FDCWD, transmute(uintptr)cpath, &how, size_of(how))
 }
 
 /*
@@ -211,10 +228,7 @@ symlink in between.
 */
 @(private)
 openat2_allowed :: proc() -> bool {
-	how: struct {
-		flags, mode, resolve: u64,
-	} = {flags = u64(transmute(u32)linux.Open_Flags{.PATH, .CLOEXEC})}
-	ret := linux.syscall(linux.SYS_openat2, linux.AT_FDCWD, transmute(uintptr)cstring("/"), &how, size_of(how))
+	ret := openat2("/", {.PATH, .CLOEXEC}, {}, 0)
 	if ret >= 0 {
 		linux.close(linux.Fd(ret))
 		return true
@@ -250,28 +264,6 @@ symlink_refused :: proc(path: string) -> bool {
 	return errno == .ELOOP
 }
 
-/*
-Give the log file to the account the process is about to become, when this
-process created it.
-
-Started as root, `init` creates the file as root, and the dropped process could
-then never open its name again: every SIGHUP after a rotation would log on into
-the renamed file. A file this process made is its own output, like the
-blocklist cache, so it goes over with the process. One that was there already is
-the operator's - possibly a shared system log - and is left as it is (Unbound
-declines to chown its log file for the same reason). By descriptor, so the file
-changed is the one being written, whatever the name points at by now. A change
-that fails leaves a file the account cannot open, which `warn_out_of_reach` in
-main names after the drop.
-*/
-hand_over :: proc(uid: posix.uid_t, gid: posix.gid_t) {
-	sync.mutex_lock(&state.mu)
-	defer sync.mutex_unlock(&state.mu)
-	if state.to_file && state.created {
-		posix.fchown(posix.FD(os.fd(state.file)), uid, gid)
-	}
-}
-
 // Whether lines go to a file rather than stderr.
 writing_to_file :: proc() -> bool {
 	sync.mutex_lock(&state.mu)
@@ -295,7 +287,8 @@ readable_by_others :: proc() -> bool {
 	if posix.fstat(posix.FD(os.fd(state.file)), &st) != .OK {
 		return false
 	}
-	return .IROTH in st.st_mode
+	// A device such as /dev/null is 0666 by design and holds nothing.
+	return posix.S_ISREG(st.st_mode) && .IROTH in st.st_mode
 }
 
 /*
@@ -318,7 +311,6 @@ shutdown :: proc() {
 	if state.to_file && state.file != nil {
 		os.close(state.file)
 		state.file = nil
-		state.created = false
 		state.to_file = false
 	}
 }
