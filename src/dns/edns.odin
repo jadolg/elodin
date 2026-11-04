@@ -166,7 +166,8 @@ appended, so the answer comes back in this server's own name compression.
 For a caller whose appended answer is over its limit: an upstream that writes
 its names in full sends an answer the encoder makes shorter, and the record
 may fit behind that one where it does not fit behind the bytes as sent. Costs
-the decode the append avoids, so it is asked for only there.
+the decode the append avoids, so it is asked for only there. Fails on a message
+that has an OPT record, which `ensure_opt` has already handed back unchanged.
 */
 ensure_opt_compressed :: proc(
 	msg: []u8,
@@ -178,9 +179,6 @@ ensure_opt_compressed :: proc(
 	out: []u8,
 	ok: bool,
 ) {
-	if _, has_opt := walk_to_end(msg); has_opt {
-		return msg, true
-	}
 	return rebuild_with_opt(msg, udp_size, nil, allocator, spent)
 }
 
@@ -204,7 +202,7 @@ Appended only to a message that walks to exactly its last byte with no OPT
 record in its additional section, and whose result fits `MAX_MESSAGE`. Anything
 else goes to `rebuild_with_opt`, which decodes and encodes it: a message
 with trailing bytes loses them, one that does not decode fails, one that turns
-out to have an OPT record fails, and one too long to grow is cut by the encoder.
+out to have an OPT record fails, and one with no room for the record fails too.
 The size check also covers the two fields that could otherwise wrap: an option
 list longer than RDLENGTH can state, and an ARCOUNT of 65535, which no message
 that walks inside `MAX_MESSAGE` can carry (a record is at least 11 bytes).
@@ -324,8 +322,9 @@ The slow path for `add_opt_record`: decode, add the record, encode again, out of
 the temp arena for the reason `rebuild_edns_option` gives. For a message that
 cannot simply be appended to; see there.
 
-Fails when the message will not decode, will not encode again, or turns out to
-have an OPT record after all.
+Fails when the message will not decode, will not encode again with every record
+and the new one inside `MAX_MESSAGE`, or turns out to have an OPT record after
+all.
 */
 @(private)
 rebuild_with_opt :: proc(
@@ -356,8 +355,16 @@ rebuild_with_opt :: proc(
 	append(&additional, opt)
 	m.additional = additional[:]
 
-	encoded, _, eerr := encode_message(m, scratch, MAX_MESSAGE)
-	if eerr != .None {
+	/*
+	Every record and the new one, or a failure. Past `MAX_MESSAGE` the encoder
+	leaves the OPT record out of a complete answer, drops glue to make room for
+	it, or cuts the answer with TC set - and none of those is the record added
+	to the message this was handed. The caller keeps the answer whole without
+	one, which is `server.match_client_opt`'s rule for a mint that would cut an
+	answer that fits.
+	*/
+	encoded, truncated, eerr := encode_message(m, scratch, MAX_MESSAGE)
+	if eerr != .None || truncated || int(u16(encoded[10]) << 8 | u16(encoded[11])) != len(m.additional) {
 		return nil, false
 	}
 	out = make([]u8, len(encoded), allocator)

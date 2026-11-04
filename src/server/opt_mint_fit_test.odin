@@ -65,10 +65,8 @@ test_a_mint_that_fits_no_way_is_abandoned :: proc(t: ^testing.T) {
 	compact, _, _ := dns.encode_message(dns.decode_message(wire, context.temp_allocator) or_else {}, context.temp_allocator)
 	// The answer fits; even compressed, the answer plus a record does not.
 	limit := len(compact) + 5
-	trimmed := make([]u8, len(compact), context.temp_allocator)
-	copy(trimmed, compact)
 	spent := 0
-	out := match_client_opt(trimmed, edns_query(), 1232, limit, .Cached, &spent, context.temp_allocator)
+	out := match_client_opt(compact, edns_query(), 1232, limit, .Cached, &spent, context.temp_allocator)
 
 	m, err := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, err, dns.Decode_Error.None)

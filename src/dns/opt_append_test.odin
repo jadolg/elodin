@@ -179,6 +179,19 @@ test_add_opt_record_at_the_size_limit :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// A message the encoder cannot shorten, within eleven bytes of `MAX_MESSAGE`:
+// the rebuild has no room for the record, and says so rather than handing back
+// the answer without one, or cut for it, as a success.
+@(test)
+test_add_opt_record_refuses_to_cut_the_answer :: proc(t: ^testing.T) {
+	empty := append_fixture(raw_len = 0)
+	full := append_fixture(raw_len = MAX_MESSAGE - 5 - len(empty))
+	testing.expect_value(t, len(full), MAX_MESSAGE - 5)
+	_, ok := add_opt_record(full, 1232, nil, context.temp_allocator, nil)
+	testing.expect(t, !ok, "a mint left out a record, or itself, and reported success")
+	free_all(context.temp_allocator)
+}
+
 // Bytes behind the last record are not the message's; the rebuild drops them,
 // and an append would leave them between the answer and its OPT record.
 @(test)
