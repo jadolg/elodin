@@ -432,19 +432,17 @@ run_wire_cases :: proc(r: ^Runner) {
 		asked with one gets a record minted, and the record is written onto the
 		end of the bytes: everything ahead of it is what the upstream sent. The
 		upstream here writes its names in full, which a decode and re-encode
-		would have compressed - shorter, and not the upstream's bytes. The same
-		`match_client_opt` call serves a cache hit, which is where the decode
-		used to cost every EDNS client.
+		compresses - shorter, and not the upstream's bytes. The same
+		`match_client_opt` call serves a cache hit, so no EDNS client's hit pays
+		for a decode.
 		*/
 		query := build_query(FLAT_QNAME, u16(dns.Type.A), edns_size = 1232)
 		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
-			want := flat
-			want[3] &~= 0x20
 			if check(r, len(res.wire) == len(flat) + 11, "length: got %d, want %d", len(res.wire), len(flat) + 11) {
 				check(
 					r,
-					bytes_equal(res.wire[2:10], want[2:10]) && bytes_equal(res.wire[12:len(flat)], want[12:]),
+					bytes_equal(res.wire[2:10], flat[2:10]) && bytes_equal(res.wire[12:len(flat)], flat[12:]),
 					"the bytes ahead of the minted record are not the upstream's",
 				)
 				check_eq_int(r, int(res.wire[11]), int(flat[11]) + 1, "ARCOUNT")

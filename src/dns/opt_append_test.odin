@@ -155,7 +155,7 @@ test_ensure_opt_decodes_nothing :: proc(t: ^testing.T) {
 }
 
 // Up to `MAX_MESSAGE` the record is appended; one byte more is the rebuild's to
-// cut, as it always was.
+// cut.
 @(test)
 test_add_opt_record_at_the_size_limit :: proc(t: ^testing.T) {
 	fits := append_fixture_of_size(MAX_MESSAGE - 11)
@@ -208,4 +208,22 @@ one_minted_opt :: proc() -> []Record {
 	r := make([]Record, 1, context.temp_allocator)
 	r[0] = make_opt(1232, false)
 	return r
+}
+
+// A record of type OPT outside the additional section is not the message's EDNS
+// record (`find_opt_span`), so the message still gets one appended.
+@(test)
+test_add_opt_record_appends_past_an_opt_typed_answer :: proc(t: ^testing.T) {
+	wire := append_fixture()
+	answer_opt := make([]u8, len(wire) + 11, context.temp_allocator)
+	copy(answer_opt, wire)
+	// A root-owned OPT record with an empty RDATA, counted in ANCOUNT.
+	answer_opt[len(wire) + 2] = u8(Type.OPT)
+	answer_opt[7] += 1
+	spent := 0
+	out, ok := add_opt_record(answer_opt, 1232, nil, context.temp_allocator, &spent)
+	testing.expect(t, ok, "an OPT-typed answer record stopped the mint")
+	testing.expect_value(t, spent, 0)
+	testing.expect_value(t, len(out), len(answer_opt) + 11)
+	free_all(context.temp_allocator)
 }

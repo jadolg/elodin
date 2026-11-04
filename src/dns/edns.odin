@@ -150,10 +150,38 @@ ensure_opt :: proc(
 	out: []u8,
 	ok: bool,
 ) {
-	if _, has_opt := find_opt_span(msg); has_opt {
+	// One walk on a cache hit: the one that finds no OPT record is the one the
+	// append needs.
+	end, has_opt := walk_to_end(msg)
+	if has_opt {
 		return msg, true
 	}
-	return add_opt_record(msg, udp_size, nil, allocator, spent)
+	return append_opt(msg, end, udp_size, nil, allocator, spent)
+}
+
+/*
+`ensure_opt`, with the record added by a decode and re-encode rather than
+appended, so the answer comes back in this server's own name compression.
+
+For a caller whose appended answer is over its limit: an upstream that writes
+its names in full sends an answer the encoder makes shorter, and the record
+may fit behind that one where it does not fit behind the bytes as sent. Costs
+the decode the append avoids, so it is asked for only there.
+*/
+ensure_opt_compressed :: proc(
+	msg: []u8,
+	udp_size: u16,
+	allocator := context.allocator,
+	// See `ensure_opt`.
+	spent: ^int = nil,
+) -> (
+	out: []u8,
+	ok: bool,
+) {
+	if _, has_opt := walk_to_end(msg); has_opt {
+		return msg, true
+	}
+	return rebuild_with_opt(msg, udp_size, nil, allocator, spent)
 }
 
 /*
@@ -174,7 +202,7 @@ place.
 
 Appended only to a message that walks to exactly its last byte with no OPT
 record in its additional section, and whose result fits `MAX_MESSAGE`. Anything
-else goes to `rebuild_with_opt`, which answers it as it always has: a message
+else goes to `rebuild_with_opt`, which decodes and encodes it: a message
 with trailing bytes loses them, one that does not decode fails, one that turns
 out to have an OPT record fails, and one too long to grow is cut by the encoder.
 The size check also covers the two fields that could otherwise wrap: an option
@@ -210,6 +238,23 @@ add_opt_record :: proc(
 	if has_opt {
 		return nil, false
 	}
+	return append_opt(msg, end, udp_size, options, allocator, spent)
+}
+
+// `add_opt_record` past its walk: `end` is where `walk_to_end` stopped, on a
+// message it found no OPT record in.
+@(private)
+append_opt :: proc(
+	msg: []u8,
+	end: int,
+	udp_size: u16,
+	options: []EDNS_Option,
+	allocator: mem.Allocator,
+	spent: ^int,
+) -> (
+	out: []u8,
+	ok: bool,
+) {
 	rdlen := 0
 	for o in options {
 		rdlen += 4 + len(o.data)
@@ -256,22 +301,12 @@ refused however much of it is left.
 */
 @(private)
 walk_to_end :: proc(msg: []u8) -> (end: int, has_opt: bool) {
-	if len(msg) < HEADER_SIZE {
+	pos, total, walked := records_start(msg)
+	if !walked {
 		return -1, false
 	}
-	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
-	before := int(u16(msg[6]) << 8 | u16(msg[7])) + int(u16(msg[8]) << 8 | u16(msg[9]))
-	arcount := int(u16(msg[10]) << 8 | u16(msg[11]))
-
-	pos := HEADER_SIZE
-	for _ in 0 ..< qdcount {
-		next, ok := skip_name(msg, pos)
-		if !ok || next + 4 > len(msg) {
-			return -1, false
-		}
-		pos = next + 4
-	}
-	for i in 0 ..< before + arcount {
+	before := total - int(u16(msg[10]) << 8 | u16(msg[11]))
+	for i in 0 ..< total {
 		type, next, ok := skip_record(msg, pos)
 		if !ok {
 			return -1, false
