@@ -255,6 +255,10 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 			os.close(nf)
 		}
 
+		// openat2 runs here, so a path's own EPERM would not be taken for a
+		// seccomp filter and walked again with only O_NOFOLLOW.
+		testing.expect(t, openat2_allowed(), "openat2 is reported unavailable on a kernel and sandbox that allow it")
+
 		// A FIFO with no reader is refused at once rather than waited on.
 		fifo, _ := filepath.join({dir, "fifo.log"}, context.temp_allocator)
 		if testing.expect(t, posix.mkfifo(strings.clone_to_cstring(fifo, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {

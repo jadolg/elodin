@@ -5,6 +5,7 @@ import "core:mem/virtual"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import "core:sys/linux"
 import "core:sys/posix"
 import "core:thread"
 import "core:time"
@@ -468,7 +469,8 @@ main :: proc() {
 			"elodin: cannot open the log file %q (%s)%s, logging to stderr instead",
 			cfg.log.file,
 			os.error_string(err),
-			LOG_GUARDED_HINT if log_guarded else "",
+			// ELOOP is a symlink refused, ENXIO a FIFO with no reader.
+			LOG_GUARDED_HINT if log_guarded && (err == os.Platform_Error(linux.Errno.ELOOP) || err == os.Platform_Error(linux.Errno.ENXIO)) else "",
 		)
 	}
 	if opts.check_only && cfg.log.file != "" && !log_file_openable(cfg.log.file, log_guarded) {

@@ -127,7 +127,10 @@ file or symlink already at the name fails it and is appended to as it is.
 @(private)
 open_log :: proc(path: string, no_follow: bool) -> (f: ^os.File, created: bool, err: os.Error) {
 	cpath := strings.clone_to_cstring(path, context.temp_allocator)
-	base: linux.Open_Flags = {.WRONLY, .APPEND, .CREAT, .CLOEXEC}
+	// NOCTTY as `os.open` sets it: a tty named here would otherwise become the
+	// controlling terminal of a session leader such as a systemd service, and
+	// its ^C or hangup would reach the process.
+	base: linux.Open_Flags = {.WRONLY, .APPEND, .CREAT, .CLOEXEC, .NOCTTY}
 	if no_follow {
 		// Not to wait at a FIFO for a reader that never comes; cleared below.
 		base += {.NONBLOCK}
@@ -149,6 +152,13 @@ open_log :: proc(path: string, no_follow: bool) -> (f: ^os.File, created: bool, 
 			linux.close(fd)
 			return nil, false, os.Platform_Error(errno)
 		}
+	}
+	// `os.new_file` panics where it cannot name the descriptor through
+	// /proc/self/fd (no /proc in a chroot), which `os.open` returns as an error.
+	first: [1]u8
+	if _, rerr := linux.readlink(fmt.ctprintf("/proc/self/fd/%d", fd), first[:]); rerr != .NONE {
+		linux.close(fd)
+		return nil, false, os.Platform_Error(rerr)
 	}
 	return os.new_file(uintptr(fd), path), created, nil
 }
@@ -183,7 +193,7 @@ open_resolved :: proc(cpath: cstring, flags: linux.Open_Flags, mode: linux.Mode,
 		resolve = RESOLVE_NO_SYMLINKS,
 	}
 	ret := linux.syscall(linux.SYS_openat2, linux.AT_FDCWD, transmute(uintptr)cpath, &how, size_of(how))
-	if ret == -int(linux.Errno.ENOSYS) || ret == -int(linux.Errno.EPERM) {
+	if ret == -int(linux.Errno.ENOSYS) || (ret == -int(linux.Errno.EPERM) && !openat2_allowed()) {
 		return linux.open(cpath, flags + {.NOFOLLOW}, mode)
 	}
 	if ret < 0 {
@@ -193,29 +203,49 @@ open_resolved :: proc(cpath: cstring, flags: linux.Open_Flags, mode: linux.Mode,
 }
 
 /*
+Whether openat2 runs at all here. A seccomp filter written before it refuses it
+with EPERM for every path, "/" included; an EPERM for one path while "/" opens
+is that path's own (a FUSE mount, say) and is not taken as a reason to walk the
+path again with only O_NOFOLLOW, where a directory on it could be swapped for a
+symlink in between.
+*/
+@(private)
+openat2_allowed :: proc() -> bool {
+	how: struct {
+		flags, mode, resolve: u64,
+	} = {flags = u64(transmute(u32)linux.Open_Flags{.PATH, .CLOEXEC})}
+	ret := linux.syscall(linux.SYS_openat2, linux.AT_FDCWD, transmute(uintptr)cstring("/"), &how, size_of(how))
+	if ret >= 0 {
+		linux.close(linux.Fd(ret))
+		return true
+	}
+	return ret != -int(linux.Errno.EPERM) && ret != -int(linux.Errno.ENOSYS)
+}
+
+/*
 For `--check`, which creates nothing: whether a `guarded` start (see `init`)
 would find a symlink on the way to `path` - on the file, or on its directory
 when there is no file yet.
 */
 symlink_refused :: proc(path: string) -> bool {
-	probe :: proc(p: string) -> linux.Errno {
+	probe :: proc(p: string, file: bool) -> linux.Errno {
 		fd, errno := open_resolved(strings.clone_to_cstring(p, context.temp_allocator), {.PATH, .CLOEXEC}, {}, true)
 		if errno != .NONE {
 			return errno
 		}
 		defer linux.close(fd)
 		// The O_NOFOLLOW fallback opens a symlink itself under O_PATH rather
-		// than failing, where the start's O_NOFOLLOW open is refused.
+		// than failing, where the start's O_NOFOLLOW open is refused - at the
+		// file only: that start follows a symlinked directory.
 		st: linux.Stat
-		if linux.fstat(fd, &st) == .NONE && linux.S_ISLNK(st.mode) {
+		if file && linux.fstat(fd, &st) == .NONE && linux.S_ISLNK(st.mode) {
 			return .ELOOP
 		}
 		return .NONE
 	}
-	errno := probe(path)
+	errno := probe(path, true)
 	if errno == .ENOENT {
-		parent := os.dir(path)
-		errno = probe(parent)
+		errno = probe(os.dir(path), false)
 	}
 	return errno == .ELOOP
 }
