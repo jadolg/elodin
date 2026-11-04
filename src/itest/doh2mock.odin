@@ -155,6 +155,12 @@ doh2_mock_loop :: proc(m: ^Doh2_Mock) {
 		conn.mock = m
 		conn.socket = client
 		t := thread.create_and_start_with_poly_data(conn, doh2_mock_conn)
+		if t == nil {
+			// Turned away rather than appended: `thread.join` on nil would crash the stop.
+			net.close(client)
+			free(conn)
+			continue
+		}
 		sync.mutex_lock(&m.mu)
 		append(&m.threads, t)
 		sync.mutex_unlock(&m.mu)

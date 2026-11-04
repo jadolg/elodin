@@ -1,10 +1,13 @@
 package itest
 
+import "core:fmt"
 import "core:net"
+import "core:sys/posix"
 import "core:sync"
 import "core:thread"
 import "core:time"
 import "elodin:dns"
+import "elodin:metrics"
 import "elodin:tlsx"
 
 /*
@@ -123,6 +126,8 @@ Mock :: struct {
 	*/
 	hold_until:  int,
 	held:        int,
+	// Threads the mock could not start, each handled on the thread that asked.
+	failed_starts: int,
 
 	mu:          sync.Mutex,
 	udp_queries: int,
@@ -139,6 +144,9 @@ Mock :: struct {
 	last_reply:  []u8,
 	replies:     int,
 }
+
+@(private = "file")
+MOCK_UDP_RCVBUF :: 1 << 20
 
 mock_make :: proc(name: string, port: int) -> ^Mock {
 	m := new(Mock)
@@ -191,6 +199,25 @@ mock_delay_all :: proc(m: ^Mock, delay: time.Duration, payload: []u8) {
 // From here on, hold delayed UDP replies until `n` are waiting. See `Mock.hold_until`.
 mock_hold_until :: proc(m: ^Mock, n: int) {
 	sync.atomic_store(&m.hold_until, n)
+}
+
+/*
+What the mock can say about a hold left short, so a failure names its cause:
+datagrams received, those the kernel dropped on the mock's socket for want of
+room, and threads it could not start.
+*/
+mock_hold_report :: proc(m: ^Mock) -> string {
+	received, _, _ := mock_counts(m)
+	inode := [1]u64{metrics.socket_inode(int(m.udp_socket))}
+	drops: [1]u64
+	_ = metrics.socket_drops(inode[:], drops[:])
+	return fmt.tprintf(
+		"held %d, received %d, dropped at its socket %d, failed thread starts %d",
+		mock_held(m),
+		received,
+		drops[0],
+		sync.atomic_load(&m.failed_starts),
+	)
 }
 
 // Whether `n` delayed replies have been held at once.
@@ -374,6 +401,14 @@ mock_start :: proc(m: ^Mock, cert_file := "", key_file := "") -> bool {
 		net.close(udp)
 		return false
 	}
+	/*
+	Room for a whole burst of small datagrams, about 1 KiB each on the receive
+	queue, so a case's burst is not dropped while the read loop is off the CPU
+	(#568). Through `setsockopt`, as `net.set_option` cannot set it; the kernel
+	caps it at `net.core.rmem_max`, and `mock_hold_report` names what was dropped.
+	*/
+	rcvbuf := i32(MOCK_UDP_RCVBUF)
+	_ = posix.setsockopt(posix.FD(udp), i32(posix.SOL_SOCKET), .RCVBUF, &rcvbuf, posix.socklen_t(size_of(rcvbuf)))
 	// Set only once both are open: `mock_stop` closes what is here, and a
 	// number closed by a failed start may by then be another socket's.
 	m.udp_socket = udp
@@ -649,6 +684,21 @@ mock_udp_loop :: proc(m: ^Mock) {
 	buf := make([]u8, 65535)
 	defer delete(buf)
 
+	/*
+	Held replies wait here rather than on a thread each. Starting a thread costs
+	far more than a read, and a burst arriving faster than the reads overflows
+	the socket's receive buffer: what is dropped there never reaches the hold,
+	which then stays short of its count (#568).
+	*/
+	held := make([dynamic]^Delayed_Reply)
+	defer {
+		for job in held {
+			delete(job.query)
+			free(job)
+		}
+		delete(held)
+	}
+
 	for !sync.atomic_load(&m.stop) {
 		n, client, err := net.recv_udp(m.udp_socket, buf)
 		if err != nil {
@@ -673,7 +723,28 @@ mock_udp_loop :: proc(m: ^Mock) {
 			job.query = make([]u8, n)
 			copy(job.query, buf[:n])
 
-			t := thread.create_and_start_with_poly_data(job, delayed_udp_reply)
+			if hold := sync.atomic_load(&m.hold_until); hold > 0 {
+				append(&held, job)
+				if sync.atomic_add(&m.held, 1) + 1 >= hold {
+					// The hold stands in for the rule's delay: all of them go out now.
+					for h in held {
+						h.rule.delay = 0
+						send_delayed_reply(h)
+					}
+					clear(&held)
+				}
+				free_all(context.temp_allocator)
+				continue
+			}
+
+			t := thread.create_and_start_with_poly_data(job, send_delayed_reply)
+			if t == nil {
+				// No thread to wait on its behalf, so it waits here: late, but
+				// answered, and nothing nil is left for `mock_stop` to join.
+				sync.atomic_add(&m.failed_starts, 1)
+				send_delayed_reply(job)
+				continue
+			}
 			sync.mutex_lock(&m.mu)
 			append(&m.threads, t)
 			sync.mutex_unlock(&m.mu)
@@ -700,16 +771,8 @@ Delayed_Reply :: struct {
 }
 
 @(private = "file")
-delayed_udp_reply :: proc(job: ^Delayed_Reply) {
+send_delayed_reply :: proc(job: ^Delayed_Reply) {
 	m := job.mock
-	// A poll on the count rather than a `sync.Barrier`, so that `mock_stop`
-	// still ends a hold that is never reached and the join cannot hang.
-	if n := sync.atomic_load(&m.hold_until); n > 0 {
-		sync.atomic_add(&m.held, 1)
-		for sync.atomic_load(&m.held) < n && !sync.atomic_load(&m.stop) {
-			time.sleep(time.Millisecond)
-		}
-	}
 	reply, ok := build_reply(m, job.query, job.rule, false, context.temp_allocator)
 	if ok && !sync.atomic_load(&m.stop) {
 		_, _ = net.send_udp(m.udp_socket, reply, job.client)
@@ -737,10 +800,7 @@ mock_tcp_loop :: proc(m: ^Mock) {
 		conn := new(Mock_Conn)
 		conn.mock = m
 		conn.socket = client
-		t := thread.create_and_start_with_poly_data(conn, mock_tcp_conn)
-		sync.mutex_lock(&m.mu)
-		append(&m.threads, t)
-		sync.mutex_unlock(&m.mu)
+		start_conn_thread(m, conn)
 	}
 }
 
@@ -756,11 +816,24 @@ mock_tls_loop :: proc(m: ^Mock) {
 		conn.mock = m
 		conn.socket = client
 		conn.tls = true
-		t := thread.create_and_start_with_poly_data(conn, mock_tcp_conn)
-		sync.mutex_lock(&m.mu)
-		append(&m.threads, t)
-		sync.mutex_unlock(&m.mu)
+		start_conn_thread(m, conn)
 	}
+}
+
+@(private = "file")
+start_conn_thread :: proc(m: ^Mock, conn: ^Mock_Conn) {
+	t := thread.create_and_start_with_poly_data(conn, mock_tcp_conn)
+	if t == nil {
+		// Turned away, as a server out of threads would: the client sees the
+		// connection close, and nothing nil is left for `mock_stop` to join.
+		sync.atomic_add(&m.failed_starts, 1)
+		net.close(conn.socket)
+		free(conn)
+		return
+	}
+	sync.mutex_lock(&m.mu)
+	append(&m.threads, t)
+	sync.mutex_unlock(&m.mu)
 }
 
 @(private = "file")
