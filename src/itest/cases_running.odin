@@ -64,10 +64,11 @@ blocking: {{ enabled: false }}
 
 /*
 Send every query at once, each from a socket of its own, and wait for them all.
-How many were answered, and how long the last one took.
+How many were answered, how long the last one took, and the answers by rcode.
 */
 @(private = "file")
-udp_burst :: proc(udp_port: int, queries: [][]u8) -> (answered: int, elapsed: time.Duration) {
+udp_burst :: proc(udp_port: int, queries: [][]u8) -> (answered: int, elapsed: time.Duration, rcodes: map[dns.Rcode]int) {
+	rcodes = make(map[dns.Rcode]int, context.temp_allocator)
 	sockets := make([]net.UDP_Socket, len(queries), context.temp_allocator)
 	opened := make([]bool, len(queries), context.temp_allocator)
 	defer for s, i in sockets {
@@ -103,9 +104,10 @@ udp_burst :: proc(udp_port: int, queries: [][]u8) -> (answered: int, elapsed: ti
 		n, _, rerr := net.recv_udp(s, buf)
 		if rerr == nil && n >= dns.HEADER_SIZE {
 			answered += 1
+			rcodes[dns.Rcode(buf[3] & 0xf)] += 1
 		}
 	}
-	return answered, time.tick_since(start)
+	return answered, time.tick_since(start), rcodes
 }
 
 @(private = "file")
@@ -165,7 +167,7 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 			"the sizing line does not report the one loop; log:\n%s",
 			read_log(&srv),
 		)
-		answered, elapsed := udp_burst(udp_port, burst_queries("overlap", 8, 0x5100))
+		answered, elapsed, _ := udp_burst(udp_port, burst_queries("overlap", 8, 0x5100))
 		check_eq_int(r, answered, 8, "queries answered")
 		// One at a time would be eight round trips.
 		check(
@@ -192,7 +194,7 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 			append(&queries, same)
 		}
 		append(&queries, ..burst_queries("beside", 4, 0x5210))
-		answered, elapsed := udp_burst(udp_port, queries[:])
+		answered, elapsed, _ := udp_burst(udp_port, queries[:])
 		check_eq_int(r, answered, 7, "queries answered")
 		check(
 			r,
@@ -227,7 +229,7 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 					}
 				}
 				if check(r, stalled, "the reply never started, so nothing is parked on the window") {
-					answered, elapsed := udp_burst(udp_port, burst_queries("past-parked", 2, 0x5310))
+					answered, elapsed, _ := udp_burst(udp_port, burst_queries("past-parked", 2, 0x5310))
 					check_eq_int(r, answered, 2, "queries answered")
 					check(
 						r,
@@ -274,7 +276,7 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 			rsrv, rok := start_server(r, Server_Options{config = race_config, udp_port = race_port, warmup = DELAY})
 			if check(r, rok, "server did not start") {
 				defer stop_server(&rsrv)
-				answered, elapsed := udp_burst(race_port, burst_queries("raced", 4, 0x5500))
+				answered, elapsed, _ := udp_burst(race_port, burst_queries("raced", 4, 0x5500))
 				check_eq_int(r, answered, 4, "queries answered")
 				check(
 					r,
@@ -335,6 +337,50 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 	end_case(r)
 
 	/*
+	The burst case after this one reads its answer off the mock, so the mock has
+	to hold a burst of 500 whatever pace it arrives at (#568). Sent back to back
+	from one socket, faster than any server would forward them, so a mock that
+	drains its socket more slowly than that drops datagrams and leaves the hold
+	short.
+
+	Only where the mock's socket has room for the whole burst, about 1 KiB a
+	datagram on the queue: below that a busy machine drops some whatever the mock
+	does. CI raises `net.core.rmem_max` so the case always runs there.
+	*/
+	if room := mock_udp_room(); room < 500 * 1024 {
+		skip_case(
+			r,
+			"mock: holds a burst of 500 sent back to back",
+			fmt.tprintf("the mock's socket gets %d bytes, under the 500 KiB the burst needs; raise net.core.rmem_max", room),
+		)
+	} else {
+		start_case(r, "mock: holds a burst of 500 sent back to back")
+		burst_mock := mock_make("running-burst", next_port(r))
+		mock_delay_all(burst_mock, 0, nil)
+		if check(r, mock_start(burst_mock), "cannot start the burst mock upstream") {
+			defer mock_stop(burst_mock)
+			mock_hold_until(burst_mock, 500)
+			s, err := net.make_unbound_udp_socket(.IP4)
+			if check(r, err == nil, "cannot open a client socket") {
+				defer net.close(s)
+				to := net.Endpoint{address = net.IP4_Loopback, port = burst_mock.port}
+				for q in burst_queries("held", 500, 0x5700) {
+					_, _ = net.send_udp(s, q, to)
+				}
+				deadline := time.tick_add(time.tick_now(), CLIENT_TIMEOUT)
+				for mock_held(burst_mock) < 500 && time.tick_diff(time.tick_now(), deadline) > 0 {
+					time.sleep(time.Millisecond)
+				}
+				// Only on a failure: the report reads `/proc/net/udp`.
+				if mock_held(burst_mock) < 500 {
+					fail(r, "the hold of 500 was not reached: %s", mock_hold_report(burst_mock))
+				}
+			}
+		}
+		end_case(r)
+	}
+
+	/*
 	What is in flight is not a thread count. One loop, and `max_pending` left to
 	the machine, carries a burst of 500 misses at once, all on one thread.
 
@@ -361,8 +407,15 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 			if check(r, dok, "server did not start") {
 				defer stop_server(&dsrv)
 				mock_hold_until(derived_mock, 500)
-				answered, _ := udp_burst(derived_port, burst_queries("derived", 500, 0x5400))
-				check(r, mock_held(derived_mock) >= 500, "only %d of 500 misses reached the upstream at once", mock_held(derived_mock))
+				answered, _, rcodes := udp_burst(derived_port, burst_queries("derived", 500, 0x5400))
+				if mock_held(derived_mock) < 500 {
+					fail(
+						r,
+						"not every one of 500 misses reached the upstream at once: %s; answers by rcode %v",
+						mock_hold_report(derived_mock),
+						rcodes,
+					)
+				}
 				check_eq_int(r, answered, 500, "queries answered")
 			}
 		}
