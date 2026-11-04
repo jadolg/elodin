@@ -32,9 +32,9 @@ rewritten in place on each hit.
   equal share of both bounds, at least 256 entries and 1 MiB (the shares add up
   to exactly `max_entries` and `max_bytes`), and evicts its own least recently
   used entries. The default 10,000 entries make 16 shards; under 512 entries
-  or 2 MiB the cache is one shard. The number is fixed when the cache is built,
-  so a reload that changes the bounds changes each shard's share but not how
-  many shards there are.
+  or 2 MiB the cache is one shard. A reload that changes the bounds counts the
+  shards again and moves the entries it keeps, with lookups held for the
+  length of the move.
 - **`max_ttl`** caps every upstream answer, forwarded or cached, and how long an
   entry is kept. It does not touch answers elodin writes itself, which carry
   `blocking.block_ttl` or a rewrite's own `ttl`.

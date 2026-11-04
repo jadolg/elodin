@@ -192,9 +192,9 @@ Stats :: struct {
 One lock's worth of the cache: its own table, its own LRU list, and its own
 share of the limits (issue #582).
 
-Every lookup takes a lock, and with one for the whole cache that lock's line
-moved between cores on every query, so adding loop threads lowered the total
-rate. A key always lands in the same shard (`shard_for`), and two lookups in
+Every lookup takes a lock, and a lock every loop thread takes moves its line
+between cores on every query, so it lowers the total rate as threads are
+added. A key always lands in the same shard (`shard_for`), and two lookups in
 different shards share no line - which is what the alignment is for.
 
 The limits are split, not shared, which is Unbound's slabhash (`msg-cache-slabs`,
@@ -207,8 +207,8 @@ picked by a keyed hash, so a flood of names lands evenly and the shards fill
 together; nobody outside can aim names at one shard to empty it faster than
 the flood empties the whole cache.
 
-`max_entries` and `max_bytes` are written atomically, under the lock, and read
-by `put` before it takes the lock.
+`max_entries` and `max_bytes` are written with every shard locked, by
+`reconfigure`, and read under this shard's lock.
 */
 Shard :: struct #align(64) {
 	mu:          sync.Mutex,
@@ -218,6 +218,15 @@ Shard :: struct #align(64) {
 	max_bytes:   int,
 	// What the entries currently hold, by `entry_bytes`.
 	bytes:       int,
+	/*
+	Last number handed to an entry here; see `Entry.serial`. Never reset, so an
+	entry's identity under a key is not reused within the life of the process:
+	a key lands in one shard at a time, a serial is only ever compared under
+	its key, and `reshard` starts every shard past the highest number any of
+	them handed out. Per shard rather than per cache so that a store bumps no
+	line the other shards' lookups read.
+	*/
+	serials:     u64,
 	// This shard's part of `Stats`; `stats` adds them up.
 	hits:        u64,
 	misses:      u64,
@@ -226,9 +235,18 @@ Shard :: struct #align(64) {
 }
 
 Cache :: struct {
-	// Fixed for the life of the cache; see `shard_count`.
-	shards:       []Shard,
-	// log2 of `len(shards)`, for `shard_for`.
+	/*
+	Every shard there can be, of which the first `1 << shard_bits` are in use
+	(see `shard_count`) and the rest are empty. All of them, so that a reload
+	that changes how many are in use moves entries and never the shards: a
+	lookup on its way to a lock is never left holding one that has been freed.
+	*/
+	shards:       [MAX_SHARDS]Shard,
+	/*
+	log2 of the number of shards in use, for `shard_for`. Written by `reshard`
+	with every shard locked, and read again by `lock_shard` once it holds one,
+	so a lookup that raced a reload knows it locked the wrong shard.
+	*/
 	shard_bits:   uint,
 	// Keys `shard_for`'s hash.
 	seed:         u64,
@@ -246,10 +264,6 @@ Cache :: struct {
 	// See `claim_prefetch`.
 	prefetch:     bool,
 	prefetch_min: time.Duration,
-	// Last number handed to an entry; see `Entry.serial`. Never reset, so an
-	// entry's identity is not reused within the life of the process. Atomic:
-	// entries are numbered in every shard.
-	serials:      u64,
 	allocator:    mem.Allocator,
 	/*
 	The counters only callers bump, atomically and outside any shard: `stale`,
@@ -359,7 +373,8 @@ needs. A few hundred entries keep a shard's eviction close to the whole
 cache's, and the default ten thousand still comes to sixteen shards; a
 megabyte holds the largest entry a response can make (64 KiB of wire plus its
 offsets and TTLs) several times over, so the split never refuses an answer the
-whole budget would have taken.
+whole budget would have taken. A reload counts the shards again (`reshard`),
+so no share falls below either floor.
 */
 MIN_SHARD_ENTRIES :: 256
 MIN_SHARD_BYTES :: 1024 * 1024
@@ -379,18 +394,6 @@ make_cache :: proc(opts: Options, allocator := context.allocator) -> ^Cache {
 	c := new(Cache, allocator)
 	c.allocator = allocator
 	c.id = sync.atomic_add(&caches_made, 1) + 1
-	/*
-	Counted from the limits the cache starts with and kept for its life. A
-	reload that changes them changes the shares (`reconfigure`) and not the
-	number: moving every entry to another shard under every lock would stall
-	the whole server for the length of a reload, for a lock that was already
-	enough before it.
-	*/
-	n := shard_count(max(opts.max_entries, 1), opts.max_bytes if opts.max_bytes > 0 else DEFAULT_MAX_BYTES)
-	c.shards = make([]Shard, n, allocator)
-	for n > 1 << c.shard_bits {
-		c.shard_bits += 1
-	}
 	crypto.rand_bytes(mem.ptr_to_bytes(&c.seed))
 	for &s in c.shards {
 		/*
@@ -407,25 +410,53 @@ make_cache :: proc(opts: Options, allocator := context.allocator) -> ^Cache {
 	return c
 }
 
+// How many shards are in use.
+@(private)
+shards_in_use :: proc(c: ^Cache) -> int {
+	return 1 << sync.atomic_load(&c.shard_bits)
+}
+
 /*
 The shard `key` lives in. The hash is keyed with `Cache.seed`, which is random
 per cache, so which names share a shard is not something a client can work out
 and aim at.
 */
 @(private)
-shard_for :: proc(c: ^Cache, key: string) -> ^Shard {
-	if c.shard_bits == 0 {
+shard_for :: proc(c: ^Cache, key: string, bits: uint) -> ^Shard {
+	if bits == 0 {
 		return &c.shards[0]
 	}
 	h := xxhash.XXH3_64_with_seed(transmute([]u8)key, c.seed)
-	return &c.shards[h >> (64 - c.shard_bits)]
+	return &c.shards[h >> (64 - bits)]
+}
+
+/*
+Lock the shard `key` lives in and return it.
+
+The number of shards can change under a lookup that has not yet got its lock
+(`reshard`), and the shard it hashed to is then not where the key lives. A
+reshard holds every lock while it changes the number, so once this holds one
+and reads the same number again, the number stays until it lets go. A lookup
+that raced a reload goes round once more; every other one reads a line nobody
+writes, twice.
+*/
+@(private)
+lock_shard :: proc(c: ^Cache, key: string) -> ^Shard {
+	for {
+		bits := sync.atomic_load(&c.shard_bits)
+		s := shard_for(c, key, bits)
+		sync.mutex_lock(&s.mu)
+		if sync.atomic_load(&c.shard_bits) == bits {
+			return s
+		}
+		sync.mutex_unlock(&s.mu)
+	}
 }
 
 /*
 Shard `i`'s part of `total` across `n`: the floor, and one more for the first
-`total % n`, so the parts add up to exactly `total`. A part can be zero once a
-reload has set a limit below the number of shards; such a shard stores nothing
-(see `put`), which keeps the whole at the limit rather than at one per shard.
+`total % n`, so the parts add up to exactly `total`. `shard_count` keeps every
+part at or above its floor.
 */
 @(private)
 split :: proc(total, n, i: int) -> int {
@@ -480,23 +511,84 @@ reconfigure :: proc(c: ^Cache, opts: Options) {
 	}
 }
 
-// Every shard is locked, or none is shared yet.
+/*
+Every shard is locked, or none is shared yet.
+
+The shards are counted again from the new limits, and the entries moved if the
+count changed: a count kept from larger limits would split smaller ones below
+the floors `shard_count` holds every share to, and refuse answers the whole
+budget has room for.
+*/
 @(private)
 apply_options :: proc(c: ^Cache, opts: Options) {
 	c.max_entries = max(opts.max_entries, 1)
-	c.max_bytes = opts.max_bytes if opts.max_bytes > 0 else DEFAULT_MAX_BYTES
-	for &s, i in c.shards {
-		sync.atomic_store(&s.max_entries, split(c.max_entries, len(c.shards), i))
-		sync.atomic_store(&s.max_bytes, split(c.max_bytes, len(c.shards), i))
+	sync.atomic_store(&c.max_bytes, opts.max_bytes if opts.max_bytes > 0 else DEFAULT_MAX_BYTES)
+	n := shard_count(c.max_entries, c.max_bytes)
+	if n != shards_in_use(c) {
+		reshard(c, n)
 	}
-	// The three lifetimes atomically: `put` reads them before it takes a
-	// lock, and `ttl_ceiling` without one.
+	for &s, i in c.shards {
+		s.max_entries = split(c.max_entries, n, i) if i < n else 0
+		s.max_bytes = split(c.max_bytes, n, i) if i < n else 0
+	}
+	// The three lifetimes and the byte budget atomically: `put` reads them
+	// before it takes a lock, and `ttl_ceiling` without one.
 	sync.atomic_store(&c.min_ttl, opts.min_ttl)
 	sync.atomic_store(&c.max_ttl, opts.max_ttl if opts.max_ttl > 0 else 86400)
 	sync.atomic_store(&c.negative_ttl, opts.negative_ttl)
 	c.serve_stale = opts.serve_stale
 	c.prefetch = opts.prefetch
 	c.prefetch_min = time.Duration(opts.prefetch_min_ttl) * time.Second
+}
+
+/*
+Spread the entries over `n` shards. Every shard is locked.
+
+A reload's work, under every lock, as the eviction and table shrink beside it
+already are: a pass over the entries and an insert each. Taken from the old
+shards' tails in turn, a step at a time, so each new shard's list keeps the
+order every old one had and interleaves them, which is as close to one LRU
+order as the shards ever kept. The limits are not applied here; the caller
+evicts against the new shares once they are set.
+*/
+@(private)
+reshard :: proc(c: ^Cache, n: int) {
+	old := shards_in_use(c)
+	cursors: [MAX_SHARDS]^Entry
+	serials: u64
+	for i in 0 ..< old {
+		s := &c.shards[i]
+		cursors[i] = s.tail
+		serials = max(serials, s.serials)
+		// The entries stay where they are in memory; only the indexes go.
+		clear(&s.entries)
+		s.head, s.tail = nil, nil
+		s.bytes = 0
+	}
+	bits: uint
+	for n > 1 << bits {
+		bits += 1
+	}
+	sync.atomic_store(&c.shard_bits, bits)
+	for moved := true; moved; {
+		moved = false
+		for i in 0 ..< old {
+			e := cursors[i]
+			if e == nil {
+				continue
+			}
+			cursors[i] = e.prev
+			to := shard_for(c, e.key, bits)
+			to.entries[e.key] = e
+			push_front(to, e)
+			to.bytes += entry_bytes(e)
+			moved = true
+		}
+	}
+	for &s in c.shards {
+		s.serials = serials
+		shrink_table(&s)
+	}
 }
 
 destroy :: proc(c: ^Cache) {
@@ -509,7 +601,6 @@ destroy :: proc(c: ^Cache) {
 		}
 		delete(s.entries)
 	}
-	delete(c.shards, c.allocator)
 	free(c, c.allocator)
 }
 
@@ -647,8 +738,7 @@ get :: proc(
 	if c == nil {
 		return nil, {}, false
 	}
-	s := shard_for(c, key)
-	sync.mutex_lock(&s.mu)
+	s := lock_shard(c, key)
 	defer sync.mutex_unlock(&s.mu)
 
 	e, found := s.entries[key]
@@ -919,8 +1009,7 @@ note_checked :: proc(c: ^Cache, key: string, serial: u64, checked: u64, refused:
 	if c == nil {
 		return
 	}
-	s := shard_for(c, key)
-	sync.mutex_lock(&s.mu)
+	s := lock_shard(c, key)
 	defer sync.mutex_unlock(&s.mu)
 	e, found := s.entries[key]
 	if !found || e.serial != serial {
@@ -965,8 +1054,7 @@ forget :: proc(c: ^Cache, key: string, serial: u64) {
 	if c == nil || serial == 0 {
 		return
 	}
-	s := shard_for(c, key)
-	sync.mutex_lock(&s.mu)
+	s := lock_shard(c, key)
 	defer sync.mutex_unlock(&s.mu)
 	if e, found := s.entries[key]; found && e.serial == serial {
 		remove_entry(c, s, e)
@@ -1093,8 +1181,7 @@ renewed :: proc(c: ^Cache, key: string, serial: u64) -> bool {
 	if c == nil {
 		return false
 	}
-	s := shard_for(c, key)
-	sync.mutex_lock(&s.mu)
+	s := lock_shard(c, key)
 	defer sync.mutex_unlock(&s.mu)
 	e, found := s.entries[key]
 	return found && e.serial != serial && !e.prefetched
@@ -1394,12 +1481,12 @@ thing in both directions.
 	Nothing an operator can set makes this reachable with real answers: the
 	smallest budget worth configuring is orders of magnitude past the 64 KiB a
 	response can be. "On its own" is in its shard's share, which `shard_count`
-	keeps at a megabyte or more - or nothing, in a shard a reload left no part
-	of a limit set below the number of shards.
+	keeps at a megabyte or more. Checked against the whole budget here, before
+	anything is copied, and against the share once the shard is locked, since a
+	reload may change the share in between.
 	*/
 	size := sizeof_entry(key, wire, offsets, ttls)
-	s := shard_for(c, key)
-	if sync.atomic_load(&s.max_entries) == 0 || size > sync.atomic_load(&s.max_bytes) {
+	if size > sync.atomic_load(&c.max_bytes) {
 		delete(offsets, c.allocator)
 		delete(ttls, c.allocator)
 		forget(c, key, stale)
@@ -1429,7 +1516,13 @@ thing in both directions.
 		}
 	}
 
-	sync.mutex_lock(&s.mu)
+	s := lock_shard(c, key)
+	if size > s.max_bytes {
+		sync.mutex_unlock(&s.mu)
+		free_entry(c, e)
+		forget(c, key, stale)
+		return false
+	}
 	defer sync.mutex_unlock(&s.mu)
 
 	if old, exists := s.entries[key]; exists {
@@ -1449,7 +1542,8 @@ thing in both directions.
 		}
 		remove_entry(c, s, old)
 	}
-	e.serial = sync.atomic_add(&c.serials, 1) + 1
+	s.serials += 1
+	e.serial = s.serials
 	s.entries[e.key] = e
 	push_front(s, e)
 	s.bytes += size

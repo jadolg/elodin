@@ -72,10 +72,10 @@ resident_proc :: proc(
 	return res, err
 }
 
-// What the cache holds whatever it stores: itself and its shards.
+// What the cache holds whatever it stores: itself, shards and all.
 @(private)
 fixed :: proc(c: ^Cache) -> int {
-	return chunk(c) + chunk(raw_data(c.shards))
+	return chunk(c)
 }
 
 // What every shard's table takes.
@@ -127,7 +127,7 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	// The premise: the budget binds, not the count.
 	testing.expectf(t, len_entries(c) < INSERTS, "all %d entries fit in the budget", INSERTS)
 
-	// The Cache itself is the only allocation the count leaves out.
+	// The Cache itself, shards and all, is the only allocation the count leaves out.
 	held := r.held - fixed(c)
 	used := bytes_used(c)
 	/*
@@ -255,7 +255,7 @@ test_sweep_shrinks_only_a_mostly_empty_table :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 1_000_000, max_bytes = 2 * MIN_SHARD_BYTES - 1, max_ttl = 3600})
 	defer destroy(c)
 
-	testing.expect_value(t, len(c.shards), 1)
+	testing.expect_value(t, shards_in_use(c), 1)
 	testing.expect_value(t, fill(c, ENTRIES), ENTRIES)
 	testing.expect_value(t, len_entries(c), ENTRIES)
 	kb: [KEY_MAX]u8
@@ -331,7 +331,7 @@ test_reconfigure_shrinks_a_table_with_nothing_to_evict :: proc(t: ^testing.T) {
 	c := make_cache(opts)
 	defer destroy(c)
 
-	testing.expect_value(t, len(c.shards), 1)
+	testing.expect_value(t, shards_in_use(c), 1)
 	testing.expect_value(t, fill(c, 3000), 3000)
 	s := &c.shards[0]
 	full := cap(s.entries)

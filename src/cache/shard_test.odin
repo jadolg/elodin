@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:sync"
 import "core:testing"
 import "core:thread"
+import "elodin:dns"
 
 // A cache the default size is split; one too small for a working share in each
 // is not, and keeps the one LRU order its size needs.
@@ -19,10 +20,10 @@ test_shard_count_follows_the_limits :: proc(t: ^testing.T) {
 
 	c := make_cache(Options{max_entries = 10_000})
 	defer destroy(c)
-	testing.expect_value(t, len(c.shards), MAX_SHARDS)
+	testing.expect_value(t, shards_in_use(c), MAX_SHARDS)
 	small := make_cache(Options{max_entries = 8})
 	defer destroy(small)
-	testing.expect_value(t, len(small.shards), 1)
+	testing.expect_value(t, shards_in_use(small), 1)
 }
 
 // The shares add up to exactly the configured limits, after a reload too, so
@@ -38,7 +39,7 @@ test_shares_add_up_to_the_limits :: proc(t: ^testing.T) {
 	}
 	c := make_cache(Options{max_entries = 10_007, max_bytes = 64 * 1024 * 1024 + 5})
 	defer destroy(c)
-	testing.expect_value(t, len(c.shards), MAX_SHARDS)
+	testing.expect_value(t, shards_in_use(c), MAX_SHARDS)
 	entries, bytes := sums(c)
 	testing.expect_value(t, entries, 10_007)
 	testing.expect_value(t, bytes, 64 * 1024 * 1024 + 5)
@@ -59,7 +60,7 @@ test_a_flood_fills_every_shard_within_the_limits :: proc(t: ^testing.T) {
 	MAX :: MIN_SHARD_ENTRIES * MAX_SHARDS
 	c := make_cache(Options{max_entries = MAX, max_ttl = 3600})
 	defer destroy(c)
-	testing.expect_value(t, len(c.shards), MAX_SHARDS)
+	testing.expect_value(t, shards_in_use(c), MAX_SHARDS)
 
 	kb: [KEY_MAX]u8
 	for i in 0 ..< 3 * MAX {
@@ -77,30 +78,128 @@ test_a_flood_fills_every_shard_within_the_limits :: proc(t: ^testing.T) {
 	testing.expect_value(t, stats(c).evictions, u64(3 * MAX - len_entries(c)))
 }
 
+// Whether every entry sits in the shard its key hashes to, and every shard's
+// byte total is what its entries hold.
+@(private = "file")
+consistent :: proc(t: ^testing.T, c: ^Cache) {
+	for &s in c.shards {
+		held := 0
+		for k, e in s.entries {
+			held += entry_bytes(e)
+			testing.expect(t, shard_for(c, k, c.shard_bits) == &s, "an entry sits in a shard its key does not hash to")
+		}
+		testing.expect_value(t, s.bytes, held)
+		testing.expect(t, len(s.entries) <= s.max_entries)
+	}
+}
+
 /*
-A reload that sets a limit below the number of shards leaves some shards no
-part of it, and those store nothing, so the cache holds what the limit says
-rather than one entry a shard.
+A reload counts the shards again from the new limits and moves the entries it
+keeps, which stay where a lookup finds them. A count kept from the old limits
+would split the new ones below the per-shard floors.
 */
 @(test)
-test_a_limit_below_the_shard_count_holds :: proc(t: ^testing.T) {
+test_a_reload_counts_the_shards_again :: proc(t: ^testing.T) {
 	opts := Options{max_entries = 100_000, max_ttl = 3600}
 	c := make_cache(opts)
 	defer destroy(c)
-	testing.expect_value(t, len(c.shards), MAX_SHARDS)
-	opts.max_entries = 3
-	reconfigure(c, opts)
-
+	testing.expect_value(t, shards_in_use(c), MAX_SHARDS)
 	kb: [KEY_MAX]u8
-	for i in 0 ..< 200 {
-		name := fmt.tprintf("z%d.example.", i)
-		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
-		key := key_for(kb[:], name)
-		stored := put(c, key, wire, msg)
-		testing.expect_value(t, stored, shard_for(c, key).max_entries > 0)
+	for i in 0 ..< 2000 {
+		name := fmt.tprintf("m%d.example.", i)
+		wire, msg := build_answer(name, 300, context.temp_allocator)
+		testing.expect(t, put(c, key_for(kb[:], name), wire, msg))
 		free_all(context.temp_allocator)
 	}
-	testing.expect_value(t, len_entries(c), 3)
+	found :: proc(c: ^Cache) -> (n: int) {
+		kb: [KEY_MAX]u8
+		for i in 0 ..< 2000 {
+			if _, _, ok := get(c, key_for(kb[:], fmt.tprintf("m%d.example.", i)), context.temp_allocator, probe = true); ok {
+				n += 1
+			}
+			free_all(context.temp_allocator)
+		}
+		return
+	}
+
+	opts.max_entries = 300
+	reconfigure(c, opts)
+	testing.expect_value(t, shards_in_use(c), 1)
+	testing.expect_value(t, c.shards[0].max_entries, 300)
+	testing.expect_value(t, len_entries(c), 300)
+	testing.expect_value(t, found(c), 300)
+	consistent(t, c)
+
+	opts.max_entries = 100_000
+	reconfigure(c, opts)
+	testing.expect_value(t, shards_in_use(c), MAX_SHARDS)
+	testing.expect_value(t, len_entries(c), 300)
+	testing.expect_value(t, found(c), 300)
+	consistent(t, c)
+}
+
+/*
+A reload to a smaller budget still takes the largest answers it has room for.
+Sixteen shards kept across a reload to 1 MiB would give each 64 KiB, under
+what one large answer takes.
+*/
+@(test)
+test_a_reload_to_a_small_budget_keeps_room_for_a_large_answer :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 10_000, max_ttl = 3600})
+	defer destroy(c)
+	testing.expect_value(t, shards_in_use(c), MAX_SHARDS)
+	reconfigure(c, Options{max_entries = 10_000, max_bytes = MIN_SHARD_BYTES, max_ttl = 3600})
+
+	records := make([]dns.Record, 3000, context.temp_allocator)
+	for &r, i in records {
+		r = {name = "big.example.", type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {10, 0, u8(i >> 8), u8(i)}}}
+	}
+	m := dns.Message {
+		question = []dns.Question{{name = "big.example.", type = .A, class = .IN}},
+		answer   = records,
+	}
+	m.flags.qr = true
+	wire, _, _ := dns.encode_message(m, context.temp_allocator)
+	msg, _ := dns.decode_message(wire, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "big.example.")
+	offsets, _ := dns.scan_ttl_offsets(wire, context.temp_allocator)
+	size := sizeof_entry(key, wire, offsets, make([]u32, len(offsets), context.temp_allocator))
+	testing.expectf(t, size > MIN_SHARD_BYTES / MAX_SHARDS, "the premise: an entry of %d bytes", size)
+	testing.expect(t, put(c, key, wire, msg), "a large answer the budget has room for was refused")
+}
+
+// A reload that moves the entries hands no serial out twice: one held across it
+// never names a later entry under the same key.
+@(test)
+test_a_reload_hands_no_serial_out_twice :: proc(t: ^testing.T) {
+	opts := Options{max_entries = 100_000, max_ttl = 3600}
+	c := make_cache(opts)
+	defer destroy(c)
+	kb: [KEY_MAX]u8
+	highest: u64
+	key: string
+	for i in 0 ..< 200 {
+		name := fmt.tprintf("q%d.example.", i)
+		wire, msg := build_answer(name, 300, context.temp_allocator)
+		key = key_for(kb[:], name)
+		put(c, key, wire, msg)
+		_, hit, _ := get(c, key, context.temp_allocator)
+		highest = max(highest, hit.serial)
+		free_all(context.temp_allocator)
+	}
+	opts.max_entries = 300
+	reconfigure(c, opts)
+	for i in 0 ..< 200 {
+		name := fmt.tprintf("q%d.example.", i)
+		wire, msg := build_answer(name, 300, context.temp_allocator)
+		key = key_for(kb[:], name)
+		put(c, key, wire, msg)
+		_, hit, _ := get(c, key, context.temp_allocator)
+		testing.expectf(t, hit.serial > highest, "serial %d handed out again after a reload", hit.serial)
+		free_all(context.temp_allocator)
+	}
 }
 
 // The hits and misses each shard counts add up to what was asked of the cache.
@@ -138,8 +237,8 @@ test_the_split_is_keyed :: proc(t: ^testing.T) {
 	differ := false
 	for i in 0 ..< 64 {
 		key := key_for(kb[:], fmt.tprintf("k%d.example.", i))
-		ia := int(uintptr(shard_for(a, key)) - uintptr(raw_data(a.shards))) / size_of(Shard)
-		ib := int(uintptr(shard_for(b, key)) - uintptr(raw_data(b.shards))) / size_of(Shard)
+		ia := int(uintptr(shard_for(a, key, a.shard_bits)) - uintptr(&a.shards[0])) / size_of(Shard)
+		ib := int(uintptr(shard_for(b, key, b.shard_bits)) - uintptr(&b.shards[0])) / size_of(Shard)
 		differ ||= ia != ib
 	}
 	testing.expect(t, differ, "two caches put 64 names in the same shards")
@@ -154,26 +253,26 @@ Probe :: struct {
 
 /*
 What the shards are for (issue #582): a lookup in one shard does not wait on
-another. With the one lock this held before, the lookup below would sit behind
-the lock the test holds.
+another. Behind a single lock for the whole cache, the lookup below would sit
+behind the lock the test holds.
 */
 @(test)
 test_a_lookup_does_not_wait_on_another_shard :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 100_000, max_ttl = 3600})
 	defer destroy(c)
 	kb, other: [KEY_MAX]u8
-	held := shard_for(c, key_for(kb[:], "held.example."))
+	held := shard_for(c, key_for(kb[:], "held.example."), c.shard_bits)
 	p := new(Probe)
 	defer free(p)
 	p.c = c
 	for i in 0 ..< 1000 {
 		p.key = key_for(other[:], fmt.tprintf("o%d.example.", i))
-		if shard_for(c, p.key) != held {
+		if shard_for(c, p.key, c.shard_bits) != held {
 			break
 		}
 	}
-	testing.expect(t, shard_for(c, p.key) != held, "the premise: no name fell in another shard")
-	testing.expect_value(t, len(c.shards), MAX_SHARDS)
+	testing.expect(t, shard_for(c, p.key, c.shard_bits) != held, "the premise: no name fell in another shard")
+	testing.expect_value(t, shards_in_use(c), MAX_SHARDS)
 
 	sync.mutex_lock(&held.mu)
 	th := thread.create_and_start_with_data(p, proc(data: rawptr) {
@@ -201,8 +300,10 @@ Racer :: struct {
 
 /*
 Lookups, stores, removals and reloads from several threads at once leave every
-shard's byte total equal to what its entries hold, and the whole within the
-limits. A total that drifts is a bound that does not hold.
+entry in the shard its key hashes to, every shard's byte total equal to what
+its entries hold, and the whole within the limits. The reloads move between
+four and sixteen shards, so lookups race the entries being moved. A total that
+drifts is a bound that does not hold.
 */
 @(test)
 test_shards_account_under_concurrency :: proc(t: ^testing.T) {
@@ -237,15 +338,6 @@ test_shards_account_under_concurrency :: proc(t: ^testing.T) {
 		thread.join(th)
 		thread.destroy(th)
 	}
-	total := 0
-	for &s in c.shards {
-		held := 0
-		for _, e in s.entries {
-			held += entry_bytes(e)
-		}
-		testing.expect_value(t, s.bytes, held)
-		testing.expect(t, len(s.entries) <= s.max_entries)
-		total += len(s.entries)
-	}
-	testing.expect(t, total <= c.max_entries)
+	consistent(t, c)
+	testing.expect(t, len_entries(c) <= c.max_entries)
 }
