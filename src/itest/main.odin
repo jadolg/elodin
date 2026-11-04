@@ -124,6 +124,18 @@ main :: proc() {
 		os.exit(2)
 	}
 
+	// A live parity run reads the clock before it claims anything, so a refusal
+	// costs no port slot, work dir or certificate. See parity_clock.odin.
+	clock_note := ""
+	if parity && parity_opts.upstream != "" {
+		clock := parity_clock_check()
+		if clock.refuse {
+			fmt.eprintfln("itest: the host clock: %s", clock.note)
+			os.exit(1)
+		}
+		clock_note = clock.note
+	}
+
 	base_port, slot_ok := claim_port_slot()
 	if !slot_ok {
 		fmt.eprintfln("itest: all %d port slots are taken by other runs", SLOTS)
@@ -155,6 +167,9 @@ main :: proc() {
 	fmt.printfln("  ports:     %d-%d", base_port, r.port_limit - 1)
 	if !cert_ok {
 		fmt.println("  note:      no certificate available, TLS cases will be skipped")
+	}
+	if clock_note != "" {
+		fmt.printfln("  clock:     %s", clock_note)
 	}
 	fmt.println()
 

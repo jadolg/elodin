@@ -76,7 +76,7 @@ parity_clock_judge :: proc(
 				return {
 					refuse = true,
 					note = fmt.tprintf(
-						"the clock is %.0fs %s of NTP time (chronyc tracking); signatures would be judged against the wrong time, so a live run would measure the clock rather than elodin. Fix the clock (e.g. `sudo chronyc makestep`) and run again",
+						"the clock is %.1fs %s of NTP time (chronyc tracking); signatures would be judged against the wrong time, so a live run would measure the clock rather than elodin. Fix the clock (e.g. `sudo chronyc makestep`) and run again",
 						abs(offset),
 						offset > 0 ? "slow" : "fast",
 					),

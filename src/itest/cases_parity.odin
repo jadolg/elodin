@@ -140,16 +140,6 @@ run_parity_cases :: proc(r: ^Runner, opts: Parity_Options) {
 // --- live mode -------------------------------------------------------------
 
 run_parity_live :: proc(r: ^Runner, opts: Parity_Options) {
-	// Before the first query, and once: see parity_clock.odin.
-	clock := parity_clock_check()
-	if clock.refuse {
-		start_case(r, "parity: the host clock")
-		fail(r, "%s", clock.note)
-		end_case(r)
-		return
-	}
-	fmt.printfln("  clock: %s", clock.note)
-
 	name := opts.scenario if opts.scenario != "baseline" else "live"
 	scenarios := parity_scenarios_named(name, true)
 	if scenarios == nil {

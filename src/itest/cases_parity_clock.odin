@@ -48,9 +48,9 @@ parity_clock_judge_case :: proc(r: ^Runner) {
 	}
 	rows := []Row {
 		// The box the issue was found on.
-		{"2h24m slow", chronyc_tracking("8640.000000000 seconds slow"), true, "", false, true, "8640s slow"},
-		{"2h24m fast", chronyc_tracking("8640.000000000 seconds fast"), true, "", false, true, "8640s fast"},
-		{"just past the limit", chronyc_tracking("60.500000000 seconds slow"), true, "", false, true, "60s slow"},
+		{"2h24m slow", chronyc_tracking("8640.000000000 seconds slow"), true, "", false, true, "8640.0s slow"},
+		{"2h24m fast", chronyc_tracking("8640.000000000 seconds fast"), true, "", false, true, "8640.0s fast"},
+		{"just past the limit", chronyc_tracking("60.500000000 seconds slow"), true, "", false, true, "60.5s slow"},
 		{"just inside the limit", chronyc_tracking("59.900000000 seconds fast"), true, "", false, false, "59.900s fast"},
 		{"in sync", chronyc_tracking("0.001557089 seconds slow"), true, "", false, false, "0.002s slow"},
 		// An offset chronyd has nothing to base on is not a measurement.
@@ -100,8 +100,18 @@ parity_clock_refuses_live_run_case :: proc(r: ^Runner) {
 		return
 	}
 
-	env := make([dynamic]string, context.temp_allocator)
-	inherited, _ := os.environ(context.temp_allocator)
+	// The script must run as itself: on a work dir mounted noexec the child would
+	// fall through to this host's clock and start a live run.
+	_, _, _, xerr := os.process_exec(os.Process_Desc{command = {chronyc}}, context.temp_allocator)
+	if !check(r, xerr == nil, "cannot run %s (is %s mounted noexec?): %v", chronyc, r.work_dir, xerr) {
+		return
+	}
+
+	inherited, eerr := os.environ(context.temp_allocator)
+	if !check(r, eerr == nil, "cannot read the environment: %v", eerr) {
+		return
+	}
+	env := make([dynamic]string, 0, len(inherited) + 1, context.temp_allocator)
 	for kv in inherited {
 		if !strings.has_prefix(kv, "PATH=") {
 			append(&env, kv)
@@ -124,7 +134,8 @@ parity_clock_refuses_live_run_case :: proc(r: ^Runner) {
 	output := fmt.tprintf("%s%s", stdout, stderr)
 	check(r, state.exit_code != 0, "the run exited 0:\n%s", output)
 	// The premise: the run read the case's chronyc, not this host's.
-	check(r, strings.contains(output, "8640s slow"), "the run did not read the clock the case set:\n%s", output)
+	check(r, strings.contains(output, "8640.0s slow"), "the run did not read the clock the case set:\n%s", output)
 	check(r, strings.contains(output, "the host clock"), "the refusal does not name the clock:\n%s", output)
-	check(r, !strings.contains(output, "parity against"), "a scenario started on a refused clock:\n%s", output)
+	// Refused before it claimed a port slot, let alone sent a query.
+	check(r, !strings.contains(output, "ports:"), "the run started on a refused clock:\n%s", output)
 }
