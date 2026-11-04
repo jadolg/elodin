@@ -3089,3 +3089,17 @@ test_client_response_head_is_held_to_8_2_and_8_3 :: proc(t: ^testing.T) {
 		mem.tracking_allocator_destroy(&track)
 	}
 }
+
+// The server's rule on the client's side: a CONTINUATION with no block open is
+// a connection error, stream 0 included, and never reaches the HPACK decoder.
+@(test)
+test_client_continuation_on_stream_zero_with_no_block_open_is_refused :: proc(t: ^testing.T) {
+	c := client_make(IO{user = nil, read = hook_read_nothing, write = write_nothing})
+	// x-t: 1, with incremental indexing: a decoder that took it has an entry.
+	block := []u8{0x40, 0x03, 'x', '-', 't', 0x01, '1'}
+	ok := client_handle_continuation(c, Frame_Header{length = len(block), type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 0}, block)
+	testing.expect(t, !ok, "a CONTINUATION on stream 0 with no block open was accepted")
+	testing.expect_value(t, len(c.decoder.entries), 0)
+	client_unref(c)
+	free_all(context.temp_allocator)
+}

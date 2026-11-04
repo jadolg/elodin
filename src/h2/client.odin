@@ -594,7 +594,8 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 
 @(private)
 client_handle_continuation :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
-	if c.continuation_on != h.stream_id {
+	// As on the server: no block open is no stream to continue, 0 included.
+	if c.continuation_on == 0 || c.continuation_on != h.stream_id {
 		client_goaway(c, .Protocol_Error)
 		return false
 	}
@@ -733,25 +734,24 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 		if malformed {
 			s.reset = true
 			loop.cond_broadcast(&c.cond)
-		}
-	}
-	if found && !already_ended && !malformed {
-		/*
-		An upstream may PING about as often as it answers - keepalive, or
-		probing bandwidth - and one busy pooled connection answers far more
-		than MAX_CONTROL_FRAMES_PER_SECOND queries, so a flat budget would drop
-		every query in flight on it. Each response to a request of ours earns
-		one frame back instead: an upstream is held to our own query rate plus
-		the budget, never to a rate it can raise by itself. Once per stream,
-		and a stream id is only ever ours to open.
-		*/
-		if !s.refunded {
-			s.refunded = true
-			control_budget_refund(&c.control)
-		}
-		if s.end_stream {
-			s.done = true
-			loop.cond_broadcast(&c.cond)
+		} else {
+			/*
+			An upstream may PING about as often as it answers - keepalive, or
+			probing bandwidth - and one busy pooled connection answers far more
+			than MAX_CONTROL_FRAMES_PER_SECOND queries, so a flat budget would drop
+			every query in flight on it. Each response to a request of ours earns
+			one frame back instead: an upstream is held to our own query rate plus
+			the budget, never to a rate it can raise by itself. Once per stream,
+			and a stream id is only ever ours to open.
+			*/
+			if !s.refunded {
+				s.refunded = true
+				control_budget_refund(&c.control)
+			}
+			if s.end_stream {
+				s.done = true
+				loop.cond_broadcast(&c.cond)
+			}
 		}
 	}
 	loop.unlock(&c.mu)

@@ -3713,3 +3713,50 @@ test_headers_after_end_stream_is_a_stream_error :: proc(t: ^testing.T) {
 		mem.tracking_allocator_destroy(&track)
 	}
 }
+
+/*
+RFC 9113 6.10: a CONTINUATION follows a HEADERS without END_HEADERS on the same
+stream, and stream 0 is no stream at all; either broken is a connection error
+of type PROTOCOL_ERROR. With no block open, one on stream 0 is both, and is
+refused before anything of it reaches the HPACK decoder.
+*/
+@(test)
+test_continuation_on_stream_zero_with_no_block_open_is_refused :: proc(t: ^testing.T) {
+	log: Request_Log
+	c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, counting_handler, &log)
+	trailer := TRAILER
+	ok := handle_continuation(c, Frame_Header{length = len(trailer), type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 0}, trailer[:])
+	testing.expect(t, !ok && log.goaway, "a CONTINUATION on stream 0 with no block open was accepted")
+	testing.expect_value(t, len(c.decoder.entries), 0)
+	conn_unref(c)
+	free_all(context.temp_allocator)
+}
+
+/*
+A block on a stream past taking one draws STREAM_CLOSED once, then nothing -
+but each is still decoded, so each is charged to MAX_CONTROL_FRAMES_PER_SECOND,
+and a peer repeating them on a stream a slow handler holds runs the budget out
+and loses the connection like any other.
+*/
+@(test)
+test_repeated_headers_on_a_held_stream_are_budgeted :: proc(t: ^testing.T) {
+	log: Request_Log
+	c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, destroying_handler, &log, context.allocator)
+	defer conn_unref(c)
+	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+	repeat := Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}
+	testing.expect(t, handle_headers(c, repeat, []u8{0x82}), "the first block past taking one dropped the connection")
+	testing.expect_value(t, log.rsts, 1)
+
+	// One frame left in a window that cannot roll over mid-test: the next
+	// repeat spends it.
+	c.control.window = time.tick_add(time.tick_now(), time.Hour)
+	c.control.frames = MAX_CONTROL_FRAMES_PER_SECOND - 1
+	testing.expect(t, handle_headers(c, repeat, []u8{0x82}), "a repeat within the budget dropped the connection")
+	testing.expect_value(t, log.rsts, 1)
+	testing.expect(t, !handle_headers(c, repeat, []u8{0x82}), "a repeat past the budget was taken for free")
+	testing.expect(t, log.goaway, "no GOAWAY once the budget was spent")
+	close_stream(c, 1)
+	free_all(context.temp_allocator)
+}

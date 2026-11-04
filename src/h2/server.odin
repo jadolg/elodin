@@ -753,7 +753,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 	loop.lock(&c.mu)
 	c.block_stream = nil
-	stream_closed := false
+	stream_closed, past_taking := false, false
 	if h.stream_id <= c.last_stream_id {
 		s, found := c.streams[h.stream_id]
 		switch {
@@ -773,9 +773,13 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			so it takes no more blocks: a stream error of type STREAM_CLOSED,
 			answered once and skipped on one the peer reset itself (5.4.2), as
 			DATA is in `handle_data`. The stream stays its handler's to retire,
-			so the block is decoded on its own.
+			so the block is decoded on its own. A block draws no reply after the
+			first but still costs a decode, so each is charged to
+			MAX_CONTROL_FRAMES_PER_SECOND: a peer repeating them on a stream a
+			slow handler holds is held to the rate any other is.
 			*/
 			stream_closed = mark_stream_closed(c, s)
+			past_taking = true
 		case was_reset_here(c, h.stream_id, forget = true) && h.flags & FLAG_END_STREAM != 0:
 		/*
 		A stream this end reset and retired while the peer was still sending
@@ -823,6 +827,9 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	if stream_closed && !stream_error(c, h.stream_id, .Stream_Closed) {
 		return false
 	}
+	if past_taking && !stream_closed && !spend_control_budget(c) {
+		return false
+	}
 	if h.flags & FLAG_END_HEADERS == 0 {
 		// Held for the CONTINUATION frames that bring the rest of it.
 		delete(c.header_block)
@@ -837,7 +844,9 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 @(private)
 handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
-	if c.continuation_on != h.stream_id {
+	// RFC 9113 6.10: only behind a HEADERS without END_HEADERS, on its stream;
+	// with no block open, `continuation_on` is 0, which is no stream either.
+	if c.continuation_on == 0 || c.continuation_on != h.stream_id {
 		goaway(c, .Protocol_Error)
 		return false
 	}
