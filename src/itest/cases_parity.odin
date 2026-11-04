@@ -903,23 +903,25 @@ read. The reference was then that stub against a whole cached answer: "tc
 (truncated): upstream 1, elodin 0" and a page of records "the upstream did not
 send".
 
-The loser's two exchanges are played here by hand against the mock a run uses,
-and `parity_upstreams_drain` is asked after each with a deadline already past,
-so what it says rests on what is on record and on nothing timed. The query is
-the one #286 found, a known shape that overflows 512 bytes, so the stub is a
-stub.
+The race scenario's two members are played here by hand against the mocks a run
+uses - the loser's datagram and its retry over TCP on one, the winner's whole
+reply on the other - and `parity_upstreams_drain` is asked after each with a
+deadline already past, so what it says rests on what is on record and on nothing
+timed. The winner's reply alone does not end the race: every member's has to be
+in. The query is the one #286 found, a known shape that overflows 512 bytes, so
+the stub is a stub.
 */
 @(private = "file")
 parity_race_drain_case :: proc(r: ^Runner) {
 	start_case(r, "parity: a race is not over until the loser's whole reply is in")
 	defer end_case(r)
 
-	ups, started := parity_upstreams_start(r, Parity_Scenario{kinds = {.UDP}})
+	ups, started := parity_upstreams_start(r, Parity_Scenario{kinds = {.UDP, .TCP}})
 	defer parity_upstreams_stop(&ups)
 	if !started {
 		return
 	}
-	mock, mock_port := ups.mocks[0], ups.ports[0]
+	mock, mock_port, winner_port := ups.mocks[0], ups.ports[0], ups.ports[1]
 
 	q := parity_fixed_query(PARITY_286_NAME, 48, PARITY_286_CEILING)
 	parity_upstreams_reset(&ups)
@@ -937,7 +939,13 @@ parity_race_drain_case :: proc(r: ^Runner) {
 	check(r, asked, "a stub on record alone is not read as the upstream having been asked")
 	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained on the stub, before its retry over TCP")
 
-	// Its retry over TCP, and the race is over.
+	// The winner's whole reply, with the loser's retry still to come.
+	if !check(r, query_tcp(winner_port, q.wire, context.temp_allocator).ok, "the mock did not answer the winner's query over tcp") {
+		return
+	}
+	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained on the winner's whole reply, before the loser's retry over TCP")
+
+	// The loser's retry over TCP, and the race is over.
 	tcp := query_tcp(mock_port, q.wire, context.temp_allocator)
 	if !check(r, tcp.ok, "the mock did not answer the retry over tcp") {
 		return
