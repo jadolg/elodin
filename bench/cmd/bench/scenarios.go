@@ -198,6 +198,7 @@ func (h *harness) runAll(filter string) (string, error) {
 		{"inflight", h.inflight},
 		{"latency", h.latency},
 		{"logging", h.loggingCost},
+		{"compare", h.compare},
 	}
 
 	for _, st := range steps {
@@ -249,7 +250,7 @@ func (h *harness) workloads() (section, error) {
 	// Cache hits and misses share one server: the cache is what separates them.
 	// Every query is matched against the lists first, so they hold the memory
 	// table's rules: a list of one fits in L1 and hides what a lookup costs.
-	s, err := h.start(serverOpts{name: "workloads", cache: true, blockRules: listRules})
+	s, err := h.startServer(serverOpts{name: "workloads", cache: true, blockRules: listRules})
 	if err != nil {
 		return section{}, err
 	}
@@ -322,7 +323,7 @@ func (h *harness) loops() (section, error) {
 	for _, kind := range h.kinds {
 		// Past the two cores, but within the 64 readers elodin's loader accepts.
 		for _, loops := range []int{1, 2, min(runtime.NumCPU(), 64)} {
-			s, err := h.start(serverOpts{
+			s, err := h.startServer(serverOpts{
 				name: "loops", kind: kind, cache: true, loops: loops, maxPending: 4096, cpus: "0-1",
 			})
 			if err != nil {
@@ -366,7 +367,7 @@ func (h *harness) misses() (section, error) {
 			return section{}, err
 		}
 		for _, kind := range h.kinds {
-			s, err := h.start(serverOpts{
+			s, err := h.startServer(serverOpts{
 				name: "misses", kind: kind, cache: true, maxPending: 4096, upstreamAddr: mock,
 			})
 			if err != nil {
@@ -410,7 +411,7 @@ func (h *harness) connections() (section, error) {
 				if n > *held || (kind == "unbound" && n > unboundHeld) {
 					continue
 				}
-				s, err := h.start(serverOpts{
+				s, err := h.startServer(serverOpts{
 					name: "conns", kind: kind, cache: true,
 					maxConnections: n + 64, clientTimeout: 120 * time.Second,
 				})
@@ -448,7 +449,7 @@ func (h *harness) inflight() (section, error) {
 	sb.WriteString("| server | in flight | answered | idle RSS | peak RSS | per query in flight |\n|---|---|---|---|---|---|\n")
 	for _, kind := range h.kinds {
 		for _, n := range []int{1000, 3000} {
-			s, err := h.start(serverOpts{
+			s, err := h.startServer(serverOpts{
 				name: "inflight", kind: kind, maxPending: n + 256, upstreamAddr: mock,
 			})
 			if err != nil {
@@ -477,7 +478,7 @@ func (h *harness) latency() (section, error) {
 	sb.WriteString("100 clients, each holding its connection, every answer from the cache.\n\n")
 	sb.WriteString("| server | transport | throughput | p50 | p99 |\n|---|---|---|---|---|\n")
 	for _, kind := range h.kinds {
-		s, err := h.start(serverOpts{name: "latency", kind: kind, cache: true})
+		s, err := h.startServer(serverOpts{name: "latency", kind: kind, cache: true})
 		if err != nil {
 			return section{}, err
 		}
@@ -559,7 +560,7 @@ func perItem(delta int64, n int) string {
 // transports is the second table of a run: every listener, each client holding
 // its own connection, answering from the cache.
 func (h *harness) transports() (section, error) {
-	s, err := h.start(serverOpts{name: "transports", cache: true})
+	s, err := h.startServer(serverOpts{name: "transports", cache: true})
 	if err != nil {
 		return section{}, err
 	}
@@ -593,7 +594,7 @@ func (h *harness) transports() (section, error) {
 // h1VersusH2 is the comparison that justifies serving HTTP/2 at all: the same
 // concurrent misses over each protocol.
 func (h *harness) h1VersusH2() (section, error) {
-	s, err := h.start(serverOpts{name: "h1h2", cache: true})
+	s, err := h.startServer(serverOpts{name: "h1h2", cache: true})
 	if err != nil {
 		return section{}, err
 	}
@@ -620,7 +621,7 @@ func (h *harness) cpuPerQuery() (section, error) {
 	var sb strings.Builder
 	sb.WriteString("| server | transport | CPU per query | at 5,000 qps |\n|---|---|---|---|\n")
 	for _, kind := range h.kinds {
-		s, err := h.start(serverOpts{name: "cpu", kind: kind, cache: true})
+		s, err := h.startServer(serverOpts{name: "cpu", kind: kind, cache: true})
 		if err != nil {
 			return section{}, err
 		}
@@ -650,7 +651,7 @@ func (h *harness) handshakes() (section, error) {
 	sb.WriteString("| key | handshakes/s | CPU per handshake | p50 |\n|---|---|---|---|\n")
 
 	for _, kind := range []string{"ecdsa", "rsa"} {
-		s, err := h.start(serverOpts{name: "handshake-" + kind, cache: true, certKind: kind})
+		s, err := h.startServer(serverOpts{name: "handshake-" + kind, cache: true, certKind: kind})
 		if err != nil {
 			return section{}, err
 		}
@@ -713,7 +714,7 @@ func (h *harness) memory() (section, error) {
 }
 
 func (h *harness) idleRSS(o serverOpts) (int64, error) {
-	s, err := h.start(o)
+	s, err := h.startServer(o)
 	if err != nil {
 		return 0, err
 	}
@@ -732,7 +733,7 @@ type cacheFill struct {
 // cacheFilledRSS drives unique names until the cache is as full as it will get,
 // and reports what the process weighed at the end.
 func (h *harness) cacheFilledRSS(o serverOpts) (cacheFill, error) {
-	s, err := h.start(o)
+	s, err := h.startServer(o)
 	if err != nil {
 		return cacheFill{}, err
 	}
@@ -765,7 +766,7 @@ func (h *harness) shedding() (section, error) {
 	sb.WriteString("| max_pending | served | p50 | p99 | dropped |\n|---|---|---|---|---|\n")
 
 	for _, mp := range []int{1024, 8192} {
-		s, err := h.start(serverOpts{
+		s, err := h.startServer(serverOpts{
 			name: fmt.Sprintf("shed-%d", mp), cache: true, maxPending: mp,
 		})
 		if err != nil {
@@ -797,7 +798,7 @@ func (h *harness) loggingCost() (section, error) {
 	for _, on := range []bool{false, true} {
 		// Both runs log at info so the only difference between them is whether
 		// a line is written per query.
-		s, err := h.start(serverOpts{
+		s, err := h.startServer(serverOpts{
 			name: fmt.Sprintf("log-%t", on), cache: true, logQueries: on, logLevel: "info",
 		})
 		if err != nil {
@@ -820,7 +821,7 @@ func (h *harness) loggingCost() (section, error) {
 
 	// What it writes is the part that matters regardless of what it costs: this
 	// is the one thing that touches the disk in steady state.
-	s, err := h.start(serverOpts{
+	s, err := h.startServer(serverOpts{
 		name: "log-bytes", cache: true, logQueries: true, logLevel: "info",
 	})
 	if err != nil {

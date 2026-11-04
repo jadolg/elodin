@@ -47,7 +47,7 @@ func (h *harness) dnssecSurvey(reference string) (string, error) {
 		return "", err
 	}
 
-	s, err := h.start(serverOpts{
+	s, err := h.startServer(serverOpts{
 		name:   "survey",
 		dnssec: true,
 		// The cache is on because zone keys are cached with it: without that

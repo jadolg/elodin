@@ -75,6 +75,54 @@ so it refuses the harness's configuration in the work directory. Copy the binary
 elsewhere (`cp /usr/sbin/unbound /tmp/unbound`) and pass the copy with
 `-unbound`; the profile is attached by path, so the copy runs unconfined.
 
+## Against the competition
+
+`-only compare` runs one set of rows against every server in `-servers`:
+
+- what the server weighs idle, with a 250,000-name list, and per cached answer;
+- cache hits on every transport it serves, and cache misses, on two pinned cores;
+- what a held connection and a waiting query cost.
+
+`-servers all` is elodin, Unbound, AdGuard Home, Blocky, Pi-hole FTL, CoreDNS,
+dnsmasq, PowerDNS Recursor, dnsdist, BIND and Knot Resolver; the other sections
+refuse any server but elodin and Unbound. `cmd/bench/competitors.go` maps
+elodin's settings onto each server and says where one has no counterpart. A
+cell that fails reads "failed" and the reason is listed under the tables, so
+one server's bad night does not lose the others.
+
+```sh
+go run ./cmd/bench -only compare -servers all -competitors ~/competitors -unbound /tmp/unbound
+```
+
+`-competitors` is a directory holding the servers that are not on `PATH`:
+
+- `bin/`: the release binaries of AdGuard Home (renamed `adguardhome`), Blocky,
+  CoreDNS and `pihole-FTL`, from each project's GitHub releases;
+- `root/`: the Ubuntu packages, extracted rather than installed, so nothing
+  starts on port 53. Run `apt-get download pdns-recursor dnsdist bind9
+  bind9-libs dnsmasq-base knot-resolver6`, add the libraries `ldd` says are
+  missing, and `dpkg -x` each into `root/`. The servers run with
+  `LD_LIBRARY_PATH` pointing in there;
+- `pihole/gravity.db.sql`: Pi-hole's schema, `advanced/Templates/gravity.db.sql`
+  from the pi-hole/pi-hole repository at its release tag.
+
+Three of them need the machine prepared:
+
+- **Knot Resolver** loads its Lua from `/usr/lib/knot-resolver`, whatever the
+  prefix, so link that path to `root/usr/lib/knot-resolver`. Its `kres.lua` and
+  `zonefile.lua` `ffi.load` their libraries by absolute path; change those calls
+  to load by soname (`libknot_SONAME:gsub('^.*/', '')`) so `LD_LIBRARY_PATH`
+  finds them.
+- **Pi-hole FTL** reads its configuration and list from `/etc/pihole` and
+  nowhere else. Each run starts it as root (`sudo unshare -m`) with the run's
+  directory bound over `/etc/pihole`, which has to exist as an empty directory.
+- **Unbound** needs the AppArmor workaround above.
+
+Blocky, Pi-hole and Knot answer all of `test.` themselves (RFC 6761), as Unbound
+does, so each config forwards the mock's zone explicitly. Knot runs as one
+process, which is one thread: it scales by running a process per core, and the
+harness samples one pid.
+
 ## Why the load generator is its own thing
 
 `cmd/loadgen` builds and parses DNS messages itself (`internal/dnswire`) rather
@@ -117,6 +165,7 @@ That control is how the query-logging result was confirmed rather than assumed.
 | `inflight` | resident memory per query waiting on a three-second upstream |
 | `latency` | cache-hit latency under a light, steady load |
 | `logging` | what `log.queries` costs and what it writes |
+| `compare` | elodin against every server in `-servers` (see above) |
 
 Rows that depend on the server doing a particular thing assert it: the blocked
 row fails unless the answers are NXDOMAIN, so a rule that stopped matching shows

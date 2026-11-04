@@ -79,6 +79,20 @@ type server struct {
 	pid     int
 }
 
+// startServer starts a server, and again if it fails: freePort hands out a port it
+// has just closed, and something else on the machine can take it first.
+func (h *harness) startServer(o serverOpts) (*server, error) {
+	var err error
+	for range 3 {
+		var s *server
+		if s, err = h.start(o); err == nil {
+			s.pid = serverPid(s.pid)
+			return s, nil
+		}
+	}
+	return nil, err
+}
+
 func (h *harness) start(o serverOpts) (*server, error) {
 	if o.kind == "" {
 		o.kind = "elodin"
@@ -146,7 +160,7 @@ func (h *harness) start(o serverOpts) (*server, error) {
 	case "unbound":
 		argv, err = h.unboundConfig(o, p, s.logPath)
 	default:
-		err = fmt.Errorf("unknown server kind %q", o.kind)
+		argv, err = h.competitorConfig(o, p)
 	}
 	if err != nil {
 		return nil, err
@@ -248,10 +262,10 @@ func unboundThreads(loops int) int {
 // far as the two overlap, and returns the command that runs it in the
 // foreground.
 func (h *harness) unboundConfig(o serverOpts, p ports, logPath string) ([]string, error) {
-	if o.blockRules > 0 || o.dnssec || o.noUpstream {
+	if o.dnssec || o.noUpstream {
 		// Each of these would need Unbound configured in a way the rows that
 		// use them do not compare, so a row asking for one is a mistake.
-		return nil, fmt.Errorf("%s: blocklists, validation and a dead upstream are elodin-only rows", o.name)
+		return nil, fmt.Errorf("%s: validation and a dead upstream are elodin-only rows", o.name)
 	}
 	threads := unboundThreads(o.loops)
 	// Unbound allocates its TCP handlers per thread, a message buffer each, and
@@ -278,11 +292,29 @@ func (h *harness) unboundConfig(o serverOpts, p ports, logPath string) ([]string
 	cert := filepath.Join(h.dir, o.certKind+"-cert.pem")
 	key := filepath.Join(h.dir, o.certKind+"-key.pem")
 
+	// Room for the row's cached answers several times over, so the cache is
+	// never what separates the two: an answer is a message and an RRset.
+	msgCache := o.cacheEntries * 1024
+	if o.cacheEntries >= 10000 {
+		msgCache = max(msgCache, 32<<20)
+	}
 	cfg := fmt.Sprintf(unboundTemplate,
 		threads, p.dns, p.dot, p.doh, p.dns, p.dot, p.doh, key, cert,
-		maxTTL, inflight, 2*inflight, perThreadTCP, o.clientTimeout.Milliseconds(),
+		msgCache, 2*msgCache, maxTTL, inflight, 2*inflight, perThreadTCP, o.clientTimeout.Milliseconds(),
 		h.dir, logPath, logQueries, p.upHost, p.upPort)
 
+	if o.blockRules > 0 {
+		// local-zone is how Unbound is given a blocklist (Pi-hole's own
+		// Unbound guide, unbound-adblock); always_nxdomain answers as elodin's
+		// list does here.
+		list, err := h.writeList(o, "conf", "server:\n", func(n string) string {
+			return fmt.Sprintf("  local-zone: %q always_nxdomain", n+".")
+		})
+		if err != nil {
+			return nil, err
+		}
+		cfg += "include: " + list + "\n"
+	}
 	cfgPath := filepath.Join(h.dir, o.name+"-unbound.conf")
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		return nil, err
@@ -466,10 +498,8 @@ const unboundTemplate = `server:
   # address asking as fast as it can.
   ratelimit: 0
   ip-ratelimit: 0
-  # Room for elodin's 10,000 cached answers several times over, so the cache
-  # is never what separates the two.
-  msg-cache-size: 32m
-  rrset-cache-size: 64m
+  msg-cache-size: %d
+  rrset-cache-size: %d
 %s  num-queries-per-thread: %d
   outgoing-range: %d
   outgoing-num-tcp: 64
@@ -499,3 +529,30 @@ forward-zone:
   name: "."
   forward-addr: %s@%s
 `
+
+// serverPid follows the wrappers a command line can start with (taskset,
+// env and sh exec into what they run; sudo stays as the parent) down to the
+// server itself, which is the process to sample.
+func serverPid(pid int) int {
+	for {
+		comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		if err != nil {
+			return pid
+		}
+		switch strings.TrimSpace(string(comm)) {
+		case "sudo", "unshare", "sh", "env", "taskset":
+		default:
+			return pid
+		}
+		kids, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid))
+		f := strings.Fields(string(kids))
+		if err != nil || len(f) != 1 {
+			return pid
+		}
+		var next int
+		if _, err := fmt.Sscan(f[0], &next); err != nil {
+			return pid
+		}
+		pid = next
+	}
+}
