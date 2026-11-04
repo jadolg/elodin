@@ -30,7 +30,7 @@ stored :: proc(c: ^Cache, m: dns.Message, qtype: dns.Type) -> (e: ^Entry, ok: bo
 	if !put(c, key, wire, msg) {
 		return nil, false
 	}
-	return c.entries[key]
+	return c.shards[0].entries[key]
 }
 
 // A signed A answer with a one-day TTL whose RRSIG lapses at `expiration`.

@@ -189,7 +189,7 @@ test_a_bogus_verdict_is_kept_for_its_own_minute :: proc(t: ^testing.T) {
 		return
 	}
 
-	e := c.entries[key]
+	e := c.shards[0].entries[key]
 	if !testing.expect(t, e != nil, "the entry went in under another key") {
 		return
 	}
@@ -607,13 +607,13 @@ test_byte_accounting_comes_back_to_the_table :: proc(t: ^testing.T) {
 	sync_expire(c, key_for(kb[:], "a.example."))
 	_, _, _ = get(c, key_for(kb[:], "a.example."), context.temp_allocator)
 	// The table stays, at its least, and is all that is counted.
-	testing.expect_value(t, bytes_used(c), table_bytes(c))
+	testing.expect_value(t, bytes_used(c), tables(c))
 
 	// Dropped by `sweep`.
 	put_one(c, kb[:], "b.example.")
 	sync_expire(c, key_for(kb[:], "b.example."))
 	testing.expect_value(t, sweep(c), 1)
-	testing.expect_value(t, bytes_used(c), table_bytes(c))
+	testing.expect_value(t, bytes_used(c), tables(c))
 
 	// Dropped by eviction, with the count as the bound this time.
 	small := make_cache(Options{max_entries = 1, max_ttl = 3600}, mem.tracking_allocator(&track))
@@ -627,7 +627,7 @@ test_byte_accounting_comes_back_to_the_table :: proc(t: ^testing.T) {
 	// Dropped by `clear_all`, as a reload does it.
 	put_one(c, kb[:], "e.example.")
 	clear_all(c)
-	testing.expect_value(t, bytes_used(c), table_bytes(c))
+	testing.expect_value(t, bytes_used(c), tables(c))
 
 	destroy(c)
 	free_all(context.temp_allocator)
@@ -641,7 +641,7 @@ test_byte_accounting_comes_back_to_the_table :: proc(t: ^testing.T) {
 // beyond a day.
 @(private = "file")
 sync_expire :: proc(c: ^Cache, key: string, ago := 1 * time.Second) {
-	if e, ok := c.entries[key]; ok {
+	if e, ok := c.shards[0].entries[key]; ok {
 		e.expires = loop.moment_add(loop.moment_now(), -ago)
 		e.inserted = loop.moment_add(loop.moment_now(), -ago - 3600 * time.Second)
 	}
@@ -874,9 +874,9 @@ test_a_cache_made_where_another_was_is_not_that_cache :: proc(t: ^testing.T) {
 /*
 A lookup that will not read the bytes takes no copy of them (issue #532).
 
-The copy is up to 64 KB made under `c.mu`. An expired entry is forwarded past
-while the upstream is healthy, and an entry whose refusal is current is refused
-from its flags, so a copy for either is thrown away. The panic allocator is the
+The copy is up to 64 KB made under the shard's lock. An expired entry is
+forwarded past while the upstream is healthy, and an entry whose refusal is
+current is refused from its flags, so a copy for either is thrown away. The panic allocator is the
 assertion: a copy made anyway fails the test.
 */
 @(test)
@@ -899,7 +899,7 @@ test_a_lookup_that_will_not_read_the_bytes_takes_no_copy :: proc(t: ^testing.T) 
 	moved, owed, _ := get(c, key, context.temp_allocator, checked_against = 3, copy_refused = false)
 	testing.expect(t, owed.recheck && len(moved) == len(wire), "an entry owed a re-walk came back without its bytes")
 
-	if e, found := c.entries[key]; found {
+	if e, found := c.shards[0].entries[key]; found {
 		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
 	}
 	held, stale, sok := get(c, key, none, checked_against = 2, copy_stale = false)

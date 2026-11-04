@@ -30,6 +30,8 @@ its header - rather than to a model of it that the code under test also uses.
 @(private)
 Resident :: struct {
 	held: int,
+	// The most `held` has been since it was last set back to `held`.
+	peak: int,
 }
 
 @(private)
@@ -69,7 +71,17 @@ resident_proc :: proc(
 	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
 		r.held += chunk(raw_data(res))
 	}
+	r.peak = max(r.peak, r.held)
 	return res, err
+}
+
+// What every shard's table takes.
+@(private)
+tables :: proc(c: ^Cache) -> (n: int) {
+	for &s in c.shards {
+		n += table_bytes(&s)
+	}
+	return
 }
 
 // Stores NXDOMAINs for `n0.example.` up to `n` and counts how many `put` took.
@@ -112,7 +124,7 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	// The premise: the budget binds, not the count.
 	testing.expectf(t, len_entries(c) < INSERTS, "all %d entries fit in the budget", INSERTS)
 
-	// The Cache itself is the only allocation the count leaves out.
+	// The Cache itself, shards and all, is the only allocation the count leaves out.
 	held := r.held - chunk(c)
 	used := bytes_used(c)
 	/*
@@ -187,8 +199,10 @@ test_sweep_shrinks_the_table :: proc(t: ^testing.T) {
 	fill(c, 20_000)
 
 	gone := loop.moment_add(loop.moment_now(), -time.Second)
-	for _, e in c.entries {
-		e.expires = gone
+	for &s in c.shards {
+		for _, e in s.entries {
+			e.expires = gone
+		}
 	}
 	testing.expect_value(t, sweep(c), 20_000)
 	testing.expectf(t, r.held <= 4096, "an emptied cache holds %d bytes", r.held)
@@ -209,11 +223,11 @@ test_put_keeps_the_entry_its_table_tipped_over :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 8, max_ttl = 3600})
 	defer destroy(c)
 	testing.expect(t, put(c, key, wire, msg), "the answer was refused with the default budget")
-	size := c.bytes
+	size := c.shards[0].bytes
 
 	// Room for the entry and none for the table.
 	clear_all(c)
-	sync.atomic_store(&c.max_bytes, size)
+	sync.atomic_store(&c.shards[0].max_bytes, size)
 	testing.expect(t, put(c, key, wire, msg), "an entry that fits was refused")
 	testing.expect_value(t, len_entries(c), 1)
 	testing.expectf(t, bytes_used(c) > size, "the table is not counted: %d for an entry of %d", bytes_used(c), size)
@@ -234,19 +248,23 @@ nothing still looks.
 @(test)
 test_sweep_shrinks_only_a_mostly_empty_table :: proc(t: ^testing.T) {
 	ENTRIES :: 3000
-	c := make_cache(Options{max_entries = 1_000_000, max_ttl = 3600})
+	// One shard, whose table is the one these thresholds are about.
+	c := make_cache(Options{max_entries = 1_000_000, max_bytes = 2 * MIN_SHARD_BYTES - 1, max_ttl = 3600})
 	defer destroy(c)
 
-	fill(c, ENTRIES)
+	testing.expect_value(t, shards_in_use(c), 1)
+	testing.expect_value(t, fill(c, ENTRIES), ENTRIES)
+	testing.expect_value(t, len_entries(c), ENTRIES)
 	kb: [KEY_MAX]u8
-	full := cap(c.entries)
+	s := &c.shards[0]
+	full := cap(s.entries)
 
 	// Each dropped by `get` on meeting it expired, so no sweep removes them.
 	gone := loop.moment_add(loop.moment_now(), -time.Second)
 	drop_until :: proc(c: ^Cache, kb: []u8, from, to: int, gone: loop.Moment) {
 		for i in from ..< to {
 			key := key_for(kb, fmt.tprintf("n%d.example.", i))
-			c.entries[key].expires = gone
+			c.shards[0].entries[key].expires = gone
 			_, _, _ = get(c, key, context.temp_allocator)
 			free_all(context.temp_allocator)
 		}
@@ -254,15 +272,15 @@ test_sweep_shrinks_only_a_mostly_empty_table :: proc(t: ^testing.T) {
 
 	// Under three eighths, which Odin would halve, and over a quarter.
 	drop_until(c, kb[:], 0, 1800, gone)
-	testing.expectf(t, len(c.entries) * 8 < full * 3 && len(c.entries) * 4 >= full, "the premise: %d entries in %d slots", len(c.entries), full)
+	testing.expectf(t, len(s.entries) * 8 < full * 3 && len(s.entries) * 4 >= full, "the premise: %d entries in %d slots", len(s.entries), full)
 	testing.expect_value(t, sweep(c), 0)
-	testing.expect_value(t, cap(c.entries), full)
+	testing.expect_value(t, cap(s.entries), full)
 
 	// Under a quarter.
 	drop_until(c, kb[:], 1800, 2200, gone)
-	testing.expectf(t, len(c.entries) * 4 < full, "the premise: %d entries in %d slots", len(c.entries), full)
+	testing.expectf(t, len(s.entries) * 4 < full, "the premise: %d entries in %d slots", len(s.entries), full)
 	testing.expect_value(t, sweep(c), 0)
-	testing.expectf(t, cap(c.entries) < full, "a sweep left %d slots for %d entries", cap(c.entries), len(c.entries))
+	testing.expectf(t, cap(s.entries) < full, "a sweep left %d slots for %d entries", cap(s.entries), len(s.entries))
 }
 
 // A reload that drops everything gives back the table too.
@@ -290,7 +308,7 @@ test_reconfigure_to_a_smaller_budget_keeps_what_fits :: proc(t: ^testing.T) {
 	defer destroy(c)
 
 	fill(c, 40_000, edns = true)
-	testing.expectf(t, table_bytes(c) >= BUDGET, "the premise: a table of %d bytes", table_bytes(c))
+	testing.expectf(t, tables(c) >= BUDGET, "the premise: tables of %d bytes", tables(c))
 
 	opts.max_bytes = BUDGET
 	reconfigure(c, opts)
@@ -305,23 +323,50 @@ nor an eviction has looked at the table since.
 */
 @(test)
 test_reconfigure_shrinks_a_table_with_nothing_to_evict :: proc(t: ^testing.T) {
-	opts := Options{max_entries = 1_000_000, max_ttl = 3600}
+	// One shard, as in the sweep's test above.
+	opts := Options{max_entries = 1_000_000, max_bytes = 2 * MIN_SHARD_BYTES - 1, max_ttl = 3600}
 	c := make_cache(opts)
 	defer destroy(c)
 
-	fill(c, 3000)
-	full := cap(c.entries)
+	testing.expect_value(t, shards_in_use(c), 1)
+	testing.expect_value(t, fill(c, 3000), 3000)
+	s := &c.shards[0]
+	full := cap(s.entries)
 	kb: [KEY_MAX]u8
 	gone := loop.moment_add(loop.moment_now(), -time.Second)
 	for i in 0 ..< 2900 {
 		key := key_for(kb[:], fmt.tprintf("n%d.example.", i))
-		c.entries[key].expires = gone
+		s.entries[key].expires = gone
 		_, _, _ = get(c, key, context.temp_allocator)
 		free_all(context.temp_allocator)
 	}
-	testing.expect_value(t, cap(c.entries), full)
+	testing.expect_value(t, cap(s.entries), full)
 
 	reconfigure(c, opts)
 	testing.expect_value(t, len_entries(c), 100)
-	testing.expectf(t, cap(c.entries) < full, "a reload left %d slots for %d entries", cap(c.entries), len(c.entries))
+	testing.expectf(t, cap(s.entries) < full, "a reload left %d slots for %d entries", cap(s.entries), len(s.entries))
+}
+
+/*
+A reload that takes the cache down to fewer shards holds no more on the way
+than it does after. Moving every entry into the shards that remain before
+evicting would index all of them in one table first: twenty thousand entries'
+worth for a cache about to hold three hundred.
+*/
+@(test)
+test_a_reload_to_fewer_shards_does_not_grow_on_the_way :: proc(t: ^testing.T) {
+	r: Resident
+	opts := Options{max_entries = 1_000_000, max_ttl = 3600}
+	c := make_cache(opts, resident_allocator(&r))
+	defer destroy(c)
+	testing.expect_value(t, shards_in_use(c), MAX_SHARDS)
+	fill(c, 20_000)
+	before := r.held
+	r.peak = r.held
+
+	opts.max_entries = 300
+	reconfigure(c, opts)
+	testing.expect_value(t, shards_in_use(c), 1)
+	testing.expect_value(t, len_entries(c), 300)
+	testing.expectf(t, r.peak <= before + 64 * 1024, "a reload from %d bytes rose to %d on the way down", before, r.peak)
 }

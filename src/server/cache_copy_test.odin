@@ -86,7 +86,7 @@ test_a_stale_lend_reads_the_rules_in_force :: proc(t: ^testing.T) {
 	if !testing.expect(t, enc == .None && derr == .None && cache.put(answers, key, wire, decoded, before), "the answer was not cached") {
 		return
 	}
-	if e, found := answers.entries[key]; found {
+	if e, found := answers.shards[0].entries[key]; found {
 		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
 	}
 

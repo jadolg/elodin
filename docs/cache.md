@@ -26,6 +26,15 @@ rewritten in place on each hit.
   The smallest entries, an NXDOMAIN for a name nobody asks twice, take close to
   500 bytes each. `cache_bytes=` in the stats line and `elodin_cache_bytes`
   report the same figure.
+- **Shards.** A cache large enough is split into up to 16 shards, each with its
+  own lock, so loop threads looking up different names do not wait on each
+  other. A name's shard comes from a hash with a random key. Each shard gets an
+  equal share of both bounds, at least 256 entries and 1 MiB (the shares add up
+  to exactly `max_entries` and `max_bytes`), and evicts its own least recently
+  used entries. The default 10,000 entries make 16 shards; under 512 entries
+  or 2 MiB the cache is one shard. A reload that changes the bounds counts the
+  shards again and moves the entries it keeps, with lookups held for the
+  length of the move.
 - **`max_ttl`** caps every upstream answer, forwarded or cached, and how long an
   entry is kept. It does not touch answers elodin writes itself, which carry
   `blocking.block_ttl` or a rewrite's own `ttl`.

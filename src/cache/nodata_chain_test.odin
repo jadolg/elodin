@@ -108,7 +108,7 @@ held_for :: proc(c: ^Cache, ch: Chain) -> (time.Duration, bool) {
 	if !put(c, key, wire, msg) {
 		return 0, false
 	}
-	e := c.entries[key]
+	e := c.shards[0].entries[key]
 	return time.Duration(e.expires - e.inserted), true
 }
 

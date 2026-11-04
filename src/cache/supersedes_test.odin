@@ -21,6 +21,8 @@ Supersede_Case :: struct {
 	msg:       dns.Message,
 	// Shrink the budget below the candidate, so it is refused for size.
 	tiny:      bool,
+	// Shrink only the shard's share, as a reload between the two checks does.
+	share:     bool,
 	// Added to the held entry's serial, to name an entry that is not there.
 	off:       u64,
 	forgotten: bool,
@@ -66,6 +68,7 @@ test_a_refused_answer_forgets_the_entry_it_supersedes :: proc(t: ^testing.T) {
 		{name = "a NODATA without a SOA", msg = supersede_msg(.No_Error), forgotten = true},
 		{name = "an NXDOMAIN without a SOA", msg = supersede_msg(.NX_Domain), forgotten = true},
 		{name = "an answer too large to keep", msg = supersede_msg(.No_Error, supersede_a(300)), tiny = true, forgotten = true},
+		{name = "an answer too large for its shard", msg = supersede_msg(.No_Error, supersede_a(300)), share = true, forgotten = true},
 		{name = "a TTL-0 answer naming another entry", msg = supersede_msg(.No_Error, supersede_a(0)), off = 1},
 		{name = "an NXDOMAIN carrying an address", msg = supersede_msg(.NX_Domain, supersede_a(300))},
 		{name = "a NOERROR about another name", msg = supersede_msg(.No_Error, {name = "other.example.", type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {5, 6, 7, 8}}})},
@@ -83,9 +86,12 @@ test_a_refused_answer_forgets_the_entry_it_supersedes :: proc(t: ^testing.T) {
 		if !testing.expectf(t, put(answers, key, held_wire, held), "%s: the held answer was not stored", c.name) {
 			continue
 		}
-		serial := answers.entries[key].serial
+		serial := answers.shards[0].entries[key].serial
 		if c.tiny {
 			sync.atomic_store(&answers.max_bytes, 1)
+		}
+		if c.share {
+			answers.shards[0].max_bytes = 1
 		}
 
 		wire, _, err := dns.encode_message(c.msg, context.temp_allocator)
@@ -94,7 +100,7 @@ test_a_refused_answer_forgets_the_entry_it_supersedes :: proc(t: ^testing.T) {
 			continue
 		}
 		testing.expectf(t, !put(answers, key, wire, msg, supersedes = serial + c.off), "%s: the candidate was stored", c.name)
-		e, found := answers.entries[key]
+		e, found := answers.shards[0].entries[key]
 		if c.forgotten {
 			testing.expectf(t, !found, "%s: the entry it supersedes is still there", c.name)
 		} else {
