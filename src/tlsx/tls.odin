@@ -358,6 +358,8 @@ client_context :: proc(
 		SSL_CTX_free(ptr)
 		return nil, .Context_Failed
 	}
+	// Pooled upstream connections sit idle too; see `server_context`.
+	ssl_ctx_set_mode(ptr, SSL_MODE_RELEASE_BUFFERS)
 
 	if verify {
 		ok: c.int
@@ -475,6 +477,17 @@ server_context :: proc(
 		SSL_CTX_free(ptr)
 		return nil, .Context_Failed
 	}
+	/*
+	Idle connections hand their record buffers back. Without the mode OpenSSL
+	keeps its record buffers, ~17 KB each, for the connection's whole life; with
+	it a buffer is freed once empty and reallocated when the next record arrives
+	or is sent. Measured on 1,000 idle DoT and DoH/2 connections it saves ~20 KB
+	each (#595). Per-query CPU is unchanged on TCP, UDP, DoT and DoH/1.1; DoH/2
+	reads 1 µs slower (17 to 18), the bench's resolution, in every round.
+	dnsdist (its `releaseBuffers` default), nginx and HAProxy set it too;
+	Unbound does not.
+	*/
+	ssl_ctx_set_mode(ptr, SSL_MODE_RELEASE_BUFFERS)
 	/*
 	No server-side session cache: resumption is by ticket alone.
 

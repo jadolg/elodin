@@ -67,7 +67,7 @@ server:
   # The table, and one client's share of it.
   #
   # 2,048 concurrent TCP/DoT/DoH connections, each of which is a fiber - about
-  # 21 KB held, 72 KB with the OpenSSL session for DoT and DoH - and a file
+  # 21 KB held, 55 KB with the OpenSSL session for DoT and DoH - and a file
   # descriptor, so this is also a claim about what the box will give the
   # process, in two limits rather than one. A connection refused because the OS
   # would not map a stack for it is counted apart, as conn_failed=, and raising

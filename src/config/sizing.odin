@@ -87,9 +87,10 @@ Memory charged to each connection `server.max_connections` lets the server hold.
 
 Every TCP, DoT and DoH connection has a fiber of its own. Held open after one
 query each, a TCP connection measured ~21 KB resident in a release build - the
-stack its fiber touched and its scratch - and a DoT or DoH/2 one ~72 KB, most of
-it OpenSSL's session (bench/results/2026-10-26-event-loop.md); this rounds up
-for the stack a query touches (#526, #547). The scratch a query uses past that is held until its connection
+stack its fiber touched and its scratch (bench/results/2026-10-26-event-loop.md)
+- and a DoT or DoH/2 one ~55 KB, most of it OpenSSL's session, with its record
+buffers released while idle (#595); this rounds up for the stack a query touches
+(#526, #547). The scratch a query uses past that is held until its connection
 closes and unmapped when it does.
 */
 CONNECTION_MEMORY_BYTES :: 128 * 1024
