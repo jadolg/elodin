@@ -157,27 +157,14 @@ open_log :: proc(path: string, no_follow: bool) -> (f: ^os.File, created: bool, 
 		if errno != .EEXIST {
 			return nil, false, os.Platform_Error(errno)
 		}
-		fd, errno = open_resolved(cpath, base, owner_only, no_follow)
+		// Guarded, not created here: a file removed since the O_EXCL open would
+		// otherwise be made now, as root, by an open that does not hand it over.
+		fd, errno = open_resolved(cpath, base - {.CREAT} if no_follow else base, owner_only, no_follow)
 		if errno != .NONE {
 			return nil, false, os.Platform_Error(errno)
 		}
-		/*
-		A hard link is a symlink's twin: where fs.protected_hardlinks is off,
-		the account that may own the directory can link the name to a file of
-		root's for this start to append to (EMLINK). Anything but a regular
-		file is refused too (ENXIO): a FIFO whose reader stops reading would
-		block every line, under the log's lock, once its buffer fills.
-		*/
 		if no_follow {
-			st: linux.Stat
-			if errno = linux.fstat(fd, &st); errno == .NONE {
-				if !linux.S_ISREG(st.mode) {
-					errno = .ENXIO
-				} else if st.nlink > 1 {
-					errno = .EMLINK
-				}
-			}
-			if errno != .NONE {
+			if errno = refused_at_name(fd); errno != .NONE {
 				linux.close(fd)
 				return nil, false, os.Platform_Error(errno)
 			}
@@ -260,11 +247,35 @@ openat2_allowed :: proc() -> bool {
 }
 
 /*
-For `--check`, which creates nothing: whether a `guarded` start (see `init`)
-would find a symlink on the way to `path` - on the file, or on its directory
-when there is no file yet.
+What a guarded open (see `init`) refuses at the name. A hard link is a
+symlink's twin: where fs.protected_hardlinks is off, the account that may own
+the directory can link the name to a file of root's for the start to append to
+(EMLINK). Anything but a regular file is refused too (ENXIO): a FIFO whose
+reader stops reading would block every line, under the log's lock, once its
+buffer fills.
 */
-symlink_refused :: proc(path: string) -> bool {
+@(private)
+refused_at_name :: proc(fd: linux.Fd) -> linux.Errno {
+	st: linux.Stat
+	if errno := linux.fstat(fd, &st); errno != .NONE {
+		return errno
+	}
+	if !linux.S_ISREG(st.mode) {
+		return .ENXIO
+	}
+	if st.nlink > 1 {
+		return .EMLINK
+	}
+	return .NONE
+}
+
+/*
+For `--check`, which creates nothing: whether a `guarded` start (see `init`)
+would refuse `path` - a symlink on the way to it, or at the name anything
+`refused_at_name` refuses; when there is no file yet, a symlink on the way to
+its directory.
+*/
+guard_refuses :: proc(path: string) -> bool {
 	probe :: proc(p: string, file: bool) -> linux.Errno {
 		fd, errno := open_resolved(strings.clone_to_cstring(p, context.temp_allocator), {.PATH, .CLOEXEC}, {}, true)
 		if errno != .NONE {
@@ -272,19 +283,36 @@ symlink_refused :: proc(path: string) -> bool {
 		}
 		defer linux.close(fd)
 		// The O_NOFOLLOW fallback opens a symlink itself under O_PATH rather
-		// than failing, where the start's O_NOFOLLOW open is refused - at the
-		// file only: that start follows a symlinked directory.
-		st: linux.Stat
-		if file && linux.fstat(fd, &st) == .NONE && linux.S_ISLNK(st.mode) {
-			return .ELOOP
-		}
-		return .NONE
+		// than failing; it is not a regular file, so it is refused here as the
+		// start's open refuses it - at the file only: that start follows a
+		// symlinked directory.
+		return refused_at_name(fd) if file else .NONE
 	}
 	errno := probe(path, true)
 	if errno == .ENOENT {
 		errno = probe(os.dir(path), false)
 	}
-	return errno == .ELOOP
+	return is_guard_refusal(os.Platform_Error(errno))
+}
+
+// Said after a log file the guard refused (see `init`), so the errno is not left to explain it.
+GUARD_HINT :: "; started as root with server.user set, a symlink anywhere on its path, a hard-linked file or anything but a regular file is refused, see docs/logging.md"
+
+/*
+`GUARD_HINT` when `err`, from `init` or `reopen`, is the guard's refusal: ELOOP
+a symlink, EMLINK a hard link, ENXIO not a regular file. Empty otherwise.
+*/
+guard_hint :: proc(err: os.Error) -> string {
+	return GUARD_HINT if sync.atomic_load(&state.guarded) && is_guard_refusal(err) else ""
+}
+
+@(private)
+is_guard_refusal :: proc(err: os.Error) -> bool {
+	return(
+		err == os.Platform_Error(linux.Errno.ELOOP) ||
+		err == os.Platform_Error(linux.Errno.EMLINK) ||
+		err == os.Platform_Error(linux.Errno.ENXIO) \
+	)
 }
 
 // Whether lines go to a file rather than stderr.

@@ -11,12 +11,13 @@ import "core:testing"
 import "core:unicode/utf8"
 
 /*
-One test proc, on purpose.
+One test proc for the logger's state, on purpose.
 
 The logger is process-wide state - a level, a mutex, one file handle - and the
 test runner gives each `@(test)` proc a thread of its own. Two of them here
 would interleave their lines in the same file and race the level, so everything
-this package has to say is said in sequence below.
+that goes through `init`, `reopen` or the lines is said in sequence below. The
+other tests call `open_log` and the probes alone, which touch no state.
 */
 @(test)
 test_every_line_is_logfmt :: proc(t: ^testing.T) {
@@ -197,6 +198,14 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect(t, strings.contains(lines[21], `level=warn msg="log.file:`), "a start on a 0644 log did not warn")
+
+	// A refusal is explained only where the guard is on, and only a refusal.
+	symlinked := os.Platform_Error(linux.Errno.ELOOP)
+	testing.expect_value(t, guard_hint(symlinked), "")
+	shutdown()
+	testing.expect(t, init(.Info, path, Owner{posix.getuid(), posix.getgid()}) == nil, "cannot open the log guarded")
+	testing.expect_value(t, guard_hint(symlinked), GUARD_HINT)
+	testing.expect_value(t, guard_hint(os.Platform_Error(linux.Errno.EACCES)), "")
 }
 
 /*
@@ -235,6 +244,11 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 		_, _, lerr := open_log(link, true)
 		testing.expect(t, lerr != nil, "a symlinked log was opened with symlinks refused")
 		testing.expect(t, !os.exists(target), "refusing a symlinked log created its target")
+		// `--check` says what the start refuses, and passes what it opens.
+		testing.expect(t, guard_refuses(link), "--check passes a symlinked log")
+		testing.expect(t, !guard_refuses(path), "--check refuses a plain log")
+		missing, _ := filepath.join({dir, "missing.log"}, context.temp_allocator)
+		testing.expect(t, !guard_refuses(missing), "--check refuses a log still to be created")
 		// Nor through a symlinked directory above it, which O_NOFOLLOW alone
 		// would follow.
 		real_dir, _ := filepath.join({dir, "real"}, context.temp_allocator)
@@ -245,6 +259,7 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 			testing.expect(t, derr != nil, "a log under a symlinked directory was opened with symlinks refused")
 			inside, _ := filepath.join({real_dir, "elodin.log"}, context.temp_allocator)
 			testing.expect(t, !os.exists(inside), "refusing a symlinked directory created the log in its target")
+			testing.expect(t, guard_refuses(through), "--check passes a log to be created under a symlinked directory")
 		}
 
 		// The descriptor a refusing open hands back blocks again: a full pipe
@@ -264,6 +279,7 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 		if testing.expect(t, posix.mkfifo(strings.clone_to_cstring(fifo, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {
 			_, _, ferr := open_log(fifo, true)
 			testing.expect(t, ferr != nil, "a FIFO with no reader was opened")
+			testing.expect(t, guard_refuses(fifo), "--check passes a FIFO")
 
 			// Nor with one: a reader that stops reading would block every line.
 			rd := posix.open(strings.clone_to_cstring(fifo, context.temp_allocator), {.NONBLOCK})
@@ -281,6 +297,7 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 		if testing.expect(t, os.write_entire_file(linked, []byte{}) == nil && posix.link(strings.clone_to_cstring(linked, context.temp_allocator), strings.clone_to_cstring(twin, context.temp_allocator)) == .OK, "cannot make the hard link") {
 			_, _, herr := open_log(linked, true)
 			testing.expectf(t, herr == os.Platform_Error(linux.Errno.EMLINK), "a hard-linked log was not refused with symlinks refused: %v", herr)
+			testing.expect(t, guard_refuses(linked), "--check passes a hard-linked log")
 			if hf, _, hferr := open_log(linked, false); testing.expectf(t, hferr == nil, "a hard-linked log was refused when links are followed: %v", hferr) {
 				os.close(hf)
 			}

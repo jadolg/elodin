@@ -5,7 +5,6 @@ import "core:mem/virtual"
 import "core:os"
 import "core:strings"
 import "core:sync"
-import "core:sys/linux"
 import "core:sys/posix"
 import "core:thread"
 import "core:time"
@@ -489,18 +488,16 @@ main :: proc() {
 	if privdrop.is_root() && cfg.server.user != "" && service.uid != 0 {
 		log_owner = logx.Owner{service.uid, service.gid}
 	}
-	log_guarded := log_owner != nil
 	if err := logx.init(logx.Level(cfg.log.level), log_file, log_owner); err != nil {
 		fmt.eprintfln(
 			"elodin: cannot open the log file %q (%s)%s, logging to stderr instead",
 			cfg.log.file,
 			os.error_string(err),
-			// ELOOP is a symlink refused, EMLINK a hard link, ENXIO not a regular file.
-			LOG_GUARDED_HINT if log_guarded && guarded_refusal(err) else "",
+			logx.guard_hint(err),
 		)
 	}
 	if opts.check_only && cfg.log.file != "" {
-		if openable, hint := log_file_openable(cfg.log.file, log_guarded); !openable {
+		if openable, hint := log_file_openable(cfg.log.file, log_owner != nil); !openable {
 			fmt.eprintfln("elodin: cannot open the log file %q%s; a start would log to stderr instead", cfg.log.file, hint)
 		}
 	}
@@ -647,43 +644,18 @@ main :: proc() {
 	run(&cfg, opts, service)
 }
 
-// Started as root with `server.user`, a symlink on the log's path, a hard-linked
-// log or anything but a regular file is refused; see `logx.init`.
-@(private)
-LOG_GUARDED_HINT :: "; started as root with server.user set, a symlink anywhere on its path, a hard-linked file or anything but a regular file is refused, see docs/logging.md"
-
-@(private)
-guarded_refusal :: proc(err: os.Error) -> bool {
-	return(
-		err == os.Platform_Error(linux.Errno.ELOOP) ||
-		err == os.Platform_Error(linux.Errno.EMLINK) ||
-		err == os.Platform_Error(linux.Errno.ENXIO) \
-	)
-}
-
 /*
 For `--check`, which opens no log: whether a start could, as this account - the
 file there for appending, or its directory to create one in. A `guarded` start
-refuses a symlink on the path (`logx.symlink_refused`), a hard-linked file and
-anything but a regular file, and `hint` says so only for those.
+refuses what `logx.guard_refuses` names, and `hint` says so only for those.
 */
 @(private)
 log_file_openable :: proc(path: string, guarded: bool) -> (ok: bool, hint: string) {
-	if guarded && logx.symlink_refused(path) {
-		return false, LOG_GUARDED_HINT
-	}
-	if guarded {
-		st: posix.stat_t
-		if posix.stat(strings.clone_to_cstring(path, context.temp_allocator), &st) == .OK && (!posix.S_ISREG(st.st_mode) || st.st_nlink > 1) {
-			return false, LOG_GUARDED_HINT
-		}
+	if guarded && logx.guard_refuses(path) {
+		return false, logx.GUARD_HINT
 	}
 	if os.exists(path) {
-		if privdrop.can_reopen(path, true) {
-			return true, ""
-		}
-		// ENXIO, from the open `can_reopen` failed: a FIFO with no reader.
-		return false, LOG_GUARDED_HINT if guarded && posix.errno() == .ENXIO else ""
+		return privdrop.can_reopen(path, true), ""
 	}
 	parent := os.dir(path)
 	cparent := strings.clone_to_cstring(parent if parent != "" else ".", context.temp_allocator)
@@ -1178,7 +1150,7 @@ reload :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m
 	reopen_err := logx.reopen(file)
 	logx.infof("SIGHUP received, reloading the configuration and the TLS certificates")
 	if reopen_err != nil {
-		logx.warnf("cannot open the log file %q again (%s); logging where it was", file, os.error_string(reopen_err))
+		logx.warnf("cannot open the log file %q again (%s)%s; logging where it was", file, os.error_string(reopen_err), logx.guard_hint(reopen_err))
 	}
 
 	out := server.reload_config(s, opts.config_path)

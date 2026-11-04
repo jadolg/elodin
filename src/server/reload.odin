@@ -130,7 +130,7 @@ reload_config :: proc(s: ^Server, path: string) -> (out: Reload_Outcome) {
 	logx.set_level(logx.Level(g.cfg.log.level))
 	if log_file_moved {
 		if err := logx.reopen(g.cfg.log.file); err != nil {
-			logx.warnf("reload: cannot open the log file %q (%s); logging where it was", g.cfg.log.file, os.error_string(err))
+			logx.warnf("reload: cannot open the log file %q (%s)%s; logging where it was", g.cfg.log.file, os.error_string(err), logx.guard_hint(err))
 		}
 	}
 
