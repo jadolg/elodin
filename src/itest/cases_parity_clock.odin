@@ -100,6 +100,9 @@ parity_clock_child :: proc(r: ^Runner, tag, first, after: string, args: []string
 	if !check(r, os.make_directory(bin_dir) == nil || os.exists(bin_dir), "cannot make %s", bin_dir) {
 		return
 	}
+	// The child's work dir is made in here too (TMPDIR below): a failing parity
+	// run leaves its own behind, and this one fails by design.
+	defer _ = os.remove_all(bin_dir)
 	chronyc := filepath.join({bin_dir, "chronyc"}, context.temp_allocator) or_else ""
 	count := fmt.tprintf("%s.count", chronyc)
 	script := fmt.tprintf(
@@ -129,14 +132,16 @@ parity_clock_child :: proc(r: ^Runner, tag, first, after: string, args: []string
 	if !check(r, eerr == nil, "cannot read the environment: %v", eerr) {
 		return
 	}
-	env := make([dynamic]string, 0, len(inherited) + 1, context.temp_allocator)
+	env := make([dynamic]string, 0, len(inherited) + 2, context.temp_allocator)
 	for kv in inherited {
-		if !strings.has_prefix(kv, "PATH=") {
+		if !strings.has_prefix(kv, "PATH=") && !strings.has_prefix(kv, "TMPDIR=") {
 			append(&env, kv)
 		}
 	}
+	// An empty element would put the working directory on the PATH.
 	path := os.get_env("PATH", context.temp_allocator)
-	append(&env, fmt.tprintf("PATH=%s:%s", bin_dir, path))
+	append(&env, fmt.tprintf("PATH=%s:%s", bin_dir, path) if path != "" else fmt.tprintf("PATH=%s", bin_dir))
+	append(&env, fmt.tprintf("TMPDIR=%s", bin_dir))
 
 	/*
 	Bounded by timeout(1): the child has no deadline of its own, and one that
@@ -153,14 +158,31 @@ parity_clock_child :: proc(r: ^Runner, tag, first, after: string, args: []string
 		append(&command, "--graceful-stop")
 	}
 	append(&command, ..args)
-	state, stdout, stderr, err := os.process_exec(
-		os.Process_Desc{command = command[:], env = env[:]},
-		context.temp_allocator,
-	)
-	if !check(r, err == nil, "cannot run %s: %v", os.args[0], err) {
+	// Into a file and waited on, as `run_binary` does: process_exec polls its
+	// pipes without blocking, and would spin a core for the whole run.
+	out_path := filepath.join({bin_dir, "output.txt"}, context.temp_allocator) or_else ""
+	out_file, oerr := os.open(out_path, {.Write, .Create, .Trunc}, os.Permissions_Read_All + {.Write_User})
+	if !check(r, oerr == nil, "cannot open %s: %v", out_path, oerr) {
 		return
 	}
-	output = fmt.tprintf("%s%s", stdout, stderr)
+	process, err := os.process_start(
+		os.Process_Desc{command = command[:], env = env[:], stdout = out_file, stderr = out_file},
+	)
+	if err != nil {
+		os.close(out_file)
+		check(r, false, "cannot run %s: %v", os.args[0], err)
+		return
+	}
+	state, wait_err := os.process_wait(process)
+	os.close(out_file)
+	if !check(r, wait_err == nil, "cannot wait for %s: %v", os.args[0], wait_err) {
+		return
+	}
+	data, rerr := os.read_entire_file(out_path, context.temp_allocator)
+	if !check(r, rerr == nil, "cannot read %s: %v", out_path, rerr) {
+		return
+	}
+	output = string(data)
 	check(r, state.exit_code != 124, "the run did not finish inside the timeout:\n%s", output)
 	return output, state.exit_code, state.exit_code != 124
 }

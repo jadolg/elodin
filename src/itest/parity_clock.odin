@@ -98,7 +98,7 @@ parity_clock_judge :: proc(
 			}
 		}
 	}
-	return {note = "unchecked: neither chronyc nor timedatectl could say; a divergence in signature validity may be the clock"}
+	return {note = "unchecked: no synchronised chronyd measured the offset and timedatectl did not answer; a divergence in signature validity may be the clock"}
 }
 
 /*
