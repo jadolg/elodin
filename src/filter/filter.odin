@@ -486,14 +486,13 @@ engine_stats :: proc(e: ^Engine) -> Stats {
 // joiner or punctuation mark RFC 5892 appendix A admits in context. A no-break or
 // zero-width space, a BOM, a symbol, a byte that is not UTF-8 (decoded as
 // U+FFFD), or ASCII no label holds (`*`, `:`) has no punycode form a stub sends.
-// Nor can a key with an empty label (`.com`, `a..com`, `a..`): only the root label
-// is empty (RFC 1035 section 3.1), and `normalise` has stripped it.
+// Nor can a key with an empty label (`.com`, `a..com`, `a..`, `a。。com`): only the
+// root label is empty (RFC 1035 section 3.1), and `normalise` has stripped it; nor
+// an ASCII key the wire cannot carry (a label past 63 bytes, a name past 255, a
+// broken escape), which `dns.encode_name` judges as it does for config names.
 @(private)
 rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool, not_ascii: bool) {
 	key, ok = normalise(domain, buf)
-	if strings.has_prefix(key, ".") || strings.has_suffix(key, ".") || strings.contains(key, "..") {
-		return "", false, false
-	}
 	for c in transmute([]u8)key {
 		if c == '/' || c <= 0x20 || c == 0x7f {
 			return "", false, false
@@ -501,9 +500,22 @@ rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool, not_ascii
 		not_ascii ||= c >= 0x80
 	}
 	if !not_ascii {
+		// `encode_name` reads a last dot as the root, but `normalise` has had that.
+		wire: [dns.MAX_NAME_WIRE]u8
+		if _, err := dns.encode_name(key, wire[:]); err != .None || strings.has_suffix(key, ".") {
+			return "", false, false
+		}
 		return
 	}
+	// The full stops below end a label as `.` does, so two in a row, or one
+	// first, leave an empty label its punycode form would hold too.
+	after_stop := true
 	for r in key {
+		stop := r == '.' || r == 0x3002 || r == 0xff0e || r == 0xff61
+		if stop && after_stop {
+			return "", false, false
+		}
+		after_stop = stop
 		switch r {
 		case 'a' ..= 'z', '0' ..= '9', '-', '_', '.', 0x200c, 0x200d, 0x00b7, 0x0375, 0x05f3, 0x05f4, 0x30fb, 0x3002, 0xff0e, 0xff61:
 		// The ASCII a label holds; RFC 5892 appendix A's CONTEXTJ and CONTEXTO

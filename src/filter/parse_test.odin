@@ -335,15 +335,77 @@ test_domain_lines_dns_cannot_express_are_skipped :: proc(t: ^testing.T) {
 test_a_rule_with_an_empty_label_is_skipped :: proc(t: ^testing.T) {
 	// No label is empty, so `.com` names nothing (#431). Stored, it would count
 	// toward a list that blocks nothing by it.
-	for src in ([]string{"*..com\n", "||.com^\n", "||*..com^\n", "a..com\n", "||a..^\n", "@@||.com^\n"}) {
-		block, allow := parsed(src, .Adblock)
-		testing.expectf(t, block.count == 0 && allow.count == 0, "%q should store no rule", src)
+	Case :: struct {
+		src:    string,
+		format: Format,
+	}
+	for c in ([]Case {
+			{"*..com\n", .Adblock},
+			{"||.com^\n", .Adblock},
+			{"||*..com^\n", .Adblock},
+			{"a..com\n", .Adblock},
+			{"||a..^\n", .Adblock},
+			{"@@||.com^\n", .Adblock},
+			{"0.0.0.0 .com\n", .Hosts},
+			{"*..com\n", .Domains},
+			{".com\n", .Domains},
+		}) {
+		block, allow := parsed(c.src, c.format)
+		testing.expectf(t, block.count == 0 && allow.count == 0 && block.not_ascii == 0, "%q should store no rule", c.src)
 		set_destroy(block)
 		set_destroy(allow)
 	}
-	// A query spells a dot within a label `\046` (`dns.decode_name`), so a dot in
-	// a key always ends a label.
+	// A `$badfilter` naming such a key cancels nothing.
+	{
+		block, allow := parsed("||.com^$badfilter\n", .Adblock)
+		testing.expect_value(t, block.cancels, 0)
+		set_destroy(block)
+		set_destroy(allow)
+	}
+	// The ideographic and fullwidth full stops end a label too, so these have no
+	// punycode form a query carries either: refused, not counted as not ASCII.
+	for src in ([]string{"a。。com\n", "。com\n", "a.。com\n", "a．．com\n"}) {
+		block, allow := parsed(src, .Domains)
+		testing.expectf(t, block.count == 0 && block.not_ascii == 0, "%q should be refused outright", src)
+		set_destroy(block)
+		set_destroy(allow)
+	}
+	{
+		block, allow := parsed("a。com\n", .Domains)
+		testing.expect_value(t, block.not_ascii, 1)
+		set_destroy(block)
+		set_destroy(allow)
+	}
+	// An ordinary rule still loads.
 	testing.expect_value(t, matches("||a.com^\n", .Adblock, "x.a.com."), Decision.Blocked)
+}
+
+@(test)
+test_a_rule_the_wire_cannot_carry_is_skipped :: proc(t: ^testing.T) {
+	// A query's label holds at most 63 bytes and its name 255 on the wire
+	// (RFC 1035 section 2.3.4), and every escape in it is whole, so a key past
+	// either, or with a broken escape, names nothing.
+	label63 := strings.repeat("a", 63, context.temp_allocator)
+	label64 := strings.repeat("a", 64, context.temp_allocator)
+	// Four 63-byte labels and `com` are 4*64 + 4 + 1 = 261 bytes on the wire.
+	too_long := strings.concatenate({label63, ".", label63, ".", label63, ".", label63, ".com"}, context.temp_allocator)
+	for src in ([]string{
+			strings.concatenate({label64, ".com\n"}, context.temp_allocator),
+			strings.concatenate({too_long, "\n"}, context.temp_allocator),
+			"a\\\n",
+			"a\\99.com\n",
+			"a\\999.com\n",
+		}) {
+		block, allow := parsed(src, .Domains)
+		testing.expectf(t, block.count == 0, "%q should store no rule", src)
+		set_destroy(block)
+		set_destroy(allow)
+	}
+	fits := strings.concatenate({label63, ".com"}, context.temp_allocator)
+	testing.expect_value(t, matches(strings.concatenate({fits, "\n"}, context.temp_allocator), .Domains, strings.concatenate({"x.", fits, "."}, context.temp_allocator)), Decision.Blocked)
+	// A 63-byte label spelled with escapes is longer as text, and still fits.
+	escaped := strings.concatenate({"\\032", strings.repeat("a", 62, context.temp_allocator), ".com"}, context.temp_allocator)
+	testing.expect_value(t, matches(strings.concatenate({escaped, "\n"}, context.temp_allocator), .Domains, strings.concatenate({escaped, "."}, context.temp_allocator)), Decision.Blocked)
 }
 
 @(test)
