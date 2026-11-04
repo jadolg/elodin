@@ -701,18 +701,34 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 			// What the server refuses in a request's trailers.
 			malformed = trailers_are_malformed(headers, s.end_stream)
 		} else {
-			// Each section carries its own `:status`: one missing after an
-			// interim response is not that response's again.
+			/*
+			Each section carries its own `:status`: one missing after an
+			interim response is not that response's again. And one `:status`,
+			ahead of the ordinary fields and with no other pseudo-header (8.3):
+			a second one would be read as the answer's over the first. The
+			ordinary fields are held to 8.2 as the trailers are.
+			*/
 			s.status = 0
+			seen_status, seen_regular := false, false
 			for f in headers {
-				if f.name == ":status" {
+				if len(f.name) > 0 && f.name[0] == ':' {
+					if f.name != ":status" || seen_status || seen_regular {
+						malformed = true
+						continue
+					}
+					seen_status = true
 					s.status = parse_status(f.value)
+				} else {
+					seen_regular = true
+					if field_is_malformed(f) {
+						malformed = true
+					}
 				}
 			}
 			// A missing or malformed `:status` reads as 0, which is no interim
 			// response; nor is a 101, which HTTP/2 has no use for (8.6).
 			s.final = s.status < 100 || s.status > 199 || s.status == 101
-			malformed = !s.final && s.end_stream
+			malformed ||= !s.final && s.end_stream
 		}
 		if malformed {
 			s.reset = true

@@ -44,8 +44,10 @@ shapes.
 A request may end with trailers after its body (RFC 9113 section 8.1). Their
 fields are ignored; trailers that do not carry END_STREAM, or that hold a
 pseudo-header or a field section 8.2 refuses, are the same PROTOCOL_ERROR. A
-HEADERS frame on a stream the client has already ended is a stream error of
-type STREAM_CLOSED (section 5.1). Neither closes the connection.
+HEADERS frame on a stream the client has already ended, while elodin still holds
+it, is a stream error of type STREAM_CLOSED (section 5.1). Neither closes the
+connection. Once the stream is answered and retired, a HEADERS frame on it is a
+connection error of type PROTOCOL_ERROR.
 
 A request body is at most 65535 bytes, the most RFC 8484 section 6 allows a DNS
 message. Past it, HTTP/2 resets the stream with ENHANCE_YOUR_CALM, and HTTP/1.1

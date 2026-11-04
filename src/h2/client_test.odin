@@ -2988,12 +2988,7 @@ test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
 			frames = make([dynamic]Frame_Header, 0, 8, allocator),
 		}
 		c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
-		c.next_stream_id = 3
-		s := new(Client_Stream, allocator)
-		s.id = 1
-		s.send_window = c.peer_initial_window
-		s.body = make([dynamic]u8, 0, 8, allocator)
-		c.streams[1] = s
+		s := open_test_stream(c, 1, allocator)
 
 		ok := true
 		for b, i in tc.blocks {
@@ -3037,6 +3032,55 @@ test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
 		delete(log.frames)
 		client_stream_destroy(c, s)
 		delete_key(&c.streams, u32(1))
+		client_unref(c)
+		free_all(context.temp_allocator)
+		for _, entry in track.allocation_map {
+			testing.expectf(t, false, "%s: %d bytes leaked at %v", tc.what, entry.size, entry.location)
+		}
+		mem.tracking_allocator_destroy(&track)
+	}
+}
+
+/*
+RFC 9113 8.3: a response's header section carries one `:status`, ahead of its
+ordinary fields, and no other pseudo-header; 8.2 holds its ordinary fields as
+it holds any. A response that breaks either is malformed and is not accepted
+(8.1.1) - a second `:status` in particular would be read as the answer's.
+*/
+@(test)
+test_client_response_head_is_held_to_8_2_and_8_3 :: proc(t: ^testing.T) {
+	Case :: struct {
+		what:   string,
+		fields: []Header_Field,
+	}
+	cases := []Case {
+		{"a second :status", {{":status", "500"}, {":status", "200"}}},
+		{"a request pseudo-header", {{":status", "200"}, {":path", "/"}}},
+		{"a pseudo-header after an ordinary field", {{"content-type", "application/dns-message"}, {":status", "200"}}},
+		{"a connection-specific field", {{":status", "200"}, {"connection", "close"}}},
+		{"an uppercase name", {{":status", "200"}, {"Content-Type", "application/dns-message"}}},
+	}
+	for tc in cases {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		allocator := mem.tracking_allocator(&track)
+
+		log := Client_Frame_Log {
+			frames = make([dynamic]Frame_Header, 0, 8, allocator),
+		}
+		c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+		s := open_test_stream(c, 1, allocator)
+
+		block := make([dynamic]u8, 0, 64, context.temp_allocator)
+		for f in tc.fields {
+			encode_header(&block, f.name, f.value)
+		}
+		ok := client_handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block[:])
+		testing.expectf(t, ok, "%s: the connection was dropped", tc.what)
+		testing.expectf(t, s.reset && !s.done, "%s: a malformed response was accepted (status %d)", tc.what, s.status)
+		testing.expectf(t, log.rst_code == .Protocol_Error, "%s: RST code %v, want PROTOCOL_ERROR", tc.what, log.rst_code)
+
+		delete(log.frames)
 		client_unref(c)
 		free_all(context.temp_allocator)
 		for _, entry in track.allocation_map {
