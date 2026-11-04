@@ -29,19 +29,20 @@ import (
 )
 
 var (
-	binary      = flag.String("binary", "", "elodin binary (default: ../bin/elodin); point it at a thread-model release for before/after rows")
-	unboundBin  = flag.String("unbound", "unbound", "Unbound binary for the comparison rows, looked up on PATH")
-	servers     = flag.String("servers", "elodin,unbound", "servers the comparison sections run against, comma-separated: elodin, unbound")
-	held        = flag.Int("held", 20000, "most connections the connections section holds open; lower it for a thread-model release, which spends a thread on each")
-	only        = flag.String("only", "", "run only scenarios whose name contains this")
-	duration    = flag.Duration("duration", 10*time.Second, "measured length of each run")
-	warmup      = flag.Duration("warmup", 2*time.Second, "unmeasured length before each run")
-	upstreamRTT = flag.Duration("upstream-rtt", 20*time.Millisecond, "delay the mock upstream answers after")
-	workdir     = flag.String("workdir", "", "where to put configs and logs (default: a temp dir)")
-	out         = flag.String("out", "", "write the markdown report here as well as to stdout")
-	repeat      = flag.Int("repeat", 3, "run each measured scenario this many times and keep the median")
-	survey      = flag.String("survey", "", "instead of benchmarking, run the DNSSEC survey against this reference resolver (e.g. 9.9.9.9:53)")
-	cooldown    = flag.Duration("cooldown", 15*time.Second, "idle time between runs, so a thermally limited machine does not drift across the matrix")
+	binary        = flag.String("binary", "", "elodin binary (default: ../bin/elodin); point it at a thread-model release for before/after rows")
+	unboundBin    = flag.String("unbound", "unbound", "Unbound binary for the comparison rows, looked up on PATH")
+	servers       = flag.String("servers", "elodin,unbound", "servers the comparison sections run against, comma-separated: elodin, unbound, adguardhome, blocky, pihole, coredns, dnsmasq, pdns, dnsdist, bind, knot; or all")
+	competitorDir = flag.String("competitors", "", "where the competitors' binaries are: <dir>/bin, or a .deb extracted to <dir>/root; PATH otherwise")
+	held          = flag.Int("held", 20000, "most connections the connections section holds open; lower it for a thread-model release, which spends a thread on each")
+	only          = flag.String("only", "", "run only scenarios whose name contains this")
+	duration      = flag.Duration("duration", 10*time.Second, "measured length of each run")
+	warmup        = flag.Duration("warmup", 2*time.Second, "unmeasured length before each run")
+	upstreamRTT   = flag.Duration("upstream-rtt", 20*time.Millisecond, "delay the mock upstream answers after")
+	workdir       = flag.String("workdir", "", "where to put configs and logs (default: a temp dir)")
+	out           = flag.String("out", "", "write the markdown report here as well as to stdout")
+	repeat        = flag.Int("repeat", 3, "run each measured scenario this many times and keep the median")
+	survey        = flag.String("survey", "", "instead of benchmarking, run the DNSSEC survey against this reference resolver (e.g. 9.9.9.9:53)")
+	cooldown      = flag.Duration("cooldown", 15*time.Second, "idle time between runs, so a thermally limited machine does not drift across the matrix")
 )
 
 func main() {
@@ -80,25 +81,8 @@ func main() {
 	}
 	log.Printf("bench: work dir %s", dir)
 
-	h := &harness{root: root, dir: dir, binary: *binary}
-	for k := range strings.SplitSeq(*servers, ",") {
-		switch k = strings.TrimSpace(k); k {
-		case "elodin":
-			h.kinds = append(h.kinds, k)
-		case "unbound":
-			// A machine without Unbound still gets elodin's rows; the report
-			// names what was left out and why rather than dropping it quietly.
-			if path, err := exec.LookPath(*unboundBin); err == nil {
-				h.unbound = path
-				h.kinds = append(h.kinds, k)
-			} else {
-				h.skipped = append(h.skipped, fmt.Sprintf("Unbound rows are skipped: `%s` is not on PATH.", *unboundBin))
-			}
-		case "":
-		default:
-			log.Fatalf("bench: -servers: unknown server %q", k)
-		}
-	}
+	h := &harness{root: root, dir: dir, binary: *binary, competitorDir: *competitorDir, bins: map[string]string{}}
+	h.addServers(*servers)
 	if err := h.setup(); err != nil {
 		log.Fatalf("bench: %v", err)
 	}
@@ -126,6 +110,48 @@ func main() {
 	}
 }
 
+// addServers resolves -servers into the kinds the comparison sections run
+// against, and names the ones left out and why.
+func (h *harness) addServers(list string) {
+	if list == "all" {
+		list = "elodin,unbound,adguardhome,blocky,pihole,coredns,dnsmasq,pdns,dnsdist,bind,knot"
+	}
+	for k := range strings.SplitSeq(list, ",") {
+		switch k = strings.TrimSpace(k); k {
+		case "elodin":
+			h.kinds = append(h.kinds, k)
+		case "unbound":
+			// A machine without Unbound still gets elodin's rows; the report
+			// names what was left out and why rather than dropping it quietly.
+			if path, err := exec.LookPath(*unboundBin); err == nil {
+				h.unbound = path
+				h.kinds = append(h.kinds, k)
+			} else {
+				h.skipped = append(h.skipped, fmt.Sprintf("Unbound rows are skipped: `%s` is not on PATH.", *unboundBin))
+			}
+		case "":
+		default:
+			c, ok := competitors[k]
+			if !ok {
+				log.Fatalf("bench: -servers: unknown server %q", k)
+			}
+			if path, err := findCompetitor(*competitorDir, c.bin); err == nil {
+				h.bins[k] = path
+				h.kinds = append(h.kinds, k)
+			} else {
+				h.skipped = append(h.skipped, fmt.Sprintf("%s rows are skipped: `%s` was not found.", k, c.bin))
+			}
+		}
+	}
+	// The other sections know Unbound's limits and transports and nobody
+	// else's; only compare asks each server what it serves.
+	for _, k := range h.kinds {
+		if _, ok := competitors[k]; ok && *only != "compare" {
+			log.Fatalf("bench: -servers %s is for -only compare; the other sections compare elodin and unbound", k)
+		}
+	}
+}
+
 func repoRoot() (string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -144,6 +170,9 @@ type harness struct {
 	dir     string
 	binary  string
 	unbound string
+	// competitorDir and bins are where the other servers' binaries are.
+	competitorDir string
+	bins          map[string]string
 	// kinds are the servers the comparison sections run against, and skipped
 	// says why any asked for are missing.
 	kinds    []string
@@ -278,6 +307,9 @@ func describeMachine() string {
 // against a thread-model release and one against the event loop produce rows
 // that cannot be mistaken for each other.
 func (h *harness) serverLabel(kind string) string {
+	if _, ok := competitors[kind]; ok {
+		return h.competitorLabel(kind)
+	}
 	if kind == "unbound" {
 		// `unbound -V` prints "Version 1.24.2" first, then how it was built.
 		if outb, err := exec.Command(h.unbound, "-V").Output(); err == nil {
