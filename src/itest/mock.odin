@@ -118,10 +118,11 @@ Mock :: struct {
 
 	/*
 	Set to hold every delayed UDP reply until this many are waiting, then send
-	them all: a barrier, so a case can ask whether queries were in flight at
-	once without timing them. `held` counts the replies waiting, and reaching
-	`hold_until` is the event the case reads. Atomic, both: set once the server
-	under test is up, so its startup probes are not held.
+	them all at once, in place of their rule's delay: a barrier, so a case can
+	ask whether queries were in flight at once without timing them. `held`
+	counts the replies held, up to `hold_until`, and reaching it is the event
+	the case reads; a reply after that keeps its rule's delay. Atomic, both:
+	set once the server under test is up, so its startup probes are not held.
 	*/
 	hold_until:  int,
 	held:        int,
@@ -221,20 +222,20 @@ mock_hold_until :: proc(m: ^Mock, n: int) {
 
 /*
 What the mock can say about a hold left short, so a failure names its cause:
-UDP queries received since the hold was set, those the kernel dropped on the mock's socket for want of
-room, and threads it could not start.
+UDP queries received since the hold was set, those the kernel dropped on the
+mock's socket for want of room since the socket opened, and threads it could
+not start.
 */
 mock_hold_report :: proc(m: ^Mock) -> string {
-	received, _, _ := mock_counts(m)
 	sync.mutex_lock(&m.mu)
-	received -= m.udp_before_hold
+	received := m.udp_queries - m.udp_before_hold
 	sync.mutex_unlock(&m.mu)
 	inode := [1]u64{metrics.socket_inode(int(m.udp_socket))}
 	drops: [1]u64
 	// Unknown rather than 0 when `/proc` would not say, so it is not read as none.
 	dropped := metrics.socket_drops(inode[:], drops[:]) ? fmt.tprint(drops[0]) : "unknown"
 	return fmt.tprintf(
-		"held %d, received %d, dropped at its socket %s, failed thread starts %d",
+		"held %d, received %d since the hold, dropped at its socket %s since it opened, failed thread starts %d",
 		mock_held(m),
 		received,
 		dropped,

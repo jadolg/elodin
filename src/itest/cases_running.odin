@@ -371,7 +371,10 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 				for mock_held(burst_mock) < 500 && time.tick_diff(time.tick_now(), deadline) > 0 {
 					time.sleep(time.Millisecond)
 				}
-				check(r, mock_held(burst_mock) >= 500, "the hold of 500 was not reached: %s", mock_hold_report(burst_mock))
+				// Only on a failure: the report reads `/proc/net/udp`.
+				if mock_held(burst_mock) < 500 {
+					fail(r, "the hold of 500 was not reached: %s", mock_hold_report(burst_mock))
+				}
 			}
 		}
 		end_case(r)
@@ -405,13 +408,14 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 				defer stop_server(&dsrv)
 				mock_hold_until(derived_mock, 500)
 				answered, _, rcodes := udp_burst(derived_port, burst_queries("derived", 500, 0x5400))
-				check(
-					r,
-					mock_held(derived_mock) >= 500,
-					"not every one of 500 misses reached the upstream at once: %s; answers by rcode %v",
-					mock_hold_report(derived_mock),
-					rcodes,
-				)
+				if mock_held(derived_mock) < 500 {
+					fail(
+						r,
+						"not every one of 500 misses reached the upstream at once: %s; answers by rcode %v",
+						mock_hold_report(derived_mock),
+						rcodes,
+					)
+				}
 				check_eq_int(r, answered, 500, "queries answered")
 			}
 		}
