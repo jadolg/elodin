@@ -120,6 +120,11 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   leaving out a name refused for something punycode cannot carry: a no-break
   or zero-width space, a symbol, a byte that is not UTF-8, or ASCII no label
   holds, such as `*` or `:`.
+- A name with an empty label (`*..com`, `||.com^`, `a..com`, `a。。com`), a
+  label past 63 bytes, a name past 255 bytes on the wire, or a `\` escape
+  that is broken or that a query never spells (a query writes only a dot, a
+  backslash, a control or a byte past ASCII as `\DDD`, as in `a\046b.com`) is
+  skipped and not counted: no query name holds one, so it could never match.
 - A UTF-8 byte order mark at the start of a line is ignored, so a list saved
   with one, or joined from files saved with one, keeps each piece's first rule.
 - `address=/…/` (dnsmasq syntax) is accepted. A `server=/…/` line that names a

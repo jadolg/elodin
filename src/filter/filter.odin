@@ -486,9 +486,16 @@ engine_stats :: proc(e: ^Engine) -> Stats {
 // joiner or punctuation mark RFC 5892 appendix A admits in context. A no-break or
 // zero-width space, a BOM, a symbol, a byte that is not UTF-8 (decoded as
 // U+FFFD), or ASCII no label holds (`*`, `:`) has no punycode form a stub sends.
+// Nor can a key with an empty label (`.com`, `a..com`, `a..`, `a。。com`): only the
+// root label is empty (RFC 1035 section 3.1), and `normalise` has stripped it; nor
+// an ASCII key the wire cannot carry (a label past 63 bytes, a name past 255, a
+// broken escape), which `dns.encode_name` judges as it does for config names.
 @(private)
 rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool, not_ascii: bool) {
 	key, ok = normalise(domain, buf)
+	if !ok {
+		return
+	}
 	for c in transmute([]u8)key {
 		if c == '/' || c <= 0x20 || c == 0x7f {
 			return "", false, false
@@ -496,9 +503,41 @@ rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool, not_ascii
 		not_ascii ||= c >= 0x80
 	}
 	if !not_ascii {
+		// A query name is `decode_name`'s spelling, so the key must come back
+		// from the wire as written: that refuses what `encode_name` refuses, a
+		// last dot (the root again, `normalise` having had one), and an escape
+		// a query never spells (`\.`, `\097`, `\065`).
+		// Written before read, so not zeroed: this runs once per list line.
+		wire: [dns.MAX_NAME_WIRE]u8 = ---
+		n, err := dns.encode_name(key, wire[:])
+		back: [dns.MAX_NAME_PRESENTATION + 1]u8 = ---
+		arena: mem.Arena
+		mem.arena_init(&arena, back[:])
+		spelt, _, derr := dns.decode_name(wire[:n], 0, mem.arena_allocator(&arena))
+		if err != .None || derr != .None || dns.name_trim_root(spelt) != key {
+			return "", false, false
+		}
 		return
 	}
+	// The full stops below end a label as `.` does, so two in a row, one first,
+	// or one before the root dot `normalise` stripped, leave an empty label its
+	// punycode form would hold too. A label's ASCII stays as it is in punycode,
+	// so it alone may not pass the wire's 63 and 255 bytes.
+	after_stop := true
+	label, wire := 0, 1
 	for r in key {
+		stop := r == '.' || r == 0x3002 || r == 0xff0e || r == 0xff61
+		if stop && after_stop {
+			return "", false, false
+		}
+		after_stop = stop
+		if stop || r < 0x80 {
+			label = 0 if stop else label + 1
+			wire += 1
+			if label > dns.MAX_LABEL_LEN || wire > dns.MAX_NAME_WIRE {
+				return "", false, false
+			}
+		}
 		switch r {
 		case 'a' ..= 'z', '0' ..= '9', '-', '_', '.', 0x200c, 0x200d, 0x00b7, 0x0375, 0x05f3, 0x05f4, 0x30fb, 0x3002, 0xff0e, 0xff61:
 		// The ASCII a label holds; RFC 5892 appendix A's CONTEXTJ and CONTEXTO
@@ -511,6 +550,9 @@ rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool, not_ascii
 				return "", false, false
 			}
 		}
+	}
+	if after_stop && strings.has_suffix(domain, ".") {
+		return "", false, false
 	}
 	return "", false, true
 }
