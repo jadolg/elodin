@@ -222,17 +222,26 @@ Run_Result :: struct {
 // one-shot modes - `--version`, `--check` - that never bind a socket.
 run_binary :: proc(r: ^Runner, args: []string, tag: string) -> Run_Result {
 	out_path := filepath.join({r.work_dir, fmt.tprintf("cli-%s.txt", tag)}, context.temp_allocator) or_else ""
+	command := make([dynamic]string, 0, len(args) + 1, context.temp_allocator)
+	append(&command, r.binary)
+	append(&command, ..args)
+	return run_command(command[:], nil, out_path)
+}
+
+/*
+Run `command` to completion, its output collected through `out_path`; `env` nil
+inherits this process's environment. Into a file and waited on rather than
+through process_exec, which polls its pipes without blocking and spins a core
+for as long as the command runs.
+*/
+run_command :: proc(command: []string, env: []string, out_path: string) -> Run_Result {
 	out_file, oerr := os.open(out_path, {.Write, .Create, .Trunc}, os.Permissions_Read_All + {.Write_User})
 	if oerr != nil {
 		return {}
 	}
 
-	command := make([dynamic]string, 0, len(args) + 1, context.temp_allocator)
-	append(&command, r.binary)
-	append(&command, ..args)
-
 	process, perr := os.process_start(
-		os.Process_Desc{command = command[:], stdout = out_file, stderr = out_file},
+		os.Process_Desc{command = command, env = env, stdout = out_file, stderr = out_file},
 	)
 	if perr != nil {
 		os.close(out_file)

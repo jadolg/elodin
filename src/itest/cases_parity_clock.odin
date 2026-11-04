@@ -105,13 +105,13 @@ parity_clock_child :: proc(r: ^Runner, tag, first, after: string, args: []string
 	defer _ = os.remove_all(bin_dir)
 	chronyc := filepath.join({bin_dir, "chronyc"}, context.temp_allocator) or_else ""
 	count := fmt.tprintf("%s.count", chronyc)
+	// "$0" rather than the path written in: the kernel hands a script the path it
+	// was run by, and nothing in a work dir's name can break the quoting.
 	script := fmt.tprintf(
 		"#!/bin/sh\n" +
-		"if [ -e '%s' ]; then cat <<'EOF'\n%sEOF\n" +
-		"else : > '%s'; cat <<'EOF'\n%sEOF\nfi\n",
-		count,
+		"if [ -e \"$0.count\" ]; then cat <<'EOF'\n%sEOF\n" +
+		"else : > \"$0.count\"; cat <<'EOF'\n%sEOF\nfi\n",
 		after,
-		count,
 		first,
 	)
 	werr := os.write_entire_file(chronyc, script, os.Permissions_Read_All + os.Permissions_Execute_All + {.Write_User})
@@ -150,41 +150,26 @@ parity_clock_child :: proc(r: ^Runner, tag, first, after: string, args: []string
 	seconds. --graceful-stop is passed on so `mise run leakcheck` sees the
 	child's servers exit too.
 	*/
+	// This itest itself, by /proc/self/exe: os.args[0] is whatever the caller
+	// chose to call it, not a path the child can be started from.
+	self, serr := os.get_executable_path(context.temp_allocator)
+	if !check(r, serr == nil, "cannot find this itest's own path: %v", serr) {
+		return
+	}
 	command := make([dynamic]string, context.temp_allocator)
 	upstream := fmt.tprintf("127.0.0.1:%d", next_port(r))
-	append(&command, "timeout", "120", os.args[0], "--binary", r.binary, "--parity", "--parity-runs", "1")
+	append(&command, "timeout", "120", self, "--binary", r.binary, "--parity", "--parity-runs", "1")
 	append(&command, "--parity-upstream", upstream)
 	if r.graceful_stop {
 		append(&command, "--graceful-stop")
 	}
 	append(&command, ..args)
-	// Into a file and waited on, as `run_binary` does: process_exec polls its
-	// pipes without blocking, and would spin a core for the whole run.
-	out_path := filepath.join({bin_dir, "output.txt"}, context.temp_allocator) or_else ""
-	out_file, oerr := os.open(out_path, {.Write, .Create, .Trunc}, os.Permissions_Read_All + {.Write_User})
-	if !check(r, oerr == nil, "cannot open %s: %v", out_path, oerr) {
+	result := run_command(command[:], env[:], filepath.join({bin_dir, "output.txt"}, context.temp_allocator) or_else "")
+	if !check(r, result.ok, "cannot run %s", self) {
 		return
 	}
-	process, err := os.process_start(
-		os.Process_Desc{command = command[:], env = env[:], stdout = out_file, stderr = out_file},
-	)
-	if err != nil {
-		os.close(out_file)
-		check(r, false, "cannot run %s: %v", os.args[0], err)
-		return
-	}
-	state, wait_err := os.process_wait(process)
-	os.close(out_file)
-	if !check(r, wait_err == nil, "cannot wait for %s: %v", os.args[0], wait_err) {
-		return
-	}
-	data, rerr := os.read_entire_file(out_path, context.temp_allocator)
-	if !check(r, rerr == nil, "cannot read %s: %v", out_path, rerr) {
-		return
-	}
-	output = string(data)
-	check(r, state.exit_code != 124, "the run did not finish inside the timeout:\n%s", output)
-	return output, state.exit_code, state.exit_code != 124
+	check(r, result.exit_code != 124, "the run did not finish inside the timeout:\n%s", result.output)
+	return result.output, result.exit_code, result.exit_code != 124
 }
 
 // End to end: a live run on a clock 2h24m slow stops before it sends anything,
