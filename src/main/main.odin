@@ -465,26 +465,8 @@ main :: proc() {
 	if !logx.init(logx.Level(cfg.log.level), log_file) {
 		fmt.eprintfln("elodin: cannot open the log file %q, logging to stderr instead", cfg.log.file)
 	}
-	// `--check` opens no log, but says what a start would find: a file it cannot
-	// open, or a directory it cannot create one in.
-	if opts.check_only && cfg.log.file != "" {
-		openable: bool
-		if os.exists(cfg.log.file) {
-			openable = privdrop.can_reopen(cfg.log.file, true)
-		} else {
-			parent := os.dir(cfg.log.file)
-			cparent := strings.clone_to_cstring(parent if parent != "" else ".", context.temp_allocator)
-			openable = posix.access(cparent, {.W_OK, .X_OK}) == .OK
-		}
-		// A start as root refuses a symlink there (`logx.refuse_symlink`).
-		st: posix.stat_t
-		clog := strings.clone_to_cstring(cfg.log.file, context.temp_allocator)
-		if privdrop.is_root() && posix.lstat(clog, &st) == .OK && posix.S_ISLNK(st.st_mode) {
-			openable = false
-		}
-		if !openable {
-			fmt.eprintfln("elodin: cannot open the log file %q; a start would log to stderr instead", cfg.log.file)
-		}
+	if opts.check_only && cfg.log.file != "" && !log_file_openable(cfg.log.file) {
+		fmt.eprintfln("elodin: cannot open the log file %q; a start would log to stderr instead", cfg.log.file)
 	}
 	defer logx.shutdown()
 
@@ -648,6 +630,24 @@ main :: proc() {
 	// process-wide and a reload does not move them.
 	dns.set_heavy_decodes(cfg.server.heavy_decodes)
 	run(&cfg, opts, service)
+}
+
+/*
+For `--check`, which opens no log: whether a start could, as this account - the
+file there for appending, or its directory to create one in. A start as root
+refuses a symlink on the path (`logx.symlink_refused`).
+*/
+@(private)
+log_file_openable :: proc(path: string) -> bool {
+	if logx.symlink_refused(path) {
+		return false
+	}
+	if os.exists(path) {
+		return privdrop.can_reopen(path, true)
+	}
+	parent := os.dir(path)
+	cparent := strings.clone_to_cstring(parent if parent != "" else ".", context.temp_allocator)
+	return posix.access(cparent, {.W_OK, .X_OK}) == .OK
 }
 
 /*
@@ -975,9 +975,10 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 	}
 
 	// Only root can give a file away; an account that is neither root nor the
-	// service fails at `apply` below.
-	if privdrop.is_root() && !logx.hand_over(service.uid, service.gid) {
-		logx.warnf("could not give the log file %q to %s; a SIGHUP after a rotation will not open it again", cfg.log.file, cfg.server.user)
+	// service fails at `apply` below. One that stays root's is named by
+	// `warn_out_of_reach`, since the service account cannot open it.
+	if privdrop.is_root() {
+		logx.hand_over(service.uid, service.gid)
 	}
 
 	if err := privdrop.apply(service); err != .None {

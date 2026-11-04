@@ -117,24 +117,26 @@ file or symlink already at the name fails it and is appended to as it is.
 @(private)
 open_log :: proc(path: string, no_follow: bool) -> (f: ^os.File, created: bool, err: os.Error) {
 	cpath := strings.clone_to_cstring(path, context.temp_allocator)
-	/*
-	`core:sys/linux`, not `core:sys/posix`: the latter's O_NOFOLLOW is the x86
-	value on every Linux, which on arm64 is O_LARGEFILE - the flag would be
-	silently dropped there.
-	*/
 	base: linux.Open_Flags = {.WRONLY, .APPEND, .CREAT, .CLOEXEC}
 	if no_follow {
-		base += {.NOFOLLOW}
+		// Not to wait at a FIFO for a reader that never comes; cleared below.
+		base += {.NONBLOCK}
 	}
 	owner_only: linux.Mode = {.IRUSR, .IWUSR}
-	fd, errno := linux.open(cpath, base + {.EXCL}, owner_only)
+	fd, errno := open_resolved(cpath, base + {.EXCL}, owner_only, no_follow)
 	created = errno == .NONE
 	if !created {
 		if errno != .EEXIST {
 			return nil, false, os.Platform_Error(errno)
 		}
-		fd, errno = linux.open(cpath, base, owner_only)
+		fd, errno = open_resolved(cpath, base, owner_only, no_follow)
 		if errno != .NONE {
+			return nil, false, os.Platform_Error(errno)
+		}
+	}
+	if no_follow {
+		if errno = linux.fcntl(fd, linux.F_SETFL, linux.Open_Flags{.APPEND}); errno != .NONE {
+			linux.close(fd)
 			return nil, false, os.Platform_Error(errno)
 		}
 	}
@@ -142,13 +144,74 @@ open_log :: proc(path: string, no_follow: bool) -> (f: ^os.File, created: bool, 
 }
 
 /*
-Whether a log opened now must not follow a symlink at its name: as root. Under
-`server.user` the dropped process may own the log's directory (the docs allow
-it), and a process that has been taken over could leave a symlink there for the
-next root start to append to - or create - whatever file it names. Unprivileged,
-following one reaches nothing the process could not open anyway.
+`open`, or with `no_symlinks` an `openat2` that refuses a symlink anywhere on
+the path (RESOLVE_NO_SYMLINKS): O_NOFOLLOW alone covers the last component, and
+the account that may own the file's directory may own one above it too. Where
+the kernel predates openat2 (5.6) it falls back to O_NOFOLLOW.
+
+`core:sys/linux`, not `core:sys/posix`: the latter's O_NOFOLLOW is the x86 value
+on every Linux, which on arm64 is O_LARGEFILE - the flag would be silently
+dropped there. It has no openat2 wrapper, hence the system call by hand.
 */
 @(private)
+open_resolved :: proc(cpath: cstring, flags: linux.Open_Flags, mode: linux.Mode, no_symlinks: bool) -> (linux.Fd, linux.Errno) {
+	if !no_symlinks {
+		return linux.open(cpath, flags, mode)
+	}
+	Open_How :: struct {
+		flags:   u64,
+		mode:    u64,
+		resolve: u64,
+	}
+	RESOLVE_NO_SYMLINKS :: 0x04
+	how := Open_How {
+		flags   = u64(transmute(u32)flags),
+		// openat2 refuses a mode without O_CREAT.
+		mode    = u64(transmute(u32)mode) if .CREAT in flags else 0,
+		resolve = RESOLVE_NO_SYMLINKS,
+	}
+	ret := linux.syscall(linux.SYS_openat2, linux.AT_FDCWD, transmute(uintptr)cpath, &how, size_of(how))
+	if ret == -int(linux.Errno.ENOSYS) {
+		return linux.open(cpath, flags + {.NOFOLLOW}, mode)
+	}
+	if ret < 0 {
+		return -1, linux.Errno(-ret)
+	}
+	return linux.Fd(ret), .NONE
+}
+
+/*
+For `--check`, which creates nothing: whether a start as this account would
+find a symlink on the way to `path` it refuses (`refuse_symlink`) - on the file,
+or on its directory when there is no file yet.
+*/
+symlink_refused :: proc(path: string) -> bool {
+	if !refuse_symlink() {
+		return false
+	}
+	probe :: proc(p: string) -> linux.Errno {
+		fd, errno := open_resolved(strings.clone_to_cstring(p, context.temp_allocator), {.PATH, .CLOEXEC}, {}, true)
+		if errno == .NONE {
+			linux.close(fd)
+		}
+		return errno
+	}
+	errno := probe(path)
+	if errno == .ENOENT {
+		parent := os.dir(path)
+		errno = probe(parent)
+	}
+	return errno == .ELOOP
+}
+
+/*
+Whether a log opened now must not follow a symlink on its path, nor wait at a
+FIFO: as root. Under `server.user` the dropped process may own the log's
+directory (the docs allow it), and a process that has been taken over could
+leave a symlink there for the next root start to append to - or create -
+whatever file it names, or a FIFO to hang it. Unprivileged, following one
+reaches nothing the process could not open anyway.
+*/
 refuse_symlink :: proc() -> bool {
 	return posix.geteuid() == 0
 }
@@ -163,17 +226,16 @@ the renamed file. A file this process made is its own output, like the
 blocklist cache, so it goes over with the process. One that was there already is
 the operator's - possibly a shared system log - and is left as it is (Unbound
 declines to chown its log file for the same reason). By descriptor, so the file
-changed is the one being written, whatever the name points at by now.
-
-True when there was nothing to hand over.
+changed is the one being written, whatever the name points at by now. A change
+that fails leaves a file the account cannot open, which `warn_out_of_reach` in
+main names after the drop.
 */
-hand_over :: proc(uid: posix.uid_t, gid: posix.gid_t) -> bool {
+hand_over :: proc(uid: posix.uid_t, gid: posix.gid_t) {
 	sync.mutex_lock(&state.mu)
 	defer sync.mutex_unlock(&state.mu)
-	if !state.to_file || !state.created {
-		return true
+	if state.to_file && state.created {
+		posix.fchown(posix.FD(os.fd(state.file)), uid, gid)
 	}
-	return posix.fchown(posix.FD(os.fd(state.file)), uid, gid) == .OK
 }
 
 // Whether lines go to a file rather than stderr.

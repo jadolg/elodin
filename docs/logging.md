@@ -31,9 +31,11 @@ owner along with the process; one that was there already is left as it is, and
 the account must be able to write it. After a rotation the name must be
 creatable by the account too, so give logrotate `create <mode> <user> <group>`
 naming it, or a directory it can write. Started as root, elodin refuses a
-`log.file` that is a symlink and logs to stderr instead: a directory the service
-account can write would otherwise let it point the next root start at any file.
-Name the target itself.
+`log.file` with a symlink anywhere on its path, or a FIFO nothing reads yet, and
+logs to stderr instead (`--check` says so too): a directory the service account
+can write would otherwise let it point the next root start at any file, or hang
+it. Name the real path. On kernels before 5.6 only a symlink at the file itself
+is refused.
 
 With `log.file` set, each line is one write to the file, not followed by a
 sync: `tail` and a shipper see it at once and a killed process loses none of

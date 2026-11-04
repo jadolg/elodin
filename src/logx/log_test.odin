@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:sys/linux"
 import "core:sys/posix"
 import "core:testing"
 import "core:unicode/utf8"
@@ -234,6 +235,33 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 		_, _, lerr := open_log(link, true)
 		testing.expect(t, lerr != nil, "a symlinked log was opened with symlinks refused")
 		testing.expect(t, !os.exists(target), "refusing a symlinked log created its target")
+		// Nor through a symlinked directory above it, which O_NOFOLLOW alone
+		// would follow.
+		real_dir, _ := filepath.join({dir, "real"}, context.temp_allocator)
+		dir_link, _ := filepath.join({dir, "dirlink"}, context.temp_allocator)
+		through, _ := filepath.join({dir_link, "elodin.log"}, context.temp_allocator)
+		if testing.expect(t, os.make_directory(real_dir) == nil && os.symlink(real_dir, dir_link) == nil, "cannot make the directory symlink") {
+			_, _, derr := open_log(through, true)
+			testing.expect(t, derr != nil, "a log under a symlinked directory was opened with symlinks refused")
+			inside, _ := filepath.join({real_dir, "elodin.log"}, context.temp_allocator)
+			testing.expect(t, !os.exists(inside), "refusing a symlinked directory created the log in its target")
+		}
+
+		// The descriptor a refusing open hands back blocks again: a full pipe
+		// to a shipper would otherwise drop lines.
+		if nf, _, nerr := open_log(path, true); testing.expectf(t, nerr == nil, "cannot open %s refusing symlinks: %v", path, nerr) {
+			fl, _ := linux.fcntl(linux.Fd(os.fd(nf)), linux.F_GETFL)
+			testing.expect(t, .NONBLOCK not_in fl, "the log was left non-blocking")
+			os.close(nf)
+		}
+
+		// A FIFO with no reader is refused at once rather than waited on.
+		fifo, _ := filepath.join({dir, "fifo.log"}, context.temp_allocator)
+		if testing.expect(t, posix.mkfifo(strings.clone_to_cstring(fifo, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {
+			_, _, ferr := open_log(fifo, true)
+			testing.expect(t, ferr != nil, "a FIFO with no reader was opened")
+		}
+
 		lf, _, ferr := open_log(link, false)
 		if testing.expectf(t, ferr == nil, "a symlinked log was refused when symlinks are followed: %v", ferr) {
 			os.close(lf)
