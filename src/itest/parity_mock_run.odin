@@ -184,10 +184,10 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 		stats.unanswered += 1
 		return
 	}
-	reference, from, asked := parity_upstreams_reference(run.ups, q)
 	// Before the drain: the server's entry dates from its answer, and an entry
 	// stamped up to the drain's guard later would read younger than it is.
 	answered_at := time.now()
+	reference, from, asked := parity_upstreams_reference(run.ups, q)
 	/*
 	The race's losers have to be in before the next ask resets the mocks; see
 	`parity_upstreams_drain`. One that is not, by the time no leg can still be
@@ -198,12 +198,27 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 	if asked && run.s.strategy == "race" && !parity_upstreams_drain(run.ups, q, time.tick_add(time.tick_now(), PARITY_UPSTREAM_TIMEOUT)) {
 		stats.failures += 1
 		run.undrained = true
+		// What each member has on record, which tells a member never asked
+		// (count 0) from a stub never retried and a reply to another question.
+		sb := strings.builder_make(context.temp_allocator)
+		for _, i in run.ups.mocks {
+			reply, count := parity_upstream_last_reply(run.ups, i)
+			fmt.sbprintf(
+				&sb,
+				"\n    upstream %d: %d replies since the reset, last whole %v, answers this question %v",
+				i,
+				count,
+				parity_whole(reply),
+				parity_answers_question(reply, q),
+			)
+		}
 		fail(
 			run.r,
-			"query %d: %s: an upstream in the race had sent no whole reply %v after the answer; the scenario stops here\n    reproduce: --parity-seed %d --parity-runs %d",
+			"query %d: %s: an upstream in the race had sent no whole reply %v after the answer; the scenario stops here%s\n    reproduce: --parity-seed %d --parity-runs %d",
 			index,
 			q.desc,
 			PARITY_UPSTREAM_TIMEOUT,
+			strings.to_string(sb),
 			run.opts.seed,
 			index + 1,
 		)
