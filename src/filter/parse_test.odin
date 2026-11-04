@@ -332,6 +332,21 @@ test_domain_lines_dns_cannot_express_are_skipped :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_a_rule_with_an_empty_label_is_skipped :: proc(t: ^testing.T) {
+	// No label is empty, so `.com` names nothing (#431). Stored, it would count
+	// toward a list that blocks nothing by it.
+	for src in ([]string{"*..com\n", "||.com^\n", "||*..com^\n", "a..com\n", "||a..^\n", "@@||.com^\n"}) {
+		block, allow := parsed(src, .Adblock)
+		testing.expectf(t, block.count == 0 && allow.count == 0, "%q should store no rule", src)
+		set_destroy(block)
+		set_destroy(allow)
+	}
+	// A query spells a dot within a label `\046` (`dns.decode_name`), so a dot in
+	// a key always ends a label.
+	testing.expect_value(t, matches("||a.com^\n", .Adblock, "x.a.com."), Decision.Blocked)
+}
+
+@(test)
 test_normalise_folds_case_and_the_trailing_dot :: proc(t: ^testing.T) {
 	// A query arrives in wire-presentation form with the root dot on the end;
 	// a list is written without it. Both have to land on the same key.

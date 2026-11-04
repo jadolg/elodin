@@ -486,9 +486,14 @@ engine_stats :: proc(e: ^Engine) -> Stats {
 // joiner or punctuation mark RFC 5892 appendix A admits in context. A no-break or
 // zero-width space, a BOM, a symbol, a byte that is not UTF-8 (decoded as
 // U+FFFD), or ASCII no label holds (`*`, `:`) has no punycode form a stub sends.
+// Nor can a key with an empty label (`.com`, `a..com`, `a..`): only the root label
+// is empty (RFC 1035 section 3.1), and `normalise` has stripped it.
 @(private)
 rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool, not_ascii: bool) {
 	key, ok = normalise(domain, buf)
+	if strings.has_prefix(key, ".") || strings.has_suffix(key, ".") || strings.contains(key, "..") {
+		return "", false, false
+	}
 	for c in transmute([]u8)key {
 		if c == '/' || c <= 0x20 || c == 0x7f {
 			return "", false, false
