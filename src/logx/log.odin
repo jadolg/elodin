@@ -29,6 +29,8 @@ State :: struct {
 	// This process created `file` rather than appending to one already there;
 	// see `hand_over`.
 	created: bool,
+	// See `init`.
+	guarded: bool,
 }
 
 @(private)
@@ -39,17 +41,25 @@ state := State {
 /*
 Point logging at a file, or at stderr when `path` is empty.
 
-Returns false if the file cannot be opened, in which case logging stays on
+`guarded`: the process is root and will drop to an account that may own the
+log's directory (the docs allow it). A process taken over under that account
+could leave a symlink on the path for the next root start to append to - or
+create - whatever file it names, or a FIFO to hang it, so both are refused, then
+and on every reopen. Without a drop there is no such account, and a root-owned
+symlink such as /var/run is followed as before.
+
+Returns the error if the file cannot be opened, in which case logging stays on
 stderr rather than being silently lost.
 */
-init :: proc(level: Level, path: string = "") -> bool {
+init :: proc(level: Level, path: string = "", guarded := false) -> os.Error {
 	sync.mutex_lock(&state.mu)
 	state.level = level
+	sync.atomic_store(&state.guarded, guarded)
 	err: os.Error
 	if path != "" {
 		f: ^os.File
 		created: bool
-		f, created, err = open_log(path, refuse_symlink())
+		f, created, err = open_log(path, guarded)
 		if err == nil {
 			state.file = f
 			state.to_file = true
@@ -59,10 +69,10 @@ init :: proc(level: Level, path: string = "") -> bool {
 	sync.mutex_unlock(&state.mu)
 
 	if err != nil {
-		return false
+		return err
 	}
 	warn_if_readable(path)
-	return true
+	return nil
 }
 
 /*
@@ -84,7 +94,7 @@ reopen :: proc(path: string) -> bool {
 	created: bool
 	if path != "" {
 		err: os.Error
-		f, created, err = open_log(path, refuse_symlink())
+		f, created, err = open_log(path, sync.atomic_load(&state.guarded))
 		if err != nil {
 			return false
 		}
@@ -147,7 +157,9 @@ open_log :: proc(path: string, no_follow: bool) -> (f: ^os.File, created: bool, 
 `open`, or with `no_symlinks` an `openat2` that refuses a symlink anywhere on
 the path (RESOLVE_NO_SYMLINKS): O_NOFOLLOW alone covers the last component, and
 the account that may own the file's directory may own one above it too. Where
-the kernel predates openat2 (5.6) it falls back to O_NOFOLLOW.
+the kernel predates openat2 (5.6), or a seccomp filter that does not know it
+answers EPERM (older container runtimes' default profiles), it falls back to
+O_NOFOLLOW.
 
 `core:sys/linux`, not `core:sys/posix`: the latter's O_NOFOLLOW is the x86 value
 on every Linux, which on arm64 is O_LARGEFILE - the flag would be silently
@@ -171,7 +183,7 @@ open_resolved :: proc(cpath: cstring, flags: linux.Open_Flags, mode: linux.Mode,
 		resolve = RESOLVE_NO_SYMLINKS,
 	}
 	ret := linux.syscall(linux.SYS_openat2, linux.AT_FDCWD, transmute(uintptr)cpath, &how, size_of(how))
-	if ret == -int(linux.Errno.ENOSYS) {
+	if ret == -int(linux.Errno.ENOSYS) || ret == -int(linux.Errno.EPERM) {
 		return linux.open(cpath, flags + {.NOFOLLOW}, mode)
 	}
 	if ret < 0 {
@@ -181,20 +193,24 @@ open_resolved :: proc(cpath: cstring, flags: linux.Open_Flags, mode: linux.Mode,
 }
 
 /*
-For `--check`, which creates nothing: whether a start as this account would
-find a symlink on the way to `path` it refuses (`refuse_symlink`) - on the file,
-or on its directory when there is no file yet.
+For `--check`, which creates nothing: whether a `guarded` start (see `init`)
+would find a symlink on the way to `path` - on the file, or on its directory
+when there is no file yet.
 */
 symlink_refused :: proc(path: string) -> bool {
-	if !refuse_symlink() {
-		return false
-	}
 	probe :: proc(p: string) -> linux.Errno {
 		fd, errno := open_resolved(strings.clone_to_cstring(p, context.temp_allocator), {.PATH, .CLOEXEC}, {}, true)
-		if errno == .NONE {
-			linux.close(fd)
+		if errno != .NONE {
+			return errno
 		}
-		return errno
+		defer linux.close(fd)
+		// The O_NOFOLLOW fallback opens a symlink itself under O_PATH rather
+		// than failing, where the start's O_NOFOLLOW open is refused.
+		st: linux.Stat
+		if linux.fstat(fd, &st) == .NONE && linux.S_ISLNK(st.mode) {
+			return .ELOOP
+		}
+		return .NONE
 	}
 	errno := probe(path)
 	if errno == .ENOENT {
@@ -202,18 +218,6 @@ symlink_refused :: proc(path: string) -> bool {
 		errno = probe(parent)
 	}
 	return errno == .ELOOP
-}
-
-/*
-Whether a log opened now must not follow a symlink on its path, nor wait at a
-FIFO: as root. Under `server.user` the dropped process may own the log's
-directory (the docs allow it), and a process that has been taken over could
-leave a symlink there for the next root start to append to - or create -
-whatever file it names, or a FIFO to hang it. Unprivileged, following one
-reaches nothing the process could not open anyway.
-*/
-refuse_symlink :: proc() -> bool {
-	return posix.geteuid() == 0
 }
 
 /*
@@ -250,6 +254,7 @@ Whether the log file in use can be read by every account on the host: a file
 an older elodin, or someone else, created with a wider mode than `open_log`
 does. False when logging to stderr or when it cannot tell.
 */
+@(private)
 readable_by_others :: proc() -> bool {
 	sync.mutex_lock(&state.mu)
 	defer sync.mutex_unlock(&state.mu)

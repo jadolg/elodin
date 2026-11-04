@@ -462,11 +462,21 @@ main :: proc() {
 	make and leave it root's (`logx.hand_over`). Its lines go to stderr.
 	*/
 	log_file := "" if opts.check_only else cfg.log.file
-	if !logx.init(logx.Level(cfg.log.level), log_file) {
-		fmt.eprintfln("elodin: cannot open the log file %q, logging to stderr instead", cfg.log.file)
+	log_guarded := privdrop.is_root() && cfg.server.user != ""
+	if err := logx.init(logx.Level(cfg.log.level), log_file, log_guarded); err != nil {
+		fmt.eprintfln(
+			"elodin: cannot open the log file %q (%s)%s, logging to stderr instead",
+			cfg.log.file,
+			os.error_string(err),
+			LOG_GUARDED_HINT if log_guarded else "",
+		)
 	}
-	if opts.check_only && cfg.log.file != "" && !log_file_openable(cfg.log.file) {
-		fmt.eprintfln("elodin: cannot open the log file %q; a start would log to stderr instead", cfg.log.file)
+	if opts.check_only && cfg.log.file != "" && !log_file_openable(cfg.log.file, log_guarded) {
+		fmt.eprintfln(
+			"elodin: cannot open the log file %q%s; a start would log to stderr instead",
+			cfg.log.file,
+			LOG_GUARDED_HINT if log_guarded else "",
+		)
 	}
 	defer logx.shutdown()
 
@@ -632,14 +642,19 @@ main :: proc() {
 	run(&cfg, opts, service)
 }
 
+// Started as root with `server.user`, a symlink on the log's path or a FIFO is
+// refused; see `logx.init`.
+@(private)
+LOG_GUARDED_HINT :: "; started as root with server.user set, a symlink anywhere on its path or a FIFO is refused, see docs/logging.md"
+
 /*
 For `--check`, which opens no log: whether a start could, as this account - the
-file there for appending, or its directory to create one in. A start as root
+file there for appending, or its directory to create one in. A `guarded` start
 refuses a symlink on the path (`logx.symlink_refused`).
 */
 @(private)
-log_file_openable :: proc(path: string) -> bool {
-	if logx.symlink_refused(path) {
+log_file_openable :: proc(path: string, guarded: bool) -> bool {
+	if guarded && logx.symlink_refused(path) {
 		return false
 	}
 	if os.exists(path) {

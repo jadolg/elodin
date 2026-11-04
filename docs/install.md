@@ -113,11 +113,14 @@ then fails at every reload: the certificate is not renewed in place, and the
 listener goes on serving the old one until it expires. A `file:` list is read
 again by every scheduled refresh as well, and one the account cannot read has
 its rules lifted then. elodin does not take
-these files over. Give the account read access, for example
-`setfacl -m u:elodin:r /etc/letsencrypt/live/<name>/privkey.pem` (and `x` on
+these files over. Give the account read access in a way that survives a
+renewal, which writes a new `privkeyN.pem` under `archive/`: certbot carries the
+previous key's group and group-read bit over to the new one, but not an ACL on
+it. So `chgrp elodin` and `chmod g+r` the current
+`/etc/letsencrypt/archive/<name>/privkeyN.pem` (and give the group `x` on
 `/etc/letsencrypt/live` and `/etc/letsencrypt/archive`, which certbot makes
-`0700`), or a certbot deploy hook that
-copies the pair somewhere the account can read. Each file out of reach is named
+`0700`), or use a certbot deploy hook that copies the pair somewhere the account
+can read. Each file out of reach is named
 in a `warn` right after the drop:
 
 ```

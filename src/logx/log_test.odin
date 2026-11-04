@@ -191,7 +191,7 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 
 	// And so does a start on one, without its caller having to ask.
 	shutdown()
-	testing.expect(t, init(.Info, path), "cannot open the log again")
+	testing.expect(t, init(.Info, path) == nil, "cannot open the log again")
 	lines = log_lines(t, path)
 	if !testing.expectf(t, len(lines) == 22, "%d lines after the second start, want 22", len(lines)) {
 		return
@@ -303,7 +303,7 @@ refusing_allocator :: proc() -> runtime.Allocator {
 open_scratch_log :: proc(t: ^testing.T) -> (dir: string, path: string, ok: bool) {
 	dir = scratch_dir(t, "elodin-logx-test") or_return
 	path, _ = filepath.join({dir, "elodin.log"}, context.temp_allocator)
-	if !init(.Info, path) {
+	if init(.Info, path) != nil {
 		testing.expectf(t, false, "cannot open %s for logging", path)
 		os.remove_all(dir)
 		return
