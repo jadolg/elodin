@@ -78,6 +78,7 @@ elsewhere (`cp /usr/sbin/unbound /tmp/unbound`) and pass the copy with
 ## Against the competition
 
 `-only compare` runs one set of rows against every server in `-servers`:
+
 - what the server weighs idle, with a 250,000-name list, and per cached answer;
 - cache hits on every transport it serves, and cache misses, on two pinned cores;
 - what a held connection and a waiting query cost.

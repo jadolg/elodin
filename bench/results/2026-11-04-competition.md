@@ -35,7 +35,7 @@ Knot is one process, so one thread; it scales by running a process per core,
 which a harness sampling one pid does not do. Its rows are one process on two
 cores.
 
-### Memory
+## Memory
 
 Idle is the server started with its cache on and nothing asked. Lists is 250,000 names, each in the server's own list format, read once `blocked.bench.test` answers NXDOMAIN. Per cache entry is two servers whose caches hold 1,000 and 200,000 answers, each given 40 s of unique names at 128 clients: the difference in RSS over the difference in entries held, so a cache allocated up front counts.
 
@@ -53,7 +53,7 @@ Idle is the server started with its cache on and nothing asked. Lists is 250,000
 | BIND 9.20.24 | 22 MB | 183 MB | 675 B | 364 B (filled 144,824) |
 | Knot Resolver 6.2.0 | 17 MB | 54 MB | 157 B | 743 B (filled 118,888) |
 
-### Cache hits on two cores
+## Cache hits on two cores
 
 Server on CPUs 0-1 with two threads, generator on 2-3, 100 clients each holding its connection, every answer from the cache. Each cell is throughput / p99 / CPU per query. A blocked answer is the UDP row's name on the list.
 
@@ -71,7 +71,7 @@ Server on CPUs 0-1 with two threads, generator on 2-3, 100 clients each holding 
 | BIND 9.20.24 | 433,172 / 1.1 ms / 4 µs | 328,885 / 3.1 ms / 6 µs | 290,343 / 1.3 ms / 8 µs | — | 119,348 / 3.3 ms / 16 µs | 162,707 / 1.4 ms / 11 µs |
 | Knot Resolver 6.2.0 | 278,431 / 0.88 ms / 4 µs | 168,850 / 1.3 ms / 7 µs | 130,738 / 1.5 ms / 9 µs | — | 1,474 / 123.9 ms / 85 µs | 260,921 / 0.68 ms / 4 µs |
 
-### Cache misses on two cores
+## Cache misses on two cores
 
 As above, 1,000 clients over UDP, every name unique, upstream at 20ms, the in-flight bound raised to 4,096 wherever the server has one. The generator cannot ask faster than 50,000 qps.
 
@@ -89,7 +89,7 @@ As above, 1,000 clients over UDP, every name unique, upstream at 20ms, the in-fl
 | BIND 9.20.24 | 8,895 qps | 30.0 ms | 79.8 ms | 1,630 | 34 µs |
 | Knot Resolver 6.2.0 | 3,950 qps | 34.3 ms | 93.4 ms | 2,338 | 43 µs |
 
-### What a held connection and a waiting query cost
+## What a held connection and a waiting query cost
 
 1,000 clients each ask one cached name and hold the connection idle; (RSS held − RSS before) ÷ N. In flight is 1,000 unique names behind a 3 s upstream, cache off; (peak − idle) ÷ N, with how many were answered.
 
@@ -110,6 +110,7 @@ As above, 1,000 clients over UDP, every name unique, upstream at 20ms, the in-fl
 Cells that failed:
 
 - Blocky 0.35.0, in flight: cmp-inflight (blocky) did not come up: read udp 127.0.0.1:45062->127.0.0.1:40009: i/o timeout
+
 ## Reading the tables
 
 - **Throughput is two cores, CPU is efficiency.** A server that spends a third

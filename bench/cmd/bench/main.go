@@ -131,25 +131,30 @@ func (h *harness) addServers(list string) {
 			}
 		case "":
 		default:
-			c, ok := competitors[k]
-			if !ok {
-				log.Fatalf("bench: -servers: unknown server %q", k)
-			}
-			if path, err := findCompetitor(*competitorDir, c.bin); err == nil {
-				h.bins[k] = path
-				h.kinds = append(h.kinds, k)
-			} else {
-				h.skipped = append(h.skipped, fmt.Sprintf("%s rows are skipped: `%s` was not found.", k, c.bin))
-			}
+			h.addCompetitor(k)
 		}
+	}
+}
+
+// addCompetitor adds one of the servers in competitors, or names it as
+// skipped when its binary is not found.
+func (h *harness) addCompetitor(k string) {
+	c, ok := competitors[k]
+	if !ok {
+		log.Fatalf("bench: -servers: unknown server %q", k)
 	}
 	// The other sections know Unbound's limits and transports and nobody
 	// else's; only compare asks each server what it serves.
-	for _, k := range h.kinds {
-		if _, ok := competitors[k]; ok && *only != "compare" {
-			log.Fatalf("bench: -servers %s is for -only compare; the other sections compare elodin and unbound", k)
-		}
+	if *only != "compare" {
+		log.Fatalf("bench: -servers %s is for -only compare; the other sections compare elodin and unbound", k)
 	}
+	path, err := findCompetitor(*competitorDir, c.bin)
+	if err != nil {
+		h.skipped = append(h.skipped, fmt.Sprintf("%s rows are skipped: `%s` was not found.", k, c.bin))
+		return
+	}
+	h.bins[k] = path
+	h.kinds = append(h.kinds, k)
 }
 
 func repoRoot() (string, error) {
