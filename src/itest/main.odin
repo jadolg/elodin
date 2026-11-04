@@ -44,7 +44,8 @@ parity (see cases_parity.odin):
                           and passing it back reproduces that run exactly
       --parity-upstream <host:port>
                           compare against this resolver rather than against a
-                          synthetic upstream. Needs the network
+                          synthetic upstream. Needs the network, and refuses
+                          to run on a clock chronyc puts over a minute off
       --parity-scenario <name|all>
                           the configuration to compare under (default
                           baseline, or live with --parity-upstream); all runs
@@ -123,6 +124,18 @@ main :: proc() {
 		os.exit(2)
 	}
 
+	// A live parity run reads the clock before it claims anything, so a refusal
+	// costs no port slot, work dir or certificate. See parity_clock.odin.
+	clock_note := ""
+	if parity && parity_opts.upstream != "" {
+		clock := parity_clock_check()
+		if clock.refuse {
+			fmt.eprintfln("itest: the host clock: %s", clock.note)
+			os.exit(1)
+		}
+		clock_note = clock.note
+	}
+
 	base_port, slot_ok := claim_port_slot()
 	if !slot_ok {
 		fmt.eprintfln("itest: all %d port slots are taken by other runs", SLOTS)
@@ -154,6 +167,9 @@ main :: proc() {
 	fmt.printfln("  ports:     %d-%d", base_port, r.port_limit - 1)
 	if !cert_ok {
 		fmt.println("  note:      no certificate available, TLS cases will be skipped")
+	}
+	if clock_note != "" {
+		fmt.printfln("  clock:     %s", clock_note)
 	}
 	fmt.println()
 
@@ -322,6 +338,9 @@ main :: proc() {
 	// seed to reach.
 	section(&r, "response parity: shapes a run found")
 	run_parity_fixed_cases(&r)
+
+	section(&r, "response parity: the live run's clock check")
+	run_parity_clock_cases(&r)
 
 	elapsed := time.diff(started, time.now())
 	report(&r, elapsed)

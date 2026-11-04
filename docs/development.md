@@ -293,6 +293,18 @@ seed.
 The live mode has no mise task, so a bare `mise run` never reaches a public
 resolver; run `./bin/itest --parity --parity-upstream <host:port>` yourself.
 
+A live run reads the host clock before its first query, because signatures are
+judged against it. When `chronyc tracking` (synchronised) puts the clock more
+than 60 seconds off NTP time, the run exits 1 with `itest: the host clock: ...`
+before it claims a port or sends anything. Fix the clock (`sudo chronyc
+makestep`) and run again. Otherwise it prints a `clock:` line: the measured
+offset, `timedatectl`'s `NTPSynchronized` when chronyc cannot measure, or
+`unchecked` when neither tool answers. The run goes ahead in those cases. The
+clock is read again after each scenario that sent queries: one that has moved
+past the limit fails `parity: the host clock` naming that scenario, whose
+divergences are then the clock's, and the run stops. The synthetic mode skips
+the check, since its answers carry no signatures.
+
 ```
 mise run parity                                   # 2000 queries per scenario, synthetic upstream
 ./bin/itest --parity --parity-seed 1 -v           # reproduce one run
