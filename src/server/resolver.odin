@@ -704,9 +704,10 @@ match_client_opt :: proc(
 		this server would encode it - the decode the append avoids, paid only
 		here - before it is given up below, or before `fit_response` cuts it. An
 		answer already over the limit is decoded for that cut anyway, so it is
-		not singled out.
+		not singled out. An answer that carries its own record comes back
+		unchanged and has nothing to mint, so it is not tried again.
 		*/
-		if ok && len(out) > limit {
+		if ok && len(out) > limit && len(out) > len(wire) {
 			out, ok = dns.ensure_opt_compressed(wire, advertise, allocator, spent)
 		}
 		/*

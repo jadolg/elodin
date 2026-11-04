@@ -95,3 +95,28 @@ test_an_answer_over_the_limit_that_fits_compressed_keeps_its_record :: proc(t: ^
 	testing.expect(t, !m.flags.tc, "an answer that fits compressed was cut")
 	free_all(context.temp_allocator)
 }
+
+// An answer that carries its own OPT record has nothing to mint, so an answer
+// of that kind over the limit is read once, for the cut, and not again for a
+// compressed mint that has no record to add.
+@(test)
+test_an_answer_with_its_own_record_is_not_rebuilt_for_a_mint :: proc(t: ^testing.T) {
+	wire := loose_answer()
+	m, _ := dns.decode_message(wire, context.temp_allocator)
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = dns.make_opt(1232, false)
+	m.additional = additional
+	with_opt, _, _ := dns.encode_message(m, context.temp_allocator)
+	limit := len(with_opt) - 20
+
+	once := 0
+	_, _ = dns.decode_message(with_opt, context.temp_allocator, &once)
+	dns.request_release(&once)
+
+	spent := 0
+	out := match_client_opt(with_opt, edns_query(), 1232, limit, .Cached, &spent, context.temp_allocator)
+	testing.expect_value(t, spent, once)
+	dns.request_release(&spent)
+	testing.expect(t, len(out) <= limit, "the answer went out over the limit")
+	free_all(context.temp_allocator)
+}
