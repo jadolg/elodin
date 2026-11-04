@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:strings"
 import "core:time"
 import "elodin:dns"
 
@@ -111,6 +112,46 @@ name_bomb_answer :: proc(query: []u8, allocator := context.allocator) -> []u8 {
 }
 
 @(private = "file")
+FLAT_QNAME :: "flat.wire.test."
+
+// An answer with no OPT record and no name compression, as an upstream that
+// does neither sends one.
+@(private = "file")
+flat_answer :: proc(allocator := context.allocator) -> []u8 {
+	m := dns.Message {
+		question = []dns.Question{{name = FLAT_QNAME, type = .A, class = .IN}},
+		answer   = []dns.Record {
+			{name = FLAT_QNAME, type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {192, 0, 2, 7}}},
+			{name = FLAT_QNAME, type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {192, 0, 2, 8}}},
+		},
+	}
+	m.flags.qr = true
+	m.flags.rd = true
+	m.flags.ra = true
+	wire, _, err := dns.encode_message(m, allocator, compress = false)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+@(private = "file")
+HEADER_POINTER_QNAME :: "headptr.wire.test."
+
+// The question, then one A record whose owner is the question's labels ended by
+// a compression pointer to offset 11 - ARCOUNT's low byte, a zero octet while
+// ARCOUNT is zero, so the owner reads as the question's name until it is not.
+@(private = "file")
+header_pointer_answer :: proc(allocator := context.allocator) -> []u8 {
+	msg := make([dynamic]u8, allocator)
+	append(&msg, 0, 0, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0)
+	append(&msg, 7, 'h', 'e', 'a', 'd', 'p', 't', 'r', 4, 'w', 'i', 'r', 'e', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1)
+	append(&msg, 7, 'h', 'e', 'a', 'd', 'p', 't', 'r', 4, 'w', 'i', 'r', 'e', 4, 't', 'e', 's', 't', 0xc0, 11)
+	append(&msg, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 9)
+	return msg[:]
+}
+
+@(private = "file")
 config_passthrough :: proc(udp_port, upstream_port: int) -> string {
 	return fmt.tprintf(
 		`log: {{ level: warn }}
@@ -197,6 +238,17 @@ run_wire_cases :: proc(r: ^Runner) {
 		return
 	}
 	mock_reply(mock, "namebomb.wire.test.", u16(dns.Type.MX), name_bomb)
+
+	flat := flat_answer(context.allocator)
+	defer delete(flat)
+	if flat == nil {
+		skip_case(r, "wire", "cannot build the uncompressed answer")
+		return
+	}
+	mock_reply(mock, FLAT_QNAME, u16(dns.Type.A), flat)
+	header_pointer := header_pointer_answer(context.allocator)
+	defer delete(header_pointer)
+	mock_reply(mock, HEADER_POINTER_QNAME, u16(dns.Type.A), header_pointer)
 
 	if !mock_start(mock) {
 		skip_case(r, "wire", "cannot start the mock upstream")
@@ -389,6 +441,68 @@ run_wire_cases :: proc(r: ^Runner) {
 					"the question was not forwarded in lower case",
 				)
 			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "edns: an OPT record minted for an EDNS client is appended to the upstream's bytes")
+	{
+		/*
+		Issue #598. An answer with no OPT record going back to a client that
+		asked with one gets a record minted, and the record is written onto the
+		end of the bytes: everything ahead of it is what the upstream sent. The
+		upstream here writes its names in full, which a decode and re-encode
+		compresses - shorter, and not the upstream's bytes. The same
+		`match_client_opt` call serves a cache hit, so no EDNS client's hit pays
+		for a decode.
+		*/
+		query := build_query(FLAT_QNAME, u16(dns.Type.A), edns_size = 1232)
+		res := query_udp(udp_port, query)
+		if check(r, res.ok, "no response") {
+			if check(r, len(res.wire) == len(flat) + 11, "length: got %d, want %d", len(res.wire), len(flat) + 11) {
+				check(
+					r,
+					bytes_equal(res.wire[2:10], flat[2:10]) && bytes_equal(res.wire[12:len(flat)], flat[12:]),
+					"the bytes ahead of the minted record are not the upstream's",
+				)
+				check_eq_int(r, int(res.wire[11]), int(flat[11]) + 1, "ARCOUNT")
+			}
+			msg, err := dns.decode_message(res.wire, context.temp_allocator)
+			if check(r, err == .None, "the response does not decode: %v", err) {
+				check(r, dns.edns_present(msg), "no OPT record went back to an EDNS client")
+			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "malformed: an upstream answer whose name points into the header is not read, and not cached")
+	{
+		/*
+		Issue #605. The owner ends in a pointer to offset 11, ARCOUNT's low
+		byte, so it reads as the question's name while ARCOUNT is zero and as
+		another once an OPT record is appended for an EDNS client - a name the
+		upstream can arrange for the client to read differently from any reading
+		taken here.
+		The decoder refuses the pointer, so the answer is one this server has
+		not read: passed on as the upstream sent it, like any other reply that
+		does not decode, and never stored. A readable answer beside it is
+		stored, so the count is the cache's and not the mock's.
+		*/
+		cached_port := next_port(r)
+		cached_cfg, _ := strings.replace(config_passthrough(cached_port, upstream_port), "cache: { enabled: false }", "cache: { enabled: true }", 1, context.temp_allocator)
+		cached, started := start_server(r, Server_Options{config = cached_cfg, udp_port = cached_port, tcp_port = cached_port})
+		if check(r, started, "the caching server did not start") {
+			defer stop_server(&cached)
+			asked := proc(r: ^Runner, port: int, mock: ^Mock, qname: string) -> int {
+				before := mock_total(mock)
+				for _ in 0 ..< 2 {
+					res := query_udp(port, build_query(qname, u16(dns.Type.A), edns_size = 1232))
+					check(r, res.ok, "no response for %s", qname)
+				}
+				return mock_total(mock) - before
+			}
+			check_eq_int(r, asked(r, cached_port, mock, FLAT_QNAME), 1, "upstream queries for a readable answer asked twice")
+			check_eq_int(r, asked(r, cached_port, mock, HEADER_POINTER_QNAME), 2, "upstream queries for an answer pointing into the header asked twice")
 		}
 	}
 	end_case(r)

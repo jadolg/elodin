@@ -255,15 +255,16 @@ skip_name :: proc(msg: []u8, pos: int) -> (next: int, ok: bool) {
 /*
 Whether the name at `pos` is the root: a zero octet, or a compression pointer
 that leads to one (RFC 1035 section 4.1.4), which is the name the decoder reads
-as ".". A pointer that does not point backwards, or one past the jumps
-`decode_name` follows, is not root, so the two agree on every owner.
+as ".". A pointer that does not point backwards, one into the header, or one
+past the jumps `decode_name` follows, is not root, so the two agree on every
+owner.
 */
 @(private)
 name_is_root :: proc(msg: []u8, pos: int) -> bool {
 	p := pos
 	for jumps := 0; p + 1 < len(msg) && msg[p] & 0xc0 == 0xc0; jumps += 1 {
 		target := int(msg[p] & 0x3f) << 8 | int(msg[p + 1])
-		if target >= p || jumps == MAX_NAME_WIRE / 2 {
+		if target >= p || target < HEADER_SIZE || jumps == MAX_NAME_WIRE / 2 {
 			return false
 		}
 		p = target

@@ -651,16 +651,19 @@ Which direction overflows decides what is given up for it:
     where the record is the tail of the message and rebuild it where it is not,
     so what comes back from those paths is an encoding of the answer rather than
     a shortening of it, and is not bounded by what went in either.
-  - a mint that is itself what overflows is abandoned. Eleven bytes longer is a
-    message that may no longer fit, and an answer whose only overflow is the
-    record being minted has nothing to drop: `encode_message` writes the answer
-    section, finds the OPT will not fit behind it, and reports a truncation - so
-    the client would be handed a complete answer with TC set and *still* no OPT
-    record, and would ask again over TCP for bytes it already had. Measured on a
-    504-byte cached answer with a client advertising 512: TC where before there
-    was none, and the same absent OPT record either way. So the answer goes as it
-    stands - which is the outcome an upstream that drops EDNS produces anyway,
-    and the one the client got before any of this ran.
+  - a mint that is itself what overflows is abandoned, once the answer
+    compressed has been tried too (`dns.ensure_opt_compressed`: the record is
+    appended to the bytes as sent, which may be longer than the encoder would
+    write them). Eleven bytes longer is a message that may no longer fit, and
+    an answer whose only overflow is the record being minted has nothing to
+    drop: `encode_message` writes the answer section, finds the OPT will not
+    fit behind it, and reports a truncation - so the client would be handed a
+    complete answer with TC set and *still* no OPT record, and would ask again
+    over TCP for bytes it already had. Measured on a 504-byte cached answer
+    with a client advertising 512: TC where before there was none, and the same
+    absent OPT record either way. So the answer goes as it stands - which is
+    the outcome an upstream that drops EDNS produces anyway, and the one the
+    client got before any of this ran.
   - an answer already over the limit before the mint keeps the minted record
     instead. It is being cut and marked whatever happens, and that record is what
     carries the payload size to ask again with, so it goes in and the cut is made
@@ -694,6 +697,19 @@ match_client_opt :: proc(
 
 	if dns.edns_present(query) {
 		out, ok := dns.ensure_opt(wire, advertise, allocator, spent)
+		/*
+		The record is appended to the bytes as they arrived, which on an answer
+		from an upstream that writes its names in full is longer than the same
+		answer compressed. A mint that overflows is tried again on the answer as
+		this server would encode it - the decode the append avoids, paid only
+		here - before it is given up below, or before `fit_response` cuts it. An
+		answer already over the limit is decoded for that cut anyway, so it is
+		not singled out. An answer that carries its own record comes back
+		unchanged and has nothing to mint, so it is not tried again.
+		*/
+		if ok && len(out) > limit && len(out) > len(wire) {
+			out, ok = dns.ensure_opt_compressed(wire, advertise, allocator, spent)
+		}
 		/*
 		A record that will not fit is a record not minted; see above.
 
