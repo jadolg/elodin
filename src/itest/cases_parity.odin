@@ -937,13 +937,13 @@ parity_race_drain_case :: proc(r: ^Runner) {
 	}
 	_, _, asked := parity_upstreams_reference(&ups, q)
 	check(r, asked, "a stub on record alone is not read as the upstream having been asked")
-	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained on the stub, before its retry over TCP")
 
-	// The winner's whole reply, with the loser's retry still to come.
+	// The winner's whole reply, with the loser's retry still to come: neither
+	// the winner's reply nor the loser's stub ends the race.
 	if !check(r, query_tcp(winner_port, q.wire, context.temp_allocator).ok, "the mock did not answer the winner's query over tcp") {
 		return
 	}
-	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained on the winner's whole reply, before the loser's retry over TCP")
+	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained on the winner's whole reply and the loser's stub, before its retry over TCP")
 
 	// The loser's retry over TCP, and the race is over.
 	tcp := query_tcp(mock_port, q.wire, context.temp_allocator)
@@ -956,4 +956,12 @@ parity_race_drain_case :: proc(r: ^Runner) {
 	// earlier ask is not this one's.
 	parity_upstreams_reset(&ups)
 	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained on a whole reply from before the reset")
+
+	// Whole replies since the reset, from every member, to another question.
+	other := parity_fixed_query(PARITY_286_NAME, 1, PARITY_286_CEILING)
+	if !check(r, query_tcp(mock_port, other.wire, context.temp_allocator).ok, "the mock did not answer the other question") ||
+	   !check(r, query_tcp(winner_port, other.wire, context.temp_allocator).ok, "the winner did not answer the other question") {
+		return
+	}
+	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained on whole replies to another question")
 }

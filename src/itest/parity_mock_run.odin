@@ -198,7 +198,15 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 	if asked && run.s.strategy == "race" && !parity_upstreams_drain(run.ups, q, time.tick_add(time.tick_now(), PARITY_UPSTREAM_TIMEOUT)) {
 		stats.failures += 1
 		run.undrained = true
-		fail(run.r, "%s: an upstream in the race had sent no whole reply %v after the answer; the scenario stops here", q.desc, PARITY_UPSTREAM_TIMEOUT)
+		fail(
+			run.r,
+			"query %d: %s: an upstream in the race had sent no whole reply %v after the answer; the scenario stops here\n    reproduce: --parity-seed %d --parity-runs %d",
+			index,
+			q.desc,
+			PARITY_UPSTREAM_TIMEOUT,
+			run.opts.seed,
+			index + 1,
+		)
 	}
 
 	/*
