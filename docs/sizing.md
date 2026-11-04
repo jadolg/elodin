@@ -130,8 +130,9 @@ them.
   not queries per second.
 
 A held TCP connection costs about 21 KB resident after a query - the stack its
-fiber touched and its scratch - and a DoT or DoH/2 one about 72 KB, most of it
-OpenSSL's session. A loop keeps the stacks of finished connections and queries warm for the
+fiber touched and its scratch - and a DoT or DoH/2 one about 55 KB, most of it
+OpenSSL's session. An idle TLS connection hands its record buffers back
+(`SSL_MODE_RELEASE_BUFFERS`) and takes them again for its next record. A loop keeps the stacks of finished connections and queries warm for the
 next ones and gives back all but eight once it has had nothing to do for a
 second. `--check` and startup warn when `max_connections` at 128 KB each is more
 than a quarter of the memory elodin may use:

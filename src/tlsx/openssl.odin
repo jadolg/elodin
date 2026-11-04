@@ -80,11 +80,14 @@ SSL_ERROR_SYSCALL :: 5
 SSL_ERROR_ZERO_RETURN :: 6
 
 SSL_CTRL_SESS_NUMBER :: 20
+SSL_CTRL_MODE :: 33
 SSL_CTRL_SET_SESS_CACHE_MODE :: 44
 SSL_CTRL_SET_TLSEXT_HOSTNAME :: 55
 SSL_CTRL_GET_CHAIN_CERTS :: 115
 SSL_CTRL_SET_MIN_PROTO_VERSION :: 123
 SSL_CTRL_SET_MAX_PROTO_VERSION :: 124
+
+SSL_MODE_RELEASE_BUFFERS :: 0x10
 
 // What `BIO_get_mem_data` is a macro for.
 BIO_CTRL_INFO :: 3
@@ -268,6 +271,17 @@ ssl_ctx_set_max_proto_version :: proc(ctx: ^SSL_CTX, version: c.long) -> bool {
 // OpenSSL answers with the previous mode, and setting one cannot fail.
 ssl_ctx_set_session_cache_mode :: proc(ctx: ^SSL_CTX, mode: c.long) {
 	SSL_CTX_ctrl(ctx, SSL_CTRL_SET_SESS_CACHE_MODE, mode, nil)
+}
+
+// ORs `mode` into the context's mode bits, which every `SSL_new` from it
+// inherits, and answers with the bits now set.
+ssl_ctx_set_mode :: proc(ctx: ^SSL_CTX, mode: c.long) -> c.long {
+	return SSL_CTX_ctrl(ctx, SSL_CTRL_MODE, mode, nil)
+}
+
+// The mode bits of one connection; `SSL_get_mode` is a macro for this.
+ssl_get_mode :: proc(ssl: ^SSL) -> c.long {
+	return SSL_ctrl(ssl, SSL_CTRL_MODE, 0, nil)
 }
 
 // How many sessions the context's internal cache holds right now.

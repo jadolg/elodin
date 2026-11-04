@@ -4,6 +4,7 @@ import "core:c"
 import "core:mem"
 import "core:net"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:sys/posix"
@@ -1649,5 +1650,49 @@ test_retired_ticket_keys_are_erased_and_never_redrawn :: proc(t: ^testing.T) {
 		redrawn := k.current.live || k.previous.live
 		sync.mutex_unlock(&k.mu)
 		testing.expectf(t, !redrawn, "%x: a retired context drew a ticket key again", version)
+	}
+}
+
+/*
+Both ends of a handshaken connection release their record buffers when idle,
+and a connection whose buffers were released still carries records both ways.
+
+The mode is read from each live `SSL`, not from the context, since a context
+bit that `SSL_new` did not copy would save nothing. Each round sends more than
+one 16 KB record, so the buffers are reallocated at full size after the idle
+gap the previous round left behind.
+*/
+@(test)
+test_idle_connections_release_their_record_buffers :: proc(t: ^testing.T) {
+	p, ok := make_pair(t)
+	if !ok {
+		return
+	}
+	defer destroy_pair(&p)
+
+	testing.expect(t, ssl_get_mode(p.server.ssl) & SSL_MODE_RELEASE_BUFFERS != 0, "the server connection keeps its buffers")
+	testing.expect(t, ssl_get_mode(p.client.ssl) & SSL_MODE_RELEASE_BUFFERS != 0, "the client connection keeps its buffers")
+
+	SIZE :: 20_000
+	out := make([]u8, SIZE)
+	defer delete(out)
+	back := make([]u8, SIZE)
+	defer delete(back)
+	for round in 0 ..< 3 {
+		for i in 0 ..< SIZE {
+			out[i] = u8(i + round)
+		}
+		from, to := p.client, p.server
+		if round % 2 == 1 {
+			from, to = p.server, p.client
+		}
+		n, werr := write(from, out)
+		if !testing.expectf(t, werr == .None && n == SIZE, "round %d: wrote %d: %v", round, n, werr) {
+			return
+		}
+		if rerr := read_full(to, back); !testing.expectf(t, rerr == .None, "round %d: read: %v", round, rerr) {
+			return
+		}
+		testing.expectf(t, slice.equal(out, back), "round %d: the bytes did not come back intact", round)
 	}
 }

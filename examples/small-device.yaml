@@ -55,7 +55,7 @@ server:
   # decode.
   max_pending: 32
 
-  # Every TCP, DoT or DoH connection is a fiber, about 21 KB held (72 KB with
+  # Every TCP, DoT or DoH connection is a fiber, about 21 KB held (55 KB with
   # TLS), so this figure is a claim about what the box can hold. 64 is generous
   # for a household - a client opens one and reuses it - and the per-prefix
   # share below derives half of it, which is fine here because the whole LAN is
