@@ -17,6 +17,13 @@ flags that describe this server rather than the data: AA and the reserved Z bit
 are cleared, RA is set, and RD and CD are the client's own (RFC 1035 section
 4.1.1, RFC 4035 section 3.2.2). The AD bit is covered under [DNSSEC](dnssec.md).
 
+A name whose compression pointer aims into the 12-byte header is not read as a
+name. Those bytes are ones elodin writes per client (the ID, AD, and ARCOUNT
+when an OPT record is added or removed), so the client would read a different
+name from the one elodin checked. A query carrying one is answered FORMERR. An
+answer carrying one is handled like any answer that does not decode: it is not
+cached, and [rebinding protection](rebinding.md) refuses it.
+
 Also handled: EDNS0 — elodin forwards a query of its own built from the
 question, with an OPT record at 1232 bytes and none of the client's options, and
 fits the answer to the client's payload size on the way back (see [What reaches

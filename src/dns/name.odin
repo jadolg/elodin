@@ -95,7 +95,16 @@ decode_name :: proc(msg: []u8, offset: int, allocator := context.allocator) -> (
 			}
 			// A pointer must always point backwards; that alone bounds the
 			// walk, but keep an explicit counter as a second line of defence.
-			if target >= pos {
+			//
+			// Nor into the header, where no name lives: one that does reads
+			// the ID, the flags or a count as label data, and those are bytes
+			// this server writes in place - the ID for each client, AD, and
+			// ARCOUNT when an OPT record is appended or cut - so the name a
+			// client reads would not be the one checked here (issue #605).
+			// RFC 1035 section 4.1.4 and RFC 9267 section 2 are silent on it;
+			// Knot refuses it (`knot_dname_wire_check`), BIND and Unbound do
+			// not. A standalone name has no header, and no pointer either.
+			if target >= pos || target < HEADER_SIZE {
 				return "", 0, .Bad_Pointer
 			}
 			jumps += 1

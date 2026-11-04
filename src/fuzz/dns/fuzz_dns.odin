@@ -180,20 +180,19 @@ edit_in_place :: proc(raw: []u8) {
 		}
 	}
 	// A minted OPT record is appended to the bytes where it can be (issue
-	// #598): every byte ahead of it but ARCOUNT is the input's, and the record
-	// is the one the readers find. Not "still decodes": a name whose pointer
-	// aims into the header reads ARCOUNT as label data, the same way it reads
-	// the ID every answer has rewritten in place.
+	// #598), so what decoded before still decodes, with its records and the
+	// one OPT record. Appended, every byte ahead of it but ARCOUNT is the
+	// input's; that ARCOUNT changes nothing a name reads is the decoder's
+	// refusal of a pointer into the header (issue #605).
 	if m, err := dns.decode_message(raw); err == .None && !dns.edns_present(m) {
 		if out, ok := dns.ensure_opt(raw, 1232); ok {
 			after, aerr := dns.decode_message(out)
+			if aerr != .None || !dns.edns_present(after) || len(after.answer) != len(m.answer) {
+				panic("a minted OPT record broke a message that decoded")
+			}
 			appended := len(out) == len(raw) + 11 && string(out[:10]) == string(raw[:10]) && string(out[12:len(raw)]) == string(raw[12:])
-			if appended {
-				if dns.peek_rcode(out) != dns.peek_rcode(raw) || !dns.set_edns_udp_size(dns.clone_message_bytes(out), 512) {
-					panic("an appended OPT record is not the one the readers find")
-				}
-			} else if aerr != .None || !dns.edns_present(after) || len(after.answer) != len(m.answer) {
-				panic("a rebuilt OPT record broke a message that decoded")
+			if appended && (dns.peek_rcode(out) != dns.peek_rcode(raw) || !dns.set_edns_udp_size(out, 512)) {
+				panic("an appended OPT record is not the one the readers find")
 			}
 		}
 	}
