@@ -178,10 +178,16 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 		return
 	}
 	reference, from, asked := parity_upstreams_reference(run.ups, q)
-	// The race's losers have to be in before the next ask resets the mocks;
-	// see `parity_upstreams_drain`.
-	if asked && run.s.strategy == "race" {
-		_ = parity_upstreams_drain(run.ups, q, time.tick_add(time.tick_now(), PARITY_UPSTREAM_TIMEOUT))
+	/*
+	The race's losers have to be in before the next ask resets the mocks; see
+	`parity_upstreams_drain`. One that is not, by the time no leg can still be
+	running, is a member the race did not ask or a mock that did not answer -
+	either way the next ask's reference is in doubt, and it fails here, under
+	its own name, rather than as a divergence on the next query.
+	*/
+	if asked && run.s.strategy == "race" && !parity_upstreams_drain(run.ups, q, time.tick_add(time.tick_now(), PARITY_UPSTREAM_TIMEOUT)) {
+		stats.failures += 1
+		fail(run.r, "%s: an upstream in the race had sent no whole reply %v after the answer", q.desc, PARITY_UPSTREAM_TIMEOUT)
 	}
 
 	/*

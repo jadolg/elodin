@@ -914,19 +914,12 @@ parity_race_drain_case :: proc(r: ^Runner) {
 	start_case(r, "parity: a race is not over until the loser's whole reply is in")
 	defer end_case(r)
 
-	mock_port := next_port(r)
-	mock := mock_make("parity", mock_port)
-	mock_parity_all(mock)
-	if !mock_start(mock) {
-		fail(r, "the parity mock did not start on port %d", mock_port)
+	ups, started := parity_upstreams_start(r, Parity_Scenario{kinds = {.UDP}})
+	defer parity_upstreams_stop(&ups)
+	if !started {
 		return
 	}
-	defer mock_stop(mock)
-	ups := Parity_Upstreams{}
-	append(&ups.mocks, mock)
-	append(&ups.doh, nil)
-	defer delete(ups.mocks)
-	defer delete(ups.doh)
+	mock, mock_port := ups.mocks[0], ups.ports[0]
 
 	q := parity_fixed_query(PARITY_286_NAME, 48, PARITY_286_CEILING)
 	parity_upstreams_reset(&ups)

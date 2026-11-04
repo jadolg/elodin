@@ -1,5 +1,6 @@
 package itest
 
+import "base:runtime"
 import "core:slice"
 import "core:strings"
 import "core:time"
@@ -100,14 +101,8 @@ parity_upstreams_reference :: proc(
 	asked: bool,
 ) {
 	from = -1
-	for m, i in ups.mocks {
-		reply: []u8
-		count: int
-		if m != nil {
-			reply, count = mock_last_reply(m)
-		} else {
-			reply, count = doh2_mock_last_reply(ups.doh[i])
-		}
+	for _, i in ups.mocks {
+		reply, count := parity_upstream_last_reply(ups, i)
 		if count == 0 || reply == nil || !parity_answers_question(reply, q) {
 			continue
 		}
@@ -144,13 +139,10 @@ passed since the answer, nothing is left to land.
 parity_upstreams_drain :: proc(ups: ^Parity_Upstreams, q: Parity_Query, deadline: time.Tick) -> (drained: bool) {
 	for i in 0 ..< len(ups.mocks) {
 		for {
-			reply: []u8
-			count: int
-			if ups.mocks[i] != nil {
-				reply, count = mock_last_reply(ups.mocks[i])
-			} else {
-				reply, count = doh2_mock_last_reply(ups.doh[i])
-			}
+			// Each poll copies and parses a reply; handed back every time
+			// rather than piling up to the deadline's worth.
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+			reply, count := parity_upstream_last_reply(ups, i)
 			// The count, because a reset clears it and not the reply: a whole
 			// answer to an earlier ask of `q` is still there to be read.
 			if count > 0 && len(reply) > 2 && reply[2] & 0x02 == 0 && parity_answers_question(reply, q) {
@@ -163,6 +155,14 @@ parity_upstreams_drain :: proc(ups: ^Parity_Upstreams, q: Parity_Query, deadline
 		}
 	}
 	return true
+}
+
+// Upstream `i`'s last reply and its count since the reset, mock or DoH alike.
+parity_upstream_last_reply :: proc(ups: ^Parity_Upstreams, i: int) -> (reply: []u8, count: int) {
+	if ups.mocks[i] != nil {
+		return mock_last_reply(ups.mocks[i])
+	}
+	return doh2_mock_last_reply(ups.doh[i])
 }
 
 // Whether `reply` is an answer to `q`'s question, name compared without case.
