@@ -1079,7 +1079,7 @@ apart with nothing to account for the gap.
 
 A counter of its own rather than a hit taken back off `hits`: a counter that
 goes down is read by Prometheus as a reset, and the window is real - `get`
-increments under the lock and releases it, and the caller's decode and walk
+increments under its shard's lock and releases it, and the caller's decode and walk
 happen before the correction would land, so a scrape falling between the two
 sees the higher figure and the next sees the lower. It would discard the
 accumulated rate for the series every time an answer was withheld. Both
@@ -1112,7 +1112,7 @@ ttl_ceiling :: proc(c: ^Cache) -> u32 {
 	if c == nil {
 		return dns.TTL_MAX
 	}
-	// Atomic, being read outside the lock that `reconfigure` writes it under.
+	// Atomic, being read outside the shard locks `reconfigure` writes it under.
 	return sync.atomic_load(&c.max_ttl)
 }
 
@@ -1430,8 +1430,8 @@ thing in both directions.
 	for the upstream's figure. `signed_left` is no bound at all for a message
 	that carries none.
 	*/
-	// Read once each, atomically: this runs outside the lock `reconfigure`
-	// writes them under.
+	// Read once each, atomically: this runs outside the shard locks
+	// `reconfigure` writes them under.
 	min_ttl := sync.atomic_load(&c.min_ttl)
 	max_ttl := sync.atomic_load(&c.max_ttl)
 	negative_ttl := sync.atomic_load(&c.negative_ttl)
