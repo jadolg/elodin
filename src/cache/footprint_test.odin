@@ -30,6 +30,8 @@ its header - rather than to a model of it that the code under test also uses.
 @(private)
 Resident :: struct {
 	held: int,
+	// The most `held` has been since it was last set back to `held`.
+	peak: int,
 }
 
 @(private)
@@ -69,13 +71,8 @@ resident_proc :: proc(
 	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
 		r.held += chunk(raw_data(res))
 	}
+	r.peak = max(r.peak, r.held)
 	return res, err
-}
-
-// What the cache holds whatever it stores: itself, shards and all.
-@(private)
-fixed :: proc(c: ^Cache) -> int {
-	return chunk(c)
 }
 
 // What every shard's table takes.
@@ -128,7 +125,7 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	testing.expectf(t, len_entries(c) < INSERTS, "all %d entries fit in the budget", INSERTS)
 
 	// The Cache itself, shards and all, is the only allocation the count leaves out.
-	held := r.held - fixed(c)
+	held := r.held - chunk(c)
 	used := bytes_used(c)
 	/*
 	The budget binds the count, exactly, and eviction stops near it rather than
@@ -185,7 +182,7 @@ test_reconfigure_shrinks_the_table :: proc(t: ^testing.T) {
 	testing.expectf(t, r.held <= 16 * 1024, "%d bytes held for 10 entries, %d before", r.held, full)
 	testing.expectf(
 		t,
-		abs(r.held - fixed(c) - bytes_used(c)) <= 256,
+		abs(r.held - chunk(c) - bytes_used(c)) <= 256,
 		"the cache counts %d bytes and holds %d",
 		bytes_used(c),
 		r.held,
@@ -348,4 +345,28 @@ test_reconfigure_shrinks_a_table_with_nothing_to_evict :: proc(t: ^testing.T) {
 	reconfigure(c, opts)
 	testing.expect_value(t, len_entries(c), 100)
 	testing.expectf(t, cap(s.entries) < full, "a reload left %d slots for %d entries", cap(s.entries), len(s.entries))
+}
+
+/*
+A reload that takes the cache down to fewer shards holds no more on the way
+than it does after. Moving every entry into the shards that remain before
+evicting would index all of them in one table first: twenty thousand entries'
+worth for a cache about to hold three hundred.
+*/
+@(test)
+test_a_reload_to_fewer_shards_does_not_grow_on_the_way :: proc(t: ^testing.T) {
+	r: Resident
+	opts := Options{max_entries = 1_000_000, max_ttl = 3600}
+	c := make_cache(opts, resident_allocator(&r))
+	defer destroy(c)
+	testing.expect_value(t, shards_in_use(c), MAX_SHARDS)
+	fill(c, 20_000)
+	before := r.held
+	r.peak = r.held
+
+	opts.max_entries = 300
+	reconfigure(c, opts)
+	testing.expect_value(t, shards_in_use(c), 1)
+	testing.expect_value(t, len_entries(c), 300)
+	testing.expectf(t, r.peak <= before + 64 * 1024, "a reload from %d bytes rose to %d on the way down", before, r.peak)
 }

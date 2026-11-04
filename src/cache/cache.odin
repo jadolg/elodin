@@ -2,7 +2,7 @@ package cache
 
 import "base:runtime"
 import "core:crypto"
-import "core:hash/xxhash"
+import "core:crypto/siphash"
 import "core:mem"
 import "core:strings"
 import "core:sync"
@@ -249,7 +249,7 @@ Cache :: struct {
 	*/
 	shard_bits:   uint,
 	// Keys `shard_for`'s hash.
-	seed:         u64,
+	seed:         [16]u8,
 	/*
 	The whole cache's limits, as configured; each shard holds its share. The
 	TTLs and flags below are written by `reconfigure` with every shard locked,
@@ -265,11 +265,9 @@ Cache :: struct {
 	prefetch:     bool,
 	prefetch_min: time.Duration,
 	allocator:    mem.Allocator,
-	/*
-	The counters only callers bump, atomically and outside any shard: `stale`,
-	`withheld`, `prefetches` and `prefetch_failures`. The rest are the shards'.
-	*/
-	stats:        Stats,
+	// The counters only callers bump, atomically and outside any shard; the
+	// rest of `Stats` is the shards'.
+	stale, withheld, prefetches, prefetch_failures: u64,
 	// Which cache this is, never reused within the process; see `identity`.
 	id:           u64,
 }
@@ -394,7 +392,7 @@ make_cache :: proc(opts: Options, allocator := context.allocator) -> ^Cache {
 	c := new(Cache, allocator)
 	c.allocator = allocator
 	c.id = sync.atomic_add(&caches_made, 1) + 1
-	crypto.rand_bytes(mem.ptr_to_bytes(&c.seed))
+	crypto.rand_bytes(c.seed[:])
 	for &s in c.shards {
 		/*
 		Not reserved at `max_entries`: a slot is 32 bytes, so a count raised
@@ -417,16 +415,16 @@ shards_in_use :: proc(c: ^Cache) -> int {
 }
 
 /*
-The shard `key` lives in. The hash is keyed with `Cache.seed`, which is random
-per cache, so which names share a shard is not something a client can work out
-and aim at.
+The shard `key` lives in. The hash is SipHash keyed with `Cache.seed`, which is
+random per cache, so which names share a shard is not something a client can
+work out and aim at; a seeded fast hash such as XXH3 makes no such promise.
 */
 @(private)
 shard_for :: proc(c: ^Cache, key: string, bits: uint) -> ^Shard {
 	if bits == 0 {
 		return &c.shards[0]
 	}
-	h := xxhash.XXH3_64_with_seed(transmute([]u8)key, c.seed)
+	h := siphash.sum_bytes_2_4(transmute([]u8)key, c.seed[:])
 	return &c.shards[h >> (64 - bits)]
 }
 
@@ -524,12 +522,13 @@ apply_options :: proc(c: ^Cache, opts: Options) {
 	c.max_entries = max(opts.max_entries, 1)
 	sync.atomic_store(&c.max_bytes, opts.max_bytes if opts.max_bytes > 0 else DEFAULT_MAX_BYTES)
 	n := shard_count(c.max_entries, c.max_bytes)
-	if n != shards_in_use(c) {
-		reshard(c, n)
-	}
+	// The shares first: `reshard` evicts against them as it moves entries.
 	for &s, i in c.shards {
 		s.max_entries = split(c.max_entries, n, i) if i < n else 0
 		s.max_bytes = split(c.max_bytes, n, i) if i < n else 0
+	}
+	if n != shards_in_use(c) {
+		reshard(c, n)
 	}
 	// The three lifetimes and the byte budget atomically: `put` reads them
 	// before it takes a lock, and `ttl_ceiling` without one.
@@ -548,8 +547,14 @@ A reload's work, under every lock, as the eviction and table shrink beside it
 already are: a pass over the entries and an insert each. Taken from the old
 shards' tails in turn, a step at a time, so each new shard's list keeps the
 order every old one had and interleaves them, which is as close to one LRU
-order as the shards ever kept. The limits are not applied here; the caller
-evicts against the new shares once they are set.
+order as the shards ever kept.
+
+Each shard evicts against its new share as entries arrive, oldest first, so it
+ends holding the most recently used of what it was sent, and no table grows
+past what the new limits hold: a reload from a million entries to three
+hundred never indexes the million in one shard on the way down. The old
+tables go first, emptied, for the same reason, and so that a table sized for
+the old limits is not charged against the new ones.
 */
 @(private)
 reshard :: proc(c: ^Cache, n: int) {
@@ -560,8 +565,10 @@ reshard :: proc(c: ^Cache, n: int) {
 		s := &c.shards[i]
 		cursors[i] = s.tail
 		serials = max(serials, s.serials)
-		// The entries stay where they are in memory; only the indexes go.
+		// The entries stay where they are in memory; only the indexes go,
+		// tables and all.
 		clear(&s.entries)
+		shrink_table(s)
 		s.head, s.tail = nil, nil
 		s.bytes = 0
 	}
@@ -582,6 +589,7 @@ reshard :: proc(c: ^Cache, n: int) {
 			to.entries[e.key] = e
 			push_front(to, e)
 			to.bytes += entry_bytes(e)
+			evict_over_limits(c, to)
 			moved = true
 		}
 	}
@@ -1087,7 +1095,7 @@ note_withheld :: proc(c: ^Cache) {
 	if c == nil {
 		return
 	}
-	sync.atomic_add(&c.stats.withheld, 1)
+	sync.atomic_add(&c.withheld, 1)
 }
 
 /*
@@ -1156,14 +1164,14 @@ note_prefetch :: proc(c: ^Cache) {
 	if c == nil {
 		return
 	}
-	sync.atomic_add(&c.stats.prefetches, 1)
+	sync.atomic_add(&c.prefetches, 1)
 }
 
 note_prefetch_failed :: proc(c: ^Cache) {
 	if c == nil {
 		return
 	}
-	sync.atomic_add(&c.stats.prefetch_failures, 1)
+	sync.atomic_add(&c.prefetch_failures, 1)
 }
 
 /*
@@ -1192,7 +1200,7 @@ note_stale_served :: proc(c: ^Cache) {
 	if c == nil {
 		return
 	}
-	sync.atomic_add(&c.stats.stale, 1)
+	sync.atomic_add(&c.stale, 1)
 }
 
 /*
@@ -1658,10 +1666,12 @@ len_entries :: proc(c: ^Cache) -> (n: int) {
 	if c == nil {
 		return 0
 	}
+	// Every lock at once: a reshard between two shards would move entries
+	// into one already counted, or out of one not yet counted.
+	lock_all(c)
+	defer unlock_all(c)
 	for &s in c.shards {
-		sync.mutex_lock(&s.mu)
 		n += len(s.entries)
-		sync.mutex_unlock(&s.mu)
 	}
 	return
 }
@@ -1671,10 +1681,11 @@ bytes_used :: proc(c: ^Cache) -> (n: int) {
 	if c == nil {
 		return 0
 	}
+	// Every lock at once, as in `len_entries`.
+	lock_all(c)
+	defer unlock_all(c)
 	for &s in c.shards {
-		sync.mutex_lock(&s.mu)
 		n += s.bytes + table_bytes(&s)
-		sync.mutex_unlock(&s.mu)
 	}
 	return
 }
@@ -1683,10 +1694,10 @@ stats :: proc(c: ^Cache) -> (out: Stats) {
 	if c == nil {
 		return {}
 	}
-	out.stale = sync.atomic_load(&c.stats.stale)
-	out.withheld = sync.atomic_load(&c.stats.withheld)
-	out.prefetches = sync.atomic_load(&c.stats.prefetches)
-	out.prefetch_failures = sync.atomic_load(&c.stats.prefetch_failures)
+	out.stale = sync.atomic_load(&c.stale)
+	out.withheld = sync.atomic_load(&c.withheld)
+	out.prefetches = sync.atomic_load(&c.prefetches)
+	out.prefetch_failures = sync.atomic_load(&c.prefetch_failures)
 	for &s in c.shards {
 		sync.mutex_lock(&s.mu)
 		out.hits += s.hits

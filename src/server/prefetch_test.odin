@@ -223,8 +223,8 @@ test_an_rd_zero_hit_does_not_prefetch :: proc(t: ^testing.T) {
 test_prefetch_counters_reach_the_endpoint :: proc(t: ^testing.T) {
 	answers := prefetch_answers()
 	defer cache.destroy(answers)
-	answers.stats.prefetches = 7
-	answers.stats.prefetch_failures = 3
+	answers.prefetches = 7
+	answers.prefetch_failures = 3
 	s, cfg := metrics_fixture(Stats{})
 	s.cfg = &cfg
 	s.answers = answers
