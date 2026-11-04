@@ -865,14 +865,21 @@ tls_resumes :: proc(port: int, version: int, alpn: []string, request: []u8) -> (
 }
 
 /*
-Ask for a receive buffer of `bytes`, which the kernel caps at `rmem_max`.
+Ask for a receive buffer of `bytes`, which the kernel caps at `rmem_max`, and
+say what it granted: the room datagrams are charged against on the queue, which
+Linux reports as twice what was asked for (socket(7)). 0 if it would not say.
 
 Through `setsockopt` rather than `net.set_option`: core:net's buffer-size
 option binds the value in a `case` listing several types, where it stays an
 `any`, and hands the kernel the `any`'s data pointer as the size.
 */
-@(private = "file")
-set_receive_buffer :: proc(socket: net.UDP_Socket, bytes: int) {
+set_receive_buffer :: proc(socket: net.UDP_Socket, bytes: int) -> (granted: int) {
 	want := i32(bytes)
 	posix.setsockopt(posix.FD(socket), i32(posix.SOL_SOCKET), .RCVBUF, &want, posix.socklen_t(size_of(want)))
+	got: i32
+	size := posix.socklen_t(size_of(got))
+	if posix.getsockopt(posix.FD(socket), i32(posix.SOL_SOCKET), .RCVBUF, &got, &size) != .OK {
+		return 0
+	}
+	return int(got)
 }

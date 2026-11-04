@@ -337,22 +337,24 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 	end_case(r)
 
 	/*
-	What is in flight is not a thread count. One loop, and `max_pending` left to
-	the machine, carries a burst of 500 misses at once, all on one thread.
+	The burst case after this one reads its answer off the mock, so the mock has
+	to hold a burst of 500 whatever pace it arrives at (#568). Sent back to back
+	from one socket, faster than any server would forward them, so a mock that
+	drains its socket more slowly than that drops datagrams and leaves the hold
+	short.
 
-	Read off the upstream rather than a clock: a mock of its own holds every
-	reply until all 500 questions are waiting on it, which only a server with all
-	of them in flight at once can bring about. One that ran fewer would leave the
-	hold unreached and the burst unanswered.
+	Only where the mock's socket has room for the whole burst, about 1 KiB a
+	datagram on the queue: below that a busy machine drops some whatever the mock
+	does. CI raises `net.core.rmem_max` so the case always runs there.
 	*/
-	/*
-	The case below reads its answer off the mock, so the mock has to hold a burst
-	of 500 whatever pace it arrives at (#568). Sent back to back from one socket,
-	faster than any server would forward them, so a mock that drains its socket
-	more slowly than that drops datagrams and leaves the hold short.
-	*/
-	start_case(r, "mock: holds a burst of 500 sent back to back")
-	{
+	if room := mock_udp_room(); room < 500 * 1024 {
+		skip_case(
+			r,
+			"mock: holds a burst of 500 sent back to back",
+			fmt.tprintf("the mock's socket gets %d bytes, under the 500 KiB the burst needs; raise net.core.rmem_max", room),
+		)
+	} else {
+		start_case(r, "mock: holds a burst of 500 sent back to back")
 		burst_mock := mock_make("running-burst", next_port(r))
 		mock_delay_all(burst_mock, 0, nil)
 		if check(r, mock_start(burst_mock), "cannot start the burst mock upstream") {
@@ -372,9 +374,18 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 				check(r, mock_held(burst_mock) >= 500, "the hold of 500 was not reached: %s", mock_hold_report(burst_mock))
 			}
 		}
+		end_case(r)
 	}
-	end_case(r)
 
+	/*
+	What is in flight is not a thread count. One loop, and `max_pending` left to
+	the machine, carries a burst of 500 misses at once, all on one thread.
+
+	Read off the upstream rather than a clock: a mock of its own holds every
+	reply until all 500 questions are waiting on it, which only a server with all
+	of them in flight at once can bring about. One that ran fewer would leave the
+	hold unreached and the burst unanswered.
+	*/
 	start_case(r, "one loop: carries a burst of 500 misses at once")
 	{
 		derived_mock := mock_make("running-derived", next_port(r))

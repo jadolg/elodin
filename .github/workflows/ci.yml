@@ -43,6 +43,9 @@ jobs:
           install: true
           cache: true
       - run: mise run test
+      # Room for the itest's burst of 500 at a mock upstream (#568); the
+      # runner's default caps a socket's receive buffer at 208 KiB.
+      - run: sudo sysctl -w net.core.rmem_max=4194304
       - run: mise run itest
 
   leakcheck:
@@ -70,6 +73,7 @@ jobs:
         with:
           install: true
           cache: true
+      - run: sudo sysctl -w net.core.rmem_max=4194304
       - run: mise run leakcheck
 
   fuzz-regression:
