@@ -2976,7 +2976,10 @@ test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
 		{"DATA behind an interim response", {{"103", false}, {"200", true}}, 0, true, 103},
 		{"a trailer field 8.2 refuses", {{"200", false}, {"connection", true}}, 0, true, 200},
 		// No `:status` is no response; the interim one's is not carried over.
-		{"a section without :status after an interim one", {{"103", false}, {"", false}, {"200", true}}, 3, true, 0},
+		{"a section without :status after an interim one", {{"103", false}, {"", true}}, 3, true, 0},
+		{"a later :status behind a section without one", {{"103", false}, {"", false}, {"200", true}}, 3, true, 0},
+		{"a response without :status", {{"", true}}, 3, true, 0},
+		{"a malformed :status", {{"0x1", true}}, 3, true, 0},
 		{"a 101, which HTTP/2 has no use for", {{"101", false}, {"200", true}}, 2, true, 101},
 	}
 	for tc in cases {

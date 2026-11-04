@@ -727,9 +727,10 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 				}
 			}
 			// A missing or malformed `:status` reads as 0, which is no interim
-			// response; nor is a 101, which HTTP/2 has no use for (8.6).
+			// response; nor is a 101, which HTTP/2 has no use for (8.6). Final,
+			// so no later block supplies the status, and malformed (8.3.2).
 			s.final = s.status < 100 || s.status > 199 || s.status == 101
-			malformed ||= !s.final && s.end_stream
+			malformed ||= s.status == 0 || !s.final && s.end_stream
 		}
 		if malformed {
 			s.reset = true
@@ -826,8 +827,7 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	if early {
 		s.reset = true
 		loop.cond_broadcast(&c.cond)
-	}
-	if found && !already_ended && !early {
+	} else if found && !already_ended {
 		s.received += len(payload)
 		// The second bound is on the window, not the body: see CLIENT_RECV_WINDOW.
 		if len(s.body) + len(data) > CLIENT_MAX_BODY || s.received > CLIENT_RECV_WINDOW / 2 {
