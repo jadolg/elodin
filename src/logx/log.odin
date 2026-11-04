@@ -50,9 +50,11 @@ reason); `warn_out_of_reach` in main names one the account cannot open.
 
 With an owner, the start is guarded. A process taken over under that account
 could leave a symlink on the path for the next root start to append to - or
-create - whatever file it names, or a FIFO to hang it, so both are refused, then
-and on every reopen. Without a drop there is no such account, and a root-owned
-symlink such as /var/run is followed as before.
+create - whatever file it names, a hard link to append to one of root's, or a
+FIFO to hang it - with no reader, or a reader that stops reading. So a symlink
+on the path is refused, and so is anything at the name but a regular file with
+one link, then and on every reopen. Without a drop there is no such account,
+and a root-owned symlink such as /var/run is followed as before.
 
 Returns the error if the file cannot be opened, in which case logging stays on
 stderr rather than being silently lost.
@@ -158,6 +160,27 @@ open_log :: proc(path: string, no_follow: bool) -> (f: ^os.File, created: bool, 
 		fd, errno = open_resolved(cpath, base, owner_only, no_follow)
 		if errno != .NONE {
 			return nil, false, os.Platform_Error(errno)
+		}
+		/*
+		A hard link is a symlink's twin: where fs.protected_hardlinks is off,
+		the account that may own the directory can link the name to a file of
+		root's for this start to append to (EMLINK). Anything but a regular
+		file is refused too (ENXIO): a FIFO whose reader stops reading would
+		block every line, under the log's lock, once its buffer fills.
+		*/
+		if no_follow {
+			st: linux.Stat
+			if errno = linux.fstat(fd, &st); errno == .NONE {
+				if !linux.S_ISREG(st.mode) {
+					errno = .ENXIO
+				} else if st.nlink > 1 {
+					errno = .EMLINK
+				}
+			}
+			if errno != .NONE {
+				linux.close(fd)
+				return nil, false, os.Platform_Error(errno)
+			}
 		}
 	}
 	if no_follow {

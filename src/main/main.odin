@@ -495,8 +495,8 @@ main :: proc() {
 			"elodin: cannot open the log file %q (%s)%s, logging to stderr instead",
 			cfg.log.file,
 			os.error_string(err),
-			// ELOOP is a symlink refused, ENXIO a FIFO with no reader.
-			LOG_GUARDED_HINT if log_guarded && (err == os.Platform_Error(linux.Errno.ELOOP) || err == os.Platform_Error(linux.Errno.ENXIO)) else "",
+			// ELOOP is a symlink refused, EMLINK a hard link, ENXIO not a regular file.
+			LOG_GUARDED_HINT if log_guarded && guarded_refusal(err) else "",
 		)
 	}
 	if opts.check_only && cfg.log.file != "" {
@@ -647,21 +647,36 @@ main :: proc() {
 	run(&cfg, opts, service)
 }
 
-// Started as root with `server.user`, a symlink on the log's path or a FIFO is
-// refused; see `logx.init`.
+// Started as root with `server.user`, a symlink on the log's path, a hard-linked
+// log or anything but a regular file is refused; see `logx.init`.
 @(private)
-LOG_GUARDED_HINT :: "; started as root with server.user set, a symlink anywhere on its path or a FIFO is refused, see docs/logging.md"
+LOG_GUARDED_HINT :: "; started as root with server.user set, a symlink anywhere on its path, a hard-linked file or anything but a regular file is refused, see docs/logging.md"
+
+@(private)
+guarded_refusal :: proc(err: os.Error) -> bool {
+	return(
+		err == os.Platform_Error(linux.Errno.ELOOP) ||
+		err == os.Platform_Error(linux.Errno.EMLINK) ||
+		err == os.Platform_Error(linux.Errno.ENXIO) \
+	)
+}
 
 /*
 For `--check`, which opens no log: whether a start could, as this account - the
 file there for appending, or its directory to create one in. A `guarded` start
-refuses a symlink on the path (`logx.symlink_refused`) and a FIFO nothing reads,
-and `hint` says so only for those.
+refuses a symlink on the path (`logx.symlink_refused`), a hard-linked file and
+anything but a regular file, and `hint` says so only for those.
 */
 @(private)
 log_file_openable :: proc(path: string, guarded: bool) -> (ok: bool, hint: string) {
 	if guarded && logx.symlink_refused(path) {
 		return false, LOG_GUARDED_HINT
+	}
+	if guarded {
+		st: posix.stat_t
+		if posix.stat(strings.clone_to_cstring(path, context.temp_allocator), &st) == .OK && (!posix.S_ISREG(st.st_mode) || st.st_nlink > 1) {
+			return false, LOG_GUARDED_HINT
+		}
 	}
 	if os.exists(path) {
 		if privdrop.can_reopen(path, true) {
@@ -964,11 +979,10 @@ The blocklist cache goes over first: it is elodin's own output and opened by
 name afterwards - the lists were downloaded above, as root, and a refresh some
 hours later reopens them - so without this the cache would silently stop being
 written the moment its owner changed. A log file this process created was given
-to the account when it was made (`logx.init`). Files that were there already are not taken over;
-`warn_out_of_reach` names those the new account cannot open. The cache only with
-blocking on, so a directory
-that is not elodin's - a shared one, named but unused - is not taken over for
-nothing. A reload that turns blocking on later finds it as it is; see
+to the account when it was made (`logx.init`). Files that were there already
+are not taken over; `warn_out_of_reach` names those the new account cannot
+open. The cache only with blocking on, so a directory that is not elodin's - a
+shared one, named but unused - is not taken over for nothing. A reload that turns blocking on later finds it as it is; see
 `docs/install.md`.
 
 A drop that was asked for and did not happen ends the process. Carrying on

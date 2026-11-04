@@ -264,6 +264,26 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 		if testing.expect(t, posix.mkfifo(strings.clone_to_cstring(fifo, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {
 			_, _, ferr := open_log(fifo, true)
 			testing.expect(t, ferr != nil, "a FIFO with no reader was opened")
+
+			// Nor with one: a reader that stops reading would block every line.
+			rd := posix.open(strings.clone_to_cstring(fifo, context.temp_allocator), {.NONBLOCK})
+			if testing.expect(t, rd >= 0, "cannot open the FIFO's read end") {
+				_, _, rerr := open_log(fifo, true)
+				testing.expect(t, rerr != nil, "a FIFO with a reader was opened with the guard on")
+				posix.close(rd)
+			}
+		}
+
+		// Nor a file with a second hard link, the symlink's twin; followed, it
+		// is appended to as before.
+		linked, _ := filepath.join({dir, "linked.log"}, context.temp_allocator)
+		twin, _ := filepath.join({dir, "twin"}, context.temp_allocator)
+		if testing.expect(t, os.write_entire_file(linked, []byte{}) == nil && posix.link(strings.clone_to_cstring(linked, context.temp_allocator), strings.clone_to_cstring(twin, context.temp_allocator)) == .OK, "cannot make the hard link") {
+			_, _, herr := open_log(linked, true)
+			testing.expectf(t, herr == os.Platform_Error(linux.Errno.EMLINK), "a hard-linked log was not refused with symlinks refused: %v", herr)
+			if hf, _, hferr := open_log(linked, false); testing.expectf(t, hferr == nil, "a hard-linked log was refused when links are followed: %v", hferr) {
+				os.close(hf)
+			}
 		}
 
 		lf, _, ferr := open_log(link, false)
