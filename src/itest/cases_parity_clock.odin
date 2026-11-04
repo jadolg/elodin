@@ -15,6 +15,7 @@ day a live run is started on a box whose clock has drifted.
 run_parity_clock_cases :: proc(r: ^Runner) {
 	parity_clock_judge_case(r)
 	parity_clock_refuses_live_run_case(r)
+	parity_clock_slips_mid_run_case(r)
 }
 
 // What chronyc tracking prints, cut to the lines the judgement reads, on a
@@ -63,6 +64,15 @@ parity_clock_judge_case :: proc(r: ^Runner) {
 			false,
 			"unchecked",
 		},
+		{
+			"chronyd leap status invalid",
+			chronyc_tracking("8640.000000000 seconds slow", "Invalid"),
+			true,
+			"",
+			false,
+			false,
+			"unchecked",
+		},
 		{"chronyc unparseable", chronyc_tracking("lots of seconds slow"), true, "", false, false, "unchecked"},
 		{"chronyc absent, timesyncd in sync", "", false, "yes\n", true, false, "synchronised to NTP (timedatectl)"},
 		{"chronyc absent, timesyncd not", "", false, "no\n", true, false, "NOT synchronised"},
@@ -76,25 +86,31 @@ parity_clock_judge_case :: proc(r: ^Runner) {
 }
 
 /*
-End to end: a live run on a host whose chronyc says the clock is 2h24m slow
-stops before it sends anything, and says the clock is why.
+Run a live parity run as a child, with a chronyc of the case's own first on the
+PATH, so the run reads the clock the case chose rather than this host's.
 
-A chronyc of the case's own goes first on the PATH, so the run reads the clock
-the case chose rather than this host's. The upstream is a port nothing listens
-on: a run that went past the check would fail too, but on queries rather than on
-the clock, which the output tells apart.
+The fake chronyc prints `first` the first time it is asked and `after` every
+time after. The upstream is a port nothing listens on: a run that went past a
+check fails too, but on queries rather than on the clock, which the output
+tells apart.
 */
 @(private = "file")
-parity_clock_refuses_live_run_case :: proc(r: ^Runner) {
-	start_case(r, "parity: a live run on a clock 2h24m slow is refused before the first query")
-	defer end_case(r)
-
-	bin_dir := filepath.join({r.work_dir, "parity-clock-bin"}, context.temp_allocator) or_else ""
+parity_clock_child :: proc(r: ^Runner, tag, first, after: string, args: []string) -> (output: string, exit_code: int, ok: bool) {
+	bin_dir := filepath.join({r.work_dir, tag}, context.temp_allocator) or_else ""
 	if !check(r, os.make_directory(bin_dir) == nil || os.exists(bin_dir), "cannot make %s", bin_dir) {
 		return
 	}
-	script := fmt.tprintf("#!/bin/sh\ncat <<'EOF'\n%sEOF\n", chronyc_tracking("8640.000000000 seconds slow"))
 	chronyc := filepath.join({bin_dir, "chronyc"}, context.temp_allocator) or_else ""
+	count := fmt.tprintf("%s.count", chronyc)
+	script := fmt.tprintf(
+		"#!/bin/sh\n" +
+		"if [ -e '%s' ]; then cat <<'EOF'\n%sEOF\n" +
+		"else : > '%s'; cat <<'EOF'\n%sEOF\nfi\n",
+		count,
+		after,
+		count,
+		first,
+	)
 	werr := os.write_entire_file(chronyc, script, os.Permissions_Read_All + os.Permissions_Execute_All + {.Write_User})
 	if !check(r, werr == nil, "cannot write %s: %v", chronyc, werr) {
 		return
@@ -106,6 +122,8 @@ parity_clock_refuses_live_run_case :: proc(r: ^Runner) {
 	if !check(r, xerr == nil, "cannot run %s (is %s mounted noexec?): %v", chronyc, r.work_dir, xerr) {
 		return
 	}
+	// That run was the script's first; the child's is to be.
+	_ = os.remove(count)
 
 	inherited, eerr := os.environ(context.temp_allocator)
 	if !check(r, eerr == nil, "cannot read the environment: %v", eerr) {
@@ -120,22 +138,68 @@ parity_clock_refuses_live_run_case :: proc(r: ^Runner) {
 	path := os.get_env("PATH", context.temp_allocator)
 	append(&env, fmt.tprintf("PATH=%s:%s", bin_dir, path))
 
+	command := make([dynamic]string, context.temp_allocator)
 	upstream := fmt.tprintf("127.0.0.1:%d", next_port(r))
+	append(&command, os.args[0], "--binary", r.binary, "--parity", "--parity-runs", "1", "--parity-upstream", upstream)
+	append(&command, ..args)
 	state, stdout, stderr, err := os.process_exec(
-		os.Process_Desc {
-			command = []string{os.args[0], "--binary", r.binary, "--parity", "--parity-runs", "1", "--parity-upstream", upstream},
-			env = env[:],
-		},
+		os.Process_Desc{command = command[:], env = env[:]},
 		context.temp_allocator,
 	)
 	if !check(r, err == nil, "cannot run %s: %v", os.args[0], err) {
 		return
 	}
-	output := fmt.tprintf("%s%s", stdout, stderr)
-	check(r, state.exit_code != 0, "the run exited 0:\n%s", output)
+	return fmt.tprintf("%s%s", stdout, stderr), state.exit_code, true
+}
+
+// End to end: a live run on a clock 2h24m slow stops before it sends anything,
+// and says the clock is why.
+@(private = "file")
+parity_clock_refuses_live_run_case :: proc(r: ^Runner) {
+	start_case(r, "parity: a live run on a clock 2h24m slow is refused before the first query")
+	defer end_case(r)
+
+	slow := chronyc_tracking("8640.000000000 seconds slow")
+	output, exit_code, ok := parity_clock_child(r, "parity-clock-slow", slow, slow, nil)
+	if !ok {
+		return
+	}
+	check(r, exit_code != 0, "the run exited 0:\n%s", output)
 	// The premise: the run read the case's chronyc, not this host's.
 	check(r, strings.contains(output, "8640.0s slow"), "the run did not read the clock the case set:\n%s", output)
 	check(r, strings.contains(output, "the host clock"), "the refusal does not name the clock:\n%s", output)
 	// Refused before it claimed a port slot, let alone sent a query.
 	check(r, !strings.contains(output, "ports:"), "the run started on a refused clock:\n%s", output)
+}
+
+/*
+End to end: a clock that slips during a run is caught after the scenario it
+slipped in, which is named, so its divergences are read as the clock's.
+
+The clock is right when the run starts and 2h24m slow every time it is read
+after that.
+*/
+@(private = "file")
+parity_clock_slips_mid_run_case :: proc(r: ^Runner) {
+	start_case(r, "parity: a clock that slips during a live run stops it after that scenario")
+	defer end_case(r)
+
+	output, _, ok := parity_clock_child(
+		r,
+		"parity-clock-slips",
+		chronyc_tracking("0.001000000 seconds slow"),
+		chronyc_tracking("8640.000000000 seconds slow"),
+		[]string{"--parity-scenario", "live"},
+	)
+	if !ok {
+		return
+	}
+	// The premise: the run started on the clock the case set as right.
+	check(r, strings.contains(output, "clock:     0.001s slow"), "the run did not start on the clock the case set:\n%s", output)
+	check(
+		r,
+		strings.contains(output, "the host clock moved during live:") && strings.contains(output, "8640.0s slow"),
+		"the slip was not reported against the scenario it happened in:\n%s",
+		output,
+	)
 }

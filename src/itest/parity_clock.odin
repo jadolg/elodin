@@ -41,7 +41,9 @@ fails to answer is passed on as `ok = false`, which the judgement reads as
 saying nothing.
 */
 parity_clock_check :: proc() -> Parity_Clock {
-	chronyc, chronyc_ok := parity_clock_run({"chronyc", "tracking"})
+	// -n: the reference's name is a reverse lookup, which on a wrong clock can
+	// stall on a resolver failing validation.
+	chronyc, chronyc_ok := parity_clock_run({"chronyc", "-n", "tracking"})
 	timedatectl, timedatectl_ok := parity_clock_run({"timedatectl", "show", "-p", "NTPSynchronized", "--value"})
 	return parity_clock_judge(chronyc, chronyc_ok, timedatectl, timedatectl_ok)
 }
@@ -72,17 +74,18 @@ parity_clock_judge :: proc(
 	if chronyc_ok {
 		offset, measured := parity_clock_chronyc_offset(chronyc)
 		if measured {
-			if abs(offset) > PARITY_CLOCK_LIMIT_SECONDS {
+			size, side := abs(offset), offset > 0 ? "slow" : "fast"
+			if size > PARITY_CLOCK_LIMIT_SECONDS {
 				return {
 					refuse = true,
 					note = fmt.tprintf(
 						"the clock is %.1fs %s of NTP time (chronyc tracking); signatures would be judged against the wrong time, so a live run would measure the clock rather than elodin. Fix the clock (e.g. `sudo chronyc makestep`) and run again",
-						abs(offset),
-						offset > 0 ? "slow" : "fast",
+						size,
+						side,
 					),
 				}
 			}
-			return {note = fmt.tprintf("%.3fs %s of NTP time (chronyc)", abs(offset), offset > 0 ? "slow" : "fast")}
+			return {note = fmt.tprintf("%.3fs %s of NTP time (chronyc)", size, side)}
 		}
 	}
 	if timedatectl_ok {
@@ -114,7 +117,8 @@ parity_clock_chronyc_offset :: proc(output: string) -> (offset: f64, ok: bool) {
 		value = strings.trim_space(value)
 		switch key {
 		case "Leap status":
-			synced = value != "Not synchronised"
+			// chronyc prints "Invalid" for a status it does not know.
+			synced = value == "Normal" || value == "Insert second" || value == "Delete second"
 		case "System time":
 			fields := strings.fields(value, context.temp_allocator)
 			if len(fields) < 3 || fields[1] != "seconds" {

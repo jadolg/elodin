@@ -299,8 +299,11 @@ than 60 seconds off NTP time, the run exits 1 with `itest: the host clock: ...`
 before it claims a port or sends anything. Fix the clock (`sudo chronyc
 makestep`) and run again. Otherwise it prints a `clock:` line: the measured
 offset, `timedatectl`'s `NTPSynchronized` when chronyc cannot measure, or
-`unchecked` when neither tool answers. The run goes ahead in those cases. The synthetic mode skips the check,
-since its answers carry no signatures.
+`unchecked` when neither tool answers. The run goes ahead in those cases. The
+clock is read again after each scenario: one that has moved past the limit fails
+`parity: the host clock` naming that scenario, whose divergences are then the
+clock's, and the run stops. The synthetic mode skips the check, since its
+answers carry no signatures.
 
 ```
 mise run parity                                   # 2000 queries per scenario, synthetic upstream

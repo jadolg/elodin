@@ -148,8 +148,20 @@ run_parity_live :: proc(r: ^Runner, opts: Parity_Options) {
 		end_case(r)
 		return
 	}
+	/*
+	main read the clock before the run; it is read again after each scenario,
+	since a run of every scenario takes minutes and a clock can slip in that
+	time. A slip fails a case naming the scenario it happened in, whose
+	divergences are then the clock's, and stops the scenarios still to come.
+	*/
 	for s in scenarios {
 		run_parity_live_scenario(r, opts, s)
+		if clock := parity_clock_check(); clock.refuse {
+			start_case(r, "parity: the host clock")
+			fail(r, "the host clock moved during %s: %s", s.name, clock.note)
+			end_case(r)
+			return
+		}
 	}
 }
 
