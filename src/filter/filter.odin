@@ -493,6 +493,9 @@ engine_stats :: proc(e: ^Engine) -> Stats {
 @(private)
 rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool, not_ascii: bool) {
 	key, ok = normalise(domain, buf)
+	if !ok {
+		return
+	}
 	for c in transmute([]u8)key {
 		if c == '/' || c <= 0x20 || c == 0x7f {
 			return "", false, false
@@ -504,13 +507,14 @@ rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool, not_ascii
 		// from the wire as written: that refuses what `encode_name` refuses, a
 		// last dot (the root again, `normalise` having had one), and an escape
 		// a query never spells (`\.`, `\097`, `\065`).
-		wire: [dns.MAX_NAME_WIRE]u8
+		// Written before read, so not zeroed: this runs once per list line.
+		wire: [dns.MAX_NAME_WIRE]u8 = ---
 		n, err := dns.encode_name(key, wire[:])
-		back: [dns.MAX_NAME_PRESENTATION + 1]u8
+		back: [dns.MAX_NAME_PRESENTATION + 1]u8 = ---
 		arena: mem.Arena
 		mem.arena_init(&arena, back[:])
 		spelt, _, derr := dns.decode_name(wire[:n], 0, mem.arena_allocator(&arena))
-		if err != .None || derr != .None || spelt[:len(spelt) - 1] != key {
+		if err != .None || derr != .None || dns.name_trim_root(spelt) != key {
 			return "", false, false
 		}
 		return
