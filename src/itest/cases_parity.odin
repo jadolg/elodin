@@ -930,7 +930,7 @@ parity_race_drain_case :: proc(r: ^Runner) {
 	res := query_udp(mock_port, q.wire, context.temp_allocator)
 	stub, count := mock_last_reply(mock)
 	if !check(r, res.ok, "the mock did not answer the loser's datagram") ||
-	   !check(r, count == 1 && len(stub) > 2 && stub[2] & 0x02 != 0, "the loser's reply is not one truncated reply (count %d)", count) {
+	   !check(r, count == 1 && len(stub) > 2 && !parity_whole(stub), "the loser's reply is not one truncated reply (count %d)", count) {
 		return
 	}
 	_, _, asked := parity_upstreams_reference(&ups, q)

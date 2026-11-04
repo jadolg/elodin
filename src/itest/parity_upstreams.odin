@@ -88,10 +88,10 @@ A reply is only taken for this query if it answers this query's question: a
 reply to an earlier query that lands after the reset would otherwise be the
 reference for a question it never answered. Under the race strategy
 `parity_upstreams_drain` keeps a loser from landing after the reset at all; the
-check is for the asks nothing drains. Where several upstreams answered - the race again -
-any whole reply will do, because the zone is the same zone; one cut short for a
-datagram is only taken if there is nothing better, which there always is once
-the retry over TCP has come back.
+check is for the asks nothing drains. Where several upstreams answered - the
+race again - any whole reply will do, because the zone is the same zone; one cut
+short for a datagram is only taken if there is nothing better, which there
+always is once the retry over TCP has come back.
 */
 parity_upstreams_reference :: proc(
 	ups: ^Parity_Upstreams,
@@ -221,14 +221,14 @@ parity_cache_key :: proc(q: Parity_Query, allocator := context.temp_allocator) -
 	return string(key)
 }
 
-parity_cache_store :: proc(store: ^map[string]Parity_Cached, q: Parity_Query, reply: []u8) {
+parity_cache_store :: proc(store: ^map[string]Parity_Cached, q: Parity_Query, reply: []u8, at: time.Time) {
 	key := parity_cache_key(q)
 	if old, found := store[key]; found {
 		delete(old.reply)
-		store[key] = Parity_Cached{reply = slice.clone(reply), at = time.now()}
+		store[key] = Parity_Cached{reply = slice.clone(reply), at = at}
 		return
 	}
-	store[strings.clone(key)] = Parity_Cached{reply = slice.clone(reply), at = time.now()}
+	store[strings.clone(key)] = Parity_Cached{reply = slice.clone(reply), at = at}
 }
 
 parity_cache_destroy :: proc(store: ^map[string]Parity_Cached) {

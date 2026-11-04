@@ -185,6 +185,9 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 		return
 	}
 	reference, from, asked := parity_upstreams_reference(run.ups, q)
+	// Before the drain: the server's entry dates from its answer, and an entry
+	// stamped up to the drain's guard later would read younger than it is.
+	answered_at := time.now()
 	/*
 	The race's losers have to be in before the next ask resets the mocks; see
 	`parity_upstreams_drain`. One that is not, by the time no leg can still be
@@ -217,7 +220,7 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 		parity_check_route(run, q, from)
 		run.served[from] += 1
 		if run.s.cache {
-			parity_cache_store(&run.cached, q, reference)
+			parity_cache_store(&run.cached, q, reference, answered_at)
 		}
 	} else {
 		entry, found := run.cached[parity_cache_key(q)]
