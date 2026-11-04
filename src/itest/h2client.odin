@@ -191,6 +191,10 @@ h2_send_request :: proc(
 	// Sent after the fields above, so a check can put a field of its own on a
 	// request that is otherwise ordinary.
 	extra: []H2_Field = nil,
+	// A trailer section after the body (RFC 9113 8.1), which then carries the
+	// END_STREAM - or nothing does, with `trailers_end_stream` unset.
+	trailers: []H2_Field = nil,
+	trailers_end_stream := true,
 ) -> bool {
 	block := make([dynamic]u8, 0, 128, context.temp_allocator)
 	if table_update >= 0 {
@@ -208,7 +212,7 @@ h2_send_request :: proc(
 		h2_literal(&block, f.name, f.value, huffman)
 	}
 
-	end_stream: u8 = h2.FLAG_END_STREAM if len(body) == 0 else 0
+	end_stream: u8 = h2.FLAG_END_STREAM if len(body) == 0 && trailers == nil else 0
 	out := make([dynamic]u8, 0, len(block) + 32, context.temp_allocator)
 
 	if split_headers && len(block) > 4 {
@@ -223,8 +227,16 @@ h2_send_request :: proc(
 	}
 
 	if len(body) > 0 {
-		h2.write_frame_header(&out, len(body), .Data, h2.FLAG_END_STREAM, stream_id)
+		h2.write_frame_header(&out, len(body), .Data, h2.FLAG_END_STREAM if trailers == nil else 0, stream_id)
 		append(&out, ..body)
+	}
+	if trailers != nil {
+		tail := make([dynamic]u8, 0, 64, context.temp_allocator)
+		for f in trailers {
+			h2_literal(&tail, f.name, f.value, huffman)
+		}
+		h2.write_frame_header(&out, len(tail), .Headers, h2.FLAG_END_HEADERS | (h2.FLAG_END_STREAM if trailers_end_stream else 0), stream_id)
+		append(&out, ..tail[:])
 	}
 	return conn_write(&c.conn, out[:])
 }

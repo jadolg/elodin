@@ -192,6 +192,51 @@ run_h2_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	/*
+	RFC 9113 8.1: a request may end with a trailer section after its body. One
+	that does is served, and the connection carries on; trailers that leave the
+	stream open or carry a pseudo-header field make the request malformed, a
+	stream error of type PROTOCOL_ERROR (8.1.1), and the connection still
+	carries on (#457). Stream 3 on the same connection is what shows it did.
+	*/
+	{
+		Trailer_Row :: struct {
+			what:       string,
+			trailers:   []H2_Field,
+			end_stream: bool,
+			served:     bool,
+		}
+		rows := []Trailer_Row {
+			{"h2: a request that ends with trailers is served", {{"x-t", "1"}}, true, true},
+			{"h2: trailers without END_STREAM reset the request", {{"x-t", "1"}}, false, false},
+			{"h2: a pseudo-header in trailers resets the request", {{":path", "/"}}, true, false},
+		}
+		for row in rows {
+			start_case(r, row.what)
+			c, cok := h2_connect(doh_port)
+			if check(r, cok, "cannot open an h2 connection") {
+				check(r, h2_send_request(c, 1, "POST", "/dns-query", query, trailers = row.trailers, trailers_end_stream = row.end_stream), "cannot send")
+				if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
+					res, _ := h2_stream(c, 1)
+					if row.served {
+						check_eq_int(r, res.status, 200, "status")
+						check(r, !res.reset, "stream 1 was reset")
+					} else {
+						check(r, res.reset && res.reset_code == .Protocol_Error, "stream 1: reset %v, code %v; want PROTOCOL_ERROR", res.reset, res.reset_code)
+					}
+				}
+				check(r, h2_send_request(c, 3, "POST", "/dns-query", query), "cannot send stream 3")
+				if check(r, h2_collect(c, []u32{3}), "stream 3 never completed after the trailers") {
+					res, _ := h2_stream(c, 3)
+					check_eq_int(r, res.status, 200, "stream 3 status")
+				}
+				check(r, !c.goaway, "GOAWAY %v for the trailers", c.goaway_code)
+				h2_close(c)
+			}
+			end_case(r)
+		}
+	}
+
+	/*
 	RFC 9113 6.5.2 makes an ENABLE_PUSH other than 0 or 1 a PROTOCOL_ERROR, and
 	5.1 makes a WINDOW_UPDATE or RST_STREAM on an idle stream one too. Stream 1
 	is served before the frame, so a refusal is the frame's and not a connection

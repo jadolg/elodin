@@ -106,6 +106,9 @@ Client_Stream :: struct {
 	refunded:    bool,
 	// This end reset the stream for sending too much; see Client_Error.Too_Large.
 	oversized:   bool,
+	// A final (non-1xx) header section has been taken, so the next block is
+	// the trailers; see client_finish_headers.
+	final:       bool,
 }
 
 Client_Request :: struct {
@@ -394,7 +397,10 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 			client_goaway(c, .Protocol_Error)
 			return false
 		}
-		if s, found := c.streams[h.stream_id]; found {
+		// A stream already reset, by either end, keeps the reason it was: a
+		// REFUSED_STREAM behind this end's own reset is no word that the request
+		// went unprocessed and may be retried.
+		if s, found := c.streams[h.stream_id]; found && !s.reset {
 			s.reset = true
 			s.refused = Error_Code(read_u32(payload)) == .Refused_Stream
 			loop.cond_broadcast(&c.cond)
@@ -588,7 +594,8 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 
 @(private)
 client_handle_continuation :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
-	if c.continuation_on != h.stream_id {
+	// As on the server: no block open is no stream to continue, 0 included.
+	if c.continuation_on == 0 || c.continuation_on != h.stream_id {
 		client_goaway(c, .Protocol_Error)
 		return false
 	}
@@ -681,32 +688,78 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 	if already_ended {
 		s.rst_sent = true
 	}
+	/*
+	RFC 9113 8.1: after any number of interim (1xx) responses comes one final
+	one, and a block after that is the trailers, which end the stream and carry
+	no pseudo-header field; an interim response does not end it. Anything else
+	is malformed, which 8.1.1 makes a stream error of type PROTOCOL_ERROR, and a
+	client MUST NOT accept it - so it fails like a stream this end reset, rather
+	than a trailer's `:status` being read as the answer's.
+	*/
+	malformed := false
 	if found && !already_ended {
-		for f in headers {
-			if f.name == ":status" {
-				s.status = parse_status(f.value)
+		if s.final {
+			// What the server refuses in a request's trailers.
+			malformed = trailers_are_malformed(headers, s.end_stream)
+		} else {
+			/*
+			Each section carries its own `:status`: one missing after an
+			interim response is not that response's again. And one `:status`,
+			ahead of the ordinary fields and with no other pseudo-header (8.3):
+			a second one would be read as the answer's over the first. The
+			ordinary fields are held to 8.2 as the trailers are.
+			*/
+			s.status = 0
+			seen_status, seen_regular := false, false
+			for f in headers {
+				if len(f.name) > 0 && f.name[0] == ':' {
+					if f.name != ":status" || seen_status || seen_regular {
+						malformed = true
+						continue
+					}
+					seen_status = true
+					s.status = parse_status(f.value)
+				} else {
+					seen_regular = true
+					if field_is_malformed(f) {
+						malformed = true
+					}
+				}
 			}
+			// A missing or malformed `:status` reads as 0, which is no interim
+			// response; nor is a 101, which HTTP/2 has no use for (8.6). Final,
+			// so no later block supplies the status, and malformed (8.3.2).
+			s.final = s.status < 100 || s.status > 199 || s.status == 101
+			malformed ||= s.status == 0 || !s.final && s.end_stream
 		}
-		/*
-		An upstream may PING about as often as it answers - keepalive, or
-		probing bandwidth - and one busy pooled connection answers far more
-		than MAX_CONTROL_FRAMES_PER_SECOND queries, so a flat budget would drop
-		every query in flight on it. Each response to a request of ours earns
-		one frame back instead: an upstream is held to our own query rate plus
-		the budget, never to a rate it can raise by itself. Once per stream,
-		and a stream id is only ever ours to open.
-		*/
-		if !s.refunded {
-			s.refunded = true
-			control_budget_refund(&c.control)
-		}
-		if s.end_stream {
-			s.done = true
+		if malformed {
+			s.reset = true
 			loop.cond_broadcast(&c.cond)
+		} else {
+			/*
+			An upstream may PING about as often as it answers - keepalive, or
+			probing bandwidth - and one busy pooled connection answers far more
+			than MAX_CONTROL_FRAMES_PER_SECOND queries, so a flat budget would drop
+			every query in flight on it. Each response to a request of ours earns
+			one frame back instead: an upstream is held to our own query rate plus
+			the budget, never to a rate it can raise by itself. Once per stream,
+			and a stream id is only ever ours to open.
+			*/
+			if !s.refunded {
+				s.refunded = true
+				control_budget_refund(&c.control)
+			}
+			if s.end_stream {
+				s.done = true
+				loop.cond_broadcast(&c.cond)
+			}
 		}
 	}
 	loop.unlock(&c.mu)
 
+	if malformed {
+		return client_rst_stream(c, stream_id, .Protocol_Error)
+	}
 	if need_rst {
 		return client_rst_stream(c, stream_id, .Stream_Closed)
 	}
@@ -767,7 +820,14 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 		s.rst_sent = true
 	}
 	oversized := false
-	if found && !already_ended {
+	// RFC 9113 8.1: DATA follows the final header section, so DATA ahead of it -
+	// before any response, or behind an interim (1xx) one - is malformed, a
+	// stream error of type PROTOCOL_ERROR the client MUST NOT accept.
+	early := found && !already_ended && !s.final
+	if early {
+		s.reset = true
+		loop.cond_broadcast(&c.cond)
+	} else if found && !already_ended {
 		s.received += len(payload)
 		// The second bound is on the window, not the body: see CLIENT_RECV_WINDOW.
 		if len(s.body) + len(data) > CLIENT_MAX_BODY || s.received > CLIENT_RECV_WINDOW / 2 {
@@ -788,6 +848,9 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	}
 	loop.unlock(&c.mu)
 
+	if early {
+		return client_rst_stream(c, h.stream_id, .Protocol_Error) && client_give_connection_credit(c, len(payload))
+	}
 	if oversized {
 		/*
 		The stream is over as far as we are concerned; no point reading more of

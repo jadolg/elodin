@@ -1171,6 +1171,8 @@ Client_Frame_Log :: struct {
 	credit:      int,
 	// Error code of the last GOAWAY written.
 	goaway_code: Error_Code,
+	// Error code of the last RST_STREAM written.
+	rst_code:    Error_Code,
 }
 
 @(private = "file")
@@ -1195,6 +1197,9 @@ client_log_write :: proc(user: rawptr, buf: []u8) -> bool {
 		}
 		if h.type == .Goaway && pos + FRAME_HEADER_SIZE + 8 <= len(buf) {
 			log.goaway_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE + 4:]))
+		}
+		if h.type == .Rst_Stream && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
+			log.rst_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
 		}
 		pos += FRAME_HEADER_SIZE + h.length
 	}
@@ -2389,6 +2394,8 @@ test_client_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 
 	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
 	s := open_test_stream(c, 1, allocator)
+	// Its response headers are in, so DATA is its body.
+	s.final = true
 
 	// One byte of body in 257 bytes of window, each.
 	frame := make([]u8, 257, context.temp_allocator)
@@ -2934,4 +2941,168 @@ test_client_idle_stream_and_enable_push_protocol_errors :: proc(t: ^testing.T) {
 		client_unref(c)
 		free_all(context.temp_allocator)
 	}
+}
+
+/*
+RFC 9113 8.1: a response is any number of interim (1xx) header sections, one
+final one, the body, and optionally trailers, which end the stream and carry no
+pseudo-header field. A response that breaks that is malformed, a stream error
+of type PROTOCOL_ERROR (8.1.1) that a client MUST NOT accept: the request fails
+as reset, so neither a trailer's `:status` nor DATA ahead of the final
+section is taken for the answer's (#457).
+*/
+@(test)
+test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
+	Block :: struct {
+		status:     string,
+		end_stream: bool,
+	}
+	Case :: struct {
+		what:      string,
+		blocks:    []Block,
+		// The block DATA goes after.
+		data_at:   int,
+		malformed: bool,
+		status:    int,
+	}
+	// A block with no status is a trailer section, of `x-t`, or of the field
+	// named in place of one.
+	cases := []Case {
+		{"trailers end the response", {{"200", false}, {"", true}}, 0, false, 200},
+		{"interim responses come first", {{"103", false}, {"200", false}, {"", true}}, 1, false, 200},
+		{"a trailer with :status", {{"200", false}, {"500", true}}, 0, true, 200},
+		{"trailers without END_STREAM", {{"200", false}, {"", false}}, 0, true, 200},
+		{"an interim response with END_STREAM", {{"100", true}}, 0, true, 100},
+		{"DATA behind an interim response", {{"103", false}, {"200", true}}, 0, true, 103},
+		{"a trailer field 8.2 refuses", {{"200", false}, {"connection", true}}, 0, true, 200},
+		// No `:status` is no response; the interim one's is not carried over.
+		{"a section without :status after an interim one", {{"103", false}, {"", true}}, 3, true, 0},
+		{"a later :status behind a section without one", {{"103", false}, {"", false}, {"200", true}}, 3, true, 0},
+		{"a response without :status", {{"", true}}, 3, true, 0},
+		{"a malformed :status", {{"0x1", true}}, 3, true, 0},
+		{"a 101, which HTTP/2 has no use for", {{"101", false}, {"200", true}}, 2, true, 101},
+	}
+	for tc in cases {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		allocator := mem.tracking_allocator(&track)
+
+		log := Client_Frame_Log {
+			frames = make([dynamic]Frame_Header, 0, 8, allocator),
+		}
+		c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+		s := open_test_stream(c, 1, allocator)
+
+		ok := true
+		for b, i in tc.blocks {
+			block := make([dynamic]u8, 0, 64, context.temp_allocator)
+			switch {
+			case b.status == "":
+				encode_header(&block, "x-t", "1")
+			case b.status[0] >= '0' && b.status[0] <= '9':
+				encode_header(&block, ":status", b.status)
+			case:
+				encode_header(&block, b.status, "1")
+			}
+			flags := u8(FLAG_END_HEADERS) | (u8(FLAG_END_STREAM) if b.end_stream else 0)
+			ok = ok && client_handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = flags, stream_id = 1}, block[:])
+			if i == tc.data_at && !b.end_stream && !s.reset {
+				body := []u8{'x'}
+				ok = ok && client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
+			}
+		}
+		testing.expectf(t, ok, "%s: the connection was dropped", tc.what)
+		testing.expectf(t, s.status == tc.status, "%s: status %d, want %d", tc.what, s.status, tc.status)
+		testing.expectf(t, s.reset == tc.malformed, "%s: reset %v, want %v", tc.what, s.reset, tc.malformed)
+		testing.expectf(t, s.done == !tc.malformed, "%s: done %v, want %v", tc.what, s.done, !tc.malformed)
+		rsts := 0
+		for f in log.frames {
+			if f.type == .Rst_Stream {
+				rsts += 1
+			}
+		}
+		if tc.malformed {
+			testing.expectf(t, rsts == 1 && log.rst_code == .Protocol_Error, "%s: %d RST_STREAM, last %v; want one PROTOCOL_ERROR", tc.what, rsts, log.rst_code)
+			// A REFUSED_STREAM in flight behind this end's reset does not make the
+			// request one to retry.
+			code := []u8{0, 0, 0, u8(Error_Code.Refused_Stream)}
+			ok = client_handle_frame(c, Frame_Header{length = 4, type = .Rst_Stream, stream_id = 1}, code)
+			testing.expectf(t, ok && !s.refused, "%s: a later REFUSED_STREAM made the reset retryable", tc.what)
+		} else {
+			testing.expectf(t, rsts == 0, "%s: %d RST_STREAM", tc.what, rsts)
+		}
+
+		delete(log.frames)
+		client_stream_destroy(c, s)
+		delete_key(&c.streams, u32(1))
+		client_unref(c)
+		free_all(context.temp_allocator)
+		for _, entry in track.allocation_map {
+			testing.expectf(t, false, "%s: %d bytes leaked at %v", tc.what, entry.size, entry.location)
+		}
+		mem.tracking_allocator_destroy(&track)
+	}
+}
+
+/*
+RFC 9113 8.3: a response's header section carries one `:status`, ahead of its
+ordinary fields, and no other pseudo-header; 8.2 holds its ordinary fields as
+it holds any. A response that breaks either is malformed and is not accepted
+(8.1.1) - a second `:status` in particular would be read as the answer's.
+*/
+@(test)
+test_client_response_head_is_held_to_8_2_and_8_3 :: proc(t: ^testing.T) {
+	Case :: struct {
+		what:   string,
+		fields: []Header_Field,
+	}
+	cases := []Case {
+		{"a second :status", {{":status", "500"}, {":status", "200"}}},
+		{"a request pseudo-header", {{":status", "200"}, {":path", "/"}}},
+		{"a pseudo-header after an ordinary field", {{"content-type", "application/dns-message"}, {":status", "200"}}},
+		{"a connection-specific field", {{":status", "200"}, {"connection", "close"}}},
+		{"an uppercase name", {{":status", "200"}, {"Content-Type", "application/dns-message"}}},
+	}
+	for tc in cases {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		allocator := mem.tracking_allocator(&track)
+
+		log := Client_Frame_Log {
+			frames = make([dynamic]Frame_Header, 0, 8, allocator),
+		}
+		c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+		s := open_test_stream(c, 1, allocator)
+
+		block := make([dynamic]u8, 0, 64, context.temp_allocator)
+		for f in tc.fields {
+			encode_header(&block, f.name, f.value)
+		}
+		ok := client_handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block[:])
+		testing.expectf(t, ok, "%s: the connection was dropped", tc.what)
+		testing.expectf(t, s.reset && !s.done, "%s: a malformed response was accepted (status %d)", tc.what, s.status)
+		testing.expectf(t, log.rst_code == .Protocol_Error, "%s: RST code %v, want PROTOCOL_ERROR", tc.what, log.rst_code)
+
+		delete(log.frames)
+		client_unref(c)
+		free_all(context.temp_allocator)
+		for _, entry in track.allocation_map {
+			testing.expectf(t, false, "%s: %d bytes leaked at %v", tc.what, entry.size, entry.location)
+		}
+		mem.tracking_allocator_destroy(&track)
+	}
+}
+
+// The server's rule on the client's side: a CONTINUATION with no block open is
+// a connection error, stream 0 included, and never reaches the HPACK decoder.
+@(test)
+test_client_continuation_on_stream_zero_with_no_block_open_is_refused :: proc(t: ^testing.T) {
+	c := client_make(IO{user = nil, read = hook_read_nothing, write = write_nothing})
+	// x-t: 1, with incremental indexing: a decoder that took it has an entry.
+	block := []u8{0x40, 0x03, 'x', '-', 't', 0x01, '1'}
+	ok := client_handle_continuation(c, Frame_Header{length = len(block), type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 0}, block)
+	testing.expect(t, !ok, "a CONTINUATION on stream 0 with no block open was accepted")
+	testing.expect_value(t, len(c.decoder.entries), 0)
+	client_unref(c)
+	free_all(context.temp_allocator)
 }
