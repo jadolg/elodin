@@ -178,6 +178,11 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 		return
 	}
 	reference, from, asked := parity_upstreams_reference(run.ups, q)
+	// The race's losers have to be in before the next ask resets the mocks;
+	// see `parity_upstreams_drain`.
+	if asked && run.s.strategy == "race" {
+		_ = parity_upstreams_drain(run.ups, q, time.tick_add(time.tick_now(), PARITY_UPSTREAM_TIMEOUT))
+	}
 
 	/*
 	Blocked by name, unless the question is one the server refuses before it

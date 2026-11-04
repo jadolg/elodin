@@ -2,6 +2,7 @@ package itest
 
 import "core:fmt"
 import "core:strings"
+import "core:time"
 
 /*
 The configurations a parity run is made under.
@@ -403,6 +404,12 @@ Everything the scenario does not name is off, and each for its own reason:
 `attempts: 1` so one client query means one upstream exchange, which is what
 lets a mock's last reply be read as this query's reference.
 */
+
+// The upstream timeout every scenario runs with. Also as long as a race's loser
+// can go on running once the query has its answer; see
+// `parity_upstreams_drain`.
+PARITY_UPSTREAM_TIMEOUT :: 5 * time.Second
+
 parity_scenario_config :: proc(
 	r: ^Runner,
 	s: Parity_Scenario,
@@ -425,7 +432,12 @@ parity_scenario_config :: proc(
 		)
 	}
 
-	fmt.sbprintf(&sb, "\nupstream:\n  strategy: %s\n  timeout: 5s\n  attempts: 1\n  servers:\n", s.strategy)
+	fmt.sbprintf(
+		&sb,
+		"\nupstream:\n  strategy: %s\n  timeout: %dms\n  attempts: 1\n  servers:\n",
+		s.strategy,
+		i64(PARITY_UPSTREAM_TIMEOUT / time.Millisecond),
+	)
 	routed := len(s.kinds) - (s.route != "" ? 1 : 0)
 	for i in 0 ..< routed {
 		parity_server_line(&sb, "    ", i, s.kinds[i], ends)

@@ -123,6 +123,48 @@ parity_upstreams_reference :: proc(
 	return
 }
 
+/*
+Wait until every upstream has sent a whole reply to `q`, or `deadline` passes,
+and say which.
+
+Under `strategy: race` the server answers from the first reply and leaves the
+losers running (`Race_State` in src/upstream/group.odin). A loser that lands
+after the next reset is read as a reply to the next ask - with the cache on,
+the next ask is usually the same question served from the cache, and nothing
+in a reply tells the two asks apart: the server sends the question folded to
+lower case under a fresh ID (`upstream_query` in src/server/resolver.odin). So
+the ask is not over until the race is: every member asked, and every member's
+last reply a whole answer to `q`, a stub's retry over TCP included (issue
+#573). A mock records a reply before it sends it, so that is the event.
+
+The mocks answer every query, so this ends on the event. `deadline` is a guard
+against a hang: a leg lives at most the upstream timeout, so once that has
+passed since the answer, nothing is left to land.
+*/
+parity_upstreams_drain :: proc(ups: ^Parity_Upstreams, q: Parity_Query, deadline: time.Tick) -> (drained: bool) {
+	for i in 0 ..< len(ups.mocks) {
+		for {
+			reply: []u8
+			count: int
+			if ups.mocks[i] != nil {
+				reply, count = mock_last_reply(ups.mocks[i])
+			} else {
+				reply, count = doh2_mock_last_reply(ups.doh[i])
+			}
+			// The count, because a reset clears it and not the reply: a whole
+			// answer to an earlier ask of `q` is still there to be read.
+			if count > 0 && len(reply) > 2 && reply[2] & 0x02 == 0 && parity_answers_question(reply, q) {
+				break
+			}
+			if time.tick_diff(time.tick_now(), deadline) <= 0 {
+				return false
+			}
+			time.sleep(time.Millisecond)
+		}
+	}
+	return true
+}
+
 // Whether `reply` is an answer to `q`'s question, name compared without case.
 parity_answers_question :: proc(reply: []u8, q: Parity_Query) -> bool {
 	m := pw_parse(reply, context.temp_allocator)

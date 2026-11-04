@@ -637,6 +637,7 @@ rather than behind `--parity`, which nothing gates.
 */
 run_parity_fixed_cases :: proc(r: ^Runner) {
 	parity_additional_dropped_case(r)
+	parity_race_drain_case(r)
 }
 
 /*
@@ -889,4 +890,69 @@ parity_fixed_query :: proc(name: string, qtype: u16, udp_size: u16) -> Parity_Qu
 		q.name = m.question[0].name
 	}
 	return q
+}
+
+/*
+A race is not over until its loser's whole reply is in (#573).
+
+Under `strategy: race` the losers run on after the winner has answered. With the
+cache on every query is asked twice and the second ask is a cache hit, so the
+first ask's UDP loser could record its truncated reply after the second ask's
+reset and its retry over TCP only after the second ask's reference had been
+read. The reference was then that stub against a whole cached answer: "tc
+(truncated): upstream 1, elodin 0" and a page of records "the upstream did not
+send".
+
+The loser's two exchanges are played here by hand against the mock a run uses,
+and `parity_upstreams_drain` is asked after each with a deadline already past,
+so what it says rests on what is on record and on nothing timed. The query is
+the one #286 found, a known shape that overflows 512 bytes, so the stub is a
+stub.
+*/
+@(private = "file")
+parity_race_drain_case :: proc(r: ^Runner) {
+	start_case(r, "parity: a race is not over until the loser's whole reply is in")
+	defer end_case(r)
+
+	mock_port := next_port(r)
+	mock := mock_make("parity", mock_port)
+	mock_parity_all(mock)
+	if !mock_start(mock) {
+		fail(r, "the parity mock did not start on port %d", mock_port)
+		return
+	}
+	defer mock_stop(mock)
+	ups := Parity_Upstreams{}
+	append(&ups.mocks, mock)
+	append(&ups.doh, nil)
+	defer delete(ups.mocks)
+	defer delete(ups.doh)
+
+	q := parity_fixed_query(PARITY_286_NAME, 48, PARITY_286_CEILING)
+	parity_upstreams_reset(&ups)
+	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained before the loser had sent anything")
+
+	// The loser's datagram: a stub, and the premise is that it is one - the
+	// old reference rule took exactly this for an ask's reference.
+	res := query_udp(mock_port, q.wire, context.temp_allocator)
+	stub, count := mock_last_reply(mock)
+	if !check(r, res.ok, "the mock did not answer the loser's datagram") ||
+	   !check(r, count == 1 && len(stub) > 2 && stub[2] & 0x02 != 0, "the loser's reply is not one truncated reply (count %d)", count) {
+		return
+	}
+	_, _, asked := parity_upstreams_reference(&ups, q)
+	check(r, asked, "a stub on record alone is not read as the upstream having been asked")
+	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained on the stub, before its retry over TCP")
+
+	// Its retry over TCP, and the race is over.
+	tcp := query_tcp(mock_port, q.wire, context.temp_allocator)
+	if !check(r, tcp.ok, "the mock did not answer the retry over tcp") {
+		return
+	}
+	check(r, parity_upstreams_drain(&ups, q, time.tick_now()), "not drained once the whole reply was in")
+
+	// The reset clears the count and leaves the reply: a whole answer to an
+	// earlier ask is not this one's.
+	parity_upstreams_reset(&ups)
+	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained on a whole reply from before the reset")
 }
