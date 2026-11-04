@@ -561,7 +561,7 @@ DEADLINE_PASSED :: "this query has waited as long as it may on its upstreams"
 // Whether the question's deadline is set and has passed. See `DEADLINE_PASSED`.
 @(private)
 deadline_passed :: proc(budget: ^Budget) -> bool {
-	return budget.deadline != nil && budget.deadline^ != {} && time.tick_diff(time.tick_now(), budget.deadline^) <= 0
+	return budget.deadline != nil && budget.deadline^ != {} && time.tick_diff(loop.tick_now(), budget.deadline^) <= 0
 }
 
 /*

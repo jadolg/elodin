@@ -167,7 +167,7 @@ for a group of two.
 */
 @(private)
 flight_patience :: proc(deadline: time.Tick, span: time.Duration) -> time.Duration {
-	return max(time.tick_diff(time.tick_now(), deadline), 0) + span
+	return max(time.tick_diff(loop.tick_now(), deadline), 0) + span
 }
 
 /*
@@ -244,9 +244,9 @@ flight_follow :: proc(
 	same: bool,
 ) {
 	sync.mutex_lock(&s.inflight.mu)
-	start := time.tick_now()
+	start := loop.tick_now()
 	for !f.landed {
-		left := patience - time.tick_since(start)
+		left := patience - loop.tick_since(start)
 		if left <= 0 {
 			break
 		}

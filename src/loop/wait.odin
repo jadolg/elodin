@@ -33,7 +33,11 @@ and the interest registered is the union of what they want.
 @(private)
 Fd_Watch :: struct {
 	waiters:    [dynamic]Fd_Waiter,
+	// What the one-shot registration is armed for, empty once it has fired.
 	registered: linux.EPoll_Event_Set,
+	// Whether epoll has been given this descriptor, armed or not. What the
+	// re-arm tries first; see `watch_update`.
+	added:      bool,
 }
 
 @(private)
@@ -74,17 +78,15 @@ wait_fd :: proc(fd: linux.Fd, events: Events, deadline: Tick) -> Wait_Result {
 		}
 		l.fds[fd] = w
 	}
-	/*
-	Registered again when somebody is already waiting, even for the same events.
-	If the descriptor was closed and its number handed out again while they
-	waited, the close took their registration away with it and nothing would
-	tell the new one's waiters it was missing; the call puts it back, and costs a
-	system call only where a descriptor has two waiters at once.
-	*/
-	again := len(w.waiters) > 0
 	append(&w.waiters, Fd_Waiter{f, f.token, events})
-	if !watch_update(l, fd, w, again) {
+	if !watch_update(l, fd, w) {
 		watch_leave(l, fd, f)
+		w.added = false
+		w.registered = {}
+		if len(w.waiters) == 0 {
+			delete_key(&l.fds, fd)
+			append(&l.spare_watches, w)
+		}
 		return .Failed
 	}
 	reason := park(deadline)
@@ -99,10 +101,20 @@ wait_fd :: proc(fd: linux.Fd, events: Events, deadline: Tick) -> Wait_Result {
 	return .Timeout
 }
 
-// Bring epoll's interest in `fd` in line with what its waiters want.
+/*
+Arm the one-shot registration for what `fd`'s waiters want: one `epoll_ctl` per
+wait that parks.
+
+Armed on every wait, never trusted from the last one. The descriptor may have
+been closed and its number handed out again since, and the close took the old
+registration away with it; nothing else would tell the new one's waiters it was
+missing. So the call is MOD while epoll has had the number, which fails with
+ENOENT for a new descriptor under it and becomes an ADD, and ADD the first time,
+which fails with EEXIST when it had one after all and becomes a MOD.
+*/
 @(private)
-watch_update :: proc(l: ^Loop, fd: linux.Fd, w: ^Fd_Watch, force := false) -> bool {
-	want: linux.EPoll_Event_Set
+watch_update :: proc(l: ^Loop, fd: linux.Fd, w: ^Fd_Watch) -> bool {
+	want := linux.EPoll_Event_Set{.ONESHOT}
 	for waiter in w.waiters {
 		if .In in waiter.events {
 			want += {.IN, .RDHUP}
@@ -111,38 +123,29 @@ watch_update :: proc(l: ^Loop, fd: linux.Fd, w: ^Fd_Watch, force := false) -> bo
 			want += {.OUT}
 		}
 	}
-	if want == w.registered && !force {
-		return true
-	}
 	ev := linux.EPoll_Event {
 		events = want,
 		data = {fd = fd},
 	}
-	if want == {} {
-		// The descriptor may be closed already, which took it out of the interest
-		// list with it; EBADF and ENOENT then say what is already so.
-		_ = linux.epoll_ctl(l.epfd, .DEL, fd, nil)
-		w.registered = {}
-		return true
-	}
-	op := linux.EPoll_Ctl_Opcode.ADD if w.registered == {} else .MOD
+	op := linux.EPoll_Ctl_Opcode.MOD if w.added else .ADD
 	err := linux.epoll_ctl(l.epfd, op, fd, &ev)
 	if op == .MOD && err == .ENOENT {
-		/*
-		Closed and the number handed out again since the last waiter on the old
-		one registered it: the close took the old registration away, and this
-		one is for whatever the number is now.
-		*/
 		err = linux.epoll_ctl(l.epfd, .ADD, fd, &ev)
+	} else if op == .ADD && err == .EEXIST {
+		err = linux.epoll_ctl(l.epfd, .MOD, fd, &ev)
 	}
 	if err != .NONE {
 		return false
 	}
+	w.added = true
 	w.registered = want
 	return true
 }
 
-// Take `f` off `fd`'s waiters, and stop watching the descriptor when it was last.
+/*
+Take `f` off `fd`'s waiters. Epoll is left as it is: a registration armed for
+`f` alone that fires later finds nobody to wake, and firing disarms it.
+*/
 @(private)
 watch_leave :: proc(l: ^Loop, fd: linux.Fd, f: ^Fiber) {
 	w := l.fds[fd]
@@ -153,12 +156,6 @@ watch_leave :: proc(l: ^Loop, fd: linux.Fd, f: ^Fiber) {
 		if w.waiters[i].fiber == f {
 			unordered_remove(&w.waiters, i)
 		}
-	}
-	_ = watch_update(l, fd, w)
-	if len(w.waiters) == 0 {
-		delete_key(&l.fds, fd)
-		w.registered = {}
-		append(&l.spare_watches, w)
 	}
 }
 
@@ -173,13 +170,26 @@ dispatch_event :: proc(l: ^Loop, ev: linux.EPoll_Event) {
 	if w == nil {
 		return
 	}
+	// Fired, so disarmed until a wait arms it again.
+	w.registered = {}
 	broken := ev.events & {.ERR, .HUP} != {}
 	readable := broken || ev.events & {.IN, .RDHUP} != {}
 	writable := broken || .OUT in ev.events
-	for waiter in w.waiters {
+	for i := len(w.waiters) - 1; i >= 0; i -= 1 {
+		waiter := w.waiters[i]
 		if (readable && .In in waiter.events) || (writable && .Out in waiter.events) {
 			wake_local(waiter.fiber, waiter.token, .Ready)
+			unordered_remove(&w.waiters, i)
 		}
+	}
+	/*
+	Those it did not wake - a writer on a connection whose reply just came in -
+	are still parked on a registration that is not armed any more. A failure
+	leaves them to their deadlines, which is where a wait that cannot be watched
+	ends anyway.
+	*/
+	if len(w.waiters) > 0 {
+		_ = watch_update(l, fd, w)
 	}
 }
 
@@ -225,7 +235,7 @@ poll_fd :: proc(fd: linux.Fd, events: Events, deadline: Tick) -> Wait_Result {
 	for {
 		ms := i32(-1)
 		if deadline != (Tick{}) {
-			left := time.tick_diff(time.tick_now(), deadline)
+			left := time.tick_diff(tick_now(), deadline)
 			if left <= 0 {
 				return .Timeout
 			}

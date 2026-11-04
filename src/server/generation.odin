@@ -284,7 +284,7 @@ client_timeout :: proc(s: ^Server) -> time.Duration {
 // `stream_rate_check`. Pinned for the check alone, as `client_timeout` is.
 stream_admits :: proc(s: ^Server, peer: net.Endpoint) -> bool {
 	pin_scope(s)
-	return stream_rate_check(live(s).limiter, peer, time.tick_now())
+	return stream_rate_check(live(s).limiter, peer, loop.tick_now())
 }
 
 /*

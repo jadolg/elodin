@@ -754,7 +754,7 @@ handshake did in that case.
 @(private)
 handshake_loop :: proc(conn: ^Conn, side: Handshake_Side) -> Error {
 	timeout := time.Duration(conn.read_timeout_ns)
-	deadline := time.tick_add(time.tick_now(), timeout)
+	deadline := time.tick_add(loop.tick_now(), timeout)
 	for {
 		ERR_clear_error()
 		ret := SSL_connect(conn.ssl) if side == .Connect else SSL_accept(conn.ssl)
@@ -873,7 +873,7 @@ reader parked on an idle connection holds nothing a writer needs.
 */
 @(private)
 transfer :: proc(conn: ^Conn, op: Op, buf: []u8, timeout: time.Duration) -> (n: int, err: Error) {
-	deadline := time.tick_add(time.tick_now(), timeout)
+	deadline := time.tick_add(loop.tick_now(), timeout)
 	for {
 		sync.mutex_lock(&conn.mu)
 		ERR_clear_error()
@@ -935,7 +935,7 @@ forward step cuts healthy waits short. The monotonic clock has neither.
 */
 @(private)
 wait_ready :: proc(conn: ^Conn, events: loop.Events, timeout: time.Duration, deadline: time.Tick) -> bool {
-	if timeout > 0 && time.tick_diff(time.tick_now(), deadline) <= 0 {
+	if timeout > 0 && time.tick_diff(loop.tick_now(), deadline) <= 0 {
 		return false
 	}
 	return loop.wait_fd(linux.Fd(socket_fd(conn.socket)), events, deadline if timeout > 0 else {}) == .Ready

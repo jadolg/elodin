@@ -343,7 +343,7 @@ start_prefetch :: proc(
 ) {
 	// Counted by the job itself, ahead of any failure it counts, so a scrape
 	// never sees more failures than prefetches.
-	if r := start_refresh(s, key, query, proto, client, limit, time.tick_now(), prefetch = true, serial = serial);
+	if r := start_refresh(s, key, query, proto, client, limit, loop.tick_now(), prefetch = true, serial = serial);
 	   r != nil {
 		refresh_release(r)
 	}

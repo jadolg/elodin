@@ -97,7 +97,7 @@ socket_wait :: proc(
 		deadline^ = socket_deadline(fd, option, start)
 		armed^ = true
 	}
-	if deadline^ != (Tick{}) && time.tick_diff(time.tick_now(), deadline^) <= 0 {
+	if deadline^ != (Tick{}) && time.tick_diff(tick_now(), deadline^) <= 0 {
 		take_turn()
 		return false
 	}
@@ -114,7 +114,7 @@ socket_wait :: proc(
 
 recv_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> (int, net.TCP_Recv_Error) {
 	assert_nonblocking(linux.Fd(socket))
-	start := time.tick_now()
+	start := tick_now()
 	deadline: Tick
 	armed: bool
 	for {
@@ -135,7 +135,7 @@ before a failure is counted in `n`.
 */
 send_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> (n: int, err: net.TCP_Send_Error) {
 	assert_nonblocking(linux.Fd(socket))
-	start := time.tick_now()
+	start := tick_now()
 	deadline: Tick
 	armed: bool
 	for {
@@ -153,7 +153,7 @@ send_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> (n: int, err: net.TCP_Sen
 
 recv_udp :: proc(socket: net.UDP_Socket, buf: []u8) -> (int, net.Endpoint, net.UDP_Recv_Error) {
 	assert_nonblocking(linux.Fd(socket))
-	start := time.tick_now()
+	start := tick_now()
 	deadline: Tick
 	armed: bool
 	for {
@@ -170,7 +170,7 @@ recv_udp :: proc(socket: net.UDP_Socket, buf: []u8) -> (int, net.Endpoint, net.U
 
 send_udp :: proc(socket: net.UDP_Socket, buf: []u8, to: net.Endpoint) -> (int, net.UDP_Send_Error) {
 	assert_nonblocking(linux.Fd(socket))
-	start := time.tick_now()
+	start := tick_now()
 	deadline: Tick
 	armed: bool
 	for {
@@ -191,7 +191,7 @@ returns is non-blocking as well, ready for this package's reads and writes.
 */
 accept_tcp :: proc(listener: net.TCP_Socket) -> (net.TCP_Socket, net.Endpoint, net.Accept_Error) {
 	assert_nonblocking(linux.Fd(listener))
-	start := time.tick_now()
+	start := tick_now()
 	deadline: Tick
 	armed: bool
 	for {

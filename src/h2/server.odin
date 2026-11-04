@@ -570,7 +570,7 @@ control_budget_spend :: proc(b: ^Control_Budget) -> bool {
 		b.earned -= 1
 		return true
 	}
-	now := time.tick_now()
+	now := loop.tick_now()
 	// A zero window is long past, so the first frame opens one.
 	if time.tick_diff(b.window, now) >= time.Second {
 		b.window = now
@@ -1823,7 +1823,7 @@ Write a response body, honouring flow control and the peer's frame size limit.
 write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 	// On the tick clock: a step of the wall clock must not cut every pending
 	// write off at once, nor hold a fiber for the length of the step.
-	deadline := time.tick_add(time.tick_now(), c.write_timeout)
+	deadline := time.tick_add(loop.tick_now(), c.write_timeout)
 	sent := 0
 	for sent < len(body) {
 		remaining := len(body) - sent
@@ -1860,7 +1860,7 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 			the wait would keep the query and its fiber for as long as the peer
 			felt like holding it.
 			*/
-			left := time.tick_diff(time.tick_now(), deadline)
+			left := time.tick_diff(loop.tick_now(), deadline)
 			if left <= 0 {
 				// Marked here, under the same lock, for the same reason
 				// handle_data's already_ended path marks it before sending its

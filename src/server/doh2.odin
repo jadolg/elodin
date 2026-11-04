@@ -9,6 +9,7 @@ import "elodin:dnssec"
 import "elodin:h2"
 import "elodin:logx"
 import "elodin:tlsx"
+import "elodin:loop"
 
 /*
 The DoH endpoint over HTTP/2 (RFC 8484 with RFC 9113 transport).
@@ -95,7 +96,7 @@ h2_begin :: proc(user: rawptr, starts_frame: bool) {
 	if !starts_frame || sync.atomic_load(&ctx.pending) != 0 {
 		return
 	}
-	now := time.tick_now()
+	now := loop.tick_now()
 	if doh_question_overdue(ctx.server, {sync.atomic_load(&ctx.last_question._nsec)}, now) {
 		ctx.budget.deadline = now
 	}
@@ -122,7 +123,7 @@ serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string, peer: net.Endpo
 		client        = client,
 		peer          = peer,
 		path          = startup_config(s).listeners.doh.path,
-		last_question = time.tick_now(),
+		last_question = loop.tick_now(),
 	}
 
 	io := h2.IO {
@@ -178,7 +179,7 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	anything then, so a 404 holds a connection no more cheaply than a query does,
 	and telling them apart would be the base64 decode the note above avoids.
 	*/
-	now := time.tick_now()
+	now := loop.tick_now()
 	asked, limited: bool
 	max_pending: int
 	{
@@ -393,7 +394,7 @@ h2_answer :: proc(data: rawptr, pool := dnssec.Walk_Pool.Shared) {
 	defer {
 		// Before the reference goes: `ctx` lives only as long as the connection.
 		if job.asked {
-			sync.atomic_store(&ctx.last_question._nsec, time.tick_now()._nsec)
+			sync.atomic_store(&ctx.last_question._nsec, loop.tick_now()._nsec)
 			sync.atomic_sub(&ctx.pending, 1)
 		}
 		h2.request_destroy(hc, req)

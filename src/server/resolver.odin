@@ -303,7 +303,7 @@ handle_query :: proc(
 	// One generation from the first read of the configuration to the last,
 	// whatever transport brought the query; see `generation.odin`.
 	pin_scope(s)
-	started := time.tick_now()
+	started := loop.tick_now()
 	sync.atomic_add(&s.stats.queries, 1)
 
 	if len(query) < dns.HEADER_SIZE {
@@ -1799,7 +1799,7 @@ join_flight :: proc(st: ^Query_State) -> bool {
 	`question_span`.
 	*/
 	st.span = question_span(st.s, st.q.name, st.q.type)
-	st.deadline = time.tick_add(time.tick_now(), st.span)
+	st.deadline = time.tick_add(loop.tick_now(), st.span)
 	if !st.refresh {
 		ceiling := follower_ceiling(st.s)
 		/*
@@ -1821,7 +1821,7 @@ join_flight :: proc(st: ^Query_State) -> bool {
 			first flight after it.
 			*/
 			if rejoined {
-				st.deadline = time.tick_add(time.tick_now(), st.span)
+				st.deadline = time.tick_add(loop.tick_now(), st.span)
 			}
 			joined, counted := flight_join(st.s, st.key, &st.own_flight, st.pool == .Shared, ceiling)
 			if joined == &st.own_flight {
@@ -2424,7 +2424,7 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 			st.q.name,
 			st.q.type,
 			st.resp,
-			time.now(),
+			loop.now(),
 			st.allocator,
 			pool = st.pool,
 			spent = st.spent,
@@ -2563,7 +2563,7 @@ finish_answer :: proc(st: ^Query_State) {
 	validated - CD, or validation off - is held to it only here.
 	*/
 	// `signatures_lapse` reads no bound at all for a message that carries none.
-	signed_left, signed := dns.signatures_lapse(st.resp, u32(time.time_to_unix(time.now())))
+	signed_left, signed := dns.signatures_lapse(st.resp, u32(time.time_to_unix(loop.now())))
 	dns.cap_ttls(st.resp, min(cache.ttl_ceiling(live(st.s).answers), signed_left))
 
 	/*
@@ -4536,7 +4536,7 @@ log_query :: proc(
 	if !live(s).cfg.log.queries || prefetching {
 		return
 	}
-	elapsed := time.tick_since(started)
+	elapsed := loop.tick_since(started)
 	/*
 	The source address and the port it sent from are two fields, not one.
 

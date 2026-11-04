@@ -98,7 +98,7 @@ bootstrap_resolve :: proc(
 		*/
 		share_end := deadline
 		if deadline != {} {
-			now := time.tick_now()
+			now := loop.tick_now()
 			left := time.tick_diff(now, deadline)
 			if left <= 0 {
 				return nil, false
@@ -108,7 +108,7 @@ bootstrap_resolve :: proc(
 		for qtype in ([]dns.Type{.A, .AAAA}) {
 			timeout := BOOTSTRAP_TIMEOUT
 			if deadline != {} {
-				left := time.tick_diff(time.tick_now(), share_end)
+				left := time.tick_diff(loop.tick_now(), share_end)
 				if left <= 0 {
 					break
 				}
@@ -282,7 +282,7 @@ bootstrap_query :: proc(
 	arriving first does not deny the real answer the rest of the window.
 	*/
 	buf := make([]u8, 4096, context.temp_allocator)
-	deadline := time.tick_add(time.tick_now(), timeout)
+	deadline := time.tick_add(loop.tick_now(), timeout)
 
 	// As in `exchange_udp`: datagrams passed over back to back never park, and
 	// `loop.recv_udp` yields between them.

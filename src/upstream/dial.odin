@@ -58,7 +58,7 @@ dial_tcp_timeout :: proc(endpoint: net.Endpoint, timeout: time.Duration) -> (soc
 		if posix.errno() != .EINPROGRESS {
 			return 0, .Dial_Failed
 		}
-		deadline := time.tick_add(time.tick_now(), max(timeout, time.Millisecond))
+		deadline := time.tick_add(loop.tick_now(), max(timeout, time.Millisecond))
 		switch loop.wait_fd(linux.Fd(fd), {.Out}, deadline) {
 		case .Ready:
 		case .Timeout, .Cancelled:

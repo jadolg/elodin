@@ -7,6 +7,7 @@ import "core:sync"
 import "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
+import "elodin:loop"
 
 /*
 Not `core:log`: its file logger writes `[LEVEL] --- [date]` lines, where these are
@@ -409,7 +410,7 @@ it as a key.
 */
 @(private)
 write_line :: proc(level: Level, msg: string, fields: string) {
-	now := time.now()
+	now := loop.now()
 	stamp_buf: [64]u8
 	stamp := time.to_string_hms(now, stamp_buf[:])
 
@@ -600,7 +601,7 @@ gate_pass :: proc(g: ^Gate, now: i64) -> (loud: bool, held: u64) {
 }
 
 gate_pass_now :: proc(g: ^Gate) -> (loud: bool, held: u64) {
-	return gate_pass(g, time.tick_now()._nsec)
+	return gate_pass(g, loop.tick_now()._nsec)
 }
 
 // Whether a gate is inside its window, without spending it: for a caller that

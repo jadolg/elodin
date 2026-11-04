@@ -48,7 +48,9 @@ src/upstream/  transports (UDP/TCP/DoT/DoH), pooling, strategies, cookies, HTTP/
 src/server/    resolver, listeners, DoH endpoint, cookies, local zones, list refresh
 src/h2/        HTTP/2 framing, HPACK, and the server connection state machine
 src/tlsx/      OpenSSL bindings and a small TLS wrapper
-src/loop/      event loops: fibers, epoll, timers, waits that park, socket calls
+src/loop/      event loops: fibers, epoll, timers, waits that park, socket calls, and the
+               clocks (`loop.now`, `loop.tick_now`); `check` refuses core:time's, which
+               skip the vDSO, outside the tests, itest and fuzz
 src/logx/      logging, in logfmt
 src/netx/      core:net's address parsers, held to what an address and a port are; `check`
                refuses core:net's own outside the tests, itest and fuzz

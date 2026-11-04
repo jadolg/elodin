@@ -1,6 +1,8 @@
 package loop
 
+import "core:fmt"
 import "core:net"
+import "core:strings"
 import "core:sync"
 import "core:sys/linux"
 import "core:testing"
@@ -365,8 +367,9 @@ test_a_wait_on_a_quiet_descriptor_times_out :: proc(t: ^testing.T) {
 	_, _ = spawn(r.l, proc(data: rawptr) {
 		s := (^Shared)(data)
 		s.p.result = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), 20 * time.Millisecond))
-		// Nothing is registered once the wait is over.
-		s.p.value = len(current_loop().fds)
+		// Nobody is waiting once the wait is over.
+		w := current_loop().fds[s.fd]
+		s.p.value = 0 if w == nil else len(w.waiters)
 		sync.sema_post(&s.p.done)
 	}, &s)
 	testing.expect(t, sync.sema_wait_with_timeout(&s.p.done, WAIT))
@@ -417,6 +420,175 @@ test_two_fibers_wait_on_one_descriptor :: proc(t: ^testing.T) {
 	_, _ = linux.write(b, transmute([]u8)string("x"))
 	testing.expect(t, sync.sema_wait_with_timeout(&s.reader.done, WAIT))
 	testing.expect_value(t, s.reader.result, Wait_Result.Ready)
+}
+
+/*
+A descriptor stays in epoll's interest list between waits, so a wait that parks
+costs one `epoll_ctl` - the re-arm - rather than an add and a remove (#594).
+Read off `/proc/self/fdinfo` for the loop's epoll descriptor, which lists every
+registration it holds. Two waits, one that times out and one that is woken, and
+the descriptor is still listed after both.
+*/
+@(test)
+test_a_descriptor_stays_registered_between_waits :: proc(t: ^testing.T) {
+	a, b, paired := socket_pair(t)
+	if !paired {
+		return
+	}
+	defer linux.close(a)
+	defer linux.close(b)
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		p:       Probe,
+		fd:      linux.Fd,
+		woken:   Wait_Result,
+		parked:  Sema,
+		listed:  [2]bool,
+	}
+	s := Shared {
+		fd = a,
+	}
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		s.p.result = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), 10 * time.Millisecond))
+		s.listed[0] = epoll_lists(current_loop().epfd, s.fd)
+		sema_post(&s.parked)
+		s.woken = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), WAIT))
+		s.listed[1] = epoll_lists(current_loop().epfd, s.fd)
+		sync.sema_post(&s.p.done)
+	}, &s)
+	testing.expect(t, sema_wait_with_timeout(&s.parked, WAIT))
+	_, _ = linux.write(b, transmute([]u8)string("x"))
+	testing.expect(t, sync.sema_wait_with_timeout(&s.p.done, WAIT))
+	testing.expect_value(t, s.p.result, Wait_Result.Timeout)
+	testing.expect_value(t, s.woken, Wait_Result.Ready)
+	testing.expect(t, s.listed[0], "a wait that timed out took the descriptor out of epoll")
+	testing.expect(t, s.listed[1], "a wait that was woken took the descriptor out of epoll")
+}
+
+/*
+A registration left armed by a wait that timed out is not trusted by the next
+wait on the same number, which may be another descriptor by then: `dup2` puts a
+new socket under the number, which takes the old one's registration away, and a
+wait on the new one is still woken by what arrives on it.
+*/
+@(test)
+test_a_number_handed_out_again_is_registered_afresh :: proc(t: ^testing.T) {
+	a, b, paired := socket_pair(t)
+	if !paired {
+		return
+	}
+	defer linux.close(a)
+	defer linux.close(b)
+	c, d, paired2 := socket_pair(t)
+	if !paired2 {
+		return
+	}
+	defer linux.close(d)
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		p:      Probe,
+		fd:     linux.Fd,
+		c:      linux.Fd,
+		parked: Sema,
+		first:  Wait_Result,
+		reused: bool,
+	}
+	s := Shared {
+		fd = a,
+		c  = c,
+	}
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		s.first = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), 10 * time.Millisecond))
+		// The number now names `c`'s socket, and the old one is closed.
+		got, err := linux.dup2(s.c, s.fd)
+		s.reused = err == .NONE && got == s.fd
+		linux.close(s.c)
+		sema_post(&s.parked)
+		s.p.result = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), WAIT))
+		sync.sema_post(&s.p.done)
+	}, &s)
+	testing.expect(t, sema_wait_with_timeout(&s.parked, WAIT))
+	_, _ = linux.write(d, transmute([]u8)string("x"))
+	testing.expect(t, sync.sema_wait_with_timeout(&s.p.done, WAIT))
+	testing.expect_value(t, s.first, Wait_Result.Timeout)
+	testing.expect(t, s.reused, "the number was not handed to the new socket")
+	testing.expect_value(t, s.p.result, Wait_Result.Ready)
+}
+
+/*
+A descriptor epoll already holds when the loop first waits on it - a watch given
+up after a failed wait, say - is armed with MOD when ADD finds it there, rather
+than the wait failing. Registered behind the loop's back here, armed for nothing.
+*/
+@(test)
+test_a_descriptor_epoll_already_holds_is_armed :: proc(t: ^testing.T) {
+	a, b, paired := socket_pair(t)
+	if !paired {
+		return
+	}
+	defer linux.close(a)
+	defer linux.close(b)
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	ev := linux.EPoll_Event {
+		events = {.ONESHOT},
+		data = {fd = a},
+	}
+	if !testing.expect(t, linux.epoll_ctl(r.l.epfd, .ADD, a, &ev) == .NONE, "could not register the descriptor") {
+		return
+	}
+	Shared :: struct {
+		p:      Probe,
+		fd:     linux.Fd,
+		parked: Sema,
+	}
+	s := Shared {
+		fd = a,
+	}
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		sema_post(&s.parked)
+		s.p.result = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), WAIT))
+		sync.sema_post(&s.p.done)
+	}, &s)
+	testing.expect(t, sema_wait_with_timeout(&s.parked, WAIT))
+	_, _ = linux.write(b, transmute([]u8)string("x"))
+	testing.expect(t, sync.sema_wait_with_timeout(&s.p.done, WAIT))
+	testing.expect_value(t, s.p.result, Wait_Result.Ready)
+}
+
+/*
+Whether epoll descriptor `epfd` holds a registration for `fd`. On stack buffers,
+since it runs on a fiber, whose scratch is not the test's.
+*/
+@(private = "file")
+epoll_lists :: proc(epfd, fd: linux.Fd) -> bool {
+	path_buf: [64]u8
+	path := fmt.bprintf(path_buf[:], "/proc/self/fdinfo/%d\x00", epfd)
+	info, err := linux.open(cstring(raw_data(path)), {})
+	if err != .NONE {
+		return false
+	}
+	defer linux.close(info)
+	data: [4096]u8
+	n, _ := linux.read(info, data[:])
+	want_buf: [32]u8
+	// "tfd:        3 events: ...", the number padded with spaces.
+	want := fmt.bprintf(want_buf[:], " %d events:", fd)
+	return strings.contains(string(data[:max(n, 0)]), want)
 }
 
 // Off a loop, the same call is `poll(2)`: what a test thread or the rebuild does.

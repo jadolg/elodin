@@ -129,7 +129,7 @@ waiter_block :: proc(w: ^Waiter, lock: ^sync.Mutex, deadline: Tick, cancellable:
 		if deadline == (Tick{}) {
 			sync.sema_wait(&w.sema)
 		} else {
-			left := time.tick_diff(time.tick_now(), deadline)
+			left := time.tick_diff(tick_now(), deadline)
 			if left > 0 {
 				_ = sync.sema_wait_with_timeout(&w.sema, left)
 			}
@@ -138,7 +138,7 @@ waiter_block :: proc(w: ^Waiter, lock: ^sync.Mutex, deadline: Tick, cancellable:
 		if w.signalled {
 			return true
 		}
-		if deadline != (Tick{}) && time.tick_diff(time.tick_now(), deadline) <= 0 {
+		if deadline != (Tick{}) && time.tick_diff(tick_now(), deadline) <= 0 {
 			return false
 		}
 	}
@@ -254,14 +254,14 @@ cond_wait_with_timeout_sync :: proc(c: ^Cond, m: ^sync.Mutex, d: time.Duration) 
 	if d <= 0 {
 		return false
 	}
-	return cond_wait_until(c, m, nil, time.tick_add(time.tick_now(), d))
+	return cond_wait_until(c, m, nil, time.tick_add(tick_now(), d))
 }
 
 cond_wait_with_timeout_loop :: proc(c: ^Cond, m: ^Mutex, d: time.Duration) -> bool {
 	if d <= 0 {
 		return false
 	}
-	return cond_wait_until(c, nil, m, time.tick_add(time.tick_now(), d))
+	return cond_wait_until(c, nil, m, time.tick_add(tick_now(), d))
 }
 
 /*
@@ -343,7 +343,7 @@ sema_wait :: proc(s: ^Sema) {
 
 // False when `d` passed, or the fiber was cancelled, before a post was taken.
 sema_wait_with_timeout :: proc(s: ^Sema, d: time.Duration) -> bool {
-	return sema_wait_until(s, time.tick_add(time.tick_now(), max(d, 0)))
+	return sema_wait_until(s, time.tick_add(tick_now(), max(d, 0)))
 }
 
 @(private)
@@ -354,7 +354,7 @@ sema_wait_until :: proc(s: ^Sema, deadline: Tick) -> bool {
 		s.count -= 1
 		return true
 	}
-	if deadline != (Tick{}) && time.tick_diff(time.tick_now(), deadline) <= 0 {
+	if deadline != (Tick{}) && time.tick_diff(tick_now(), deadline) <= 0 {
 		return false
 	}
 	w: Waiter

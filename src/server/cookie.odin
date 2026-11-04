@@ -9,6 +9,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
 import "elodin:netx"
+import "elodin:loop"
 
 /*
 DNS cookies, on the side facing the clients (RFC 7873, RFC 9018).
@@ -448,5 +449,5 @@ cookie_address_bytes :: proc(address: net.Address, out: []u8) -> (n: int, ok: bo
 
 @(private)
 cookie_now :: proc() -> u32 {
-	return u32(time.time_to_unix(time.now()))
+	return u32(time.time_to_unix(loop.now()))
 }
