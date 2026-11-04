@@ -75,3 +75,23 @@ test_a_mint_that_fits_no_way_is_abandoned :: proc(t: ^testing.T) {
 	testing.expect(t, !m.flags.tc, "TC was set on an answer that fits")
 	free_all(context.temp_allocator)
 }
+
+// An answer over the limit before the mint keeps the record, and an answer that
+// fits once compressed is not cut for the bytes the upstream spent on its names.
+@(test)
+test_an_answer_over_the_limit_that_fits_compressed_keeps_its_record :: proc(t: ^testing.T) {
+	wire := loose_answer()
+	compact, _, _ := dns.encode_message(dns.decode_message(wire, context.temp_allocator) or_else {}, context.temp_allocator)
+	limit := len(compact) + 20
+	testing.expect(t, len(wire) > limit, "the fixture does not start over the limit")
+	spent := 0
+	out := match_client_opt(wire, edns_query(), 1232, limit, .Cached, &spent, context.temp_allocator)
+
+	testing.expect(t, len(out) <= limit, "the answer went out over the limit")
+	m, err := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, err, dns.Decode_Error.None)
+	testing.expect(t, dns.edns_present(m), "the record was lost")
+	testing.expect_value(t, len(m.answer), 20)
+	testing.expect(t, !m.flags.tc, "an answer that fits compressed was cut")
+	free_all(context.temp_allocator)
+}

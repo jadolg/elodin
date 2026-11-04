@@ -700,11 +700,13 @@ match_client_opt :: proc(
 		/*
 		The record is appended to the bytes as they arrived, which on an answer
 		from an upstream that writes its names in full is longer than the same
-		answer compressed. Before a mint that overflows an answer which fits is
-		given up, it is tried on the answer as this server would encode it - the
-		decode the append avoids, paid only here.
+		answer compressed. A mint that overflows is tried again on the answer as
+		this server would encode it - the decode the append avoids, paid only
+		here - before it is given up below, or before `fit_response` cuts it. An
+		answer already over the limit is decoded for that cut anyway, so it is
+		not singled out.
 		*/
-		if ok && len(out) > limit && len(wire) <= limit {
+		if ok && len(out) > limit {
 			out, ok = dns.ensure_opt_compressed(wire, advertise, allocator, spent)
 		}
 		/*

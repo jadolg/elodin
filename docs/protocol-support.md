@@ -21,8 +21,11 @@ A name whose compression pointer aims into the 12-byte header is not read as a
 name. Those bytes are ones elodin writes per client (the ID, AD, and ARCOUNT
 when an OPT record is added or removed), so the client would read a different
 name from the one elodin checked. A query carrying one is answered FORMERR. An
-answer carrying one is handled like any answer that does not decode: it is not
-cached, and [rebinding protection](rebinding.md) refuses it.
+answer carrying one in an owner name is handled like any answer that does not
+decode: it is not cached, and [rebinding protection](rebinding.md) refuses it.
+One inside a record's data (a CNAME, NS or MX target) leaves that record unread,
+kept as the bytes it arrived as like any record data that does not decode; with
+blocking on, a CNAME kept that way has the answer refused.
 
 Also handled: EDNS0 — elodin forwards a query of its own built from the
 question, with an OPT record at 1232 bytes and none of the client's options, and
