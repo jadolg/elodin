@@ -195,9 +195,10 @@ one after it, `live-pipe`, is what a run that went on past the slip would name.
 */
 @(private = "file")
 parity_clock_slips_mid_run_case :: proc(r: ^Runner) {
-	start_case(r, "parity: a clock that slips during a live run stops it after that scenario")
-	defer end_case(r)
-
+	name :: "parity: a clock that slips during a live run stops it after that scenario"
+	// Run before the case opens, so a box whose every port slot is taken (this
+	// child, unlike the refused one, claims a slot of its own) skips the case
+	// rather than failing it. A setup failure in the child still fails the run.
 	output, exit_code, ok := parity_clock_child(
 		r,
 		"parity-clock-slips",
@@ -208,10 +209,13 @@ parity_clock_slips_mid_run_case :: proc(r: ^Runner) {
 	if !ok {
 		return
 	}
-	// This child, unlike the refused one, claims a port slot of its own.
-	if !check(r, !strings.contains(output, "port slots are taken"), "no port slot was free for the child run") {
+	if strings.contains(output, "port slots are taken") {
+		skip_case(r, name, "no port slot was free for the child run")
 		return
 	}
+	start_case(r, name)
+	defer end_case(r)
+
 	check(r, exit_code != 0, "the run exited 0:\n%s", output)
 	check(r, !strings.contains(output, "live-pipe"), "the run went on past the scenario the clock slipped in:\n%s", output)
 	// The premise: the run started on the clock the case set as right.

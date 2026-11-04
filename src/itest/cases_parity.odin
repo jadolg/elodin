@@ -152,10 +152,14 @@ run_parity_live :: proc(r: ^Runner, opts: Parity_Options) {
 	main read the clock before the run; it is read again after each scenario,
 	since a run of every scenario takes minutes and a clock can slip in that
 	time. A slip fails a case naming the scenario it happened in, whose
-	divergences are then the clock's, and stops the scenarios still to come.
+	divergences are then the clock's, and stops the scenarios still to come. A
+	scenario that sent nothing (skipped, or its server never came up) has no
+	divergences to blame on the clock, so the check waits for one that did.
 	*/
 	for s in scenarios {
-		run_parity_live_scenario(r, opts, s)
+		if !run_parity_live_scenario(r, opts, s) {
+			continue
+		}
 		if clock := parity_clock_check(); clock.refuse {
 			start_case(r, "parity: the host clock")
 			fail(r, "the host clock moved during %s: %s", s.name, clock.note)
@@ -166,7 +170,9 @@ run_parity_live :: proc(r: ^Runner, opts: Parity_Options) {
 }
 
 @(private = "file")
-run_parity_live_scenario :: proc(r: ^Runner, opts: Parity_Options, s: Parity_Scenario) {
+// Whether the scenario sent its queries; false when it was skipped or never got
+// a server to send them through.
+run_parity_live_scenario :: proc(r: ^Runner, opts: Parity_Options, s: Parity_Scenario) -> (sent: bool) {
 	// Heap rather than the arena; see `run_parity_scenario`.
 	title := fmt.aprintf("parity against %s: %s - %s (seed %d)", opts.upstream, s.name, s.levers, opts.seed)
 	defer delete(title)
@@ -231,6 +237,7 @@ run_parity_live_scenario :: proc(r: ^Runner, opts: Parity_Options, s: Parity_Sce
 	}
 
 	parity_report(r, opts, stats)
+	return true
 }
 
 @(private = "file")
