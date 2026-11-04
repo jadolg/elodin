@@ -926,7 +926,7 @@ parity_race_drain_case :: proc(r: ^Runner) {
 	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained before the loser had sent anything")
 
 	// The loser's datagram: a stub, and the premise is that it is one - the
-	// old reference rule took exactly this for an ask's reference.
+	// reference rule reads exactly this as the upstream having been asked.
 	res := query_udp(mock_port, q.wire, context.temp_allocator)
 	stub, count := mock_last_reply(mock)
 	if !check(r, res.ok, "the mock did not answer the loser's datagram") ||

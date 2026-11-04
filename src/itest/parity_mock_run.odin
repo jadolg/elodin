@@ -40,6 +40,10 @@ Parity_Mock_Run :: struct {
 	cached: map[string]Parity_Cached,
 	// How many references each upstream was, for the checks a strategy makes.
 	served: []int,
+	// Set when a race did not drain: every reference after it is in doubt, and
+	// a cause that holds for one query holds for the rest at the guard's cost
+	// each, so the scenario ends there.
+	undrained: bool,
 }
 
 @(private = "file")
@@ -104,6 +108,9 @@ run_parity_scenario :: proc(r: ^Runner, opts: Parity_Options, s: Parity_Scenario
 	defer delete(run.served)
 
 	for i in 0 ..< opts.runs {
+		if run.undrained {
+			break
+		}
 		parity_one_mock(&run, &g, i)
 		// The generator allocates a query and the comparator a page of strings
 		// per iteration; without this a long run grows without bound.
@@ -150,7 +157,7 @@ parity_one_mock :: proc(run: ^Parity_Mock_Run, g: ^Parity_Gen, index: int) {
 	again where there is none - a ttl of zero, say - and either way it is
 	judged: against the reply that filled the entry, or against its own.
 	*/
-	if run.s.cache {
+	if run.s.cache && !run.undrained {
 		parity_settle(run, q, index)
 	}
 }
@@ -187,7 +194,8 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 	*/
 	if asked && run.s.strategy == "race" && !parity_upstreams_drain(run.ups, q, time.tick_add(time.tick_now(), PARITY_UPSTREAM_TIMEOUT)) {
 		stats.failures += 1
-		fail(run.r, "%s: an upstream in the race had sent no whole reply %v after the answer", q.desc, PARITY_UPSTREAM_TIMEOUT)
+		run.undrained = true
+		fail(run.r, "%s: an upstream in the race had sent no whole reply %v after the answer; the scenario stops here", q.desc, PARITY_UPSTREAM_TIMEOUT)
 	}
 
 	/*

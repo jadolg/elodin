@@ -84,10 +84,11 @@ The reply this query was answered from, and which upstream sent it.
 `asked` is false when no upstream answered this question since the last reset,
 which is the server having answered from its own mouth.
 
-A reply is only taken for this query if it answers this query's question. The
-race strategy is why: the slower upstream's reply to the previous query can land
-after the reset, and read without the check it would be the reference for a
-question it never answered. Where several upstreams answered - the race again -
+A reply is only taken for this query if it answers this query's question: a
+reply to an earlier query that lands after the reset would otherwise be the
+reference for a question it never answered. Under the race strategy
+`parity_upstreams_drain` keeps a loser from landing after the reset at all; the
+check is for the asks nothing drains. Where several upstreams answered - the race again -
 any whole reply will do, because the zone is the same zone; one cut short for a
 datagram is only taken if there is nothing better, which there always is once
 the retry over TCP has come back.
@@ -106,7 +107,7 @@ parity_upstreams_reference :: proc(
 		if count == 0 || reply == nil || !parity_answers_question(reply, q) {
 			continue
 		}
-		whole := len(reply) > 2 && reply[2] & 0x02 == 0
+		whole := parity_whole(reply)
 		if reference == nil || whole {
 			reference, from = reply, i
 		}
@@ -145,7 +146,7 @@ parity_upstreams_drain :: proc(ups: ^Parity_Upstreams, q: Parity_Query, deadline
 			reply, count := parity_upstream_last_reply(ups, i)
 			// The count, because a reset clears it and not the reply: a whole
 			// answer to an earlier ask of `q` is still there to be read.
-			if count > 0 && len(reply) > 2 && reply[2] & 0x02 == 0 && parity_answers_question(reply, q) {
+			if count > 0 && parity_whole(reply) && parity_answers_question(reply, q) {
 				break
 			}
 			if time.tick_diff(time.tick_now(), deadline) <= 0 {
@@ -163,6 +164,11 @@ parity_upstream_last_reply :: proc(ups: ^Parity_Upstreams, i: int) -> (reply: []
 		return mock_last_reply(ups.mocks[i])
 	}
 	return doh2_mock_last_reply(ups.doh[i])
+}
+
+// Whether `reply` is a whole reply: long enough for its flags, and TC clear.
+parity_whole :: proc(reply: []u8) -> bool {
+	return len(reply) > 2 && reply[2] & 0x02 == 0
 }
 
 // Whether `reply` is an answer to `q`'s question, name compared without case.
