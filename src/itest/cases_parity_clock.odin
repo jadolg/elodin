@@ -138,9 +138,20 @@ parity_clock_child :: proc(r: ^Runner, tag, first, after: string, args: []string
 	path := os.get_env("PATH", context.temp_allocator)
 	append(&env, fmt.tprintf("PATH=%s:%s", bin_dir, path))
 
+	/*
+	Bounded by timeout(1): the child has no deadline of its own, and one that
+	stalled would stall this suite rather than fail the case. A refused run
+	takes milliseconds and one scenario against a dead upstream about ten
+	seconds. --graceful-stop is passed on so `mise run leakcheck` sees the
+	child's servers exit too.
+	*/
 	command := make([dynamic]string, context.temp_allocator)
 	upstream := fmt.tprintf("127.0.0.1:%d", next_port(r))
-	append(&command, os.args[0], "--binary", r.binary, "--parity", "--parity-runs", "1", "--parity-upstream", upstream)
+	append(&command, "timeout", "120", os.args[0], "--binary", r.binary, "--parity", "--parity-runs", "1")
+	append(&command, "--parity-upstream", upstream)
+	if r.graceful_stop {
+		append(&command, "--graceful-stop")
+	}
 	append(&command, ..args)
 	state, stdout, stderr, err := os.process_exec(
 		os.Process_Desc{command = command[:], env = env[:]},
@@ -149,7 +160,9 @@ parity_clock_child :: proc(r: ^Runner, tag, first, after: string, args: []string
 	if !check(r, err == nil, "cannot run %s: %v", os.args[0], err) {
 		return
 	}
-	return fmt.tprintf("%s%s", stdout, stderr), state.exit_code, true
+	output = fmt.tprintf("%s%s", stdout, stderr)
+	check(r, state.exit_code != 124, "the run did not finish inside the timeout:\n%s", output)
+	return output, state.exit_code, state.exit_code != 124
 }
 
 // End to end: a live run on a clock 2h24m slow stops before it sends anything,
@@ -177,23 +190,30 @@ End to end: a clock that slips during a run is caught after the scenario it
 slipped in, which is named, so its divergences are read as the clock's.
 
 The clock is right when the run starts and 2h24m slow every time it is read
-after that.
+after that. Every live scenario is asked for and `live` comes first, so the
+one after it, `live-pipe`, is what a run that went on past the slip would name.
 */
 @(private = "file")
 parity_clock_slips_mid_run_case :: proc(r: ^Runner) {
 	start_case(r, "parity: a clock that slips during a live run stops it after that scenario")
 	defer end_case(r)
 
-	output, _, ok := parity_clock_child(
+	output, exit_code, ok := parity_clock_child(
 		r,
 		"parity-clock-slips",
 		chronyc_tracking("0.001000000 seconds slow"),
 		chronyc_tracking("8640.000000000 seconds slow"),
-		[]string{"--parity-scenario", "live"},
+		[]string{"--parity-scenario", "all"},
 	)
 	if !ok {
 		return
 	}
+	// This child, unlike the refused one, claims a port slot of its own.
+	if !check(r, !strings.contains(output, "port slots are taken"), "no port slot was free for the child run") {
+		return
+	}
+	check(r, exit_code != 0, "the run exited 0:\n%s", output)
+	check(r, !strings.contains(output, "live-pipe"), "the run went on past the scenario the clock slipped in:\n%s", output)
 	// The premise: the run started on the clock the case set as right.
 	check(r, strings.contains(output, "clock:     0.001s slow"), "the run did not start on the clock the case set:\n%s", output)
 	check(
