@@ -40,6 +40,10 @@ Parity_Mock_Run :: struct {
 	cached: map[string]Parity_Cached,
 	// How many references each upstream was, for the checks a strategy makes.
 	served: []int,
+	// Set when a race did not drain: every reference after it is in doubt, and
+	// a cause that holds for one query holds for the rest at the guard's cost
+	// each, so the scenario ends there.
+	undrained: bool,
 }
 
 @(private = "file")
@@ -104,6 +108,9 @@ run_parity_scenario :: proc(r: ^Runner, opts: Parity_Options, s: Parity_Scenario
 	defer delete(run.served)
 
 	for i in 0 ..< opts.runs {
+		if run.undrained {
+			break
+		}
 		parity_one_mock(&run, &g, i)
 		// The generator allocates a query and the comparator a page of strings
 		// per iteration; without this a long run grows without bound.
@@ -150,7 +157,7 @@ parity_one_mock :: proc(run: ^Parity_Mock_Run, g: ^Parity_Gen, index: int) {
 	again where there is none - a ttl of zero, say - and either way it is
 	judged: against the reply that filled the entry, or against its own.
 	*/
-	if run.s.cache {
+	if run.s.cache && !run.undrained {
 		parity_settle(run, q, index)
 	}
 }
@@ -177,7 +184,45 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 		stats.unanswered += 1
 		return
 	}
+	// Before the drain: the server's entry dates from its answer, and an entry
+	// stamped up to the drain's guard later would read younger than it is.
+	answered_at := time.now()
 	reference, from, asked := parity_upstreams_reference(run.ups, q)
+	/*
+	The race's losers have to be in before the next ask resets the mocks; see
+	`parity_upstreams_drain`. One that is not, by the time no leg can still be
+	running, is a member the race did not ask or a mock that did not answer -
+	either way the next ask's reference is in doubt, and it fails here, under
+	its own name, rather than as a divergence on the next query.
+	*/
+	if asked && run.s.strategy == "race" && !parity_upstreams_drain(run.ups, q, time.tick_add(time.tick_now(), PARITY_UPSTREAM_TIMEOUT)) {
+		stats.failures += 1
+		run.undrained = true
+		// What each member has on record, which tells a member never asked
+		// (count 0) from a stub never retried and a reply to another question.
+		sb := strings.builder_make(context.temp_allocator)
+		for _, i in run.ups.mocks {
+			reply, count := parity_upstream_last_reply(run.ups, i)
+			fmt.sbprintf(
+				&sb,
+				"\n    upstream %d: %d replies since the reset, last whole %v, answers this question %v",
+				i,
+				count,
+				parity_whole(reply),
+				parity_answers_question(reply, q),
+			)
+		}
+		fail(
+			run.r,
+			"query %d: %s: an upstream in the race had sent no whole reply %v after the answer; the scenario stops here%s\n    reproduce: --parity-seed %d --parity-runs %d",
+			index,
+			q.desc,
+			PARITY_UPSTREAM_TIMEOUT,
+			strings.to_string(sb),
+			run.opts.seed,
+			index + 1,
+		)
+	}
 
 	/*
 	Blocked by name, unless the question is one the server refuses before it
@@ -198,7 +243,7 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 		parity_check_route(run, q, from)
 		run.served[from] += 1
 		if run.s.cache {
-			parity_cache_store(&run.cached, q, reference)
+			parity_cache_store(&run.cached, q, reference, answered_at)
 		}
 	} else {
 		entry, found := run.cached[parity_cache_key(q)]

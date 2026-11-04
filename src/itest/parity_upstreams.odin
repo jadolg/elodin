@@ -1,5 +1,6 @@
 package itest
 
+import "base:runtime"
 import "core:slice"
 import "core:strings"
 import "core:time"
@@ -83,13 +84,14 @@ The reply this query was answered from, and which upstream sent it.
 `asked` is false when no upstream answered this question since the last reset,
 which is the server having answered from its own mouth.
 
-A reply is only taken for this query if it answers this query's question. The
-race strategy is why: the slower upstream's reply to the previous query can land
-after the reset, and read without the check it would be the reference for a
-question it never answered. Where several upstreams answered - the race again -
-any whole reply will do, because the zone is the same zone; one cut short for a
-datagram is only taken if there is nothing better, which there always is once
-the retry over TCP has come back.
+A reply is only taken for this query if it answers this query's question: a
+reply to an earlier query that lands after the reset would otherwise be the
+reference for a question it never answered. Under the race strategy
+`parity_upstreams_drain` keeps a loser from landing after the reset at all; the
+check is for the asks nothing drains. Where several upstreams answered - the
+race again - any whole reply will do, because the zone is the same zone; one cut
+short for a datagram is only taken if there is nothing better, which there
+always is once the retry over TCP has come back.
 */
 parity_upstreams_reference :: proc(
 	ups: ^Parity_Upstreams,
@@ -100,18 +102,12 @@ parity_upstreams_reference :: proc(
 	asked: bool,
 ) {
 	from = -1
-	for m, i in ups.mocks {
-		reply: []u8
-		count: int
-		if m != nil {
-			reply, count = mock_last_reply(m)
-		} else {
-			reply, count = doh2_mock_last_reply(ups.doh[i])
-		}
+	for _, i in ups.mocks {
+		reply, count := parity_upstream_last_reply(ups, i)
 		if count == 0 || reply == nil || !parity_answers_question(reply, q) {
 			continue
 		}
-		whole := len(reply) > 2 && reply[2] & 0x02 == 0
+		whole := parity_whole(reply)
 		if reference == nil || whole {
 			reference, from = reply, i
 		}
@@ -121,6 +117,58 @@ parity_upstreams_reference :: proc(
 		}
 	}
 	return
+}
+
+/*
+Wait until every upstream has sent a whole reply to `q`, or `deadline` passes,
+and say which.
+
+Under `strategy: race` the server answers from the first reply and leaves the
+losers running (`Race_State` in src/upstream/group.odin). A loser that lands
+after the next reset is read as a reply to the next ask - with the cache on,
+the next ask is usually the same question served from the cache, and nothing
+in a reply tells the two asks apart: the server sends the question folded to
+lower case under a fresh ID (`upstream_query` in src/server/resolver.odin). So
+the ask is not over until the race is: every member asked, and every member's
+last reply a whole answer to `q`, a stub's retry over TCP included (issue
+#573). A mock records a reply before it sends it, so that is the event.
+
+The mocks answer every query, so this ends on the event. `deadline` is a guard
+against a hang: a leg lives at most the upstream timeout, so once that has
+passed since the answer, nothing is left to land.
+*/
+parity_upstreams_drain :: proc(ups: ^Parity_Upstreams, q: Parity_Query, deadline: time.Tick) -> (drained: bool) {
+	for i in 0 ..< len(ups.mocks) {
+		for {
+			// Each poll copies and parses a reply; handed back every time
+			// rather than piling up to the deadline's worth.
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+			reply, count := parity_upstream_last_reply(ups, i)
+			// The count, because a reset clears it and not the reply: a whole
+			// answer to an earlier ask of `q` is still there to be read.
+			if count > 0 && parity_whole(reply) && parity_answers_question(reply, q) {
+				break
+			}
+			if time.tick_diff(time.tick_now(), deadline) <= 0 {
+				return false
+			}
+			time.sleep(time.Millisecond)
+		}
+	}
+	return true
+}
+
+// Upstream `i`'s last reply and its count since the reset, mock or DoH alike.
+parity_upstream_last_reply :: proc(ups: ^Parity_Upstreams, i: int) -> (reply: []u8, count: int) {
+	if ups.mocks[i] != nil {
+		return mock_last_reply(ups.mocks[i])
+	}
+	return doh2_mock_last_reply(ups.doh[i])
+}
+
+// Whether `reply` is a whole reply: long enough for its flags, and TC clear.
+parity_whole :: proc(reply: []u8) -> bool {
+	return len(reply) > 2 && reply[2] & 0x02 == 0
 }
 
 // Whether `reply` is an answer to `q`'s question, name compared without case.
@@ -173,14 +221,14 @@ parity_cache_key :: proc(q: Parity_Query, allocator := context.temp_allocator) -
 	return string(key)
 }
 
-parity_cache_store :: proc(store: ^map[string]Parity_Cached, q: Parity_Query, reply: []u8) {
+parity_cache_store :: proc(store: ^map[string]Parity_Cached, q: Parity_Query, reply: []u8, at: time.Time) {
 	key := parity_cache_key(q)
 	if old, found := store[key]; found {
 		delete(old.reply)
-		store[key] = Parity_Cached{reply = slice.clone(reply), at = time.now()}
+		store[key] = Parity_Cached{reply = slice.clone(reply), at = at}
 		return
 	}
-	store[strings.clone(key)] = Parity_Cached{reply = slice.clone(reply), at = time.now()}
+	store[strings.clone(key)] = Parity_Cached{reply = slice.clone(reply), at = at}
 }
 
 parity_cache_destroy :: proc(store: ^map[string]Parity_Cached) {
