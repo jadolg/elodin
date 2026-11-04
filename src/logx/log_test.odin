@@ -212,7 +212,7 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 	defer os.remove_all(dir)
 	path, _ := filepath.join({dir, "elodin.log"}, context.temp_allocator)
 
-	f, created, err := open_log(path)
+	f, created, err := open_log(path, false)
 	if !testing.expectf(t, err == nil, "cannot open %s: %v", path, err) {
 		return
 	}
@@ -220,10 +220,24 @@ test_log_file_is_created_owner_only :: proc(t: ^testing.T) {
 	testing.expect(t, created, "a new log file was not reported as created")
 
 	// Opened again, it is appended to, and not this open's to hand over.
-	again, created_again, err_again := open_log(path)
+	again, created_again, err_again := open_log(path, false)
 	if testing.expectf(t, err_again == nil, "cannot open %s again: %v", path, err_again) {
 		os.close(again)
 		testing.expect(t, !created_again, "an existing log file was reported as created")
+	}
+
+	// A symlink at the name is refused when asked to be - what a root start
+	// asks - and the file it names is neither created nor appended to.
+	target, _ := filepath.join({dir, "target"}, context.temp_allocator)
+	link, _ := filepath.join({dir, "link.log"}, context.temp_allocator)
+	if testing.expect(t, os.symlink(target, link) == nil, "cannot make the symlink") {
+		_, _, lerr := open_log(link, true)
+		testing.expect(t, lerr != nil, "a symlinked log was opened with symlinks refused")
+		testing.expect(t, !os.exists(target), "refusing a symlinked log created its target")
+		lf, _, ferr := open_log(link, false)
+		if testing.expectf(t, ferr == nil, "a symlinked log was refused when symlinks are followed: %v", ferr) {
+			os.close(lf)
+		}
 	}
 	st: posix.stat_t
 	if !testing.expect(t, posix.stat(strings.clone_to_cstring(path, context.temp_allocator), &st) == .OK, "cannot stat the log") {

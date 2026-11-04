@@ -30,7 +30,10 @@ Under `server.user` the file is opened again on `SIGHUP` as that account
 owner along with the process; one that was there already is left as it is, and
 the account must be able to write it. After a rotation the name must be
 creatable by the account too, so give logrotate `create <mode> <user> <group>`
-naming it, or a directory it can write.
+naming it, or a directory it can write. Started as root, elodin refuses a
+`log.file` that is a symlink and logs to stderr instead: a directory the service
+account can write would otherwise let it point the next root start at any file.
+Name the target itself.
 
 With `log.file` set, each line is one write to the file, not followed by a
 sync: `tail` and a shipper see it at once and a killed process loses none of

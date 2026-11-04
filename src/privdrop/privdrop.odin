@@ -250,12 +250,12 @@ already :: proc(id: Identity) -> bool {
 /*
 Hand a directory the process keeps writing to over to `id`.
 
-The blocklist cache is the one path elodin writes and owns that is still opened
-by name after the drop: the lists are downloaded before the listeners bind, so
-the files land under whoever started the process, and a refresh hours later
-would then fail on every one of them. Ownership moves with the process. The
-files an operator names and SIGHUP reads again are not taken over; see
-`can_reopen`.
+The blocklist cache is elodin's own output and opened by name after the drop:
+the lists are downloaded before the listeners bind, so the files land under
+whoever started the process, and a refresh hours later would then fail on every
+one of them. Ownership moves with the process, as a log file the process created
+does (`logx.hand_over`). The files an operator names and SIGHUP reads again are
+not taken over; see `can_reopen`.
 
 One level deep, because that is the shape of the directory - a flat set of
 `.list` files - and a recursive chown as root over a path an operator supplied

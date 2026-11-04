@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
 
@@ -48,7 +49,7 @@ init :: proc(level: Level, path: string = "") -> bool {
 	if path != "" {
 		f: ^os.File
 		created: bool
-		f, created, err = open_log(path)
+		f, created, err = open_log(path, refuse_symlink())
 		if err == nil {
 			state.file = f
 			state.to_file = true
@@ -83,7 +84,7 @@ reopen :: proc(path: string) -> bool {
 	created: bool
 	if path != "" {
 		err: os.Error
-		f, created, err = open_log(path)
+		f, created, err = open_log(path, refuse_symlink())
 		if err != nil {
 			return false
 		}
@@ -114,17 +115,42 @@ the mode it has; `readable_by_others` says when that mode is too wide.
 file or symlink already at the name fails it and is appended to as it is.
 */
 @(private)
-open_log :: proc(path: string) -> (f: ^os.File, created: bool, err: os.Error) {
-	OWNER_ONLY :: os.Permissions{.Read_User, .Write_User}
-	f, err = os.open(path, {.Write, .Create, .Excl, .Append}, OWNER_ONLY)
-	if err == nil {
-		return f, true, nil
+open_log :: proc(path: string, no_follow: bool) -> (f: ^os.File, created: bool, err: os.Error) {
+	cpath := strings.clone_to_cstring(path, context.temp_allocator)
+	/*
+	`core:sys/linux`, not `core:sys/posix`: the latter's O_NOFOLLOW is the x86
+	value on every Linux, which on arm64 is O_LARGEFILE - the flag would be
+	silently dropped there.
+	*/
+	base: linux.Open_Flags = {.WRONLY, .APPEND, .CREAT, .CLOEXEC}
+	if no_follow {
+		base += {.NOFOLLOW}
 	}
-	if err != .Exist {
-		return nil, false, err
+	owner_only: linux.Mode = {.IRUSR, .IWUSR}
+	fd, errno := linux.open(cpath, base + {.EXCL}, owner_only)
+	created = errno == .NONE
+	if !created {
+		if errno != .EEXIST {
+			return nil, false, os.Platform_Error(errno)
+		}
+		fd, errno = linux.open(cpath, base, owner_only)
+		if errno != .NONE {
+			return nil, false, os.Platform_Error(errno)
+		}
 	}
-	f, err = os.open(path, {.Write, .Create, .Append}, OWNER_ONLY)
-	return f, false, err
+	return os.new_file(uintptr(fd), path), created, nil
+}
+
+/*
+Whether a log opened now must not follow a symlink at its name: as root. Under
+`server.user` the dropped process may own the log's directory (the docs allow
+it), and a process that has been taken over could leave a symlink there for the
+next root start to append to - or create - whatever file it names. Unprivileged,
+following one reaches nothing the process could not open anyway.
+*/
+@(private)
+refuse_symlink :: proc() -> bool {
+	return posix.geteuid() == 0
 }
 
 /*

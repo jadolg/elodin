@@ -287,6 +287,22 @@ run_cli_cases :: proc(r: ^Runner) {
 		res = new_check(r, path, "check-nolog-dir")
 		check(r, res.exit_code == 0, "--check with a log file in a missing directory exited %d: %q", res.exit_code, res.output)
 		check(r, strings.contains(res.output, "cannot open the log file"), "--check did not say the log file cannot be opened: %q", res.output)
+
+		// Nor in a directory the account cannot write; root writes any.
+		if posix.geteuid() != 0 {
+			ro := filepath.join({r.work_dir, "read-only-dir"}, context.temp_allocator) or_else ""
+			_ = os.make_directory(ro)
+			_ = os.chmod(ro, {.Read_User, .Execute_User})
+			defer _ = os.chmod(ro, {.Read_User, .Write_User, .Execute_User})
+			in_ro := filepath.join({ro, "check.log"}, context.temp_allocator) or_else ""
+			_ = os.write_entire_file(
+				path,
+				transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", in_ro),
+			)
+			res = new_check(r, path, "check-nolog-ro")
+			check(r, res.exit_code == 0, "--check with a log file in a read-only directory exited %d: %q", res.exit_code, res.output)
+			check(r, strings.contains(res.output, "cannot open the log file"), "--check did not say a log file in a read-only directory cannot be created: %q", res.output)
+		}
 	}
 	end_case(r)
 

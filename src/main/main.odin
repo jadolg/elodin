@@ -466,12 +466,21 @@ main :: proc() {
 		fmt.eprintfln("elodin: cannot open the log file %q, logging to stderr instead", cfg.log.file)
 	}
 	// `--check` opens no log, but says what a start would find: a file it cannot
-	// open, or a directory that is not there.
+	// open, or a directory it cannot create one in.
 	if opts.check_only && cfg.log.file != "" {
-		parent := os.dir(cfg.log.file)
-		openable := os.is_dir(parent if parent != "" else ".")
+		openable: bool
 		if os.exists(cfg.log.file) {
 			openable = privdrop.can_reopen(cfg.log.file, true)
+		} else {
+			parent := os.dir(cfg.log.file)
+			cparent := strings.clone_to_cstring(parent if parent != "" else ".", context.temp_allocator)
+			openable = posix.access(cparent, {.W_OK, .X_OK}) == .OK
+		}
+		// A start as root refuses a symlink there (`logx.refuse_symlink`).
+		st: posix.stat_t
+		clog := strings.clone_to_cstring(cfg.log.file, context.temp_allocator)
+		if privdrop.is_root() && posix.lstat(clog, &st) == .OK && posix.S_ISLNK(st.st_mode) {
+			openable = false
 		}
 		if !openable {
 			fmt.eprintfln("elodin: cannot open the log file %q; a start would log to stderr instead", cfg.log.file)
@@ -926,12 +935,13 @@ everything from here on is parsing whatever arrives on those sockets. The
 sockets themselves are already open, so the process keeps serving on them
 whoever it becomes.
 
-The blocklist cache goes over first. It is the one path elodin writes and owns
-that is still opened by name afterwards - the lists were downloaded above, as
-root, and a refresh some hours later reopens them - so without this the cache
-would silently stop being written the moment its owner changed. The files the
-operator names are not taken over; `warn_out_of_reach` names those the new
-account cannot open. Only with blocking on, so a directory
+The blocklist cache goes over first, then a log file this process created
+(`logx.hand_over`): both are elodin's own output and opened by name afterwards -
+the lists were downloaded above, as root, and a refresh some hours later reopens
+them - so without this the cache would silently stop being written the moment
+its owner changed. Files that were there already are not taken over;
+`warn_out_of_reach` names those the new account cannot open. The cache only with
+blocking on, so a directory
 that is not elodin's - a shared one, named but unused - is not taken over for
 nothing. A reload that turns blocking on later finds it as it is; see
 `docs/install.md`.
