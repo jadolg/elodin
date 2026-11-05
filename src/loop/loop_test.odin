@@ -1,6 +1,8 @@
 package loop
 
+import "core:fmt"
 import "core:net"
+import "core:strings"
 import "core:sync"
 import "core:sys/linux"
 import "core:testing"
@@ -365,8 +367,9 @@ test_a_wait_on_a_quiet_descriptor_times_out :: proc(t: ^testing.T) {
 	_, _ = spawn(r.l, proc(data: rawptr) {
 		s := (^Shared)(data)
 		s.p.result = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), 20 * time.Millisecond))
-		// Nothing is registered once the wait is over.
-		s.p.value = len(current_loop().fds)
+		// Nobody is waiting once the wait is over.
+		w := current_loop().fds[s.fd]
+		s.p.value = 0 if w == nil else len(w.waiters)
 		sync.sema_post(&s.p.done)
 	}, &s)
 	testing.expect(t, sync.sema_wait_with_timeout(&s.p.done, WAIT))
@@ -417,6 +420,359 @@ test_two_fibers_wait_on_one_descriptor :: proc(t: ^testing.T) {
 	_, _ = linux.write(b, transmute([]u8)string("x"))
 	testing.expect(t, sync.sema_wait_with_timeout(&s.reader.done, WAIT))
 	testing.expect_value(t, s.reader.result, Wait_Result.Ready)
+}
+
+/*
+Fibers an event wakes run in the order they parked, so the longest waiter on a
+shared socket is not the last to get at it every time.
+*/
+@(test)
+test_waiters_are_woken_in_the_order_they_parked :: proc(t: ^testing.T) {
+	a, b, paired := socket_pair(t)
+	if !paired {
+		return
+	}
+	defer linux.close(a)
+	defer linux.close(b)
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		fd:     linux.Fd,
+		parked: Sema,
+		done:   sync.Sema,
+		order:  [3]int,
+		ran:    int,
+		next:   int,
+	}
+	s := Shared {
+		fd = a,
+	}
+	for _ in 0 ..< 3 {
+		_, _ = spawn(r.l, proc(data: rawptr) {
+			s := (^Shared)(data)
+			me := s.next
+			s.next += 1
+			sema_post(&s.parked)
+			_ = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), WAIT))
+			s.order[s.ran] = me
+			s.ran += 1
+			sync.sema_post(&s.done)
+		}, &s)
+		testing.expect(t, sema_wait_with_timeout(&s.parked, WAIT))
+	}
+	_, _ = linux.write(b, transmute([]u8)string("x"))
+	for _ in 0 ..< 3 {
+		testing.expect(t, sync.sema_wait_with_timeout(&s.done, WAIT))
+	}
+	testing.expect_value(t, s.order, [3]int{0, 1, 2})
+}
+
+/*
+A descriptor stays in epoll's interest list between waits, so a wait that parks
+costs one `epoll_ctl` - the re-arm - rather than an add and a remove (#594).
+Read off `/proc/self/fdinfo` for the loop's epoll descriptor, which lists every
+registration it holds. Two waits, one that times out and one that is woken, and
+the descriptor is still listed after both.
+*/
+@(test)
+test_a_descriptor_stays_registered_between_waits :: proc(t: ^testing.T) {
+	a, b, paired := socket_pair(t)
+	if !paired {
+		return
+	}
+	defer linux.close(a)
+	defer linux.close(b)
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		p:       Probe,
+		fd:      linux.Fd,
+		woken:   Wait_Result,
+		parked:  Sema,
+		listed:  [2]bool,
+	}
+	s := Shared {
+		fd = a,
+	}
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		s.p.result = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), 10 * time.Millisecond))
+		s.listed[0] = epoll_lists(current_loop().epfd, s.fd)
+		sema_post(&s.parked)
+		s.woken = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), WAIT))
+		s.listed[1] = epoll_lists(current_loop().epfd, s.fd)
+		sync.sema_post(&s.p.done)
+	}, &s)
+	testing.expect(t, sema_wait_with_timeout(&s.parked, WAIT))
+	_, _ = linux.write(b, transmute([]u8)string("x"))
+	testing.expect(t, sync.sema_wait_with_timeout(&s.p.done, WAIT))
+	testing.expect_value(t, s.p.result, Wait_Result.Timeout)
+	testing.expect_value(t, s.woken, Wait_Result.Ready)
+	testing.expect(t, s.listed[0], "a wait that timed out took the descriptor out of epoll")
+	testing.expect(t, s.listed[1], "a wait that was woken took the descriptor out of epoll")
+}
+
+/*
+A registration left armed by a wait that timed out is not trusted by the next
+wait on the same number, which may be another descriptor by then: `dup2` puts a
+new socket under the number, which takes the old one's registration away, and a
+wait on the new one is still woken by what arrives on it.
+*/
+@(test)
+test_a_number_handed_out_again_is_registered_afresh :: proc(t: ^testing.T) {
+	a, b, paired := socket_pair(t)
+	if !paired {
+		return
+	}
+	defer linux.close(a)
+	defer linux.close(b)
+	c, d, paired2 := socket_pair(t)
+	if !paired2 {
+		return
+	}
+	defer linux.close(c)
+	defer linux.close(d)
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		p:      Probe,
+		fd:     linux.Fd,
+		c:      linux.Fd,
+		parked: Sema,
+		first:  Wait_Result,
+		reused: bool,
+	}
+	s := Shared {
+		fd = a,
+		c  = c,
+	}
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		s.first = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), 10 * time.Millisecond))
+		// The number now names `c`'s socket, and the old one is closed.
+		got, err := linux.dup2(s.c, s.fd)
+		s.reused = err == .NONE && got == s.fd
+		sema_post(&s.parked)
+		s.p.result = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), WAIT))
+		sync.sema_post(&s.p.done)
+	}, &s)
+	testing.expect(t, sema_wait_with_timeout(&s.parked, WAIT))
+	_, _ = linux.write(d, transmute([]u8)string("x"))
+	testing.expect(t, sync.sema_wait_with_timeout(&s.p.done, WAIT))
+	testing.expect_value(t, s.first, Wait_Result.Timeout)
+	testing.expect(t, s.reused, "the number was not handed to the new socket")
+	testing.expect_value(t, s.p.result, Wait_Result.Ready)
+}
+
+/*
+A waiter an event did not wake, on a registration that cannot be armed again, is
+woken to re-check rather than left parked: with no deadline it would never wake.
+
+A pipe's read end, with a reader and a writer parked on it (a read end is never
+writable). A third fiber puts /dev/null - which epoll refuses - under the number,
+while a `dup` keeps the pipe and so its registration alive, then writes. The
+event wakes the reader, and the re-arm for the writer fails.
+*/
+@(test)
+test_a_waiter_left_by_a_failed_re_arm_is_woken :: proc(t: ^testing.T) {
+	pipe: [2]linux.Fd
+	if !testing.expect(t, linux.pipe2(&pipe, {.CLOEXEC}) == .NONE, "no pipe") {
+		return
+	}
+	defer linux.close(pipe[0])
+	defer linux.close(pipe[1])
+	keep, derr := linux.dup(pipe[0])
+	if !testing.expect(t, derr == .NONE, "cannot dup the read end") {
+		return
+	}
+	defer linux.close(keep)
+	null, nerr := linux.open("/dev/null", {.CLOEXEC})
+	if !testing.expect(t, nerr == .NONE, "cannot open /dev/null") {
+		return
+	}
+	defer linux.close(null)
+	// The premise: epoll refuses /dev/null, so the re-arm on its number fails.
+	// Checked before it is closed: stdin is closed under `odin test`, so a failed
+	// create's zero would close another test's descriptor.
+	scratch, serr := linux.epoll_create1({.FDCLOEXEC})
+	if !testing.expect(t, serr == .NONE, "no scratch epoll") {
+		return
+	}
+	ev := linux.EPoll_Event {
+		events = {.IN},
+	}
+	refused := linux.epoll_ctl(scratch, .ADD, null, &ev) != .NONE
+	linux.close(scratch)
+	if !testing.expect(t, refused, "epoll took /dev/null, so nothing here fails the re-arm") {
+		return
+	}
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		reader, writer: Probe,
+		read_end:       linux.Fd,
+		write_end:      linux.Fd,
+		null:           linux.Fd,
+	}
+	s := Shared {
+		read_end  = pipe[0],
+		write_end = pipe[1],
+		null      = null,
+	}
+	// Spawned in order, and each parks before the next runs.
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		s.reader.result = wait_fd(s.read_end, {.In}, time.tick_add(time.tick_now(), WAIT))
+		sync.sema_post(&s.reader.done)
+	}, &s)
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		s.writer.result = wait_fd(s.read_end, {.Out}, time.tick_add(time.tick_now(), WAIT))
+		sync.sema_post(&s.writer.done)
+	}, &s)
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		_, _ = linux.dup2(s.null, s.read_end)
+		_, _ = linux.write(s.write_end, transmute([]u8)string("x"))
+	}, &s)
+	testing.expect(t, sync.sema_wait_with_timeout(&s.reader.done, 2 * WAIT))
+	testing.expect_value(t, s.reader.result, Wait_Result.Ready)
+	testing.expect(t, sync.sema_wait_with_timeout(&s.writer.done, 2 * WAIT))
+	testing.expect_value(t, s.writer.result, Wait_Result.Ready)
+}
+
+/*
+The same for a wait that fails to arm on its way in: those already parked on the
+number are woken to re-check, rather than left to their deadlines. A reader
+parks on a pipe's read end, /dev/null is put under the number, and a second wait
+on it fails; nothing is ever written.
+*/
+@(test)
+test_a_failed_wait_wakes_those_parked_before_it :: proc(t: ^testing.T) {
+	pipe: [2]linux.Fd
+	if !testing.expect(t, linux.pipe2(&pipe, {.CLOEXEC}) == .NONE, "no pipe") {
+		return
+	}
+	defer linux.close(pipe[0])
+	defer linux.close(pipe[1])
+	keep, derr := linux.dup(pipe[0])
+	if !testing.expect(t, derr == .NONE, "cannot dup the read end") {
+		return
+	}
+	defer linux.close(keep)
+	null, nerr := linux.open("/dev/null", {.CLOEXEC})
+	if !testing.expect(t, nerr == .NONE, "cannot open /dev/null") {
+		return
+	}
+	defer linux.close(null)
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		reader, late: Probe,
+		read_end:     linux.Fd,
+		null:         linux.Fd,
+	}
+	s := Shared {
+		read_end = pipe[0],
+		null     = null,
+	}
+	// Spawned in order, and the reader parks before the second runs.
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		s.reader.result = wait_fd(s.read_end, {.In}, time.tick_add(time.tick_now(), WAIT))
+		sync.sema_post(&s.reader.done)
+	}, &s)
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		_, _ = linux.dup2(s.null, s.read_end)
+		s.late.result = wait_fd(s.read_end, {.In}, time.tick_add(time.tick_now(), WAIT))
+		sync.sema_post(&s.late.done)
+	}, &s)
+	testing.expect(t, sync.sema_wait_with_timeout(&s.late.done, 2 * WAIT))
+	testing.expect_value(t, s.late.result, Wait_Result.Failed)
+	testing.expect(t, sync.sema_wait_with_timeout(&s.reader.done, 2 * WAIT))
+	testing.expect_value(t, s.reader.result, Wait_Result.Ready)
+}
+
+/*
+A descriptor epoll already holds when the loop first waits on it is armed by the
+MOD every wait makes, rather than the wait failing. Registered behind the loop's
+back here, armed for nothing.
+*/
+@(test)
+test_a_descriptor_epoll_already_holds_is_armed :: proc(t: ^testing.T) {
+	a, b, paired := socket_pair(t)
+	if !paired {
+		return
+	}
+	defer linux.close(a)
+	defer linux.close(b)
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	ev := linux.EPoll_Event {
+		events = {.ONESHOT},
+		data = {fd = a},
+	}
+	if !testing.expect(t, linux.epoll_ctl(r.l.epfd, .ADD, a, &ev) == .NONE, "could not register the descriptor") {
+		return
+	}
+	Shared :: struct {
+		p:      Probe,
+		fd:     linux.Fd,
+		parked: Sema,
+	}
+	s := Shared {
+		fd = a,
+	}
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		sema_post(&s.parked)
+		s.p.result = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), WAIT))
+		sync.sema_post(&s.p.done)
+	}, &s)
+	testing.expect(t, sema_wait_with_timeout(&s.parked, WAIT))
+	_, _ = linux.write(b, transmute([]u8)string("x"))
+	testing.expect(t, sync.sema_wait_with_timeout(&s.p.done, WAIT))
+	testing.expect_value(t, s.p.result, Wait_Result.Ready)
+}
+
+/*
+Whether epoll descriptor `epfd` holds a registration for `fd`. On stack buffers,
+since it runs on a fiber, whose scratch is not the test's.
+*/
+@(private = "file")
+epoll_lists :: proc(epfd, fd: linux.Fd) -> bool {
+	path_buf: [64]u8
+	path := fmt.bprintf(path_buf[:], "/proc/self/fdinfo/%d\x00", epfd)
+	info, err := linux.open(cstring(raw_data(path)), {})
+	if err != .NONE {
+		return false
+	}
+	defer linux.close(info)
+	data: [4096]u8
+	n, _ := linux.read(info, data[:])
+	want_buf: [32]u8
+	// "tfd:        3 events: ...", the number padded with spaces.
+	want := fmt.bprintf(want_buf[:], " %d events:", fd)
+	return strings.contains(string(data[:max(n, 0)]), want)
 }
 
 // Off a loop, the same call is `poll(2)`: what a test thread or the rebuild does.
@@ -1312,4 +1668,55 @@ test_a_cancel_made_before_the_start_is_drained_holds :: proc(t: ^testing.T) {
 	testing.expect(t, sync.sema_wait_with_timeout(&s.p.done, WAIT))
 	testing.expect(t, s.ran, "the fiber did not run")
 	testing.expect(t, s.cancelled, "the start undid a cancel made before it was drained")
+}
+
+/*
+A waiter that leaves - here by timing out - leaves the rest in the order they
+parked, so `dispatch_event` still wakes the longest waiter first.
+*/
+@(test)
+test_a_waiter_leaving_keeps_the_others_order :: proc(t: ^testing.T) {
+	a, b, paired := socket_pair(t)
+	if !paired {
+		return
+	}
+	defer linux.close(a)
+	defer linux.close(b)
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		fd:     linux.Fd,
+		parked: Sema,
+		done:   sync.Sema,
+		order:  [4]int,
+		ran:    int,
+		next:   int,
+	}
+	s := Shared {
+		fd = a,
+	}
+	for _ in 0 ..< 4 {
+		_, _ = spawn(r.l, proc(data: rawptr) {
+			s := (^Shared)(data)
+			me := s.next
+			s.next += 1
+			sema_post(&s.parked)
+			wait := 50 * time.Millisecond if me == 1 else WAIT
+			_ = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), wait))
+			s.order[s.ran] = me
+			s.ran += 1
+			sync.sema_post(&s.done)
+		}, &s)
+		testing.expect(t, sema_wait_with_timeout(&s.parked, WAIT))
+	}
+	// The short waiter times out and leaves before anything is readable.
+	testing.expect(t, sync.sema_wait_with_timeout(&s.done, WAIT))
+	_, _ = linux.write(b, transmute([]u8)string("x"))
+	for _ in 0 ..< 3 {
+		testing.expect(t, sync.sema_wait_with_timeout(&s.done, WAIT))
+	}
+	testing.expect_value(t, s.order, [4]int{1, 0, 2, 3})
 }

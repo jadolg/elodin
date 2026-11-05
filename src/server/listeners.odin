@@ -789,7 +789,7 @@ udp_loop :: proc(data: rawptr) {
 			live(ctx.server).cookies,
 			buf[:n],
 			client,
-			time.tick_now(),
+			loop.tick_now(),
 		)
 		switch verdict {
 		case .Allow:
@@ -1412,7 +1412,7 @@ udp_job :: proc(data: rawptr) {
 		live(s).limiter,
 		job.client,
 		len(response),
-		time.tick_now(),
+		loop.tick_now(),
 		.Proven if job.proven else .Datagram,
 	)
 	_, _ = loop.send_udp(job.socket, response, job.client)
@@ -1820,7 +1820,7 @@ accept_loop :: proc(data: rawptr) {
 		writing a reason takes a connection, and a connection is what is being
 		refused.
 		*/
-		if !conn_rate_check(live(ctx.server).limiter, client, time.tick_now()) {
+		if !conn_rate_check(live(ctx.server).limiter, client, loop.tick_now()) {
 			// The figure this client's own network is held to, which is the
 			// top-level one only where no override names it - see
 			// `prefix_response_budget`.
@@ -1975,29 +1975,22 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 	// Whether this connection has anything the close could take back, which is
 	// what decides whether the refusal below drains first - see `stream_linger`.
 	answered := false
+	reader: Stream_Reader
+	budget: Read_Budget
 	// A client pipelining queries the cache answers never lets this fiber park;
 	// its reads and writes step aside between them (`loop.take_turn`).
 	for {
 		/*
-		One budget for the length prefix and the body behind it, taken fresh per
-		message and not restarted by the bytes that arrive inside one - see
-		`Read_Budget`.
+		One deadline for the length prefix and the body behind it, started fresh
+		per message and not restarted by the bytes that arrive inside one - see
+		`Read_Budget`. The idle wait is read per message too, so a reload that
+		changes `client_timeout` reaches a connection that is already open; `armed`
+		keeps an unchanged one from being set again.
 		*/
-		budget := Read_Budget {
-			idle = client_timeout(s),
-		}
-
-		length_buf: [2]u8
-		if !conn_read_full(conn, length_buf[:], &budget) {
-			return
-		}
-		length := int(length_buf[0]) << 8 | int(length_buf[1])
-		if length < dns.HEADER_SIZE || length > dns.MAX_MESSAGE {
-			return
-		}
-
-		query := make([]u8, length, context.temp_allocator)
-		if !conn_read_full(conn, query, &budget) {
+		budget.idle = client_timeout(s)
+		budget.deadline = {}
+		query, read := stream_read_message(conn, &reader, &budget)
+		if !read {
 			return
 		}
 
@@ -2143,10 +2136,10 @@ would be time out of one of `max_connections` spent protecting nothing.
 @(private)
 stream_linger :: proc(conn: Conn) {
 	conn_set_read_timeout(conn, STREAM_LINGER_IDLE)
-	start := time.tick_now()
+	start := loop.tick_now()
 	chunk: [4096]u8
 	discarded := 0
-	for discarded < STREAM_LINGER_BYTES && time.tick_since(start) < STREAM_LINGER_TIMEOUT {
+	for discarded < STREAM_LINGER_BYTES && loop.tick_since(start) < STREAM_LINGER_TIMEOUT {
 		n, ok := conn_read(conn, chunk[:])
 		if !ok {
 			return
@@ -2247,13 +2240,16 @@ the receipt of a full DNS message, rather than on receipt of any part of a DNS
 message". So the reads that assemble one message share a deadline and shorten as
 it runs down.
 
-`deadline` is zero until the first byte of that message arrives, and that is the
-other half of the rule: a connection between questions is not assembling anything,
-so it waits `idle` for the first byte - which is the figure the idle timeout this
-server advertises states (RFC 7828) - and the message gets the whole of `idle`
-from that byte on. Spending the two out of one budget instead would close on a
-keep-alive client that asked late in the window and had its message split across
-segments, which is a client this server has no complaint about.
+`deadline` is zero until the first read made for that message returns bytes, and
+that is the other half of the rule: a connection between questions is not
+assembling anything, so it waits `idle` for the first byte - which is the figure
+the idle timeout this server advertises states (RFC 7828) - and the message gets
+the whole of `idle` from that read on. A message whose head came in behind the
+last one, in `Stream_Reader`'s read-ahead, has made no read yet: its next read
+waits `idle`, and the deadline starts there - one idle wait and one deadline, as
+for a message sent alone. Spending the two out of one budget instead would close
+on a keep-alive client that asked late in the window and had its message split
+across segments, which is a client this server has no complaint about.
 
 A non-positive `idle` is no receive timeout on the socket at all - see
 `test_a_timeout_that_cannot_be_stated_is_left_off` for the other half of what that
@@ -2264,6 +2260,10 @@ setting means - and leaves both unbounded, rather than turning "wait forever" in
 Read_Budget :: struct {
 	idle:     time.Duration,
 	deadline: time.Tick,
+	// The wait last put on the socket, zero when nothing is known to be there. A
+	// budget kept across a connection's messages skips setting the idle wait it
+	// set for the last one.
+	armed:    time.Duration,
 }
 
 /*
@@ -2271,17 +2271,13 @@ Give this read the idle wait or what is left of the message's deadline, and say
 when the deadline is spent.
 
 `conn_set_read_timeout` rather than a bare `net.set_option`, because over DoT and
-DoH the socket option stopped applying at the handshake - see there. The wait is
-set on every read rather than only when it changes: the message that ran the
-deadline down leaves a short one behind it, and the idle wait for the next message
-is where that is put back.
-
-What that costs is a `setsockopt` per read on the plain-TCP path where there was
-none before - two per message, one for the idle wait and one for the deadline the
-body is read against, since a deadline running down is a different figure every
-time and there is nothing to skip. Over DoT and DoH it costs an atomic store.
-Keeping a socket armed with a wait the message has already spent is not a
-cheaper version of this, it is the bug.
+DoH the socket option stopped applying at the handshake - see there. A read
+against the deadline sets the wait every time, since a deadline running down is a
+different figure every time; the idle wait is set when `armed` says the socket
+holds something else, which is how the message that ran the deadline down has its
+short wait put back for the next one. Keeping a socket armed with a wait the
+message has already spent is the bug this avoids. On the plain-TCP path each
+setting is a `setsockopt`, over DoT and DoH an atomic store.
 
 Floored at a microsecond because `net.set_option` carries the wait to the kernel
 as a `timeval`, and anything under a microsecond truncates to a zero one - which
@@ -2298,14 +2294,18 @@ conn_arm_read :: proc(c: Conn, b: ^Read_Budget, now: time.Tick) -> bool {
 		return true
 	}
 	if b.deadline == (time.Tick{}) {
-		conn_set_read_timeout(c, b.idle)
+		if b.armed != b.idle {
+			conn_set_read_timeout(c, b.idle)
+			b.armed = b.idle
+		}
 		return true
 	}
 	left := time.tick_diff(now, b.deadline)
 	if left <= 0 {
 		return false
 	}
-	conn_set_read_timeout(c, max(left, time.Microsecond))
+	b.armed = max(left, time.Microsecond)
+	conn_set_read_timeout(c, b.armed)
 	return true
 }
 
@@ -2313,14 +2313,75 @@ conn_arm_read :: proc(c: Conn, b: ^Read_Budget, now: time.Tick) -> bool {
 // that every reader shares one answer to what counts as the message beginning.
 @(private)
 conn_read_budgeted :: proc(c: Conn, buf: []u8, b: ^Read_Budget) -> (n: int, ok: bool) {
-	if !conn_arm_read(c, b, time.tick_now()) {
+	if !conn_arm_read(c, b, loop.tick_now()) {
 		return 0, false
 	}
 	n, ok = conn_read(c, buf)
 	if ok && b.idle > 0 && b.deadline == (time.Tick{}) {
-		b.deadline = time.tick_add(time.tick_now(), b.idle)
+		b.deadline = time.tick_add(loop.tick_now(), b.idle)
 	}
 	return n, ok
+}
+
+/*
+What a DNS stream has read and not yet answered.
+
+A query and its length prefix arrive in one segment, and one `recv` into this
+takes both, rather than one for the prefix and one for the body (#594). What
+arrives behind the message - a pipelined query - waits here for the next one.
+The size covers any query a stub sends; a longer message is read past it.
+*/
+STREAM_READ_AHEAD :: 512
+
+@(private)
+Stream_Reader :: struct {
+	buf:   [STREAM_READ_AHEAD]u8,
+	start: int,
+	end:   int,
+}
+
+/*
+The next length-prefixed message (RFC 1035 4.2.2, RFC 7766 8) on the stream,
+or false when the connection ended, the budget ran out, or the prefix gives a
+length no DNS message has. The message is in `r` or the temp allocator, and is
+good until the next call.
+*/
+@(private)
+stream_read_message :: proc(c: Conn, r: ^Stream_Reader, b: ^Read_Budget) -> (msg: []u8, ok: bool) {
+	for r.end - r.start < 2 {
+		if !stream_fill(c, r, b) {
+			return nil, false
+		}
+	}
+	length := int(r.buf[r.start]) << 8 | int(r.buf[r.start + 1])
+	if length < dns.HEADER_SIZE || length > dns.MAX_MESSAGE {
+		return nil, false
+	}
+	r.start += 2
+	if length <= len(r.buf) {
+		for r.end - r.start < length {
+			if !stream_fill(c, r, b) {
+				return nil, false
+			}
+		}
+		msg = r.buf[r.start:][:length]
+		r.start += length
+		return msg, true
+	}
+	msg = make([]u8, length, context.temp_allocator)
+	got := copy(msg, r.buf[r.start:r.end])
+	r.start, r.end = 0, 0
+	return msg, conn_read_full(c, msg[got:], b)
+}
+
+// One read into the free end of `r`, its unread bytes moved to the front first.
+@(private)
+stream_fill :: proc(c: Conn, r: ^Stream_Reader, b: ^Read_Budget) -> bool {
+	r.end = copy(r.buf[:], r.buf[r.start:r.end])
+	r.start = 0
+	n, ok := conn_read_budgeted(c, r.buf[r.end:], b)
+	r.end += n if ok else 0
+	return ok
 }
 
 // Read exactly `len(buf)` bytes, within what the budget has left. The budget is a
@@ -2352,7 +2413,7 @@ conn_write_all :: proc(c: Conn, buf: []u8) -> bool {
 
 @(private)
 now_http_date :: proc(allocator := context.allocator) -> string {
-	return http_date(time.now(), allocator)
+	return http_date(loop.now(), allocator)
 }
 
 /*

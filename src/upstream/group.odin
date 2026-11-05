@@ -376,7 +376,7 @@ resolve_insisting :: proc(
 	*/
 	budget := query_budget(g)
 	if deadline != nil && deadline^ != {} {
-		left := time.tick_diff(time.tick_now(), deadline^)
+		left := time.tick_diff(loop.tick_now(), deadline^)
 		if left <= 0 {
 			logx.debugf("this query's upstream deadline has passed, not asking the group again for it")
 			return nil, nil, .Deadline
@@ -391,7 +391,7 @@ resolve_insisting :: proc(
 	unreachable: [dynamic]^Upstream
 	unreachable.allocator = context.temp_allocator
 
-	started := time.tick_now()
+	started := loop.tick_now()
 	response, winner, err = resolve_within(g, query, budget, allocator, &unreachable)
 	if err != .None {
 		return response, winner, err
@@ -557,14 +557,14 @@ resolve_insisting :: proc(
 	expiry one query pays for it again, which is the arrangement every other
 	part of this file already makes.
 	*/
-	budget = min(g.timeout, budget - time.tick_since(started))
+	budget = min(g.timeout, budget - loop.tick_since(started))
 	spent: time.Duration
 	// The member that gave the first reply, which `winner` stops naming once a
 	// later reply takes its place in hand.
 	first := winner
 	for u in g.servers {
 		if spent >= budget {
-			logx.debugf("this query has waited %v on its upstreams, leaving the rest of the group unswept", time.tick_since(started))
+			logx.debugf("this query has waited %v on its upstreams, leaving the rest of the group unswept", loop.tick_since(started))
 			break
 		}
 		if u == first {
@@ -620,13 +620,13 @@ resolve_insisting :: proc(
 			logx.debugf("upstream %s is not known to be answering, not held out for", u.spec.name)
 			continue
 		}
-		before := time.tick_now()
+		before := loop.tick_now()
 		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
 		// Charged whatever the exchange did, because what is being bounded is
 		// the client's wait and an upstream can spend the time either way: a
 		// member that recurses for most of the timeout and then says SERVFAIL
 		// has cost this query exactly what a member that said nothing did.
-		spent += time.tick_since(before)
+		spent += loop.tick_since(before)
 		// A failed exchange is left to `exchange`, which says why.
 		if xerr != .None {
 			continue
@@ -1048,7 +1048,7 @@ resolve_sequential :: proc(
 					continue
 				}
 				asked[i] = round
-				before := time.tick_now()
+				before := loop.tick_now()
 				resp, xerr := exchange(u, query, g.timeout, allocator)
 				if xerr == .None {
 					return resp, u, .None
@@ -1057,7 +1057,7 @@ resolve_sequential :: proc(
 				// member's timeout failing on included; `exchange` records that
 				// failure like any other, so such a member parks rather than
 				// taking the budget on every query.
-				spent += time.tick_since(before)
+				spent += loop.tick_since(before)
 				last_err = xerr
 				if unreachable != nil {
 					append(unreachable, u)

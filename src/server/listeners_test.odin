@@ -1151,3 +1151,136 @@ test_udp_job_is_one_allocation :: proc(t: ^testing.T) {
 	testing.expect_value(t, track.total_free_count, 1)
 	testing.expect_value(t, len(track.allocation_map), 0)
 }
+
+/*
+A stream query is one read, with its length prefix, and what a client pipelined
+behind it waits in the reader for the next message (#594).
+
+A read for the prefix and one for the body would be three `recv` per TCP query,
+with the one that finds the queue empty, against UDP's one. Sent here in one
+write: a query, a message longer than the read-ahead, and the prefix of a third with half
+its body, then the rest of it. The first read takes the first query and as much
+of the second as fits, which is the one read the change is for; the long message
+is assembled across the buffer and the socket; and the third, split inside
+itself, still arrives whole.
+*/
+@(test)
+test_a_stream_query_and_its_prefix_are_one_read :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+		return
+	}
+	defer net.close(listener)
+	bound, _ := net.bound_endpoint(listener)
+	client, derr := net.dial_tcp(bound)
+	if !testing.expectf(t, derr == nil, "cannot connect: %v", derr) {
+		return
+	}
+	defer net.close(client)
+	accepted, _, aerr := net.accept_tcp(listener)
+	if !testing.expectf(t, aerr == nil, "nothing connected: %v", aerr) {
+		return
+	}
+	defer net.close(accepted)
+	_ = net.set_option(accepted, .Receive_Timeout, 5 * time.Second)
+
+	LONG :: STREAM_READ_AHEAD + 100
+	wire: [dynamic]u8
+	defer delete(wire)
+	frame :: proc(wire: ^[dynamic]u8, length: int, fill: u8) {
+		append(wire, u8(length >> 8), u8(length))
+		for _ in 0 ..< length {
+			append(wire, fill)
+		}
+	}
+	frame(&wire, dns.HEADER_SIZE, 'a')
+	frame(&wire, LONG, 'b')
+	frame(&wire, dns.HEADER_SIZE + 4, 'c')
+	tail := len(wire) - 8
+	_, serr := net.send_tcp(client, wire[:tail])
+	if !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
+		return
+	}
+
+	conn := Conn {
+		socket = accepted,
+	}
+	reader: Stream_Reader
+	budget := Read_Budget {
+		idle = 5 * time.Second,
+	}
+	first, ok := stream_read_message(conn, &reader, &budget)
+	if !testing.expect(t, ok, "the first query never arrived") {
+		return
+	}
+	testing.expect_value(t, len(first), dns.HEADER_SIZE)
+	testing.expect_value(t, first[0], 'a')
+	testing.expectf(
+		t,
+		reader.end == STREAM_READ_AHEAD,
+		"the read that took the first query filled %d of %d bytes: a query and its prefix took a read each",
+		reader.end,
+		STREAM_READ_AHEAD,
+	)
+
+	budget.deadline = {}
+	second, ok2 := stream_read_message(conn, &reader, &budget)
+	if !testing.expect(t, ok2, "the long message never arrived") {
+		return
+	}
+	testing.expect_value(t, len(second), LONG)
+	testing.expect(t, second[0] == 'b' && second[LONG - 1] == 'b', "the long message was not read whole")
+
+	_, serr = net.send_tcp(client, wire[tail:])
+	testing.expectf(t, serr == nil, "cannot send the tail: %v", serr)
+	budget.deadline = {}
+	third, ok3 := stream_read_message(conn, &reader, &budget)
+	if !testing.expect(t, ok3, "the split message never arrived") {
+		return
+	}
+	testing.expect_value(t, len(third), dns.HEADER_SIZE + 4)
+	testing.expect(t, third[0] == 'c' && third[len(third) - 1] == 'c', "the split message was not read whole")
+	free_all(context.temp_allocator)
+}
+
+/*
+A budget kept across a connection's messages sets the idle wait once, not once
+per message (#594), and still puts it back after a message whose deadline set a
+shorter one.
+
+Asserted on a TLS connection because there the figure that was set can be read
+back: a sentinel written behind the budget's back survives an idle arm that has
+nothing to change, and is replaced by one after a deadline arm.
+*/
+@(test)
+test_an_unchanged_idle_wait_is_not_set_again :: proc(t: ^testing.T) {
+	tls := tlsx.Conn{}
+	conn := Conn {
+		tls = &tls,
+	}
+	budget := Read_Budget {
+		idle = 10 * time.Second,
+	}
+	now := time.tick_now()
+	SENTINEL :: 7 * time.Second
+
+	testing.expect(t, conn_arm_read(conn, &budget, now), "an idle arm refused")
+	testing.expect_value(t, time.Duration(tls.read_timeout_ns), 10 * time.Second)
+
+	tlsx.set_read_timeout(&tls, SENTINEL)
+	testing.expect(t, conn_arm_read(conn, &budget, now), "an idle arm refused")
+	testing.expect_value(t, time.Duration(tls.read_timeout_ns), SENTINEL)
+
+	budget.deadline = time.tick_add(now, 3 * time.Second)
+	testing.expect(t, conn_arm_read(conn, &budget, now), "a deadline arm refused")
+	testing.expect_value(t, time.Duration(tls.read_timeout_ns), 3 * time.Second)
+
+	budget.deadline = {}
+	testing.expect(t, conn_arm_read(conn, &budget, now), "an idle arm refused")
+	testing.expectf(
+		t,
+		time.Duration(tls.read_timeout_ns) == 10 * time.Second,
+		"the next message waits %v, what the last one's deadline left, not the idle wait",
+		time.Duration(tls.read_timeout_ns),
+	)
+}

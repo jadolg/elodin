@@ -7,6 +7,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:h2"
+import "elodin:loop"
 import "elodin:netx"
 import "elodin:tlsx"
 
@@ -75,7 +76,7 @@ exchange_doh_h2 :: proc(
 	// A refused stream is retried once too, on whatever get_h2_conn hands out
 	// next - usually the same, still healthy, connection.
 	for attempt in 0 ..< 2 {
-		remaining := time.tick_diff(time.tick_now(), deadline)
+		remaining := time.tick_diff(loop.tick_now(), deadline)
 		if remaining <= 0 {
 			return nil, .Timeout
 		}
@@ -87,7 +88,7 @@ exchange_doh_h2 :: proc(
 		// this attempt started with: a caller queued behind somebody else's
 		// handshake has already spent part of its budget by the time it gets
 		// a connection.
-		remaining = time.tick_diff(time.tick_now(), deadline)
+		remaining = time.tick_diff(loop.tick_now(), deadline)
 		if remaining <= 0 {
 			if is_h2 {
 				h2.client_unref(conn)
@@ -179,13 +180,13 @@ exchange_doh_h1 :: proc(
 	A `Tick` rather than a `Time`, because it is a bound on waiting rather than
 	a moment anyone reads off a clock, and the wall clock steps.
 	*/
-	deadline := time.tick_add(time.tick_now(), timeout)
+	deadline := time.tick_add(loop.tick_now(), timeout)
 	endpoint := endpoint_of(u) or_return
 
 	// Pooled connection first, then a fresh one; see exchange_pipelined for why a
 	// dead pooled connection must not count as an upstream failure.
 	for attempt in 0 ..< 2 {
-		remaining := time.tick_diff(time.tick_now(), deadline)
+		remaining := time.tick_diff(loop.tick_now(), deadline)
 		if remaining <= 0 {
 			return nil, .Timeout
 		}
@@ -319,7 +320,7 @@ fetch_url :: proc(
 	body: []u8,
 	err: Error,
 ) {
-	deadline := time.tick_add(time.tick_now(), total)
+	deadline := time.tick_add(loop.tick_now(), total)
 	current := url
 	// What the operator configured, which is what every later hop is judged
 	// against - rather than the hop before it, so a chain cannot walk itself
@@ -331,7 +332,7 @@ fetch_url :: proc(
 	for _ in 0 ..< 5 {
 		// Before the lookup, so a spent budget does not start one. The lookup
 		// itself is bounded by the bootstrap resolver's own timeout.
-		if time.tick_diff(time.tick_now(), deadline) <= 0 {
+		if time.tick_diff(loop.tick_now(), deadline) <= 0 {
 			return nil, .Timeout
 		}
 		scheme, host, path, port, host_only, purl_ok := split_http_url(current)
@@ -370,7 +371,7 @@ fetch_url :: proc(
 			tlsx.context_destroy(tls_ctx)
 		}
 
-		remaining := time.tick_diff(time.tick_now(), deadline)
+		remaining := time.tick_diff(loop.tick_now(), deadline)
 		if remaining <= 0 {
 			return nil, .Timeout
 		}

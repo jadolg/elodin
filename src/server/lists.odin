@@ -10,6 +10,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:filter"
 import "elodin:logx"
+import "elodin:loop"
 import "elodin:upstream"
 
 /*
@@ -475,7 +476,7 @@ fetch_list :: proc(cfg: ^config.Config, list: config.Block_List, ignore_fresh :=
 	// Skip the download when the cached copy is still within the refresh window.
 	path := list_cache_path(cfg, list)
 	if info, err := os.stat(path, context.temp_allocator); err == nil && !ignore_fresh {
-		age := time.diff(info.modification_time, time.now())
+		age := time.diff(info.modification_time, loop.now())
 		if age < cfg.blocking.refresh && copy_is_of(list, path) {
 			return "", .Cache_Is_Fresh
 		}

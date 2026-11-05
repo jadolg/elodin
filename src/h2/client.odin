@@ -971,7 +971,7 @@ client_request :: proc(
 	}
 	end_stream: u8 = FLAG_END_STREAM if len(req.body) == 0 else 0
 	// A `Tick`, not a `Time`: this bounds waiting, and the wall clock steps.
-	deadline := time.tick_add(time.tick_now(), timeout)
+	deadline := time.tick_add(loop.tick_now(), timeout)
 
 	loop.lock(&c.mu)
 	/*
@@ -1000,7 +1000,7 @@ client_request :: proc(
 			loop.cond_broadcast(&c.slot_cond)
 			break
 		}
-		remaining := time.tick_diff(time.tick_now(), deadline)
+		remaining := time.tick_diff(loop.tick_now(), deadline)
 		if remaining <= 0 {
 			loop.unlock(&c.mu)
 			return {}, .Timeout
@@ -1101,7 +1101,7 @@ client_request :: proc(
 
 	loop.lock(&c.mu)
 	for !s.done && !s.reset && !c.closed {
-		remaining := time.tick_diff(time.tick_now(), deadline)
+		remaining := time.tick_diff(loop.tick_now(), deadline)
 		if remaining <= 0 {
 			loop.unlock(&c.mu)
 			client_rst_stream(c, stream_id, .Cancel)
@@ -1191,7 +1191,7 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 				s.send_window -= chunk
 				break
 			}
-			left := time.tick_diff(time.tick_now(), deadline)
+			left := time.tick_diff(loop.tick_now(), deadline)
 			if left <= 0 {
 				// Marked before the write, same as the s.done branch above: DATA
 				// the peer already had in flight must find this stream already

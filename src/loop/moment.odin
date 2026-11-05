@@ -26,10 +26,16 @@ The zero value is boot, so a zero `Moment` is always in the past.
 Moment :: distinct i64
 
 moment_now :: proc "contextless" () -> Moment {
+	return Moment(clock_ns(.BOOTTIME))
+}
+
+// `clock_id` in nanoseconds, through libc so the vDSO answers it. `posix.Clock`
+// names only what POSIX does; CLOCK_BOOTTIME and CLOCK_MONOTONIC_RAW are Linux's.
+@(private)
+clock_ns :: proc "contextless" (clock_id: linux.Clock_Id) -> i64 {
 	ts: posix.timespec
-	// `posix.Clock` names only what POSIX does; CLOCK_BOOTTIME is Linux's.
-	posix.clock_gettime(posix.Clock(linux.Clock_Id.BOOTTIME), &ts)
-	return Moment(i64(ts.tv_sec) * i64(time.Second) + i64(ts.tv_nsec))
+	posix.clock_gettime(posix.Clock(clock_id), &ts)
+	return i64(ts.tv_sec) * i64(time.Second) + i64(ts.tv_nsec)
 }
 
 moment_since :: proc "contextless" (m: Moment) -> time.Duration {
@@ -38,4 +44,32 @@ moment_since :: proc "contextless" (m: Moment) -> time.Duration {
 
 moment_add :: proc "contextless" (m: Moment, d: time.Duration) -> Moment {
 	return m + Moment(d)
+}
+
+/*
+The clocks `core:time` reads, read through libc so the vDSO answers them.
+
+`core:time` on Linux calls `clock_gettime` as a raw system call, which bypasses
+the vDSO: each `time.now` and `time.tick_now` enters the kernel, and a cache hit
+reads the clock six to nine times (#594). These read the same clocks -
+CLOCK_REALTIME and CLOCK_MONOTONIC_RAW - so a `Tick` or `Time` from either
+agrees with one from the other.
+
+`mise run check` keeps `time.now`, `time.since`, `time.tick_now` and
+`time.tick_since` out of the server.
+*/
+now :: proc "contextless" () -> time.Time {
+	return time.Time{_nsec = clock_ns(.REALTIME)}
+}
+
+since :: proc "contextless" (t: time.Time) -> time.Duration {
+	return time.diff(t, now())
+}
+
+tick_now :: proc "contextless" () -> Tick {
+	return Tick{_nsec = clock_ns(.MONOTONIC_RAW)}
+}
+
+tick_since :: proc "contextless" (t: Tick) -> time.Duration {
+	return time.tick_diff(t, tick_now())
 }

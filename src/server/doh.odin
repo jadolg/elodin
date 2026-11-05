@@ -7,6 +7,7 @@ import "elodin:cache"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
+import "elodin:loop"
 import "elodin:tlsx"
 
 /*
@@ -566,12 +567,12 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 	}
 	defer delete(r.buf)
 
-	last_question := time.tick_now()
+	last_question := loop.tick_now()
 	// A client pipelining requests the cache answers never lets this fiber park;
 	// its reads and writes step aside between them (`loop.take_turn`).
 	for {
 		// Nothing to free: the round before this one reset the arena on its way out.
-		if doh_question_overdue(s, last_question, time.tick_now()) {
+		if doh_question_overdue(s, last_question, loop.tick_now()) {
 			return
 		}
 		// Per request, so a connection kept alive between requests waits the whole
@@ -617,7 +618,7 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 		// idle wait starts once its answer is written: the time the question takes
 		// is not time the connection asked nothing.
 		if asked {
-			last_question = time.tick_now()
+			last_question = loop.tick_now()
 		}
 		if !handled || !keep_alive {
 			return
@@ -1016,10 +1017,10 @@ http_linger :: proc(conn: Conn, idle: time.Duration) {
 	// Not `net.set_option`: over DoH the connection is a TLS one, where the socket
 	// option stopped applying at the handshake - see `conn_set_read_timeout`.
 	conn_set_read_timeout(conn, idle)
-	start := time.tick_now()
+	start := loop.tick_now()
 	chunk: [4096]u8
 	discarded := 0
-	for discarded < HTTP_LINGER_BYTES && time.tick_since(start) < HTTP_LINGER_TIMEOUT {
+	for discarded < HTTP_LINGER_BYTES && loop.tick_since(start) < HTTP_LINGER_TIMEOUT {
 		n, ok := conn_read(conn, chunk[:])
 		if !ok {
 			return

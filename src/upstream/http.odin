@@ -222,7 +222,7 @@ next_wait :: proc(deadline: time.Tick, idle: time.Duration) -> (wait: time.Durat
 	if deadline == {} {
 		return idle, idle > 0
 	}
-	left := time.tick_diff(time.tick_now(), deadline)
+	left := time.tick_diff(loop.tick_now(), deadline)
 	if idle > 0 && idle < left {
 		return idle, true
 	}
@@ -806,11 +806,11 @@ open_stream :: proc(
 	stream: Stream,
 	err: Error,
 ) {
-	deadline := time.tick_add(time.tick_now(), timeout)
+	deadline := time.tick_add(loop.tick_now(), timeout)
 	for attempt in 0 ..< 2 {
-		socket, derr := dial_tcp_timeout(endpoint, stream_time_left(timeout, deadline, time.tick_now()))
+		socket, derr := dial_tcp_timeout(endpoint, stream_time_left(timeout, deadline, loop.tick_now()))
 		if derr != .None {
-			if derr != .Dial_Reset || !retry_due(timeout, deadline, time.tick_now(), attempt) {
+			if derr != .Dial_Reset || !retry_due(timeout, deadline, loop.tick_now(), attempt) {
 				return {}, derr
 			}
 			continue
@@ -819,7 +819,7 @@ open_stream :: proc(
 		// `tlsx.handshake_loop` - so this is what bounds it. A dial that used the
 		// last of the budget still gets one bounded attempt: `stream_time_left`
 		// floors what is left at a millisecond.
-		set_socket_timeouts(socket, stream_time_left(timeout, deadline, time.tick_now()))
+		set_socket_timeouts(socket, stream_time_left(timeout, deadline, loop.tick_now()))
 		_ = net.set_option(socket, .TCP_Nodelay, true)
 
 		if tls_ctx == nil {
@@ -833,7 +833,7 @@ open_stream :: proc(
 		// here rather than at the point the error surfaces.
 		detail := tlsx.describe_error(terr, context.temp_allocator)
 		net.close(socket)
-		if terr == .Closed && retry_due(timeout, deadline, time.tick_now(), attempt) {
+		if terr == .Closed && retry_due(timeout, deadline, loop.tick_now(), attempt) {
 			logx.debugf("TLS handshake with %q failed: %s, retrying once", hostname, detail)
 			continue
 		}

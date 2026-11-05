@@ -154,7 +154,7 @@ wait_for_tick :: proc(deadline: time.Tick, rebuild: ^server.Rebuild) -> Wait_Out
 		if sync.atomic_exchange(&reload_requested, false) {
 			return .Reload
 		}
-		remaining := time.tick_diff(time.tick_now(), deadline)
+		remaining := time.tick_diff(loop.tick_now(), deadline)
 		if remaining <= 0 {
 			return .Tick
 		}
@@ -800,7 +800,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	s := server.Server {
 		filters      = filters,
 		loops        = loops,
-		started      = time.now(),
+		started      = loop.now(),
 		up_since     = loop.moment_now(),
 		running      = true,
 	}
@@ -1068,9 +1068,9 @@ maintenance_loop :: proc(
 	TICK :: 30 * time.Second
 	m := Maintenance {
 		rebuild      = rebuild,
-		next_tick    = time.tick_add(time.tick_now(), TICK),
-		last_refresh = time.now(),
-		last_report  = time.tick_now(),
+		next_tick    = time.tick_add(loop.tick_now(), TICK),
+		last_refresh = loop.now(),
+		last_report  = loop.tick_now(),
 	}
 	refresh := server.live_config(s).blocking.refresh
 	if !lists_current && !opts.no_fetch && refresh > 0 {
@@ -1089,7 +1089,7 @@ maintenance_loop :: proc(
 		case .Rebuilt:
 			collect(s, opts, &m)
 		case .Tick:
-			m.next_tick = time.tick_add(time.tick_now(), TICK)
+			m.next_tick = time.tick_add(loop.tick_now(), TICK)
 			tick(s, listeners, opts, &m)
 		}
 		if released := server.reap_generations(s); released > 0 {
@@ -1190,7 +1190,7 @@ collect :: proc(s: ^server.Server, opts: Options, m: ^Maintenance) {
 		start_rebuild(s, opts, m, after_reload = true)
 		return
 	}
-	m.last_refresh = time.now()
+	m.last_refresh = loop.now()
 	refresh := server.live_config(s).blocking.refresh
 	switch {
 	case current || opts.no_fetch || refresh <= 0:
@@ -1245,16 +1245,16 @@ tick :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m: 
 		switch {
 		case m.rebuild_again:
 			start_rebuild(s, opts, m, after_reload = true)
-		case refreshing && time.since(m.last_refresh) >= server.refresh_wait(m.retry, cfg.blocking.refresh):
+		case refreshing && loop.since(m.last_refresh) >= server.refresh_wait(m.retry, cfg.blocking.refresh):
 			logx.infof("refreshing blocklists")
 			start_rebuild(s, opts, m, after_reload = false)
 		}
 	}
 
-	if time.tick_since(m.last_report) >= 5 * time.Minute {
+	if loop.tick_since(m.last_report) >= 5 * time.Minute {
 		report(s, answers)
 		report_udp_drops(listeners, &m.last_udp_drops)
-		m.last_report = time.tick_now()
+		m.last_report = loop.tick_now()
 	}
 }
 

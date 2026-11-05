@@ -20,14 +20,15 @@ block the thread instead - a plain mutex held across a park, a blocking socket -
 is a bug that stalls every fiber on the loop with it, which is why the waits in
 this package are the only ones code on a loop may use.
 
-Level-triggered epoll, registered for the length of one wait. A descriptor is
-added when the first fiber waits on it and removed when the last stops, so a
-descriptor nobody waits on is in no interest list, and closing one cannot leave
-a registration behind for a later descriptor with the same number to inherit;
-and a readiness that arrives with nobody waiting is reported again to whoever
-waits next, rather than lost the way an edge-triggered one would be. It costs two
-`epoll_ctl` calls per wait that actually parks; a read that finds data waiting
-does not park at all.
+Level-triggered epoll, one-shot, armed afresh by every wait that parks. A
+registration fires once and is then disarmed, so a descriptor nobody waits on
+any more costs at most one wake-up that finds nobody, rather than a loop that
+spins on it; arming on every wait, rather than trusting the last one, is what
+keeps a descriptor that was closed and its number handed out again from
+inheriting a registration it does not have (see `watch_update`); and a readiness
+that arrives with nobody waiting is reported again to whoever waits next, rather
+than lost the way an edge-triggered one would be. It costs one `epoll_ctl` per
+wait that actually parks; a read that finds data waiting does not park at all.
 
 Linux only, as the rest of the server is.
 */
@@ -44,7 +45,6 @@ Loop :: struct {
 	running:             [dynamic]^Fiber,
 	timers:              [dynamic]^Fiber,
 	fds:                 map[linux.Fd]^Fd_Watch,
-	spare_watches:       [dynamic]^Fd_Watch,
 	// Live fibers, for `cancel_all`.
 	live:                ^Fiber,
 	alive:               int,
@@ -72,7 +72,7 @@ Loop :: struct {
 	thread_stack_bottom: rawptr,
 	thread_stack_size:   uint,
 	/*
-	The clock timers are judged against. `time.tick_now` everywhere but in the
+	The clock timers are judged against. `tick_now` everywhere but in the
 	package's own tests, which move it by hand so that "the timer fired" and "the
 	timer did not fire" are decided by the test rather than by how fast the
 	machine was that day.
@@ -129,7 +129,7 @@ make_loop :: proc(allocator := context.allocator) -> (l: ^Loop, ok: bool) {
 	l = new(Loop, allocator)
 	l.epfd = epfd
 	l.wakefd = wakefd
-	l.clock = time.tick_now
+	l.clock = tick_now
 	l.ctx = context
 	// Everything the loop allocates, and every fiber's own allocations, come from
 	// the allocator it was made with; `destroy` frees through it. The lists too,
@@ -140,7 +140,6 @@ make_loop :: proc(allocator := context.allocator) -> (l: ^Loop, ok: bool) {
 	l.ready = make([dynamic]^Fiber, allocator)
 	l.running = make([dynamic]^Fiber, allocator)
 	l.timers = make([dynamic]^Fiber, allocator)
-	l.spare_watches = make([dynamic]^Fd_Watch, allocator)
 	l.posted = make([dynamic]Post, allocator)
 	l.draining = make([dynamic]Post, allocator)
 	ev := linux.EPoll_Event {
@@ -182,12 +181,7 @@ destroy :: proc(l: ^Loop) {
 		delete(w.waiters)
 		free(w)
 	}
-	for w in l.spare_watches {
-		delete(w.waiters)
-		free(w)
-	}
 	delete(l.fds)
-	delete(l.spare_watches)
 	delete(l.ready)
 	delete(l.running)
 	delete(l.timers)

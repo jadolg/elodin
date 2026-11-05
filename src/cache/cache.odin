@@ -1355,7 +1355,7 @@ the same shape stopped one layer further out, on the paths no validator
 	// expiration; everything the entry stores is on the moment clock. The
 	// moment is read first, so the expiration it carries is never late.
 	now := loop.moment_now()
-	wall := time.now()
+	wall := loop.now()
 	now_unix := time.time_to_unix(wall)
 	signed_left, signed := dns.signatures_lapse(wire, u32(now_unix))
 	// A message whose signature has already lapsed is not stored at all, past

@@ -451,7 +451,7 @@ said it, and the two lines' counts overlap by the handshakes.
 */
 @(private)
 note_failure_kind :: proc(u: ^Upstream, err: Error) -> (loud: bool, held: u64) {
-	return note_failure_kind_at(u, err, time.tick_now()._nsec)
+	return note_failure_kind_at(u, err, loop.tick_now()._nsec)
 }
 
 // `note_failure_kind` against a clock the caller names.
@@ -742,7 +742,7 @@ take several, and every bound above - a group's budget, a question's
 	nothing fails as a timeout, which it is: the upstream had the whole of it.
 	On the tick clock, which an NTP step cannot move.
 	*/
-	entered := time.tick_now()
+	entered := loop.tick_now()
 	deadline := time.tick_add(entered, timeout)
 	/*
 	A hostname the bootstrap resolvers were asked about and did not resolve is a
@@ -760,7 +760,7 @@ servers to ask the refusal costs nothing, and is left unrecorded.
 		return nil, .Not_Resolved
 	}
 
-	start := time.tick_now()
+	start := loop.tick_now()
 	// Never both: a cookie is for the transports with nothing authenticating
 	// the peer, padding for the transports where a length is the only thing
 	// left showing. `cookies_wanted` and `padding_wanted` name disjoint kinds.
@@ -792,12 +792,12 @@ servers to ask the refusal costs nothing, and is left unrecorded.
 			u.spec.port,
 			// From entry rather than `start`: bootstrap resolution is part of
 			// what the exchange's timeout covers.
-			time.tick_since(entered),
+			loop.tick_since(entered),
 			err,
 		)
 		return nil, err
 	}
-	record_success(u, time.tick_since(start))
+	record_success(u, loop.tick_since(start))
 	return response, .None
 }
 
@@ -820,7 +820,7 @@ send :: proc(
 	response: []u8,
 	err: Error,
 ) {
-	if time.tick_diff(time.tick_now(), deadline) <= 0 {
+	if time.tick_diff(loop.tick_now(), deadline) <= 0 {
 		return nil, .Timeout
 	}
 	switch u.spec.kind {

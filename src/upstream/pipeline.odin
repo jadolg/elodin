@@ -465,7 +465,7 @@ time left, which goes on and fails as the timeout it is.
 @(private)
 pipe_backlogged :: proc(c: ^Pipe_Conn, left: time.Duration) -> bool {
 	b := &c.backlog
-	if left <= 0 || time.tick_since(b.at) >= c.timeout {
+	if left <= 0 || loop.tick_since(b.at) >= c.timeout {
 		return false
 	}
 	// A slot never written holds zero, which is below any floor: a connection
@@ -514,12 +514,12 @@ gone, so it is emptied first: one slow name after a quiet spell is not eight.
 @(private)
 pipe_note_wait :: proc(c: ^Pipe_Conn, waited: time.Duration, answered: bool) {
 	b := &c.backlog
-	if time.tick_since(b.at) >= c.timeout {
+	if loop.tick_since(b.at) >= c.timeout {
 		b.waited = {}
 	}
 	b.waited[b.next] = waited
 	b.next = (b.next + 1) % PIPE_BACKLOG_SAMPLES
-	b.at = time.tick_now()
+	b.at = loop.tick_now()
 	if answered && (b.floor == 0 || waited < b.floor) {
 		b.floor = waited
 	}
@@ -656,7 +656,7 @@ get_pipe :: proc(
 		`exchange_pipelined` hands every stage the same deadline: what it is
 		owed is its timeout, not one per stage it passes through.
 		*/
-		remaining := time.tick_diff(time.tick_now(), deadline)
+		remaining := time.tick_diff(loop.tick_now(), deadline)
 		if remaining <= 0 {
 			sync.mutex_unlock(&u.mu)
 			return nil, .Timeout
@@ -673,7 +673,7 @@ get_pipe :: proc(
 				// it is closed again the moment this query is done with it.
 				// The shared one stays where it is for everyone else.
 				sync.mutex_unlock(&u.mu)
-				c, err = dial_pipe(u, timeout, time.tick_diff(time.tick_now(), deadline))
+				c, err = dial_pipe(u, timeout, time.tick_diff(loop.tick_now(), deadline))
 				return c, err
 			case .Gone:
 			}
@@ -692,7 +692,7 @@ get_pipe :: proc(
 	// holds its own and tears it down when it is finished with it.
 	_ = pipe_unref(stale)
 
-	dialled, derr := dial_pipe(u, timeout, time.tick_diff(time.tick_now(), deadline))
+	dialled, derr := dial_pipe(u, timeout, time.tick_diff(loop.tick_now(), deadline))
 
 	sync.mutex_lock(&u.mu)
 	u.connecting = false
@@ -796,7 +796,7 @@ all of it.
 	`elodin_upstream_failure_kind_total` is only worth reading if a reply that
 	could not be used is counted as one.
 	*/
-	if time.tick_diff(time.tick_now(), deadline) <= 0 {
+	if time.tick_diff(loop.tick_now(), deadline) <= 0 {
 		_ = pipe_unref(c)
 		return nil, err
 	}
@@ -851,7 +851,7 @@ pipe_query :: proc(
 		sync.mutex_unlock(&c.mu)
 		return nil, .IO_Error
 	}
-	w.asked = time.tick_now()
+	w.asked = loop.tick_now()
 	if !pipe_admit(c, &w, id, time.tick_diff(w.asked, deadline)) {
 		sync.mutex_unlock(&c.mu)
 		return nil, .Backlogged
@@ -947,7 +947,7 @@ pipe_wait :: proc(c: ^Pipe_Conn, w: ^Pipe_Waiter, id: u16) -> Error {
 			delete_key(&c.waiters, id)
 			return c.err
 		}
-		remaining := time.tick_diff(time.tick_now(), w.deadline)
+		remaining := time.tick_diff(loop.tick_now(), w.deadline)
 		if remaining <= 0 {
 			delete_key(&c.waiters, id)
 			c.last = loop.moment_now()
@@ -1056,7 +1056,7 @@ everyone exactly as a message half read does.
 */
 @(private)
 pipe_framing_deadline :: proc(c: ^Pipe_Conn, mine: time.Tick) -> time.Tick {
-	now := time.tick_now()
+	now := loop.tick_now()
 	return time.tick_add(now, min(max(time.tick_diff(now, mine), PIPE_FRAMING_GRACE), c.timeout))
 }
 
@@ -1085,7 +1085,7 @@ pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 	records is, and a reader that gave up holding one byte of a length would
 	leave the stream unreadable for everyone on it.
 	*/
-	mine := time.tick_add(time.tick_now(), budget)
+	mine := time.tick_add(loop.tick_now(), budget)
 	if _, rerr := pipe_read_full(c, length_buf[:1], mine); rerr != .None {
 		return .Timeout if rerr == .Timeout else rerr
 	}
@@ -1157,7 +1157,7 @@ pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
 	// answer its query is sampled but sets no floor: a server answering the
 	// wrong question quickly says nothing about how fast it answers the right
 	// one.
-	pipe_note_wait(c, time.tick_since(w.asked) if waiting else c.timeout, matches)
+	pipe_note_wait(c, loop.tick_since(w.asked) if waiting else c.timeout, matches)
 	if !waiting {
 		// Nobody is on this ID: an answer to a query that has already given
 		// up, or one nobody asked. Dropped rather than treated as a failure -
@@ -1195,7 +1195,7 @@ socket on either.
 @(private)
 pipe_read_full :: proc(c: ^Pipe_Conn, buf: []u8, deadline: time.Tick) -> (n: int, err: Error) {
 	for n < len(buf) {
-		remaining := time.tick_diff(time.tick_now(), deadline)
+		remaining := time.tick_diff(loop.tick_now(), deadline)
 		if remaining <= 0 {
 			return n, .Timeout
 		}
@@ -1325,7 +1325,7 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 		// the connection's budget, so it is told this caller's instead.
 		tlsx.set_write_timeout(
 			c.stream.tls,
-			min(max(time.tick_diff(time.tick_now(), deadline), PIPE_FRAMING_GRACE), c.timeout),
+			min(max(time.tick_diff(loop.tick_now(), deadline), PIPE_FRAMING_GRACE), c.timeout),
 		)
 		/*
 		A failed `SSL_write` is reported as having sent something whatever it
@@ -1373,7 +1373,7 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 		// told it: `SO_SNDTIMEO` left at the connection's figure would let one
 		// blocked send outlast the whole write, which is the overshoot this
 		// loop exists to close.
-		remaining := time.tick_diff(time.tick_now(), bound)
+		remaining := time.tick_diff(loop.tick_now(), bound)
 		if remaining <= 0 {
 			return sent, .Timeout
 		}

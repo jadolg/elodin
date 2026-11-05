@@ -135,7 +135,7 @@ all. On the tick clock, which an NTP step cannot move. Shared with
 */
 @(private)
 arm_receive :: proc(socket: net.UDP_Socket, deadline: time.Tick) -> bool {
-	left := time.tick_diff(time.tick_now(), deadline)
+	left := time.tick_diff(loop.tick_now(), deadline)
 	if left <= 0 {
 		return false
 	}

@@ -6,6 +6,7 @@ import "core:os"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
+import "elodin:loop"
 import "elodin:netx"
 
 /*
@@ -141,7 +142,7 @@ signer_valid_at :: proc(s: Signer, at_unix: i64) -> bool {
 
 // The wall clock in the form `signer_valid_at` wants.
 unix_now :: proc() -> i64 {
-	return time.to_unix_seconds(time.now())
+	return time.to_unix_seconds(loop.now())
 }
 
 /*
