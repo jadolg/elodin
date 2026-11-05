@@ -792,7 +792,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	that waits on the network runs on them - see `loop` - and each takes one UDP
 	reader. Started before anything that could spawn on one.
 	*/
-	loops, loop_threads := start_loops(max(cfg.listeners.udp.readers, 1))
+	loops, loop_threads := start_loops(max(cfg.listeners.udp.readers, 1), cfg.server.pin_loops)
 
 	filters := filter.engine_make()
 	defer filter.engine_destroy(filters)
@@ -1368,11 +1368,34 @@ Start `n` event loops, each on a thread that never takes the signals `main` acts
 on (#416). A loop that cannot be made is fatal: the server would run with fewer
 than it reported, and on a machine that refuses an epoll descriptor nothing
 else would work either.
+
+With `pin`, loop i is held to the i-th CPU the process may run on
+(`server.pin_loops`). With more loops than CPUs none is pinned, and a pin that
+cannot be had leaves that loop unpinned; both are warnings.
 */
 @(private)
-start_loops :: proc(n: int) -> (loops: []^loop.Loop, threads: []^thread.Thread) {
+start_loops :: proc(n: int, pin: bool) -> (loops: []^loop.Loop, threads: []^thread.Thread) {
 	loops = make([]^loop.Loop, n)
 	threads = make([]^thread.Thread, n)
+	// One CPU per loop, in loop order; empty when not pinning.
+	on: []int
+	if pin {
+		cpus := loop.allowed_cpus(context.temp_allocator)
+		switch {
+		case len(cpus) == 0:
+			logx.warnf("server.pin_loops: the CPUs this process may use could not be read; the event loops run unpinned")
+		case len(cpus) < n:
+			/*
+			Two loops pinned to one CPU queue behind each other for good, which
+			is the wait pinning exists to end, and neither can move off. Left
+			unpinned, the scheduler at least can.
+			*/
+			logx.warnf("server.pin_loops: %d event loops on %d CPUs would share one; the event loops run unpinned", n, len(cpus))
+		case:
+			on = cpus[:n]
+			logx.infof("server.pin_loops: pinning the event loops to CPUs %v", on)
+		}
+	}
 	for i in 0 ..< n {
 		l, ok := loop.make_loop()
 		if !ok {
@@ -1380,13 +1403,28 @@ start_loops :: proc(n: int) -> (loops: []^loop.Loop, threads: []^thread.Thread) 
 			os.exit(1)
 		}
 		loops[i] = l
-		threads[i] = loop.spawn_thread(l, loop.run, context)
+		threads[i] = loop.spawn_thread(Loop_Start{l, on[i] if len(on) > 0 else -1}, run_loop, context)
 		if threads[i] == nil {
 			logx.errorf("cannot start a thread for event loop %d of %d", i + 1, n)
 			os.exit(1)
 		}
 	}
 	return
+}
+
+@(private)
+Loop_Start :: struct {
+	l:   ^loop.Loop,
+	// The CPU to hold the loop's thread to, or -1 for none.
+	cpu: int,
+}
+
+@(private)
+run_loop :: proc(start: Loop_Start) {
+	if start.cpu >= 0 && !loop.pin_current_thread(start.cpu) {
+		logx.warnf("server.pin_loops: an event loop could not be held to CPU %d; it runs unpinned", start.cpu)
+	}
+	loop.run(start.l)
 }
 
 /*

@@ -352,6 +352,7 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 		"max_pending",
 		"max_udp_response",
 		"client_timeout",
+		"pin_loops",
 		"user",
 		"group",
 		"allow_from",
@@ -363,6 +364,7 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	opt_int(l, n, "max_connections", &cfg.server.max_connections, "server")
 	opt_int(l, n, "max_connections_per_prefix", &cfg.server.max_connections_per_prefix, "server")
 	opt_int(l, n, "max_pending", &cfg.server.max_pending, "server")
+	opt_bool(l, n, "pin_loops", &cfg.server.pin_loops, "server")
 	// A size, so "1232" and "1232B" and "4KiB" all read, the same as the cache
 	// sizes do.
 	opt_bytes(l, n, "max_udp_response", &cfg.server.max_udp_response, "server")

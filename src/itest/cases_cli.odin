@@ -549,12 +549,12 @@ STOP_AND_RELOAD_MASK :: u64(1) << (u64(posix.Signal.SIGHUP) - 1) | u64(1) << (u6
 
 @(private = "file")
 threads_taking_signals :: proc(pid: int) -> (main_takes: bool, others, taking: int, ok: bool) {
-	entries, err := os.read_directory_by_path(fmt.tprintf("/proc/%d/task", pid), -1, context.temp_allocator)
-	if err != nil {
+	ids, listed := task_ids(pid)
+	if !listed {
 		return
 	}
-	for e in entries {
-		mask, read := proc_status_field(fmt.tprintf("/proc/%d/task/%s/status", pid, e.name), "SigBlk")
+	for id in ids {
+		mask, read := proc_status_field(fmt.tprintf("/proc/%d/task/%s/status", pid, id), "SigBlk")
 		if !read {
 			continue // a thread that has just ended
 		}
@@ -563,7 +563,7 @@ threads_taking_signals :: proc(pid: int) -> (main_takes: bool, others, taking: i
 			return
 		}
 		takes := blocked & STOP_AND_RELOAD_MASK != STOP_AND_RELOAD_MASK
-		if e.name == fmt.tprintf("%d", pid) {
+		if id == fmt.tprintf("%d", pid) {
 			main_takes = takes
 			continue
 		}

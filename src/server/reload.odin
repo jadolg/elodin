@@ -189,10 +189,10 @@ name the ones the file changed.
 
 The listeners and the metrics endpoint, because their sockets were bound before
 privileges were dropped: a port below 1024 cannot be bound again, and the event
-loops that serve them are started once. The loop count and the connection
-table, because neither is resized in place. And the
-account, because root, once given up, cannot be had back - nor, with it, the
-handover of the blocklist cache directory to that account. The certificates under
+loops that serve them are started once. The loop count, their pinning and the
+connection table, because none of them is changed in place. And the account,
+because root, once given up, cannot be had back - nor, with it, the handover of
+the blocklist cache directory to that account. The certificates under
 `listeners.dot` and `listeners.doh` are still read again on every SIGHUP, from
 the paths the process started with.
 
@@ -234,6 +234,8 @@ keep_restart_only :: proc(boot, cfg: ^config.Config, allocator := context.alloca
 		&cfg.server.max_connections_per_prefix,
 		boot.server.sizing.derived_per_prefix && cfg.server.sizing.derived_per_prefix,
 	)
+	// The loops are pinned, or not, as their threads start.
+	hold(&changed, "server.pin_loops", boot.server.pin_loops, &cfg.server.pin_loops)
 	hold(&changed, "server.user", boot.server.user, &cfg.server.user)
 	hold(&changed, "server.group", boot.server.group, &cfg.server.group)
 	// Handed to `server.user` at startup, as root; a directory named afterwards

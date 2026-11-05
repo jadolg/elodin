@@ -183,7 +183,7 @@ rules in effect` when turned off), or keep the rules in effect;
 | `dnssec` | a change rebuilds the validator, which fetches its zone keys again |
 | `cookies` | applied; the secret is kept unless `cookies.secret` changes |
 | `blocking` | a change to `enabled`, the lists or the rules rebuilds the rule sets, and a list whose cached copy is within `refresh` is not downloaded again; `response`, `custom_ipv4`, `custom_ipv6`, `block_ttl` and `refresh` apply from the next query or tick. Lists read from a `file:` are read again on every SIGHUP, changed configuration or not. If a list that loaded before cannot be had, the rules in effect are kept, as on a refresh, and the change applies at the retry |
-| `listeners` (including `udp.readers`, the loop count), `ddr`, `metrics`, `max_connections`, `max_connections_per_prefix`, `user`, `group`, `blocking.cache_dir` | need a restart; each one changed is named in a warning and keeps the value it started with |
+| `listeners` (including `udp.readers`, the loop count), `ddr`, `metrics`, `max_connections`, `max_connections_per_prefix`, `pin_loops`, `user`, `group`, `blocking.cache_dir` | need a restart; each one changed is named in a warning and keeps the value it started with |
 
 A change to which upstreams are asked (`upstream.servers`, `upstream.bootstrap`,
 `upstream.zones` and their servers), to `dnssec.enabled`, `trust_anchors` or

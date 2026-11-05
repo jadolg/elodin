@@ -667,6 +667,33 @@ log_count :: proc(srv: ^Server, needle: string) -> int {
 	}
 }
 
+/*
+The thread ids of process `pid`, from `/proc/<pid>/task`, read with `readdir`
+alone. `os.read_directory_by_path` opens every entry it lists, so a thread that
+ends between the listing and the open fails the whole read; a name read here is
+only a name, and a reader of its files skips one that has gone.
+*/
+task_ids :: proc(pid: int, allocator := context.temp_allocator) -> (ids: []string, ok: bool) {
+	dir := posix.opendir(strings.clone_to_cstring(fmt.tprintf("/proc/%d/task", pid), context.temp_allocator))
+	if dir == nil {
+		return
+	}
+	defer posix.closedir(dir)
+	found := make([dynamic]string, allocator)
+	for {
+		posix.set_errno(.NONE)
+		entry := posix.readdir(dir)
+		if entry == nil {
+			return found[:], posix.get_errno() == .NONE
+		}
+		// Names here are digits, and `.` and `..`; each ends in a NUL inside its record.
+		name := string(cstring(&entry.d_name[0]))
+		if name != "." && name != ".." {
+			append(&found, strings.clone(name, allocator))
+		}
+	}
+}
+
 // One field of a /proc status file, such as `VmRSS` or `SigBlk`, trimmed; not
 // ok when the file cannot be read (a thread that has just ended) or lacks it.
 proc_status_field :: proc(path, field: string) -> (value: string, ok: bool) {

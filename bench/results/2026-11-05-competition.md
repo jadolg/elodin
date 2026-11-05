@@ -87,8 +87,30 @@ clients on two cores, two runs each:
 
 Across #604 DoT's p50 fell (0.33 → 0.25 ms) and its p99 rose (0.71 → 3.05
 ms), with the spread of queries per client widening (16,706–17,154 →
-16,872–18,012); TCP improved on all three (p99 2.39 → 1.44 ms). A DoT
-connection is sometimes served a round late.
+16,872–18,012); TCP improved on all three (p99 2.39 → 1.44 ms).
+
+No DoT connection waits in elodin's code (#610). Counted under this load on an
+instrumented build, no read left decrypted bytes in OpenSSL. Of 2.38 million
+parks, 205 found bytes already queued; each was an arrival racing the park,
+which level-triggered epoll fires on at once. What #604 changed is that a cache
+hit got cheap enough for the loops to go idle: at saturation each loop ran at
+87% and slept in `epoll_wait` about 5,500 times a second. Reverting #604's
+epoll change and its vDSO clock together keeps them at 100%, and the tail
+goes. Reverting either alone, or the read path, does not.
+
+A loop that wakes can be queued on the CPU the other loop is running on. It
+then waits out that loop's slice, about 3 ms, with its ~50 connections behind
+it. In `perf sched` at 200,000 DoT queries a second, the elodin wake-ups
+delayed by more than 2 ms each waited about 3.0 ms behind the other loop
+thread. That was 8–49 times a second, against 1 before #604. `server.pin_loops`
+holds each loop to a CPU of its own. Over three alternating pairs at
+200,000 a second it took those delays to 0–1 a second, p99 from 0.95–1.72 to
+0.83–0.93 ms, and p99.5 from 2.1–3.3 to 1.0–1.4 ms.
+
+At saturation the p99 stays near 3 ms pinned or not. That 3 ms belongs to the
+generator: its threads were delayed more than 0.5 ms 389 times a second, and
+a build that never blocks in `epoll_wait` shows it too. The runs above are
+elodin's defaults, unpinned.
 
 ## Memory
 
@@ -195,8 +217,9 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
 
 ## Where elodin falls behind
 
-- **DoT p99 at 3 ms** (#610), against BIND's 1.1 ms and Knot's 1.5 ms: the #604
-  regression above.
+- **DoT p99 at 3 ms** (#610), against BIND's 1.1 ms and Knot's 1.5 ms. Below
+  saturation, the share of it that is loops queuing behind each other goes with
+  `server.pin_loops` (above). At saturation it is mostly the generator's.
 - **CPU per cache miss** (#612): 27 µs at saturation against dnsdist's 8 µs, and a
   p99 of 107 ms at 75,000 against dnsdist's 62 ms. Unbound and Knot are
   level with elodin at 28 µs.
