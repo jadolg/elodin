@@ -136,6 +136,36 @@ run_config_reload_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	A reload that shortens `client_timeout` reaches a connection already open: its
+	next idle wait is the new one (#594). The wait that was parked when the signal came keeps
+	the figure it was armed with, so a query after the reload starts the next one.
+	One second against the default ten, read with a five-second wait: a close is
+	the new figure, a timeout here the old one.
+	*/
+	start_case(r, "config reload: a shorter client_timeout reaches a connection held across the reload")
+	{
+		socket, derr := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = udp_port})
+		if check(r, derr == nil, "cannot connect over tcp") {
+			defer net.close(socket)
+			_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
+			_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
+			conn := Test_Conn {
+				socket = socket,
+			}
+			check(r, stream_query(&conn, build_query("rw.reload.test.", u16(dns.Type.A)), context.temp_allocator).ok, "no answer before the reload")
+			shorter := config_reload_text(udp_port, a_port, "  client_timeout: 1s\n")
+			if check(r, reload_to(r, &srv, shorter, "msg=reloaded"), "the reload was never logged") {
+				check(r, stream_query(&conn, build_query("rw.reload.test.", u16(dns.Type.A)), context.temp_allocator).ok, "no answer after the reload")
+				_ = net.set_option(socket, .Receive_Timeout, 5 * time.Second)
+				buf: [1]u8
+				n, rerr := net.recv_tcp(socket, buf[:])
+				check(r, n == 0 && rerr == nil, fmt.tprintf("the idle connection was not closed on the new client_timeout (read %d, %v)", n, rerr))
+			}
+		}
+	}
+	end_case(r)
+
 	// The accept loop checks `server.allow_from` once, so a reload that narrows
 	// it has to reach the connections already open as well.
 	start_case(r, "config reload: a connection held across a reload that drops its network from allow_from is refused")

@@ -1976,17 +1976,18 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 	// what decides whether the refusal below drains first - see `stream_linger`.
 	answered := false
 	reader: Stream_Reader
-	budget := Read_Budget {
-		idle = client_timeout(s),
-	}
+	budget: Read_Budget
 	// A client pipelining queries the cache answers never lets this fiber park;
 	// its reads and writes step aside between them (`loop.take_turn`).
 	for {
 		/*
 		One deadline for the length prefix and the body behind it, started fresh
 		per message and not restarted by the bytes that arrive inside one - see
-		`Read_Budget`.
+		`Read_Budget`. The idle wait is read per message too, so a reload that
+		changes `client_timeout` reaches a connection that is already open; `armed`
+		keeps an unchanged one from being set again.
 		*/
+		budget.idle = client_timeout(s)
 		budget.deadline = {}
 		query, read := stream_read_message(conn, &reader, &budget)
 		if !read {
@@ -2323,7 +2324,7 @@ conn_read_budgeted :: proc(c: Conn, buf: []u8, b: ^Read_Budget) -> (n: int, ok: 
 What a DNS stream has read and not yet answered.
 
 A query and its length prefix arrive in one segment, and one `recv` into this
-takes both, where reading the prefix and then the body took two (#594). What
+takes both, rather than one for the prefix and one for the body (#594). What
 arrives behind the message - a pipelined query - waits here for the next one.
 The size covers any query a stub sends; a longer message is read past it.
 */

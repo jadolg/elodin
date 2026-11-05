@@ -132,11 +132,12 @@ run = [
   fi
   """,
   # core:time reads the clock with a raw system call that bypasses the vDSO,
-  # and a cache hit read it six to nine times (#594). loop.now, loop.since,
+  # and a cache hit reads it six to nine times (#594). loop.now, loop.since,
   # loop.tick_now and loop.tick_since read the same clocks through libc. A backtick
-  # before it is a comment naming the call.
+  # before it is a comment naming the call. Matched as a call or as a proc value
+  # (`clock = time.tick_now`), and with the stopwatch procs that read the tick clock.
   """
-  if grep -rnE '(^|[^A-Za-z0-9_.`])time\\.(now|since|tick_now|tick_since)\\(' src \\
+  if grep -rnE '(^|[^A-Za-z0-9_.`])time\\.(now|since|tick_now|tick_since|tick_lap_time|stopwatch_start|stopwatch_stop|stopwatch_duration)([^A-Za-z0-9_]|$)' src \\
       --include='*.odin' --exclude='*_test.odin' --exclude-dir=itest --exclude-dir=fuzz; then
     echo 'read the clock with loop.now / loop.tick_now: core:time makes a system call of each read' >&2
     exit 1

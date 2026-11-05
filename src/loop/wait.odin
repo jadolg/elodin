@@ -32,12 +32,10 @@ and the interest registered is the union of what they want.
 */
 @(private)
 Fd_Watch :: struct {
-	waiters:    [dynamic]Fd_Waiter,
-	// What the one-shot registration is armed for, empty once it has fired.
-	registered: linux.EPoll_Event_Set,
+	waiters: [dynamic]Fd_Waiter,
 	// Whether epoll has been given this descriptor, armed or not. What the
 	// re-arm tries first; see `watch_update`.
-	added:      bool,
+	added:   bool,
 }
 
 @(private)
@@ -68,25 +66,17 @@ wait_fd :: proc(fd: linux.Fd, events: Events, deadline: Tick) -> Wait_Result {
 	if f.cancelled {
 		return .Cancelled
 	}
+	// Kept in `fds` once made, waited on or not: `added` is what the next wait
+	// on the number arms from, and `destroy` frees them.
 	w := l.fds[fd]
 	if w == nil {
-		if n := len(l.spare_watches); n > 0 {
-			w = pop(&l.spare_watches)
-		} else {
-			w = new(Fd_Watch, l.allocator)
-			w.waiters = make([dynamic]Fd_Waiter, 0, 2, l.allocator)
-		}
+		w = new(Fd_Watch, l.allocator)
+		w.waiters = make([dynamic]Fd_Waiter, 0, 2, l.allocator)
 		l.fds[fd] = w
 	}
 	append(&w.waiters, Fd_Waiter{f, f.token, events})
 	if !watch_update(l, fd, w) {
 		watch_leave(l, fd, f)
-		w.added = false
-		w.registered = {}
-		if len(w.waiters) == 0 {
-			delete_key(&l.fds, fd)
-			append(&l.spare_watches, w)
-		}
 		return .Failed
 	}
 	reason := park(deadline)
@@ -138,7 +128,6 @@ watch_update :: proc(l: ^Loop, fd: linux.Fd, w: ^Fd_Watch) -> bool {
 		return false
 	}
 	w.added = true
-	w.registered = want
 	return true
 }
 
@@ -170,8 +159,6 @@ dispatch_event :: proc(l: ^Loop, ev: linux.EPoll_Event) {
 	if w == nil {
 		return
 	}
-	// Fired, so disarmed until a wait arms it again.
-	w.registered = {}
 	broken := ev.events & {.ERR, .HUP} != {}
 	readable := broken || ev.events & {.IN, .RDHUP} != {}
 	writable := broken || .OUT in ev.events
@@ -184,12 +171,16 @@ dispatch_event :: proc(l: ^Loop, ev: linux.EPoll_Event) {
 	}
 	/*
 	Those it did not wake - a writer on a connection whose reply just came in -
-	are still parked on a registration that is not armed any more. A failure
-	leaves them to their deadlines, which is where a wait that cannot be watched
-	ends anyway.
+	are still parked on a registration that is not armed any more. When it
+	cannot be armed again they are woken rather than left to their deadlines,
+	which a wait with none never reaches: `.Ready` has every wait re-check, and
+	the wait that follows reports the failure as `.Failed`.
 	*/
-	if len(w.waiters) > 0 {
-		_ = watch_update(l, fd, w)
+	if len(w.waiters) > 0 && !watch_update(l, fd, w) {
+		for waiter in w.waiters {
+			wake_local(waiter.fiber, waiter.token, .Ready)
+		}
+		clear(&w.waiters)
 	}
 }
 

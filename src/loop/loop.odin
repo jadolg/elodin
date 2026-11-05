@@ -28,8 +28,7 @@ keeps a descriptor that was closed and its number handed out again from
 inheriting a registration it does not have (see `watch_update`); and a readiness
 that arrives with nobody waiting is reported again to whoever waits next, rather
 than lost the way an edge-triggered one would be. It costs one `epoll_ctl` per
-wait that actually parks; a read that finds
-data waiting does not park at all.
+wait that actually parks; a read that finds data waiting does not park at all.
 
 Linux only, as the rest of the server is.
 */
@@ -46,7 +45,6 @@ Loop :: struct {
 	running:             [dynamic]^Fiber,
 	timers:              [dynamic]^Fiber,
 	fds:                 map[linux.Fd]^Fd_Watch,
-	spare_watches:       [dynamic]^Fd_Watch,
 	// Live fibers, for `cancel_all`.
 	live:                ^Fiber,
 	alive:               int,
@@ -142,7 +140,6 @@ make_loop :: proc(allocator := context.allocator) -> (l: ^Loop, ok: bool) {
 	l.ready = make([dynamic]^Fiber, allocator)
 	l.running = make([dynamic]^Fiber, allocator)
 	l.timers = make([dynamic]^Fiber, allocator)
-	l.spare_watches = make([dynamic]^Fd_Watch, allocator)
 	l.posted = make([dynamic]Post, allocator)
 	l.draining = make([dynamic]Post, allocator)
 	ev := linux.EPoll_Event {
@@ -184,12 +181,7 @@ destroy :: proc(l: ^Loop) {
 		delete(w.waiters)
 		free(w)
 	}
-	for w in l.spare_watches {
-		delete(w.waiters)
-		free(w)
-	}
 	delete(l.fds)
-	delete(l.spare_watches)
 	delete(l.ready)
 	delete(l.running)
 	delete(l.timers)

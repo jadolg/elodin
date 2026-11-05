@@ -526,9 +526,84 @@ test_a_number_handed_out_again_is_registered_afresh :: proc(t: ^testing.T) {
 }
 
 /*
-A descriptor epoll already holds when the loop first waits on it - a watch given
-up after a failed wait, say - is armed with MOD when ADD finds it there, rather
-than the wait failing. Registered behind the loop's back here, armed for nothing.
+A waiter an event did not wake, on a registration that cannot be armed again, is
+woken to re-check rather than left parked: with no deadline it would never wake.
+
+A pipe's read end, with a reader and a writer parked on it (a read end is never
+writable). A third fiber puts /dev/null - which epoll refuses - under the number,
+while a `dup` keeps the pipe and so its registration alive, then writes. The
+event wakes the reader, and the re-arm for the writer fails.
+*/
+@(test)
+test_a_waiter_left_by_a_failed_re_arm_is_woken :: proc(t: ^testing.T) {
+	pipe: [2]linux.Fd
+	if !testing.expect(t, linux.pipe2(&pipe, {.CLOEXEC}) == .NONE, "no pipe") {
+		return
+	}
+	defer linux.close(pipe[0])
+	defer linux.close(pipe[1])
+	keep, derr := linux.dup(pipe[0])
+	if !testing.expect(t, derr == .NONE, "cannot dup the read end") {
+		return
+	}
+	defer linux.close(keep)
+	null, nerr := linux.open("/dev/null", {.CLOEXEC})
+	if !testing.expect(t, nerr == .NONE, "cannot open /dev/null") {
+		return
+	}
+	defer linux.close(null)
+	// The premise: epoll refuses /dev/null, so the re-arm on its number fails.
+	scratch, _ := linux.epoll_create1({.FDCLOEXEC})
+	ev := linux.EPoll_Event {
+		events = {.IN},
+	}
+	refused := linux.epoll_ctl(scratch, .ADD, null, &ev) != .NONE
+	linux.close(scratch)
+	if !testing.expect(t, refused, "epoll took /dev/null, so nothing here fails the re-arm") {
+		return
+	}
+	r, started := start(t)
+	if !started {
+		return
+	}
+	defer finish(r)
+	Shared :: struct {
+		reader, writer: Probe,
+		read_end:       linux.Fd,
+		write_end:      linux.Fd,
+		null:           linux.Fd,
+	}
+	s := Shared {
+		read_end  = pipe[0],
+		write_end = pipe[1],
+		null      = null,
+	}
+	// Spawned in order, and each parks before the next runs.
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		s.reader.result = wait_fd(s.read_end, {.In}, time.tick_add(time.tick_now(), WAIT))
+		sync.sema_post(&s.reader.done)
+	}, &s)
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		s.writer.result = wait_fd(s.read_end, {.Out}, time.tick_add(time.tick_now(), WAIT))
+		sync.sema_post(&s.writer.done)
+	}, &s)
+	_, _ = spawn(r.l, proc(data: rawptr) {
+		s := (^Shared)(data)
+		_, _ = linux.dup2(s.null, s.read_end)
+		_, _ = linux.write(s.write_end, transmute([]u8)string("x"))
+	}, &s)
+	testing.expect(t, sync.sema_wait_with_timeout(&s.reader.done, 2 * WAIT))
+	testing.expect_value(t, s.reader.result, Wait_Result.Ready)
+	testing.expect(t, sync.sema_wait_with_timeout(&s.writer.done, 2 * WAIT))
+	testing.expect_value(t, s.writer.result, Wait_Result.Ready)
+}
+
+/*
+A descriptor epoll already holds when the loop first waits on it is armed with
+MOD when ADD finds it there, rather than the wait failing. Registered behind the
+loop's back here, armed for nothing.
 */
 @(test)
 test_a_descriptor_epoll_already_holds_is_armed :: proc(t: ^testing.T) {
