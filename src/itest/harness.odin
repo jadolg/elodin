@@ -9,6 +9,7 @@ import "core:strings"
 import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
+import "elodin:metrics"
 
 /*
 Test harness.
@@ -1026,4 +1027,21 @@ cms_verify :: proc(r: ^Runner, der: []u8, ca_file: string) -> (payload: string, 
 		return "", false
 	}
 	return string(data), true
+}
+
+/*
+How many descriptors a process holds, counted off `/proc/<pid>/fd` (`pid` 0 is
+this process), or false when the directory cannot be read to the end.
+
+Counted by `metrics.descriptor_count`, which opens none of the entries:
+`os.read_dir` opens every entry it lists to fill in a `File_Info`, so a
+descriptor closed between the listing and the open - a connection the server is
+finishing with, a mock thread's socket - fails the whole read with ENOENT. The
+one `opendir` holds is counted when `pid` is this process, the same on every
+reading.
+*/
+open_descriptor_count :: proc(pid: int = 0) -> (n: int, ok: bool) {
+	path: cstring = "/proc/self/fd" if pid == 0 else fmt.ctprintf("/proc/%d/fd", pid)
+	count, count_ok := metrics.descriptor_count(path)
+	return int(count), count_ok
 }

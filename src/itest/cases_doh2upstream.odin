@@ -2,7 +2,6 @@ package itest
 
 import "core:fmt"
 import "core:net"
-import "core:os"
 import "core:time"
 import "elodin:h2"
 
@@ -341,12 +340,13 @@ blocking: {{ enabled: false }}
 			mock_stop(dot)
 			// With the UDP port held, the bind fails first, and the socket it could
 			// not bind is closed rather than left open.
-			before := open_fds()
-			check(r, before >= 0, "cannot count the open descriptors")
+			before, bok := open_descriptor_count()
+			check(r, bok, "cannot count the open descriptors")
 			udp_only := mock_make("held", port)
 			check(r, !mock_start(udp_only), "the mock started on a UDP port already held")
 			mock_stop(udp_only)
-			check(r, open_fds() == before, "the failed UDP bind left its socket open")
+			after, aok := open_descriptor_count()
+			check(r, aok && after == before, "the failed UDP bind left its socket open")
 			// With the UDP port free, the plain mock binds it and then fails on TCP,
 			// closing the UDP socket it already had.
 			net.close(held_udp)
@@ -360,14 +360,4 @@ blocking: {{ enabled: false }}
 	}
 
 	delete(payload)
-}
-
-// How many descriptors this process has open, or -1 when /proc cannot say.
-@(private = "file")
-open_fds :: proc() -> int {
-	entries, err := os.read_directory_by_path("/proc/self/fd", -1, context.temp_allocator)
-	if err != nil {
-		return -1
-	}
-	return len(entries)
 }

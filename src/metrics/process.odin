@@ -201,24 +201,37 @@ this metric and is off by exactly one for the duration of the scrape.
 */
 @(private)
 open_fd_count :: proc() -> i64 {
-	dir := posix.opendir("/proc/self/fd")
+	n, ok := descriptor_count("/proc/self/fd")
+	return n if ok else -1
+}
+
+/*
+How many descriptors a `/proc/<pid>/fd` directory lists, or false when it cannot
+be read to the end.
+
+Only names are counted: nothing is opened, so a descriptor closed while the
+directory is read is simply in the count or out of it. `readdir` returns nil
+both at the end and on an error, so errno is cleared before each call and read
+after, and a listing cut short is a failure rather than a smaller count.
+*/
+descriptor_count :: proc(dir_path: cstring) -> (n: i64, ok: bool) {
+	dir := posix.opendir(dir_path)
 	if dir == nil {
-		return -1
+		return 0, false
 	}
 	defer posix.closedir(dir)
 
-	count: i64
 	for {
+		posix.set_errno(.NONE)
 		entry := posix.readdir(dir)
 		if entry == nil {
-			break
+			return n, posix.get_errno() == .NONE
 		}
 		if is_dot_entry(entry) {
 			continue
 		}
-		count += 1
+		n += 1
 	}
-	return count
 }
 
 /*
