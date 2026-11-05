@@ -129,10 +129,12 @@ them.
   `max_pending`. Connections are reused, so the cap bounds concurrent clients,
   not queries per second.
 
-A held TCP connection costs about 21 KB resident after a query - the stack its
-fiber touched and its scratch - and a DoT or DoH/2 one about 55 KB, most of it
-OpenSSL's session. An idle TLS connection hands its record buffers back
-(`SSL_MODE_RELEASE_BUFFERS`) and takes them again for its next record. A loop
+A held TCP connection costs about 9 KB resident after a query - its scratch and
+the page of stack its fiber is parked on, since a connection that has waited a
+quarter of a second for its next query hands the rest of its stack back - and a
+DoT or DoH/2 one about 45 KB, most of it OpenSSL's session. An idle TLS
+connection hands its record buffers back (`SSL_MODE_RELEASE_BUFFERS`) and takes
+them again for its next record. A loop
 keeps the stacks of finished connections and queries warm for the next ones and
 gives back all but eight once it has had nothing to do for a
 second. `--check` and startup warn when `max_connections` at 128 KB each is more

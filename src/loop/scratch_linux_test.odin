@@ -107,13 +107,13 @@ counting_proc :: proc(
 
 // The kernel's page, which mincore(2) wants its start aligned to: 16 KiB or
 // 64 KiB on some arm64 kernels.
-@(private = "file")
+@(private)
 page_size :: proc() -> uintptr {
 	return uintptr(posix.sysconf(._PAGESIZE))
 }
 
 // Pages of `b` resident, by mincore(2) over the pages it spans.
-@(private = "file")
+@(private)
 residency :: proc(b: []u8) -> (pages: int, err: linux.Errno) {
 	page := page_size()
 	start := uintptr(raw_data(b)) &~ (page - 1)

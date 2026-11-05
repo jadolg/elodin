@@ -2132,9 +2132,13 @@ takes the RST with it, which is no worse than not draining at all.
 Reached only from a connection that has answered something, for the same reason:
 with nothing written there is nothing for the RST to take back, and the drain
 would be time out of one of `max_connections` spent protecting nothing.
+
+Never inlined, nor is `http_linger`: their 4 KiB chunk would join the frame of
+the connection loop that calls them, which is live under every idle wait, and keep a
+page of each held connection's stack resident for nothing (#596).
 */
 @(private)
-stream_linger :: proc(conn: Conn) {
+stream_linger :: #force_no_inline proc(conn: Conn) {
 	conn_set_read_timeout(conn, STREAM_LINGER_IDLE)
 	start := loop.tick_now()
 	chunk: [4096]u8
@@ -2316,7 +2320,15 @@ conn_read_budgeted :: proc(c: Conn, buf: []u8, b: ^Read_Budget) -> (n: int, ok: 
 	if !conn_arm_read(c, b, loop.tick_now()) {
 		return 0, false
 	}
+	/*
+	No deadline yet is a connection between messages, waiting for as long as the
+	client cares to keep it open. Parked there for `loop.IDLE_TRIM_AFTER`, the
+	fiber hands back the stack its last query touched (#596): most of what an
+	idle TCP, DoT or DoH connection costs.
+	*/
+	loop.set_idle(b.deadline == (time.Tick{}))
 	n, ok = conn_read(c, buf)
+	loop.set_idle(false)
 	if ok && b.idle > 0 && b.deadline == (time.Tick{}) {
 		b.deadline = time.tick_add(loop.tick_now(), b.idle)
 	}

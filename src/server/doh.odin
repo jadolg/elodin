@@ -150,13 +150,20 @@ Http_Reader :: struct {
 
 @(private)
 http_fill :: proc(r: ^Http_Reader) -> bool {
-	chunk: [4096]u8
-	n, ok := conn_read_budgeted(r.conn, chunk[:], &r.budget)
-	if !ok {
+	/*
+	Straight into the buffer's free capacity, not through a chunk on the stack: the
+	read between requests is where an idle connection parks, and a 4 KiB chunk
+	there is a page the parked fiber keeps resident for as long as the client
+	keeps the connection (#596). Grown by doubling once full, as `append` grows it.
+	*/
+	have := len(r.buf)
+	if have == cap(r.buf) && reserve(&r.buf, max(2 * cap(r.buf), HTTP_BUF_SIZE)) != nil {
 		return false
 	}
-	append(&r.buf, ..chunk[:n])
-	return true
+	_ = non_zero_resize(&r.buf, cap(r.buf))
+	n, ok := conn_read_budgeted(r.conn, r.buf[have:], &r.budget)
+	_ = resize(&r.buf, have + (n if ok else 0))
+	return ok
 }
 
 /*
@@ -1013,7 +1020,7 @@ passed rather than defaulted so that a path added later has to answer the questi
 rather than inherit an answer.
 */
 @(private)
-http_linger :: proc(conn: Conn, idle: time.Duration) {
+http_linger :: #force_no_inline proc(conn: Conn, idle: time.Duration) {
 	// Not `net.set_option`: over DoH the connection is a TLS one, where the socket
 	// option stopped applying at the handshake - see `conn_set_read_timeout`.
 	conn_set_read_timeout(conn, idle)

@@ -110,8 +110,12 @@ Whether the binary is built with AddressSanitizer, skipping case `name` if so.
 A sanitizer's runtime answers malloc itself and ignores glibc's settings, and
 its quarantine grows every process alike.
 */
-@(private = "file")
-built_with_asan :: proc(r: ^Runner, name: string) -> bool {
+@(private)
+built_with_asan :: proc(
+	r: ^Runner,
+	name: string,
+	reason := "the binary is built with AddressSanitizer, whose allocator is not glibc's",
+) -> bool {
 	// Heap: the temp allocator is not reset until the next case ends, and a
 	// skip from here ends none.
 	exe, xerr := os.read_entire_file(r.binary, context.allocator)
@@ -122,7 +126,7 @@ built_with_asan :: proc(r: ^Runner, name: string) -> bool {
 	asan := strings.contains(string(exe), "__asan_init")
 	delete(exe)
 	if asan {
-		skip_case(r, name, "the binary is built with AddressSanitizer, whose allocator is not glibc's")
+		skip_case(r, name, reason)
 	}
 	return asan
 }

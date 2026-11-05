@@ -1205,7 +1205,7 @@ connection reset, which is exactly the bare closed connection the status was
 added to replace.
 
 So the drain has to happen before the close. The body here is larger than one
-`http_fill` chunk, which is what leaves bytes behind for the close to trip over -
+`http_fill` read, which is what leaves bytes behind for the close to trip over -
 a request that fits in the first read is drained by having been read. The client
 shuts down its sending half rather than closing outright, so the drain ends on the
 end of the data instead of on its timeout, and can still read afterwards.
