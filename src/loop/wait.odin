@@ -33,9 +33,6 @@ and the interest registered is the union of what they want.
 @(private)
 Fd_Watch :: struct {
 	waiters: [dynamic]Fd_Waiter,
-	// Whether epoll has been given this descriptor, armed or not. What the
-	// re-arm tries first; see `watch_update`.
-	added:   bool,
 }
 
 @(private)
@@ -66,8 +63,8 @@ wait_fd :: proc(fd: linux.Fd, events: Events, deadline: Tick) -> Wait_Result {
 	if f.cancelled {
 		return .Cancelled
 	}
-	// Kept in `fds` once made, waited on or not: `added` is what the next wait
-	// on the number arms from, and `destroy` frees them.
+	// Kept in `fds` once made, waited on or not, so a wait that parks allocates
+	// nothing; `destroy` frees them.
 	w := l.fds[fd]
 	if w == nil {
 		w = new(Fd_Watch, l.allocator)
@@ -101,9 +98,9 @@ wait that parks.
 Armed on every wait, never trusted from the last one. The descriptor may have
 been closed and its number handed out again since, and the close took the old
 registration away with it; nothing else would tell the new one's waiters it was
-missing. So the call is MOD while epoll has had the number, which fails with
-ENOENT for a new descriptor under it and becomes an ADD, and ADD the first time,
-which fails with EEXIST when it had one after all and becomes a MOD.
+missing. So the call is MOD, which fails with ENOENT for a descriptor epoll does
+not hold - the first wait on a number, or a new descriptor under an old one - and
+becomes an ADD.
 */
 @(private)
 watch_update :: proc(l: ^Loop, fd: linux.Fd, w: ^Fd_Watch) -> bool {
@@ -120,18 +117,11 @@ watch_update :: proc(l: ^Loop, fd: linux.Fd, w: ^Fd_Watch) -> bool {
 		events = want,
 		data = {fd = fd},
 	}
-	op := linux.EPoll_Ctl_Opcode.MOD if w.added else .ADD
-	err := linux.epoll_ctl(l.epfd, op, fd, &ev)
-	if op == .MOD && err == .ENOENT {
+	err := linux.epoll_ctl(l.epfd, .MOD, fd, &ev)
+	if err == .ENOENT {
 		err = linux.epoll_ctl(l.epfd, .ADD, fd, &ev)
-	} else if op == .ADD && err == .EEXIST {
-		err = linux.epoll_ctl(l.epfd, .MOD, fd, &ev)
 	}
-	if err != .NONE {
-		return false
-	}
-	w.added = true
-	return true
+	return err == .NONE
 }
 
 /*
@@ -146,7 +136,8 @@ watch_leave :: proc(l: ^Loop, fd: linux.Fd, f: ^Fiber) {
 	}
 	for i := len(w.waiters) - 1; i >= 0; i -= 1 {
 		if w.waiters[i].fiber == f {
-			unordered_remove(&w.waiters, i)
+			// Ordered, so the waiters left keep the order `dispatch_event` wakes in.
+			ordered_remove(&w.waiters, i)
 		}
 	}
 }
@@ -165,13 +156,18 @@ dispatch_event :: proc(l: ^Loop, ev: linux.EPoll_Event) {
 	broken := ev.events & {.ERR, .HUP} != {}
 	readable := broken || ev.events & {.IN, .RDHUP} != {}
 	writable := broken || .OUT in ev.events
-	for i := len(w.waiters) - 1; i >= 0; i -= 1 {
-		waiter := w.waiters[i]
+	// Woken in the order they parked, and those left keep theirs, so the
+	// longest waiter on a shared socket is not the last to run every time.
+	kept := 0
+	for waiter in w.waiters {
 		if (readable && .In in waiter.events) || (writable && .Out in waiter.events) {
 			wake_local(waiter.fiber, waiter.token, .Ready)
-			unordered_remove(&w.waiters, i)
+		} else {
+			w.waiters[kept] = waiter
+			kept += 1
 		}
 	}
+	resize(&w.waiters, kept)
 	/*
 	Those it did not wake - a writer on a connection whose reply just came in -
 	are still parked on a registration that is not armed any more. When it
