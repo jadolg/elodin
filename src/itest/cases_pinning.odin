@@ -1,10 +1,10 @@
 package itest
 
 import "core:fmt"
-import "core:os"
 import "core:slice"
 import "core:strconv"
 import "core:time"
+import "elodin:config"
 import "elodin:loop"
 
 /*
@@ -42,13 +42,10 @@ blocking: {{ enabled: false }}
 // The CPU of each of `pid`'s threads that is allowed exactly one, sorted.
 @(private = "file")
 pinned_thread_cpus :: proc(pid: int) -> (cpus: []int, ok: bool) {
-	entries, err := os.read_directory_by_path(fmt.tprintf("/proc/%d/task", pid), -1, context.temp_allocator)
-	if err != nil {
-		return
-	}
+	ids := task_ids(pid) or_return
 	found := make([dynamic]int, context.temp_allocator)
-	for e in entries {
-		list, read := proc_status_field(fmt.tprintf("/proc/%d/task/%s/status", pid, e.name), "Cpus_allowed_list")
+	for id in ids {
+		list, read := proc_status_field(fmt.tprintf("/proc/%d/task/%s/status", pid, id), "Cpus_allowed_list")
 		if !read {
 			continue // a thread that has just ended
 		}
@@ -117,8 +114,10 @@ run_pinning_cases :: proc(r: ^Runner) {
 	more loops than CPUs none is pinned. The warning is what decides it: it is
 	written before any loop's thread starts. The thread list is a second look.
 	*/
-	start_case(r, "server.pin_loops: with more loops than CPUs, none is pinned")
-	{
+	if len(allowed) >= config.MAX_UDP_READERS {
+		skip_case(r, "server.pin_loops: with more loops than CPUs, none is pinned", "one loop past this run's CPUs is past the most listeners.udp.readers takes")
+	} else {
+		start_case(r, "server.pin_loops: with more loops than CPUs, none is pinned")
 		udp_port := next_port(r)
 		srv, ok := start_server(r, Server_Options{config = config_pinning(udp_port, upstream_port, len(allowed) + 1, true), udp_port = udp_port})
 		if check(r, ok, "server did not start") {
@@ -130,8 +129,8 @@ run_pinning_cases :: proc(r: ^Runner) {
 			}
 			check(r, log_contains(&srv, "the event loops run unpinned"), "startup did not warn that the loops run unpinned; log:\n%s", read_log(&srv))
 		}
+		end_case(r)
 	}
-	end_case(r)
 
 	start_case(r, "server.pin_loops: off by default, no thread is held to one CPU")
 	{

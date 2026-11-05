@@ -83,6 +83,9 @@ elodin's.
 - The CPUs are the ones the process may run on: its affinity, as `taskset`, a
   cpuset or systemd's `CPUAffinity=` sets it. Loop i takes the i-th of them, and
   startup logs the plan (`server.pin_loops: pinning the event loops to CPUs [0, 1]`).
+  CPU numbers are not cores: if two of them are hyperthreads of one core, the
+  loops on them share that core. To give each loop a core of its own, set the
+  affinity to one hyperthread per core (`lscpu -e` shows the pairs).
 - With more loops (`listeners.udp.readers`) than CPUs, no loop is pinned, since
   two loops pinned to one CPU would queue behind each other for good. Startup
   warns.

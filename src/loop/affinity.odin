@@ -8,8 +8,9 @@ import "core:sys/linux"
 CPU_MASK_WORDS :: 128
 
 /*
-The CPUs this process may run on, in order: its affinity, which `taskset`, a
-cpuset cgroup or systemd's `CPUAffinity=` narrow. Empty when it cannot be read.
+The CPUs the calling thread may run on, in order: its affinity, which `taskset`, a
+cpuset cgroup or systemd's `CPUAffinity=` narrow. On a thread nothing has pinned,
+the main thread at startup, that is the process's. Empty when it cannot be read.
 */
 allowed_cpus :: proc(allocator := context.allocator) -> []int {
 	mask: [CPU_MASK_WORDS]u64
