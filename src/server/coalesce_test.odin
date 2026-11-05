@@ -1,6 +1,5 @@
 package server
 
-import "core:crypto/siphash"
 import "core:fmt"
 import "core:net"
 import "core:sync"
@@ -614,6 +613,9 @@ second, and each still gathers its followers (#612).
 test_a_thousand_distinct_misses_each_lead :: proc(t: ^testing.T) {
 	N :: 1000
 	s: Server
+	// A fixed seed: under a drawn one, about one run in ten thousand fills a window.
+	s.inflight.seed = {16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
+	s.inflight.seeded.done = true
 	flights := make([]Flight, N)
 	defer delete(flights)
 	keys := make([]string, N)
@@ -653,10 +655,10 @@ which a client cannot know.
 @(test)
 test_a_full_flight_window_forwards_without_joining :: proc(t: ^testing.T) {
 	s: Server
-	s.inflight.seeded = true
 	s.inflight.seed = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	home :: proc(s: ^Server, key: string) -> u64 {
-		return siphash.sum_bytes_2_4(transmute([]u8)key, s.inflight.seed[:]) % INFLIGHT_SLOTS
+	s.inflight.seeded.done = true
+	home :: proc(s: ^Server, key: string) -> int {
+		return flight_home(&s.inflight, key)
 	}
 	keys: [dynamic]string
 	defer {

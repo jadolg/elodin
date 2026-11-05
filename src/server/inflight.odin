@@ -82,9 +82,9 @@ INFLIGHT_PROBE :: 16
 Inflight_Table :: struct {
 	mu:        sync.Mutex,
 	slots:     [INFLIGHT_SLOTS]^Flight,
-	// The SipHash key for `slots`, drawn at the first join; see `INFLIGHT_SLOTS`.
+	// The SipHash key for `slots`, drawn at the first join; see `flight_home`.
 	seed:      [16]u8,
-	seeded:    bool,
+	seeded:    sync.Once,
 	// Followers waiting on a leader; see `follower_ceiling`.
 	followers: int,
 }
@@ -203,13 +203,9 @@ flight_join :: proc(
 	flight: ^Flight,
 	counted: bool,
 ) {
+	home := flight_home(&s.inflight, key)
 	sync.mutex_lock(&s.inflight.mu)
 	defer sync.mutex_unlock(&s.inflight.mu)
-	if !s.inflight.seeded {
-		crypto.rand_bytes(s.inflight.seed[:])
-		s.inflight.seeded = true
-	}
-	home := int(siphash.sum_bytes_2_4(transmute([]u8)key, s.inflight.seed[:]) % INFLIGHT_SLOTS)
 	free_slot := -1
 	// The whole window, holes and all: a land leaves a hole wherever its flight sat.
 	for probe in 0 ..< INFLIGHT_PROBE {
@@ -240,6 +236,20 @@ flight_join :: proc(
 	}
 	s.inflight.slots[free_slot] = own
 	return own, false
+}
+
+/*
+Where `key`'s window starts. Hashed outside the lock every miss takes; the seed
+is drawn once, at the first join, so a `Server` built as a literal needs nothing
+initialised.
+*/
+@(private)
+flight_home :: proc(t: ^Inflight_Table, key: string) -> int {
+	sync.once_do(&t.seeded, proc(data: rawptr) {
+		seed := (^[16]u8)(data)
+		crypto.rand_bytes(seed[:])
+	}, &t.seed)
+	return int(siphash.sum_bytes_2_4(transmute([]u8)key, t.seed[:]) % INFLIGHT_SLOTS)
 }
 
 /*
