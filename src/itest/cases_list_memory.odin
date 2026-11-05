@@ -326,12 +326,10 @@ while it is taken.
 The case reads the server's count while the server is closing connections -
 `wait_tcp`'s probe at the first reading, the whole burst in the wait after it.
 `os.read_dir` opens every entry it lists, so one closed between the listing and
-the open failed the reading, which failed the case as "cannot read the server's
-status", or read as zero in the wait and passed it. A thread here opens and
-closes a descriptor without pause: the old reading is first seen to fail under
-it - the premise, waited for, with a deadline that only ends a run where it
-never does - and then `open_descriptor_count` is taken as many times again and
-must never fail.
+the open fails its reading. A thread here opens and closes a descriptor without
+pause: `os.read_dir` is first seen to fail under it - the premise, waited for,
+with a deadline that only ends a run where it never does - and then
+`open_descriptor_count` is taken as many times again and must never fail.
 */
 @(private = "file")
 descriptor_count_case :: proc(r: ^Runner) {
@@ -478,7 +476,10 @@ blocking: {{ enabled: false }}
 		time.sleep(20 * time.Millisecond)
 		fds2, f2ok = open_descriptor_count(pid)
 	}
-	if !check(r, f2ok && fds2 <= fds0, "descriptors still at %d (from %d) after the connections closed", fds2, fds0) {
+	if !check(r, f2ok, "cannot count the server's descriptors after the connections closed") {
+		return
+	}
+	if !check(r, fds2 <= fds0, "descriptors still at %d (from %d) after the connections closed", fds2, fds0) {
 		return
 	}
 	/*

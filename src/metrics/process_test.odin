@@ -38,3 +38,17 @@ test_a_dot_entry_is_read_no_further_than_its_name :: proc(t: ^testing.T) {
 		libc.free(p)
 	}
 }
+
+// A directory read to the end is a count, and one that cannot be read is a
+// failure rather than a count of zero.
+@(test)
+test_descriptor_count_reads_or_fails :: proc(t: ^testing.T) {
+	n, ok := descriptor_count("/proc/self/fd")
+	testing.expect(t, ok, "/proc/self/fd could not be counted")
+	// The standard three, less fd 0, which `odin test` closes, plus the one
+	// `opendir` holds.
+	testing.expectf(t, n >= 2, "only %d descriptors counted", n)
+
+	_, missing := descriptor_count("/proc/self/no-such-directory")
+	testing.expect(t, !missing, "a directory that does not exist was counted")
+}
