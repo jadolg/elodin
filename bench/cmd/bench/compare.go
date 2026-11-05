@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"net"
+	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +25,9 @@ func (h *harness) compare() (section, error) {
 	if runtime.NumCPU() < 4 {
 		return section{title: "Against the competition", body: "Skipped: needs four CPUs.\n"}, nil
 	}
+	if err := checkReceiveBuffer(); err != nil {
+		return section{}, err
+	}
 	var notes []string
 	fail := func(kind, what string, err error) string {
 		notes = append(notes, fmt.Sprintf("- %s, %s: %v", h.serverLabel(kind), what, oneLine(err)))
@@ -39,6 +44,29 @@ func (h *harness) compare() (section, error) {
 		sb.WriteString("\nCells that failed:\n\n" + strings.Join(notes, "\n") + "\n")
 	}
 	return section{title: "Against the competition", body: sb.String()}, nil
+}
+
+// equalReceiveBuffer is the UDP receive buffer elodin asks for
+// (listeners.udp.receive_buffer). Most of the other servers have no setting
+// for theirs and take net.core.rmem_default, 208 KiB untuned, which a burst of
+// a thousand queries overflows: each query the kernel drops is a client
+// waiting out its timeout, and the row then measures the timeout. With the
+// default at elodin's figure every server reads from the same size of buffer.
+const equalReceiveBuffer = 1 << 20
+
+func checkReceiveBuffer() error {
+	b, err := os.ReadFile("/proc/sys/net/core/rmem_default")
+	if err != nil {
+		return err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return err
+	}
+	if n < equalReceiveBuffer {
+		return fmt.Errorf("net.core.rmem_default is %d; the comparison needs every server's UDP buffer at elodin's %d: sudo sysctl net.core.rmem_default=%d", n, equalReceiveBuffer, equalReceiveBuffer)
+	}
+	return nil
 }
 
 // failer records why a cell failed and returns what the cell reads.
@@ -97,6 +125,11 @@ func (h *harness) compareHits(sb *strings.Builder, fail failer) {
 			fmt.Fprintf(sb, " | %s |||||\n", fail(kind, "start", err))
 			continue
 		}
+		// Asked once before the clients start, so the rows measure answers from
+		// the cache rather than a hundred clients at once asking a name the
+		// server has not seen: BIND drops the copies of one question past
+		// clients-per-query (10) while the first is upstream.
+		_ = waitReady(s.dnsAddr, 5*time.Second, "cached.bench.test")
 		for _, t := range []string{"udp", "tcp", "dot", "doh1", "doh2"} {
 			sb.WriteString(" | " + h.hitCell(s, kind, t, fail))
 		}
@@ -120,32 +153,112 @@ func (h *harness) hitCell(s *server, kind, t string, fail failer) string {
 	return fmt.Sprintf("%s / %s / %d µs%s", thousands(r.QPS), ms(r.P99ms), sm.CPUPerQuery(r.Answered).Microseconds(), timedOut(r))
 }
 
-// compareMisses is the cache-miss ceiling on two cores.
+// missLadder is the offered cache-miss rates compareMisses climbs, and
+// missClients enough clients that none of them is the limit: at 100,000 a
+// second and a 20 ms upstream, 2,000 queries are waiting at once.
+var missLadder = []int{2000, 5000, 10000, 25000, 50000, 75000, 100000}
+
+const missClients = 4000
+
+// missClean is the share of queries a step may lose and still count as
+// carried: a server that answers half its queries faster is not faster.
+const missClean = 0.001
+
+// compareMisses is the cache-miss ceiling on two cores, as offered load rather
+// than as many clients as fast as they can: a closed loop of clients measures
+// the generator's timeout as soon as a server drops one query, since that
+// client then waits the timeout out. Each server climbs missLadder until a
+// step loses more than missClean or falls 3% short of the rate offered; the
+// row is the last step it carried, and the first step, which every server is
+// asked at, is the equal-load comparison.
 func (h *harness) compareMisses(sb *strings.Builder, fail failer) {
-	const missClients = 1000
-	fmt.Fprintf(sb, "\n### Cache misses on two cores\n\nAs above, %s clients over UDP, every name unique, "+
-		"upstream at %s, the in-flight bound raised to 4,096 wherever the server has one. "+
-		"The generator cannot ask faster than %s qps.\n\n",
-		thousands(missClients), *upstreamRTT, thousands(missClients/upstreamRTT.Seconds()))
-	sb.WriteString("| server | cache misses | p50 | p99 | timed out | CPU per miss |\n|---|---|---|---|---|---|\n")
+	fmt.Fprintf(sb, "\n### Cache misses on two cores\n\nAs above, every name unique, upstream at %s, the "+
+		"in-flight bound raised to 4,096 wherever the server has one. The load is offered at a fixed rate "+
+		"and climbs %s qps until a step loses more than %.1f%% of its queries or answers under 97%% of "+
+		"the rate; sustained is the last step carried, with its latency and CPU. At %s qps is every "+
+		"server at the same load, median of %d.\n\n",
+		*upstreamRTT, ladderText(), missClean*100, thousands(float64(missLadder[0])), *repeat)
+	fmt.Fprintf(sb, "| server | sustained | p50 / p99 there | CPU per miss there | at %s qps: p50 / p99 / CPU | lost at the next step |\n|---|---|---|---|---|---|\n",
+		thousands(float64(missLadder[0])))
 	for _, kind := range h.kinds {
 		s, err := h.startServer(serverOpts{name: "cmp-miss", kind: kind, cache: true, loops: 2, cpus: "0-1", maxPending: 4096})
 		if err != nil {
 			fmt.Fprintf(sb, "| %s | %s |||||\n", h.serverLabel(kind), fail(kind, "start", err))
 			continue
 		}
-		r, sm, err := h.load(s, loadOpts{transport: "udp", clients: missClients, qmode: "unique", cpus: "2-3"})
+		row, err := h.missRow(s)
 		s.stop()
-		if err == nil {
-			err = expectRcode(r, "noerror")
-		}
 		if err != nil {
 			fmt.Fprintf(sb, "| %s | %s |||||\n", h.serverLabel(kind), fail(kind, "misses", err))
 			continue
 		}
-		fmt.Fprintf(sb, "| %s | %s qps | %s | %s | %s | %d µs |\n", h.serverLabel(kind), thousands(r.QPS),
-			ms(r.P50ms), ms(r.P99ms), thousands(float64(r.Errors)), sm.CPUPerQuery(r.Answered).Microseconds())
+		fmt.Fprintf(sb, "| %s | %s |\n", h.serverLabel(kind), row)
 	}
+}
+
+func ladderText() string {
+	parts := make([]string, len(missLadder))
+	for i, r := range missLadder {
+		parts[i] = thousands(float64(r))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// missRow climbs the ladder against a running server and formats its cells.
+func (h *harness) missRow(s *server) (string, error) {
+	type step struct {
+		rate int
+		r    Result
+		sm   sample
+	}
+	run := func(rate, n int) (step, error) {
+		r, sm, err := h.load(s, loadOpts{transport: "udp", clients: missClients, qmode: "unique", rate: rate, cpus: "2-3", repeat: n})
+		if err == nil && r.Answered > 0 {
+			err = expectRcode(r, "noerror")
+		}
+		return step{rate, r, sm}, err
+	}
+	carried := func(st step) bool {
+		asked := st.r.Answered + st.r.Errors
+		return asked > 0 && float64(st.r.Errors) <= missClean*float64(asked) && st.r.QPS >= 0.97*float64(st.rate)
+	}
+	lost := func(st step) string {
+		asked := st.r.Answered + st.r.Errors
+		if asked == 0 {
+			return "all"
+		}
+		return fmt.Sprintf("%.1f%% at %s (answered %s qps)", 100*float64(st.r.Errors)/float64(asked),
+			thousands(float64(st.rate)), thousands(st.r.QPS))
+	}
+	// A fresh server's first seconds of misses are slower than the rest (its
+	// upstream sockets, timers and tables coming up), which the equal-load
+	// cell is not about; a short run it does not count is taken first.
+	if _, _, err := h.load(s, loadOpts{transport: "udp", clients: missClients, qmode: "unique", rate: missLadder[0],
+		cpus: "2-3", repeat: 1, duration: 5 * time.Second}); err != nil {
+		return "", err
+	}
+	first, err := run(missLadder[0], 0)
+	if err != nil {
+		return "", err
+	}
+	equal := fmt.Sprintf("%s / %s / %d µs", ms(first.r.P50ms), ms(first.r.P99ms), first.sm.CPUPerQuery(first.r.Answered).Microseconds())
+	if !carried(first) {
+		return fmt.Sprintf("under %s | — | — | %s | %s", thousands(float64(first.rate)), equal, lost(first)), nil
+	}
+	best, next := first, "— (carried every step)"
+	for _, rate := range missLadder[1:] {
+		st, err := run(rate, 1)
+		if err != nil {
+			return "", err
+		}
+		if !carried(st) {
+			next = lost(st)
+			break
+		}
+		best = st
+	}
+	return fmt.Sprintf("%s qps | %s / %s | %d µs | %s | %s", thousands(float64(best.rate)), ms(best.r.P50ms), ms(best.r.P99ms),
+		best.sm.CPUPerQuery(best.r.Answered).Microseconds(), equal, next), nil
 }
 
 // heldN is how many connections, and how many queries in flight, the held
@@ -154,13 +267,17 @@ const heldN = 1000
 
 // compareHeld is what a held connection and a waiting query cost.
 func (h *harness) compareHeld(sb *strings.Builder, fail failer) error {
-	mock, err := h.startMock(3 * time.Second)
+	// Long enough for the sampler to see every query waiting at once, and no
+	// longer: BIND retransmits after 800 ms and backs off, dropping the late
+	// replies, so behind 1.5 s it answers after five; Blocky gives up on an
+	// attempt after about three.
+	mock, err := h.startMock(time.Second)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(sb, "\n### What a held connection and a waiting query cost\n\n%s clients each ask one "+
 		"cached name and hold the connection idle; (RSS held − RSS before) ÷ N. In flight is %s unique "+
-		"names behind a 3 s upstream, cache off; (peak − idle) ÷ N, with how many were answered.\n\n",
+		"names behind a 1 s upstream, cache off; (peak − idle) ÷ N, with how many were answered.\n\n",
 		thousands(heldN), thousands(heldN))
 	sb.WriteString("| server | per idle TCP | per idle DoT | per idle DoH/2 | per query in flight |\n|---|---|---|---|---|\n")
 	for _, kind := range h.kinds {
@@ -325,8 +442,11 @@ func oneLine(err error) string {
 // timedOut marks a cell whose server dropped queries, so one that sheds
 // cannot read as one that is merely slower.
 func timedOut(r Result) string {
-	if r.Errors == 0 {
-		return ""
+	switch {
+	case r.Reconnects > 0:
+		return fmt.Sprintf(" (**%s failed, %s reconnects**)", thousands(float64(r.Errors)), thousands(float64(r.Reconnects)))
+	case r.Errors > 0:
+		return fmt.Sprintf(" (**%s timed out**)", thousands(float64(r.Errors)))
 	}
-	return fmt.Sprintf(" (**%s timed out**)", thousands(float64(r.Errors)))
+	return ""
 }

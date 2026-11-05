@@ -185,7 +185,7 @@ func (h *harness) start(o serverOpts) (*server, error) {
 	}
 	s.pid = s.cmd.Process.Pid
 
-	if err := waitReady(s.dnsAddr, 15*time.Second); err != nil {
+	if err := waitReady(s.dnsAddr, 15*time.Second, "ready.bench.test"); err != nil {
 		s.stop()
 		said, _ := os.ReadFile(stderr.Name())
 		return nil, fmt.Errorf("%s (%s) did not come up: %w\n%s", o.name, o.kind, err, strings.TrimSpace(string(said)))
@@ -324,7 +324,7 @@ func (h *harness) unboundConfig(o serverOpts, p ports, logPath string) ([]string
 
 // waitReady polls until a query is answered, so a run never starts against a
 // server that is still binding its listeners.
-func waitReady(addr string, within time.Duration) error {
+func waitReady(addr string, within time.Duration, qname string) error {
 	deadline := time.Now().Add(within)
 	var last error
 	for time.Now().Before(deadline) {
@@ -334,7 +334,7 @@ func waitReady(addr string, within time.Duration) error {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		q := dnswire.Query(1, "ready.bench.test", dnswire.TypeA, 0)
+		q := dnswire.Query(1, qname, dnswire.TypeA, 0)
 		// Long enough for the slowest mock a row starts (three seconds): a
 		// server that coalesces answers a later probe from the first one's
 		// question, but one that does not answers only the probe that asked.

@@ -42,6 +42,7 @@ var (
 	out           = flag.String("out", "", "write the markdown report here as well as to stdout")
 	repeat        = flag.Int("repeat", 3, "run each measured scenario this many times and keep the median")
 	survey        = flag.String("survey", "", "instead of benchmarking, run the DNSSEC survey against this reference resolver (e.g. 9.9.9.9:53)")
+	mockCPUs      = flag.String("mock-cpus", "", "pin the mock upstream to these CPUs (taskset -c); 2-3 keeps it off the cores the compare rows give the server")
 	cooldown      = flag.Duration("cooldown", 15*time.Second, "idle time between runs, so a thermally limited machine does not drift across the matrix")
 )
 
@@ -224,7 +225,11 @@ func (h *harness) startMock(delay time.Duration) (string, error) {
 		return "", err
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	mock := exec.Command(h.mockdns, "-addr", addr, "-delay", delay.String())
+	argv := []string{h.mockdns, "-addr", addr, "-delay", delay.String()}
+	if *mockCPUs != "" {
+		argv = append([]string{"taskset", "-c", *mockCPUs}, argv...)
+	}
+	mock := exec.Command(argv[0], argv[1:]...)
 	mock.Stderr = nil
 	if err := mock.Start(); err != nil {
 		return "", fmt.Errorf("starting mockdns: %w", err)

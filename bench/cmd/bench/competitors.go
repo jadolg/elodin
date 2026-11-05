@@ -282,6 +282,9 @@ options {
 %s  recursive-clients %d;
   tcp-clients %d;
   http-listener-clients %d;
+  # BIND's listen backlog is 10 by default, which a thousand clients
+  # connecting at once overflow; the kernel's own ceiling, as the others use.
+  tcp-listen-queue 4096;
   tcp-initial-timeout %d;
   tcp-idle-timeout %d;
   minimal-responses no-auth;

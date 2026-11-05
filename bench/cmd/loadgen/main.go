@@ -61,6 +61,9 @@ type Result struct {
 	P99ms        float64          `json:"p99_ms"`
 	MinPerClient int64            `json:"min_per_client"`
 	MaxPerClient int64            `json:"max_per_client"`
+	// Reconnects is how often a TCP or DoT client found its connection
+	// broken and dialled again.
+	Reconnects int64 `json:"reconnects"`
 }
 
 func main() {
@@ -189,17 +192,21 @@ func run(c config) (Result, error) {
 	}
 
 	rec := hist.New(1 << 20)
-	var answered, errors atomic.Int64
+	var answered, errors, reconnects atomic.Int64
 	perClient := make([]atomic.Int64, c.clients)
 	var rcodeMu sync.Mutex
 	rcodes := map[string]int64{}
 
-	// One token bucket shared by every client when a rate is asked for. Without
-	// it the generator runs open-loop and the numbers describe the generator.
-	var ticker *time.Ticker
+	// One schedule shared by every client when a rate is asked for: each query
+	// takes the next slot and waits for its time. Without it the generator runs
+	// open-loop and the numbers describe the generator. A time.Ticker does not
+	// do: it drops the ticks nobody was waiting on, and above a few thousand a
+	// second it delivers a fraction of the rate asked for.
+	var slots atomic.Int64
+	var paceFrom time.Time
+	var interval time.Duration
 	if c.rate > 0 {
-		ticker = time.NewTicker(time.Second / time.Duration(c.rate))
-		defer ticker.Stop()
+		interval = time.Second / time.Duration(c.rate)
 	}
 
 	// Unique names carry the run's own nonce: the repeats of a row share one
@@ -222,7 +229,11 @@ func run(c config) (Result, error) {
 				errCh <- err
 				return
 			}
-			defer cl.Close()
+			defer func() {
+				if cl != nil {
+					cl.Close()
+				}
+			}()
 
 			<-start
 
@@ -236,8 +247,11 @@ func run(c config) (Result, error) {
 					local := make([]time.Duration, 0, 1<<14)
 					var counter uint64
 					for time.Now().Before(deadline) {
-						if ticker != nil {
-							<-ticker.C
+						if interval > 0 {
+							due := paceFrom.Add(time.Duration(slots.Add(1)-1) * interval)
+							if d := time.Until(due); d > 0 {
+								time.Sleep(d)
+							}
 						}
 						name := c.qname
 						if c.qmode == "unique" {
@@ -250,6 +264,24 @@ func run(c config) (Result, error) {
 						lat := time.Since(t0)
 						if err != nil {
 							errors.Add(1)
+							// A stream the server gave up on stays broken, and
+							// asking on it again would count one failure per
+							// spin of this loop. A client dials again; so does
+							// this one. Only TCP and DoT, which run one query
+							// per connection at a time.
+							if c.transport == "tcp" || c.transport == "dot" {
+								cl.Close()
+								for {
+									if cl, err = dial(c); err == nil || !time.Now().Before(deadline) {
+										break
+									}
+									time.Sleep(10 * time.Millisecond)
+								}
+								if err != nil {
+									return
+								}
+								reconnects.Add(1)
+							}
 							continue
 						}
 						if t0.After(measureFrom) {
@@ -280,6 +312,7 @@ func run(c config) (Result, error) {
 	measureFrom = time.Now().Add(c.warmup)
 	deadline = measureFrom.Add(c.duration)
 	runStart := time.Now()
+	paceFrom = runStart
 	close(start)
 	wg.Wait()
 	elapsed := time.Since(runStart) - c.warmup
@@ -314,6 +347,7 @@ func run(c config) (Result, error) {
 		P99ms:        float64(ps[1].Microseconds()) / 1000,
 		MinPerClient: minC,
 		MaxPerClient: maxC,
+		Reconnects:   reconnects.Load(),
 	}, nil
 }
 
