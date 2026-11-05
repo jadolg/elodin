@@ -75,8 +75,8 @@ socket_deadline :: proc(fd: linux.Fd, option: linux.Socket_Option, start: Tick) 
 }
 
 /*
-Wait for `fd` until the deadline the socket option gives, computed once. False
-when the wait ended without the descriptor becoming ready: a timeout, a
+Wait for `fd` until `deadline`: the one the caller gave when it comes `armed`,
+otherwise the one the socket option gives, computed once. False when the wait ended without the descriptor becoming ready: a timeout, a
 cancellation, or a descriptor epoll will not take.
 
 A wait that ends without parking - the deadline already spent, the fiber

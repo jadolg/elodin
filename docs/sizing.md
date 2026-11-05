@@ -176,7 +176,8 @@ connection hands its record buffers back (`SSL_MODE_RELEASE_BUFFERS`) and takes
 them again for its next record. A loop
 keeps the stacks of finished connections and queries warm for the next ones,
 never more than it had in use at once, and every second gives back as many as
-it did not need in that second, down to eight. `--check` and startup warn when `max_connections` at 128 KB each is more
+it did not need in that second, down to eight. `--check` and startup warn when
+`max_connections` at 128 KB each is more
 than a quarter of the memory elodin may use:
 
 ```

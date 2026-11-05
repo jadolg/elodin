@@ -243,8 +243,14 @@ run :: proc(l: ^Loop) {
 		// Wake to trim, if there is anything to trim; see `trim_window`. The lock
 		// `trim_pending` takes is asked for only when the answer could matter: a
 		// busy round polls without waiting, and a busy round is every round under load.
-		if (timeout < 0 || timeout > i32(TRIM_AFTER / time.Millisecond)) && trim_pending(l) {
-			timeout = i32(TRIM_AFTER / time.Millisecond)
+		// To the end of the window, not a whole `TRIM_AFTER` from now: a quiet loop
+		// last woken late in a window would otherwise stretch it to nearly two.
+		if timeout != 0 {
+			left := time.tick_diff(l.clock(), time.tick_add(l.trim_from, TRIM_AFTER))
+			window := i32(clamp((left + time.Millisecond - 1) / time.Millisecond, 0, TRIM_AFTER / time.Millisecond))
+			if (timeout < 0 || timeout > window) && trim_pending(l) {
+				timeout = window
+			}
 		}
 		// Stacks still owed are unmapped a batch a round, so a round with nothing
 		// else to do comes straight back for the next batch.
