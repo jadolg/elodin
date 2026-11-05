@@ -121,8 +121,9 @@ run = [
   # Nothing in upstream or h2 measures a duration on the wall clock (#548): a
   # step of it would park members, reap pooled connections and cut deadlines
   # short or long. Deadlines are `time.Tick`; stored moments `loop.Moment`.
+  # `loop.now` and `loop.since` are the same wall clock read through the vDSO.
   """
-  if grep -rnE '\\btime\\.(now|since|diff|time_add)\\(|\\btime\\.Time\\b' src/upstream src/h2 \\
+  if grep -rnE '\\b(time|loop)\\.(now|since)\\(|\\btime\\.(diff|time_add)\\(|\\btime\\.Time\\b' src/upstream src/h2 \\
       --include='*.odin' --exclude='*_test.odin'; then
     echo 'measure durations in upstream and h2 on time.Tick or loop.Moment, not the wall clock' >&2
     exit 1

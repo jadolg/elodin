@@ -488,6 +488,7 @@ test_a_number_handed_out_again_is_registered_afresh :: proc(t: ^testing.T) {
 	if !paired2 {
 		return
 	}
+	defer linux.close(c)
 	defer linux.close(d)
 	r, started := start(t)
 	if !started {
@@ -512,7 +513,6 @@ test_a_number_handed_out_again_is_registered_afresh :: proc(t: ^testing.T) {
 		// The number now names `c`'s socket, and the old one is closed.
 		got, err := linux.dup2(s.c, s.fd)
 		s.reused = err == .NONE && got == s.fd
-		linux.close(s.c)
 		sema_post(&s.parked)
 		s.p.result = wait_fd(s.fd, {.In}, time.tick_add(time.tick_now(), WAIT))
 		sync.sema_post(&s.p.done)
