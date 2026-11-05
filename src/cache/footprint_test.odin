@@ -32,6 +32,8 @@ Resident :: struct {
 	held: int,
 	// The most `held` has been since it was last set back to `held`.
 	peak: int,
+	// How many blocks are live.
+	blocks: int,
 }
 
 @(private)
@@ -65,11 +67,13 @@ resident_proc :: proc(
 	#partial switch mode {
 	case .Free, .Resize, .Resize_Non_Zeroed:
 		r.held -= chunk(old_memory)
+		r.blocks -= 1 if old_memory != nil else 0
 	}
 	res, err := runtime.heap_allocator_proc(nil, mode, size, alignment, old_memory, old_size, loc)
 	#partial switch mode {
 	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
 		r.held += chunk(raw_data(res))
+		r.blocks += 1 if raw_data(res) != nil else 0
 	}
 	r.peak = max(r.peak, r.held)
 	return res, err
@@ -104,10 +108,11 @@ fill :: proc(c: ^Cache, n: int, edns := false) -> (stored: int) {
 smallest entries a flood of distinct names leaves behind (issue #531).
 
 An NXDOMAIN with one SOA is a few dozen bytes of wire, so what it costs is
-mostly the five allocations an entry is and its slot in the map - and the count
-has been raised so far that the byte budget is what binds, which is the setting
-under which those have to be counted. With an OPT record, as an upstream asked
-over EDNS sends it, whose slot `scan_ttl_offsets` sizes for and then drops.
+mostly the entry's own fields, the heap's header and rounding on its block, and
+its slot in the map - and the count has been raised so far that the byte budget
+is what binds, which is the setting under which those have to be counted. With
+an OPT record, as an upstream asked over EDNS sends it, which has no TTL to
+keep.
 */
 @(test)
 test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
@@ -154,6 +159,64 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 	)
 	page := int(posix.sysconf(._PAGESIZE))
 	testing.expectf(t, held - used <= held / 200 + page, "the cache undercounts: %d counted, %d held", used, held)
+}
+
+/*
+A cached A answer is one block on the heap, and what it holds is the wire, the
+key, the TTLs and their offsets with the entry's own fields (issue #599). Each
+separate block costs a pointer and a size word and is rounded to 16 bytes with
+32 the least; four small ones more per entry would be a third of what an entry
+costs.
+*/
+@(test)
+test_a_cached_answer_is_one_block :: proc(t: ^testing.T) {
+	ENTRIES :: 20_000
+	r: Resident
+	c := make_cache(Options{max_entries = 1_000_000, max_ttl = 3600}, resident_allocator(&r))
+	defer destroy(c)
+
+	kb: [KEY_MAX]u8
+	for i in 0 ..< ENTRIES {
+		name := fmt.tprintf("a%d.example.", i)
+		wire, msg := build_answer(name, 300, context.temp_allocator)
+		testing.expect(t, put(c, key_for(kb[:], name), wire, msg), "an answer was refused")
+		free_all(context.temp_allocator)
+	}
+	testing.expect_value(t, len_entries(c), ENTRIES)
+
+	// The Cache itself, and one table for each shard that holds anything.
+	tabled := 0
+	for &s in c.shards {
+		tabled += 1 if cap(s.entries) > 0 else 0
+	}
+	testing.expect_value(t, r.blocks - 1 - tabled, ENTRIES)
+
+	per := (r.held - chunk(c) - tables(c)) / ENTRIES
+	testing.expectf(t, per <= 224, "a cached A answer holds %d bytes of heap", per)
+}
+
+/*
+A key longer than any `make_key` builds is refused: the entry holds its length
+in a `u16`, so one of 64 KiB and more would be stored under a key it wrapped.
+*/
+@(test)
+test_put_refuses_a_key_past_key_max :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600})
+	defer destroy(c)
+	wire, msg := build_answer("example.com.", 300, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "example.com.")
+	// Just past the bound, and far enough past it that the length wraps.
+	for n in ([]int{KEY_MAX + 1, 65536 + len(key)}) {
+		long := make([]u8, n, context.temp_allocator)
+		copy(long, key)
+		testing.expectf(t, !put(c, string(long), wire, msg), "a key of %d bytes was stored", n)
+	}
+	testing.expect_value(t, len_entries(c), 0)
+	// The premise: the key itself is stored.
+	testing.expect(t, put(c, key, wire, msg), "the answer was refused")
 }
 
 // An empty cache holds next to nothing, whatever count it is allowed.
@@ -369,4 +432,99 @@ test_a_reload_to_fewer_shards_does_not_grow_on_the_way :: proc(t: ^testing.T) {
 	testing.expect_value(t, shards_in_use(c), 1)
 	testing.expect_value(t, len_entries(c), 300)
 	testing.expectf(t, r.peak <= before + 64 * 1024, "a reload from %d bytes rose to %d on the way down", before, r.peak)
+}
+
+// Refuses every allocation.
+@(private = "file")
+refusing :: proc(
+	_: rawptr,
+	mode: mem.Allocator_Mode,
+	_, _: int,
+	_: rawptr,
+	_: int,
+	_ := #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	#partial switch mode {
+	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
+		return nil, .Out_Of_Memory
+	}
+	return nil, .None
+}
+
+/*
+A hit whose copy cannot be allocated is a miss, fresh or stale: the query goes
+on to an upstream. Found with no bytes would read as a hit the caller asked not
+to have copied, and on a stale hit the TTLs were written into nothing.
+*/
+@(test)
+test_get_misses_when_the_copy_cannot_be_allocated :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer destroy(c)
+	wire, msg := build_answer("example.com.", 300, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "example.com.")
+	testing.expect(t, put(c, key, wire, msg), "the answer was refused")
+	refuse := mem.Allocator{procedure = refusing}
+
+	out, _, ok := get(c, key, refuse)
+	testing.expect(t, !ok && out == nil, "a fresh hit with no copy was reported found")
+
+	// Expired, inside the stale window.
+	c.shards[0].entries[key].expires = loop.moment_add(loop.moment_now(), -time.Second)
+	out, _, ok = get(c, key, refuse)
+	testing.expect(t, !ok && out == nil, "a stale hit with no copy was reported found")
+
+	// The premise: with an allocator that works, the entry is there.
+	_, _, ok = get(c, key, context.temp_allocator)
+	testing.expect(t, ok, "the entry was not found")
+}
+
+/*
+An answer whose TTLs cannot be read into a list is refused, not stored with
+fewer TTLs than it has records: the block is not zeroed, so the ones missing
+would be whatever was there. The cache's allocator lets the scan through and
+refuses `read_ttls`.
+*/
+@(test)
+test_put_refuses_when_its_ttls_cannot_be_read :: proc(t: ^testing.T) {
+	Second_Fails :: struct {
+		allocs: int,
+	}
+	second_fails :: proc(
+		data: rawptr,
+		mode: mem.Allocator_Mode,
+		size, alignment: int,
+		old_memory: rawptr,
+		old_size: int,
+		loc := #caller_location,
+	) -> (
+		[]byte,
+		mem.Allocator_Error,
+	) {
+		s := (^Second_Fails)(data)
+		if mode == .Alloc || mode == .Alloc_Non_Zeroed {
+			s.allocs += 1
+			if s.allocs == 2 {
+				return nil, .Out_Of_Memory
+			}
+		}
+		return runtime.heap_allocator_proc(nil, mode, size, alignment, old_memory, old_size, loc)
+	}
+	state: Second_Fails
+	c := make_cache(Options{max_entries = 8, max_ttl = 3600, min_ttl = 60}, mem.Allocator{procedure = second_fails, data = &state})
+	defer destroy(c)
+	// `make_cache` took the first allocation; the scan is the next, then `read_ttls`.
+	state.allocs = 0
+	wire, msg := build_answer("example.com.", 300, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	kb: [KEY_MAX]u8
+	key := key_for(kb[:], "example.com.")
+	testing.expect(t, !put(c, key, wire, msg), "an answer with no TTLs read was stored")
+	testing.expect_value(t, len_entries(c), 0)
+	// The premise: past the refusal, the same answer is stored.
+	testing.expect(t, put(c, key, wire, msg), "the answer was refused")
 }

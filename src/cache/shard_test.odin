@@ -165,7 +165,7 @@ test_a_reload_to_a_small_budget_keeps_room_for_a_large_answer :: proc(t: ^testin
 	kb: [KEY_MAX]u8
 	key := key_for(kb[:], "big.example.")
 	offsets, _ := dns.scan_ttl_offsets(wire, context.temp_allocator)
-	size := sizeof_entry(key, wire, offsets, make([]u32, len(offsets), context.temp_allocator))
+	size := sizeof_entry(len(key), len(wire), len(offsets))
 	testing.expectf(t, size > MIN_SHARD_BYTES / MAX_SHARDS, "the premise: an entry of %d bytes", size)
 	testing.expect(t, put(c, key, wire, msg), "a large answer the budget has room for was refused")
 }

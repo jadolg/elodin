@@ -140,7 +140,7 @@ test_min_ttl_does_not_hold_an_entry_past_its_rrsig :: proc(t: ^testing.T) {
 	sig_expiry := loop.moment_add(e.inserted, 60 * time.Second)
 	testing.expectf(t, time.Duration(e.expires - sig_expiry) <= 0, "min_ttl kept the entry %v past its RRSIG", time.Duration(e.expires - sig_expiry))
 	// Nor does it raise what a copy is told past the signature.
-	wire, _, hit := get(c, e.key, context.temp_allocator)
+	wire, _, hit := get(c, key_of(e), context.temp_allocator)
 	testing.expect(t, hit, "the entry was not served")
 	msg, _ := dns.decode_message(wire, context.temp_allocator)
 	for rec in msg.answer {
@@ -201,7 +201,7 @@ test_a_served_copy_is_told_no_more_than_the_rrsig_allows :: proc(t: ^testing.T) 
 	if !ok {
 		return
 	}
-	wire, _, hit := get(c, e.key, context.temp_allocator)
+	wire, _, hit := get(c, key_of(e), context.temp_allocator)
 	testing.expect(t, hit, "the entry was not served")
 	msg, _ := dns.decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, len(msg.answer), 2)
@@ -225,7 +225,7 @@ test_a_stale_copy_is_told_no_more_than_the_rrsig_allows :: proc(t: ^testing.T) {
 	}
 	// Expired, with the signature still ten seconds from lapsing.
 	e.expires = loop.moment_add(loop.moment_now(), -time.Second)
-	wire, hit, served := get(c, e.key, context.temp_allocator)
+	wire, hit, served := get(c, key_of(e), context.temp_allocator)
 	testing.expect(t, served && hit.stale, "the expired entry was not served stale")
 	msg, _ := dns.decode_message(wire, context.temp_allocator)
 	for rec in msg.answer {
@@ -267,7 +267,7 @@ test_an_entry_is_timed_on_the_moment_clock :: proc(t: ^testing.T) {
 	within(t, "the signature's lapse less an hour", loop.moment_add(e.signed_until, -3600 * time.Second), loop.moment_add(before, -2 * time.Second), after)
 
 	// And what `get` hands a caller is on the same clock.
-	_, hit, got := get(c, e.key, context.temp_allocator)
+	_, hit, got := get(c, key_of(e), context.temp_allocator)
 	if testing.expect(t, got, "the entry was not served") {
 		testing.expect_value(t, hit.signed_until, e.signed_until)
 	}

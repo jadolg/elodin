@@ -4,7 +4,6 @@ import "base:runtime"
 import "core:crypto"
 import "core:crypto/siphash"
 import "core:mem"
-import "core:strings"
 import "core:sync"
 import "core:time"
 import "elodin:dns"
@@ -20,10 +19,22 @@ decode/encode round trip on the hot path.
 */
 
 Entry :: struct {
-	key:         string,
-	wire:        []u8,
-	ttl_offsets: []int,
-	ttls:        []u32,
+	/*
+	How long each of the arrays that follow the entry is: one block on the heap
+	holds the entry, its TTLs, their offsets, the key and the wire, in that
+	order (issue #599). Read them through `ttls_of`, `offsets_of`, `key_of` and
+	`wire_of`.
+
+	One block, because each block costs a pointer and a size word and is
+	rounded to 16 bytes, 32 at the least: on an A answer four more would be a
+	third of what the entry takes. And lengths rather than slices, because a
+	slice is 16 bytes and these fit in two. A key is at most `KEY_MAX` and a
+	message at most `dns.MAX_MESSAGE`, which `put` checks, and there are fewer
+	TTLs than bytes in the message.
+	*/
+	ttl_count:   u16,
+	key_len:     u16,
+	wire_len:    u16,
 	/*
 	On the moment clock, not the wall clock (issue #557): a TTL is a duration,
 	and a step of the wall clock would otherwise expire the whole cache at once
@@ -585,8 +596,8 @@ reshard :: proc(c: ^Cache, n: int) {
 				continue
 			}
 			cursors[i] = e.prev
-			to := shard_for(c, e.key, bits)
-			to.entries[e.key] = e
+			to := shard_for(c, key_of(e), bits)
+			to.entries[key_of(e)] = e
 			push_front(to, e)
 			to.bytes += entry_bytes(e)
 			evict_over_limits(c, to)
@@ -777,8 +788,20 @@ get :: proc(
 	elapsed := u32(max(0, time.duration_seconds(time.Duration(now - e.inserted))))
 	out: []u8
 	if copies {
-		out = make([]u8, len(e.wire), allocator)
-		copy(out, e.wire)
+		/*
+		A copy that cannot be had is a miss: the query goes on to an upstream.
+		Found with no bytes would read as a hit the caller asked not to have
+		copied, and the stale branch below would write TTLs into nothing.
+		*/
+		alloc_err: mem.Allocator_Error
+		out, alloc_err = make([]u8, e.wire_len, allocator)
+		if alloc_err != nil {
+			if !probe {
+				s.misses += 1
+			}
+			return nil, {}, false
+		}
+		copy(out, wire_of(e))
 	}
 
 	if stale {
@@ -793,8 +816,8 @@ get :: proc(
 		// too (RFC 4034 section 3.1.5).
 		stale_ttl = min(stale_ttl, signature_left(e.signed_until, now))
 		if copies {
-			for off in e.ttl_offsets {
-				dns.write_ttl_at(out, off, stale_ttl)
+			for off in offsets_of(e) {
+				dns.write_ttl_at(out, int(off), stale_ttl)
 			}
 		}
 		/*
@@ -813,7 +836,7 @@ get :: proc(
 		// `min_ttl` floors what records claim, not what their signatures allow
 		// (RFC 4034 section 3.1.5): no copy is told to hold one past it.
 		if copies {
-			dns.patch_ttls(out, e.ttl_offsets, e.ttls, elapsed, min(c.min_ttl, signature_left(e.signed_until, now)))
+			dns.patch_ttls(out, offsets_of(e), ttls_of(e), elapsed, min(c.min_ttl, signature_left(e.signed_until, now)))
 		}
 		if !probe {
 			s.hits += 1
@@ -1243,7 +1266,9 @@ put :: proc(
 	ede: u16 = 0,
 	supersedes: u64 = 0,
 ) -> bool {
-	if c == nil || len(wire) < dns.HEADER_SIZE {
+	// A key fits the `u16` `Entry` holds its length in: every one `make_key`
+	// builds is at most `KEY_MAX`. The wire's is `scan_ttl_offsets`'s to refuse.
+	if c == nil || len(wire) < dns.HEADER_SIZE || len(key) > KEY_MAX {
 		return false
 	}
 	if msg.flags.tc {
@@ -1398,17 +1423,25 @@ the same shape stopped one layer further out, on the paths no validator
 		}
 	}
 
+	// Both lists are copied into the entry's block, or the put is refused.
 	offsets, scan_ok := dns.scan_ttl_offsets(wire, c.allocator)
 	if !scan_ok {
 		return false
 	}
+	defer delete(offsets, c.allocator)
 	ttls := dns.read_ttls(wire, offsets, c.allocator)
+	defer delete(ttls, c.allocator)
+	// A list `read_ttls` could not allocate is empty, and the block is not
+	// zeroed: an entry stored from it would serve whatever was there.
+	if len(ttls) != len(offsets) {
+		return false
+	}
 
 	/*
 	`max_ttl` applied to the stored figures, not only to the entry's lifetime.
 
-	Every copy this cache serves is `e.wire` with `e.ttls` counted down into it
-	by `patch_ttls`, so bounding the array here bounds what every client is told
+	Every copy this cache serves is `wire_of(e)` with `ttls_of(e)` counted down
+	into it by `patch_ttls`, so bounding the array here bounds what every client is told
 	for as long as the entry lives, and the hot path stays the copy plus a
 	handful of u32 writes it was. Capping in `get` instead would put a second
 	comparison in that loop for a figure that cannot change after the insert.
@@ -1475,8 +1508,6 @@ thing in both directions.
 		effective = clamp(effective, min_ttl, max_ttl)
 	}
 	if effective == 0 {
-		delete(offsets, c.allocator)
-		delete(ttls, c.allocator)
 		forget(c, key, stale)
 		return false
 	}
@@ -1493,20 +1524,30 @@ thing in both directions.
 	anything is copied, and against the share once the shard is locked, since a
 	reload may change the share in between.
 	*/
-	size := sizeof_entry(key, wire, offsets, ttls)
+	size := sizeof_entry(len(key), len(wire), len(offsets))
 	if size > sync.atomic_load(&c.max_bytes) {
-		delete(offsets, c.allocator)
-		delete(ttls, c.allocator)
 		forget(c, key, stale)
 		return false
 	}
 
-	e := new(Entry, c.allocator)
-	e.key = strings.clone(key, c.allocator)
-	e.wire = make([]u8, len(wire), c.allocator)
-	copy(e.wire, wire)
-	e.ttl_offsets = offsets
-	e.ttls = ttls
+	// Unzeroed: everything past the entry's own fields is copied over below.
+	block, alloc_err := mem.alloc_bytes_non_zeroed(
+		block_len(len(key), len(wire), len(offsets)),
+		align_of(Entry),
+		c.allocator,
+	)
+	if alloc_err != nil {
+		return false
+	}
+	e := (^Entry)(raw_data(block))
+	e^ = {}
+	e.ttl_count = u16(len(offsets))
+	e.key_len = u16(len(key))
+	e.wire_len = u16(len(wire))
+	copy(ttls_of(e), ttls)
+	copy(offsets_of(e), offsets)
+	copy(key_bytes(e), key)
+	copy(wire_of(e), wire)
 	e.redirects = redirects(msg)
 	e.bogus = bogus
 	e.checked = checked
@@ -1552,7 +1593,7 @@ thing in both directions.
 	}
 	s.serials += 1
 	e.serial = s.serials
-	s.entries[e.key] = e
+	s.entries[key_of(e)] = e
 	push_front(s, e)
 	s.bytes += size
 	s.inserts += 1
@@ -1755,29 +1796,61 @@ deadline :: proc(c: ^Cache, e: ^Entry) -> loop.Moment {
 /*
 What one entry takes from the heap.
 
-The response as it arrived, an offset and a TTL for every record in it, the key,
-and the entry itself - five allocations, each charged as the heap sizes it
-rather than as asked for. On a small entry that is near a third of the cost:
-an NXDOMAIN with one SOA asks for about three hundred bytes and takes over four
-hundred, and a flood of distinct names leaves nothing but those (issue #531).
-The entry's slot in the map is charged with the table, in `table_bytes`.
+The entry itself, a TTL and an offset for every record, the key and the
+response as it arrived - one block, charged as the heap sizes it rather than as
+asked for (issue #531): a flood of distinct names leaves nothing but small
+entries, on which the heap's header and rounding are a large share. The entry's
+slot in the map is charged with the table, in `table_bytes`.
 */
 @(private)
-sizeof_entry :: proc(key: string, wire: []u8, offsets: []int, ttls: []u32) -> int {
-	return(
-		heap_block(size_of(Entry)) +
-		heap_block(len(key)) +
-		heap_block(len(wire)) +
-		heap_block(len(offsets) * size_of(int)) +
-		heap_block(len(ttls) * size_of(u32)) \
-	)
+sizeof_entry :: proc(key_len, wire_len, ttl_count: int) -> int {
+	return heap_block(block_len(key_len, wire_len, ttl_count), align_of(Entry))
+}
+
+// The one block an entry is: see `Entry.ttl_count`.
+@(private)
+block_len :: proc(key_len, wire_len, ttl_count: int) -> int {
+	return size_of(Entry) + ttl_count * (size_of(u32) + size_of(u16)) + key_len + wire_len
+}
+
+// What follows the entry in its block. `Entry` is a multiple of its 8-byte
+// alignment in size, so the TTLs after it are aligned, and the `u16` offsets
+// after those.
+@(private)
+tail :: #force_inline proc "contextless" (e: ^Entry) -> [^]u8 {
+	return ([^]u8)(e)[size_of(Entry):]
+}
+
+@(private)
+ttls_of :: #force_inline proc "contextless" (e: ^Entry) -> []u32 {
+	return ([^]u32)(tail(e))[:e.ttl_count]
+}
+
+@(private)
+offsets_of :: #force_inline proc "contextless" (e: ^Entry) -> []u16 {
+	return ([^]u16)(tail(e)[int(e.ttl_count) * size_of(u32):])[:e.ttl_count]
+}
+
+@(private)
+key_bytes :: #force_inline proc "contextless" (e: ^Entry) -> []u8 {
+	return tail(e)[int(e.ttl_count) * (size_of(u32) + size_of(u16)):][:e.key_len]
+}
+
+@(private)
+key_of :: #force_inline proc "contextless" (e: ^Entry) -> string {
+	return string(key_bytes(e))
+}
+
+// The answer as it was stored, its TTLs as they arrived.
+wire_of :: #force_inline proc "contextless" (e: ^Entry) -> []u8 {
+	return raw_data(key_bytes(e))[e.key_len:][:e.wire_len]
 }
 
 /*
 What the map's table takes from the heap: all of it, used or not, because it
 grows by doubling and is the same allocation whether a slot is filled. That is
 a key, a value and a hash per slot, at most three quarters full - over forty
-bytes an entry, a tenth of what the smallest entries cost.
+bytes an entry, a fifth of what the smallest entries cost.
 */
 @(private)
 table_bytes :: proc(s: ^Shard) -> int {
@@ -1810,7 +1883,7 @@ heap_block :: proc(n: int, align := 8) -> int {
 
 @(private)
 entry_bytes :: proc(e: ^Entry) -> int {
-	return sizeof_entry(e.key, e.wire, e.ttl_offsets, e.ttls)
+	return sizeof_entry(int(e.key_len), int(e.wire_len), int(e.ttl_count))
 }
 
 /*
@@ -1827,18 +1900,14 @@ The caller holds `s.mu`.
 remove_entry :: proc(c: ^Cache, s: ^Shard, e: ^Entry) {
 	unlink(s, e)
 	// Before `free_entry`, which frees the string the map is keyed on.
-	delete_key(&s.entries, e.key)
+	delete_key(&s.entries, key_of(e))
 	s.bytes -= entry_bytes(e)
 	free_entry(c, e)
 }
 
 @(private)
 free_entry :: proc(c: ^Cache, e: ^Entry) {
-	delete(e.wire, c.allocator)
-	delete(e.ttl_offsets, c.allocator)
-	delete(e.ttls, c.allocator)
-	delete(e.key, c.allocator)
-	free(e, c.allocator)
+	mem.free_with_size(e, block_len(int(e.key_len), int(e.wire_len), int(e.ttl_count)), c.allocator)
 }
 
 @(private)

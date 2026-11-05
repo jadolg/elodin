@@ -223,7 +223,7 @@ func (h *harness) elodinConfig(o serverOpts, p ports, logPath string) ([]string,
 		p.doh,
 		filepath.Join(h.dir, o.certKind+"-cert.pem"), filepath.Join(h.dir, o.certKind+"-key.pem"),
 		o.attempts, p.upHost, p.upPort,
-		o.cache, o.cacheEntries, o.dnssec)
+		o.cache, o.cacheEntries, max(cacheBytes(o, 1024), 64<<20), o.dnssec)
 
 	if o.blockRules > 0 {
 		cfg += fmt.Sprintf(`
@@ -461,6 +461,11 @@ upstream:
 cache:
   enabled: %t
   max_entries: %d
+  # Room for every entry the row allows, as the byte-sized servers get through
+  # cacheBytes: left at the 64 MiB default, the byte bound evicts first in the
+  # 200,000-entry row and the per-entry figure divides by entries not held.
+  # Never under that default, so the rows it already fitted are run as before.
+  max_bytes: %d
 
 dnssec:
   enabled: %t
