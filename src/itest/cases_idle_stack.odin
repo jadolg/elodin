@@ -77,6 +77,7 @@ listeners:
   dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
   doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}
 server:
+  client_timeout: 60s
   max_connections: %d
   max_connections_per_prefix: %d
   rate_limit: {{ enabled: false }}
@@ -127,15 +128,18 @@ blocking: {{ enabled: false }}
 			if c.socket != 0 {
 				append(&conns, c)
 			}
-			if !check(r, answered, "%v connection %d was not answered; log:\n%s", transport, len(conns), read_log(&srv)) {
+			// The log is read only on a failure: an argument is read on every call.
+			if !answered {
+				fail(r, "%v connection %d was not answered; log:\n%s", transport, len(conns), read_log(&srv))
 				return
 			}
 		}
 		/*
 		Read until the figure is inside the bound, since the stacks go back
-		`loop.IDLE_TRIM_AFTER` into the wait; the deadline only ends a failing run, which then
-		reports the last reading. Well inside `client_timeout`, which would close
-		the connections being measured.
+		`loop.IDLE_TRIM_AFTER` into the wait; the deadline only ends a failing
+		run, which then reports the last reading. `client_timeout` is set far
+		past the time the connections take to open, which on a loaded host is
+		seconds, so none of the connections being measured is closed for idling.
 		*/
 		held, over, hok := fiber_stacks(pid, bound_kib)
 		for start := time.tick_now(); hok && over > IDLE_WARM && time.tick_since(start) < 5 * time.Second; {

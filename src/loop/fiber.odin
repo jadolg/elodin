@@ -131,7 +131,9 @@ kernel_page: uintptr
 
 @(private, init)
 kernel_page_init :: proc "contextless" () {
-	kernel_page = max(uintptr(posix.sysconf(._PAGESIZE)), PAGE)
+	// `PAGE` should sysconf fail, which wraps the unsigned figure to nonsense.
+	size := posix.sysconf(._PAGESIZE)
+	kernel_page = uintptr(size) if size > PAGE else PAGE
 }
 
 /*
