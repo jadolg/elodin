@@ -8,8 +8,8 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
-import "elodin:netx"
 import "elodin:loop"
+import "elodin:netx"
 
 /*
 DNS cookies, on the side facing the clients (RFC 7873, RFC 9018).

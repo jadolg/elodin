@@ -6,8 +6,8 @@ import "core:os"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
-import "elodin:netx"
 import "elodin:loop"
+import "elodin:netx"
 
 /*
 Signing a blob of bytes with the certificate a server context already serves.

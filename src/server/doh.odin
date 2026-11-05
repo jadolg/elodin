@@ -7,8 +7,8 @@ import "elodin:cache"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
-import "elodin:tlsx"
 import "elodin:loop"
+import "elodin:tlsx"
 
 /*
 The DoH endpoint (RFC 8484) over HTTP/1.1.

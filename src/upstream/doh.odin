@@ -7,9 +7,9 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:h2"
+import "elodin:loop"
 import "elodin:netx"
 import "elodin:tlsx"
-import "elodin:loop"
 
 // RFC 8484 6: a DoH reply is at most 65535 bytes, on HTTP/2 as on HTTP/1.1.
 #assert(h2.CLIENT_MAX_BODY == dns.MAX_MESSAGE)

@@ -23,12 +23,11 @@ Wait_Result :: enum u8 {
 }
 
 /*
-The fibers of one loop that are waiting on one descriptor, and what the loop has
-asked epoll to watch for on their behalf.
+The fibers of one loop that are waiting on one descriptor.
 
 Several at once is the ordinary case for a shared upstream connection - one fiber
 reading replies while others wait to write - so this is a list rather than a slot,
-and the interest registered is the union of what they want.
+and the interest `watch_update` arms is the union of what they want.
 */
 @(private)
 Fd_Watch :: struct {

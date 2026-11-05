@@ -601,7 +601,12 @@ test_a_waiter_left_by_a_failed_re_arm_is_woken :: proc(t: ^testing.T) {
 	}
 	defer linux.close(null)
 	// The premise: epoll refuses /dev/null, so the re-arm on its number fails.
-	scratch, _ := linux.epoll_create1({.FDCLOEXEC})
+	// Checked before it is closed: stdin is closed under `odin test`, so a failed
+	// create's zero would close another test's descriptor.
+	scratch, serr := linux.epoll_create1({.FDCLOEXEC})
+	if !testing.expect(t, serr == .NONE, "no scratch epoll") {
+		return
+	}
 	ev := linux.EPoll_Event {
 		events = {.IN},
 	}

@@ -8,8 +8,8 @@ import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:h2"
 import "elodin:logx"
-import "elodin:tlsx"
 import "elodin:loop"
+import "elodin:tlsx"
 
 /*
 The DoH endpoint over HTTP/2 (RFC 8484 with RFC 9113 transport).

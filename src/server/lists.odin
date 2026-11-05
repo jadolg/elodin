@@ -10,8 +10,8 @@ import "core:time"
 import "elodin:config"
 import "elodin:filter"
 import "elodin:logx"
-import "elodin:upstream"
 import "elodin:loop"
+import "elodin:upstream"
 
 /*
 Loading and refreshing sink lists.
