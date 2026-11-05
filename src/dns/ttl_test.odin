@@ -222,8 +222,9 @@ test_scan_refuses_a_message_past_max_message :: proc(t: ^testing.T) {
 	// The premise: the most records that fit in MAX_MESSAGE scan.
 	fits := a_records((MAX_MESSAGE - HEADER_SIZE) / 15)
 	offsets, ok := scan_ttl_offsets(fits, context.temp_allocator)
-	testing.expect(t, ok, "a message of MAX_MESSAGE bytes or fewer was refused")
-	testing.expect_value(t, int(offsets[len(offsets) - 1]), len(fits) - 15 + 5)
+	if testing.expect(t, ok, "a message of MAX_MESSAGE bytes or fewer was refused") {
+		testing.expect_value(t, int(offsets[len(offsets) - 1]), len(fits) - 15 + 5)
+	}
 
 	// Two more, and the last TTL is past what an offset can hold.
 	past := a_records((MAX_MESSAGE - HEADER_SIZE) / 15 + 2)

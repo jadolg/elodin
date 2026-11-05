@@ -19,14 +19,14 @@ rewritten in place on each hit.
 
 - **Size.** Both bounds apply, because the upstream decides how large an entry
   is (up to 64 KiB over a stream transport). Passing either evicts the least
-  recently used entries. `max_bytes` is heap: each entry's allocations as the
-  allocator rounds them, and the table that indexes them, which grows as entries
+  recently used entries. `max_bytes` is heap: each entry's allocation as the
+  allocator rounds it, and the table that indexes them, which grows as entries
   arrive and is given back by the periodic sweep and by a reload once it is
   under a quarter full, so a raised `max_entries` costs nothing until it fills.
-  An entry is one allocation: the answer, its key and its TTLs. The smallest,
-  an NXDOMAIN for a name nobody asks twice, take about 320 bytes each with
-  their slot in the table, and an A answer about 280. `cache_bytes=` in the stats line and `elodin_cache_bytes`
-  report the same figure.
+  An entry is one allocation: the answer, its key and its TTLs. An A answer
+  takes about 280 bytes with its slot in the table, and an NXDOMAIN for a name
+  nobody asks twice about 320. `cache_bytes=` in the stats line and
+  `elodin_cache_bytes` report the same figure.
 - **Shards.** A cache large enough is split into up to 16 shards, each with its
   own lock, so loop threads looking up different names do not wait on each
   other. A name's shard comes from a hash with a random key. Each shard gets an

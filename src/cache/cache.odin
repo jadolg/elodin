@@ -25,9 +25,9 @@ Entry :: struct {
 	order (issue #599). Read them through `ttls_of`, `offsets_of`, `key_of` and
 	`wire_of`.
 
-	One block rather than five because each costs a pointer and a size word
-	and is rounded to 16 bytes, 32 at the least, which on an A answer was a
-	third of what the entry took; and lengths rather than slices because a
+	One block, because each block costs a pointer and a size word and is
+	rounded to 16 bytes, 32 at the least: on an A answer four more would be a
+	third of what the entry takes. And lengths rather than slices, because a
 	slice is 16 bytes and these fit in two. A key is at most `KEY_MAX` and a
 	message at most `dns.MAX_MESSAGE`, which `put` checks, and there are fewer
 	TTLs than bytes in the message.
@@ -1420,8 +1420,8 @@ the same shape stopped one layer further out, on the paths no validator
 	/*
 	`max_ttl` applied to the stored figures, not only to the entry's lifetime.
 
-	Every copy this cache serves is `e.wire` with `e.ttls` counted down into it
-	by `patch_ttls`, so bounding the array here bounds what every client is told
+	Every copy this cache serves is `wire_of(e)` with `ttls_of(e)` counted down
+	into it by `patch_ttls`, so bounding the array here bounds what every client is told
 	for as long as the entry lives, and the hot path stays the copy plus a
 	handful of u32 writes it was. Capping in `get` instead would put a second
 	comparison in that loop for a figure that cannot change after the insert.
@@ -1514,7 +1514,8 @@ thing in both directions.
 		return false
 	}
 
-	block, alloc_err := mem.alloc_bytes(
+	// Unzeroed: everything past the entry's own fields is copied over below.
+	block, alloc_err := mem.alloc_bytes_non_zeroed(
 		block_len(len(key), len(wire), len(offsets)),
 		align_of(Entry),
 		c.allocator,
@@ -1525,6 +1526,7 @@ thing in both directions.
 		return false
 	}
 	e := (^Entry)(raw_data(block))
+	e^ = {}
 	e.ttl_count = u16(len(offsets))
 	e.key_len = u16(len(key))
 	e.wire_len = u16(len(wire))
@@ -1836,7 +1838,7 @@ wire_of :: #force_inline proc "contextless" (e: ^Entry) -> []u8 {
 What the map's table takes from the heap: all of it, used or not, because it
 grows by doubling and is the same allocation whether a slot is filled. That is
 a key, a value and a hash per slot, at most three quarters full - over forty
-bytes an entry, a tenth of what the smallest entries cost.
+bytes an entry, a fifth of what the smallest entries cost.
 */
 @(private)
 table_bytes :: proc(s: ^Shard) -> int {

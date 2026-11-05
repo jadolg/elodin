@@ -165,7 +165,8 @@ test_cache_bytes_are_what_small_entries_hold :: proc(t: ^testing.T) {
 A cached A answer is one block on the heap, and what it holds is the wire, the
 key, the TTLs and their offsets with the entry's own fields (issue #599). Each
 separate block costs a pointer and a size word and is rounded to 16 bytes with
-32 the least; four small ones per entry were a third of what an entry cost.
+32 the least; four small ones more per entry would be a third of what an entry
+costs.
 */
 @(test)
 test_a_cached_answer_is_one_block :: proc(t: ^testing.T) {

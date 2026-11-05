@@ -283,8 +283,8 @@ instead of round-tripping through the decoder. OPT records are skipped: their
 The offsets are `u16`, which every offset into a DNS message fits: RFC 1035
 section 4.2.2 frames a message with a two-byte length, so none is longer than
 `MAX_MESSAGE`. A longer one is refused rather than have its offsets wrap. The
-cache keeps the list for as long as it keeps the answer, a quarter of what
-`int`s would take.
+cache keeps a copy of the list for as long as it keeps the answer, a quarter of
+what `int`s would take.
 */
 scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets: []u16, ok: bool) {
 	if len(msg) < HEADER_SIZE || len(msg) > MAX_MESSAGE {
