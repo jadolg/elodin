@@ -87,8 +87,34 @@ clients on two cores, two runs each:
 
 Across #604 DoT's p50 fell (0.33 → 0.25 ms) and its p99 rose (0.71 → 3.05
 ms), with the spread of queries per client widening (16,706–17,154 →
-16,872–18,012); TCP improved on all three (p99 2.39 → 1.44 ms). A DoT
-connection is sometimes served a round late.
+16,872–18,012); TCP improved on all three (p99 2.39 → 1.44 ms).
+
+No DoT connection waits in elodin (#610). Counted under this load, no read
+left decrypted bytes in OpenSSL, and 205 of 2.38 million parks found bytes
+already queued, each an arrival racing the park that level-triggered epoll
+fires on at once. What #604 changed is that a cache hit got cheap enough for
+each loop to go idle: at saturation a loop thread ran at 87% and slept in
+`epoll_wait` about 5,500 times a second, where before it ran at 100% and
+never slept. On this VM a halted vCPU takes the host about 3 ms to wake, and
+every build and transport has that 3 ms mode. #604 moved it from DoT's p99.9
+to its p99:
+
+- Reverting #604's read path, its epoll change or its vDSO clock alone leaves
+  the p99 at 3 ms. Reverting the epoll change and the clock together restores
+  the per-query system calls, keeps the loops at 100%, and brings the p99 back
+  to 0.66 ms.
+- Keeping CPUs 0-1 from halting with `SCHED_IDLE` spinners, which a woken
+  thread preempts, moves the mode back to p99.9: dev-979abb2 at saturation
+  goes from 3.2 to 1.03 ms.
+- The guest scheduler delayed 18 of 22,524 loop wake-ups by more than 0.1 ms,
+  so the wait is in the host, not in Linux.
+- At the same DoT throughput, Unbound (300,491 / 2.5 ms) and dnsdist
+  (305,056 / 3.1 ms) show the same tail. BIND (8 µs per query) and Knot
+  (131,079 a second) spend more per query, so they idle less.
+
+A loop that spun before sleeping would hide the wake-up here, at the cost of
+CPU on every idle device. Unbound, BIND, Knot Resolver, PowerDNS Recursor and
+dnsmasq block in their pollers too.
 
 ## Memory
 
@@ -195,8 +221,9 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
 
 ## Where elodin falls behind
 
-- **DoT p99 at 3 ms** (#610), against BIND's 1.1 ms and Knot's 1.5 ms: the #604
-  regression above.
+- **DoT p99 at 3 ms**, against BIND's 1.1 ms and Knot's 1.5 ms. This is the VM's
+  vCPU wake-up, not a wait in elodin (#610, above); Unbound and dnsdist show
+  the same tail at the same throughput.
 - **CPU per cache miss** (#612): 27 µs at saturation against dnsdist's 8 µs, and a
   p99 of 107 ms at 75,000 against dnsdist's 62 ms. Unbound and Knot are
   level with elodin at 28 µs.
