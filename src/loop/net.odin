@@ -75,8 +75,8 @@ socket_deadline :: proc(fd: linux.Fd, option: linux.Socket_Option, start: Tick) 
 }
 
 /*
-Wait for `fd` until the deadline the socket option gives, computed once. False
-when the wait ended without the descriptor becoming ready: a timeout, a
+Wait for `fd` until `deadline`: the one the caller gave when it comes `armed`,
+otherwise the one the socket option gives, computed once. False when the wait ended without the descriptor becoming ready: a timeout, a
 cancellation, or a descriptor epoll will not take.
 
 A wait that ends without parking - the deadline already spent, the fiber
@@ -152,10 +152,38 @@ send_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> (n: int, err: net.TCP_Sen
 }
 
 recv_udp :: proc(socket: net.UDP_Socket, buf: []u8) -> (int, net.Endpoint, net.UDP_Recv_Error) {
+	return recv_udp_armed(socket, buf, {}, false)
+}
+
+/*
+`recv_udp` and `send_udp`, waiting until `deadline` rather than for the socket's
+timeout option. The option costs a `setsockopt` to set and a `getsockopt` to
+read back, both per query on a socket that lives for one exchange (#612). The
+zero tick is no deadline.
+*/
+recv_udp_until :: proc(socket: net.UDP_Socket, buf: []u8, deadline: Tick) -> (int, net.Endpoint, net.UDP_Recv_Error) {
+	return recv_udp_armed(socket, buf, deadline, true)
+}
+
+send_udp_until :: proc(socket: net.UDP_Socket, buf: []u8, to: net.Endpoint, deadline: Tick) -> (int, net.UDP_Send_Error) {
+	return send_udp_armed(socket, buf, to, deadline, true)
+}
+
+@(private)
+recv_udp_armed :: proc(
+	socket: net.UDP_Socket,
+	buf: []u8,
+	deadline: Tick,
+	armed: bool,
+) -> (
+	int,
+	net.Endpoint,
+	net.UDP_Recv_Error,
+) {
 	assert_nonblocking(linux.Fd(socket))
-	start := tick_now()
-	deadline: Tick
-	armed: bool
+	// Read only to arm from the socket's option; a deadline given needs no clock.
+	start := Tick{} if armed else tick_now()
+	deadline, armed := deadline, armed
 	for {
 		n, from, err := net.recv_udp(socket, buf)
 		if err != .Would_Block {
@@ -169,10 +197,24 @@ recv_udp :: proc(socket: net.UDP_Socket, buf: []u8) -> (int, net.Endpoint, net.U
 }
 
 send_udp :: proc(socket: net.UDP_Socket, buf: []u8, to: net.Endpoint) -> (int, net.UDP_Send_Error) {
+	return send_udp_armed(socket, buf, to, {}, false)
+}
+
+@(private)
+send_udp_armed :: proc(
+	socket: net.UDP_Socket,
+	buf: []u8,
+	to: net.Endpoint,
+	deadline: Tick,
+	armed: bool,
+) -> (
+	int,
+	net.UDP_Send_Error,
+) {
 	assert_nonblocking(linux.Fd(socket))
-	start := tick_now()
-	deadline: Tick
-	armed: bool
+	// Read only to arm from the socket's option; a deadline given needs no clock.
+	start := Tick{} if armed else tick_now()
+	deadline, armed := deadline, armed
 	for {
 		n, err := net.send_udp(socket, buf, to)
 		if err != .Would_Block {

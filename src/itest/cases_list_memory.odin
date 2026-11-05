@@ -489,9 +489,9 @@ blocking: {{ enabled: false }}
 	}
 	/*
 	And until the loops have given back the stacks they kept warm, which they do
-	after a second with nothing to do (`loop.TRIM_AFTER`). Read until the figure
-	is inside the bound; the deadline only ends a failing run, which then reports
-	the last reading.
+	within two `loop.TRIM_AFTER` windows of nothing taking them. Read until the
+	figure is inside the bound; the deadline only ends a failing run, which then
+	reports the last reading.
 	*/
 	after, aok := proc_status_int(pid, "VmRSS")
 	for start := time.tick_now(); aok && after - base > CONN_BURST * KEPT_KIB_PER_CONN && time.tick_since(start) < 5 * time.Second; {

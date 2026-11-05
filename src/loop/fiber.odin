@@ -137,17 +137,6 @@ kernel_page_init :: proc "contextless" () {
 }
 
 /*
-How many stacks a loop keeps for reuse once their fibers are done.
-
-A stack handed back is still mapped and its touched pages still resident, so the
-next fiber starts warm and no `mmap` is paid per query. Past this many the rest
-are unmapped, which is what returns a burst's memory: 64 stacks at the ~20 KB a
-query touches is about a megabyte per loop kept for the next burst.
-*/
-@(private)
-STACK_CACHE :: 64
-
-/*
 How much a recycled fiber's scratch may keep.
 
 `arena_free_all` keeps the first block, and that block is as large as the first

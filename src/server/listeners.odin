@@ -93,8 +93,7 @@ their own, which is the tests. Closing a socket does not reliably wake a thread
 already blocked reading or accepting on it - the same reason
 `upstream/h2client.odin` polls rather than trusting close to cut a read short -
 so the loops carry a timeout and come up for air instead. One wakeup a second
-per listener costs nothing next to the queries going through them, and an event
-loop does not count it as work (see `loop.trim_idle`).
+per listener costs nothing next to the queries going through them.
 */
 @(private)
 LISTENER_POLL :: time.Second

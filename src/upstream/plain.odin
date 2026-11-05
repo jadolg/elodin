@@ -2,6 +2,7 @@ package upstream
 
 import "core:mem"
 import "core:net"
+import "core:sys/linux"
 import "core:time"
 import "elodin:dns"
 import "elodin:loop"
@@ -27,19 +28,13 @@ exchange_udp :: proc(
 	err: Error,
 ) {
 	endpoint := endpoint_of(u) or_return
-	family := net.family_from_endpoint(endpoint)
-	socket, serr := net.make_unbound_udp_socket(family)
-	if serr != nil {
+	socket, opened := open_udp(endpoint)
+	if !opened {
 		return nil, .Dial_Failed
 	}
 	defer net.close(socket)
-	// Non-blocking, so a wait for the answer parks a fiber rather than a loop.
-	if net.set_blocking(socket, false) != nil {
-		return nil, .Dial_Failed
-	}
-	set_socket_timeouts(socket, timeout)
 
-	if _, send_err := loop.send_udp(socket, query, endpoint); send_err != nil {
+	if _, send_err := loop.send_udp_until(socket, query, endpoint, deadline); send_err != nil {
 		return nil, .IO_Error
 	}
 
@@ -82,10 +77,10 @@ exchange_udp :: proc(
 	rejected := false
 
 	// Datagrams passed over arriving back to back - a spoofed flood at this port -
-	// never let this query park; `loop.recv_udp` yields between them (see
+	// never let this query park; `loop.recv_udp_until` yields between them (see
 	// `loop.take_turn`).
-	for arm_receive(socket, deadline) {
-		n, remote, recv_err := loop.recv_udp(socket, buf)
+	for time.tick_diff(loop.tick_now(), deadline) > 0 {
+		n, remote, recv_err := loop.recv_udp_until(socket, buf, deadline)
 		if recv_err != nil {
 			// The datagram was larger than the room the query offered, so what
 			// arrived is a prefix of an answer. TCP is where the whole one is.
@@ -125,22 +120,25 @@ exchange_udp :: proc(
 }
 
 /*
-Arm the next receive with what is left before `deadline`, and say whether
-anything is. Not the whole timeout: the socket's timeout restarts with every
-call, so a datagram passed over - a stray, a forgery - landing just before it
-ran out bought another whole one, and an off-path sender could double any
-exchange (issue #446). Never zero, which `SO_RCVTIMEO` reads as no timeout at
-all. On the tick clock, which an NTP step cannot move. Shared with
-`bootstrap_query`, whose loop passes datagrams over the same way.
+A socket of its own for one exchange with `endpoint`, bound by the kernel to a
+random port at the send: RFC 5452 section 9.2 asks for an unpredictable source
+port, and a socket shared between queries would hold one port for all of them.
+Non-blocking from its creation, so a wait for the answer parks a fiber rather
+than a loop; its reads and writes wait to the exchange's deadline with
+`loop.recv_udp_until` and `loop.send_udp_until` rather than a timeout option,
+so what an exchange costs above the send and the answer is this, one epoll
+registration and the close (#612).
+
+Every wait runs to the one deadline, not a timeout restarted per read: a datagram
+passed over - a stray, a forgery - landing just before a fresh timeout ran out
+would buy another whole one, and an off-path sender could double any exchange
+(issue #446). On the tick clock, which an NTP step cannot move.
 */
 @(private)
-arm_receive :: proc(socket: net.UDP_Socket, deadline: time.Tick) -> bool {
-	left := time.tick_diff(loop.tick_now(), deadline)
-	if left <= 0 {
-		return false
-	}
-	_ = net.set_option(socket, .Receive_Timeout, max(left, time.Millisecond))
-	return true
+open_udp :: proc(endpoint: net.Endpoint) -> (net.UDP_Socket, bool) {
+	domain := linux.Address_Family.INET if net.family_from_endpoint(endpoint) == .IP4 else .INET6
+	fd, err := linux.socket(domain, .DGRAM, {.CLOEXEC, .NONBLOCK}, .UDP)
+	return net.UDP_Socket(fd), err == .NONE
 }
 
 @(private)
