@@ -667,8 +667,6 @@ log_count :: proc(srv: ^Server, needle: string) -> int {
 	}
 }
 
-// One field of a /proc status file, such as `VmRSS` or `SigBlk`, trimmed; not
-
 /*
 The thread ids of process `pid`, from `/proc/<pid>/task`, read with `readdir`
 alone. `os.read_directory_by_path` opens every entry it lists, so a thread that
@@ -696,6 +694,7 @@ task_ids :: proc(pid: int, allocator := context.temp_allocator) -> (ids: []strin
 	}
 }
 
+// One field of a /proc status file, such as `VmRSS` or `SigBlk`, trimmed; not
 // ok when the file cannot be read (a thread that has just ended) or lacks it.
 proc_status_field :: proc(path, field: string) -> (value: string, ok: bool) {
 	data, err := os.read_entire_file(path, context.temp_allocator)

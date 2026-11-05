@@ -142,6 +142,7 @@ run_pinning_cases :: proc(r: ^Runner) {
 			if check(r, read, "the server's threads could not be listed") {
 				check(r, len(cpus) == 0, "threads are pinned to CPUs %v with pin_loops off", cpus)
 			}
+			check(r, !log_contains(&srv, "server.pin_loops"), "startup spoke of pinning with pin_loops off; log:\n%s", read_log(&srv))
 		}
 	}
 	end_case(r)
