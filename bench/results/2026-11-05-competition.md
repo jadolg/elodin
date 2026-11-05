@@ -90,7 +90,6 @@ ms), with the spread of queries per client widening (16,706–17,154 →
 16,872–18,012); TCP improved on all three (p99 2.39 → 1.44 ms). A DoT
 connection is sometimes served a round late.
 
-
 ## Memory
 
 Idle is the server started with its cache on and nothing asked. Lists is 250,000 names, each in the server's own list format, read once `blocked.bench.test` answers NXDOMAIN. Per cache entry is two servers whose caches hold 1,000 and 200,000 answers, each given 40 s of unique names at 128 clients: the difference in RSS over the difference in entries held, so a cache allocated up front counts.
@@ -162,7 +161,6 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
 | dnsdist 2.0.2 | 0.1 KB | 25 KB | 42 KB | 0.0 KB (all answered) |
 | BIND 9.20.24 | 21 KB | 65 KB | 74 KB | 33 KB (all answered) |
 | Knot Resolver 6.2.0 | 17 KB | 42 KB | 60 KB | 22 KB (all answered) |
-
 
 ## Reading the tables
 
