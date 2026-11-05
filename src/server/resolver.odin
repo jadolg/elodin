@@ -3893,6 +3893,23 @@ build_block_response :: proc(
 	limit: int,
 	typed_only := false,
 ) -> []u8 {
+	if out, ok := block_wire(s, query, q, allocator, limit, typed_only); ok {
+		return out
+	}
+	return encode_block_response(s, query, q, allocator, limit, typed_only)
+}
+
+// The block answer as a message, through the general encoder. `block_wire`
+// writes the same bytes faster wherever it can, and says where it cannot.
+@(private)
+encode_block_response :: proc(
+	s: ^Server,
+	query: dns.Message,
+	q: dns.Question,
+	allocator: mem.Allocator,
+	limit: int,
+	typed_only: bool,
+) -> []u8 {
 	ttl := live(s).cfg.blocking.block_ttl
 
 	rcode := dns.Rcode.No_Error
