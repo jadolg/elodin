@@ -3,7 +3,6 @@ package loop
 
 import "base:runtime"
 import "core:sys/linux"
-import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 
@@ -54,7 +53,7 @@ test_a_spawned_threads_scratch_is_unmapped_when_it_exits :: proc(t: ^testing.T) 
 				return
 			}
 			// A calloc'd block is resident throughout; this one, where touched.
-			testing.expectf(t, probe.resident[i] <= 2, "block %d: %d pages resident of %d (context %v)", i, probe.resident[i], len(b) / int(page_size()), with_context)
+			testing.expectf(t, probe.resident[i] <= 2, "block %d: %d pages resident of %d (context %v)", i, probe.resident[i], len(b) / int(kernel_page), with_context)
 		}
 		testing.expectf(t, probe.allocs == 2 && probe.frees == 2, "%d blocks mapped, %d given back (context %v)", probe.allocs, probe.frees, with_context)
 	}
@@ -105,17 +104,11 @@ counting_proc :: proc(
 	return b, err
 }
 
-// The kernel's page, which mincore(2) wants its start aligned to: 16 KiB or
-// 64 KiB on some arm64 kernels.
-@(private = "file")
-page_size :: proc() -> uintptr {
-	return uintptr(posix.sysconf(._PAGESIZE))
-}
-
-// Pages of `b` resident, by mincore(2) over the pages it spans.
-@(private = "file")
+// Pages of `b` resident, by mincore(2) over the kernel's pages it spans: mincore
+// wants its start aligned to `kernel_page`, not to `PAGE`.
+@(private)
 residency :: proc(b: []u8) -> (pages: int, err: linux.Errno) {
-	page := page_size()
+	page := kernel_page
 	start := uintptr(raw_data(b)) &~ (page - 1)
 	end := (uintptr(raw_data(b)) + uintptr(len(b)) + page - 1) &~ (page - 1)
 	vec := make([]b8, (end - start) / page)

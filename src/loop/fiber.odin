@@ -3,6 +3,8 @@ package loop
 import "base:runtime"
 import "core:mem"
 import "core:sys/linux"
+import "core:sys/posix"
+import "core:time"
 
 /*
 A fiber: a stack of its own, run by one loop thread at a time and never by two.
@@ -52,7 +54,11 @@ Fiber :: struct {
 	cancelled:    bool,
 	// Whether `cancel` may end the park in progress; see `park`.
 	cancellable:  bool,
+	// Whether a park gives back the stack below it; see `set_idle`.
+	idle:         bool,
 	deadline:     Tick,
+	// When an idle park hands its stack back, or zero; see `IDLE_TRIM_AFTER`.
+	trim_at:      Tick,
 	// Where this fiber sits in its loop's timer heap, or -1.
 	heap_index:   int,
 	// The fiber's scratch, which is its `context.temp_allocator`; see `fiber_entry`.
@@ -114,6 +120,21 @@ STACK_SIZE :: #config(ELODIN_FIBER_STACK, 1024 * 1024 when ASAN else 256 * 1024)
 
 @(private)
 PAGE :: 4096
+
+/*
+The kernel's page, which `madvise` wants the start of its range aligned to and
+rounds its length up to: 16 KiB or 64 KiB on some arm64 kernels, where rounding
+to `PAGE` would hand back part of the page a parked frame is still on.
+*/
+@(private)
+kernel_page: uintptr
+
+@(private, init)
+kernel_page_init :: proc "contextless" () {
+	// `PAGE` should sysconf fail, which wraps the unsigned figure to nonsense.
+	size := posix.sysconf(._PAGESIZE)
+	kernel_page = uintptr(size) if size > PAGE else PAGE
+}
 
 /*
 How many stacks a loop keeps for reuse once their fibers are done.
@@ -212,6 +233,56 @@ stack_unmap :: proc(s: Stack) {
 		linux.munmap(s.base, s.size)
 	}
 }
+
+/*
+Hand the pages of `f`'s stack below where it parked back to the kernel (#596).
+
+Everything under the stack pointer a parked fiber switched out with is frames it
+has returned from, so the range is dead until the fiber goes deeper again, and
+`MADV_DONTNEED` on private anonymous memory makes each of its pages read as zero
+when next touched. Done from the timer heap while the fiber is parked - nothing
+on its stack is running while its pages go.
+The guard page is left alone, and so is the page the stack pointer is in.
+*/
+@(private)
+stack_release :: proc "contextless" (f: ^Fiber) {
+	page := kernel_page
+	low := (uintptr(f.stack.base) + PAGE + page - 1) &~ (page - 1)
+	high := uintptr(f.sp) &~ (page - 1)
+	if high > low {
+		_ = linux.madvise(rawptr(low), uint(high - low), .DONTNEED)
+	}
+}
+
+/*
+Whether the running fiber is about to wait for work with nothing in hand - a
+connection between queries - so that a park that lasts hands its stack back.
+
+A connection's fiber touches the stack for its deepest query, and left resident
+those pages are most of what a held connection costs between queries: about
+13 KiB of it (#596). A park made while this is set gives them back once it has
+lasted `IDLE_TRIM_AFTER`. Cleared once the wait is
+over, so the parks a query makes on its upstreams keep their pages. Off a fiber
+it does nothing.
+*/
+set_idle :: proc "contextless" (idle: bool) {
+	if f := current(); f != nil {
+		f.idle = idle
+	}
+}
+
+/*
+How long an idle park lasts before its stack is handed back.
+
+Not at once: the hand-back is a `madvise`, which flushes the TLB of every loop
+thread, and the pages fault back in when the next query comes - on a client
+asking back to back, every query, which measured 2 µs more a TCP query and 4 µs
+a DoT one. Such a client's gaps are well under a millisecond. A connection quiet
+for a quarter of a second pays it at most four times a second, which is nothing
+beside the queries, and one quiet for longer pays it once. Kept with the park's
+own deadline in the timer heap, so the loop wakes for it and the fiber does not.
+*/
+IDLE_TRIM_AFTER :: 250 * time.Millisecond
 
 @(private)
 stack_top :: proc(s: Stack) -> uintptr {

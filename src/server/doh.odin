@@ -150,13 +150,22 @@ Http_Reader :: struct {
 
 @(private)
 http_fill :: proc(r: ^Http_Reader) -> bool {
-	chunk: [4096]u8
-	n, ok := conn_read_budgeted(r.conn, chunk[:], &r.budget)
-	if !ok {
+	/*
+	Straight into the buffer's free capacity, not through a chunk on the stack: the
+	read between requests is where an idle connection parks, and a 4 KiB chunk
+	there is a page the parked fiber keeps resident for as long as the client
+	keeps the connection (#596). Grown by doubling once full, as `append` grows it.
+	A read takes at most `HTTP_BUF_SIZE`, so a header that never ends is refused
+	within one such read past `MAX_HEADER_BYTES`.
+	*/
+	have := len(r.buf)
+	if have == cap(r.buf) && reserve(&r.buf, max(2 * cap(r.buf), HTTP_BUF_SIZE)) != nil {
 		return false
 	}
-	append(&r.buf, ..chunk[:n])
-	return true
+	_ = non_zero_resize(&r.buf, have + min(cap(r.buf) - have, HTTP_BUF_SIZE))
+	n, ok := conn_read_budgeted(r.conn, r.buf[have:], &r.budget)
+	_ = resize(&r.buf, have + (n if ok else 0))
+	return ok
 }
 
 /*
@@ -1018,10 +1027,11 @@ http_linger :: proc(conn: Conn, idle: time.Duration) {
 	// option stopped applying at the handshake - see `conn_set_read_timeout`.
 	conn_set_read_timeout(conn, idle)
 	start := loop.tick_now()
-	chunk: [4096]u8
+	// Scratch, not a local: see `stream_linger`.
+	chunk := make([]u8, 4096, context.temp_allocator)
 	discarded := 0
 	for discarded < HTTP_LINGER_BYTES && loop.tick_since(start) < HTTP_LINGER_TIMEOUT {
-		n, ok := conn_read(conn, chunk[:])
+		n, ok := conn_read(conn, chunk)
 		if !ok {
 			return
 		}

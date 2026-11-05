@@ -1205,7 +1205,7 @@ connection reset, which is exactly the bare closed connection the status was
 added to replace.
 
 So the drain has to happen before the close. The body here is larger than one
-`http_fill` chunk, which is what leaves bytes behind for the close to trip over -
+`http_fill` read, which is what leaves bytes behind for the close to trip over -
 a request that fits in the first read is drained by having been read. The client
 shuts down its sending half rather than closing outright, so the drain ends on the
 end of the data instead of on its timeout, and can still read afterwards.
@@ -2282,4 +2282,63 @@ test_doh_a_held_connection_outside_the_allow_list_gets_nothing_but_403 :: proc(t
 	head := strings.to_string(answer)
 	testing.expect(t, strings.contains(head, "HTTP/1.1 403"), "a source outside the allow list was answered on another path")
 	testing.expect(t, !strings.contains(head, "HTTP/1.1 404"), "a source outside the allow list was told what is not there")
+}
+
+/*
+A header that never ends is refused within one read of `HTTP_BUF_SIZE` past
+`MAX_HEADER_BYTES` (#596).
+
+`http_fill` reads into the buffer's free capacity, and the buffer doubles when
+full, so a read that took all of it could carry the buffer to twice the limit
+before `http_line` looks again. The whole of it is queued before the first read,
+so every read finds as much as it asks for - which is why it is twice the limit
+and no more: the sender is joined before anything is read and has no send
+timeout, so all of it has to fit in loopback's socket buffers.
+*/
+@(test)
+test_doh_reader_stops_a_header_that_never_ends_within_one_read :: proc(t: ^testing.T) {
+	b := strings.builder_make(context.allocator)
+	defer strings.builder_destroy(&b)
+	strings.write_string(&b, "GET /dns-query HTTP/1.1\r\nX-Long: ")
+	for _ in 0 ..< 2 * MAX_HEADER_BYTES {
+		strings.write_byte(&b, 'a')
+	}
+
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+	sender := Sender {
+		endpoint = bound,
+		request  = strings.to_string(b),
+	}
+	client := thread.create_and_start_with_poly_data(&sender, send_request)
+	accepted, _, aerr := net.accept_tcp(listener)
+	// Sent whole before anything is read: the sender returns once it has.
+	thread.join(client)
+	thread.destroy(client)
+	if aerr != nil {
+		testing.expectf(t, false, "nothing connected: %v", aerr)
+		return
+	}
+	defer net.close(accepted)
+	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
+
+	r := Http_Reader {
+		conn = Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}},
+		buf  = make([dynamic]u8, 0, HTTP_BUF_SIZE),
+	}
+	defer delete(r.buf)
+	_, _, ok := read_http_request(&r)
+	testing.expect(t, !ok, "a header with no end was read as a request")
+	// The premise: the limit was reached, not the end of what was sent.
+	testing.expectf(t, len(r.buf) > MAX_HEADER_BYTES, "only %d bytes were read", len(r.buf))
+	testing.expectf(t, len(r.buf) <= MAX_HEADER_BYTES + HTTP_BUF_SIZE, "%d bytes read for a %d-byte header limit", len(r.buf), MAX_HEADER_BYTES)
 }

@@ -230,7 +230,7 @@ run :: proc(l: ^Loop) {
 		if busy {
 			timeout = 0
 		} else if len(l.timers) > 0 {
-			left := time.tick_diff(l.clock(), l.timers[0].deadline)
+			left := time.tick_diff(l.clock(), timer_due(l.timers[0]))
 			// Rounded up, so a timer due in 0.4 ms is not polled for in a loop of
 			// zero-length waits until it is due.
 			// Held to what `epoll_wait` takes: a deadline weeks away would
@@ -400,6 +400,7 @@ spawn :: proc(l: ^Loop, fn: proc(data: rawptr), data: rawptr) -> (h: Handle, ok:
 	f.data = data
 	f.cancelled = false
 	f.wake_reason = .None
+	f.idle = false
 	// A job starts from the zero values a fresh thread would, whatever the last
 	// job on this fiber left in its registered thread-locals.
 	f.locals = {}
@@ -677,7 +678,11 @@ park :: proc(deadline: Tick, cancellable := true) -> Wake_Reason {
 	}
 	f.wake_reason = .None
 	f.deadline = deadline
-	if deadline != (Tick{}) {
+	f.trim_at = {}
+	if f.idle {
+		f.trim_at = time.tick_add(l.clock(), IDLE_TRIM_AFTER)
+	}
+	if deadline != (Tick{}) || f.trim_at != (Tick{}) {
 		timer_push(l, f)
 	}
 	f.state = .Parked
@@ -804,15 +809,29 @@ sleep :: proc(d: time.Duration) -> bool {
 // --- Timers -------------------------------------------------------------------
 
 /*
-A binary heap of parked fibers by deadline.
+A binary heap of parked fibers by `timer_due`: the deadline, or an idle park's
+trim when that comes first.
 
-A fiber is in it at most once - one park, one deadline - and leaves it when the
+A fiber is in it at most once - one park, one entry - and leaves it when the
 park ends however it ends, so the heap holds exactly the parks that could still
-time out and never a backlog of stale entries for waits long since answered.
+time out or hand their stack back, and never a backlog of stale entries for
+waits long since answered.
 */
 @(private)
 timer_less :: proc(a, b: ^Fiber) -> bool {
-	return time.tick_diff(b.deadline, a.deadline) < 0
+	return time.tick_diff(timer_due(b), timer_due(a)) < 0
+}
+
+// Whether an idle park's stack is handed back before its deadline comes.
+@(private)
+timer_trims :: proc(f: ^Fiber) -> bool {
+	return f.trim_at != (Tick{}) && (f.deadline == (Tick{}) || time.tick_diff(f.deadline, f.trim_at) < 0)
+}
+
+// When the timer of a parked fiber fires: its trim or its deadline.
+@(private)
+timer_due :: proc(f: ^Fiber) -> Tick {
+	return f.trim_at if timer_trims(f) else f.deadline
 }
 
 @(private)
@@ -877,15 +896,30 @@ timer_remove :: proc(l: ^Loop, f: ^Fiber) {
 	}
 }
 
-// Wake every fiber whose deadline is at or before `now`.
+/*
+Wake every fiber whose deadline is at or before `now`, and hand back the stacks
+of the idle parks that have lasted `IDLE_TRIM_AFTER` - without waking them: such
+a fiber goes back in the heap on its own deadline, if it has one.
+*/
 @(private)
 expire_timers :: proc(l: ^Loop, now: Tick) {
 	for len(l.timers) > 0 {
 		f := l.timers[0]
-		if time.tick_diff(now, f.deadline) > 0 {
+		if time.tick_diff(now, timer_due(f)) > 0 {
 			return
 		}
 		timer_remove(l, f)
+		if timer_trims(f) {
+			f.trim_at = {}
+			// One already woken runs next round, and would fault the pages straight back.
+			if f.state == .Parked {
+				stack_release(f)
+			}
+			if f.deadline != (Tick{}) {
+				timer_push(l, f)
+			}
+			continue
+		}
 		wake_local(f, f.token, .Timeout)
 	}
 }
