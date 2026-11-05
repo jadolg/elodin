@@ -9,7 +9,7 @@ The bytes `encode_block_response` writes for a blocked name, written directly.
 
 A blocked name is answered at whatever rate a client asks, and building that
 answer as a `dns.Message` for the general encoder - its compression map, its
-dynamic arrays, a fold and a hash per suffix - made it a quarter dearer than a
+dynamic arrays, a fold and a hash per suffix - costs a quarter more than a
 cache hit, which is a copy. Every block answer has one shape: the question,
 then one A or AAAA record owned by it or the SOA `synth_soa` makes for its
 parent, then the client's OPT record echoed, so it is written here as that.
@@ -36,7 +36,8 @@ block_wire :: proc(
 	ok: bool,
 ) {
 	b := &live(s).cfg.blocking
-	buf: [512]u8
+	// Every byte up to `p` is written before it is read or copied out.
+	buf: [512]u8 = ---
 	n, err := dns.encode_name(q.name, buf[dns.HEADER_SIZE:])
 	if err != .None || n <= 1 || ends_in_soa_name(buf[dns.HEADER_SIZE:][:n]) {
 		return nil, false
@@ -50,7 +51,7 @@ block_wire :: proc(
 	if addr := block_address(b, q.type); len(addr) > 0 {
 		// Owned by the question's name, at the start of the question.
 		answers = 1
-		p += copy(buf[p:], []u8{0xc0, u8(dns.HEADER_SIZE)})
+		wire_u16(buf[:], &p, 0xc000 | dns.HEADER_SIZE)
 		wire_u16(buf[:], &p, u16(q.type))
 		wire_u16(buf[:], &p, u16(dns.Class.IN))
 		wire_u32(buf[:], &p, b.block_ttl)

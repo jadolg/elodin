@@ -7,16 +7,17 @@ import "core:testing"
 import "elodin:config"
 import "elodin:dns"
 
+// `opt` 0 sends no OPT record, 1 one with DO set, 2 one without and another size.
 @(private = "file")
-block_query :: proc(name: string, qtype: dns.Type, edns: bool, rd, cd: bool) -> dns.Message {
+block_query :: proc(name: string, qtype: dns.Type, opt: int, rd, cd: bool) -> dns.Message {
 	m: dns.Message
 	m.id = 0xbeef
 	m.flags.rd, m.flags.cd = rd, cd
 	m.question = make([]dns.Question, 1, context.temp_allocator)
 	m.question[0] = {name = name, type = qtype, class = .IN}
-	if edns {
+	if opt > 0 {
 		m.additional = make([]dns.Record, 1, context.temp_allocator)
-		m.additional[0] = dns.make_opt(1232, true)
+		m.additional[0] = dns.make_opt(1232 if opt == 1 else 1400, opt == 1)
 	}
 	return m
 }
@@ -24,9 +25,10 @@ block_query :: proc(name: string, qtype: dns.Type, edns: bool, rd, cd: bool) -> 
 /*
 `block_wire` writes the encoder's bytes, compared with the encoder itself over
 every response mode, a type each mode answers differently, both settings of
-`typed_only`, with and without an OPT record, and names that move the SOA's
-owner pointer: one label, mixed case, an escaped dot in the first label, the
-longest name there is.
+`typed_only`, without an OPT record and with two that differ in size and DO,
+and names that move the SOA's owner pointer: one label, mixed case, an escaped
+dot in the first label, the longest name there is. Each answer is written at a
+`limit` of its own length and left to the encoder one byte below it.
 */
 @(test)
 test_block_wire_is_the_encoders_bytes :: proc(t: ^testing.T) {
@@ -49,13 +51,16 @@ test_block_wire_is_the_encoders_bytes :: proc(t: ^testing.T) {
 		for name in names {
 			for qtype in types {
 				for typed_only in ([2]bool{false, true}) {
-					for edns in ([2]bool{false, true}) {
-						q := block_query(name, qtype, edns, rd = edns, cd = !edns)
+					for opt in 0 ..< 3 {
+						q := block_query(name, qtype, opt, rd = opt != 1, cd = opt == 1)
 						fast, ok := block_wire(&s, q, q.question[0], context.temp_allocator, 512, typed_only)
 						want := encode_block_response(&s, q, q.question[0], context.temp_allocator, 512, typed_only)
-						what := fmt.tprintf("%v %s %v typed_only=%v edns=%v", mode, name, qtype, typed_only, edns)
+						what := fmt.tprintf("%v %s %v typed_only=%v opt=%d", mode, name, qtype, typed_only, opt)
 						if testing.expectf(t, ok, "%s: left to the encoder", what) {
 							testing.expectf(t, string(fast) == string(want), "%s:\n got % x\nwant % x", what, fast, want)
+							_, fits := block_wire(&s, q, q.question[0], context.temp_allocator, len(fast), typed_only)
+							_, over := block_wire(&s, q, q.question[0], context.temp_allocator, len(fast) - 1, typed_only)
+							testing.expectf(t, fits && !over, "%s: limit %d fits=%v over=%v", what, len(fast), fits, over)
 						}
 					}
 				}
@@ -81,7 +86,7 @@ test_block_wire_leaves_the_rest_to_the_encoder :: proc(t: ^testing.T) {
 		limit: int,
 	}{{"x.invalid.", 512}, {"x.LocalHost.", 512}, {"hostmaster.INVALID.", 512}, {".", 512}, {"blocked.bench.test.", 40}}
 	for c in cases {
-		q := block_query(c.name, .A, true, true, false)
+		q := block_query(c.name, .A, 1, true, false)
 		_, ok := block_wire(&s, q, q.question[0], context.temp_allocator, c.limit, false)
 		testing.expectf(t, !ok, "%s at %d: written directly", c.name, c.limit)
 		out := build_block_response(&s, q, q.question[0], context.temp_allocator, c.limit)
@@ -103,7 +108,7 @@ test_block_response_is_one_allocation :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
 	defer mem.tracking_allocator_destroy(&track)
-	q := block_query("blocked.bench.test.", .A, true, true, false)
+	q := block_query("blocked.bench.test.", .A, 1, true, false)
 
 	out := build_block_response(&s, q, q.question[0], mem.tracking_allocator(&track), 512)
 	testing.expectf(t, len(out) > 0, "no block answer")
