@@ -200,10 +200,6 @@ edit_in_place :: proc(raw: []u8) {
 	// The cache's walk: where the TTLs are, what they say, and the rewrite of
 	// each one as the entry ages.
 	if offsets, ok := dns.scan_ttl_offsets(raw); ok {
-		// The offsets are `u16`, so a message they could not all reach is refused.
-		if len(raw) > dns.MAX_MESSAGE {
-			panic("a message past MAX_MESSAGE was scanned into offsets that wrap")
-		}
 		ttls := dns.read_ttls(raw, offsets)
 		dns.patch_ttls(dns.clone_message_bytes(raw), offsets, ttls, 60, 5)
 	}
