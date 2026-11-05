@@ -5,6 +5,7 @@ import "core:net"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
 
@@ -35,8 +36,10 @@ STACK_KIB :: 256
 
 /*
 What an idle connection's stack may keep: the frames it is parked under. Two
-pages on every transport in the debug build this suite runs, one in the release
-build; a query takes the stack to 20 KiB and more.
+4 KiB pages on every transport in the debug build this suite runs, one in the
+release build; a query takes the stack to 20 KiB and more. Raised to two of the
+kernel's pages on a 16 or 64 KiB-page kernel, where the page the stack pointer is
+in stays resident whole.
 */
 @(private = "file")
 IDLE_STACK_KIB :: 8
@@ -107,6 +110,7 @@ blocking: {{ enabled: false }}
 	}
 	defer stop_server(&srv)
 	pid := srv.process.pid
+	bound_kib := max(IDLE_STACK_KIB, 2 * int(posix.sysconf(._PAGESIZE)) / 1024)
 
 	// Answered locally, so the query runs the whole answer path with no upstream.
 	query := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
@@ -118,7 +122,10 @@ blocking: {{ enabled: false }}
 		}
 		for _ in 0 ..< IDLE_HELD {
 			c, answered := idle_hold_one(transport, tcp_port, dot_port, doh_port, query)
-			append(&conns, c)
+			// A dial that failed has no socket, and closing its zero one closes fd 0.
+			if c.socket != 0 {
+				append(&conns, c)
+			}
 			if !check(r, answered, "%v connection %d was not answered; log:\n%s", transport, len(conns), read_log(&srv)) {
 				return
 			}
@@ -129,10 +136,10 @@ blocking: {{ enabled: false }}
 		reports the last reading. Well inside `client_timeout`, which would close
 		the connections being measured.
 		*/
-		held, over, hok := fiber_stacks(pid)
+		held, over, hok := fiber_stacks(pid, bound_kib)
 		for start := time.tick_now(); hok && over > IDLE_WARM && time.tick_since(start) < 5 * time.Second; {
 			time.sleep(100 * time.Millisecond)
-			held, over, hok = fiber_stacks(pid)
+			held, over, hok = fiber_stacks(pid, bound_kib)
 		}
 		if !check(r, hok, "cannot read the server's smaps") {
 			return
@@ -150,7 +157,7 @@ blocking: {{ enabled: false }}
 			transport,
 			over,
 			held,
-			IDLE_STACK_KIB,
+			bound_kib,
 			IDLE_HELD,
 		)
 	}
@@ -188,12 +195,12 @@ idle_hold_one :: proc(transport: Idle_Transport, tcp_port, dot_port, doh_port: i
 
 /*
 The server's fiber stacks, and how many of them are resident past
-`IDLE_STACK_KIB`: anonymous mappings of `STACK_KIB`, read from smaps. Nothing else
+`bound_kib`: anonymous mappings of `STACK_KIB`, read from smaps. Nothing else
 the server maps is that size and anonymous; the guard page below each is a
 mapping of its own.
 */
 @(private = "file")
-fiber_stacks :: proc(pid: int) -> (count, over: int, ok: bool) {
+fiber_stacks :: proc(pid: int, bound_kib: int) -> (count, over: int, ok: bool) {
 	data, err := os.read_entire_file(fmt.tprintf("/proc/%d/smaps", pid), context.temp_allocator)
 	if err != nil {
 		return 0, 0, false
@@ -216,7 +223,7 @@ fiber_stacks :: proc(pid: int) -> (count, over: int, ok: bool) {
 		case fields[0] == "Rss:" && len(fields) >= 2 && anonymous && size == STACK_KIB:
 			rss, _ := strconv.parse_int(fields[1])
 			count += 1
-			over += 1 if rss > IDLE_STACK_KIB else 0
+			over += 1 if rss > bound_kib else 0
 		}
 	}
 	return count, over, true

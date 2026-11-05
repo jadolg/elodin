@@ -25,6 +25,8 @@ stack_clock :: proc "contextless" () -> Tick {
 Stack_Probe :: struct {
 	done:    sync.Sema,
 	idle:    bool,
+	// Woken before its trim comes due, as a query arriving in the same round is.
+	woken:   bool,
 	parked:  ^Fiber,
 	token:   u64,
 	// Pages of the parked fiber's stack resident at once, and once its park has
@@ -45,7 +47,8 @@ those pages resident while it is parked, and after `set_idle(true)` it keeps no
 more than the few its parked frames are on - but not before the park has lasted:
 a connection asking back to back would pay the faults on every query. The trim
 does not wake the fiber, which stays parked on its own deadline and then runs
-on, its frames intact.
+on, its frames intact. A fiber woken in the round its trim comes due keeps its
+pages: it runs next, and would only fault them back.
 
 Residency is read by a second fiber on the same loop, which runs once the first
 has switched out and moves the loop's clock itself.
@@ -69,22 +72,24 @@ test_an_idle_fiber_gives_its_stack_back_once_its_park_lasts :: proc(t: ^testing.
 		thread.destroy(th)
 	}
 	page := int(page_size())
-	for idle in ([]bool{false, true}) {
+	for c in ([][2]bool{{false, false}, {true, false}, {true, true}}) {
+		idle, woken := c[0], c[1]
 		p := Stack_Probe {
-			idle = idle,
+			idle  = idle,
+			woken = woken,
 		}
 		_, ok := spawn(l, deep_then_park, &p)
 		if !testing.expect(t, ok) || !testing.expect(t, sync.sema_wait_with_timeout(&p.done, 5 * time.Second)) {
 			return
 		}
 		testing.expectf(t, p.reason == .Ready && p.canary == 0x5eed, "idle %v: woke %v with canary %x", idle, p.reason, p.canary)
-		testing.expectf(t, p.waiting, "idle %v: the park did not outlast its trim on its own deadline", idle)
+		testing.expectf(t, p.waiting != woken, "idle %v, woken %v: still parked on its deadline is %v", idle, woken, p.waiting)
 		// The premise: what went deep is resident until it is given back.
 		testing.expectf(t, p.early * page >= DEPTH, "idle %v: only %d pages resident at once", idle, p.early)
-		if idle {
+		if idle && !woken {
 			testing.expectf(t, p.late * page <= max(16 * 1024, 2 * page), "an idle park kept %d pages resident", p.late)
 		} else {
-			testing.expectf(t, p.late * page >= DEPTH, "a busy park kept only %d pages resident", p.late)
+			testing.expectf(t, p.late * page >= DEPTH, "idle %v, woken %v: only %d pages kept resident", idle, woken, p.late)
 		}
 	}
 }
@@ -111,11 +116,16 @@ measure_then_wake :: proc(data: rawptr) {
 	f := p.parked
 	s := f.stack
 	p.early, _ = residency(([^]u8)(s.base)[:s.size])
+	if p.woken {
+		wake(f, p.token)
+	}
 	stack_now = time.tick_add(stack_now, IDLE_TRIM_AFTER)
 	expire_timers(f.loop, stack_now)
 	p.late, _ = residency(([^]u8)(s.base)[:s.size])
 	p.waiting = f.state == .Parked && f.heap_index >= 0 && timer_due(f) == f.deadline
-	wake(f, p.token)
+	if !p.woken {
+		wake(f, p.token)
+	}
 }
 
 @(private = "file")

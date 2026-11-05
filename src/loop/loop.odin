@@ -809,11 +809,13 @@ sleep :: proc(d: time.Duration) -> bool {
 // --- Timers -------------------------------------------------------------------
 
 /*
-A binary heap of parked fibers by deadline.
+A binary heap of parked fibers by `timer_due`: the deadline, or an idle park's
+trim when that comes first.
 
-A fiber is in it at most once - one park, one deadline - and leaves it when the
+A fiber is in it at most once - one park, one entry - and leaves it when the
 park ends however it ends, so the heap holds exactly the parks that could still
-time out and never a backlog of stale entries for waits long since answered.
+time out or hand their stack back, and never a backlog of stale entries for
+waits long since answered.
 */
 @(private)
 timer_less :: proc(a, b: ^Fiber) -> bool {
@@ -909,7 +911,10 @@ expire_timers :: proc(l: ^Loop, now: Tick) {
 		timer_remove(l, f)
 		if timer_trims(f) {
 			f.trim_at = {}
-			stack_release(f)
+			// One already woken runs next round, and would fault the pages straight back.
+			if f.state == .Parked {
+				stack_release(f)
+			}
 			if f.deadline != (Tick{}) {
 				timer_push(l, f)
 			}

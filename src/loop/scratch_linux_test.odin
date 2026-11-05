@@ -3,7 +3,6 @@ package loop
 
 import "base:runtime"
 import "core:sys/linux"
-import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 
@@ -109,7 +108,7 @@ counting_proc :: proc(
 // 64 KiB on some arm64 kernels.
 @(private)
 page_size :: proc() -> uintptr {
-	return uintptr(posix.sysconf(._PAGESIZE))
+	return kernel_page
 }
 
 // Pages of `b` resident, by mincore(2) over the pages it spans.

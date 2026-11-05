@@ -155,12 +155,14 @@ http_fill :: proc(r: ^Http_Reader) -> bool {
 	read between requests is where an idle connection parks, and a 4 KiB chunk
 	there is a page the parked fiber keeps resident for as long as the client
 	keeps the connection (#596). Grown by doubling once full, as `append` grows it.
+	A read takes at most `HTTP_BUF_SIZE`, so a header that never ends is refused
+	within one such read past `MAX_HEADER_BYTES`.
 	*/
 	have := len(r.buf)
 	if have == cap(r.buf) && reserve(&r.buf, max(2 * cap(r.buf), HTTP_BUF_SIZE)) != nil {
 		return false
 	}
-	_ = non_zero_resize(&r.buf, cap(r.buf))
+	_ = non_zero_resize(&r.buf, have + min(cap(r.buf) - have, HTTP_BUF_SIZE))
 	n, ok := conn_read_budgeted(r.conn, r.buf[have:], &r.budget)
 	_ = resize(&r.buf, have + (n if ok else 0))
 	return ok
