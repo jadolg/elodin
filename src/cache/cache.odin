@@ -788,7 +788,19 @@ get :: proc(
 	elapsed := u32(max(0, time.duration_seconds(time.Duration(now - e.inserted))))
 	out: []u8
 	if copies {
-		out = make([]u8, e.wire_len, allocator)
+		/*
+		A copy that cannot be had is a miss: the query goes on to an upstream.
+		Found with no bytes would read as a hit the caller asked not to have
+		copied, and the stale branch below would write TTLs into nothing.
+		*/
+		alloc_err: mem.Allocator_Error
+		out, alloc_err = make([]u8, e.wire_len, allocator)
+		if alloc_err != nil {
+			if !probe {
+				s.misses += 1
+			}
+			return nil, {}, false
+		}
 		copy(out, wire_of(e))
 	}
 
@@ -1411,11 +1423,19 @@ the same shape stopped one layer further out, on the paths no validator
 		}
 	}
 
+	// Both lists are copied into the entry's block, or the put is refused.
 	offsets, scan_ok := dns.scan_ttl_offsets(wire, c.allocator)
 	if !scan_ok {
 		return false
 	}
+	defer delete(offsets, c.allocator)
 	ttls := dns.read_ttls(wire, offsets, c.allocator)
+	defer delete(ttls, c.allocator)
+	// A list `read_ttls` could not allocate is empty, and the block is not
+	// zeroed: an entry stored from it would serve whatever was there.
+	if len(ttls) != len(offsets) {
+		return false
+	}
 
 	/*
 	`max_ttl` applied to the stored figures, not only to the entry's lifetime.
@@ -1488,8 +1508,6 @@ thing in both directions.
 		effective = clamp(effective, min_ttl, max_ttl)
 	}
 	if effective == 0 {
-		delete(offsets, c.allocator)
-		delete(ttls, c.allocator)
 		forget(c, key, stale)
 		return false
 	}
@@ -1508,8 +1526,6 @@ thing in both directions.
 	*/
 	size := sizeof_entry(len(key), len(wire), len(offsets))
 	if size > sync.atomic_load(&c.max_bytes) {
-		delete(offsets, c.allocator)
-		delete(ttls, c.allocator)
 		forget(c, key, stale)
 		return false
 	}
@@ -1521,8 +1537,6 @@ thing in both directions.
 		c.allocator,
 	)
 	if alloc_err != nil {
-		delete(offsets, c.allocator)
-		delete(ttls, c.allocator)
 		return false
 	}
 	e := (^Entry)(raw_data(block))
@@ -1534,8 +1548,6 @@ thing in both directions.
 	copy(offsets_of(e), offsets)
 	copy(key_bytes(e), key)
 	copy(wire_of(e), wire)
-	delete(offsets, c.allocator)
-	delete(ttls, c.allocator)
 	e.redirects = redirects(msg)
 	e.bogus = bogus
 	e.checked = checked
@@ -1831,7 +1843,7 @@ key_of :: #force_inline proc "contextless" (e: ^Entry) -> string {
 
 // The answer as it was stored, its TTLs as they arrived.
 wire_of :: #force_inline proc "contextless" (e: ^Entry) -> []u8 {
-	return tail(e)[int(e.ttl_count) * (size_of(u32) + size_of(u16)) + int(e.key_len):][:e.wire_len]
+	return raw_data(key_bytes(e))[e.key_len:][:e.wire_len]
 }
 
 /*

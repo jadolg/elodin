@@ -232,3 +232,40 @@ test_scan_refuses_a_message_past_max_message :: proc(t: ^testing.T) {
 	_, ok = scan_ttl_offsets(past, context.temp_allocator)
 	testing.expect(t, !ok, "a message past MAX_MESSAGE was scanned")
 }
+
+/*
+A list that cannot be reserved is a refusal, not a shorter list: one missing
+a record would read as a message with fewer TTLs, and the cache would store the
+answer with nothing to count those down.
+*/
+@(test)
+test_scan_refuses_when_its_list_cannot_be_reserved :: proc(t: ^testing.T) {
+	refuse :: proc(
+		_: rawptr,
+		mode: mem.Allocator_Mode,
+		_, _: int,
+		_: rawptr,
+		_: int,
+		_ := #caller_location,
+	) -> (
+		[]byte,
+		mem.Allocator_Error,
+	) {
+		return nil, .Out_Of_Memory if mode == .Alloc || mode == .Alloc_Non_Zeroed || mode == .Resize || mode == .Resize_Non_Zeroed else .None
+	}
+	// One A record owned by the root.
+	msg := []u8 {
+		0x12, 0x34, 0x81, 0x80, // id, flags
+		0x00, 0x00, 0x00, 0x01, // qdcount 0, ancount 1
+		0x00, 0x00, 0x00, 0x00, // nscount 0, arcount 0
+		0x00, 0x00, 0x01, 0x00, 0x01, // the root name, type A, class IN
+		0x00, 0x00, 0x01, 0x2c, 0x00, 0x04, 1, 2, 3, 4, // TTL 300, rdlength 4, the address
+	}
+	// The premise: the message scans.
+	offsets, ok := scan_ttl_offsets(msg, context.temp_allocator)
+	testing.expect_value(t, len(offsets), 1)
+	free_all(context.temp_allocator)
+
+	offsets, ok = scan_ttl_offsets(msg, mem.Allocator{procedure = refuse})
+	testing.expectf(t, !ok, "scanned into a list of %d offsets for a message with one TTL", len(offsets))
+}

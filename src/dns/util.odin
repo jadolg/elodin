@@ -303,7 +303,7 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 
 	The caller is `cache.put`, which `resolve_query` reaches only with a
 	response it has decoded. A 17-byte reply claiming three sections of 65535 records would
-	otherwise allocate 1.5 MB for a walk that fails on the first name, and a
+	otherwise allocate 384 KiB for a walk that fails on the first name, and a
 	guard that costs one comparison is not worth removing for a caller that
 	might hand it bytes nothing has checked.
 	*/
@@ -321,7 +321,15 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 		}
 	}
 
-	out := make([dynamic]u16, 0, total, allocator)
+	/*
+	Reserved whole, so no `append` below can fail: a list short of a record
+	would read as a message with fewer TTLs, and the cache would store the
+	answer with the upstream's figures in it and nothing to count them down.
+	*/
+	out, alloc_err := make([dynamic]u16, 0, total, allocator)
+	if alloc_err != nil {
+		return nil, false
+	}
 	for _ in 0 ..< total {
 		next, name_ok := skip_name(msg, pos)
 		if !name_ok {
@@ -683,8 +691,13 @@ write_ttl_at :: proc(msg: []u8, off: int, v: u32) {
 	msg[off + 3] = u8(v)
 }
 
+// Empty when the list cannot be allocated, which a caller tells from a message
+// with no TTLs by comparing it with `offsets`.
 read_ttls :: proc(msg: []u8, offsets: []u16, allocator := context.allocator) -> []u32 {
-	ttls := make([]u32, len(offsets), allocator)
+	ttls, err := make([]u32, len(offsets), allocator)
+	if err != nil {
+		return nil
+	}
 	for off, i in offsets {
 		ttls[i] = sane_ttl(read_ttl_at(msg, int(off)))
 	}
