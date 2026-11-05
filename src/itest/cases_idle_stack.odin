@@ -1,5 +1,6 @@
 package itest
 
+import "base:runtime"
 import "core:fmt"
 import "core:net"
 import "core:os"
@@ -201,6 +202,9 @@ mapping of its own.
 */
 @(private = "file")
 fiber_stacks :: proc(pid: int, bound_kib: int) -> (count, over: int, ok: bool) {
+	// Polled until the stacks go back, and the temp allocator is reset only when
+	// the case ends: each reading's file and fields go when it returns.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	data, err := os.read_entire_file(fmt.tprintf("/proc/%d/smaps", pid), context.temp_allocator)
 	if err != nil {
 		return 0, 0, false

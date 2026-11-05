@@ -2291,14 +2291,16 @@ A header that never ends is refused within one read of `HTTP_BUF_SIZE` past
 `http_fill` reads into the buffer's free capacity, and the buffer doubles when
 full, so a read that took all of it could carry the buffer to twice the limit
 before `http_line` looks again. The whole of it is queued before the first read,
-so every read finds as much as it asks for.
+so every read finds as much as it asks for - which is why it is twice the limit
+and no more: the sender is joined before anything is read and has no send
+timeout, so all of it has to fit in loopback's socket buffers.
 */
 @(test)
 test_doh_reader_stops_a_header_that_never_ends_within_one_read :: proc(t: ^testing.T) {
 	b := strings.builder_make(context.allocator)
 	defer strings.builder_destroy(&b)
 	strings.write_string(&b, "GET /dns-query HTTP/1.1\r\nX-Long: ")
-	for _ in 0 ..< 4 * MAX_HEADER_BYTES {
+	for _ in 0 ..< 2 * MAX_HEADER_BYTES {
 		strings.write_byte(&b, 'a')
 	}
 

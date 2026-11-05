@@ -1022,15 +1022,16 @@ passed rather than defaulted so that a path added later has to answer the questi
 rather than inherit an answer.
 */
 @(private)
-http_linger :: #force_no_inline proc(conn: Conn, idle: time.Duration) {
+http_linger :: proc(conn: Conn, idle: time.Duration) {
 	// Not `net.set_option`: over DoH the connection is a TLS one, where the socket
 	// option stopped applying at the handshake - see `conn_set_read_timeout`.
 	conn_set_read_timeout(conn, idle)
 	start := loop.tick_now()
-	chunk: [4096]u8
+	// Scratch, not a local: see `stream_linger`.
+	chunk := make([]u8, 4096, context.temp_allocator)
 	discarded := 0
 	for discarded < HTTP_LINGER_BYTES && loop.tick_since(start) < HTTP_LINGER_TIMEOUT {
-		n, ok := conn_read(conn, chunk[:])
+		n, ok := conn_read(conn, chunk)
 		if !ok {
 			return
 		}

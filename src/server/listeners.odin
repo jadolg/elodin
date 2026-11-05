@@ -2133,18 +2133,19 @@ Reached only from a connection that has answered something, for the same reason:
 with nothing written there is nothing for the RST to take back, and the drain
 would be time out of one of `max_connections` spent protecting nothing.
 
-Never inlined, nor is `http_linger`: their 4 KiB chunk would join the frame of
-the connection loop that calls them, which is live under every idle wait, and keep a
-page of each held connection's stack resident for nothing (#596).
+The chunk is scratch rather than a local, as `http_linger`'s is: inlined into
+the connection loop that calls it, a 4 KiB local would join a frame that is live
+under every idle wait, and keep a page of each held connection's stack resident
+for nothing (#596). The caller resets the scratch once this returns.
 */
 @(private)
-stream_linger :: #force_no_inline proc(conn: Conn) {
+stream_linger :: proc(conn: Conn) {
 	conn_set_read_timeout(conn, STREAM_LINGER_IDLE)
 	start := loop.tick_now()
-	chunk: [4096]u8
+	chunk := make([]u8, 4096, context.temp_allocator)
 	discarded := 0
 	for discarded < STREAM_LINGER_BYTES && loop.tick_since(start) < STREAM_LINGER_TIMEOUT {
-		n, ok := conn_read(conn, chunk[:])
+		n, ok := conn_read(conn, chunk)
 		if !ok {
 			return
 		}
@@ -2324,7 +2325,9 @@ conn_read_budgeted :: proc(c: Conn, buf: []u8, b: ^Read_Budget) -> (n: int, ok: 
 	No deadline yet is a connection between messages, waiting for as long as the
 	client cares to keep it open. Parked there for `loop.IDLE_TRIM_AFTER`, the
 	fiber hands back the stack its last query touched (#596): most of what an
-	idle TCP, DoT or DoH connection costs.
+	idle TCP, DoT or DoH connection costs. A budget with no idle wait never
+	starts a deadline, so there every read counts, the reads inside a message
+	included: a trim there costs only refaults if that read lasts `loop.IDLE_TRIM_AFTER`.
 	*/
 	loop.set_idle(b.deadline == (time.Tick{}))
 	n, ok = conn_read(c, buf)

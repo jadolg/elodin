@@ -71,7 +71,7 @@ test_an_idle_fiber_gives_its_stack_back_once_its_park_lasts :: proc(t: ^testing.
 		thread.join(th)
 		thread.destroy(th)
 	}
-	page := int(page_size())
+	page := int(kernel_page)
 	for c in ([][2]bool{{false, false}, {true, false}, {true, true}}) {
 		idle, woken := c[0], c[1]
 		p := Stack_Probe {
