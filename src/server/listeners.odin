@@ -2136,7 +2136,8 @@ would be time out of one of `max_connections` spent protecting nothing.
 The chunk is scratch rather than a local, as `http_linger`'s is: inlined into
 the connection loop that calls it, a 4 KiB local would join a frame that is live
 under every idle wait, and keep a page of each held connection's stack resident
-for nothing (#596). The caller resets the scratch once this returns.
+for nothing (#596). The connection ends once this returns, and `stream_job`
+frees the scratch on its way out.
 */
 @(private)
 stream_linger :: proc(conn: Conn) {
