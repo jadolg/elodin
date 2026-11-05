@@ -197,18 +197,18 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
 
 ## Where elodin falls behind
 
-- **DoT p99 at 3 ms**, against BIND's 1.1 ms and Knot's 1.5 ms: the #604
+- **DoT p99 at 3 ms** (#610), against BIND's 1.1 ms and Knot's 1.5 ms: the #604
   regression above.
-- **CPU per cache miss**: 27 µs at saturation against dnsdist's 8 µs, and a
+- **CPU per cache miss** (#612): 27 µs at saturation against dnsdist's 8 µs, and a
   p99 of 107 ms at 75,000 against dnsdist's 62 ms. Unbound and Knot are
   level with elodin at 28 µs.
-- **Blocked answers cost more than cached ones**: 488,474 a second against
+- **Blocked answers cost more than cached ones** (#611): 488,474 a second against
   640,906 for a hit. Unbound (593,258) and PowerDNS (515,741) answer a
   listed name as fast as a cached one.
-- **Per idle TCP connection**: 8.7 KB, halved, against 0.1–0.2 KB for
+- **Per idle TCP connection** (#613): 8.7 KB, halved, against 0.1–0.2 KB for
   PowerDNS, dnsdist and Unbound.
-- **Per idle DoT connection**: 43 KB against dnsdist's 25 KB, Blocky's 34 KB
+- **Per idle DoT connection** (#614): 43 KB against dnsdist's 25 KB, Blocky's 34 KB
   and CoreDNS's 35 KB.
-- **Per query in flight**: 17 KB against Unbound's 12 KB and CoreDNS's 14 KB.
+- **Per query in flight** (#614): 17 KB against Unbound's 12 KB and CoreDNS's 14 KB.
 - **Per cache entry**: 301 B, fourth behind dnsmasq (194 B), Pi-hole (247 B)
   and dnsdist (271 B).
