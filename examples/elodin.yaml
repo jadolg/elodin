@@ -28,6 +28,11 @@ server:
   max_connections_per_prefix: 0
   # How long an idle client connection is held; 1ms to 24h.
   client_timeout: 10s
+  # Hold event loop i to the i-th CPU this process may use. It cuts a ~3 ms
+  # tail a loop pays when it wakes onto a CPU another loop is running on, but a
+  # pinned loop can't move off a CPU another process keeps busy, so turn it on
+  # only where the CPUs are elodin's. Takes a restart. See docs/sizing.md.
+  pin_loops: false
   # Queries in flight at once - every UDP query and DoH/2 request from arrival
   # to answer - before new ones are dropped (DoH/2: answered 503). A query
   # waiting on an upstream holds no thread, so this is about memory, not cores:

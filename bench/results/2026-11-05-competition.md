@@ -89,33 +89,28 @@ Across #604 DoT's p50 fell (0.33 → 0.25 ms) and its p99 rose (0.71 → 3.05
 ms), with the spread of queries per client widening (16,706–17,154 →
 16,872–18,012); TCP improved on all three (p99 2.39 → 1.44 ms).
 
-No DoT connection waits in elodin (#610). Counted under this load on an
-instrumented dev-7b5c052, no read left decrypted bytes in OpenSSL, and 205 of
-2.38 million parks found bytes already queued: each an arrival racing the
-park, which level-triggered epoll fires on at once. What #604 changed is that
-a cache hit got cheap enough for each loop to go idle: at saturation a loop
-thread runs at 87% and sleeps in `epoll_wait` about 5,500 times a second;
-with #604's epoll wait and clock reverted it runs at 100% and sleeps about 20
-times a second. On this VM (qemu on a macOS host) a halted vCPU takes the host
-about 3 ms to wake, and every build and transport has that 3 ms mode. #604
-moved it from DoT's p99.9 to its p99:
+No DoT connection waits in elodin's code (#610). Counted under this load on an
+instrumented build, no read left decrypted bytes in OpenSSL. Of 2.38 million
+parks, 205 found bytes already queued; each was an arrival racing the park,
+which level-triggered epoll fires on at once. What #604 changed is that a cache
+hit got cheap enough for the loops to go idle: at saturation each loop ran at
+87% and slept in `epoll_wait` about 5,500 times a second. Reverting #604's
+epoll change and its vDSO clock together keeps them at 100%, and the tail
+goes. Reverting either alone, or the read path, does not.
 
-- Reverting #604's read path, its `listeners.odin`, its epoll change or its
-  vDSO clock alone leaves the p99 at 2.5–3.3 ms. Reverting the epoll change
-  and the clock together restores the per-query system calls, keeps the loops
-  at 100%, and brings the p99 back to 0.66 and 0.98 ms.
-- Keeping CPUs 0-1 from halting with `SCHED_IDLE` spinners, which a woken
-  thread preempts, moves the mode back to p99.9: dev-979abb2 at saturation
-  goes from 3.2 to 1.03 ms.
-- The guest scheduler delayed 18 of 22,524 loop wake-ups by more than 0.1 ms,
-  so the wait is in the host, not in Linux.
+A loop that wakes can be queued on the CPU the other loop is running on. It
+then waits out that loop's slice, about 3 ms, with its ~50 connections behind
+it. In `perf sched` at 200,000 DoT queries a second, the elodin wake-ups
+delayed by more than 2 ms each waited about 3.0 ms behind the other loop
+thread. That was 8–49 times a second, against 1 before #604. `server.pin_loops`
+holds each loop to a CPU of its own. Over three alternating pairs at
+200,000 a second it took those delays to 0–1 a second, p99 from 0.95–1.72 to
+0.83–0.93 ms, and p99.5 from 2.1–3.3 to 1.0–1.4 ms.
 
-A loop that spun before sleeping would hide the server's wake-up, not the
-generator's: at saturation the generator's vCPUs are about 40% idle and pay
-the same cost, so a build that never blocks still shows 3 ms at 366,000 a
-second, and 0.60–0.74 ms at a fixed 200,000. Spinning costs CPU on every idle
-device. Unbound, BIND, Knot Resolver, PowerDNS Recursor and dnsmasq block in
-their pollers too.
+At saturation the p99 stays near 3 ms pinned or not. That 3 ms belongs to the
+generator: its threads were delayed more than 0.5 ms 389 times a second, and
+a build that never blocks in `epoll_wait` shows it too. The runs above are
+elodin's defaults, unpinned.
 
 ## Memory
 
@@ -222,9 +217,9 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
 
 ## Where elodin falls behind
 
-- **DoT p99 at 3 ms**, against BIND's 1.1 ms and Knot's 1.5 ms. This is the VM's
-  vCPU wake-up, not a wait in elodin (#610, above). These runs do not show why
-  BIND and Knot avoid it.
+- **DoT p99 at 3 ms** (#610), against BIND's 1.1 ms and Knot's 1.5 ms. Below
+  saturation, the share of it that is loops queuing behind each other goes with
+  `server.pin_loops` (above). At saturation it is mostly the generator's.
 - **CPU per cache miss** (#612): 27 µs at saturation against dnsdist's 8 µs, and a
   p99 of 107 ms at 75,000 against dnsdist's 62 ms. Unbound and Knot are
   level with elodin at 28 µs.

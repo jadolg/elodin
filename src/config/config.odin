@@ -593,6 +593,19 @@ Server_Config :: struct {
 	number.
 	*/
 	client_timeout:             time.Duration,
+	/*
+	Hold event loop i to the i-th CPU the process may run on, wrapping when
+	there are more loops than CPUs. Off by default (#610).
+
+	A loop that goes idle in `epoll_wait` and wakes can be queued by the
+	scheduler on the CPU another loop is running on, and then waits out that
+	loop's slice - about 3 ms - with every connection it serves behind it. A
+	pinned loop never queues behind another. What it gives up is moving: a loop
+	held to a CPU that another process is keeping busy stays there. So it is for
+	a machine whose CPUs are elodin's, as the same setting is opt-in in
+	PowerDNS (`cpu-map`), dnsdist, nginx and HAProxy.
+	*/
+	pin_loops:                  bool,
 	// Stream connections - TCP, DoT and DoH together - that may exist at once,
 	// for the whole server. How much of it one client may hold is
 	// `max_connections_per_prefix`.

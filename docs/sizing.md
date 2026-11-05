@@ -60,6 +60,38 @@ reaches 64 KiB), and a reader every 64 messages it reads without waiting.
 Between turns a validating query holds its loop for a few hundred microseconds
 at most, where the whole of its DNSSEC allowance is a few milliseconds.
 
+### Pinning the loops
+
+```yaml
+server:
+  pin_loops: false   # true holds loop i to the i-th CPU the process may use
+```
+
+A loop that goes idle in `epoll_wait` gives up its CPU. When it wakes, the
+scheduler can queue it on a CPU where another loop is running, and it then
+waits out that loop's slice, about 3 ms, with all its connections waiting
+behind it. That happens between idle and saturated. A saturated loop never goes
+idle, and an idle server has nothing queued. `pin_loops: true` holds each loop
+to a CPU of its own, so no loop ever queues behind another. Measured with DoT
+cache hits at 200,000 a second on two cores, it took p99.5 from 2.1–3.3 ms to
+1.0–1.4 ms.
+
+It is off by default because a pinned loop can't move. If another process keeps
+that CPU busy, the loop's connections wait for it. Turn it on where the CPUs are
+elodin's.
+
+- The CPUs are the ones the process may run on: its affinity, as `taskset`, a
+  cpuset or systemd's `CPUAffinity=` sets it. Loop i takes the i-th of them,
+  wrapping when there are more loops than CPUs. Startup logs the CPU each loop
+  runs on (`server.pin_loops: the event loops run on CPUs [0, 1]`), and warns
+  when loops have to share a CPU.
+- A CPU quota (`docker run --cpus`, `CPUQuota=`) is not an affinity. Pinned
+  loops under a quota still share its time.
+- If the affinity can't be read, or a loop can't be held to its CPU, startup
+  warns and those loops run unpinned.
+- It takes a restart. A reload that changes it says so and keeps the value the
+  process started with.
+
 ## Queries in flight
 
 `server.max_pending` bounds the queries in flight on fibers of their own: every

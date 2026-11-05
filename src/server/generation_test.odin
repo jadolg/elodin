@@ -1043,3 +1043,27 @@ test_a_rebuild_holds_no_generation_a_reload_replaces :: proc(t: ^testing.T) {
 	}
 	rebuild_collect(&r)
 }
+
+// `server.pin_loops` is read as the loops start, so a reload that turns it on is
+// named and held off.
+@(test)
+test_a_reload_holds_pin_loops :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	if err := virtual.arena_init_growing(&arena); err != nil {
+		testing.expectf(t, false, "cannot reserve an arena: %v", err)
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	boot, boot_err := config.load_string(BASE, virtual.arena_allocator(&arena))
+	cfg, err := config.load_string(swap(BASE, "server:\n", "server:\n  pin_loops: true\n"), virtual.arena_allocator(&arena))
+	if boot_err != nil || err != nil {
+		testing.expectf(t, false, "does not load: %v %v", boot_err, err)
+		return
+	}
+	testing.expect(t, !boot.server.pin_loops, "off is not the default")
+	testing.expect(t, cfg.server.pin_loops, "pin_loops: true did not load as on")
+
+	named := keep_restart_only(&boot, &cfg, context.temp_allocator)
+	testing.expectf(t, len(named) == 1 && named[0] == "server.pin_loops", "named %v", named)
+	testing.expect(t, !cfg.server.pin_loops, "a reload turned pinning on for loops already running")
+}
