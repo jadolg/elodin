@@ -6,6 +6,9 @@ import "core:os"
 import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
+import "core:sys/posix"
+import "core:thread"
 import "core:time"
 import "elodin:dns"
 
@@ -309,21 +312,6 @@ KEPT_KIB_PER_CONN :: 32
 @(private = "file")
 KEPT_HUGE_KIB :: 2048
 
-// Descriptors the process holds open, counted off /proc/<pid>/fd.
-@(private = "file")
-open_descriptors :: proc(pid: int) -> (n: int, ok: bool) {
-	dir, err := os.open(fmt.tprintf("/proc/%d/fd", pid))
-	if err != nil {
-		return 0, false
-	}
-	defer os.close(dir)
-	entries, rerr := os.read_dir(dir, -1, context.temp_allocator)
-	if rerr != nil {
-		return 0, false
-	}
-	return len(entries), true
-}
-
 // The process's huge pages in KiB, summed over its mappings by the kernel.
 @(private = "file")
 anon_huge_kib :: proc(pid: int) -> (kib: int, ok: bool) {
@@ -331,8 +319,62 @@ anon_huge_kib :: proc(pid: int) -> (kib: int, ok: bool) {
 	return strconv.parse_int(strings.trim_space(strings.trim_suffix(value, "kB")))
 }
 
+/*
+The descriptor count the case below is judged on survives descriptors closing
+while it is taken.
+
+The case reads the server's count while the server is closing connections -
+`wait_tcp`'s probe at the first reading, the whole burst in the wait after it.
+`os.read_dir` opens every entry it lists, so one closed between the listing and
+the open failed the reading, which failed the case as "cannot read the server's
+status", or read as zero in the wait and passed it. A thread here opens and
+closes a descriptor without pause: the old reading is first seen to fail under
+it - the premise, waited for, with a deadline that only ends a run where it
+never does - and then `open_descriptor_count` is taken as many times again and
+must never fail.
+*/
+@(private = "file")
+descriptor_count_case :: proc(r: ^Runner) {
+	start_case(r, "harness: the descriptor count survives descriptors closing while it is read")
+	defer end_case(r)
+
+	stop: bool
+	churn := thread.create_and_start_with_data(&stop, proc(data: rawptr) {
+		stop := (^bool)(data)
+		for !sync.atomic_load(stop) {
+			fd := posix.open("/dev/null", {})
+			if fd >= 0 {
+				posix.close(fd)
+			}
+		}
+	})
+	defer {
+		sync.atomic_store(&stop, true)
+		thread.join(churn)
+		thread.destroy(churn)
+	}
+
+	readings := 0
+	failed := false
+	for start := time.tick_now(); !failed && time.tick_since(start) < 30 * time.Second; readings += 1 {
+		_, err := os.read_directory_by_path("/proc/self/fd", -1, context.temp_allocator)
+		failed = err != nil
+		free_all(context.temp_allocator)
+	}
+	if !check(r, failed, "os.read_dir never failed in %d readings while descriptors closed", readings) {
+		return
+	}
+	for i in 0 ..< max(readings, 1000) {
+		if _, ok := open_descriptor_count(); !check(r, ok, "open_descriptor_count failed on reading %d of %d", i, max(readings, 1000)) {
+			return
+		}
+	}
+}
+
 run_connection_memory_cases :: proc(r: ^Runner) {
 	NAME :: "conns: a burst of TCP connections under the shipped unit's environment gives their memory back on close"
+
+	descriptor_count_case(r)
 
 	unit_env, unit_ok := unit_environment(r)
 	if !unit_ok || built_with_asan(r, NAME) {
@@ -383,7 +425,7 @@ blocking: {{ enabled: false }}
 	}
 	base, bok := proc_status_int(pid, "VmRSS")
 	threads0, tok := proc_status_int(pid, "Threads")
-	fds0, fok := open_descriptors(pid)
+	fds0, fok := open_descriptor_count(pid)
 	if !check(r, bok && tok && fok, "cannot read the server's status") {
 		return
 	}
@@ -412,11 +454,11 @@ blocking: {{ enabled: false }}
 	}
 	held, hok := proc_status_int(pid, "VmRSS")
 	threads1, _ := proc_status_int(pid, "Threads")
-	fds1, _ := open_descriptors(pid)
+	fds1, f1ok := open_descriptor_count(pid)
 	// The premise: the server is holding every connection - one descriptor
 	// each. One short, as `wait_tcp`'s probe may still have been in the first
 	// reading.
-	if !check(r, hok && fds1 >= fds0 + CONN_BURST - 1, "descriptors went %d -> %d holding %d connections", fds0, fds1, CONN_BURST) {
+	if !check(r, hok && f1ok && fds1 >= fds0 + CONN_BURST - 1, "descriptors went %d -> %d holding %d connections", fds0, fds1, CONN_BURST) {
 		return
 	}
 	// And held on the loops' threads, not on threads of their own.
@@ -430,12 +472,13 @@ blocking: {{ enabled: false }}
 	clear(&sockets)
 	// Until the server has closed its ends, which is when the fibers have
 	// returned and their scratch is unmapped. The bound only ends a failing run.
-	fds2 := fds1
-	for start := time.tick_now(); fds2 > fds0 && time.tick_since(start) < 10 * time.Second; {
+	// A reading that fails is not a count of zero, which would pass.
+	fds2, f2ok := fds1, true
+	for start := time.tick_now(); f2ok && fds2 > fds0 && time.tick_since(start) < 10 * time.Second; {
 		time.sleep(20 * time.Millisecond)
-		fds2, _ = open_descriptors(pid)
+		fds2, f2ok = open_descriptor_count(pid)
 	}
-	if !check(r, fds2 <= fds0, "descriptors still at %d (from %d) after the connections closed", fds2, fds0) {
+	if !check(r, f2ok && fds2 <= fds0, "descriptors still at %d (from %d) after the connections closed", fds2, fds0) {
 		return
 	}
 	/*

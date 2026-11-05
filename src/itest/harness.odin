@@ -1027,3 +1027,35 @@ cms_verify :: proc(r: ^Runner, der: []u8, ca_file: string) -> (payload: string, 
 	}
 	return string(data), true
 }
+
+/*
+How many descriptors a process holds, counted off `/proc/<pid>/fd` (`pid` 0 is
+this process), or false when the directory cannot be read.
+
+Names counted through `readdir` and never opened. `os.read_dir` opens every
+entry it lists to fill in a `File_Info`, so a descriptor closed between the
+listing and the open - a connection the server is finishing with, a mock
+thread's socket - fails the whole read with ENOENT, and a caller that took the
+failure as zero read "everything closed". `.` and `..` are not descriptors; the
+one `opendir` holds is counted when `pid` is this process, the same on every
+reading.
+*/
+open_descriptor_count :: proc(pid: int = 0) -> (n: int, ok: bool) {
+	path := "/proc/self/fd" if pid == 0 else fmt.tprintf("/proc/%d/fd", pid)
+	dir := posix.opendir(strings.clone_to_cstring(path, context.temp_allocator))
+	if dir == nil {
+		return 0, false
+	}
+	defer posix.closedir(dir)
+	for {
+		entry := posix.readdir(dir)
+		if entry == nil {
+			return n, true
+		}
+		name := &entry.d_name
+		if name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0)) {
+			continue
+		}
+		n += 1
+	}
+}
