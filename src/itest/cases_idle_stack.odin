@@ -24,8 +24,7 @@ Read from smaps: a fiber stack is an anonymous mapping of `loop.STACK_SIZE`, and
 each held connection adds one. The case holds `IDLE_HELD` connections per
 transport, each answered once, and counts the stacks resident past
 `IDLE_STACK_KIB`. A stack that a finished fiber leaves to the loop's cache is
-kept warm on purpose, so up to `IDLE_WARM` of them may be over; with one loop
-that is its whole cache. A connection's own stack never may, so a server that
+kept warm on purpose, so up to `IDLE_WARM` of them may be over. A connection's own stack never may, so a server that
 keeps them has every held connection over.
 */
 @(private = "file")
@@ -45,7 +44,7 @@ in stays resident whole.
 @(private = "file")
 IDLE_STACK_KIB :: 8
 
-// `loop.STACK_CACHE`, the most warm stacks one loop keeps.
+// Warm stacks a finished fiber may leave; a loop trims to `loop.WARM_IDLE_KEEP` within seconds.
 @(private = "file")
 IDLE_WARM :: 64
 

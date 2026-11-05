@@ -1,5 +1,7 @@
 package server
 
+import "core:crypto"
+import "core:crypto/siphash"
 import "core:mem"
 import "core:sync"
 import "core:time"
@@ -59,19 +61,32 @@ returned before it could join - and a leader waits on nothing a follower holds.
 */
 
 /*
-Distinct questions that can be coalesced at once. A miss that finds the table
-full forwards without joining it, which is what it did before there was a table.
+Distinct questions that can be coalesced at once, and how far from its hash a
+key may sit.
 
-`ponytail: a fixed array scanned under one lock. A hash map once a box forwards
-more distinct misses at once than this.`
+A key lives in the `INFLIGHT_PROBE` slots from where its hash points, so a join
+or a land looks at that many and no more, however full the table: a fixed
+array scanned whole cost every miss a pass over all of it under the lock every
+miss takes, and with more distinct misses in flight than it had slots - a few
+hundred, at tens of thousands of misses a second against a 20 ms upstream - the
+pass found no room and the miss was not coalesced either (#612). The hash is
+SipHash keyed from the entropy source at first use, as the cache's shards are,
+so a client cannot choose names that crowd one window; a miss that finds its
+window full forwards without joining, which is what it did before there was a
+table. 4096 slots of a pointer each are 32 KiB per server.
 */
 @(private)
-INFLIGHT_SLOTS :: 256
+INFLIGHT_SLOTS :: 4096
+@(private)
+INFLIGHT_PROBE :: 16
 
 @(private)
 Inflight_Table :: struct {
 	mu:        sync.Mutex,
 	slots:     [INFLIGHT_SLOTS]^Flight,
+	// The SipHash key for `slots`, drawn at the first join; see `INFLIGHT_SLOTS`.
+	seed:      [16]u8,
+	seeded:    bool,
 	// Followers waiting on a leader; see `follower_ceiling`.
 	followers: int,
 }
@@ -175,7 +190,7 @@ Join the flight for `key`, leading it if there is none.
 
 `own` back: the caller leads, and must `flight_land` it. Another flight: the
 caller follows, and must `flight_follow` it, passing back `counted`. Nil: the
-table is full, or `counted_query` and the followers counted in `max_pending` are
+key's window is full, or `counted_query` and the followers counted in `max_pending` are
 at `ceiling` (zero is none), and the caller forwards on its own.
 */
 @(private)
@@ -192,8 +207,16 @@ flight_join :: proc(
 ) {
 	sync.mutex_lock(&s.inflight.mu)
 	defer sync.mutex_unlock(&s.inflight.mu)
+	if !s.inflight.seeded {
+		crypto.rand_bytes(s.inflight.seed[:])
+		s.inflight.seeded = true
+	}
+	home := int(siphash.sum_bytes_2_4(transmute([]u8)key, s.inflight.seed[:]) % INFLIGHT_SLOTS)
 	free_slot := -1
-	for f, i in s.inflight.slots {
+	// The whole window, holes and all: a land leaves a hole wherever its flight sat.
+	for probe in 0 ..< INFLIGHT_PROBE {
+		i := (home + probe) % INFLIGHT_SLOTS
+		f := s.inflight.slots[i]
 		if f == nil {
 			if free_slot < 0 {
 				free_slot = i

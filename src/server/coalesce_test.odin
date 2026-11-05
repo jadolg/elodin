@@ -1,5 +1,6 @@
 package server
 
+import "core:crypto/siphash"
 import "core:fmt"
 import "core:net"
 import "core:sync"
@@ -604,21 +605,96 @@ test_a_follower_stops_waiting_at_its_patience :: proc(t: ^testing.T) {
 	testing.expect(t, s.inflight.slots[0] == nil, "the landed flight is still in the table")
 }
 
-// A full table turns nobody away: the query forwards on its own.
+/*
+Distinct questions in flight at once each lead a flight of their own, well past
+the few hundred a 20 ms upstream keeps in flight at tens of thousands of misses a
+second, and each still gathers its followers (#612).
+*/
 @(test)
-test_a_full_flight_table_forwards_without_joining :: proc(t: ^testing.T) {
+test_a_thousand_distinct_misses_each_lead :: proc(t: ^testing.T) {
+	N :: 1000
 	s: Server
-	flights: [INFLIGHT_SLOTS]Flight
-	keys: [INFLIGHT_SLOTS]string
-	for i in 0 ..< INFLIGHT_SLOTS {
-		keys[i] = fmt.tprintf("k%d", i)
-		f, _ := flight_join(&s, keys[i], &flights[i])
-		testing.expect(t, f == &flights[i], "a free slot was not taken")
+	flights := make([]Flight, N)
+	defer delete(flights)
+	keys := make([]string, N)
+	defer {
+		for k in keys {
+			delete(k)
+		}
+		delete(keys)
 	}
-	extra: Flight
-	f, _ := flight_join(&s, "one more", &extra)
-	testing.expect(t, f == nil, "a full table handed out a flight")
-	for i in 0 ..< INFLIGHT_SLOTS {
+	led := 0
+	for i in 0 ..< N {
+		keys[i] = fmt.aprintf("k%d", i)
+		if f, _ := flight_join(&s, keys[i], &flights[i]); f == &flights[i] {
+			led += 1
+		}
+	}
+	testing.expectf(t, led == N, "%d of %d distinct misses led a flight", led, N)
+	follower: Flight
+	f, _ := flight_join(&s, keys[N - 1], &follower)
+	testing.expect(t, f == &flights[N - 1], "a miss for a key in flight did not follow it")
+	if f == &flights[N - 1] {
+		flights[N - 1].waiters -= 1
+	}
+	for i in 0 ..< N {
+		if flights[i].key != "" {
+			flight_land(&s, &flights[i])
+		}
+	}
+}
+
+/*
+A key looks no further than `INFLIGHT_PROBE` slots from its hash, and a full
+window turns nobody away: the query forwards on its own, and a key whose window
+has room still leads. Keys picked to share a window under a seed the test sets,
+which a client cannot know.
+*/
+@(test)
+test_a_full_flight_window_forwards_without_joining :: proc(t: ^testing.T) {
+	s: Server
+	s.inflight.seeded = true
+	s.inflight.seed = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	home :: proc(s: ^Server, key: string) -> u64 {
+		return siphash.sum_bytes_2_4(transmute([]u8)key, s.inflight.seed[:]) % INFLIGHT_SLOTS
+	}
+	keys: [dynamic]string
+	defer {
+		for k in keys {
+			delete(k)
+		}
+		delete(keys)
+	}
+	elsewhere := ""
+	target := home(&s, "k0")
+	for i := 0; (len(keys) <= INFLIGHT_PROBE || elsewhere == "") && i < 10_000_000; i += 1 {
+		k := fmt.aprintf("k%d", i)
+		h := home(&s, k)
+		if h == target && len(keys) <= INFLIGHT_PROBE {
+			append(&keys, k)
+		} else if elsewhere == "" && (h + INFLIGHT_SLOTS - target) % INFLIGHT_SLOTS > 2 * INFLIGHT_PROBE {
+			elsewhere = k
+		} else {
+			delete(k)
+		}
+	}
+	if !testing.expectf(t, len(keys) == INFLIGHT_PROBE + 1 && elsewhere != "", "found %d keys for one window", len(keys)) {
+		delete(elsewhere)
+		return
+	}
+	defer delete(elsewhere)
+	flights: [INFLIGHT_PROBE + 1]Flight
+	for i in 0 ..< INFLIGHT_PROBE {
+		f, _ := flight_join(&s, keys[i], &flights[i])
+		testing.expect(t, f == &flights[i], "a free slot in the window was not taken")
+	}
+	f, _ := flight_join(&s, keys[INFLIGHT_PROBE], &flights[INFLIGHT_PROBE])
+	testing.expect(t, f == nil, "a full window handed out a flight")
+	other: Flight
+	g, _ := flight_join(&s, elsewhere, &other)
+	testing.expect(t, g == &other, "a key with room in its own window did not lead")
+	flight_land(&s, &other)
+	for i in 0 ..< INFLIGHT_PROBE {
 		flight_land(&s, &flights[i])
 	}
 }

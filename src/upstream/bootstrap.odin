@@ -256,18 +256,14 @@ bootstrap_query :: proc(
 		return nil, false
 	}
 
-	socket, serr := net.make_unbound_udp_socket(net.family_from_endpoint(endpoint))
-	if serr != nil {
+	socket, opened := open_udp(endpoint)
+	if !opened {
 		return nil, false
 	}
 	defer net.close(socket)
-	// Non-blocking, so a wait for the answer parks a fiber rather than a loop.
-	if net.set_blocking(socket, false) != nil {
-		return nil, false
-	}
-	set_socket_timeouts(socket, timeout)
+	deadline := time.tick_add(loop.tick_now(), timeout)
 
-	if _, send_err := loop.send_udp(socket, wire, endpoint); send_err != nil {
+	if _, send_err := loop.send_udp_until(socket, wire, endpoint, deadline); send_err != nil {
 		return nil, false
 	}
 
@@ -282,12 +278,11 @@ bootstrap_query :: proc(
 	arriving first does not deny the real answer the rest of the window.
 	*/
 	buf := make([]u8, 4096, context.temp_allocator)
-	deadline := time.tick_add(loop.tick_now(), timeout)
 
 	// As in `exchange_udp`: datagrams passed over back to back never park, and
-	// `loop.recv_udp` yields between them.
-	for arm_receive(socket, deadline) {
-		n, remote, recv_err := loop.recv_udp(socket, buf)
+	// `loop.recv_udp_until` yields between them.
+	for time.tick_diff(loop.tick_now(), deadline) > 0 {
+		n, remote, recv_err := loop.recv_udp_until(socket, buf, deadline)
 		if recv_err != nil {
 			return nil, false
 		}

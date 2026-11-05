@@ -1143,10 +1143,7 @@ test_a_reused_fiber_starts_with_its_thread_locals_at_zero :: proc(t: ^testing.T)
 
 // --- Scale ---------------------------------------------------------------------
 
-/*
-Thousands of fibers parked at once, all on one loop thread, all finish - and a
-burst leaves no more than the stack cache behind once it is over.
-*/
+// Thousands of fibers parked at once, all on one loop thread, all finish.
 @(test)
 test_thousands_of_parked_fibers_on_one_thread :: proc(t: ^testing.T) {
 	r, started := start(t)
@@ -1176,15 +1173,11 @@ test_thousands_of_parked_fibers_on_one_thread :: proc(t: ^testing.T) {
 	for fibers_alive(r.l) != 0 {
 		time.sleep(time.Millisecond)
 	}
-	sync.mutex_lock(&r.l.mu)
-	warm := r.l.warm
-	sync.mutex_unlock(&r.l.mu)
-	testing.expectf(t, warm <= STACK_CACHE, "%d stacks kept", warm)
 }
 
 /*
-A burst's warm stacks are kept while the loop is busy and given back once it has
-had nothing to do for `TRIM_AFTER`, down to `WARM_IDLE_KEEP`. Waited for on the
+A burst's warm stacks are given back once the loop has had nothing to do, down
+to `WARM_IDLE_KEEP`. Waited for on the
 count itself; the deadline only ends a failing run.
 */
 @(test)

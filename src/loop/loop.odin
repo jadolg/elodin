@@ -51,11 +51,12 @@ Loop :: struct {
 	// Guards the free lists, `posted`, `alive` and `stopping`, which other threads
 	// reach through `spawn` and `post`.
 	mu:                  sync.Mutex,
-	// Free fibers that still hold a stack, at most `STACK_CACHE` of them, and
-	// free fibers that do not.
+	// Free fibers that still hold a stack, and free fibers that do not.
 	free_warm:           ^Fiber,
 	free_cold:           ^Fiber,
 	warm:                int,
+	// The fewest `free_warm` held at once since `trim_from`; see `trim_unused`.
+	warm_low:            int,
 	posted:              [dynamic]Post,
 	draining:            [dynamic]Post,
 	// Whether the eventfd has been written since the scheduler last drained it.
@@ -85,8 +86,8 @@ Loop :: struct {
 	before the stop can post its start after the cancel has been drained.
 	*/
 	cancelled_all:       bool,
-	// When the loop last had anything to do, for `trim_idle`.
-	last_busy:           Tick,
+	// When the window `warm_low` covers began. Loop thread only.
+	trim_from:           Tick,
 }
 
 Tick :: time.Tick
@@ -212,7 +213,7 @@ run :: proc(l: ^Loop) {
 		l.local_addresses[i] = locals[i].address()
 	}
 	events: [128]linux.EPoll_Event
-	l.last_busy = l.clock()
+	l.trim_from = l.clock()
 	for {
 		run_ready(l)
 		drain_posts(l)
@@ -237,7 +238,7 @@ run :: proc(l: ^Loop) {
 			// otherwise wrap to a negative figure, which is no timeout at all.
 			timeout = i32(clamp((left + time.Millisecond - 1) / time.Millisecond, 0, time.Duration(max(i32))))
 		}
-		// Wake to trim, if there is anything to trim; see `trim_idle`. The lock
+		// Wake to trim, if there is anything to trim; see `trim_unused`. The lock
 		// `trim_pending` takes is asked for only when the answer could matter: a
 		// busy round polls without waiting, and a busy round is every round under load.
 		if (timeout < 0 || timeout > i32(TRIM_AFTER / time.Millisecond)) && trim_pending(l) {
@@ -252,17 +253,11 @@ run :: proc(l: ^Loop) {
 		for i in 0 ..< max(n, 0) {
 			dispatch_event(l, events[i])
 		}
-		expire_timers(l, l.clock())
-		/*
-		Busy is a fiber still ready, or a descriptor or another thread having had
-		something for this loop. A timer coming due is not: the listeners wake on one every
-		`LISTENER_POLL` to look for a stop, and a loop that counted those as work
-		would never be idle enough to trim.
-		*/
-		if n > 0 || busy {
-			l.last_busy = l.clock()
-		} else if time.tick_diff(l.last_busy, l.clock()) >= TRIM_AFTER {
-			trim_idle(l)
+		now := l.clock()
+		expire_timers(l, now)
+		if time.tick_diff(l.trim_from, now) >= TRIM_AFTER {
+			trim_unused(l)
+			l.trim_from = now
 		}
 	}
 }
@@ -368,6 +363,7 @@ spawn :: proc(l: ^Loop, fn: proc(data: rawptr), data: rawptr) -> (h: Handle, ok:
 			f = l.free_warm
 			l.free_warm = f.next
 			l.warm -= 1
+			l.warm_low = min(l.warm_low, l.warm)
 		case l.free_cold != nil:
 			f = l.free_cold
 			l.free_cold = f.next
@@ -545,12 +541,12 @@ live_remove :: proc(l: ^Loop, f: ^Fiber) {
 }
 
 /*
-Put a finished fiber back on the free list, keeping its stack for the next one
-while the cache has room.
+Put a finished fiber back on the free list, keeping its stack for the next one;
+`trim_unused` gives back the ones the loop stops needing.
 
-A stack past the cache is unmapped, and so is one whose scratch grew past what a
-recycled fiber keeps: the next query to get this struct starts on a fresh stack
-and arena instead of inheriting a large one's high-water mark.
+A stack whose scratch grew past what a recycled fiber keeps is unmapped at once:
+the next query to get this struct starts on a fresh stack and arena instead of
+inheriting a large one's high-water mark.
 */
 @(private)
 fiber_recycle :: proc(l: ^Loop, f: ^Fiber) {
@@ -563,7 +559,7 @@ fiber_recycle :: proc(l: ^Loop, f: ^Fiber) {
 	// A stack kept warm goes straight back on the list, in the one lock a
 	// finished query costs; only one being unmapped is let go of first, since
 	// `spawn` may hand out whatever is on a list the moment it is there.
-	keep := !oversized && l.warm < STACK_CACHE
+	keep := !oversized
 	if keep {
 		l.warm += 1
 		f.next = l.free_warm
@@ -585,15 +581,20 @@ fiber_recycle :: proc(l: ^Loop, f: ^Fiber) {
 }
 
 /*
-How long a loop sits with nothing to do before it gives back the stacks it kept
-warm, and how many it keeps through the quiet.
+How often a loop gives back the warm stacks it did not need, and how many it
+keeps through a quiet spell.
 
-The cache is for the next query, which under load is microseconds away and would
-otherwise pay a `mmap` and the page faults of a fresh stack. After a burst that is
-over, the same cache is memory nobody will touch: a burst of two hundred
-connections leaves up to `STACK_CACHE` stacks per loop resident, some twenty
-kilobytes each. A second of nothing is long past any gap between the queries of a
-loaded server, and a few stacks are enough for a quiet one's next query.
+Every finished fiber's stack is kept for the next one, so a loaded loop maps none:
+with a few hundred queries in flight on each loop, as a 20 ms upstream and tens of
+thousands of misses a second make, a fixed cache of a few dozen overflowed on
+every swing in that number, and each query past it paid a `mmap`, the faults of a
+fresh stack and a `munmap` (#612). What bounds the cache instead is use: each
+`TRIM_AFTER` the loop unmaps as many as lay on the list unused for the whole of
+it - the fewest it held at any moment - so a loop holds what its own traffic
+reaches for, and a burst's stacks go within two windows of its end, busy or not.
+The kept stacks are ones the burst had in use at once, so the cache never holds
+more than the loop's own peak did. A quiet loop is trimmed to `WARM_IDLE_KEEP`,
+enough for its next few queries.
 */
 @(private)
 TRIM_AFTER :: time.Second
@@ -607,14 +608,17 @@ trim_pending :: proc(l: ^Loop) -> bool {
 	return l.warm > WARM_IDLE_KEEP
 }
 
-// Unmap the warm stacks past `WARM_IDLE_KEEP`; their fibers stay, cold.
+// Unmap the warm stacks that went unused since `trim_from`, keeping `WARM_IDLE_KEEP`; their fibers stay, cold.
 @(private)
-trim_idle :: proc(l: ^Loop) {
-	for {
+trim_unused :: proc(l: ^Loop) {
+	sync.mutex_lock(&l.mu)
+	n := l.warm_low
+	sync.mutex_unlock(&l.mu)
+	for _ in 0 ..< n {
 		sync.mutex_lock(&l.mu)
 		if l.warm <= WARM_IDLE_KEEP || l.free_warm == nil {
 			sync.mutex_unlock(&l.mu)
-			return
+			break
 		}
 		f := l.free_warm
 		l.free_warm = f.next
@@ -626,6 +630,9 @@ trim_idle :: proc(l: ^Loop) {
 		l.free_cold = f
 		sync.mutex_unlock(&l.mu)
 	}
+	sync.mutex_lock(&l.mu)
+	l.warm_low = l.warm
+	sync.mutex_unlock(&l.mu)
 }
 
 /*
