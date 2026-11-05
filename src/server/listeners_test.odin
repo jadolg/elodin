@@ -1156,9 +1156,9 @@ test_udp_job_is_one_allocation :: proc(t: ^testing.T) {
 A stream query is one read, with its length prefix, and what a client pipelined
 behind it waits in the reader for the next message (#594).
 
-Reading the prefix and then the body took a `recv` each, and a third to find the
-queue empty - three per TCP query against UDP's one. Sent here in one write: a
-query, a message longer than the read-ahead, and the prefix of a third with half
+A read for the prefix and one for the body would be three `recv` per TCP query,
+with the one that finds the queue empty, against UDP's one. Sent here in one
+write: a query, a message longer than the read-ahead, and the prefix of a third with half
 its body, then the rest of it. The first read takes the first query and as much
 of the second as fits, which is the one read the change is for; the long message
 is assembled across the buffer and the socket; and the third, split inside

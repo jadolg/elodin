@@ -76,7 +76,10 @@ wait_fd :: proc(fd: linux.Fd, events: Events, deadline: Tick) -> Wait_Result {
 	}
 	append(&w.waiters, Fd_Waiter{f, f.token, events})
 	if !watch_update(l, fd, w) {
+		// Those already parked here are on a registration that may be gone with
+		// the descriptor; woken as `dispatch_event` wakes them for the same failure.
 		watch_leave(l, fd, f)
+		watch_wake_all(w)
 		return .Failed
 	}
 	reason := park(deadline)
@@ -177,11 +180,17 @@ dispatch_event :: proc(l: ^Loop, ev: linux.EPoll_Event) {
 	the wait that follows reports the failure as `.Failed`.
 	*/
 	if len(w.waiters) > 0 && !watch_update(l, fd, w) {
-		for waiter in w.waiters {
-			wake_local(waiter.fiber, waiter.token, .Ready)
-		}
-		clear(&w.waiters)
+		watch_wake_all(w)
 	}
+}
+
+// Wake every waiter on `w` to re-check its descriptor, and forget them.
+@(private)
+watch_wake_all :: proc(w: ^Fd_Watch) {
+	for waiter in w.waiters {
+		wake_local(waiter.fiber, waiter.token, .Ready)
+	}
+	clear(&w.waiters)
 }
 
 /*

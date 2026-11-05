@@ -2240,13 +2240,16 @@ the receipt of a full DNS message, rather than on receipt of any part of a DNS
 message". So the reads that assemble one message share a deadline and shorten as
 it runs down.
 
-`deadline` is zero until the first byte of that message arrives, and that is the
-other half of the rule: a connection between questions is not assembling anything,
-so it waits `idle` for the first byte - which is the figure the idle timeout this
-server advertises states (RFC 7828) - and the message gets the whole of `idle`
-from that byte on. Spending the two out of one budget instead would close on a
-keep-alive client that asked late in the window and had its message split across
-segments, which is a client this server has no complaint about.
+`deadline` is zero until the first read made for that message returns bytes, and
+that is the other half of the rule: a connection between questions is not
+assembling anything, so it waits `idle` for the first byte - which is the figure
+the idle timeout this server advertises states (RFC 7828) - and the message gets
+the whole of `idle` from that read on. A message whose head came in behind the
+last one, in `Stream_Reader`'s read-ahead, has made no read yet: its next read
+waits `idle`, and the deadline starts there - one idle wait and one deadline, as
+for a message sent alone. Spending the two out of one budget instead would close
+on a keep-alive client that asked late in the window and had its message split
+across segments, which is a client this server has no complaint about.
 
 A non-positive `idle` is no receive timeout on the socket at all - see
 `test_a_timeout_that_cannot_be_stated_is_left_off` for the other half of what that
