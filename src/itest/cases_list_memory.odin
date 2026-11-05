@@ -362,8 +362,9 @@ descriptor_count_case :: proc(r: ^Runner) {
 	if !check(r, failed, "os.read_dir never failed in %d readings while descriptors closed", readings) {
 		return
 	}
-	for i in 0 ..< max(readings, 1000) {
-		if _, ok := open_descriptor_count(); !check(r, ok, "open_descriptor_count failed on reading %d of %d", i, max(readings, 1000)) {
+	total := max(readings, 1000)
+	for i in 0 ..< total {
+		if _, ok := open_descriptor_count(); !check(r, ok, "open_descriptor_count failed on reading %d of %d", i, total) {
 			return
 		}
 	}

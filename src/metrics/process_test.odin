@@ -47,7 +47,7 @@ test_descriptor_count_reads_or_fails :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "/proc/self/fd could not be counted")
 	// The standard three, less fd 0, which `odin test` closes, plus the one
 	// `opendir` holds.
-	testing.expectf(t, n >= 2, "only %d descriptors counted", n)
+	testing.expectf(t, n >= 3, "only %d descriptors counted", n)
 
 	_, missing := descriptor_count("/proc/self/no-such-directory")
 	testing.expect(t, !missing, "a directory that does not exist was counted")

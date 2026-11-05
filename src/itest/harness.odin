@@ -1041,7 +1041,7 @@ one `opendir` holds is counted when `pid` is this process, the same on every
 reading.
 */
 open_descriptor_count :: proc(pid: int = 0) -> (n: int, ok: bool) {
-	path := "/proc/self/fd" if pid == 0 else fmt.tprintf("/proc/%d/fd", pid)
-	count, count_ok := metrics.descriptor_count(strings.clone_to_cstring(path, context.temp_allocator))
+	path: cstring = "/proc/self/fd" if pid == 0 else fmt.ctprintf("/proc/%d/fd", pid)
+	count, count_ok := metrics.descriptor_count(path)
 	return int(count), count_ok
 }
