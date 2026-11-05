@@ -158,8 +158,8 @@ recv_udp :: proc(socket: net.UDP_Socket, buf: []u8) -> (int, net.Endpoint, net.U
 /*
 `recv_udp` and `send_udp`, waiting until `deadline` rather than for the socket's
 timeout option. The option costs a `setsockopt` to set and a `getsockopt` to
-read back, and a socket that lives for one exchange paid both on every query
-(#612). The zero tick is no deadline.
+read back, both per query on a socket that lives for one exchange (#612). The
+zero tick is no deadline.
 */
 recv_udp_until :: proc(socket: net.UDP_Socket, buf: []u8, deadline: Tick) -> (int, net.Endpoint, net.UDP_Recv_Error) {
 	return recv_udp_armed(socket, buf, deadline, true)
@@ -181,7 +181,8 @@ recv_udp_armed :: proc(
 	net.UDP_Recv_Error,
 ) {
 	assert_nonblocking(linux.Fd(socket))
-	start := tick_now()
+	// Read only to arm from the socket's option; a deadline given needs no clock.
+	start := Tick{} if armed else tick_now()
 	deadline, armed := deadline, armed
 	for {
 		n, from, err := net.recv_udp(socket, buf)
@@ -211,7 +212,8 @@ send_udp_armed :: proc(
 	net.UDP_Send_Error,
 ) {
 	assert_nonblocking(linux.Fd(socket))
-	start := tick_now()
+	// Read only to arm from the socket's option; a deadline given needs no clock.
+	start := Tick{} if armed else tick_now()
 	deadline, armed := deadline, armed
 	for {
 		n, err := net.send_udp(socket, buf, to)

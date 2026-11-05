@@ -44,7 +44,7 @@ in stays resident whole.
 @(private = "file")
 IDLE_STACK_KIB :: 8
 
-// Warm stacks a finished fiber may leave; a loop trims to `loop.WARM_IDLE_KEEP` within seconds.
+// Warm stacks finished fibers may leave: `loop.WARM_IDLE_KEEP` (8) a loop, on up to eight loops.
 @(private = "file")
 IDLE_WARM :: 64
 

@@ -65,15 +65,13 @@ Distinct questions that can be coalesced at once, and how far from its hash a
 key may sit.
 
 A key lives in the `INFLIGHT_PROBE` slots from where its hash points, so a join
-or a land looks at that many and no more, however full the table: a fixed
-array scanned whole cost every miss a pass over all of it under the lock every
-miss takes, and with more distinct misses in flight than it had slots - a few
-hundred, at tens of thousands of misses a second against a 20 ms upstream - the
-pass found no room and the miss was not coalesced either (#612). The hash is
-SipHash keyed from the entropy source at first use, as the cache's shards are,
-so a client cannot choose names that crowd one window; a miss that finds its
-window full forwards without joining, which is what it did before there was a
-table. 4096 slots of a pointer each are 32 KiB per server.
+or a land looks at that many and no more, however full the table, under the
+lock every miss takes. The slots are far more than the few hundred distinct
+misses a 20 ms upstream keeps in flight at tens of thousands of misses a second,
+so each of them is coalesced (#612). The hash is SipHash keyed from the entropy
+source at first use, as the cache's shards are, so a client cannot choose names
+that crowd one window; a miss that finds its window full forwards on its own,
+uncoalesced. 4096 slots of a pointer each are 32 KiB per server.
 */
 @(private)
 INFLIGHT_SLOTS :: 4096

@@ -602,7 +602,7 @@ test_a_follower_stops_waiting_at_its_patience :: proc(t: ^testing.T) {
 	testing.expectf(t, waited >= 50 * time.Millisecond && waited < 2 * time.Second, "waited %v for 50ms of patience", waited)
 	testing.expect_value(t, lead.waiters, 0)
 	flight_land(&s, &lead)
-	testing.expect(t, s.inflight.slots[0] == nil, "the landed flight is still in the table")
+	testing.expect(t, s.inflight.slots[lead.slot] == nil, "the landed flight is still in the table")
 }
 
 /*

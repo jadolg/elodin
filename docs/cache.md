@@ -109,8 +109,9 @@ go to the upstream once. The first forwards and the rest wait for it:
   lifted the listing serves the answer; an entry evicted or expired meanwhile
   makes them ask once more, coalesced among themselves and on a fresh budget.
 - **Cap.** A query counted in `server.max_pending` arriving when a quarter of it
-  is already waiting asks for itself, as does one for a question that finds no
-  room among the 4,096 distinct questions tracked at once. Queries on a connection are not counted:
+  is already waiting asks for itself, as does one for a question whose 16 slots
+  of the 4,096 that track questions in flight are all taken. Queries on a
+  connection are not counted:
   `server.max_connections` bounds them.
 - **Logging.** Queries given the first one's outcome, or refused from its cached
   refusal, count in `elodin_answers_coalesced_total`; those that asked do not.

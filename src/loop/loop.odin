@@ -55,7 +55,7 @@ Loop :: struct {
 	free_warm:           ^Fiber,
 	free_cold:           ^Fiber,
 	warm:                int,
-	// The fewest `free_warm` held at once since `trim_from`; see `trim_unused`.
+	// The fewest `free_warm` held at once since `trim_from`; see `trim_window`.
 	warm_low:            int,
 	posted:              [dynamic]Post,
 	draining:            [dynamic]Post,
@@ -86,8 +86,10 @@ Loop :: struct {
 	before the stop can post its start after the cancel has been drained.
 	*/
 	cancelled_all:       bool,
-	// When the window `warm_low` covers began. Loop thread only.
+	// When the window `warm_low` covers began, and how many warm stacks the
+	// last window found unused and `trim_some` has yet to unmap. Loop thread only.
 	trim_from:           Tick,
+	trim_owed:           int,
 }
 
 Tick :: time.Tick
@@ -238,11 +240,16 @@ run :: proc(l: ^Loop) {
 			// otherwise wrap to a negative figure, which is no timeout at all.
 			timeout = i32(clamp((left + time.Millisecond - 1) / time.Millisecond, 0, time.Duration(max(i32))))
 		}
-		// Wake to trim, if there is anything to trim; see `trim_unused`. The lock
+		// Wake to trim, if there is anything to trim; see `trim_window`. The lock
 		// `trim_pending` takes is asked for only when the answer could matter: a
 		// busy round polls without waiting, and a busy round is every round under load.
 		if (timeout < 0 || timeout > i32(TRIM_AFTER / time.Millisecond)) && trim_pending(l) {
 			timeout = i32(TRIM_AFTER / time.Millisecond)
+		}
+		// Stacks still owed are unmapped a batch a round, so a round with nothing
+		// else to do comes straight back for the next batch.
+		if l.trim_owed > 0 {
+			timeout = 0
 		}
 		n, err := epoll_wait(l.epfd, events[:], timeout)
 		if err != .NONE && err != .EINTR {
@@ -256,8 +263,11 @@ run :: proc(l: ^Loop) {
 		now := l.clock()
 		expire_timers(l, now)
 		if time.tick_diff(l.trim_from, now) >= TRIM_AFTER {
-			trim_unused(l)
+			trim_window(l)
 			l.trim_from = now
+		}
+		if l.trim_owed > 0 {
+			trim_some(l)
 		}
 	}
 }
@@ -542,7 +552,7 @@ live_remove :: proc(l: ^Loop, f: ^Fiber) {
 
 /*
 Put a finished fiber back on the free list, keeping its stack for the next one;
-`trim_unused` gives back the ones the loop stops needing.
+`trim_window` gives back the ones the loop stops needing.
 
 A stack whose scratch grew past what a recycled fiber keeps is unmapped at once:
 the next query to get this struct starts on a fresh stack and arena instead of
@@ -585,13 +595,13 @@ How often a loop gives back the warm stacks it did not need, and how many it
 keeps through a quiet spell.
 
 Every finished fiber's stack is kept for the next one, so a loaded loop maps none:
-with a few hundred queries in flight on each loop, as a 20 ms upstream and tens of
-thousands of misses a second make, a fixed cache of a few dozen overflowed on
-every swing in that number, and each query past it paid a `mmap`, the faults of a
-fresh stack and a `munmap` (#612). What bounds the cache instead is use: each
-`TRIM_AFTER` the loop unmaps as many as lay on the list unused for the whole of
-it - the fewest it held at any moment - so a loop holds what its own traffic
-reaches for, and a burst's stacks go within two windows of its end, busy or not.
+a loop with a few hundred queries in flight, as a 20 ms upstream and tens of
+thousands of misses a second make, swings by hundreds, and a query given a fresh
+stack pays a `mmap`, its faults and a `munmap` (#612). What bounds the cache is
+use: each `TRIM_AFTER` the loop unmaps as many as lay on the list unused for the
+whole of it - the fewest it held at any moment - `TRIM_BATCH` a round, so a loop
+holds what its own traffic reaches for, and a burst's stacks go within two
+windows of its end, busy or not.
 The kept stacks are ones the burst had in use at once, so the cache never holds
 more than the loop's own peak did. A quiet loop is trimmed to `WARM_IDLE_KEEP`,
 enough for its next few queries.
@@ -608,31 +618,49 @@ trim_pending :: proc(l: ^Loop) -> bool {
 	return l.warm > WARM_IDLE_KEEP
 }
 
-// Unmap the warm stacks that went unused since `trim_from`, keeping `WARM_IDLE_KEEP`; their fibers stay, cold.
+/*
+Close a window: as many warm stacks as lay on the list for the whole of it -
+the fewest it held at once - are owed to the kernel, and `trim_some` unmaps them
+`TRIM_BATCH` a round, so a loop that falls from thousands in flight to hundreds
+does not stall its live queries behind a thousand `munmap` calls at once.
+Which stacks go is the list's order, not their age: what is bounded is how many
+the loop keeps, never more than a window's use.
+*/
 @(private)
-trim_unused :: proc(l: ^Loop) {
+trim_window :: proc(l: ^Loop) {
 	sync.mutex_lock(&l.mu)
-	n := l.warm_low
-	sync.mutex_unlock(&l.mu)
-	for _ in 0 ..< n {
+	defer sync.mutex_unlock(&l.mu)
+	l.trim_owed = l.warm_low
+	l.warm_low = l.warm
+}
+
+// How many stacks a loop round unmaps at most.
+@(private)
+TRIM_BATCH :: 32
+
+// Unmap up to `TRIM_BATCH` of the stacks owed, keeping `WARM_IDLE_KEEP`; their fibers stay, cold.
+@(private)
+trim_some :: proc(l: ^Loop) {
+	for _ in 0 ..< min(l.trim_owed, TRIM_BATCH) {
 		sync.mutex_lock(&l.mu)
 		if l.warm <= WARM_IDLE_KEEP || l.free_warm == nil {
 			sync.mutex_unlock(&l.mu)
-			break
+			l.trim_owed = 0
+			return
 		}
 		f := l.free_warm
 		l.free_warm = f.next
 		l.warm -= 1
+		// What the list held at its fewest includes what a trim took off it.
+		l.warm_low = min(l.warm_low, l.warm)
 		sync.mutex_unlock(&l.mu)
 		fiber_release(l, f)
 		sync.mutex_lock(&l.mu)
 		f.next = l.free_cold
 		l.free_cold = f
 		sync.mutex_unlock(&l.mu)
+		l.trim_owed -= 1
 	}
-	sync.mutex_lock(&l.mu)
-	l.warm_low = l.warm
-	sync.mutex_unlock(&l.mu)
 }
 
 /*
