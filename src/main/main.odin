@@ -1370,8 +1370,8 @@ than it reported, and on a machine that refuses an epoll descriptor nothing
 else would work either.
 
 With `pin`, loop i is held to the i-th CPU the process may run on
-(`server.pin_loops`), wrapping when there are more loops than CPUs. A pin that
-cannot be had is a warning, and that loop runs unpinned.
+(`server.pin_loops`). With more loops than CPUs none is pinned, and a pin that
+cannot be had leaves that loop unpinned; both are warnings.
 */
 @(private)
 start_loops :: proc(n: int, pin: bool) -> (loops: []^loop.Loop, threads: []^thread.Thread) {
@@ -1385,14 +1385,15 @@ start_loops :: proc(n: int, pin: bool) -> (loops: []^loop.Loop, threads: []^thre
 		case len(cpus) == 0:
 			logx.warnf("server.pin_loops: the CPUs this process may use could not be read; the event loops run unpinned")
 		case len(cpus) < n:
-			logx.warnf("server.pin_loops: %d event loops on %d CPUs, so some loops share a CPU", n, len(cpus))
-		}
-		if len(cpus) > 0 {
-			on = make([]int, n, context.temp_allocator)
-			for &c, i in on {
-				c = cpus[i % len(cpus)]
-			}
-			logx.infof("server.pin_loops: the event loops run on CPUs %v", on)
+			/*
+			Two loops pinned to one CPU queue behind each other for good, which
+			is the wait pinning exists to end, and neither can move off. Left
+			unpinned, the scheduler at least can.
+			*/
+			logx.warnf("server.pin_loops: %d event loops on %d CPUs would share one; the event loops run unpinned", n, len(cpus))
+		case:
+			on = cpus[:n]
+			logx.infof("server.pin_loops: pinning the event loops to CPUs %v", on)
 		}
 	}
 	for i in 0 ..< n {

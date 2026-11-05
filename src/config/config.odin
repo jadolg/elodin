@@ -594,8 +594,8 @@ Server_Config :: struct {
 	*/
 	client_timeout:             time.Duration,
 	/*
-	Hold event loop i to the i-th CPU the process may run on, wrapping when
-	there are more loops than CPUs. Off by default (#610).
+	Hold event loop i to the i-th CPU the process may run on; with more loops
+	than CPUs none is pinned. Off by default (#610).
 
 	A loop that goes idle in `epoll_wait` and wakes can be queued by the
 	scheduler on the CPU another loop is running on, and then waits out that

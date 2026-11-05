@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:slice"
 import "core:strconv"
+import "core:time"
 import "elodin:loop"
 
 /*
@@ -16,11 +17,12 @@ by. The loops are the threads to look for because nothing else in the server is
 pinned: a thread allowed exactly one CPU, on a run allowed more, is a loop.
 */
 
+// Without `pin`, the file does not name `pin_loops`, so the default is what runs.
 @(private = "file")
 config_pinning :: proc(udp_port, upstream_port, readers: int, pin: bool) -> string {
 	return fmt.tprintf(
 		`log: {{ level: info }}
-server: {{ pin_loops: %v }}
+%s
 listeners:
   udp: {{ enabled: true, address: "127.0.0.1", port: %d, readers: %d }}
   tcp: {{ enabled: false }}
@@ -30,7 +32,7 @@ upstream:
 cache: {{ enabled: false }}
 blocking: {{ enabled: false }}
 `,
-		pin,
+		"server: { pin_loops: true }" if pin else "",
 		udp_port,
 		readers,
 		upstream_port,
@@ -59,6 +61,26 @@ pinned_thread_cpus :: proc(pid: int) -> (cpus: []int, ok: bool) {
 	return found[:], true
 }
 
+/*
+The pinned threads' CPUs once they equal `want`, or as they last stood when
+`PIN_WAIT` ran out. Each loop pins itself on its own thread, and the server
+answering is not ordered after every loop has done so.
+*/
+@(private = "file")
+PIN_WAIT :: 5 * time.Second
+
+@(private = "file")
+wait_pinned :: proc(pid: int, want: []int) -> (cpus: []int, ok: bool) {
+	start := time.tick_now()
+	for {
+		cpus, ok = pinned_thread_cpus(pid)
+		if !ok || slice.equal(cpus, want) || time.tick_since(start) >= PIN_WAIT {
+			return
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+}
+
 run_pinning_cases :: proc(r: ^Runner) {
 	allowed := loop.allowed_cpus(context.temp_allocator)
 	if len(allowed) < 2 {
@@ -81,11 +103,32 @@ run_pinning_cases :: proc(r: ^Runner) {
 		if check(r, ok, "server did not start") {
 			defer stop_server(&srv)
 			check(r, query_udp(udp_port, build_query("pin.example.", 1, id = 0x610, allocator = context.temp_allocator), context.temp_allocator).ok, "a query was not answered")
-			cpus, read := pinned_thread_cpus(srv.process.pid)
+			cpus, read := wait_pinned(srv.process.pid, allowed[:2])
 			if check(r, read, "the server's threads could not be listed") {
 				check(r, slice.equal(cpus, allowed[:2]), "pinned threads are on CPUs %v, not one loop on each of %v", cpus, allowed[:2])
 			}
-			check(r, log_contains(&srv, "the event loops run on CPUs"), "startup did not say where the loops run; log:\n%s", read_log(&srv))
+			check(r, log_contains(&srv, "pinning the event loops to CPUs"), "startup did not say where the loops run; log:\n%s", read_log(&srv))
+		}
+	}
+	end_case(r)
+
+	/*
+	Two loops pinned to one CPU would queue behind each other for good, so with
+	more loops than CPUs none is pinned. The warning is what decides it: it is
+	written before any loop's thread starts. The thread list is a second look.
+	*/
+	start_case(r, "server.pin_loops: with more loops than CPUs, none is pinned")
+	{
+		udp_port := next_port(r)
+		srv, ok := start_server(r, Server_Options{config = config_pinning(udp_port, upstream_port, len(allowed) + 1, true), udp_port = udp_port})
+		if check(r, ok, "server did not start") {
+			defer stop_server(&srv)
+			check(r, query_udp(udp_port, build_query("pin.example.", 1, id = 0x611, allocator = context.temp_allocator), context.temp_allocator).ok, "a query was not answered")
+			cpus, read := pinned_thread_cpus(srv.process.pid)
+			if check(r, read, "the server's threads could not be listed") {
+				check(r, len(cpus) == 0, "threads are pinned to CPUs %v with more loops than CPUs", cpus)
+			}
+			check(r, log_contains(&srv, "the event loops run unpinned"), "startup did not warn that the loops run unpinned; log:\n%s", read_log(&srv))
 		}
 	}
 	end_case(r)

@@ -31,7 +31,8 @@ server:
   # Hold event loop i to the i-th CPU this process may use. It cuts a ~3 ms
   # tail a loop pays when it wakes onto a CPU another loop is running on, but a
   # pinned loop can't move off a CPU another process keeps busy, so turn it on
-  # only where the CPUs are elodin's. Takes a restart. See docs/sizing.md.
+  # only where the CPUs are elodin's. With more loops than CPUs nothing is
+  # pinned. Takes a restart. See docs/sizing.md.
   pin_loops: false
   # Queries in flight at once - every UDP query and DoH/2 request from arrival
   # to answer - before new ones are dropped (DoH/2: answered 503). A query

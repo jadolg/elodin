@@ -81,10 +81,14 @@ that CPU busy, the loop's connections wait for it. Turn it on where the CPUs are
 elodin's.
 
 - The CPUs are the ones the process may run on: its affinity, as `taskset`, a
-  cpuset or systemd's `CPUAffinity=` sets it. Loop i takes the i-th of them,
-  wrapping when there are more loops than CPUs. Startup logs the CPU each loop
-  runs on (`server.pin_loops: the event loops run on CPUs [0, 1]`), and warns
-  when loops have to share a CPU.
+  cpuset or systemd's `CPUAffinity=` sets it. Loop i takes the i-th of them, and
+  startup logs the plan (`server.pin_loops: pinning the event loops to CPUs [0, 1]`).
+- With more loops (`listeners.udp.readers`) than CPUs, no loop is pinned, since
+  two loops pinned to one CPU would queue behind each other for good. Startup
+  warns.
+- Only the loops are pinned. elodin's other threads (the main thread, the
+  metrics endpoint, a blocklist rebuild) can still run on a loop's CPU, and
+  while they do, that loop shares it.
 - A CPU quota (`docker run --cpus`, `CPUQuota=`) is not an affinity. Pinned
   loops under a quota still share its time.
 - If the affinity can't be read, or a loop can't be held to its CPU, startup
