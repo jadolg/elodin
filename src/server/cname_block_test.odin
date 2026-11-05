@@ -850,7 +850,7 @@ test_a_refused_answer_is_not_cached_with_the_upstream_ad_bit :: proc(t: ^testing
 	}
 	testing.expect(
 		t,
-		entry.wire[3] & 0x20 == 0,
+		cache.wire_of(entry)[3] & 0x20 == 0,
 		"the stored answer kept the upstream's AD bit, which a later reload would serve under our name",
 	)
 	free_all(context.temp_allocator)

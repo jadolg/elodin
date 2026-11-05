@@ -289,6 +289,6 @@ test_an_unbounded_answer_is_forwarded_with_what_could_be_bounded :: proc(t: ^tes
 	if !testing.expect(t, len(out) == len(reply), "the answer was not forwarded as it stood") {
 		return
 	}
-	testing.expect_value(t, dns.read_ttl_at(out, offsets[0]), u32(0))
+	testing.expect_value(t, dns.read_ttl_at(out, int(offsets[0])), u32(0))
 	free_all(context.temp_allocator)
 }

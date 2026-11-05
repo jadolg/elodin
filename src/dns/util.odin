@@ -279,9 +279,15 @@ Used by the cache, which stores upstream answers as untouched wire bytes and
 rewrites the TTLs on each hit. That keeps the original name compression intact
 instead of round-tripping through the decoder. OPT records are skipped: their
 "TTL" is really the extended rcode and flags.
+
+The offsets are `u16`, which every offset into a DNS message fits: RFC 1035
+section 4.2.2 frames a message with a two-byte length, so none is longer than
+`MAX_MESSAGE`. A longer one is refused rather than have its offsets wrap. The
+cache keeps the list for as long as it keeps the answer, a quarter of what
+`int`s would take.
 */
-scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets: []int, ok: bool) {
-	if len(msg) < HEADER_SIZE {
+scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets: []u16, ok: bool) {
+	if len(msg) < HEADER_SIZE || len(msg) > MAX_MESSAGE {
 		return nil, false
 	}
 	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
@@ -315,7 +321,7 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 		}
 	}
 
-	out := make([dynamic]int, 0, total, allocator)
+	out := make([dynamic]u16, 0, total, allocator)
 	for _ in 0 ..< total {
 		next, name_ok := skip_name(msg, pos)
 		if !name_ok {
@@ -329,28 +335,13 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 		}
 		rtype := Type(u16(msg[pos]) << 8 | u16(msg[pos + 1]))
 		if rtype != .OPT {
-			append(&out, pos + 4)
+			append(&out, u16(pos + 4))
 		}
 		rdlength := int(u16(msg[pos + 8]) << 8 | u16(msg[pos + 9]))
 		pos += 10 + rdlength
 		if pos > len(msg) {
 			delete(out)
 			return nil, false
-		}
-	}
-	/*
-	The OPT record's slot given back, so the block is what the slice says it
-	is: the cache charges an entry by its length (issue #531). A copy, not
-	`shrink`: glibc's realloc keeps a chunk whole when what it would split off
-	is under 32 bytes, and one slot is 8, so a shrunk block holds what it did.
-	A failed copy keeps the list it has: a nil one would store the answer with
-	nothing to count its TTLs down.
-	*/
-	if len(out) < cap(out) {
-		if exact, err := make([]int, len(out), allocator); err == nil {
-			copy(exact, out[:])
-			delete(out)
-			return exact, true
 		}
 	}
 	return out[:], true
@@ -692,10 +683,10 @@ write_ttl_at :: proc(msg: []u8, off: int, v: u32) {
 	msg[off + 3] = u8(v)
 }
 
-read_ttls :: proc(msg: []u8, offsets: []int, allocator := context.allocator) -> []u32 {
+read_ttls :: proc(msg: []u8, offsets: []u16, allocator := context.allocator) -> []u32 {
 	ttls := make([]u32, len(offsets), allocator)
 	for off, i in offsets {
-		ttls[i] = sane_ttl(read_ttl_at(msg, off))
+		ttls[i] = sane_ttl(read_ttl_at(msg, int(off)))
 	}
 	return ttls
 }
@@ -851,8 +842,9 @@ signatures_lapse :: proc(msg: []u8, now: u32) -> (left: u32, signed: bool) {
 }
 
 // Rewrites each TTL to `original - elapsed`, floored at `floor_ttl`.
-patch_ttls :: proc(msg: []u8, offsets: []int, originals: []u32, elapsed: u32, floor_ttl: u32 = 0) {
-	for off, i in offsets {
+patch_ttls :: proc(msg: []u8, offsets: []u16, originals: []u32, elapsed: u32, floor_ttl: u32 = 0) {
+	for o, i in offsets {
+		off := int(o)
 		if off + 4 > len(msg) || i >= len(originals) {
 			break
 		}

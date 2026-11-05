@@ -136,8 +136,8 @@ test_cap_ttls_bounds_what_it_can_reach :: proc(t: ^testing.T) {
 	}
 
 	cap_ttls(wire, 3600)
-	testing.expect_value(t, read_ttl_at(wire, offsets[0]), u32(3600))
-	testing.expect_value(t, read_ttl_at(wire, offsets[1]), u32(0))
+	testing.expect_value(t, read_ttl_at(wire, int(offsets[0])), u32(3600))
+	testing.expect_value(t, read_ttl_at(wire, int(offsets[1])), u32(0))
 	free_all(context.temp_allocator)
 }
 
@@ -156,7 +156,7 @@ A reply claiming more records than it could possibly hold is refused before the
 count is spent as a capacity.
 
 Three sections of 65535 records fit in a header that is seventeen bytes long in
-total, and the array they ask `scan_ttl_offsets` to reserve is 1.5 MB, spent on
+total, and the array they ask `scan_ttl_offsets` to reserve is 384 KiB, spent on
 a walk that fails at the first name.
 
 Written when `cap_ttls` walked undecoded bytes through this scan and every query
@@ -194,4 +194,40 @@ test_scan_refuses_counts_that_cannot_fit :: proc(t: ^testing.T) {
 		"refusing the message reserved %d bytes",
 		track.peak_memory_allocated,
 	)
+}
+
+/*
+A message longer than any DNS message can be is refused, rather than scanned
+into offsets that wrap. RFC 1035 section 4.2.2 frames a message with a two-byte
+length, so `u16` holds every offset into a real one; the cache keeps them as
+`u16` for as long as it keeps the answer (issue #599).
+*/
+@(test)
+test_scan_refuses_a_message_past_max_message :: proc(t: ^testing.T) {
+	// `n` A records owned by the root, 15 bytes each, and nothing else.
+	a_records :: proc(n: int) -> []u8 {
+		msg := make([]u8, HEADER_SIZE + n * 15, context.temp_allocator)
+		msg[6] = u8(n >> 8)
+		msg[7] = u8(n)
+		for i in 0 ..< n {
+			at := HEADER_SIZE + i * 15
+			msg[at + 2] = 1 // type A
+			msg[at + 4] = 1 // class IN
+			msg[at + 10] = 4 // rdlength
+		}
+		return msg
+	}
+	defer free_all(context.temp_allocator)
+
+	// The premise: the most records that fit in MAX_MESSAGE scan.
+	fits := a_records((MAX_MESSAGE - HEADER_SIZE) / 15)
+	offsets, ok := scan_ttl_offsets(fits, context.temp_allocator)
+	testing.expect(t, ok, "a message of MAX_MESSAGE bytes or fewer was refused")
+	testing.expect_value(t, int(offsets[len(offsets) - 1]), len(fits) - 15 + 5)
+
+	// Two more, and the last TTL is past what an offset can hold.
+	past := a_records((MAX_MESSAGE - HEADER_SIZE) / 15 + 2)
+	testing.expect(t, len(past) > MAX_MESSAGE, "the premise: the message is longer than MAX_MESSAGE")
+	_, ok = scan_ttl_offsets(past, context.temp_allocator)
+	testing.expect(t, !ok, "a message past MAX_MESSAGE was scanned")
 }
