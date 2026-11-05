@@ -91,8 +91,17 @@ cell that fails reads "failed" and the reason is listed under the tables, so
 one server's bad night does not lose the others.
 
 ```sh
-go run ./cmd/bench -only compare -servers all -competitors ~/competitors -unbound /tmp/unbound
+sudo sysctl net.core.rmem_default=1048576
+go run ./cmd/bench -only compare -servers all -competitors ~/competitors -unbound /tmp/unbound -mock-cpus 2-3
 ```
+
+The section refuses to run until `net.core.rmem_default` is 1 MiB. elodin asks
+for that receive buffer on its UDP sockets; most of the others have no setting
+for theirs and take the kernel default, 208 KiB untuned, which a burst of a
+thousand queries overflows. A query the kernel drops is a client waiting out
+its timeout, and the row then measures the timeout instead of the server.
+`-mock-cpus 2-3` puts the mock upstream beside the generator, so the server's
+two cores are its own; the two together carry 100,000 misses a second there.
 
 `-competitors` is a directory holding the servers that are not on `PATH`:
 

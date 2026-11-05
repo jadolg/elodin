@@ -29,6 +29,7 @@ type Result struct {
 	P99ms        float64          `json:"p99_ms"`
 	MinPerClient int64            `json:"min_per_client"`
 	MaxPerClient int64            `json:"max_per_client"`
+	Reconnects   int64            `json:"reconnects"`
 }
 
 // sample is what was true of the server process while the run happened.

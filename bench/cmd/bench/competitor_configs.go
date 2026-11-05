@@ -107,7 +107,10 @@ func corednsConfig(h *harness, o serverOpts, p ports, bin string) ([]string, err
 `, scheme, port, tls, p.upPort, inflightBound(o), cache, secs(o.clientTimeout))
 	}
 	tls := fmt.Sprintf("tls %s %s", cert, key)
-	cfg := block("", p.dns, "") + block("tls://", p.dot, tls) + block("https://", p.doh, tls)
+	// CoreDNS serves at most 200 DoH connections unless told otherwise; the
+	// counterpart of max_connections, as for the other listeners.
+	https := fmt.Sprintf("%s\n  https {\n    max_connections %d\n  }", tls, o.maxConnections)
+	cfg := block("", p.dns, "") + block("tls://", p.dot, tls) + block("https://", p.doh, https)
 	path, err := h.writeConf(o, "Corefile", cfg)
 	if err != nil {
 		return nil, err
