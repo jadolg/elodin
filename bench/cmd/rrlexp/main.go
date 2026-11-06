@@ -1320,7 +1320,7 @@ func runArm(bin, dir, upstream string, a arm) (row, error) {
 	}
 	// Reads the server while the load is on it, for an arm long enough that
 	// what it looked like at the end is not what it looked like throughout.
-	soaking := startSoakSampler(srv, a, &r)
+	soaking := startSoakSampler(srv, a, &r, start)
 
 	time.Sleep(dur)
 	r.elapsed = time.Since(start)

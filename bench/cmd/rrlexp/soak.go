@@ -65,14 +65,16 @@ the function that stops it.
 A no-op for every other arm, returned rather than branched on at the call site:
 `runArm` reads better for having one path, and an arm with no sampling interval
 is most of them.
+
+`start` is the measured window's, so a reading's `at` is on the clock the
+`upstream-fail` arms' `downAt` and `upAt` are.
 */
-func startSoakSampler(srv *server, a arm, r *row) func() {
+func startSoakSampler(srv *server, a arm, r *row, start time.Time) func() {
 	if a.sample <= 0 {
 		return func() {}
 	}
 	done := make(chan struct{})
 	stopped := make(chan struct{})
-	start := time.Now()
 
 	/*
 		The first reading is taken now, before any of the measured window has

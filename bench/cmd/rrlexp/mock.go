@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -48,8 +49,18 @@ type mock struct {
 }
 
 func startMock(delay time.Duration, records int, ttl uint32) (*mock, error) {
-	m := &mock{addr: "127.0.0.1:0", delay: delay, records: records, ttl: ttl}
-	if err := m.listen(); err != nil {
+	m := &mock{delay: delay, records: records, ttl: ttl}
+	// The kernel picks the UDP port and TCP has to take the same one, which an
+	// outbound connection on a busy machine may already hold as its local
+	// port: another port is as good, so another is picked.
+	var err error
+	for range 20 {
+		m.addr = "127.0.0.1:0"
+		if err = m.listen(); !errors.Is(err, syscall.EADDRINUSE) {
+			break
+		}
+	}
+	if err != nil {
 		return nil, err
 	}
 	probe, _ := answer(dnswire.Query(1, "size.rrl.test", dnswire.TypeA, 0), records, ttl)

@@ -27,9 +27,10 @@ Each arm runs two clients for `failArm`:
 
 `failBefore` into the measured window the first upstream fails, and `failFor`
 later it comes back, so each arm reports the transition and the recovery rather
-than a server that started without it. Long enough to cover the failure
-threshold, the cooldown and the probe after it. The server is read every
-second, which is the series `upstreamTable` prints.
+than a server that started without it. The arm runs 12 s past the return: a
+member parked late in the outage stays out until its 10 s cooldown ends, up to
+six seconds after it is back, and the margin keeps that inside the arm. The
+server is read every second, which is the series `upstreamTable` prints.
 
 Two ways of failing, because they cost a forwarder very differently:
 `blackhole` reads every query and answers none, so each costs the full
@@ -56,7 +57,7 @@ asking from their own /24 anyway. `upstream.attempts` is the shipped default.
 const (
 	failBefore   = 3 * time.Second
 	failFor      = 15 * time.Second
-	failArm      = failBefore + failFor + 7*time.Second
+	failArm      = failBefore + failFor + 12*time.Second
 	failMissRate = 200
 )
 
@@ -313,9 +314,13 @@ func parked(r row) string {
 	return fmt.Sprintf("+%s → +%s", down.Round(time.Second), up.Round(time.Second))
 }
 
-// recovered is how long after the upstream returned the misses were answered
-// again: the first window after `upAt` from which every window answered 95%.
-// "never lost" when no window of the outage fell below that, as under `race`.
+/*
+recovered is when the misses were answered again: the first window from which
+every window to the end of the arm answered 95%, as a time after `upAt`. "never
+lost" when no window of the outage fell below that, as under `race`, and "before
+it returned" when they came back while it was still gone, as once a strategy
+with a healthy second member parks the failing one.
+*/
 func recovered(r row) string {
 	var at time.Duration
 	lost := false
@@ -326,15 +331,14 @@ func recovered(r row) string {
 		}
 		mo, mf := s.attackerOffered-prev.attackerOffered, s.attackerFull-prev.attackerFull
 		healthy := mo > 0 && float64(mf) >= 0.95*float64(mo)
-		if !healthy && prev.at >= r.downAt-200*time.Millisecond && prev.at < r.upAt-200*time.Millisecond {
-			lost = true
-		}
-		switch {
-		case prev.at < r.upAt-200*time.Millisecond:
-		case healthy && at == 0:
-			at = s.at
-		case !healthy:
-			at = 0
+		if prev.at >= r.downAt-200*time.Millisecond {
+			switch {
+			case !healthy:
+				lost = lost || prev.at < r.upAt-200*time.Millisecond
+				at = 0
+			case at == 0:
+				at = s.at
+			}
 		}
 		prev = s
 	}
@@ -343,6 +347,8 @@ func recovered(r row) string {
 		return "never lost"
 	case at == 0:
 		return "not within the arm"
+	case at <= r.upAt+200*time.Millisecond:
+		return fmt.Sprintf("before it returned (+%s)", at.Round(time.Second))
 	}
 	return fmt.Sprintf("within %s", (at - r.upAt).Round(time.Second))
 }
