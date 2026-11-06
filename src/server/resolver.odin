@@ -1492,14 +1492,20 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	of every parked query's stack (#614). One allocation for both.
 
 	An arena with no room for them has none for a SERVFAIL either, so the
-	question fails unanswered, counted and logged as `shape_forwarded` counts
-	and logs its own failure.
+	question fails with no response, counted and logged as `shape_forwarded`
+	counts and logs its own failure. A detached refresh counts and logs nothing:
+	it reports `unanswered`, and the client holding the entry is counted for the
+	answer it gets, as `judge_reply` has it.
 	*/
 	size := cache.key_size(st.q.name)
 	keys, _ := make([]u8, 2 * size, st.allocator)
 	if len(keys) < 2 * size {
-		count_answer(&st.s.stats.failed)
-		log_query(st.s, st.client, st.proto, st.q, .Failed, "query", st.started)
+		if st.refresh {
+			st.unanswered = true
+		} else {
+			count_answer(&st.s.stats.failed)
+			log_query(st.s, st.client, st.proto, st.q, .Failed, "query", st.started)
+		}
 		return answered(st, nil, .Failed, false)
 	}
 	st.key = cache.make_key(keys[:size], st.q.name, st.q.type, st.q.class, dns.edns_do(st.msg), st.msg.flags.cd, policy = policy)
@@ -1753,9 +1759,14 @@ shape_forwarded :: proc(st: ^Query_State) -> bool {
 	if !built {
 		// The question decoded, so its encoding failing is not a shape a client
 		// can send; failing closed rather than forwarding its bytes as they stand.
-		count_answer(&st.s.stats.failed)
+		// A detached refresh reports `unanswered` instead, as in `judge_reply`.
 		out, ok := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
-		log_query(st.s, st.client, st.proto, st.q, .Failed, "query", st.started)
+		if st.refresh {
+			st.unanswered = true
+		} else {
+			count_answer(&st.s.stats.failed)
+			log_query(st.s, st.client, st.proto, st.q, .Failed, "query", st.started)
+		}
 		return answered(st, out, .Failed, ok)
 	}
 	st.forwarded = wire

@@ -63,12 +63,18 @@ test_cache_keys_are_as_long_as_the_name :: proc(t: ^testing.T) {
 	}
 	defer free_all(context.temp_allocator)
 
-	// 127 labels of one escaped byte: 127 * 5 = 635 presentation bytes, a
-	// 255-byte wire name.
-	long := make([]u8, 127 * 5, context.temp_allocator)
-	for i in 0 ..< 127 {
-		copy(long[i * 5:], "\\000.")
+	// Labels of 63, 63, 63 and 61 escaped bytes: a 255-byte wire name, and at
+	// four presentation bytes a byte, the longest presentation name there is.
+	long_name: [dynamic]u8
+	long_name.allocator = context.temp_allocator
+	for label_len in ([]int{63, 63, 63, 61}) {
+		for _ in 0 ..< label_len {
+			append(&long_name, "\\000")
+		}
+		append(&long_name, '.')
 	}
+	long := long_name[:]
+	testing.expect_value(t, len(long), 1004)
 	for name in ([]string{"www.Example.COM.", string(long)}) {
 		spent: int
 		st := stage_state(&s, name, &spent, context.temp_allocator)
@@ -114,11 +120,16 @@ test_a_request_with_no_room_for_its_keys_fails :: proc(t: ^testing.T) {
 		cfg = &cfg,
 	}
 	defer free_all(context.temp_allocator)
-	spent: int
-	st := stage_state(&s, "example.com.", &spent, mem.nil_allocator())
-	testing.expect(t, answer_from_cache(&st), "a question with no keys was handed on")
-	testing.expect(t, !st.ok, "a question with no keys was answered")
-	testing.expect_value(t, st.outcome, Outcome.Failed)
-	testing.expect_value(t, st.key, "")
-	testing.expect_value(t, s.stats.failed, 1)
+	for refresh in ([]bool{false, true}) {
+		spent: int
+		st := stage_state(&s, "example.com.", &spent, mem.nil_allocator())
+		st.refresh = refresh
+		testing.expect(t, answer_from_cache(&st), "a question with no keys was handed on")
+		testing.expect(t, !st.ok, "a question with no keys was answered")
+		testing.expect_value(t, st.outcome, Outcome.Failed)
+		testing.expect_value(t, st.key, "")
+		// A detached refresh is counted by the client holding the entry, not here.
+		testing.expect_value(t, st.unanswered, refresh)
+		testing.expect_value(t, s.stats.failed, 1)
+	}
 }
