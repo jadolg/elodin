@@ -285,7 +285,7 @@ func (h *harness) makeCerts() error {
 
 // describeMachine records what the numbers are numbers for. A throughput
 // figure without it is not reproducible by anyone else.
-func (h *harness) describeMachine() string {
+func describeMachine() string {
 	model := "unknown CPU"
 	if data, err := os.ReadFile("/proc/cpuinfo"); err == nil {
 		for line := range strings.SplitSeq(string(data), "\n") {
@@ -319,8 +319,13 @@ func (h *harness) describeMachine() string {
 	if outb, err := exec.Command(*binary, "--version").Output(); err == nil {
 		version = strings.TrimSpace(string(outb))
 	}
-	return fmt.Sprintf("Measured on %s (%d logical cores%s%s), %s, started with %s's environment (%s).",
-		model, runtime.NumCPU(), mem, kernel, version, unitenv.File, strings.Join(h.unitEnv, " "))
+	return fmt.Sprintf("Measured on %s (%d logical cores%s%s), %s.",
+		model, runtime.NumCPU(), mem, kernel, version)
+}
+
+// environmentNote says what elodin was started with, for the report's header.
+func (h *harness) environmentNote() string {
+	return fmt.Sprintf("elodin was started with %s's environment (%s).", unitenv.File, strings.Join(h.unitEnv, " "))
 }
 
 // serverLabel names a server in a row by the version it reports, so a run

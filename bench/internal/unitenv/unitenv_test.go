@@ -1,6 +1,7 @@
 package unitenv
 
 import (
+	"bufio"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -79,12 +80,27 @@ func TestShipped(t *testing.T) {
 
 // Check reads the environment the kernel holds for a process.
 func TestCheck(t *testing.T) {
-	cmd := exec.Command("sleep", "5")
+	// Start returns once the exec is committed, which is before the kernel has
+	// set out the new environment: /proc/<pid>/environ can read empty until
+	// then. The child says when it is running, as the bench's server does by
+	// answering, and holds until its stdin closes.
+	cmd := exec.Command("sh", "-c", "echo ready; read _")
 	cmd.Env = Shipped([]string{"ELODIN_UNITENV_TEST=1"}, os.Environ())
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := cmd.Start(); err != nil {
 		t.Skip(err)
 	}
-	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	defer func() { _ = stdin.Close(); _ = cmd.Wait() }()
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); line != "ready\n" {
+		t.Fatalf("child said %q: %v", line, err)
+	}
 	if err := Check(cmd.Process.Pid, []string{"ELODIN_UNITENV_TEST=1"}); err != nil {
 		t.Fatal(err)
 	}

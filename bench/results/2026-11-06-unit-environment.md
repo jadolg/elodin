@@ -62,7 +62,6 @@ log once read. No document quotes its figures.
 | light mixed load (20 in flight) | 428,552 qps | 0.02 ms | 0.33 ms | 21 MB |
 | sustained cache misses | 3,395 qps | 31.8 ms | 78.9 ms | 25 MB |
 
-
 ### Transports, one connection per client
 
 | transport | clients | throughput | p50 | p99 | answered per client (min–max) | errors |
@@ -74,7 +73,6 @@ log once read. No document quotes its figures.
 | DoH over HTTP/2 | 100 | 124,192 qps | 0.48 ms | 4.0 ms | 11977 – 12902 | 0 |
 | TCP | 500 | 508,477 qps | 0.55 ms | 5.4 ms | 9532 – 11390 | 0 |
 
-
 ### HTTP/1.1 against HTTP/2 under concurrency
 
 10 clients, 8 concurrent requests each, every one a cache miss.
@@ -83,7 +81,6 @@ log once read. No document quotes its figures.
 |---|---|---|---|
 | DoH over HTTP/1.1 | 238 qps | 322.3 ms | 439.6 ms |
 | DoH over HTTP/2 | 2,049 qps | 34.4 ms | 81.2 ms |
-
 
 ### CPU per query
 
@@ -95,14 +92,12 @@ log once read. No document quotes its figures.
 | elodin dev-82a8687 | DoH over HTTP/1.1 | 11 µs | 0.06 core |
 | elodin dev-82a8687 | DoH over HTTP/2 | 13 µs | 0.07 core |
 
-
 ### Fresh TLS handshakes
 
 | key | handshakes/s | CPU per handshake | p50 |
 |---|---|---|---|
 | ECDSA | 6,378 /s | 195 µs | 2.1 ms |
 | RSA | 3,801 /s | 558 µs | 3.8 ms |
-
 
 ### Memory
 
@@ -112,7 +107,6 @@ log once read. No document quotes its figures.
 | blocklists | ~44 B per rule (11 MB for 250,000 rules) |
 | answer cache | ~595 B per entry (6 MB at the default 10,000) |
 | realistic total under load | 83 MB with 250,000 rules and 105,702 cached answers |
-
 
 ### Past capacity
 
@@ -125,7 +119,6 @@ Cache misses from 6,000 clients at once, against an upstream answering after 20m
 
 A dropped query gets no answer at all, so it shows up as a client timeout rather than an error code. A thread-model release queues what its workers cannot carry, so for one of those the second row is the unbounded queue.
 
-
 ### Event loops on two cores
 
 Server pinned to CPUs 0-1, generator to 2-3, 1,000 clients over UDP, `max_pending` 4096. elodin's loops are `listeners.udp.readers`; Unbound's are `num-threads`. A thread-model release takes `readers` as its UDP reader count only.
@@ -136,7 +129,6 @@ Server pinned to CPUs 0-1, generator to 2-3, 1,000 clients over UDP, `max_pendin
 | elodin dev-82a8687 | 2 | 34,002 qps | 73.8 ms | 472,008 qps | 6.4 ms |
 | elodin dev-82a8687 | 4 | 40,943 qps | 56.5 ms | 501,616 qps | 5.5 ms |
 
-
 ### Cache misses against the upstream delay
 
 2,000 clients over UDP, every name unique, `max_pending` 4096.
@@ -145,7 +137,6 @@ Server pinned to CPUs 0-1, generator to 2-3, 1,000 clients over UDP, `max_pendin
 |---|---|---|---|---|---|---|
 | elodin dev-82a8687 | 20ms | 84,816 qps | 22.5 ms | 45.5 ms | 0 | 100,000 qps |
 | elodin dev-82a8687 | 5ms | 117,867 qps | 16.4 ms | 30.6 ms | 0 | 400,000 qps |
-
 
 ### Memory per idle connection
 
@@ -163,7 +154,6 @@ Each client asks one cached name and then holds its connection idle. The figure 
 | elodin dev-82a8687 | DoH over HTTP/2 | 5,000 | all | 10 MB | 185 MB | 36 KB |
 | elodin dev-82a8687 | DoH over HTTP/2 | 20,000 | all | 10 MB | 702 MB | 35 KB |
 
-
 ### Memory per query in flight
 
 Upstream answering after 3s, every name unique, cache off, `max_pending` N + 256 (Unbound: `num-queries-per-thread` 4096). The figure is (peak RSS − idle RSS) ÷ N.
@@ -174,7 +164,6 @@ Upstream answering after 3s, every name unique, cache off, `max_pending` N + 256
 | elodin dev-82a8687 | 3,000 | all | 10 MB | 59 MB | 17 KB |
 
 A thread-model release carries only as many as it has workers at once and queues the rest, so behind a three-second upstream most of its queries outlive the generator's five-second wait.
-
 
 ### Cache-hit latency
 

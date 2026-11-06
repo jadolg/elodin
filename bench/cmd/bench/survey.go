@@ -166,7 +166,7 @@ func askDOOnce(addr, name string) (int, bool, error) {
 func (h *harness) renderSurvey(results []verdict, reference string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "# elodin DNSSEC survey\n\n")
-	fmt.Fprintf(&sb, "%s\n\n", h.describeMachine())
+	fmt.Fprintf(&sb, "%s %s\n\n", describeMachine(), h.environmentNote())
 	fmt.Fprintf(&sb, "%d names asked through elodin with validation on, and asked again of %s.\n\n",
 		len(results), reference)
 
