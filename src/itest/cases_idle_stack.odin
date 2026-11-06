@@ -134,15 +134,11 @@ blocking: {{ enabled: false }}
 	// Answered locally, so the query runs the whole answer path with no upstream.
 	query := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
 	for transport in Idle_Transport {
-		// Only TCP's is read: a TLS connection holds OpenSSL's objects, tens of
-		// kilobytes of them.
-		rest_before := 0
-		if transport == .TCP {
-			rest_ok: bool
-			rest_before, _, rest_ok = fiber_stacks(pid, bound_kib, rest = true)
-			if !check(r, rest_ok, "cannot read the server's smaps") {
-				return
-			}
+		// The memory outside the stacks is bounded for TCP only: a TLS connection
+		// holds OpenSSL's objects, tens of kilobytes of them.
+		_, _, rest_before, before_ok := fiber_stacks(pid, bound_kib)
+		if !check(r, before_ok, "cannot read the server's smaps") {
+			return
 		}
 		conns := make([dynamic]Test_Conn, 0, IDLE_HELD, context.temp_allocator)
 		defer for &c in conns {
@@ -162,16 +158,19 @@ blocking: {{ enabled: false }}
 			}
 		}
 		/*
-		Read until the figure is inside the bound, since the stacks go back
-		`loop.IDLE_TRIM_AFTER` into the wait; the deadline only ends a failing
-		run, which then reports the last reading. `client_timeout` is set far
-		past the time the connections take to open, which on a loaded host is
-		seconds, so none of the connections being measured is closed for idling.
+		Read until the figures are inside their bounds, since the stacks and the
+		scratches go back `loop.IDLE_TRIM_AFTER` into the wait; the deadline only
+		ends a failing run, which then reports the last reading. `client_timeout`
+		is set far past the time the connections take to open, which on a loaded
+		host is seconds, so none of the connections being measured is closed for
+		idling.
 		*/
-		held, over, hok := fiber_stacks(pid, bound_kib)
-		for start := time.tick_now(); hok && over > IDLE_WARM && time.tick_since(start) < 5 * time.Second; {
+		held, over, rest, hok := fiber_stacks(pid, bound_kib)
+		per := (rest - rest_before) * 1024 / IDLE_HELD
+		for start := time.tick_now(); hok && (over > IDLE_WARM || transport == .TCP && per > IDLE_REST_BYTES) && time.tick_since(start) < 5 * time.Second; {
 			time.sleep(100 * time.Millisecond)
-			held, over, hok = fiber_stacks(pid, bound_kib)
+			held, over, rest, hok = fiber_stacks(pid, bound_kib)
+			per = (rest - rest_before) * 1024 / IDLE_HELD
 		}
 		if !check(r, hok, "cannot read the server's smaps") {
 			return
@@ -192,30 +191,17 @@ blocking: {{ enabled: false }}
 			bound_kib,
 			IDLE_HELD,
 		)
-		if transport != .TCP {
-			continue
+		if transport == .TCP {
+			check(
+				r,
+				per <= IDLE_REST_BYTES,
+				"TCP: each idle connection holds %d bytes outside its stack (%d KiB before, %d KiB held), over %d",
+				per,
+				rest_before,
+				rest,
+				IDLE_REST_BYTES,
+			)
 		}
-		// Polled as the stacks are: the loop above stops with up to `IDLE_WARM`
-		// connections not yet trimmed, and each of those still has its scratch.
-		rest, _, rok := fiber_stacks(pid, bound_kib, rest = true)
-		per := (rest - rest_before) * 1024 / IDLE_HELD
-		for start := time.tick_now(); rok && per > IDLE_REST_BYTES && time.tick_since(start) < 5 * time.Second; {
-			time.sleep(100 * time.Millisecond)
-			rest, _, rok = fiber_stacks(pid, bound_kib, rest = true)
-			per = (rest - rest_before) * 1024 / IDLE_HELD
-		}
-		if !check(r, rok, "cannot read the server's smaps") {
-			return
-		}
-		check(
-			r,
-			per <= IDLE_REST_BYTES,
-			"TCP: each idle connection holds %d bytes outside its stack (%d KiB before, %d KiB held), over %d",
-			per,
-			rest_before,
-			rest,
-			IDLE_REST_BYTES,
-		)
 	}
 }
 
@@ -255,18 +241,18 @@ The server's fiber stacks, and how many of them are resident past
 the server maps is that size and anonymous; the guard page below each is a
 mapping of its own.
 
-With `rest`, `count` is instead the KiB resident in every other anonymous
-mapping, less what huge pages back: a glibc arena that THP backs jumps 2 MiB at
-once, which is the kernel's choice and not what a connection holds.
+`rest_kib` is what every other anonymous mapping has resident, less what huge
+pages back: a glibc arena that THP backs jumps 2 MiB at once, which is the
+kernel's choice and not what a connection holds.
 */
 @(private = "file")
-fiber_stacks :: proc(pid: int, bound_kib: int, rest := false) -> (count, over: int, ok: bool) {
+fiber_stacks :: proc(pid: int, bound_kib: int) -> (count, over, rest_kib: int, ok: bool) {
 	// Polled until the stacks go back, and the temp allocator is reset only when
 	// the case ends: each reading's file and fields go when it returns.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	data, err := os.read_entire_file(fmt.tprintf("/proc/%d/smaps", pid), context.temp_allocator)
 	if err != nil {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
 	text := string(data)
 	anonymous := false
@@ -283,14 +269,14 @@ fiber_stacks :: proc(pid: int, bound_kib: int, rest := false) -> (count, over: i
 			size = 0
 		case fields[0] == "Size:" && len(fields) >= 2:
 			size, _ = strconv.parse_int(fields[1])
-		case rest && anonymous && size != STACK_KIB && len(fields) >= 2 && (fields[0] == "Rss:" || fields[0] == "AnonHugePages:"):
-			kib, _ := strconv.parse_int(fields[1])
-			count += kib if fields[0] == "Rss:" else -kib
-		case !rest && fields[0] == "Rss:" && len(fields) >= 2 && anonymous && size == STACK_KIB:
+		case fields[0] == "Rss:" && len(fields) >= 2 && anonymous && size == STACK_KIB:
 			rss, _ := strconv.parse_int(fields[1])
 			count += 1
 			over += 1 if rss > bound_kib else 0
+		case anonymous && size != STACK_KIB && len(fields) >= 2 && (fields[0] == "Rss:" || fields[0] == "AnonHugePages:"):
+			kib, _ := strconv.parse_int(fields[1])
+			rest_kib += kib if fields[0] == "Rss:" else -kib
 		}
 	}
-	return count, over, true
+	return count, over, rest_kib, true
 }
