@@ -50,6 +50,12 @@ type sample struct {
 	victimOffered int64
 	victimFull    int64
 	victimClosed  int64
+	// How many victim latencies had been recorded, so a window's percentiles
+	// are of the replies that arrived in it. And the flood's counters, which
+	// in the `upstream-fail` arms is the miss traffic that needs an upstream.
+	victimLat       int
+	attackerOffered int64
+	attackerFull    int64
 }
 
 /*
@@ -117,6 +123,11 @@ func takeSample(srv *server, r *row, at time.Duration) sample {
 		victimOffered: r.victim.offered.Load(),
 		victimFull:    r.victim.full.Load(),
 		victimClosed:  r.victim.closed.Load(),
+		victimLat:     r.victim.latLen(),
+	}
+	if r.attacker != nil {
+		s.attackerOffered = r.attacker.offered.Load()
+		s.attackerFull = r.attacker.full.Load()
 	}
 	return s
 }
@@ -141,7 +152,7 @@ func soakTable(b *strings.Builder, rows []row) {
 	}
 	b.WriteString("\n## The soak: what changed while it ran\n\n")
 	for _, r := range rows {
-		if len(r.samples) < 2 {
+		if len(r.samples) < 2 || r.arm.fail != nil {
 			continue
 		}
 		fmt.Fprintf(b, "### %s — %s, sampled every %s\n\n", r.arm.name, armDuration(r.arm), r.arm.sample)
@@ -249,7 +260,7 @@ func goodSample(samples []sample, last bool) sample {
 // least one window after it, which is the least the table can be read from.
 func hasSamples(rows []row) bool {
 	for _, r := range rows {
-		if len(r.samples) > 1 {
+		if len(r.samples) > 1 && r.arm.fail == nil {
 			return true
 		}
 	}

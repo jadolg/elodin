@@ -11,6 +11,17 @@ import (
 
 func renderReport(rows []row, skips []skip) string {
 	var b strings.Builder
+	if onlyFail(rows) {
+		b.WriteString("# Upstream failure: what clients get\n\n")
+		fmt.Fprintf(&b, "Each arm: one server, two clients at once, %s measured after %s of the same load, the rate limiter off, a %s upstream round trip, and the shipped default for everything an arm does not name.\n",
+			failArm, *warmup, *upDelay)
+		upstreamTable(&b, rows)
+		b.WriteString("\n")
+		victimTable(&b, rows)
+		serverTable(&b, rows)
+		skipList(&b, skips)
+		return b.String()
+	}
 	b.WriteString("# Response rate limiting: what a bystander gets\n\n")
 	if *soak > 0 {
 		fmt.Fprintf(&b, "A soak run: the soak arm alone, %s of load after %s of the same, with the server read every %s.\n",
@@ -30,6 +41,7 @@ func renderReport(rows []row, skips []skip) string {
 	connTable(&b, rows)
 	handshakeTable(&b, rows)
 	soakTable(&b, rows)
+	upstreamTable(&b, rows)
 	serverTable(&b, rows)
 
 	b.WriteString("\n## What each arm was asking\n\n")
@@ -38,6 +50,17 @@ func renderReport(rows []row, skips []skip) string {
 	}
 	skipList(&b, skips)
 	return b.String()
+}
+
+// onlyFail is a run of `-only upstream-fail`, whose report is about upstreams
+// rather than the rate limiter the rest of the matrix is about.
+func onlyFail(rows []row) bool {
+	for _, r := range rows {
+		if r.arm.fail == nil {
+			return false
+		}
+	}
+	return len(rows) > 0
 }
 
 // skipList names the arms this machine could not run, so a missing section is

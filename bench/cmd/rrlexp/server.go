@@ -83,6 +83,9 @@ func connectionBlock(a arm) string {
 	if a.clientTimeout > 0 {
 		fmt.Fprintf(&b, "  client_timeout: %s\n", a.clientTimeout)
 	}
+	if a.maxPending > 0 {
+		fmt.Fprintf(&b, "  max_pending: %d\n", a.maxPending)
+	}
 	return b.String()
 }
 
@@ -107,8 +110,9 @@ type armServer struct {
 	rateLimit   string
 	connections string
 	cert, key   string
-	upHost      string
-	upPort      string
+	// The whole `upstream:` section. See `upstreamBlock`.
+	upstream string
+	stale    bool
 	// What the DNS listeners bind, which is also the family the arm's clients
 	// are on. See `armListen`.
 	listen       string
@@ -129,7 +133,7 @@ func serverConfig(a armServer) string {
 	return fmt.Sprintf(configTemplate,
 		*logLevel, *logQueries, a.logPath, *workers, *workers/2, a.connections, a.rateLimit,
 		a.listen, a.port, a.dotPort, a.dohPort, a.cert, a.key,
-		a.upHost, a.upPort, a.cacheEntries, a.metrics, a.readers)
+		a.upstream, a.cacheEntries, a.metrics, a.readers, a.stale)
 }
 
 /*
@@ -212,7 +216,7 @@ listeners:
     enabled: true
     address: "%[8]s"
     port: %[9]d
-%[18]s  tcp:
+%[17]s  tcp:
     enabled: true
     address: "%[8]s"
     port: %[9]d
@@ -235,24 +239,15 @@ listeners:
     cert_file: %[12]s
     key_file: %[13]s
 
-upstream:
-  strategy: failover
-  timeout: 5s
-  attempts: 1
-  bootstrap: [127.0.0.1]
-  servers:
-    - name: mock
-      type: udp
-      address: %[14]s
-      port: %[15]s
-
+%[14]s
 cache:
   enabled: true
   # Every query in a run asks about a name of its own, so a run's worth of
   # misses has to fit without evicting: a cache churning is a cost of the
   # generator's making rather than of the load. The soak arm asks for the
   # shipped figure instead - see armCache in server.go.
-  max_entries: %[16]d
+  max_entries: %[15]d
+  serve_stale: %[18]t
 
 blocking:
   enabled: false
@@ -268,9 +263,35 @@ dnssec:
 metrics:
   enabled: true
   address: "127.0.0.1"
-  port: %[17]d
+  port: %[16]d
   path: /metrics
 `
+
+// One upstream in the arm's `servers:` list.
+type member struct{ name, addr string }
+
+/*
+upstreamBlock is the arm's `upstream:` section.
+
+Every arm but the `upstream-fail` ones has one mock, `failover` and one attempt,
+for the reason bench/README.md gives: a failure reads as one rather than as a
+slower success. The `upstream-fail` arms pass 0 for `attempts`, which leaves it
+at the shipped default, since what those measure is a failure as a deployment
+meets it.
+*/
+func upstreamBlock(strategy string, attempts int, members []member) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "upstream:\n  strategy: %s\n  timeout: 5s\n", strategy)
+	if attempts > 0 {
+		fmt.Fprintf(&b, "  attempts: %d\n", attempts)
+	}
+	b.WriteString("  bootstrap: [127.0.0.1]\n  servers:\n")
+	for _, m := range members {
+		host, port, _ := net.SplitHostPort(m.addr)
+		fmt.Fprintf(&b, "    - name: %s\n      type: udp\n      address: %s\n      port: %s\n", m.name, host, port)
+	}
+	return b.String()
+}
 
 func startServer(bin, dir, upstream string, a arm) (*server, error) {
 	port, dotPort, dohPort, metricsPort, err := armPorts()
@@ -281,7 +302,6 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 	if err != nil {
 		return nil, err
 	}
-	host, upPort, _ := net.SplitHostPort(upstream)
 	name := strings.NewReplacer("/", "-").Replace(a.name)
 	logPath := filepath.Join(dir, name+".log")
 
@@ -292,8 +312,8 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 		connections:  connectionBlock(a),
 		cert:         cert,
 		key:          key,
-		upHost:       host,
-		upPort:       upPort,
+		upstream:     upstream,
+		stale:        a.fail != nil && a.fail.stale,
 		listen:       listen,
 		port:         port,
 		dotPort:      dotPort,
