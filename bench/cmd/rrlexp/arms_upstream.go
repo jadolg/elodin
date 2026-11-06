@@ -305,6 +305,10 @@ func parked(r row) string {
 			up = s.at
 		}
 	}
+	return parkedText(down, up)
+}
+
+func parkedText(down, up time.Duration) string {
 	switch {
 	case down == 0:
 		return "never parked"
@@ -348,6 +352,10 @@ func recovered(r row) string {
 		}
 		prev = s
 	}
+	return recoveredText(r, at, lost)
+}
+
+func recoveredText(r row, at time.Duration, lost bool) string {
 	switch {
 	case !lost:
 		return "never lost"
