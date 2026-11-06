@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"elodin.bench/internal/procstat"
@@ -789,9 +790,26 @@ func (h *harness) shedding() (section, error) {
 	return section{title: "Past capacity", body: sb.String()}, nil
 }
 
+// logDiskNeeded is what loggingCost wants free in the work directory: one
+// logged run at full rate, ~500,000 queries a second for three 12-second
+// repeats at ~220 bytes a query, with headroom.
+const logDiskNeeded = 5 << 30
+
 // loggingCost is the throughput `log.queries` costs, which docs/sizing.md warns
 // about because it is also the one thing that writes to disk in steady state.
 func (h *harness) loggingCost() (section, error) {
+	// A logged row writes ~220 bytes a query, over 3 GB in a full-rate run.
+	// On a disk that fills partway the server keeps answering and the lines are
+	// lost, so the row would report a cost and a byte count for a log it never
+	// wrote: refuse to start rather than measure that.
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(h.dir, &fs); err != nil {
+		return section{}, err
+	}
+	if free := fs.Bavail * uint64(fs.Bsize); free < logDiskNeeded {
+		return section{}, fmt.Errorf("%s has %d MiB free, short of the %d MiB a logged run writes; point -workdir at a larger disk",
+			h.dir, free>>20, logDiskNeeded>>20)
+	}
 	var sb strings.Builder
 	sb.WriteString("| log.queries | throughput | run-to-run spread | cost |\n|---|---|---|---|\n")
 
@@ -807,6 +825,9 @@ func (h *harness) loggingCost() (section, error) {
 		}
 		r, sm, err := h.load(s, loadOpts{transport: "udp", clients: 200})
 		s.stop()
+		// A logged run at full rate writes hundreds of MB that nothing reads,
+		// and kept until the end of a matrix it can fill a disk.
+		_ = os.Remove(s.logPath)
 		if err != nil {
 			return section{}, err
 		}
@@ -835,6 +856,7 @@ func (h *harness) loggingCost() (section, error) {
 		return section{}, err
 	}
 	written := fileSize(s.logPath) - before
+	_ = os.Remove(s.logPath)
 	fmt.Fprintf(&sb, "\nAt %s qps it wrote %.0f MB/s — %.0f bytes per query.\n",
 		thousands(r.QPS), float64(written)/r.Seconds/(1<<20), float64(written)/float64(r.Answered))
 

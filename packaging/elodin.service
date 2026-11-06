@@ -66,7 +66,9 @@ LimitNOFILE=65536
 # musl ignores it. For glibc's default, put
 # UnsetEnvironment=MALLOC_MMAP_THRESHOLD_ in a drop-in.
 # `mise run bench` and the load smoke start elodin with this file's Environment=
-# lines and refuse any that is not a plain KEY=VALUE, so the figures describe it.
+# lines and refuse any that is not a plain KEY=VALUE, so the figures describe it;
+# against glibc's default they are within the noise
+# (bench/results/2026-11-06-unit-environment.md).
 Environment=MALLOC_MMAP_THRESHOLD_=131072
 
 NoNewPrivileges=yes

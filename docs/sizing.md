@@ -194,7 +194,8 @@ are slow: a browser's concurrent requests overlap instead of queueing.
 
 TLS handshakes are the expensive part of the encrypted transports, orders of
 magnitude more CPU than answering on an open connection, and they run on the
-loop the connection is on. ECDSA P-256 costs about half what RSA-2048 does;
+loop the connection is on. An ECDSA P-256 handshake takes about a third of the
+CPU an RSA-2048 one does (about 200 µs against 550 µs);
 `mise run certs` generates ECDSA, and production should use it too.
 
 Clients resume by session ticket (RFC 5077, and TLS 1.3's own), which costs the
@@ -271,8 +272,13 @@ silent.
 ## Measuring and disk
 
 `mise run bench` measures all of this; see [`bench/README.md`](../bench/README.md).
-Committed runs are under `bench/results/`: read them as the shape of the thing,
-and re-take them rather than quoting an old run against a change.
+It starts elodin with the shipped unit's environment, so the figures describe
+`MALLOC_MMAP_THRESHOLD_` as the unit sets it. The held-connection and handshake
+figures on this page are from
+[`bench/results/2026-11-06-unit-environment.md`](../bench/results/2026-11-06-unit-environment.md),
+which also runs glibc's default threshold beside it: the two are within the
+noise. Committed runs are under `bench/results/`: read them as the shape of the
+thing, and re-take them rather than quoting an old run against a change.
 
 On disk, `log.queries` writes a line per query and wants rotation. Nothing else
 is written in steady state; the blocklist cache is the size of the lists.
