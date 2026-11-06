@@ -86,13 +86,14 @@ DEFAULT_HEAVY_DECODES :: 16
 Memory charged to each connection `server.max_connections` lets the server hold.
 
 Every TCP, DoT and DoH connection has a fiber of its own. Held open after one
-query each, a TCP connection measured ~9 KB resident in a release build - the
-page of stack its parked fiber keeps (#596) and its scratch - and a DoT or
-DoH/2 one ~43 KB, about two thirds of it OpenSSL's objects for the
-connection, with its record buffers released while idle (#595;
-bench/results/2026-11-06-held-memory.md); this rounds up for the stack a query
-touches (#526, #547). The scratch a query uses past that is held until its
-connection closes and unmapped when it does.
+query each, a TCP connection measured ~5 KB resident in a release build - the
+page of stack its parked fiber keeps (#596) and the fiber itself, its scratch
+unmapped while it idles (#613) - and a DoT or DoH/2 one ~39 KB, most of it
+OpenSSL's objects for the connection, with its record buffers released while
+idle (#595; bench/results/2026-11-06-held-memory.md,
+bench/results/2026-11-06-idle-tcp.md); this rounds up for the stack and the
+scratch a query touches (#526, #547), which a connection holds while it is
+answering and gives back once it has idled for `loop.IDLE_TRIM_AFTER`.
 */
 CONNECTION_MEMORY_BYTES :: 128 * 1024
 

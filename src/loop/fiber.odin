@@ -244,13 +244,36 @@ stack_release :: proc "contextless" (f: ^Fiber) {
 }
 
 /*
+Unmap the blocks of an idle fiber's scratch when nothing in it is live (#613).
+
+`arena_free_all` keeps the first block mapped for the next query, and a query
+touches at least the page its header is in: 4 KiB of every held connection,
+about half of what an idle TCP connection costs once its stack is trimmed. A
+connection between queries has freed its scratch, so an idle park that lasts
+gives the blocks back with the stack, and the next query maps a fresh first block
+as a new fiber's does. Anything a fiber still holds in its scratch across the
+wait - an allocation, or a temp region opened around it - keeps the arena whole,
+since a pointer into it is live; `total_used` and `temp_count` say so. Under
+`SCRATCH_DEBUG` every allocation is the heap's and an empty scratch maps nothing.
+*/
+@(private)
+scratch_release :: proc "contextless" (s: ^Scratch) {
+	when !SCRATCH_DEBUG {
+		if s.arena.curr_block != nil && s.arena.total_used == 0 && s.arena.temp_count == 0 {
+			runtime.arena_destroy(&s.arena)
+		}
+	}
+}
+
+/*
 Whether the running fiber is about to wait for work with nothing in hand - a
 connection between queries - so that a park that lasts hands its stack back.
 
 A connection's fiber touches the stack for its deepest query, and left resident
 those pages are most of what a held connection costs between queries: about
 13 KiB of it (#596). A park made while this is set gives them back once it has
-lasted `IDLE_TRIM_AFTER`. Cleared once the wait is
+lasted `IDLE_TRIM_AFTER`, and the fiber's scratch with them if nothing in it is
+live (`scratch_release`). Cleared once the wait is
 over, so the parks a query makes on its upstreams keep their pages. Off a fiber
 it does nothing.
 */

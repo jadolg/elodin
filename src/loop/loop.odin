@@ -939,8 +939,9 @@ timer_remove :: proc(l: ^Loop, f: ^Fiber) {
 
 /*
 Wake every fiber whose deadline is at or before `now`, and hand back the stacks
-of the idle parks that have lasted `IDLE_TRIM_AFTER` - without waking them: such
-a fiber goes back in the heap on its own deadline, if it has one.
+and empty scratches of the idle parks that have lasted `IDLE_TRIM_AFTER` -
+without waking them: such a fiber goes back in the heap on its own deadline, if
+it has one.
 */
 @(private)
 expire_timers :: proc(l: ^Loop, now: Tick) {
@@ -955,6 +956,7 @@ expire_timers :: proc(l: ^Loop, now: Tick) {
 			// One already woken runs next round, and would fault the pages straight back.
 			if f.state == .Parked {
 				stack_release(f)
+				scratch_release(&f.scratch)
 			}
 			if f.deadline != (Tick{}) {
 				timer_push(l, f)
