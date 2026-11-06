@@ -50,8 +50,8 @@ server:
 
   # Nothing off this machine can connect, so the connection table is bounding
   # this host's own `dig +tcp` and any local client that speaks DoT or DoH to
-  # loopback. 64 is plenty for that, at about 9 KB a TCP connection held and
-  # 43 KB a DoT or DoH one.
+  # loopback. 64 is plenty for that, at about 5 KB a TCP connection held and
+  # 39 KB a DoT or DoH one.
   max_connections: 64
 
   rate_limit:

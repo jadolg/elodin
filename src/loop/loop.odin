@@ -955,6 +955,7 @@ expire_timers :: proc(l: ^Loop, now: Tick) {
 			// One already woken runs next round, and would fault the pages straight back.
 			if f.state == .Parked {
 				stack_release(f)
+				scratch_release(&f.scratch)
 			}
 			if f.deadline != (Tick{}) {
 				timer_push(l, f)
