@@ -1486,14 +1486,20 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	// reload has since replaced is never found here; see `Live.policy`.
 	policy := live(st.s).policy
 	/*
-	In the request's arena rather than in `Query_State`: two `cache.KEY_MAX`
-	arrays there were 2 KiB of a parked query's stack, a page of every query
-	waiting on an upstream, for keys that are the name and fifteen bytes (#614).
-	One allocation for both.
+	In the request's arena rather than in `Query_State`, whose frame a query
+	waiting on an upstream holds for the whole wait: the keys are the name and
+	fifteen bytes, so they cost what the name does and not two `cache.KEY_MAX`
+	of every parked query's stack (#614). One allocation for both.
+
+	An arena with no room for them has none for a SERVFAIL either, so the
+	question fails unanswered, counted and logged as `shape_forwarded` counts
+	and logs its own failure.
 	*/
 	size := cache.key_size(st.q.name)
 	keys, _ := make([]u8, 2 * size, st.allocator)
 	if len(keys) < 2 * size {
+		count_answer(&st.s.stats.failed)
+		log_query(st.s, st.client, st.proto, st.q, .Failed, "query", st.started)
 		return answered(st, nil, .Failed, false)
 	}
 	st.key = cache.make_key(keys[:size], st.q.name, st.q.type, st.q.class, dns.edns_do(st.msg), st.msg.flags.cd, policy = policy)

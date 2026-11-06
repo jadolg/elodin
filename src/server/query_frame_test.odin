@@ -11,7 +11,7 @@ import "elodin:dns"
 `Query_State` sits in `resolve_query`'s frame, which a query waiting on its
 upstream holds for the whole wait, so its size is stack every query in flight
 keeps resident (#614). Nothing in it is a buffer sized for the worst case: the
-cache keys, which were two of `cache.KEY_MAX`, are the request's.
+cache keys are the request's, not two `cache.KEY_MAX` arrays in the frame.
 */
 @(test)
 test_a_parked_query_holds_no_key_buffer :: proc(t: ^testing.T) {
@@ -120,4 +120,5 @@ test_a_request_with_no_room_for_its_keys_fails :: proc(t: ^testing.T) {
 	testing.expect(t, !st.ok, "a question with no keys was answered")
 	testing.expect_value(t, st.outcome, Outcome.Failed)
 	testing.expect_value(t, st.key, "")
+	testing.expect_value(t, s.stats.failed, 1)
 }
