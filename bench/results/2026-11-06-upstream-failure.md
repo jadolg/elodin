@@ -30,10 +30,10 @@ the stall.
 |---|---:|---:|---:|---:|---:|---:|---|---|
 | upstream-fail/blackhole/failover | 100% | 84µs / 797µs | 100% | 1004 / 3164 | 0 | 0 | +8s → +23s | within 1s |
 | upstream-fail/blackhole/round-robin | 100% | 88µs / 712µs | 100% | 505 / 3164 | 0 | 0 | +9s → +24s | within 1s |
-| upstream-fail/blackhole/race | 100% | 91µs / 2.5ms | 100% | 4 / 3164 | 0 | 0 | +8s → +23s | within 1s |
+| upstream-fail/blackhole/race | 100% | 91µs / 2.5ms | 100% | 4 / 3164 | 0 | 0 | +8s → +23s | never lost |
 | upstream-fail/refused/failover | 100% | 94µs / 1.4ms | 100% | 1004 / 3164 | 0 | 0 | +8s → +23s | within 1s |
 | upstream-fail/refused/round-robin | 100% | 79µs / 507µs | 100% | 505 / 3164 | 0 | 0 | +8s → +23s | within 1s |
-| upstream-fail/refused/race | 100% | 90µs / 892µs | 100% | 5 / 3164 | 0 | 0 | +8s → +23s | within 1s |
+| upstream-fail/refused/race | 100% | 90µs / 892µs | 100% | 5 / 3164 | 0 | 0 | +8s → +23s | never lost |
 | upstream-fail/blackhole/only-upstream/stale-off | 7% | 113µs / 4.4ms | 0% | 2449 / 3164 | 0 | 0 | +8s → +19s | within 1s |
 | upstream-fail/blackhole/only-upstream/stale-on | 100% | 61µs / 725µs | 0% | 2000 / 3164 | 0 | 696 | +8s → +19s | within 1s |
 | upstream-fail/refused/only-upstream/stale-off | 7% | 54µs / 101µs | 0% | 2444 / 3164 | 0 | 0 | +8s → +19s | within 1s |

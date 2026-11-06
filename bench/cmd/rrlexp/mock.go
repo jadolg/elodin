@@ -5,8 +5,10 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"elodin.bench/internal/dnswire"
@@ -33,8 +35,9 @@ type mock struct {
 	mu sync.Mutex
 	pc *net.UDPConn
 	ln net.Listener
-	// Holds the UDP port while `mockRefused`; see `fail`.
+	// Hold the port while `mockRefused`; see `fail`.
 	hold       *net.UDPConn
+	tcpHold    *os.File
 	addr       string
 	delay      time.Duration
 	records    int
@@ -94,7 +97,8 @@ from: a datagram from anywhere else matches no socket, so the kernel still
 answers it with port unreachable, but no other socket can take the port in the
 meantime. Without it the forwarder's own per-exchange sockets, a thousand or
 more of them held by the outage, bind random ports and one landing on this one
-makes `restore` fail.
+makes `restore` fail. The TCP port is held the same way by `holdTCP`, against
+any outbound connection on the machine taking it as its local port.
 */
 func (m *mock) fail(mode int32) error {
 	m.mode.Store(mode)
@@ -112,7 +116,37 @@ func (m *mock) fail(mode int32) error {
 	m.mu.Lock()
 	m.hold = hold
 	m.mu.Unlock()
+	tcpHold, err := holdTCP(m.addr)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.tcpHold = tcpHold
+	m.mu.Unlock()
 	return nil
+}
+
+/*
+holdTCP binds `addr` without listening on it: a connection to it meets no
+listener and is reset, and no outbound connection can take the port as its local
+one. SO_REUSEADDR, as the listener had, so a connection that listener accepted
+and that still shares the port does not refuse the bind.
+*/
+func holdTCP(addr string) (*os.File, error) {
+	ap := netip.MustParseAddrPort(addr)
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+	if err == nil {
+		err = syscall.Bind(fd, &syscall.SockaddrInet4{Port: int(ap.Port()), Addr: ap.Addr().As4()})
+	}
+	if err != nil {
+		syscall.Close(fd)
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), "tcp hold"), nil
 }
 
 // restore is up before the sockets are, so the first datagram the new ones read
@@ -124,10 +158,7 @@ func (m *mock) restore() error {
 		return nil
 	}
 	m.mu.Lock()
-	if m.hold != nil {
-		m.hold.Close()
-		m.hold = nil
-	}
+	m.releaseHolds()
 	m.mu.Unlock()
 	return m.listen()
 }
@@ -137,8 +168,18 @@ func (m *mock) closeSockets() {
 	defer m.mu.Unlock()
 	m.pc.Close()
 	m.ln.Close()
+	m.releaseHolds()
+}
+
+// releaseHolds gives up the ports `fail` held. Called with `mu` held.
+func (m *mock) releaseHolds() {
 	if m.hold != nil {
 		m.hold.Close()
+		m.hold = nil
+	}
+	if m.tcpHold != nil {
+		m.tcpHold.Close()
+		m.tcpHold = nil
 	}
 }
 

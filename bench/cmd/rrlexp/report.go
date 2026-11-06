@@ -211,7 +211,9 @@ func floodTable(b *strings.Builder, rows []row) {
 	for _, r := range rows {
 		// Handshake floods send no queries at all, so every column here would
 		// be a zero standing where a rate belongs. `handshakeTable` is theirs.
-		if r.attacker == nil || r.arm.attacker.handshake {
+		// The upstream-fail arms' miss stream is not a flood; `upstreamTable`
+		// is theirs.
+		if r.attacker == nil || r.arm.attacker.handshake || r.arm.fail != nil {
 			continue
 		}
 		secs := r.elapsed.Seconds()
@@ -239,7 +241,7 @@ func floodTable(b *strings.Builder, rows []row) {
 // every flood but the handshake ones.
 func hasQueryFlood(rows []row) bool {
 	for _, r := range rows {
-		if r.attacker != nil && !r.arm.attacker.handshake {
+		if r.attacker != nil && !r.arm.attacker.handshake && r.arm.fail == nil {
 			return true
 		}
 	}

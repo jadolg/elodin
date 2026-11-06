@@ -1196,7 +1196,7 @@ func bindHint(addr string) string {
 }
 
 // armDuration is how long the arm's measured window is: `-duration`, or the
-// arm's own length where it has one. Only the soak arm has one.
+// arm's own length where it has one (the soak and `upstream-fail` arms).
 func armDuration(a arm) time.Duration {
 	if a.dur > 0 {
 		return a.dur

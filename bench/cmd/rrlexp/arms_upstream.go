@@ -315,8 +315,10 @@ func parked(r row) string {
 
 // recovered is how long after the upstream returned the misses were answered
 // again: the first window after `upAt` from which every window answered 95%.
+// "never lost" when no window of the outage fell below that, as under `race`.
 func recovered(r row) string {
 	var at time.Duration
+	lost := false
 	prev := r.samples[0]
 	for _, s := range r.samples[1:] {
 		if !s.ok {
@@ -324,6 +326,9 @@ func recovered(r row) string {
 		}
 		mo, mf := s.attackerOffered-prev.attackerOffered, s.attackerFull-prev.attackerFull
 		healthy := mo > 0 && float64(mf) >= 0.95*float64(mo)
+		if !healthy && prev.at >= r.downAt-200*time.Millisecond && prev.at < r.upAt-200*time.Millisecond {
+			lost = true
+		}
 		switch {
 		case prev.at < r.upAt-200*time.Millisecond:
 		case healthy && at == 0:
@@ -333,7 +338,10 @@ func recovered(r row) string {
 		}
 		prev = s
 	}
-	if at == 0 {
+	switch {
+	case !lost:
+		return "never lost"
+	case at == 0:
 		return "not within the arm"
 	}
 	return fmt.Sprintf("within %s", (at - r.upAt).Round(time.Second))
