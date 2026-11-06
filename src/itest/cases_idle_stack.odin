@@ -134,9 +134,15 @@ blocking: {{ enabled: false }}
 	// Answered locally, so the query runs the whole answer path with no upstream.
 	query := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
 	for transport in Idle_Transport {
-		rest_before, _, rest_ok := fiber_stacks(pid, bound_kib, rest = true)
-		if !check(r, rest_ok, "cannot read the server's smaps") {
-			return
+		// Only TCP's is read: a TLS connection holds OpenSSL's objects, tens of
+		// kilobytes of them.
+		rest_before := 0
+		if transport == .TCP {
+			rest_ok: bool
+			rest_before, _, rest_ok = fiber_stacks(pid, bound_kib, rest = true)
+			if !check(r, rest_ok, "cannot read the server's smaps") {
+				return
+			}
 		}
 		conns := make([dynamic]Test_Conn, 0, IDLE_HELD, context.temp_allocator)
 		defer for &c in conns {
@@ -187,11 +193,20 @@ blocking: {{ enabled: false }}
 			IDLE_HELD,
 		)
 		if transport != .TCP {
-			// A TLS connection holds OpenSSL's objects, tens of kilobytes of them.
 			continue
 		}
-		rest, _, _ := fiber_stacks(pid, bound_kib, rest = true)
+		// Polled as the stacks are: the loop above stops with up to `IDLE_WARM`
+		// connections not yet trimmed, and each of those still has its scratch.
+		rest, _, rok := fiber_stacks(pid, bound_kib, rest = true)
 		per := (rest - rest_before) * 1024 / IDLE_HELD
+		for start := time.tick_now(); rok && per > IDLE_REST_BYTES && time.tick_since(start) < 5 * time.Second; {
+			time.sleep(100 * time.Millisecond)
+			rest, _, rok = fiber_stacks(pid, bound_kib, rest = true)
+			per = (rest - rest_before) * 1024 / IDLE_HELD
+		}
+		if !check(r, rok, "cannot read the server's smaps") {
+			return
+		}
 		check(
 			r,
 			per <= IDLE_REST_BYTES,

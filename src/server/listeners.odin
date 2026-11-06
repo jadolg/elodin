@@ -2324,8 +2324,8 @@ conn_read_budgeted :: proc(c: Conn, buf: []u8, b: ^Read_Budget) -> (n: int, ok: 
 	/*
 	No deadline yet is a connection between messages, waiting for as long as the
 	client cares to keep it open. Parked there for `loop.IDLE_TRIM_AFTER`, the
-	fiber hands back the stack its last query touched (#596), and its scratch,
-	which `serve_dns_stream` has freed by then (#613). A budget with no idle
+	fiber hands back the stack its last query touched (#596), and its scratch
+	if the transport's read loop has freed it (#613). A budget with no idle
 	wait never starts a deadline, so there every read counts, the reads inside a
 	message included: a trim there costs only refaults if that read lasts
 	`loop.IDLE_TRIM_AFTER`, and a message held in the scratch keeps it mapped.
