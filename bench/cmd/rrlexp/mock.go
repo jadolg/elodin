@@ -30,9 +30,11 @@ const (
 )
 
 type mock struct {
-	mu         sync.Mutex
-	pc         *net.UDPConn
-	ln         net.Listener
+	mu sync.Mutex
+	pc *net.UDPConn
+	ln net.Listener
+	// Holds the UDP port while `mockRefused`; see `fail`.
+	hold       *net.UDPConn
 	addr       string
 	delay      time.Duration
 	records    int
@@ -84,22 +86,45 @@ func (m *mock) listen() error {
 	return nil
 }
 
-// fail puts the mock into `mode`; `restore` takes it back out.
+/*
+fail puts the mock into `mode`; `restore` takes it back out.
+
+`mockRefused` keeps the UDP port with a socket connected to a peer nobody sends
+from: a datagram from anywhere else matches no socket, so the kernel still
+answers it with port unreachable, but no other socket can take the port in the
+meantime. Without it the forwarder's own per-exchange sockets, a thousand or
+more of them held by the outage, bind random ports and one landing on this one
+makes `restore` fail.
+*/
 func (m *mock) fail(mode int32) {
 	m.mode.Store(mode)
-	if mode == mockRefused {
-		m.closeSockets()
+	if mode != mockRefused {
+		return
+	}
+	m.closeSockets()
+	hold, err := net.DialUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort(m.addr)), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9})
+	if err == nil {
+		m.mu.Lock()
+		m.hold = hold
+		m.mu.Unlock()
 	}
 }
 
+// restore is up before the sockets are, so the first datagram the new ones read
+// is answered rather than dropped as still failing.
 func (m *mock) restore() error {
-	if m.mode.Load() == mockRefused {
-		if err := m.listen(); err != nil {
-			return err
-		}
-	}
+	refused := m.mode.Load() == mockRefused
 	m.mode.Store(mockUp)
-	return nil
+	if !refused {
+		return nil
+	}
+	m.mu.Lock()
+	if m.hold != nil {
+		m.hold.Close()
+		m.hold = nil
+	}
+	m.mu.Unlock()
+	return m.listen()
 }
 
 func (m *mock) closeSockets() {
@@ -107,6 +132,9 @@ func (m *mock) closeSockets() {
 	defer m.mu.Unlock()
 	m.pc.Close()
 	m.ln.Close()
+	if m.hold != nil {
+		m.hold.Close()
+	}
 }
 
 func (m *mock) serveUDP(pc *net.UDPConn) {
@@ -158,6 +186,9 @@ func (m *mock) serveConn(c net.Conn) {
 		// way the kernel would for a process that exited.
 		switch m.mode.Load() {
 		case mockRefused:
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetLinger(0)
+			}
 			return
 		case mockBlackhole:
 			continue

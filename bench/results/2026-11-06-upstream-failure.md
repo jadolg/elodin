@@ -26,23 +26,22 @@ arrived in it, so misses held 5 s and answered later bring the outage window's
 total back to 100% under the two-upstream strategies. The series below show
 the stall.
 
-| arm | victim answered during | victim p50 / p99 during | misses answered during | peak in flight / max_pending | shed | stale served | `upstream_up` 0 → 1 | misses back |
+| arm | victim answered during | victim answers' p50 / p99 during | misses answered during | peak in flight / max_pending | shed during | stale served during | `upstream_up` 0 → 1 | misses back |
 |---|---:|---:|---:|---:|---:|---:|---|---|
-| upstream-fail/blackhole/failover | 100% | 66µs / 276µs | 100% | 1004 / 3164 | 0 | 0 | +8s → +23s | within 1s |
-| upstream-fail/blackhole/round-robin | 100% | 59µs / 504µs | 100% | 504 / 3164 | 0 | 0 | +9s → +23s | within 1s |
-| upstream-fail/blackhole/race | 100% | 60µs / 1.1ms | 100% | 5 / 3164 | 0 | 0 | +8s → +23s | within 1s |
-| upstream-fail/refused/failover | 100% | 57µs / 774µs | 100% | 1005 / 3164 | 0 | 0 | +8s → +23s | within 1s |
-| upstream-fail/refused/round-robin | 100% | 71µs / 887µs | 100% | 504 / 3164 | 0 | 0 | +9s → +24s | within 1s |
-| upstream-fail/refused/race | 100% | 71µs / 694µs | 100% | 5 / 3164 | 0 | 0 | +8s → +23s | within 1s |
-| upstream-fail/blackhole/only-upstream/stale-off | 7% | 72µs / 4ms | 0% | 2445 / 3164 | 0 | 0 | +8s → +19s | within 1s |
-| upstream-fail/blackhole/only-upstream/stale-on | 100% | 84µs / 672µs | 0% | 1999 / 3164 | 0 | 754 | +8s → +19s | within 1s |
-| upstream-fail/refused/only-upstream/stale-off | 7% | 64µs / 228µs | 0% | 2444 / 3164 | 0 | 0 | +8s → +19s | within 1s |
-| upstream-fail/refused/only-upstream/stale-on | 100% | 74µs / 696µs | 0% | 1999 / 3164 | 0 | 755 | +8s → +19s | within 1s |
-| upstream-fail/blackhole/only-upstream/pending-full | 17% | 83µs / 4.7ms | 0% | 256 / 256 | 3113 | 0 | +8s → +19s | within 1s |
-## What it says
+| upstream-fail/blackhole/failover | 100% | 84µs / 797µs | 100% | 1004 / 3164 | 0 | 0 | +8s → +23s | within 1s |
+| upstream-fail/blackhole/round-robin | 100% | 88µs / 712µs | 100% | 505 / 3164 | 0 | 0 | +9s → +24s | within 1s |
+| upstream-fail/blackhole/race | 100% | 91µs / 2.5ms | 100% | 4 / 3164 | 0 | 0 | +8s → +23s | within 1s |
+| upstream-fail/refused/failover | 100% | 94µs / 1.4ms | 100% | 1004 / 3164 | 0 | 0 | +8s → +23s | within 1s |
+| upstream-fail/refused/round-robin | 100% | 79µs / 507µs | 100% | 505 / 3164 | 0 | 0 | +8s → +23s | within 1s |
+| upstream-fail/refused/race | 100% | 90µs / 892µs | 100% | 5 / 3164 | 0 | 0 | +8s → +23s | within 1s |
+| upstream-fail/blackhole/only-upstream/stale-off | 7% | 113µs / 4.4ms | 0% | 2449 / 3164 | 0 | 0 | +8s → +19s | within 1s |
+| upstream-fail/blackhole/only-upstream/stale-on | 100% | 61µs / 725µs | 0% | 2000 / 3164 | 0 | 696 | +8s → +19s | within 1s |
+| upstream-fail/refused/only-upstream/stale-off | 7% | 54µs / 101µs | 0% | 2444 / 3164 | 0 | 0 | +8s → +19s | within 1s |
+| upstream-fail/refused/only-upstream/stale-on | 100% | 59µs / 1.1ms | 0% | 2001 / 3164 | 0 | 696 | +8s → +19s | within 1s |
+| upstream-fail/blackhole/only-upstream/pending-full | 17% | 83µs / 1.5ms | 0% | 256 / 256 | 3114 | 0 | +8s → +19s | within 1s |
 
-**With two upstreams, cache hits are untouched.** The victim's p99 stays under
-a millisecond in every strategy arm. #255 predicted a stall from a shared worker
+**With two upstreams, cache hits are untouched.** The victim gets 100% in every
+strategy arm, and its p99 stays within 2.5 ms. #255 predicted a stall from a shared worker
 pool, but the event loop (#547) doesn't hold a thread for an upstream round trip,
 so a held miss no longer delays a hit.
 
@@ -50,7 +49,7 @@ so a held miss no longer delays a hit.
 of them.** Until the failing member is parked (+8 s: three consecutive
 failures, each a 5 s timeout), `failover` sends every miss to it first. In
 flight climbs 200 a second to 1004, and nothing is answered for 5 s. Under
-`round-robin` half the misses land on it (peak 504). Under `race` the healthy
+`round-robin` half the misses land on it (peak 505). Under `race` the healthy
 member answers first and in flight never passes 5. When it's back at +18 s,
 the member stays parked until its 10 s cooldown ends at +23 s, which costs
 nothing because the healthy member is there.
@@ -65,7 +64,7 @@ stale off it got 7% during the outage, then SERVFAIL after the full budget.
 With it on it got 100%, answered stale at the 1.8 s `stale_timeout`, and p99
 stayed under a millisecond. Misses get nothing either way, and parking the only
 member frees nothing: it's still asked, so each miss holds a slot for
-`timeout × attempts` = 10 s and in flight peaks at 2445.
+`timeout × attempts` = 10 s and in flight peaks at 2449.
 
 **Once held misses fill `max_pending`, cache hits are shed with them.** The
 `pending-full` arm pins `max_pending` to 256 with fresh victim answers. From +5 s,
@@ -76,7 +75,7 @@ total stall #255 described, with `max_pending` in place of the worker pool. On a
 blackholed only upstream fills. Filed as #623.
 
 **Recovery is immediate.** Misses are answered again in the first second after
-the upstream returns. A stale-off victim is back within 2 s, the time its
+the upstream returns. A stale-off victim is fully back within 3 s, the time its
 coalesced query takes to give up.
 
 ## The series
@@ -88,73 +87,73 @@ prints every second.
 
 | at | failing up | steady up | in flight | shed/s | stale/s | victim answered | victim p50 | victim p99 | misses answered |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 3s | 1 | 1 | 5 | 0 | 0 | 100% | 41µs | 533µs | 100% |
-| 4s | 1 | 1 | 205 | 0 | 0 | 100% | 70µs | 173µs | 0% |
-| 5s | 1 | 1 | 405 | 0 | 0 | 100% | 62µs | 144µs | 0% |
-| 6s | 1 | 1 | 605 | 0 | 0 | 100% | 51µs | 151µs | 0% |
-| 9s | 0 | 1 | 806 | 0 | 0 | 100% | 42µs | 1.1ms | 199% |
-| 11s | 0 | 1 | 406 | 0 | 0 | 100% | 68µs | 193µs | 200% |
-| 12s | 0 | 1 | 207 | 0 | 0 | 100% | 82µs | 143µs | 200% |
-| 13s | 0 | 1 | 6 | 0 | 0 | 100% | 73µs | 163µs | 200% |
-| 17s | 0 | 1 | 4 | 0 | 0 | 100% | 78µs | 203µs | 100% |
-| 18s | 0 | 1 | 4 | 0 | 0 | 100% | 72µs | 202µs | 100% |
-| 19s | 0 | 1 | 4 | 0 | 0 | 100% | 86µs | 1.4ms | 100% |
-| 20s | 0 | 1 | 4 | 0 | 0 | 100% | 83µs | 190µs | 100% |
-| 21s | 0 | 1 | 4 | 0 | 0 | 100% | 76µs | 203µs | 100% |
+| 3s | 1 | 1 | 4 | 0 | 0 | 100% | 61µs | 184µs | 100% |
+| 4s | 1 | 1 | 204 | 0 | 0 | 100% | 75µs | 113µs | 0% |
+| 5s | 1 | 1 | 404 | 0 | 0 | 100% | 96µs | 244µs | 0% |
+| 6s | 1 | 1 | 604 | 0 | 0 | 100% | 94µs | 651µs | 0% |
+| 9s | 0 | 1 | 806 | 0 | 0 | 100% | 64µs | 267µs | 199% |
+| 11s | 0 | 1 | 406 | 0 | 0 | 100% | 62µs | 284µs | 200% |
+| 12s | 0 | 1 | 206 | 0 | 0 | 100% | 87µs | 189µs | 200% |
+| 13s | 0 | 1 | 6 | 0 | 0 | 100% | 90µs | 235µs | 200% |
+| 17s | 0 | 1 | 4 | 0 | 0 | 100% | 104µs | 242µs | 100% |
+| 18s | 0 | 1 | 4 | 0 | 0 | 100% | 101µs | 282µs | 100% |
+| 19s | 0 | 1 | 4 | 0 | 0 | 100% | 113µs | 322µs | 100% |
+| 20s | 0 | 1 | 4 | 0 | 0 | 100% | 101µs | 1.9ms | 100% |
+| 21s | 0 | 1 | 4 | 0 | 0 | 100% | 103µs | 253µs | 100% |
 
 ### upstream-fail/blackhole/round-robin — down at +3s, back at +18s
 
 | at | failing up | steady up | in flight | shed/s | stale/s | victim answered | victim p50 | victim p99 | misses answered |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 3s | 1 | 1 | 4 | 0 | 0 | 100% | 37µs | 88µs | 100% |
-| 4s | 1 | 1 | 104 | 0 | 0 | 100% | 39µs | 118µs | 50% |
-| 5s | 1 | 1 | 204 | 0 | 0 | 100% | 52µs | 82µs | 50% |
-| 6s | 1 | 1 | 304 | 0 | 0 | 100% | 44µs | 265µs | 50% |
-| 9s | 0 | 1 | 406 | 0 | 0 | 100% | 40µs | 88µs | 149% |
-| 11s | 0 | 1 | 206 | 0 | 0 | 100% | 73µs | 130µs | 150% |
-| 12s | 0 | 1 | 106 | 0 | 0 | 100% | 81µs | 1.3ms | 150% |
-| 13s | 0 | 1 | 6 | 0 | 0 | 100% | 71µs | 565µs | 150% |
-| 17s | 0 | 1 | 4 | 0 | 0 | 100% | 78µs | 171µs | 100% |
-| 18s | 0 | 1 | 4 | 0 | 0 | 100% | 82µs | 139µs | 100% |
-| 19s | 0 | 1 | 4 | 0 | 0 | 100% | 72µs | 119µs | 100% |
-| 20s | 0 | 1 | 4 | 0 | 0 | 100% | 67µs | 112µs | 100% |
-| 21s | 0 | 1 | 4 | 0 | 0 | 100% | 72µs | 140µs | 100% |
+| 3s | 1 | 1 | 4 | 0 | 0 | 100% | 65µs | 281µs | 100% |
+| 4s | 1 | 1 | 104 | 0 | 0 | 100% | 87µs | 659µs | 50% |
+| 5s | 1 | 1 | 204 | 0 | 0 | 100% | 89µs | 634µs | 50% |
+| 6s | 1 | 1 | 304 | 0 | 0 | 100% | 85µs | 171µs | 50% |
+| 9s | 0 | 1 | 407 | 0 | 0 | 100% | 59µs | 620µs | 148% |
+| 11s | 0 | 1 | 207 | 0 | 0 | 100% | 60µs | 712µs | 150% |
+| 12s | 0 | 1 | 107 | 0 | 0 | 100% | 99µs | 522µs | 150% |
+| 13s | 0 | 1 | 7 | 0 | 0 | 100% | 93µs | 213µs | 150% |
+| 17s | 0 | 1 | 4 | 0 | 0 | 100% | 91µs | 177µs | 100% |
+| 18s | 0 | 1 | 4 | 0 | 0 | 100% | 104µs | 173µs | 100% |
+| 19s | 0 | 1 | 4 | 0 | 0 | 100% | 93µs | 181µs | 100% |
+| 20s | 0 | 1 | 4 | 0 | 0 | 100% | 88µs | 195µs | 100% |
+| 21s | 0 | 1 | 4 | 0 | 0 | 100% | 82µs | 188µs | 100% |
 
 ### upstream-fail/blackhole/only-upstream/stale-off — down at +3s, back at +18s
 
 | at | failing up | steady up | in flight | shed/s | stale/s | victim answered | victim p50 | victim p99 | misses answered |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 3s | 1 | — | 4 | 0 | 0 | 100% | 43µs | 811µs | 100% |
-| 4s | 1 | — | 204 | 0 | 0 | 100% | 71µs | 4ms | 0% |
-| 5s | 1 | — | 451 | 0 | 0 | 6% | 74µs | 74µs | 0% |
-| 6s | 1 | — | 701 | 0 | 0 | 0% | 0s | 0s | 0% |
-| 9s | 0 | — | 1451 | 0 | 0 | 0% | 0s | 0s | 0% |
-| 11s | 0 | — | 1951 | 0 | 0 | 0% | 0s | 0s | 0% |
-| 12s | 0 | — | 2201 | 0 | 0 | 0% | 0s | 0s | 0% |
-| 13s | 0 | — | 2445 | 0 | 0 | 0% | 0s | 0s | 0% |
-| 17s | 0 | — | 1344 | 0 | 0 | 0% | 0s | 0s | 0% |
-| 18s | 0 | — | 1196 | 0 | 0 | 0% | 0s | 0s | 0% |
-| 19s | 1 | — | 1072 | 0 | 0 | 0% | 0s | 0s | 98% |
-| 20s | 1 | — | 603 | 0 | 0 | 92% | 111µs | 1.4ms | 100% |
-| 21s | 1 | — | 403 | 0 | 0 | 100% | 97µs | 200µs | 100% |
+| 3s | 1 | — | 4 | 0 | 0 | 100% | 59µs | 1.2ms | 100% |
+| 4s | 1 | — | 226 | 0 | 0 | 73% | 113µs | 4.4ms | 0% |
+| 5s | 1 | — | 455 | 0 | 0 | 0% | — | — | 0% |
+| 6s | 1 | — | 705 | 0 | 0 | 0% | — | — | 0% |
+| 9s | 0 | — | 1455 | 0 | 0 | 0% | — | — | 0% |
+| 11s | 0 | — | 1955 | 0 | 0 | 0% | — | — | 0% |
+| 12s | 0 | — | 2205 | 0 | 0 | 0% | — | — | 0% |
+| 13s | 0 | — | 2449 | 0 | 0 | 0% | — | — | 0% |
+| 17s | 0 | — | 1329 | 0 | 0 | 0% | — | — | 0% |
+| 18s | 0 | — | 1181 | 0 | 0 | 0% | — | — | 0% |
+| 19s | 1 | — | 1035 | 0 | 0 | 0% | — | — | 98% |
+| 20s | 1 | — | 604 | 0 | 0 | 60% | 68µs | 135µs | 100% |
+| 21s | 1 | — | 404 | 0 | 0 | 100% | 41µs | 333µs | 100% |
 
 ### upstream-fail/blackhole/only-upstream/pending-full — down at +3s, back at +18s
 
 | at | failing up | steady up | in flight | shed/s | stale/s | victim answered | victim p50 | victim p99 | misses answered |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 3s | 1 | — | 4 | 0 | 0 | 100% | 52µs | 1.7ms | 100% |
-| 4s | 1 | — | 204 | 0 | 0 | 100% | 81µs | 402µs | 0% |
-| 5s | 1 | — | 256 | 185 | 0 | 26% | 68µs | 280µs | 0% |
-| 6s | 1 | — | 256 | 250 | 0 | 0% | 0s | 0s | 0% |
-| 9s | 0 | — | 256 | 250 | 0 | 0% | 0s | 0s | 0% |
-| 11s | 0 | — | 256 | 250 | 0 | 0% | 0s | 0s | 0% |
-| 12s | 0 | — | 256 | 250 | 0 | 0% | 0s | 0s | 0% |
-| 13s | 0 | — | 255 | 245 | 0 | 4% | 1.4ms | 1.4ms | 0% |
-| 17s | 0 | — | 256 | 250 | 0 | 0% | 0s | 0s | 0% |
-| 18s | 0 | — | 255 | 248 | 0 | 2% | 61µs | 61µs | 0% |
-| 19s | 1 | — | 62 | 0 | 0 | 100% | 90µs | 175µs | 98% |
-| 20s | 1 | — | 5 | 0 | 0 | 100% | 78µs | 154µs | 100% |
-| 21s | 1 | — | 5 | 0 | 0 | 100% | 72µs | 153µs | 100% |
+| 3s | 1 | — | 5 | 0 | 0 | 100% | 72µs | 110µs | 100% |
+| 4s | 1 | — | 205 | 0 | 0 | 100% | 73µs | 1.1ms | 0% |
+| 5s | 1 | — | 256 | 187 | 0 | 24% | 96µs | 660µs | 0% |
+| 6s | 1 | — | 256 | 250 | 0 | 0% | — | — | 0% |
+| 9s | 0 | — | 256 | 250 | 0 | 0% | — | — | 0% |
+| 11s | 0 | — | 256 | 250 | 0 | 0% | — | — | 0% |
+| 12s | 0 | — | 256 | 250 | 0 | 0% | — | — | 0% |
+| 13s | 0 | — | 255 | 245 | 0 | 2% | 70µs | 70µs | 0% |
+| 17s | 0 | — | 256 | 250 | 0 | 0% | — | — | 0% |
+| 18s | 0 | — | 254 | 247 | 0 | 2% | 49µs | 49µs | 0% |
+| 19s | 1 | — | 61 | 0 | 0 | 100% | 71µs | 131µs | 98% |
+| 20s | 1 | — | 6 | 0 | 0 | 100% | 75µs | 133µs | 100% |
+| 21s | 1 | — | 6 | 0 | 0 | 100% | 80µs | 140µs | 100% |
 
 ## What it settles in #255
 

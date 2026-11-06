@@ -191,7 +191,7 @@ time. `cmd/rrlexp/main.go` opens with what each group of arms claims.
 ```sh
 mise run release
 cd bench
-go run ./cmd/rrlexp -out results/$(date +%F)-rate-limit.md    # about six minutes
+go run ./cmd/rrlexp -out results/$(date +%F)-rate-limit.md    # about eleven minutes
 go run ./cmd/rrlexp -only handshake-flood                     # one group
 ```
 

@@ -19,6 +19,7 @@ func renderReport(rows []row, skips []skip) string {
 		b.WriteString("\n")
 		victimTable(&b, rows)
 		serverTable(&b, rows)
+		questionList(&b, rows)
 		skipList(&b, skips)
 		return b.String()
 	}
@@ -44,12 +45,16 @@ func renderReport(rows []row, skips []skip) string {
 	upstreamTable(&b, rows)
 	serverTable(&b, rows)
 
-	b.WriteString("\n## What each arm was asking\n\n")
-	for _, r := range rows {
-		fmt.Fprintf(&b, "- **%s** — %s\n", r.arm.name, r.arm.question)
-	}
+	questionList(&b, rows)
 	skipList(&b, skips)
 	return b.String()
+}
+
+func questionList(b *strings.Builder, rows []row) {
+	b.WriteString("\n## What each arm was asking\n\n")
+	for _, r := range rows {
+		fmt.Fprintf(b, "- **%s** — %s\n", r.arm.name, r.arm.question)
+	}
 }
 
 // onlyFail is a run of `-only upstream-fail`, whose report is about upstreams

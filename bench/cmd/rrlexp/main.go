@@ -188,9 +188,10 @@ type arm struct {
 	/*
 		How long the arm runs, and how often the server is read while it does.
 
-		Both zero outside the soak arm: `-duration` and no sampling, which is
-		what an arm whose result is a single row wants. The soak arm is the one
-		whose result is a series - see `soakArms`.
+		Both zero outside the soak and `upstream-fail` arms: `-duration` and no
+		sampling, which is what an arm whose result is a single row wants. Those
+		are the ones whose result is a series - see `soakArms` and
+		`upstreamFailArms`.
 	*/
 	dur    time.Duration
 	sample time.Duration
@@ -1331,10 +1332,13 @@ func runArm(bin, dir, upstream string, a arm) (row, error) {
 		stopAttack()
 	}
 	soaking()
-	if o != nil {
-		r.downAt, r.upAt = o.wait()
-	}
 	sampler.Stop()
+	if o != nil {
+		var err error
+		if r.downAt, r.upAt, err = o.wait(); err != nil {
+			return row{}, err
+		}
+	}
 	r.cpu = sampler.CPUUsed()
 	r.peakRSS = sampler.PeakRSS
 

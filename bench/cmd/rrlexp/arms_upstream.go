@@ -121,6 +121,7 @@ type outage struct {
 	done    chan struct{}
 	// From the start of the measured window; written before `done` closes.
 	downAt, upAt time.Duration
+	err          error
 }
 
 func startOutage(f failSpec) (*outage, error) {
@@ -156,15 +157,17 @@ func (o *outage) schedule(start time.Time) {
 		o.downAt = time.Since(start)
 		time.Sleep(time.Until(start.Add(failBefore + failFor)))
 		if err := o.failing.restore(); err != nil {
-			fatal(fmt.Errorf("the failing upstream could not come back: %w", err))
+			// Returned by `wait` rather than fatal here, so the arm's server is
+			// stopped on the way out instead of orphaned by an exit.
+			o.err = fmt.Errorf("the failing upstream could not come back: %w", err)
 		}
 		o.upAt = time.Since(start)
 	}()
 }
 
-func (o *outage) wait() (time.Duration, time.Duration) {
+func (o *outage) wait() (time.Duration, time.Duration, error) {
 	<-o.done
-	return o.downAt, o.upAt
+	return o.downAt, o.upAt, o.err
 }
 
 func (o *outage) stop() {
@@ -196,7 +199,7 @@ func upstreamTable(b *strings.Builder, rows []row) {
 	b.WriteString("\n## Upstream failure: what clients see while one goes away\n\n")
 	fmt.Fprintf(b, "The first upstream fails %s into the window and returns %s later. The victim asks one cached name at %d q/s; the misses are %d q/s of new names.\n\n",
 		failBefore, failFor, *victimRate, failMissRate)
-	b.WriteString("| arm | victim answered during | victim p50 / p99 during | misses answered during | peak in flight / max_pending | shed | stale served | `upstream_up` 0 → 1 | misses back |\n")
+	b.WriteString("| arm | victim answered during | victim answers' p50 / p99 during | misses answered during | peak in flight / max_pending | shed during | stale served during | `upstream_up` 0 → 1 | misses back |\n")
 	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---|---|\n")
 	for _, r := range fails {
 		failSummary(b, r)
@@ -216,9 +219,10 @@ func failSummary(b *strings.Builder, r row) {
 	}
 	fmt.Fprintf(b, "| %s | %s | %s / %s | %s | %d / %d | %d | %d | %s | %s |\n",
 		r.arm.name, share(vf, vo),
-		round(r.victim.pctOf(from.victimLat, to.victimLat, 0.5)), round(r.victim.pctOf(from.victimLat, to.victimLat, 0.99)),
+		windowPct(r.victim, from, to, 0.5), windowPct(r.victim, from, to, 0.99),
 		share(mf, mo), peak, r.srv["elodin_queries_inflight_max"],
-		r.srv["elodin_queries_dropped_total"], r.srv["elodin_cache_stale_total"],
+		to.srv["elodin_queries_dropped_total"]-from.srv["elodin_queries_dropped_total"],
+		to.srv["elodin_cache_stale_total"]-from.srv["elodin_cache_stale_total"],
 		parked(r), recovered(r))
 }
 
@@ -240,11 +244,22 @@ func failSeries(b *strings.Builder, r row) {
 			float64(s.srv["elodin_queries_dropped_total"]-prev.srv["elodin_queries_dropped_total"])/window,
 			float64(s.srv["elodin_cache_stale_total"]-prev.srv["elodin_cache_stale_total"])/window,
 			share(s.victimFull-prev.victimFull, s.victimOffered-prev.victimOffered),
-			round(r.victim.pctOf(prev.victimLat, s.victimLat, 0.5)),
-			round(r.victim.pctOf(prev.victimLat, s.victimLat, 0.99)),
+			windowPct(r.victim, prev, s, 0.5),
+			windowPct(r.victim, prev, s, 0.99),
 			share(s.attackerFull-prev.attackerFull, s.attackerOffered-prev.attackerOffered))
 		prev = s
 	}
+}
+
+// windowPct is the victim's percentile over the replies answered between two
+// samples, or "—" when none were: a window that answered nothing is not 0s.
+// Only NOERROR replies have a latency (see `record`), so a SERVFAIL after the
+// full upstream budget shows in the answered share, not here.
+func windowPct(st *stats, from, to sample, q float64) string {
+	if to.victimLat <= from.victimLat {
+		return "—"
+	}
+	return round(st.pctOf(from.victimLat, to.victimLat, q)).String()
 }
 
 func share(n, of int64) string {
