@@ -791,9 +791,14 @@ func (h *harness) shedding() (section, error) {
 }
 
 // logDiskNeeded is what loggingCost wants free in the work directory: one
-// logged run at full rate, ~500,000 queries a second for three 12-second
-// repeats at ~220 bytes a query, with headroom.
-const logDiskNeeded = 5 << 30
+// logged run at full rate, ~500,000 queries a second at ~220 bytes a query for
+// -repeat runs of -warmup plus -duration, with half again as headroom. About
+// 6 GB at the defaults.
+// ponytail: the rate is this machine's; a faster one wants more headroom.
+func logDiskNeeded() uint64 {
+	secs := (time.Duration(max(*repeat, 1)) * (*warmup + *duration)).Seconds()
+	return uint64(secs*500_000*220) * 3 / 2
+}
 
 // loggingCost is the throughput `log.queries` costs, which docs/sizing.md warns
 // about because it is also the one thing that writes to disk in steady state.
@@ -806,9 +811,9 @@ func (h *harness) loggingCost() (section, error) {
 	if err := syscall.Statfs(h.dir, &fs); err != nil {
 		return section{}, err
 	}
-	if free := fs.Bavail * uint64(fs.Bsize); free < logDiskNeeded {
+	if free, need := fs.Bavail*uint64(fs.Bsize), logDiskNeeded(); free < need {
 		return section{}, fmt.Errorf("%s has %d MiB free, short of the %d MiB a logged run writes; point -workdir at a larger disk",
-			h.dir, free>>20, logDiskNeeded>>20)
+			h.dir, free>>20, need>>20)
 	}
 	var sb strings.Builder
 	sb.WriteString("| log.queries | throughput | run-to-run spread | cost |\n|---|---|---|---|\n")
@@ -852,11 +857,11 @@ func (h *harness) loggingCost() (section, error) {
 	before := fileSize(s.logPath)
 	r, _, err := h.load(s, loadOpts{transport: "udp", clients: 200, repeat: 1})
 	s.stop()
+	written := fileSize(s.logPath) - before
+	_ = os.Remove(s.logPath)
 	if err != nil {
 		return section{}, err
 	}
-	written := fileSize(s.logPath) - before
-	_ = os.Remove(s.logPath)
 	fmt.Fprintf(&sb, "\nAt %s qps it wrote %.0f MB/s — %.0f bytes per query.\n",
 		thousands(r.QPS), float64(written)/r.Seconds/(1<<20), float64(written)/float64(r.Answered))
 

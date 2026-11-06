@@ -39,6 +39,8 @@ func TestParseRefuses(t *testing.T) {
 		"[Service]\nEnvironment=\n",
 		"[Service]\nEnvironment=A\n",
 		"[Service]\nEnvironment==1\n",
+		"[Service]\nEnvironment=A-B=1\n",
+		"[Service]\nEnvironment=1A=1\n",
 		"[Service]\nEnvironment=A=1 A=2\n",
 		"[Unit]\nEnvironment=A=1\n",
 		"[Service]\nUnsetEnvironment=A\n",
@@ -54,9 +56,9 @@ func TestParseRefuses(t *testing.T) {
 // The unit's assignments come first, and an allocator setting of the caller's
 // own does not reach the server.
 func TestShipped(t *testing.T) {
-	got := Shipped([]string{"MALLOC_MMAP_THRESHOLD_=131072"},
-		[]string{"PATH=/bin", "MALLOC_ARENA_MAX=1", "GLIBC_TUNABLES=glibc.malloc.trim_threshold=1", "LD_PRELOAD=x.so", "HOME=/h"})
-	if want := []string{"MALLOC_MMAP_THRESHOLD_=131072", "PATH=/bin", "HOME=/h"}; !slices.Equal(got, want) {
+	got := Shipped([]string{"MALLOC_MMAP_THRESHOLD_=131072", "TZ=UTC"},
+		[]string{"PATH=/bin", "MALLOC_ARENA_MAX=1", "GLIBC_TUNABLES=glibc.malloc.trim_threshold=1", "LD_PRELOAD=x.so", "TZ=Europe/Berlin", "HOME=/h"})
+	if want := []string{"MALLOC_MMAP_THRESHOLD_=131072", "TZ=UTC", "PATH=/bin", "HOME=/h"}; !slices.Equal(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
 }

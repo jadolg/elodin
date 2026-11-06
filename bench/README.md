@@ -49,7 +49,8 @@ harness owns all of them rather than inheriting them from the machine:
   sets how glibc serves and returns memory) ahead of the harness's own
   environment, less any `MALLOC_`, `GLIBC_TUNABLES` or `LD_PRELOAD` setting.
   The run fails if `/proc/<pid>/environ` lacks them, and the report names them.
-  `cmd/rrlexp` does the same (`-unit`). A unit line other than a plain
+  `cmd/rrlexp` does the same (`-unit`), and `scripts/load-smoke.sh` runs elodin
+  under what `cmd/unitenv` prints. A unit line other than a plain
   `Environment=KEY=VALUE` is refused rather than interpreted.
 - **Its own certificates.** ECDSA P-256 and RSA-2048, generated per run, so the
   handshake comparison is not at the mercy of whatever is in `certs/`.
@@ -180,7 +181,7 @@ That control is how the query-logging result was confirmed rather than assumed.
 | `connections` | resident memory per idle TCP, DoT and DoH/2 connection, at 1,000 to 20,000 held |
 | `inflight` | resident memory per query waiting on a three-second upstream |
 | `latency` | cache-hit latency under a light, steady load |
-| `logging` | what `log.queries` costs and what it writes; refuses to start with under 5 GiB free in `-workdir`, since a logged run writes over 3 GB |
+| `logging` | what `log.queries` costs and what it writes; refuses to start without room in `-workdir` for what a logged run writes at `-repeat`, `-warmup` and `-duration` (about 6 GB at the defaults) |
 | `compare` | elodin against every server in `-servers` (see above) |
 
 Rows that depend on the server doing a particular thing assert it: the blocked
@@ -271,6 +272,7 @@ of them needs an explanation.
 cmd/bench/      orchestrator: starts everything, runs the matrix, prints markdown
 cmd/loadgen/    one scenario against a running server, reports JSON
 cmd/mockdns/    upstream that answers after a fixed delay
+cmd/unitenv/    prints the environment the shipped unit gives elodin, for the load smoke
 cmd/rrlexp/     the rate-limiting and connection-share experiment: two clients, one server, per arm
 internal/dnswire/   DNS message building and parsing, independent of elodin
 internal/hist/      latency samples and percentiles

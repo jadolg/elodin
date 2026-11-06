@@ -17,10 +17,10 @@ const File = "packaging/elodin.service"
 // Parse returns the KEY=VALUE assignments of the unit's Environment=
 // lines, read with the rules of unit_environment in
 // src/itest/cases_list_memory.odin. Quoting, specifiers, an empty assignment
-// (which resets the list), a field without `=`, a key set twice, an
-// Environment= outside [Service] and any other environment directive
-// (UnsetEnvironment=, EnvironmentFile=, PassEnvironment=) are refused rather
-// than interpreted, so a value this does not read cannot pass as one.
+// (which resets the list), a field without `=` or with a name systemd refuses,
+// a key set twice, an Environment= outside [Service] and any other environment
+// directive (UnsetEnvironment=, EnvironmentFile=, PassEnvironment=) are refused
+// rather than interpreted, so a value this does not read cannot pass as one.
 func Parse(text string) ([]string, error) {
 	var env []string
 	inService := false
@@ -45,7 +45,7 @@ func Parse(text string) ([]string, error) {
 		// systemd splits on ASCII blanks only.
 		for field := range strings.FieldsFuncSeq(value, func(c rune) bool { return c == ' ' || c == '\t' || c == '\r' }) {
 			sep := strings.IndexByte(field, '=')
-			if sep <= 0 {
+			if sep <= 0 || !validName(field[:sep]) {
 				return nil, fmt.Errorf("%s: %q is not an assignment", File, field)
 			}
 			key := field[:sep+1]
@@ -58,18 +58,33 @@ func Parse(text string) ([]string, error) {
 	return env, nil
 }
 
+// validName is an environment variable name systemd takes: a letter or `_`,
+// then letters, digits and `_`. systemd refuses any other, so the process
+// would never see it.
+func validName(key string) bool {
+	for i, c := range key {
+		if c != '_' && !('A' <= c && c <= 'Z') && !('a' <= c && c <= 'z') && (i == 0 || !('0' <= c && c <= '9')) {
+			return false
+		}
+	}
+	return key != ""
+}
+
 // Shipped is what elodin is started with: the unit's assignments
 // first, then this process's environment without any MALLOC_ setting,
 // GLIBC_TUNABLES or LD_PRELOAD (which can replace the allocator), so the
-// allocator is configured by the unit and nothing else. getenv takes the first
-// of a key set twice, and under systemd the unit's value is the one the process
-// sees.
+// allocator is configured by the unit and nothing else. An inherited key the
+// unit also sets is dropped too: os/exec keeps the last of a key set twice, and
+// under systemd the unit's value is the one the process sees.
 func Shipped(unit, inherited []string) []string {
 	env := slices.Clone(unit)
 	for _, kv := range inherited {
-		if !strings.HasPrefix(kv, "MALLOC_") && !strings.HasPrefix(kv, "GLIBC_TUNABLES=") && !strings.HasPrefix(kv, "LD_PRELOAD=") {
-			env = append(env, kv)
+		key, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(kv, "MALLOC_") || strings.HasPrefix(kv, "GLIBC_TUNABLES=") || strings.HasPrefix(kv, "LD_PRELOAD=") ||
+			slices.ContainsFunc(unit, func(set string) bool { return strings.HasPrefix(set, key+"=") }) {
+			continue
 		}
+		env = append(env, kv)
 	}
 	return env
 }

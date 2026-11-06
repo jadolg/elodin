@@ -377,10 +377,11 @@ var (
 func main() {
 	flag.Parse()
 
-	dir, cleanup := scratchDir()
-	defer cleanup()
+	// Before the scratch directory: fatal exits past its deferred removal.
 	bin := resolveBinary()
 	unitEnv = loadUnit()
+	dir, cleanup := scratchDir()
+	defer cleanup()
 
 	mock, err := startMock(*upDelay, *records, 300)
 	if err != nil {

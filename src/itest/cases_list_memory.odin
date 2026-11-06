@@ -48,8 +48,8 @@ MEMORY_RELOADS :: 4
 UNIT_FILE :: "packaging/elodin.service"
 
 // The `KEY=VALUE` assignments of the unit's Environment= lines. Quoting,
-// specifiers, an empty line (which resets the list), an assignment without `=`,
-// a key set twice (where systemd takes the last and getenv the first), an
+// specifiers, an empty line (which resets the list), an assignment without `=`
+// or with a name systemd refuses, a key set twice (where systemd takes the last and getenv the first), an
 // Environment= outside [Service] (which systemd ignores) and any other
 // environment directive (UnsetEnvironment=, EnvironmentFile=, PassEnvironment=)
 // are refused rather than interpreted, so a value this does not read cannot
@@ -88,7 +88,7 @@ unit_environment :: proc(r: ^Runner) -> (env: [dynamic]string, ok: bool) {
 		// splits on \v, \f and Unicode spaces.
 		for field in strings.fields_proc(value, proc(c: rune) -> bool {return c == ' ' || c == '\t' || c == '\r'}, context.temp_allocator) {
 			sep := strings.index_byte(field, '=')
-			if sep <= 0 {
+			if sep <= 0 || !env_name_valid(field[:sep]) {
 				fail(r, "%s: %q is not an assignment", UNIT_FILE, field)
 				return
 			}
@@ -103,6 +103,22 @@ unit_environment :: proc(r: ^Runner) -> (env: [dynamic]string, ok: bool) {
 		}
 	}
 	return env, true
+}
+
+// A name systemd takes for an environment variable: a letter or `_`, then
+// letters, digits and `_`. It refuses any other, so the process never sees it.
+@(private = "file")
+env_name_valid :: proc(name: string) -> bool {
+	for c, i in transmute([]u8)name {
+		switch c {
+		case 'A' ..= 'Z', 'a' ..= 'z', '_':
+		case '0' ..= '9':
+			if i == 0 {return false}
+		case:
+			return false
+		}
+	}
+	return len(name) > 0
 }
 
 /*
