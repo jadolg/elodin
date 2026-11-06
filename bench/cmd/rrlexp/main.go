@@ -52,6 +52,10 @@ resident memory, a cache under eviction, a connection table lending and
 reclaiming - is a shape rather than a final number, and the short arms cannot see
 it at all.
 
+The `upstream-fail` arms have no attacker at all: an upstream stops answering
+mid-run, and the arm reports what a cache-hit victim and a stream of misses got
+through the failure and the recovery. See `arms_upstream.go`.
+
 The load generator builds and parses DNS messages itself (`internal/dnswire`)
 and the upstream is in-process here, for the reason bench/README.md gives: a
 generator sharing the codec under test could agree with a bug in it.
@@ -172,6 +176,8 @@ type arm struct {
 	maxConns      int
 	perPrefix     int
 	clientTimeout time.Duration
+	// `server.max_pending`, or zero for the figure derived from the machine.
+	maxPending int
 	/*
 		What the arm's listeners bind, and so which family its clients are on.
 
@@ -182,9 +188,10 @@ type arm struct {
 	/*
 		How long the arm runs, and how often the server is read while it does.
 
-		Both zero outside the soak arm: `-duration` and no sampling, which is
-		what an arm whose result is a single row wants. The soak arm is the one
-		whose result is a series - see `soakArms`.
+		Both zero outside the soak and `upstream-fail` arms: `-duration` and no
+		sampling, which is what an arm whose result is a single row wants. Those
+		are the ones whose result is a series - see `soakArms` and
+		`upstreamFailArms`.
 	*/
 	dur    time.Duration
 	sample time.Duration
@@ -201,6 +208,9 @@ type arm struct {
 	// `cache.max_entries` for the arm. Zero is the harness's own large figure;
 	// see `armCache`.
 	cacheEntries int
+	// The upstream that stops mid-arm. nil everywhere but the `upstream-fail`
+	// arms; see `upstreamFailArms`.
+	fail *failSpec
 	// nil for the arms that measure a victim with nobody else on the server.
 	attacker *clientSpec
 	victim   clientSpec
@@ -307,13 +317,25 @@ func (s *stats) addLatency(d time.Duration) {
 }
 
 func (s *stats) pct(q float64) time.Duration {
+	return s.pctOf(0, s.latLen(), q)
+}
+
+func (s *stats) latLen() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.lat) == 0 {
+	return len(s.lat)
+}
+
+// pctOf is the percentile of the latencies recorded `from` up to `to`, which is
+// one window's replies in a sampled arm.
+func (s *stats) pctOf(from, to int, q float64) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if to <= from {
 		return 0
 	}
-	sorted := make([]time.Duration, len(s.lat))
-	copy(sorted, s.lat)
+	sorted := make([]time.Duration, to-from)
+	copy(sorted, s.lat[from:to])
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	i := int(q * float64(len(sorted)-1))
 	return sorted[i]
@@ -357,7 +379,7 @@ func main() {
 	defer cleanup()
 	bin := resolveBinary()
 
-	mock, err := startMock(*upDelay, *records)
+	mock, err := startMock(*upDelay, *records, 300)
 	if err != nil {
 		fatal(err)
 	}
@@ -436,6 +458,7 @@ func matrix() []arm {
 	arms = append(arms, handshakeArms()...)
 	arms = append(arms, readerArms()...)
 	arms = append(arms, v6Arms()...)
+	arms = append(arms, upstreamFailArms()...)
 	return arms
 }
 
@@ -1173,7 +1196,7 @@ func bindHint(addr string) string {
 }
 
 // armDuration is how long the arm's measured window is: `-duration`, or the
-// arm's own length where it has one. Only the soak arm has one.
+// arm's own length where it has one (the soak and `upstream-fail` arms).
 func armDuration(a arm) time.Duration {
 	if a.dur > 0 {
 		return a.dur
@@ -1202,9 +1225,12 @@ type row struct {
 	// The server's own counters as of the end of the arm. See `counters`.
 	srv map[string]int64
 	// What the server looked like while the arm was still running. Empty
-	// except in the soak arm, which is the only one long enough for the
-	// difference between a series and an end state to be the point.
+	// except in the soak and `upstream-fail` arms, the ones whose result is a
+	// series rather than an end state.
 	samples []sample
+	// When the failing upstream went and came back, from the start of the
+	// measured window. Zero outside the `upstream-fail` arms.
+	downAt, upAt time.Duration
 }
 
 func (r row) line() string {
@@ -1245,7 +1271,17 @@ func round(d time.Duration) time.Duration {
 }
 
 func runArm(bin, dir, upstream string, a arm) (row, error) {
-	srv, err := startServer(bin, dir, upstream, a)
+	ups := upstreamBlock("failover", 1, []member{{"mock", upstream}})
+	var o *outage
+	if a.fail != nil {
+		var err error
+		if o, err = startOutage(*a.fail); err != nil {
+			return row{}, err
+		}
+		defer o.stop()
+		ups = o.block()
+	}
+	srv, err := startServer(bin, dir, ups, a)
 	if err != nil {
 		return row{}, err
 	}
@@ -1279,9 +1315,12 @@ func runArm(bin, dir, upstream string, a arm) (row, error) {
 		stopAttack = runClient(srv, *a.attacker, dur, "atk", false, r.attacker)
 	}
 	stopVictim := runClient(srv, a.victim, dur, "vic", true, r.victim)
+	if o != nil {
+		o.schedule(start)
+	}
 	// Reads the server while the load is on it, for an arm long enough that
 	// what it looked like at the end is not what it looked like throughout.
-	soaking := startSoakSampler(srv, a, &r)
+	soaking := startSoakSampler(srv, a, &r, start)
 
 	time.Sleep(dur)
 	r.elapsed = time.Since(start)
@@ -1294,6 +1333,12 @@ func runArm(bin, dir, upstream string, a arm) (row, error) {
 	}
 	soaking()
 	sampler.Stop()
+	if o != nil {
+		var err error
+		if r.downAt, r.upAt, err = o.wait(); err != nil {
+			return row{}, err
+		}
+	}
 	r.cpu = sampler.CPUUsed()
 	r.peakRSS = sampler.PeakRSS
 

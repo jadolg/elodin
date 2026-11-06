@@ -11,6 +11,18 @@ import (
 
 func renderReport(rows []row, skips []skip) string {
 	var b strings.Builder
+	if onlyFail(rows) {
+		b.WriteString("# Upstream failure: what clients get\n\n")
+		fmt.Fprintf(&b, "Each arm: one server, two clients at once, %s measured after %s of the miss stream alone, the rate limiter off, a %s upstream round trip, a 400,000-entry cache, and the shipped default for everything else an arm does not name.\n",
+			failArm, *warmup, *upDelay)
+		upstreamTable(&b, rows)
+		b.WriteString("\n")
+		victimTable(&b, rows)
+		serverTable(&b, rows)
+		questionList(&b, rows)
+		skipList(&b, skips)
+		return b.String()
+	}
 	b.WriteString("# Response rate limiting: what a bystander gets\n\n")
 	if *soak > 0 {
 		fmt.Fprintf(&b, "A soak run: the soak arm alone, %s of load after %s of the same, with the server read every %s.\n",
@@ -30,14 +42,30 @@ func renderReport(rows []row, skips []skip) string {
 	connTable(&b, rows)
 	handshakeTable(&b, rows)
 	soakTable(&b, rows)
+	upstreamTable(&b, rows)
 	serverTable(&b, rows)
 
-	b.WriteString("\n## What each arm was asking\n\n")
-	for _, r := range rows {
-		fmt.Fprintf(&b, "- **%s** — %s\n", r.arm.name, r.arm.question)
-	}
+	questionList(&b, rows)
 	skipList(&b, skips)
 	return b.String()
+}
+
+func questionList(b *strings.Builder, rows []row) {
+	b.WriteString("\n## What each arm was asking\n\n")
+	for _, r := range rows {
+		fmt.Fprintf(b, "- **%s** — %s\n", r.arm.name, r.arm.question)
+	}
+}
+
+// onlyFail is a run of `-only upstream-fail`, whose report is about upstreams
+// rather than the rate limiter the rest of the matrix is about.
+func onlyFail(rows []row) bool {
+	for _, r := range rows {
+		if r.arm.fail == nil {
+			return false
+		}
+	}
+	return len(rows) > 0
 }
 
 // skipList names the arms this machine could not run, so a missing section is
@@ -183,7 +211,9 @@ func floodTable(b *strings.Builder, rows []row) {
 	for _, r := range rows {
 		// Handshake floods send no queries at all, so every column here would
 		// be a zero standing where a rate belongs. `handshakeTable` is theirs.
-		if r.attacker == nil || r.arm.attacker.handshake {
+		// The upstream-fail arms' miss stream is not a flood; `upstreamTable`
+		// is theirs.
+		if r.attacker == nil || r.arm.attacker.handshake || r.arm.fail != nil {
 			continue
 		}
 		secs := r.elapsed.Seconds()
@@ -211,7 +241,7 @@ func floodTable(b *strings.Builder, rows []row) {
 // every flood but the handshake ones.
 func hasQueryFlood(rows []row) bool {
 	for _, r := range rows {
-		if r.attacker != nil && !r.arm.attacker.handshake {
+		if r.attacker != nil && !r.arm.attacker.handshake && r.arm.fail == nil {
 			return true
 		}
 	}

@@ -191,11 +191,11 @@ time. `cmd/rrlexp/main.go` opens with what each group of arms claims.
 ```sh
 mise run release
 cd bench
-go run ./cmd/rrlexp -out results/$(date +%F)-rate-limit.md    # about six minutes
+go run ./cmd/rrlexp -out results/$(date +%F)-rate-limit.md    # about twelve minutes
 go run ./cmd/rrlexp -only handshake-flood                     # one group
 ```
 
-Four things a publicly reachable instance meets are arms of their own:
+Five things a publicly reachable instance meets are arms of their own:
 
 | `-only` | what it asks |
 |---|---|
@@ -203,6 +203,7 @@ Four things a publicly reachable instance meets are arms of their own:
 | `handshake-flood` | a client that only handshakes, over DoT and DoH, against a DoT victim, with its own quiet baseline |
 | `v6/` | the prefix-isolation arms over IPv6, where a prefix is a /64 |
 | `-soak 1h` | one flood for an hour, with the server read throughout rather than at the end |
+| `upstream-fail` | an upstream that stops mid-run, blackholed or refused, once per strategy and with `serve_stale` off and on; a cache-hit victim beside a stream of misses, read every second through the failure and the recovery (about six minutes) |
 
 ### IPv6
 

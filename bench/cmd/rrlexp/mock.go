@@ -2,9 +2,14 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"net/netip"
+	"os"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"elodin.bench/internal/dnswire"
@@ -12,20 +17,63 @@ import (
 
 // --------------------------------------------------------- the mock upstream
 
+/*
+What the mock does with a query. Only the `upstream-fail` arms change it.
+
+`mockBlackhole` reads every query and answers none, over both transports, which
+is an upstream behind a firewall that drops: the forwarder learns nothing until
+its own timeout. `mockRefused` closes both sockets, so the kernel answers a
+datagram with port unreachable and a connection with a reset - an upstream whose
+process has gone, which a forwarder can learn in a syscall.
+*/
+const (
+	mockUp int32 = iota
+	mockBlackhole
+	mockRefused
+)
+
 type mock struct {
-	pc         *net.UDPConn
-	ln         net.Listener
+	mu sync.Mutex
+	pc *net.UDPConn
+	ln net.Listener
+	// Hold the port while `mockRefused`; see `fail`.
+	hold       *net.UDPConn
+	tcpHold    *os.File
 	addr       string
 	delay      time.Duration
 	records    int
+	ttl        uint32
 	answerSize int
 	served     atomic.Int64
+	mode       atomic.Int32
 }
 
-func startMock(delay time.Duration, records int) (*mock, error) {
-	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+func startMock(delay time.Duration, records int, ttl uint32) (*mock, error) {
+	m := &mock{delay: delay, records: records, ttl: ttl}
+	// The kernel picks the UDP port and TCP has to take the same one, which an
+	// outbound connection on a busy machine may already hold as its local
+	// port: another port is as good, so another is picked.
+	var err error
+	for range 20 {
+		m.addr = "127.0.0.1:0"
+		if err = m.listen(); !errors.Is(err, syscall.EADDRINUSE) {
+			break
+		}
+	}
 	if err != nil {
 		return nil, err
+	}
+	probe, _ := answer(dnswire.Query(1, "size.rrl.test", dnswire.TypeA, 0), records, ttl)
+	m.answerSize = len(probe)
+	return m, nil
+}
+
+// listen binds both sockets on `m.addr` and serves them, which is how the mock
+// starts and how it comes back from `mockRefused` on the port it had.
+func (m *mock) listen() error {
+	pc, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort(m.addr)))
+	if err != nil {
+		return err
 	}
 	_ = pc.SetReadBuffer(8 << 20)
 	_ = pc.SetWriteBuffer(8 << 20)
@@ -42,24 +90,124 @@ func startMock(delay time.Duration, records int) (*mock, error) {
 	ln, err := net.Listen("tcp", pc.LocalAddr().String())
 	if err != nil {
 		pc.Close()
-		return nil, err
+		return err
 	}
-	m := &mock{pc: pc, ln: ln, addr: pc.LocalAddr().String(), delay: delay, records: records}
-
-	probe, _ := answer(dnswire.Query(1, "size.rrl.test", dnswire.TypeA, 0), records)
-	m.answerSize = len(probe)
-
-	go m.serveTCP()
-	go m.serveUDP()
-	return m, nil
+	m.mu.Lock()
+	m.pc, m.ln, m.addr = pc, ln, pc.LocalAddr().String()
+	m.mu.Unlock()
+	go m.serveTCP(ln)
+	go m.serveUDP(pc)
+	return nil
 }
 
-func (m *mock) serveUDP() {
+/*
+fail puts the mock into `mode`; `restore` takes it back out.
+
+`mockRefused` keeps the UDP port with a socket connected to a peer nobody sends
+from: a datagram from anywhere else matches no socket, so the kernel still
+answers it with port unreachable, but no other socket can take the port in the
+meantime. Without it the forwarder's own per-exchange sockets, a thousand or
+more of them held by the outage, bind random ports and one landing on this one
+makes `restore` fail. The TCP port is held the same way by `holdTCP`, against
+any outbound connection on the machine taking it as its local port.
+*/
+func (m *mock) fail(mode int32) error {
+	m.mode.Store(mode)
+	if mode != mockRefused {
+		return nil
+	}
+	m.closeSockets()
+	// A socket that took the port in the moment between the close and this
+	// bind would read the forwarder's queries itself, which is not a refused
+	// upstream, so the arm stops rather than measures it.
+	hold, err := net.DialUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort(m.addr)), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9})
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.hold = hold
+	m.mu.Unlock()
+	tcpHold, err := holdTCP(m.addr)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.tcpHold = tcpHold
+	m.mu.Unlock()
+	return nil
+}
+
+/*
+holdTCP binds `addr` without listening on it: a connection to it meets no
+listener and is reset, and no outbound connection can take the port as its local
+one. SO_REUSEADDR, as the listener had, so a connection that listener accepted
+and that still shares the port does not refuse the bind.
+*/
+func holdTCP(addr string) (*os.File, error) {
+	ap := netip.MustParseAddrPort(addr)
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+	if err == nil {
+		err = syscall.Bind(fd, &syscall.SockaddrInet4{Port: int(ap.Port()), Addr: ap.Addr().As4()})
+	}
+	if err != nil {
+		syscall.Close(fd)
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), "tcp hold"), nil
+}
+
+// restore is up before the sockets are, so the first datagram the new ones read
+// is answered rather than dropped as still failing.
+func (m *mock) restore() error {
+	refused := m.mode.Load() == mockRefused
+	m.mode.Store(mockUp)
+	if !refused {
+		return nil
+	}
+	m.mu.Lock()
+	m.releaseHolds()
+	m.mu.Unlock()
+	return m.listen()
+}
+
+// closeSockets leaves `ln` nil, so a connection the closed listener accepted is
+// gone to `serveConn` at once rather than only once `restore` replaces it.
+func (m *mock) closeSockets() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pc.Close()
+	if m.ln != nil {
+		m.ln.Close()
+		m.ln = nil
+	}
+	m.releaseHolds()
+}
+
+// releaseHolds gives up the ports `fail` held. Called with `mu` held.
+func (m *mock) releaseHolds() {
+	if m.hold != nil {
+		m.hold.Close()
+		m.hold = nil
+	}
+	if m.tcpHold != nil {
+		m.tcpHold.Close()
+		m.tcpHold = nil
+	}
+}
+
+func (m *mock) serveUDP(pc *net.UDPConn) {
 	buf := make([]byte, 65535)
 	for {
-		n, peer, err := m.pc.ReadFromUDP(buf)
+		n, peer, err := pc.ReadFromUDP(buf)
 		if err != nil {
 			return
+		}
+		if m.mode.Load() != mockUp {
+			continue
 		}
 		q := make([]byte, n)
 		copy(q, buf[:n])
@@ -67,25 +215,26 @@ func (m *mock) serveUDP() {
 		// queue: the upstream is meant to be slow, not serialised.
 		go func(q []byte, peer *net.UDPAddr) {
 			resp, err := m.reply(q)
-			if err != nil {
+			if err != nil || m.mode.Load() != mockUp {
 				return
 			}
-			_, _ = m.pc.WriteToUDP(resp, peer)
+			_, _ = pc.WriteToUDP(resp, peer)
 		}(q, peer)
 	}
 }
 
-func (m *mock) serveTCP() {
+func (m *mock) serveTCP(ln net.Listener) {
 	for {
-		conn, err := m.ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		go m.serveConn(conn)
+		go m.serveConn(conn, ln)
 	}
 }
 
-func (m *mock) serveConn(c net.Conn) {
+// serveConn serves one connection `ln` accepted.
+func (m *mock) serveConn(c net.Conn, ln net.Listener) {
 	defer c.Close()
 	for {
 		var hdr [2]byte
@@ -95,6 +244,22 @@ func (m *mock) serveConn(c net.Conn) {
 		q := make([]byte, binary.BigEndian.Uint16(hdr[:]))
 		if _, err := io.ReadFull(c, q); err != nil {
 			return
+		}
+		// A connection opened before the mock went away is reset with it, the
+		// way the kernel would for a process that exited - including one that
+		// sat idle through the outage and asks again after `restore`, whose
+		// listener is no longer the mock's.
+		m.mu.Lock()
+		gone := ln != m.ln
+		m.mu.Unlock()
+		if gone || m.mode.Load() == mockRefused {
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetLinger(0)
+			}
+			return
+		}
+		if m.mode.Load() == mockBlackhole {
+			continue
 		}
 		resp, err := m.reply(q)
 		if err != nil {
@@ -109,7 +274,7 @@ func (m *mock) serveConn(c net.Conn) {
 // reply is one upstream round trip: the delay, then the answer.
 func (m *mock) reply(query []byte) ([]byte, error) {
 	time.Sleep(m.delay)
-	resp, err := answer(query, m.records)
+	resp, err := answer(query, m.records, m.ttl)
 	if err != nil {
 		return nil, err
 	}
@@ -118,8 +283,7 @@ func (m *mock) reply(query []byte) ([]byte, error) {
 }
 
 func (m *mock) stop() {
-	m.pc.Close()
-	m.ln.Close()
+	m.closeSockets()
 }
 
 /*
@@ -132,8 +296,8 @@ about 1180 bytes, which is what fits under the shipped `max_udp_response` of
 1232 - so the arms measure the largest answer the default configuration will
 send rather than the smallest one a mock could return.
 */
-func answer(query []byte, records int) ([]byte, error) {
-	out, err := dnswire.AnswerA(query, [4]byte{203, 0, 113, 1}, 300)
+func answer(query []byte, records int, ttl uint32) ([]byte, error) {
+	out, err := dnswire.AnswerA(query, [4]byte{203, 0, 113, 1}, ttl)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +305,7 @@ func answer(query []byte, records int) ([]byte, error) {
 		out = append(out, 0xC0, 0x0C)
 		out = binary.BigEndian.AppendUint16(out, dnswire.TypeA)
 		out = binary.BigEndian.AppendUint16(out, dnswire.ClassIN)
-		out = binary.BigEndian.AppendUint32(out, 300)
+		out = binary.BigEndian.AppendUint32(out, ttl)
 		out = binary.BigEndian.AppendUint16(out, 4)
 		out = append(out, 203, 0, 113, byte(1+i%250))
 	}

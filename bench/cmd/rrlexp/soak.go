@@ -50,6 +50,12 @@ type sample struct {
 	victimOffered int64
 	victimFull    int64
 	victimClosed  int64
+	// How many victim latencies had been recorded, so a window's percentiles
+	// are of the replies that arrived in it. And the flood's counters, which
+	// in the `upstream-fail` arms is the miss traffic that needs an upstream.
+	victimLat       int
+	attackerOffered int64
+	attackerFull    int64
 }
 
 /*
@@ -59,14 +65,16 @@ the function that stops it.
 A no-op for every other arm, returned rather than branched on at the call site:
 `runArm` reads better for having one path, and an arm with no sampling interval
 is most of them.
+
+`start` is the measured window's, so a reading's `at` is on the clock the
+`upstream-fail` arms' `downAt` and `upAt` are.
 */
-func startSoakSampler(srv *server, a arm, r *row) func() {
+func startSoakSampler(srv *server, a arm, r *row, start time.Time) func() {
 	if a.sample <= 0 {
 		return func() {}
 	}
 	done := make(chan struct{})
 	stopped := make(chan struct{})
-	start := time.Now()
 
 	/*
 		The first reading is taken now, before any of the measured window has
@@ -106,18 +114,24 @@ takeSample reads the server and both clients at one moment.
 
 Appended by the sampling goroutine alone and read only after it has stopped, so
 the slice needs no lock; the client counters it reads are atomics the clients are
-still writing, which is what makes the reading safe to do while they run.
+still writing, which is what makes the reading safe to do while they run. The
+clients are read before the scrape, which can take a while, so their counts are
+as of `at` like the clock is.
 */
 func takeSample(srv *server, r *row, at time.Duration) sample {
-	got := srv.counters()
 	s := sample{
 		at:            at,
-		ok:            len(got) > 0,
-		srv:           got,
 		victimOffered: r.victim.offered.Load(),
 		victimFull:    r.victim.full.Load(),
 		victimClosed:  r.victim.closed.Load(),
+		victimLat:     r.victim.latLen(),
 	}
+	if r.attacker != nil {
+		s.attackerOffered = r.attacker.offered.Load()
+		s.attackerFull = r.attacker.full.Load()
+	}
+	s.srv = srv.counters()
+	s.ok = len(s.srv) > 0
 	return s
 }
 
@@ -141,7 +155,7 @@ func soakTable(b *strings.Builder, rows []row) {
 	}
 	b.WriteString("\n## The soak: what changed while it ran\n\n")
 	for _, r := range rows {
-		if len(r.samples) < 2 {
+		if len(r.samples) < 2 || r.arm.fail != nil {
 			continue
 		}
 		fmt.Fprintf(b, "### %s — %s, sampled every %s\n\n", r.arm.name, armDuration(r.arm), r.arm.sample)
@@ -249,7 +263,7 @@ func goodSample(samples []sample, last bool) sample {
 // least one window after it, which is the least the table can be read from.
 func hasSamples(rows []row) bool {
 	for _, r := range rows {
-		if len(r.samples) > 1 {
+		if len(r.samples) > 1 && r.arm.fail == nil {
 			return true
 		}
 	}
