@@ -1491,11 +1491,12 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	fifteen bytes, so they cost what the name does and not two `cache.KEY_MAX`
 	of every parked query's stack (#614). One allocation for both.
 
-	An arena with no room for them has none for a SERVFAIL either, so the
-	question fails with no response, counted and logged as `shape_forwarded`
-	counts and logs its own failure. A detached refresh counts and logs nothing:
-	it reports `unanswered`, and the client holding the entry is counted for the
-	answer it gets, as `judge_reply` has it.
+	An arena that cannot give them is out of memory, and a SERVFAIL built in it
+	can trap in the encoder (#620), so the question fails with no response,
+	counted and logged as `shape_forwarded` counts and logs its own failure. A
+	detached refresh counts and logs nothing: it reports `unanswered`, and the
+	client holding the entry is counted for the answer it gets, as `judge_reply`
+	has it.
 	*/
 	size := cache.key_size(st.q.name)
 	keys, _ := make([]u8, 2 * size, st.allocator)
