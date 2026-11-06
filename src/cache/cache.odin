@@ -623,9 +623,16 @@ destroy :: proc(c: ^Cache) {
 	free(c, c.allocator)
 }
 
-// Longest key we build on the stack: a presentation name plus type/class/flags
-// and the policy number.
+// Longest key `make_key` builds: a presentation name plus `KEY_TAIL`.
 KEY_MAX :: 1024 + 16
+// What follows the name in a key: type, class, the three flags and the policy number.
+KEY_TAIL :: 15
+
+// How many bytes `make_key` writes for `name`, so a caller can hand it a buffer
+// of exactly that.
+key_size :: proc(name: string) -> int {
+	return min(len(name), KEY_MAX - KEY_TAIL) + KEY_TAIL
+}
 
 /*
 Build a lookup key for a question.
@@ -673,7 +680,7 @@ make_key :: proc(
 	policy: u64 = 0,
 ) -> string {
 	n := 0
-	limit := len(buf) - 15
+	limit := len(buf) - KEY_TAIL
 	for i in 0 ..< len(name) {
 		if n >= limit {
 			break
@@ -692,7 +699,7 @@ make_key :: proc(
 	for i in 0 ..< 8 {
 		buf[n + 7 + i] = u8(policy >> uint(56 - 8 * i))
 	}
-	return string(buf[:n + 15])
+	return string(buf[:n + KEY_TAIL])
 }
 
 /*
