@@ -3,7 +3,8 @@
 Measured 2026-11-06 with `go run ./cmd/rrlexp -only upstream-fail` against an
 `o:speed` build of `main` at 82a8687, on a 4-core aarch64 Linux VM with 7 GB of
 RAM, which derives `server.max_pending` 3164. The rate limiter is off, the mock
-upstreams answer in 20 ms with 70 A records, and everything else is the shipped
+upstreams answer in 20 ms with 70 A records, the cache holds 400,000 entries
+so the misses never evict, and everything else is the shipped
 default: `upstream.timeout` 5 s, `attempts` 2, `serve_stale` off unless the arm
 says otherwise. Another session's `cmd/bench` run shared the machine, which
 these arms' low rates make little of, but it is where a lone slow p99 comes from.

@@ -174,11 +174,16 @@ func (m *mock) restore() error {
 	return m.listen()
 }
 
+// closeSockets leaves `ln` nil, so a connection the closed listener accepted is
+// gone to `serveConn` at once rather than only once `restore` replaces it.
 func (m *mock) closeSockets() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pc.Close()
-	m.ln.Close()
+	if m.ln != nil {
+		m.ln.Close()
+		m.ln = nil
+	}
 	m.releaseHolds()
 }
 

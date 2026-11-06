@@ -128,7 +128,7 @@ type armServer struct {
 
 // serverConfig is the configuration one arm runs against. The arguments are
 // indexed rather than positional: the listener address is written into four
-// blocks, and a template with seventeen `%s` in it is one a reader has to count.
+// blocks, and a template with eighteen verbs in it is one a reader has to count.
 func serverConfig(a armServer) string {
 	return fmt.Sprintf(configTemplate,
 		*logLevel, *logQueries, a.logPath, *workers, *workers/2, a.connections, a.rateLimit,

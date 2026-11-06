@@ -330,7 +330,13 @@ func recovered(r row) string {
 			continue
 		}
 		mo, mf := s.attackerOffered-prev.attackerOffered, s.attackerFull-prev.attackerFull
-		healthy := mo > 0 && float64(mf) >= 0.95*float64(mo)
+		// A window with nothing offered, as one after the stream has stopped,
+		// says nothing either way and must not undo a recovery.
+		if mo <= 0 {
+			prev = s
+			continue
+		}
+		healthy := float64(mf) >= 0.95*float64(mo)
 		if prev.at >= r.downAt-200*time.Millisecond {
 			switch {
 			case !healthy:

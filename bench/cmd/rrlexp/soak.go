@@ -114,14 +114,13 @@ takeSample reads the server and both clients at one moment.
 
 Appended by the sampling goroutine alone and read only after it has stopped, so
 the slice needs no lock; the client counters it reads are atomics the clients are
-still writing, which is what makes the reading safe to do while they run.
+still writing, which is what makes the reading safe to do while they run. The
+clients are read before the scrape, which can take a while, so their counts are
+as of `at` like the clock is.
 */
 func takeSample(srv *server, r *row, at time.Duration) sample {
-	got := srv.counters()
 	s := sample{
 		at:            at,
-		ok:            len(got) > 0,
-		srv:           got,
 		victimOffered: r.victim.offered.Load(),
 		victimFull:    r.victim.full.Load(),
 		victimClosed:  r.victim.closed.Load(),
@@ -131,6 +130,8 @@ func takeSample(srv *server, r *row, at time.Duration) sample {
 		s.attackerOffered = r.attacker.offered.Load()
 		s.attackerFull = r.attacker.full.Load()
 	}
+	s.srv = srv.counters()
+	s.ok = len(s.srv) > 0
 	return s
 }
 
