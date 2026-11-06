@@ -113,8 +113,9 @@ Landing :: struct {
 
 @(private)
 Flight :: struct {
-	// The leader's own key, which outlives the flight: the leader lands before
-	// its frame goes.
+	// The leader's own key, in its request's arena, which outlives the flight:
+	// the leader lands before `resolve_query` returns, and the arena is dropped
+	// only after the answer is written.
 	key:           string,
 	cond:          loop.Cond,
 	waiters:       int,

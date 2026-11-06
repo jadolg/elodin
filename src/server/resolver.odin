@@ -1093,9 +1093,11 @@ One question on its way through `resolve_query`: the request it came in as,
 what each stage has worked out for the stages after it, and the answer once a
 stage has one.
 
-Lives in `resolve_query`'s frame and is handed down by pointer, which two of its
-fields rely on: `key` is a slice of `key_buf`, and a leader's `own_flight` sits
-in the in-flight table until it lands, both for as long as that frame does.
+Lives in `resolve_query`'s frame and is handed down by pointer, which a leader's
+`own_flight` relies on: it sits in the in-flight table until it lands, for as
+long as that frame does. A query waiting on its upstream holds this frame for
+the whole wait, so nothing in here is sized for the worst case: the cache keys
+are the request's, as long as the name (#614).
 */
 @(private)
 Query_State :: struct {
@@ -1128,9 +1130,7 @@ Query_State :: struct {
 
 	// Settled by `answer_from_cache`.
 	validating:       bool,
-	key_buf:          [cache.KEY_MAX]u8,
 	key:              string,
-	verdict_buf:      [cache.KEY_MAX]u8,
 	verdict_key:      string,
 	generation:       u64,
 	stale_hit:        Cached_Answer,
@@ -1485,12 +1485,36 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	// Under this generation's policy number, so an answer judged by rules a
 	// reload has since replaced is never found here; see `Live.policy`.
 	policy := live(st.s).policy
-	st.key = cache.make_key(st.key_buf[:], st.q.name, st.q.type, st.q.class, dns.edns_do(st.msg), st.msg.flags.cd, policy = policy)
+	/*
+	In the request's arena rather than in `Query_State`, whose frame a query
+	waiting on an upstream holds for the whole wait: the keys are the name and
+	fifteen bytes, so they cost what the name does and not two `cache.KEY_MAX`
+	of every parked query's stack (#614). One allocation for both.
+
+	An arena that cannot give them is out of memory, and a SERVFAIL built in it
+	can trap in the encoder (#620), so the question fails with no response,
+	counted and logged as `shape_forwarded` counts and logs its own failure. A
+	detached refresh counts and logs nothing: it reports `unanswered`, and the
+	client holding the entry is counted for the answer it gets, as `judge_reply`
+	has it.
+	*/
+	size := cache.key_size(st.q.name)
+	keys, _ := make([]u8, 2 * size, st.allocator)
+	if len(keys) < 2 * size {
+		if st.refresh {
+			st.unanswered = true
+		} else {
+			count_answer(&st.s.stats.failed)
+			log_query(st.s, st.client, st.proto, st.q, .Failed, "query", st.started)
+		}
+		return answered(st, nil, .Failed, false)
+	}
+	st.key = cache.make_key(keys[:size], st.q.name, st.q.type, st.q.class, dns.edns_do(st.msg), st.msg.flags.cd, policy = policy)
 	// Where a `Bogus` verdict for this question is remembered, if one was
 	// reached. A key of its own so that the memory costs the answer under the
 	// question's own key nothing; see `remember_bogus_verdict`.
 	st.verdict_key = cache.make_key(
-		st.verdict_buf[:],
+		keys[size:],
 		st.q.name,
 		st.q.type,
 		st.q.class,
@@ -1736,9 +1760,14 @@ shape_forwarded :: proc(st: ^Query_State) -> bool {
 	if !built {
 		// The question decoded, so its encoding failing is not a shape a client
 		// can send; failing closed rather than forwarding its bytes as they stand.
-		count_answer(&st.s.stats.failed)
+		// A detached refresh reports `unanswered` instead, as in `judge_reply`.
 		out, ok := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
-		log_query(st.s, st.client, st.proto, st.q, .Failed, "query", st.started)
+		if st.refresh {
+			st.unanswered = true
+		} else {
+			count_answer(&st.s.stats.failed)
+			log_query(st.s, st.client, st.proto, st.q, .Failed, "query", st.started)
+		}
 		return answered(st, out, .Failed, ok)
 	}
 	st.forwarded = wire
