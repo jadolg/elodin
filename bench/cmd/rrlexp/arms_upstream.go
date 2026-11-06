@@ -153,10 +153,12 @@ func (o *outage) schedule(start time.Time) {
 	go func() {
 		defer close(o.done)
 		time.Sleep(time.Until(start.Add(failBefore)))
-		o.failing.fail(o.spec.mode)
+		if err := o.failing.fail(o.spec.mode); err != nil {
+			o.err = fmt.Errorf("the failing upstream could not hold its port: %w", err)
+		}
 		o.downAt = time.Since(start)
 		time.Sleep(time.Until(start.Add(failBefore + failFor)))
-		if err := o.failing.restore(); err != nil {
+		if err := o.failing.restore(); err != nil && o.err == nil {
 			// Returned by `wait` rather than fatal here, so the arm's server is
 			// stopped on the way out instead of orphaned by an exit.
 			o.err = fmt.Errorf("the failing upstream could not come back: %w", err)
@@ -278,14 +280,14 @@ func upGauge(s sample, name string) string {
 }
 
 // sampleAt is the first reading the server answered at or after `t`, allowing
-// for the ticker landing a little early.
+// for the ticker landing a little early, or the last one it answered.
 func sampleAt(samples []sample, t time.Duration) sample {
 	for _, s := range samples {
 		if s.ok && s.at >= t-200*time.Millisecond {
 			return s
 		}
 	}
-	return samples[len(samples)-1]
+	return goodSample(samples, true)
 }
 
 // parked is when the failing upstream's `elodin_upstream_up` went to 0 and when

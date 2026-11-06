@@ -96,18 +96,23 @@ meantime. Without it the forwarder's own per-exchange sockets, a thousand or
 more of them held by the outage, bind random ports and one landing on this one
 makes `restore` fail.
 */
-func (m *mock) fail(mode int32) {
+func (m *mock) fail(mode int32) error {
 	m.mode.Store(mode)
 	if mode != mockRefused {
-		return
+		return nil
 	}
 	m.closeSockets()
+	// A socket that took the port in the moment between the close and this
+	// bind would read the forwarder's queries itself, which is not a refused
+	// upstream, so the arm stops rather than measures it.
 	hold, err := net.DialUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort(m.addr)), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9})
-	if err == nil {
-		m.mu.Lock()
-		m.hold = hold
-		m.mu.Unlock()
+	if err != nil {
+		return err
 	}
+	m.mu.Lock()
+	m.hold = hold
+	m.mu.Unlock()
+	return nil
 }
 
 // restore is up before the sockets are, so the first datagram the new ones read
@@ -167,11 +172,12 @@ func (m *mock) serveTCP(ln net.Listener) {
 		if err != nil {
 			return
 		}
-		go m.serveConn(conn)
+		go m.serveConn(conn, ln)
 	}
 }
 
-func (m *mock) serveConn(c net.Conn) {
+// serveConn serves one connection `ln` accepted.
+func (m *mock) serveConn(c net.Conn, ln net.Listener) {
 	defer c.Close()
 	for {
 		var hdr [2]byte
@@ -183,14 +189,19 @@ func (m *mock) serveConn(c net.Conn) {
 			return
 		}
 		// A connection opened before the mock went away is reset with it, the
-		// way the kernel would for a process that exited.
-		switch m.mode.Load() {
-		case mockRefused:
+		// way the kernel would for a process that exited - including one that
+		// sat idle through the outage and asks again after `restore`, whose
+		// listener is no longer the mock's.
+		m.mu.Lock()
+		gone := ln != m.ln
+		m.mu.Unlock()
+		if gone || m.mode.Load() == mockRefused {
 			if tc, ok := c.(*net.TCPConn); ok {
 				_ = tc.SetLinger(0)
 			}
 			return
-		case mockBlackhole:
+		}
+		if m.mode.Load() == mockBlackhole {
 			continue
 		}
 		resp, err := m.reply(q)

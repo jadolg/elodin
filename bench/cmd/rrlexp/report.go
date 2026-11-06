@@ -13,7 +13,7 @@ func renderReport(rows []row, skips []skip) string {
 	var b strings.Builder
 	if onlyFail(rows) {
 		b.WriteString("# Upstream failure: what clients get\n\n")
-		fmt.Fprintf(&b, "Each arm: one server, two clients at once, %s measured after %s of the same load, the rate limiter off, a %s upstream round trip, and the shipped default for everything an arm does not name.\n",
+		fmt.Fprintf(&b, "Each arm: one server, two clients at once, %s measured after %s of the miss stream alone, the rate limiter off, a %s upstream round trip, and the shipped default for everything an arm does not name.\n",
 			failArm, *warmup, *upDelay)
 		upstreamTable(&b, rows)
 		b.WriteString("\n")
