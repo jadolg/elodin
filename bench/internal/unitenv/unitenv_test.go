@@ -32,11 +32,13 @@ func TestParse(t *testing.T) {
 // A line a backslash continues is part of the directive before it, as it is
 // to systemd, including past a comment between them.
 func TestParseContinuation(t *testing.T) {
-	got, err := Parse("[Service]\nExecStart=/usr/bin/elodin \\\n  Environment=X=1\nExecStartPre=/bin/true \\\n# a comment\n  Environment=Y=1\nEnvironment=A=1\n")
+	got, err := Parse("[Service]\nExecStart=/usr/bin/elodin \\\n  Environment=X=1\nExecStartPre=/bin/true \\\n# a comment\n  Environment=Y=1\nExecStopPost=/bin/true \\\r\nEnvironment=Z=1\nEnvironment=A=1\n" +
+		// Neither of these continues: systemd 259 sets both B and C.
+		"ExecStartPost=/bin/true \\ \nEnvironment=B=1\nExecReload=/bin/true \\\\\nEnvironment=C=1\n")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"A=1"}; !slices.Equal(got, want) {
+	if want := []string{"A=1", "B=1", "C=1"}; !slices.Equal(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
 }

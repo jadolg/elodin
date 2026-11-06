@@ -75,17 +75,17 @@ unit_environment :: proc(r: ^Runner) -> (env: [dynamic]string, ok: bool) {
 		// the backslash, which is refused below.
 		if continued {
 			if !comment {
-				continued = strings.has_suffix(strings.trim_right(line, " \t\r"), `\`)
+				continued = line_continues(line)
 			}
 			continue
 		}
-		continued = !comment && strings.has_suffix(strings.trim_right(line, " \t\r"), `\`)
+		continued = !comment && line_continues(line)
 		if strings.has_prefix(line, "[") {
 			in_service = strings.trim_right(line, " \t\r") == "[Service]"
 			continue
 		}
 		eq := strings.index_byte(line, '=')
-		if eq < 0 || strings.has_prefix(line, "#") || strings.has_prefix(line, ";") {
+		if eq < 0 || comment {
 			continue
 		}
 		directive := strings.trim_right(line[:eq], " \t")
@@ -116,6 +116,15 @@ unit_environment :: proc(r: ^Runner) -> (env: [dynamic]string, ok: bool) {
 		}
 	}
 	return env, true
+}
+
+// Whether systemd joins the next line onto this one: the line ends in a
+// backslash that does not escape another, with nothing after it but the line's
+// \r. A blank after the backslash, or `\\`, ends the directive there.
+@(private = "file")
+line_continues :: proc(line: string) -> bool {
+	trimmed := strings.trim_suffix(line, "\r")
+	return (len(trimmed) - len(strings.trim_right(trimmed, `\`))) % 2 == 1
 }
 
 // A name systemd takes for an environment variable: a letter or `_`, then

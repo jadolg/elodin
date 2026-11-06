@@ -35,17 +35,17 @@ func Parse(text string) ([]string, error) {
 		// the backslash, which is refused below.
 		if continued {
 			if !comment {
-				continued = strings.HasSuffix(strings.TrimRight(line, " \t\r"), `\`)
+				continued = continues(line)
 			}
 			continue
 		}
-		continued = !comment && strings.HasSuffix(strings.TrimRight(line, " \t\r"), `\`)
+		continued = !comment && continues(line)
 		if strings.HasPrefix(line, "[") {
 			inService = strings.TrimRight(line, " \t\r") == "[Service]"
 			continue
 		}
 		directive, value, found := strings.Cut(line, "=")
-		if !found || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+		if !found || comment {
 			continue
 		}
 		directive = strings.TrimRight(directive, " \t")
@@ -69,6 +69,14 @@ func Parse(text string) ([]string, error) {
 		}
 	}
 	return env, nil
+}
+
+// continues is whether systemd joins the next line onto this one: the line ends
+// in a backslash that does not escape another, with nothing after it but the
+// line's \r. A blank after the backslash, or `\\`, ends the directive there.
+func continues(line string) bool {
+	line = strings.TrimSuffix(line, "\r")
+	return (len(line)-len(strings.TrimRight(line, `\`)))%2 == 1
 }
 
 // validName is an environment variable name systemd takes: a letter or `_`,
