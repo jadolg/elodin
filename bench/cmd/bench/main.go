@@ -26,6 +26,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"elodin.bench/internal/unitenv"
 )
 
 var (
@@ -70,6 +72,11 @@ func main() {
 		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim)
 	}
 
+	unitEnv, err := unitenv.Load(filepath.Join(root, unitenv.File))
+	if err != nil {
+		log.Fatalf("bench: %v", err)
+	}
+
 	dir := *workdir
 	if dir == "" {
 		dir, err = os.MkdirTemp("", "elodin-bench-*")
@@ -82,7 +89,7 @@ func main() {
 	}
 	log.Printf("bench: work dir %s", dir)
 
-	h := &harness{root: root, dir: dir, binary: *binary, competitorDir: *competitorDir, bins: map[string]string{}}
+	h := &harness{root: root, dir: dir, binary: *binary, competitorDir: *competitorDir, bins: map[string]string{}, unitEnv: unitEnv}
 	h.addServers(*servers)
 	if err := h.setup(); err != nil {
 		log.Fatalf("bench: %v", err)
@@ -187,6 +194,9 @@ type harness struct {
 	mockdns  string
 	mocks    []*exec.Cmd
 	mockAddr string
+	// unitEnv is the shipped unit's Environment= assignments, which elodin is
+	// started with: the figures describe the allocator setup that ships.
+	unitEnv []string
 }
 
 func (h *harness) setup() error {
@@ -311,6 +321,11 @@ func describeMachine() string {
 	}
 	return fmt.Sprintf("Measured on %s (%d logical cores%s%s), %s.",
 		model, runtime.NumCPU(), mem, kernel, version)
+}
+
+// environmentNote says what elodin was started with, for the report's header.
+func (h *harness) environmentNote() string {
+	return fmt.Sprintf("elodin was started with %s's environment (%s).", unitenv.File, strings.Join(h.unitEnv, " "))
 }
 
 // serverLabel names a server in a row by the version it reports, so a run

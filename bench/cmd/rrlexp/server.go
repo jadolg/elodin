@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"elodin.bench/internal/dnswire"
+	"elodin.bench/internal/unitenv"
 )
 
 // ----------------------------------------------------------------- the server
@@ -339,6 +340,8 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 		logPath:     logPath,
 	}
 	s.cmd = serverCommand(bin, cfgPath)
+	// As the unit starts it, so a figure describes the allocator that ships.
+	s.cmd.Env = unitenv.Shipped(unitEnv, os.Environ())
 	if err := s.cmd.Start(); err != nil {
 		return nil, err
 	}
@@ -346,6 +349,10 @@ func startServer(bin, dir, upstream string, a arm) (*server, error) {
 	if err := waitReady(s.udpAddr, s.probeSrc, 10*time.Second); err != nil {
 		s.stop()
 		return nil, fmt.Errorf("did not come up: %w", err)
+	}
+	if err := unitenv.Check(s.pid, unitEnv); err != nil {
+		s.stop()
+		return nil, err
 	}
 	return s, nil
 }

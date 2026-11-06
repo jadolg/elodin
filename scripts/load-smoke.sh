@@ -34,7 +34,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> building the load generator and the mock upstream"
-(cd bench && go build -o "$work/loadgen" ./cmd/loadgen && go build -o "$work/mockdns" ./cmd/mockdns)
+(cd bench && go build -o "$work/loadgen" ./cmd/loadgen && go build -o "$work/mockdns" ./cmd/mockdns && go build -o "$work/unitenv" ./cmd/unitenv)
 
 # Newer generators check the certificate the server presents and take it with
 # -ca; older ones skip the check and have no such flag.
@@ -80,9 +80,16 @@ metrics:
   port: $METRICS
 EOF
 
+# The server runs under the shipped unit's environment, since its
+# MALLOC_MMAP_THRESHOLD_ sets how glibc gives memory back: bench/cmd/unitenv
+# reads the unit as the benchmarks do, refusing any line it does not
+# interpret, and prints the whole environment, so nothing else reaches it.
+"$work/unitenv" packaging/elodin.service >"$work/server.env"
+mapfile -d '' -t server_env <"$work/server.env"
+
 "$work/mockdns" -addr "127.0.0.1:$UP" -delay 20ms >"$work/mockdns.log" 2>&1 &
 pids+=($!)
-"$BIN" --config "$work/elodin.yaml" --no-fetch >"$work/stdout" 2>&1 &
+env -i "${server_env[@]}" "$BIN" --config "$work/elodin.yaml" --no-fetch >"$work/stdout" 2>&1 &
 server=$!
 pids+=("$server")
 

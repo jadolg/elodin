@@ -48,12 +48,13 @@ MEMORY_RELOADS :: 4
 UNIT_FILE :: "packaging/elodin.service"
 
 // The `KEY=VALUE` assignments of the unit's Environment= lines. Quoting,
-// specifiers, an empty line (which resets the list), an assignment without `=`,
-// a key set twice (where systemd takes the last and getenv the first), an
-// Environment= outside [Service] (which systemd ignores) and any other
-// environment directive (UnsetEnvironment=, EnvironmentFile=, PassEnvironment=)
-// are refused rather than interpreted, so a value this does not read cannot
-// pass as one.
+// specifiers, an empty line (which resets the list), an assignment without `=`
+// or with a name systemd refuses, a key set twice (where systemd takes the last
+// and getenv the first), an Environment= outside [Service] (which systemd
+// ignores) and any other environment directive (UnsetEnvironment=,
+// EnvironmentFile=, PassEnvironment=) are refused rather than interpreted, so a
+// value this does not read cannot pass as one. Lines a backslash continues
+// belong to the directive before them.
 @(private = "file")
 unit_environment :: proc(r: ^Runner) -> (env: [dynamic]string, ok: bool) {
 	data, err := os.read_entire_file(UNIT_FILE, context.temp_allocator)
@@ -63,16 +64,28 @@ unit_environment :: proc(r: ^Runner) -> (env: [dynamic]string, ok: bool) {
 	}
 	env = make([dynamic]string, context.temp_allocator)
 	text := string(data)
-	in_service := false
+	in_service, continued := false, false
 	for raw in strings.split_lines_iterator(&text) {
 		// systemd strips ASCII blanks around the directive and its `=`.
 		line := strings.trim_left(raw, " \t")
+		comment := strings.has_prefix(line, "#") || strings.has_prefix(line, ";")
+		// A line ending in a backslash goes on into the next, comments between
+		// them aside, so what follows it is part of that directive and not one
+		// of its own. Environment= is never continued: its value would hold
+		// the backslash, which is refused below.
+		if continued {
+			if !comment {
+				continued = line_continues(line)
+			}
+			continue
+		}
+		continued = !comment && line_continues(line)
 		if strings.has_prefix(line, "[") {
 			in_service = strings.trim_right(line, " \t\r") == "[Service]"
 			continue
 		}
 		eq := strings.index_byte(line, '=')
-		if eq < 0 || strings.has_prefix(line, "#") || strings.has_prefix(line, ";") {
+		if eq < 0 || comment {
 			continue
 		}
 		directive := strings.trim_right(line[:eq], " \t")
@@ -88,7 +101,7 @@ unit_environment :: proc(r: ^Runner) -> (env: [dynamic]string, ok: bool) {
 		// splits on \v, \f and Unicode spaces.
 		for field in strings.fields_proc(value, proc(c: rune) -> bool {return c == ' ' || c == '\t' || c == '\r'}, context.temp_allocator) {
 			sep := strings.index_byte(field, '=')
-			if sep <= 0 {
+			if sep <= 0 || !env_name_valid(field[:sep]) {
 				fail(r, "%s: %q is not an assignment", UNIT_FILE, field)
 				return
 			}
@@ -103,6 +116,31 @@ unit_environment :: proc(r: ^Runner) -> (env: [dynamic]string, ok: bool) {
 		}
 	}
 	return env, true
+}
+
+// Whether systemd joins the next line onto this one: the line ends in a
+// backslash that does not escape another, with nothing after it but the line's
+// \r. A blank after the backslash, or `\\`, ends the directive there.
+@(private = "file")
+line_continues :: proc(line: string) -> bool {
+	trimmed := strings.trim_suffix(line, "\r")
+	return (len(trimmed) - len(strings.trim_right(trimmed, `\`))) % 2 == 1
+}
+
+// A name systemd takes for an environment variable: a letter or `_`, then
+// letters, digits and `_`. It refuses any other, so the process never sees it.
+@(private = "file")
+env_name_valid :: proc(name: string) -> bool {
+	for c, i in transmute([]u8)name {
+		switch c {
+		case 'A' ..= 'Z', 'a' ..= 'z', '_':
+		case '0' ..= '9':
+			if i == 0 {return false}
+		case:
+			return false
+		}
+	}
+	return len(name) > 0
 }
 
 /*

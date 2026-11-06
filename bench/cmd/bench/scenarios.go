@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"elodin.bench/internal/procstat"
@@ -202,6 +203,11 @@ func (h *harness) runAll(filter string) (string, error) {
 		{"compare", h.compare},
 	}
 
+	if want("logging") {
+		if err := h.logDiskRoom(); err != nil {
+			return "", fmt.Errorf("logging: %w", err)
+		}
+	}
 	for _, st := range steps {
 		if !want(st.name) {
 			continue
@@ -216,7 +222,7 @@ func (h *harness) runAll(filter string) (string, error) {
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "# elodin benchmark\n\n")
-	fmt.Fprintf(&sb, "%s\n\n", describeMachine())
+	fmt.Fprintf(&sb, "%s %s\n\n", describeMachine(), h.environmentNote())
 	fmt.Fprintf(&sb, "Mock upstream held at %s. DNSSEC off. Each run %s measured after %s of warmup, "+
 		"median of %d, %s idle between runs.\n\n",
 		*upstreamRTT, *duration, *warmup, *repeat, *cooldown)
@@ -789,6 +795,60 @@ func (h *harness) shedding() (section, error) {
 	return section{title: "Past capacity", body: sb.String()}, nil
 }
 
+// logDiskNeeded is what loggingCost wants free in the work directory: one
+// logged run at full rate, ~500,000 queries a second at ~220 bytes a query for
+// -repeat runs of -warmup plus -duration, with half again as headroom. About
+// 6 GB at the defaults.
+// ponytail: the rate is this machine's; a faster one wants more headroom.
+func logDiskNeeded() uint64 {
+	secs := (time.Duration(max(*repeat, 1)) * (*warmup + *duration)).Seconds()
+	return uint64(secs*500_000*220) * 3 / 2
+}
+
+// freeBytes is what an unprivileged writer can still put on dir's filesystem.
+func freeBytes(dir string) (uint64, error) {
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(dir, &fs); err != nil {
+		return 0, err
+	}
+	// statfs counts blocks in f_frsize, which is f_bsize where it is unset.
+	block := uint64(fs.Frsize)
+	if block == 0 {
+		block = uint64(fs.Bsize)
+	}
+	return fs.Bavail * block, nil
+}
+
+// logDiskRoom refuses a run whose logging section has no room for what a
+// logged run writes, ~220 bytes a query and over 3 GB at full rate. On a disk
+// that fills partway the server keeps answering and the lines are lost, so the
+// row would report a cost and a byte count for a log it never wrote. runAll
+// asks before the first section, so a short disk does not cost a whole matrix.
+func (h *harness) logDiskRoom() error {
+	free, err := freeBytes(h.dir)
+	if err != nil {
+		return err
+	}
+	if need := logDiskNeeded(); free < need {
+		return fmt.Errorf("%s has %d MiB free, short of the %d MiB a logged run writes; point -workdir at a larger disk",
+			h.dir, free>>20, need>>20)
+	}
+	return nil
+}
+
+// logDiskFilled fails a logged run that ran its disk out anyway, which the
+// estimate in logDiskNeeded cannot rule out on a faster machine.
+func (h *harness) logDiskFilled() error {
+	free, err := freeBytes(h.dir)
+	if err != nil {
+		return err
+	}
+	if free < 64<<20 {
+		return fmt.Errorf("%s filled during a logged run (%d MiB left), so its log is short; point -workdir at a larger disk", h.dir, free>>20)
+	}
+	return nil
+}
+
 // loggingCost is the throughput `log.queries` costs, which docs/sizing.md warns
 // about because it is also the one thing that writes to disk in steady state.
 func (h *harness) loggingCost() (section, error) {
@@ -807,6 +867,12 @@ func (h *harness) loggingCost() (section, error) {
 		}
 		r, sm, err := h.load(s, loadOpts{transport: "udp", clients: 200})
 		s.stop()
+		if err == nil {
+			err = h.logDiskFilled()
+		}
+		// A logged run at full rate writes hundreds of MB that nothing reads,
+		// and kept until the end of a matrix it can fill a disk.
+		_ = os.Remove(s.logPath)
 		if err != nil {
 			return section{}, err
 		}
@@ -831,10 +897,14 @@ func (h *harness) loggingCost() (section, error) {
 	before := fileSize(s.logPath)
 	r, _, err := h.load(s, loadOpts{transport: "udp", clients: 200, repeat: 1})
 	s.stop()
+	written := fileSize(s.logPath) - before
+	if err == nil {
+		err = h.logDiskFilled()
+	}
+	_ = os.Remove(s.logPath)
 	if err != nil {
 		return section{}, err
 	}
-	written := fileSize(s.logPath) - before
 	fmt.Fprintf(&sb, "\nAt %s qps it wrote %.0f MB/s — %.0f bytes per query.\n",
 		thousands(r.QPS), float64(written)/r.Seconds/(1<<20), float64(written)/float64(r.Answered))
 
