@@ -53,7 +53,8 @@ UNIT_FILE :: "packaging/elodin.service"
 // and getenv the first), an Environment= outside [Service] (which systemd
 // ignores) and any other environment directive (UnsetEnvironment=,
 // EnvironmentFile=, PassEnvironment=) are refused rather than interpreted, so a
-// value this does not read cannot pass as one.
+// value this does not read cannot pass as one. Lines a backslash continues
+// belong to the directive before them.
 @(private = "file")
 unit_environment :: proc(r: ^Runner) -> (env: [dynamic]string, ok: bool) {
 	data, err := os.read_entire_file(UNIT_FILE, context.temp_allocator)
@@ -63,10 +64,22 @@ unit_environment :: proc(r: ^Runner) -> (env: [dynamic]string, ok: bool) {
 	}
 	env = make([dynamic]string, context.temp_allocator)
 	text := string(data)
-	in_service := false
+	in_service, continued := false, false
 	for raw in strings.split_lines_iterator(&text) {
 		// systemd strips ASCII blanks around the directive and its `=`.
 		line := strings.trim_left(raw, " \t")
+		comment := strings.has_prefix(line, "#") || strings.has_prefix(line, ";")
+		// A line ending in a backslash goes on into the next, comments between
+		// them aside, so what follows it is part of that directive and not one
+		// of its own. Environment= is never continued: its value would hold
+		// the backslash, which is refused below.
+		if continued {
+			if !comment {
+				continued = strings.has_suffix(strings.trim_right(line, " \t\r"), `\`)
+			}
+			continue
+		}
+		continued = !comment && strings.has_suffix(strings.trim_right(line, " \t\r"), `\`)
 		if strings.has_prefix(line, "[") {
 			in_service = strings.trim_right(line, " \t\r") == "[Service]"
 			continue

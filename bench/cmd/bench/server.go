@@ -103,10 +103,8 @@ func (h *harness) startServer(o serverOpts) (*server, error) {
 	return nil, err
 }
 
+// start runs one attempt of startServer, which has defaulted o.kind.
 func (h *harness) start(o serverOpts) (*server, error) {
-	if o.kind == "" {
-		o.kind = "elodin"
-	}
 	if o.maxConnections == 0 {
 		o.maxConnections = 512
 	}

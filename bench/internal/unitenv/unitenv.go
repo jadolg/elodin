@@ -21,12 +21,25 @@ const File = "packaging/elodin.service"
 // a key set twice, an Environment= outside [Service] and any other environment
 // directive (UnsetEnvironment=, EnvironmentFile=, PassEnvironment=) are refused
 // rather than interpreted, so a value this does not read cannot pass as one.
+// Lines a backslash continues belong to the directive before them.
 func Parse(text string) ([]string, error) {
 	var env []string
-	inService := false
+	inService, continued := false, false
 	for raw := range strings.SplitSeq(text, "\n") {
 		// systemd strips ASCII blanks around the directive and its `=`.
 		line := strings.TrimLeft(raw, " \t")
+		comment := strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";")
+		// A line ending in a backslash goes on into the next, comments between
+		// them aside, so what follows it is part of that directive and not one
+		// of its own. Environment= is never continued: its value would hold
+		// the backslash, which is refused below.
+		if continued {
+			if !comment {
+				continued = strings.HasSuffix(strings.TrimRight(line, " \t\r"), `\`)
+			}
+			continue
+		}
+		continued = !comment && strings.HasSuffix(strings.TrimRight(line, " \t\r"), `\`)
 		if strings.HasPrefix(line, "[") {
 			inService = strings.TrimRight(line, " \t\r") == "[Service]"
 			continue

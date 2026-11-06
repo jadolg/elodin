@@ -203,6 +203,11 @@ func (h *harness) runAll(filter string) (string, error) {
 		{"compare", h.compare},
 	}
 
+	if want("logging") {
+		if err := h.logDiskRoom(); err != nil {
+			return "", fmt.Errorf("logging: %w", err)
+		}
+	}
 	for _, st := range steps {
 		if !want(st.name) {
 			continue
@@ -800,26 +805,53 @@ func logDiskNeeded() uint64 {
 	return uint64(secs*500_000*220) * 3 / 2
 }
 
-// loggingCost is the throughput `log.queries` costs, which docs/sizing.md warns
-// about because it is also the one thing that writes to disk in steady state.
-func (h *harness) loggingCost() (section, error) {
-	// A logged row writes ~220 bytes a query, over 3 GB in a full-rate run.
-	// On a disk that fills partway the server keeps answering and the lines are
-	// lost, so the row would report a cost and a byte count for a log it never
-	// wrote: refuse to start rather than measure that.
+// freeBytes is what an unprivileged writer can still put on dir's filesystem.
+func freeBytes(dir string) (uint64, error) {
 	var fs syscall.Statfs_t
-	if err := syscall.Statfs(h.dir, &fs); err != nil {
-		return section{}, err
+	if err := syscall.Statfs(dir, &fs); err != nil {
+		return 0, err
 	}
 	// statfs counts blocks in f_frsize, which is f_bsize where it is unset.
 	block := uint64(fs.Frsize)
 	if block == 0 {
 		block = uint64(fs.Bsize)
 	}
-	if free, need := fs.Bavail*block, logDiskNeeded(); free < need {
-		return section{}, fmt.Errorf("%s has %d MiB free, short of the %d MiB a logged run writes; point -workdir at a larger disk",
+	return fs.Bavail * block, nil
+}
+
+// logDiskRoom refuses a run whose logging section has no room for what a
+// logged run writes, ~220 bytes a query and over 3 GB at full rate. On a disk
+// that fills partway the server keeps answering and the lines are lost, so the
+// row would report a cost and a byte count for a log it never wrote. runAll
+// asks before the first section, so a short disk does not cost a whole matrix.
+func (h *harness) logDiskRoom() error {
+	free, err := freeBytes(h.dir)
+	if err != nil {
+		return err
+	}
+	if need := logDiskNeeded(); free < need {
+		return fmt.Errorf("%s has %d MiB free, short of the %d MiB a logged run writes; point -workdir at a larger disk",
 			h.dir, free>>20, need>>20)
 	}
+	return nil
+}
+
+// logDiskFilled fails a logged run that ran its disk out anyway, which the
+// estimate in logDiskNeeded cannot rule out on a faster machine.
+func (h *harness) logDiskFilled() error {
+	free, err := freeBytes(h.dir)
+	if err != nil {
+		return err
+	}
+	if free < 64<<20 {
+		return fmt.Errorf("%s filled during a logged run (%d MiB left), so its log is short; point -workdir at a larger disk", h.dir, free>>20)
+	}
+	return nil
+}
+
+// loggingCost is the throughput `log.queries` costs, which docs/sizing.md warns
+// about because it is also the one thing that writes to disk in steady state.
+func (h *harness) loggingCost() (section, error) {
 	var sb strings.Builder
 	sb.WriteString("| log.queries | throughput | run-to-run spread | cost |\n|---|---|---|---|\n")
 
@@ -835,6 +867,9 @@ func (h *harness) loggingCost() (section, error) {
 		}
 		r, sm, err := h.load(s, loadOpts{transport: "udp", clients: 200})
 		s.stop()
+		if err == nil {
+			err = h.logDiskFilled()
+		}
 		// A logged run at full rate writes hundreds of MB that nothing reads,
 		// and kept until the end of a matrix it can fill a disk.
 		_ = os.Remove(s.logPath)
@@ -863,6 +898,9 @@ func (h *harness) loggingCost() (section, error) {
 	r, _, err := h.load(s, loadOpts{transport: "udp", clients: 200, repeat: 1})
 	s.stop()
 	written := fileSize(s.logPath) - before
+	if err == nil {
+		err = h.logDiskFilled()
+	}
 	_ = os.Remove(s.logPath)
 	if err != nil {
 		return section{}, err

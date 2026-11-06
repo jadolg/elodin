@@ -72,7 +72,6 @@ func main() {
 		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim)
 	}
 
-	// Before the work directory: a fatal exit here would leave a temp dir behind.
 	unitEnv, err := unitenv.Load(filepath.Join(root, unitenv.File))
 	if err != nil {
 		log.Fatalf("bench: %v", err)

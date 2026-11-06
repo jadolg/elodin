@@ -181,7 +181,7 @@ That control is how the query-logging result was confirmed rather than assumed.
 | `connections` | resident memory per idle TCP, DoT and DoH/2 connection, at 1,000 to 20,000 held |
 | `inflight` | resident memory per query waiting on a three-second upstream |
 | `latency` | cache-hit latency under a light, steady load |
-| `logging` | what `log.queries` costs and what it writes; refuses to start without room in `-workdir` for what a logged run writes at `-repeat`, `-warmup` and `-duration` (about 6 GB at the defaults) |
+| `logging` | what `log.queries` costs and what it writes; a run that includes it refuses to start without room in `-workdir` for what a logged run writes at `-repeat`, `-warmup` and `-duration` (about 6 GB at the defaults), and fails if a logged run fills the disk anyway |
 | `compare` | elodin against every server in `-servers` (see above) |
 
 Rows that depend on the server doing a particular thing assert it: the blocked
