@@ -216,7 +216,7 @@ func (h *harness) runAll(filter string) (string, error) {
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "# elodin benchmark\n\n")
-	fmt.Fprintf(&sb, "%s\n\n", describeMachine())
+	fmt.Fprintf(&sb, "%s\n\n", h.describeMachine())
 	fmt.Fprintf(&sb, "Mock upstream held at %s. DNSSEC off. Each run %s measured after %s of warmup, "+
 		"median of %d, %s idle between runs.\n\n",
 		*upstreamRTT, *duration, *warmup, *repeat, *cooldown)

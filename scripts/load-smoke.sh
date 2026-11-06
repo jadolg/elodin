@@ -80,9 +80,22 @@ metrics:
   port: $METRICS
 EOF
 
+# The server runs with the shipped unit's Environment= assignments, since they
+# set how glibc gives memory back. Only plain KEY=VALUE lines are read; any other
+# environment directive fails the run rather than being half-interpreted
+# (bench/internal/unitenv reads the same file for the benchmarks).
+unit_env=()
+while IFS= read -r line; do
+	if [[ $line =~ ^Environment=([A-Za-z_][A-Za-z0-9_]*=[^[:space:]\"\'\\%]+)$ ]]; then
+		unit_env+=("${BASH_REMATCH[1]}")
+	else
+		echo "FAIL: packaging/elodin.service: '$line' is not read here"; exit 1
+	fi
+done < <(grep -E '^[[:space:]]*[A-Za-z]*Environment' packaging/elodin.service)
+
 "$work/mockdns" -addr "127.0.0.1:$UP" -delay 20ms >"$work/mockdns.log" 2>&1 &
 pids+=($!)
-"$BIN" --config "$work/elodin.yaml" --no-fetch >"$work/stdout" 2>&1 &
+env "${unit_env[@]}" "$BIN" --config "$work/elodin.yaml" --no-fetch >"$work/stdout" 2>&1 &
 server=$!
 pids+=("$server")
 

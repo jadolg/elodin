@@ -84,7 +84,7 @@ func (h *harness) dnssecSurvey(reference string) (string, error) {
 	}
 	wg.Wait()
 
-	return renderSurvey(results, reference), nil
+	return h.renderSurvey(results, reference), nil
 }
 
 type domain struct {
@@ -163,10 +163,10 @@ func askDOOnce(addr, name string) (int, bool, error) {
 	}
 }
 
-func renderSurvey(results []verdict, reference string) string {
+func (h *harness) renderSurvey(results []verdict, reference string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "# elodin DNSSEC survey\n\n")
-	fmt.Fprintf(&sb, "%s\n\n", describeMachine())
+	fmt.Fprintf(&sb, "%s\n\n", h.describeMachine())
 	fmt.Fprintf(&sb, "%d names asked through elodin with validation on, and asked again of %s.\n\n",
 		len(results), reference)
 

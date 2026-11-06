@@ -75,6 +75,7 @@ import (
 	"time"
 
 	"elodin.bench/internal/procstat"
+	"elodin.bench/internal/unitenv"
 )
 
 // A client, which is a source address and a way of asking from it.
@@ -343,6 +344,7 @@ func (s *stats) pctOf(from, to int, q float64) time.Duration {
 
 var (
 	binary_    = flag.String("binary", "../bin/elodin", "elodin binary to run")
+	unit       = flag.String("unit", "../"+unitenv.File, "systemd unit whose Environment= assignments the server is started with")
 	duration   = flag.Duration("duration", 8*time.Second, "measured length of each arm")
 	warmup     = flag.Duration("warmup", 1*time.Second, "unmeasured lead-in")
 	floodRate  = flag.Int("flood-rate", 20000, "queries/s the attacker offers; 0 is flat out")
@@ -378,6 +380,7 @@ func main() {
 	dir, cleanup := scratchDir()
 	defer cleanup()
 	bin := resolveBinary()
+	unitEnv = loadUnit()
 
 	mock, err := startMock(*upDelay, *records, 300)
 	if err != nil {
@@ -410,6 +413,18 @@ func scratchDir() (string, func()) {
 		return dir, func() {}
 	}
 	return dir, func() { os.RemoveAll(dir) }
+}
+
+// unitEnv is the shipped unit's Environment= assignments, which the server is
+// started with: the figures describe the allocator setup that ships.
+var unitEnv []string
+
+func loadUnit() []string {
+	env, err := unitenv.Load(*unit)
+	if err != nil {
+		fatal(err)
+	}
+	return env
 }
 
 func resolveBinary() string {

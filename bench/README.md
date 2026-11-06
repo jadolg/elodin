@@ -44,6 +44,13 @@ harness owns all of them rather than inheriting them from the machine:
   success. The template names no key a thread-model release would refuse, so
   `-binary` can point at one of those and run the same matrix for before/after
   rows. `cmd/bench/server.go` is where that template lives.
+- **The shipped unit's environment.** elodin starts with the `Environment=`
+  assignments of `packaging/elodin.service` (`MALLOC_MMAP_THRESHOLD_`, which
+  sets how glibc serves and returns memory) ahead of the harness's own
+  environment, less any `MALLOC_`, `GLIBC_TUNABLES` or `LD_PRELOAD` setting.
+  The run fails if `/proc/<pid>/environ` lacks them, and the report names them.
+  `cmd/rrlexp` does the same (`-unit`). A unit line other than a plain
+  `Environment=KEY=VALUE` is refused rather than interpreted.
 - **Its own certificates.** ECDSA P-256 and RSA-2048, generated per run, so the
   handshake comparison is not at the mercy of whatever is in `certs/`.
 - **The server process alone.** RSS and CPU come from `/proc/<pid>` for the
@@ -268,5 +275,6 @@ cmd/rrlexp/     the rate-limiting and connection-share experiment: two clients, 
 internal/dnswire/   DNS message building and parsing, independent of elodin
 internal/hist/      latency samples and percentiles
 internal/procstat/  RSS, CPU time and thread count for one pid
+internal/unitenv/   the shipped unit's Environment= assignments (go test ./internal/...)
 results/        committed runs, so a change in the numbers is visible in a diff
 ```

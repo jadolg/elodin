@@ -26,6 +26,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"elodin.bench/internal/unitenv"
 )
 
 var (
@@ -82,7 +84,11 @@ func main() {
 	}
 	log.Printf("bench: work dir %s", dir)
 
-	h := &harness{root: root, dir: dir, binary: *binary, competitorDir: *competitorDir, bins: map[string]string{}}
+	unitEnv, err := unitenv.Load(filepath.Join(root, unitenv.File))
+	if err != nil {
+		log.Fatalf("bench: %v", err)
+	}
+	h := &harness{root: root, dir: dir, binary: *binary, competitorDir: *competitorDir, bins: map[string]string{}, unitEnv: unitEnv}
 	h.addServers(*servers)
 	if err := h.setup(); err != nil {
 		log.Fatalf("bench: %v", err)
@@ -187,6 +193,9 @@ type harness struct {
 	mockdns  string
 	mocks    []*exec.Cmd
 	mockAddr string
+	// unitEnv is the shipped unit's Environment= assignments, which elodin is
+	// started with: the figures describe the allocator setup that ships.
+	unitEnv []string
 }
 
 func (h *harness) setup() error {
@@ -275,7 +284,7 @@ func (h *harness) makeCerts() error {
 
 // describeMachine records what the numbers are numbers for. A throughput
 // figure without it is not reproducible by anyone else.
-func describeMachine() string {
+func (h *harness) describeMachine() string {
 	model := "unknown CPU"
 	if data, err := os.ReadFile("/proc/cpuinfo"); err == nil {
 		for line := range strings.SplitSeq(string(data), "\n") {
@@ -309,8 +318,8 @@ func describeMachine() string {
 	if outb, err := exec.Command(*binary, "--version").Output(); err == nil {
 		version = strings.TrimSpace(string(outb))
 	}
-	return fmt.Sprintf("Measured on %s (%d logical cores%s%s), %s.",
-		model, runtime.NumCPU(), mem, kernel, version)
+	return fmt.Sprintf("Measured on %s (%d logical cores%s%s), %s, started with %s's environment (%s).",
+		model, runtime.NumCPU(), mem, kernel, version, unitenv.File, strings.Join(h.unitEnv, " "))
 }
 
 // serverLabel names a server in a row by the version it reports, so a run

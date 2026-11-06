@@ -34,7 +34,8 @@ func renderReport(rows []row, skips []skip) string {
 	fmt.Fprintf(&b, "The victim offers %d q/s; the flood offers %d q/s (0 = flat out). Limit: %d responses/s per client prefix - a /24, or a /64 in the IPv6 arms - slip %d.\n",
 		*victimRate, *floodRate, *rps, *slip)
 	fmt.Fprintf(&b, "Every name is asked once, so every query is a cache miss and a %s upstream round trip.\n", *upDelay)
-	fmt.Fprintf(&b, "server.workers %d, upstream_workers %d, and the shipped default for everything an arm does not name.\n\n", *workers, *workers/2)
+	fmt.Fprintf(&b, "server.workers %d, upstream_workers %d, and the shipped default for everything an arm does not name.\n", *workers, *workers/2)
+	fmt.Fprintf(&b, "The server runs with %s's environment (%s).\n\n", *unit, strings.Join(unitEnv, " "))
 
 	victimTable(&b, rows)
 	floodTable(&b, rows)

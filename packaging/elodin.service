@@ -63,8 +63,10 @@ LimitNOFILE=65536
 # mmap'd and returned on free. Per-query allocations stay below it; a fiber's
 # stack and scratch are mapped by elodin itself and given back when an idle
 # loop trims them.
-# The transport benchmarks stayed within their noise (#513). musl ignores it.
-# For glibc's default, put UnsetEnvironment=MALLOC_MMAP_THRESHOLD_ in a drop-in.
+# musl ignores it. For glibc's default, put
+# UnsetEnvironment=MALLOC_MMAP_THRESHOLD_ in a drop-in.
+# `mise run bench` and the load smoke start elodin with this file's Environment=
+# lines and refuse any that is not a plain KEY=VALUE, so the figures describe it.
 Environment=MALLOC_MMAP_THRESHOLD_=131072
 
 NoNewPrivileges=yes
