@@ -236,6 +236,9 @@ run = [
   "odin test src/upstream -collection:elodin=src -out:bin/test_upstream -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/h2       -collection:elodin=src -out:bin/test_h2 -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/server   -collection:elodin=src -out:bin/test_server -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
+  # The bench's reader of the shipped unit, which the benchmarks and the load
+  # smoke start elodin with.
+  "cd bench && go test ./internal/...",
 ]
 
 [tasks.itest]
@@ -302,9 +305,9 @@ run = "./bin/elodin --config examples/dev.yaml"
 
 [tasks.certs]
 description = "Generate a self-signed cert for local DoT/DoH testing"
-# ECDSA rather than RSA: a TLS handshake costs the server about 1 ms of CPU with
-# a P-256 key against 2 ms with RSA-2048, and handshakes dominate DoT/DoH cost
-# whenever clients do not reuse connections.
+# ECDSA rather than RSA: a TLS handshake costs the server about 200 µs of CPU
+# with a P-256 key against 550 µs with RSA-2048 (docs/sizing.md), and
+# handshakes dominate DoT/DoH cost whenever clients do not reuse connections.
 run = """
 mkdir -p certs
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \

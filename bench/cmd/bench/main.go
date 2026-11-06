@@ -72,6 +72,12 @@ func main() {
 		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim)
 	}
 
+	// Before the work directory: a fatal exit here would leave a temp dir behind.
+	unitEnv, err := unitenv.Load(filepath.Join(root, unitenv.File))
+	if err != nil {
+		log.Fatalf("bench: %v", err)
+	}
+
 	dir := *workdir
 	if dir == "" {
 		dir, err = os.MkdirTemp("", "elodin-bench-*")
@@ -84,10 +90,6 @@ func main() {
 	}
 	log.Printf("bench: work dir %s", dir)
 
-	unitEnv, err := unitenv.Load(filepath.Join(root, unitenv.File))
-	if err != nil {
-		log.Fatalf("bench: %v", err)
-	}
 	h := &harness{root: root, dir: dir, binary: *binary, competitorDir: *competitorDir, bins: map[string]string{}, unitEnv: unitEnv}
 	h.addServers(*servers)
 	if err := h.setup(); err != nil {

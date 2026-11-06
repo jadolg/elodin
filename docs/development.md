@@ -93,7 +93,8 @@ and fuzz regression run in CI; `mise run bench` measures rather than asserts.
 **Unit tests** (`mise run test`) run per package, so a failure names one. One
 test on its own is `odin test src/<pkg> -collection:elodin=src
 -define:ODIN_TEST_NAMES=<pkg>.<test>`, after `mise run prepare` has assembled
-the fiber switch into `bin/elodin_switch.o`, which every build links. They
+the fiber switch into `bin/elodin_switch.o`, which every build links. The task
+also runs the bench's own Go tests (`cd bench && go test ./internal/...`). They
 cover:
 
 - the message codec: round trips for every modelled RDATA type, compression,

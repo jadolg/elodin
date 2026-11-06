@@ -811,7 +811,12 @@ func (h *harness) loggingCost() (section, error) {
 	if err := syscall.Statfs(h.dir, &fs); err != nil {
 		return section{}, err
 	}
-	if free, need := fs.Bavail*uint64(fs.Bsize), logDiskNeeded(); free < need {
+	// statfs counts blocks in f_frsize, which is f_bsize where it is unset.
+	block := uint64(fs.Frsize)
+	if block == 0 {
+		block = uint64(fs.Bsize)
+	}
+	if free, need := fs.Bavail*block, logDiskNeeded(); free < need {
 		return section{}, fmt.Errorf("%s has %d MiB free, short of the %d MiB a logged run writes; point -workdir at a larger disk",
 			h.dir, free>>20, need>>20)
 	}

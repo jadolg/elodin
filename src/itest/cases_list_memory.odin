@@ -49,11 +49,11 @@ UNIT_FILE :: "packaging/elodin.service"
 
 // The `KEY=VALUE` assignments of the unit's Environment= lines. Quoting,
 // specifiers, an empty line (which resets the list), an assignment without `=`
-// or with a name systemd refuses, a key set twice (where systemd takes the last and getenv the first), an
-// Environment= outside [Service] (which systemd ignores) and any other
-// environment directive (UnsetEnvironment=, EnvironmentFile=, PassEnvironment=)
-// are refused rather than interpreted, so a value this does not read cannot
-// pass as one.
+// or with a name systemd refuses, a key set twice (where systemd takes the last
+// and getenv the first), an Environment= outside [Service] (which systemd
+// ignores) and any other environment directive (UnsetEnvironment=,
+// EnvironmentFile=, PassEnvironment=) are refused rather than interpreted, so a
+// value this does not read cannot pass as one.
 @(private = "file")
 unit_environment :: proc(r: ^Runner) -> (env: [dynamic]string, ok: bool) {
 	data, err := os.read_entire_file(UNIT_FILE, context.temp_allocator)

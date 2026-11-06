@@ -83,12 +83,15 @@ type server struct {
 // startServer starts a server, and again if it fails: freePort hands out a port it
 // has just closed, and something else on the machine can take it first.
 func (h *harness) startServer(o serverOpts) (*server, error) {
+	if o.kind == "" {
+		o.kind = "elodin"
+	}
 	var err error
 	for range 3 {
 		var s *server
 		if s, err = h.start(o); err == nil {
 			s.pid = serverPid(s.pid)
-			if o.kind == "" || o.kind == "elodin" {
+			if o.kind == "elodin" {
 				if err := unitenv.Check(s.pid, h.unitEnv); err != nil {
 					s.stop()
 					return nil, err
@@ -178,10 +181,14 @@ func (h *harness) start(o serverOpts) (*server, error) {
 		argv = append([]string{"taskset", "-c", o.cpus}, argv...)
 	}
 	s.cmd = exec.Command(argv[0], argv[1:]...)
+	// elodin as the unit starts it, so a figure describes the allocator that
+	// ships; every other server without the caller's allocator settings, so a
+	// row differs between servers in the server and nothing else.
+	var unit []string
 	if o.kind == "elodin" {
-		// As the unit starts it, so a figure describes the allocator that ships.
-		s.cmd.Env = unitenv.Shipped(h.unitEnv, os.Environ())
+		unit = h.unitEnv
 	}
+	s.cmd.Env = unitenv.Shipped(unit, os.Environ())
 	// What a server says before its own log is open - a config it refuses, a
 	// file it may not read - goes here, and into the error if it never answers.
 	stderr, err := os.Create(filepath.Join(h.dir, o.name+"-"+o.kind+".stderr"))

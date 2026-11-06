@@ -40,17 +40,17 @@ func Parse(text string) ([]string, error) {
 			continue
 		}
 		if directive != "Environment" || !inService || strings.ContainsAny(value, `"'\%`) || strings.TrimSpace(value) == "" {
-			return nil, fmt.Errorf("%s: %q is not read here", File, line)
+			return nil, fmt.Errorf("%q is not read here", line)
 		}
 		// systemd splits on ASCII blanks only.
 		for field := range strings.FieldsFuncSeq(value, func(c rune) bool { return c == ' ' || c == '\t' || c == '\r' }) {
 			sep := strings.IndexByte(field, '=')
 			if sep <= 0 || !validName(field[:sep]) {
-				return nil, fmt.Errorf("%s: %q is not an assignment", File, field)
+				return nil, fmt.Errorf("%q is not an assignment", field)
 			}
 			key := field[:sep+1]
 			if slices.ContainsFunc(env, func(set string) bool { return strings.HasPrefix(set, key) }) {
-				return nil, fmt.Errorf("%s: %s is set twice", File, key)
+				return nil, fmt.Errorf("%s is set twice", key)
 			}
 			env = append(env, field)
 		}
@@ -95,7 +95,11 @@ func Load(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Parse(string(data))
+	env, err := Parse(string(data))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return env, nil
 }
 
 // Check reads back the environment the kernel holds for pid and
@@ -110,7 +114,7 @@ func Check(pid int, want []string) error {
 	have := strings.Split(string(data), "\x00")
 	for _, kv := range want {
 		if !slices.Contains(have, kv) {
-			return fmt.Errorf("pid %d runs without %s from %s", pid, kv, File)
+			return fmt.Errorf("pid %d runs without the unit's %s", pid, kv)
 		}
 	}
 	return nil
