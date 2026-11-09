@@ -35,7 +35,7 @@ exchange_udp :: proc(
 	}
 	defer net.close(socket)
 
-	if _, send_err := loop.send_udp_until(socket, query, deadline); send_err != nil {
+	if _, send_err := udp_send_until(socket, query, deadline); send_err != nil {
 		return nil, .IO_Error
 	}
 
@@ -81,7 +81,7 @@ exchange_udp :: proc(
 	// never let this query park; `loop.recv_udp_until` yields between them (see
 	// `loop.take_turn`).
 	for time.tick_diff(loop.tick_now(), deadline) > 0 {
-		n, remote, recv_err := loop.recv_udp_until(socket, buf, deadline)
+		n, remote, recv_err := udp_recv_until(socket, buf, deadline)
 		if recv_err != nil {
 			/*
 			Anything but the deadline is TCP's to settle. `.Excess_Truncated`:
@@ -250,4 +250,50 @@ roundtrip_failure :: proc(terr: tlsx.Error) -> Error {
 		return .Peer_Closed
 	}
 	return .IO_Error
+}
+
+/*
+`loop.recv_udp_until` and `loop.send_udp_until`, for every UDP wait in this
+package, so a test can read the deadline each was handed.
+
+That a stage shares its exchange's deadline - a cookie retry, a bootstrap query,
+a read after a stray - is then a comparison of deadlines, where judging how long
+the exchange took against a margin is one a scheduler stall can cross (issue
+#556). Kept per thread: the package's tests run in parallel, and each runs its
+exchanges on its own thread. Written only in tests; declared in every build, as
+`odin check` compiles the test files without `ODIN_TEST`.
+*/
+@(private)
+Udp_Wait :: struct {
+	// When the wait began, and the deadline it was handed.
+	at, deadline: time.Tick,
+}
+
+@(private, thread_local)
+udp_waits: [16]Udp_Wait
+
+// How many waits there were since the test reset it, past the 16 kept too.
+@(private, thread_local)
+udp_wait_count: int
+
+@(private)
+note_udp_wait :: #force_inline proc(deadline: time.Tick) {
+	when ODIN_TEST {
+		if udp_wait_count < len(udp_waits) {
+			udp_waits[udp_wait_count] = {loop.tick_now(), deadline}
+		}
+		udp_wait_count += 1
+	}
+}
+
+@(private)
+udp_recv_until :: proc(socket: net.UDP_Socket, buf: []u8, deadline: time.Tick) -> (int, net.Endpoint, net.UDP_Recv_Error) {
+	note_udp_wait(deadline)
+	return loop.recv_udp_until(socket, buf, deadline)
+}
+
+@(private)
+udp_send_until :: proc(socket: net.UDP_Socket, buf: []u8, deadline: time.Tick) -> (int, net.UDP_Send_Error) {
+	note_udp_wait(deadline)
+	return loop.send_udp_until(socket, buf, deadline)
 }

@@ -214,14 +214,16 @@ test_bootstrap_resolution_shares_the_exchange_timeout :: proc(t: ^testing.T) {
 
 	query := dns.Message{id = 0x4491, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}
 	wire, _, _ := dns.encode_message(query, context.temp_allocator)
+	udp_waits_reset()
 	started := time.tick_now()
 	_, xerr := exchange(u, wire, X_TIMEOUT, context.temp_allocator)
-	spent := time.tick_since(started)
 
 	testing.expect_value(t, xerr, Error.Not_Resolved)
 	// Each bootstrap query had `BOOTSTRAP_TIMEOUT` of its own - three seconds,
-	// for A and again for AAAA - before the exchange's timeout even began.
-	testing.expectf(t, spent < X_TIMEOUT * 5 / 4, "the exchange waited %v, where its timeout is %v", spent, X_TIMEOUT)
+	// for A and again for AAAA - before the exchange's timeout even began. The
+	// one server gets all of it, so A's send and read run to the exchange's
+	// deadline and AAAA is never asked.
+	expect_udp_waits_share(t, started, X_TIMEOUT, 2)
 	u.spec.bootstrap = nil
 	free_all(context.temp_allocator)
 }

@@ -263,7 +263,7 @@ bootstrap_query :: proc(
 	defer net.close(socket)
 	deadline := time.tick_add(loop.tick_now(), timeout)
 
-	if _, send_err := loop.send_udp_until(socket, wire, deadline); send_err != nil {
+	if _, send_err := udp_send_until(socket, wire, deadline); send_err != nil {
 		return nil, false
 	}
 
@@ -282,7 +282,7 @@ bootstrap_query :: proc(
 	// As in `exchange_udp`: datagrams passed over back to back never park, and
 	// `loop.recv_udp_until` yields between them.
 	for time.tick_diff(loop.tick_now(), deadline) > 0 {
-		n, remote, recv_err := loop.recv_udp_until(socket, buf, deadline)
+		n, remote, recv_err := udp_recv_until(socket, buf, deadline)
 		/*
 		An ICMP error on the connected socket (see `open_udp`) is waited past,
 		as Unbound does with every one: forgeable by whoever guesses the source
