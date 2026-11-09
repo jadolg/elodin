@@ -102,6 +102,13 @@ fresh connection. A sustained run of those hang-ups does count, and parks the
 server a few queries later than an unreachable one;
 `elodin_upstream_failure_kind_total{error="peer_closed"}` names such a server.
 
+A `udp://` server whose port is closed fails over at once, not at the timeout:
+an ICMP unreachable for the query is checked by asking the same server over TCP,
+and a refused connect there is the `Dial_Failed` that counts. A forged ICMP
+therefore moves one query to TCP rather than failing it. The ICMP for a
+`bootstrap` query is ignored, so a closed bootstrap server still costs its share
+of the timeout.
+
 Each *kind* of failure is logged once at `warn`, with the transport and address,
 and at `debug` after that; `elodin_upstream_failures_total` and
 `elodin_upstream_failure_kind_total` count every one. A member that fails every
@@ -116,6 +123,7 @@ level=warn msg="upstream quad9-dot: TLS handshake with \"dns.quad9.net\" failed:
 | kind | meaning |
 |---|---|
 | `Timeout` | nothing usable arrived inside `upstream.timeout`, including a TLS handshake that did not finish in it and a TLS or HTTPS session that handshook and then went quiet |
+| `Dial_Failed` | the connection was refused or could not be made, including a `udp://` server whose port is closed (an ICMP unreachable, then a refused TCP connect) |
 | `Peer_Closed` | the peer hung up before a byte of the reply arrived, and hung up again on the retry |
 | `IO_Error` | the transport failed on an established session, including a reply cut off partway |
 | `Bad_Response` | a reply arrived and was thrown away: it did not echo the question, or on `udp://`/`tcp://` lacked the DNS cookie the query carried |

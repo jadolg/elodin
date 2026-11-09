@@ -283,6 +283,18 @@ bootstrap_query :: proc(
 	// `loop.recv_udp_until` yields between them.
 	for time.tick_diff(loop.tick_now(), deadline) > 0 {
 		n, remote, recv_err := loop.recv_udp_until(socket, buf, deadline)
+		/*
+		An ICMP error on the connected socket (see `open_udp`) is waited past,
+		as Unbound does with every one: forgeable by whoever guesses the source
+		port, and unlike `exchange_udp` this has no TCP path to check it on, so
+		taking it would hand an off-path sender the bootstrap answer - the
+		address every query to this upstream goes to. Reported once, so the next
+		read waits again; a bootstrap server whose port is closed costs this
+		server's share of the timeout, as before.
+		*/
+		if recv_err != nil && recv_err != .Would_Block {
+			continue
+		}
 		if recv_err != nil {
 			return nil, false
 		}
