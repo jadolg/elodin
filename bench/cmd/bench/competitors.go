@@ -42,9 +42,12 @@ var competitors = map[string]competitor{
 
 // forksTCP is the servers that serve each TCP connection from a forked child
 // (dnsmasq's model, which Pi-hole's FTL keeps). The harness samples one pid,
-// so their TCP CPU and per-connection memory would count the parent alone;
-// those cells read unmeasured rather than as a figure for nothing.
-var forksTCP = map[string]bool{"pihole": true}
+// so their TCP CPU and per-connection memory would count the parent alone,
+// and summing the children's RSS would count the pages they share with it
+// once per child. Those cells read unmeasured rather than as either.
+var forksTCP = map[string]bool{"pihole": true, "dnsmasq": true}
+
+func forked(kind, transport string) bool { return transport == "tcp" && forksTCP[kind] }
 
 const forkedCell = "— (a process per connection)"
 

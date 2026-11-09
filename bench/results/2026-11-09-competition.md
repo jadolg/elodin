@@ -14,9 +14,11 @@ go run ./cmd/bench -only compare -servers pihole -competitors ~/competitors \
   -mock-cpus 2-3 -cooldown 5s
 ```
 
-Pi-hole's rows are from that second run, the others from the first. Its UDP
-row read 181k in the first and 164k in the second, about the run-to-run
-spread.
+The first ran before the Pi-hole fixes below; Pi-hole's rows are from the
+second, run once its TCP limit was set. Its TCP CPU and per idle TCP cells
+are then written as the harness at this commit prints them: unmeasured, with
+the connections held, 997 of 1,000. Its UDP row read 181k in the first run
+and 164k in the second, about the run-to-run spread.
 
 Mock upstream at 20 ms, DNSSEC off, each run 10 s after 2 s of warmup, median
 of 3. elodin runs its shipped defaults (`server.pin_loops` off) under the
@@ -56,8 +58,8 @@ Only rows whose method did not change; the second round's CPU divided by 1.2.
 | per query in flight | 17 KB | 16 KB |
 
 100,000 qps is about what the mock carries on two cores, so elodin's miss
-ceiling is unmeasured. Blocked answers are left out: within one run they cost
-93% of a hit against 76% in the second round, but both cells changed
+ceiling is unmeasured. Blocked answers are left out: within one run they are
+answered at 93% of the hit rate against 76% in the second round, but both cells changed
 generator, so how much of that is #611 the two rounds cannot say.
 
 ## Memory
@@ -124,7 +126,7 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
 | Unbound 1.24.2 | 0.2 KB | 55 KB | 69 KB | 13 KB (all answered) |
 | AdGuard Home 0.107.80 | 21 KB | 46 KB | 72 KB | 25 KB (all answered) |
 | Blocky 0.35.0 | 20 KB | 34 KB | — | 32 KB (all answered) |
-| Pi-hole FTL 6.8 | — (a process per connection) | — | — | 0.8 KB (all answered) |
+| Pi-hole FTL 6.8 | — (a process per connection) (**997 of 1,000** held) | — | — | 0.8 KB (all answered) |
 | CoreDNS 1.15.0 | 7.2 KB | 37 KB | 57 KB | 14 KB (all answered) |
 | dnsmasq 2.92 | — | — | — | 0.3 KB (all answered) |
 | PowerDNS Recursor 5.3.5 | 1.4 KB | — | — | 16 KB (all answered) |
@@ -139,7 +141,11 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
   the shape of Nagle meeting a delayed ACK.
 - **Blocky's TCP and DoT** include reconnects: it closes a connection after
   a number of queries.
-- **Pi-hole's TCP** is a forked dnsmasq child per connection, which closes too.
+- **Pi-hole's TCP** is a forked dnsmasq child per connection. dnsmasq closes
+  a TCP connection after 100 queries (`TCP_MAX_QUERIES`, fixed at compile
+  time), and 9,887 qps over 10 s is about a thousand connections, near the
+  947 reconnects: the row measures a fork per hundred queries more than a
+  cache hit.
 - **dnsdist and dnsmasq are forwarders**: no recursion state, hence their
   CPU per miss and cost per query in flight.
 - **Saturated p99s are each at the server's own maximum rate.** Compare tails
@@ -163,11 +169,18 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
 
 ## Where elodin falls behind
 
-- CPU per miss: 14 µs against dnsdist's 6 µs.
+- CPU per miss: 14 µs against dnsdist's 6 µs at the sustained rate, and
+  40 µs against dnsdist's 27 µs at 2,000 qps.
 - UDP p99 at saturation: 0.43 ms, against Unbound 0.12, PowerDNS 0.14,
   dnsdist 0.27, BIND and dnsmasq 0.37 ms, each at its own rate.
 - Per idle TCP connection: 4.7 KB against 0.1-1.4 KB for dnsdist, Unbound and
-  PowerDNS. Per idle DoT: 39 KB against dnsdist's 26 KB.
+  PowerDNS. Per idle DoT: 39 KB against dnsdist's 26 KB, Blocky's 34 KB and
+  CoreDNS's 37 KB.
+- DoH/2 p99: 2.7 ms against Unbound's 2.4, dnsdist's 2.5 and BIND's 2.6 ms.
 - Per query in flight: 16 KB against Unbound's 13 KB and CoreDNS's 14 KB
   (the forwarders hold under 1 KB).
 - Per cache entry: 311 B, fourth behind dnsmasq, Pi-hole and dnsdist.
+
+CPU per hit differs from the best by 1-2 µs on several transports (TCP 3
+against PowerDNS's 2, DoH/2 11 against dnsdist's 9, blocked 2 against
+Unbound's 1), at a resolution of 1 µs.

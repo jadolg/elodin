@@ -132,8 +132,9 @@ no-poll
 server=127.0.0.1#%s
 cache-size=%d
 dns-forward-max=%d
+max-tcp-connections=%d
 pid-file=
-`, p.dns, p.upPort, cache, inflightBound(o))
+`, p.dns, p.upPort, cache, inflightBound(o), o.maxConnections)
 	if o.blockRules > 0 {
 		// Pi-hole's own form before it moved the list into gravity.db.
 		list, err := h.writeList(o, "conf", "", func(n string) string { return "address=/" + n + "/" })

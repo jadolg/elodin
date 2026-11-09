@@ -150,9 +150,9 @@ func (h *harness) hitCell(s *server, kind, t string, fail failer) string {
 	if err != nil {
 		return fail(kind, label(t), err)
 	}
-	cpu := fmt.Sprintf("%d µs", sm.CPUPerQuery(r.Answered).Microseconds())
-	if t == "tcp" && forksTCP[kind] {
-		cpu = forkedCell
+	cpu := forkedCell
+	if !forked(kind, t) {
+		cpu = fmt.Sprintf("%d µs", sm.CPUPerQuery(r.Answered).Microseconds())
 	}
 	return fmt.Sprintf("%s / %s / %s%s", thousands(r.QPS), ms(r.P99ms), cpu, timedOut(r))
 }
@@ -299,9 +299,6 @@ func (h *harness) heldCell(kind, t string, fail failer) string {
 	if !supports(kind, t) {
 		return "—"
 	}
-	if t == "tcp" && forksTCP[kind] {
-		return forkedCell
-	}
 	s, err := h.startServer(serverOpts{name: "cmp-conns", kind: kind, cache: true,
 		maxConnections: heldN + 64, clientTimeout: 120 * time.Second})
 	if err != nil {
@@ -313,6 +310,11 @@ func (h *harness) heldCell(kind, t string, fail failer) string {
 	s.stop()
 	if err != nil {
 		return fail(kind, label(t)+" held", err)
+	}
+	// A forking server's memory is not measured, but how many connections it
+	// held still is: it shows whether its connection limit took.
+	if forked(kind, t) {
+		return forkedCell + " (" + answeredOf(r, heldN) + " held)"
 	}
 	cell := perItem(held-before, heldN)
 	if r.Answered != heldN {
