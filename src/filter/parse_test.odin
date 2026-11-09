@@ -269,6 +269,43 @@ test_a_domain_line_covers_the_name_and_everything_under_it :: proc(t: ^testing.T
 }
 
 @(test)
+test_a_leading_dot_domain_line_covers_the_name_and_everything_under_it :: proc(t: ^testing.T) {
+	/*
+	Squid `dstdomain` and Privoxy lists mark a subtree with a leading dot, and
+	both read `.ads.example` as `ads.example` itself and every name under it
+	(#591): the subtree a bare line already covers here.
+	*/
+	src := ".ads.example\n"
+	testing.expect_value(t, matches(src, .Domains, "ads.example."), Decision.Blocked)
+	testing.expect_value(t, matches(src, .Domains, "x.ads.example."), Decision.Blocked)
+	testing.expect_value(t, matches(src, .Domains, "xads.example."), Decision.None)
+	block, allow := parsed(src, .Domains)
+	testing.expect_value(t, block.count, 1)
+	set_destroy(block)
+	set_destroy(allow)
+	// An allow line reads its dot the same way.
+	allowed := "ads.example\n-.good.ads.example\n"
+	testing.expect_value(t, matches(allowed, .Domains, "good.ads.example."), Decision.Allowed)
+	testing.expect_value(t, matches(allowed, .Domains, "x.good.ads.example."), Decision.Allowed)
+	testing.expect_value(t, matches(allowed, .Domains, "ads.example."), Decision.Blocked)
+	// The dot is the line's mark, not a second one for the parser to strip.
+	testing.expect_value(t, matches("*..ads.example\n", .Domains, "x.ads.example."), Decision.None)
+	testing.expect_value(t, matches("..ads.example\n", .Domains, "ads.example."), Decision.None)
+	// A dot at both ends is Privoxy's unanchored pattern, not a subtree of the
+	// name between them.
+	testing.expect_value(t, matches(".ads.\n", .Domains, "x.ads."), Decision.None)
+	testing.expect_value(t, matches(".ads.example.\n", .Domains, "ads.example."), Decision.None)
+	// With the mark gone, a name outside ASCII is skipped and counted as one.
+	block, allow = parsed(".bücher.example\n", .Domains)
+	testing.expect_value(t, block.not_ascii, 1)
+	set_destroy(block)
+	set_destroy(allow)
+	// A hosts or adblock line gives the dot no meaning.
+	testing.expect_value(t, matches("0.0.0.0 .ads.example\n", .Hosts, "ads.example."), Decision.None)
+	testing.expect_value(t, matches(".ads.example\n", .Adblock, "x.ads.example."), Decision.None)
+}
+
+@(test)
 test_a_domain_wildcard_prefix_covers_only_what_is_under_it :: proc(t: ^testing.T) {
 	// `*.example` is the subtree without the name itself, which is a
 	// distinction list authors make on purpose.
@@ -333,8 +370,9 @@ test_domain_lines_dns_cannot_express_are_skipped :: proc(t: ^testing.T) {
 
 @(test)
 test_a_rule_with_an_empty_label_is_skipped :: proc(t: ^testing.T) {
-	// No label is empty, so `.com` names nothing (#431). Stored, it would count
-	// toward a list that blocks nothing by it.
+	// No label is empty, so `..com` names nothing (#431); a single leading dot
+	// is only a domains list's subtree mark (#591). Stored, such a rule would
+	// count toward a list that blocks nothing by it.
 	Case :: struct {
 		src:    string,
 		format: Format,
@@ -348,7 +386,9 @@ test_a_rule_with_an_empty_label_is_skipped :: proc(t: ^testing.T) {
 			{"@@||.com^\n", .Adblock},
 			{"0.0.0.0 .com\n", .Hosts},
 			{"*..com\n", .Domains},
-			{".com\n", .Domains},
+			{"..com\n", .Domains},
+			{"*...com\n", .Domains},
+			{".\n", .Domains},
 		}) {
 		block, allow := parsed(c.src, c.format)
 		testing.expectf(t, block.count == 0 && allow.count == 0 && block.not_ascii == 0, "%q should store no rule", c.src)
