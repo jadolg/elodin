@@ -17,8 +17,8 @@ go run ./cmd/bench -only compare -servers pihole -competitors ~/competitors \
 The first ran before the Pi-hole fixes below; Pi-hole's rows are from the
 second, run once its TCP limit was set. Its TCP CPU and per idle TCP cells
 are then written as the harness at this commit prints them: unmeasured, with
-the connections held, 997 of 1,000. Its UDP row read 181k in the first run
-and 164k in the second, about the run-to-run spread.
+how many of the 1,000 clients it answered, 997. Its UDP row read 181k in
+the first run and 164k in the second, about the run-to-run spread.
 
 Mock upstream at 20 ms, DNSSEC off, each run 10 s after 2 s of warmup, median
 of 3. elodin runs its shipped defaults (`server.pin_loops` off) under the
@@ -40,8 +40,8 @@ shipped unit's environment. Versions are as in the first two rounds.
   as the others serve their counterpart of `max_connections`. At dnsmasq's
   default of 20 the other 80 connections waited in the listen backlog,
   accepted by the kernel and never served or closed, so dnsperf had nothing
-  to redial: 30 qps with every client timed out. With the limit set it holds
-  997 of 1,000 idle connections, 60 before.
+  to redial: 30 qps with every client timed out. With the limit set it
+  answers 997 of the 1,000 held-connection clients, 60 before.
 - **Pi-hole's TCP CPU and per idle TCP connection read unmeasured.** It serves
   each TCP connection from a forked child, and the harness samples one pid.
 
@@ -126,7 +126,7 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
 | Unbound 1.24.2 | 0.2 KB | 55 KB | 69 KB | 13 KB (all answered) |
 | AdGuard Home 0.107.80 | 21 KB | 46 KB | 72 KB | 25 KB (all answered) |
 | Blocky 0.35.0 | 20 KB | 34 KB | — | 32 KB (all answered) |
-| Pi-hole FTL 6.8 | — (a process per connection) (**997 of 1,000** held) | — | — | 0.8 KB (all answered) |
+| Pi-hole FTL 6.8 | — (a process per connection) (**997 of 1,000** answered) | — | — | 0.8 KB (all answered) |
 | CoreDNS 1.15.0 | 7.2 KB | 37 KB | 57 KB | 14 KB (all answered) |
 | dnsmasq 2.92 | — | — | — | 0.3 KB (all answered) |
 | PowerDNS Recursor 5.3.5 | 1.4 KB | — | — | 16 KB (all answered) |

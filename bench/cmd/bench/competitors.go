@@ -45,7 +45,9 @@ var competitors = map[string]competitor{
 // so their TCP CPU and per-connection memory would count the parent alone,
 // and summing the children's RSS would count the pages they share with it
 // once per child. Those cells read unmeasured rather than as either.
-var forksTCP = map[string]bool{"pihole": true, "dnsmasq": true}
+// dnsmasq forks the same way but is compared over UDP alone, so it has no
+// entry here and no TCP connection limit in its configuration.
+var forksTCP = map[string]bool{"pihole": true}
 
 func forked(kind, transport string) bool { return transport == "tcp" && forksTCP[kind] }
 

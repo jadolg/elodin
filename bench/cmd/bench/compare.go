@@ -311,10 +311,11 @@ func (h *harness) heldCell(kind, t string, fail failer) string {
 	if err != nil {
 		return fail(kind, label(t)+" held", err)
 	}
-	// A forking server's memory is not measured, but how many connections it
-	// held still is: it shows whether its connection limit took.
+	// A forking server's memory is not measured, but how many of the clients
+	// it answered still is: past its connection limit, the rest wait in the
+	// listen backlog unanswered.
 	if forked(kind, t) {
-		return forkedCell + " (" + answeredOf(r, heldN) + " held)"
+		return forkedCell + " (" + answeredOf(r, heldN) + " answered)"
 	}
 	cell := perItem(held-before, heldN)
 	if r.Answered != heldN {
