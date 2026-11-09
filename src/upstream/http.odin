@@ -2,6 +2,7 @@ package upstream
 
 import "core:mem"
 import "core:net"
+import "core:slice"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
@@ -302,12 +303,13 @@ empty body is nil, which `shrink` to nothing leaves.
 @(private)
 reader_take :: proc(r: ^Buf_Reader, data: []u8, allocator: mem.Allocator) -> []u8 {
 	if r.buf.allocator != allocator {
-		out := make([]u8, len(data), allocator)
-		copy(out, data)
-		return out
+		return slice.clone(data, allocator)
 	}
-	n := copy(r.buf[:], data)
-	resize(&r.buf, n)
+	// A body read past a shift already starts the buffer.
+	if raw_data(data) != raw_data(r.buf) {
+		copy(r.buf[:], data)
+	}
+	resize(&r.buf, len(data))
 	// In place: a heap block cut short is not moved.
 	shrink(&r.buf)
 	body := r.buf[:]
@@ -754,7 +756,10 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator, limit: int) -> (b
 			if need := len(out) + len(data); need > cap(out) {
 				reserve(&out, min(max(2 * cap(out), need), limit))
 			}
-			append(&out, ..data)
+			// Dropped, the piece would leave a gap in the body rather than fail it.
+			if _, aerr := append(&out, ..data); aerr != nil {
+				return nil, .Too_Large
+			}
 			left -= len(data)
 		}
 		// The data ends in CRLF and nothing else (RFC 9112 7.1). Thrown away,

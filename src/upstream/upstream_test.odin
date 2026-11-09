@@ -1167,6 +1167,26 @@ test_read_chunked_never_reserves_past_its_limit :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// A piece the caller's allocator cannot take fails the body: dropped, it would
+// leave a gap in a list that is then cached and loaded as whole.
+@(test)
+test_read_chunked_fails_a_piece_it_cannot_hold :: proc(t: ^testing.T) {
+	body := "20\r\nabcdefghijklmnopqrstuvwxyz012345\r\n0\r\n\r\n"
+	r := Buf_Reader {
+		buf = make([dynamic]u8, 0, 128, context.temp_allocator),
+	}
+	append(&r.buf, ..transmute([]u8)body)
+	// Room for less than the chunk, and nothing past it.
+	backing: [16]u8
+	arena: mem.Arena
+	mem.arena_init(&arena, backing[:])
+
+	got, err := read_chunked(&r, mem.arena_allocator(&arena), 100)
+	testing.expect_value(t, err, Error.Too_Large)
+	testing.expectf(t, got == nil, "a body with a piece missing came back: %q", string(got))
+	free_all(context.temp_allocator)
+}
+
 // A count that cannot be read cannot be satisfied, and must not be answered
 // with a slice running backwards from the cursor.
 @(test)

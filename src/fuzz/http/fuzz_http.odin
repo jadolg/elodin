@@ -13,7 +13,8 @@ server sent it, followed by its close.
 
 Read twice: with the list fetcher's body limit, which no input reaches, and with
 one at half the input, so each framing's refusal at `max_body` - the limit a
-DoH reply is held to (#525) - is reached as well as its success.
+DoH reply is held to (#525) - is reached as well as its success. The two reads
+also take the body the two ways callers do: handed over, and copied out.
 */
 @(export, link_name = "LLVMFuzzerTestOneInput")
 fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
@@ -61,14 +62,23 @@ exchange :: proc(data: []u8, max_body: int) {
 		stream := upstream.Stream {
 			socket = socket,
 		}
-		// The body on the tracked heap too, as a real caller's allocator frees:
-		// `read_chunked` grows it chunk by chunk and deletes it on every error.
-		_, _ = upstream.http_exchange(
+		/*
+		At the list limit the body is in the reader's own allocator, as a list's
+		is, so `reader_take` hands the buffer over and LeakSanitizer sees a body
+		that still owns it; at the DoH limit it is in scratch, as a DoH reply's
+		per-request allocator is, so it is copied out. Either way `read_chunked`
+		grows it chunk by chunk and deletes it on every error.
+		*/
+		body_allocator := heap if max_body == upstream.MAX_HTTP_BODY else context.temp_allocator
+		resp, _ := upstream.http_exchange(
 			&stream,
 			upstream.Http_Request{method = "GET", path = "/", host = "fuzz"},
-			context.temp_allocator,
+			body_allocator,
 			max_body = max_body,
 		)
+		if body_allocator == heap {
+			delete(resp.body, heap)
+		}
 	}
 }
 
