@@ -574,10 +574,10 @@ strays, or forgeries, that the exchange must pass over. From the server's own
 address and port, since the exchange's socket is connected and the kernel drops
 a datagram from any other (issue #622).
 
-The first lands at a tenth of the timeout, with the rest of it to spare, so it
-is certain to reach the read: what shows the strays are read at all. The second
-lands at `at`, late enough that a wait restarted by it would outlast the
-assertion's half a timeout of slack.
+The first goes as soon as the query is read, with no sleep to overshoot, and
+queues on the exchange's socket until its read: what shows the strays are read
+at all. The second lands at `at`, late enough that a wait restarted by it would
+outlast the assertion's half a timeout of slack.
 */
 @(private = "file")
 Stray_Mock :: struct {
@@ -592,10 +592,8 @@ stray_mock_serve :: proc(m: ^Stray_Mock) {
 	if err != nil || n < dns.HEADER_SIZE {
 		return
 	}
-	early := DEADLINE_TIMEOUT / 10
-	time.sleep(early)
 	_, _ = net.send_udp(m.socket, buf[:n], client)
-	time.sleep(m.at - early)
+	time.sleep(m.at)
 	_, _ = net.send_udp(m.socket, buf[:n], client)
 }
 
