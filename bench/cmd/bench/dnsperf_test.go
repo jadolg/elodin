@@ -63,3 +63,20 @@ func TestDnsperfResult(t *testing.T) {
 		t.Errorf("got %+v, %v", r, err)
 	}
 }
+
+// A dnsperf row has answers and no per-client counts; a loadgen row that
+// answered nothing still reads as zero, not as uncounted.
+func TestPerClient(t *testing.T) {
+	for _, c := range []struct {
+		r    Result
+		want string
+	}{
+		{Result{Answered: 10}, "—"},
+		{Result{}, "0 – 0"},
+		{Result{Answered: 10, MinPerClient: 4, MaxPerClient: 6}, "4 – 6"},
+	} {
+		if got := perClient(c.r); got != c.want {
+			t.Errorf("perClient(%+v) = %q, want %q", c.r, got, c.want)
+		}
+	}
+}

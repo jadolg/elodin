@@ -110,7 +110,7 @@ func NewSampler(pid int) *Sampler {
 }
 
 func (s *Sampler) Start() {
-	s.mark()
+	s.Mark()
 	go func() {
 		defer close(s.done)
 		tick := time.NewTicker(100 * time.Millisecond)
@@ -133,9 +133,7 @@ func (s *Sampler) Start() {
 
 // Mark starts the CPU count afresh, and reads Watch's size again, at the end
 // of a run's warmup: the queries they are divided by are counted from there.
-func (s *Sampler) Mark() { s.mark() }
-
-func (s *Sampler) mark() {
+func (s *Sampler) Mark() {
 	s.CPUStart, _ = CPUTime(s.pid)
 	if s.Watch != "" {
 		if fi, err := os.Stat(s.Watch); err == nil {

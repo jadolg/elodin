@@ -10,7 +10,8 @@ mise run release          # the numbers describe the optimised build
 mise run bench            # the whole matrix, about twenty minutes
 ```
 
-It needs `dnsperf` on `PATH` (`apt install dnsperf`), which drives the UDP, TCP
+It needs `dnsperf` on `PATH` (`apt install dnsperf`; 2.15 is the release it is
+written against), which drives the UDP, TCP
 and DoT rows; see [the load generators](#the-load-generators).
 
 Narrower runs, for when one table is what you care about:
@@ -304,7 +305,7 @@ cmd/mockdns/    upstream that answers after a fixed delay
 cmd/unitenv/    prints the environment the shipped unit gives elodin, for the load smoke
 cmd/rrlexp/     the rate-limiting and connection-share experiment: two clients, one server, per arm
 internal/dnswire/   DNS message building and parsing, independent of elodin
-internal/dnsperf/   reads dnsperf's report (go test ./internal/...)
+internal/dnsperf/   reads dnsperf's report
 internal/hist/      latency samples and percentiles
 internal/procstat/  RSS, CPU time and thread count for one pid
 internal/unitenv/   the shipped unit's Environment= assignments (go test ./internal/...)

@@ -200,8 +200,8 @@ type harness struct {
 }
 
 func (h *harness) setup() error {
-	// The generator and the mock are built from this module so a run needs
-	// nothing installed beyond a Go toolchain.
+	// The generator and the mock are built from this module. dnsperf, which
+	// drives the UDP, TCP and DoT rows, is the one generator installed apart.
 	for _, cmd := range []string{"loadgen", "mockdns"} {
 		bin := filepath.Join(h.dir, cmd)
 		build := exec.Command("go", "build", "-o", bin, "./cmd/"+cmd)
@@ -217,8 +217,9 @@ func (h *harness) setup() error {
 		}
 	}
 
-	// The UDP, TCP and DoT rows run under dnsperf (dnsperfDrives).
-	if _, err := exec.LookPath("dnsperf"); err != nil {
+	// The UDP, TCP and DoT rows run under dnsperf (dnsperfDrives); the DNSSEC
+	// survey runs no load.
+	if _, err := exec.LookPath("dnsperf"); err != nil && *survey == "" {
 		return fmt.Errorf("dnsperf is not on PATH: the UDP, TCP and DoT rows run under it (apt install dnsperf)")
 	}
 

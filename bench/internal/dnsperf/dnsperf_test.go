@@ -2,6 +2,7 @@ package dnsperf
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -21,39 +22,24 @@ func load(t *testing.T, name string) string {
 func TestParse(t *testing.T) {
 	us := time.Microsecond
 	cases := []struct {
-		file                  string
-		sent, completed, lost int64
-		qps                   float64
-		p50, p99              time.Duration
-		conns                 int64
-		rcodes                map[string]int64
+		file string
+		want Report
 	}{
 		// The connection block's own histogram (handshakes, 16-52 ms) must not
 		// reach the query percentiles.
-		{"dot.txt", 335937, 335937, 0, 335898.371687, 123 * us, 783 * us, 100, map[string]int64{"noerror": 335937}},
-		{"udp-mixed.txt", 2000, 2000, 0, 1999.928003, 55 * us, 97 * us, 0, map[string]int64{"noerror": 1000, "nxdomain": 1000}},
+		{"dot.txt", Report{Sent: 335937, Completed: 335937, Rcodes: map[string]int64{"noerror": 335937},
+			Seconds: 1.000115, QPS: 335898.371687, P50: 123 * us, P99: 783 * us, Connections: 100}},
+		{"udp-mixed.txt", Report{Sent: 2000, Completed: 2000, Rcodes: map[string]int64{"noerror": 1000, "nxdomain": 1000},
+			Seconds: 1.000036, QPS: 1999.928003, P50: 55 * us, P99: 97 * us}},
 		// num-queries-per-conn=100 over 4 clients: every client dialled again.
-		{"tcp-reconnect.txt", 1604, 1604, 0, 1552.572586, 97 * us, 47103 * us, 20, map[string]int64{"noerror": 1604}},
+		{"tcp-reconnect.txt", Report{Sent: 1604, Completed: 1604, Rcodes: map[string]int64{"noerror": 1604},
+			Seconds: 1.033124, QPS: 1552.572586, P50: 97 * us, P99: 47103 * us, Connections: 20}},
 		// Nothing answered: no histogram, no rcodes, every query lost.
-		{"udp-lost.txt", 8, 0, 8, 0, 0, 0, 0, map[string]int64{}},
+		{"udp-lost.txt", Report{Sent: 8, Lost: 8, Rcodes: map[string]int64{}, Seconds: 1.008171}},
 	}
 	for _, c := range cases {
-		r, err := Parse(load(t, c.file))
-		if err != nil {
-			t.Errorf("%s: %v", c.file, err)
-			continue
-		}
-		if r.Sent != c.sent || r.Completed != c.completed || r.Lost != c.lost || r.QPS != c.qps ||
-			r.P50 != c.p50 || r.P99 != c.p99 || r.Connections != c.conns || r.Seconds == 0 {
-			t.Errorf("%s: got %+v", c.file, r)
-		}
-		if len(r.Rcodes) != len(c.rcodes) {
-			t.Errorf("%s: rcodes %v, want %v", c.file, r.Rcodes, c.rcodes)
-		}
-		for k, v := range c.rcodes {
-			if r.Rcodes[k] != v {
-				t.Errorf("%s: rcodes %v, want %v", c.file, r.Rcodes, c.rcodes)
-			}
+		if r, err := Parse(load(t, c.file)); err != nil || !reflect.DeepEqual(r, c.want) {
+			t.Errorf("%s: got %+v, %v\nwant %+v", c.file, r, err, c.want)
 		}
 	}
 }

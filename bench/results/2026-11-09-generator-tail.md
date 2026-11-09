@@ -64,8 +64,8 @@ than a setting.
 ## The harness, after the change
 
 `go run ./cmd/bench -only compare -servers elodin -mock-cpus 2-3 -repeat 3
--duration 6s -warmup 2s -cooldown 2s`, with `-binary` for the build before
-#604. The cache-hit row is throughput / p99 / CPU per query:
+-duration 6s -warmup 2s -cooldown 2s`, with `-binary` for the build
+before #604. The cache-hit row is throughput / p99 / CPU per query:
 
 | build | UDP | TCP | DoT | DoH/1.1 | DoH/2 | blocked (UDP) |
 |---|---|---|---|---|---|---|

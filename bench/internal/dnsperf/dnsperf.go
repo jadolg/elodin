@@ -31,73 +31,105 @@ type bucket struct {
 	n  int64
 }
 
+// required is every line of the totals a report must carry.
+var required = []string{"Queries sent", "Queries completed", "Queries lost", "Run time (s)", "Queries per second", "Response codes"}
+
 // Parse reads dnsperf's output. The first block, under "Statistics:", is the
 // queries; a second, under "Connection Statistics:" (TCP and DoT only), is
 // the handshakes and has a histogram of its own, which is not query latency.
 // Output missing a figure the harness reports is refused rather than read as
 // zero, so a dnsperf that printed something else cannot pass as a result.
 func Parse(out string) (Report, error) {
+	queries, conns, _ := strings.Cut(out, "Connection Statistics:")
 	r := Report{Rcodes: map[string]int64{}}
+	var err error
+	if r.Connections, err = connectionAttempts(conns); err != nil {
+		return Report{}, err
+	}
 	var buckets []bucket
-	inConn, inHist := false, false
+	inHist := false
 	seen := map[string]bool{}
-	for line := range strings.SplitSeq(out, "\n") {
+	for line := range strings.SplitSeq(queries, "\n") {
 		line = strings.TrimSpace(line)
 		key, val, hasColon := strings.Cut(line, ":")
 		val = strings.TrimSpace(val)
 		switch {
-		case line == "Connection Statistics:":
-			inConn, inHist = true, false
-		case inConn:
-			if key == "Connection attempts" {
-				n, err := firstInt(val)
-				if err != nil {
-					return Report{}, fmt.Errorf("connection attempts %q: %w", val, err)
-				}
-				r.Connections = n
-			}
-		case strings.HasPrefix(line, "Latency bucket (s):"):
+		case key == "Latency bucket (s)":
 			inHist = true
 		case inHist && hasColon && strings.Contains(key, " - "):
-			_, hi, _ := strings.Cut(key, " - ")
-			secs, err := strconv.ParseFloat(strings.TrimSpace(hi), 64)
-			if err != nil {
-				return Report{}, fmt.Errorf("latency bucket %q: %w", line, err)
-			}
-			n, err := strconv.ParseInt(val, 10, 64)
-			if err != nil {
-				return Report{}, fmt.Errorf("latency bucket %q: %w", line, err)
-			}
-			// Rounded: 0.000065 s times 1e9 is 64999.99... ns.
-			buckets = append(buckets, bucket{time.Duration(math.Round(secs * float64(time.Second))), n})
+			var b bucket
+			b, err = parseBucket(key, val)
+			buckets = append(buckets, b)
 		default:
 			inHist = false
-			var err error
-			switch key {
-			case "Queries sent":
-				r.Sent, err = firstInt(val)
-			case "Queries completed":
-				r.Completed, err = firstInt(val)
-			case "Queries lost":
-				r.Lost, err = firstInt(val)
-			case "Run time (s)":
-				r.Seconds, err = strconv.ParseFloat(val, 64)
-			case "Queries per second":
-				r.QPS, err = strconv.ParseFloat(val, 64)
-			case "Response codes":
-				err = parseRcodes(val, r.Rcodes)
-			default:
-				continue
-			}
-			if err != nil {
-				return Report{}, fmt.Errorf("%s %q: %w", key, val, err)
-			}
-			seen[key] = true
+			seen[key], err = r.total(key, val)
+		}
+		if err != nil {
+			return Report{}, fmt.Errorf("%q: %w", line, err)
 		}
 	}
-	for _, k := range []string{"Queries sent", "Queries completed", "Queries lost", "Run time (s)", "Queries per second", "Response codes"} {
+	if err := r.finish(seen, buckets); err != nil {
+		return Report{}, err
+	}
+	return r, nil
+}
+
+// connectionAttempts reads the count from the connection block, which UDP
+// runs do not print.
+func connectionAttempts(conns string) (int64, error) {
+	for line := range strings.SplitSeq(conns, "\n") {
+		key, val, _ := strings.Cut(strings.TrimSpace(line), ":")
+		if key == "Connection attempts" {
+			n, err := firstInt(strings.TrimSpace(val))
+			if err != nil {
+				return 0, fmt.Errorf("connection attempts %q: %w", val, err)
+			}
+			return n, nil
+		}
+	}
+	return 0, nil
+}
+
+// parseBucket reads "0.000046 - 0.000047:  12" as its upper edge and count.
+func parseBucket(key, val string) (bucket, error) {
+	_, hi, _ := strings.Cut(key, " - ")
+	secs, err := strconv.ParseFloat(strings.TrimSpace(hi), 64)
+	if err != nil {
+		return bucket{}, err
+	}
+	n, err := strconv.ParseInt(val, 10, 64)
+	// Rounded: 0.000065 s times 1e9 is 64999.99... ns.
+	return bucket{time.Duration(math.Round(secs * float64(time.Second))), n}, err
+}
+
+// total reads one line of the totals into r, and says whether it was one.
+func (r *Report) total(key, val string) (bool, error) {
+	var err error
+	switch key {
+	case "Queries sent":
+		r.Sent, err = firstInt(val)
+	case "Queries completed":
+		r.Completed, err = firstInt(val)
+	case "Queries lost":
+		r.Lost, err = firstInt(val)
+	case "Run time (s)":
+		r.Seconds, err = strconv.ParseFloat(val, 64)
+	case "Queries per second":
+		r.QPS, err = strconv.ParseFloat(val, 64)
+	case "Response codes":
+		err = parseRcodes(val, r.Rcodes)
+	default:
+		return false, nil
+	}
+	return true, err
+}
+
+// finish refuses a report missing a total or whose histogram does not hold
+// every answer, and takes the percentiles from the histogram.
+func (r *Report) finish(seen map[string]bool, buckets []bucket) error {
+	for _, k := range required {
 		if !seen[k] {
-			return Report{}, fmt.Errorf("dnsperf printed no %q", k)
+			return fmt.Errorf("dnsperf printed no %q", k)
 		}
 	}
 	var total int64
@@ -105,10 +137,10 @@ func Parse(out string) (Report, error) {
 		total += b.n
 	}
 	if total != r.Completed {
-		return Report{}, fmt.Errorf("latency histogram holds %d answers, dnsperf completed %d (is it run with -O latency-histogram?)", total, r.Completed)
+		return fmt.Errorf("latency histogram holds %d answers, dnsperf completed %d (is it run with -O latency-histogram?)", total, r.Completed)
 	}
 	r.P50, r.P99 = quantile(buckets, total, 0.50), quantile(buckets, total, 0.99)
-	return r, nil
+	return nil
 }
 
 // quantile is the upper edge of the bucket holding the sample at q, the same

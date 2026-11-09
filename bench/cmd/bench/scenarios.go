@@ -633,9 +633,10 @@ func (h *harness) transports() (section, error) {
 	return section{title: "Transports, one connection per client", body: sb.String()}, nil
 }
 
-// perClient is the spread of answers across clients, which only loadgen counts.
+// perClient is the spread of answers across clients, which only loadgen counts:
+// a row with answers and no spread is dnsperf's, and one with neither is "0 – 0".
 func perClient(r Result) string {
-	if r.MaxPerClient == 0 {
+	if r.MaxPerClient == 0 && r.Answered > 0 {
 		return "—"
 	}
 	return fmt.Sprintf("%d – %d", r.MinPerClient, r.MaxPerClient)
