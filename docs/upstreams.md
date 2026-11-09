@@ -105,8 +105,10 @@ server a few queries later than an unreachable one;
 A `udp://` server whose port is closed fails over at once, not at the timeout:
 an ICMP unreachable for the query is checked by asking the same server over TCP,
 and a refused connect there is the `Dial_Failed` that counts. A forged ICMP
-therefore moves one query to TCP rather than failing it, unless the server's TCP
-is refused or dropped, where that query fails as its TCP does. The ICMP for a
+therefore moves one query onto the shared TCP connection rather than failing it,
+unless the server's TCP is refused or dropped, where that query fails as its TCP
+does. It never opens a connection of its own: with the shared one full, the
+query moves on to the next member as `Backlogged`. The ICMP for a
 `bootstrap` query is ignored, so a closed bootstrap server costs its share of
 the timeout.
 
@@ -131,7 +133,7 @@ level=warn msg="upstream quad9-dot: TLS handshake with \"dns.quad9.net\" failed:
 | `Too_Large` | an `https` 200 longer than a DNS message (65535 bytes, RFC 8484 section 6), over HTTP/2 or HTTP/1.1; over HTTP/2 also a stream whose DATA, padding included, passes half the 1 MiB receive window. A declared `Content-Length` past it is refused before the body is read; it is not retried on a fresh connection. Any other status is `HTTP_Error` whatever the size of its body |
 | `HTTP_Error` | an `https` reply that is not a 200 with at least a DNS header; over HTTP/2 also a stream the upstream reset with anything but REFUSED_STREAM, and a response RFC 9113 sections 8.1 to 8.3 make malformed: a missing, malformed or second `:status`, another pseudo-header, or a field section 8.2 refuses in its header section; a pseudo-header such as `:status` or a field 8.2 refuses in its trailers; trailers that do not end the stream, an interim (1xx) response that does, or DATA ahead of the final response |
 | `TLS_Failed`, `Verify_Failed` | the handshake; the log line carries OpenSSL's reason |
-| `Backlogged` | not sent: the pipelined connection's queue would outlast the query's timeout (see [connections](#connections)); never counts towards the cooldown |
+| `Backlogged` | not sent: the pipelined connection's queue would outlast the query's timeout (see [connections](#connections)), or it was full when a `udp://` query was being checked over TCP after an ICMP error; never counts towards the cooldown |
 
 `Bad_Response` on a `udp://` or `tcp://` upstream means answers are arriving and
 being refused. An anycast resolver whose nodes do not share a cookie secret does

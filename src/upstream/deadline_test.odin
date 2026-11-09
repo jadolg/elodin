@@ -568,10 +568,17 @@ test_the_calls_of_one_question_share_its_deadline :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// Reads one query and answers nothing, but sends a datagram of junk to the
-// asker at `at` after it arrived: a stray, or a forgery, that the exchange must
-// pass over. From the server's own address and port, since the exchange's socket
-// is connected and the kernel drops a datagram from any other (issue #622).
+/*
+Reads one query and answers nothing, but sends the asker two datagrams of junk:
+strays, or forgeries, that the exchange must pass over. From the server's own
+address and port, since the exchange's socket is connected and the kernel drops
+a datagram from any other (issue #622).
+
+The first lands at a tenth of the timeout, with the rest of it to spare, so it
+is certain to reach the read: what shows the strays are read at all. The second
+lands at `at`, late enough that a wait restarted by it would outlast the
+assertion's half a timeout of slack.
+*/
 @(private = "file")
 Stray_Mock :: struct {
 	socket: net.UDP_Socket,
@@ -585,12 +592,15 @@ stray_mock_serve :: proc(m: ^Stray_Mock) {
 	if err != nil || n < dns.HEADER_SIZE {
 		return
 	}
-	time.sleep(m.at)
+	early := DEADLINE_TIMEOUT / 10
+	time.sleep(early)
+	_, _ = net.send_udp(m.socket, buf[:n], client)
+	time.sleep(m.at - early)
 	_, _ = net.send_udp(m.socket, buf[:n], client)
 }
 
-// Binds the mock, the stray landing at nine tenths of the timeout. The caller
-// closes the socket.
+// Binds the mock, the late stray landing at nine tenths of the timeout. The
+// caller closes the socket.
 @(private = "file")
 stray_mock_bind :: proc(t: ^testing.T) -> (m: Stray_Mock, ok: bool) {
 	m.at = DEADLINE_TIMEOUT * 9 / 10
@@ -637,10 +647,8 @@ test_a_stray_datagram_does_not_extend_a_udp_exchange :: proc(t: ^testing.T) {
 	thread.destroy(worker)
 	delete(resp, context.allocator)
 
-	// `Bad_Response` if the stray reached the read before the deadline and was
-	// passed over, `Timeout` if it landed after: which one races the deadline,
-	// and either way the exchange must end on time.
-	testing.expectf(t, xerr == .Bad_Response || xerr == .Timeout, "the exchange ended %v", xerr)
+	// Not `Timeout`: the early stray reached the read and was passed over.
+	testing.expect_value(t, xerr, Error.Bad_Response)
 	testing.expectf(t, spent < DEADLINE_TIMEOUT * 3 / 2, "the exchange waited %v, where its timeout is %v", spent, DEADLINE_TIMEOUT)
 	free_all(context.temp_allocator)
 }

@@ -287,8 +287,8 @@ bootstrap_query :: proc(
 		An ICMP error on the connected socket (see `open_udp`) is waited past,
 		as Unbound does with every one: forgeable by whoever guesses the source
 		port, and unlike `exchange_udp` this has no TCP path to check it on, so
-		taking it would hand an off-path sender the bootstrap answer - the
-		address every query to this upstream goes to. Reported once, so the next
+		taking it would let an off-path sender skip this server, or with one
+		per server leave the upstream unresolved. Reported once, so the next
 		read waits again; a bootstrap server whose port is closed costs this
 		server's share of the timeout.
 		*/

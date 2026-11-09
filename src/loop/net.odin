@@ -156,7 +156,7 @@ recv_udp :: proc(socket: net.UDP_Socket, buf: []u8) -> (int, net.Endpoint, net.U
 }
 
 /*
-`recv_udp` and `send_udp`, waiting until `deadline` rather than for the socket's
+`recv_udp`, waiting until `deadline` rather than for the socket's
 timeout option. The option costs a `setsockopt` to set and a `getsockopt` to
 read back, both per query on a socket that lives for one exchange (#612). The
 zero tick is no deadline.
@@ -166,7 +166,8 @@ recv_udp_until :: proc(socket: net.UDP_Socket, buf: []u8, deadline: Tick) -> (in
 }
 
 /*
-For a connected socket, so it takes no address: `send` rides the route the
+`send_udp` waiting until `deadline`, as `recv_udp_until` does, and for a
+connected socket, so it takes no address: `send` rides the route the
 connect cached, where a `sendto` naming the peer looks one up again per datagram
 (`udp_sendmsg`'s connected fast path is for a send without one).
 */
@@ -213,24 +214,10 @@ recv_udp_armed :: proc(
 }
 
 send_udp :: proc(socket: net.UDP_Socket, buf: []u8, to: net.Endpoint) -> (int, net.UDP_Send_Error) {
-	return send_udp_armed(socket, buf, to, {}, false)
-}
-
-@(private)
-send_udp_armed :: proc(
-	socket: net.UDP_Socket,
-	buf: []u8,
-	to: net.Endpoint,
-	deadline: Tick,
-	armed: bool,
-) -> (
-	int,
-	net.UDP_Send_Error,
-) {
 	assert_nonblocking(linux.Fd(socket))
-	// Read only to arm from the socket's option; a deadline given needs no clock.
-	start := Tick{} if armed else tick_now()
-	deadline, armed := deadline, armed
+	start := tick_now()
+	deadline: Tick
+	armed: bool
 	for {
 		n, err := net.send_udp(socket, buf, to)
 		if err != .Would_Block {

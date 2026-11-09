@@ -633,6 +633,17 @@ get_pipe :: proc(
 	u: ^Upstream,
 	timeout: time.Duration,
 	deadline: time.Tick,
+	/*
+	False for a caller that may not dial a connection of its own past a full
+	shared one, and is turned away as `Backlogged` instead: `exchange_udp`'s
+	check of an ICMP error (issue #622). Its trigger is a datagram an off-path
+	sender can forge for every exchange in flight at once, and a connection per
+	query would let a spray of them turn the forwarder's UDP into a TCP
+	handshake per query against the upstream. A shared connection open enough
+	to be full is the answer the check was for - the server's TCP is there - so
+	the query moves on to the next member, uncharged.
+	*/
+	private := true,
 ) -> (
 	c: ^Pipe_Conn,
 	err: Error,
@@ -669,6 +680,10 @@ get_pipe :: proc(
 				sync.mutex_unlock(&u.mu)
 				return c, .None
 			case .Full:
+				if !private {
+					sync.mutex_unlock(&u.mu)
+					return nil, .Backlogged
+				}
 				// A connection of this caller's own, left out of `u.pipe` so
 				// it is closed again the moment this query is done with it.
 				// The shared one stays where it is for everyone else.
@@ -730,6 +745,9 @@ exchange_pipelined :: proc(
 	// This exchange's, which a UDP reply's retry has already spent part of.
 	deadline: time.Tick,
 	allocator: mem.Allocator,
+	// Whether a full shared connection may be stepped round with one of this
+	// query's own; see `get_pipe`.
+	private := true,
 ) -> (
 	response: []u8,
 	err: Error,
@@ -748,7 +766,7 @@ all of it.
 	timeout, and, through `pipe_framing_deadline`, a bound whose blast radius
 	is the shared connection rather than one query.
 	*/
-	c, gerr := get_pipe(u, timeout, deadline)
+	c, gerr := get_pipe(u, timeout, deadline, private)
 	if gerr != .None {
 		return nil, gerr
 	}
@@ -803,7 +821,7 @@ all of it.
 
 	// Held until the redial is done, so `get_pipe` sees the dead connection it
 	// has to replace rather than an address something else has since reused.
-	retry, rerr := get_pipe(u, timeout, deadline)
+	retry, rerr := get_pipe(u, timeout, deadline, private)
 	_ = pipe_unref(c)
 	if rerr != .None {
 		return nil, rerr

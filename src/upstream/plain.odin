@@ -88,31 +88,34 @@ exchange_udp :: proc(
 			the datagram was larger than the room the query offered, so what
 			arrived is a prefix of an answer, and TCP is where the whole one is.
 
-			Anything else is an ICMP error the kernel matched to this connected
-			socket (issue #622): a hard one in `__udp4_lib_err`'s terms - a
-			destination unreachable `icmp_err_convert` marks fatal (port or
-			protocol unreachable, an unknown or prohibited host or network),
-			fragmentation needed, a parameter problem - since it keeps the soft
-			ones, host and network unreachable among them, from a socket without
-			IP_RECVERR. It is not the verdict: an off-path sender who guesses
-			the source port can forge one, and acted on it would end the
-			exchange and, three in a row, park the upstream for `COOLDOWN`. The
-			same server asked over TCP gives one that cannot be forged that way:
-			a closed port answers the SYN with a RST acknowledging our initial
-			sequence number, which fails the dial at once as `Dial_Failed`, and
-			a live one answers the query.
+			Anything else is, in practice, an ICMP error the kernel matched to
+			this connected socket (issue #622): a hard one in `__udp4_lib_err`'s
+			terms - a destination unreachable `icmp_err_convert` marks fatal
+			(port or protocol unreachable, an unknown or prohibited host or
+			network), fragmentation needed, a parameter problem - since it keeps
+			the soft ones, host and network unreachable among them, from a
+			socket without IP_RECVERR. It is not the verdict: an off-path sender
+			who guesses the source port can forge one, and acted on it would end
+			the exchange and, three in a row, park the upstream for `COOLDOWN`.
+			The same server asked over TCP gives one that cannot be forged that
+			way: a closed port answers the SYN with a RST acknowledging our
+			initial sequence number, which fails the dial at once as
+			`Dial_Failed`, and a live one answers the query.
+
+			A local failure of the read takes the same road, and costs a TCP
+			exchange rather than a wrong verdict.
 
 			So a forged ICMP buys its sender one query moved to the pipelined
-			connection - and, against a server whose TCP is refused or dropped,
-			that query's failure, charged as its TCP's. RFC 7766 section 5 has
-			every DNS server support TCP, and a TC answer from such a server
-			fails the same way. RFCs are silent on what a forwarder does with
-			the ICMP itself; PowerDNS Recursor fails the query and throttles the
-			server on it, Unbound connects but ignores it and waits out the
-			timeout.
+			connection, never a connection of its own (see `get_pipe`) - and,
+			against a server whose TCP is refused or dropped, that query's
+			failure, charged as its TCP's. RFC 7766 section 5 has every DNS
+			server support TCP, and a TC answer from such a server fails the
+			same way. RFCs are silent on what a forwarder does with the ICMP
+			itself; PowerDNS Recursor fails the query and throttles the server
+			on it, Unbound connects but ignores it and waits out the timeout.
 			*/
 			if recv_err != .Would_Block {
-				return exchange_pipelined(u, query, timeout, deadline, allocator)
+				return exchange_pipelined(u, query, timeout, deadline, allocator, private = recv_err == .Excess_Truncated)
 			}
 			return nil, .Bad_Response if rejected else .Timeout
 		}
