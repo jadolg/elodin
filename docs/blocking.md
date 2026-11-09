@@ -117,8 +117,9 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
 - Hosts entries are exact, since hosts lists spell out every subdomain; bare
   domains and `||` rules cover subtrees, as in AdGuard Home. In a domains
   list, one leading dot (`.ads.foo.com`, Squid and Privoxy style) marks the
-  same subtree as the bare name; a hosts or adblock line gives it no meaning. A hosts line
-  whose first field is not an IPv4 or IPv6 address adds nothing.
+  same subtree as the bare name; a hosts or adblock line gives it no meaning,
+  and a line with a dot at both ends (`.ads.`, a Privoxy pattern) is skipped.
+  A hosts line whose first field is not an IPv4 or IPv6 address adds nothing.
 - A name holding a byte outside ASCII, such as an international name written
   in UTF-8 (`bücher.example`), is skipped: a client asks for the punycode
   form (`xn--bcher-kva.example`), so write it that way. The list's load says

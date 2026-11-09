@@ -292,6 +292,10 @@ test_a_leading_dot_domain_line_covers_the_name_and_everything_under_it :: proc(t
 	// a hosts or adblock line gives it no meaning.
 	testing.expect_value(t, matches("*..ads.example\n", .Domains, "x.ads.example."), Decision.None)
 	testing.expect_value(t, matches("..ads.example\n", .Domains, "ads.example."), Decision.None)
+	// A dot at both ends is Privoxy's unanchored pattern, not a subtree of the
+	// name between them.
+	testing.expect_value(t, matches(".ads.\n", .Domains, "x.ads."), Decision.None)
+	testing.expect_value(t, matches(".ads.example.\n", .Domains, "ads.example."), Decision.None)
 	testing.expect_value(t, matches("0.0.0.0 .ads.example\n", .Hosts, "ads.example."), Decision.None)
 	testing.expect_value(t, matches(".ads.example\n", .Adblock, "x.ads.example."), Decision.None)
 }
