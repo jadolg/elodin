@@ -292,6 +292,34 @@ reader_exact :: proc(r: ^Buf_Reader, n: int) -> (data: []u8, err: Error) {
 }
 
 /*
+`data`, the body as read into `r.buf`, as the caller's own. A list is up to
+`max_body` bytes, and a copy out of the buffer holds it twice at the peak - a 64
+MB list costing 128 MB on top of the rule sets a refresh builds (#414). So when
+the buffer is in the caller's allocator it is the body: moved to its start, cut
+to its length, and `r.buf` left empty for the exchange's deferred delete. An
+empty body is nil, which `shrink` to nothing leaves.
+*/
+@(private)
+reader_take :: proc(r: ^Buf_Reader, data: []u8, allocator: mem.Allocator) -> []u8 {
+	if r.buf.allocator != allocator {
+		out := make([]u8, len(data), allocator)
+		copy(out, data)
+		return out
+	}
+	n := copy(r.buf[:], data)
+	resize(&r.buf, n)
+	// In place: a heap block cut short is not moved.
+	shrink(&r.buf)
+	body := r.buf[:]
+	r.buf = {}
+	return body
+}
+
+// How much of a chunk is read before it is copied into the body; see `read_chunked`.
+@(private)
+CHUNK_PIECE :: 64 * 1024
+
+/*
 Read until the peer closes, for responses with no length information.
 
 Bounded by `limit`, like every other framing path: the header scan stops at 64
@@ -585,16 +613,10 @@ http_exchange :: proc(
 		// Before a byte of the body is read.
 		return resp, .Too_Large
 	case content_length > 0:
-		data := reader_exact(&r, content_length) or_return
-		out := make([]u8, len(data), allocator)
-		copy(out, data)
-		resp.body = out
+		resp.body = reader_take(&r, reader_exact(&r, content_length) or_return, allocator)
 	case:
 		// No framing information: the body ends when the connection does.
-		data := reader_to_end(&r, max_body) or_return
-		out := make([]u8, len(data), allocator)
-		copy(out, data)
-		resp.body = out
+		resp.body = reader_take(&r, reader_to_end(&r, max_body) or_return, allocator)
 		resp.keep_alive = false
 	}
 	return resp, .None
@@ -720,13 +742,21 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator, limit: int) -> (b
 		if size > u64(limit) || len(out) + int(size) > limit {
 			return nil, .Too_Large
 		}
-		data := reader_exact(r, int(size)) or_return
-		// Doubled, but never past `limit`: `append` grows by more than twice,
-		// which would hold a body just under the limit in more than it allows.
-		if need := len(out) + len(data); need > cap(out) {
-			reserve(&out, min(max(2 * cap(out), need), limit))
+		/*
+		Read in pieces, each copied out before the next, so `r.buf` holds a
+		piece rather than the chunk: a list sent as one chunk is held once, in
+		`out`, not twice (#414).
+		*/
+		for left := int(size); left > 0; {
+			data := reader_exact(r, min(left, CHUNK_PIECE)) or_return
+			// Doubled, but never past `limit`: `append` grows by more than twice,
+			// which would hold a body just under the limit in more than it allows.
+			if need := len(out) + len(data); need > cap(out) {
+				reserve(&out, min(max(2 * cap(out), need), limit))
+			}
+			append(&out, ..data)
+			left -= len(data)
 		}
-		append(&out, ..data)
 		// The data ends in CRLF and nothing else (RFC 9112 7.1). Thrown away,
 		// the line let `helloEXTRA` read as `hello` on a connection kept for
 		// the next response (#437).
