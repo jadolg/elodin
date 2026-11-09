@@ -150,7 +150,11 @@ func (h *harness) hitCell(s *server, kind, t string, fail failer) string {
 	if err != nil {
 		return fail(kind, label(t), err)
 	}
-	return fmt.Sprintf("%s / %s / %d µs%s", thousands(r.QPS), ms(r.P99ms), sm.CPUPerQuery(r.Answered).Microseconds(), timedOut(r))
+	cpu := fmt.Sprintf("%d µs", sm.CPUPerQuery(r.Answered).Microseconds())
+	if t == "tcp" && forksTCP[kind] {
+		cpu = forkedCell
+	}
+	return fmt.Sprintf("%s / %s / %s%s", thousands(r.QPS), ms(r.P99ms), cpu, timedOut(r))
 }
 
 // missLadder is the offered cache-miss rates compareMisses climbs, and
@@ -294,6 +298,9 @@ func (h *harness) compareHeld(sb *strings.Builder, fail failer) error {
 func (h *harness) heldCell(kind, t string, fail failer) string {
 	if !supports(kind, t) {
 		return "—"
+	}
+	if t == "tcp" && forksTCP[kind] {
+		return forkedCell
 	}
 	s, err := h.startServer(serverOpts{name: "cmp-conns", kind: kind, cache: true,
 		maxConnections: heldN + 64, clientTimeout: 120 * time.Second})

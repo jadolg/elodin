@@ -143,7 +143,9 @@ Three of them need the machine prepared:
 Blocky, Pi-hole and Knot answer all of `test.` themselves (RFC 6761), as Unbound
 does, so each config forwards the mock's zone explicitly. Knot runs as one
 process, which is one thread: it scales by running a process per core, and the
-harness samples one pid.
+harness samples one pid. Pi-hole serves each TCP connection from a forked
+child, which that pid does not include, so its TCP CPU and per idle TCP
+connection read unmeasured.
 
 ## The load generators
 

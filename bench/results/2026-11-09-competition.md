@@ -9,7 +9,14 @@ Linux 7.0.0-42-generic), server and generator on the same machine, on
 sudo sysctl net.core.rmem_default=1048576
 go run ./cmd/bench -only compare -servers all -competitors ~/competitors \
   -unbound /home/ubuntu/unbound-bench -mock-cpus 2-3 -cooldown 5s
+# Pi-hole's rows, after its TCP limit was set
+go run ./cmd/bench -only compare -servers pihole -competitors ~/competitors \
+  -mock-cpus 2-3 -cooldown 5s
 ```
+
+Pi-hole's rows are from that second run, the others from the first. Its UDP
+row read 181k in the first and 164k in the second, about the run-to-run
+spread.
 
 Mock upstream at 20 ms, DNSSEC off, each run 10 s after 2 s of warmup, median
 of 3. elodin runs its shipped defaults (`server.pin_loops` off) under the
@@ -29,11 +36,12 @@ shipped unit's environment. Versions are as in the first two rounds.
   now reads 342k.
 - **Pi-hole serves the shared TCP connection limit** (`max-tcp-connections`),
   as the others serve their counterpart of `max_connections`. At dnsmasq's
-  default of 20, dnsperf, which does not redial, read 30 qps with every
-  client timed out. Pi-hole's rows below are from a re-run with the limit set
-  (`-servers pihole`); in it it holds 997 of 1,000 idle connections, 60 before.
-  Its UDP row read 181k in the main run and 164k in the re-run, about the
-  run-to-run spread.
+  default of 20 the other 80 connections waited in the listen backlog,
+  accepted by the kernel and never served or closed, so dnsperf had nothing
+  to redial: 30 qps with every client timed out. With the limit set it holds
+  997 of 1,000 idle connections, 60 before.
+- **Pi-hole's TCP CPU and per idle TCP connection read unmeasured.** It serves
+  each TCP connection from a forked child, and the harness samples one pid.
 
 ## elodin since the second round
 
@@ -44,12 +52,13 @@ Only rows whose method did not change; the second round's CPU divided by 1.2.
 | misses sustained | 75,000 qps | 100,000 qps, the ladder's top step |
 | CPU per miss there | 27 µs (≈22) | 14 µs |
 | at 2,000 qps: p99 / CPU | 22.3 ms / 52 µs (≈43) | 21.5 ms / 40 µs |
-| blocked ÷ hit, UDP | 76% | 93% |
 | per idle TCP / DoT / DoH/2 | 8.7 / 43 / 46 KB | 4.7 / 39 / 41 KB |
 | per query in flight | 17 KB | 16 KB |
 
 100,000 qps is about what the mock carries on two cores, so elodin's miss
-ceiling is unmeasured.
+ceiling is unmeasured. Blocked answers are left out: within one run they cost
+93% of a hit against 76% in the second round, but both cells changed
+generator, so how much of that is #611 the two rounds cannot say.
 
 ## Memory
 
@@ -79,7 +88,7 @@ Server on CPUs 0-1 with two threads, generator on 2-3, 100 clients each holding 
 | Unbound 1.24.2 | 717,338 / 0.12 ms / 2 µs | 436,802 / 0.48 ms / 4 µs | 349,829 / 0.48 ms / 5 µs | — | 137,312 / 2.4 ms / 11 µs | 701,416 / 0.34 ms / 1 µs |
 | AdGuard Home 0.107.80 | 114,949 / 3.0 ms / 16 µs | 120,344 / 4.0 ms / 15 µs | 116,778 / 3.9 ms / 16 µs | 83,749 / 5.2 ms / 22 µs | 56,046 / 6.5 ms / 33 µs | 126,453 / 2.7 ms / 15 µs |
 | Blocky 0.35.0 | 162,465 / 2.4 ms / 11 µs | 128,743 / 1.7 ms / 12 µs (**81 failed, 10,000 reconnects**) | 47,226 / 3.9 ms / 15 µs (**70 failed, 3,747 reconnects**) | 85,081 / 4.8 ms / 20 µs | — | 168,238 / 1.9 ms / 11 µs |
-| Pi-hole FTL 6.8 | 164,114 / 1.9 ms / 12 µs | 9,887 / 122.9 ms / 50 µs (**59 failed, 947 reconnects**) | — | — | — | 180,605 / 1.7 ms / 10 µs |
+| Pi-hole FTL 6.8 | 164,114 / 1.9 ms / 12 µs | 9,887 / 122.9 ms / — (a process per connection) (**59 failed, 947 reconnects**) | — | — | — | 180,605 / 1.7 ms / 10 µs |
 | CoreDNS 1.15.0 | 298,030 / 1.3 ms / 6 µs | 343,391 / 1.8 ms / 4 µs | 283,369 / 1.9 ms / 5 µs | 125,998 / 4.4 ms / 11 µs | 66,456 / 5.6 ms / 23 µs | — |
 | dnsmasq 2.92 | 319,818 / 0.37 ms / 3 µs | — | — | — | — | 307,723 / 0.39 ms / 3 µs |
 | PowerDNS Recursor 5.3.5 | 720,304 / 0.14 ms / 2 µs | 340,244 / 0.53 ms / 2 µs | — | — | — | 697,348 / 0.17 ms / 2 µs |
@@ -115,14 +124,13 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
 | Unbound 1.24.2 | 0.2 KB | 55 KB | 69 KB | 13 KB (all answered) |
 | AdGuard Home 0.107.80 | 21 KB | 46 KB | 72 KB | 25 KB (all answered) |
 | Blocky 0.35.0 | 20 KB | 34 KB | — | 32 KB (all answered) |
-| Pi-hole FTL 6.8 | 0.2 KB (**997 of 1,000**) | — | — | 0.8 KB (all answered) |
+| Pi-hole FTL 6.8 | — (a process per connection) | — | — | 0.8 KB (all answered) |
 | CoreDNS 1.15.0 | 7.2 KB | 37 KB | 57 KB | 14 KB (all answered) |
 | dnsmasq 2.92 | — | — | — | 0.3 KB (all answered) |
 | PowerDNS Recursor 5.3.5 | 1.4 KB | — | — | 16 KB (all answered) |
 | dnsdist 2.0.2 | 0.1 KB | 26 KB | 42 KB | 0.0 KB (all answered) |
 | BIND 9.20.24 | 9.8 KB | 65 KB | 73 KB | 33 KB (all answered) |
 | Knot Resolver 6.2.0 | 7.0 KB | 41 KB | 60 KB | 22 KB (all answered) |
-
 
 ## Reading the tables
 
@@ -141,20 +149,25 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
 
 - Cache misses: the only server to carry every step, 100,000 qps; dnsdist
   75,000, the recursors 25,000 or fewer.
-- TCP hits, 573k at p99 0.29 ms, and DoH/1.1, 141k.
-- 10 MB idle, 21 MB with 250,000 names.
+- DoH/1.1 hits, 141k against CoreDNS's 126k.
+- TCP p99, 0.29 ms, the lowest, at the highest TCP rate.
 
 ## Level
 
-- UDP (777k against dnsdist's 794k), DoT (435k against 429k), DoH/2 (133k
-  against BIND's 139k), blocked (719k against 743k): inside the spread.
+- UDP (777k against dnsdist's 794k), TCP (573k against 556k), DoT (435k
+  against 429k), DoH/2 (133k against BIND's 139k), blocked (719k against
+  743k): inside the spread.
+- Weight: 10 MB idle, as Pi-hole, behind dnsmasq's 5 MB. 21 MB with
+  250,000 names, behind Pi-hole's 10 MB (its list is in SQLite on disk) and
+  ahead of dnsmasq's 26 MB.
 
 ## Where elodin falls behind
 
 - CPU per miss: 14 µs against dnsdist's 6 µs.
-- UDP p99 at saturation: 0.43 ms against Unbound's 0.12 ms and PowerDNS's
-  0.14 ms, each at its own rate.
+- UDP p99 at saturation: 0.43 ms, against Unbound 0.12, PowerDNS 0.14,
+  dnsdist 0.27, BIND and dnsmasq 0.37 ms, each at its own rate.
 - Per idle TCP connection: 4.7 KB against 0.1-1.4 KB for dnsdist, Unbound and
   PowerDNS. Per idle DoT: 39 KB against dnsdist's 26 KB.
-- Per query in flight: 16 KB against Unbound's 13 KB.
+- Per query in flight: 16 KB against Unbound's 13 KB and CoreDNS's 14 KB
+  (the forwarders hold under 1 KB).
 - Per cache entry: 311 B, fourth behind dnsmasq, Pi-hole and dnsdist.

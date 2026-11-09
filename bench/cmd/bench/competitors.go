@@ -40,6 +40,14 @@ var competitors = map[string]competitor{
 	"knot":        {"kresd", "--version", []string{"udp", "tcp", "dot", "doh2"}, true, knotConfig},
 }
 
+// forksTCP is the servers that serve each TCP connection from a forked child
+// (dnsmasq's model, which Pi-hole's FTL keeps). The harness samples one pid,
+// so their TCP CPU and per-connection memory would count the parent alone;
+// those cells read unmeasured rather than as a figure for nothing.
+var forksTCP = map[string]bool{"pihole": true}
+
+const forkedCell = "— (a process per connection)"
+
 // supports says whether kind serves transport, and whether it can block.
 func supports(kind, transport string) bool {
 	switch kind {
