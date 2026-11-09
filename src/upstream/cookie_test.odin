@@ -60,10 +60,10 @@ cookie_mock_loop :: proc(m: ^Cookie_Mock) {
 		m.last_len = copy(m.last_query[:], buf[:n])
 		sync.mutex_unlock(&m.mu)
 
-		reply, ok := cookie_mock_reply(m, buf[:n], count)
 		if limit, capped := m.answer.?; capped && count > limit {
-			ok = false
+			continue
 		}
+		reply, ok := cookie_mock_reply(m, buf[:n], count)
 		if ok {
 			_, _ = net.send_udp(m.socket, reply, client)
 		}
@@ -454,11 +454,8 @@ test_upstream_cookie_retry_left_unanswered_times_out :: proc(t: ^testing.T) {
 	started := time.tick_now()
 	_, err := exchange(u, edns_query("example.com."), TIMEOUT, context.temp_allocator)
 	testing.expect_value(t, err, Error.Timeout)
-
-	sync.mutex_lock(&m.mu)
-	seen := m.queries
-	sync.mutex_unlock(&m.mu)
-	testing.expect_value(t, seen, 2)
+	// The retry's send is the third wait, so four show it went out without
+	// reading a count the mock may not have reached yet.
 	expect_udp_waits_share(t, started, TIMEOUT, 4)
 	free_all(context.temp_allocator)
 }

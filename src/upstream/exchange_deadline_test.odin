@@ -219,10 +219,10 @@ test_bootstrap_resolution_shares_the_exchange_timeout :: proc(t: ^testing.T) {
 	_, xerr := exchange(u, wire, X_TIMEOUT, context.temp_allocator)
 
 	testing.expect_value(t, xerr, Error.Not_Resolved)
-	// Each bootstrap query had `BOOTSTRAP_TIMEOUT` of its own - three seconds,
-	// for A and again for AAAA - before the exchange's timeout even began. The
-	// one server gets all of it, so A's send and read run to the exchange's
-	// deadline and AAAA is never asked.
+	// A bootstrap query given `BOOTSTRAP_TIMEOUT` of its own - three seconds,
+	// for A and again for AAAA - waits past the exchange's deadline. The one
+	// server gets all of what the exchange has, so A's send and read run to the
+	// exchange's deadline and AAAA is never asked.
 	expect_udp_waits_share(t, started, X_TIMEOUT, 2)
 	u.spec.bootstrap = nil
 	free_all(context.temp_allocator)
