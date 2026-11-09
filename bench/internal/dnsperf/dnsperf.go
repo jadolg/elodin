@@ -5,6 +5,7 @@ package dnsperf
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -67,7 +68,8 @@ func Parse(out string) (Report, error) {
 			if err != nil {
 				return Report{}, fmt.Errorf("latency bucket %q: %w", line, err)
 			}
-			buckets = append(buckets, bucket{time.Duration(secs * float64(time.Second)), n})
+			// Rounded: 0.000065 s times 1e9 is 64999.99... ns.
+			buckets = append(buckets, bucket{time.Duration(math.Round(secs * float64(time.Second))), n})
 		default:
 			inHist = false
 			var err error
@@ -111,7 +113,8 @@ func Parse(out string) (Report, error) {
 
 // quantile is the upper edge of the bucket holding the sample at q, the same
 // rank internal/hist takes from its sorted samples. dnsperf's buckets are a
-// microsecond wide below a millisecond, so the edge is the sample there.
+// microsecond wide below 64 µs and double at each power of two above it (16 µs
+// between 0.5 and 1 ms), so the edge reads at most about 3% high.
 func quantile(buckets []bucket, total int64, q float64) time.Duration {
 	if total == 0 {
 		return 0

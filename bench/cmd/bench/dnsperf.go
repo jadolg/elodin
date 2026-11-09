@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -45,6 +46,7 @@ func (h *harness) dnsperfOnce(s *server, o loadOpts) (Result, sample, error) {
 		}
 	}
 	sampler := procstat.NewSampler(s.pid)
+	sampler.Watch = s.logPath
 	sampler.Start()
 	out, err := runDnsperf(o.cpus, args(o.duration))
 	sampler.Stop()
@@ -54,6 +56,20 @@ func (h *harness) dnsperfOnce(s *server, o loadOpts) (Result, sample, error) {
 	rep, err := dnsperf.Parse(out)
 	if err != nil {
 		return Result{}, sample{}, fmt.Errorf("parsing dnsperf output: %w", err)
+	}
+	r, err := dnsperfResult(rep, o, s.addrFor(o.transport))
+	if err != nil {
+		return Result{}, sample{}, err
+	}
+	return r, samplerResult(sampler), nil
+}
+
+// dnsperfResult is a dnsperf report as the Result loadgen would print.
+func dnsperfResult(rep dnsperf.Report, o loadOpts, addr string) (Result, error) {
+	// dnsperf exits 0 having sent nothing when no connection opens; loadgen
+	// fails the run there, and so does this.
+	if rep.Sent == 0 {
+		return Result{}, fmt.Errorf("dnsperf sent no queries to %s (%d connection attempts)", addr, rep.Connections)
 	}
 	r := Result{
 		Transport:   o.transport,
@@ -72,8 +88,11 @@ func (h *harness) dnsperfOnce(s *server, o loadOpts) (Result, sample, error) {
 	if rep.Connections > int64(o.clients) {
 		r.Reconnects = rep.Connections - int64(o.clients)
 	}
-	return r, sample{PeakRSS: sampler.PeakRSS, CPU: sampler.CPUUsed(), MaxThreads: sampler.MaxThreads}, nil
+	return r, nil
 }
+
+// dnsperfClientsPerThread is dnsperf's built-in cap on one thread's clients.
+const dnsperfClientsPerThread = 256
 
 // dnsperfArgs is one dnsperf run of the scenario, d long.
 func dnsperfArgs(o loadOpts, host, port, data string, d time.Duration) []string {
@@ -84,13 +103,18 @@ func dnsperfArgs(o loadOpts, host, port, data string, d time.Duration) []string 
 	}
 	a := []string{
 		"-m", o.transport, "-s", host, "-p", port, "-d", data,
-		// As many queries outstanding as clients: one each, as loadgen keeps.
+		// As many queries outstanding as clients, as loadgen keeps. dnsperf
+		// hands them to its sockets in turn, so a connection is not held to one.
 		"-c", strconv.Itoa(o.clients), "-q", strconv.Itoa(o.clients),
-		// A thread per generator CPU, so the generator is not the limit.
-		"-T", strconv.Itoa(min(cpuCount(o.cpus), o.clients)),
+		// A thread per generator CPU, so the generator is not the limit, and
+		// enough that no thread holds more clients than dnsperf allows one,
+		// above which it quietly runs fewer clients than asked.
+		"-T", strconv.Itoa(max(min(cpuCount(o.cpus), o.clients), (o.clients+dnsperfClientsPerThread-1)/dnsperfClientsPerThread)),
 		"-t", timeout,
 		"-l", strconv.FormatFloat(d.Seconds(), 'f', -1, 64),
 		"-O", "latency-histogram",
+		// A line per lost query on stdout says nothing the totals do not.
+		"-O", "suppress=timeouts",
 	}
 	if o.rate > 0 {
 		a = append(a, "-Q", strconv.Itoa(o.rate))
@@ -98,21 +122,26 @@ func dnsperfArgs(o loadOpts, host, port, data string, d time.Duration) []string 
 	return a
 }
 
+// runDnsperf returns dnsperf's report, which it prints on stdout. Its complaint
+// is the first line of stderr: a usage text follows a bad argument.
 func runDnsperf(cpus string, args []string) (string, error) {
-	cmd := exec.Command("dnsperf", args...)
-	if cpus != "" {
-		cmd = exec.Command("taskset", append([]string{"-c", cpus, "dnsperf"}, args...)...)
-	}
-	out, err := cmd.CombinedOutput()
+	out, err := generatorCmd(cpus, "dnsperf", args).Output()
 	if err != nil {
-		return "", fmt.Errorf("dnsperf %s: %w: %s", strings.Join(args, " "), err, lastLine(string(out)))
+		var complaint string
+		if ee := (*exec.ExitError)(nil); errors.As(err, &ee) {
+			complaint, _, _ = strings.Cut(strings.TrimSpace(string(ee.Stderr)), "\n")
+		}
+		return "", fmt.Errorf("dnsperf %s: %w: %s", strings.Join(args, " "), err, complaint)
 	}
 	return string(out), nil
 }
 
-func lastLine(s string) string {
-	s = strings.TrimSpace(s)
-	return s[strings.LastIndexByte(s, '\n')+1:]
+// generatorCmd runs a load generator, pinned by taskset when cpus names a list.
+func generatorCmd(cpus, bin string, args []string) *exec.Cmd {
+	if cpus == "" {
+		return exec.Command(bin, args...)
+	}
+	return exec.Command("taskset", append([]string{"-c", cpus, bin}, args...)...)
 }
 
 // cpuCount is how many CPUs a taskset -c list names ("2-3", "0,2,4-5"), or

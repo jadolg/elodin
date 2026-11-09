@@ -40,9 +40,15 @@ type sample struct {
 	PeakRSS    int64
 	CPU        time.Duration
 	MaxThreads int
+	// LogFrom is the server's log size where the measured run began.
+	LogFrom int64
 	// Spread is the relative gap between the fastest and slowest of the repeated
 	// runs, so a reader can tell a real difference from the machine's noise.
 	Spread float64
+}
+
+func samplerResult(sp *procstat.Sampler) sample {
+	return sample{PeakRSS: sp.PeakRSS, CPU: sp.CPUUsed(), MaxThreads: sp.MaxThreads, LogFrom: sp.WatchFrom}
 }
 
 // CPUPerQuery is the figure the Resource use table reports.
@@ -175,10 +181,7 @@ func (h *harness) loadgenOnce(s *server, o loadOpts) (Result, sample, error) {
 		args = append(args, "-rate", strconv.Itoa(o.rate))
 	}
 
-	cmd := exec.Command(h.loadgen, args...)
-	if o.cpus != "" {
-		cmd = exec.Command("taskset", append([]string{"-c", o.cpus, h.loadgen}, args...)...)
-	}
+	cmd := generatorCmd(o.cpus, h.loadgen, args)
 	var stdout strings.Builder
 	cmd.Stdout = &stdout
 	stderr, err := cmd.StderrPipe()
@@ -190,6 +193,7 @@ func (h *harness) loadgenOnce(s *server, o loadOpts) (Result, sample, error) {
 	}
 
 	sampler := procstat.NewSampler(s.pid)
+	sampler.Watch = s.logPath
 	sampler.Start()
 	errText := watchWarmup(stderr, sampler)
 	err = cmd.Wait()
@@ -202,12 +206,7 @@ func (h *harness) loadgenOnce(s *server, o loadOpts) (Result, sample, error) {
 	if err := json.Unmarshal([]byte(stdout.String()), &r); err != nil {
 		return Result{}, sample{}, fmt.Errorf("parsing loadgen output: %w", err)
 	}
-	sm := sample{
-		PeakRSS:    sampler.PeakRSS,
-		CPU:        sampler.CPUUsed(),
-		MaxThreads: sampler.MaxThreads,
-	}
-	return r, sm, nil
+	return r, samplerResult(sampler), nil
 }
 
 type section struct {
@@ -938,10 +937,11 @@ func (h *harness) loggingCost() (section, error) {
 	if err != nil {
 		return section{}, err
 	}
-	before := fileSize(s.logPath)
-	r, _, err := h.load(s, loadOpts{transport: "udp", clients: 200, repeat: 1})
+	// From the end of the warmup, as the answers it is divided by are; read
+	// once the server has stopped, so nothing it buffered is missed.
+	r, sm, err := h.load(s, loadOpts{transport: "udp", clients: 200, repeat: 1})
 	s.stop()
-	written := fileSize(s.logPath) - before
+	written := fileSize(s.logPath) - sm.LogFrom
 	if err == nil {
 		err = h.logDiskFilled()
 	}

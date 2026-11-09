@@ -92,7 +92,11 @@ func ThreadCount(pid int) (int, error) {
 // Sampler watches a process for the length of a run, keeping the peak RSS and
 // the CPU time consumed between Start and Stop.
 type Sampler struct {
-	pid        int
+	pid int
+	// Watch, when set, is a file whose size is read where the CPU count starts.
+	Watch string
+	// WatchFrom is Watch's size there.
+	WatchFrom  int64
 	stop       chan struct{}
 	done       chan struct{}
 	PeakRSS    int64
@@ -106,7 +110,7 @@ func NewSampler(pid int) *Sampler {
 }
 
 func (s *Sampler) Start() {
-	s.CPUStart, _ = CPUTime(s.pid)
+	s.mark()
 	go func() {
 		defer close(s.done)
 		tick := time.NewTicker(100 * time.Millisecond)
@@ -127,9 +131,18 @@ func (s *Sampler) Start() {
 	}()
 }
 
-// Mark starts the CPU count afresh, at the end of a run's warmup: the queries
-// it is divided by are counted from there.
-func (s *Sampler) Mark() { s.CPUStart, _ = CPUTime(s.pid) }
+// Mark starts the CPU count afresh, and reads Watch's size again, at the end
+// of a run's warmup: the queries they are divided by are counted from there.
+func (s *Sampler) Mark() { s.mark() }
+
+func (s *Sampler) mark() {
+	s.CPUStart, _ = CPUTime(s.pid)
+	if s.Watch != "" {
+		if fi, err := os.Stat(s.Watch); err == nil {
+			s.WatchFrom = fi.Size()
+		}
+	}
+}
 
 func (s *Sampler) Stop() {
 	close(s.stop)

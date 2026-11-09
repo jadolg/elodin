@@ -152,7 +152,8 @@ reasoning the integration suite applies to its fixtures.
 
 **dnsperf** (DNS-OARC's) drives every row that asks one name over UDP, TCP or
 DoT: a warmup run, then the measured one, with as many queries outstanding as
-there are clients and a thread per generator CPU. Each run opens its
+there are clients, a thread per generator CPU, and at least one per 256 clients,
+dnsperf's limit for a thread. A run that sends nothing fails. Each run opens its
 connections afresh, so a DoT row's first hundred handshakes fall inside it.
 dnsperf counts queries per run, not per client, so those rows print "—" for
 the per-client spread.

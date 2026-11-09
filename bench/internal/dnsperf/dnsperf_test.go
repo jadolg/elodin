@@ -77,3 +77,21 @@ func TestParseRefusesWhatItCannotRead(t *testing.T) {
 		}
 	}
 }
+
+// 0.000065 s times 1e9 is 64999.99... ns in floating point; the edge is 65 µs.
+func TestParseRoundsBucketEdges(t *testing.T) {
+	out := `Statistics:
+  Queries sent:         2
+  Queries completed:    2 (100.00%)
+  Queries lost:         0 (0.00%)
+  Response codes:       NOERROR 2 (100.00%)
+  Run time (s):         1.0
+  Queries per second:   2.0
+  Latency bucket (s):   answer count
+  0.000065 - 0.000065:  2
+`
+	r, err := Parse(out)
+	if err != nil || r.P50 != 65*time.Microsecond || r.P99 != 65*time.Microsecond {
+		t.Fatalf("got %+v, %v", r, err)
+	}
+}
