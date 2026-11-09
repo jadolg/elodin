@@ -21,6 +21,11 @@ test_the_upstream_wait_ceiling_reserves_a_quarter :: proc(t: ^testing.T) {
 	testing.expect_value(t, upstream_wait_ceiling(&s), 409 - 102)
 	cfg.server.max_pending = 4
 	testing.expect_value(t, upstream_wait_ceiling(&s), 2)
+	// Never fewer than one place to wait in.
+	cfg.server.max_pending = 2
+	testing.expect_value(t, upstream_wait_ceiling(&s), 1)
+	cfg.server.max_pending = 1
+	testing.expect_value(t, upstream_wait_ceiling(&s), 1)
 	cfg.server.max_pending = 0
 	testing.expect_value(t, upstream_wait_ceiling(&s), 0)
 }

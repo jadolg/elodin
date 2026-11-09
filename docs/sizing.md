@@ -139,7 +139,9 @@ rest at `debug`.
 
 A client asking for an expired entry with no place left is served the entry at
 once and starts no refresh, as when the refresh ceiling is reached; it is not
-counted as shed.
+counted as shed. Where the entry can no longer be served - its signatures have
+lapsed, or it was evicted - that client is answered SERVFAIL, logged as
+`detail=upstream-busy`, and is not counted as shed either.
 
 ### What reaches the upstreams
 
