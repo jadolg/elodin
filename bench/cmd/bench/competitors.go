@@ -40,6 +40,19 @@ var competitors = map[string]competitor{
 	"knot":        {"kresd", "--version", []string{"udp", "tcp", "dot", "doh2"}, true, knotConfig},
 }
 
+// forksTCP is the servers that serve each TCP connection from a forked child
+// (dnsmasq's model, which Pi-hole's FTL keeps). The harness samples one pid,
+// so their TCP CPU and per-connection memory would count the parent alone,
+// and summing the children's RSS would count the pages they share with it
+// once per child. Those cells read unmeasured rather than as either.
+// dnsmasq forks the same way but is compared over UDP alone, so it has no
+// entry here and no TCP connection limit in its configuration.
+var forksTCP = map[string]bool{"pihole": true}
+
+func forked(kind, transport string) bool { return transport == "tcp" && forksTCP[kind] }
+
+const forkedCell = "— (a process per connection)"
+
 // supports says whether kind serves transport, and whether it can block.
 func supports(kind, transport string) bool {
 	switch kind {
@@ -330,5 +343,7 @@ active = false
 # counterpart of max_pending. FTL answers all of test. itself (RFC 6761);
 # the mock's zone is under it, so the more specific server= forwards it,
 # and a blocked name under it is answered from the list or not at all.
-dnsmasq_lines = ["dns-forward-max=%d", "server=/bench.test/127.0.0.1#%s"]
+# max-tcp-connections is the counterpart of max_connections: dnsmasq serves
+# 20 TCP clients at once otherwise and leaves the rest unanswered.
+dnsmasq_lines = ["dns-forward-max=%d", "max-tcp-connections=%d", "server=/bench.test/127.0.0.1#%s"]
 `

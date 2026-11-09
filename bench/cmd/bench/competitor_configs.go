@@ -231,7 +231,10 @@ func bindConfig(h *harness, o serverOpts, p ports, bin string) ([]string, error)
 		if err != nil {
 			return nil, err
 		}
-		rpz = `  response-policy { zone "rpz.bench"; };` + "\n"
+		// log no: BIND otherwise logs every rewrite, and -g sends it to
+		// stderr whatever the logging statement says, a line per blocked
+		// answer that no other server writes.
+		rpz = `  response-policy { zone "rpz.bench" log no; };` + "\n"
 		zone = fmt.Sprintf("zone \"rpz.bench\" { type primary; file %q; };\n", path)
 	}
 	nocache := ""
@@ -325,7 +328,7 @@ func piholeConfig(h *harness, o serverOpts, p ports, bin string) ([]string, erro
 	if !o.cache {
 		cache = 0
 	}
-	cfg := fmt.Sprintf(piholeTemplate, p.upPort, p.dns, cache, web, dir, dir, dir, dir, inflightBound(o), p.upPort)
+	cfg := fmt.Sprintf(piholeTemplate, p.upPort, p.dns, cache, web, dir, dir, dir, dir, inflightBound(o), o.maxConnections, p.upPort)
 	if err := os.WriteFile(filepath.Join(etc, "pihole.toml"), []byte(cfg), 0o644); err != nil {
 		return nil, err
 	}

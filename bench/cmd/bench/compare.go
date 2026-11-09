@@ -150,7 +150,11 @@ func (h *harness) hitCell(s *server, kind, t string, fail failer) string {
 	if err != nil {
 		return fail(kind, label(t), err)
 	}
-	return fmt.Sprintf("%s / %s / %d µs%s", thousands(r.QPS), ms(r.P99ms), sm.CPUPerQuery(r.Answered).Microseconds(), timedOut(r))
+	cpu := forkedCell
+	if !forked(kind, t) {
+		cpu = fmt.Sprintf("%d µs", sm.CPUPerQuery(r.Answered).Microseconds())
+	}
+	return fmt.Sprintf("%s / %s / %s%s", thousands(r.QPS), ms(r.P99ms), cpu, timedOut(r))
 }
 
 // missLadder is the offered cache-miss rates compareMisses climbs, and
@@ -306,6 +310,12 @@ func (h *harness) heldCell(kind, t string, fail failer) string {
 	s.stop()
 	if err != nil {
 		return fail(kind, label(t)+" held", err)
+	}
+	// A forking server's memory is not measured, but how many of the clients
+	// it answered still is: past its connection limit, the rest wait in the
+	// listen backlog unanswered.
+	if forked(kind, t) {
+		return forkedCell + " (" + answeredOf(r, heldN) + " answered)"
 	}
 	cell := perItem(held-before, heldN)
 	if r.Answered != heldN {
