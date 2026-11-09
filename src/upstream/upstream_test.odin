@@ -418,16 +418,23 @@ expect_caller_holds_nothing :: proc(t: ^testing.T, track: ^mem.Tracking_Allocato
 }
 
 /*
-Reading a body costs the body and the reader's buffer, not a buffer grown by
-doubling past the body's size, nor one still holding every chunk already
-copied out. 600 KB lands a doubling buffer at 1 MiB.
+A body is held once while it is read, and afterwards in exactly its size: not in
+the reader's buffer and a copy of it (#414), nor in a buffer still holding every
+chunk already copied out, nor in the slack its doubling left.
+
+A buffer grown by doubling from 8 KB holds 1,000,000 bytes in 1 MiB, 5% over,
+so a body held twice at any point is the only way past the peak bound. The same
+5% is inside any ratio bound on what is held, so that one is exact.
 */
 @(test)
-test_a_body_costs_about_twice_its_size_to_read :: proc(t: ^testing.T) {
-	SIZE :: 600_000
+test_a_body_is_held_once_while_it_is_read :: proc(t: ^testing.T) {
+	SIZE :: 1_000_000
 	sized := strings.builder_make()
 	defer strings.builder_destroy(&sized)
 	fmt.sbprintf(&sized, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", SIZE)
+	unframed := strings.builder_make()
+	defer strings.builder_destroy(&unframed)
+	strings.write_string(&unframed, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
 	chunked := strings.builder_make()
 	defer strings.builder_destroy(&chunked)
 	strings.write_string(&chunked, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
@@ -444,12 +451,18 @@ test_a_body_costs_about_twice_its_size_to_read :: proc(t: ^testing.T) {
 	fmt.sbprintf(&one_chunk, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n%x\r\n", SIZE)
 	for _ in 0 ..< SIZE {
 		strings.write_byte(&sized, 'x')
+		strings.write_byte(&unframed, 'x')
 		strings.write_byte(&one_chunk, 'x')
 	}
 	strings.write_string(&one_chunk, "\r\n0\r\n\r\n")
 
-	framings := [3]string{"Content-Length", "chunked", "one chunk"}
-	replies := [3]string{strings.to_string(sized), strings.to_string(chunked), strings.to_string(one_chunk)}
+	framings := [4]string{"Content-Length", "until close", "chunked", "one chunk"}
+	replies := [4]string {
+		strings.to_string(sized),
+		strings.to_string(unframed),
+		strings.to_string(chunked),
+		strings.to_string(one_chunk),
+	}
 	for reply, framing in replies {
 		track: mem.Tracking_Allocator
 		mem.tracking_allocator_init(&track, context.allocator)
@@ -464,7 +477,7 @@ test_a_body_costs_about_twice_its_size_to_read :: proc(t: ^testing.T) {
 			testing.expect_value(t, len(resp.body), SIZE)
 			testing.expectf(
 				t,
-				track.current_memory_allocated < 1.1 * SIZE,
+				track.current_memory_allocated == SIZE,
 				"%s: a %d-byte body is held in %d bytes",
 				framings[framing],
 				SIZE,
@@ -474,13 +487,63 @@ test_a_body_costs_about_twice_its_size_to_read :: proc(t: ^testing.T) {
 		}
 		testing.expectf(
 			t,
-			track.peak_memory_allocated < 2.1 * SIZE,
+			track.peak_memory_allocated < 1.2 * SIZE,
 			"%s: a %d-byte body peaked at %d bytes",
 			framings[framing],
 			SIZE,
 			track.peak_memory_allocated,
 		)
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A body ended by the close before a byte of it arrived is no body, and holds
+nothing: callers free a body only when it has a length, so an empty one that
+still owned the reader's buffer would leak it.
+*/
+@(test)
+test_an_empty_body_holds_nothing :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		// The reader's buffer in the caller's allocator, as a list's is.
+		context.allocator = mem.tracking_allocator(&track)
+		resp, err, ok := exchange_against(t, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", &track)
+		if !ok {
+			return
+		}
+		testing.expect_value(t, err, Error.None)
+		testing.expectf(t, resp.body == nil, "an empty body came back as %d bytes at %p", len(resp.body), raw_data(resp.body))
+	}
+	expect_caller_holds_nothing(t, &track, "empty body")
+	free_all(context.temp_allocator)
+}
+
+/*
+A body that arrived with the fields sits past them in the reader's buffer, so the
+buffer handed over as the body is the body moved to its start: whole, and held in
+exactly its size.
+*/
+@(test)
+test_a_body_read_with_its_fields_is_handed_over_whole :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		// The reader's buffer in the caller's allocator, as a list's is.
+		context.allocator = mem.tracking_allocator(&track)
+		resp, err, ok := exchange_against(t, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", &track)
+		if !ok {
+			return
+		}
+		testing.expect_value(t, err, Error.None)
+		testing.expect_value(t, string(resp.body), "hello")
+		testing.expect_value(t, track.current_memory_allocated, 5)
+		delete(resp.body)
+	}
+	expect_caller_holds_nothing(t, &track, "body read with its fields")
 	free_all(context.temp_allocator)
 }
 
@@ -1128,6 +1191,44 @@ test_read_chunked_never_reserves_past_its_limit :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(got), "abcd")
 	testing.expectf(t, track.peak_memory_allocated <= 100, "peaked at %d bytes for a limit of 100", track.peak_memory_allocated)
 	delete(got, mem.tracking_allocator(&track))
+	free_all(context.temp_allocator)
+}
+
+// A piece the caller's allocator cannot take fails the body: dropped, it would
+// leave a gap in a list that is then cached and loaded as whole.
+@(test)
+test_read_chunked_fails_a_piece_it_cannot_hold :: proc(t: ^testing.T) {
+	body := "20\r\nabcdefghijklmnopqrstuvwxyz012345\r\n0\r\n\r\n"
+	r := Buf_Reader {
+		buf = make([dynamic]u8, 0, 128, context.temp_allocator),
+	}
+	append(&r.buf, ..transmute([]u8)body)
+	// Room for less than the chunk, and nothing past it.
+	backing: [16]u8
+	arena: mem.Arena
+	mem.arena_init(&arena, backing[:])
+
+	got, err := read_chunked(&r, mem.arena_allocator(&arena), 100)
+	testing.expect_value(t, err, Error.Too_Large)
+	testing.expectf(t, got == nil, "a body with a piece missing came back: %q", string(got))
+	free_all(context.temp_allocator)
+}
+
+// A body copied into an allocator that cannot hold it fails, rather than coming
+// back empty as if the server had sent nothing.
+@(test)
+test_a_body_the_allocator_cannot_hold_fails :: proc(t: ^testing.T) {
+	r := Buf_Reader {
+		buf = make([dynamic]u8, 0, 128, context.temp_allocator),
+	}
+	append(&r.buf, "0123456789abcdefghijklmnopqrstuv")
+	backing: [16]u8
+	arena: mem.Arena
+	mem.arena_init(&arena, backing[:])
+
+	got, err := reader_take(&r, r.buf[:], mem.arena_allocator(&arena))
+	testing.expect_value(t, err, Error.Too_Large)
+	testing.expectf(t, got == nil, "a body the allocator could not hold came back as %d bytes", len(got))
 	free_all(context.temp_allocator)
 }
 
