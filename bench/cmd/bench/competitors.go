@@ -330,5 +330,7 @@ active = false
 # counterpart of max_pending. FTL answers all of test. itself (RFC 6761);
 # the mock's zone is under it, so the more specific server= forwards it,
 # and a blocked name under it is answered from the list or not at all.
-dnsmasq_lines = ["dns-forward-max=%d", "server=/bench.test/127.0.0.1#%s"]
+# max-tcp-connections is the counterpart of max_connections: dnsmasq serves
+# 20 TCP clients at once otherwise and leaves the rest unanswered.
+dnsmasq_lines = ["dns-forward-max=%d", "max-tcp-connections=%d", "server=/bench.test/127.0.0.1#%s"]
 `
