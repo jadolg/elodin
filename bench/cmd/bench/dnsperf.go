@@ -103,6 +103,10 @@ func dnsperfArgs(o loadOpts, host, port, data string, d time.Duration) []string 
 	}
 	a := []string{
 		"-m", o.transport, "-s", host, "-p", port, "-d", data,
+		// With an OPT record, as loadgen asks over UDP, TCP and DoT. dnsperf
+		// offers 4096 bytes where loadgen offers 1232; the rows' answers fit
+		// in either, so the server answers the same query under both.
+		"-e",
 		// As many queries outstanding as clients, as loadgen keeps. dnsperf
 		// hands them to its sockets in turn, so a connection is not held to one.
 		"-c", strconv.Itoa(o.clients), "-q", strconv.Itoa(o.clients),

@@ -48,6 +48,9 @@ func TestDnsperfArgsThreads(t *testing.T) {
 		if got := a[slices.Index(a, "-T")+1]; got != c.want {
 			t.Errorf("%d clients on %q: -T %s, want %s", c.clients, c.cpus, got, c.want)
 		}
+		if !slices.Contains(a, "-e") {
+			t.Errorf("dnsperf asks without EDNS, loadgen with it: %v", a)
+		}
 	}
 }
 

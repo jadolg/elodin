@@ -173,7 +173,7 @@ the waiting thread read 3 ms slow. It shows against elodin since #604, whose
 loops sleep between bursts, and not against the build before it, whose loops
 never slept. At that rate loadgen read p99 3.2 ms and 0.45 ms. In #610 it read
 elodin's DoT p99 at 100 clients as 3 ms at 320,000 queries a second. dnsperf on
-the same build measured 0.32–0.53 ms at 407,000–460,000, and loadgen with
+the same build measured 0.34–0.39 ms at 415,000–454,000, and loadgen with
 `GOMAXPROCS=8` measured 0.47 ms. No single `GOMAXPROCS` suits every row: more Ps
 took loadgen's UDP p99 from 0.4 to 0.9 ms.
 
@@ -308,6 +308,6 @@ internal/dnswire/   DNS message building and parsing, independent of elodin
 internal/dnsperf/   reads dnsperf's report
 internal/hist/      latency samples and percentiles
 internal/procstat/  RSS, CPU time and thread count for one pid
-internal/unitenv/   the shipped unit's Environment= assignments (go test ./internal/...)
+internal/unitenv/   the shipped unit's Environment= assignments (go test ./...)
 results/        committed runs, so a change in the numbers is visible in a diff
 ```

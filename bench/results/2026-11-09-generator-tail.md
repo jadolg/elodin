@@ -9,7 +9,8 @@ and DoT with dnsperf (see the README's "The load generators").
 (the merge before #604) and `e11e4e6` (main). Server on CPUs 0-1, generator
 and mock upstream on 2-3, 100 clients, every answer from the cache, 6 s after
 a 2 s warmup. loadgen is `bench/cmd/loadgen` at `e11e4e6`; dnsperf is 2.15.0
-(`-c 100 -q 100 -T 2 -O latency-histogram`).
+(`-e -c 100 -q 100 -T 2 -O latency-histogram`: with an OPT record, as
+loadgen asks).
 
 ## At the same offered load
 
@@ -20,11 +21,11 @@ work. Alternating runs.
 |---|---|---|---|
 | loadgen | DoT | 0.50, 0.43, 0.45 ms | 3.24, 3.27, 3.24 ms |
 | loadgen | TCP | 0.61, 0.59 ms | 2.63, 2.61 ms |
-| dnsperf | DoT | 1.21, 0.83 ms | 0.78, 1.01 ms |
-| dnsperf | TCP | 1.09, 0.94 ms | 0.69, 0.46 ms |
+| dnsperf | DoT | 1.38, 1.15 ms | 0.78, 0.45 ms |
+| dnsperf | TCP | 0.91, 0.77 ms | 0.43, 0.32 ms |
 
 loadgen puts main's tail near 3 ms on TCP as well, below TCP's ceiling.
-dnsperf puts main level with or ahead of the build before #604 on both.
+dnsperf puts main ahead of the build before #604 on both.
 
 ## Where the 3 ms is
 
@@ -58,8 +59,8 @@ than a setting.
 
 | build | DoT | TCP |
 |---|---|---|
-| before #604 | 308,269 / 0.64 ms; 306,820 / 0.72 ms | 372,365 / 0.53 ms |
-| main | 407,045 / 0.53 ms; 460,594 / 0.32 ms | 522,340 / 0.32 ms |
+| before #604 | 314,155 / 0.50 ms; 299,902 / 0.59 ms | 370,909 / 0.42 ms |
+| main | 415,162 / 0.39 ms; 453,812 / 0.34 ms | 573,021 / 0.32 ms |
 
 ## The harness, after the change
 
@@ -69,8 +70,8 @@ before #604. The cache-hit row is throughput / p99 / CPU per query:
 
 | build | UDP | TCP | DoT | DoH/1.1 | DoH/2 | blocked (UDP) |
 |---|---|---|---|---|---|---|
-| before #604 | 668,935 / 0.23 ms / 2 µs | 377,414 / 0.51 ms / 5 µs | 297,246 / 0.81 ms / 6 µs | 144,709 / 3.1 ms / 10 µs | 126,966 / 2.9 ms / 13 µs | 662,080 / 0.26 ms / 2 µs |
-| main | 758,572 / 0.41 ms / 2 µs | 552,223 / 0.32 ms / 3 µs | 437,391 / 0.38 ms / 4 µs | 138,043 / 3.0 ms / 9 µs | 130,656 / 2.7 ms / 11 µs | 731,576 / 0.28 ms / 2 µs |
+| before #604 | 722,629 / 0.17 ms / 2 µs | 376,253 / 0.40 ms / 5 µs | 309,069 / 0.53 ms / 6 µs | 150,053 / 3.2 ms / 10 µs | 144,820 / 2.2 ms / 12 µs | 664,587 / 0.21 ms / 2 µs |
+| main | 789,196 / 0.16 ms / 2 µs | 526,553 / 0.27 ms / 3 µs | 408,994 / 0.36 ms / 4 µs | 139,426 / 2.8 ms / 9 µs | 130,532 / 2.7 ms / 11 µs | 727,528 / 0.14 ms / 2 µs |
 
 The DoH cells are still loadgen's. CPU per query is now counted from the end
 of the warmup, as the answers it is divided by are. Before, the warmup's CPU
@@ -84,5 +85,5 @@ loadgen. Under dnsperf, DoT at 200,000 a second, main, three alternating pairs:
 
 | pin_loops | p99 | p99.5 | p99.9 |
 |---|---|---|---|
-| false | 0.77, 0.67, 0.61 ms | 1.31, 1.18, 1.12 ms | 2.56, 3.01, 3.01 ms |
-| true | 0.62, 0.64, 0.66 ms | 0.97, 1.09, 1.05 ms | 3.14, 2.62, 3.01 ms |
+| false | 0.53, 0.49, 0.48 ms | 0.88, 0.77, 0.56 ms | 2.56, 1.92, 1.57 ms |
+| true | 0.49, 0.49, 0.46 ms | 0.67, 0.64, 0.47 ms | 1.63, 1.50, 0.53 ms |

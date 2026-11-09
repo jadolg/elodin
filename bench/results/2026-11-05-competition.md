@@ -93,7 +93,7 @@ That tail is loadgen's. Pinned to two CPUs, it runs Go with two Ps, whose
 threads wait about 3 ms behind one another, and since #604 elodin's loops sleep
 between bursts, which sets that off. At the same offered load, dnsperf reads
 main's DoT and TCP p99 level with or below the build before #604. Saturated
-under dnsperf, main's DoT is 407,000–460,000 qps at 0.32–0.53 ms. See
+under dnsperf, main's DoT is 415,000–454,000 qps at 0.34–0.39 ms. See
 `2026-11-09-generator-tail.md`. The harness now drives UDP, TCP and DoT with
 dnsperf, so this run's cells for those transports do not compare with later
 runs. `server.pin_loops` (#616) takes away the share that was elodin's own:
@@ -206,7 +206,7 @@ As above, every name unique, upstream at 20ms, the in-flight bound raised to 4,0
 ## Where elodin falls behind
 
 - **DoT p99 at 3 ms** (#610), against BIND's 1.1 ms and Knot's 1.5 ms, was
-  the generator's (above). Under dnsperf it is 0.38 ms at 437,391 qps
+  the generator's (above). Under dnsperf it is 0.36 ms at 408,994 qps
   (`2026-11-09-generator-tail.md`).
 - **CPU per cache miss** (#612): 27 µs at saturation against dnsdist's 8 µs, and a
   p99 of 107 ms at 75,000 against dnsdist's 62 ms. Unbound and Knot are
