@@ -2,6 +2,7 @@ package server
 
 import "core:sync"
 import "core:time"
+import "elodin:config"
 import "elodin:loop"
 
 /*
@@ -44,14 +45,8 @@ stream, which lives there; off a loop - a test driving the resolver from a
 thread of its own - on the server's first loop, or nowhere when it has none.
 */
 submit_query :: proc(s: ^Server, fn: proc(data: rawptr), data: rawptr, limit: int) -> Submit_Result {
-	for {
-		in_flight := sync.atomic_load(&s.pending)
-		if limit > 0 && in_flight >= limit {
-			return .Full
-		}
-		if _, taken := sync.atomic_compare_exchange_weak(&s.pending, in_flight, in_flight + 1); taken {
-			break
-		}
+	if !take_place(&s.pending, limit) {
+		return .Full
 	}
 	l := loop.current_loop()
 	if l == nil && len(s.loops) > 0 {
@@ -64,6 +59,52 @@ submit_query :: proc(s: ^Server, fn: proc(data: rawptr), data: rawptr, limit: in
 	}
 	query_done(s)
 	return .Stopped
+}
+
+/*
+How many of the queries counted in `server.max_pending` may be waiting on an
+upstream at once: everything but a reserved quarter, never fewer than two, the
+reservation `config.derive_chain_walks` keeps from the chain walks (issue #356)
+and for the same reason - the reserved places are never held for an upstream's
+timeout, so they turn over at the speed of the cache (issue #623). Never fewer
+than one place to wait in either, so a `max_pending` of two reserves one and of
+one reserves none. Zero, which is no bound, where `max_pending` sets none.
+*/
+upstream_wait_ceiling :: proc(s: ^Server) -> int {
+	limit := live(s).cfg.server.max_pending
+	if limit <= 0 {
+		return 0
+	}
+	return config.derive_chain_walks(limit)
+}
+
+/*
+Take a place among the queries waiting on an upstream, or report there is none
+under `ceiling`; zero or less is no bound. Decided and counted in one step, as
+`submit_query` is and for its reason.
+*/
+upstream_wait_begin :: proc(s: ^Server, ceiling: int) -> bool {
+	return take_place(&s.upstream_waits, ceiling)
+}
+
+// One more on `counter` unless it is at `limit` already, zero or less being no
+// limit: `submit_query`'s and `upstream_wait_begin`'s check-and-count.
+@(private)
+take_place :: proc(counter: ^int, limit: int) -> bool {
+	for {
+		held := sync.atomic_load(counter)
+		if limit > 0 && held >= limit {
+			return false
+		}
+		if _, taken := sync.atomic_compare_exchange_weak(counter, held, held + 1); taken {
+			return true
+		}
+	}
+}
+
+// The end of a wait `upstream_wait_begin` started.
+upstream_wait_end :: proc(s: ^Server) {
+	sync.atomic_sub(&s.upstream_waits, 1)
 }
 
 // The end of a query `submit_query` started.

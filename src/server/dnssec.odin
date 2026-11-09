@@ -251,8 +251,8 @@ many queries are held that way is `dnssec.max_chain_walks`, which
 `config.derive_chain_walks` sets to everything but a reserved quarter of
 `server.max_pending`: that quarter cannot be inside a walk, so it turns over in a
 round trip rather than in thirty of them, whatever a flood is doing. Free of the
-walk rather than idle - a reserved query may still be waiting on its own upstream
-forward, which is not bounded here. A walk past the bound reads the caches and
+walk and of every other upstream wait too, which `upstream_wait_ceiling` bounds
+to the same figure rather than this. A walk past the bound reads the caches and
 gives up where it would have called this, which the client sees as the SERVFAIL
 an unreachable authority produces.
 

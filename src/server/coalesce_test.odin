@@ -426,6 +426,9 @@ run_burst :: proc(
 	}
 	thread.join(mock)
 	thread.destroy(mock)
+	// Every place taken among the queries waiting on an upstream - leaders,
+	// followers, the validator's walks - is given back (issue #623).
+	testing.expect_value(t, srv.upstream_waits, 0)
 	if stats != nil {
 		stats^ = srv.stats
 	}

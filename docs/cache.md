@@ -80,8 +80,9 @@ the entry is refreshed in the background (Unbound's `prefetch` rule).
   be above `max_ttl`.
 - RD=0 queries are answered from the entry without starting a refresh.
 - **Bounds.** A refresh shares `serve_stale`'s slots: one per name at a time, and
-  at most a quarter of `server.max_pending` (and 64) at once. With none free, the entry is left
-  to expire.
+  at most a quarter of `server.max_pending` (and 64) at once. With none free, or
+  with every [place to wait on an upstream](sizing.md#waiting-on-an-upstream)
+  taken, the entry is left to expire.
 - **Counting.** A prefetch is not a client query: it is in neither
   `elodin_answers_total`, the cache hit and miss counts nor the query log. It
   counts in `elodin_cache_prefetches_total` (and

@@ -36,6 +36,7 @@ scrape_configs:
 | `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` |
 | `elodin_answers_coalesced_total` | counter | queries answered by waiting on an identical one already in flight. Also counted under the outcome they got: `cached` (`detail=coalesced`, though the cache never held it), `failed` (`detail=upstream-coalesced`, or a stale `cached` if an expired copy was served), or the refusal the first one cached (`detail=dnssec:cache`, or the block detail) |
 | `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
+| `elodin_queries_upstream_shed_total` | counter | queries answered from an expired entry or SERVFAIL without asking an upstream, because all of `server.max_pending` but its reserved quarter was already waiting on upstreams; see [waiting on an upstream](sizing.md#waiting-on-an-upstream). Also counted under the outcome they got, except an expired entry's refresh, which has no client and is counted here alone |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
 | `elodin_connections_rate_limited_total` | counter | refused because the prefix was opening connections faster than `rate_limit.responses_per_second` allows |

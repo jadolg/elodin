@@ -80,6 +80,7 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 			accept_backoff = 16,
 			unreadable_rcode = 17,
 			coalesced = 18,
+			upstream_shed = 19,
 		},
 	)
 
@@ -100,6 +101,7 @@ test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 	expect_line(t, page, "elodin_rebind_refused_total 14")
 	expect_line(t, page, "elodin_special_use_total 15")
 	expect_line(t, page, "elodin_answers_coalesced_total 18")
+	expect_line(t, page, "elodin_queries_upstream_shed_total 19")
 	/*
 	`unreadable_rcode` is the one counter whose series is not here, and
 	deliberately: it is published per upstream, because "which of the group is
@@ -413,6 +415,7 @@ test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
 		special_use    = 15,
 		accept_backoff = 16,
 		unreadable_rcode = 17,
+		upstream_shed  = 18,
 	}
 	cs := cache.Stats {
 		hits      = 20,

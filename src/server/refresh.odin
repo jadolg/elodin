@@ -329,7 +329,10 @@ now. Every reason `start_refresh` declines - a refresh for this key already
 running, the ceiling reached, `max_pending` reached or stopping - leaves the entry to
 expire as it would have without prefetching, which is also what a failed
 prefetch comes to: the claim is spent either way, so neither is tried again for
-this entry.
+this entry. So does every place to wait on an upstream being taken
+(`upstream_wait_ceiling`): the job would only be turned away by
+`wait_on_upstream` after counting itself a prefetch and a failed one, and a
+prefetch no upstream was asked for says nothing of how prefetching does.
 */
 @(private)
 start_prefetch :: proc(
@@ -341,6 +344,9 @@ start_prefetch :: proc(
 	limit: int,
 	serial: u64,
 ) {
+	if ceiling := upstream_wait_ceiling(s); ceiling > 0 && sync.atomic_load(&s.upstream_waits) >= ceiling {
+		return
+	}
 	// Counted by the job itself, ahead of any failure it counts, so a scrape
 	// never sees more failures than prefetches.
 	if r := start_refresh(s, key, query, proto, client, limit, loop.tick_now(), prefetch = true, serial = serial);
