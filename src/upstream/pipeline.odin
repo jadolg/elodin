@@ -641,7 +641,7 @@ get_pipe :: proc(
 	query would let a spray of them turn the forwarder's UDP into a TCP
 	handshake per query against the upstream. A shared connection open enough
 	to be full is the answer the check was for - the server's TCP is there - so
-	the query moves on to the next member, uncharged.
+	`exchange_udp` goes back to waiting for the UDP answer.
 	*/
 	private := true,
 ) -> (

@@ -106,7 +106,8 @@ exchange_udp :: proc(
 			exchange rather than a wrong verdict.
 
 			So a forged ICMP buys its sender one query moved to the pipelined
-			connection, never a connection of its own (see `get_pipe`) - and,
+			connection - never a connection of its own, and with that one full
+			the query goes back to waiting on UDP - and,
 			against a server whose TCP is refused or dropped, that query's
 			failure, charged as its TCP's. RFC 7766 section 5 has every DNS
 			server support TCP, and a TC answer from such a server fails the
@@ -115,7 +116,19 @@ exchange_udp :: proc(
 			on it, Unbound connects but ignores it and waits out the timeout.
 			*/
 			if recv_err != .Would_Block {
-				return exchange_pipelined(u, query, timeout, deadline, allocator, private = recv_err == .Excess_Truncated)
+				icmp := recv_err != .Excess_Truncated
+				tcp_response, tcp_err := exchange_pipelined(u, query, timeout, deadline, allocator, private = !icmp)
+				/*
+				Turned away from a full shared connection (see `get_pipe`): the
+				server's TCP is up, so the ICMP was most likely not the
+				server's, and the UDP answer may still be on its way. The
+				error is reported once, so the read waits again, to the same
+				deadline.
+				*/
+				if icmp && tcp_err == .Backlogged {
+					continue
+				}
+				return tcp_response, tcp_err
 			}
 			return nil, .Bad_Response if rejected else .Timeout
 		}

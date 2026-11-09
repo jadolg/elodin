@@ -1,7 +1,6 @@
 package upstream
 
 import "core:fmt"
-import "core:math/rand"
 import "core:net"
 import "core:sync"
 import "core:sys/linux"
@@ -25,45 +24,69 @@ with a RST an off-path sender cannot forge, and a live one answers the query.
 @(private = "file")
 R_TIMEOUT :: 2 * time.Second
 
-// Where `quiet_port` starts its scan, a stride apart per call.
-@(private = "file")
-quiet_next: int
-
 /*
-A loopback port free on both TCP and UDP, held on each. Below the kernel's
-ephemeral range (32768 up by default), so once released no parallel test
-binding port 0 or connecting can be handed it: a closed port here stays closed.
+UDP `port` on loopback held, but refusing: bound, so no other socket can be
+handed it while a test runs, and connected to a peer that never sends, so a
+datagram from anyone else matches no socket and draws ICMP port unreachable -
+the closed port, without releasing it for a parallel test to take.
 */
 @(private = "file")
-quiet_port :: proc(t: ^testing.T) -> (listener: net.TCP_Socket, udp: net.UDP_Socket, ok: bool) {
-	LOW :: 10000
-	SPAN :: 20000
-	start := rand.int_max(SPAN) + sync.atomic_add(&quiet_next, 1) * 211
-	for i in 0 ..< 500 {
-		port := LOW + (start + i) % SPAN
-		l, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = port})
-		if lerr != nil {
-			continue
-		}
-		d, uerr := net.make_bound_udp_socket(net.IP4_Loopback, port)
-		if uerr != nil {
-			net.close(l)
-			continue
-		}
-		return l, d, true
+refusing_udp :: proc(t: ^testing.T, port: int) -> (linux.Fd, bool) {
+	fd, err := linux.socket(.INET, .DGRAM, {.CLOEXEC}, .UDP)
+	if !testing.expectf(t, err == .NONE, "cannot open a udp socket: %v", err) {
+		return -1, false
 	}
-	testing.expect(t, false, "no loopback port below the ephemeral range is free")
-	return {}, {}, false
+	at := linux.Sock_Addr_In{sin_family = .INET, sin_port = u16be(u16(port)), sin_addr = {127, 0, 0, 1}}
+	peer := linux.Sock_Addr_In{sin_family = .INET, sin_port = 9, sin_addr = {127, 0, 0, 1}}
+	if berr := linux.bind(fd, &at); berr != .NONE {
+		linux.close(fd)
+		return -1, false
+	}
+	if cerr := linux.connect(fd, &peer); !testing.expectf(t, cerr == .NONE, "cannot connect the refusing socket: %v", cerr) {
+		linux.close(fd)
+		return -1, false
+	}
+	return fd, true
 }
 
-// A loopback port closed on both UDP and TCP.
+// A loopback port closed on UDP and on TCP, held for the test: a TCP socket
+// bound and never listening answers a SYN with a RST. The caller closes both.
 @(private = "file")
-closed_port :: proc(t: ^testing.T) -> (port: int, ok: bool) {
-	listener, udp := quiet_port(t) or_return
-	bound, _ := net.bound_endpoint(listener)
-	net.close(listener)
-	net.close(udp)
-	return bound.port, true
+Closed_Port :: struct {
+	port: int,
+	tcp:  linux.Fd,
+	udp:  linux.Fd,
+}
+
+@(private = "file")
+closed_port :: proc(t: ^testing.T) -> (c: Closed_Port, ok: bool) {
+	// The TCP port is the kernel's pick; its UDP twin is usually free too, and
+	// a few picks find one that is.
+	for _ in 0 ..< 16 {
+		fd, err := linux.socket(.INET, .STREAM, {.CLOEXEC}, .TCP)
+		if !testing.expectf(t, err == .NONE, "cannot open a tcp socket: %v", err) {
+			return
+		}
+		any := linux.Sock_Addr_In{sin_family = .INET, sin_addr = {127, 0, 0, 1}}
+		bound: linux.Sock_Addr_Any
+		if linux.bind(fd, &any) != .NONE || linux.getsockname(fd, &bound) != .NONE {
+			linux.close(fd)
+			continue
+		}
+		port := int(bound.sin_port)
+		if udp, held := refusing_udp(t, port); held {
+			return Closed_Port{port = port, tcp = fd, udp = udp}, true
+		}
+		linux.close(fd)
+	}
+	testing.expect(t, false, "no loopback port is free on both TCP and UDP")
+	return
+}
+
+@(private = "file")
+release_port :: proc(c: Closed_Port) {
+	linux.close(c.tcp)
+	linux.close(c.udp)
 }
 
 @(private = "file")
@@ -90,10 +113,12 @@ udp_upstream :: proc(t: ^testing.T, port: int) -> (^Upstream, bool) {
 
 @(test)
 test_a_refused_udp_upstream_fails_at_once :: proc(t: ^testing.T) {
-	port, ok := closed_port(t)
+	closed, ok := closed_port(t)
 	if !ok {
 		return
 	}
+	defer release_port(closed)
+	port := closed.port
 
 	// The premise: the platform reports the refusal to a connected socket.
 	fd, serr := linux.socket(.INET, .DGRAM, {.CLOEXEC}, .UDP)
@@ -159,29 +184,41 @@ echo_tcp_serve :: proc(listener: net.TCP_Socket) {
 	}
 }
 
-// A UDP upstream on a port closed on UDP and open on TCP, with `echo_tcp_serve`
-// behind it. The caller calls `stop_echo`.
+// A UDP upstream on a port refusing on UDP and open on TCP, with
+// `echo_tcp_serve` behind it. The caller calls `stop_echo`.
 @(private = "file")
 Echo_Fixture :: struct {
 	listener: net.TCP_Socket,
+	udp:      linux.Fd,
 	u:        ^Upstream,
 	answerer: ^thread.Thread,
 }
 
 @(private = "file")
 start_echo :: proc(t: ^testing.T) -> (f: Echo_Fixture, ok: bool) {
-	listener, udp := quiet_port(t) or_return
-	// Released, so the query draws a refusal; see `quiet_port` for why nobody
-	// else can take it meanwhile.
-	net.close(udp)
-	_ = net.set_option(listener, .Receive_Timeout, R_TIMEOUT)
-	bound, _ := net.bound_endpoint(listener)
-	u, built := udp_upstream(t, bound.port)
-	if !built {
-		net.close(listener)
-		return
+	for _ in 0 ..< 16 {
+		listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+		if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+			return
+		}
+		bound, _ := net.bound_endpoint(listener)
+		udp, held := refusing_udp(t, bound.port)
+		if !held {
+			net.close(listener)
+			continue
+		}
+		_ = net.set_option(listener, .Receive_Timeout, R_TIMEOUT)
+		u, built := udp_upstream(t, bound.port)
+		if !built {
+			net.close(listener)
+			linux.close(udp)
+			return
+		}
+		answerer := thread.create_and_start_with_poly_data(listener, echo_tcp_serve)
+		return Echo_Fixture{listener = listener, udp = udp, u = u, answerer = answerer}, true
 	}
-	return Echo_Fixture{listener = listener, u = u, answerer = thread.create_and_start_with_poly_data(listener, echo_tcp_serve)}, true
+	testing.expect(t, false, "no loopback port is free on both TCP and UDP")
+	return
 }
 
 // The upstream first: closing its connection is what ends the answerer's read.
@@ -191,6 +228,7 @@ stop_echo :: proc(f: ^Echo_Fixture) {
 	thread.join(f.answerer)
 	thread.destroy(f.answerer)
 	net.close(f.listener)
+	linux.close(f.udp)
 }
 
 /*
@@ -221,14 +259,16 @@ test_a_udp_refusal_is_checked_over_tcp :: proc(t: ^testing.T) {
 }
 
 /*
-And the check never dials a connection of its own past a full shared one: a
-spray of forged ICMP reaches every exchange in flight at once, and would
-otherwise turn each into a TCP handshake against the upstream. The shared
-connection is made full by lowering its limit to zero once it is open; the
-query is turned away as `Backlogged`, uncharged, for the group to send on.
+And past a full shared connection the check neither dials a connection of its
+own nor gives up: a spray of forged ICMP reaches every exchange in flight at
+once, and a connection each would turn them into a TCP handshake apiece against
+the upstream, where a full connection already says the server's TCP is there.
+So the exchange goes back to waiting for its UDP answer, which here never comes
+- the port refuses - and it ends at its deadline. The shared connection is made
+full by lowering its limit to zero once it is open.
 */
 @(test)
-test_a_udp_refusal_does_not_dial_past_a_full_connection :: proc(t: ^testing.T) {
+test_a_udp_refusal_waits_on_udp_past_a_full_connection :: proc(t: ^testing.T) {
 	f, ok := start_echo(t)
 	if !ok {
 		return
@@ -240,14 +280,20 @@ test_a_udp_refusal_does_not_dial_past_a_full_connection :: proc(t: ^testing.T) {
 		return
 	}
 	sync.atomic_store(&f.u.max_outstanding, 0)
+	WAIT :: 300 * time.Millisecond
 	started := time.tick_now()
-	_, err := exchange(f.u, refused_query(), R_TIMEOUT, context.temp_allocator)
+	_, err := exchange(f.u, refused_query(), WAIT, context.temp_allocator)
 	spent := time.tick_since(started)
-	testing.expectf(t, err == .Backlogged, "the exchange ended %v, not turned away from the full connection", err)
-	testing.expectf(t, spent < R_TIMEOUT / 2, "the exchange took %v, waiting on a connection of its own", spent)
-	failures := stats_of(f.u).failures
-	testing.expectf(t, failures == 1, "%d failures recorded, where the one turned away counts and is not charged", failures)
-	testing.expect(t, f.u.failures == 0, "the query turned away was charged towards the cooldown")
+	testing.expectf(t, err == .Timeout, "the exchange ended %v, not waiting out its UDP answer", err)
+	testing.expectf(t, spent >= WAIT, "the exchange ended after %v, before its %v", spent, WAIT)
+
+	// A connection of its own would be waiting in the backlog by now, since the
+	// answerer is busy with the shared one.
+	_ = net.set_option(f.listener, .Receive_Timeout, 10 * time.Millisecond)
+	if extra, _, aerr := net.accept_tcp(f.listener); aerr == nil {
+		net.close(extra)
+		testing.expect(t, false, "the check dialled a connection of its own past the full one")
+	}
 	free_all(context.temp_allocator)
 }
 
@@ -258,10 +304,12 @@ The assertion is a lower bound on the wait, which a slow machine only lengthens.
 */
 @(test)
 test_a_bootstrap_query_waits_past_a_refusal :: proc(t: ^testing.T) {
-	port, ok := closed_port(t)
+	closed, ok := closed_port(t)
 	if !ok {
 		return
 	}
+	defer release_port(closed)
+	port := closed.port
 	WAIT :: 200 * time.Millisecond
 	server := fmt.tprintf("127.0.0.1:%d", port)
 	started := time.tick_now()
