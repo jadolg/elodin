@@ -666,7 +666,7 @@ test_a_stray_datagram_does_not_extend_a_bootstrap_query :: proc(t: ^testing.T) {
 
 	udp_waits_reset()
 	started := time.tick_now()
-	_, ok := bootstrap_query(fmt.tprintf("127.0.0.1:%d", bound.port), "dns.example", .A, DEADLINE_TIMEOUT)
+	_, ok := bootstrap_query(fmt.tprintf("127.0.0.1:%d", bound.port), "dns.example", .A, time.tick_add(started, DEADLINE_TIMEOUT))
 	thread.join(worker)
 	thread.destroy(worker)
 

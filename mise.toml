@@ -134,9 +134,10 @@ run = [
   fi
   """,
   # Every UDP wait in upstream goes through udp_wait.odin, which records the
-  # deadline each was handed for the tests that compare them (#556).
+  # deadline each was handed for the tests that compare them (#556). Matched as a
+  # call or as a proc value; a backtick before it is a comment naming the call.
   """
-  if grep -rnE '\\bloop\\.(recv|send)_udp(_until)?\\(' src/upstream \\
+  if grep -rnE '(^|[^A-Za-z0-9_.`])loop\\.(recv|send)_udp(_until)?([^A-Za-z0-9_]|$)' src/upstream \\
       --include='*.odin' --exclude='*_test.odin' --exclude='udp_wait.odin'; then
     echo 'wait on a UDP socket in upstream through udp_recv_until / udp_send_until' >&2
     exit 1

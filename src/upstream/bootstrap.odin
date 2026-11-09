@@ -106,15 +106,20 @@ bootstrap_resolve :: proc(
 			share_end = time.tick_add(now, left / time.Duration(len(servers) - i))
 		}
 		for qtype in ([]dns.Type{.A, .AAAA}) {
-			timeout := BOOTSTRAP_TIMEOUT
+			// Handed down as a deadline, not as what is left of it: one worked
+			// out again inside the query would run past the share by the time
+			// between the two readings of the clock.
+			now := loop.tick_now()
+			query_end := time.tick_add(now, BOOTSTRAP_TIMEOUT)
 			if deadline != {} {
-				left := time.tick_diff(loop.tick_now(), share_end)
-				if left <= 0 {
+				if time.tick_diff(now, share_end) <= 0 {
 					break
 				}
-				timeout = min(timeout, left)
+				if time.tick_diff(share_end, query_end) > 0 {
+					query_end = share_end
+				}
 			}
-			result, found := bootstrap_query(server, hostname, qtype, timeout)
+			result, found := bootstrap_query(server, hostname, qtype, query_end)
 			if !found {
 				continue
 			}
@@ -225,7 +230,8 @@ bootstrap_query :: proc(
 	server: string,
 	hostname: string,
 	qtype: dns.Type,
-	timeout := BOOTSTRAP_TIMEOUT,
+	// When the query gives up, sent or not.
+	deadline: time.Tick,
 ) -> (
 	addr: net.Address,
 	ok: bool,
@@ -261,7 +267,6 @@ bootstrap_query :: proc(
 		return nil, false
 	}
 	defer net.close(socket)
-	deadline := time.tick_add(loop.tick_now(), timeout)
 
 	if _, send_err := udp_send_until(socket, wire, deadline); send_err != nil {
 		return nil, false

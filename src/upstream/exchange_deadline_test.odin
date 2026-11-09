@@ -229,6 +229,35 @@ test_bootstrap_resolution_shares_the_exchange_timeout :: proc(t: ^testing.T) {
 }
 
 /*
+And to that deadline exactly, not to one worked out again from what is left:
+handed a deadline, the lone server's query waits to it and to nothing later.
+What `test_bootstrap_resolution_shares_the_exchange_timeout` cannot see on its
+own, since it knows the exchange's deadline only to within the exchange's
+start - a bootstrap stage given a whole timeout of its own lands inside that.
+Nothing answers, so nothing reaches the package-global cache.
+*/
+@(test)
+test_a_bootstrap_query_waits_to_the_deadline_it_is_given :: proc(t: ^testing.T) {
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if !testing.expectf(t, serr == nil, "cannot bind the bootstrap mock: %v", serr) {
+		return
+	}
+	defer net.close(socket)
+	bound, _ := net.bound_endpoint(socket)
+	servers := []string{net.endpoint_to_string(bound, context.temp_allocator)}
+
+	udp_waits_reset()
+	deadline := time.tick_add(time.tick_now(), X_TIMEOUT)
+	_, ok := bootstrap_resolve(servers, "given.example.test", deadline)
+	testing.expect(t, !ok, "resolved with nothing answering")
+	if testing.expectf(t, udp_wait_count >= 2, "%d UDP waits, where A's send and read were expected", udp_wait_count) {
+		testing.expectf(t, udp_waits[0].deadline == deadline, "A waited %v past the deadline it was given", time.tick_diff(deadline, udp_waits[0].deadline))
+	}
+	expect_udp_waits_share(t, time.tick_add(deadline, -X_TIMEOUT), X_TIMEOUT, 2)
+	free_all(context.temp_allocator)
+}
+
+/*
 Sharing the exchange's timeout must not cost the rest of the bootstrap list: a
 dead first server given all that is left - three seconds for A out of the
 default five, and the rest for AAAA - leaves the second unasked, and a hostname
