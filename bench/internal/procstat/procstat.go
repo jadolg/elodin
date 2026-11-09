@@ -127,6 +127,10 @@ func (s *Sampler) Start() {
 	}()
 }
 
+// Mark starts the CPU count afresh, at the end of a run's warmup: the queries
+// it is divided by are counted from there.
+func (s *Sampler) Mark() { s.CPUStart, _ = CPUTime(s.pid) }
+
 func (s *Sampler) Stop() {
 	close(s.stop)
 	<-s.done

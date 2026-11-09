@@ -217,6 +217,11 @@ func (h *harness) setup() error {
 		}
 	}
 
+	// The UDP, TCP and DoT rows run under dnsperf (dnsperfDrives).
+	if _, err := exec.LookPath("dnsperf"); err != nil {
+		return fmt.Errorf("dnsperf is not on PATH: the UDP, TCP and DoT rows run under it (apt install dnsperf)")
+	}
+
 	if err := h.makeCerts(); err != nil {
 		return err
 	}

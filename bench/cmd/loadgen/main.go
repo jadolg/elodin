@@ -311,6 +311,10 @@ func run(c config) (Result, error) {
 
 	measureFrom = time.Now().Add(c.warmup)
 	deadline = measureFrom.Add(c.duration)
+	// The harness counts the server's CPU from this line, as answers are
+	// counted from measureFrom.
+	measuring := time.AfterFunc(c.warmup, func() { fmt.Fprintln(os.Stderr, "loadgen: measuring") })
+	defer measuring.Stop()
 	runStart := time.Now()
 	paceFrom = runStart
 	close(start)
