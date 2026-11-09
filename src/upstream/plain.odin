@@ -35,7 +35,7 @@ exchange_udp :: proc(
 	}
 	defer net.close(socket)
 
-	if _, send_err := loop.send_udp_until(socket, query, endpoint, deadline); send_err != nil {
+	if _, send_err := loop.send_udp_until(socket, query, deadline); send_err != nil {
 		return nil, .IO_Error
 	}
 
@@ -89,17 +89,25 @@ exchange_udp :: proc(
 			arrived is a prefix of an answer, and TCP is where the whole one is.
 
 			Anything else is an ICMP error the kernel matched to this connected
-			socket - port, host or network unreachable (issue #622). It is not
-			the verdict: an off-path sender who guesses the source port can
-			forge one, and acted on it would end the exchange and, three in a
-			row, park the upstream for `COOLDOWN`. The same server asked over
-			TCP gives one that cannot be forged that way: a closed port answers
-			the SYN with a RST carrying our initial sequence number, which fails
-			the dial at once as `Dial_Failed`, and a live one answers the query.
-			A forged ICMP buys its sender one query moved to the pipelined
-			connection. RFCs are silent on what a stub or forwarder does with
-			one; PowerDNS Recursor fails the query and throttles the server on
-			it, Unbound connects but ignores it and waits out the timeout.
+			socket (issue #622): a hard one - port or protocol unreachable,
+			administratively prohibited - since `__udp4_lib_err` keeps the soft
+			ones, host and network unreachable, from a socket without
+			IP_RECVERR. It is not the verdict: an off-path sender who guesses
+			the source port can forge one, and acted on it would end the
+			exchange and, three in a row, park the upstream for `COOLDOWN`. The
+			same server asked over TCP gives one that cannot be forged that way:
+			a closed port answers the SYN with a RST acknowledging our initial
+			sequence number, which fails the dial at once as `Dial_Failed`, and
+			a live one answers the query.
+
+			So a forged ICMP buys its sender one query moved to the pipelined
+			connection - and, against a server whose TCP is refused or dropped,
+			that query's failure, charged as its TCP's. RFC 7766 section 5 has
+			every DNS server support TCP, and a TC answer from such a server
+			fails the same way. RFCs are silent on what a forwarder does with
+			the ICMP itself; PowerDNS Recursor fails the query and throttles the
+			server on it, Unbound connects but ignores it and waits out the
+			timeout.
 			*/
 			if recv_err != .Would_Block {
 				return exchange_pipelined(u, query, timeout, deadline, allocator)
@@ -149,9 +157,10 @@ so what an exchange costs above the send and the answer is this, one epoll
 registration and the close (#612).
 
 Connected to `endpoint` (issue #622), for two things an unconnected socket
-does not get. Linux reports an ICMP error - port, host or network unreachable -
-only to a UDP socket that is connected (udp(7)), so a closed port fails in a
-syscall rather than at the deadline; what `exchange_udp` makes of that is there.
+does not get. Without IP_RECVERR, Linux reports an ICMP hard error - port
+unreachable, administratively prohibited - only to a UDP socket that is
+connected (`__udp4_lib_err`), so a closed port fails in a syscall rather than
+at the deadline; what `exchange_udp` makes of that is there.
 And the kernel delivers only datagrams from `endpoint`, so a spoofed answer from
 any other address never reaches the read, and a probe of this port from one is
 answered as a closed port would be - the ICMP side channel Unbound's

@@ -105,9 +105,10 @@ server a few queries later than an unreachable one;
 A `udp://` server whose port is closed fails over at once, not at the timeout:
 an ICMP unreachable for the query is checked by asking the same server over TCP,
 and a refused connect there is the `Dial_Failed` that counts. A forged ICMP
-therefore moves one query to TCP rather than failing it. The ICMP for a
-`bootstrap` query is ignored, so a closed bootstrap server still costs its share
-of the timeout.
+therefore moves one query to TCP rather than failing it, unless the server's TCP
+is refused or dropped, where that query fails as its TCP does. The ICMP for a
+`bootstrap` query is ignored, so a closed bootstrap server costs its share of
+the timeout.
 
 Each *kind* of failure is logged once at `warn`, with the transport and address,
 and at `debug` after that; `elodin_upstream_failures_total` and

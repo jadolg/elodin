@@ -167,7 +167,9 @@ test_a_udp_refusal_is_checked_over_tcp :: proc(t: ^testing.T) {
 	testing.expectf(t, err == .None, "the exchange ended %v, where the server answers over TCP", err)
 	testing.expectf(t, len(resp) == len(query), "the answer is %d bytes, not the %d echoed", len(resp), len(query))
 	testing.expectf(t, spent < R_TIMEOUT / 2, "the exchange took %v, where a refusal is a syscall", spent)
-	testing.expect(t, healthy(u), "a refusal the server contradicted was charged against it")
+	// Not `healthy`, which holds until `FAILURE_THRESHOLD` failures and could not see one.
+	failures := stats_of(u).failures
+	testing.expectf(t, failures == 0, "a refusal the server contradicted was charged against it: %d failures", failures)
 	free_all(context.temp_allocator)
 }
 

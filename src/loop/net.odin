@@ -165,8 +165,24 @@ recv_udp_until :: proc(socket: net.UDP_Socket, buf: []u8, deadline: Tick) -> (in
 	return recv_udp_armed(socket, buf, deadline, true)
 }
 
-send_udp_until :: proc(socket: net.UDP_Socket, buf: []u8, to: net.Endpoint, deadline: Tick) -> (int, net.UDP_Send_Error) {
-	return send_udp_armed(socket, buf, to, deadline, true)
+/*
+For a connected socket, so it takes no address: `send` rides the route the
+connect cached, where a `sendto` naming the peer looks one up again per datagram
+(`udp_sendmsg`'s connected fast path is for a send without one).
+*/
+send_udp_until :: proc(socket: net.UDP_Socket, buf: []u8, deadline: Tick) -> (int, net.UDP_Send_Error) {
+	assert_nonblocking(linux.Fd(socket))
+	deadline, armed := deadline, true
+	for {
+		n, errno := linux.send(linux.Fd(socket), buf, {})
+		if errno != .EAGAIN {
+			take_turn()
+			return n, nil if errno == .NONE else .Unknown
+		}
+		if !socket_wait(linux.Fd(socket), {.Out}, .SNDTIMEO, {}, &deadline, &armed) {
+			return 0, .Would_Block
+		}
+	}
 }
 
 @(private)

@@ -263,7 +263,7 @@ bootstrap_query :: proc(
 	defer net.close(socket)
 	deadline := time.tick_add(loop.tick_now(), timeout)
 
-	if _, send_err := loop.send_udp_until(socket, wire, endpoint, deadline); send_err != nil {
+	if _, send_err := loop.send_udp_until(socket, wire, deadline); send_err != nil {
 		return nil, false
 	}
 
@@ -290,13 +290,13 @@ bootstrap_query :: proc(
 		taking it would hand an off-path sender the bootstrap answer - the
 		address every query to this upstream goes to. Reported once, so the next
 		read waits again; a bootstrap server whose port is closed costs this
-		server's share of the timeout, as before.
+		server's share of the timeout.
 		*/
-		if recv_err != nil && recv_err != .Would_Block {
-			continue
+		if recv_err == .Would_Block {
+			return nil, false
 		}
 		if recv_err != nil {
-			return nil, false
+			continue
 		}
 		if n < dns.HEADER_SIZE {
 			continue
