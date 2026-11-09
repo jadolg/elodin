@@ -418,12 +418,13 @@ expect_caller_holds_nothing :: proc(t: ^testing.T, track: ^mem.Tracking_Allocato
 }
 
 /*
-A body is held once while it is read, and afterwards in no more than its size:
-not in the reader's buffer and a copy of it (#414), nor in a buffer still
-holding every chunk already copied out.
+A body is held once while it is read, and afterwards in exactly its size: not in
+the reader's buffer and a copy of it (#414), nor in a buffer still holding every
+chunk already copied out, nor in the slack its doubling left.
 
 A buffer grown by doubling from 8 KB holds 1,000,000 bytes in 1 MiB, 5% over,
-so a body held twice at any point is the only way past the bound.
+so a body held twice at any point is the only way past the peak bound. The same
+5% is inside any ratio bound on what is held, so that one is exact.
 */
 @(test)
 test_a_body_is_held_once_while_it_is_read :: proc(t: ^testing.T) {
@@ -476,7 +477,7 @@ test_a_body_is_held_once_while_it_is_read :: proc(t: ^testing.T) {
 			testing.expect_value(t, len(resp.body), SIZE)
 			testing.expectf(
 				t,
-				track.current_memory_allocated < 1.1 * SIZE,
+				track.current_memory_allocated == SIZE,
 				"%s: a %d-byte body is held in %d bytes",
 				framings[framing],
 				SIZE,

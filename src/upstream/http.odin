@@ -400,9 +400,10 @@ Perform one request/response exchange on `stream`.
 
 The returned body is allocated from `allocator`; everything else borrows from
 scratch memory and must be copied if it needs to outlive the call. The response
-is read through a buffer from `context.allocator`, freed before returning, so
-that has to be an allocator that frees: in an arena, every block the buffer
-outgrew would stay.
+is read through a buffer from `context.allocator`, freed before returning or,
+when `allocator` is that same allocator, handed over as the body (see
+`reader_take`). So it has to be an allocator that frees: in an arena, every
+block the buffer outgrew would stay.
 
 `deadline`, when set, bounds the request's writes and the reading of the whole
 response, and `idle` any one read or write under it; see `stream_write` and
