@@ -28,7 +28,7 @@ func dnsperfDrives(o loadOpts) bool {
 }
 
 // dnsperfOnce runs a scenario as two dnsperf runs, the warmup and then the
-// measured one, with the server sampled over the second alone. Each opens its
+// measured one, with the server's CPU counted over the second alone. Each opens its
 // connections afresh: a hundred handshakes in a ten-second run.
 func (h *harness) dnsperfOnce(s *server, o loadOpts) (Result, sample, error) {
 	host, port, err := net.SplitHostPort(s.addrFor(o.transport))
@@ -40,14 +40,18 @@ func (h *harness) dnsperfOnce(s *server, o loadOpts) (Result, sample, error) {
 		return Result{}, sample{}, err
 	}
 	args := func(d time.Duration) []string { return dnsperfArgs(o, host, port, data, d) }
-	if *warmup > 0 {
-		if _, err := runDnsperf(o.cpus, args(*warmup)); err != nil {
-			return Result{}, sample{}, err
-		}
-	}
+	// RSS and threads over both runs, CPU and the log from the second, as a
+	// loadgen row samples its warmup and measured run.
 	sampler := procstat.NewSampler(s.pid)
 	sampler.Watch = s.logPath
 	sampler.Start()
+	if *warmup > 0 {
+		if _, err := runDnsperf(o.cpus, args(*warmup)); err != nil {
+			sampler.Stop()
+			return Result{}, sample{}, err
+		}
+	}
+	sampler.Mark()
 	out, err := runDnsperf(o.cpus, args(o.duration))
 	sampler.Stop()
 	if err != nil {

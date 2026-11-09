@@ -598,6 +598,9 @@ func runHandshake(c config) (Result, error) {
 	rec := hist.New(1 << 16)
 	var done, errs atomic.Int64
 
+	// No warmup: every handshake from here on is counted, and so is the
+	// server's CPU.
+	fmt.Fprintln(os.Stderr, "loadgen: measuring")
 	deadline := time.Now().Add(c.duration)
 	var wg sync.WaitGroup
 	for range c.clients {

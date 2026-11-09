@@ -148,13 +148,16 @@ const loadgenMeasuring = "loadgen: measuring"
 // watchWarmup reads loadgen's stderr to its end, starting the server's CPU
 // count afresh when loadgen says its warmup is over: the answers are counted
 // from there. RSS and threads are watched over the whole run. It returns the
-// rest of stderr, which is loadgen's complaint if it failed.
-func watchWarmup(stderr io.Reader, sampler *procstat.Sampler) string {
+// rest of stderr, which is loadgen's complaint if it failed, and whether the
+// line came.
+func watchWarmup(stderr io.Reader, sampler *procstat.Sampler) (string, bool) {
 	var rest strings.Builder
+	marked := false
 	sc := bufio.NewScanner(stderr)
 	for sc.Scan() {
 		if sc.Text() == loadgenMeasuring {
 			sampler.Mark()
+			marked = true
 			continue
 		}
 		rest.WriteString(sc.Text() + " ")
@@ -162,7 +165,7 @@ func watchWarmup(stderr io.Reader, sampler *procstat.Sampler) string {
 	// A line too long for the scanner ends the loop: drain the rest, or loadgen
 	// would block writing it and never exit.
 	_, _ = io.Copy(&rest, stderr)
-	return strings.TrimSpace(rest.String())
+	return strings.TrimSpace(rest.String()), marked
 }
 
 func (h *harness) loadgenOnce(s *server, o loadOpts) (Result, sample, error) {
@@ -195,11 +198,16 @@ func (h *harness) loadgenOnce(s *server, o loadOpts) (Result, sample, error) {
 	sampler := procstat.NewSampler(s.pid)
 	sampler.Watch = s.logPath
 	sampler.Start()
-	errText := watchWarmup(stderr, sampler)
+	errText, marked := watchWarmup(stderr, sampler)
 	err = cmd.Wait()
 	sampler.Stop()
 	if err != nil {
 		return Result{}, sample{}, fmt.Errorf("loadgen %s: %w: %s", strings.Join(args, " "), err, errText)
+	}
+	// Without the line the CPU count holds the warmup, and every CPU per query
+	// reads high with nothing to show it.
+	if !marked {
+		return Result{}, sample{}, fmt.Errorf("loadgen never wrote %q, so the warmup's CPU would be counted", loadgenMeasuring)
 	}
 
 	var r Result

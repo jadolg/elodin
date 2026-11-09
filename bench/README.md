@@ -171,7 +171,8 @@ about 3 ms. In `perf sched` at 270,000 DoT queries a second there were about 250
 such waits a second, each behind another loadgen thread, and the queries on
 the waiting thread read 3 ms slow. It shows against elodin since #604, whose
 loops sleep between bursts, and not against the build before it, whose loops
-never slept. At that rate loadgen read p99 3.2 ms and 0.45 ms. In #610 it read
+never slept. At that rate loadgen read p99 3.2 ms on the first and 0.45 ms on
+the second. In #610 it read
 elodin's DoT p99 at 100 clients as 3 ms at 320,000 queries a second. dnsperf on
 the same build measured 0.34–0.39 ms at 415,000–454,000, and loadgen with
 `GOMAXPROCS=8` measured 0.47 ms. No single `GOMAXPROCS` suits every row: more Ps
