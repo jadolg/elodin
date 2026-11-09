@@ -180,8 +180,10 @@ took loadgen's UDP p99 from 0.4 to 0.9 ms.
 
 Every client holds one connection for the whole run. That is what the
 per-transport table is meant to describe: the cost of answering on an
-established connection, not of establishing one. Handshakes are measured
-separately by `-transport=handshake`, which reconnects for every query.
+established connection, not of establishing one. Under dnsperf the measured
+run opens its own connections, so a DoT row's hundred handshakes fall inside
+its CPU count, which over a ten-second run is too few to move CPU per query.
+Handshakes are measured separately by `-transport=handshake`, which reconnects for every query.
 
 ## Noise, and what is done about it
 
