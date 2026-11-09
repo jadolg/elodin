@@ -261,6 +261,7 @@ main :: proc() {
 	run_cache_cases(&r)
 	run_cache_bytes_cases(&r)
 	run_serve_stale_cases(&r)
+	run_upstream_wait_cases(&r)
 	run_rrsig_expiry_cases(&r)
 	run_stale_refresh_cases(&r)
 	run_stale_superseded_cases(&r)

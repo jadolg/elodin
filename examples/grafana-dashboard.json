@@ -955,6 +955,18 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
+          "expr": "sum(rate(elodin_queries_upstream_shed_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "not sent upstream (upstream waits full)",
+          "range": true,
+          "instant": false,
+          "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
           "expr": "sum(rate(elodin_queries_refused_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "refused (allow_from)",
           "range": true,

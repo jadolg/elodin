@@ -2,6 +2,7 @@ package server
 
 import "core:sync"
 import "core:time"
+import "elodin:config"
 import "elodin:loop"
 
 /*
@@ -64,6 +65,44 @@ submit_query :: proc(s: ^Server, fn: proc(data: rawptr), data: rawptr, limit: in
 	}
 	query_done(s)
 	return .Stopped
+}
+
+/*
+How many of the queries counted in `server.max_pending` may be waiting on an
+upstream at once: everything but a reserved quarter, never fewer than two, the
+reservation `config.derive_chain_walks` keeps from the chain walks (issue #356)
+and for the same reason - the reserved places are never held for an upstream's
+timeout, so they turn over at the speed of the cache (issue #623). Zero, which
+is no bound, where `max_pending` sets none.
+*/
+upstream_wait_ceiling :: proc(s: ^Server) -> int {
+	limit := live(s).cfg.server.max_pending
+	if limit <= 0 {
+		return 0
+	}
+	return config.derive_chain_walks(limit)
+}
+
+/*
+Take a place among the queries waiting on an upstream, or report there is none
+under `ceiling`; zero or less is no bound. Decided and counted in one step, as
+`submit_query` is and for its reason.
+*/
+upstream_wait_begin :: proc(s: ^Server, ceiling: int) -> bool {
+	for {
+		waiting := sync.atomic_load(&s.upstream_waits)
+		if ceiling > 0 && waiting >= ceiling {
+			return false
+		}
+		if _, taken := sync.atomic_compare_exchange_weak(&s.upstream_waits, waiting, waiting + 1); taken {
+			return true
+		}
+	}
+}
+
+// The end of a wait `upstream_wait_begin` started.
+upstream_wait_end :: proc(s: ^Server) {
+	sync.atomic_sub(&s.upstream_waits, 1)
 }
 
 // The end of a query `submit_query` started.

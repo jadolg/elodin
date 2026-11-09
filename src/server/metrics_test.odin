@@ -413,6 +413,7 @@ test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
 		special_use    = 15,
 		accept_backoff = 16,
 		unreadable_rcode = 17,
+		upstream_shed  = 18,
 	}
 	cs := cache.Stats {
 		hits      = 20,

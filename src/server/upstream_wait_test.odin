@@ -1,0 +1,161 @@
+package server
+
+import "core:testing"
+import "core:time"
+import "elodin:cache"
+import "elodin:config"
+import "elodin:dns"
+
+/*
+Issue #623: misses held by a dead upstream must not take the whole of
+`server.max_pending`, or the readers shed cache hits with them.
+*/
+
+// Everything but a reserved quarter, never fewer than two reserved; none
+// without a `max_pending`.
+@(test)
+test_the_upstream_wait_ceiling_reserves_a_quarter :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := Server{cfg = &cfg}
+	cfg.server.max_pending = 409
+	testing.expect_value(t, upstream_wait_ceiling(&s), 409 - 102)
+	cfg.server.max_pending = 4
+	testing.expect_value(t, upstream_wait_ceiling(&s), 2)
+	cfg.server.max_pending = 0
+	testing.expect_value(t, upstream_wait_ceiling(&s), 0)
+}
+
+// The places stop at the ceiling, come back as they are given up, and are
+// unbounded at zero.
+@(test)
+test_upstream_waits_stop_at_the_ceiling :: proc(t: ^testing.T) {
+	s: Server
+	testing.expect(t, upstream_wait_begin(&s, 2), "the first wait was refused")
+	testing.expect(t, upstream_wait_begin(&s, 2), "the second wait was refused")
+	testing.expect(t, !upstream_wait_begin(&s, 2), "a wait past the ceiling was let in")
+	upstream_wait_end(&s)
+	testing.expect(t, upstream_wait_begin(&s, 2), "the place given back was not free again")
+	testing.expect(t, upstream_wait_begin(&s, 0), "no ceiling refused a wait")
+	testing.expect_value(t, s.upstream_waits, 3)
+}
+
+@(private = "file")
+wait_query :: proc(name: string) -> []u8 {
+	msg := dns.Message {
+		id       = 0x2345,
+		question = []dns.Question{{name = name, type = .A, class = .IN}},
+	}
+	msg.flags.rd = true
+	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+	return wire
+}
+
+/*
+With every place taken, a miss is answered SERVFAIL at once and counted, and a
+cache hit is still answered: hits need no place. No upstream group is set, so a
+miss that reached the exchange would crash rather than pass.
+
+A query on a connection is not held to the places at all, and the refresh that
+would wait on its behalf reports it was not answered rather than counting a
+client's failure.
+*/
+@(test)
+test_a_miss_past_the_upstream_waits_fails_and_a_hit_is_served :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.blocking.enabled = false
+	cfg.server.max_pending = 8
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	defer cache.destroy(answers)
+	s := Server {
+		cfg     = &cfg,
+		answers = answers,
+	}
+	s.upstream_waits = upstream_wait_ceiling(&s)
+
+	hit := "hit.example."
+	reply := dns.Message {
+		id       = 0x2345,
+		question = []dns.Question{{name = hit, type = .A, class = .IN}},
+		answer   = []dns.Record{{name = hit, type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {192, 0, 2, 1}}}},
+	}
+	reply.flags.qr = true
+	reply.flags.rd = true
+	reply.flags.ra = true
+	wire, _, _ := dns.encode_message(reply, context.temp_allocator)
+	decoded, _ := dns.decode_message(wire, context.temp_allocator)
+	key_buf: [cache.KEY_MAX]u8
+	if !testing.expect(t, cache.put(answers, cache.make_key(key_buf[:], hit, .A, .IN, false, false), wire, decoded), "not cached") {
+		return
+	}
+
+	_, outcome, ok := handle_query(&s, wait_query(hit), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	testing.expect(t, ok, "the hit went unanswered")
+	testing.expect_value(t, outcome, Outcome.Cached)
+
+	out, missed, answered_miss := handle_query(&s, wait_query("miss.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	if testing.expect(t, answered_miss, "the miss went unanswered") {
+		testing.expect_value(t, missed, Outcome.Failed)
+		testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Serv_Fail)
+	}
+	testing.expect_value(t, s.stats.upstream_shed, 1)
+	testing.expect_value(t, s.stats.failed, 1)
+	testing.expect_value(t, s.upstream_waits, upstream_wait_ceiling(&s))
+
+	msg, _ := dns.decode_message(wait_query("refresh.example."), context.temp_allocator)
+	spent := 0
+	r := resolve_query(&s, wait_query("refresh.example."), msg, .UDP, "", 512, {}, {}, &spent, context.temp_allocator, refresh = true)
+	testing.expect(t, r.unanswered, "a refresh with no place counted as a client's failure")
+	testing.expect_value(t, s.stats.failed, 1)
+	testing.expect_value(t, s.stats.upstream_shed, 2)
+
+	free_all(context.temp_allocator)
+}
+
+/*
+A client waiting on an expired entry's refresh is waiting on an upstream, and
+holds a place for it as the refresh does: the refreshes are a quarter of
+`max_pending` and the clients waiting on them a quarter more, which with the
+places full would be all of it. With one place left the client takes it and
+its refresh finds none, so the held bytes go out without the wait; with none
+left the client is served them at once and no refresh is started.
+
+The group has no servers, so a refresh that did get a place fails at once
+rather than holding one; `upstream_shed` is what says which way it went.
+*/
+@(test)
+test_a_wait_on_a_refresh_holds_a_place :: proc(t: ^testing.T) {
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	defer cache.destroy(answers)
+	group := down_upstream()
+	cfg: config.Config
+	s := stale_server(&cfg, answers, &group)
+	cfg.server.max_pending = 8
+	cfg.cache.stale_timeout = 5 * time.Second
+	workers: Test_Loop
+	if !testing.expect(t, start_test_loop(&workers), "no loop") {
+		return
+	}
+	s.loops = workers.loops[:]
+	defer stop_test_loop(&workers)
+	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
+		return
+	}
+	ceiling := upstream_wait_ceiling(&s)
+
+	for left in 0 ..= 1 {
+		s.upstream_waits = ceiling - left
+		before := s.stats.upstream_shed
+		begun := time.tick_now()
+		_, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		testing.expectf(t, ok && outcome == .Cached, "%d left: the expired entry was not served (%v)", left, outcome)
+		testing.expectf(t, time.tick_since(begun) < 2 * time.Second, "%d left: the client waited %v", left, time.tick_since(begun))
+		// The client's own refusal with none left; its refresh's with one.
+		testing.expectf(t, s.stats.upstream_shed - before == 1, "%d left: %d turned away, want 1", left, s.stats.upstream_shed - before)
+		for start := time.tick_now(); queries_pending(&s) > 0 && time.tick_since(start) < 2 * time.Second; {
+			time.sleep(time.Millisecond)
+		}
+		testing.expectf(t, s.upstream_waits == ceiling - left, "%d left: %d places held after, want %d", left, s.upstream_waits, ceiling - left)
+	}
+	free_all(context.temp_allocator)
+}

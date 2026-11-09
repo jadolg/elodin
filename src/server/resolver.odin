@@ -191,6 +191,14 @@ Stats :: struct {
 	nothing to account for the gap - or its failure, counted in `failed`.
 	*/
 	coalesced:        u64,
+	/*
+	Queries counted in `server.max_pending` that would have waited on an
+	upstream while as many already were as `upstream_wait_ceiling` allows, and
+	were answered as an unreachable upstream answers instead - the expired entry
+	where one is held, SERVFAIL otherwise (issue #623). Also in `failed` or
+	`cached`, whichever the client got.
+	*/
+	upstream_shed:    u64,
 }
 
 Server :: struct {
@@ -229,6 +237,8 @@ Server :: struct {
 	// Queries in flight on fibers of their own, against `max_pending`. See
 	// `submit_query`.
 	pending:      int,
+	// Those of them waiting on an upstream, against `upstream_wait_ceiling`.
+	upstream_waits: int,
 	// Where the next accepted connection goes; see `next_loop`.
 	next_loop:    uint,
 	// Race legs in flight in every group, against `max_pending`; see `build_upstreams`.
@@ -1127,6 +1137,8 @@ Query_State :: struct {
 	*/
 	refresh:          bool,
 	pool:             dnssec.Walk_Pool,
+	// Holding one of the places `upstream_wait_ceiling` counts; see `wait_on_upstream`.
+	waiting:          bool,
 
 	// Settled by `answer_from_cache`.
 	validating:       bool,
@@ -1213,7 +1225,20 @@ resolve_query :: proc(
 
 @(private)
 resolve_stages :: proc(st: ^Query_State) {
-	if answer_locally(st) || answer_from_cache(st) || shape_forwarded(st) || join_flight(st) {
+	if answer_locally(st) || answer_from_cache(st) || shape_forwarded(st) {
+		return
+	}
+	/*
+	Everything from here may wait on an upstream - leading the exchange,
+	following a leader, walking the chain - so it holds a place among the
+	queries that may. See `wait_on_upstream`.
+	*/
+	if !wait_on_upstream(st) {
+		upstream_busy(st)
+		return
+	}
+	defer stop_waiting(st)
+	if join_flight(st) {
 		return
 	}
 	defer if st.flight != nil {
@@ -1683,7 +1708,8 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	Those three are the only ways out of this block. Every other reason
 	`start_refresh` declines - a refresh for this key already running, the
 	ceiling reached, `max_pending` reached or the server shutting down - serves
-	the expired bytes here and now. Each of them says the same thing, which is
+	the expired bytes here and now, as does finding no place to wait on an
+	upstream (`wait_on_upstream`). Each of them says the same thing, which is
 	that this query is not the one to spend an upstream round trip on, and none
 	of them leaves the entry unrefreshed for longer than the refresh that is
 	already in flight or the load that is shedding them.
@@ -1692,6 +1718,17 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	   st.stale_hit.stale &&
 	   live(st.s).cfg.cache.stale_timeout > 0 &&
 	   can_detach(st.s) {
+		/*
+		The wait for the refresh is a wait on an upstream like any other, and
+		counted with them: the refreshes are a quarter of `max_pending` at most,
+		but the clients waiting on them are a quarter more (issue #623). Without
+		a place, the held bytes go out now, as when `start_refresh` declines.
+		*/
+		if !wait_on_upstream(st) {
+			upstream_busy(st)
+			return true
+		}
+		defer stop_waiting(st)
 		if r := start_refresh(st.s, st.key, st.query, st.proto, st.client, st.limit, st.started); r != nil {
 			defer refresh_release(r)
 			if out, refreshed, code, taken := refresh_take(r, live(st.s).cfg.cache.stale_timeout, st.allocator);
@@ -3026,6 +3063,106 @@ stored_verdict :: proc(
 @(private)
 stale_usable :: proc(hit: Cached_Answer) -> bool {
 	return hit.signed_until == 0 || hit.signed_until > loop.moment_now()
+}
+
+/*
+Whether this query may wait on an upstream, taking a place among the queries that
+are if it may. `stop_waiting` gives the place back.
+
+The bound is `upstream_wait_ceiling`, and it is what keeps a dead upstream from
+taking the whole of `server.max_pending` (issue #623). Each query held on one
+holds its place in flight for the upstream's whole budget - ten seconds with the
+defaults - so without it about forty misses a second against a blackholed
+upstream fill a 1 GiB box's bound, and from then on the readers shed cache hits
+with the misses, though no hit needed the upstream. With it, a reserved quarter
+of `max_pending` is never waiting on an upstream: it turns over as fast as the
+cache answers, so hits keep being admitted whatever the upstream is doing.
+
+Every wait is counted - leading an exchange, following a leader, walking the
+chain, waiting on an expired entry's refresh - because each holds a place in
+flight as long as the others do, and leaving any one out lets a flood shaped to
+it fill the reservation. Queries answered on a connection's fiber are not:
+`max_connections` bounds those, and `max_pending` does not count them.
+*/
+@(private)
+wait_on_upstream :: proc(st: ^Query_State) -> bool {
+	if st.pool != .Shared {
+		return true
+	}
+	if !upstream_wait_begin(st.s, upstream_wait_ceiling(st.s)) {
+		return false
+	}
+	st.waiting = true
+	return true
+}
+
+// The end of what `wait_on_upstream` began, if it took a place.
+@(private)
+stop_waiting :: proc(st: ^Query_State) {
+	if st.waiting {
+		st.waiting = false
+		upstream_wait_end(st.s)
+	}
+}
+
+/*
+The answer for a query `wait_on_upstream` turned away: what an upstream that
+cannot be reached produces, without the wait - the expired entry where
+`serve_stale` kept one, SERVFAIL otherwise - since that is what this server is
+for the moment as far as the query is concerned. RFC 8767 section 5 asks for the
+stale answer rather than the wait, and BIND answers SERVFAIL past its own
+`fetches-per-server` and `fetches-per-zone` quotas the same way.
+
+Answered rather than dropped as `max_pending` drops: the query has been read,
+parsed and admitted by now, so the client's retry would only cost the same again,
+and the SERVFAIL is no larger than the query it answers.
+
+A detached refresh reports `unanswered` instead, as `judge_reply` has it do: the
+client holding the expired entry serves it.
+*/
+@(private)
+upstream_busy :: proc(st: ^Query_State) {
+	sync.atomic_add(&st.s.stats.upstream_shed, 1)
+	report_upstream_busy(st)
+	if st.refresh {
+		st.unanswered = true
+		out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
+		answered(st, out, .Failed, built)
+		return
+	}
+	answered(st, upstream_failed(st, "upstream-busy"))
+}
+
+upstream_busy_reported: bool
+
+/*
+Once per process at `warn`, naming the setting, and at `debug` after that, for
+the reason `report_shed` gives: how many there are is the flood's to decide.
+`elodin_queries_upstream_shed_total` goes on counting.
+*/
+@(private)
+report_upstream_busy :: proc(st: ^Query_State) {
+	say, first := report_once(&upstream_busy_reported, logx.enabled(.Debug))
+	if !say {
+		return
+	}
+	if !first {
+		logx.debugf(
+			"query %s %s from %s: not sent upstream, the queries waiting on upstreams are at their limit",
+			dns.type_name(st.q.type),
+			dns.name_trim_root(st.q.name),
+			st.client,
+		)
+		return
+	}
+	logx.warnf(
+		"query %s %s from %s: not sent upstream, %d queries are already waiting on upstreams - all of server.max_pending (%d) but the quarter kept for answers that need none - so it was answered from the expired entry or SERVFAIL. Counted as elodin_queries_upstream_shed_total; further ones are logged at debug level",
+		dns.type_name(st.q.type),
+		dns.name_trim_root(st.q.name),
+		st.client,
+		upstream_wait_ceiling(st.s),
+		live(st.s).cfg.server.max_pending,
+	)
 }
 
 /*
@@ -4685,5 +4822,6 @@ stats_of :: proc(s: ^Server) -> Stats {
 		special_use = sync.atomic_load(&s.stats.special_use),
 		unreadable_rcode = sync.atomic_load(&s.stats.unreadable_rcode),
 		coalesced = sync.atomic_load(&s.stats.coalesced),
+		upstream_shed = sync.atomic_load(&s.stats.upstream_shed),
 	}
 }

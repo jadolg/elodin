@@ -121,6 +121,20 @@ rises is the server turning queries away. Against a 20 ms upstream, 1,000 in
 flight is 50,000 cache misses a second; raise `max_pending` only when the dropped
 counter says so.
 
+### Waiting on an upstream
+
+At most `max_pending` less a reserved quarter (never fewer than two reserved) of
+these queries may be waiting on an upstream at once: forwarding, waiting on an
+identical query already forwarding, walking a DNSSEC chain, or waiting on an
+expired entry's refresh. The reserved quarter is never held for an upstream's
+timeout, so cache hits keep being admitted while a dead upstream holds every
+miss for `timeout` × `attempts`. A query that would wait past the bound is
+answered as an unreachable upstream answers - the expired entry where
+`cache.serve_stale` kept one, SERVFAIL otherwise - at once, logged as
+`outcome=failed detail=upstream-busy` and counted in
+`elodin_queries_upstream_shed_total`. The first one is logged at `warn`, the
+rest at `debug`.
+
 ### What reaches the upstreams
 
 `max_pending` is also how much of a flood the upstreams see. A query for a name

@@ -71,7 +71,7 @@ stats_line :: proc(
 	limited, slipped, conn_limited: u64,
 ) -> string {
 	return fmt.tprintf(
-		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d unreadable_rcode=%d coalesced=%d cache_prefetches=%d cache_prefetch_failures=%d",
+		"queries=%d blocked=%d cached=%d forwarded=%d failed=%d rewritten=%d dropped=%d refused=%d conn_refused=%d conn_rate_limited=%d conn_failed=%d accept_backoff=%d handshakes=%d limited=%d truncated=%d secure=%d bogus=%d rebind=%d special_use=%d cache_entries=%d cache_bytes=%d cache_hits=%d cache_withheld=%d cache_misses=%d cache_stale=%d cache_evictions=%d unreadable_rcode=%d coalesced=%d cache_prefetches=%d cache_prefetch_failures=%d upstream_shed=%d",
 		st.queries,
 		st.blocked,
 		st.cached,
@@ -120,6 +120,7 @@ stats_line :: proc(
 		st.coalesced,
 		cs.prefetches,
 		cs.prefetch_failures,
+		st.upstream_shed,
 	)
 }
 
@@ -417,6 +418,13 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		.Counter,
 		"Queries turned away before any work was done, because the backlog was full or the source could not be answered.",
 		st.dropped,
+	)
+	metrics.scalar(
+		&b,
+		"elodin_queries_upstream_shed_total",
+		.Counter,
+		"Queries answered from an expired entry or SERVFAIL without asking an upstream, because the queries already waiting on upstreams held all of server.max_pending but its reserved quarter.",
+		st.upstream_shed,
 	)
 	metrics.scalar(
 		&b,
