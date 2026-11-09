@@ -521,6 +521,32 @@ test_an_empty_body_holds_nothing :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+A body that arrived with the fields sits past them in the reader's buffer, so the
+buffer handed over as the body is the body moved to its start: whole, and held in
+exactly its size.
+*/
+@(test)
+test_a_body_read_with_its_fields_is_handed_over_whole :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	{
+		// The reader's buffer in the caller's allocator, as a list's is.
+		context.allocator = mem.tracking_allocator(&track)
+		resp, err, ok := exchange_against(t, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", &track)
+		if !ok {
+			return
+		}
+		testing.expect_value(t, err, Error.None)
+		testing.expect_value(t, string(resp.body), "hello")
+		testing.expect_value(t, track.current_memory_allocated, 5)
+		delete(resp.body)
+	}
+	expect_caller_holds_nothing(t, &track, "body read with its fields")
+	free_all(context.temp_allocator)
+}
+
 @(test)
 test_redirect_location_is_not_the_callers_to_free :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
