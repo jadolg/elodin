@@ -3,6 +3,7 @@ package upstream
 import "core:mem"
 import "core:net"
 import "core:sys/linux"
+import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
 import "elodin:loop"
@@ -34,7 +35,7 @@ exchange_udp :: proc(
 	}
 	defer net.close(socket)
 
-	if _, send_err := loop.send_udp_until(socket, query, endpoint, deadline); send_err != nil {
+	if _, send_err := loop.send_udp_until(socket, query, deadline); send_err != nil {
 		return nil, .IO_Error
 	}
 
@@ -82,17 +83,61 @@ exchange_udp :: proc(
 	for time.tick_diff(loop.tick_now(), deadline) > 0 {
 		n, remote, recv_err := loop.recv_udp_until(socket, buf, deadline)
 		if recv_err != nil {
-			// The datagram was larger than the room the query offered, so what
-			// arrived is a prefix of an answer. TCP is where the whole one is.
-			if recv_err == .Excess_Truncated {
-				return exchange_pipelined(u, query, timeout, deadline, allocator)
+			/*
+			Anything but the deadline is TCP's to settle. `.Excess_Truncated`:
+			the datagram was larger than the room the query offered, so what
+			arrived is a prefix of an answer, and TCP is where the whole one is.
+
+			Anything else is, in practice, an ICMP error the kernel matched to
+			this connected socket (issue #622): a hard one in `__udp4_lib_err`'s
+			terms - a destination unreachable `icmp_err_convert` marks fatal
+			(port or protocol unreachable, an unknown or prohibited host or
+			network), fragmentation needed, a parameter problem - since it keeps
+			the soft ones, host and network unreachable among them, from a
+			socket without IP_RECVERR. It is not the verdict: an off-path sender
+			who guesses the source port can forge one, and acted on it would end
+			the exchange and, three in a row, park the upstream for `COOLDOWN`.
+			The same server asked over TCP gives one that cannot be forged that
+			way: a closed port answers the SYN with a RST acknowledging our
+			initial sequence number, which fails the dial at once as
+			`Dial_Failed`, and a live one answers the query.
+
+			A local failure of the read takes the same road, and costs a TCP
+			exchange rather than a wrong verdict.
+
+			So a forged ICMP buys its sender one query moved to the pipelined
+			connection - never a connection of its own, and with that one full
+			the query goes back to waiting on UDP - and,
+			against a server whose TCP is refused or dropped, that query's
+			failure, charged as its TCP's. RFC 7766 section 5 has every DNS
+			server support TCP, and a TC answer from such a server fails the
+			same way. RFCs are silent on what a forwarder does with the ICMP
+			itself; PowerDNS Recursor fails the query and throttles the server
+			on it, Unbound connects but ignores it and waits out the timeout.
+			*/
+			if recv_err != .Would_Block {
+				icmp := recv_err != .Excess_Truncated
+				tcp_response, tcp_err := exchange_pipelined(u, query, timeout, deadline, allocator, private = !icmp)
+				/*
+				Turned away from a full shared connection (see `get_pipe`): the
+				server's TCP is up, so the ICMP was most likely not the
+				server's, and the UDP answer may still be on its way. The
+				error is reported once, so the read waits again, to the same
+				deadline.
+				*/
+				if icmp && tcp_err == .Backlogged {
+					continue
+				}
+				return tcp_response, tcp_err
 			}
 			return nil, .Bad_Response if rejected else .Timeout
 		}
 		if n < dns.HEADER_SIZE {
 			continue
 		}
-		// Ignore anything that did not come from the server we asked.
+		// Ignore anything that did not come from the server we asked. The
+		// connected socket has the kernel drop those already; this stays as
+		// the check that does not depend on it.
 		if remote.port != endpoint.port || !netx.addresses_equal(remote.address, endpoint.address) {
 			continue
 		}
@@ -121,13 +166,23 @@ exchange_udp :: proc(
 
 /*
 A socket of its own for one exchange with `endpoint`, bound by the kernel to a
-random port at the send: RFC 5452 section 9.2 asks for an unpredictable source
+random port at the connect: RFC 5452 section 9.2 asks for an unpredictable source
 port, and a socket shared between queries would hold one port for all of them.
 Non-blocking from its creation, so a wait for the answer parks a fiber rather
 than a loop; its reads and writes wait to the exchange's deadline with
 `loop.recv_udp_until` and `loop.send_udp_until` rather than a timeout option,
 so what an exchange costs above the send and the answer is this, one epoll
 registration and the close (#612).
+
+Connected to `endpoint` (issue #622), for two things an unconnected socket
+does not get. Without IP_RECVERR, Linux reports an ICMP hard error - port
+unreachable, say, or administratively prohibited - only to a UDP socket that is
+connected (`__udp4_lib_err`), so a closed port fails in a syscall rather than
+at the deadline; what `exchange_udp` makes of that is there.
+And the kernel delivers only datagrams from `endpoint`, so a spoofed answer from
+any other address never reaches the read, and a probe of this port from one is
+answered as a closed port would be - the ICMP side channel Unbound's
+`udp-connect` (on by default) closes. PowerDNS Recursor connects its sockets too.
 
 Every wait runs to the one deadline, not a timeout restarted per read: a datagram
 passed over - a stray, a forgery - landing just before a fresh timeout ran out
@@ -138,7 +193,18 @@ would buy another whole one, and an off-path sender could double any exchange
 open_udp :: proc(endpoint: net.Endpoint) -> (net.UDP_Socket, bool) {
 	domain := linux.Address_Family.INET if net.family_from_endpoint(endpoint) == .IP4 else .INET6
 	fd, err := linux.socket(domain, .DGRAM, {.CLOEXEC, .NONBLOCK}, .UDP)
-	return net.UDP_Socket(fd), err == .NONE
+	if err != .NONE {
+		return {}, false
+	}
+	// A UDP connect sends nothing: it fixes the peer, and binds the random port.
+	storage: posix.sockaddr_in6
+	addr_len: posix.socklen_t
+	fill_sockaddr(endpoint, &storage, &addr_len)
+	if posix.connect(posix.FD(fd), cast(^posix.sockaddr)&storage, addr_len) != .OK {
+		linux.close(fd)
+		return {}, false
+	}
+	return net.UDP_Socket(fd), true
 }
 
 @(private)

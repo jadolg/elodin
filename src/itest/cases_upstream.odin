@@ -316,6 +316,56 @@ blocking: {{ enabled: false }}
 			}
 		}
 	}
+
+	/*
+	--- failover past a refused upstream (issue #622) ---
+
+	A port nothing listens on, on UDP or TCP: the kernel answers the datagram
+	with ICMP port unreachable, and the TCP check that follows with a RST. The
+	failover is in a syscall, not at the 2 s timeout.
+	*/
+	{
+		closed_port := next_port(r)
+		live_port := next_port(r)
+		live := mock_make("live", live_port)
+		mock_reply_all(live, make_a_response(QNAME, {198, 51, 100, 9}, 60))
+		if !mock_start(live) {
+			skip_case(r, "strategy: failover past a refused upstream", "cannot start the mock")
+		} else {
+			defer mock_stop(live)
+			udp_port := next_port(r)
+			srv, ok := start_server(
+				r,
+				Server_Options {
+					config = base_config(udp_port, "failover", server_list([]int{closed_port, live_port})),
+					udp_port = udp_port,
+				},
+			)
+			if ok {
+				start_case(r, "upstream: a refused server fails over at once")
+				{
+					started := time.tick_now()
+					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = 622))
+					elapsed := time.tick_since(started)
+					if check(r, res.ok, "no response") {
+						check_eq_str(r, first_address(r, res.wire), "198.51.100.9", "answering upstream")
+						check(
+							r,
+							elapsed < time.Second,
+							"took %.0fms, so the refused upstream was waited out to its timeout",
+							time.duration_milliseconds(elapsed),
+						)
+					}
+					// The refusal was seen, rather than the timeout coming early.
+					check(r, log_contains(&srv, "Dial_Failed"), "the refused upstream was not reported as a refused dial")
+				}
+				end_case(r)
+				stop_server(&srv)
+			} else {
+				skip_case(r, "strategy: failover past a refused upstream", "server did not start")
+			}
+		}
+	}
 }
 
 run_upstream_transport_cases :: proc(r: ^Runner) {

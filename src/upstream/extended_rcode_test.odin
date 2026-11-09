@@ -732,8 +732,8 @@ is asked by `resolve` and times out, the second answers, and the reply is one th
 sweep will not take. Before this the sweep asked the dead member again, and a
 question that cost one timeout cost two.
 
-A socket bound and closed gives an address nothing is listening on, which is a
-timeout rather than a refusal on UDP. The timeout is 200ms and the assertion is
+A socket bound and never read is a member that does not answer, which is a
+timeout. The timeout is 200ms and the assertion is
 that the whole call comes in under three of them: the fixture cannot see a
 skipped exchange, only the wait it would have cost.
 */
@@ -743,8 +743,9 @@ test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testin
 	if !testing.expectf(t, derr == nil, "cannot bind the dead port: %v", derr) {
 		return
 	}
+	// Held open and never read: silent. Closed, it would refuse (issue #622).
+	defer net.close(dead_socket)
 	dead_bound, berr := net.bound_endpoint(dead_socket)
-	net.close(dead_socket)
 	if !testing.expectf(t, berr == nil, "cannot read the dead port: %v", berr) {
 		return
 	}
@@ -864,8 +865,9 @@ test_a_live_spare_behind_a_dead_one_is_reached_once_the_dead_one_parks :: proc(t
 	if !testing.expectf(t, derr == nil, "cannot bind the dead port: %v", derr) {
 		return
 	}
+	// Held open and never read: silent. Closed, it would refuse (issue #622).
+	defer net.close(dead_socket)
 	dead_bound, berr := net.bound_endpoint(dead_socket)
-	net.close(dead_socket)
 	if !testing.expectf(t, berr == nil, "cannot read the dead port: %v", berr) {
 		return
 	}
@@ -943,21 +945,21 @@ spare is asked and the second is not, because by then the budget is gone.
 
 The assertion is the elapsed time, against a threshold between one timeout and
 two: a fixture cannot see an exchange that was never made, only the wait it
-would have cost. The dead ports are bound and closed, which on UDP is a timeout
-rather than a refusal - `exchange_udp` does not connect its socket, so no ICMP
-comes back.
+would have cost. The dead ports are bound and never read, which is a timeout;
+closed, they would refuse at once (issue #622) and prove nothing.
 */
 @(test)
 test_the_sweep_spends_one_timeout_on_the_members_it_has_left :: proc(t: ^testing.T) {
-	dead_upstream :: proc(t: ^testing.T, name: string) -> (^Upstream, bool) {
+	// The socket is held open and never read until the caller closes it.
+	dead_upstream :: proc(t: ^testing.T, name: string) -> (^Upstream, net.UDP_Socket, bool) {
 		socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 		if !testing.expectf(t, serr == nil, "cannot bind a dead port: %v", serr) {
-			return nil, false
+			return nil, {}, false
 		}
 		bound, berr := net.bound_endpoint(socket)
-		net.close(socket)
 		if !testing.expectf(t, berr == nil, "cannot read a dead port: %v", berr) {
-			return nil, false
+			net.close(socket)
+			return nil, {}, false
 		}
 		u, uerr := make_upstream(
 			config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port},
@@ -966,9 +968,10 @@ test_the_sweep_spends_one_timeout_on_the_members_it_has_left :: proc(t: ^testing
 			context.allocator,
 		)
 		if !testing.expectf(t, uerr == .None, "cannot build %s: %v", name, uerr) {
-			return nil, false
+			net.close(socket)
+			return nil, {}, false
 		}
-		return u, true
+		return u, socket, true
 	}
 
 	refusing := Canned_Mock{}
@@ -984,15 +987,18 @@ test_the_sweep_spends_one_timeout_on_the_members_it_has_left :: proc(t: ^testing
 		destroy(ref)
 	}
 
-	first, first_ok := dead_upstream(t, "spare-one")
+	// Silent, not refusing: each socket is bound until the end and never read.
+	first, first_socket, first_ok := dead_upstream(t, "spare-one")
 	if !first_ok {
 		return
 	}
+	defer net.close(first_socket)
 	defer destroy(first)
-	second, second_ok := dead_upstream(t, "spare-two")
+	second, second_socket, second_ok := dead_upstream(t, "spare-two")
 	if !second_ok {
 		return
 	}
+	defer net.close(second_socket)
 	defer destroy(second)
 
 	servers := make([]^Upstream, 3, context.allocator)

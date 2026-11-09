@@ -263,7 +263,7 @@ bootstrap_query :: proc(
 	defer net.close(socket)
 	deadline := time.tick_add(loop.tick_now(), timeout)
 
-	if _, send_err := loop.send_udp_until(socket, wire, endpoint, deadline); send_err != nil {
+	if _, send_err := loop.send_udp_until(socket, wire, deadline); send_err != nil {
 		return nil, false
 	}
 
@@ -283,8 +283,20 @@ bootstrap_query :: proc(
 	// `loop.recv_udp_until` yields between them.
 	for time.tick_diff(loop.tick_now(), deadline) > 0 {
 		n, remote, recv_err := loop.recv_udp_until(socket, buf, deadline)
-		if recv_err != nil {
+		/*
+		An ICMP error on the connected socket (see `open_udp`) is waited past,
+		as Unbound does with every one: forgeable by whoever guesses the source
+		port, and unlike `exchange_udp` this has no TCP path to check it on, so
+		taking it would let an off-path sender skip this server, or with one
+		per server leave the upstream unresolved. Reported once, so the next
+		read waits again; a bootstrap server whose port is closed costs this
+		server's share of the timeout.
+		*/
+		if recv_err == .Would_Block {
 			return nil, false
+		}
+		if recv_err != nil {
+			continue
 		}
 		if n < dns.HEADER_SIZE {
 			continue
