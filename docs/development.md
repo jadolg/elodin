@@ -334,7 +334,9 @@ by hand: `curl --http2 -k -H 'content-type: application/dns-message'
 `main`:
 
 - once: `mise run check`, `fuzz-regression`, `parity-regression`, `leakcheck`
-- on both architectures: `mise run test`, `itest`, `build`, and `mise run deb`,
+- on both architectures: `mise run test` (a crash while its tests build or run
+  leaves a backtrace in the job log and the core in a `cores-<arch>` artifact),
+  `itest`, `build`, and `mise run deb`,
   whose package is installed on the runner, made to resolve a handful of names
   through the resolver takeover it performs, then removed, checking the runner
   gets its own resolver back

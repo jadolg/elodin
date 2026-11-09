@@ -42,11 +42,38 @@ jobs:
         with:
           install: true
           cache: true
-      - run: mise run test
+      # A segfault while the tests build or run (the compiler on arm64 in
+      # #626) leaves a core behind. The runner's core_pattern hands cores to
+      # apport, which keeps none, and ulimit -c lasts only the step's shell.
+      - name: Keep core dumps
+        run: |
+          mkdir -p "$RUNNER_TEMP/cores"
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p"
+      - run: ulimit -c unlimited && mise run test
       # Room for the itest's burst of 500 at a mock upstream (#568); the
       # runner's default caps a socket's receive buffer at 208 KiB.
       - run: sudo sysctl -w net.core.rmem_max=4194304
       - run: mise run itest
+      - name: Backtrace the core dumps
+        if: failure()
+        run: |
+          shopt -s nullglob
+          cores=("$RUNNER_TEMP"/cores/core.*)
+          [ ${#cores[@]} -gt 0 ] || { echo "no core dumps"; exit 0; }
+          sudo apt-get install -y gdb >/dev/null
+          for c in "${cores[@]}"; do
+            exe=$(file -b "$c" | sed -n "s/.*execfn: '\([^']*\)'.*/\1/p")
+            echo "::group::$c ($exe)"
+            gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' "$exe" "$c" || true
+            echo "::endgroup::"
+          done
+      - name: Keep the core dumps
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cores-${{ matrix.arch }}
+          path: ${{ runner.temp }}/cores
+          if-no-files-found: ignore
 
   leakcheck:
     name: Memory (AddressSanitizer)
