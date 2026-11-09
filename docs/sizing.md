@@ -73,8 +73,8 @@ waits out that loop's slice, about 3 ms, with all its connections waiting
 behind it. That happens between idle and saturated. A saturated loop never goes
 idle, and an idle server has nothing queued. `pin_loops: true` holds each loop
 to a CPU of its own, so no loop ever queues behind another. Measured with DoT
-cache hits at 200,000 a second on two cores, it took p99.5 from 2.1–3.3 ms to
-1.0–1.4 ms.
+cache hits at 200,000 a second on two cores, it took p99.5 from 0.56–0.88 ms to
+0.47–0.67 ms.
 
 It is off by default because a pinned loop can't move. If another process keeps
 that CPU busy, the loop's connections wait for it. Turn it on where the CPUs are

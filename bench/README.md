@@ -10,6 +10,10 @@ mise run release          # the numbers describe the optimised build
 mise run bench            # the whole matrix, about twenty minutes
 ```
 
+It needs `dnsperf` on `PATH` (`apt install dnsperf`; 2.15 is the release it is
+written against), which drives the UDP, TCP
+and DoT rows; see [the load generators](#the-load-generators).
+
 Narrower runs, for when one table is what you care about:
 
 ```sh
@@ -56,7 +60,8 @@ harness owns all of them rather than inheriting them from the machine:
   handshake comparison is not at the mercy of whatever is in `certs/`.
 - **The server process alone.** RSS and CPU come from `/proc/<pid>` for the
   server under test only. The generator and the mock share this machine, and anything taken from
-  the whole system would be mostly them.
+  the whole system would be mostly them. CPU is counted from the end of the
+  warmup, as the queries it is divided by are.
 
 **DNSSEC is off throughout.** The mock serves an unsigned zone with no chain to
 the root, so with validation on every answer would be SERVFAIL and the tables
@@ -140,17 +145,45 @@ does, so each config forwards the mock's zone explicitly. Knot runs as one
 process, which is one thread: it scales by running a process per core, and the
 harness samples one pid.
 
-## Why the load generator is its own thing
+## The load generators
 
-`cmd/loadgen` builds and parses DNS messages itself (`internal/dnswire`) rather
-than linking elodin's codec. A generator sharing the encoder under test could
-agree with a bug in it and still report success — the same reasoning the
-integration suite applies to its fixtures.
+Neither generator links elodin's codec. A generator sharing the encoder under
+test could agree with a bug in it and still report success — the same
+reasoning the integration suite applies to its fixtures.
+
+**dnsperf** (DNS-OARC's) drives every row that asks one name over UDP, TCP or
+DoT: a warmup run, then the measured one, with as many queries outstanding as
+there are clients, a thread per generator CPU, and at least one per 256 clients,
+dnsperf's limit for a thread. A run that sends nothing fails. Each run opens its
+connections afresh, so a DoT row's first hundred handshakes fall inside it.
+dnsperf counts queries per run, not per client, so those rows print "—" for
+the per-client spread.
+
+**`cmd/loadgen`** drives the rest: DoH (dnsperf speaks only HTTP/2, and the DoH
+rows set HTTP/1.1 beside it), unique names (dnsperf would need a data file
+holding every name a run asks), handshakes, and held connections. It builds and
+parses DNS messages itself (`internal/dnswire`).
+
+The split is because loadgen measures Go's scheduler as well as the server
+when one name is asked as fast as possible. Pinned to two CPUs, the Go runtime
+runs two Ps, and its threads wait behind one another for a scheduler slice,
+about 3 ms. In `perf sched` at 270,000 DoT queries a second there were about 250
+such waits a second, each behind another loadgen thread, and the queries on
+the waiting thread read 3 ms slow. It shows against elodin since #604, whose
+loops sleep between bursts, and not against the build before it, whose loops
+never slept. At that rate loadgen read p99 3.2 ms on the first and 0.45 ms on
+the second. In #610 it read
+elodin's DoT p99 at 100 clients as 3 ms at 320,000 queries a second. dnsperf on
+the same build measured 0.34–0.39 ms at 415,000–454,000, and loadgen with
+`GOMAXPROCS=8` measured 0.47 ms. No single `GOMAXPROCS` suits every row: more Ps
+took loadgen's UDP p99 from 0.4 to 0.9 ms.
 
 Every client holds one connection for the whole run. That is what the
 per-transport table is meant to describe: the cost of answering on an
-established connection, not of establishing one. Handshakes are measured
-separately by `-transport=handshake`, which reconnects for every query.
+established connection, not of establishing one. Under dnsperf the measured
+run opens its own connections, so a DoT row's hundred handshakes fall inside
+its CPU count, which over a ten-second run is too few to move CPU per query.
+Handshakes are measured separately by `-transport=handshake`, which reconnects for every query.
 
 ## Noise, and what is done about it
 
@@ -275,8 +308,9 @@ cmd/mockdns/    upstream that answers after a fixed delay
 cmd/unitenv/    prints the environment the shipped unit gives elodin, for the load smoke
 cmd/rrlexp/     the rate-limiting and connection-share experiment: two clients, one server, per arm
 internal/dnswire/   DNS message building and parsing, independent of elodin
+internal/dnsperf/   reads dnsperf's report
 internal/hist/      latency samples and percentiles
 internal/procstat/  RSS, CPU time and thread count for one pid
-internal/unitenv/   the shipped unit's Environment= assignments (go test ./internal/...)
+internal/unitenv/   the shipped unit's Environment= assignments (go test ./...)
 results/        committed runs, so a change in the numbers is visible in a diff
 ```

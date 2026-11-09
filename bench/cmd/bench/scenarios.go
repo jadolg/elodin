@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -38,9 +40,15 @@ type sample struct {
 	PeakRSS    int64
 	CPU        time.Duration
 	MaxThreads int
+	// LogFrom is the server's log size where the measured run began.
+	LogFrom int64
 	// Spread is the relative gap between the fastest and slowest of the repeated
 	// runs, so a reader can tell a real difference from the machine's noise.
 	Spread float64
+}
+
+func samplerResult(sp *procstat.Sampler) sample {
+	return sample{PeakRSS: sp.PeakRSS, CPU: sp.CPUUsed(), MaxThreads: sp.MaxThreads, LogFrom: sp.WatchFrom}
 }
 
 // CPUPerQuery is the figure the Resource use table reports.
@@ -128,7 +136,39 @@ func (h *harness) loadOnce(s *server, o loadOpts) (Result, sample, error) {
 	if o.duration == 0 {
 		o.duration = *duration
 	}
+	if dnsperfDrives(o) {
+		return h.dnsperfOnce(s, o)
+	}
+	return h.loadgenOnce(s, o)
+}
 
+// loadgenMeasuring is the line loadgen writes to stderr when its warmup ends.
+const loadgenMeasuring = "loadgen: measuring"
+
+// watchWarmup reads loadgen's stderr to its end, starting the server's CPU
+// count afresh when loadgen says its warmup is over: the answers are counted
+// from there. RSS and threads are watched over the whole run. It returns the
+// rest of stderr, which is loadgen's complaint if it failed, and whether the
+// line came.
+func watchWarmup(stderr io.Reader, sampler *procstat.Sampler) (string, bool) {
+	var rest strings.Builder
+	marked := false
+	sc := bufio.NewScanner(stderr)
+	for sc.Scan() {
+		if sc.Text() == loadgenMeasuring {
+			sampler.Mark()
+			marked = true
+			continue
+		}
+		rest.WriteString(sc.Text() + " ")
+	}
+	// A line too long for the scanner ends the loop: drain the rest, or loadgen
+	// would block writing it and never exit.
+	_, _ = io.Copy(&rest, stderr)
+	return strings.TrimSpace(rest.String()), marked
+}
+
+func (h *harness) loadgenOnce(s *server, o loadOpts) (Result, sample, error) {
 	args := []string{
 		"-server", s.addrFor(o.transport),
 		"-transport", o.transport,
@@ -144,32 +184,37 @@ func (h *harness) loadOnce(s *server, o loadOpts) (Result, sample, error) {
 		args = append(args, "-rate", strconv.Itoa(o.rate))
 	}
 
-	cmd := exec.Command(h.loadgen, args...)
-	if o.cpus != "" {
-		cmd = exec.Command("taskset", append([]string{"-c", o.cpus, h.loadgen}, args...)...)
-	}
+	cmd := generatorCmd(o.cpus, h.loadgen, args)
 	var stdout strings.Builder
 	cmd.Stdout = &stdout
-	cmd.Stderr = nil
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return Result{}, sample{}, err
+	}
+	if err := cmd.Start(); err != nil {
+		return Result{}, sample{}, fmt.Errorf("loadgen: %w", err)
+	}
 
 	sampler := procstat.NewSampler(s.pid)
+	sampler.Watch = s.logPath
 	sampler.Start()
-	err := cmd.Run()
+	errText, marked := watchWarmup(stderr, sampler)
+	err = cmd.Wait()
 	sampler.Stop()
 	if err != nil {
-		return Result{}, sample{}, fmt.Errorf("loadgen %s: %w", strings.Join(args, " "), err)
+		return Result{}, sample{}, fmt.Errorf("loadgen %s: %w: %s", strings.Join(args, " "), err, errText)
+	}
+	// Without the line the CPU count holds the warmup, and every CPU per query
+	// reads high with nothing to show it.
+	if !marked {
+		return Result{}, sample{}, fmt.Errorf("loadgen never wrote %q, so the warmup's CPU would be counted", loadgenMeasuring)
 	}
 
 	var r Result
 	if err := json.Unmarshal([]byte(stdout.String()), &r); err != nil {
 		return Result{}, sample{}, fmt.Errorf("parsing loadgen output: %w", err)
 	}
-	sm := sample{
-		PeakRSS:    sampler.PeakRSS,
-		CPU:        sampler.CPUUsed(),
-		MaxThreads: sampler.MaxThreads,
-	}
-	return r, sm, nil
+	return r, samplerResult(sampler), nil
 }
 
 type section struct {
@@ -581,9 +626,8 @@ func (h *harness) transports() (section, error) {
 		if err != nil {
 			return section{}, err
 		}
-		fmt.Fprintf(&sb, "| %s | %d | %s qps | %s | %s | %d – %d | %d |\n",
-			label(t), r.Clients, thousands(r.QPS), ms(r.P50ms), ms(r.P99ms),
-			r.MinPerClient, r.MaxPerClient, r.Errors)
+		fmt.Fprintf(&sb, "| %s | %d | %s qps | %s | %s | %s | %d |\n",
+			label(t), r.Clients, thousands(r.QPS), ms(r.P50ms), ms(r.P99ms), perClient(r), r.Errors)
 	}
 
 	// The connection cap is 512, so 500 is the most that can be held at once.
@@ -591,11 +635,19 @@ func (h *harness) transports() (section, error) {
 	if err != nil {
 		return section{}, err
 	}
-	fmt.Fprintf(&sb, "| TCP | %d | %s qps | %s | %s | %d – %d | %d |\n",
-		r.Clients, thousands(r.QPS), ms(r.P50ms), ms(r.P99ms),
-		r.MinPerClient, r.MaxPerClient, r.Errors)
+	fmt.Fprintf(&sb, "| TCP | %d | %s qps | %s | %s | %s | %d |\n",
+		r.Clients, thousands(r.QPS), ms(r.P50ms), ms(r.P99ms), perClient(r), r.Errors)
 
 	return section{title: "Transports, one connection per client", body: sb.String()}, nil
+}
+
+// perClient is the spread of answers across clients, which only loadgen counts:
+// a row with answers and no spread is dnsperf's, and one with neither is "0 – 0".
+func perClient(r Result) string {
+	if r.MaxPerClient == 0 && r.Answered > 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%d – %d", r.MinPerClient, r.MaxPerClient)
 }
 
 // h1VersusH2 is the comparison that justifies serving HTTP/2 at all: the same
@@ -894,10 +946,11 @@ func (h *harness) loggingCost() (section, error) {
 	if err != nil {
 		return section{}, err
 	}
-	before := fileSize(s.logPath)
-	r, _, err := h.load(s, loadOpts{transport: "udp", clients: 200, repeat: 1})
+	// From the end of the warmup, as the answers it is divided by are; read
+	// once the server has stopped, so nothing it buffered is missed.
+	r, sm, err := h.load(s, loadOpts{transport: "udp", clients: 200, repeat: 1})
 	s.stop()
-	written := fileSize(s.logPath) - before
+	written := fileSize(s.logPath) - sm.LogFrom
 	if err == nil {
 		err = h.logDiskFilled()
 	}

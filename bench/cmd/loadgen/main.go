@@ -311,6 +311,10 @@ func run(c config) (Result, error) {
 
 	measureFrom = time.Now().Add(c.warmup)
 	deadline = measureFrom.Add(c.duration)
+	// The harness counts the server's CPU from this line, as answers are
+	// counted from measureFrom.
+	measuring := time.AfterFunc(c.warmup, func() { fmt.Fprintln(os.Stderr, "loadgen: measuring") })
+	defer measuring.Stop()
 	runStart := time.Now()
 	paceFrom = runStart
 	close(start)
@@ -594,6 +598,9 @@ func runHandshake(c config) (Result, error) {
 	rec := hist.New(1 << 16)
 	var done, errs atomic.Int64
 
+	// No warmup: every handshake from here on is counted, and so is the
+	// server's CPU.
+	fmt.Fprintln(os.Stderr, "loadgen: measuring")
 	deadline := time.Now().Add(c.duration)
 	var wg sync.WaitGroup
 	for range c.clients {

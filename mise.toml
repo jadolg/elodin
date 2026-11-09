@@ -250,9 +250,10 @@ run = [
   "odin test src/upstream -collection:elodin=src -out:bin/test_upstream -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/h2       -collection:elodin=src -out:bin/test_h2 -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
   "odin test src/server   -collection:elodin=src -out:bin/test_server -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES $ELODIN_TEST_DEFINES",
-  # The bench's reader of the shipped unit, which the benchmarks and the load
-  # smoke start elodin with.
-  "cd bench && go test ./internal/...",
+  # The bench's own tests: its reader of the shipped unit, which the
+  # benchmarks and the load smoke start elodin with, and of dnsperf's report.
+  # Every command builds with them.
+  "cd bench && go test ./...",
 ]
 
 [tasks.itest]
