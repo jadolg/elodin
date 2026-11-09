@@ -313,7 +313,7 @@ test_a_bootstrap_query_waits_past_a_refusal :: proc(t: ^testing.T) {
 	WAIT :: 200 * time.Millisecond
 	server := fmt.tprintf("127.0.0.1:%d", port)
 	started := time.tick_now()
-	_, found := bootstrap_query(server, "example.com.", .A, WAIT)
+	_, found := bootstrap_query(server, "example.com.", .A, time.tick_add(started, WAIT))
 	spent := time.tick_since(started)
 	testing.expect(t, !found, "a closed bootstrap port produced an address")
 	testing.expectf(t, spent >= WAIT, "the bootstrap query ended after %v, on a refusal, before its %v", spent, WAIT)

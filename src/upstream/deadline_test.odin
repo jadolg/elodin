@@ -576,8 +576,8 @@ a datagram from any other (issue #622).
 
 The first goes as soon as the query is read, with no sleep to overshoot, and
 queues on the exchange's socket until its read: what shows the strays are read
-at all. The second lands at `at`, late enough that a wait restarted by it would
-outlast the assertion's half a timeout of slack.
+at all. The second lands at `at`, near the end, where a wait restarted by it
+would run a whole timeout past the deadline the first wait had.
 */
 @(private = "file")
 Stray_Mock :: struct {
@@ -638,16 +638,17 @@ test_a_stray_datagram_does_not_extend_a_udp_exchange :: proc(t: ^testing.T) {
 	defer destroy(u)
 	worker := thread.create_and_start_with_poly_data(&m, stray_mock_serve)
 
+	udp_waits_reset()
 	started := time.tick_now()
 	resp, xerr := exchange(u, deadline_query(), DEADLINE_TIMEOUT, context.allocator)
-	spent := time.tick_since(started)
 	thread.join(worker)
 	thread.destroy(worker)
 	delete(resp, context.allocator)
 
 	// Not `Timeout`: the early stray reached the read and was passed over.
 	testing.expect_value(t, xerr, Error.Bad_Response)
-	testing.expectf(t, spent < DEADLINE_TIMEOUT * 3 / 2, "the exchange waited %v, where its timeout is %v", spent, DEADLINE_TIMEOUT)
+	// The send, the read the early stray ends and the one after it.
+	expect_udp_waits_share(t, started, DEADLINE_TIMEOUT, 3)
 	free_all(context.temp_allocator)
 }
 
@@ -663,13 +664,13 @@ test_a_stray_datagram_does_not_extend_a_bootstrap_query :: proc(t: ^testing.T) {
 	bound, _ := net.bound_endpoint(m.socket)
 	worker := thread.create_and_start_with_poly_data(&m, stray_mock_serve)
 
+	udp_waits_reset()
 	started := time.tick_now()
-	_, ok := bootstrap_query(fmt.tprintf("127.0.0.1:%d", bound.port), "dns.example", .A, DEADLINE_TIMEOUT)
-	spent := time.tick_since(started)
+	_, ok := bootstrap_query(fmt.tprintf("127.0.0.1:%d", bound.port), "dns.example", .A, time.tick_add(started, DEADLINE_TIMEOUT))
 	thread.join(worker)
 	thread.destroy(worker)
 
 	testing.expect(t, !ok, "the bootstrap query resolved from a silent server")
-	testing.expectf(t, spent < DEADLINE_TIMEOUT * 3 / 2, "the bootstrap query waited %v, where its timeout is %v", spent, DEADLINE_TIMEOUT)
+	expect_udp_waits_share(t, started, DEADLINE_TIMEOUT, 3)
 	free_all(context.temp_allocator)
 }

@@ -796,7 +796,7 @@ test_bootstrap_ignores_a_reply_from_another_port :: proc(t: ^testing.T) {
 		net.endpoint_to_string(bound, context.temp_allocator),
 		"mock.invalid",
 		.A,
-		200 * time.Millisecond,
+		time.tick_add(time.tick_now(), 200 * time.Millisecond),
 	)
 	testing.expect(t, !found, "an answer from a port we never asked was accepted")
 	testing.expect(t, addr == nil, "a rejected answer still produced an address")
@@ -826,7 +826,7 @@ test_bootstrap_ignores_a_reply_to_another_question :: proc(t: ^testing.T) {
 		net.endpoint_to_string(bound, context.temp_allocator),
 		"mock.invalid",
 		.A,
-		200 * time.Millisecond,
+		time.tick_add(time.tick_now(), 200 * time.Millisecond),
 	)
 	testing.expect(t, !found, "an answer to a question we never asked was accepted")
 	testing.expect(t, addr == nil, "a rejected answer still produced an address")
@@ -857,7 +857,7 @@ test_bootstrap_accepts_the_server_it_asked :: proc(t: ^testing.T) {
 		net.endpoint_to_string(bound, context.temp_allocator),
 		"mock.invalid",
 		.A,
-		200 * time.Millisecond,
+		time.tick_add(time.tick_now(), 200 * time.Millisecond),
 	)
 	testing.expect(t, found, "the honest responder's answer was refused")
 	testing.expect_value(t, addr, net.Address(net.IP4_Address{203, 0, 113, 7}))
@@ -962,7 +962,7 @@ test_bootstrap_query_id_does_not_follow_the_clock :: proc(t: ^testing.T) {
 	sent_at: [TRIALS]i64
 	for i in 0 ..< TRIALS {
 		sent_at[i] = time.now()._nsec
-		addr, found := bootstrap_query(address, "mock.invalid", .A, 200 * time.Millisecond)
+		addr, found := bootstrap_query(address, "mock.invalid", .A, time.tick_add(time.tick_now(), 200 * time.Millisecond))
 		free_all(context.temp_allocator)
 		if !found || addr == nil {
 			testing.expectf(t, false, "trial %d: the honest responder's answer was refused", i)

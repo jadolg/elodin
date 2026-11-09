@@ -36,8 +36,8 @@ Cookie_Mock :: struct {
 	drop_after: Maybe(int),
 	// Reply with a server cookie shorter than the eight bytes RFC 7873 allows.
 	short:      bool,
-	// How long each reply takes.
-	delay:      time.Duration,
+	// Answer only this many queries; `nil` answers every one.
+	answer:     Maybe(int),
 
 	mu:         sync.Mutex,
 	queries:    int,
@@ -60,10 +60,10 @@ cookie_mock_loop :: proc(m: ^Cookie_Mock) {
 		m.last_len = copy(m.last_query[:], buf[:n])
 		sync.mutex_unlock(&m.mu)
 
-		reply, ok := cookie_mock_reply(m, buf[:n], count)
-		if m.delay > 0 {
-			time.sleep(m.delay)
+		if limit, capped := m.answer.?; capped && count > limit {
+			continue
 		}
+		reply, ok := cookie_mock_reply(m, buf[:n], count)
 		if ok {
 			_, _ = net.send_udp(m.socket, reply, client)
 		}
@@ -400,18 +400,18 @@ test_upstream_cookie_badcookie_is_retried :: proc(t: ^testing.T) {
 }
 
 /*
-And the retry shares the exchange's timeout rather than starting one of its own
-(issue #449): a BADCOOKIE at 0.7 of the timeout leaves 0.3 for the retry, which
-this server answers after 0.7 again - an answer at 1.4 timeouts on a retry's own
-clock, past every bound built on one exchange taking one timeout.
+And the retry shares the exchange's deadline rather than starting one of its own
+(issue #449): every wait, the first query's and the retry's, runs to the one the
+exchange took on entry. Read off the waits rather than judged by how long the
+exchange took (issue #556), so the server answers both at once and nothing here
+waits the timeout out.
 */
 @(test)
 test_upstream_cookie_retry_shares_the_exchange_timeout :: proc(t: ^testing.T) {
-	TIMEOUT :: 200 * time.Millisecond
+	TIMEOUT :: 2 * time.Second
 	m := Cookie_Mock {
 		server = {9, 9, 9, 9, 9, 9, 9, 9},
 		demand = true,
-		delay  = TIMEOUT * 7 / 10,
 	}
 	u, worker, ok := start_cookie_mock(t, &m)
 	if !ok {
@@ -419,11 +419,44 @@ test_upstream_cookie_retry_shares_the_exchange_timeout :: proc(t: ^testing.T) {
 	}
 	defer stop_cookie_mock(&m, u, worker)
 
+	udp_waits_reset()
 	started := time.tick_now()
 	_, err := exchange(u, edns_query("example.com."), TIMEOUT, context.temp_allocator)
-	spent := time.tick_since(started)
-	testing.expectf(t, err == .Timeout, "the retry ended %v, where it should time out", err)
-	testing.expectf(t, spent < TIMEOUT * 5 / 4, "the exchange waited %v, where its timeout is %v", spent, TIMEOUT)
+	testing.expectf(t, err == .None, "the retry did not produce an answer: %v", err)
+
+	sync.mutex_lock(&m.mu)
+	seen := m.queries
+	sync.mutex_unlock(&m.mu)
+	testing.expect_value(t, seen, 2)
+	// A send and at least one read for each query.
+	expect_udp_waits_share(t, started, TIMEOUT, 4)
+	free_all(context.temp_allocator)
+}
+
+// A retry nothing answers ends as the exchange's timeout, on the exchange's
+// deadline: what #449 first checked, with the reply never sent rather than late.
+@(test)
+test_upstream_cookie_retry_left_unanswered_times_out :: proc(t: ^testing.T) {
+	// Waited out in full, and long enough that the BADCOOKIE is in well before it.
+	TIMEOUT :: 500 * time.Millisecond
+	m := Cookie_Mock {
+		server = {9, 9, 9, 9, 9, 9, 9, 9},
+		demand = true,
+		answer = 1,
+	}
+	u, worker, ok := start_cookie_mock(t, &m)
+	if !ok {
+		return
+	}
+	defer stop_cookie_mock(&m, u, worker)
+
+	udp_waits_reset()
+	started := time.tick_now()
+	_, err := exchange(u, edns_query("example.com."), TIMEOUT, context.temp_allocator)
+	testing.expect_value(t, err, Error.Timeout)
+	// The retry's send is the third wait, so four show it went out without
+	// reading a count the mock may not have reached yet.
+	expect_udp_waits_share(t, started, TIMEOUT, 4)
 	free_all(context.temp_allocator)
 }
 

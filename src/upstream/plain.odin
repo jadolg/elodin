@@ -35,7 +35,7 @@ exchange_udp :: proc(
 	}
 	defer net.close(socket)
 
-	if _, send_err := loop.send_udp_until(socket, query, deadline); send_err != nil {
+	if _, send_err := udp_send_until(socket, query, deadline); send_err != nil {
 		return nil, .IO_Error
 	}
 
@@ -81,7 +81,7 @@ exchange_udp :: proc(
 	// never let this query park; `loop.recv_udp_until` yields between them (see
 	// `loop.take_turn`).
 	for time.tick_diff(loop.tick_now(), deadline) > 0 {
-		n, remote, recv_err := loop.recv_udp_until(socket, buf, deadline)
+		n, remote, recv_err := udp_recv_until(socket, buf, deadline)
 		if recv_err != nil {
 			/*
 			Anything but the deadline is TCP's to settle. `.Excess_Truncated`:
