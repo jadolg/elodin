@@ -250,6 +250,11 @@ parse_domain_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	if strings.has_prefix(line, "*.") {
 		flags = {.Subdomains}
 		line = line[2:]
+	} else if strings.has_prefix(line, ".") {
+		// Squid `dstdomain` and Privoxy mark a subtree with one leading dot:
+		// `.ads.com` is `ads.com` and every name under it (#591), as a bare line
+		// is here. A second dot is an empty label, which `set_add` refuses.
+		line = line[1:]
 	}
 	if line == "" || strings.contains(line, "*") {
 		return 0

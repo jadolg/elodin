@@ -73,6 +73,7 @@ address=/dnsmasq.test/0.0.0.0
 		`# domains-format list
 subtree.test
 *.wildcard.test
+.dotted.test
 `,
 	)
 
@@ -350,9 +351,10 @@ blocking:
 		}
 		end_case(r)
 
-		start_case(r, "blocking: bare domains cover their subtree")
+		// A leading dot (Squid, Privoxy) marks the same subtree as a bare line (#591).
+		start_case(r, "blocking: bare and leading-dot domains cover their subtree")
 		{
-			for name in ([]string{"subtree.test.", "a.subtree.test."}) {
+			for name in ([]string{"subtree.test.", "a.subtree.test.", "dotted.test.", "a.dotted.test."}) {
 				res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
 				if check(r, res.ok, "no response for %s", name) {
 					h := parse_header(r, res.wire)
