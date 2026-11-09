@@ -1042,12 +1042,71 @@ this whole change exists to keep would be out of the group. Which is how the
 first version of the bound was wrong: it divided the timeout between the members
 it had left.
 
-A member that answers at three quarters of the timeout, asked four times: the
-assertion is that it is still in the group at the end, and that its answer is
-what the client got.
+What is asserted is the deadline each sweep exchange waits on, read off the
+pipelined connection's waiter by the member itself before it answers - not how
+long a member that sleeps before answering took, which a scheduler overshooting
+the sleep turns into a timeout. The exchange takes its deadline as it starts,
+after `before` is read, so a member asked with the group's timeout waits until
+no earlier than `before + TIMEOUT`, and one asked with a share of it until no
+later than the share past its start. Asked four times, one past the threshold
+that would park it.
 */
+@(private = "file")
+SWEEP_ASKS :: FAILURE_THRESHOLD + 1
+
+// A TCP member that answers each of `SWEEP_ASKS` queries at once with `reply`,
+// noting first the deadline its waiter is parked on.
+@(private = "file")
+Deadline_Mock :: struct {
+	listener: net.TCP_Socket,
+	u:        ^Upstream,
+	reply:    []u8,
+	parked:   [SWEEP_ASKS]time.Tick,
+}
+
+@(private = "file")
+deadline_mock_serve :: proc(m: ^Deadline_Mock) {
+	client, _, err := net.accept_tcp(m.listener)
+	if err != nil {
+		return
+	}
+	defer net.close(client)
+	_ = net.set_option(client, .Receive_Timeout, 5 * time.Second)
+	for i in 0 ..< SWEEP_ASKS {
+		frame: [2 + 1024]u8
+		if read_full_tcp(client, frame[:2]) != .None {
+			return
+		}
+		n := int(frame[0]) << 8 | int(frame[1])
+		if n < dns.HEADER_SIZE || n > len(frame) - 2 || read_full_tcp(client, frame[2:][:n]) != .None {
+			return
+		}
+		id := u16(frame[2]) << 8 | u16(frame[3])
+		// The waiter is registered before its query is written and leaves only
+		// once answered or at its deadline: read before the answer, it is there.
+		sync.mutex_lock(&m.u.mu)
+		c := m.u.pipe
+		sync.mutex_unlock(&m.u.mu)
+		if c != nil {
+			sync.mutex_lock(&c.mu)
+			if w, found := c.waiters[id]; found {
+				m.parked[i] = w.deadline
+			}
+			sync.mutex_unlock(&c.mu)
+		}
+		out := frame[:2 + len(m.reply)]
+		out[0], out[1] = u8(len(m.reply) >> 8), u8(len(m.reply))
+		copy(out[2:], m.reply)
+		// Echo the ID it was asked under, which the connection gave it.
+		out[2], out[3] = u8(id >> 8), u8(id)
+		if _, serr := net.send_tcp(client, out); serr != nil {
+			return
+		}
+	}
+}
+
 @(test)
-test_a_slow_member_the_sweep_reaches_is_not_marked_down :: proc(t: ^testing.T) {
+test_a_member_the_sweep_reaches_is_judged_on_the_groups_timeout :: proc(t: ^testing.T) {
 	refusing := Canned_Mock{}
 	ref, ref_thread, ref_ok := start_canned_mock(t, &refusing, "refusing", canned_reply(0, .Refused))
 	if !ref_ok {
@@ -1061,20 +1120,36 @@ test_a_slow_member_the_sweep_reaches_is_not_marked_down :: proc(t: ^testing.T) {
 		destroy(ref)
 	}
 
-	TIMEOUT :: 400 * time.Millisecond
-	slow := Canned_Mock {
-		delay = 300 * time.Millisecond,
-	}
-	good, good_thread, good_ok := start_canned_mock(t, &slow, "slow", canned_reply(0))
-	if !good_ok {
+	// Only ever a deadline: the member answers at once, so nothing waits on it.
+	TIMEOUT :: 2 * time.Second
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
 		return
 	}
+	_ = net.set_option(listener, .Receive_Timeout, TIMEOUT)
+	bound, _ := net.bound_endpoint(listener)
+	good, gerr := make_upstream(
+		config.Upstream_Spec{name = "judged", kind = .TCP, address = "127.0.0.1", port = bound.port},
+		0,
+		TIMEOUT,
+		context.allocator,
+	)
+	if !testing.expectf(t, gerr == .None, "cannot build the member: %v", gerr) {
+		net.close(listener)
+		return
+	}
+	m := Deadline_Mock {
+		listener = listener,
+		u        = good,
+		reply    = canned_reply(0),
+	}
+	member := thread.create_and_start_with_poly_data(&m, deadline_mock_serve)
 	defer {
-		sync.atomic_store(&slow.stop, true)
-		thread.join(good_thread)
-		thread.destroy(good_thread)
-		net.close(slow.socket)
+		// The member first: closing its connection ends the mock's read.
 		destroy(good)
+		thread.join(member)
+		thread.destroy(member)
+		net.close(listener)
 	}
 
 	servers := make([]^Upstream, 2, context.allocator)
@@ -1093,23 +1168,34 @@ test_a_slow_member_the_sweep_reaches_is_not_marked_down :: proc(t: ^testing.T) {
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
 
-	for i in 0 ..< FAILURE_THRESHOLD + 1 {
+	before: [SWEEP_ASKS]time.Tick
+	for i in 0 ..< SWEEP_ASKS {
+		before[i] = time.tick_now()
 		resp, winner, err := resolve_readable(&g, wire, context.allocator)
 		testing.expect_value(t, err, Error.None)
 		testing.expectf(
 			t,
 			winner == good && dns.peek_rcode(resp) == .No_Error,
-			"query %d did not reach the slow member, which answers inside the group's timeout",
+			"query %d was not answered by the member the sweep reaches",
 			i,
 		)
 		delete(resp, context.allocator)
 	}
 
-	testing.expect(
-		t,
-		healthy(good),
-		"the slow member was parked for answering inside the timeout its group allows",
-	)
+	for i in 0 ..< SWEEP_ASKS {
+		if !testing.expectf(t, m.parked[i] != {}, "query %d's waiter was not found on the connection", i) {
+			continue
+		}
+		testing.expectf(
+			t,
+			time.tick_diff(before[i], m.parked[i]) >= TIMEOUT,
+			"query %d was asked to answer within %v, where its group's timeout is %v",
+			i,
+			time.tick_diff(before[i], m.parked[i]),
+			TIMEOUT,
+		)
+	}
+	testing.expect(t, healthy(good), "the member the sweep reaches was parked")
 	testing.expect_value(t, stats_of(good).failures, u64(0))
 }
 
