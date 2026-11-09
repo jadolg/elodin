@@ -298,12 +298,15 @@ reader_exact :: proc(r: ^Buf_Reader, n: int) -> (data: []u8, err: Error) {
 MB list costing 128 MB on top of the rule sets a refresh builds (#414). So when
 the buffer is in the caller's allocator it is the body: moved to its start, cut
 to its length, and `r.buf` left empty for the exchange's deferred delete. An
-empty body is nil, which `shrink` to nothing leaves.
+empty body is nil, which `shrink` to nothing leaves. A copy the caller's
+allocator cannot hold is `Too_Large`, as a buffer that cannot grow is in
+`reader_fill`, not an empty body read as a success.
 */
 @(private)
-reader_take :: proc(r: ^Buf_Reader, data: []u8, allocator: mem.Allocator) -> []u8 {
+reader_take :: proc(r: ^Buf_Reader, data: []u8, allocator: mem.Allocator) -> ([]u8, Error) {
 	if r.buf.allocator != allocator {
-		return slice.clone(data, allocator)
+		out, err := slice.clone(data, allocator)
+		return out, .Too_Large if err != nil else .None
 	}
 	// A body read past a shift already starts the buffer.
 	if raw_data(data) != raw_data(r.buf) {
@@ -314,7 +317,7 @@ reader_take :: proc(r: ^Buf_Reader, data: []u8, allocator: mem.Allocator) -> []u
 	shrink(&r.buf)
 	body := r.buf[:]
 	r.buf = {}
-	return body
+	return body, .None
 }
 
 // How much of a chunk is read before it is copied into the body; see `read_chunked`.
@@ -615,10 +618,10 @@ http_exchange :: proc(
 		// Before a byte of the body is read.
 		return resp, .Too_Large
 	case content_length > 0:
-		resp.body = reader_take(&r, reader_exact(&r, content_length) or_return, allocator)
+		resp.body = reader_take(&r, reader_exact(&r, content_length) or_return, allocator) or_return
 	case:
 		// No framing information: the body ends when the connection does.
-		resp.body = reader_take(&r, reader_to_end(&r, max_body) or_return, allocator)
+		resp.body = reader_take(&r, reader_to_end(&r, max_body) or_return, allocator) or_return
 		resp.keep_alive = false
 	}
 	return resp, .None

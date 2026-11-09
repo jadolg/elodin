@@ -1187,6 +1187,24 @@ test_read_chunked_fails_a_piece_it_cannot_hold :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// A body copied into an allocator that cannot hold it fails, rather than coming
+// back empty as if the server had sent nothing.
+@(test)
+test_a_body_the_allocator_cannot_hold_fails :: proc(t: ^testing.T) {
+	r := Buf_Reader {
+		buf = make([dynamic]u8, 0, 128, context.temp_allocator),
+	}
+	append(&r.buf, "0123456789abcdefghijklmnopqrstuv")
+	backing: [16]u8
+	arena: mem.Arena
+	mem.arena_init(&arena, backing[:])
+
+	got, err := reader_take(&r, r.buf[:], mem.arena_allocator(&arena))
+	testing.expect_value(t, err, Error.Too_Large)
+	testing.expectf(t, got == nil, "a body the allocator could not hold came back as %d bytes", len(got))
+	free_all(context.temp_allocator)
+}
+
 // A count that cannot be read cannot be satisfied, and must not be answered
 // with a slice running backwards from the cursor.
 @(test)
