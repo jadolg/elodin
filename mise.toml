@@ -133,6 +133,18 @@ run = [
     exit 1
   fi
   """,
+  # Every UDP wait in upstream goes through udp_wait.odin, which records the
+  # deadline each was handed for the tests that compare them (#556).
+  """
+  if grep -rnE '\\bloop\\.(recv|send)_udp(_until)?\\(' src/upstream \\
+      --include='*.odin' --exclude='*_test.odin' --exclude='udp_wait.odin'; then
+    echo 'wait on a UDP socket in upstream through udp_recv_until / udp_send_until' >&2
+    exit 1
+  elif [ $? -gt 1 ]; then
+    echo 'the UDP-wait gate could not search src' >&2
+    exit 1
+  fi
+  """,
   # core:time reads the clock with a raw system call that bypasses the vDSO,
   # and a cache hit reads it six to nine times (#594). loop.now, loop.since,
   # loop.tick_now and loop.tick_since read the same clocks through libc. A backtick
