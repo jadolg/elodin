@@ -334,9 +334,12 @@ by hand: `curl --http2 -k -H 'content-type: application/dns-message'
 `main`:
 
 - once: `mise run check`, `fuzz-regression`, `parity-regression`, `leakcheck`
-- on both architectures: `mise run test` (a crash while its tests build or run
-  leaves a backtrace in the job log and the core in a `cores-<arch>` artifact),
-  `itest`, `build`, and `mise run deb`,
+- on both architectures: `mise run test` and `itest` (a process that crashes
+  while they build or run, such as the compiler, leaves a backtrace in the job
+  log and the core in a `cores-<arch>` artifact; a test thread's segfault is
+  caught by the Odin test runner and fails that test instead, and a crash in a
+  thread a test starts spins until the step's timeout, with no core),
+  `build`, and `mise run deb`,
   whose package is installed on the runner, made to resolve a handful of names
   through the resolver takeover it performs, then removed, checking the runner
   gets its own resolver back

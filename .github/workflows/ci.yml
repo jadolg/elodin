@@ -42,27 +42,37 @@ jobs:
         with:
           install: true
           cache: true
-      # A segfault while the tests build or run (the compiler on arm64 in
-      # #626) leaves a core behind. The runner's core_pattern hands cores to
-      # apport, which keeps none, and ulimit -c lasts only the step's shell.
-      - name: Keep core dumps
+      # A process that dies of a signal while the tests or the itest build or
+      # run (the compiler on arm64 in #626, a test runner's main thread, a
+      # server) leaves a core: the runner's core_pattern hands cores to
+      # apport, which keeps none, and ulimit -c lasts only a step's shell. %E
+      # names the core after the executable's path, '!' for '/'. The Odin test
+      # runner catches a test thread's SIGSEGV/SIGILL/SIGFPE/SIGTRAP and fails
+      # the test, no core; a thread a test starts returns from that handler
+      # into the fault and spins, so the steps' timeouts (about 9x a green run)
+      # end it instead of the job's six hours.
+      - name: Write core dumps to a file
         run: |
           mkdir -p "$RUNNER_TEMP/cores"
-          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%e.%p"
+          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%E.%p"
       - run: ulimit -c unlimited && mise run test
+        timeout-minutes: 15
       # Room for the itest's burst of 500 at a mock upstream (#568); the
       # runner's default caps a socket's receive buffer at 208 KiB.
       - run: sudo sysctl -w net.core.rmem_max=4194304
-      - run: mise run itest
+      - run: ulimit -c unlimited && mise run itest
+        timeout-minutes: 30
       - name: Backtrace the core dumps
         if: failure()
         run: |
           shopt -s nullglob
           cores=("$RUNNER_TEMP"/cores/core.*)
           [ ${#cores[@]} -gt 0 ] || { echo "no core dumps"; exit 0; }
-          sudo apt-get install -y gdb >/dev/null
+          sudo apt-get install -y -qq gdb
           for c in "${cores[@]}"; do
-            exe=$(file -b "$c" | sed -n "s/.*execfn: '\([^']*\)'.*/\1/p")
+            exe=${c##*/core.}
+            exe=${exe%.*}
+            exe=${exe//!//}
             echo "::group::$c ($exe)"
             gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' "$exe" "$c" || true
             echo "::endgroup::"
@@ -73,6 +83,7 @@ jobs:
         with:
           name: cores-${{ matrix.arch }}
           path: ${{ runner.temp }}/cores
+          retention-days: 14
           if-no-files-found: ignore
 
   leakcheck:
