@@ -218,6 +218,39 @@ test_an_rd_zero_hit_does_not_prefetch :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+With every place to wait on an upstream taken, a hit near expiry starts no
+prefetch, as with `max_pending` full: one started would be turned away before it
+asked, and count as a prefetch and a failed one (issue #623).
+*/
+@(test)
+test_no_prefetch_past_the_upstream_waits :: proc(t: ^testing.T) {
+	answers := prefetch_answers()
+	defer cache.destroy(answers)
+	cfg: config.Config
+	group := down_upstream()
+	s := stale_server(&cfg, answers, &group)
+	cfg.server.max_pending = 8
+	s.upstream_waits = upstream_wait_ceiling(&s)
+	if !testing.expect(t, cache_an_answer(answers, expired = false), "the answer was not cached") {
+		return
+	}
+	age_to(answers, 20 * time.Second)
+
+	workers: Test_Loop
+	start_test_loop(&workers)
+	s.loops = workers.loops[:]
+	_, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	testing.expect(t, ok && outcome == .Cached, "the hit went unserved")
+	stop_test_loop(&workers)
+	s.loops = nil
+	cs := cache.stats(answers)
+	testing.expect_value(t, cs.prefetches, 0)
+	testing.expect_value(t, cs.prefetch_failures, 0)
+	testing.expect_value(t, s.stats.upstream_shed, 0)
+	free_all(context.temp_allocator)
+}
+
 // Both prefetch counters reach the endpoint, each from its own field.
 @(test)
 test_prefetch_counters_reach_the_endpoint :: proc(t: ^testing.T) {

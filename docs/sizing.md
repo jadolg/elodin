@@ -123,7 +123,8 @@ counter says so.
 
 ### Waiting on an upstream
 
-At most `max_pending` less a reserved quarter (never fewer than two reserved) of
+At most `max_pending` less a reserved quarter (never fewer than two reserved,
+nor fewer than one left to wait in) of
 these queries may be waiting on an upstream at once: forwarding, waiting on an
 identical query already forwarding, walking a DNSSEC chain, or waiting on an
 expired entry's refresh. The reserved quarter is never held for an upstream's
@@ -134,6 +135,10 @@ answered as an unreachable upstream answers - the expired entry where
 `outcome=failed detail=upstream-busy` and counted in
 `elodin_queries_upstream_shed_total`. The first one is logged at `warn`, the
 rest at `debug`.
+
+A client asking for an expired entry with no place left is served the entry at
+once and starts no refresh, as when the refresh ceiling is reached; it is not
+counted as shed.
 
 ### What reaches the upstreams
 

@@ -196,7 +196,8 @@ Stats :: struct {
 	upstream while as many already were as `upstream_wait_ceiling` allows, and
 	were answered as an unreachable upstream answers instead - the expired entry
 	where one is held, SERVFAIL otherwise (issue #623). Also in `failed` or
-	`cached`, whichever the client got.
+	`cached`, whichever the client got; a detached refresh, which has no client,
+	is counted here alone.
 	*/
 	upstream_shed:    u64,
 }
@@ -1722,11 +1723,13 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 		The wait for the refresh is a wait on an upstream like any other, and
 		counted with them: the refreshes are a quarter of `max_pending` at most,
 		but the clients waiting on them are a quarter more (issue #623). Without
-		a place, the held bytes go out now, as when `start_refresh` declines.
+		a place, the held bytes go out now, as when `start_refresh` declines -
+		and like those declines it is not counted as shed: the client gets what
+		it would have had with a refresh already running, and no upstream was
+		going to be asked on its account.
 		*/
 		if !wait_on_upstream(st) {
-			upstream_busy(st)
-			return true
+			return answered(st, upstream_failed(st))
 		}
 		defer stop_waiting(st)
 		if r := start_refresh(st.s, st.key, st.query, st.proto, st.client, st.limit, st.started); r != nil {
@@ -3133,6 +3136,7 @@ upstream_busy :: proc(st: ^Query_State) {
 	answered(st, upstream_failed(st, "upstream-busy"))
 }
 
+@(private)
 upstream_busy_reported: bool
 
 /*

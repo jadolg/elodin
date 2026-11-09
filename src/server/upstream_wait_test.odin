@@ -150,8 +150,9 @@ test_a_wait_on_a_refresh_holds_a_place :: proc(t: ^testing.T) {
 		_, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 		testing.expectf(t, ok && outcome == .Cached, "%d left: the expired entry was not served (%v)", left, outcome)
 		testing.expectf(t, time.tick_since(begun) < 2 * time.Second, "%d left: the client waited %v", left, time.tick_since(begun))
-		// The client's own refusal with none left; its refresh's with one.
-		testing.expectf(t, s.stats.upstream_shed - before == 1, "%d left: %d turned away, want 1", left, s.stats.upstream_shed - before)
+		// None with none left: the client is served as when `start_refresh`
+		// declines, and starts no refresh. Its refresh's, with one.
+		testing.expectf(t, int(s.stats.upstream_shed - before) == left, "%d left: %d turned away, want %d", left, s.stats.upstream_shed - before, left)
 		for start := time.tick_now(); queries_pending(&s) > 0 && time.tick_since(start) < 2 * time.Second; {
 			time.sleep(time.Millisecond)
 		}
