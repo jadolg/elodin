@@ -89,9 +89,11 @@ exchange_udp :: proc(
 			arrived is a prefix of an answer, and TCP is where the whole one is.
 
 			Anything else is an ICMP error the kernel matched to this connected
-			socket (issue #622): a hard one - port or protocol unreachable,
-			administratively prohibited - since `__udp4_lib_err` keeps the soft
-			ones, host and network unreachable, from a socket without
+			socket (issue #622): a hard one in `__udp4_lib_err`'s terms - a
+			destination unreachable `icmp_err_convert` marks fatal (port or
+			protocol unreachable, an unknown or prohibited host or network),
+			fragmentation needed, a parameter problem - since it keeps the soft
+			ones, host and network unreachable among them, from a socket without
 			IP_RECVERR. It is not the verdict: an off-path sender who guesses
 			the source port can forge one, and acted on it would end the
 			exchange and, three in a row, park the upstream for `COOLDOWN`. The
@@ -148,7 +150,7 @@ exchange_udp :: proc(
 
 /*
 A socket of its own for one exchange with `endpoint`, bound by the kernel to a
-random port at the send: RFC 5452 section 9.2 asks for an unpredictable source
+random port at the connect: RFC 5452 section 9.2 asks for an unpredictable source
 port, and a socket shared between queries would hold one port for all of them.
 Non-blocking from its creation, so a wait for the answer parks a fiber rather
 than a loop; its reads and writes wait to the exchange's deadline with
@@ -158,7 +160,7 @@ registration and the close (#612).
 
 Connected to `endpoint` (issue #622), for two things an unconnected socket
 does not get. Without IP_RECVERR, Linux reports an ICMP hard error - port
-unreachable, administratively prohibited - only to a UDP socket that is
+unreachable, say, or administratively prohibited - only to a UDP socket that is
 connected (`__udp4_lib_err`), so a closed port fails in a syscall rather than
 at the deadline; what `exchange_udp` makes of that is there.
 And the kernel delivers only datagrams from `endpoint`, so a spoofed answer from

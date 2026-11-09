@@ -950,15 +950,16 @@ closed, they would refuse at once (issue #622) and prove nothing.
 */
 @(test)
 test_the_sweep_spends_one_timeout_on_the_members_it_has_left :: proc(t: ^testing.T) {
-	dead_upstream :: proc(t: ^testing.T, name: string, socket: ^net.UDP_Socket) -> (^Upstream, bool) {
-		bound_socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	// The socket is held open and never read until the caller closes it.
+	dead_upstream :: proc(t: ^testing.T, name: string) -> (^Upstream, net.UDP_Socket, bool) {
+		socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 		if !testing.expectf(t, serr == nil, "cannot bind a dead port: %v", serr) {
-			return nil, false
+			return nil, {}, false
 		}
-		socket^ = bound_socket
-		bound, berr := net.bound_endpoint(bound_socket)
+		bound, berr := net.bound_endpoint(socket)
 		if !testing.expectf(t, berr == nil, "cannot read a dead port: %v", berr) {
-			return nil, false
+			net.close(socket)
+			return nil, {}, false
 		}
 		u, uerr := make_upstream(
 			config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port},
@@ -967,9 +968,10 @@ test_the_sweep_spends_one_timeout_on_the_members_it_has_left :: proc(t: ^testing
 			context.allocator,
 		)
 		if !testing.expectf(t, uerr == .None, "cannot build %s: %v", name, uerr) {
-			return nil, false
+			net.close(socket)
+			return nil, {}, false
 		}
-		return u, true
+		return u, socket, true
 	}
 
 	refusing := Canned_Mock{}
@@ -985,23 +987,18 @@ test_the_sweep_spends_one_timeout_on_the_members_it_has_left :: proc(t: ^testing
 		destroy(ref)
 	}
 
-	// Bound until the end and never read; zero (fd 0, another test's) until bound.
-	first_socket, second_socket: net.UDP_Socket
-	defer if first_socket != 0 {
-		net.close(first_socket)
-	}
-	defer if second_socket != 0 {
-		net.close(second_socket)
-	}
-	first, first_ok := dead_upstream(t, "spare-one", &first_socket)
+	// Silent, not refusing: each socket is bound until the end and never read.
+	first, first_socket, first_ok := dead_upstream(t, "spare-one")
 	if !first_ok {
 		return
 	}
+	defer net.close(first_socket)
 	defer destroy(first)
-	second, second_ok := dead_upstream(t, "spare-two", &second_socket)
+	second, second_socket, second_ok := dead_upstream(t, "spare-two")
 	if !second_ok {
 		return
 	}
+	defer net.close(second_socket)
 	defer destroy(second)
 
 	servers := make([]^Upstream, 3, context.allocator)
