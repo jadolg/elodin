@@ -1729,7 +1729,7 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 		going to be asked on its account.
 		*/
 		if !wait_on_upstream(st) {
-			return answered(st, upstream_failed(st))
+			return answered(st, upstream_failed(st, "upstream-busy"))
 		}
 		defer stop_waiting(st)
 		if r := start_refresh(st.s, st.key, st.query, st.proto, st.client, st.limit, st.started); r != nil {

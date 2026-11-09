@@ -118,8 +118,9 @@ query to, at an eighth of memory.
 `elodin_queries_inflight` against `elodin_queries_inflight_max` shows how close
 the server is; a figure sitting at the maximum while `elodin_queries_dropped_total`
 rises is the server turning queries away. Against a 20 ms upstream, 1,000 in
-flight is 50,000 cache misses a second; raise `max_pending` only when the dropped
-counter says so.
+flight is 37,500 cache misses a second, since a quarter is kept from upstream
+waits (below); raise `max_pending` only when the dropped counter or
+`elodin_queries_upstream_shed_total` says so.
 
 ### Waiting on an upstream
 
@@ -156,8 +157,9 @@ behind it with it.
 one network is no larger than before. What changed is the ceiling on a flood
 spread over many. Where the upstream is a public resolver with limits of its own,
 or a link with a fixed capacity, set `max_pending` to what the upstream should
-carry: target misses per second × upstream round trip, with headroom - 1,000 is
-50,000 a second against 20 ms. `dnssec.max_chain_walks` caps the chain walks
+carry: target misses per second × upstream round trip, over the three quarters
+that may wait on an upstream, with headroom - 1,000 is 37,500 a second against
+20 ms. `dnssec.max_chain_walks` caps the chain walks
 within that the same way, for validating resolvers.
 
 Measured before and after the event loops, and against Unbound, in
