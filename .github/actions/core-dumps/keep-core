@@ -1,0 +1,8 @@
+#!/bin/sh
+# The kernel's core_pattern pipe handler, run as root for every core dump in
+# the job: keep-core DIR EXE PID, with the core on stdin. EXE is %E, the
+# executable's path with '!' for '/'. A crash loop stops at ten cores, so it
+# cannot fill the runner's disk and hide the failure that started it.
+n=$(ls "$1" | grep -c '^core\.')
+[ "$n" -lt 10 ] || exit 0
+cat > "$1/core.$2.$3"

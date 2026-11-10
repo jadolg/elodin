@@ -340,12 +340,12 @@ by hand: `curl --http2 -k -H 'content-type: application/dns-message'
   gets its own resolver back
 
 A process that crashes in any job that builds Odin code, the compiler
-included, leaves a gdb backtrace in the job's log and its core in a
-`cores-<job>-<arch>-<attempt>` artifact, kept 14 days
-(`.github/actions/core-dumps`). The Package job's installed service is the
-exception: systemd starts it with a core limit of 0, as a dynamic user, and
-without `/home`, so its crash shows only in the journal the job prints. A test
-thread's own segfault is caught by the Odin test runner and fails that test
-instead. A crash in a thread a test
-starts spins in the runner's handler; a minute before the `test` step's
-15-minute timeout the test binaries get SIGABRT, which leaves that core.
+included, leaves its core in a `cores-<job>-<arch>-<attempt>` artifact, kept 14
+days (`.github/actions/core-dumps`). A job keeps its first ten cores; the
+first five get a gdb backtrace in the log and their binary in the artifact.
+Anything built with `-sanitize:address` (the leakcheck server, the fuzz
+targets) prints AddressSanitizer's report and exits instead. A test thread's
+own segfault is caught by the Odin test runner and fails that test instead. A
+crash in a thread a test starts spins in the runner's handler; a minute
+before the `test` step's 15-minute timeout the test binaries get SIGABRT,
+which leaves that core.

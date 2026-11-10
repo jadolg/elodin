@@ -14,38 +14,40 @@ inputs:
 runs:
   using: composite
   steps:
-    # The runner's core_pattern hands cores to apport, which keeps none, and
-    # the core limit is 0. Every step's shell is a child of Runner.Worker, this
-    # step's parent, so lifting the limit there covers the job's later steps.
-    # %E names the core after the executable's path, '!' for '/'.
+    # The runner's core_pattern hands cores to apport, which keeps none. A
+    # pipe instead, to keep-core: the kernel ignores RLIMIT_CORE for a piped
+    # dump (core(5)), so every process in the job is covered, whatever its
+    # limit, user or mount namespace - a systemd service's included.
     - if: inputs.mode == 'setup'
       shell: bash
       run: |
         mkdir -p "$RUNNER_TEMP/cores"
-        sudo sysctl -q -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%E.%p"
-        sudo prlimit --pid "$PPID" --core=unlimited:unlimited
-        parent=$(ps -o comm= -p "$PPID")
-        echo "$parent: $(prlimit --pid "$PPID" --core --noheadings)"
-        [ "$parent" = Runner.Worker ] ||
-          echo "::warning::core limit lifted on $parent, not Runner.Worker; later steps may keep none"
+        sudo install -m 0755 "$GITHUB_ACTION_PATH/keep-core" /usr/local/bin/keep-core
+        sudo sysctl -w kernel.core_pattern="|/usr/local/bin/keep-core $RUNNER_TEMP/cores %E %p"
     - if: inputs.mode == 'report'
       shell: bash
       run: |
         shopt -s nullglob
         cores=("$RUNNER_TEMP"/cores/core.*)
         [ ${#cores[@]} -gt 0 ] || { echo "no core dumps"; exit 0; }
-        # A core is 0600 and owned by whoever crashed; root's would be
-        # unreadable to gdb and to the upload below.
+        # Oldest first: in a crash loop the first crash is the cause, and the
+        # glob sorts by the pid as text.
+        mapfile -t cores < <(ls -1tr -- "${cores[@]}")
+        # keep-core writes as root; gdb and the upload run as the runner.
         sudo chown -R "$(id -u)" "$RUNNER_TEMP/cores"
         # Not fatal: a failed install (stale lists, or no DNS after the
         # Package job's takeover went wrong) would skip the upload.
-        sudo apt-get update -qq && sudo apt-get install -y -qq gdb ||
+        command -v gdb >/dev/null ||
+          { sudo apt-get update -qq && sudo apt-get install -y -qq gdb; } ||
           echo "::warning::gdb not installed, the cores are uploaded without a backtrace"
         # Five backtraces bound the step; a crash loop's other cores still upload.
         for c in "${cores[@]:0:5}"; do
           exe=${c##*/core.}
           exe=${exe%.*}
           exe=${exe//!//}
+          # The binary goes with its core: bin/ is built per run and gone
+          # with the runner, and a core is unreadable without it.
+          [ -f "$exe" ] && cp "$exe" "$RUNNER_TEMP/cores/" || true
           echo "::group::$c ($exe)"
           timeout 5m gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' "$exe" "$c" || true
           echo "::endgroup::"
