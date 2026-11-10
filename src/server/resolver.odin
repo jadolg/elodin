@@ -343,7 +343,14 @@ handle_query :: proc(
 	limit := response_limit(s, msg, proto)
 	advertise := advertised_udp_size(s, msg, proto)
 	if derr != .None {
-		out, built := dns.error_response(query, {}, .Form_Err, allocator, limit)
+		/*
+		FORMERR says the query could not be interpreted (RFC 1035 section
+		4.1.1), and a stub reads it as an EDNS problem and asks again without
+		one (RFC 6891 section 7). A reading this server refused on its own
+		account - its memory or its budget - is SERVFAIL: the query was fine.
+		*/
+		rcode := dns.Rcode.Serv_Fail if dns.reading_refused(derr) else dns.Rcode.Form_Err
+		out, built := dns.error_response(query, {}, rcode, allocator, limit)
 		return advertise_udp_size(out, advertise, proto), .Failed, built
 	}
 	// A response arriving on a listener port is not something to answer.
@@ -1825,7 +1832,11 @@ back in the client's case before it goes out (`dns.copy_question_case`).
 @(private)
 upstream_query :: proc(q: dns.Question, dnssec_ok, checking_disabled: bool, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
 	question := [1]dns.Question{q}
-	question[0].name = dns.name_fold(q.name, allocator)
+	folded, ferr := dns.name_fold(q.name, allocator)
+	if ferr != nil {
+		return nil, false
+	}
+	question[0].name = folded
 	additional := [1]dns.Record{dns.make_opt(UPSTREAM_UDP_SIZE, dnssec_ok)}
 	m := dns.Message {
 		id         = dns.random_id(),
@@ -4174,7 +4185,12 @@ synth_soa :: proc(name: string, ttl: u32, allocator: mem.Allocator, apex := "") 
 // The same, for a caller that knows the zone rather than a name inside it.
 @(private)
 synth_soa_for_zone :: proc(zone: string, ttl: u32, allocator: mem.Allocator) -> []dns.Record {
-	recs := make([]dns.Record, 1, allocator)
+	// No SOA where the allocator ran dry: a negative answer without one is
+	// still the answer, and the encode after this fails in the same arena.
+	recs, built := dns.alloc_slice([]dns.Record, 1, allocator)
+	if !built {
+		return nil
+	}
 	recs[0] = dns.Record {
 		name = zone,
 		type = .SOA,
@@ -4392,7 +4408,10 @@ chase_rewrite_alias :: proc(
 		break walk
 	}
 
-	answers := make([]dns.Record, len(chain) + len(rest.answer), allocator)
+	answers, answers_built := dns.alloc_slice([]dns.Record, len(chain) + len(rest.answer), allocator)
+	if !answers_built {
+		return plain, counted
+	}
 	copy(answers, chain[:])
 	copy(answers[len(chain):], rest.answer)
 	resp := dns.make_response(msg, dns.Rcode(rest.flags.rcode), allocator)
@@ -4679,9 +4698,12 @@ answer_chaos :: proc(
 		return nil, false
 	}
 
-	strs := make([]string, 1, allocator)
+	strs, strs_built := dns.alloc_slice([]string, 1, allocator)
+	answers, answers_built := dns.alloc_slice([]dns.Record, 1, allocator)
+	if !strs_built || !answers_built {
+		return nil, false
+	}
 	strs[0] = text
-	answers := make([]dns.Record, 1, allocator)
 	answers[0] = dns.Record {
 		name = q.name,
 		type = .TXT,

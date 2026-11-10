@@ -33,15 +33,25 @@ Writer :: struct {
 	name_buf:  [MAX_NAME_WIRE]u8,
 	fold_buf:  [MAX_NAME_WIRE]u8,
 	offsets:   [dynamic]int,
+	/*
+	An allocation the writer needed came back short - an append to `buf`, or
+	a compression target `comp` could not record - so what was written is not
+	the message. Every record and question checks it before patching a byte it
+	wrote, and `encode_message` before the header fill, so a failed allocation
+	is `.Out_Of_Memory` and never an index past the end.
+	*/
+	short:     bool,
 }
 
 writer_init :: proc(w: ^Writer, allocator := context.allocator, compress := true) {
 	w.allocator = allocator
 	w.compress = compress
-	w.buf = make([dynamic]u8, 0, 512, allocator)
-	w.offsets = make([dynamic]int, 0, 16, allocator)
+	// Reservations only: a list or map whose `make` failed keeps its allocator
+	// and grows on first use, and every write that grows one is checked.
+	w.buf, _ = make([dynamic]u8, 0, 512, allocator)
+	w.offsets, _ = make([dynamic]int, 0, 16, allocator)
 	if compress {
-		w.comp = make(map[u64]u16, 32, allocator)
+		w.comp, _ = make(map[u64]u16, 32, allocator)
 	}
 }
 
@@ -64,22 +74,29 @@ writer_release_scratch :: proc(w: ^Writer) {
 
 @(private)
 w_u8 :: proc(w: ^Writer, v: u8) {
-	append(&w.buf, v)
+	w_bytes(w, {v})
 }
 
 @(private)
 w_u16 :: proc(w: ^Writer, v: u16) {
-	append(&w.buf, u8(v >> 8), u8(v))
+	w_bytes(w, {u8(v >> 8), u8(v)})
 }
 
 @(private)
 w_u32 :: proc(w: ^Writer, v: u32) {
-	append(&w.buf, u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v))
+	w_bytes(w, {u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v)})
 }
 
 @(private)
 w_bytes :: proc(w: ^Writer, v: []u8) {
-	append(&w.buf, ..v)
+	// A grow that fails can still append part of `v`, so the count is what
+	// says whether all of it landed. Nothing more is written after a miss.
+	if w.short {
+		return
+	}
+	if n, _ := append(&w.buf, ..v); n != len(v) {
+		w.short = true
+	}
 }
 
 @(private)
@@ -123,8 +140,9 @@ w_name :: proc(w: ^Writer, name: string, compress := true) -> Encode_Error {
 			// A collision: the first suffix keeps the slot.
 			continue
 		}
-		if base + off < 0x4000 {
-			w.comp[key] = u16(base + off)
+		if base + off < 0x4000 && map_insert(&w.comp, key, u16(base + off)) == nil {
+			w.short = true
+			return .Out_Of_Memory
 		}
 	}
 
@@ -190,7 +208,7 @@ w_question :: proc(w: ^Writer, q: Question) -> Encode_Error {
 	w_name(w, q.name) or_return
 	w_u16(w, u16(q.type))
 	w_u16(w, u16(q.class))
-	return .None
+	return .Out_Of_Memory if w.short else .None
 }
 
 @(private)
@@ -288,6 +306,9 @@ w_record :: proc(w: ^Writer, rec: Record) -> Encode_Error {
 		// nil rdata encodes as an empty RDATA section
 	}
 
+	if w.short {
+		return .Out_Of_Memory
+	}
 	rdlen := len(w.buf) - rdata_start
 	if rdlen > 0xffff {
 		return .Too_Large
@@ -494,6 +515,9 @@ encode_message :: proc(
 	truncated: bool,
 	err: Encode_Error,
 ) {
+	if m.incomplete {
+		return nil, false, .Out_Of_Memory
+	}
 	w: Writer
 	writer_init(&w, allocator, compress)
 	/*
@@ -510,7 +534,10 @@ encode_message :: proc(
 		writer_release_scratch(&w)
 	}
 
-	append(&w.buf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	w_bytes(&w, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	if w.short {
+		return nil, false, .Out_Of_Memory
+	}
 
 	for q in m.question {
 		w_question(&w, q) or_return

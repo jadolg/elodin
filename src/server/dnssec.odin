@@ -932,12 +932,20 @@ attach_extended_error :: proc(resp: ^dns.Message, code: u16, text: string, alloc
 		if rec.type != .OPT {
 			continue
 		}
-		payload := make([]u8, 2 + len(text), allocator)
+		/*
+		Left without the error where the allocator ran dry: an extended error
+		is diagnostic information only (RFC 8914 section 6), and the rcode it
+		explains is in the header and the record's TTL already.
+		*/
+		payload, payload_built := dns.alloc_slice([]u8, 2 + len(text), allocator)
+		options, options_built := dns.alloc_slice([]dns.EDNS_Option, 1, allocator)
+		if !payload_built || !options_built {
+			return
+		}
 		payload[0] = u8(code >> 8)
 		payload[1] = u8(code)
 		copy(payload[2:], transmute([]u8)text)
 
-		options := make([]dns.EDNS_Option, 1, allocator)
 		options[0] = dns.EDNS_Option {
 			code = u16(dns.EDNS_Option_Code.Ext_Error),
 			data = payload,

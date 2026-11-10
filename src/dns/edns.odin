@@ -108,12 +108,8 @@ ensure_edns_option :: proc(
 
 	// The list is scratch: `add_opt_record` reads it while writing and keeps
 	// nothing, and only the answer comes out of the caller's allocator.
-	options := make([]EDNS_Option, 1, context.temp_allocator)
-	options[0] = EDNS_Option {
-		code = u16(code),
-		data = data,
-	}
-	return add_opt_record(msg, udp_size, options, allocator, spent)
+	options := [1]EDNS_Option{{code = u16(code), data = data}}
+	return add_opt_record(msg, udp_size, options[:], allocator, spent)
 }
 
 /*
@@ -263,7 +259,7 @@ append_opt :: proc(
 		return rebuild_with_opt(msg, udp_size, options, allocator, spent)
 	}
 
-	out = make([]u8, size, allocator)
+	out = alloc_slice([]u8, size, allocator) or_return
 	copy(out, msg)
 	arcount := int(u16(msg[10]) << 8 | u16(msg[11])) + 1
 	out[10] = u8(arcount >> 8)
@@ -350,7 +346,8 @@ rebuild_with_opt :: proc(
 	opt := make_opt(udp_size, false)
 	opt.data = Rdata_OPT{options = options}
 
-	additional := make([dynamic]Record, 0, len(m.additional) + 1, scratch)
+	// Reserved whole, so no append below can fail and drop a record.
+	additional := alloc_list([dynamic]Record, len(m.additional) + 1, scratch) or_return
 	append(&additional, ..m.additional)
 	append(&additional, opt)
 	m.additional = additional[:]
@@ -367,7 +364,7 @@ rebuild_with_opt :: proc(
 	if eerr != .None || truncated || int(u16(encoded[10]) << 8 | u16(encoded[11])) != len(m.additional) {
 		return nil, false
 	}
-	out = make([]u8, len(encoded), allocator)
+	out = alloc_slice([]u8, len(encoded), allocator) or_return
 	copy(out, encoded)
 	return out, true
 }
@@ -433,7 +430,7 @@ remove_opt :: proc(
 		return nil, false
 	}
 	arcount -= 1
-	out = make([]u8, span.rec_start, allocator)
+	out = alloc_slice([]u8, span.rec_start, allocator) or_return
 	copy(out, msg[:span.rec_start])
 	out[10] = u8(arcount >> 8)
 	out[11] = u8(arcount)
@@ -455,7 +452,8 @@ rebuild_without_opt :: proc(msg: []u8, allocator: mem.Allocator, spent: ^int) ->
 	if derr != .None {
 		return nil, false
 	}
-	additional := make([dynamic]Record, 0, len(m.additional), scratch)
+	// Reserved whole, as in `rebuild_with_opt`.
+	additional := alloc_list([dynamic]Record, len(m.additional), scratch) or_return
 	for rec in m.additional {
 		if rec.type == .OPT {
 			continue
@@ -468,7 +466,7 @@ rebuild_without_opt :: proc(msg: []u8, allocator: mem.Allocator, spent: ^int) ->
 	if eerr != .None {
 		return nil, false
 	}
-	out = make([]u8, len(encoded), allocator)
+	out = alloc_slice([]u8, len(encoded), allocator) or_return
 	copy(out, encoded)
 	return out, true
 }
@@ -749,7 +747,7 @@ rewrite_edns_option :: proc(
 		return nil, false
 	}
 
-	out = make([]u8, len(msg) + delta, allocator)
+	out = alloc_slice([]u8, len(msg) + delta, allocator) or_return
 	copy(out, msg[:cut_start])
 	p := cut_start
 	if !remove {
@@ -810,7 +808,8 @@ rebuild_edns_option :: proc(
 			continue
 		}
 		rdata, _ := rec.data.(Rdata_OPT)
-		options := make([dynamic]EDNS_Option, 0, len(rdata.options) + 1, scratch)
+		// Reserved whole, as in `rebuild_with_opt`.
+		options := alloc_list([dynamic]EDNS_Option, len(rdata.options) + 1, scratch) or_return
 		written := false
 		for o in rdata.options {
 			if o.code == code {
@@ -834,7 +833,7 @@ rebuild_edns_option :: proc(
 		if eerr != .None {
 			return nil, false
 		}
-		out = make([]u8, len(encoded), allocator)
+		out = alloc_slice([]u8, len(encoded), allocator) or_return
 		copy(out, encoded)
 		return out, true
 	}
@@ -910,7 +909,7 @@ strip_edns_options :: proc(
 	every offset before them is where it was. RDLENGTH itself sits ahead of
 	`rd_start` and so is inside the copy.
 	*/
-	out = make([]u8, span.rd_start, allocator)
+	out = alloc_slice([]u8, span.rd_start, allocator) or_return
 	copy(out, msg[:span.rd_start])
 	out[span.rdlen_pos] = 0
 	out[span.rdlen_pos + 1] = 0
@@ -945,7 +944,8 @@ rebuild_without_edns_options :: proc(msg: []u8, allocator: mem.Allocator, spent:
 	if derr != .None {
 		return nil, false
 	}
-	additional := make([dynamic]Record, 0, len(m.additional), scratch)
+	// Reserved whole, as in `rebuild_with_opt`.
+	additional := alloc_list([dynamic]Record, len(m.additional), scratch) or_return
 	seen := false
 	for rec in m.additional {
 		if rec.type != .OPT {
@@ -982,7 +982,7 @@ rebuild_without_edns_options :: proc(msg: []u8, allocator: mem.Allocator, spent:
 	if eerr != .None || truncated {
 		return nil, false
 	}
-	out = make([]u8, len(encoded), allocator)
+	out = alloc_slice([]u8, len(encoded), allocator) or_return
 	copy(out, encoded)
 	return out, true
 }
@@ -1062,7 +1062,11 @@ encode_with_every_opt :: proc(
 		if err != .None {
 			return
 		}
-		append(&extra, ..lone[HEADER_SIZE:])
+		// Counted only once its bytes have all landed, or ARCOUNT would
+		// claim a record the message does not hold.
+		if n, _ := append(&extra, ..lone[HEADER_SIZE:]); n != len(lone) - HEADER_SIZE {
+			return nil, false, .Out_Of_Memory
+		}
 		extras += 1
 	}
 	wire: []u8
@@ -1070,7 +1074,10 @@ encode_with_every_opt :: proc(
 	if err != .None {
 		return
 	}
-	out = make([]u8, len(wire) + len(extra), allocator)
+	built: bool
+	if out, built = alloc_slice([]u8, len(wire) + len(extra), allocator); !built {
+		return nil, false, .Out_Of_Memory
+	}
 	copy(out, wire)
 	copy(out[len(wire):], extra[:])
 	arcount := (int(wire[10]) << 8 | int(wire[11])) + extras
@@ -1078,3 +1085,4 @@ encode_with_every_opt :: proc(
 	out[11] = u8(arcount)
 	return out, truncated, .None
 }
+

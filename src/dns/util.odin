@@ -1,5 +1,7 @@
 package dns
 
+import "core:mem"
+
 find_opt :: proc(m: Message) -> (opt: Record, found: bool) {
 	for rec in m.additional {
 		if rec.type == .OPT {
@@ -76,8 +78,14 @@ refused for arriving with RD=0 still gets RA=1 back - the same way BIND and
 Unbound keep answering RA=1 to a query an ACL declines to recurse for. The
 capability is on offer; this request just did not use it.
 */
-make_response :: proc(query: Message, rcode: Rcode, allocator := context.allocator) -> Message {
-	resp: Message
+make_response :: proc(
+	query: Message,
+	rcode: Rcode,
+	allocator := context.allocator,
+) -> (
+	resp: Message,
+	err: mem.Allocator_Error,
+) #optional_allocator_error {
 	resp.id = query.id
 	resp.flags.qr = true
 	resp.flags.opcode = query.flags.opcode
@@ -88,11 +96,18 @@ make_response :: proc(query: Message, rcode: Rcode, allocator := context.allocat
 	resp.question = query.question
 
 	if _, found := find_opt(query); found {
-		add := make([]Record, 1, allocator)
+		// Without its OPT record the answer would state a different rcode
+		// (RFC 6891 section 6.1.3) and lose the client's EDNS, so a failed
+		// allocation is reported rather than the record left out.
+		add, built := alloc_slice([]Record, 1, allocator)
+		if !built {
+			resp.incomplete = true
+			return resp, .Out_Of_Memory
+		}
 		add[0] = make_opt(edns_udp_size(query), edns_do(query), u8(u16(rcode) >> 4))
 		resp.additional = add
 	}
-	return resp
+	return resp, nil
 }
 
 /*
@@ -136,7 +151,7 @@ truncated_response :: proc(query_bytes: []u8, allocator := context.allocator) ->
 		}
 	}
 
-	buf := make([]u8, end, allocator)
+	buf := alloc_slice([]u8, end, allocator) or_return
 	copy(buf, query_bytes[:end])
 	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
 	flags.qr = true
@@ -195,17 +210,26 @@ error_response :: proc(
 	*/
 	usable := len(query.question) > 0 || query.id != 0 || (u16(rcode) > 0xf && edns_present(query))
 	if usable {
+		/*
+		An allocator that ran dry - here or in `make_response` - builds nothing
+		below either, which is twelve bytes of it, and the header alone could
+		not carry an extended rcode. Reported as no answer, which the caller
+		already has to handle.
+		*/
 		resp := make_response(query, rcode, allocator)
 		bytes, _, err := encode_message(resp, allocator, max_size)
 		if err == .None {
 			return bytes, true
+		}
+		if err == .Out_Of_Memory {
+			return nil, false
 		}
 	}
 
 	if len(query_bytes) < HEADER_SIZE {
 		return nil, false
 	}
-	buf := make([]u8, HEADER_SIZE, allocator)
+	buf := alloc_slice([]u8, HEADER_SIZE, allocator) or_return
 	copy(buf, query_bytes[:HEADER_SIZE])
 	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
 	flags.qr = true
@@ -326,10 +350,7 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 	would read as a message with fewer TTLs, and the cache would store the
 	answer with the upstream's figures in it and nothing to count them down.
 	*/
-	out, alloc_err := make([dynamic]u16, 0, total, allocator)
-	if alloc_err != nil {
-		return nil, false
-	}
+	out := alloc_list([dynamic]u16, total, allocator) or_return
 	for _ in 0 ..< total {
 		next, name_ok := skip_name(msg, pos)
 		if !name_ok {
@@ -935,4 +956,29 @@ clone_message_bytes :: proc(src: []u8, allocator := context.allocator) -> []u8 {
 	dst := make([]u8, len(src), allocator)
 	copy(dst, src)
 	return dst
+}
+
+/*
+`n` elements from `allocator`, or false where it ran dry.
+
+Asked of the length as well as the error: an allocator that hands back nothing
+is not obliged to call it a failure (`mem.nil_allocator` does not), and a
+caller that indexes or patches what it asked for traps on the empty slice
+either way.
+*/
+alloc_slice :: proc($T: typeid/[]$E, n: int, allocator: mem.Allocator) -> (out: T, ok: bool) {
+	err: mem.Allocator_Error
+	out, err = make(T, n, allocator)
+	return out, err == nil && len(out) == n
+}
+
+/*
+An empty list with room for `n` from `allocator`, or false where it ran dry.
+Reserved whole, so no append within it can fail and drop an element.
+*/
+@(private)
+alloc_list :: proc($T: typeid/[dynamic]$E, n: int, allocator: mem.Allocator) -> (out: T, ok: bool) {
+	err: mem.Allocator_Error
+	out, err = make(T, 0, n, allocator)
+	return out, err == nil && cap(out) >= n
 }

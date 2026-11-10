@@ -163,7 +163,11 @@ build_resolver_arpa_response :: proc(
 	} else {
 		// Behind the client's OPT record rather than over it, so the encoder keeps
 		// that record's room as the addresses fill the section.
-		resp.additional = slice.concatenate([][]dns.Record{resp.additional, ddr_addresses(live(s).cfg, allocator)}, allocator)
+		// Kept as it was where the allocator ran dry, so the client's OPT record
+		// stays: the addresses are the part RFC 9462 section 4 makes optional.
+		if joined, jerr := slice.concatenate([][]dns.Record{resp.additional, ddr_addresses(live(s).cfg, allocator)}, allocator); jerr == nil {
+			resp.additional = joined
+		}
 	}
 
 	// Addresses that do not fit are dropped by the encoder without TC: they only
