@@ -334,15 +334,17 @@ name_trim_root :: proc(name: string) -> string {
 	return name
 }
 
-// Accepts "example.com" or "example.com." and returns the canonical form.
-name_canonical :: proc(name: string, allocator := context.allocator) -> string {
-	if name == "" || name == "." {
-		return strings.clone(".", allocator)
+// Accepts "example.com" or "example.com." and returns the canonical form, or
+// false where the allocator ran dry: an empty result would read as the root.
+name_canonical :: proc(name: string, allocator := context.allocator) -> (canonical: string, ok: bool) #optional_ok {
+	trimmed := name_trim_root(name)
+	buf := alloc_slice([]u8, len(trimmed) + 1, allocator) or_return
+	copy(buf, trimmed)
+	buf[len(trimmed)] = '.'
+	for &c in buf {
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
 	}
-	if name[len(name) - 1] == '.' {
-		return name_fold(name, allocator)
-	}
-	lowered := name_fold(name, allocator)
-	defer delete(lowered, allocator)
-	return strings.concatenate({lowered, "."}, allocator)
+	return string(buf), true
 }

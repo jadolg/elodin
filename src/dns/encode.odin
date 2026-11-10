@@ -111,10 +111,13 @@ w_char_string :: proc(w: ^Writer, s: string) -> Encode_Error {
 
 @(private)
 w_name :: proc(w: ^Writer, name: string, compress := true) -> Encode_Error {
-	n := encode_name(name, w.name_buf[:], &w.offsets) or_return
+	// The label offsets only serve compression, so a name written in full asks
+	// for none and cannot fail on them.
+	compressing := w.compress && compress
+	n := encode_name(name, w.name_buf[:], &w.offsets if compressing else nil) or_return
 	tmp := w.name_buf[:n]
 
-	if !w.compress || !compress {
+	if !compressing {
 		w_bytes(w, tmp)
 		return .None
 	}

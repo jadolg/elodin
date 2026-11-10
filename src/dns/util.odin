@@ -715,8 +715,8 @@ write_ttl_at :: proc(msg: []u8, off: int, v: u32) {
 // Empty when the list cannot be allocated, which a caller tells from a message
 // with no TTLs by comparing it with `offsets`.
 read_ttls :: proc(msg: []u8, offsets: []u16, allocator := context.allocator) -> []u32 {
-	ttls, err := make([]u32, len(offsets), allocator)
-	if err != nil {
+	ttls, built := alloc_slice([]u32, len(offsets), allocator)
+	if !built {
 		return nil
 	}
 	for off, i in offsets {
@@ -976,7 +976,6 @@ alloc_slice :: proc($T: typeid/[]$E, n: int, allocator: mem.Allocator) -> (out: 
 An empty list with room for `n` from `allocator`, or false where it ran dry.
 Reserved whole, so no append within it can fail and drop an element.
 */
-@(private)
 alloc_list :: proc($T: typeid/[dynamic]$E, n: int, allocator: mem.Allocator) -> (out: T, ok: bool) {
 	err: mem.Allocator_Error
 	out, err = make(T, 0, n, allocator)

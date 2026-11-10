@@ -142,11 +142,10 @@ test_local_answers_with_no_memory :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	none := mem.nil_allocator()
 
-	testing.expect_value(t, len(synth_soa_for_zone("example.com.", 60, none)), 0)
-
 	chaos_q := dns.Question{name = "version.bind.", type = .TXT, class = .CH}
+	// Ours to answer whether or not it could be built, so not refused as a class.
 	chaos, handled := answer_chaos(&s, msg, chaos_q, none, 512)
-	testing.expect(t, !handled, "a CHAOS answer was reported built with no memory to build it")
+	testing.expect(t, handled, "a CHAOS name was handed on for want of memory to answer it")
 	testing.expect_value(t, len(chaos), 0)
 
 	_, failed_built := dnssec_failure_response(msg, dnssec.Result{status = .Bogus}, none, 512)
@@ -251,13 +250,13 @@ test_an_upstream_query_whose_name_cannot_be_folded_is_not_built :: proc(t: ^test
 
 // Fails the `fail_at`th request it is given and hands every other to the
 // temp arena.
-@(private = "file")
+@(private)
 Fail_Nth :: struct {
 	seen:    int,
 	fail_at: int,
 }
 
-@(private = "file")
+@(private)
 fail_nth_proc :: proc(
 	data: rawptr,
 	mode: mem.Allocator_Mode,

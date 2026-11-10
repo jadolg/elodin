@@ -1312,7 +1312,7 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 	if st.q.class == .CH {
 		if out, handled := answer_chaos(st.s, st.msg, st.q, st.allocator, st.limit); handled {
 			log_query(st.s, st.client, st.proto, st.q, .Local, "chaos", st.started)
-			return answered(st, out, .Local, true)
+			return answered(st, out, .Local, len(out) > 0)
 		}
 	}
 	if st.q.class != .IN && st.q.class != .ANY {
@@ -1353,7 +1353,7 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 			count_answer(&st.s.stats.rewritten)
 		}
 		log_query(st.s, st.client, st.proto, st.q, .Rewritten, "rewrite", st.started)
-		return answered(st, out, .Rewritten, true)
+		return answered(st, out, .Rewritten, len(out) > 0)
 	}
 
 	/*
@@ -4147,10 +4147,12 @@ encode_block_response :: proc(
 
 	resp := dns.make_response(query, rcode, allocator)
 	resp.answer = answers[:]
+	soa: [1]dns.Record
 	if len(answers) == 0 && rcode != .Refused {
 		// An SOA in the authority section tells resolvers how long to remember
 		// this, which keeps blocked names from being re-asked every second.
-		resp.authority = synth_soa(q.name, ttl, allocator)
+		soa[0] = synth_soa(q.name, ttl)
+		resp.authority = soa[:]
 	}
 
 	out, _, err := dns.encode_message(resp, allocator, limit)
@@ -4171,7 +4173,7 @@ parent, which is the best guess available to the blocking and rewrite paths -
 they answer for names scattered through zones this server knows nothing about.
 */
 @(private)
-synth_soa :: proc(name: string, ttl: u32, allocator: mem.Allocator, apex := "") -> []dns.Record {
+synth_soa :: proc(name: string, ttl: u32, apex := "") -> dns.Record {
 	zone := apex
 	if zone == "" {
 		zone = dns.name_parent(name)
@@ -4179,19 +4181,19 @@ synth_soa :: proc(name: string, ttl: u32, allocator: mem.Allocator, apex := "") 
 			zone = name
 		}
 	}
-	return synth_soa_for_zone(zone, ttl, allocator)
+	return synth_soa_for_zone(zone, ttl)
 }
 
-// The same, for a caller that knows the zone rather than a name inside it.
+/*
+The same, for a caller that knows the zone rather than a name inside it.
+
+A value rather than a slice, so the caller holds it in an array of its own and
+nothing is allocated: a negative answer that went out without its SOA could not
+be cached (RFC 2308 section 3), and an allocation here is one that could fail.
+*/
 @(private)
-synth_soa_for_zone :: proc(zone: string, ttl: u32, allocator: mem.Allocator) -> []dns.Record {
-	// No SOA where the allocator ran dry: a negative answer without one is
-	// still the answer, and the encode after this fails in the same arena.
-	recs, built := dns.alloc_slice([]dns.Record, 1, allocator)
-	if !built {
-		return nil
-	}
-	recs[0] = dns.Record {
+synth_soa_for_zone :: proc(zone: string, ttl: u32) -> dns.Record {
+	return dns.Record {
 		name = zone,
 		type = .SOA,
 		class = .IN,
@@ -4206,7 +4208,6 @@ synth_soa_for_zone :: proc(zone: string, ttl: u32, allocator: mem.Allocator) -> 
 			minimum = ttl,
 		},
 	}
-	return recs
 }
 
 /*
@@ -4281,8 +4282,10 @@ apply_rewrite :: proc(
 
 	resp := dns.make_response(query, .No_Error, allocator)
 	resp.answer = answers[:]
+	soa: [1]dns.Record
 	if len(answers) == 0 {
-		resp.authority = synth_soa(q.name, rule.ttl, allocator)
+		soa[0] = synth_soa(q.name, rule.ttl)
+		resp.authority = soa[:]
 	}
 	out, _, err := dns.encode_message(resp, allocator, limit)
 	if err != .None {
@@ -4325,6 +4328,14 @@ are this server's own and unsigned.
 No additional section, as `apply_rewrite` has none: the target's glue is the
 upstream's reply to a question the client did not ask.
 */
+// The SERVFAIL `chase_rewrite_alias` answers where its allocator ran dry, or
+// nothing where there is not room even for that.
+@(private)
+chase_ran_dry :: proc(msg: dns.Message, limit: int, allocator: mem.Allocator) -> []u8 {
+	out, _ := dns.error_response(nil, msg, .Serv_Fail, allocator, limit)
+	return out
+}
+
 @(private)
 chase_rewrite_alias :: proc(
 	s: ^Server,
@@ -4352,9 +4363,17 @@ chase_rewrite_alias :: proc(
 		return plain, false
 	}
 
-	chain := make([dynamic]dns.Record, 0, 4, allocator)
+	/*
+	The chain and the question are indexed below. Where the allocator ran dry
+	the answer is SERVFAIL rather than the plain alias: an alias alone is the
+	not-found this procedure exists to prevent.
+	*/
+	chain, chain_built := dns.alloc_list([dynamic]dns.Record, 4, allocator)
+	questions, questions_built := dns.alloc_slice([]dns.Question, 1, allocator)
+	if !chain_built || !questions_built {
+		return chase_ran_dry(msg, limit, allocator), false
+	}
 	append(&chain, alias)
-	questions := make([]dns.Question, 1, allocator)
 	next := msg
 	next.question = questions
 	rest: dns.Message
@@ -4393,7 +4412,10 @@ chase_rewrite_alias :: proc(
 				break walk
 			}
 		} else if next_alias, is_alias := more.?; is_alias {
-			append(&chain, next_alias)
+			// A link that did not land would be looked up again and again.
+			if n, _ := append(&chain, next_alias); n != 1 {
+				return chase_ran_dry(msg, limit, allocator), false
+			}
 			continue walk
 		}
 		got, derr := dns.decode_message(out, allocator, spent)
@@ -4410,7 +4432,7 @@ chase_rewrite_alias :: proc(
 
 	answers, answers_built := dns.alloc_slice([]dns.Record, len(chain) + len(rest.answer), allocator)
 	if !answers_built {
-		return plain, counted
+		return chase_ran_dry(msg, limit, allocator), counted
 	}
 	copy(answers, chain[:])
 	copy(answers[len(chain):], rest.answer)
@@ -4700,8 +4722,10 @@ answer_chaos :: proc(
 
 	strs, strs_built := dns.alloc_slice([]string, 1, allocator)
 	answers, answers_built := dns.alloc_slice([]dns.Record, 1, allocator)
+	// Handled with nothing built: the name is ours, and falling through would
+	// answer it REFUSED, which says something untrue about it.
 	if !strs_built || !answers_built {
-		return nil, false
+		return nil, true
 	}
 	strs[0] = text
 	answers[0] = dns.Record {
@@ -4716,7 +4740,7 @@ answer_chaos :: proc(
 	resp.answer = answers
 	out, _, err := dns.encode_message(resp, allocator, limit)
 	if err != .None {
-		return nil, false
+		return nil, true
 	}
 	return out, true
 }

@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:os"
-import "core:slice"
 import "core:strings"
 import "core:sync"
 import "elodin:config"
@@ -158,14 +157,19 @@ build_resolver_arpa_response :: proc(
 	if q.type == .SVCB && dns.name_equal_fold(q.name, DDR_QNAME) {
 		resp.answer = ddr_records(s, q.name, allocator)
 	}
+	soa: [1]dns.Record
 	if len(resp.answer) == 0 {
-		resp.authority = synth_soa_for_zone(RESOLVER_ARPA, RESOLVER_ARPA_TTL, allocator)
+		soa[0] = synth_soa_for_zone(RESOLVER_ARPA, RESOLVER_ARPA_TTL)
+		resp.authority = soa[:]
 	} else {
 		// Behind the client's OPT record rather than over it, so the encoder keeps
 		// that record's room as the addresses fill the section.
 		// Kept as it was where the allocator ran dry, so the client's OPT record
 		// stays: the addresses are the part RFC 9462 section 4 makes optional.
-		if joined, jerr := slice.concatenate([][]dns.Record{resp.additional, ddr_addresses(live(s).cfg, allocator)}, allocator); jerr == nil {
+		addresses := ddr_addresses(live(s).cfg, allocator)
+		if joined, built := dns.alloc_slice([]dns.Record, len(resp.additional) + len(addresses), allocator); built {
+			copy(joined, resp.additional)
+			copy(joined[len(resp.additional):], addresses)
 			resp.additional = joined
 		}
 	}

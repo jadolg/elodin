@@ -207,7 +207,7 @@ route_reply_nodata :: proc(name: string, type: dns.Type, rcode := dns.Rcode.No_E
 	// cache would not keep it at all.
 	msg := dns.Message {
 		question  = question,
-		authority = synth_soa_for_zone(name, 300, context.temp_allocator),
+		authority = []dns.Record{synth_soa_for_zone(name, 300)},
 	}
 	msg.flags.qr = true
 	msg.flags.rd = true

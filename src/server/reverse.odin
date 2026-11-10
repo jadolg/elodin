@@ -161,6 +161,7 @@ apply_reverse_rewrite :: proc(
 
 	resp := dns.make_response(query, .No_Error, allocator)
 	resp.answer = answers[:]
+	soa: [1]dns.Record
 	if len(answers) == 0 {
 		/*
 		NODATA for every other type, which is `apply_rewrite`'s own answer for a
@@ -173,7 +174,8 @@ apply_reverse_rewrite :: proc(
 		name's parent, `1.168.192.in-addr.arpa.` being a zone nobody was ever
 		authoritative for.
 		*/
-		resp.authority = synth_soa(q.name, ttl, allocator, zone)
+		soa[0] = synth_soa(q.name, ttl, zone)
+		resp.authority = soa[:]
 	}
 
 	out, _, err := dns.encode_message(resp, allocator, limit)

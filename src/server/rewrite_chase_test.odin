@@ -1,6 +1,7 @@
 package server
 
 import "core:fmt"
+import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:config"
@@ -288,4 +289,78 @@ test_a_chased_rewrite_is_counted_once :: proc(t: ^testing.T) {
 			testing.expectf(t, rewritten == 1, "%s: counted %d times", c.name, rewritten)
 		}
 	}
+}
+
+/*
+Whichever allocation of the chase is refused, the answer is never the bare alias
+(issue #620): that is the not-found a stub reads it as. It is the whole chain,
+or SERVFAIL, or - with not even room for that - nothing.
+
+Asked twice: once of a one-link chain, and once of one long enough that the
+chain's list grows partway, so a link that fails to land is asked about too.
+*/
+@(test)
+test_a_chase_that_runs_dry_is_never_the_bare_alias :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	chase_dry_sweep(t, chase_rules(), "old.lan.", 2)
+
+	long := make([]config.Rewrite, 7, context.temp_allocator)
+	for i in 0 ..< 6 {
+		long[i] = config.Rewrite {
+			domain  = fmt.tprintf("a%d.lan.", i),
+			answers = one_answer({kind = .CNAME, name = fmt.tprintf("a%d.lan.", i + 1)}),
+			ttl     = 60,
+		}
+	}
+	long[6] = config.Rewrite {
+		domain  = "a6.lan.",
+		answers = one_answer({kind = .A, v4 = {192, 168, 1, 60}}),
+		ttl     = 60,
+	}
+	chase_dry_sweep(t, long, "a0.lan.", 7)
+}
+
+@(private = "file")
+chase_dry_sweep :: proc(t: ^testing.T, rules: []config.Rewrite, name: string, whole: int) {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.rewrites = rules
+	s := Server {
+		cfg = &cfg,
+	}
+	questions := []dns.Question{{name = name, type = .A, class = .IN}}
+	msg := dns.Message{id = 0x3202, question = questions}
+	msg.flags.rd = true
+	plain, matched, alias := apply_rewrite(&s, msg, questions[0], context.temp_allocator, 512)
+	cname, is_alias := alias.?
+	if !testing.expectf(t, matched && is_alias, "%s should be answered by its alias", name) {
+		return
+	}
+	servfails := 0
+	for n := 1; ; n += 1 {
+		f := Fail_Nth{fail_at = n}
+		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
+		spent := 0
+		out, _ := chase_rewrite_alias(&s, plain, cname, msg, .UDP, "127.0.0.1:5555", 512, Cookie_Request{}, time.tick_now(), &spent, one, .Shared)
+		if f.seen < n {
+			break
+		}
+		if len(out) == 0 {
+			continue
+		}
+		resp, derr := dns.decode_message(out, context.temp_allocator)
+		if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+			return
+		}
+		rcode := dns.Rcode(resp.flags.rcode)
+		if rcode == .Serv_Fail {
+			servfails += 1
+			continue
+		}
+		if !testing.expectf(t, len(resp.answer) == whole, "%s: refusing allocation %d answered %v with %d records", name, n, rcode, len(resp.answer)) {
+			return
+		}
+	}
+	testing.expectf(t, servfails > 0, "%s: no refusal was answered SERVFAIL, so the guard went untested", name)
 }

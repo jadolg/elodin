@@ -322,6 +322,24 @@ test_name_fold_with_no_memory :: proc(t: ^testing.T) {
 	testing.expect_value(t, folded, "")
 }
 
+// Not "" or ".", either of which a caller would take for the root.
+@(test)
+test_name_canonical_with_no_memory :: proc(t: ^testing.T) {
+	_, ok := name_canonical("Example.COM", mem.nil_allocator())
+	testing.expect(t, !ok)
+	cases := [?][2]string{{"", "."}, {".", "."}, {"A.b", "a.b."}, {"A.b.", "a.b."}, {"a..", "a.."}}
+	for c in cases {
+		got, built := name_canonical(c[0], context.temp_allocator)
+		testing.expect(t, built)
+		testing.expect_value(t, got, c[1])
+	}
+}
+
+@(test)
+test_read_ttls_with_no_memory :: proc(t: ^testing.T) {
+	testing.expect_value(t, len(read_ttls(make([]u8, 16, context.temp_allocator), {12}, mem.nil_allocator())), 0)
+}
+
 /*
 The answers built for a query that is being refused or sent to TCP: the
 SERVFAIL a request that ran out of arena is answered with is one of these.

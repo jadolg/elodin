@@ -1085,4 +1085,3 @@ encode_with_every_opt :: proc(
 	out[11] = u8(arcount)
 	return out, truncated, .None
 }
-

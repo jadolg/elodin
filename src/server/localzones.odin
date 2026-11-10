@@ -689,7 +689,7 @@ answer_special_use :: proc(
 			break
 		}
 		if q.type == .SOA || q.type == .ANY {
-			append(&answers, ..synth_soa_for_zone(zone, SPECIAL_USE_TTL, allocator))
+			append(&answers, synth_soa_for_zone(zone, SPECIAL_USE_TTL))
 		}
 		if q.type == .NS || q.type == .ANY {
 			append(
@@ -707,8 +707,10 @@ answer_special_use :: proc(
 
 	resp := dns.make_response(query, rcode, allocator)
 	resp.answer = answers[:]
+	soa: [1]dns.Record
 	if len(answers) == 0 {
-		resp.authority = synth_soa(q.name, SPECIAL_USE_TTL, allocator, zone)
+		soa[0] = synth_soa(q.name, SPECIAL_USE_TTL, zone)
+		resp.authority = soa[:]
 	}
 
 	out, _, err := dns.encode_message(resp, allocator, limit)

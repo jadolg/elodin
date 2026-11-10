@@ -434,7 +434,8 @@ rebind_nodata :: proc(
 	allocator: mem.Allocator,
 ) -> []u8 {
 	out_msg := dns.make_response(query, .No_Error, allocator)
-	out_msg.authority = synth_soa(q.name, live(s).cfg.blocking.block_ttl, allocator)
+	soa := [1]dns.Record{synth_soa(q.name, live(s).cfg.blocking.block_ttl)}
+	out_msg.authority = soa[:]
 	attach_extended_error(&out_msg, EDE_BLOCKED, "rebind", allocator)
 
 	encoded, _, enc_err := dns.encode_message(out_msg, allocator, limit)
