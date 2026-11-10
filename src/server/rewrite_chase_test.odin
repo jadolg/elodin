@@ -1,6 +1,7 @@
 package server
 
 import "core:fmt"
+import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:config"
@@ -288,4 +289,237 @@ test_a_chased_rewrite_is_counted_once :: proc(t: ^testing.T) {
 			testing.expectf(t, rewritten == 1, "%s: counted %d times", c.name, rewritten)
 		}
 	}
+}
+
+/*
+Whichever allocation of the chase is refused, the answer is never the bare alias
+(issue #620): that is the not-found a stub reads it as. It is the whole chain,
+or SERVFAIL, or - with not even room for that - nothing.
+
+Asked twice: once of a one-link chain, and once of one long enough that the
+chain's list grows partway, so a link that fails to land is asked about too.
+*/
+@(test)
+test_a_chase_that_runs_dry_is_never_the_bare_alias :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	chase_dry_sweep(t, chase_rules(), "old.lan.", 2)
+	// With EDNS, so the answer's own OPT record is one of the refusals.
+	chase_dry_sweep(t, chase_rules(), "old.lan.", 2, edns = true)
+
+	long := make([]config.Rewrite, 7, context.temp_allocator)
+	for i in 0 ..< 6 {
+		long[i] = config.Rewrite {
+			domain  = fmt.tprintf("a%d.lan.", i),
+			answers = one_answer({kind = .CNAME, name = fmt.tprintf("a%d.lan.", i + 1)}),
+			ttl     = 60,
+		}
+	}
+	long[6] = config.Rewrite {
+		domain  = "a6.lan.",
+		answers = one_answer({kind = .A, v4 = {192, 168, 1, 60}}),
+		ttl     = 60,
+	}
+	chase_dry_sweep(t, long, "a0.lan.", 7)
+
+	// A target that is no rule, so it is asked of `resolve_query`, which the
+	// special-use table answers NXDOMAIN without an upstream. Not NOERROR: the
+	// chain alone is the bare alias.
+	dead := make([]config.Rewrite, 1, context.temp_allocator)
+	dead[0] = config.Rewrite {
+		domain  = "dead.lan.",
+		answers = one_answer({kind = .CNAME, name = "gone.invalid."}),
+		ttl     = 60,
+	}
+	chase_dry_sweep(t, dead, "dead.lan.", 1, final = .NX_Domain)
+}
+
+@(private = "file")
+chase_dry_sweep :: proc(
+	t: ^testing.T,
+	rules: []config.Rewrite,
+	name: string,
+	whole: int,
+	edns := false,
+	final := dns.Rcode.No_Error,
+) {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.rewrites = rules
+	s := Server {
+		cfg = &cfg,
+	}
+	questions := []dns.Question{{name = name, type = .A, class = .IN}}
+	msg := dns.Message{id = 0x3202, question = questions}
+	msg.flags.rd = true
+	opt := []dns.Record{dns.make_opt(1232, false)}
+	if edns {
+		msg.additional = opt
+	}
+	plain, matched, alias := apply_rewrite(&s, msg, questions[0], context.temp_allocator, 512)
+	cname, is_alias := alias.?
+	if !testing.expectf(t, matched && is_alias, "%s should be answered by its alias", name) {
+		return
+	}
+	servfails := 0
+	// Runs as well as single refusals: a refused reservation is retried by the
+	// append behind it, so an encode fails only when the grow is refused too.
+	for run in ([]int{1, 3}) do for n := 1; ; n += 1 {
+		f := Fail_Nth{fail_at = n, fail_for = run}
+		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
+		spent := 0
+		before := chase_answers_counted(&s)
+		out, counted := chase_rewrite_alias(&s, plain, cname, msg, .UDP, "127.0.0.1:5555", 512, Cookie_Request{}, time.tick_now(), &spent, one, .Shared)
+		if f.seen < n {
+			break
+		}
+		if len(out) == 0 {
+			continue
+		}
+		resp, derr := dns.decode_message(out, context.temp_allocator)
+		if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+			return
+		}
+		rcode := dns.Rcode(resp.flags.rcode)
+		if rcode == .Serv_Fail {
+			// Counted where it was built - once, and by a counter - so the caller
+			// never counts it a rewrite.
+			if !testing.expectf(t, counted && chase_answers_counted(&s) == before + 1, "%s: refusing %d from allocation %d answered SERVFAIL uncounted", name, run, n) {
+				return
+			}
+			servfails += 1
+			continue
+		}
+		if !testing.expectf(t, rcode == final && len(resp.answer) == whole, "%s: refusing %d from allocation %d answered %v with %d records", name, run, n, rcode, len(resp.answer)) {
+			return
+		}
+	}
+	testing.expectf(t, servfails > 0, "%s: no refusal was answered SERVFAIL, so the guard went untested", name)
+}
+
+/*
+A rewrite whose allocations run dry stays matched, and what it builds is the
+whole alias or nothing: never a NODATA, never an `answers[0]` past the end, and
+never unmatched, which would send the operator's name on to the upstreams.
+
+Runs of refusals, since a refused reserve alone is retried by the append that
+follows it.
+*/
+@(test)
+test_a_rewrite_that_runs_dry_stays_matched :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.rewrites = chase_rules()
+	s := Server {
+		cfg = &cfg,
+	}
+	questions := []dns.Question{{name = "old.lan.", type = .A, class = .IN}}
+	msg := dns.Message{id = 0x3203, question = questions}
+	for run in ([]int{1, 2, 3, 8}) {
+		for from := 1; ; from += 1 {
+			f := Fail_Nth{fail_at = from, fail_for = run}
+			dry := mem.Allocator{procedure = fail_nth_proc, data = &f}
+			out, matched, _ := apply_rewrite(&s, msg, questions[0], dry, 512)
+			if f.seen < from {
+				break
+			}
+			if !testing.expectf(t, matched, "refusing %d from %d left the rule unmatched", run, from) {
+				return
+			}
+			if len(out) == 0 {
+				continue
+			}
+			resp, derr := dns.decode_message(out, context.temp_allocator)
+			if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+				return
+			}
+			if !testing.expectf(t, len(resp.answer) == 1, "refusing %d from %d answered %d records", run, from, len(resp.answer)) {
+				return
+			}
+		}
+	}
+}
+
+/*
+A rewrite that built nothing is counted failed, as `shape_forwarded` counts a
+query it could not build, and not as a rewrite answered.
+*/
+@(test)
+test_a_rewrite_that_built_nothing_is_counted_failed :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.rewrites = chase_rules()
+	s := Server {
+		cfg = &cfg,
+	}
+	questions := []dns.Question{{name = "old.lan.", type = .A, class = .IN}}
+	msg := dns.Message{id = 0x3204, question = questions}
+	msg.flags.rd = true
+	spent: int
+	st := Query_State {
+		s         = &s,
+		msg       = msg,
+		q         = questions[0],
+		proto     = .UDP,
+		client    = "127.0.0.1:5555",
+		limit     = 512,
+		started   = time.tick_now(),
+		spent     = &spent,
+		allocator = mem.nil_allocator(),
+	}
+	testing.expect(t, answer_locally(&st), "the rewrite was handed on")
+	testing.expect(t, !st.ok, "an answer was reported built with no memory to build it")
+	testing.expect_value(t, s.stats.rewritten, 0)
+	testing.expect_value(t, s.stats.failed, 1)
+}
+
+/*
+The reverse of a rewrite stays matched where its allocations run dry, as the
+rewrite does: falling through would answer the address out of the special-use
+table, which says it has no PTR.
+*/
+@(test)
+test_a_reverse_rewrite_that_runs_dry_stays_matched :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg := config.default_config()
+	cfg.log.queries = false
+	rules := make([]config.Rewrite, 1, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "nas.lan.",
+		answers = one_answer({kind = .A, v4 = {192, 168, 1, 50}}),
+		ttl     = 300,
+		ptr     = true,
+	}
+	cfg.rewrites = rules
+	s := Server {
+		cfg = &cfg,
+	}
+	questions := []dns.Question{{name = "50.1.168.192.in-addr.arpa.", type = .PTR, class = .IN}}
+	msg := dns.Message{id = 0x3204, question = questions}
+	whole, whole_matched := apply_reverse_rewrite(&s, msg, questions[0], context.temp_allocator, 512)
+	if !testing.expect(t, whole_matched && len(whole) > 0, "nas.lan.'s address should be answered by its PTR") {
+		return
+	}
+	for run in ([]int{1, 3}) do for from := 1; ; from += 1 {
+		f := Fail_Nth{fail_at = from, fail_for = run}
+		dry := mem.Allocator{procedure = fail_nth_proc, data = &f}
+		out, matched := apply_reverse_rewrite(&s, msg, questions[0], dry, 512)
+		if f.seen < from {
+			break
+		}
+		if !testing.expectf(t, matched, "refusing %d from %d left the PTR unmatched", run, from) {
+			return
+		}
+		if len(out) > 0 && !testing.expectf(t, string(out) == string(whole), "refusing %d from %d built a different answer", run, from) {
+			return
+		}
+	}
+}
+
+// Every answer counter a chase's outcome can land in, summed.
+@(private = "file")
+chase_answers_counted :: proc(s: ^Server) -> u64 {
+	return s.stats.failed + s.stats.blocked + s.stats.cached + s.stats.forwarded + s.stats.rewritten
 }

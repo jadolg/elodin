@@ -1,6 +1,7 @@
 package server
 
 import "core:mem"
+import "core:slice"
 import "elodin:dns"
 
 /*
@@ -643,7 +644,10 @@ answer_special_use :: proc(
 	limit: int,
 ) -> []u8 {
 	rcode := dns.Rcode.No_Error
-	answers := make([dynamic]dns.Record, 0, 2, allocator)
+	// On the stack: at most two records (A and AAAA, or SOA and NS, for ANY),
+	// so no append can run dry and turn the answer into a NODATA.
+	answer_buf: [2]dns.Record
+	answers := slice.into_dynamic(answer_buf[:])
 
 	switch kind {
 	case .None:
@@ -689,7 +693,7 @@ answer_special_use :: proc(
 			break
 		}
 		if q.type == .SOA || q.type == .ANY {
-			append(&answers, ..synth_soa_for_zone(zone, SPECIAL_USE_TTL, allocator))
+			append(&answers, synth_soa_for_zone(zone, SPECIAL_USE_TTL))
 		}
 		if q.type == .NS || q.type == .ANY {
 			append(
@@ -707,11 +711,19 @@ answer_special_use :: proc(
 
 	resp := dns.make_response(query, rcode, allocator)
 	resp.answer = answers[:]
+	soa: [1]dns.Record
 	if len(answers) == 0 {
-		resp.authority = synth_soa(q.name, SPECIAL_USE_TTL, allocator, zone)
+		soa[0] = synth_soa(q.name, SPECIAL_USE_TTL, zone)
+		resp.authority = soa[:]
 	}
 
 	out, _, err := dns.encode_message(resp, allocator, limit)
+	// Not the header fallback where the allocator ran dry: it would turn the
+	// loopback address into a NODATA, and a denial into one without the SOA it
+	// is cached by (RFC 2308 section 3).
+	if err == .Out_Of_Memory {
+		return nil
+	}
 	if err != .None {
 		fallback, _ := dns.error_response(nil, query, rcode, allocator, limit)
 		return fallback

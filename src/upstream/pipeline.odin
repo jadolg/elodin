@@ -851,7 +851,10 @@ pipe_query :: proc(
 
 	// Scratch, on this caller's own arena: the bytes only have to outlive the
 	// exchange, and the reader reaches them through the waiter.
-	asked := make([]u8, len(query), context.temp_allocator)
+	asked, asked_built := dns.alloc_slice([]u8, len(query), context.temp_allocator)
+	if !asked_built {
+		return nil, .Out_Of_Memory
+	}
 	copy(asked, query)
 	w := Pipe_Waiter {
 		query    = asked,
@@ -903,7 +906,20 @@ pipe_query :: proc(
 	if !response_accepted(u, asked, reply) {
 		return nil, .Bad_Response
 	}
-	response = make([]u8, len(reply), allocator)
+	return pipe_reply_copy(reply, query, allocator)
+}
+
+/*
+The reply in the caller's allocator, under the caller's ID. An empty copy would
+leave as an answer with no error beside it, so a copy that cannot be had is
+`Out_Of_Memory`.
+*/
+@(private)
+pipe_reply_copy :: proc(reply, query: []u8, allocator: mem.Allocator) -> (response: []u8, err: Error) {
+	built: bool
+	if response, built = dns.alloc_slice([]u8, len(reply), allocator); !built {
+		return nil, .Out_Of_Memory
+	}
 	copy(response, reply)
 	dns.set_id_in_place(response, u16(query[0]) << 8 | u16(query[1]))
 	return response, .None
@@ -1278,7 +1294,12 @@ pipe_set_write_timeout :: proc(c: ^Pipe_Conn, d: time.Duration) {
 
 @(private)
 pipe_write :: proc(c: ^Pipe_Conn, query: []u8, deadline: time.Tick) -> Error {
-	framed := make([]u8, 2 + len(query), context.temp_allocator)
+	// Before the connection is touched: a query that cannot be framed was never
+	// a turn on it, so the connection stays as it was.
+	framed, framed_built := dns.alloc_slice([]u8, 2 + len(query), context.temp_allocator)
+	if !framed_built {
+		return .Out_Of_Memory
+	}
 	framed[0] = u8(len(query) >> 8)
 	framed[1] = u8(len(query))
 	copy(framed[2:], query)

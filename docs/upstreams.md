@@ -134,6 +134,7 @@ level=warn msg="upstream quad9-dot: TLS handshake with \"dns.quad9.net\" failed:
 | `HTTP_Error` | an `https` reply that is not a 200 with at least a DNS header; over HTTP/2 also a stream the upstream reset with anything but REFUSED_STREAM, and a response RFC 9113 sections 8.1 to 8.3 make malformed: a missing, malformed or second `:status`, another pseudo-header, or a field section 8.2 refuses in its header section; a pseudo-header such as `:status` or a field 8.2 refuses in its trailers; trailers that do not end the stream, an interim (1xx) response that does, or DATA ahead of the final response |
 | `TLS_Failed`, `Verify_Failed` | the handshake; the log line carries OpenSSL's reason |
 | `Backlogged` | not sent: the pipelined connection's queue would outlast the query's timeout (see [connections](#connections)); never counts towards the cooldown |
+| `Out_Of_Memory` | elodin could not allocate the query's buffer, so nothing was sent, or the copy of the reply it received (process out of memory, `RLIMIT_AS`, `vm.max_map_count`; see [sizing](sizing.md#memory-mappings)); never counts towards the cooldown |
 
 `Bad_Response` on a `udp://` or `tcp://` upstream means answers are arriving and
 being refused. An anycast resolver whose nodes do not share a cookie secret does

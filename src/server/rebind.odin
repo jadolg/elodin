@@ -245,6 +245,9 @@ rebind_reads_answer :: proc(s: ^Server, q: dns.Question) -> bool {
 	return !rebind_exempt(live(s).cfg.rebind.allow_domains, q.name) && !is_zone_routed(s, q.name)
 }
 
+// The detail of a rebinding check this server could not read for itself.
+REBIND_UNREAD :: "answer-unread"
+
 /*
 The answer to send instead, when the upstream's answer cannot be passed on.
 
@@ -264,6 +267,11 @@ checked. Both are this guard withholding an answer and both move the same
 counter - they should each be zero in production, and a second counter for a
 number that never moves is a number nobody reads - but they point an operator at
 completely different things, so the log has to be able to say which.
+
+A reading this server refused on its own account - its memory, or the request's
+decode budget (`dns.reading_refused`) - is neither. It says nothing about the
+answer, so it is SERVFAIL rather than a NODATA a client caches, and the detail
+is `REBIND_UNREAD`: counted failed here, and logged failed by the caller.
 */
 @(private)
 rebind_refusal :: proc(
@@ -279,6 +287,11 @@ rebind_refusal :: proc(
 	refused: bool,
 ) {
 	msg, readable, err := rebind_readable(decoded)
+	if !readable && dns.reading_refused(err) {
+		count_answer(&s.stats.failed)
+		out, _ = dns.error_response(nil, query, .Serv_Fail, allocator, limit)
+		return out, REBIND_UNREAD, true
+	}
 	if !readable {
 		sync.atomic_add(&s.stats.rebind, 1)
 		report_unreadable(q.name, err)
@@ -434,16 +447,18 @@ rebind_nodata :: proc(
 	allocator: mem.Allocator,
 ) -> []u8 {
 	out_msg := dns.make_response(query, .No_Error, allocator)
-	out_msg.authority = synth_soa(q.name, live(s).cfg.blocking.block_ttl, allocator)
+	soa := [1]dns.Record{synth_soa(q.name, live(s).cfg.blocking.block_ttl)}
+	out_msg.authority = soa[:]
 	attach_extended_error(&out_msg, EDE_BLOCKED, "rebind", allocator)
 
 	encoded, _, enc_err := dns.encode_message(out_msg, allocator, limit)
 	if enc_err != .None {
 		/*
 		Whatever happens, not the upstream's bytes. An answer that could not be
-		encoded is a header this server can always build, and a client that gets
-		an empty NOERROR has lost a name; a client that gets the answer this
-		procedure just decided to withhold has lost rather more than that.
+		encoded falls back to the header alone, or to no answer where the
+		allocator ran dry: a client that gets an empty NOERROR, or nothing, has
+		lost a name; a client that gets the answer this procedure just decided
+		to withhold has lost rather more than that.
 		*/
 		fallback, _ := dns.error_response(nil, query, .No_Error, allocator, limit)
 		return fallback

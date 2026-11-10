@@ -343,7 +343,8 @@ handle_query :: proc(
 	limit := response_limit(s, msg, proto)
 	advertise := advertised_udp_size(s, msg, proto)
 	if derr != .None {
-		out, built := dns.error_response(query, {}, .Form_Err, allocator, limit)
+		rcode := query_decode_rcode(derr)
+		out, built := dns.error_response(query, {}, rcode, allocator, limit)
 		return advertise_udp_size(out, advertise, proto), .Failed, built
 	}
 	// A response arriving on a listener port is not something to answer.
@@ -681,10 +682,11 @@ Which direction overflows decides what is given up for it:
     with its room kept behind it - the trade `encode_message` argues for every
     other truncation.
 
-A failed mint or strip keeps the answer rather than withholding it - the OPT
-mismatch is worth correcting, and not worth costing a client its answer. Both
-still go through `fit_response`, so the one procedure that holds the ceiling is
-reached whichever step failed.
+A failed mint keeps the answer rather than withholding it - the OPT mismatch is
+worth correcting, and not worth costing a client its answer. A failed strip does
+not: the answer would carry the upstream's options, so it is SERVFAIL instead
+(see `normalise_client_opt`). Both still go through `fit_response`, so the one
+procedure that holds the ceiling is reached whichever step failed.
 
 The record that does go back is then made this server's own, which is the rest
 of the sentence in RFC 6891 section 6.1.1: presence is what a client reads first,
@@ -924,9 +926,21 @@ normalise_client_opt :: proc(
 	out := wire
 	switch outcome {
 	case .Forwarded, .Cached:
-		if stripped, ok := dns.strip_edns_options(wire, allocator, spent); ok {
-			out = stripped
+		/*
+		An answer whose upstream options could not be taken out does not go
+		out with them: that is the upstream's OPT record forwarded, which RFC
+		6891 section 6.1.1 says MUST NOT happen. The strip fails only where the
+		message cannot be rebuilt - out of memory, the request's decode budget,
+		a message with records after its OPT record that will not decode or
+		encode again, or a re-encode that outgrows `dns.MAX_MESSAGE` - so
+		SERVFAIL, or nothing where even that cannot be built.
+		*/
+		stripped, ok := dns.strip_edns_options(wire, allocator, spent)
+		if !ok {
+			refusal, _ := dns.error_response(nil, query, .Serv_Fail, allocator)
+			return refusal
 		}
+		out = stripped
 	/*
 	Built here, by `dns.make_response` or `dns.error_response`, whose OPT record
 	is minted with no options in it - so what is in one is what this server put
@@ -1261,6 +1275,20 @@ answered :: proc(st: ^Query_State, response: []u8, outcome: Outcome, ok: bool) -
 }
 
 /*
+The rcode for a client's query that would not decode.
+
+FORMERR says the query could not be interpreted (RFC 1035 section 4.1.1), and a
+stub reads it as an EDNS problem and asks again without one (RFC 6891 section
+7). A query this server had no memory to read is SERVFAIL: the query was fine.
+Not the request budget, which on the client's own query is spent by nothing but
+that query's bytes.
+*/
+@(private)
+query_decode_rcode :: proc "contextless" (err: dns.Decode_Error) -> dns.Rcode {
+	return .Serv_Fail if err == .Out_Of_Memory else .Form_Err
+}
+
+/*
 Everything this server answers for itself, without a cache lookup or an
 upstream: the request-shape gates, then the operator's rewrites and block lists,
 then the tables. See `resolve_query` for where this sits.
@@ -1304,8 +1332,12 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 
 	if st.q.class == .CH {
 		if out, handled := answer_chaos(st.s, st.msg, st.q, st.allocator, st.limit); handled {
-			log_query(st.s, st.client, st.proto, st.q, .Local, "chaos", st.started)
-			return answered(st, out, .Local, true)
+			// Nothing built is a failure, as for every local answer.
+			if len(out) == 0 {
+				count_answer(&st.s.stats.failed)
+			}
+			log_query(st.s, st.client, st.proto, st.q, .Local if len(out) > 0 else .Failed, "chaos", st.started)
+			return answered(st, out, .Local, len(out) > 0)
 		}
 	}
 	if st.q.class != .IN && st.q.class != .ANY {
@@ -1342,11 +1374,12 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 				st.pool,
 			)
 		}
+		// Nothing built is a failure, as `shape_forwarded` counts one.
 		if !counted {
-			count_answer(&st.s.stats.rewritten)
+			count_answer(&st.s.stats.rewritten if len(out) > 0 else &st.s.stats.failed)
 		}
-		log_query(st.s, st.client, st.proto, st.q, .Rewritten, "rewrite", st.started)
-		return answered(st, out, .Rewritten, true)
+		log_query(st.s, st.client, st.proto, st.q, .Rewritten if len(out) > 0 else .Failed, "rewrite", st.started)
+		return answered(st, out, .Rewritten, len(out) > 0)
 	}
 
 	/*
@@ -1365,18 +1398,19 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 	that this server answered it out of a forward rule rather than forwarding it.
 	*/
 	if out, matched := apply_reverse_rewrite(st.s, st.msg, st.q, st.allocator, st.limit); matched {
-		count_answer(&st.s.stats.rewritten)
-		log_query(st.s, st.client, st.proto, st.q, .Rewritten, "rewrite-ptr", st.started)
-		return answered(st, out, .Rewritten, true)
+		count_answer(&st.s.stats.rewritten if len(out) > 0 else &st.s.stats.failed)
+		log_query(st.s, st.client, st.proto, st.q, .Rewritten if len(out) > 0 else .Failed, "rewrite-ptr", st.started)
+		return answered(st, out, .Rewritten, len(out) > 0)
 	}
 
 	if live(st.s).cfg.blocking.enabled && st.s.filters != nil {
 		typed_only: bool
 		if filter.engine_match(st.s.filters, st.q.name, st.q.type, &typed_only) == .Blocked {
-			count_answer(&st.s.stats.blocked)
 			out := build_block_response(st.s, st.msg, st.q, st.allocator, st.limit, typed_only)
-			log_query(st.s, st.client, st.proto, st.q, .Blocked, "list", st.started)
-			return answered(st, out, .Blocked, true)
+			// Nothing built is a failure, as for a rewrite.
+			count_answer(&st.s.stats.blocked if len(out) > 0 else &st.s.stats.failed)
+			log_query(st.s, st.client, st.proto, st.q, .Blocked if len(out) > 0 else .Failed, "list", st.started)
+			return answered(st, out, .Blocked, len(out) > 0)
 		}
 	}
 
@@ -1403,8 +1437,12 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 	*/
 	if is_resolver_arpa(st.q.name) {
 		out := build_resolver_arpa_response(st.s, st.msg, st.q, st.allocator, st.limit)
-		log_query(st.s, st.client, st.proto, st.q, .Local, "ddr", st.started)
-		return answered(st, out, .Local, true)
+		// Nothing built is a failure, as for a rewrite.
+		if len(out) == 0 {
+			count_answer(&st.s.stats.failed)
+		}
+		log_query(st.s, st.client, st.proto, st.q, .Local if len(out) > 0 else .Failed, "ddr", st.started)
+		return answered(st, out, .Local, len(out) > 0)
 	}
 
 	/*
@@ -1456,13 +1494,17 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		// folded in it would drown the `.onion` and `localhost.` signal the
 		// counter exists for. The query log still tells them apart.
 		private_reverse := kind == .Empty_Nonterminal || (kind == .Empty_Zone && zone != "home.arpa.")
-		if private_reverse {
+		if len(out) == 0 {
+			// Nothing built is a failure, as for a rewrite, whichever zone.
+			count_answer(&st.s.stats.failed)
+			log_query(st.s, st.client, st.proto, st.q, .Failed, "special-use", st.started)
+		} else if private_reverse {
 			log_query(st.s, st.client, st.proto, st.q, .Local, "private-reverse", st.started)
 		} else {
 			sync.atomic_add(&st.s.stats.special_use, 1)
 			log_query(st.s, st.client, st.proto, st.q, .Local, "special-use", st.started)
 		}
-		return answered(st, out, .Local, true)
+		return answered(st, out, .Local, len(out) > 0)
 	}
 	return false
 }
@@ -1825,7 +1867,11 @@ back in the client's case before it goes out (`dns.copy_question_case`).
 @(private)
 upstream_query :: proc(q: dns.Question, dnssec_ok, checking_disabled: bool, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
 	question := [1]dns.Question{q}
-	question[0].name = dns.name_fold(q.name, allocator)
+	folded, ferr := dns.name_fold(q.name, allocator)
+	if ferr != nil {
+		return nil, false
+	}
+	question[0].name = folded
 	additional := [1]dns.Record{dns.make_opt(UPSTREAM_UDP_SIZE, dnssec_ok)}
 	m := dns.Message {
 		id         = dns.random_id(),
@@ -2525,18 +2571,20 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 			*/
 			shed := result.shed && result.status == .Indeterminate
 			/*
-			Everything but our own shedding is counted as `bogus`.
+			Everything but what this server gave up on for itself is counted as
+			`bogus`: its own shedding, and a reading it refused for its memory or
+			the request's decode budget (`counts_as_bogus`).
 
 			The counter's two readings have always been folded together here -
 			see the note in `validate_rrset` - on the argument that the ones
-			folded in are upstream failures, which nobody chooses. This one is
+			folded in are upstream failures, which nobody chooses. Shedding is
 			chosen: a flood decides how often it happens, so leaving it in would
 			let an attacker drive a series operators read as "somebody is forging
 			answers" at whatever rate they like. `failed` still moves, because
 			the query did, and `elodin_dnssec_queries_shed_total` is the series
 			that says how often this was us.
 			*/
-			if !shed {
+			if counts_as_bogus(result) {
 				sync.atomic_add(&st.s.stats.bogus, 1)
 			}
 			count_answer(&st.s.stats.failed)
@@ -2557,6 +2605,22 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 		st.ede = st.answer_ede
 	}
 	return false
+}
+
+/*
+Whether a failed validation goes in `stats.bogus`: everything but what this
+server chose for itself. Its own shedding, which a flood decides the rate of,
+and a reading it refused on its own account - the request's decode budget, which
+an attacker answering the chain expensively spends, or its memory - are both
+`Indeterminate` with nothing proved, and folded in they would let either drive a
+series operators read as "somebody is forging answers".
+*/
+@(private)
+counts_as_bogus :: proc(result: dnssec.Result) -> bool {
+	if result.status != .Indeterminate {
+		return true
+	}
+	return !result.shed && !reading_refused_verdict(result)
 }
 
 /*
@@ -2675,6 +2739,11 @@ finish_answer :: proc(st: ^Query_State) {
 	*/
 	if checking_rebind {
 		if out, detail, blocked := rebind_refusal(st.s, st.msg, st.q, decoded, st.limit, st.allocator); blocked {
+			if detail == REBIND_UNREAD {
+				log_query(st.s, st.client, st.proto, st.q, .Failed, detail, st.started)
+				answered(st, out, .Failed, len(out) > 0)
+				return
+			}
 			if detail == "rebind" &&
 			   decoded.full &&
 			   !decoded.msg.flags.tc &&
@@ -2896,7 +2965,7 @@ finish_answer :: proc(st: ^Query_State) {
 					st.flight.stored = .Cloak
 				}
 			}
-			answered(st, out, cloak_outcome(verdict), true)
+			answered(st, out, cloak_outcome(verdict), len(out) > 0)
 			return
 		}
 	}
@@ -3644,14 +3713,16 @@ remember_bogus_verdict :: proc(
 		return
 	}
 	asked := msg
+	// On the stack, as in `answer_special_use`: the build below is its only
+	// reader, and an allocation here is one a dry arena would trap indexing.
+	opt: [1]dns.Record
 	if _, has := dns.find_opt(msg); !has {
-		opt := make([]dns.Record, 1, allocator)
 		// The payload size is this server's to state and `advertise_udp_size`
 		// writes its own over it on the way out, so what is in here only has to
 		// be a number. DO is the client's, and the key already keeps the two
 		// kinds of client apart.
 		opt[0] = dns.make_opt(UPSTREAM_UDP_SIZE, dns.edns_do(msg))
-		asked.additional = opt
+		asked.additional = opt[:]
 	}
 	wire, built := dnssec_failure_response(asked, result, allocator, dns.MAX_MESSAGE)
 	if !built {
@@ -3805,7 +3876,8 @@ serve_from_cache :: proc(
 		// `cache.put` checks: `put` never decodes, it takes an already-decoded
 		// message and trusts it to describe the bytes beside it. A third store
 		// written without that guard would break this quietly.
-		if stored, derr := dns.decode_message(hit.wire, st.allocator, st.spent); derr == .None {
+		stored, derr := dns.decode_message(hit.wire, st.allocator, st.spent)
+		if derr == .None {
 			if out, verdict := block_cloaked_answer(
 				st.s,
 				stored.answer,
@@ -3837,7 +3909,7 @@ serve_from_cache :: proc(
 					cache.forget(live(st.s).answers, hit.key, hit.serial)
 				}
 				cache.note_withheld(live(st.s).answers)
-				return out, cloak_outcome(verdict), true
+				return out, cloak_outcome(verdict), len(out) > 0
 			}
 			// Inside the decode, not after it. An entry nothing could read has
 			// not been looked at, and stamping it here would say it had - which
@@ -3853,16 +3925,25 @@ serve_from_cache :: proc(
 
 			Serving it was the other way this could have gone and it is the same
 			mistake `Unwalkable` exists to refuse: the check is not a thing to
-			skip on the inputs that defeat it. Nothing reaches here as things
-			stand - `cache.put` stores no message it could not read - which is
-			the reason refusing costs nothing, not a reason to fall through.
+			skip on the inputs that defeat it. Bytes that will not decode do not
+			reach here as things stand - `cache.put` stores no message it could
+			not read - which is the reason refusing costs nothing, not a reason
+			to fall through.
 
 			The entry is dropped rather than stamped. It cannot be walked on any
 			later hit either, so leaving it would refuse this name for as long
 			as it lived; dropping it sends the next query upstream for an answer
 			that can be read.
+
+			A reading this server refused on its own account - its memory, or
+			the request's decode budget - says nothing about the bytes, so the
+			entry stays: a later hit with room to read it walks it then. Dropped
+			for that, a short spell of memory pressure would empty the cache of
+			every chained answer it was asked for and send each one upstream.
 			*/
-			cache.forget(live(st.s).answers, hit.key, hit.serial)
+			if !dns.reading_refused(derr) {
+				cache.forget(live(st.s).answers, hit.key, hit.serial)
+			}
 			cache.note_withheld(live(st.s).answers)
 			count_answer(&st.s.stats.failed)
 			out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)
@@ -4083,7 +4164,9 @@ encode_block_response :: proc(
 	ttl := live(s).cfg.blocking.block_ttl
 
 	rcode := dns.Rcode.No_Error
-	answers := make([dynamic]dns.Record, 0, 1, allocator)
+	// On the stack, as in `answer_special_use`: one record at most.
+	answer_buf: [1]dns.Record
+	answers := slice.into_dynamic(answer_buf[:])
 
 	switch live(s).cfg.blocking.response {
 	case .NX_Domain:
@@ -4136,10 +4219,12 @@ encode_block_response :: proc(
 
 	resp := dns.make_response(query, rcode, allocator)
 	resp.answer = answers[:]
+	soa: [1]dns.Record
 	if len(answers) == 0 && rcode != .Refused {
 		// An SOA in the authority section tells resolvers how long to remember
 		// this, which keeps blocked names from being re-asked every second.
-		resp.authority = synth_soa(q.name, ttl, allocator)
+		soa[0] = synth_soa(q.name, ttl)
+		resp.authority = soa[:]
 	}
 
 	out, _, err := dns.encode_message(resp, allocator, limit)
@@ -4160,7 +4245,7 @@ parent, which is the best guess available to the blocking and rewrite paths -
 they answer for names scattered through zones this server knows nothing about.
 */
 @(private)
-synth_soa :: proc(name: string, ttl: u32, allocator: mem.Allocator, apex := "") -> []dns.Record {
+synth_soa :: proc(name: string, ttl: u32, apex := "") -> dns.Record {
 	zone := apex
 	if zone == "" {
 		zone = dns.name_parent(name)
@@ -4168,14 +4253,19 @@ synth_soa :: proc(name: string, ttl: u32, allocator: mem.Allocator, apex := "") 
 			zone = name
 		}
 	}
-	return synth_soa_for_zone(zone, ttl, allocator)
+	return synth_soa_for_zone(zone, ttl)
 }
 
-// The same, for a caller that knows the zone rather than a name inside it.
+/*
+The same, for a caller that knows the zone rather than a name inside it.
+
+A value rather than a slice, so the caller holds it in an array of its own and
+nothing is allocated: a negative answer that went out without its SOA could not
+be cached (RFC 2308 section 3), and an allocation here is one that could fail.
+*/
 @(private)
-synth_soa_for_zone :: proc(zone: string, ttl: u32, allocator: mem.Allocator) -> []dns.Record {
-	recs := make([]dns.Record, 1, allocator)
-	recs[0] = dns.Record {
+synth_soa_for_zone :: proc(zone: string, ttl: u32) -> dns.Record {
+	return dns.Record {
 		name = zone,
 		type = .SOA,
 		class = .IN,
@@ -4190,7 +4280,6 @@ synth_soa_for_zone :: proc(zone: string, ttl: u32, allocator: mem.Allocator) -> 
 			minimum = ttl,
 		},
 	}
-	return recs
 }
 
 /*
@@ -4226,7 +4315,17 @@ apply_rewrite :: proc(
 		return build_block_response(s, query, q, allocator, limit), true, nil
 	}
 
-	answers := make([dynamic]dns.Record, 0, len(rule.answers), allocator)
+	/*
+	Reserved whole, so no append below can drop a record: a lost CNAME is an
+	`answers[0]` past the end, and a lost address a NODATA. Matched with
+	nothing built where it cannot be had, as where the encode below runs dry:
+	not matched would send the operator's name on to the block lists and the
+	upstreams.
+	*/
+	answers, answers_built := dns.alloc_list([dynamic]dns.Record, len(rule.answers), allocator)
+	if !answers_built {
+		return nil, true, nil
+	}
 	for a in rule.answers {
 		// A CNAME answers every type; `chase_rewrite_alias` follows it.
 		if !kind_answers(a.kind, q.type) {
@@ -4265,17 +4364,31 @@ apply_rewrite :: proc(
 
 	resp := dns.make_response(query, .No_Error, allocator)
 	resp.answer = answers[:]
+	soa: [1]dns.Record
 	if len(answers) == 0 {
-		resp.authority = synth_soa(q.name, rule.ttl, allocator)
+		soa[0] = synth_soa(q.name, rule.ttl)
+		resp.authority = soa[:]
 	}
 	out, _, err := dns.encode_message(resp, allocator, limit)
 	if err != .None {
-		return nil, false, nil
+		return nil, err == .Out_Of_Memory, nil
 	}
 	if rule_holds_alias(rule) {
 		alias = answers[0]
 	}
 	return out, true, alias
+}
+
+// The SERVFAIL `chase_rewrite_alias` answers where its allocator ran dry, or
+// nothing where there is not room even for that. Counted failed unless the
+// target's lookup already counted the query, so it is never a rewrite.
+@(private)
+chase_ran_dry :: proc(s: ^Server, msg: dns.Message, limit: int, allocator: mem.Allocator, counted: bool) -> ([]u8, bool) {
+	if !counted {
+		count_answer(&s.stats.failed)
+	}
+	out, _ := dns.error_response(nil, msg, .Serv_Fail, allocator, limit)
+	return out, true
 }
 
 /*
@@ -4336,9 +4449,17 @@ chase_rewrite_alias :: proc(
 		return plain, false
 	}
 
-	chain := make([dynamic]dns.Record, 0, 4, allocator)
+	/*
+	The chain and the question are indexed below. Where the allocator ran dry
+	the answer is SERVFAIL rather than the plain alias: an alias alone is the
+	not-found this procedure exists to prevent.
+	*/
+	chain, chain_built := dns.alloc_list([dynamic]dns.Record, 4, allocator)
+	questions, questions_built := dns.alloc_slice([]dns.Question, 1, allocator)
+	if !chain_built || !questions_built {
+		return chase_ran_dry(s, msg, limit, allocator, false)
+	}
 	append(&chain, alias)
-	questions := make([]dns.Question, 1, allocator)
 	next := msg
 	next.question = questions
 	rest: dns.Message
@@ -4361,6 +4482,9 @@ chase_rewrite_alias :: proc(
 		out, matched, more := apply_rewrite(s, next, questions[0], allocator, limit)
 		if !matched {
 			wire, _, enc := dns.encode_message(next, allocator)
+			if enc == .Out_Of_Memory {
+				return chase_ran_dry(s, msg, limit, allocator, false)
+			}
 			if enc != .None {
 				break walk
 			}
@@ -4370,14 +4494,18 @@ chase_rewrite_alias :: proc(
 			// and nor does a special-use name, so the chain either leaves as the
 			// answer is counted as the rewrite it is. A block list answering
 			// `refused` is `.Blocked` and counted as blocked, alias alone or not.
-			counted = outcome != .Refused && outcome != .Local
+			// A local answer that built nothing has counted itself failed.
+			counted = outcome != .Refused && (outcome != .Local || !r.ok)
 			// Unanswered leaves `out` nil, which the decode below turns into
 			// SERVFAIL rather than the bare alias.
 			if outcome == .Refused {
 				break walk
 			}
 		} else if next_alias, is_alias := more.?; is_alias {
-			append(&chain, next_alias)
+			// A link that did not land would be looked up again and again.
+			if n, _ := append(&chain, next_alias); n != 1 {
+				return chase_ran_dry(s, msg, limit, allocator, false)
+			}
 			continue walk
 		}
 		got, derr := dns.decode_message(out, allocator, spent)
@@ -4385,14 +4513,23 @@ chase_rewrite_alias :: proc(
 			// The target was answered and this server could not read the answer
 			// back - the request's decode budget, in practice. SERVFAIL, not the
 			// bare alias: that is the not-found this procedure exists to prevent.
+			// Or a rule further down the chain built nothing. Counted failed
+			// where the target's lookup did not count it, never as a rewrite.
 			rest.flags.rcode = u8(dns.Rcode.Serv_Fail)
+			if !counted {
+				count_answer(&s.stats.failed)
+				counted = true
+			}
 		} else if dns.Rcode(got.flags.rcode) != .Refused {
 			rest = got
 		}
 		break walk
 	}
 
-	answers := make([]dns.Record, len(chain) + len(rest.answer), allocator)
+	answers, answers_built := dns.alloc_slice([]dns.Record, len(chain) + len(rest.answer), allocator)
+	if !answers_built {
+		return chase_ran_dry(s, msg, limit, allocator, counted)
+	}
 	copy(answers, chain[:])
 	copy(answers[len(chain):], rest.answer)
 	resp := dns.make_response(msg, dns.Rcode(rest.flags.rcode), allocator)
@@ -4414,6 +4551,9 @@ chase_rewrite_alias :: proc(
 		resp.additional[0].data = own.data
 	}
 	wire, _, err := dns.encode_message(resp, allocator, limit)
+	if err == .Out_Of_Memory {
+		return chase_ran_dry(s, msg, limit, allocator, counted)
+	}
 	if err != .None {
 		return plain, counted
 	}
@@ -4679,22 +4819,19 @@ answer_chaos :: proc(
 		return nil, false
 	}
 
-	strs := make([]string, 1, allocator)
-	strs[0] = text
-	answers := make([]dns.Record, 1, allocator)
-	answers[0] = dns.Record {
-		name = q.name,
-		type = .TXT,
-		class = .CH,
-		ttl = 0,
-		data = dns.Rdata_TXT{strings = strs},
-	}
+	// On the stack, as in `answer_special_use`: the encode below is their only
+	// reader.
+	strs := [1]string{text}
+	answers := [1]dns.Record{{name = q.name, type = .TXT, class = .CH, ttl = 0, data = dns.Rdata_TXT{strings = strs[:]}}}
 
 	resp := dns.make_response(query, .No_Error, allocator)
-	resp.answer = answers
+	resp.answer = answers[:]
 	out, _, err := dns.encode_message(resp, allocator, limit)
 	if err != .None {
-		return nil, false
+		// Still handled where the allocator ran dry: the name is ours, and
+		// falling through would answer it REFUSED, which says something untrue
+		// about it.
+		return nil, err == .Out_Of_Memory
 	}
 	return out, true
 }

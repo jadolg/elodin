@@ -167,8 +167,9 @@ parse_trust_anchor :: proc(text: string, allocator := context.allocator) -> (anc
 		return {}, false
 	}
 
+	canonical := dns.name_canonical(zone, allocator) or_return
 	return Trust_Anchor {
-			zone = dns.name_canonical(zone, allocator),
+			zone = canonical,
 			ds = Ds {
 				key_tag = u16(key_tag),
 				algorithm = u8(algorithm),

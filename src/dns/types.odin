@@ -260,6 +260,13 @@ Message :: struct {
 	answer:     []Record,
 	authority:  []Record,
 	additional: []Record,
+	/*
+	A builder ran out of memory partway and this is not the message it meant
+	to build - `make_response` without the OPT record that carries the
+	client's EDNS and an rcode's top bits. `encode_message` refuses it, so a
+	caller that encodes what it was handed cannot send it.
+	*/
+	incomplete: bool,
 }
 
 EDNS_Option_Code :: enum u16 {

@@ -149,6 +149,13 @@ edit_in_place :: proc(raw: []u8) {
 	_ = dns.peek_rcode(raw)
 	_ = dns.peek_udp_size(raw)
 	_, _ = dns.peek_question(raw)
+	// The in-place compare a reply is matched to its query with, which has to
+	// read either side without running off it and agree with itself both ways.
+	@(static) asked := [?]u8{0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1}
+	if dns.same_question(raw, asked[:]) != dns.same_question(asked[:], raw) {
+		panic("same_question is not symmetric")
+	}
+	_ = dns.same_question(raw, raw)
 	_, _ = dns.peek_alias_target(raw)
 	// The two normalisations a client's answer goes through, checked for having
 	// left no option behind and no OPT record at all.

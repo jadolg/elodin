@@ -2063,16 +2063,40 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 			continue
 		}
 
-		framed := make([]u8, 2 + len(response), context.temp_allocator)
-		framed[0] = u8(len(response) >> 8)
-		framed[1] = u8(len(response))
-		copy(framed[2:], response)
+		/*
+		An answer that cannot be framed cannot be sent, and the query it
+		answers is one the client is waiting on: closed rather than left
+		unanswered, so it asks again on a new connection now (RFC 7766 section
+		6.2.4) rather than at its timeout. Drained first where answers have
+		gone out, as for the rate-limit close above: a pipelining client's
+		unread queries would turn the close into an RST that takes them back.
+		The scratch is freed so the drain has room for its chunk.
+		*/
+		framed, framed_built := stream_frame(response, context.temp_allocator)
+		if !framed_built {
+			if answered {
+				free_all(context.temp_allocator)
+				stream_linger(conn)
+			}
+			return
+		}
 		if !conn_write_all(conn, framed) {
 			return
 		}
 		answered = true
 		free_all(context.temp_allocator)
 	}
+}
+
+// `response` behind its two-byte length (RFC 1035 section 4.2.2), or false
+// where the allocator ran dry.
+@(private)
+stream_frame :: proc(response: []u8, allocator: mem.Allocator) -> (framed: []u8, ok: bool) {
+	framed = dns.alloc_slice([]u8, 2 + len(response), allocator) or_return
+	framed[0] = u8(len(response) >> 8)
+	framed[1] = u8(len(response))
+	copy(framed[2:], response)
+	return framed, true
 }
 
 /*

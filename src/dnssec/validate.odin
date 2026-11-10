@@ -540,10 +540,11 @@ WALKS_IN_FLIGHT :: "too many chains of trust being walked at once"
 Why a step stopped when the request had already taken what it may to read what
 it was sent.
 
-A reading refused for `dns.REQUEST_DECODE_BUDGET` is this server declining to
-read any more of what it was sent, so the step established nothing - the same
-report an unanswered lookup gets, code 22, and deliberately not `Bogus`. The
-reply may be perfectly genuine; what ran out is ours. See issue #354.
+A reading refused for `dns.REQUEST_DECODE_BUDGET`, or for the memory to hold it
+(`dns.reading_refused`), is this server declining to read any more of what it
+was sent, so the step established nothing - the same report an unanswered lookup
+gets, code 22, and deliberately not `Bogus`. The reply may be perfectly genuine;
+what ran out is ours. See issues #354 and #620.
 */
 READING_OVER_BUDGET :: "this query has taken as much as it may to read what it was sent"
 
@@ -1276,12 +1277,12 @@ validate :: proc(
 		/*
 		A reading this server refused itself is not a response it read and
 		found wanting. `Bogus` here would accuse the zone of a forgery on the
-		strength of our own accounting - and an attacker with a signed zone
+		strength of our own accounting or our own memory - and an attacker with a signed zone
 		gets to choose when that happens, by answering the chain with replies
 		expensive enough to spend the request's allowance. `Indeterminate` is
 		what an unreachable authority gets, which is what this is.
 		*/
-		if derr == .Request_Budget {
+		if dns.reading_refused(derr) {
 			return {status = .Indeterminate, reason = READING_OVER_BUDGET}
 		}
 		return {status = .Bogus, reason = "unparseable response"}
@@ -4036,7 +4037,7 @@ zone_step :: proc(
 	if derr != .None {
 		// As in `validate`: a reply this request had no allowance left to read
 		// is a step that established nothing, not a delegation reported broken.
-		if derr == .Request_Budget {
+		if dns.reading_refused(derr) {
 			return walk_gave_up(budget, READING_OVER_BUDGET), nil
 		}
 		broke_at(budget, child, "the DS reply could not be decoded", allocator)
@@ -4477,7 +4478,7 @@ fetch_keys :: proc(
 	if derr != .None {
 		// And as in `zone_step`: the request's own budget running out leaves
 		// this zone's keys unread rather than forged.
-		if derr == .Request_Budget {
+		if dns.reading_refused(derr) {
 			budget.walk_stopped = READING_OVER_BUDGET
 			return nil, .Indeterminate, {}, 0
 		}

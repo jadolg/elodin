@@ -164,3 +164,48 @@ counting_query :: proc(
 	u.calls += 1
 	return nil, false
 }
+
+/*
+Nor is a response this server had no memory to read (issue #620).
+
+The same accounting as the budget's: the allocator running dry is a statement
+about this server, and `Bogus` would report the zone forged for it.
+*/
+@(test)
+test_a_response_read_without_memory_is_not_called_a_forgery :: proc(t: ^testing.T) {
+	up := Counting_Upstream{}
+	v := make_validator(counting_query, &up, Options{})
+	defer destroy_validator(v)
+
+	result := validate(
+		v,
+		"www.example.com.",
+		.A,
+		ordinary_reply("www.example.com.", .A),
+		time.unix(FIXTURE_TIME, 0),
+		mem.nil_allocator(),
+	)
+	testing.expect_value(t, result.status, Status.Indeterminate)
+	testing.expect_value(t, result.reason, READING_OVER_BUDGET)
+	testing.expect_value(t, up.calls, 0)
+	free_all(context.temp_allocator)
+}
+
+// And a chain step whose reply there was no memory to read stops the walk.
+@(test)
+test_a_chain_step_read_without_memory_stops_the_walk :: proc(t: ^testing.T) {
+	up := Answering_Upstream{}
+	v := make_validator(answering_query, &up, Options{})
+	defer destroy_validator(v)
+
+	now := time.unix(FIXTURE_TIME, 0)
+	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
+
+	budget := query_budget(v)
+	status, _, _ := zone_trust(v, &budget, "www.example.com.", now, mem.nil_allocator())
+
+	testing.expect_value(t, status, Status.Indeterminate)
+	testing.expect_value(t, budget.walk_stopped, READING_OVER_BUDGET)
+	testing.expectf(t, up.calls > 0, "the walk stopped before it asked anybody anything")
+	free_all(context.temp_allocator)
+}

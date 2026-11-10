@@ -25,6 +25,22 @@ Decode_Error :: enum u8 {
 	apart.
 	*/
 	Request_Budget,
+	/*
+	The allocator the reading was given ran dry: the process is out of memory,
+	an `RLIMIT_AS` is hit, or `vm.max_map_count` is reached. Like
+	`Request_Budget`, a statement about this server and not about the message,
+	and a reader telling the two apart asks `reading_refused`.
+	*/
+	Out_Of_Memory,
+}
+
+/*
+Whether a decode stopped on this server's own account - its budget or its
+memory - rather than on anything in the bytes. Such a reply was never read, so
+it is not evidence about whoever sent it.
+*/
+reading_refused :: proc "contextless" (err: Decode_Error) -> bool {
+	return err == .Request_Budget || err == .Out_Of_Memory
 }
 
 Encode_Error :: enum u8 {
@@ -36,6 +52,8 @@ Encode_Error :: enum u8 {
 	Name_Too_Long,
 	Too_Large,
 	Bad_Rdata,
+	// The allocator ran dry partway; nothing was built. See `Writer.short`.
+	Out_Of_Memory,
 }
 
 /*
@@ -273,6 +291,24 @@ Reader :: struct {
 	other reading the same request makes.
 	*/
 	spent:      ^int,
+	/*
+	An allocation this reading asked for came back short. Set where it happens
+	and read by `budget_spent`, so a path that cannot fail on its own - the raw
+	RDATA fallback - still fails the record it was copying.
+	*/
+	dry:        bool,
+}
+
+/*
+Note an allocation that failed, as `Out_Of_Memory`.
+*/
+@(private)
+ran_dry :: proc(r: ^Reader, built: bool) -> Decode_Error {
+	if built {
+		return .None
+	}
+	r.dry = true
+	return .Out_Of_Memory
 }
 
 /*
@@ -315,6 +351,9 @@ the message - see `Request_Budget`.
 */
 @(private)
 budget_spent :: proc(r: ^Reader) -> Decode_Error {
+	if r.dry {
+		return .Out_Of_Memory
+	}
 	if over_request_budget(r.spent) {
 		return .Request_Budget
 	}
@@ -380,7 +419,9 @@ r_bytes :: proc(r: ^Reader, n: int, allocator: mem.Allocator) -> (v: []u8, err: 
 		return nil, .Short_Buffer
 	}
 	charge_bytes(r, n) or_return
-	v = make([]u8, n, allocator)
+	built: bool
+	v, built = alloc_slice([]u8, n, allocator)
+	ran_dry(r, built) or_return
 	copy(v, r.msg[r.pos:r.pos + n])
 	r.pos += n
 	return
@@ -391,6 +432,7 @@ r_name :: proc(r: ^Reader, allocator: mem.Allocator) -> (name: string, err: Deco
 	next: int
 	name, next, err = decode_name(r.msg, r.pos, allocator)
 	if err != .None {
+		r.dry |= err == .Out_Of_Memory
 		return
 	}
 	if err = charge_name(r, len(name)); err != .None {
@@ -514,7 +556,8 @@ decode_sections :: proc(
 
 	if qdcount > 0 {
 		charge_bytes(&r, size_of(Question) * int(qdcount)) or_return
-		qs := make([]Question, int(qdcount), allocator)
+		qs, built := alloc_slice([]Question, int(qdcount), allocator)
+		ran_dry(&r, built) or_return
 		for i in 0 ..< int(qdcount) {
 			qs[i].name = r_name(&r, allocator) or_return
 			qs[i].type = Type(r_u16(&r) or_return)
@@ -538,7 +581,8 @@ decode_records :: proc(r: ^Reader, count: int, allocator: mem.Allocator) -> (out
 		return nil, .None
 	}
 	charge_bytes(r, size_of(Record) * count) or_return
-	recs := make([]Record, count, allocator)
+	recs, built := alloc_slice([]Record, count, allocator)
+	ran_dry(r, built) or_return
 	for i in 0 ..< count {
 		recs[i] = decode_record(r, allocator) or_return
 	}
@@ -687,7 +731,8 @@ decode_rdata :: proc(
 			}
 		}
 		charge_bytes(r, size_of(string) * count) or_return
-		parts := make([]string, count, allocator)
+		parts, built := alloc_slice([]string, count, allocator)
+		ran_dry(r, built) or_return
 		for i in 0 ..< count {
 			parts[i] = r_char_string(r, allocator) or_return
 		}
@@ -742,7 +787,8 @@ decode_rdata :: proc(
 			}
 		}
 		charge_bytes(r, size_of(EDNS_Option) * count) or_return
-		opts := make([]EDNS_Option, count, allocator)
+		opts, built := alloc_slice([]EDNS_Option, count, allocator)
+		ran_dry(r, built) or_return
 		for i in 0 ..< count {
 			opts[i].code = r_u16(r) or_return
 			olen := int(r_u16(r) or_return)

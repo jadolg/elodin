@@ -1,5 +1,6 @@
 package dns
 
+import "core:mem"
 import "core:strings"
 
 // Domain names are carried around in escaped presentation form, always fully
@@ -62,7 +63,11 @@ decode_name :: proc(msg: []u8, offset: int, allocator := context.allocator) -> (
 					buf[0] = '.'
 					blen = 1
 				}
-				return strings.clone(string(buf[:blen]), allocator), next, .None
+				cloned, cerr := strings.clone(string(buf[:blen]), allocator)
+				if cerr != nil || len(cloned) != blen {
+					return "", 0, .Out_Of_Memory
+				}
+				return cloned, next, .None
 			}
 			label_len := int(n)
 			if pos + 1 + label_len > len(msg) {
@@ -135,8 +140,8 @@ encode_name :: proc(name: string, out: []u8, label_offsets: ^[dynamic]int = nil)
 		if len(out) < 1 {
 			return 0, .Buffer_Too_Small
 		}
-		if label_offsets != nil {
-			append(label_offsets, 0)
+		if label_offsets != nil && append(label_offsets, 0) != 1 {
+			return 0, .Out_Of_Memory
 		}
 		out[0] = 0
 		return 1, .None
@@ -145,8 +150,10 @@ encode_name :: proc(name: string, out: []u8, label_offsets: ^[dynamic]int = nil)
 	i := 0
 	n = 0
 	for i < len(name) {
-		if label_offsets != nil {
-			append(label_offsets, n)
+		// A boundary missing from the list would quietly change what the
+		// writer compresses, so an append that did not land fails the name.
+		if label_offsets != nil && append(label_offsets, n) != 1 {
+			return 0, .Out_Of_Memory
 		}
 		if n >= len(out) {
 			return 0, .Buffer_Too_Small
@@ -214,8 +221,8 @@ encode_name :: proc(name: string, out: []u8, label_offsets: ^[dynamic]int = nil)
 		}
 	}
 
-	if label_offsets != nil {
-		append(label_offsets, n)
+	if label_offsets != nil && append(label_offsets, n) != 1 {
+		return 0, .Out_Of_Memory
 	}
 	if n >= len(out) {
 		return 0, .Buffer_Too_Small
@@ -229,16 +236,23 @@ encode_name :: proc(name: string, out: []u8, label_offsets: ^[dynamic]int = nil)
 }
 
 // Lowercase ASCII letters only, per DNS case-insensitivity rules.
-name_fold :: proc(name: string, allocator := context.allocator) -> string {
-	buf := make([]u8, len(name), allocator)
-	for i in 0 ..< len(name) {
-		c := name[i]
+name_fold :: proc(name: string, allocator := context.allocator) -> (folded: string, err: mem.Allocator_Error) #optional_allocator_error {
+	buf, built := alloc_slice([]u8, len(name), allocator)
+	if !built {
+		return "", .Out_Of_Memory
+	}
+	copy(buf, name)
+	fold_ascii(buf)
+	return string(buf), nil
+}
+
+@(private)
+fold_ascii :: proc "contextless" (b: []u8) {
+	for &c in b {
 		if c >= 'A' && c <= 'Z' {
 			c += 32
 		}
-		buf[i] = c
 	}
-	return string(buf)
 }
 
 name_equal_fold :: proc(a, b: string) -> bool {
@@ -324,15 +338,13 @@ name_trim_root :: proc(name: string) -> string {
 	return name
 }
 
-// Accepts "example.com" or "example.com." and returns the canonical form.
-name_canonical :: proc(name: string, allocator := context.allocator) -> string {
-	if name == "" || name == "." {
-		return strings.clone(".", allocator)
-	}
-	if name[len(name) - 1] == '.' {
-		return name_fold(name, allocator)
-	}
-	lowered := name_fold(name, allocator)
-	defer delete(lowered, allocator)
-	return strings.concatenate({lowered, "."}, allocator)
+// Accepts "example.com" or "example.com." and returns the canonical form, or
+// false where the allocator ran dry: an empty result would read as the root.
+name_canonical :: proc(name: string, allocator := context.allocator) -> (canonical: string, ok: bool) #optional_ok {
+	trimmed := name_trim_root(name)
+	buf := alloc_slice([]u8, len(trimmed) + 1, allocator) or_return
+	copy(buf, trimmed)
+	buf[len(trimmed)] = '.'
+	fold_ascii(buf)
+	return string(buf), true
 }

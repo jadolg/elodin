@@ -1,5 +1,7 @@
 package dns
 
+import "core:mem"
+
 find_opt :: proc(m: Message) -> (opt: Record, found: bool) {
 	for rec in m.additional {
 		if rec.type == .OPT {
@@ -76,8 +78,14 @@ refused for arriving with RD=0 still gets RA=1 back - the same way BIND and
 Unbound keep answering RA=1 to a query an ACL declines to recurse for. The
 capability is on offer; this request just did not use it.
 */
-make_response :: proc(query: Message, rcode: Rcode, allocator := context.allocator) -> Message {
-	resp: Message
+make_response :: proc(
+	query: Message,
+	rcode: Rcode,
+	allocator := context.allocator,
+) -> (
+	resp: Message,
+	err: mem.Allocator_Error,
+) #optional_allocator_error {
 	resp.id = query.id
 	resp.flags.qr = true
 	resp.flags.opcode = query.flags.opcode
@@ -88,11 +96,18 @@ make_response :: proc(query: Message, rcode: Rcode, allocator := context.allocat
 	resp.question = query.question
 
 	if _, found := find_opt(query); found {
-		add := make([]Record, 1, allocator)
+		// Without its OPT record the answer would state a different rcode
+		// (RFC 6891 section 6.1.3) and lose the client's EDNS, so a failed
+		// allocation is reported rather than the record left out.
+		add, built := alloc_slice([]Record, 1, allocator)
+		if !built {
+			resp.incomplete = true
+			return resp, .Out_Of_Memory
+		}
 		add[0] = make_opt(edns_udp_size(query), edns_do(query), u8(u16(rcode) >> 4))
 		resp.additional = add
 	}
-	return resp
+	return resp, nil
 }
 
 /*
@@ -136,7 +151,7 @@ truncated_response :: proc(query_bytes: []u8, allocator := context.allocator) ->
 		}
 	}
 
-	buf := make([]u8, end, allocator)
+	buf := alloc_slice([]u8, end, allocator) or_return
 	copy(buf, query_bytes[:end])
 	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
 	flags.qr = true
@@ -195,18 +210,42 @@ error_response :: proc(
 	*/
 	usable := len(query.question) > 0 || query.id != 0 || (u16(rcode) > 0xf && edns_present(query))
 	if usable {
+		/*
+		An allocator that ran dry - here or in `make_response` - still tries
+		the header below, which is twelve bytes where the encode wanted its
+		buffer, compression state and records: a nearly full arena can hold
+		one and not the other. Not for an extended rcode, whatever stopped the
+		encode, since the header alone would state it as a different one; that
+		is reported as no answer, which the caller already has to handle.
+		*/
 		resp := make_response(query, rcode, allocator)
 		bytes, _, err := encode_message(resp, allocator, max_size)
 		if err == .None {
 			return bytes, true
 		}
+		if u16(rcode) > 0xf {
+			return nil, false
+		}
 	}
 
-	if len(query_bytes) < HEADER_SIZE {
+	/*
+	A caller with the decoded query and not its bytes - an answer built for
+	itself, a chase - still gets the header, from the ID and flags it has: the
+	fields below are all this reads of the bytes, and the counts are cleared.
+	*/
+	header := query_bytes
+	from_msg: [HEADER_SIZE]u8
+	if len(header) < HEADER_SIZE && usable {
+		fv := transmute(u16)query.flags
+		from_msg[0], from_msg[1] = u8(query.id >> 8), u8(query.id)
+		from_msg[2], from_msg[3] = u8(fv >> 8), u8(fv)
+		header = from_msg[:]
+	}
+	if len(header) < HEADER_SIZE {
 		return nil, false
 	}
-	buf := make([]u8, HEADER_SIZE, allocator)
-	copy(buf, query_bytes[:HEADER_SIZE])
+	buf := alloc_slice([]u8, HEADER_SIZE, allocator) or_return
+	copy(buf, header[:HEADER_SIZE])
 	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
 	flags.qr = true
 	flags.ra = true
@@ -326,10 +365,7 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 	would read as a message with fewer TTLs, and the cache would store the
 	answer with the upstream's figures in it and nothing to count them down.
 	*/
-	out, alloc_err := make([dynamic]u16, 0, total, allocator)
-	if alloc_err != nil {
-		return nil, false
-	}
+	out := alloc_list([dynamic]u16, total, allocator) or_return
 	for _ in 0 ..< total {
 		next, name_ok := skip_name(msg, pos)
 		if !name_ok {
@@ -576,6 +612,10 @@ sits in the section does not decide whether the chain can be read.
 @(private)
 alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased, unreadable: bool) {
 	decoded, err := decode_through_answer(msg, context.temp_allocator)
+	// A chain this server had no memory to read goes nobody here knows where.
+	if reading_refused(err) {
+		return "", "", false, true
+	}
 	if err != .None || len(decoded.question) != 1 {
 		return
 	}
@@ -627,6 +667,10 @@ referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
 		type, next, _ := skip_record(msg, pos)
 		if type == .NS {
 			zone, _, nerr := decode_name(msg, pos, context.temp_allocator)
+			// Unread for want of memory is "cannot tell", as above.
+			if nerr == .Out_Of_Memory {
+				return true
+			}
 			if nerr == .None && name_at_or_below(target, zone) && !name_at_or_below(asked, zone) {
 				return true
 			}
@@ -694,8 +738,8 @@ write_ttl_at :: proc(msg: []u8, off: int, v: u32) {
 // Empty when the list cannot be allocated, which a caller tells from a message
 // with no TTLs by comparing it with `offsets`.
 read_ttls :: proc(msg: []u8, offsets: []u16, allocator := context.allocator) -> []u32 {
-	ttls, err := make([]u32, len(offsets), allocator)
-	if err != nil {
+	ttls, built := alloc_slice([]u32, len(offsets), allocator)
+	if !built {
 		return nil
 	}
 	for off, i in offsets {
@@ -931,8 +975,72 @@ copy_question_case :: proc(resp: []u8, query: []u8) {
 	copy(resp[HEADER_SIZE:r_end], query[HEADER_SIZE:q_end])
 }
 
+/*
+Whether two messages ask the same first question, read where they lie: the name
+label by label without regard to ASCII case (RFC 4343), then TYPE and CLASS.
+
+Allocates nothing, so a reader with no memory to spare still tells a reply to
+its own question from one that is not. A compression pointer in either name is
+no match: the first question follows the header, so a pointer there could only
+aim back into the header, which no well-formed message does - the same reading
+`truncated_response` takes.
+*/
+same_question :: proc(a, b: []u8) -> bool {
+	if len(a) < HEADER_SIZE || len(b) < HEADER_SIZE {
+		return false
+	}
+	if a[4] == 0 && a[5] == 0 || b[4] == 0 && b[5] == 0 {
+		return false
+	}
+	p := HEADER_SIZE
+	for {
+		if p >= len(a) || p >= len(b) {
+			return false
+		}
+		n := int(a[p])
+		if n != int(b[p]) || n & 0xc0 != 0 || p + 1 + n > len(a) || p + 1 + n > len(b) {
+			return false
+		}
+		if !name_equal_fold(string(a[p + 1:][:n]), string(b[p + 1:][:n])) {
+			return false
+		}
+		p += 1 + n
+		if n == 0 {
+			break
+		}
+	}
+	if p + 4 > len(a) || p + 4 > len(b) {
+		return false
+	}
+	return a[p] == b[p] && a[p + 1] == b[p + 1] && a[p + 2] == b[p + 2] && a[p + 3] == b[p + 3]
+}
+
 clone_message_bytes :: proc(src: []u8, allocator := context.allocator) -> []u8 {
 	dst := make([]u8, len(src), allocator)
 	copy(dst, src)
 	return dst
+}
+
+/*
+`n` elements from `allocator`, or false where it ran dry.
+
+Asked of the length as well as the error: an allocator that hands back nothing
+is not obliged to call it a failure (`mem.nil_allocator` does not), and a
+caller that indexes or patches what it asked for traps on the empty slice
+either way.
+*/
+alloc_slice :: proc($T: typeid/[]$E, n: int, allocator: mem.Allocator) -> (out: T, ok: bool) {
+	err: mem.Allocator_Error
+	out, err = make(T, n, allocator)
+	return out, err == nil && len(out) == n
+}
+
+/*
+An empty list with room for `n` from `allocator`, or false where it ran dry.
+Reserved whole, so no append within it can fail and drop an element.
+*/
+alloc_list :: proc($T: typeid/[dynamic]$E, n: int, allocator: mem.Allocator) -> (out: T, ok: bool) {
+	err: mem.Allocator_Error
+	out, err = make(T, 0, n, allocator)
+	return out, err == nil && cap(out) >= n
 }

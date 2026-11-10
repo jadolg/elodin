@@ -184,7 +184,10 @@ decode_raw_rdata :: proc(r: ^Reader, type: Type, start, end: int, allocator: mem
 	same bounded overshoot a name over the budget has, and for the same reason.
 	*/
 	_ = charge_bytes(r, end - start)
-	verbatim := make([]u8, end - start, allocator)
+	// An allocation that fails here is reported the same way, by
+	// `budget_spent` on the way out of `decode_record`.
+	verbatim, built := alloc_slice([]u8, end - start, allocator)
+	_ = ran_dry(r, built)
 	copy(verbatim, msg[start:end])
 	return Rdata_Raw{data = verbatim}
 }
@@ -252,6 +255,7 @@ expand_rdata_names :: proc(
 		// walked, so a name that overran the RDATA shows up as an end past it.
 		name, next, derr := decode_name(msg, pos, allocator)
 		if derr != .None {
+			r.dry |= derr == .Out_Of_Memory
 			return nil, false
 		}
 		defer delete(name, allocator)
@@ -303,7 +307,10 @@ expand_rdata_names :: proc(
 	if charge_bytes(r, total) != .None {
 		return nil, false
 	}
-	buf := make([]u8, total, allocator)
+	buf, built := alloc_slice([]u8, total, allocator)
+	if ran_dry(r, built) != .None {
+		return nil, false
+	}
 	copy(buf, msg[start:head])
 	at := head - start
 	for i in 0 ..< layout.names {

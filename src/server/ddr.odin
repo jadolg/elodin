@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:os"
-import "core:slice"
 import "core:strings"
 import "core:sync"
 import "elodin:config"
@@ -156,19 +155,40 @@ build_resolver_arpa_response :: proc(
 ) -> []u8 {
 	resp := dns.make_response(query, .No_Error, allocator)
 	if q.type == .SVCB && dns.name_equal_fold(q.name, DDR_QNAME) {
-		resp.answer = ddr_records(s, q.name, allocator)
+		// Nothing where the designation could not be built whole: a lost record
+		// would go out as a NODATA the client caches, and lost params as a
+		// designation it cannot use.
+		answer, built := ddr_records(s, q.name, allocator)
+		if !built {
+			return nil
+		}
+		resp.answer = answer
 	}
+	soa: [1]dns.Record
 	if len(resp.answer) == 0 {
-		resp.authority = synth_soa_for_zone(RESOLVER_ARPA, RESOLVER_ARPA_TTL, allocator)
+		soa[0] = synth_soa_for_zone(RESOLVER_ARPA, RESOLVER_ARPA_TTL)
+		resp.authority = soa[:]
 	} else {
 		// Behind the client's OPT record rather than over it, so the encoder keeps
 		// that record's room as the addresses fill the section.
-		resp.additional = slice.concatenate([][]dns.Record{resp.additional, ddr_addresses(live(s).cfg, allocator)}, allocator)
+		// Kept as it was where the allocator ran dry, so the client's OPT record
+		// stays: the addresses are the part RFC 9462 section 4 makes optional.
+		addresses := ddr_addresses(live(s).cfg, allocator)
+		if joined, built := dns.alloc_slice([]dns.Record, len(resp.additional) + len(addresses), allocator); built {
+			copy(joined, resp.additional)
+			copy(joined[len(resp.additional):], addresses)
+			resp.additional = joined
+		}
 	}
 
 	// Addresses that do not fit are dropped by the encoder without TC: they only
 	// save the client a lookup (RFC 9462 section 4).
 	out, _, err := dns.encode_message(resp, allocator, limit)
+	// Nor the empty NOERROR below where the allocator ran dry, which reads as
+	// no designation.
+	if err == .Out_Of_Memory {
+		return nil
+	}
 	if err != .None {
 		fallback, _ := dns.error_response(nil, query, .No_Error, allocator, limit)
 		return fallback
@@ -179,22 +199,28 @@ build_resolver_arpa_response :: proc(
 // One SVCB record per designated listener, in ServiceMode with priority 1:
 // neither transport is preferred over the other, and the client picks.
 @(private)
-ddr_records :: proc(s: ^Server, owner: string, allocator: mem.Allocator) -> []dns.Record {
+ddr_records :: proc(s: ^Server, owner: string, allocator: mem.Allocator) -> (records: []dns.Record, ok: bool) {
 	cfg := live(s).cfg
 	if cfg.ddr.name == "" {
-		return nil
+		return nil, true
 	}
-	records := make([dynamic]dns.Record, 0, 2, allocator)
-	if sync.atomic_load(&s.ddr.dot) {
-		params := svc_params(DOT_ALPN, cfg.listeners.dot.port, 853, "", allocator)
-		append(&records, ddr_record(owner, cfg.ddr.name, params))
+	dot, doh := sync.atomic_load(&s.ddr.dot), sync.atomic_load(&s.ddr.doh)
+	dot_params, doh_params: []u8
+	if dot {
+		dot_params = svc_params(DOT_ALPN, cfg.listeners.dot.port, 853, "", allocator) or_return
 	}
-	if sync.atomic_load(&s.ddr.doh) {
-		dohpath := strings.concatenate({cfg.listeners.doh.path, "{?dns}"}, allocator)
-		params := svc_params(DOH_ALPN, cfg.listeners.doh.port, 443, dohpath, allocator)
-		append(&records, ddr_record(owner, cfg.ddr.name, params))
+	if doh {
+		doh_params = svc_params(DOH_ALPN, cfg.listeners.doh.port, 443, cfg.listeners.doh.path, allocator) or_return
 	}
-	return records[:]
+	// Reserved whole, so neither append below can drop a record.
+	list := dns.alloc_list([dynamic]dns.Record, 2, allocator) or_return
+	if dot {
+		append(&list, ddr_record(owner, cfg.ddr.name, dot_params))
+	}
+	if doh {
+		append(&list, ddr_record(owner, cfg.ddr.name, doh_params))
+	}
+	return list[:], true
 }
 
 @(private)
@@ -209,9 +235,11 @@ ddr_record :: proc(owner, target: string, params: []u8) -> dns.Record {
 }
 
 // SvcParams in wire form, keys in increasing order (RFC 9460 section 2.2).
+// `doh_path` is the listener's path; the dohpath key carries it behind the
+// `{?dns}` template variable (RFC 9461 section 5).
 @(private)
-svc_params :: proc(alpn: []string, port, default_port: int, dohpath: string, allocator: mem.Allocator) -> []u8 {
-	b := make([dynamic]u8, 0, 64, allocator)
+svc_params :: proc(alpn: []string, port, default_port: int, doh_path: string, allocator: mem.Allocator) -> (params: []u8, ok: bool) {
+	DOH_TEMPLATE :: "{?dns}"
 	put_u16 :: proc(b: ^[dynamic]u8, v: u16) {
 		append(b, u8(v >> 8), u8(v))
 	}
@@ -220,6 +248,9 @@ svc_params :: proc(alpn: []string, port, default_port: int, dohpath: string, all
 	for p in alpn {
 		alpn_len += 1 + len(p)
 	}
+	// Reserved whole - each key's four-byte header and its value - so no
+	// append below can leave a key without its value.
+	b := dns.alloc_list([dynamic]u8, 4 + alpn_len + 6 + 4 + len(doh_path) + len(DOH_TEMPLATE), allocator) or_return
 	put_u16(&b, SVC_KEY_ALPN)
 	put_u16(&b, u16(alpn_len))
 	for p in alpn {
@@ -231,12 +262,13 @@ svc_params :: proc(alpn: []string, port, default_port: int, dohpath: string, all
 		put_u16(&b, 2)
 		put_u16(&b, u16(port))
 	}
-	if dohpath != "" {
+	if doh_path != "" {
 		put_u16(&b, SVC_KEY_DOHPATH)
-		put_u16(&b, u16(len(dohpath)))
-		append(&b, ..transmute([]u8)dohpath)
+		put_u16(&b, u16(len(doh_path) + len(DOH_TEMPLATE)))
+		append(&b, ..transmute([]u8)doh_path)
+		append(&b, DOH_TEMPLATE)
 	}
-	return b[:]
+	return b[:], true
 }
 
 /*

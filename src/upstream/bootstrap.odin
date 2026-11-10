@@ -73,7 +73,7 @@ bootstrap_resolve :: proc(
 
 	// Keyed by the canonical name, which is the name asked: `Hop.example` and
 	// `hop.example.` are one entry, not two of `BOOTSTRAP_MAX_ENTRIES`.
-	key := dns.name_canonical(hostname, context.temp_allocator)
+	key := dns.name_canonical(hostname, context.temp_allocator) or_return
 	sync.mutex_lock(&bootstrap_cache.mu)
 	if entry, found := bootstrap_cache.entries[key]; found {
 		if loop.moment_since(entry.expires) < 0 {
@@ -245,7 +245,7 @@ bootstrap_query :: proc(
 		endpoint.port = 53
 	}
 
-	name := dns.name_canonical(hostname, context.temp_allocator)
+	name := dns.name_canonical(hostname, context.temp_allocator) or_return
 	query := dns.Message {
 		// From the entropy source rather than from the clock: the low bits of a
 		// timestamp carry only as much unpredictability as the platform's clock
