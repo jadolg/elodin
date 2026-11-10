@@ -293,7 +293,9 @@ fail_nth_proc :: proc(
 A DDR answer keeps the client's OPT record whichever of its allocations is
 refused: the designated resolvers' addresses are the optional part (RFC 9462
 section 4), and an answer that went out without the record would lose the
-client's EDNS without a word.
+client's EDNS without a word. And its designation is whole or not sent: a lost
+record would be a NODATA the client caches, and a lost param a designation it
+cannot use.
 */
 @(test)
 test_a_ddr_answer_keeps_its_opt_record_whatever_runs_dry :: proc(t: ^testing.T) {
@@ -302,6 +304,7 @@ test_a_ddr_answer_keeps_its_opt_record_whatever_runs_dry :: proc(t: ^testing.T) 
 	// One designation, so the addresses are concatenated behind the OPT record.
 	cfg.ddr.name = "dns.example."
 	s.ddr.dot = true
+	s.ddr.doh = true
 	defer free_all(context.temp_allocator)
 	query := dns.Message {
 		id         = 0x620,
@@ -309,9 +312,15 @@ test_a_ddr_answer_keeps_its_opt_record_whatever_runs_dry :: proc(t: ^testing.T) 
 		additional = []dns.Record{dns.make_opt(1232, false)},
 	}
 	q := query.question[0]
+	want, want_err := dns.decode_message(build_resolver_arpa_response(&s, query, q, context.temp_allocator, 1232), context.temp_allocator)
+	if !testing.expect_value(t, want_err, dns.Decode_Error.None) || !testing.expect_value(t, len(want.answer), 2) {
+		return
+	}
 	built_once := false
-	for n := 1; ; n += 1 {
-		f := Fail_Nth{fail_at = n, fail_for = 1}
+	// Runs as well as single refusals: a reserve refused alone is made up by
+	// the next append's grow.
+	for run in ([]int{1, 2, 3}) do for n := 1; ; n += 1 {
+		f := Fail_Nth{fail_at = n, fail_for = run}
 		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
 		out := build_resolver_arpa_response(&s, query, q, one, 1232)
 		if f.seen < n {
@@ -328,6 +337,52 @@ test_a_ddr_answer_keeps_its_opt_record_whatever_runs_dry :: proc(t: ^testing.T) 
 		if !testing.expectf(t, dns.edns_present(read), "refusing allocation %d sent the answer without its OPT record", n) {
 			return
 		}
+		if !testing.expectf(t, len(read.answer) == len(want.answer), "refusing allocation %d sent %d of %d designations", n, len(read.answer), len(want.answer)) {
+			return
+		}
+		for rec, i in read.answer {
+			got, _ := rec.data.(dns.Rdata_SVCB)
+			full, _ := want.answer[i].data.(dns.Rdata_SVCB)
+			if !testing.expectf(t, string(got.params) == string(full.params), "refusing allocation %d cut designation %d's params", n, i) {
+				return
+			}
+		}
 	}
 	testing.expect(t, built_once, "no refusal left room for an answer, so the record went untested")
+}
+
+/*
+The loopback answer is the address or nothing: the header fallback with any of
+its allocations refused would be a NODATA for `localhost.`.
+*/
+@(test)
+test_a_loopback_answer_that_runs_dry_is_never_nodata :: proc(t: ^testing.T) {
+	query := dns.Message {
+		id         = 0x620,
+		question   = []dns.Question{{name = "localhost.", type = .A, class = .IN}},
+		additional = []dns.Record{dns.make_opt(1232, false)},
+	}
+	q := query.question[0]
+	defer free_all(context.temp_allocator)
+	built_once := false
+	for n := 1; ; n += 1 {
+		f := Fail_Nth{fail_at = n, fail_for = 1}
+		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
+		out := answer_special_use(query, q, LOCALHOST_ZONE, .Loopback, one, 1232)
+		if f.seen < n {
+			break
+		}
+		if len(out) == 0 {
+			continue
+		}
+		built_once = true
+		read, err := dns.decode_message(out, context.temp_allocator)
+		if !testing.expect_value(t, err, dns.Decode_Error.None) {
+			return
+		}
+		if !testing.expectf(t, len(read.answer) == 1, "refusing allocation %d answered localhost with %d records", n, len(read.answer)) {
+			return
+		}
+	}
+	testing.expect(t, built_once, "no refusal left room for an answer")
 }

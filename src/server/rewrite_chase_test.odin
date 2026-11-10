@@ -436,6 +436,40 @@ test_a_rewrite_that_runs_dry_stays_matched :: proc(t: ^testing.T) {
 }
 
 /*
+A rewrite that built nothing is counted failed, as `shape_forwarded` counts a
+query it could not build, and not as a rewrite answered.
+*/
+@(test)
+test_a_rewrite_that_built_nothing_is_counted_failed :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.rewrites = chase_rules()
+	s := Server {
+		cfg = &cfg,
+	}
+	questions := []dns.Question{{name = "old.lan.", type = .A, class = .IN}}
+	msg := dns.Message{id = 0x3204, question = questions}
+	msg.flags.rd = true
+	spent: int
+	st := Query_State {
+		s         = &s,
+		msg       = msg,
+		q         = questions[0],
+		proto     = .UDP,
+		client    = "127.0.0.1:5555",
+		limit     = 512,
+		started   = time.tick_now(),
+		spent     = &spent,
+		allocator = mem.nil_allocator(),
+	}
+	testing.expect(t, answer_locally(&st), "the rewrite was handed on")
+	testing.expect(t, !st.ok, "an answer was reported built with no memory to build it")
+	testing.expect_value(t, s.stats.rewritten, 0)
+	testing.expect_value(t, s.stats.failed, 1)
+}
+
+/*
 The reverse of a rewrite stays matched where its allocations run dry, as the
 rewrite does: falling through would answer the address out of the special-use
 table, which says it has no PTR.

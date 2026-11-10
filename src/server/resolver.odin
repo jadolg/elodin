@@ -1357,8 +1357,9 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 				st.pool,
 			)
 		}
+		// Nothing built is a failure, as `shape_forwarded` counts one.
 		if !counted {
-			count_answer(&st.s.stats.rewritten)
+			count_answer(&st.s.stats.rewritten if len(out) > 0 else &st.s.stats.failed)
 		}
 		log_query(st.s, st.client, st.proto, st.q, .Rewritten, "rewrite", st.started)
 		return answered(st, out, .Rewritten, len(out) > 0)
@@ -1380,7 +1381,7 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 	that this server answered it out of a forward rule rather than forwarding it.
 	*/
 	if out, matched := apply_reverse_rewrite(st.s, st.msg, st.q, st.allocator, st.limit); matched {
-		count_answer(&st.s.stats.rewritten)
+		count_answer(&st.s.stats.rewritten if len(out) > 0 else &st.s.stats.failed)
 		log_query(st.s, st.client, st.proto, st.q, .Rewritten, "rewrite-ptr", st.started)
 		return answered(st, out, .Rewritten, len(out) > 0)
 	}
@@ -4746,27 +4747,19 @@ answer_chaos :: proc(
 		return nil, false
 	}
 
-	strs, strs_built := dns.alloc_slice([]string, 1, allocator)
-	answers, answers_built := dns.alloc_slice([]dns.Record, 1, allocator)
-	// Handled with nothing built: the name is ours, and falling through would
-	// answer it REFUSED, which says something untrue about it.
-	if !strs_built || !answers_built {
-		return nil, true
-	}
-	strs[0] = text
-	answers[0] = dns.Record {
-		name = q.name,
-		type = .TXT,
-		class = .CH,
-		ttl = 0,
-		data = dns.Rdata_TXT{strings = strs},
-	}
+	// On the stack, as in `answer_special_use`: the encode below is their only
+	// reader.
+	strs := [1]string{text}
+	answers := [1]dns.Record{{name = q.name, type = .TXT, class = .CH, ttl = 0, data = dns.Rdata_TXT{strings = strs[:]}}}
 
 	resp := dns.make_response(query, .No_Error, allocator)
-	resp.answer = answers
+	resp.answer = answers[:]
 	out, _, err := dns.encode_message(resp, allocator, limit)
 	if err != .None {
-		return nil, true
+		// Still handled where the allocator ran dry: the name is ours, and
+		// falling through would answer it REFUSED, which says something untrue
+		// about it.
+		return nil, err == .Out_Of_Memory
 	}
 	return out, true
 }

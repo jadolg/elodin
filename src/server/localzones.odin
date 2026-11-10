@@ -718,6 +718,12 @@ answer_special_use :: proc(
 	}
 
 	out, _, err := dns.encode_message(resp, allocator, limit)
+	// Not the header fallback where the allocator ran dry: it would turn the
+	// loopback address into a NODATA, and a denial into one without the SOA it
+	// is cached by (RFC 2308 section 3).
+	if err == .Out_Of_Memory {
+		return nil
+	}
 	if err != .None {
 		fallback, _ := dns.error_response(nil, query, rcode, allocator, limit)
 		return fallback

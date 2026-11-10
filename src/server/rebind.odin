@@ -442,9 +442,10 @@ rebind_nodata :: proc(
 	if enc_err != .None {
 		/*
 		Whatever happens, not the upstream's bytes. An answer that could not be
-		encoded is a header this server can always build, and a client that gets
-		an empty NOERROR has lost a name; a client that gets the answer this
-		procedure just decided to withhold has lost rather more than that.
+		encoded falls back to the header alone, or to no answer where the
+		allocator ran dry: a client that gets an empty NOERROR, or nothing, has
+		lost a name; a client that gets the answer this procedure just decided
+		to withhold has lost rather more than that.
 		*/
 		fallback, _ := dns.error_response(nil, query, .No_Error, allocator, limit)
 		return fallback
