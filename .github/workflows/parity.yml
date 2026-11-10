@@ -29,6 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       # Pinned to a commit rather than to `v4`, which the other workflows here
@@ -56,6 +59,10 @@ jobs:
             --parity-runs "${{ inputs.runs || '20000' }}" \
             --parity-seed "${{ inputs.seed || '0' }}" \
             -v
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
 
   live:
     name: Parity (${{ matrix.resolver }})
@@ -100,6 +107,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       # Pinned to a commit rather than to `v4`, which the other workflows here
@@ -142,3 +152,8 @@ jobs:
             --parity-runs 2000 \
             --parity-seed "${{ inputs.seed || '0' }}" \
             -v
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
+          name: live-${{ strategy.job-index }}

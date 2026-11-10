@@ -24,6 +24,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - uses: jdx/mise-action@v5
@@ -90,6 +93,11 @@ jobs:
             elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}.tar.gz \
             dist/elodin_*_${{ matrix.arch }}.deb \
             --clobber
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
+          name: release
 
   publish-deb:
     name: Publish deb to repository

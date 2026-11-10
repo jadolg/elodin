@@ -11,6 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - uses: jdx/mise-action@v5
@@ -18,6 +21,10 @@ jobs:
           install: true
           cache: true
       - run: mise run check
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
 
   test:
     name: Tests (${{ matrix.arch }})
@@ -35,6 +42,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       # strace: the log.file case counts the server's syncs with it.
       - name: Install OpenSSL headers and strace
         run: sudo apt-get update && sudo apt-get install -y libssl-dev strace
@@ -42,49 +52,25 @@ jobs:
         with:
           install: true
           cache: true
-      # A process that dies of a signal while the tests or the itest build or
-      # run (the compiler on arm64 in #626, a test runner's main thread, a
-      # server) leaves a core: the runner's core_pattern hands cores to
-      # apport, which keeps none, and ulimit -c lasts only a step's shell. %E
-      # names the core after the executable's path, '!' for '/'. The Odin test
-      # runner catches a test thread's SIGSEGV/SIGILL/SIGFPE/SIGTRAP and fails
-      # the test, no core; a thread a test starts returns from that handler
-      # into the fault and spins, so the steps' timeouts (about 9x a green run)
-      # end it instead of the job's six hours.
-      - name: Write core dumps to a file
-        run: |
-          mkdir -p "$RUNNER_TEMP/cores"
-          sudo sysctl -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%E.%p"
-      - run: ulimit -c unlimited && mise run test
+      # A thread a unit test starts that segfaults spins forever: the Odin
+      # test runner's handler returns into the fault on any thread that isn't
+      # the test's. A minute before the timeout (7-9x a green run) the
+      # watchdog sends the test binaries SIGABRT, which the runner leaves
+      # alone, so the hang ends as a core with the spinning thread in it.
+      - run: |
+          ( sleep 840; pkill -ABRT '^test_' ) >/dev/null 2>&1 &
+          trap 'kill $!' EXIT
+          mise run test
         timeout-minutes: 15
       # Room for the itest's burst of 500 at a mock upstream (#568); the
       # runner's default caps a socket's receive buffer at 208 KiB.
       - run: sudo sysctl -w net.core.rmem_max=4194304
-      - run: ulimit -c unlimited && mise run itest
+      - run: mise run itest
         timeout-minutes: 30
-      - name: Backtrace the core dumps
-        if: failure()
-        run: |
-          shopt -s nullglob
-          cores=("$RUNNER_TEMP"/cores/core.*)
-          [ ${#cores[@]} -gt 0 ] || { echo "no core dumps"; exit 0; }
-          sudo apt-get install -y -qq gdb
-          for c in "${cores[@]}"; do
-            exe=${c##*/core.}
-            exe=${exe%.*}
-            exe=${exe//!//}
-            echo "::group::$c ($exe)"
-            gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' "$exe" "$c" || true
-            echo "::endgroup::"
-          done
-      - name: Keep the core dumps
-        if: failure()
-        uses: actions/upload-artifact@v7
+      - if: failure()
+        uses: ./.github/actions/core-dumps
         with:
-          name: cores-${{ matrix.arch }}
-          path: ${{ runner.temp }}/cores
-          retention-days: 14
-          if-no-files-found: ignore
+          mode: report
 
   leakcheck:
     name: Memory (AddressSanitizer)
@@ -104,6 +90,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       # strace: the log.file case runs its server traced, with the leak check off.
       - name: Install OpenSSL headers and strace
         run: sudo apt-get update && sudo apt-get install -y libssl-dev strace
@@ -113,6 +102,10 @@ jobs:
           cache: true
       - run: sudo sysctl -w net.core.rmem_max=4194304
       - run: mise run leakcheck
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
 
   fuzz-regression:
     name: Fuzz corpus regression
@@ -122,6 +115,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - uses: jdx/mise-action@v5
@@ -129,6 +125,10 @@ jobs:
           install: true
           cache: true
       - run: mise run fuzz-regression
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
 
   parity-regression:
     name: Parity seed regression
@@ -138,6 +138,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - uses: jdx/mise-action@v5
@@ -145,6 +148,10 @@ jobs:
           install: true
           cache: true
       - run: mise run parity-regression
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
 
   load:
     name: Load (${{ matrix.arch }})
@@ -163,6 +170,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - name: Install OpenSSL headers and jq
         run: sudo apt-get update && sudo apt-get install -y libssl-dev jq
       - uses: jdx/mise-action@v5
@@ -178,6 +188,10 @@ jobs:
         with:
           name: load-smoke-${{ matrix.arch }}
           path: ${{ runner.temp }}/load-smoke
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
 
   build:
     name: Build (${{ matrix.arch }})
@@ -192,6 +206,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - uses: jdx/mise-action@v5
@@ -199,6 +216,10 @@ jobs:
           install: true
           cache: true
       - run: mise run build
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
 
   package:
     name: Package (${{ matrix.arch }})
@@ -218,6 +239,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - name: Install OpenSSL headers and a DNS client
         run: sudo apt-get update && sudo apt-get install -y libssl-dev dnsutils
       - uses: jdx/mise-action@v5
@@ -322,3 +346,7 @@ jobs:
           } > /tmp/resolv-after
           diff /tmp/resolv-before /tmp/resolv-after
           getent hosts example.com
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report

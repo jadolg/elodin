@@ -1,0 +1,49 @@
+name: Core dumps
+description: >
+  Keep the core of anything that crashes in the job (the Odin compiler on
+  arm64 in #626, a test runner, a server), then backtrace and upload them.
+  Use once with mode setup before the first build, and once with mode report
+  and `if: failure()` as the job's last step.
+inputs:
+  mode:
+    description: setup or report
+    required: true
+  name:
+    description: report only, the artifact is cores-<name>-<arch>-<attempt>; defaults to the job's id
+    default: ''
+runs:
+  using: composite
+  steps:
+    # The runner's core_pattern hands cores to apport, which keeps none, and
+    # the core limit is 0. Every step's shell is a child of Runner.Worker, this
+    # step's parent, so lifting the limit there covers the job's later steps.
+    # %E names the core after the executable's path, '!' for '/'.
+    - if: inputs.mode == 'setup'
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/cores"
+        sudo sysctl -q -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%E.%p"
+        sudo prlimit --pid "$PPID" --core=unlimited:unlimited
+        echo "$(ps -o comm= -p "$PPID"): $(prlimit --pid "$PPID" --core --noheadings)"
+    - if: inputs.mode == 'report'
+      shell: bash
+      run: |
+        shopt -s nullglob
+        cores=("$RUNNER_TEMP"/cores/core.*)
+        [ ${#cores[@]} -gt 0 ] || { echo "no core dumps"; exit 0; }
+        sudo apt-get install -y -qq gdb
+        for c in "${cores[@]}"; do
+          exe=${c##*/core.}
+          exe=${exe%.*}
+          exe=${exe//!//}
+          echo "::group::$c ($exe)"
+          timeout 5m gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' "$exe" "$c" || true
+          echo "::endgroup::"
+        done
+    - if: inputs.mode == 'report'
+      uses: actions/upload-artifact@v7
+      with:
+        name: cores-${{ inputs.name || github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/cores
+        retention-days: 14
+        if-no-files-found: ignore

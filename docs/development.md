@@ -334,12 +334,15 @@ by hand: `curl --http2 -k -H 'content-type: application/dns-message'
 `main`:
 
 - once: `mise run check`, `fuzz-regression`, `parity-regression`, `leakcheck`
-- on both architectures: `mise run test` and `itest` (a process that crashes
-  while they build or run, such as the compiler, leaves a backtrace in the job
-  log and the core in a `cores-<arch>` artifact; a test thread's segfault is
-  caught by the Odin test runner and fails that test instead, and a crash in a
-  thread a test starts spins until the step's timeout, with no core),
-  `build`, and `mise run deb`,
+- on both architectures: `mise run test`, `itest`, `build`, and `mise run deb`,
   whose package is installed on the runner, made to resolve a handful of names
   through the resolver takeover it performs, then removed, checking the runner
   gets its own resolver back
+
+A process that crashes in any job that builds Odin code, the compiler
+included, leaves a gdb backtrace in the job's log and its core in a
+`cores-<job>-<arch>-<attempt>` artifact, kept 14 days
+(`.github/actions/core-dumps`). A test thread's own segfault is caught by the
+Odin test runner and fails that test instead. A crash in a thread a test
+starts spins in the runner's handler; a minute before the `test` step's
+15-minute timeout the test binaries get SIGABRT, which leaves that core.
