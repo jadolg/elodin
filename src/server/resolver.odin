@@ -2571,11 +2571,13 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 			*/
 			shed := result.shed && result.status == .Indeterminate
 			/*
-			Everything but our own shedding is counted as `bogus`.
+			Everything but what this server gave up on for itself is counted as
+			`bogus`: its own shedding, and a reading it refused for its memory or
+			the request's decode budget (`counts_as_bogus`).
 
 			The counter's two readings have always been folded together here -
 			see the note in `validate_rrset` - on the argument that the ones
-			folded in are upstream failures, which nobody chooses. This one is
+			folded in are upstream failures, which nobody chooses. Shedding is
 			chosen: a flood decides how often it happens, so leaving it in would
 			let an attacker drive a series operators read as "somebody is forging
 			answers" at whatever rate they like. `failed` still moves, because
@@ -2618,7 +2620,7 @@ counts_as_bogus :: proc(result: dnssec.Result) -> bool {
 	if result.status != .Indeterminate {
 		return true
 	}
-	return !result.shed && result.reason != dnssec.READING_OVER_BUDGET
+	return !result.shed && !reading_refused_verdict(result)
 }
 
 /*
@@ -2963,7 +2965,7 @@ finish_answer :: proc(st: ^Query_State) {
 					st.flight.stored = .Cloak
 				}
 			}
-			answered(st, out, cloak_outcome(verdict), true)
+			answered(st, out, cloak_outcome(verdict), len(out) > 0)
 			return
 		}
 	}
@@ -3907,7 +3909,7 @@ serve_from_cache :: proc(
 					cache.forget(live(st.s).answers, hit.key, hit.serial)
 				}
 				cache.note_withheld(live(st.s).answers)
-				return out, cloak_outcome(verdict), true
+				return out, cloak_outcome(verdict), len(out) > 0
 			}
 			// Inside the decode, not after it. An entry nothing could read has
 			// not been looked at, and stamping it here would say it had - which

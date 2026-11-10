@@ -239,14 +239,12 @@ test_encode_with_no_memory_reports_it :: proc(t: ^testing.T) {
 
 @(test)
 test_encode_at_every_budget :: proc(t: ^testing.T) {
-	@(static) want: []u8
 	w, _, err := encode_message(oom_message(), context.allocator)
 	if !testing.expect_value(t, err, Encode_Error.None) {
 		return
 	}
 	defer delete(w)
-	want = w
-	oom_sweep(t, "encode", want, proc(a: mem.Allocator) -> ([]u8, bool) {
+	oom_sweep(t, "encode", w, proc(a: mem.Allocator) -> ([]u8, bool) {
 		out, _, err := encode_message(oom_message(), a)
 		if err != .None {
 			assert(err == .Out_Of_Memory, "an encode that ran dry reported something else")
@@ -254,14 +252,12 @@ test_encode_at_every_budget :: proc(t: ^testing.T) {
 		}
 		return out, true
 	})
-	@(static) glued: []u8
 	g, _, gerr := encode_message(oom_message_with_glue(), context.allocator)
 	if !testing.expect_value(t, gerr, Encode_Error.None) {
 		return
 	}
 	defer delete(g)
-	glued = g
-	oom_sweep(t, "encode glue", glued, proc(a: mem.Allocator) -> ([]u8, bool) {
+	oom_sweep(t, "encode glue", g, proc(a: mem.Allocator) -> ([]u8, bool) {
 		out, _, err := encode_message(oom_message_with_glue(), a)
 		if err != .None {
 			assert(err == .Out_Of_Memory, "an encode that ran dry reported something else")
@@ -271,14 +267,12 @@ test_encode_at_every_budget :: proc(t: ^testing.T) {
 	})
 
 	// Cut short, the walk back and the re-added OPT record write after a resize.
-	@(static) cut: []u8
 	c, _, cerr := encode_message(oom_message(), context.allocator, max_size = 100)
 	if !testing.expect_value(t, cerr, Encode_Error.None) {
 		return
 	}
 	defer delete(c)
-	cut = c
-	oom_sweep(t, "encode truncated", cut, proc(a: mem.Allocator) -> ([]u8, bool) {
+	oom_sweep(t, "encode truncated", c, proc(a: mem.Allocator) -> ([]u8, bool) {
 		out, _, err := encode_message(oom_message(), a, max_size = 100)
 		if err != .None {
 			assert(err == .Out_Of_Memory, "a truncating encode that ran dry reported something else")

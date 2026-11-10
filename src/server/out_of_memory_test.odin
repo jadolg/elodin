@@ -585,3 +585,11 @@ test_a_reading_this_server_refused_is_not_counted_bogus :: proc(t: ^testing.T) {
 	testing.expect(t, !counts_as_bogus(dnssec.Result{status = .Indeterminate, shed = true}))
 	testing.expect(t, !counts_as_bogus(dnssec.Result{status = .Indeterminate, reason = dnssec.READING_OVER_BUDGET}))
 }
+
+// The verdict whose log line leaves the upstream out.
+@(test)
+test_a_refused_reading_is_told_apart_from_a_failed_validation :: proc(t: ^testing.T) {
+	testing.expect(t, reading_refused_verdict(dnssec.Result{status = .Indeterminate, reason = dnssec.READING_OVER_BUDGET}))
+	testing.expect(t, !reading_refused_verdict(dnssec.Result{status = .Indeterminate, reason = "chain of trust unavailable"}))
+	testing.expect(t, !reading_refused_verdict(dnssec.Result{status = .Bogus, reason = dnssec.READING_OVER_BUDGET}))
+}

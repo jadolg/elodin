@@ -766,6 +766,22 @@ report_bogus :: proc(q: dns.Question, client: string, result: dnssec.Result, fro
 		return
 	}
 	gate := zone_gate(&bogus_reported if result.status == .Bogus else &indeterminate_reported, q, result)
+	/*
+	A reading this server refused on its own account - its memory, or the
+	request's decode budget - is about this server, as a shed is: the line
+	says so and leaves the upstream out, which answered and is not at fault.
+	*/
+	if reading_refused_verdict(result) {
+		logx.gated_warnf_from(
+			gate,
+			client,
+			"dnssec: %s %s was not validated: %s, so this server stopped reading the chain of trust; not the upstream's doing",
+			dns.type_name(q.type),
+			dns.name_trim_root(q.name),
+			result.reason,
+		)
+		return
+	}
 	// The detail as arguments rather than formatted in here, so a refusal the
 	// gate sends to a disabled `debug` formats nothing.
 	logx.gated_warnf_from(
@@ -780,6 +796,13 @@ report_bogus :: proc(q: dns.Question, client: string, result: dnssec.Result, fro
 		result.detail,
 		from,
 	)
+}
+
+// Whether a verdict says only that this server would not read the chain: the
+// request's decode budget or its memory, which `dnssec` reports as one reason.
+@(private)
+reading_refused_verdict :: proc(result: dnssec.Result) -> bool {
+	return result.status == .Indeterminate && result.reason == dnssec.READING_OVER_BUDGET
 }
 
 /*
