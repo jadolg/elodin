@@ -66,8 +66,9 @@ Error :: enum u8 {
 	Backlogged,
 	/*
 	This server could not allocate what the exchange needed - the request's
-	arena could not grow (issue #620) - so nothing was sent. A statement about
-	this server, not the upstream, and not charged towards its cooldown.
+	arena could not grow (issue #620): the query was not sent, or its reply could
+	not be copied out. A statement about this server, not the upstream, and not
+	charged towards its cooldown.
 	*/
 	Out_Of_Memory,
 }
@@ -883,17 +884,16 @@ response_matches :: proc(query, response: []u8) -> bool {
 	}
 
 	// A query with no question (a bare NOTIFY, say) has nothing to compare.
-	// Read from QDCOUNT rather than from a failed peek, which is also what an
-	// allocator that ran dry reports, and must not wave every reply through.
 	if query[4] == 0 && query[5] == 0 {
 		return true
 	}
-	qq, qok := dns.peek_question(query, context.temp_allocator)
-	rq, rok := dns.peek_question(response, context.temp_allocator)
-	if !qok || !rok {
-		return false
-	}
-	return qq.type == rq.type && qq.class == rq.class && dns.name_equal_fold(qq.name, rq.name)
+	/*
+	Compared in place rather than decoded: a decode needs memory, and a reader
+	that had none would have to either wave every reply carrying the right ID
+	through, or refuse a genuine one as `Bad_Response` and charge the upstream
+	for this server's memory.
+	*/
+	return dns.same_question(query, response)
 }
 
 @(private)

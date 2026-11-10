@@ -228,11 +228,24 @@ error_response :: proc(
 		}
 	}
 
-	if len(query_bytes) < HEADER_SIZE {
+	/*
+	A caller with the decoded query and not its bytes - an answer built for
+	itself, a chase - still gets the header, from the ID and flags it has: the
+	fields below are all this reads of the bytes, and the counts are cleared.
+	*/
+	header := query_bytes
+	from_msg: [HEADER_SIZE]u8
+	if len(header) < HEADER_SIZE && usable {
+		fv := transmute(u16)query.flags
+		from_msg[0], from_msg[1] = u8(query.id >> 8), u8(query.id)
+		from_msg[2], from_msg[3] = u8(fv >> 8), u8(fv)
+		header = from_msg[:]
+	}
+	if len(header) < HEADER_SIZE {
 		return nil, false
 	}
 	buf := alloc_slice([]u8, HEADER_SIZE, allocator) or_return
-	copy(buf, query_bytes[:HEADER_SIZE])
+	copy(buf, header[:HEADER_SIZE])
 	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
 	flags.qr = true
 	flags.ra = true
@@ -960,6 +973,51 @@ copy_question_case :: proc(resp: []u8, query: []u8) {
 		return
 	}
 	copy(resp[HEADER_SIZE:r_end], query[HEADER_SIZE:q_end])
+}
+
+/*
+Whether two messages ask the same first question, read where they lie: the name
+label by label without regard to ASCII case (RFC 4343), then TYPE and CLASS.
+
+Allocates nothing, so a reader with no memory to spare still tells a reply to
+its own question from one that is not. A compression pointer in either name is
+no match: the first question follows the header, so a pointer there could only
+aim back into the header, which no well-formed message does - the same reading
+`truncated_response` takes.
+*/
+same_question :: proc "contextless" (a, b: []u8) -> bool {
+	if len(a) < HEADER_SIZE || len(b) < HEADER_SIZE {
+		return false
+	}
+	if a[4] == 0 && a[5] == 0 || b[4] == 0 && b[5] == 0 {
+		return false
+	}
+	p := HEADER_SIZE
+	for {
+		if p >= len(a) || p >= len(b) {
+			return false
+		}
+		n := int(a[p])
+		if n != int(b[p]) || n & 0xc0 != 0 || p + 1 + n > len(a) || p + 1 + n > len(b) {
+			return false
+		}
+		for i in p + 1 ..< p + 1 + n {
+			x, y := a[i], b[i]
+			x = x + 32 if x >= 'A' && x <= 'Z' else x
+			y = y + 32 if y >= 'A' && y <= 'Z' else y
+			if x != y {
+				return false
+			}
+		}
+		p += 1 + n
+		if n == 0 {
+			break
+		}
+	}
+	if p + 4 > len(a) || p + 4 > len(b) {
+		return false
+	}
+	return a[p] == b[p] && a[p + 1] == b[p + 1] && a[p + 2] == b[p + 2] && a[p + 3] == b[p + 3]
 }
 
 clone_message_bytes :: proc(src: []u8, allocator := context.allocator) -> []u8 {

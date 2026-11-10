@@ -60,6 +60,16 @@ test_a_reply_read_without_memory_is_not_matched :: proc(t: ^testing.T) {
 	context.temp_allocator = temp
 
 	testing.expect(t, !matched, "a reply for another name was matched once the question could not be read")
+
+	// Nor is a genuine one refused for it, which would charge the upstream as a
+	// `Bad_Response` for this server's memory.
+	ours, _, oerr := dns.encode_message(dns.Message{id = 0x1234, flags = {qr = true}, question = asked[:]})
+	defer delete(ours)
+	testing.expect_value(t, oerr, dns.Encode_Error.None)
+	context.temp_allocator = mem.nil_allocator()
+	genuine := response_matches(query, ours)
+	context.temp_allocator = temp
+	testing.expect(t, genuine, "the upstream's own reply was refused for want of memory")
 }
 
 // Nor is a reply this server has no memory to copy taken for an empty answer.

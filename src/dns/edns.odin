@@ -872,8 +872,8 @@ Never written in place, for `remove_opt`'s reason: the bytes handed in may be a
 cache entry other clients are still being served from, and an option's absence
 is this client's answer alone.
 
-Fails only where a message whose OPT record is not the last one cannot be
-decoded and encoded again.
+Fails only where the allocator runs dry, or where a message whose OPT record is
+not the last one cannot be decoded and encoded again.
 */
 strip_edns_options :: proc(
 	msg: []u8,
@@ -974,9 +974,10 @@ rebuild_without_edns_options :: proc(msg: []u8, allocator: mem.Allocator, spent:
 	`MAX_MESSAGE`, so a large answer that grew past it would come back with
 	records dropped and TC set, and the caller's own refit would find it inside
 	the limit and do nothing - leaving a client told to ask again over the TCP it
-	is already using. Handing back the bytes as they arrived is the better of the
-	two: the caller keeps an answer that is whole and still carries the options,
-	which is a leak, where the other is a name that will not resolve.
+	is already using. A failure is the better of the two: the caller answers it
+	SERVFAIL (`server.normalise_client_opt`) rather than forward the upstream's
+	options (RFC 6891 section 6.1.1), and a client reads SERVFAIL as the failure
+	it is, where TC on a stream sends it back round the same connection.
 	*/
 	encoded, truncated, eerr := encode_message(m, scratch, MAX_MESSAGE)
 	if eerr != .None || truncated {

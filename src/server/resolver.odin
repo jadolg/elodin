@@ -682,10 +682,11 @@ Which direction overflows decides what is given up for it:
     with its room kept behind it - the trade `encode_message` argues for every
     other truncation.
 
-A failed mint or strip keeps the answer rather than withholding it - the OPT
-mismatch is worth correcting, and not worth costing a client its answer. Both
-still go through `fit_response`, so the one procedure that holds the ceiling is
-reached whichever step failed.
+A failed mint keeps the answer rather than withholding it - the OPT mismatch is
+worth correcting, and not worth costing a client its answer. A failed strip does
+not: the answer would carry the upstream's options, so it is SERVFAIL instead
+(see `normalise_client_opt`). Both still go through `fit_response`, so the one
+procedure that holds the ceiling is reached whichever step failed.
 
 The record that does go back is then made this server's own, which is the rest
 of the sentence in RFC 6891 section 6.1.1: presence is what a client reads first,
@@ -929,8 +930,9 @@ normalise_client_opt :: proc(
 		An answer whose upstream options could not be taken out does not go
 		out with them: that is the upstream's OPT record forwarded, which RFC
 		6891 section 6.1.1 says MUST NOT happen. The strip fails only where the
-		message cannot be rebuilt - out of memory, or the request's decode
-		budget - so SERVFAIL, or nothing where even that cannot be built.
+		message cannot be rebuilt - out of memory, the request's decode budget,
+		or a re-encode that outgrows `dns.MAX_MESSAGE` - so SERVFAIL, or nothing
+		where even that cannot be built.
 		*/
 		stripped, ok := dns.strip_edns_options(wire, allocator, spent)
 		if !ok {

@@ -431,6 +431,17 @@ test_an_extended_rcode_is_not_answered_with_the_header_alone :: proc(t: ^testing
 	mem.arena_init(&f.arena, backing)
 	out, fail_built := error_response(query, q, .Serv_Fail, first)
 	testing.expect(t, fail_built && len(out) == HEADER_SIZE, "a SERVFAIL that fits in the header was not sent")
+
+	// And from the decoded query alone, for a caller that has no bytes.
+	f = Fail_Nth{fail_at = 1, fail_for = 1}
+	mem.arena_init(&f.arena, backing)
+	bare, bare_built := error_response(nil, q, .Serv_Fail, first)
+	if testing.expect(t, bare_built && len(bare) == HEADER_SIZE, "a caller with no query bytes got no SERVFAIL") {
+		id, _ := peek_id(bare)
+		testing.expect_value(t, id, 0x4321)
+		testing.expect_value(t, peek_rcode(bare), Rcode.Serv_Fail)
+		testing.expect(t, bare[2] & 0x80 != 0, "the header built for it is not a response")
+	}
 }
 
 @(test)
@@ -525,4 +536,36 @@ test_edns_rewrites_at_every_budget :: proc(t: ^testing.T) {
 		delete(want)
 		free_all(context.temp_allocator)
 	}
+}
+
+// The in-place question compare `upstream.response_matches` reads replies with.
+@(test)
+test_same_question_reads_in_place :: proc(t: ^testing.T) {
+	ask :: proc(name: string, type: Type) -> []u8 {
+		q := [1]Question{{name = name, type = type, class = .IN}}
+		out, _, err := encode_message(Message{id = 1, question = q[:]}, context.temp_allocator)
+		assert(err == .None)
+		return out
+	}
+	defer free_all(context.temp_allocator)
+	a := ask("Example.COM.", .A)
+	testing.expect(t, same_question(a, ask("example.com.", .A)), "ASCII case decided a match")
+	testing.expect(t, !same_question(a, ask("example.com.", .AAAA)), "a different type matched")
+	testing.expect(t, !same_question(a, ask("example.org.", .A)), "a different name matched")
+	testing.expect(t, !same_question(a, ask("www.example.com.", .A)), "a longer name matched")
+	testing.expect(t, !same_question(a, a[:len(a) - 2]), "a question cut short matched")
+
+	// The question's bytes still there, but QDCOUNT says there is none.
+	none := make([]u8, len(a), context.temp_allocator)
+	copy(none, a)
+	none[5] = 0
+	testing.expect(t, !same_question(a, none), "a message with no question matched one with")
+
+	// A pointer where a name should start can only aim into the header, and
+	// is no match even against itself - here with as many bytes behind it as
+	// its first octet, read as a label length, would want.
+	pointed := make([]u8, HEADER_SIZE + 1 + 0xc0 + 1 + 4, context.temp_allocator)
+	pointed[5] = 1
+	pointed[HEADER_SIZE] = 0xc0
+	testing.expect(t, !same_question(pointed, pointed), "a compression pointer in the question matched")
 }
