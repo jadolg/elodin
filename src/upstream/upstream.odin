@@ -64,6 +64,23 @@ Error :: enum u8 {
 	still arriving.
 	*/
 	Backlogged,
+	/*
+	This server could not allocate what the exchange needed - the request's
+	arena could not grow (issue #620) - so nothing was sent. A statement about
+	this server, not the upstream, and not charged towards its cooldown.
+	*/
+	Out_Of_Memory,
+}
+
+/*
+Whether a failure moves the upstream towards its cooldown. Not the ones that
+say nothing about it: a timeout on an exchange whose hostname lookup spent part
+of the member's time (see `exchange`), a backlog on the path to it, or this
+server's own memory.
+*/
+@(private)
+charges_member :: proc "contextless" (err: Error, resolving: bool) -> bool {
+	return !(resolving && err == .Timeout) && err != .Backlogged && err != .Out_Of_Memory
 }
 
 @(private)
@@ -706,6 +723,8 @@ error_label :: proc(e: Error) -> string {
 		return "deadline"
 	case .Backlogged:
 		return "backlogged"
+	case .Out_Of_Memory:
+		return "out_of_memory"
 	}
 	return "unknown"
 }
@@ -783,7 +802,7 @@ servers to ask the refusal costs nothing, and is left unrecorded.
 		then held and every later exchange gives the member its whole timeout
 		and judges it on that. Still counted, so the figures show the query.
 		*/
-		record_failure(u, err, charge = !(resolving && err == .Timeout) && err != .Backlogged)
+		record_failure(u, err, charge = charges_member(err, resolving))
 		logx.debugf(
 			"upstream %s (%v %s:%d) failed after %v: %v",
 			u.spec.name,

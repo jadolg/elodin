@@ -87,7 +87,9 @@ block_wire :: proc(
 	for v in header {
 		wire_u16(buf[:], &h, v)
 	}
-	out = make([]u8, p, allocator)
+	// Not built where the allocator ran dry, which hands the answer to
+	// `encode_block_response` rather than reporting an empty one built.
+	out = dns.alloc_slice([]u8, p, allocator) or_return
 	copy(out, buf[:p])
 	return out, true
 }

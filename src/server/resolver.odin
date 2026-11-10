@@ -1319,6 +1319,10 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 
 	if st.q.class == .CH {
 		if out, handled := answer_chaos(st.s, st.msg, st.q, st.allocator, st.limit); handled {
+			// Nothing built is a failure, as for every local answer.
+			if len(out) == 0 {
+				count_answer(&st.s.stats.failed)
+			}
 			log_query(st.s, st.client, st.proto, st.q, .Local, "chaos", st.started)
 			return answered(st, out, .Local, len(out) > 0)
 		}
@@ -1419,8 +1423,12 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 	*/
 	if is_resolver_arpa(st.q.name) {
 		out := build_resolver_arpa_response(st.s, st.msg, st.q, st.allocator, st.limit)
+		// Nothing built is a failure, as for a rewrite.
+		if len(out) == 0 {
+			count_answer(&st.s.stats.failed)
+		}
 		log_query(st.s, st.client, st.proto, st.q, .Local, "ddr", st.started)
-		return answered(st, out, .Local, true)
+		return answered(st, out, .Local, len(out) > 0)
 	}
 
 	/*
@@ -1472,13 +1480,17 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		// folded in it would drown the `.onion` and `localhost.` signal the
 		// counter exists for. The query log still tells them apart.
 		private_reverse := kind == .Empty_Nonterminal || (kind == .Empty_Zone && zone != "home.arpa.")
-		if private_reverse {
+		if len(out) == 0 {
+			// Nothing built is a failure, as for a rewrite, whichever zone.
+			count_answer(&st.s.stats.failed)
+			log_query(st.s, st.client, st.proto, st.q, .Failed, "special-use", st.started)
+		} else if private_reverse {
 			log_query(st.s, st.client, st.proto, st.q, .Local, "private-reverse", st.started)
 		} else {
 			sync.atomic_add(&st.s.stats.special_use, 1)
 			log_query(st.s, st.client, st.proto, st.q, .Local, "special-use", st.started)
 		}
-		return answered(st, out, .Local, true)
+		return answered(st, out, .Local, len(out) > 0)
 	}
 	return false
 }
@@ -4319,11 +4331,15 @@ apply_rewrite :: proc(
 }
 
 // The SERVFAIL `chase_rewrite_alias` answers where its allocator ran dry, or
-// nothing where there is not room even for that.
+// nothing where there is not room even for that. Counted failed unless the
+// target's lookup already counted the query, so it is never a rewrite.
 @(private)
-chase_ran_dry :: proc(msg: dns.Message, limit: int, allocator: mem.Allocator) -> []u8 {
+chase_ran_dry :: proc(s: ^Server, msg: dns.Message, limit: int, allocator: mem.Allocator, counted: bool) -> ([]u8, bool) {
+	if !counted {
+		count_answer(&s.stats.failed)
+	}
 	out, _ := dns.error_response(nil, msg, .Serv_Fail, allocator, limit)
-	return out
+	return out, true
 }
 
 /*
@@ -4392,7 +4408,7 @@ chase_rewrite_alias :: proc(
 	chain, chain_built := dns.alloc_list([dynamic]dns.Record, 4, allocator)
 	questions, questions_built := dns.alloc_slice([]dns.Question, 1, allocator)
 	if !chain_built || !questions_built {
-		return chase_ran_dry(msg, limit, allocator), false
+		return chase_ran_dry(s, msg, limit, allocator, false)
 	}
 	append(&chain, alias)
 	next := msg
@@ -4418,7 +4434,7 @@ chase_rewrite_alias :: proc(
 		if !matched {
 			wire, _, enc := dns.encode_message(next, allocator)
 			if enc == .Out_Of_Memory {
-				return chase_ran_dry(msg, limit, allocator), false
+				return chase_ran_dry(s, msg, limit, allocator, false)
 			}
 			if enc != .None {
 				break walk
@@ -4429,7 +4445,8 @@ chase_rewrite_alias :: proc(
 			// and nor does a special-use name, so the chain either leaves as the
 			// answer is counted as the rewrite it is. A block list answering
 			// `refused` is `.Blocked` and counted as blocked, alias alone or not.
-			counted = outcome != .Refused && outcome != .Local
+			// A local answer that built nothing has counted itself failed.
+			counted = outcome != .Refused && (outcome != .Local || !r.ok)
 			// Unanswered leaves `out` nil, which the decode below turns into
 			// SERVFAIL rather than the bare alias.
 			if outcome == .Refused {
@@ -4438,7 +4455,7 @@ chase_rewrite_alias :: proc(
 		} else if next_alias, is_alias := more.?; is_alias {
 			// A link that did not land would be looked up again and again.
 			if n, _ := append(&chain, next_alias); n != 1 {
-				return chase_ran_dry(msg, limit, allocator), false
+				return chase_ran_dry(s, msg, limit, allocator, false)
 			}
 			continue walk
 		}
@@ -4447,7 +4464,13 @@ chase_rewrite_alias :: proc(
 			// The target was answered and this server could not read the answer
 			// back - the request's decode budget, in practice. SERVFAIL, not the
 			// bare alias: that is the not-found this procedure exists to prevent.
+			// Or a rule further down the chain built nothing. Counted failed
+			// where the target's lookup did not count it, never as a rewrite.
 			rest.flags.rcode = u8(dns.Rcode.Serv_Fail)
+			if !counted {
+				count_answer(&s.stats.failed)
+				counted = true
+			}
 		} else if dns.Rcode(got.flags.rcode) != .Refused {
 			rest = got
 		}
@@ -4456,7 +4479,7 @@ chase_rewrite_alias :: proc(
 
 	answers, answers_built := dns.alloc_slice([]dns.Record, len(chain) + len(rest.answer), allocator)
 	if !answers_built {
-		return chase_ran_dry(msg, limit, allocator), counted
+		return chase_ran_dry(s, msg, limit, allocator, counted)
 	}
 	copy(answers, chain[:])
 	copy(answers[len(chain):], rest.answer)
@@ -4480,7 +4503,7 @@ chase_rewrite_alias :: proc(
 	}
 	wire, _, err := dns.encode_message(resp, allocator, limit)
 	if err == .Out_Of_Memory {
-		return chase_ran_dry(msg, limit, allocator), counted
+		return chase_ran_dry(s, msg, limit, allocator, counted)
 	}
 	if err != .None {
 		return plain, counted

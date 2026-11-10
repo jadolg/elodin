@@ -626,12 +626,24 @@ strip_dnssec_records :: proc(
 	// Read before the OPT record goes, since the top bits of the rcode live in it.
 	rcode := dns.rcode_of(msg)
 
-	msg.answer = without_dnssec(msg.answer, qtype, allocator)
-	msg.authority = without_dnssec(msg.authority, qtype, allocator)
-	additional := without_dnssec(msg.additional, qtype, allocator)
+	/*
+	Each list reserved whole, and the answer as it arrived where one cannot be:
+	a record lost to a failed append would turn the answer into a NODATA, and a
+	lost OPT record would state a different rcode (RFC 6891 section 6.1.3).
+	*/
+	answer, answer_built := without_dnssec(msg.answer, qtype, allocator)
+	authority, authority_built := without_dnssec(msg.authority, qtype, allocator)
+	additional, additional_built := without_dnssec(msg.additional, qtype, allocator)
+	if !answer_built || !authority_built || !additional_built {
+		return wire
+	}
+	msg.answer, msg.authority = answer, authority
 
 	if _, had := dns.find_opt(query); had {
-		with_opt := make([dynamic]dns.Record, 0, len(additional) + 1, allocator)
+		with_opt, with_opt_built := dns.alloc_list([dynamic]dns.Record, len(additional) + 1, allocator)
+		if !with_opt_built {
+			return wire
+		}
 		append(&with_opt, ..additional)
 		append(&with_opt, dns.make_opt(dns.edns_udp_size(query), false, u8(u16(rcode) >> 4)))
 		additional = with_opt[:]
@@ -646,8 +658,8 @@ strip_dnssec_records :: proc(
 }
 
 @(private)
-without_dnssec :: proc(records: []dns.Record, qtype: dns.Type, allocator: mem.Allocator) -> []dns.Record {
-	out := make([dynamic]dns.Record, 0, len(records), allocator)
+without_dnssec :: proc(records: []dns.Record, qtype: dns.Type, allocator: mem.Allocator) -> (kept: []dns.Record, ok: bool) {
+	out := dns.alloc_list([dynamic]dns.Record, len(records), allocator) or_return
 	for rec in records {
 		if rec.type == .OPT {
 			continue
@@ -661,7 +673,7 @@ without_dnssec :: proc(records: []dns.Record, qtype: dns.Type, allocator: mem.Al
 		}
 		append(&out, rec)
 	}
-	return out[:]
+	return out[:], true
 }
 
 /*

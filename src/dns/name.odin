@@ -241,14 +241,18 @@ name_fold :: proc(name: string, allocator := context.allocator) -> (folded: stri
 	if !built {
 		return "", .Out_Of_Memory
 	}
-	for i in 0 ..< len(name) {
-		c := name[i]
+	copy(buf, name)
+	fold_ascii(buf)
+	return string(buf), nil
+}
+
+@(private)
+fold_ascii :: proc "contextless" (b: []u8) {
+	for &c in b {
 		if c >= 'A' && c <= 'Z' {
 			c += 32
 		}
-		buf[i] = c
 	}
-	return string(buf), nil
 }
 
 name_equal_fold :: proc(a, b: string) -> bool {
@@ -341,10 +345,6 @@ name_canonical :: proc(name: string, allocator := context.allocator) -> (canonic
 	buf := alloc_slice([]u8, len(trimmed) + 1, allocator) or_return
 	copy(buf, trimmed)
 	buf[len(trimmed)] = '.'
-	for &c in buf {
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-	}
+	fold_ascii(buf)
 	return string(buf), true
 }

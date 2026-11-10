@@ -368,7 +368,8 @@ chase_dry_sweep :: proc(
 		f := Fail_Nth{fail_at = n, fail_for = run}
 		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
 		spent := 0
-		out, _ := chase_rewrite_alias(&s, plain, cname, msg, .UDP, "127.0.0.1:5555", 512, Cookie_Request{}, time.tick_now(), &spent, one, .Shared)
+		before := chase_answers_counted(&s)
+		out, counted := chase_rewrite_alias(&s, plain, cname, msg, .UDP, "127.0.0.1:5555", 512, Cookie_Request{}, time.tick_now(), &spent, one, .Shared)
 		if f.seen < n {
 			break
 		}
@@ -381,6 +382,11 @@ chase_dry_sweep :: proc(
 		}
 		rcode := dns.Rcode(resp.flags.rcode)
 		if rcode == .Serv_Fail {
+			// Counted where it was built - once, and by a counter - so the caller
+			// never counts it a rewrite.
+			if !testing.expectf(t, counted && chase_answers_counted(&s) == before + 1, "%s: refusing %d from allocation %d answered SERVFAIL uncounted", name, run, n) {
+				return
+			}
 			servfails += 1
 			continue
 		}
@@ -510,4 +516,10 @@ test_a_reverse_rewrite_that_runs_dry_stays_matched :: proc(t: ^testing.T) {
 			return
 		}
 	}
+}
+
+// Every answer counter a chase's outcome can land in, summed.
+@(private = "file")
+chase_answers_counted :: proc(s: ^Server) -> u64 {
+	return s.stats.failed + s.stats.blocked + s.stats.cached + s.stats.forwarded + s.stats.rewritten
 }

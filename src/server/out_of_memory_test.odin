@@ -151,6 +151,12 @@ test_local_answers_with_no_memory :: proc(t: ^testing.T) {
 	_, failed_built := dnssec_failure_response(msg, dnssec.Result{status = .Bogus}, none, 512)
 	testing.expect(t, !failed_built, "a DNSSEC failure was reported built with no memory to build it")
 
+	// The fast block answer is not reported built empty, so the encoder gets its turn.
+	_, block_built := block_wire(&s, msg, msg.question[0], context.temp_allocator, 512, false)
+	testing.expect(t, block_built, "the fast block answer did not take this query, so the dry case proves nothing")
+	_, block_dry_built := block_wire(&s, msg, msg.question[0], none, 512, false)
+	testing.expect(t, !block_dry_built, "a fast block answer was reported built with no memory to build it")
+
 	query_wire, _, _ := dns.encode_message(msg, context.temp_allocator)
 	_, refusal_built := upstream_refusal(query_wire, msg, "test", 512, none)
 	testing.expect(t, !refusal_built, "a refusal was reported built with no memory to build it")
@@ -385,4 +391,84 @@ test_a_loopback_answer_that_runs_dry_is_never_nodata :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, built_once, "no refusal left room for an answer")
+}
+
+/*
+The DNSSEC strip either strips the answer whole or hands back the answer as it
+arrived: a record lost to a failed append would be a NODATA, and a lost OPT
+record a different rcode (RFC 6891 section 6.1.3).
+*/
+@(test)
+test_a_dnssec_strip_that_runs_dry_is_whole_or_untouched :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	_, query, ok := oom_query(t)
+	if !ok {
+		return
+	}
+	reply := dns.Message {
+		id         = query.id,
+		flags      = {qr = true, rd = true, ra = true},
+		question   = query.question,
+		answer     = []dns.Record {
+			{name = "example.com.", type = .A, class = .IN, ttl = 60, data = dns.Rdata_A{addr = {192, 0, 2, 1}}},
+			{name = "example.com.", type = .RRSIG, class = .IN, ttl = 60, data = dns.Rdata_Raw{data = make([]u8, 24, context.temp_allocator)}},
+		},
+		additional = []dns.Record{dns.make_opt(1232, true)},
+	}
+	wire, _, err := dns.encode_message(reply, context.temp_allocator)
+	if !testing.expect_value(t, err, dns.Encode_Error.None) {
+		return
+	}
+	whole := strip_dnssec_records(wire, query, .A, nil, context.temp_allocator, 1232)
+	if !testing.expect(t, string(whole) != string(wire), "the strip took nothing out, so the sweep proves nothing") {
+		return
+	}
+	for run in ([]int{1, 2, 3}) do for n := 1; ; n += 1 {
+		f := Fail_Nth{fail_at = n, fail_for = run}
+		dry := mem.Allocator{procedure = fail_nth_proc, data = &f}
+		out := strip_dnssec_records(wire, query, .A, nil, dry, 1232)
+		if f.seen < n {
+			break
+		}
+		if !testing.expectf(t, string(out) == string(whole) || string(out) == string(wire), "refusing %d from %d stripped part of the answer", run, n) {
+			return
+		}
+	}
+}
+
+// A local answer that built nothing is counted failed and not reported built.
+@(test)
+test_a_special_use_answer_that_built_nothing_is_counted_failed :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := oom_server(&cfg)
+	defer free_all(context.temp_allocator)
+	Asked :: struct {
+		name:  string,
+		type:  dns.Type,
+		class: dns.Class,
+	}
+	for a in ([]Asked{{"localhost.", .A, .IN}, {"_dns.resolver.arpa.", .SVCB, .IN}, {"version.bind.", .TXT, .CH}}) {
+		name := a.name
+		questions := make([]dns.Question, 1, context.temp_allocator)
+		questions[0] = dns.Question{name = name, type = a.type, class = a.class}
+		msg := dns.Message{id = 0x620, question = questions}
+		wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+		spent: int
+		st := Query_State {
+			s         = &s,
+			query     = wire,
+			msg       = msg,
+			q         = msg.question[0],
+			proto     = .UDP,
+			client    = "127.0.0.1:5555",
+			limit     = 512,
+			started   = time.tick_now(),
+			spent     = &spent,
+			allocator = mem.nil_allocator(),
+		}
+		before := s.stats.failed
+		testing.expectf(t, answer_locally(&st), "%s was not answered locally", name)
+		testing.expectf(t, !st.ok, "%s: an answer was reported built with nothing to build it", name)
+		testing.expect_value(t, s.stats.failed, before + 1)
+	}
 }
