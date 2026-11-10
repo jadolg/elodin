@@ -35,9 +35,11 @@ runs:
         mapfile -t cores < <(ls -1tr -- "${cores[@]}")
         # keep-core writes as root; gdb and the upload run as the runner.
         sudo chown -R "$(id -u)" "$RUNNER_TEMP/cores"
-        # Not fatal: a failed install (stale lists, or no DNS after the
+        # Most jobs refreshed the lists already, so the update runs only when
+        # the install needs it. Not fatal: a failed install (no DNS after the
         # Package job's takeover went wrong) would skip the upload.
         command -v gdb >/dev/null ||
+          sudo apt-get install -y -qq gdb ||
           { sudo apt-get update -qq && sudo apt-get install -y -qq gdb; } ||
           echo "::warning::gdb not installed, the cores are uploaded without a backtrace"
         # Five backtraces bound the step; a crash loop's other cores still upload.
@@ -49,7 +51,8 @@ runs:
           # with the runner, and a core is unreadable without it.
           [ -f "$exe" ] && cp "$exe" "$RUNNER_TEMP/cores/" || true
           echo "::group::$c ($exe)"
-          timeout 5m gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' "$exe" "$c" || true
+          # gdb only notices SIGTERM between steps; -k bounds a stuck one.
+          timeout -k 30s 5m gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' "$exe" "$c" || true
           echo "::endgroup::"
         done
     - if: inputs.mode == 'report'
