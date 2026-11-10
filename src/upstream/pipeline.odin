@@ -906,7 +906,20 @@ pipe_query :: proc(
 	if !response_accepted(u, asked, reply) {
 		return nil, .Bad_Response
 	}
-	response = make([]u8, len(reply), allocator)
+	return pipe_reply_copy(reply, query, allocator)
+}
+
+/*
+The reply in the caller's allocator, under the caller's ID. An empty copy would
+leave as an answer with no error beside it, so a copy that cannot be had is
+`Out_Of_Memory`.
+*/
+@(private)
+pipe_reply_copy :: proc(reply, query: []u8, allocator: mem.Allocator) -> (response: []u8, err: Error) {
+	built: bool
+	if response, built = dns.alloc_slice([]u8, len(reply), allocator); !built {
+		return nil, .Out_Of_Memory
+	}
 	copy(response, reply)
 	dns.set_id_in_place(response, u16(query[0]) << 8 | u16(query[1]))
 	return response, .None

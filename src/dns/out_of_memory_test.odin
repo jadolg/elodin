@@ -368,12 +368,25 @@ test_error_responses_at_every_budget :: proc(t: ^testing.T) {
 	// sweeps: `error_response` leaves its message's OPT record in the allocator.
 	defer free_all(context.temp_allocator)
 	want_err, _ := error_response(query, decoded, .Serv_Fail, context.temp_allocator)
+	@(static) servfail: []u8
+	servfail = want_err
 	oom_sweep(t, "error_response", want_err, proc(a: mem.Allocator) -> ([]u8, bool) {
 		msg, derr := decode_message(query, a)
 		if derr != .None {
 			return nil, false
 		}
-		return error_response(query, msg, .Serv_Fail, a)
+		out, built := error_response(query, msg, .Serv_Fail, a)
+		// Or the header alone, where the encode ran dry and twelve bytes did not:
+		// the query's ID and a SERVFAIL, with nothing claimed behind them.
+		if built && len(out) == HEADER_SIZE {
+			id, _ := peek_id(out)
+			whole := peek_rcode(out) == .Serv_Fail && id == 0x1234 && out[2] & 0x80 != 0
+			for b in out[4:] {
+				whole &&= b == 0
+			}
+			return servfail if whole else out, true
+		}
+		return out, built
 	})
 
 	// The header-only fallback, for a query that did not decode.
@@ -386,6 +399,38 @@ test_error_responses_at_every_budget :: proc(t: ^testing.T) {
 	oom_sweep(t, "truncated_response", want_tc, proc(a: mem.Allocator) -> ([]u8, bool) {
 		return truncated_response(query, a)
 	})
+}
+
+/*
+An extended rcode is never answered with the header alone, which would state a
+different one (RFC 6891 section 6.1.3): BADVERS read as NOERROR. A plain rcode
+is, where the encode runs dry and the header does not.
+*/
+@(test)
+test_an_extended_rcode_is_not_answered_with_the_header_alone :: proc(t: ^testing.T) {
+	q := Message {
+		id         = 0x4321,
+		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
+		additional = []Record{make_opt(1232, false)},
+	}
+	query, _, err := encode_message(q, context.temp_allocator)
+	if !testing.expect_value(t, err, Encode_Error.None) {
+		return
+	}
+	defer free_all(context.temp_allocator)
+	backing := make([]u8, 1 << 16)
+	defer delete(backing)
+	// Refusing the OPT record's allocation fails the encode, and leaves room.
+	f := Fail_Nth{fail_at = 1, fail_for = 1}
+	mem.arena_init(&f.arena, backing)
+	first := mem.Allocator{procedure = fail_nth_proc, data = &f}
+	_, vers_built := error_response(query, q, .Bad_Vers, first)
+	testing.expect(t, !vers_built, "BADVERS was answered with a header that cannot carry it")
+
+	f = Fail_Nth{fail_at = 1, fail_for = 1}
+	mem.arena_init(&f.arena, backing)
+	out, fail_built := error_response(query, q, .Serv_Fail, first)
+	testing.expect(t, fail_built && len(out) == HEADER_SIZE, "a SERVFAIL that fits in the header was not sent")
 }
 
 @(test)

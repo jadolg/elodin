@@ -925,9 +925,19 @@ normalise_client_opt :: proc(
 	out := wire
 	switch outcome {
 	case .Forwarded, .Cached:
-		if stripped, ok := dns.strip_edns_options(wire, allocator, spent); ok {
-			out = stripped
+		/*
+		An answer whose upstream options could not be taken out does not go
+		out with them: that is the upstream's OPT record forwarded, which RFC
+		6891 section 6.1.1 says MUST NOT happen. The strip fails only where the
+		message cannot be rebuilt - out of memory, or the request's decode
+		budget - so SERVFAIL, or nothing where even that cannot be built.
+		*/
+		stripped, ok := dns.strip_edns_options(wire, allocator, spent)
+		if !ok {
+			refusal, _ := dns.error_response(nil, query, .Serv_Fail, allocator)
+			return refusal
 		}
+		out = stripped
 	/*
 	Built here, by `dns.make_response` or `dns.error_response`, whose OPT record
 	is minted with no options in it - so what is in one is what this server put
@@ -1323,7 +1333,7 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 			if len(out) == 0 {
 				count_answer(&st.s.stats.failed)
 			}
-			log_query(st.s, st.client, st.proto, st.q, .Local, "chaos", st.started)
+			log_query(st.s, st.client, st.proto, st.q, .Local if len(out) > 0 else .Failed, "chaos", st.started)
 			return answered(st, out, .Local, len(out) > 0)
 		}
 	}
@@ -1365,7 +1375,7 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		if !counted {
 			count_answer(&st.s.stats.rewritten if len(out) > 0 else &st.s.stats.failed)
 		}
-		log_query(st.s, st.client, st.proto, st.q, .Rewritten, "rewrite", st.started)
+		log_query(st.s, st.client, st.proto, st.q, .Rewritten if len(out) > 0 else .Failed, "rewrite", st.started)
 		return answered(st, out, .Rewritten, len(out) > 0)
 	}
 
@@ -1386,17 +1396,18 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 	*/
 	if out, matched := apply_reverse_rewrite(st.s, st.msg, st.q, st.allocator, st.limit); matched {
 		count_answer(&st.s.stats.rewritten if len(out) > 0 else &st.s.stats.failed)
-		log_query(st.s, st.client, st.proto, st.q, .Rewritten, "rewrite-ptr", st.started)
+		log_query(st.s, st.client, st.proto, st.q, .Rewritten if len(out) > 0 else .Failed, "rewrite-ptr", st.started)
 		return answered(st, out, .Rewritten, len(out) > 0)
 	}
 
 	if live(st.s).cfg.blocking.enabled && st.s.filters != nil {
 		typed_only: bool
 		if filter.engine_match(st.s.filters, st.q.name, st.q.type, &typed_only) == .Blocked {
-			count_answer(&st.s.stats.blocked)
 			out := build_block_response(st.s, st.msg, st.q, st.allocator, st.limit, typed_only)
-			log_query(st.s, st.client, st.proto, st.q, .Blocked, "list", st.started)
-			return answered(st, out, .Blocked, true)
+			// Nothing built is a failure, as for a rewrite.
+			count_answer(&st.s.stats.blocked if len(out) > 0 else &st.s.stats.failed)
+			log_query(st.s, st.client, st.proto, st.q, .Blocked if len(out) > 0 else .Failed, "list", st.started)
+			return answered(st, out, .Blocked, len(out) > 0)
 		}
 	}
 
@@ -1427,7 +1438,7 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		if len(out) == 0 {
 			count_answer(&st.s.stats.failed)
 		}
-		log_query(st.s, st.client, st.proto, st.q, .Local, "ddr", st.started)
+		log_query(st.s, st.client, st.proto, st.q, .Local if len(out) > 0 else .Failed, "ddr", st.started)
 		return answered(st, out, .Local, len(out) > 0)
 	}
 

@@ -6,6 +6,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
+import "elodin:filter"
 
 /*
 Issue #620: an answer built in a request arena that cannot grow fails on its
@@ -442,12 +443,20 @@ test_a_special_use_answer_that_built_nothing_is_counted_failed :: proc(t: ^testi
 	cfg: config.Config
 	s := oom_server(&cfg)
 	defer free_all(context.temp_allocator)
+	// And a blocked name, which is answered locally as well.
+	cfg.blocking.enabled = true
+	block, allow := filter.set_make(), filter.set_make()
+	filter.parse_list(block, allow, "||ads.example^\n", .Adblock)
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	filter.engine_swap(engine, block, allow)
+	s.filters = engine
 	Asked :: struct {
 		name:  string,
 		type:  dns.Type,
 		class: dns.Class,
 	}
-	for a in ([]Asked{{"localhost.", .A, .IN}, {"_dns.resolver.arpa.", .SVCB, .IN}, {"version.bind.", .TXT, .CH}}) {
+	for a in ([]Asked{{"localhost.", .A, .IN}, {"_dns.resolver.arpa.", .SVCB, .IN}, {"version.bind.", .TXT, .CH}, {"ads.example.", .A, .IN}}) {
 		name := a.name
 		questions := make([]dns.Question, 1, context.temp_allocator)
 		questions[0] = dns.Question{name = name, type = a.type, class = a.class}
@@ -470,5 +479,48 @@ test_a_special_use_answer_that_built_nothing_is_counted_failed :: proc(t: ^testi
 		testing.expectf(t, answer_locally(&st), "%s was not answered locally", name)
 		testing.expectf(t, !st.ok, "%s: an answer was reported built with nothing to build it", name)
 		testing.expect_value(t, s.stats.failed, before + 1)
+	}
+}
+
+/*
+An upstream's EDNS options never reach the client, even where the answer they are
+in cannot be rebuilt without them: that would be its OPT record forwarded, which
+RFC 6891 section 6.1.1 says MUST NOT happen. SERVFAIL, or nothing, instead.
+*/
+@(test)
+test_an_upstream_option_that_cannot_be_stripped_is_not_forwarded :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	_, query, ok := oom_query(t)
+	if !ok {
+		return
+	}
+	marker := []u8{0xde, 0xad, 0xbe, 0xef, 0x62, 0x00}
+	opt := dns.make_opt(1232, false)
+	opt.data = dns.Rdata_OPT{options = []dns.EDNS_Option{{code = u16(dns.EDNS_Option_Code.NSID), data = marker}}}
+	// The OPT record ahead of a glue record, so the strip has to rebuild.
+	reply := dns.Message {
+		id         = query.id,
+		flags      = {qr = true, rd = true, ra = true},
+		question   = query.question,
+		answer     = []dns.Record{{name = "example.com.", type = .A, class = .IN, ttl = 60, data = dns.Rdata_A{addr = {192, 0, 2, 1}}}},
+		additional = []dns.Record{opt, {name = "ns.example.com.", type = .A, class = .IN, ttl = 60, data = dns.Rdata_A{addr = {192, 0, 2, 2}}}},
+	}
+	wire, _, err := dns.encode_message(reply, context.temp_allocator)
+	if !testing.expect_value(t, err, dns.Encode_Error.None) {
+		return
+	}
+	for run in ([]int{1, 2, 3, 8}) do for n := 1; ; n += 1 {
+		f := Fail_Nth{fail_at = n, fail_for = run}
+		dry := mem.Allocator{procedure = fail_nth_proc, data = &f}
+		spent := 0
+		out := normalise_client_opt(wire, query, .Forwarded, &spent, dry)
+		if f.seen < n {
+			break
+		}
+		for i in 0 ..< max(0, len(out) - len(marker) + 1) {
+			if !testing.expectf(t, string(out[i:][:len(marker)]) != string(marker), "refusing %d from %d forwarded the upstream's option", run, n) {
+				return
+			}
+		}
 	}
 }

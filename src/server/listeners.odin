@@ -2067,10 +2067,17 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		An answer that cannot be framed cannot be sent, and the query it
 		answers is one the client is waiting on: closed rather than left
 		unanswered, so it asks again on a new connection now (RFC 7766 section
-		6.2.4) rather than at its timeout.
+		6.2.4) rather than at its timeout. Drained first where answers have
+		gone out, as for the rate-limit close above: a pipelining client's
+		unread queries would turn the close into an RST that takes them back.
+		The scratch is freed so the drain has room for its chunk.
 		*/
 		framed, framed_built := stream_frame(response, context.temp_allocator)
 		if !framed_built {
+			if answered {
+				free_all(context.temp_allocator)
+				stream_linger(conn)
+			}
 			return
 		}
 		if !conn_write_all(conn, framed) {

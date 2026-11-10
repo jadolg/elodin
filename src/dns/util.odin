@@ -211,17 +211,19 @@ error_response :: proc(
 	usable := len(query.question) > 0 || query.id != 0 || (u16(rcode) > 0xf && edns_present(query))
 	if usable {
 		/*
-		An allocator that ran dry - here or in `make_response` - builds nothing
-		below either, which is twelve bytes of it, and the header alone could
-		not carry an extended rcode. Reported as no answer, which the caller
-		already has to handle.
+		An allocator that ran dry - here or in `make_response` - still tries
+		the header below, which is twelve bytes where the encode wanted its
+		buffer, compression state and records: a nearly full arena can hold
+		one and not the other. Not for an extended rcode, which the header
+		alone would state as a different one; that is reported as no answer,
+		which the caller already has to handle.
 		*/
 		resp := make_response(query, rcode, allocator)
 		bytes, _, err := encode_message(resp, allocator, max_size)
 		if err == .None {
 			return bytes, true
 		}
-		if err == .Out_Of_Memory {
+		if err == .Out_Of_Memory && u16(rcode) > 0xf {
 			return nil, false
 		}
 	}

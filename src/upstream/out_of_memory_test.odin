@@ -3,6 +3,7 @@ package upstream
 import "core:mem"
 import "core:testing"
 import "core:time"
+import "elodin:dns"
 
 /*
 Issue #620: a query this server cannot allocate the buffers for is not sent, and
@@ -34,4 +35,47 @@ test_a_failure_of_this_server_s_own_is_not_charged_to_the_upstream :: proc(t: ^t
 	testing.expect(t, !charges_member(.Timeout, true))
 	testing.expect(t, charges_member(.Timeout, false))
 	testing.expect(t, charges_member(.IO_Error, false))
+}
+
+/*
+A reply's question is checked against the query's even where the temp allocator
+has run dry: a failed read of the query's question is not a query without one,
+or any reply carrying the right ID would be taken for the answer.
+*/
+@(test)
+test_a_reply_read_without_memory_is_not_matched :: proc(t: ^testing.T) {
+	asked := [1]dns.Question{{name = "example.com.", type = .A, class = .IN}}
+	other := [1]dns.Question{{name = "attacker.test.", type = .A, class = .IN}}
+	query, _, qerr := dns.encode_message(dns.Message{id = 0x1234, question = asked[:]})
+	defer delete(query)
+	reply, _, rerr := dns.encode_message(dns.Message{id = 0x1234, flags = {qr = true}, question = other[:]})
+	defer delete(reply)
+	testing.expect_value(t, qerr, dns.Encode_Error.None)
+	testing.expect_value(t, rerr, dns.Encode_Error.None)
+	testing.expect(t, !response_matches(query, reply), "the fixture's question mismatch went unseen")
+
+	temp := context.temp_allocator
+	context.temp_allocator = mem.nil_allocator()
+	matched := response_matches(query, reply)
+	context.temp_allocator = temp
+
+	testing.expect(t, !matched, "a reply for another name was matched once the question could not be read")
+}
+
+// Nor is a reply this server has no memory to copy taken for an empty answer.
+@(test)
+test_a_reply_that_cannot_be_copied_is_not_an_empty_answer :: proc(t: ^testing.T) {
+	query := []u8{0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	reply := []u8{0xab, 0xcd, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	out, err := pipe_reply_copy(reply, query, mem.nil_allocator())
+	testing.expect_value(t, err, Error.Out_Of_Memory)
+	testing.expect_value(t, len(out), 0)
+
+	copied, copy_err := pipe_reply_copy(reply, query, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	testing.expect_value(t, copy_err, Error.None)
+	if testing.expect_value(t, len(copied), len(reply)) {
+		testing.expect_value(t, copied[0], 0x12)
+		testing.expect_value(t, copied[2], 0x80)
+	}
 }

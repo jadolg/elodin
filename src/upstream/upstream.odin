@@ -882,13 +882,15 @@ response_matches :: proc(query, response: []u8) -> bool {
 		return false
 	}
 
-	qq, qok := dns.peek_question(query, context.temp_allocator)
-	if !qok {
-		// A query with no question (a bare NOTIFY, say) has nothing to compare.
+	// A query with no question (a bare NOTIFY, say) has nothing to compare.
+	// Read from QDCOUNT rather than from a failed peek, which is also what an
+	// allocator that ran dry reports, and must not wave every reply through.
+	if query[4] == 0 && query[5] == 0 {
 		return true
 	}
+	qq, qok := dns.peek_question(query, context.temp_allocator)
 	rq, rok := dns.peek_question(response, context.temp_allocator)
-	if !rok {
+	if !qok || !rok {
 		return false
 	}
 	return qq.type == rq.type && qq.class == rq.class && dns.name_equal_fold(qq.name, rq.name)
