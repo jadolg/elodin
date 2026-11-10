@@ -142,7 +142,7 @@ An arena that runs dry refuses everything after the first refusal too, so a
 check missing at one allocation is covered by whichever check comes next. This
 refuses a short run and then lets the next succeed, which is what finds it.
 */
-@(private = "file")
+@(private)
 Fail_Nth :: struct {
 	arena:    mem.Arena,
 	seen:     int,
@@ -150,7 +150,7 @@ Fail_Nth :: struct {
 	fail_for: int,
 }
 
-@(private = "file")
+@(private)
 fail_nth_proc :: proc(
 	data: rawptr,
 	mode: mem.Allocator_Mode,

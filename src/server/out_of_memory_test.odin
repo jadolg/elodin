@@ -163,6 +163,15 @@ test_local_answers_with_no_memory :: proc(t: ^testing.T) {
 	testing.expect(t, !has_options, "an extended error was attached with no memory to attach it")
 }
 
+// The budget is the query's own doing, so it stays FORMERR; only memory is ours.
+@(test)
+test_a_query_over_its_budget_is_still_a_format_error :: proc(t: ^testing.T) {
+	testing.expect_value(t, query_decode_rcode(.Out_Of_Memory), dns.Rcode.Serv_Fail)
+	testing.expect_value(t, query_decode_rcode(.Request_Budget), dns.Rcode.Form_Err)
+	testing.expect_value(t, query_decode_rcode(.Name_Budget), dns.Rcode.Form_Err)
+	testing.expect_value(t, query_decode_rcode(.Short_Buffer), dns.Rcode.Form_Err)
+}
+
 // A TCP or DoT answer that cannot be framed is not sent, rather than trapping.
 @(test)
 test_a_stream_answer_with_no_memory_to_frame_it :: proc(t: ^testing.T) {
@@ -248,12 +257,13 @@ test_an_upstream_query_whose_name_cannot_be_folded_is_not_built :: proc(t: ^test
 	testing.expectf(t, !built, "a query was built without its name: %v", wire)
 }
 
-// Fails the `fail_at`th request it is given and hands every other to the
-// temp arena.
+// Fails `fail_for` requests from its `fail_at`th on and hands every other to
+// the temp arena.
 @(private)
 Fail_Nth :: struct {
-	seen:    int,
-	fail_at: int,
+	seen:     int,
+	fail_at:  int,
+	fail_for: int,
 }
 
 @(private)
@@ -272,7 +282,7 @@ fail_nth_proc :: proc(
 	#partial switch mode {
 	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
 		f.seen += 1
-		if f.seen == f.fail_at {
+		if f.seen >= f.fail_at && f.seen < f.fail_at + f.fail_for {
 			return nil, .Out_Of_Memory
 		}
 	}
@@ -301,7 +311,7 @@ test_a_ddr_answer_keeps_its_opt_record_whatever_runs_dry :: proc(t: ^testing.T) 
 	q := query.question[0]
 	built_once := false
 	for n := 1; ; n += 1 {
-		f := Fail_Nth{fail_at = n}
+		f := Fail_Nth{fail_at = n, fail_for = 1}
 		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
 		out := build_resolver_arpa_response(&s, query, q, one, 1232)
 		if f.seen < n {

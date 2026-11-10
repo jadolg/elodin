@@ -303,6 +303,8 @@ chain's list grows partway, so a link that fails to land is asked about too.
 test_a_chase_that_runs_dry_is_never_the_bare_alias :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	chase_dry_sweep(t, chase_rules(), "old.lan.", 2)
+	// With EDNS, so the answer's own OPT record is one of the refusals.
+	chase_dry_sweep(t, chase_rules(), "old.lan.", 2, edns = true)
 
 	long := make([]config.Rewrite, 7, context.temp_allocator)
 	for i in 0 ..< 6 {
@@ -318,10 +320,28 @@ test_a_chase_that_runs_dry_is_never_the_bare_alias :: proc(t: ^testing.T) {
 		ttl     = 60,
 	}
 	chase_dry_sweep(t, long, "a0.lan.", 7)
+
+	// A target that is no rule, so it is asked of `resolve_query`, which the
+	// special-use table answers NXDOMAIN without an upstream. Not NOERROR: the
+	// chain alone is the bare alias.
+	dead := make([]config.Rewrite, 1, context.temp_allocator)
+	dead[0] = config.Rewrite {
+		domain  = "dead.lan.",
+		answers = one_answer({kind = .CNAME, name = "gone.invalid."}),
+		ttl     = 60,
+	}
+	chase_dry_sweep(t, dead, "dead.lan.", 1, final = .NX_Domain)
 }
 
 @(private = "file")
-chase_dry_sweep :: proc(t: ^testing.T, rules: []config.Rewrite, name: string, whole: int) {
+chase_dry_sweep :: proc(
+	t: ^testing.T,
+	rules: []config.Rewrite,
+	name: string,
+	whole: int,
+	edns := false,
+	final := dns.Rcode.No_Error,
+) {
 	cfg := config.default_config()
 	cfg.log.queries = false
 	cfg.cache.enabled = false
@@ -332,14 +352,20 @@ chase_dry_sweep :: proc(t: ^testing.T, rules: []config.Rewrite, name: string, wh
 	questions := []dns.Question{{name = name, type = .A, class = .IN}}
 	msg := dns.Message{id = 0x3202, question = questions}
 	msg.flags.rd = true
+	opt := []dns.Record{dns.make_opt(1232, false)}
+	if edns {
+		msg.additional = opt
+	}
 	plain, matched, alias := apply_rewrite(&s, msg, questions[0], context.temp_allocator, 512)
 	cname, is_alias := alias.?
 	if !testing.expectf(t, matched && is_alias, "%s should be answered by its alias", name) {
 		return
 	}
 	servfails := 0
-	for n := 1; ; n += 1 {
-		f := Fail_Nth{fail_at = n}
+	// Runs as well as single refusals: a refused reservation is retried by the
+	// append behind it, so an encode fails only when the grow is refused too.
+	for run in ([]int{1, 3}) do for n := 1; ; n += 1 {
+		f := Fail_Nth{fail_at = n, fail_for = run}
 		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
 		spent := 0
 		out, _ := chase_rewrite_alias(&s, plain, cname, msg, .UDP, "127.0.0.1:5555", 512, Cookie_Request{}, time.tick_now(), &spent, one, .Shared)
@@ -358,9 +384,96 @@ chase_dry_sweep :: proc(t: ^testing.T, rules: []config.Rewrite, name: string, wh
 			servfails += 1
 			continue
 		}
-		if !testing.expectf(t, len(resp.answer) == whole, "%s: refusing allocation %d answered %v with %d records", name, n, rcode, len(resp.answer)) {
+		if !testing.expectf(t, rcode == final && len(resp.answer) == whole, "%s: refusing %d from allocation %d answered %v with %d records", name, run, n, rcode, len(resp.answer)) {
 			return
 		}
 	}
 	testing.expectf(t, servfails > 0, "%s: no refusal was answered SERVFAIL, so the guard went untested", name)
+}
+
+/*
+A rewrite whose allocations run dry stays matched, and what it builds is the
+whole alias or nothing: never a NODATA, never an `answers[0]` past the end, and
+never unmatched, which would send the operator's name on to the upstreams.
+
+Runs of refusals, since a refused reserve alone is retried by the append that
+follows it.
+*/
+@(test)
+test_a_rewrite_that_runs_dry_stays_matched :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.rewrites = chase_rules()
+	s := Server {
+		cfg = &cfg,
+	}
+	questions := []dns.Question{{name = "old.lan.", type = .A, class = .IN}}
+	msg := dns.Message{id = 0x3203, question = questions}
+	for run in ([]int{1, 2, 3, 8}) {
+		for from := 1; ; from += 1 {
+			f := Fail_Nth{fail_at = from, fail_for = run}
+			dry := mem.Allocator{procedure = fail_nth_proc, data = &f}
+			out, matched, _ := apply_rewrite(&s, msg, questions[0], dry, 512)
+			if f.seen < from {
+				break
+			}
+			if !testing.expectf(t, matched, "refusing %d from %d left the rule unmatched", run, from) {
+				return
+			}
+			if len(out) == 0 {
+				continue
+			}
+			resp, derr := dns.decode_message(out, context.temp_allocator)
+			if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+				return
+			}
+			if !testing.expectf(t, len(resp.answer) == 1, "refusing %d from %d answered %d records", run, from, len(resp.answer)) {
+				return
+			}
+		}
+	}
+}
+
+/*
+The reverse of a rewrite stays matched where its allocations run dry, as the
+rewrite does: falling through would answer the address out of the special-use
+table, which says it has no PTR.
+*/
+@(test)
+test_a_reverse_rewrite_that_runs_dry_stays_matched :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg := config.default_config()
+	cfg.log.queries = false
+	rules := make([]config.Rewrite, 1, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = "nas.lan.",
+		answers = one_answer({kind = .A, v4 = {192, 168, 1, 50}}),
+		ttl     = 300,
+		ptr     = true,
+	}
+	cfg.rewrites = rules
+	s := Server {
+		cfg = &cfg,
+	}
+	questions := []dns.Question{{name = "50.1.168.192.in-addr.arpa.", type = .PTR, class = .IN}}
+	msg := dns.Message{id = 0x3204, question = questions}
+	whole, whole_matched := apply_reverse_rewrite(&s, msg, questions[0], context.temp_allocator, 512)
+	if !testing.expect(t, whole_matched && len(whole) > 0, "nas.lan.'s address should be answered by its PTR") {
+		return
+	}
+	for run in ([]int{1, 3}) do for from := 1; ; from += 1 {
+		f := Fail_Nth{fail_at = from, fail_for = run}
+		dry := mem.Allocator{procedure = fail_nth_proc, data = &f}
+		out, matched := apply_reverse_rewrite(&s, msg, questions[0], dry, 512)
+		if f.seen < from {
+			break
+		}
+		if !testing.expectf(t, matched, "refusing %d from %d left the PTR unmatched", run, from) {
+			return
+		}
+		if len(out) > 0 && !testing.expectf(t, string(out) == string(whole), "refusing %d from %d built a different answer", run, from) {
+			return
+		}
+	}
 }

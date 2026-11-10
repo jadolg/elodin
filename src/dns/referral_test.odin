@@ -1,6 +1,7 @@
 package dns
 
 import "core:fmt"
+import "core:mem"
 import "core:testing"
 
 /*
@@ -238,4 +239,45 @@ test_peek_referral_bounds_the_alias_branch :: proc(t: ^testing.T) {
 		testing.expectf(t, !peek_referral(full[:n]), "cut at %d of %d read as a referral", n, len(full))
 	}
 	free_all(context.temp_allocator)
+}
+
+/*
+A chain there is no memory to read is "cannot tell" (issue #620), as an
+unreadable link is: called a referral, never passed on as the answer. Here the
+NS are the asked name's own zone, which read with memory is an answer.
+*/
+@(test)
+test_peek_referral_without_memory_cannot_tell :: proc(t: ^testing.T) {
+	msg := Message {
+		question  = []Question{{name = "www.corp.", type = .A, class = .IN}},
+		answer    = []Record{{name = "www.corp.", type = .CNAME, class = .IN, ttl = 60, data = Rdata_Name{"host.sub.corp."}}},
+		authority = []Record{{name = "corp.", type = .NS, class = .IN, ttl = 3600, data = Rdata_Name{"ns1.elsewhere."}}},
+	}
+	msg.flags.qr = true
+	wire, _, err := encode_message(msg, context.temp_allocator)
+	assert(err == .None)
+	testing.expect(t, !peek_referral(wire), "the asked name's own NS beside its alias is an answer")
+
+	temp := context.temp_allocator
+	context.temp_allocator = mem.nil_allocator()
+	referral := peek_referral(wire)
+	context.temp_allocator = temp
+	testing.expect(t, referral, "a chain read without memory was passed on as an answer")
+
+	// And each of its readings refused on its own, the NS owner's among them.
+	backing := make([]u8, 1 << 16)
+	defer delete(backing)
+	for n := 1; ; n += 1 {
+		f := Fail_Nth{fail_at = n, fail_for = 1}
+		mem.arena_init(&f.arena, backing)
+		context.temp_allocator = mem.Allocator{procedure = fail_nth_proc, data = &f}
+		got := peek_referral(wire)
+		context.temp_allocator = temp
+		if f.seen < n {
+			break
+		}
+		if !testing.expectf(t, got, "refusing allocation %d passed the chain on as an answer", n) {
+			return
+		}
+	}
 }

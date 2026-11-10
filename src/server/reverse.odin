@@ -1,6 +1,7 @@
 package server
 
 import "core:mem"
+import "core:slice"
 import "core:strconv"
 import "elodin:config"
 import "elodin:dns"
@@ -145,7 +146,10 @@ apply_reverse_rewrite :: proc(
 		return nil, false
 	}
 
-	answers := make([dynamic]dns.Record, 0, 1, allocator)
+	// On the stack, so the PTR cannot be lost to an allocation and the answer
+	// read as NODATA.
+	answer_buf: [1]dns.Record
+	answers := slice.into_dynamic(answer_buf[:])
 	if q.type == .PTR || q.type == .ANY {
 		append(
 			&answers,
@@ -178,9 +182,11 @@ apply_reverse_rewrite :: proc(
 		resp.authority = soa[:]
 	}
 
+	// Still handled where the allocator ran dry: falling through would answer
+	// the name out of the special-use table, which says it has no PTR.
 	out, _, err := dns.encode_message(resp, allocator, limit)
 	if err != .None {
-		return nil, false
+		return nil, err == .Out_Of_Memory
 	}
 	return out, true
 }

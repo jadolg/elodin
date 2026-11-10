@@ -597,6 +597,10 @@ sits in the section does not decide whether the chain can be read.
 @(private)
 alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased, unreadable: bool) {
 	decoded, err := decode_through_answer(msg, context.temp_allocator)
+	// A chain this server had no memory to read goes nobody here knows where.
+	if reading_refused(err) {
+		return "", "", false, true
+	}
 	if err != .None || len(decoded.question) != 1 {
 		return
 	}
@@ -648,6 +652,10 @@ referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
 		type, next, _ := skip_record(msg, pos)
 		if type == .NS {
 			zone, _, nerr := decode_name(msg, pos, context.temp_allocator)
+			// Unread for want of memory is "cannot tell", as above.
+			if nerr == .Out_Of_Memory {
+				return true
+			}
 			if nerr == .None && name_at_or_below(target, zone) && !name_at_or_below(asked, zone) {
 				return true
 			}

@@ -1,6 +1,7 @@
 package server
 
 import "core:mem"
+import "core:slice"
 import "elodin:dns"
 
 /*
@@ -643,7 +644,10 @@ answer_special_use :: proc(
 	limit: int,
 ) -> []u8 {
 	rcode := dns.Rcode.No_Error
-	answers := make([dynamic]dns.Record, 0, 2, allocator)
+	// On the stack: at most two records (A and AAAA, or SOA and NS, for ANY),
+	// so no append can run dry and turn the answer into a NODATA.
+	answer_buf: [2]dns.Record
+	answers := slice.into_dynamic(answer_buf[:])
 
 	switch kind {
 	case .None:

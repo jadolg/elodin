@@ -343,13 +343,7 @@ handle_query :: proc(
 	limit := response_limit(s, msg, proto)
 	advertise := advertised_udp_size(s, msg, proto)
 	if derr != .None {
-		/*
-		FORMERR says the query could not be interpreted (RFC 1035 section
-		4.1.1), and a stub reads it as an EDNS problem and asks again without
-		one (RFC 6891 section 7). A reading this server refused on its own
-		account - its memory or its budget - is SERVFAIL: the query was fine.
-		*/
-		rcode := dns.Rcode.Serv_Fail if dns.reading_refused(derr) else dns.Rcode.Form_Err
+		rcode := query_decode_rcode(derr)
 		out, built := dns.error_response(query, {}, rcode, allocator, limit)
 		return advertise_udp_size(out, advertise, proto), .Failed, built
 	}
@@ -1268,6 +1262,20 @@ answered :: proc(st: ^Query_State, response: []u8, outcome: Outcome, ok: bool) -
 }
 
 /*
+The rcode for a client's query that would not decode.
+
+FORMERR says the query could not be interpreted (RFC 1035 section 4.1.1), and a
+stub reads it as an EDNS problem and asks again without one (RFC 6891 section
+7). A query this server had no memory to read is SERVFAIL: the query was fine.
+Not the request budget, which on the client's own query is spent by nothing but
+that query's bytes.
+*/
+@(private)
+query_decode_rcode :: proc "contextless" (err: dns.Decode_Error) -> dns.Rcode {
+	return .Serv_Fail if err == .Out_Of_Memory else .Form_Err
+}
+
+/*
 Everything this server answers for itself, without a cache lookup or an
 upstream: the request-shape gates, then the operator's rewrites and block lists,
 then the tables. See `resolve_query` for where this sits.
@@ -1374,7 +1382,7 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 	if out, matched := apply_reverse_rewrite(st.s, st.msg, st.q, st.allocator, st.limit); matched {
 		count_answer(&st.s.stats.rewritten)
 		log_query(st.s, st.client, st.proto, st.q, .Rewritten, "rewrite-ptr", st.started)
-		return answered(st, out, .Rewritten, true)
+		return answered(st, out, .Rewritten, len(out) > 0)
 	}
 
 	if live(st.s).cfg.blocking.enabled && st.s.filters != nil {
@@ -4094,7 +4102,9 @@ encode_block_response :: proc(
 	ttl := live(s).cfg.blocking.block_ttl
 
 	rcode := dns.Rcode.No_Error
-	answers := make([dynamic]dns.Record, 0, 1, allocator)
+	// On the stack, as in `answer_special_use`: one record at most.
+	answer_buf: [1]dns.Record
+	answers := slice.into_dynamic(answer_buf[:])
 
 	switch live(s).cfg.blocking.response {
 	case .NX_Domain:
@@ -4243,7 +4253,17 @@ apply_rewrite :: proc(
 		return build_block_response(s, query, q, allocator, limit), true, nil
 	}
 
-	answers := make([dynamic]dns.Record, 0, len(rule.answers), allocator)
+	/*
+	Reserved whole, so no append below can drop a record: a lost CNAME is an
+	`answers[0]` past the end, and a lost address a NODATA. Matched with
+	nothing built where it cannot be had, as where the encode below runs dry:
+	not matched would send the operator's name on to the block lists and the
+	upstreams.
+	*/
+	answers, answers_built := dns.alloc_list([dynamic]dns.Record, len(rule.answers), allocator)
+	if !answers_built {
+		return nil, true, nil
+	}
 	for a in rule.answers {
 		// A CNAME answers every type; `chase_rewrite_alias` follows it.
 		if !kind_answers(a.kind, q.type) {
@@ -4289,12 +4309,20 @@ apply_rewrite :: proc(
 	}
 	out, _, err := dns.encode_message(resp, allocator, limit)
 	if err != .None {
-		return nil, false, nil
+		return nil, err == .Out_Of_Memory, nil
 	}
 	if rule_holds_alias(rule) {
 		alias = answers[0]
 	}
 	return out, true, alias
+}
+
+// The SERVFAIL `chase_rewrite_alias` answers where its allocator ran dry, or
+// nothing where there is not room even for that.
+@(private)
+chase_ran_dry :: proc(msg: dns.Message, limit: int, allocator: mem.Allocator) -> []u8 {
+	out, _ := dns.error_response(nil, msg, .Serv_Fail, allocator, limit)
+	return out
 }
 
 /*
@@ -4328,14 +4356,6 @@ are this server's own and unsigned.
 No additional section, as `apply_rewrite` has none: the target's glue is the
 upstream's reply to a question the client did not ask.
 */
-// The SERVFAIL `chase_rewrite_alias` answers where its allocator ran dry, or
-// nothing where there is not room even for that.
-@(private)
-chase_ran_dry :: proc(msg: dns.Message, limit: int, allocator: mem.Allocator) -> []u8 {
-	out, _ := dns.error_response(nil, msg, .Serv_Fail, allocator, limit)
-	return out
-}
-
 @(private)
 chase_rewrite_alias :: proc(
 	s: ^Server,
@@ -4396,6 +4416,9 @@ chase_rewrite_alias :: proc(
 		out, matched, more := apply_rewrite(s, next, questions[0], allocator, limit)
 		if !matched {
 			wire, _, enc := dns.encode_message(next, allocator)
+			if enc == .Out_Of_Memory {
+				return chase_ran_dry(msg, limit, allocator), false
+			}
 			if enc != .None {
 				break walk
 			}
@@ -4455,6 +4478,9 @@ chase_rewrite_alias :: proc(
 		resp.additional[0].data = own.data
 	}
 	wire, _, err := dns.encode_message(resp, allocator, limit)
+	if err == .Out_Of_Memory {
+		return chase_ran_dry(msg, limit, allocator), counted
+	}
 	if err != .None {
 		return plain, counted
 	}
