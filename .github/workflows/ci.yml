@@ -59,7 +59,7 @@ jobs:
       # alone, so the hang ends as a core with the spinning thread in it.
       - run: |
           ( sleep 840; pkill -ABRT '^test_' ) >/dev/null 2>&1 &
-          trap 'kill $!' EXIT
+          trap 'kill $! 2>/dev/null || true' EXIT
           mise run test
         timeout-minutes: 15
       # Room for the itest's burst of 500 at a mock upstream (#568); the

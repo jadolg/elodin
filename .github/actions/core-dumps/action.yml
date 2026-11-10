@@ -24,15 +24,25 @@ runs:
         mkdir -p "$RUNNER_TEMP/cores"
         sudo sysctl -q -w kernel.core_pattern="$RUNNER_TEMP/cores/core.%E.%p"
         sudo prlimit --pid "$PPID" --core=unlimited:unlimited
-        echo "$(ps -o comm= -p "$PPID"): $(prlimit --pid "$PPID" --core --noheadings)"
+        parent=$(ps -o comm= -p "$PPID")
+        echo "$parent: $(prlimit --pid "$PPID" --core --noheadings)"
+        [ "$parent" = Runner.Worker ] ||
+          echo "::warning::core limit lifted on $parent, not Runner.Worker; later steps may keep none"
     - if: inputs.mode == 'report'
       shell: bash
       run: |
         shopt -s nullglob
         cores=("$RUNNER_TEMP"/cores/core.*)
         [ ${#cores[@]} -gt 0 ] || { echo "no core dumps"; exit 0; }
-        sudo apt-get install -y -qq gdb
-        for c in "${cores[@]}"; do
+        # A core is 0600 and owned by whoever crashed; root's would be
+        # unreadable to gdb and to the upload below.
+        sudo chown -R "$(id -u)" "$RUNNER_TEMP/cores"
+        # Not fatal: a failed install (stale lists, or no DNS after the
+        # Package job's takeover went wrong) would skip the upload.
+        sudo apt-get update -qq && sudo apt-get install -y -qq gdb ||
+          echo "::warning::gdb not installed, the cores are uploaded without a backtrace"
+        # Five backtraces bound the step; a crash loop's other cores still upload.
+        for c in "${cores[@]:0:5}"; do
           exe=${c##*/core.}
           exe=${exe%.*}
           exe=${exe//!//}
