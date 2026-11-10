@@ -1,0 +1,64 @@
+name: Core dumps
+description: >
+  Keep the core of anything that crashes in the job (the Odin compiler on
+  arm64 in #626, a test runner, a server), then backtrace and upload them.
+  Use once with mode setup before the first build, and once with mode report
+  and `if: failure()` as the job's last step.
+inputs:
+  mode:
+    description: setup or report
+    required: true
+  name:
+    description: report only, the artifact is cores-<name>-<arch>-<attempt>; defaults to the job's id
+    default: ''
+runs:
+  using: composite
+  steps:
+    # The runner's core_pattern hands cores to apport, which keeps none. A
+    # pipe instead, to keep-core: the kernel ignores RLIMIT_CORE for a piped
+    # dump (core(5)), so every process in the job is covered, whatever its
+    # limit, user or mount namespace - a systemd service's included.
+    - if: inputs.mode == 'setup'
+      shell: bash
+      run: |
+        mkdir -p "$RUNNER_TEMP/cores"
+        sudo install -m 0755 "$GITHUB_ACTION_PATH/keep-core" /usr/local/bin/keep-core
+        sudo sysctl -w kernel.core_pattern="|/usr/local/bin/keep-core $RUNNER_TEMP/cores %E %p"
+    - if: inputs.mode == 'report'
+      shell: bash
+      run: |
+        shopt -s nullglob
+        cores=("$RUNNER_TEMP"/cores/core.*)
+        [ ${#cores[@]} -gt 0 ] || { echo "no core dumps"; exit 0; }
+        # Oldest first: in a crash loop the first crash is the cause, and the
+        # glob sorts by the pid as text.
+        mapfile -t cores < <(ls -1tr -- "${cores[@]}")
+        # keep-core writes as root; gdb and the upload run as the runner.
+        sudo chown -R "$(id -u)" "$RUNNER_TEMP/cores"
+        # Most jobs refreshed the lists already, so the update runs only when
+        # the install needs it. Not fatal: a failed install (no DNS after the
+        # Package job's takeover went wrong) would skip the upload.
+        command -v gdb >/dev/null ||
+          sudo apt-get install -y -qq gdb ||
+          { sudo apt-get update -qq && sudo apt-get install -y -qq gdb; } ||
+          echo "::warning::gdb not installed, the cores are uploaded without a backtrace"
+        # Five backtraces bound the step; a crash loop's other cores still upload.
+        for c in "${cores[@]:0:5}"; do
+          exe=${c##*/core.}
+          exe=${exe%.*}
+          exe=${exe//!//}
+          # The binary goes with its core: bin/ is built per run and gone
+          # with the runner, and a core is unreadable without it.
+          [ -f "$exe" ] && cp "$exe" "$RUNNER_TEMP/cores/" || true
+          echo "::group::$c ($exe)"
+          # gdb only notices SIGTERM between steps; -k bounds a stuck one.
+          timeout -k 30s 5m gdb -batch -ex 'info sharedlibrary' -ex 'thread apply all bt' "$exe" "$c" || true
+          echo "::endgroup::"
+        done
+    - if: inputs.mode == 'report'
+      uses: actions/upload-artifact@v7
+      with:
+        name: cores-${{ inputs.name || github.job }}-${{ runner.arch }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/cores
+        retention-days: 14
+        if-no-files-found: ignore

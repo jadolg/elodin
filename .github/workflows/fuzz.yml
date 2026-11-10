@@ -37,6 +37,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - uses: jdx/mise-action@v5
@@ -85,6 +88,11 @@ jobs:
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: crashes/
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
+          name: fuzz-${{ matrix.target }}
 
   # Not a fuzzer, but the same shape: a long random run that finds what a gated
   # one would not. A regex rule elodin keeps must block exactly the names
@@ -95,6 +103,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - uses: jdx/mise-action@v5
         with:
           install: true
@@ -102,3 +113,7 @@ jobs:
       - run: mise run re2-diff
         env:
           RE2DIFF_ARGS: -n 2000000
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report

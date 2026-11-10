@@ -338,3 +338,15 @@ by hand: `curl --http2 -k -H 'content-type: application/dns-message'
   whose package is installed on the runner, made to resolve a handful of names
   through the resolver takeover it performs, then removed, checking the runner
   gets its own resolver back
+
+When a job that builds Odin code fails, the core of any process that crashed
+in it, the compiler included, is in a `cores-<job>-<arch>-<attempt>` artifact,
+kept 14 days (`.github/actions/core-dumps`); a green job uploads none. A job
+keeps its first ten cores; the first five get a gdb backtrace in the log and
+their binary in the artifact. Anything built with `-sanitize:address` (the
+leakcheck server, the fuzz targets) leaves no core: AddressSanitizer sets its
+core limit to 1, which makes the kernel skip a piped dump. A test thread's
+own segfault is caught by the Odin test runner and fails that test instead. A
+crash in a thread a test starts spins in the runner's handler; a minute
+before the `test` step's 15-minute timeout the test binaries get SIGABRT,
+which leaves that core.
