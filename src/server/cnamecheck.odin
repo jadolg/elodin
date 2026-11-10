@@ -439,7 +439,6 @@ refuse_cloaked :: proc(
 		return out
 	}
 
-	count_answer(&s.stats.blocked)
 	if verdict == .Unwalkable {
 		logx.debugf(
 			"%s %s from %s redirects through more than %d names, which is more than this server will follow; withheld",
@@ -473,7 +472,9 @@ refuse_cloaked :: proc(
 	}
 	out := build_block_response(s, msg, q, allocator, limit, verdict == .Listed_Typed)
 	detail := "cname-deep" if verdict == .Unwalkable else "cname"
-	log_query(s, client, proto, q, .Blocked, detail, started)
+	// Nothing built is a failure, as for every other answer this server builds.
+	count_answer(&s.stats.blocked if len(out) > 0 else &s.stats.failed)
+	log_query(s, client, proto, q, .Blocked if len(out) > 0 else .Failed, detail, started)
 	return out
 }
 

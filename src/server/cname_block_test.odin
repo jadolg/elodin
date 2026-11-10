@@ -1,5 +1,6 @@
 package server
 
+import "core:mem"
 import "core:fmt"
 import "core:net"
 import "core:testing"
@@ -1526,4 +1527,78 @@ test_a_block_by_dnstype_alone_is_nodata :: proc(t: ^testing.T) {
 			testing.expectf(t, len(decoded.answer) == 0, "%v: %d answers", c.rules, len(decoded.answer))
 		}
 	}
+}
+
+/*
+An entry whose recheck this server had no memory to read stays in the cache
+(issue #620): the bytes are fine, and a later hit with room to read them walks
+them then. Dropped, a spell of memory pressure would send every chained answer
+asked for back upstream.
+*/
+@(test)
+test_a_recheck_read_without_memory_keeps_the_entry :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = true
+	cfg.dnssec.enabled = false
+	cfg.blocking.enabled = true
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	defer cache.destroy(answers)
+	engine := filter.engine_make()
+	defer filter.engine_destroy(engine)
+	block_set := filter.set_make()
+	filter.set_add(block_set, "tracker.evil.example", {.Apex, .Subdomains})
+	filter.engine_swap(engine, block_set, filter.set_make())
+	s := Server{cfg = &cfg, answers = answers, filters = engine}
+
+	hops := []string{"www.brand.example.", "cdn.brand.example."}
+	wire := chain_reply(hops)
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	key_buf: [cache.KEY_MAX]u8
+	key := cache.make_key(key_buf[:], hops[0], .A, .IN, false, false)
+	testing.expect(t, cache.put(answers, key, wire, decoded), "the answer was not cached")
+	hit, stored := stored_answer(&s, key, rules_generation(&s), context.temp_allocator)
+	if !testing.expect(t, stored && hit.recheck, "an entry from before the reload was not flagged for a second look") {
+		return
+	}
+
+	query := cloak_query(hops[0])
+	msg, _ := dns.decode_message(query, context.temp_allocator)
+	spent: int
+	st := Query_State {
+		s         = &s,
+		query     = query,
+		msg       = msg,
+		q         = msg.question[0],
+		proto     = .UDP,
+		client    = "127.0.0.1:5555",
+		limit     = 512,
+		spent     = &spent,
+		allocator = mem.nil_allocator(),
+	}
+	_, outcome, _ := serve_from_cache(&st, hit)
+	testing.expect_value(t, outcome, Outcome.Failed)
+
+	_, kept, found := cache.get(answers, key, context.temp_allocator, checked_against = filter.engine_generation(engine))
+	testing.expect(t, found && kept.recheck, "an entry nothing was wrong with was dropped for want of memory")
+	free_all(context.temp_allocator)
+}
+
+// A cloaked name refused with no memory to build the refusal is counted failed.
+@(test)
+test_a_cloak_refusal_that_built_nothing_is_counted_failed :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.log.queries = false
+	cfg.blocking.enabled = true
+	s := Server{cfg = &cfg}
+	query := cloak_query("www.brand.example.")
+	msg, _ := dns.decode_message(query, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+
+	out := refuse_cloaked(&s, "tracker.evil.example.", .Listed, msg, msg.question[0], .UDP, "127.0.0.1:5555", 512, time.tick_now(), mem.nil_allocator())
+	testing.expect_value(t, len(out), 0)
+	testing.expect_value(t, s.stats.blocked, 0)
+	testing.expect_value(t, s.stats.failed, 1)
 }

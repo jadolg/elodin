@@ -3850,7 +3850,8 @@ serve_from_cache :: proc(
 		// `cache.put` checks: `put` never decodes, it takes an already-decoded
 		// message and trusts it to describe the bytes beside it. A third store
 		// written without that guard would break this quietly.
-		if stored, derr := dns.decode_message(hit.wire, st.allocator, st.spent); derr == .None {
+		stored, derr := dns.decode_message(hit.wire, st.allocator, st.spent)
+		if derr == .None {
 			if out, verdict := block_cloaked_answer(
 				st.s,
 				stored.answer,
@@ -3898,16 +3899,25 @@ serve_from_cache :: proc(
 
 			Serving it was the other way this could have gone and it is the same
 			mistake `Unwalkable` exists to refuse: the check is not a thing to
-			skip on the inputs that defeat it. Nothing reaches here as things
-			stand - `cache.put` stores no message it could not read - which is
-			the reason refusing costs nothing, not a reason to fall through.
+			skip on the inputs that defeat it. Bytes that will not decode do not
+			reach here as things stand - `cache.put` stores no message it could
+			not read - which is the reason refusing costs nothing, not a reason
+			to fall through.
 
 			The entry is dropped rather than stamped. It cannot be walked on any
 			later hit either, so leaving it would refuse this name for as long
 			as it lived; dropping it sends the next query upstream for an answer
 			that can be read.
+
+			A reading this server refused on its own account - its memory, or
+			the request's decode budget - says nothing about the bytes, so the
+			entry stays: a later hit with room to read it walks it then. Dropped
+			for that, a short spell of memory pressure would empty the cache of
+			every chained answer it was asked for and send each one upstream.
 			*/
-			cache.forget(live(st.s).answers, hit.key, hit.serial)
+			if !dns.reading_refused(derr) {
+				cache.forget(live(st.s).answers, hit.key, hit.serial)
+			}
 			cache.note_withheld(live(st.s).answers)
 			count_answer(&st.s.stats.failed)
 			out, built := dns.error_response(st.query, st.msg, .Serv_Fail, st.allocator, st.limit)

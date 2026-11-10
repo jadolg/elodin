@@ -210,11 +210,7 @@ ddr_records :: proc(s: ^Server, owner: string, allocator: mem.Allocator) -> (rec
 		dot_params = svc_params(DOT_ALPN, cfg.listeners.dot.port, 853, "", allocator) or_return
 	}
 	if doh {
-		dohpath, derr := strings.concatenate({cfg.listeners.doh.path, "{?dns}"}, allocator)
-		if derr != nil || len(dohpath) != len(cfg.listeners.doh.path) + len("{?dns}") {
-			return nil, false
-		}
-		doh_params = svc_params(DOH_ALPN, cfg.listeners.doh.port, 443, dohpath, allocator) or_return
+		doh_params = svc_params(DOH_ALPN, cfg.listeners.doh.port, 443, cfg.listeners.doh.path, allocator) or_return
 	}
 	// Reserved whole, so neither append below can drop a record.
 	list := dns.alloc_list([dynamic]dns.Record, 2, allocator) or_return
@@ -239,8 +235,11 @@ ddr_record :: proc(owner, target: string, params: []u8) -> dns.Record {
 }
 
 // SvcParams in wire form, keys in increasing order (RFC 9460 section 2.2).
+// `doh_path` is the listener's path; the dohpath key carries it behind the
+// `{?dns}` template variable (RFC 9461 section 5).
 @(private)
-svc_params :: proc(alpn: []string, port, default_port: int, dohpath: string, allocator: mem.Allocator) -> (params: []u8, ok: bool) {
+svc_params :: proc(alpn: []string, port, default_port: int, doh_path: string, allocator: mem.Allocator) -> (params: []u8, ok: bool) {
+	DOH_TEMPLATE :: "{?dns}"
 	put_u16 :: proc(b: ^[dynamic]u8, v: u16) {
 		append(b, u8(v >> 8), u8(v))
 	}
@@ -251,7 +250,7 @@ svc_params :: proc(alpn: []string, port, default_port: int, dohpath: string, all
 	}
 	// Reserved whole - each key's four-byte header and its value - so no
 	// append below can leave a key without its value.
-	b := dns.alloc_list([dynamic]u8, 4 + alpn_len + 6 + 4 + len(dohpath), allocator) or_return
+	b := dns.alloc_list([dynamic]u8, 4 + alpn_len + 6 + 4 + len(doh_path) + len(DOH_TEMPLATE), allocator) or_return
 	put_u16(&b, SVC_KEY_ALPN)
 	put_u16(&b, u16(alpn_len))
 	for p in alpn {
@@ -263,10 +262,11 @@ svc_params :: proc(alpn: []string, port, default_port: int, dohpath: string, all
 		put_u16(&b, 2)
 		put_u16(&b, u16(port))
 	}
-	if dohpath != "" {
+	if doh_path != "" {
 		put_u16(&b, SVC_KEY_DOHPATH)
-		put_u16(&b, u16(len(dohpath)))
-		append(&b, ..transmute([]u8)dohpath)
+		put_u16(&b, u16(len(doh_path) + len(DOH_TEMPLATE)))
+		append(&b, ..transmute([]u8)doh_path)
+		append(&b, DOH_TEMPLATE)
 	}
 	return b[:], true
 }

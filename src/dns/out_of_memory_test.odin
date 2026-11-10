@@ -426,6 +426,9 @@ test_an_extended_rcode_is_not_answered_with_the_header_alone :: proc(t: ^testing
 	first := mem.Allocator{procedure = fail_nth_proc, data = &f}
 	_, vers_built := error_response(query, q, .Bad_Vers, first)
 	testing.expect(t, !vers_built, "BADVERS was answered with a header that cannot carry it")
+	// Nor where the encode fails for anything else: a ceiling under the question.
+	_, small_built := error_response(query, q, .Bad_Vers, context.temp_allocator, HEADER_SIZE + 4)
+	testing.expect(t, !small_built, "BADVERS that would not encode was answered with the header alone")
 
 	f = Fail_Nth{fail_at = 1, fail_for = 1}
 	mem.arena_init(&f.arena, backing)
