@@ -47,7 +47,7 @@ scrape_configs:
 | `elodin_tls_handshakes_total` | counter | TLS handshakes completed on the DoT and DoH listeners |
 | `elodin_rate_limited_total` | counter | queries the rate limiter withheld an answer from |
 | `elodin_rate_limit_slipped_total` | counter | those answered truncated instead, to send a real client to TCP |
-| `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus` |
+| `elodin_dnssec_answers_total{result}` | counter | `secure` and `bogus`. `bogus` leaves out the questions this server gave up on itself: a shed walk, and a reply it would not read for want of memory or of the request's decode budget. Those still count as `failed` |
 | `elodin_dnssec_queries_shed_total` | counter | questions whose chain-of-trust walk was shed because `dnssec.max_chain_walks` (or, on a connection, `max_connection_walks`) were already waiting. One per question. Rising with SERVFAIL means the shedding is this server's, not an upstream failing; it cannot tell an attack from honest load, and a slow upstream can cause it too |
 | `elodin_dnssec_oversized_key_sets_total` | counter | DNSKEY sets over the 8 KB per-zone limit, validated but not cached, so each question walks the chain again. Not a fault; a rising figure is a zone publishing something extraordinary, or someone probing. See `dnssec.max_cached_zones` |
 | `elodin_rebind_refused_total` | counter | answers withheld because a public name was pointed into private space |

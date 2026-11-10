@@ -524,3 +524,64 @@ test_an_upstream_option_that_cannot_be_stripped_is_not_forwarded :: proc(t: ^tes
 		}
 	}
 }
+
+/*
+A Bogus verdict remembered for a client that sent no OPT record is built with
+one of this server's own, and that record is not an allocation: a dry arena
+would hand back an empty list and the index into it would trap.
+*/
+@(test)
+test_a_bogus_verdict_remembered_without_memory_does_not_trap :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := oom_server(&cfg)
+	cfg.cache.enabled = true
+	msg := dns.Message {
+		id       = 0x620,
+		flags    = {rd = true},
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	result := dnssec.Result{status = .Bogus, reason = "test"}
+	spent := 0
+	stored := remember_bogus_verdict(&s, "example.com./A", msg, result, false, &spent, mem.nil_allocator())
+	testing.expect(t, !stored, "a verdict built without memory was stored")
+}
+
+/*
+The rebinding guard's refusal of an answer it could not read is about the bytes.
+One this server declined to read - its memory, or the request's budget - is
+SERVFAIL, not the NODATA a client caches, and not counted as a rebind.
+*/
+@(test)
+test_a_rebind_check_read_without_memory_is_servfail_not_nodata :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := oom_server(&cfg)
+	cfg.rebind.enabled = true
+	defer free_all(context.temp_allocator)
+	_, msg, ok := oom_query(t)
+	if !ok {
+		return
+	}
+	for err, i in ([]dns.Decode_Error{.Out_Of_Memory, .Request_Budget}) {
+		decoded := Decoded_Answer{full_err = err, partial_err = err}
+		out, detail, refused := rebind_refusal(&s, msg, msg.question[0], decoded, 512, context.temp_allocator)
+		testing.expect(t, refused)
+		testing.expect_value(t, detail, REBIND_UNREAD)
+		testing.expect_value(t, s.stats.rebind, 0)
+		testing.expect_value(t, s.stats.failed, u64(i + 1))
+		if testing.expect(t, len(out) >= dns.HEADER_SIZE, "no SERVFAIL was built") {
+			testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Serv_Fail)
+		}
+	}
+}
+
+/*
+A validation this server gave up on for itself is not counted as bogus: not its
+shedding, and not a reply it would not read for want of memory or budget.
+*/
+@(test)
+test_a_reading_this_server_refused_is_not_counted_bogus :: proc(t: ^testing.T) {
+	testing.expect(t, counts_as_bogus(dnssec.Result{status = .Bogus}))
+	testing.expect(t, counts_as_bogus(dnssec.Result{status = .Indeterminate, reason = "chain of trust unavailable"}))
+	testing.expect(t, !counts_as_bogus(dnssec.Result{status = .Indeterminate, shed = true}))
+	testing.expect(t, !counts_as_bogus(dnssec.Result{status = .Indeterminate, reason = dnssec.READING_OVER_BUDGET}))
+}

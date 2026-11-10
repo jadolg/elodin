@@ -931,8 +931,9 @@ normalise_client_opt :: proc(
 		out with them: that is the upstream's OPT record forwarded, which RFC
 		6891 section 6.1.1 says MUST NOT happen. The strip fails only where the
 		message cannot be rebuilt - out of memory, the request's decode budget,
-		or a re-encode that outgrows `dns.MAX_MESSAGE` - so SERVFAIL, or nothing
-		where even that cannot be built.
+		a message with records after its OPT record that will not decode or
+		encode again, or a re-encode that outgrows `dns.MAX_MESSAGE` - so
+		SERVFAIL, or nothing where even that cannot be built.
 		*/
 		stripped, ok := dns.strip_edns_options(wire, allocator, spent)
 		if !ok {
@@ -2581,7 +2582,7 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 			the query did, and `elodin_dnssec_queries_shed_total` is the series
 			that says how often this was us.
 			*/
-			if !shed {
+			if counts_as_bogus(result) {
 				sync.atomic_add(&st.s.stats.bogus, 1)
 			}
 			count_answer(&st.s.stats.failed)
@@ -2602,6 +2603,22 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 		st.ede = st.answer_ede
 	}
 	return false
+}
+
+/*
+Whether a failed validation goes in `stats.bogus`: everything but what this
+server chose for itself. Its own shedding, which a flood decides the rate of,
+and a reading it refused on its own account - the request's decode budget, which
+an attacker answering the chain expensively spends, or its memory - are both
+`Indeterminate` with nothing proved, and folded in they would let either drive a
+series operators read as "somebody is forging answers".
+*/
+@(private)
+counts_as_bogus :: proc(result: dnssec.Result) -> bool {
+	if result.status != .Indeterminate {
+		return true
+	}
+	return !result.shed && result.reason != dnssec.READING_OVER_BUDGET
 }
 
 /*
@@ -2720,6 +2737,11 @@ finish_answer :: proc(st: ^Query_State) {
 	*/
 	if checking_rebind {
 		if out, detail, blocked := rebind_refusal(st.s, st.msg, st.q, decoded, st.limit, st.allocator); blocked {
+			if detail == REBIND_UNREAD {
+				log_query(st.s, st.client, st.proto, st.q, .Failed, detail, st.started)
+				answered(st, out, .Failed, len(out) > 0)
+				return
+			}
 			if detail == "rebind" &&
 			   decoded.full &&
 			   !decoded.msg.flags.tc &&
@@ -3689,14 +3711,16 @@ remember_bogus_verdict :: proc(
 		return
 	}
 	asked := msg
+	// On the stack, as in `answer_special_use`: the build below is its only
+	// reader, and an allocation here is one a dry arena would trap indexing.
+	opt: [1]dns.Record
 	if _, has := dns.find_opt(msg); !has {
-		opt := make([]dns.Record, 1, allocator)
 		// The payload size is this server's to state and `advertise_udp_size`
 		// writes its own over it on the way out, so what is in here only has to
 		// be a number. DO is the client's, and the key already keeps the two
 		// kinds of client apart.
 		opt[0] = dns.make_opt(UPSTREAM_UDP_SIZE, dns.edns_do(msg))
-		asked.additional = opt
+		asked.additional = opt[:]
 	}
 	wire, built := dnssec_failure_response(asked, result, allocator, dns.MAX_MESSAGE)
 	if !built {
