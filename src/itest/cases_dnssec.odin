@@ -466,8 +466,7 @@ run_dnssec_config_cases :: proc(r: ^Runner) {
 		if !write_fixture(r, path, transmute([]u8)body) {
 			return 0, ""
 		}
-		res := run_binary(r, []string{"--config", path, "--check"}, tag)
-		check(r, res.ok, "could not run the binary")
+		res := new_check(r, path, tag)
 		return res.exit_code, res.output
 	}
 

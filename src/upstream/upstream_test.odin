@@ -162,6 +162,66 @@ test_a_race_starts_only_the_legs_its_budget_has_room_for :: proc(t: ^testing.T) 
 	free_all(context.temp_allocator)
 }
 
+/*
+A race answer the caller's arena has no room for is `Out_Of_Memory`, not an
+empty reply: an empty one reads as a NOERROR that is no referral, so the sweep
+would take it and the client would be sent nothing.
+*/
+@(test)
+test_a_race_answer_that_cannot_be_copied_is_not_an_empty_answer :: proc(t: ^testing.T) {
+	m := Mock{}
+	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+	if serr != nil {
+		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
+		return
+	}
+	m.socket = socket
+	set_socket_timeouts(socket, 50 * time.Millisecond)
+	bound, berr := net.bound_endpoint(socket)
+	if berr != nil {
+		net.close(socket)
+		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
+		return
+	}
+	responder := thread.create_and_start_with_poly_data(&m, mock_loop)
+	defer {
+		sync.atomic_store(&m.stop, true)
+		thread.join(responder)
+		thread.destroy(responder)
+		net.close(socket)
+	}
+
+	cfg := config.Upstream_Config {
+		strategy = .Race,
+		timeout  = 2 * time.Second,
+		attempts = 1,
+		servers  = []config.Upstream_Spec {
+			{name = "a", kind = .UDP, address = "127.0.0.1", port = bound.port},
+			{name = "b", kind = .UDP, address = "127.0.0.1", port = bound.port},
+		},
+	}
+	query := dns.Message {
+		id       = 0x2C2C,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
+	if !testing.expectf(t, enc_err == .None, "cannot encode the query: %v", enc_err) {
+		return
+	}
+	g, gerr := make_group(cfg)
+	if !testing.expectf(t, gerr == .None, "cannot build the group: %v", gerr) {
+		return
+	}
+	resp, _, err := resolve_race(g, wire, 2 * time.Second, mem.nil_allocator())
+	testing.expect_value(t, err, Error.Out_Of_Memory)
+	testing.expect_value(t, len(resp), 0)
+	for deadline := time.tick_now(); busy(g) && time.tick_since(deadline) < 5 * time.Second; {
+		time.sleep(time.Millisecond)
+	}
+	destroy_group(g)
+	free_all(context.temp_allocator)
+}
+
 // A group with no usable server is refused with nothing left allocated: a reload
 // that cannot build one keeps running, so a leak here is one per SIGHUP.
 @(test)

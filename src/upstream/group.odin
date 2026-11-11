@@ -1258,8 +1258,12 @@ resolve_race :: proc(
 		return nil, nil, st.last_err
 	}
 	// Hand the caller a copy in its own allocator; the shared buffer is freed
-	// with the state once the last racer has let go of it.
-	out := make([]u8, len(st.response), allocator)
+	// with the state once the last racer has let go of it. No room for the copy
+	// is this server's failure: an empty reply would read as a usable NOERROR.
+	out, built := dns.alloc_slice([]u8, len(st.response), allocator)
+	if !built {
+		return nil, nil, .Out_Of_Memory
+	}
 	copy(out, st.response)
 	return out, st.winner, .None
 }

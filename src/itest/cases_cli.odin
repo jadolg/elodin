@@ -504,7 +504,6 @@ server: {{ user: root }}
 // `--check` on `path`. A binary that did not run fails the case here, since a
 // zero exit code and empty output would otherwise pass any case that expects
 // success.
-@(private = "file")
 new_check :: proc(r: ^Runner, path: string, tag: string) -> Run_Result {
 	res := run_binary(r, []string{"--config", path, "--check"}, tag)
 	check(r, res.ok, "could not run the binary")
