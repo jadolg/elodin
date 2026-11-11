@@ -361,7 +361,7 @@ rebuild_with_opt :: proc(
 	one, which is `server.match_client_opt`'s rule for a mint that would cut an
 	answer that fits.
 	*/
-	return encode_rebuilt(m, allocator, arcount = len(m.additional))
+	return encode_rebuilt(m, allocator)
 }
 
 /*
@@ -964,14 +964,15 @@ falls through to `add_opt_record`, and `server.normalise_client_opt` answers
 SERVFAIL rather than forward the upstream's options (RFC 6891 section 6.1.1),
 which a client reads as the failure it is.
 
-`arcount`, where given, is the ARCOUNT the encode must come back with: past
-`MAX_MESSAGE` the encoder can leave an OPT record out of a complete answer
-without truncating it, and for a rebuild whose whole point is that record that
-is a failure too. `every_opt` keeps every OPT record the message holds, as
-`encode_with_every_opt` does.
+Whole means the additional section too: past `MAX_MESSAGE` the encoder can
+leave the OPT record, or glue ahead of it, out of a complete answer without
+setting TC, and a rebuild that came back without the record it was writing
+into is no more the message than a cut one. So the encode has to come back
+with an ARCOUNT of every record it was given. `every_opt` keeps every OPT
+record the message holds, as `encode_with_every_opt` does, which counts them.
 */
 @(private)
-encode_rebuilt :: proc(m: Message, allocator: mem.Allocator, arcount := -1, every_opt := false) -> (out: []u8, ok: bool) {
+encode_rebuilt :: proc(m: Message, allocator: mem.Allocator, every_opt := false) -> (out: []u8, ok: bool) {
 	encoded: []u8
 	truncated: bool
 	eerr: Encode_Error
@@ -983,7 +984,7 @@ encode_rebuilt :: proc(m: Message, allocator: mem.Allocator, arcount := -1, ever
 	if eerr != .None || truncated {
 		return nil, false
 	}
-	if arcount >= 0 && int(u16(encoded[10]) << 8 | u16(encoded[11])) != arcount {
+	if int(u16(encoded[10]) << 8 | u16(encoded[11])) != len(m.additional) {
 		return nil, false
 	}
 	out = alloc_slice([]u8, len(encoded), allocator) or_return

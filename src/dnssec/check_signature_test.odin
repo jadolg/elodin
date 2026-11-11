@@ -129,7 +129,10 @@ owner's), and the key that verifies it. The key comes from a fixed seed, so the
 vector is the same every run.
 */
 @(private = "file")
-cs_resign :: proc(sig: Rrsig, signing_owner: string) -> (signed: Rrsig, keys: []Dnskey) {
+cs_resign :: proc(t: ^testing.T, sig: Rrsig, signing_owner: string) -> (signed: Rrsig, keys: []Dnskey) {
+	// A vector that could not be made fails the test: with no key, every case
+	// below would be refused for that alone and pass.
+	defer testing.expect(t, keys != nil, "cs_resign could not make the signature")
 	seed: [ed25519.PRIVATE_KEY_SIZE]u8
 	for &b, i in seed {
 		b = u8(i + 1)
@@ -222,7 +225,7 @@ test_check_signature_refuses_a_signer_outside_the_owners_zone :: proc(t: ^testin
 	for signer in ([]string{"example.org.", "attacker.example.", "www.www.example.com.", "ample.com."}) {
 		moved := cs_sig(CS_PLAIN_SIG)
 		moved.signer = signer
-		sig, keys := cs_resign(moved, "www.example.com.")
+		sig, keys := cs_resign(t, moved, "www.example.com.")
 		result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
 		testing.expectf(t, result == .Bad, "%q must not be able to sign www.example.com., got %v", signer, result)
 	}
@@ -231,7 +234,7 @@ test_check_signature_refuses_a_signer_outside_the_owners_zone :: proc(t: ^testin
 	// from `com.` is accepted.
 	moved := cs_sig(CS_PLAIN_SIG)
 	moved.signer = "com."
-	sig, keys := cs_resign(moved, "www.example.com.")
+	sig, keys := cs_resign(t, moved, "www.example.com.")
 	in_bailiwick, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
 	testing.expect_value(t, in_bailiwick, Verify_Result.Ok)
 	free_all(context.temp_allocator)
@@ -250,7 +253,7 @@ test_check_signature_refuses_a_labels_field_the_owner_contradicts :: proc(t: ^te
 	for labels in ([]u8{4, 5, 255}) {
 		moved := cs_sig(CS_PLAIN_SIG)
 		moved.labels = labels
-		sig, keys := cs_resign(moved, "www.example.com.")
+		sig, keys := cs_resign(t, moved, "www.example.com.")
 		result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
 		testing.expectf(t, result == .Bad, "a labels field of %d over a three-label name must be refused", labels)
 	}
@@ -259,7 +262,7 @@ test_check_signature_refuses_a_labels_field_the_owner_contradicts :: proc(t: ^te
 	// would put the wildcard, `*.com.`, above the zone that signed it.
 	moved := cs_sig(CS_PLAIN_SIG)
 	moved.labels = 1
-	sig, keys := cs_resign(moved, "*.com.")
+	sig, keys := cs_resign(t, moved, "*.com.")
 	result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
 	testing.expect_value(t, result, Verify_Result.Bad)
 	free_all(context.temp_allocator)

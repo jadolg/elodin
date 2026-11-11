@@ -298,7 +298,9 @@ of configured zones and wildcards, `encode_message` asks it, through
 them can be tightened without the others following.
 */
 name_below :: proc(name, zone: string) -> bool {
-	return name_at_or_below(name, zone) && !name_equal_fold(name, zone)
+	// At or below, and not by matching the whole name: `name_at_or_below` only
+	// matches at a label start, so the same length is the zone itself.
+	return len(name) != len(zone) && name_at_or_below(name, zone)
 }
 
 // `name_below`, with the zone's own name counting as inside it.

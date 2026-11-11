@@ -2137,6 +2137,12 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 		if !name_fits_the_wire(l, rw.domain, fmt.tprintf("%s.domain", path)) {
 			continue
 		}
+		// `*.` is every name below the root, which is every name: one rule over
+		// the whole name space, refused as `upstream.zones` refuses the root.
+		if rw.wildcard && rw.domain == "." {
+			errorf(l, "%s.domain: \"*.\" rewrites every name; write the zone the rule is for, such as *.lan", path)
+			continue
+		}
 
 		/*
 		Whichever of the two spellings the rule used is the one its errors are

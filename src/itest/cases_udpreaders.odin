@@ -163,7 +163,7 @@ run_udp_reader_cases :: proc(r: ^Runner) {
 	start_case(r, "listeners.udp.readers: --check refuses a count this server will not honour")
 	{
 		path := filepath.join({r.work_dir, "readers-absurd.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r, 
+		write_fixture(r,
 			path,
 			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp:\n    readers: 4096\n"),
 		)

@@ -23,12 +23,12 @@ asked for) followed by an A record, so every writer has to take the rebuild
 path rather than cut bytes off the end.
 */
 @(private = "file")
-growing_answer :: proc(with_opt: bool, option := false) -> []u8 {
+growing_answer :: proc(with_opt: bool, option := false, srvs := GROWING_SRVS) -> []u8 {
 	buf := make([dynamic]u8, 0, 65535, context.temp_allocator)
 	arcount := 1 + (1 if with_opt else 0)
-	append(&buf, 0x42, 0x42, 0x81, 0x80, 0, 1, u8(GROWING_SRVS >> 8), u8(GROWING_SRVS & 0xff), 0, 0, 0, u8(arcount))
+	append(&buf, 0x42, 0x42, 0x81, 0x80, 0, 1, u8(srvs >> 8), u8(srvs & 0xff), 0, 0, 0, u8(arcount))
 	append(&buf, 1, 'a', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0, 0, 33, 0, 1)
-	for _ in 0 ..< GROWING_SRVS {
+	for _ in 0 ..< srvs {
 		// owner, SRV IN, TTL 300, RDLENGTH 8, priority 1 weight 1 port 53, target
 		append(&buf, 0xc0, 0x0c, 0, 33, 0, 1, 0, 0, 1, 0x2c, 0, 8, 0, 1, 0, 1, 0, 53, 0xc0, 0x0c)
 	}
@@ -90,4 +90,36 @@ test_every_rebuild_refuses_a_reencode_that_outgrew_the_message :: proc(t: ^testi
 
 	out, ok = ensure_opt_compressed(bare, 1232, context.temp_allocator)
 	expect_whole_or_refused(t, out, ok, "ensure_opt_compressed")
+}
+
+/*
+A re-encode whose answers still fit but whose OPT record no longer does. The
+encoder leaves the record out of a complete answer without setting TC, so an
+option writer that took that as `ok` would hand back a message with no OPT
+record at all - the option it was asked to write, and every other, gone.
+
+2258 SRVs re-encode to 65509 bytes: room for the bare record, not for one
+carrying a 20-byte option.
+*/
+@(test)
+test_a_rebuild_that_drops_its_opt_record_is_refused :: proc(t: ^testing.T) {
+	SRVS :: 2258
+	plain := growing_answer(true, srvs = SRVS)
+	data := make([]u8, 20, context.temp_allocator)
+
+	out, ok := set_edns_option(plain, .NSID, data, context.temp_allocator)
+	if !ok {
+		free_all(context.temp_allocator)
+		return
+	}
+	m, derr := decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expectf(t, len(m.answer) == SRVS, "%d of %d answers survived", len(m.answer), SRVS)
+	opt, has_opt := find_opt(m)
+	testing.expect(t, has_opt, "set_edns_option came back ok with no OPT record")
+	if has_opt {
+		rdata, _ := opt.data.(Rdata_OPT)
+		testing.expectf(t, len(rdata.options) == 1, "set_edns_option came back ok with options %v", rdata.options)
+	}
+	free_all(context.temp_allocator)
 }

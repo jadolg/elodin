@@ -14,6 +14,7 @@ rewrites:
 
 - Rewrites are matched before everything else, the block lists included.
 - Wildcards match subdomains only: `*.lan` covers `host.lan`, not `lan`.
+  A wildcard on the root (`*.`) would match every name and is refused.
   Quote them: unquoted, `*` starts a YAML alias and the file is refused.
 - `ttl` sets the answer's TTL: 0 to 2147483647 seconds (RFC 2181 §8), as a
   number or a duration such as `5m`; the default is 300 seconds.
