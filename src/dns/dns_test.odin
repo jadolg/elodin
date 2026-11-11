@@ -1505,3 +1505,36 @@ test_name_below_counts_labels_not_suffix_bytes :: proc(t: ^testing.T) {
 		)
 	}
 }
+
+/*
+A name is canonical in the spelling `decode_name` writes, so one written in
+configuration compares equal to the same name read off the wire: `\.` and
+`\046` are one byte (RFC 1035 section 5.1), and a byte past ASCII is `\DDD` on
+the wire side. Only ASCII folds (RFC 4343 section 3).
+*/
+@(test)
+test_name_canonical_is_the_decoders_spelling :: proc(t: ^testing.T) {
+	cases := [?][2]string {
+		{"Example.COM", "example.com."},
+		{"example.com.", "example.com."},
+		{"", "."},
+		{".", "."},
+		{"A\\.Test", "a\\046test."},
+		{"a\\046test.", "a\\046test."},
+		{"*.Lan", "*.lan."},
+		// "bücher", and an upper-case "Ä" that ASCII folding leaves alone.
+		{"bücher.de", "b\\195\\188cher.de."},
+		{"ÄB.de", "\\195\\132b.de."},
+	}
+	for c in cases {
+		got, ok := name_canonical(c[0], context.temp_allocator)
+		testing.expectf(t, ok && got == c[1], "name_canonical(%q) is %q, want %q", c[0], got, c[1])
+	}
+	// A name that does not encode keeps its own spelling, for a caller's wire
+	// check to refuse.
+	bad, ok := name_canonical("a..b", context.temp_allocator)
+	testing.expectf(t, ok && bad == "a..b.", "name_canonical(\"a..b\") is %q", bad)
+	tail, tok := name_canonical("A..", context.temp_allocator)
+	testing.expectf(t, tok && tail == "a..", "name_canonical(\"A..\") is %q", tail)
+	free_all(context.temp_allocator)
+}

@@ -218,6 +218,11 @@ test_a_race_answer_that_cannot_be_copied_is_not_an_empty_answer :: proc(t: ^test
 	for deadline := time.tick_now(); busy(g) && time.tick_since(deadline) < 5 * time.Second; {
 		time.sleep(time.Millisecond)
 	}
+	if !testing.expect(t, !busy(g), "a leg never finished") {
+		// Destroyed under a leg still holding it would be a use after free.
+		free_all(context.temp_allocator)
+		return
+	}
 	destroy_group(g)
 	free_all(context.temp_allocator)
 }

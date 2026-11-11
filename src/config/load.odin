@@ -2733,15 +2733,10 @@ parse_rdata_u16 :: proc(s: string) -> (v: u16, ok: bool) {
 	return u16(n), true
 }
 
-// Lowercase with a trailing dot, matching the form the resolver compares against.
+// `dns.name_canonical` past the surrounding space: the spelling the resolver
+// compares against.
 canonical_domain :: proc(s: string, allocator := context.allocator) -> string {
-	trimmed := strings.trim_space(s)
-	trimmed = strings.trim_suffix(trimmed, ".")
-	lowered := strings.to_lower(trimmed, allocator)
-	if lowered == "" {
-		return strings.clone(".", allocator)
-	}
-	return strings.concatenate({lowered, "."}, allocator)
+	return dns.name_canonical(strings.trim_space(s), allocator)
 }
 
 @(private)

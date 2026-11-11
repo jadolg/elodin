@@ -655,7 +655,13 @@ test_a_wildcard_on_the_root_is_refused :: proc(t: ^testing.T) {
 		context.temp_allocator,
 	)
 	if e, has := err.?; testing.expect(t, has, "a rewrite of every name was accepted") {
-		testing.expectf(t, strings.contains(e.messages[0], "rewrites[0].domain"), "the message should name the domain: %s", e.messages[0])
+		// The root refusal itself, not any other error on the same domain.
+		testing.expectf(
+			t,
+			strings.contains(e.messages[0], "rewrites[0].domain") && strings.contains(e.messages[0], "rewrites every name"),
+			"the message should refuse the root wildcard by name: %s",
+			e.messages[0],
+		)
 	}
 	free_all(context.temp_allocator)
 }

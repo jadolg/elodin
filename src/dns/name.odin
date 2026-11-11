@@ -353,10 +353,32 @@ name_trim_root :: proc(name: string) -> string {
 	return name
 }
 
-// Accepts "example.com" or "example.com." and returns the canonical form, or
-// false where the allocator ran dry: an empty result would read as the root.
+/*
+Accepts "example.com" or "example.com." and returns the canonical form, or false
+where the allocator ran dry: an empty result would read as the root.
+
+Spelled as `decode_name` spells it, so a name written in configuration compares
+equal to the same name read off the wire. RFC 1035 section 5.1 lets `a\.b` and
+`a\046b` both write the label "a.b", and the decoder writes only the second; a
+UTF-8 byte is `\DDD` there too. Folded in ASCII only (RFC 4343 section 3), as
+the comparisons are. A name that does not encode keeps its own spelling, for
+the caller's wire check to refuse.
+*/
 name_canonical :: proc(name: string, allocator := context.allocator) -> (canonical: string, ok: bool) #optional_ok {
 	trimmed := name_trim_root(name)
+	// The name as given, not `trimmed`: "a.." without its last dot would
+	// encode, and an empty label is for the caller to refuse.
+	wire: [MAX_NAME_WIRE]u8
+	if n, eerr := encode_name(name, wire[:]); eerr == .None {
+		spelled, _, derr := decode_name(wire[:n], 0, allocator)
+		if derr == .Out_Of_Memory {
+			return "", false
+		}
+		if derr == .None {
+			fold_ascii(transmute([]u8)spelled)
+			return spelled, true
+		}
+	}
 	buf := alloc_slice([]u8, len(trimmed) + 1, allocator) or_return
 	copy(buf, trimmed)
 	buf[len(trimmed)] = '.'

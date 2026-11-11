@@ -118,8 +118,17 @@ test_a_rebuild_that_drops_its_opt_record_is_refused :: proc(t: ^testing.T) {
 		testing.expect_value(t, eerr, Encode_Error.None)
 		testing.expect(t, !truncated, "the re-encode is cut, so this is the other test's shape")
 		if eerr == .None {
-			arcount := int(u16(encoded[10]) << 8 | u16(encoded[11]))
-			testing.expectf(t, arcount == 1, "the re-encode keeps %d additional records, so the OPT record was not dropped", arcount)
+			// The A record kept and the OPT record gone, not the other way round.
+			re, rderr := decode_message(encoded, context.temp_allocator)
+			testing.expect_value(t, rderr, Decode_Error.None)
+			_, kept := find_opt(re)
+			testing.expectf(
+				t,
+				len(re.additional) == 1 && !kept,
+				"the re-encode keeps %d additional records, OPT among them: %v, so the OPT record was not dropped",
+				len(re.additional),
+				kept,
+			)
 		}
 	}
 

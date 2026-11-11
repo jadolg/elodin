@@ -394,8 +394,9 @@ refresh_release :: proc(r: ^Refresh) {
 Wait out the client response timer, and take the refresh's answer if it beat it.
 
 `taken` is false wherever the client is better served by the expired entry it is
-holding: the timer fired with the refresh still running, or the refresh finished
-having got nothing at all out of the upstream. Everything else the refresh
+holding: the timer fired with the refresh still running, the refresh finished
+having got nothing at all out of the upstream, or `allocator` had no room for
+the copy. Everything else the refresh
 reached is this client's answer, including the refusals - a Bogus verdict, an
 unreadable answer - which are decisions this server made rather than outages,
 and which the fallback has never covered.
