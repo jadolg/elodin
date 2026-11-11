@@ -420,8 +420,9 @@ resolve_insisting :: proc(
 	common reply than an unreadable rcode. A group of
 	two pays one extra exchange for a name its first member cannot answer. A
 	group of three or more pays up to one per remaining member, and a member that
-	is unreachable but has not yet accrued its three failures - a fresh start, or
-	the first query after a cooldown expires - costs `g.timeout` of that on the
+	is unreachable but not parked - a fresh start before its third failure, or
+	the queries that reach it after a cooldown expires, until one of them
+	fails - costs `g.timeout` of that on the
 	client's own latency path before the next is tried. The same arithmetic
 	applies to upstream traffic: a client asking names that SERVFAIL turns each
 	of its queries into up to one exchange per member of the group. Both are the

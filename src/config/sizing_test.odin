@@ -107,9 +107,8 @@ test_a_negative_chain_walk_bound_is_refused :: proc(t: ^testing.T) {
 }
 
 /*
-The worker keys #547 removed are unknown keys, refused like any other: the
-warning that named them said so for 0.25.0 to 0.27.0. The connection walk bound
-is not one of them.
+The worker keys #547 removed are unknown keys, refused like any other. The
+connection walk bound is not one of them.
 */
 @(test)
 test_the_removed_worker_keys_are_refused :: proc(t: ^testing.T) {

@@ -862,9 +862,7 @@ func handshakeArms() []arm {
 Concurrency, not a rate: there is nothing to pace, and this many dialers is
 enough to keep the server handshaking flat out.
 
-`hsDialers` rather than `workers` because that is the flag for the server's own
-thread pool, and the two figures have nothing to do with each other. The table
-and the share are the small ones the `slowloris` arms use, for the same reason
+The table and the share are the small ones the `slowloris` arms use, for the same reason
 those do: what `handshakeShareArms` shows is a client held to half a table, and
 the property is scale-free.
 */
