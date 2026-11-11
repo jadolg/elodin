@@ -170,9 +170,8 @@ test_rewrite_answers_srv :: proc(t: ^testing.T) {
 }
 
 /*
-A type the rule has no record of is NODATA with an SOA, which is what
-`apply_rewrite` already did for an address rule asked for an MX and is now the
-answer in every direction.
+A type the rule has no record of is NODATA with an SOA, the same answer
+`apply_rewrite` gives an address rule asked for an MX, in every direction.
 */
 @(test)
 test_rewrite_records_are_answered_by_type :: proc(t: ^testing.T) {
@@ -215,8 +214,8 @@ test_rewrite_records_answer_any :: proc(t: ^testing.T) {
 /*
 A rule that only adds records to a name leaves the rest of the name alone.
 
-This is the difference between the kinds this commit adds and the ones that were
-here before. An address, an alias and the sink each answer "what is this name",
+This is the difference between the record kinds and the others. An address, an
+alias and the sink each answer "what is this name",
 so a rule holding one of them may say NODATA for the types it has no record of.
 An `MX` does not: the ordinary reason to write one is a domain whose address is
 somebody else's business, and `example.com` with two MX records is still a real
@@ -254,11 +253,10 @@ test_a_record_only_rule_leaves_other_types_alone :: proc(t: ^testing.T) {
 }
 
 /*
-The other side of it: one address in the rule and the old reading is back.
+The other side of it: one address in the rule and the rule claims the whole name.
 
 That is the line, and it is deliberate - an operator who wants the name wholly
-answered here writes down where it points, which is what they were always
-writing before these kinds existed.
+answered here writes down where it points.
 */
 @(test)
 test_an_address_in_the_rule_still_claims_the_whole_name :: proc(t: ^testing.T) {

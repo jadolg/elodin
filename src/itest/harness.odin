@@ -40,9 +40,8 @@ Runner :: struct {
 	/*
 	End each case by asking the server to shut down rather than killing it.
 
-	Off by default because it costs the suite a shutdown per case - the
-	maintenance loop notices the signal on a 200ms slice, and there are two
-	hundred cases - and nothing in the ordinary run needs it. What needs it is a
+	Off by default because it costs the suite a shutdown per server - the
+	maintenance loop notices the signal on a 200ms slice - and nothing in the ordinary run needs it. What needs it is a
 	binary built with `-sanitize:address`: LeakSanitizer reports at exit, and a
 	process that was killed never has one. See `mise run leakcheck`.
 	*/
@@ -175,9 +174,9 @@ none is.
 A group sets up its server before its first `start_case`, so a server that
 never came up fails here with no case open. Marking the case that last ran
 would put the failure under a name that had already passed, and no `end_case`
-would come to count it - the next `start_case` clears the mark. The run then
-read as one skip and nothing failed, which is how a configuration the server
-refused to load looked green (issue #468).
+would come to count it - the next `start_case` clears the mark. So a server
+that never came up is counted as a failure of its own, not read as one skip
+with nothing failed (issue #468).
 */
 fail :: proc(r: ^Runner, format: string, args: ..any) {
 	message := fmt.tprintf(format, ..args)
@@ -449,7 +448,7 @@ Probe until the server answers over TCP.
 The listeners bind in order, udp before tcp, so the UDP probe above succeeding
 says nothing yet about the stream listener: a TCP dial in the gap between the
 two binds is refused, and on a loaded runner the gap is more than microseconds.
-A case that queries over TCP passes the udp_port in `Server_Options` and this probes
+A case that queries over TCP passes `tcp_port` in `Server_Options` and this probes
 it the same way as the datagram path - a CHAOS version.bind query, answered
 locally, retried until the deadline.
 */
@@ -730,8 +729,8 @@ proc_status_field :: proc(path, field: string) -> (value: string, ok: bool) {
 Decode a message, failing the case when the bytes cannot be read.
 
 Every helper that reads one answers a question of the form "is this in it", and
-a decode error used to come back as "no" - the same answer a readable message
-with nothing in it gives. A negative assertion then passed on bytes nothing
+a decode error must not come back as "no" - the same answer a readable message
+with nothing in it gives - or a negative assertion would pass on bytes nothing
 read, which is the one failure the suite most exists to catch.
 
 A message rather than a reply: the cookie cases read what the mock upstream was
@@ -896,7 +895,7 @@ Read the header straight from the bytes, without the decoder under test.
 
 A reply too short to hold one fails the case as well as handing back a zeroed
 header: that zero reads as NOERROR with every count at zero, which is what most
-cases assert, so bytes nothing could read used to satisfy them. The caller's own
+cases assert, so bytes nothing could read would otherwise satisfy them. The caller's own
 checks still run over the zeroed header, so a case that counts or accumulates
 what it reads here - `cases_queryid.odin` draws distinct transaction IDs from it -
 wants a length guard of its own rather than a second failure line.

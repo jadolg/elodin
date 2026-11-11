@@ -23,9 +23,9 @@ whoever sent the query, and the search space collapses from about 2^31 to the
 port alone.
 
 Driven through `handle_query` against a real socket rather than against the
-rewriting procedures directly, because the defect was not in any one of them:
-each path builds the outgoing query correctly, and none of them was replacing
-the ID. So all three are exercised here - a plain forward, the DNSSEC rewrite,
+rewriting procedures directly, because the property is not any one of theirs:
+each path builds the outgoing query from the client's message, and each must
+replace the ID. So all three are exercised here - a plain forward, the DNSSEC rewrite,
 and the one that strips a client cookie - and what is asserted is what arrived
 at the far end.
 */
@@ -352,7 +352,7 @@ test_forwarded_query_id_is_not_the_client_id :: proc(t: ^testing.T) {
 @(test)
 test_forwarded_query_id_is_replaced_on_the_dnssec_path :: proc(t: ^testing.T) {
 	// The DNSSEC rewrite re-encodes the client's message to set CD and DO, and
-	// carried its ID across with everything else.
+	// would carry its ID across with everything else.
 	h: Harness
 	if !harness_start(t, &h, validating = true) {
 		return

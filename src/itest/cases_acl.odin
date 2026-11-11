@@ -136,7 +136,7 @@ run_acl_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	// The same source over TCP, where the connection is closed on accept rather
-	// than given a thread, a read and an answer to write into.
+	// than given a fiber, a read and an answer to write into.
 	start_case(r, "allow_from: a source outside the list gets no answer over tcp")
 	{
 		srv, tcp_port, ok := start_denying_server(r, upstream_port)

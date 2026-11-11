@@ -430,7 +430,7 @@ test_a_route_knows_whether_an_anchor_covers_it :: proc(t: ^testing.T) {
 	zone exactly as insecure as it was.
 
 	The root anchor rides along with this one and the one below it because a set
-	without it is refused outright now - it anchors nothing, every chain
+	without it is refused outright - it anchors nothing, every chain
 	starting at the root - and what is under test here is which zone an anchor
 	covers, not whether the set is one a server could start on.
 	*/

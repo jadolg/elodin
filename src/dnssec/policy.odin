@@ -14,19 +14,19 @@ run: Fedora and RHEL ship an OpenSSL whose crypto policy refuses SHA-1
 signatures outright, so `EVP_DigestVerifyInit` declines algorithms 5 and 7 on
 those hosts and returns `.Refused` before a signature byte is read.
 
-Answering the two separately is what made the second one dangerous. An
-algorithm we never implemented settles the question at the delegation, where
-RFC 6840 section 5.2 puts it: no DS names anything we can check, so the child
-is an insecure delegation and everything under it is unvalidated data that
-nobody claims otherwise about. An algorithm the *library* declined would be
-noticed much later, inside a zone the chain had already established as secure,
-and treated as unsigned there - which is RFC 6840 section 5.11 inverted. A zone
-mid-migration publishes an RRSIG per algorithm, so an attacker had only to
-strip the one this build can verify, alter the records, and leave the
+Answered separately, the second one would be dangerous. An algorithm we never
+implemented settles the question at the delegation, where RFC 6840 section 5.2
+puts it: no DS names anything we can check, so the child is an insecure
+delegation and everything under it is unvalidated data that nobody claims
+otherwise about. An algorithm the *library* declined would be noticed much
+later, inside a zone the chain had already established as secure, and treated
+as unsigned there - which is RFC 6840 section 5.11 inverted. A zone
+mid-migration publishes an RRSIG per algorithm, so an attacker would only have
+to strip the one this build can verify, alter the records, and leave the
 algorithm-5 signature standing: the refusal is a policy decision made before
-the bytes are looked at, so a forgery earned it exactly as a genuine signature
-would, and the altered RRset reached the client as merely unvalidated instead
-of refused. The whole point of the second algorithm, inverted.
+the bytes are looked at, so a forgery would earn it exactly as a genuine
+signature does, and the altered RRset would reach the client as merely
+unvalidated instead of refused.
 
 So the two are one answer here, and it is reached by asking rather than by
 assuming: `probe_algorithms` verifies one known-good signature per algorithm

@@ -424,7 +424,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 		start_case(r, "cookies: and the answer to it still arrives")
 		{
 			/*
-			The other half of the case above, and the half that was missing.
+			The other half of the case above.
 
 			Sending the query without a cookie is only correct if the reply that
 			comes back without one is then accepted. A cookie-aware server

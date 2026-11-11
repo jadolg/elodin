@@ -112,12 +112,11 @@ run_udp_reader_cases :: proc(r: ^Runner) {
 				check(r, total >= QUERIES, "the readers counted %d datagrams of at least %d", total, QUERIES)
 				/*
 				More than one reader received. This is the property, and it is
-				what a single socket could not have done: before `SO_REUSEPORT`
-				the second reader's bind was refused outright.
+				what a single socket could not have done: without `SO_REUSEPORT`
+				a second bind is refused.
 
 				The kernel could in principle hash all 32 onto one reader; at
-				four readers that is (3/4)^32 per reader, about one run in ten
-				thousand for any of them. Retried nowhere, because a failure
+				four readers that is 4 x (1/4)^32, about 2e-19. Retried nowhere, because a failure
 				here is far more likely to be the sharing having stopped
 				working.
 				*/

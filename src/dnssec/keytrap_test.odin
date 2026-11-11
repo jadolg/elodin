@@ -13,10 +13,11 @@ The chain walk's own signature checks, under a response written to make it work.
 `MAX_VERIFICATIONS_PER_QUERY` and both throw the hopeless signatures out for
 nothing through `signature_worth_trying`. The two loops that build the chain of
 trust - the RRSIGs over a DS set in `zone_step`, and the RRSIGs over a DNSKEY
-set in `fetch_keys` - had neither, and their signature list comes straight out
-of a response, so its length is whoever answered the lookup.
+set in `fetch_keys` - are held to both as well, and they need it most: their
+signature list comes straight out of a response, so its length is whoever
+answered the lookup.
 
-That is the KeyTrap shape (CVE-2023-50387). Every field deciding whether a
+Unbounded, that is the KeyTrap shape (CVE-2023-50387). Every field deciding whether a
 signature is worth trying is public: the key tag and algorithm are printed in
 the zone's own DNSKEY set, and the validity window is copyable from the genuine
 signature beside it. So a DS response padded with several hundred RRSIGs
@@ -212,13 +213,13 @@ kt_baseline :: proc(t: ^testing.T) -> (spent: int, ok: bool) {
 A DS set padded with signatures that name the parent's real key is bounded.
 
 `zone_step` takes the RRSIGs over the DS set straight from the response and
-tries every one whose signer names the parent. Two hundred copies of the real
-signature with the last bytes flipped therefore bought two hundred
+tries every one whose signer names the parent. Unbounded, two hundred copies of
+the real signature with the last bytes flipped would buy two hundred
 canonicalisations of the DS set and two hundred ECDSA verifications, for one
 step of one chain, on nothing but a reply the attacker wrote.
 
 The genuine signature sits behind the padding, so a walk that grinds through it
-still ends `Secure` - which is exactly how this went unnoticed. The verdict here
+still ends `Secure` - which is why the verdict alone cannot show it. The verdict here
 is `Indeterminate` because the walk gave up, and the meter says it gave up on
 the budget.
 */
@@ -249,7 +250,7 @@ test_a_padded_ds_set_cannot_run_unbounded_verifications :: proc(t: ^testing.T) {
 /*
 Padding a DS set with signatures nothing could verify costs nothing.
 
-The other half of the fix, and the half that decides whether the budget is the
+The other half of the bound, and the half that decides whether the budget is the
 attacker's to spend. A forgery whose key tag names no key the parent published
 cannot verify, and finding that out needs no crypto and no canonicalisation - so
 two hundred of them must leave the meter exactly where an untouched response
@@ -293,7 +294,7 @@ A signature whose window has closed is refused on the chain for nothing too.
 
 The second half of the free pre-check, and the one that is easiest to leave out
 because `check_signature` reads the dates as well. It reads them *first*, so a
-lapsed forgery was already cheap - but only cheap, not free: with the budget
+lapsed forgery is cheap there - but only cheap, not free: with the budget
 wired in, a signature nothing could verify must not be able to take a
 verification off the allowance on its way to being refused. Two hundred lapsed
 copies of the real DS signature therefore leave the meter where an untouched
@@ -440,8 +441,9 @@ set, and the genuine RRSIG over it verifies exactly as it did.
 
 The genuine DNSKEY signature is removed here so that nothing verifies and every
 one of those iterations runs, which is the state an attacker arranges by
-replacing the signature rather than adding to it. Sixty-four DS records and
-eight forgeries were 512 verifications for a single step.
+replacing the signature rather than adding to it. Tried once per DS record,
+sixty-four DS records and eight forgeries would be 512 verifications for a
+single step.
 */
 @(test)
 test_duplicate_ds_records_do_not_multiply_the_dnskey_check :: proc(t: ^testing.T) {
@@ -499,18 +501,17 @@ kt_ds :: proc(t: ^testing.T, zone: string) -> (ds: Ds, ok: bool) {
 /*
 Running out of verifications is not an insecure delegation.
 
-The trap in wiring a budget into `fetch_keys`: its failure return is
-`Insecure if unsupported else Bogus`, and `unsupported` is set by any DS in the
-set naming an algorithm or digest this build cannot check - which a parent zone
-is free to publish alongside a supported one. Leaving through that return when
-the budget dies would hand an attacker a downgrade: pad the DNSKEY set, exhaust
-the allowance before the genuine signature is reached, and the zone comes back
-`Insecure` - no AD bit asked for, no chain, and every answer below it accepted
-unvalidated.
+The trap in wiring a budget into `fetch_keys`: its failure return is a verdict
+about the zone - `Bogus` when some DS in the set names something this build can
+check (`checkable`), `Insecure` when none does. Leaving through that return when
+the budget dies would let a padded DNSKEY set choose a verdict: exhaust the
+allowance before the genuine signature is reached, and the zone comes back
+accused, or, read per record as RFC 6840 section 5.2 does not, `Insecure` - no
+AD bit asked for, no chain, and every answer below it accepted unvalidated.
 
-The cache makes it worse than one answer: `zone_step` writes an `Insecure`
-verdict for the zone into the zone cache for the DS set's TTL, so one padded
-reply buys the downgrade for every question about that zone until it expires.
+The cache makes a downgrade worse than one answer: `zone_step` writes an
+`Insecure` verdict for the zone into the zone cache for the DS set's TTL, so one
+padded reply would buy it for every question about that zone until it expires.
 
 Exhaustion is a statement about this server and not about the zone, so it leaves
 as `Indeterminate`, the same verdict `zone_step` already gives a DS step whose
@@ -524,8 +525,9 @@ test_an_exhausted_key_check_is_not_a_downgrade :: proc(t: ^testing.T) {
 		return
 	}
 	// The same delegation, published a second time under an algorithm this
-	// build has never implemented. Nothing forbids a parent from doing that,
-	// and it is what sets `unsupported`.
+	// build has never implemented. Nothing forbids a parent from doing that;
+	// the set stays `checkable` through the genuine DS, and this is the record
+	// a per-record reading would call the delegation insecure over.
 	unsupported := genuine
 	unsupported.algorithm = 253
 

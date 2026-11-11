@@ -149,9 +149,9 @@ The OPT record is itself what does not fit.
 There is nothing behind it to drop, so it goes out without one - and the answer
 is still complete, so TC stays clear. This is the case `server.attach_cookie`
 reaches when the cookie is the twenty-eight bytes that push the answer over the
-client's buffer: before this split, the client was handed a complete answer with
-TC set, no OPT record and no cookie, and asked again over TCP for bytes it
-already had.
+client's buffer: setting TC there would hand the client a complete answer with
+no OPT record and no cookie, and send it back over TCP for bytes it already
+has.
 */
 @(test)
 test_an_opt_record_that_will_not_fit_leaves_tc_clear :: proc(t: ^testing.T) {
@@ -247,10 +247,10 @@ test_an_overflowing_additional_section_re_adds_one_opt :: proc(t: ^testing.T) {
 A cut that leaves the OPT record nowhere to go takes another record with it.
 
 The re-add is what keeps a client's EDNS parameters on a truncated answer, and
-before this it only worked when the record the cut dropped happened to be larger
-than the OPT record: below that, the client was handed TC with no OPT record at
-all - no payload size to size its retry with, no upper bits of the rcode, and,
-where `server.attach_cookie` had put one in, no cookie. So the walk back goes to
+it cannot rest on the record the cut dropped happening to be larger than the OPT
+record: below that, the client would be handed TC with no OPT record at all - no
+payload size to size its retry with, no upper bits of the rcode, and, where
+`server.attach_cookie` had put one in, no cookie. So the walk back goes to
 the last record that leaves room, which is a record dropped from an answer
 section the client is being told to discard anyway.
 
@@ -513,10 +513,10 @@ The room the OPT record needs is kept against the records ahead of it too.
 
 It is normally the last record in the section, so the glue in front of it spends
 the ceiling first - and where that leaves eleven bytes short, a client that
-asked with EDNS used to get an answer with no OPT record in it at all: no
-payload size, no cookie, no extended error, and no cut for the walk back to
-work from, since the answer came out whole. The glue goes instead, which is a
-hint the client can ask for again.
+asked with EDNS would get an answer with no OPT record in it at all: no payload
+size, no cookie, no extended error, and no cut for the walk back to work from,
+since the answer comes out whole. The glue goes instead, which is a hint the
+client can ask for again.
 
 Reachable from `server.strip_dnssec_records`, which appends a minted OPT record
 behind the additional records that survived the strip and encodes the lot at the

@@ -777,8 +777,8 @@ destroy_generation :: proc(g: ^Generation) {
 /*
 Release every generation, current and retired, at shutdown.
 
-Only once nothing can be using any of them: the listeners are stopped and both
-pools drained.
+Only once nothing can be using any of them: the listeners are stopped and
+`drain_queries` has run.
 */
 destroy_generations :: proc(s: ^Server) {
 	for s.gens.retired != nil {

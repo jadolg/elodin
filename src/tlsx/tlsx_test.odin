@@ -33,11 +33,11 @@ CERT_DIR :: "/tmp/elodin-tlsx-test"
 /*
 How long a generated certificate lives.
 
-Thirty rather than the two it was, now that an expired one is noticed rather than
-handshaken with: the reuse is there to keep key generation off the clock, and a
-lifetime measured in days spent it again every other day for no reason. Still
-short enough that a forgotten key in the system temp directory is not a permanent
-one.
+Thirty days, since an expired one is noticed rather than handshaken with (see
+`cert_still_valid`): the reuse is there to keep key generation off the clock,
+and a lifetime of a day or two would spend it again every other day for no
+reason. Still short enough that a forgotten key in the system temp directory is
+not a permanent one.
 */
 @(private = "file")
 CERT_DAYS :: "30"
@@ -54,14 +54,12 @@ cert_ok: bool
 /*
 Whether a certificate already on disk can still be handshaken with.
 
-The reuse above it is the point of the cache and was also a time bomb: the
-generated certificate lives for `CERT_DAYS`, the files are reused whenever they
-exist, and nothing looked at the date. So every machine that ran these tests more
-than that long ago failed `test_verifying_context_refuses_a_name_it_cannot_bind`
-on its *control* case - the name the certificate carries, refused - and went on
-failing it, on every run, until somebody deleted the directory by hand. It is not
-a flake and a re-run does not clear it; the one that found this had expired eight
-minutes before the run that caught it.
+The reuse above it is the point of the cache, and without a look at the date it
+is a time bomb: the generated certificate lives for `CERT_DAYS` and the files
+are reused whenever they exist. Reusing an expired pair would fail
+`test_verifying_context_refuses_a_name_it_cannot_bind` on its *control* case -
+the name the certificate carries, refused - on every run, until somebody
+deleted the directory by hand.
 
 `-checkend` asks the question directly, and asks it about an hour from now rather
 than about this instant, so a certificate cannot expire between this check and

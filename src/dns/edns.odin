@@ -848,8 +848,7 @@ record for the rebuild below to drop, and the common case - an upstream that
 wrote no options, with its OPT record where an OPT record goes - allocates
 nothing. An empty record with anything behind it goes to the rebuild instead:
 what is behind it may be another OPT record carrying options, and returning early
-on the first record's emptiness would hand that one to the client whole. Ordered
-the other way round this read as an optimisation and was a hole.
+on the first record's emptiness would hand that one to the client whole.
 
 Never written in place, for `remove_opt`'s reason: the bytes handed in may be a
 cache entry other clients are still being served from, and an option's absence

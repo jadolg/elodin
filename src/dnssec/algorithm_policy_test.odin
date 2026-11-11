@@ -360,9 +360,8 @@ test_no_probe_vector_can_be_rejected_as_a_forgery :: proc(t: ^testing.T) {
 /*
 What the table reports is what the library did, algorithm by algorithm.
 
-This is the whole point of probing: `algorithm_supported` used to answer for
-what this codebase implements, which on a host whose OpenSSL refuses SHA-1 is
-not the same list. Both directions are asserted, because both are load-bearing
+This is the whole point of probing: what this codebase implements is, on a host
+whose OpenSSL refuses SHA-1, not the same list as what the library will run. Both directions are asserted, because both are load-bearing
 - an algorithm reported supported that the library will not run leaves the
 RFC 6840 section 5.11 downgrade open, and one reported unsupported that it
 would run degrades a zone to insecure for no reason.
@@ -565,8 +564,8 @@ test_a_refused_signature_does_not_downgrade_an_altered_rrset :: proc(t: ^testing
 /*
 A zone signed only with a refused algorithm keeps resolving.
 
-The other half, and the reason the refusal was ever kept apart from an
-unimplemented algorithm: a zone that has done nothing wrong must not become
+The other half, and the reason a refusal is decided where an unimplemented
+algorithm is: a zone that has done nothing wrong must not become
 unresolvable on one distribution and fine on every other. RFC 6840 section 5.2
 puts that decision at the DS, and putting it there is what lets the RRset
 inside a secure zone be judged strictly - so this test and the one above hold
@@ -653,9 +652,9 @@ A DS set that names a refused algorithm beside a checkable one is not an
 insecure delegation.
 
 RFC 6840 section 5.2 makes a delegation insecure when the resolver supports
-*none* of the algorithms in the DS RRset. `fetch_keys` was reading it as "some
-DS named something we cannot check", which is a different set of zones - and a
-much larger one once an algorithm can leave `algorithm_supported` at start-up.
+*none* of the algorithms in the DS RRset. Read as "some DS named something we
+cannot check" it is a different set of zones - and a much larger one once an
+algorithm can leave `algorithm_supported` at start-up.
 
 `migrating.` is delegated with two DS records, one per algorithm. Take the
 signatures off its DNSKEY set - the cheapest tampering on the path to an
@@ -777,10 +776,10 @@ mid-rollover hands them the material to fill it with: it really does publish
 the refused algorithm, so copies of its own RRSIG carry a real key tag, a real
 algorithm and a window that is genuinely open, and every cheap test in front of
 the crypto passes them. Charged a verification each, sixty-four of them ahead
-of the ECDSA signature turn a name that resolves into `Indeterminate` and a
-SERVFAIL.
+of the ECDSA signature would turn a name that resolves into `Indeterminate` and
+a SERVFAIL.
 
-Nothing is spent on them now, because nothing has to be: the policy table
+Nothing is spent on them, because nothing has to be: the policy table
 answers for a refused algorithm without asking libcrypto, so the answer is in
 hand before the meter is touched. The padded set costs exactly what the
 unpadded one costs, and still validates.

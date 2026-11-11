@@ -256,8 +256,8 @@ runs_ok :: proc(command: []string) -> bool {
 /*
 The `port` field of a query line, as a number.
 
-0 for anything that is not one - an empty field, or a value with a byte in it
-that is not a digit - so a caller asking for a real port asks `> 0` and a line
+0 for anything `strconv.parse_int` rejects, an empty field among them, so a
+caller asking for a real port asks `> 0` and a line
 that lost the field fails the check rather than passing it by accident.
 */
 @(private = "file")

@@ -273,9 +273,9 @@ The DNAME rescue exists because RFC 6672 section 3.4.1 has the responder
 synthesize its CNAME unsigned, the DNAME being what carries the authority. The
 verdict it produces names an RRset, though, and the prune keeps everything
 matching that name, type and class - so asking whether *one* record is covered
-and then vouching for the set let a second CNAME at the same owner go out under
-the AD bit, pointing wherever the sender chose. Nothing signed it and nothing
-looked at it.
+and then vouching for the set would let a second CNAME at the same owner go out
+under the AD bit, pointing wherever the sender chose, with nothing having signed
+it or looked at it.
 
 Reachable by whoever writes the answer: a malicious upstream, or anyone on the
 path to a plain UDP or TCP one. A zone may not publish two CNAMEs at one name

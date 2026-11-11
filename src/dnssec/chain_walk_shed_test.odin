@@ -16,14 +16,13 @@ misses both caches is an upstream round trip taken in line - up to
 `MAX_LOOKUPS_PER_QUERY` of them for one client question. #349's memo takes a
 *repeated* run down to one walk per name, but a client that varies a label near
 the apex makes every name below it fresh by construction and misses the memo the
-whole way down, however often it asks. No cache closes that; the note on
-`MAX_CACHED_NON_CUTS` has the argument, and a bound on the run itself was tried
-in #349 and reverted because deployed `ip6.arpa.` zones sit deeper than the walk
-an attacker needs.
+whole way down, however often it asks. No cache closes that, and neither does a
+bound on the run itself, because deployed `ip6.arpa.` zones sit deeper than the
+walk an attacker needs; the note after `MAX_NON_CUT_TTL` has the argument.
 
 So what is bounded here is not the walk but the number of them in flight. The
-first test is the reproduction: without a bound, every thread that asks is a
-thread parked on the walk's first round trip at the same moment.
+first test is the reproduction: without a bound, every query that asks is a
+query parked on the walk's first round trip at the same moment.
 
 The rest are the other half of the bargain, and the third of them is there
 because the second reads better than the truth. A walk turned away still reads
@@ -206,8 +205,7 @@ A walk that needs no lookup is not affected by the bound at all.
 This is what keeps the bound from being a second denial of service, and it is
 why the slot is taken at the first upstream lookup rather than on the way into
 the walk: a question a warm cache answers must neither be refused while every
-slot is held nor take a slot other walks need - and must not move `queries_shed`,
-which an operator reads as the flood's own number.
+slot is held nor take a slot other walks need.
 */
 @(test)
 test_a_shed_walk_still_answers_from_the_cache :: proc(t: ^testing.T) {

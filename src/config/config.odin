@@ -1,7 +1,6 @@
 package config
 
 import "core:encoding/hex"
-import "core:fmt"
 import "core:time"
 
 Log_Level :: enum u8 {
@@ -24,11 +23,12 @@ Listener :: struct {
 	cert_file:         string,
 	key_file:          string,
 	/*
-	UDP only: reader threads, each with a socket of its own on the same port.
+	UDP only: readers, each an event loop with a socket of its own on the same
+	port.
 
 	Everything a datagram costs before the rate limiter can see it - the
 	`recvfrom`, the allow-list compare, the siphash of the source prefix -
-	happens on the thread that read it, so one reader is one core's worth of
+	happens on the loop that read it, so one reader is one core's worth of
 	drain rate for the whole server. Past it the kernel's receive queue
 	overflows and datagrams are dropped by the socket rather than by anything
 	this server decides, which is where its fairness properties stop applying:
@@ -41,7 +41,7 @@ Listener :: struct {
 	Each reader binds the same address and port with `SO_REUSEPORT`, so the
 	kernel hands each socket its own receive queue and spreads arriving
 	datagrams between them by a hash of the 4-tuple. The drain rate then scales
-	with readers instead of being one thread's, which is how BIND and Unbound
+	with readers instead of being one loop's, which is how BIND and Unbound
 	scale the same path.
 
 	Zero derives one per usable CPU, to a ceiling - see `sizing.odin`. What it
@@ -146,7 +146,7 @@ Upstream_Config :: struct {
 	instead. Empty on a server that forwards everything to one place.
 
 	Always empty on a route's own `upstream` below: routes do not nest, and
-	`load_upstream` refuses a `zones` key inside one rather than reading it and
+	`load_upstream_zones` refuses a `zones` key inside one rather than reading it and
 	doing nothing with it. The field is here rather than beside it because a
 	route is a whole upstream configuration in its own right - its own
 	strategy, timeout and server list - and that is the type `make_group`
@@ -252,8 +252,8 @@ Cache_Config :: struct {
 	is ten seconds with the defaults. A glibc stub gives up after five
 	(`RES_TIMEOUT`) and systemd-resolved sooner, so in the outage the setting
 	exists for - an upstream that is unreachable rather than answering - the
-	expired answer arrived after the client had already failed, and the feature
-	did nothing for the case an operator turns it on for (issue #164).
+	expired answer would arrive after the client had already failed (issue
+	#164).
 
 	1.8 seconds is the figure section 5 recommends, and it is chosen against the
 	stub rather than against the upstream: it has to leave the answer a margin
@@ -359,7 +359,8 @@ Dnssec_Config :: struct {
 	behalf of the query it is validating, once per label of the name being
 	walked. Nothing about the name is this server's to choose, so without a
 	bound a client picking names whose upper labels are fresh holds every query
-	it may have in flight there, each for up to thirty round trips (issue #356).
+	it may have in flight there, each for up to `MAX_LOOKUPS_PER_QUERY` round
+	trips (issue #356).
 	Past this many, a walk reads the caches and answers SERVFAIL where it would
 	have gone upstream, which is what an upstream that did not answer already
 	produces - and that covers every cold name while it binds, unsigned ones
@@ -431,7 +432,7 @@ is answered NODATA and the client stays on Do53. Off by default because only the
 operator knows which name their certificate covers, and a designation the
 certificate does not cover moves a client to an endpoint it cannot verify, which
 is worse than designating nothing. Each enabled DoT and DoH listener whose
-certificate covers the name is designated; see `server.ddr.odin`.
+certificate covers the name is designated; see `server/ddr.odin`.
 */
 DDR_Config :: struct {
 	// Canonical, lowercase, trailing dot.
@@ -632,8 +633,7 @@ Server_Config :: struct {
 
 	Zero derives half of `max_connections`: an even split with everybody else, and
 	far above what any real client network holds at once. Anything at or above
-	`max_connections` is no cap at all - one client may have the whole table, which
-	is what this server did before the setting existed.
+	`max_connections` is no cap at all - one client may have the whole table.
 
 	Note what a prefix is on a private network. Every device on a 192.168.1.0/24
 	LAN is one client to this setting, sharing one cap between them, so a resolver
@@ -784,11 +784,11 @@ it, a refusal that costs a TLS handshake being dearer than the answer it withhel
 
 The truncated answers have a budget too, an eighth of the figure below and at least
 one a second, so `slip` is "at most one in N" and not "one in N of whatever
-arrives". Without it their number was a fraction of the attack rate with no ceiling
-in it - a flood of two million datagrams a second had this server send half a
-million truncated answers a second at the address it named, on a configuration that
-says 500 - and each of those writes came off the thread reading the UDP socket, at
-the expense of every other client's queries. An eighth, rather than the whole
+arrives". Uncharged, their number is a fixed fraction of the attack rate with no
+ceiling in it - a flood of two million datagrams a second makes half a million
+truncated answers a second at the address it names, on a configuration that says
+500 - and each of those writes comes off the loop reading the UDP socket, at the
+expense of every other client's queries. An eighth, rather than the whole
 figure, because a truncated answer is an invitation and not an answer: a client that
 takes it moves onto a connection, whose budget a datagram flood cannot empty.
 
@@ -806,7 +806,7 @@ What the datagram figure is denominated in is `response_size_estimate`, which is
 the other half of what it means: the count bounds sendings, and an answer larger
 than the estimate is charged as several of them, so the bytes one prefix can be
 made to receive stop depending on which question was asked. Unset it is
-`server.max_udp_response`, and every answer costs one token exactly as before.
+`server.max_udp_response`, and every answer costs one token.
 
 `overrides` is what makes the figures above defaults rather than the only answer.
 See `Rate_Limit_Override`.
@@ -878,12 +878,12 @@ means two incompatible things depending on where this server is: on a LAN a /24
 is a household or an office, and the shipped 500 responses a second is "far past
 what the busiest of those asks for". On the internet a /24 behind carrier-grade
 NAT is thousands of subscribers, and 500 a second is what they get between them.
-One figure cannot be right for both, and nothing in the file said which one a
-given prefix was.
+One figure cannot be right for both, and only the file can say which one a
+given prefix is.
 
 So a prefix can be named and given its own. Everything else stays on the
-defaults, which is the shape `allow_from` already has and the reason the
-vocabulary was there to reuse.
+defaults, which is the shape `allow_from` already has, and the vocabulary is
+the same.
 
 What the slip does about this without an override is real but bounded, and the
 bound is worth knowing before deciding not to write one. A prefix over its
@@ -1091,7 +1091,7 @@ cannot because the network whose router answers those PTRs has a way to say so
 that outranks the key rather than fighting it: an `upstream.zones` route over
 the zone (or over any name in it) is sent to the route, and so is a zone the
 operator anchored in `dnssec.trust_anchors`. Off hands every one of those names
-back to `upstream.servers`, as before. Same `DS` carve-out at each apex, for
+back to `upstream.servers`. Same `DS` carve-out at each apex, for
 the same reason.
 */
 Special_Use_Config :: struct {
@@ -1103,59 +1103,7 @@ Special_Use_Config :: struct {
 	private_reverse: bool,
 }
 
-/*
-Keys a file may still name although nothing reads them any more.
-
-The worker pools these sized went with #547: queries and connections run on
-fibers of the event loops, and what the pools bounded is bounded by
-`server.max_pending`, `server.max_connections` and `listeners.udp.readers`
-instead. Refusing a key is how this loader treats an unknown one (see
-`check_keys`), and a file that named one of these was correct the day before
-the upgrade - so for one release each is accepted, read as an integer, ignored,
-and said once at startup, at every reload and under `--check` (`retired_warning`).
-After that they are unknown keys like any other.
-*/
-Retired_Key :: enum u8 {
-	Workers,
-	Upstream_Workers,
-	Running_Workers,
-}
-
-Retired_Keys :: bit_set[Retired_Key]
-
-// The release in which the retired keys become unknown ones, and are refused:
-// the one after the release that retires them, 0.25.0.
-RETIRED_KEYS_REFUSED_IN :: "0.26.0"
-
-/*
-What a retired key was, and what decides what it decided now. One place, so
-startup, a reload and `--check` say it in the same words.
-*/
-retired_warning :: proc(key: Retired_Key, allocator := context.temp_allocator) -> string {
-	name, instead: string
-	switch key {
-	case .Workers:
-		name = "server.workers"
-		instead = "queries no longer wait on threads; server.max_pending bounds how many are in flight"
-	case .Upstream_Workers:
-		name = "server.upstream_workers"
-		instead = "racers run beside the query that started them; server.max_pending bounds the queries"
-	case .Running_Workers:
-		name = "server.running_workers"
-		instead = "listeners.udp.readers is how many event loops, and so how many cores, the server uses"
-	}
-	return fmt.aprintf(
-		"%s is no longer used and is ignored: %s. Remove it; from release %s it is refused",
-		name,
-		instead,
-		RETIRED_KEYS_REFUSED_IN,
-		allocator = allocator,
-	)
-}
-
 Config :: struct {
-	// The retired keys the file named; see `Retired_Key`.
-	retired:     Retired_Keys,
 	log:         Log_Config,
 	server:      Server_Config,
 	listeners:   Listeners,

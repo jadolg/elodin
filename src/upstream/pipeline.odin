@@ -16,8 +16,8 @@ A `tcp://` or `tls://` upstream that wrote one query and blocked reading its
 reply would leave the connection unavailable to anyone else until that
 returned, and N concurrent queries would cost N connections. Section 6.2.1.1
 asks for the opposite - a client SHOULD NOT wait for an outstanding reply
-before sending the next query - and section 6.2.2 makes the consequence a MUST:
-no more than one connection for regular queries. It matters in practice as well
+before sending the next query - and section 6.2.2 requires keeping concurrent
+connections to a minimum (MUST) and recommends one for regular queries. It matters in practice as well
 as on paper. A resolver that rate-limits *new* connections (Quad9 measurably
 does) refuses a share of them while answering perfectly well on one already
 established, so connection churn would itself be the failure.
@@ -49,9 +49,9 @@ How many queries may be outstanding on one connection at once, at least.
 
 A backstop, and deliberately not a throughput limit. Past it a caller dials a
 connection for its own query and closes it again afterwards, which is a fresh
-handshake per query and worse churn than the pool this replaced - so the figure
+handshake per query and worse churn than a pool of connections - so the figure
 has to sit above every number of callers the server can actually put in
-`exchange` at once, or the fix becomes the bug.
+`exchange` at once, or the backstop becomes the churn it exists to prevent.
 
 That number is what may be in flight: every query a fiber of its own runs
 (`server.max_pending`) and every connection's (`server.max_connections`), all of
@@ -106,7 +106,7 @@ would spend a new connection per slow name.
 Two, because the thing being told apart is "nothing at all, twice" from "one
 late answer", and a third would only delay the recovery. What it costs is one
 extra timeout before a connection that really has gone is replaced, against the
-fifteen minutes it used to cost.
+fifteen minutes the kernel takes to give up (see `pipe_wait`).
 */
 PIPE_SILENT_TIMEOUTS :: 2
 
@@ -290,7 +290,7 @@ Pipe_Conn :: struct {
 Pipe_State :: enum u8 {
 	// Ready for another query.
 	Ready,
-	// Alive, but already carrying `PIPELINE_MAX_OUTSTANDING`.
+	// Alive, but already carrying `Upstream.max_outstanding`.
 	Full,
 	// Dead, or idle for longer than the upstream's idle timeout.
 	Gone,
@@ -940,8 +940,9 @@ pipe_take_id :: proc(c: ^Pipe_Conn) -> (id: u16, ok: bool) {
 			return id, true
 		}
 	}
-	// Unreachable under `Upstream.max_outstanding`, which is held to half the
-	// number of IDs; see `PIPELINE_OUTSTANDING_CEILING`.
+	// Unreachable while `Upstream.max_outstanding` is at most half the number
+	// of IDs, which the caller holds it to by setting it from
+	// `pipeline_outstanding`; see `PIPELINE_OUTSTANDING_CEILING`.
 	return 0, false
 }
 
@@ -1341,8 +1342,8 @@ pipe_write :: proc(c: ^Pipe_Conn, query: []u8, deadline: time.Tick) -> Error {
 		is one that came out of the dial queue on a sliver - `get_pipe` lets it
 		through on a nanosecond - and the connection it would take down is the
 		one just dialled for the burst behind it. Killing on a write that never
-		started would turn the queue into exactly the churn this change exists
-		to remove.
+		started would turn the queue into exactly the churn pipelining exists
+		to avoid.
 
 		Killed here rather than by the caller, because `wmu` is still held.
 		`pipe_query` doing it would let one more writer take its turn in the

@@ -77,9 +77,7 @@ stats_line :: proc(
 		st.cached,
 		st.forwarded,
 		st.failed,
-		// Published by the endpoint as `outcome="rewritten"` since it existed,
-		// and absent from this line until the guard below started reading the
-		// struct instead of a list somebody maintained by hand.
+		// The endpoint publishes it as `outcome="rewritten"`.
 		st.rewritten,
 		st.dropped,
 		st.refused,
@@ -112,10 +110,10 @@ stats_line :: proc(
 		cs.misses,
 		cs.stale,
 		cs.evictions,
-		// Last, and after the cache's figures, because it is the newest of them
-		// rather than because it belongs there: a scraper reading positions
-		// rather than names is not something this line owes anything to, but an
-		// operator's eye reading the same line every day is.
+		// Placed where the line keeps its order stable rather than grouped by
+		// meaning: a scraper reading positions rather than names is not something
+		// this line owes anything to, but an operator's eye reading the same line
+		// every day is.
 		st.unreadable_rcode,
 		st.coalesced,
 		cs.prefetches,
@@ -221,8 +219,8 @@ metrics_accept_loop :: proc(data: rawptr) {
 		The DNS listeners' handling exactly, including reading every field of the
 		action on every path - this is the quietest socket in the process, so the
 		poll tick is almost the only thing that ever takes its run to zero, and a
-		re-arm read only after a successful accept was one this loop would never
-		have performed.
+		re-arm read only after a successful accept would be one this loop never
+		performs.
 
 		`accept_backoff=` counts the waiting rather than a connection, which is
 		what lets this loop share it without putting a scraper into a
@@ -380,7 +378,7 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 	that a PromQL query and a Loki query about the same event are written the
 	same way.
 
-	These do not add up to `elodin_queries_total`. A query the backlog or the
+	These do not add up to `elodin_queries_total`. A query `max_pending` or the
 	allow list turned away never reached an outcome, and one answered from a
 	local zone is not among these either; the difference is the `dropped` and
 	`refused` counters below. Of the local answers only the reserved-name table
@@ -416,7 +414,7 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		&b,
 		"elodin_queries_dropped_total",
 		.Counter,
-		"Queries turned away before any work was done, because the backlog was full or the source could not be answered.",
+		"Queries turned away before any work was done: server.max_pending was reached, the query could not be started, or the source could not be answered.",
 		st.dropped,
 	)
 	metrics.scalar(

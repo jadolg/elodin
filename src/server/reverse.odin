@@ -30,9 +30,10 @@ than repeating one an operator wrote down.
 
 Several names for one address is legal and common - a host with an alias, a
 service name beside the machine's own - and only one PTR can be right. The
-first matching rule wins, in file order, which is the precedence `find_rewrite`
-already gives the forward direction: an operator reading their file top to
-bottom sees the same rule claim the name and the address.
+first matching rule wins, in file order, as the forward direction's
+`rewrite_rule_for` takes the first rule with an answer of the type asked: an
+operator reading their file top to bottom sees the same rule claim the name and
+the address.
 
 Nothing outside private space is synthesised. A rule pointing a name at a public
 address must not make this server answer PTR for somebody else's reverse zone,
@@ -76,7 +77,7 @@ a site nothing, either - they are serving a signed reverse zone, so the PTR this
 would have invented is one they already publish.
 
 What it does change for an existing installation is narrow and worth naming: a
-site whose upstream really does serve its own reverse zone, unsigned, now gets
+site whose upstream really does serve its own reverse zone, unsigned, gets
 this server's answer for the addresses named in `rewrites` rather than the
 router's. The two disagree only where the operator wrote one of them down, and
 the one they wrote down is this one. Signing that zone and anchoring it is how
@@ -237,12 +238,12 @@ pointing at a name whose own A is NXDOMAIN would be this server contradicting
 itself between two answers to one question.
 
 And a rule the forward direction never reaches does not hand out its address
-either. `rewrites` is matched first-wins by `find_rewrite`, so an earlier
-wildcard over the same name - `*.home` above `nas.home` - or an earlier rule
-with a duplicate `domain:` is what answers, and the shadowed rule's address is
-never given to anybody. Synthesising from it would point the reverse at a name
-whose forward answer is a different address, which is the forward-confirmed
-reverse check failing on this server's own two answers.
+either. `rewrite_rule_for` takes the first rule with an answer of the type
+asked, so an earlier wildcard over the same name - `*.home` above `nas.home` -
+or an earlier rule with a duplicate `domain:` is what answers, and the shadowed
+rule's address is never given to anybody. Synthesising from it would point the
+reverse at a name whose forward answer is a different address, which is the
+forward-confirmed reverse check failing on this server's own two answers.
 
 That last test is on the answer rather than on which rule won, and the
 difference matters in one direction only. `*.lab -> 10.0.0.1` above
@@ -250,7 +251,7 @@ difference matters in one direction only. `*.lab -> 10.0.0.1` above
 resolves to 10.0.0.1, so the pair agrees and the name is a true reverse for the
 address; refusing it because some other rule answered would lose a PTR for no
 reason. What has to hold is that the name really does resolve to the address
-being asked about, which is what `find_rewrite_index` is asked - "same domain"
+being asked about, which is what `rewrite_rule_for` is asked - "same domain"
 could not answer it, the second of two duplicate `domain:` entries having the
 same domain as the first and none of its answers.
 */

@@ -194,13 +194,12 @@ Reload_Race :: struct {
 A reload must not release the context while a connection is still taking a
 reference from it.
 
-This is the whole of the bug that was here. `reload_tls` freed the context it
-displaced the moment it had swapped a new one in, and `accept_tls` reads that
-pointer and dereferences it in `tlsx.server_session` a few instructions later —
-so a SIGHUP landing in between left a connection thread calling `SSL_new` on
-freed memory. Under ASan and with the window widened to a couple of
-milliseconds it is a `heap-use-after-free` that ends the process; in production
-it is a rare crash on the one operation an operator is told is safe to automate.
+`accept_tls` reads the context pointer and dereferences it in
+`tlsx.server_session` a few instructions later, so a reload that freed the
+context it displaced the moment it had swapped a new one in would let a SIGHUP
+landing in between leave a connection calling `SSL_new` on freed memory: a
+`heap-use-after-free` under ASan, and in production a rare crash on the one
+operation an operator is told is safe to automate.
 
 What closes it is that `accept_tls` holds `tls_mu` shared across the pointer
 read and `SSL_new`, and the reload takes it exclusively to swap and free. So the

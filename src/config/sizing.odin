@@ -184,9 +184,9 @@ MAX_DERIVED_UDP_READERS :: 8
 /*
 Readers for a machine.
 
-A machine whose CPUs could not be counted gets one, which is what elodin had
-before this setting existed: a loop that has no core to run on buys nothing and
-costs a thread and a receive buffer, so guessing narrow is the safe direction.
+A machine whose CPUs could not be counted gets one: a loop that has no core to
+run on buys nothing and costs a thread and a receive buffer, so guessing narrow
+is the safe direction.
 */
 derive_udp_readers :: proc(m: Machine) -> int {
 	if m.cpus <= 0 {
@@ -225,8 +225,8 @@ Queries in flight kept back from the chain walk.
 
 The chain walk waits on the network once per label of a name the client chose,
 so without a bound a flood of fresh names holds every query the server may have
-in flight, each for up to thirty round trips, and the resolver stops answering
-anything at all (issue #356). What has to be guaranteed is that most of what may
+in flight, each for up to `MAX_LOOKUPS_PER_QUERY` round trips, and the resolver
+stops answering anything at all (issue #356). What has to be guaranteed is that most of what may
 be in flight keeps *turning over* - and that is a *reservation* rather than a
 ceiling.
 
@@ -237,8 +237,8 @@ not bounded here. What the reservation buys is that at most `max_chain_walks` of
 them can be inside a chain walk, and a walk is up to `MAX_LOOKUPS_PER_QUERY` round
 trips against a forward's one - so the rest come back in a round trip rather than
 in a second, and new queries keep being admitted instead of shed. Enough of a
-flood will still fill `max_pending` and shed; what it can no longer do is hold
-it for thirty round trips apiece, which is the whole of #356.
+flood will still fill `max_pending` and shed; what it cannot do is hold
+it for `MAX_LOOKUPS_PER_QUERY` round trips apiece, which is the whole of #356.
 
 Stated this way round on purpose. A ceiling of half the bound also caps honest
 throughput at half, and the walks past it are answered SERVFAIL: every
@@ -509,9 +509,9 @@ parse_memory_max :: proc(text: string) -> (bytes: i64, ok: bool) {
 Read a small pseudo-file into a caller-supplied buffer.
 
 `/sys` and `/proc` files report a size of zero, so the usual read-the-whole-file
-path allocates nothing and reads nothing. Everything read here is a line or two,
-so a stack buffer covers it and the config loader stays free of allocations it
-would have to own.
+path cannot size a buffer from them and grows one on the heap instead. Everything
+read here is a line or two, so a stack buffer covers it and the config loader
+stays free of allocations it would have to own.
 
 Read to the end rather than trusting one `read`, and refuse a buffer that filled
 completely: half of "10737418240" is "1073", which parses as cleanly as the whole
@@ -555,8 +555,8 @@ Pooled upstream connections this configuration can hold open at once.
 
 `upstream.max_idle` is a per-server figure - `make_upstream` gives every server
 its own pool - so the total is that many for each server named anywhere, and a
-zone route is named anywhere: `main` builds one group per `upstream.zones` entry,
-each with the route's own `max_idle` and its own servers.
+zone route is named anywhere: `server.build_upstreams` builds one group per
+`upstream.zones` entry, each with the route's own `max_idle` and its own servers.
 
 Counted rather than estimated because a configuration with a dozen routes has a
 pool that is no longer a rounding error against the connection table. The

@@ -254,9 +254,9 @@ allowance.
 
 A hundred iterations here, which is legal, is the ceiling this server ships with
 and is what a zone that has not read RFC 9276 still publishes. The proof has to
-hold up, and with one kept hash it does not: ninety hashes at a hundred and one
-rounds each is more than a whole allowance, so a zone mid-rollover would have
-gone SERVFAIL for as long as the rollover lasted.
+hold up, and with one kept hash it would not: ninety hashes at a hundred and one
+rounds each is more than a whole allowance, so a zone mid-rollover would go
+SERVFAIL for as long as the rollover lasted.
 */
 @(test)
 test_a_denial_carrying_two_salts_still_fits_in_one_allowance :: proc(t: ^testing.T) {
@@ -396,10 +396,10 @@ refusal is a policy rather than a moment - this server will not read those
 records for any question, so what the new chain says is the whole of what it
 knows about the zone, and it is a complete answer rather than one cut short.
 
-Reading the refusals together got this wrong for as long as it took to be
-noticed here: the step came back undecided, `zone_step` turned that into
-`Indeterminate`, and a subtree that resolves on any other resolver went SERVFAIL
-because of a chain this server had decided to ignore.
+Reading the refusals together would get this wrong: the step would come back
+undecided, `zone_step` would turn that into `Indeterminate`, and a subtree that
+resolves on any other resolver would go SERVFAIL because of a chain this server
+had decided to ignore.
 */
 @(test)
 test_a_chain_above_the_ceiling_does_not_stop_the_one_beside_it :: proc(t: ^testing.T) {
@@ -433,8 +433,8 @@ A DS denial this server could read none of for its iteration count keeps the
 walk going on the parent's keys, rather than leaving it undecided.
 
 Every record above the ceiling is refused, and that refusal is a policy: no
-question will ever read them. Reading it as `Indeterminate` made every name
-below a parent over the ceiling SERVFAIL here and nowhere else. Issue #331.
+question will ever read them. Reading it as `Indeterminate` would make every
+name below a parent over the ceiling SERVFAIL here and nowhere else (#331).
 
 Not `.Insecure` either, which is the other easy answer and a hole: the walk
 runs over every label of every owner it checks, so an insecure step makes every

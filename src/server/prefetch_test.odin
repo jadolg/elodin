@@ -146,7 +146,7 @@ entry's one claim every later hit would start another: an upstream query per
 client query, against an upstream that has just shown it is not answering. The
 entry expires as it would have without prefetching, and the failure is counted.
 
-The pool is joined between the two queries so the second finds the first
+The loop is stopped between the two queries so the second finds the first
 refresh finished rather than still in its slot, which would hold it off for a
 different reason.
 */

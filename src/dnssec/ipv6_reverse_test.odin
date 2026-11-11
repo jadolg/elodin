@@ -12,13 +12,13 @@ The chain here is what answers one for real - root, `arpa.`, `ip6.arpa.`, and
 the /32 the address sits in - with the run of empty non-terminals between
 `ip6.arpa.` and that delegation that the nibble-per-label encoding forces. Four
 zone cuts and a walk fourteen labels long, none of it unusual; the only thing
-out of the ordinary about the name is that it has thirty-four labels, and that
-was enough for `zone_trust` to refuse it before asking anybody anything.
+out of the ordinary about the name is that it has thirty-four labels, which is
+past `MAX_CHAIN_DEPTH` were labels counted rather than cuts (#352).
 
 Nothing is forged. Every record verifies against the zone above it, the denial
 verifies against the /32's own key, and the answer a client gets is `Secure` -
-which is the point: the bug turned a correct, signable, entirely ordinary answer
-into SERVFAIL for every IPv6 address on the internet.
+which is the point: counting labels would turn a correct, signable, entirely
+ordinary answer into SERVFAIL for every IPv6 address on the internet.
 
 Generated - `testdata/gen/sign_fixtures.py`, scenario `ipv6_reverse_name_error`.
 Ed25519 throughout, root replaced by a trust anchor of the generator's own
@@ -322,9 +322,9 @@ r6_fixture :: proc(key: string) -> []u8 {
 The walk reaches the zone that holds the address space.
 
 Fourteen labels down, past eleven empty non-terminals and three zone cuts, with
-the keys of the /32 in hand at the end of it. Before the fix this returned
-`Indeterminate` and `.` without a single upstream query, because thirty-four is
-more than twenty-four.
+the keys of the /32 in hand at the end of it. A depth bound on labels would
+return `Indeterminate` and `.` without a single upstream query, because
+thirty-four is more than twenty-four.
 */
 @(test)
 test_an_ipv6_reverse_chain_is_walked_to_its_zone :: proc(t: ^testing.T) {
@@ -356,9 +356,8 @@ test_an_ipv6_reverse_chain_is_walked_to_its_zone :: proc(t: ^testing.T) {
 And the client-facing half: the denial validates rather than SERVFAILing.
 
 `validate_denial` walks to the question's own name, which is the path every
-NXDOMAIN and NODATA takes and the one the issue measured - so this is what a mail
-server, `UseDNS` or a logging pipeline got back for an IPv6 address before the
-fix.
+NXDOMAIN and NODATA takes - so this is what a mail server, `UseDNS` or a logging
+pipeline gets back for an IPv6 address.
 */
 @(test)
 test_an_ipv6_reverse_name_error_validates :: proc(t: ^testing.T) {

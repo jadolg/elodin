@@ -367,12 +367,11 @@ budget, not two timeouts each (issue #439).
 
 A silent member stands in front of one that serves the whole chain. The
 client's forward costs one timeout on the silent member before the second
-answers, and every DS and DNSKEY lookup after it used to be a call with a
-budget of its own - so each one waited out the silent member again until it
-parked, and the query was answered at three timeouts, with the stub long gone.
-The query's deadline is two timeouts from its first exchange, and the first
-lookup to meet the silent member spends what is left of it: the query ends
-there, SERVFAIL, at two.
+answers. A DS or DNSKEY lookup with a budget of its own would wait out the
+silent member again until it parked, and the query would be answered at three
+timeouts, with the stub long gone. The query's deadline is two timeouts from its
+first exchange, and each lookup spends what is left of it: the first to meet the
+silent member ends the query there, SERVFAIL, at two.
 */
 @(test)
 test_the_chain_lookups_spend_what_is_left_of_the_query_budget :: proc(t: ^testing.T) {
@@ -441,8 +440,8 @@ test_the_chain_lookups_spend_what_is_left_of_the_query_budget :: proc(t: ^testin
 	_, _, served := handle_query(&s, wire, .UDP, "test", context.temp_allocator)
 	spent := time.tick_since(started)
 	testing.expect(t, served, "no response at all")
-	// Two timeouts and slack for a loaded runner; a budget per lookup waited
-	// three, one per lookup until the silent member parked.
+	// Two timeouts and slack for a loaded runner; a budget per lookup would
+	// wait three, one per lookup until the silent member parked.
 	testing.expectf(t, spent < 5 * cfg.upstream.timeout / 2, "the query waited %v, where its budget is two timeouts of %v", spent, cfg.upstream.timeout)
 	free_all(context.temp_allocator)
 }

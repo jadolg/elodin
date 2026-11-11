@@ -27,7 +27,7 @@ USAGE :: `elodin integration tests
 usage:
   itest [-v] [--binary <path>] [--keep] [--graceful-stop]
   itest --parity [--parity-runs <n>] [--parity-seed <n>] [--parity-upstream <host:port>]
-               [--parity-scenario <name|all>]
+               [--parity-scenario <name|all>] [--parity-explain]
 
 options:
   -v, --verbose       print each case as it runs

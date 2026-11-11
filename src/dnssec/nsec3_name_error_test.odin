@@ -259,9 +259,9 @@ ceiling admits are the ones whose proofs the allowance cannot pay for, so the
 setting reads as laxer and acts as SERVFAIL for names that were being served.
 
 Held here, where the arithmetic is, rather than refused wherever the option came
-from. A configuration carrying a larger number was legal before this bound
-existed, and refusing it would mean a resolver that does not come up after an
-upgrade - a worse answer than either of the ones this is choosing between.
+from, so that a configuration with a larger number still starts: refusing it
+would mean a resolver that does not come up after an upgrade - a worse answer
+than either of the ones this is choosing between.
 */
 @(test)
 test_an_iteration_ceiling_past_the_allowance_is_held_down :: proc(t: ^testing.T) {
@@ -273,8 +273,8 @@ test_an_iteration_ceiling_past_the_allowance_is_held_down :: proc(t: ^testing.T)
 	defer destroy_validator(under)
 	testing.expect_value(t, under.max_nsec3_iterations, 10)
 
-	// Unset still means the shipped default, which is what `make_validator`
-	// has always done with a zero here.
+	// Unset means the shipped default: `make_validator` reads a zero here as
+	// that.
 	unset := make_validator(n3_query, nil, Options{})
 	defer destroy_validator(unset)
 	testing.expect_value(t, unset.max_nsec3_iterations, DEFAULT_MAX_NSEC3_ITERATIONS)
@@ -369,14 +369,14 @@ A step can be refused a hash and decide anyway - a chain above the ceiling
 beside one this server can read is exactly that - and the walk carries on. If
 what stops it five labels later is a lookup nobody answered, saying "nsec3
 iterations above the ceiling" tells the client to go and look at a zone's
-parameters over an upstream that timed out. Which is the misdirection this
-branch added the precise reason to remove, pointing the other way.
+parameters over an upstream that timed out - the misdirection a precise reason
+exists to remove, pointing the other way.
 
 So the reason is written where the walk gives up rather than worked out
 afterwards from counters that only ever go up. What this holds to account is
 the half of that this fixture can reach: a walk stopped by its lookups says so
-in those words, where every `Indeterminate` from a walk used to say the same
-sentence about a chain.
+in those words, rather than the same sentence about a chain every
+`Indeterminate` from a walk could otherwise carry.
 */
 @(test)
 test_a_walk_that_ran_out_of_lookups_does_not_blame_the_hashing :: proc(t: ^testing.T) {
@@ -406,9 +406,9 @@ An unsigned answer inside a zone past the ceiling is not served.
 
 The walk that checks an unsigned answer runs down every label of its owner, and
 the DS denial at each one is past the ceiling here. Reading those steps as
-insecure made every name in the zone unsigned to the walk, and a forged A
-record for any of them - no signature needed - came back `Insecure` and was
-served. On main it was SERVFAIL, and that is what it has to stay: this server
+insecure would make every name in the zone unsigned to the walk, and a forged A
+record for any of them - no signature needed - would come back `Insecure` and
+be served. It is SERVFAIL, and that is what it has to stay: this server
 cannot tell a forgery from an unsigned delegation it could not read, so it
 says so rather than guessing either way.
 */
@@ -450,8 +450,8 @@ An unsigned denial inside a zone past the ceiling is not called forged either.
 An unsigned delegation's own NXDOMAIN or NODATA carries no NSEC3 records, and
 the walk past a DS denial it could not read ends on the parent's keys, which
 sign nothing here. That is the same undecided case as the unsigned answer above,
-and it gets the same answer: `Indeterminate` with the ceiling named, as on main,
-rather than `Bogus` - extended error 6 and a forgery logged over our refusal.
+and it gets the same answer: `Indeterminate` with the ceiling named, rather
+than `Bogus` - extended error 6 and a forgery logged over our refusal.
 */
 @(test)
 test_an_unsigned_denial_past_the_ceiling_is_not_called_forged :: proc(t: ^testing.T) {

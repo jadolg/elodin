@@ -36,6 +36,12 @@ state := State {
 	level = .Info,
 }
 
+// Who `init` hands a file it creates to; see `init`.
+Owner :: struct {
+	uid: posix.uid_t,
+	gid: posix.gid_t,
+}
+
 /*
 Point logging at a file, or at stderr when `path` is empty.
 
@@ -55,16 +61,11 @@ create - whatever file it names, a hard link to append to one of root's, or a
 FIFO to hang it - with no reader, or a reader that stops reading. So a symlink
 on the path is refused, and so is anything at the name but a regular file with
 one link, then and on every reopen. Without a drop there is no such account,
-and a root-owned symlink such as /var/run is followed as before.
+and a root-owned symlink such as /var/run is followed.
 
 Returns the error if the file cannot be opened, in which case logging stays on
 stderr rather than being silently lost.
 */
-Owner :: struct {
-	uid: posix.uid_t,
-	gid: posix.gid_t,
-}
-
 init :: proc(level: Level, path: string = "", owner: Maybe(Owner) = nil) -> os.Error {
 	guarded := owner != nil
 	sync.mutex_lock(&state.mu)

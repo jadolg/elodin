@@ -8,11 +8,11 @@ import "elodin:dns"
 /*
 The address hints that ride beside an HTTPS, SVCB, SRV or MX answer.
 
-#177 cut a `Secure` response's additional section down to the OPT record before
-the AD bit went on it, which is right for what it was about: glue below a zone
-cut is unsigned by design, nobody can ever check it, and it must not travel under
-this server's authentication. It was heavier than it needed to be for everything
-else in there. The A and AAAA records an authoritative server sends beside an
+A `Secure` response's additional section is cut down to the OPT record before
+the AD bit goes on it (#177), which is right for glue: glue below a zone cut is
+unsigned by design, nobody can ever check it, and it must not travel under this
+server's authentication. Applied to everything else in there it is heavier than
+it needs to be. The A and AAAA records an authoritative server sends beside an
 HTTPS, SVCB, SRV or MX answer are not glue - they are ordinary signed zone data,
 and RFC 9460 section 5 asks a recursive resolver to pass them on precisely so a
 client does not have to ask again before it can connect.
@@ -25,7 +25,7 @@ signature has to hold over the records actually present, and it must not be a
 wildcard expansion - because the denial proof that goes with one is in a zone
 this message is not about.
 
-Everything else is dropped exactly as it was before, and the tests that say so
+Everything else is dropped, and the tests that say so
 are as much the point as the ones that keep a record: passing an unchecked
 address through under AD=1 is the harm #177 was filed about, and a client that
 reads AD=1 and then opens a connection to what it finds here is the shape of it.
@@ -435,7 +435,7 @@ test_hints_in_the_answers_own_zone_are_kept :: proc(t: ^testing.T) {
 	)
 	// A client that validates for itself needs the signature, not just the
 	// address: without it the record is one it has to refuse or re-fetch, which
-	// is the round trip this whole change is about saving.
+	// is the round trip passing hints on exists to save.
 	testing.expect_value(t, sh_holds_signature_over(pruned.additional, "svc.hinttest.", .A), 1)
 	testing.expect_value(t, sh_holds_signature_over(pruned.additional, "svc.hinttest.", .AAAA), 1)
 
@@ -749,7 +749,7 @@ A denial keeps no hints.
 
 Nothing on that path authenticates an answer RRset, so nothing on it names a
 target - and the additional section goes back to holding the OPT record and
-nothing else, which is what #177 left it holding. Worth pinning separately
+nothing else (#177). Worth pinning separately
 because `Result.additional` is a field the prune reads on every `Secure` verdict,
 and a denial reaching it with something in it would be a hole the answer path's
 tests could not see.
@@ -948,7 +948,7 @@ test_a_padded_hint_keeps_a_bounded_number_of_signatures :: proc(t: ^testing.T) {
 	testing.expect_value(t, perr, dns.Decode_Error.None)
 
 	// The genuine record survives the padding - that is what makes a cap safe
-	// here, and it is the failure a plain count cap had.
+	// here, and it is what a plain count cap would fail.
 	testing.expect(t, sh_holds(pruned.additional, "svc.hinttest.", .A), "the authenticated hint was dropped")
 	kept := sh_holds_signature_over(pruned.additional, "svc.hinttest.", .A)
 	testing.expectf(

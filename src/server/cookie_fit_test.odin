@@ -11,23 +11,23 @@ will not fit.
 
 `attach_cookie` writes twenty-eight bytes into the answer's OPT record - four of
 option header and twenty-four of cookie - after the answer is already encoded.
-An answer sitting within thirty bytes of what the client advertised is therefore
+An answer sitting within twenty-eight bytes of what the client advertised is therefore
 one the cookie pushes over, and there are two quite different ways to be over:
 
   - the answer itself does not fit, which is what the comment on `attach_cookie`
-    was written against. Records are dropped, the client is told to ask again
+    is written against. Records are dropped, the client is told to ask again
     over TCP, and the OPT record is re-added behind the cut so the cookie
     survives the round trip;
   - the answer fits and only the cookie does not. There is nothing behind the
     OPT record to drop, so the answer goes out whole and without one.
 
-The second used to arrive at the worst of both: `encode_message` set TC for the
-OPT record it could not fit, re-added it on the same arithmetic and dropped it
-again, so the client was handed a complete answer with TC set, no OPT record and
-no cookie - and asked again over TCP for bytes it already had. Now the cookie is
-abandoned instead, which is what `match_client_opt` does with an OPT record it
-cannot mint (see the comment there): an answer that fits is worth more to the
-client than the EDNS parameters it would have carried.
+In the second the cookie is abandoned, which is what `match_client_opt` does
+with an OPT record it cannot mint (see the comment there): an answer that fits
+is worth more to the client than the EDNS parameters it would have carried.
+Left to `encode_message`, it would arrive at the worst of both: TC set for the
+OPT record that could not fit, the record re-added on the same arithmetic and
+dropped again, so the client would be handed a complete answer with TC set, no
+OPT record and no cookie - and ask again over TCP for bytes it already had.
 
 Both cases are pinned here, along with the ordinary one where the cookie fits.
 */

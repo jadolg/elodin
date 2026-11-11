@@ -23,7 +23,7 @@ something. A DANE client told SERVFAIL retries or refuses to connect; one told
 NODATA concludes the name has no TLSA record and connects without checking a
 certificate - which is #271's downgrade reached without touching DNSSEC at all.
 So these run with `dnssec.enabled: false`, where the validator that refuses the
-same shape is not running and the guard in `resolve_query` is the whole of what
+same shape is not running and `unreadable_rcode_refusal` is the whole of what
 catches it.
 */
 
@@ -463,9 +463,9 @@ what one broken member said.
 elodin only ever sends EDNS version 0, which every EDNS implementation is
 required to support, so a BADVERS in answer to one is that server violating the
 protocol rather than anything about the name. `resolve_readable` treats it as
-the transport-level failure it is and sweeps the rest of the group, which is what
-`resolve_answerable` already did for a chain lookup that got an rcode saying
-nothing. The client gets the answer the second server had all along.
+the transport-level failure it is and sweeps the rest of the group, as
+`resolve_answerable` does for a chain lookup that got an rcode saying nothing.
+The client gets the answer the second server had all along.
 */
 @(test)
 test_a_broken_upstream_is_asked_past_for_an_extended_rcode :: proc(t: ^testing.T) {
@@ -611,8 +611,7 @@ Issue #309, over the path a client's question actually takes. RFC 2308 section
 7.1 reads SERVFAIL as the responder saying nothing about the name, and REFUSED as
 it declining to be asked; neither is a statement the rest of a failover group
 cannot improve on, and neither trips the health cooldown, which counts transport
-failures - so a member in that state answers promptly and forever, and before
-this every client query stopped at it.
+failures - so a member in that state answers promptly and forever.
 
 Counted as a forward rather than a failure, because that is what happened: a
 question went to the group and an answer came back.
@@ -685,9 +684,9 @@ test_a_group_with_a_spare_is_asked_past_a_servfail :: proc(t: ^testing.T) {
 /*
 And a composed rcode nothing has a name for still says what it was.
 
-`Rcode` names 16 to 23; the field is eight bits wide, so 4080 of the 4096
-composed values have no name at all, and Odin's `%v` renders one of those as a
-`BAD ENUM VALUE` placeholder. The whole threat model here is an attacker
+`Rcode` names 0 to 11 and 16 to 23; the field is eight bits wide, so 4076 of the
+4096 composed values have no name at all, and Odin's `%v` renders one of those
+as a `BAD ENUM VALUE` placeholder. The whole threat model here is an attacker
 choosing the byte, so it would choose one of those - and the extended error's
 info-code is 0, "Other", which means the text is the only thing it carries. A
 placeholder there tells the client's operator nothing and tells this server's
@@ -810,8 +809,8 @@ test_a_clients_extended_rcode_byte_is_not_forwarded :: proc(t: ^testing.T) {
 		"the upstream was asked with composed rcode %d, which is the client's byte forwarded",
 		u16(dns.peek_rcode(x.seen[:x.seen_len])),
 	)
-	// And the query is otherwise untouched: it still asks the same question and
-	// still carries an OPT record for the upstream to answer into.
+	// And the rest of the query, which `upstream_query` rebuilds, still asks the
+	// same question and still carries an OPT record for the upstream to answer into.
 	seen, serr := dns.decode_message(x.seen[:x.seen_len], context.temp_allocator)
 	testing.expect_value(t, serr, dns.Decode_Error.None)
 	if testing.expect(t, len(seen.question) == 1, "the forwarded query lost its question") {
@@ -840,9 +839,8 @@ records ask for more hashing than this server does is neither - it is this
 resolver declining work over a number the zone chose, and RFC 8914 section 4.28
 has a code that says exactly that.
 
-Sending "no reachable authority" for it, which is what everything non-bogus used
-to get, sends whoever is debugging the zone to look at connectivity, which is
-the one thing that is fine.
+Sending "no reachable authority" for it sends whoever is debugging the zone to
+look at connectivity, which is the one thing that is fine.
 */
 @(test)
 test_a_dnssec_refusal_names_which_refusal_it_was :: proc(t: ^testing.T) {

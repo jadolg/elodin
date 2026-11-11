@@ -217,8 +217,7 @@ test_nsec3_iteration_ceiling_refuses_the_hash :: proc(t: ^testing.T) {
 	every proof built on that record fail, and never spends the CPU. What the
 	answer becomes is the caller's to say: a denial with nothing readable in it
 	is insecure (`nsec3_all_over_ceiling`), and one with readable records beside
-	the refused ones is decided by those. Issue #331 found this comment claiming
-	the first while the code said `Bogus`.
+	the refused ones is decided by those (#331).
 	*/
 	rr := n3(H_EXAMPLE, H_NS1, {.NS, .SOA}).rr
 	out: [20]u8
@@ -769,8 +768,8 @@ A scan cut short by the allowance is not a record that is not there.
 the opt-out span, which is the one place in this file where a *negative* result
 from a scan decides anything. Hashing that ran out returns the same "not found"
 as hashing that finished, so a question whose meter emptied one hash before the
-wildcard was reached came back `Opt_Out` - served to the client as an insecure
-answer - where the whole proof says `Failed`. The records below hold the
+wildcard was reached would come back `Opt_Out` - served to the client as an
+insecure answer - where the whole proof says `Failed`. The records below hold the
 wildcard `*.w.example.` with MX set, so an MX question is a denial contradicted
 by the zone's own bit map: `Failed` with a whole allowance, and nothing less
 than `Failed` with part of one.
@@ -834,11 +833,11 @@ A proof that could not hash always leaves the refusal behind.
 
 The callers tell "this failed" from "this server would not finish" by counting
 refusals across the proof, so a proof that gives up without counting one is a
-proof reported to the client as a forgery. The walk up to the closest encloser
-used to do exactly that: it read the flag on the budget, which belongs to the
-whole question and stays set, and returned - so when the scan it had just made
-was answered out of the kept hashes, and the thing that emptied the allowance
-was some earlier proof, this one charged nothing at all and its caller saw a
+proof reported to the client as a forgery. A walk up to the closest encloser
+that read the flag on the budget - which belongs to the whole question and stays
+set - and returned would do exactly that: when the scan it had just made was
+answered out of the kept hashes, and the thing that emptied the allowance was
+some earlier proof, it would charge nothing at all and its caller would see a
 proof that simply failed.
 
 Three steps to stand that up, and all three are shapes a real question makes:
@@ -883,7 +882,7 @@ count, it could not: that record is unreadable for good, the ones around it are
 the zone as far as this server is concerned, and the answer is the same answer
 it will give tomorrow.
 
-Reading the two together turned a zone mid-rollover across the ceiling into
+Reading the two together would turn a zone mid-rollover across the ceiling into
 SERVFAIL where the same records, without the chain on its way out, are an
 insecure answer.
 */
@@ -928,14 +927,14 @@ test_nsec3_a_delegation_is_no_closest_encloser_for_a_name_error :: proc(t: ^test
 	prove any name in the child does not exist, against the parent's keys, and
 	that answer reaches the client with AD.
 
-	The walk is what used to make this unreachable: it descends to the child
+	The walk makes this unreachable on its own while it descends to the child
 	and judges the denial against the child's keys, so the parent's records are
 	dropped before the proof reads them. Anything that lets the walk stop above
 	a cut takes that away.
 
 	Only this proof refuses it. An opt-out proof rests on a delegation being
 	the encloser - declining to speak for what is under an unsigned delegation
-	is what opt-out is - and the test below it holds that line.
+	is what opt-out is.
 	*/
 	zone := a_zone()
 	testing.expect_value(
@@ -944,9 +943,9 @@ test_nsec3_a_delegation_is_no_closest_encloser_for_a_name_error :: proc(t: ^test
 		Proof.Failed,
 	)
 
-	// The mechanism it must not disturb is held by
-	// `test_a_chain_above_the_ceiling_does_not_suppress_an_opt_out`, which
-	// proves `Opt_Out` over this same delegation with the flag actually set.
+	// The opt-out mechanism it must not disturb is held by
+	// `test_a_chain_above_the_ceiling_does_not_suppress_an_opt_out` above, which
+	// proves `Opt_Out` with the flag actually set.
 	free_all(context.temp_allocator)
 }
 

@@ -541,8 +541,7 @@ What the datagram budget is denominated in, and what it is when nobody says.
 
 The default is the one property that matters for every file already written: the
 estimate resolves to `server.max_udp_response`, which no datagram can exceed, so
-every answer costs exactly one token and the figure means what it meant before
-there was a key. That holds at a raised ceiling too, which is the case a constant
+every answer costs exactly one token and the figure counts answers. That holds at a raised ceiling too, which is the case a constant
 1232 here would have quietly changed.
 */
 @(test)
@@ -951,7 +950,7 @@ test_service_account_is_read :: proc(t: ^testing.T) {
 	testing.expect_value(t, cfg.server.user, "elodin")
 	testing.expect_value(t, cfg.server.group, "elodin")
 
-	// Nothing configured is the historical behaviour: stay as started.
+	// Nothing configured stays as started.
 	bare, berr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
 	testing.expect(t, berr == nil, "a config without a service account should load")
 	testing.expect_value(t, bare.server.user, "")
@@ -1510,14 +1509,13 @@ test_rebind_allow_domains_will_not_take_an_empty_label :: proc(t: ^testing.T) {
 One client's share of the connection table: derived from the table, and never
 larger than it.
 
-`max_connections` is a budget for the whole server, and before this setting
-existed nothing said how it was shared - so one client could hold all 512 slots
-and no configured limit said otherwise. The default is half, which leaves the
-other half for everybody else; a figure at or above the table is stored as the
-table's own size, which is no cap at all and is how an operator asks for the old
-behaviour on purpose.
+`max_connections` is a budget for the whole server, and this setting says how
+it is shared, so that one client cannot hold all 512 slots. The default is half,
+which leaves the other half for everybody else; a figure at or above the table
+is stored as the table's own size, which is no cap at all and is how an operator
+asks for one client to be able to hold the whole table.
 
-Derived at load rather than at startup, for the reason the worker counts are:
+Derived at load rather than at startup, for the reason `max_pending` is:
 `--check` and the run after it then report the same number by construction.
 */
 @(test)
@@ -1576,9 +1574,9 @@ test_the_connection_share_is_derived_from_the_table :: proc(t: ^testing.T) {
 And the table the share is derived from has to be a table.
 
 `conn_manager_init` reads anything below one as one connection, so a zero or a
-negative used to load: the server came up serving a single client while the
-startup line and `--check` said "at most 0 at once ... any one client prefix may
-hold all of them", and `elodin_connections_max` published the same. Refused
+negative that loaded would serve a single client while the startup line and
+`--check` said "at most 0 at once ... any one client prefix may hold all of
+them", and `elodin_connections_max` published the same. Refused
 here for the reason `max_udp_response` is refused rather than clamped - a figure
 an operator can read off the server has to be the one the server is using - and
 because every figure below is derived from it.

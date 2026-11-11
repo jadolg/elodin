@@ -696,8 +696,8 @@ run_h2_cases :: proc(r: ^Runner) {
 /*
 A response larger than one DATA frame.
 
-The upstream is reached over TCP so a big answer is not clipped by the 4096-byte
-UDP receive path, and the mock returns a TXT set well over the 16 KiB default
+The upstream is reached over TCP so a big answer is not clipped to the UDP size
+the upstream query advertises, and the mock returns a TXT set well over the 16 KiB default
 frame size.
 */
 run_h2_large_response_case :: proc(r: ^Runner) {
@@ -748,7 +748,7 @@ run_h2_large_response_case :: proc(r: ^Runner) {
 	end_case(r)
 }
 
-// A DNS response carrying `count` TXT records of 400 bytes each.
+// A DNS response carrying `count` TXT records of one 255-byte string each.
 @(private = "file")
 build_large_txt_response :: proc(name: string, count: int, allocator := context.allocator) -> []u8 {
 	answers := make([]dns.Record, count, context.temp_allocator)

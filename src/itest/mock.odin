@@ -102,7 +102,7 @@ Mock :: struct {
 	once, which is the *fast* failure, not the blackhole.
 
 	Atomic because the serving threads are already running by the time a case
-	reaches for it; every other field here is written before `mock_start`.
+	reaches for it.
 	*/
 	gone_silent: bool,
 
@@ -243,7 +243,7 @@ mock_hold_report :: proc(m: ^Mock) -> string {
 	)
 }
 
-// Whether `n` delayed replies have been held at once.
+// How many delayed replies have been held.
 mock_held :: proc(m: ^Mock) -> int {
 	return sync.atomic_load(&m.held)
 }
@@ -919,7 +919,7 @@ mock_tcp_conn :: proc(conn: ^Mock_Conn) {
 				v, err := net.recv_tcp(conn.socket, buf[got:])
 				// SO_RCVTIMEO expiring on a blocking recv() is EAGAIN on
 				// Linux, which core:net reports as .Would_Block, not
-				// .Timeout - see h2client.odin's h2_io_read.
+				// .Timeout - see src/upstream/h2client.odin's h2_io_read.
 				if err == .Timeout || err == .Would_Block {
 					continue
 				}

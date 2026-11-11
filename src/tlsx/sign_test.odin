@@ -150,7 +150,7 @@ profile comes back out of it unchanged.
 
 This is the property the whole feature rests on: a device that cannot verify the
 signature, or that recovers something other than the profile that was signed,
-has been handed a worse file than the unsigned one it used to get.
+has been handed a worse file than an unsigned one.
 */
 @(test)
 test_signed_profile_verifies_with_openssl :: proc(t: ^testing.T) {

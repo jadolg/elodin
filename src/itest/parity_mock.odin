@@ -434,14 +434,6 @@ pm_opt :: proc(query: []u8, r: ^Pg_Rand, shape: int, allocator: mem.Allocator) -
 
 	rdata := make([dynamic]u8, 0, 32, allocator)
 
-	/*
-	A cookie, when the query carried one.
-
-	Written here rather than by `Mock.cookies`, which would build it with
-	elodin's own encoder - and the question being asked is what happens to the
-	*other* options when this server takes this cookie back out. An upstream
-	whose OPT record was assembled by the codec under test could not ask it.
-	*/
 	// NSID names the server that answered. Always present, because it is the
 	// plainest case of an option a forwarder has no business dropping: it is
 	// information the client asked for by name.
@@ -450,6 +442,14 @@ pm_opt :: proc(query: []u8, r: ^Pg_Rand, shape: int, allocator: mem.Allocator) -
 	pm_put16(&rdata, u16(len(nsid)))
 	append(&rdata, nsid)
 
+	/*
+	A cookie, when the query carried one.
+
+	Written here rather than by `Mock.cookies`, which would build it with
+	elodin's own encoder - and the question being asked is what happens to the
+	*other* options when this server takes this cookie back out. An upstream
+	whose OPT record was assembled by the codec under test could not ask it.
+	*/
 	if sent, has_cookie := pw_find_option(q, 10); has_cookie && len(sent) >= 8 {
 		pm_put16(&rdata, 10)
 		pm_put16(&rdata, 16)

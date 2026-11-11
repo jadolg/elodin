@@ -154,8 +154,8 @@ Validator :: struct {
 	an upstream round trip taken in line. Thirty-two of those - what
 	`MAX_LOOKUPS_PER_QUERY` allows - is the better part of a second at ordinary
 	RTT, and a client choosing names whose *upper* labels are fresh pays that on
-	every question however often it asks. Nothing cached can help; the note on
-	`MAX_CACHED_NON_CUTS` says why, and #356 is the record of it.
+	every question however often it asks. Nothing cached can help; the note after
+	`MAX_NON_CUT_TTL` says why (#356).
 
 	So the bound is not on the walk but on how many of them may be doing this at
 	once - two bounds, one per `Walk_Pool`, because the queries counted in flight
@@ -281,8 +281,8 @@ Zone cuts one chain may have between the root and the name asked about.
 Cuts, not labels: a name with many labels is ordinary - `ip6.arpa.` puts one
 nibble in each, so a reverse name for an IPv6 address has thirty-four - while a
 delegation hierarchy this deep is not a shape anything in use has. Counting the
-question's labels here instead is issue #352, and cost this server every IPv6
-reverse lookup it was asked; `zone_trust` has the whole of it.
+question's labels here instead would refuse every IPv6 reverse lookup (#352);
+`zone_trust` has the whole of it.
 */
 MAX_CHAIN_DEPTH :: 24
 
@@ -421,8 +421,8 @@ Budget :: struct {
 	served insecure. What it must not do is let an *unsigned* answer or a
 	broken step below be judged as if the parent had been read - calling the
 	first insecure is a forgery served, calling either bogus accuses the zone
-	of our refusal. Both are `Indeterminate` with the ceiling named instead,
-	which is what they were before. The same goes for a denial that proves
+	of our refusal. Both are `Indeterminate` with the ceiling named instead.
+	The same goes for a denial that proves
 	nothing. Cleared with `walk_stopped`, and at a signed cut below the step.
 	*/
 	walk_past_ceiling: bool,
@@ -608,9 +608,9 @@ side of the wire: a resolver whose clock is wrong refuses every signature minted
 inside the drift, and an operator told "broken chain of trust" has no reason to
 look at the clock. So the instant is kept, and the reason names it.
 
-Only a signature naming a key its zone published counts - one `signature_worth_
-trying` would otherwise have spent a verification on - so noise in the RRSIGs
-of a response cannot put a window on a set it did not otherwise touch. And it
+Only a signature naming a key its zone published counts - one
+`signature_worth_trying` would otherwise have spent a verification on - so noise
+in the RRSIGs of a response cannot put a window on a set it did not otherwise touch. And it
 is reported only for a set that nothing in its window was tried for: a set that
 had a current signature and failed it is a signature that does not verify, and
 that is code 6 whatever lapsed beside it.
@@ -749,14 +749,14 @@ query_budget :: proc(v: ^Validator) -> Budget {
 /*
 Signature checks one client question may provoke, in total.
 
-A per-RRset cap cannot do this job, and having one was a way to break a zone: a
-signature is only tried when its signer names a zone in the owner's ancestry,
-but the signer is a name in the RDATA and anyone able to add records can write
-it. Eight forgeries at the head of an RRset therefore spent the whole per-RRset
-allowance before the genuine signature was reached, the set was dropped, and the
-answer came back Bogus - a denial's RRset taking every NXDOMAIN in the zone with
-it. The cap could only ever be filled by signatures an attacker chose; the
-genuine one is what it kept out.
+A per-RRset cap cannot do this job, and having one would be a way to break a
+zone: a signature is only tried when its signer names a zone in the owner's
+ancestry, but the signer is a name in the RDATA and anyone able to add records
+can write it. Eight forgeries at the head of an RRset would spend the whole
+per-RRset allowance before the genuine signature was reached, the set would be
+dropped, and the answer would come back Bogus - a denial's RRset taking every
+NXDOMAIN in the zone with it. Such a cap could only ever be filled by signatures
+an attacker chose; the genuine one is what it would keep out.
 
 Counted across the question instead, and spent only on signatures that could
 actually verify - see `signature_worth_trying`, which refuses the rest for
@@ -798,8 +798,8 @@ Signature checks a query makes between giving its loop to the other fibers on it
 A check is CPU and never waits, so a walk that reaches the budget without a
 lookup in between would hold its loop for all of them - 64 checks at the 40 us an
 Ed25519 one takes here is 2.6 ms - while every other query on the loop, cache
-hits included, waits behind it. Threads had the kernel's scheduler for this.
-Four is at most ~160 us between turns; a turn costs about a microsecond, which
+hits included, waits behind it: nothing preempts a fiber, so the turn has to be
+given. Four is at most ~160 us between turns; a turn costs about a microsecond, which
 before every check would be a tenth of the cheapest one (RSA-2048, 8 us).
 */
 VERIFICATIONS_PER_TURN :: 4
@@ -991,7 +991,7 @@ Nothing here can fix that, which is worth saying plainly. A bound on the run is
 the only thing that would, and there is no bound that separates the two cases: a
 customer's reverse zone can sit fifteen empty non-terminals below its provider's
 under `ip6.arpa.`, which is deeper than the walk an attacker needs. So what is
-left bounding one question is `MAX_LOOKUPS_PER_QUERY`, as before, and what would
+left bounding one question is `MAX_LOOKUPS_PER_QUERY`, and what would
 change it is not caching but not holding a query in flight for the walk.
 */
 
@@ -1181,10 +1181,10 @@ Authenticated_Set :: struct {
 	set and takes the exemption. Keyed on the signature bytes, an attacker does
 	not even have to forge: it appends verbatim copies, and then - once those are
 	counted - a near-copy, the genuine record with one bit of its ORIGINAL TTL
-	flipped and the signature left alone. That mutant satisfied a
-	signature-bytes test, took the exemption, and the forgeries behind it filled
-	the cap so that the *genuine* record was the one dropped. The answer then
-	went out under AD and into the cache no longer validating for anybody.
+	flipped and the signature left alone. That mutant would satisfy a
+	signature-bytes test and take the exemption, and the forgeries behind it
+	would fill the cap so that the *genuine* record was the one dropped. The
+	answer would then go out under AD and into the cache validating for nobody.
 
 	Every field is compared because every field an attacker can vary is a way to
 	be mistaken for the record that verified while not being it. A copy that
@@ -1323,9 +1323,10 @@ validate :: proc(
 	With the nibble at 3 the client reads a name error. With the nibble left at
 	0 it reads NOERROR and takes the answer section, and that half is not a
 	denial bug at all but the whole validator stepped over: the same forged
-	`www.example.com. A`, signature no longer covering it, is `Bogus` plain and
-	was `Insecure` with one byte set, forwarded, and believed. Neither costs the
-	attacker a forgery they did not already have to make.
+	`www.example.com. A`, signature not covering it, is `Bogus` plain and would
+	be `Insecure` with one byte set, forwarded, and believed, were the excuse
+	read off this server's rcode alone. Neither costs the attacker a forgery
+	they did not already have to make.
 
 	Trying to tell a rewritten header from a real extended rcode by what else is
 	in the message does not work, and the attempt is worth writing down because
@@ -1341,12 +1342,13 @@ validate :: proc(
 	read as an answer or a denial is one this server cannot reason about and
 	must not pass on, whichever of the two produced it, and the honest report is
 	that nothing was established: `Indeterminate`, which is SERVFAIL to the
-	client and `NO_REACHABLE_AUTHORITY` in the extended error rather than
-	`DNSSEC_BOGUS`. That is the part of "an upstream error is not a forgery"
-	worth keeping, and it is what `test_badvers_is_refused_without_being_called_
-	a_forgery` pins. Refusing costs a real BADVERS nothing it had: forwarded, it
-	reaches the client as NOERROR with an empty answer, so what this replaces is
-	not a working answer but a silently wrong one.
+	client and `EDE_NO_REACHABLE_AUTHORITY` in the extended error rather than
+	`EDE_DNSSEC_BOGUS`. That is the part of "an upstream error is not a forgery"
+	worth keeping, and it is what
+	`test_badvers_is_refused_without_being_called_a_forgery` pins. Refusing
+	costs a real BADVERS nothing it had: forwarded, it would reach the client as
+	NOERROR with an empty answer, so what refusing gives up is not a working
+	answer but a silently wrong one.
 
 	Only where the nibble reads as an answer. BADCOOKIE's is 7, which a client
 	reads as YXRRSET and acts on as the error it is, and the upstream layer
@@ -1599,8 +1601,8 @@ name the walk stopped at, which for `.Chain_Only` is the name a denial beside
 the chain is about (RFC 6604 section 3).
 
 The walk is the only thing consulted, and that is the point. Scanning the whole
-section for any record of the type is not the same test and was a way to get
-this wrong: an attacker with a signed zone of its own appends
+section for any record of the type is not the same test and would be a way to
+get this wrong: an attacker with a signed zone of its own appends
 `x.evil.example. A`, which has nothing to do with the question, and a scan sees
 the type and stops asking.
 */
@@ -1671,8 +1673,8 @@ wanted something else: RFC 1034 section 4.3.2 step 3a restarts the walk at the
 target *unless* the query type matches the CNAME, so for `CNAME` and for `ANY`
 the record is the answer, the walk stops, and the rcode is about the name that
 was asked about. Read as a hop instead, a flipped rcode over a signed
-`dig CNAME` answer walked past the very record that refutes it, found the target
-empty, and came back `Secure` - #271 intact for that one question.
+`dig CNAME` answer would walk past the very record that refutes it, find the
+target empty, and come back `Secure` - #271 intact for that one question.
 
 The general rule and both of those cases are the same line: a record that
 matches the question ends the walk, whatever the type. It is only when nothing
@@ -2204,8 +2206,8 @@ validate_answer :: proc(
 		Every record of the set has to be covered, not just the first one found
 		at that owner. The verdict recorded below names an RRset, and the prune
 		keeps everything matching it - so asking about one record and vouching
-		for the set let a second, unsigned CNAME at the same owner ride out
-		under the AD bit, pointing wherever the sender liked. A zone may not
+		for the set would let a second, unsigned CNAME at the same owner ride
+		out under the AD bit, pointing wherever the sender liked. A zone may not
 		publish two CNAMEs at one name (RFC 1034 section 3.6.2) and a DNAME
 		synthesizes exactly one, so a set with a second is not a set a DNAME
 		produced; the loop stops at the first record no DNAME accounts for.
@@ -2338,11 +2340,11 @@ validate_answer :: proc(
 	`Bogus, "no denial of existence"` while its answer section is empty, and one
 	appended record from a zone that really is unsigned - `www.reddit.com.
 	CNAME`, no forgery, no signature to break - reroutes the whole message to
-	this path instead, where nothing ever demanded a proof. Gated on `worst`,
-	the check that would have caught it here was skipped too, because that
-	unsigned record had already dragged `worst` to `Insecure`; the verdict fell
-	through as `Insecure`, `resolve_query` forwards those, and the client read a
-	name error for a signed name that nobody had proven anything about.
+	this path instead, where nothing ever demands a proof. So the check runs
+	whatever `worst` is: that unsigned record has already dragged `worst` to
+	`Insecure`, a check gated on it would be skipped, the verdict would fall
+	through as `Insecure`, `resolve_query` forwards those, and the client would
+	read a name error for a signed name that nobody had proven anything about.
 
 	A record that does not address the question cannot make a response an
 	answer, whatever its zone thinks of it, and being unable to authenticate the
@@ -2361,14 +2363,14 @@ validate_answer :: proc(
 	The shape above was settled from signed data; the rcode is the one part of
 	the message no signature covers, and the header is a byte an attacker on a
 	plain UDP or TCP leg can rewrite without touching an RRset. Left alone, a
-	genuine signed answer with one nibble changed came out of here `Secure` -
-	the RRsets are the zone's own and verify perfectly - and the AD bit went out
-	over an authenticated denial for a name whose signed records were sitting in
+	genuine signed answer with one nibble changed would come out of here
+	`Secure` - the RRsets are the zone's own and verify perfectly - and the AD
+	bit would go out over an authenticated denial for a name whose signed records were sitting in
 	the answer section. Clients decide on the rcode before they read that
 	section (glibc's `res_query` returns HOST_NOT_FOUND, Go's `checkHeader`
-	returns `errNoSuchHost`), so the records were there and nobody looked, and a
-	fail-closed DANE or MTA-STS lookup that would have deferred on a Bogus
-	answer instead proceeded without the record it was checking for. RFC 4035
+	returns `errNoSuchHost`), so the records would be there and nobody would
+	look, and a fail-closed DANE or MTA-STS lookup that defers on a Bogus answer
+	would proceed without the record it was checking for. RFC 4035
 	section 5.3 lets a validator authenticate RRsets, not a header claim that
 	contradicts them.
 
@@ -2395,8 +2397,8 @@ validate_answer :: proc(
 	`denial_contradicted` follows the chain to that name and asks only whether
 	an authenticated record is sitting at it.
 
-	Not gated on the whole message being `Secure`, which was a way round the
-	whole thing. `worst` is the worst verdict any RRset in the section reached,
+	Not gated on the whole message being `Secure`, which would be a way round
+	the whole thing. `worst` is the worst verdict any RRset in the section reached,
 	and the section is the sender's to fill: one unsigned RRset appended from a
 	zone that really is unsigned - `www.reddit.com. A` in the captured set -
 	comes back `Insecure`, drags `worst` down with it, and would leave the
@@ -2692,8 +2694,8 @@ validate_denial :: proc(
 
 	Worth being exact about how far that difference reaches today: `server`
 	counts and logs the two verdicts in one branch, so the bogus counter ticks
-	either way and the warn line is the same. The extended error and the reason
-	text are the whole of what an operator or a client can tell apart.
+	either way. The extended error, the status the warn line names and the
+	reason text are what an operator or a client can tell apart.
 
 	Counted over this proof rather than read off the budget, because the flags
 	there belong to the whole question and stay set once anything sets them: an
@@ -3005,9 +3007,10 @@ validate_rrset :: proc(
 	What that changes is the extended error the client is sent - 22, "No
 	Reachable Authority", instead of 6, "DNSSEC Bogus" - and the `reason` that
 	reaches the log. It does not change `Stats.bogus`: `resolve_query` counts every
-	`Bogus` and `Indeterminate` verdict there except one that is our own shedding
-	(`Result.shed`), so a spent verification budget counts like a forgery, which is
-	worth knowing before reading that gauge as a forgery count.
+	`Bogus` and `Indeterminate` verdict there except this server's own shedding
+	and a reading it refused (`server.counts_as_bogus`), so a spent verification
+	budget counts like a forgery, which is worth knowing before reading that gauge
+	as a forgery count.
 	*/
 	if exhausted {
 		return .Indeterminate, "", exhausted_reason(budget), "", {}, {}
@@ -3274,8 +3277,8 @@ expansion is not free, since `validated_denial_records` spends
 nothing wrong. Eight expansions over an authority
 section carrying five NSEC3 RRsets is forty verifications for five sets' worth
 of information, which alone is most of the allowance - so a legitimate response
-came back `Indeterminate`, and reached the client as SERVFAIL, for being large
-rather than for being false.
+would come back `Indeterminate`, and reach the client as SERVFAIL, for being
+large rather than for being false.
 
 Keyed by the zone the records were established against. That, with the message
 and the class, is everything the verification depends on: the keys are the
@@ -3941,7 +3944,7 @@ zone_trust :: proc(
 			walk descends from the apex, so a question whose *upper* labels are
 			fresh misses the memo the whole way down however many times it is
 			asked. What bounds that is `MAX_LOOKUPS_PER_QUERY` and nothing
-			finer - see the note on `MAX_CACHED_NON_CUTS` for why no bound on
+			finer - see the note after `MAX_NON_CUT_TTL` for why no bound on
 			the run itself survives contact with `ip6.arpa.`.
 			*/
 			continue
@@ -4308,9 +4311,9 @@ zone_step :: proc(
 		A non-cut is the expensive one. The walk has to keep going past it - the
 		cut may be below - so a run of them is a DS lookup per label waited on
 		by the query already answering the client, and uncached every question
-		under the name pays the whole run again. That is issue #330: a zone with
-		twenty empty non-terminals turned each question into twenty sequential
-		upstream queries, and the same shape is what a legitimate deep hierarchy
+		under the name pays the whole run again (#330): a zone with twenty empty
+		non-terminals would turn each question into twenty sequential upstream
+		queries, and the same shape is what a legitimate deep hierarchy
 		costs every time somebody asks about it - `ip6.arpa.` puts a nibble
 		label between apexes, so a customer's reverse zone sits several
 		non-cuts below its provider's.
@@ -4522,10 +4525,10 @@ fetch_keys :: proc(
 	per record instead - "did some DS name something we cannot check" - is a
 	different question with a much larger answer, because a parent is free to
 	publish an algorithm we cannot check beside one we can, and every zone
-	mid-rollover does. A DNSKEY set that then failed to verify against the DS we
-	*could* check came back insecure rather than bogus, which is a tampered
-	DNSKEY response taking a signed zone out of validation - and `zone_step`
-	caches that for the DS TTL, so it stays out.
+	mid-rollover does. Asked that way, a DNSKEY set that then failed to verify
+	against the DS we *could* check would come back insecure rather than bogus,
+	which is a tampered DNSKEY response taking a signed zone out of validation -
+	and `zone_step` would cache that for the DS TTL, so it would stay out.
 	*/
 	checkable := false
 	for ds in ds_set {
@@ -5165,7 +5168,7 @@ substitution has been recomputed and found to match.
 Recomputing it is the entire safeguard. Accepting any unsigned CNAME that
 happened to sit below a validated DNAME would hand out a redirect to anywhere,
 for every name under every DNAME there is - a good deal worse than refusing
-them, which is what this replaces.
+them.
 */
 @(private)
 dname_covered :: proc(
@@ -5307,9 +5310,8 @@ is the denial in the authority section, not anything here.
 What this refuses is an answer section with nothing at the queried name at all,
 which is not an answer to this question whatever else it is.
 
-Only the shape is checked. Every record here has already been through
-`validate_rrset`, so reaching a name by following this chain means the records
-that led there carried signatures from the zones that own them.
+Only the shape is checked: whether the records that led there carried
+signatures from the zones that own them is the caller's to establish.
 */
 @(private)
 answers_question :: proc(records: []dns.Record, qname: string, qtype: dns.Type, class: dns.Class) -> bool {

@@ -8,7 +8,7 @@ import "elodin:dns"
 /*
 Per-domain upstreams (`upstream.zones`), end to end.
 
-The deployment is the one elodin had no answer for at all: a network that runs
+The deployment: a network that runs
 its own DNS for its own zone - a domain controller for `corp.example`, a router
 answering `home.arpa.` - while everything else goes to a public resolver. Two
 mocks stand in for the two, and every case below is about which of them a name

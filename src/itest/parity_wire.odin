@@ -16,7 +16,8 @@ RDATA or drops a record loses it identically on both sides of the comparison and
 reports agreement. The same reasoning `fixtures.odin` gives for freezing captured
 wire data as hex rather than generating it with our own encoder.
 
-So this walks the bytes itself, and it is the only file in the suite that may.
+So this walks the bytes itself, and it is the suite's only reader of whole
+messages.
 What it produces is a canonical form - names expanded, sections as multisets,
 rcode reassembled from both of the places it is written - in which two messages
 that say the same thing compare equal however they were laid out.

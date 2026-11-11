@@ -15,9 +15,9 @@ Several readers, one port.
 
 The whole of what `SO_REUSEPORT` buys this server: every reader has a socket, a
 receive queue and a thread of its own, so the rate at which datagrams can be
-taken off the wire scales with cores instead of being one of them. Before this
-the port was held by a single socket, and a second bind of it - which is what a
-second reader is - was refused with `Address_In_Use`.
+taken off the wire scales with cores instead of being one of them. Without it,
+a second bind of the port - which is what a second reader is - would be refused
+with `Address_In_Use`.
 */
 
 @(private = "file")
@@ -86,8 +86,8 @@ bind what the first *got*: with `port: 0` the file's number is not a port at
 all, and asking the kernel for another ephemeral one per reader would quietly
 produce one listener per reader on ports nobody can find.
 
-The connection table is asserted because the readers are threads in the same
-manager that bounds client connections, and a reader that counted against
+The connection table is asserted because the readers run on the same event loops
+as the client connections that table bounds, and a reader that counted against
 `server.max_connections` would take a slot from a client for every core the
 machine has.
 */
@@ -150,7 +150,7 @@ The kernel spreads datagrams over the readers, and every one of them answers.
 
 Two properties in one exchange, because they are the same exchange. That more
 than one reader received says the sockets really are sharing the port - a single
-socket answering everything is exactly what this looked like before - and that
+socket would answer everything - and that
 every query is answered says each reader's own socket is what its answers go
 back out of.
 
@@ -242,8 +242,8 @@ test_the_kernel_spreads_datagrams_over_the_readers :: proc(t: ^testing.T) {
 /*
 One reader is still a whole listener.
 
-The configuration every installation had before this setting existed, and the
-one a single-core machine derives. Worth its own case because the code that
+The configuration an installation gets by writing `readers: 1`, and the one a
+single-core machine derives. Worth its own case because the code that
 binds the second socket is the code that binds the first, and a listener that
 worked only in a plural is one nobody would notice was broken until they set
 `readers: 1`.

@@ -549,7 +549,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Composition of what happened to each query. These do not sum to the query rate: a query the backlog or the allow list turned away never reached an outcome, and one answered from a local zone is not counted apart. See the panels to the right.",
+      "description": "Composition of what happened to each query. These do not sum to the query rate: a query server.max_pending or the allow list turned away never reached an outcome, and one answered from a local zone is not counted apart. See the panels to the right.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -825,7 +825,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "dropped (backlog full)"
+              "options": "dropped (shed)"
             },
             "properties": [
               {

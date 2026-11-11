@@ -35,7 +35,7 @@ scrape_configs:
 | `elodin_queries_total` | counter | queries accepted, whatever became of them |
 | `elodin_answers_total{outcome}` | counter | `forwarded`, `cached`, `blocked`, `rewritten`, `failed` |
 | `elodin_answers_coalesced_total` | counter | queries answered by waiting on an identical one already in flight. Also counted under the outcome they got: `cached` (`detail=coalesced`, though the cache never held it), `failed` (`detail=upstream-coalesced`, or a stale `cached` if an expired copy was served), or the refusal the first one cached (`detail=dnssec:cache`, or the block detail) |
-| `elodin_queries_dropped_total` | counter | turned away before any work: the backlog was full, or the source could not be answered |
+| `elodin_queries_dropped_total` | counter | turned away before any work: `server.max_pending` was reached, the query could not be started, or the source could not be answered |
 | `elodin_queries_upstream_shed_total` | counter | queries answered from an expired entry or SERVFAIL without asking an upstream, because all of `server.max_pending` but its reserved quarter was already waiting on upstreams; see [waiting on an upstream](sizing.md#waiting-on-an-upstream). Also counted under the outcome they got, except an expired entry's refresh, which has no client and is counted here alone |
 | `elodin_queries_refused_total` | counter | turned away by `server.allow_from` |
 | `elodin_connections_refused_total` | counter | refused for want of a slot: `server.max_connections` full, or the client's prefix already holding its share |
@@ -82,7 +82,7 @@ scrape_configs:
 
 `elodin_answers_total` does not sum to `elodin_queries_total`:
 
-- queries the backlog or the allow list turned away have no outcome;
+- queries `server.max_pending` or the allow list turned away have no outcome;
 - answers the rebinding guard withheld are in `elodin_rebind_refused_total`;
 - of the `outcome=local` answers, only the reserved-name table is counted, in
   `elodin_special_use_total`.

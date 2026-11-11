@@ -23,7 +23,7 @@ is a reporter that logs a flood.
 Both the flag and the level are the case's own: the flag rather than either of
 the package's globals, so a reporter that has already fired elsewhere in the
 suite cannot decide the answer, and the level as a parameter rather than
-`logx.set_level`, which is process-wide and would race the fifteen other threads
+`logx.set_level`, which is process-wide and would race the other test threads
 this suite runs on.
 */
 @(test)

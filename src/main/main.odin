@@ -102,13 +102,14 @@ install_stop_handlers :: proc() {
 }
 
 /*
-SIGHUP asks the maintenance loop to reload the DoT/DoH certificates from the
-paths already in the configuration, without restarting the process.
+SIGHUP asks the maintenance loop to reload without restarting the process: the
+log file is opened again, the configuration file is read again and what it
+changes is put into effect (`server.reload_config`), and the DoT/DoH
+certificates are read again from the paths the process started with.
 
-Nothing else about the configuration is reloaded - listener addresses, the
-upstream set, blocking, all of that still needs a restart - but a certificate
-renewed in place by certbot or its equivalent is the one thing that otherwise
-forces a resolver to bounce on a schedule it does not control.
+The keys that need a restart - the listeners, `metrics`, `server.max_connections`,
+`server.user` and a few more - keep the value the process started with, and the
+reload names each one that changed; see `server.keep_restart_only`.
 */
 install_reload_handler :: proc() {
 	act: posix.sigaction_t
@@ -162,17 +163,6 @@ wait_for_tick :: proc(deadline: time.Tick, rebuild: ^server.Rebuild) -> Wait_Out
 	}
 }
 
-/*
-One line saying how large this instance is and why.
-
-Worth printing on every start, not only when something was derived: a loop
-count or an in-flight bound that came from the machine is one an operator has
-never seen in a file, so
-leaving it out of the log would make the first question about memory or
-throughput unanswerable from anything but the source. `--check` prints the same
-line, and derives it the same way, so it answers the question on the machine the
-config is bound for rather than in the abstract.
-*/
 // "1 usable CPU" rather than "1 usable CPUs", which is a machine small enough
 // that this line is exactly the one an operator reads twice.
 @(private)
@@ -230,6 +220,16 @@ udp_readers_origin :: proc(s: config.Server_Config) -> string {
 }
 
 /*
+One line saying how large this instance is and why.
+
+Worth logging on every start, not only when something was derived: a loop count
+or an in-flight bound that came from the machine is one an operator has never
+seen in a file, so leaving it out of the log would make the first question about
+memory or throughput unanswerable from anything but the source. Every start logs
+its figures, less the walks, as the `sizing` event, and `--check` prints this
+line, derived the same way, so it answers the question on the machine the config
+is bound for rather than in the abstract.
+
 `chain_walks` rides along with `max_pending` because it is derived from it and
 spent out of it: it is how many of the queries in flight may be waiting on a DS
 or DNSKEY lookup at once, the rest being reserved for what needs no chain walk.
@@ -433,9 +433,7 @@ main :: proc() {
 
 	An arena sidesteps the question by making the lifetime one decision instead
 	of hundreds, and it is what every other caller of the loader already does -
-	the tests all hand it a scratch arena. This was the one that handed it the
-	heap and never came back, so a `--check` run, and every run of the server,
-	ended holding the whole parse.
+	the tests all hand it a scratch arena.
 
 	Registered before `logx.shutdown` so it is released after it: defers run in
 	reverse, and the log's own file name is one of these strings.
@@ -615,9 +613,6 @@ main :: proc() {
 		if text, say := connection_memory_warning(&cfg); say {
 			fmt.printfln("  warning: %s", text)
 		}
-		for key in cfg.retired {
-			fmt.printfln("  warning: %s", config.retired_warning(key))
-		}
 		for text in ddr_warnings {
 			fmt.printfln("  warning: %s", text)
 		}
@@ -634,9 +629,6 @@ main :: proc() {
 		cfg.server.heavy_decodes,
 		logx.quote(sizing_origin(cfg.server)),
 	)
-	for key in cfg.retired {
-		logx.warnf("%s", config.retired_warning(key))
-	}
 	log_config_warnings(&cfg)
 	// Before anything decodes on behalf of a request, and once: the slots are
 	// process-wide and a reload does not move them.
@@ -687,6 +679,13 @@ log_config_warnings :: proc(cfg: ^config.Config) {
 			logx.warnf("%s", text)
 		}
 	}
+	if text, say := mixed_validation_warning(cfg); say {
+		logx.warnf("%s", text)
+	}
+	if text, say := connection_memory_warning(cfg); say {
+		logx.warnf("%s", text)
+	}
+
 	/*
 	Said out loud for the same reason an empty allow list is: with the table
 	off, a .onion query is forwarded, which tells the upstream operator that
@@ -705,13 +704,6 @@ log_config_warnings :: proc(cfg: ^config.Config) {
 	operator to write both would be telling them to do something that changes
 	nothing.
 	*/
-	if text, say := mixed_validation_warning(cfg); say {
-		logx.warnf("%s", text)
-	}
-	if text, say := connection_memory_warning(cfg); say {
-		logx.warnf("%s", text)
-	}
-
 	switch {
 	case !cfg.special_use.enabled:
 		logx.warnf("special_use.enabled is off: localhost., onion., invalid. and the private reverse zones are forwarded to the upstream")
@@ -720,8 +712,7 @@ log_config_warnings :: proc(cfg: ^config.Config) {
 		// reason having nothing to do with tor - wanting their own hosts file to
 		// own `localhost.`, say - is also giving up the root's signed
 		// nonexistence proof for `.onion`, and this line is the only place they
-		// will see that. The warning it replaced said the opposite, that they
-		// had to write `onion: false` to get here.
+		// will see that.
 		if cfg.dnssec.enabled {
 			logx.warnf("special_use.enabled is off: .onion answers are served insecure, as nothing under a zone the root proves is not delegated can be signed")
 		}

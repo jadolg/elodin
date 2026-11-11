@@ -7,11 +7,11 @@ import "core:time"
 /*
 The configurations a parity run is made under.
 
-One configuration answers one question. The run that existed first held every
-answer against its upstream with the cache off, a single plain-UDP upstream and
-nothing between the two sides but the codec - which is the question of whether
-the pipe itself loses anything, and says nothing about what a cache, a cookie
-exchange, a TLS upstream or a block list does to an answer on its way through.
+One configuration answers one question. The `baseline` scenario holds every
+answer against a single plain-UDP upstream with the cache off - which is the
+question of whether the pipe itself loses anything, and says nothing about what
+a cache, a cookie requirement, a TLS upstream or a block list does to an answer
+on its way through.
 Those are where a resolver in service actually spends its time, and each is a
 path of its own with its own chances to drop a record or leak an option.
 
@@ -27,7 +27,7 @@ forwards comes back as the upstream sent it, and the only answers allowed to
 differ outright are the ones the configuration says this server answers itself
 - a blocked name, a cookie it demands first. Those are not skipped: each is
 checked for being exactly the answer the configuration promises, and every
-query that is not one of them is held to parity as before.
+query that is not one of them is held to parity like any other.
 */
 
 Parity_Upstream_Kind :: enum u8 {
@@ -274,8 +274,7 @@ PARITY_ALLOWED :: "safe.www.parity.test."
 
 /*
 A `||*.zone^` rule: every name under the zone, and not the zone itself. The
-AdGuard DNS filter writes its subtree rules this way, and they used to be
-dropped as wildcards (#323). The zone and a name under it are both in the pool,
+AdGuard DNS filter writes its subtree rules this way (#323). The zone and a name under it are both in the pool,
 so a rule read as the plain `||zone^` shows up as much as one not read at all.
 */
 PARITY_BLOCKED_SUBTREE :: "subtree.parity.test."

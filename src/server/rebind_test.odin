@@ -108,7 +108,7 @@ test_a_public_name_is_not_answered_with_a_private_address :: proc(t: ^testing.T)
 		cfg.cache.enabled = false
 		cfg.dnssec.enabled = false
 		cfg.blocking.enabled = false
-		// Off by default now, and this is the reproducer for the guard on.
+		// Off by default, and this is the reproducer for the guard on.
 		cfg.rebind.enabled = true
 		cfg.upstream.strategy = .Failover
 		cfg.upstream.attempts = 1
@@ -324,7 +324,7 @@ ask_raw :: proc(
 }
 
 // A configuration with nothing in the way of the check but the check itself.
-// The guard is off in the shipped default now, so it is turned on here: these
+// The guard is off in the shipped default, so it is turned on here: these
 // tests are all about what it does once on, and the off case has its own test.
 @(private = "file")
 rebind_config :: proc() -> config.Config {
@@ -728,15 +728,13 @@ test_an_https_record_cannot_hint_at_a_private_address :: proc(t: ^testing.T) {
 RFC 6761 section 6.3 makes 127.0.0.1 and ::1 the only answers that name can
 have, so this is not the operator granting latitude but the guard declining to
 refuse the one answer the standard permits. It is deliberately not a setting,
-and deliberately not deferred to the RFC 6761 handling that would answer the
-name locally and keep it off the forwarding path entirely: two guards whose
-correctness depends on which of them merged first is a live bug waiting for one
-to land while the other is still in review.
+and deliberately not left to the RFC 6761 handling, which answers the name
+locally and keeps it off the forwarding path entirely: each guard holds without
+the other.
 
-That handling has since landed, and it does keep these names off the forwarding
-path - so this test builds its configuration with `special_use.enabled: false`
-to reach the guard at all. The exemption is still the guard's own, which is the
-point of holding it here rather than deleting it: it is what answers a
+So this test builds its configuration with `special_use.enabled: false` to reach
+the guard at all. The exemption is the guard's own, which is the point of
+holding it here: it is what answers a
 `localhost.` query if an operator ever turns the table off, and it is why doing
 so does not cost them the one answer RFC 6761 permits.
 
@@ -792,8 +790,8 @@ test_localhost_may_be_answered_with_loopback :: proc(t: ^testing.T) {
 }
 
 /*
-And what a shipped configuration actually does with those names, now that both
-features are in it.
+And what a shipped configuration actually does with those names, with both
+features in it.
 
 The RFC 6761 table runs before anything is forwarded, so with it at its default
 a hostile answer for a `.localhost` name is not refused by the guard - it is
@@ -902,17 +900,16 @@ test_a_zero_ip_block_response_still_reaches_the_client :: proc(t: ^testing.T) {
 /*
 An answer this server cannot decode is refused rather than forwarded.
 
-This was the way round the guard, and it cost the attacker nothing: they own the
-authoritative server, so they emit a truthful answer section carrying
-192.168.1.1 and an ARCOUNT of 100 with no additional records behind it. The
-count check in `decode_message` rejects the message, `rebind_refusal` had
-nothing to inspect and said so, and the bytes went to the client verbatim -
-where glibc's `getanswer`, which only ever walks the answer section, hands the
-browser the address. Deterministic, one flag in the header, no timing and no
-race.
+Forwarded, it would be a way round the guard that costs the attacker nothing:
+they own the authoritative server, so they emit a truthful answer section
+carrying 192.168.1.1 and an ARCOUNT of 100 with no additional records behind it.
+The count check in `decode_message` rejects the message, so with nothing to
+inspect the bytes would go to the client verbatim - where glibc's `getanswer`,
+which only ever walks the answer section, hands the browser the address.
+Deterministic, one flag in the header, no timing and no race.
 
-What the file used to offer against that was that such a message is also one the
-validator cannot validate. It is not much: `validating` is false whenever
+That such a message is also one the validator cannot validate is not much of a
+defence: `validating` is false whenever
 `dnssec.enabled` is off - a supported configuration, and the one recommended for
 an upstream that cannot return DNSSEC records - or the client sets CD, and an
 attacker's own zone is unsigned in any case, so validation reaches Insecure and
@@ -1072,12 +1069,12 @@ test_an_https_answer_cannot_smuggle_an_address_in_the_additional_section :: proc
 A clean answer section is not refused over a section nothing reads.
 
 The fail-closed rule exists for one bypass - a truthful answer carrying a private
-address behind a count of records that are not in the message - and the first cut
-of it enforced fail-closed with `decode_message`, which refuses a message for a
-malformed record anywhere in it. That is wider than the bypass by everything a
-stub never looks at: an authority or additional section that does not parse has
-no bearing on the address the client is about to connect to, and a name whose
-upstream emits one resolves today.
+address behind a count of records that are not in the message - and enforcing it
+with `decode_message`, which refuses a message for a malformed record anywhere in
+it, would be wider than the bypass by everything a stub never looks at: an
+authority or additional section that does not parse has no bearing on the
+address the client is about to connect to, and a name whose upstream emits one
+resolves.
 
 Three cases, and the middle one is the point of the other two: the guard has to
 still be reading the answer section, not skipping the message.
@@ -1174,11 +1171,11 @@ An address record the decoder could not parse is unreadable, not absent.
 
 `decode_record` does not fail on RDATA it cannot make sense of - it keeps the
 bytes and reports success, which is right for a forwarder that has to pass on
-types it does not model. The guard reads the union tag to find addresses, so such
-a record matched nothing and was forwarded unexamined. For HTTPS that is a way
-through with something behind it: the `ipv4hint` bytes are sitting in the RDATA,
-a client that parses the target name differently from this decoder reads them,
-and the guard never looked.
+types it does not model. A guard that found addresses by the union tag alone
+would match nothing in such a record and forward it unexamined. For HTTPS that
+is a way through with something behind it: the `ipv4hint` bytes are sitting in
+the RDATA, a client that parses the target name differently from this decoder
+reads them, and the guard would never look.
 
 Scoped to the four types the guard takes addresses from - a raw TXT is a raw TXT,
 and refusing on those would be a rule about malformed messages rather than about
@@ -1255,7 +1252,7 @@ test_an_unparsable_address_record_is_refused :: proc(t: ^testing.T) {
 The IPv6 forms that carry an IPv4 address inside them.
 
 `::ffff:a.b.c.d` is undone by `address_in` and has its own case above. Two more
-reach a private IPv4 host and were not being undone: RFC 6052's well-known NAT64
+reach a private IPv4 host and are undone too: RFC 6052's well-known NAT64
 prefix, which on a NAT64 network is how a client is given an IPv4 destination at
 all, and the deprecated IPv4-compatible form. Both are one AAAA record, which is
 the record a client on such a network asks for first.
@@ -1377,8 +1374,8 @@ Written as a measurement because there is nothing else to look at. Both readings
 are of the same bytes by the same decoder and they agree, so every answer this
 server sends is identical whether the decode happened once or twice - the only
 trace the second one leaves is what it spent. That is issue #188: on a cache
-miss the guard decoded the response for itself and the cache block a few lines
-below decoded it again.
+miss the guard and the cache block a few lines below it share one decode of the
+response.
 
 The reply is one RRset of twelve addresses, which is twelve records and twelve
 names to allocate: a dozen allocations that either happen once or happen twice,

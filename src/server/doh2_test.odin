@@ -17,7 +17,7 @@ everything the connection writes back.
 `await` holds the peer open until the answer has been written. `h2.serve` marks
 the connection closed on its way out, and a closed connection refuses writes -
 so a peer that leaves the moment its request is sent would silence a handler
-still running on a pool worker, which is not what a real one does.
+still running on its request's fiber, which is not what a real one does.
 */
 @(private = "file")
 Script :: struct {
@@ -111,7 +111,7 @@ one_get_request :: proc(path: string, requests := 1) -> [dynamic]u8 {
 
 // Whether any DATA frame went out, which is what says a response carried a
 // body: a body is the flow-controlled part, and the only part that can park the
-// thread writing it.
+// fiber writing it.
 @(private = "file")
 wrote_a_body :: proc(out: []u8) -> bool {
 	pos := 0
@@ -268,8 +268,8 @@ serve_one :: proc(
 	hc := h2.make_conn(io, h2_handler, &ctx)
 	h2.serve(hc)
 
-	// Read before the gate opens: once the worker is free the pool drains, and
-	// a job that was queued would no longer be pending to find.
+	// Read before the gate opens: until then the gate's place is counted in it,
+	// and is taken back off below.
 	queued := queries_pending(&s)
 	if occupy {
 		queued -= 1
@@ -301,7 +301,7 @@ request is never read, so it is neither answered nor counted.
 */
 @(test)
 test_doh2_a_held_connection_outside_the_allow_list_gets_403 :: proc(t: ^testing.T) {
-	// See the note in the first test.
+	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()
@@ -354,10 +354,10 @@ test_doh2_sheds_a_request_it_cannot_start :: proc(t: ^testing.T) {
 /*
 DoH over HTTP/2 must shed against `max_pending` like every other queued query.
 
-It is the only transport that hands its work to the shared worker pool instead
-of answering on its own connection thread, so it is the one that can fill that
-pool - up to `max_connections` x `MAX_HELD_STREAMS` streams - while the operator's
-backlog limit sheds UDP at a few hundred.
+It is the only stream transport that starts a query on a fiber of its own per
+request rather than answering on its connection's fiber, so without the bound it
+runs up to `max_connections` x `MAX_HELD_STREAMS` queries beside the UDP ones
+`max_pending` sheds at a few hundred.
 
 The query is a bare DNS header with no question, which the endpoint answers
 FORMERR without reaching the cache, the filters or an upstream group - none of
@@ -367,11 +367,11 @@ that queues it again should fail this test rather than crash it.
 @(test)
 test_doh2_sheds_when_the_pool_backlog_is_full :: proc(t: ^testing.T) {
 	/*
-	A queued job is allocated on the connection thread and released on a pool
-	worker, and in the server both run under the default heap allocator. The
-	test runner hands this proc a per-test tracking allocator instead, which
-	would make that pairing a free through an allocator that never made the
-	block.
+	A started job is allocated on the connection's reader and released on the
+	request's own fiber, and in the server both run under the default heap
+	allocator. The test runner hands this proc a per-test tracking allocator
+	instead, which would make that pairing a free through an allocator that
+	never made the block.
 	*/
 	context.allocator = runtime.heap_allocator()
 
@@ -388,7 +388,7 @@ test_doh2_sheds_when_the_pool_backlog_is_full :: proc(t: ^testing.T) {
 	testing.expectf(t, got.queued == 0, "%d requests were queued past max_pending", got.queued)
 
 	// The status is the whole answer: a shed carries no body, so that it cannot
-	// park this thread on flow control. See `h2_shed`.
+	// park the reader on flow control. See `h2_shed`.
 	testing.expect(
 		t,
 		strings.contains(string(got.output[:]), "503"),
@@ -402,8 +402,8 @@ test_doh2_sheds_when_the_pool_backlog_is_full :: proc(t: ^testing.T) {
 	testing.expect_value(t, got.dropped, u64(1))
 }
 
-// The shed is a limit, not a policy: with the pool idle the same request goes to
-// a worker and is answered there.
+// The shed is a limit, not a policy: with room under `max_pending` the same
+// request is started on a fiber of its own and answered there.
 @(test)
 test_doh2_queues_while_the_pool_has_room :: proc(t: ^testing.T) {
 	// See the note in the test above.
@@ -433,11 +433,12 @@ test_doh2_queues_while_the_pool_has_room :: proc(t: ^testing.T) {
 /*
 A request over the response budget is answered 429 and never queued.
 
-HTTP/2 multiplexes, so one connection carries as many requests as the client cares
-to open streams for - up to `MAX_CONCURRENT` at a time, each of them replaced the
-moment it completes - and `max_connections` bounds none of that. The charge is on
-the reader thread ahead of `try_submit` so an over-budget request costs a HEADERS
-frame rather than a place in the backlog and a worker.
+HTTP/2 multiplexes, so one connection carries as many requests as the client
+cares to open streams for - up to `MAX_CONCURRENT` at a time, each of them
+replaced the moment it completes - and `max_connections` bounds none of that.
+The charge is on the connection's reader fiber ahead of `submit_query`, so an
+over-budget request costs a HEADERS frame rather than a place in `max_pending`
+and a fiber of its own.
 
 The bucket is spent before the connection opens, which is what a client that has
 already been asking looks like. The pool is deliberately occupied and
@@ -446,7 +447,7 @@ pending for `queued` to find, and the answer would be 503 rather than 429.
 */
 @(test)
 test_doh2_refuses_a_request_over_the_rate_limit :: proc(t: ^testing.T) {
-	// See the note in the first test.
+	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()
@@ -476,7 +477,7 @@ test_doh2_refuses_a_request_over_the_rate_limit :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(answer, "429"), "the over-budget request was not answered 429")
 	testing.expect(t, !strings.contains(answer, "503"), "the request was shed rather than rate limited")
 	// The status is the whole answer, for the reason `h2_shed` sends none either:
-	// a body can park this thread on flow control.
+	// a body can park the reader on flow control.
 	testing.expect(
 		t,
 		!wrote_a_body(got.output[:]),
@@ -503,7 +504,7 @@ clients being served. The same argument `h2_shed` counts by, one step earlier.
 */
 @(test)
 test_doh2_rate_limit_charges_only_queries :: proc(t: ^testing.T) {
-	// See the note in the first test.
+	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()
@@ -532,14 +533,14 @@ test_doh2_rate_limit_charges_only_queries :: proc(t: ^testing.T) {
 /*
 `dropped` counts queries the server refused, not streams it turned away.
 
-A request for some other path is shed like any other once the backlog is full -
-it would have taken a worker to answer - but it was never going to reach the
-resolver, so counting it would have a scanner on the DoH port inflating the
-figure an operator reads as "this server cannot keep up".
+A request for some other path is shed like any other once `max_pending` is
+full - it would have taken a fiber of its own to answer - but it was never going
+to reach the resolver, so counting it would have a scanner on the DoH port
+inflating the figure an operator reads as "this server cannot keep up".
 */
 @(test)
 test_doh2_shed_counts_only_queries :: proc(t: ^testing.T) {
-	// See the note in the first test.
+	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()
@@ -566,14 +567,14 @@ A `dns` parameter that is not base64 - or a missing one, or a POST naming the
 wrong content type, or a message short of a DNS header - is answered out of the
 request and nothing else: no resolver, no cache, no upstream, none of the costs
 this bound exists to hold down. Charged, they would let anything able to address
-`/dns-query` spend the budget of the clients sharing its prefix, without even the
-expense of asking a question - a cheaper flood than the one the limiter was added
-for. `h2_charged` is what draws the line, and it draws it with the same checks the
-worker answers by, so the two cannot come apart.
+`/dns-query` spend the budget of the clients sharing its prefix, without even
+the expense of asking a question - a cheaper flood than the one the limiter was
+added for. `h2_charged` is what draws the line, and it draws it with the same
+checks the request's fiber answers by, so the two cannot come apart.
 */
 @(test)
 test_doh2_rate_limit_charges_only_well_formed_queries :: proc(t: ^testing.T) {
-	// See the note in the first test.
+	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()
@@ -614,10 +615,10 @@ test_doh2_rate_limit_charges_only_well_formed_queries :: proc(t: ^testing.T) {
 A connection that has asked nothing for too long gets no further frame read (#344).
 
 `h2_begin` is where every frame starts, so it is where the bound is applied: the
-budget it hands the read is already spent, which is what ends `h2.serve`. Before,
-each frame got a fresh budget whatever came before it, and a peer completing a
-SETTINGS or a PING inside every idle wait held its connection forever while
-nothing charged it.
+budget it hands the read is already spent, which is what ends `h2.serve`.
+Without it, each frame would get a fresh budget whatever came before it, and a
+peer completing a SETTINGS or a PING inside every idle wait would hold its
+connection forever while nothing charged it.
 */
 @(test)
 test_doh2_stops_reading_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
@@ -667,7 +668,7 @@ connection either, or the 404 is the free way to hold one.
 */
 @(test)
 test_doh2_only_a_question_keeps_the_connection :: proc(t: ^testing.T) {
-	// See the note in the first test.
+	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()
@@ -683,7 +684,7 @@ test_doh2_only_a_question_keeps_the_connection :: proc(t: ^testing.T) {
 	defer delete(scanned.output)
 	testing.expect(t, !scanned.asked, "a request for another path counted as a question")
 
-	// Held behind a busy worker, so the answer comes well after the question.
+	// Held behind the gate (`occupy`), so the answer comes well after the question.
 	queried := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true, limiter = limiter)
 	defer delete(queried.output)
 	testing.expect(t, queried.asked, "a query did not count as a question")

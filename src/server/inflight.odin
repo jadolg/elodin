@@ -11,7 +11,7 @@ import "elodin:loop"
 Identical questions in flight at once go to the upstream once (issue #311).
 
 The first query to miss the cache for a key leads: it registers a `Flight` here
-and forwards as it always did. A query that misses for the same key while the
+and forwards as any miss does. A query that misses for the same key while the
 leader is still out follows: it waits for the leader to land and is served the
 leader's answer through `serve_from_cache`, as it would have been had it arrived
 a moment later and found that answer stored - bar `cache.min_ttl`, which is
@@ -174,10 +174,7 @@ resolution, a cookie retry, a truncated reply's retry over TCP (issue #449). The
 other is slack for the leader's own work after it, decoding, validating and
 storing, which no deadline covers. A leader past that is validating a long
 chain or stuck, and the follower gains nothing by waiting on: its own forward,
-once patience runs out, finds the deadline spent and asks nobody. The old
-figure - every server for every attempt, twice for a truncated reply, plus the
-sweep - was sized for a forward nothing bounded, and held a query ten timeouts
-for a group of two.
+once patience runs out, finds the deadline spent and asks nobody.
 */
 @(private)
 flight_patience :: proc(deadline: time.Tick, span: time.Duration) -> time.Duration {

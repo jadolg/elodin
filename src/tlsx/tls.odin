@@ -281,12 +281,11 @@ every accepted connection holds one from `SSL_new` until it closes - so the
 buffer is handed to the `SSL_CTX` as well, through ex_data, and dies with the
 last reference rather than with the wrapper.
 
-Owning it any other way is what the reload showed to be wrong: a peer that
-connects and then stalls before its ClientHello decides when `alpn_select` runs,
-because the handshake is deliberately outside the reload's lock. Freeing with
-the `Context` therefore let a stalled handshake read the list back out of
-reclaimed memory - and OpenSSL copies whatever the callback names straight into
-the ServerHello.
+Owning it any other way is wrong across a reload: a peer that connects and then
+stalls before its ClientHello decides when `alpn_select` runs, because the
+handshake is deliberately outside the reload's lock. Freeing with the `Context`
+would let a stalled handshake read the list back out of reclaimed memory - and
+OpenSSL copies whatever the callback names straight into the ServerHello.
 
 It is libc memory rather than Odin's because the free runs inside `SSL_CTX_free`
 on whichever thread drops the last reference, with no Odin context to reach an
@@ -312,7 +311,7 @@ where the `SSL_CTX` names a buffer nothing will free.
 install_alpn :: proc(ptr: ^SSL_CTX, protocols: []string) -> Error {
 	// -1 means `CRYPTO_get_ex_new_index` failed during `init`, which leaves no
 	// way to tie the buffer to the context; refusing beats installing a list
-	// with the old lifetime.
+	// that dies with the `Context` rather than the `SSL_CTX`.
 	if alpn_ex_index < 0 || !alpn_encodable(protocols) {
 		return .Alpn_Failed
 	}
@@ -748,8 +747,8 @@ has just made non-blocking.
 The deadline is the socket's receive timeout, which is the caller's figure: for
 an accepted connection the per-connection budget, and for a dial the timeout
 `upstream.open_stream` was given. A zero timeout is the caller having set no
-SO_RCVTIMEO, and waits as long as the peer takes, which is what the blocking
-handshake did in that case.
+SO_RCVTIMEO, and waits as long as the peer takes, as a blocking handshake on
+such a socket would.
 */
 @(private)
 handshake_loop :: proc(conn: ^Conn, side: Handshake_Side) -> Error {
@@ -918,7 +917,7 @@ transfer :: proc(conn: ^Conn, op: Op, buf: []u8, timeout: time.Duration) -> (n: 
 
 /*
 Wait for the socket, with the connection's lock released. A zero timeout waits
-indefinitely, which is what a blocking socket with no SO_RCVTIMEO did.
+indefinitely, as a blocking socket with no SO_RCVTIMEO would.
 
 On a loop this parks the fiber on the loop's epoll, and the loop runs other
 connections meanwhile; off one - the blocklist downloads, a test - it is `poll`.

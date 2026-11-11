@@ -19,7 +19,7 @@ Loading and refreshing sink lists.
 Remote lists are cached on disk. A refresh that fails falls back to the cached
 copy, so a network outage cannot silently turn blocking off. Where there is no
 copy either, a refresh keeps the rules already in effect rather than swapping in
-a set that lacks a list it had (#411); see `reload_filters`.
+a set that lacks a list it had (#411); see `reload_filters_from`.
 */
 
 FETCH_TIMEOUT :: 30 * time.Second
@@ -161,7 +161,7 @@ move_query_named_caches :: proc(cfg: ^config.Config) {
 }
 
 // What a pair of sets holds. Said of the sets being swapped in, so that a
-// refresh `reload_filters` drops does not log a count nothing is enforcing.
+// refresh `reload_filters_from` drops does not log a count nothing is enforcing.
 @(private)
 log_filter_sets :: proc(block, allow: ^filter.Set) {
 	logx.infof(
@@ -182,7 +182,7 @@ log_filter_sets :: proc(block, allow: ^filter.Set) {
 
 /*
 Whether the operator's rule added a rule or, as a `$badfilter`, took one back.
-Looking for `badfilter` in the text instead let a skipped one, such as
+Looking for `badfilter` in the text instead would let a skipped one, such as
 `$important, badfilter` or `$third-party,badfilter`, cancel nothing unremarked.
 */
 @(private)
@@ -249,7 +249,7 @@ load_one_list :: proc(
 			if load == .Unavailable {
 				// The download arrived and holds nothing, and there is no copy
 				// to stand in: the list is empty, not lost, so it does not hold
-				// the other lists back as `reload_filters` holds them for a
+				// the other lists back as `reload_filters_from` holds them for a
 				// list it cannot reach. It stays not current, and so retried.
 				return .Empty
 			}

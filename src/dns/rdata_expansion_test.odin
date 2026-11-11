@@ -116,7 +116,7 @@ test_opt_of_empty_options_is_barely_charged :: proc(t: ^testing.T) {
 /*
 Counting the elements before reading them does not change what is read.
 
-Both lists are now sized from a pass that follows the length fields, so that pass
+Both lists are sized from a pass that follows the length fields, so that pass
 and the read after it have to agree about where every element starts and where
 the RDATA ends - including for the RDATA that is wrong, which the decoder keeps
 as `Rdata_Raw` rather than rejecting.

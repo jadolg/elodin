@@ -43,7 +43,7 @@ reads it as "wait indefinitely" - and the only value this could send for that is
 of what such a connection does. There is no encoding for "no idle timeout", so
 the option is left off and the client is told nothing rather than told a lie.
 
-The ceiling is the field's own. 65535 hundredths is a little under two hours,
+The ceiling is the field's own. 65535 tenths is a little under two hours,
 and a `client_timeout` past that is clamped down to it for the same reason the
 truncation goes that way.
 */
@@ -52,8 +52,8 @@ keepalive_units :: proc(d: time.Duration) -> (units: u16, ok: bool) {
 	if d <= 0 {
 		return 0, false
 	}
-	hundredths := i64(d / (100 * time.Millisecond))
-	if hundredths > i64(max(u16)) {
+	tenths := i64(d / (100 * time.Millisecond))
+	if tenths > i64(max(u16)) {
 		return max(u16), true
 	}
 	// A timeout under 100ms floors to zero, which is the one value this may not
@@ -61,10 +61,10 @@ keepalive_units :: proc(d: time.Duration) -> (units: u16, ok: bool) {
 	// connection is closed at once in practice, but saying so is a decision and
 	// not a rounding artefact, so it is left to the honest answer of saying
 	// nothing.
-	if hundredths == 0 {
+	if tenths == 0 {
 		return 0, false
 	}
-	return u16(hundredths), true
+	return u16(tenths), true
 }
 
 /*
@@ -95,8 +95,7 @@ The answer having room: an option that will not fit is dropped and the answer
 goes as it stands, which is what `pad_answer` does and for the same reason. The
 limit on these transports is the 65535 of the DNS framing, so this is a message
 already within six bytes of the largest one there is - and a client that reads
-no keepalive option simply keeps its own idea of when to close, which is where
-it was before this ran.
+no keepalive option simply keeps its own idea of when to close.
 
 Ordered after `attach_cookie` and before `pad_answer`: it writes into the OPT
 record the way the cookie does, so it must run after `match_client_opt` has

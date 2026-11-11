@@ -176,7 +176,7 @@ chain, not the ceiling's doing.
 The parent signed the DS, so from that DS down the walk is reading a zone it
 established, and a key set that DS does not match is `Bogus` there - the same
 as it would be with no ceiling step above. Letting go of the flag only once the
-step succeeded left this reported as `Indeterminate` with extended error 27,
+step succeeded would report this as `Indeterminate` with extended error 27,
 telling whoever debugs a forged or broken key set to look at iteration counts.
 */
 @(test)

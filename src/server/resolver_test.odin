@@ -101,10 +101,10 @@ test_response_limit_floors_an_unset_ceiling :: proc(t: ^testing.T) {
 The ceiling holds on the paths that go wrong too.
 
 `fit_response` is the only thing between an answer and the wire, so whatever it
-returns is what a UDP client receives. An answer it cannot re-encode used to be
-returned unchanged, which meant the one case where the size was not under this
-server's control was the case where the size was not bounded either - and the
-number it is bounded by is an amplification factor.
+returns is what a UDP client receives. Returning an answer it cannot re-encode
+unchanged would make the one case where the size is not under this server's
+control the case where the size is not bounded either - and the number it is
+bounded by is an amplification factor.
 */
 @(test)
 test_fit_response_never_exceeds_the_limit :: proc(t: ^testing.T) {
@@ -506,8 +506,8 @@ An upstream that is up is asked, and its answer is the one the client gets.
 This is the half of RFC 8767 section 5 that a counter cannot show: not that a
 stale answer is available, but that it is not reached for while the refresh can
 still succeed. Serving the expired copy on sight means a client gets data known
-to be out of date - for as long as the entry is kept, now a day rather than the
-thirty seconds the sweep used to allow - while a healthy upstream sits unqueried
+to be out of date - for as long as the entry is kept, up to a day - while a
+healthy upstream sits unqueried
 and the name it would have returned goes on changing.
 
 Driven against a real socket, because what is being asserted is that a query
@@ -789,12 +789,12 @@ test_rd_zero_is_answered_from_a_stale_entry :: proc(t: ^testing.T) {
 /*
 The client response timer, which is what `cache.serve_stale` is worth.
 
-Issue #164: the fallback used to be reached only once `upstream.resolve` had
-given up, which is `attempts` x servers x `timeout` - ten seconds with the
-defaults against one blackholed upstream, twenty against two - while a glibc
-stub gives up at five and systemd-resolved sooner. The expired answer therefore
-arrived after the client it was kept for had already failed, so the setting did
-nothing in the one outage an operator turns it on for.
+Issue #164: a fallback reached only once `upstream.resolve` had given up would
+wait out `attempts` x servers x `timeout` - ten seconds with the defaults against
+one blackholed upstream, twenty against two - while a glibc stub gives up at five
+and systemd-resolved sooner. The expired answer would arrive after the client it
+was kept for had already failed, so the setting would do nothing in the one
+outage an operator turns it on for.
 
 The upstream here is a socket that is bound and never read. That is the shape
 the issue is about and the one a closed port cannot stand in for: a datagram to
@@ -804,9 +804,9 @@ comes back and nothing is refused, so only the timeout ends the attempt.
 
 The budget below is two seconds and the timer is 150 ms, so the assertion has
 850 ms of slack in it - enough that a loaded runner cannot fail it without also
-being a second behind, and tight enough that the old behaviour cannot pass. Set
-`cache.stale_timeout` to 0 - the escape hatch, and what every release before
-this one did - and this case takes the whole two seconds and fails.
+being a second behind, and tight enough that waiting out the upstream cannot
+pass. Set `cache.stale_timeout` to 0 - the escape hatch - and this case takes the
+whole two seconds and fails.
 */
 @(test)
 test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T) {
@@ -967,8 +967,8 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 	/*
 	Joined before the count is taken, and the count is exact because of it.
 
-	The refresh sends from a pool worker, and nothing about a client having
-	been answered says that worker has reached its send: the four calls above
+	The refresh sends from a fiber on the test loop, and nothing about a client
+	having been answered says that fiber has reached its send: the four calls above
 	return when the timer fires, which is 100 ms into a two-second upstream
 	attempt the job is still sitting in. Counting then would be counting
 	against a scheduler - the assertion would be waiting for a datagram rather
@@ -1035,7 +1035,7 @@ test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
 	start_test_loop(&workers)
 	// Joined in the middle of the case rather than at the end of it, since the
 	// store this is about happens on the refresh's way out. The flag is what
-	// keeps an early return from leaking the pool all the same.
+	// keeps an early return from leaking the loop all the same.
 	joined := false
 	defer if !joined {
 		stop_test_loop(&workers)
@@ -1071,7 +1071,7 @@ test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
 	testing.expect(t, x.got, "the refresh never reached the upstream")
 
 	// The refresh is joined rather than slept on: the store happens on its way
-	// out, so the pool going quiet is what says the entry is final.
+	// out, so the loop going quiet is what says the entry is final.
 	stop_test_loop(&workers)
 	joined = true
 	s.loops = nil
@@ -1103,7 +1103,7 @@ hundreds of them, so the ordinary refresh of an expired name is a client served
 fresh data and a cache that renewed itself, with nothing stale involved.
 
 `test_a_live_upstream_beats_a_stale_entry` asserts the same thing on the path
-with no worker pool, where the refresh cannot be detached and the client waits
+with no event loop, where the refresh cannot be detached and the client waits
 for the upstream itself. This is the detached one.
 */
 @(test)
@@ -1194,10 +1194,10 @@ the attempt times out. The datagram count says the upstream was asked at all -
 it cannot tell the two paths apart, since either way exactly one query goes out,
 which is why the clock is what carries this.
 
-The worker pool is built and handed over, which is the point of the case: with
-no pool there is nothing to detach onto and the fall-through happens for a
+An event loop is built and handed over, which is the point of the case: with
+no loop there is nothing to detach onto and the fall-through happens for a
 second reason, so a `Server` without one would pass this while proving nothing
-about the setting. Here the pool is there, unused, and the zero is the only
+about the setting. Here the loop is there, unused, and the zero is the only
 thing keeping the refresh on this thread.
 */
 @(test)
@@ -1275,7 +1275,7 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 	testing.expect_value(t, counters.failed, u64(0))
 	testing.expect_value(t, cache.stats(answers).stale, u64(1))
 
-	// Nothing was ever submitted, so this joins an idle pool; the count behind
+	// Nothing was ever submitted, so this stops an idle loop; the count behind
 	// it is the one attempt this thread made for itself.
 	stop_test_loop(&workers)
 	joined = true
@@ -1328,8 +1328,9 @@ The snapshot carries every counter, and this is what makes that true.
 `stats_of` reads the live counters one at a time, so a counter added to `Stats`
 and not added here reports zero forever - which is worse than not reporting it,
 because the stats line still prints the name and an operator reads the zero as
-the answer. `refused` was exactly that: incremented on every refused datagram
-and connection, and absent from the snapshot the report is built from.
+the answer. `refused` is the example: incremented on every refused datagram and
+connection, it would be absent from the snapshot the report is built from if
+`stats_of` left it out.
 
 Whole-struct equality rather than a field-by-field walk, because the failure
 being guarded against is a field nobody thought to check.

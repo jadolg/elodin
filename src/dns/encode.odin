@@ -37,8 +37,8 @@ Writer :: struct {
 	An allocation the writer needed came back short - an append to `buf`, or
 	a compression target `comp` could not record - so what was written is not
 	the message. Every record and question checks it before patching a byte it
-	wrote, and `encode_message` before the header fill, so a failed allocation
-	is `.Out_Of_Memory` and never an index past the end.
+	wrote, and `encode_message` right after reserving the header, so a failed
+	allocation is `.Out_Of_Memory` and never an index past the end.
 	*/
 	short:     bool,
 }

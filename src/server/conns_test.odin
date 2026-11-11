@@ -8,7 +8,7 @@ import "core:time"
 import "elodin:loop"
 
 /*
-The connection limit is `len(threads) - permanent`, so `permanent` has to keep
+The connection limit is `len(entries) - permanent`, so `permanent` has to keep
 meaning what it says for as long as the manager runs.
 
 Then how that limit is shared out. `max_connections` is one budget for the whole
@@ -84,13 +84,13 @@ test_a_permanent_entry_leaving_keeps_the_count_honest :: proc(t: ^testing.T) {
 /*
 One client must not be able to hold every slot in the table.
 
-This is the whole of the finding: `max_connections` bounded how many connections
-existed and nothing bounded whose they were, so 512 of them from one source
-address were 512 the rest of the network could not have. The limiter does not
-reach it either - what it charges is opening a connection and the queries asked
-over it, both of them rates a client can stay inside while never letting go - so a
-client that opens connections slowly and sits there is, to every counter this
-server keeps, several well-behaved clients.
+`max_connections` alone bounds how many connections exist and not whose they
+are, so without a share one source address could hold all 512, and they would be
+512 the rest of the network could not have. The limiter does not reach it
+either - what it charges is opening a connection and the queries asked over it,
+both of them rates a client can stay inside while never letting go - so a client
+that opens connections slowly and sits there is, to every counter this server
+keeps, several well-behaved clients.
 
 Two slots each out of four, so the case can tell a share being full from the
 table being full: the third connection from the flooded /24 is refused with half
@@ -162,13 +162,14 @@ test_the_prefix_share_holds_for_v6_too :: proc(t: ^testing.T) {
 /*
 A connection that ends gives its client's share back.
 
-The share is counted off the thread list rather than kept in a table beside it,
-which is what makes this true by construction: the same `reap_locked` that
-returns the slot returns the share, and there is no second place for the two to
-disagree. A count that was incremented on accept and decremented at the far end
-of a connection handler would be one refusal away from leaking a share
-permanently - and a leaked share is a client this server refuses for the rest of
-its uptime, on the strength of connections that ended.
+The share is counted off the connection table (`prefix_conns_locked`) rather
+than kept in a table beside it, which is what makes this true by construction:
+the `conn_entry_remove_locked` that returns the slot returns the share, and
+there is no second place for the two to disagree. A count that was incremented
+on accept and decremented at the far end of a connection handler would be one
+refusal away from leaking a share permanently - and a leaked share is a client
+this server refuses for the rest of its uptime, on the strength of connections
+that ended.
 */
 @(test)
 test_a_finished_connection_gives_its_share_back :: proc(t: ^testing.T) {
@@ -212,7 +213,7 @@ test_a_full_table_is_not_blamed_on_the_client :: proc(t: ^testing.T) {
 }
 
 /*
-No share configured is the behaviour this server had before there was one.
+No share configured lets one client take the whole table.
 
 `max_connections_per_prefix` at or above `max_connections` is stored as no cap,
 which an operator asks for by saying so - a resolver serving one large NAT, where

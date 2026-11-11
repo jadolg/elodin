@@ -8,27 +8,26 @@ import "core:time"
 import "elodin:dns"
 
 /*
-Issue #352: the chain walk refused a name for having too many labels, and a
-full IPv6 reverse name has more of them than the bound allowed.
+Issue #352: the chain walk must not refuse a name for having many labels, since
+a full IPv6 reverse name has more of them than `MAX_CHAIN_DEPTH` allows cuts.
 
-`MAX_CHAIN_DEPTH` says in its own comment that it bounds a delegation
-hierarchy - zone cuts - and `zone_trust` spent it on `label_count(name)`
-instead. A reverse name for an IPv6 address is one nibble per label: thirty-two
-of them, plus `ip6` and `arpa`, so thirty-four against a bound of twenty-four.
-Every such name was `Indeterminate` before a single DS was asked for, and
-`Indeterminate` is SERVFAIL with EDE 22. The client-facing paths that reach the
-walk with the question's own name rather than a signer's are `validate_denial` -
-every NXDOMAIN and NODATA, which is most of IPv6 reverse space - and
-`validate_rrset`'s fallback owner walk, so with validation on a resolver
-answered essentially no IPv6 reverse lookup. IPv4 reverse names are six labels
-and were never affected, which is why this hid.
+`MAX_CHAIN_DEPTH` bounds a delegation hierarchy - zone cuts - and `zone_trust`
+spends it on cuts, not on `label_count(name)`. A reverse name for an IPv6
+address is one nibble per label: thirty-two of them, plus `ip6` and `arpa`, so
+thirty-four against a bound of twenty-four. Spent on labels, every such name
+would be `Indeterminate` before a single DS was asked for, and `Indeterminate`
+is SERVFAIL with EDE 22. The client-facing paths that reach the walk with the
+question's own name rather than a signer's are `validate_denial` - every
+NXDOMAIN and NODATA, which is most of IPv6 reverse space - and
+`validate_rrset`'s fallback owner walk, so with validation on a resolver would
+answer essentially no IPv6 reverse lookup. IPv4 reverse names are six labels
+and never reach the bound, which is why such a mistake would hide.
 
-What actually bounds the work is elsewhere and was all along:
-`MAX_LOOKUPS_PER_QUERY` for the round trips, `MAX_NSEC3_ROUNDS_PER_QUERY` for
-the hashing, `MAX_VERIFICATIONS_PER_QUERY` for the signature checks, and the
-wire format itself for the label count - a name is 255 octets and a label costs
-two, so nothing can carry more than 127. The bound here is back on what it says
-it bounds.
+What actually bounds the work is elsewhere: `MAX_LOOKUPS_PER_QUERY` for the
+round trips, `MAX_NSEC3_ROUNDS_PER_QUERY` for the hashing,
+`MAX_VERIFICATIONS_PER_QUERY` for the signature checks, and the wire format
+itself for the label count - a name is 255 octets and a label costs two, so
+nothing can carry more than 127.
 */
 
 // The reverse name of 2001:4860:4860::8888, from the issue: thirty-two nibble
@@ -36,9 +35,9 @@ it bounds.
 @(private = "file")
 IP6_PTR :: "8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa."
 
-// An upstream that answers nothing and counts what it was asked. Nothing is
-// asked of it before the fix, which is the whole of the bug: the walk decided
-// against the name rather than against anything the chain said.
+// An upstream that answers nothing and counts what it was asked. A walk that
+// refused the name on its label count would ask it nothing, deciding against
+// the name rather than against anything the chain said.
 @(private = "file")
 Counting_Upstream :: struct {
 	calls: int,
@@ -70,8 +69,8 @@ The walk asks about an IPv6 reverse name rather than refusing it for its length.
 With the root primed and secure, a walk that gets as far as its first DS lookup
 has accepted the name; one that comes back having asked nobody anything has
 refused it on the label count alone. The upstream here answers nothing, so the
-verdict is `Indeterminate` either way - what separates the bug from the fix is
-whether a question was asked at all.
+verdict is `Indeterminate` either way - what separates the two is whether a
+question was asked at all.
 */
 @(test)
 test_an_ipv6_reverse_name_reaches_the_chain :: proc(t: ^testing.T) {
@@ -109,7 +108,7 @@ establishes the deepest zone rather than falling back to the root.
 `arpa.`, `ip6.arpa.` and the /32 the address sits in are secure in the cache,
 and the label below that zone's apex is a name the upstream will not answer
 about - so the walk has to have descended fourteen labels to be sitting on the
-right zone when it stops. Before the fix it never left `.`.
+right zone when it stops. A walk bounded on labels would never leave `.`.
 */
 @(test)
 test_an_ipv6_reverse_walk_settles_on_the_deepest_cached_zone :: proc(t: ^testing.T) {
@@ -200,10 +199,9 @@ and walked to the end.
 A name is 255 octets and a label costs two of them - a length byte and a
 character - so 127 labels is the most anything can reach the walk with, whatever
 a client asks and whatever an upstream puts in an owner or a signer. That is
-what stands in for the label bound this walk used to keep, and it is worth
-pinning: it is the number the loop below is really bounded by now, and a name
-built to be long is exactly what an attacker would send at a walk that lost its
-own limit.
+what bounds the walk's label loop, and it is worth pinning: a name built to be
+long is exactly what an attacker would send at a walk with no label bound of
+its own.
 
 Every label is remembered as a non-cut, so the walk costs no lookup and the test
 measures the walk rather than an allowance running out in front of it.

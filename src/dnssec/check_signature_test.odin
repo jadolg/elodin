@@ -404,13 +404,13 @@ cs_colliding :: proc(decoys: int) -> []Dnskey {
 test_check_signature_bounds_the_keys_one_signature_is_tried_against :: proc(t: ^testing.T) {
 	/*
 	`MAX_VERIFICATIONS_PER_QUERY` counts calls into here, and that bounds the
-	crypto only if a call means a verification. It did not: a key tag is a
-	16-bit checksum over the RDATA rather than an identity, so a signature
-	naming one may name several keys, and the loop has to try each of them
-	because any could be the one that made it. Every further key sharing the tag
-	was another full verification charged to nobody, so the query's allowance
-	was bounding `MAX_KEYS_PER_ZONE` times what it counted - sixty-four
-	signature checks buying four thousand.
+	crypto only if a call means a verification. A key tag is a 16-bit checksum
+	over the RDATA rather than an identity, so a signature naming one may name
+	several keys, and the loop has to try each of them because any could be the
+	one that made it. Uncounted, every further key sharing the tag would be
+	another full verification charged to nobody, so the query's allowance would
+	bound `MAX_KEYS_PER_ZONE` times what it counted - sixty-four signature
+	checks buying four thousand.
 
 	The multiplier is the zone's to choose and needs no cleverness: nothing
 	requires a DNSKEY RRset's records to be distinct, so sixty-four copies of

@@ -85,10 +85,8 @@ Parity_Stats :: struct {
 	Queries sent over each transport.
 
 	Reported because a run that believed it was covering four and covered one
-	is a run whose result means less than it says, and that is not a
-	hypothetical: the generator's transport list was once allocated in the
-	arena the loop resets per query, so every query after the first went out
-	over UDP while the summary said nothing was wrong. A count nobody reads is
+	is a run whose result means less than it says: counted, a run covering
+	fewer transports than it believes is visible. A count nobody reads is
 	still a count somebody can check.
 	*/
 	transports: [Parity_Transport]int,
@@ -265,8 +263,8 @@ PARITY_LIVE_POOL := []string {
 	The second is here because of issue #352, which this run walks straight into
 	and which nothing else in this pool could: reverse space is a nibble per
 	label under `ip6.arpa.`, so the name is thirty-four labels where every other
-	name here is two or three, and the chain walk used to refuse it for that
-	alone. This run has validation on, so a question about it that comes back
+	name here is two or three, which the chain walk has to accept (#352).
+	This run has validation on, so a question about it that comes back
 	SERVFAIL while the upstream answers is a divergence rather than something to
 	be reasoned about afterwards.
 

@@ -40,9 +40,10 @@ Stats :: struct {
 	failed:       u64,
 	rewritten:    u64,
 	/*
-	Queries refused before any work was done: the backlog was full, or the
-	source was one no answer could reach - see `plausible_source`. Queries the
-	rate limiter withheld are counted by the limiter itself.
+	Queries refused before any work was done: `server.max_pending` was reached
+	or the query could not be started, or the source was one no answer could
+	reach - see `plausible_source`. Queries the rate limiter withheld are counted
+	by the limiter itself.
 	*/
 	dropped:      u64,
 	/*
@@ -81,14 +82,14 @@ Stats :: struct {
 	*/
 	conn_refused: u64,
 	/*
-	Connections turned away because the OS would not start a thread for one.
+	Connections turned away because the OS would not map a fiber stack for one.
 
 	Counted apart from `conn_refused` because it happens *below* every limit
-	here - `RLIMIT_NPROC`, a cgroup `pids.max`, or memory - and the two point an
-	operator in opposite directions. Folded together, a host that ran out of
-	threads at a tenth of `max_connections` would read as a server that had
-	filled it, and the obvious response would be to raise a number that was never
-	the bound.
+	here - `RLIMIT_AS`, a cgroup `memory.max`, or `vm.max_map_count` - and the
+	two point an operator in opposite directions. Folded together, a host that
+	ran out of memory at a tenth of `max_connections` would read as a server that
+	had filled it, and the obvious response would be to raise a number that was
+	never the bound.
 	*/
 	conn_failed:  u64,
 	/*
@@ -216,7 +217,7 @@ Server :: struct {
 	// where a list comes from rather than its position, so a reload that adds,
 	// removes or moves lists leaves it as it is and never touches it beside a
 	// running rebuild. Nil before the first load. The caller that built this
-	// `Server` frees it. See `reload_filters`.
+	// `Server` frees it. See `reload_filters_from`.
 	lists_loaded: map[u64]bool,
 	/*
 	What signs the Apple configuration profile, or nil when the DoH listener or
@@ -647,11 +648,11 @@ since an answer `resolve_query` reports success for is one it decoded or built.
 That ordering is the point rather than a tidying-up. `encode_message` keeps room
 behind a cut for the OPT record of the message it is handed, which on a forwarded
 or a cached answer is the upstream's, options and all - so an answer fitted while
-it still carried them was packed against a ceiling lower than the one it went out
-under by exactly the length of the options stripped afterwards, and nothing put
-back the records that had been dropped for the difference. A client was sent to
-TCP for records that had fitted its datagram, or lost an additional address with
-no TC bit to say it had ever been there. So the forwarded and the cached path hand
+it still carried them would be packed against a ceiling lower than the one it goes
+out under by exactly the length of the options stripped afterwards, and nothing
+would put back the records dropped for the difference: a client sent to TCP for
+records that fit its datagram, or an additional address lost with no TC bit to
+say it was ever there. So the forwarded and the cached path hand
 their answers over unfitted, at whatever size the upstream or the entry made them,
 and `normalise_client_opt` strips without refitting. Issue #281.
 
@@ -672,10 +673,10 @@ Which direction overflows decides what is given up for it:
     fit behind it, and reports a truncation - so the client would be handed a
     complete answer with TC set and *still* no OPT record, and would ask again
     over TCP for bytes it already had. Measured on a 504-byte cached answer
-    with a client advertising 512: TC where before there was none, and the same
-    absent OPT record either way. So the answer goes as it stands - which is
-    the outcome an upstream that drops EDNS produces anyway, and the one the
-    client got before any of this ran.
+    with a client advertising 512: minting gives TC where there is none
+    without it, and the same absent OPT record either way. So the answer goes
+    as it stands - which is the outcome an upstream that drops EDNS produces
+    anyway.
   - an answer already over the limit before the mint keeps the minted record
     instead. It is being cut and marked whatever happens, and that record is what
     carries the payload size to ask again with, so it goes in and the cut is made
@@ -792,9 +793,9 @@ this server is the responder for the answer it sends:
 
   - VERSION is stated as 0, the one version implemented here. It is also the one
     `handle_query` refuses a *query* in any other value of, with BADVERS, a
-    screen earlier - so passing an upstream's version on was this server holding
-    requestors to a rule it did not hold itself to, and answering a client in a
-    version it may not implement.
+    screen earlier - so passing an upstream's version on would be this server
+    holding requestors to a rule it does not hold itself to, and answering a
+    client in a version it may not implement.
   - DO is taken from the query. RFC 3225 section 3: "The DO bit of the query
     MUST be copied in the response." What arrives in a forwarded answer is the
     upstream's copy of the bit *this server* sent it, which on a validating
@@ -1033,9 +1034,9 @@ and every option in front of that stump reads as absent to anything asking the
 decoded message - `find_edns_option` included.
 
 Asked of the message rather than of one option, because the answer is the same
-for every option in it and asking per option is what went wrong before: the
-client's subnet had a gate of its own and the client's cookie, which is a secret
-and the more expensive of the two to hand to a stranger, had none.
+for every option in it: a gate per option leaves out whichever option has none,
+and the client's cookie - a secret, and more expensive to hand to a stranger than
+its subnet - is as much at stake as the subnet is.
 
 Only the additional section is counted for the pair above, because that is the
 only section `find_opt` and `find_opt_span` look in. A record of type OPT in the
@@ -1044,11 +1045,10 @@ put one there for the asking.
 
 Which is the third shape, and the same defect once more: a record this server
 does not read is one the client may mean as its EDNS, to a reader taking the
-first OPT it meets whatever section that is in, which is what this server's own
-`peek_udp_size` did until #325. A query has no answer or authority section
-to begin with, so nothing legitimate is being turned away: the records that do
-belong in one, a prerequisite in an UPDATE or the SOA of an IXFR, are not OPT
-records and are not counted here.
+first OPT it meets whatever section that is in (#325). A query has no answer
+or authority section to begin with, so nothing legitimate is being turned
+away: the records that do belong in one, a prerequisite in an UPDATE or the SOA
+of an IXFR, are not OPT records and are not counted here.
 
 The fourth is an OPT record owned by a name other than the root. RFC 6891
 section 6.1.2 says NAME MUST be 0, and Unbound (`parse_edns_from_query_pkt`) and
@@ -1465,8 +1465,8 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 
 	Ahead of the cache, and of the RD gate below. Ahead of the cache because
 	there is nothing there to find: these answers are never stored, and one a
-	previous configuration forwarded and stored cannot outlive the restart it
-	takes to change the setting. The order is what keeps that true rather than
+	previous configuration forwarded and stored is never reached once a reload
+	changes the setting. The order is what keeps that true rather than
 	something to re-check if either of those facts ever stops holding. Ahead of
 	the RD gate because RD=0 asks for what this server already knows without
 	recursion, and this is precisely that: an answer from a table, with nowhere
@@ -1723,9 +1723,9 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	client's to spend: `upstream.resolve` gives up only once it has waited two
 	timeouts, which with the defaults is ten seconds against blackholed
 	upstreams, while a glibc stub gives up at five (`RES_TIMEOUT`) and
-	systemd-resolved sooner. So the answer the whole
-	setting exists to produce arrived after the client had already failed, and
-	`serve_stale` bought nothing in the one outage it was turned on for - an
+	systemd-resolved sooner. Waited out in line, the answer the whole setting
+	exists to produce would arrive after the client has already failed, and
+	`serve_stale` would buy nothing in the one outage it is turned on for - an
 	upstream that is unreachable rather than answering (issue #164).
 
 	RFC 8767 section 5 asks for the other shape, and this is it: the refresh
@@ -1743,10 +1743,10 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 
 	Nothing changes where the cache is not holding anything for this name, where
 	`cache.stale_timeout` is zero - the escape hatch, which turns serving stale
-	off - or where there is no pool to run the refresh
-	on, which is a `Server` built as a literal. The fall-through is the ordinary
-	forwarding path, expired entry in hand, exactly as it was: the client waits
-	the upstream out and is served that entry only once that has failed.
+	off - or where there is no loop to run the refresh on, which is a `Server`
+	built as a literal (`can_detach`). The fall-through is the ordinary
+	forwarding path, expired entry in hand: the client waits the upstream out
+	and is served that entry only once that has failed.
 
 	Those three are the only ways out of this block. Every other reason
 	`start_refresh` declines - a refresh for this key already running, the
@@ -2037,8 +2037,8 @@ exchange_upstream :: proc(st: ^Query_State) {
 
 	Both read once. `apex_ds_off_route` and `zone_route_group` each walk the whole
 	route table, the skip below and the fallback under it both want the pair, and
-	the answers cannot change between them - the table is built at startup and
-	never reloaded, which is the same fact the cache key rests on.
+	the answers cannot change between them - the request is pinned to one
+	generation, and the route table is that generation's.
 
 	`own` is only asked for when the carve-out fired: for every other question
 	`route_group` has already returned the zone's own group, so the two are the
@@ -2125,13 +2125,13 @@ exchange_upstream :: proc(st: ^Query_State) {
 		say anything, so a member that hands back SERVFAIL or REFUSED has not
 		answered and the group's other members are asked before the route is.
 
-		`resolve` alone left a group whose members disagree about the zone - one
-		publishing the proof beside a CPE resolver that mangles every `DS` it
-		meets - answering from whichever one it happened to reach: the parent's
-		proof on one query and the route's own unsigned NODATA on the next, which
-		is the cache flap `routes.odin` describes. The proof returns from the
-		first exchange and none of the sweep runs, so `home.arpa.`'s NODATA
-		costs exactly what it did.
+		`resolve` alone would leave a group whose members disagree about the
+		zone - one publishing the proof beside a CPE resolver that mangles every
+		`DS` it meets - answering from whichever one it happens to reach: the
+		parent's proof on one query and the route's own unsigned NODATA on the
+		next, which is the cache flap `routes.odin` describes. The proof returns
+		from the first exchange and none of the sweep runs, so `home.arpa.`'s
+		NODATA costs no more than one exchange.
 
 		The route's own exchange below stays on `resolve_readable`, as the
 		ordinary path does: whatever it says is the client's answer, rcode and
@@ -2207,8 +2207,8 @@ exchange_upstream :: proc(st: ^Query_State) {
 			/*
 			Two lines rather than one with both fields, because there is no
 			rcode to name when nothing arrived: printing the zero value beside
-			the error read as the parent having answered NOERROR, which is the
-			one thing this branch has established it did not.
+			the error would read as the parent having answered NOERROR, which is
+			the one thing this branch has established it did not.
 			*/
 			if st.uerr == .None {
 				logx.debugf(
@@ -2322,8 +2322,9 @@ exchange_upstream :: proc(st: ^Query_State) {
 	spends all of it on its two rounds, and the parent is not reached: that is
 	two queries, since each charges the route twice, after which the route is
 	parked, the memory is passed over by the `group_reachable(own)` above, and
-	the parent is asked first with the whole deadline. Before, those two queries
-	were answered - at four timeouts, twenty seconds, long after the stub left.
+	the parent is asked first with the whole deadline. Those two queries go
+	unanswered rather than answered at four timeouts, twenty seconds, long after
+	the stub has left.
 	*/
 	if memoised_parent != nil {
 		route_proved, _ := parent_answers_apex_ds(st.resp, st.q.name, st.uerr == .None, st.spent, live(st.s).cfg.dnssec.max_nsec3_iterations, st.allocator)
@@ -2377,8 +2378,8 @@ judge_reply :: proc(st: ^Query_State) -> bool {
 	answers `www.corp. CNAME host.lab.corp.` beside `lab.corp. NS`: that is all
 	it holds, and a client that follows the CNAME asks `host.lab.corp.` of the
 	second, which answers. Whether a group other than the one that referred
-	can answer the target is not known here, so the reply goes out as it did
-	before issue #451; where the target comes back to that same group - one
+	can answer the target is not known here, so the reply is handed on as the
+	upstream sent it (issue #451); where the target comes back to that same group - one
 	lame member of the default group, the shape the issue is about - the
 	group has already said it cannot, and the refusal stands.
 	*/
@@ -2575,7 +2576,7 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 			`bogus`: its own shedding, and a reading it refused for its memory or
 			the request's decode budget (`counts_as_bogus`).
 
-			The counter's two readings have always been folded together here -
+			The counter's two readings are folded together here -
 			see the note in `validate_rrset` - on the argument that the ones
 			folded in are upstream failures, which nobody chooses. Shedding is
 			chosen: a flood decides how often it happens, so leaving it in would
@@ -2664,22 +2665,20 @@ finish_answer :: proc(st: ^Query_State) {
 	wire afterwards would leave the two disagreeing about the same answer, with
 	the entry outliving what its own bytes tell a client.
 
-	Before the rebinding refusal, not after it. The argument
-	for running after is that an answer the refusal turns back is replaced
-	wholesale, so bounding its TTLs first is work done on bytes nobody is handed.
-	That is true and it is worth a walk of the answers this server refuses; what
-	it cost was a whole decode of the answers it does not. The refusal reads the
-	same message the cache reads, the cache's reading has to be of the bytes as
-	they now stand - the paragraph above - and so the one decode that serves both
-	can only sit below this. `rebind.odin` reads addresses and not TTLs, so
-	nothing either of them decides changes by the swap.
+	Before the rebinding refusal, not after it. Running after would spare a walk
+	of the answers the refusal turns back, which are replaced wholesale, and cost
+	a second whole decode of the answers it does not. The refusal reads the same
+	message the cache reads, the cache's reading has to be of the bytes as they
+	now stand - the paragraph above - and so the one decode that serves both can
+	only sit below this. `rebind.odin` reads addresses and not TTLs, so nothing
+	either of them decides depends on the order.
 
 	Best-effort, and it does not refuse. `dns.cap_ttls` bounds every record it
 	can read and stops at the first it cannot, which for the malformed messages
 	that actually arrive means the answer section is bounded and the junk that
 	follows it is not. Refusing the whole message instead - SERVFAIL, the way
-	`fit_response` fails on the size ceiling - turned junk in an authority or
-	additional section into a dead name whose answer section was perfectly good,
+	`fit_response` fails on the size ceiling - would turn junk in an authority or
+	additional section into a dead name whose answer section is perfectly good,
 	which is the fail-closed-on-the-wrong-evidence the chain walk below spells
 	out at length and settles the same way.
 
@@ -2703,11 +2702,10 @@ finish_answer :: proc(st: ^Query_State) {
 	Decoded once for the three things below that read it: the rebinding check
 	looks through the answer section for private addresses, the chain walk reads
 	that same section, and the cache reads the whole message. Decoding for each
-	of them separately meant two or three full passes over every forwarded
+	of them separately would be two or three full passes over every forwarded
 	response, which is the one part of this that every query pays for.
 
-	Skipped when none of them will run, which is the only arrangement that was
-	not already paying for a decode here.
+	Skipped when none of them will run.
 
 	The answer-section fallback is attempted only for the two readers that can
 	use one. With the cache the only reader, a message that would not decode in
@@ -2762,17 +2760,17 @@ finish_answer :: proc(st: ^Query_State) {
 	What the walk needs is the answer section, and only that.
 
 	Which is why the decode above keeps a reading that stops there. Holding the
-	walk to the whole-message standard the cache needs turned one malformed
+	walk to the whole-message standard the cache needs would turn one malformed
 	record in an authority or additional section - sections the walk never looks
-	at - into SERVFAIL for a name whose answer section was clean, and only once
-	blocking was on. That is not the check failing closed, it is the check
-	refusing an answer it had no opinion about.
+	at - into SERVFAIL for a name whose answer section is clean, and only while
+	blocking is on. That would not be the check failing closed, it would be the
+	check refusing an answer it has no opinion about.
 
 	`walking` is asked again on the fallback because the reading is also made for
 	the rebinding check above, which has a rule of its own about when a half-read
 	message is enough. Taking it unguarded here would hand the walk a fallback it
 	never asked for, and with blocking off would put `block_cloaked_answer` on a
-	path it does not run on today.
+	path it does not run on.
 	*/
 	walkable := decoded.full || (walking && decoded.partial)
 	walk_answer: []dns.Record
@@ -2783,10 +2781,10 @@ finish_answer :: proc(st: ^Query_State) {
 	/*
 	An answer the walk was going to look at and cannot read is refused.
 
-	This read the other way round - hand it to the client, it is the upstream's
-	answer and not ours to withhold over our own reading of it - which is a fair
-	argument about an answer nobody was going to inspect, and the wrong one about
-	an answer that was about to be checked. An answer section that does not
+	The other reading - hand it to the client, it is the upstream's answer and
+	not ours to withhold over our own reading of it - is a fair argument about an
+	answer nobody was going to inspect, and the wrong one about an answer that is
+	about to be checked. An answer section that does not
 	decode is not walked, and serving what could not be walked is the same
 	fail-open the `Unwalkable` verdict exists to refuse, reachable by writing one
 	CNAME with a bad compression pointer or an RDLENGTH that runs off the end.
@@ -2804,8 +2802,8 @@ finish_answer :: proc(st: ^Query_State) {
 
 	Gated on the walk actually being due. With blocking off there is nothing this
 	would have checked, and refusing then would be this server withholding an
-	answer over a parse it had no use for - which is what the old comment was
-	right about.
+	answer over a parse it had no use for, which is where the other reading
+	above holds.
 
 	The cost is an upstream whose *answer sections* this decoder rejects becoming
 	unresolvable rather than merely unfiltered, for the names it does that on.
@@ -2816,7 +2814,7 @@ finish_answer :: proc(st: ^Query_State) {
 	*/
 	if walking && !walkable && filter.engine_match(st.s.filters, st.q.name, st.q.type) != .Allowed {
 		/*
-		No stale fallback, deliberately, and it had one for a round.
+		No stale fallback, deliberately.
 
 		The rule for that is set out where the upstream fails, above: expired
 		data covers an outage, and only a failure to get an answer at all counts
@@ -2838,16 +2836,16 @@ finish_answer :: proc(st: ^Query_State) {
 	/*
 	The answer is stored anyway, with the refusal stamped on it.
 
-	Leaving it out was the first shape of this, on the reasoning that an answer
-	this server will not hand out is not one to keep a copy of. What that missed
-	is which case it applies to: a cloaked name that is *not* already cached -
-	the ordinary one, and the one an attacker arranges - then costs an upstream
-	round trip on every single query, forever, because nothing about the refusal
-	is remembered. A name blocked on the question costs none at all. So the
-	cheapest name to serve became one of the most expensive, and the memoisation
-	built for the hit path stopped short of the case that needed it most.
+	Leaving it out would rest on the reasoning that an answer this server will
+	not hand out is not one to keep a copy of. What that misses is which case it
+	applies to: a cloaked name that is *not* already cached - the ordinary one,
+	and the one an attacker arranges - would then cost an upstream round trip on
+	every single query, forever, because nothing about the refusal would be
+	remembered. A name blocked on the question costs none at all. So the cheapest
+	name to serve would become one of the most expensive, and the memoisation
+	built for the hit path would stop short of the case that needs it most.
 
-	Storing it does not put the hole back: the entry carries the verdict, so the
+	Storing it does not open a hole: the entry carries the verdict, so the
 	hit path serves the refusal from it rather than the bytes, and it is walked
 	again as soon as a reload moves the generation past its stamp. The bytes are
 	kept only so that later walk has something to walk.
@@ -2861,10 +2859,10 @@ finish_answer :: proc(st: ^Query_State) {
 	Settled here, above everything that might store these bytes, rather than
 	beside one of the stores.
 
-	`validating` is recomputed for every request and can be turned off after the
-	key is built - the upstream query failing to rebuild does exactly that - so
-	nothing otherwise ties the AD bit an entry carries to whether that entry was
-	ever validated. A later request that does validate reads the stored bit as a
+	`validating` is decided for every request, from the request - its CD bit,
+	its class, the zone it asks about - and not from the entry, so nothing
+	otherwise ties the AD bit an entry carries to whether that entry was ever
+	validated. A later request that does validate reads the stored bit as a
 	verdict of ours and hands the upstream's claim to a client under our name.
 
 	Next to the ordinary store it would not cover the second store, below it, for
@@ -2909,9 +2907,8 @@ finish_answer :: proc(st: ^Query_State) {
 			is replayed on every hit until it expires, against bytes that say
 			something else.
 
-			So it is not cached at all in that case. The next query for the name
-			asks the upstream again, which is what happened before any of this
-			was memoised.
+			So it is not cached at all in that case, and the next query for the
+			name asks the upstream again.
 			*/
 			/*
 			`Unreadable` is not stored. The other two verdicts are stable
@@ -2991,12 +2988,11 @@ finish_answer :: proc(st: ^Query_State) {
 	RRset, said something about the public tree that holds until the public tree
 	changes, so the route's answer for those zones is the answer and is kept like
 	any other - `parent_answers_apex_ds` is where the two are told apart. The
-	proof itself is the parent's own answer and is stored as it always was.
+	proof itself is the parent's own answer and is stored like any other.
 
 	The same rule as the `Unreadable` verdict above and as `cache.put`'s own
-	refusal of transient failures: the next query asks again, which is what
-	happened before any of this was memoised, and the one that reaches a parent
-	willing to speak stores what it said.
+	refusal of transient failures: the next query asks again, and the one that
+	reaches a parent willing to speak stores what it said.
 	*/
 	if live(st.s).cfg.cache.enabled && decoded.full && !st.unproven_apex_ds {
 		// `supersedes`: an answer that cannot be kept still replaces the
@@ -3396,7 +3392,7 @@ stands it reads as NOERROR over an empty answer section, which is a NODATA, so a
 client asking for a TLSA record or an MTA-STS TXT is told the name has no such
 record rather than that its resolver could not find out. That is #271's harm - a
 downgrade out of one rewritten byte - reached without touching DNSSEC. `validate`
-refuses the same shape now, but with `dnssec.enabled: false` it is not running
+refuses the same shape too, but with `dnssec.enabled: false` it is not running
 and nothing else catches it.
 
 The group has already been asked by the time this reads the reply:
@@ -3581,10 +3577,10 @@ upstream_refusal :: proc(
 /*
 A hit as `resolve_query` found it.
 
-Carried as one value because these seven travel together from `cache.get` to
+Carried as one value because these fields travel together from `cache.get` to
 whichever of the three places ends up serving them, and because what has to be
 done with them - re-match the chain, then put the stamp back on the entry the
-bytes came out of - needs all seven at once.
+bytes came out of - needs all of them at once.
 */
 @(private)
 Cached_Answer :: struct {
@@ -3621,10 +3617,10 @@ Cached_Answer :: struct {
 /*
 Write down that this question's answer did not validate.
 
-Nothing on this path was kept before, and a verdict is the one answer nobody
-ever stops asking for: a zone with a broken signature refuses every query for
-it, and each refusal was a round trip to an upstream that was only ever going to
-hand back the same unusable answer. Whoever is asking decides how many of those
+A verdict is the one answer nobody ever stops asking for: a zone with a broken
+signature refuses every query for it, and without this store each refusal is a
+round trip to an upstream that is only ever going to hand back the same unusable
+answer. Whoever is asking decides how many of those
 there are, which makes a name somebody controls and deliberately breaks the
 cheapest way there is to spend this server's upstream budget - and RFC 4035
 section 4.7 allows precisely this store to close it. The lifetime is
@@ -3633,7 +3629,7 @@ minute.
 
 What is kept is the refusal and never the answer that failed, so there is
 nothing in the cache for a later change of mind, a reload or a bug to serve as
-data. Four things are not kept at all:
+data. Three things are not kept at all:
 
 `Indeterminate`. The branch above handles it beside `Bogus` because both are
 SERVFAIL to the client, but they are opposite statements: `Bogus` is an answer
@@ -3648,7 +3644,8 @@ transient this procedure declines to memoise at the `Unreadable` verdict and at
 `unproven_apex_ds`, and it is why the budget case is dangerous rather than
 merely wasteful: heavy load would convert itself into refusals.
 
-A routed apex `DS` nothing proved, on the terms the two stores below give: an
+A routed apex `DS` nothing proved, on the terms the two stores in
+`finish_answer` give: an
 answer that stood in for a statement the parent never made is not one to hand to
 the next client with the parent still unasked.
 
@@ -3835,23 +3832,22 @@ serve_from_cache :: proc(
 	the steady state, against the copy and the handful of TTL writes that serving
 	a hit is meant to be.
 
-	Clearing the cache in `reload_filters` instead is one line and was not taken:
-	it throws away every unrelated entry on every refresh interval, and buys a
-	burst of upstream traffic each time to re-learn answers nothing was wrong
-	with.
+	Clearing the cache on every rule rebuild instead would throw away every
+	unrelated entry on every refresh interval, and buy a burst of upstream
+	traffic each time to re-learn answers nothing was wrong with.
 
 	An entry that is refused stays where it is, and its refusal is stamped on it
 	along with the number. Nothing here can tell whether the next reload will put
 	it back in service, and dropping it would cost an upstream query per client
 	query until something did.
 
-	Keeping it and *not* recording the verdict was the first shape of this, and
-	it was wrong in a way worth naming: an entry cannot be stamped as merely
-	checked, because a stamp says "serve it", so the refusal had to be re-derived
-	from the bytes on every hit - a decode and a walk, on the hot path, at
-	whatever rate a client cares to ask, for as long as the entry lived. That is
-	the per-hit decode the stamp exists to avoid, reintroduced for exactly the
-	names an attacker is interested in. With the verdict recorded, a refused
+	Keeping it and *not* recording the verdict would be wrong in a way worth
+	naming: an entry cannot be stamped as merely checked, because a stamp says
+	"serve it", so the refusal would have to be re-derived from the bytes on
+	every hit - a decode and a walk, on the hot path, at whatever rate a client
+	cares to ask, for as long as the entry lives. That is the per-hit decode the
+	stamp exists to avoid, spent on exactly the names an attacker is interested
+	in. With the verdict recorded, a refused
 	entry costs one walk per reload like any other.
 	*/
 	if !hit.recheck && (hit.wire == nil || cloak_refusal_stands(st.s)) {
@@ -4006,12 +4002,11 @@ response_limit :: proc(s: ^Server, msg: dns.Message, proto: Protocol) -> int {
 /*
 Shrink an already-encoded response to fit `limit`.
 
-Forwarded answers are normally sized correctly because the client's own EDNS0
-options are passed through to the upstream. A cached answer, though, may have
-been stored for a client that advertised a larger buffer, and `limit` on UDP is
-`server.max_udp_response` where that is the smaller of the two - a number no
-upstream was ever told about. Both are re-encoded here with the truncation rules
-and the TC bit set.
+Forwarded and cached answers arrive at whatever size the upstream or the entry
+made them, and are fitted here once the OPT record is settled. `limit` on UDP is
+the smaller of the client's buffer and `server.max_udp_response` - a number no
+upstream was ever told about. An answer over it is re-encoded here with the
+truncation rules and the TC bit set.
 
 Whatever comes back is no larger than `limit`, on every path including the ones
 that fail. That is what the callers rely on: this is the last thing between an
@@ -4047,22 +4042,21 @@ fit_response :: proc(
 	Nothing could be re-encoded, and what is in hand is over the limit.
 
 	Sending it as it stands is the tempting answer - the bytes are a valid
-	message, just a larger one than was asked for - and it is what this did when
-	either step failed. On UDP that is the one outcome the limit exists to
-	prevent: `limit` there is `server.max_udp_response`, which is an
+	message, just a larger one than was asked for. On UDP that is the one outcome
+	the limit exists to prevent: `limit` there is `server.max_udp_response`, which is an
 	amplification factor, and an answer that reaches it by failing to re-encode
 	is exactly as large as one that was allowed to. The ceiling has to hold on
 	the paths that go wrong or it is not a ceiling.
 
 	The re-encode is not reachable from a well-formed answer - a message that
-	decoded re-encodes - and the decode was not either until names got a budget.
-	Now a reply that spends `dns.NAME_BUDGET` arrives here well formed: nothing
-	upstream of this refused it, because with blocking off and the cache on it is
-	forwarded without the answer section ever being read on its own. It used to
-	be truncated properly and is now answered TC with an empty answer section,
-	which is the same answer one byte too large would get and costs the client a
-	round trip rather than an answer. That is the trade a budget is: the reply
-	has to be read to be cut down, and reading it is what was refused.
+	decoded re-encodes - but the decode is, because names have a budget. A reply
+	that spends `dns.NAME_BUDGET` arrives here well formed: nothing upstream of
+	this refused it, because with blocking off and the cache on it is forwarded
+	without the answer section ever being read on its own. It is answered TC with
+	an empty answer section, which is the same answer one byte too large would
+	get and costs the client a round trip rather than an answer. That is the
+	trade a budget is: the reply has to be read to be cut down, and reading it is
+	what was refused.
 
 	`dns.REQUEST_DECODE_BUDGET` arrives here by the same road and gets the same
 	answer: a request that has already taken what it may cannot read this reply
@@ -4843,8 +4837,8 @@ One line per query, once `log.queries` is on.
 name of the upstream that answered, on `outcome=forwarded`; a bare token naming
 the guard that decided, on everything else - `list`, `rewrite`, `cache`,
 `upstream`; or `reason:upstream` where a named server supplied an answer this
-server then refused, which today is `dnssec:<name>` alone. The reason stays in
-front so that grepping the token still finds every one of them.
+server then refused - `dnssec:`, `rcode:` and `opt:`. The reason stays in front
+so that grepping the token still finds every one of them.
 */
 @(private)
 log_query :: proc(

@@ -143,8 +143,8 @@ exactly that rather than doubling past it.
 reader_fill :: proc(r: ^Buf_Reader, unread := 0) -> Error {
 	/*
 	A timeout per read bounds a silent peer and nothing else: a peer sending a
-	line just inside it, again and again, held the exchange for as long as the
-	field limit and the body limit let it (#445). So each read waits for what
+	line just inside it, again and again, would hold the exchange for as long as
+	the field limit and the body limit let it (#445). So each read waits for what
 	is left of the deadline at most.
 	*/
 	if wait, bounded := next_wait(r.deadline, r.idle); bounded {
@@ -249,8 +249,8 @@ reader_line :: proc(r: ^Buf_Reader) -> (line: string, err: Error) {
 			/*
 			A bare CR or LF, or a NUL, is refused (RFC 9112 2.2, RFC 9110 5.5),
 			as the server's `http_line` does (#432). Kept, `Connection:
-			keep-alive\nConnection: close` was one field with no `close` in it
-			where a peer taking the LF for a line end sent two (#437).
+			keep-alive\nConnection: close` would be one field with no `close` in
+			it where a peer taking the LF for a line end sent two (#437).
 			*/
 			for i in 0 ..< len(line) {
 				if line[i] == '\r' || line[i] == '\n' || line[i] == 0 {
@@ -343,10 +343,10 @@ reader_to_end :: proc(r: ^Buf_Reader, limit: int) -> (data: []u8, err: Error) {
 			return nil, .Too_Large
 		}
 		/*
-		The close is the end of the body, and nothing else is. Any failed read
-		ended it: a deadline or a read timeout cut it short and the part that
-		had arrived came back as the whole, with no error - for a list, a
-		partial copy written over the good cached one (#445).
+		The close is the end of the body, and nothing else is. Were any failed
+		read to end it, a deadline or a read timeout would cut it short and the
+		part that had arrived would come back as the whole, with no error - for
+		a list, a partial copy written over the good cached one (#445).
 		*/
 		if ferr := reader_fill(r, limit + 1); ferr != .None {
 			if r.closed {
@@ -389,8 +389,8 @@ run of interim responses go on a hundred times as long. Trailers have a budget
 of their own.
 
 `reader_line` bounds a line at 64 KB but says nothing about how many lines
-follow, so a peer sending short fields forever was answered for as long as it
-kept the socket open. A hundred is well past what any list host or DoH resolver
+follow, so without this a peer sending short fields forever would be read for
+as long as it kept the socket open. A hundred is well past what any list host or DoH resolver
 sends; the largest seen in practice is around twenty.
 */
 MAX_HTTP_HEADERS :: 100
@@ -524,7 +524,8 @@ http_exchange :: proc(
 			/*
 			Names and the `close` option compare without regard to ASCII case and no
 			other: `strings.equal_fold` folds Unicode, where the long s (U+017F) is
-			an `s`, so `Tran\u017ffer-Encoding` framed the body as chunked (#432).
+			an `s`, so `Tran\u017ffer-Encoding` would frame the body as chunked
+			(#432).
 			*/
 			case dns.name_equal_fold(name, "content-length"):
 				// RFC 9112 6.3: more than one of these and the message is invalid,
@@ -547,9 +548,10 @@ http_exchange :: proc(
 				/*
 				`chunked` alone, once, or the response is refused (#437). This
 				client asks for no codings, so any other is one it cannot undo -
-				`chunked, gzip` framed as chunks handed the gzip on as the answer -
-				and RFC 9112 6.1 forbids chunked anywhere but last, or twice. Read
-				as a substring, `xchunked` took chunk framing out of a plain body.
+				`chunked, gzip` framed as chunks would hand the gzip on as the
+				answer - and RFC 9112 6.1 forbids chunked anywhere but last, or
+				twice. Read as a substring, `xchunked` would take chunk framing
+				out of a plain body.
 				*/
 				if chunked || !dns.name_equal_fold(value, "chunked") {
 					return resp, .HTTP_Error
@@ -575,8 +577,9 @@ http_exchange :: proc(
 		}
 		/*
 		A 1xx may not frame a body (RFC 9110 8.6, RFC 9112 6.1). Passed over,
-		one that did had what it framed read as the answer - a 200 of the peer's
-		choosing - with the real one left on the connection for the next query.
+		one that did would have what it framed read as the answer - a 200 of the
+		peer's choosing - with the real one left on the connection for the next
+		query.
 		*/
 		if chunked || content_length >= 0 {
 			return resp, .HTTP_Error
@@ -603,7 +606,8 @@ http_exchange :: proc(
 	switch {
 	case resp.status == 204 || resp.status == 304:
 		// No body, whatever the fields say (RFC 9112 6.3): read by them, a 204
-		// on a kept-alive connection waited for a close that never came (#442).
+		// on a kept-alive connection would wait for a close that never comes
+		// (#442).
 		// A 204 may not frame a body (RFC 9110 8.6, 6.1); one that does may have
 		// sent it, and the next response would be read from inside it. A 304's
 		// framing fields describe its representation, and nothing follows it.
@@ -657,7 +661,8 @@ parse_status :: proc(line: string) -> (status: int, http_1_0: bool, err: Error) 
 	// Three digits or 0, which the range check below refuses.
 	v := h2.parse_status(line[V + 1:V + 4])
 	// RFC 9110 15: a status is 100 to 599. Below that it is not even an interim
-	// response to pass over, which is what `099` was read as (#442).
+	// response to pass over, which is what `099` would otherwise be read as
+	// (#442).
 	if v < 100 || v > 599 {
 		return 0, false, .HTTP_Error
 	}
@@ -668,9 +673,9 @@ parse_status :: proc(line: string) -> (status: int, http_1_0: bool, err: Error) 
 split_header :: proc(line: string) -> (name, value: string, ok: bool) {
 	/*
 	A line starting with whitespace is obs-fold (RFC 9112 5.2), and whitespace
-	before the colon makes no field name (5.1). Skipped, either one hid a field
-	the unfolded or trimmed reading has: `Transfer-Encoding: chunked` then
-	` , gzip` framed a gzip body as chunks (#437). Refused by the caller, as is
+	before the colon makes no field name (5.1). Skipped, either one would hide a
+	field the unfolded or trimmed reading has: `Transfer-Encoding: chunked` then
+	` , gzip` would frame a gzip body as chunks (#437). Refused by the caller, as is
 	a line with no name at all.
 	*/
 	idx := strings.index_byte(line, ':')
@@ -694,7 +699,7 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator, limit: int) -> (b
 		/*
 		`1*HEXDIG`, then optionally BWS and a `;` extension (RFC 9112 7.1.1).
 		The BWS is spaces and tabs and only in front of the `;`: trimmed off
-		both ends regardless, ` 5` and `5 ` were chunk sizes (#437).
+		both ends regardless, ` 5` and `5 ` would be chunk sizes (#437).
 		*/
 		digits := line
 		if idx := strings.index_byte(line, ';'); idx >= 0 {
@@ -702,9 +707,9 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator, limit: int) -> (b
 		}
 		/*
 		Parsed here rather than by `strconv.parse_u64_of_base`, which takes a
-		sign and skips `_` - so `+5` and `0_5` were five - and has no overflow
-		check: a size longer than a u64 wrapped to some unrelated number, zero
-		among them, which would be read as the end of the body. Sixteen
+		sign and skips `_` - so `+5` and `0_5` would be five - and has no
+		overflow check: a size longer than a u64 would wrap to some unrelated
+		number, zero among them, which would be read as the end of the body. Sixteen
 		significant hex digits is exactly what fits.
 		*/
 		for len(digits) > 1 && digits[0] == '0' {
@@ -767,8 +772,8 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator, limit: int) -> (b
 			left -= len(data)
 		}
 		// The data ends in CRLF and nothing else (RFC 9112 7.1). Thrown away,
-		// the line let `helloEXTRA` read as `hello` on a connection kept for
-		// the next response (#437).
+		// the line would let `helloEXTRA` read as `hello` on a connection kept
+		// for the next response (#437).
 		if tail := reader_line(r) or_return; tail != "" {
 			return nil, .HTTP_Error
 		}

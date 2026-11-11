@@ -27,9 +27,8 @@ The third is the defaults, which are the whole argument of the feature: `.local`
 keys turn them off. This is the case that fails loudest if the table ever grows
 past what was argued for it.
 
-The fourth is the counter, since `special_use=` in the stats line and
-`elodin_special_use_total` on the metrics endpoint are what an operator watches
-instead of the query log.
+The fourth is the counter on the metrics endpoint, since it and `special_use=`
+in the stats line are what an operator watches instead of the query log.
 
 The mock synthesises an A answer for whatever it is asked, so any name that
 reaches it comes back 198.51.100.7 - an address the table would never produce.
@@ -184,8 +183,8 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 
 	start_case(r, "special_use: private reverse names are NXDOMAIN with an SOA at the RFC 6303 zone")
 	{
-		// Issue #321's reproduction: a LAN PTR from every client used to reach
-		// the upstream, naming the network's private addressing to it.
+		// Issue #321's reproduction: a LAN PTR never reaches the upstream,
+		// which would name the network's private addressing to it.
 		cases := []struct {
 			name: string,
 			apex: string,
@@ -266,10 +265,11 @@ run_special_use_default_forwarding_cases :: proc(r: ^Runner) {
 /*
 The keys, each turning over the one zone it names and no other.
 
-`local: true` is the departure from the default; `onion: false` is the departure
-in the other direction, for an upstream that really can answer those names. Both
-are checked against a second name that must not move with them, since a key that
-turned the whole table on or off would pass the first half of either case.
+`local: true` and `home_arpa: true` are departures from the default; `onion:
+false` is the departure in the other direction, for an upstream that really can
+answer those names. Each is checked against a second name that must not move
+with it, since a key that turned the whole table on or off would pass the first
+half of any of them.
 */
 @(private = "file")
 run_special_use_key_cases :: proc(r: ^Runner) {
@@ -454,12 +454,11 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 }
 
 /*
-The counter, in both places an operator reads it.
+The counter, as the metrics endpoint reports it.
 
-`special_use=` in the `msg=stats` line and `elodin_special_use_total` on the
-metrics endpoint are the only aggregate evidence the table did anything, so both
-are checked against a known number of queries rather than merely for being
-present.
+`elodin_special_use_total` and `special_use=` in the `msg=stats` line are the
+only aggregate evidence the table did anything, so the metric is checked against
+a known number of queries rather than merely for being present.
 */
 @(private = "file")
 run_special_use_counter_cases :: proc(r: ^Runner) {

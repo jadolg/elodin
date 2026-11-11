@@ -413,15 +413,14 @@ otherwise push ordinary answers past the point where they need a retry over TCP.
 prune_failure_reported: logx.Gate
 
 /*
-And a third, for the verdict this server reached about itself.
+A flag of its own for the verdict this server reached about itself.
 
-Same argument as the one above, one step further in. A shed walk is an
-`Indeterminate`, so it would share that flag - and the two are provoked by
-different things at different rates. A shed is the only one of the three whose
-rate a client chooses: under a flood it is every query, so sharing would have
-the first shed spend the `warn` that a genuinely unreachable parent needed, or
-the reverse. They are also the two an operator would act on differently, which
-is the test for whether a flag is worth splitting.
+A shed walk is an `Indeterminate`, so it could share `indeterminate_reported` -
+and the two are provoked by different things at different rates. A shed is the
+one verdict whose rate a client chooses: under a flood it is every query, so
+sharing would have the first shed spend the `warn` that a genuinely unreachable
+parent needed, or the reverse. They are also the two an operator would act on
+differently, which is the test for whether a flag is worth splitting.
 
 Its line says what no other line here can: which setting was reached, and where
 the count lives. See `report_bogus`.

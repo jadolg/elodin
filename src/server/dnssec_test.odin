@@ -33,15 +33,6 @@ question :: proc() -> []dns.Question {
 }
 
 /*
-An RRSIG's RDATA, far enough along to be read as one.
-
-Only the covered type is ever looked at here - `dnssec.strip_unauthenticated`
-keeps a signature for the RRset it covers, so a record whose first two bytes say
-nothing is a signature over nothing and is dropped. The rest is filler: no
-signature is verified anywhere in this file, which is `src/dnssec`'s work
-against captured chains.
-*/
-/*
 The signer these synthetic signatures name.
 
 Written out rather than left as the root, because the prune keeps a signature
@@ -53,6 +44,15 @@ signature and look like a prune bug.
 @(private = "file")
 TEST_SIGNER :: "example.com."
 
+/*
+An RRSIG's RDATA, far enough along to be read as one.
+
+What is read of it is the covered type, the signer and the validity window -
+`dnssec.strip_unauthenticated` keeps a signature for the RRset it covers, so a
+record whose first two bytes say nothing is a signature over nothing and is
+dropped. The rest is filler: no signature is verified anywhere in this file,
+which is `src/dnssec`'s work against captured chains.
+*/
 @(private = "file")
 rrsig_over :: proc(covered: dns.Type) -> dns.Rdata_Raw {
 	// 18 bytes of fixed fields, the signer name, then a signature.
@@ -119,9 +119,9 @@ signed_response :: proc() -> dns.Message {
 /*
 The verdict a validator would have reached over `signed_response`.
 
-Spelled out rather than reduced to "secure", because that is what a verdict is
-now: `present_response` cuts a secure answer down to the RRsets the validator
-names, so a `Result` that names nothing strips the message to its OPT record.
+Spelled out rather than reduced to "secure", because that is what a verdict is:
+`present_response` cuts a secure answer down to the RRsets the validator names,
+so a `Result` that names nothing strips the message to its OPT record.
 */
 @(private = "file")
 secure_verdict :: proc() -> dnssec.Result {
@@ -658,8 +658,8 @@ whatever the upstream put in that bit is its claim, not ours, and passing it on
 lends it our name. RFC 6840 section 5.8 and RFC 4035 section 3.2.2.
 
 Driven through `handle_query` on the cache path rather than against
-`apply_ad_policy` directly, because the defect was not in that procedure: it
-was in only calling it when we had validated.
+`apply_ad_policy` directly, because the policy has to apply on every served
+path, not only after validation.
 */
 
 @(private = "file")
@@ -754,10 +754,10 @@ A reply to a query we could not parse still has to be recognisable as a reply.
 
 `make_response` builds from the decoded message, and a query that did not decode
 leaves that empty — id zero, no question. Encoding an empty message succeeds, so
-`error_response` returned those twelve bytes and never reached the fallback that
-was written to patch the request's own header. The client is waiting on its own
-transaction ID, so what came back was dropped as unsolicited and the query
-waited out its full timeout instead.
+`error_response` decides on whether there is anything to build from, and with
+nothing patches the request's own header instead: the client is waiting on its
+own transaction ID, and a reply without it would be dropped as unsolicited and
+the query would wait out its full timeout.
 */
 @(test)
 test_formerr_for_an_unparseable_query_carries_its_id :: proc(t: ^testing.T) {
@@ -798,12 +798,10 @@ test_formerr_for_an_unparseable_query_carries_its_id :: proc(t: ^testing.T) {
 An answer we did not check must not be stored carrying a claim that we did.
 
 `validating` is recomputed for every request, so nothing ties the AD bit an
-entry carries to whether that entry was ever validated. The two agree today only
+entry carries to whether that entry was ever validated. The two agree only
 because the cache key carries CD and the class, which keeps the entries a
-non-validating request writes away from the requests that would trust them -
-an accident of the key rather than a property of the cache, and one that stops
-holding the moment `validating` is turned off after the key is built, as it is
-when the upstream query cannot be rebuilt.
+non-validating request writes away from the requests that would trust them - an
+accident of the key rather than a property of the cache.
 
 So the bit is settled before the entry goes in, and this drives the real store
 path to check it: a miss, forwarded to an upstream that sets AD, with CD on the
@@ -906,7 +904,7 @@ test_unvalidated_answer_is_not_cached_with_ad :: proc(t: ^testing.T) {
 
 	testing.expect(t, served, "no response was produced")
 	testing.expectf(t, outcome == .Forwarded, "expected the forwarded path, got %v", outcome)
-	// Already right, and the reason this went unnoticed: the client is told nothing.
+	// The client's copy carries no AD either.
 	testing.expect(
 		t,
 		len(out) >= dns.HEADER_SIZE && out[3] & 0x20 == 0,
@@ -939,12 +937,11 @@ test_unvalidated_answer_is_not_cached_with_ad :: proc(t: ^testing.T) {
 CD comes back the way the client wrote it, whatever the upstream's copy says.
 
 RFC 4035 section 3.2.2 has a responder copy CD from the query, and the answer an
-upstream hands over is its echo of the question this server put - or not an
-echo at all: OpenDNS clears CD on every answer, so a client that set it behind
-that upstream was told checking had been left on. The validated path already
-put the client's bit back; an answer served without validating, which is every
-answer to a CD query, went out with the upstream's. Found by the live parity run
-against 208.67.222.222.
+upstream hands over is its echo of the question this server put - or not an echo
+at all: OpenDNS clears CD on every answer, so a client that set it behind that
+upstream (208.67.222.222) would be told checking had been left on. So the
+client's bit is put back on every path: the validated one, and an answer served
+without validating, which is every answer to a CD query.
 */
 @(test)
 test_cd_bit_echoes_the_client_not_the_upstream :: proc(t: ^testing.T) {

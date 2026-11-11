@@ -291,10 +291,10 @@ SERVFAIL and REFUSED are swept past for a plainer reason: neither is an answer
 about the name. RFC 2308 section 7.1 reads SERVFAIL as the responder reporting
 on itself, and REFUSED is it declining to be asked at all - policy, or an ACL
 that no longer lists this server. A failover group exists so that one member can
-be in that state, and before issue #309 it did not help: `record_failure` counts
-transport failures, so a member that answers REFUSED to everything, promptly and
-forever, is never parked and every client query stopped at it while the member
-beside it held the answer. dnsmasq, Unbound and BIND all move to the next server
+be in that state, and parking does not help with it (#309): `record_failure`
+counts transport failures only, so without the sweep a member that answers
+REFUSED to everything, promptly and forever, would never be parked and every
+client query would stop at it while the member beside it held the answer. dnsmasq, Unbound and BIND all move to the next server
 on these two.
 
 And a referral, a NOERROR that says only who else to ask (issue #410,
@@ -417,17 +417,15 @@ resolve_insisting :: proc(
 	is a member the group no longer has when the next one times out.
 
 	The sweep's own cost is worth stating plainly, because SERVFAIL is a far more
-	common reply than the unreadable rcode this was first written for. A group of
+	common reply than an unreadable rcode. A group of
 	two pays one extra exchange for a name its first member cannot answer. A
 	group of three or more pays up to one per remaining member, and a member that
 	is unreachable but has not yet accrued its three failures - a fresh start, or
-	the ten seconds after a cooldown expired - costs `g.timeout` of that on the
+	the first query after a cooldown expires - costs `g.timeout` of that on the
 	client's own latency path before the next is tried. The same arithmetic
 	applies to upstream traffic: a client asking names that SERVFAIL turns each
 	of its queries into up to one exchange per member of the group. Both are the
-	price of the group having somewhere else to go, and both were already the
-	arrangement for the rcodes above; what issue #309 changed is how often it is
-	reached.
+	price of the group having somewhere else to go (#309).
 
 	An unreadable rcode is left alone for a sharper reason: those eight bits are
 	two bytes an on-path attacker can write into any reply it can reach. Counting
@@ -460,12 +458,12 @@ resolve_insisting :: proc(
 	teaching `Race_State` to keep a reply it will not return yet, on the one
 	path where a racer can outlive the caller.
 
-	Since #309 that cost is worth reading twice, because a racing group has a
-	way of paying it on every query. `resolve_race` returns the first reply to
-	arrive whatever its rcode, and the member that REFUSES this server on an ACL
-	is the member that answers in microseconds - so it wins the race essentially
-	always, and the sweep runs behind every race rather than behind the rare
-	unreadable rcode this was written for. A racing group with a member in that
+	That cost is worth reading twice, because a racing group has a way of
+	paying it on every query. `resolve_race` returns the first reply to arrive
+	whatever its rcode, and the member that REFUSES this server on an ACL is the
+	member that answers in microseconds - so it wins the race essentially always,
+	and the sweep runs behind every race rather than behind a rare unreadable
+	rcode. A racing group with a member in that
 	state is a group running at up to two exchanges per member per query, with
 	the client waiting on the sequential half. `strategy: failover` pays one
 	exchange for it instead, and the upgrade path above is what would fix it in
@@ -504,8 +502,8 @@ resolve_insisting :: proc(
 	two are one budget, not one on top of the other. A group whose first member
 	is silent and whose second recurses for most of a timeout before saying
 	SERVFAIL hands the reply back near the end of the budget, and a fresh
-	timeout for the sweep then let a slow third and a silent fourth take the
-	query to four timeouts - the twenty seconds issue #327 was filed about.
+	timeout for the sweep would then let a slow third and a silent fourth take
+	the query to four timeouts - the twenty seconds of issue #327.
 	What `resolve` took is read off the tick clock around the whole call rather
 	than added up by it, so every wait in it counts, answered exchanges and
 	failures that cost nothing included.
@@ -537,7 +535,7 @@ resolve_insisting :: proc(
 	`exchange` refuses an upstream whose hostname it cannot resolve before it
 	sends anything. With no bootstrap servers that costs nothing, and counting
 	attempts would stop there on every sweep until the member parked and never
-	reach the member behind it, which is issue #309's own failure. A failure
+	reach the member behind it, the failure issue #309 is about. A failure
 	that cost no time is simply passed over. With a bootstrap resolver that is
 	down it costs seconds, and is charged like any other wait; `exchange`
 	records it as a failure, so the member parks like a dead one rather than
@@ -545,7 +543,7 @@ resolve_insisting :: proc(
 
 	Nor by dividing the timeout between the members: `exchange` counts a timeout as a failure, so a member cut off by a
 	share it would have answered inside gets marked down for being asked
-	impatiently, and three of those park the spare this change exists to keep.
+	impatiently, and three of those park the spare the sweep exists to reach.
 	The wait is what must be bounded; what a member is judged on has to go on
 	being the group's own timeout.
 
@@ -673,7 +671,7 @@ report_swept :: proc(winner: ^Upstream, response: []u8, u: ^Upstream) {
 	// REFUSED from behind the same ACL bypasses nothing, and warning about it
 	// would spend the one-shot line on it.
 	report_swept_refusal(winner, response)
-	// The rcode as a number: 4080 of the 4096 composed values have no name,
+	// The rcode as a number: most of the 4096 composed values have no name,
 	// and `%v` renders one of those as a placeholder - the same reading
 	// `unreadable_rcode_refusal` gives its own line.
 	logx.debugf(
@@ -903,10 +901,10 @@ usable_rcode :: proc(response: []u8) -> bool {
 /*
 Say once, at warn, that a REFUSED carrying no policy extended error was swept.
 
-The one deployment this change can quietly break: a filtering resolver as a
-member of a group - AdGuard Home in its REFUSED blocking mode, Blocky, an RPZ
-rule - beside a public resolver for everything else. A blocked name is now
-re-asked of the member beside it and answered, and where the filtering member
+The deployment this sweep can quietly break: a filtering resolver as a member of
+a group - AdGuard Home in its REFUSED blocking mode, Blocky, an RPZ rule - beside
+a public resolver for everything else. A blocked name is re-asked of the member
+beside it and answered, and where the filtering member
 says why it refused (`POLICY_EDE_FIRST`) that does not happen; where it says
 nothing, which is most of them today, it does. An operator's first sign would
 otherwise be the ads coming back.

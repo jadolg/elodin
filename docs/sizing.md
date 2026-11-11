@@ -29,10 +29,8 @@ $ elodin --check
   connections: at most 512 at once across TCP, DoT and DoH, of which one client prefix (/24, /64) may hold 256; connections past a prefix's share are refused and counted as conn_refused=
 ```
 
-`server.workers`, `server.running_workers` and `server.upstream_workers` are no
-longer used. A file that names them still
-loads, and each is named in a `warn` at startup, at every reload and under
-`--check`; 0.26.0 refuses them. Remove them.
+`server.workers`, `server.running_workers` and `server.upstream_workers` are
+refused as unknown keys. Remove them.
 
 ## Event loops
 

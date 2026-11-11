@@ -221,7 +221,7 @@ test_a_connection_past_the_limit_is_counted :: proc(t: ^testing.T) {
 	cfg.log.queries = false
 	cfg.server.max_connections = 1
 	// Long enough that the first connection is still holding its slot when the
-	// second arrives, without leaving a stuck thread behind if it is not.
+	// second arrives, without leaving a stuck fiber behind if it is not.
 	cfg.server.client_timeout = 5 * time.Second
 
 	handler_pool: Test_Loop
@@ -248,7 +248,7 @@ test_a_connection_past_the_limit_is_counted :: proc(t: ^testing.T) {
 		return
 	}
 
-	// Opened and left open with nothing written on it, so the connection thread
+	// Opened and left open with nothing written on it, so the connection's fiber
 	// sits in its read and the slot stays taken.
 	first, ferr := net.dial_tcp(bound)
 	if !testing.expectf(t, ferr == nil, "cannot open the first connection: %v", ferr) {
@@ -280,7 +280,7 @@ test_a_connection_past_the_limit_is_counted :: proc(t: ^testing.T) {
 		"a connection refused past max_connections was not counted: conn_refused=%d",
 		sync.atomic_load(&s.stats.conn_refused),
 	)
-	// And it is the limit that was blamed, not the OS refusing a thread.
+	// And it is the limit that was blamed, not a fiber that could not be started.
 	testing.expect_value(t, sync.atomic_load(&s.stats.conn_failed), u64(0))
 }
 
@@ -405,7 +405,7 @@ test_a_connection_accepted_during_shutdown_is_dropped :: proc(t: ^testing.T) {
 	cfg.cache.enabled = false
 	cfg.blocking.enabled = false
 	cfg.log.queries = false
-	// Long enough that a connection a thread was started for is still open when
+	// Long enough that a connection a fiber was started for is still open when
 	// the read below gives up, so EOF can only be the accept loop closing it.
 	cfg.server.client_timeout = 5 * time.Second
 
@@ -554,7 +554,7 @@ those answers and then the end of the stream.
 Served by hand rather than through `serve_dns_stream`, which wants a whole server
 behind it. What is under test is the three things the refusal path does and the
 order it does them in - the answer, the drain, the close - and the drain is the
-only one of the three that is new. The client shuts down its sending half so the
+one this case is about. The client shuts down its sending half so the
 drain ends on the end of the data rather than on `STREAM_LINGER_TIMEOUT`, and can
 still read afterwards.
 */
@@ -660,16 +660,16 @@ test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T)
 }
 
 /*
-The drains' short read wait reaches a TLS connection, which the socket option it
-used to be written as did not.
+The drains' short read wait reaches a TLS connection, which a socket option would
+not.
 
 `tlsx` reads SO_RCVTIMEO once, at the handshake, and then puts the socket into
 non-blocking mode and waits on the deadline the connection carries instead. So a
-`net.set_option` afterwards changes nothing a TLS read looks at, and the drains -
-which are reached over DoT and DoH as often as over TCP - were left waiting out
-`client_timeout` on a client that had stopped sending, holding one of
-`max_connections` for the whole of it. That is what the short wait exists to
-avoid, so it has to be the wait that a TLS read actually uses.
+`net.set_option` afterwards changes nothing a TLS read looks at, and set that
+way the drains - which are reached over DoT and DoH as often as over TCP - would
+wait out `client_timeout` on a client that had stopped sending, holding one of
+`max_connections` for the whole of it. The short wait is therefore set on the
+TLS connection's read deadline.
 
 Nothing is handshaked here: what is under test is which field the wait lands in,
 and a bare `tlsx.Conn` carries both of them. The write deadline is asserted too -
@@ -818,15 +818,14 @@ A message trickled a byte at a time is given up on at `client_timeout`, not held
 for as long as the client keeps trickling.
 
 `client_timeout` reaches the socket as SO_RCVTIMEO, which bounds one read: every
-byte that arrives restarts it, so before `Read_Budget` the only thing that ever
-reclaimed an accepted connection could not fire at all against a client sending a
-byte inside every wait. Nothing else caught it either - the connection and
-connection-rate limits bound how many are opened and how fast, and the query
+byte that arrives restarts it, so SO_RCVTIMEO alone cannot fire against a client
+sending a byte inside every wait. Nothing else caught it either - the connection
+and connection-rate limits bound how many are opened and how fast, and the query
 budgets are charged per message, so a connection on which no message ever
 completes is charged nothing and counted against nothing while it holds one of
 `max_connections`. RFC 7766 6.2.3 names the attack and says the idle timeout is
-reset "on the receipt of a full DNS message, rather than on receipt of any part of
-a DNS message".
+reset "on the receipt of a full DNS message, rather than on receipt of any part
+of a DNS message".
 
 The drip is shorter than `client_timeout`, which is what makes it a drip: every
 byte lands inside the window the byte before it opened. Against a server holding
@@ -977,7 +976,7 @@ Both waits here are 700ms against a one-second budget, which leaves either
 reading of it 300ms of margin: measured from the connection the two of them are
 1.4s and the message could never arrive, and measured from its first byte the
 second half has 700ms of a second to make. The margin matters more than the
-speed here - this is the one case in the change that a slow box could fail with
+speed here - this is the one case in this file that a slow box could fail with
 correct code, so it is the one that gets the room.
 */
 @(test)
@@ -1078,14 +1077,15 @@ test_a_nearly_spent_deadline_does_not_arm_an_endless_read :: proc(t: ^testing.T)
 Shortening how long an idle connection is held does not shorten the handshake in
 front of it.
 
-`server_handshake` bounds a handshake as a whole now, and the figure it uses is
-the socket's receive timeout - which `stream_job` sets from `client_timeout`, the
+`server_handshake` bounds a handshake as a whole, and the figure it uses is the
+socket's receive timeout - which `stream_job` sets from `client_timeout`, the
 same value RFC 7828 advertises as how long an idle connection is kept. An
-operator shortens that to reclaim slots sooner, which says nothing about how long
-a client may take to shake hands: a handshake is several round trips and whatever
-a lossy path makes of them, so the two sharing one figure would have a
+operator shortens that to reclaim slots sooner, which says nothing about how
+long a client may take to shake hands: a handshake is several round trips and
+whatever a lossy path makes of them, so the two sharing one figure would have a
 high-latency client failing to connect at all. Hence the floor, and hence this,
-because a floor that quietly stopped applying would look exactly like it working.
+because a floor that quietly stopped applying would look exactly like it
+working.
 */
 @(test)
 test_the_handshake_keeps_its_floor_under_a_short_client_timeout :: proc(t: ^testing.T) {
@@ -1136,8 +1136,7 @@ test_parse_bind_refuses_a_stray_bracket :: proc(t: ^testing.T) {
 
 /*
 #533: a datagram's job and its bytes are one heap block, so the reader makes one
-allocation per datagram and the worker one `free`, which crosses back to the
-reader's malloc arena.
+allocation per datagram and the query's fiber one `free`.
 */
 @(test)
 test_udp_job_is_one_allocation :: proc(t: ^testing.T) {
@@ -1165,11 +1164,11 @@ behind it waits in the reader for the next message (#594).
 
 A read for the prefix and one for the body would be three `recv` per TCP query,
 with the one that finds the queue empty, against UDP's one. Sent here in one
-write: a query, a message longer than the read-ahead, and the prefix of a third with half
-its body, then the rest of it. The first read takes the first query and as much
-of the second as fits, which is the one read the change is for; the long message
-is assembled across the buffer and the socket; and the third, split inside
-itself, still arrives whole.
+write: a query, a message longer than the read-ahead, and the prefix of a third
+with half its body, then the rest of it. The first read takes the first query
+and as much of the second as fits, which is the one read a query should cost;
+the long message is assembled across the buffer and the socket; and the third,
+split inside itself, still arrives whole.
 */
 @(test)
 test_a_stream_query_and_its_prefix_are_one_read :: proc(t: ^testing.T) {

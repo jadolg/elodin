@@ -290,9 +290,9 @@ run_reload_cases :: proc(r: ^Runner) {
 		the selection callback run arrives whenever the client chooses to send
 		it, deliberately outside the lock the reload holds. So a connection
 		opened before a SIGHUP and handshaken after it is where that list has to
-		still be there - and where, while it was freed along with the wrapper the
-		reload releases, the callback walked reclaimed heap and OpenSSL copied
-		what it found into the ServerHello.
+		still be there: the list has to outlive a reload for a connection
+		accepted before it, or the callback walks reclaimed heap and OpenSSL
+		copies what it finds into the ServerHello.
 
 		Nothing on disk changes here: a reload rebuilds the context and releases
 		the displaced one whether or not the certificate is new, which is the
@@ -313,10 +313,10 @@ run_reload_cases :: proc(r: ^Runner) {
 
 			// A whole handshake on a second connection, to place the one above
 			// well inside the server. One accept loop serves this listener and
-			// spawns a thread per connection in the order they arrive, so a
+			// spawns a fiber per connection in the order they arrive, so a
 			// later connection completing a whole handshake says the earlier
-			// one's thread was started before it. What that does not order is
-			// that thread reaching `server_session`, which is where the
+			// one's fiber was started before it. What that does not order is
+			// that fiber reaching `server_session` through `accept_tls`, where the
 			// reference to the current context is taken; what covers the rest
 			// is the reload being a maintenance-loop poll - 200ms - further
 			// away still.

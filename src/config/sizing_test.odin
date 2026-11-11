@@ -1,6 +1,6 @@
 package config
 
-import "core:strings"
+import "core:fmt"
 import "core:testing"
 
 @(private = "file")
@@ -30,7 +30,7 @@ test_derive_max_pending_is_sized_by_memory :: proc(t: ^testing.T) {
 /*
 A term the machine did not report is left out rather than guessed: an unreadable
 `/proc` on a large host should not size it like a Raspberry Pi, so with no memory
-figure the answer is the bound the worker pools shipped with.
+figure the answer is `DEFAULT_MAX_PENDING`.
 */
 @(test)
 test_derive_max_pending_ignores_what_it_cannot_measure :: proc(t: ^testing.T) {
@@ -40,8 +40,8 @@ test_derive_max_pending_ignores_what_it_cannot_measure :: proc(t: ^testing.T) {
 
 /*
 The heavy decode slots take a thirty-second of memory at the whole decode budget
-each, which is the share the worker threads were held to: never fewer than two,
-never more than the 128 workers there ever were, and 16 where memory is unknown.
+each: never fewer than `MIN_DERIVED_HEAVY_DECODES`, never more than
+`MAX_DERIVED_HEAVY_DECODES`, and `DEFAULT_HEAVY_DECODES` where memory is unknown.
 */
 @(test)
 test_derive_heavy_decodes_is_sized_by_memory :: proc(t: ^testing.T) {
@@ -106,34 +106,22 @@ test_a_negative_chain_walk_bound_is_refused :: proc(t: ^testing.T) {
 }
 
 /*
-The keys #547 retired are accepted for one release, each recorded so it can be
-named - a file that was correct before the upgrade still starts - and read as the
-integers they always were, so a typo in one is still caught.
+The worker keys #547 removed are unknown keys, refused like any other: the
+warning that named them said so for 0.25.0 to 0.27.0. The connection walk bound
+is not one of them.
 */
 @(test)
-test_retired_keys_are_accepted_and_recorded :: proc(t: ^testing.T) {
+test_the_removed_worker_keys_are_refused :: proc(t: ^testing.T) {
+	for key in ([]string{"workers", "upstream_workers", "running_workers"}) {
+		_, err := load_string(fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nserver:\n  %s: 8\n", key), context.temp_allocator)
+		testing.expectf(t, err != nil, "server.%s was accepted", key)
+	}
 	cfg, err := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 8\n  upstream_workers: 1\n  running_workers: 4\ndnssec:\n  max_connection_walks: 24\n",
+		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: 24\n",
 		context.temp_allocator,
 	)
-	testing.expect(t, err == nil, "a file naming the retired keys was refused")
-	testing.expect_value(t, cfg.retired, Retired_Keys{.Workers, .Upstream_Workers, .Running_Workers})
-	// Not retired: the connections keep a walk bound of their own.
+	testing.expect(t, err == nil, "dnssec.max_connection_walks was refused")
 	testing.expect_value(t, cfg.dnssec.max_connection_walks, 24)
-
-	plain, perr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
-	testing.expect(t, perr == nil, "expected a clean load")
-	testing.expect_value(t, plain.retired, Retired_Keys{})
-
-	_, terr := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: lots\n", context.temp_allocator)
-	testing.expect(t, terr != nil, "a retired key that is not an integer was accepted")
-
-	// Each warning names its own key and the release that refuses it.
-	for key in Retired_Key {
-		line := retired_warning(key)
-		testing.expectf(t, strings.contains(line, RETIRED_KEYS_REFUSED_IN), "%v: %q names no release", key, line)
-	}
-	testing.expect(t, strings.contains(retired_warning(.Workers), "server.workers"))
 	free_all(context.temp_allocator)
 }
 
@@ -145,7 +133,7 @@ systemd's `CPUQuota=` throttle rather than narrow the mask.
 test_parse_cpu_max :: proc(t: ^testing.T) {
 	quota, ok := parse_cpu_max("50000 100000\n")
 	testing.expect(t, ok, "half a CPU should parse")
-	// Rounded up: half a CPU still runs a worker's worth of work.
+	// Rounded up: half a CPU still runs one loop.
 	testing.expect_value(t, quota, 1)
 
 	quota, ok = parse_cpu_max("250000 100000\n")

@@ -59,9 +59,9 @@ cookies_wanted :: proc(u: ^Upstream) -> bool {
 /*
 Put our cookie for this upstream into a copy of the query.
 
-`ok` is false when the query has no OPT record to carry it. Adding one would
-start an EDNS negotiation on behalf of a client that did not ask for it, and
-change what may come back; the query goes out as it is instead.
+`ok` is false when the query has no OPT record to carry it, and the query goes
+out as it is. Every query the server forwards carries one
+(`server.upstream_query`); this is for one built by hand.
 */
 @(private)
 attach_cookie :: proc(u: ^Upstream, query: []u8, allocator: mem.Allocator) -> (out: []u8, ok: bool) {
@@ -117,38 +117,26 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	/*
 	A cookie is owed on a reply to a query that carried one, and only then.
 
-	Having been issued a server cookie is not enough on its own, because this
-	resolver does not put a cookie on every query it sends. `attach_cookie`
-	declines when the query has no OPT record to carry one - which is what a
-	client asking without EDNS produces - and a cookie-aware server answering a
-	query that carried no cookie correctly answers with no cookie of its own
-	(RFC 7873 section 5.2.1). Demanding one there rejects the only reply that
-	could ever have arrived, and the client gets a timeout and a servfail for a
-	name that resolves.
+	Having been issued a server cookie is not enough on its own, because not
+	every query sent through here carries a cookie. `attach_cookie` declines
+	when the query has no OPT record to carry one, and a cookie-aware server
+	answering a query that carried no cookie correctly answers with no cookie of
+	its own (RFC 7873 section 5.2.1). Demanding one there rejects the only reply
+	that could ever have arrived, and the caller gets a timeout for a name that
+	resolves.
 
 	On the exchange itself this costs nothing. The cookie's value is that an
 	off-path attacker has to guess 64 bits it never saw, and that only ever
-	applied to exchanges where those bits were sent. On one carrying no cookie
+	applies to exchanges where those bits were sent. On one carrying no cookie
 	there is nothing to guess and nothing to opt out of: forging a reply is
-	exactly as hard as it was before cookies existed, which is where every reply
-	from a cookie-less upstream already sits. What must not happen is the
-	reverse - a reply to a query that did carry a cookie being accepted without
-	one - and that is what `held` still governs.
+	exactly as hard as it is without cookies, which is where every reply from a
+	cookie-less upstream already sits. What must not happen is the reverse - a
+	reply to a query that did carry a cookie being accepted without one - and
+	that is what `held` still governs.
 
-	The residual, stated plainly: which exchanges carry a cookie is decided by
-	the client, so a client that asks without EDNS gets an exchange with no
-	cookie protection on it, and with the cache on the answer it gets is the
-	answer everyone behind this server gets. Failing closed there would mean
-	never resolving the name at all, for every stub that does not do EDNS, so it
-	is not a defence anyone would choose.
-
-	The defence rather than the trade is to put an OPT record on the *upstream*
-	query even where the client sent none, and carry a cookie on it. What ruled
-	that out was that it negotiates EDNS on behalf of a client that did not ask
-	- but since #276 the upstream's OPT record does not reach the client at all
-	(`normalise_client_opt`), so the client need never see that it happened.
-	That would be a change to what this server asks upstream, and is not made
-	here: this handling is the availability half.
+	Every query the server forwards carries an OPT record
+	(`server.upstream_query`), so this only lets a hand-built query without one
+	go out uncookied, with its reply not held to a cookie.
 	*/
 	// Behind `held`, so the walk happens only where its answer can change the
 	// outcome. `response_accepted` runs per received datagram, so on an
@@ -320,7 +308,7 @@ exchange_with_cookie :: proc(
 	}
 	/*
 	Free the superseded reply only once it is a different buffer. The cookie is
-	present here (the `reply_cookie` guard returned otherwise) and the guard now
+	present here (the `reply_cookie` guard returned otherwise) and the guard
 	walks the same OPT record `remove_edns_option` does, so the strip always
 	makes a fresh buffer and this is always the case. The comparison stays
 	because `remove_edns_option` hands the input straight back when it finds no

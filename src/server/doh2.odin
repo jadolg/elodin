@@ -45,11 +45,11 @@ H2_Context :: struct {
 
 	The other transports bound a message this way and this one needs it for the
 	same reason - see `Read_Budget`. An h2 connection is long-lived by design and
-	nothing here shortens that: the wait for the next frame to start is still the
-	whole of `client_timeout`, as it was when the socket option was the only bound.
-	What it ends is the peer that trickles one byte inside every wait and so is
-	never waited out at all, which before any stream exists - over the preface, or
-	a frame header - held a connection with no request ever made.
+	nothing here shortens that: the wait for the next frame to start is the whole
+	of `client_timeout`. What it ends is the peer that trickles one byte inside
+	every wait and so is never waited out at all, which before any stream exists -
+	over the preface, or a frame header - would hold a connection with no request
+	ever made.
 
 	It is what one frame may take and not what one connection may. A peer that
 	keeps completing frames would keep its connection, and a frame is not charged
@@ -395,8 +395,9 @@ h2_job :: proc(data: rawptr) {
 /*
 Answer one request.
 
-Split from `h2_job` because the shutdown path above runs it inline on the
-connection's reader fiber, whose scratch holds the frame `h2.serve` is still
+Split from `h2_job` because the no-loop path in `h2_handler` (a `Server` built
+as a literal, in tests) runs it inline on the connection's reader fiber, whose
+scratch holds the frame `h2.serve` is still
 working through — resetting it there would free the ground from under it.
 */
 @(private)
@@ -432,13 +433,13 @@ Whether this request is one the response budget is denominated in.
 
 Answered on the connection's reader fiber, because that is where the charge is,
 and answerable there because none of it is a lookup: the endpoint is a string
-compare and the rest is the request as it arrived. Without it the budget was spent
-by anything at all addressed to the DNS path - a POST with the wrong content type,
+compare and the rest is the request as it arrived. Without it the budget would be
+spent by anything at all addressed to the DNS path - a POST with the wrong content type,
 a `dns` parameter that is not base64, twelve bytes short of a header - none of
 which reach the resolver, the cache or an upstream, and all of which could
 therefore starve the clients sharing their prefix while costing this server
-nothing it needed a budget for. The HTTP/1.1 endpoint has always charged after
-these same checks; this is that, one fiber earlier.
+nothing it needed a budget for. The HTTP/1.1 endpoint charges after these same
+checks; this is that, one fiber earlier.
 */
 @(private)
 h2_charged :: proc(ctx: ^H2_Context, req: ^h2.Request) -> bool {

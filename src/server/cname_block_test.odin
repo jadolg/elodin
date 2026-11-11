@@ -304,10 +304,9 @@ test_an_allowed_question_exempts_the_chain_it_leads_to :: proc(t: ^testing.T) {
 /*
 An allow rule speaks for its own name and does not excuse the one beside it.
 
-This asserted the opposite until an allowlisted name anywhere in the answer was
-recognised for what it is: a key the responder can use to turn the check off.
-The chain here reaches a listed name and then an allowed one, and the answer is
-refused for the listed name regardless of what follows it.
+An allowlisted name anywhere in the answer would be a key the responder can use
+to turn the check off. The chain here reaches a listed name and then an allowed
+one, and the answer is refused for the listed name regardless of what follows it.
 */
 @(test)
 test_an_allow_rule_later_in_the_chain_does_not_excuse_a_block_earlier_in_it :: proc(t: ^testing.T) {
@@ -697,11 +696,9 @@ test_a_chain_longer_than_the_budget_is_refused :: proc(t: ^testing.T) {
 /*
 A chain of exactly the budget is walked to the end and served.
 
-The boundary in the other direction, and it has to be the *exact* one. This
-tested fifteen targets against a walk that admits sixteen, and its partner
-tested eighteen against a refusal that starts at seventeen - so the pair passed
-whether the budget was 15, 16 or 17, on a number that decides whether ordinary
-answers are withheld. Sixteen here and seventeen there is what pins it.
+The boundary in the other direction, and it has to be the *exact* one, on a
+number that decides whether ordinary answers are withheld. Sixteen targets here
+and seventeen in the test above pin `MAX_CHAIN_NAMES` exactly.
 */
 @(test)
 test_a_chain_that_fits_the_budget_is_answered :: proc(t: ^testing.T) {
@@ -786,8 +783,7 @@ A refused answer does not take the upstream's AD bit into the cache with it.
 The bytes are stored so a later reload has something to walk, and a reload that
 clears the name serves them. If the upstream's AD bit went in with them, that
 later answer would carry this server's assurance that it validated something it
-never looked at - which is what clearing the bit before the store is for, and
-which the refused branch quietly did not do when it was added.
+never looked at - which is what clearing the bit before the store is for.
 
 Driven with DNSSEC off, so `validating` is false and the bit must be cleared on
 every stored answer, refused or not.
@@ -861,11 +857,10 @@ test_a_refused_answer_is_not_cached_with_the_upstream_ad_bit :: proc(t: ^testing
 A malformed record in a section the walk never reads does not cost the answer.
 
 The walk reads the answer section. The cache reads the whole message, so a
-record it cannot parse anywhere means the answer is not stored - which is fine,
-and was always the behaviour. What is not fine is refusing to *serve* it: for a
-round this gate was the whole-message decode having failed, so one bad
-RDLENGTH in an additional section turned a clean, walkable answer into SERVFAIL,
-and only once blocking was on.
+record it cannot parse anywhere means the answer is not stored - which is fine.
+What is not fine is refusing to *serve* it: that would turn one bad RDLENGTH in
+an additional section into SERVFAIL for a clean, walkable answer, and only once
+blocking is on.
 
 The reply here has a good CNAME chain and one additional record whose RDLENGTH
 runs past the end of the message.
@@ -970,12 +965,12 @@ A refusal reached on a partial decode is not frozen into the cache.
 
 The walk can run on an answer section alone, and the cache wants the whole
 message. When only the first succeeds, `decoded` is still the zero message it
-was declared as, and storing the refusal from it built an entry out of nothing
-to do with these bytes: `redirects` came out false, and `get` derives `recheck`
-from `redirects`, so the entry could never be walked again. The refusal it
-carried was then replayed on every hit until it expired - including after the
-operator wrote the allow rule the documentation points them at, which is the one
-thing that was supposed to release it.
+was declared as, and storing the refusal from it would build an entry out of
+nothing to do with these bytes: `redirects` would come out false, and `get`
+derives `recheck` from `redirects`, so the entry could never be walked again.
+The refusal it carried would be replayed on every hit until it expired -
+including after the operator wrote the allow rule the documentation points them
+at, which is the one thing that is supposed to release it.
 
 So nothing is stored for that answer, and the name goes upstream again. This
 asserts the release: the same cloaked answer, refused, and then allowed once the
@@ -1059,7 +1054,7 @@ test_a_refusal_on_a_partial_decode_is_released_by_a_reload :: proc(t: ^testing.T
 	/*
 	Built from the configuration rather than with a literal, and `negative_ttl`
 	is the reason. A cache made without one rejects the bogus entry this is
-	about for having a zero lifetime, so the test passed against the bug -
+	about for having a zero lifetime, so without it the test cannot fail -
 	`put` derives the lifetime from a zero message, which reads as a denial, and
 	a denial with no negative TTL configured is not stored at all. The running
 	server has 300 there.
@@ -1123,15 +1118,15 @@ test_a_refusal_on_a_partial_decode_is_released_by_a_reload :: proc(t: ^testing.T
 /*
 An unreadable CNAME is SERVFAIL, not a policy answer.
 
-The three refusals are not the same kind of thing. A listed name and a
-seventeen-name chain are answers somebody built, and `blocking.response` is what
-the operator asked for those. One CNAME whose target will not parse is as likely
-to be an upstream or a middlebox as an attack, and rendering it through
-`blocking.response` says something confident and wrong: with the default that is
-NXDOMAIN, so a name that exists is reported not to, with no rule behind it and
-nothing in the lists to explain it - and the stub caches that for
-`blocking.block_ttl`. Under `zero_ip` the client gets an address to connect to
-instead.
+The three refusals are not the same kind of thing. A listed name and a chain
+past `MAX_CHAIN_NAMES` targets are answers somebody built, and
+`blocking.response` is what the operator asked for those. One CNAME whose target
+will not parse is as likely to be an upstream or a middlebox as an attack, and
+rendering it through `blocking.response` says something confident and wrong:
+with the default that is NXDOMAIN, so a name that exists is reported not to,
+with no rule behind it and nothing in the lists to explain it - and the stub
+caches that for `blocking.block_ttl`. Under `zero_ip` the client gets an address
+to connect to instead.
 
 SERVFAIL is the only one of the three a stub retries or fails over from, and it
 is what the whole-message version of the same problem already returns.
@@ -1336,8 +1331,7 @@ An entry that turns unreadable on a *later* walk is dropped, not pinned.
 
 The sibling test covers the forwarding path: an answer that is unreadable the
 first time it is seen is never stored. This is the way in that the sibling
-misses, and it is the one that took a round to find - the entry goes in clean,
-and only a later walk reaches the verdict.
+misses: the entry goes in clean, and only a later walk reaches the verdict.
 
 It goes in clean because the question was allowlisted when it was stored, so the
 walk returned before looking at any record. The operator then removes that rule

@@ -40,8 +40,7 @@ datagrams: `rate_check` admits on one token before the answer exists and
 `rate_charge_response` bills the rest once it has been packed, which makes
 `responses_per_second * response_size_estimate` the bound on what one prefix can
 be made to receive whatever is asked for. Unset, the estimate is
-`server.max_udp_response` and every answer costs exactly one token, which is what
-this did before there was a second figure.
+`server.max_udp_response` and every answer costs exactly one token.
 
 Over-limit queries are not all dropped. At most every `slip`th one is answered
 with a header and a question and the TC bit set, which is 30-odd bytes rather
@@ -90,8 +89,8 @@ connections themselves out of a third, and none is a way to spend another. There
 a fourth, for the truncated answers, further down, and a fifth for the datagrams
 a server cookie rescues once their own pool is empty. See `Rate_Class`.
 
-One shared budget is what this began as, and it was wrong - which is worth writing
-down, because the argument for sharing is the one that reads better. It goes: what
+One shared budget would be wrong - which is worth writing down, because the
+argument for sharing is the one that reads better. It goes: what
 is bounded is what this server does for one prefix, so a prefix that has spent its
 budget on datagrams has spent it, and two budgets are just a way to have twice as
 much by asking twice as many ways. What it misses is that the two transports have
@@ -104,14 +103,14 @@ has its first query refused and its connection closed - so an attacker who canno
 receive anything at P, and who is asking none of P's questions, decides what this
 server does for the clients who actually live there, on a default configuration.
 It also shuts the one door the slip exists to open: a truncated answer says come
-back over TCP, and coming back over TCP arrived at the budget the flood had
+back over TCP, and coming back over TCP would arrive at the budget the flood had
 already emptied.
 
 So the two are separated, and the doubling is accepted deliberately. A prefix
 willing to ask both ways can draw `responses_per_second` out of each, which is a
 factor of two on the work behind an answer - a constant, applied to a figure an
 operator chose, and half of it reachable only over a completed handshake from an
-address that is therefore real. What the shared budget bought instead was letting
+address that is therefore real. What a shared budget would buy instead is letting
 anyone with a raw socket switch off a stranger's TCP.
 
 The property to keep is that neither pool can be spent from the other side: a
@@ -149,7 +148,8 @@ that has emptied the stream pool itself is refused there like anything else, and
 slip says the address is worth proving rather than reserving anything for the
 proof. But the retry is not answerable only in the gaps a flood leaves.
 
-The truncated answers themselves are charged too, to a third pool. What `slip`
+The truncated answers themselves are charged too, to a pool of their own
+(`Slip`). What `slip`
 picks is every Nth datagram *over* the budget, so left uncharged the number this
 server sends is a fixed fraction of whatever arrives, with no ceiling in it:
 measured at two million spoofed datagrams a second, the shipped default sent
@@ -196,22 +196,22 @@ recourse.
 That is the trade: an operator who configured 500 responses/s gets a server that
 sends about that much, rather than one that sends a stranger 19 MB/s and costs an
 uninvolved client 44 points of its answer rate. `slip: 0` is still there for a
-deployment that wants neither, and it is now within 0.01 MB/s of the default on
-every figure the bench reports - the default stopped being the expensive choice.
+deployment that wants neither, and it is within 0.01 MB/s of the default on
+every figure the bench reports - the default is not the expensive choice.
 
 What the connection budget is worth, and what it is not, said as plainly. On the
-shipped 500 it holds one unspoofed client to 500 arrivals a second where nothing
-held it before, which measured as 0.25 to 0.29 of four cores against the 1.25 to
-1.42 the same flood drew uncharged - a fifth, and the remainder is the accepts and
-closes rather than the key work, since a bound this cheap to trip is one the flood
-trips four times as often. What it is not is a defence against a botnet. It is per prefix like
-everything else here, so an actor with addresses in n prefixes has n of it, and on
-IPv6 a routine /48 is 65,536 /64s - the same granularity and the same limitation
-the response budget has, and the reason a publicly reachable instance still wants a
-per-source connection *rate* limit in front of it, in the packet filter or whatever
-terminates TLS in the deployment. The bound here is what keeps a single client with
-one real address from spending a third of the server; it is not what makes the
-address count stop mattering.
+shipped 500 it holds one unspoofed client to 500 arrivals a second, which
+measured as 0.25 to 0.29 of four cores against the 1.25 to 1.42 the same flood
+drew uncharged - a fifth, and the remainder is the accepts and closes rather
+than the key work, since a bound this cheap to trip is one the flood trips four
+times as often. What it is not is a defence against a botnet. It is per prefix
+like everything else here, so an actor with addresses in n prefixes has n of it,
+and on IPv6 a routine /48 is 65,536 /64s - the same granularity and the same
+limitation the response budget has, and the reason a publicly reachable instance
+still wants a per-source connection *rate* limit in front of it, in the packet
+filter or whatever terminates TLS in the deployment. The bound here is what
+keeps a single client with one real address from spending a third of the server;
+it is not what makes the address count stop mattering.
 
 It is also not free to a client that shares a prefix with a flood, in exactly the
 way the slip pool is not: a NAT whose /24 somebody is dialling into gets its share
@@ -465,11 +465,11 @@ Rate_Limiter :: struct {
 	syscall that delivered the query and orders of magnitude shorter than
 	answering it - so a finer lock would buy contention on a lock nobody holds.
 
-	Which is worth checking rather than asserting, now the accept loops are on it:
+	Which is worth checking rather than asserting, with the accept loops on it:
 	refusing an arrival is cheap, so a flood held to its budget dials several times
 	faster than one being served, and 27,000 acquisitions a second off an accept
-	loop is not the load this was written against. Measured, the datagram path does
-	not notice - `handshake-flood/udp-bystander` in
+	loop is a different load from the datagram path's. Measured, the datagram
+	path does not notice - `handshake-flood/udp-bystander` in
 	`bench/results/2026-09-04-handshake-budget.md` answers every query at 22.5 ms
 	against its own quiet 20.4 ms, under a flood taking this lock 27,499 times a
 	second. That is one rate on four cores and not a bound on what a much larger
@@ -506,8 +506,8 @@ Rate_Limiter :: struct {
 /*
 The figures one tier is built out of.
 
-Split from `make_rate_limiter` because it is now done once per configured
-override as well as once for the defaults, and every one of them has to be built
+Split from `make_rate_limiter` because it is done once per configured override
+as well as once for the defaults, and every one of them has to be built
 the same way: a tier that derived its `Slip` rate or its capacity differently
 from the others would be a prefix whose budget does not mean what the same
 figure means everywhere else.
@@ -534,7 +534,7 @@ make_rate_tier :: proc(responses_per_second: int, slip: int) -> (t: Rate_Tier) {
 /*
 `overrides` defaults to none, which is every caller that does not configure any -
 the tests included. Tier 0 is always the pair passed here, so a limiter with no
-overrides behaves exactly as it did before there were tiers.
+overrides holds every prefix to that pair.
 
 `response_size_estimate` defaults to 0, which charges one token per answer
 whatever its size - see `Rate_Limiter.estimate`. The server passes the configured

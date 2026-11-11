@@ -385,27 +385,22 @@ server: {{ user: root }}
 	end_case(r)
 
 	/*
-	A file that names the keys #547 retired still passes `--check`, as it still
-	starts, and each one is named with what replaced it: refused outright, a
-	configuration that was correct before the upgrade would stop the resolver
-	the moment the package was updated.
+	The worker keys #547 removed are unknown keys: `--check` refuses a file that
+	names one, and says which. The connection walk bound is still a setting.
 	*/
-	start_case(r, "cli: --check accepts the retired worker keys and names each")
+	start_case(r, "cli: --check refuses the removed worker keys and names each")
 	{
-		path := filepath.join({r.work_dir, "retired-keys.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)string(
-				"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 8\n  upstream_workers: 2\n  running_workers: 4\ndnssec:\n  max_connection_walks: 24\n",
-			),
-		)
-		res := new_check(r, path, "check-retired-keys")
-		check_eq_int(r, res.exit_code, 0, "exit code for a file naming the retired keys")
-		for key in ([]string{"server.workers", "server.upstream_workers", "server.running_workers"}) {
-			check(r, strings.contains(res.output, fmt.tprintf("warning: %s is no longer used", key)), "%s was not named: %q", key, res.output)
+		for key in ([]string{"workers", "upstream_workers", "running_workers"}) {
+			path := filepath.join({r.work_dir, fmt.tprintf("removed-%s.yaml", key)}, context.temp_allocator) or_else ""
+			write_fixture(r, path, transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nserver:\n  %s: 8\n", key))
+			res := new_check(r, path, fmt.tprintf("check-removed-%s", key))
+			check(r, res.exit_code != 0, "a file naming server.%s passed --check", key)
+			check(r, strings.contains(res.output, fmt.tprintf("server.%s: unknown key", key)), "server.%s was not named: %q", key, res.output)
 		}
-		// Still a setting: the connections keep a walk bound of their own.
-		check(r, !strings.contains(res.output, "max_connection_walks is no longer used"), "max_connection_walks was called retired: %q", res.output)
+		path := filepath.join({r.work_dir, "connection-walks.yaml"}, context.temp_allocator) or_else ""
+		write_fixture(r, path, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: 24\n"))
+		res := new_check(r, path, "check-connection-walks")
+		check_eq_int(r, res.exit_code, 0, "exit code for dnssec.max_connection_walks")
 		check(r, strings.contains(res.output, "connection_walks=24"), "the configured connection walk bound was not printed: %q", res.output)
 	}
 	end_case(r)
@@ -617,7 +612,7 @@ run_shutdown_cases :: proc(r: ^Runner) {
 	start_case(r, "shutdown: SIGTERM is answered by an orderly exit")
 	{
 		// Answer something first, so the shutdown has a warmed-up server with
-		// its worker pools and caches populated to take down.
+		// its caches populated to take down.
 		res := query_udp(udp_port, from_hex(f.query))
 		check(r, res.ok, "the server did not answer before being asked to stop")
 

@@ -1653,13 +1653,13 @@ test_client_headers_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
 }
 
 /*
-The HEADERS half of the same already-ended rule DATA got in the prior commit.
+The HEADERS half of the already-ended rule `client_handle_data` keeps for DATA.
 
-`client_finish_headers` wrote `:status` into `s.status` and could re-set
-`s.done` regardless of whether the stream had already finished, so an
-upstream sending a second HEADERS block after END_STREAM overwrote the
-status of a response the waiter in `client_request` might be reading at that
-exact moment - broadcast already fired, lock not yet re-acquired.
+`client_finish_headers` writes `:status` into `s.status` and sets `s.done`, so
+without that rule an upstream sending a second HEADERS block after END_STREAM
+would overwrite the status of a response the waiter in `client_request` might
+be reading at that exact moment - broadcast already fired, lock not yet
+re-acquired.
 */
 @(test)
 test_client_headers_after_end_stream_is_refused :: proc(t: ^testing.T) {
@@ -1767,10 +1767,10 @@ test_client_send_body_stops_once_the_stream_is_reset_by_us :: proc(t: ^testing.T
 /*
 RFC 9113 8.1 explicitly allows a server to answer before it has read the
 whole request, if the answer does not depend on the rest - a 413 on an
-upload too large, a 401, a redirect. `client_send_body` treated `s.done` as a
-failure exactly like `s.reset`, so `client_request` (client.odin:809) read
-that as `.Timeout` and threw away a complete, valid response sitting right
-there in `s.status`/`s.body`. Stopping the upload once the answer is in is
+upload too large, a 401, a redirect. `client_send_body` returns success on
+`s.done`, unlike `s.reset`, so `client_request` goes on to its wait loop and
+returns the complete, valid response sitting in `s.status`/`s.body` rather than
+reading a failure as `.Timeout`. Stopping the upload once the answer is in is
 correct; reporting that as a failure is not.
 */
 @(test)
@@ -1869,12 +1869,13 @@ test_client_send_body_does_not_double_rst_a_stream_already_reset_by_us :: proc(t
 }
 
 /*
-The response-wait timeout at client.odin:844 sends RST_STREAM(.Cancel) when
-it gives up; the upload-side flow-control deadline in `client_send_body` did
-not, though it gives up the same way for the same reason - a peer that stops
-granting window and says nothing else. Without it, a request abandoned to a
-timeout mid-upload leaves the peer holding the stream (and one of its
-MAX_CONCURRENT_STREAMS slots) open for the rest of the connection's life.
+The response-wait timeout in `client_request` sends RST_STREAM(.Cancel) when
+it gives up, and so does the upload-side flow-control deadline in
+`client_send_body`, which gives up the same way for the same reason - a peer
+that stops granting window and says nothing else. Without it, a request
+abandoned to a timeout mid-upload would leave the peer holding the stream (and
+one of its MAX_CONCURRENT_STREAMS slots) open for the rest of the connection's
+life.
 */
 @(test)
 test_client_send_body_resets_the_stream_on_a_flow_control_timeout :: proc(t: ^testing.T) {
@@ -1922,8 +1923,8 @@ test_client_send_body_resets_the_stream_on_a_flow_control_timeout :: proc(t: ^te
 /*
 RFC 9113 6.4: RST_STREAM always names a stream; stream 0 is a connection
 error of type PROTOCOL_ERROR, the same check the server's Rst_Stream arm
-just gained. The client's checked frame size but not this, so RST_STREAM on
-stream 0 looked up c.streams[0] - always a miss - and returned true.
+makes. Checking the frame size alone would let RST_STREAM on stream 0 look up
+c.streams[0] - always a miss - and return true.
 */
 @(test)
 test_client_rst_stream_on_stream_zero_is_a_connection_error :: proc(t: ^testing.T) {
@@ -2012,11 +2013,11 @@ test_client_send_body_early_response_rst_suppresses_a_later_one :: proc(t: ^test
 }
 
 /*
-The flow-control deadline path (client.odin:946) sends RST(.Cancel) but left
-`s.done`, `s.reset`, and `s.rst_sent` all false - so a DATA frame the peer
-already had in flight took the ordinary append path in `client_handle_data`
-instead of `already_ended`: bytes appended to `s.body`, and a stream-level
-WINDOW_UPDATE written, both on a stream this end had already reset. RFC 9113
+The flow-control deadline path in `client_send_body` sends RST(.Cancel) and
+sets `s.rst_sent` before it does - so a DATA frame the peer already had in
+flight takes the `already_ended` path in `client_handle_data` rather than the
+ordinary append path, which would append bytes to `s.body` and write a
+stream-level WINDOW_UPDATE, both on a stream this end has already reset. RFC 9113
 5.1 forbids sending or, implicitly, accepting anything but PRIORITY on a
 stream closed with RST_STREAM.
 */
@@ -2338,10 +2339,9 @@ test_client_control_budget_refills_each_second :: proc(t: ^testing.T) {
 }
 
 /*
-The client side of #393: each 1-byte DATA frame on an open stream drew a
-connection and a stream WINDOW_UPDATE back, 26 bytes out for 10 in. Credit is
-now owed until a batch of it is due, and every byte of it is still returned or
-owed.
+The client side of #393: a WINDOW_UPDATE pair for each 1-byte DATA frame on
+an open stream would be 26 bytes out for 10 in. Credit is owed until a batch of
+it is due, and every byte of it is still returned or owed.
 */
 @(test)
 test_client_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {

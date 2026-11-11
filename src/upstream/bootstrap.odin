@@ -210,8 +210,9 @@ resolve_address :: proc(host: string, bootstrap: []string) -> (addr: net.Address
 	if resolved, found := bootstrap_resolve(bootstrap, host); found {
 		return resolved, true
 	}
-	// Nothing configured to bootstrap with: fall back to the system resolver,
-	// which is fine for a blocklist download once the server is already up.
+	// Nothing configured to bootstrap with, or nothing the bootstrap servers
+	// answered: fall back to the system resolver, which is fine for a
+	// blocklist download once the server is already up.
 	ip4, ip6, err := netx.resolve(host)
 	if err != nil {
 		return nil, false

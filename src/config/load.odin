@@ -198,21 +198,6 @@ opt_int :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^int, path: string)
 }
 
 /*
-A key that is accepted for one release and then refused (see `Retired_Key`): read
-as the integer it always was, so a file with a typo in one still fails here, and
-otherwise only noted, for the warning that names it.
-*/
-@(private)
-retired_int :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node, key: string, which: Retired_Key, path: string) {
-	if yaml.is_null(yaml.get(n, key)) {
-		return
-	}
-	ignored: int
-	opt_int(l, n, key, &ignored, path)
-	cfg.retired += {which}
-}
-
-/*
 A TTL, which RFC 2181 section 8 makes 0 to 2^31-1 seconds: a receiver treats one
 with the top bit set as zero, so a figure past it is not the long TTL it was
 written as but none at all.
@@ -352,9 +337,6 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 		l,
 		n,
 		"server",
-		"workers",
-		"upstream_workers",
-		"running_workers",
 		"max_connections",
 		"max_connections_per_prefix",
 		"max_pending",
@@ -366,9 +348,6 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 		"allow_from",
 		"rate_limit",
 	)
-	retired_int(l, cfg, n, "workers", .Workers, "server")
-	retired_int(l, cfg, n, "upstream_workers", .Upstream_Workers, "server")
-	retired_int(l, cfg, n, "running_workers", .Running_Workers, "server")
 	opt_int(l, n, "max_connections", &cfg.server.max_connections, "server")
 	opt_int(l, n, "max_connections_per_prefix", &cfg.server.max_connections_per_prefix, "server")
 	opt_int(l, n, "max_pending", &cfg.server.max_pending, "server")
@@ -1304,9 +1283,10 @@ bypass exists for. Neither does an anchor that will not parse - `validate`
 refuses the file over one of those, so no operator ever sees what this answered
 for such a file.
 
-Read by `main` for the `--check` line and nothing else, so the parse is scratch:
-the anchors it builds are thrown at the temporary allocator rather than freed
-one by one, the caller's own line being built there too.
+Read by `main` for the `--check` line and the startup and reload warnings, so
+the parse is scratch: the anchors it builds are thrown at the temporary
+allocator rather than freed one by one, the caller's own line being built there
+too.
 */
 route_is_anchored :: proc(cfg: ^Config, route: Zone_Route) -> bool {
 	if !cfg.dnssec.enabled || len(cfg.dnssec.trust_anchors) == 0 || len(route.domains) == 0 {
@@ -2162,11 +2142,11 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 			ans, parsed := parse_rewrite_answer(l, a, apath)
 			if !parsed {
 				// The whole rule goes, the way every other failure in here
-				// treats one. Keeping a rule that lost an answer left the
-				// resolver relying on these errors being fatal to `load_string`
-				// - true today, and a rule with an empty `answers` reads to the
-				// server as a record-only rule with nothing to say, which it
-				// would step over in silence.
+				// treats one. A rule kept without the answer it lost would
+				// rest on these errors being fatal to `load_string`, and a
+				// rule with an empty `answers` reads to the server as a
+				// record-only rule with nothing to say, which it would step
+				// over in silence.
 				continue rules
 			}
 			append(&answers, ans)
@@ -2715,12 +2695,10 @@ Deliberately stricter than `strconv`: this is a configuration file, and `0x1f`,
 `+5`, `1_000` and a leading space are all shapes that would be accepted
 somewhere and mean something else here. A number is digits.
 
-Leading zeros are digits too. `MX 000010` is ten however it is padded, and
-refusing it while saying it "is not a number from 0 to 65535" was a message
-arguing with itself - the value is in range and the reader is left looking for
-the part that is not. The bound is on what the digits come to rather than on how
-many there are, which also stops a thousand of them from being counted before
-being rejected.
+Leading zeros are digits too. `MX 000010` is ten however it is padded, and in
+range. The bound is on what the digits come to rather than on how many there
+are, which also stops a thousand of them from being counted before being
+rejected.
 
 The reverse-name parser in `server/reverse.odin` refuses a padded octet on purpose, and the
 two are not in disagreement: `050` there is a second spelling of a *name*, and
@@ -3055,9 +3033,9 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	The table itself, refused rather than clamped.
 
 	`conn_manager_init` reads anything below one as one connection, so a server
-	configured with zero came up serving a single client and said "at most 0 at
-	once" on the startup line and in `elodin_connections_max` - a figure that
-	described neither the file nor the running server. It is also the number the
+	configured with zero would serve a single client and say "at most 0 at once"
+	on the startup line and in `elodin_connections_max` - a figure that describes
+	neither the file nor the running server. It is also the number the
 	share below is derived from and reported against, so a nonsense table makes
 	a nonsense share: at or below zero the derivation and the clamp both land on
 	one, which then reads as "any one client prefix may hold all of them".

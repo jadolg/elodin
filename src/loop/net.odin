@@ -27,15 +27,6 @@ A cancelled fiber's call returns as a timeout does.
 */
 
 /*
-The deadline a socket timeout option gives a call that began at `start`, or the
-zero tick for none.
-
-Read with the system call itself: `core:sys/linux`'s `getsockopt` passes the size
-of the pointer it is given as the option's length, which for a `timeval` is half
-of it, and the kernel refuses the read - every socket would have looked as if it
-had no timeout, and a wait meant to end would have lasted for ever.
-*/
-/*
 A socket read or written from a fiber must be non-blocking, or the call sleeps
 in the kernel with the whole loop under it - every other fiber on the thread
 waiting out this one's timeout. Nothing at the call says which a socket is, so
@@ -55,6 +46,15 @@ assert_nonblocking :: proc(fd: linux.Fd, loc := #caller_location) {
 	}
 }
 
+/*
+The deadline a socket timeout option gives a call that began at `start`, or the
+zero tick for none.
+
+Read with the system call itself: `core:sys/linux`'s `getsockopt` passes the size
+of the pointer it is given as the option's length, which for a `timeval` is half
+of it, and the kernel refuses the read - every socket would look as if it had no
+timeout, and a wait meant to end would last for ever.
+*/
 @(private)
 socket_deadline :: proc(fd: linux.Fd, option: linux.Socket_Option, start: Tick) -> Tick {
 	tv: linux.Time_Val

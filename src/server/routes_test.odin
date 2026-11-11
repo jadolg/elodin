@@ -64,12 +64,12 @@ undo. `thread.create_and_start_with_poly_data` is called with no `init_context`,
 which per `thread.Thread.init_context` gives this procedure a temporary
 allocator of its own that the runtime destroys when the thread dies - so a name
 decoded into temp memory here is freed by `thread.join` returning, which is
-precisely when the test reads it. That read is a use-after-free; it was one for
-as long as this mock has existed, and it segfaulted the test runner on arm64
-while passing on amd64, the way that class of bug does. `name_buf` lives in the
-caller's own frame, which outlives the mock by construction.
+precisely when the test reads it. That read would be a use-after-free, one that
+can segfault the test runner on arm64 while passing on amd64, the way that class
+of bug does. `name_buf` lives in the caller's own frame, which outlives the mock
+by construction.
 
-The stack arena below keeps that honest rather than merely fixed: nothing this
+The stack arena below keeps that honest: nothing this
 procedure decodes can outlive the arena it was decoded into, so the copy is the
 only way anything leaves. `peek_question` reads one name and stops, where a
 whole-message decode would allocate per record for a reply the mock never looks
@@ -158,8 +158,8 @@ route_mock_quiet :: proc(socket: net.UDP_Socket, name: string) -> bool {
 	return route_mock_heard(socket, name) == 0
 }
 
-// `type` defaults to the `A` every case here asked for before the apex `DS`
-// carve-out gave one of them a reason to ask for something else.
+// `type` defaults to the `A` almost every case here asks for; the apex `DS`
+// cases ask for something else.
 @(private = "file")
 route_query :: proc(name: string, type: dns.Type = .A) -> []u8 {
 	questions := make([]dns.Question, 1, context.temp_allocator)
@@ -750,8 +750,8 @@ The other half of the carve-out above. Sending the apex `DS` to the parent is
 worth doing for one answer - a NODATA, the proof that the delegation is insecure,
 which is `home.arpa.`'s answer from `arpa.` and the whole of what RFC 8375
 section 4 item 4.B asks to be fetched. Every other *statement about the
-delegation* is the route's to give, and each of the three here is a deployment
-that breaks if it is not:
+delegation* is the route's to give, and each listed here is a deployment that
+breaks if it is not:
 
   - *No such name.* An internal `corp.example.com` under a public, signed
     `example.com` that delegates no `corp`. The parent answers, with a signature
@@ -763,8 +763,7 @@ that breaks if it is not:
   - *A `DS` RRset.* Split horizon over a zone that really is delegated and signed
     in public, routed to an internal view that is not the signed one. Handing the
     client the public DS makes it demand a `DNSKEY` the internal view has no
-    matching key for, and Bogus is what it gets - where the same deployment
-    resolved before the carve-out existed.
+    matching key for, and Bogus is what it gets.
 
   - *SERVFAIL.* An upstream with an ACL, or a CPE resolver that answers every
     `DS` query it does not understand with a refusal. It says nothing about the
@@ -772,7 +771,7 @@ that breaks if it is not:
     rcode the way `upstream.resolve_answerable` reads its own rather than passing
     it on, and `parent_answers_apex_ds` argues why.
 
-All four cases run against one fixture and differ only in what the parent says,
+Every case runs against one fixture and differs only in what the parent says,
 which is the point: what the route does has to follow from the parent's answer
 and from nothing else. `apex_ds_off_route` and `parent_answers_apex_ds` argue
 each of them in full.
@@ -2985,11 +2984,11 @@ test_two_upstreams_of_one_name_have_their_figures_added :: proc(t: ^testing.T) {
 /*
 One client question, one budget, however many groups it asks (issue #439).
 
-An apex `DS` asks the parent's group and then the route's, and each of those
-used to be a call with two timeouts of its own to spend. So a parent whose two
-members are silent took the full two timeouts, and the route was then asked on
-a fresh budget - three at least, and four where the route was silent too, with
-a validating stub long gone. The query's deadline is set by the first group it
+An apex `DS` asks the parent's group and then the route's. Were each of those a
+call with two timeouts of its own to spend, a parent whose two members are
+silent would take the full two timeouts, and the route would then be asked on a
+fresh budget - three at least, and four where the route was silent too, with a
+validating stub long gone. The query's deadline is set by the first group it
 asks, and the route is asked only while any of it is left: here none is, and
 the question is a SERVFAIL at two timeouts rather than an answer at three.
 

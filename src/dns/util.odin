@@ -191,10 +191,10 @@ error_response :: proc(
 	/*
 	A query that did not decode arrives here as an empty message, and an empty
 	message encodes perfectly well - into twelve bytes carrying id zero and no
-	question. Taking that as success is what left the fallback below unreachable
-	and sent malformed queries a reply their client had no way to recognise: a
-	stub matches on the transaction ID, so what came back was dropped as
-	unsolicited and the query waited out its full timeout.
+	question. Taking that as success would leave the fallback below unreachable
+	and send a malformed query a reply its client has no way to recognise: a
+	stub matches on the transaction ID, so it drops that reply as unsolicited
+	and waits out its full timeout.
 
 	So the decision is made on whether there is anything to build from, not on
 	whether the encoder objected.
@@ -497,7 +497,7 @@ and NS owners decoded, into scratch, to follow the chain. And only one no larger
 than `MAX_ALIAS_REFERRAL_RECORDS` in either section: every judgement of a reply
 reads this, several times per reply and once per chain-walk step, and none of
 those readings is charged to the request's decode budget (issue #354). A reply
-past it is left as the answer it claims to be, which it was before issue #451.
+past it is left as the answer it claims to be (issue #451).
 */
 peek_referral :: proc(msg: []u8) -> bool {
 	if len(msg) < HEADER_SIZE {
@@ -714,15 +714,17 @@ sane_ttl :: proc(v: u32) -> u32 {
 /*
 The TTL field at `off`, read and written as the four big-endian bytes it is.
 
-One spelling of the pair, because four places move a TTL in and out of a message
-in place - `read_ttls`, `cap_ttls`, `patch_ttls` and the cache's stale branch -
-and arithmetic typed out four times is arithmetic that can be typed wrong once.
+One spelling of the pair, because several places move a TTL in and out of a
+message in place - `read_ttls`, `cap_ttls`, `patch_ttls` and the cache's stale
+branch - and `signatures_lapse` reads an RRSIG's expiration, the same four
+bytes, with it. Arithmetic typed out at each is arithmetic that can be typed
+wrong once.
 
 Neither bounds-checks. Every offset in play was established to be inside the
 message before it was handed over - by `scan_ttl_offsets` for the cache's
-callers, and by `cap_ttls`'s own walk for that one - so a check here would be
-dead in every caller; Odin's own bounds checks stay on in release builds and
-catch a caller that invents one.
+callers, and by their own walks for `cap_ttls` and `signatures_lapse` - so a
+check here would be dead in every caller; Odin's own bounds checks stay on in
+release builds and catch a caller that invents one.
 */
 read_ttl_at :: proc(msg: []u8, off: int) -> u32 {
 	return u32(msg[off]) << 24 | u32(msg[off + 1]) << 16 | u32(msg[off + 2]) << 8 | u32(msg[off + 3])
@@ -790,14 +792,13 @@ Best-effort, and deliberately so: every record this can read is bounded, and the
 walk stops at the first one it cannot. It does not refuse the message, and it
 reports nothing for a caller to act on.
 
-Refusing was the first shape of this - a message that could not be walked got
-SERVFAIL rather than being forwarded with the sender's own figures in it. What
-that missed is which messages fail the walk. Records are laid out answer first,
-so the section a client acts on is the section already bounded by the time any
-later one goes wrong; what a whole-message refusal actually turned away was junk
-in an authority or additional section, sections no TTL decision here depends on,
-and it turned it into SERVFAIL for a name whose answer section was clean. That
-is the same fail-closed-on-the-wrong-evidence `server.resolve_query` documents
+Refusing the whole message - SERVFAIL rather than forwarding it with the
+sender's own figures in it - would refuse the wrong messages. Records are laid
+out answer first, so the section a client acts on is the section already bounded
+by the time any later one goes wrong; what a whole-message refusal would turn
+away is junk in an authority or additional section, sections no TTL decision here
+depends on, and it would turn it into SERVFAIL for a name whose answer section is
+clean. That is the same fail-closed-on-the-wrong-evidence `server.resolve_query` documents
 at length for the chain walk, and it is settled the same way: hold the refusal to
 the part that was actually read.
 

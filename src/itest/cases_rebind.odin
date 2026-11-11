@@ -20,8 +20,6 @@ is exactly the move the attack makes: the name is public, the address is not.
 */
 
 // The info-code of the extended error a response carries, or -1 if it has none.
-// Read here rather than through a shared helper because only the rebinding cases
-// care about the value, not merely that an EDE is present.
 @(private = "file")
 extended_error_code :: proc(r: ^Runner, wire: []u8) -> int {
 	msg, ok := decode_reply(r, wire)
@@ -43,7 +41,7 @@ extended_error_code :: proc(r: ^Runner, wire: []u8) -> int {
 }
 
 /*
-Point the server at one synthesising upstream and hand back a running server.
+The configuration for one synthesising upstream and the given `rebind:` block.
 
 The config is generated per case so the `rebind:` block can vary; caching and
 blocking are off so nothing sits between the upstream's answer and the guard, and

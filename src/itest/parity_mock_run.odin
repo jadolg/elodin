@@ -126,9 +126,7 @@ The transports a run's generator picks from.
 
 The generator holds this for the whole run, so it cannot come from the temp
 allocator: the loop resets that arena after every query, and a slice into it
-reads reclaimed memory from the second query on. What that looked like was
-every query going out over UDP while the run reported itself as covering four
-transports.
+reads reclaimed memory from the second query on.
 */
 parity_transports :: proc(tls: bool) -> [dynamic]Parity_Transport {
 	transports := make([dynamic]Parity_Transport, 0, len(Parity_Transport), context.allocator)

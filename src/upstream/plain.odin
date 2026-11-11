@@ -49,11 +49,9 @@ exchange_udp :: proc(
 	those in a row park a healthy upstream for the cooldown.
 
 	Read off the query rather than assumed, and the callers are what keep it
-	small: every query the server forwards has had this field clamped into
-	[512, `UPSTREAM_UDP_SIZE`] on the way out, so the *ceiling* is ours even
-	where the number itself is still the client's smaller one. A client can
-	therefore lower this buffer and nothing else about it. The clamp below is
-	the floor and the wire's own ceiling rather than a policy - `bootstrap_query`
+	small: every query the server forwards advertises `UPSTREAM_UDP_SIZE`
+	(`server.upstream_query`), whatever the client asked for. The clamp below
+	is the floor and the wire's own ceiling rather than a policy - `bootstrap_query`
 	builds a query with no OPT record at all and lands on the floor, and a query
 	built by hand asking for more would be honoured and would cost this one
 	buffer.

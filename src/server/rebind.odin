@@ -88,16 +88,16 @@ one on its own. SVCB is the exception in the specification rather than here - RF
 the additional section precisely so that the client does not have to ask for
 them, so a client following it connects to what it finds there. That is the same
 "address a browser reaches without ever asking for the A record" the hints are
-covered for, arriving by the other door, and an `HTTPS 1 target.` with no hints
-at all was the way through.
+covered for, arriving by the other door, and without this an `HTTPS 1 target.`
+with no hints at all would be the way through.
 
 An answer this server cannot decode is refused, not forwarded, for the five
-question types above. That was the way round the whole guard and it cost the
-attacker one byte: they own the authoritative server, so they emit a truthful
-answer section carrying 192.168.1.1 and an ARCOUNT of 100 with nothing behind it,
-the count check in `decode_message` rejects the message, and the bytes reach the
-client verbatim - where glibc's `getanswer`, which only ever walks the answer
-section, hands the browser the address.
+question types above. Forwarding it would be the way round the whole guard, at
+a cost to the attacker of one byte: they own the authoritative server, so they
+emit a truthful answer section carrying 192.168.1.1 and an ARCOUNT of 100 with
+nothing behind it, the count check in `decode_message` rejects the message, and
+the bytes would reach the client verbatim - where glibc's `getanswer`, which
+only ever walks the answer section, hands the browser the address.
 
 It is not enough that such a message is also one the validator cannot validate
 and the cache declines to store. The second half is true and useless: the client
@@ -110,7 +110,7 @@ by not signing their zone is not one.
 
 So it fails closed, and only exactly here: with the guard on, for the questions
 the guard covers, when the part of the message a client acts on cannot be read.
-An undecodable MX or TXT answer is forwarded as it always was.
+An undecodable MX or TXT answer is forwarded.
 
 That last clause is narrower than "when the decode fails", and the difference
 matters in both directions. `decode_message` refuses a message for a malformed
@@ -340,7 +340,7 @@ that rejects it - eleven bytes needed per record, five per question, against the
 bytes actually there - is in `decode_sections`' prologue, ahead of the branch
 that stops at the answer section. Both decoders refuse it. What gets past the
 prologue and fails later is a count that overruns by a record or two, and there
-the answer section is read and checked exactly as it always was: a private
+the answer section is read and checked as in any other message: a private
 address in it is still found and the answer still refused. What the attacker
 buys with the malformed tail is a decode that stops early, not an address that
 goes unlooked-at.
@@ -348,7 +348,7 @@ goes unlooked-at.
 The exception is an answer carrying SVCB or HTTPS. RFC 9460 section 5 has the
 client take addresses for the target out of the additional section - see
 `first_private_answer` - so there the part that did not read is a part that is
-acted on, and the message is refused as it was before.
+acted on, and the message is refused.
 
 A record the decoder kept as `Rdata_Raw` is the other way a message can be
 unreadable without saying so. `decode_record` does not fail on RDATA it cannot

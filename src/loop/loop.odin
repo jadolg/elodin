@@ -48,8 +48,9 @@ Loop :: struct {
 	// Live fibers, for `cancel_all`.
 	live:                ^Fiber,
 	alive:               int,
-	// Guards the free lists, `posted`, `alive` and `stopping`, which other threads
-	// reach through `spawn` and `post`.
+	// Guards the free lists and their warm-stack counts, `posted`, `signalled`,
+	// `alive` and `stopping`, which other threads reach through `spawn`, `post`
+	// and `stop`.
 	mu:                  sync.Mutex,
 	// Free fibers that still hold a stack, and free fibers that do not.
 	free_warm:           ^Fiber,

@@ -159,9 +159,8 @@ Three sections of 65535 records fit in a header that is seventeen bytes long in
 total, and the array they ask `scan_ttl_offsets` to reserve is 384 KiB, spent on
 a walk that fails at the first name.
 
-Written when `cap_ttls` walked undecoded bytes through this scan and every query
-paid for it. It does its own walk and allocates nothing now, so the guard stands
-for `cache.put`, whose counts come from a caller rather than from this package.
+`cap_ttls` does its own walk and allocates nothing, so the guard stands for
+`cache.put`, whose counts come from a caller rather than from this package.
 
 Tracked rather than asserted on the outcome, because the outcome cannot tell the
 two apart: the message is refused either way, and what is under test is what was
