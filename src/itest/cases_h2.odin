@@ -631,12 +631,12 @@ run_h2_cases :: proc(r: ^Runner) {
 	GOAWAY(NO_ERROR), as HTTP/1.1 closes it (#642). The status is read from the
 	wire: an encoder that cannot spell a status sends 500.
 
-	The request is followed by more than the server reads before it stops, and
-	read only once the refusal is logged, after the close: a close with bytes
-	unread is an RST, which RFC 1122 4.2.2.13 lets this end's kernel answer by
-	discarding the 403 and the GOAWAY unless the server drained first. Linux hands
-	over what it already holds, the server's close_notify included, and leaves the
-	reset pending on the socket - so that pending error is what is checked.
+	The request is followed by more than the server reads before it stops. A close
+	with bytes unread is an RST, which RFC 1122 4.2.2.13 lets this end's kernel
+	answer by discarding the 403 and the GOAWAY unless the server drained first.
+	Linux hands over what it already holds, the server's close_notify included, so
+	what is checked is what comes after that on the socket: the end of the stream,
+	not a reset.
 	*/
 	start_case(r, "h2: a connection held across a reload that drops its network from allow_from gets 403, then GOAWAY")
 	{
@@ -655,8 +655,8 @@ run_h2_cases :: proc(r: ^Runner) {
 			if check(r, reload_to(r, &srv, narrowed, "msg=reloaded"), "the reload was never logged") {
 				NEEDLE :: "no longer admits"
 				before := log_count(&srv, NEEDLE)
-				// Four TLS records of PINGs behind the request, in the same write: more
-				// than one read takes, there before the server answers.
+				// 68 KB of PINGs behind the request (five TLS records), in the same
+				// write: more than one read takes, there before the server answers.
 				pings := make([dynamic]u8, 0, 4000 * 17, context.temp_allocator)
 				for _ in 0 ..< 4000 {
 					h2.write_frame_header(&pings, 8, .Ping, 0, 0)
@@ -678,10 +678,14 @@ run_h2_cases :: proc(r: ^Runner) {
 					end = .Closed if err == .None && n == 0 else err
 				}
 				check(r, end == .Closed, "the refused connection ended with %v, not a close", end)
-				so_err: posix.Errno
-				so_len := posix.socklen_t(size_of(so_err))
-				if check(r, posix.getsockopt(posix.FD(c.conn.socket), posix.SOL_SOCKET, .ERROR, &so_err, &so_len) == .OK, "cannot read SO_ERROR") {
-					check(r, so_err == .NONE, "the refused connection was reset: %v", so_err)
+				// Past the close_notify the socket holds the FIN or the RST, whichever
+				// the close sent; the socket is non-blocking under TLS, hence the poll.
+				fd := posix.FD(c.conn.socket)
+				pfd := posix.pollfd{fd = fd, events = {.IN}}
+				if check(r, posix.poll(&pfd, 1, 5000) == 1, "the refused connection was never closed") {
+					tail: [1]u8
+					n := posix.recv(fd, &tail, 1, {})
+					check(r, n == 0, "the refused connection ended with %d, %v, not a close", n, posix.errno())
 				}
 			}
 		}

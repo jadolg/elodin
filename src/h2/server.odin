@@ -1764,10 +1764,13 @@ goaway :: proc(c: ^Conn, code: Error_Code) {
 
 /*
 End the connection from a handler: GOAWAY(NO_ERROR), which RFC 9113 6.8 says an
-endpoint SHOULD send before closing, and `serve` reads nothing after it. Streams
-already started are not waited for: once `serve` returns their writes are refused.
-6.8 says such streams "might still complete", which does not oblige them to, and
-the peer is told only that they may have been processed.
+endpoint SHOULD send before closing. Called inline, from the handler `dispatch`
+runs on the reader, `serve` reads nothing after it; `dispatch` is where that is
+checked, so from a fiber of the handler's own it takes effect only at the next
+request the reader dispatches. Streams already started are not waited for: once
+`serve` returns their writes are refused. 6.8 says such streams "might still
+complete", which does not oblige them to, and the peer is told only that they may
+have been processed.
 */
 shutdown :: proc(c: ^Conn) {
 	goaway(c, .No_Error)
