@@ -153,9 +153,8 @@ check_keys :: proc(l: ^Loader, n: ^yaml.Node, path: string, known: ..string) -> 
 /*
 Whether `dst` was set: false for a key left out or null (bare, `~` or `null`;
 a quoted "" is a string), which keeps the default, and false with an error for a
-list or a mapping. A key read as one word
-from a fixed set goes through here too, so `type: [tls]` is refused rather than
-taken for no `type` at all.
+list or a mapping. A key read as one word from a fixed set goes through here
+too, so `type: [tls]` is refused rather than taken for no `type` at all.
 */
 @(private)
 opt_string :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^string, path: string) -> bool {

@@ -1,5 +1,6 @@
 package config
 
+import "core:slice"
 import "core:strings"
 import "core:testing"
 
@@ -67,8 +68,18 @@ plaintext sent with nothing said.
 test_upstream_type_list_does_not_load_as_udp :: proc(t: ^testing.T) {
 	src := "upstream:\n  servers:\n    - address: 1.1.1.1\n      type: [tls]\n"
 	cfg, err := load_string(src, context.temp_allocator)
-	_, has := err.?
-	testing.expectf(t, has, "type: [tls] loaded, as %v", cfg.upstream.servers)
+	e, has := err.?
+	if !testing.expectf(t, has, "type: [tls] loaded, as %v", cfg.upstream.servers) {
+		return
+	}
+	// Refused for the `type`, not for some other reason that would pass this
+	// with the list still read as no `type`.
+	testing.expectf(
+		t,
+		slice.contains(e.messages, "upstream.servers[0].type: expected a string"),
+		"refused for something else: %v",
+		e.messages,
+	)
 }
 
 // A key written empty (`type:` or `type: ~`) is still the key left out, and a
