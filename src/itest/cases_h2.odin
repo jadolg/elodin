@@ -2,9 +2,11 @@ package itest
 
 import "core:fmt"
 import "core:strings"
+import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
 import "elodin:h2"
+import "elodin:tlsx"
 
 /*
 DoH over HTTP/2.
@@ -628,6 +630,13 @@ run_h2_cases :: proc(r: ^Runner) {
 	connection's next request is refused 403 and the connection ended with
 	GOAWAY(NO_ERROR), as HTTP/1.1 closes it (#642). The status is read from the
 	wire: an encoder that cannot spell a status sends 500.
+
+	The request is followed by more than the server reads before it stops, and
+	read only once the refusal is logged, after the close: a close with bytes
+	unread is an RST, which RFC 1122 4.2.2.13 lets this end's kernel answer by
+	discarding the 403 and the GOAWAY unless the server drained first. Linux hands
+	over what it already holds, the server's close_notify included, and leaves the
+	reset pending on the socket - so that pending error is what is checked.
 	*/
 	start_case(r, "h2: a connection held across a reload that drops its network from allow_from gets 403, then GOAWAY")
 	{
@@ -644,15 +653,36 @@ run_h2_cases :: proc(r: ^Runner) {
 				context.temp_allocator,
 			)
 			if check(r, reload_to(r, &srv, narrowed, "msg=reloaded"), "the reload was never logged") {
-				check(r, h2_send_get(c, 3, "/dns-query", query), "cannot send the request")
-				if check(r, h2_collect(c, []u32{3}), "stream 3 never completed") {
-					res, _ := h2_stream(c, 3)
+				NEEDLE :: "no longer admits"
+				before := log_count(&srv, NEEDLE)
+				// Four TLS records of PINGs behind the request, in the same write: more
+				// than one read takes, there before the server answers.
+				pings := make([dynamic]u8, 0, 4000 * 17, context.temp_allocator)
+				for _ in 0 ..< 4000 {
+					h2.write_frame_header(&pings, 8, .Ping, 0, 0)
+					append(&pings, 0, 0, 0, 0, 0, 0, 0, 0)
+				}
+				check(r, h2_send_request(c, 3, "POST", "/dns-query", query, then = pings[:]), "cannot send the request")
+				check(r, wait_for_log_count(&srv, NEEDLE, before + 1, 5 * time.Second), "the refusal was never logged")
+				for !c.goaway && h2_pump(c) {}
+				res, found := h2_stream(c, 3)
+				if check(r, found, "stream 3 was never answered") {
 					check_eq_int(r, res.status, 403, "status after the reload")
 				}
-				// The 403 and the GOAWAY are one burst; read until the close.
-				for !c.goaway && h2_pump(c) {}
 				check(r, c.goaway, "the refused connection was not sent GOAWAY")
 				check(r, c.goaway_code == .No_Error, "GOAWAY code %v, want NO_ERROR", c.goaway_code)
+				end := tlsx.Error.None
+				for end == .None {
+					rest: [4096]u8
+					n, err := tlsx.read(c.conn.tls, rest[:])
+					end = .Closed if err == .None && n == 0 else err
+				}
+				check(r, end == .Closed, "the refused connection ended with %v, not a close", end)
+				so_err: posix.Errno
+				so_len := posix.socklen_t(size_of(so_err))
+				if check(r, posix.getsockopt(posix.FD(c.conn.socket), posix.SOL_SOCKET, .ERROR, &so_err, &so_len) == .OK, "cannot read SO_ERROR") {
+					check(r, so_err == .NONE, "the refused connection was reset: %v", so_err)
+				}
 			}
 		}
 	}

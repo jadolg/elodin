@@ -195,6 +195,9 @@ h2_send_request :: proc(
 	// END_STREAM - or nothing does, with `trailers_end_stream` unset.
 	trailers: []H2_Field = nil,
 	trailers_end_stream := true,
+	// Frames sent behind the request in the same write, so that they reach the
+	// server with it rather than after it has answered.
+	then: []u8 = nil,
 ) -> bool {
 	block := make([dynamic]u8, 0, 128, context.temp_allocator)
 	if table_update >= 0 {
@@ -238,6 +241,7 @@ h2_send_request :: proc(
 		h2.write_frame_header(&out, len(tail), .Headers, h2.FLAG_END_HEADERS | (h2.FLAG_END_STREAM if trailers_end_stream else 0), stream_id)
 		append(&out, ..tail[:])
 	}
+	append(&out, ..then)
 	return conn_write(&c.conn, out[:])
 }
 

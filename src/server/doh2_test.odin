@@ -125,53 +125,39 @@ wrote_a_body :: proc(out: []u8) -> bool {
 	return false
 }
 
-// How many frames of `type` the connection wrote, and the error code of the
-// last GOAWAY among them when that is the type asked for.
+// How many frames of `type` the connection wrote, and the payload of the first.
 @(private = "file")
-frames_of :: proc(out: []u8, type: u8) -> (count: int, code: u32) {
-	pos := 0
-	for pos + 9 <= len(out) {
-		length := int(out[pos]) << 16 | int(out[pos + 1]) << 8 | int(out[pos + 2])
-		if pos + 9 + length > len(out) {
-			break
+frames_of :: proc(out: []u8, type: h2.Frame_Type) -> (count: int, first: []u8) {
+	rest := out
+	for {
+		h, ok := h2.parse_frame_header(rest)
+		if !ok || h2.FRAME_HEADER_SIZE + h.length > len(rest) {
+			return
 		}
-		if out[pos + 3] == type {
-			count += 1
-			if type == 0x7 && length >= 8 {
-				p := out[pos + 13:]
-				code = u32(p[0]) << 24 | u32(p[1]) << 16 | u32(p[2]) << 8 | u32(p[3])
+		if h.type == type {
+			if count == 0 {
+				first = rest[h2.FRAME_HEADER_SIZE:][:h.length]
 			}
+			count += 1
 		}
-		pos += 9 + length
+		rest = rest[h2.FRAME_HEADER_SIZE + h.length:]
 	}
-	return
 }
 
-// The `:status` of the first response HEADERS, decoded: HPACK sends the common
-// codes (200, 404, 500 among them) as a static table index, not as digits.
+// The `:status` in a HEADERS block, decoded: HPACK sends the common codes (200,
+// 404, 500 among them) as a static table index, not as digits.
 @(private = "file")
-response_status :: proc(out: []u8) -> string {
-	pos := 0
-	for pos + 9 <= len(out) {
-		length := int(out[pos]) << 16 | int(out[pos + 1]) << 8 | int(out[pos + 2])
-		if pos + 9 + length > len(out) {
-			break
+response_status :: proc(block: []u8) -> string {
+	table: h2.Dynamic_Table
+	h2.dynamic_table_init(&table, 4096, context.temp_allocator)
+	fields, err := h2.decode(&table, block, context.temp_allocator)
+	if err != .None {
+		return ""
+	}
+	for f in fields {
+		if f.name == ":status" {
+			return f.value
 		}
-		if out[pos + 3] == 0x1 {
-			table: h2.Dynamic_Table
-			h2.dynamic_table_init(&table, 4096, context.temp_allocator)
-			fields, err := h2.decode(&table, out[pos + 9:pos + 9 + length], context.temp_allocator)
-			if err != .None {
-				return ""
-			}
-			for f in fields {
-				if f.name == ":status" {
-					return f.value
-				}
-			}
-			return ""
-		}
-		pos += 9 + length
 	}
 	return ""
 }
@@ -326,15 +312,19 @@ test_doh2_a_held_connection_outside_the_allow_list_gets_403 :: proc(t: ^testing.
 	got := serve_one(&cfg, "/not-the-endpoint", "403", occupy = false, peer = outside, requests = 2)
 	defer delete(got.output)
 
-	// Not 404 either: a source outside the allow list is told nothing about paths.
-	testing.expect_value(t, response_status(got.output[:]), "403")
-	testing.expect_value(t, got.refused, 1)
-	answered, _ := frames_of(got.output[:], 0x1)
+	answered, headers := frames_of(got.output[:], .Headers)
 	testing.expect_value(t, answered, 1)
+	// Not 404 either: a source outside the allow list is told nothing about paths.
+	testing.expect_value(t, response_status(headers), "403")
+	testing.expect_value(t, got.refused, 1)
 	// RFC 9113 6.8: a GOAWAY before closing, and NO_ERROR, since the peer did nothing wrong.
-	goaways, code := frames_of(got.output[:], 0x7)
+	goaways, goaway := frames_of(got.output[:], .Goaway)
 	testing.expect_value(t, goaways, 1)
-	testing.expect_value(t, code, u32(h2.Error_Code.No_Error))
+	if testing.expect(t, len(goaway) == 8, "GOAWAY payload is not 8 bytes") {
+		code := u32(goaway[4]) << 24 | u32(goaway[5]) << 16 | u32(goaway[6]) << 8 | u32(goaway[7])
+		testing.expect_value(t, code, u32(h2.Error_Code.No_Error))
+	}
+	free_all(context.temp_allocator)
 }
 
 /*

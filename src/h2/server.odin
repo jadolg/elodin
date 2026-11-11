@@ -392,14 +392,6 @@ serve :: proc(c: ^Conn) {
 		if !handle_frame(c, h, payload) {
 			return
 		}
-		// A handler can end the connection too, through `shutdown`; nothing is
-		// read past a GOAWAY this end has sent.
-		loop.lock(&c.mu)
-		done := c.goaway_sent
-		loop.unlock(&c.mu)
-		if done {
-			return
-		}
 		free_all(context.temp_allocator)
 	}
 }
@@ -1646,7 +1638,12 @@ dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
 	s.dispatched = true
 	loop.unlock(&c.mu)
 	c.handler(c, req)
-	return true
+	// A handler can end the connection too, through `shutdown`, and nothing is
+	// read past a GOAWAY this end has sent. Asked here, once per request, rather
+	// than once per frame in `serve`: the handler runs inline on the reader.
+	loop.lock(&c.mu)
+	defer loop.unlock(&c.mu)
+	return !c.goaway_sent
 }
 
 // Release a request once its handler is finished with it.
@@ -1768,7 +1765,9 @@ goaway :: proc(c: ^Conn, code: Error_Code) {
 /*
 End the connection from a handler: GOAWAY(NO_ERROR), which RFC 9113 6.8 says an
 endpoint SHOULD send before closing, and `serve` reads nothing after it. Streams
-already started may still answer until `serve` returns.
+already started are not waited for: once `serve` returns their writes are refused.
+6.8 says such streams "might still complete", which does not oblige them to, and
+the peer is told only that they may have been processed.
 */
 shutdown :: proc(c: ^Conn) {
 	goaway(c, .No_Error)
