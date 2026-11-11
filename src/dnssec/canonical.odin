@@ -72,7 +72,6 @@ name_drop_labels :: proc(name: string, count: int) -> string {
 	return out
 }
 
-
 @(private)
 split_labels :: proc "contextless" (wire: []u8, out: [][]u8) -> int {
 	n := 0

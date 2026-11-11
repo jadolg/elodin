@@ -107,6 +107,22 @@ test_a_rebuild_that_drops_its_opt_record_is_refused :: proc(t: ^testing.T) {
 	plain := growing_answer(true, srvs = SRVS)
 	data := make([]u8, 20, context.temp_allocator)
 
+	// The premise: with the option in it, the re-encode keeps every answer and
+	// drops the OPT record without TC. Without that, a refusal below proves nothing.
+	pm, pderr := decode_message(plain, context.temp_allocator)
+	testing.expect_value(t, pderr, Decode_Error.None)
+	if testing.expect(t, len(pm.additional) == 2 && pm.additional[0].type == .OPT, "the fixture's OPT record is not first") {
+		options := []EDNS_Option{{code = u16(EDNS_Option_Code.NSID), data = data}}
+		pm.additional[0].data = Rdata_OPT{options = options}
+		encoded, truncated, eerr := encode_message(pm, context.temp_allocator, MAX_MESSAGE)
+		testing.expect_value(t, eerr, Encode_Error.None)
+		testing.expect(t, !truncated, "the re-encode is cut, so this is the other test's shape")
+		if eerr == .None {
+			arcount := int(u16(encoded[10]) << 8 | u16(encoded[11]))
+			testing.expectf(t, arcount == 1, "the re-encode keeps %d additional records, so the OPT record was not dropped", arcount)
+		}
+	}
+
 	out, ok := set_edns_option(plain, .NSID, data, context.temp_allocator)
 	if !ok {
 		free_all(context.temp_allocator)

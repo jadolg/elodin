@@ -1479,6 +1479,7 @@ test_name_below_counts_labels_not_suffix_bytes :: proc(t: ^testing.T) {
 		{"WWW.Example.COM.", "example.com.", true, true},
 		{"example.com.", "example.com.", false, true},
 		{"notexample.com.", "example.com.", false, false},
+		{"example.org.", "example.com.", false, false},
 		{"com.", "example.com.", false, false},
 		// The root holds every name but itself.
 		{"www.example.com.", ".", true, true},

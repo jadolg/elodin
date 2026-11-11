@@ -1197,30 +1197,6 @@ load_route_domains :: proc(
 }
 
 /*
-Whether `name` is `zone` or sits under it, both already canonical.
-
-The resolver's own `name_at_or_below` folds case because the names reaching it
-are whatever the client spelled. Nothing here is: both sides have been through
-`canonical_domain` or are written lowercase in this file, so the comparison is
-bytes and the fold would only hide a name that failed to be canonicalised.
-*/
-@(private)
-domain_at_or_below :: proc(name, zone: string) -> bool {
-	if len(name) < len(zone) {
-		return false
-	}
-	if len(name) == len(zone) {
-		return name == zone
-	}
-	// The zone has to begin right after a label break, or it is a bare string
-	// suffix of some other name rather than a subtree of it.
-	if name[len(name) - len(zone) - 1] != '.' {
-		return false
-	}
-	return name[len(name) - len(zone):] == zone
-}
-
-/*
 A route into a zone the special-use table already answers never fires.
 
 `special_use_zone` runs in `resolve_query` before anything is forwarded, so a
@@ -1251,7 +1227,7 @@ check_route_reachable :: proc(l: ^Loader, cfg: ^Config, route: Zone_Route) {
 	but that it will never fire.
 	*/
 	for domain in route.domains {
-		if domain_at_or_below(domain, "resolver.arpa.") {
+		if dns.name_at_or_below(domain, "resolver.arpa.") {
 			errorf(
 				l,
 				"upstream.zones: the route for %s would never be used: this server answers resolver.arpa. itself, for DDR (RFC 9462), before a query is forwarded",
@@ -1295,7 +1271,7 @@ check_route_reachable :: proc(l: ^Loader, cfg: ^Config, route: Zone_Route) {
 	}
 	for domain in route.domains {
 		for entry in table {
-			if !entry.on || !domain_at_or_below(domain, entry.zone) {
+			if !entry.on || !dns.name_at_or_below(domain, entry.zone) {
 				continue
 			}
 			errorf(
@@ -1346,7 +1322,7 @@ route_is_anchored :: proc(cfg: ^Config, route: Zone_Route) -> bool {
 			// Both sides canonical: `canonical_domain` made the route's, and
 			// `parse_trust_anchor` runs the anchor's through
 			// `dns.name_canonical`.
-			if domain_at_or_below(domain, anchor.zone) {
+			if dns.name_at_or_below(domain, anchor.zone) {
 				covered = true
 				break
 			}
@@ -1937,7 +1913,7 @@ check_ddr :: proc(l: ^Loader, cfg: ^Config) {
 		return
 	}
 	bare := strings.trim_suffix(name, ".")
-	if bare == "" || domain_at_or_below(name, "resolver.arpa.") {
+	if bare == "" || dns.name_at_or_below(name, "resolver.arpa.") {
 		errorf(l, "ddr.name: %q cannot be designated: RFC 9462 section 4 forbids the root and resolver.arpa as the target", name)
 		return
 	}

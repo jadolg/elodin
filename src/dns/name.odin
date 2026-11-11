@@ -293,8 +293,9 @@ name.
 
 `server.name_below` is this, and calls it: the server package asks the question
 of configured zones and wildcards, `encode_message` asks it, through
-`name_at_or_below`, of a delegation it is about to drop glue from, and
-`dnssec` asks it of a signer's bailiwick. One answer, so none of
+`name_at_or_below`, of a delegation it is about to drop glue from,
+`dnssec` asks it of a signer's bailiwick, and `config` of the routes it
+checks against the zones answered locally. One answer, so none of
 them can be tightened without the others following.
 */
 name_below :: proc(name, zone: string) -> bool {
@@ -308,20 +309,20 @@ name_at_or_below :: proc(name, zone: string) -> bool {
 	if zone == "." {
 		return true
 	}
-	// Each label start in turn, so only a real break can begin the zone.
+	// The suffix first, which turns most names away without a walk.
+	start := len(name) - len(zone)
+	if start < 0 || !name_equal_fold(name[start:], zone) {
+		return false
+	}
+	// Then the label starts, so only a real break can begin the zone.
 	i := 0
-	for {
-		if len(name) - i == len(zone) {
-			return name_equal_fold(name[i:], zone)
-		}
-		if len(name) - i < len(zone) {
-			return false
-		}
+	for i < start {
 		for i < len(name) && name[i] != '.' {
 			i += 2 if name[i] == '\\' else 1
 		}
 		i += 1
 	}
+	return i == start
 }
 
 // "www.example.com." -> "example.com."; "." -> "."
