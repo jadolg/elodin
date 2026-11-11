@@ -1,7 +1,6 @@
 package yaml
 
 import "core:mem"
-import "core:strconv"
 import "core:strings"
 
 /*
@@ -896,26 +895,35 @@ unquote_scalar :: proc(p: ^Parser, s: string, line_num: int, flow := false, key 
 				strings.write_byte(&b, '"')
 			case '/':
 				strings.write_byte(&b, '/')
-			case 'x':
-				if i + 2 >= len(inner) {
+			// The rest of YAML 1.2 section 5.7's list.
+			case ' ', '\t':
+				strings.write_byte(&b, inner[i])
+			case 'a':
+				strings.write_byte(&b, 0x07)
+			case 'b':
+				strings.write_byte(&b, 0x08)
+			case 'e':
+				strings.write_byte(&b, 0x1b)
+			case 'f':
+				strings.write_byte(&b, 0x0c)
+			case 'v':
+				strings.write_byte(&b, 0x0b)
+			case 'N':
+				strings.write_rune(&b, 0x85)
+			case '_':
+				strings.write_rune(&b, 0xa0)
+			case 'L':
+				strings.write_rune(&b, 0x2028)
+			case 'P':
+				strings.write_rune(&b, 0x2029)
+			case 'x', 'u', 'U':
+				width := 2 if inner[i] == 'x' else 4 if inner[i] == 'u' else 8
+				r, rok := hex_escape(inner, i + 1, width)
+				if !rok {
 					return "", true
 				}
-				v, vok := strconv.parse_u64_of_base(inner[i + 1:i + 3], 16)
-				if !vok {
-					return "", true
-				}
-				strings.write_byte(&b, u8(v))
-				i += 2
-			case 'u':
-				if i + 4 >= len(inner) {
-					return "", true
-				}
-				v, vok := strconv.parse_u64_of_base(inner[i + 1:i + 5], 16)
-				if !vok {
-					return "", true
-				}
-				strings.write_rune(&b, rune(v))
-				i += 4
+				strings.write_rune(&b, r)
+				i += width
 			case:
 				return "", true
 			}
@@ -924,4 +932,39 @@ unquote_scalar :: proc(p: ^Parser, s: string, line_num: int, flow := false, key 
 		return strings.to_string(b), false
 	}
 	return s, false
+}
+
+/*
+The code point a `\x`, `\u` or `\U` escape names: exactly `width` hex digits
+at `at`. YAML 1.2 section 5.7 makes each a Unicode character, so `\xe9` is "é"
+in UTF-8 rather than the byte 0xE9, and a surrogate half or a value past
+U+10FFFF is no character at all.
+Digits only, where `strconv` would also take a sign or a `_`.
+*/
+@(private)
+hex_escape :: proc(s: string, at, width: int) -> (r: rune, ok: bool) {
+	if at + width > len(s) {
+		return 0, false
+	}
+	v: u32
+	for c in transmute([]u8)s[at:at + width] {
+		d := hex_digit(c) or_return
+		v = v * 16 + u32(d)
+	}
+	// A surrogate half, or past the last code point, is no character.
+	return rune(v), v <= 0x10ffff && (v < 0xd800 || v > 0xdfff)
+}
+
+// A hex digit's value, for the escapes above and `as_int`'s bases.
+@(private)
+hex_digit :: proc(c: u8) -> (d: u8, ok: bool) {
+	switch c {
+	case '0' ..= '9':
+		return c - '0', true
+	case 'a' ..= 'f':
+		return c - 'a' + 10, true
+	case 'A' ..= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }

@@ -352,9 +352,9 @@ test_dr_fixture_names_do_not_collide_in_non_cut_table :: proc(t: ^testing.T) {
 	slots: [dynamic]int
 	defer delete(slots)
 
-	// The 8 labels below the apex:
+	// The 8 labels below the apex, DR_QNAME itself first:
 	for i in 1 ..= 8 {
-		name := name_drop_labels(DR_QNAME, 9 - i)
+		name := name_drop_labels(DR_QNAME, i - 1)
 		slot := non_cut_slot(v, name)
 		for existing in slots {
 			testing.expectf(

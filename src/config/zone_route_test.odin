@@ -296,6 +296,18 @@ test_a_route_under_an_enabled_special_use_zone_is_refused :: proc(t: ^testing.T)
 	)
 	testing.expect(t, rerr == nil, "a route under a private reverse zone was refused")
 	testing.expect_value(t, len(routed.upstream.zones), 1)
+	// `a\.test` is one label under the root, not a name under `test.`, and it
+	// is kept in the decoder's spelling, `a\046test.`, which is how a query for
+	// it reads off the wire - so the route is not refused, and it does fire.
+	escaped, eerr := load_string(
+		"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: ['a\\.test']\n      servers: [10.0.0.1]\n" +
+		"special_use:\n  test: true\n",
+		context.temp_allocator,
+	)
+	testing.expectf(t, eerr == nil, "a route whose dot is escaped was read as one under test.: %v", eerr)
+	if testing.expect_value(t, len(escaped.upstream.zones), 1) && testing.expect_value(t, len(escaped.upstream.zones[0].domains), 1) {
+		testing.expect_value(t, escaped.upstream.zones[0].domains[0], "a\\046test.")
+	}
 	free_all(context.temp_allocator)
 }
 

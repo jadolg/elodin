@@ -540,7 +540,7 @@ nsec3_closest_encloser :: proc(
 	match: Nsec3_Rr,
 	ok: bool,
 ) {
-	if !name_in_zone(qname, zone) {
+	if !dns.name_at_or_below(qname, zone) {
 		return "", "", {}, false
 	}
 	name := qname

@@ -1336,32 +1336,7 @@ being guarded against is a field nobody thought to check.
 */
 @(test)
 test_stats_of_carries_every_counter :: proc(t: ^testing.T) {
-	// Distinct values, so a snapshot that reads the wrong field is a failure
-	// rather than a coincidence.
-	want := Stats {
-		queries      = 1,
-		blocked      = 2,
-		cached       = 3,
-		forwarded    = 4,
-		failed       = 5,
-		rewritten    = 6,
-		dropped      = 7,
-		refused      = 8,
-		conn_refused = 9,
-		conn_failed  = 10,
-		handshakes   = 11,
-		secure       = 12,
-		bogus        = 13,
-		// Distinct and non-zero like the rest: whole-struct equality cannot fail
-		// over a field the snapshot drops if the value it was given was zero.
-		rebind       = 14,
-		special_use  = 15,
-		// Not a connection and not a query - see `Stats.accept_backoff` - but
-		// carried by the same snapshot, and dropped by it just as silently.
-		accept_backoff = 16,
-		unreadable_rcode = 17,
-		coalesced = 18,
-	}
+	want := DISTINCT_STATS
 	s := Server {
 		stats = want,
 	}

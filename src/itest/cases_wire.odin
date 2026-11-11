@@ -52,6 +52,34 @@ empty_character_strings_answer :: proc(name: string, allocator := context.alloca
 
 
 /*
+An SRV answer near 64 KiB whose re-encode does not fit a stream message.
+
+Every owner and every target is a pointer at the question name, so each record
+is 20 bytes as sent and 37 once the encoder writes the target in full, as it
+writes every SRV target. The OPT record is followed by an A record, so taking
+it out for a client that asked without EDNS has to decode and encode the whole
+message again rather than cut bytes off the end.
+*/
+@(private = "file")
+GROWING_QNAME :: "srvgrow.wire.test."
+@(private = "file")
+GROWING_SRVS :: 3200
+
+@(private = "file")
+growing_srv_answer :: proc(allocator := context.allocator) -> []u8 {
+	buf := make([dynamic]u8, 0, 65535, allocator)
+	append(&buf, 0, 0, 0x81, 0x80, 0, 1, u8(GROWING_SRVS >> 8), u8(GROWING_SRVS & 0xff), 0, 0, 0, 2)
+	append(&buf, 7, 's', 'r', 'v', 'g', 'r', 'o', 'w', 4, 'w', 'i', 'r', 'e', 4, 't', 'e', 's', 't', 0, 0, 33, 0, 1)
+	for _ in 0 ..< GROWING_SRVS {
+		// owner, SRV IN, TTL 300, RDLENGTH 8, priority 1 weight 1 port 53, target
+		append(&buf, 0xc0, 0x0c, 0, 33, 0, 1, 0, 0, 1, 0x2c, 0, 8, 0, 1, 0, 1, 0, 53, 0xc0, 0x0c)
+	}
+	append(&buf, 0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0)
+	append(&buf, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4, 192, 0, 2, 1)
+	return buf[:]
+}
+
+/*
 A reply whose names cost a whole reading's budget, out of a few kilobytes.
 
 Issue #298's shape - MX records whose owner and exchange are both two-byte
@@ -228,6 +256,9 @@ run_wire_cases :: proc(r: ^Runner) {
 		return
 	}
 	mock_truncate_udp(mock, "manystrings.wire.test.", u16(dns.Type.TXT), empty_strings)
+	growing := growing_srv_answer()
+	defer delete(growing)
+	mock_truncate_udp(mock, GROWING_QNAME, u16(dns.Type.SRV), growing)
 
 	bomb_query := build_query("namebomb.wire.test.", u16(dns.Type.MX), id = 0x5151, allocator = context.allocator)
 	defer delete(bomb_query)
@@ -620,6 +651,32 @@ run_wire_cases :: proc(r: ^Runner) {
 			if check(r, len(res.wire) == len(empty_strings), "length: got %d, want %d", len(res.wire), len(empty_strings)) {
 				check(r, bytes_equal(res.wire[2:], empty_strings[2:]), "payload differs from what the upstream sent")
 			}
+		}
+	}
+	end_case(r)
+
+	/*
+	A client that asked without EDNS has the upstream's OPT record taken out,
+	and here that means a rebuild that outgrows `MAX_MESSAGE`. Kept, the
+	encoder's cut would reach the client with records dropped and TC set - over
+	the TCP connection TC tells it to retry on. Refused, the answer is SERVFAIL
+	(RFC 6891 section 6.1.1 still keeps the upstream's record from the client).
+	*/
+	start_case(r, "wire: an answer whose rebuild outgrows a stream message is not cut with TC")
+	{
+		query := build_query(GROWING_QNAME, u16(dns.Type.SRV))
+		res := query_tcp(udp_port, query)
+		if check(r, res.ok, "no response") {
+			h := parse_header(r, res.wire)
+			check(r, !h.tc, "the TC bit was set on a TCP answer of %d records", h.ancount)
+			check(
+				r,
+				h.ancount == GROWING_SRVS || h.rcode == int(dns.Rcode.Serv_Fail),
+				"got %d of %d records with rcode %d",
+				h.ancount,
+				GROWING_SRVS,
+				h.rcode,
+			)
 		}
 	}
 	end_case(r)

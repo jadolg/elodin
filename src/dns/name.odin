@@ -284,30 +284,46 @@ deliberately, so that a response can echo the question back byte for byte. That
 rules out any byte-wise shortcut on the suffix, however tempting one looks in
 front of the fold.
 
-The zone has to begin right after a label break, or "notexample.com." would
-count as a name below "example.com.".
+Asked label by label: the zone has to begin right after a label break, or
+"notexample.com." would count as a name below "example.com.", and a dot escaped
+inside a label (`\046` as the decoder and `name_canonical` spell it, or `\.`)
+is part of that label rather than a break - so "a\.example.com." is one label
+under "com.", not a name below "example.com.". The root is below nothing and holds every other
+name.
 
 `server.name_below` is this, and calls it: the server package asks the question
-of configured zones and wildcards, and `encode_message` asks it, through
-`name_at_or_below`, of a delegation it is about to drop glue from. One answer, so neither can be tightened without
-the other following.
+of configured zones and wildcards, `encode_message` asks it, through
+`name_at_or_below`, of a delegation it is about to drop glue from,
+`dnssec` asks it of a signer's bailiwick, and `config` of the routes it
+checks against the zones answered locally. One answer, so none of
+them can be tightened without the others following.
 */
 name_below :: proc(name, zone: string) -> bool {
-	if len(name) <= len(zone) {
-		return false
-	}
-	if name[len(name) - len(zone) - 1] != '.' {
-		return false
-	}
-	return name_equal_fold(name[len(name) - len(zone):], zone)
+	// At or below, and not by matching the whole name: `name_at_or_below` only
+	// matches at a label start, so the same length is the zone itself.
+	return len(name) != len(zone) && name_at_or_below(name, zone)
 }
 
 // `name_below`, with the zone's own name counting as inside it.
 name_at_or_below :: proc(name, zone: string) -> bool {
-	if len(name) == len(zone) {
-		return name_equal_fold(name, zone)
+	if zone == "." {
+		return true
 	}
-	return name_below(name, zone)
+	// A dot before the zone and then the suffix, which turn most names away
+	// without a walk. The dot is needed but not enough: it may be escaped.
+	start := len(name) - len(zone)
+	if start < 0 || (start > 0 && name[start - 1] != '.') || !name_equal_fold(name[start:], zone) {
+		return false
+	}
+	// Then the label starts, so only a real break can begin the zone.
+	i := 0
+	for i < start {
+		for i < len(name) && name[i] != '.' {
+			i += 2 if name[i] == '\\' else 1
+		}
+		i += 1
+	}
+	return i == start
 }
 
 // "www.example.com." -> "example.com."; "." -> "."
@@ -338,10 +354,32 @@ name_trim_root :: proc(name: string) -> string {
 	return name
 }
 
-// Accepts "example.com" or "example.com." and returns the canonical form, or
-// false where the allocator ran dry: an empty result would read as the root.
+/*
+Accepts "example.com" or "example.com." and returns the canonical form, or false
+where the allocator ran dry: an empty result would read as the root.
+
+Spelled as `decode_name` spells it, so a name written in configuration compares
+equal to the same name read off the wire. RFC 1035 section 5.1 lets `a\.b` and
+`a\046b` both write the label "a.b", and the decoder writes only the second; a
+UTF-8 byte is `\DDD` there too. Folded in ASCII only (RFC 4343 section 3), as
+the comparisons are. A name that does not encode keeps its own spelling, for
+the caller's wire check to refuse.
+*/
 name_canonical :: proc(name: string, allocator := context.allocator) -> (canonical: string, ok: bool) #optional_ok {
 	trimmed := name_trim_root(name)
+	// The name as given, not `trimmed`: "a.." without its last dot would
+	// encode, and an empty label is for the caller to refuse.
+	wire: [MAX_NAME_WIRE]u8
+	if n, eerr := encode_name(name, wire[:]); eerr == .None {
+		spelled, _, derr := decode_name(wire[:n], 0, allocator)
+		if derr == .Out_Of_Memory {
+			return "", false
+		}
+		if derr == .None {
+			fold_ascii(transmute([]u8)spelled)
+			return spelled, true
+		}
+	}
 	buf := alloc_slice([]u8, len(trimmed) + 1, allocator) or_return
 	copy(buf, trimmed)
 	buf[len(trimmed)] = '.'

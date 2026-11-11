@@ -642,3 +642,26 @@ test_a_referral_that_drops_out_of_domain_glue_is_not :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+A delegation from the root has every name server inside the zone being
+delegated, so all of its glue is in-domain (RFC 9471 section 3.3) and leaving
+any of it out is a truncation like the one above.
+*/
+@(test)
+test_a_root_referral_that_drops_glue_is_truncated :: proc(t: ^testing.T) {
+	two := referral([]Record{address("a.root-servers.net.", 1), address("a.root-servers.net.", 2)})
+	two.authority[0].name = "."
+	two.authority[0].data = Rdata_Name{name = "a.root-servers.net."}
+	room := encoded_size(t, two) - 1
+
+	wire, truncated, err := encode_message(two, context.temp_allocator, room)
+	testing.expect_value(t, err, Encode_Error.None)
+	testing.expect(t, truncated, "a root referral short of its glue reported no truncation")
+
+	got, derr := decode_message(wire, context.temp_allocator)
+	testing.expect_value(t, derr, Decode_Error.None)
+	testing.expect(t, got.flags.tc, "the resolver was handed a partial root glue set with nothing to say so")
+
+	free_all(context.temp_allocator)
+}

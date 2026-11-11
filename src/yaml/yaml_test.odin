@@ -946,3 +946,47 @@ test_a_plain_scalar_may_not_start_with_an_indicator :: proc(t: ^testing.T) {
 	testing.expectf(t, gok && len(g) == 3 && g[0] == "-1" && g[1] == "?x" && g[2] == "!t", "g: %v", g)
 	free_all(context.temp_allocator)
 }
+
+/*
+`\xNN` is the code point U+00NN (YAML 1.2 section 5.7), written as UTF-8 like
+`\uNNNN`, and both take hex digits only: no sign, no digit separator, and no
+surrogate half, which is not a character.
+*/
+@(test)
+test_hex_escapes_are_code_points_of_hex_digits :: proc(t: ^testing.T) {
+	root, err := parse("a: \"caf\\xe9\"\nb: \"\\u00e9\\x41\"\nc: \"\\U0001F600\"\n", context.temp_allocator)
+	if testing.expectf(t, err == nil, "parse failed: %v", err) {
+		a, _ := as_string(get(root, "a"))
+		testing.expect_value(t, a, "café")
+		b, _ := as_string(get(root, "b"))
+		testing.expect_value(t, b, "éA")
+		c, _ := as_string(get(root, "c"))
+		testing.expect_value(t, c, "\U0001F600")
+	}
+	free_all(context.temp_allocator)
+
+	// The single-character escapes of section 5.7 beside them.
+	named, nerr := parse("a: \"\\a\\b\\e\\f\\v\\ \\\t\\N\\_\\L\\P\"\n", context.temp_allocator)
+	if testing.expectf(t, nerr == nil, "parse failed: %v", nerr) {
+		a, _ := as_string(get(named, "a"))
+		testing.expect_value(t, a, "\a\b\e\f\v \t\u0085\u00a0\u2028\u2029")
+	}
+	free_all(context.temp_allocator)
+
+	refused := []string{
+		"a: \"\\x+1\"\n",
+		"a: \"\\x_4\"\n",
+		"a: \"\\u+041\"\n",
+		"a: \"\\u0_41\"\n",
+		"a: \"\\ud800\"\n",
+		"a: \"\\x4\"\n",
+		"a: \"\\U00110000\"\n",
+		"a: \"\\UFFFFFFFF\"\n",
+		"a: \"\\U0000d800\"\n",
+	}
+	for src in refused {
+		_, rerr := parse(src, context.temp_allocator)
+		testing.expectf(t, rerr != nil, "%q was accepted", src)
+		free_all(context.temp_allocator)
+	}
+}

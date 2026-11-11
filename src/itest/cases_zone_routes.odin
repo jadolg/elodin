@@ -1,7 +1,6 @@
 package itest
 
 import "core:fmt"
-import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "elodin:dns"
@@ -158,7 +157,7 @@ checks off itself, or it is noise where a real warning should be.
 run_route_warning_cases :: proc(r: ^Runner) {
 	write :: proc(r: ^Runner, name, body: string) -> string {
 		path := filepath.join({r.work_dir, name}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(path, transmute([]u8)body)
+		write_fixture(r, path, transmute([]u8)body)
 		return path
 	}
 

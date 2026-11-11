@@ -1,7 +1,6 @@
 package itest
 
 import "core:fmt"
-import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "elodin:dns"
@@ -96,7 +95,7 @@ run_ddr_cases :: proc(r: ^Runner) {
 		udp_port, dot_port, doh_port := next_port(r), next_port(r), next_port(r)
 		config := ddr_config(r, udp_port, dot_port, doh_port, "not-on-the-certificate.example")
 		path := filepath.join({r.work_dir, "ddr-uncovered.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(path, transmute([]u8)config)
+		write_fixture(r, path, transmute([]u8)config)
 		res := run_binary(r, []string{"--config", path, "--check"}, "ddr-uncovered")
 		// A warning, not a failure: the server starts on this file, as below.
 		check(r, res.ok && res.exit_code == 0, "--check failed a file the server starts on: %q", res.output)

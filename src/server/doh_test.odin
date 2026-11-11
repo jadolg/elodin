@@ -1613,6 +1613,7 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 			break
 		}
 		if rerr != nil {
+			net.close(accepted)
 			testing.expectf(t, false, "the client's bytes never finished arriving: %v", rerr)
 			return
 		}

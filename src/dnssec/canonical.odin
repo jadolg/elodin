@@ -72,18 +72,6 @@ name_drop_labels :: proc(name: string, count: int) -> string {
 	return out
 }
 
-// Is `child` at or below `parent`?
-name_in_zone :: proc(child, parent: string) -> bool {
-	if parent == "." {
-		return true
-	}
-	cl, pl := label_count(child), label_count(parent)
-	if cl < pl {
-		return false
-	}
-	return dns.name_equal_fold(name_drop_labels(child, cl - pl), parent)
-}
-
 @(private)
 split_labels :: proc "contextless" (wire: []u8, out: [][]u8) -> int {
 	n := 0

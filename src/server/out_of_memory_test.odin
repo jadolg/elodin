@@ -593,3 +593,21 @@ test_a_refused_reading_is_told_apart_from_a_failed_validation :: proc(t: ^testin
 	testing.expect(t, !reading_refused_verdict(dnssec.Result{status = .Indeterminate, reason = "chain of trust unavailable"}))
 	testing.expect(t, !reading_refused_verdict(dnssec.Result{status = .Bogus, reason = dnssec.READING_OVER_BUDGET}))
 }
+
+/*
+A refresh whose answer cannot be copied into the request's arena is not taken.
+The client is then served the expired entry it was holding, where a copy that
+came back empty and `taken` would be served as the answer: no datagram at all.
+*/
+@(test)
+test_a_refreshed_answer_that_cannot_be_copied_is_not_taken :: proc(t: ^testing.T) {
+	r := Refresh {
+		done     = true,
+		ok       = true,
+		response = []u8{0x06, 0x20, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0},
+		outcome  = .Forwarded,
+	}
+	out, _, _, taken := refresh_take(&r, 0, mem.nil_allocator())
+	testing.expect(t, !taken, "a refreshed answer copied into nothing was taken")
+	testing.expect_value(t, len(out), 0)
+}

@@ -2559,13 +2559,13 @@ test_the_override_lines_say_what_the_estimate_makes_of_them :: proc(t: ^testing.
 	}
 	// 4000 * 128 and 50 * 128, rendered by the `%.1M` every other byte figure
 	// this server prints is rendered by.
-	testing.expect(
+	testing.expectf(
 		t,
 		strings.contains(lines[1], "500.0KiB/s"),
 		"the raised network's line did not say what its budget comes to: %q",
 		lines[1],
 	)
-	testing.expect(
+	testing.expectf(
 		t,
 		strings.contains(lines[2], "6.2KiB/s"),
 		"the lowered network's line did not say what its budget comes to: %q",
@@ -2576,7 +2576,7 @@ test_the_override_lines_say_what_the_estimate_makes_of_them :: proc(t: ^testing.
 	// that does not write one resolves to.
 	quiet := rate_limit_override_lines(overrides, 1232, 1232, context.temp_allocator)
 	if testing.expect_value(t, len(quiet), 3) {
-		testing.expect(
+		testing.expectf(
 			t,
 			!strings.contains(quiet[1], "/s of answers"),
 			"a default estimate put a byte figure on an override's line: %q",

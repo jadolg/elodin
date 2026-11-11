@@ -494,7 +494,7 @@ test_cookie_secret_parsing :: proc(t: ^testing.T) {
 	// `hex.decode_sequence`, which reads each pair, takes a `0x` prefix off
 	// before it looks: a pair that is the prefix is not a byte.
 	testing.expect(t, !config.parse_cookie_secret("0xe973e5a6b2a43f48e7dc849e37bfcf", &secret), "a 0x pair was accepted")
-	testing.expect(t, !config.parse_cookie_secret("e5e973e5a6b2a43f48e7dc849e370X", &secret), "a 0X pair was accepted")
+	testing.expect(t, !config.parse_cookie_secret("e5e973e5a6b2a43f48e7dc849e37bf0X", &secret), "a 0X pair was accepted")
 	testing.expect(t, !config.parse_cookie_secret("+5e973e5a6b2a43f48e7dc849e37bfcf", &secret), "a sign was accepted")
 	free_all(context.temp_allocator)
 }

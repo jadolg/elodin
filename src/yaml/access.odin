@@ -113,18 +113,9 @@ as_int :: proc(n: ^Node) -> (i64, bool) {
 	limit := u64(max(i64)) + (1 if neg else 0)
 	v: u64
 	for c in transmute([]u8)s {
-		d: u64
-		switch c {
-		case '0' ..= '9':
-			d = u64(c - '0')
-		case 'a' ..= 'f':
-			d = u64(c - 'a' + 10)
-		case 'A' ..= 'F':
-			d = u64(c - 'A' + 10)
-		case:
-			return 0, false
-		}
-		if d >= u64(base) || v > (limit - d) / u64(base) {
+		digit, is_digit := hex_digit(c)
+		d := u64(digit)
+		if !is_digit || d >= u64(base) || v > (limit - d) / u64(base) {
 			return 0, false
 		}
 		v = v * u64(base) + d

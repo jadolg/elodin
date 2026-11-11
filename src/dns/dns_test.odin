@@ -1462,3 +1462,79 @@ test_w_name_does_not_point_at_a_colliding_suffix :: proc(t: ^testing.T) {
 	testing.expectf(t, len(second) == 4 && second[2] == 0xc0 && second[3] == 2, "b.example. was written as %v", second)
 	free_all(context.temp_allocator)
 }
+
+/*
+`name_below` and `name_at_or_below` answer by label, not by suffix: every name
+is below the root, and a dot escaped inside a label (`\.` from configuration,
+`\046` from the wire) is part of that label, not a break between two.
+*/
+@(test)
+test_name_below_counts_labels_not_suffix_bytes :: proc(t: ^testing.T) {
+	Case :: struct {
+		name, zone:     string,
+		below, at_or_below: bool,
+	}
+	cases := [?]Case {
+		{"www.example.com.", "example.com.", true, true},
+		{"WWW.Example.COM.", "example.com.", true, true},
+		{"example.com.", "example.com.", false, true},
+		{"notexample.com.", "example.com.", false, false},
+		{"example.org.", "example.com.", false, false},
+		{"com.", "example.com.", false, false},
+		// The root holds every name but itself.
+		{"www.example.com.", ".", true, true},
+		{"com.", ".", true, true},
+		{".", ".", false, true},
+		// One label, "a.example", whose dot is escaped.
+		{"a\\.example.com.", "example.com.", false, false},
+		{"a\\046example.com.", "example.com.", false, false},
+		{"a\\.example.com.", "a\\.example.com.", false, true},
+		{"b.a\\.example.com.", "a\\.example.com.", true, true},
+		// An escaped backslash ends where it ends: the dot after it is real.
+		{"a\\\\.example.com.", "example.com.", true, true},
+	}
+	for c in cases {
+		testing.expectf(t, name_below(c.name, c.zone) == c.below, "name_below(%q, %q) is %v", c.name, c.zone, !c.below)
+		testing.expectf(
+			t,
+			name_at_or_below(c.name, c.zone) == c.at_or_below,
+			"name_at_or_below(%q, %q) is %v",
+			c.name,
+			c.zone,
+			!c.at_or_below,
+		)
+	}
+}
+
+/*
+A name is canonical in the spelling `decode_name` writes, so one written in
+configuration compares equal to the same name read off the wire: `\.` and
+`\046` are one byte (RFC 1035 section 5.1), and a byte past ASCII is `\DDD` on
+the wire side. Only ASCII folds (RFC 4343 section 3).
+*/
+@(test)
+test_name_canonical_is_the_decoders_spelling :: proc(t: ^testing.T) {
+	cases := [?][2]string {
+		{"Example.COM", "example.com."},
+		{"example.com.", "example.com."},
+		{"", "."},
+		{".", "."},
+		{"A\\.Test", "a\\046test."},
+		{"a\\046test.", "a\\046test."},
+		{"*.Lan", "*.lan."},
+		// "bücher", and an upper-case "Ä" that ASCII folding leaves alone.
+		{"bücher.de", "b\\195\\188cher.de."},
+		{"ÄB.de", "\\195\\132b.de."},
+	}
+	for c in cases {
+		got, ok := name_canonical(c[0], context.temp_allocator)
+		testing.expectf(t, ok && got == c[1], "name_canonical(%q) is %q, want %q", c[0], got, c[1])
+	}
+	// A name that does not encode keeps its own spelling, for a caller's wire
+	// check to refuse.
+	bad, ok := name_canonical("a..b", context.temp_allocator)
+	testing.expectf(t, ok && bad == "a..b.", "name_canonical(\"a..b\") is %q", bad)
+	tail, tok := name_canonical("A..", context.temp_allocator)
+	testing.expectf(t, tok && tail == "a..", "name_canonical(\"A..\") is %q", tail)
+	free_all(context.temp_allocator)
+}

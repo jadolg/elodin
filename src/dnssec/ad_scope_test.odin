@@ -365,7 +365,7 @@ test_forged_signatures_do_not_survive_the_prune_in_bulk :: proc(t: ^testing.T) {
 		}
 		testing.expectf(
 			t,
-			name_in_zone(rec.name, sig.signer),
+			dns.name_at_or_below(rec.name, sig.signer),
 			"a signature signed by %s survived over an RRset at %s",
 			sig.signer,
 			rec.name,

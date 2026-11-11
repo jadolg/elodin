@@ -87,7 +87,7 @@ the root is - `zone_keys` then finds no anchor, which is `Indeterminate`.
 closest_anchor :: proc(anchors: []Trust_Anchor, name: string) -> string {
 	closest := "."
 	for anchor in anchors {
-		if name_in_zone(name, anchor.zone) && label_count(anchor.zone) > label_count(closest) {
+		if dns.name_at_or_below(name, anchor.zone) && label_count(anchor.zone) > label_count(closest) {
 			closest = anchor.zone
 		}
 	}

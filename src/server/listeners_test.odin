@@ -108,22 +108,23 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	barrier := Barrier {
 		server = &s,
 	}
+	// Every early return lets the held query go and tears down what started.
+	abandon :: proc(barrier: ^Barrier, l: ^Listeners, pool: ^Test_Loop) {
+		sync.atomic_store(&barrier.go, true)
+		stop_listeners(l)
+		stop_test_loop(pool)
+		destroy_listeners(l)
+	}
 	testing.expect(t, submit_query(&s, barrier_job, &barrier, 0) == .Accepted, "could not start the held query")
 	if !wait_until(barrier_started, &barrier, time.Second) {
-		sync.atomic_store(&barrier.go, true)
-		stop_listeners(&l)
-		stop_test_loop(&handler_pool)
-		destroy_listeners(&l)
+		abandon(&barrier, &l, &handler_pool)
 		testing.expect(t, false, "the held query never started")
 		return
 	}
 
 	bound, berr := net.bound_endpoint(l.udp[0].socket)
 	if berr != nil {
-		sync.atomic_store(&barrier.go, true)
-		stop_listeners(&l)
-		stop_test_loop(&handler_pool)
-		destroy_listeners(&l)
+		abandon(&barrier, &l, &handler_pool)
 		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
 		return
 	}
@@ -135,7 +136,13 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	here.
 	*/
 	client, cerr := net.make_unbound_udp_socket(net.family_from_endpoint(bound))
-	testing.expectf(t, cerr == nil, "cannot open a client socket: %v", cerr)
+	if cerr != nil {
+		// No send and no close: the handle is zero, which under `odin test` can
+		// be another test's socket, since fd 0 is closed.
+		abandon(&barrier, &l, &handler_pool)
+		testing.expectf(t, false, "cannot open a client socket: %v", cerr)
+		return
+	}
 	query: [dns.HEADER_SIZE]u8
 	_, _ = net.send_udp(client, query[:], bound)
 

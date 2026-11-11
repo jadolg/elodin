@@ -642,3 +642,26 @@ test_rewrite_txt_string_length_limit :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+`*.` is a wildcard on the root, which is every name there is: one rule that
+rewrites every query, written in a way nothing about the file admits to. Refused
+as `upstream.zones` and `rebind.allow_domains` refuse the root.
+*/
+@(test)
+test_a_wildcard_on_the_root_is_refused :: proc(t: ^testing.T) {
+	_, err := load_string(
+		"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: \"*.\"\n    answer: 192.168.1.50\n",
+		context.temp_allocator,
+	)
+	if e, has := err.?; testing.expect(t, has, "a rewrite of every name was accepted") {
+		// The root refusal itself, not any other error on the same domain.
+		testing.expectf(
+			t,
+			strings.contains(e.messages[0], "rewrites[0].domain") && strings.contains(e.messages[0], "rewrites every name"),
+			"the message should refuse the root wildcard by name: %s",
+			e.messages[0],
+		)
+	}
+	free_all(context.temp_allocator)
+}
