@@ -150,17 +150,25 @@ check_keys :: proc(l: ^Loader, n: ^yaml.Node, path: string, known: ..string) -> 
 	return true
 }
 
+/*
+Whether `dst` was set: false for a key left out or written empty, which keeps the
+default, and false with an error for a list or a mapping. A key read as one word
+from a fixed set goes through here too, so `type: [tls]` is refused rather than
+taken for no `type` at all.
+*/
 @(private)
-opt_string :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^string, path: string) {
+opt_string :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^string, path: string) -> bool {
 	child := yaml.get(n, key)
 	if yaml.is_null(child) {
-		return
+		return false
 	}
-	if v, ok := yaml.as_string(child); ok {
-		dst^ = v
-	} else {
+	v, ok := yaml.as_string(child)
+	if !ok {
 		errorf(l, "%s.%s: expected a string", path, key)
+		return false
 	}
+	dst^ = v
+	return true
 }
 
 @(private)
@@ -316,7 +324,7 @@ load_log :: proc(l: ^Loader, cfg: ^Config) {
 		return
 	}
 	check_keys(l, n, "log", "level", "queries", "file")
-	if s, ok := yaml.as_string(yaml.get(n, "level")); ok {
+	if s: string; opt_string(l, n, "level", &s, "log") {
 		switch strings.to_lower(s, l.allocator) {
 		case "debug":
 			cfg.log.level = .Debug
@@ -834,8 +842,8 @@ load_listeners :: proc(l: ^Loader, cfg: ^Config) {
 // way the default group chooses between its.
 @(private)
 load_strategy :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Strategy, path: string) {
-	s, ok := yaml.as_string(yaml.get(n, "strategy"))
-	if !ok {
+	s: string
+	if !opt_string(l, n, "strategy", &s, path) {
 		return
 	}
 	switch strings.to_lower(s, l.allocator) {
@@ -1393,8 +1401,8 @@ load_upstream_spec :: proc(
 		spec.bootstrap = load_bootstrap(l, b, fmt.tprintf("%s.bootstrap", path))
 	}
 
-	kind_str, has_kind := yaml.as_string(yaml.get(n, "type"))
-	if has_kind {
+	kind_str: string
+	if opt_string(l, n, "type", &kind_str, path) {
 		switch strings.to_lower(kind_str, l.allocator) {
 		case "udp", "plain", "dns":
 			spec.kind = .UDP
@@ -1735,7 +1743,7 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 		opt_string(l, e, "url", &bl.url, item_path)
 		opt_string(l, e, "file", &bl.file, item_path)
 		opt_bool(l, e, "enabled", &bl.enabled, item_path)
-		if f, ok := yaml.as_string(yaml.get(e, "format")); ok {
+		if f: string; opt_string(l, e, "format", &f, item_path) {
 			switch strings.to_lower(f, l.allocator) {
 			case "auto":
 				bl.format = .Auto
@@ -1793,7 +1801,7 @@ load_blocking :: proc(l: ^Loader, cfg: ^Config) {
 	opt_duration(l, n, "refresh", &cfg.blocking.refresh, "blocking")
 	opt_string(l, n, "cache_dir", &cfg.blocking.cache_dir, "blocking")
 
-	if s, ok := yaml.as_string(yaml.get(n, "response")); ok {
+	if s: string; opt_string(l, n, "response", &s, "blocking") {
 		switch strings.to_lower(s, l.allocator) {
 		case "nxdomain", "nx_domain":
 			cfg.blocking.response = .NX_Domain
@@ -1809,10 +1817,10 @@ load_blocking :: proc(l: ^Loader, cfg: ^Config) {
 			errorf(l, "blocking.response: unknown mode %q (want nxdomain, nodata, zeroip, custom or refused)", s)
 		}
 	}
-	if s, ok := yaml.as_string(yaml.get(n, "custom_ipv4")); ok {
+	if s: string; opt_string(l, n, "custom_ipv4", &s, "blocking") {
 		parse_v4(l, s, "blocking.custom_ipv4", &cfg.blocking.custom_ipv4)
 	}
-	if s, ok := yaml.as_string(yaml.get(n, "custom_ipv6")); ok {
+	if s: string; opt_string(l, n, "custom_ipv6", &s, "blocking") {
 		parse_v6(l, s, "blocking.custom_ipv6", &cfg.blocking.custom_ipv6)
 	}
 
