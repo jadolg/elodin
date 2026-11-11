@@ -100,11 +100,11 @@ the port, and only then discovers it has nowhere to go.
 
 `user` is a name or a numeric uid; `group` is a name or a numeric gid, and may
 be empty to take the user's primary group. Digits and nothing else are an id,
-and anything else is a name: `+1000` is looked up as an account of that name,
-not read as uid 1000. An id must fit the 32-bit id type below its all-ones
-value, which the set*id calls read as "leave this id alone" - cut to its low 32
-bits, 4294967296 would be uid 0, and a start as root would find the drop
-already done (#639).
+and anything else is a name: `+1000` and `1_000` are looked up as accounts of
+those names, not read as uid 1000. An id must fit the 32-bit id type below its
+all-ones value, which the set*id calls read as "leave this id alone" - cut to
+its low 32 bits, 4294967296 would be uid 0, and a start as root would find the
+drop already done (#639).
 */
 resolve :: proc(user: string, group: string) -> (id: Identity, err: Error) {
 	if user == "" {

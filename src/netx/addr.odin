@@ -43,12 +43,8 @@ split_port :: proc(s: string) -> (addr_or_host: string, port: int, ok: bool) {
 		return s, 0, false
 	}
 	if ok && addr_or_host != s {
-		n := 0
-		for c in s[strings.last_index_byte(s, ':') + 1:] {
-			n = n * 10 + int(c - '0')
-			if c < '0' || c > '9' || n > 65535 {
-				return s, 0, false
-			}
+		if _, in_range := parse_decimal(s[strings.last_index_byte(s, ':') + 1:], 65535); !in_range {
+			return s, 0, false
 		}
 	}
 	return
