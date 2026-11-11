@@ -690,7 +690,11 @@ serve_doh_request :: proc(
 	// a held connection's network leaves it in the same place. Closed after the
 	// answer, as the accept loop would have.
 	if !stream_source_allowed(s, conn.peer, .DoH) {
-		return send_http_error(conn, "doh", 403, "forbidden", false, head = req.method == "HEAD")
+		written := send_http_error(conn, "doh", 403, "forbidden", false, head = req.method == "HEAD")
+		// What the client pipelined behind this request is unread, and the close
+		// would take the 403 back with it - see `http_linger`.
+		http_linger(conn, STREAM_LINGER_IDLE)
+		return written
 	}
 	mc_path := startup_config(s).listeners.doh.mobileconfig_path
 	if mc_path != "" && req.path == mc_path {
@@ -1016,10 +1020,11 @@ the drain on the idle wait, the limit or the deadline rather than holding the
 thread.
 
 `idle` is the per-read wait, and the caller chooses it because the caller is what
-knows whether the bytes that are left are already here or still arriving. Every
-caller has a body outstanding today and so passes `HTTP_LINGER_BODY_IDLE`; it is
-passed rather than defaulted so that a path added later has to answer the question
-rather than inherit an answer.
+knows whether the bytes that are left are already here or still arriving. A
+refused request whose body may still be arriving passes `HTTP_LINGER_BODY_IDLE`;
+the allow-list refusal, behind which there is only what the client had already
+pipelined, passes `STREAM_LINGER_IDLE`. It is passed rather than defaulted so
+that a path added later has to answer the question rather than inherit an answer.
 */
 @(private)
 http_linger :: proc(conn: Conn, idle: time.Duration) {

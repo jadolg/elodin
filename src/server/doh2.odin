@@ -68,6 +68,9 @@ H2_Context :: struct {
 	// Questions started on fibers of their own and not yet answered. A connection
 	// waiting on one is not asking nothing, however slow the upstream.
 	pending:       int,
+	// Set by the reader when `server.allow_from` no longer admits the peer and the
+	// connection is being ended; see `serve_doh2`.
+	refused:       bool,
 }
 
 @(private)
@@ -143,6 +146,12 @@ serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string, peer: net.Endpo
 	// finished with them before it returns.
 	h2.conn_wait_idle(hc)
 	h2.conn_unref(hc)
+	// A refused connection ends with the frames the peer sent after its request
+	// unread, and the close would take the 403 and the GOAWAY back with them:
+	// drained first, as over HTTP/1.1 - see `http_linger`.
+	if ctx.refused {
+		http_linger(Conn{tls = conn, peer = peer}, STREAM_LINGER_IDLE)
+	}
 }
 
 @(private)
@@ -154,6 +163,11 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	if !stream_source_allowed(ctx.server, ctx.peer, .DoH) {
 		h2.respond(hc, req.stream_id, h2.Response{status = 403})
 		h2.request_destroy(hc, req)
+		// Then closed, as over HTTP/1.1 and as the accept loop would have: a
+		// source outside the list does not keep one of `max_connections`. On the
+		// reader, which `serve_doh2` reads it back on once `h2.serve` returns.
+		ctx.refused = true
+		h2.shutdown(hc)
 		return
 	}
 

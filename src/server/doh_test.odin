@@ -2249,7 +2249,19 @@ test_doh_a_held_connection_outside_the_allow_list_gets_nothing_but_403 :: proc(t
 		return
 	}
 	defer net.close(client)
-	if !send_all(t, client, "GET /not-the-endpoint HTTP/1.1\r\nHost: dns.example\r\n\r\n") {
+	// Two requests, kept alive: the refusal closes the connection, so the second
+	// is never answered. Padded past what one read takes, so that the close finds
+	// bytes unread - which without a drain first is an RST, and the 403 lost.
+	pipelined := strings.concatenate(
+		{
+			"GET /not-the-endpoint HTTP/1.1\r\nHost: dns.example\r\n\r\n",
+			"GET /not-the-endpoint HTTP/1.1\r\nHost: dns.example\r\nX-Pad: ",
+			strings.repeat("p", 4 * HTTP_BUF_SIZE, context.temp_allocator),
+			"\r\n\r\n",
+		},
+		context.temp_allocator,
+	)
+	if !send_all(t, client, pipelined) {
 		return
 	}
 	net.shutdown(client, .Send)
@@ -2258,7 +2270,6 @@ test_doh_a_held_connection_outside_the_allow_list_gets_nothing_but_403 :: proc(t
 		testing.expectf(t, false, "nothing connected: %v", aerr)
 		return
 	}
-	defer net.close(accepted)
 	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
 
 	cfg := config.default_config()
@@ -2268,20 +2279,28 @@ test_doh_a_held_connection_outside_the_allow_list_gets_nothing_but_403 :: proc(t
 	}
 	// TEST-NET-3: in no range the default allow list names.
 	serve_doh(&s, Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Address{203, 0, 113, 9}, port = 1}}, "test")
+	// What the listener's connection job does once `serve_doh` returns.
+	net.close(accepted)
 
 	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
 	answer := strings.builder_make(context.temp_allocator)
+	last: net.Network_Error
 	for {
 		chunk: [4096]u8
 		n, rerr := net.recv_tcp(client, chunk[:])
 		if rerr != nil || n <= 0 {
+			last = rerr
 			break
 		}
 		strings.write_bytes(&answer, chunk[:n])
 	}
 	head := strings.to_string(answer)
+	// No bytes and no error is the FIN; an RST is an error, the 403 gone with it.
+	testing.expectf(t, last == nil, "the close was not graceful: %v", last)
 	testing.expect(t, strings.contains(head, "HTTP/1.1 403"), "a source outside the allow list was answered on another path")
 	testing.expect(t, !strings.contains(head, "HTTP/1.1 404"), "a source outside the allow list was told what is not there")
+	testing.expect_value(t, strings.count(head, "HTTP/1.1 403"), 1)
+	testing.expect_value(t, sync.atomic_load(&s.stats.refused), u64(1))
 }
 
 /*

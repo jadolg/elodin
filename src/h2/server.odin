@@ -1638,7 +1638,12 @@ dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
 	s.dispatched = true
 	loop.unlock(&c.mu)
 	c.handler(c, req)
-	return true
+	// A handler can end the connection too, through `shutdown`, and nothing is
+	// read past a GOAWAY this end has sent. Asked here, once per request, rather
+	// than once per frame in `serve`: the handler runs inline on the reader.
+	loop.lock(&c.mu)
+	defer loop.unlock(&c.mu)
+	return !c.goaway_sent
 }
 
 // Release a request once its handler is finished with it.
@@ -1755,6 +1760,20 @@ goaway :: proc(c: ^Conn, code: Error_Code) {
 	append_u32(&out, last)
 	append_u32(&out, u32(code))
 	_ = write_all(c, out[:])
+}
+
+/*
+End the connection from a handler: GOAWAY(NO_ERROR), which RFC 9113 6.8 says an
+endpoint SHOULD send before closing. Called inline, from the handler `dispatch`
+runs on the reader, `serve` reads nothing after it; `dispatch` is where that is
+checked, so from a fiber of the handler's own it takes effect only at the next
+request the reader dispatches. Streams already started are not waited for: once
+`serve` returns their writes are refused. 6.8 says such streams "might still
+complete", which does not oblige them to, and the peer is told only that they may
+have been processed.
+*/
+shutdown :: proc(c: ^Conn) {
+	goaway(c, .No_Error)
 }
 
 /*
@@ -1920,36 +1939,20 @@ close_stream :: proc(c: ^Conn, stream_id: u32, peer_sending := false) {
 }
 
 /*
-The `:status` value as HPACK wants it, which is a string.
+The `:status` value as HPACK wants it: the code's three digits (RFC 9113 8.3.2).
 
-A table rather than a conversion so that the digits are static storage and no
-response has to allocate for three bytes. Every status this server sends is
-listed; a status that is not falls back to 500, so a caller adding one has to add
-it here as well - which is a thing to know, and the reason it is written down.
+Converted rather than looked up, so that no status a caller sends can be missing
+from a table. RFC 9110 15 puts every valid code in 100 to 599, and `respond`
+sends a final response, which 15.2 says a 1xx is not (RFC 9113 8.6 forbids 101
+outright). Anything outside 200 to 599 is a caller's mistake - a Response left at
+its zero status - and goes out as 500 rather than as a field no client can use.
 */
 @(private)
 status_text :: proc(status: int) -> string {
-	switch status {
-	case 200:
-		return "200"
-	case 400:
-		return "400"
-	case 404:
-		return "404"
-	case 405:
-		return "405"
-	case 413:
-		return "413"
-	case 415:
-		return "415"
-	case 429:
-		return "429"
-	case 500:
+	if status < 200 || status > 599 {
 		return "500"
-	case 503:
-		return "503"
 	}
-	return "500"
+	return int_to_string(status, context.temp_allocator)
 }
 
 @(private)

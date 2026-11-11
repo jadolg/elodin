@@ -3760,3 +3760,19 @@ test_repeated_headers_on_a_held_stream_are_budgeted :: proc(t: ^testing.T) {
 	close_stream(c, 1)
 	free_all(context.temp_allocator)
 }
+
+/*
+`:status` carries the code's own digits for every final status (RFC 9110 15:
+2xx to 5xx), and anything else - a 1xx, which `respond` cannot send as a final
+response, or a Response left at its zero status - goes out as 500 (#642).
+*/
+@(test)
+test_status_text_is_the_code :: proc(t: ^testing.T) {
+	for code in 200 ..= 599 {
+		testing.expect_value(t, status_text(code), fmt.tprintf("%d", code))
+	}
+	for code in ([]int{min(int), -1, 0, 99, 100, 101, 199, 600, 1000, max(int)}) {
+		testing.expect_value(t, status_text(code), "500")
+	}
+	free_all(context.temp_allocator)
+}

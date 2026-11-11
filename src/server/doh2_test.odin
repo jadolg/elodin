@@ -87,10 +87,10 @@ write_field :: proc(out: ^[dynamic]u8, name, value: string) {
 	append(out, ..transmute([]u8)value)
 }
 
-// Everything a client sends for one complete GET: the preface, the SETTINGS it
-// opens with, and a single HEADERS frame carrying the whole request.
+// Everything a client sends for `requests` complete GETs: the preface, the
+// SETTINGS it opens with, and a HEADERS frame carrying each whole request.
 @(private = "file")
-one_get_request :: proc(path: string) -> [dynamic]u8 {
+one_get_request :: proc(path: string, requests := 1) -> [dynamic]u8 {
 	block := make([dynamic]u8, 0, 128, context.allocator)
 	defer delete(block)
 	write_field(&block, ":method", "GET")
@@ -101,9 +101,11 @@ one_get_request :: proc(path: string) -> [dynamic]u8 {
 	out := make([dynamic]u8, 0, 256, context.allocator)
 	append(&out, ..transmute([]u8)string(h2.PREFACE))
 	write_frame(&out, 0, 0x4, 0, 0)
-	// END_STREAM | END_HEADERS: a complete request in one frame.
-	write_frame(&out, len(block), 0x1, 0x5, 1)
-	append(&out, ..block[:])
+	for i in 0 ..< requests {
+		// END_STREAM | END_HEADERS: a complete request in one frame.
+		write_frame(&out, len(block), 0x1, 0x5, u32(2 * i + 1))
+		append(&out, ..block[:])
+	}
 	return out
 }
 
@@ -121,6 +123,43 @@ wrote_a_body :: proc(out: []u8) -> bool {
 		pos += 9 + length
 	}
 	return false
+}
+
+// How many frames of `type` the connection wrote, and the payload of the first.
+@(private = "file")
+frames_of :: proc(out: []u8, type: h2.Frame_Type) -> (count: int, first: []u8) {
+	rest := out
+	for {
+		h, ok := h2.parse_frame_header(rest)
+		if !ok || h2.FRAME_HEADER_SIZE + h.length > len(rest) {
+			return
+		}
+		if h.type == type {
+			if count == 0 {
+				first = rest[h2.FRAME_HEADER_SIZE:][:h.length]
+			}
+			count += 1
+		}
+		rest = rest[h2.FRAME_HEADER_SIZE + h.length:]
+	}
+}
+
+// The `:status` in a HEADERS block, decoded: HPACK sends the common codes (200,
+// 404, 500 among them) as a static table index, not as digits.
+@(private = "file")
+response_status :: proc(block: []u8) -> string {
+	table: h2.Dynamic_Table
+	h2.dynamic_table_init(&table, 4096, context.temp_allocator)
+	fields, err := h2.decode(&table, block, context.temp_allocator)
+	if err != .None {
+		return ""
+	}
+	for f in fields {
+		if f.name == ":status" {
+			return f.value
+		}
+	}
+	return ""
 }
 
 @(private = "file")
@@ -144,6 +183,8 @@ Result :: struct {
 	// Everything the connection wrote. The caller owns it.
 	output:  [dynamic]u8,
 	dropped: u64,
+	// Requests refused by `server.allow_from`.
+	refused: u64,
 	// Requests in flight, the job occupying the bound not counted.
 	queued:  int,
 	// Whether the request counted as a question for `doh_question_overdue`.
@@ -184,6 +225,8 @@ serve_one :: proc(
 	// Stop the loop first, so every start is refused while the server still
 	// has loops: what a stack that cannot be mapped looks like.
 	refuse_starts := false,
+	peer := H2_PEER,
+	requests := 1,
 ) -> Result {
 	handler_pool: Test_Loop
 	start_test_loop(&handler_pool)
@@ -202,7 +245,7 @@ serve_one :: proc(
 		submit_query(&s, gate_job, &gate, 0)
 	}
 
-	input := one_get_request(path)
+	input := one_get_request(path, requests)
 	defer delete(input)
 
 	script := Script {
@@ -214,7 +257,7 @@ serve_one :: proc(
 	ctx := H2_Context {
 		server = &s,
 		client = "127.0.0.1",
-		peer   = H2_PEER,
+		peer   = peer,
 		path   = cfg.listeners.doh.path,
 	}
 	io := h2.IO {
@@ -241,11 +284,47 @@ serve_one :: proc(
 	return Result {
 		output = script.output,
 		dropped = sync.atomic_load(&s.stats.dropped),
+		refused = sync.atomic_load(&s.stats.refused),
 		queued = queued,
 		asked = ctx.last_question != (time.Tick{}),
 		pending = ctx.pending,
 		stamped_after_gate = time.tick_diff(opened, ctx.last_question) > 0,
 	}
+}
+
+/*
+A reload can take a held connection's network out of `server.allow_from`, and its
+next request is refused 403 and the connection closed, as over HTTP/1.1 (#642).
+The `:status` is decoded from the HEADERS frame on the wire, which is where a 403
+the encoder could not spell would show up as 500. The peer asks twice; the second
+request is never read, so it is neither answered nor counted.
+*/
+@(test)
+test_doh2_a_held_connection_outside_the_allow_list_gets_403 :: proc(t: ^testing.T) {
+	// See the note in the first test.
+	context.allocator = runtime.heap_allocator()
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+
+	// TEST-NET-3: in no range the default allow list names.
+	outside := net.Endpoint{address = net.IP4_Address{203, 0, 113, 9}, port = 1}
+	got := serve_one(&cfg, "/not-the-endpoint", "403", occupy = false, peer = outside, requests = 2)
+	defer delete(got.output)
+
+	answered, headers := frames_of(got.output[:], .Headers)
+	testing.expect_value(t, answered, 1)
+	// Not 404 either: a source outside the allow list is told nothing about paths.
+	testing.expect_value(t, response_status(headers), "403")
+	testing.expect_value(t, got.refused, 1)
+	// RFC 9113 6.8: a GOAWAY before closing, and NO_ERROR, since the peer did nothing wrong.
+	goaways, goaway := frames_of(got.output[:], .Goaway)
+	testing.expect_value(t, goaways, 1)
+	if testing.expect(t, len(goaway) == 8, "GOAWAY payload is not 8 bytes") {
+		code := u32(goaway[4]) << 24 | u32(goaway[5]) << 16 | u32(goaway[6]) << 8 | u32(goaway[7])
+		testing.expect_value(t, code, u32(h2.Error_Code.No_Error))
+	}
+	free_all(context.temp_allocator)
 }
 
 /*
