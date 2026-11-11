@@ -3,6 +3,7 @@ package server
 import "core:fmt"
 import "core:net"
 import "core:reflect"
+import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:testing"
@@ -389,14 +390,6 @@ test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
 	// Whole fields, so that `queries=1` is not found inside `queries=10`, nor
 	// `failed=5` inside `conn_failed=5`.
 	fields := strings.fields(line, context.temp_allocator)
-	has_field :: proc(fields: []string, want: string) -> bool {
-		for f in fields {
-			if f == want {
-				return true
-			}
-		}
-		return false
-	}
 
 	for name in reflect.struct_field_names(Stats) {
 		value := reflect.struct_field_value_by_name(st, name)
@@ -406,7 +399,7 @@ test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
 			continue
 		}
 		want := fmt.tprintf("%s=%d", name, count)
-		testing.expectf(t, has_field(fields, want), "the stats line is missing %q: %s", want, line)
+		testing.expectf(t, slice.contains(fields, want), "the stats line is missing %q: %s", want, line)
 	}
 
 	// The figures that do not live in `Stats` - the limiter's and the cache's -
@@ -425,7 +418,7 @@ test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
 			"cache_prefetches=25",
 			"cache_prefetch_failures=26",
 		}) {
-		testing.expectf(t, has_field(fields, want), "the stats line is missing %q: %s", want, line)
+		testing.expectf(t, slice.contains(fields, want), "the stats line is missing %q: %s", want, line)
 	}
 	free_all(context.temp_allocator)
 }

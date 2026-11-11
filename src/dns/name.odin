@@ -286,9 +286,9 @@ front of the fold.
 
 Asked label by label: the zone has to begin right after a label break, or
 "notexample.com." would count as a name below "example.com.", and a dot escaped
-inside a label (`\.` from configuration, `\046` from the wire) is part of that
-label rather than a break - so "a\.example.com." is one label under "com.", not
-a name below "example.com.". The root is below nothing and holds every other
+inside a label (`\046` as the decoder and `name_canonical` spell it, or `\.`)
+is part of that label rather than a break - so "a\.example.com." is one label
+under "com.", not a name below "example.com.". The root is below nothing and holds every other
 name.
 
 `server.name_below` is this, and calls it: the server package asks the question
@@ -309,9 +309,10 @@ name_at_or_below :: proc(name, zone: string) -> bool {
 	if zone == "." {
 		return true
 	}
-	// The suffix first, which turns most names away without a walk.
+	// A dot before the zone and then the suffix, which turn most names away
+	// without a walk. The dot is needed but not enough: it may be escaped.
 	start := len(name) - len(zone)
-	if start < 0 || !name_equal_fold(name[start:], zone) {
+	if start < 0 || (start > 0 && name[start - 1] != '.') || !name_equal_fold(name[start:], zone) {
 		return false
 	}
 	// Then the label starts, so only a real break can begin the zone.

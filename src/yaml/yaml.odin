@@ -948,17 +948,23 @@ hex_escape :: proc(s: string, at, width: int) -> (r: rune, ok: bool) {
 	}
 	v: u32
 	for c in transmute([]u8)s[at:at + width] {
-		switch c {
-		case '0' ..= '9':
-			v = v * 16 + u32(c - '0')
-		case 'a' ..= 'f':
-			v = v * 16 + u32(c - 'a' + 10)
-		case 'A' ..= 'F':
-			v = v * 16 + u32(c - 'A' + 10)
-		case:
-			return 0, false
-		}
+		d := hex_digit(c) or_return
+		v = v * 16 + u32(d)
 	}
 	// A surrogate half, or past the last code point, is no character.
 	return rune(v), v <= 0x10ffff && (v < 0xd800 || v > 0xdfff)
+}
+
+// A hex digit's value, for the escapes above and `as_int`'s bases.
+@(private)
+hex_digit :: proc(c: u8) -> (d: u8, ok: bool) {
+	switch c {
+	case '0' ..= '9':
+		return c - '0', true
+	case 'a' ..= 'f':
+		return c - 'a' + 10, true
+	case 'A' ..= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
