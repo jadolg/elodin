@@ -1,6 +1,7 @@
 package config
 
 import "core:fmt"
+import "core:strings"
 import "core:testing"
 
 @(private = "file")
@@ -114,7 +115,9 @@ is not one of them.
 test_the_removed_worker_keys_are_refused :: proc(t: ^testing.T) {
 	for key in ([]string{"workers", "upstream_workers", "running_workers"}) {
 		_, err := load_string(fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nserver:\n  %s: 8\n", key), context.temp_allocator)
-		testing.expectf(t, err != nil, "server.%s was accepted", key)
+		e, refused := err.?
+		want := fmt.tprintf("server.%s: unknown key", key)
+		testing.expectf(t, refused && len(e.messages) == 1 && strings.has_prefix(e.messages[0], want), "server.%s: want only %q, got %v", key, want, e.messages)
 	}
 	cfg, err := load_string(
 		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: 24\n",

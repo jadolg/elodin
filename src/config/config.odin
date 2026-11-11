@@ -359,8 +359,8 @@ Dnssec_Config :: struct {
 	behalf of the query it is validating, once per label of the name being
 	walked. Nothing about the name is this server's to choose, so without a
 	bound a client picking names whose upper labels are fresh holds every query
-	it may have in flight there, each for up to `MAX_LOOKUPS_PER_QUERY` round
-	trips (issue #356).
+	it may have in flight there, each for up to `dnssec.MAX_LOOKUPS_PER_QUERY`
+	round trips (issue #356).
 	Past this many, a walk reads the caches and answers SERVFAIL where it would
 	have gone upstream, which is what an upstream that did not answer already
 	produces - and that covers every cold name while it binds, unsigned ones

@@ -825,7 +825,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "dropped (shed)"
+              "options": "dropped"
             },
             "properties": [
               {
@@ -944,7 +944,7 @@
           },
           "editorMode": "code",
           "expr": "sum(rate(elodin_queries_dropped_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "dropped (max_pending reached)",
+          "legendFormat": "dropped",
           "range": true,
           "instant": false,
           "refId": "A"

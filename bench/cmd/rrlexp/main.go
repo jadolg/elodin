@@ -353,7 +353,6 @@ var (
 	slip       = flag.Int("slip", 2, "rate_limit.slip (the shipped default is 2)")
 	records    = flag.Int("answer-records", 70, "A records the mock upstream returns, which sets the answer size")
 	upDelay    = flag.Duration("upstream-delay", 20*time.Millisecond, "how long the mock upstream takes to answer")
-	workers    = flag.Int("workers", 64, "server.workers, pinned rather than derived from this machine")
 	only       = flag.String("only", "", "run only arms whose name contains this")
 	keep       = flag.Bool("keep", false, "keep the generated configs and server logs")
 	serverCPUs = flag.String("server-cpus", "", "run the server under `taskset -c` on these CPUs, keeping it off the generator's (e.g. 0,1)")
