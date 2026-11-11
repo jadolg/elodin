@@ -172,3 +172,37 @@ test_unmap_takes_only_the_mapped_prefix :: proc(t: ^testing.T) {
 	testing.expect(t, !addresses_equal(net.parse_address("::10.0.0.1"), net.IP4_Address{10, 0, 0, 1}), "a compat address is its IPv4 one")
 	testing.expect(t, !addresses_equal(nil, nil), "no address equals no address")
 }
+
+@(test)
+test_parse_decimal_is_digits_within_the_bound :: proc(t: ^testing.T) {
+	Case :: struct {
+		text: string,
+		max:  u64,
+		want: u64,
+		ok:   bool,
+	}
+	cases := []Case {
+		{"0", 0, 0, true},
+		{"1", 0, 0, false},
+		{"32", 32, 32, true},
+		{"33", 32, 0, false},
+		{"008", 32, 8, true},
+		{"65535", 65535, 65535, true},
+		{"65536", 65535, 0, false},
+		{"18446744073709551615", max(u64), max(u64), true},
+		// Each of these is a number `strconv` reads, and the last two wrap to 0 and 8.
+		{"18446744073709551616", max(u64), 0, false},
+		{"18446744073709551624", 32, 0, false},
+		{"+8", 32, 0, false},
+		{"-0", 32, 0, false},
+		{"1_6", 32, 0, false},
+		{"0x10", 32, 0, false},
+		{"", 32, 0, false},
+		{" 8", 32, 0, false},
+		{"8 ", 32, 0, false},
+	}
+	for c in cases {
+		n, ok := parse_decimal(c.text, c.max)
+		testing.expectf(t, ok == c.ok && n == c.want, "%q under %d: got %d, %v", c.text, c.max, n, ok)
+	}
+}

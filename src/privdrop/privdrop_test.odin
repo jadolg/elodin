@@ -65,6 +65,43 @@ test_resolve_rejects_unknown_names :: proc(t: ^testing.T) {
 }
 
 /*
+A numeric id is digits and nothing else, and fits the id type. Read by
+`strconv` and cut to 32 bits, each of these would be root or `(uid_t)-1`: a
+start as root would then find the drop already done and report success (#639).
+`(uid_t)-1` is the set*id calls' "leave this id alone", never an identity.
+*/
+@(test)
+test_resolve_refuses_a_numeric_id_out_of_range :: proc(t: ^testing.T) {
+	for user in ([]string{"4294967296", "18446744073709551616", "4294967295", "99999999999999999999999"}) {
+		id, err := resolve(user, "root")
+		testing.expectf(t, err == .Id_Out_Of_Range, "user %q resolved to uid %d (%v)", user, id.uid, err)
+	}
+	for group in ([]string{"4294967296", "18446744073709551616", "4294967295"}) {
+		id, err := resolve("60999", group)
+		testing.expectf(t, err == .Id_Out_Of_Range, "group %q resolved to gid %d (%v)", group, id.gid, err)
+	}
+
+	// The largest id there is, and a leading zero, which is still that number.
+	id, err := resolve("4294967294", "04294967294")
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, id.uid, posix.uid_t(4294967294))
+	testing.expect_value(t, id.gid, posix.gid_t(4294967294))
+}
+
+// Not digits, so not an id: what is left is a name, and no account is called this.
+@(test)
+test_resolve_reads_only_digits_as_an_id :: proc(t: ^testing.T) {
+	for user in ([]string{"+0", "0_0", "-0", "+60999", " 0", "0 "}) {
+		id, err := resolve(user, "root")
+		testing.expectf(t, err == .Unknown_User, "user %q resolved to uid %d (%v)", user, id.uid, err)
+	}
+	for group in ([]string{"+0", "0_0", " 0"}) {
+		id, err := resolve("60999", group)
+		testing.expectf(t, err == .Unknown_Group, "group %q resolved to gid %d (%v)", group, id.gid, err)
+	}
+}
+
+/*
 A numeric uid nobody has an account for leaves nowhere to read a primary group
 from. Guessing one would be a silent choice about which files the process can
 reach, so it is refused instead.

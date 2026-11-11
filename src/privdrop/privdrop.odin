@@ -19,9 +19,9 @@ package privdrop
 
 import "core:c"
 import "core:os"
-import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
+import "elodin:netx"
 
 when ODIN_OS == .Darwin {
 	foreign import libc "system:System"
@@ -51,6 +51,9 @@ Error :: enum u8 {
 	None,
 	Unknown_User,
 	Unknown_Group,
+	// A user or group written as digits that is past the id's width, or is the
+	// width's all-ones value.
+	Id_Out_Of_Range,
 	// Asked to become somebody else without the privilege to do it.
 	Not_Permitted,
 	Setgroups_Failed,
@@ -68,6 +71,8 @@ explain :: proc(err: Error) -> string {
 		return "no such user"
 	case .Unknown_Group:
 		return "no such group"
+	case .Id_Out_Of_Range:
+		return "a numeric user or group id is at most 4294967294"
 	case .Not_Permitted:
 		return "not running as root, so the identity cannot be changed"
 	case .Setgroups_Failed:
@@ -94,7 +99,12 @@ user name is then a startup error, rather than a process that comes up, takes
 the port, and only then discovers it has nowhere to go.
 
 `user` is a name or a numeric uid; `group` is a name or a numeric gid, and may
-be empty to take the user's primary group.
+be empty to take the user's primary group. Digits and nothing else are an id,
+and anything else is a name: `+1000` is looked up as an account of that name,
+not read as uid 1000. An id must fit the 32-bit id type below its all-ones
+value, which the set*id calls read as "leave this id alone" - cut to its low 32
+bits, 4294967296 would be uid 0, and a start as root would find the drop
+already done (#639).
 */
 resolve :: proc(user: string, group: string) -> (id: Identity, err: Error) {
 	if user == "" {
@@ -103,7 +113,11 @@ resolve :: proc(user: string, group: string) -> (id: Identity, err: Error) {
 	id.name = user
 
 	have_gid := false
-	if uid, ok := strconv.parse_uint(user, 10); ok {
+	if is_numeric_id(user) {
+		uid, in_range := netx.parse_decimal(user, MAX_ID)
+		if !in_range {
+			return {}, .Id_Out_Of_Range
+		}
 		id.uid = posix.uid_t(uid)
 		// A numeric uid is allowed to have no account behind it — containers do
 		// this — but then there is no primary group to read, and picking one
@@ -123,7 +137,11 @@ resolve :: proc(user: string, group: string) -> (id: Identity, err: Error) {
 	}
 
 	if group != "" {
-		if gid, ok := strconv.parse_uint(group, 10); ok {
+		if is_numeric_id(group) {
+			gid, in_range := netx.parse_decimal(group, MAX_ID)
+			if !in_range {
+				return {}, .Id_Out_Of_Range
+			}
 			id.gid = posix.gid_t(gid)
 		} else {
 			gid, found := gid_of_name(group)
@@ -139,6 +157,17 @@ resolve :: proc(user: string, group: string) -> (id: Identity, err: Error) {
 		return {}, .Unknown_Group
 	}
 	return id, .None
+}
+
+// The largest uid or gid: both types are 32 bits, and all ones is not an id.
+@(private)
+MAX_ID :: u64(max(u32)) - 1
+
+#assert(size_of(posix.uid_t) == size_of(u32) && size_of(posix.gid_t) == size_of(u32))
+
+@(private)
+is_numeric_id :: proc(s: string) -> bool {
+	return s != "" && strings.trim_left(s, "0123456789") == ""
 }
 
 /*

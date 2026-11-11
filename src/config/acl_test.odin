@@ -105,6 +105,14 @@ test_parse_prefix_refuses_what_is_not_a_network :: proc(t: ^testing.T) {
 		"192.168.0.0/16bits",
 		"192.168.0.0/1 6",
 		"192.168.0.0/",
+		// `parse_int` reads a sign and `_` separators, and wraps past 2^64: the
+		// first two were /0, every address (#640).
+		"0.0.0.0/18446744073709551616",
+		"::/18446744073709551616",
+		"10.0.0.0/18446744073709551624",
+		"10.0.0.0/+8",
+		"10.0.0.0/1_6",
+		"2001:db8::/+32",
 		// A scope makes an address usable on one host and one interface; there
 		// is no zone on the wire to compare it against.
 		"fe80::1%eth0/64",

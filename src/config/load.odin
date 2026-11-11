@@ -2732,20 +2732,7 @@ number, and a number has one value.
 */
 @(private)
 parse_rdata_u16 :: proc(s: string) -> (v: u16, ok: bool) {
-	if len(s) == 0 {
-		return 0, false
-	}
-	n := 0
-	for i in 0 ..< len(s) {
-		c := s[i]
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		n = n * 10 + int(c - '0')
-		if n > 65535 {
-			return 0, false
-		}
-	}
+	n := netx.parse_decimal(s, 65535) or_return
 	return u16(n), true
 }
 

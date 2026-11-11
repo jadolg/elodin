@@ -1,9 +1,9 @@
 package dnssec
 
-import "core:strconv"
 import "core:encoding/hex"
 import "core:strings"
 import "elodin:dns"
+import "elodin:netx"
 
 /*
 Trust anchors.
@@ -139,10 +139,10 @@ parse_trust_anchor :: proc(text: string, allocator := context.allocator) -> (anc
 		return {}, false
 	}
 
-	key_tag, tag_ok := strconv.parse_uint(fields[start], 10)
-	algorithm, alg_ok := strconv.parse_uint(fields[start + 1], 10)
-	digest_type, dt_ok := strconv.parse_uint(fields[start + 2], 10)
-	if !tag_ok || !alg_ok || !dt_ok || key_tag > 0xffff || algorithm > 0xff || digest_type > 0xff {
+	key_tag, tag_ok := netx.parse_decimal(fields[start], 0xffff)
+	algorithm, alg_ok := netx.parse_decimal(fields[start + 1], 0xff)
+	digest_type, dt_ok := netx.parse_decimal(fields[start + 2], 0xff)
+	if !tag_ok || !alg_ok || !dt_ok {
 		return {}, false
 	}
 
