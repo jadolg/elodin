@@ -43,15 +43,41 @@ split_port :: proc(s: string) -> (addr_or_host: string, port: int, ok: bool) {
 		return s, 0, false
 	}
 	if ok && addr_or_host != s {
-		n := 0
-		for c in s[strings.last_index_byte(s, ':') + 1:] {
-			n = n * 10 + int(c - '0')
-			if c < '0' || c > '9' || n > 65535 {
-				return s, 0, false
-			}
+		if _, in_range := parse_decimal(s[strings.last_index_byte(s, ':') + 1:], 65535); !in_range {
+			return s, 0, false
 		}
 	}
 	return
+}
+
+/*
+A decimal number no greater than `max`: one or more digits and nothing else.
+
+`strconv`'s integer parsers also read a sign and `_` separators, and wrap past
+2^64 without saying so, so 2^64 + 8 reads as 8 and passes any bound the caller
+checks afterwards. A configured number goes through this instead, so a value
+mistyped past its bound is refused rather than read as a small one (#639, #640).
+*/
+parse_decimal :: proc(s: string, max: u64) -> (n: u64, ok: bool) {
+	if s == "" {
+		return 0, false
+	}
+	for i in 0 ..< len(s) {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		// Checked before each step, so neither the multiply nor the add can wrap.
+		if n > max / 10 {
+			return 0, false
+		}
+		n *= 10
+		d := u64(s[i] - '0')
+		if d > max - n {
+			return 0, false
+		}
+		n += d
+	}
+	return n, true
 }
 
 /*

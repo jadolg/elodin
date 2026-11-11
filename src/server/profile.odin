@@ -1,9 +1,9 @@
 package server
 
 import "core:mem"
-import "core:strconv"
 import "core:sync"
 import "elodin:logx"
+import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -386,18 +386,12 @@ profile_servable_port :: proc(p: ^Profile_Signer, port: string) -> bool {
 	if port == "" {
 		return true
 	}
-	// A port is at most five digits, and a leading zero is a second spelling of
-	// a number that already has one.
-	if len(port) > 5 || port[0] == '0' {
+	// A leading zero is a second spelling of a number that already has one.
+	if port[0] == '0' {
 		return false
 	}
-	for i in 0 ..< len(port) {
-		if port[i] < '0' || port[i] > '9' {
-			return false
-		}
-	}
-	n, ok := strconv.parse_int(port, 10)
-	return ok && (n == 443 || n == p.doh_port)
+	n, ok := netx.parse_decimal(port, 65535)
+	return ok && (n == 443 || int(n) == p.doh_port)
 }
 
 @(private)

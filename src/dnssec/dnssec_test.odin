@@ -238,6 +238,23 @@ test_parse_trust_anchor :: proc(t: ^testing.T) {
 
 	_, junk := parse_trust_anchor("not an anchor", context.temp_allocator)
 	testing.expect(t, !junk, "nonsense should not parse")
+
+	// Each field is digits within its width: `strconv` would read a sign and `_`
+	// separators and wrap past 2^64 to a number that passes the width check.
+	DIGEST :: "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
+	for fields in ([]string {
+			"18446744073709571942 8 2", // 2^64 + 20326
+			"+20326 8 2",
+			"20_326 8 2",
+			"20326 18446744073709551624 2", // 2^64 + 8
+			"20326 +8 2",
+			"20326 8 18446744073709551618", // 2^64 + 2
+			"20326 8 _2",
+		}) {
+		line := fmt.tprintf(". IN DS %s %s", fields, DIGEST)
+		_, wrapped := parse_trust_anchor(line, context.temp_allocator)
+		testing.expectf(t, !wrapped, "%q was accepted", fields)
+	}
 	free_all(context.temp_allocator)
 }
 

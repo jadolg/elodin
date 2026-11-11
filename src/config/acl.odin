@@ -3,7 +3,6 @@ package config
 import "core:fmt"
 import "core:mem"
 import "core:net"
-import "core:strconv"
 import "core:strings"
 import "elodin:netx"
 
@@ -426,11 +425,8 @@ parse_prefix :: proc(text: string) -> (p: Prefix, ok: bool) {
 	p.bits = 128 if p.v6 else 32
 
 	if has_length {
-		// `parse_int` stops at the first byte it cannot use, so "8junk" parses as
-		// happily as "8"; how much of the text it consumed is what rejects it.
-		used := 0
-		n, nok := strconv.parse_int(bits_text, 10, &used)
-		if !nok || used != len(bits_text) || n < 0 || n > int(p.bits) {
+		n, nok := netx.parse_decimal(bits_text, u64(p.bits))
+		if !nok {
 			return {}, false
 		}
 		p.bits = u8(n)
