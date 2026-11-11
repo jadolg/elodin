@@ -135,7 +135,16 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	here.
 	*/
 	client, cerr := net.make_unbound_udp_socket(net.family_from_endpoint(bound))
-	testing.expectf(t, cerr == nil, "cannot open a client socket: %v", cerr)
+	if cerr != nil {
+		// No send and no close: the handle is zero, which under `odin test` can
+		// be another test's socket, since fd 0 is closed.
+		sync.atomic_store(&barrier.go, true)
+		stop_listeners(&l)
+		stop_test_loop(&handler_pool)
+		destroy_listeners(&l)
+		testing.expectf(t, false, "cannot open a client socket: %v", cerr)
+		return
+	}
 	query: [dns.HEADER_SIZE]u8
 	_, _ = net.send_udp(client, query[:], bound)
 

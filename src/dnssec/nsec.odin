@@ -125,7 +125,7 @@ the record cannot deny any subdomain of it.
 */
 @(private)
 nsec_speaks_for :: proc(n: Nsec_Rr, name: string) -> bool {
-	if !name_in_zone(name, n.owner) || dns.name_equal_fold(name, n.owner) {
+	if !dns.name_below(name, n.owner) {
 		return true
 	}
 	return types_enclose(n.rr.types)
@@ -352,7 +352,7 @@ nsec_shows_node :: proc(nsecs: []Nsec_Rr, name: string) -> bool {
 		return true
 	}
 	cover, covered := nsec_covering(nsecs, name)
-	return covered && !dns.name_equal_fold(cover.rr.next, name) && name_in_zone(cover.rr.next, name)
+	return covered && dns.name_below(cover.rr.next, name)
 }
 
 /*

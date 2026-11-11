@@ -117,7 +117,8 @@ test_served_ttl_is_clamped_to_the_signature :: proc(t: ^testing.T) {
 		}
 		rec.ttl = 604800
 	}
-	raised, _, _ := dns.encode_message(msg, context.temp_allocator)
+	raised, _, rerr := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, rerr, dns.Encode_Error.None)
 
 	// Once with a signature that has hours left, where the Original TTL binds,
 	// and once a hundred seconds before it lapses, where the expiration does.
@@ -132,7 +133,8 @@ test_served_ttl_is_clamped_to_the_signature :: proc(t: ^testing.T) {
 		testing.expectf(t, result.status == .Secure, "at %d the raised answer is %v (%s)", c.at, result.status, result.reason)
 		out, ok := strip_unauthenticated(raised, result)
 		testing.expect(t, ok, "the prune failed")
-		served, _ := dns.decode_message(out, context.temp_allocator)
+		served, sderr := dns.decode_message(out, context.temp_allocator)
+		testing.expect_value(t, sderr, dns.Decode_Error.None)
 		testing.expect(t, len(served.answer) >= 2, "the answer lost its records")
 		for rec in served.answer {
 			testing.expectf(t, rec.ttl <= c.ceiling, "at %d %v went out with TTL %d over a ceiling of %d", c.at, rec.type, rec.ttl, c.ceiling)
@@ -146,15 +148,20 @@ test_served_ttl_is_clamped_to_the_signature :: proc(t: ^testing.T) {
 test_served_ttl_under_the_ceiling_is_kept :: proc(t: ^testing.T) {
 	v := make_validator(st_query, nil, Options{})
 	defer destroy_validator(v)
-	msg, _ := dns.decode_message(st_fixture("example_a"), context.temp_allocator)
+	msg, derr := dns.decode_message(st_fixture("example_a"), context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
 	for &rec in msg.answer {
 		rec.ttl = 7
 	}
-	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+	wire, _, eerr := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, eerr, dns.Encode_Error.None)
 	result := validate(v, "www.example.com.", .A, wire, time.unix(FIXTURE_TIME, 0))
 	testing.expect_value(t, result.status, Status.Secure)
-	out, _ := strip_unauthenticated(wire, result)
-	served, _ := dns.decode_message(out, context.temp_allocator)
+	out, ok := strip_unauthenticated(wire, result)
+	testing.expect(t, ok, "the prune failed")
+	served, sderr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, sderr, dns.Decode_Error.None)
+	testing.expect(t, len(served.answer) >= 2, "the answer lost its records")
 	for rec in served.answer {
 		testing.expect_value(t, rec.ttl, u32(7))
 	}
@@ -238,15 +245,19 @@ records disagree goes out as one TTL, the lowest.
 test_served_ttl_takes_the_least_received :: proc(t: ^testing.T) {
 	v := make_validator(st_query, nil, Options{})
 	defer destroy_validator(v)
-	msg, _ := dns.decode_message(st_fixture("example_a"), context.temp_allocator)
+	msg, derr := dns.decode_message(st_fixture("example_a"), context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
 	for &rec in msg.answer {
 		rec.ttl = 100 if rec.type == .RRSIG else 250
 	}
-	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+	wire, _, eerr := dns.encode_message(msg, context.temp_allocator)
+	testing.expect_value(t, eerr, dns.Encode_Error.None)
 	result := validate(v, "www.example.com.", .A, wire, time.unix(FIXTURE_TIME, 0))
 	testing.expect_value(t, result.status, Status.Secure)
-	out, _ := strip_unauthenticated(wire, result)
-	served, _ := dns.decode_message(out, context.temp_allocator)
+	out, ok := strip_unauthenticated(wire, result)
+	testing.expect(t, ok, "the prune failed")
+	served, sderr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, sderr, dns.Decode_Error.None)
 	testing.expect(t, len(served.answer) >= 2, "the answer lost its records")
 	for rec in served.answer {
 		testing.expectf(t, rec.ttl == 100, "%v went out with TTL %d, the RRSIG arrived with 100", rec.type, rec.ttl)

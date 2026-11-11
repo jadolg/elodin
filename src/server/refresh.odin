@@ -430,7 +430,12 @@ refresh_take :: proc(
 	if !r.ok || r.unanswered || len(r.response) == 0 {
 		return nil, .Failed, 0, false
 	}
-	out := make([]u8, len(r.response), allocator)
+	// A copy the arena had no room for is not taken: the expired entry the
+	// caller holds is a better answer than none (#620).
+	out, built := dns.alloc_slice([]u8, len(r.response), allocator)
+	if !built {
+		return nil, .Failed, 0, false
+	}
 	copy(out, r.response)
 	return out, r.outcome, r.ede, true
 }

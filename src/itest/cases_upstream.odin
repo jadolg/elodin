@@ -653,6 +653,9 @@ start_server_tcp_only :: proc(r: ^Runner, config: string, tcp_port: int) -> (srv
 		return srv, false
 	}
 	if !wait_tcp(tcp_port, 5 * time.Second) {
+		// A failure, not a skip: the caller reads `!ok` as a server that never
+		// started, which would hide this one (#468).
+		fail(r, "server on port %d never answered over tcp; log:\n%s", tcp_port, read_log(&srv))
 		stop_server(&srv)
 		return srv, false
 	}

@@ -2879,7 +2879,7 @@ validate_rrset :: proc(
 	anchor := closest_anchor(v.anchors, zone_holding(owner, type))
 
 	for sig in sigs {
-		if !signer_holds(owner, type, sig.signer) || !name_in_zone(sig.signer, anchor) {
+		if !signer_holds(owner, type, sig.signer) || !dns.name_at_or_below(sig.signer, anchor) {
 			continue
 		}
 		/*
@@ -3142,7 +3142,7 @@ and so no DS, and nothing may sign one there.
 */
 @(private)
 signer_holds :: proc(owner: string, type: dns.Type, signer: string) -> bool {
-	if !name_in_zone(owner, signer) {
+	if !dns.name_at_or_below(owner, signer) {
 		return false
 	}
 	return type != .DS || !dns.name_equal_fold(owner, signer)
@@ -3393,7 +3393,7 @@ validate_wildcard_proof :: proc(
 	// The denial records were verified against `established`, so a name outside
 	// it is not theirs to speak for - a hash of one landing in some span of the
 	// zone would say nothing at all.
-	if !name_in_zone(next_closer, established) {
+	if !dns.name_at_or_below(next_closer, established) {
 		forget_unreached_non_cut(v, owner, established)
 		return .Bogus, nil, "wildcard expansion not proven", {}
 	}
@@ -4831,7 +4831,7 @@ DS lookup the entry was saving.
 */
 @(private)
 forget_unreached_non_cut :: proc(v: ^Validator, name, established: string) {
-	if dns.name_equal_fold(name, established) || !name_in_zone(name, established) {
+	if !dns.name_below(name, established) {
 		return
 	}
 	non_cut_forget(v, name)
@@ -5241,7 +5241,7 @@ untouched (RFC 6672 section 3.4.1).
 @(private)
 dname_synthesizes :: proc(owner, target, cname_owner, cname_target: string, allocator: mem.Allocator) -> bool {
 	// A DNAME redirects what is below it, never its own name.
-	if dns.name_equal_fold(cname_owner, owner) || !name_in_zone(cname_owner, owner) {
+	if !dns.name_below(cname_owner, owner) {
 		return false
 	}
 	prefix_labels := label_count(cname_owner) - label_count(owner)

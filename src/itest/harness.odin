@@ -219,6 +219,20 @@ Run_Result :: struct {
 	ok:        bool,
 }
 
+/*
+Write a fixture file a case reads, failing the case when the write does not
+land. Discarded, a failed write turns up later as an unrelated assertion - or
+passes: `--check` on a file that was never written exits non-zero, which a
+rejection case reads as the rejection it wanted.
+*/
+write_fixture :: proc(r: ^Runner, path: string, data: []u8) -> bool {
+	if werr := os.write_entire_file(path, data); werr != nil {
+		fail(r, "cannot write %s: %v", path, werr)
+		return false
+	}
+	return true
+}
+
 // Run the binary to completion with `args` and collect what it printed. For the
 // one-shot modes - `--version`, `--check` - that never bind a socket.
 run_binary :: proc(r: ^Runner, args: []string, tag: string) -> Run_Result {

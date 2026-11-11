@@ -46,7 +46,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: --check accepts a valid config")
 	{
 		path := filepath.join({r.work_dir, "valid.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			path,
 			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nblocking:\n  rules: [\"||a.test^\"]\n"),
 		)
@@ -75,7 +75,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: --check reports an estimate no answer can reach")
 	{
 		path := filepath.join({r.work_dir, "inert-estimate.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			path,
 			transmute([]u8)string(
 				"upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: true\n    response_size_estimate: 2048\n",
@@ -98,7 +98,7 @@ run_cli_cases :: proc(r: ^Runner) {
 		// figure an operator is confirming before they restart: 500/s at 128
 		// bytes is 64,000 bytes a second at one prefix.
 		biting := filepath.join({r.work_dir, "biting-estimate.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			biting,
 			transmute([]u8)string(
 				"upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: true\n    responses_per_second: 500\n    response_size_estimate: 128\n",
@@ -118,7 +118,7 @@ run_cli_cases :: proc(r: ^Runner) {
 		// And the file that does not name one is not warned at: the loader
 		// resolves an unset estimate to the ceiling itself.
 		quiet := filepath.join({r.work_dir, "default-estimate.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(quiet, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\n"))
+		write_fixture(r, quiet, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\n"))
 		qres := run_binary(r, []string{"--config", quiet, "--check"}, "check-default-estimate")
 		if check(r, qres.ok, "could not run the binary") {
 			check(
@@ -134,7 +134,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: --check rejects a config with no upstreams")
 	{
 		path := filepath.join({r.work_dir, "no-upstream.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(path, transmute([]u8)string("log:\n  level: info\n"))
+		write_fixture(r, path, transmute([]u8)string("log:\n  level: info\n"))
 		res := run_binary(r, []string{"--config", path, "--check"}, "check-empty")
 		if check(r, res.ok, "could not run the binary") {
 			check(r, res.exit_code != 0, "an unusable config exited 0")
@@ -148,7 +148,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: --check rejects an upstream timeout of zero")
 	{
 		path := filepath.join({r.work_dir, "zero-timeout.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			path,
 			transmute([]u8)string(
 				"upstream:\n  timeout: 0s\n  servers: [1.1.1.1]\n  zones:\n    - domains: [home.arpa]\n      timeout: 0ms\n      servers: [192.168.1.1]\n",
@@ -168,7 +168,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: --check rejects ports, TTLs and timeouts out of range")
 	{
 		path := filepath.join({r.work_dir, "out-of-range.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			path,
 			transmute([]u8)string(
 				"listeners:\n  udp: {enabled: true, address: 127.0.0.1, port: 106837}\n  tcp: {enabled: true, address: 127.0.0.1, port: 0}\n" +
@@ -189,7 +189,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: --check reports every problem at once, with line numbers")
 	{
 		path := filepath.join({r.work_dir, "bad.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			path,
 			transmute([]u8)string("upstream:\n  strategy: teleport\n  servers: [1.1.1.1]\nblocking:\n  response: explode\n"),
 		)
@@ -215,7 +215,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: malformed YAML is reported with a line number")
 	{
 		path := filepath.join({r.work_dir, "malformed.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(path, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nthis is not a mapping\n"))
+		write_fixture(r, path, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nthis is not a mapping\n"))
 		res := new_check(r, path, "check-yaml")
 		check(r, res.exit_code != 0, "malformed YAML exited 0")
 		check(r, strings.contains(res.output, "line 3"), "the failing line was not identified: %q", res.output)
@@ -227,7 +227,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: a plain value starting with a YAML indicator is refused")
 	{
 		path := filepath.join({r.work_dir, "indicator.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(path, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: *.lan\n    answer: 192.168.1.10\n"))
+		write_fixture(r, path, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: *.lan\n    answer: 192.168.1.10\n"))
 		res := new_check(r, path, "check-yaml-indicator")
 		check(r, res.exit_code != 0, "an unquoted *.lan exited 0: %q", res.output)
 		check(r, strings.contains(res.output, "line 4") && strings.contains(res.output, "quote"), "the line and the remedy were not given: %q", res.output)
@@ -237,7 +237,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: a DoT listener without a certificate is refused")
 	{
 		path := filepath.join({r.work_dir, "nocert.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			path,
 			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nlisteners:\n  dot:\n    enabled: true\n"),
 		)
@@ -250,7 +250,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: --check rejects a service account nobody has")
 	{
 		path := filepath.join({r.work_dir, "baduser.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			path,
 			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nserver:\n  user: elodin-no-such-user\n"),
 		)
@@ -269,7 +269,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	{
 		log_path := filepath.join({r.work_dir, "check-nolog.log"}, context.temp_allocator) or_else ""
 		path := filepath.join({r.work_dir, "nolog.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			path,
 			transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", log_path),
 		)
@@ -280,7 +280,7 @@ run_cli_cases :: proc(r: ^Runner) {
 
 		// One the start could not open is still said, though nothing is opened.
 		missing := filepath.join({r.work_dir, "no-such-dir", "check.log"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			path,
 			transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", missing),
 		)
@@ -295,7 +295,7 @@ run_cli_cases :: proc(r: ^Runner) {
 			_ = os.chmod(ro, {.Read_User, .Execute_User})
 			defer _ = os.chmod(ro, {.Read_User, .Write_User, .Execute_User})
 			in_ro := filepath.join({ro, "check.log"}, context.temp_allocator) or_else ""
-			_ = os.write_entire_file(
+			write_fixture(r, 
 				path,
 				transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", in_ro),
 			)
@@ -309,7 +309,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: --check rejects a group with no user")
 	{
 		path := filepath.join({r.work_dir, "groupalone.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			path,
 			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nserver:\n  group: elodin\n"),
 		)
@@ -347,7 +347,7 @@ server: {{ user: root }}
 				next_port(r),
 			)
 			path := filepath.join({r.work_dir, "cannotdrop.yaml"}, context.temp_allocator) or_else ""
-			_ = os.write_entire_file(path, transmute([]u8)cfg)
+			write_fixture(r, path, transmute([]u8)cfg)
 
 			res := run_binary(r, []string{"--config", path}, "cannot-drop")
 			if check(r, res.ok, "could not run the binary") {
@@ -393,7 +393,7 @@ server: {{ user: root }}
 	start_case(r, "cli: --check accepts the retired worker keys and names each")
 	{
 		path := filepath.join({r.work_dir, "retired-keys.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(
+		write_fixture(r, 
 			path,
 			transmute([]u8)string(
 				"upstream:\n  servers: [1.1.1.1]\nserver:\n  workers: 8\n  upstream_workers: 2\n  running_workers: 4\ndnssec:\n  max_connection_walks: 24\n",
@@ -486,7 +486,7 @@ server: {{ user: root }}
 				context.temp_allocator,
 			)
 			path := filepath.join({r.work_dir, "public-with-certs.yaml"}, context.temp_allocator) or_else ""
-			_ = os.write_entire_file(path, transmute([]u8)text)
+			write_fixture(r, path, transmute([]u8)text)
 
 			res = new_check(r, path, "check-public-example-certs")
 			check_eq_int(r, res.exit_code, 0, "exit code for public.yaml with a certificate it has")
@@ -501,9 +501,14 @@ server: {{ user: root }}
 	end_case(r)
 }
 
+// `--check` on `path`. A binary that did not run fails the case here, since a
+// zero exit code and empty output would otherwise pass any case that expects
+// success.
 @(private = "file")
 new_check :: proc(r: ^Runner, path: string, tag: string) -> Run_Result {
-	return run_binary(r, []string{"--config", path, "--check"}, tag)
+	res := run_binary(r, []string{"--config", path, "--check"}, tag)
+	check(r, res.ok, "could not run the binary")
+	return res
 }
 
 /*

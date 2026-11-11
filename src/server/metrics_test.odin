@@ -60,29 +60,7 @@ on a coincidence.
 */
 @(test)
 test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
-	page := render_fixture(
-		Stats {
-			queries = 1,
-			blocked = 2,
-			cached = 3,
-			forwarded = 4,
-			failed = 5,
-			rewritten = 6,
-			dropped = 7,
-			refused = 8,
-			conn_refused = 9,
-			conn_failed = 10,
-			handshakes = 11,
-			secure = 12,
-			bogus = 13,
-			rebind = 14,
-			special_use = 15,
-			accept_backoff = 16,
-			unreadable_rcode = 17,
-			coalesced = 18,
-			upstream_shed = 19,
-		},
-	)
+	page := render_fixture(DISTINCT_STATS)
 
 	expect_line(t, page, "elodin_queries_total 1")
 	expect_line(t, page, `elodin_answers_total{outcome="blocked"} 2`)
@@ -397,26 +375,7 @@ to be argued.
 */
 @(test)
 test_the_stats_line_carries_every_counter :: proc(t: ^testing.T) {
-	st := Stats {
-		queries        = 1,
-		blocked        = 2,
-		cached         = 3,
-		forwarded      = 4,
-		failed         = 5,
-		rewritten      = 6,
-		dropped        = 7,
-		refused        = 8,
-		conn_refused   = 9,
-		conn_failed    = 10,
-		handshakes     = 11,
-		secure         = 12,
-		bogus          = 13,
-		rebind         = 14,
-		special_use    = 15,
-		accept_backoff = 16,
-		unreadable_rcode = 17,
-		upstream_shed  = 18,
-	}
+	st := DISTINCT_STATS
 	cs := cache.Stats {
 		hits      = 20,
 		misses    = 21,
@@ -536,5 +495,52 @@ test_uptime_is_measured_on_the_moment_clock :: proc(t: ^testing.T) {
 	line = line[:strings.index_byte(line, '\n')]
 	up, parsed := strconv.parse_f64(line)
 	testing.expectf(t, parsed && up >= 5 && up < 60, "uptime read %q, want five seconds and change", line)
+	free_all(context.temp_allocator)
+}
+
+/*
+One value per `Stats` counter, each distinct and none zero, for the three tests
+that check a counter reaches the snapshot, the endpoint and the stats line. A
+zero lets a dropped field pass whole-struct equality, and a repeat lets a field
+read from the wrong counter pass. Kept in one place so a counter added to `Stats`
+is added here once, and `test_distinct_stats_covers_every_counter` fails until
+it is.
+*/
+DISTINCT_STATS :: Stats {
+	queries          = 1,
+	blocked          = 2,
+	cached           = 3,
+	forwarded        = 4,
+	failed           = 5,
+	rewritten        = 6,
+	dropped          = 7,
+	refused          = 8,
+	conn_refused     = 9,
+	conn_failed      = 10,
+	handshakes       = 11,
+	secure           = 12,
+	bogus            = 13,
+	rebind           = 14,
+	special_use      = 15,
+	accept_backoff   = 16,
+	unreadable_rcode = 17,
+	coalesced        = 18,
+	upstream_shed    = 19,
+}
+
+@(test)
+test_distinct_stats_covers_every_counter :: proc(t: ^testing.T) {
+	seen := make(map[u64]string, context.temp_allocator)
+	for name in reflect.struct_field_names(Stats) {
+		count, is_u64 := reflect.struct_field_value_by_name(DISTINCT_STATS, name).(u64)
+		if !testing.expectf(t, is_u64, "Stats.%s is not a u64", name) {
+			continue
+		}
+		testing.expectf(t, count != 0, "DISTINCT_STATS leaves Stats.%s at zero", name)
+		if other, dup := seen[count]; dup {
+			testing.expectf(t, false, "DISTINCT_STATS gives Stats.%s and Stats.%s the same %d", other, name, count)
+		}
+		seen[count] = name
+	}
 	free_all(context.temp_allocator)
 }

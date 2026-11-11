@@ -1,7 +1,6 @@
 package yaml
 
 import "core:mem"
-import "core:strconv"
 import "core:strings"
 
 /*
@@ -896,26 +895,14 @@ unquote_scalar :: proc(p: ^Parser, s: string, line_num: int, flow := false, key 
 				strings.write_byte(&b, '"')
 			case '/':
 				strings.write_byte(&b, '/')
-			case 'x':
-				if i + 2 >= len(inner) {
+			case 'x', 'u':
+				width := 2 if inner[i] == 'x' else 4
+				r, rok := hex_escape(inner, i + 1, width)
+				if !rok {
 					return "", true
 				}
-				v, vok := strconv.parse_u64_of_base(inner[i + 1:i + 3], 16)
-				if !vok {
-					return "", true
-				}
-				strings.write_byte(&b, u8(v))
-				i += 2
-			case 'u':
-				if i + 4 >= len(inner) {
-					return "", true
-				}
-				v, vok := strconv.parse_u64_of_base(inner[i + 1:i + 5], 16)
-				if !vok {
-					return "", true
-				}
-				strings.write_rune(&b, rune(v))
-				i += 4
+				strings.write_rune(&b, r)
+				i += width
 			case:
 				return "", true
 			}
@@ -924,4 +911,32 @@ unquote_scalar :: proc(p: ^Parser, s: string, line_num: int, flow := false, key 
 		return strings.to_string(b), false
 	}
 	return s, false
+}
+
+/*
+The code point a `\x` or `\u` escape names: exactly `width` hex digits at
+`at`. YAML 1.2 section 5.7 makes both a Unicode character, so `\xe9` is "é" in
+UTF-8 rather than the byte 0xE9, and a surrogate half is no character at all.
+Digits only, where `strconv` would also take a sign or a `_`.
+*/
+@(private)
+hex_escape :: proc(s: string, at, width: int) -> (r: rune, ok: bool) {
+	if at + width > len(s) {
+		return 0, false
+	}
+	for c in transmute([]u8)s[at:at + width] {
+		d: rune
+		switch c {
+		case '0' ..= '9':
+			d = rune(c - '0')
+		case 'a' ..= 'f':
+			d = rune(c - 'a' + 10)
+		case 'A' ..= 'F':
+			d = rune(c - 'A' + 10)
+		case:
+			return 0, false
+		}
+		r = r * 16 + d
+	}
+	return r, r < 0xd800 || r > 0xdfff
 }

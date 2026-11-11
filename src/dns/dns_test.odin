@@ -1462,3 +1462,45 @@ test_w_name_does_not_point_at_a_colliding_suffix :: proc(t: ^testing.T) {
 	testing.expectf(t, len(second) == 4 && second[2] == 0xc0 && second[3] == 2, "b.example. was written as %v", second)
 	free_all(context.temp_allocator)
 }
+
+/*
+`name_below` and `name_at_or_below` answer by label, not by suffix: every name
+is below the root, and a dot escaped inside a label (`\.` from configuration,
+`\046` from the wire) is part of that label, not a break between two.
+*/
+@(test)
+test_name_below_counts_labels_not_suffix_bytes :: proc(t: ^testing.T) {
+	Case :: struct {
+		name, zone:     string,
+		below, at_or_below: bool,
+	}
+	cases := [?]Case {
+		{"www.example.com.", "example.com.", true, true},
+		{"WWW.Example.COM.", "example.com.", true, true},
+		{"example.com.", "example.com.", false, true},
+		{"notexample.com.", "example.com.", false, false},
+		{"com.", "example.com.", false, false},
+		// The root holds every name but itself.
+		{"www.example.com.", ".", true, true},
+		{"com.", ".", true, true},
+		{".", ".", false, true},
+		// One label, "a.example", whose dot is escaped.
+		{"a\\.example.com.", "example.com.", false, false},
+		{"a\\046example.com.", "example.com.", false, false},
+		{"a\\.example.com.", "a\\.example.com.", false, true},
+		{"b.a\\.example.com.", "a\\.example.com.", true, true},
+		// An escaped backslash ends where it ends: the dot after it is real.
+		{"a\\\\.example.com.", "example.com.", true, true},
+	}
+	for c in cases {
+		testing.expectf(t, name_below(c.name, c.zone) == c.below, "name_below(%q, %q) is %v", c.name, c.zone, !c.below)
+		testing.expectf(
+			t,
+			name_at_or_below(c.name, c.zone) == c.at_or_below,
+			"name_at_or_below(%q, %q) is %v",
+			c.name,
+			c.zone,
+			!c.at_or_below,
+		)
+	}
+}

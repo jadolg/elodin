@@ -923,19 +923,23 @@ test_client_reuses_connection_across_requests :: proc(t: ^testing.T) {
 		return
 	}
 
-	// Serves every connection the test dials, not just one: this checks that a
-	// single Client issuing several sequential requests keeps reusing the same
-	// stream-multiplexed connection rather than reconnecting.
-	Counting_Server :: struct {
-		listener: net.TCP_Socket,
-		accepts:  int,
+	/*
+	Answers each request with the stream ID it arrived on. A connection numbers
+	the client's streams 1, 3, 5, ... (RFC 9113 section 5.1.1), so five requests
+	answered 1 through 9 went out on one connection, and a client that dialled
+	again for any of them would read a 1 a second time.
+	*/
+	stream_id_handler :: proc(conn: ^Conn, req: ^Request) {
+		defer request_destroy(conn, req)
+		body := make([]u8, 1, context.temp_allocator)
+		body[0] = u8(req.stream_id)
+		respond(conn, req.stream_id, Response{status = 200, content_type = "application/dns-message", body = body})
 	}
-	loop :: proc(s: ^Counting_Server) {
-		client, _, err := net.accept_tcp(s.listener)
+	serve_one :: proc(listener: net.TCP_Socket) {
+		client, _, err := net.accept_tcp(listener)
 		if err != nil {
 			return
 		}
-		s.accepts += 1
 		tc := new(Test_Conn)
 		tc.socket = client
 		defer {
@@ -943,13 +947,12 @@ test_client_reuses_connection_across_requests :: proc(t: ^testing.T) {
 			free(tc)
 		}
 		io := IO{user = tc, read = test_io_read, write = test_io_write}
-		hc := make_conn(io, echo_handler, nil)
+		hc := make_conn(io, stream_id_handler, nil)
 		serve(hc)
 		conn_wait_idle(hc)
 		conn_unref(hc)
 	}
-	srv := Counting_Server{listener = listener}
-	server_thread := thread.create_and_start_with_poly_data(&srv, loop)
+	server_thread := thread.create_and_start_with_poly_data(listener, serve_one)
 	defer {
 		thread.join(server_thread)
 		thread.destroy(server_thread)
@@ -966,22 +969,25 @@ test_client_reuses_connection_across_requests :: proc(t: ^testing.T) {
 	}
 
 	for i in 0 ..< 5 {
-		body := []u8{u8(i)}
 		resp, err := client_request(
 			c,
-			Client_Request{method = "POST", scheme = "https", authority = "mock.invalid", path = "/dns-query", body = body},
+			Client_Request{method = "POST", scheme = "https", authority = "mock.invalid", path = "/dns-query", body = {u8(i)}},
 			2 * time.Second,
 		)
 		testing.expectf(t, err == .None, "request %d failed: %v", i, err)
 		if err == .None {
-			testing.expect_value(t, len(resp.body), 1)
-			if len(resp.body) == 1 {
-				testing.expect_value(t, resp.body[0], u8(i))
-			}
+			want := u8(2 * i + 1)
+			testing.expectf(
+				t,
+				len(resp.body) == 1 && resp.body[0] == want,
+				"request %d was answered on stream %v, want %d",
+				i,
+				resp.body,
+				want,
+			)
 			delete(resp.body)
 		}
 	}
-	testing.expect_value(t, srv.accepts, 1)
 	free_all(context.temp_allocator)
 }
 

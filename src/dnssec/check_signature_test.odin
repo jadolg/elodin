@@ -1,5 +1,6 @@
 package dnssec
 
+import "core:crypto/ed25519"
 import "core:testing"
 import "elodin:dns"
 
@@ -18,7 +19,9 @@ DS and DNSKEY the chain of trust is built out of.
 That makes them worth testing where they live rather than through a caller that
 has already refused the same signature for its own reasons. Each test below
 takes a real Ed25519 signature that verifies, changes one field, and expects a
-refusal:
+refusal. Where the field is inside the signed data, the signature is made again
+over the changed field (`cs_resign`, or a fixed vector below), so the arithmetic
+succeeds and only the rule can refuse it:
 
   - a validity window that has closed, or has not opened. An attacker replaying
     a signature the zone has since rotated away from needs only for nobody to
@@ -119,6 +122,43 @@ cs_records :: proc() -> []dns.Record {
 	return records
 }
 
+/*
+`sig` signed over exactly the fields it carries, with `signing_owner` as the
+name the signature covers (the wildcard, for a Labels field short of the
+owner's), and the key that verifies it. The key comes from a fixed seed, so the
+vector is the same every run.
+*/
+@(private = "file")
+cs_resign :: proc(sig: Rrsig, signing_owner: string) -> (signed: Rrsig, keys: []Dnskey) {
+	seed: [ed25519.PRIVATE_KEY_SIZE]u8
+	for &b, i in seed {
+		b = u8(i + 1)
+	}
+	priv: ed25519.Private_Key
+	if !ed25519.private_key_set_bytes(&priv, seed[:]) {
+		return
+	}
+	// Flags 257, protocol 3, Ed25519, then the public key.
+	rdata := make([]u8, 4 + ed25519.PUBLIC_KEY_SIZE, context.temp_allocator)
+	copy(rdata, []u8{0x01, 0x01, 0x03, ALG_ED25519})
+	ed25519.private_key_public_bytes(&priv, rdata[4:])
+	key, kerr := parse_dnskey(rdata)
+	if kerr != .None {
+		return
+	}
+	signed = sig
+	signed.key_tag = key.tag
+	data, built := signing_input(signed, signing_owner, .IN, cs_records())
+	if !built {
+		return
+	}
+	signed.signature = make([]u8, ed25519.SIGNATURE_SIZE, context.temp_allocator)
+	ed25519.sign(&priv, data, signed.signature)
+	keys = make([]Dnskey, 1, context.temp_allocator)
+	keys[0] = key
+	return
+}
+
 @(test)
 test_check_signature_accepts_the_signature_it_should :: proc(t: ^testing.T) {
 	// The control. Every test below is this one with a single field moved, so
@@ -172,28 +212,28 @@ test_check_signature_refuses_a_signer_outside_the_owners_zone :: proc(t: ^testin
 	other name on the internet, and the chain of trust would no longer say who
 	is allowed to answer for what.
 
-	The signature itself is untouched here - it is a real one, over these very
-	records - so nothing but the bailiwick check stands between this call and a
-	verdict of Ok.
+	Each signature is made over the signer it names, so the arithmetic succeeds
+	and nothing but the bailiwick check stands between this call and a verdict of
+	Ok.
 	*/
 	records := cs_records()
-	keys := cs_key()
 
 	// A sibling zone, and a child of the owner rather than a parent.
 	for signer in ([]string{"example.org.", "attacker.example.", "www.www.example.com.", "ample.com."}) {
-		sig := cs_sig(CS_PLAIN_SIG)
-		sig.signer = signer
+		moved := cs_sig(CS_PLAIN_SIG)
+		moved.signer = signer
+		sig, keys := cs_resign(moved, "www.example.com.")
 		result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
 		testing.expectf(t, result == .Bad, "%q must not be able to sign www.example.com., got %v", signer, result)
 	}
 
-	// The owner's own zone and its parents are all inside bailiwick, and fail
-	// only because the signature was not made with those fields.
-	sig := cs_sig(CS_PLAIN_SIG)
-	sig.signer = "com."
-	sig.labels = 2
+	// The control: a parent zone is inside bailiwick, so the same signature
+	// from `com.` is accepted.
+	moved := cs_sig(CS_PLAIN_SIG)
+	moved.signer = "com."
+	sig, keys := cs_resign(moved, "www.example.com.")
 	in_bailiwick, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
-	testing.expect(t, in_bailiwick == .Bad, "a parent zone is in bailiwick, though this signature is not its")
+	testing.expect_value(t, in_bailiwick, Verify_Result.Ok)
 	free_all(context.temp_allocator)
 }
 
@@ -205,19 +245,21 @@ test_check_signature_refuses_a_labels_field_the_owner_contradicts :: proc(t: ^te
 	has is a signature reaching above its own zone.
 	*/
 	records := cs_records()
-	keys := cs_key()
 
+	// Each signed over the Labels field it carries, so only the rule refuses it.
 	for labels in ([]u8{4, 5, 255}) {
-		sig := cs_sig(CS_PLAIN_SIG)
-		sig.labels = labels
+		moved := cs_sig(CS_PLAIN_SIG)
+		moved.labels = labels
+		sig, keys := cs_resign(moved, "www.example.com.")
 		result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
 		testing.expectf(t, result == .Bad, "a labels field of %d over a three-label name must be refused", labels)
 	}
 
 	// Fewer labels than the signer zone carries: `example.com.` is two, so one
-	// would put the wildcard above the zone that signed it.
-	sig := cs_sig(CS_PLAIN_SIG)
-	sig.labels = 1
+	// would put the wildcard, `*.com.`, above the zone that signed it.
+	moved := cs_sig(CS_PLAIN_SIG)
+	moved.labels = 1
+	sig, keys := cs_resign(moved, "*.com.")
 	result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
 	testing.expect_value(t, result, Verify_Result.Bad)
 	free_all(context.temp_allocator)

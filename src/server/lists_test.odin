@@ -430,7 +430,7 @@ test_a_changed_query_is_not_fresh :: proc(t: ^testing.T) {
 
 	testing.expect(t, !strings.contains(path, "SECRET"), "the query is in the file name")
 	src, _ := os.read_entire_file(source_path(path), context.temp_allocator)
-	testing.expect(t, len(src) > 0 && !strings.contains(string(src), "SECRET"), "the fingerprint is %q", string(src))
+	testing.expectf(t, len(src) > 0 && !strings.contains(string(src), "SECRET"), "the fingerprint is %q", string(src))
 
 	// The query dropped from the url: the copy of the query is not fresh for it,
 	// and its own copy, once saved, leaves no fingerprint behind to say otherwise.

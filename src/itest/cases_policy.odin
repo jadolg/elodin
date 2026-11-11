@@ -1,7 +1,6 @@
 package itest
 
 import "core:fmt"
-import "core:os"
 import "core:path/filepath"
 import "core:time"
 import "elodin:dns"
@@ -15,7 +14,7 @@ Policy coverage: sink lists, block response modes, rewrites and the cache.
 @(private = "file")
 write_list :: proc(r: ^Runner, name: string, contents: string) -> string {
 	path := filepath.join({r.work_dir, name}, context.allocator) or_else ""
-	_ = os.write_entire_file(path, transmute([]u8)contents)
+	write_fixture(r, path, transmute([]u8)contents)
 	return path
 }
 
@@ -974,9 +973,14 @@ blocking: {{ enabled: false }}
 	start_case(r, "cache: negative answers are cached")
 	{
 		mock_reset_counts(mock)
-		_ = query_udp(udp_port, build_query("nx.example.com.", u16(dns.Type.A), id = 7))
+		// Both answered, and the first by the upstream, or an unchanged count
+		// proves nothing.
+		first := query_udp(udp_port, build_query("nx.example.com.", u16(dns.Type.A), id = 7))
+		check(r, first.ok, "no response to the first query")
 		count_after_first := mock_total(mock)
-		_ = query_udp(udp_port, build_query("nx.example.com.", u16(dns.Type.A), id = 8))
+		check_eq_int(r, count_after_first, 1, "upstream queries for the first negative answer")
+		second := query_udp(udp_port, build_query("nx.example.com.", u16(dns.Type.A), id = 8))
+		check(r, second.ok, "no response to the second query")
 		check_eq_int(r, mock_total(mock), count_after_first, "upstream queries after a cached negative answer")
 	}
 	end_case(r)

@@ -2,6 +2,7 @@ package itest
 
 import "core:fmt"
 import "core:strings"
+import "core:time"
 import "elodin:dns"
 
 /*
@@ -192,7 +193,7 @@ run_connection_limit_cases :: proc(r: ^Runner) {
 			// naming the setting that would change the outcome.
 			check(
 				r,
-				log_contains(&srv, "server.max_connections_per_prefix"),
+				wait_for_log(&srv, "server.max_connections_per_prefix", 5 * time.Second),
 				"the refusal never named the setting behind it; log:\n%s",
 				read_log(&srv),
 			)

@@ -326,13 +326,5 @@ test_label_helpers_walk_names_the_way_the_chain_does :: proc(t: ^testing.T) {
 	testing.expect_value(t, name_drop_labels("www.example.com.", 1), "example.com.")
 	testing.expect_value(t, name_drop_labels("www.example.com.", 3), ".")
 
-	testing.expect(t, name_in_zone("www.example.com.", "example.com."), "a child is in its zone")
-	testing.expect(t, name_in_zone("example.com.", "example.com."), "a zone contains its own apex")
-	testing.expect(t, name_in_zone("example.com.", "."), "everything is under the root")
-	testing.expect(t, !name_in_zone("example.com.", "www.example.com."), "a parent is not inside its child")
-	testing.expect(t, !name_in_zone("example.org.", "example.com."), "a sibling zone is not inside it")
-	// The check that stops a zone vouching for a name it has no authority over,
-	// and the near-miss an attacker would reach for.
-	testing.expect(t, !name_in_zone("notexample.com.", "example.com."), "a longer label is not a subdomain")
 	free_all(context.temp_allocator)
 }

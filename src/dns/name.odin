@@ -284,30 +284,42 @@ deliberately, so that a response can echo the question back byte for byte. That
 rules out any byte-wise shortcut on the suffix, however tempting one looks in
 front of the fold.
 
-The zone has to begin right after a label break, or "notexample.com." would
-count as a name below "example.com.".
+Asked label by label: the zone has to begin right after a label break, or
+"notexample.com." would count as a name below "example.com.", and a dot escaped
+inside a label (`\.` from configuration, `\046` from the wire) is part of that
+label rather than a break - so "a\.example.com." is one label under "com.", not
+a name below "example.com.". The root is below nothing and holds every other
+name.
 
 `server.name_below` is this, and calls it: the server package asks the question
-of configured zones and wildcards, and `encode_message` asks it, through
-`name_at_or_below`, of a delegation it is about to drop glue from. One answer, so neither can be tightened without
-the other following.
+of configured zones and wildcards, `encode_message` asks it, through
+`name_at_or_below`, of a delegation it is about to drop glue from, and
+`dnssec` asks it of a signer's bailiwick. One answer, so none of
+them can be tightened without the others following.
 */
 name_below :: proc(name, zone: string) -> bool {
-	if len(name) <= len(zone) {
-		return false
-	}
-	if name[len(name) - len(zone) - 1] != '.' {
-		return false
-	}
-	return name_equal_fold(name[len(name) - len(zone):], zone)
+	return name_at_or_below(name, zone) && !name_equal_fold(name, zone)
 }
 
 // `name_below`, with the zone's own name counting as inside it.
 name_at_or_below :: proc(name, zone: string) -> bool {
-	if len(name) == len(zone) {
-		return name_equal_fold(name, zone)
+	if zone == "." {
+		return true
 	}
-	return name_below(name, zone)
+	// Each label start in turn, so only a real break can begin the zone.
+	i := 0
+	for {
+		if len(name) - i == len(zone) {
+			return name_equal_fold(name[i:], zone)
+		}
+		if len(name) - i < len(zone) {
+			return false
+		}
+		for i < len(name) && name[i] != '.' {
+			i += 2 if name[i] == '\\' else 1
+		}
+		i += 1
+	}
 }
 
 // "www.example.com." -> "example.com."; "." -> "."

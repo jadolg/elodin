@@ -2,7 +2,6 @@ package itest
 
 import "core:fmt"
 import "core:net"
-import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:time"
@@ -306,7 +305,7 @@ run_acl_cases :: proc(r: ^Runner) {
 		udp_port, tcp_port := next_port(r), next_port(r)
 		cfg := config_acl(udp_port, tcp_port, upstream_port, `allow_from: ["192.168.0.0/33"]`)
 		path := filepath.join({r.work_dir, "acl-bad.yaml"}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(path, transmute([]u8)cfg)
+		write_fixture(r, path, transmute([]u8)cfg)
 		res := run_binary(r, []string{"--config", path, "--check"}, "acl-bad")
 		if check(r, res.ok, "could not run the binary") {
 			check(r, res.exit_code != 0, "--check accepted an impossible prefix length")

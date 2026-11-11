@@ -459,31 +459,16 @@ has_extended_error :: proc(opt: dns.Record) -> bool {
 
 @(private = "file")
 run_dnssec_config_cases :: proc(r: ^Runner) {
+	// A file that was not written or a binary that did not run fails the case,
+	// rather than coming back as a non-zero exit a rejection case would accept.
 	check_config :: proc(r: ^Runner, tag: string, body: string) -> (exit_code: int, output: string) {
 		path := filepath.join({r.work_dir, fmt.tprintf("%s.yaml", tag)}, context.temp_allocator) or_else ""
-		_ = os.write_entire_file(path, transmute([]u8)body)
-
-		out_path := filepath.join({r.work_dir, fmt.tprintf("%s.txt", tag)}, context.temp_allocator) or_else ""
-		out_file, oerr := os.open(out_path, {.Write, .Create, .Trunc}, os.Permissions_Read_All + {.Write_User})
-		if oerr != nil {
-			return -1, ""
+		if !write_fixture(r, path, transmute([]u8)body) {
+			return 0, ""
 		}
-		process, perr := os.process_start(
-			os.Process_Desc {
-				command = []string{r.binary, "--config", path, "--check"},
-				stdout = out_file,
-				stderr = out_file,
-			},
-		)
-		if perr != nil {
-			os.close(out_file)
-			return -1, ""
-		}
-		state, _ := os.process_wait(process)
-		os.close(out_file)
-
-		data, rerr := os.read_entire_file(out_path, context.temp_allocator)
-		return state.exit_code, rerr == nil ? string(data) : ""
+		res := run_binary(r, []string{"--config", path, "--check"}, tag)
+		check(r, res.ok, "could not run the binary")
+		return res.exit_code, res.output
 	}
 
 	start_case(r, "dnssec: --check accepts a configured trust anchor")

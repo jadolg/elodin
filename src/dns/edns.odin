@@ -61,7 +61,8 @@ Put `data` into the message's OPT record under `code`, replacing any option
 already there.
 
 Fails when the message has no OPT record - an EDNS option has nowhere to live
-without one - or when it cannot be walked.
+without one - when it cannot be walked, or when a message that has to be built
+again does not fit `MAX_MESSAGE` whole (see `encode_rebuilt`).
 */
 set_edns_option :: proc(
 	msg: []u8,
@@ -360,13 +361,7 @@ rebuild_with_opt :: proc(
 	one, which is `server.match_client_opt`'s rule for a mint that would cut an
 	answer that fits.
 	*/
-	encoded, truncated, eerr := encode_message(m, scratch, MAX_MESSAGE)
-	if eerr != .None || truncated || int(u16(encoded[10]) << 8 | u16(encoded[11])) != len(m.additional) {
-		return nil, false
-	}
-	out = alloc_slice([]u8, len(encoded), allocator) or_return
-	copy(out, encoded)
-	return out, true
+	return encode_rebuilt(m, allocator, arcount = len(m.additional))
 }
 
 /*
@@ -383,7 +378,8 @@ clients are still being served from, and the record's absence is this client's
 answer alone.
 
 Fails only where a message that has an OPT record somewhere other than the end
-cannot be decoded and encoded again.
+cannot be decoded and encoded again whole inside `MAX_MESSAGE`
+(see `encode_rebuilt`).
 
 A message that cannot be walked as far as an OPT record is reported the same way
 as one that has none: returned unchanged, and `ok`. So `ok` says the caller has
@@ -461,14 +457,7 @@ rebuild_without_opt :: proc(msg: []u8, allocator: mem.Allocator, spent: ^int) ->
 		append(&additional, rec)
 	}
 	m.additional = additional[:]
-
-	encoded, _, eerr := encode_message(m, scratch, MAX_MESSAGE)
-	if eerr != .None {
-		return nil, false
-	}
-	out = alloc_slice([]u8, len(encoded), allocator) or_return
-	copy(out, encoded)
-	return out, true
+	return encode_rebuilt(m, allocator)
 }
 
 /*
@@ -829,13 +818,7 @@ rebuild_edns_option :: proc(
 
 		// Every OPT record the message arrived with, so a second one is still
 		// there for `peek_opt_unreadable` to refuse the reply over.
-		encoded, _, eerr := encode_with_every_opt(m, scratch)
-		if eerr != .None {
-			return nil, false
-		}
-		out = alloc_slice([]u8, len(encoded), allocator) or_return
-		copy(out, encoded)
-		return out, true
+		return encode_rebuilt(m, allocator, every_opt = true)
 	}
 	return nil, false
 }
@@ -873,7 +856,8 @@ cache entry other clients are still being served from, and an option's absence
 is this client's answer alone.
 
 Fails only where the allocator runs dry, or where a message whose OPT record is
-not the last one cannot be decoded and encoded again.
+not the last one cannot be decoded and encoded again whole inside `MAX_MESSAGE`
+(see `encode_rebuilt`).
 */
 strip_edns_options :: proc(
 	msg: []u8,
@@ -961,26 +945,45 @@ rebuild_without_edns_options :: proc(msg: []u8, allocator: mem.Allocator, spent:
 		append(&additional, bare)
 	}
 	m.additional = additional[:]
+	return encode_rebuilt(m, allocator)
+}
 
-	/*
-	A re-encode that had to truncate is reported as a failure rather than
-	returned, which is the one place this parts company with the rebuilds beside
-	it.
+/*
+The tail every rebuild in this file shares: encode the edited message in the
+temp arena, and copy it out into `allocator` only if it came back whole.
 
-	They shorten a message by construction, so a truncation there is a message
-	that was already too long. This one can *grow*: a name the sender compressed
-	inside RDATA comes back written in full, which is what `w_record` does with
-	an SRV target. On the stream transports the caller's limit is 65535 and so is
-	`MAX_MESSAGE`, so a large answer that grew past it would come back with
-	records dropped and TC set, and the caller's own refit would find it inside
-	the limit and do nothing - leaving a client told to ask again over the TCP it
-	is already using. A failure is the better of the two: the caller answers it
-	SERVFAIL (`server.normalise_client_opt`) rather than forward the upstream's
-	options (RFC 6891 section 6.1.1), and a client reads SERVFAIL as the failure
-	it is, where TC on a stream sends it back round the same connection.
-	*/
-	encoded, truncated, eerr := encode_message(m, scratch, MAX_MESSAGE)
+A re-encode that had to truncate is a failure, never a message. A rebuild can
+*grow*: a name the sender compressed inside RDATA comes back written in full,
+which is what `w_record` does with an SRV target. On the stream transports the
+caller's limit is 65535 and so is `MAX_MESSAGE`, so a large answer that grew
+past it would come back with records dropped and TC set, and the caller's own
+refit would find it inside the limit and do nothing - leaving a client told to
+ask again over the TCP it is already using. Every caller has a fallback for a
+failure instead: `server.match_client_opt` keeps the record, `ensure_edns_option`
+falls through to `add_opt_record`, and `server.normalise_client_opt` answers
+SERVFAIL rather than forward the upstream's options (RFC 6891 section 6.1.1),
+which a client reads as the failure it is.
+
+`arcount`, where given, is the ARCOUNT the encode must come back with: past
+`MAX_MESSAGE` the encoder can leave an OPT record out of a complete answer
+without truncating it, and for a rebuild whose whole point is that record that
+is a failure too. `every_opt` keeps every OPT record the message holds, as
+`encode_with_every_opt` does.
+*/
+@(private)
+encode_rebuilt :: proc(m: Message, allocator: mem.Allocator, arcount := -1, every_opt := false) -> (out: []u8, ok: bool) {
+	encoded: []u8
+	truncated: bool
+	eerr: Encode_Error
+	if every_opt {
+		encoded, truncated, eerr = encode_with_every_opt(m, context.temp_allocator)
+	} else {
+		encoded, truncated, eerr = encode_message(m, context.temp_allocator, MAX_MESSAGE)
+	}
 	if eerr != .None || truncated {
+		return nil, false
+	}
+	if arcount >= 0 && int(u16(encoded[10]) << 8 | u16(encoded[11])) != arcount {
 		return nil, false
 	}
 	out = alloc_slice([]u8, len(encoded), allocator) or_return
