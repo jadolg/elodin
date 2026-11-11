@@ -625,10 +625,11 @@ run_h2_cases :: proc(r: ^Runner) {
 
 	/*
 	Last, because it narrows `server.allow_from` past loopback for good. A held
-	connection's next request is refused 403, as over HTTP/1.1 (#642), and the
-	status is read from the wire: an encoder that cannot spell a status sends 500.
+	connection's next request is refused 403 and the connection ended with
+	GOAWAY(NO_ERROR), as HTTP/1.1 closes it (#642). The status is read from the
+	wire: an encoder that cannot spell a status sends 500.
 	*/
-	start_case(r, "h2: a connection held across a reload that drops its network from allow_from gets 403")
+	start_case(r, "h2: a connection held across a reload that drops its network from allow_from gets 403, then GOAWAY")
 	{
 		c, cok := h2_connect(doh_port)
 		if check(r, cok, "cannot open an h2 connection") {
@@ -648,6 +649,10 @@ run_h2_cases :: proc(r: ^Runner) {
 					res, _ := h2_stream(c, 3)
 					check_eq_int(r, res.status, 403, "status after the reload")
 				}
+				// The 403 and the GOAWAY are one burst; read until the close.
+				for !c.goaway && h2_pump(c) {}
+				check(r, c.goaway, "the refused connection was not sent GOAWAY")
+				check(r, c.goaway_code == .No_Error, "GOAWAY code %v, want NO_ERROR", c.goaway_code)
 			}
 		}
 	}

@@ -34,10 +34,10 @@ the query is started:
 - **TCP, DoT, DoH**: the connection is closed on accept, before a fiber or TLS
   handshake, so refused sources cannot use up `max_connections`.
 - **A reload that narrows the list** reaches connections already open, at their
-  next query: TCP and DoT ones are closed unanswered; a DoH request gets `403`,
-  after which an HTTP/1.1 connection is closed and an HTTP/2 one answers each
-  further request the same way. Each such query counts once as `refused=`.
-- Counted as `refused=`: one per datagram on UDP, one per connection on streams.
+  next query: TCP and DoT ones are closed unanswered; a DoH request gets `403`
+  and the connection is closed (HTTP/2 sends `GOAWAY` with `NO_ERROR` first).
+- Counted as `refused=`: one per datagram on UDP, one per connection on streams,
+  whether refused on accept or at its next query after a reload.
 - A UDP source no reply could reach — port 0, this server's own endpoint, a
   multicast group, the limited broadcast, or `0.0.0.0`/`::` — is dropped before
   the list, whatever it says, and counted as `dropped=`.

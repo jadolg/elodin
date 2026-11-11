@@ -392,6 +392,14 @@ serve :: proc(c: ^Conn) {
 		if !handle_frame(c, h, payload) {
 			return
 		}
+		// A handler can end the connection too, through `shutdown`; nothing is
+		// read past a GOAWAY this end has sent.
+		loop.lock(&c.mu)
+		done := c.goaway_sent
+		loop.unlock(&c.mu)
+		if done {
+			return
+		}
 		free_all(context.temp_allocator)
 	}
 }
@@ -1755,6 +1763,15 @@ goaway :: proc(c: ^Conn, code: Error_Code) {
 	append_u32(&out, last)
 	append_u32(&out, u32(code))
 	_ = write_all(c, out[:])
+}
+
+/*
+End the connection from a handler: GOAWAY(NO_ERROR), which RFC 9113 6.8 says an
+endpoint SHOULD send before closing, and `serve` reads nothing after it. Streams
+already started may still answer until `serve` returns.
+*/
+shutdown :: proc(c: ^Conn) {
+	goaway(c, .No_Error)
 }
 
 /*

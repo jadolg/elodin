@@ -154,6 +154,9 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	if !stream_source_allowed(ctx.server, ctx.peer, .DoH) {
 		h2.respond(hc, req.stream_id, h2.Response{status = 403})
 		h2.request_destroy(hc, req)
+		// Then closed, as over HTTP/1.1 and as the accept loop would have: a
+		// source outside the list does not keep one of `max_connections`.
+		h2.shutdown(hc)
 		return
 	}
 
