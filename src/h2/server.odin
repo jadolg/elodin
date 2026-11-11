@@ -1920,36 +1920,20 @@ close_stream :: proc(c: ^Conn, stream_id: u32, peer_sending := false) {
 }
 
 /*
-The `:status` value as HPACK wants it, which is a string.
+The `:status` value as HPACK wants it: the code's three digits (RFC 9113 8.3.2).
 
-A table rather than a conversion so that the digits are static storage and no
-response has to allocate for three bytes. Every status this server sends is
-listed; a status that is not falls back to 500, so a caller adding one has to add
-it here as well - which is a thing to know, and the reason it is written down.
+Converted rather than looked up, so that no status a caller sends can be missing
+from a table. RFC 9110 15 puts every valid code in 100 to 599, and `respond`
+sends a final response, which 15.2 says a 1xx is not (RFC 9113 8.6 forbids 101
+outright). Anything outside 200 to 599 is a caller's mistake - a Response left at
+its zero status - and goes out as 500 rather than as a field no client can use.
 */
 @(private)
 status_text :: proc(status: int) -> string {
-	switch status {
-	case 200:
-		return "200"
-	case 400:
-		return "400"
-	case 404:
-		return "404"
-	case 405:
-		return "405"
-	case 413:
-		return "413"
-	case 415:
-		return "415"
-	case 429:
-		return "429"
-	case 500:
+	if status < 200 || status > 599 {
 		return "500"
-	case 503:
-		return "503"
 	}
-	return "500"
+	return int_to_string(status, context.temp_allocator)
 }
 
 @(private)

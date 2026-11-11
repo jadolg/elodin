@@ -622,6 +622,36 @@ run_h2_cases :: proc(r: ^Runner) {
 		}
 	}
 	end_case(r)
+
+	/*
+	Last, because it narrows `server.allow_from` past loopback for good. A held
+	connection's next request is refused 403, as over HTTP/1.1 (#642), and the
+	status is read from the wire: an encoder that cannot spell a status sends 500.
+	*/
+	start_case(r, "h2: a connection held across a reload that drops its network from allow_from gets 403")
+	{
+		c, cok := h2_connect(doh_port)
+		if check(r, cok, "cannot open an h2 connection") {
+			defer h2_close(c)
+			check(r, h2_send_get(c, 1, "/dns-query", query), "cannot send the request")
+			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
+				res, _ := h2_stream(c, 1)
+				check_eq_int(r, res.status, 200, "status before the reload")
+			}
+			narrowed := strings.concatenate(
+				{config_h2(r, udp_port, doh_port, upstream_port), "server:\n  allow_from: [\"192.0.2.0/24\"]\n"},
+				context.temp_allocator,
+			)
+			if check(r, reload_to(r, &srv, narrowed, "msg=reloaded"), "the reload was never logged") {
+				check(r, h2_send_get(c, 3, "/dns-query", query), "cannot send the request")
+				if check(r, h2_collect(c, []u32{3}), "stream 3 never completed") {
+					res, _ := h2_stream(c, 3)
+					check_eq_int(r, res.status, 403, "status after the reload")
+				}
+			}
+		}
+	}
+	end_case(r)
 }
 
 /*

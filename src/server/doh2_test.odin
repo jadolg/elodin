@@ -123,6 +123,35 @@ wrote_a_body :: proc(out: []u8) -> bool {
 	return false
 }
 
+// The `:status` of the first response HEADERS, decoded: HPACK sends the common
+// codes (200, 404, 500 among them) as a static table index, not as digits.
+@(private = "file")
+response_status :: proc(out: []u8) -> string {
+	pos := 0
+	for pos + 9 <= len(out) {
+		length := int(out[pos]) << 16 | int(out[pos + 1]) << 8 | int(out[pos + 2])
+		if pos + 9 + length > len(out) {
+			break
+		}
+		if out[pos + 3] == 0x1 {
+			table: h2.Dynamic_Table
+			h2.dynamic_table_init(&table, 4096, context.temp_allocator)
+			fields, err := h2.decode(&table, out[pos + 9:pos + 9 + length], context.temp_allocator)
+			if err != .None {
+				return ""
+			}
+			for f in fields {
+				if f.name == ":status" {
+					return f.value
+				}
+			}
+			return ""
+		}
+		pos += 9 + length
+	}
+	return ""
+}
+
 @(private = "file")
 Gate :: struct {
 	open:   bool,
@@ -184,6 +213,7 @@ serve_one :: proc(
 	// Stop the loop first, so every start is refused while the server still
 	// has loops: what a stack that cannot be mapped looks like.
 	refuse_starts := false,
+	peer := H2_PEER,
 ) -> Result {
 	handler_pool: Test_Loop
 	start_test_loop(&handler_pool)
@@ -214,7 +244,7 @@ serve_one :: proc(
 	ctx := H2_Context {
 		server = &s,
 		client = "127.0.0.1",
-		peer   = H2_PEER,
+		peer   = peer,
 		path   = cfg.listeners.doh.path,
 	}
 	io := h2.IO {
@@ -246,6 +276,29 @@ serve_one :: proc(
 		pending = ctx.pending,
 		stamped_after_gate = time.tick_diff(opened, ctx.last_question) > 0,
 	}
+}
+
+/*
+A reload can take a held connection's network out of `server.allow_from`, and its
+next request is refused 403, as over HTTP/1.1 (#642). The `:status` is decoded
+from the HEADERS frame on the wire, which is where a 403 the encoder could not
+spell would show up as 500.
+*/
+@(test)
+test_doh2_a_held_connection_outside_the_allow_list_gets_403 :: proc(t: ^testing.T) {
+	// See the note in the first test.
+	context.allocator = runtime.heap_allocator()
+
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+
+	// TEST-NET-3: in no range the default allow list names.
+	outside := net.Endpoint{address = net.IP4_Address{203, 0, 113, 9}, port = 1}
+	got := serve_one(&cfg, "/not-the-endpoint", "403", occupy = false, peer = outside)
+	defer delete(got.output)
+
+	// Not 404 either: a source outside the allow list is told nothing about paths.
+	testing.expect_value(t, response_status(got.output[:]), "403")
 }
 
 /*
