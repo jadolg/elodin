@@ -59,9 +59,9 @@ test_non_string_scalar_keys_are_refused :: proc(t: ^testing.T) {
 }
 
 /*
-`type: [tls]` on an upstream given by address does not load at all - before, it
-loaded as plain UDP to port 53, an encrypted upstream asked for and plaintext
-sent with nothing said.
+`type: [tls]` on an upstream given by address does not load at all: read as no
+`type`, it would be plain UDP to port 53, an encrypted upstream asked for and
+plaintext sent with nothing said.
 */
 @(test)
 test_upstream_type_list_does_not_load_as_udp :: proc(t: ^testing.T) {
@@ -87,4 +87,26 @@ test_upstream_type_null_keeps_default :: proc(t: ^testing.T) {
 
 	_, err = load_string("upstream:\n  servers:\n    - address: 1.1.1.1\n      type: \"\"\n", context.temp_allocator)
 	testing.expect(t, err != nil, "type: \"\" loaded")
+}
+
+// `null` is one of `blocking.response`'s names, and written bare it is that mode,
+// not YAML's empty value leaving the default nxdomain in force.
+@(test)
+test_blocking_response_null_is_zero_ip :: proc(t: ^testing.T) {
+	for v in ([]string{"null", "Null", "NULL", "\"null\""}) {
+		src := strings.concatenate({"upstream:\n  servers: [1.1.1.1]\nblocking:\n  response: ", v, "\n"}, context.temp_allocator)
+		cfg, err := load_string(src, context.temp_allocator)
+		if !testing.expectf(t, err == nil, "%s: %v", v, err) {
+			continue
+		}
+		testing.expectf(t, cfg.blocking.response == .Zero_IP, "%s: %v", v, cfg.blocking.response)
+	}
+	for v in ([]string{"~", ""}) {
+		src := strings.concatenate({"upstream:\n  servers: [1.1.1.1]\nblocking:\n  response: ", v, "\n"}, context.temp_allocator)
+		cfg, err := load_string(src, context.temp_allocator)
+		if !testing.expectf(t, err == nil, "%q: %v", v, err) {
+			continue
+		}
+		testing.expectf(t, cfg.blocking.response == .NX_Domain, "%q: %v", v, cfg.blocking.response)
+	}
 }

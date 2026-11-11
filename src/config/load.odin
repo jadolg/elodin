@@ -151,8 +151,9 @@ check_keys :: proc(l: ^Loader, n: ^yaml.Node, path: string, known: ..string) -> 
 }
 
 /*
-Whether `dst` was set: false for a key left out or written empty, which keeps the
-default, and false with an error for a list or a mapping. A key read as one word
+Whether `dst` was set: false for a key left out or null (bare, `~` or `null`;
+a quoted "" is a string), which keeps the default, and false with an error for a
+list or a mapping. A key read as one word
 from a fixed set goes through here too, so `type: [tls]` is refused rather than
 taken for no `type` at all.
 */
@@ -1801,8 +1802,15 @@ load_blocking :: proc(l: ^Loader, cfg: ^Config) {
 	opt_duration(l, n, "refresh", &cfg.blocking.refresh, "blocking")
 	opt_string(l, n, "cache_dir", &cfg.blocking.cache_dir, "blocking")
 
-	if s: string; opt_string(l, n, "response", &s, "blocking") {
-		switch strings.to_lower(s, l.allocator) {
+	response: string
+	has_response := opt_string(l, n, "response", &response, "blocking")
+	// `null` names a mode as well as YAML's empty value: written bare, it is the
+	// mode, which `opt_string` reads as the key left out.
+	if r := yaml.get(n, "response"); !has_response && r != nil && r.kind == .Scalar && r.scalar != "" && r.scalar != "~" {
+		response, has_response = r.scalar, true
+	}
+	if has_response {
+		switch strings.to_lower(response, l.allocator) {
 		case "nxdomain", "nx_domain":
 			cfg.blocking.response = .NX_Domain
 		case "nodata", "no_data", "empty":
@@ -1814,7 +1822,7 @@ load_blocking :: proc(l: ^Loader, cfg: ^Config) {
 		case "refused":
 			cfg.blocking.response = .Refused
 		case:
-			errorf(l, "blocking.response: unknown mode %q (want nxdomain, nodata, zeroip, custom or refused)", s)
+			errorf(l, "blocking.response: unknown mode %q (want nxdomain, nodata, zeroip, custom or refused)", response)
 		}
 	}
 	if s: string; opt_string(l, n, "custom_ipv4", &s, "blocking") {
