@@ -4753,9 +4753,8 @@ rather than by what it says.
 address if it is the rule that would answer its own name, and "the same domain"
 is not enough to decide that - a duplicated `domain:` is two rules with one name
 between them, and the second is reached only for a type the first has no answer
-of. That goes through
-`rewrite_rule_for`, which answers by this loop, so the precedence cannot be
-described twice and drift.
+of. That goes through `rewrite_rule_for`, which answers by this loop, so the
+precedence cannot be described twice and drift.
 */
 @(private)
 find_rewrite_index :: proc(

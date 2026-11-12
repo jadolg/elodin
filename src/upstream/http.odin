@@ -385,8 +385,8 @@ Http_Request :: struct {
 /*
 RFC 9110 5.5: a field value an HTTP/1.1 request can carry. `h2.field_value_is_valid`
 holds RFC 9113's rule, which refuses only what ends a field (NUL, CR, LF) and
-the whitespace a reader trims; no other control but HTAB is a `field-vchar`
-either, and nor is DEL.
+the whitespace a reader trims; RFC 9110 also refuses every other control but
+HTAB, which may sit between `field-vchar`s, and DEL.
 */
 @(private = "file")
 request_field_value_is_valid :: proc(value: string) -> bool {
@@ -453,8 +453,8 @@ http_exchange :: proc(
 	some other way - or, given a CR LF, one carrying fields nobody meant to send.
 	Checked here, where every request is written: a list url comes from config,
 	and a redirect's from whoever answered (#438). The method and the two header
-	values are this package's own today, and are held to the same rule so that a
-	caller passing one through cannot open the same hole.
+	values are held to the same rule, so that a caller passing one through cannot
+	open the same hole.
 	*/
 	if !h2.is_token(req.method) ||
 	   !h2.target_is_valid(req.path) ||

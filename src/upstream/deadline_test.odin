@@ -15,9 +15,9 @@ import "elodin:loop"
 A failover or round-robin query waits out a bounded budget, not every member for
 every attempt (issue #327).
 
-`attempts` rounds over every member at the full timeout each would be, for two
-black-holed members at the shipped five seconds and two attempts, a client held
-for twenty seconds, four times what a stub waits.
+Without the budget, `attempts` rounds over every member at the full timeout each
+hold a client for twenty seconds with two black-holed members at the shipped five
+seconds and two attempts: four times what a stub waits.
 */
 
 @(private = "file")
