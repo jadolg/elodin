@@ -1,6 +1,5 @@
 package server
 
-import "core:mem"
 import "core:net"
 import "core:sync"
 import "core:testing"
@@ -9,6 +8,7 @@ import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:logx"
 import "elodin:loop"
 import "elodin:dnssec"
 import "elodin:upstream"
@@ -61,11 +61,10 @@ Counting_Mock :: struct {
 	// temp arena before its deferred `fixture_stop` joins this loop.
 	reply:       [512]u8,
 	length:      int,
-	// How many bytes of the question section the fixture's reply carries, so a
-	// query for something else can be told apart from the client's.
-	question:    int,
 	answer_keys: bool,
 	seen:        u64,
+	// How many times the client's question was answered with the reply.
+	answered:    u64,
 	stop:        bool,
 }
 
@@ -81,12 +80,13 @@ counting_mock_serve :: proc(m: ^Counting_Mock) {
 		// Counted on arrival, so a query these tests say was never sent is one
 		// that was never counted either.
 		sync.atomic_add(&m.seen, 1)
-		if n >= dns.HEADER_SIZE + m.question &&
-		   mem.compare(buf[dns.HEADER_SIZE:][:m.question], m.reply[dns.HEADER_SIZE:][:m.question]) == 0 {
+		// The client's question rather than one of the validator's own.
+		if dns.same_question(buf[:n], m.reply[:m.length]) {
 			out := m.reply
 			// The query's transaction id back, so the reply is matched to it.
 			out[0], out[1] = buf[0], buf[1]
 			_, _ = net.send_udp(m.socket, out[:m.length], remote)
+			sync.atomic_add(&m.answered, 1)
 			continue
 		}
 		if !m.answer_keys {
@@ -106,45 +106,15 @@ counting_mock_serve :: proc(m: ^Counting_Mock) {
 // tests are about, reached without a captured chain.
 @(private = "file")
 unsigned_answer :: proc() -> []u8 {
-	m := dns.Message {
-		id       = 0x4d4d,
-		question = []dns.Question{{name = BOGUS_NAME, type = .A, class = .IN}},
-		answer   = []dns.Record {
-			{
-				name = BOGUS_NAME,
-				type = .A,
-				class = .IN,
-				ttl = 300,
-				data = dns.Rdata_A{addr = {203, 0, 113, 55}},
-			},
-		},
-	}
-	m.flags.qr = true
-	m.flags.ra = true
-	wire, _, err := dns.encode_message(m, context.temp_allocator)
-	if err != .None {
-		panic("failed to encode the mock's answer")
-	}
-	return wire
+	return test_reply(BOGUS_NAME, .A, a_record(BOGUS_NAME, {203, 0, 113, 55}, ttl = 300))
 }
 
 @(private = "file")
 bogus_client_query :: proc(with_edns := false, rd := true) -> []u8 {
-	m := dns.Message {
-		id       = 0x7a7a,
-		question = []dns.Question{{name = BOGUS_NAME, type = .A, class = .IN}},
-	}
-	m.flags.rd = rd
 	if with_edns {
-		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = dns.make_opt(1232, false)
-		m.additional = additional
+		return test_query(BOGUS_NAME, id = 0x7a7a, rd = rd, opt = dns.make_opt(1232, false))
 	}
-	wire, _, err := dns.encode_message(m, context.temp_allocator)
-	if err != .None {
-		panic("failed to encode the client query")
-	}
-	return wire
+	return test_query(BOGUS_NAME, id = 0x7a7a, rd = rd)
 }
 
 /*
@@ -176,19 +146,17 @@ Fixture :: struct {
 
 @(private = "file")
 fixture_start :: proc(t: ^testing.T, f: ^Fixture, answer_keys: bool, serve_stale := false) -> bool {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind the mock upstream: %v", serr)
+	socket, spec, bound := bind_mock(t)
+	if !bound {
 		return false
 	}
 	f.mock.socket = socket
 	f.mock.answer_keys = answer_keys
 	// Short, because it is what the serve loop uses to notice that the test is
-	// over; nothing here waits on a query that is not coming.
-	_ = net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond)
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
+	// over; nothing here waits on a query that is not coming. Unset, the loop
+	// would never see `stop` and `fixture_stop` would wait out the long one.
+	if terr := net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond); terr != nil {
+		testing.expectf(t, false, "cannot shorten the mock's wait: %v", terr)
 		net.close(socket)
 		return false
 	}
@@ -200,22 +168,11 @@ fixture_start :: proc(t: ^testing.T, f: ^Fixture, answer_keys: bool, serve_stale
 		return false
 	}
 	f.mock.length = copy(f.mock.reply[:], answer)
-	name_buf: [dns.MAX_NAME_WIRE]u8
-	name_len, name_err := dns.encode_name(BOGUS_NAME, name_buf[:])
-	if name_err != .None {
-		testing.expect(t, false, "the fixture's name does not encode")
-		net.close(socket)
-		return false
-	}
-	f.mock.question = name_len + 4
 
-	f.cfg = config.default_config()
-	f.cfg.log.queries = false
+	f.cfg = test_config(loopback_upstream(spec.port))
 	f.cfg.cache.enabled = true
 	f.cfg.cache.serve_stale = serve_stale
 	f.cfg.dnssec.enabled = true
-	f.cfg.upstream.strategy = .Failover
-	f.cfg.upstream.attempts = 1
 	/*
 	Short, and it is the validator's lookup that may spend it: a mock that does
 	not answer the walk's questions leaves it waiting, which is most of what
@@ -224,14 +181,6 @@ fixture_start :: proc(t: ^testing.T, f: ^Fixture, answer_keys: bool, serve_stale
 	assertions rather than pass them quietly.
 	*/
 	f.cfg.upstream.timeout = 1 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	f.cfg.upstream.servers = servers
 
 	g, gerr := upstream.make_group(f.cfg.upstream)
 	if gerr != .None {
@@ -269,25 +218,6 @@ fixture_stop :: proc(f: ^Fixture) {
 	net.close(f.mock.socket)
 }
 
-@(private = "file")
-is_servfail :: proc(wire: []u8) -> bool {
-	return len(wire) >= dns.HEADER_SIZE && wire[3] & 0xf == u8(dns.Rcode.Serv_Fail)
-}
-
-@(private = "file")
-carries_extended_error :: proc(opt: dns.Record) -> bool {
-	options, ok := opt.data.(dns.Rdata_OPT)
-	if !ok {
-		return false
-	}
-	for option in options.options {
-		if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
-			return true
-		}
-	}
-	return false
-}
-
 @(test)
 test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
 	f: Fixture
@@ -301,18 +231,21 @@ test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
 	first, outcome, served := handle_query(&f.server, query, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served, "no response was produced for the first query")
 	testing.expect_value(t, outcome, Outcome.Failed)
-	testing.expect(t, is_servfail(first), "the first query was not refused")
+	testing.expect(t, dns.peek_rcode(first) == .Serv_Fail, "the first query was not refused")
 
 	asked := sync.atomic_load(&f.mock.seen)
 	if !testing.expect(t, asked > 0, "the upstream was never asked, so nothing was validated") {
 		return
 	}
+	// The premise: what failed is the unsigned answer, told apart from the
+	// validator's own lookups by its question.
+	testing.expect_value(t, sync.atomic_load(&f.mock.answered), 1)
 
 	// What the entry holds is the refusal and not the answer that failed: the
 	// unvalidated data must not be anywhere a later hit could reach it.
 	stored, _, found := cache.get(f.answers, f.vkey, context.temp_allocator)
 	if testing.expect(t, found, "the verdict was not remembered") {
-		testing.expect(t, is_servfail(stored), "the answer that did not validate was stored")
+		testing.expect(t, dns.peek_rcode(stored) == .Serv_Fail, "the answer that did not validate was stored")
 		testing.expect(t, stored[6] == 0 && stored[7] == 0, "the stored refusal carries an answer section")
 	}
 
@@ -320,7 +253,7 @@ test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
 	second, again, served_again := handle_query(&f.server, query, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served_again, "no response was produced for the second query")
 	testing.expect_value(t, again, Outcome.Failed)
-	testing.expect(t, is_servfail(second), "the second query was not refused")
+	testing.expect(t, dns.peek_rcode(second) == .Serv_Fail, "the second query was not refused")
 	// The whole of it: the second client query cost nothing upstream.
 	testing.expect_value(t, sync.atomic_load(&f.mock.seen), asked)
 
@@ -359,9 +292,10 @@ test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
 	testing.expect_value(t, sync.atomic_load(&f.mock.seen), asked)
 	msg, derr := dns.decode_message(third, context.temp_allocator)
 	if testing.expect(t, derr == .None, "the response does not decode") {
-		opt, has := dns.find_opt(msg)
+		_, has := dns.find_opt(msg)
 		if testing.expect(t, has, "the EDNS client got no OPT record back") {
-			testing.expect(t, carries_extended_error(opt), "the remembered refusal explains nothing to an EDNS client")
+			code, _ := extended_error(third)
+			testing.expect(t, code >= 0, "the remembered refusal explains nothing to an EDNS client")
 		}
 	}
 
@@ -380,7 +314,7 @@ test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
 	testing.expect_value(t, plain, Outcome.Forwarded)
 	testing.expect(
 		t,
-		len(fourth) >= dns.HEADER_SIZE && fourth[3] & 0xf == u8(dns.Rcode.No_Error),
+		len(fourth) >= dns.HEADER_SIZE && dns.peek_rcode(fourth) == .No_Error,
 		"the remembered verdict answered a query this server was not validating",
 	)
 	testing.expect(
@@ -417,7 +351,7 @@ test_a_verdict_that_could_not_be_reached_is_not_remembered :: proc(t: ^testing.T
 	first, outcome, served := handle_query(&f.server, query, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served, "no response was produced")
 	testing.expect_value(t, outcome, Outcome.Failed)
-	testing.expect(t, is_servfail(first), "the query was not refused")
+	testing.expect(t, dns.peek_rcode(first) == .Serv_Fail, "the query was not refused")
 
 	_, _, found := cache.get(f.answers, f.vkey, context.temp_allocator)
 	testing.expect(t, !found, "a walk this server could not finish was stored as a verdict")
@@ -475,7 +409,7 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 	out, outcome, served := handle_query(&f.server, bogus_client_query(), .UDP, "test", context.temp_allocator)
 	testing.expect(t, served, "no response was produced")
 	testing.expect_value(t, outcome, Outcome.Failed)
-	testing.expect(t, is_servfail(out), "the query was not refused")
+	testing.expect(t, dns.peek_rcode(out) == .Serv_Fail, "the query was not refused")
 
 	kept, hit, found := cache.get(f.answers, f.key, context.temp_allocator)
 	if testing.expect(t, found, "the expired answer was dropped when the verdict was written down") {
@@ -497,7 +431,7 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 		if e, in_cache := f.answers.shards[0].entries[f.vkey]; testing.expect(t, in_cache, "the verdict went in elsewhere") {
 			testing.expect(t, e.bogus, "what is under the verdict key is not a verdict")
 		}
-		testing.expect(t, is_servfail(verdict), "the verdict is not a refusal")
+		testing.expect(t, dns.peek_rcode(verdict) == .Serv_Fail, "the verdict is not a refusal")
 	}
 
 	asked := sync.atomic_load(&f.mock.seen)
@@ -528,7 +462,7 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 	testing.expect_value(t, from_cache, Outcome.Cached)
 	testing.expect(
 		t,
-		len(local) >= dns.HEADER_SIZE && local[3] & 0xf == u8(dns.Rcode.No_Error) && local[7] == 1,
+		len(local) >= dns.HEADER_SIZE && dns.peek_rcode(local) == .No_Error && local[7] == 1,
 		"the RD=0 client was refused from the verdict instead of served what this server holds",
 	)
 	testing.expect_value(t, sync.atomic_load(&f.mock.seen), asked)
@@ -549,9 +483,10 @@ test_a_bogus_zone_has_a_gate_of_its_own :: proc(t: ^testing.T) {
 	broken := dnssec.Result{status = .Bogus, reason = "broken chain of trust", detail = "busy.example: the DNSKEY reply held no keys"}
 	forged := dnssec.Result{status = .Bogus, reason = "no valid signature"}
 
-	busy := zone_gate(&bogus_reported, dns.Question{name = "a1.busy.example.", type = .A}, forged)
-	testing.expect(t, busy == zone_gate(&bogus_reported, dns.Question{name = "ZZ9.Busy.Example.", type = .A}, forged), "two names under one zone took two gates")
-	testing.expect(t, busy == zone_gate(&bogus_reported, dns.Question{name = "deep.under.busy.example.", type = .A}, broken), "the zone the walk named was not the key")
-	testing.expect(t, busy != zone_gate(&bogus_reported, dns.Question{name = "www.quiet.example.", type = .A}, forged), "another zone shared the busy one's gate")
-	free_all(context.temp_allocator)
+	// A table of the test's own, so nothing here touches the server's.
+	gates: [ZONE_GATES]logx.Gate
+	busy := zone_gate(&gates, dns.Question{name = "a1.busy.example.", type = .A}, forged)
+	testing.expect(t, busy == zone_gate(&gates, dns.Question{name = "ZZ9.Busy.Example.", type = .A}, forged), "two names under one zone took two gates")
+	testing.expect(t, busy == zone_gate(&gates, dns.Question{name = "deep.under.busy.example.", type = .A}, broken), "the zone the walk named was not the key")
+	testing.expect(t, busy != zone_gate(&gates, dns.Question{name = "www.quiet.example.", type = .A}, forged), "another zone shared the busy one's gate")
 }

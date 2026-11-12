@@ -2,15 +2,12 @@ package server
 
 import "core:mem"
 import "core:fmt"
-import "core:net"
 import "core:testing"
-import "core:thread"
 import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
-import "elodin:upstream"
 
 /*
 Blocking is decided on the answer as well as the question.
@@ -23,117 +20,90 @@ holds it to that - through a mock upstream for the forwarding path, and through
 an answer put straight into the cache for the hit path.
 */
 
+/*
+The lists a case runs under: `block` and `allow` as domains, and `rules` as
+blocklist lines, each of which has to parse or the case would pass on an empty
+list.
+*/
 @(private = "file")
-Cloak_Mock :: struct {
-	socket: net.UDP_Socket,
-	reply:  []u8,
-	asked:  bool,
-}
-
-@(private = "file")
-serve_cloak :: proc(x: ^Cloak_Mock) {
-	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
-		return
+make_engine :: proc(t: ^testing.T, block, allow: []string, rules: []string = nil) -> ^filter.Engine {
+	engine := filter.engine_make()
+	block_set := filter.set_make()
+	allow_set := filter.set_make()
+	for d in block {
+		filter.set_add(block_set, d, {.Apex, .Subdomains})
 	}
-	x.asked = true
-	out: [4096]u8
-	copy(out[:], x.reply)
-	// The resolver draws a fresh transaction ID for every query it forwards.
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
+	for d in allow {
+		filter.set_add(allow_set, d, {.Apex, .Subdomains})
+	}
+	for r in rules {
+		testing.expectf(t, filter.parse_rule(block_set, allow_set, r) > 0, "rule %q did not parse", r)
+	}
+	filter.engine_swap(engine, block_set, allow_set)
+	return engine
+}
+
+// A server forwarding to a mock upstream with blocking on under `block` and
+// `allow`. Torn down with `blocking_harness_stop`.
+@(private = "file")
+blocking_harness :: proc(t: ^testing.T, h: ^Harness, caching: bool, block: []string, allow: []string = nil) -> bool {
+	if !harness_start(t, h, caching) {
+		return false
+	}
+	h.cfg.blocking.enabled = true
+	h.srv.filters = make_engine(t, block, allow)
+	return true
 }
 
 @(private = "file")
-cloak_query :: proc(name: string) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question{name = name, type = .A, class = .IN}
-	msg := dns.Message{id = 0x4321, question = questions}
-	msg.flags.rd = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+blocking_harness_stop :: proc(h: ^Harness) {
+	filter.engine_destroy(h.srv.filters)
+	harness_stop(h)
+}
+
+/*
+A CNAME at the question whose RDATA is a compression pointer past the end of the
+message: the record decodes as `Rdata_Raw`, and the message decodes whole.
+`extra_a` adds an A record at the question name behind it.
+*/
+@(private = "file")
+unreadable_cname_reply :: proc(extra_a := false) -> []u8 {
+	base := test_reply("www.brand.example.", .A)
+	owner: [dns.MAX_NAME_WIRE]u8
+	n, err := dns.encode_name("www.brand.example.", owner[:])
 	if err != .None {
-		return nil
+		panic("the CNAME's owner does not encode")
 	}
-	return wire
-}
-
-@(private = "file")
-cloak_reply :: proc(qname, target: string) -> []u8 {
-	answer := make([]dns.Record, 2, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = qname,
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = target},
+	wire := make([dynamic]u8, 0, len(base) + n + 28, context.temp_allocator)
+	append(&wire, ..base)
+	wire[7] = 2 if extra_a else 1 // ANCOUNT
+	// Owner written out rather than compressed; CNAME, IN, TTL 60, RDLENGTH 2,
+	// and the pointer.
+	append(&wire, ..owner[:n])
+	append(&wire, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 0xfe)
+	if extra_a {
+		append(&wire, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1)
 	}
-	answer[1] = dns.Record {
-		name  = target,
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
-	}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = qname, type = .A, class = .IN}
-	msg := dns.Message{question = question, answer = answer}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return wire[:]
 }
 
 @(test)
 test_a_blocked_name_reached_through_a_cname_is_still_blocked :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	h: Harness
+	if !blocking_harness(t, &h, false, {"tracker.evil.example"}) {
 		return
 	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, _ := net.bound_endpoint(socket)
-
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	block := filter.set_make()
-	allow := filter.set_make()
-	filter.set_add(block, "tracker.evil.example", {.Apex, .Subdomains})
-	filter.engine_swap(engine, block, allow)
-
-	s := Server{cfg = &cfg, group = group, filters = engine}
+	defer blocking_harness_stop(&h)
+	engine := h.srv.filters
 
 	// The tracker is on the list: asked for directly, it is blocked.
 	testing.expect_value(t, filter.engine_match(engine, "tracker.evil.example.", .A), filter.Decision.Blocked)
 
-	x := Cloak_Mock{socket = socket, reply = cloak_reply("www.brand.example.", "tracker.evil.example.")}
-	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
-	out, outcome, ok := handle_query(&s, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-
+	out, outcome, ok, _ := harness_ask(
+		&h,
+		test_query("www.brand.example."),
+		chain_reply({"www.brand.example.", "tracker.evil.example."}),
+	)
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
@@ -169,42 +139,39 @@ chain_reply :: proc(hops: []string) -> []u8 {
 	// answer: the chain is what leads there and the address is the point of it.
 	answer := make([]dns.Record, len(hops), context.temp_allocator)
 	for i in 0 ..< len(hops) - 1 {
-		answer[i] = dns.Record {
-			name  = hops[i],
-			type  = .CNAME,
-			class = .IN,
-			ttl   = 60,
-			data  = dns.Rdata_Name{name = hops[i + 1]},
-		}
+		answer[i] = cname_record(hops[i], hops[i + 1])
 	}
-	answer[len(hops) - 1] = dns.Record {
-		name  = hops[len(hops) - 1],
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
-	}
-	return chain_wire(hops[0], answer)
+	answer[len(hops) - 1] = a_record(hops[len(hops) - 1], TRACKER_ADDR)
+	return test_reply(hops[0], .A, ..answer)
 }
 
+// The address every chain here ends at.
 @(private = "file")
-chain_wire :: proc(qname: string, answer: []dns.Record) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = qname, type = .A, class = .IN}
-	msg := dns.Message{question = question, answer = answer}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
+TRACKER_ADDR :: [4]u8{203, 0, 113, 7}
 
 @(private = "file")
 serve_cached_chain :: proc(t: ^testing.T, hops, block, allow: []string) -> Outcome {
 	return serve_cached_answer(t, hops[0], chain_reply(hops), block, allow)
+}
+
+// A server answering from its cache alone, with blocking on under the lists
+// `make_engine` builds. Torn down with `cached_server_destroy`.
+@(private = "file")
+cached_server :: proc(t: ^testing.T, cfg: ^config.Config, block, allow: []string, rules: []string = nil) -> Server {
+	cfg^ = test_config()
+	cfg.cache.enabled = true
+	cfg.blocking.enabled = true
+	return Server {
+		cfg = cfg,
+		answers = cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600}),
+		filters = make_engine(t, block, allow, rules),
+	}
+}
+
+@(private = "file")
+cached_server_destroy :: proc(s: ^Server) {
+	cache.destroy(s.answers)
+	filter.engine_destroy(s.filters)
 }
 
 /*
@@ -223,40 +190,12 @@ serve_cached_answer :: proc(
 	response: ^[]u8 = nil,
 	asks := 1,
 ) -> Outcome {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = true
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
+	cfg: config.Config
+	s := cached_server(t, &cfg, block, allow, rules)
+	defer cached_server_destroy(&s)
 
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	defer cache.destroy(answers)
-
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	block_set := filter.set_make()
-	allow_set := filter.set_make()
-	for d in block {
-		filter.set_add(block_set, d, {.Apex, .Subdomains})
-	}
-	for d in allow {
-		filter.set_add(allow_set, d, {.Apex, .Subdomains})
-	}
-	for r in rules {
-		filter.parse_rule(block_set, allow_set, r)
-	}
-	filter.engine_swap(engine, block_set, allow_set)
-
-	s := Server{cfg = &cfg, answers = answers, filters = engine}
-
-	decoded, derr := dns.decode_message(wire, context.temp_allocator)
-	if !testing.expectf(t, derr == .None, "the answer would not decode: %v", derr) {
-		return .Failed
-	}
-	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], qname, .A, .IN, false, false)
-	checked := filter.engine_generation(engine) if stamped else 0
-	if !testing.expect(t, cache.put(answers, key, wire, decoded, checked), "the answer was not cached") {
+	checked := filter.engine_generation(s.filters) if stamped else 0
+	if !seed_cache(t, s.answers, qname, wire, checked = checked) {
 		return .Failed
 	}
 
@@ -264,7 +203,7 @@ serve_cached_answer :: proc(
 	outcome: Outcome
 	ok: bool
 	for _ in 0 ..< asks {
-		out, outcome, ok = handle_query(&s, cloak_query(qname), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		out, outcome, ok = handle_query(&s, test_query(qname), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	}
 	testing.expect(t, ok, "nothing came back at all")
 	if response != nil {
@@ -287,8 +226,15 @@ test_a_cached_answer_is_matched_against_the_lists_as_they_stand_now :: proc(t: ^
 	free_all(context.temp_allocator)
 }
 
-// An exception written for the name that was asked about covers the lookup and
-// not just the label: the chain below it is not searched for a reason to refuse.
+/*
+An exception written for the name that was asked about covers the lookup and not
+just the label: the chain below it is not searched for a reason to refuse.
+
+That is the escape hatch that remains. Nobody but the client chooses what gets
+asked, so an allow rule on the question is an operator statement about a lookup
+rather than something a responder can manufacture. This is what an operator
+reaches for when a first-party name resolves through a CDN somebody has listed.
+*/
 @(test)
 test_an_allowed_question_exempts_the_chain_it_leads_to :: proc(t: ^testing.T) {
 	outcome := serve_cached_chain(
@@ -332,56 +278,21 @@ to precisely because they had to unbreak a site.
 */
 @(test)
 test_an_allowed_sibling_does_not_clear_the_listed_target :: proc(t: ^testing.T) {
-	answer := make([]dns.Record, 3, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = "www.brand.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "cdn.allowed.example."},
-	}
-	answer[1] = dns.Record {
-		name  = "www.brand.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "tracker.evil.example."},
-	}
-	answer[2] = dns.Record {
-		name  = "tracker.evil.example.",
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
-	}
+	answer := test_reply(
+		"www.brand.example.",
+		.A,
+		cname_record("www.brand.example.", "cdn.allowed.example."),
+		cname_record("www.brand.example.", "tracker.evil.example."),
+		a_record("tracker.evil.example.", TRACKER_ADDR),
+	)
 	outcome := serve_cached_answer(
 		t,
 		"www.brand.example.",
-		chain_wire("www.brand.example.", answer),
+		answer,
 		[]string{"tracker.evil.example"},
 		[]string{"cdn.allowed.example"},
 	)
 	testing.expect_value(t, outcome, Outcome.Blocked)
-	free_all(context.temp_allocator)
-}
-
-/*
-The escape hatch that remains: allow the question.
-
-Nobody but the client chooses what gets asked, so an allow rule on the question
-is an operator statement about a lookup rather than something a responder can
-manufacture. This is what an operator reaches for when a first-party name
-resolves through a CDN somebody has listed.
-*/
-@(test)
-test_allowing_the_question_still_exempts_a_listed_chain :: proc(t: ^testing.T) {
-	outcome := serve_cached_chain(
-		t,
-		[]string{"www.brand.example.", "tracker.evil.example."},
-		[]string{"evil.example"},
-		[]string{"www.brand.example"},
-	)
-	testing.expect_value(t, outcome, Outcome.Cached)
 	free_all(context.temp_allocator)
 }
 
@@ -396,32 +307,17 @@ answer.
 */
 @(test)
 test_a_decoy_cname_beside_the_listed_one_does_not_hide_it :: proc(t: ^testing.T) {
-	answer := make([]dns.Record, 3, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = "www.brand.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "decoy.brand.example."},
-	}
-	answer[1] = dns.Record {
-		name  = "www.brand.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "tracker.evil.example."},
-	}
-	answer[2] = dns.Record {
-		name  = "tracker.evil.example.",
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
-	}
+	answer := test_reply(
+		"www.brand.example.",
+		.A,
+		cname_record("www.brand.example.", "decoy.brand.example."),
+		cname_record("www.brand.example.", "tracker.evil.example."),
+		a_record("tracker.evil.example.", TRACKER_ADDR),
+	)
 	outcome := serve_cached_answer(
 		t,
 		"www.brand.example.",
-		chain_wire("www.brand.example.", answer),
+		answer,
 		[]string{"tracker.evil.example"},
 		nil,
 	)
@@ -440,39 +336,18 @@ equally free to take.
 */
 @(test)
 test_a_decoy_branch_does_not_end_the_walk_before_the_other_one :: proc(t: ^testing.T) {
-	answer := make([]dns.Record, 4, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = "www.brand.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "decoy.brand.example."},
-	}
-	answer[1] = dns.Record {
-		name  = "www.brand.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "hop.other.example."},
-	}
-	answer[2] = dns.Record {
-		name  = "hop.other.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "tracker.evil.example."},
-	}
-	answer[3] = dns.Record {
-		name  = "tracker.evil.example.",
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
-	}
+	answer := test_reply(
+		"www.brand.example.",
+		.A,
+		cname_record("www.brand.example.", "decoy.brand.example."),
+		cname_record("www.brand.example.", "hop.other.example."),
+		cname_record("hop.other.example.", "tracker.evil.example."),
+		a_record("tracker.evil.example.", TRACKER_ADDR),
+	)
 	outcome := serve_cached_answer(
 		t,
 		"www.brand.example.",
-		chain_wire("www.brand.example.", answer),
+		answer,
 		[]string{"tracker.evil.example"},
 		nil,
 	)
@@ -493,32 +368,14 @@ no chain to build, no second zone to run, just the same line repeated.
 test_a_repeated_cname_does_not_spend_the_budget_for_the_listed_one :: proc(t: ^testing.T) {
 	answer := make([]dns.Record, MAX_CHAIN_NAMES + 2, context.temp_allocator)
 	for i in 0 ..< MAX_CHAIN_NAMES {
-		answer[i] = dns.Record {
-			name  = "www.brand.example.",
-			type  = .CNAME,
-			class = .IN,
-			ttl   = 60,
-			data  = dns.Rdata_Name{name = "decoy.brand.example."},
-		}
+		answer[i] = cname_record("www.brand.example.", "decoy.brand.example.")
 	}
-	answer[MAX_CHAIN_NAMES] = dns.Record {
-		name  = "www.brand.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "tracker.evil.example."},
-	}
-	answer[MAX_CHAIN_NAMES + 1] = dns.Record {
-		name  = "tracker.evil.example.",
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
-	}
+	answer[MAX_CHAIN_NAMES] = cname_record("www.brand.example.", "tracker.evil.example.")
+	answer[MAX_CHAIN_NAMES + 1] = a_record("tracker.evil.example.", TRACKER_ADDR)
 	outcome := serve_cached_answer(
 		t,
 		"www.brand.example.",
-		chain_wire("www.brand.example.", answer),
+		test_reply("www.brand.example.", .A, ..answer),
 		[]string{"tracker.evil.example"},
 		nil,
 	)
@@ -575,36 +432,23 @@ the entry is stamped with the generation it was matched against, which is what
 */
 @(test)
 test_a_clean_answer_is_walked_once_per_reload_and_not_once_per_hit :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = true
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	defer cache.destroy(answers)
-
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	block_set := filter.set_make()
-	filter.set_add(block_set, "tracker.evil.example", {.Apex, .Subdomains})
-	filter.engine_swap(engine, block_set, filter.set_make())
-
-	s := Server{cfg = &cfg, answers = answers, filters = engine}
+	cfg: config.Config
+	s := cached_server(t, &cfg, {"tracker.evil.example"}, nil)
+	defer cached_server_destroy(&s)
+	answers, engine := s.answers, s.filters
 
 	hops := []string{"www.brand.example.", "cdn.brand.example."}
-	wire := chain_reply(hops)
-	decoded, derr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	// Stored before the lists this server is running: the first hit has to walk it.
+	if !seed_cache(t, answers, hops[0], chain_reply(hops)) {
+		return
+	}
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], hops[0], .A, .IN, false, false)
-	// Stored before the lists this server is running: the first hit has to walk it.
-	testing.expect(t, cache.put(answers, key, wire, decoded), "the answer was not cached")
 
 	_, first, _ := cache.get(answers, key, context.temp_allocator, checked_against = filter.engine_generation(engine))
 	testing.expect(t, first.recheck, "an entry from before the reload was not flagged for a second look")
 
-	_, outcome, ok := handle_query(&s, cloak_query(hops[0]), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	_, outcome, ok := handle_query(&s, test_query(hops[0]), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expect(t, ok, "nothing came back at all")
 	testing.expect_value(t, outcome, Outcome.Cached)
 
@@ -625,32 +469,14 @@ walk has not reached it has not cleared.
 test_distinct_decoys_do_not_bury_the_listed_name :: proc(t: ^testing.T) {
 	answer := make([]dns.Record, MAX_CHAIN_NAMES + 2, context.temp_allocator)
 	for i in 0 ..< MAX_CHAIN_NAMES {
-		answer[i] = dns.Record {
-			name  = "www.brand.example.",
-			type  = .CNAME,
-			class = .IN,
-			ttl   = 60,
-			data  = dns.Rdata_Name{name = fmt.tprintf("decoy%d.brand.example.", i)},
-		}
+		answer[i] = cname_record("www.brand.example.", fmt.tprintf("decoy%d.brand.example.", i))
 	}
-	answer[MAX_CHAIN_NAMES] = dns.Record {
-		name  = "www.brand.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "tracker.evil.example."},
-	}
-	answer[MAX_CHAIN_NAMES + 1] = dns.Record {
-		name  = "tracker.evil.example.",
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
-	}
+	answer[MAX_CHAIN_NAMES] = cname_record("www.brand.example.", "tracker.evil.example.")
+	answer[MAX_CHAIN_NAMES + 1] = a_record("tracker.evil.example.", TRACKER_ADDR)
 	outcome := serve_cached_answer(
 		t,
 		"www.brand.example.",
-		chain_wire("www.brand.example.", answer),
+		test_reply("www.brand.example.", .A, ..answer),
 		[]string{"tracker.evil.example"},
 		nil,
 	)
@@ -723,55 +549,23 @@ while a name blocked on the *question* costs none at all.
 */
 @(test)
 test_a_cloaked_answer_is_fetched_from_the_upstream_only_once :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	h: Harness
+	if !blocking_harness(t, &h, true, {"tracker.evil.example"}) {
 		return
 	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, _ := net.bound_endpoint(socket)
+	defer blocking_harness_stop(&h)
 
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	defer cache.destroy(answers)
-
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = true
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	block := filter.set_make()
-	allow := filter.set_make()
-	filter.set_add(block, "tracker.evil.example", {.Apex, .Subdomains})
-	filter.engine_swap(engine, block, allow)
-
-	s := Server{cfg = &cfg, group = group, filters = engine, answers = answers}
-
-	x := Cloak_Mock{socket = socket, reply = cloak_reply("www.brand.example.", "tracker.evil.example.")}
-	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
-	_, first, _ := handle_query(&s, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-	testing.expect(t, x.asked, "the upstream was never asked for the first query")
+	_, first, _, asked := harness_ask(
+		&h,
+		test_query("www.brand.example."),
+		chain_reply({"www.brand.example.", "tracker.evil.example."}),
+	)
+	testing.expect(t, asked, "the upstream was never asked for the first query")
 	testing.expect_value(t, first, Outcome.Blocked)
 
 	// No mock is listening now. A second upstream query would time out and the
 	// query would fail; answered from the stored refusal, it is blocked again.
-	_, second, ok := handle_query(&s, cloak_query("www.brand.example."), .UDP, "127.0.0.2:5555", context.temp_allocator)
+	_, second, ok := handle_query(&h.srv, test_query("www.brand.example."), .UDP, "127.0.0.2:5555", context.temp_allocator)
 	testing.expect(t, ok, "the second query produced nothing at all")
 	testing.expect_value(t, second, Outcome.Blocked)
 	free_all(context.temp_allocator)
@@ -790,58 +584,22 @@ every stored answer, refused or not.
 */
 @(test)
 test_a_refused_answer_is_not_cached_with_the_upstream_ad_bit :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	h: Harness
+	if !blocking_harness(t, &h, true, {"tracker.evil.example"}) {
 		return
 	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, _ := net.bound_endpoint(socket)
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	defer cache.destroy(answers)
-
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = true
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	block := filter.set_make()
-	allow := filter.set_make()
-	filter.set_add(block, "tracker.evil.example", {.Apex, .Subdomains})
-	filter.engine_swap(engine, block, allow)
-
-	s := Server{cfg = &cfg, group = group, filters = engine, answers = answers}
+	defer blocking_harness_stop(&h)
 
 	// The upstream claims the answer is authenticated.
-	reply := cloak_reply("www.brand.example.", "tracker.evil.example.")
+	reply := chain_reply({"www.brand.example.", "tracker.evil.example."})
 	reply[3] |= 0x20
 
-	x := Cloak_Mock{socket = socket, reply = reply}
-	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
-	_, outcome, _ := handle_query(&s, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
+	_, outcome, _, _ := harness_ask(&h, test_query("www.brand.example."), reply)
 	testing.expect_value(t, outcome, Outcome.Blocked)
 
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], "www.brand.example.", .A, .IN, false, false)
-	entry, found := answers.shards[0].entries[key]
+	entry, found := h.answers.shards[0].entries[key]
 	if !testing.expect(t, found, "the refused answer was not stored, so nothing can re-walk it later") {
 		return
 	}
@@ -869,22 +627,12 @@ runs past the end of the message.
 test_junk_outside_the_answer_section_does_not_withhold_the_answer :: proc(t: ^testing.T) {
 	// A well-formed reply for www.brand.example -> good.brand.example, built and
 	// then extended by hand with an additional record that cannot be parsed.
-	answer := make([]dns.Record, 2, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = "www.brand.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "good.brand.example."},
-	}
-	answer[1] = dns.Record {
-		name  = "good.brand.example.",
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_A{addr = {203, 0, 113, 20}},
-	}
-	base := chain_wire("www.brand.example.", answer)
+	base := test_reply(
+		"www.brand.example.",
+		.A,
+		cname_record("www.brand.example.", "good.brand.example."),
+		a_record("good.brand.example.", {203, 0, 113, 20}),
+	)
 
 	// One additional record: root name, type TXT, class IN, ttl 0, RDLENGTH 32
 	// with no bytes behind it. The answer section ahead of it is untouched.
@@ -910,46 +658,13 @@ test_junk_outside_the_answer_section_does_not_withhold_the_answer :: proc(t: ^te
 
 	// Driven through the forwarding path: the cache path cannot store a message
 	// it could not decode, so this is only reachable from an upstream reply.
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	h: Harness
+	if !blocking_harness(t, &h, false, {"tracker.evil.example"}) {
 		return
 	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, _ := net.bound_endpoint(socket)
+	defer blocking_harness_stop(&h)
 
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	block := filter.set_make()
-	allow := filter.set_make()
-	filter.set_add(block, "tracker.evil.example", {.Apex, .Subdomains})
-	filter.engine_swap(engine, block, allow)
-
-	srv := Server{cfg = &cfg, group = group, filters = engine}
-
-	x := Cloak_Mock{socket = socket, reply = wire}
-	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
-	_, outcome, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
+	_, outcome, _, _ := harness_ask(&h, test_query("www.brand.example."), wire)
 
 	testing.expectf(
 		t,
@@ -978,22 +693,7 @@ question is on the allow list and the lists have been reloaded.
 */
 @(test)
 test_a_refusal_on_a_partial_decode_is_released_by_a_reload :: proc(t: ^testing.T) {
-	answer := make([]dns.Record, 2, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = "www.brand.example.",
-		type  = .CNAME,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_Name{name = "tracker.evil.example."},
-	}
-	answer[1] = dns.Record {
-		name  = "tracker.evil.example.",
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_A{addr = {203, 0, 113, 7}},
-	}
-	base := chain_wire("www.brand.example.", answer)
+	base := chain_reply({"www.brand.example.", "tracker.evil.example."})
 
 	/*
 	One additional record whose owner name is a compression pointer aiming past
@@ -1031,64 +731,21 @@ test_a_refusal_on_a_partial_decode_is_released_by_a_reload :: proc(t: ^testing.T
 		return
 	}
 
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return
-	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, _ := net.bound_endpoint(socket)
-
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = true
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
-
 	/*
-	Built from the configuration rather than with a literal, and `negative_ttl`
-	is the reason. A cache made without one rejects the bogus entry this is
-	about for having a zero lifetime, so without it the test cannot fail -
-	`put` derives the lifetime from a zero message, which reads as a denial, and
-	a denial with no negative TTL configured is not stored at all. The running
-	server has 300 there.
+	Caching, with the `negative_ttl` the harness takes from the configuration.
+	A cache made without one rejects the bogus entry this is about for having a
+	zero lifetime, so without it the test cannot fail - `put` derives the
+	lifetime from a zero message, which reads as a denial, and a denial with no
+	negative TTL configured is not stored at all. The running server has 300
+	there.
 	*/
-	answers := cache.make_cache(
-		cache.Options {
-			max_entries = 8,
-			max_ttl = cfg.cache.max_ttl,
-			min_ttl = cfg.cache.min_ttl,
-			negative_ttl = cfg.cache.negative_ttl,
-		},
-	)
-	defer cache.destroy(answers)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+	h: Harness
+	if !blocking_harness(t, &h, true, {"tracker.evil.example"}) {
 		return
 	}
-	defer upstream.destroy_group(group)
+	defer blocking_harness_stop(&h)
 
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	block := filter.set_make()
-	allow := filter.set_make()
-	filter.set_add(block, "tracker.evil.example", {.Apex, .Subdomains})
-	filter.engine_swap(engine, block, allow)
-
-	srv := Server{cfg = &cfg, group = group, filters = engine, answers = answers}
-
-	x := Cloak_Mock{socket = socket, reply = wire}
-	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
-	_, first, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
+	_, first, _, _ := harness_ask(&h, test_query("www.brand.example."), wire)
 	testing.expect_value(t, first, Outcome.Blocked)
 
 	// The operator writes the documented escape hatch and reloads.
@@ -1096,15 +753,11 @@ test_a_refusal_on_a_partial_decode_is_released_by_a_reload :: proc(t: ^testing.T
 	allow2 := filter.set_make()
 	filter.set_add(block2, "tracker.evil.example", {.Apex, .Subdomains})
 	filter.set_add(allow2, "www.brand.example", {.Apex, .Subdomains})
-	ob, oa := filter.engine_swap(engine, block2, allow2)
+	ob, oa := filter.engine_swap(h.srv.filters, block2, allow2)
 	filter.set_destroy(ob)
 	filter.set_destroy(oa)
 
-	y := Cloak_Mock{socket = socket, reply = wire}
-	mock2 := thread.create_and_start_with_poly_data(&y, serve_cloak)
-	_, second, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.2:5555", context.temp_allocator)
-	thread.join(mock2)
-	thread.destroy(mock2)
+	_, second, _, _ := harness_ask(&h, test_query("www.brand.example."), wire, client = "127.0.0.2:5555")
 
 	testing.expectf(
 		t,
@@ -1133,35 +786,8 @@ is what the whole-message version of the same problem already returns.
 */
 @(test)
 test_an_unreadable_cname_target_is_servfail_not_a_block_answer :: proc(t: ^testing.T) {
-	// A CNAME whose RDATA is a compression pointer aiming past the end of the
-	// message: the record decodes as Rdata_Raw, the message decodes fine.
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = "www.brand.example.", type = .A, class = .IN}
-	msg := dns.Message{question = question}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	base, _, enc := dns.encode_message(msg, context.temp_allocator)
-	if !testing.expect(t, enc == .None, "could not build the fixture") {
-		return
-	}
-
-	wire := make([dynamic]u8, 0, len(base) + 32, context.temp_allocator)
-	append(&wire, ..base)
-	wire[7] = 1 // ANCOUNT = 1
-	// Owner: www.brand.example., written out rather than compressed.
-	for label in ([]string{"www", "brand", "example"}) {
-		append(&wire, u8(len(label)))
-		append(&wire, ..transmute([]u8)label)
-	}
-	append(&wire, 0)
-	append(&wire, 0, 5) // TYPE = CNAME
-	append(&wire, 0, 1) // CLASS = IN
-	append(&wire, 0, 0, 0, 60) // TTL
-	append(&wire, 0, 2) // RDLENGTH = 2
-	append(&wire, 0xc0, 0xfe) // a pointer past the end of the message
-
-	decoded, derr := dns.decode_message(wire[:], context.temp_allocator)
+	wire := unreadable_cname_reply()
+	decoded, derr := dns.decode_message(wire, context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture was meant to decode as a whole") {
 		return
 	}
@@ -1172,51 +798,22 @@ test_an_unreadable_cname_target_is_servfail_not_a_block_answer :: proc(t: ^testi
 		testing.fail_now(t, "the CNAME parsed after all, so this does not reach the Unreadable path")
 	}
 
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return
-	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, _ := net.bound_endpoint(socket)
-
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
 	// Nothing on any list: the refusal is about the record, not about a rule.
-	filter.engine_swap(engine, filter.set_make(), filter.set_make())
+	h: Harness
+	if !blocking_harness(t, &h, false, nil) {
+		return
+	}
+	defer blocking_harness_stop(&h)
 
-	srv := Server{cfg = &cfg, group = group, filters = engine}
-
-	x := Cloak_Mock{socket = socket, reply = wire[:]}
-	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
-	out, outcome, ok := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-
+	out, outcome, ok, asked := harness_ask(&h, test_query("www.brand.example."), wire)
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
+	// Asked, or the SERVFAIL below is a timeout and says nothing of the record.
+	testing.expect(t, asked, "the upstream was never asked")
 	testing.expect_value(t, outcome, Outcome.Failed)
-	served, serr2 := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, serr2, dns.Decode_Error.None)
+	served, serr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, serr, dns.Decode_Error.None)
 	testing.expectf(
 		t,
 		dns.rcode_of(served) == .Serv_Fail,
@@ -1243,85 +840,24 @@ So the upstream is asked again, and a good answer is served.
 */
 @(test)
 test_an_unreadable_refusal_does_not_outlive_the_answer_that_caused_it :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return
-	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, _ := net.bound_endpoint(socket)
-
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = true
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
-
-	answers := cache.make_cache(
-		cache.Options {
-			max_entries = 8,
-			max_ttl = cfg.cache.max_ttl,
-			min_ttl = cfg.cache.min_ttl,
-			negative_ttl = cfg.cache.negative_ttl,
-		},
-	)
-	defer cache.destroy(answers)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
 	// Nothing on any list: the refusal is about the record alone.
-	filter.engine_swap(engine, filter.set_make(), filter.set_make())
-
-	srv := Server{cfg = &cfg, group = group, filters = engine, answers = answers}
-
-	// A CNAME whose RDATA is a pointer past the end of the message.
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = "www.brand.example.", type = .A, class = .IN}
-	skeleton := dns.Message{question = question}
-	skeleton.flags.qr = true
-	skeleton.flags.rd = true
-	skeleton.flags.ra = true
-	base, _, enc := dns.encode_message(skeleton, context.temp_allocator)
-	if !testing.expect(t, enc == .None, "could not build the fixture") {
+	h: Harness
+	if !blocking_harness(t, &h, true, nil) {
 		return
 	}
-	bad := make([dynamic]u8, 0, len(base) + 32, context.temp_allocator)
-	append(&bad, ..base)
-	bad[7] = 1
-	for label in ([]string{"www", "brand", "example"}) {
-		append(&bad, u8(len(label)))
-		append(&bad, ..transmute([]u8)label)
-	}
-	append(&bad, 0)
-	append(&bad, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 0xfe)
+	defer blocking_harness_stop(&h)
 
-	x := Cloak_Mock{socket = socket, reply = bad[:]}
-	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
-	_, first, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
+	_, first, _, _ := harness_ask(&h, test_query("www.brand.example."), unreadable_cname_reply())
 	testing.expect_value(t, first, Outcome.Failed)
 
 	// The upstream stops sending the malformed record. It must be asked.
-	y := Cloak_Mock{socket = socket, reply = cloak_reply("www.brand.example.", "good.brand.example.")}
-	mock2 := thread.create_and_start_with_poly_data(&y, serve_cloak)
-	_, second, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.2:5555", context.temp_allocator)
-	thread.join(mock2)
-	thread.destroy(mock2)
-
-	testing.expect(t, y.asked, "the upstream was never re-asked: the parse failure was memoised")
+	_, second, _, asked := harness_ask(
+		&h,
+		test_query("www.brand.example."),
+		chain_reply({"www.brand.example.", "good.brand.example."}),
+		client = "127.0.0.2:5555",
+	)
+	testing.expect(t, asked, "the upstream was never re-asked: the parse failure was memoised")
 	testing.expectf(t, second != .Failed, "the name stayed broken after a good answer was available (outcome=%v)", second)
 	free_all(context.temp_allocator)
 }
@@ -1342,108 +878,45 @@ path declines to create, reached from the other side.
 */
 @(test)
 test_an_entry_that_turns_unreadable_on_a_later_walk_is_dropped :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return
-	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, _ := net.bound_endpoint(socket)
-
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = true
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
-
-	answers := cache.make_cache(
-		cache.Options {
-			max_entries = 8,
-			max_ttl = cfg.cache.max_ttl,
-			min_ttl = cfg.cache.min_ttl,
-			negative_ttl = cfg.cache.negative_ttl,
-		},
-	)
-	defer cache.destroy(answers)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
 	// The question is allowlisted, so the first walk returns before reading any
 	// record and the answer is stored clean.
-	block1 := filter.set_make()
-	allow1 := filter.set_make()
-	filter.set_add(allow1, "www.brand.example", {.Apex, .Subdomains})
-	filter.engine_swap(engine, block1, allow1)
-
-	srv := Server{cfg = &cfg, group = group, filters = engine, answers = answers}
-
-	// A CNAME whose RDATA is a pointer past the end of the message.
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = "www.brand.example.", type = .A, class = .IN}
-	skeleton := dns.Message{question = question}
-	skeleton.flags.qr = true
-	skeleton.flags.rd = true
-	skeleton.flags.ra = true
-	base, _, enc := dns.encode_message(skeleton, context.temp_allocator)
-	if !testing.expect(t, enc == .None, "could not build the fixture") {
+	h: Harness
+	if !blocking_harness(t, &h, true, nil, {"www.brand.example"}) {
 		return
 	}
-	bad := make([dynamic]u8, 0, len(base) + 32, context.temp_allocator)
-	append(&bad, ..base)
-	bad[7] = 2
-	for label in ([]string{"www", "brand", "example"}) {
-		append(&bad, u8(len(label)))
-		append(&bad, ..transmute([]u8)label)
-	}
-	append(&bad, 0)
-	append(&bad, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 0xfe)
-	// And an A at the question name, so the answer is one the cache keeps: a
-	// chain that stops short of the type asked for is a denial, and with no SOA
-	// it is not stored. Beside a CNAME at the same name that is CNAME-and-other-
-	// data (RFC 2181 section 10.1), which no zone serves - but the CNAME's target
-	// is unreadable, so no name past this one is there to hold it, and the walk
-	// that refuses the entry later never reads the A.
-	append(&bad, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1)
+	defer blocking_harness_stop(&h)
 
-	x := Cloak_Mock{socket = socket, reply = bad[:]}
-	mock := thread.create_and_start_with_poly_data(&x, serve_cloak)
-	_, first, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
+	/*
+	The malformed CNAME and an A at the question name, so the answer is one the
+	cache keeps: a chain that stops short of the type asked for is a denial, and
+	with no SOA it is not stored. Beside a CNAME at the same name that is
+	CNAME-and-other-data (RFC 2181 section 10.1), which no zone serves - but the
+	CNAME's target is unreadable, so no name past this one is there to hold it,
+	and the walk that refuses the entry later never reads the A.
+	*/
+	_, first, _, _ := harness_ask(&h, test_query("www.brand.example."), unreadable_cname_reply(extra_a = true))
 	// Allowlisted, so it was served and stored rather than refused.
 	testing.expect_value(t, first, Outcome.Forwarded)
 	// Stored, or the refusal below is the dead mock's timeout and not the re-walk.
-	testing.expect_value(t, cache.stats(answers).inserts, 1)
+	testing.expect_value(t, cache.stats(h.answers).inserts, 1)
 
 	// The operator drops the allow rule and reloads.
-	ob, oa := filter.engine_swap(engine, filter.set_make(), filter.set_make())
+	ob, oa := filter.engine_swap(h.srv.filters, filter.set_make(), filter.set_make())
 	filter.set_destroy(ob)
 	filter.set_destroy(oa)
 
 	// The re-walk now reaches the malformed record: refused, and the entry goes.
-	_, second, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.2:5555", context.temp_allocator)
+	_, second, _ := handle_query(&h.srv, test_query("www.brand.example."), .UDP, "127.0.0.2:5555", context.temp_allocator)
 	testing.expect_value(t, second, Outcome.Failed)
 
 	// The upstream stops sending the malformed record. It must be asked again.
-	y := Cloak_Mock{socket = socket, reply = cloak_reply("www.brand.example.", "good.brand.example.")}
-	mock2 := thread.create_and_start_with_poly_data(&y, serve_cloak)
-	_, third, _ := handle_query(&srv, cloak_query("www.brand.example."), .UDP, "127.0.0.3:5555", context.temp_allocator)
-	thread.join(mock2)
-	thread.destroy(mock2)
-
-	testing.expect(t, y.asked, "the upstream was never re-asked: the parse failure was pinned onto the entry")
+	_, third, _, asked := harness_ask(
+		&h,
+		test_query("www.brand.example."),
+		chain_reply({"www.brand.example.", "good.brand.example."}),
+		client = "127.0.0.3:5555",
+	)
+	testing.expect(t, asked, "the upstream was never re-asked: the parse failure was pinned onto the entry")
 	testing.expectf(t, third != .Failed, "the name stayed broken after a good answer was available (outcome=%v)", third)
 	free_all(context.temp_allocator)
 }
@@ -1531,35 +1004,27 @@ asked for back upstream.
 */
 @(test)
 test_a_recheck_read_without_memory_keeps_the_entry :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = true
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	defer cache.destroy(answers)
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	block_set := filter.set_make()
-	filter.set_add(block_set, "tracker.evil.example", {.Apex, .Subdomains})
-	filter.engine_swap(engine, block_set, filter.set_make())
-	s := Server{cfg = &cfg, answers = answers, filters = engine}
+	cfg: config.Config
+	s := cached_server(t, &cfg, {"tracker.evil.example"}, nil)
+	defer cached_server_destroy(&s)
+	answers, engine := s.answers, s.filters
 
 	hops := []string{"www.brand.example.", "cdn.brand.example."}
-	wire := chain_reply(hops)
-	decoded, derr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !seed_cache(t, answers, hops[0], chain_reply(hops)) {
+		return
+	}
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], hops[0], .A, .IN, false, false)
-	testing.expect(t, cache.put(answers, key, wire, decoded), "the answer was not cached")
 	hit, stored := stored_answer(&s, key, rules_generation(&s), context.temp_allocator)
 	if !testing.expect(t, stored && hit.recheck, "an entry from before the reload was not flagged for a second look") {
 		return
 	}
 
-	query := cloak_query(hops[0])
-	msg, _ := dns.decode_message(query, context.temp_allocator)
+	query := test_query(hops[0])
+	msg, merr := dns.decode_message(query, context.temp_allocator)
+	if !testing.expect(t, merr == .None && len(msg.question) == 1, "the query does not decode") {
+		return
+	}
 	spent: int
 	st := Query_State {
 		s         = &s,
@@ -1568,7 +1033,7 @@ test_a_recheck_read_without_memory_keeps_the_entry :: proc(t: ^testing.T) {
 		q         = msg.question[0],
 		proto     = .UDP,
 		client    = "127.0.0.1:5555",
-		limit     = 512,
+		limit     = dns.MAX_UDP_SIZE,
 		spent     = &spent,
 		allocator = mem.nil_allocator(),
 	}
@@ -1583,15 +1048,27 @@ test_a_recheck_read_without_memory_keeps_the_entry :: proc(t: ^testing.T) {
 // A cloaked name refused with no memory to build the refusal is counted failed.
 @(test)
 test_a_cloak_refusal_that_built_nothing_is_counted_failed :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
+	cfg := test_config()
 	cfg.blocking.enabled = true
 	s := Server{cfg = &cfg}
-	query := cloak_query("www.brand.example.")
-	msg, _ := dns.decode_message(query, context.temp_allocator)
 	defer free_all(context.temp_allocator)
+	msg, derr := dns.decode_message(test_query("www.brand.example."), context.temp_allocator)
+	if !testing.expect(t, derr == .None && len(msg.question) == 1, "the query does not decode") {
+		return
+	}
 
-	out := refuse_cloaked(&s, "tracker.evil.example.", .Listed, msg, msg.question[0], .UDP, "127.0.0.1:5555", 512, time.tick_now(), mem.nil_allocator())
+	out := refuse_cloaked(
+		&s,
+		"tracker.evil.example.",
+		.Listed,
+		msg,
+		msg.question[0],
+		.UDP,
+		"127.0.0.1:5555",
+		dns.MAX_UDP_SIZE,
+		time.tick_now(),
+		mem.nil_allocator(),
+	)
 	testing.expect_value(t, len(out), 0)
 	testing.expect_value(t, s.stats.blocked, 0)
 	testing.expect_value(t, s.stats.failed, 1)

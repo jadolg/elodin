@@ -151,7 +151,7 @@ run_superseded :: proc(t: ^testing.T, c: Superseded_Case, detached: bool) {
 	cfg.upstream.attempts = 1
 	cfg.upstream.timeout = 5 * time.Second
 	cfg.cache.stale_timeout = 100 * time.Millisecond
-	cfg.upstream.servers = blackhole_servers(bound.port)
+	cfg.upstream.servers = loopback_upstream(bound.port)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -313,7 +313,7 @@ run_truncated :: proc(t: ^testing.T, reply: []u8, rebind: bool) {
 	cfg.upstream.attempts = 1
 	cfg.upstream.timeout = 5 * time.Second
 	cfg.rebind.enabled = rebind
-	servers := blackhole_servers(bound.port)
+	servers := loopback_upstream(bound.port)
 	servers[0].kind = .TCP
 	cfg.upstream.servers = servers
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)

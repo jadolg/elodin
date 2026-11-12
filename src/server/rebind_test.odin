@@ -302,19 +302,13 @@ ask_raw :: proc(
 	mock: ^thread.Thread
 	if forwarded {
 		mock = thread.create_and_start_with_poly_data(&x, serve_rebind)
-	} else {
-		// How long the read below waits to find out that nothing arrived. Not
-		// zero: `SO_RCVTIMEO` reads zero as "no timeout", which on a socket
-		// nothing is going to send to is the one value that hangs.
-		_ = net.set_option(socket, .Receive_Timeout, 20 * time.Millisecond)
 	}
 	out, got, sent := handle_query(&s, rebind_query_type(name, type), .UDP, "127.0.0.1:5555", request)
 	if forwarded {
 		thread.join(mock)
 		thread.destroy(mock)
 	} else {
-		serve_rebind(&x)
-		testing.expect(t, !x.asked, "the query was forwarded, so the answer did not come from this server")
+		testing.expect(t, mock_untouched(socket), "the query was forwarded, so the answer did not come from this server")
 	}
 
 	if !testing.expect(t, sent, "nothing came back at all") {

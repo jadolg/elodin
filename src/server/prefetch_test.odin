@@ -67,7 +67,7 @@ test_a_hit_near_expiry_is_refreshed_behind_the_client :: proc(t: ^testing.T) {
 	cfg.upstream.strategy = .Failover
 	cfg.upstream.attempts = 1
 	cfg.upstream.timeout = 5 * time.Second
-	cfg.upstream.servers = blackhole_servers(bound.port)
+	cfg.upstream.servers = loopback_upstream(bound.port)
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return

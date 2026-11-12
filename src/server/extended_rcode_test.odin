@@ -3,7 +3,6 @@ package server
 import "core:net"
 import "core:testing"
 import "core:thread"
-import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
@@ -227,42 +226,6 @@ tlsa_answer_reply :: proc() -> []u8 {
 	return wire
 }
 
-// Binds a mock upstream on the loopback and hands back its spec.
-@(private = "file")
-bind_mock :: proc(t: ^testing.T, name: string) -> (socket: net.UDP_Socket, spec: config.Upstream_Spec, ok: bool) {
-	sock, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return {}, {}, false
-	}
-	// Only a bound on a hang, and past the upstream timeout below rather than
-	// under it: see the note on `MOCK_RECV_TIMEOUT`.
-	_ = net.set_option(sock, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(sock)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		net.close(sock)
-		return {}, {}, false
-	}
-	return sock, config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port}, true
-}
-
-// A forwarding server with nothing between the client and the upstream: no
-// cache to answer from or store into, no blocklist, and no validator - which is
-// the arrangement this guard exists for.
-@(private = "file")
-forwarding_config :: proc(specs: []config.Upstream_Spec) -> config.Config {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.upstream.strategy = .Failover
-	// One try, so a case that is going wrong says so instead of retrying.
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	cfg.upstream.servers = specs
-	return cfg
-}
-
 // The premise every case below rests on, asserted against the fixture rather
 // than assumed: rcode 16 with a header a client reads as NOERROR.
 @(private = "file")
@@ -300,7 +263,7 @@ test_an_extended_rcode_is_not_forwarded_to_the_client :: proc(t: ^testing.T) {
 
 	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	specs[0] = spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -394,7 +357,7 @@ test_an_extended_rcode_with_a_nonzero_nibble_is_not_forwarded_either :: proc(t: 
 
 	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	specs[0] = spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -483,7 +446,7 @@ test_a_broken_upstream_is_asked_past_for_an_extended_rcode :: proc(t: ^testing.T
 	specs := make([]config.Upstream_Spec, 2, context.temp_allocator)
 	specs[0] = broken_spec
 	specs[1] = good_spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -573,7 +536,7 @@ test_a_readable_rcode_is_still_the_clients_answer :: proc(t: ^testing.T) {
 	specs := make([]config.Upstream_Spec, 2, context.temp_allocator)
 	specs[0] = first_spec
 	specs[1] = second_spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -633,7 +596,7 @@ test_a_group_with_a_spare_is_asked_past_a_servfail :: proc(t: ^testing.T) {
 		specs := make([]config.Upstream_Spec, 2, context.temp_allocator)
 		specs[0] = broken_spec
 		specs[1] = good_spec
-		cfg := forwarding_config(specs)
+		cfg := test_config(specs)
 
 		group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 		if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -706,7 +669,7 @@ test_an_unnamed_extended_rcode_is_reported_as_a_number :: proc(t: ^testing.T) {
 
 	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	specs[0] = spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -774,7 +737,7 @@ test_a_clients_extended_rcode_byte_is_not_forwarded :: proc(t: ^testing.T) {
 
 	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	specs[0] = spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {

@@ -52,6 +52,9 @@ Mock :: struct {
 	others:     bool,
 	queries:    int,
 	lookups:    int,
+	// Set once every client has been joined: the loop drains what is left in
+	// the socket and returns at its next quiet poll.
+	stop:       bool,
 }
 
 @(private = "file")
@@ -61,13 +64,8 @@ TRACKER :: "tracker.evil.test."
 // validator's own.
 @(private = "file")
 asks_qname :: proc(query: []u8) -> bool {
-	want: [dns.MAX_NAME_WIRE + 4]u8
-	n, err := dns.encode_name(QNAME, want[:])
-	if err != .None {
-		return false
-	}
-	want[n], want[n + 1], want[n + 2], want[n + 3] = 0, u8(dns.Type.A), 0, u8(dns.Class.IN)
-	return len(query) >= dns.HEADER_SIZE + n + 4 && string(query[dns.HEADER_SIZE:][:n + 4]) == string(want[:n + 4])
+	q, ok := dns.peek_question(query, context.temp_allocator)
+	return ok && dns.name_equal_fold(q.name, QNAME) && q.type == .A
 }
 
 @(private = "file")
@@ -115,15 +113,22 @@ flight_open :: proc(s: ^Server) -> bool {
 	return false
 }
 
-// Count every query until the socket goes quiet, answering each one unless told
-// not to.
+// Count every query until told to stop, answering each one unless told not to.
 @(private = "file")
 serve_mock :: proc(m: ^Mock) {
 	buf: [4096]u8
 	for {
 		n, remote, err := net.recv_udp(m.socket, buf[:])
-		if err != nil || n < dns.HEADER_SIZE {
-			return
+		if err != nil {
+			// A quiet poll: the only point the loop looks at `stop`, so whatever
+			// was already sent is counted before it returns.
+			if sync.atomic_load(&m.stop) {
+				return
+			}
+			continue
+		}
+		if n < dns.HEADER_SIZE {
+			continue
 		}
 		if m.others && !asks_qname(buf[:n]) {
 			m.lookups += 1
@@ -134,17 +139,12 @@ serve_mock :: proc(m: ^Mock) {
 		}
 		m.queries += 1
 		if m.queries == 1 {
-			// Quiet for longer than the leader can take to give up, so a
-			// follower that forwards after it is still counted.
-			_ = net.set_option(m.socket, .Receive_Timeout, m.srv.cfg.upstream.timeout + time.Second)
 			// Bounded under the upstream timeout, so that without coalescing
 			// every client is still answered and it is the count that fails.
-			for start := time.tick_now(); waiting_on(m.srv) < m.hold_for; {
-				if time.tick_since(start) > HOLD_LIMIT {
-					break
-				}
-				time.sleep(time.Millisecond)
-			}
+			_ = wait_until(proc(data: rawptr) -> bool {
+					m := (^Mock)(data)
+					return waiting_on(m.srv) >= m.hold_for
+				}, m, HOLD_LIMIT)
 		}
 		if m.silent || (m.drop_first && m.queries == 1) {
 			continue
@@ -156,45 +156,19 @@ serve_mock :: proc(m: ^Mock) {
 
 @(private = "file")
 coalesce_reply :: proc(hi, lo: u8, ttl: u32, rcode: dns.Rcode, cloak := false) -> []u8 {
-	answer := make([]dns.Record, 2 if cloak else 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-		ttl   = ttl,
-		data  = dns.Rdata_A{addr = {192, 0, 2, 7}},
-	}
+	answer: [2]dns.Record
+	n := 1
+	answer[0] = a_record(QNAME, {192, 0, 2, 7}, ttl)
 	if cloak {
-		answer[0] = dns.Record {
-			name  = QNAME,
-			type  = .CNAME,
-			class = .IN,
-			ttl   = ttl,
-			data  = dns.Rdata_Name{name = TRACKER},
-		}
-		answer[1] = dns.Record {
-			name  = TRACKER,
-			type  = .A,
-			class = .IN,
-			ttl   = ttl,
-			data  = dns.Rdata_A{addr = {192, 0, 2, 7}},
-		}
+		answer[0] = cname_record(QNAME, TRACKER, ttl)
+		answer[1] = a_record(TRACKER, {192, 0, 2, 7}, ttl)
+		n = 2
 	}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = QNAME, type = .A, class = .IN}
-	msg := dns.Message {
-		id       = u16(hi) << 8 | u16(lo),
-		question = question,
-		answer   = answer,
-	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	msg.flags.rcode = u8(rcode)
 	if rcode != .No_Error {
-		msg.answer = nil
+		n = 0
 	}
-	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+	wire := test_reply(QNAME, .A, ..answer[:n], rcode = rcode)
+	wire[0], wire[1] = hi, lo
 	return wire
 }
 
@@ -216,19 +190,11 @@ Client :: struct {
 @(private = "file")
 ask :: proc(c: ^Client) {
 	defer free_all(context.temp_allocator)
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = QNAME, type = .A, class = .IN}
-	msg := dns.Message {
-		id       = c.id,
-		question = question,
-	}
-	msg.flags.rd = true
+	opt: Maybe(dns.Record)
 	if c.edns {
-		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = dns.make_opt(UPSTREAM_UDP_SIZE, false)
-		msg.additional = additional
+		opt = dns.make_opt(UPSTREAM_UDP_SIZE, false)
 	}
-	query, _, _ := dns.encode_message(msg, context.temp_allocator)
+	query := test_query(QNAME, id = c.id, opt = opt)
 	started := time.tick_now()
 	out, outcome, served := handle_query(c.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
 	c.took = time.tick_since(started)
@@ -300,34 +266,28 @@ run_burst :: proc(
 	// How long the hand-made leader holds its followers before it lands.
 	land_after: time.Duration = 0,
 ) -> int {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	socket, spec, bound := bind_mock(t)
+	if !bound {
 		return -1
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
+	// Short, because it is how the mock's loop gets to look at `stop`.
+	if terr := net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond); !testing.expectf(
+		t,
+		terr == nil,
+		"cannot shorten the mock's wait: %v",
+		terr,
+	) {
 		return -1
 	}
 
-	cfg := config.default_config()
-	cfg.log.queries = false
+	cfg := test_config(loopback_upstream(spec.port))
 	cfg.blocking.enabled = cloak
 	cfg.cache.enabled = cache_on
 	cfg.dnssec.enabled = validating
-	cfg.upstream.strategy = .Failover
 	cfg.upstream.attempts = attempts
 	cfg.upstream.timeout = timeout
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return -1
 	}
@@ -394,23 +354,25 @@ run_burst :: proc(
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&clients[i], ask)
 		// Let the leader register before anybody else asks.
-		for start := time.tick_now(); mixed && i == 0 && !flight_open(&srv); {
-			if time.tick_since(start) > HOLD_LIMIT {
-				break
-			}
-			time.sleep(time.Millisecond)
+		if mixed && i == 0 {
+			_ = wait_until(proc(data: rawptr) -> bool {
+					return flight_open((^Server)(data))
+				}, &srv, HOLD_LIMIT)
 		}
 	}
 	for round in 0 ..< (2 if evicted_twice else 1) {
 		if !leading {
 			break
 		}
-		for start := time.tick_now(); waiting_on(&srv) < clients_asking; {
-			if time.tick_since(start) > HOLD_LIMIT {
-				break
-			}
-			time.sleep(time.Millisecond)
+		Waiting :: struct {
+			srv:   ^Server,
+			count: int,
 		}
+		w := Waiting{&srv, clients_asking}
+		_ = wait_until(proc(data: rawptr) -> bool {
+				w := (^Waiting)(data)
+				return waiting_on(w.srv) >= w.count
+			}, &w, HOLD_LIMIT)
 		testing.expect_value(t, waiting_on(&srv), clients_asking)
 		time.sleep(land_after)
 		leaders[round].stored = evicted
@@ -424,6 +386,7 @@ run_burst :: proc(
 		thread.join(th)
 		thread.destroy(th)
 	}
+	sync.atomic_store(&m.stop, true)
 	thread.join(mock)
 	thread.destroy(mock)
 	// Every place taken among the queries waiting on an upstream - leaders,
@@ -720,7 +683,10 @@ test_a_follower_is_told_whether_its_message_was_the_leaders :: proc(t: ^testing.
 		}
 		msg.flags.rd = true
 		msg.flags.ad = ad
-		wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+		wire, _, err := dns.encode_message(msg, context.temp_allocator)
+		if err != .None {
+			panic("the message does not encode")
+		}
 		return wire
 	}
 	follow :: proc(leader, follower: []u8) -> bool {
@@ -732,7 +698,7 @@ test_a_follower_is_told_whether_its_message_was_the_leaders :: proc(t: ^testing.
 		joined, _ := flight_join(&s, "k", &other)
 		// Landed from another thread, which is what a follower waits for.
 		landing := thread.create_and_start_with_poly_data2(&s, &lead, flight_land)
-		_, landed, same := flight_follow(&s, joined, 5 * time.Second, context.temp_allocator, false, follower)
+		_, landed, same := flight_follow(&s, joined, 5 * time.Second, context.temp_allocator, counted = false, forwarded = follower)
 		thread.join(landing)
 		thread.destroy(landing)
 		return landed && same
@@ -928,29 +894,24 @@ two.
 test_a_follower_waits_no_longer_than_its_deadline_allows :: proc(t: ^testing.T) {
 	TIMEOUT :: 100 * time.Millisecond
 	sockets: [2]net.UDP_Socket
+	bound := 0
+	defer for socket in sockets[:bound] {
+		net.close(socket)
+	}
 	servers := make([]config.Upstream_Spec, 2, context.temp_allocator)
 	for i in 0 ..< 2 {
-		socket, err := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-		if !testing.expectf(t, err == nil, "cannot bind mock %d: %v", i, err) {
+		socket, spec, ok := bind_mock(t, "silent")
+		if !ok {
 			return
 		}
 		sockets[i] = socket
-		bound, _ := net.bound_endpoint(socket)
-		servers[i] = config.Upstream_Spec{name = "silent", kind = .UDP, address = "127.0.0.1", port = bound.port}
+		bound += 1
+		servers[i] = spec
 	}
-	defer for socket in sockets {
-		net.close(socket)
-	}
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.upstream.strategy = .Failover
+	cfg := test_config(servers)
 	cfg.upstream.attempts = 2
 	cfg.upstream.timeout = TIMEOUT
-	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -970,12 +931,8 @@ test_a_follower_waits_no_longer_than_its_deadline_allows :: proc(t: ^testing.T) 
 	}
 	defer flight_land(&srv, &leader)
 
-	questions := []dns.Question{{name = QNAME, type = .A, class = .IN}}
-	msg := dns.Message{id = 0x4460, question = questions}
-	msg.flags.rd = true
-	query, _, _ := dns.encode_message(msg, context.temp_allocator)
 	started := time.tick_now()
-	out, _, ok := handle_query(&srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, _, ok := handle_query(&srv, test_query(QNAME, id = 0x4460), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	took := time.tick_since(started)
 
 	testing.expect(t, ok, "the follower got no answer at all")
@@ -1020,23 +977,15 @@ nobody left to ask.
 @(test)
 test_a_follower_still_takes_an_answer_landing_just_past_its_deadline :: proc(t: ^testing.T) {
 	TIMEOUT :: 400 * time.Millisecond
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock: %v", serr) {
+	socket, spec, bound := bind_mock(t, "silent")
+	if !bound {
 		return
 	}
 	defer net.close(socket)
-	bound, _ := net.bound_endpoint(socket)
-	cfg := config.default_config()
-	cfg.log.queries = false
+	cfg := test_config(loopback_upstream(spec.port, "silent"))
 	cfg.cache.enabled = true
-	cfg.blocking.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
 	cfg.upstream.timeout = TIMEOUT
-	servers := []config.Upstream_Spec{{name = "silent", kind = .UDP, address = "127.0.0.1", port = bound.port}}
-	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream, context.allocator)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -1049,14 +998,7 @@ test_a_follower_still_takes_an_answer_landing_just_past_its_deadline :: proc(t: 
 		answers = answers,
 	}
 
-	questions := []dns.Question{{name = QNAME, type = .A, class = .IN}}
-	reply := dns.Message {
-		id       = 0x4461,
-		question = questions,
-		answer   = []dns.Record{{name = QNAME, type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {192, 0, 2, 46}}}},
-	}
-	reply.flags.qr, reply.flags.rd, reply.flags.ra = true, true, true
-	answer, _, _ := dns.encode_message(reply, context.temp_allocator)
+	answer := test_reply(QNAME, .A, a_record(QNAME, {192, 0, 2, 46}, ttl = 300))
 
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
@@ -1070,10 +1012,7 @@ test_a_follower_still_takes_an_answer_landing_just_past_its_deadline :: proc(t: 
 	late := Late_Leader{srv = &srv, flight = &leader, answer = answer, at = time.tick_add(time.tick_now(), 7 * TIMEOUT / 2)}
 	lander := thread.create_and_start_with_poly_data(&late, land_late)
 
-	query_msg := dns.Message{id = 0x4462, question = questions}
-	query_msg.flags.rd = true
-	query, _, _ := dns.encode_message(query_msg, context.temp_allocator)
-	out, outcome, ok := handle_query(&srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&srv, test_query(QNAME, id = 0x4462), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(lander)
 	thread.destroy(lander)
 

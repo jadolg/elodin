@@ -455,7 +455,7 @@ test_a_lapsed_stale_copy_waits_for_the_refresh :: proc(t: ^testing.T) {
 	cfg.upstream.attempts = 1
 	cfg.upstream.timeout = 5 * time.Second
 	cfg.cache.stale_timeout = 100 * time.Millisecond
-	cfg.upstream.servers = blackhole_servers(bound.port)
+	cfg.upstream.servers = loopback_upstream(bound.port)
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
@@ -828,7 +828,7 @@ test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T)
 	cfg.upstream.attempts = 2
 	cfg.upstream.timeout = 1 * time.Second
 	cfg.cache.stale_timeout = 150 * time.Millisecond
-	cfg.upstream.servers = blackhole_servers(bound.port)
+	cfg.upstream.servers = loopback_upstream(bound.port)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -927,7 +927,7 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 	// second query arrives.
 	cfg.upstream.timeout = 2 * time.Second
 	cfg.cache.stale_timeout = 100 * time.Millisecond
-	cfg.upstream.servers = blackhole_servers(bound.port)
+	cfg.upstream.servers = loopback_upstream(bound.port)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -1023,7 +1023,7 @@ test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
 	cfg.upstream.attempts = 1
 	cfg.upstream.timeout = 5 * time.Second
 	cfg.cache.stale_timeout = 100 * time.Millisecond
-	cfg.upstream.servers = blackhole_servers(bound.port)
+	cfg.upstream.servers = loopback_upstream(bound.port)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -1129,7 +1129,7 @@ test_a_refresh_that_beats_the_timer_answers_the_client :: proc(t: ^testing.T) {
 	// Well past what a loopback exchange takes, so a case that goes wrong says
 	// the refresh was not reached rather than that the machine was busy.
 	cfg.cache.stale_timeout = 5 * time.Second
-	cfg.upstream.servers = blackhole_servers(bound.port)
+	cfg.upstream.servers = loopback_upstream(bound.port)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -1221,7 +1221,7 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 	cfg.upstream.timeout = 400 * time.Millisecond
 	// The escape hatch, and the only thing under test.
 	cfg.cache.stale_timeout = 0
-	cfg.upstream.servers = blackhole_servers(bound.port)
+	cfg.upstream.servers = loopback_upstream(bound.port)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -1282,19 +1282,6 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 	s.loops = nil
 	testing.expect_value(t, drain_datagrams(hole), 1)
 	free_all(context.temp_allocator)
-}
-
-// One upstream, at a port on loopback, for the response-timer fixtures above.
-@(private)
-blackhole_servers :: proc(port: int) -> []config.Upstream_Spec {
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = port,
-	}
-	return servers
 }
 
 /*
