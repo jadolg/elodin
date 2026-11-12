@@ -292,7 +292,8 @@ run_dnssec_cname_denial_cases :: proc(r: ^Runner) {
 		if f.key == "cd_no_proof" {
 			padded, padded_ok := with_unsigned_answer(wire)
 			if !padded_ok {
-				skip_case(r, "dnssec: denial after a cname", "cannot append to the unproven denial")
+				// The codec's failure or the fixture's, not a busy port: failed.
+				fail(r, "dnssec: denial after a cname: cannot append to the unproven denial")
 				mock_stop(mock)
 				return
 			}

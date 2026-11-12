@@ -2,6 +2,7 @@ package itest
 
 import "core:fmt"
 import "core:net"
+import "core:strings"
 import "core:time"
 import "elodin:dns"
 
@@ -39,6 +40,11 @@ config_running :: proc(
 	servers := "",
 	cache := "{ enabled: false }",
 ) -> string {
+	// On lines of their own, as `base_config` takes them.
+	upstream_extra := upstream_extra
+	if upstream_extra != "" && !strings.has_suffix(upstream_extra, "\n") {
+		upstream_extra = fmt.tprintf("%s\n", upstream_extra)
+	}
 	doh := "doh: { enabled: false }"
 	if doh_port > 0 {
 		doh = fmt.tprintf(
@@ -262,8 +268,9 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 		second_port := next_port(r)
 		second := mock_make("running-race", second_port)
 		mock_delay_all(second, DELAY, nil)
+		// Stopped whether or not it started: `mock_stop` frees a failed start too.
+		defer mock_stop(second)
 		if check(r, mock_start(second), "cannot start the second mock upstream") {
-			defer mock_stop(second)
 			race_port := next_port(r)
 			race_config := config_running(
 				r,
@@ -271,7 +278,7 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 				0,
 				upstream_port,
 				"  rate_limit: { enabled: false }",
-				upstream_extra = "  strategy: race\n",
+				upstream_extra = "  strategy: race",
 				servers = fmt.tprintf(`["127.0.0.1:%d", "127.0.0.1:%d"]`, upstream_port, second_port),
 			)
 			rsrv, rok := start_server(r, Server_Options{config = race_config, udp_port = race_port, warmup = DELAY})
@@ -304,8 +311,9 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 		stale_port := next_port(r)
 		stale_mock := mock_make("running-stale", stale_port)
 		mock_delay_all(stale_mock, 200 * time.Millisecond, make_a_response(qname, {203, 0, 113, 9}, 60, context.allocator))
+		// Stopped whether or not it started: `mock_stop` frees a failed start too.
+		defer mock_stop(stale_mock)
 		if check(r, mock_start(stale_mock), "cannot start the stale mock upstream") {
-			defer mock_stop(stale_mock)
 			udp := next_port(r)
 			stale_config := config_running(
 				r,
@@ -359,8 +367,9 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 		start_case(r, "mock: holds a burst of 500 sent back to back")
 		burst_mock := mock_make("running-burst", next_port(r))
 		mock_delay_all(burst_mock, 0, nil)
+		// Stopped whether or not it started: `mock_stop` frees a failed start too.
+		defer mock_stop(burst_mock)
 		if check(r, mock_start(burst_mock), "cannot start the burst mock upstream") {
-			defer mock_stop(burst_mock)
 			mock_hold_until(burst_mock, 500)
 			s, err := net.make_unbound_udp_socket(.IP4)
 			if check(r, err == nil, "cannot open a client socket") {
@@ -395,8 +404,9 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 	{
 		derived_mock := mock_make("running-derived", next_port(r))
 		mock_delay_all(derived_mock, 0, nil)
+		// Stopped whether or not it started: `mock_stop` frees a failed start too.
+		defer mock_stop(derived_mock)
 		if check(r, mock_start(derived_mock), "cannot start the derived mock upstream") {
-			defer mock_stop(derived_mock)
 			derived_port := next_port(r)
 			dsrv, dok := start_server(
 				r,

@@ -207,7 +207,8 @@ ttl_mock :: proc(r: ^Runner) -> (mock: ^Mock, reference: []u8, original: u32, ok
 run_dnssec_ttl_cases :: proc(r: ^Runner) {
 	mock, reference, original, built := ttl_mock(r)
 	if !built {
-		skip_case(r, "dnssec: served ttl", "cannot raise the answer's ttls")
+		// The codec's failure or the fixture's, not a busy port: failed.
+		fail(r, "dnssec: served ttl: cannot raise the answer's ttls")
 		mock_stop(mock)
 		return
 	}

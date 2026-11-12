@@ -93,6 +93,8 @@ Server :: struct {
 	running:   bool,
 	// See `Runner.graceful_stop`.
 	graceful:  bool,
+	// Started on its configuration as written, which `reload_to` keeps to.
+	verbatim:  bool,
 }
 
 next_port :: proc(r: ^Runner) -> int {
@@ -424,6 +426,18 @@ upstream_at :: proc(port: int) -> string {
 	return fmt.tprintf(`["127.0.0.1:%d"]`, port)
 }
 
+// Loopback upstreams on `ports`, in order and each under `scheme` ("udp://",
+// say, or none), as a `servers` value for `base_config`.
+upstreams_at :: proc(ports: []int, scheme := "") -> string {
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_byte(&b, '[')
+	for port, i in ports {
+		fmt.sbprintf(&b, "%s\"%s127.0.0.1:%d\"", ", " if i > 0 else "", scheme, port)
+	}
+	strings.write_byte(&b, ']')
+	return strings.to_string(b)
+}
+
 /*
 Turn DNSSEC validation off for cases that are not about it.
 
@@ -501,6 +515,7 @@ start_server_raw :: proc(
 		// Carried on the server rather than looked up at stop time, so a case
 		// that keeps one past the runner's frame still ends it the same way.
 		graceful = r.graceful_stop,
+		verbatim = verbatim,
 	}
 	return srv, true
 }
@@ -738,7 +753,8 @@ is over.
 */
 reload_to :: proc(r: ^Runner, srv: ^Server, config: string, needle: string, timeout := 5 * time.Second) -> bool {
 	before := log_count(srv, needle)
-	if !write_fixture(r, config_path(r, srv.udp_port), transmute([]u8)without_dnssec(config)) {
+	written := config if srv.verbatim else without_dnssec(config)
+	if !write_fixture(r, config_path(r, srv.udp_port), transmute([]u8)written) {
 		return false
 	}
 	return signal_reload(srv) && wait_for_log_count(srv, needle, before + 1, timeout)

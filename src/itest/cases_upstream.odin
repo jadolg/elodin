@@ -71,13 +71,9 @@ run_strategy_cases :: proc(r: ^Runner) {
 	}
 
 	strategy_config :: proc(udp_port: int, strategy: string, ports: []int) -> string {
-		servers := "["
-		for p, i in ports {
-			servers = fmt.tprintf("%s%s\"127.0.0.1:%d\"", servers, i > 0 ? ", " : "", p)
-		}
 		return base_config(
 			udp_port,
-			fmt.tprintf("%s]", servers),
+			upstreams_at(ports),
 			log = "{ level: debug, queries: true }",
 			upstream_extra = fmt.tprintf("  strategy: %s\n  attempts: 1", strategy),
 		)

@@ -59,10 +59,11 @@ run_stale_superseded_cases :: proc(r: ^Runner) {
 
 	after := mock_make("superseded-after", upstream_port)
 	mock_delay_all(after, 800 * time.Millisecond, make_a_response(qname, {203, 0, 113, 42}, 0, context.allocator))
+	// Stopped whether or not it started: `mock_stop` frees a failed start too.
+	defer mock_stop(after)
 	if !check(r, mock_start(after), "cannot restart the mock upstream") {
 		return
 	}
-	defer mock_stop(after)
 	held := superseded_entries(metrics_port)
 	if !check(r, held >= 1, "elodin_cache_entries read %d with the expired copy held", held) {
 		return

@@ -111,12 +111,6 @@ routed_config :: proc(
 	rebind := true,
 	strategy := "",
 ) -> string {
-	list := strings.builder_make(context.temp_allocator)
-	strings.write_byte(&list, '[')
-	for port, i in servers {
-		fmt.sbprintf(&list, "%sudp://127.0.0.1:%d", ", " if i > 0 else "", port)
-	}
-	strings.write_byte(&list, ']')
 	upstream := strings.builder_make(context.temp_allocator)
 	strings.write_string(&upstream, "  attempts: 1\n")
 	if strategy != "" {
@@ -125,7 +119,7 @@ routed_config :: proc(
 	fmt.sbprintf(&upstream, "  zones:\n%s", zones)
 	return base_config(
 		udp_port,
-		strings.to_string(list),
+		upstreams_at(servers, "udp://"),
 		log = "{ level: info }",
 		upstream_extra = strings.to_string(upstream),
 		extra = fmt.tprintf("%srebind: {{ enabled: %v }}\n", dnssec, rebind),
