@@ -444,14 +444,16 @@ mock_start :: proc(m: ^Mock, cert_file := "", key_file := "") -> bool {
 
 	if !track_thread(&m.mu, &m.threads, thread.create_and_start_with_poly_data(m, mock_udp_loop)) ||
 	   !track_thread(&m.mu, &m.threads, thread.create_and_start_with_poly_data(m, mock_tcp_loop)) {
-		// A loop that did start is told to go and joined, so the sockets close
-		// under nothing that is still reading them.
+		// A loop that did start is told to go and joined first, so the sockets
+		// close under nothing that is still reading them: the loops read
+		// `m.udp_socket` and `m.tcp_socket` each turn, and wake within
+		// POLL_INTERVAL to see the flag.
 		sync.atomic_store(&m.stop, true)
+		join_threads(&m.mu, &m.threads)
 		net.close(udp)
 		net.close(tcp)
 		m.udp_socket = 0
 		m.tcp_socket = 0
-		join_threads(&m.mu, &m.threads)
 		return false
 	}
 	return true

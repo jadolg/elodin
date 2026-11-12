@@ -21,15 +21,20 @@ with and sending the signal an operator's `systemctl reload` sends.
 */
 
 @(private = "file")
-config_reload_text :: proc(udp_port, upstream_port: int, extra: string) -> string {
+config_reload_text :: proc(
+	udp_port, upstream_port: int,
+	extra: string,
+	log := "{ level: debug, queries: true }",
+	rate_limit := false,
+) -> string {
 	return base_config(
 		udp_port,
 		upstream_at(upstream_port),
-		log = "{ level: debug, queries: true }",
+		log = log,
 		upstream_extra = "  attempts: 1",
 		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
 		cache = "{ enabled: true }",
-		extra = fmt.tprintf("server:\n  rate_limit: {{ enabled: false }}\n%s", extra),
+		extra = fmt.tprintf("server:\n  rate_limit: {{ enabled: %v }}\n%s", rate_limit, extra),
 	)
 }
 
@@ -255,12 +260,7 @@ run_log_reopen_case :: proc(r: ^Runner, upstream_port: int) {
 	udp_port := next_port(r)
 	log_file := fmt.aprintf("%s/reload-%d.log", r.work_dir, udp_port)
 	defer delete(log_file)
-	config := strings.concatenate(
-		{config_reload_text(udp_port, upstream_port, ""), fmt.tprintf("log: {{ level: info, file: %q }}\n", log_file)},
-		context.temp_allocator,
-	)
-	// The `log:` above is the second one in the file; keep only the last.
-	config, _ = strings.replace(config, "log: { level: debug, queries: true }\n", "", 1, context.temp_allocator)
+	config := config_reload_text(udp_port, upstream_port, "", log = fmt.tprintf("{{ level: info, file: %q }}", log_file))
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
 		return
@@ -313,14 +313,7 @@ budget is refilled.
 run_cookie_limit_reload_case :: proc(r: ^Runner, upstream_port: int) {
 	udp_port := next_port(r)
 	text :: proc(udp_port, upstream_port: int, cookies: bool) -> string {
-		base, _ := strings.replace(
-			config_reload_text(udp_port, upstream_port, fmt.tprintf("cookies: {{ enabled: %v }}\n", cookies)),
-			"rate_limit: { enabled: false }",
-			"rate_limit: { enabled: true }",
-			1,
-			context.temp_allocator,
-		)
-		return base
+		return config_reload_text(udp_port, upstream_port, fmt.tprintf("cookies: {{ enabled: %v }}\n", cookies), rate_limit = true)
 	}
 	srv, ok := start_server(r, Server_Options{config = text(udp_port, upstream_port, false), udp_port = udp_port})
 	if !ok {

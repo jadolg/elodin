@@ -25,10 +25,12 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 	{
 		upstream_port := next_port(r)
 		mock := doh2_mock_make(upstream_port, "/dns-query", payload)
-		if !doh2_mock_start(mock, r.cert_file, r.key_file) {
+		// Stopped whether or not it started: `doh2_mock_stop` frees a failed start too.
+		started := doh2_mock_start(mock, r.cert_file, r.key_file)
+		defer doh2_mock_stop(mock)
+		if !started {
 			skip_case(r, "upstream: doh over h2", "cannot start the mock")
 		} else {
-			defer doh2_mock_stop(mock)
 			udp_port := next_port(r)
 			config := base_config(udp_port, fmt.tprintf("[%s]", doh_upstream("doh2up", upstream_port)), timeout = "5s")
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
@@ -66,10 +68,11 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 	{
 		upstream_port := next_port(r)
 		mock := doh2_mock_make(upstream_port, "/dns-query", payload)
-		if !doh2_mock_start(mock, r.cert_file, r.key_file, {"http/1.1"}) {
+		started := doh2_mock_start(mock, r.cert_file, r.key_file, {"http/1.1"})
+		defer doh2_mock_stop(mock)
+		if !started {
 			skip_case(r, "upstream: doh h2 alpn fallback", "cannot start the mock")
 		} else {
-			defer doh2_mock_stop(mock)
 			udp_port := next_port(r)
 			config := base_config(udp_port, fmt.tprintf("[%s]", doh_upstream("h1up", upstream_port)), timeout = "5s")
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
@@ -152,10 +155,11 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 		upstream_port := next_port(r)
 		mock := doh2_mock_make(upstream_port, "/dns-query", payload)
 		mock.pad = 98304
-		if !doh2_mock_start(mock, r.cert_file, r.key_file, {"http/1.1"}) {
+		started := doh2_mock_start(mock, r.cert_file, r.key_file, {"http/1.1"})
+		defer doh2_mock_stop(mock)
+		if !started {
 			skip_case(r, "upstream: doh h1 oversized reply", "cannot start the mock")
 		} else {
-			defer doh2_mock_stop(mock)
 			udp_port := next_port(r)
 			config := base_config(udp_port, fmt.tprintf("[%s]", doh_upstream("big", upstream_port)), timeout = "5s")
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})

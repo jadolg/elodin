@@ -22,19 +22,22 @@ run_name_cases :: proc(r: ^Runner) {
 	http_port := next_port(r)
 	http := http_mock_make(http_port)
 	http_mock_serve(http, "/hosts.txt?key=SECRET3", "0.0.0.0 named.test\n")
-	if !http_mock_start(http) {
+	// Each mock is stopped whether or not it started: the stop frees a failed start too.
+	http_ok := http_mock_start(http)
+	defer http_mock_stop(http)
+	if !http_ok {
 		skip_case(r, "names: a default name holds no query", "cannot start the HTTP mock")
 		return
 	}
-	defer http_mock_stop(http)
 
 	upstream_port := next_port(r)
 	mock := doh2_mock_make(upstream_port, "/dns-query", payload)
-	if !doh2_mock_start(mock, r.cert_file, r.key_file) {
+	mock_ok := doh2_mock_start(mock, r.cert_file, r.key_file)
+	defer doh2_mock_stop(mock)
+	if !mock_ok {
 		skip_case(r, "names: a default name holds no query", "cannot start the mock")
 		return
 	}
-	defer doh2_mock_stop(mock)
 
 	cache_dir := filepath.join({r.work_dir, "namecache"}, context.allocator) or_else ""
 	defer delete(cache_dir)

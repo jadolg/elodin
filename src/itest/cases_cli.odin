@@ -282,11 +282,13 @@ run_cli_cases :: proc(r: ^Runner) {
 				cache = "{ enabled: true }",
 				extra = "dnssec: { enabled: false }\nserver: { user: root }",
 			)
-			path := filepath.join({r.work_dir, "cannotdrop.yaml"}, context.temp_allocator) or_else ""
-			write_fixture(r, path, transmute([]u8)cfg)
-
-			res := run_binary(r, []string{"--config", path}, "cannot-drop")
-			if check(r, res.ok, "could not run the binary") {
+			// A write that did not land has failed the case already.
+			path, written := write_work_file(r, "cannotdrop.yaml", cfg)
+			res: Run_Result
+			if written {
+				res = run_binary(r, []string{"--config", path}, "cannot-drop")
+			}
+			if written && check(r, res.ok, "could not run the binary") {
 				check(r, res.exit_code != 0, "the server kept running after a failed drop")
 				check(
 					r,

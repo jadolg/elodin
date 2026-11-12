@@ -1102,8 +1102,9 @@ Ask the server `name`/`qtype` over UDP and read the reply's header: `ok` is
 false, and the case failed with `what`, when nothing came back.
 */
 ask :: proc(r: ^Runner, udp_port: int, name: string, qtype: u16, what := "no response") -> (res: Query_Result, h: Header, ok: bool) {
-	res = query_udp(udp_port, build_query(name, qtype))
-	if !check(r, res.ok, what) {
+	// Temp: every caller reads the reply inside the case that asked.
+	res = query_udp(udp_port, build_query(name, qtype), context.temp_allocator)
+	if !check(r, res.ok, "%s", what) {
 		return res, {}, false
 	}
 	return res, parse_header(r, res.wire), true

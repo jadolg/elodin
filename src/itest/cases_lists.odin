@@ -207,16 +207,6 @@ run_list_refresh_cases :: proc(r: ^Runner) {
 }
 
 /*
-Signals while a list download waits on a host that has stopped answering (#416).
-
-The rule sets are rebuilt off the maintenance loop, so a SIGHUP is acted on and a
-SIGTERM ends the process while a download waits, rather than once `FETCH_TIMEOUT`
-has run out for each read; and the signal does not cut the download short as a
-failed one, as it would on a thread that took it. A silent host is a socket that
-listens and never accepts: the kernel completes the handshake, and nothing is
-sent. Closing it resets the connection, which ends the download at once.
-*/
-/*
 A blocking configuration over `lists`, each a `list_entry`, with an upstream at
 `upstream_port` and the cache off. The default `cache_dir` cannot be written, so
 a case that wants the cached copy names one of its own.
@@ -268,6 +258,16 @@ listen_silent :: proc(r: ^Runner, port: int) -> (net.TCP_Socket, bool) {
 	return sock, check(r, err == nil, "cannot listen on port %d: %v", port, err)
 }
 
+/*
+Signals while a list download waits on a host that has stopped answering (#416).
+
+The rule sets are rebuilt off the maintenance loop, so a SIGHUP is acted on and a
+SIGTERM ends the process while a download waits, rather than once `FETCH_TIMEOUT`
+has run out for each read; and the signal does not cut the download short as a
+failed one, as it would on a thread that took it. A silent host is a socket that
+listens and never accepts: the kernel completes the handshake, and nothing is
+sent. Closing it resets the connection, which ends the download at once.
+*/
 run_list_refresh_signal_cases :: proc(r: ^Runner) {
 	mock, upstream_port, mock_ok := synth_mock(r, "lists-refresh-signals", "lists: signals during a download", {203, 0, 113, 9})
 	if !mock_ok {
