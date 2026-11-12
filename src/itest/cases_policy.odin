@@ -1280,8 +1280,8 @@ holds.
 
 An entry is the response as it arrived plus an offset and a TTL for each of its
 records, and the size of a response is decided by whoever answered the query -
-up to 64 KiB of it. So an entry count is not a bound on memory: ten thousand
-entries at the default stood for something near 640 MB, and an attacker serving
+up to 64 KiB of it. So an entry count alone bounds nothing: ten thousand
+maximal entries are about 640 MB, and an attacker serving
 maximal answers from a zone it controls needs only distinct names to walk elodin
 there.
 
@@ -1374,20 +1374,19 @@ blocking: {{ enabled: false }}
 
 /*
 `cache.serve_stale` against an upstream that has gone away, which is the outage
-the setting exists for and the one it used not to cover.
+the setting exists for (#164).
 
-Issue #164: the expired entry was served only once `upstream.resolve` had given
-up on every server for every attempt. With the defaults that is ten seconds
-against one blackholed upstream and twenty against two, while a glibc stub
-resolver gives up after five (`RES_TIMEOUT`) and systemd-resolved sooner - so
-the fallback arrived after the client had already failed and the feature did
-nothing for the case an operator turns it on for.
+The expired entry does not wait for `upstream.resolve` to give up on every
+server for every attempt. With the defaults that is ten seconds against one
+blackholed upstream and twenty against two, while a glibc stub resolver gives
+up after five (`RES_TIMEOUT`) and systemd-resolved sooner - so a fallback that
+late arrives after the client has already failed.
 
 RFC 8767 section 5's client response timer is what these cases are about: the
 held bytes go out once `cache.stale_timeout` has run, and the refresh carries
 on without the client. The upstream here is silenced rather than stopped,
 because a stopped one is a closed port and a closed port answers ICMP - the
-fast failure that was always covered. One attempt and a five-second timeout, so
+fast failure, which is not this case. One attempt and a five-second timeout, so
 the refresh is certainly still running while the second case runs and every
 datagram counted is a refresh of its own.
 */
@@ -1500,7 +1499,7 @@ What says which of the two happened is the upstream's own query count. A third
 query that finds the entry refreshed is a cache hit and asks nobody; one that
 finds it still expired starts another refresh, and the count goes up. Neither
 the address nor the TTL can tell them apart here - the mock answers the same
-bytes every time, and `cache.max_ttl` of 3 bounds the stale answer's 30-second
+bytes every time, and `cache.max_ttl` of 4 bounds the stale answer's 30-second
 TTL to the same figure as a fresh one's.
 
 The upstream answers 1.2 seconds after it is asked, against a 300 ms timer, so

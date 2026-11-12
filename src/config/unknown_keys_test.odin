@@ -8,8 +8,8 @@ import "core:testing"
 A key nobody reads is refused, at every level of the file.
 
 Each line below is a misspelling or a mis-nesting of a real key, and each one
-used to pass `--check` with the default left in force - rebind protection off,
-RRL at 500 - because the loader only ever asked for the keys it knew.
+would pass `--check` with the default left in force - rebind protection off,
+RRL at 500 - if the loader only asked for the keys it knew.
 */
 @(test)
 test_unknown_keys_are_refused :: proc(t: ^testing.T) {

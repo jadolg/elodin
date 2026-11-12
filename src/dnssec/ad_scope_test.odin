@@ -8,22 +8,19 @@ import "elodin:dns"
 /*
 What the Secure verdict actually covers.
 
-`validate_answer` walks the RRsets in the ANSWER section and nothing else. The
-verdict it reaches is then written onto the whole message as the AD bit, and the
-message goes to the client with its AUTHORITY and ADDITIONAL sections exactly as
-they arrived.
-
-RFC 4035 section 3.2.3 puts the boundary somewhere else: AD may be set only when
-every RRset in the Answer *and Authority* sections has been authenticated. So
-anything able to add records to a response - a malicious authoritative server
-for a zone it owns, or anyone on the path to a plain UDP upstream who leaves the
-signed answer alone - gets its own unsigned records stamped as authenticated.
+The verdict `validate` reaches is written onto the whole message as the AD bit.
+RFC 4035 section 3.2.3 says AD may be set only when every RRset in the Answer
+*and Authority* sections has been authenticated, so `strip_unauthenticated`
+prunes the AUTHORITY and ADDITIONAL sections of a `Secure` response down to what
+the verdict names. Without that, anything able to add records to a response - a
+malicious authoritative server for a zone it owns, or anyone on the path to a
+plain UDP upstream who leaves the signed answer alone - would get its own
+unsigned records stamped as authenticated.
 
 The answer itself is genuine in both tests below, so the verdict is `Secure` and
-stays that way: what is checked here is that the records nobody signed are no
-longer part of the message that verdict is written onto, and that the ones a
-client cannot do without - the denial, and the SOA it is remembered by - still
-are.
+stays that way: what is checked here is that the records nobody signed are not
+part of the message that verdict is written onto, and that the ones a client
+cannot do without - the denial, and the SOA it is remembered by - still are.
 */
 
 @(private = "file")
@@ -158,10 +155,9 @@ test_unsigned_authority_records_do_not_reach_the_client :: proc(t: ^testing.T) {
 A denial has to be claimed as well as implied by the chain.
 
 The pair with `chain_shape`: that one says the chain stopped short, this one says
-the sender is asserting there is nothing more. Both are needed, and finding out
-why cost a regression - a DNAME redirection is a chain that stops short and is
-not a denial at all, so refusing AD on the shape alone took the bit off every one
-of them.
+the sender is asserting there is nothing more. Both are needed: a DNAME
+redirection is a chain that stops short and is not a denial at all, so refusing
+AD on the shape alone would take the bit off every one of them.
 
 This is the one place on this path that reads fields the sender writes, and
 deliberately: what is guarded against is a false denial going out under our AD
@@ -275,15 +271,16 @@ verifying it are checked: its signer has to lie in the owner's ancestry, and no
 more than `MAX_SIGNATURES_PER_RRSET` are kept for one RRset.
 
 Without those an attacker who can add records - a zone it owns, or the path to a
-plain UDP upstream - appends as many as it likes at an authenticated owner and
-type. Every one matched what it claimed to cover and rode out under the AD bit.
+plain UDP upstream - would append as many as it liked at an authenticated owner
+and type, and every one would match what it claimed to cover and ride out under
+the AD bit.
 
 The filter is signer equality against the signature that actually carried the
 set, which admits an algorithm rollover - those name the same signer - and
 refuses what the validator never looked at. The rest are capped, and the
-signature that verified is exempt from the cap: a plain count cap was tried
-first and evicted the genuine signature instead, the forgeries coming first in
-a section whose order the attacker chooses.
+signature that verified is exempt from the cap: a plain count cap would evict
+the genuine signature instead, the forgeries coming first in a section whose
+order the attacker chooses.
 */
 @(private = "file")
 forged_rrsig :: proc(owner: string, signer: string) -> dns.Record {
@@ -381,13 +378,13 @@ test_forged_signatures_do_not_survive_the_prune_in_bulk :: proc(t: ^testing.T) {
 	)
 
 	/*
-	The assertion that matters, and the one a count cap failed.
+	The assertion that matters, and the one a plain count cap fails.
 
-	Capping how many signatures survive sounds prudent and is the opposite: the
-	signer field is written by whoever wrote the record, so the cap fills with
-	forgeries placed ahead of the real signature and the genuine one is what
-	gets evicted - leaving a message that goes out under AD with nothing in it
-	that verifies. Re-validating the pruned bytes is what says that has not
+	A cap with no exemption is not prudent: the signer field is written by
+	whoever wrote the record, so such a cap fills with forgeries placed ahead of
+	the real signature and the genuine one is what gets evicted - leaving a
+	message that goes out under AD with nothing in it that verifies. The cap
+	here exempts the signature that verified. Re-validating the pruned bytes is what says that has not
 	happened, rather than counting what came through.
 	*/
 	after := validate(v, "www.example.com.", .A, out, time.unix(FIXTURE_TIME, 0))
@@ -404,18 +401,19 @@ test_forged_signatures_do_not_survive_the_prune_in_bulk :: proc(t: ^testing.T) {
 /*
 Forgeries placed *ahead* of the genuine signature, in the authority section.
 
-This is the shape a count cap loses to, and the reason there is no longer one.
-The section order belongs to whoever wrote the answer, so eight RRSIGs at the
-head of a denial's NSEC RRset fill any per-RRset allowance before the real
-signature is reached - and what gets evicted is the only record in the message
-that verifies. The answer then goes out under AD with a denial nothing supports,
-and is cached that way for every downstream validator behind this resolver.
+This is the shape a plain count cap loses to, and the reason the cap exempts the
+signature that verified. The section order belongs to whoever wrote the answer,
+so eight RRSIGs at the head of a denial's NSEC RRset would fill any unexempted
+allowance before the real signature is reached - and what would be evicted is
+the only record in the message that verifies. The answer would then go out under
+AD with a denial nothing supports, and be cached that way for every downstream
+validator behind this resolver.
 
-The authority section rather than the answer, because that is where the two
-filters disagreed: the validator accepts a denial's signature only when its
-signer *is* the established zone, while the prune was asking the looser question
-of whether the signer lay somewhere in the owner's ancestry. `com.` passes the
-loose test over `cloudflare.com.` and fails the strict one.
+The authority section rather than the answer, because that is where two filters
+can disagree: the validator accepts a denial's signature only when its signer
+*is* the established zone, while a prune asking only whether the signer lies
+somewhere in the owner's ancestry is looser. `com.` passes the loose test over
+`cloudflare.com.` and fails the strict one.
 */
 @(test)
 test_forgeries_ahead_of_the_real_signature_do_not_evict_it :: proc(t: ^testing.T) {
@@ -488,10 +486,10 @@ validity window is in the real record. So a forgery copies all of it and changes
 only the bytes it cannot produce, which is what a cheap pre-check cannot tell
 apart and what any cap therefore has to survive.
 
-Built from `real` for exactly that reason. An earlier version of this wrote a
-key tag of its own, which matched no key in the zone - so `signature_worth_trying`
-rejected every one of them for free, `spend_verification` was never called, and
-the test passed while touching none of the code it names.
+Built from `real` for exactly that reason. A key tag of its own would match no
+key in the zone - so `signature_worth_trying` would reject every one of them for
+free, `spend_verification` would never be called, and the test would pass while
+touching none of the code it names.
 */
 @(private = "file")
 forged_like :: proc(real: dns.Record) -> dns.Record {
@@ -541,14 +539,13 @@ forged_denial_rrsig :: proc(owner: string, signer: string) -> dns.Record {
 /*
 Junk in front of a real signature costs nothing, so it cannot starve anything.
 
-This is the half of the starvation problem that is actually solvable, and the
-one that used to break a zone: a signature was tried whenever its signer named
-the zone, and the signer is a name in the RDATA. Eight RRSIGs naming
-`cloudflare.com` in front of the genuine one therefore spent a per-RRset
-allowance before it was reached, the RRset was dropped, and every NXDOMAIN in
-the zone came back SERVFAIL.
+This is the half of the starvation problem that is actually solvable: were a
+signature tried whenever its signer named the zone - and the signer is a name in
+the RDATA - eight RRSIGs naming `cloudflare.com` in front of the genuine one
+would spend a per-RRset allowance before it was reached, the RRset would be
+dropped, and every NXDOMAIN in the zone would come back SERVFAIL.
 
-They cost nothing now: their key tag names no key the zone published, so
+They cost nothing: their key tag names no key the zone published, so
 `signature_worth_trying` refuses them without touching the budget.
 
 What this does *not* claim is that no forgery can drain it. One that copies the
@@ -610,14 +607,15 @@ test_free_rejectable_forgeries_do_not_touch_the_budget :: proc(t: ^testing.T) {
 Copies of the genuine signature do not take its exemption with them.
 
 The prune keeps the record that verified whatever else it drops, so that a cap
-can never evict the one thing the answer rests on. That exemption was first
-keyed on the key tag and algorithm - both of which are printed in the zone's
-DNSKEY set - so a forgery copied them and took the exemption too, the cap never
-fired, and an answer padded with hundreds of them went out under AD and into the
-cache for every downstream validator to work through on each hit.
+can never evict the one thing the answer rests on. Keyed on the key tag and
+algorithm - both of which are printed in the zone's DNSKEY set - a forgery would
+copy them and take the exemption too, the cap would never fire, and an answer
+padded with hundreds of them would go out under AD and into the cache for every
+downstream validator to work through on each hit.
 
-Keyed on the signature bytes now: the one field of an RRSIG that cannot be
-copied from public data and still be the record that verified.
+The exemption compares the whole record (`rrsig_equal`), signature bytes
+included: the one field of an RRSIG that cannot be copied from public data and
+still be the record that verified.
 */
 @(test)
 test_copies_of_the_real_signature_do_not_inherit_its_exemption :: proc(t: ^testing.T) {
@@ -683,14 +681,14 @@ test_copies_of_the_real_signature_do_not_inherit_its_exemption :: proc(t: ^testi
 /*
 Verbatim copies of the genuine signature do not each take the exemption.
 
-The exemption is decided by comparing signature bytes, which is a test of
-content and not of identity - and the genuine signature is public. So an
-attacker does not need to forge anything at all: it appends copies of the real
-record, every copy matches, and an exemption that fired once per match let all
-of them through the cap. The padding then goes out under AD and into the cache,
-which is what the cap exists to stop, reached by copying rather than forging.
+The exemption is decided by comparing the record, which is a test of content and
+not of identity - and the genuine signature is public. So an attacker does not
+need to forge anything at all: it appends copies of the real record, and every
+copy matches. An exemption that fired once per match would let all of them
+through the cap, and the padding would go out under AD and into the cache, which
+is what the cap exists to stop, reached by copying rather than forging.
 
-Fires once now, and the copies are charged against the cap like anything else.
+It fires once, and the copies are charged against the cap like anything else.
 */
 @(test)
 test_verbatim_copies_of_the_real_signature_are_capped :: proc(t: ^testing.T) {
@@ -753,17 +751,17 @@ test_verbatim_copies_of_the_real_signature_are_capped :: proc(t: ^testing.T) {
 /*
 A near-copy of the genuine signature cannot steal its exemption.
 
-The sharpest form of this, and the one two earlier tests both walked past: one
+The sharpest form of this, and the one the two tests above both walk past: one
 copies the whole record, the other changes the signature bytes, and neither
 varies a field *other* than the signature while holding the signature fixed.
 
-That is the gap. Take the genuine RRSIG, flip a bit of its ORIGINAL TTL, leave
-the signature alone. It keeps the real key tag, algorithm and validity window,
-so nothing rejects it early and `check_signature` simply fails on it - but an
-exemption keyed on the signature bytes matched it. The mutant took the
-exemption, the forgeries behind it filled the cap, and the record that actually
-verified was the one dropped. The answer went out under AD, was cached, and
-validated for nobody.
+Take the genuine RRSIG, flip a bit of its ORIGINAL TTL, leave the signature
+alone. It keeps the real key tag, algorithm and validity window, so nothing
+rejects it early and `check_signature` simply fails on it - but an exemption
+keyed on the signature bytes alone would match it. The mutant would take the
+exemption, the forgeries behind it would fill the cap, and the record that
+actually verified would be the one dropped. The answer would go out under AD,
+be cached, and validate for nobody.
 
 Ordered the way an attacker would: mutant first, padding next, the genuine
 record last.
@@ -845,13 +843,12 @@ test_a_near_copy_does_not_evict_the_record_that_verified :: proc(t: ^testing.T) 
 What the chain does with the question, and what it must not be talked out of.
 
 `chain_shape` decides whether the AD bit may go out over an answer whose chain
-stops short of the type asked for, so it is worth testing on its own. Five
-earlier attempts at this question consulted something the sender writes - an SOA
-in the authority section, an NSEC, the rcode - and each was defeated either by
-adding a record or by deleting one. This consults the chain and nothing else.
+stops short of the type asked for, so it is worth testing on its own. A
+predicate that consults something the sender writes - an SOA in the authority
+section, an NSEC, the rcode - is defeated either by adding a record or by
+deleting one. This consults the chain and nothing else.
 
-The cases below are the ones those attempts got wrong, kept as the record of
-what the predicate has to survive.
+The cases below are what the predicate has to survive.
 */
 @(test)
 test_chain_shape_reads_only_the_chain :: proc(t: ^testing.T) {
@@ -888,9 +885,9 @@ test_chain_shape_reads_only_the_chain :: proc(t: ^testing.T) {
 	/*
 	An unrelated record of the right type does not answer the question.
 
-	A predicate that scanned the whole section for the type stopped here: an
+	A predicate that scanned the whole section for the type would stop here: an
 	attacker with a signed zone appends `x.evil.example. A`, every RRset
-	verifies, and the guard was talked out of firing by a record with nothing to
+	verifies, and the guard is talked out of firing by a record with nothing to
 	do with the name asked about.
 	*/
 	unrelated := dns.Record {
@@ -911,8 +908,8 @@ test_chain_shape_reads_only_the_chain :: proc(t: ^testing.T) {
 
 	The other direction, and the one an on-path attacker reaches for: strip the
 	AAAA and its signature, strip the authority section, and a predicate that
-	asked whether a denial had been *claimed* saw nothing to object to. The chain
-	still stops short, which is all this asks.
+	asked whether a denial had been *claimed* would see nothing to object to.
+	The chain still stops short, which is all this asks.
 	*/
 	testing.expect_value(
 		t,
@@ -959,19 +956,18 @@ test_chain_shape_reads_only_the_chain :: proc(t: ^testing.T) {
 The denial records behind a wildcard proof are verified once for the message.
 
 An answer may expand from several wildcards, and each expansion needs the same
-authority section verified against the same zone. Doing that per expansion was
-free while nothing counted it. It is not free now that the verification spends
-`MAX_VERIFICATIONS_PER_QUERY`, and what it spends it on is work already done:
-eight expansions over five NSEC3 RRsets is forty verifications carrying five
-sets' worth of information, most of the allowance gone before the answer's own
-RRsets are reached. The response that pays for it is a legitimate one - an
-attacker gains nothing by making a zone answer from its own wildcards - so the
-budget fires on size rather than on forgery, and a good answer reaches the
-client as SERVFAIL.
+authority section verified against the same zone. Doing that per expansion is
+not free, since the verification spends `MAX_VERIFICATIONS_PER_QUERY`, and what
+it would spend it on is work already done: eight expansions over five NSEC3
+RRsets is forty verifications carrying five sets' worth of information, most of
+the allowance gone before the answer's own RRsets are reached. The response that
+would pay for it is a legitimate one - an attacker gains nothing by making a
+zone answer from its own wildcards - so the budget would fire on size rather
+than on forgery, and a good answer would reach the client as SERVFAIL.
 
-Asserted on the budget rather than on a verdict because that is where the bug
-lived: both calls return the same records either way, and only the meter says
-whether the second one paid for them again.
+Asserted on the budget rather than on a verdict because that is where the
+difference shows: both calls return the same records either way, and only the
+meter says whether the second one paid for them again.
 */
 @(test)
 test_a_messages_denial_records_are_verified_once :: proc(t: ^testing.T) {

@@ -532,10 +532,10 @@ test_followers_of_another_message_ask_for_themselves :: proc(t: ^testing.T) {
 /*
 A follower's wait on the leader is its question's first exchange, and spends its
 deadline (issue #439). One whose message was not the leader's forwards on its
-own once the leader lands with nothing - and used to do it on a fresh deadline,
-so against a silent upstream it waited the leader's two timeouts and then two
-more of its own. It now asks with what the wait left, so it is done within one
-more timeout of the leader, the exchange that crosses the line.
+own once the leader lands with nothing, and asks with what the wait left, so
+against a silent upstream it is done within one more timeout of the leader, the
+exchange that crosses the line. A fresh deadline would wait the leader's two
+timeouts and then two more of its own.
 */
 @(test)
 test_a_follower_forwards_on_what_its_wait_left_of_the_deadline :: proc(t: ^testing.T) {
@@ -545,14 +545,14 @@ test_a_follower_forwards_on_what_its_wait_left_of_the_deadline :: proc(t: ^testi
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .Serv_Fail, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
 		// The leader's two timeouts and the one that crosses the line, with
-		// slack; a fresh deadline for the follower waited four.
+		// slack; a fresh deadline for the follower would take four.
 		testing.expectf(t, c.took < 7 * TIMEOUT / 2, "client %d waited %v, where its deadline is two timeouts of %v", i, c.took, TIMEOUT)
 	}
 }
 
 /*
 An rcode is shared or not on the same terms. From a leader whose message was the
-follower's - which clients asking with and without EDNS now both are - a FORMERR
+follower's - which clients asking with and without EDNS both are - a FORMERR
 or a REFUSED is the upstream's word on that message; from one whose was not, it
 may be a refusal of bytes no follower sent, and only the rcodes the cache itself
 keeps are handed on.
@@ -913,14 +913,15 @@ test_followers_rejoin_an_evicted_verdict_once_only :: proc(t: ^testing.T) {
 
 /*
 A follower waits on its leader for what is left of its own deadline and one
-exchange more, not for as long as the unbounded forward once took (issue #446).
+exchange more, not for as long as an unbounded forward would take (issue #446).
 
-Since #439 the deadline is armed before the join, so a leader still out past
-it and the one exchange it may finish is stuck on something other than its
-upstreams - and the follower, when its patience runs out, forwards on a deadline
-already spent and asks nobody. Any wait past that point holds a worker for
-nothing. The leader here never lands; with two servers and two attempts the old
-patience was ten timeouts, where the follower's deadline is two.
+The deadline is armed before the join (#439), so a leader still out past it and
+the one exchange it may finish is stuck on something other than its upstreams -
+and the follower, when its patience runs out, forwards on a deadline already
+spent and asks nobody. Any wait past that point holds the follower for nothing.
+The leader here never lands; with two servers and two attempts a patience sized
+for an unbounded forward would be ten timeouts, where the follower's deadline is
+two.
 */
 @(test)
 test_a_follower_waits_no_longer_than_its_deadline_allows :: proc(t: ^testing.T) {
@@ -981,7 +982,7 @@ test_a_follower_waits_no_longer_than_its_deadline_allows :: proc(t: ^testing.T) 
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.Serv_Fail)
 	// Its two timeouts of deadline and two for the leader's crossing exchange,
-	// with slack; the old patience waited ten.
+	// with slack; a patience sized for an unbounded forward would wait ten.
 	testing.expectf(t, took < 6 * TIMEOUT, "the follower waited %v on a leader, where its deadline is %v", took, 2 * TIMEOUT)
 	// And it forwarded on nothing: the deadline was spent on the wait.
 	for socket in sockets {

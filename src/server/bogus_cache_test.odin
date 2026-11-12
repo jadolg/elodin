@@ -17,13 +17,13 @@ import "elodin:upstream"
 What a name that does not validate costs the server that refuses it.
 
 The refusal itself is not in question - an answer with no chain to the anchor is
-SERVFAIL and always was. What this is about is the second query for it, and the
-ten thousandth: nothing on that path was stored, so every one of them was an
-exchange with an upstream that was only ever going to hand back the same
-unusable answer. Which name is asked about is the client's choice, so a zone
-somebody breaks on purpose is the cheapest way there is to spend this server's
-upstream budget - and it is not a fetch anybody benefits from, because the
-answer is thrown away when it arrives.
+SERVFAIL. What this is about is the second query for it, and the ten thousandth:
+without memory of the verdict, every one of them would be an exchange with an
+upstream that is only ever going to hand back the same unusable answer. Which
+name is asked about is the client's choice, so a zone somebody breaks on purpose
+is the cheapest way there is to spend this server's upstream budget - and it is
+not a fetch anybody benefits from, because the answer is thrown away when it
+arrives.
 
 The verdict is remembered instead (`cache.BOGUS_TTL`), and what is written down
 is this server's own SERVFAIL rather than the answer that failed: there is
@@ -57,8 +57,8 @@ must not treat them alike in the cache.
 @(private = "file")
 Counting_Mock :: struct {
 	socket:      net.UDP_Socket,
-	// A copy of its own, not a slice of the test's arena: the loop outlives the
-	// body it was started from on every early return here.
+	// A copy of its own, not a slice of the test's arena: each test resets the
+	// temp arena before its deferred `fixture_stop` joins this loop.
 	reply:       [512]u8,
 	length:      int,
 	// How many bytes of the question section the fixture's reply carries, so a
@@ -331,8 +331,8 @@ test_a_bogus_verdict_is_not_asked_of_the_upstream_twice :: proc(t: ^testing.T) {
 	already been asked and has already counted what it found, so it is asked for
 	as a `probe` and counted in neither direction. Counted, one query would show
 	up as two misses and the identity an operator reads these numbers by - hits
-	and misses are what the queries came to - would stop holding on exactly the
-	traffic this change is about.
+	and misses are what the queries came to - would stop holding on exactly this
+	traffic.
 	*/
 	settled := cache.stats(f.answers)
 	testing.expect_value(t, settled.misses - counted.misses, 1)

@@ -178,8 +178,7 @@ process, so two threads looking something up at the same time read each other's
 entries. What that looks like is a uid parsed correctly from the configuration
 and a gid belonging to whoever the other thread happened to ask about — a drop
 into the wrong group, which is the one mistake this package exists to avoid, and
-one that leaves no trace of having happened. It has already shown up as a test
-failing on a parallel runner and passing everywhere else.
+one that leaves no trace of having happened.
 
 elodin resolves once at startup, before any event loop exists, so nothing in the
 running server races here today. The `_r` forms cost a stack buffer and remove

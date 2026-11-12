@@ -369,8 +369,8 @@ test_scan_ttl_offsets_releases_on_bad_name :: proc(t: ^testing.T) {
 
 /*
 `encode_message` hands the caller its output buffer and abandons everything else
-the writer allocated: the label-offset list, the compression map, and a cloned
-string per distinct name suffix recorded in it.
+the writer allocated: the label-offset list and the compression map, with the
+table it grows to as name suffixes are recorded in it.
 
 Nothing leaks in the server, where every caller threads a per-request arena
 through and `free_all` reclaims the lot. But the allocator parameter defaults to
@@ -385,8 +385,8 @@ test_encode_message_releases_its_writer :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	allocator := mem.tracking_allocator(&track)
 
-	// Names sharing suffixes, so the compression map is populated and its keys
-	// are actually cloned rather than the map staying empty.
+	// Names sharing suffixes, so the compression map is populated rather than
+	// staying empty.
 	m := Message {
 		id = 0x1234,
 		question = []Question{{name = "www.example.com.", type = .A, class = .IN}},
@@ -446,12 +446,11 @@ test_encode_message_releases_its_writer_on_error :: proc(t: ^testing.T) {
 }
 
 /*
-Truncation is the third path, and the one that used to leak: it `clear`s the
-compression map to invalidate the targets recorded for the dropped bytes, then
-leans on the deferred `writer_release_scratch` to free the cloned keys - but an
-already-cleared map has nothing to iterate, so every key clone made before the
-cut escaped. The answer here is large enough to force a cut with the map already
-populated by distinct name suffixes.
+Truncation is the third path: it `clear`s the compression map to invalidate the
+targets recorded for the dropped bytes, and the deferred `writer_release_scratch`
+still has to free the table the map grew before the cut. The answer here is
+large enough to force a cut with the map already populated by distinct name
+suffixes.
 */
 @(test)
 test_encode_message_releases_its_writer_on_truncation :: proc(t: ^testing.T) {
@@ -460,8 +459,8 @@ test_encode_message_releases_its_writer_on_truncation :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	allocator := mem.tracking_allocator(&track)
 
-	// Distinct suffixes so the compression map holds real cloned keys, and
-	// enough of them that `max_size` cuts the answer partway through.
+	// Distinct suffixes so the compression map has grown, and enough of them
+	// that `max_size` cuts the answer partway through.
 	answer: [dynamic]Record
 	for i in 0 ..< 64 {
 		name := fmt.aprintf("host%d.example.com.", i, allocator = context.temp_allocator)
@@ -1393,7 +1392,7 @@ test_rdata_cut_off_inside_a_pointer_is_kept_and_not_written :: proc(t: ^testing.
 
 /*
 #533: recording a compression target allocates nothing per name. A map keyed by
-a cloned suffix makes one allocation per distinct suffix: thousands for an
+a cloned suffix would make one allocation per distinct suffix: thousands for an
 answer of two thousand distinct names, encoded two or three times a request.
 */
 @(test)

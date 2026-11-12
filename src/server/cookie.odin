@@ -71,8 +71,8 @@ Cookie_Verdict :: enum u8 {
 
 	Kept apart from `Absent` because the client did send one. Both mean no
 	cookie goes back, but only one of them means `require` has nothing to
-	enforce, and folding them together made that setting fail open on the single
-	input it cannot verify.
+	enforce, and folding them together would make that setting fail open on the
+	single input it cannot verify.
 	*/
 	Unbindable,
 	// A client cookie with nothing behind it, or one we cannot vouch for.
@@ -201,7 +201,7 @@ up at all.
 
 Asked as "the client sent a cookie and it is not one of ours", rather than as a
 list of the verdicts that fail. A verdict this server cannot vouch for is one it
-should refuse, and enumerating them the other way round is what let an address
+should refuse, and enumerating them the other way round would let an address
 the hash cannot be taken over walk straight past `require`.
 
 Only UDP is checked; the stream transports already made the client prove it can
@@ -281,9 +281,8 @@ attach_cookie :: proc(
 	existing OPT record's class alone. On UDP that is the ceiling, and
 	`handle_query` writes it again over the top a moment later, so the value is
 	belt and braces there. On the stream transports nothing writes it again, and
-	it is the client's own figure - the same number this passed before, and the
-	only one available on a transport where this server has no payload size to
-	report.
+	it is the client's own figure, the only one available on a transport where
+	this server has no payload size to report.
 	*/
 	out, ok := dns.ensure_edns_option(wire, .Cookie, cookie[:], advertise, allocator, spent)
 	if !ok {

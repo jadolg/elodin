@@ -233,8 +233,7 @@ denial made of them. Issue #331.
 Serving it insecure would hand out a record the zone signed for `*` as the
 answer for a name that may hold records of its own, on the strength of NSEC3
 records nothing checked the relevance of - a substitution rather than a name
-made to look absent. So it keeps the answer main gave: SERVFAIL, with the
-ceiling named.
+made to look absent. So it is SERVFAIL, with the ceiling named.
 
 This zone hashes zero times, so the ceiling is set below zero to have something
 to refuse, and the owner is remembered as a non-cut so that the walk ends at the

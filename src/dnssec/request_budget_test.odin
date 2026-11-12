@@ -7,9 +7,9 @@ import "elodin:dns"
 
 /*
 Issue #354: the chain walk reads a reply per step into the request's arena, and
-each of those readings was bounded only on its own.
+those readings are bounded together, not each on its own.
 
-The counter is the request's now, so a walk can run out of it - and what it
+The counter is the request's, so a walk can run out of it - and what it
 reports then must be the truth, which is that this server stopped reading. The
 alternative is an accusation: a zone reported forged because the question it
 belongs to had already taken its allowance, at a moment an attacker with a
@@ -70,9 +70,9 @@ test_a_response_past_the_request_budget_is_not_called_a_forgery :: proc(t: ^test
 And neither is a step of the chain.
 
 The upstream answers the DS lookup perfectly well; the request simply has
-nothing left to read the reply into. `zone_step` used to read any
-decode failure as a broken delegation, which under this counter would report a
-forgery for every zone the walk reached after the allowance ran out.
+nothing left to read the reply into. Reading any decode failure as a broken
+delegation would, under this counter, report a forgery for every zone the walk
+reached after the allowance ran out.
 */
 @(test)
 test_a_chain_step_past_the_request_budget_stops_the_walk :: proc(t: ^testing.T) {

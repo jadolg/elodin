@@ -35,7 +35,7 @@ Listeners :: struct {
 	/*
 	The Prometheus endpoint. Opened by `start_listeners`, but deliberately
 	outlives `stop_listeners`: it is stopped on its own, by `stop_metrics`,
-	after the pools have drained. See the note there for why.
+	before `drain_queries`. See the note there for why.
 	*/
 	metrics_socket: net.TCP_Socket,
 	tcp_open:       bool,
@@ -88,12 +88,13 @@ How long a read or accept loop may wait before it gets a chance to notice that
 it has been told to stop.
 
 On an event loop the stop cancels the loop's fiber, which ends its wait at once
-(`conn_manager_stop_permanent`); this is for the same loops run on threads of
-their own, which is the tests. Closing a socket does not reliably wake a thread
-already blocked reading or accepting on it - the same reason
-`upstream/h2client.odin` polls rather than trusting close to cut a read short -
-so the loops carry a timeout and come up for air instead. One wakeup a second
-per listener costs nothing next to the queries going through them.
+(`conn_manager_stop_permanent`); this is for loops run on threads of their
+own, which are the tests and the metrics endpoint's accept loop. Closing a
+socket does not reliably wake a thread already blocked reading or accepting on
+it - the same reason `upstream/h2client.odin` polls rather than trusting close
+to cut a read short - so the loops carry a timeout and come up for air instead.
+One wakeup a second per listener costs nothing next to the queries going through
+them.
 */
 @(private)
 LISTENER_POLL :: time.Second
@@ -379,12 +380,9 @@ Udp_Job :: struct {
 
 /*
 A job and its datagram in one block, the bytes trailing the struct, so the
-reader makes one heap allocation per datagram and the worker one `free`.
-
-The reader and the worker are different threads, and glibc hands a chunk back
-to the arena it came from, so every `free` here takes the reader's arena lock
-from the worker; one block is one of those per query rather than two. `data` is
-a view into the block and dies with it - a plain `free(job)` releases both.
+reader makes one heap allocation per datagram and the query's fiber, on the
+reader's own loop, one `free`. `data` is a view into the block and dies with
+it - a plain `free(job)` releases both.
 */
 @(private)
 new_udp_job :: proc(datagram: []u8) -> ^Udp_Job {
@@ -423,8 +421,8 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 	configuration being tried out beside the running one: without this the
 	kernel would take the second listener into the group and hand it half the
 	datagrams, and the operator would have a resolver answering half its queries
-	from a configuration nobody meant to be serving. Before the readers existed
-	the second bind was refused outright, and it still is.
+	from a configuration nobody meant to be serving. With this probe the second
+	server's bind is refused outright.
 
 	Asked with a plain bind, which is refused by exactly the case the readers
 	must not join and is refused by everything that would have refused them
@@ -1054,8 +1052,8 @@ two wordings of one fact drift apart.
 
 The no-cap form is not a shorter version of the other: it says the thing worth
 knowing about that configuration, which is that one client may take the table.
-That is where this server was before the setting existed, and it is still
-reachable on purpose, by setting the share to `max_connections` or above.
+It is reachable on purpose, by setting the share to `max_connections` or
+above.
 */
 connection_limits_line :: proc(limit, prefix_limit: int) -> string {
 	if prefix_limit <= 0 || prefix_limit >= limit {
@@ -1075,9 +1073,9 @@ connection_limits_line :: proc(limit, prefix_limit: int) -> string {
 Say why a connection could not be given a fiber, once, and then quietly.
 
 The same reasoning as `report_refusal`, and reached the same way: a peer opening
-connections past the limit wrote one line per attempt otherwise, at `warn`, so it
-was on at the default level. The setting is named because it is the one thing
-that would change the outcome, and because a connection refused for want of a
+connections past the limit would otherwise write one line per attempt, at
+`warn`, which is on at the default level. The setting is named because it is the
+one thing that would change the outcome, and because a connection refused for want of a
 slot and one refused for want of an allow-list entry look identical from the
 client's side.
 
@@ -1103,10 +1101,10 @@ Everything that differs between the three causes, chosen in one place.
 Split out of the reporter because the choosing is the part that can be wrong and
 the printing is not: a branch inverted here says "raising max_connections will
 not help" to the operator whose only problem is `max_connections`, and tells the
-host that ran out of pids to raise it. Every line still appears in the log, and
-every one still counts something, so nothing downstream of the mistake looks
-wrong. Returned as data so a test can hold them side by side - the same reason
-`refused_unit` is its own procedure.
+host that could not map a stack to raise it. Every line still appears in the
+log, and every one still counts something, so nothing downstream of the
+mistake looks wrong. Returned as data so a test can hold them side by side - the
+same reason `refused_unit` is its own procedure.
 
 `brief` and `line` take the transport and the limit, in that order, and which
 limit that is comes from `spawn_failure_limit`: a share refused against the
@@ -1734,12 +1732,12 @@ accept_loop :: proc(data: rawptr) {
 		Every outcome goes through `accept_action`, including the successful
 		accept and the poll tick, and every field it returns is consumed here.
 
-		One call rather than one per branch, because the branches were how the
-		re-arm got lost: `recovered` is reached by any call that takes the run to
-		zero, and on a quiet listener that is the idle tick far more often than
-		an accepted connection. Read on one path only, it was discarded on the
-		one that usually produces it, and the flags stayed set for the life of
-		the process.
+		One call rather than one per branch, because a read per branch loses the
+		re-arm: `recovered` is reached by any call that takes the run to zero,
+		and on a quiet listener that is the idle tick far more often than an
+		accepted connection. Read on one path only, it would be discarded on the
+		one that usually produces it, and the flags would stay set for the life
+		of the process.
 
 		A failure is counted rather than judged on the spot, for the reason
 		`accept_failed` sets out: a per-connection network error and a descriptor
@@ -2230,8 +2228,8 @@ conn_read :: proc(c: Conn, buf: []u8) -> (n: int, ok: bool) {
 /*
 The least a TLS handshake gets, whatever a connection's reads are given.
 
-`server_handshake` bounds the handshake as a whole now rather than each read of
-it, and the figure it uses is the socket's receive timeout - which is
+`server_handshake` bounds the handshake as a whole rather than each read of it,
+and the figure it uses is the socket's receive timeout - which is
 `client_timeout`, the same value RFC 7828 advertises to a connected client as
 how long an idle connection is held. Those two are not the same want. Ten
 seconds of idle is generous, but an operator who shortens `client_timeout` to

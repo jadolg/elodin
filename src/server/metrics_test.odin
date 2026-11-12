@@ -99,11 +99,11 @@ refused.
 
 Separate from the test above because these do not come off `Stats`: the endpoint
 reads them through `rate_limit_stats`, so a counter added to the limiter and not
-added there publishes a zero for as long as nobody checks. `conn_rate_limited` is
-the one that matters most here - `elodin_connections_refused_total` reading zero
-through a handshake flood is the blindness issue #247 was filed about, and a
-series that reported the new bound as a flat zero would be the same blindness with
-a metric name on it.
+added there publishes a zero for as long as nobody checks. `conn_rate_limited`
+is the one that matters most here - `elodin_connections_refused_total` reading
+zero through a handshake flood is the blindness issue #247 was filed about, and
+a series that reported the connection-rate bound as a flat zero would be the
+same blindness with a metric name on it.
 */
 @(test)
 test_the_limiters_counters_reach_the_endpoint :: proc(t: ^testing.T) {
@@ -120,14 +120,6 @@ test_the_limiters_counters_reach_the_endpoint :: proc(t: ^testing.T) {
 	expect_line(t, page, "elodin_connections_rate_limited_total 7")
 	free_all(context.temp_allocator)
 }
-
-/*
-A family is declared once, whatever it holds.
-
-Two `# TYPE` lines for one metric name are a duplicate, and a scraper rejects
-the whole response over it rather than the line - so a page that is merely
-noisy in this respect is a page that reports nothing at all.
-*/
 
 /*
 A failing upstream is published with what went wrong, not only that it failed.
@@ -200,7 +192,7 @@ test_a_failed_exchange_is_published_with_its_kind :: proc(t: ^testing.T) {
 
 	expect_line(t, page, `elodin_upstream_failure_kind_total{upstream="broken",error="dial_failed"} 1`)
 	// The total it splits still reads the same, which is what lets the two be
-	// graphed together: the new family is a breakdown, not a second count.
+	// graphed together: the kind family is a breakdown, not a second count.
 	expect_line(t, page, `elodin_upstream_failures_total{upstream="broken"} 1`)
 	// And a kind that did not happen is not stated at all, rather than stated
 	// as a zero for every member of the enum against every upstream.
@@ -274,6 +266,13 @@ test_an_unreadable_rcode_is_published_against_the_upstream :: proc(t: ^testing.T
 	free_all(context.temp_allocator)
 }
 
+/*
+A family is declared once, whatever it holds.
+
+Two `# TYPE` lines for one metric name are a duplicate, and a scraper rejects
+the whole response over it rather than the line - so a page that is merely
+noisy in this respect is a page that reports nothing at all.
+*/
 @(test)
 test_no_family_is_declared_twice :: proc(t: ^testing.T) {
 	page := render_fixture(Stats{})
@@ -359,14 +358,11 @@ expect_line :: proc(t: ^testing.T, page: string, line: string, loc := #caller_lo
 Every counter in `Stats` appears in the line, with its own value.
 
 Read off the struct rather than off a list kept here by hand, which is the
-difference between a guard and a note. The first version of this test carried the
-list, and so had exactly the failure it was written to close: it checked the
-counters somebody remembered, and `Stats.rewritten` - published by the endpoint
-since it existed, absent from the line since it existed - passed it.
+difference between a guard and a note: a hand-kept list checks only the counters
+somebody remembered.
 
 `reflect.struct_field_names` cannot forget. A counter added to `Stats` and left
-out of `stats_line` fails here on the day it is added, which is what the other
-two guards do for the snapshot and the endpoint.
+out of `stats_line` fails here on the day it is added.
 
 Distinct values, and the value is asserted with the name, so a field printed from
 the wrong counter fails rather than passing on the presence of its key. Every

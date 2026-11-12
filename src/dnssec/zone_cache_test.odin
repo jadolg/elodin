@@ -8,16 +8,15 @@ import "elodin:dns"
 import "elodin:loop"
 
 /*
-Issue #336: the zone-key cache was bounded by entry count alone, kept whatever a
-zone published, and emptied itself when it filled.
+Issue #336: the zone-key cache is bounded by bytes as well as entries, keeps
+only the keys that can sign, and evicts one cold entry when it fills.
 
-Three separate ways for one client's names to cost everybody else. The count
-bound says nothing about size, so a zone that publishes sixty-four RSA keys
-occupies as much room as `MAX_KEYS_PER_ZONE` times the largest key the parser
-will read; `cache_put` copied every parsed key whether or not it could sign
-anything; and a full cache threw away every zone in it, so a flood of fresh
-names took the root and the TLDs with it and left every client re-walking from
-the top.
+Each is a way for one client's names to cost everybody else. A count bound says
+nothing about size, so a zone that publishes sixty-four RSA keys would occupy as
+much room as `MAX_KEYS_PER_ZONE` times the largest key the parser will read;
+copying every parsed key would keep ones that cannot sign anything; and a full
+cache that threw away every zone in it would let a flood of fresh names take the
+root and the TLDs with it and leave every client re-walking from the top.
 */
 
 // These tests never reach an upstream: what they exercise is the cache itself,
@@ -66,10 +65,10 @@ cached_key_bytes :: proc(v: ^Validator, zone: string) -> int {
 One zone cannot take an unbounded share of the cache.
 
 `fetch_keys` admits `MAX_KEYS_PER_ZONE` records and the RSA parser reads a
-modulus of `MAX_MODULUS_BYTES`, so what a single apex could hand the cache was
-bounded only by what fits in a DNS message. Multiply that by
-`DEFAULT_MAX_CACHED_ZONES` and the cache alone is larger than the machines this
-runs on.
+modulus of `MAX_MODULUS_BYTES`, so without a byte bound what a single apex could
+hand the cache would be bounded only by what fits in a DNS message. Multiply
+that by `DEFAULT_MAX_CACHED_ZONES` and the cache alone is larger than the
+machines this runs on.
 */
 @(test)
 test_one_zone_cannot_fill_the_cache_by_itself :: proc(t: ^testing.T) {
@@ -159,9 +158,9 @@ test_the_cache_keeps_only_keys_that_could_sign :: proc(t: ^testing.T) {
 The root's keys survive a flood of zones nobody else asked for.
 
 This is the half of the issue that costs every other client rather than the
-server: a full cache used to be emptied wholesale, so a client cycling
-`max_cached_zones` names of its own threw out the root and every TLD beside it,
-and every question in flight went back to walking from the top.
+server: were a full cache emptied wholesale, a client cycling
+`max_cached_zones` names of its own would throw out the root and every TLD
+beside it, and every question in flight would go back to walking from the top.
 
 The root is touched here the way a walk touches it - `zone_keys` reads it from
 the cache at the start of every chain - so under any eviction that prefers what
@@ -197,8 +196,8 @@ test_a_flood_of_fresh_zones_does_not_evict_the_root :: proc(t: ^testing.T) {
 /*
 A full cache drops one zone, and it drops the one nobody has asked for.
 
-The wholesale flush made the cost of overflowing the cache fall on every zone in
-it; what makes room now is the entry at the cold end of the list.
+A wholesale flush would make the cost of overflowing the cache fall on every
+zone in it; what makes room is the entry at the cold end of the list.
 */
 @(test)
 test_a_full_cache_evicts_the_least_recently_used_zone :: proc(t: ^testing.T) {
@@ -461,10 +460,10 @@ The figure the documentation quotes is the figure the constants add up to.
 
 `MAX_CACHED_ZONE_BYTES` is what an operator multiplies by `max_cached_zones`,
 and it is quoted in three places away from here: the startup warning, the
-`max_cached_zones` paragraph of docs/dnssec.md, and the constant's own note. It was quoted wrongly
-once already - as `MAX_CACHED_ZONE_KEY_BYTES` alone, which is the RDATA and not
-the entry - so the arithmetic is pinned rather than left to be re-derived by
-whoever next changes one of the parts.
+`max_cached_zones` paragraph of docs/dnssec.md, and the constant's own note.
+Quoting `MAX_CACHED_ZONE_KEY_BYTES` alone, which is the RDATA and not the entry,
+is the easy mistake, so the arithmetic is pinned rather than left to be
+re-derived by whoever next changes one of the parts.
 */
 @(test)
 test_what_an_entry_costs_is_what_the_parts_come_to :: proc(t: ^testing.T) {
@@ -474,9 +473,8 @@ test_what_an_entry_costs_is_what_the_parts_come_to :: proc(t: ^testing.T) {
 		MAX_CACHED_ZONE_KEY_BYTES + MAX_KEYS_PER_ZONE * size_of(Dnskey) + size_of(Zone_Entry) + dns.MAX_NAME_PRESENTATION,
 	)
 
-	// The RDATA cap is the larger part of it but not the whole, which is the
-	// mistake the documentation made: a bound quoted as 8 KB understated the
-	// entry by a third.
+	// The RDATA cap is the larger part of it but not the whole: quoted alone
+	// as 8 KB, it understates the entry by a third.
 	testing.expect(
 		t,
 		MAX_CACHED_ZONE_BYTES > MAX_CACHED_ZONE_KEY_BYTES,

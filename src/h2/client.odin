@@ -153,8 +153,8 @@ Client_Error :: enum u8 {
 // rather than left to stall with none.
 CLIENT_RECV_WINDOW :: 1 << 20
 // Bound on one response body: a DNS message, which RFC 8484 6 holds to 65535
-// bytes. The h2 package does not depend on the dns package, so the limit is
-// restated here, and `upstream` asserts the two agree.
+// bytes. Written out rather than taken from `dns.MAX_MESSAGE`, and `upstream`
+// asserts the two agree.
 CLIENT_MAX_BODY :: 65535
 
 client_make :: proc(io: IO, allocator := context.allocator) -> ^Client {

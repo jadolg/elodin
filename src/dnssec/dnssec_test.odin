@@ -996,9 +996,8 @@ broken_ds_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: me
 	if !ok || type != .DS || !dns.name_equal_fold(name, "example.com.") {
 		return wire, ok
 	}
-	// The DS digest is the last four bytes of the record's RDATA; flipping a
-	// byte inside the message is enough to break the match without disturbing
-	// anything the parser needs.
+	// The digest ends the DS record's RDATA; flipping its last byte is enough
+	// to break the match without disturbing anything the parser needs.
 	msg, err := dns.decode_message(wire, allocator)
 	if err != .None {
 		return wire, ok
@@ -1146,17 +1145,16 @@ test_answers_question_follows_the_cname_chain :: proc(t: ^testing.T) {
 @(test)
 test_cached_key_set_holds_no_gaps :: proc(t: ^testing.T) {
 	/*
-	`cache_put` copies each key, re-parses the copy, and skips any that fail -
-	but writes by index, so a skip leaves a zero-valued `Dnskey` behind rather
-	than a shorter set.
+	`cache_put` copies each key, re-parses the copy, and skips any that fail,
+	so a key that fails to parse shortens the set rather than leaving a
+	zero-valued `Dnskey` behind.
 
-	Nothing reaches that today: every key handed here has already been parsed
-	from the same bytes once. It is worth closing anyway, because of the
-	direction it fails in. A zero key carries algorithm 0, which no signature
-	matches, and an RRset with nothing to check it against is reported
-	unsupported - which `validate_rrset` turns into insecure. A cache quietly
-	holding entries that mean "treat this zone as unsigned" is the wrong way
-	round for a validator.
+	Every key handed here in production has already been parsed from the same
+	bytes once, so this is pinned for the direction a gap would fail in. A zero
+	key carries algorithm 0, which no signature matches, and an RRset with
+	nothing to check it against is reported unsupported - which
+	`validate_rrset` turns into insecure. A cache quietly holding entries that
+	mean "treat this zone as unsigned" is the wrong way round for a validator.
 	*/
 	v := make_validator(fixture_query, nil, Options{})
 	defer destroy_validator(v)
@@ -1543,7 +1541,7 @@ test_reason_belongs_to_the_returned_verdict :: proc(t: ^testing.T) {
 }
 
 /*
-The issue's own reproduction: the captured `example_a` chain a year either side
+The reproduction from #360: the captured `example_a` chain a year either side
 of `FIXTURE_TIME`. Every signature lapses together, so the first step of the
 walk - the root's DNSKEY set, under its trust anchor - is the one named.
 */

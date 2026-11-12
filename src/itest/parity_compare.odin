@@ -458,7 +458,7 @@ pc_header :: proc(
 	excuses an answer for being *smaller* than the upstream's, and an answer
 	that arrived whole in one oversized datagram agrees with the upstream in
 	every record. RFC 6891 section 6.2.3 holds a responder to the requestor's
-	payload size, and `response_limit` floors it further at
+	payload size, and `response_limit` caps it further at
 	`server.max_udp_response`; a datagram past either is one the client's
 	buffer, or the path to it, drops.
 	*/
@@ -487,7 +487,7 @@ thrown away.
 the two differ: this server expands the compressed names inside the RDATA of the
 older record types (RFC 3597 section 4, and src/dns/rdata_raw.odin), and an
 answer that arrived at 1230 bytes can need more than 1232 once those names are
-spelled out. So the test is whether the smallest record left out would have fitted
+spelled out. So the test is whether the first record left out would have fitted
 alongside what was kept. If it would have, the truncation was not forced and the
 client is paying for a TCP round trip it did not need.
 */
@@ -890,7 +890,7 @@ pc_missing :: proc(
 	record dropped for exactly that reserved room - which is what #281 was
 	about - would read as a record dropped for nothing.
 
-	Narrow on three counts, because "additional records may go missing" would
+	Narrow on four counts, because "additional records may go missing" would
 	retire the check on the section glue and the OPT record both live in:
 
 	  - over UDP only, the one transport with a datagram to fit;
@@ -899,7 +899,7 @@ pc_missing :: proc(
 	  - with TC clear, because this reason says "with tc clear" and a message
 	    carrying the bit was cut rather than filled. Both sides truncated is
 	    the shape that reaches here - one side truncated is the allowance
-	    above - and it stays the finding it was before this one existed;
+	    above - and it stays a finding;
 	  - not on a referral, which is `omitted_glue_truncates`' exception (RFC
 	    9471 section 3.3): glue for a name server inside the zone being
 	    delegated is learnable from that reply and nowhere else, so a referral
@@ -1009,8 +1009,7 @@ was decoded, and taking the message's end for the record's position there
 would overstate the room by everything written after it.
 
 One thing makes that reading wrong, and it falls back to the finished length
-less the OPT record, which is what this judged by before it could tell the
-difference: a section holding a record elodin minted is not the upstream's
+less the OPT record: a section holding a record elodin minted is not the upstream's
 with records removed, so the order says nothing about where anything stood.
 The fallback is as if the drop had happened at the very end, the most
 permissive reading of it, so a fallback can only ever excuse and never
@@ -1626,7 +1625,7 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 			A code this server would not have written into *this* answer has no
 			business being here at all, whatever it now says.
 
-			Byte equality is not the test, and was: an option can cross
+			Byte equality is not the test: an option can cross
 			half-rewritten and still be the upstream's. For a code this server
 			never mints, the code appearing on both sides is the finding, and
 			comparing the values would only ask whether the leak was tidy.
@@ -1851,7 +1850,7 @@ pc_same_but_for_id :: proc(a, b: []u8) -> bool {
 	That is the only place it may legitimately differ: the client randomised it
 	and the server echoes what it was sent, so the upstream's copy and the
 	client's carry different letters for the same name. Folding the whole
-	message instead - which this did - counts two answers as identical when a
+	message instead counts two answers as identical when a
 	byte inside an RDATA differs in case, and a downcased name inside RDATA is
 	exactly the kind of quiet re-encoding this statistic exists to notice.
 	*/

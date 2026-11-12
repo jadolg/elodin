@@ -12,19 +12,20 @@ import "elodin:upstream"
 /*
 EDNS this server cannot account for, refused before it is read.
 
-Two shapes reach `decode_message` intact and then hide an option from every
-reader here: a second OPT record, which `find_opt` and `find_opt_span` both stop
-short of, and an OPT whose RDATA is not a well-formed option list, which
-`decode_record` keeps as raw bytes with the options in front of the fault
-unreadable. Either one survives a strip that reports success, so `handle_query`
-answers both FORMERR - RFC 6891 section 6.1.1, which permits exactly one OPT
-record and an option list to be a list - before a cookie is looked for, a name
-is looked up or a cache is consulted.
+`edns_opt_readable` refuses four shapes. Two of them reach `decode_message`
+intact and then hide an option from every reader here: a second OPT record,
+which `find_opt` and `find_opt_span` both stop short of, and an OPT whose RDATA
+is not a well-formed option list, which `decode_record` keeps as raw bytes with
+the options in front of the fault unreadable. Either one survives a strip that
+reports success, so `handle_query` answers both FORMERR - RFC 6891 section
+6.1.1, which permits exactly one OPT record and an option list to be a list -
+before a cookie is looked for, a name is looked up or a cache is consulted.
 
-The cases below are the two properties that follow: what the gate keeps off the
+The cases below are the two properties that follow - what the gate keeps off the
 wire (a client's cookie, the secret of the two options that stop here), and that
-it holds whatever the cache would otherwise have answered. The client-subnet
-half of the same gate is in `ecs_test.odin`.
+it holds whatever the cache would otherwise have answered - and the fourth
+shape, an OPT owned by a name other than the root (#301). The client-subnet half
+of the same gate is in `ecs_test.odin`.
 */
 
 @(private = "file")

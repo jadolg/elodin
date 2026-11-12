@@ -866,9 +866,9 @@ validator reads any answer under it as unsigned data inside the root zone.
 Both keys are checked because the rule is about forwarding, not about one
 setting. `onion: false` is the narrow claim about the upstream; `enabled: false`
 is the blunt key an operator with a local tor may well reach for instead, having
-no reason to read the difference off the names. When only the first stood the
-validator down, the second was a SERVFAIL for every `.onion` name and a startup
-warning was all that pointed at it. If `special_use_deferred` is ever narrowed
+no reason to read the difference off the names. Were only the first to stand the
+validator down, the second would be a SERVFAIL for every `.onion` name with a
+startup warning all that pointed at it. If `special_use_deferred` is ever narrowed
 back to `onion` alone, the second case here fails.
 
 The mock answers with an address the way a local tor would, and the assertion is

@@ -244,8 +244,9 @@ forward_once :: proc(t: ^testing.T, h: ^Harness, query: []u8, proto := Protocol.
 
 /*
 A locally built answer is the plainest case: `make_response` echoes the client's
-own advertised size straight into the OPT record it puts back, so with the
-shipped ceiling a client asking with 4096 was told 4096 and given 1232.
+own advertised size straight into the OPT record it puts back, so left at that,
+a client asking with 4096 under the shipped ceiling would be told 4096 and given
+1232.
 
 Asked over CHAOS, which is answered from this process without a cache, a filter
 or an upstream - so what the OPT says is the only thing under test.

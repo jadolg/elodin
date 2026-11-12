@@ -106,17 +106,16 @@ test_ddr_does_not_swallow_neighbouring_names :: proc(t: ^testing.T) {
 A blocklist entry that reaches `resolver.arpa` wins, because the block lists run
 first.
 
-This is the placement, pinned. The DDR answer used to be built ahead of the block
-lists, on the argument that nothing legitimately lists this name; it is now
-behind them, so that everything this server answers for itself goes in one place
-and a reader learns the rule once. See the ordering note in `resolve_query`, and
+This is the placement, pinned. The DDR answer is built behind the block lists,
+so that everything this server answers for itself goes in one place and a reader
+learns the rule once. See the ordering note in `answer_locally`, and
 `test_a_blocklist_entry_for_a_reserved_name_wins` for the other half of it.
 
 The case given up is written out here rather than left implicit: a list broad
-enough to match `resolver.arpa` - a rule over `arpa` itself, as below - now
-blocks the probe instead of having it answered NODATA. A list like that is
-already breaking every reverse lookup on the machine, which is why this is an
-acceptable trade and not a regression anybody will meet.
+enough to match `resolver.arpa` - a rule over `arpa` itself, as below - blocks
+the probe instead of having it answered NODATA. A list like that is already
+breaking every reverse lookup on the machine, which is why this is an acceptable
+trade and not a regression anybody will meet.
 */
 @(test)
 test_a_blocklist_entry_over_arpa_beats_the_ddr_answer :: proc(t: ^testing.T) {

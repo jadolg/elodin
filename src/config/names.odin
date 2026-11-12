@@ -49,10 +49,10 @@ A default name stops at the url's query, so two DoH servers whose urls differ
 only there would come to share one: they would sum into one series on /metrics
 and read as one in the log, with nothing in the file to tell them apart. That is
 refused, as is a name the file gives that is another server's url up to its
-query, and the same for a fragment, which is cut too. Every other shared name the file held already before the query was cut,
-and is left as it was: one url listed twice or pinned to two addresses, two DoT
-servers on one address, a name the file gives to several servers. Those sum by
-the operator's own spelling of the file.
+query, and the same for a fragment, which is cut too. Every other shared name is
+one the file spells itself, and is allowed: one url listed twice or pinned to two
+addresses, two DoT servers on one address, a name the file gives to several
+servers. Those sum by the operator's own spelling of the file.
 */
 @(private)
 check_default_upstream_names :: proc(l: ^Loader, cfg: ^Config) {

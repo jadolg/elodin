@@ -17,9 +17,9 @@ the whole record does for a client that asked without EDNS. Every byte of that
 is room the encoder had already spent, so an answer fitted before the record was
 settled is packed against a ceiling lower than the one it goes out under.
 
-Nothing put those records back, and the client is the one that paid for it. Two
-ways, and three cases below - the second way twice, once for each of the two
-things that hand the room back:
+Unless that room is handed back to the records it was taken from, the client
+pays for it. Two ways, and three cases below - the second way twice, once for
+each of the two things that hand the room back:
 
   - a TCP round trip for records that fitted. The answer is cut and TC set, the
     client asks again over TCP, and the datagram it was sent had room for the
@@ -326,7 +326,7 @@ test_a_truncated_answer_is_filled_to_the_clients_datagram :: proc(t: ^testing.T)
 }
 
 /*
-The same, for the additional record that used to pay for the options' room.
+The same, for an additional record the options' room would otherwise cost.
 
 Worse for the client than the case above, and it is the same arithmetic: an
 additional record left out sets no TC bit, so nothing in the reply says the

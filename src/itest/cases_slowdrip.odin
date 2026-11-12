@@ -17,8 +17,8 @@ one read and is restarted by every byte that arrives. It is also the only thing
 that reclaims a connection already accepted - `max_connections` and the per-prefix
 share bound how many exist, `conn_rate_check` bounds how fast they are opened, and
 every query budget is charged per message - so a client sending one byte inside
-every wait was never given up on at all, and held a connection, a thread and one of
-the table's slots for as long as it cared to while no message ever completed. RFC
+every wait would never be given up on, and would hold a connection, its fiber and
+one of the table's slots for as long as it cared to while no message completed. RFC
 7766 6.2.3 names the attack and says the idle timeout should be reset "on the
 receipt of a full DNS message, rather than on receipt of any part of a DNS
 message".
@@ -182,7 +182,7 @@ The other side of the same trust boundary: an upstream that trickles its
 ServerHello is given up on at the query's timeout, not held for as long as it
 keeps trickling (#346). SO_RCVTIMEO bounds one read and restarts with every byte,
 so a handshake bounded per read would let a DoT upstream - or anything on the
-path to it - sending a byte inside every wait hold the worker that dialled it.
+path to it - sending a byte inside every wait hold the query.
 */
 @(private = "file")
 run_upstream_drip_case :: proc(r: ^Runner) {

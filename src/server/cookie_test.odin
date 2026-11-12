@@ -194,7 +194,8 @@ test_cookie_inspection :: proc(t: ^testing.T) {
 	only_client := inspect_cookie(&k, query_with_cookie(unhex("2464c4abcf10c957")), client)
 	testing.expect_value(t, only_client.verdict, Cookie_Verdict.Unproven)
 
-	// Between 9 and 15 bytes, and beyond 40, is malformed (RFC 7873 section 5.2.2).
+	// Shorter than 8, between 9 and 15, or beyond 40 is malformed (RFC 7873
+	// section 5.2.2).
 	bad_lengths := []int{1, 7, 9, 15, 41}
 	for bad in bad_lengths {
 		req := inspect_cookie(&k, query_with_cookie(make([]u8, bad, context.temp_allocator)), client)

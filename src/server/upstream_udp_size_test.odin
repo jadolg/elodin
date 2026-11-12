@@ -337,14 +337,13 @@ server does not read.
 
 `find_opt`, `find_opt_span` and `edns_opt_readable` all read the additional
 section alone - RFC 6891 section 6.1.1 is where the record belongs - and a client
-may put a record of type OPT in its answer section for the asking. Two things
-went wrong with that. `peek_udp_size` used to walk every section and return the
-first record it met, so the decoy was what this rewrite and the receive buffer in
-`upstream/plain.odin` both read while the real record went out saying whatever
-the decoy said; that is fixed in the codec, and `dns.test_peek_udp_size_reads_the_opt_record`
-holds it. And the decoy itself was forwarded, so an upstream reading the first
-OPT *it* met - which is exactly what this server did until #325 - would answer
-the client's 65000 whatever this server wrote in the record it does read.
+may put a record of type OPT in its answer section for the asking. Two rules
+hold against that. The size is read from the additional section's OPT record
+alone, so the decoy is not what this rewrite and the receive buffer in
+`upstream/plain.odin` read; `dns.test_peek_udp_size_reads_the_opt_record` holds
+that in the codec. And the decoy itself is not forwarded, since an upstream
+reading the first OPT *it* meets (#325) would answer the client's 65000 whatever
+this server wrote in the record it does read.
 
 The second is what this case is about, and the gate that already refuses the two
 other EDNS shapes this server cannot account for is where it is settled: FORMERR,

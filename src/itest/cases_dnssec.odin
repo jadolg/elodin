@@ -531,7 +531,7 @@ dnssec:
 	}
 	end_case(r)
 
-	// Issue #336: the zone-key cache had a bound only the source could set. It
+	// `dnssec.max_cached_zones` bounds the zone-key cache (#336). It
 	// is the one dial on how much memory validation may hold, so a box whose
 	// memory the operator knows and this server does not needs to reach it.
 	start_case(r, "dnssec: --check accepts a zone-cache bound")

@@ -202,17 +202,11 @@ raw_layout :: proc "contextless" (t: dns.Type) -> (layout: Raw_Layout, ok: bool)
 /*
 Copy raw RDATA, lowercasing the domain names it is known to contain.
 
-Falls back to a verbatim copy when the layout does not parse — including when a
-name turns out to be compressed, which cannot be expanded here because the
-surrounding message is long gone. Such a record simply fails to validate, which
-is the right outcome for RDATA that RFC 4034 forbade compressing in the first
-place.
-
-A compressed name should no longer reach that fallback: the decoder expands the
-ones it can while the message is still in hand (see src/dns/rdata_raw.odin), so
-what arrives here is the uncompressed form RFC 4034 section 6.2 asks for rather
-than a canonical form no signer ever signed. What is left is RDATA nothing could
-walk, and a validation failure is the honest answer for it.
+The decoder expands compressed names while the message is still in hand (see
+src/dns/rdata_raw.odin), so what arrives here is the uncompressed form RFC 4034
+section 6.2 asks for. Falls back to a verbatim copy when the layout does not
+parse: that is RDATA nothing could walk, and the record then fails to validate,
+which is the honest answer for it.
 */
 @(private)
 write_downcased_raw :: proc(out: ^[dynamic]u8, type: dns.Type, rdata: []u8) {

@@ -80,10 +80,9 @@ run_strategy_cases :: proc(r: ^Runner) {
 	/*
 	Three upstreams, each answering with a distinguishable address.
 
-	TEST-NET-2 rather than 10.0.0.0/8, which is what these were: the rebinding
-	guard refuses an answer that points a public name into private space, and
-	though it is off by default now, keeping these on a documentation range means
-	the case does not quietly depend on that default. Any documentation range
+	TEST-NET-2, a documentation range: the rebinding guard refuses an answer that
+	points a public name into private space, so the case does not depend on that
+	guard's default. Any documentation range
 	does; the addresses only have to differ from each other.
 	*/
 	ports := [3]int{next_port(r), next_port(r), next_port(r)}
@@ -578,10 +577,10 @@ blocking: {{ enabled: false }}
 	/*
 	--- a query's wait on black-holed upstreams is bounded ---
 
-	Issue #327: failover used to run `attempts` rounds over every member at the
-	full timeout each, here 2 x 3 x 500ms = 3s for one query, holding a worker
-	throughout. It now gives up once two timeouts have been waited, and the
-	third member is never asked.
+	Issue #327: failover gives up with SERVFAIL once two timeouts have been
+	waited, and the third member is never asked - rather than `attempts` rounds
+	over every member at the full timeout each, here 2 x 3 x 500ms = 3s for one
+	query.
 	*/
 	{
 		ports: [3]int

@@ -41,8 +41,8 @@ resolver is usually asked to answer for.
 That headroom is the point and not generosity. A working set that does not fit
 is one an ordinary client evicts just by working through the names it was given,
 and then every request is a miss paying for a signature, which is the budget
-below spent on nothing and a 503 for whoever asks next. Sixteen, which this was,
-ran out at six names.
+below spent on nothing and a 503 for whoever asks next. Sixteen entries run out
+at six names.
 
 An entry costs its authority and the signed profile, so a couple of kilobytes;
 the whole table is under two hundred.
@@ -419,13 +419,13 @@ profile_cache_put :: proc(p: ^Profile_Signer, authority: string, signed: []u8) {
 /*
 The slot a new entry takes: a free one, else the one handed out longest ago.
 
-Plainly least-recently-used, and not more than that. What was here before
-preferred entries nothing had come back for, on the theory that a flood of
-invented authorities is made of those and a real device's is not - but which
-entries get asked for twice is the client's to decide, so a flood that repeats
-itself marked every slot and the preference evaporated exactly when it was
-wanted. A rule that holds only against an attacker who has not read it is worse
-than none: it reads as a defence in the code and is not one.
+Plainly least-recently-used, and not more than that. Preferring entries nothing
+has come back for, on the theory that a flood of invented authorities is made of
+those and a real device's is not, does not hold: which entries get asked for
+twice is the client's to decide, so a flood that repeats itself marks every slot
+and the preference evaporates exactly when it is wanted. A rule that holds only
+against an attacker who has not read it is worse than none: it reads as a
+defence in the code and is not one.
 
 What actually bounds this endpoint is upstream of the cache - the certificate
 decides which hosts may be asked about, the port rule and the two normalisations

@@ -472,13 +472,13 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	/*
-	The same flood down one TCP connection, which the limiter used not to see at
-	all.
+	The same flood down one TCP connection: the limiter charges each pipelined
+	query on a connection.
 
 	`server.max_connections` bounds how many clients are here, not how fast one of
-	them asks, so a client that pipelines - which RFC 7766 6.2.1.1 allows - had the
-	upstream round trips and the cache churn of an unmetered flood for the price of
-	one connection.
+	them asks, so without that a client that pipelines - which RFC 7766 6.2.1.1
+	allows - would have the upstream round trips and the cache churn of an
+	unmetered flood for the price of one connection.
 
 	Both runs are here rather than only the limited one, because the ceiling below is
 	a bound only if the flood arrives: a run that answered forty queries because forty
@@ -562,10 +562,10 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	A datagram flood does not close the prefix's connections.
 
 	The budget is keyed on the query's source address, and on a datagram the sender
-	writes that field. So when one budget served both transports, anybody able to
-	send UDP could empty any prefix's budget - and every genuine TCP, DoT or DoH
-	connection from that prefix then had its first query refused and its connection
-	closed. This is that case from the outside: the datagram budget is spent dry and
+	writes that field. So datagrams and connections draw on separate budgets: with
+	one for both, anybody able to send UDP could empty any prefix's budget - and
+	every genuine TCP, DoT or DoH connection from that prefix would have its first
+	query refused and its connection closed. This is that case from the outside: the datagram budget is spent dry and
 	a TCP client at the same address asks anyway.
 
 	One response a second, which is what makes the case say something rather than
@@ -719,9 +719,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			Read against the run above rather than against `QUERIES`: what the
 			case claims is that naming the network raised its budget, and a
 			figure that happened to equal the whole flood would say the same
-			thing less clearly. The mock answers after 20 ms, so how much of a
-			200-query flood arrives inside the drain is the runner's business and
-			not the limiter's.
+			thing less clearly.
 			*/
 			check(
 				r,
@@ -756,9 +754,9 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	Both families of client on one wildcard listener, each with a budget of its own.
 
 	An IPv4 client reaching a listener bound to `::` arrives as `::ffff:a.b.c.d`,
-	which is zeroes in the four groups an IPv6 source is keyed on - so keyed as
-	IPv6 it landed in the `::/64` bucket, the same one `::1` lands in, and the
-	whole IPv4 side of the listener shared a budget with it. This is that from the
+	which is zeroes in the four groups an IPv6 source is keyed on, so it is keyed
+	as IPv4: keyed as IPv6 it would land in the `::/64` bucket, the same one `::1`
+	lands in, and the whole IPv4 side of the listener would share a budget with it. This is that from the
 	outside, and it is the case that needs no spoofing to show: two real clients,
 	two real families, one port, and the kernel filling in the source addresses.
 

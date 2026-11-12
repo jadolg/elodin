@@ -412,8 +412,8 @@ engine_generation :: proc(e: ^Engine) -> u64 {
 
 	Worth the paragraph because this is on the hot path: it runs once per query
 	on top of the read lock `engine_match` takes for the question and one more
-	per name in the chain, and it was a second lock round trip for a number that
-	changes when a list is reloaded and at no other time.
+	per name in the chain, and a lock round trip here would be one more per
+	query for a number that only a list reload changes.
 	*/
 	return sync.atomic_load(&e.generation)
 }

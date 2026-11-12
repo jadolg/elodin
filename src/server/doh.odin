@@ -38,11 +38,11 @@ HTTP/2.
 
 RFC 9110 8.3.1: the type and subtype are case-insensitive, and parameters follow
 a `;`. So it is the media type before any parameters, compared whole and without
-regard to case - not a prefix, which let `application/dns-messageZZZZ` through,
-and not a case-sensitive one, which refused `Application/DNS-Message`. The fold is
-ASCII only: `strings.equal_fold` folds Unicode, and would take the long s (U+017F)
-in `application/dns-mes\u017fage` for an `s`. A missing Content-Type is accepted
-as before.
+regard to case - not a prefix, which would let `application/dns-messageZZZZ`
+through, and not a case-sensitive one, which would refuse
+`Application/DNS-Message`. The fold is ASCII only: `strings.equal_fold` folds
+Unicode, and would take the long s (U+017F) in `application/dns-mes\u017fage` for
+an `s`. A missing Content-Type is accepted.
 */
 doh_content_type_ok :: proc(value: string) -> bool {
 	if value == "" {
@@ -102,8 +102,8 @@ requests.
 
 It grows to hold whatever the largest request on the connection needed - a body
 at `MAX_DOH_BODY` takes it to 128 KiB, since a dynamic array doubles - and since
-the buffer now lives as long as the connection rather than as long as one
-request, that is capacity a client can raise once and leave raised for as long as
+the buffer lives as long as the connection rather than as long as one request,
+that is capacity a client can raise once and leave raised for as long as
 it keeps the connection open, whatever it sends afterwards. At
 `server.max_connections`, connections that each did that hold tens of megabytes
 between them for nothing. One oversized request is not a reason to keep an
@@ -308,9 +308,9 @@ the refusal to a HEAD can go without content (RFC 9110 9.3.2).
 Everything kept in the result but the body is copied out of the reader's buffer
 rather than pointed into it. `http_line` and `http_exact` return views, and every
 read after one of them may grow that buffer - which, past its capacity, means a
-different block. The arena behind `context.temp_allocator` happens to carry the old
-contents forward and hold onto the block until `free_all`, so views into it kept
-reading correctly, but nothing here should depend on which allocator it was
+different block. The arena behind `context.temp_allocator` happens to carry the
+old contents forward and hold onto the block until `free_all`, so views into it
+would read correctly, but nothing here should depend on which allocator it was
 handed. The copies live in the same scratch space and go the same way.
 */
 @(private)
@@ -336,8 +336,8 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	/*
 	`second` is the first space in `rest`, so what follows the target - any
 	further space included - is all in `version`. Checked rather than taken for
-	one: read as "not HTTP/1.0, so 1.1 with keep-alive", `GET / JUNK` was a
-	request, and so was `GET / HTTP/1.1 trailing-garbage`.
+	one: read as "not HTTP/1.0, so 1.1 with keep-alive", `GET / JUNK` would be a
+	request, and so would `GET / HTTP/1.1 trailing-garbage`.
 
 	Both are the disagreement `h2.parse_content_length` is written against, on
 	the other half of the request line. A front end sharing :443 with elodin, or
@@ -362,8 +362,8 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	3.2). SP is the only separator this reader splits on, but RFC 9112 3 lets a
 	recipient split on HTAB, VT, FF or a bare CR as well, so a byte of those in
 	either half is a request line two hops read differently:
-	`POST\t/allowed /dns-query HTTP/1.1` was a POST to `/dns-query` here and a
-	request for `/allowed` to a front end that split on the tab (#438). Bare CR
+	`POST\t/allowed /dns-query HTTP/1.1` would be a POST to `/dns-query` here and
+	a request for `/allowed` to a front end that split on the tab (#438). Bare CR
 	never gets this far - see `http_line`.
 	*/
 	if !h2.is_token(line[:first]) || !h2.target_is_valid(target) {
@@ -424,7 +424,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 		/*
 		And a name is a token (RFC 9110 5.1), compared without regard to ASCII
 		case and no other. `strings.equal_fold` folds Unicode, where the long s
-		(U+017F) is an `s`, so `Ho\u017ft` was counted as Host; and a name outside
+		(U+017F) is an `s`, so `Ho\u017ft` would count as Host; and a name outside
 		the token grammar, once folded ASCII only, would be skipped here while a
 		hop that folds the other way reads `Tran\u017ffer-Encoding` as framing
 		(#432). Refused, as the two shapes above are.
@@ -644,18 +644,17 @@ how long a connection may live, and over HTTP those come apart. A request for
 another path is answered 404 and keeps its connection, and an h2 SETTINGS or PING
 is read and the loop goes round again - and none of them is charged to
 `stream_rate_check`, which bills questions. A peer sending one inside every idle
-wait held a connection, a thread and one of `max_connections` forever for nothing.
-The length-prefixed transports never had the gap: a TCP or DoT client keeps its
-connection only by completing DNS messages, and every one is charged.
+wait would hold a connection, a fiber and one of `max_connections` forever for
+nothing. The length-prefixed transports do not have the gap: a TCP or DoT client
+keeps its connection only by completing DNS messages, and every one is charged.
 
 So this is that rule, put in terms HTTP can keep: a connection must ask a question
 - the thing the limiter charges - within twice `client_timeout`, or it is let go.
 Twice because that is the longest a TCP client may go between messages it is
 charged for: the idle wait for the next one to start, and the deadline that start
 begins. A browser asking questions is never near it, and one holding an idle DoH
-connection with nothing on it is closed by the idle wait long before it, as it
-always was. What it ends is a connection kept alive only by requests that cost the
-peer nothing.
+connection with nothing on it is closed by the idle wait long before it. What it
+ends is a connection kept alive only by requests that cost the peer nothing.
 
 Checked where each request or frame is about to be read, so a connection is held
 past the figure by at most the one read it was waiting on - which the per-message
@@ -1017,7 +1016,7 @@ so nothing further on this connection is answered and what these bytes say does
 not matter. A client that stops short of what it declared, that keeps sending past
 `HTTP_LINGER_BYTES`, or that trickles for longer than `HTTP_LINGER_TIMEOUT`, ends
 the drain on the idle wait, the limit or the deadline rather than holding the
-thread.
+connection's fiber.
 
 `idle` is the per-read wait, and the caller chooses it because the caller is what
 knows whether the bytes that are left are already here or still arriving. A

@@ -71,10 +71,10 @@ Waits escalate rather than starting at the ceiling, which is the difference
 between waiting out the two conditions that arrive as the same error. A run of
 pending network errors - four queued connections behind an nftables `reject`, a
 flapping route - is over in a millisecond or two of waiting and then the queue
-moves; a descriptor shortage is not over at all. Starting at the ceiling made the
-first of those cost a listener a full second of deafness per failure for as long
-as bad entries kept arriving, which is a worse failure than the spin this change
-set out to remove: the spin at least kept accepting.
+moves; a descriptor shortage is not over at all. Starting at the ceiling would
+cost the first of those a full second of deafness per failure for as long as bad
+entries kept arriving, which is worse than the busy-accept this file exists to
+remove: a spinning listener at least keeps accepting.
 
 Doubling from a millisecond reaches the ceiling in about a second of total
 waiting, so a shortage is at one attempt per second almost immediately, while a
@@ -102,13 +102,12 @@ one - so there is no eleventh useful step, and every failure past it wants the
 ceiling by definition rather than by arithmetic.
 
 Bounding it is not tidiness. `ACCEPT_FIRST_WAIT << steps` is an `i64` of
-nanoseconds, and a base of a million overflows one at 44 steps: the first version
-of this guarded at 62 on the reasoning that `1 << 62` nanoseconds is centuries,
-which is true of a base of *one* and not of this one. Past 44 the shift wrapped,
-several values came out zero or negative, `act.wait > 0` was false for them, and
-the loop spent those iterations neither waiting nor counting - a burst of exactly
-the busy-accept this file exists to remove, about thirty-five seconds into a
-descriptor shortage and invisible in the counter.
+nanoseconds, and a base of a million overflows one at 44 steps: `1 << 62`
+nanoseconds is centuries for a base of *one* and not for this one. Past 44 the
+shift wraps, several values come out zero or negative, `act.wait > 0` is false
+for them, and the loop spends those iterations neither waiting nor counting - a
+burst of exactly the busy-accept this file exists to remove, about thirty-five
+seconds into a descriptor shortage and invisible in the counter.
 
 Two assertions, because the two ends fail differently. The first says the
 escalation actually reaches the ceiling, so lowering the step count cannot leave
@@ -182,11 +181,11 @@ How long a listener has to have been failing before it says so.
 
 One rule for both ceilings, in the terms an operator would use: the `warn` is
 said once this listener has spent about a second not accepting. Not "once the
-wait reached its ceiling", which is what this was and which read very differently
-on either side of it - a shortage reached its ceiling after a second, and a queue
-error reached its own after sixty-three milliseconds, so a route flap queueing
-ten bad entries burned the one warning a listener gets on a condition that had
-lasted a sixteenth of a second.
+wait reaches its ceiling", which reads very differently on either side of it - a
+shortage reaches its ceiling after a second, and a queue error reaches its own
+after sixty-three milliseconds, so a route flap queueing ten bad entries would
+burn the one warning a listener gets on a condition that had lasted a sixteenth
+of a second.
 
 Stated as a duration rather than as a count of failures because the two ceilings
 make the same count mean different things, and what matters is neither: it is how
@@ -210,8 +209,8 @@ So a success pays back a fixed `ACCEPT_FIRST_WAIT` rather than the lot. A burst
 that really has cleared is worth about a hundred of those and is gone within a
 hundred accepts, which a working listener does immediately; a shortage letting
 one connection through per ten failures adds far more per cycle than it takes
-back, climbs to the second, and says so. Halving was tried first and decays too
-fast to notice that second shape at all.
+back, climbs to the second, and says so. Halving would decay too fast to notice
+that second shape at all.
 
 Between them is a band - roughly one success in five - where the accumulation and
 the repayment balance below the threshold and no `warn` is said. That is
@@ -252,11 +251,11 @@ Accept_Run :: struct {
 	This run reached the reporting threshold.
 
 	What makes a recovery worth acting on. A listener that never said anything
-	has nothing to hand back, and clearing the shared flag from one was an
+	has nothing to hand back, and clearing the shared flag from one would be an
 	unbounded line rate: with `waited` held at the threshold, the listener that
 	*is* in trouble reports on every failure, so a neighbour recovering every
-	second - four failures and one idle tick will do it - made it say both lines
-	again, for the length of the outage.
+	second - four failures and one idle tick will do it - would make it say both
+	lines again, for the length of the outage.
 	*/
 	reported: bool,
 }
@@ -435,8 +434,8 @@ a cadence that never happens again, disagreeing with the `accept_backoff` rate
 the documentation tells them to expect.
 
 Which ceiling, though, and not `ACCEPT_BACKOFF`: a queue error settles at a
-twentieth of that, and naming the shortage's figure at it was the last thing this
-line got wrong.
+twentieth of that, and naming the shortage's figure for it would overstate its
+cadence twentyfold.
 */
 @(private)
 report_accept_failure :: proc(listener: string, run: Accept_Run, err: net.Accept_Error, listener_flag: ^bool) {
@@ -602,7 +601,7 @@ server, so the figure is the right one.
 A warning rather than a refusal to start. The configuration is not wrong - the
 machine is short - and a server that will hold fewer clients than asked is worth
 more to the operator than one that will not start at all. What it must not do is
-meet the shortage silently, which is what it did.
+meet the shortage silently.
 */
 descriptor_limit_line :: proc(soft_limit: int, d: Descriptor_Demand) -> (line: string, short: bool) {
 	wanted := descriptors_wanted(d)

@@ -526,8 +526,9 @@ test_block_scalar_stops_at_its_own_indent :: proc(t: ^testing.T) {
 
 @(test)
 test_block_scalar_as_sequence_entry :: proc(t: ^testing.T) {
-	// A block scalar as a bare sequence entry, `- |`, used to fall through to
-	// the plain-scalar path: its body was read as YAML and the parse failed.
+	// A block scalar as a bare sequence entry, `- |`, is read as a block
+	// scalar, not through the plain-scalar path, which would read its body as
+	// YAML and fail the parse.
 	root, err := parse("- |\n  text # kept\n- x\n", context.temp_allocator)
 	testing.expectf(t, err == nil, "parse failed: %v", err)
 	seq := items(root)

@@ -146,8 +146,8 @@ test_unwalkable_raw_rdata_stays_within_the_name_budget :: proc(t: ^testing.T) {
 @(private)
 decode_into_arena :: proc(msg: []u8) -> (used: int, err: Decode_Error) {
 	// Enough for the unbudgeted shapes these fixtures reach when the budget is
-	// taken out to check that they still do - 11.4 MB is the largest - and not
-	// the 48 MB it once was, with four of these running side by side.
+	// taken out to check that they still do - 11.4 MB is the largest - with
+	// four of these running side by side.
 	backing := make([]u8, 16 << 20)
 	defer delete(backing)
 	arena: mem.Arena

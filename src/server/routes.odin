@@ -58,10 +58,10 @@ rather than making them configure the same fact twice.
 
 What a route does not change is the cache. The key is name/type/class/DO/CD with
 no upstream identity in it, which stays sound only because a question always
-routes the same way: the table is built once at startup from a file that is
-never reloaded (SIGHUP reloads TLS certificates and nothing else). A future
-reload that could move a zone from one route to another would have to flush, or
-key on the route, or it would serve one upstream's answers on another's behalf.
+routes the same way under one policy: the route table belongs to the
+generation, and a reload that changes the routes moves `Live.policy`, which is
+in every cache key, so one upstream's answers are never served on another's
+behalf.
 The apex `DS` carve-out is the one question where that reading is not the whole
 story, and it is worth saying so rather than resting on "the type is in the key".
 The type is in the key, but the carve-out does not split by type: both the
@@ -84,7 +84,7 @@ answering once an answerable reply is in hand (a `failover` spare that is never
 otherwise asked, say; see `upstream.answering`) - while another holds the
 proof. The route's answer is then stored where the group's best reply
 settled the question, for at most `cache.negative_ttl`, which is the behaviour
-the zone had before the carve-out existed: an unsigned NODATA for the apex
+the zone has without the carve-out: an unsigned NODATA for the apex
 `DS`, served for the entry's lifetime.
 */
 Zone_Route :: struct {
@@ -170,8 +170,8 @@ rather than proved absent, which is Bogus, which is SERVFAIL for every name in
 the zone. RFC 8375 section 4 item 4.B carves the same query out of the same MUST
 NOT ("MUST result in forwarding whatever queries are necessary"), and
 `validator_query` already carves it out for the lookups this server makes on its
-own account, so leaving the client's copy of that question on the route was the
-one place the three disagreed.
+own account, so leaving the client's copy of that question on the route would be
+the one place the three disagree.
 
 Three things the carve-out deliberately is not:
 
@@ -194,12 +194,12 @@ What it does not touch is whether the answer is validated. `served_locally` stil
 covers the routed zone's apex, so the parent's proof is passed to the client with
 the upstream's signatures intact and without the AD bit, for the client to check
 against its own anchor - which is exactly what `LOCALLY_SERVED_ZONES` does with
-the same query for `home.arpa.` today, and the client asking it is the only
+the same query for `home.arpa.`, and the client asking it is the only
 party that has a use for the proof.
 
 The privacy cost is one name and it is worth naming: a route otherwise means the
 public resolver never hears any part of the zone (issue #200), and the apex `DS`
-is now one question that reaches it. No host inside the zone is in it - the name
+is one question that reaches it. No host inside the zone is in it - the name
 is the zone's own, which its public parent already publishes if the delegation
 exists and answers NXDOMAIN for if it does not - and only a validating client
 below this server ever asks it. RFC 8375 section 4 item 4.B makes the same
@@ -270,7 +270,7 @@ client that the route cannot. Every other reply goes back on the route -
     split horizon, which `rebind.odin` names as the reason its guard defaults
     off. Handing the client the public DS makes it demand a `DNSKEY` the
     internal view has no matching key for, and Bogus is what it gets, where
-    before the carve-out the same deployment resolved. An operator who really
+    without the carve-out the same deployment resolves. An operator who really
     is mirroring the signed zone loses the secure path and keeps the insecure
     one, which is the trade this whole file makes for a routed zone anyway
     (point 3 above), and `trust_anchors` is the escape hatch there as here.
@@ -735,7 +735,7 @@ left the client with anyway. `parent_answers_apex_ds` is the reading, applied to
 the route's reply rather than the parent's. Anything else - no reply, a SERVFAIL,
 an NXDOMAIN, a `DS` RRset, a NOERROR somebody rewrote - is not that answer, so
 the bet is off and the parent is asked after the fact; a parent that has come
-back with the proof is read and remembered as it always would have been, and
+back with the proof is read and remembered as on any other path, and
 where it still says nothing the route's reply stands exactly as it would have
 after the wait. The saving is of a wait the route can cover, never of the answer
 itself.

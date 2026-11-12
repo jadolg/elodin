@@ -84,11 +84,11 @@ that bad minute into a bad day: the entry answers SERVFAIL until it expires with
 the upstream never asked again, and a reload cannot release it because the
 re-walk reads the same bytes and reaches the same verdict.
 
-Asked here rather than written out at each site that persists a verdict, because
-writing it out is how the two sites came to disagree: the forwarding path was
-taught this and the cache's own recheck was not, so an answer that went in clean
-and turned unreadable on a later walk was pinned exactly as before. A third site
-should have to answer this question rather than remember to.
+Asked here rather than written out at each site that persists a verdict - the
+forwarding path and the cache's own recheck - so the two cannot disagree: written
+out twice, one could pin an answer that went in clean and turned unreadable on a
+later walk. A third site should have to answer this question rather than
+remember to.
 */
 @(private)
 cloak_verdict_worth_keeping :: proc(verdict: Cloak_Verdict) -> bool {
@@ -137,14 +137,13 @@ resolves allow over block for a single name, and that is the whole of what it
 settles: an allowed name is not a block, and the walk goes on. It does not
 excuse a *different* name found beside it.
 
-Hoisting it to the answer - any allowed name anywhere clears the lot - was the
-first shape of this and it handed the whole check away. The party that writes
-the answer section is the party this feature is aimed at, so it may write
-whatever names it likes into it: one extra CNAME at the question's owner
-pointing at any host the operator has ever allowlisted, the tracker's CNAME
-beside it, and the answer went out intact. Every allowlist entry was a master
-key, and an allowlist is a thing operators add to precisely because they had to
-unbreak something.
+Hoisting it to the answer - any allowed name anywhere clears the lot - would
+hand the whole check away. The party that writes the answer section is the party
+this feature is aimed at, so it may write whatever names it likes into it: one
+extra CNAME at the question's owner pointing at any host the operator has ever
+allowlisted, the tracker's CNAME beside it, and the answer would go out intact.
+Every allowlist entry would be a master key, and an allowlist is a thing
+operators add to precisely because they had to unbreak something.
 
 So the only whole-answer exemption is an allow rule on the *question*, matched
 above before any of this runs. That one is safe because the question is the
@@ -175,9 +174,9 @@ not matching the DNAME's target as a name.
 A CNAME whose RDATA this decoder would not parse arrives as `Rdata_Raw`, and the
 answer is refused rather than walked past it. There is no target in hand to look
 up, so what the record redirects onto is exactly the thing this check cannot
-find out - and passing over it was the last place here that answered "cannot
-tell" with "serve it". The rest of this file, and both unreadable-answer paths in
-the resolver, answer it the other way.
+find out, and passing over it would answer "cannot tell" with "serve it". The
+rest of this file, and both unreadable-answer paths in the resolver, answer it
+the same way.
 
 It costs little that a client keeps: a CNAME reaches `Rdata_Raw` only when the
 name inside it ran outside the message, pointed forward or into the header
@@ -284,15 +283,16 @@ cloaked_chain_target :: proc(
 			The walk has outrun its budget, and the answer is refused rather
 			than served.
 
-			Serving it was the whole of the evasion this check exists to stop.
-			An attacker who can write the answer can write as many distinct
-			names into it as it likes, and while the budget bounded the work it
-			did nothing about what happened at the end of it: the walk stopped,
-			the listed name sat one hop past where it stopped, and the answer
-			went out. A plain eighteen-name chain did it - no repetition, no
-			malformed record, nothing a client would not follow to the end.
+			Serving it would be the whole of the evasion this check exists to
+			stop. An attacker who can write the answer can write as many
+			distinct names into it as it likes, and a budget that bounded only
+			the work would do nothing about what happens at the end of it: the
+			walk stops, the listed name sits one hop past where it stopped, and
+			the answer goes out. A plain eighteen-name chain would do it - no
+			repetition, no malformed record, nothing a client would not follow
+			to the end.
 
-			So the budget now bounds the work *and* the answer. An answer this
+			So the budget bounds the work *and* the answer. An answer this
 			server could not finish checking is one it does not know about, and
 			the honest thing to do with a name it does not know about is decline
 			it, exactly as it declines a name it knows is listed.
@@ -347,8 +347,8 @@ it differently.
 
 The answer section arrives decoded rather than as wire. Each caller has the
 message in hand already - the forwarding path decodes it for the cache and the
-hit path to reach this at all - and taking the bytes here meant decoding every
-forwarded response a second time for nothing.
+hit path to reach this at all - and taking the bytes here would mean decoding
+every forwarded response a second time for nothing.
 
 The response is built from the question, exactly as a block on the question is:
 what the client asked for is `www.brand.example`, and `blocking.response` says
@@ -487,12 +487,10 @@ blocking having been switched off entirely since, which would make a remembered
 refusal this server declining a name under a feature the operator has turned
 off.
 
-Nothing can switch it off today: SIGHUP re-reads the certificates and nothing
-else, and the only other thing that changes at runtime is the lists themselves,
-on `blocking.refresh`. `blocking.enabled` is read once from the configuration and
-is fixed for the life of the process, so this half of the guard is a constant. It is kept as the cheap half of a
-condition that is about to be read wrongly the day configuration reload grows -
-not as a claim that reload exists.
+`blocking.enabled` belongs to the generation, and a reload can turn it off while
+refusals made under it are still cached. The generation this request is pinned
+to says whether blocking is on, so this half of the guard follows the reload
+that switched it.
 */
 @(private)
 cloak_refusal_stands :: proc(s: ^Server) -> bool {

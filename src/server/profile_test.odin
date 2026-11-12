@@ -130,9 +130,10 @@ make_cert :: proc(cert, key: string, name := "") -> bool {
 	return werr == nil && state.exit_code == 0
 }
 
-// Package-visible: `mobileconfig_test` drives the same certificate through the
-// real HTTP endpoints, and a second copy of the generation would be a second
-// `openssl` racing this one over its own output files.
+// Generated once per run: `mobileconfig_test` and `metrics_test` drive the same
+// certificate through `make_test_profile_signer`, and a second copy of the
+// generation would be a second `openssl` racing this one over its own output
+// files.
 ensure_profile_certs :: proc() -> (cert, key: string, ok: bool) {
 	sync.once_do(&cert_once, generate_certs)
 	return cert_path, key_path, cert_ok

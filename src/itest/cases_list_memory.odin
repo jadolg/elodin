@@ -471,7 +471,7 @@ blocking: {{ enabled: false }}
 		return
 	}
 
-	// Answered locally, so every connection's thread runs a query through its
+	// Answered locally, so every connection's fiber runs a query through its
 	// scratch arena without an upstream.
 	query := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
 	sockets := make([dynamic]net.TCP_Socket, 0, CONN_BURST, context.temp_allocator)

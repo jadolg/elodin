@@ -345,11 +345,11 @@ test_strip_edns_options_drops_a_second_opt_record :: proc(t: ^testing.T) {
 /*
 And the same, with the *first* OPT record empty.
 
-The shape that slipped past the first version of this: "there are no options
-here" is a fact about the record `find_opt_span` stopped at, not about the
-message, so an early return on it handed a second record - options, version, DO
-bit and all - straight to the client. The early return is behind the `span.last`
-check now, which is what makes the two readings the same one.
+"There are no options here" is a fact about the record `find_opt_span` stopped
+at, not about the message, so an early return on it alone would hand a second
+record - options, version, DO bit and all - straight to the client. The early
+return is behind the `span.last` check, which is what makes the two readings the
+same one.
 */
 @(test)
 test_strip_edns_options_drops_a_second_opt_behind_an_empty_first :: proc(t: ^testing.T) {

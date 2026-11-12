@@ -111,7 +111,7 @@ than relying on close to interrupt a loop): the reader's socket carries
 a short receive timeout so it wakes on its own and can notice this flag. The
 `shutdown(2)` in `retire_h2_conn` is what normally wakes it; the flag and the
 timeout bound a reader that shutdown missed. `refs` counts the two owners,
-`Upstream.h2` and the reader; see `start_h2_conn`.
+`Upstream.h2` and the reader; see `start_h2_reader`.
 */
 @(private)
 H2_Conn :: struct {
@@ -164,7 +164,7 @@ Upstream :: struct {
 	cond the last of them broadcasts on as it leaves. Under `mu`. A reader is a
 	fiber of the loop that dialled its connection, and nothing joins a fiber:
 	`teardown_h2` waits for this to reach zero instead, since a reader frees
-	into `allocator` and a TLS one uses `tls_ctx`. See `start_h2_conn`.
+	into `allocator` and a TLS one uses `tls_ctx`. See `start_h2_reader`.
 	*/
 	h2_readers:      int,
 	h2_readers_done: loop.Cond,
@@ -739,8 +739,8 @@ stats_of :: proc(u: ^Upstream) -> Stats {
 /*
 Send one query and return the response bytes.
 
-`query` is the client's message verbatim; the caller owns the transaction ID and
-is responsible for restoring it on the way back out. The returned buffer belongs
+`query` is the message to send; the caller owns its transaction ID and is
+responsible for restoring the client's on the way back out. The returned buffer belongs
 to `allocator`.
 */
 exchange :: proc(

@@ -569,8 +569,7 @@ grows_on_rebuild_reply :: proc(srv_count: int, filler: int) -> []u8 {
 
 	The option is what sends the strip down the rebuild path at all - with an
 	empty list there is nothing to take out and `dns.strip_edns_options` returns
-	the bytes as they stand, which is the shape this case first had and the
-	reason it proved nothing.
+	the bytes as they stand.
 	*/
 	append(&b, 0)
 	put_u16(&b, u16(dns.Type.OPT))

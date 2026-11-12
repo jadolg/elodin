@@ -129,10 +129,10 @@ type armServer struct {
 
 // serverConfig is the configuration one arm runs against. The arguments are
 // indexed rather than positional: the listener address is written into four
-// blocks, and a template with eighteen verbs in it is one a reader has to count.
+// blocks, and a template with sixteen verbs in it is one a reader has to count.
 func serverConfig(a armServer) string {
 	return fmt.Sprintf(configTemplate,
-		*logLevel, *logQueries, a.logPath, *workers, *workers/2, a.connections, a.rateLimit,
+		*logLevel, *logQueries, a.logPath, a.connections, a.rateLimit,
 		a.listen, a.port, a.dotPort, a.dohPort, a.cert, a.key,
 		a.upstream, a.cacheEntries, a.metrics, a.readers, a.stale)
 }
@@ -195,11 +195,8 @@ Everything not named here is the shipped default, including
 `max_udp_response`, which is the figure the budget is denominated in, and the
 connection table, which only the `slowloris` arms pin.
 
-`workers` and `upstream_workers` are pinned instead of derived from this
-machine, for the reason the integration suite pins them: an arm whose flood
-was shed by a queue this machine happened to size differently would be
-measuring the machine rather than the limiter. `log.level: info` is so the
-stats line the report reads `limited=`/`slipped=` off is written.
+`log.level: info` is so the stats line the report reads `limited=`/`slipped=`
+off is written.
 */
 const configTemplate = `log:
   level: %[1]s
@@ -207,20 +204,18 @@ const configTemplate = `log:
   file: %[3]s
 
 server:
-  workers: %[4]d
-  upstream_workers: %[5]d
-%[6]s  rate_limit:
-%[7]s
+%[4]s  rate_limit:
+%[5]s
 
 listeners:
   udp:
     enabled: true
-    address: "%[8]s"
-    port: %[9]d
-%[17]s  tcp:
+    address: "%[6]s"
+    port: %[7]d
+%[15]s  tcp:
     enabled: true
-    address: "%[8]s"
-    port: %[9]d
+    address: "%[6]s"
+    port: %[7]d
   # DoT and DoH are on in every arm rather than only the arms that use them, so
   # a listener an arm does not use is still there to be sure it costs nothing: a
   # bystander's result would mean less if the DoH arms ran against a differently
@@ -228,27 +223,27 @@ listeners:
   # without HTTP on top of it, which is what the handshake-flood arms need.
   dot:
     enabled: true
-    address: "%[8]s"
-    port: %[10]d
-    cert_file: %[12]s
-    key_file: %[13]s
+    address: "%[6]s"
+    port: %[8]d
+    cert_file: %[10]s
+    key_file: %[11]s
   doh:
     enabled: true
-    address: "%[8]s"
-    port: %[11]d
+    address: "%[6]s"
+    port: %[9]d
     path: /dns-query
-    cert_file: %[12]s
-    key_file: %[13]s
+    cert_file: %[10]s
+    key_file: %[11]s
 
-%[14]s
+%[12]s
 cache:
   enabled: true
   # Every query in a run asks about a name of its own, so a run's worth of
   # misses has to fit without evicting: a cache churning is a cost of the
   # generator's making rather than of the load. The soak arm asks for the
   # shipped figure instead - see armCache in server.go.
-  max_entries: %[15]d
-  serve_stale: %[18]t
+  max_entries: %[13]d
+  serve_stale: %[16]t
 
 blocking:
   enabled: false
@@ -264,7 +259,7 @@ dnssec:
 metrics:
   enabled: true
   address: "127.0.0.1"
-  port: %[16]d
+  port: %[14]d
   path: /metrics
 `
 

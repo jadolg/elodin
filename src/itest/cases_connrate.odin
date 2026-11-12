@@ -88,7 +88,7 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 	With the limiter off, one client is served every connection it opens.
 
 	The shape of the finding rather than a feature: 24 connections in as many
-	milliseconds from one source, every one accepted and given a thread, and no
+	milliseconds from one source, every one accepted and served, and no
 	counter in this server moving for any of them. `rate_limit.enabled: false` is
 	also what an operator who wants that back asks for, so the row is worth
 	keeping green as well as worth reading.

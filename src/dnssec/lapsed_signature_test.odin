@@ -611,7 +611,7 @@ The window is what the verdict rests on, or it is not mentioned.
 A current signature beside an expired one is what a zone mid-re-sign publishes,
 and it verifies. A current one that does not verify is a forgery whatever lapsed
 beside it - RFC 8914's codes 7 and 8 are for when "no signatures are presently
-valid" - so that stays code 6, in the words it always had.
+valid" - so that stays code 6, "no valid signature", with no window reported.
 */
 @(test)
 test_a_lapsed_signature_beside_a_current_one_is_not_the_verdict :: proc(t: ^testing.T) {

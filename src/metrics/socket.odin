@@ -167,11 +167,11 @@ add_socket_drops :: proc(text: string, inodes: []u64, drops: []u64) -> (matched:
 /*
 Read a `/proc` file whose size the kernel reports as zero.
 
-`os.read_entire_file` sizes its buffer from the file, so it reads nothing at all
-from `/proc`. `read_small_file` next door is for the one-line files and refuses
-a buffer that filled, which is the right answer for a number and the wrong one
-for a table with a line per socket on the machine. This grows instead, and is
-called once per scrape.
+`os.read_entire_file` grows a buffer for such a file with no bound on how far.
+`read_small_file` next door is for the one-line files and refuses a buffer that
+filled, which is the right answer for a number and the wrong one for a table
+with a line per socket on the machine. This grows, to a cap, and is called once
+per scrape.
 
 Bounded, because the length of this table is not this process's to decide: it is
 every UDP socket on the host, and a scrape is what pays to read it. The cap is

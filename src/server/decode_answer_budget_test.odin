@@ -81,7 +81,7 @@ What both readings of one reply may come to.
 will not read, and both readings expand the same message into the one arena the
 request is served from - which therefore holds both expansions at once. Each is
 given `dns.NAME_BUDGET`, so this is the ceiling on the pair, and it is what the
-issue's own fixture now costs instead of 8.5 MB.
+issue's fixture costs.
 */
 @(test)
 test_reading_a_reply_twice_costs_two_budgets_at_most :: proc(t: ^testing.T) {
@@ -113,11 +113,11 @@ the answer section is read again, and those names are expanded a second time
 into the same arena. Nothing about that is particular to a budget failure, which
 is why the ceiling is stated for the pair rather than for the one error.
 
-The record count is taken from the budget rather than written down, at a third
-of it a reading, so that neither end is near a boundary: the first reading has
-to survive - the point is a failure that is not the budget's - while the two
-together have to come to more than one budget, or nothing here is being charged
-twice.
+The record count is taken from the budget rather than written down, at two
+thirds of it a reading, so that neither end is near a boundary: the first
+reading has to survive - the point is a failure that is not the budget's - while
+the two together have to come to more than one budget, or nothing here is being
+charged twice.
 */
 @(test)
 test_a_near_budget_answer_read_twice_stays_within_the_pair :: proc(t: ^testing.T) {
@@ -163,7 +163,7 @@ test_a_cheap_answer_survives_an_expensive_additional_section :: proc(t: ^testing
 	defer delete(bomb)
 
 	// The same bytes, with the answer count moved to the additional count: one
-	// A record answers, the rest of the reply is somebody else's problem.
+	// MX record answers, the rest of the reply is somebody else's problem.
 	msg := make([dynamic]u8, 0, len(bomb) + 16)
 	defer delete(msg)
 	append(&msg, ..bomb[:])

@@ -5,20 +5,19 @@ import "core:testing"
 import "elodin:dns"
 
 /*
-Issue #354: a request reads far more than one message, and every budget the
-decoder had was per reading.
+Issue #354: a request reads far more than one message, so the decoder's budget
+is the request's, not each reading's.
 
 `decode_answer` reads the upstream's reply for the cache and again for the
 answer section alone, `fit_response` reads it a third time when it passes the
 client's limit, and the validator reads a reply of its own for every step of the
 chain - about thirty-five readings, all into the one arena the request is served
-from. Each got a fresh `dns.NAME_BUDGET` and nothing at all bounded what it
-allocated besides names, so five kilobytes of wire reached 23 MB of names and a
-full-length TXT record reached 37 MB of `string` headers, in a single in-flight
-request; against a pool of sixteen to a hundred and twenty-eight workers, a few
-dozen such queries are the box.
+from. A fresh `dns.NAME_BUDGET` for each, with nothing bounding what it
+allocated besides names, would let five kilobytes of wire reach 23 MB of names
+and a full-length TXT record reach 37 MB of `string` headers, in a single
+in-flight request; a few dozen such queries in flight at once are the box.
 
-The counter belongs to the request now. `handle_query` owns it and hands it to
+The counter belongs to the request. `handle_query` owns it and hands it to
 everything that reads into its arena, which is what the readings below stand in
 for. What each shape costs is `dns/request_budget_test.odin`; what is measured
 here is that the request's own procedures charge the one counter.

@@ -133,7 +133,7 @@ doh2_mock_reset_replies :: proc(m: ^Doh2_Mock) {
 	m.replies = 0
 }
 
-// Connections handled over h2 and over HTTP/1.1, so a test can tell which
+// Requests answered over h2 and over HTTP/1.1, so a test can tell which
 // protocol ALPN actually picked rather than only that a query was answered.
 doh2_mock_counts :: proc(m: ^Doh2_Mock) -> (h2_hits, h1_hits: int) {
 	sync.mutex_lock(&m.mu)

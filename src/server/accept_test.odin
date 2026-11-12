@@ -11,11 +11,10 @@ import "elodin:metrics"
 Every `net.Accept_Error`, against a table written out by hand.
 
 Written as an enumerated array rather than as a switch mirroring the
-implementation, which is what this test used to be and which could not fail: a
-`#partial switch` copied from `accept_failed` agrees with it by construction,
-including where both are wrong.
+implementation: a `#partial switch` copied from `accept_failed` would agree with
+it by construction, including where both are wrong.
 
-The array is the guard the mirror only claimed to be. Odin refuses an incomplete
+Odin refuses an incomplete
 enumerated array literal - "Unhandled enumerated array case" - so a member added
 to `net.Accept_Error` upstream is a compile error here until somebody decides
 which side of the line it falls on, which is exactly the decision that must not
@@ -54,7 +53,7 @@ test_only_the_idle_and_transient_accept_errors_are_not_failures :: proc(t: ^test
 }
 
 /*
-The two errors the fix turns on, named on their own.
+The two errors the back-off is for, named on their own.
 
 A descriptor shortage has to be waited out or the loop spins; a pending network
 error - `EPROTO`, `EHOSTUNREACH` and the rest of the set `accept(2)` says to
@@ -128,8 +127,8 @@ test_descriptors_wanted_counts_everything_that_holds_one :: proc(t: ^testing.T) 
 	}
 	testing.expect_value(t, descriptors_wanted(d), 512 + 16 + 1024 + 1024 + 4 + 2 * 4 + DESCRIPTOR_RESERVE)
 
-	// The readers are a term of their own because an operator may set 64 of
-	// them, which would otherwise eat a reserve sized for eight.
+	// The readers are a term of their own because an operator may set up to
+	// `MAX_UDP_READERS` (64) of them, more than `DESCRIPTOR_RESERVE` could absorb.
 	many := d
 	many.udp_readers = 64
 	testing.expect_value(t, descriptors_wanted(many) - descriptors_wanted(d), 60)
@@ -181,10 +180,10 @@ The premise the line rests on, read from the platform rather than assumed.
 `sysconf` that reported something other than the live soft limit would leave it
 silent on exactly the machine that needs it. Asserted loosely here - the figure
 is the machine's - because the tight check cannot be made without lowering a
-process-wide limit under a test runner that runs its tests in parallel. That one
-was made out of band, in the pull request: a process whose `RLIMIT_NOFILE` was
-lowered under it saw the lowered figure here, and its next `accept` returned
-`Insufficient_Resources`.
+process-wide limit under a test runner that runs its tests in parallel: a
+process whose `RLIMIT_NOFILE` is lowered under it sees the lowered figure here,
+and its next `accept` returns `Insufficient_Resources`, which takes a process of
+its own to show.
 */
 @(test)
 test_the_descriptor_limit_is_readable :: proc(t: ^testing.T) {
@@ -199,19 +198,17 @@ test_the_descriptor_limit_is_readable :: proc(t: ^testing.T) {
 The loop's own behaviour, as a sequence, without a socket.
 
 The classifier tests above say which errors are failures; none of them says what
-the loop does with a *run* of them, which is the whole of this change and the
-part where "the fourth in a row" and "the first after a success" are easy to get
-wrong. `accept_action` is the whole decision, so driving it with a sequence is
-driving the loop.
+the loop does with a *run* of them, which is the part where "the fourth in a
+row" and "the first after a success" are easy to get wrong. `accept_action` is
+the whole decision, so driving it with a sequence is driving the loop.
 */
 @(test)
 test_a_burst_that_clears_costs_almost_nothing :: proc(t: ^testing.T) {
 	/*
-	The shape the review caught: four connections behind an nftables reject, or a
-	flapping route, arriving together. `accept(2)` says to retry these at once,
-	and a flat back-off charged the whole listener a second of deafness for each
-	one - worse than the spin this change removes, since the spin at least kept
-	accepting.
+	Four connections behind an nftables reject, or a flapping route, arriving
+	together. `accept(2)` says to retry these at once, and a flat back-off would
+	cost the whole listener a second of deafness for each one - worse than a spin,
+	since a spin at least keeps accepting.
 	*/
 	run: Accept_Run
 	total: time.Duration
@@ -315,16 +312,11 @@ test_a_short_wait_does_not_spend_the_one_warning :: proc(t: ^testing.T) {
 /*
 Every wait, for far longer than a shortage would ever be left running.
 
-The bound this asserts is not an edge case: the first version of `accept_action`
-overflowed `i64` at the 48th consecutive failure - some thirty-five seconds into
-a descriptor shortage - and produced waits of zero and below. `act.wait > 0` is
-what the loops test, so those iterations neither slept nor counted: the spin
-came back, briefly, in the middle of the fix for it, and the counter said
-nothing.
-
-Two hundred iterations rather than the forty the first test of this ran, because
-forty stopped eight short of the first wrapped value. A test that stops before
-the arithmetic goes wrong is the shape of test this whole review has been about.
+The bound this asserts is not an edge case: an unbounded shift wraps `i64` past
+44 escalation steps, at the 48th consecutive failure - some thirty-five seconds
+into a descriptor shortage - and gives waits of zero and below. `act.wait > 0` is
+what the loops test, so those iterations would neither sleep nor count. Two
+hundred iterations, so the run goes well past the first value that would wrap.
 */
 @(test)
 test_no_wait_is_ever_zero_or_negative :: proc(t: ^testing.T) {
@@ -361,12 +353,12 @@ test_no_wait_is_ever_zero_or_negative :: proc(t: ^testing.T) {
 /*
 A stream of per-connection errors is not held to the shortage's ceiling.
 
-The burst test above covers four of them. This is the case the review raised
-against it: a firewall rejecting a steady stream, or a flapping route, where
-every accept fails and nothing resets the count. Those failures are *delivered
-by* the accept, so the entry leaves the queue - a second between attempts would
-leave a listener taking one connection a second with good ones queued behind bad
-ones, which is the starvation this design argues against met from the other side.
+The burst test above covers four of them. This is a firewall rejecting a steady
+stream, or a flapping route, where every accept fails and nothing resets the
+count. Those failures are *delivered by* the accept, so the entry leaves the
+queue - a second between attempts would leave a listener taking one connection a
+second with good ones queued behind bad ones, which is the starvation this design
+argues against met from the other side.
 */
 @(test)
 test_a_stream_of_queue_errors_settles_far_below_the_shortage_ceiling :: proc(t: ^testing.T) {
@@ -395,16 +387,15 @@ test_a_stream_of_queue_errors_settles_far_below_the_shortage_ceiling :: proc(t: 
 /*
 The one warning is spent on time not accepting, not on reaching a ceiling.
 
-Deciding it on the ceiling read very differently on either side of the two: a
-shortage reached its own after a second, and a queue error reached its after
-sixty-three milliseconds - so ten bad entries from a route flap, which is this
-file's own example of a burst that clears, permanently burned the one `warn` a
-listener gets, on a line telling the operator its socket may no longer be usable.
+A shortage reaches its ceiling after a second and a queue error reaches its own
+after sixty-three milliseconds, so deciding on the ceiling would spend the one
+`warn` a listener gets on ten bad entries from a route flap - this file's own
+example of a burst that clears.
 
-The rule is a duration now, and the assertion is what an operator would say: ten
-consecutive queue errors say nothing, because a sixteenth of a second is not a
-listener in trouble; a run that really does go on says so, whichever ceiling it
-is held to.
+The rule is a duration, and the assertion is what an operator would say: ten
+consecutive queue errors are about 113 ms of waiting, below `ACCEPT_REPORT_AFTER`,
+and say nothing; a run that really does go on says so, whichever ceiling it is
+held to.
 */
 @(test)
 test_the_warning_waits_for_a_second_of_not_accepting :: proc(t: ^testing.T) {
@@ -520,12 +511,11 @@ The idle tick is what usually hands the warning back, so a caller reading
 `recovered` on the accept path alone reads it on the path that rarely produces
 it.
 
-That is not a hypothetical: both loops did exactly that for a round. A listener
-that took a burst, warned, and then went quiet reached zero on a poll tick, and
-the one `recovered` it would ever produce was discarded - after which
-`run.waited` was already zero, so no later accept could produce another and the
-flags stayed set for the life of the process. Asserted here because the fix is in
-the loops and this is the fact about `accept_action` the loops have to respect.
+A listener that took a burst, warned, and then went quiet reaches zero on a poll
+tick, and that is the one `recovered` it will produce - after it `run.waited` is
+zero, so no later accept can produce another. The loops therefore read
+`recovered` on the idle path too; this is the fact about `accept_action` they
+have to respect.
 */
 @(test)
 test_the_idle_tick_can_be_what_recovers_a_listener :: proc(t: ^testing.T) {
@@ -554,7 +544,7 @@ An outage cannot cost more to recover from than it took to notice.
 
 `waited` is capped at the threshold, because past it the figure decides nothing
 more and the only thing it still does is lengthen the repayment. Uncapped, an
-hour-long shortage left three and a half million milliseconds to repay before a
+hour-long shortage would leave three and a half million milliseconds to repay before a
 later trouble could be reported again.
 */
 @(test)
@@ -578,13 +568,12 @@ test_a_long_outage_does_not_become_unrecoverable :: proc(t: ^testing.T) {
 /*
 A listener that never said anything cannot hand back a warning it never took.
 
-The shape the review caught, and it compounds two earlier fixes: `waited` is held
-at the threshold, so the listener that *is* in trouble reports on every failure,
-and `report_once` is the only thing keeping that to one line. Clearing the shared
-flag from any recovery meant a neighbour that took four failures and then went
-quiet for a second - which no listener has to be in trouble to do - handed the
-warning back, and the one still out of descriptors said both lines again. For the
-length of the outage.
+`waited` is held at the threshold, so the listener that *is* in trouble reports
+on every failure, and `report_once` is the only thing keeping that to one line.
+Only a run that reported re-arms: clearing the shared flag from any recovery would
+let a neighbour that took four failures and then went quiet for a second - which
+no listener has to be in trouble to do - hand the warning back, and the one still
+out of descriptors would say both lines again, for the length of the outage.
 */
 @(test)
 test_a_listener_that_never_reported_does_not_rearm :: proc(t: ^testing.T) {
@@ -611,7 +600,7 @@ attempt.
 
 A firewall reject arriving while the process is out of descriptors is two facts
 about the same second, and both reach `core:net` as `Unknown`. Reading the
-wording off that one attempt told the operator their socket may be unusable, at a
+wording off that one attempt would tell the operator their socket may be unusable, at a
 fifty-millisecond cadence, during a descriptor shortage.
 */
 @(test)

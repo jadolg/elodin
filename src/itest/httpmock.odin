@@ -157,7 +157,7 @@ http_mock_conn :: proc(conn: ^Http_Mock_Conn) {
 		n, err := net.recv_tcp(conn.socket, chunk[:])
 		// SO_RCVTIMEO expiring on a blocking recv() is EAGAIN on Linux,
 		// which core:net reports as .Would_Block, not .Timeout - see
-		// h2client.odin's h2_io_read.
+		// src/upstream/h2client.odin's h2_io_read.
 		if err == .Timeout || err == .Would_Block {
 			continue
 		}

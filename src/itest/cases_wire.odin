@@ -20,10 +20,10 @@ A TXT record whose RDATA is nothing but length bytes of zero.
 
 The shape from issue #351: a `<character-string>` may be zero bytes long, so one
 wire byte is one whole string, and 65,000 of them are well formed and legal.
-The decoder used to collect them into a doubling `[dynamic]string`, which under
-the arena a request is served from cost 32 times the record's own length; it
-counts them off the wire and allocates the list once now. What this checks is
-that counting them did not change what comes back - the record has to survive the
+The decoder counts them off the wire and allocates the list once (#351); a
+doubling `[dynamic]string` under the arena a request is served from would cost
+32 times the record's own length. What this checks is that counting them does
+not change what comes back - the record has to survive the
 trip byte for byte, and `fit_response` has to still be able to read it.
 */
 @(private = "file")
@@ -86,8 +86,8 @@ Issue #298's shape - MX records whose owner and exchange are both two-byte
 pointers at one 255-octet name of unprintable octets - built onto the question
 the client asked, so the upstream's answer matches the query that went out.
 
-The point of it here is issue #354: what bounds those expansions is the
-request's counter now rather than each reading's, and a reply that spends what a
+The point of it here is issue #354: those expansions are bounded by a
+per-request counter rather than each reading's, and a reply that spends what a
 single reading may spend is still a reply this server forwards. That is the
 failure mode a per-request budget invites - one made too tight refuses answers
 nobody had a quarrel with - and the only way to see it is through the whole
@@ -205,9 +205,9 @@ run_wire_cases :: proc(r: ^Runner) {
 		Twelve bytes that parse as a header and cannot decode as a message: the
 		header claims one answer record and the record is not there.
 
-		Every helper used to report this as "the thing you asked about is
-		absent", which is exactly what a negative assertion wants to hear, so a
-		case could go green on bytes nothing read. A scratch runner collects the
+		Every helper fails the case on bytes it cannot decode. Reported as "the
+		thing you asked about is absent", they are exactly what a negative
+		assertion wants to hear, so a case would go green on bytes nothing read. A scratch runner collects the
 		failures instead of this case taking them.
 		*/
 		bad := []u8{0x12, 0x34, 0x81, 0x80, 0, 0, 0, 1, 0, 0, 0, 0}
@@ -367,10 +367,10 @@ run_wire_cases :: proc(r: ^Runner) {
 	start_case(r, "wire: a reply that spends a reading's name budget is still forwarded")
 	{
 		/*
-		Issue #354: what one request may take out of its arena is now counted
-		across every reading it makes rather than per reading. A reply that
-		spends what a single reading is allowed is far under that, so it goes to
-		the client as it always did - byte for byte, since nothing here reads
+		Issue #354: what one request may take out of its arena is bounded by a
+		per-request counter across every reading it makes. A reply that spends
+		what a single reading is allowed is far under that, so it goes to the
+		client byte for byte, since nothing here reads
 		its answer section and nothing rebuilds it. The `manystrings` case above
 		is the same statement for the other end of the expansion: a full-length
 		TXT record of empty character-strings, which is a megabyte of `string`

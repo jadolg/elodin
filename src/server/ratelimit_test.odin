@@ -178,11 +178,11 @@ An IPv4 client that arrived mapped is keyed on its own /24, not on `::/64`.
 
 A socket bound to `::` serving IPv4 clients is a documented deployment - see
 `mapped` above - and every `::ffff:a.b.c.d` address is zeroes in the four groups
-an IPv6 source is keyed on. Keying such a source as IPv6 therefore put the whole
+an IPv6 source is keyed on. Keying such a source as IPv6 would put the whole
 IPv4 side of a wildcard listener into one bucket: at the shipped defaults, 500
 responses a second between all of them, half the excess dropped and half
 truncated. Any one client inside `server.allow_from` - a busy stub, a NAT
-gateway, or something deliberately trying - then spent the budget of every
+gateway, or something deliberately trying - would then spend the budget of every
 other, which is the limiter denying service to the clients it exists to protect.
 */
 @(test)
@@ -280,8 +280,8 @@ test_a_mapped_source_and_its_v4_form_are_one_prefix :: proc(t: ^testing.T) {
 /*
 The mapped clients of a wildcard listener are told apart over connections too.
 
-The datagram pool is where amplification lives, so it is where the collapse was
-worth the most to an attacker, but the stream pool is keyed by the same procedure
+The datagram pool is where amplification lives, so it is where a collapse would
+be worth the most to an attacker, but the stream pool is keyed by the same procedure
 and a `::` bind is how DoT and DoH are usually served. Collapsed, one pipelining
 client would close every other IPv4 client's connections on a default
 configuration.
@@ -355,7 +355,8 @@ test_only_the_v4_mapped_prefix_is_unmapped :: proc(t: ^testing.T) {
 		{mapped(198, 51, 100, 1).address, mapped(198, 51, 101, 1).address, false, "the mapped /24 next door"},
 		{mapped(198, 51, 100, 1).address, mapped(203, 0, 113, 1).address, false, "an unrelated mapped network"},
 		// The collapse itself: mapped addresses are zeroes in the four groups an
-		// IPv6 source is keyed on, so this pair shared a key and a bucket.
+		// IPv6 source is keyed on, so keyed as IPv6 this pair would share a key
+		// and a bucket.
 		{mapped(0, 0, 0, 1).address, v6_of({0, 0, 0, 0, 0, 0, 0, 1}), false, "`::ffff:0.0.0.1` is not `::1`"},
 
 		// Forms that are not the mapping and must not be read as one.
@@ -474,7 +475,7 @@ test_a_real_v4_client_on_a_wildcard_bind_is_judged_by_its_v4_address :: proc(t: 
 		from.address,
 	)
 	// And it must not be keyed as `::/64`, which is what every mapped address
-	// collapsed to and the reason one bucket held the whole IPv4 side.
+	// would collapse to, putting the whole IPv4 side in one bucket.
 	testing.expectf(
 		t,
 		prefix_key(r, from.address) != prefix_key(r, net.IP6_Any),
@@ -652,9 +653,9 @@ test_rate_limit_slips_a_truncated_answer :: proc(t: ^testing.T) {
 Truncated answers are bounded by a budget of their own, not by how much arrives.
 
 `slip` picks every Nth over-limit datagram, so charged to nothing the count of
-truncated answers is a fixed fraction of the flood: at two million datagrams a
-second the shipped default sent half a million truncated answers a second at
-whatever address the flood had named. Byte for byte that is a loss for the sender
+truncated answers would be a fixed fraction of the flood: at two million
+datagrams a second the shipped default would send half a million truncated
+answers a second at whatever address the flood had named. Byte for byte that is a loss for the sender
 - a 51-byte query draws a 40-byte reply - so it is not amplification. What it is
 instead is this server made the source of traffic proportional to an attack, at
 an address that never asked, on a figure the operator set to 500; and a write per
@@ -845,7 +846,7 @@ test_the_bytes_a_prefix_is_sent_do_not_depend_on_the_answer :: proc(t: ^testing.
 			if rate_check(r, client, at(0)) != .Allow {
 				continue
 			}
-			// What the read loop and the worker do, in the order they do it:
+			// What the read loop and the query's fiber do, in the order they do it:
 			// admitted on one token, billed for the rest once the answer exists.
 			rate_charge_response(r, client, LARGE, at(0))
 			large_bytes += LARGE
@@ -881,8 +882,8 @@ test_the_bytes_a_prefix_is_sent_do_not_depend_on_the_answer :: proc(t: ^testing.
 		ceiling,
 	)
 	/*
-	And the spread is gone: what the attacker chooses now is how many answers
-	their bytes are cut into, not how many bytes their answers come to. Within a
+	And there is no spread: what the attacker chooses is how many answers their
+	bytes are cut into, not how many bytes their answers come to. Within a
 	token of each other, since the large answer is charged in whole tokens - ten
 	for 1232 bytes at 128 - so the last one may overshoot by a fraction of one.
 	*/
@@ -896,7 +897,7 @@ test_the_bytes_a_prefix_is_sent_do_not_depend_on_the_answer :: proc(t: ^testing.
 }
 
 /*
-A prefix asking small questions is charged exactly as it was.
+A prefix asking small questions is charged one token an answer.
 
 The other half of the property above: an answer that fits inside the estimate
 costs one token, so the count is still a count for every client whose answers are
@@ -935,8 +936,8 @@ No estimate charges one token per answer, whatever the answer.
 Which is what every configuration that does not name one gets: the loader
 resolves it to `server.max_udp_response`, so no datagram can exceed it, and the
 limiter's own default of 0 is the same statement for the callers that build one
-by hand. A change that cost an existing deployment answers it used to get would
-be this test failing.
+by hand. A change that cost an existing deployment answers it gets would be this
+test failing.
 */
 @(test)
 test_without_an_estimate_the_budget_is_the_count_it_was :: proc(t: ^testing.T) {
@@ -1029,7 +1030,7 @@ test_an_oversized_answer_is_paid_for_by_the_next_query :: proc(t: ^testing.T) {
 /*
 The other pools are not charged for a datagram's size.
 
-The separation the top of `ratelimit.odin` argues for, asked of the new charge:
+The separation the top of `ratelimit.odin` argues for, asked of the size charge:
 a prefix whose answers are large must not thereby lose the connections it may
 open or the queries it may ask over them. Nothing about a large UDP answer says
 anything about the work behind a query on a connection, and a size charged to the
@@ -1175,7 +1176,8 @@ test_the_debt_from_a_burst_is_carried_until_it_is_repaid :: proc(t: ^testing.T) 
 
 	client := v4(203, 0, 113, 66)
 	// A full bucket admitted and then billed, which is the order the read loop
-	// and the workers do it in when a flood arrives faster than it is answered.
+	// and the query fibers do it in when a flood arrives faster than it is
+	// answered.
 	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
 		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
 	}
@@ -1215,7 +1217,7 @@ test_a_prefix_in_debt_keeps_its_bucket :: proc(t: ^testing.T) {
 	victim := v4(198, 51, 100, 5)
 	/*
 	Admitted first and billed after, which is the order the read loop and the
-	workers do it in - and the only order that leaves the bucket owing rather
+	query fibers do it in - and the only order that leaves the bucket owing rather
 	than merely empty. Billing as each answer is admitted stops at zero: the
 	check refuses the next datagram the moment the tokens run out, so nothing is
 	left to overspend, and a millisecond of refill would hand the prefix an
@@ -1486,13 +1488,12 @@ wildcard, the source of our own datagrams is whichever local address the route
 picked rather than the address we asked for, so a datagram from a loopback
 address on our own port is this server talking to itself. On a `::` bind, that
 address is `::ffff:127.0.0.1` - which read as a plain IPv6 address is not
-`::1`, and so was taken for a client.
+`::1`, and so would be taken for a client.
 
 Milder than the budget above, because `handle_query` drops anything with QR set
 before it looks at the question, so the exchange is one datagram each way rather
-than a loop. It is the same missing normalisation, and the test above already
-asserts the unmapped form, so leaving the mapped one out was an oversight rather
-than a decision.
+than a loop. It is the same normalisation, and the test above asserts the
+unmapped form, so the mapped one is held to it too.
 
 Bound to `::` here, since that is the deployment the mapping arises in at all,
 and no socket: `plausible_source` reads `udp_bound` and nothing else.
@@ -1655,7 +1656,7 @@ well past the 1-in-`slip` an operator asked for, and the other truncates none of
 them and leaves a client behind a busy NAT with nothing to act on.
 
 Charging the two classes to separate pools is what keeps a connection away from
-this counter, so the test reads as one about the pools now. It is kept as one about
+this counter, so the test reads as one about the pools. It is kept as one about
 the slip because that is the behaviour a reader can check: both budgets are spent
 dry first, since a refusal is the only way a stream query gets far enough to be
 capable of touching `over` at all.
@@ -1736,12 +1737,12 @@ Stated as the attack rather than as a property, because the attack is the reason
 the separation is there. The bucket is keyed on the query's source address, and over
 UDP the sender writes that field: somebody spoofing sources inside prefix P, at
 more than the configured rate, keeps P's datagram pool empty for as long as they
-care to run it. When one pool served both, every genuine TCP, DoT or DoH connection
-from P then had its first query refused and its connection closed - so a party who
-could not receive a byte at P, and who was asking none of P's questions, decided
-what this server did for the clients who live there, on a default configuration. It
-also emptied the budget the slip's own advice sends a client to, which is the whole
-of what a truncated answer is for.
+care to run it. Were one pool to serve both, every genuine TCP, DoT or DoH
+connection from P would then have its first query refused and its connection
+closed - so a party who could not receive a byte at P, and who was asking none of
+P's questions, would decide what this server did for the clients who live there, on
+a default configuration. It would also empty the budget the slip's own advice sends
+a client to, which is the whole of what a truncated answer is for.
 
 Both directions, since a pool that can be drained from the other side is not a
 separate pool: the flood must not reach the connections, and a client pipelining
@@ -1802,7 +1803,7 @@ test_the_stream_budget_is_not_the_datagram_one :: proc(t: ^testing.T) {
 }
 
 /*
-Opening a connection is charged, which is the load nothing here used to see.
+Opening a connection is charged, a load no other pool here sees.
 
 The client this is about asks nothing at all: it dials, completes a TLS handshake
 and hangs up. So it spends no datagram budget and no stream budget however fast it
@@ -1999,12 +2000,12 @@ hammer :: proc(h: ^Hammer) {
 }
 
 /*
-The bucket table is reached from as many threads as there are connections, and
-this is what says the accounting survives it.
+The bucket table is reached from every event loop's thread at once, and this is
+what says the accounting survives it.
 
-Every stream connection charges the queries it reads on its own thread, so the
-single-reader assumption the table was first written under is gone. What its
-absence costs is not a crash but a limiter that under-counts at the moment it is
+Every stream connection charges the queries it reads on the loop it runs on, so
+the table has as many writers as there are loops. What an unguarded write costs
+is not a crash but a limiter that under-counts at the moment it is
 counting something: `tokens` read, decremented and written back by two threads at
 once loses one of the two decrements, and `over` loses slips the same way. Both
 are counted here rather than only the first, because the numbers an operator reads
@@ -2383,7 +2384,7 @@ test_a_bucket_changing_hands_takes_the_new_prefixs_figures :: proc(t: ^testing.T
 }
 
 /*
-A limiter with no overrides is the limiter that was here before there were any.
+A limiter with no overrides is the configured pair and nothing more.
 
 The guard on the whole change: `tiers[0]` is the configured pair, every bucket
 starts on tier 0, and `resolve_tier` returns 0 without looking at anything when
@@ -2542,8 +2543,8 @@ would be the same figure in two units, one of them the one nobody meant.
 
 Silent where the estimate cannot bite, which is every configuration that does not
 write one: the loader resolves an unset estimate to `server.max_udp_response`, so
-`estimate < ceiling` is false and these lines read exactly as they did before
-there was a second figure.
+`estimate < ceiling` is false and these lines read exactly as they would with no
+second figure.
 */
 @(test)
 test_the_override_lines_say_what_the_estimate_makes_of_them :: proc(t: ^testing.T) {

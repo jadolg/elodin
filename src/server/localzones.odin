@@ -88,10 +88,9 @@ having had to say so.
 What this entry does not do is keep the query at home. By itself it leaves
 `home.arpa.` forwarded to whatever `upstream.servers` names, so a network with
 no local authority for it sends those names out and gets the blackhole servers'
-empty zone back, insecure and correct, exactly as it did before the entry
-existed. The two halves do not overlap: where this entry changes a verdict the
-router answered and nothing left the building, and where the names leak the
-chain already worked.
+empty zone back, insecure and correct. The two halves do not overlap: where this
+entry changes a verdict the router answered and nothing left the building, and
+where the names leak the chain already worked.
 
 `special_use.home_arpa` is the other half, and the forward table below is where
 it lives - answering the zone here for the network that has nothing serving it.
@@ -275,14 +274,14 @@ reservation that exists to stop registries selling them.
 
 The three keys are not symmetric with each other either: `onion` is on and
 turning it off is a statement about the upstream, while `local` and `test` are
-off and turning them on is a statement about this network. Each default leaves
-an installation answering as it did before the table existed, which is the
-weaker claim it sounds like but is not: a site whose upstream really does serve
-`.local` is not necessarily *working* today, since with `dnssec.enabled` on -
+off and turning them on is a statement about this network. Off, `local` and
+`test` leave an installation answering those names as its upstream does, which
+is a weaker claim than it sounds: a site whose upstream really does serve
+`.local` is not necessarily *working*, since with `dnssec.enabled` on -
 the default - that unsigned answer is checked against a root that publishes a
 signed proof there is no `local.` to delegate, and SERVFAIL is the likely
 verdict. Such a site has already turned validation off, or has not noticed. What
-the default guarantees is only that nothing here is what changed for them, and
+the default guarantees is only that nothing here changes those answers, and
 that turning `local` on is a decision rather than an upgrade.
 
 `local.`, `test.` and `home.arpa.` are in the table only when
@@ -391,7 +390,7 @@ about freshness - it is how long a client goes on believing this after an
 operator has changed their mind. A day would be the honest figure for `onion.`
 and be wrong the first time somebody turns `special_use.local` off to get their
 Active Directory domain back and finds their own clients still holding the
-NXDOMAIN. Ten minutes is short enough that the restart which changes the setting
+NXDOMAIN. Ten minutes is short enough that the reload which changes the setting
 takes effect while the operator is still watching, and long enough that a chatty
 `.local` client is not asking every second.
 */
@@ -552,12 +551,12 @@ client gets SERVFAIL - so a Tor-aware upstream would be worth nothing while
 The condition is that the table is not answering `onion.` itself, by either of
 the two keys that can take it out: `special_use.onion: false`, which says the
 upstream is Tor-aware, or `special_use.enabled: false`, which says none of this
-handling is wanted. Keying it on `onion` alone was the narrower reading, and it
-left a trap: an operator with a local tor who reached for `enabled: false` -
-the blunter key, and the one whose name sounds like it covers everything - got
-the forwarding they asked for and a SERVFAIL for every `.onion` name, because
-the bypass was still waiting for a key they had no reason to think they needed.
-A startup warning could have pointed at it; answering it in the code is better:
+handling is wanted. Keying it on `onion` alone would leave a trap: an operator
+with a local tor who reached for `enabled: false` - the blunter key, and the one
+whose name sounds like it covers everything - would get the forwarding they
+asked for and a SERVFAIL for every `.onion` name, because the bypass would still
+be waiting for a key they had no reason to think they needed. A startup warning
+could point at it; answering it in the code is better:
 the rule is that a `.onion` name this server forwards is a `.onion` name it does
 not validate, which holds however the operator said to forward it.
 
@@ -567,9 +566,9 @@ by default, so nothing reaches this without an operator having written something
 down, and writing it down is the claim that makes it right.
 
 `covered_by_local_anchor` stands it down in turn, the same way it does the
-reverse-side bypass. The argument for leaving it out was that this bypass is
-already what an operator asked for, so no anchor could be more deliberate than
-the key that turned it on - but that is only true while the two cannot be written
+reverse-side bypass. Leaving it out would rest on this bypass already being
+what an operator asked for, so that no anchor could be more deliberate than the
+key that turned it on - but that holds only while the two cannot be written
 together, and they can. An operator who runs a privately signed tree under
 `onion.` behind their own resolver and configures a trust anchor over it has said
 something more specific than either key, and the reverse side already settles
@@ -587,7 +586,7 @@ is not a default, and the installation that set it asked.
 
 What it costs, so the trade is written down rather than discovered. An operator
 who set `enabled: false` for some reason other than tor, and whose upstream is
-an ordinary public resolver, now gets that upstream's NXDOMAIN for a `.onion`
+an ordinary public resolver, gets that upstream's NXDOMAIN for a `.onion`
 name as insecure rather than as the root-signed nonexistence it could have
 proved - and a forged address for one, from a hostile upstream or somebody on
 the path, is passed on as insecure instead of being caught as Bogus. That is the
@@ -735,10 +734,9 @@ answer_special_use :: proc(
 Whether `name` sits strictly below `zone`, the zone's own name excluded.
 
 This is what a wildcard means: "*.lan." stands for at least one label under
-"lan.", so `find_rewrite` in the resolver asks this question while the callers
-above ask the inclusive one. Both go through the same test so that neither can
-be tightened or loosened without the other following, which is how the two came
-to disagree about case in the first place.
+"lan.", so `find_rewrite_index` in the resolver asks this question while the
+callers above ask the inclusive one. Both go through the same test so that
+neither can be tightened or loosened without the other following.
 
 The comparison folds case throughout, since DNS names compare without regard to
 it (RFC 1035 section 2.3.3, restated for every label by RFC 4343) and the names

@@ -19,8 +19,9 @@ the ECDSA ones were selected for the bit patterns that break a naive DER
 encoder:
 
   - a signature whose R and S both begin with the high bit set. DER integers are
-    signed, so each needs a 0x00 byte in front of it. Omit that and roughly one
-    signature in four fails - the intermittent, unreproducible DNSSEC failure.
+    signed, so each needs a 0x00 byte in front of it. Omit that and roughly
+    three signatures in four fail - the intermittent, unreproducible DNSSEC
+    failure.
   - a signature whose R begins with a zero byte, which DER requires be dropped
     rather than encoded as a redundant leading zero.
 */

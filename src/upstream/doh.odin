@@ -308,7 +308,8 @@ HTTP and TLS machinery has exactly one implementation.
 
 `timeout` bounds the dial and any one read; `total` bounds the whole fetch,
 redirects included. Per read alone, a host sending a line or a chunk just
-inside `timeout` held the fetch for as long as the body limit let it (#445).
+inside `timeout` would hold the fetch for as long as the body limit let it
+(#445).
 */
 fetch_url :: proc(
 	url: string,

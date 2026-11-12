@@ -15,8 +15,8 @@ memory.
 
 The prefix sweeps below are the shape a fuzzer would find, written down so they
 run every time. Each takes a well-formed record and hands the parser every
-truncation of it, checking that nothing crashes and that anything short of a
-complete fixed header is refused outright.
+truncation of it at least up to its fixed header, checking that nothing crashes and that
+anything short of a complete fixed header is refused outright.
 */
 
 // "example." on the wire.

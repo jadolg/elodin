@@ -38,6 +38,11 @@ directions:
     parent republishes - so the only thing standing between an attacker replaying
     a withdrawn key and a working chain of trust is the validator reading that
     bit.
+  - a DS set whose one followable record matches no key, beside one we cannot
+    evaluate (`uftest.`). Call it insecure and stripping the DNSKEY signatures
+    takes the zone out of validation; it is Bogus.
+  - a DS set with nothing usable in it (`uatest.`). Insecure either way, so what
+    is pinned is that the zone's DNSKEY set is never asked for.
 */
 
 @(private = "file")
@@ -425,22 +430,22 @@ test_an_unfollowable_ds_beside_an_unknown_one_is_bogus :: proc(t: ^testing.T) {
 	set through. So the verdict has to be reached the second time, after the
 	keys are in hand and none of them satisfies the DS we could follow.
 
-	That verdict is `Bogus`, and it used to be `Insecure` on the reasoning that
-	the DS we cannot read may well have been the one that was right. What is
-	wrong with that reasoning is not the charity, it is who gets to use it. RFC
+	That verdict is `Bogus`, not `Insecure` on the reasoning that the DS we
+	cannot read may well have been the one that was right. What is wrong with
+	that reasoning is not the charity, it is who gets to use it. RFC
 	6840 section 5.2 makes a delegation insecure when the validator supports
 	*none* of the algorithms in the DS set; here it supports one, so there is a
 	supported authentication path from parent to child and it does not lead to a
 	key. RFC 4035 section 5.2 calls that Bogus, and every other validator agrees
-	- so the leniency did not keep a zone resolving that would have resolved
-	elsewhere, it only made this resolver the one that accepted it.
+	- so leniency would not keep a zone resolving that resolves elsewhere, it
+	would only make this resolver the one that accepted it.
 
 	And the DNSKEY response is not signed by the parent. Anyone on the path to a
 	plain UDP or TCP upstream can take the signatures off it, and against any
 	zone whose parent published something we cannot check beside something we
-	can - which is every zone mid-rollover - `Insecure` here was that attacker's
-	answer: the zone out of validation, and `zone_step` caching it for the DS
-	TTL.
+	can - which is every zone mid-rollover - `Insecure` here would be that
+	attacker's answer: the zone out of validation, and `zone_step` caching it
+	for the DS TTL.
 
 	Without this scenario the two checks cover for each other: break either one
 	and the other still produces the same verdict, and nothing fails.

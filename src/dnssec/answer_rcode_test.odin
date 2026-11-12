@@ -271,8 +271,8 @@ test_denial_contradicted_reads_the_end_of_the_chain :: proc(t: ^testing.T) {
 	restarts the walk at the target only when the query type does *not* match
 	the CNAME, so for `CNAME` and for `ANY` this record is the answer and the
 	rcode is about the name that was asked about - which the record proves.
-	Walked past as a hop, a flipped rcode over a signed `dig CNAME` answer came
-	back `Secure` with AD set.
+	Walked past as a hop, a flipped rcode over a signed `dig CNAME` answer would
+	come back `Secure` with AD set.
 	*/
 	kept_chain := []Authenticated_Set{set("www.example.com.", .CNAME)}
 	testing.expect(
@@ -326,9 +326,9 @@ test_denial_contradicted_reads_the_end_of_the_chain :: proc(t: ^testing.T) {
 /*
 The two ways round the guard that cost the attacker one more byte each.
 
-Both were found reviewing the guard above rather than reported with #271, and
-both reach the same place by a different door: the client reads a name error for
-a signed name, and no proof of it was ever asked for. Neither needs a forgery.
+Both reach the place #271 is about by a different door: the client reads a name
+error for a signed name, and no proof of it is ever asked for. Neither needs a
+forgery.
 */
 
 /*
@@ -338,13 +338,13 @@ One unsigned record must not reroute a forged denial away from its proof.
 authenticate - any record, at any name. So a forged NXDOMAIN for a signed name
 is `Bogus` while that section is empty, because `validate_denial` demands a
 proof and finds none; append one record from a zone that really is unsigned and
-the message goes to `validate_answer` instead, where nothing ever demanded one.
-The check that catches it there is `shape == .None`, and it used to be gated on
-`worst` - which the same appended record had already dragged to `Insecure`.
+the message goes to `validate_answer` instead, where nothing demands one. The
+check that catches it there is `shape == .None`, and it runs whatever `worst` is
+- the same appended record has already dragged `worst` to `Insecure`.
 
-`Insecure` is forwarded to the client. So the record bought the attacker the
-denial that the empty version was refused for, in exchange for a CNAME anyone
-can copy out of an unsigned zone.
+`Insecure` is forwarded to the client. Gated on `worst`, the record would buy
+the attacker the denial that the empty version is refused for, in exchange for
+a CNAME anyone can copy out of an unsigned zone.
 */
 @(test)
 test_an_unsigned_record_does_not_reroute_a_forged_denial :: proc(t: ^testing.T) {
@@ -394,10 +394,10 @@ And the extended rcode is not a way to say NXDOMAIN to the client only.
 `rcode_of` composes twelve bits - the header's four and eight more from the OPT
 record's TTL (RFC 6891 section 6.1.3) - while every consumer this guard is
 written for reads the four. So setting a bit in the OPT's top byte alongside the
-flipped nibble made the message unanswerable to us and a name error to them:
-`answerable_rcode` bailed out before `validate_answer` was ever entered, the
-verdict was `Insecure`, and `resolve_query` forwarded it with the signed records
-still in the answer section and a header saying the name is not there.
+flipped nibble makes the message unanswerable to us and a name error to them.
+Were that excused before `validate_answer` is entered, the verdict would be
+`Insecure`, and `resolve_query` would forward it with the signed records still
+in the answer section and a header saying the name is not there.
 */
 @(test)
 test_the_extended_rcode_is_not_a_way_past_the_guard :: proc(t: ^testing.T) {
@@ -436,11 +436,11 @@ test_the_extended_rcode_is_not_a_way_past_the_guard :: proc(t: ^testing.T) {
 And with the nibble left at 0 the client reads NOERROR, which is not a denial
 bug at all but the whole validator stepped over.
 
-The same one byte, and now the client takes the answer section instead of
-discarding it. A forged `www.example.com. A` whose signature no longer covers it
-is `Bogus` on its own; excused as "nothing to authenticate" it was forwarded as
-`Insecure` and believed. Nothing here is about NXDOMAIN any more - it is every
-answer this server would otherwise have checked.
+The same one byte, and this time the client takes the answer section instead of
+discarding it. A forged `www.example.com. A` whose signature does not cover it
+is `Bogus` on its own; excused as "nothing to authenticate" it would be
+forwarded as `Insecure` and believed. Nothing here is about NXDOMAIN - it is
+every answer this server would otherwise have checked.
 */
 @(test)
 test_a_forgery_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.T) {
@@ -550,17 +550,18 @@ cost, and the distinction it draws is the one worth keeping. A BADVERS is
 indistinguishable on the wire from the forged NODATA above, so it is refused
 too - but `Indeterminate` rather than `Bogus`, which is this server saying it
 established nothing rather than accusing anyone. The client gets SERVFAIL either
-way; the extended error is `NO_REACHABLE_AUTHORITY` rather than `DNSSEC_BOGUS`,
-and the operator reading the log is not sent looking for an attacker.
+way; the extended error is `EDE_NO_REACHABLE_AUTHORITY` rather than
+`EDE_DNSSEC_BOGUS`, and the operator reading the log is not sent looking for an
+attacker.
 
 Refusing costs a real one nothing it had. `rcode_of` reads twelve bits and every
-client reads four, so forwarding a BADVERS hands the client NOERROR with an
-empty answer - a NODATA it never sent. What this replaces is a silently wrong
-answer, not a working one.
+client reads four, so forwarding a BADVERS would hand the client NOERROR with an
+empty answer - a NODATA it never sent. What refusing gives up is a silently
+wrong answer, not a working one.
 
-An earlier turn of this guard got the pair backwards, and only a realistic
-BADVERS catches that: written against a capture whose answer section was still
-full, the test passed while pinning the attack shape itself as acceptable.
+Only a realistic BADVERS - a question and an OPT, nothing else - can tell the
+pair apart: written against a capture whose answer section is still full, a
+test could pass while pinning the attack shape itself as acceptable.
 */
 @(test)
 test_badvers_is_refused_without_being_called_a_forgery :: proc(t: ^testing.T) {

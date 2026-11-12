@@ -353,7 +353,6 @@ var (
 	slip       = flag.Int("slip", 2, "rate_limit.slip (the shipped default is 2)")
 	records    = flag.Int("answer-records", 70, "A records the mock upstream returns, which sets the answer size")
 	upDelay    = flag.Duration("upstream-delay", 20*time.Millisecond, "how long the mock upstream takes to answer")
-	workers    = flag.Int("workers", 64, "server.workers, pinned rather than derived from this machine")
 	only       = flag.String("only", "", "run only arms whose name contains this")
 	keep       = flag.Bool("keep", false, "keep the generated configs and server logs")
 	serverCPUs = flag.String("server-cpus", "", "run the server under `taskset -c` on these CPUs, keeping it off the generator's (e.g. 0,1)")
@@ -863,9 +862,7 @@ func handshakeArms() []arm {
 Concurrency, not a rate: there is nothing to pace, and this many dialers is
 enough to keep the server handshaking flat out.
 
-`hsDialers` rather than `workers` because that is the flag for the server's own
-thread pool, and the two figures have nothing to do with each other. The table
-and the share are the small ones the `slowloris` arms use, for the same reason
+The table and the share are the small ones the `slowloris` arms use, for the same reason
 those do: what `handshakeShareArms` shows is a client held to half a table, and
 the property is scale-free.
 */

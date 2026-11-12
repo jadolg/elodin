@@ -171,11 +171,11 @@ run_serve_doh_mc :: proc(d: ^Mc_Session) {
 Run one request through the real `serve_doh` loop and return everything written
 back.
 
-The three profile cases below differ only in the request line and in what the
-server was given to sign with, so the loopback pair, the handler thread and the
-drain are here once. What is deliberately not factored out is `serve_doh` itself:
-these exist to catch a break in the wiring between routing, the Host capture and
-the signing, and a test that called the builder directly would not see one.
+The cases below differ only in the request line and in what the server was given
+to sign with, so the loopback pair, the handler thread and the drain are here
+once. What is deliberately not factored out is `serve_doh` itself: these exist
+to catch a break in the wiring between routing, the Host capture and the
+signing, and a test that called the builder directly would not see one.
 */
 @(private = "file")
 mc_roundtrip :: proc(t: ^testing.T, s: ^Server, request: string) -> (reply: string, ok: bool) {

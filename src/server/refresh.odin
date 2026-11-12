@@ -15,12 +15,12 @@ RFC 8767 section 5 asks for two things that `resolve_query` on its own cannot
 give at once: the client is answered from the expired entry once a short timer
 has run out, and the refresh that would have answered it carries on anyway, so
 the entry is renewed rather than left to be served stale again on the next
-query. Tying the two together is what issue #164 is about - the fallback was
-reached only after `upstream.resolve` had given up on every server for every
-attempt, which is ten seconds with the defaults and a stub that gave up at five.
+query. Tying the two together is issue #164: a fallback reached only after
+`upstream.resolve` has given up on every server for every attempt comes after
+ten seconds with the defaults, and a stub gives up at five.
 
-So the refresh is moved off the client's fiber and the client waits on it with
-a deadline. A fiber of its own runs `resolve_query` over a copy of the client's
+So the refresh runs off the client's fiber and the client waits on it with a
+deadline. A fiber of its own runs `resolve_query` over a copy of the client's
 own query, which is what makes this cheap to be sure of: it is the
 same procedure, on the same bytes, reaching the same validator, the same
 blocking walk and the same store. There is no second forwarding path to keep in
@@ -239,8 +239,8 @@ Nil is returned for every reason a client should stop waiting and take the
 expired entry it is holding: a refresh for this key is already running, the
 ceiling is reached, `max_pending` is reached or the server is shutting down, or
 there is nowhere to run one at all - which is a `Server` built as a literal and
-driven from a test's own thread, where the only honest thing left to do is what
-this server did before the timer existed.
+driven from a test's own thread, where the only honest thing left to do is
+serve the expired entry without a timer.
 
 The caller owns the reference that comes back and releases it with
 `refresh_release`, whether or not it waited for the answer.

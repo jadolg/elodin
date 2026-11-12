@@ -803,8 +803,8 @@ decode_rdata :: proc(
 	return decode_raw_rdata(r, type, start, end, allocator), .None
 }
 
-// Cheap header peek for paths that only need the ID or the QR bit and do not
-// want to pay for a full parse.
+// Cheap header peek for paths that only need the ID and do not want to pay for
+// a full parse.
 peek_id :: proc(msg: []u8) -> (id: u16, ok: bool) {
 	if len(msg) < 2 {
 		return 0, false

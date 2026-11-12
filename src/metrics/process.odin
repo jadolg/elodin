@@ -190,7 +190,7 @@ split_fields :: proc(text: string, out: []string) -> (count: int) {
 How many descriptors this process has open.
 
 Worth having next to `elodin_connections_active`: the connection limit counts
-threads this server started, and a descriptor leak - or a limit set below what
+connections, and a descriptor leak - or a limit set below what
 `server.max_connections` implies - shows up here first, as a count climbing
 towards `process_max_fds` while the connection count sits still.
 
@@ -255,9 +255,9 @@ Read a small pseudo-file into a caller-supplied buffer.
 
 The same shape, and for the same reason, as `read_small_file` in
 `config/sizing.odin`: `/proc` reports a size of zero, so the read-the-whole-file
-path allocates nothing and reads nothing, and a buffer that filled completely
-means the file was cut short - here that would be a stat line missing its tail,
-which is the half that holds the memory figures.
+path cannot size a buffer from it and grows one on the heap instead, and a
+buffer that filled completely means the file was cut short - here that would be
+a stat line missing its tail, which is the half that holds the memory figures.
 
 Kept here rather than shared with the config loader so that this package depends
 on nothing: it is read by the one thread that must never be waiting on anything

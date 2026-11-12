@@ -18,9 +18,8 @@ a margin either side. What says the refresh happened is the upstream's count:
 one query from the prefetch while the entry is still fresh, then none from a
 query past the old expiry, which the renewed entry answers.
 
-Asked once over UDP, which a worker of the shared pool answers, and once over
-TCP, which a connection's own thread answers: the refresh runs on the pool
-either way, and both have to reach it.
+Asked once over UDP and once over TCP, which are served on different fibers:
+both have to reach the prefetch.
 */
 run_prefetch_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)

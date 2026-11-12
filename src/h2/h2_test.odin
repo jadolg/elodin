@@ -545,13 +545,13 @@ test_data_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
 }
 
 /*
-`handle_headers` rejects an even stream id outright (server.odin:495 area) -
-this server can never have opened one - so an even id is idle regardless of
-where `last_stream_id` sits, the same reasoning `client_handle_data`'s
-parity check already applies. The `> last_stream_id` test alone missed it:
-DATA on stream 2 after the peer opened stream 3 fell through to the
-closed-stream path instead, spending a slot of `closed_stream_rst_budget` to
-answer a connection error as a stream error.
+`handle_headers` rejects an even stream id outright - this server can never
+have opened one - so an even id is idle regardless of where `last_stream_id`
+sits, the same reasoning `client_handle_data`'s parity check applies. The
+`> last_stream_id` test alone would miss it: DATA on stream 2 after the peer
+opened stream 3 would fall through to the closed-stream path instead, spending
+a slot of `closed_stream_rst_budget` to answer a connection error as a stream
+error.
 */
 @(test)
 test_data_on_an_even_stream_is_rejected :: proc(t: ^testing.T) {
@@ -653,8 +653,8 @@ test_data_on_a_closed_stream_is_answered_with_stream_closed :: proc(t: ^testing.
 Answering every one of these forever is its own amplification vector: a peer
 that keeps a closed stream id around and just keeps sending draws an
 RST_STREAM out of this end for each frame, for free. `closed_stream_rst_budget`
-bounds that to `MAX_CLOSED_STREAM_RST` per connection; past it, this falls
-back to the credit-only behaviour the case had before this fix existed.
+bounds that to `MAX_CLOSED_STREAM_RST` per connection; past it, the frame
+only returns its connection credit.
 */
 @(test)
 test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(t: ^testing.T) {
@@ -823,11 +823,11 @@ test_body_in_flight_behind_a_refused_headers_is_ignored :: proc(t: ^testing.T) {
 }
 
 /*
-The same in-flight case with trailers instead of DATA: HEADERS on a stream id
-already used was a connection error outright, so trailers sent before the peer
-saw this end's reset took the whole connection down (#390). They are ignored
-now, but still decoded - here across a CONTINUATION - or the HPACK table
-falls out of step with the peer's and every block after them misdecodes.
+The same in-flight case with trailers instead of DATA: treating HEADERS on a
+stream id already used as a connection error outright would let trailers sent
+before the peer saw this end's reset take the whole connection down (#390).
+They are ignored, but still decoded - here across a CONTINUATION - or the HPACK
+table falls out of step with the peer's and every block after them misdecodes.
 */
 @(test)
 test_trailers_in_flight_on_a_stream_this_end_reset_are_decoded_and_ignored :: proc(t: ^testing.T) {
@@ -1173,10 +1173,9 @@ test_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 RFC 9113 5.1 puts closed in the same bucket as half-closed (remote): once the
 peer has reset a stream, only WINDOW_UPDATE, PRIORITY, and RST_STREAM are
 still allowed from it. A dispatched stream stays in `c.streams` after an
-inbound RST_STREAM - `respond` is what retires it - so `handle_data` could
-still find it and, before this fix, would append to its body and hand back a
-stream-level WINDOW_UPDATE for a stream the peer had already walked away
-from. Answering with an RST_STREAM of our own would loop (RFC 9113 5.4.2),
+inbound RST_STREAM - `respond` is what retires it - so `handle_data` can
+still find it, and must not append to its body or hand back a stream-level
+WINDOW_UPDATE for a stream the peer has already walked away from. Answering with an RST_STREAM of our own would loop (RFC 9113 5.4.2),
 so this checks its absence rather than its presence.
 */
 @(test)
@@ -1377,15 +1376,13 @@ decoding error. The limit here is 4096 - what `dynamic_table_init` is given on
 both the server and the client connection, and what SETTINGS_HEADER_TABLE_SIZE
 states.
 
-What the decoder enforced instead was 65536, a constant of its own with no
-relation to the number the table was built with. The two are supposed to be the
-same number.
+The decoder bounds an update by the number the table was built with, not by a
+constant of its own.
 
-Not all of that 65536 was reachable: `read_integer` refuses any value past
-MAX_HEADER_LIST, so an update above 32 KiB was already a decoding error by
-another route, and what a peer could actually take was eight times the size
-this end agreed to rather than sixteen. Both boundaries are here, each with the
-error that turns it away, so which one does the work is on the record.
+`read_integer` also refuses any value past MAX_HEADER_LIST, so an update above
+32 KiB is a decoding error by another route. Both boundaries are here, each
+with the error that turns it away, so which one does the work is on the
+record.
 */
 @(test)
 test_dynamic_table_update_is_bounded_by_the_advertised_limit :: proc(t: ^testing.T) {
@@ -1575,10 +1572,9 @@ test_reset_stream_is_retired :: proc(t: ^testing.T) {
 }
 
 /*
-RFC 9113 6.4: RST_STREAM's payload is exactly one 4-byte error code. The
-client's handle_frame checks this (client.odin:312-315); the server's did
-not, and read `c.streams[h.stream_id]` regardless of what the "payload" it
-never measured actually held.
+RFC 9113 6.4: RST_STREAM's payload is exactly one 4-byte error code. Both
+sides' `.Rst_Stream` arms check its length before they look the stream up in
+`c.streams`.
 */
 @(test)
 test_rst_stream_with_a_bad_frame_size_is_a_connection_error :: proc(t: ^testing.T) {
@@ -2142,10 +2138,9 @@ serve_harness_write :: proc(user: rawptr, buf: []u8) -> bool {
 test_frame_larger_than_advertised_max_is_refused :: proc(t: ^testing.T) {
 	/*
 	The frame loop advertises the RFC 9113 6.5.2 default MAX_FRAME_SIZE (16384)
-	by never sending one, yet the bound it enforced was the receive window, 64x
-	that. A peer told one size and allowed another was refused only above 1 MB,
-	so any frame in between was accepted while the peer had been promised it
-	would not be.
+	by never sending one, so that is the bound it enforces, not the receive
+	window, 64x that: a frame in between would be accepted while the peer had
+	been promised it would not be.
 	*/
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
@@ -2153,7 +2148,7 @@ test_frame_larger_than_advertised_max_is_refused :: proc(t: ^testing.T) {
 	allocator := mem.tracking_allocator(&track)
 
 	// Preface, then a frame header claiming a payload one byte over the
-	// advertised maximum - well under the old receive-window bound.
+	// advertised maximum - well under the receive window.
 	input := make([dynamic]u8, 0, len(PREFACE) + FRAME_HEADER_SIZE, context.temp_allocator)
 	append(&input, ..transmute([]u8)string(PREFACE))
 	write_frame_header(&input, DEFAULT_MAX_FRAME + 1, .Data, 0, 1)
@@ -3086,11 +3081,11 @@ test_control_frame_budget_refills_each_second :: proc(t: ^testing.T) {
 }
 
 /*
-Each 1-byte DATA frame on an open stream used to draw a connection and a
-stream WINDOW_UPDATE back: 26 bytes out for 10 in, for as long as the peer
-kept sending. Credit is now owed until there is enough of it to be worth a
-frame, and the stream-level update was never needed: MAX_BODY resets a stream
-long before it could use up the RECV_WINDOW it was given.
+A connection and a stream WINDOW_UPDATE for each 1-byte DATA frame on an open
+stream would be 26 bytes out for 10 in, for as long as the peer kept sending.
+Credit is owed until there is enough of it to be worth a frame, and the
+stream-level update is never needed: MAX_BODY resets a stream long before it
+could use up the RECV_WINDOW it was given.
 */
 @(test)
 test_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {

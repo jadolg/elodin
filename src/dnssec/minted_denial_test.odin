@@ -20,10 +20,10 @@ every name that way, and Cloudflare serves them for every signed zone it hosts.
 Nothing here is forged. Every record verifies against `drtest.`'s own key, and
 the answer the client gets is correct. What the shape costs is the chain walk:
 `zone_trust` cannot stop at a name that is not a cut, so a question about a name
-eight labels deep descends all eight, one blocking DS lookup apiece, on the
-thread already answering the client. That is issue #330 - and the name is a
-client's to choose, so the depth was too, and every question under the same run
-used to pay for the whole of it again.
+eight labels deep descends all eight, one DS lookup apiece, waited on by the
+query already answering the client (#330). The name is a client's to choose, so
+the depth is too, and without the non-cut memo every question under the same run
+would pay for the whole of it again.
 
 Generated - `testdata/gen/sign_fixtures.py`, scenario
 `deep_run_of_empty_non_terminals`. Ed25519 throughout, root replaced by a trust
@@ -383,9 +383,9 @@ test_dr_fixture_names_do_not_collide_in_non_cut_table :: proc(t: ^testing.T) {
 test_a_run_of_non_cuts_is_walked_once :: proc(t: ^testing.T) {
 	/*
 	Issue #330. Eight labels of the question are answered as names that are
-	there and hold no delegation, so the walk descends all eight and pays a
-	blocking DS lookup for each - and used to pay them again for the next
-	question underneath the same run, because only zones were remembered.
+	there and hold no delegation, so the walk descends all eight and pays a DS
+	lookup for each - and, were only zones remembered, would pay them again for
+	the next question underneath the same run.
 
 	The numbers are written out rather than derived from a constant: a test
 	that says "no more than the limit" passes when somebody raises the limit,
@@ -474,11 +474,11 @@ test_a_flood_of_non_cuts_keeps_neither_the_zones_nor_the_slots_it_wants :: proc(
 	}
 
 	// Eight to learn the run, and after that only what the flood collides
-	// with - about sixteen, and not a fixed number, because the slot a name
-	// owns comes from a basis drawn at start-up. Uncached it is 1600, and a table that
-	// gives up its front row on every insert comes out in the high hundreds,
-	// so the bound is close enough to notice a policy regression rather than
-	// only a total one.
+	// with - about sixteen under the seed `dr_validator` pins, held to a bound
+	// rather than that figure. Uncached it is 1600, and a table that gives up
+	// its front row on every insert comes out in the high hundreds, so the
+	// bound is close enough to notice a policy regression rather than only a
+	// total one.
 	testing.expectf(
 		t,
 		lookups < 40,
@@ -712,8 +712,8 @@ test_a_delegation_at_a_remembered_name_heals_on_the_next_question :: proc(t: ^te
 	The case the three forgets in `zone_step` cannot reach. All of them sit
 	after that proc's DS query, and a memo hit returns before it - so when the
 	remembered name is itself the one that became a zone, no lookup is made and
-	nothing notices. Every signature the new zone makes is refused, and asking
-	again used to change nothing.
+	nothing notices. Every signature the new zone makes is refused, and without
+	a way back asking again would change nothing.
 
 	`sub.l1...l8.drtest.` is a real signed cut in these fixtures, so
 	remembering it as a non-cut is exactly the state an operator creates by
@@ -819,9 +819,9 @@ test_a_parents_delegation_nsec_cannot_deny_a_name_inside_the_child :: proc(t: ^t
 	the span without reading the bit map will prove any name in the child does
 	not exist, against the parent's keys, and hand the client AD.
 
-	`nsec_proves_no_data` has always made that check. The name-error path did
-	not, and what made it unreachable was the walk: it descends to the child
-	and judges the denial against the child's keys, so the parent's record is
+	`nsec_proves_no_data` makes that check, and so does the name-error path.
+	The walk alone would make it unreachable: it descends to the child and
+	judges the denial against the child's keys, so the parent's record is
 	dropped before it is read. The table takes that away - a name remembered as
 	no cut is a name the walk stops above - so the check has to be where the
 	proof is instead.
@@ -897,7 +897,8 @@ test_a_non_cut_is_not_remembered_past_its_signature :: proc(t: ^testing.T) {
 test_a_zone_entry_does_not_outlive_its_signature_ceiling :: proc(t: ^testing.T) {
 	v := make_validator(dr_query, nil, Options{})
 	defer destroy_validator(v)
-	// One reading of the clock for every step; see the test above.
+	// One reading of the clock for every step; see
+	// `test_the_memo_is_believed_for_less_time_than_a_zone`.
 	base := loop.moment_now()
 	cache_put(v, "unsigned.drtest.", .Insecure, nil, MAX_ZONE_TTL, base, 10)
 	_, found, _ := cache_get(v, "unsigned.drtest.", loop.moment_add(base, 9 * time.Second), context.temp_allocator)

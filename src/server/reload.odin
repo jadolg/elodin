@@ -75,9 +75,6 @@ reload_config :: proc(s: ^Server, path: string) -> (out: Reload_Outcome) {
 	g.config = loaded
 	g.cfg = &g.config
 
-	for key in g.cfg.retired {
-		logx.warnf("reload: %s", config.retired_warning(key))
-	}
 	for key in keep_restart_only(s.gens.boot, g.cfg, context.temp_allocator) {
 		logx.warnf("reload: %s changed, which takes a restart; it keeps the value the process started with until then", key)
 	}
@@ -167,7 +164,7 @@ reads_list_files :: proc(cfg: ^config.Config) -> bool {
 Build the rule sets `cfg` asks for, or take them away. It reads the blocking
 section and the bootstrap servers, and no other part (see `rebuild_snapshot`).
 
-`lists_current` is `reload_filters`'s. A list that loaded before and cannot be
+`lists_current` is `reload_filters_from`'s. A list that loaded before and cannot be
 had now leaves the rules already in effect, and the retry it schedules applies
 the change once the list is back.
 
@@ -176,7 +173,7 @@ On any thread, one at a time.
 rebuild_rules :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool) -> (lists_current: bool) {
 	if !cfg.blocking.enabled {
 		clear_filters(s)
-		// The line a rebuild ends with, as `reload_filters` logs its own.
+		// The line a rebuild ends with, as `reload_filters_from` logs its own.
 		logx.infof("filter: blocking is off; no rules in effect")
 		return true
 	}
@@ -217,13 +214,9 @@ keep_restart_only :: proc(boot, cfg: ^config.Config, allocator := context.alloca
 	// It names what the listeners above serve, and their certificates were
 	// checked against it when they were loaded.
 	hold(&changed, "ddr", boot.ddr, &cfg.ddr)
-	/*
-	Not keys, and nothing a reload changes: the heavy decode slots are set once,
-	process-wide, and the retired keys do nothing whatever the file says about
-	them - `reload_config` has already said what this file names.
-	*/
+	// Not a key, and nothing a reload changes: the heavy decode slots are set
+	// once, process-wide.
 	cfg.server.heavy_decodes = boot.server.heavy_decodes
-	cfg.retired = boot.retired
 	hold(&changed, "server.max_connections", boot.server.max_connections, &cfg.server.max_connections)
 	// Unnamed when both files leave it to be derived: it moves with
 	// `max_connections`, which is already the key to name.

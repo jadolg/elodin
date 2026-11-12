@@ -58,8 +58,7 @@ test_a_query_with_a_slash_in_a_label_is_matched_against_the_lists :: proc(t: ^te
 	/*
 	A label may hold any byte. Presentation form escapes the dot, whitespace and
 	anything unprintable, but not `/`, so a query for `x/.blocked.example.` is
-	decoded with the slash in it - and is still under a blocked zone (#398). The
-	matcher used to refuse such a name as not a domain and let it through.
+	decoded with the slash in it - and is still under a blocked zone (#398).
 	*/
 	block, allow := filter.set_make(), filter.set_make()
 	filter.parse_list(block, allow, "||blocked.example^\n", .Adblock)
@@ -225,8 +224,8 @@ test_a_download_that_opens_with_markup_is_not_a_list :: proc(t: ^testing.T) {
 
 @(test)
 test_a_list_of_badfilter_rules_holds_rules :: proc(t: ^testing.T) {
-	// It adds nothing and takes rules back, so reading it by what it added
-	// alone called its download empty and never cached it.
+	// It adds nothing and takes rules back, so `held` and not `added` says
+	// whether the download holds rules.
 	block, allow := filter.set_make(), filter.set_make()
 	defer filter.set_destroy(block)
 	defer filter.set_destroy(allow)
@@ -572,7 +571,8 @@ test_a_fresh_cached_page_is_downloaded_over :: proc(t: ^testing.T) {
 	defer thread.destroy(server)
 	defer thread.join(server)
 
-	// Registered first so it runs last: the removals below read paths it zeroes.
+	// Registered before the removals so it runs after them: they read paths it
+	// zeroes.
 	defer free_all(context.temp_allocator)
 	dir := fmt.tprintf("/tmp/elodin-server-lists-test-fresh-page-%d", os.get_pid())
 	testing.expect(t, os.make_directory(dir) == nil)
@@ -673,7 +673,8 @@ test_an_empty_download_with_no_copy_does_not_hold_the_others_back :: proc(t: ^te
 	defer thread.destroy(server)
 	defer thread.join(server)
 
-	// Registered first so it runs last: the removals below read paths it zeroes.
+	// Registered before the removals so it runs after them: they read paths it
+	// zeroes.
 	defer free_all(context.temp_allocator)
 	dir := fmt.tprintf("/tmp/elodin-server-lists-test-emptied-%d", os.get_pid())
 	testing.expect(t, os.make_directory(dir) == nil)

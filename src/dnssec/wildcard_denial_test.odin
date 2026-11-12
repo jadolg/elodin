@@ -20,11 +20,11 @@ unchanged after that field has been rewritten to any other name in the zone.
 
 For an answer RRset that is a fact, not a hole: `validate_rrset` sees the short
 count and goes looking for the RFC 4035 section 5.3.4 proof that a wildcard
-expansion was the right thing to do. For a denial record nothing looked, and a
-relocated NSEC is a bit map that answers for a name it was never published
-under. Once is NODATA for a type the name really has; twice, with the owners
-chosen so the two spans cover a qname and the wildcard, is NXDOMAIN for a name
-the zone answers for. Both go out with AD=1 and into the cache.
+expansion was the right thing to do. A denial record has no such proof to look
+for, and a relocated NSEC would be a bit map that answers for a name it was
+never published under. Once would be NODATA for a type the name really has;
+twice, with the owners chosen so the two spans cover a qname and the wildcard,
+NXDOMAIN for a name the zone answers for - both at AD=1 and into the cache.
 
 RFC 4592 section 4.7 is what makes this always a forgery rather than a case
 to be handled: a wildcard owns an NSEC of its own, but "synthesis of these
@@ -556,7 +556,7 @@ test_a_wildcards_own_nsec_still_proves_nodata :: proc(t: ^testing.T) {
 @(test)
 test_a_zone_cut_whose_ds_signature_expanded_is_refused :: proc(t: ^testing.T) {
 	/*
-	The same discarded return, one call site over.
+	The same check, one call site over.
 
 	A DS digest binds the child's name, so replaying some other delegation's DS
 	here dies in `ds_matches` rather than in the signature. What does not is a
@@ -684,9 +684,9 @@ test_an_expanded_ds_or_soa_answer_is_not_secure_either :: proc(t: ^testing.T) {
 	has a DS at a wildcard "meaningless and harmless" and a synthesized one of
 	no use away from a delegation point, and section 4.1 has a wildcard owning
 	an SOA be the zone apex, which is not a source of synthesis. The chain walk
-	refuses an expanded DS already and `verified_rrset` refuses an expanded SOA
-	in the authority section; the answer section was the one place left that
-	took either, at AD=1.
+	refuses an expanded DS and `verified_rrset` refuses an expanded SOA in the
+	authority section; this holds the answer section to the same, so neither
+	goes out at AD=1.
 	*/
 	// The walk down to `nx.wctest.` asks for its DS, and both the denial and
 	// the attack are filed under that name and type. `wc_query` takes the

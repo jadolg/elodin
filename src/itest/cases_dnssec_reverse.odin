@@ -4,14 +4,14 @@ import "core:fmt"
 import "elodin:dns"
 
 /*
-Issue #352: with validation on, the server answered no IPv6 reverse lookup.
+Issue #352: with validation on, an IPv6 reverse lookup is answered.
 
-`zone_trust` bounded the chain walk by the label count of the name it was asked
-about, against a constant meant for zone cuts. A reverse name for an IPv6
-address is one nibble per label - thirty-two of them, plus `ip6` and `arpa` -
-so every one of them was past the bound before a single DS was fetched, and came
-back SERVFAIL with EDE 22. IPv4 reverse names are six labels and were fine,
-which is why it took a while to notice.
+`zone_trust` bounds the chain walk by the zone cuts it finds
+(`MAX_CHAIN_DEPTH`), not by the label count of the name it is asked about. A
+reverse name for an IPv6 address is one nibble per label - thirty-two of them,
+plus `ip6` and `arpa` - so a bound on labels would put every one of them past
+it before a single DS is fetched, and answer SERVFAIL with EDE 22. IPv4 reverse
+names are six labels, so they pass either bound.
 
 The unit tests in `src/dnssec` pin the walk and the denial; what this pins is
 the server. The mock serves a whole signed chain - root, `arpa.`, `ip6.arpa.`,
@@ -276,9 +276,8 @@ dnssec:
 
 	start_case(r, "dnssec: the ipv4 reverse name beside it is unaffected")
 	{
-		// The counterpart, and the reason this hid for as long as it did: six
-		// labels never reached the bound, so in-addr.arpa. answered normally
-		// throughout. Nothing signs this one here, so it fails closed - what
+		// The counterpart: six labels never reach a label-count bound, so
+		// in-addr.arpa. says nothing about one. Nothing signs this one here, so it fails closed - what
 		// matters is that both names reach a verdict of their own rather than
 		// one being decided by its length.
 		res := query_udp(udp_port, build_query("8.8.8.8.in-addr.arpa.", u16(dns.Type.PTR), edns_size = 1232))

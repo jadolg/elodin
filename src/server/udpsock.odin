@@ -63,8 +63,7 @@ order of magnitude past what it has.
 
 Linux reports back twice what it set aside, the second half being its own
 per-datagram bookkeeping rather than room for data, so the figure is halved to
-get back to something comparable with what was asked for. Elsewhere the value
-is returned as it was set.
+get back to something comparable with what was asked for.
 
 0 means the kernel would not say, which the caller reports as nothing rather
 than as a size.

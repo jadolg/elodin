@@ -5,10 +5,10 @@ import "core:testing"
 /*
 The gate that keeps locally-served names off the public chain of trust.
 
-`is_locally_served` is the whole of the decision - once it answers, `validating`
-follows - so the cases that matter are the boundaries: the reported name, the
-siblings of the range it lives in, the label-break trap, and a public name that
-must stay validated.
+`served_locally` is the decision - `is_locally_served` or a zone route, unless a
+local anchor covers the name - and `st.validating` follows from it, so the cases
+that matter are the boundaries: the reported name, the siblings of the range it
+lives in, the label-break trap, and a public name that must stay validated.
 */
 
 @(test)

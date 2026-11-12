@@ -34,9 +34,7 @@ on its own, with nothing in the path that could have echoed it.
 KEPT :: "kept.example."
 
 // The default `client_timeout` is ten seconds, which is a hundred units of the
-// 100ms the TIMEOUT field is counted in (RFC 7828 section 3.1). Written as the
-// arithmetic rather than as 100, so a changed default is a changed expectation
-// and not a failing test.
+// 100ms the TIMEOUT field is counted in (RFC 7828 section 3.1).
 @(private = "file")
 DEFAULT_UNITS :: u16(10 * time.Second / (100 * time.Millisecond))
 
@@ -467,8 +465,7 @@ server issuing exactly that - from a hop where the option was legal, onto one
 where it is not, describing a connection the upstream is not an end of.
 
 What the mock reads is the bytes that left rather than what this server meant to
-send, which is the only reading that would have caught the option travelling
-before this.
+send.
 */
 @(test)
 test_a_client_keepalive_does_not_reach_the_upstream :: proc(t: ^testing.T) {
@@ -551,7 +548,7 @@ test_a_client_keepalive_does_not_reach_the_upstream :: proc(t: ^testing.T) {
 // --- the arithmetic --------------------------------------------------------
 
 @(test)
-test_the_keepalive_timeout_is_counted_in_hundredths_of_a_second :: proc(t: ^testing.T) {
+test_the_keepalive_timeout_is_counted_in_tenths_of_a_second :: proc(t: ^testing.T) {
 	Want :: struct {
 		timeout: time.Duration,
 		units:   u16,

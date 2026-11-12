@@ -206,7 +206,7 @@ peek_id_of :: proc(msg: []u8) -> u16 {
 The largest answer this client can be sent in one datagram.
 
 The smaller of what the client advertised and what the server will put in a
-datagram at all - `response_limit` in src/server/resolver.odin, which floors the
+datagram at all - `response_limit` in src/server/resolver.odin, which caps the
 advertised size at `server.max_udp_response`. Both halves matter: a client
 asking for 65535 does not get 65535, because a datagram that large fragments and
 a fragmented DNS answer is a reassembly problem somebody else has to have.

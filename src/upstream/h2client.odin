@@ -53,12 +53,9 @@ h2_io_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 		if nerr == nil {
 			return got, true
 		}
-		// SO_RCVTIMEO expiring surfaces as EAGAIN on
-		// Linux, which core:net maps to .Would_Block rather than .Timeout -
-		// ETIMEDOUT (and thus .Timeout) is never actually produced by a
-		// receive-timeout poll there. Treating only .Timeout as "no data yet"
-		// misread every idle poll tick as the peer closing, tearing down a
-		// perfectly healthy connection roughly once per H2_POLL_INTERVAL.
+		// A receive timeout is `.Would_Block` from `loop.recv_tcp`; both it and
+		// `.Timeout` are an idle poll tick, not a close. Read as a close, every
+		// tick would tear down a healthy connection once per H2_POLL_INTERVAL.
 		if nerr == .Timeout || nerr == .Would_Block {
 			continue
 		}
@@ -207,7 +204,7 @@ get_h2_conn :: proc(
 		sliver, and `open_stream` puts that figure on the socket. A pooled
 		connection carrying it would give every later request on it a deadline
 		belonging to the query that happened to open it - the same confusion
-		`Pipe_Conn.timeout` exists to avoid. The h2 branch below overrides both
+		`Pipe_Conn.timeout` exists to avoid. The h2 branch above overrides both
 		already, for its own reasons.
 		*/
 		set_socket_timeouts(stream.socket, timeout)
@@ -233,13 +230,6 @@ Wrap a negotiated stream in an h2 client and start its reader: `make_h2_conn`,
 then `start_h2_reader`, the caller holding `u.mu`. For a caller off a loop - the
 tests - where a preface write that waits blocks only its own thread; a fiber
 builds the connection before taking the lock instead (see `get_h2_conn`).
-
-The reader is a fiber of the loop the dialling query runs on - a thread of its
-own off a loop, which is the tests - and it reads every stream's frames for as
-long as the connection lives. The connection has two owners, `u.h2` and the
-reader, and whichever lets go last frees it (`release_h2_conn`). The reader is
-counted in `u.h2_readers` until its last touch of `u`, which `teardown_h2` waits
-for.
 */
 @(private)
 start_h2_conn :: proc(u: ^Upstream, stream: Stream) -> ^H2_Conn {
@@ -260,7 +250,17 @@ make_h2_conn :: proc(u: ^Upstream, stream: Stream) -> ^H2_Conn {
 	return hc
 }
 
-// Under `u.mu`, which `h2_readers` is counted under. Starting a fiber does not park.
+/*
+Start the reader of a connection `make_h2_conn` built. Under `u.mu`, which
+`h2_readers` is counted under. Starting a fiber does not park.
+
+The reader is a fiber of the loop the dialling query runs on - a thread of its
+own off a loop, which is the tests - and it reads every stream's frames for as
+long as the connection lives. The connection has two owners, `u.h2` and the
+reader, and whichever lets go last frees it (`release_h2_conn`). The reader is
+counted in `u.h2_readers` until its last touch of `u`, which `teardown_h2` waits
+for.
+*/
 @(private)
 start_h2_reader :: proc(u: ^Upstream, hc: ^H2_Conn) {
 	u.h2_readers += 1

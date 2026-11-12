@@ -24,7 +24,7 @@ of the day `serve_stale` keeps them, while the upstream answers the whole time.
 A failure is the other side: SERVFAIL and REFUSED are what RFC 8767 keeps the
 copy for, so they leave it where it was.
 
-Both roads a refresh takes: detached on the pool, answering after the client was
+Both roads a refresh takes: detached onto a loop, answering after the client was
 lent the copy, and on the client's own thread where there is no loop.
 */
 @(private = "file")

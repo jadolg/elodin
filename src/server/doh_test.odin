@@ -17,15 +17,16 @@ import "elodin:upstream"
 /*
 The DoH reader hands back views into a buffer it goes on appending to.
 
-`http_line` returns a slice of `Http_Reader.buf`, and `read_http_request` keeps
-several of those - the method, the path, the query string, the content type -
-while it reads the headers and then the body. Every one of those reads can grow
-the buffer past its capacity, and a grown buffer is a different block.
+`http_line` returns a slice of `Http_Reader.buf`, and `read_http_request` takes
+the method, the path, the query string and the content type from those views
+while it goes on reading the headers and then the body. Every one of those reads
+can grow the buffer past its capacity, and a grown buffer is a different block.
 
-That the fields still read correctly today is a property of the arena behind
-`context.temp_allocator`, which copies the old contents forward and does not
-reclaim the block until `free_all`. Nothing in the reader depends on that, or
-says so, and any other allocator invalidates the lot.
+So every field it keeps but the body is copied out (`hold`), and this pins that
+the copies survive a buffer that moves. The arena behind `context.temp_allocator`
+would hide a view into a released block - it copies the old contents forward and
+does not reclaim the block until `free_all` - so the test swaps in an allocator
+that does not.
 */
 
 // Delegates everything, and scribbles over a block before letting go of it.
@@ -177,8 +178,9 @@ test_doh_request_survives_a_buffer_that_grows :: proc(t: ^testing.T) {
 	poison := Poisoning_Allocator {
 		backing = virtual.arena_allocator(&arena),
 	}
-	// The reader's buffer comes from `context.temp_allocator`; swapped for one
-	// that will not quietly keep a released block readable.
+	// This test's reader takes its buffer from `context.temp_allocator` (the
+	// server's is on the heap); swapped for one that will not quietly keep a
+	// released block readable.
 	saved := context.temp_allocator
 	context.temp_allocator = poisoning_allocator(&poison)
 	defer context.temp_allocator = saved
@@ -292,12 +294,12 @@ test_doh_answers_a_pipelined_pair :: proc(t: ^testing.T) {
 /*
 One large request does not leave the connection holding a large buffer.
 
-The reader outlives the request now, so its buffer is no longer handed back by
-the `free_all` between requests: it holds whatever the largest request on the
-connection made it grow to. A body at `MAX_DOH_BODY` doubles it to 128 KiB, and
-a client that sends one and then goes back to 200-byte queries would keep that
-for as long as it holds the connection open - no malformed input needed, and
-multiplied by `server.max_connections`.
+The reader lives as long as the connection, so its buffer is not reclaimed
+between requests: it holds whatever the largest request on the connection made
+it grow to. A body at `MAX_DOH_BODY` doubles it to 128 KiB, and a client that
+sends one and then goes back to 200-byte queries would keep that for as long as
+it holds the connection open - no malformed input needed, and multiplied by
+`server.max_connections`.
 
 Checked either side of `http_compact`, so this fails if the growth stops
 happening as well as if the buffer stops being given back.
@@ -326,8 +328,8 @@ test_doh_reader_gives_back_an_oversized_buffer :: proc(t: ^testing.T) {
 		return
 	}
 
-	// On its own thread: 64 KiB is more than the socket buffers hold, so the
-	// send only finishes as the read below drains it.
+	// On its own thread, so the test does not depend on the socket buffers
+	// holding all 64 KiB: the send may only finish as the read below drains it.
 	sender := Sender {
 		endpoint = bound,
 		request  = strings.to_string(b),
@@ -379,11 +381,12 @@ run_serve_doh :: proc(d: ^Doh_Session) {
 /*
 The half of the next request that has already arrived is still the front of it.
 
-This is the worse of the two ways the per-request reader lost pipelined bytes.
-The dropped-whole case costs an answer; here the leftover is a fragment, and the
-next `http_line` starts wherever the socket resumes - the middle of the request
-line - so what the server reads is not the request the client sent. It parses as
-garbage and the connection is closed under a client that did nothing wrong.
+This is the worse of the two ways a reader that did not outlive the request
+would lose pipelined bytes. The dropped-whole case costs an answer; here the
+leftover would be a fragment, and the next `http_line` would start wherever the
+socket resumes - the middle of the request line - so what the server read would
+not be the request the client sent. It would parse as garbage and the connection
+would be closed under a client that did nothing wrong.
 
 The pause between the two writes is what puts the split there: the first read
 takes the whole of one request and the beginning of the next.
@@ -473,9 +476,9 @@ test_doh_answers_a_request_that_arrives_split :: proc(t: ^testing.T) {
 A query over the budget is answered 429 and the connection survives it.
 
 DoH pipelines - `Connection: keep-alive` is what this endpoint advertises - so a
-client sitting on one connection can put queries through it as fast as the socket
-carries them, and until the limiter was charged here that rate was bounded by
-nothing at all: `max_connections` counts connections, and this is one.
+client sitting on one connection can put queries through it as fast as the
+socket carries them, and `max_connections` does not bound that rate: it counts
+connections, and this is one.
 
 429 rather than the bare close TCP and DoT get, because over HTTP there is a
 status to say it with; and the connection is kept, because ending it charges this
@@ -595,22 +598,24 @@ test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
 A connection over its budget is refused a query at a time rather than refused
 once and closed.
 
-The refusal is the cheapest thing this endpoint does and the close beside it was
-the dearest: `Connection: close` sent the client back through the accept path and
-a TLS handshake for every question it asked, so a client offering six thousand
-queries a second had this server signing about that many key exchanges. More CPU
-went on refusing than the flood cost the client, which never has to spoof an
-address to provoke it - 236 us per refusal against the HTTP/2 path's 10.5 us on
-the same flood, measured in `bench/results/2026-09-03-rate-limit-bystander.md`.
+The refusal is the cheapest thing this endpoint does and a close beside it would
+be the dearest: `Connection: close` would send the client back through the
+accept path and a TLS handshake for every question it asked, so a client
+offering six thousand queries a second would have this server signing about that
+many key exchanges. More CPU would go on refusing than the flood cost the
+client, which never has to spoof an address to provoke it - 236 us per refusal
+against the HTTP/2 path's 10.5 us on the same flood, measured in
+`bench/results/2026-09-03-rate-limit-bystander.md`.
 
 So the two queries here go out pipelined, on one connection, both over the
-budget, and both come back 429 on a connection that is still open. What the close
-did to the second one is why they are pipelined: it was written before its client
-could have read the first refusal, so it arrived either way, and `http_linger`
-read it and threw it away.
+budget, and both come back 429 on a connection that is still open. They are
+pipelined because of what a close would do to the second one: it is written
+before its client could have read the first refusal, so it arrives either way,
+and `http_linger` would read it and throw it away.
 
-The client shuts its send side down after writing, which is what ends `serve_doh`
-now that a refusal does not: in the server proper that is `client_timeout`.
+The client shuts its send side down after writing, which is what ends
+`serve_doh`, since a refusal does not: in the server proper that is
+`client_timeout`.
 */
 @(test)
 test_doh_keeps_the_connection_after_a_429 :: proc(t: ^testing.T) {
@@ -914,10 +919,11 @@ A request line is three tokens, and the third of them is a version this server
 speaks.
 
 RFC 9112 3 writes it as `method SP request-target SP HTTP-version` with nothing
-around it, and 2.3 writes the version as `HTTP/1.<DIGIT>` here. Split on its
-first two spaces and never looked at, the third token took anything: `JUNK` was
-read as a version, and so was `HTTP/1.1 trailing-garbage`, because everything
-after the target - further spaces included - landed in it.
+around it, and 2.3 writes the version as `HTTP/1.<DIGIT>` here. A reader that
+split on the first two spaces and never looked at the third token would take
+anything there: `JUNK` would be read as a version, and so would
+`HTTP/1.1 trailing-garbage`, because everything after the target - further
+spaces included - would land in it.
 
 Both are the disagreement the `Content-Length` cases below are about, on the
 other half of the request line. A front end sharing :443 with elodin, or
@@ -1040,11 +1046,11 @@ test_request_line_is_three_tokens_with_a_known_version :: proc(t: ^testing.T) {
 /*
 `Content-Length` is `1*DIGIT` (RFC 9110 8.6) and nothing else.
 
-Read with `strconv.parse_int` and its default base, it is a good deal more than
-that: the base is taken from a prefix, so `0x10` is 16 and `0b1010` is 10; `_`
-between digits is skipped, so `1_0` is 10; a leading sign is allowed; and the
-accumulator wraps without reporting it, so `18446744073709551620` is 4 and the
-range check that follows sees nothing wrong with it.
+A lenient parser reads a good deal more than that - `strconv.parse_int` with its
+default base takes the base from a prefix, so `0x10` would be 16 and `0b1010`
+10; skips `_` between digits, so `1_0` would be 10; allows a leading sign; and
+wraps the accumulator without reporting it, so `18446744073709551620` would be 4
+and the range check that follows would see nothing wrong with it.
 
 Every one of those is a length elodin would act on and a front end would not.
 Sharing :443 with a web server, or terminating TLS at nginx, haproxy or Envoy,
@@ -1054,8 +1060,8 @@ disagree about where one request ends is the whole of CL.CL request smuggling:
 what elodin reads as the tail of a body, the front end reads as the start of
 the next request, and attributes to whoever's connection it is pipelining onto.
 
-Repeats are refused for the same reason (RFC 9112 6.3). The loop kept the last
-one it saw, and nothing says a proxy in front resolves the same way.
+Repeats are refused for the same reason (RFC 9112 6.3): keeping the last one
+seen is a choice nothing says a proxy in front makes the same way.
 */
 @(test)
 test_content_length_is_strict_decimal :: proc(t: ^testing.T) {
@@ -1315,22 +1321,17 @@ leaves open - which is what a client on a link with any latency looks like from
 this end, and what `test_a_refusal_outlives_the_close_that_follows_it` cannot
 show, its body being on the wire before the reader is.
 
-Two semaphores and one sleep, and which is which is the point. The sleep used to
-be the whole of it, timed from whenever this thread happened to start, and it had
-to be long enough that the reader always won the race to it and short enough that
-the drain was always still waiting when it ended. On a loaded runner it was
-neither: thread start is unbounded, `time.sleep` may overshoot by as much as it
-was asked for, and between them the body could arrive after the drain and the
-check behind it had both finished - which is the flakiness this test had, on both
-architectures, with the suite at its normal speed.
-
-Both unbounded terms are taken out rather than one. `ready` is posted from inside
-the thread, and the caller waits for it before it starts reading, so thread start
-is absorbed where nothing is timing it; `go` is posted once the refusal has been
+Two semaphores and one sleep, and which is which is the point. Thread start is
+unbounded and `time.sleep` may overshoot by as much as it was asked for, so a
+sleep timed from whenever this thread happened to start could put the body on
+the wire after the drain and the check behind it had both finished, on a loaded
+runner. Both unbounded terms are taken out. `ready` is posted from inside the
+thread, and the caller waits for it before it starts reading, so thread start is
+absorbed where nothing is timing it; `go` is posted once the refusal has been
 written, so the body cannot reach the wire before then however this thread is
 scheduled. What is left to time is the sleep below - 50 ms against the 250 the
-drain waits out - and it now runs on a thread known to be alive and sitting on
-this line, rather than standing in for one that may not have started.
+drain waits out - and it runs on a thread known to be alive and sitting on this
+line.
 */
 @(private = "file")
 send_late_body :: proc(lb: ^Late_Body) {
@@ -1373,34 +1374,21 @@ behind for the close to trip over, and then whether the status survived the clos
 The first is the mechanism and the second is the consequence, and shortening the
 wait fails on both.
 
-The sequence is waited for rather than timed, which it did not used to be. A
-100 ms sleep in the sender stood in for a round trip against the 250 ms of
-`HTTP_LINGER_BODY_IDLE`, and the margin between the two was supposed to keep the
-result off the scheduler. It did not: on a loaded CI runner the sender's thread
-start plus a sleep that may overshoot by its own length put the body on the wire
-after the drain and after the 500 ms check behind it, so the close met bytes
-nobody had drained and the RST took the 400 with it - the test reporting the real
-consequence of a body it had itself sent too late. It failed on both
-architectures with the suite at its normal speed.
-
-`Late_Body` is now handed its turn instead of guessing at it: it reports itself
-alive before the reader runs, waits to be told the refusal has been written, and
-only then sleeps the round trip - 50 ms against the drain's 250. Thread start and
-sleep overshoot were the two unbounded terms sitting inside that margin, and both
-are now outside it.
+The sequence is waited for rather than timed. `Late_Body` is handed its turn:
+it reports itself alive before the reader runs, waits to be told the refusal has
+been written, and only then sleeps the round trip - 50 ms against the 250 ms of
+`HTTP_LINGER_BODY_IDLE`. Thread start and sleep overshoot, the two unbounded
+terms, are outside that margin (see `send_late_body`).
 
 The sender is reaped between the drain and the check rather than after both, so
-an empty queue at the check can only mean the drain emptied it. That is what a
-late body used to be able to counterfeit, and the exact shape of the old failure:
-16 KiB turning up after the drain and the check had finished, and the close
-sending an RST over it.
+an empty queue at the check can only mean the drain emptied it.
 
 What is deliberately *not* done is waiting for the body before the drain, which
 would be more deterministic still. `http_linger` has to be what meets a body on
 its way: with the whole 16 KiB already in the receive queue before the drain
 began, a drain of any length would read it, and shortening
 `HTTP_LINGER_BODY_IDLE` would stop failing this test - which is most of what it
-is for. Nothing about the property changed either way: the body still cannot
+is for. Nothing about the property changes either way: the body still cannot
 exist on the wire until after the refusal was read and written, which is what
 makes this the opposite case to the test named above.
 
@@ -1476,8 +1464,7 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	defer thread.destroy(sender)
 
 	// Wait for it to be alive and waiting before anything below is timed against
-	// it. Thread start is the other unbounded term this test used to have inside
-	// its margin; absorbed here, it is outside it.
+	// it, so thread start is absorbed here and is outside the margin.
 	sync.sema_wait(&late.ready)
 
 	r := Http_Reader {
@@ -1522,9 +1509,7 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	Reaped here, between the drain and the check, so that what the check sees can
 	only be the drain's doing. The body is fully written by the time this returns,
 	so an empty queue below means the drain read it rather than that it had yet to
-	be sent - which is the reading a late sender used to be able to fake, and the
-	shape the old failure took: bytes arriving after both the drain and the check
-	had finished, and the close sending an RST over them.
+	be sent.
 
 	A join can block, which is why the sender's socket carries a send timeout. In
 	the ordinary case it cannot: 16 KiB goes into a loopback receive buffer two
@@ -1541,18 +1526,18 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	And then the sending half goes down, which is what makes the check below an
 	answer rather than a guess.
 
-	`send_tcp` returning means the bytes reached the kernel's send buffer, not that
-	they reached the server - so a joined sender can still have a body in flight,
-	and the check reading nothing could mean either that the drain took it all or
-	that it has yet to land. That ambiguity is the last of this test's flakiness:
-	when the body landed after the check, the close met unread bytes and sent an
-	RST, the client lost its 400, and the failure named the close while saying
-	nothing about the body being late.
+	`send_tcp` returning means the bytes reached the kernel's send buffer, not
+	that they reached the server - so a joined sender can still have a body in
+	flight, and the check reading nothing could mean either that the drain took
+	it all or that it has yet to land. Left open, that ambiguity would make the
+	test flaky: a body landing after the check would meet the close as unread
+	bytes, the RST would cost the client its 400, and the failure would name the
+	close while saying nothing about the body being late.
 
 	A FIN is queued behind everything already written, so once this is sent the
-	read below can only return the leftover the drain failed to take, or the clean
-	EOF that says there was none - `conn_read` reports both as `ok = false` only in
-	the second case, since it requires `got > 0`. Nothing can arrive afterwards
+	read below can only return the leftover the drain failed to take, or the
+	clean EOF that says there was none - `net.recv_tcp` returns the first as
+	bytes and the second as zero with no error. Nothing can arrive afterwards
 	either, which is what leaves the close with one possible outcome.
 
 	It does not weaken what the drain was measured against. `http_linger` had
@@ -1562,7 +1547,7 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	*/
 	// Kept rather than discarded. This is the first operation on `client` after
 	// whatever the teardown does to the connection, so on a failing run it is where
-	// a pending `ECONNRESET` is consumed - which is why the read below then saw the
+	// a pending `ECONNRESET` is consumed - which is why the read below then sees the
 	// socket's *second* reading, `Not_Connected`, rather than the first. Naming it
 	// lets the final check report whether the reset had already arrived by here.
 	shutdown_err := net.shutdown(client, .Send)
@@ -1574,29 +1559,27 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	arrived left it to turn up here, which is the close finding it there and
 	sending an RST instead of a FIN.
 
-	Read to a clean EOF rather than to one read returning nothing, which is what
-	this used to do and is where an earlier round of flakiness lived. `conn_read`
-	reports a receive timeout and an orderly shutdown the same way - `ok = false`,
-	because it asks only for `got > 0` - so a body that had not yet landed within
-	the wait was read as a queue that was empty, and the close then met the bytes
-	and took the 400 with it in an RST. A `recv` returning zero with no error
-	cannot be faked by a slow sender: the FIN is queued behind everything the
-	client wrote, so reaching it means every byte before it has already been read
-	here.
+	Read to a clean EOF rather than to one read returning nothing: a read that
+	reports a receive timeout and an orderly shutdown the same way would take a
+	body that had not yet landed within the wait for a queue that was empty, and
+	the close would then meet the bytes and take the 400 with it in an RST. A
+	`recv` returning zero with no error cannot be faked by a slow sender: the
+	FIN is queued behind everything the client wrote, so reaching it means every
+	byte before it has already been read here.
 
-	`Not_Connected` and the `Connection_Closed` that precedes it name a socket the
-	peer reset, not bytes still on their way, and they are the end of the read, not
-	a failure of it. The verdict is `behind`, which counts bytes, and a client that
-	gave up mid-body reaches this loop as data followed by the FIN of its
-	`shutdown(.Send)` - counted and caught below - never as an RST, because this
-	test's client only ever shuts its sending half down. An RST here is the
-	teardown's own doing rather than the drain's, it flushes the receive queue as it
-	lands so there is nothing left to measure, and taking it as the errno-shaped
-	verdict is what let the suite stop on a socket state while saying nothing about
-	the body. See the note on `Not_Connected` in issue #197: it is `recv` on a
-	socket already torn down, distinct from the receive timeout, which surfaces as
-	`Would_Block` on Linux and is a body that never arrived at all - a real hang,
-	and still a failure that says so.
+	`Not_Connected` and the `Connection_Closed` that precedes it name a socket
+	the peer reset, not bytes still on their way, and they are the end of the
+	read, not a failure of it. The verdict is `behind`, which counts bytes, and
+	a client that gave up mid-body reaches this loop as data followed by the FIN
+	of its `shutdown(.Send)` - counted and caught below - never as an RST,
+	because this test's client only ever shuts its sending half down. An RST
+	here is the teardown's own doing rather than the drain's, it flushes the
+	receive queue as it lands so there is nothing left to measure, and taking it
+	as the errno-shaped verdict would stop the suite on a socket state while
+	saying nothing about the body. See the note on `Not_Connected` in issue
+	#197: it is `recv` on a socket already torn down, distinct from the receive
+	timeout, which surfaces as `Would_Block` on Linux and is a body that never
+	arrived at all - a real hang, and still a failure that says so.
 
 	The timeout is that guard against a hang rather than the mechanism, which is why
 	it is generous and why it is written out rather than derived from
@@ -1705,12 +1688,13 @@ A request trickled a byte at a time is given up on at the deadline the request
 began with, not held for as long as the client keeps trickling.
 
 The socket's receive timeout bounds one read and is restarted by every byte that
-arrives, so a request line, its headers and its body - as many reads as the client
-cares to split them into - had no bound between them: a client sending a byte
-inside every wait holds the connection, and one of `max_connections`, for as long
-as it likes while no request ever completes and nothing charges it for one. See
-`Http_Reader.budget`, and `Read_Budget` where the DNS stream has the same
-shape and RFC 7766 6.2.3 says what a server should do about it.
+arrives, so a request line, its headers and its body - as many reads as the
+client cares to split them into - would have no bound between them on that
+timeout alone: a client sending a byte inside every wait would hold the
+connection, and one of `max_connections`, for as long as it likes while no
+request ever completes and nothing charges it for one. See `Http_Reader.budget`,
+and `Read_Budget` where the DNS stream has the same shape and RFC 7766 6.2.3
+says what a server should do about it.
 
 The receive timeout here is five seconds, far longer than the deadline, so the
 reader giving up inside two is the deadline doing it and not the socket: a reader
@@ -1792,11 +1776,11 @@ ask_the_wrong_path :: proc(p: ^Wrong_Path_Peer) {
 /*
 A connection that never asks a question is not kept for as long as it likes (#344).
 
-A 404 honours the client's keep-alive and is charged to nothing, since the budget
-is denominated in questions. So a peer asking for the wrong path once inside every
-idle wait held a connection, a thread and one of `max_connections` forever, and
-the rate limiter never saw it. It is let go once twice `client_timeout` passes
-with no question asked - see `doh_question_overdue`.
+A 404 honours the client's keep-alive and is charged to nothing, since the
+budget is denominated in questions. So a peer asking for the wrong path once
+inside every idle wait could hold a connection and one of `max_connections`
+forever, and the rate limiter would never see it. It is let go once twice
+`client_timeout` passes with no question asked - see `doh_question_overdue`.
 
 The peer here keeps asking for three seconds; the server must hang up long before
 that, rather than when the peer stops.
@@ -1865,10 +1849,10 @@ The time a question takes to answer is not time the connection asked nothing (#3
 
 A TCP client's idle wait starts once its answer is written, and so does the
 window `doh_question_overdue` gives an HTTP/1.1 connection. Stamped where the
-question was charged instead, an upstream slower than twice `client_timeout` - two
-unreachable servers at the defaults - ended the connection as soon as the answer
-went out, under the `Connection: keep-alive` that answer had just promised, and a
-request the client had already sent was lost with it.
+question was charged instead, an upstream slower than twice `client_timeout` -
+two unreachable servers at the defaults - would end the connection as soon as
+the answer went out, under the `Connection: keep-alive` that answer had just
+promised, and a request the client had already sent would be lost with it.
 
 The upstream here never answers, and gives up after 400ms against a 100ms
 `client_timeout`. The 404 pipelined behind the query must still be answered.
@@ -2005,9 +1989,9 @@ test_doh_a_timeout_near_the_range_limit_keeps_connections :: proc(t: ^testing.T)
 /*
 A POST's Content-Type is judged by its media type, whole and without regard to
 ASCII case (RFC 9110 8.3.1), on the HTTP/2 path and so through the predicate the
-HTTP/1.1 path shares. A prefix match let `application/dns-message-bogus` in and
-a case-sensitive one turned `Application/DNS-Message` away (#304); a Unicode fold
-would take the long s (U+017F) for an `s`.
+HTTP/1.1 path shares. A prefix match would let `application/dns-message-bogus`
+in and a case-sensitive one would turn `Application/DNS-Message` away (#304); a
+Unicode fold would take the long s (U+017F) for an `s`.
 */
 @(test)
 test_doh_content_type_is_the_media_type_folded :: proc(t: ^testing.T) {
@@ -2047,8 +2031,8 @@ test_doh_content_type_is_the_media_type_folded :: proc(t: ^testing.T) {
 	}
 }
 
-// A repeated Content-Type is a 400 on HTTP/1.1: the reader kept the last of the
-// two, and a hop in front may have judged the first.
+// A repeated Content-Type is a 400 on HTTP/1.1: a reader keeping the last of the
+// two could disagree with a hop in front that judged the first.
 // An empty first one counts too: the counter is not the stored value.
 @(test)
 test_doh_repeated_content_type_is_refused :: proc(t: ^testing.T) {
@@ -2070,9 +2054,9 @@ test_doh_repeated_content_type_is_refused :: proc(t: ^testing.T) {
 /*
 The HTTP/1.1 reader hands the predicate the Content-Type with only OWS off it.
 `strings.trim_space` also takes a non-breaking space, a vertical tab or a form
-feed off the end - none of them OWS - and a type a front end judged with one
-of those on it became `application/dns-message` here, while HTTP/2 kept the
-character and refused it.
+feed off the end - none of them OWS - so trimmed with it, a type a front end
+judged with one of those on it would become `application/dns-message` here,
+while HTTP/2 keeps the character and refuses it.
 */
 @(test)
 test_doh_content_type_keeps_what_is_not_ows :: proc(t: ^testing.T) {
@@ -2108,11 +2092,11 @@ test_doh_content_type_keeps_what_is_not_ows :: proc(t: ^testing.T) {
 /*
 A field name is a token (RFC 9110 5.1), and names and the `close` option compare
 without regard to ASCII case only (#432). `strings.equal_fold` folds Unicode, so
-`Ho\u017ft` - the long s, U+017F - was counted as Host and `clo\u017fe` closed the
-connection, and a name outside the token grammar was read at all: a hop that
-folds the same way reads `Tran\u017ffer-Encoding` as chunked framing while this
-one, once it folds ASCII only, would not. So such a line is refused, and a value
-keeps whatever is not OWS.
+with it `Ho\u017ft` - the long s, U+017F - would count as Host and `clo\u017fe`
+would close the connection, and a name outside the token grammar would be read
+at all: a hop that folds the same way reads `Tran\u017ffer-Encoding` as chunked
+framing while this one, folding ASCII only, does not. So such a line is refused,
+and a value keeps whatever is not OWS.
 */
 @(test)
 test_doh_field_names_are_ascii_tokens :: proc(t: ^testing.T) {
@@ -2194,8 +2178,9 @@ test_doh_lines_hold_no_bare_line_ends :: proc(t: ^testing.T) {
 /*
 `Connection` is a list of options (RFC 9110 7.6.1), and a client that puts
 `close` anywhere in it wants no second request on this connection. Read as one
-token, `close, TE` was kept open until `client_timeout`, holding a thread for
-nothing (#437). An option that merely contains the letters is not `close`.
+token, `close, TE` would be kept open until `client_timeout`, holding one of
+`max_connections` for nothing (#437). An option that merely contains the letters
+is not `close`.
 */
 @(test)
 test_doh_request_connection_is_a_list :: proc(t: ^testing.T) {

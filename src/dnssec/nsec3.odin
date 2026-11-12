@@ -104,9 +104,9 @@ denial in every zone is `Indeterminate` and every name in one is SERVFAIL. A
 setting that reads as "accept more" and acts as "accept nothing" is worth
 catching, so `make_validator` holds a larger number down to this and says so in
 the log rather than leaving it to be discovered as a resolver that came up fine
-and answers nothing. Held down rather than refused at load: a configuration
-carrying a larger number was legal before this bound existed, and a resolver
-that does not come back from an upgrade is worse than either.
+and answers nothing. Held down rather than refused at load, so that a
+configuration with a larger number still starts: a resolver that does not come
+back from an upgrade is worse than either.
 
 What it promises is a floor, not a guarantee, and the difference is worth being
 plain about. At this ceiling a record with a salt of ordinary length costs 256
@@ -333,8 +333,8 @@ spend_nsec3_rounds :: proc(budget: ^Nsec3_Budget, rr: Nsec3, name: string) -> bo
 
 /*
 SHA-1 blocks a query hashes between giving its loop to the other fibers on it:
-about 100 us here, where the whole of `MAX_NSEC3_ROUNDS_PER_QUERY` is 0.8 ms
-held at once. A hash of the iteration count RFC 9276 asks for, zero, is a
+an eighth of `MAX_NSEC3_ROUNDS_PER_QUERY`, whose note gives what a whole
+allowance costs held at once. A hash of the iteration count RFC 9276 asks for, zero, is a
 block or two, so an ordinary proof never reaches one.
 */
 NSEC3_ROUNDS_PER_TURN :: 1024
