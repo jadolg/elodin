@@ -28,13 +28,14 @@ main :: proc() {
 	names: [dynamic]string
 	lines := string(name_text)
 	for line in strings.split_lines_iterator(&lines) {
-		wire, ok := hex.decode(transmute([]u8)line)
-		name, _, err := dns.decode_name(wire, 0)
-		if !ok || err != nil {
-			fmt.eprintfln("re2diff-elodin: bad name %q", line)
-			os.exit(2)
+		if wire, ok := hex.decode(transmute([]u8)line); ok {
+			if name, _, err := dns.decode_name(wire, 0); err == nil {
+				append(&names, name)
+				continue
+			}
 		}
-		append(&names, name)
+		fmt.eprintfln("re2diff-elodin: bad name %q", line)
+		os.exit(2)
 	}
 	out: strings.Builder
 	patterns := string(pattern_text)

@@ -6,6 +6,7 @@ import "core:net"
 import "core:os"
 import "core:strings"
 import "core:time"
+import "core:unicode"
 import "elodin:cache"
 import "elodin:dns"
 import "elodin:dnssec"
@@ -103,6 +104,7 @@ load_string :: proc(src: string, allocator := context.allocator, tls_files := tr
 	load_metrics(&l, &cfg)
 	load_rewrites(&l, &cfg)
 	validate(&l, &cfg)
+	derive_sizes(&cfg)
 
 	if len(l.errors) > 0 {
 		return cfg, Load_Error{l.errors[:]}
@@ -170,6 +172,20 @@ opt_string :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^string, path: s
 	}
 	dst^ = v
 	return true
+}
+
+// A list of strings, refused as "a list of `what`" when it is anything else.
+@(private)
+opt_string_list :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^[]string, path: string, what: string) {
+	child := yaml.get(n, key)
+	if yaml.is_null(child) {
+		return
+	}
+	if list, ok := yaml.as_string_list(child, l.allocator); ok {
+		dst^ = list
+	} else {
+		errorf(l, "%s.%s: expected a list of %s", path, key, what)
+	}
 }
 
 @(private)
@@ -400,7 +416,7 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 			"server.rate_limit",
 		)
 		/*
-		0 is the loader's own marker for a key nobody wrote, which `validate`
+		0 is the loader's own marker for a key nobody wrote, which `derive_sizes`
 		turns into `server.max_udp_response`. A file that writes it means
 		something by it, and what it would get is that same resolution: the key
 		doing nothing, silently, which is the one shape this setting is reported
@@ -479,7 +495,7 @@ checked here too: the loader is the only thing that sees an entry beside the lin
 it was written on, and a limiter built out of a bad figure has nothing left to
 complain with.
 
-An entry that names no `slip` carries -1 out of here, and `validate` fills it in
+An entry that names no `slip` carries -1 out of here, and `derive_sizes` fills it in
 from the top-level figure once that is known to be final. Reading it during this
 pass would inherit whatever had been parsed so far, which depends on the order
 the keys happen to appear in the file.
@@ -618,7 +634,7 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 		}
 
 		/*
-		`slip` of -1 is "the entry did not say", which `validate` fills in; 0 is a
+		`slip` of -1 is "the entry did not say", which `derive_sizes` fills in; 0 is a
 		value `slip` can be given on purpose, so it cannot stand for absence.
 
 		`responses_per_second` starts at 1 rather than 0 so that a figure
@@ -857,33 +873,51 @@ load_upstream :: proc(l: ^Loader, cfg: ^Config) {
 		"servers",
 		"zones",
 	)
-	load_strategy(l, n, &cfg.upstream.strategy, "upstream")
-	opt_upstream_timeout(l, n, &cfg.upstream.timeout, "upstream")
-	opt_int(l, n, "attempts", &cfg.upstream.attempts, "upstream")
-	opt_int(l, n, "max_idle", &cfg.upstream.max_idle, "upstream")
-	opt_duration(l, n, "idle_timeout", &cfg.upstream.idle_timeout, "upstream")
+	load_group_fields(l, n, &cfg.upstream, "upstream")
+	load_servers(l, n, &cfg.upstream, "upstream")
+	load_upstream_zones(l, cfg, n)
+}
 
+/*
+The fields `upstream` and every `upstream.zones` entry share: how a group picks
+between its servers, how long it waits, and how it reuses connections. A field
+the node leaves out keeps what `dst` held.
+*/
+@(private)
+load_group_fields :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Upstream_Config, path: string) {
+	load_strategy(l, n, &dst.strategy, path)
+	opt_upstream_timeout(l, n, &dst.timeout, path)
+	opt_int(l, n, "attempts", &dst.attempts, path)
+	opt_int(l, n, "max_idle", &dst.max_idle, path)
+	opt_duration(l, n, "idle_timeout", &dst.idle_timeout, path)
 	if b := yaml.get(n, "bootstrap"); !yaml.is_null(b) {
-		cfg.upstream.bootstrap = load_bootstrap(l, b, "upstream.bootstrap")
+		dst.bootstrap = load_bootstrap(l, b, fmt.tprintf("%s.bootstrap", path))
 	}
+}
 
-	// As in `load_block_lists`: `items` answers nil for one server written
-	// without its "-", which would be reported as no server at all.
+/*
+A group's `servers`, each with the group's bootstrap as its default. Left out or
+empty, `dst.servers` keeps what it held. False when the key holds something
+other than a list: as in `load_block_lists`, `items` answers nil for one server
+written without its "-", which would be reported as no server at all.
+*/
+@(private)
+load_servers :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Upstream_Config, path: string) -> bool {
 	if s := yaml.get(n, "servers"); !yaml.is_null(s) && s.kind != .Sequence {
-		errorf(l, "upstream.servers: expected a list of servers, with a \"-\" in front of each one")
+		errorf(l, "%s.servers: expected a list of servers, with a \"-\" in front of each one", path)
+		return false
 	}
 	if servers := yaml.items(yaml.get(n, "servers")); len(servers) > 0 {
 		out := make([dynamic]Upstream_Spec, 0, len(servers), l.allocator)
 		for sn, i in servers {
-			spec, ok := load_upstream_spec(l, sn, fmt.tprintf("upstream.servers[%d]", i), cfg.upstream.bootstrap)
+			spec, ok := load_upstream_spec(l, sn, fmt.tprintf("%s.servers[%d]", path, i), dst.bootstrap)
 			if ok {
 				append(&out, spec)
 			}
 		}
-		cfg.upstream.servers = out[:]
+		dst.servers = out[:]
 	}
-
-	load_upstream_zones(l, cfg, n)
+	return true
 }
 
 /*
@@ -968,37 +1002,12 @@ load_upstream_zones :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node) {
 		route.upstream.servers = nil
 		route.upstream.zones = nil
 
-		load_strategy(l, entry, &route.upstream.strategy, path)
-		opt_upstream_timeout(l, entry, &route.upstream.timeout, path)
-		opt_int(l, entry, "attempts", &route.upstream.attempts, path)
-		opt_int(l, entry, "max_idle", &route.upstream.max_idle, path)
-		opt_duration(l, entry, "idle_timeout", &route.upstream.idle_timeout, path)
-		if b := yaml.get(entry, "bootstrap"); !yaml.is_null(b) {
-			route.upstream.bootstrap = load_bootstrap(l, b, fmt.tprintf("%s.bootstrap", path))
-		}
-
+		load_group_fields(l, entry, &route.upstream, path)
 		route.domains = load_route_domains(l, entry, path, i, &claimed)
-
-		// Refused outright, as above, rather than appended to be reported by
-		// `validate` as a route with no servers.
-		if s := yaml.get(entry, "servers"); !yaml.is_null(s) && s.kind != .Sequence {
-			errorf(l, "%s.servers: expected a list of servers, with a \"-\" in front of each one", path)
+		// A route whose `servers` is not a list is refused outright rather than
+		// appended to be reported by `validate` as a route with no servers.
+		if !load_servers(l, entry, &route.upstream, path) {
 			continue
-		}
-		if servers := yaml.items(yaml.get(entry, "servers")); len(servers) > 0 {
-			out := make([dynamic]Upstream_Spec, 0, len(servers), l.allocator)
-			for sn, j in servers {
-				spec, ok := load_upstream_spec(
-					l,
-					sn,
-					fmt.tprintf("%s.servers[%d]", path, j),
-					route.upstream.bootstrap,
-				)
-				if ok {
-					append(&out, spec)
-				}
-			}
-			route.upstream.servers = out[:]
 		}
 
 		append(&routes, route)
@@ -1035,7 +1044,7 @@ canonical_zone_entry :: proc(
 	domain: string,
 	ok: bool,
 ) {
-	domain = canonical_domain(written, l.allocator)
+	domain = canonical_domain(l, written, fmt.tprintf("%s[%d]: %q", path, index, written)) or_return
 
 	/*
 	`rewrites` further down does take a `*.` prefix, so an operator who has
@@ -1293,17 +1302,20 @@ route_is_anchored :: proc(cfg: ^Config, route: Zone_Route) -> bool {
 	if !cfg.dnssec.enabled || len(cfg.dnssec.trust_anchors) == 0 || len(route.domains) == 0 {
 		return false
 	}
+	// Parsed once for every domain of the route.
+	zones := make([dynamic]string, 0, len(cfg.dnssec.trust_anchors), context.temp_allocator)
+	for line in cfg.dnssec.trust_anchors {
+		if anchor, ok := dnssec.parse_trust_anchor(line, context.temp_allocator); ok && anchor.zone != "." {
+			append(&zones, anchor.zone)
+		}
+	}
 	for domain in route.domains {
 		covered := false
-		for line in cfg.dnssec.trust_anchors {
-			anchor, ok := dnssec.parse_trust_anchor(line, context.temp_allocator)
-			if !ok || anchor.zone == "." {
-				continue
-			}
+		for zone in zones {
 			// Both sides canonical: `canonical_domain` made the route's, and
 			// `parse_trust_anchor` runs the anchor's through
 			// `dns.name_canonical`.
-			if dns.name_at_or_below(domain, anchor.zone) {
+			if dns.name_at_or_below(domain, zone) {
 				covered = true
 				break
 			}
@@ -1498,7 +1510,7 @@ parse_upstream_shorthand :: proc(
 	// ASCII whitespace only: `trim_space` also eats Unicode spaces such as NBSP,
 	// silently rewriting what the operator wrote; the check below refuses it
 	// instead (#438).
-	s := strings.trim(raw, " \t\r\n")
+	s := strings.trim(raw, ASCII_SPACE)
 
 	if has_scheme(s, "https://") {
 		spec.kind = .HTTPS
@@ -1637,13 +1649,8 @@ parse_v4 :: proc(l: ^Loader, s: string, path: string, dst: ^[4]u8) {
 
 @(private)
 parse_v6 :: proc(l: ^Loader, s: string, path: string, dst: ^[16]u8) {
-	addr := netx.parse_address(s)
-	if v6, is_v6 := addr.(net.IP6_Address); is_v6 {
-		for group, i in v6 {
-			v := u16(group)
-			dst[i * 2] = u8(v >> 8)
-			dst[i * 2 + 1] = u8(v)
-		}
+	if bytes, is_v6 := netx.address_bytes(netx.parse_address(s)); is_v6 {
+		dst^ = bytes
 		return
 	}
 	errorf(l, "%s: %q is not an IPv6 address", path, s)
@@ -1788,20 +1795,8 @@ load_blocking :: proc(l: ^Loader, cfg: ^Config) {
 	cfg.blocking.lists = load_block_lists(l, yaml.get(n, "lists"), "blocking.lists")
 	cfg.blocking.allow_lists = load_block_lists(l, yaml.get(n, "allowlists"), "blocking.allowlists")
 
-	if r := yaml.get(n, "rules"); !yaml.is_null(r) {
-		if list, ok := yaml.as_string_list(r, l.allocator); ok {
-			cfg.blocking.rules = list
-		} else {
-			errorf(l, "blocking.rules: expected a list of rules")
-		}
-	}
-	if r := yaml.get(n, "allow"); !yaml.is_null(r) {
-		if list, ok := yaml.as_string_list(r, l.allocator); ok {
-			cfg.blocking.allow_rules = list
-		} else {
-			errorf(l, "blocking.allow: expected a list of rules")
-		}
-	}
+	opt_string_list(l, n, "rules", &cfg.blocking.rules, "blocking", "rules")
+	opt_string_list(l, n, "allow", &cfg.blocking.allow_rules, "blocking", "rules")
 }
 
 @(private)
@@ -1827,13 +1822,7 @@ load_dnssec :: proc(l: ^Loader, cfg: ^Config) {
 	opt_int(l, n, "max_connection_walks", &cfg.dnssec.max_connection_walks, "dnssec")
 	opt_int(l, n, "max_cached_zones", &cfg.dnssec.max_cached_zones, "dnssec")
 
-	if a := yaml.get(n, "trust_anchors"); !yaml.is_null(a) {
-		if list, ok := yaml.as_string_list(a, l.allocator); ok {
-			cfg.dnssec.trust_anchors = list
-		} else {
-			errorf(l, "dnssec.trust_anchors: expected a list of DS records")
-		}
-	}
+	opt_string_list(l, n, "trust_anchors", &cfg.dnssec.trust_anchors, "dnssec", "DS records")
 }
 
 @(private)
@@ -1858,8 +1847,8 @@ load_ddr :: proc(l: ^Loader, cfg: ^Config) {
 	check_keys(l, n, "ddr", "name")
 	written: string
 	opt_string(l, n, "name", &written, "ddr")
-	// Refused as written: `canonical_domain` trims Unicode space, so a trailing
-	// no-break space would otherwise reach `check_ddr` already gone.
+	// Refused as written: a hostname holds no space, control or byte outside
+	// ASCII anywhere, so `canonical_domain` has nothing left to trim or refuse.
 	for c in transmute([]u8)written {
 		if c <= ' ' || c >= 0x7f {
 			errorf(l, "ddr.name: %q must be a hostname, the one the certificate of the DoT or DoH listener covers", written)
@@ -1867,7 +1856,7 @@ load_ddr :: proc(l: ^Loader, cfg: ^Config) {
 		}
 	}
 	if written != "" {
-		cfg.ddr.name = canonical_domain(written, l.allocator)
+		cfg.ddr.name, _ = canonical_domain(l, written, "ddr.name")
 	}
 }
 
@@ -2063,8 +2052,11 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 		if !check_keys(l, e, path, "domain", "ttl", "ptr", "answer", "answers") {
 			continue
 		}
-		domain := ""
-		opt_string(l, e, "domain", &domain, path)
+		written := ""
+		opt_string(l, e, "domain", &written, path)
+		// Trimmed before the `*.` is looked for, so " *.lan" is the wildcard it
+		// reads as, and a domain of spaces alone is no domain rather than the root.
+		domain := strings.trim(written, ASCII_SPACE)
 		if domain == "" {
 			errorf(l, "%s: missing domain", path)
 			continue
@@ -2087,8 +2079,9 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 		outcome the answer-side check exists to prevent, and the same one line
 		to prevent it.
 		*/
-		rw.domain = canonical_domain(domain, l.allocator)
-		if !name_fits_the_wire(l, rw.domain, fmt.tprintf("%s.domain", path)) {
+		domain_ok: bool
+		rw.domain, domain_ok = canonical_domain(l, domain, fmt.tprintf("%s.domain: %q", path, written))
+		if !domain_ok || !name_fits_the_wire(l, rw.domain, fmt.tprintf("%s.domain", path)) {
 			continue
 		}
 		// `*.` is every name below the root, which is every name: one rule over
@@ -2302,22 +2295,23 @@ parse_rewrite_answer :: proc(
 	ans: Rewrite_Answer,
 	ok: bool,
 ) {
-	trimmed := strings.trim_space(text)
+	trimmed := strings.trim(text, ASCII_SPACE)
 	if trimmed == "" {
 		errorf(l, "%s: empty answer", path)
 		return {}, false
 	}
 	// Case-folded like the type tokens below, and for the same reason: `Block`
 	// read as a name is a CNAME to the host `block`, which is the opposite of
-	// what the word was written to ask for.
-	if strings.equal_fold(trimmed, "block") || strings.equal_fold(trimmed, "deny") {
+	// what the word was written to ask for. ASCII only, as names fold: "ſrv"
+	// is no SRV.
+	if dns.name_equal_fold(trimmed, "block") || dns.name_equal_fold(trimmed, "deny") {
 		return Rewrite_Answer{kind = .Block}, true
 	}
 
 	head, rest, typed := split_first_field(trimmed)
 	if typed {
 		switch {
-		case strings.equal_fold(head, "a"):
+		case dns.name_equal_fold(head, "a"):
 			addr, is4 := netx.parse_address(rest).(net.IP4_Address)
 			if !is4 {
 				errorf(l, "%s: A needs an IPv4 address, got %q", path, rest)
@@ -2325,7 +2319,7 @@ parse_rewrite_answer :: proc(
 			}
 			return Rewrite_Answer{kind = .A, v4 = cast([4]u8)addr}, true
 
-		case strings.equal_fold(head, "aaaa"):
+		case dns.name_equal_fold(head, "aaaa"):
 			addr, is6 := netx.parse_address(rest).(net.IP6_Address)
 			if !is6 {
 				errorf(l, "%s: AAAA needs an IPv6 address, got %q", path, rest)
@@ -2333,17 +2327,17 @@ parse_rewrite_answer :: proc(
 			}
 			return v6_rewrite_answer(addr), true
 
-		case strings.equal_fold(head, "cname"):
+		case dns.name_equal_fold(head, "cname"):
 			name := rdata_name(l, rest, path, "CNAME") or_return
 			return Rewrite_Answer{kind = .CNAME, name = name}, true
 
-		case strings.equal_fold(head, "mx"):
+		case dns.name_equal_fold(head, "mx"):
 			return parse_mx_answer(l, rest, path)
 
-		case strings.equal_fold(head, "srv"):
+		case dns.name_equal_fold(head, "srv"):
 			return parse_srv_answer(l, rest, path)
 
-		case strings.equal_fold(head, "txt"):
+		case dns.name_equal_fold(head, "txt"):
 			strs := parse_txt_strings(l, rest, path) or_return
 			return Rewrite_Answer{kind = .TXT, strings = strs}, true
 		}
@@ -2570,20 +2564,17 @@ MAX_RECORD_RDATA :: dns.MAX_MESSAGE - 12 - (255 + 4) - (255 + 10)
 @(private)
 v6_rewrite_answer :: proc(v: net.IP6_Address) -> (ans: Rewrite_Answer) {
 	ans.kind = .AAAA
-	for group, gi in v {
-		x := u16(group)
-		ans.v6[gi * 2] = u8(x >> 8)
-		ans.v6[gi * 2 + 1] = u8(x)
-	}
+	ans.v6, _ = netx.address_bytes(v)
 	return ans
 }
 
 /*
 A domain name out of an RDATA field, checked for being one.
 
-`canonical_domain` takes anything at all, so both checks are here. A field with
-a space in it is two fields that were meant to be one, and the message says
-which record was being written rather than leaving the operator to find it.
+`canonical_domain` refuses only a space outside ASCII at an end, so both checks
+are here. A field with a space in it is two fields that were meant to be one,
+and the message says which record was being written rather than leaving the
+operator to find it.
 
 The second check is that the wire can carry it, and it is here because of what
 happens when it cannot: `encode_message` fails on the record, `apply_rewrite`
@@ -2596,7 +2587,7 @@ name that cannot be sent is a startup error instead.
 */
 @(private)
 rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: bool) {
-	trimmed := strings.trim_space(text)
+	trimmed := strings.trim(text, ASCII_SPACE)
 	if trimmed == "" || strings.index_any(trimmed, " \t") >= 0 {
 		errorf(l, "%s: %s needs one host name, got %q", path, type, text)
 		return "", false
@@ -2620,8 +2611,15 @@ rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: b
 		errorf(l, "%s: %s host %q ends in a number, so it is no name, and it is no IPv4 address either", path, type, trimmed)
 		return "", false
 	}
-	canonical := canonical_domain(trimmed, l.allocator)
-	if !name_fits_the_wire(l, canonical, fmt.tprintf("%s: %s host %q", path, type, trimmed)) {
+	what := fmt.tprintf("%s: %s host %q", path, type, trimmed)
+	canonical := canonical_domain(l, trimmed, what) or_return
+	// A space outside ASCII inside it splits two fields just as one at the
+	// check above does: "TXT hello" is no name to point at.
+	if strings.index_proc(trimmed, unicode.is_space) >= 0 {
+		errorf(l, "%s: %s needs one host name, got %q", path, type, text)
+		return "", false
+	}
+	if !name_fits_the_wire(l, canonical, what) {
 		return "", false
 	}
 	return canonical, true
@@ -2654,7 +2652,7 @@ split_first_field :: proc(s: string) -> (head, rest: string, ok: bool) {
 	if i < 0 {
 		return s, "", false
 	}
-	return s[:i], strings.trim_space(s[i:]), true
+	return s[:i], strings.trim(s[i:], ASCII_SPACE), true
 }
 
 /*
@@ -2668,12 +2666,12 @@ hundred trailing words from being walked to the end.
 @(private)
 rdata_fields :: proc(s: string, out: []string) -> int {
 	n := 0
-	rest := strings.trim_space(s)
+	rest := strings.trim(s, ASCII_SPACE)
 	for rest != "" {
 		field := rest
 		if i := strings.index_any(rest, " \t"); i >= 0 {
 			field = rest[:i]
-			rest = strings.trim_space(rest[i:])
+			rest = strings.trim(rest[i:], ASCII_SPACE)
 		} else {
 			rest = ""
 		}
@@ -2709,10 +2707,24 @@ parse_rdata_u16 :: proc(s: string) -> (v: u16, ok: bool) {
 	return u16(n), true
 }
 
-// `dns.name_canonical` past the surrounding space: the spelling the resolver
-// compares against.
-canonical_domain :: proc(s: string, allocator := context.allocator) -> string {
-	return dns.name_canonical(strings.trim_space(s), allocator)
+// The whitespace a configured name or answer is trimmed of: ASCII only.
+@(private)
+ASCII_SPACE :: " \t\n\v\f\r"
+
+/*
+`dns.name_canonical` past the surrounding ASCII space: the spelling the resolver
+compares against. A space outside ASCII at either end - a no-break space pasted
+from a web page, or YAML's `\_` - is refused under `what` rather than trimmed,
+so a name means the bytes it was written with or nothing (#438).
+*/
+@(private)
+canonical_domain :: proc(l: ^Loader, s, what: string) -> (domain: string, ok: bool) {
+	trimmed := strings.trim(s, ASCII_SPACE)
+	if strings.trim_space(trimmed) != trimmed {
+		errorf(l, "%s has a space outside ASCII at one end, such as a no-break space; delete it", what)
+		return "", false
+	}
+	return dns.name_canonical(trimmed, l.allocator), true
 }
 
 @(private)
@@ -2720,12 +2732,7 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if len(cfg.upstream.servers) == 0 {
 		errorf(l, "upstream.servers: at least one upstream server is required")
 	}
-	any_listener :=
-		cfg.listeners.udp.enabled ||
-		cfg.listeners.tcp.enabled ||
-		cfg.listeners.dot.enabled ||
-		cfg.listeners.doh.enabled
-	if !any_listener {
+	if !cfg.listeners.udp.enabled && !stream_listeners_enabled(cfg.listeners) {
 		errorf(l, "listeners: every listener is disabled, so nothing would be served")
 	}
 
@@ -2750,20 +2757,14 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	check_tls(l, cfg.listeners.dot, "dot")
 	check_tls(l, cfg.listeners.doh, "doh")
 
-	if cfg.listeners.doh.enabled && !strings.has_prefix(cfg.listeners.doh.path, "/") {
-		errorf(l, "listeners.doh.path: must start with '/'")
-	} else if cfg.listeners.doh.enabled && !http_path_is_valid(cfg.listeners.doh.path) {
-		errorf(l, "listeners.doh.path: %s", HTTP_PATH_RULE)
+	if cfg.listeners.doh.enabled {
+		check_http_path(l, cfg.listeners.doh.path, "listeners.doh.path")
 	}
 	// The profile endpoint shares the DoH listener, so it has to be a path of its
 	// own: absolute, and not the one that answers queries — a request cannot be
 	// both a DNS message and a download of the profile that points at it.
 	if cfg.listeners.doh.enabled && cfg.listeners.doh.mobileconfig_path != "" {
-		if !strings.has_prefix(cfg.listeners.doh.mobileconfig_path, "/") {
-			errorf(l, "listeners.doh.mobileconfig_path: must start with '/'")
-		} else if !http_path_is_valid(cfg.listeners.doh.mobileconfig_path) {
-			errorf(l, "listeners.doh.mobileconfig_path: %s", HTTP_PATH_RULE)
-		}
+		check_http_path(l, cfg.listeners.doh.mobileconfig_path, "listeners.doh.mobileconfig_path")
 		if cfg.listeners.doh.mobileconfig_path == cfg.listeners.doh.path {
 			errorf(l, "listeners.doh.mobileconfig_path: must not be the same as listeners.doh.path")
 		}
@@ -2772,11 +2773,7 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	check_ddr(l, cfg)
 
 	if cfg.metrics.enabled {
-		if !strings.has_prefix(cfg.metrics.path, "/") {
-			errorf(l, "metrics.path: must start with '/'")
-		} else if !http_path_is_valid(cfg.metrics.path) {
-			errorf(l, "metrics.path: %s", HTTP_PATH_RULE)
-		}
+		check_http_path(l, cfg.metrics.path, "metrics.path")
 		// Port 0 binds and works, on whichever port the kernel picked - which
 		// nothing can be told to scrape. Refused here rather than left as an
 		// endpoint that comes up and is never reached.
@@ -2866,28 +2863,13 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		errorf(l, "cache.stale_timeout must not be negative; 0 waits for the upstream instead")
 	}
 	/*
-	What this machine has, measured once whether or not anything below is left
-	to it: the heavy decode slots are derived from its memory every time, since
-	they are not a key a file can set.
-
-	Done here rather than at startup so that `--check` and the run that follows
-	it agree by construction, and so an operator can see on the machine itself
-	what the file leaves unsaid.
-	*/
-	cfg.server.sizing.machine = probe_machine()
-	cfg.server.heavy_decodes = derive_heavy_decodes(cfg.server.sizing.machine)
-	/*
-	The UDP readers, sized the same way and reported the same way.
-
-	Refused rather than clamped, for the reason `max_udp_response` is: the
-	number decides how much traffic this server can hear at all, so a file
-	naming one it will not get is a file whose author should be told rather
-	than quietly given something else. Checked whether or not UDP is enabled -
-	a mistyped figure under a listener that is off is still a mistake, and one
-	that would surface only when somebody turned the listener on.
-
-	Derived whether or not UDP is on, since the readers' count is the event
-	loops' count and every listener runs on them.
+	The UDP readers, refused rather than clamped, for the reason
+	`max_udp_response` is: the number decides how much traffic this server can
+	hear at all, so a file naming one it will not get is a file whose author
+	should be told rather than quietly given something else. Checked whether or
+	not UDP is enabled - a mistyped figure under a listener that is off is still
+	a mistake, and one that would surface only when somebody turned the listener
+	on.
 	*/
 	if cfg.listeners.udp.readers < 0 {
 		errorf(l, "listeners.udp.readers must not be negative")
@@ -2912,10 +2894,6 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			DEFAULT_UDP_RECEIVE_BUFFER,
 		)
 	}
-	if cfg.listeners.udp.readers == 0 {
-		cfg.listeners.udp.readers = derive_udp_readers(cfg.server.sizing.machine)
-		cfg.server.sizing.derived_udp_readers = true
-	}
 	if cfg.server.rate_limit.enabled {
 		if cfg.server.rate_limit.responses_per_second < 1 {
 			errorf(l, "server.rate_limit.responses_per_second must be at least 1")
@@ -2924,12 +2902,8 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			errorf(l, "server.rate_limit.slip must not be negative")
 		}
 		/*
-		The denomination, resolved here to the ceiling it is measured against.
-
-		Unset is `server.max_udp_response`, the largest datagram this server will
-		send, so every answer costs exactly one token.
-
-		Written, it is held to bounds of its own. Below
+		The denomination, when written, is held to bounds of its own; unset,
+		`derive_sizes` resolves it to `server.max_udp_response`. Below
 		`MIN_RESPONSE_SIZE_ESTIMATE` every answer this server can send costs more
 		than a token, which is `responses_per_second` made into a byte budget with
 		a multiplier nobody stated; above `MAX_UDP_RESPONSE` there is no datagram
@@ -2939,10 +2913,8 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		what the budget is counted in, and a server that quietly counted in
 		something else would be one whose bound is not the one its file states.
 		*/
-		if cfg.server.rate_limit.response_size_estimate == 0 {
-			cfg.server.rate_limit.response_size_estimate = cfg.server.max_udp_response
-		} else if cfg.server.rate_limit.response_size_estimate < MIN_RESPONSE_SIZE_ESTIMATE ||
-		   cfg.server.rate_limit.response_size_estimate > MAX_UDP_RESPONSE {
+		estimate := cfg.server.rate_limit.response_size_estimate
+		if estimate != 0 && (estimate < MIN_RESPONSE_SIZE_ESTIMATE || estimate > MAX_UDP_RESPONSE) {
 			errorf(
 				l,
 				"server.rate_limit.response_size_estimate must be between %d and %d bytes (it is %d); left out it is server.max_udp_response, which charges one token per answer",
@@ -2951,27 +2923,14 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 				cfg.server.rate_limit.response_size_estimate,
 			)
 		}
-		/*
-		The overrides' own figures, held to the same rules as the defaults they
-		replace, and the inherited `slip` filled in here.
-
-		Here rather than in the loader because the top-level figures are only
-		final once the whole `rate_limit` map has been read: an entry written
-		above `slip:` in the same file would otherwise inherit the value from
-		before it was parsed.
-		*/
-		for &o in cfg.server.rate_limit.overrides {
+		// The overrides' own figures, held to the same rules as the defaults
+		// they replace.
+		for o in cfg.server.rate_limit.overrides {
 			if o.responses_per_second < 1 {
 				// Rendered where it is said, so a file whose entries are all fine
 				// renders nothing: the common case is every entry valid.
 				label := format_prefix(o.prefix, context.temp_allocator)
 				errorf(l, "server.rate_limit.overrides: %s: responses_per_second must be at least 1", label)
-			}
-			// Not "must not be negative": a negative figure an operator wrote is
-			// refused beside the line it was written on, so anything below zero
-			// here is the loader's own marker for an entry that said nothing.
-			if o.slip < 0 {
-				o.slip = cfg.server.rate_limit.slip
 			}
 		}
 	} else if len(cfg.server.rate_limit.overrides) > 0 {
@@ -3007,26 +2966,6 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 			DEFAULT_MAX_UDP_RESPONSE,
 		)
 	}
-	if cfg.server.max_pending == 0 {
-		cfg.server.max_pending = derive_max_pending(cfg.server.sizing.machine)
-		cfg.server.sizing.derived_max_pending = true
-	}
-	/*
-	The chain-walk bound, after the figure it is a share of, here rather than
-	at start-up for the reason above: `--check` and the run that follows it have
-	to agree, and an operator told to raise a number has to be able to see what
-	it currently is. See `derive_chain_walks`.
-	*/
-	if cfg.dnssec.max_chain_walks == 0 {
-		cfg.dnssec.max_chain_walks = derive_chain_walks(cfg.server.max_pending)
-		cfg.server.sizing.derived_chain_walks = true
-	}
-	// The connections answer their queries outside `max_pending`, so their bound
-	// comes from `max_connections`. See `Dnssec_Config.max_connection_walks`.
-	if cfg.dnssec.max_connection_walks == 0 {
-		cfg.dnssec.max_connection_walks = derive_chain_walks(cfg.server.max_connections)
-		cfg.server.sizing.derived_connection_walks = true
-	}
 	/*
 	The table itself, refused rather than clamped.
 
@@ -3041,37 +2980,14 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.server.max_connections < 1 {
 		errorf(
 			l,
-			"server.max_connections must be at least 1 (it is %d); 512 is the default",
+			"server.max_connections must be at least 1 (it is %d); %d is the default",
 			cfg.server.max_connections,
+			DEFAULT_MAX_CONNECTIONS,
 		)
 	}
 	if cfg.server.max_connections_per_prefix < 0 {
 		errorf(l, "server.max_connections_per_prefix must not be negative")
 	}
-	/*
-	One client's share of the connection table, worked out here for the reason
-	`max_pending` is: `--check` and the run that follows it then agree by
-	construction, and a figure nobody wrote in the file is one an operator can
-	still read off the server.
-
-	Half of the table, and never more than the table. Half is what leaves the
-	other half for everybody else, which is the whole property the cap exists
-	for. At or above `max_connections` there is no cap left to apply - the total
-	is reached first, from wherever the connections came - and storing that as
-	the table's own size is what makes it inert without `conn_spawn` needing a
-	special case for it. The `max(..., 1)` guards keep the arithmetic sane for a
-	table the check above has already refused: the load fails, but validation
-	runs to the end first and the figures it prints on the way have to mean
-	something.
-	*/
-	if cfg.server.max_connections_per_prefix == 0 {
-		cfg.server.max_connections_per_prefix = max(cfg.server.max_connections / 2, 1)
-		cfg.server.sizing.derived_per_prefix = true
-	}
-	cfg.server.max_connections_per_prefix = min(
-		cfg.server.max_connections_per_prefix,
-		max(cfg.server.max_connections, 1),
-	)
 	// A group on its own would read as a privilege drop that was configured,
 	// and nothing at all is what it would do.
 	if cfg.server.group != "" && cfg.server.user == "" {
@@ -3102,11 +3018,12 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		errorf(l, "dnssec.max_cached_zones must not be negative; 0 uses the built-in default")
 	}
 	// Parsed here rather than at startup so `--check` reports a bad anchor
-	// instead of a resolver that comes up refusing every name.
-	parsed_anchors := make([dynamic]dnssec.Trust_Anchor, 0, len(cfg.dnssec.trust_anchors), l.allocator)
+	// instead of a resolver that comes up refusing every name. Scratch: only
+	// the verdict is kept, and `start_validator` parses them again.
+	parsed_anchors := make([dynamic]dnssec.Trust_Anchor, 0, len(cfg.dnssec.trust_anchors), context.temp_allocator)
 	all_anchors_read := true
 	for anchor, i in cfg.dnssec.trust_anchors {
-		read, ok := dnssec.parse_trust_anchor(anchor, l.allocator)
+		read, ok := dnssec.parse_trust_anchor(anchor, context.temp_allocator)
 		if !ok {
 			errorf(l, "dnssec.trust_anchors[%d]: %q is not a DS record", i, anchor)
 			all_anchors_read = false
@@ -3197,8 +3114,112 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	}
 }
 
+/*
+The figures a file may leave to the machine or to another figure, filled in
+after `validate` has checked what the file wrote. Each fills a zero the file
+wrote or left, or clamps the per-prefix share, and no check in `validate` reads
+one, so running after it changes no verdict. It runs whether or not the load
+failed.
+*/
+@(private)
+derive_sizes :: proc(cfg: ^Config) {
+	/*
+	What this machine has, measured once whether or not anything below is left
+	to it: the heavy decode slots are derived from its memory every time, since
+	they are not a key a file can set.
+
+	Done at load rather than at startup so that `--check` and the run that
+	follows it agree by construction, and so an operator can see on the machine
+	itself what the file leaves unsaid.
+	*/
+	cfg.server.sizing.machine = probe_machine()
+	cfg.server.heavy_decodes = derive_heavy_decodes(cfg.server.sizing.machine)
+	// Derived whether or not UDP is on, since the readers' count is the event
+	// loops' count and every listener runs on them.
+	if cfg.listeners.udp.readers == 0 {
+		cfg.listeners.udp.readers = derive_udp_readers(cfg.server.sizing.machine)
+		cfg.server.sizing.derived_udp_readers = true
+	}
+	if cfg.server.rate_limit.enabled {
+		// Unset, the denomination is `server.max_udp_response`, the largest
+		// datagram this server will send, so every answer costs exactly one
+		// token.
+		if cfg.server.rate_limit.response_size_estimate == 0 {
+			cfg.server.rate_limit.response_size_estimate = cfg.server.max_udp_response
+		}
+		/*
+		The inherited `slip`, filled in here rather than in the loader because
+		the top-level figures are only final once the whole `rate_limit` map has
+		been read: an entry written above `slip:` in the same file would
+		otherwise inherit the value from before it was parsed.
+
+		Anything below zero is the loader's own marker for an entry that said
+		nothing: a negative figure an operator wrote is refused beside the line
+		it was written on.
+		*/
+		for &o in cfg.server.rate_limit.overrides {
+			if o.slip < 0 {
+				o.slip = cfg.server.rate_limit.slip
+			}
+		}
+	}
+	if cfg.server.max_pending == 0 {
+		cfg.server.max_pending = derive_max_pending(cfg.server.sizing.machine)
+		cfg.server.sizing.derived_max_pending = true
+	}
+	/*
+	The chain-walk bound, after the figure it is a share of, at load for the
+	reason above: `--check` and the run that follows it have to agree, and an
+	operator told to raise a number has to be able to see what it currently is.
+	See `derive_chain_walks`.
+	*/
+	if cfg.dnssec.max_chain_walks == 0 {
+		cfg.dnssec.max_chain_walks = derive_chain_walks(cfg.server.max_pending)
+		cfg.server.sizing.derived_chain_walks = true
+	}
+	// The connections answer their queries outside `max_pending`, so their bound
+	// comes from `max_connections`. See `Dnssec_Config.max_connection_walks`.
+	if cfg.dnssec.max_connection_walks == 0 {
+		cfg.dnssec.max_connection_walks = derive_chain_walks(cfg.server.max_connections)
+		cfg.server.sizing.derived_connection_walks = true
+	}
+	/*
+	One client's share of the connection table, worked out at load for the
+	reason `max_pending` is: `--check` and the run that follows it then agree by
+	construction, and a figure nobody wrote in the file is one an operator can
+	still read off the server.
+
+	Half of the table, and never more than the table. Half is what leaves the
+	other half for everybody else, which is the whole property the cap exists
+	for. At or above `max_connections` there is no cap left to apply - the total
+	is reached first, from wherever the connections came - and storing that as
+	the table's own size is what makes it inert without `conn_spawn` needing a
+	special case for it. The `max(..., 1)` guards keep the arithmetic sane for a
+	table `validate` has already refused: the load fails, but this runs all the
+	same and the figures it leaves have to mean something.
+	*/
+	if cfg.server.max_connections_per_prefix == 0 {
+		cfg.server.max_connections_per_prefix = max(cfg.server.max_connections / 2, 1)
+		cfg.server.sizing.derived_per_prefix = true
+	}
+	cfg.server.max_connections_per_prefix = min(
+		cfg.server.max_connections_per_prefix,
+		max(cfg.server.max_connections, 1),
+	)
+}
+
 @(private)
 HTTP_PATH_RULE :: "must be visible ASCII with no '?' or '#'"
+
+// An endpoint's path as `key` wrote it: absolute, and one a request can reach.
+@(private)
+check_http_path :: proc(l: ^Loader, path, key: string) {
+	if !strings.has_prefix(path, "/") {
+		errorf(l, "%s: must start with '/'", key)
+	} else if !http_path_is_valid(path) {
+		errorf(l, "%s: %s", key, HTTP_PATH_RULE)
+	}
+}
 
 /*
 Whether a request can reach `path` at all. It is compared with the target's path

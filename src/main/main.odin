@@ -244,15 +244,15 @@ key and is said here so it can be read.
 */
 @(private)
 sizing_line :: proc(s: config.Server_Config, loops: int, chain_walks := 0, connection_walks := 0) -> string {
+	return fmt.tprintf("%s (%s)", sizing_figures(s, loops, chain_walks, connection_walks), sizing_origin(s))
+}
+
+// The figures both the `sizing` event and `sizing_line` print, the walks only
+// where there are any.
+@(private)
+sizing_figures :: proc(s: config.Server_Config, loops: int, chain_walks := 0, connection_walks := 0) -> string {
 	walks := fmt.tprintf(" chain_walks=%d connection_walks=%d", chain_walks, connection_walks) if chain_walks > 0 else ""
-	return fmt.tprintf(
-		"loops=%d max_pending=%d heavy_decodes=%d%s (%s)",
-		loops,
-		s.max_pending,
-		s.heavy_decodes,
-		walks,
-		sizing_origin(s),
-	)
+	return fmt.tprintf("loops=%d max_pending=%d heavy_decodes=%d%s", loops, s.max_pending, s.heavy_decodes, walks)
 }
 
 /*
@@ -297,14 +297,11 @@ wrote is not a route", so it is worth its own line.
 */
 route_shaped_rules :: proc(cfg: ^config.Config, allocator := context.allocator) -> []string {
 	out := make([dynamic]string, 0, 0, allocator)
-	for rule in cfg.blocking.rules {
-		if strings.has_prefix(strings.trim_space(rule), "server=/") {
-			append(&out, rule)
-		}
-	}
-	for rule in cfg.blocking.allow_rules {
-		if strings.has_prefix(strings.trim_space(rule), "server=/") {
-			append(&out, rule)
+	for rules in ([][]string{cfg.blocking.rules, cfg.blocking.allow_rules}) {
+		for rule in rules {
+			if strings.has_prefix(strings.trim_space(rule), "server=/") {
+				append(&out, rule)
+			}
 		}
 	}
 	return out[:]
@@ -486,7 +483,7 @@ main :: proc() {
 	if privdrop.is_root() && service.uid != 0 {
 		log_owner = logx.Owner{service.uid, service.gid}
 	}
-	if err := logx.init(logx.Level(cfg.log.level), log_file, log_owner); err != nil {
+	if err := logx.init(cfg.log.level, log_file, log_owner); err != nil {
 		fmt.eprintfln(
 			"elodin: cannot open the log file %q (%s)%s, logging to stderr instead",
 			cfg.log.file,
@@ -500,8 +497,6 @@ main :: proc() {
 		}
 	}
 	defer logx.shutdown()
-
-	misrouted := route_shaped_rules(&cfg, context.temp_allocator)
 
 	if opts.check_only {
 		// The certificates are read here, which the loader does not do.
@@ -523,7 +518,7 @@ main :: proc() {
 			"  %s",
 			sizing_line(
 				cfg.server,
-				max(cfg.listeners.udp.readers, 1),
+				cfg.listeners.udp.readers,
 				cfg.dnssec.max_chain_walks if cfg.dnssec.enabled else 0,
 				cfg.dnssec.max_connection_walks if cfg.dnssec.enabled else 0,
 			),
@@ -599,7 +594,7 @@ main :: proc() {
 				fmt.printfln("  %s", line)
 			}
 		}
-		for rule in misrouted {
+		for rule in route_shaped_rules(&cfg, context.temp_allocator) {
 			fmt.printfln("  warning: %s", route_rule_warning(rule, context.temp_allocator))
 		}
 		for route in cfg.upstream.zones {
@@ -623,10 +618,8 @@ main :: proc() {
 	logx.eventf(
 		.Info,
 		"sizing",
-		"loops=%d max_pending=%d heavy_decodes=%d origin=%s",
-		max(cfg.listeners.udp.readers, 1),
-		cfg.server.max_pending,
-		cfg.server.heavy_decodes,
+		"%s origin=%s",
+		sizing_figures(cfg.server, cfg.listeners.udp.readers),
 		logx.quote(sizing_origin(cfg.server)),
 	)
 	log_config_warnings(&cfg)
@@ -783,7 +776,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	that waits on the network runs on them - see `loop` - and each takes one UDP
 	reader. Started before anything that could spawn on one.
 	*/
-	loops, loop_threads := start_loops(max(cfg.listeners.udp.readers, 1), cfg.server.pin_loops)
+	loops, loop_threads := start_loops(cfg.listeners.udp.readers, cfg.server.pin_loops)
 
 	filters := filter.engine_make()
 	defer filter.engine_destroy(filters)

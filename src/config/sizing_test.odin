@@ -250,29 +250,6 @@ test_cgroup_file_refuses_what_it_cannot_place :: proc(t: ^testing.T) {
 }
 
 /*
-A truncated pseudo-file is refused rather than parsed.
-
-"1073" of "10737418240" is a limit off by seven orders of magnitude and parses
-as cleanly as the whole of it, so a buffer that filled has to be read as a file
-this did not understand.
-*/
-@(test)
-test_read_small_file_refuses_a_truncated_read :: proc(t: ^testing.T) {
-	// /proc/self/cmdline is longer than one byte and, unlike /sys, is here on
-	// every machine the tests run on.
-	tiny: [1]u8
-	_, ok := read_small_file("/proc/self/cmdline", tiny[:])
-	testing.expect(t, !ok, "a value that did not fit should be refused")
-
-	roomy: [4096]u8
-	_, ok = read_small_file("/proc/self/cmdline", roomy[:])
-	testing.expect(t, ok, "a value that fits should be read")
-
-	_, ok = read_small_file("/proc/elodin-does-not-exist", roomy[:])
-	testing.expect(t, !ok, "a missing file is not a limit")
-}
-
-/*
 The machine this test is running on, whatever it is, has to produce usable
 sizes. The exact numbers are not the assertion - they are the machine's - but
 the bounds are.

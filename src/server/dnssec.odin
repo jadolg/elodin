@@ -210,7 +210,7 @@ start_validator :: proc(s: ^Server, l: ^Live) -> bool {
 	// `elodin_dnssec_queries_shed_total` rise is being told to raise, and
 	// `config.derive_chain_walks` usually picked it rather than the file. Read
 	// back off the validator rather than off the configuration: a validator
-	// built from a configuration that never went through `config.validate` -
+	// built from a configuration that never went through `config.load_string` -
 	// which is every one the tests assemble by hand - substitutes its own
 	// default, and a log line naming a number nothing is using is worse than no
 	// line at all.

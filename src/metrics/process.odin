@@ -159,28 +159,20 @@ stat_u64 :: proc(fields: []string, n: int) -> (value: u64, ok: bool) {
 }
 
 /*
-Split on spaces into a caller-supplied slice, stopping when it is full.
+Split on whitespace into a caller-supplied slice, stopping when it is full.
 
-`strings.fields` would do this and allocate to do it. Everything here is read
-under a scrape that must not be able to disturb the process it is measuring, so
-the whole of this file works out of stack buffers and takes nothing from an
-allocator a query might be waiting on.
+`strings.fields_iterator` rather than `strings.fields`, which allocates: a scrape
+must not be able to disturb the process it is measuring, so this file works out
+of stack buffers and takes nothing from an allocator a query might be waiting on.
 */
 @(private)
 split_fields :: proc(text: string, out: []string) -> (count: int) {
-	i := 0
-	for i < len(text) && count < len(out) {
-		for i < len(text) && text[i] == ' ' {
-			i += 1
-		}
-		start := i
-		for i < len(text) && text[i] != ' ' {
-			i += 1
-		}
-		if i == start {
+	rest := text
+	for field in strings.fields_iterator(&rest) {
+		if count == len(out) {
 			break
 		}
-		out[count] = text[start:i]
+		out[count] = field
 		count += 1
 	}
 	return
@@ -253,17 +245,20 @@ is_dot_entry :: proc(entry: ^posix.dirent) -> bool {
 /*
 Read a small pseudo-file into a caller-supplied buffer.
 
-The same shape, and for the same reason, as `read_small_file` in
-`config/sizing.odin`: `/proc` reports a size of zero, so the read-the-whole-file
-path cannot size a buffer from it and grows one on the heap instead, and a
-buffer that filled completely means the file was cut short - here that would be
-a stat line missing its tail, which is the half that holds the memory figures.
+`/sys` and `/proc` files report a size of zero, so the read-the-whole-file path
+cannot size a buffer from them and grows one on the heap instead. Everything
+read here is a line or two, so a stack buffer covers it: the scrape takes
+nothing from an allocator a query might be waiting on, and the config loader's
+cgroup and memory probes stay free of allocations it would have to own. This
+package imports only `core`, so the loader can share it.
 
-Kept here rather than shared with the config loader so that this package depends
-on nothing: it is read by the one thread that must never be waiting on anything
-a query holds.
+Read to the end rather than trusting one `read`, and refuse a buffer that filled
+completely: half of "10737418240" is "1073", which parses as cleanly as the whole
+of it and would be a limit off by seven orders of magnitude, and a stat line
+missing its tail has lost the half that holds the memory figures. Nothing read
+here is long enough for that to bind, so a truncation means something is not the
+file this expected, and no figure is a better answer than a wrong one.
 */
-@(private)
 read_small_file :: proc(path: string, buf: []u8) -> (text: string, ok: bool) {
 	f, err := os.open(path)
 	if err != nil {
@@ -275,6 +270,10 @@ read_small_file :: proc(path: string, buf: []u8) -> (text: string, ok: bool) {
 	for n < len(buf) {
 		got, read_err := os.read(f, buf[n:])
 		n += got
+		// The end of the file arrives as `io.EOF` rather than a zero-length
+		// read, so it has to be named: treating every error as a failure would
+		// throw away the bytes that were read, and treating every error as the
+		// end would accept a file that stopped halfway through a number.
 		if read_err == io.Error.EOF {
 			break
 		}

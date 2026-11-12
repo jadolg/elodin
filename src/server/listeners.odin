@@ -407,9 +407,9 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 		return false
 	}
 	// Both guards are for a `Listeners` built by hand rather than loaded from a
-	// file - the tests do that. A loaded configuration has been through
-	// `validate`, which derives the reader count and refuses a receive buffer
-	// outside its bounds, so neither branch is reachable from a running server.
+	// file - the tests do that. A loaded configuration has had its reader count
+	// derived and a receive buffer outside its bounds refused, so neither branch
+	// is reachable from a running server.
 	readers := max(cfg.readers, 1)
 	buffer := cfg.receive_buffer if cfg.receive_buffer > 0 else config.DEFAULT_UDP_RECEIVE_BUFFER
 
