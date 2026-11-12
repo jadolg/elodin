@@ -259,7 +259,7 @@ types_deny :: proc(types: []u8, qname: string, qtype: dns.Type) -> bool {
 	}
 	// NS but no SOA belongs to the parent side of a zone cut, so it says
 	// nothing about the type at the child.
-	if qtype != .DS && bitmap_has(types, .NS) && !bitmap_has(types, .SOA) {
+	if qtype != .DS && !types_no_cut(types) {
 		return false
 	}
 	// And the converse: SOA set is the child's own apex, which says nothing

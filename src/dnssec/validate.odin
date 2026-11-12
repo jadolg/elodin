@@ -779,14 +779,14 @@ an attacker chose; the genuine one is what it would keep out.
 
 Counted across the question instead, and spent only on signatures that could
 actually verify - see `signature_worth_trying`, which refuses the rest for
-nothing. Every verification a question can reach comes from here, at four call
+nothing. Every verification a question can reach comes from here, at three call
 sites: `validate_rrset` for an answer's own RRsets, `verified_rrset` for a
-denial's proof, the RRSIGs over a DS set in `zone_step`, and the RRSIGs over a
-DNSKEY set in `fetch_keys`. The last two come out of a response, so the
-length of their signature list is whoever answered the lookup's to choose, and
-`MAX_LOOKUPS_PER_QUERY` allows 32 such lookups per question (#193).
+denial's proof and for the DS set and CNAME `zone_step` reads, and the RRSIGs
+over a DNSKEY set in `fetch_keys`. The chain walk's sets come out of a response,
+so the length of their signature list is whoever answered the lookup's to
+choose, and `MAX_LOOKUPS_PER_QUERY` allows 32 such lookups per question (#193).
 
-One budget for all four, so no path keeps a private allowance that can be
+One budget for all three, so no path keeps a private allowance that can be
 emptied on its own - and so the chain walk shares what it spends with the
 answer. That is deliberate, and it costs something: a padded DS set early in a
 walk can exhaust what a later step needs and leave a resolvable name
@@ -3521,8 +3521,9 @@ Check one RRset against keys that are already in hand.
 
 The zone is named by the caller rather than taken from the signature, so this
 answers "did this zone sign this" and not "did somebody sign this". Every use is
-in an authority section that has already been placed in a zone, where a signer
-of the response's own choosing is precisely what must not be believed.
+a set already placed in a zone - a denial's records in an authority section, or
+the DS set and CNAME a parent answers `zone_step` with - where a signer of the
+response's own choosing is precisely what must not be believed.
 
 The attempts are bounded the way `validate_rrset` bounds them, which is not a
 per-RRset cap: both spend the query-wide
