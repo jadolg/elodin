@@ -65,7 +65,7 @@ TRACKER :: "tracker.evil.test."
 @(private = "file")
 asks_qname :: proc(query: []u8) -> bool {
 	q, ok := dns.peek_question(query, context.temp_allocator)
-	return ok && dns.name_equal_fold(q.name, QNAME) && q.type == .A
+	return ok && dns.name_equal_fold(q.name, QNAME) && q.type == .A && q.class == .IN
 }
 
 @(private = "file")

@@ -60,16 +60,30 @@ Not zero milliseconds: `SO_RCVTIMEO` reads zero as "no timeout", which on a sock
 nothing is going to send to is the one value that hangs. `nothing_reached` in
 special_use_test.odin is this same reading, kept there because it also wants the
 question the leaked query asked.
+
+With `query`, only a datagram asking its question counts, and any other is
+skipped as `Canned_Mock` skips it: for a socket whose port may have been another
+case's a moment ago, whose server can still be retrying to it.
 */
 @(private)
-mock_untouched :: proc(socket: net.UDP_Socket) -> bool {
+mock_untouched :: proc(socket: net.UDP_Socket, query: []u8 = nil) -> bool {
 	_ = net.set_option(socket, .Receive_Timeout, 20 * time.Millisecond)
 	// Left as the harnesses set it, so a fixture socket can be read this way in
 	// the middle of a test that goes on to expect an exchange.
 	defer _ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	buf: [4096]u8
-	n, _, err := net.recv_udp(socket, buf[:])
-	return err != nil || n == 0
+	for {
+		n, _, err := net.recv_udp(socket, buf[:])
+		if err != nil {
+			return true
+		}
+		if query == nil {
+			return n == 0
+		}
+		if dns.same_question(buf[:n], query) {
+			return false
+		}
+	}
 }
 
 /*
@@ -156,8 +170,8 @@ A server forwarding to one mock upstream on loopback.
 caller keeps the harness where it put it, and changes `cfg` in place - turning
 blocking on, say - between `harness_start` and the first query.
 
-The cache, when there is one, is sized from `cfg` rather than with a literal,
-and `negative_ttl` is the reason: a cache made without one stores no denial at
+The cache, when there is one, takes its TTL bounds from `cfg` rather than from
+literals, and `negative_ttl` is the reason: a cache made without one stores no denial at
 all, so a case about what is or is not remembered could not fail.
 */
 @(private)
