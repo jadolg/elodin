@@ -351,6 +351,9 @@ below what the count alone would allow.
 */
 DEFAULT_MAX_BYTES :: 64 * 1024 * 1024
 
+// The longest any entry lives when `Options.max_ttl` is zero: a day.
+DEFAULT_MAX_TTL :: 86400
+
 Options :: struct {
 	max_entries:  int,
 	max_bytes:    int,
@@ -544,7 +547,7 @@ apply_options :: proc(c: ^Cache, opts: Options) {
 	// The three lifetimes and the byte budget atomically: `put` reads them
 	// before it takes a lock, and `ttl_ceiling` without one.
 	sync.atomic_store(&c.min_ttl, opts.min_ttl)
-	sync.atomic_store(&c.max_ttl, opts.max_ttl if opts.max_ttl > 0 else 86400)
+	sync.atomic_store(&c.max_ttl, opts.max_ttl if opts.max_ttl > 0 else DEFAULT_MAX_TTL)
 	sync.atomic_store(&c.negative_ttl, opts.negative_ttl)
 	c.serve_stale = opts.serve_stale
 	c.prefetch = opts.prefetch
@@ -624,7 +627,7 @@ destroy :: proc(c: ^Cache) {
 }
 
 // Longest key `make_key` builds: a presentation name plus `KEY_TAIL`.
-KEY_MAX :: 1024 + 16
+KEY_MAX :: dns.MAX_NAME_PRESENTATION + KEY_TAIL
 // What follows the name in a key: type, class, the three flags and the policy number.
 KEY_TAIL :: 15
 
@@ -679,16 +682,8 @@ make_key :: proc(
 	verdict := false,
 	policy: u64 = 0,
 ) -> string {
-	n := 0
-	limit := len(buf) - KEY_TAIL
-	for i in 0 ..< len(name) {
-		if n >= limit {
-			break
-		}
-		c := name[i]
-		buf[n] = c + 32 if c >= 'A' && c <= 'Z' else c
-		n += 1
-	}
+	folded, _ := dns.fold_into(name[:min(len(name), len(buf) - KEY_TAIL)], buf)
+	n := len(folded)
 	buf[n] = u8(u16(type) >> 8)
 	buf[n + 1] = u8(u16(type))
 	buf[n + 2] = u8(u16(class) >> 8)

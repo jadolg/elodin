@@ -117,15 +117,12 @@ w_name :: proc(w: ^Writer, name: string, compress := true) -> Encode_Error {
 	}
 
 	base := len(w.buf)
+	// Folded once: every suffix tried below is a suffix of the whole name.
+	fold_into(string(tmp), w.fold_buf[:])
 	// The last entry is the root label; a 1-byte root beats a 2-byte pointer.
 	for i in 0 ..< max(0, len(w.offsets) - 1) {
 		off := w.offsets[i]
-		suffix := tmp[off:n]
-		for k in 0 ..< len(suffix) {
-			c := suffix[k]
-			w.fold_buf[k] = c + 32 if c >= 'A' && c <= 'Z' else c
-		}
-		folded := w.fold_buf[:len(suffix)]
+		folded := w.fold_buf[off:n]
 		key := hash.fnv64a(folded)
 
 		if target, found := w.comp[key]; found {
@@ -295,7 +292,7 @@ w_record :: proc(w: ^Writer, rec: Record) -> Encode_Error {
 		the worse thing to hand out - but it is a whole answer, not a degraded
 		one.
 		*/
-		if raw_rdata_holds_pointer(rec.type, d.data) {
+		if layout, known := raw_rdata_layout(rec.type, d.data); known && raw_rdata_holds_pointer(layout, d.data) {
 			return .Bad_Rdata
 		}
 		w_bytes(w, d.data)

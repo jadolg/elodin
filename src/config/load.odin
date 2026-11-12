@@ -6,6 +6,7 @@ import "core:net"
 import "core:os"
 import "core:strings"
 import "core:time"
+import "elodin:cache"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:h2"
@@ -1608,10 +1609,10 @@ load_cache :: proc(l: ^Loader, cfg: ^Config) {
 	wrote: the default is below any `max_ttl` worth setting, and a file from
 	before this key existed that caps entries under it has nothing here to be
 	wrong about - its entries are all short, and short ones are left to expire.
-	Zero `max_ttl` is the cache's own ceiling of a day (`cache.make_cache`),
+	Zero `max_ttl` is the cache's own ceiling of a day (`cache.DEFAULT_MAX_TTL`),
 	which a threshold can be above too.
 	*/
-	ceiling := cfg.cache.max_ttl if cfg.cache.max_ttl > 0 else 86400
+	ceiling := cfg.cache.max_ttl if cfg.cache.max_ttl > 0 else cache.DEFAULT_MAX_TTL
 	if cfg.cache.enabled &&
 	   cfg.cache.prefetch &&
 	   !yaml.is_null(yaml.get(n, "prefetch_min_ttl")) &&

@@ -241,18 +241,28 @@ name_fold :: proc(name: string, allocator := context.allocator) -> (folded: stri
 	if !built {
 		return "", .Out_Of_Memory
 	}
-	copy(buf, name)
-	fold_ascii(buf)
+	fold_into(name, buf)
 	return string(buf), nil
 }
 
-@(private)
-fold_ascii :: proc "contextless" (b: []u8) {
-	for &c in b {
-		if c >= 'A' && c <= 'Z' {
-			c += 32
-		}
+/*
+`name` with ASCII A-Z lowered (RFC 4343) into `buf`, which may be `name`'s own
+bytes; false where `buf` is too short for it. Every other byte is copied as it
+stands, so a UTF-8 or escaped byte is never folded. Allocates nothing.
+*/
+fold_into :: proc "contextless" (name: string, buf: []u8) -> (folded: string, ok: bool) {
+	if len(name) > len(buf) {
+		return "", false
 	}
+	for i in 0 ..< len(name) {
+		buf[i] = fold_byte(name[i])
+	}
+	return string(buf[:len(name)]), true
+}
+
+@(private)
+fold_byte :: #force_inline proc "contextless" (c: u8) -> u8 {
+	return c + 32 if c >= 'A' && c <= 'Z' else c
 }
 
 name_equal_fold :: proc(a, b: string) -> bool {
@@ -260,14 +270,7 @@ name_equal_fold :: proc(a, b: string) -> bool {
 		return false
 	}
 	for i in 0 ..< len(a) {
-		x, y := a[i], b[i]
-		if x >= 'A' && x <= 'Z' {
-			x += 32
-		}
-		if y >= 'A' && y <= 'Z' {
-			y += 32
-		}
-		if x != y {
+		if fold_byte(a[i]) != fold_byte(b[i]) {
 			return false
 		}
 	}
@@ -376,13 +379,13 @@ name_canonical :: proc(name: string, allocator := context.allocator) -> (canonic
 			return "", false
 		}
 		if derr == .None {
-			fold_ascii(transmute([]u8)spelled)
+			fold_into(spelled, transmute([]u8)spelled)
 			return spelled, true
 		}
 	}
 	buf := alloc_slice([]u8, len(trimmed) + 1, allocator) or_return
 	copy(buf, trimmed)
 	buf[len(trimmed)] = '.'
-	fold_ascii(buf)
+	fold_into(string(buf), buf)
 	return string(buf), true
 }

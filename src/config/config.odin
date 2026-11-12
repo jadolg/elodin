@@ -2,6 +2,7 @@ package config
 
 import "core:encoding/hex"
 import "core:time"
+import "elodin:cache"
 
 Log_Level :: enum u8 {
 	Debug,
@@ -1196,9 +1197,9 @@ default_config :: proc() -> Config {
 	c.cache = Cache_Config {
 		enabled       = true,
 		max_entries   = 10000,
-		max_bytes     = 64 * 1024 * 1024,
+		max_bytes     = cache.DEFAULT_MAX_BYTES,
 		min_ttl       = 0,
-		max_ttl       = 86400,
+		max_ttl       = cache.DEFAULT_MAX_TTL,
 		negative_ttl  = 300,
 		serve_stale   = false,
 		// RFC 8767 section 5's recommended client response timer. It costs

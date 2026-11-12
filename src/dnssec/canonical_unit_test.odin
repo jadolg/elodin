@@ -262,6 +262,43 @@ test_raw_rdata_downcasing_walks_the_layout :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+/*
+The decoder walks names in more types than a signer lowercases
+(`dns.raw_rdata_layout` against `downcases_rdata_names`). The rest are copied as
+they arrived: NSEC's next name (RFC 6840 section 5.1), NSAP-PTR and HIP, which
+RFC 4034 section 6.2 does not list, an RRSIG's signer, and A6, which has no
+layout to walk.
+*/
+@(test)
+test_raw_rdata_off_the_lowercasing_list_is_copied_verbatim :: proc(t: ^testing.T) {
+	out := make([dynamic]u8, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	name := []u8{7, 'E', 'X', 'A', 'M', 'P', 'L', 'E', 0}
+	rrsig := make([dynamic]u8, context.temp_allocator)
+	append(&rrsig, ..make([]u8, 18, context.temp_allocator))
+	append(&rrsig, ..name)
+	append(&rrsig, 0xde, 0xad)
+	cases := []struct {
+		type:  dns.Type,
+		rdata: []u8,
+	} {
+		{.NSEC, []u8{7, 'E', 'X', 'A', 'M', 'P', 'L', 'E', 0, 0, 1, 0x40}},
+		{.NSAP_PTR, name},
+		{.HIP, []u8{1, 1, 0, 1, 0xaa, 0xbb, 7, 'E', 'X', 'A', 'M', 'P', 'L', 'E', 0}},
+		{.RRSIG, rrsig[:]},
+		{.A6, []u8{0, 7, 'E', 'X', 'A', 'M', 'P', 'L', 'E', 0}},
+	}
+	for c in cases {
+		clear(&out)
+		write_downcased_raw(&out, c.type, c.rdata)
+		testing.expectf(t, mem.compare(out[:], c.rdata) == 0, "%v was rewritten", c.type)
+	}
+	// The premise: the same name in a type on the list is lowered.
+	clear(&out)
+	write_downcased_raw(&out, .CNAME, name)
+	expect_hex(t, out[:], "076578616d706c6500", "a raw CNAME")
+}
+
 @(test)
 test_raw_rdata_is_copied_verbatim_when_it_cannot_be_walked :: proc(t: ^testing.T) {
 	/*
