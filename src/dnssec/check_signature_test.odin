@@ -359,9 +359,6 @@ test_check_signature_refuses_a_consistent_wildcard_above_the_signing_zone :: pro
 @(private = "file")
 cs_colliding :: proc(decoys: int) -> []Dnskey {
 	real := ed25519_key()
-	if len(real) != 1 {
-		return nil
-	}
 	keys := make([dynamic]Dnskey, 0, decoys + 1, context.temp_allocator)
 	for i in 0 ..< decoys {
 		// The same tag, algorithm and flags as the key that signed - only the

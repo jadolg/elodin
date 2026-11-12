@@ -414,7 +414,7 @@ cd_validate :: proc(key: string, unreachable: ^string = nil, edit: proc(msg: ^dn
 	v := make_validator(cd_query, unreachable, Options{anchors = fixture_anchors(CD_ANCHOR)})
 	defer destroy_validator(v)
 	f := fixture(key, CD_FIXTURES)
-	reply := scenario_fixture(CD_FIXTURES, key)
+	reply := unhex(f.wire)
 	if edit != nil {
 		msg, derr := dns.decode_message(reply, context.temp_allocator)
 		if derr != .None {

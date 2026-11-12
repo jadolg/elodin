@@ -61,21 +61,7 @@ holds :: proc(records: []dns.Record, name: string, type: dns.Type) -> bool {
 // because one owner carries signatures over several types at once and "an
 // RRSIG survived" would be answered by any of them.
 holds_signature_over :: proc(records: []dns.Record, name: string, covered: dns.Type) -> int {
-	found := 0
-	for rec in records {
-		if rec.type != .RRSIG || !dns.name_equal_fold(rec.name, name) {
-			continue
-		}
-		rdata, is_raw := raw_rdata(rec)
-		if !is_raw {
-			continue
-		}
-		sig, err := parse_rrsig(rdata, context.temp_allocator)
-		if err == .None && sig.type_covered == covered {
-			found += 1
-		}
-	}
-	return found
+	return len(sigs_covering(records, name, covered, .IN, context.temp_allocator))
 }
 
 // Every name in `names` owns its own slot of `v`'s non-cut table, so a test that
@@ -91,10 +77,11 @@ expect_distinct_non_cut_slots :: proc(t: ^testing.T, v: ^Validator, names: []str
 		}
 		return non_cut_slot(v, key)
 	}
+	slots := make([]int, len(names), context.temp_allocator)
 	for name, i in names {
-		slot := slot_of(v, name)
-		for other in names[:i] {
-			testing.expectf(t, slot_of(v, other) != slot, "%s and %s share non-cut slot %d", name, other, slot)
+		slots[i] = slot_of(v, name)
+		for other, j in names[:i] {
+			testing.expectf(t, slots[j] != slots[i], "%s and %s share non-cut slot %d", name, other, slots[i])
 		}
 	}
 }
@@ -132,11 +119,12 @@ rrsig_record :: proc(owner: string, sig: Rrsig, ttl := u32(300)) -> dns.Record {
 		panic("cannot encode the signer")
 	}
 	out := make([dynamic]u8, 0, RRSIG_SIGNER + n + len(sig.signature), context.temp_allocator)
-	append(&out, u8(u16(sig.type_covered) >> 8), u8(u16(sig.type_covered)), sig.algorithm, sig.labels)
-	for v in ([3]u32{sig.original_ttl, sig.expiration, sig.inception}) {
-		append(&out, u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v))
-	}
-	append(&out, u8(sig.key_tag >> 8), u8(sig.key_tag))
+	append_u16(&out, u16(sig.type_covered))
+	append(&out, sig.algorithm, sig.labels)
+	append_u32(&out, sig.original_ttl)
+	append_u32(&out, sig.expiration)
+	append_u32(&out, sig.inception)
+	append_u16(&out, sig.key_tag)
 	append(&out, ..name[:n])
 	append(&out, ..sig.signature)
 	return dns.Record{name = owner, type = .RRSIG, class = .IN, ttl = ttl, data = dns.Rdata_Raw{data = out[:]}}
@@ -147,7 +135,7 @@ RRSIG_ORIGINAL_TTL :: 4
 RRSIG_EXPIRATION :: 8
 RRSIG_INCEPTION :: 12
 RRSIG_KEY_TAG :: 16
-RRSIG_SIGNER :: 18
+RRSIG_SIGNER :: RRSIG_FIXED_PREFIX
 
 /*
 What `rrsig_mutant` changes in a copy of a genuine signature:
@@ -267,10 +255,12 @@ scenario_fixture :: proc(fixtures: []Fixture, key: string) -> []u8 {
 }
 
 // The reply `fixtures` holds for a lookup, the way an upstream would answer it.
+// No fixture is no answer; a fixture that is not hex is a broken test, so it
+// panics rather than read as an upstream that never replied.
 fixture_answer :: proc(fixtures: []Fixture, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
 	for f in fixtures {
 		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return decode_hex(f.wire, allocator)
+			return unhex(f.wire, allocator), true
 		}
 	}
 	return nil, false

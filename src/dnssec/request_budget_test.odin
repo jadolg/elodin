@@ -33,7 +33,6 @@ ordinary_reply :: proc(name: string, type: dns.Type) -> []u8 {
 	return wire
 }
 
-
 /*
 A response this server had no allowance left to read is undecided, not forged.
 

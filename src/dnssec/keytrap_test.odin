@@ -150,8 +150,8 @@ kt_pad :: proc(wire: []u8, pad: Padding, allocator: mem.Allocator) -> []u8 {
 }
 
 // The fixture chain, with whatever tampering `ctx` names applied on the way
-// out. A nil `ctx` serves the fixtures untouched, which is the baseline the
-// free-reject tests compare against.
+// out. A nil `ctx`, or one naming no padding, serves the fixtures untouched,
+// which is the baseline the free-reject tests compare against.
 @(private = "file")
 kt_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
 	raw, ok := fixture_answer(FIXTURES, name, type, allocator)
