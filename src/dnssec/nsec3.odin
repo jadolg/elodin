@@ -441,7 +441,6 @@ nsec3_hash_of :: proc(name: string, rr: Nsec3, budget: ^Nsec3_Budget) -> (hash: 
 		if kept.have &&
 		   kept.name == name &&
 		   kept.iterations == rr.iterations &&
-		   len(kept.salt) == len(rr.salt) &&
 		   mem.compare(kept.salt, rr.salt) == 0 {
 			return kept.hash[:], true
 		}
@@ -487,10 +486,7 @@ nsec3_covering :: proc(n3s: []Nsec3_Rr, name: string, budget: ^Nsec3_Budget) -> 
 	for n in n3s {
 		h, ok := nsec3_hash_of(name, n.rr, budget)
 		if !ok {
-			// Not `break`, even once the allowance is gone: a record whose
-			// hash is one of the kept ones still answers for free, and giving
-			// up at the first refusal would let the order the records arrive
-			// in decide the verdict.
+			// Not `break`; see `nsec3_matching`.
 			continue
 		}
 		// Both ends of the span must be the width of the hash we computed, or
@@ -687,13 +683,7 @@ NSEC3 records for delegations it does not sign.
 */
 nsec3_proves_no_ds :: proc(n3s: []Nsec3_Rr, name, zone: string, budget: ^Nsec3_Budget) -> Proof {
 	if match, found := nsec3_matching(n3s, name, budget); found {
-		if bitmap_has(match.rr.types, .DS) || bitmap_has(match.rr.types, .SOA) {
-			return .Failed
-		}
-		if !bitmap_has(match.rr.types, .NS) {
-			return .Failed
-		}
-		return .Proven
+		return .Proven if types_unsigned_delegation(match.rr.types) else .Failed
 	}
 
 	_, next_closer, _, ok := nsec3_closest_encloser(n3s, name, zone, budget)
@@ -727,7 +717,7 @@ nsec3_proves_no_delegation :: proc(
 	matched: bool,
 ) {
 	if match, found := nsec3_matching(n3s, name, budget); found {
-		return !bitmap_has(match.rr.types, .NS) || bitmap_has(match.rr.types, .SOA), true
+		return types_no_cut(match.rr.types), true
 	}
 	// Opt-out spans prove nothing about what they cover, so they cannot rule a
 	// delegation out.

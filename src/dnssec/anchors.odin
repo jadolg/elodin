@@ -60,7 +60,7 @@ usable_anchor :: proc(anchors: []Trust_Anchor, zone: string) -> bool {
 		if !dns.name_equal_fold(anchor.zone, zone) {
 			continue
 		}
-		if algorithm_supported(anchor.ds.algorithm) && digest_supported(anchor.ds.digest_type) {
+		if ds_usable(anchor.ds) {
 			return true
 		}
 	}

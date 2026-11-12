@@ -140,10 +140,36 @@ Unbound refuses both in `nsec3_prove_closest_encloser`.
 */
 @(private)
 types_enclose :: proc(types: []u8) -> bool {
-	if bitmap_has(types, .DNAME) {
-		return false
-	}
+	return !bitmap_has(types, .DNAME) && types_no_cut(types)
+}
+
+// No zone cut at the record's owner: NS clear, or SOA beside it, which is the
+// zone's own apex rather than its parent's side of a cut (RFC 6840 section 4.1).
+@(private)
+types_no_cut :: proc(types: []u8) -> bool {
 	return !bitmap_has(types, .NS) || bitmap_has(types, .SOA)
+}
+
+/*
+An unsigned delegation at the record's owner (RFC 4035 section 5.2, RFC 5155
+section 8.9): NS set, DS clear, and SOA clear, since a record with SOA is the
+child's own apex and not its parent's delegation to it.
+*/
+@(private)
+types_unsigned_delegation :: proc(types: []u8) -> bool {
+	return bitmap_has(types, .NS) && !bitmap_has(types, .DS) && !bitmap_has(types, .SOA)
+}
+
+/*
+The closest encloser a span covering `qname` shows (RFC 4035 section 5.4): the
+deepest ancestor of `qname` that the span shows to exist, which is whichever of
+its two ends shares more with `qname`.
+*/
+@(private)
+nsec_encloser :: proc(qname: string, covering: Nsec_Rr) -> string {
+	from_owner := common_ancestor(qname, covering.owner)
+	from_next := common_ancestor(qname, covering.rr.next)
+	return from_owner if label_count(from_owner) >= label_count(from_next) else from_next
 }
 
 @(private)
@@ -174,14 +200,7 @@ nsec_proves_name_error :: proc(nsecs: []Nsec_Rr, qname: string, allocator := con
 		return .Failed
 	}
 
-	// The closest encloser is the deepest ancestor of qname that the covering
-	// span shows to exist, which is whichever of its two ends shares more with
-	// qname.
-	from_owner := common_ancestor(qname, covering.owner)
-	from_next := common_ancestor(qname, covering.rr.next)
-	encloser := from_owner if label_count(from_owner) >= label_count(from_next) else from_next
-
-	wildcard := wildcard_of(encloser, allocator)
+	wildcard := wildcard_of(nsec_encloser(qname, covering), allocator)
 	// And the same of the record that swallows the wildcard: a delegation's
 	// span reaches `*.<child>` as readily as anything else under the cut.
 	wc, covered := nsec_covering(nsecs, wildcard)
@@ -274,11 +293,7 @@ nsec_proves_no_data :: proc(
 	if nsec_shows_node(nsecs, qname) {
 		return .Proven
 	}
-	from_owner := common_ancestor(qname, covering.owner)
-	from_next := common_ancestor(qname, covering.rr.next)
-	encloser := from_owner if label_count(from_owner) >= label_count(from_next) else from_next
-
-	wildcard, wfound := nsec_matching(nsecs, wildcard_of(encloser, allocator))
+	wildcard, wfound := nsec_matching(nsecs, wildcard_of(nsec_encloser(qname, covering), allocator))
 	if !wfound {
 		return .Failed
 	}
@@ -293,17 +308,7 @@ trust there. Everything else means the records did not establish that, and the
 caller must not treat the subtree as insecure on their say-so.
 */
 nsec_proves_no_ds :: proc(nsecs: []Nsec_Rr, name: string) -> Proof {
-	if match, found := nsec_matching(nsecs, name); found {
-		if bitmap_has(match.rr.types, .DS) {
-			return .Failed
-		}
-		if bitmap_has(match.rr.types, .SOA) {
-			// The apex of the zone itself, not a delegation from its parent.
-			return .Failed
-		}
-		if !bitmap_has(match.rr.types, .NS) {
-			return .Failed
-		}
+	if match, found := nsec_matching(nsecs, name); found && types_unsigned_delegation(match.rr.types) {
 		return .Proven
 	}
 	return .Failed
@@ -318,7 +323,7 @@ rather than declare the subtree insecure.
 */
 nsec_proves_no_delegation :: proc(nsecs: []Nsec_Rr, name: string) -> bool {
 	if match, found := nsec_matching(nsecs, name); found {
-		return !bitmap_has(match.rr.types, .NS) || bitmap_has(match.rr.types, .SOA)
+		return types_no_cut(match.rr.types)
 	}
 	// The name does not exist, so nothing is delegated at it - unless the
 	// record saying so is the parent's own at a cut above, which speaks for
@@ -394,16 +399,6 @@ base32hex_decode :: proc(text: string, out: []u8) -> (n: int, ok: bool) {
 
 // The leftmost label of a presentation-form name.
 first_label :: proc(name: string) -> string {
-	i := 0
-	for i < len(name) {
-		if name[i] == '\\' {
-			i += 2
-			continue
-		}
-		if name[i] == '.' {
-			return name[:i]
-		}
-		i += 1
-	}
-	return name
+	off, ok := label_offset(name, 1)
+	return name[:off - 1] if ok else name
 }
