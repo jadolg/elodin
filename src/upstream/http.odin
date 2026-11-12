@@ -82,7 +82,13 @@ stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}, idle := tim
 
 /*
 How long the next read may wait, on whichever half the stream reads through.
-Never less than a millisecond: a zero `SO_RCVTIMEO` is no timeout at all.
+
+Never under a millisecond, and that is not rounding. `SO_RCVTIMEO` is a
+`timeval`, so core:net turns a duration under a microsecond into a zero one -
+which on Linux does not mean "expire at once" but "no timeout at all", and the
+read that was meant to be the shortest of all would be the one that never
+returned. A caller reaching here with a sliver of its deadline left is
+ordinary: a waiter that woke a hair before its own expiry.
 */
 stream_set_read_timeout :: proc(s: ^Stream, timeout: time.Duration) {
 	bounded := max(timeout, time.Millisecond)
@@ -93,7 +99,8 @@ stream_set_read_timeout :: proc(s: ^Stream, timeout: time.Duration) {
 	_ = net.set_option(s.socket, .Receive_Timeout, bounded)
 }
 
-// The same for the next write.
+// The same for the next write, with the same floor for the same reason:
+// `SO_SNDTIMEO` is a `timeval` too.
 stream_set_write_timeout :: proc(s: ^Stream, timeout: time.Duration) {
 	bounded := max(timeout, time.Millisecond)
 	if s.tls != nil {
@@ -373,8 +380,6 @@ Http_Request :: struct {
 	body:         []u8,
 	content_type: string,
 	accept:       string,
-	// Extra headers, already formatted as "Name: value" without CRLF.
-	extra:        []string,
 }
 
 // What `http_exchange` takes for a body unless told otherwise: a blocklist. A
@@ -456,10 +461,6 @@ http_exchange :: proc(
 		}
 		strings.write_string(&b, "Content-Length: ")
 		strings.write_int(&b, len(req.body))
-		strings.write_string(&b, "\r\n")
-	}
-	for h in req.extra {
-		strings.write_string(&b, h)
 		strings.write_string(&b, "\r\n")
 	}
 	strings.write_string(&b, "\r\n")

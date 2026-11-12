@@ -776,7 +776,7 @@ udp_loop :: proc(data: rawptr) {
 		reply that never gets built is charged for anyway, and a query that turns
 		out to be answerable from cache costs the same as one that is not.
 
-		The server cookie is read here and not left to the worker, because which
+		The server cookie is read here and not left to `udp_job`, because which
 		budget pays can depend on it: a datagram the datagram pool would refuse
 		is charged to a pool of its own if it proves its source, out of reach of
 		a flood spoofing the same prefix. See `datagram_rate_check`.

@@ -43,7 +43,6 @@ Kind :: enum u8 {
 
 Node :: struct {
 	kind:    Kind,
-	line:    int,
 	// Scalar payload. `quoted` suppresses the null/bool/number interpretation
 	// that bare scalars get, so "null" stays the string "null".
 	scalar:  string,
@@ -87,7 +86,7 @@ parse :: proc(src: string, allocator := context.allocator) -> (root: ^Node, err:
 	scan_lines(&p, src) or_return
 
 	if len(p.lines) == 0 {
-		return new_mapping(&p, 1), nil
+		return new_mapping(&p), nil
 	}
 	root = parse_block(&p, p.lines[0].indent)
 	if e, has := p.err.?; has {
@@ -337,31 +336,30 @@ strip_comment :: proc(s: string) -> string {
 }
 
 @(private)
-new_node :: proc(p: ^Parser, kind: Kind, line: int) -> ^Node {
+new_node :: proc(p: ^Parser, kind: Kind) -> ^Node {
 	n := new(Node, p.allocator)
 	n.kind = kind
-	n.line = line
 	return n
 }
 
 @(private)
-new_mapping :: proc(p: ^Parser, line: int) -> ^Node {
-	n := new_node(p, .Mapping, line)
+new_mapping :: proc(p: ^Parser) -> ^Node {
+	n := new_node(p, .Mapping)
 	n.keys = make([dynamic]string, 0, 8, p.allocator)
 	n.fields = make(map[string]^Node, 8, p.allocator)
 	return n
 }
 
 @(private)
-new_sequence :: proc(p: ^Parser, line: int) -> ^Node {
-	n := new_node(p, .Sequence, line)
+new_sequence :: proc(p: ^Parser) -> ^Node {
+	n := new_node(p, .Sequence)
 	n.seq = make([dynamic]^Node, 0, 8, p.allocator)
 	return n
 }
 
 @(private)
-new_scalar :: proc(p: ^Parser, value: string, quoted: bool, line: int) -> ^Node {
-	n := new_node(p, .Scalar, line)
+new_scalar :: proc(p: ^Parser, value: string, quoted: bool) -> ^Node {
+	n := new_node(p, .Scalar)
 	n.scalar = value
 	n.quoted = quoted
 	return n
@@ -373,7 +371,7 @@ fail :: proc(p: ^Parser, line: int, msg: string) -> ^Node {
 		p.err = Error{line, msg}
 	}
 	p.pos = len(p.lines)
-	return new_scalar(p, "", false, line)
+	return new_scalar(p, "", false)
 }
 
 @(private)
@@ -402,7 +400,7 @@ parse_block :: proc(p: ^Parser, indent: int) -> ^Node {
 		return fail(p, line, "too deeply nested")
 	}
 	if p.pos >= len(p.lines) {
-		return new_scalar(p, "", false, 0)
+		return new_scalar(p, "", false)
 	}
 	if is_sequence_entry(p.lines[p.pos].text) {
 		return parse_sequence(p, indent)
@@ -412,7 +410,7 @@ parse_block :: proc(p: ^Parser, indent: int) -> ^Node {
 
 @(private)
 parse_mapping :: proc(p: ^Parser, indent: int) -> ^Node {
-	node := new_mapping(p, p.lines[p.pos].num)
+	node := new_mapping(p)
 
 	for p.pos < len(p.lines) {
 		line := p.lines[p.pos]
@@ -455,7 +453,7 @@ parse_mapping :: proc(p: ^Parser, indent: int) -> ^Node {
 
 @(private)
 parse_sequence :: proc(p: ^Parser, indent: int) -> ^Node {
-	node := new_sequence(p, p.lines[p.pos].num)
+	node := new_sequence(p)
 
 	for p.pos < len(p.lines) {
 		line := p.lines[p.pos]
@@ -475,7 +473,7 @@ parse_sequence :: proc(p: ^Parser, indent: int) -> ^Node {
 			if p.pos < len(p.lines) && p.lines[p.pos].indent > indent {
 				append(&node.seq, parse_block(p, p.lines[p.pos].indent))
 			} else {
-				append(&node.seq, new_scalar(p, "", false, line.num))
+				append(&node.seq, new_scalar(p, "", false))
 			}
 			continue
 		}
@@ -525,7 +523,7 @@ parse_value :: proc(p: ^Parser, rest: string, indent: int, line_num: int) -> ^No
 		if p.pos < len(p.lines) && p.lines[p.pos].indent == indent && is_sequence_entry(p.lines[p.pos].text) {
 			return parse_sequence(p, indent)
 		}
-		return new_scalar(p, "", false, line_num)
+		return new_scalar(p, "", false)
 	}
 	if rest[0] == '|' || rest[0] == '>' {
 		return parse_block_scalar(p, rest, indent, line_num)
@@ -614,7 +612,7 @@ parse_block_scalar :: proc(p: ^Parser, header: string, indent: int, line_num: in
 			s = strings.concatenate({s, "\n"}, p.allocator)
 		}
 	}
-	return new_scalar(p, s, true, line_num)
+	return new_scalar(p, s, true)
 }
 
 @(private)
@@ -634,7 +632,7 @@ parse_flow_or_scalar :: proc(p: ^Parser, text: string, line_num: int) -> ^Node {
 		return fail(p, line_num, "malformed quoted scalar")
 	}
 	quoted := is_quoted(text)
-	return new_scalar(p, value, quoted, line_num)
+	return new_scalar(p, value, quoted)
 }
 
 @(private)
@@ -647,7 +645,7 @@ parse_flow :: proc(p: ^Parser, text: string, line_num: int) -> (node: ^Node, con
 	}
 	closing := byte(']') if text[0] == '[' else byte('}')
 	is_seq := text[0] == '['
-	node = new_sequence(p, line_num) if is_seq else new_mapping(p, line_num)
+	node = new_sequence(p) if is_seq else new_mapping(p)
 
 	// Entries are separated by exactly one `,`, and one may trail the last:
 	// `[,x]`, `[x,,y]` and `[[a] [b]]` are not YAML.
@@ -719,7 +717,7 @@ parse_flow :: proc(p: ^Parser, text: string, line_num: int) -> (node: ^Node, con
 				return nil, 0, false
 			}
 			quoted := is_quoted(item)
-			append(&node.seq, new_scalar(p, value, quoted, line_num))
+			append(&node.seq, new_scalar(p, value, quoted))
 		} else {
 			colon := find_key_colon(item) or_return
 			key, kbad := unquote_scalar(p, strings.trim_space(item[:colon]), line_num, flow = true, key = true)
@@ -751,7 +749,7 @@ parse_flow :: proc(p: ^Parser, text: string, line_num: int) -> (node: ^Node, con
 				return nil, 0, false
 			}
 			quoted := is_quoted(val_text)
-			node.fields[key] = new_scalar(p, value, quoted, line_num)
+			node.fields[key] = new_scalar(p, value, quoted)
 		}
 	}
 }

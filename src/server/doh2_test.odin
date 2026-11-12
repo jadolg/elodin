@@ -228,14 +228,14 @@ serve_one :: proc(
 	peer := H2_PEER,
 	requests := 1,
 ) -> Result {
-	handler_pool: Test_Loop
-	start_test_loop(&handler_pool)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	if refuse_starts {
-		loop.stop(handler_pool.loops[0])
+		loop.stop(tl.loops[0])
 	}
 	s := Server {
 		cfg          = cfg,
-		loops        = handler_pool.loops[:],
+		loops        = tl.loops[:],
 		limiter      = limiter,
 	}
 
@@ -279,7 +279,7 @@ serve_one :: proc(
 	sync.atomic_store(&gate.open, true)
 	h2.conn_wait_idle(hc)
 	h2.conn_unref(hc)
-	stop_test_loop(&handler_pool)
+	stop_test_loop(&tl)
 
 	return Result {
 		output = script.output,
@@ -301,7 +301,7 @@ request is never read, so it is neither answered nor counted.
 */
 @(test)
 test_doh2_a_held_connection_outside_the_allow_list_gets_403 :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
+	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()
@@ -365,7 +365,7 @@ which are wired up here. A shed request never gets that far, but a regression
 that queues it again should fail this test rather than crash it.
 */
 @(test)
-test_doh2_sheds_when_the_pool_backlog_is_full :: proc(t: ^testing.T) {
+test_doh2_sheds_when_max_pending_is_full :: proc(t: ^testing.T) {
 	/*
 	A started job is allocated on the connection's reader and released on the
 	request's own fiber, and in the server both run under the default heap
@@ -405,7 +405,7 @@ test_doh2_sheds_when_the_pool_backlog_is_full :: proc(t: ^testing.T) {
 // The shed is a limit, not a policy: with room under `max_pending` the same
 // request is started on a fiber of its own and answered there.
 @(test)
-test_doh2_queues_while_the_pool_has_room :: proc(t: ^testing.T) {
+test_doh2_queues_while_max_pending_has_room :: proc(t: ^testing.T) {
 	// See the note in the test above.
 	context.allocator = runtime.heap_allocator()
 
@@ -422,9 +422,9 @@ test_doh2_queues_while_the_pool_has_room :: proc(t: ^testing.T) {
 	testing.expect(
 		t,
 		strings.contains(answer, "not found"),
-		"the request was not answered by a worker",
+		"the request was not answered",
 	)
-	testing.expect(t, !strings.contains(answer, "503"), "an idle pool shed a request")
+	testing.expect(t, !strings.contains(answer, "503"), "an idle server shed a request")
 	// Also what says `wrote_a_body` can tell: this answer has one.
 	testing.expect(t, wrote_a_body(got.output[:]), "the 404 went out without its body")
 	testing.expect_value(t, got.dropped, u64(0))
@@ -441,13 +441,13 @@ over-budget request costs a HEADERS frame rather than a place in `max_pending`
 and a fiber of its own.
 
 The bucket is spent before the connection opens, which is what a client that has
-already been asking looks like. The pool is deliberately occupied and
+already been asking looks like. A query is deliberately held in flight and
 `max_pending` left wide: had the request been queued instead, it would still be
 pending for `queued` to find, and the answer would be 503 rather than 429.
 */
 @(test)
 test_doh2_refuses_a_request_over_the_rate_limit :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
+	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()
@@ -504,7 +504,7 @@ clients being served. The same argument `h2_shed` counts by, one step earlier.
 */
 @(test)
 test_doh2_rate_limit_charges_only_queries :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
+	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()
@@ -540,7 +540,7 @@ inflating the figure an operator reads as "this server cannot keep up".
 */
 @(test)
 test_doh2_shed_counts_only_queries :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
+	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()
@@ -574,7 +574,7 @@ checks the request's fiber answers by, so the two cannot come apart.
 */
 @(test)
 test_doh2_rate_limit_charges_only_well_formed_queries :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
+	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()
@@ -668,7 +668,7 @@ connection either, or the 404 is the free way to hold one.
 */
 @(test)
 test_doh2_only_a_question_keeps_the_connection :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_the_pool_backlog_is_full`.
+	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
 	context.allocator = runtime.heap_allocator()
 
 	cfg := config.default_config()

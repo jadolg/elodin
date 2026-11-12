@@ -91,16 +91,16 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	cfg.server.max_connections = 8
 	cfg.server.max_pending = 0
 
-	handler_pool: Test_Loop
-	start_test_loop(&handler_pool)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	s := Server {
 		cfg          = &cfg,
-		loops        = handler_pool.loops[:],
+		loops        = tl.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		testing.expect(t, false, "could not start the UDP listener")
 		return
 	}
@@ -109,22 +109,22 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 		server = &s,
 	}
 	// Every early return lets the held query go and tears down what started.
-	abandon :: proc(barrier: ^Barrier, l: ^Listeners, pool: ^Test_Loop) {
+	abandon :: proc(barrier: ^Barrier, l: ^Listeners, tl: ^Test_Loop) {
 		sync.atomic_store(&barrier.go, true)
 		stop_listeners(l)
-		stop_test_loop(pool)
+		stop_test_loop(tl)
 		destroy_listeners(l)
 	}
 	testing.expect(t, submit_query(&s, barrier_job, &barrier, 0) == .Accepted, "could not start the held query")
 	if !wait_until(barrier_started, &barrier, time.Second) {
-		abandon(&barrier, &l, &handler_pool)
+		abandon(&barrier, &l, &tl)
 		testing.expect(t, false, "the held query never started")
 		return
 	}
 
 	bound, berr := net.bound_endpoint(l.udp[0].socket)
 	if berr != nil {
-		abandon(&barrier, &l, &handler_pool)
+		abandon(&barrier, &l, &tl)
 		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
 		return
 	}
@@ -139,7 +139,7 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	if cerr != nil {
 		// No send and no close: the handle is zero, which under `odin test` can
 		// be another test's socket, since fd 0 is closed.
-		abandon(&barrier, &l, &handler_pool)
+		abandon(&barrier, &l, &tl)
 		testing.expectf(t, false, "cannot open a client socket: %v", cerr)
 		return
 	}
@@ -167,7 +167,7 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 
 	// Draining lets the held query finish.
 	sync.atomic_store(&barrier.go, true)
-	stop_test_loop(&handler_pool)
+	stop_test_loop(&tl)
 
 	destroy_listeners(&l)
 	testing.expect(t, l.udp == nil, "destroy_listeners left the readers behind")
@@ -224,22 +224,22 @@ test_a_connection_past_the_limit_is_counted :: proc(t: ^testing.T) {
 	// second arrives, without leaving a stuck fiber behind if it is not.
 	cfg.server.client_timeout = 5 * time.Second
 
-	handler_pool: Test_Loop
-	start_test_loop(&handler_pool)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	s := Server {
 		cfg          = &cfg,
-		loops        = handler_pool.loops[:],
+		loops        = tl.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		testing.expect(t, false, "could not start the TCP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		destroy_listeners(&l)
 	}
 
@@ -321,22 +321,22 @@ test_a_connection_over_its_prefix_share_is_refused :: proc(t: ^testing.T) {
 	cfg.server.max_connections_per_prefix = 1
 	cfg.server.client_timeout = 5 * time.Second
 
-	handler_pool: Test_Loop
-	start_test_loop(&handler_pool)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	s := Server {
 		cfg          = &cfg,
-		loops        = handler_pool.loops[:],
+		loops        = tl.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		testing.expect(t, false, "could not start the TCP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		destroy_listeners(&l)
 	}
 
@@ -409,22 +409,22 @@ test_a_connection_accepted_during_shutdown_is_dropped :: proc(t: ^testing.T) {
 	// the read below gives up, so EOF can only be the accept loop closing it.
 	cfg.server.client_timeout = 5 * time.Second
 
-	handler_pool: Test_Loop
-	start_test_loop(&handler_pool)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	s := Server {
 		cfg          = &cfg,
-		loops        = handler_pool.loops[:],
+		loops        = tl.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		testing.expect(t, false, "could not start the TCP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		destroy_listeners(&l)
 	}
 
@@ -856,22 +856,22 @@ test_a_drip_fed_message_is_reclaimed_at_the_deadline :: proc(t: ^testing.T) {
 	cfg.server.client_timeout = 400 * time.Millisecond
 	DRIP :: 150 * time.Millisecond
 
-	handler_pool: Test_Loop
-	start_test_loop(&handler_pool)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	s := Server {
 		cfg          = &cfg,
-		loops        = handler_pool.loops[:],
+		loops        = tl.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		testing.expect(t, false, "could not start the TCP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		destroy_listeners(&l)
 	}
 

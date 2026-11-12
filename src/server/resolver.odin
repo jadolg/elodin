@@ -4732,21 +4732,6 @@ rule_claims_name :: proc(rule: config.Rewrite) -> bool {
 	return false
 }
 
-@(private)
-find_rewrite :: proc(rules: []config.Rewrite, name: string) -> (rule: config.Rewrite, found: bool) {
-	i := find_rewrite_index(rules, name) or_return
-	return rules[i], true
-}
-
-/*
-The same search, reporting which rule won rather than what it says.
-
-`reverse.odin` needs the identity: a rule only gets to supply the PTR for its
-address if it is the rule that would answer its own name, and "the same domain"
-is not enough to decide that - a duplicated `domain:` is two rules with one name
-between them, and only the first of them is ever reached. Both callers go
-through one loop so that the precedence cannot be described twice and drift.
-*/
 // Whether `rule` makes the name an alias. `answers_agree` in the loader keeps a
 // CNAME from sharing a rule with any record, so this is a property of the whole
 // rule rather than of one answer. See `apply_rewrite`.
@@ -4760,6 +4745,17 @@ rule_holds_alias :: proc(rule: config.Rewrite) -> bool {
 	return false
 }
 
+/*
+The first rule from `from` on whose domain matches `name`, by index rather than
+by what it says.
+
+`reverse.odin` needs the identity: a rule only gets to supply the PTR for its
+address if it is the rule that would answer its own name, and "the same domain"
+is not enough to decide that - a duplicated `domain:` is two rules with one name
+between them, and only the first of them is ever reached. That goes through
+`rewrite_rule_for`, which answers by this loop, so the precedence cannot be
+described twice and drift.
+*/
 @(private)
 find_rewrite_index :: proc(
 	rules: []config.Rewrite,

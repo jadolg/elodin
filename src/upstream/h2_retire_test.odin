@@ -376,3 +376,16 @@ test_a_cancelled_h2_reader_leaves_its_loop :: proc(t: ^testing.T) {
 	loop.destroy(l)
 	testing.expect_value(t, h2_readers_running(u), 0)
 }
+
+/*
+Wrap a negotiated stream in an h2 client and start its reader: `make_h2_conn`,
+then `start_h2_reader`, the caller holding `u.mu`. For a test, off a loop,
+where a preface write that waits blocks only its own thread; a fiber
+builds the connection before taking the lock instead (see `get_h2_conn`).
+*/
+@(private)
+start_h2_conn :: proc(u: ^Upstream, stream: Stream) -> ^H2_Conn {
+	hc := make_h2_conn(u, stream)
+	start_h2_reader(u, hc)
+	return hc
+}

@@ -1404,7 +1404,7 @@ test_dynamic_table_update_is_bounded_by_the_advertised_limit :: proc(t: ^testing
 		{MAX_HEADER_LIST, false, .Bad_Update, "the largest update that gets this far"},
 		// Past what `read_integer` will read at all, whatever it is for.
 		{MAX_HEADER_LIST + 1, false, .Too_Large, "past the integer cap"},
-		{65536, false, .Too_Large, "the old local cap"},
+		{65536, false, .Too_Large, "a 64 KiB table"},
 	}
 
 	for c in CASES {

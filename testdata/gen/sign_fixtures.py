@@ -273,7 +273,7 @@ def message(qname, qtype, answer, authority=(), additional=(), rcode=0):
     return out
 
 
-def emit(key, name, rtype, wire, rcode=0):
+def emit(key, name, rtype, wire):
     """Print one `Fixture` literal, wrapped the way the Odin files are written."""
     text = wire.hex()
     lines = [text[i:i + 96] for i in range(0, len(text), 96)]
@@ -282,7 +282,6 @@ def emit(key, name, rtype, wire, rcode=0):
     print('\t\tkey   = "%s",' % key)
     print('\t\tname  = "%s",' % name)
     print("\t\ttype  = .%s," % rtype)
-    print("\t\trcode = %d," % rcode)
     print('\t\twire  = "%s",' % body)
     print("\t},")
 
@@ -664,11 +663,11 @@ def zone_cut_under_empty_non_terminal():
     ]
     denial = apex_nsec + [sign(apex_nsec, child)]
     emit("en_nx", "nx.deep.mid.entest.", "A",
-         message("nx.deep.mid.entest.", A, [], denial, rcode=3), rcode=3)
+         message("nx.deep.mid.entest.", A, [], denial, rcode=3))
     # The walk asks about the queried name itself before it settles on a zone,
     # so the denial has to answer a DS lookup too.
     emit("en_nx_ds", "nx.deep.mid.entest.", "DS",
-         message("nx.deep.mid.entest.", DS, [], denial, rcode=3), rcode=3)
+         message("nx.deep.mid.entest.", DS, [], denial, rcode=3))
 
 
 @scenario
@@ -851,7 +850,7 @@ def relocated_wildcard_denial():
         RR("!.wctest.", NSEC, wild_rdata), RR("!.wctest.", RRSIG, wild_sig.rdata),
     ]
     emit("wc_relocated_nxdomain", "www.wctest.", "A",
-         message("www.wctest.", A, [], relocated_nx + wc_soa + [wc_soa_sig], rcode=3), rcode=3)
+         message("www.wctest.", A, [], relocated_nx + wc_soa + [wc_soa_sig], rcode=3))
 
     # The control, and the reason the refusal cannot simply be "the signature
     # expanded": a wildcard has an NSEC of its own, published under `*.wctest.`,
@@ -1071,9 +1070,9 @@ def nsec3_name_error():
     # cache reads its negative lifetime from (RFC 2308 section 5).
     soa = [soa_rr(zone.zone)]
     emit("n3_nx", "nx.deep.n3test.", "A",
-         message("nx.deep.n3test.", A, [], soa + [sign(soa, zone)] + authority, rcode=3), rcode=3)
+         message("nx.deep.n3test.", A, [], soa + [sign(soa, zone)] + authority, rcode=3))
     emit("n3_deep_ds", "deep.n3test.", "DS",
-         message("deep.n3test.", DS, [], authority, rcode=3), rcode=3)
+         message("deep.n3test.", DS, [], authority, rcode=3))
 
     # The same name error with the chain re-signed under flag bit 0x02, which
     # nothing defines. RFC 5155 section 8.2: a validator MUST ignore such a
@@ -1093,7 +1092,7 @@ def nsec3_name_error():
     for record in (odd["n3test."], odd["a.n3test."]):
         odd_authority += [record, sign([record], zone)]
     emit("n3_nx_unknown_flags", "nx.deep.n3test.", "A",
-         message("nx.deep.n3test.", A, [], soa + [sign(soa, zone)] + odd_authority, rcode=3), rcode=3)
+         message("nx.deep.n3test.", A, [], soa + [sign(soa, zone)] + odd_authority, rcode=3))
 
 
 @scenario
@@ -1192,13 +1191,13 @@ def deep_run_of_empty_non_terminals():
     # parent is who publishes it.
     deleg = [RR(sub.zone, NSEC, nsec_rdata("zz." + sub.zone, [NS, RRSIG, NSEC]))]
     emit("dr_delegation_nsec", "www." + sub.zone, "A",
-         message("www." + sub.zone, A, [], deleg + [sign(deleg, zone)], rcode=3), rcode=3)
+         message("www." + sub.zone, A, [], deleg + [sign(deleg, zone)], rcode=3))
     # The same record answering the DS the walk asks on its way down, which is
     # what lets the walk settle on the parent and read the denial above against
     # the parent's keys. Whoever can put the one in front of the validator can
     # put the other.
     emit("dr_www_ds", "www." + sub.zone, "DS",
-         message("www." + sub.zone, DS, [], deleg + [sign(deleg, zone)], rcode=3), rcode=3)
+         message("www." + sub.zone, DS, [], deleg + [sign(deleg, zone)], rcode=3))
 
 
 @scenario
@@ -1260,9 +1259,9 @@ def ipv6_reverse_name_error():
     absent = [RR(apex.zone, NSEC,
                  nsec_rdata("z." + apex.zone, [NS, SOA, RRSIG, NSEC, DNSKEY]))]
     emit("r6_ds_below_apex", suffix(15), "DS",
-         message(suffix(15), DS, [], absent + [sign(absent, apex)], rcode=3), rcode=3)
+         message(suffix(15), DS, [], absent + [sign(absent, apex)], rcode=3))
     emit("r6_nxdomain", qname, "PTR",
-         message(qname, PTR, [], absent + [sign(absent, apex)], rcode=3), rcode=3)
+         message(qname, PTR, [], absent + [sign(absent, apex)], rcode=3))
 
 
 @scenario
@@ -1384,7 +1383,7 @@ def cd_nsec(key, owner, next_name, types):
 def cd_answer(key, qname, qtype, records, authority, rcode=0):
     """Emit one `cname_denial` reply to an A or AAAA question."""
     emit(key, qname, {A: "A", AAAA: "AAAA"}[qtype],
-         message(qname, qtype, records, authority, rcode=rcode), rcode)
+         message(qname, qtype, records, authority, rcode=rcode))
 
 
 def cd_chain(root, zones):
@@ -1416,7 +1415,7 @@ def cd_proven(src, tgt, n3):
     cd_answer("cd_two_hops", "two.cdsrc.", AAAA,
               cd_cname(src, "two.cdsrc.", "mid.cdsrc.") + cd_cname(src, "mid.cdsrc.", "host.cdtgt."), nodata)
     emit("cd_host_ds", "host.cdtgt.", "DS", message("host.cdtgt.", DS, [], nodata))
-    emit("cd_missing_ds", "missing.cdtgt.", "DS", message("missing.cdtgt.", DS, [], nxdomain, rcode=3), 3)
+    emit("cd_missing_ds", "missing.cdtgt.", "DS", message("missing.cdtgt.", DS, [], nxdomain, rcode=3))
 
     # The same chain over an NSEC3 zone.
     chain = nsec3_chain(
@@ -1717,12 +1716,12 @@ def lapse_lt(lt):
          message("nope.lt.", DS, [],
                  nsec["mixed.lt."] + [sign(nsec["mixed.lt."], lt)]
                  + nsec["lt."] + [sign(nsec["lt."], lt)] + lt_soa + [lt_soa_sig],
-                 rcode=3), rcode=3)
+                 rcode=3))
     emit("lp_nope_nxdomain", "nope.lt.", "A",
          message("nope.lt.", A, [],
                  nsec["mixed.lt."] + [sign(nsec["mixed.lt."], lt, window=NOT_YET)]
                  + nsec["lt."] + [sign(nsec["lt."], lt)] + lt_soa + [lt_soa_sig],
-                 rcode=3), rcode=3)
+                 rcode=3))
     return nsec, lt_soa + [lt_soa_sig]
 
 
@@ -1810,7 +1809,7 @@ def lapse_ds_questions(lt, nsec, lt_soa):
          message("www.late.lt.", DS, [],
                  nsec["late.lt."] + [sign(nsec["late.lt."], lt)]
                  + nsec["lt."] + [sign(nsec["lt."], lt)] + lt_soa,
-                 rcode=3), rcode=3)
+                 rcode=3))
     dname = [RR("late.lt.", DNAME, wire_name("both.lt."))]
     synthesized = [RR("www.late.lt.", CNAME, wire_name("www.both.lt."))]
     emit("lp_dname_a", "www.late.lt.", "A",

@@ -225,19 +225,6 @@ get_h2_conn :: proc(
 	return conn, true, .None
 }
 
-/*
-Wrap a negotiated stream in an h2 client and start its reader: `make_h2_conn`,
-then `start_h2_reader`, the caller holding `u.mu`. For a caller off a loop - the
-tests - where a preface write that waits blocks only its own thread; a fiber
-builds the connection before taking the lock instead (see `get_h2_conn`).
-*/
-@(private)
-start_h2_conn :: proc(u: ^Upstream, stream: Stream) -> ^H2_Conn {
-	hc := make_h2_conn(u, stream)
-	start_h2_reader(u, hc)
-	return hc
-}
-
 // The connection and its client, which writes the preface. Not under `u.mu`.
 @(private)
 make_h2_conn :: proc(u: ^Upstream, stream: Stream) -> ^H2_Conn {

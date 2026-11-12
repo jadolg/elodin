@@ -46,11 +46,11 @@ other one is shed - whatever order the threads happen to start in.
 */
 @(private = "file")
 Slow_Upstream :: struct {
-	mu:       sync.Mutex,
-	in_fli:   int,
-	peak:     int,
-	calls:    int,
-	released: bool,
+	mu:        sync.Mutex,
+	in_flight: int,
+	peak:      int,
+	calls:     int,
+	released:  bool,
 }
 
 @(private = "file")
@@ -66,10 +66,10 @@ slow_query :: proc(
 ) {
 	u := cast(^Slow_Upstream)ctx
 	sync.mutex_lock(&u.mu)
-	u.in_fli += 1
+	u.in_flight += 1
 	u.calls += 1
-	if u.in_fli > u.peak {
-		u.peak = u.in_fli
+	if u.in_flight > u.peak {
+		u.peak = u.in_flight
 	}
 	sync.mutex_unlock(&u.mu)
 
@@ -78,7 +78,7 @@ slow_query :: proc(
 	}
 
 	sync.mutex_lock(&u.mu)
-	u.in_fli -= 1
+	u.in_flight -= 1
 	sync.mutex_unlock(&u.mu)
 	// Nothing came back, which is where a walk that reached the upstream and
 	// waited ends up. What this measures is the waiting, not the answer.

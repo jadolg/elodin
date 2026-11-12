@@ -209,7 +209,7 @@ test_reverse_rewrite_walks_past_an_alias_as_the_forward_answer_does :: proc(t: ^
 /*
 Two names for one address is legal, so one of them has to be chosen, and the
 choice is the one an operator can predict: the first rule in the file, which is
-the precedence `find_rewrite` gives the forward direction.
+the precedence `find_rewrite_index` gives the forward direction.
 */
 @(test)
 test_reverse_rewrite_takes_the_first_rule :: proc(t: ^testing.T) {

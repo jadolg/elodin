@@ -79,7 +79,6 @@ SSL_ERROR_WANT_WRITE :: 3
 SSL_ERROR_SYSCALL :: 5
 SSL_ERROR_ZERO_RETURN :: 6
 
-SSL_CTRL_SESS_NUMBER :: 20
 SSL_CTRL_MODE :: 33
 SSL_CTRL_SET_SESS_CACHE_MODE :: 44
 SSL_CTRL_SET_TLSEXT_HOSTNAME :: 55
@@ -277,16 +276,6 @@ ssl_ctx_set_session_cache_mode :: proc(ctx: ^SSL_CTX, mode: c.long) {
 // inherits, and answers with the bits now set.
 ssl_ctx_set_mode :: proc(ctx: ^SSL_CTX, mode: c.long) -> c.long {
 	return SSL_CTX_ctrl(ctx, SSL_CTRL_MODE, mode, nil)
-}
-
-// The mode bits of one connection; `SSL_get_mode` is a macro for this.
-ssl_get_mode :: proc(ssl: ^SSL) -> c.long {
-	return SSL_ctrl(ssl, SSL_CTRL_MODE, 0, nil)
-}
-
-// How many sessions the context's internal cache holds right now.
-ssl_ctx_sess_number :: proc(ctx: ^SSL_CTX) -> int {
-	return int(SSL_CTX_ctrl(ctx, SSL_CTRL_SESS_NUMBER, 0, nil))
 }
 
 ssl_set_tlsext_host_name :: proc(ssl: ^SSL, name: cstring) -> bool {

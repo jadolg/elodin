@@ -462,10 +462,10 @@ test_a_lapsed_stale_copy_waits_for_the_refresh :: proc(t: ^testing.T) {
 	}
 	defer upstream.destroy_group(group)
 	s.group = group
-	workers: Test_Loop
-	start_test_loop(&workers)
-	defer stop_test_loop(&workers)
-	s.loops = workers.loops[:]
+	tl: Test_Loop
+	start_test_loop(&tl)
+	defer stop_test_loop(&tl)
+	s.loops = tl.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -842,10 +842,10 @@ test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T)
 	refresh, which is still inside its two-second upstream budget when this
 	returns and which writes to the cache and the group when it comes out.
 	*/
-	workers: Test_Loop
-	start_test_loop(&workers)
-	defer stop_test_loop(&workers)
-	s.loops = workers.loops[:]
+	tl: Test_Loop
+	start_test_loop(&tl)
+	defer stop_test_loop(&tl)
+	s.loops = tl.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -935,15 +935,15 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 	}
 	defer upstream.destroy_group(group)
 	s.group = group
-	workers: Test_Loop
-	start_test_loop(&workers)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	// Joined in the middle of the case rather than at the end of it; the drain
 	// below says why. The flag is what keeps an early return from leaking it.
 	joined := false
 	defer if !joined {
-		stop_test_loop(&workers)
+		stop_test_loop(&tl)
 	}
-	s.loops = workers.loops[:]
+	s.loops = tl.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -979,7 +979,7 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 	attempt is on the socket or was never going to be. That is a fact about this
 	process rather than a delay long enough to hope.
 	*/
-	stop_test_loop(&workers)
+	stop_test_loop(&tl)
 	joined = true
 	s.loops = nil
 
@@ -1031,16 +1031,16 @@ test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
 	}
 	defer upstream.destroy_group(group)
 	s.group = group
-	workers: Test_Loop
-	start_test_loop(&workers)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	// Joined in the middle of the case rather than at the end of it, since the
 	// store this is about happens on the refresh's way out. The flag is what
 	// keeps an early return from leaking the loop all the same.
 	joined := false
 	defer if !joined {
-		stop_test_loop(&workers)
+		stop_test_loop(&tl)
 	}
-	s.loops = workers.loops[:]
+	s.loops = tl.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -1072,7 +1072,7 @@ test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
 
 	// The refresh is joined rather than slept on: the store happens on its way
 	// out, so the loop going quiet is what says the entry is final.
-	stop_test_loop(&workers)
+	stop_test_loop(&tl)
 	joined = true
 	s.loops = nil
 
@@ -1137,10 +1137,10 @@ test_a_refresh_that_beats_the_timer_answers_the_client :: proc(t: ^testing.T) {
 	}
 	defer upstream.destroy_group(group)
 	s.group = group
-	workers: Test_Loop
-	start_test_loop(&workers)
-	defer stop_test_loop(&workers)
-	s.loops = workers.loops[:]
+	tl: Test_Loop
+	start_test_loop(&tl)
+	defer stop_test_loop(&tl)
+	s.loops = tl.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -1230,13 +1230,13 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 	defer upstream.destroy_group(group)
 	s.group = group
 
-	workers: Test_Loop
-	start_test_loop(&workers)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	joined := false
 	defer if !joined {
-		stop_test_loop(&workers)
+		stop_test_loop(&tl)
 	}
-	s.loops = workers.loops[:]
+	s.loops = tl.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -1277,7 +1277,7 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 
 	// Nothing was ever submitted, so this stops an idle loop; the count behind
 	// it is the one attempt this thread made for itself.
-	stop_test_loop(&workers)
+	stop_test_loop(&tl)
 	joined = true
 	s.loops = nil
 	testing.expect_value(t, drain_datagrams(hole), 1)
@@ -1364,7 +1364,7 @@ test_wildcard_rewrite_matches_regardless_of_case :: proc(t: ^testing.T) {
 
 	names := [?]string{"host.lan.", "host.LAN.", "HOST.Lan.", "deep.HOST.lAn."}
 	for name in names {
-		_, found := find_rewrite(rules, name)
+		_, found := find_rewrite_index(rules, name)
 		testing.expectf(t, found, "%s should match the wildcard rule *.lan.", name)
 	}
 }
@@ -1383,7 +1383,7 @@ test_wildcard_rewrite_excludes_the_apex_and_bare_suffixes :: proc(t: ^testing.T)
 
 	outside := [?]string{"lan.", "LAN.", "notlan.", "NOTLAN.", "an.", "example.com."}
 	for name in outside {
-		_, found := find_rewrite(rules, name)
+		_, found := find_rewrite_index(rules, name)
 		testing.expectf(t, !found, "%s must not match the wildcard rule *.lan.", name)
 	}
 }
@@ -1397,10 +1397,10 @@ other shows up.
 test_exact_rewrite_matches_regardless_of_case :: proc(t: ^testing.T) {
 	rules := []config.Rewrite{{domain = "host.lan.", ttl = 60}}
 
-	_, exact := find_rewrite(rules, "HOST.LAN.")
+	_, exact := find_rewrite_index(rules, "HOST.LAN.")
 	testing.expect(t, exact, "an exact rewrite must match a differently-cased name")
 
-	_, deeper := find_rewrite(rules, "sub.HOST.LAN.")
+	_, deeper := find_rewrite_index(rules, "sub.HOST.LAN.")
 	testing.expect(t, !deeper, "an exact rewrite must not claim names below it")
 }
 

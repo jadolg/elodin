@@ -95,22 +95,22 @@ machine has.
 test_every_reader_binds_the_same_port :: proc(t: ^testing.T) {
 	cfg: config.Config
 	fixture(&cfg, READERS)
-	handler_pool: Test_Loop
-	start_test_loop(&handler_pool)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	s := Server {
 		cfg          = &cfg,
-		loops        = handler_pool.loops[:],
+		loops        = tl.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		testing.expect(t, false, "could not start the UDP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		destroy_listeners(&l)
 	}
 
@@ -161,22 +161,22 @@ reaching the cache, the filters or an upstream, none of which are wired up here.
 test_the_kernel_spreads_datagrams_over_the_readers :: proc(t: ^testing.T) {
 	cfg: config.Config
 	fixture(&cfg, READERS)
-	handler_pool: Test_Loop
-	start_test_loop(&handler_pool)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	s := Server {
 		cfg          = &cfg,
-		loops        = handler_pool.loops[:],
+		loops        = tl.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		testing.expect(t, false, "could not start the UDP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		destroy_listeners(&l)
 	}
 
@@ -252,22 +252,22 @@ worked only in a plural is one nobody would notice was broken until they set
 test_one_reader_is_a_whole_listener :: proc(t: ^testing.T) {
 	cfg: config.Config
 	fixture(&cfg, 1)
-	handler_pool: Test_Loop
-	start_test_loop(&handler_pool)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	s := Server {
 		cfg          = &cfg,
-		loops        = handler_pool.loops[:],
+		loops        = tl.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		testing.expect(t, false, "could not start the UDP listener")
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		destroy_listeners(&l)
 	}
 
@@ -445,23 +445,23 @@ test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
 	cfg: config.Config
 	fixture(&cfg, READERS)
 	cfg.listeners.udp.port = bound.port
-	handler_pool: Test_Loop
-	start_test_loop(&handler_pool)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	s := Server {
 		cfg          = &cfg,
-		loops        = handler_pool.loops[:],
+		loops        = tl.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
 		// The port was taken between the probe and here, which is nobody's bug.
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		logx.infof("the free port %d was taken before the listener could bind it", bound.port)
 		return
 	}
 	defer {
 		stop_listeners(&l)
-		stop_test_loop(&handler_pool)
+		stop_test_loop(&tl)
 		destroy_listeners(&l)
 	}
 	testing.expect_value(t, len(l.udp), READERS)
@@ -471,11 +471,11 @@ test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
 	second_cfg: config.Config
 	fixture(&second_cfg, READERS)
 	second_cfg.listeners.udp.port = bound.port
-	second_pool: Test_Loop
-	start_test_loop(&second_pool)
+	second_tl: Test_Loop
+	start_test_loop(&second_tl)
 	second := Server {
 		cfg          = &second_cfg,
-		loops        = second_pool.loops[:],
+		loops        = second_tl.loops[:],
 	}
 	second_l: Listeners
 	started := start_listeners(&second, &second_l)
@@ -483,7 +483,7 @@ test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
 	// manager before it binds anything, and `stop_listeners` is what gives it
 	// back.
 	stop_listeners(&second_l)
-	stop_test_loop(&second_pool)
+	stop_test_loop(&second_tl)
 	destroy_listeners(&second_l)
 	testing.expect(t, !started, "a second listener joined the running one's port and took a share of its datagrams")
 }

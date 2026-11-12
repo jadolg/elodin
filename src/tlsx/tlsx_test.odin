@@ -19,6 +19,21 @@ here mocks OpenSSL: the property under test is how this package drives it from
 more than one thread at a time, and a mock would define that away.
 */
 
+@(private = "file")
+SSL_CTRL_SESS_NUMBER :: 20
+
+// The mode bits of one connection; `SSL_get_mode` is a macro for this.
+@(private = "file")
+ssl_get_mode :: proc(ssl: ^SSL) -> c.long {
+	return SSL_ctrl(ssl, SSL_CTRL_MODE, 0, nil)
+}
+
+// How many sessions the context's internal cache holds right now.
+@(private = "file")
+ssl_ctx_sess_number :: proc(ctx: ^SSL_CTX) -> int {
+	return int(SSL_CTX_ctrl(ctx, SSL_CTRL_SESS_NUMBER, 0, nil))
+}
+
 /*
 Provide a certificate, the same way the integration suite does.
 

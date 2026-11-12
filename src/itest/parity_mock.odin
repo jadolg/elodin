@@ -71,7 +71,7 @@ parity_synth_reply :: proc(
 			counts[0] = pm_cname_chain(&body, &r, qtype, q_end, allocator)
 		case 3:
 			counts[0] = pm_answer(&body, &r, qtype, allocator)
-			counts[1] = pm_ns_authority(&body, &r, allocator)
+			counts[1] = pm_ns_authority(&body, allocator)
 			counts[2] = pm_glue(&body, &r, allocator)
 		case 4:
 			counts[0] = pm_large_answer(&body, &r, qtype, query[12:q_end - 4], q_end, allocator)
@@ -396,7 +396,7 @@ pm_soa_authority :: proc(body: ^[dynamic]u8, r: ^Pg_Rand, allocator: mem.Allocat
 }
 
 @(private = "file")
-pm_ns_authority :: proc(body: ^[dynamic]u8, r: ^Pg_Rand, allocator: mem.Allocator) -> u16 {
+pm_ns_authority :: proc(body: ^[dynamic]u8, allocator: mem.Allocator) -> u16 {
 	pm_rr(
 		body,
 		pm_name(PM_ZONE, allocator),

@@ -55,16 +55,10 @@ writer_init :: proc(w: ^Writer, allocator := context.allocator, compress := true
 	}
 }
 
-writer_destroy :: proc(w: ^Writer) {
-	delete(w.buf)
-	writer_release_scratch(w)
-}
-
 /*
 Release everything the writer allocated except its output buffer.
 
-Split out because `encode_message` hands that buffer to its caller and has to let
-go of the rest.
+`encode_message` hands that buffer to its caller and has to let go of the rest.
 */
 @(private)
 writer_release_scratch :: proc(w: ^Writer) {

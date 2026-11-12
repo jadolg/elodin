@@ -171,12 +171,12 @@ run_superseded :: proc(t: ^testing.T, c: Superseded_Case, detached: bool) {
 	defer if s.filters != nil {
 		filter.engine_destroy(s.filters)
 	}
-	workers: Test_Loop
+	tl: Test_Loop
 	if detached {
-		start_test_loop(&workers)
-		s.loops = workers.loops[:]
+		start_test_loop(&tl)
+		s.loops = tl.loops[:]
 	}
-	defer stop_test_loop(&workers)
+	defer stop_test_loop(&tl)
 
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
@@ -203,7 +203,7 @@ run_superseded :: proc(t: ^testing.T, c: Superseded_Case, detached: bool) {
 	if detached {
 		testing.expectf(t, outcome == .Cached, "%s: the client was not lent the copy (%v)", c.name, outcome)
 		// Joined, not slept on: the store happens on the refresh's way out.
-		stop_test_loop(&workers)
+		stop_test_loop(&tl)
 		s.loops = nil
 	}
 
@@ -226,7 +226,7 @@ test_a_late_refused_answer_supersedes_the_stale_copy :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_a_refused_answer_supersedes_the_stale_copy_without_a_pool :: proc(t: ^testing.T) {
+test_a_refused_answer_supersedes_the_stale_copy_without_a_loop :: proc(t: ^testing.T) {
 	for c in superseded_cases() {
 		run_superseded(t, c, detached = false)
 	}

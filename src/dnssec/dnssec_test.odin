@@ -1079,43 +1079,47 @@ rec :: proc(name: string, type: dns.Type, target: string = "") -> dns.Record {
 }
 
 @(test)
-test_answers_question_follows_the_cname_chain :: proc(t: ^testing.T) {
+test_chain_walk_follows_the_cname_chain :: proc(t: ^testing.T) {
 	/*
 	The shape of an answer that addresses its question, case by case. Chains
 	that stop short are ordinary - the zone at the end may hold nothing of the
-	type, which the authority section is what proves - so those count. An
-	answer section with nothing at the queried name does not.
+	type, which the authority section is what proves - so those are
+	`.Chain_Only` rather than `.None`. An answer section with nothing at the
+	queried name is `.None`, which `validate_answer` refuses.
 	*/
 	direct := []dns.Record{rec("www.example.com.", .A)}
-	testing.expect(t, answers_question(direct, "www.example.com.", .A, .IN), "the type at the name should count")
+	shape, _ := chain_walk(direct, "www.example.com.", .A, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Direct)
 
 	// Case folding, since a name is not the bytes it was written with.
-	testing.expect(t, answers_question(direct, "WWW.Example.COM.", .A, .IN), "names should match case-insensitively")
+	shape, _ = chain_walk(direct, "WWW.Example.COM.", .A, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Direct)
 
 	chain := []dns.Record {
 		rec("www.example.com.", .CNAME, "target.example.net."),
 		rec("target.example.net.", .A),
 	}
-	testing.expect(t, answers_question(chain, "www.example.com.", .A, .IN), "a completed chain should count")
+	shape, _ = chain_walk(chain, "www.example.com.", .A, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Direct)
 
 	// The chain stops at the CNAME: the target holds no A, which the authority
 	// section proves rather than this.
 	partial := []dns.Record{rec("www.example.com.", .CNAME, "target.example.net.")}
-	testing.expect(t, answers_question(partial, "www.example.com.", .A, .IN), "a chain that stops short should count")
+	shape, _ = chain_walk(partial, "www.example.com.", .A, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Chain_Only)
 
 	// The CNAME itself, when that is what was asked for.
-	testing.expect(t, answers_question(partial, "www.example.com.", .CNAME, .IN), "a CNAME answers a CNAME question")
+	shape, _ = chain_walk(partial, "www.example.com.", .CNAME, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Direct)
 
 	// Anything at the name answers ANY.
-	testing.expect(t, answers_question(direct, "www.example.com.", .ANY, .IN), "ANY takes whatever is there")
+	shape, _ = chain_walk(direct, "www.example.com.", .ANY, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Direct)
 
 	// The attack: signed records, wrong name.
 	elsewhere := []dns.Record{rec("evil.attacker.example.", .A)}
-	testing.expect(
-		t,
-		!answers_question(elsewhere, "www.example.com.", .A, .IN),
-		"records about another name do not answer this question",
-	)
+	shape, _ = chain_walk(elsewhere, "www.example.com.", .A, .IN)
+	testing.expect_value(t, shape, Answer_Shape.None)
 
 	// A chain that leads somewhere unrelated still has to start at the name
 	// that was asked about.
@@ -1123,23 +1127,22 @@ test_answers_question_follows_the_cname_chain :: proc(t: ^testing.T) {
 		rec("other.example.com.", .CNAME, "target.example.net."),
 		rec("target.example.net.", .A),
 	}
-	testing.expect(
-		t,
-		!answers_question(detached, "www.example.com.", .A, .IN),
-		"a chain that does not start at the queried name proves nothing",
-	)
+	shape, _ = chain_walk(detached, "www.example.com.", .A, .IN)
+	testing.expect_value(t, shape, Answer_Shape.None)
 
 	// Class has to match too.
 	wrong_class := []dns.Record{rec("www.example.com.", .A)}
 	wrong_class[0].class = .CH
-	testing.expect(t, !answers_question(wrong_class, "www.example.com.", .A, .IN), "a different class is a different question")
+	shape, _ = chain_walk(wrong_class, "www.example.com.", .A, .IN)
+	testing.expect_value(t, shape, Answer_Shape.None)
 
 	// A loop must terminate rather than spin.
 	loop := []dns.Record {
 		rec("a.example.com.", .CNAME, "b.example.com."),
 		rec("b.example.com.", .CNAME, "a.example.com."),
 	}
-	testing.expect(t, !answers_question(loop, "a.example.com.", .A, .IN), "a CNAME loop should not be an answer")
+	shape, _ = chain_walk(loop, "a.example.com.", .A, .IN)
+	testing.expect_value(t, shape, Answer_Shape.None)
 }
 
 @(test)

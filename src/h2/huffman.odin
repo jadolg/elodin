@@ -24,7 +24,6 @@ Huffman_Index :: struct {
 	count:        [31]int,
 	first_symbol: [31]int,
 	symbols:      [257]u16,
-	built:        bool,
 }
 
 @(private)
@@ -62,7 +61,6 @@ build_huffman_index :: proc() {
 		idx.symbols[offset[length]] = u16(sym)
 		offset[length] += 1
 	}
-	idx.built = true
 }
 
 /*

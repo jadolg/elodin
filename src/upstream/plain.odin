@@ -205,28 +205,6 @@ open_udp :: proc(endpoint: net.Endpoint) -> (net.UDP_Socket, bool) {
 	return net.UDP_Socket(fd), true
 }
 
-@(private)
-write_all_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> Error {
-	// One call: `loop.send_tcp` writes the whole buffer or says why not.
-	if _, err := loop.send_tcp(socket, buf); err != nil {
-		return .IO_Error
-	}
-	return .None
-}
-
-@(private)
-read_full_tcp :: proc(socket: net.TCP_Socket, buf: []u8) -> Error {
-	got := 0
-	for got < len(buf) {
-		n, err := loop.recv_tcp(socket, buf[got:])
-		if err != nil || n <= 0 {
-			return .IO_Error
-		}
-		got += n
-	}
-	return .None
-}
-
 /*
 What a failed read or write on an established TLS session means above.
 
