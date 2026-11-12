@@ -194,7 +194,11 @@ test_a_cookie_that_will_not_fit_does_not_truncate_the_answer :: proc(t: ^testing
 	if !testing.expectf(t, int(advertised) > dns.MAX_UDP_SIZE, "the answer is only %d bytes", len(stored)) {
 		return
 	}
-	#assert(COOKIE_OPTION_LEN > 20, "the cookie fits after all, so this case is not reachable")
+	// A runtime check, not `#assert`: test files are compiled into every build,
+	// and this premise failing is a test's problem, not the binary's.
+	if !testing.expect(t, COOKIE_OPTION_LEN > 20, "the cookie fits after all, so this case is not reachable") {
+		return
+	}
 
 	out, ok := answer_once(t, stored, advertised)
 	if !testing.expect(t, ok, "the query went unanswered") {

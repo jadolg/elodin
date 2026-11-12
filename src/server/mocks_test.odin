@@ -61,6 +61,7 @@ nothing is going to send to is the one value that hangs. `nothing_reached` in
 special_use_test.odin is this same reading, kept there because it also wants the
 question the leaked query asked.
 */
+@(private)
 mock_untouched :: proc(socket: net.UDP_Socket) -> bool {
 	_ = net.set_option(socket, .Receive_Timeout, 20 * time.Millisecond)
 	// Left as the harnesses set it, so a fixture socket can be read this way in
@@ -74,14 +75,16 @@ mock_untouched :: proc(socket: net.UDP_Socket) -> bool {
 /*
 A mock upstream's socket on loopback, and the spec that names it.
 
-The socket waits `MOCK_RECV_TIMEOUT` for a query, past the upstream timeout of
-`test_config` rather than under it: see the note on the constant. Closed again
-on every failure, so a caller that gets `ok` false has nothing to clean up.
+The socket waits `wait` for a query: `MOCK_RECV_TIMEOUT`, past the upstream
+timeout of `test_config` rather than under it (see the note on the constant), or
+a short poll for a mock loop that watches a stop flag. Closed again on every
+failure, so a caller that gets `ok` false has nothing to clean up.
 */
 @(private)
 bind_mock :: proc(
 	t: ^testing.T,
 	name := "mock",
+	wait := MOCK_RECV_TIMEOUT,
 	loc := #caller_location,
 ) -> (
 	socket: net.UDP_Socket,
@@ -92,7 +95,7 @@ bind_mock :: proc(
 	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr, loc = loc) {
 		return {}, {}, false
 	}
-	terr := net.set_option(sock, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	terr := net.set_option(sock, .Receive_Timeout, wait)
 	if !testing.expectf(t, terr == nil, "cannot bound the mock's wait: %v", terr, loc = loc) {
 		net.close(sock)
 		return {}, {}, false

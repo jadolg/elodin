@@ -757,7 +757,9 @@ test_a_refusal_on_a_partial_decode_is_released_by_a_reload :: proc(t: ^testing.T
 	filter.set_destroy(ob)
 	filter.set_destroy(oa)
 
-	_, second, _, _ := harness_ask(&h, test_query("www.brand.example."), wire, client = "127.0.0.2:5555")
+	_, second, _, asked := harness_ask(&h, test_query("www.brand.example."), wire, client = "127.0.0.2:5555")
+	// Asked, or an outcome other than Blocked is a timeout and releases nothing.
+	testing.expect(t, asked, "the upstream was not asked again after the reload")
 
 	testing.expectf(
 		t,
@@ -908,6 +910,8 @@ test_an_entry_that_turns_unreadable_on_a_later_walk_is_dropped :: proc(t: ^testi
 	// The re-walk now reaches the malformed record: refused, and the entry goes.
 	_, second, _ := handle_query(&h.srv, test_query("www.brand.example."), .UDP, "127.0.0.2:5555", context.temp_allocator)
 	testing.expect_value(t, second, Outcome.Failed)
+	// From the entry, or the refusal above is the dead mock's timeout.
+	testing.expect(t, mock_untouched(h.socket), "the second query went upstream rather than to the stored entry")
 
 	// The upstream stops sending the malformed record. It must be asked again.
 	_, third, _, asked := harness_ask(

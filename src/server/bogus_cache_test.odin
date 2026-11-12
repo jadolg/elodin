@@ -146,20 +146,15 @@ Fixture :: struct {
 
 @(private = "file")
 fixture_start :: proc(t: ^testing.T, f: ^Fixture, answer_keys: bool, serve_stale := false) -> bool {
-	socket, spec, bound := bind_mock(t)
+	// Short, because it is what the serve loop uses to notice that the test is
+	// over; nothing here waits on a query that is not coming. Left long, the
+	// loop would not see `stop` and `fixture_stop` would wait out the long one.
+	socket, spec, bound := bind_mock(t, wait = 100 * time.Millisecond)
 	if !bound {
 		return false
 	}
 	f.mock.socket = socket
 	f.mock.answer_keys = answer_keys
-	// Short, because it is what the serve loop uses to notice that the test is
-	// over; nothing here waits on a query that is not coming. Unset, the loop
-	// would never see `stop` and `fixture_stop` would wait out the long one.
-	if terr := net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond); terr != nil {
-		testing.expectf(t, false, "cannot shorten the mock's wait: %v", terr)
-		net.close(socket)
-		return false
-	}
 
 	answer := unsigned_answer()
 	if len(answer) > len(f.mock.reply) {

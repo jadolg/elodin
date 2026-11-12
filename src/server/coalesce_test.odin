@@ -130,11 +130,15 @@ serve_mock :: proc(m: ^Mock) {
 		if n < dns.HEADER_SIZE {
 			continue
 		}
-		if m.others && !asks_qname(buf[:n]) {
-			m.lookups += 1
-			buf[2] |= 0x80 // QR
-			buf[3] |= 0x80 // RA
-			_, _ = net.send_udp(m.socket, buf[:n], remote)
+		if !asks_qname(buf[:n]) {
+			// The validator's own lookup, or another case's stray: counted as a
+			// query, a stray would fail a burst on a name it never asked.
+			if m.others {
+				m.lookups += 1
+				buf[2] |= 0x80 // QR
+				buf[3] |= 0x80 // RA
+				_, _ = net.send_udp(m.socket, buf[:n], remote)
+			}
 			continue
 		}
 		m.queries += 1
@@ -266,20 +270,12 @@ run_burst :: proc(
 	// How long the hand-made leader holds its followers before it lands.
 	land_after: time.Duration = 0,
 ) -> int {
-	socket, spec, bound := bind_mock(t)
+	// Short, because it is how the mock's loop gets to look at `stop`.
+	socket, spec, bound := bind_mock(t, wait = 100 * time.Millisecond)
 	if !bound {
 		return -1
 	}
 	defer net.close(socket)
-	// Short, because it is how the mock's loop gets to look at `stop`.
-	if terr := net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond); !testing.expectf(
-		t,
-		terr == nil,
-		"cannot shorten the mock's wait: %v",
-		terr,
-	) {
-		return -1
-	}
 
 	cfg := test_config(loopback_upstream(spec.port))
 	cfg.blocking.enabled = cloak
