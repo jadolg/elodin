@@ -1755,8 +1755,8 @@ test_response_gives_up_when_no_window_is_granted :: proc(t: ^testing.T) {
 	/*
 	A client that advertises a zero window and then says nothing leaves the
 	handler answering it parked on flow control. Nothing else marks the
-	connection dead - its reader is perfectly healthy - so the wait had no end
-	to it, and one connection could pin a worker per stream, up to
+	connection dead - its reader is perfectly healthy - so without a bound the
+	wait has no end, and one connection pins a handler per stream, up to
 	MAX_CONCURRENT of them.
 	*/
 	track: mem.Tracking_Allocator

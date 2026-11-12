@@ -382,6 +382,22 @@ Http_Request :: struct {
 	accept:       string,
 }
 
+/*
+RFC 9110 5.5: a field value an HTTP/1.1 request can carry. `h2.field_value_is_valid`
+holds RFC 9113's rule, which refuses only what ends a field (NUL, CR, LF) and
+the whitespace a reader trims; no other control but HTAB is a `field-vchar`
+either, and nor is DEL.
+*/
+@(private = "file")
+request_field_value_is_valid :: proc(value: string) -> bool {
+	for i in 0 ..< len(value) {
+		if (value[i] < ' ' && value[i] != '\t') || value[i] == 0x7f {
+			return false
+		}
+	}
+	return h2.field_value_is_valid(value)
+}
+
 // What `http_exchange` takes for a body unless told otherwise: a blocklist. A
 // DoH reply is a DNS message and passes `dns.MAX_MESSAGE` instead (#525).
 MAX_HTTP_BODY :: 64 * 1024 * 1024
@@ -443,8 +459,8 @@ http_exchange :: proc(
 	if !h2.is_token(req.method) ||
 	   !h2.target_is_valid(req.path) ||
 	   !h2.authority_is_valid(req.host) ||
-	   !h2.field_value_is_valid(req.accept) ||
-	   !h2.field_value_is_valid(req.content_type) {
+	   !request_field_value_is_valid(req.accept) ||
+	   !request_field_value_is_valid(req.content_type) {
 		return {}, .HTTP_Error
 	}
 	b := strings.builder_make(context.temp_allocator)

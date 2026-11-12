@@ -4438,6 +4438,11 @@ test_a_request_line_holds_only_visible_ascii :: proc(t: ^testing.T) {
 		{"/", "mock.invalid", "", "", ""},
 		{"/", "mock.invalid", "GET", "*/*\r\nX-Injected: 1", ""},
 		{"/", "mock.invalid", "POST", "", "text/plain\r\nX-Injected: 1"},
+		{"/", "mock.invalid", "GET", " text/plain", ""},
+		{"/", "mock.invalid", "POST", "", "text/plain\x00"},
+		// RFC 9110 5.5: no control but HTAB is a `field-vchar`, nor is DEL.
+		{"/", "mock.invalid", "GET", "text/\x0bplain", ""},
+		{"/", "mock.invalid", "POST", "", "text/plain\x7f"},
 		// The control: an ordinary request goes out and is answered.
 		{"/hosts.txt", "mock.invalid", "POST", "text/plain, */*", "text/plain"},
 	}

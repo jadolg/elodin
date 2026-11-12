@@ -4746,13 +4746,14 @@ rule_holds_alias :: proc(rule: config.Rewrite) -> bool {
 }
 
 /*
-The first rule from `from` on whose domain matches `name`, by index rather than
-by what it says.
+The first rule, from index `from` on, whose domain matches `name`: by index
+rather than by what it says.
 
 `reverse.odin` needs the identity: a rule only gets to supply the PTR for its
 address if it is the rule that would answer its own name, and "the same domain"
 is not enough to decide that - a duplicated `domain:` is two rules with one name
-between them, and only the first of them is ever reached. That goes through
+between them, and the second is reached only for a type the first has no answer
+of. That goes through
 `rewrite_rule_for`, which answers by this loop, so the precedence cannot be
 described twice and drift.
 */

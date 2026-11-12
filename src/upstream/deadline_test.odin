@@ -15,10 +15,9 @@ import "elodin:loop"
 A failover or round-robin query waits out a bounded budget, not every member for
 every attempt (issue #327).
 
-`resolve_sequential` used to loop `attempts` rounds over every member at the
-full timeout each: two black-holed members at the shipped five seconds and two
-attempts held a query worker for twenty seconds, four times what a stub waits,
-and a client repeating such names could empty the pool.
+`attempts` rounds over every member at the full timeout each would be, for two
+black-holed members at the shipped five seconds and two attempts, a client held
+for twenty seconds, four times what a stub waits.
 */
 
 @(private = "file")
