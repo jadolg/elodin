@@ -16,6 +16,9 @@ rewrites:
 - Wildcards match subdomains only: `*.lan` covers `host.lan`, not `lan`.
   Quote them: unquoted, `*` starts a YAML alias and the file is refused.
   A wildcard on the root (`*.`) would match every name and is refused.
+- Names are compared ignoring ASCII case only. A name with a space outside
+  ASCII at either end, such as a no-break space, is refused; ordinary spaces
+  around it are trimmed.
 - `ttl` sets the answer's TTL: 0 to 2147483647 seconds (RFC 2181 §8), as a
   number or a duration such as `5m`; the default is 300 seconds.
 

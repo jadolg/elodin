@@ -3,13 +3,10 @@ package config
 import "core:encoding/hex"
 import "core:time"
 import "elodin:cache"
+import "elodin:logx"
 
-Log_Level :: enum u8 {
-	Debug,
-	Info,
-	Warn,
-	Error,
-}
+// The logger's own levels, so `log.level` is handed to it as read.
+Log_Level :: logx.Level
 
 Log_Config :: struct {
 	level:   Log_Level,
@@ -1120,6 +1117,9 @@ Config :: struct {
 	special_use: Special_Use_Config,
 }
 
+// `server.max_connections` when the file does not say.
+DEFAULT_MAX_CONNECTIONS :: 512
+
 default_config :: proc() -> Config {
 	c: Config
 	c.log = Log_Config {
@@ -1128,7 +1128,7 @@ default_config :: proc() -> Config {
 	}
 	c.server = Server_Config {
 		client_timeout             = 10 * time.Second,
-		max_connections            = 512,
+		max_connections            = DEFAULT_MAX_CONNECTIONS,
 		// Zero, and worked out from `max_connections` at load: an operator who
 		// raises the table expects one client's share to move with it, and a
 		// figure written here would stay at half of the default table for ever.

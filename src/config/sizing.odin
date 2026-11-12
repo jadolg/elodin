@@ -1,12 +1,12 @@
 package config
 
 import "core:fmt"
-import "core:io"
 import "core:os"
 import "core:strconv"
 import "core:strings"
 import si "core:sys/info"
 import "elodin:dns"
+import "elodin:metrics"
 
 /*
 What the server's size is derived from where the file leaves it unset: the
@@ -285,7 +285,7 @@ probe_machine :: proc() -> (m: Machine) {
 	detection depends on.
 	*/
 	cgroup_buf: [4096]u8
-	cgroups, has_cgroups := read_small_file("/proc/self/cgroup", cgroup_buf[:])
+	cgroups, has_cgroups := metrics.read_small_file("/proc/self/cgroup", cgroup_buf[:])
 
 	// Affinity rather than the CPU count: a process pinned to two cores of a
 	// sixty-four core box is running on a two-core machine.
@@ -332,7 +332,7 @@ cgroup_cpus :: proc(cgroups: string) -> (cpus: int, ok: bool) {
 	path_buf: [512]u8
 	// cgroup v2: "$MAX $PERIOD", where $MAX is "max" when there is no limit.
 	if path, found := cgroup_file(path_buf[:], cgroups, V2_MOUNT, "", "cpu.max"); found {
-		if text, read_ok := read_small_file(path, value_buf[:]); read_ok {
+		if text, read_ok := metrics.read_small_file(path, value_buf[:]); read_ok {
 			return parse_cpu_max(text)
 		}
 	}
@@ -344,8 +344,8 @@ cgroup_cpus :: proc(cgroups: string) -> (cpus: int, ok: bool) {
 	period_path := cgroup_file(period_path_buf[:], cgroups, V1_CPU_MOUNT, "cpu", "cpu.cfs_period_us") or_return
 	quota_buf: [64]u8
 	period_buf: [64]u8
-	quota_text := read_small_file(quota_path, quota_buf[:]) or_return
-	period_text := read_small_file(period_path, period_buf[:]) or_return
+	quota_text := metrics.read_small_file(quota_path, quota_buf[:]) or_return
+	period_text := metrics.read_small_file(period_path, period_buf[:]) or_return
 	quota := strconv.parse_i64(strings.trim_space(quota_text)) or_return
 	period := strconv.parse_i64(strings.trim_space(period_text)) or_return
 	return cpus_from_quota(quota, period)
@@ -476,12 +476,12 @@ cgroup_memory :: proc(cgroups: string) -> (bytes: i64, ok: bool) {
 	buf: [64]u8
 	path_buf: [512]u8
 	if path, found := cgroup_file(path_buf[:], cgroups, V2_MOUNT, "", "memory.max"); found {
-		if text, read_ok := read_small_file(path, buf[:]); read_ok {
+		if text, read_ok := metrics.read_small_file(path, buf[:]); read_ok {
 			return parse_memory_max(text)
 		}
 	}
 	v1_path := cgroup_file(path_buf[:], cgroups, V1_MEMORY_MOUNT, "memory", "memory.limit_in_bytes") or_return
-	text := read_small_file(v1_path, buf[:]) or_return
+	text := metrics.read_small_file(v1_path, buf[:]) or_return
 	return parse_memory_max(text)
 }
 
@@ -503,51 +503,6 @@ parse_memory_max :: proc(text: string) -> (bytes: i64, ok: bool) {
 		return 0, false
 	}
 	return value, true
-}
-
-/*
-Read a small pseudo-file into a caller-supplied buffer.
-
-`/sys` and `/proc` files report a size of zero, so the usual read-the-whole-file
-path cannot size a buffer from them and grows one on the heap instead. Everything
-read here is a line or two, so a stack buffer covers it and the config loader
-stays free of allocations it would have to own.
-
-Read to the end rather than trusting one `read`, and refuse a buffer that filled
-completely: half of "10737418240" is "1073", which parses as cleanly as the whole
-of it and would be a limit off by seven orders of magnitude. Nothing read here is
-long enough for that to bind, so a truncation means something is not the file
-this expected, and no limit is a better answer than a wrong one.
-*/
-@(private)
-read_small_file :: proc(path: string, buf: []u8) -> (text: string, ok: bool) {
-	f, err := os.open(path)
-	if err != nil {
-		return "", false
-	}
-	defer os.close(f)
-	n := 0
-	for n < len(buf) {
-		got, read_err := os.read(f, buf[n:])
-		n += got
-		// The end of the file arrives as `io.EOF` rather than a zero-length
-		// read, so it has to be named: treating every error as a failure would
-		// throw away the bytes that were read, and treating every error as the
-		// end would accept a file that stopped halfway through a number.
-		if read_err == io.Error.EOF {
-			break
-		}
-		if read_err != nil {
-			return "", false
-		}
-		if got == 0 {
-			break
-		}
-	}
-	if n <= 0 || n == len(buf) {
-		return "", false
-	}
-	return string(buf[:n]), true
 }
 
 /*

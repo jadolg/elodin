@@ -289,6 +289,8 @@ upstream:
 
 `domains` matches on label boundaries and ignores case: `corp.example` covers
 itself and everything under it, not `notcorp.example`. The longest match wins.
+A domain with a space outside ASCII at either end, such as a no-break space, is
+refused.
 
 A [reload](install.md#signals) rebuilds the routing table along with the upstreams.
 `--check` and the startup log print one line per route that gives something up,

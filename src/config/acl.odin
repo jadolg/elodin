@@ -61,7 +61,12 @@ has to say so.
 Written masked and by hand rather than parsed at startup: these are the bytes a
 security default comes down to, and a table that can be read straight through is
 worth more here than one assembled from strings.
+
+Read-only, as every table in this file is: `default_config` hands this array to
+every configuration it makes, so a write through `cfg.server.allow_from[i]`
+would change the default for every later one. It faults instead.
 */
+@(rodata)
 DEFAULT_ALLOW_FROM := []Prefix {
 	{addr = {0 = 127}, bits = 8}, // 127.0.0.0/8      loopback
 	{addr = {0 = 10}, bits = 8}, // 10.0.0.0/8       private (RFC 1918)
@@ -116,6 +121,7 @@ the ACL, and that question has not been asked. Nothing is silently missing from
 the table on their account; what a table of prefixes cannot express is an
 address that has to be rewritten before it is matched.
 */
+@(rodata)
 PRIVATE_NETWORKS := []Prefix {
 	{addr = {0 = 127}, bits = 8}, // 127.0.0.0/8      loopback
 	{addr = {}, bits = 8}, // 0.0.0.0/8        "this network" (RFC 1122)
@@ -138,6 +144,7 @@ the one private address a client can also reach without this resolver's help.
 `0.0.0.0/8` and `::` are not in it - they are not loopback, whatever a stack
 happens to do with a connection to them.
 */
+@(rodata)
 LOOPBACK_NETWORKS := []Prefix {
 	{addr = {0 = 127}, bits = 8}, // 127.0.0.0/8
 	{addr = {15 = 1}, bits = 128, v6 = true}, // ::1/128
@@ -171,6 +178,7 @@ IPv4 address it carries. `64:ff9b:1::/48` is, for the layouts under it this
 cannot read; its first /96 is unwrapped before the table is consulted, and so is
 judged as what it carries. See `origin_is_public` for the other side of it.
 */
+@(rodata)
 NON_PUBLIC_NETWORKS := []Prefix {
 	{addr = {}, bits = 8}, // 0.0.0.0/8        "this network" (RFC 1122)
 	{addr = {0 = 10}, bits = 8}, // 10.0.0.0/8       private (RFC 1918)
@@ -230,6 +238,7 @@ origin_is_public :: proc(addr: net.Address) -> bool {
 }
 
 @(private)
+@(rodata)
 LOCAL_USE_NAT64 := Prefix {
 	addr = {1 = 0x64, 2 = 0xff, 3 = 0x9b, 5 = 1},
 	bits = 48,
