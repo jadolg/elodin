@@ -176,9 +176,9 @@ test_the_descriptor_line_is_silent_unless_the_limit_is_short :: proc(t: ^testing
 /*
 The premise the line rests on, read from the platform rather than assumed.
 
-`descriptor_limit` is the only reason any of the above is ever printed, and a
-`sysconf` that reported something other than the live soft limit would leave it
-silent on exactly the machine that needs it. Asserted loosely here - the figure
+`metrics.descriptor_limit` is the only reason any of the above is ever printed,
+and a `sysconf` that reported something other than the live soft limit would
+leave it silent on exactly the machine that needs it. Asserted loosely here - the figure
 is the machine's - because the tight check cannot be made without lowering a
 process-wide limit under a test runner that runs its tests in parallel: a
 process whose `RLIMIT_NOFILE` is lowered under it sees the lowered figure here,
@@ -189,7 +189,7 @@ its own to show.
 test_the_descriptor_limit_is_readable :: proc(t: ^testing.T) {
 	testing.expect(
 		t,
-		descriptor_limit() > 0,
+		metrics.descriptor_limit() > 0,
 		"RLIMIT_NOFILE has to be readable, or the shortage warning can never be printed",
 	)
 }
@@ -232,6 +232,41 @@ test_a_burst_that_clears_costs_almost_nothing :: proc(t: ^testing.T) {
 	testing.expect_value(t, after.run.failures, 0)
 	testing.expect_value(t, after.wait, 0)
 	testing.expect(t, after.run.waited < run.waited, "an accepted connection pays some of it back")
+}
+
+/*
+What both accept loops do with an outcome, which `accept_settle` is: a failure
+that waits is counted as `accept_backoff=` and, once the run has lasted, reported
+on the listener's own flag; a failure retried at once is neither; and the run's
+recovery re-arms the flag, however many successes that takes. `.Unknown` keeps
+the report off the process-wide shortage flag, which other tests could see.
+*/
+@(test)
+test_an_accept_outcome_is_counted_reported_and_rearmed :: proc(t: ^testing.T) {
+	s: Server
+	flag := false
+
+	fresh: Accept_Run
+	testing.expect(t, accept_settle(&s, &fresh, .Unknown, "test", &flag), "a failure was not retried")
+	testing.expect_value(t, s.stats.accept_backoff, 0)
+
+	// One wait short of the report, so this failure crosses it.
+	run := Accept_Run {
+		failures = ACCEPT_FAST_RETRIES,
+		waited   = ACCEPT_REPORT_AFTER - ACCEPT_FIRST_WAIT,
+	}
+	testing.expect(t, accept_settle(&s, &run, .Unknown, "test", &flag), "a failure was not retried")
+	testing.expect_value(t, s.stats.accept_backoff, 1)
+	testing.expect(t, flag, "the report did not spend the listener's flag")
+
+	for _ in 0 ..< 2 * int(ACCEPT_REPORT_AFTER / ACCEPT_FIRST_WAIT) {
+		testing.expect(t, !accept_settle(&s, &run, .None, "test", &flag), "an accept counted as a failure")
+		if !flag {
+			break
+		}
+	}
+	testing.expect(t, !flag, "a run that cleared did not re-arm the listener's flag")
+	testing.expect_value(t, s.stats.accept_backoff, 1)
 }
 
 @(test)

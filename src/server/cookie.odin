@@ -430,20 +430,13 @@ one path would not verify on the other.
 */
 @(private)
 cookie_address_bytes :: proc(address: net.Address, out: []u8) -> (n: int, ok: bool) {
-	switch addr in address {
-	case net.IP4_Address:
-		bytes := addr
-		copy(out[:4], bytes[:])
-		return 4, true
-	case net.IP6_Address:
-		for group, i in addr {
-			v := u16(group)
-			out[i * 2] = u8(v >> 8)
-			out[i * 2 + 1] = u8(v)
-		}
-		return 16, true
+	if address == nil {
+		return 0, false
 	}
-	return 0, false
+	bytes, v6 := netx.address_bytes(address)
+	n = 16 if v6 else 4
+	copy(out[:n], bytes[:n])
+	return n, true
 }
 
 @(private)

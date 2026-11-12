@@ -20,9 +20,22 @@ client that never asked for DNSSEC records has them taken back out.
 
 // Extended DNS error codes, RFC 8914. Sent only to clients that use EDNS0,
 // which is the only place there is to put them.
+//
+// Section 4.1, "Other", for `unreadable_rcode_refusal`: the error does not match
+// any of the pre-defined codes, so the EXTRA-TEXT is what carries it. There is
+// no code for "the responder's rcode is not one a client can be handed", and
+// inventing a nearer-sounding one - a network error, an unreachable authority -
+// would say something untrue about an upstream that answered.
+@(private)
+EDE_OTHER :: 0
 EDE_DNSSEC_BOGUS :: 6
 EDE_SIGNATURE_EXPIRED :: 7
 EDE_SIGNATURE_NOT_YET_VALID :: 8
+// Code 15, "Blocked", for the rebinding guard: the answer was withheld for an
+// internal security policy of the resolver's, which is exactly what that is. 17
+// ("Filtered") is the one for filtering the client itself asked for, and nobody
+// asked for this.
+EDE_BLOCKED :: 15
 EDE_NO_REACHABLE_AUTHORITY :: 22
 EDE_UNSUPPORTED_NSEC3_ITERATIONS :: 27
 
@@ -391,23 +404,6 @@ report_chain_fetch_failed :: proc(type: dns.Type, name: string, uerr: upstream.E
 	}
 }
 
-/*
-Turn a validated upstream answer into the one the client gets.
-
-An answer this server is about to vouch for is first cut down to the records it
-actually checked. The verdict covers the RRsets the validator looked at, and a
-response carries whatever else its sender chose to put in the authority and
-additional sections - so passing those on under an AD bit would lend our name to
-a delegation, or an address, that nothing here examined (RFC 4035 section
-3.2.3). `dnssec.strip_unauthenticated` has the whole argument for taking them
-out rather than trying to check them - and for the one part of it that is
-checked instead, the address hints beside an HTTPS, SVCB, SRV or MX answer.
-
-A client that set DO asked for the signatures and keeps every record that
-survived the prune above. One that did not has the DNSSEC records taken back
-out, because RFC 4035 says not to send them unasked and because they would
-otherwise push ordinary answers past the point where they need a retry over TCP.
-*/
 // Opens once a window for an answer that lost its AD bit to a failed rebuild; see below.
 @(private)
 prune_failure_reported: logx.Gate
@@ -428,6 +424,23 @@ the count lives. See `report_bogus`.
 @(private)
 chain_walk_shed_reported: bool
 
+/*
+Turn a validated upstream answer into the one the client gets.
+
+An answer this server is about to vouch for is first cut down to the records it
+actually checked. The verdict covers the RRsets the validator looked at, and a
+response carries whatever else its sender chose to put in the authority and
+additional sections - so passing those on under an AD bit would lend our name to
+a delegation, or an address, that nothing here examined (RFC 4035 section
+3.2.3). `dnssec.strip_unauthenticated` has the whole argument for taking them
+out rather than trying to check them - and for the one part of it that is
+checked instead, the address hints beside an HTTPS, SVCB, SRV or MX answer.
+
+A client that set DO asked for the signatures and keeps every record that
+survived the prune above. One that did not has the DNSSEC records taken back
+out, because RFC 4035 says not to send them unasked and because they would
+otherwise push ordinary answers past the point where they need a retry over TCP.
+*/
 @(private)
 present_response :: proc(
 	wire: []u8,
@@ -521,14 +534,6 @@ present_response :: proc(
 }
 
 /*
-Take the AD bit back off for a client that never asked about authentication.
-
-RFC 6840 section 5.8: the bit is an answer to a question, and a client that set
-neither DO nor AD did not ask it. Applied to cache hits as much as to fresh
-answers, so which client happened to warm an entry cannot change what a later
-one is told.
-*/
-/*
 Settle the header bits that are this server's to state: AA, RA, RD, Z, CD and AD.
 
 Every answer goes through here, whether it came from the cache or from an
@@ -577,6 +582,14 @@ settle_header :: proc(wire: []u8, query: dns.Message, validated: bool) {
 	set_ad_bit(wire, false)
 }
 
+/*
+Take the AD bit back off for a client that never asked about authentication.
+
+RFC 6840 section 5.8: the bit is an answer to a question, and a client that set
+neither DO nor AD did not ask it. Applied to cache hits as much as to fresh
+answers, so which client happened to warm an entry cannot change what a later
+one is told.
+*/
 @(private)
 apply_ad_policy :: proc(wire: []u8, query: dns.Message) {
 	if dns.edns_do(query) || query.flags.ad {
@@ -728,16 +741,16 @@ zone_gate :: proc(table: ^[ZONE_GATES]logx.Gate, q: dns.Question, result: dnssec
 	if i := strings.index(result.detail, ": "); i >= 0 {
 		zone = result.detail[:i]
 	}
-	// FNV-1a over the name with ASCII folded, which is DNS's case rule, in
-	// place: a flood picks the names, so nothing here allocates per refusal.
+	/*
+	FNV-1a over the name with ASCII folded, which is DNS's case rule, a byte at a
+	time: a flood picks the names, so nothing here allocates per refusal, and the
+	detail's zone has no length bound a buffer for `dns.fold_into` could be sized
+	to.
+	*/
 	key := dns.name_trim_root(zone)
 	h := u32(0x811c9dc5)
 	for i in 0 ..< len(key) {
-		c := key[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		h = (h ~ u32(c)) * 0x01000193
+		h = (h ~ u32(dns.fold_byte(key[i]))) * 0x01000193
 	}
 	return &table[h % ZONE_GATES]
 }

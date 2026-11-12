@@ -411,7 +411,7 @@ is not a name this synthesises for.
 */
 @(private)
 parse_reverse_v4 :: proc(name: string) -> (addr: [4]u8, ok: bool) {
-	if !name_below(name, V4_REVERSE_SUFFIX) {
+	if !dns.name_below(name, V4_REVERSE_SUFFIX) {
 		return {}, false
 	}
 	rest := name[:len(name) - len(V4_REVERSE_SUFFIX) - 1]
@@ -448,7 +448,7 @@ is a zone cut or a typo, and either way names no host.
 */
 @(private)
 parse_reverse_v6 :: proc(name: string) -> (addr: [16]u8, ok: bool) {
-	if !name_below(name, V6_REVERSE_SUFFIX) {
+	if !dns.name_below(name, V6_REVERSE_SUFFIX) {
 		return {}, false
 	}
 	rest := name[:len(name) - len(V6_REVERSE_SUFFIX) - 1]

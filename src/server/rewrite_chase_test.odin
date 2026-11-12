@@ -117,6 +117,23 @@ chase_ask :: proc(
 	return msg, true
 }
 
+// The request `resolve_query` holds for `msg` from a UDP client, for calling
+// `chase_rewrite_alias` directly.
+chase_state :: proc(s: ^Server, msg: dns.Message, spent: ^int, allocator: mem.Allocator) -> Query_State {
+	return Query_State {
+		s = s,
+		msg = msg,
+		q = msg.question[0],
+		proto = .UDP,
+		client = "127.0.0.1:5555",
+		limit = 512,
+		started = time.tick_now(),
+		spent = spent,
+		allocator = allocator,
+		pool = .Shared,
+	}
+}
+
 @(test)
 test_a_cname_rewrite_to_a_rewritten_name_carries_its_address :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
@@ -251,20 +268,8 @@ test_a_chased_target_that_cannot_be_read_back_is_servfail :: proc(t: ^testing.T)
 		return
 	}
 	spent := dns.REQUEST_DECODE_BUDGET + 1
-	out, _ := chase_rewrite_alias(
-		&s,
-		plain,
-		cname,
-		msg,
-		.UDP,
-		"127.0.0.1:5555",
-		512,
-		Cookie_Request{},
-		time.tick_now(),
-		&spent,
-		context.temp_allocator,
-		.Shared,
-	)
+	st := chase_state(&s, msg, &spent, context.temp_allocator)
+	out, _ := chase_rewrite_alias(&st, plain, cname)
 	resp, derr := dns.decode_message(out, context.temp_allocator)
 	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
 		return
@@ -369,7 +374,8 @@ chase_dry_sweep :: proc(
 		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
 		spent := 0
 		before := chase_answers_counted(&s)
-		out, counted := chase_rewrite_alias(&s, plain, cname, msg, .UDP, "127.0.0.1:5555", 512, Cookie_Request{}, time.tick_now(), &spent, one, .Shared)
+		st := chase_state(&s, msg, &spent, one)
+		out, counted := chase_rewrite_alias(&st, plain, cname)
 		if f.seen < n {
 			break
 		}

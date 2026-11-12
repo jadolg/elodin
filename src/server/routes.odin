@@ -137,7 +137,7 @@ the zone, because a CNAME or DNAME can take any answer there.
 route_meets_an_anchor :: proc(s: ^Server, route: Zone_Route) -> bool {
 	for domain in route.domains {
 		for zone in live(s).anchor_zones {
-			if name_at_or_below(domain, zone) || name_at_or_below(zone, domain) {
+			if dns.name_at_or_below(domain, zone) || dns.name_at_or_below(zone, domain) {
 				return true
 			}
 		}
@@ -154,7 +154,7 @@ two routes claiming the same domain are refused at load, and two domains of the
 same length that both match one name would have to be the same domain.
 
 `name` is the question name in presentation form with its root dot, which is
-what `resolve_query` holds. Matching is `name_at_or_below`: label boundaries and
+what `resolve_query` holds. Matching is `dns.name_at_or_below`: label boundaries and
 case-insensitive, so `notcorp.example.` is outside `corp.example.` and
 `NAS.Corp.Example.` is inside it.
 
@@ -970,7 +970,7 @@ zone_route :: proc(s: ^Server, name: string) -> (route: Zone_Route, found: bool)
 	best := -1
 	for candidate in live(s).routes {
 		for domain in candidate.domains {
-			if !name_at_or_below(name, domain) {
+			if !dns.name_at_or_below(name, domain) {
 				continue
 			}
 			if best < 0 || len(domain) > best {

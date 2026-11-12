@@ -6,7 +6,7 @@ import "core:sync"
 import "core:time"
 import "elodin:config"
 import "elodin:logx"
-import "elodin:metrics"
+import "elodin:loop"
 
 /*
 Whether an accept error is a failure at all.
@@ -350,6 +350,47 @@ accept_action :: proc(err: net.Accept_Error, run: Accept_Run) -> Accept_Action {
 }
 
 /*
+Everything an accept loop does with one outcome, and whether it was a failure,
+which the caller answers by going round again.
+
+Every field of the action is consumed, on every path: a re-arm read only after a
+successful accept is one a quiet listener - whose run is taken to zero by the
+poll tick far more often than by a connection - would never perform. A failure
+waits as `accept_action` says, counted as `accept_backoff=` and reported once
+the run has lasted long enough to be worth a line.
+
+`loop.sleep` waits on the loop where there is one, and is `time.sleep` on the
+metrics endpoint's own thread, which has none.
+*/
+@(private)
+accept_settle :: proc(
+	s: ^Server,
+	run: ^Accept_Run,
+	err: net.Accept_Error,
+	listener: string,
+	listener_flag: ^bool,
+) -> (
+	failed: bool,
+) {
+	act := accept_action(err, run^)
+	run^ = act.run
+	if act.recovered {
+		rearm_accept_reports(listener_flag)
+	}
+	if err == nil {
+		return false
+	}
+	if act.wait > 0 {
+		sync.atomic_add(&s.stats.accept_backoff, 1)
+		if act.report {
+			report_accept_failure(listener, act.run, err, listener_flag)
+		}
+		_ = loop.sleep(act.wait)
+	}
+	return true
+}
+
+/*
 Say why an accept loop is waiting, once, and then quietly.
 
 `report_spawn_failure`'s reasoning, met one step earlier: this is the same loop,
@@ -393,8 +434,10 @@ rearm_accept_reports :: proc(listener_flag: ^bool) {
 	sync.atomic_store(listener_flag, false)
 }
 
+// What a once-then-quietly report says, and the flag that makes it once; see
+// `report_failure_words`.
 @(private)
-Accept_Failure_Words :: struct {
+Failure_Words :: struct {
 	reported: ^bool,
 	// The `debug` line, for every occurrence after the first.
 	brief:    string,
@@ -403,17 +446,44 @@ Accept_Failure_Words :: struct {
 	hint:     string,
 }
 
+/*
+Say `words` once at `warn`, with the hint under it, and at `debug` after that;
+`args` fill both `brief` and `line`.
+
+The hint goes through `%s` rather than as the format itself: it is long prose
+that an operator-facing edit will touch, and the day one gains a percent sign it
+would print `%!s(MISSING)` in the one line this design allots.
+
+The scratch is released after: the accept loops, which both callers run on, are
+the one place that never resets their own temp arena, and the line was formatted
+out of it.
+*/
 @(private)
-accept_failure_words :: proc(shortage: bool, listener_flag: ^bool) -> Accept_Failure_Words {
+report_failure_words :: proc(words: Failure_Words, args: ..any) {
+	say, first := report_once(words.reported, logx.enabled(.Debug))
+	if !say {
+		return
+	}
+	defer free_all(context.temp_allocator)
+	if !first {
+		logx.debugf(words.brief, ..args)
+		return
+	}
+	logx.warnf(words.line, ..args)
+	logx.warnf("%s", words.hint)
+}
+
+@(private)
+accept_failure_words :: proc(shortage: bool, listener_flag: ^bool) -> Failure_Words {
 	if shortage {
-		return Accept_Failure_Words {
+		return Failure_Words {
 			reported = &accept_shortage_reported,
 			brief = "%s: still out of descriptors, waiting %v before accepting again (%v)",
 			line = "%s: cannot accept, the process is out of file descriptors - waiting %v between attempts until that clears (%v)",
 			hint = "raise the descriptor limit (RLIMIT_NOFILE, LimitNOFILE= in the systemd unit) so it covers server.max_connections with room over; until it does, no connection can be accepted on any listener, and each wait is counted as accept_backoff= in the stats line",
 		}
 	}
-	return Accept_Failure_Words {
+	return Failure_Words {
 		reported = listener_flag,
 		brief = "%s: accept is still failing, waiting %v before trying again (%v)",
 		line = "%s: accept keeps failing and this listening socket may no longer be usable - waiting %v between attempts (%v)",
@@ -450,25 +520,7 @@ report_accept_failure :: proc(listener: string, run: Accept_Run, err: net.Accept
 	is now taking queue errors waits fifty milliseconds, and a line saying a
 	second would describe neither the past nor the present.
 	*/
-	words := accept_failure_words(run.shortage, listener_flag)
-	settles_at := accept_ceiling(err)
-	say, first := report_once(words.reported, logx.enabled(.Debug))
-	if !say {
-		return
-	}
-	// As in `report_spawn_failure`: the accept loop is the one place that never
-	// resets its own temp arena, and the line was formatted out of it.
-	defer free_all(context.temp_allocator)
-
-	if !first {
-		logx.debugf(words.brief, listener, settles_at, err)
-		return
-	}
-	logx.warnf(words.line, listener, settles_at, err)
-	// Through `%s` rather than as the format itself: it is long prose that an
-	// operator-facing edit will touch, and the day one gains a percent sign it
-	// would print `%!s(MISSING)` in the one line this design allots.
-	logx.warnf("%s", words.hint)
+	report_failure_words(accept_failure_words(run.shortage, listener_flag), listener, accept_ceiling(err), err)
 }
 
 /*
@@ -628,16 +680,4 @@ descriptor_limit_line :: proc(soft_limit: int, d: Descriptor_Demand) -> (line: s
 		2 * d.loops,
 		DESCRIPTOR_RESERVE,
 	), true
-}
-
-/*
-The soft `RLIMIT_NOFILE`, or 0 where it cannot be read.
-
-`metrics.descriptor_limit` rather than a copy of it here: `process_max_fds`
-publishes the same figure from the same `sysconf(_SC_OPEN_MAX)`, and two readings
-of one limit are two things to keep in step. It reports the live soft limit,
-verified against a process whose limit was lowered under it.
-*/
-descriptor_limit :: proc() -> int {
-	return metrics.descriptor_limit()
 }

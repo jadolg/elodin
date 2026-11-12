@@ -78,6 +78,13 @@ SVC_KEY_PORT :: u16(3)
 @(private)
 SVC_KEY_DOHPATH :: u16(7)
 
+// The ports a designation leaves unsaid: DoT's (RFC 7858 section 3.1), and the
+// `https` scheme's for DoH (RFC 9110 section 4.2.2).
+@(private)
+DOT_DEFAULT_PORT :: 853
+@(private)
+DOH_DEFAULT_PORT :: 443
+
 /*
 Record whether `ctx`, the certificate `listener` now serves, covers `ddr.name`.
 
@@ -134,7 +141,7 @@ RESOLVER_ARPA_TTL :: u32(300)
 // the second copy of the name.
 @(private)
 is_resolver_arpa :: proc(name: string) -> bool {
-	return name_at_or_below(name, RESOLVER_ARPA)
+	return dns.name_at_or_below(name, RESOLVER_ARPA)
 }
 
 /*
@@ -207,10 +214,10 @@ ddr_records :: proc(s: ^Server, owner: string, allocator: mem.Allocator) -> (rec
 	dot, doh := sync.atomic_load(&s.ddr.dot), sync.atomic_load(&s.ddr.doh)
 	dot_params, doh_params: []u8
 	if dot {
-		dot_params = svc_params(DOT_ALPN, cfg.listeners.dot.port, 853, "", allocator) or_return
+		dot_params = svc_params(DOT_ALPN, cfg.listeners.dot.port, DOT_DEFAULT_PORT, "", allocator) or_return
 	}
 	if doh {
-		doh_params = svc_params(DOH_ALPN, cfg.listeners.doh.port, 443, cfg.listeners.doh.path, allocator) or_return
+		doh_params = svc_params(DOH_ALPN, cfg.listeners.doh.port, DOH_DEFAULT_PORT, cfg.listeners.doh.path, allocator) or_return
 	}
 	// Reserved whole, so neither append below can drop a record.
 	list := dns.alloc_list([dynamic]dns.Record, 2, allocator) or_return
@@ -370,7 +377,7 @@ ddr_check :: proc(cfg: ^config.Config, allocator := context.allocator) -> (probl
 		case dns.Rdata_A:
 			append(&addresses, net.IP4_Address(d.addr))
 		case dns.Rdata_AAAA:
-			append(&addresses, transmute(net.IP6_Address)d.addr)
+			append(&addresses, netx.ip6_from_bytes(d.addr))
 		}
 	}
 	if len(addresses) == 0 {

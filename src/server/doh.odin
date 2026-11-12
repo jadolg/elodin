@@ -594,23 +594,8 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 		if !ok {
 			// The connection ends either way: `keep_alive` is false, so nothing
 			// further is read off a connection whose next byte this server cannot
-			// place. A `status` of 0 is a request that is not answered at all -
-			// see `read_http_request`.
-			if status != 0 {
-				_ = send_http_error(
-					conn,
-					"doh",
-					status,
-					http_refusal_message(status),
-					false,
-					head = req.method == "HEAD",
-				)
-				// The refused request may have declared a body that was never read,
-				// and the close below would take the answer with it. That body may
-				// also still be arriving, which is what picks the longer of the two
-				// idle waits - see `HTTP_LINGER_BODY_IDLE`.
-				http_linger(conn, HTTP_LINGER_BODY_IDLE)
-			}
+			// place.
+			refuse_http_request(conn, "doh", status, req.method)
 			free_all(context.temp_allocator)
 			return
 		}
@@ -694,37 +679,30 @@ serve_doh_request :: proc(
 		http_linger(conn, STREAM_LINGER_IDLE)
 		return written
 	}
+	head := req.method == "HEAD"
 	mc_path := startup_config(s).listeners.doh.mobileconfig_path
 	if mc_path != "" && req.path == mc_path {
-		return serve_doh_mobileconfig(s, conn, req)
+		profile, status, why, ok := doh_profile(s, req.method, req.host, "missing or invalid Host header")
+		if !ok {
+			allow := MOBILECONFIG_METHODS if status == 405 else ""
+			return send_http_error(conn, "doh", status, why, req.keep_alive, allow, head)
+		}
+		return send_http_ok(
+			conn,
+			DOH_MOBILECONFIG_CONTENT_TYPE,
+			profile,
+			req.keep_alive,
+			"Content-Disposition",
+			`attachment; filename="elodin-doh.mobileconfig"`,
+		)
 	}
 	if req.path != path {
-		return send_http_error(conn, "doh", 404, "not found", req.keep_alive, head = req.method == "HEAD")
+		return send_http_error(conn, "doh", 404, "not found", req.keep_alive, head = head)
 	}
 
-	query: []u8
-	switch {
-	case req.method == "POST":
-		if !doh_content_type_ok(req.content_type) {
-			return send_http_error(conn, "doh", 415, "unsupported media type", req.keep_alive)
-		}
-		query = req.body
-	case req.method == "GET":
-		encoded, found := query_param(req.query, "dns")
-		if !found {
-			return send_http_error(conn, "doh", 400, "missing dns parameter", req.keep_alive)
-		}
-		decoded, dok := decode_dns_param(encoded)
-		if !dok || len(decoded) == 0 {
-			return send_http_error(conn, "doh", 400, "malformed dns parameter", req.keep_alive)
-		}
-		query = decoded
-	case:
-		return send_http_error(conn, "doh", 405, "method not allowed", req.keep_alive, DOH_METHODS, req.method == "HEAD")
-	}
-
-	if len(query) < dns.HEADER_SIZE {
-		return send_http_error(conn, "doh", 400, "message too short", req.keep_alive)
+	query, status, why, is_query := doh_query_message(req.method, req.content_type, req.body, req.query)
+	if !is_query {
+		return send_http_error(conn, "doh", status, why, req.keep_alive, DOH_METHODS if status == 405 else "", head)
 	}
 
 	/*
@@ -788,38 +766,79 @@ serve_doh_request :: proc(
 	if !ok || len(response) == 0 {
 		return send_http_error(conn, "doh", 500, "no response", req.keep_alive)
 	}
-
-	b := strings.builder_make(context.temp_allocator)
-	strings.write_string(&b, "HTTP/1.1 200 OK\r\nContent-Type: ")
-	strings.write_string(&b, DOH_CONTENT_TYPE)
-	strings.write_string(&b, "\r\nContent-Length: ")
-	strings.write_int(&b, len(response))
-	strings.write_string(&b, "\r\nCache-Control: max-age=")
-	strings.write_int(&b, int(max_age))
-	strings.write_string(&b, "\r\nDate: ")
-	strings.write_string(&b, now_http_date(context.temp_allocator))
-	strings.write_string(&b, "\r\nServer: elodin/")
-	strings.write_string(&b, VERSION)
-	strings.write_string(&b, "\r\nConnection: ")
-	strings.write_string(&b, "keep-alive" if req.keep_alive else "close")
-	strings.write_string(&b, "\r\n\r\n")
-
-	head := strings.to_string(b)
-	if !conn_write_all(conn, transmute([]u8)head) {
-		return false
-	}
-	return conn_write_all(conn, response)
+	return send_http_ok(
+		conn,
+		DOH_CONTENT_TYPE,
+		response,
+		req.keep_alive,
+		"Cache-Control",
+		doh_cache_control(max_age),
+	)
 }
 
 /*
-Serve the Apple .mobileconfig profile that points a device at this DoH endpoint.
+The DNS message a request to the DoH endpoint is asking about, over either HTTP
+version, or the status and reason that say it was not asking about one.
+
+It decides both whether a request is charged and what it asks: `serve_doh_request`
+charges once it passes, and over HTTP/2 `h2_charged` asks it on the reader fiber
+before `build_h2_response` asks it again for the message. One check for every
+caller, because two that disagreed would spend a budget on a 400, or let the same
+400 through for free.
+
+`query` is the request target's query string, which carries the GET form's
+`dns` parameter (RFC 8484 4.1).
+*/
+@(private)
+doh_query_message :: proc(
+	method: string,
+	content_type: string,
+	body: []u8,
+	query: string,
+) -> (
+	message: []u8,
+	status: int,
+	why: string,
+	ok: bool,
+) {
+	switch method {
+	case "POST":
+		if !doh_content_type_ok(content_type) {
+			return nil, 415, "unsupported media type", false
+		}
+		message = body
+	case "GET":
+		encoded, found := query_param(query, "dns")
+		if !found {
+			return nil, 400, "missing dns parameter", false
+		}
+		decoded, dok := decode_dns_param(encoded)
+		if !dok || len(decoded) == 0 {
+			return nil, 400, "malformed dns parameter", false
+		}
+		message = decoded
+	case:
+		return nil, 405, "method not allowed", false
+	}
+
+	if len(message) < dns.HEADER_SIZE {
+		return nil, 400, "message too short", false
+	}
+	return message, 0, "", true
+}
+
+/*
+The Apple .mobileconfig profile that points a device at this DoH endpoint, over
+either HTTP version, or the status and reason that turn the request away.
 
 A GET, since a device downloads it by navigating to the URL; anything else is a
-405. The URL inside it is built from the request's own `Host` header, so a
-client that sends none - or one this server could not have a certificate for -
-gets a 400 rather than a profile naming a host that does not resolve. The path
-the profile has the device query is `listeners.doh.path`, which the signer was
-built with; nothing here has to be told it a second time.
+405. The URL inside it is built from `host` - the request's `Host`, or its
+`:authority` over HTTP/2 - so a request that carries none, or one this server
+could not have a certificate for, gets a 400 rather than a profile naming a host
+that does not resolve. `bad_host` is that 400's reason, naming the field the way
+the request's own HTTP version spells it. The path the profile has the device
+query is `listeners.doh.path`, which the signer was built with; nothing here has
+to be told it a second time.
 
 What comes back is signed with the listener's own certificate, so the device
 reports a profile it can verify rather than an unsigned one. `profile.odin` owns
@@ -828,52 +847,44 @@ refusals this endpoint could not have made before there was a signature to make
 them about.
 */
 @(private)
-serve_doh_mobileconfig :: proc(s: ^Server, conn: Conn, req: Http_Request_In) -> bool {
-	if req.method != "GET" {
-		return send_http_error(
-			conn,
-			"doh",
-			405,
-			"method not allowed",
-			req.keep_alive,
-			MOBILECONFIG_METHODS,
-			req.method == "HEAD",
-		)
+doh_profile :: proc(
+	s: ^Server,
+	method: string,
+	host: string,
+	bad_host: string,
+) -> (
+	profile: []u8,
+	status: int,
+	why: string,
+	ok: bool,
+) {
+	if method != "GET" {
+		return nil, 405, "method not allowed", false
 	}
 	// Cheap syntax first: a Host with a byte no authority may contain is turned
 	// away without the certificate being consulted about it.
-	if !valid_mobileconfig_host(req.host) {
-		return send_http_error(conn, "doh", 400, "missing or invalid Host header", req.keep_alive)
+	if !valid_mobileconfig_host(host) {
+		return nil, 400, bad_host, false
 	}
-
-	profile, status := profile_for_host(s.profiles, req.host, tlsx.unix_now(), context.temp_allocator)
-	switch status {
+	signed, verdict := profile_for_host(s.profiles, host, tlsx.unix_now(), context.temp_allocator)
+	switch verdict {
 	case .Unknown_Host:
-		return send_http_error(conn, "doh", 400, "not a host and port this server serves", req.keep_alive)
+		return nil, 400, "not a host and port this server serves", false
 	case .Unavailable:
-		return send_http_error(conn, "doh", 503, "profile signing unavailable", req.keep_alive)
+		return nil, 503, "profile signing unavailable", false
 	case .OK:
 	}
+	return signed, 0, "", true
+}
 
+// The `Cache-Control` value for an answer `doh_max_age` gave `max_age`, over
+// either HTTP version.
+@(private)
+doh_cache_control :: proc(max_age: u32) -> string {
 	b := strings.builder_make(context.temp_allocator)
-	strings.write_string(&b, "HTTP/1.1 200 OK\r\nContent-Type: ")
-	strings.write_string(&b, DOH_MOBILECONFIG_CONTENT_TYPE)
-	strings.write_string(&b, "\r\nContent-Length: ")
-	strings.write_int(&b, len(profile))
-	strings.write_string(&b, "\r\nContent-Disposition: attachment; filename=\"elodin-doh.mobileconfig\"")
-	strings.write_string(&b, "\r\nDate: ")
-	strings.write_string(&b, now_http_date(context.temp_allocator))
-	strings.write_string(&b, "\r\nServer: elodin/")
-	strings.write_string(&b, VERSION)
-	strings.write_string(&b, "\r\nConnection: ")
-	strings.write_string(&b, "keep-alive" if req.keep_alive else "close")
-	strings.write_string(&b, "\r\n\r\n")
-
-	head := strings.to_string(b)
-	if !conn_write_all(conn, transmute([]u8)head) {
-		return false
-	}
-	return conn_write_all(conn, profile)
+	strings.write_string(&b, "max-age=")
+	strings.write_int(&b, int(max_age))
+	return strings.to_string(b)
 }
 
 /*
@@ -1026,20 +1037,66 @@ that a path added later has to answer the question rather than inherit an answer
 */
 @(private)
 http_linger :: proc(conn: Conn, idle: time.Duration) {
-	// Not `net.set_option`: over DoH the connection is a TLS one, where the socket
-	// option stopped applying at the handshake - see `conn_set_read_timeout`.
-	conn_set_read_timeout(conn, idle)
-	start := loop.tick_now()
-	// Scratch, not a local: see `stream_linger`.
-	chunk := make([]u8, 4096, context.temp_allocator)
-	discarded := 0
-	for discarded < HTTP_LINGER_BYTES && loop.tick_since(start) < HTTP_LINGER_TIMEOUT {
-		n, ok := conn_read(conn, chunk)
-		if !ok {
-			return
-		}
-		discarded += n
+	conn_linger(conn, idle, HTTP_LINGER_TIMEOUT, HTTP_LINGER_BYTES)
+}
+
+/*
+Answer a request `read_http_request` refused with the status it handed back,
+then drain what the client sent before the close takes the answer with it. A
+`status` of 0 is a request answered with nothing - see `read_http_request` - and
+nothing is drained for it either.
+
+Both HTTP endpoints refuse this way, the connection closing after: `who` names
+the one in the debug line, and a refusal to a HEAD goes without content (RFC 9110
+9.3.2). The refused request may have declared a body that was never read and may
+still be arriving, which is what picks the longer of the two idle waits - see
+`HTTP_LINGER_BODY_IDLE`.
+*/
+@(private)
+refuse_http_request :: proc(conn: Conn, who: string, status: int, method: string) {
+	if status == 0 {
+		return
 	}
+	_ = send_http_error(conn, who, status, http_refusal_message(status), false, head = method == "HEAD")
+	http_linger(conn, HTTP_LINGER_BODY_IDLE)
+}
+
+/*
+A 200 carrying `body`, and the one field beside the common ones that each answer
+has its own reason for: Cache-Control on a DoH answer and on the metrics page,
+Content-Disposition on the profile. A reply to `head` is its fields alone (RFC
+9112 6.3), carrying the Content-Length GET would have (RFC 9110 8.6).
+*/
+@(private)
+send_http_ok :: proc(
+	conn: Conn,
+	content_type: string,
+	body: []u8,
+	keep_alive: bool,
+	field: string,
+	value: string,
+	head := false,
+) -> bool {
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_string(&b, "HTTP/1.1 200 OK\r\nContent-Type: ")
+	strings.write_string(&b, content_type)
+	strings.write_string(&b, "\r\nContent-Length: ")
+	strings.write_int(&b, len(body))
+	strings.write_string(&b, "\r\n")
+	strings.write_string(&b, field)
+	strings.write_string(&b, ": ")
+	strings.write_string(&b, value)
+	strings.write_string(&b, "\r\nDate: ")
+	strings.write_string(&b, now_http_date(context.temp_allocator))
+	strings.write_string(&b, "\r\nServer: elodin/")
+	strings.write_string(&b, VERSION)
+	strings.write_string(&b, "\r\nConnection: ")
+	strings.write_string(&b, "keep-alive" if keep_alive else "close")
+	strings.write_string(&b, "\r\n\r\n")
+	if !conn_write_all(conn, transmute([]u8)strings.to_string(b)) {
+		return false
+	}
+	return head || conn_write_all(conn, body)
 }
 
 // `who` names the endpoint in the debug line. Both HTTP endpoints this server
