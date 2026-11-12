@@ -80,26 +80,11 @@ no budget every member is.
 @(test)
 test_a_race_starts_only_the_legs_its_budget_has_room_for :: proc(t: ^testing.T) {
 	m := Mock{}
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
+	bound, responder, ok := serve_udp_mock(t, &m, mock_loop)
+	if !ok {
 		return
 	}
-	m.socket = socket
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		net.close(socket)
-		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
-		return
-	}
-	responder := thread.create_and_start_with_poly_data(&m, mock_loop)
-	defer {
-		sync.atomic_store(&m.stop, true)
-		thread.join(responder)
-		thread.destroy(responder)
-		net.close(socket)
-	}
+	defer stop_udp_mock(&m, responder)
 
 	cfg := config.Upstream_Config {
 		strategy = .Race,
@@ -170,26 +155,11 @@ would take it and the client would be sent nothing.
 @(test)
 test_a_race_answer_that_cannot_be_copied_is_not_an_empty_answer :: proc(t: ^testing.T) {
 	m := Mock{}
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
+	bound, responder, ok := serve_udp_mock(t, &m, mock_loop)
+	if !ok {
 		return
 	}
-	m.socket = socket
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		net.close(socket)
-		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
-		return
-	}
-	responder := thread.create_and_start_with_poly_data(&m, mock_loop)
-	defer {
-		sync.atomic_store(&m.stop, true)
-		thread.join(responder)
-		thread.destroy(responder)
-		net.close(socket)
-	}
+	defer stop_udp_mock(&m, responder)
 
 	cfg := config.Upstream_Config {
 		strategy = .Race,
@@ -245,41 +215,11 @@ test_race_worker_releases_its_scratch :: proc(t: ^testing.T) {
 	}
 
 	m := Mock{}
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
+	u, responder, ok := start_udp_mock(t, &m, mock_loop)
+	if !ok {
 		return
 	}
-	m.socket = socket
-	// Without this the responder would sit in recv_udp and never see `stop`.
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		net.close(socket)
-		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
-		return
-	}
-
-	responder := thread.create_and_start_with_poly_data(&m, mock_loop)
-	defer {
-		sync.atomic_store(&m.stop, true)
-		thread.join(responder)
-		thread.destroy(responder)
-		net.close(socket)
-	}
-
-	u, uerr := make_upstream(
-		config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port},
-		0,
-		time.Second,
-		context.allocator,
-	)
-	testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr)
-	if uerr != .None {
-		return
-	}
-	defer destroy(u)
+	defer stop_udp_mock(&m, responder, u)
 
 	query := dns.Message {
 		id       = 0x2A2A,
@@ -809,25 +749,6 @@ wrong_question_loop :: proc(m: ^Mock) {
 }
 
 /*
-Bind a loopback UDP socket and report the endpoint it landed on.
-*/
-@(private = "file")
-bind_loopback_udp :: proc(t: ^testing.T) -> (socket: net.UDP_Socket, endpoint: net.Endpoint, ok: bool) {
-	sock, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
-		return {}, {}, false
-	}
-	bound, berr := net.bound_endpoint(sock)
-	if berr != nil {
-		net.close(sock)
-		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
-		return {}, {}, false
-	}
-	return sock, bound, true
-}
-
-/*
 A bootstrap answer has to come from the server that was asked.
 
 The 16-bit ID is all an off-path attacker has to guess, and the entry it lands in
@@ -836,26 +757,17 @@ is cached for an hour and used to resolve blocklist hosts as well as upstreams.
 @(test)
 test_bootstrap_ignores_a_reply_from_another_port :: proc(t: ^testing.T) {
 	m := Spoof_Mock{}
-	server, bound, ok := bind_loopback_udp(t)
+	spoofer, _, spoof_ok := bind_loopback_udp(t)
+	if !spoof_ok {
+		return
+	}
+	defer net.close(spoofer)
+	m.spoofer = spoofer
+	bound, responder, ok := serve_udp_mock(t, &m, spoof_loop)
 	if !ok {
 		return
 	}
-	spoofer, _, spoof_ok := bind_loopback_udp(t)
-	if !spoof_ok {
-		net.close(server)
-		return
-	}
-	m.socket, m.spoofer = server, spoofer
-	set_socket_timeouts(server, 50 * time.Millisecond)
-
-	responder := thread.create_and_start_with_poly_data(&m, spoof_loop)
-	defer {
-		sync.atomic_store(&m.stop, true)
-		thread.join(responder)
-		thread.destroy(responder)
-		net.close(server)
-		net.close(spoofer)
-	}
+	defer stop_udp_mock(&m, responder)
 
 	addr, found := bootstrap_query(
 		net.endpoint_to_string(bound, context.temp_allocator),
@@ -872,20 +784,11 @@ test_bootstrap_ignores_a_reply_from_another_port :: proc(t: ^testing.T) {
 @(test)
 test_bootstrap_ignores_a_reply_to_another_question :: proc(t: ^testing.T) {
 	m := Mock{}
-	server, bound, ok := bind_loopback_udp(t)
+	bound, responder, ok := serve_udp_mock(t, &m, wrong_question_loop)
 	if !ok {
 		return
 	}
-	m.socket = server
-	set_socket_timeouts(server, 50 * time.Millisecond)
-
-	responder := thread.create_and_start_with_poly_data(&m, wrong_question_loop)
-	defer {
-		sync.atomic_store(&m.stop, true)
-		thread.join(responder)
-		thread.destroy(responder)
-		net.close(server)
-	}
+	defer stop_udp_mock(&m, responder)
 
 	addr, found := bootstrap_query(
 		net.endpoint_to_string(bound, context.temp_allocator),
@@ -903,20 +806,11 @@ test_bootstrap_ignores_a_reply_to_another_question :: proc(t: ^testing.T) {
 @(test)
 test_bootstrap_accepts_the_server_it_asked :: proc(t: ^testing.T) {
 	m := Mock{}
-	server, bound, ok := bind_loopback_udp(t)
+	bound, responder, ok := serve_udp_mock(t, &m, a_record_loop)
 	if !ok {
 		return
 	}
-	m.socket = server
-	set_socket_timeouts(server, 50 * time.Millisecond)
-
-	responder := thread.create_and_start_with_poly_data(&m, a_record_loop)
-	defer {
-		sync.atomic_store(&m.stop, true)
-		thread.join(responder)
-		thread.destroy(responder)
-		net.close(server)
-	}
+	defer stop_udp_mock(&m, responder)
 
 	addr, found := bootstrap_query(
 		net.endpoint_to_string(bound, context.temp_allocator),
@@ -1004,20 +898,11 @@ test_bootstrap_query_id_does_not_follow_the_clock :: proc(t: ^testing.T) {
 	MAX_IN_WINDOW :: 24
 
 	m := Id_Mock{}
-	server, bound, ok := bind_loopback_udp(t)
+	bound, responder, ok := serve_udp_mock(t, &m, id_recording_loop)
 	if !ok {
 		return
 	}
-	m.socket = server
-	set_socket_timeouts(server, 50 * time.Millisecond)
-
-	responder := thread.create_and_start_with_poly_data(&m, id_recording_loop)
-	defer {
-		sync.atomic_store(&m.stop, true)
-		thread.join(responder)
-		thread.destroy(responder)
-		net.close(server)
-	}
+	defer stop_udp_mock(&m, responder)
 
 	// Not from the temp allocator, which the loop below resets between trials so
 	// that 32 receive buffers are not held at once.
@@ -1091,28 +976,11 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	context.allocator = mem.tracking_allocator(&track)
 
 	m := Mock{}
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
+	bound, responder, mock_ok := serve_udp_mock(t, &m, a_record_loop)
+	if !mock_ok {
 		return
 	}
-	m.socket = socket
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		net.close(socket)
-		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
-		return
-	}
-
-	responder := thread.create_and_start_with_poly_data(&m, a_record_loop)
-	defer {
-		sync.atomic_store(&m.stop, true)
-		thread.join(responder)
-		thread.destroy(responder)
-		net.close(socket)
-	}
+	defer stop_udp_mock(&m, responder)
 
 	HOST :: "mock.invalid"
 	servers := []string{net.endpoint_to_string(bound, context.temp_allocator)}
@@ -1671,40 +1539,11 @@ test_udp_answer_up_to_the_advertised_size_is_not_truncated :: proc(t: ^testing.T
 	m := Big_Mock {
 		size = REPLY,
 	}
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
+	u, responder, ok := start_udp_mock(t, &m, big_reply_loop, timeout = 2 * time.Second)
+	if !ok {
 		return
 	}
-	m.socket = socket
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		net.close(socket)
-		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
-		return
-	}
-
-	responder := thread.create_and_start_with_poly_data(&m, big_reply_loop)
-	defer {
-		sync.atomic_store(&m.stop, true)
-		thread.join(responder)
-		thread.destroy(responder)
-		net.close(socket)
-	}
-
-	u, uerr := make_upstream(
-		config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port},
-		0,
-		2 * time.Second,
-		context.allocator,
-	)
-	testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr)
-	if uerr != .None {
-		return
-	}
-	defer destroy(u)
+	defer stop_udp_mock(&m, responder, u)
 
 	// The OPT record is the whole point: it is what tells the upstream how much
 	// room there is, and therefore how much has to be read back.
@@ -1974,6 +1813,76 @@ generate_dot_certs :: proc() {
 	dot_cert_ok = true
 }
 
+/*
+A loopback listener and a TLS server context on the test certificate, for a DoT
+or DoH mock to serve on, and with `client` a client context that does not verify
+it (the certificate is self-signed), offering `alpn`. The caller ends it with
+`dot_fixture_destroy`.
+
+`ignore_sigpipe` because a peer hanging up mid-handshake raises SIGPIPE on the
+write that follows, which the server ignores (see main.odin) and the test runner
+does not.
+*/
+@(private)
+Dot_Fixture :: struct {
+	listener: net.TCP_Socket,
+	bound:    net.Endpoint,
+	sctx:     ^tlsx.Context,
+	cctx:     ^tlsx.Context,
+}
+
+@(private)
+dot_fixture :: proc(
+	t: ^testing.T,
+	client := false,
+	alpn: []string = nil,
+	ignore_sigpipe := true,
+) -> (
+	f: Dot_Fixture,
+	ok: bool,
+) {
+	if ignore_sigpipe {
+		posix.sigignore(.SIGPIPE)
+	}
+	sync.once_do(&dot_cert_once, generate_dot_certs)
+	if !testing.expect(t, dot_cert_ok, "no certificate available and openssl could not make one") {
+		return
+	}
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+		return
+	}
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		net.close(listener)
+		return
+	}
+	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
+	if !testing.expectf(t, serr == .None, "server_context: %v", serr) {
+		net.close(listener)
+		return
+	}
+	f = Dot_Fixture{listener = listener, bound = bound, sctx = sctx}
+	if client {
+		cctx, cerr := tlsx.client_context(false, "", alpn)
+		if !testing.expectf(t, cerr == .None, "client_context: %v", cerr) {
+			dot_fixture_destroy(&f)
+			return {}, false
+		}
+		f.cctx = cctx
+	}
+	return f, true
+}
+
+@(private)
+dot_fixture_destroy :: proc(f: ^Dot_Fixture) {
+	if f.cctx != nil {
+		tlsx.context_destroy(f.cctx)
+	}
+	tlsx.context_destroy(f.sctx)
+	net.close(f.listener)
+}
+
 @(private = "file")
 Dot_Reset_Mock :: struct {
 	listener: net.TCP_Socket,
@@ -2043,34 +1952,14 @@ test_dot_handshake_reset_by_the_peer_is_retried :: proc(t: ^testing.T) {
 	// The reset arrives while OpenSSL still has handshake bytes to push, so the
 	// write that follows raises SIGPIPE. The server ignores it (see main.odin);
 	// the test runner does not.
-	posix.sigignore(.SIGPIPE)
-
-	sync.once_do(&dot_cert_once, generate_dot_certs)
-	if !dot_cert_ok {
-		testing.expect(t, false, "no certificate available and openssl could not make one")
+	f, fixture_ok := dot_fixture(t)
+	if !fixture_ok {
 		return
 	}
-
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
-		return
-	}
+	defer dot_fixture_destroy(&f)
+	listener, bound, sctx := f.listener, f.bound, f.sctx
 	// So a missing retry ends the accept below rather than hanging the suite.
 	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
-
-	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
-	if serr != .None {
-		testing.expectf(t, false, "server_context: %v", serr)
-		return
-	}
-	defer tlsx.context_destroy(sctx)
 
 	m := Dot_Reset_Mock {
 		listener = listener,
@@ -2163,40 +2052,13 @@ the peer killed is worth exactly the retry the DoT path gets.
 */
 @(test)
 test_https_handshake_reset_by_the_peer_is_retried :: proc(t: ^testing.T) {
-	posix.sigignore(.SIGPIPE)
-
-	sync.once_do(&dot_cert_once, generate_dot_certs)
-	if !dot_cert_ok {
-		testing.expect(t, false, "no certificate available and openssl could not make one")
+	f, fixture_ok := dot_fixture(t, client = true)
+	if !fixture_ok {
 		return
 	}
-
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
-		return
-	}
+	defer dot_fixture_destroy(&f)
+	listener, bound, sctx, cctx := f.listener, f.bound, f.sctx, f.cctx
 	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
-
-	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
-	if serr != .None {
-		testing.expectf(t, false, "server_context: %v", serr)
-		return
-	}
-	defer tlsx.context_destroy(sctx)
-
-	cctx, cerr := tlsx.client_context(false)
-	if cerr != .None {
-		testing.expectf(t, false, "client_context: %v", cerr)
-		return
-	}
-	defer tlsx.context_destroy(cctx)
 
 	m := Tls_Reset_Mock {
 		listener = listener,
@@ -2504,34 +2366,7 @@ start_rcode_mock :: proc(
 	ok: bool,
 ) {
 	m.rcode = u8(rcode) & 0xf
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
-		return nil, nil, false
-	}
-	m.socket = socket
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		net.close(socket)
-		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
-		return nil, nil, false
-	}
-
-	built, uerr := make_upstream(
-		config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port},
-		0,
-		time.Second,
-		context.allocator,
-	)
-	if uerr != .None {
-		net.close(socket)
-		testing.expectf(t, false, "cannot build the upstream: %v", uerr)
-		return nil, nil, false
-	}
-
-	return built, thread.create_and_start_with_poly_data(m, rcode_mock_loop), true
+	return start_udp_mock(t, m, rcode_mock_loop, name)
 }
 
 @(test)
@@ -2543,38 +2378,17 @@ test_a_chain_lookup_is_asked_elsewhere_when_one_upstream_declines :: proc(t: ^te
 	if !bad_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&refuser.stop, true)
-		thread.join(bad_thread)
-		thread.destroy(bad_thread)
-		net.close(refuser.socket)
-		destroy(bad)
-	}
+	defer stop_udp_mock(&refuser, bad_thread, bad)
 
 	good, good_thread, good_ok := start_rcode_mock(t, &answerer, "answerer", .No_Error)
 	if !good_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&answerer.stop, true)
-		thread.join(good_thread)
-		thread.destroy(good_thread)
-		net.close(answerer.socket)
-		destroy(good)
-	}
+	defer stop_udp_mock(&answerer, good_thread, good)
 
-	servers := make([]^Upstream, 2, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = bad
-	servers[1] = good
+	servers := []^Upstream{bad, good}
 
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers)
 
 	query := dns.Message {
 		id       = 0x2A2A,
@@ -2633,41 +2447,20 @@ test_the_sweep_leaves_a_parked_upstream_alone :: proc(t: ^testing.T) {
 	if !bad_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&refuser.stop, true)
-		thread.join(bad_thread)
-		thread.destroy(bad_thread)
-		net.close(refuser.socket)
-		destroy(bad)
-	}
+	defer stop_udp_mock(&refuser, bad_thread, bad)
 
 	good, good_thread, good_ok := start_rcode_mock(t, &answerer, "answerer", .No_Error)
 	if !good_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&answerer.stop, true)
-		thread.join(good_thread)
-		thread.destroy(good_thread)
-		net.close(answerer.socket)
-		destroy(good)
-	}
+	defer stop_udp_mock(&answerer, good_thread, good)
 
 	good.failures = FAILURE_THRESHOLD
 	good.down_until = loop.moment_add(loop.moment_now(), COOLDOWN)
 
-	servers := make([]^Upstream, 2, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = bad
-	servers[1] = good
+	servers := []^Upstream{bad, good}
 
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers)
 
 	query := dns.Message {
 		id       = 0x2B2B,
@@ -2702,38 +2495,17 @@ test_a_chain_lookup_keeps_the_reply_when_no_upstream_can_answer :: proc(t: ^test
 	if !a_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&first.stop, true)
-		thread.join(a_thread)
-		thread.destroy(a_thread)
-		net.close(first.socket)
-		destroy(a)
-	}
+	defer stop_udp_mock(&first, a_thread, a)
 
 	b, b_thread, b_ok := start_rcode_mock(t, &second, "second", .Refused)
 	if !b_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&second.stop, true)
-		thread.join(b_thread)
-		thread.destroy(b_thread)
-		net.close(second.socket)
-		destroy(b)
-	}
+	defer stop_udp_mock(&second, b_thread, b)
 
-	servers := make([]^Upstream, 2, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = a
-	servers[1] = b
+	servers := []^Upstream{a, b}
 
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers)
 
 	query := dns.Message {
 		id       = 0x2A2A,
@@ -4190,35 +3962,12 @@ peer as broken rather than slow (#445 review).
 */
 @(test)
 test_a_silent_tls_peer_is_a_timeout :: proc(t: ^testing.T) {
-	posix.sigignore(.SIGPIPE)
-	sync.once_do(&dot_cert_once, generate_dot_certs)
-	if !dot_cert_ok {
-		testing.expect(t, false, "no certificate available and openssl could not make one")
+	f, fixture_ok := dot_fixture(t, client = true, alpn = []string{"http/1.1"})
+	if !fixture_ok {
 		return
 	}
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
-		return
-	}
-	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
-	if serr != .None {
-		testing.expectf(t, false, "server_context: %v", serr)
-		return
-	}
-	defer tlsx.context_destroy(sctx)
-	cctx, cerr := tlsx.client_context(false, "", []string{"http/1.1"})
-	if cerr != .None {
-		testing.expectf(t, false, "client_context: %v", cerr)
-		return
-	}
-	defer tlsx.context_destroy(cctx)
+	defer dot_fixture_destroy(&f)
+	listener, bound, sctx, cctx := f.listener, f.bound, f.sctx, f.cctx
 
 	m := Tls_Silent_Mock {
 		listener = listener,
@@ -4259,104 +4008,30 @@ held a large request body for that long whatever the deadline said.
 */
 @(test)
 test_a_peer_that_stops_reading_is_bounded_by_the_deadline :: proc(t: ^testing.T) {
-	posix.sigignore(.SIGPIPE)
-	sync.once_do(&dot_cert_once, generate_dot_certs)
-	if !dot_cert_ok {
-		testing.expect(t, false, "no certificate available and openssl could not make one")
-		return
-	}
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
-		return
-	}
-	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
-	if serr != .None {
-		testing.expectf(t, false, "server_context: %v", serr)
-		return
-	}
-	defer tlsx.context_destroy(sctx)
-	cctx, cerr := tlsx.client_context(false, "", []string{"http/1.1"})
-	if cerr != .None {
-		testing.expectf(t, false, "client_context: %v", cerr)
-		return
-	}
-	defer tlsx.context_destroy(cctx)
-
-	m := Tls_Silent_Mock {
-		listener = listener,
-		ctx      = sctx,
-		hold     = 2 * time.Second,
-	}
-	server := thread.create_and_start_with_poly_data(&m, tls_silent_once)
-	defer {
-		thread.join(server)
-		thread.destroy(server)
-	}
-
-	stream, oerr := open_stream(bound, cctx, "doh.invalid", 3 * time.Second)
-	if !testing.expectf(t, oerr == .None, "cannot open the stream: %v", oerr) {
-		return
-	}
-	defer stream_close(&stream)
-	body := make([]u8, 16 * 1024 * 1024)
-	defer delete(body)
-	start := time.tick_now()
-	_, err := http_exchange(
-		&stream,
-		Http_Request{method = "POST", path = "/", host = "doh.invalid", body = body},
-		context.temp_allocator,
-		deadline = time.tick_add(time.tick_now(), 500 * time.Millisecond),
-	)
-	spent := time.tick_since(start)
-	testing.expectf(t, err == .Timeout, "a peer that stopped reading reported %v after %v", err, spent)
-	testing.expectf(t, spent < 1500 * time.Millisecond, "a 500ms deadline held the write for %v", spent)
-	free_all(context.temp_allocator)
+	expect_write_bounded(t, 500 * time.Millisecond, 0, "a 500ms deadline")
 }
 
 // And a write waits no longer than `idle` under a deadline far off, as a read
 // does: a list host that stopped reading held the fetch for the whole total.
 @(test)
 test_a_peer_that_stops_reading_is_bounded_by_the_idle_bound :: proc(t: ^testing.T) {
-	posix.sigignore(.SIGPIPE)
-	sync.once_do(&dot_cert_once, generate_dot_certs)
-	if !dot_cert_ok {
-		testing.expect(t, false, "no certificate available and openssl could not make one")
+	expect_write_bounded(t, 10 * time.Second, 300 * time.Millisecond, "a 300ms idle bound")
+}
+
+// A request body far larger than the socket buffers, to a peer that reads
+// nothing, ends in `.Timeout` well inside 1.5s under `deadline` (from now) and
+// `idle`; `bound_name` names the one that should end it.
+@(private = "file")
+expect_write_bounded :: proc(t: ^testing.T, deadline, idle: time.Duration, bound_name: string) {
+	f, fixture_ok := dot_fixture(t, client = true, alpn = []string{"http/1.1"})
+	if !fixture_ok {
 		return
 	}
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
-		return
-	}
-	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
-	if serr != .None {
-		testing.expectf(t, false, "server_context: %v", serr)
-		return
-	}
-	defer tlsx.context_destroy(sctx)
-	cctx, cerr := tlsx.client_context(false, "", []string{"http/1.1"})
-	if cerr != .None {
-		testing.expectf(t, false, "client_context: %v", cerr)
-		return
-	}
-	defer tlsx.context_destroy(cctx)
+	defer dot_fixture_destroy(&f)
 
 	m := Tls_Silent_Mock {
-		listener = listener,
-		ctx      = sctx,
+		listener = f.listener,
+		ctx      = f.sctx,
 		hold     = 2 * time.Second,
 	}
 	server := thread.create_and_start_with_poly_data(&m, tls_silent_once)
@@ -4365,7 +4040,7 @@ test_a_peer_that_stops_reading_is_bounded_by_the_idle_bound :: proc(t: ^testing.
 		thread.destroy(server)
 	}
 
-	stream, oerr := open_stream(bound, cctx, "doh.invalid", 3 * time.Second)
+	stream, oerr := open_stream(f.bound, f.cctx, "doh.invalid", 3 * time.Second)
 	if !testing.expectf(t, oerr == .None, "cannot open the stream: %v", oerr) {
 		return
 	}
@@ -4377,12 +4052,12 @@ test_a_peer_that_stops_reading_is_bounded_by_the_idle_bound :: proc(t: ^testing.
 		&stream,
 		Http_Request{method = "POST", path = "/", host = "doh.invalid", body = body},
 		context.temp_allocator,
-		deadline = time.tick_add(time.tick_now(), 10 * time.Second),
-		idle = 300 * time.Millisecond,
+		deadline = time.tick_add(time.tick_now(), deadline),
+		idle = idle,
 	)
 	spent := time.tick_since(start)
 	testing.expectf(t, err == .Timeout, "a peer that stopped reading reported %v after %v", err, spent)
-	testing.expectf(t, spent < 1500 * time.Millisecond, "a 300ms idle bound held the write for %v", spent)
+	testing.expectf(t, spent < 1500 * time.Millisecond, "%s held the write for %v", bound_name, spent)
 	free_all(context.temp_allocator)
 }
 
@@ -4567,21 +4242,11 @@ a bound socket that never answers, so no other test's server is asked.
 */
 @(test)
 test_a_late_resolved_endpoint_is_published_once :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the silent member: %v", serr) {
+	u, socket, ok := silent_upstream(t, "late")
+	if !ok {
 		return
 	}
 	defer net.close(socket)
-	bound, _ := net.bound_endpoint(socket)
-	u, uerr := make_upstream(
-		config.Upstream_Spec{name = "late", kind = .UDP, address = "127.0.0.1", port = bound.port},
-		0,
-		time.Second,
-		context.allocator,
-	)
-	if !testing.expectf(t, uerr == .None, "setup: %v", uerr) {
-		return
-	}
 	defer destroy(u)
 	u.resolved = false
 	u.endpoint = {}
@@ -4597,7 +4262,9 @@ test_a_late_resolved_endpoint_is_published_once :: proc(t: ^testing.T) {
 
 	ep, eerr := endpoint_of(u)
 	testing.expect_value(t, eerr, Error.None)
-	testing.expect_value(t, ep.port, bound.port)
+	// The socket's own port, not the spec the endpoint was built from.
+	bound, berr := net.bound_endpoint(socket)
+	testing.expectf(t, berr == nil && ep.port == bound.port, "the endpoint is on port %d, the member's socket on %d (%v)", ep.port, bound.port, berr)
 	testing.expect(t, ep.address == net.Address(net.IP4_Loopback), "the endpoint is not the address the name resolved to")
 
 	// A lookup that finishes after the endpoint is out leaves it as it is: a

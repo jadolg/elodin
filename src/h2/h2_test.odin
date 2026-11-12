@@ -1,6 +1,5 @@
 package h2
 
-import "core:encoding/hex"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
@@ -14,15 +13,6 @@ import "elodin:loop"
 HPACK tests built on the worked examples in RFC 7541 appendix C, so the codec is
 checked against the specification's own vectors rather than against itself.
 */
-
-@(private = "file")
-from_hex :: proc(s: string) -> []u8 {
-	out, ok := hex.decode(transmute([]u8)s, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	return out
-}
 
 @(test)
 test_huffman_rfc_examples :: proc(t: ^testing.T) {
@@ -63,9 +53,9 @@ test_huffman_rejects_bad_padding :: proc(t: ^testing.T) {
 test_decode_rfc_c31_literal_with_indexing :: proc(t: ^testing.T) {
 	// C.3.1: a full request header set, literals plus indexed fields.
 	table: Dynamic_Table
-	dynamic_table_init(&table, 4096, context.temp_allocator)
+	dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, context.temp_allocator)
 
-	block := from_hex("828684410f7777772e6578616d706c652e636f6d")
+	block := request_block()
 	headers, err := decode(&table, block, context.temp_allocator)
 	testing.expectf(t, err == .None, "decode failed: %v", err)
 	testing.expect_value(t, len(headers), 4)
@@ -88,7 +78,7 @@ test_decode_rfc_c4_huffman_request_sequence :: proc(t: ^testing.T) {
 	// C.4: the same three requests as C.3 but Huffman coded, decoded on one
 	// connection so the dynamic table carries across them.
 	table: Dynamic_Table
-	dynamic_table_init(&table, 4096, context.temp_allocator)
+	dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, context.temp_allocator)
 
 	first, e1 := decode(&table, from_hex("828684418cf1e3c2e5f23a6ba0ab90f4ff"), context.temp_allocator)
 	testing.expectf(t, e1 == .None, "first request failed: %v", e1)
@@ -169,7 +159,7 @@ test_encoder_round_trips_through_decoder :: proc(t: ^testing.T) {
 	encode_header(&out, "server", "elodin")
 
 	table: Dynamic_Table
-	dynamic_table_init(&table, 4096, context.temp_allocator)
+	dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, context.temp_allocator)
 	headers, err := decode(&table, out[:], context.temp_allocator)
 	testing.expectf(t, err == .None, "decode failed: %v", err)
 	testing.expect_value(t, len(headers), 4)
@@ -187,7 +177,7 @@ test_encoder_round_trips_through_decoder :: proc(t: ^testing.T) {
 @(test)
 test_decode_rejects_bad_index :: proc(t: ^testing.T) {
 	table: Dynamic_Table
-	dynamic_table_init(&table, 4096, context.temp_allocator)
+	dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, context.temp_allocator)
 	// Index 62 with an empty dynamic table refers to nothing.
 	_, err := decode(&table, []u8{0xbe}, context.temp_allocator)
 	testing.expect(t, err != .None, "an out-of-range index was accepted")
@@ -220,23 +210,13 @@ abandoned request releases what it allocated. A leak here is reachable by any
 peer that can open a connection, so it is worth asserting on directly.
 */
 
-@(private = "file")
-expect_no_leaks :: proc(t: ^testing.T, track: ^mem.Tracking_Allocator, what: string) {
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%s: %d bytes leaked, allocated at %v", what, entry.size, entry.location)
-	}
-	testing.expectf(t, len(track.bad_free_array) == 0, "%s: %d bad frees", what, len(track.bad_free_array))
-}
-
 @(test)
 test_decode_error_releases_partial_list :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	table: Dynamic_Table
-	dynamic_table_init(&table, 4096, allocator)
+	dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, allocator)
 
 	// Two valid indexed fields (:method GET, :scheme http) and then index 62,
 	// which refers to a dynamic table that is still empty. The two fields are
@@ -249,35 +229,19 @@ test_decode_error_releases_partial_list :: proc(t: ^testing.T) {
 }
 
 @(private = "file")
-discard_write :: proc(user: rawptr, buf: []u8) -> bool {
-	return true
-}
-
-@(private = "file")
-no_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
-	return 0, false
-}
-
-@(private = "file")
 ignore_request :: proc(conn: ^Conn, req: ^Request) {
 }
-
-// RFC 7541 C.3.1: GET http / www.example.com, four fields.
-@(private = "file")
-REQUEST_BLOCK :: "828684410f7777772e6578616d706c652e636f6d"
 
 @(test)
 test_teardown_releases_parked_request :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 
 	// HEADERS without END_STREAM: the request is complete but its body is not,
 	// so it is parked on the stream and no handler ever takes ownership of it.
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
@@ -286,21 +250,17 @@ test_teardown_releases_parked_request :: proc(t: ^testing.T) {
 	testing.expect(t, s.pending != nil, "no request was parked on the stream")
 
 	// The peer goes away here, which is all it takes.
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "parked request")
+	conn_done(t, c, &track, "parked request")
 }
 
 @(test)
 test_oversized_body_drops_the_stream :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 
 	body := make([]u8, MAX_BODY + 1, context.temp_allocator)
@@ -312,9 +272,7 @@ test_oversized_body_drops_the_stream :: proc(t: ^testing.T) {
 	_, still_open := c.streams[1]
 	testing.expect(t, !still_open, "the reset stream is still in the table")
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "oversized body")
+	conn_done(t, c, &track, "oversized body")
 }
 
 /*
@@ -327,14 +285,12 @@ what is held and not the bookkeeping that is meant to bound it.
 @(test)
 test_parked_bodies_are_bounded_per_connection :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	log: Request_Log
 	c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, ignore_request, nil, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	// In frames of the size a peer may send by default, so each body grows its
 	// buffer the way a real one does.
 	frame := make([]u8, DEFAULT_MAX_FRAME, context.temp_allocator)
@@ -374,9 +330,7 @@ test_parked_bodies_are_bounded_per_connection :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, c.request_bytes, 0)
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "parked bodies")
+	conn_done(t, c, &track, "parked bodies")
 }
 
 /*
@@ -388,9 +342,7 @@ charged against the same bound.
 @(test)
 test_parked_fields_are_bounded_per_connection :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	log: Request_Log
 	c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, ignore_request, nil, allocator)
@@ -431,9 +383,7 @@ test_parked_fields_are_bounded_per_connection :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, c.request_bytes, 0)
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "parked fields")
+	conn_done(t, c, &track, "parked fields")
 }
 
 /*
@@ -445,13 +395,11 @@ and the handler frees it, which the leak check holds to exactly once.
 @(test)
 test_answered_request_gives_its_charge_back :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, destroying_handler, nil, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	body := make([]u8, MAX_BODY, context.temp_allocator)
 	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
@@ -466,9 +414,7 @@ test_answered_request_gives_its_charge_back :: proc(t: ^testing.T) {
 	respond(c, 1, Response{status = 200, content_type = "application/dns-message", body = []u8{1, 2, 3, 4}})
 	testing.expect_value(t, c.request_bytes, 0)
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "answered request")
+	conn_done(t, c, &track, "answered request")
 }
 
 /*
@@ -480,31 +426,18 @@ not, and fell through to look up a stream that can never be in the map.
 @(test)
 test_data_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
 	body := []u8{'x'}
 	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 0}, body)
 	testing.expect(t, !ok, "DATA on stream 0 was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on stream 0")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for DATA on stream 0")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "data on stream zero")
+	conn_done(t, c, &track, "data on stream zero", &log)
 }
 
 /*
@@ -517,31 +450,18 @@ a connection WINDOW_UPDATE for a stream id that was never opened.
 @(test)
 test_data_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
 	body := []u8{'x'}
 	ok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 3}, body)
 	testing.expect(t, !ok, "DATA on an idle stream was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on an idle stream")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for DATA on an idle stream")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "data on an idle stream")
+	conn_done(t, c, &track, "data on an idle stream", &log)
 }
 
 /*
@@ -556,16 +476,12 @@ error.
 @(test)
 test_data_on_an_even_stream_is_rejected :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 3}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
@@ -575,18 +491,9 @@ test_data_on_an_even_stream_is_rejected :: proc(t: ^testing.T) {
 	testing.expect(t, !dok, "DATA on an even (never-opened) stream was accepted")
 	testing.expect_value(t, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST)
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on an even stream")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for DATA on an even stream")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "data on an even stream")
+	conn_done(t, c, &track, "data on an even stream", &log)
 }
 
 /*
@@ -600,20 +507,16 @@ out, was gone.
 @(test)
 test_data_on_a_closed_stream_is_answered_with_stream_closed :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
 	// HEADERS without END_STREAM opens the stream (advancing last_stream_id)
 	// without dispatching it, so the inbound RST_STREAM below finds it an
 	// orphan and retires it via close_stream - opened, then gone, same as a
 	// stream a handler finished answering.
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
@@ -630,23 +533,10 @@ test_data_on_a_closed_stream_is_answered_with_stream_closed :: proc(t: ^testing.
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, dok, "DATA on a closed stream should be a stream error, not a connection error")
 
-	saw_rst := false
-	saw_credit := false
-	for f in log.frames {
-		if f.type == .Rst_Stream && f.stream_id == 1 {
-			saw_rst = true
-		}
-		if f.type == .Window_Update && f.stream_id == 0 {
-			saw_credit = true
-		}
-	}
-	testing.expect(t, saw_rst, "no RST_STREAM was sent for DATA on a closed stream")
-	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+	testing.expect(t, saw_frame(&log, .Rst_Stream, 1), "no RST_STREAM was sent for DATA on a closed stream")
+	testing.expect(t, saw_frame(&log, .Window_Update, 0), "the connection window was not replenished for a frame that was refused")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "data on a closed stream")
+	conn_done(t, c, &track, "data on a closed stream", &log)
 }
 
 /*
@@ -659,16 +549,12 @@ only returns its connection credit.
 @(test)
 test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 	rst := []u8{0, 0, 0, 8} // CANCEL
@@ -686,34 +572,10 @@ test_data_on_a_closed_stream_stops_drawing_rst_once_the_budget_is_spent :: proc(
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, dok, "DATA on a closed stream should still be tolerated once the budget is spent")
 
-	saw_rst := false
-	saw_credit := false
-	for f in log.frames {
-		if f.type == .Rst_Stream {
-			saw_rst = true
-		}
-		if f.type == .Window_Update && f.stream_id == 0 {
-			saw_credit = true
-		}
-	}
-	testing.expectf(t, !saw_rst, "an RST_STREAM was sent after the closed-stream budget was spent")
-	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+	testing.expectf(t, !saw_frame(&log, .Rst_Stream), "an RST_STREAM was sent after the closed-stream budget was spent")
+	testing.expect(t, saw_frame(&log, .Window_Update, 0), "the connection window was not replenished for a frame that was refused")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "closed stream rst budget")
-}
-
-@(private = "file")
-count_rst :: proc(log: ^Frame_Log, stream_id: u32) -> int {
-	n := 0
-	for f in log.frames {
-		if f.type == .Rst_Stream && f.stream_id == stream_id {
-			n += 1
-		}
-	}
-	return n
+	conn_done(t, c, &track, "closed stream rst budget", &log)
 }
 
 /*
@@ -728,20 +590,16 @@ client with no budget for a real violation.
 @(test)
 test_data_in_flight_on_a_stream_this_end_reset_is_ignored :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	body := make([]u8, MAX_BODY + 1, context.temp_allocator)
 	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
-	testing.expect_value(t, count_rst(&log, 1), 1)
+	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
 	_, still_open := c.streams[1]
 	testing.expect(t, !still_open, "an oversized stream was not retired")
 
@@ -753,14 +611,11 @@ test_data_in_flight_on_a_stream_this_end_reset_is_ignored :: proc(t: ^testing.T)
 		ok := handle_data(c, Frame_Header{length = len(chunk), type = .Data, stream_id = 1}, chunk)
 		testing.expect(t, ok, "DATA in flight on a stream this end reset dropped the connection")
 	}
-	testing.expectf(t, count_rst(&log, 1) == 0, "RST_STREAM frames sent for in-flight DATA on a stream this end reset: %d, want 0", count_rst(&log, 1))
+	testing.expectf(t, count_frames(&log, .Rst_Stream, 1) == 0, "RST_STREAM frames sent for in-flight DATA on a stream this end reset: %d, want 0", count_frames(&log, .Rst_Stream, 1))
 	testing.expect_value(t, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST)
 	testing.expectf(t, log.credit + c.credit_owed - owed == 4 * len(chunk), "connection credit returned: %d, want %d", log.credit + c.credit_owed - owed, 4 * len(chunk))
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "data in flight on a reset stream")
+	conn_done(t, c, &track, "data in flight on a reset stream", &log)
 }
 
 /*
@@ -777,15 +632,12 @@ test_body_in_flight_behind_a_refused_headers_is_ignored :: proc(t: ^testing.T) {
 	}
 	for cause in Cause {
 		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		allocator := mem.tracking_allocator(&track)
+		allocator := track_allocations(&track)
 
-		log := Frame_Log {
-			frames = make([dynamic]Frame_Header, 0, 8, allocator),
-		}
-		c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+		log: Frame_Log
+		c := logged_conn(&log, ignore_request, allocator)
 
-		block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+		block := request_block()
 		id := u32(1)
 		switch cause {
 		case .Concurrency:
@@ -804,21 +656,17 @@ test_body_in_flight_behind_a_refused_headers_is_ignored :: proc(t: ^testing.T) {
 		if cause == .Room {
 			c.request_bytes = 0
 		}
-		testing.expectf(t, count_rst(&log, id) == 1, "%v: RST_STREAM frames for the refused HEADERS: %d, want 1", cause, count_rst(&log, id))
+		testing.expectf(t, count_frames(&log, .Rst_Stream, id) == 1, "%v: RST_STREAM frames for the refused HEADERS: %d, want 1", cause, count_frames(&log, .Rst_Stream, id))
 
 		body := []u8{'x'}
 		for _ in 0 ..< 3 {
 			handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = id}, body)
 		}
 		handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = id}, body)
-		testing.expectf(t, count_rst(&log, id) == 1, "%v: RST_STREAM frames after the body in flight: %d, want 1", cause, count_rst(&log, id))
+		testing.expectf(t, count_frames(&log, .Rst_Stream, id) == 1, "%v: RST_STREAM frames after the body in flight: %d, want 1", cause, count_frames(&log, .Rst_Stream, id))
 		testing.expectf(t, c.closed_stream_rst_budget == MAX_CLOSED_STREAM_RST, "%v: closed_stream_rst_budget %d, want %d", cause, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST)
 
-		delete(log.frames)
-		conn_unref(c)
-		free_all(context.temp_allocator)
-		expect_no_leaks(t, &track, "body behind a refused headers")
-		mem.tracking_allocator_destroy(&track)
+		conn_done(t, c, &track, "body behind a refused headers", &log)
 	}
 }
 
@@ -832,20 +680,16 @@ table falls out of step with the peer's and every block after them misdecodes.
 @(test)
 test_trailers_in_flight_on_a_stream_this_end_reset_are_decoded_and_ignored :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	body := make([]u8, MAX_BODY + 1, context.temp_allocator)
 	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
-	testing.expect_value(t, count_rst(&log, 1), 1)
+	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
 	clear(&log.frames)
 
 	// x-t: 1, literal with incremental indexing: becomes dynamic index 62.
@@ -861,10 +705,7 @@ test_trailers_in_flight_on_a_stream_this_end_reset_are_decoded_and_ignored :: pr
 	// Trailers end the stream, so a second block on it cannot be in flight.
 	testing.expect(t, !handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82}), "a second block on a stream this end reset was accepted")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "trailers on a reset stream")
+	conn_done(t, c, &track, "trailers on a reset stream", &log)
 }
 
 /*
@@ -877,28 +718,21 @@ another header block for one DATA frame.
 @(test)
 test_headers_after_drawing_stream_closed_is_a_connection_error :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	body := []u8{'x'}
 	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	rst := []u8{0, 0, 0, 8} // CANCEL
 	handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 1}, rst)
 	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
-	testing.expect_value(t, count_rst(&log, 1), 1)
+	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
 	testing.expect(t, !handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82}), "HEADERS on a stream the peer reset was accepted")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "headers after stream closed")
+	conn_done(t, c, &track, "headers after stream closed", &log)
 }
 
 /*
@@ -910,15 +744,12 @@ flight, and a block after that is a connection error like any other.
 test_a_reset_id_the_peer_then_ends_takes_no_header_block :: proc(t: ^testing.T) {
 	for end_with_rst in ([]bool{false, true}) {
 		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		allocator := mem.tracking_allocator(&track)
+		allocator := track_allocations(&track)
 
-		log := Frame_Log {
-			frames = make([dynamic]Frame_Header, 0, 8, allocator),
-		}
-		c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+		log: Frame_Log
+		c := logged_conn(&log, ignore_request, allocator)
 
-		block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+		block := request_block()
 		c.request_bytes = MAX_CONN_REQUEST
 		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 		c.request_bytes = 0
@@ -932,11 +763,7 @@ test_a_reset_id_the_peer_then_ends_takes_no_header_block :: proc(t: ^testing.T) 
 		ok := handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82})
 		testing.expectf(t, !ok, "end_with_rst=%v: a header block after the peer ended the stream was accepted", end_with_rst)
 
-		delete(log.frames)
-		conn_unref(c)
-		free_all(context.temp_allocator)
-		expect_no_leaks(t, &track, "reset id the peer then ends")
-		mem.tracking_allocator_destroy(&track)
+		conn_done(t, c, &track, "reset id the peer then ends", &log)
 	}
 }
 
@@ -948,26 +775,19 @@ connection error rather than a request dropped in silence.
 @(test)
 test_a_block_without_end_stream_on_a_reset_id_is_a_connection_error :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	c.request_bytes = MAX_CONN_REQUEST
 	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	c.request_bytes = 0
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, !ok, "a block without END_STREAM on a reset id was taken as trailers")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "block without end_stream on a reset id")
+	conn_done(t, c, &track, "block without end_stream on a reset id", &log)
 }
 
 /*
@@ -985,15 +805,12 @@ test_a_stream_refused_on_its_end_stream_is_not_remembered :: proc(t: ^testing.T)
 	}
 	for cause in Cause {
 		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		allocator := mem.tracking_allocator(&track)
+		allocator := track_allocations(&track)
 
-		log := Frame_Log {
-			frames = make([dynamic]Frame_Header, 0, 8, allocator),
-		}
-		c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+		log: Frame_Log
+		c := logged_conn(&log, ignore_request, allocator)
 
-		block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+		block := request_block()
 		id := u32(1)
 		flags := u8(FLAG_END_HEADERS | FLAG_END_STREAM)
 		switch cause {
@@ -1015,15 +832,11 @@ test_a_stream_refused_on_its_end_stream_is_not_remembered :: proc(t: ^testing.T)
 			big := make([]u8, MAX_BODY + 1, context.temp_allocator)
 			handle_data(c, Frame_Header{length = len(big), type = .Data, flags = FLAG_END_STREAM, stream_id = id}, big)
 		}
-		testing.expectf(t, count_rst(&log, id) == 1, "%v: RST_STREAM frames: %d, want 1", cause, count_rst(&log, id))
+		testing.expectf(t, count_frames(&log, .Rst_Stream, id) == 1, "%v: RST_STREAM frames: %d, want 1", cause, count_frames(&log, .Rst_Stream, id))
 		ok := handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}, []u8{0x82})
 		testing.expectf(t, !ok, "%v: a block after END_STREAM on a refused stream was taken as trailers", cause)
 
-		delete(log.frames)
-		conn_unref(c)
-		free_all(context.temp_allocator)
-		expect_no_leaks(t, &track, "refused on its end stream")
-		mem.tracking_allocator_destroy(&track)
+		conn_done(t, c, &track, "refused on its end stream", &log)
 	}
 }
 
@@ -1043,16 +856,16 @@ test_headers_on_a_reset_stream_still_being_answered_are_ignored :: proc(t: ^test
 	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, context.allocator)
 	defer conn_unref(c)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
 	body := []u8{'x'}
 	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
-	testing.expect_value(t, count_rst(&log, 1), 1)
+	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
 	s := c.streams[1]
 
 	ok := handle_headers(c, Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, []u8{0x82})
 	testing.expect(t, ok, "HEADERS on a stream still being answered dropped the connection")
-	testing.expect_value(t, count_rst(&log, 1), 1)
+	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
 	testing.expect(t, c.streams[1] == s, "the stream being answered was replaced")
 	free_all(context.temp_allocator)
 }
@@ -1074,7 +887,7 @@ test_a_reset_id_pushed_out_of_the_ring_falls_back_to_the_budget :: proc(t: ^test
 	// Every slot starts empty, and empty is 0: never a hit.
 	testing.expect(t, !was_reset_here(c, 0), "stream 0 read as a remembered reset")
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	big := make([]u8, MAX_BODY + 1, context.temp_allocator)
 	open_and_overflow :: proc(c: ^Conn, id: u32, block, big: []u8) {
 		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = id}, block)
@@ -1088,9 +901,9 @@ test_a_reset_id_pushed_out_of_the_ring_falls_back_to_the_budget :: proc(t: ^test
 	clear(&log.frames)
 	body := []u8{'x'}
 	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 3}, body)
-	testing.expect_value(t, count_rst(&log, 3), 0)
+	testing.expect_value(t, count_frames(&log, .Rst_Stream, 3), 0)
 	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
-	testing.expect_value(t, count_rst(&log, 1), 1)
+	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
 	testing.expect_value(t, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST - 1)
 	free_all(context.temp_allocator)
 }
@@ -1104,19 +917,15 @@ straight to `s.body`, silently accepting a body that was already complete.
 @(test)
 test_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, destroying_handler, allocator)
 
 	// END_STREAM on the HEADERS dispatches straight away and marks the stream
 	// half-closed (remote); the handler frees the request but leaves the
 	// stream itself for whoever answers it.
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(
 		c,
 		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
@@ -1137,18 +946,8 @@ test_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 		testing.expect_value(t, len(s.body), 0)
 	}
 
-	saw_rst := false
-	saw_credit := false
-	for f in log.frames {
-		if f.type == .Rst_Stream && f.stream_id == 1 {
-			saw_rst = true
-		}
-		if f.type == .Window_Update && f.stream_id == 0 {
-			saw_credit = true
-		}
-	}
-	testing.expect(t, saw_rst, "no RST_STREAM was sent for DATA after END_STREAM")
-	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+	testing.expect(t, saw_frame(&log, .Rst_Stream, 1), "no RST_STREAM was sent for DATA after END_STREAM")
+	testing.expect(t, saw_frame(&log, .Window_Update, 0), "the connection window was not replenished for a frame that was refused")
 
 	/*
 	A peer that keeps sending after the first violation must not draw a fresh
@@ -1159,14 +958,9 @@ test_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	clear(&log.frames)
 	dok2 := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, dok2, "a repeat violation should still be a stream error, not a connection error")
-	for f in log.frames {
-		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent for a stream already marked cancelled")
-	}
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "a second RST_STREAM was sent for a stream already marked cancelled")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "data after end stream")
+	conn_done(t, c, &track, "data after end stream", &log)
 }
 
 /*
@@ -1181,16 +975,12 @@ so this checks its absence rather than its presence.
 @(test)
 test_data_on_a_peer_reset_stream_is_refused :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, destroying_handler, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(
 		c,
 		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
@@ -1219,19 +1009,10 @@ test_data_on_a_peer_reset_stream_is_refused :: proc(t: ^testing.T) {
 		testing.expect_value(t, len(s.body), 0)
 	}
 
-	saw_credit := false
-	for f in log.frames {
-		testing.expectf(t, f.type != .Rst_Stream, "an RST_STREAM was sent answering a stream the peer had already reset")
-		if f.type == .Window_Update && f.stream_id == 0 {
-			saw_credit = true
-		}
-	}
-	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "an RST_STREAM was sent answering a stream the peer had already reset")
+	testing.expect(t, saw_frame(&log, .Window_Update, 0), "the connection window was not replenished for a frame that was refused")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "data on a peer-reset stream")
+	conn_done(t, c, &track, "data on a peer-reset stream", &log)
 }
 
 @(test)
@@ -1317,9 +1098,7 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	covers the same race for a stream a handler already owns.
 	*/
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	hook := Close_Hook{}
 	c := make_conn(IO{user = &hook, read = no_read, write = close_on_write}, destroying_handler, nil, allocator)
@@ -1335,7 +1114,7 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	for this DATA to reach but the now-`already_ended` short-circuit, which
 	returns before ever writing a WINDOW_UPDATE.
 	*/
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
@@ -1358,9 +1137,7 @@ test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	testing.expect(t, !back_in_map, "the retired stream was put back in the table")
 
 	stream_destroy(c, hook.closed)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "data after close")
+	conn_done(t, c, &track, "data after close")
 }
 
 // ---------------------------------------------------------------------------
@@ -1447,14 +1224,12 @@ test_continuation_flood_is_refused :: proc(t: ^testing.T) {
 	So the block has to be bounded as it accumulates.
 	*/
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 
 	// END_HEADERS clear, so the block stays open.
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = 0, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
@@ -1480,9 +1255,7 @@ test_continuation_flood_is_refused :: proc(t: ^testing.T) {
 		MAX_HEADER_LIST,
 	)
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "continuation flood")
+	conn_done(t, c, &track, "continuation flood")
 }
 
 /*
@@ -1499,13 +1272,11 @@ So the frames are counted as well as measured.
 @(test)
 test_empty_continuation_flood_is_refused :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = 0, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
@@ -1522,9 +1293,7 @@ test_empty_continuation_flood_is_refused :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, refused, "%d empty CONTINUATION frames were all accepted", sent)
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "empty continuation flood")
+	conn_done(t, c, &track, "empty continuation flood")
 }
 
 /*
@@ -1539,15 +1308,13 @@ long as the connection lasts.
 @(test)
 test_reset_stream_is_retired :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 
 	// END_HEADERS without END_STREAM: the request is parked awaiting a body, so
 	// no handler owns it.
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(
 		c,
 		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1},
@@ -1566,9 +1333,7 @@ test_reset_stream_is_retired :: proc(t: ^testing.T) {
 	_, still_open := c.streams[1]
 	testing.expect(t, !still_open, "the reset stream is still in the table")
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "reset stream")
+	conn_done(t, c, &track, "reset stream")
 }
 
 /*
@@ -1579,31 +1344,18 @@ sides' `.Rst_Stream` arms check its length before they look the stream up in
 @(test)
 test_rst_stream_with_a_bad_frame_size_is_a_connection_error :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
 	bad := []u8{0, 0, 8} // one byte short of an error code
 	ok := handle_frame(c, Frame_Header{length = len(bad), type = .Rst_Stream, stream_id = 1}, bad)
 	testing.expect(t, !ok, "a malformed RST_STREAM was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for a malformed RST_STREAM")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for a malformed RST_STREAM")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "rst_stream bad frame size")
+	conn_done(t, c, &track, "rst_stream bad frame size", &log)
 }
 
 /*
@@ -1615,31 +1367,18 @@ and returned true as if a peer sending it meant nothing in particular.
 @(test)
 test_rst_stream_on_stream_zero_is_a_connection_error :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
 	rst := []u8{0, 0, 0, 8} // CANCEL
 	ok := handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 0}, rst)
 	testing.expect(t, !ok, "RST_STREAM on stream 0 was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for RST_STREAM on stream 0")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for RST_STREAM on stream 0")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "rst_stream on stream zero")
+	conn_done(t, c, &track, "rst_stream on stream zero", &log)
 }
 
 /*
@@ -1649,15 +1388,13 @@ leak: two frames per stream and the connection stops accepting new ones.
 @(test)
 test_reset_streams_do_not_exhaust_concurrency :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 
 	rst := []u8{0, 0, 0, 8} // CANCEL
 	for i in 0 ..< MAX_CONCURRENT {
-		block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+		block := request_block()
 		id := u32(1 + 2 * i)
 		handle_headers(
 			c,
@@ -1670,7 +1407,7 @@ test_reset_streams_do_not_exhaust_concurrency :: proc(t: ^testing.T) {
 	testing.expectf(t, len(c.streams) == 0, "%d reset streams are still held on the connection", len(c.streams))
 
 	// So the next one is still accepted rather than refused.
-	fresh, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	fresh := request_block()
 	next := u32(1 + 2 * MAX_CONCURRENT)
 	handle_headers(
 		c,
@@ -1680,9 +1417,7 @@ test_reset_streams_do_not_exhaust_concurrency :: proc(t: ^testing.T) {
 	_, accepted := c.streams[next]
 	testing.expect(t, accepted, "a fresh stream was refused after MAX_CONCURRENT resets")
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "reset stream flood")
+	conn_done(t, c, &track, "reset stream flood")
 }
 
 /*
@@ -1696,17 +1431,13 @@ the handler's own `close_stream` with nothing to close.
 @(test)
 test_reset_stream_with_a_handler_is_left_for_it :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, destroying_handler, allocator)
 
 	// END_STREAM dispatches straight away, so a handler owns this one.
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(
 		c,
 		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
@@ -1731,10 +1462,7 @@ test_reset_stream_with_a_handler_is_left_for_it :: proc(t: ^testing.T) {
 	_, after := c.streams[1]
 	testing.expect(t, !after, "respond did not retire the cancelled stream")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "reset with handler")
+	conn_done(t, c, &track, "reset with handler", &log)
 }
 
 @(private = "file")
@@ -1760,16 +1488,14 @@ test_response_gives_up_when_no_window_is_granted :: proc(t: ^testing.T) {
 	MAX_CONCURRENT of them.
 	*/
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, destroying_handler, nil, allocator)
 	// The peer grants nothing, so no stream ever has room for a DATA frame.
 	c.peer_initial_window = 0
 	c.write_timeout = 200 * time.Millisecond
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(
 		c,
 		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
@@ -1800,9 +1526,7 @@ test_response_gives_up_when_no_window_is_granted :: proc(t: ^testing.T) {
 	thread.join(worker)
 	thread.destroy(worker)
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "no window granted")
+	conn_done(t, c, &track, "no window granted")
 }
 
 /*
@@ -1815,9 +1539,7 @@ up the moment the violation was seen.
 @(test)
 test_data_after_end_stream_wakes_a_parked_responder :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, destroying_handler, nil, allocator)
 	// No room for the body, ever - so `respond` parks in `write_body` waiting
@@ -1825,7 +1547,7 @@ test_data_after_end_stream_wakes_a_parked_responder :: proc(t: ^testing.T) {
 	c.peer_initial_window = 0
 	c.write_timeout = 2 * time.Second
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(
 		c,
 		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
@@ -1863,9 +1585,7 @@ test_data_after_end_stream_wakes_a_parked_responder :: proc(t: ^testing.T) {
 	thread.join(worker)
 	thread.destroy(worker)
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "parked responder woken")
+	conn_done(t, c, &track, "parked responder woken")
 }
 
 /*
@@ -1880,19 +1600,15 @@ just reset.
 @(test)
 test_write_body_deadline_marks_the_stream_cancelled :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, destroying_handler, allocator)
 	// No room for the body, ever, and a short timeout so the test does not wait long.
 	c.peer_initial_window = 0
 	c.write_timeout = 50 * time.Millisecond
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(
 		c,
 		Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1},
@@ -1906,13 +1622,7 @@ test_write_body_deadline_marks_the_stream_cancelled :: proc(t: ^testing.T) {
 	sent := write_body(c, 1, []u8{1, 2, 3, 4})
 	testing.expect(t, !sent, "write_body should have given up once its deadline passed")
 
-	saw_rst := false
-	for f in log.frames {
-		if f.type == .Rst_Stream && f.stream_id == 1 {
-			saw_rst = true
-		}
-	}
-	testing.expect(t, saw_rst, "no RST_STREAM was sent for the flow-control deadline")
+	testing.expect(t, saw_frame(&log, .Rst_Stream, 1), "no RST_STREAM was sent for the flow-control deadline")
 
 	s, still_open := c.streams[1]
 	testing.expect(t, still_open, "the stream should still be here for respond to retire")
@@ -1926,62 +1636,14 @@ test_write_body_deadline_marks_the_stream_cancelled :: proc(t: ^testing.T) {
 	body := []u8{'x'}
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, dok, "DATA after the deadline RST should still be a stream error, not a connection error")
-	for f in log.frames {
-		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent on a stream write_body had already reset")
-	}
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "a second RST_STREAM was sent on a stream write_body had already reset")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "write_body deadline cancelled")
+	conn_done(t, c, &track, "write_body deadline cancelled", &log)
 }
 
 // ---------------------------------------------------------------------------
 // Flow-control credit for bytes we refused
 // ---------------------------------------------------------------------------
-
-@(private = "file")
-Frame_Log :: struct {
-	frames: [dynamic]Frame_Header,
-	// Sum of the connection WINDOW_UPDATE increments written.
-	credit:      int,
-	// Error code of the last GOAWAY written.
-	goaway_code: Error_Code,
-}
-
-@(private = "file")
-log_write :: proc(user: rawptr, buf: []u8) -> bool {
-	log := cast(^Frame_Log)user
-	if log == nil {
-		return true
-	}
-	pos := 0
-	for pos + FRAME_HEADER_SIZE <= len(buf) {
-		h, ok := parse_frame_header(buf[pos:])
-		if !ok {
-			break
-		}
-		append(&log.frames, h)
-		if h.type == .Window_Update && h.stream_id == 0 && h.length == 4 && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
-			log.credit += int(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
-		}
-		if h.type == .Goaway && pos + FRAME_HEADER_SIZE + 8 <= len(buf) {
-			log.goaway_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE + 4:]))
-		}
-		pos += FRAME_HEADER_SIZE + h.length
-	}
-	return true
-}
-
-@(private = "file")
-saw_connection_window_update :: proc(log: ^Frame_Log) -> bool {
-	for f in log.frames {
-		if f.type == .Window_Update && f.stream_id == 0 {
-			return true
-		}
-	}
-	return false
-}
 
 @(test)
 test_oversized_body_returns_connection_credit :: proc(t: ^testing.T) {
@@ -1994,16 +1656,12 @@ test_oversized_body_returns_connection_credit :: proc(t: ^testing.T) {
 	longer allowed to send anything at all.
 	*/
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 
 	clear(&log.frames)
@@ -2012,14 +1670,11 @@ test_oversized_body_returns_connection_credit :: proc(t: ^testing.T) {
 
 	testing.expect(
 		t,
-		saw_connection_window_update(&log),
+		saw_frame(&log, .Window_Update, 0),
 		"the connection window was not replenished for a body that was refused",
 	)
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "oversized body credit")
+	conn_done(t, c, &track, "oversized body credit", &log)
 }
 
 /*
@@ -2036,16 +1691,12 @@ accumulated window from getting there a byte at a time.
 @(test)
 test_settings_window_change_is_bounded :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 
 	// Exactly the maximum is allowed, and is where a peer parks a stream before
@@ -2063,18 +1714,9 @@ test_settings_window_change_is_bounded :: proc(t: ^testing.T) {
 	accepted := handle_settings(c, Frame_Header{length = len(settings), type = .Settings, stream_id = 0}, settings)
 	testing.expect(t, !accepted, "a settings change past the maximum window was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for a flow-control violation")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for a flow-control violation")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "settings window overflow")
+	conn_done(t, c, &track, "settings window overflow", &log)
 }
 
 // ---------------------------------------------------------------------------
@@ -2143,9 +1785,7 @@ test_frame_larger_than_advertised_max_is_refused :: proc(t: ^testing.T) {
 	been promised it would not be.
 	*/
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	// Preface, then a frame header claiming a payload one byte over the
 	// advertised maximum - well under the receive window.
@@ -2164,9 +1804,7 @@ test_frame_larger_than_advertised_max_is_refused :: proc(t: ^testing.T) {
 	testing.expect_value(t, h.code, Error_Code.Frame_Size_Error)
 
 	delete(h.written)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "oversized frame")
+	conn_done(t, c, &track, "oversized frame")
 }
 
 // ---------------------------------------------------------------------------
@@ -2198,9 +1836,7 @@ block that references it decodes against the wrong table.
 @(test)
 test_refused_stream_still_decodes_its_header_block :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 	fill_concurrency(c, allocator)
@@ -2247,9 +1883,7 @@ test_refused_stream_still_decodes_its_header_block :: proc(t: ^testing.T) {
 	_, accepted := c.streams[next_id]
 	testing.expect(t, accepted, "the following stream was not accepted")
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "refused stream decode")
+	conn_done(t, c, &track, "refused stream decode")
 }
 
 /*
@@ -2261,9 +1895,7 @@ connection - so a client merely at its stream limit loses every in-flight stream
 @(test)
 test_refused_stream_accepts_its_continuation :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 	fill_concurrency(c, allocator)
@@ -2291,9 +1923,7 @@ test_refused_stream_accepts_its_continuation :: proc(t: ^testing.T) {
 	// The whole block was decoded, so the decoder stayed in step.
 	testing.expectf(t, len(c.decoder.entries) == 1, "the refused block was not decoded: %d entries", len(c.decoder.entries))
 
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "refused stream continuation")
+	conn_done(t, c, &track, "refused stream continuation")
 }
 
 /*
@@ -2305,14 +1935,10 @@ with a connection-level WINDOW_UPDATE rather than silently dropped.
 @(test)
 test_data_on_a_refused_stream_returns_connection_credit :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 	fill_concurrency(c, allocator)
 
 	refused_id := u32(1 + 2 * MAX_CONCURRENT)
@@ -2333,14 +1959,11 @@ test_data_on_a_refused_stream_returns_connection_credit :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "DATA on a refused stream was not handled gracefully")
 	testing.expect(
 		t,
-		saw_connection_window_update(&log),
+		saw_frame(&log, .Window_Update, 0),
 		"the connection window was not replenished for DATA on a refused stream",
 	)
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "data on a refused stream")
+	conn_done(t, c, &track, "data on a refused stream", &log)
 }
 
 // ---------------------------------------------------------------------------
@@ -2400,12 +2023,6 @@ counting_handler :: proc(conn: ^Conn, req: ^Request) {
 	request_destroy(conn, req)
 }
 
-@(private = "file")
-Field :: struct {
-	name:  string,
-	value: string,
-}
-
 // HPACK literal without indexing, new name: no table state, so a block with any
 // field name at all can be built here without going through the encoder - which
 // only ever emits names the static table knows.
@@ -2417,7 +2034,7 @@ put_field :: proc(out: ^[dynamic]u8, name, value: string) {
 }
 
 @(private = "file")
-build_block :: proc(fields: []Field) -> []u8 {
+build_block :: proc(fields: []Header_Field) -> []u8 {
 	out := make([dynamic]u8, 0, 128, context.temp_allocator)
 	for f in fields {
 		put_field(&out, f.name, f.value)
@@ -2440,13 +2057,11 @@ codebase already refuses the same shapes.
 @(test)
 test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	Case :: struct {
 		what:   string,
-		fields: []Field,
+		fields: []Header_Field,
 	}
 	cases := []Case {
 		// 8.2.2: connection-specific fields have no place in HTTP/2.
@@ -2884,13 +2499,11 @@ test_malformed_requests_are_reset :: proc(t: ^testing.T) {
 @(test)
 test_conformant_requests_are_served :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	Case :: struct {
 		what:   string,
-		fields: []Field,
+		fields: []Header_Field,
 	}
 	cases := []Case {
 		{
@@ -3003,14 +2616,10 @@ budget is told ENHANCE_YOUR_CALM and dropped instead.
 @(private = "file")
 expect_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []u8, what: string, fill := false) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 	// A window that opens in the future cannot roll over mid-burst, so a slow
 	// box cannot hand the flood a fresh budget and move the refusal.
 	c.control.window = time.tick_add(time.tick_now(), time.Hour)
@@ -3034,16 +2643,9 @@ expect_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []
 	}
 	testing.expectf(t, refused, "%s: %d frames in a burst were all answered", what, sent)
 	testing.expectf(t, sent == MAX_CONTROL_FRAMES_PER_SECOND + 1, "%s: refused at frame %d, not the first one over the budget", what, sent)
-	saw_goaway := false
-	for f in log.frames {
-		saw_goaway ||= f.type == .Goaway
-	}
-	testing.expectf(t, saw_goaway, "%s: the flood was dropped without a GOAWAY", what)
+	testing.expectf(t, saw_frame(&log, .Goaway), "%s: the flood was dropped without a GOAWAY", what)
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, what)
+	conn_done(t, c, &track, what, &log)
 }
 
 @(test)
@@ -3090,16 +2692,12 @@ could use up the RECV_WINDOW it was given.
 @(test)
 test_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
@@ -3122,10 +2720,7 @@ test_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {
 	testing.expectf(t, log.credit >= CREDIT_BATCH, "%d bytes read, only %d of credit returned", frames, log.credit)
 	testing.expectf(t, log.credit + c.credit_owed == frames, "%d bytes read, %d returned and %d owed", frames, log.credit, c.credit_owed)
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "tiny data frames")
+	conn_done(t, c, &track, "tiny data frames", &log)
 }
 
 /*
@@ -3144,7 +2739,7 @@ test_malformed_headers_flood_is_refused :: proc(t: ^testing.T) {
 
 @(test)
 test_refused_stream_flood_is_refused :: proc(t: ^testing.T) {
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1 + 2 * MAX_CONCURRENT}
 	expect_control_flood_refused(t, h, block, "refused stream flood", fill = true)
 }
@@ -3158,15 +2753,11 @@ the same budget.
 @(test)
 test_refused_body_spends_the_control_budget :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, ignore_request, nil, allocator)
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	log: Frame_Log
+	c := logged_conn(&log, ignore_request, allocator)
+	block := request_block()
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
@@ -3176,17 +2767,10 @@ test_refused_body_spends_the_control_budget :: proc(t: ^testing.T) {
 	body := []u8{'x'}
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, !dok, "a body refused past the budget drew a reset and kept the connection")
-	saw_goaway := false
-	for f in log.frames {
-		saw_goaway ||= f.type == .Goaway
-		testing.expect(t, f.type != .Rst_Stream, "a body refused past the budget still drew a RST_STREAM")
-	}
-	testing.expect(t, saw_goaway, "a body refused past the budget was dropped without a GOAWAY")
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "a body refused past the budget still drew a RST_STREAM")
+	testing.expect(t, saw_frame(&log, .Goaway), "a body refused past the budget was dropped without a GOAWAY")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "refused body budget")
+	conn_done(t, c, &track, "refused body budget", &log)
 }
 
 /*
@@ -3200,18 +2784,14 @@ per HEADERS.
 @(test)
 test_reset_streams_free_their_slot_for_the_peer :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
+	log: Frame_Log
+	c := logged_conn(&log, destroying_handler, allocator)
 	c.control.window = time.tick_add(time.tick_now(), time.Hour)
 
 	// Dispatched to a handler that never answers, then reset by the peer.
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	rst := []u8{0, 0, 0, 8} // CANCEL
 	id := u32(1)
 	open :: proc(c: ^Conn, id: ^u32, block: []u8) -> bool {
@@ -3234,9 +2814,7 @@ test_reset_streams_free_their_slot_for_the_peer :: proc(t: ^testing.T) {
 		handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = sid}, rst)
 	}
 	testing.expect_value(t, len(c.streams), MAX_HELD_STREAMS)
-	for f in log.frames {
-		testing.expect(t, f.type != .Rst_Stream, "a client within the limit by its own count was refused")
-	}
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "a client within the limit by its own count was refused")
 
 	// Nothing is open by the peer's count now; only the held cap refuses.
 	refused := 0
@@ -3247,20 +2825,13 @@ test_reset_streams_free_their_slot_for_the_peer :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect_value(t, refused, MAX_CONTROL_FRAMES_PER_SECOND + 1)
-	saw_goaway := false
-	for f in log.frames {
-		saw_goaway ||= f.type == .Goaway
-	}
-	testing.expect(t, saw_goaway, "refusals past MAX_HELD_STREAMS were never charged")
+	testing.expect(t, saw_frame(&log, .Goaway), "refusals past MAX_HELD_STREAMS were never charged")
 
 	for sid := u32(1); sid < id; sid += 2 {
 		close_stream(c, sid)
 	}
 	testing.expect_value(t, c.closed_held, 0)
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "reset stream slots")
+	conn_done(t, c, &track, "reset stream slots", &log)
 }
 
 /*
@@ -3272,13 +2843,11 @@ rather than left to run it dry and stall for good.
 @(test)
 test_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 	testing.expect(t, ok, "handle_headers failed")
 
@@ -3300,10 +2869,7 @@ test_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 	}
 	_, open = c.streams[1]
 	testing.expectf(t, !open, "a stream that spent %d bytes of its window was left open", spent)
-	free_all(context.temp_allocator)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "padded stream")
+	conn_done(t, c, &track, "padded stream")
 }
 
 /*
@@ -3314,15 +2880,11 @@ budget as any other stream error.
 @(test)
 test_data_after_end_stream_spends_the_control_budget :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, destroying_handler, nil, allocator)
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	log: Frame_Log
+	c := logged_conn(&log, destroying_handler, allocator)
+	block := request_block()
 	h := Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}
 	testing.expect(t, handle_headers(c, h, block), "handle_headers failed")
 
@@ -3331,17 +2893,10 @@ test_data_after_end_stream_spends_the_control_budget :: proc(t: ^testing.T) {
 	body := []u8{'x'}
 	dok := handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, !dok, "DATA after END_STREAM past the budget drew a reset and kept the connection")
-	saw_goaway := false
-	for f in log.frames {
-		saw_goaway ||= f.type == .Goaway
-		testing.expect(t, f.type != .Rst_Stream, "DATA after END_STREAM past the budget still drew a RST_STREAM")
-	}
-	testing.expect(t, saw_goaway, "DATA after END_STREAM past the budget was dropped without a GOAWAY")
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "DATA after END_STREAM past the budget still drew a RST_STREAM")
+	testing.expect(t, saw_frame(&log, .Goaway), "DATA after END_STREAM past the budget was dropped without a GOAWAY")
 
-	delete(log.frames)
-	conn_unref(c)
-	free_all(context.temp_allocator)
-	expect_no_leaks(t, &track, "data after end stream budget")
+	conn_done(t, c, &track, "data after end stream budget", &log)
 }
 
 /*
@@ -3452,10 +3007,7 @@ test_idle_stream_and_enable_push_protocol_errors :: proc(t: ^testing.T) {
 		// Stream 3 was opened and has closed.
 		c.last_stream_id = 3
 		ok := handle_frame(c, tc.h, tc.payload)
-		saw_goaway := false
-		for f in log.frames {
-			saw_goaway ||= f.type == .Goaway
-		}
+		saw_goaway := saw_frame(&log, .Goaway)
 		if tc.accepted {
 			testing.expectf(t, ok && !saw_goaway, "%s: accepted=%v goaway=%v, want accepted", tc.what, ok, saw_goaway)
 		} else {
@@ -3484,9 +3036,7 @@ allocation and free on the reader thread.
 @(test)
 test_headers_reach_the_connection_allocator_only_for_kept_fields :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	c := make_conn(IO{read = no_read, write = discard_write}, ignore_request, nil, allocator)
 
@@ -3569,12 +3119,11 @@ test_trailers_end_a_parked_request :: proc(t: ^testing.T) {
 	for split in ([]bool{false, true}) {
 		for body in ([]string{"xy", ""}) {
 			track: mem.Tracking_Allocator
-			mem.tracking_allocator_init(&track, context.allocator)
-			allocator := mem.tracking_allocator(&track)
+			allocator := track_allocations(&track)
 
 			log: Request_Log
 			c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, counting_handler, &log, allocator)
-			block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+			block := request_block()
 			handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 			if len(body) > 0 {
 				handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, transmute([]u8)body)
@@ -3597,10 +3146,7 @@ test_trailers_end_a_parked_request :: proc(t: ^testing.T) {
 			handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 3}, block)
 			testing.expectf(t, log.dispatched == 2, "split=%v body=%q: the next stream was not served", split, body)
 
-			conn_unref(c)
-			free_all(context.temp_allocator)
-			expect_no_leaks(t, &track, "trailers on a parked request")
-			mem.tracking_allocator_destroy(&track)
+			conn_done(t, c, &track, "trailers on a parked request")
 		}
 	}
 }
@@ -3616,7 +3162,7 @@ decoded all the same, so HPACK stays in step.
 test_malformed_trailers_are_a_stream_error :: proc(t: ^testing.T) {
 	Case :: struct {
 		what:  string,
-		field: Field,
+		field: Header_Field,
 		flags: u8,
 	}
 	cases := []Case {
@@ -3629,12 +3175,11 @@ test_malformed_trailers_are_a_stream_error :: proc(t: ^testing.T) {
 	for tc in cases {
 		for split in ([]bool{false, true}) {
 			track: mem.Tracking_Allocator
-			mem.tracking_allocator_init(&track, context.allocator)
-			allocator := mem.tracking_allocator(&track)
+			allocator := track_allocations(&track)
 
 			log: Request_Log
 			c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, counting_handler, &log, allocator)
-			block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+			block := request_block()
 			handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 			body := []u8{'x'}
 			handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
@@ -3654,10 +3199,7 @@ test_malformed_trailers_are_a_stream_error :: proc(t: ^testing.T) {
 				testing.expectf(t, ok && log.rsts == 1, "%s split=%v: DATA behind the reset was not ignored", tc.what, split)
 			}
 
-			conn_unref(c)
-			free_all(context.temp_allocator)
-			expect_no_leaks(t, &track, "malformed trailers")
-			mem.tracking_allocator_destroy(&track)
+			conn_done(t, c, &track, "malformed trailers")
 		}
 	}
 }
@@ -3673,13 +3215,12 @@ connection and still decoded.
 test_headers_after_end_stream_is_a_stream_error :: proc(t: ^testing.T) {
 	for retire_midway in ([]bool{false, true}) {
 		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		allocator := mem.tracking_allocator(&track)
+		allocator := track_allocations(&track)
 
 		log: Request_Log
 		// Takes the request and never answers: the stream stays its to retire.
 		c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, destroying_handler, &log, allocator)
-		block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+		block := request_block()
 		handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
 		s := c.streams[1]
 
@@ -3702,10 +3243,7 @@ test_headers_after_end_stream_is_a_stream_error :: proc(t: ^testing.T) {
 			close_stream(c, 1)
 		}
 
-		conn_unref(c)
-		free_all(context.temp_allocator)
-		expect_no_leaks(t, &track, "headers after end stream")
-		mem.tracking_allocator_destroy(&track)
+		conn_done(t, c, &track, "headers after end stream")
 	}
 }
 
@@ -3738,7 +3276,7 @@ test_repeated_headers_on_a_held_stream_are_budgeted :: proc(t: ^testing.T) {
 	log: Request_Log
 	c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, destroying_handler, &log, context.allocator)
 	defer conn_unref(c)
-	block, _ := hex.decode(transmute([]u8)string(REQUEST_BLOCK), context.temp_allocator)
+	block := request_block()
 	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
 	repeat := Frame_Header{length = 1, type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}
 	testing.expect(t, handle_headers(c, repeat, []u8{0x82}), "the first block past taking one dropped the connection")

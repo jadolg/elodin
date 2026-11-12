@@ -2,7 +2,6 @@ package loop
 
 import "core:sync"
 import "core:testing"
-import "core:thread"
 import "core:time"
 
 // The loop's clock in this file's test, moved by the test thread.
@@ -78,22 +77,13 @@ says and not when the machine gets round to it.
 */
 @(test)
 test_a_busy_loop_keeps_the_stacks_it_uses :: proc(t: ^testing.T) {
-	l, made := make_loop()
-	if !testing.expect(t, made, "no loop") {
-		return
-	}
-	defer destroy(l)
 	sync.atomic_store(&warm_now, time.tick_now()._nsec)
-	l.clock = warm_clock
-	th := spawn_thread(l, run, context)
-	if !testing.expect(t, th != nil, "no loop thread") {
+	r, started := start(t, warm_clock)
+	if !started {
 		return
 	}
-	defer {
-		stop(l)
-		thread.join(th)
-		thread.destroy(th)
-	}
+	defer finish(r)
+	l := r.l
 	N :: 200
 	M :: 50
 	advance :: proc() {

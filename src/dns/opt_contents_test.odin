@@ -18,13 +18,7 @@ NAME :: "www.example.com."
 
 @(private = "file")
 answer_record :: proc() -> Record {
-	return Record {
-		name = NAME,
-		type = .A,
-		class = .IN,
-		ttl = 300,
-		data = Rdata_A{addr = [4]u8{192, 0, 2, 1}},
-	}
+	return a_answer(NAME, 300)
 }
 
 /*
@@ -37,15 +31,6 @@ decode and encode again.
 */
 @(private = "file")
 answer_with_options :: proc(options: []EDNS_Option, trailing := 0) -> []u8 {
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = NAME,
-		type  = .A,
-		class = .IN,
-	}
-	answer := make([]Record, 1, context.temp_allocator)
-	answer[0] = answer_record()
-
 	additional := make([]Record, 1 + trailing, context.temp_allocator)
 	opt := make_opt(1232, false)
 	opt.data = Rdata_OPT{options = options}
@@ -54,14 +39,14 @@ answer_with_options :: proc(options: []EDNS_Option, trailing := 0) -> []u8 {
 		additional[1 + i] = answer_record()
 	}
 
-	wire, _, err := encode_message(
-		Message{id = 0x4242, question = questions, answer = answer, additional = additional},
-		context.temp_allocator,
+	return test_wire(
+		{
+			id = 0x4242,
+			question = []Question{{name = NAME, type = .A, class = .IN}},
+			answer = []Record{answer_record()},
+			additional = additional,
+		},
 	)
-	if err != .None {
-		return nil
-	}
-	return wire
 }
 
 @(private = "file")

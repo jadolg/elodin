@@ -59,37 +59,7 @@ echo_mock_loop :: proc(m: ^Echo_Mock) {
 
 @(private = "file")
 start_echo_mock :: proc(t: ^testing.T, m: ^Echo_Mock, name: string) -> (u: ^Upstream, worker: ^thread.Thread, ok: bool) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind a loopback responder: %v", serr) {
-		return nil, nil, false
-	}
-	m.socket = socket
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the responder's port: %v", berr) {
-		net.close(socket)
-		return nil, nil, false
-	}
-	built, uerr := make_upstream(
-		config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port},
-		0,
-		DEADLINE_TIMEOUT,
-		context.allocator,
-	)
-	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr) {
-		net.close(socket)
-		return nil, nil, false
-	}
-	return built, thread.create_and_start_with_poly_data(m, echo_mock_loop), true
-}
-
-@(private = "file")
-stop_echo_mock :: proc(m: ^Echo_Mock, u: ^Upstream, worker: ^thread.Thread) {
-	sync.atomic_store(&m.stop, true)
-	thread.join(worker)
-	thread.destroy(worker)
-	net.close(m.socket)
-	destroy(u)
+	return start_udp_mock(t, m, echo_mock_loop, name, DEADLINE_TIMEOUT)
 }
 
 @(private = "file")
@@ -113,6 +83,11 @@ test_a_failover_query_waits_out_two_timeouts_and_no_more :: proc(t: ^testing.T) 
 	mocks: [3]Echo_Mock
 	ups: [3]^Upstream
 	workers: [3]^thread.Thread
+	// Only the mocks that started: a zero socket is fd 0, another test's.
+	live := 0
+	defer for i in 0 ..< live {
+		stop_udp_mock(&mocks[i], workers[i], ups[i])
+	}
 	for i in 0 ..< 3 {
 		mocks[i].mute = true
 		ok: bool
@@ -120,18 +95,10 @@ test_a_failover_query_waits_out_two_timeouts_and_no_more :: proc(t: ^testing.T) 
 		if !ok {
 			return
 		}
-	}
-	defer for i in 0 ..< 3 {
-		stop_echo_mock(&mocks[i], ups[i], workers[i])
+		live += 1
 	}
 
-	g := Group {
-		servers   = ups[:],
-		strategy  = .Failover,
-		timeout   = DEADLINE_TIMEOUT,
-		attempts  = 2,
-		allocator = context.allocator,
-	}
+	g := failover_group(ups[:], DEADLINE_TIMEOUT, attempts = 2)
 	started := time.tick_now()
 	resp, _, err := resolve(&g, deadline_query(), context.allocator)
 	spent := time.tick_since(started)
@@ -161,21 +128,15 @@ test_a_dead_first_member_still_fails_over_to_a_slow_second :: proc(t: ^testing.T
 	if !dok {
 		return
 	}
-	defer stop_echo_mock(&dead, du, dw)
+	defer stop_udp_mock(&dead, dw, du)
 	su, sw, sok := start_echo_mock(t, &slow, "slow")
 	if !sok {
 		return
 	}
-	defer stop_echo_mock(&slow, su, sw)
+	defer stop_udp_mock(&slow, sw, su)
 
 	servers := []^Upstream{du, su}
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = DEADLINE_TIMEOUT,
-		attempts  = 2,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, DEADLINE_TIMEOUT, attempts = 2)
 	resp, winner, err := resolve(&g, deadline_query(), context.allocator)
 	defer delete(resp, context.allocator)
 	testing.expect_value(t, err, Error.None)
@@ -217,21 +178,15 @@ test_members_that_fail_for_free_do_not_spend_the_budget :: proc(t: ^testing.T) {
 	if !dok {
 		return
 	}
-	defer stop_echo_mock(&dead, du, dw)
+	defer stop_udp_mock(&dead, dw, du)
 	su, sw, sok := start_echo_mock(t, &slow, "slow")
 	if !sok {
 		return
 	}
-	defer stop_echo_mock(&slow, su, sw)
+	defer stop_udp_mock(&slow, sw, su)
 
 	servers := []^Upstream{stuck[0], stuck[1], stuck[2], du, su}
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = DEADLINE_TIMEOUT,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, DEADLINE_TIMEOUT)
 	resp, winner, err := resolve(&g, deadline_query(), context.allocator)
 	defer delete(resp, context.allocator)
 	testing.expect_value(t, err, Error.None)
@@ -255,24 +210,18 @@ test_a_retry_round_asks_a_parked_member_before_a_failed_one :: proc(t: ^testing.
 	if !qok {
 		return
 	}
-	defer stop_echo_mock(&quiet, qu, qw)
+	defer stop_udp_mock(&quiet, qw, qu)
 	bu, bw, bok := start_echo_mock(t, &back, "back")
 	if !bok {
 		return
 	}
-	defer stop_echo_mock(&back, bu, bw)
+	defer stop_udp_mock(&back, bw, bu)
 	// Parked by what it did a moment ago, and answering again now.
 	bu.failures = FAILURE_THRESHOLD
 	bu.down_until = loop.moment_add(loop.moment_now(), COOLDOWN)
 
 	servers := []^Upstream{qu, bu}
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = DEADLINE_TIMEOUT,
-		attempts  = 2,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, DEADLINE_TIMEOUT, attempts = 2)
 	resp, winner, err := resolve(&g, deadline_query(), context.allocator)
 	defer delete(resp, context.allocator)
 	testing.expect_value(t, err, Error.None)
@@ -297,24 +246,18 @@ test_a_member_parked_by_this_query_is_not_asked_again_first :: proc(t: ^testing.
 	if !qok {
 		return
 	}
-	defer stop_echo_mock(&quiet, qu, qw)
+	defer stop_udp_mock(&quiet, qw, qu)
 	bu, bw, bok := start_echo_mock(t, &back, "back")
 	if !bok {
 		return
 	}
-	defer stop_echo_mock(&back, bu, bw)
+	defer stop_udp_mock(&back, bw, bu)
 	qu.failures = FAILURE_THRESHOLD - 1
 	bu.failures = FAILURE_THRESHOLD
 	bu.down_until = loop.moment_add(loop.moment_now(), COOLDOWN)
 
 	servers := []^Upstream{qu, bu}
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = DEADLINE_TIMEOUT,
-		attempts  = 2,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, DEADLINE_TIMEOUT, attempts = 2)
 	resp, winner, err := resolve(&g, deadline_query(), context.allocator)
 	defer delete(resp, context.allocator)
 	testing.expect_value(t, err, Error.None)
@@ -362,28 +305,22 @@ test_a_slow_unresolvable_member_is_charged_and_parks :: proc(t: ^testing.T) {
 	if !bok {
 		return
 	}
-	defer stop_echo_mock(&boot, bu, bw)
+	defer stop_udp_mock(&boot, bw, bu)
 	du, dw, dok := start_echo_mock(t, &dead, "dead")
 	if !dok {
 		return
 	}
-	defer stop_echo_mock(&dead, du, dw)
+	defer stop_udp_mock(&dead, dw, du)
 	lu, lw, lok := start_echo_mock(t, &live, "live")
 	if !lok {
 		return
 	}
-	defer stop_echo_mock(&live, lu, lw)
+	defer stop_udp_mock(&live, lw, lu)
 	stuck := slow_unresolvable(t, bu)
 	defer destroy(stuck)
 
 	servers := []^Upstream{stuck, du, lu}
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = DEADLINE_TIMEOUT,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, DEADLINE_TIMEOUT)
 	for i in 0 ..< FAILURE_THRESHOLD {
 		resp, _, err := resolve(&g, deadline_query(), context.allocator)
 		delete(resp, context.allocator)
@@ -412,28 +349,22 @@ test_the_sweep_charges_a_slow_unresolvable_member_until_it_parks :: proc(t: ^tes
 	if !bok {
 		return
 	}
-	defer stop_echo_mock(&boot, bu, bw)
+	defer stop_udp_mock(&boot, bw, bu)
 	ru, rw, rok := start_echo_mock(t, &refusing, "refusing")
 	if !rok {
 		return
 	}
-	defer stop_echo_mock(&refusing, ru, rw)
+	defer stop_udp_mock(&refusing, rw, ru)
 	lu, lw, lok := start_echo_mock(t, &live, "live")
 	if !lok {
 		return
 	}
-	defer stop_echo_mock(&live, lu, lw)
+	defer stop_udp_mock(&live, lw, lu)
 	stuck := slow_unresolvable(t, bu)
 	defer destroy(stuck)
 
 	servers := []^Upstream{ru, stuck, lu}
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = DEADLINE_TIMEOUT,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, DEADLINE_TIMEOUT)
 	// `resolve` asks only the refusing member; the sweep then meets the slow
 	// one, whose 1.2 timeouts are past the sweep's one.
 	for i in 0 ..< FAILURE_THRESHOLD {
@@ -472,24 +403,21 @@ test_the_sweep_spends_what_is_left_of_the_query_budget :: proc(t: ^testing.T) {
 	mocks[3].mute = true
 	ups: [4]^Upstream
 	workers: [4]^thread.Thread
+	// Only the mocks that started: a zero socket is fd 0, another test's.
+	live := 0
+	defer for i in 0 ..< live {
+		stop_udp_mock(&mocks[i], workers[i], ups[i])
+	}
 	for i in 0 ..< 4 {
 		ok: bool
 		ups[i], workers[i], ok = start_echo_mock(t, &mocks[i], fmt.tprintf("m%d", i))
 		if !ok {
 			return
 		}
-	}
-	defer for i in 0 ..< 4 {
-		stop_echo_mock(&mocks[i], ups[i], workers[i])
+		live += 1
 	}
 
-	g := Group {
-		servers   = ups[:],
-		strategy  = .Failover,
-		timeout   = DEADLINE_TIMEOUT,
-		attempts  = 2,
-		allocator = context.allocator,
-	}
+	g := failover_group(ups[:], DEADLINE_TIMEOUT, attempts = 2)
 	// Both callers, since both are the one sweep: a client's question and a
 	// chain lookup. Each call gets a budget of its own.
 	for insisting, i in ([]proc(_: ^Group, _: []u8, _: mem.Allocator, _: ^time.Tick) -> ([]u8, ^Upstream, Error){resolve_readable, resolve_answerable}) {
@@ -526,23 +454,20 @@ test_the_calls_of_one_question_share_its_deadline :: proc(t: ^testing.T) {
 	mocks[1].delay = DEADLINE_TIMEOUT * 9 / 10
 	ups: [2]^Upstream
 	workers: [2]^thread.Thread
+	// Only the mocks that started: a zero socket is fd 0, another test's.
+	live := 0
+	defer for i in 0 ..< live {
+		stop_udp_mock(&mocks[i], workers[i], ups[i])
+	}
 	for i in 0 ..< 2 {
 		ok: bool
 		ups[i], workers[i], ok = start_echo_mock(t, &mocks[i], fmt.tprintf("m%d", i))
 		if !ok {
 			return
 		}
+		live += 1
 	}
-	defer for i in 0 ..< 2 {
-		stop_echo_mock(&mocks[i], ups[i], workers[i])
-	}
-	g := Group {
-		servers   = ups[:],
-		strategy  = .Failover,
-		timeout   = DEADLINE_TIMEOUT,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(ups[:], DEADLINE_TIMEOUT)
 
 	deadline := time.tick_add(time.tick_now(), 2 * DEADLINE_TIMEOUT)
 	first, _, _ := resolve_answerable(&g, deadline_query(), context.allocator, &deadline)
@@ -599,15 +524,11 @@ stray_mock_serve :: proc(m: ^Stray_Mock) {
 // Binds the mock, the late stray landing at nine tenths of the timeout. The
 // caller closes the socket.
 @(private = "file")
-stray_mock_bind :: proc(t: ^testing.T) -> (m: Stray_Mock, ok: bool) {
+stray_mock_bind :: proc(t: ^testing.T) -> (m: Stray_Mock, bound: net.Endpoint, ok: bool) {
 	m.at = DEADLINE_TIMEOUT * 9 / 10
-	err: net.Network_Error
-	m.socket, err = net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, err == nil, "cannot bind the mock: %v", err) {
-		return
-	}
+	m.socket, bound = bind_loopback_udp(t) or_return
 	_ = net.set_option(m.socket, .Receive_Timeout, 10 * DEADLINE_TIMEOUT)
-	return m, true
+	return m, bound, true
 }
 
 /*
@@ -619,12 +540,11 @@ with it the one a question's deadline lets cross the line (issues #446, #376).
 */
 @(test)
 test_a_stray_datagram_does_not_extend_a_udp_exchange :: proc(t: ^testing.T) {
-	m, ok := stray_mock_bind(t)
+	m, bound, ok := stray_mock_bind(t)
 	if !ok {
 		return
 	}
 	defer net.close(m.socket)
-	bound, _ := net.bound_endpoint(m.socket)
 	u, uerr := make_upstream(
 		config.Upstream_Spec{name = "stray", kind = .UDP, address = "127.0.0.1", port = bound.port},
 		0,
@@ -655,12 +575,11 @@ test_a_stray_datagram_does_not_extend_a_udp_exchange :: proc(t: ^testing.T) {
 // exchange that needs it, so a stray must not stretch it either.
 @(test)
 test_a_stray_datagram_does_not_extend_a_bootstrap_query :: proc(t: ^testing.T) {
-	m, bound_ok := stray_mock_bind(t)
+	m, bound, bound_ok := stray_mock_bind(t)
 	if !bound_ok {
 		return
 	}
 	defer net.close(m.socket)
-	bound, _ := net.bound_endpoint(m.socket)
 	worker := thread.create_and_start_with_poly_data(&m, stray_mock_serve)
 
 	udp_waits_reset()

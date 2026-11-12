@@ -14,36 +14,17 @@ it plus a ceiling to a message on its way out.
 
 @(private = "file")
 answer_with_ttls :: proc(ttls: []u32, ext_rcode: u8 = 0) -> []u8 {
-	question := make([]Question, 1, context.temp_allocator)
-	question[0] = Question {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-	}
 	answer := make([]Record, len(ttls), context.temp_allocator)
 	for ttl, i in ttls {
-		answer[i] = Record {
-			name  = "example.com.",
-			type  = .A,
-			class = .IN,
-			ttl   = ttl,
-			data  = Rdata_A{addr = {192, 0, 2, u8(i + 1)}},
-		}
+		answer[i] = a_answer("example.com.", ttl, u8(i + 1))
 	}
-	additional := make([]Record, 1, context.temp_allocator)
-	additional[0] = make_opt(1232, true, ext_rcode)
-
 	m := Message {
-		question   = question,
+		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
 		answer     = answer,
-		additional = additional,
+		additional = []Record{make_opt(1232, true, ext_rcode)},
 	}
 	m.flags.qr = true
-	wire, _, err := encode_message(m, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_wire(m)
 }
 
 @(test)

@@ -64,15 +64,7 @@ nx_with_answer :: proc(
 	m.flags.qr = true
 	m.flags.ra = true
 	m.flags.rcode = u8(dns.Rcode.NX_Domain)
-	wire, _, err := dns.encode_message(m, allocator)
-	if err != .None {
-		panic("failed to encode the test nxdomain")
-	}
-	decoded, derr := dns.decode_message(wire, allocator)
-	if derr != .None {
-		panic("failed to decode the test nxdomain")
-	}
-	return wire, decoded
+	return wire_and_msg(m, allocator)
 }
 
 @(test)
@@ -82,7 +74,7 @@ test_nxdomain_carrying_data_is_not_cached :: proc(t: ^testing.T) {
 
 	wire, msg := nx_with_answer("mail.example.com.", .A, allocator = context.temp_allocator)
 	kb: [KEY_MAX]u8
-	key := key_for_nx(kb[:], "mail.example.com.")
+	key := key_for(kb[:], "mail.example.com.")
 
 	testing.expect(t, !put(c, key, wire, msg), "an NXDOMAIN holding an A record was stored")
 	testing.expect_value(t, len_entries(c), 0)
@@ -103,7 +95,7 @@ test_nxdomain_after_a_cname_is_still_cached :: proc(t: ^testing.T) {
 
 	wire, msg := nx_with_answer("www.example.com.", .CNAME, allocator = context.temp_allocator)
 	kb: [KEY_MAX]u8
-	key := key_for_nx(kb[:], "www.example.com.")
+	key := key_for(kb[:], "www.example.com.")
 
 	testing.expect(t, put(c, key, wire, msg), "an NXDOMAIN after a CNAME should still be cached")
 	testing.expect_value(t, len_entries(c), 1)
@@ -180,10 +172,7 @@ test_nxdomain_after_a_cname_is_cached_for_an_rrsig_question :: proc(t: ^testing.
 	m.flags.qr = true
 	m.flags.ra = true
 	m.flags.rcode = u8(dns.Rcode.NX_Domain)
-	wire, _, err := dns.encode_message(m, context.temp_allocator)
-	testing.expect(t, err == .None, "the test nxdomain did not encode")
-	msg, derr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect(t, derr == .None, "the test nxdomain did not decode")
+	wire, msg := wire_and_msg(m)
 
 	kb: [KEY_MAX]u8
 	key := make_key(kb[:], "www.example.com.", .RRSIG, .IN, false)
@@ -222,10 +211,7 @@ test_nxdomain_over_a_dname_above_the_queried_name_is_cached :: proc(t: ^testing.
 	m.flags.qr = true
 	m.flags.ra = true
 	m.flags.rcode = u8(dns.Rcode.NX_Domain)
-	wire, _, err := dns.encode_message(m, context.temp_allocator)
-	testing.expect(t, err == .None, "the test nxdomain did not encode")
-	msg, derr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect(t, derr == .None, "the test nxdomain did not decode")
+	wire, msg := wire_and_msg(m)
 
 	kb: [KEY_MAX]u8
 	key := make_key(kb[:], "a.sub.example.com.", .DNAME, .IN, false)
@@ -265,21 +251,13 @@ test_nxdomain_over_a_cname_in_another_class_is_not_cached :: proc(t: ^testing.T)
 	m.flags.qr = true
 	m.flags.ra = true
 	m.flags.rcode = u8(dns.Rcode.NX_Domain)
-	wire, _, err := dns.encode_message(m, context.temp_allocator)
-	testing.expect(t, err == .None, "the test nxdomain did not encode")
-	msg, derr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect(t, derr == .None, "the test nxdomain did not decode")
+	wire, msg := wire_and_msg(m)
 
 	kb: [KEY_MAX]u8
-	key := key_for_nx(kb[:], "www.example.com.")
+	key := key_for(kb[:], "www.example.com.")
 	testing.expect(t, !put(c, key, wire, msg), "an NXDOMAIN over a CNAME in another class was stored")
 	testing.expect_value(t, len_entries(c), 0)
 	free_all(context.temp_allocator)
-}
-
-@(private = "file")
-key_for_nx :: proc(buf: []u8, name: string) -> string {
-	return make_key(buf, name, .A, .IN, false)
 }
 
 // The SOA of the zone a redirection led into, which is what a real name error

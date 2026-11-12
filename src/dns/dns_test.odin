@@ -6,6 +6,32 @@ import "core:hash"
 import "core:mem"
 import "core:testing"
 
+// `m` on the wire, in the temp allocator. A fixture that does not encode is a
+// broken test, not a case, so it panics rather than hand back nil.
+@(private)
+test_wire :: proc(m: Message, compress := true) -> []u8 {
+	wire, _, err := encode_message(m, context.temp_allocator, compress = compress)
+	if err != .None {
+		panic("a test message did not encode")
+	}
+	return wire
+}
+
+// An A record for `name` at 192.0.2.`last`.
+@(private)
+a_answer :: proc(name: string, ttl: u32, last: u8 = 1) -> Record {
+	return Record{name = name, type = .A, class = .IN, ttl = ttl, data = Rdata_A{addr = {192, 0, 2, last}}}
+}
+
+// Fails `t` for every allocation `track` still holds and for any bad free.
+@(private)
+expect_no_leaks :: proc(t: ^testing.T, track: ^mem.Tracking_Allocator, loc := #caller_location) {
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%d bytes left held, allocated at %v", entry.size, entry.location, loc = loc)
+	}
+	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array), loc = loc)
+}
+
 @(test)
 test_name_roundtrip :: proc(t: ^testing.T) {
 	names := []string{".", "com.", "www.example.com.", "a.b.c.d.e.f.", "xn--bcher-kva.de."}
@@ -362,9 +388,7 @@ test_scan_ttl_offsets_releases_on_bad_name :: proc(t: ^testing.T) {
 	testing.expect(t, !ok, "a reserved label type was accepted")
 	testing.expect(t, offsets == nil, "a failed scan returned a list")
 
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%d bytes leaked, allocated at %v", entry.size, entry.location)
-	}
+	expect_no_leaks(t, &track)
 }
 
 /*
@@ -411,10 +435,7 @@ test_encode_message_releases_its_writer :: proc(t: ^testing.T) {
 	// The buffer is the caller's, and is meant to be the only thing that is.
 	delete(wire, allocator)
 
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%d bytes left held, allocated at %v", entry.size, entry.location)
-	}
-	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array))
+	expect_no_leaks(t, &track)
 }
 
 /*
@@ -439,10 +460,7 @@ test_encode_message_releases_its_writer_on_error :: proc(t: ^testing.T) {
 	testing.expect(t, err != .None, "a message past max_size was accepted")
 	testing.expect(t, wire == nil, "a refused encode still returned a buffer")
 
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%d bytes left held, allocated at %v", entry.size, entry.location)
-	}
-	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array))
+	expect_no_leaks(t, &track)
 }
 
 /*
@@ -481,10 +499,7 @@ test_encode_message_releases_its_writer_on_truncation :: proc(t: ^testing.T) {
 	delete(wire, allocator)
 	delete(answer)
 
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%d bytes left held, allocated at %v", entry.size, entry.location)
-	}
-	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array))
+	expect_no_leaks(t, &track)
 }
 
 /*
@@ -1473,9 +1488,7 @@ test_encode_message_compression_allocates_nothing_per_name :: proc(t: ^testing.T
 
 	delete(wire, allocator)
 	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%d bytes left held, allocated at %v", entry.size, entry.location)
-	}
+	expect_no_leaks(t, &track)
 }
 
 /*

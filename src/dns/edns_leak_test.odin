@@ -69,7 +69,7 @@ test_remove_edns_option_frees_its_scratch :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "remove_edns_option failed")
 	testing.expect(t, raw_data(out) != raw_data(wire), "expected the rebuild path, not the in-place one")
 
-	_, still_there := option_code_present(out, .Cookie)
+	_, still_there := option_in(out, .Cookie)
 	testing.expect(t, !still_there, "the cookie survived the removal")
 
 	// The caller owns exactly one thing: the buffer it was handed.
@@ -84,13 +84,4 @@ test_remove_edns_option_frees_its_scratch :: proc(t: ^testing.T) {
 	)
 
 	free_all(context.temp_allocator)
-}
-
-@(private = "file")
-option_code_present :: proc(wire: []u8, code: EDNS_Option_Code) -> (data: []u8, found: bool) {
-	m, err := decode_message(wire, context.temp_allocator)
-	if err != .None {
-		return nil, false
-	}
-	return find_edns_option(m, code)
 }

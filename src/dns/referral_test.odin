@@ -18,9 +18,7 @@ referral_wire :: proc(rcode: Rcode, answer, authority: []Record) -> []u8 {
 	}
 	msg.flags.qr = true
 	msg.flags.rcode = u8(rcode)
-	wire, _, err := encode_message(msg, context.temp_allocator)
-	assert(err == .None)
-	return wire
+	return test_wire(msg)
 }
 
 @(test)

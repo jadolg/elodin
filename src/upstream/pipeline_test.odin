@@ -87,9 +87,7 @@ pipe_mock_loop :: proc(m: ^Pipe_Mock) {
 	}
 
 	// Hold the connection open until the test is done with it.
-	for !sync.atomic_load(&m.stop) {
-		time.sleep(10 * time.Millisecond)
-	}
+	hold_until_stop(&m.stop)
 }
 
 @(private = "file")
@@ -510,9 +508,7 @@ handoff_mock_loop :: proc(m: ^Handoff_Mock) {
 	framed[3] = u8(stray)
 	_ = write_all_tcp(client, framed)
 
-	for !sync.atomic_load(&m.stop) {
-		time.sleep(10 * time.Millisecond)
-	}
+	hold_until_stop(&m.stop)
 }
 
 /*
@@ -958,9 +954,7 @@ split_mock_loop :: proc(m: ^Split_Mock) {
 	body[2] |= 0x80
 	_ = write_all_tcp(client, body)
 
-	for !sync.atomic_load(&m.stop) {
-		time.sleep(10 * time.Millisecond)
-	}
+	hold_until_stop(&m.stop)
 }
 
 @(private = "file")
@@ -1471,9 +1465,7 @@ stall_mock_loop :: proc(m: ^Stall_Mock) {
 		_ = write_all_tcp(client, prefix[1:])
 	}
 
-	for !sync.atomic_load(&m.stop) {
-		time.sleep(10 * time.Millisecond)
-	}
+	hold_until_stop(&m.stop)
 }
 
 @(private = "file")

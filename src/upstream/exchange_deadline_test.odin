@@ -98,9 +98,7 @@ truncating_tcp_once :: proc(m: ^Truncating_Mock) {
 	}
 	sync.sema_post(&m.scanned)
 	// Open and silent: a closed connection would end the retry early.
-	for !sync.atomic_load(&m.stop) {
-		time.sleep(10 * time.Millisecond)
-	}
+	hold_until_stop(&m.stop)
 }
 
 @(test)
@@ -188,12 +186,11 @@ test_a_truncated_replys_tcp_retry_shares_the_exchange_timeout :: proc(t: ^testin
 @(test)
 test_bootstrap_resolution_shares_the_exchange_timeout :: proc(t: ^testing.T) {
 	// Bound and never read: queries queue in the kernel and nothing answers.
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the bootstrap mock: %v", serr) {
+	socket, bound, bound_ok := bind_loopback_udp(t)
+	if !bound_ok {
 		return
 	}
 	defer net.close(socket)
-	bound, _ := net.bound_endpoint(socket)
 
 	// Built with no bootstrap servers, so construction fails to resolve at once
 	// rather than waiting out the silent one; it is handed over afterwards, the
@@ -238,12 +235,11 @@ Nothing answers, so nothing reaches the package-global cache.
 */
 @(test)
 test_a_bootstrap_query_waits_to_the_deadline_it_is_given :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the bootstrap mock: %v", serr) {
+	socket, bound, bound_ok := bind_loopback_udp(t)
+	if !bound_ok {
 		return
 	}
 	defer net.close(socket)
-	bound, _ := net.bound_endpoint(socket)
 	servers := []string{net.endpoint_to_string(bound, context.temp_allocator)}
 
 	udp_waits_reset()
@@ -267,18 +263,16 @@ tests read; what is checked is that the second server was asked at all.
 */
 @(test)
 test_a_dead_bootstrap_server_leaves_time_for_the_next :: proc(t: ^testing.T) {
-	first, ferr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, ferr == nil, "cannot bind the first bootstrap mock: %v", ferr) {
+	first, a, first_ok := bind_loopback_udp(t)
+	if !first_ok {
 		return
 	}
 	defer net.close(first)
-	second, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the second bootstrap mock: %v", serr) {
+	second, b, second_ok := bind_loopback_udp(t)
+	if !second_ok {
 		return
 	}
 	defer net.close(second)
-	a, _ := net.bound_endpoint(first)
-	b, _ := net.bound_endpoint(second)
 	servers := []string {
 		net.endpoint_to_string(a, context.temp_allocator),
 		net.endpoint_to_string(b, context.temp_allocator),
@@ -303,12 +297,11 @@ therefore asked nothing more; it is sent one query, not two.
 */
 @(test)
 test_a_bootstrap_servers_a_query_has_its_whole_share :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the bootstrap mock: %v", serr) {
+	socket, bound, bound_ok := bind_loopback_udp(t)
+	if !bound_ok {
 		return
 	}
 	defer net.close(socket)
-	bound, _ := net.bound_endpoint(socket)
 	servers := []string{net.endpoint_to_string(bound, context.temp_allocator)}
 
 	_, ok := bootstrap_resolve(servers, "share.example.test", time.tick_add(time.tick_now(), X_TIMEOUT))
@@ -340,21 +333,11 @@ cache, which another test owns while it runs.
 */
 @(test)
 test_the_exchange_that_resolved_a_member_does_not_charge_it_a_timeout :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the silent member: %v", serr) {
+	u, socket, ok := silent_upstream(t, "silent", X_TIMEOUT)
+	if !ok {
 		return
 	}
 	defer net.close(socket)
-	bound, _ := net.bound_endpoint(socket)
-	u, uerr := make_upstream(
-		config.Upstream_Spec{name = "silent", kind = .UDP, address = "127.0.0.1", port = bound.port},
-		0,
-		X_TIMEOUT,
-		context.allocator,
-	)
-	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr) {
-		return
-	}
 	defer destroy(u)
 	u.resolved = false
 

@@ -89,7 +89,7 @@ test_misshapen_sections_are_refused :: proc(t: ^testing.T) {
 		{"blocking:\n  lists:\n    -\n", "blocking.lists[0]: needs either a url or a file"},
 		{"upstream:\n  servers:\n    address: 10.0.0.1\n", "upstream.servers: expected"},
 		{
-			"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [corp.example]\n      servers:\n        address: 10.0.0.1\n",
+			MINIMAL + "  zones:\n    - domains: [corp.example]\n      servers:\n        address: 10.0.0.1\n",
 			"upstream.zones[0].servers: expected",
 		},
 	}
@@ -98,18 +98,9 @@ test_misshapen_sections_are_refused :: proc(t: ^testing.T) {
 		// be refused as a duplicate key before the loader saw either.
 		src := c[0]
 		if !strings.has_prefix(src, "upstream:") {
-			src = strings.concatenate({"upstream:\n  servers: [1.1.1.1]\n", c[0]}, context.temp_allocator)
+			src = strings.concatenate({MINIMAL, c[0]}, context.temp_allocator)
 		}
-		_, err := load_string(src, context.temp_allocator)
-		e, has := err.?
-		found := false
-		for m in e.messages {
-			if strings.has_prefix(m, c[1]) {
-				found = true
-				break
-			}
-		}
-		testing.expectf(t, has && found, "%q: no %q error in %v", c[0], c[1], e.messages)
+		expect_refused(t, src, c[1], prefix = true)
 	}
 	free_all(context.temp_allocator)
 }
@@ -119,8 +110,8 @@ test_misshapen_sections_are_refused :: proc(t: ^testing.T) {
 @(test)
 test_a_misshapen_entry_is_one_error :: proc(t: ^testing.T) {
 	for src in ([]string {
-			"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - nas.home\n",
-			"upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists:\n    - [a, b]\n",
+			MINIMAL + "rewrites:\n  - nas.home\n",
+			MINIMAL + "blocking:\n  lists:\n    - [a, b]\n",
 			"upstream:\n  servers:\n    - 1.1.1.1\n    - [9.9.9.9]\n",
 		}) {
 		_, err := load_string(src, context.temp_allocator)

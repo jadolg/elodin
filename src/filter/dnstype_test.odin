@@ -11,11 +11,8 @@ import "elodin:dns"
 
 @(private = "file")
 decide :: proc(text: string, name: string, qtype: dns.Type) -> Decision {
-	block, allow := set_make(), set_make()
-	parse_list(block, allow, text, .Adblock)
-	e := engine_make()
+	e := engine_of(text)
 	defer engine_destroy(e)
-	engine_swap(e, block, allow)
 	return engine_match(e, name, qtype)
 }
 
@@ -352,10 +349,7 @@ test_a_block_says_when_only_a_dnstype_rule_made_it :: proc(t: ^testing.T) {
 		{"||v6.example^\n@@/^a\\.v6\\.example$/$dnstype=A", "v6.example.", false},
 	}
 	for c in cases {
-		block, allow := set_make(), set_make()
-		parse_list(block, allow, c.list, .Adblock)
-		e := engine_make()
-		engine_swap(e, block, allow)
+		e := engine_of(c.list)
 		typed_only := !c.typed_only
 		got := engine_match(e, c.name, .AAAA, &typed_only)
 		testing.expectf(t, got == .Blocked && typed_only == c.typed_only, "%q: %v, typed only %v", c.list, got, typed_only)

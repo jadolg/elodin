@@ -3,9 +3,6 @@ package upstream
 import "core:net"
 import "core:sync"
 import "core:testing"
-import "core:thread"
-import "core:time"
-import "elodin:config"
 import "elodin:dns"
 
 /*
@@ -92,33 +89,6 @@ doubled_cookie_opts :: proc(query: []u8) -> []dns.Record {
 	return opts
 }
 
-@(private = "file")
-start_mock :: proc(t: ^testing.T, m: ^Opt_Mock, name: string, cookies := false) -> (^Upstream, ^thread.Thread, bool) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "bind: %v", serr) {
-		return nil, nil, false
-	}
-	m.socket = socket
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the responder's port: %v", berr) {
-		net.close(socket)
-		return nil, nil, false
-	}
-	u, uerr := make_upstream(
-		config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port},
-		0,
-		time.Second,
-		context.allocator,
-		cookies,
-	)
-	if !testing.expectf(t, uerr == .None, "upstream: %v", uerr) {
-		net.close(socket)
-		return nil, nil, false
-	}
-	return u, thread.create_and_start_with_poly_data(m, opt_loop), true
-}
-
 @(test)
 test_a_stray_opt_record_is_swept_past :: proc(t: ^testing.T) {
 	stray := Opt_Mock {
@@ -157,39 +127,19 @@ expect_swept_past :: proc(t: ^testing.T, stray: ^Opt_Mock, cookies := false) {
 	plain: Opt_Mock
 	// Neither started means neither closed: a zero socket here is fd 0, which
 	// under `odin test` is another test's.
-	bad, bad_thread, bad_ok := start_mock(t, stray, "stray", cookies)
+	bad, bad_thread, bad_ok := start_udp_mock(t, stray, opt_loop, "stray", cookies = cookies)
 	if !bad_ok {
 		return
 	}
-	good, good_thread, good_ok := start_mock(t, &plain, "plain")
+	defer stop_udp_mock(stray, bad_thread, bad)
+	good, good_thread, good_ok := start_udp_mock(t, &plain, opt_loop, "plain")
 	if !good_ok {
-		sync.atomic_store(&stray.stop, true)
-		thread.join(bad_thread)
-		thread.destroy(bad_thread)
-		net.close(stray.socket)
-		destroy(bad)
 		return
 	}
-	defer {
-		sync.atomic_store(&stray.stop, true)
-		sync.atomic_store(&plain.stop, true)
-		thread.join(bad_thread)
-		thread.join(good_thread)
-		thread.destroy(bad_thread)
-		thread.destroy(good_thread)
-		net.close(stray.socket)
-		net.close(plain.socket)
-		destroy(bad)
-		destroy(good)
-	}
+	defer stop_udp_mock(&plain, good_thread, good)
 
-	g := Group {
-		servers   = []^Upstream{bad, good},
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	servers := []^Upstream{bad, good}
+	g := failover_group(servers)
 	query := dns.Message{id = 0x3530, question = []dns.Question{{name = "www.example.com.", type = .A, class = .IN}}}
 	query.flags.rd = true
 	// An OPT record for the cookie to be attached to, where one is.

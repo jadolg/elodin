@@ -5,7 +5,6 @@ import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
-import "elodin:config"
 import "elodin:dns"
 
 /*
@@ -59,29 +58,12 @@ start_fixed :: proc(t: ^testing.T, fg: ^Fixed_Group, rcodes: []dns.Rcode) -> boo
 	for rcode, i in rcodes {
 		m := &fg.mocks[i]
 		m.rcode = u8(rcode) & 0xf
-		socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-		if !testing.expectf(t, serr == nil, "bind: %v", serr) {
+		u, worker, ok := start_udp_mock(t, m, fixed_loop, NAMES[i])
+		if !ok {
 			return false
 		}
-		bound, berr := net.bound_endpoint(socket)
-		if !testing.expectf(t, berr == nil, "cannot read the responder's port: %v", berr) {
-			net.close(socket)
-			return false
-		}
-		u, uerr := make_upstream(
-			config.Upstream_Spec{name = NAMES[i], kind = .UDP, address = "127.0.0.1", port = bound.port},
-			0,
-			time.Second,
-			context.allocator,
-		)
-		if !testing.expectf(t, uerr == .None, "upstream: %v", uerr) {
-			net.close(socket)
-			return false
-		}
-		m.socket = socket
-		set_socket_timeouts(socket, 50 * time.Millisecond)
 		fg.servers[i] = u
-		fg.threads[i] = thread.create_and_start_with_poly_data(m, fixed_loop)
+		fg.threads[i] = worker
 		fg.started = i + 1
 	}
 	return true
@@ -90,11 +72,7 @@ start_fixed :: proc(t: ^testing.T, fg: ^Fixed_Group, rcodes: []dns.Rcode) -> boo
 @(private = "file")
 stop_fixed :: proc(fg: ^Fixed_Group) {
 	for i in 0 ..< fg.started {
-		sync.atomic_store(&fg.mocks[i].stop, true)
-		thread.join(fg.threads[i])
-		thread.destroy(fg.threads[i])
-		net.close(fg.mocks[i].socket)
-		destroy(fg.servers[i])
+		stop_udp_mock(&fg.mocks[i], fg.threads[i], fg.servers[i])
 	}
 }
 
@@ -139,13 +117,7 @@ test_an_answerable_reply_that_is_not_the_proof_does_not_end_the_sweep :: proc(t:
 		return
 	}
 	warm(t, &fg)
-	g := Group {
-		servers   = fg.servers[:2],
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(fg.servers[:2])
 	wire := fixed_query()
 
 	// The premise: `resolve_answerable`, which takes any answerable reply,
@@ -173,13 +145,7 @@ test_a_proof_from_the_first_member_sweeps_nobody :: proc(t: ^testing.T) {
 	if !start_fixed(t, &fg, {.No_Error, .NX_Domain}) {
 		return
 	}
-	g := Group {
-		servers   = fg.servers[:2],
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(fg.servers[:2])
 	resp, winner, err := resolve_proving(&g, fixed_query(), proves_noerror, nil, context.allocator)
 	testing.expect_value(t, err, Error.None)
 	testing.expect(t, winner == fg.servers[0], "the first member's proof was not taken")
@@ -201,13 +167,7 @@ test_a_sweep_with_no_proof_keeps_the_first_answerable_reply :: proc(t: ^testing.
 		return
 	}
 	warm(t, &fg)
-	g := Group {
-		servers   = fg.servers[:3],
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(fg.servers[:3])
 	resp, winner, err := resolve_proving(&g, fixed_query(), proves_nothing, nil, context.allocator)
 	testing.expect_value(t, err, Error.None)
 	testing.expect(t, winner == fg.servers[1], "the first answerable reply did not stand")
@@ -260,13 +220,7 @@ test_a_member_not_known_to_be_answering_is_not_held_out_for :: proc(t: ^testing.
 	if !start_fixed(t, &fg, {.NX_Domain, .No_Error}) {
 		return
 	}
-	g := Group {
-		servers   = fg.servers[:2],
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(fg.servers[:2])
 
 	// Never asked: a failover spare, or a fresh start.
 	resp, winner, err := resolve_proving(&g, fixed_query(), proves_noerror, nil, context.allocator)

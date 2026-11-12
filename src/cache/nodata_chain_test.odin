@@ -88,15 +88,7 @@ chain_response :: proc(c: Chain) -> ([]u8, dns.Message) {
 	}
 	m.flags.qr = true
 	m.flags.rcode = u8(c.rcode)
-	wire, _, err := dns.encode_message(m, context.temp_allocator)
-	if err != .None {
-		panic("failed to encode the test chain")
-	}
-	msg, derr := dns.decode_message(wire, context.temp_allocator)
-	if derr != .None {
-		panic("failed to decode the test chain")
-	}
-	return wire, msg
+	return wire_and_msg(m)
 }
 
 // How long `put` holds the entry, or false when it is not kept.

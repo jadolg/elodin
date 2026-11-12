@@ -214,26 +214,13 @@ ignored it.
 */
 @(test)
 test_retiring_a_tls_h2_conn_sends_close_notify :: proc(t: ^testing.T) {
-	sync.once_do(&dot_cert_once, generate_dot_certs)
-	if !testing.expect(t, dot_cert_ok, "no certificate available and openssl could not make one") {
+	// SIGPIPE left alone: the close under test must not raise it.
+	f, fixture_ok := dot_fixture(t, client = true, ignore_sigpipe = false)
+	if !fixture_ok {
 		return
 	}
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
-		return
-	}
-	defer net.close(listener)
-	bound, _ := net.bound_endpoint(listener)
-	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
-	if !testing.expectf(t, serr == .None, "server_context: %v", serr) {
-		return
-	}
-	defer tlsx.context_destroy(sctx)
-	cctx, cerr := tlsx.client_context(false)
-	if !testing.expectf(t, cerr == .None, "client_context: %v", cerr) {
-		return
-	}
-	defer tlsx.context_destroy(cctx)
+	defer dot_fixture_destroy(&f)
+	listener, bound, sctx, cctx := f.listener, f.bound, f.sctx, f.cctx
 
 	peer := Close_Notify_Peer {
 		listener = listener,

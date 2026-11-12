@@ -38,7 +38,7 @@ test_derive_udp_readers_does_not_guess :: proc(t: ^testing.T) {
 // as though the machine had chosen it.
 @(test)
 test_configured_udp_readers_are_not_derived :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp:\n    readers: 3\n"
+	src := MINIMAL + "listeners:\n  udp:\n    readers: 3\n"
 	cfg, err := load_string(src, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect_value(t, cfg.listeners.udp.readers, 3)
@@ -50,7 +50,7 @@ test_configured_udp_readers_are_not_derived :: proc(t: ^testing.T) {
 // almost every installation runs.
 @(test)
 test_unset_udp_readers_are_derived :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect(t, cfg.server.sizing.derived_udp_readers, "an unset reader count should be derived")
 	testing.expect(
@@ -62,7 +62,7 @@ test_unset_udp_readers_are_derived :: proc(t: ^testing.T) {
 	// With the UDP listener off the count is derived all the same: it is the
 	// number of event loops, and the stream listeners run on them (#547).
 	off, oerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp: { enabled: false }\n",
+		MINIMAL + "listeners:\n  udp: { enabled: false }\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, oerr == nil, "expected a clean load")
@@ -81,7 +81,7 @@ is a file whose author should be told.
 @(test)
 test_impossible_udp_reader_counts_are_refused :: proc(t: ^testing.T) {
 	_, negative := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp:\n    readers: -1\n",
+		MINIMAL + "listeners:\n  udp:\n    readers: -1\n",
 		context.temp_allocator,
 	)
 	e, has := negative.?
@@ -90,7 +90,7 @@ test_impossible_udp_reader_counts_are_refused :: proc(t: ^testing.T) {
 	}
 
 	_, huge := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp:\n    readers: 1000\n",
+		MINIMAL + "listeners:\n  udp:\n    readers: 1000\n",
 		context.temp_allocator,
 	)
 	he, has_huge := huge.?
@@ -100,7 +100,7 @@ test_impossible_udp_reader_counts_are_refused :: proc(t: ^testing.T) {
 
 	// The ceiling itself is allowed: it is the first figure that is not.
 	at, aerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp:\n    readers: 64\n",
+		MINIMAL + "listeners:\n  udp:\n    readers: 64\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, aerr == nil, "the ceiling itself should be accepted")
@@ -109,7 +109,7 @@ test_impossible_udp_reader_counts_are_refused :: proc(t: ^testing.T) {
 	// A reader count under a listener that is off is still a number somebody
 	// will turn on one day.
 	_, off := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp: { enabled: false, readers: -2 }\n",
+		MINIMAL + "listeners:\n  udp: { enabled: false, readers: -2 }\n",
 		context.temp_allocator,
 	)
 	_, has_off := off.?
@@ -123,18 +123,18 @@ test_impossible_udp_reader_counts_are_refused :: proc(t: ^testing.T) {
 @(test)
 test_udp_receive_buffer_is_a_size :: proc(t: ^testing.T) {
 	cfg, err := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp:\n    receive_buffer: 4MiB\n",
+		MINIMAL + "listeners:\n  udp:\n    receive_buffer: 4MiB\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect_value(t, cfg.listeners.udp.receive_buffer, 4 * 1024 * 1024)
 
-	base, berr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	base, berr := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, berr == nil, "expected a clean load")
 	testing.expect_value(t, base.listeners.udp.receive_buffer, DEFAULT_UDP_RECEIVE_BUFFER)
 
 	_, small := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp:\n    receive_buffer: 1KiB\n",
+		MINIMAL + "listeners:\n  udp:\n    receive_buffer: 1KiB\n",
 		context.temp_allocator,
 	)
 	e, has := small.?
@@ -143,7 +143,7 @@ test_udp_receive_buffer_is_a_size :: proc(t: ^testing.T) {
 	}
 
 	_, huge := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp:\n    receive_buffer: 4GiB\n",
+		MINIMAL + "listeners:\n  udp:\n    receive_buffer: 4GiB\n",
 		context.temp_allocator,
 	)
 	_, has_huge := huge.?
@@ -159,7 +159,7 @@ test_udp_receive_buffer_is_a_size :: proc(t: ^testing.T) {
 @(test)
 test_reader_settings_are_udp_only :: proc(t: ^testing.T) {
 	_, err := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  tcp:\n    readers: 4\n    receive_buffer: 4MiB\n",
+		MINIMAL + "listeners:\n  tcp:\n    readers: 4\n    receive_buffer: 4MiB\n",
 		context.temp_allocator,
 	)
 	e, has := err.?

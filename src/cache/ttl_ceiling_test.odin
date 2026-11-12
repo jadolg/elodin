@@ -1,9 +1,7 @@
 package cache
 
 import "core:testing"
-import "core:time"
 import "elodin:dns"
-import "elodin:loop"
 
 /*
 What the client is told a record is good for.
@@ -14,32 +12,10 @@ goes on holding the record long after this cache has dropped it.
 */
 
 @(private = "file")
-answer_with_ttl :: proc(name: string, ttl: u32, allocator := context.allocator) -> ([]u8, dns.Message) {
-	m := dns.Message {
-		id       = 0x1111,
-		question = []dns.Question{{name = name, type = .A, class = .IN}},
-		answer   = []dns.Record {
-			{name = name, type = .A, class = .IN, ttl = ttl, data = dns.Rdata_A{addr = {1, 2, 3, 4}}},
-		},
-	}
-	m.flags.qr = true
-	m.flags.ra = true
-	wire, _, err := dns.encode_message(m, allocator)
-	if err != .None {
-		panic("cannot encode the test answer")
-	}
-	decoded, derr := dns.decode_message(wire, allocator)
-	if derr != .None {
-		panic("cannot decode the test answer")
-	}
-	return wire, decoded
-}
-
-@(private = "file")
 served_ttl :: proc(t: ^testing.T, c: ^Cache, name: string, ttl: u32) -> (u32, bool) {
-	wire, msg := answer_with_ttl(name, ttl, context.temp_allocator)
+	wire, msg := build_answer(name, ttl, context.temp_allocator)
 	kb: [KEY_MAX]u8
-	key := make_key(kb[:], name, .A, .IN, false)
+	key := key_for(kb[:], name)
 	if !testing.expect(t, put(c, key, wire, msg), "the answer was not stored") {
 		return 0, false
 	}
@@ -97,9 +73,9 @@ test_a_ttl_with_the_high_bit_set_is_not_cached :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 8, max_ttl = 86400})
 	defer destroy(c)
 
-	wire, msg := answer_with_ttl("hostile.example.", 0x8000_0000, context.temp_allocator)
+	wire, msg := build_answer("hostile.example.", 0x8000_0000, context.temp_allocator)
 	kb: [KEY_MAX]u8
-	key := make_key(kb[:], "hostile.example.", .A, .IN, false)
+	key := key_for(kb[:], "hostile.example.")
 	testing.expect(t, !put(c, key, wire, msg), "an answer with the top TTL bit set was stored")
 	_, _, found := get(c, key, context.temp_allocator)
 	testing.expect(t, !found, "an answer with the top TTL bit set can be served")
@@ -129,16 +105,6 @@ test_a_zeroed_ttl_is_still_raised_by_min_ttl :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// Age an entry past its expiry without spending the time. The stale path is
-// what is under test, not the clock that gets there.
-@(private = "file")
-expire_entry :: proc(c: ^Cache, key: string) {
-	if e, found := c.shards[0].entries[key]; found {
-		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
-		e.inserted = loop.moment_add(loop.moment_now(), -3601 * time.Second)
-	}
-}
-
 /*
 The ceiling reaches the stale answer too.
 
@@ -153,13 +119,13 @@ test_a_stale_answer_is_bounded_by_max_ttl :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 8, max_ttl = 10, serve_stale = true})
 	defer destroy(c)
 
-	wire, msg := answer_with_ttl("stale.example.", 300, context.temp_allocator)
+	wire, msg := build_answer("stale.example.", 300, context.temp_allocator)
 	kb: [KEY_MAX]u8
-	key := make_key(kb[:], "stale.example.", .A, .IN, false)
+	key := key_for(kb[:], "stale.example.")
 	if !testing.expect(t, put(c, key, wire, msg), "the answer was not stored") {
 		return
 	}
-	expire_entry(c, key)
+	sync_expire(c, key)
 
 	got, hit, ok := get(c, key, context.temp_allocator)
 	if !testing.expect(t, ok && hit.stale, "the expired entry was not lent out") {

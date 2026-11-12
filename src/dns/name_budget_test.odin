@@ -5,7 +5,7 @@ import "core:testing"
 
 // A 255-octet wire name (four labels of low bytes) whose presentation form is
 // four characters per octet: the worst expansion a single name can buy.
-@(private = "file")
+@(private)
 long_wire_name :: proc() -> []u8 {
 	out := make([dynamic]u8, 0, 256)
 	for l in ([]int{63, 63, 63, 61}) {
@@ -18,9 +18,56 @@ long_wire_name :: proc() -> []u8 {
 	return out[:]
 }
 
+// A response header with one question and the given answer and additional
+// counts.
 @(private)
-put_header :: proc(buf: ^[dynamic]u8, ancount: u16) {
-	append(buf, 0x12, 0x34, 0x81, 0x80, 0, 1, u8(ancount >> 8), u8(ancount), 0, 0, 0, 0)
+put_header :: proc(buf: ^[dynamic]u8, ancount: u16, arcount: u16 = 0) {
+	append(buf, 0x12, 0x34, 0x81, 0x80, 0, 1, u8(ancount >> 8), u8(ancount), 0, 0, u8(arcount >> 8), u8(arcount))
+}
+
+// One PX record - a type this decoder does not model, with a layout of two
+// names - whose RDATA is two pointers at the question's `long_wire_name`.
+@(private)
+px_pointer_record :: proc() -> []u8 {
+	name := long_wire_name()
+	defer delete(name)
+	msg := make([dynamic]u8, 0, 512)
+	put_header(&msg, 1)
+	append(&msg, ..name)
+	put_u16(&msg, u16(Type.PX))
+	put_u16(&msg, u16(Class.IN))
+	append(&msg, 0xc0, 0x0c)
+	put_u16(&msg, u16(Type.PX))
+	put_u16(&msg, u16(Class.IN))
+	append(&msg, 0, 0, 0x0e, 0x10)
+	put_u16(&msg, 6) // rdlength
+	put_u16(&msg, 10) // preference
+	append(&msg, 0xc0, 0x0c)
+	append(&msg, 0xc0, 0x0c)
+	return msg[:]
+}
+
+// A full-length answer of A records, every owner a pointer at the question's
+// `name`: one name written out once and pointed at by a whole RRset.
+@(private)
+pointer_owned_rrset :: proc(name: []u8) -> []u8 {
+	msg := make([dynamic]u8, 0, 65535)
+	put_header(&msg, 0)
+	append(&msg, ..name)
+	put_u16(&msg, u16(Type.A))
+	put_u16(&msg, u16(Class.IN))
+	count := 0
+	for len(msg) + 16 <= 65535 {
+		append(&msg, 0xc0, 0x0c)
+		put_u16(&msg, u16(Type.A))
+		put_u16(&msg, u16(Class.IN))
+		append(&msg, 0, 0, 0x0e, 0x10)
+		put_u16(&msg, 4)
+		append(&msg, 93, 184, 216, 34)
+		count += 1
+	}
+	msg[6], msg[7] = u8(count >> 8), u8(count)
+	return msg[:]
 }
 
 @(private)
@@ -465,23 +512,8 @@ magnitude, and nothing else here would notice it.
 */
 @(test)
 test_a_two_name_layout_does_not_outgrow_its_buffer :: proc(t: ^testing.T) {
-	name := long_wire_name()
-	defer delete(name)
-
-	msg := make([dynamic]u8, 0, 512)
+	msg := px_pointer_record()
 	defer delete(msg)
-	put_header(&msg, 1)
-	append(&msg, ..name)
-	put_u16(&msg, u16(Type.PX))
-	put_u16(&msg, u16(Class.IN))
-	append(&msg, 0xc0, 0x0c)
-	put_u16(&msg, u16(Type.PX))
-	put_u16(&msg, u16(Class.IN))
-	append(&msg, 0, 0, 0x0e, 0x10)
-	put_u16(&msg, 6) // rdlength
-	put_u16(&msg, 10) // preference
-	append(&msg, 0xc0, 0x0c)
-	append(&msg, 0xc0, 0x0c)
 
 	used, err := decode_into_arena(msg[:])
 	testing.expect_value(t, err, Decode_Error.None)
@@ -516,25 +548,9 @@ test_long_name_pointed_at_by_a_whole_rrset_still_decodes :: proc(t: ^testing.T) 
 	}
 	append(&name, 0)
 
-	msg := make([dynamic]u8, 0, 65535)
+	msg := pointer_owned_rrset(name[:])
 	defer delete(msg)
-	put_header(&msg, 0)
-	append(&msg, ..name[:])
-	put_u16(&msg, u16(Type.A))
-	put_u16(&msg, u16(Class.IN))
-	count := 0
-	for len(msg) + 16 <= 65535 {
-		append(&msg, 0xc0, 0x0c)
-		put_u16(&msg, u16(Type.A))
-		put_u16(&msg, u16(Class.IN))
-		append(&msg, 0, 0, 0x0e, 0x10)
-		put_u16(&msg, 4)
-		append(&msg, 93, 184, 216, 34)
-		count += 1
-	}
-	msg[6] = u8(count >> 8)
-	msg[7] = u8(count)
 
-	_, err := decode_into_arena(msg[:])
+	_, err := decode_into_arena(msg)
 	testing.expect_value(t, err, Decode_Error.None)
 }

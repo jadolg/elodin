@@ -3,9 +3,6 @@ package config
 import "core:strings"
 import "core:testing"
 
-@(private = "file")
-UP :: "upstream:\n  servers: [1.1.1.1]\n"
-
 // Whether loading `doc` fails with `wanted` as one of its messages, word for word.
 @(private = "file")
 refused_with :: proc(t: ^testing.T, doc, wanted: string, loc := #caller_location) {
@@ -34,38 +31,38 @@ test_shared_loaders_name_their_callers_keys :: proc(t: ^testing.T) {
 	}
 	DOH :: "listeners:\n  doh: {enabled: true, cert_file: c, key_file: k, path: "
 	cases := [?]Case {
-		{UP + "blocking:\n  rules: {a: b}\n", "blocking.rules: expected a list of rules"},
-		{UP + "blocking:\n  allow: {a: b}\n", "blocking.allow: expected a list of rules"},
-		{UP + "dnssec:\n  trust_anchors: {a: b}\n", "dnssec.trust_anchors: expected a list of DS records"},
-		{UP + DOH + "dns-query}\n", "listeners.doh.path: must start with '/'"},
-		{UP + DOH + "\"/q?x\"}\n", "listeners.doh.path: must be visible ASCII with no '?' or '#'"},
-		{UP + DOH + "/dns-query, mobileconfig_path: p}\n", "listeners.doh.mobileconfig_path: must start with '/'"},
+		{MINIMAL + "blocking:\n  rules: {a: b}\n", "blocking.rules: expected a list of rules"},
+		{MINIMAL + "blocking:\n  allow: {a: b}\n", "blocking.allow: expected a list of rules"},
+		{MINIMAL + "dnssec:\n  trust_anchors: {a: b}\n", "dnssec.trust_anchors: expected a list of DS records"},
+		{MINIMAL + DOH + "dns-query}\n", "listeners.doh.path: must start with '/'"},
+		{MINIMAL + DOH + "\"/q?x\"}\n", "listeners.doh.path: must be visible ASCII with no '?' or '#'"},
+		{MINIMAL + DOH + "/dns-query, mobileconfig_path: p}\n", "listeners.doh.mobileconfig_path: must start with '/'"},
 		{
-			UP + DOH + "/dns-query, mobileconfig_path: \"/p#x\"}\n",
+			MINIMAL + DOH + "/dns-query, mobileconfig_path: \"/p#x\"}\n",
 			"listeners.doh.mobileconfig_path: must be visible ASCII with no '?' or '#'",
 		},
-		{UP + "metrics:\n  enabled: true\n  path: m\n", "metrics.path: must start with '/'"},
-		{UP + "metrics:\n  enabled: true\n  path: \"/m?x\"\n", "metrics.path: must be visible ASCII with no '?' or '#'"},
+		{MINIMAL + "metrics:\n  enabled: true\n  path: m\n", "metrics.path: must start with '/'"},
+		{MINIMAL + "metrics:\n  enabled: true\n  path: \"/m?x\"\n", "metrics.path: must be visible ASCII with no '?' or '#'"},
 		{
 			"upstream:\n  servers: 1.1.1.1\n",
 			"upstream.servers: expected a list of servers, with a \"-\" in front of each one",
 		},
 		{
-			UP + "  zones:\n    - domains: [corp.example]\n      servers: 10.0.0.1\n",
+			MINIMAL + "  zones:\n    - domains: [corp.example]\n      servers: 10.0.0.1\n",
 			"upstream.zones[0].servers: expected a list of servers, with a \"-\" in front of each one",
 		},
 		{"upstream:\n  bootstrap: [nope]\n  servers: [1.1.1.1]\n", "upstream.bootstrap: \"nope\" is not an IP address"},
 		{
-			UP + "  zones:\n    - domains: [corp.example]\n      bootstrap: [nope]\n      servers: [10.0.0.1]\n",
+			MINIMAL + "  zones:\n    - domains: [corp.example]\n      bootstrap: [nope]\n      servers: [10.0.0.1]\n",
 			"upstream.zones[0].bootstrap: \"nope\" is not an IP address",
 		},
-		{UP + "  zones:\n    - domains: [corp.example]\n      servers: [\"tls://\"]\n", "upstream.zones[0].servers[0]: cannot parse \"tls://\""},
+		{MINIMAL + "  zones:\n    - domains: [corp.example]\n      servers: [\"tls://\"]\n", "upstream.zones[0].servers[0]: cannot parse \"tls://\""},
 		{
-			UP + "server:\n  max_connections: 0\n",
+			MINIMAL + "server:\n  max_connections: 0\n",
 			"server.max_connections must be at least 1 (it is 0); 512 is the default",
 		},
 		{
-			UP + "listeners:\n  udp: {enabled: false}\n  tcp: {enabled: false}\n",
+			MINIMAL + "listeners:\n  udp: {enabled: false}\n  tcp: {enabled: false}\n",
 			"listeners: every listener is disabled, so nothing would be served",
 		},
 	}
@@ -75,7 +72,7 @@ test_shared_loaders_name_their_callers_keys :: proc(t: ^testing.T) {
 
 	// A route whose `servers` is not a list is dropped there, not reported a
 	// second time as a route with no servers.
-	_, err := load_string(UP + "  zones:\n    - domains: [corp.example]\n      servers: 10.0.0.1\n", context.temp_allocator)
+	_, err := load_string(MINIMAL + "  zones:\n    - domains: [corp.example]\n      servers: 10.0.0.1\n", context.temp_allocator)
 	if e, has := err.?; testing.expect(t, has, "a route with servers: 10.0.0.1 loaded") {
 		testing.expectf(t, len(e.messages) == 1, "wanted one refusal: %v", e.messages)
 	}
@@ -95,14 +92,14 @@ test_a_space_outside_ascii_at_a_names_end_is_refused :: proc(t: ^testing.T) {
 	}
 	REWRITE :: "rewrites:\n  - domain: "
 	cases := [?]Case {
-		{UP + REWRITE + "\"lan.example\\_\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"lan.example\\u00a0\""},
-		{UP + REWRITE + "\"*.lan.example\\_\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"*.lan.example\\u00a0\""},
-		{UP + REWRITE + "lan.example\n    answer: \"host.example\\_\"\n", "rewrites[0].answer: an answer host"},
-		{UP + REWRITE + "lan.example\n    answer: \"\\_host.example\"\n", "rewrites[0].answer: an answer host"},
-		{UP + REWRITE + "lan.example\n    answer: \"CNAME host.example\\_\"\n", "rewrites[0].answer: CNAME host"},
-		{UP + REWRITE + "lan.example\n    answer: \"MX 10 mail.example\\_\"\n", "rewrites[0].answer: MX host"},
-		{UP + "  zones:\n    - domains: [\"corp.example\\_\"]\n      servers: [10.0.0.1]\n", "upstream.zones[0].domains[0]"},
-		{UP + "rebind:\n  allow_domains: [\"\\_home.example\"]\n", "rebind.allow_domains[0]"},
+		{MINIMAL + REWRITE + "\"lan.example\\_\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"lan.example\\u00a0\""},
+		{MINIMAL + REWRITE + "\"*.lan.example\\_\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"*.lan.example\\u00a0\""},
+		{MINIMAL + REWRITE + "lan.example\n    answer: \"host.example\\_\"\n", "rewrites[0].answer: an answer host"},
+		{MINIMAL + REWRITE + "lan.example\n    answer: \"\\_host.example\"\n", "rewrites[0].answer: an answer host"},
+		{MINIMAL + REWRITE + "lan.example\n    answer: \"CNAME host.example\\_\"\n", "rewrites[0].answer: CNAME host"},
+		{MINIMAL + REWRITE + "lan.example\n    answer: \"MX 10 mail.example\\_\"\n", "rewrites[0].answer: MX host"},
+		{MINIMAL + "  zones:\n    - domains: [\"corp.example\\_\"]\n      servers: [10.0.0.1]\n", "upstream.zones[0].domains[0]"},
+		{MINIMAL + "rebind:\n  allow_domains: [\"\\_home.example\"]\n", "rebind.allow_domains[0]"},
 	}
 	for c in cases {
 		_, err := load_string(c.doc, context.temp_allocator)
@@ -118,19 +115,19 @@ test_a_space_outside_ascii_at_a_names_end_is_refused :: proc(t: ^testing.T) {
 	}
 
 	// The address is not one with the space on it.
-	_, err := load_string(UP + REWRITE + "lan.example\n    answer: \"A 192.0.2.1\\_\"\n", context.temp_allocator)
+	_, err := load_string(MINIMAL + REWRITE + "lan.example\n    answer: \"A 192.0.2.1\\_\"\n", context.temp_allocator)
 	testing.expect(t, err != nil, "an address with a no-break space after it was read as the address")
 
 	// Nor is a name with one inside it, which is two fields run together.
-	_, err = load_string(UP + REWRITE + "lan.example\n    answer: \"TXT\\_hello\"\n", context.temp_allocator)
+	_, err = load_string(MINIMAL + REWRITE + "lan.example\n    answer: \"TXT\\_hello\"\n", context.temp_allocator)
 	testing.expect(t, err != nil, "\"TXT\\u00a0hello\" was read as a name")
 
 	// A domain of ASCII space alone is no domain, not the root.
-	refused_with(t, UP + REWRITE + "\"   \"\n    answer: 10.0.0.1\n", "rewrites[0]: missing domain")
+	refused_with(t, MINIMAL + REWRITE + "\"   \"\n    answer: 10.0.0.1\n", "rewrites[0]: missing domain")
 
 	// ASCII space is trimmed, and before the `*.` is looked for.
 	cfg, aerr := load_string(
-		UP +
+		MINIMAL +
 		REWRITE +
 		"\" lan.example\\t\"\n    answer: \"CNAME host.example \"\n" +
 		"  - domain: \" *.wild.example\"\n    answer: 10.0.0.1\n" +
@@ -154,7 +151,7 @@ folding takes both for it.
 */
 @(test)
 test_rewrite_tokens_fold_ascii_only :: proc(t: ^testing.T) {
-	REWRITE :: UP + "rewrites:\n  - domain: lan.example\n    answer: "
+	REWRITE :: MINIMAL + "rewrites:\n  - domain: lan.example\n    answer: "
 	_, err := load_string(REWRITE + "\"\u017frv 0 5 5060 sip.example\"\n", context.temp_allocator)
 	testing.expect(t, err != nil, "a long s was read as SRV")
 
@@ -177,9 +174,9 @@ test_rewrite_tokens_fold_ascii_only :: proc(t: ^testing.T) {
 // name with one is: trimmed, it would admit a network the file does not spell.
 @(test)
 test_an_allow_from_entry_with_a_unicode_space_is_refused :: proc(t: ^testing.T) {
-	_, err := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: [\"10.0.0.0/8\\_\"]\n", context.temp_allocator)
+	_, err := load_string(MINIMAL + "server:\n  allow_from: [\"10.0.0.0/8\\_\"]\n", context.temp_allocator)
 	testing.expect(t, err != nil, "10.0.0.0/8 with a no-break space was accepted")
-	_, ok := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: [\" 10.0.0.0/8 \"]\n", context.temp_allocator)
+	_, ok := load_string(MINIMAL + "server:\n  allow_from: [\" 10.0.0.0/8 \"]\n", context.temp_allocator)
 	testing.expect(t, ok == nil, "ASCII space around an entry is trimmed")
 	free_all(context.temp_allocator)
 }

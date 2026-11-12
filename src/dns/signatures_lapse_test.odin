@@ -23,8 +23,7 @@ sl_wire :: proc(answer, additional: []Record) -> []u8 {
 		additional = additional,
 	}
 	m.flags.qr = true
-	wire, _, _ := encode_message(m, context.temp_allocator)
-	return wire
+	return test_wire(m)
 }
 
 @(test)

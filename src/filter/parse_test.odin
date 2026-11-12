@@ -22,18 +22,9 @@ and `localhost` is on the second list.
 */
 
 @(private = "file")
-parsed :: proc(text: string, format: Format) -> (^Set, ^Set) {
-	block, allow := set_make(), set_make()
-	parse_list(block, allow, text, format)
-	return block, allow
-}
-
-@(private = "file")
 matches :: proc(text: string, format: Format, name: string) -> Decision {
-	block, allow := parsed(text, format)
-	e := engine_make()
+	e := engine_of(text, format)
 	defer engine_destroy(e)
-	engine_swap(e, block, allow)
 	return engine_match(e, name, .A)
 }
 
@@ -61,7 +52,7 @@ ff02::3 ip6-allhosts
 0.0.0.0 0.0.0.0
 0.0.0.0 ads.example
 `
-	block, allow := parsed(src, .Hosts)
+	block, allow := build(src, .Hosts)
 	defer set_destroy(block)
 	defer set_destroy(allow)
 	testing.expectf(t, block.count == 1, "only the one real rule should be kept, got %d", block.count)
@@ -71,7 +62,7 @@ ff02::3 ip6-allhosts
 	}
 
 	// And the check does not care about case, because hosts files do not.
-	upper, upper_allow := parsed("0.0.0.0 LocalHost\n0.0.0.0 IP6-AllNodes\n", .Hosts)
+	upper, upper_allow := build("0.0.0.0 LocalHost\n0.0.0.0 IP6-AllNodes\n", .Hosts)
 	defer set_destroy(upper)
 	defer set_destroy(upper_allow)
 	testing.expect_value(t, upper.count, 0)
@@ -80,7 +71,7 @@ ff02::3 ip6-allhosts
 @(test)
 test_a_hosts_line_sinks_every_name_after_the_address :: proc(t: ^testing.T) {
 	// One address, several names, which is how hosts files pack aliases.
-	block, allow := parsed("0.0.0.0 a.example b.example\tc.example\n", .Hosts)
+	block, allow := build("0.0.0.0 a.example b.example\tc.example\n", .Hosts)
 	defer set_destroy(block)
 	defer set_destroy(allow)
 	testing.expect_value(t, block.count, 3)
@@ -97,7 +88,7 @@ test_a_hosts_line_with_no_address_adds_nothing :: proc(t: ^testing.T) {
 	names begin - and reading the whole line as a name would sink whatever the
 	author actually wrote there.
 	*/
-	block, allow := parsed("ads.example\n\n   \n", .Hosts)
+	block, allow := build("ads.example\n\n   \n", .Hosts)
 	defer set_destroy(block)
 	defer set_destroy(allow)
 	testing.expect_value(t, block.count, 0)
@@ -163,7 +154,7 @@ input: whatever a list host serves reaches the address parser.
 test_a_list_line_beginning_with_a_bracket_does_not_panic :: proc(t: ^testing.T) {
 	text := "\x00f\n]:\t\xeb@\xf1/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb{99\\[/\np\n1}/"
 	for format in Format {
-		block, allow := parsed(text, format)
+		block, allow := build(text, format)
 		set_destroy(block)
 		set_destroy(allow)
 	}
@@ -173,7 +164,7 @@ test_a_list_line_beginning_with_a_bracket_does_not_panic :: proc(t: ^testing.T) 
 test_a_hosts_line_needs_an_address_first :: proc(t: ^testing.T) {
 	// An error page served as a hosts list sank every word after the first
 	// (#317), and passed for a list that held rules.
-	block, allow := parsed("429 Too Many Requests\nError: service unavailable\n0.0.0.0 ads.example\n", .Hosts)
+	block, allow := build("429 Too Many Requests\nError: service unavailable\n0.0.0.0 ads.example\n", .Hosts)
 	defer set_destroy(block)
 	defer set_destroy(allow)
 	testing.expect_value(t, block.count, 1)
@@ -279,7 +270,7 @@ test_a_leading_dot_domain_line_covers_the_name_and_everything_under_it :: proc(t
 	testing.expect_value(t, matches(src, .Domains, "ads.example."), Decision.Blocked)
 	testing.expect_value(t, matches(src, .Domains, "x.ads.example."), Decision.Blocked)
 	testing.expect_value(t, matches(src, .Domains, "xads.example."), Decision.None)
-	block, allow := parsed(src, .Domains)
+	block, allow := build(src, .Domains)
 	testing.expect_value(t, block.count, 1)
 	set_destroy(block)
 	set_destroy(allow)
@@ -296,7 +287,7 @@ test_a_leading_dot_domain_line_covers_the_name_and_everything_under_it :: proc(t
 	testing.expect_value(t, matches(".ads.\n", .Domains, "x.ads."), Decision.None)
 	testing.expect_value(t, matches(".ads.example.\n", .Domains, "ads.example."), Decision.None)
 	// With the mark gone, a name outside ASCII is skipped and counted as one.
-	block, allow = parsed(".bücher.example\n", .Domains)
+	block, allow = build(".bücher.example\n", .Domains)
 	testing.expect_value(t, block.not_ascii, 1)
 	set_destroy(block)
 	set_destroy(allow)
@@ -361,7 +352,7 @@ test_domain_lines_dns_cannot_express_are_skipped :: proc(t: ^testing.T) {
 	would put a key in the map that no query can ever equal - harmless - but
 	counting it as a rule reports a list as loaded when part of it was not.
 	*/
-	block, allow := parsed("example.com/ads\nexa*ple.example\n*\n-\n\n", .Domains)
+	block, allow := build("example.com/ads\nexa*ple.example\n*\n-\n\n", .Domains)
 	defer set_destroy(block)
 	defer set_destroy(allow)
 	testing.expect_value(t, block.count, 0)
@@ -390,14 +381,14 @@ test_a_rule_with_an_empty_label_is_skipped :: proc(t: ^testing.T) {
 			{"*...com\n", .Domains},
 			{".\n", .Domains},
 		}) {
-		block, allow := parsed(c.src, c.format)
+		block, allow := build(c.src, c.format)
 		testing.expectf(t, block.count == 0 && allow.count == 0 && block.not_ascii == 0, "%q should store no rule", c.src)
 		set_destroy(block)
 		set_destroy(allow)
 	}
 	// A `$badfilter` naming such a key cancels nothing.
 	{
-		block, allow := parsed("||.com^$badfilter\n", .Adblock)
+		block, allow := build("||.com^$badfilter\n", .Adblock)
 		testing.expect_value(t, block.cancels, 0)
 		set_destroy(block)
 		set_destroy(allow)
@@ -407,13 +398,13 @@ test_a_rule_with_an_empty_label_is_skipped :: proc(t: ^testing.T) {
 	// The last dot is the root `normalise` strips, so a full stop before it
 	// ends an empty label, as `a..` does.
 	for src in ([]string{"a。。com\n", "。com\n", "a.。com\n", "a．．com\n", "é..\n", "é。.\n"}) {
-		block, allow := parsed(src, .Domains)
+		block, allow := build(src, .Domains)
 		testing.expectf(t, block.count == 0 && block.not_ascii == 0, "%q should be refused outright", src)
 		set_destroy(block)
 		set_destroy(allow)
 	}
 	{
-		block, allow := parsed("a。com\n", .Domains)
+		block, allow := build("a。com\n", .Domains)
 		testing.expect_value(t, block.not_ascii, 1)
 		set_destroy(block)
 		set_destroy(allow)
@@ -438,7 +429,7 @@ test_a_rule_the_wire_cannot_carry_is_skipped :: proc(t: ^testing.T) {
 			"a\\99.com\n",
 			"a\\999.com\n",
 		}) {
-		block, allow := parsed(src, .Domains)
+		block, allow := build(src, .Domains)
 		testing.expectf(t, block.count == 0, "%q should store no rule", src)
 		set_destroy(block)
 		set_destroy(allow)
@@ -451,7 +442,7 @@ test_a_rule_the_wire_cannot_carry_is_skipped :: proc(t: ^testing.T) {
 	// A query spells a byte one way: `\DDD` for a dot, a backslash, a control or
 	// a byte past ASCII, and itself otherwise. Any other spelling names nothing.
 	for src in ([]string{"a\\.b.com\n", "a\\\\b.com\n", "\\097ds.com\n", "\\065ds.com\n", "\\ads.com\n"}) {
-		block, allow := parsed(src, .Domains)
+		block, allow := build(src, .Domains)
 		testing.expectf(t, block.count == 0, "%q should store no rule", src)
 		set_destroy(block)
 		set_destroy(allow)
@@ -463,13 +454,13 @@ test_a_rule_the_wire_cannot_carry_is_skipped :: proc(t: ^testing.T) {
 			strings.concatenate({label64, ".é.com\n"}, context.temp_allocator),
 			strings.concatenate({too_long, ".é\n"}, context.temp_allocator),
 		}) {
-		block, allow := parsed(src, .Domains)
+		block, allow := build(src, .Domains)
 		testing.expectf(t, block.count == 0 && block.not_ascii == 0, "%q should be refused outright", src)
 		set_destroy(block)
 		set_destroy(allow)
 	}
 	{
-		block, allow := parsed(strings.concatenate({label63, ".é.com\n"}, context.temp_allocator), .Domains)
+		block, allow := build(strings.concatenate({label63, ".é.com\n"}, context.temp_allocator), .Domains)
 		testing.expect_value(t, block.not_ascii, 1)
 		set_destroy(block)
 		set_destroy(allow)
@@ -543,7 +534,7 @@ test_a_rule_that_cannot_be_a_domain_is_refused :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(s.cancelled), 0)
 
 	// A query spells these bytes as \DDD, so a rule holding one raw never matches.
-	block, allow := parsed("0.0.0.0 b\u00fccher.de a\x01b.example ok.example\n", .Hosts)
+	block, allow := build("0.0.0.0 b\u00fccher.de a\x01b.example ok.example\n", .Hosts)
 	defer set_destroy(block)
 	defer set_destroy(allow)
 	testing.expect_value(t, block.count, 1)
@@ -771,7 +762,7 @@ test_a_rule_whose_name_is_not_ascii_is_counted :: proc(t: ^testing.T) {
 		format: Format,
 	}{{"0.0.0.0 bücher.example ok.example\n", .Hosts}, {"bücher.example\nok.example\n", .Domains}, {"||bücher.example^\n||ok.example^\n", .Adblock}, {"||bücher.example^$badfilter\n||ok.example^\n", .Adblock}}
 	for c in cases {
-		block, allow := parsed(c.text, c.format)
+		block, allow := build(c.text, c.format)
 		testing.expectf(t, block.not_ascii == 1, "%v: not_ascii = %d", c.format, block.not_ascii)
 		testing.expect_value(t, block.count, 1)
 		set_destroy(block)
@@ -783,7 +774,7 @@ test_a_rule_whose_name_is_not_ascii_is_counted :: proc(t: ^testing.T) {
 		// a combining acute, a Devanagari vowel sign, Arabic-Indic digits, a
 		// Persian ZWNJ and a Catalan middle dot. An ideographic, fullwidth or
 		// halfwidth full stop is a dot (RFC 3490 section 3.1).
-		block, allow := parsed(
+		block, allow := build(
 			"0.0.0.0 éte.example किताब.example ١٢.example می‌خواهم.example col·legi.example 例え。テスト bücher．example bücher｡example\n",
 			.Hosts,
 		)
@@ -796,7 +787,7 @@ test_a_rule_whose_name_is_not_ascii_is_counted :: proc(t: ^testing.T) {
 	// whose bytes past ASCII are no letter: a no-break or zero-width space, a
 	// BOM, or a byte that is not UTF-8, as a Latin-1 file holds. Nor is one
 	// holding ASCII no label holds, such as a `*` or a `:`.
-	block, allow := parsed(
+	block, allow := build(
 		"0.0.0.0 a\x01b.example example.com/path example.de/über ads.example\u00a0x.example \u200bads.example \ufeffads.example b\xfccher.example bü\x01cher.example bü*cher.example bücher.example:8080\n",
 		.Hosts,
 	)
@@ -816,7 +807,7 @@ test_crlf_lines_are_rules_and_sniffed :: proc(t: ^testing.T) {
 		format: Format,
 	}{{hosts, .Auto}, {"ads.example\r\ntrack.example\r\n", .Domains}, {"||ads.example^\r\n||track.example^", .Adblock}}
 	for c in cases {
-		block, allow := parsed(c.text, c.format)
+		block, allow := build(c.text, c.format)
 		testing.expectf(t, block.count == 2, "%v: count = %d", c.format, block.count)
 		testing.expectf(t, block.not_ascii == 0, "%v: not_ascii = %d", c.format, block.not_ascii)
 		set_destroy(block)
@@ -835,7 +826,7 @@ test_a_byte_order_mark_is_not_part_of_the_first_rule :: proc(t: ^testing.T) {
 		format: Format,
 	}{{"\xef\xbb\xbf0.0.0.0 ads.example\n", .Hosts}, {"\xef\xbb\xbfads.example\n", .Domains}, {"\xef\xbb\xbf||ads.example^\n", .Adblock}, {"\xef\xbb\xbf||ads.example^\n", .Auto}, {"# a.txt\n\xef\xbb\xbfads.example\n", .Domains}, {"# a.txt\n\xef\xbb\xbf0.0.0.0 ads.example\n", .Auto}}
 	for c in cases {
-		block, allow := parsed(c.text, c.format)
+		block, allow := build(c.text, c.format)
 		testing.expectf(t, block.count == 1, "%v: count = %d", c.format, block.count)
 		testing.expectf(t, block.not_ascii == 0, "%v: not_ascii = %d", c.format, block.not_ascii)
 		set_destroy(block)

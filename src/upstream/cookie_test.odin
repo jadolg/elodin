@@ -111,48 +111,7 @@ cookie_mock_reply :: proc(m: ^Cookie_Mock, query: []u8, count: int) -> (reply: [
 
 @(private = "file")
 start_cookie_mock :: proc(t: ^testing.T, m: ^Cookie_Mock) -> (u: ^Upstream, worker: ^thread.Thread, ok: bool) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
-		return nil, nil, false
-	}
-	m.socket = socket
-	// Without this the responder would sit in recv_udp and never see `stop`.
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		net.close(socket)
-		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
-		return nil, nil, false
-	}
-
-	worker = thread.create_and_start_with_poly_data(m, cookie_mock_loop)
-	built, uerr := make_upstream(
-		config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port},
-		0,
-		time.Second,
-		context.allocator,
-		cookies = true,
-	)
-	if uerr != .None {
-		sync.atomic_store(&m.stop, true)
-		thread.join(worker)
-		thread.destroy(worker)
-		net.close(socket)
-		testing.expectf(t, false, "cannot build the upstream: %v", uerr)
-		return nil, nil, false
-	}
-	return built, worker, true
-}
-
-@(private = "file")
-stop_cookie_mock :: proc(m: ^Cookie_Mock, u: ^Upstream, worker: ^thread.Thread) {
-	sync.atomic_store(&m.stop, true)
-	thread.join(worker)
-	thread.destroy(worker)
-	net.close(m.socket)
-	destroy(u)
+	return start_udp_mock(t, m, cookie_mock_loop, cookies = true)
 }
 
 @(private = "file")
@@ -195,7 +154,7 @@ test_upstream_cookie_is_sent_and_learned :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	defer stop_cookie_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	first, err := exchange(u, edns_query("example.com."), time.Second, context.temp_allocator)
 	testing.expectf(t, err == .None, "first exchange failed: %v", err)
@@ -246,7 +205,7 @@ test_upstream_cookie_strip_leaves_no_orphan_on_heap :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	defer stop_cookie_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	// Stand in for the heap the race workers hand down, so a buffer left behind
 	// shows up as a live allocation rather than being swallowed by an arena.
@@ -284,7 +243,7 @@ test_upstream_cookie_forged_reply_is_ignored :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	defer stop_cookie_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	_, err := exchange(u, edns_query("example.com."), 300 * time.Millisecond, context.temp_allocator)
 	testing.expectf(t, err == .Bad_Response, "a forged reply was accepted (%v)", err)
@@ -316,7 +275,7 @@ test_upstream_cookie_missing_from_reply_is_ignored :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	defer stop_cookie_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	// The first reply carries one, so from here on this server is known to do
 	// cookies and a reply without one has to be turned away.
@@ -345,7 +304,7 @@ test_upstream_cookie_illegal_length_is_ignored :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	defer stop_cookie_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	_, err := exchange(u, edns_query("example.com."), 300 * time.Millisecond, context.temp_allocator)
 	testing.expectf(t, err == .Bad_Response, "a reply with an illegal cookie length was accepted (%v)", err)
@@ -364,7 +323,7 @@ test_upstream_cookie_absent_server_is_tolerated :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	defer stop_cookie_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	for name in ([]string{"example.com.", "example.org."}) {
 		_, err := exchange(u, edns_query(name), time.Second, context.temp_allocator)
@@ -384,7 +343,7 @@ test_upstream_cookie_badcookie_is_retried :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	defer stop_cookie_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	response, err := exchange(u, edns_query("example.com."), time.Second, context.temp_allocator)
 	testing.expectf(t, err == .None, "the retry did not produce an answer: %v", err)
@@ -417,7 +376,7 @@ test_upstream_cookie_retry_shares_the_exchange_timeout :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	defer stop_cookie_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	udp_waits_reset()
 	started := time.tick_now()
@@ -448,7 +407,7 @@ test_upstream_cookie_retry_left_unanswered_times_out :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	defer stop_cookie_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	udp_waits_reset()
 	started := time.tick_now()
@@ -473,7 +432,7 @@ test_upstream_cookie_needs_an_opt_record :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	defer stop_cookie_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	_, err := exchange(u, edns_query("example.com.", with_opt = false), time.Second, context.temp_allocator)
 	testing.expectf(t, err == .None, "the exchange failed: %v", err)

@@ -105,7 +105,7 @@ test_upstream_type_null_keeps_default :: proc(t: ^testing.T) {
 @(test)
 test_blocking_response_null_is_zero_ip :: proc(t: ^testing.T) {
 	for v in ([]string{"null", "Null", "NULL", "\"null\""}) {
-		src := strings.concatenate({"upstream:\n  servers: [1.1.1.1]\nblocking:\n  response: ", v, "\n"}, context.temp_allocator)
+		src := strings.concatenate({MINIMAL + "blocking:\n  response: ", v, "\n"}, context.temp_allocator)
 		cfg, err := load_string(src, context.temp_allocator)
 		if !testing.expectf(t, err == nil, "%s: %v", v, err) {
 			continue
@@ -113,7 +113,7 @@ test_blocking_response_null_is_zero_ip :: proc(t: ^testing.T) {
 		testing.expectf(t, cfg.blocking.response == .Zero_IP, "%s: %v", v, cfg.blocking.response)
 	}
 	for v in ([]string{"~", ""}) {
-		src := strings.concatenate({"upstream:\n  servers: [1.1.1.1]\nblocking:\n  response: ", v, "\n"}, context.temp_allocator)
+		src := strings.concatenate({MINIMAL + "blocking:\n  response: ", v, "\n"}, context.temp_allocator)
 		cfg, err := load_string(src, context.temp_allocator)
 		if !testing.expectf(t, err == nil, "%q: %v", v, err) {
 			continue

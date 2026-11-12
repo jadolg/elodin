@@ -73,7 +73,7 @@ test_derive_chain_walks_reserves_a_quarter :: proc(t: ^testing.T) {
 
 @(test)
 test_chain_walks_are_derived_at_load :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  max_pending: 16\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL + "server:\n  max_pending: 16\n", context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	// From the bound on queries in flight, derived at load rather than at
 	// start-up, so `--check` and the run that follows it name the same number.
@@ -85,7 +85,7 @@ test_chain_walks_are_derived_at_load :: proc(t: ^testing.T) {
 
 	// A number in the file wins, as everywhere else in this file.
 	set, serr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_pending: 16\ndnssec:\n  max_chain_walks: 3\n",
+		MINIMAL + "server:\n  max_pending: 16\ndnssec:\n  max_chain_walks: 3\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, serr == nil, "expected a clean load")
@@ -99,7 +99,7 @@ test_a_negative_chain_walk_bound_is_refused :: proc(t: ^testing.T) {
 	// denial-of-service guard, so a number that cannot be one is a mistake to
 	// report rather than to paper over.
 	_, err := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_chain_walks: -1\n",
+		MINIMAL + "dnssec:\n  max_chain_walks: -1\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, err != nil, "a negative chain-walk bound should be refused")
@@ -113,13 +113,13 @@ connection walk bound is not one of them.
 @(test)
 test_the_removed_worker_keys_are_refused :: proc(t: ^testing.T) {
 	for key in ([]string{"workers", "upstream_workers", "running_workers"}) {
-		_, err := load_string(fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nserver:\n  %s: 8\n", key), context.temp_allocator)
+		_, err := load_string(fmt.tprintf(MINIMAL + "server:\n  %s: 8\n", key), context.temp_allocator)
 		e, refused := err.?
 		want := fmt.tprintf("server.%s: unknown key", key)
 		testing.expectf(t, refused && len(e.messages) == 1 && strings.has_prefix(e.messages[0], want), "server.%s: want only %q, got %v", key, want, e.messages)
 	}
 	cfg, err := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: 24\n",
+		MINIMAL + "dnssec:\n  max_connection_walks: 24\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, err == nil, "dnssec.max_connection_walks was refused")
@@ -274,7 +274,7 @@ listener runs on the loops.
 @(test)
 test_unset_sizes_are_derived_at_load :: proc(t: ^testing.T) {
 	cfg, err := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp: { enabled: false }\n",
+		MINIMAL + "listeners:\n  udp: { enabled: false }\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, err == nil, "expected a clean load")
@@ -289,13 +289,13 @@ test_unset_sizes_are_derived_at_load :: proc(t: ^testing.T) {
 // A number in the file wins, and what is derived from it follows it.
 @(test)
 test_configured_max_pending_wins :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  max_pending: 40\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL + "server:\n  max_pending: 40\n", context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect_value(t, cfg.server.max_pending, 40)
 	testing.expect(t, !cfg.server.sizing.derived_max_pending, "a configured bound is not a derived one")
 	testing.expect_value(t, cfg.dnssec.max_chain_walks, derive_chain_walks(40))
 
-	_, nerr := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  max_pending: -1\n", context.temp_allocator)
+	_, nerr := load_string(MINIMAL + "server:\n  max_pending: -1\n", context.temp_allocator)
 	testing.expect(t, nerr != nil, "a negative max_pending should be refused")
 	free_all(context.temp_allocator)
 }
@@ -339,14 +339,14 @@ and this server does not.
 */
 @(test)
 test_the_zone_cache_bound_is_configurable :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	// Zero here rather than a number of its own: the validator holds the
 	// default, so the two cannot drift apart.
 	testing.expect_value(t, cfg.dnssec.max_cached_zones, 0)
 
 	set, serr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_cached_zones: 512\n",
+		MINIMAL + "dnssec:\n  max_cached_zones: 512\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, serr == nil, "expected a clean load")
@@ -354,7 +354,7 @@ test_the_zone_cache_bound_is_configurable :: proc(t: ^testing.T) {
 
 	// Negative is not a cache without a bound, it is a number nobody meant.
 	_, nerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_cached_zones: -1\n",
+		MINIMAL + "dnssec:\n  max_cached_zones: -1\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, nerr != nil, "a negative zone-cache bound should be refused")

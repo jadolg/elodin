@@ -26,18 +26,14 @@ once, at its exact size. That is the whole of what these measure: the doubling i
 gone, and what is left is the element itself, which is inherent to keeping it.
 */
 
-@(private = "file")
-put_ar_header :: proc(buf: ^[dynamic]u8, arcount: u16) {
-	append(buf, 0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, u8(arcount >> 8), u8(arcount))
-}
-
 /*
 One TXT record whose RDATA is nothing but length bytes of zero.
 
 65,504 well-formed empty character-strings in 65,535 bytes of wire, which is the
-shape reported in #351 and the most `[]string` headers a message can ask for.
+shape reported in #351 and the most `[]string` headers a message can ask for:
+one wire byte is one 16-byte `string` header.
 */
-@(private = "file")
+@(private)
 txt_of_empty_character_strings :: proc() -> []u8 {
 	msg := make([dynamic]u8, 0, 65535)
 	put_header(&msg, 1)
@@ -77,7 +73,7 @@ test_txt_of_empty_character_strings_stays_within_the_decode_ceiling :: proc(t: ^
 @(private = "file")
 opt_of_empty_options :: proc() -> []u8 {
 	msg := make([dynamic]u8, 0, 65535)
-	put_ar_header(&msg, 1)
+	put_header(&msg, 0, arcount = 1)
 	append(&msg, 1, 'x', 0)
 	put_u16(&msg, u16(Type.A))
 	put_u16(&msg, u16(Class.IN))
@@ -220,7 +216,7 @@ one_record_message :: proc(type: Type, rdata: []u8) -> []u8 {
 @(private = "file")
 one_opt_message :: proc(rdata: []u8) -> []u8 {
 	msg := make([dynamic]u8, 0, 512)
-	put_ar_header(&msg, 1)
+	put_header(&msg, 0, arcount = 1)
 	append(&msg, 1, 'x', 0)
 	put_u16(&msg, u16(Type.A))
 	put_u16(&msg, u16(Class.IN))
