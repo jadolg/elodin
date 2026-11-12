@@ -374,7 +374,9 @@ test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
 	l: Listeners
 	if !start_listeners(&s, &l) {
 		// The port was taken between the probe and here, which is nobody's bug.
-		stop_test_loop(&tl)
+		// The connection manager was built before the bind failed, and is given
+		// back with the rest.
+		stop_test_listeners(&l, &tl)
 		logx.infof("the free port %d was taken before the listener could bind it", bound.port)
 		return
 	}
@@ -449,7 +451,7 @@ test_a_reader_lets_its_queries_run_between_batches :: proc(t: ^testing.T) {
 	l: Listeners
 	if !start_listeners(&s, &l) {
 		sync.sema_post(&gate.go)
-		stop_test_loop(&tl)
+		stop_test_listeners(&l, &tl)
 		testing.expect(t, false, "could not start the UDP listener")
 		return
 	}

@@ -84,12 +84,13 @@ test_a_miss_past_the_upstream_waits_fails_and_a_hit_is_served :: proc(t: ^testin
 	testing.expect_value(t, s.stats.failed, 1)
 	testing.expect_value(t, s.upstream_waits, upstream_wait_ceiling(&s))
 
-	msg, derr := dns.decode_message(test_query("refresh.example.", id = 0x2345), context.temp_allocator)
+	refresh := test_query("refresh.example.", id = 0x2345)
+	msg, derr := dns.decode_message(refresh, context.temp_allocator)
 	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
 		return
 	}
 	spent := 0
-	r := resolve_query(&s, test_query("refresh.example.", id = 0x2345), msg, .UDP, "", 512, {}, {}, &spent, context.temp_allocator, refresh = true)
+	r := resolve_query(&s, refresh, msg, .UDP, "", 512, {}, {}, &spent, context.temp_allocator, refresh = true)
 	testing.expect(t, r.unanswered, "a refresh with no place counted as a client's failure")
 	testing.expect_value(t, s.stats.failed, 1)
 	testing.expect_value(t, s.stats.upstream_shed, 2)

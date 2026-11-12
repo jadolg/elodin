@@ -117,20 +117,27 @@ mock is kept only where an answer has to come back.
 Not zero milliseconds: `SO_RCVTIMEO` reads zero as "no timeout", which on a
 socket nothing is going to send to is the one value that hangs.
 
-Only `query`'s question counts, as `Canned_Mock` counts it: a straggler from
-another case on a reused port is not this case's leak. `asked` is the name that
-did arrive, read into the test's own temporary memory.
+Any datagram naming `query`'s name counts, whatever type it asks: the name is
+what must not leave, and a fix that sent it out under another type leaks it as
+surely. A datagram about another name is a straggler from another case on a
+reused port, and is skipped. `asked` is the question that did arrive, read into
+the test's own temporary memory.
 */
 @(private = "file")
-nothing_reached :: proc(x: ^Canned_Mock, query: []u8) -> (clean: bool, asked: string) {
+nothing_reached :: proc(x: ^Canned_Mock, query: []u8) -> (clean: bool, asked: dns.Question) {
 	_ = net.set_option(x.socket, .Receive_Timeout, 20 * time.Millisecond)
+	want, _ := dns.peek_question(query, context.temp_allocator)
 	buf: [4096]u8
-	n, _, leaked := recv_question(x.socket, query, buf[:])
-	if !leaked {
-		return true, ""
+	for {
+		n, _, err := net.recv_udp(x.socket, buf[:])
+		if err != nil {
+			return true, {}
+		}
+		q, ok := dns.peek_question(buf[:n], context.temp_allocator)
+		if ok && dns.name_equal_fold(q.name, want.name) {
+			return false, q
+		}
 	}
-	q, _ := dns.peek_question(buf[:n], context.temp_allocator)
-	return false, q.name
 }
 
 @(private = "file")
@@ -281,7 +288,7 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		out, outcome, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
 
 		clean, asked := nothing_reached(x, query)
-		testing.expectf(t, clean, "%s was sent to the public upstream, which asked for %q", c.name, asked)
+		testing.expectf(t, clean, "%s was sent to the public upstream, which was asked %s %v", c.name, asked.name, asked.type)
 		if !testing.expectf(t, ok, "%s went unanswered", c.name) {
 			continue
 		}
@@ -398,7 +405,7 @@ test_a_default_configuration_still_forwards_local_test_and_example :: proc(t: ^t
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		_, outcome, _ := exchange_with(&s, x, serve_canned,test_query(name))
+		_, outcome, _ := exchange_with(&s, x, serve_canned, test_query(name))
 
 		testing.expectf(t, x.got, "%s was answered locally by a default configuration", name)
 		testing.expectf(t, outcome == .Forwarded, "%s came back as %v rather than forwarded", name, outcome)
@@ -444,7 +451,7 @@ test_the_home_arpa_apex_ds_is_still_forwarded :: proc(t: ^testing.T) {
 		if do_bit {
 			opt = dns.make_opt(1232, true)
 		}
-		_, outcome, _ := exchange_with(&s, x, serve_canned,test_query("home.arpa.", .DS, opt = opt))
+		_, outcome, _ := exchange_with(&s, x, serve_canned, test_query("home.arpa.", .DS, opt = opt))
 
 		testing.expectf(
 			t,
@@ -560,7 +567,7 @@ test_private_reverse_stands_down_where_it_must :: proc(t: ^testing.T) {
 			}
 
 			if pass == 0 {
-				_, outcome, _ := exchange_with(&s, x, serve_canned,test_query(name, type))
+				_, outcome, _ := exchange_with(&s, x, serve_canned, test_query(name, type))
 				testing.expectf(t, x.got, "%s: %s %v was answered from the table", c.what, name, type)
 				testing.expectf(t, outcome == .Forwarded, "%s: %s came back as %v", c.what, name, outcome)
 			} else {
@@ -732,7 +739,7 @@ test_a_tor_aware_upstream_can_be_given_onion_back :: proc(t: ^testing.T) {
 	defer net.close(x_socket)
 	defer upstream.destroy_group(s.group)
 
-	_, outcome, _ := exchange_with(&s, x, serve_canned,test_query("duskgytldkxiuqc6otgh4.onion."))
+	_, outcome, _ := exchange_with(&s, x, serve_canned, test_query("duskgytldkxiuqc6otgh4.onion."))
 
 	testing.expect(t, x.got, "special_use.onion: false did not hand the query to the upstream")
 	testing.expectf(t, outcome == .Forwarded, "the .onion query came back as %v rather than forwarded", outcome)
@@ -814,7 +821,7 @@ check_onion_is_not_validated :: proc(t: ^testing.T, label: string, apply: proc(c
 	s.validator = dnssec.make_validator(no_chain, nil, dnssec.Options{})
 	defer dnssec.destroy_validator(s.validator)
 
-	out, _, ok := exchange_with(&s, x, serve_canned,test_query(name))
+	out, _, ok := exchange_with(&s, x, serve_canned, test_query(name))
 
 	testing.expectf(t, x.got, "%s: the .onion query never reached the Tor-aware upstream", label)
 	if !testing.expectf(t, ok, "%s: the .onion query went unanswered", label) {
@@ -991,7 +998,7 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		_, outcome, _ := exchange_with(&s, x, serve_canned,test_query(name))
+		_, outcome, _ := exchange_with(&s, x, serve_canned, test_query(name))
 
 		testing.expectf(t, outcome == .Forwarded, "%s came back as %v rather than forwarded", name, outcome)
 		testing.expectf(
@@ -1107,7 +1114,7 @@ test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) 
 	anchors[0] = "onion."
 	s.anchor_zones = anchors
 
-	out, _, ok := exchange_with(&s, x, serve_canned,test_query(name))
+	out, _, ok := exchange_with(&s, x, serve_canned, test_query(name))
 
 	if !testing.expect(t, ok, "the anchored .onion query went unanswered") {
 		return
