@@ -202,8 +202,8 @@ test_close_idle_keeps_only_fresh_pooled_conns :: proc(t: ^testing.T) {
 	if !testing.expect(t, ferr == .None && serr == .None, "cannot dial the listener") {
 		return
 	}
-	put_idle(f.u, Idle_Conn{socket = stale})
-	put_idle(f.u, Idle_Conn{socket = fresh})
+	put_idle(f.u, Stream{socket = stale})
+	put_idle(f.u, Stream{socket = fresh})
 	sync.mutex_lock(&f.u.mu)
 	f.u.idle[0].since = loop.moment_add(f.u.idle[0].since, -2 * f.u.idle_timeout)
 	sync.mutex_unlock(&f.u.mu)
@@ -212,6 +212,6 @@ test_close_idle_keeps_only_fresh_pooled_conns :: proc(t: ^testing.T) {
 	sync.mutex_lock(&f.u.mu)
 	defer sync.mutex_unlock(&f.u.mu)
 	if testing.expect_value(t, len(f.u.idle), 1) {
-		testing.expect(t, f.u.idle[0].socket == fresh, "the fresh pooled connection was not the one kept")
+		testing.expect(t, f.u.idle[0].stream.socket == fresh, "the fresh pooled connection was not the one kept")
 	}
 }

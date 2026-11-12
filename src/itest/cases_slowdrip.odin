@@ -158,7 +158,7 @@ run_slow_drip_cases :: proc(r: ^Runner) {
 	HTTP/2 connection preface: 24 bytes before a stream exists, before a request
 	has been made, and before anything this server counts per query has seen the
 	client at all. It is the same reader for every frame header behind it - see
-	`h2.read_exact`.
+	`h2.io_read_exact`.
 	*/
 	start_case(r, "drip: a trickled HTTP/2 preface is given up on at client_timeout")
 	{

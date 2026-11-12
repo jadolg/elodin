@@ -239,7 +239,7 @@ run :: proc(l: ^Loop) {
 			// zero-length waits until it is due.
 			// Held to what `epoll_wait` takes: a deadline weeks away would
 			// otherwise wrap to a negative figure, which is no timeout at all.
-			timeout = i32(clamp((left + time.Millisecond - 1) / time.Millisecond, 0, time.Duration(max(i32))))
+			timeout = ms_ceil(left, max(i32))
 		}
 		// Wake to trim, if there is anything to trim; see `trim_window`. The lock
 		// `trim_pending` takes is asked for only when the answer could matter: a
@@ -248,7 +248,7 @@ run :: proc(l: ^Loop) {
 		// last woken late in a window would otherwise stretch it to nearly two.
 		if timeout != 0 {
 			left := time.tick_diff(l.clock(), time.tick_add(l.trim_from, TRIM_AFTER))
-			window := i32(clamp((left + time.Millisecond - 1) / time.Millisecond, 0, TRIM_AFTER / time.Millisecond))
+			window := ms_ceil(left, i32(TRIM_AFTER / time.Millisecond))
 			if (timeout < 0 || timeout > window) && trim_pending(l) {
 				timeout = window
 			}
@@ -299,10 +299,8 @@ epoll_wait :: proc(epfd: linux.Fd, events: []linux.EPoll_Event, timeout_ms: i32)
 		0,
 		0,
 	)
-	if int(ret) < 0 && int(ret) > -4096 {
-		return 0, linux.Errno(-int(ret))
-	}
-	return i32(ret), .NONE
+	n, err := syscall_result(ret)
+	return i32(n), err
 }
 
 @(private)
@@ -395,8 +393,7 @@ spawn :: proc(l: ^Loop, fn: proc(data: rawptr), data: rawptr) -> (h: Handle, ok:
 		stack, mapped := stack_map()
 		if !mapped {
 			sync.mutex_lock(&l.mu)
-			f.next = l.free_cold
-			l.free_cold = f
+			push_cold_locked(l, f)
 			l.alive -= 1
 			// The count this took kept a stopping loop from returning; as in
 			// `fiber_recycle`, the one that takes it to zero says so.
@@ -592,9 +589,15 @@ fiber_recycle :: proc(l: ^Loop, f: ^Fiber) {
 	}
 	fiber_release(l, f)
 	sync.mutex_lock(&l.mu)
+	push_cold_locked(l, f)
+	sync.mutex_unlock(&l.mu)
+}
+
+// Put a fiber whose stack is gone on the cold list. Caller holds `l.mu`.
+@(private)
+push_cold_locked :: proc(l: ^Loop, f: ^Fiber) {
 	f.next = l.free_cold
 	l.free_cold = f
-	sync.mutex_unlock(&l.mu)
 }
 
 /*
@@ -663,8 +666,7 @@ trim_some :: proc(l: ^Loop) {
 		sync.mutex_unlock(&l.mu)
 		fiber_release(l, f)
 		sync.mutex_lock(&l.mu)
-		f.next = l.free_cold
-		l.free_cold = f
+		push_cold_locked(l, f)
 		sync.mutex_unlock(&l.mu)
 		l.trim_owed -= 1
 	}

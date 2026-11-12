@@ -124,29 +124,13 @@ h2_literal :: proc(out: ^[dynamic]u8, name, value: string, huffman: bool) {
 @(private)
 h2_write_string :: proc(out: ^[dynamic]u8, s: string, huffman: bool) {
 	if !huffman {
-		h2_write_integer(out, 7, len(s), 0x00)
+		h2.write_integer(out, 7, len(s), 0x00)
 		append(out, ..transmute([]u8)s)
 		return
 	}
 	encoded := h2_huffman_encode(s, context.temp_allocator)
-	h2_write_integer(out, 7, len(encoded), 0x80)
+	h2.write_integer(out, 7, len(encoded), 0x80)
 	append(out, ..encoded)
-}
-
-@(private)
-h2_write_integer :: proc(out: ^[dynamic]u8, prefix_bits: uint, value: int, flags: u8) {
-	mask := int(1 << prefix_bits) - 1
-	if value < mask {
-		append(out, flags | u8(value))
-		return
-	}
-	append(out, flags | u8(mask))
-	v := value - mask
-	for v >= 0x80 {
-		append(out, u8(v & 0x7f) | 0x80)
-		v >>= 7
-	}
-	append(out, u8(v))
 }
 
 // Huffman encoder, used only to drive the server's decoder.
@@ -201,7 +185,7 @@ h2_send_request :: proc(
 ) -> bool {
 	block := make([dynamic]u8, 0, 128, context.temp_allocator)
 	if table_update >= 0 {
-		h2_write_integer(&block, 5, table_update, 0x20)
+		h2.write_integer(&block, 5, table_update, 0x20)
 	}
 	h2_literal(&block, ":method", method, huffman)
 	h2_literal(&block, ":scheme", "https", huffman)

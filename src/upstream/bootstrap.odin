@@ -19,6 +19,7 @@ instead, and results are cached for BOOTSTRAP_TTL, at most
 BOOTSTRAP_MAX_ENTRIES names at once.
 */
 
+@(private)
 BOOTSTRAP_TTL :: 1 * time.Hour
 
 @(private)
@@ -52,6 +53,7 @@ Resolve `hostname` using `servers` (plain "IP" or "IP:port" strings).
 
 A and AAAA are tried in that order; the first usable address wins.
 */
+@(private)
 bootstrap_resolve :: proc(
 	servers: []string,
 	hostname: string,
@@ -203,10 +205,9 @@ bootstrap_prune :: proc() {
 }
 
 // Resolve a host that may already be an IP literal, for the HTTP fetcher.
+@(private)
 resolve_address :: proc(host: string, bootstrap: []string) -> (addr: net.Address, ok: bool) {
-	if literal := netx.parse_address(host); literal != nil {
-		return literal, true
-	}
+	// An IP literal is returned as it stands, by `bootstrap_resolve` first.
 	if resolved, found := bootstrap_resolve(bootstrap, host); found {
 		return resolved, true
 	}
@@ -307,7 +308,7 @@ bootstrap_query :: proc(
 		if n < dns.HEADER_SIZE {
 			continue
 		}
-		if remote.port != endpoint.port || !netx.addresses_equal(remote.address, endpoint.address) {
+		if !came_from(remote, endpoint) {
 			continue
 		}
 		if !response_matches(wire, buf[:n]) {
@@ -323,11 +324,7 @@ bootstrap_query :: proc(
 			case dns.Rdata_A:
 				return net.IP4_Address(d.addr), true
 			case dns.Rdata_AAAA:
-				v6: net.IP6_Address
-				for i in 0 ..< 8 {
-					v6[i] = u16be(u16(d.addr[i * 2]) << 8 | u16(d.addr[i * 2 + 1]))
-				}
-				return v6, true
+				return netx.ip6_from_bytes(d.addr), true
 			}
 		}
 		return nil, false

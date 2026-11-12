@@ -80,11 +80,19 @@ dynamic_table_init :: proc(t: ^Dynamic_Table, max_size: int, allocator := contex
 }
 
 dynamic_table_destroy :: proc(t: ^Dynamic_Table) {
+	table_clear(t)
+	delete(t.entries)
+}
+
+// Empty the table, releasing every entry.
+@(private)
+table_clear :: proc(t: ^Dynamic_Table) {
 	for e in t.entries {
 		delete(e.name, t.allocator)
 		delete(e.value, t.allocator)
 	}
-	delete(t.entries)
+	clear(&t.entries)
+	t.size = 0
 }
 
 dynamic_table_set_max :: proc(t: ^Dynamic_Table, max_size: int) {
@@ -112,12 +120,7 @@ dynamic_table_add :: proc(t: ^Dynamic_Table, name, value: string) {
 	size := entry_size(f)
 	// An entry larger than the whole table empties it and is not stored.
 	if size > t.max_size {
-		for e in t.entries {
-			delete(e.name, t.allocator)
-			delete(e.value, t.allocator)
-		}
-		clear(&t.entries)
-		t.size = 0
+		table_clear(t)
 		delete(f.name, t.allocator)
 		delete(f.value, t.allocator)
 		return
@@ -289,9 +292,9 @@ decode :: proc(
 			append(&out, f)
 		}
 
+		// Guarded, since an append that could not allocate leaves `out` as it was.
 		if len(out) > 0 {
-			last := out[len(out) - 1]
-			total += len(last.name) + len(last.value) + 32
+			total += entry_size(out[len(out) - 1])
 			if total > MAX_HEADER_LIST {
 				return nil, .Too_Large
 			}
@@ -363,7 +366,7 @@ encode_header :: proc(out: ^[dynamic]u8, name, value: string) {
 	write_string(out, value)
 }
 
-@(private)
+// RFC 7541 5.1. Public for the integration tests' encoder.
 write_integer :: proc(out: ^[dynamic]u8, prefix_bits: uint, value: int, flags: u8) {
 	mask := int(1 << prefix_bits) - 1
 	if value < mask {

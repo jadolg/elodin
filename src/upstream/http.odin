@@ -25,14 +25,15 @@ Stream :: struct {
 	tls:    ^tlsx.Conn,
 }
 
+@(private)
 stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 	if s.tls != nil {
 		got, terr := tlsx.read(s.tls, buf)
 		if terr == .Closed {
 			return 0, .None
 		}
-		// A read that ran out of time is a timeout on either half, as in
-		// `pipe_read_full`: `IO_Error` says the peer broke, not that it was slow.
+		// A read that ran out of time is a timeout on either half: `IO_Error`
+		// says the peer broke, not that it was slow.
 		if terr != .None {
 			return 0, roundtrip_failure(terr)
 		}
@@ -40,13 +41,16 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 	}
 	got, nerr := loop.recv_tcp(s.socket, buf)
 	if nerr != nil {
-		// SO_RCVTIMEO expiring is EAGAIN, which core:net calls .Would_Block.
-		if nerr == .Timeout || nerr == .Would_Block {
-			return 0, .Timeout
-		}
-		return 0, .IO_Error
+		return 0, .Timeout if timed_out(nerr) else .IO_Error
 	}
 	return got, .None
+}
+
+// Whether a `loop` socket call ran out of time: its socket timeout expiring is
+// EAGAIN, which core:net reports as `.Would_Block` rather than `.Timeout`.
+@(private)
+timed_out :: proc(err: $E) -> bool {
+	return err == .Timeout || err == .Would_Block
 }
 
 /*
@@ -56,6 +60,7 @@ each send: `tlsx.write` holds a call to one timeout, and so does
 `loop.send_tcp`, whose clock runs from the call and does not restart when a
 short send makes progress.
 */
+@(private)
 stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}, idle := time.Duration(0)) -> Error {
 	if wait, bounded := next_wait(deadline, idle); bounded {
 		if wait <= 0 {
@@ -71,11 +76,8 @@ stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}, idle := tim
 	}
 	// One call: `loop.send_tcp` writes the whole buffer or says why not.
 	_, err := loop.send_tcp(s.socket, buf)
-	if err == .Timeout || err == .Would_Block {
-		return .Timeout
-	}
 	if err != nil {
-		return .IO_Error
+		return .Timeout if timed_out(err) else .IO_Error
 	}
 	return .None
 }
@@ -90,6 +92,7 @@ read that was meant to be the shortest of all would be the one that never
 returned. A caller reaching here with a sliver of its deadline left is
 ordinary: a waiter that woke a hair before its own expiry.
 */
+@(private)
 stream_set_read_timeout :: proc(s: ^Stream, timeout: time.Duration) {
 	bounded := max(timeout, time.Millisecond)
 	if s.tls != nil {
@@ -101,6 +104,7 @@ stream_set_read_timeout :: proc(s: ^Stream, timeout: time.Duration) {
 
 // The same for the next write, with the same floor for the same reason:
 // `SO_SNDTIMEO` is a `timeval` too.
+@(private)
 stream_set_write_timeout :: proc(s: ^Stream, timeout: time.Duration) {
 	bounded := max(timeout, time.Millisecond)
 	if s.tls != nil {
@@ -110,6 +114,7 @@ stream_set_write_timeout :: proc(s: ^Stream, timeout: time.Duration) {
 	_ = net.set_option(s.socket, .Send_Timeout, bounded)
 }
 
+@(private)
 stream_close :: proc(s: ^Stream) {
 	if s.tls != nil {
 		tlsx.close(s.tls)
@@ -160,7 +165,7 @@ reader_fill :: proc(r: ^Buf_Reader, unread := 0) -> Error {
 		}
 		stream_set_read_timeout(r.stream, wait)
 	}
-	chunk: [8192]u8
+	chunk: [HTTP_READ_CHUNK]u8
 	// What has been read past is dropped rather than grown over, or a chunked
 	// body would be held twice: here, and in the body its chunks are copied to.
 	// A view into `buf` lasts only until the next read, so nothing points here.
@@ -266,7 +271,7 @@ reader_line :: proc(r: ^Buf_Reader) -> (line: string, err: Error) {
 			}
 			return line, .None
 		}
-		if len(r.buf) - r.pos > 64 * 1024 {
+		if len(r.buf) - r.pos > MAX_HTTP_LINE {
 			return "", .HTTP_Error
 		}
 		reader_fill(r) or_return
@@ -414,7 +419,22 @@ follow, so without this a peer sending short fields forever would be read for
 as long as it kept the socket open. A hundred is well past what any list host or DoH resolver
 sends; the largest seen in practice is around twenty.
 */
+@(private)
 MAX_HTTP_HEADERS :: 100
+
+// How many redirects `fetch_url` follows before it gives up on a list.
+@(private)
+MAX_REDIRECTS :: 5
+
+// The longest field or status line `reader_line` reads, and so the furthest the
+// header scan reaches.
+@(private)
+MAX_HTTP_LINE :: 64 * 1024
+
+// What one read off the wire takes at most, and what a body or a response
+// buffer starts at.
+@(private)
+HTTP_READ_CHUNK :: 8192
 
 /*
 Perform one request/response exchange on `stream`.
@@ -497,7 +517,7 @@ http_exchange :: proc(
 	// list's download until the last one has loaded.
 	r := Buf_Reader {
 		stream   = stream,
-		buf      = make([dynamic]u8, 0, 8192),
+		buf      = make([dynamic]u8, 0, HTTP_READ_CHUNK),
 		deadline = deadline,
 		idle     = idle,
 	}
@@ -711,7 +731,7 @@ split_header :: proc(line: string) -> (name, value: string, ok: bool) {
 @(private)
 read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator, limit: int) -> (body: []u8, err: Error) {
 	// Never more than `limit` from the start, as never more than it on the way.
-	out := make([dynamic]u8, 0, min(8192, limit), allocator)
+	out := make([dynamic]u8, 0, min(HTTP_READ_CHUNK, limit), allocator)
 	// A body assembled only in part is of no use to anyone, and every `or_return`
 	// below is a way to end up holding one.
 	defer if err != .None {
@@ -809,36 +829,6 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator, limit: int) -> (b
 	return out[:], .None
 }
 
-/*
-Open a stream to `endpoint`, optionally wrapping it in TLS.
-
-`tls_ctx` is nil for plain HTTP. `hostname` is used for SNI and certificate
-verification. `name` names the upstream in the log when there is one to name;
-the bootstrap resolver has none.
-
-A handshake the transport killed - a peer that reset the connection partway
-through - is retried once on a new socket. Some resolvers do this to a share of
-connections while the very next attempt goes through: Quad9 reset roughly a
-fifth of the handshakes offered to it from one network, and a single retry
-recovered two thirds of those. Left alone they accumulate into the consecutive
-failure count and park an upstream that answers perfectly well.
-
-Only that case is retried. A certificate that did not check out will not check
-out on a second look, and a handshake that ran out of time has already spent the
-caller's budget - retrying it would spend it twice. A reset comes back
-immediately, so the retry costs a round trip.
-
-The same reset can also surface before the handshake starts: `dial_tcp_timeout`
-reports `Dial_Reset` when the peer closed before this side finished connecting,
-which is retried on the same terms.
-
-`timeout` is one deadline over all of it - both dials, both handshakes - so each
-step is given what the ones before it left, and a peer slow to accept, slow to
-shake hands, or resetting the first attempt just short of the deadline costs the
-caller its budget once rather than once per step (#346). The socket leaves
-carrying whatever is left; every caller sets its own timeouts on the stream
-before using it.
-*/
 // Whether `open_stream` makes its one retry: only from the first attempt, and only
 // inside the deadline. Out of time, the first attempt's failure is the one
 // reported, not a `Timeout` that hides it. `now` is passed in so a test can put
@@ -863,6 +853,37 @@ stream_time_left :: proc(timeout: time.Duration, deadline, now: time.Tick) -> ti
 	return timeout if timeout <= 0 else max(time.tick_diff(now, deadline), time.Millisecond)
 }
 
+/*
+Open a stream to `endpoint`, optionally wrapping it in TLS.
+
+`tls_ctx` is nil for a plain stream: HTTP, `tcp`, and a `udp` upstream's retry.
+`hostname` is used for SNI and certificate verification. `u` names the upstream
+in the log when there is one to name, and dials through `Upstream.dial` when
+that is set; the bootstrap resolver has none.
+
+A handshake the transport killed - a peer that reset the connection partway
+through - is retried once on a new socket. Some resolvers do this to a share of
+connections while the very next attempt goes through: Quad9 reset roughly a
+fifth of the handshakes offered to it from one network, and a single retry
+recovered two thirds of those. Left alone they accumulate into the consecutive
+failure count and park an upstream that answers perfectly well.
+
+Only that case is retried. A certificate that did not check out will not check
+out on a second look, and a handshake that ran out of time has already spent the
+caller's budget - retrying it would spend it twice. A reset comes back
+immediately, so the retry costs a round trip.
+
+The same reset can also surface before the handshake starts: `dial_tcp_timeout`
+reports `Dial_Reset` when the peer closed before this side finished connecting,
+which is retried on the same terms.
+
+`timeout` is one deadline over all of it - both dials, both handshakes - so each
+step is given what the ones before it left, and a peer slow to accept, slow to
+shake hands, or resetting the first attempt just short of the deadline costs the
+caller its budget once rather than once per step (#346). The socket leaves
+carrying whatever is left; every caller sets its own timeouts on the stream
+before using it.
+*/
 open_stream :: proc(
 	endpoint: net.Endpoint,
 	tls_ctx: ^tlsx.Context,
@@ -873,9 +894,13 @@ open_stream :: proc(
 	stream: Stream,
 	err: Error,
 ) {
+	dial := dial_tcp_timeout
+	if u != nil && u.dial != nil {
+		dial = u.dial
+	}
 	deadline := time.tick_add(loop.tick_now(), timeout)
 	for attempt in 0 ..< 2 {
-		socket, derr := dial_tcp_timeout(endpoint, stream_time_left(timeout, deadline, loop.tick_now()))
+		socket, derr := dial(endpoint, stream_time_left(timeout, deadline, loop.tick_now()))
 		if derr != .None {
 			if derr != .Dial_Reset || !retry_due(timeout, deadline, loop.tick_now(), attempt) {
 				return {}, derr

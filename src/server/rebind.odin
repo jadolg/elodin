@@ -6,6 +6,7 @@ import "core:sync"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:netx"
 
 /*
 Refusing an upstream answer that points a public name at a private address.
@@ -710,9 +711,5 @@ rebind_address_text :: proc(addr: [16]u8, v6: bool, allocator: mem.Allocator) ->
 	if !v6 {
 		return net.address_to_string(net.IP4_Address{addr[0], addr[1], addr[2], addr[3]}, allocator)
 	}
-	a: net.IP6_Address
-	for i in 0 ..< 8 {
-		a[i] = u16be(u16(addr[i * 2]) << 8 | u16(addr[i * 2 + 1]))
-	}
-	return net.address_to_string(a, allocator)
+	return net.address_to_string(netx.ip6_from_bytes(addr), allocator)
 }

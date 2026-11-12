@@ -100,7 +100,7 @@ make_group :: proc(
 
 	servers := make([dynamic]^Upstream, 0, len(cfg.servers), allocator)
 	for spec in cfg.servers {
-		u, uerr := make_upstream(spec, cfg.max_idle, cfg.idle_timeout, allocator, cookies, outstanding)
+		u, uerr := make_upstream(spec, cfg.max_idle, cfg.idle_timeout, allocator, cookies = cookies, outstanding = outstanding)
 		if uerr != .None {
 			logx.errorf("upstream %s: not usable (%v)", spec.name, uerr)
 			continue

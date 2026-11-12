@@ -1,6 +1,7 @@
 package h2
 
 import "core:mem"
+import "core:strconv"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
@@ -124,13 +125,6 @@ query in flight per stream. Long enough that a genuinely slow reader is not cut
 off, short enough that a deliberate one cannot accumulate them.
 */
 DEFAULT_WRITE_TIMEOUT :: 10 * time.Second
-// Advertised receive window. Generous, so a client streaming request bodies is
-// never throttled by us; DoH bodies are tiny anyway. Well past MAX_BODY, so a
-// stream is never given more than this and only the connection window needs
-// replenishing. Padding spends the window without growing the body, so a
-// stream is also reset once half the window has gone (Stream.received), rather
-// than left to stall with none.
-RECV_WINDOW :: 1 << 20
 // Connection credit is owed until this much has built up, so a peer sending
 // 1-byte DATA frames does not draw a WINDOW_UPDATE back for each one. Far
 // below RECV_WINDOW, so the peer never waits on it.
@@ -351,44 +345,14 @@ serve :: proc(c: ^Conn) {
 		return
 	}
 
-	header: [FRAME_HEADER_SIZE]u8
-	// A peer that keeps the socket readable never lets this reader park, and the
-	// handlers it starts on the same loop would wait behind it: counted per frame
-	// as well as per socket call, since `IO` need not be a socket (the tests',
-	// read from memory). See `loop.take_turn`.
 	for {
-		loop.take_turn()
-		if !read_exact(c, header[:]) {
-			return
-		}
-		h, ok := parse_frame_header(header[:])
+		h, payload, refuse, ok := read_frame(c.io, c.continuation_on)
 		if !ok {
-			return
-		}
-		// Bounded at the frame size we advertise, not at the receive window. We
-		// never send SETTINGS_MAX_FRAME_SIZE, so the peer is held to the RFC 9113
-		// 6.5.2 default (16384); accepting 64x that (RECV_WINDOW) would allow a
-		// frame the peer was told to keep smaller. The window still caps the body
-		// a stream may buffer; this caps a single frame off the wire.
-		if h.length > DEFAULT_MAX_FRAME {
-			goaway(c, .Frame_Size_Error)
-			return
-		}
-
-		payload: []u8
-		if h.length > 0 {
-			payload = make([]u8, h.length, context.temp_allocator)
-			if !read_exact(c, payload, starts_frame = false) {
-				return
+			if code, bad := refuse.?; bad {
+				goaway(c, code)
 			}
-		}
-
-		// A header block may not be interrupted by frames for other streams.
-		if c.continuation_on != 0 && (h.type != .Continuation || h.stream_id != c.continuation_on) {
-			goaway(c, .Protocol_Error)
 			return
 		}
-
 		if !handle_frame(c, h, payload) {
 			return
 		}
@@ -399,38 +363,15 @@ serve :: proc(c: ^Conn) {
 @(private)
 read_preface :: proc(c: ^Conn) -> bool {
 	buf: [len(PREFACE)]u8
-	if !read_exact(c, buf[:]) {
+	if !io_read_exact(c.io, buf[:]) {
 		return false
 	}
 	return string(buf[:]) == PREFACE
 }
 
 @(private)
-read_exact :: proc(c: ^Conn, buf: []u8, starts_frame := true) -> bool {
-	// One whole thing off the wire starts here: everything this package reads it
-	// reads through this, so this is the one place that has to say so. See `IO`.
-	if c.io.begin != nil {
-		c.io.begin(c.io.user, starts_frame)
-	}
-	got := 0
-	for got < len(buf) {
-		n, ok := c.io.read(c.io.user, buf[got:])
-		if !ok || n <= 0 {
-			return false
-		}
-		got += n
-	}
-	return true
-}
-
-@(private)
 write_all :: proc(c: ^Conn, buf: []u8) -> bool {
-	loop.lock(&c.mu)
-	defer loop.unlock(&c.mu)
-	if c.closed {
-		return false
-	}
-	return c.io.write(c.io.user, buf)
+	return io_write_locked(c.io, &c.mu, &c.closed, buf)
 }
 
 @(private)
@@ -476,10 +417,7 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		if h.flags & FLAG_ACK != 0 {
 			return true
 		}
-		out := make([dynamic]u8, 0, 17, context.temp_allocator)
-		write_frame_header(&out, 8, .Ping, FLAG_ACK, 0)
-		append(&out, ..payload)
-		return write_all(c, out[:])
+		return write_all(c, ping_ack_frame(payload))
 
 	case .Window_Update:
 		return handle_window_update(c, h, payload)
@@ -641,6 +579,11 @@ handle_settings :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	for i := 0; i + 6 <= len(payload); i += 6 {
 		id := Setting(read_u16(payload[i:]))
 		value := read_u32(payload[i + 2:])
+		if code, bad := setting_error(id, value); bad {
+			loop.unlock(&c.mu)
+			goaway(c, code)
+			return false
+		}
 		#partial switch id {
 		case .Enable_Push:
 			// RFC 9113 6.5.2: anything but 0 or 1 is a PROTOCOL_ERROR. This
@@ -651,33 +594,9 @@ handle_settings :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 				return false
 			}
 		case .Max_Frame_Size:
-			if value < DEFAULT_MAX_FRAME || value > 16777215 {
-				loop.unlock(&c.mu)
-				goaway(c, .Protocol_Error)
-				return false
-			}
 			c.peer_max_frame = int(value)
 		case .Initial_Window_Size:
-			if value > MAX_WINDOW {
-				loop.unlock(&c.mu)
-				goaway(c, .Flow_Control_Error)
-				return false
-			}
-			/*
-			A change retroactively adjusts every open stream's window, and a
-			stream carried past the maximum by that adjustment is the same
-			connection error as one carried there by a WINDOW_UPDATE (RFC 9113
-			section 6.9.2). The check above only refuses a settings *value* over
-			the maximum, which does not stop an already-raised window from being
-			nudged over it.
-			*/
-			delta := int(value) - c.peer_initial_window
-			c.peer_initial_window = int(value)
-			overflow := false
-			for _, s in c.streams {
-				s.send_window += delta
-				overflow ||= s.send_window > MAX_WINDOW
-			}
+			overflow := apply_initial_window(&c.peer_initial_window, value, c.streams)
 			loop.cond_broadcast(&c.cond)
 			if overflow {
 				loop.unlock(&c.mu)
@@ -687,21 +606,14 @@ handle_settings :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		}
 	}
 	loop.unlock(&c.mu)
-
-	out := make([dynamic]u8, 0, FRAME_HEADER_SIZE, context.temp_allocator)
-	write_frame_header(&out, 0, .Settings, FLAG_ACK, 0)
-	return write_all(c, out[:])
+	return write_all(c, settings_ack_frame())
 }
 
 @(private)
 handle_window_update :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
-	if len(payload) != 4 {
-		goaway(c, .Frame_Size_Error)
-		return false
-	}
-	increment := int(read_u32(payload) & 0x7fff_ffff)
-	if increment == 0 {
-		goaway(c, .Protocol_Error)
+	increment, code, ok := window_increment(payload)
+	if !ok {
+		goaway(c, code)
 		return false
 	}
 
@@ -736,18 +648,9 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return false
 	}
 
-	body, ok := strip_padding(payload, h.flags)
+	block, code, ok := header_fragment(payload, h.flags)
 	if !ok {
-		goaway(c, .Protocol_Error)
-		return false
-	}
-	block, pok := strip_priority(body, h.flags)
-	if !pok {
-		goaway(c, .Protocol_Error)
-		return false
-	}
-	if len(block) > MAX_HEADER_LIST {
-		goaway(c, .Compression_Error)
+		goaway(c, code)
 		return false
 	}
 
@@ -844,44 +747,14 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 
 @(private)
 handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
-	// RFC 9113 6.10: only behind a HEADERS without END_HEADERS, on its stream;
-	// with no block open, `continuation_on` is 0, which is no stream either.
-	if c.continuation_on == 0 || c.continuation_on != h.stream_id {
-		goaway(c, .Protocol_Error)
+	complete, refuse := continue_header_block(&c.continuation_on, &c.continuation_frames, &c.header_block, h, payload)
+	if code, bad := refuse.?; bad {
+		goaway(c, code)
 		return false
 	}
-	/*
-	Counted as well as measured.
-
-	The size cap below is no cap against frames that carry nothing: an empty
-	CONTINUATION never advances `len(c.header_block)`, so a peer sending them
-	holds the block open and this reader reading nine-byte frames for as long as
-	it likes. Nothing accrues, which is why the cap is generous - a legitimate
-	block is MAX_HEADER_LIST at the outside and arrives in a handful of frames,
-	so anything near this many is a peer with something else in mind.
-	*/
-	c.continuation_frames += 1
-	if c.continuation_frames > MAX_CONTINUATION_FRAMES {
-		goaway(c, .Enhance_Your_Calm)
-		return false
-	}
-	/*
-	Bounded as it accumulates, not once it is whole. Neither HEADERS nor
-	CONTINUATION is flow-controlled, so nothing slows a peer sending these, and
-	HPACK's own limit lives in `decode` - which never runs for a block whose
-	END_HEADERS never arrives. Without a cap here one connection can make us
-	hold as much as it cares to send.
-	*/
-	if len(c.header_block) + len(payload) > MAX_HEADER_LIST {
-		goaway(c, .Compression_Error)
-		return false
-	}
-	append(&c.header_block, ..payload)
-
-	if h.flags & FLAG_END_HEADERS == 0 {
+	if !complete {
 		return true
 	}
-	c.continuation_on = 0
 	return finish_headers(c, c.block_stream, c.header_block[:])
 }
 
@@ -1113,174 +986,6 @@ trailers_are_malformed :: proc(trailers: []Header_Field, end_stream: bool) -> bo
 		}
 	}
 	return false
-}
-
-/*
-RFC 9110 5.6.2: a token, which is what a field name is on either version of the
-protocol. ASCII only, so a name outside it cannot be one a Unicode case fold in
-some other hop reads as a field this one knows by another spelling.
-*/
-is_token :: proc(s: string) -> bool {
-	for i in 0 ..< len(s) {
-		switch s[i] {
-		case 'a' ..= 'z', 'A' ..= 'Z', '0' ..= '9':
-			continue
-		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
-			continue
-		}
-		return false
-	}
-	// 1*tchar: nothing at all is not a token.
-	return len(s) > 0
-}
-
-/*
-RFC 9112 3.2 and RFC 3986 2: a request target is visible ASCII and nothing
-else. No SP, HTAB, VT or FF, which a lenient hop is entitled to split a request
-line on (RFC 9112 3), no other control, and no byte outside ASCII, which a URI
-cannot hold unencoded. Emptiness is left to the caller, which knows what an
-empty target means on its version.
-*/
-target_is_valid :: proc(s: string) -> bool {
-	for i in 0 ..< len(s) {
-		if s[i] <= ' ' || s[i] >= 0x7f {
-			return false
-		}
-	}
-	return true
-}
-
-/*
-RFC 9110 7.2 and RFC 3986 3.2: a host, `uri-host [":" port]`, is a target that
-holds no userinfo (which RFC 9113 8.3.1 forbids in `:authority` by name), no
-path, query or fragment, and no backslash, which WHATWG parsers read as a `/`.
-Each of those is a Host that a hop routing by it parses its own way:
-`a.example@b.example` is `b.example` to one reader and `a.example` to another.
-Empty is left to the caller, as for `target_is_valid`.
-*/
-authority_is_valid :: proc(s: string) -> bool {
-	return target_is_valid(s) && strings.index_any(s, "@/\\?#") < 0
-}
-
-/*
-RFC 9110 5.6.1: whether the comma-separated list `value` holds `token`, compared
-without regard to ASCII case. `Connection: keep-alive, close` is a close, which
-a single-token compare missed (#437); each element loses its OWS and nothing
-more, and empty elements match nothing. For lists of tokens only, such as
-`Connection`: a comma inside a quoted-string is split on like any other.
-*/
-list_has_token :: proc(value, token: string) -> bool {
-	rest := value
-	for element in strings.split_iterator(&rest, ",") {
-		if dns.name_equal_fold(trim_ows(element), token) {
-			return true
-		}
-	}
-	return false
-}
-
-/*
-`value` with `OWS` taken off either end and nothing else.
-
-`OWS` is spaces and tabs (RFC 9110 5.6.3), which is all a recipient may take off
-a field value. `strings.trim_space` takes more: it is Unicode-aware, so it also
-takes a non-breaking space off the end, which would make `close\u00a0` a close. A hop
-in front reads the field as the grammar writes it and refuses the message rather
-than trimming it, so trimming one here is this hop reading a value the front end
-never saw.
-*/
-trim_ows :: proc(value: string) -> string {
-	return strings.trim(value, " \t")
-}
-
-/*
-An HTTP/1 `Content-Length` value, which is `1*DIGIT` (RFC 9110 8.6) and nothing
-else, with `OWS` around it. One parser for the DoH server and the HTTP client,
-since both carry the same request-smuggling hardening and two that disagree are
-the bug.
-
-`strconv.parse_int` with its default base reads a good deal more: the base comes
-from a prefix, so `0x10` is 16 and `0b1010` is 10; `_` between digits is
-skipped; a leading sign is allowed; and the accumulator wraps in silence, so
-`18446744073709551620` comes back as 4 and a range check downstream sees nothing
-wrong. On the server that is CL.CL request smuggling behind a front end that
-reads the field as the RFC writes it; on the client it leaves a kept-alive
-connection reading from the middle of a body.
-
-A value past `limit` comes back as `limit + 1`, so nothing wraps on the way to
-the caller's range check, and its digits are still all checked: too large and
-not a length at all are different refusals.
-*/
-parse_content_length :: proc(value: string, limit: int) -> (length: int, ok: bool) {
-	// A step is taken only from `length <= limit`, so it stays under
-	// `limit * 10 + 9`, which this keeps inside an int.
-	assert(limit >= 0 && limit < max(int) / 10)
-	digits := trim_ows(value)
-	if len(digits) == 0 {
-		return 0, false
-	}
-	for i in 0 ..< len(digits) {
-		c := digits[i]
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		if length <= limit {
-			length = min(length * 10 + int(c - '0'), limit + 1)
-		}
-	}
-	return length, true
-}
-
-/*
-An HTTP/1 `HTTP-version`: `HTTP/` `DIGIT` `.` `DIGIT`, case-sensitively, and
-nothing on either side of it (RFC 9112 2.3) - the request line's third token, or
-the first eight bytes of a status line.
-*/
-http1_version :: proc(s: string) -> (major, minor: u8, ok: bool) {
-	if len(s) != 8 || !strings.has_prefix(s, "HTTP/") || s[6] != '.' {
-		return
-	}
-	if s[5] < '0' || s[5] > '9' || s[7] < '0' || s[7] > '9' {
-		return
-	}
-	return s[5] - '0', s[7] - '0', true
-}
-
-/*
-RFC 9113 8.2.1: a field name is an RFC 9110 token, and lowercase. Uppercase is
-not folded on receipt but malformed, so that two hops cannot disagree about
-which of `Transfer-Encoding` and `transfer-encoding` they were sent.
-*/
-@(private)
-field_name_is_valid :: proc(name: string) -> bool {
-	for i in 0 ..< len(name) {
-		if name[i] >= 'A' && name[i] <= 'Z' {
-			return false
-		}
-	}
-	return is_token(name)
-}
-
-/*
-RFC 9113 8.2.1 again: a field value holds no NUL, CR or LF, and neither begins
-nor ends with whitespace. The three characters are what an HTTP/1.1 hop would
-read as the end of the field, or of the message, so a value carrying one is how
-a request smuggled through this end would be written.
-*/
-field_value_is_valid :: proc(value: string) -> bool {
-	if len(value) > 0 {
-		first, last := value[0], value[len(value) - 1]
-		if first == ' ' || first == '\t' || last == ' ' || last == '\t' {
-			return false
-		}
-	}
-	for i in 0 ..< len(value) {
-		switch value[i] {
-		case 0, '\n', '\r':
-			return false
-		}
-	}
-	return true
 }
 
 /*
@@ -1662,9 +1367,6 @@ request_destroy :: proc(c: ^Conn, req: ^Request) {
 	free(req, req.allocator)
 }
 
-// A DNS message, which RFC 8484 6 holds to 65535 bytes; restated as
-// CLIENT_MAX_BODY is, and `server` asserts it agrees with `dns.MAX_MESSAGE`.
-MAX_BODY :: 65535
 /*
 Request bytes - decoded header fields and body - one connection may hold across
 all its streams at once.
@@ -1718,10 +1420,7 @@ stream_error :: proc(c: ^Conn, stream_id: u32, code: Error_Code) -> bool {
 
 @(private)
 rst_stream :: proc(c: ^Conn, stream_id: u32, code: Error_Code) -> bool {
-	out := make([dynamic]u8, 0, 13, context.temp_allocator)
-	write_frame_header(&out, 4, .Rst_Stream, 0, stream_id)
-	append_u32(&out, u32(code))
-	return write_all(c, out[:])
+	return write_all(c, rst_stream_frame(stream_id, code))
 }
 
 // Whether `stream_id` is in Conn.reset_ids, struck off as well with `forget`.
@@ -1753,12 +1452,7 @@ goaway :: proc(c: ^Conn, code: Error_Code) {
 	c.goaway_sent = true
 	last := c.last_stream_id
 	loop.unlock(&c.mu)
-
-	out := make([dynamic]u8, 0, 17, context.temp_allocator)
-	write_frame_header(&out, 8, .Goaway, 0, 0)
-	append_u32(&out, last)
-	append_u32(&out, u32(code))
-	_ = write_all(c, out[:])
+	_ = write_all(c, goaway_frame(last, code))
 }
 
 /*
@@ -1800,7 +1494,8 @@ respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
 	}
 
 	block := make([dynamic]u8, 0, 128, context.temp_allocator)
-	encode_header(&block, ":status", status_text(resp.status))
+	status: [3]u8
+	encode_header(&block, ":status", status_text(&status, resp.status))
 	if resp.content_type != "" {
 		encode_header(&block, "content-type", resp.content_type)
 	}
@@ -1811,7 +1506,8 @@ respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
 		encode_header(&block, "allow", resp.allow)
 	}
 	if !resp.head {
-		encode_header(&block, "content-length", int_to_string(len(resp.body), context.temp_allocator))
+		digits: [20]u8
+		encode_header(&block, "content-length", strconv.write_int(digits[:], i64(len(resp.body)), 10))
 	}
 	encode_header(&block, "server", "elodin")
 
@@ -1858,13 +1554,8 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 				loop.unlock(&c.mu)
 				return true
 			}
-			available := min(c.send_window, s.send_window)
-			available = min(available, c.peer_max_frame)
-			available = min(available, remaining)
-			if available > 0 {
-				chunk = available
-				c.send_window -= chunk
-				s.send_window -= chunk
+			chunk = take_send_credit(&c.send_window, &s.send_window, c.peer_max_frame, remaining)
+			if chunk > 0 {
 				if chunk == remaining {
 					// This chunk carries END_STREAM; see MAX_HELD_STREAMS.
 					set_state(c, s, .Closed)
@@ -1896,11 +1587,7 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 		}
 		loop.unlock(&c.mu)
 
-		last := sent + chunk >= len(body)
-		out := make([dynamic]u8, 0, chunk + FRAME_HEADER_SIZE, context.temp_allocator)
-		write_frame_header(&out, chunk, .Data, u8(FLAG_END_STREAM) if last else 0, stream_id)
-		append(&out, ..body[sent:sent + chunk])
-		if !write_all(c, out[:]) {
+		if !write_all(c, data_frame(stream_id, body[sent:sent + chunk], sent + chunk >= len(body))) {
 			return false
 		}
 		sent += chunk
@@ -1947,16 +1634,9 @@ outright). Anything outside 200 to 599 is a caller's mistake - a Response left a
 its zero status - and goes out as 500 rather than as a field no client can use.
 */
 @(private)
-status_text :: proc(status: int) -> string {
+status_text :: proc(buf: ^[3]u8, status: int) -> string {
 	if status < 200 || status > 599 {
 		return "500"
 	}
-	return int_to_string(status, context.temp_allocator)
-}
-
-@(private)
-int_to_string :: proc(v: int, allocator: mem.Allocator) -> string {
-	b := strings.builder_make(allocator)
-	strings.write_int(&b, v)
-	return strings.to_string(b)
+	return strconv.write_int(buf[:], i64(status), 10)
 }

@@ -206,3 +206,15 @@ test_parse_decimal_is_digits_within_the_bound :: proc(t: ^testing.T) {
 		testing.expectf(t, ok == c.ok && n == c.want, "%q under %d: got %d, %v", c.text, c.max, n, ok)
 	}
 }
+
+// `ip6_from_bytes` reads the groups big-endian, as `address_bytes` writes them.
+@(test)
+test_ip6_from_bytes_reverses_address_bytes :: proc(t: ^testing.T) {
+	a := net.IP6_Address{0x2001, 0x0db8, 0, 0, 0, 0, 0xff00, 0x0042}
+	b, v6 := address_bytes(a)
+	testing.expect(t, v6, "an IPv6 address read as IPv4")
+	testing.expect_value(t, b[0], 0x20)
+	testing.expect_value(t, b[1], 0x01)
+	testing.expect_value(t, b[15], 0x42)
+	testing.expect_value(t, ip6_from_bytes(b), a)
+}

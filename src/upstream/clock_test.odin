@@ -47,7 +47,7 @@ test_upstream_stamps_its_moments_on_the_moment_clock :: proc(t: ^testing.T) {
 
 	before := loop.moment_now()
 	// No descriptor at all, so nothing closes another test's socket.
-	put_idle(u, Idle_Conn{socket = net.TCP_Socket(-1)})
+	put_idle(u, Stream{socket = net.TCP_Socket(-1)})
 	for _ in 0 ..< FAILURE_THRESHOLD {
 		record_failure(u, .Dial_Failed)
 	}

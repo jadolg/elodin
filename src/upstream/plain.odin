@@ -133,10 +133,7 @@ exchange_udp :: proc(
 		if n < dns.HEADER_SIZE {
 			continue
 		}
-		// Ignore anything that did not come from the server we asked. The
-		// connected socket has the kernel drop those already; this stays as
-		// the check that does not depend on it.
-		if remote.port != endpoint.port || !netx.addresses_equal(remote.address, endpoint.address) {
+		if !came_from(remote, endpoint) {
 			continue
 		}
 		// A forged datagram is passed over rather than reported: the genuine
@@ -203,6 +200,14 @@ open_udp :: proc(endpoint: net.Endpoint) -> (net.UDP_Socket, bool) {
 		return {}, false
 	}
 	return net.UDP_Socket(fd), true
+}
+
+// Whether a datagram came from the server asked. The connected socket (see
+// `open_udp`) has the kernel drop anything else already; this is the check
+// that does not depend on it.
+@(private)
+came_from :: proc(remote, endpoint: net.Endpoint) -> bool {
+	return remote.port == endpoint.port && netx.addresses_equal(remote.address, endpoint.address)
 }
 
 /*

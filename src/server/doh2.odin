@@ -82,7 +82,7 @@ H2_Job :: struct {
 	asked:     bool,
 }
 
-// Called by `h2.read_exact` where the preface, a frame header or a frame payload
+// Called by `h2.io_read_exact` where the preface, a frame header or a frame payload
 // starts; `h2_read` then spends this budget across however many reads the peer
 // splits that into.
 @(private)

@@ -30,7 +30,6 @@ DOH_METHODS :: "GET, POST"
 MAX_HEADER_BYTES :: 16 * 1024
 // RFC 8484 6: application/dns-message is at most 65535 bytes.
 MAX_DOH_BODY :: dns.MAX_MESSAGE
-#assert(h2.MAX_BODY == dns.MAX_MESSAGE)
 
 /*
 Whether a POST's Content-Type names the DoH media type, for both HTTP/1.1 and
