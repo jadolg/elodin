@@ -400,7 +400,9 @@ refused, which is what BIND and Unbound do with the same input, so `127.0.0.1/8`
 and `127.0.0.0/8` are the same network.
 */
 parse_prefix :: proc(text: string) -> (p: Prefix, ok: bool) {
-	trimmed := strings.trim_space(text)
+	// ASCII space only: a no-break space at an end stays, and the entry is
+	// refused as unparseable rather than read as the network without it.
+	trimmed := strings.trim(text, ASCII_SPACE)
 	if trimmed == "" {
 		return {}, false
 	}

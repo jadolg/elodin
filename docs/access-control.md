@@ -23,7 +23,8 @@ the attack.
 - Entries are CIDR networks in either family. A bare address is that one host,
   host bits below the length are masked off, and a v4-mapped entry
   (`::ffff:192.168.0.0/112`) matches the IPv4 network it names.
-- An entry that does not parse fails `--check`.
+- An entry that does not parse fails `--check`, and so does one with a space
+  outside ASCII at either end, such as a no-break space.
 - Carrier-grade NAT (`100.64.0.0/10`, also used by Tailscale) is not in the
   default: behind one, elodin would serve the ISP's other customers.
 

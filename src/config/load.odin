@@ -6,6 +6,7 @@ import "core:net"
 import "core:os"
 import "core:strings"
 import "core:time"
+import "core:unicode"
 import "elodin:cache"
 import "elodin:dns"
 import "elodin:dnssec"
@@ -2053,8 +2054,11 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 		if !check_keys(l, e, path, "domain", "ttl", "ptr", "answer", "answers") {
 			continue
 		}
-		domain := ""
-		opt_string(l, e, "domain", &domain, path)
+		written := ""
+		opt_string(l, e, "domain", &written, path)
+		// Trimmed before the `*.` is looked for, so " *.lan" is the wildcard it
+		// reads as, and a domain of spaces alone is no domain rather than the root.
+		domain := strings.trim(written, ASCII_SPACE)
 		if domain == "" {
 			errorf(l, "%s: missing domain", path)
 			continue
@@ -2078,7 +2082,7 @@ load_rewrites :: proc(l: ^Loader, cfg: ^Config) {
 		to prevent it.
 		*/
 		domain_ok: bool
-		rw.domain, domain_ok = canonical_domain(l, domain, fmt.tprintf("%s.domain: %q", path, domain))
+		rw.domain, domain_ok = canonical_domain(l, domain, fmt.tprintf("%s.domain: %q", path, written))
 		if !domain_ok || !name_fits_the_wire(l, rw.domain, fmt.tprintf("%s.domain", path)) {
 			continue
 		}
@@ -2611,6 +2615,12 @@ rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: b
 	}
 	what := fmt.tprintf("%s: %s host %q", path, type, trimmed)
 	canonical := canonical_domain(l, trimmed, what) or_return
+	// A space outside ASCII inside it splits two fields just as one at the
+	// check above does: "TXT hello" is no name to point at.
+	if strings.index_proc(trimmed, unicode.is_space) >= 0 {
+		errorf(l, "%s: %s needs one host name, got %q", path, type, text)
+		return "", false
+	}
 	if !name_fits_the_wire(l, canonical, what) {
 		return "", false
 	}

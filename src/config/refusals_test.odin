@@ -96,7 +96,7 @@ test_a_space_outside_ascii_at_a_names_end_is_refused :: proc(t: ^testing.T) {
 	REWRITE :: "rewrites:\n  - domain: "
 	cases := [?]Case {
 		{UP + REWRITE + "\"lan.example\\_\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"lan.example\\u00a0\""},
-		{UP + REWRITE + "\"*.lan.example\\_\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"lan.example\\u00a0\""},
+		{UP + REWRITE + "\"*.lan.example\\_\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"*.lan.example\\u00a0\""},
 		{UP + REWRITE + "lan.example\n    answer: \"host.example\\_\"\n", "rewrites[0].answer: an answer host"},
 		{UP + REWRITE + "lan.example\n    answer: \"\\_host.example\"\n", "rewrites[0].answer: an answer host"},
 		{UP + REWRITE + "lan.example\n    answer: \"CNAME host.example\\_\"\n", "rewrites[0].answer: CNAME host"},
@@ -121,14 +121,27 @@ test_a_space_outside_ascii_at_a_names_end_is_refused :: proc(t: ^testing.T) {
 	_, err := load_string(UP + REWRITE + "lan.example\n    answer: \"A 192.0.2.1\\_\"\n", context.temp_allocator)
 	testing.expect(t, err != nil, "an address with a no-break space after it was read as the address")
 
-	// ASCII space is trimmed as before.
+	// Nor is a name with one inside it, which is two fields run together.
+	_, err = load_string(UP + REWRITE + "lan.example\n    answer: \"TXT\\_hello\"\n", context.temp_allocator)
+	testing.expect(t, err != nil, "\"TXT\\u00a0hello\" was read as a name")
+
+	// A domain of ASCII space alone is no domain, not the root.
+	refused_with(t, UP + REWRITE + "\"   \"\n    answer: 10.0.0.1\n", "rewrites[0]: missing domain")
+
+	// ASCII space is trimmed, and before the `*.` is looked for.
 	cfg, aerr := load_string(
-		UP + REWRITE + "\" lan.example\\t\"\n    answer: \"CNAME host.example \"\n" + "rebind:\n  allow_domains: [\" home.example\\t\"]\n",
+		UP +
+		REWRITE +
+		"\" lan.example\\t\"\n    answer: \"CNAME host.example \"\n" +
+		"  - domain: \" *.wild.example\"\n    answer: 10.0.0.1\n" +
+		"rebind:\n  allow_domains: [\" home.example\\t\"]\n",
 		context.temp_allocator,
 	)
 	if testing.expectf(t, aerr == nil, "ASCII space was refused: %v", aerr) {
 		testing.expect_value(t, cfg.rewrites[0].domain, "lan.example.")
 		testing.expect_value(t, cfg.rewrites[0].answers[0].name, "host.example.")
+		testing.expect_value(t, cfg.rewrites[1].domain, "wild.example.")
+		testing.expect(t, cfg.rewrites[1].wildcard, "\" *.wild.example\" was not read as a wildcard")
 		testing.expect_value(t, cfg.rebind.allow_domains[0], "home.example.")
 	}
 	free_all(context.temp_allocator)
@@ -156,5 +169,16 @@ test_rewrite_tokens_fold_ascii_only :: proc(t: ^testing.T) {
 	if testing.expectf(t, terr == nil, "%v", terr) {
 		testing.expect_value(t, txt.rewrites[0].answers[0].strings[0], "hello\u00a0")
 	}
+	free_all(context.temp_allocator)
+}
+
+// An access-list entry with a space outside ASCII at an end is refused, as a
+// name with one is: trimmed, it would admit a network the file does not spell.
+@(test)
+test_an_allow_from_entry_with_a_unicode_space_is_refused :: proc(t: ^testing.T) {
+	_, err := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: [\"10.0.0.0/8\\_\"]\n", context.temp_allocator)
+	testing.expect(t, err != nil, "10.0.0.0/8 with a no-break space was accepted")
+	_, ok := load_string("upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: [\" 10.0.0.0/8 \"]\n", context.temp_allocator)
+	testing.expect(t, ok == nil, "ASCII space around an entry is trimmed")
 	free_all(context.temp_allocator)
 }
