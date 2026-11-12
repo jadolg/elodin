@@ -1,7 +1,6 @@
 package server
 
 import "core:net"
-import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -139,11 +138,11 @@ test_config :: proc(servers: []config.Upstream_Spec = nil) -> config.Config {
 
 // A group of one UDP upstream on loopback at `port`, with `cfg`'s settings.
 @(private)
-mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, port: int) -> ^upstream.Group {
+mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, port: int, loc := #caller_location) -> ^upstream.Group {
 	one := cfg
 	one.servers = loopback_upstream(port)
 	group, gerr := upstream.make_group(one, context.allocator)
-	testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr)
+	testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr, loc = loc)
 	return group
 }
 
@@ -260,12 +259,6 @@ Canned_Mock :: struct {
 	// actually forwarded. Read after the thread is joined.
 	seen:     [512]u8,
 	seen_len: int,
-	// How long to sit on the query before answering it, for a case that needs
-	// an upstream that is slow rather than absent.
-	delay:    time.Duration,
-	// Held until posted, where the case needs the client answered before the
-	// upstream is; bounded by `MOCK_RECV_TIMEOUT`.
-	hold:     ^sync.Sema,
 }
 
 @(private)
@@ -288,12 +281,6 @@ serve_canned :: proc(x: ^Canned_Mock) {
 		}
 		x.got = true
 		x.seen_len = copy(x.seen[:], buf[:n])
-		if x.delay > 0 {
-			time.sleep(x.delay)
-		}
-		if x.hold != nil {
-			_ = sync.sema_wait_with_timeout(x.hold, MOCK_RECV_TIMEOUT)
-		}
 		out: [4096]u8
 		copy(out[:], x.reply)
 		// Echo the ID it was asked with. The resolver draws a fresh one for

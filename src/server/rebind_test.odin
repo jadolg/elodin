@@ -195,11 +195,6 @@ rebind_reply_of :: proc(name: string, type: dns.Type, answers: []dns.Record) -> 
 }
 
 @(private = "file")
-a_record :: proc(name: string, addr: [4]u8) -> dns.Record {
-	return dns.Record{name = name, type = .A, class = .IN, ttl = 60, data = dns.Rdata_A{addr = addr}}
-}
-
-@(private = "file")
 aaaa_record :: proc(name: string, addr: [16]u8) -> dns.Record {
 	return dns.Record{name = name, type = .AAAA, class = .IN, ttl = 60, data = dns.Rdata_AAAA{addr = addr}}
 }

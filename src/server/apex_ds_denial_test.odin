@@ -96,7 +96,10 @@ test_an_apex_ds_nodata_is_the_proof_unless_the_denial_shows_no_delegation :: pro
 	}
 	// The bitmap follows the next name, `example.`, written out in full.
 	next: [dns.MAX_NAME_WIRE]u8
-	next_len, _ := dns.encode_name("example.", next[:])
+	next_len, nerr := dns.encode_name("example.", next[:])
+	if !testing.expectf(t, nerr == .None, "the next name does not encode: %v", nerr) {
+		return
+	}
 	types := m.authority[0].data.(dns.Rdata_Raw).data[next_len:]
 	testing.expect(t, !dnssec.bitmap_has(types, .NS) && dnssec.bitmap_has(types, .A), "the held name's NSEC has the NS bit")
 
