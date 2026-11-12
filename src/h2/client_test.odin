@@ -1744,8 +1744,7 @@ expect_client_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payl
 	testing.expectf(t, saw_frame(&log, .Goaway), "%s: the flood was dropped without a GOAWAY", what)
 	testing.expectf(t, log.goaway_code == .Enhance_Your_Calm, "%s: GOAWAY said %v, not ENHANCE_YOUR_CALM", what, log.goaway_code)
 
-	delete(log.frames)
-	client_done(t, c, &track, what)
+	client_done(t, c, &track, what, &log)
 }
 
 @(test)
@@ -2466,8 +2465,7 @@ test_client_response_head_is_held_to_8_2_and_8_3 :: proc(t: ^testing.T) {
 		testing.expectf(t, s.reset && !s.done, "%s: a malformed response was accepted (status %d)", tc.what, s.status)
 		testing.expectf(t, log.rst_code == .Protocol_Error, "%s: RST code %v, want PROTOCOL_ERROR", tc.what, log.rst_code)
 
-		delete(log.frames)
-		client_done(t, c, &track, tc.what)
+		client_done(t, c, &track, tc.what, &log)
 	}
 }
 

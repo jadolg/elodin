@@ -15,7 +15,7 @@ goes on holding the record long after this cache has dropped it.
 served_ttl :: proc(t: ^testing.T, c: ^Cache, name: string, ttl: u32) -> (u32, bool) {
 	wire, msg := build_answer(name, ttl, context.temp_allocator)
 	kb: [KEY_MAX]u8
-	key := make_key(kb[:], name, .A, .IN, false)
+	key := key_for(kb[:], name)
 	if !testing.expect(t, put(c, key, wire, msg), "the answer was not stored") {
 		return 0, false
 	}
@@ -75,7 +75,7 @@ test_a_ttl_with_the_high_bit_set_is_not_cached :: proc(t: ^testing.T) {
 
 	wire, msg := build_answer("hostile.example.", 0x8000_0000, context.temp_allocator)
 	kb: [KEY_MAX]u8
-	key := make_key(kb[:], "hostile.example.", .A, .IN, false)
+	key := key_for(kb[:], "hostile.example.")
 	testing.expect(t, !put(c, key, wire, msg), "an answer with the top TTL bit set was stored")
 	_, _, found := get(c, key, context.temp_allocator)
 	testing.expect(t, !found, "an answer with the top TTL bit set can be served")
@@ -121,7 +121,7 @@ test_a_stale_answer_is_bounded_by_max_ttl :: proc(t: ^testing.T) {
 
 	wire, msg := build_answer("stale.example.", 300, context.temp_allocator)
 	kb: [KEY_MAX]u8
-	key := make_key(kb[:], "stale.example.", .A, .IN, false)
+	key := key_for(kb[:], "stale.example.")
 	if !testing.expect(t, put(c, key, wire, msg), "the answer was not stored") {
 		return
 	}

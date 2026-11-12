@@ -55,7 +55,7 @@ test_decode_rfc_c31_literal_with_indexing :: proc(t: ^testing.T) {
 	table: Dynamic_Table
 	dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, context.temp_allocator)
 
-	block := from_hex("828684410f7777772e6578616d706c652e636f6d")
+	block := request_block()
 	headers, err := decode(&table, block, context.temp_allocator)
 	testing.expectf(t, err == .None, "decode failed: %v", err)
 	testing.expect_value(t, len(headers), 4)

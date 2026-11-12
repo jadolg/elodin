@@ -1225,7 +1225,8 @@ resume_fixture :: proc(t: ^testing.T, f: ^Resume_Fixture, version: c.long, round
 	}
 	f.srv.rounds = rounds
 	f.worker = thread.create_and_start_with_poly_data(&f.srv, resume_server_worker)
-	return true
+	// Without one, every handshake would sit out the client's 10s timeout.
+	return testing.expect(t, f.worker != nil, "cannot start the resumption server", loc = loc)
 }
 
 // Wakes the worker from an accept no client reached, and waits for it.

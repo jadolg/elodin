@@ -4262,7 +4262,9 @@ test_a_late_resolved_endpoint_is_published_once :: proc(t: ^testing.T) {
 
 	ep, eerr := endpoint_of(u)
 	testing.expect_value(t, eerr, Error.None)
-	testing.expect_value(t, ep.port, u.spec.port)
+	// The socket's own port, not the spec the endpoint was built from.
+	bound, berr := net.bound_endpoint(socket)
+	testing.expectf(t, berr == nil && ep.port == bound.port, "the endpoint is on port %d, the member's socket on %d (%v)", ep.port, bound.port, berr)
 	testing.expect(t, ep.address == net.Address(net.IP4_Loopback), "the endpoint is not the address the name resolved to")
 
 	// A lookup that finishes after the endpoint is out leaves it as it is: a
