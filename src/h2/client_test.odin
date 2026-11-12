@@ -175,8 +175,14 @@ start_peer :: proc(t: ^testing.T, p: ^Peer) -> bool {
 		return false
 	}
 	p.server = thread.create_and_start_with_poly_data(p, run_peer)
+	if !testing.expect(t, p.server != nil, "cannot start the peer") {
+		net.close(p.listener)
+		return false
+	}
 	p.c, p.ct, p.tc, ok = test_dial_client(t, bound)
 	if !ok {
+		// Wakes the peer from an accept no client reached.
+		net.shutdown(p.listener, .Both)
 		thread.join(p.server)
 		thread.destroy(p.server)
 		net.close(p.listener)
@@ -2421,7 +2427,6 @@ test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
 		client_stream_destroy(c, s)
 		delete_key(&c.streams, u32(1))
 		client_done(t, c, &track, tc.what)
-		mem.tracking_allocator_destroy(&track)
 	}
 }
 
@@ -2463,7 +2468,6 @@ test_client_response_head_is_held_to_8_2_and_8_3 :: proc(t: ^testing.T) {
 
 		delete(log.frames)
 		client_done(t, c, &track, tc.what)
-		mem.tracking_allocator_destroy(&track)
 	}
 }
 

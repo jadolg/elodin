@@ -39,7 +39,13 @@ serve_udp_mock :: proc(t: ^testing.T, m: ^$M, serve: proc(_: ^M)) -> (bound: net
 	socket, bound = bind_loopback_udp(t) or_return
 	m.socket = socket
 	set_socket_timeouts(socket, 50 * time.Millisecond)
-	return bound, thread.create_and_start_with_poly_data(m, serve), true
+	worker = thread.create_and_start_with_poly_data(m, serve)
+	if !testing.expect(t, worker != nil, "cannot start the responder") {
+		net.close(socket)
+		m.socket = {}
+		return {}, nil, false
+	}
+	return bound, worker, true
 }
 
 // `serve_udp_mock`, and a UDP upstream named `name` pointing at it.

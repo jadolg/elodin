@@ -83,6 +83,11 @@ test_a_failover_query_waits_out_two_timeouts_and_no_more :: proc(t: ^testing.T) 
 	mocks: [3]Echo_Mock
 	ups: [3]^Upstream
 	workers: [3]^thread.Thread
+	// Only the mocks that started: a zero socket is fd 0, another test's.
+	live := 0
+	defer for i in 0 ..< live {
+		stop_udp_mock(&mocks[i], workers[i], ups[i])
+	}
 	for i in 0 ..< 3 {
 		mocks[i].mute = true
 		ok: bool
@@ -90,9 +95,7 @@ test_a_failover_query_waits_out_two_timeouts_and_no_more :: proc(t: ^testing.T) 
 		if !ok {
 			return
 		}
-	}
-	defer for i in 0 ..< 3 {
-		stop_udp_mock(&mocks[i], workers[i], ups[i])
+		live += 1
 	}
 
 	g := failover_group(ups[:], DEADLINE_TIMEOUT, attempts = 2)
@@ -400,15 +403,18 @@ test_the_sweep_spends_what_is_left_of_the_query_budget :: proc(t: ^testing.T) {
 	mocks[3].mute = true
 	ups: [4]^Upstream
 	workers: [4]^thread.Thread
+	// Only the mocks that started: a zero socket is fd 0, another test's.
+	live := 0
+	defer for i in 0 ..< live {
+		stop_udp_mock(&mocks[i], workers[i], ups[i])
+	}
 	for i in 0 ..< 4 {
 		ok: bool
 		ups[i], workers[i], ok = start_echo_mock(t, &mocks[i], fmt.tprintf("m%d", i))
 		if !ok {
 			return
 		}
-	}
-	defer for i in 0 ..< 4 {
-		stop_udp_mock(&mocks[i], workers[i], ups[i])
+		live += 1
 	}
 
 	g := failover_group(ups[:], DEADLINE_TIMEOUT, attempts = 2)
@@ -448,15 +454,18 @@ test_the_calls_of_one_question_share_its_deadline :: proc(t: ^testing.T) {
 	mocks[1].delay = DEADLINE_TIMEOUT * 9 / 10
 	ups: [2]^Upstream
 	workers: [2]^thread.Thread
+	// Only the mocks that started: a zero socket is fd 0, another test's.
+	live := 0
+	defer for i in 0 ..< live {
+		stop_udp_mock(&mocks[i], workers[i], ups[i])
+	}
 	for i in 0 ..< 2 {
 		ok: bool
 		ups[i], workers[i], ok = start_echo_mock(t, &mocks[i], fmt.tprintf("m%d", i))
 		if !ok {
 			return
 		}
-	}
-	defer for i in 0 ..< 2 {
-		stop_udp_mock(&mocks[i], workers[i], ups[i])
+		live += 1
 	}
 	g := failover_group(ups[:], DEADLINE_TIMEOUT)
 

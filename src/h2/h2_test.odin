@@ -667,7 +667,6 @@ test_body_in_flight_behind_a_refused_headers_is_ignored :: proc(t: ^testing.T) {
 		testing.expectf(t, c.closed_stream_rst_budget == MAX_CLOSED_STREAM_RST, "%v: closed_stream_rst_budget %d, want %d", cause, c.closed_stream_rst_budget, MAX_CLOSED_STREAM_RST)
 
 		conn_done(t, c, &track, "body behind a refused headers", &log)
-		mem.tracking_allocator_destroy(&track)
 	}
 }
 
@@ -765,7 +764,6 @@ test_a_reset_id_the_peer_then_ends_takes_no_header_block :: proc(t: ^testing.T) 
 		testing.expectf(t, !ok, "end_with_rst=%v: a header block after the peer ended the stream was accepted", end_with_rst)
 
 		conn_done(t, c, &track, "reset id the peer then ends", &log)
-		mem.tracking_allocator_destroy(&track)
 	}
 }
 
@@ -839,7 +837,6 @@ test_a_stream_refused_on_its_end_stream_is_not_remembered :: proc(t: ^testing.T)
 		testing.expectf(t, !ok, "%v: a block after END_STREAM on a refused stream was taken as trailers", cause)
 
 		conn_done(t, c, &track, "refused on its end stream", &log)
-		mem.tracking_allocator_destroy(&track)
 	}
 }
 
@@ -3150,7 +3147,6 @@ test_trailers_end_a_parked_request :: proc(t: ^testing.T) {
 			testing.expectf(t, log.dispatched == 2, "split=%v body=%q: the next stream was not served", split, body)
 
 			conn_done(t, c, &track, "trailers on a parked request")
-			mem.tracking_allocator_destroy(&track)
 		}
 	}
 }
@@ -3204,7 +3200,6 @@ test_malformed_trailers_are_a_stream_error :: proc(t: ^testing.T) {
 			}
 
 			conn_done(t, c, &track, "malformed trailers")
-			mem.tracking_allocator_destroy(&track)
 		}
 	}
 }
@@ -3249,7 +3244,6 @@ test_headers_after_end_stream_is_a_stream_error :: proc(t: ^testing.T) {
 		}
 
 		conn_done(t, c, &track, "headers after end stream")
-		mem.tracking_allocator_destroy(&track)
 	}
 }
 

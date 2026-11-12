@@ -58,7 +58,9 @@ ELODIN_SAN :: "DNS:elodin.local,DNS:localhost,IP:127.0.0.1"
 // if missing; `san` is the subjectAltName, or none when empty.
 @(private)
 self_signed :: proc(dir, cert, key, days, subject, san: string) -> bool {
-	if !os.exists(dir) && os.make_directory(dir) != nil {
+	// Tests running beside this one make the same directory; one of them
+	// making it first is not a failure.
+	if !os.exists(dir) && os.make_directory(dir) != nil && !os.exists(dir) {
 		return false
 	}
 	args := make([dynamic]string, context.temp_allocator)

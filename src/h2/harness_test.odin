@@ -106,8 +106,8 @@ log_write :: proc(user: rawptr, buf: []u8) -> bool {
 @(private)
 count_frames :: proc(log: ^Frame_Log, type: Frame_Type, stream_id: Maybe(u32) = nil) -> int {
 	n := 0
+	id, one := stream_id.?
 	for f in log.frames {
-		id, one := stream_id.?
 		if f.type == type && (!one || f.stream_id == id) {
 			n += 1
 		}
