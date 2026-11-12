@@ -5,16 +5,18 @@ argument-hint: <issue-number>
 disable-model-invocation: true
 ---
 
-Solve https://github.com/jadolg/elodin/issues/$ARGUMENTS now, from reading the issue to merging the fix, without stopping except where this file says to.
+Solve <https://github.com/jadolg/elodin/issues/$ARGUMENTS> now, from reading the issue to merging the fix, without stopping except where this file says to.
 
 If `$ARGUMENTS` isn't a single issue number, or the current repo isn't jadolg/elodin, stop and ask.
 
 **Paths.** Nothing here is tied to one machine. Work out these three once, at the start, and use the real paths from then on (shell variables don't survive between commands):
+
 - `$ROOT`, the primary checkout: `dirname "$(git rev-parse --path-format=absolute --git-common-dir)"`. This works from the primary checkout and from any worktree of it.
 - `$WT`, this issue's worktree: `$(dirname "$ROOT")/elodin-$ARGUMENTS`, a sibling of `$ROOT`.
 - `$SCRATCH`, repro fixtures that outlive the session: `$(dirname "$ROOT")/elodin-review-scratch`. Don't use the session scratchpad, which other sessions can't read and which is cleaned up.
 
 ## 0. Preflight
+
 - Check the clock: `chronyc tracking` (or `timedatectl` where chrony isn't installed). If it's off, step it (`sudo -n chronyc makestep`) first. A skewed clock breaks `gh` TLS, live DNSSEC and every deadline test.
 - Record the state of the primary tree (`git -C $ROOT log --oneline -1; git -C $ROOT status --short`). It's shared with other sessions, so never switch its branch or edit it.
 - `git fetch origin`, then `gh issue view $ARGUMENTS --comments`.
@@ -23,13 +25,16 @@ If `$ARGUMENTS` isn't a single issue number, or the current repo isn't jadolg/el
 - **Security mode** is on when the issue has the `security` label, or when you judge it security-relevant (say so when you turn it on without the label). In security mode: fix it correctly and leave no hole behind. After fixing, review your own diff as an attacker would. Check that the fix opens no new hole: a new allocation, a new bound, a new parse, or a new branch an attacker can steer.
 
 ## 1. Worktree
+
 Always start from the latest `main` on GitHub. The local `main` ref in the primary tree is routinely behind, and an old worktree or branch is too, so never start from either.
+
 ```
 git fetch origin main
 git worktree add -b fix/$ARGUMENTS-<slug> $WT origin/main
 git -C $WT rev-parse HEAD   # must equal:
 git ls-remote origin refs/heads/main
 ```
+
 - The two hashes must match. If they don't, fetch again and recreate the worktree.
 - If a worktree or branch for this issue already exists from an earlier attempt, look at it first:
   - Unpushed work worth keeping gets rebased onto the fresh `origin/main`.
@@ -40,6 +45,7 @@ git ls-remote origin refs/heads/main
 Do all the work there. Don't use `Agent` with `isolation: "worktree"`, because the sandbox breaks it. Other sessions work in other worktrees at the same time.
 
 ## 2. Understand before touching anything
+
 - Trace the whole path, from the socket to the answer. Grep every caller of the function you'll change.
 - List the variants of the bug, meaning the same mistake reached by another road:
   - other transports: UDP, TCP, DoT, DoH over h1 and h2, client side and upstream side;
@@ -67,6 +73,7 @@ Do all the work there. Don't use `Agent` with `isolation: "worktree"`, because t
   - The failing test in step 3 is the new behaviour, written as a test before the feature exists.
 
 ## 3. Reproduce it with a failing test
+
 Pick the layer that shows the bug. Often that means more than one:
 
 | Layer | Where | When |
@@ -81,6 +88,7 @@ Pick the layer that shows the bug. Often that means more than one:
 - Tests run in parallel, so don't mutate package state that other tests read. fd 0 is closed under `odin test`, so a zero socket handle is someone else's socket. Scratch paths carry the pid.
 
 **Test rules.** The #638 audit found every one of these broken across the tree. They apply to every test you write, review-round tests included:
+
 - **Every assertion must be able to fail.** Mutation-prove each new test, not only the headline one: break what it guards, and watch it fail for the stated reason. The audit's vacuous tests:
   - `testing.expect(t, cond, "…%v", x)`: `expect` doesn't format, so use `expectf`;
   - a fixture refused for some other reason (a 30-character secret where 32 are needed), so the code under test is never reached;
@@ -100,6 +108,7 @@ Pick the layer that shows the bug. Often that means more than one:
 - **Readable tables.** Table rows with more than one bool use named fields. Look up fixtures by key, not by index.
 
 ## 4. Fix
+
 - Fix the root cause, in the shared function every caller goes through.
 - Limits: keep them flat, charge them to the part that amplifies, and make sure they survive a decode → re-encode → decode round trip. Bound the wait, not the timeout a member is judged on. Charge every attempt. A bound needs a number for each thread model.
 - Every bound or guard the fix adds gets a test of its own. Guards that depend on the clock need a tick clock.
@@ -133,6 +142,7 @@ Pick the layer that shows the bug. Often that means more than one:
 - **Prove the test has teeth:** revert the fix at the call site (not the procedure, since `odin build` compiles test files too), check that the unit test and the itest fail, then restore the fix from a copy you took first. Do this yourself, because a reviewer's sandbox refuses the revert on security code.
 
 ## 5. Parity and fuzzing
+
 - Always run `mise run parity-regression`, plus `./bin/itest --parity --parity-scenario all --parity-runs 400` for anything on the answer path.
 - If the fix changes what reaches the client, decide whether that's a bug or a new entitled difference. An entitled difference gets an entry in `src/itest/parity_compare.odin`, with its reason and citation.
 - If the generator or mock can't produce the shape of this bug, extend them so parity would have caught it. Prove the new check by mutating the code. A seed that finds a divergence goes in `testdata/parity-seeds`.
@@ -140,6 +150,7 @@ Pick the layer that shows the bug. Often that means more than one:
 - A changed parser needs `mise run fuzz-regression`, plus a corpus seed for the new shape. A new parser gets a new target under `src/fuzz/`.
 
 ## 6. Docs and comments, with every change
+
 Every change updates whatever documents that behaviour, in the same commit. That includes review-round fixes and changes made along the way. Never leave it for a later audit.
 
 **Before every commit,** take each symbol, config key, default, limit, rcode/EDE, log string and metric that the diff changes, renames or removes. Grep `src/`, `docs/`, `examples/` and `README.md` for each one, and fix every comment or doc that still describes the old behaviour, including in files the diff doesn't otherwise touch.
@@ -147,6 +158,7 @@ Every change updates whatever documents that behaviour, in the same commit. That
 **When a change retires a model** (the thread pool before #547, a setting that reload now applies, a removed key), also grep for the old model's vocabulary (`worker`, `thread per connection`, `fixed for the life of the process`, `RLIMIT_NPROC`, …). Comments written for the old model were the audit's most misleading findings, because they make the cache-soundness reasoning wrong. User-facing text that names a release ("refused from 0.26.0") gets checked against the current version.
 
 The docs are an operator reference. Update each place the change reaches:
+
 - `docs/<topic>.md`: every key, default, limit, rcode/EDE, log string or `detail`, metric and startup warning the change adds or alters. Add a clause of *why* only when it changes what an operator configures. Leave out history, issue archaeology and design argument.
 - `docs/metrics.md` and `examples/grafana-dashboard.json` for a metric.
 - `examples/*.yaml` (the annotated references) for a config key or default.
@@ -155,7 +167,9 @@ The docs are an operator reference. Update each place the change reaches:
 - Check every claim you write against the code.
 
 ## 7. Local gates
+
 Run these in the worktree before every push:
+
 ```
 mise run check
 odin check src/<pkg> -collection:elodin=src -vet -strict-style -no-entry-point   # each touched package, including src/itest
@@ -167,15 +181,18 @@ mise run leakcheck         # if the change allocates or frees
 # audit patterns in the lines this branch adds; fix each hit or say in the PR why it stays
 git diff -U0 origin/main -- '*.odin' | grep -E '^\+[^+]' | grep -nE 'used to|no longer|\bnow\b|before this|the fix\b|\btoday\b|time\.sleep|time\.now\(|, _ :?=|^\+\s*_ = |testing\.expect\(t, [^)]*%|\.odin:[0-9]+'
 ```
+
 - **Another session's itest collides on ports.** Check with a `/proc` walk for cmdline starting with `./bin/itest`, not `pgrep -f`, which matches itself. Wait it out, and never kill it.
 - **Deadline tests failing in a batch:** check `chronyc tracking`, then run the package on a detached `origin/main` worktree before blaming the diff. If it isn't the diff, it's still a flake to fix, not to rerun past (see step 11.5).
 - **Never `pkill` elodin.** Kill only by PID.
 - Check for IPv6 egress once: `timeout 4 bash -c 'exec 3<>/dev/tcp/2001:4860:4860::8888/53'`. A v6 route alone doesn't prove it. Without egress, local v6 tests always fail, so probe v6 behaviour from outside with Globalping.
 
 ## 8. Other defects found along the way: fix them here
+
 Fix it in this PR by default. A follow-up issue is the exception, and needs a reason you can state.
 
 **Fix in this PR** (with its own test, listed in the PR description) when any of these holds:
+
 - It's a variant of the bug you're fixing (see step 2), or the same mistake in a nearby function, or a missed edge case.
 - It's in code this PR already touches, or in code the fix depends on.
 - A reviewer found it during the loop and you confirmed it (step 10.5). Confirmed review findings are part of this PR, not follow-ups.
@@ -184,6 +201,7 @@ Fix it in this PR by default. A follow-up issue is the exception, and needs a re
 - An RFC settles what's correct, or comparing other implementations does (step 2). Then it isn't a "design question".
 
 **File a follow-up issue only** when the defect is truly unrelated (a different subsystem and a different root cause) **and** at least one of these holds:
+
 - Fixing it needs a design decision, a behaviour or config change the user should approve, or a new dependency.
 - It would grow this PR into a second, independent change that deserves its own review.
 - It can't be verified here (it needs IPv6 egress this machine lacks, the production box at elodin.akiel.dev, or a real resolver's live behaviour).
@@ -191,6 +209,7 @@ Fix it in this PR by default. A follow-up issue is the exception, and needs a re
 "It's out of scope", "it's a separate concern" or "to keep the PR small" aren't reasons on their own. If you're unsure, fix it.
 
 **Optimisations of code outside the ticket's change are the exception:** they always become an issue, never part of this PR. Label it `enhancement` with a `priority:*` (the repo has no performance label), and give:
+
 - where the waste is, with permalinks;
 - your idea for removing it, and what it should save (bytes, allocations, CPU);
 - the command that measures it. Add a quick measurement too if one costs minutes; don't build a bench for it.
@@ -198,6 +217,7 @@ Fix it in this PR by default. A follow-up issue is the exception, and needs a re
 An optimisation that is a defect (unbounded growth, a leak, work an attacker can multiply) is not an optimisation; it follows the rules above.
 
 A follow-up issue is filed only for a defect you've proven, by the same bar as a review finding (step 10.5). If you can't reproduce it, don't file it; record it as rejected, with what you tried. The issue gets:
+
 - labels: a type (`bug` or `enhancement`), `severity:*`, `priority:*`, and `security` where it applies;
 - the `origin/main` commit it was reproduced at;
 - steps to reproduce: the exact commands, plus the failing test or script pasted in full so anyone can run it without this machine (also keep the fixture under `$SCRATCH/<date>/`), and the output you observed;
@@ -206,6 +226,7 @@ A follow-up issue is filed only for a defect you've proven, by the same bar as a
 - the reason it wasn't fixed here.
 
 ## 9. Commit and PR
+
 - **Commit subject:** `<pkg>: <the behaviour as it now is> (#$ARGUMENTS)`, e.g. `upstream: a referral is not an answer (#410)`. The body gives the problem and the fix in prose, and ends with the attribution line.
 - **Before every push:** `git diff --stat origin/main`. More files than you touched means the base moved. Rebase, and never `reset --soft origin/main`.
 - **PR title:** the same as the commit subject.
@@ -221,7 +242,9 @@ A follow-up issue is filed only for a defect you've proven, by the same bar as a
   - a done/declined map of the issue's requests, with links to the comments that decline any.
 
 ## 10. Review/fix loop
+
 Each round:
+
 1. Refresh the local `main` ref and record the primary tree's state.
 2. Run `/code-review high <PR>`, without `--fix`. Nothing the reviewer says reaches the branch until you've proven it.
 3. Afterwards, restore the primary tree exactly as you recorded it, and remove any worktree the agent made. It has used your worktree, a worktree of its own, and the primary tree.
@@ -237,17 +260,20 @@ Each round:
 8. Update the docs and comments the round's fixes reach (steps 4 and 6). Run the gates, then commit as `<pkg>: review round K - <what changed>` and push.
 
 **Don't go in circles.** The `## Decisions` section in the PR body is the loop's memory:
+
 - Record each decision as you make it: the choice, the RFC section behind it (or, where the RFCs are silent, what the other implementations do), the invariant that makes it safe, and what the rejected option costs.
 - A finding that argues against RFC-backed behaviour is declined, citing the section, unless it shows the RFC was misread.
 - Before acting on a finding, check it against Decisions. Don't reverse a recorded decision unless there's new evidence.
 - On the second finding that contradicts an earlier one, stop changing code. First look for a way both sides can hold (e.g. separate keys or separate budgets). If there isn't one, record the trade-off instead of flipping it back.
 
 **When to stop:**
+
 - Stop after a round with no confirmed high or medium findings. Rejected findings don't count. In that round, fix only confirmed lows that change behaviour or would mislead an operator; the round comment covers the rest.
 - If most of a round's findings are defects in the previous round's fix, batch them rather than start another cycle.
 - **At round 10, stop and ask the user what to do.** Do not merge.
 
 ## 11. Merge
+
 1. `git fetch origin`, then re-read the log over the files you touched. If main has since decided the question the other way, drop your fix.
 2. Rebase on `origin/main`, then `git diff --stat origin/main`.
 3. Run the gates in step 7 on the rebased head, and push.
@@ -262,6 +288,7 @@ Each round:
    If it fails, go back to step 1.
 
 After the merge:
+
 - Check that the issue closed. If it didn't, comment on it and close it.
 - Remove the worktree (`git worktree remove $WT`) and delete the local branch.
 - Report:
