@@ -9,9 +9,14 @@ Solve https://github.com/jadolg/elodin/issues/$ARGUMENTS now, from reading the i
 
 If `$ARGUMENTS` isn't a single issue number, or the current repo isn't jadolg/elodin, stop and ask.
 
+**Paths.** Nothing here is tied to one machine. Work out these three once, at the start, and use the real paths from then on (shell variables don't survive between commands):
+- `$ROOT`, the primary checkout: `dirname "$(git rev-parse --path-format=absolute --git-common-dir)"`. This works from the primary checkout and from any worktree of it.
+- `$WT`, this issue's worktree: `$(dirname "$ROOT")/elodin-$ARGUMENTS`, a sibling of `$ROOT`.
+- `$SCRATCH`, repro fixtures that outlive the session: `$(dirname "$ROOT")/elodin-review-scratch`. Don't use the session scratchpad, which other sessions can't read and which is cleaned up.
+
 ## 0. Preflight
-- `chronyc tracking`. If the clock is off, run `sudo -n chronyc makestep` first. A skewed clock breaks `gh` TLS, live DNSSEC and every deadline test.
-- Record the state of the primary tree (`git -C /home/ubuntu/elodin log --oneline -1; git -C /home/ubuntu/elodin status --short`). It's shared with other sessions, so never switch its branch or edit it.
+- Check the clock: `chronyc tracking` (or `timedatectl` where chrony isn't installed). If it's off, step it (`sudo -n chronyc makestep`) first. A skewed clock breaks `gh` TLS, live DNSSEC and every deadline test.
+- Record the state of the primary tree (`git -C $ROOT log --oneline -1; git -C $ROOT status --short`). It's shared with other sessions, so never switch its branch or edit it.
 - `git fetch origin`, then `gh issue view $ARGUMENTS --comments`.
 - Check whether it's already fixed: `git log -S '<guard or symbol>' origin/main` and the recent log over the files involved. Sibling PRs often close holes without linking the issue. If it's fixed, show that at `origin/main` with a test, comment, and close the issue.
 - List every request in the issue. Each one must end up done, or declined with a reason posted on the issue.
@@ -21,8 +26,8 @@ If `$ARGUMENTS` isn't a single issue number, or the current repo isn't jadolg/el
 Always start from the latest `main` on GitHub. The local `main` ref in the primary tree is routinely behind, and an old worktree or branch is too, so never start from either.
 ```
 git fetch origin main
-git worktree add -b fix/$ARGUMENTS-<slug> /home/ubuntu/elodin-$ARGUMENTS origin/main
-git -C /home/ubuntu/elodin-$ARGUMENTS rev-parse HEAD   # must equal:
+git worktree add -b fix/$ARGUMENTS-<slug> $WT origin/main
+git -C $WT rev-parse HEAD   # must equal:
 git ls-remote origin refs/heads/main
 ```
 - The two hashes must match. If they don't, fetch again and recreate the worktree.
@@ -165,7 +170,7 @@ git diff -U0 origin/main -- '*.odin' | grep -E '^\+[^+]' | grep -nE 'used to|no 
 - **Another session's itest collides on ports.** Check with a `/proc` walk for cmdline starting with `./bin/itest`, not `pgrep -f`, which matches itself. Wait it out, and never kill it.
 - **Deadline tests failing in a batch:** check `chronyc tracking`, then run the package on a detached `origin/main` worktree before blaming the diff. If it isn't the diff, it's still a flake to fix, not to rerun past (see step 11.5).
 - **Never `pkill` elodin.** Kill only by PID.
-- No IPv6 egress here. Probe v6 behaviour from outside with Globalping.
+- Check for IPv6 egress once: `timeout 4 bash -c 'exec 3<>/dev/tcp/2001:4860:4860::8888/53'`. A v6 route alone doesn't prove it. Without egress, local v6 tests always fail, so probe v6 behaviour from outside with Globalping.
 
 ## 8. Other defects found along the way: fix them here
 Fix it in this PR by default. A follow-up issue is the exception, and needs a reason you can state.
@@ -181,7 +186,7 @@ Fix it in this PR by default. A follow-up issue is the exception, and needs a re
 **File a follow-up issue only** when the defect is truly unrelated (a different subsystem and a different root cause) **and** at least one of these holds:
 - Fixing it needs a design decision, a behaviour or config change the user should approve, or a new dependency.
 - It would grow this PR into a second, independent change that deserves its own review.
-- It can't be verified here (it needs IPv6 egress, the production box at elodin.akiel.dev, or a real resolver's live behaviour).
+- It can't be verified here (it needs IPv6 egress this machine lacks, the production box at elodin.akiel.dev, or a real resolver's live behaviour).
 
 "It's out of scope", "it's a separate concern" or "to keep the PR small" aren't reasons on their own. If you're unsure, fix it.
 
@@ -195,7 +200,7 @@ An optimisation that is a defect (unbounded growth, a leak, work an attacker can
 A follow-up issue is filed only for a defect you've proven, by the same bar as a review finding (step 10.5). If you can't reproduce it, don't file it; record it as rejected, with what you tried. The issue gets:
 - labels: a type (`bug` or `enhancement`), `severity:*`, `priority:*`, and `security` where it applies;
 - the `origin/main` commit it was reproduced at;
-- steps to reproduce: the exact commands, plus the failing test or script pasted in full so anyone can run it without this box (also keep the fixture under `/home/ubuntu/elodin-review-scratch/<date>/`, not the scratchpad), and the output you observed;
+- steps to reproduce: the exact commands, plus the failing test or script pasted in full so anyone can run it without this machine (also keep the fixture under `$SCRATCH/<date>/`), and the output you observed;
 - expected vs actual, and what decides "expected": the RFC section with its rfc-editor.org link, the project doc, or the other implementations' source or docs, each linked;
 - permalinks to the code at fault, at that commit;
 - the reason it wasn't fixed here.
@@ -258,7 +263,7 @@ Each round:
 
 After the merge:
 - Check that the issue closed. If it didn't, comment on it and close it.
-- Remove the worktree (`git worktree remove /home/ubuntu/elodin-$ARGUMENTS`) and delete the local branch.
+- Remove the worktree (`git worktree remove $WT`) and delete the local branch.
 - Report:
   - the PR link;
   - the root cause, in one line;
