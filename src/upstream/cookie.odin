@@ -25,8 +25,11 @@ Held per upstream: a different server learns a different client cookie, so the
 cookie cannot be used to correlate this resolver across the servers it asks.
 */
 
+@(private)
 COOKIE_CLIENT_LEN :: 8
+@(private)
 COOKIE_SERVER_MIN :: 8
+@(private)
 COOKIE_SERVER_MAX :: 32
 
 @(private)
@@ -149,7 +152,7 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 		expected = asked_with_cookie
 	}
 
-	raw, found := dns.peek_edns_option(response, .Cookie)
+	raw, found := reply_cookie(response)
 	if !found {
 		return !expected
 	}

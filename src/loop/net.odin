@@ -47,16 +47,15 @@ assert_nonblocking :: proc(fd: linux.Fd, loc := #caller_location) {
 }
 
 /*
-The deadline a socket timeout option gives a call that began at `start`, or the
-zero tick for none.
+The timeout a socket option (`.RCVTIMEO`, `.SNDTIMEO`) holds, zero for none or
+one that cannot be read.
 
 Read with the system call itself: `core:sys/linux`'s `getsockopt` passes the size
 of the pointer it is given as the option's length, which for a `timeval` is half
 of it, and the kernel refuses the read - every socket would look as if it had no
 timeout, and a wait meant to end would last for ever.
 */
-@(private)
-socket_deadline :: proc(fd: linux.Fd, option: linux.Socket_Option, start: Tick) -> Tick {
+socket_timeout :: proc(fd: linux.Fd, option: linux.Socket_Option) -> time.Duration {
 	tv: linux.Time_Val
 	size := u32(size_of(tv))
 	ret := intrinsics.syscall(
@@ -67,10 +66,20 @@ socket_deadline :: proc(fd: linux.Fd, option: linux.Socket_Option, start: Tick) 
 		uintptr(&tv),
 		uintptr(&size),
 	)
-	if int(ret) < 0 || (tv.seconds == 0 && tv.microseconds == 0) {
+	if _, err := syscall_result(ret); err != .NONE {
+		return 0
+	}
+	return time.Duration(tv.seconds) * time.Second + time.Duration(tv.microseconds) * time.Microsecond
+}
+
+// The deadline a socket timeout option gives a call that began at `start`, or
+// the zero tick for none.
+@(private)
+socket_deadline :: proc(fd: linux.Fd, option: linux.Socket_Option, start: Tick) -> Tick {
+	d := socket_timeout(fd, option)
+	if d == 0 {
 		return {}
 	}
-	d := time.Duration(tv.seconds) * time.Second + time.Duration(tv.microseconds) * time.Microsecond
 	return time.tick_add(start, d)
 }
 

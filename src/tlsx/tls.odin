@@ -347,28 +347,24 @@ client_context :: proc(
 	ctx: ^Context,
 	err: Error,
 ) {
-	init()
-	ptr := SSL_CTX_new(TLS_client_method())
+	ptr := new_ssl_ctx(server = false)
 	if ptr == nil {
 		return nil, .Context_Failed
 	}
-	if !ssl_ctx_set_min_proto_version(ptr, TLS1_2_VERSION) {
+	ok := false
+	defer if !ok {
 		SSL_CTX_free(ptr)
-		return nil, .Context_Failed
 	}
-	// Pooled upstream connections sit idle too; see `server_context`.
-	ssl_ctx_set_mode(ptr, SSL_MODE_RELEASE_BUFFERS)
 
 	if verify {
-		ok: c.int
+		loaded: c.int
 		if ca_file != "" {
 			cpath := strings.clone_to_cstring(ca_file, context.temp_allocator)
-			ok = SSL_CTX_load_verify_locations(ptr, cpath, nil)
+			loaded = SSL_CTX_load_verify_locations(ptr, cpath, nil)
 		} else {
-			ok = SSL_CTX_set_default_verify_paths(ptr)
+			loaded = SSL_CTX_set_default_verify_paths(ptr)
 		}
-		if ok != 1 {
-			SSL_CTX_free(ptr)
+		if loaded != 1 {
 			return nil, .Certificate_Failed
 		}
 		SSL_CTX_set_verify(ptr, SSL_VERIFY_PEER, nil)
@@ -378,21 +374,47 @@ client_context :: proc(
 
 	if len(alpn) > 0 {
 		if !alpn_encodable(alpn) {
-			SSL_CTX_free(ptr)
 			return nil, .Alpn_Failed
 		}
 		wire := encode_alpn(alpn, context.temp_allocator)
 		if SSL_CTX_set_alpn_protos(ptr, raw_data(wire), c.uint(len(wire))) != 0 {
-			SSL_CTX_free(ptr)
 			return nil, .Alpn_Failed
 		}
 	}
 
+	ok = true
 	ctx = new(Context, allocator)
 	ctx.ptr = ptr
 	ctx.allocator = allocator
 	ctx.verify = verify
 	return ctx, .None
+}
+
+/*
+A fresh `SSL_CTX` for either end, held to TLS 1.2 or later, or nil.
+
+Idle connections hand their record buffers back. Without the mode OpenSSL keeps
+its record buffers, ~17 KB each, for the connection's whole life; with it a
+buffer is freed once empty and reallocated when the next record arrives or is
+sent. Measured on 1,000 idle DoT and DoH/2 connections it saves ~20 KB each
+(#595). Per-query CPU is unchanged on TCP, UDP, DoT and DoH/1.1; DoH/2 reads
+1 µs slower (17 to 18), the bench's resolution, in every round. dnsdist (its
+`releaseBuffers` default), nginx and HAProxy set it too; Unbound does not.
+Pooled upstream connections sit idle too, so the client sets it as well.
+*/
+@(private)
+new_ssl_ctx :: proc(server: bool) -> ^SSL_CTX {
+	init()
+	ptr := SSL_CTX_new(TLS_server_method() if server else TLS_client_method())
+	if ptr == nil {
+		return nil
+	}
+	if !ssl_ctx_set_min_proto_version(ptr, TLS1_2_VERSION) {
+		SSL_CTX_free(ptr)
+		return nil
+	}
+	ssl_ctx_set_mode(ptr, SSL_MODE_RELEASE_BUFFERS)
+	return ptr
 }
 
 /*
@@ -466,26 +488,14 @@ server_context :: proc(
 	ctx: ^Context,
 	err: Error,
 ) {
-	init()
-	ptr := SSL_CTX_new(TLS_server_method())
+	ptr := new_ssl_ctx(server = true)
 	if ptr == nil {
 		return nil, .Context_Failed
 	}
-	if !ssl_ctx_set_min_proto_version(ptr, TLS1_2_VERSION) {
+	ok := false
+	defer if !ok {
 		SSL_CTX_free(ptr)
-		return nil, .Context_Failed
 	}
-	/*
-	Idle connections hand their record buffers back. Without the mode OpenSSL
-	keeps its record buffers, ~17 KB each, for the connection's whole life; with
-	it a buffer is freed once empty and reallocated when the next record arrives
-	or is sent. Measured on 1,000 idle DoT and DoH/2 connections it saves ~20 KB
-	each (#595). Per-query CPU is unchanged on TCP, UDP, DoT and DoH/1.1; DoH/2
-	reads 1 µs slower (17 to 18), the bench's resolution, in every round.
-	dnsdist (its `releaseBuffers` default), nginx and HAProxy set it too;
-	Unbound does not.
-	*/
-	ssl_ctx_set_mode(ptr, SSL_MODE_RELEASE_BUFFERS)
 	/*
 	No server-side session cache: resumption is by ticket alone.
 
@@ -504,22 +514,18 @@ server_context :: proc(
 	// Rotated, rather than OpenSSL's one key for the life of the context; see
 	// `TICKET_KEY_INTERVAL`.
 	if !install_ticket_keys(ptr) {
-		SSL_CTX_free(ptr)
 		return nil, .Context_Failed
 	}
 
 	ccert := strings.clone_to_cstring(cert_file, context.temp_allocator)
 	ckey := strings.clone_to_cstring(key_file, context.temp_allocator)
 	if SSL_CTX_use_certificate_chain_file(ptr, ccert) != 1 {
-		SSL_CTX_free(ptr)
 		return nil, .Certificate_Failed
 	}
 	if SSL_CTX_use_PrivateKey_file(ptr, ckey, SSL_FILETYPE_PEM) != 1 {
-		SSL_CTX_free(ptr)
 		return nil, .Certificate_Failed
 	}
 	if SSL_CTX_check_private_key(ptr) != 1 {
-		SSL_CTX_free(ptr)
 		return nil, .Certificate_Failed
 	}
 
@@ -528,11 +534,11 @@ server_context :: proc(
 		// it on every handshake, including handshakes still running after a
 		// reload has released the wrapper. See `alpn_ex_index`.
 		if aerr := install_alpn(ptr, alpn_protocols); aerr != .None {
-			SSL_CTX_free(ptr)
 			return nil, aerr
 		}
 	}
 
+	ok = true
 	ctx = new(Context, allocator)
 	ctx.ptr = ptr
 	ctx.is_server = true
@@ -799,21 +805,11 @@ halves take this before their handshake.
 */
 @(private)
 adopt_socket :: proc(conn: ^Conn) {
-	conn.read_timeout_ns = i64(socket_timeout(conn.socket, .RCVTIMEO))
-	conn.write_timeout_ns = i64(socket_timeout(conn.socket, .SNDTIMEO))
+	conn.read_timeout_ns = i64(loop.socket_timeout(linux.Fd(socket_fd(conn.socket)), .RCVTIMEO))
+	conn.write_timeout_ns = i64(loop.socket_timeout(linux.Fd(socket_fd(conn.socket)), .SNDTIMEO))
 	_ = net.set_blocking(conn.socket, false)
 }
 
-// Zero when the caller set none, which means waits on this socket are unbounded.
-@(private)
-socket_timeout :: proc(socket: net.TCP_Socket, option: posix.Sock_Option) -> time.Duration {
-	tv: posix.timeval
-	length := posix.socklen_t(size_of(tv))
-	if posix.getsockopt(posix.FD(socket_fd(socket)), posix.SOL_SOCKET, option, &tv, &length) != .OK {
-		return 0
-	}
-	return time.Duration(tv.tv_sec) * time.Second + time.Duration(tv.tv_usec) * time.Microsecond
-}
 
 /*
 Change how long this connection waits.
@@ -996,8 +992,10 @@ close :: proc(conn: ^Conn) {
 		// taking the lock costs nothing here and keeps the rule about this `SSL`
 		// object true right to the end of its life.
 		sync.mutex_lock(&conn.mu)
+		ssl_enter(conn)
 		SSL_shutdown(conn.ssl)
 		SSL_free(conn.ssl)
+		ssl_leave(conn)
 		conn.ssl = nil
 		sync.mutex_unlock(&conn.mu)
 	}

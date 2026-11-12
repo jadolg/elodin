@@ -3763,11 +3763,12 @@ response, or a Response left at its zero status - goes out as 500 (#642).
 */
 @(test)
 test_status_text_is_the_code :: proc(t: ^testing.T) {
+	buf: [3]u8
 	for code in 200 ..= 599 {
-		testing.expect_value(t, status_text(code), fmt.tprintf("%d", code))
+		testing.expect_value(t, status_text(&buf, code), fmt.tprintf("%d", code))
 	}
 	for code in ([]int{min(int), -1, 0, 99, 100, 101, 199, 600, 1000, max(int)}) {
-		testing.expect_value(t, status_text(code), "500")
+		testing.expect_value(t, status_text(&buf, code), "500")
 	}
 	free_all(context.temp_allocator)
 }

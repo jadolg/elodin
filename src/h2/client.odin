@@ -99,7 +99,7 @@ Client_Stream :: struct {
 	*/
 	rst_sent:    bool,
 	// DATA payload taken on this stream, padding included: what it has spent of
-	// its flow-control window. See CLIENT_RECV_WINDOW.
+	// its flow-control window. See RECV_WINDOW.
 	received:    int,
 	// Whether this stream's answer has refunded its control frame; see
 	// client_finish_headers. Not `status != 0`: a malformed :status reads as 0.
@@ -137,25 +137,12 @@ Client_Error :: enum u8 {
 	// again (RFC 9113 8.7).
 	Refused,
 	Timeout,
-	// This end reset the stream: the response ran past CLIENT_MAX_BODY, or
+	// This end reset the stream: the response ran past MAX_BODY, or
 	// spent half the receive window. What the peer sent, not a reset it chose,
 	// so the caller can report it as the HTTP/1.1 client does. The response
 	// carries the status, and no body.
 	Too_Large,
 }
-
-// Advertised receive window: generous, so we are never the reason a DoH
-// response stalls. Answers are tiny; this covers many of them arriving at
-// once across every multiplexed stream. Well past CLIENT_MAX_BODY, so a stream
-// is never given more than this and only the connection window needs
-// replenishing. Padding spends the window without growing the body, so a
-// stream is also reset once half the window has gone (Client_Stream.received),
-// rather than left to stall with none.
-CLIENT_RECV_WINDOW :: 1 << 20
-// Bound on one response body: a DNS message, which RFC 8484 6 holds to 65535
-// bytes. Written out rather than taken from `dns.MAX_MESSAGE`, and `upstream`
-// asserts the two agree.
-CLIENT_MAX_BODY :: 65535
 
 client_make :: proc(io: IO, allocator := context.allocator) -> ^Client {
 	c := new(Client, allocator)
@@ -248,43 +235,14 @@ client_serve :: proc(c: ^Client) {
 		loop.unlock(&c.mu)
 	}
 
-	header: [FRAME_HEADER_SIZE]u8
-	// An upstream that keeps the socket readable never lets this reader park, and
-	// the queries waiting on its answers may be on the same loop: counted per
-	// frame as well as per socket call, as in `serve`. See `loop.take_turn`.
 	for {
-		loop.take_turn()
-		if !client_read_exact(c, header[:]) {
-			return
-		}
-		h, ok := parse_frame_header(header[:])
+		h, payload, refuse, ok := read_frame(c.io, c.continuation_on)
 		if !ok {
-			return
-		}
-		// Bounded at the frame size we advertise, not at the receive window: we
-		// send no SETTINGS_MAX_FRAME_SIZE, so an upstream is held to the RFC 9113
-		// 6.5.2 default (16384). The window still caps how much of a response we
-		// buffer; this caps a single frame off the wire.
-		if h.length > DEFAULT_MAX_FRAME {
-			client_goaway(c, .Frame_Size_Error)
-			return
-		}
-
-		payload: []u8
-		if h.length > 0 {
-			payload = make([]u8, h.length, context.temp_allocator)
-			if !client_read_exact(c, payload, starts_frame = false) {
-				return
+			if code, bad := refuse.?; bad {
+				client_goaway(c, code)
 			}
-		}
-
-		// A response header block may not be interrupted by frames for other
-		// streams.
-		if c.continuation_on != 0 && (h.type != .Continuation || h.stream_id != c.continuation_on) {
-			client_goaway(c, .Protocol_Error)
 			return
 		}
-
 		if !client_handle_frame(c, h, payload) {
 			return
 		}
@@ -293,31 +251,8 @@ client_serve :: proc(c: ^Client) {
 }
 
 @(private)
-client_read_exact :: proc(c: ^Client, buf: []u8, starts_frame := true) -> bool {
-	// One whole thing off the wire starts here, as it does in `read_exact` on the
-	// server side, and for the same reason. See `IO`.
-	if c.io.begin != nil {
-		c.io.begin(c.io.user, starts_frame)
-	}
-	got := 0
-	for got < len(buf) {
-		n, ok := c.io.read(c.io.user, buf[got:])
-		if !ok || n <= 0 {
-			return false
-		}
-		got += n
-	}
-	return true
-}
-
-@(private)
 client_write_all :: proc(c: ^Client, buf: []u8) -> bool {
-	loop.lock(&c.mu)
-	defer loop.unlock(&c.mu)
-	if c.closed {
-		return false
-	}
-	return c.io.write(c.io.user, buf)
+	return io_write_locked(c.io, &c.mu, &c.closed, buf)
 }
 
 @(private)
@@ -339,14 +274,14 @@ client_send_preface :: proc(c: ^Client) -> bool {
 	append(&out, 0, u8(Setting.Enable_Push))
 	append_u32(&out, 0)
 	append(&out, 0, u8(Setting.Initial_Window_Size))
-	append_u32(&out, CLIENT_RECV_WINDOW)
+	append_u32(&out, RECV_WINDOW)
 	// So an upstream is told the header bound rather than discovering it as a
 	// connection error.
 	append(&out, 0, u8(Setting.Max_Header_List_Size))
 	append_u32(&out, MAX_HEADER_LIST)
 
 	write_frame_header(&out, 4, .Window_Update, 0, 0)
-	append_u32(&out, CLIENT_RECV_WINDOW - DEFAULT_WINDOW)
+	append_u32(&out, RECV_WINDOW - DEFAULT_WINDOW)
 	return client_write_all(c, out[:])
 }
 
@@ -369,10 +304,7 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 		if h.flags & FLAG_ACK != 0 {
 			return true
 		}
-		out := make([dynamic]u8, 0, 17, context.temp_allocator)
-		write_frame_header(&out, 8, .Ping, FLAG_ACK, 0)
-		append(&out, ..payload)
-		return client_write_all(c, out[:])
+		return client_write_all(c, ping_ack_frame(payload))
 
 	case .Window_Update:
 		return client_handle_window_update(c, h, payload)
@@ -450,6 +382,11 @@ client_handle_settings :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bo
 	for i := 0; i + 6 <= len(payload); i += 6 {
 		id := Setting(read_u16(payload[i:]))
 		value := read_u32(payload[i + 2:])
+		if code, bad := setting_error(id, value); bad {
+			loop.unlock(&c.mu)
+			client_goaway(c, code)
+			return false
+		}
 		#partial switch id {
 		case .Enable_Push:
 			// RFC 9113 6.5.2: a server MUST NOT set it to 1, and a client
@@ -460,31 +397,13 @@ client_handle_settings :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bo
 				return false
 			}
 		case .Max_Frame_Size:
-			if value < DEFAULT_MAX_FRAME || value > 16777215 {
-				loop.unlock(&c.mu)
-				client_goaway(c, .Protocol_Error)
-				return false
-			}
 			c.peer_max_frame = int(value)
 		case .Max_Concurrent_Streams:
 			c.peer_max_streams = int(value)
 			// A raised limit lets a waiting request in.
 			loop.cond_broadcast(&c.slot_cond)
 		case .Initial_Window_Size:
-			if value > MAX_WINDOW {
-				loop.unlock(&c.mu)
-				client_goaway(c, .Flow_Control_Error)
-				return false
-			}
-			// A change retroactively adjusts every open stream's window; see the
-			// server's handle_settings for why the result needs checking too.
-			delta := int(value) - c.peer_initial_window
-			c.peer_initial_window = int(value)
-			overflow := false
-			for _, s in c.streams {
-				s.send_window += delta
-				overflow ||= s.send_window > MAX_WINDOW
-			}
+			overflow := apply_initial_window(&c.peer_initial_window, value, c.streams)
 			loop.cond_broadcast(&c.cond)
 			if overflow {
 				loop.unlock(&c.mu)
@@ -494,21 +413,14 @@ client_handle_settings :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bo
 		}
 	}
 	loop.unlock(&c.mu)
-
-	out := make([dynamic]u8, 0, FRAME_HEADER_SIZE, context.temp_allocator)
-	write_frame_header(&out, 0, .Settings, FLAG_ACK, 0)
-	return client_write_all(c, out[:])
+	return client_write_all(c, settings_ack_frame())
 }
 
 @(private)
 client_handle_window_update :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
-	if len(payload) != 4 {
-		client_goaway(c, .Frame_Size_Error)
-		return false
-	}
-	increment := int(read_u32(payload) & 0x7fff_ffff)
-	if increment == 0 {
-		client_goaway(c, .Protocol_Error)
+	increment, code, ok := window_increment(payload)
+	if !ok {
+		client_goaway(c, code)
 		return false
 	}
 
@@ -556,18 +468,9 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 		return false
 	}
 
-	body, ok := strip_padding(payload, h.flags)
+	block, code, ok := header_fragment(payload, h.flags)
 	if !ok {
-		client_goaway(c, .Protocol_Error)
-		return false
-	}
-	block, pok := strip_priority(body, h.flags)
-	if !pok {
-		client_goaway(c, .Protocol_Error)
-		return false
-	}
-	if len(block) > MAX_HEADER_LIST {
-		client_goaway(c, .Compression_Error)
+		client_goaway(c, code)
 		return false
 	}
 
@@ -594,36 +497,14 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 
 @(private)
 client_handle_continuation :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
-	// As on the server: no block open is no stream to continue, 0 included.
-	if c.continuation_on == 0 || c.continuation_on != h.stream_id {
-		client_goaway(c, .Protocol_Error)
+	complete, refuse := continue_header_block(&c.continuation_on, &c.continuation_frames, &c.header_scratch, h, payload)
+	if code, bad := refuse.?; bad {
+		client_goaway(c, code)
 		return false
 	}
-	/*
-	Bounded as it accumulates, for the same reason as the server side: neither
-	HEADERS nor CONTINUATION is flow-controlled, and HPACK's own limit lives in
-	`decode`, which never runs for a block whose END_HEADERS never arrives. An
-	upstream that sent these without end would otherwise grow this without end.
-
-	Counted as well, because a size cap is no cap against frames that carry
-	nothing: an empty CONTINUATION advances neither the block nor this check,
-	and holds the reader on a block that never ends.
-	*/
-	c.continuation_frames += 1
-	if c.continuation_frames > MAX_CONTINUATION_FRAMES {
-		client_goaway(c, .Enhance_Your_Calm)
-		return false
-	}
-	if len(c.header_scratch) + len(payload) > MAX_HEADER_LIST {
-		client_goaway(c, .Compression_Error)
-		return false
-	}
-	append(&c.header_scratch, ..payload)
-
-	if h.flags & FLAG_END_HEADERS == 0 {
+	if !complete {
 		return true
 	}
-	c.continuation_on = 0
 	return client_finish_headers(c, h.stream_id)
 }
 
@@ -829,16 +710,16 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 		loop.cond_broadcast(&c.cond)
 	} else if found && !already_ended {
 		s.received += len(payload)
-		// The second bound is on the window, not the body: see CLIENT_RECV_WINDOW.
-		if len(s.body) + len(data) > CLIENT_MAX_BODY || s.received > CLIENT_RECV_WINDOW / 2 {
+		// The second bound is on the window, not the body: see RECV_WINDOW.
+		if len(s.body) + len(data) > MAX_BODY || s.received > RECV_WINDOW / 2 {
 			oversized = true
 			s.reset = true
 			s.oversized = true
 		} else {
-			// Doubled, but never past CLIENT_MAX_BODY: left to `append`, a
+			// Doubled, but never past MAX_BODY: left to `append`, a
 			// 65535-byte body in 16 KiB frames is held in a 116 KiB buffer.
 			if need := len(s.body) + len(data); need > cap(s.body) {
-				reserve(&s.body, min(max(2 * cap(s.body), need), CLIENT_MAX_BODY))
+				reserve(&s.body, min(max(2 * cap(s.body), need), MAX_BODY))
 			}
 			append(&s.body, ..data)
 		}
@@ -874,7 +755,7 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	}
 
 	// Give the credit back; we buffer whole responses anyway. The stream's own
-	// window needs none: see CLIENT_RECV_WINDOW.
+	// window needs none: see RECV_WINDOW.
 	if !client_give_connection_credit(c, len(payload)) {
 		return false
 	}
@@ -914,21 +795,14 @@ client_give_connection_credit :: proc(c: ^Client, n: int) -> bool {
 
 @(private)
 client_rst_stream :: proc(c: ^Client, stream_id: u32, code: Error_Code) -> bool {
-	out := make([dynamic]u8, 0, 13, context.temp_allocator)
-	write_frame_header(&out, 4, .Rst_Stream, 0, stream_id)
-	append_u32(&out, u32(code))
-	return client_write_all(c, out[:])
+	return client_write_all(c, rst_stream_frame(stream_id, code))
 }
 
 // Nothing is sent on a connection already closed.
 client_goaway :: proc(c: ^Client, code: Error_Code) {
-	out := make([dynamic]u8, 0, 17, context.temp_allocator)
-	write_frame_header(&out, 8, .Goaway, 0, 0)
 	// Streams are always client-initiated and push is refused, so we never
 	// process a peer-initiated stream; the last-stream-id field is vestigial.
-	append_u32(&out, 0)
-	append_u32(&out, u32(code))
-	_ = client_write_all(c, out[:])
+	_ = client_write_all(c, goaway_frame(0, code))
 }
 
 /*
@@ -1133,7 +1007,7 @@ client_request :: proc(
 }
 
 // Write a request body, honouring flow control and the peer's frame size
-// limit. Mirrors the server's response-body writer (h2/server.odin), bounded
+// limit (`take_send_credit`), as the server's `write_body` does, bounded
 // additionally by the caller's deadline since nothing else here would notice
 // a peer that simply never grants window.
 @(private)
@@ -1182,13 +1056,8 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 				loop.unlock(&c.mu)
 				return false
 			}
-			available := min(c.send_window, s.send_window)
-			available = min(available, c.peer_max_frame)
-			available = min(available, remaining)
-			if available > 0 {
-				chunk = available
-				c.send_window -= chunk
-				s.send_window -= chunk
+			chunk = take_send_credit(&c.send_window, &s.send_window, c.peer_max_frame, remaining)
+			if chunk > 0 {
 				break
 			}
 			left := time.tick_diff(loop.tick_now(), deadline)
@@ -1209,11 +1078,7 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 		}
 		loop.unlock(&c.mu)
 
-		last := sent + chunk >= len(body)
-		out := make([dynamic]u8, 0, chunk + FRAME_HEADER_SIZE, context.temp_allocator)
-		write_frame_header(&out, chunk, .Data, u8(FLAG_END_STREAM) if last else 0, s.id)
-		append(&out, ..body[sent:sent + chunk])
-		if !client_write_all(c, out[:]) {
+		if !client_write_all(c, data_frame(s.id, body[sent:sent + chunk], sent + chunk >= len(body))) {
 			return false
 		}
 		sent += chunk

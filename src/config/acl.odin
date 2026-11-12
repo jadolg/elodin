@@ -546,11 +546,7 @@ prefix_contains :: proc(p: Prefix, addr: [16]u8) -> bool {
 // Render a prefix the way it was written, for the startup line and `--check`.
 format_prefix :: proc(p: Prefix, allocator := context.allocator) -> string {
 	if p.v6 {
-		a: net.IP6_Address
-		for i in 0 ..< 8 {
-			a[i] = u16be(u16(p.addr[i * 2]) << 8 | u16(p.addr[i * 2 + 1]))
-		}
-		text := net.address_to_string(net.Address(a), allocator)
+		text := net.address_to_string(net.Address(netx.ip6_from_bytes(p.addr)), allocator)
 		// `aprintf` copies it, so the intermediate goes back here rather than
 		// resting on every caller happening to pass an allocator that is reset
 		// wholesale.

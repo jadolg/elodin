@@ -86,8 +86,7 @@ charges_member :: proc "contextless" (err: Error, resolving: bool) -> bool {
 
 @(private)
 Idle_Conn :: struct {
-	socket: net.TCP_Socket,
-	tls:    ^tlsx.Conn,
+	stream: Stream,
 	// A `loop.Moment`, which neither steps nor stops while the machine sleeps; see
 	// `loop.Moment` for why.
 	since:  loop.Moment,
@@ -132,6 +131,10 @@ Upstream :: struct {
 	endpoint:     net.Endpoint,
 	resolved:     bool,
 	tls_ctx:      ^tlsx.Context,
+	// What `open_stream` dials this upstream's connections with; nil is
+	// `dial_tcp_timeout`. Set by tests, to stand in for a peer that resets a
+	// dial, which a real one does only by the luck of the scheduler.
+	dial:         proc(endpoint: net.Endpoint, timeout: time.Duration) -> (net.TCP_Socket, Error),
 
 	mu:           sync.Mutex,
 	// HTTP/1.1 only, which is the one transport left that can do nothing but
@@ -267,19 +270,12 @@ make_upstream :: proc(
 	init_cookie(u)
 
 	#partial switch spec.kind {
-	case .TLS:
-		ctx, terr := tlsx.client_context(spec.verify, "", nil, allocator)
-		if terr != .None {
-			logx.errorf("upstream %s: cannot create TLS context: %s", spec.name, tlsx.describe_error(terr, context.temp_allocator))
-			destroy(u)
-			return nil, .TLS_Failed
-		}
-		u.tls_ctx = ctx
-	case .HTTPS:
-		// h2 first: preferring it is what lets a resolver that only accepts
-		// HTTP/2 be used at all, and ALPN falls back to http/1.1 for the ones
-		// that do not offer h2.
-		ctx, terr := tlsx.client_context(spec.verify, "", []string{"h2", "http/1.1"}, allocator)
+	case .TLS, .HTTPS:
+		// h2 first for DoH: preferring it is what lets a resolver that only
+		// accepts HTTP/2 be used at all, and ALPN falls back to http/1.1 for the
+		// ones that do not offer h2. DoT offers no ALPN.
+		alpn := []string{"h2", "http/1.1"} if spec.kind == .HTTPS else nil
+		ctx, terr := tlsx.client_context(spec.verify, "", alpn, allocator)
 		if terr != .None {
 			logx.errorf("upstream %s: cannot create TLS context: %s", spec.name, tlsx.describe_error(terr, context.temp_allocator))
 			destroy(u)
@@ -898,44 +894,41 @@ response_matches :: proc(query, response: []u8) -> bool {
 
 @(private)
 take_idle :: proc(u: ^Upstream) -> (conn: Idle_Conn, ok: bool) {
-	sync.mutex_lock(&u.mu)
-	defer sync.mutex_unlock(&u.mu)
-
 	now := loop.moment_now()
-	for len(u.idle) > 0 {
+	for {
+		sync.mutex_lock(&u.mu)
+		if len(u.idle) == 0 {
+			sync.mutex_unlock(&u.mu)
+			return {}, false
+		}
 		conn = pop(&u.idle)
+		sync.mutex_unlock(&u.mu)
 		if time.Duration(now - conn.since) < u.idle_timeout {
 			return conn, true
 		}
-		close_conn(conn)
+		// Closed with the lock let go, for the reason `close_idle` gives.
+		stream_close(&conn.stream)
 	}
-	return {}, false
 }
 
 @(private)
-put_idle :: proc(u: ^Upstream, conn: Idle_Conn) {
+put_idle :: proc(u: ^Upstream, stream: Stream) {
+	c := Idle_Conn {
+		stream = stream,
+	}
 	sync.mutex_lock(&u.mu)
 	if len(u.idle) >= u.max_idle {
 		sync.mutex_unlock(&u.mu)
-		close_conn(conn)
+		stream_close(&c.stream)
 		return
 	}
-	c := conn
 	c.since = loop.moment_now()
 	append(&u.idle, c)
 	sync.mutex_unlock(&u.mu)
 }
 
-@(private)
-close_conn :: proc(conn: Idle_Conn) {
-	if conn.tls != nil {
-		tlsx.close(conn.tls)
-		return
-	}
-	net.close(conn.socket)
-}
-
 // Drop idle connections, either the expired ones or every one of them.
+@(private)
 close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 	sync.mutex_lock(&u.mu)
 	pipe_relearn_idle_locked(u)
@@ -960,8 +953,8 @@ close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 	// connection it replaces: a TLS close writes a close_notify, nothing in
 	// closing needs `u.mu`, and every query on this upstream waits on it to
 	// get a connection.
-	for conn in stale {
-		close_conn(conn)
+	for &conn in stale {
+		stream_close(&conn.stream)
 	}
 	closed += len(stale)
 	if stale_h2 != nil {

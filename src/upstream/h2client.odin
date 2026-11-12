@@ -27,6 +27,7 @@ no way to do anything else.
 // `H2_Conn.stopping`. Idle time between queries is normal on a
 // long-lived shared connection, so this is a polling interval, not a request
 // deadline — a plain read timeout is not treated as a connection failure.
+@(private)
 H2_POLL_INTERVAL :: time.Second
 
 @(private)
@@ -38,28 +39,14 @@ h2_io_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 		if sync.atomic_load(&hc.stopping) || loop.cancelled() {
 			return 0, false
 		}
-		if hc.stream.tls != nil {
-			got, terr := tlsx.read(hc.stream.tls, buf)
-			#partial switch terr {
-			case .None:
-				return got, true
-			case .Timeout:
-				continue
-			case:
-				return 0, false
-			}
-		}
-		got, nerr := loop.recv_tcp(hc.stream.socket, buf)
-		if nerr == nil {
-			return got, true
-		}
-		// A receive timeout is `.Would_Block` from `loop.recv_tcp`; both it and
-		// `.Timeout` are an idle poll tick, not a close. Read as a close, every
+		// A timeout is an idle poll tick, not a close. Read as a close, every
 		// tick would tear down a healthy connection once per H2_POLL_INTERVAL.
-		if nerr == .Timeout || nerr == .Would_Block {
+		// A close is nothing read, which `h2.io_read_exact` takes as the end.
+		got, err := stream_read(&hc.stream, buf)
+		if err == .Timeout {
 			continue
 		}
-		return 0, false
+		return got, err == .None
 	}
 }
 
@@ -211,7 +198,7 @@ get_h2_conn :: proc(
 		if stream.tls != nil {
 			tlsx.set_timeouts(stream.tls, timeout, timeout)
 		}
-		put_idle(u, Idle_Conn{socket = stream.socket, tls = stream.tls})
+		put_idle(u, stream)
 		return nil, false, .None
 	}
 

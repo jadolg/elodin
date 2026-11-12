@@ -32,16 +32,22 @@ split_url :: proc(url: string) -> (scheme, authority, target: string, ok: bool) 
 	if sep < 0 || !is_scheme(url[:sep]) {
 		return "", "", "", false
 	}
-	rest := url[sep + 3:]
-	end := strings.index_any(rest, "/?#")
-	if end < 0 {
-		end = len(rest)
-	}
-	target = rest[end:]
+	authority, target = split_authority(url[sep + 3:])
 	if i := strings.index_byte(target, '#'); i >= 0 {
 		target = target[:i]
 	}
-	return url[:sep], rest[:end], target, true
+	return url[:sep], authority, target, true
+}
+
+// RFC 3986 3.2: the authority ends at the first `/`, `?` or `#`, and `rest` is
+// what follows it.
+@(private)
+split_authority :: proc(s: string) -> (authority, rest: string) {
+	end := strings.index_any(s, "/?#")
+	if end < 0 {
+		end = len(s)
+	}
+	return s[:end], s[end:]
 }
 
 /*
@@ -85,12 +91,7 @@ resolve_reference :: proc(base, ref: string) -> string {
 	// An authority of its own, whose path loses its dot segments as any other.
 	own_authority := strings.has_prefix(rest, "//")
 	if own_authority {
-		rest = rest[2:]
-		end := strings.index_any(rest, "/?#")
-		if end < 0 {
-			end = len(rest)
-		}
-		authority, rest = rest[:end], rest[end:]
+		authority, rest = split_authority(rest[2:])
 	}
 
 	// The fragment, then the query: either may hold a `/`, a `?` or a dot segment.

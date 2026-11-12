@@ -99,7 +99,7 @@ is_ip6_literal :: proc(s: string) -> bool {
 		return false
 	}
 	_, ok := net.parse_ip6_address(s)
-	return ok && is_dotted_quad(s)
+	return ok && ip4_part_is_dotted_quad(s)
 }
 
 // Whether `s` splits into a host and a port. `[::1]` is not bare but has none:
@@ -146,7 +146,7 @@ allow list entry `192.168.1/24` would be another network. An IPv6 address with
 no IPv4 part passes.
 */
 @(private)
-is_dotted_quad :: proc(s: string) -> bool {
+ip4_part_is_dotted_quad :: proc(s: string) -> bool {
 	v4 := s[strings.last_index_byte(s, ':') + 1:]
 	if v4 != s && !strings.contains_rune(v4, '.') {
 		return true
@@ -155,21 +155,21 @@ is_dotted_quad :: proc(s: string) -> bool {
 }
 
 parse_address :: proc(s: string) -> net.Address {
-	if !is_bare(s) || !is_dotted_quad(s) {
+	if !is_bare(s) || !ip4_part_is_dotted_quad(s) {
 		return nil
 	}
 	return net.parse_address(s)
 }
 
 parse_ip4_address :: proc(s: string) -> (addr: net.IP4_Address, ok: bool) {
-	if !is_bare(s) || !is_dotted_quad(s) {
+	if !is_bare(s) || !ip4_part_is_dotted_quad(s) {
 		return
 	}
 	return net.parse_ip4_address(s)
 }
 
 parse_ip6_address :: proc(s: string) -> (addr: net.IP6_Address, ok: bool) {
-	if !is_bare(s) || !is_dotted_quad(s) {
+	if !is_bare(s) || !ip4_part_is_dotted_quad(s) {
 		return
 	}
 	return net.parse_ip6_address(s)
@@ -210,6 +210,12 @@ address_bytes :: proc(address: net.Address) -> (out: [16]u8, v6: bool) {
 		v6 = true
 	}
 	return
+}
+
+// `address_bytes`'s reverse for IPv6: sixteen bytes in network order as the
+// eight big-endian groups `net.IP6_Address` holds.
+ip6_from_bytes :: proc(b: [16]u8) -> net.IP6_Address {
+	return transmute(net.IP6_Address)b
 }
 
 /*

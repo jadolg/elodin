@@ -206,10 +206,27 @@ ppoll :: proc(fds: []linux.Poll_Fd, timeout_ms: i32) -> (i32, linux.Errno) {
 		tsp = &ts
 	}
 	ret := intrinsics.syscall(linux.SYS_ppoll, uintptr(raw_data(fds)), uintptr(len(fds)), uintptr(tsp), 0, 0)
+	n, err := syscall_result(ret)
+	return i32(n), err
+}
+
+// A raw system call's return: the kernel reports an error as -1 to -4095.
+@(private)
+syscall_result :: proc "contextless" (ret: uintptr) -> (int, linux.Errno) {
 	if int(ret) < 0 && int(ret) > -4096 {
 		return 0, linux.Errno(-int(ret))
 	}
-	return i32(ret), .NONE
+	return int(ret), .NONE
+}
+
+/*
+Milliseconds to wait for `d`, rounded up so a wait due in 0.4 ms is not polled
+for in a loop of zero-length waits, and held to `most`: a deadline weeks away
+would otherwise wrap to a negative figure, which is no timeout at all.
+*/
+@(private)
+ms_ceil :: proc(d: time.Duration, most: i32) -> i32 {
+	return i32(clamp((d + time.Millisecond - 1) / time.Millisecond, 0, time.Duration(most)))
 }
 
 /*
@@ -234,7 +251,7 @@ poll_fd :: proc(fd: linux.Fd, events: Events, deadline: Tick) -> Wait_Result {
 			if left <= 0 {
 				return .Timeout
 			}
-			ms = i32(min((left + time.Millisecond - 1) / time.Millisecond, time.Duration(max(i32))))
+			ms = ms_ceil(left, max(i32))
 		}
 		fds := [1]linux.Poll_Fd{{fd = fd, events = want}}
 		n, err := ppoll(fds[:], ms)

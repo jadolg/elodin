@@ -2884,7 +2884,7 @@ test_the_doh_query_that_dialled_is_retried :: proc(t: ^testing.T) {
 	dns.set_id_in_place(body, 0)
 
 	// The pool is empty, so this dials - and used to get one attempt for it.
-	_, err := exchange_doh_h1(u, wire, body, 2 * time.Second, context.temp_allocator)
+	_, err := exchange_doh_h1(u, wire, body, time.tick_add(loop.tick_now(), 2 * time.Second), context.temp_allocator)
 	testing.expectf(t, err == .Peer_Closed, "a hang-up was reported as %v", err)
 	testing.expect(t, sync.atomic_load(&m.conns) >= 2, "the query that dialled was not retried")
 	free_all(context.temp_allocator)
@@ -2945,10 +2945,10 @@ test_a_refused_doh_h1_reply_releases_its_body :: proc(t: ^testing.T) {
 				if pooled {
 					socket, derr := dial_tcp_timeout(bound, time.Second)
 					if testing.expectf(t, derr == .None, "cannot dial the mock: %v", derr) {
-						put_idle(u, Idle_Conn{socket = socket})
+						put_idle(u, Stream{socket = socket})
 					}
 				}
-				resp, err := exchange_doh_h1(u, query, query, 2 * time.Second, mem.tracking_allocator(&track))
+				resp, err := exchange_doh_h1(u, query, query, time.tick_add(loop.tick_now(), 2 * time.Second), mem.tracking_allocator(&track))
 				testing.expectf(t, err == .HTTP_Error, "%q pooled=%v: got %v", reply[:12], pooled, err)
 				testing.expect(t, resp == nil, "a refused reply came back as an answer")
 				expect_caller_holds_nothing(t, &track, reply[:12])
@@ -3047,14 +3047,14 @@ test_doh_h1_reply_is_bounded_by_a_dns_message :: proc(t: ^testing.T) {
 					if pooled {
 						socket, derr := dial_tcp_timeout(bound, time.Second)
 						if testing.expectf(t, derr == .None, "cannot dial the mock: %v", derr) {
-							put_idle(u, Idle_Conn{socket = socket})
+							put_idle(u, Stream{socket = socket})
 						}
 					}
 					resp: []u8
 					err: Error
 					{
 						context.allocator = mem.tracking_allocator(&reader)
-						resp, err = exchange_doh_h1(u, query, query, 5 * time.Second, mem.tracking_allocator(&caller))
+						resp, err = exchange_doh_h1(u, query, query, time.tick_add(loop.tick_now(), 5 * time.Second), mem.tracking_allocator(&caller))
 					}
 					if size <= dns.MAX_MESSAGE {
 						testing.expectf(t, err == .None, "%v %d pooled=%v: a whole DNS message was refused: %v", framing, size, pooled, err)
@@ -3145,10 +3145,10 @@ test_a_doh_h1_408_on_a_pooled_connection_is_retried :: proc(t: ^testing.T) {
 				if pooled {
 					socket, derr := dial_tcp_timeout(bound, time.Second)
 					if testing.expectf(t, derr == .None, "cannot dial the mock: %v", derr) {
-						put_idle(u, Idle_Conn{socket = socket})
+						put_idle(u, Stream{socket = socket})
 					}
 				}
-				resp, err := exchange_doh_h1(u, query, query, 2 * time.Second, mem.tracking_allocator(&track))
+				resp, err := exchange_doh_h1(u, query, query, time.tick_add(loop.tick_now(), 2 * time.Second), mem.tracking_allocator(&track))
 				if pooled {
 					testing.expectf(t, err == .None, "page %d: a 408 on a pooled connection was not retried: %v", page, err)
 					testing.expect(t, len(resp) == len(answer), "the retry's answer did not come back")
@@ -3302,7 +3302,7 @@ test_a_doh_query_with_no_budget_left_does_not_dial :: proc(t: ^testing.T) {
 	copy(body, wire)
 	dns.set_id_in_place(body, 0)
 
-	_, err := exchange_doh_h1(u, wire, body, 0, context.temp_allocator)
+	_, err := exchange_doh_h1(u, wire, body, time.tick_add(loop.tick_now(), 0), context.temp_allocator)
 	testing.expectf(t, err == .Timeout, "a query with no budget reported %v", err)
 	testing.expect_value(t, sync.atomic_load(&m.conns), 0)
 	free_all(context.temp_allocator)
@@ -3408,7 +3408,7 @@ test_a_pooled_doh_connection_takes_this_querys_deadline :: proc(t: ^testing.T) {
 		return
 	}
 	set_socket_timeouts(socket, 5 * time.Second)
-	put_idle(u, Idle_Conn{socket = socket})
+	put_idle(u, Stream{socket = socket})
 
 	query := dns.Message {
 		id       = 0x9595,
@@ -3426,7 +3426,7 @@ test_a_pooled_doh_connection_takes_this_querys_deadline :: proc(t: ^testing.T) {
 	// Two hundred milliseconds, against a server that says nothing. Both
 	// attempts are inside one deadline, so the whole call is.
 	start := time.tick_now()
-	_, err := exchange_doh_h1(u, wire, body, 200 * time.Millisecond, context.temp_allocator)
+	_, err := exchange_doh_h1(u, wire, body, time.tick_add(loop.tick_now(), 200 * time.Millisecond), context.temp_allocator)
 	spent := time.tick_since(start)
 	testing.expectf(t, err == .Timeout, "a silent server reported %v", err)
 	testing.expectf(
@@ -4082,7 +4082,7 @@ test_a_trickled_doh_response_is_bounded_by_the_query_timeout :: proc(t: ^testing
 	dns.set_id_in_place(body, 0)
 
 	start := time.tick_now()
-	_, err := exchange_doh_h1(u, wire, body, 500 * time.Millisecond, context.temp_allocator)
+	_, err := exchange_doh_h1(u, wire, body, time.tick_add(loop.tick_now(), 500 * time.Millisecond), context.temp_allocator)
 	spent := time.tick_since(start)
 	testing.expectf(t, err == .Timeout, "a trickled response reported %v", err)
 	testing.expectf(t, spent < 1500 * time.Millisecond, "a 500ms query was held for %v", spent)

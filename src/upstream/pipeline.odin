@@ -1,7 +1,6 @@
 package upstream
 
 import "core:mem"
-import "core:net"
 import "core:sync"
 import "core:time"
 import "elodin:dns"
@@ -65,6 +64,7 @@ Which leaves the bound doing what it was asked to do and nothing else: a server
 that has stopped answering cannot pile up waiters without limit, and one that
 is merely busy never reaches it.
 */
+@(private)
 PIPELINE_MAX_OUTSTANDING :: 256
 
 /*
@@ -72,6 +72,7 @@ The most a connection's 16-bit IDs allow with room to spare: a reply arriving
 after its caller gave up must not be taken for a later query that reused its ID
 (`pipe_take_id`), so the figure stays well short of 65,536.
 */
+@(private)
 PIPELINE_OUTSTANDING_CEILING :: 1 << 15
 
 /*
@@ -108,6 +109,7 @@ late answer", and a third would only delay the recovery. What it costs is one
 extra timeout before a connection that really has gone is replaced, against the
 fifteen minutes the kernel takes to give up (see `pipe_wait`).
 */
+@(private)
 PIPE_SILENT_TIMEOUTS :: 2
 
 /*
@@ -134,12 +136,14 @@ orders of magnitude of headroom. What it bounds is the overrun: a reader at its
 deadline holds on for this rather than for `upstream.timeout`, which on a
 default configuration is five times as long.
 */
+@(private)
 PIPE_FRAMING_GRACE :: 1 * time.Second
 
 /*
 The shortest idle timeout this will believe of a peer, and the floor the
 learned ceiling is held at. See `note_idle_death`.
 */
+@(private)
 PIPE_IDLE_FLOOR :: 2 * time.Second
 
 /*
@@ -159,6 +163,7 @@ Forgetting it costs one dead query an hour per upstream, which the retry in
 `exchange_pipelined` makes invisible, and bounds the damage of a bad sample to
 an hour rather than to the uptime.
 */
+@(private)
 PIPE_IDLE_RELEARN :: time.Hour
 
 /*
@@ -169,6 +174,7 @@ shows in every reply; a slow name holds up only its own, since a server may
 answer out of order (RFC 7766 section 7). Eight in a row all slow is a queue,
 and one is a name.
 */
+@(private)
 PIPE_BACKLOG_SAMPLES :: 8
 
 // How long a connection's latest replies waited, newest at `next - 1`.
@@ -579,25 +585,15 @@ dial_pipe :: proc(u: ^Upstream, timeout, budget: time.Duration) -> (c: ^Pipe_Con
 	// bounded attempt rather than handing a negative timeval to the socket.
 	spend := max(budget, time.Millisecond)
 	endpoint := endpoint_of(u) or_return
-	stream: Stream
-	if u.spec.kind == .TLS {
-		stream = open_stream(endpoint, u.tls_ctx, u.spec.hostname, spend, u) or_return
-		// `open_stream` left the session on the dial's budget; what it carries
-		// from here is the connection's. Guarded the way h2client.odin guards
-		// it: a stream is only a TLS one when it was dialled through a context.
-		if stream.tls != nil {
-			tlsx.set_timeouts(stream.tls, timeout, timeout)
-		}
+	// `tls_ctx` is nil for `tcp` and for a `udp` upstream's retry, which then
+	// dial plain, with the same retry of a reset dial as `tls`.
+	stream := open_stream(endpoint, u.tls_ctx, u.spec.hostname, spend, u) or_return
+	// `open_stream` left the stream on the dial's budget; what it carries from
+	// here is the connection's.
+	if stream.tls != nil {
+		tlsx.set_timeouts(stream.tls, timeout, timeout)
 	} else {
-		socket, derr := dial_tcp_timeout(endpoint, spend)
-		if derr != .None {
-			return nil, derr
-		}
-		set_socket_timeouts(socket, timeout)
-		_ = net.set_option(socket, .TCP_Nodelay, true)
-		stream = Stream {
-			socket = socket,
-		}
+		set_socket_timeouts(stream.socket, timeout)
 	}
 
 	c = new(Pipe_Conn, u.allocator)
@@ -842,7 +838,7 @@ pipe_query :: proc(
 	response: []u8,
 	err: Error,
 ) {
-	if len(query) > 0xffff {
+	if len(query) > dns.MAX_MESSAGE {
 		return nil, .Too_Large
 	}
 	if len(query) < dns.HEADER_SIZE {
@@ -1240,30 +1236,9 @@ pipe_read_full :: proc(c: ^Pipe_Conn, buf: []u8, deadline: time.Tick) -> (n: int
 			return n, .Timeout
 		}
 		stream_set_read_timeout(&c.stream, remaining)
-		if c.stream.tls != nil {
-			got, terr := tlsx.read(c.stream.tls, buf[n:])
-			if terr != .None {
-				return n, roundtrip_failure(terr)
-			}
-			// Nothing read and no error is the peer having closed: the same
-			// event `roundtrip_failure` names above, reached by the other
-			// route, and reported the same way so it is not read as an outage.
-			if got <= 0 {
-				return n, .Peer_Closed
-			}
-			n += got
-			continue
-		}
-		got, nerr := loop.recv_tcp(c.stream.socket, buf[n:])
-		if nerr != nil {
-			// SO_RCVTIMEO expiring on a blocking recv() is EAGAIN on Linux,
-			// which core:net reports as .Would_Block rather than .Timeout -
-			// see h2client.odin's h2_io_read.
-			if nerr == .Timeout || nerr == .Would_Block {
-				return n, .Timeout
-			}
-			return n, .IO_Error
-		}
+		got := stream_read(&c.stream, buf[n:]) or_return
+		// Nothing read and no error is the peer having closed, reported as
+		// `roundtrip_failure` reports a TLS close so it is not read as an outage.
 		if got <= 0 {
 			return n, .Peer_Closed
 		}
@@ -1404,9 +1379,8 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 			break
 		}
 		// A send timeout is the peer not reading, which is a different thing
-		// from the peer closing and is counted as such; see `pipe_read_full`
-		// for why Linux reports it as a would-block.
-		if werr != .Timeout && werr != .Would_Block {
+		// from the peer closing and is counted as such.
+		if !timed_out(werr) {
 			return sent, .IO_Error
 		}
 		if n <= 0 {
@@ -1414,7 +1388,7 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 		}
 		// The first bytes are away: the rest is owed on the framing budget.
 		// Once, so a send that moved nothing never moves the bound.
-		if n > 0 && sent == n {
+		if sent == n {
 			bound = pipe_framing_deadline(c, deadline)
 		}
 	}

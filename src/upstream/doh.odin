@@ -11,9 +11,6 @@ import "elodin:loop"
 import "elodin:netx"
 import "elodin:tlsx"
 
-// RFC 8484 6: a DoH reply is at most 65535 bytes, on HTTP/2 as on HTTP/1.1.
-#assert(h2.CLIENT_MAX_BODY == dns.MAX_MESSAGE)
-
 /*
 DNS over HTTPS (RFC 8484).
 
@@ -96,7 +93,7 @@ exchange_doh_h2 :: proc(
 			return nil, .Timeout
 		}
 		if !is_h2 {
-			return exchange_doh_h1(u, query, body, remaining, allocator)
+			return exchange_doh_h1(u, query, body, deadline, allocator)
 		}
 
 		resp, herr := h2.client_request(
@@ -123,10 +120,7 @@ exchange_doh_h2 :: proc(
 				}
 				return nil, .HTTP_Error
 			}
-			// `exchange_doh` turned away a query shorter than a header.
-			id, _ := dns.peek_id(query)
-			dns.set_id_in_place(resp.body, id)
-			if !response_matches(query, resp.body) {
+			if !doh_reply_matches(query, resp.body) {
 				delete(resp.body, allocator)
 				return nil, .Bad_Response
 			}
@@ -167,7 +161,7 @@ exchange_doh_h1 :: proc(
 	u: ^Upstream,
 	query: []u8,
 	body: []u8,
-	timeout: time.Duration,
+	deadline: time.Tick,
 	allocator: mem.Allocator,
 ) -> (
 	response: []u8,
@@ -182,7 +176,6 @@ exchange_doh_h1 :: proc(
 	A `Tick` rather than a `Time`, because it is a bound on waiting rather than
 	a moment anyone reads off a clock, and the wall clock steps.
 	*/
-	deadline := time.tick_add(loop.tick_now(), timeout)
 	endpoint := endpoint_of(u) or_return
 
 	// Pooled connection first, then a fresh one; see exchange_pipelined for why a
@@ -199,10 +192,7 @@ exchange_doh_h1 :: proc(
 		}
 		stream: Stream
 		if reused {
-			stream = Stream {
-				socket = conn.socket,
-				tls    = conn.tls,
-			}
+			stream = conn.stream
 			// The timeouts it carries are whatever the query that dialled it
 			// had; `http_exchange` replaces them with this query's deadline
 			// before every write and read.
@@ -233,17 +223,13 @@ exchange_doh_h1 :: proc(
 		)
 
 		if herr == .None && resp.status == 200 && len(resp.body) >= dns.HEADER_SIZE {
-			// Restore the ID the caller sent so the usual matching applies.
-			// `exchange_doh` turned away a query shorter than a header.
-			id, _ := dns.peek_id(query)
-			dns.set_id_in_place(resp.body, id)
-			if !response_matches(query, resp.body) {
+			if !doh_reply_matches(query, resp.body) {
 				delete(resp.body, allocator)
 				stream_close(&stream)
 				return nil, .Bad_Response
 			}
 			if resp.keep_alive {
-				put_idle(u, Idle_Conn{socket = stream.socket, tls = stream.tls})
+				put_idle(u, stream)
 			} else {
 				stream_close(&stream)
 			}
@@ -334,7 +320,7 @@ fetch_url :: proc(
 	origin_public: bool
 	have_origin := false
 
-	for _ in 0 ..< 5 {
+	for _ in 0 ..< MAX_REDIRECTS {
 		// Before the lookup, so a spent budget does not start one. The lookup
 		// itself is bounded by the bootstrap resolver's own timeout.
 		if time.tick_diff(loop.tick_now(), deadline) <= 0 {
@@ -463,4 +449,17 @@ doh_authority :: proc(hostname, url: string) -> string {
 		return host
 	}
 	return fmt.tprintf("%s:%d", host, port)
+}
+
+/*
+Whether a DoH reply body answers `query`, once the ID the caller sent is put
+back in it: RFC 8484 4.1 has the query go out with ID 0, so the usual matching
+applies only after. `exchange_doh` turned away a query shorter than a header,
+and both callers a body shorter than one.
+*/
+@(private)
+doh_reply_matches :: proc(query, body: []u8) -> bool {
+	id, _ := dns.peek_id(query)
+	dns.set_id_in_place(body, id)
+	return response_matches(query, body)
 }

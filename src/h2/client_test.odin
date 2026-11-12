@@ -328,17 +328,17 @@ test_wait_for_frame_type :: proc(socket: net.TCP_Socket, want: Frame_Type) -> (h
 	}
 }
 
-// Answers with `CLIENT_MAX_BODY - 1` bytes more than the request carried, so a
+// Answers with `MAX_BODY - 1` bytes more than the request carried, so a
 // one-byte request is answered at the bound and a two-byte one just past it.
 @(private = "file")
 sized_handler :: proc(conn: ^Conn, req: ^Request) {
 	defer request_destroy(conn, req)
-	body := make([]u8, CLIENT_MAX_BODY - 1 + len(req.body), context.temp_allocator)
+	body := make([]u8, MAX_BODY - 1 + len(req.body), context.temp_allocator)
 	respond(conn, req.stream_id, Response{status = 200, content_type = "application/dns-message", body = body})
 }
 
 /*
-A response is a DNS message, at most CLIENT_MAX_BODY bytes (RFC 8484 6). One of
+A response is a DNS message, at most MAX_BODY bytes (RFC 8484 6). One of
 exactly that is kept; one byte more is this end's reset, reported as
 `Too_Large` and not as the peer's `Reset`, so the caller can tell the two apart
 as the HTTP/1.1 client does (#525).
@@ -375,13 +375,13 @@ test_client_response_past_max_body_is_too_large :: proc(t: ^testing.T) {
 				heap,
 			)
 			if extra == 0 {
-				testing.expectf(t, err == .None, "a %d-byte response was refused: %v", CLIENT_MAX_BODY, err)
-				testing.expect_value(t, len(resp.body), CLIENT_MAX_BODY)
+				testing.expectf(t, err == .None, "a %d-byte response was refused: %v", MAX_BODY, err)
+				testing.expect_value(t, len(resp.body), MAX_BODY)
 				// The stream's body grows by doubling but never past the bound,
 				// where `append` alone takes it to 116 KiB.
-				testing.expectf(t, held.peak_memory_allocated < CLIENT_MAX_BODY + 8192, "the client peaked at %d bytes", held.peak_memory_allocated)
+				testing.expectf(t, held.peak_memory_allocated < MAX_BODY + 8192, "the client peaked at %d bytes", held.peak_memory_allocated)
 			} else {
-				testing.expectf(t, err == .Too_Large, "a %d-byte response came back as %v", CLIENT_MAX_BODY + 1, err)
+				testing.expectf(t, err == .Too_Large, "a %d-byte response came back as %v", MAX_BODY + 1, err)
 				// With its status, so the caller can tell an oversized answer from
 				// an error page it would not have read anyway.
 				testing.expect_value(t, resp.status, 200)
@@ -398,7 +398,7 @@ test_client_response_past_max_body_is_too_large :: proc(t: ^testing.T) {
 }
 
 /*
-A response can run past CLIENT_MAX_BODY while the request is still going up,
+A response can run past MAX_BODY while the request is still going up,
 held back by flow control (RFC 9113 8.1 lets a server answer early). That is
 the same `Too_Large` as a response that overran after the upload, not a reset
 the peer chose (#525).
@@ -1238,7 +1238,7 @@ test_oversized_response_returns_connection_credit :: proc(t: ^testing.T) {
 	c.streams[1] = s
 
 	clear(&log.frames)
-	payload := make([]u8, CLIENT_MAX_BODY + 1, context.temp_allocator)
+	payload := make([]u8, MAX_BODY + 1, context.temp_allocator)
 	client_handle_data(c, Frame_Header{length = len(payload), type = .Data, stream_id = 1}, payload)
 
 	credited := false
@@ -2388,7 +2388,7 @@ test_client_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {
 /*
 With no stream-level WINDOW_UPDATE, a stream's window is only ever spent, and
 padding spends it without growing the body. A padded response under
-CLIENT_MAX_BODY is kept; a stream that has spent half its window is reset
+MAX_BODY is kept; a stream that has spent half its window is reset
 rather than left to run it dry and stall its caller until the timeout.
 */
 @(test)
@@ -2411,11 +2411,11 @@ test_client_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 		spent^ += len(frame)
 		return client_handle_data(c, Frame_Header{length = len(frame), type = .Data, flags = FLAG_PADDED, stream_id = 1}, frame)
 	}
-	for spent <= CLIENT_MAX_BODY {
+	for spent <= MAX_BODY {
 		testing.expect(t, send(c, frame, &spent), "a padded DATA frame was a connection error")
 	}
-	testing.expectf(t, !s.reset, "a %d-byte response padded past CLIENT_MAX_BODY was refused", len(s.body))
-	for spent <= CLIENT_RECV_WINDOW / 2 {
+	testing.expectf(t, !s.reset, "a %d-byte response padded past MAX_BODY was refused", len(s.body))
+	for spent <= RECV_WINDOW / 2 {
 		testing.expect(t, send(c, frame, &spent), "a padded DATA frame was a connection error")
 	}
 	testing.expectf(t, s.reset, "a stream that spent %d bytes of its window was left open", spent)

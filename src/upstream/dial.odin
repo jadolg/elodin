@@ -6,6 +6,7 @@ import "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
 import "elodin:loop"
+import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -21,32 +22,27 @@ The socket stays non-blocking for the rest of the session. Every read and write
 on it goes through `loop`'s socket calls or `tlsx`, both of which wait where a
 blocking socket would have, for as long as its SO_RCVTIMEO or SO_SNDTIMEO says.
 */
+@(private)
 dial_tcp_timeout :: proc(endpoint: net.Endpoint, timeout: time.Duration) -> (socket: net.TCP_Socket, err: Error) {
-	family: posix.AF
+	domain: linux.Address_Family
 	switch _ in endpoint.address {
 	case net.IP4_Address:
-		family = .INET
+		domain = .INET
 	case net.IP6_Address:
-		family = .INET6
+		domain = .INET6
 	case:
 		return 0, .Dial_Failed
 	}
 
-	fd := posix.socket(family, .STREAM)
-	if c.int(fd) < 0 {
+	// Close-on-exec, as every other descriptor this server opens is.
+	lfd, serr := linux.socket(domain, .STREAM, {.CLOEXEC, .NONBLOCK}, .TCP)
+	if serr != .NONE {
 		return 0, .Dial_Failed
 	}
+	fd := posix.FD(lfd)
 	ok := false
 	defer if !ok {
 		posix.close(fd)
-	}
-
-	flags := posix.fcntl(fd, .GETFL)
-	if flags < 0 {
-		return 0, .Dial_Failed
-	}
-	if posix.fcntl(fd, .SETFL, flags | c.int(posix.O_NONBLOCK)) < 0 {
-		return 0, .Dial_Failed
 	}
 
 	storage: posix.sockaddr_in6
@@ -102,13 +98,7 @@ fill_sockaddr :: proc(endpoint: net.Endpoint, storage: ^posix.sockaddr_in6, out_
 		storage^ = {}
 		storage.sin6_family = .INET6
 		storage.sin6_port = posix.in_port_t(u16be(u16(endpoint.port)))
-		groups := a
-		bytes: [16]u8
-		for g, i in groups {
-			v := u16(g)
-			bytes[i * 2] = u8(v >> 8)
-			bytes[i * 2 + 1] = u8(v)
-		}
+		bytes, _ := netx.address_bytes(a)
 		storage.sin6_addr = transmute(posix.in6_addr)bytes
 		out_len^ = posix.socklen_t(size_of(posix.sockaddr_in6))
 	}
@@ -140,6 +130,7 @@ handshake_failure :: proc(terr: tlsx.Error) -> Error {
 // both of which the socket and `tlsx` take as no timeout at all - while zero
 // stays zero, which is no timeout - a figure no configuration reaches, since the
 // loader refuses an `upstream.timeout` under a millisecond (#499).
+@(private)
 set_socket_timeouts :: proc(socket: net.Any_Socket, timeout: time.Duration) {
 	bounded := max(timeout, time.Millisecond) if timeout != 0 else 0
 	_ = net.set_option(socket, .Receive_Timeout, bounded)
