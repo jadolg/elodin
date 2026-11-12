@@ -745,6 +745,8 @@ pw_lower_name :: proc(name: []u8) {
 	}
 }
 
+// Two names held to the case-insensitive comparison RFC 4343 gives every name:
+// ASCII letters fold, every other byte is compared as it stands.
 pw_names_equal_fold :: proc(a, b: []u8) -> bool {
 	if len(a) != len(b) {
 		return false

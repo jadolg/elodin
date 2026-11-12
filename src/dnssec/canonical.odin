@@ -170,8 +170,12 @@ which is the honest answer for it.
 */
 @(private)
 write_downcased_raw :: proc(out: ^[dynamic]u8, type: dns.Type, rdata: []u8) {
+	if type == .RRSIG || !downcases_rdata_names(type) {
+		append(out, ..rdata)
+		return
+	}
 	layout, known := dns.raw_rdata_layout(type, rdata)
-	if !known || type == .RRSIG || !downcases_rdata_names(type) {
+	if !known {
 		append(out, ..rdata)
 		return
 	}

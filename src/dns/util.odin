@@ -613,7 +613,11 @@ referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
 	pos := authority_at
 	for _ in 0 ..< nscount {
 		type, _, next, ok := skip_record(msg, pos)
-		if ok && type == .NS {
+		// A record that does not walk leaves the rest unread: "cannot tell".
+		if !ok {
+			return true
+		}
+		if type == .NS {
 			zone, _, nerr := decode_name(msg, pos, context.temp_allocator)
 			// Unread for want of memory is "cannot tell", as above.
 			if nerr == .Out_Of_Memory {

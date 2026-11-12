@@ -1142,7 +1142,7 @@ pc_signed_again :: proc(rec: Pw_RR, el_recs: []Pw_RR) -> bool {
 		if e.type != rec.type || e.class != rec.class {
 			continue
 		}
-		if !pc_name_equal_fold(e.name, rec.name) {
+		if !pw_names_equal_fold(e.name, rec.name) {
 			continue
 		}
 		if pc_same_signed_set(rec.rdata, e.rdata) {
@@ -1167,14 +1167,14 @@ pc_serial_moved :: proc(rec: Pw_RR, el_recs: []Pw_RR) -> bool {
 		if e.type != rec.type || e.class != rec.class || len(b) != len(a) {
 			continue
 		}
-		if !pc_name_equal_fold(e.name, rec.name) {
+		if !pw_names_equal_fold(e.name, rec.name) {
 			continue
 		}
 		b_mname, b_ok := pc_name_end(b, 0)
 		if !b_ok || b_mname != a_mname {
 			continue
 		}
-		if pc_name_equal_fold(a[:a_end], b[:a_end]) && pc_bytes_equal(a[a_end + 4:], b[a_end + 4:]) {
+		if pw_names_equal_fold(a[:a_end], b[:a_end]) && pc_bytes_equal(a[a_end + 4:], b[a_end + 4:]) {
 			return true
 		}
 	}
@@ -1210,7 +1210,7 @@ pc_same_signed_set :: proc(a, b: []u8) -> bool {
 	if !a_ok || !b_ok {
 		return false
 	}
-	return pc_name_equal_fold(a[18:a_end], b[18:b_end])
+	return pw_names_equal_fold(a[18:a_end], b[18:b_end])
 }
 
 // Where an uncompressed name ends. A pointer is not legal in RRSIG RDATA and is
@@ -1230,14 +1230,6 @@ pc_name_end :: proc(buf: []u8, start: int) -> (end: int, ok: bool) {
 		i += 1 + length
 	}
 	return 0, false
-}
-
-// The signer name in an RRSIG's rdata, held to the case-insensitive comparison
-// RFC 1035 section 2.3.3 gives every name. `pc_bytes_equal` below is the rest
-// of the record, where a byte is a byte.
-@(private = "file")
-pc_name_equal_fold :: proc(a, b: []u8) -> bool {
-	return dns.name_equal_fold(string(a), string(b))
 }
 
 @(private = "file")
@@ -1342,7 +1334,7 @@ pc_signed_ttl :: proc(u, e: Pw_RR, up_recs, el_recs: []Pw_RR, policy: Parity_Pol
 	now := u32(time.time_to_unix(time.now()))
 	lo, hi := max(u32), u32(0)
 	for r in el_recs {
-		if r.type != 46 || r.class != e.class || len(r.rdata) < 12 || !pc_name_equal_fold(r.name, e.name) {
+		if r.type != 46 || r.class != e.class || len(r.rdata) < 12 || !pw_names_equal_fold(r.name, e.name) {
 			continue
 		}
 		if pw_u16(r.rdata, 0) != covered {
@@ -1358,7 +1350,7 @@ pc_signed_ttl :: proc(u, e: Pw_RR, up_recs, el_recs: []Pw_RR, policy: Parity_Pol
 	}
 	received := u.ttl
 	for r in up_recs {
-		if r.class != e.class || !pc_name_equal_fold(r.name, e.name) {
+		if r.class != e.class || !pw_names_equal_fold(r.name, e.name) {
 			continue
 		}
 		if r.type == covered || (r.type == 46 && len(r.rdata) >= 2 && pw_u16(r.rdata, 0) == covered) {
