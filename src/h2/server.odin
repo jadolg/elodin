@@ -68,6 +68,8 @@ Response :: struct {
 	status:        int,
 	content_type:  string,
 	cache_control: string,
+	// RFC 6266: how a client stores the body, for a download such as a profile.
+	content_disposition: string,
 	// The methods the target supports, which RFC 9110 15.5.6 requires on a 405.
 	allow:         string,
 	// A reply to HEAD: no content (RFC 9110 9.3.2), and no content-length,
@@ -1501,6 +1503,9 @@ respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
 	}
 	if resp.cache_control != "" {
 		encode_header(&block, "cache-control", resp.cache_control)
+	}
+	if resp.content_disposition != "" {
+		encode_header(&block, "content-disposition", resp.content_disposition)
 	}
 	if resp.allow != "" {
 		encode_header(&block, "allow", resp.allow)

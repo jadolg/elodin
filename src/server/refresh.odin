@@ -119,6 +119,12 @@ is the same 512 bytes whatever the load. There is nothing here to exhaust.
 @(private)
 REFRESH_SLOTS :: 64
 
+// The divisor of `server.max_pending` that gives the stale refreshes their
+// ceiling, and the followers waiting on leaders theirs: a quarter each. See
+// `refresh_ceiling` and `follower_ceiling`.
+@(private)
+PENDING_SHARE :: 4
+
 @(private)
 Refresh_Table :: struct {
 	mu:    sync.Mutex,
@@ -229,7 +235,7 @@ refresh_ceiling :: proc(s: ^Server) -> int {
 	if limit <= 0 {
 		return REFRESH_SLOTS
 	}
-	return clamp(limit / 4, 1, REFRESH_SLOTS)
+	return clamp(limit / PENDING_SHARE, 1, REFRESH_SLOTS)
 }
 
 /*

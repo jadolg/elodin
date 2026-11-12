@@ -11,7 +11,6 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
-import "elodin:h2"
 import "elodin:upstream"
 
 /*
@@ -1306,6 +1305,88 @@ test_a_refusal_outlives_the_close_that_follows_it :: proc(t: ^testing.T) {
 	)
 }
 
+/*
+The 200 every HTTP answer here goes out as - a DoH answer, the profile and the
+metrics page - in one order of fields, with the one field each adds between
+Content-Length and Date, and to a HEAD the fields alone with GET's
+Content-Length (RFC 9110 9.3.2, 8.6).
+*/
+@(test)
+test_a_200_writes_its_fields_in_one_order :: proc(t: ^testing.T) {
+	Case :: struct {
+		content_type, field, value, body: string,
+		keep_alive, head:                 bool,
+		want:                             string,
+	}
+	cases := []Case {
+		{
+			DOH_CONTENT_TYPE,
+			"Cache-Control",
+			"max-age=300",
+			"abc",
+			true,
+			false,
+			"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: 3\r\nCache-Control: max-age=300\r\nDate: D\r\nServer: elodin/" + VERSION + "\r\nConnection: keep-alive\r\n\r\nabc",
+		},
+		{
+			"text/plain",
+			"Cache-Control",
+			"no-store",
+			"page",
+			false,
+			true,
+			"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nCache-Control: no-store\r\nDate: D\r\nServer: elodin/" + VERSION + "\r\nConnection: close\r\n\r\n",
+		},
+	}
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if lerr != nil {
+		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if berr != nil {
+		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+		return
+	}
+	for c in cases {
+		client, derr := net.dial_tcp_from_endpoint(bound)
+		if derr != nil {
+			testing.expectf(t, false, "cannot dial the listener: %v", derr)
+			return
+		}
+		defer net.close(client)
+		_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
+		accepted, _, aerr := net.accept_tcp(listener)
+		if aerr != nil {
+			testing.expectf(t, false, "nothing connected: %v", aerr)
+			return
+		}
+		written := send_http_ok(Conn{socket = accepted}, c.content_type, transmute([]u8)c.body, c.keep_alive, c.field, c.value, c.head)
+		net.close(accepted)
+		testing.expect(t, written, "the 200 was not written")
+
+		reply := make([dynamic]u8, 0, 512, context.temp_allocator)
+		for {
+			chunk: [512]u8
+			n, rerr := net.recv_tcp(client, chunk[:])
+			if rerr != nil || n == 0 {
+				break
+			}
+			append(&reply, ..chunk[:n])
+		}
+		// The date is the clock's; `http_date` has a test of its own.
+		got := string(reply[:])
+		if at := strings.index(got, "\r\nDate: "); at >= 0 {
+			end := strings.index(got[at + 2:], "\r\n")
+			if end >= 0 {
+				got = strings.concatenate({got[:at], "\r\nDate: D", got[at + 2 + end:]}, context.temp_allocator)
+			}
+		}
+		testing.expectf(t, got == c.want, "head=%v:\n got %q\nwant %q", c.head, got, c.want)
+	}
+}
+
 @(private = "file")
 Late_Body :: struct {
 	socket: net.TCP_Socket,
@@ -1988,10 +2069,10 @@ test_doh_a_timeout_near_the_range_limit_keeps_connections :: proc(t: ^testing.T)
 
 /*
 A POST's Content-Type is judged by its media type, whole and without regard to
-ASCII case (RFC 9110 8.3.1), on the HTTP/2 path and so through the predicate the
-HTTP/1.1 path shares. A prefix match would let `application/dns-message-bogus`
-in and a case-sensitive one would turn `Application/DNS-Message` away (#304); a
-Unicode fold would take the long s (U+017F) for an `s`.
+ASCII case (RFC 9110 8.3.1), by the check both HTTP versions share. A prefix
+match would let `application/dns-message-bogus` in and a case-sensitive one
+would turn `Application/DNS-Message` away (#304); a Unicode fold would take the
+long s (U+017F) for an `s`.
 */
 @(test)
 test_doh_content_type_is_the_media_type_folded :: proc(t: ^testing.T) {
@@ -2017,13 +2098,7 @@ test_doh_content_type_is_the_media_type_folded :: proc(t: ^testing.T) {
 	}
 	body := make([]u8, dns.HEADER_SIZE, context.temp_allocator)
 	for c in CASES {
-		req := h2.Request {
-			method       = "POST",
-			path         = "/dns-query",
-			content_type = c.content_type,
-			body         = body,
-		}
-		_, status, _, ok := h2_query_message(&req)
+		_, status, _, ok := doh_query_message("POST", c.content_type, body, "")
 		testing.expectf(t, ok == c.accepted, "%q: accepted %v, want %v", c.content_type, ok, c.accepted)
 		if !c.accepted {
 			testing.expectf(t, status == 415, "%q: status %d, want 415", c.content_type, status)

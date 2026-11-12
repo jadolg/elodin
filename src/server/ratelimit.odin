@@ -1106,18 +1106,15 @@ Client_Prefix :: struct {
 }
 
 client_prefix :: proc(address: net.Address) -> Client_Prefix {
-	p: Client_Prefix
-	switch a in netx.unmap(address) {
-	case net.IP4_Address:
-		p.bytes[0], p.bytes[1], p.bytes[2] = a[0], a[1], a[2]
-		p.n = 3
-	case net.IP6_Address:
-		for i in 0 ..< 4 {
-			p.bytes[i * 2] = u8(u16(a[i]) >> 8)
-			p.bytes[i * 2 + 1] = u8(u16(a[i]))
-		}
-		p.n = 8
+	a := netx.unmap(address)
+	if a == nil {
+		return {}
 	}
+	bytes, v6 := netx.address_bytes(a)
+	p := Client_Prefix {
+		n = 8 if v6 else 3,
+	}
+	copy(p.bytes[:p.n], bytes[:p.n])
 	return p
 }
 
@@ -1183,30 +1180,9 @@ report_rate_limiter :: proc(l: ^Live) {
 			rescued,
 		)
 	}
-	/*
-	And what the figure above is worth in bytes, when that is not simply the
-	figure times the ceiling.
-
-	Said only when the estimate can bite - at or above `max_udp_response` no
-	answer is ever charged more than one token, so the line would describe a
-	setting that is doing nothing. When it does bite, this is the multiplication
-	an operator would otherwise do by hand, and the number they were actually
-	choosing: what one client prefix can be made to receive.
-
-	The default tier's figure. A network named in `overrides` has its own
-	`responses_per_second`, printed on its own line below, and the same estimate
-	applies to it - the unit is one per server, see `Rate_Limiter.estimate`.
-
-	Rendered by `%.1M`, which is what every other byte figure this server prints
-	is rendered by - the receive buffer on the `udp:` line is the one beside it -
-	so the unit on the number is the unit the number was divided by. A figure of
-	its own for each scale, and a digit past the point at every one of them: a
-	tight budget - 10/s at the 64-byte floor - reads "640.0B/s" rather than
-	rounding into "about 0 KB/s", and 16/s at 128 reads "2.0KiB/s" rather than
-	standing for anything between one and two kibibytes. Both are figures an
-	operator cannot have meant, and one threshold hand-written here would have
-	traded the first for the second.
-	*/
+	// And what the figure above is worth in bytes, when that is not simply the
+	// figure times the ceiling: the multiplication an operator would otherwise do
+	// by hand. See `rate_limit_denomination_line`.
 	if text, say := rate_limit_denomination_line(
 		cfg.responses_per_second,
 		cfg.response_size_estimate,

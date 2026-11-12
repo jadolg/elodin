@@ -4,7 +4,6 @@ import "core:net"
 import "core:strings"
 import "core:sync"
 import "core:time"
-import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:h2"
 import "elodin:logx"
@@ -440,70 +439,24 @@ which reach the resolver, the cache or an upstream, and all of which could
 therefore starve the clients sharing their prefix while costing this server
 nothing it needed a budget for. The HTTP/1.1 endpoint charges after these same
 checks; this is that, one fiber earlier.
+
+`build_h2_response` asks `doh_query_message` again on the request's fiber, so a
+query is checked twice. What the second call costs is a base64 decode of a
+`:path` that HPACK's `MAX_HEADER_LIST` already bounds at 32 KiB, which is cheaper
+than the alternative: the decode lands in `context.temp_allocator`, and on the
+reader fiber that is the scratch `h2.serve` resets between frames, so carrying
+it across to the request's fiber would mean copying every message out to the
+heap - a cost on every query, to save a decode on the ones a browser sends by
+GET.
 */
 @(private)
 h2_charged :: proc(ctx: ^H2_Context, req: ^h2.Request) -> bool {
-	endpoint, _ := h2_split_path(req.path)
+	endpoint, query := h2_split_path(req.path)
 	if endpoint != ctx.path {
 		return false
 	}
-	_, _, _, is_query := h2_query_message(req)
+	_, _, _, is_query := doh_query_message(req.method, req.content_type, req.body, query)
 	return is_query
-}
-
-/*
-The DNS message a request to the DoH endpoint is asking about, or the status that
-says it was not asking about one.
-
-Split out of `build_h2_response` because `h2_charged` needs the question it
-answers - is this a query? - a fiber before the message itself is wanted, and
-the two must agree: a request charged here and refused there would spend a budget
-on a 400, and one refused here and charged there would let the same 400 through
-for free.
-
-Called twice per query as a result, once for the verdict and once for the
-message. What the second call costs is a base64 decode of a `:path` that HPACK's
-`MAX_HEADER_LIST` already bounds at 32 KiB, which is cheaper than the alternative:
-the decode lands in `context.temp_allocator`, and on the reader fiber that is the
-scratch `h2.serve` resets between frames, so carrying it across to the request's
-fiber would
-mean copying every message out to the heap - a cost on every query, to save a
-decode on the ones a browser sends by GET.
-*/
-@(private)
-h2_query_message :: proc(
-	req: ^h2.Request,
-) -> (
-	message: []u8,
-	status: int,
-	why: string,
-	ok: bool,
-) {
-	_, query := h2_split_path(req.path)
-	switch req.method {
-	case "POST":
-		if !doh_content_type_ok(req.content_type) {
-			return nil, 415, "unsupported media type", false
-		}
-		message = req.body
-	case "GET":
-		encoded, found := query_param(query, "dns")
-		if !found {
-			return nil, 400, "missing dns parameter", false
-		}
-		decoded, dok := decode_dns_param(encoded)
-		if !dok || len(decoded) == 0 {
-			return nil, 400, "malformed dns parameter", false
-		}
-		message = decoded
-	case:
-		return nil, 405, "method not allowed", false
-	}
-
-	if len(message) < dns.HEADER_SIZE {
-		return nil, 400, "message too short", false
-	}
-	return message, 0, "", true
 }
 
 @(private)
@@ -516,11 +469,23 @@ build_h2_response :: proc(
 	resp: h2.Response,
 	ok: bool,
 ) {
-	path, _ := h2_split_path(req.path)
+	path, query := h2_split_path(req.path)
 
 	mc_path := startup_config(ctx.server).listeners.doh.mobileconfig_path
 	if mc_path != "" && path == mc_path {
-		return build_h2_mobileconfig(ctx, req)
+		// The HTTP/1.1 endpoint's twin, the host read from `:authority` - the
+		// HTTP/2 spelling of `Host`. See `doh_profile`.
+		profile, status, why, is_profile := doh_profile(ctx.server, req.method, req.authority, "missing or invalid :authority")
+		if !is_profile {
+			return h2_error(status, why, MOBILECONFIG_METHODS if status == 405 else ""), true
+		}
+		return h2.Response {
+				status = 200,
+				content_type = DOH_MOBILECONFIG_CONTENT_TYPE,
+				content_disposition = PROFILE_DISPOSITION,
+				body = profile,
+			},
+			true
 	}
 	if path != ctx.path {
 		return h2_error(404, "not found"), true
@@ -529,7 +494,7 @@ build_h2_response :: proc(
 	// The status is built here rather than by the check, so that the refusal is
 	// logged and formatted once - on the request's fiber, by the call that wants
 	// the message - and not again by `h2_charged` on the reader fiber.
-	message, status, why, is_query := h2_query_message(req)
+	message, status, why, is_query := doh_query_message(req.method, req.content_type, req.body, query)
 	if !is_query {
 		return h2_error(status, why, DOH_METHODS if status == 405 else ""), true
 	}
@@ -551,47 +516,8 @@ build_h2_response :: proc(
 	return h2.Response {
 			status = 200,
 			content_type = DOH_CONTENT_TYPE,
-			cache_control = h2_cache_control(max_age),
+			cache_control = doh_cache_control(max_age),
 			body = answer,
-		},
-		true
-}
-
-/*
-Answer the .mobileconfig endpoint over HTTP/2.
-
-The HTTP/1.1 endpoint's twin: a GET returns the Apple profile, the URL inside it
-built from the request's `:authority` - the HTTP/2 spelling of `Host` - so a
-stream carrying none, or one for a host this server has no certificate for, is
-turned away rather than handed a profile that names an unreachable host. The
-profile is signed, and refused rather than served unsigned; see
-`serve_doh_mobileconfig`, whose answers this mirrors.
-*/
-@(private)
-build_h2_mobileconfig :: proc(ctx: ^H2_Context, req: ^h2.Request) -> (resp: h2.Response, ok: bool) {
-	if req.method != "GET" {
-		return h2_error(405, "method not allowed", MOBILECONFIG_METHODS), true
-	}
-	if !valid_mobileconfig_host(req.authority) {
-		return h2_error(400, "missing or invalid :authority"), true
-	}
-	profile, status := profile_for_host(
-		ctx.server.profiles,
-		req.authority,
-		tlsx.unix_now(),
-		context.temp_allocator,
-	)
-	switch status {
-	case .Unknown_Host:
-		return h2_error(400, "not a host and port this server serves"), true
-	case .Unavailable:
-		return h2_error(503, "profile signing unavailable"), true
-	case .OK:
-	}
-	return h2.Response {
-			status = 200,
-			content_type = DOH_MOBILECONFIG_CONTENT_TYPE,
-			body = profile,
 		},
 		true
 }
@@ -603,14 +529,6 @@ h2_split_path :: proc(path: string) -> (endpoint: string, query: string) {
 		return path[:idx], path[idx + 1:]
 	}
 	return path, ""
-}
-
-@(private)
-h2_cache_control :: proc(max_age: u32) -> string {
-	b := strings.builder_make(context.temp_allocator)
-	strings.write_string(&b, "max-age=")
-	strings.write_int(&b, int(max_age))
-	return strings.to_string(b)
 }
 
 @(private)

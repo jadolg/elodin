@@ -193,11 +193,11 @@ answers at once.
 locally_served_zone :: proc(name: string) -> (zone: string, found: bool) {
 	// Every entry is under `arpa.`, and `special_use_zone` asks this for every
 	// query: one compare turns the forward names away before the full scan.
-	if !name_below(name, "arpa.") {
+	if !dns.name_below(name, "arpa.") {
 		return "", false
 	}
 	for z in LOCALLY_SERVED_ZONES {
-		if name_at_or_below(name, z) {
+		if dns.name_at_or_below(name, z) {
 			return z, true
 		}
 	}
@@ -215,7 +215,7 @@ else here: the anchor has to sit on a label break, not merely be a string suffix
 @(private)
 covered_by_local_anchor :: proc(s: ^Server, name: string) -> bool {
 	for zone in live(s).anchor_zones {
-		if name_at_or_below(name, zone) {
+		if dns.name_at_or_below(name, zone) {
 			return true
 		}
 	}
@@ -434,24 +434,24 @@ special_use_zone :: proc(
 	// cleanly and never fire.
 	//
 	// The two with no key of their own.
-	if name_at_or_below(name, "localhost.") {
+	if dns.name_at_or_below(name, "localhost.") {
 		return "localhost.", .Loopback
 	}
-	if name_at_or_below(name, "invalid.") {
+	if dns.name_at_or_below(name, "invalid.") {
 		return "invalid.", .Nonexistent
 	}
 	// The three an operator can hand back to the upstream, each for a
 	// deployment that really is served there.
-	if live(s).cfg.special_use.onion && name_at_or_below(name, "onion.") {
+	if live(s).cfg.special_use.onion && dns.name_at_or_below(name, "onion.") {
 		return "onion.", .Nonexistent
 	}
-	if live(s).cfg.special_use.local && name_at_or_below(name, "local.") {
+	if live(s).cfg.special_use.local && dns.name_at_or_below(name, "local.") {
 		return "local.", .Nonexistent
 	}
-	if live(s).cfg.special_use.test && name_at_or_below(name, "test.") {
+	if live(s).cfg.special_use.test && dns.name_at_or_below(name, "test.") {
 		return "test.", .Nonexistent
 	}
-	if live(s).cfg.special_use.home_arpa && name_at_or_below(name, "home.arpa.") {
+	if live(s).cfg.special_use.home_arpa && dns.name_at_or_below(name, "home.arpa.") {
 		// The delegation's own DS, and only at the apex: a DS below it is a
 		// query about a name that exists nowhere but this network, and the
 		// answer to that one really is here.
@@ -506,7 +506,7 @@ special_use_zone :: proc(
 has_zone_below :: proc(s: ^Server, name: string) -> bool {
 	for r in live(s).cfg.rewrites {
 		// "*.x." is held as "x." and answers below it, so "x." is above a name.
-		if name_below(r.domain, name) || (r.wildcard && dns.name_equal_fold(r.domain, name)) {
+		if dns.name_below(r.domain, name) || (r.wildcard && dns.name_equal_fold(r.domain, name)) {
 			return true
 		}
 		if r.wildcard || !r.ptr {
@@ -515,20 +515,20 @@ has_zone_below :: proc(s: ^Server, name: string) -> bool {
 		for a in r.answers {
 			local := (a.kind == .A && address_is_local_v4(a.v4)) || (a.kind == .AAAA && address_is_local_v6(a.v6))
 			buf: [80]u8
-			if local && name_below(reverse_name_of(a, buf[:]), name) {
+			if local && dns.name_below(reverse_name_of(a, buf[:]), name) {
 				return true
 			}
 		}
 	}
 	for route in live(s).routes {
 		for domain in route.domains {
-			if name_below(domain, name) {
+			if dns.name_below(domain, name) {
 				return true
 			}
 		}
 	}
 	for zone in live(s).anchor_zones {
-		if name_below(zone, name) {
+		if dns.name_below(zone, name) {
 			return true
 		}
 	}
@@ -599,7 +599,7 @@ special_use_deferred :: proc(s: ^Server, name: string) -> bool {
 	if live(s).cfg.special_use.enabled && live(s).cfg.special_use.onion {
 		return false
 	}
-	if !name_at_or_below(name, "onion.") {
+	if !dns.name_at_or_below(name, "onion.") {
 		return false
 	}
 	// An anchor over the zone is the operator asking for the opposite, and it is
@@ -728,29 +728,4 @@ answer_special_use :: proc(
 		return fallback
 	}
 	return out
-}
-
-/*
-Whether `name` sits strictly below `zone`, the zone's own name excluded.
-
-This is what a wildcard means: "*.lan." stands for at least one label under
-"lan.", so `find_rewrite_index` in the resolver asks this question while the
-callers above ask the inclusive one. Both go through the same test so that
-neither can be tightened or loosened without the other following.
-
-The comparison folds case throughout, since DNS names compare without regard to
-it (RFC 1035 section 2.3.3, restated for every label by RFC 4343) and the names
-reaching here are whatever the client spelled - nothing upstream of this lowers
-them, deliberately, so that a response can echo the question back byte for
-byte. That rules out any byte-wise shortcut on the suffix, however tempting one
-looks in front of the fold.
-*/
-@(private)
-name_below :: proc(name, zone: string) -> bool {
-	return dns.name_below(name, zone)
-}
-
-@(private)
-name_at_or_below :: proc(name, zone: string) -> bool {
-	return dns.name_at_or_below(name, zone)
 }

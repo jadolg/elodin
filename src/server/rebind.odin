@@ -185,16 +185,11 @@ the argument for the default it has is in `Rebind_Config`.
 /*
 The name RFC 6761 section 6.3 reserves, with everything under it.
 
-`name_at_or_below` gives both halves of what section 6.3 describes - the name
+`dns.name_at_or_below` gives both halves of what section 6.3 describes - the name
 itself and any name ending in `.localhost.` - from one entry.
 */
 @(private)
 LOCALHOST_ZONE :: "localhost."
-
-// RFC 8914 code 15, "Blocked": the answer was withheld for an internal security
-// policy of the resolver's, which is exactly what this is. 17 ("Filtered") is
-// the one for filtering the client itself asked for, and nobody asked for this.
-EDE_BLOCKED :: 15
 
 // SvcParamKeys 4 and 6, RFC 9460 sections 7.3 and 7.4. Everything else in the
 // parameter list is a port, an ALPN or a public key, none of which name a host.
@@ -303,7 +298,7 @@ rebind_refusal :: proc(
 	// beside each address: `localhost.` earns the same latitude the setting
 	// grants, and one verdict per query is what keeps the two from drifting into
 	// meaning different things about the same address.
-	loopback_ok := live(s).cfg.rebind.allow_loopback || name_at_or_below(q.name, LOCALHOST_ZONE)
+	loopback_ok := live(s).cfg.rebind.allow_loopback || dns.name_at_or_below(q.name, LOCALHOST_ZONE)
 
 	addr, v6, found := first_private_answer(msg, loopback_ok)
 	if !found {
@@ -477,7 +472,7 @@ dnsmasq and what an operator writing a zone name expects.
 @(private)
 rebind_exempt :: proc(domains: []string, name: string) -> bool {
 	for domain in domains {
-		if name_at_or_below(name, domain) {
+		if dns.name_at_or_below(name, domain) {
 			return true
 		}
 	}
@@ -503,15 +498,9 @@ first_private_answer :: proc(msg: dns.Message, loopback_ok: bool) -> (addr: [16]
 	service_answer := false
 	for rec in msg.answer {
 		switch data in rec.data {
-		case dns.Rdata_A:
-			a: [16]u8
-			a[0], a[1], a[2], a[3] = data.addr[0], data.addr[1], data.addr[2], data.addr[3]
-			if rebind_private(a, false, loopback_ok) {
-				return a, false, true
-			}
-		case dns.Rdata_AAAA:
-			if rebind_private(data.addr, true, loopback_ok) {
-				return data.addr, true, true
+		case dns.Rdata_A, dns.Rdata_AAAA:
+			if a, is6, hit := private_address_record(rec.data, loopback_ok); hit {
+				return a, is6, true
 			}
 		case dns.Rdata_SVCB:
 			service_answer = true
@@ -533,20 +522,26 @@ first_private_answer :: proc(msg: dns.Message, loopback_ok: bool) -> (addr: [16]
 		return {}, false, false
 	}
 	for rec in msg.additional {
-		#partial switch data in rec.data {
-		case dns.Rdata_A:
-			a: [16]u8
-			a[0], a[1], a[2], a[3] = data.addr[0], data.addr[1], data.addr[2], data.addr[3]
-			if rebind_private(a, false, loopback_ok) {
-				return a, false, true
-			}
-		case dns.Rdata_AAAA:
-			if rebind_private(data.addr, true, loopback_ok) {
-				return data.addr, true, true
-			}
+		if a, is6, hit := private_address_record(rec.data, loopback_ok); hit {
+			return a, is6, true
 		}
 	}
 	return {}, false, false
+}
+
+// The address an A or AAAA record carries, as `rebind_private` reads one, and
+// whether it is private; false for every other type.
+@(private)
+private_address_record :: proc(data: dns.Record_Data, loopback_ok: bool) -> (addr: [16]u8, v6: bool, found: bool) {
+	#partial switch d in data {
+	case dns.Rdata_A:
+		addr[0], addr[1], addr[2], addr[3] = d.addr[0], d.addr[1], d.addr[2], d.addr[3]
+	case dns.Rdata_AAAA:
+		addr, v6 = d.addr, true
+	case:
+		return {}, false, false
+	}
+	return addr, v6, rebind_private(addr, v6, loopback_ok)
 }
 
 /*

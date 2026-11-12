@@ -4,10 +4,6 @@ import "core:sync"
 import "core:time"
 import "elodin:loop"
 
-// Stamped at build time from the git tag; see ELODIN_VERSION in mise.toml. A
-// build that bypasses mise reports "dev" rather than claiming a release number.
-VERSION :: #config(ELODIN_VERSION, "dev")
-
 /*
 Bookkeeping for the fibers that serve connections, and for the listeners' own.
 

@@ -203,6 +203,10 @@ Stats :: struct {
 	upstream_shed:    u64,
 }
 
+// Stamped at build time from the git tag; see ELODIN_VERSION in mise.toml. A
+// build that bypasses mise reports "dev" rather than claiming a release number.
+VERSION :: #config(ELODIN_VERSION, "dev")
+
 Server :: struct {
 	/*
 	The configuration and everything built from it, as a test that builds this
@@ -1359,20 +1363,7 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		// Not in a detached refresh, whose answer is neither served nor - being
 		// a rewrite - stored, and which must not start another one.
 		if cname, is_alias := alias.?; is_alias && !st.refresh {
-			out, counted = chase_rewrite_alias(
-				st.s,
-				out,
-				cname,
-				st.msg,
-				st.proto,
-				st.client,
-				st.limit,
-				st.cookie,
-				st.started,
-				st.spent,
-				st.allocator,
-				st.pool,
-			)
+			out, counted = chase_rewrite_alias(st, out, cname)
 		}
 		// Nothing built is a failure, as `shape_forwarded` counts one.
 		if !counted {
@@ -3382,6 +3373,37 @@ answering_upstream :: proc(u: ^upstream.Upstream) -> string {
 	return u.spec.name if u != nil else "?"
 }
 
+// For a reply no upstream can be named for, which the per-upstream gate cannot
+// hold; see `upstream.Upstream.unreadable`.
+@(private)
+unreadable_rcode_reported: logx.Gate
+
+// The line about an upstream OPT record `resolve_query` refuses, for a reply
+// no upstream can be named for; see `upstream.Upstream.stray_opt`.
+@(private)
+unreadable_opt_reported: logx.Gate
+
+/*
+What to call an rcode in a line a person reads.
+
+`%v` on an `Rcode` prints Odin's `BAD ENUM VALUE` placeholder for every composed
+value the enum does not name, which is all but eight of the 4080 an OPT record
+can carry (RFC 6891 section 6.1.3) - and the byte those upper bits come out of is
+one an on-path attacker writes, so it would pick a value that renders as the
+placeholder and leave both the operator's line and the client's extended error
+saying nothing. The number is what is true when the name is not known, and
+`RCODE<n>` is the shape RFC 3597 gave the same problem for types and classes -
+nothing standardises it for an rcode, so this follows the neighbouring
+convention rather than a rule.
+*/
+@(private)
+rcode_text :: proc(rcode: dns.Rcode) -> string {
+	if name, known := dns.rcode_name(rcode); known {
+		return name
+	}
+	return fmt.tprintf("RCODE%d", u16(rcode))
+}
+
 /*
 An upstream reply whose rcode the client cannot read, answered SERVFAIL instead.
 
@@ -3432,45 +3454,6 @@ with the rcode named, the way the rebinding guard and the validator explain
 their own refusals. A client that queried without EDNS has nowhere to put one
 and gets the bare SERVFAIL.
 */
-// For a reply no upstream can be named for, which the per-upstream gate cannot
-// hold; see `upstream.Upstream.unreadable`.
-@(private)
-unreadable_rcode_reported: logx.Gate
-
-// The line about an upstream OPT record `resolve_query` refuses, for a reply
-// no upstream can be named for; see `upstream.Upstream.stray_opt`.
-@(private)
-unreadable_opt_reported: logx.Gate
-
-/*
-What to call an rcode in a line a person reads.
-
-`%v` on an `Rcode` prints Odin's `BAD ENUM VALUE` placeholder for every composed
-value the enum does not name, which is all but eight of the 4080 an OPT record
-can carry (RFC 6891 section 6.1.3) - and the byte those upper bits come out of is
-one an on-path attacker writes, so it would pick a value that renders as the
-placeholder and leave both the operator's line and the client's extended error
-saying nothing. The number is what is true when the name is not known, and
-`RCODE<n>` is the shape RFC 3597 gave the same problem for types and classes -
-nothing standardises it for an rcode, so this follows the neighbouring
-convention rather than a rule.
-*/
-@(private)
-rcode_text :: proc(rcode: dns.Rcode) -> string {
-	if name, known := dns.rcode_name(rcode); known {
-		return name
-	}
-	return fmt.tprintf("RCODE%d", u16(rcode))
-}
-
-// RFC 8914 section 4.1: the error does not match any of the pre-defined codes,
-// so the EXTRA-TEXT is what carries it. There is no code for "the responder's
-// rcode is not one a client can be handed", and inventing a nearer-sounding one
-// - a network error, an unreachable authority - would say something untrue about
-// an upstream that answered.
-@(private)
-EDE_OTHER :: 0
-
 @(private)
 unreadable_rcode_refusal :: proc(
 	s: ^Server,
@@ -4155,64 +4138,29 @@ encode_block_response :: proc(
 	limit: int,
 	typed_only: bool,
 ) -> []u8 {
-	ttl := live(s).cfg.blocking.block_ttl
-
-	rcode := dns.Rcode.No_Error
+	blocking := &live(s).cfg.blocking
+	ttl := blocking.block_ttl
+	rcode := block_rcode(blocking.response, typed_only)
 	// On the stack, as in `answer_special_use`: one record at most.
 	answer_buf: [1]dns.Record
-	answers := slice.into_dynamic(answer_buf[:])
-
-	switch live(s).cfg.blocking.response {
-	case .NX_Domain:
-		/*
-		Unless only a `$dnstype` rule blocked it (`typed_only`): NXDOMAIN says the
-		name has no records of any type, nor anything below it (RFC 8020 section
-		2, RFC 2308 section 5), and a cache would answer the types left open
-		with it. NODATA withholds the one type asked for.
-		*/
-		if !typed_only {
-			rcode = .NX_Domain
+	answers := answer_buf[:0]
+	if addr := block_address(blocking, q.type); addr != nil {
+		rec := dns.Record{name = q.name, type = q.type, class = .IN, ttl = ttl}
+		if q.type == .A {
+			a: dns.Rdata_A
+			copy(a.addr[:], addr)
+			rec.data = a
+		} else {
+			a: dns.Rdata_AAAA
+			copy(a.addr[:], addr)
+			rec.data = a
 		}
-	case .Refused:
-		rcode = .Refused
-	case .No_Data:
-	// NOERROR with an empty answer section
-	case .Zero_IP:
-		#partial switch q.type {
-		case .A:
-			append(&answers, dns.Record{name = q.name, type = .A, class = .IN, ttl = ttl, data = dns.Rdata_A{}})
-		case .AAAA:
-			append(&answers, dns.Record{name = q.name, type = .AAAA, class = .IN, ttl = ttl, data = dns.Rdata_AAAA{}})
-		}
-	case .Custom_IP:
-		#partial switch q.type {
-		case .A:
-			append(
-				&answers,
-				dns.Record {
-					name = q.name,
-					type = .A,
-					class = .IN,
-					ttl = ttl,
-					data = dns.Rdata_A{addr = live(s).cfg.blocking.custom_ipv4},
-				},
-			)
-		case .AAAA:
-			append(
-				&answers,
-				dns.Record {
-					name = q.name,
-					type = .AAAA,
-					class = .IN,
-					ttl = ttl,
-					data = dns.Rdata_AAAA{addr = live(s).cfg.blocking.custom_ipv6},
-				},
-			)
-		}
+		answer_buf[0] = rec
+		answers = answer_buf[:]
 	}
 
 	resp := dns.make_response(query, rcode, allocator)
-	resp.answer = answers[:]
+	resp.answer = answers
 	soa: [1]dns.Record
 	if len(answers) == 0 && rcode != .Refused {
 		// An SOA in the authority section tells resolvers how long to remember
@@ -4265,16 +4213,30 @@ synth_soa_for_zone :: proc(zone: string, ttl: u32) -> dns.Record {
 		class = .IN,
 		ttl = ttl,
 		data = dns.Rdata_SOA {
-			ns = "localhost.",
-			mbox = "hostmaster.invalid.",
-			serial = 1,
-			refresh = 3600,
-			retry = 900,
-			expire = 604800,
+			ns = SYNTH_SOA_NS,
+			mbox = SYNTH_SOA_MBOX,
+			serial = SYNTH_SOA_SERIAL,
+			refresh = SYNTH_SOA_REFRESH,
+			retry = SYNTH_SOA_RETRY,
+			expire = SYNTH_SOA_EXPIRE,
 			minimum = ttl,
 		},
 	}
 }
+
+// The synthetic SOA's fixed fields, which `put_soa` writes as well.
+@(private)
+SYNTH_SOA_NS :: "localhost."
+@(private)
+SYNTH_SOA_MBOX :: "hostmaster.invalid."
+@(private)
+SYNTH_SOA_SERIAL :: 1
+@(private)
+SYNTH_SOA_REFRESH :: 3600
+@(private)
+SYNTH_SOA_RETRY :: 900
+@(private)
+SYNTH_SOA_EXPIRE :: 604800
 
 /*
 The longest chain of CNAME rewrites one answer carries. A loop ends sooner, at
@@ -4418,18 +4380,10 @@ upstream's reply to a question the client did not ask.
 */
 @(private)
 chase_rewrite_alias :: proc(
-	s: ^Server,
+	// The request whose question `alias` answers; each link is looked up as it.
+	st: ^Query_State,
 	plain: []u8,
 	alias: dns.Record,
-	msg: dns.Message,
-	proto: Protocol,
-	client: string,
-	limit: int,
-	cookie: Cookie_Request,
-	started: time.Tick,
-	spent: ^int,
-	allocator: mem.Allocator,
-	pool: dnssec.Walk_Pool,
 ) -> (
 	response: []u8,
 	// Whether the target's lookup counted this query under its own outcome, as
@@ -4438,6 +4392,7 @@ chase_rewrite_alias :: proc(
 	// `elodin_answers_total` however long the chain.
 	counted: bool,
 ) {
+	s, msg, limit, allocator := st.s, st.msg, st.limit, st.allocator
 	q := msg.question[0]
 	if q.type == .CNAME || q.type == .ANY {
 		return plain, false
@@ -4482,7 +4437,19 @@ chase_rewrite_alias :: proc(
 			if enc != .None {
 				break walk
 			}
-			r := resolve_query(s, wire, next, proto, client, limit, cookie, started, spent, allocator, pool = pool)
+			r := resolve_query(
+				s,
+				wire,
+				next,
+				st.proto,
+				st.client,
+				limit,
+				st.cookie,
+				st.started,
+				st.spent,
+				allocator,
+				pool = st.pool,
+			)
 			out, outcome, code = r.response, r.outcome, r.ede
 			// A refusal counts nowhere in that family, the RD gate's included,
 			// and nor does a special-use name, so the chain either leaves as the
@@ -4502,7 +4469,7 @@ chase_rewrite_alias :: proc(
 			}
 			continue walk
 		}
-		got, derr := dns.decode_message(out, allocator, spent)
+		got, derr := dns.decode_message(out, allocator, st.spent)
 		if derr != .None {
 			// The target was answered and this server could not read the answer
 			// back - the request's decode budget, in practice. SERVFAIL, not the
@@ -4768,11 +4735,11 @@ find_rewrite_index :: proc(
 	for r, offset in rules[from:] {
 		i := offset + from
 		if r.wildcard {
-			// "*.lan." matches any strictly deeper name, which is `name_below`
+			// "*.lan." matches any strictly deeper name, which is `dns.name_below`
 			// exactly: the label-break guard that keeps "notlan." out of a rule
 			// written for "lan.", and the case-insensitive comparison that DNS
 			// requires, are both its business rather than this loop's.
-			if name_below(name, r.domain) {
+			if dns.name_below(name, r.domain) {
 				return i, true
 			}
 			continue

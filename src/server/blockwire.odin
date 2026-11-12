@@ -94,7 +94,16 @@ block_wire :: proc(
 	return out, true
 }
 
-// The rcode `encode_block_response` answers with; see there for why.
+/*
+The rcode a block answers with, for both `block_wire` and `encode_block_response`.
+
+NXDOMAIN unless only a `$dnstype` rule blocked it (`typed_only`): NXDOMAIN says
+the name has no records of any type, nor anything below it (RFC 8020 section 2,
+RFC 2308 section 5), and a cache would answer the types left open with it.
+NODATA withholds the one type asked for. `No_Data`, `Zero_IP` and `Custom_IP`
+are NOERROR, the last two with the address `block_address` gives where the type
+has one.
+*/
 @(private)
 block_rcode :: proc(response: config.Block_Response, typed_only: bool) -> dns.Rcode {
 	#partial switch response {
@@ -143,10 +152,11 @@ put_soa :: proc(buf: []u8, p: ^int, first_label: u8, ttl: u32) {
 	wire_u16(buf, p, u16(dns.Type.SOA))
 	wire_u16(buf, p, u16(dns.Class.IN))
 	wire_u32(buf, p, ttl)
+	// `SYNTH_SOA_NS` and `SYNTH_SOA_MBOX`, in wire form.
 	rdata := "\x09localhost\x00\x0ahostmaster\x07invalid\x00"
 	wire_u16(buf, p, u16(len(rdata) + 20))
 	p^ += copy(buf[p^:], rdata)
-	fields := [5]u32{1, 3600, 900, 604800, ttl}
+	fields := [5]u32{SYNTH_SOA_SERIAL, SYNTH_SOA_REFRESH, SYNTH_SOA_RETRY, SYNTH_SOA_EXPIRE, ttl}
 	for v in fields {
 		wire_u32(buf, p, v)
 	}

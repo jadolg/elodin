@@ -216,29 +216,17 @@ metrics_accept_loop :: proc(data: rawptr) {
 			break
 		}
 		/*
-		The DNS listeners' handling exactly, including reading every field of the
-		action on every path - this is the quietest socket in the process, so the
-		poll tick is almost the only thing that ever takes its run to zero, and a
-		re-arm read only after a successful accept would be one this loop never
-		performs.
+		The DNS listeners' handling, `accept_settle`, which reads every field of
+		the action on every path - this is the quietest socket in the process, so
+		the poll tick is almost the only thing that ever takes its run to zero,
+		and a re-arm read only after a successful accept would be one this loop
+		never performs.
 
 		`accept_backoff=` counts the waiting rather than a connection, which is
 		what lets this loop share it without putting a scraper into a
 		client-facing counter.
 		*/
-		act := accept_action(err, run)
-		run = act.run
-		if act.recovered {
-			rearm_accept_reports(&ctx.accept_reported)
-		}
-		if err != nil {
-			if act.wait > 0 {
-				sync.atomic_add(&ctx.server.stats.accept_backoff, 1)
-				if act.report {
-					report_accept_failure("metrics", act.run, err, &ctx.accept_reported)
-				}
-				time.sleep(act.wait)
-			}
+		if accept_settle(ctx.server, &run, err, "metrics", &ctx.accept_reported) {
 			continue
 		}
 		serve_metrics(ctx.server, l, client_socket, client)
@@ -278,23 +266,8 @@ serve_metrics :: proc(s: ^Server, l: ^Listeners, socket: net.TCP_Socket, client:
 		// A scraper is a program, and one whose request line this endpoint will
 		// not read is one whose author has something to fix: the status says
 		// which half of it was wrong instead of leaving a bare closed connection
-		// to be read as the endpoint being down. 0 is a request that is not
-		// answered at all - see `read_http_request`.
-		if status != 0 {
-			_ = send_http_error(
-				conn,
-				"metrics",
-				status,
-				http_refusal_message(status),
-				false,
-				head = req.method == "HEAD",
-			)
-			// The refused request may have declared a body that was never read, and
-			// the close in the accept loop would take the answer with it. The body
-			// may not have finished arriving either, which is the longer of the two
-			// idle waits - see `HTTP_LINGER_BODY_IDLE`.
-			http_linger(conn, HTTP_LINGER_BODY_IDLE)
-		}
+		// to be read as the endpoint being down. The close is the accept loop's.
+		refuse_http_request(conn, "metrics", status, req.method)
 		return
 	}
 
@@ -315,28 +288,17 @@ serve_metrics :: proc(s: ^Server, l: ^Listeners, socket: net.TCP_Socket, client:
 	}
 
 	body := render_metrics(s, l, context.temp_allocator)
-
-	b := strings.builder_make(context.temp_allocator)
-	strings.write_string(&b, "HTTP/1.1 200 OK\r\nContent-Type: ")
-	strings.write_string(&b, metrics.CONTENT_TYPE)
-	strings.write_string(&b, "\r\nContent-Length: ")
-	strings.write_int(&b, len(body))
 	// Nothing here may be cached: a scraper that re-read a stored copy would
 	// draw a flat line over a server that had stopped answering.
-	strings.write_string(&b, "\r\nCache-Control: no-store\r\nDate: ")
-	strings.write_string(&b, now_http_date(context.temp_allocator))
-	strings.write_string(&b, "\r\nServer: elodin/")
-	strings.write_string(&b, VERSION)
-	strings.write_string(&b, "\r\nConnection: close\r\n\r\n")
-
-	if !conn_write_all(conn, transmute([]u8)strings.to_string(b)) {
-		return
-	}
-	// A HEAD answer carries the headers the body would have had and no body.
-	if req.method == "HEAD" {
-		return
-	}
-	_ = conn_write_all(conn, transmute([]u8)body)
+	_ = send_http_ok(
+		conn,
+		metrics.CONTENT_TYPE,
+		transmute([]u8)body,
+		false,
+		"Cache-Control",
+		"no-store",
+		head = req.method == "HEAD",
+	)
 }
 
 /*
@@ -577,6 +539,9 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		)
 	}
 
+	// The help names `ZONE_GATES` by its value, a constant string being what
+	// `metrics.family` takes.
+	#assert(ZONE_GATES == 16)
 	metrics.family(
 		&b,
 		"elodin_dnssec_answers_total",
@@ -659,7 +624,7 @@ render_udp_metrics :: proc(b: ^strings.Builder, l: ^Listeners) {
 			b,
 			"elodin_udp_datagrams_total",
 			sync.atomic_load(&reader.received),
-			metrics.Label{"reader", reader_label(i)},
+			metrics.Label{"reader", index_label(i)},
 		)
 	}
 
@@ -674,12 +639,12 @@ render_udp_metrics :: proc(b: ^strings.Builder, l: ^Listeners) {
 		"Datagrams the kernel dropped on each reader's receive queue before they could be read.",
 	)
 	for n, i in drops {
-		metrics.sample(b, "elodin_udp_receive_drops_total", n, metrics.Label{"reader", reader_label(i)})
+		metrics.sample(b, "elodin_udp_receive_drops_total", n, metrics.Label{"reader", index_label(i)})
 	}
 }
 
 /*
-The reader index as a label value.
+A reader's or a loop's index as a label value.
 
 Formatted into the temporary arena, which the metrics loop resets after every
 scrape - the same arena the rendered page itself is built in. The label is
@@ -687,7 +652,7 @@ copied into the builder by `metrics.sample` before it returns, so nothing here
 outlives the reset.
 */
 @(private)
-reader_label :: proc(i: int) -> string {
+index_label :: proc(i: int) -> string {
 	return fmt.tprintf("%d", i)
 }
 
@@ -1023,7 +988,7 @@ render_loop_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 
 	metrics.family(b, "elodin_fibers", .Gauge, "Fibers running on each event loop.")
 	for l, i in s.loops {
-		metrics.sample(b, "elodin_fibers", i64(loop.fibers_alive(l)), metrics.Label{"loop", fmt.tprintf("%d", i)})
+		metrics.sample(b, "elodin_fibers", i64(loop.fibers_alive(l)), metrics.Label{"loop", index_label(i)})
 	}
 
 	metrics.family(b, "elodin_queries_inflight", .Gauge, "Queries admitted on fibers of their own and not yet answered.")

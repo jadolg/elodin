@@ -435,7 +435,7 @@ test_an_exempt_domain_may_resolve_to_a_private_address :: proc(t: ^testing.T) {
 	And the exemption stops at the label break. `notcorp.example` is not inside
 	`corp.example`, however much of a string suffix it is - the same rule the
 	rewrites and the locally-served zones are matched by, and the reason all
-	three go through `name_at_or_below`.
+	three go through `dns.name_at_or_below`.
 	*/
 	cfg := rebind_config()
 	exempt := make([]string, 1, context.temp_allocator)

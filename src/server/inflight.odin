@@ -156,7 +156,7 @@ follower_ceiling :: proc(s: ^Server) -> int {
 	if limit <= 0 {
 		return 0
 	}
-	return max(limit / 4, 1)
+	return max(limit / PENDING_SHARE, 1)
 }
 
 /*

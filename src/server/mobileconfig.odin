@@ -1,6 +1,7 @@
 package server
 
 import "core:crypto/siphash"
+import "core:fmt"
 import "core:strings"
 
 /*
@@ -55,75 +56,72 @@ build_doh_mobileconfig :: proc(host: string, doh_path: string, allocator := cont
 	// payloads in one profile need distinct UUIDs, hence the tags.
 	profile_uuid := mobileconfig_uuid(server_url_raw, "profile")
 	dns_uuid := mobileconfig_uuid(server_url_raw, "dns")
-
-	url := xml_escape(server_url_raw, context.temp_allocator)
 	display_host := xml_escape(host, context.temp_allocator)
 
-	b := strings.builder_make(allocator)
-	strings.write_string(&b, `<?xml version="1.0" encoding="UTF-8"?>`)
-	strings.write_byte(&b, '\n')
-	strings.write_string(
-		&b,
-		`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
+	return fmt.aprintf(
+		MOBILECONFIG_TEMPLATE,
+		xml_escape(server_url_raw, context.temp_allocator),
+		mobileconfig_identifier(dns_uuid),
+		dns_uuid,
+		display_host,
+		display_host,
+		mobileconfig_identifier(profile_uuid),
+		profile_uuid,
+		allocator = allocator,
 	)
-	strings.write_byte(&b, '\n')
-	strings.write_string(&b, "<plist version=\"1.0\">\n")
-	strings.write_string(&b, "<dict>\n")
-	strings.write_string(&b, "\t<key>PayloadContent</key>\n")
-	strings.write_string(&b, "\t<array>\n")
-	strings.write_string(&b, "\t\t<dict>\n")
-	strings.write_string(&b, "\t\t\t<key>DNSSettings</key>\n")
-	strings.write_string(&b, "\t\t\t<dict>\n")
-	strings.write_string(&b, "\t\t\t\t<key>DNSProtocol</key>\n")
-	strings.write_string(&b, "\t\t\t\t<string>HTTPS</string>\n")
-	strings.write_string(&b, "\t\t\t\t<key>ServerURL</key>\n")
-	write_tag(&b, "\t\t\t\t", "string", url)
-	strings.write_string(&b, "\t\t\t</dict>\n")
-	strings.write_string(&b, "\t\t\t<key>PayloadDescription</key>\n")
-	strings.write_string(&b, "\t\t\t<string>Resolve DNS through elodin over HTTPS.</string>\n")
-	strings.write_string(&b, "\t\t\t<key>PayloadDisplayName</key>\n")
-	strings.write_string(&b, "\t\t\t<string>elodin DNS-over-HTTPS</string>\n")
-	strings.write_string(&b, "\t\t\t<key>PayloadIdentifier</key>\n")
-	write_tag(&b, "\t\t\t", "string", mobileconfig_identifier(dns_uuid))
-	strings.write_string(&b, "\t\t\t<key>PayloadType</key>\n")
-	strings.write_string(&b, "\t\t\t<string>com.apple.dnsSettings.managed</string>\n")
-	strings.write_string(&b, "\t\t\t<key>PayloadUUID</key>\n")
-	write_tag(&b, "\t\t\t", "string", dns_uuid)
-	strings.write_string(&b, "\t\t\t<key>PayloadVersion</key>\n")
-	strings.write_string(&b, "\t\t\t<integer>1</integer>\n")
-	strings.write_string(&b, "\t\t</dict>\n")
-	strings.write_string(&b, "\t</array>\n")
-	strings.write_string(&b, "\t<key>PayloadDescription</key>\n")
-	write_tag(&b, "\t", "string", strings.concatenate({"Encrypted DNS via ", display_host, "."}, context.temp_allocator))
-	strings.write_string(&b, "\t<key>PayloadDisplayName</key>\n")
-	write_tag(&b, "\t", "string", strings.concatenate({"elodin DoH (", display_host, ")"}, context.temp_allocator))
-	strings.write_string(&b, "\t<key>PayloadIdentifier</key>\n")
-	write_tag(&b, "\t", "string", mobileconfig_identifier(profile_uuid))
-	strings.write_string(&b, "\t<key>PayloadRemovalDisallowed</key>\n")
-	strings.write_string(&b, "\t<false/>\n")
-	strings.write_string(&b, "\t<key>PayloadType</key>\n")
-	strings.write_string(&b, "\t<string>Configuration</string>\n")
-	strings.write_string(&b, "\t<key>PayloadUUID</key>\n")
-	write_tag(&b, "\t", "string", profile_uuid)
-	strings.write_string(&b, "\t<key>PayloadVersion</key>\n")
-	strings.write_string(&b, "\t<integer>1</integer>\n")
-	strings.write_string(&b, "</dict>\n")
-	strings.write_string(&b, "</plist>\n")
-	return strings.to_string(b)
 }
 
+/*
+The profile, with its seven substitutions in order: the escaped `ServerURL`, the
+DNS payload's identifier and UUID, the escaped host twice, and the profile's own
+identifier and UUID. Nothing else in it is a `%`.
+*/
 @(private)
-write_tag :: proc(b: ^strings.Builder, indent: string, tag: string, value: string) {
-	strings.write_string(b, indent)
-	strings.write_byte(b, '<')
-	strings.write_string(b, tag)
-	strings.write_byte(b, '>')
-	strings.write_string(b, value)
-	strings.write_string(b, "</")
-	strings.write_string(b, tag)
-	strings.write_byte(b, '>')
-	strings.write_byte(b, '\n')
-}
+MOBILECONFIG_TEMPLATE :: `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>DNSSettings</key>
+			<dict>
+				<key>DNSProtocol</key>
+				<string>HTTPS</string>
+				<key>ServerURL</key>
+				<string>%s</string>
+			</dict>
+			<key>PayloadDescription</key>
+			<string>Resolve DNS through elodin over HTTPS.</string>
+			<key>PayloadDisplayName</key>
+			<string>elodin DNS-over-HTTPS</string>
+			<key>PayloadIdentifier</key>
+			<string>%s</string>
+			<key>PayloadType</key>
+			<string>com.apple.dnsSettings.managed</string>
+			<key>PayloadUUID</key>
+			<string>%s</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>PayloadDescription</key>
+	<string>Encrypted DNS via %s.</string>
+	<key>PayloadDisplayName</key>
+	<string>elodin DoH (%s)</string>
+	<key>PayloadIdentifier</key>
+	<string>%s</string>
+	<key>PayloadRemovalDisallowed</key>
+	<false/>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>%s</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>
+`
 
 @(private)
 mobileconfig_identifier :: proc(uuid: string) -> string {

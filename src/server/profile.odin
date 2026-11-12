@@ -1,7 +1,9 @@
 package server
 
 import "core:mem"
+import "core:strings"
 import "core:sync"
+import "elodin:dns"
 import "elodin:logx"
 import "elodin:netx"
 import "elodin:tlsx"
@@ -323,15 +325,11 @@ profile_normalise_authority :: proc(authority: string, allocator := context.temp
 	if !folds {
 		return authority
 	}
-	out, err := make([]u8, len(authority), allocator)
+	folded, err := dns.name_fold(authority, allocator)
 	if err != nil {
 		return authority
 	}
-	for i in 0 ..< len(authority) {
-		c := authority[i]
-		out[i] = c + ('a' - 'A') if c >= 'A' && c <= 'Z' else c
-	}
-	return string(out)
+	return folded
 }
 
 /*
@@ -411,7 +409,8 @@ profile_cache_put :: proc(p: ^Profile_Signer, authority: string, signed: []u8) {
 	victim := profile_cache_victim(p)
 	profile_entry_release(p, victim)
 	p.clock += 1
-	victim.authority = profile_clone_string(authority, p.allocator)
+	// Empty where the allocator ran dry, which leaves the entry a free slot.
+	victim.authority, _ = strings.clone(authority, p.allocator)
 	victim.profile = signed
 	victim.used = p.clock
 }
@@ -447,16 +446,6 @@ profile_cache_victim :: proc(p: ^Profile_Signer) -> ^Profile_Entry {
 		}
 	}
 	return oldest
-}
-
-@(private)
-profile_clone_string :: proc(s: string, allocator: mem.Allocator) -> string {
-	out, err := make([]u8, len(s), allocator)
-	if err != nil {
-		return ""
-	}
-	copy(out, transmute([]u8)s)
-	return string(out)
 }
 
 /*

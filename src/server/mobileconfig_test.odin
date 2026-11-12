@@ -8,6 +8,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:config"
+import "elodin:h2"
 import "elodin:tlsx"
 
 /*
@@ -458,5 +459,37 @@ test_serve_doh_head_reader_refusal_has_no_body :: proc(t: ^testing.T) {
 	testing.expectf(t, strings.has_prefix(reply, "HTTP/1.1 400"), "a HEAD without a Host should be a 400: %q", reply)
 	testing.expectf(t, strings.has_suffix(reply, "\r\n\r\n"), "the 400 to HEAD should end at its fields: %q", reply)
 	testing.expectf(t, !strings.contains(reply, "Content-Length"), "a reply to HEAD should carry no Content-Length: %q", reply)
+	free_all(context.temp_allocator)
+}
+
+// The HTTP/2 endpoint serves the profile as the same download the HTTP/1.1 one
+// does: a client that asked over h2 gets the filename too.
+@(test)
+test_the_h2_profile_is_a_download :: proc(t: ^testing.T) {
+	signer, ctx, sok := make_test_profile_signer(t)
+	if !sok {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	defer destroy_profile_signer(signer)
+
+	cfg := config.default_config()
+	s := Server {
+		cfg      = &cfg,
+		profiles = signer,
+	}
+	hc := H2_Context {
+		server = &s,
+		path   = cfg.listeners.doh.path,
+	}
+	req := h2.Request {
+		method    = "GET",
+		path      = cfg.listeners.doh.mobileconfig_path,
+		authority = "elodin.local",
+	}
+	resp, ok := build_h2_response(&hc, &req)
+	testing.expect(t, ok, "the profile request was not answered")
+	testing.expect_value(t, resp.status, 200)
+	testing.expect_value(t, resp.content_disposition, PROFILE_DISPOSITION)
 	free_all(context.temp_allocator)
 }

@@ -260,7 +260,8 @@ fold_into :: proc "contextless" (name: string, buf: []u8) -> (folded: string, ok
 	return string(buf[:len(name)]), true
 }
 
-@(private)
+// One byte of `fold_into`, for a caller that folds as it goes rather than into a
+// buffer.
 fold_byte :: #force_inline proc "contextless" (c: u8) -> u8 {
 	return c + 32 if c >= 'A' && c <= 'Z' else c
 }
@@ -294,12 +295,11 @@ is part of that label rather than a break - so "a\.example.com." is one label
 under "com.", not a name below "example.com.". The root is below nothing and holds every other
 name.
 
-`server.name_below` is this, and calls it: the server package asks the question
-of configured zones and wildcards, `encode_message` asks it, through
-`name_at_or_below`, of a delegation it is about to drop glue from,
-`dnssec` asks it of a signer's bailiwick, and `config` of the routes it
-checks against the zones answered locally. One answer, so none of
-them can be tightened without the others following.
+The server package asks the question of configured zones and wildcards,
+`encode_message` asks it, through `name_at_or_below`, of a delegation it is
+about to drop glue from, `dnssec` asks it of a signer's bailiwick, and `config`
+of the routes it checks against the zones answered locally. One answer, so none
+of them can be tightened without the others following.
 */
 name_below :: proc(name, zone: string) -> bool {
 	// At or below, and not by matching the whole name: `name_at_or_below` only

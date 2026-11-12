@@ -169,7 +169,9 @@ start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 		loops           = len(s.loops),
 	}
 	if streams || cfg.metrics.enabled {
-		if line, short := descriptor_limit_line(descriptor_limit(), demand); short {
+		// The soft `RLIMIT_NOFILE`, read by the code `process_max_fds` publishes
+		// it with, so the two cannot disagree.
+		if line, short := descriptor_limit_line(metrics.descriptor_limit(), demand); short {
 			logx.warnf("%s", line)
 		}
 	}
@@ -692,7 +694,7 @@ udp_loop :: proc(data: rawptr) {
 	// This loop's own socket and its own buffer. Neither is shared with the
 	// other readers: that is the whole of what having several of them buys.
 	socket := ctx.reader.socket
-	buf := make([]u8, 65535)
+	buf := make([]u8, dns.MAX_MESSAGE)
 	defer delete(buf)
 
 	// Labelled for the submit below, whose `break` would otherwise leave only
@@ -952,8 +954,7 @@ report_refusal :: proc(client: net.Endpoint, proto: Protocol) {
 	// and the less of a refused packet's cost goes through an allocator the
 	// better.
 	buf: [64]u8
-	builder := strings.builder_from_bytes(buf[:])
-	who := net.endpoint_to_string(client, &builder)
+	who := endpoint_text(client, &buf)
 
 	transport := proto_name(proto)
 	unit := refused_unit(proto)
@@ -970,6 +971,14 @@ report_refusal :: proc(client: net.Endpoint, proto: Protocol) {
 	logx.warnf(
 		"add its network to server.allow_from if that client should be served; refusals are counted as refused= in the stats line, and further ones are logged at debug level",
 	)
+}
+
+// `e` as a log line prints it, in `buf` rather than in an allocator: an address
+// and port are a fixed few dozen bytes. The text lives as long as `buf` does.
+@(private)
+endpoint_text :: proc(e: net.Endpoint, buf: ^[64]u8) -> string {
+	b := strings.builder_from_bytes(buf[:])
+	return net.endpoint_to_string(e, &b)
 }
 
 /*
@@ -998,8 +1007,7 @@ report_shed :: proc(client: net.Endpoint, limit: int) {
 
 	// The stack rather than that arena, as in `report_refusal`.
 	buf: [64]u8
-	builder := strings.builder_from_bytes(buf[:])
-	who := net.endpoint_to_string(client, &builder)
+	who := endpoint_text(client, &buf)
 
 	logx.debugf("udp: shedding a query from %s, server.max_pending (%d) is reached", who, limit)
 }
@@ -1111,27 +1119,17 @@ limit that is comes from `spawn_failure_limit`: a share refused against the
 table's own size would read as a table that is full when it is not.
 */
 @(private)
-Spawn_Failure_Words :: struct {
-	reported: ^bool,
-	// The `debug` line, for every occurrence after the first.
-	brief:    string,
-	// The `warn`, said once, and the line under it saying what to do.
-	line:     string,
-	hint:     string,
-}
-
-@(private)
-spawn_failure_words :: proc(why: Spawn_Result) -> Spawn_Failure_Words {
+spawn_failure_words :: proc(why: Spawn_Result) -> Failure_Words {
 	switch why {
 	case .Limit_Reached:
-		return Spawn_Failure_Words {
+		return Failure_Words {
 			reported = &conn_limit_reported,
 			brief = "%s: refusing a connection, the limit of %d is reached",
 			line = "%s: refusing a connection, server.max_connections (%d) is reached",
 			hint = "raise server.max_connections if this server should hold more clients at once; these are counted as conn_refused= in the stats line, and further ones are logged at debug level",
 		}
 	case .Prefix_Limit_Reached:
-		return Spawn_Failure_Words {
+		return Failure_Words {
 			reported = &conn_prefix_limit_reported,
 			brief = "%s: refusing a connection, this client's prefix already holds the %d it may",
 			line = "%s: refusing a connection, this client's /24 or /64 already holds server.max_connections_per_prefix (%d) of them",
@@ -1139,7 +1137,7 @@ spawn_failure_words :: proc(why: Spawn_Result) -> Spawn_Failure_Words {
 		}
 	case .Started, .Spawn_Failed, .Stopped:
 	}
-	return Spawn_Failure_Words {
+	return Failure_Words {
 		reported = &conn_failed_reported,
 		brief = "%s: refusing a connection, the OS would not map a stack for it, below the limit of %d",
 		line = "%s: refusing a connection, the OS would not map a stack for it - this is below server.max_connections (%d), so raising that will not help",
@@ -1195,23 +1193,7 @@ report_query_spawn_failure :: proc(proto: Protocol) {
 
 @(private)
 report_spawn_failure :: proc(proto: Protocol, why: Spawn_Result, cm: ^Conn_Manager) {
-	limit := spawn_failure_limit(why, cm)
-	words := spawn_failure_words(why)
-	say, first := report_once(words.reported, logx.enabled(.Debug))
-	if !say {
-		return
-	}
-	// As in `report_refusal`: the accept loop is the one place that never resets
-	// its own scratch, and the line was formatted out of it.
-	defer free_all(context.temp_allocator)
-
-	transport := proto_name(proto)
-	if !first {
-		logx.debugf(words.brief, transport, limit)
-		return
-	}
-	logx.warnf(words.line, transport, limit)
-	logx.warnf(words.hint)
+	report_failure_words(spawn_failure_words(why), proto_name(proto), spawn_failure_limit(why, cm))
 }
 
 /*
@@ -1260,8 +1242,7 @@ report_conn_rate_limit :: proc(client: net.Endpoint, proto: Protocol, rate: int)
 		// The stack rather than the arena, as in `report_refusal`: an address is
 		// a fixed few dozen bytes, and this is the level every refusal reaches.
 		buf: [64]u8
-		builder := strings.builder_from_bytes(buf[:])
-		who := net.endpoint_to_string(client, &builder)
+		who := endpoint_text(client, &buf)
 		logx.debugf(
 			"%s: refused a connection from %s, whose /24 or /64 is opening them faster than %d/s",
 			transport,
@@ -1752,19 +1733,7 @@ accept_loop :: proc(data: rawptr) {
 		the oscillating shortage - one descriptor freed, one connection served,
 		`EMFILE` again - is still recognised as one. See `ACCEPT_REPORT_AFTER`.
 		*/
-		act := accept_action(err, run)
-		run = act.run
-		if act.recovered {
-			rearm_accept_reports(&ctx.accept_reported)
-		}
-		if err != nil {
-			if act.wait > 0 {
-				sync.atomic_add(&ctx.server.stats.accept_backoff, 1)
-				if act.report {
-					report_accept_failure(proto_name(ctx.proto), act.run, err, &ctx.accept_reported)
-				}
-				_ = loop.sleep(act.wait)
-			}
+		if accept_settle(ctx.server, &run, err, proto_name(ctx.proto), &ctx.accept_reported) {
 			continue
 		}
 
@@ -1912,52 +1881,54 @@ stream_job :: proc(data: rawptr) {
 	// so the client label must not live there: it is used for the lifetime of
 	// the connection. A stack buffer owned by this frame outlives all of them.
 	client_buf: [64]u8
-	client_builder := strings.builder_from_bytes(client_buf[:])
-	client := net.endpoint_to_string(job.client, &client_builder)
+	client := endpoint_text(job.client, &client_buf)
 
 	switch job.ctx.proto {
 	case .TCP:
 		defer net.close(job.socket)
 		serve_dns_stream(s, {socket = job.socket, peer = job.client}, .TCP, client)
-	case .DoT:
-		// The handshake is bounded as a whole, and by this - not by what the
-		// connection's reads are given. See `handshake_timeout`; put back below.
-		_ = net.set_option(job.socket, .Receive_Timeout, handshake_timeout(timeout))
-		conn, err := accept_tls(job.ctx.listeners, .DoT, job.socket)
-		if err != .None {
-			logx.debugf("dot: handshake with %s failed: %v", client, err)
-			net.close(job.socket)
+	case .DoT, .DoH:
+		tls := stream_tls_accept(job, timeout, client)
+		if tls == nil {
 			return
 		}
-		// Counted here, where a handshake has actually completed - see
-		// `Stats.handshakes` for what the figure is for.
-		sync.atomic_add(&s.stats.handshakes, 1)
-		defer tlsx.close(conn)
-		// Back to the connection's own figure now the handshake is done.
-		tlsx.set_read_timeout(conn, timeout)
-		serve_dns_stream(s, {socket = job.socket, tls = conn, peer = job.client}, .DoT, client)
-	case .DoH:
-		// The handshake is bounded as a whole, and by this - not by what the
-		// connection's reads are given. See `handshake_timeout`; put back below.
-		_ = net.set_option(job.socket, .Receive_Timeout, handshake_timeout(timeout))
-		conn, err := accept_tls(job.ctx.listeners, .DoH, job.socket)
-		if err != .None {
-			logx.debugf("doh: handshake with %s failed: %v", client, err)
-			net.close(job.socket)
-			return
-		}
-		sync.atomic_add(&s.stats.handshakes, 1)
-		defer tlsx.close(conn)
-		// Back to the connection's own figure now the handshake is done.
-		tlsx.set_read_timeout(conn, timeout)
-		if tlsx.alpn_protocol(conn) == "h2" {
-			serve_doh2(s, conn, client, job.client)
-		} else {
-			serve_doh(s, {socket = job.socket, tls = conn, peer = job.client}, client)
+		defer tlsx.close(tls)
+		conn := Conn{socket = job.socket, tls = tls, peer = job.client}
+		switch {
+		case job.ctx.proto == .DoT:
+			serve_dns_stream(s, conn, .DoT, client)
+		case tlsx.alpn_protocol(tls) == "h2":
+			serve_doh2(s, tls, client, job.client)
+		case:
+			serve_doh(s, conn, client)
 		}
 	case .UDP:
 	// not reachable: UDP has no accept loop
 	}
+}
+
+/*
+The TLS handshake a DoT or DoH connection starts with, on the job's own socket.
+
+The handshake is bounded as a whole, and by `handshake_timeout(timeout)` - not by
+what the connection's reads are given; the connection's own figure is put back
+once it is done. A handshake that fails closes the socket and comes back nil, and
+the caller returns with nothing to release. Counted where a handshake has
+actually completed - see `Stats.handshakes` for what the figure is for.
+*/
+@(private)
+stream_tls_accept :: proc(job: ^Stream_Job, timeout: time.Duration, client: string) -> ^tlsx.Conn {
+	proto := job.ctx.proto
+	_ = net.set_option(job.socket, .Receive_Timeout, handshake_timeout(timeout))
+	tls, err := accept_tls(job.ctx.listeners, proto, job.socket)
+	if err != .None {
+		logx.debugf("%s: handshake with %s failed: %v", proto_name(proto), client, err)
+		net.close(job.socket)
+		return nil
+	}
+	sync.atomic_add(&job.ctx.server.stats.handshakes, 1)
+	tlsx.set_read_timeout(tls, timeout)
+	return tls
 }
 
 /*
@@ -2153,20 +2124,35 @@ takes the RST with it, which is no worse than not draining at all.
 Reached only from a connection that has answered something, for the same reason:
 with nothing written there is nothing for the RST to take back, and the drain
 would be time out of one of `max_connections` spent protecting nothing.
-
-The chunk is scratch rather than a local, as `http_linger`'s is: inlined into
-the connection loop that calls it, a 4 KiB local would join a frame that is live
-under every idle wait, and keep a page of each held connection's stack resident
-for nothing (#596). The connection ends once this returns, and `stream_job`
-frees the scratch on its way out.
 */
 @(private)
 stream_linger :: proc(conn: Conn) {
-	conn_set_read_timeout(conn, STREAM_LINGER_IDLE)
+	conn_linger(conn, STREAM_LINGER_IDLE, STREAM_LINGER_TIMEOUT, STREAM_LINGER_BYTES)
+}
+
+/*
+The drain both `stream_linger` and `http_linger` are: read and discard until
+`max_bytes` are gone, a read waits `idle` for nothing, or `timeout` has passed
+since the first, whichever comes first. Each caller's figures are argued beside
+its constants.
+
+The read timeout goes through `conn_set_read_timeout` rather than `net.set_option`:
+over DoT and DoH the connection is a TLS one, where the socket option stopped
+applying at the handshake.
+
+The chunk is scratch rather than a local: inlined into the connection loop that
+calls it, a 4 KiB local would join a frame that is live under every idle wait,
+and keep a page of each held connection's stack resident for nothing (#596). The
+connection ends once this returns, and its owner - `stream_job`, or the metrics
+loop after a scrape - frees the scratch on its way out.
+*/
+@(private)
+conn_linger :: proc(conn: Conn, idle, timeout: time.Duration, max_bytes: int) {
+	conn_set_read_timeout(conn, idle)
 	start := loop.tick_now()
 	chunk := make([]u8, 4096, context.temp_allocator)
 	discarded := 0
-	for discarded < STREAM_LINGER_BYTES && loop.tick_since(start) < STREAM_LINGER_TIMEOUT {
+	for discarded < max_bytes && loop.tick_since(start) < timeout {
 		n, ok := conn_read(conn, chunk)
 		if !ok {
 			return
