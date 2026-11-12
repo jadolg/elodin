@@ -31,8 +31,8 @@ unvalidated instead of refused.
 So the two are one answer here, and it is reached by asking rather than by
 assuming: `probe_algorithms` verifies one known-good signature per algorithm
 against the linked library at start-up and drops whatever it will not run.
-What is left is what `algorithm_supported` reports, which is what the DS
-usability checks in `zone_step` and `fetch_keys` read - so a refused algorithm
+What is left is what `algorithm_supported` reports, which is what `ds_usable`
+reads for `zone_step` and `fetch_keys` - so a refused algorithm
 goes insecure at the delegation, in front of the zone, and no RRset inside
 an established zone is ever left resting on a signature this build cannot
 check. A zone publishing only a refused algorithm keeps resolving; a zone
@@ -133,6 +133,17 @@ algorithm_refused :: proc "contextless" (algorithm: u8) -> bool {
 digest_supported :: proc "contextless" (digest_type: u8) -> bool {
 	bit := digest_bit(digest_type)
 	return bit != 0 && sync.atomic_load(&refused_digests) & bit == 0
+}
+
+/*
+Whether a DS names a key this build can follow: its algorithm and its digest
+both supported. RFC 6840 section 5.2 makes a delegation none of whose DS records
+pass this insecure, so every reader of a DS set - `zone_step`, `fetch_keys` and
+the trust anchors - asks this one question, or an anchor would count as
+followable where the walk cannot follow it.
+*/
+ds_usable :: proc "contextless" (ds: Ds) -> bool {
+	return algorithm_supported(ds.algorithm) && digest_supported(ds.digest_type)
 }
 
 @(private)
@@ -353,22 +364,16 @@ run_probe :: proc() {
 		out: [64]u8
 		want, want_ok := decode_hex(probe.want, scratch)
 		size := digest_size(probe.digest_type)
-		/*
-		`len(want) == size` before the comparison below walks `want`: `digest`
-		fills `out[:size]` and nothing else, so a constant longer than its own
-		digest type would compare against stack bytes nobody wrote, and one over
-		64 would walk off the end of `out`. The test holds the constants to
-		their lengths, and the loop should not need it to.
-		*/
-		ran := message_ok && want_ok && len(want) == size && digest(probe.digest_type, message, out[:size])
-		if ran {
-			for b, i in want {
-				if out[i] != b {
-					ran = false
-					break
-				}
-			}
-		}
+		// `digest` fills `out[:size]` and nothing else, so that is what is
+		// compared, and a constant of any other length fails the probe. The
+		// test holds the constants to their lengths, and this should not need
+		// it to.
+		ran :=
+			message_ok &&
+			want_ok &&
+			len(want) == size &&
+			digest(probe.digest_type, message, out[:size]) &&
+			mem.compare(out[:size], want) == 0
 		if !ran {
 			digests |= digest_bit(probe.digest_type)
 			logx.warnf(

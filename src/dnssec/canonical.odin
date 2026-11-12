@@ -257,13 +257,13 @@ write_canonical_rdata :: proc(out: ^[dynamic]u8, rec: dns.Record) -> bool {
 		if !write_name(out, buf[:], d.ns, down) || !write_name(out, buf[:], d.mbox, down) {
 			return false
 		}
-		append(out, u8(d.serial >> 24), u8(d.serial >> 16), u8(d.serial >> 8), u8(d.serial))
-		append(out, u8(d.refresh >> 24), u8(d.refresh >> 16), u8(d.refresh >> 8), u8(d.refresh))
-		append(out, u8(d.retry >> 24), u8(d.retry >> 16), u8(d.retry >> 8), u8(d.retry))
-		append(out, u8(d.expire >> 24), u8(d.expire >> 16), u8(d.expire >> 8), u8(d.expire))
-		append(out, u8(d.minimum >> 24), u8(d.minimum >> 16), u8(d.minimum >> 8), u8(d.minimum))
+		append_u32(out, d.serial)
+		append_u32(out, d.refresh)
+		append_u32(out, d.retry)
+		append_u32(out, d.expire)
+		append_u32(out, d.minimum)
 	case dns.Rdata_MX:
-		append(out, u8(d.preference >> 8), u8(d.preference))
+		append_u16(out, d.preference)
 		return write_name(out, buf[:], d.exchange, down)
 	case dns.Rdata_TXT:
 		for s in d.strings {
@@ -274,9 +274,9 @@ write_canonical_rdata :: proc(out: ^[dynamic]u8, rec: dns.Record) -> bool {
 			append(out, ..transmute([]u8)s)
 		}
 	case dns.Rdata_SRV:
-		append(out, u8(d.priority >> 8), u8(d.priority))
-		append(out, u8(d.weight >> 8), u8(d.weight))
-		append(out, u8(d.port >> 8), u8(d.port))
+		append_u16(out, d.priority)
+		append_u16(out, d.weight)
+		append_u16(out, d.port)
 		return write_name(out, buf[:], d.target, down)
 	case dns.Rdata_CAA:
 		append(out, d.flags)
@@ -287,7 +287,7 @@ write_canonical_rdata :: proc(out: ^[dynamic]u8, rec: dns.Record) -> bool {
 		append(out, ..transmute([]u8)d.tag)
 		append(out, ..transmute([]u8)d.value)
 	case dns.Rdata_SVCB:
-		append(out, u8(d.priority >> 8), u8(d.priority))
+		append_u16(out, d.priority)
 		// SVCB is not on the lowercasing list, and its target is never compressed.
 		if !write_name(out, buf[:], d.target, false) {
 			return false
@@ -380,7 +380,7 @@ de-duplicated on those bytes, which is what "canonical order" means for an
 RRset (RFC 4034 section 6.3).
 */
 @(private)
-render_rdatas :: proc(scratch: ^Signing_Scratch, records: []dns.Record, allocator: mem.Allocator) -> bool {
+render_rdatas :: proc(scratch: ^Signing_Scratch, records: []dns.Record, allocator: mem.Allocator) {
 	scratch.records = records
 	scratch.rdatas = nil
 	scratch.rdata_bytes = 0
@@ -399,7 +399,7 @@ render_rdatas :: proc(scratch: ^Signing_Scratch, records: []dns.Record, allocato
 	*/
 	STORE_START :: 512
 	if !charge_scratch(scratch, len(records) * (size_of(int) + size_of([]u8)) + 2 * STORE_START) {
-		return false
+		return
 	}
 	ends := make([]int, len(records), allocator)
 	rdatas := make([][]u8, len(records), allocator)
@@ -410,11 +410,13 @@ render_rdatas :: proc(scratch: ^Signing_Scratch, records: []dns.Record, allocato
 		rendered := write_canonical_rdata(&store, rec) && len(store) - start <= 0xffff
 		// Before the verdict: the arena has paid for this record either way.
 		if 2 * cap(store) > charged {
-			charge_scratch(scratch, 2 * cap(store) - charged) or_return
+			if !charge_scratch(scratch, 2 * cap(store) - charged) {
+				return
+			}
 			charged = 2 * cap(store)
 		}
 		if !rendered {
-			return false
+			return
 		}
 		ends[i] = len(store)
 	}
@@ -436,7 +438,6 @@ render_rdatas :: proc(scratch: ^Signing_Scratch, records: []dns.Record, allocato
 		scratch.rdata_bytes += len(rdata)
 	}
 	scratch.rdatas = rdatas[:n]
-	return true
 }
 
 /*
@@ -502,23 +503,34 @@ signing_input :: proc(
 	}
 	out := &s.out
 	clear(out)
-	append(out, u8(u16(sig.type_covered) >> 8), u8(u16(sig.type_covered)))
+	append_u16(out, u16(sig.type_covered))
 	append(out, sig.algorithm, sig.labels)
-	append(out, u8(sig.original_ttl >> 24), u8(sig.original_ttl >> 16), u8(sig.original_ttl >> 8), u8(sig.original_ttl))
-	append(out, u8(sig.expiration >> 24), u8(sig.expiration >> 16), u8(sig.expiration >> 8), u8(sig.expiration))
-	append(out, u8(sig.inception >> 24), u8(sig.inception >> 16), u8(sig.inception >> 8), u8(sig.inception))
-	append(out, u8(sig.key_tag >> 8), u8(sig.key_tag))
+	append_u32(out, sig.original_ttl)
+	append_u32(out, sig.expiration)
+	append_u32(out, sig.inception)
+	append_u16(out, sig.key_tag)
 	append(out, ..signer_buf[:signer_len])
 
 	for rdata in s.rdatas {
 		append(out, ..owner_wire)
-		append(out, u8(u16(sig.type_covered) >> 8), u8(u16(sig.type_covered)))
-		append(out, u8(u16(class) >> 8), u8(u16(class)))
-		append(out, u8(sig.original_ttl >> 24), u8(sig.original_ttl >> 16), u8(sig.original_ttl >> 8), u8(sig.original_ttl))
-		append(out, u8(len(rdata) >> 8), u8(len(rdata)))
+		append_u16(out, u16(sig.type_covered))
+		append_u16(out, u16(class))
+		append_u32(out, sig.original_ttl)
+		append_u16(out, u16(len(rdata)))
 		append(out, ..rdata)
 	}
 	return out[:], true
+}
+
+// A field in network byte order, as RFC 4034 lays out every integer it signs.
+@(private)
+append_u16 :: proc(out: ^[dynamic]u8, v: u16) {
+	append(out, u8(v >> 8), u8(v))
+}
+
+@(private)
+append_u32 :: proc(out: ^[dynamic]u8, v: u32) {
+	append(out, u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v))
 }
 
 // Type Covered, Algorithm, Labels, Original TTL, Expiration, Inception and Key

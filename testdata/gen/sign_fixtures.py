@@ -952,6 +952,22 @@ def wildcard_expanded_ds(root):
     emit("wd_fine_answer", "fine.wdtest.", "A",
          message("fine.wdtest.", A, fine_a + [sign(fine_a, fi)]))
 
+    # A DS set at `gs.wdtest.` signed in the root's name with the key
+    # `wdtest.` signs with, as a root sharing that key would sign it. The
+    # signature verifies under a key of the parent's and the root is an
+    # ancestor of the owner, so only the signer being the parent itself refuses
+    # it: a DS is the parent's word (RFC 4035 section 5.2), not any ancestor's.
+    gs = Key("gs.wdtest.", "wcard-gs")
+    gs_ds = [RR("gs.wdtest.", DS, gs.ds())]
+    emit("wd_gs_ds", "gs.wdtest.", "DS",
+         message("gs.wdtest.", DS, gs_ds + [sign(gs_ds, wd, signer=".")]))
+    gs_keys = [RR("gs.wdtest.", DNSKEY, gs.rdata)]
+    emit("wd_gs_dnskey", "gs.wdtest.", "DNSKEY",
+         message("gs.wdtest.", DNSKEY, gs_keys + [sign(gs_keys, gs)]))
+    gs_a = [a_rr("gs.wdtest.", "192.0.2.69")]
+    emit("wd_gs_answer", "gs.wdtest.", "A",
+         message("gs.wdtest.", A, gs_a + [sign(gs_a, gs)]))
+
 
 def wildcard_dname(root):
     """Emit `dwtest.`, which holds a wildcard DNAME and one ordinary name."""
@@ -1628,6 +1644,10 @@ def lapsed_signatures():
     #   www.cn.lt.          a DS question answered by a CNAME the parent signed
     #                       in the future, beside a denial whose current
     #                       signature fails: code 6
+    #   www.dw.lt.          a DS set whose only current signature expanded a
+    #                       wildcard, beside an expired one: code 7
+    #   x.late.lt.          a lapsed DNAME, and a DS set on the walk to its
+    #                       CNAME whose current signature fails: code 6
     lt, wl, wm = lapse_zones()
     nsec, lt_soa = lapse_lt(lt)
     wild_nsec, wl_soa = lapse_wl(wl)
@@ -1828,6 +1848,28 @@ def lapse_ds_questions(lt, nsec, lt_soa):
                  + lt_soa))
     unsigned2 = [a_rr("www.cn2.lt.", "192.0.2.9")]
     emit("lp_cn2_www", "www.cn2.lt.", "A", message("www.cn2.lt.", A, unsigned2))
+
+    # The DS set at `dw.lt.` with two signatures by `lt.`: one expired, and one
+    # current and verifying but made over `*.lt.`. An expansion is no DS for
+    # this name, and no failed signature either: the window is what is left,
+    # code 7, as for the wildcard CNAME at `z.wl.`.
+    dw = Key("dw.lt.", "lapse-dw")
+    dw_ds = [RR("dw.lt.", DS, dw.ds())]
+    emit("lp_dw_ds", "dw.lt.", "DS",
+         message("dw.lt.", DS, dw_ds + [sign(dw_ds, lt, window=EXPIRED), sign(dw_ds, lt, labels=1)]))
+    emit("lp_dw_www", "www.dw.lt.", "A", message("www.dw.lt.", A, [a_rr("www.dw.lt.", "192.0.2.10")]))
+
+    # A DNAME whose only signature expired, and the unsigned CNAME it
+    # synthesized at `x.late.lt.`, where the DS set the walk reads carries a
+    # current signature made over other data. The chain to the CNAME broke on
+    # a forgery, so the DNAME's window is not the verdict: code 6.
+    xl = Key("x.late.lt.", "lapse-xl")
+    xl_ds = [RR("x.late.lt.", DS, xl.ds())]
+    xl_forged = sign([RR("x.late.lt.", DS, dw.ds())], lt)
+    emit("lp_xl_ds", "x.late.lt.", "DS", message("x.late.lt.", DS, xl_ds + [xl_forged]))
+    xl_cname = [RR("x.late.lt.", CNAME, wire_name("x.both.lt."))]
+    emit("lp_xl_a", "x.late.lt.", "A",
+         message("x.late.lt.", A, dname + [sign(dname, lt, window=EXPIRED)] + xl_cname))
 
 
 @scenario

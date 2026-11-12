@@ -389,9 +389,31 @@ test_a_walk_that_ran_out_of_lookups_does_not_blame_the_hashing :: proc(t: ^testi
 	budget.lookups = MAX_LOOKUPS_PER_QUERY - 3
 	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
 	testing.expect_value(t, result.status, Status.Indeterminate)
-	testing.expect_value(t, result.reason, "lookup budget spent")
+	testing.expect_value(t, result.reason, LOOKUPS_SPENT)
 	testing.expect_value(t, budget.nsec3.over_ceiling, 0)
 	testing.expect_value(t, budget.nsec3.spent, 0)
+	free_all(context.temp_allocator)
+}
+
+// The same words when the lookup refused is the one for a zone's keys rather
+// than for a DS: the allowance that ran out is one allowance, whichever
+// question it stopped.
+@(test)
+test_a_walk_out_of_lookups_at_the_keys_says_so :: proc(t: ^testing.T) {
+	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+	testing.expect(t, err == .None, "the fixture should decode")
+
+	v := n3_validator()
+	testing.expect(t, v != nil, "the anchor should parse")
+	defer destroy_validator(v)
+
+	// Nothing left, so the first thing the walk asks - the anchored zone's
+	// DNSKEY set - is refused.
+	budget := query_budget(v)
+	budget.lookups = MAX_LOOKUPS_PER_QUERY
+	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	testing.expect_value(t, result.status, Status.Indeterminate)
+	testing.expect_value(t, result.reason, LOOKUPS_SPENT)
 	free_all(context.temp_allocator)
 }
 

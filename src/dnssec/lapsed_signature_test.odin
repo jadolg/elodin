@@ -457,6 +457,42 @@ LP_FIXTURES := []Fixture{
 		wire  = "1234858000010001000000000377777703636e32026c7400000100010377777703636e32026c74000001000100000e10" +
 			"0004c0000209",
 	},
+	{
+		key   = "lp_dw_ds",
+		name  = "dw.lt.",
+		type  = .DS,
+		wire  = "123485800001000300000000026477026c7400002b0001026477026c7400002b000100000e100024d1840f02af374b8e" +
+			"2693b9bb27d6354403ae26230768e6cece15acc17e69e4ad96f12391026477026c7400002e000100000e100056002b0f" +
+			"0200000e106a4788206a1ffb2003a1026c74000065a73624f397cc0e8e57eba8d5760776d921eee9ee342e4872cbcc2c" +
+			"3d036cd8c8fc2239f7c2fc19e18b1fb4287a43799c7513800da7864825969dd6438f06026477026c7400002e00010000" +
+			"0e100056002b0f0100000e107d3b18206a47882003a1026c7400efef908f56dd0f633febcb293942a4fecf6e0584f36a" +
+			"ac263654a9217f9cdca24e93853794a2df823136917af55e684b79f12c54c2dbb5dcd1cde9b5b6f0a104",
+	},
+	{
+		key   = "lp_dw_www",
+		name  = "www.dw.lt.",
+		type  = .A,
+		wire  = "12348580000100010000000003777777026477026c74000001000103777777026477026c74000001000100000e100004" +
+			"c000020a",
+	},
+	{
+		key   = "lp_xl_ds",
+		name  = "x.late.lt.",
+		type  = .DS,
+		wire  = "1234858000010002000000000178046c617465026c7400002b00010178046c617465026c7400002b000100000e100024" +
+			"f5bb0f02690d0d5a368e8635f569a1fa7a71c4d5465b75bd167dc80d94097b2404e002cc0178046c617465026c740000" +
+			"2e000100000e100056002b0f0300000e107d3b18206a47882003a1026c7400f12de44d0121a5a64582def7bed5547b29" +
+			"030e446e94f040e47b0bdf2940a21f255fd0cf9bb9b395f9b218d1d7d870f48952d48b908a21e25379e63cfd01f80f",
+	},
+	{
+		key   = "lp_xl_a",
+		name  = "x.late.lt.",
+		type  = .A,
+		wire  = "1234858000010003000000000178046c617465026c740000010001046c617465026c74000027000100000e1000090462" +
+			"6f7468026c7400046c617465026c7400002e000100000e10005600270f0200000e106a4788206a1ffb2003a1026c7400" +
+			"1147a3808504239369c8f6758ca8d16ea505a3ed9aab674088c2ed93532038f7e096e1ec58364c2f0e891449395dedba" +
+			"4c8ac0b31c17ae75f29608c3879caf050178046c617465026c74000005000100000e10000b017804626f7468026c7400",
+	},
 }
 
 @(private = "file")
@@ -516,6 +552,7 @@ test_a_signature_outside_its_window_is_named_on_every_road :: proc(t: ^testing.T
 		{"lp_x_a", "x.wl.", .Expired, LP_EXPIRED, "the NSEC a wildcard expansion rests on"},
 		{"lp_wc_cn_www", "www.z.wl.", .Not_Yet_Valid, LP_NOT_YET, "a DS denial beside a wildcard CNAME that verified"},
 		{"lp_dname_a", "www.late.lt.", .Expired, LP_EXPIRED, "a DNAME and the unsigned CNAME it synthesized"},
+		{"lp_dw_www", "www.dw.lt.", .Expired, LP_EXPIRED, "a DS set beside a signature over it that expanded a wildcard"},
 	}
 	for c in cases {
 		result := lp_validate(c.key, c.qname)
@@ -728,6 +765,7 @@ test_a_forgery_beside_a_lapse_is_a_forgery_end_to_end :: proc(t: ^testing.T) {
 		{"lp_two_wildcards", "x.wl.", "wildcard expansion not proven", "a lapsed wildcard proof before a refuted one"},
 		{"lp_cn_www", "www.cn.lt.", BROKEN_CHAIN, "a lapsed CNAME at a DS question beside a refuted denial"},
 		{"lp_cn2_www", "www.cn2.lt.", BROKEN_CHAIN, "a refuted CNAME at a DS question beside a lapsed denial that proves nothing"},
+		{"lp_xl_a", "x.late.lt.", BROKEN_CHAIN, "a lapsed DNAME beside a refuted DS set on the walk to its CNAME"},
 	}
 	for c in cases {
 		result := lp_validate(c.key, c.qname)

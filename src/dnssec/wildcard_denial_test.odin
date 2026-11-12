@@ -298,6 +298,34 @@ WC_FIXTURES := []Fixture{
 			"3beed9e0bdde6c18470bd86a0de6e8e38dbedf58890de7bfebe1f836e50a",
 	},
 	{
+		key   = "wd_gs_ds",
+		name  = "gs.wdtest.",
+		type  = .DS,
+		wire  = "1234858000010002000000000267730677647465737400002b00010267730677647465737400002b000100000e100024" +
+			"45ac0f023a2aa85451df85fb7feded9e2ce2135d3b05d67ab75a4059ada04949ec89bf0f026773067764746573740000" +
+			"2e000100000e100053002b0f0200000e107d3b18206a478820e4410041bdfeb61d61e3346dfd1918109574bbe005de8c" +
+			"226b21daa95348c0f07f7808356534f89e3eab99e2483b8edfd51e06dfcfa62b795539da40e80e1982f3670a",
+	},
+	{
+		key   = "wd_gs_dnskey",
+		name  = "gs.wdtest.",
+		type  = .DNSKEY,
+		wire  = "12348580000100020000000002677306776474657374000030000102677306776474657374000030000100000e100024" +
+			"0101030f4f243603c278451fd35eddcc2942679550468cf7af37d014716a481b9f83bd45026773067764746573740000" +
+			"2e000100000e10005d00300f0200000e107d3b18206a47882045ac026773067764746573740068ce4af419e365268d49" +
+			"87f183d564d76f1aee36cf0b81ec97b0d5b561aa5f9a73ef07e9ef3325df57739fcf4e30cd19b6b4ac92439740669e77" +
+			"6db2e7f8fd03",
+	},
+	{
+		key   = "wd_gs_answer",
+		name  = "gs.wdtest.",
+		type  = .A,
+		wire  = "12348580000100020000000002677306776474657374000001000102677306776474657374000001000100000e100004" +
+			"c00002450267730677647465737400002e000100000e10005d00010f0200000e107d3b18206a47882045ac0267730677" +
+			"6474657374004a15872a44761502dcea4834e22d9520c9fb14d1b70fcdbbff9f1886f4afeaae452a283e0cfbe2699264" +
+			"30debf04396852a173410698c8ee92685eed8b535c04",
+	},
+	{
 		key   = "dw_ds",
 		name  = "dwtest.",
 		type  = .DS,
@@ -559,6 +587,30 @@ test_a_zone_cut_whose_ds_signature_is_its_own_still_holds :: proc(t: ^testing.T)
 		t,
 		result.status == .Secure,
 		"an ordinary signed delegation is still a zone cut, got %v (%q)",
+		result.status,
+		result.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_a_zone_cut_whose_ds_another_ancestor_signed_is_refused :: proc(t: ^testing.T) {
+	/*
+	The other half of "the parent's word": who signed it. The DS set at
+	`gs.wdtest.` carries a signature in the root's name, made with the very key
+	`wdtest.` signs with - a root and a child sharing a key, as one operator's
+	zones may. It verifies under a key of the parent's, and the root is an
+	ancestor of the owner, so `check_signature` has nothing against it; only
+	`verified_rrset` holding the signer to the parent refuses it. A DS is the
+	parent's to vouch for (RFC 4035 section 5.2), and taken on another zone's
+	word the cut would make everything below it `Secure` on keys the parent
+	never attested.
+	*/
+	result := wc_validate("wd_gs_answer", "gs.wdtest.", .A)
+	testing.expectf(
+		t,
+		result.status == .Bogus && result.reason == BROKEN_CHAIN,
+		"a DS set another ancestor signed is not a zone cut, got %v (%q)",
 		result.status,
 		result.reason,
 	)

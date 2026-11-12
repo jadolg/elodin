@@ -11,8 +11,8 @@ The chain walk's own signature checks, under a response written to make it work.
 
 `validate_rrset` and `verified_rrset` are bounded: both spend
 `MAX_VERIFICATIONS_PER_QUERY` and both throw the hopeless signatures out for
-nothing through `signature_worth_trying`. The two loops that build the chain of
-trust - the RRSIGs over a DS set in `zone_step`, and the RRSIGs over a DNSKEY
+nothing through `signature_worth_trying`. The two sets that build the chain of
+trust - the DS set `zone_step` checks through `verified_rrset`, and the DNSKEY
 set in `fetch_keys` - are held to both as well, and they need it most: their
 signature list comes straight out of a response, so its length is whoever
 answered the lookup.

@@ -569,7 +569,7 @@ deadline_passed :: proc(budget: ^Budget) -> bool {
 Why a walk that came back `Indeterminate` stopped, in the words of the step that
 stopped it.
 
-"chain of trust unavailable" is the fallback and the truth for most of them - a
+`CHAIN_UNAVAILABLE` is the fallback and the truth for most of them - a
 lookup that could not be made, a parent that did not answer. The allowances can
 be said more precisely, and saying them is worth a line, because this reason is
 what picks the extended error the client is handed: the walk is where a zone
@@ -579,11 +579,30 @@ without this the precise code would be the one nobody ever sees.
 */
 @(private)
 walk_reason :: proc(budget: ^Budget) -> string {
-	return budget.walk_stopped if budget.walk_stopped != "" else "chain of trust unavailable"
+	return budget.walk_stopped if budget.walk_stopped != "" else CHAIN_UNAVAILABLE
 }
 
 // The reason of a verdict that a step of the chain of trust produced.
 BROKEN_CHAIN :: "broken chain of trust"
+
+/*
+The other reasons more than one path gives, named once like `BROKEN_CHAIN`.
+
+`CHAIN_UNAVAILABLE` is the fallback `walk_reason` gives (see there), and
+`LOOKUPS_SPENT` is a walk out of `MAX_LOOKUPS_PER_QUERY`, whichever question
+the last lookup was for. Both go out as RFC 8914 extra text beside code 22. The
+rest are the verdicts a proof reaches: an unsigned zone and an opt-out span
+(RFC 5155 section 6) are `Insecure`, a wildcard expansion or denial left
+unproven (RFC 4035 section 5.4) is `Bogus`, and a response with nothing in it
+to check is `Insecure`.
+*/
+CHAIN_UNAVAILABLE :: "chain of trust unavailable"
+LOOKUPS_SPENT :: "lookup budget spent"
+UNSIGNED_ZONE :: "unsigned zone"
+OPT_OUT_SPAN :: "opt-out span"
+WILDCARD_NOT_PROVEN :: "wildcard expansion not proven"
+DENIAL_NOT_PROVEN :: "denial of existence not proven"
+NOTHING_TO_AUTHENTICATE :: "nothing to authenticate"
 
 // Say which step of the walk broke, for the log only: the first call in a walk
 // wins, since what is tried after the step that broke is a consequence of it.
@@ -760,14 +779,14 @@ an attacker chose; the genuine one is what it would keep out.
 
 Counted across the question instead, and spent only on signatures that could
 actually verify - see `signature_worth_trying`, which refuses the rest for
-nothing. Every verification a question can reach comes from here, at four call
+nothing. Every verification a question can reach comes from here, at three call
 sites: `validate_rrset` for an answer's own RRsets, `verified_rrset` for a
-denial's proof, the RRSIGs over a DS set in `zone_step`, and the RRSIGs over a
-DNSKEY set in `fetch_keys`. The last two come out of a response, so the
-length of their signature list is whoever answered the lookup's to choose, and
-`MAX_LOOKUPS_PER_QUERY` allows 32 such lookups per question (#193).
+denial's proof and for the DS set and CNAME `zone_step` reads, and the RRSIGs
+over a DNSKEY set in `fetch_keys`. The chain walk's sets come out of a response,
+so the length of their signature list is whoever answered the lookup's to
+choose, and `MAX_LOOKUPS_PER_QUERY` allows 32 such lookups per question (#193).
 
-One budget for all four, so no path keeps a private allowance that can be
+One budget for all three, so no path keeps a private allowance that can be
 emptied on its own - and so the chain walk shares what it spends with the
 answer. That is deliberate, and it costs something: a padded DS set early in a
 walk can exhaust what a later step needs and leave a resolvable name
@@ -1204,6 +1223,12 @@ Authenticated_Set :: struct {
 	ttl:   u32,
 }
 
+// One set that verified, as a verdict lists it.
+@(private)
+authenticated_set :: proc(name: string, type: dns.Type, class: dns.Class, signer: string, rrsig: Rrsig, ttl: u32) -> Authenticated_Set {
+	return {name = name, type = type, class = class, signer = signer, rrsig = rrsig, ttl = ttl}
+}
+
 // The least TTL any set this verdict rests on may be served with.
 ttl_ceiling :: proc(result: Result) -> u32 {
 	ceiling := max(u32)
@@ -1396,7 +1421,7 @@ validate :: proc(
 	denial to demand either.
 	*/
 	if qtype == .RRSIG && len(msg.answer) > 0 {
-		return {status = .Insecure, reason = "nothing to authenticate"}
+		return {status = .Insecure, reason = NOTHING_TO_AUTHENTICATE}
 	}
 	denied := name_the_window(validate_denial(v, &budget, msg, qname, qtype, class, unix, now, allocator), now, allocator)
 	denied.shed = shed_verdict(&budget, denied)
@@ -2111,17 +2136,7 @@ validated_hints :: proc(
 		if status != .Secure || encloser != "" {
 			continue
 		}
-		append(
-			&out,
-			Authenticated_Set {
-				name = rec.name,
-				type = rec.type,
-				class = class,
-				signer = signer,
-				rrsig = carried,
-				ttl = signed_ttl_ceiling(carried, unix),
-			},
-		)
+		append(&out, authenticated_set(rec.name, rec.type, class, signer, carried, signed_ttl_ceiling(carried, unix)))
 	}
 	return out[:]
 }
@@ -2284,17 +2299,7 @@ validate_answer :: proc(
 			worst = worse(worst, status)
 			continue
 		}
-		append(
-			&authenticated,
-			Authenticated_Set {
-				name = rec.name,
-				type = rec.type,
-				class = class,
-				signer = signer,
-				rrsig = carried,
-				ttl = ceiling,
-			},
-		)
+		append(&authenticated, authenticated_set(rec.name, rec.type, class, signer, carried, ceiling))
 	}
 
 	/*
@@ -2303,7 +2308,7 @@ validate_answer :: proc(
 	what is authenticatable. Whatever the cause, an empty check is not a pass.
 	*/
 	if checked == 0 {
-		return {status = .Insecure, reason = "nothing to authenticate"}
+		return {status = .Insecure, reason = NOTHING_TO_AUTHENTICATE}
 	}
 
 	/*
@@ -2608,7 +2613,7 @@ validate_denial :: proc(
 	status, keys, established := zone_trust(v, budget, zone_of, now, allocator)
 	#partial switch status {
 	case .Insecure:
-		return {status = .Insecure, reason = "unsigned zone"}
+		return {status = .Insecure, reason = UNSIGNED_ZONE}
 	case .Bogus:
 		return {status = .Bogus, reason = BROKEN_CHAIN, detail = budget.broken, lapsed = budget.broken_lapsed}
 	case .Indeterminate:
@@ -2711,14 +2716,14 @@ validate_denial :: proc(
 	case .Proven:
 		return {status = .Secure, authority = proved_denial(budget, msg, proved, established, class, keys, unix, allocator)}
 	case .Opt_Out:
-		return {status = .Insecure, reason = "opt-out span"}
+		return {status = .Insecure, reason = OPT_OUT_SPAN}
 	case .Failed:
 		if budget.walk_past_ceiling {
 			return {status = .Indeterminate, reason = NSEC3_OVER_CEILING}
 		}
-		return {status = .Bogus, reason = "denial of existence not proven", lapsed = records.lapsed}
+		return {status = .Bogus, reason = DENIAL_NOT_PROVEN, lapsed = records.lapsed}
 	}
-	return {status = .Bogus, reason = "denial of existence not proven", lapsed = records.lapsed}
+	return {status = .Bogus, reason = DENIAL_NOT_PROVEN, lapsed = records.lapsed}
 }
 
 /*
@@ -2765,17 +2770,7 @@ proved_denial :: proc(
 	append(&out, ..proved)
 	_, signer, carried, ok, _, _ := verified_rrset(budget, msg.authority, zone, .SOA, class, zone, keys, unix, allocator)
 	if ok {
-		append(
-			&out,
-			Authenticated_Set {
-				name = zone,
-				type = .SOA,
-				class = class,
-				signer = signer,
-				rrsig = carried,
-				ttl = signed_ttl_ceiling(carried, unix),
-			},
-		)
+		append(&out, authenticated_set(zone, .SOA, class, signer, carried, signed_ttl_ceiling(carried, unix)))
 	}
 	return out[:]
 }
@@ -2989,7 +2984,7 @@ validate_rrset :: proc(
 	Our own allowance running out is not evidence about the zone.
 
 	`spend_lookup` already settles this the same way: a chain this server could
-	not afford to walk comes back `Indeterminate`, "chain of trust unavailable",
+	not afford to walk comes back `Indeterminate`, `LOOKUPS_SPENT`,
 	because the answer might be perfectly good and we simply stopped looking.
 
 	What that changes is the extended error the client is sent - 22, "No
@@ -3019,7 +3014,7 @@ validate_rrset :: proc(
 	}
 	switch owner_status {
 	case .Insecure:
-		return .Insecure, "", "unsigned zone", "", {}, {}
+		return .Insecure, "", UNSIGNED_ZONE, "", {}, {}
 	case .Indeterminate:
 		return .Indeterminate, "", walk_reason(budget), "", {}, {}
 	case .Bogus:
@@ -3375,10 +3370,10 @@ validate_wildcard_proof :: proc(
 		case .Insecure:
 			// The expanded name's zone is unsigned, or sits in an opt-out span:
 			// nothing to prove, and nothing forged.
-			return trust, nil, "unsigned zone", {}
+			return trust, nil, UNSIGNED_ZONE, {}
 		case .Secure:
 		}
-		return trust, nil, "wildcard expansion not proven", {}
+		return trust, nil, WILDCARD_NOT_PROVEN, {}
 	}
 	next_closer := name_drop_labels(owner, label_count(owner) - label_count(encloser) - 1)
 	// The denial records were verified against `established`, so a name outside
@@ -3386,7 +3381,7 @@ validate_wildcard_proof :: proc(
 	// zone would say nothing at all.
 	if !dns.name_at_or_below(next_closer, established) {
 		forget_unreached_non_cut(v, owner, established)
-		return .Bogus, nil, "wildcard expansion not proven", {}
+		return .Bogus, nil, WILDCARD_NOT_PROVEN, {}
 	}
 	denial := denial_records_for(v, budget, seen, msg.authority, established, class, keys, unix, now, allocator)
 	/*
@@ -3410,7 +3405,7 @@ validate_wildcard_proof :: proc(
 			// the span may be hiding an unsigned delegation, so the next closer
 			// name is not proven absent and the wildcard may not have applied.
 			if cover.rr.flags & NSEC3_FLAG_OPT_OUT != 0 {
-				return .Insecure, nil, "opt-out span", {}
+				return .Insecure, nil, OPT_OUT_SPAN, {}
 			}
 			return .Secure, denial.verified, "", {}
 		}
@@ -3436,7 +3431,7 @@ validate_wildcard_proof :: proc(
 	// As on the denial path: a proof that speaks for nothing may be one the
 	// walk stopped above. See `forget_unreached_non_cut`.
 	forget_unreached_non_cut(v, owner, established)
-	return .Bogus, nil, "wildcard expansion not proven", denial.lapsed
+	return .Bogus, nil, WILDCARD_NOT_PROVEN, denial.lapsed
 }
 
 /*
@@ -3512,17 +3507,7 @@ validated_denial_records :: proc(
 			keep_lapse(&lapsed, dropped)
 			continue
 		}
-		append(
-			&out_verified,
-			Authenticated_Set {
-				name = rec.name,
-				type = rec.type,
-				class = class,
-				signer = signer,
-				rrsig = carried,
-				ttl = signed_ttl_ceiling(carried, unix),
-			},
-		)
+		append(&out_verified, authenticated_set(rec.name, rec.type, class, signer, carried, signed_ttl_ceiling(carried, unix)))
 
 		for r in records {
 			append_denial_record(r, &out_nsec, &out_nsec3, allocator)
@@ -3536,8 +3521,9 @@ Check one RRset against keys that are already in hand.
 
 The zone is named by the caller rather than taken from the signature, so this
 answers "did this zone sign this" and not "did somebody sign this". Every use is
-in an authority section that has already been placed in a zone, where a signer
-of the response's own choosing is precisely what must not be believed.
+a set already placed in a zone - a denial's records in an authority section, or
+the DS set and CNAME a parent answers `zone_step` with - where a signer of the
+response's own choosing is precisely what must not be believed.
 
 The attempts are bounded the way `validate_rrset` bounds them, which is not a
 per-RRset cap: both spend the query-wide
@@ -3854,7 +3840,7 @@ zone_trust :: proc(
 		// it was this server's own shedding that stopped it, and overwriting
 		// that would send the client a code about the authority instead.
 		if seed_status == .Indeterminate && budget.walk_stopped == "" {
-			budget.walk_stopped = "chain of trust unavailable"
+			budget.walk_stopped = CHAIN_UNAVAILABLE
 		}
 		return seed_status, nil, seed
 	}
@@ -3897,7 +3883,7 @@ zone_trust :: proc(
 		case .Secure:
 			cuts += 1
 			if cuts > MAX_CHAIN_DEPTH {
-				budget.walk_stopped = "chain of trust unavailable"
+				budget.walk_stopped = CHAIN_UNAVAILABLE
 				return .Indeterminate, nil, "."
 			}
 			zone = child
@@ -4018,11 +4004,11 @@ zone_step :: proc(
 		return walk_gave_up(budget, WALKS_IN_FLIGHT), nil
 	}
 	if !spend_lookup(budget) {
-		return walk_gave_up(budget, "lookup budget spent"), nil
+		return walk_gave_up(budget, LOOKUPS_SPENT), nil
 	}
 	wire, ok := v.query(v.query_ctx, child, .DS, allocator, budget.deadline)
 	if !ok {
-		return walk_gave_up(budget, "chain of trust unavailable"), nil
+		return walk_gave_up(budget, CHAIN_UNAVAILABLE), nil
 	}
 	msg, derr := dns.decode_message(wire, allocator, budget.spent)
 	if derr != .None {
@@ -4045,7 +4031,7 @@ zone_step :: proc(
 	conclusion for the same rcodes on the response being validated.
 	*/
 	if !answerable_rcode(msg) {
-		return walk_gave_up(budget, "chain of trust unavailable"), nil
+		return walk_gave_up(budget, CHAIN_UNAVAILABLE), nil
 	}
 	unix := u32(time.to_unix_seconds(now))
 	// We asked in class IN, and the transport already checked the reply's
@@ -4053,57 +4039,21 @@ zone_step :: proc(
 	// choose which canonical form we build.
 	class := dns.Class.IN
 
-	ds_records := records_of(msg.answer, child, .DS, class, allocator)
-	if len(ds_records) > 0 {
-		sigs := sigs_covering(msg.answer, child, .DS, class, allocator)
-		verified := false
-		exhausted := false
-		ds_sig: Rrsig
-		lapsed: Lapsed
-		tried := false
-		scratch := Signing_Scratch {
-			budget = budget,
-		}
-		for sig in sigs {
-			if !dns.name_equal_fold(sig.signer, parent) {
-				continue
-			}
-			// Free rejects first, so a padded DS set spends the budget only on
-			// signatures that could actually verify.
-			if !signature_worth_trying(sig, parent_keys, unix) {
-				note_lapsed(&lapsed, sig, parent_keys, unix)
-				continue
-			}
-			tried = true
-			if !spend_verification(budget) {
-				logx.debugf(
-					"dnssec: DS %s ran out of verifications before a signature held; the step is undecided",
-					dns.name_trim_root(child),
-				)
-				exhausted = true
-				break
-			}
-			// And not from a wildcard either. A DS is the parent's word about
-			// one child, so a signature made over `*.<parent>` is not the
-			// parent naming this cut; see `verified_rrset` for the rest of it.
-			result, encloser := check_signature(sig, child, class, ds_records, parent_keys, unix, allocator, &scratch)
-			if scratch.over_budget {
-				exhausted = true
-				break
-			}
-			if result == .Ok && encloser == "" {
-				verified = true
-				ds_sig = sig
-				break
-			}
+	if len(records_of(msg.answer, child, .DS, class, allocator)) > 0 {
+		/*
+		The parent's word about one child, so checked against the parent's keys
+		by `verified_rrset` and held to what it holds every such set to: a
+		signer other than the parent does not count, and neither does a
+		signature made over `*.<parent>` - see there for the rest of it.
+		*/
+		ds_records, _, ds_sig, verified, exhausted, ds_lapsed := verified_rrset(budget, msg.answer, child, .DS, class, parent, parent_keys, unix, allocator)
+		// A step this server ran out of allowance on is one it did not read,
+		// which is `Indeterminate` territory rather than a broken delegation -
+		// the same distinction the denial path below makes.
+		if exhausted {
+			return walk_gave_up(budget, exhausted_reason(budget)), nil
 		}
 		if !verified {
-			// A step this server ran out of allowance on is one it did not
-			// read, which is `Indeterminate` territory rather than a broken
-			// delegation - the same distinction the denial path below makes.
-			if exhausted {
-				return walk_gave_up(budget, exhausted_reason(budget)), nil
-			}
 			/*
 			The third way a delegation appearing at a remembered non-cut shows
 			up here, and the one that arrives with records rather than without:
@@ -4118,7 +4068,7 @@ zone_step :: proc(
 				child,
 				"the DS set is not signed by any key of its parent, or its signature expanded a wildcard",
 				allocator,
-				Lapsed{} if tried else lapsed,
+				ds_lapsed,
 			)
 			return .Bogus, nil
 		}
@@ -4139,27 +4089,26 @@ zone_step :: proc(
 				continue
 			}
 			append(&set, parsed)
-			if algorithm_supported(parsed.algorithm) && digest_supported(parsed.digest_type) {
-				usable = true
-			}
-		}
-		if !usable {
-			// Every DS names an algorithm or a digest we cannot check, which
-			// RFC 6840 section 5.2 makes an insecure delegation rather than a
-			// broken one.
-			cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), walk_began(budget), sig_lapses(ds_sig, unix))
-			return .Insecure, nil
+			usable ||= ds_usable(parsed)
 		}
 
-		child_keys, kstatus, keys_sig, keys_ttl := fetch_keys(v, budget, child, set[:], unix, allocator)
-		if kstatus != .Secure {
-			if kstatus == .Insecure {
-				cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), walk_began(budget), sig_lapses(ds_sig, unix))
-				return .Insecure, nil
-			}
-			if kstatus == .Bogus {
-				return .Bogus, nil
-			}
+		// Every DS names an algorithm or a digest we cannot check, which RFC
+		// 6840 section 5.2 makes an insecure delegation rather than a broken
+		// one - the same answer `fetch_keys` gives for a set it reads that way.
+		kstatus := Status.Insecure
+		child_keys: []Dnskey
+		keys_sig: Rrsig
+		keys_ttl: u32
+		if usable {
+			child_keys, kstatus, keys_sig, keys_ttl = fetch_keys(v, budget, child, set[:], unix, allocator)
+		}
+		switch kstatus {
+		case .Insecure:
+			cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), walk_began(budget), sig_lapses(ds_sig, unix))
+			return .Insecure, nil
+		case .Bogus:
+			return .Bogus, nil
+		case .Indeterminate:
 			/*
 			Only where nothing more precise was written, as at the root in
 			`zone_trust`. `fetch_keys` says when it was this server's own
@@ -4177,9 +4126,10 @@ zone_step :: proc(
 			rather than an argument about why it is not needed.
 			*/
 			if budget.walk_stopped == "" {
-				budget.walk_stopped = "chain of trust unavailable"
+				budget.walk_stopped = CHAIN_UNAVAILABLE
 			}
 			return .Indeterminate, nil
+		case .Secure:
 		}
 		// Held to both RRsets the keys rest on and the signatures over them:
 		// the parent's over the DS and the zone's own over its DNSKEY set.
@@ -4459,6 +4409,7 @@ fetch_keys :: proc(
 		return nil, .Indeterminate, {}, 0
 	}
 	if !spend_lookup(budget) {
+		budget.walk_stopped = LOOKUPS_SPENT
 		return nil, .Indeterminate, {}, 0
 	}
 	wire, ok := v.query(v.query_ctx, zone, .DNSKEY, allocator, budget.deadline)
@@ -4520,7 +4471,7 @@ fetch_keys :: proc(
 	*/
 	checkable := false
 	for ds in ds_set {
-		if algorithm_supported(ds.algorithm) && digest_supported(ds.digest_type) {
+		if ds_usable(ds) {
 			checkable = true
 			break
 		}
@@ -4535,7 +4486,7 @@ fetch_keys :: proc(
 		budget = budget,
 	}
 	ds_loop: for ds in ds_set {
-		if !algorithm_supported(ds.algorithm) || !digest_supported(ds.digest_type) {
+		if !ds_usable(ds) {
 			continue
 		}
 		for key in parsed {
