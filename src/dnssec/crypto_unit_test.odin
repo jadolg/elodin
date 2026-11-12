@@ -26,12 +26,8 @@ encoder:
     rather than encoded as a redundant leading zero.
 */
 
-// The canonical signing input from `canonical_unit_test.odin`, which is what
-// each of these vectors was signed over.
-@(private = "file")
-SIGNED_DATA ::
-	"00010d0300000e106a000000690000001234076578616d706c6503636f6d0003777777076578616d706c6503636f6d00" +
-	"0001000100000e100004c000020103777777076578616d706c6503636f6d000001000100000e100004c0000202"
+// Every vector here was signed over `SIGNED_DATA`, the canonical signing input
+// `canonical_unit_test.odin` pins.
 
 @(private = "file")
 P256_HIGH_BIT_KEY ::

@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 
 # Signatures are pinned to the window the Odin tests use for FIXTURE_TIME.
-FIXTURE_TIME = 1785664800  # must match FIXTURE_TIME in src/dnssec/dnssec_test.odin
+FIXTURE_TIME = 1785664800  # must match FIXTURE_TIME in src/dnssec/fixtures_test.odin
 INCEPTION = FIXTURE_TIME - 86400 * 30
 EXPIRATION = FIXTURE_TIME + 86400 * 3650
 

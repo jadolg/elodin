@@ -9,48 +9,22 @@ import "elodin:loop"
 // Issue #337: a signature's validity allows for a signer whose clock runs ahead
 // of ours, and an RRset it verified is never served or kept longer than it says.
 
-@(private = "file")
-st_fixture :: proc(key: string) -> []u8 {
-	for f in FIXTURES {
-		if f.key == key {
-			return unhex(f.wire)
-		}
-	}
-	return nil
-}
-
-@(private = "file")
-st_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return unhex(f.wire, allocator), true
-		}
-	}
-	return nil, false
-}
-
-// The first RRSIG in a captured reply.
+// The first signature over a captured reply's own RRset. A reply without one is
+// a broken test, not a window of zero.
 @(private = "file")
 first_sig :: proc(key: string) -> Rrsig {
-	msg, _ := dns.decode_message(st_fixture(key), context.temp_allocator)
-	for section in ([][]dns.Record{msg.answer, msg.authority}) {
-		for rec in section {
-			if rec.type != .RRSIG {
-				continue
-			}
-			rdata, _ := raw_rdata(rec)
-			sig, err := parse_rrsig(rdata, context.temp_allocator)
-			if err == .None {
-				return sig
-			}
-		}
+	f := fixture(key)
+	msg, err := dns.decode_message(scenario_fixture(FIXTURES, key), context.temp_allocator)
+	sigs := sigs_covering(msg.answer, f.name, f.type, .IN, context.temp_allocator)
+	if err != .None || len(sigs) == 0 {
+		panic("the fixture carries no signature over its own RRset")
 	}
-	return {}
+	return sigs[0]
 }
 
 @(test)
 test_signature_inception_skew :: proc(t: ^testing.T) {
-	now := u32(1_785_664_800)
+	now := u32(FIXTURE_TIME)
 	sig := Rrsig {
 		inception  = now + 30,
 		expiration = now + 30 * 86400,
@@ -79,7 +53,7 @@ test_signature_inception_skew :: proc(t: ^testing.T) {
 
 @(test)
 test_signed_ttl_ceiling :: proc(t: ^testing.T) {
-	now := u32(1_785_664_800)
+	now := u32(FIXTURE_TIME)
 	sig := Rrsig {
 		original_ttl = 300,
 		inception    = now - 86400,
@@ -103,18 +77,17 @@ validates - the clamp is what keeps a signed answer from outliving its word.
 */
 @(test)
 test_served_ttl_is_clamped_to_the_signature :: proc(t: ^testing.T) {
-	v := make_validator(st_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(st_fixture("example_a"), context.temp_allocator)
+	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "example_a"), context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	original := max(u32)
+	for sig in sigs_covering(msg.answer, "www.example.com.", .A, .IN, context.temp_allocator) {
+		original = min(original, sig.original_ttl)
+	}
+	testing.expect(t, original != max(u32), "the answer carries no signature")
 	for &rec in msg.answer {
-		if rec.type == .RRSIG {
-			rdata, _ := raw_rdata(rec)
-			sig, _ := parse_rrsig(rdata, context.temp_allocator)
-			original = min(original, sig.original_ttl)
-		}
 		rec.ttl = 604800
 	}
 	raised, _, rerr := dns.encode_message(msg, context.temp_allocator)
@@ -146,16 +119,16 @@ test_served_ttl_is_clamped_to_the_signature :: proc(t: ^testing.T) {
 // A TTL already under the ceiling is the one the records carry, untouched.
 @(test)
 test_served_ttl_under_the_ceiling_is_kept :: proc(t: ^testing.T) {
-	v := make_validator(st_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
-	msg, derr := dns.decode_message(st_fixture("example_a"), context.temp_allocator)
+	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "example_a"), context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	for &rec in msg.answer {
 		rec.ttl = 7
 	}
 	wire, _, eerr := dns.encode_message(msg, context.temp_allocator)
 	testing.expect_value(t, eerr, dns.Encode_Error.None)
-	result := validate(v, "www.example.com.", .A, wire, time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "www.example.com.", .A, wire, fixture_now())
 	testing.expect_value(t, result.status, Status.Secure)
 	out, ok := strip_unauthenticated(wire, result)
 	testing.expect(t, ok, "the prune failed")
@@ -180,10 +153,10 @@ test_zone_keys_are_timed_from_the_whole_second :: proc(t: ^testing.T) {
 	// How long the entry is held, bounded both ways by the moments either
 	// side of the walk.
 	held :: proc(t: ^testing.T, now: time.Time) -> (least, most: time.Duration, ok: bool) {
-		v := make_validator(st_query, nil, Options{})
+		v := scenario_validator(&FIXTURES)
 		defer destroy_validator(v)
 		before := loop.moment_now()
-		result := validate(v, "www.example.com.", .A, st_fixture("example_a"), now)
+		result := validate(v, "www.example.com.", .A, scenario_fixture(FIXTURES, "example_a"), now)
 		after := loop.moment_now()
 		testing.expect_value(t, result.status, Status.Secure)
 		entry, found := v.zones["example.com."]
@@ -192,7 +165,7 @@ test_zone_keys_are_timed_from_the_whole_second :: proc(t: ^testing.T) {
 		}
 		return time.Duration(entry.expires - after), time.Duration(entry.expires - before), true
 	}
-	_, whole, whole_ok := held(t, time.unix(FIXTURE_TIME, 0))
+	_, whole, whole_ok := held(t, fixture_now())
 	part, _, part_ok := held(t, time.unix(FIXTURE_TIME, i64(900 * time.Millisecond)))
 	if whole_ok && part_ok {
 		testing.expectf(t, part <= whole - 900 * time.Millisecond, "held %v from 0.9 s past the second, %v from the second itself", part, whole)
@@ -214,7 +187,7 @@ test_zone_keys_do_not_outlive_their_signatures :: proc(t: ^testing.T) {
 		bound: string,
 	}{{".", "root_dnskey"}, {"com.", "com_dnskey"}, {"example.com.", "example_ds"}}
 	for c in cases {
-		v := make_validator(st_query, nil, Options{})
+		v := scenario_validator(&FIXTURES)
 		defer destroy_validator(v)
 		last := first_sig(c.bound).expiration
 		budget := query_budget(v)
@@ -243,16 +216,16 @@ records disagree goes out as one TTL, the lowest.
 */
 @(test)
 test_served_ttl_takes_the_least_received :: proc(t: ^testing.T) {
-	v := make_validator(st_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
-	msg, derr := dns.decode_message(st_fixture("example_a"), context.temp_allocator)
+	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "example_a"), context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	for &rec in msg.answer {
 		rec.ttl = 100 if rec.type == .RRSIG else 250
 	}
 	wire, _, eerr := dns.encode_message(msg, context.temp_allocator)
 	testing.expect_value(t, eerr, dns.Encode_Error.None)
-	result := validate(v, "www.example.com.", .A, wire, time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "www.example.com.", .A, wire, fixture_now())
 	testing.expect_value(t, result.status, Status.Secure)
 	out, ok := strip_unauthenticated(wire, result)
 	testing.expect(t, ok, "the prune failed")
@@ -268,7 +241,7 @@ test_served_ttl_takes_the_least_received :: proc(t: ^testing.T) {
 // The root's and `com.`'s DNSKEY sets, sent with a TTL of two minutes.
 @(private = "file")
 st_short_dnskey_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, deadline: ^time.Tick) -> (wire: []u8, ok: bool) {
-	wire, ok = st_query(ctx, name, type, allocator, deadline)
+	wire, ok = scenario_query(&FIXTURES, name, type, allocator, deadline)
 	if !ok || type != .DNSKEY || !(name == "." || dns.name_equal_fold(name, "com.")) {
 		return
 	}
@@ -291,7 +264,7 @@ st_short_dnskey_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocat
 test_zone_keys_do_not_outlive_their_dnskey_ttl :: proc(t: ^testing.T) {
 	v := make_validator(st_short_dnskey_query, nil, Options{})
 	defer destroy_validator(v)
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	budget := query_budget(v)
 	before := loop.moment_now()
 	status, _, _ := zone_trust(v, &budget, "com.", now, context.temp_allocator)

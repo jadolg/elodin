@@ -1,9 +1,6 @@
 package dnssec
 
-import "core:mem"
 import "core:testing"
-import "core:time"
-import "elodin:dns"
 
 /*
 A signed zone whose apex sits two labels below its signed parent.
@@ -119,89 +116,47 @@ ENT_FIXTURES := []Fixture{
 	},
 }
 
-@(private = "file")
-ent_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in ENT_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-ent_validator :: proc() -> ^Validator {
-	anchor, ok := parse_trust_anchor(ENT_ANCHOR, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	return make_validator(ent_query, nil, Options{anchors = anchors})
-}
-
-@(private = "file")
-ent_fixture :: proc(key: string) -> []u8 {
-	for f in ENT_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
-
 @(test)
 test_the_walk_passes_through_an_empty_non_terminal :: proc(t: ^testing.T) {
-	// The statement the two tests below rest on: the deepest signed zone at or
+	// The statement the test below rests on: the deepest signed zone at or
 	// above `deep.mid.entest.` is that zone itself, not the `entest.` the walk
 	// meets an empty non-terminal under.
-	v := ent_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&ENT_FIXTURES, ENT_ANCHOR)
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	status, keys, zone := zone_trust(v, &budget, "deep.mid.entest.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, keys, zone := zone_trust(v, &budget, "deep.mid.entest.", fixture_now(), context.temp_allocator)
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, zone, "deep.mid.entest.")
 	testing.expect(t, len(keys) > 0, "the zone should publish a key")
 	free_all(context.temp_allocator)
 }
 
+// An answer, and the same walk reached by the other path: a denial is
+// established against the zone the queried name lives in rather than against
+// a signer it names.
 @(test)
-test_an_answer_from_a_zone_below_an_empty_non_terminal_validates :: proc(t: ^testing.T) {
-	v := ent_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
-	defer destroy_validator(v)
+test_replies_from_a_zone_below_an_empty_non_terminal_validate :: proc(t: ^testing.T) {
+	cases := []struct {
+		key, qname, what: string,
+	} {
+		{"en_answer", "deep.mid.entest.", "an answer signed by"},
+		{"en_nx", "nx.deep.mid.entest.", "an NXDOMAIN proven by"},
+	}
+	for c in cases {
+		v := scenario_validator(&ENT_FIXTURES, ENT_ANCHOR)
+		defer destroy_validator(v)
 
-	result := validate(v, "deep.mid.entest.", .A, ent_fixture("en_answer"), time.unix(FIXTURE_TIME, 0))
-	testing.expectf(
-		t,
-		result.status == .Secure,
-		"an answer signed by the zone below an empty non-terminal should validate, got %v (%q)",
-		result.status,
-		result.reason,
-	)
-	free_all(context.temp_allocator)
-}
-
-@(test)
-test_a_denial_from_a_zone_below_an_empty_non_terminal_validates :: proc(t: ^testing.T) {
-	// The same walk, reached by the other path: a denial is established against
-	// the zone the queried name lives in rather than against a signer it names.
-	v := ent_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
-	defer destroy_validator(v)
-
-	result := validate(v, "nx.deep.mid.entest.", .A, ent_fixture("en_nx"), time.unix(FIXTURE_TIME, 0))
-	testing.expectf(
-		t,
-		result.status == .Secure,
-		"an NXDOMAIN proven by the zone below an empty non-terminal should validate, got %v (%q)",
-		result.status,
-		result.reason,
-	)
+		result := validate(v, c.qname, .A, scenario_fixture(ENT_FIXTURES, c.key), fixture_now())
+		testing.expectf(
+			t,
+			result.status == .Secure,
+			"%s the zone below an empty non-terminal should validate, got %v (%q)",
+			c.what,
+			result.status,
+			result.reason,
+		)
+	}
 	free_all(context.temp_allocator)
 }
 
@@ -219,8 +174,7 @@ test_the_walk_stops_at_a_name_the_zone_says_is_not_there :: proc(t: ^testing.T) 
 	NSEC3 zone, where the denial speaks for the next closer name and not for the
 	label below it - as `Bogus` on a zone that is perfectly well signed.
 	*/
-	v := ent_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&ENT_FIXTURES, ENT_ANCHOR)
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
@@ -228,7 +182,7 @@ test_the_walk_stops_at_a_name_the_zone_says_is_not_there :: proc(t: ^testing.T) 
 		v,
 		&budget,
 		"a.b.nx.deep.mid.entest.",
-		time.unix(FIXTURE_TIME, 0),
+		fixture_now(),
 		context.temp_allocator,
 	)
 	testing.expect_value(t, status, Status.Secure)

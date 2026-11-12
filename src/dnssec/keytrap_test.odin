@@ -1,6 +1,5 @@
 package dnssec
 
-import "base:runtime"
 import "core:mem"
 import "core:testing"
 import "core:time"
@@ -75,39 +74,21 @@ Padding :: struct {
 // signature bytes is public, so everything but the signature bytes is kept:
 // the key tag, the algorithm and the validity window are exactly what the cheap
 // pre-check reads, and a forgery that changed any of them would be rejected for
-// free and would prove nothing about the loops this file is about.
+// free and would prove nothing about the loops this file is about. `junk_tag`
+// and `stale` are those free rejects on purpose: a key the zone never
+// published, and a window that closed the moment it opened. Nothing else about
+// the record changes, so it is the tag or the dates and only those that can be
+// refusing it.
 @(private = "file")
 kt_forged :: proc(real: dns.Record, pad: Padding, allocator: mem.Allocator) -> dns.Record {
-	rdata, is_raw := raw_rdata(real)
-	if !is_raw {
-		panic("the signature to copy did not arrive as raw RDATA")
-	}
-	out := make([]u8, len(rdata), allocator)
-	copy(out, rdata)
-	for i in max(0, len(out) - 8) ..< len(out) {
-		out[i] ~= 0xff
-	}
-	// The key tag sits at offset 16, after the fixed fields and before the
-	// signer name. Flipping it names a key the zone never published, which is
-	// what `signature_worth_trying` refuses without doing any work.
+	damage := bit_set[Rrsig_Damage]{.Signature}
 	if pad.junk_tag {
-		out[16] ~= 0xff
-		out[17] ~= 0xff
+		damage += {.Key_Tag}
 	}
-	// The other free reject: expiration at offset 8, set to the inception that
-	// follows it, which is a window that closed the moment it opened. Nothing
-	// else about the record changes, so it is the dates and only the dates that
-	// can be refusing it.
 	if pad.stale {
-		copy(out[8:12], out[12:16])
+		damage += {.Closed_Window}
 	}
-	return dns.Record {
-		name = real.name,
-		type = .RRSIG,
-		class = real.class,
-		ttl = real.ttl,
-		data = dns.Rdata_Raw{data = out},
-	}
+	return rrsig_mutant(real, damage, allocator)
 }
 
 @(private = "file")
@@ -172,37 +153,37 @@ kt_pad :: proc(wire: []u8, pad: Padding, allocator: mem.Allocator) -> []u8 {
 // out. A nil `ctx` serves the fixtures untouched, which is the baseline the
 // free-reject tests compare against.
 @(private = "file")
-kt_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in FIXTURES {
-		if f.type != type || !dns.name_equal_fold(f.name, name) {
-			continue
-		}
-		raw, decoded := decode_hex(f.wire, allocator)
-		if !decoded {
-			return nil, false
-		}
-		if ctx == nil {
-			return raw, true
-		}
-		for pad in (^[]Padding)(ctx)^ {
-			if pad.type == type && dns.name_equal_fold(pad.name, name) {
-				return kt_pad(raw, pad, allocator), true
-			}
-		}
-		return raw, true
+kt_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
+	raw, ok := fixture_answer(FIXTURES, name, type, allocator)
+	if !ok || ctx == nil {
+		return raw, ok
 	}
-	return nil, false
+	for pad in (^[]Padding)(ctx)^ {
+		if pad.type == type && dns.name_equal_fold(pad.name, name) {
+			return kt_pad(raw, pad, allocator), true
+		}
+	}
+	return raw, true
+}
+
+// The walk to `cloudflare.com.` through responses padded as `pads` says, its
+// reading charged to `spent` when there is one.
+@(private = "file")
+kt_walk :: proc(pads: []Padding, spent: ^int = nil) -> (Status, Budget) {
+	pads := pads
+	v := make_validator(kt_query, &pads, Options{})
+	defer destroy_validator(v)
+	budget := query_budget(v)
+	budget.spent = spent
+	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", fixture_now(), context.temp_allocator)
+	return status, budget
 }
 
 // What the walk costs when nobody has touched the responses, so that a test
 // claiming padding was free has something to say "free" against.
 @(private = "file")
 kt_baseline :: proc(t: ^testing.T) -> (spent: int, ok: bool) {
-	v := make_validator(kt_query, nil, Options{})
-	defer destroy_validator(v)
-
-	budget := query_budget(v)
-	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, budget := kt_walk(nil)
 	if !testing.expectf(t, status == .Secure, "the untampered chain did not establish, got %v", status) {
 		return 0, false
 	}
@@ -225,12 +206,7 @@ the budget.
 */
 @(test)
 test_a_padded_ds_set_cannot_run_unbounded_verifications :: proc(t: ^testing.T) {
-	pads := []Padding{{name = "cloudflare.com.", type = .DS, sigs = 200}}
-	v := make_validator(kt_query, &pads, Options{})
-	defer destroy_validator(v)
-
-	budget := query_budget(v)
-	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, budget := kt_walk([]Padding{{name = "cloudflare.com.", type = .DS, sigs = 200}})
 	testing.expectf(
 		t,
 		status == .Indeterminate,
@@ -267,12 +243,7 @@ test_free_rejectable_ds_padding_costs_the_chain_nothing :: proc(t: ^testing.T) {
 		return
 	}
 
-	pads := []Padding{{name = "cloudflare.com.", type = .DS, sigs = 200, junk_tag = true}}
-	v := make_validator(kt_query, &pads, Options{})
-	defer destroy_validator(v)
-
-	budget := query_budget(v)
-	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, budget := kt_walk([]Padding{{name = "cloudflare.com.", type = .DS, sigs = 200, junk_tag = true}})
 	testing.expectf(
 		t,
 		status == .Secure,
@@ -307,12 +278,7 @@ test_lapsed_ds_padding_costs_the_chain_nothing :: proc(t: ^testing.T) {
 		return
 	}
 
-	pads := []Padding{{name = "cloudflare.com.", type = .DS, sigs = 200, stale = true}}
-	v := make_validator(kt_query, &pads, Options{})
-	defer destroy_validator(v)
-
-	budget := query_budget(v)
-	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, budget := kt_walk([]Padding{{name = "cloudflare.com.", type = .DS, sigs = 200, stale = true}})
 	testing.expectf(
 		t,
 		status == .Secure,
@@ -346,7 +312,7 @@ test_a_padded_root_dnskey_set_is_bounded :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	status, _ := zone_keys(v, &budget, ".", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, _ := zone_keys(v, &budget, ".", fixture_now(), context.temp_allocator)
 	testing.expectf(
 		t,
 		status == .Indeterminate,
@@ -374,12 +340,7 @@ DNSKEY set before it looks at a key.
 */
 @(test)
 test_a_padded_dnskey_set_cannot_run_unbounded_verifications :: proc(t: ^testing.T) {
-	pads := []Padding{{name = "cloudflare.com.", type = .DNSKEY, sigs = 200}}
-	v := make_validator(kt_query, &pads, Options{})
-	defer destroy_validator(v)
-
-	budget := query_budget(v)
-	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, budget := kt_walk([]Padding{{name = "cloudflare.com.", type = .DNSKEY, sigs = 200}})
 	testing.expectf(
 		t,
 		status == .Indeterminate,
@@ -403,12 +364,7 @@ test_free_rejectable_dnskey_padding_costs_the_chain_nothing :: proc(t: ^testing.
 		return
 	}
 
-	pads := []Padding{{name = "cloudflare.com.", type = .DNSKEY, sigs = 200, junk_tag = true}}
-	v := make_validator(kt_query, &pads, Options{})
-	defer destroy_validator(v)
-
-	budget := query_budget(v)
-	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, budget := kt_walk([]Padding{{name = "cloudflare.com.", type = .DNSKEY, sigs = 200, junk_tag = true}})
 	testing.expectf(
 		t,
 		status == .Secure,
@@ -447,15 +403,10 @@ single step.
 */
 @(test)
 test_duplicate_ds_records_do_not_multiply_the_dnskey_check :: proc(t: ^testing.T) {
-	pads := []Padding {
+	status, budget := kt_walk([]Padding {
 		{name = "cloudflare.com.", type = .DS, records = 63},
 		{name = "cloudflare.com.", type = .DNSKEY, sigs = 8, drop_real = true},
-	}
-	v := make_validator(kt_query, &pads, Options{})
-	defer destroy_validator(v)
-
-	budget := query_budget(v)
-	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	})
 	testing.expectf(
 		t,
 		status == .Indeterminate,
@@ -562,16 +513,11 @@ test_an_exhausted_key_check_is_not_a_downgrade :: proc(t: ^testing.T) {
 
 // Arena a padded walk to cloudflare.com. takes, from an empty arena.
 @(private = "file")
-kt_walk_arena :: proc(pads: []Padding) -> int {
+kt_walk_arena :: proc(pads: []Padding) -> (int, Status) {
 	free_all(context.temp_allocator)
-	pads := pads
-	v := make_validator(kt_query, &pads, Options{})
-	defer destroy_validator(v)
-	budget := query_budget(v)
-	arena := cast(^runtime.Arena)context.temp_allocator.data
-	before := arena.total_used
-	zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
-	return int(arena.total_used - before)
+	before := arena_used()
+	status, _ := kt_walk(pads)
+	return arena_used() - before, status
 }
 
 /*
@@ -592,8 +538,12 @@ test_chain_walk_signatures_do_not_rerender_the_set :: proc(t: ^testing.T) {
 		// Each record is copied `records` times; the fixture's DNSKEY set holds
 		// two keys, and a set past `MAX_KEYS_PER_ZONE` is not tried at all.
 		records := 255 if type == .DS else MAX_KEYS_PER_ZONE / 2 - 1
-		few := kt_walk_arena([]Padding{{name = "cloudflare.com.", type = type, records = records, sigs = 1}})
-		many := kt_walk_arena([]Padding{{name = "cloudflare.com.", type = type, records = records, sigs = 41}})
+		few, few_status := kt_walk_arena([]Padding{{name = "cloudflare.com.", type = type, records = records, sigs = 1}})
+		many, many_status := kt_walk_arena([]Padding{{name = "cloudflare.com.", type = type, records = records, sigs = 41}})
+		// The premise: the genuine signature still verifies behind the padding,
+		// so both walks reached the end and the arena measures the whole of it.
+		testing.expect_value(t, few_status, Status.Secure)
+		testing.expect_value(t, many_status, Status.Secure)
 		testing.expectf(t, many - few < 40 * PER_FORGERY, "40 more %v forgeries cost %d more bytes of arena", type, many - few)
 	}
 	free_all(context.temp_allocator)
@@ -611,22 +561,14 @@ DNSKEY signature's verification is spent, the reading before it.
 */
 @(test)
 test_the_dnskey_render_is_charged_to_the_request :: proc(t: ^testing.T) {
-	walk :: proc(spent: ^int) -> (Status, Budget) {
-		v := make_validator(kt_query, nil, Options{})
-		defer destroy_validator(v)
-		budget := query_budget(v)
-		budget.spent = spent
-		status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
-		return status, budget
-	}
 	spent := 0
-	status, untouched := walk(&spent)
+	status, untouched := kt_walk(nil, &spent)
 	testing.expect_value(t, status, Status.Secure)
 	room := spent
 
 	spent = dns.REQUEST_DECODE_BUDGET - room + 1
 	budget: Budget
-	status, budget = walk(&spent)
+	status, budget = kt_walk(nil, &spent)
 	testing.expect_value(t, status, Status.Indeterminate)
 	testing.expect_value(t, budget.walk_stopped, READING_OVER_BUDGET)
 	testing.expect_value(t, budget.verifications, untouched.verifications)
@@ -642,13 +584,9 @@ padded reply adds: the rest is the render.
 */
 @(test)
 test_the_ds_render_is_charged_to_the_request :: proc(t: ^testing.T) {
-	walk_spent :: proc(pads: []Padding) -> (spent: int, verifications: int) {
-		pads := pads
-		v := make_validator(kt_query, &pads, Options{})
-		defer destroy_validator(v)
-		budget := query_budget(v)
-		budget.spent = &spent
-		zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	walk_spent :: proc(t: ^testing.T, pads: []Padding) -> (spent: int, verifications: int) {
+		status, budget := kt_walk(pads, &spent)
+		testing.expect_value(t, status, Status.Secure)
 		return spent, budget.verifications
 	}
 	read_spent :: proc(pads: []Padding) -> (spent: int) {
@@ -660,8 +598,8 @@ test_the_ds_render_is_charged_to_the_request :: proc(t: ^testing.T) {
 	padded := []Padding{{name = "cloudflare.com.", type = .DS, records = 255}}
 	plain := []Padding{{name = "cloudflare.com.", type = .DS}}
 
-	walk_plain, untouched := walk_spent(plain)
-	walk_padded, verifications := walk_spent(padded)
+	walk_plain, untouched := walk_spent(t, plain)
+	walk_padded, verifications := walk_spent(t, padded)
 	// The premise: the padding changed nothing about what verified.
 	testing.expect_value(t, verifications, untouched)
 
@@ -681,14 +619,9 @@ that did not answer.
 */
 @(test)
 test_an_exhausted_key_check_says_which_allowance :: proc(t: ^testing.T) {
-	pads := []Padding{{name = "cloudflare.com.", type = .DNSKEY, sigs = 200}}
-	v := make_validator(kt_query, &pads, Options{})
-	defer destroy_validator(v)
-
-	budget := query_budget(v)
-	status, _, _ := zone_trust(v, &budget, "cloudflare.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, budget := kt_walk([]Padding{{name = "cloudflare.com.", type = .DNSKEY, sigs = 200}})
 	testing.expect_value(t, status, Status.Indeterminate)
 	testing.expect_value(t, budget.verifications, MAX_VERIFICATIONS_PER_QUERY)
-	testing.expect_value(t, budget.walk_stopped, "verification budget spent")
+	testing.expect_value(t, budget.walk_stopped, VERIFICATIONS_SPENT)
 	free_all(context.temp_allocator)
 }

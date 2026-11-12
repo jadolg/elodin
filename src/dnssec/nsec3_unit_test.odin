@@ -98,29 +98,6 @@ A_VECTORS := []struct {
 	{"xx.example.", H_XX},
 }
 
-// A type bit map with just these types set. Every type used here is below 256,
-// so one window holds them all.
-@(private = "file")
-types_bitmap :: proc(types: []dns.Type) -> []u8 {
-	if len(types) == 0 {
-		return nil
-	}
-	high := 0
-	for type in types {
-		if int(type) > high {
-			high = int(type)
-		}
-	}
-	length := high / 8 + 1
-	out := make([]u8, 2 + length, context.temp_allocator)
-	out[0] = 0
-	out[1] = u8(length)
-	for type in types {
-		out[2 + int(type) / 8] |= 0x80 >> u8(int(type) % 8)
-	}
-	return out
-}
-
 @(private = "file")
 n3 :: proc(owner, next: string, types: []dns.Type, flags: u8 = 0, iterations: u16 = A_ITERATIONS) -> Nsec3_Rr {
 	owner_hash := make([]u8, 20, context.temp_allocator)
@@ -867,7 +844,7 @@ test_a_proof_that_could_not_hash_counts_the_refusal :: proc(t: ^testing.T) {
 	testing.expect_value(t, nsec3_proves_name_error(zone, "nx.example.", "example.", &budget), Proof.Failed)
 	declined, why := nsec3_declined(&budget, before)
 	testing.expect(t, declined, "a proof this server would not finish has to be visible as one to its caller")
-	testing.expect_value(t, why, "nsec3 hashing budget spent")
+	testing.expect_value(t, why, NSEC3_BUDGET_SPENT)
 	free_all(context.temp_allocator)
 }
 

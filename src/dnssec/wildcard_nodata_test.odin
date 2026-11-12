@@ -1,8 +1,6 @@
 package dnssec
 
-import "core:mem"
 import "core:testing"
-import "core:time"
 import "elodin:dns"
 
 /*
@@ -140,27 +138,11 @@ WN_FIXTURES := []Fixture{
 }
 
 @(private = "file")
-wn_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in WN_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return decode_hex(f.wire, allocator)
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
 wn_validate :: proc(qname: string, type: dns.Type) -> Result {
-	anchor, parsed := parse_trust_anchor(WN_ANCHOR, context.temp_allocator)
-	if !parsed {
-		return {status = .Indeterminate, reason = "the anchor did not parse"}
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	v := make_validator(wn_query, nil, Options{anchors = anchors})
+	v := scenario_validator(&WN_FIXTURES, WN_ANCHOR)
 	defer destroy_validator(v)
-	reply, _ := wn_query(nil, qname, type, context.temp_allocator, nil)
-	return validate(v, qname, type, reply, time.unix(FIXTURE_TIME, 0))
+	reply, _ := fixture_answer(WN_FIXTURES, qname, type, context.temp_allocator)
+	return validate(v, qname, type, reply, fixture_now())
 }
 
 @(test)

@@ -47,26 +47,6 @@ Node :: struct {
 	types: []dns.Type,
 }
 
-@(private = "file")
-bitmap_of :: proc(types: []dns.Type) -> []u8 {
-	if len(types) == 0 {
-		return nil
-	}
-	high := 0
-	for type in types {
-		if int(type) > high {
-			high = int(type)
-		}
-	}
-	length := high / 8 + 1
-	out := make([]u8, 2 + length, context.temp_allocator)
-	out[1] = u8(length)
-	for type in types {
-		out[2 + int(type) / 8] |= 0x80 >> u8(int(type) % 8)
-	}
-	return out
-}
-
 /*
 The NSEC3 chain a zone holding exactly these names would publish: one record
 per name, in hash order, each pointing at the next and the last wrapping round.
@@ -88,7 +68,7 @@ nsec3_zone :: proc(nodes: []Node, salt := D_SALT, iterations: u16 = 0) -> []Nsec
 				hash_algorithm = NSEC3_HASH_SHA1,
 				salt = salt,
 				iterations = iterations,
-				types = bitmap_of(node.types),
+				types = types_bitmap(node.types),
 			},
 		}
 	}
@@ -99,11 +79,6 @@ nsec3_zone :: proc(nodes: []Node, salt := D_SALT, iterations: u16 = 0) -> []Nsec
 		out[i].rr.next_hash = out[(i + 1) % len(out)].hash
 	}
 	return out
-}
-
-@(private = "file")
-nsec_rr_of :: proc(owner, next: string, types: []dns.Type) -> Nsec_Rr {
-	return Nsec_Rr{owner = owner, rr = Nsec{next = next, types = bitmap_of(types)}}
 }
 
 @(test)
@@ -120,9 +95,9 @@ test_a_denial_of_a_name_that_is_not_there_ends_the_walk :: proc(t: ^testing.T) {
 	// And NSEC, where the same span answers for every name inside it, so the
 	// walk would otherwise keep going label by label to the bottom of the name.
 	nsecs := []Nsec_Rr {
-		nsec_rr_of("example.", "a.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
-		nsec_rr_of("a.example.", "z.example.", {.A, .RRSIG, .NSEC}),
-		nsec_rr_of("z.example.", "example.", {.A, .RRSIG, .NSEC}),
+		nsec_rr("example.", "a.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
+		nsec_rr("a.example.", "z.example.", {.A, .RRSIG, .NSEC}),
+		nsec_rr("z.example.", "example.", {.A, .RRSIG, .NSEC}),
 	}
 	nsec_step, _ := denial_step(nsecs, nil, "nx.example.", "example.", budget_at(150))
 	testing.expect_value(t, nsec_step, Step.Absent)
@@ -153,8 +128,8 @@ test_a_denial_at_an_empty_non_terminal_keeps_the_walk_going :: proc(t: ^testing.
 	it exists for.
 	*/
 	nsecs := []Nsec_Rr {
-		nsec_rr_of("example.", "a.ent.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
-		nsec_rr_of("a.ent.example.", "example.", {.A, .RRSIG, .NSEC}),
+		nsec_rr("example.", "a.ent.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
+		nsec_rr("a.ent.example.", "example.", {.A, .RRSIG, .NSEC}),
 	}
 	nsec_step, _ := denial_step(nsecs, nil, "ent.example.", "example.", budget_at(150))
 	testing.expect_value(t, nsec_step, Step.No_Cut)
@@ -170,8 +145,8 @@ test_a_denial_at_an_unsigned_delegation_still_ends_the_chain :: proc(t: ^testing
 	testing.expect_value(t, nsec3_step, Step.Insecure)
 
 	nsecs := []Nsec_Rr {
-		nsec_rr_of("example.", "sub.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
-		nsec_rr_of("sub.example.", "example.", {.NS, .NSEC}),
+		nsec_rr("example.", "sub.example.", {.NS, .SOA, .RRSIG, .NSEC, .DNSKEY}),
+		nsec_rr("sub.example.", "example.", {.NS, .NSEC}),
 	}
 	nsec_step, _ := denial_step(nsecs, nil, "sub.example.", "example.", budget_at(150))
 	testing.expect_value(t, nsec_step, Step.Insecure)
@@ -182,7 +157,7 @@ test_a_denial_at_an_unsigned_delegation_still_ends_the_chain :: proc(t: ^testing
 test_a_denial_that_settles_nothing_is_refused :: proc(t: ^testing.T) {
 	// Records from some other part of the zone say nothing about this name, and
 	// "says nothing" must not be read as either answer.
-	nsecs := []Nsec_Rr{nsec_rr_of("a.example.", "b.example.", {.A, .RRSIG, .NSEC})}
+	nsecs := []Nsec_Rr{nsec_rr("a.example.", "b.example.", {.A, .RRSIG, .NSEC})}
 	out_of_zone, _ := denial_step(nsecs, nil, "q.other.", "other.", budget_at(150))
 	testing.expect_value(t, out_of_zone, Step.Bogus)
 	free_all(context.temp_allocator)

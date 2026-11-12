@@ -1,10 +1,8 @@
 package dnssec
 
-import "core:mem"
 import "core:slice"
 import "core:strings"
 import "core:testing"
-import "core:time"
 import "elodin:dns"
 
 /*
@@ -433,9 +431,10 @@ WC_FIXTURES := []Fixture{
 }
 
 /*
-What the chain walk sees, which is not always what the client was sent.
+What the chain walk sees from `WC_FIXTURES`, which is not always what the
+client was sent.
 
-Matched on name and type, first entry wins - and two fixtures here share
+`fixture_answer` matches on name and type, first entry wins - and two fixtures here share
 `nx.wctest. DS` on purpose. `wc_nx_ds` is the honest denial the walk needs on
 its way down to that name; `wc_expanded_ds_answer` is an attack reply, handed
 to `validate` by key through `wc_reply` and never something an upstream should
@@ -445,57 +444,37 @@ that it still does: with the two swapped, the DS and NSEC repros quietly stop
 reproducing - every test still passes, because the message is refused a step
 earlier for an unrelated reason.
 */
-@(private = "file")
-wc_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in WC_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return decode_hex(f.wire, allocator)
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-wc_reply :: proc(key: string) -> []u8 {
-	for f in WC_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
 
 /*
-The reason a refusal has to carry.
+The reasons a refusal has to carry.
 
 `Bogus` on its own would be satisfied by a fixture chain that had quietly come
 apart - a signature whose window `FIXTURE_TIME` drifted out of, a lookup that
 matched the wrong record - and a test reading only the verdict would stay green
-while exercising nothing. This is what a denial with no record left standing
-settles as, which is what dropping the relocated NSEC leaves behind.
+while exercising nothing. `NO_DENIAL` is what a denial with no record left
+standing settles as, which is what dropping the relocated NSEC leaves behind;
+`WC_IMPOSSIBLE` is what `validate_answer` settles at for a type RFC 4592
+section 4 says a wildcard never produces.
 */
-@(private = "file")
-WC_UNPROVEN :: "no denial of existence"
-
-// What `validate_answer` settles at for a type RFC 4592 section 4 says a
-// wildcard never produces. Named for the same reason as the one above: a bare
-// `Bogus` would also be what a fixture chain that had quietly come apart
-// returns.
 @(private = "file")
 WC_IMPOSSIBLE :: "wildcard expansion not possible"
 
 @(private = "file")
-wc_validate :: proc(key, qname: string, type: dns.Type) -> Result {
-	anchor, parsed := parse_trust_anchor(WC_ANCHOR, context.temp_allocator)
-	if !parsed {
-		return {status = .Indeterminate, reason = "the anchor did not parse"}
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	v := make_validator(wc_query, nil, Options{anchors = anchors})
+wc_reply :: proc(key: string) -> []u8 {
+	return scenario_fixture(WC_FIXTURES, key)
+}
+
+// Validate `wire` under `WC_ANCHOR`, or the fixture under `key` with `wc_validate`.
+@(private = "file")
+wc_validate_wire :: proc(qname: string, type: dns.Type, wire: []u8) -> Result {
+	v := scenario_validator(&WC_FIXTURES, WC_ANCHOR)
 	defer destroy_validator(v)
-	return validate(v, qname, type, wc_reply(key), time.unix(FIXTURE_TIME, 0))
+	return validate(v, qname, type, wire, fixture_now())
+}
+
+@(private = "file")
+wc_validate :: proc(key, qname: string, type: dns.Type) -> Result {
+	return wc_validate_wire(qname, type, wc_reply(key))
 }
 
 @(test)
@@ -506,7 +485,7 @@ test_a_relocated_wildcard_nsec_cannot_prove_nodata :: proc(t: ^testing.T) {
 	result := wc_validate("wc_relocated_nodata", "real.wctest.", .TXT)
 	testing.expectf(
 		t,
-		result.status == .Bogus && result.reason == WC_UNPROVEN,
+		result.status == .Bogus && result.reason == NO_DENIAL,
 		"a wildcard's NSEC re-owned to a real name cannot deny that name's TXT, got %v (%q)",
 		result.status,
 		result.reason,
@@ -521,7 +500,7 @@ test_a_relocated_wildcard_nsec_cannot_prove_nxdomain :: proc(t: ^testing.T) {
 	result := wc_validate("wc_relocated_nxdomain", "www.wctest.", .A)
 	testing.expectf(
 		t,
-		result.status == .Bogus && result.reason == WC_UNPROVEN,
+		result.status == .Bogus && result.reason == NO_DENIAL,
 		"two relocated copies of a wildcard's NSEC cannot deny a name the zone answers for, got %v (%q)",
 		result.status,
 		result.reason,
@@ -568,7 +547,7 @@ test_a_zone_cut_whose_ds_signature_expanded_is_refused :: proc(t: ^testing.T) {
 	result := wc_validate("wd_evil_answer", "evil.wdtest.", .A)
 	testing.expectf(
 		t,
-		result.status == .Bogus && result.reason == "broken chain of trust",
+		result.status == .Bogus && result.reason == BROKEN_CHAIN,
 		"a DS whose signature expanded a wildcard is not a zone cut, got %v (%q)",
 		result.status,
 		result.reason,
@@ -712,10 +691,10 @@ test_an_expanded_ds_or_soa_answer_is_not_secure_either :: proc(t: ^testing.T) {
 	goes out at AD=1.
 	*/
 	// The walk down to `nx.wctest.` asks for its DS, and both the denial and
-	// the attack are filed under that name and type. `wc_query` takes the
-	// first, so the order of the two decides whether what follows reproduces
-	// anything; see the comment on `wc_query`.
-	walked, answered := wc_query(nil, "nx.wctest.", .DS, context.temp_allocator, nil)
+	// the attack are filed under that name and type. `fixture_answer` takes
+	// the first, so the order of the two decides whether what follows
+	// reproduces anything; see the note after `WC_FIXTURES`.
+	walked, answered := fixture_answer(WC_FIXTURES, "nx.wctest.", .DS, context.temp_allocator)
 	testing.expect(
 		t,
 		answered && slice.equal(walked, wc_reply("wc_nx_ds")),
@@ -755,7 +734,7 @@ for the log.
 test_a_broken_chain_names_the_zone_and_the_step :: proc(t: ^testing.T) {
 	result := wc_validate("wd_evil_answer", "evil.wdtest.", .A)
 	testing.expect_value(t, result.status, Status.Bogus)
-	testing.expect_value(t, result.reason, "broken chain of trust")
+	testing.expect_value(t, result.reason, BROKEN_CHAIN)
 	testing.expectf(
 		t,
 		strings.contains(result.detail, "evil.wdtest"),
@@ -786,7 +765,7 @@ test_a_secure_verdict_carries_no_detail :: proc(t: ^testing.T) {
 test_a_bogus_that_is_not_a_chain_step_carries_no_detail :: proc(t: ^testing.T) {
 	result := wc_validate("wc_relocated_nxdomain", "www.wctest.", .A)
 	testing.expect_value(t, result.status, Status.Bogus)
-	testing.expect_value(t, result.reason, WC_UNPROVEN)
+	testing.expect_value(t, result.reason, NO_DENIAL)
 	testing.expect_value(t, result.detail, "")
 	free_all(context.temp_allocator)
 }
@@ -813,12 +792,7 @@ test_a_broken_chain_keeps_its_detail_past_a_later_rrset :: proc(t: ^testing.T) {
 	wire, _, encerr := dns.encode_message(evil, context.temp_allocator, compress = false)
 	testing.expect_value(t, encerr, dns.Encode_Error.None)
 
-	anchor, parsed := parse_trust_anchor(WC_ANCHOR, context.temp_allocator)
-	testing.expect(t, parsed, "the anchor did not parse")
-	anchors := []Trust_Anchor{anchor}
-	v := make_validator(wc_query, nil, Options{anchors = anchors})
-	defer destroy_validator(v)
-	result := validate(v, "evil.wdtest.", .A, wire, time.unix(FIXTURE_TIME, 0))
+	result := wc_validate_wire("evil.wdtest.", .A, wire)
 
 	testing.expect_value(t, result.status, Status.Bogus)
 	testing.expect_value(t, result.reason, BROKEN_CHAIN)
@@ -862,12 +836,9 @@ a DS the root does not have.
 test_a_root_that_matches_no_anchor_says_so :: proc(t: ^testing.T) {
 	// The real anchor's key tag and algorithm, with a digest that is not its key's.
 	stale := ". IN DS 38604 15 2 0000000000000000000000000000000000000000000000000000000000000000"
-	anchor, parsed := parse_trust_anchor(stale, context.temp_allocator)
-	testing.expect(t, parsed, "the anchor did not parse")
-	anchors := []Trust_Anchor{anchor}
-	v := make_validator(wc_query, nil, Options{anchors = anchors})
+	v := scenario_validator(&WC_FIXTURES, stale)
 	defer destroy_validator(v)
-	result := validate(v, "fine.wdtest.", .A, wc_reply("wd_fine_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "fine.wdtest.", .A, wc_reply("wd_fine_answer"), fixture_now())
 
 	testing.expect_value(t, result.status, Status.Bogus)
 	testing.expect_value(t, result.reason, BROKEN_CHAIN)
@@ -901,12 +872,7 @@ test_a_dname_check_does_not_take_the_cnames_detail :: proc(t: ^testing.T) {
 	wire, _, encerr := dns.encode_message(msg, context.temp_allocator, compress = false)
 	testing.expect_value(t, encerr, dns.Encode_Error.None)
 
-	anchor, parsed := parse_trust_anchor(WC_ANCHOR, context.temp_allocator)
-	testing.expect(t, parsed, "the anchor did not parse")
-	anchors := []Trust_Anchor{anchor}
-	v := make_validator(wc_query, nil, Options{anchors = anchors})
-	defer destroy_validator(v)
-	result := validate(v, "x.evil.wdtest.", .A, wire, time.unix(FIXTURE_TIME, 0))
+	result := wc_validate_wire("x.evil.wdtest.", .A, wire)
 
 	testing.expect_value(t, result.status, Status.Bogus)
 	testing.expect_value(t, result.reason, BROKEN_CHAIN)

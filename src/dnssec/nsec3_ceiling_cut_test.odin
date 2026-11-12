@@ -91,45 +91,21 @@ C3_FIXTURES := []Fixture{
 	},
 }
 
-@(private = "file")
-c3_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in C3_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return decode_hex(f.wire, allocator)
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-c3_wire :: proc(key: string) -> []u8 {
-	for f in C3_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
-
 @(test)
 test_a_signed_cut_below_the_ceiling_is_judged_on_its_own_keys :: proc(t: ^testing.T) {
-	anchor, parsed := parse_trust_anchor(C3_ANCHOR, context.temp_allocator)
-	testing.expect(t, parsed, "the anchor should parse")
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	now := time.unix(FIXTURE_TIME, 0)
+	anchors := fixture_anchors(C3_ANCHOR)
+	now := fixture_now()
 
 	// The child's own signed answer validates: the step the ceiling could not
 	// read did not stop the walk reaching the zone that signed it.
-	v := make_validator(c3_query, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
+	v := make_validator(scenario_query, &C3_FIXTURES, Options{anchors = anchors, max_nsec3_iterations = 5})
 	defer destroy_validator(v)
-	signed := validate(v, "s.e.c3test.", .A, c3_wire("c3_answer"), now)
+	signed := validate(v, "s.e.c3test.", .A, scenario_fixture(C3_FIXTURES, "c3_answer"), now)
 	testing.expectf(t, signed.status == .Secure, "the child's signed answer should validate, got %v (%q)", signed.status, signed.reason)
 
 	// The same answer stripped of its signature is a forgery in a zone this
 	// walk read, and is called one rather than blamed on the ceiling above.
-	msg, err := dns.decode_message(c3_wire("c3_answer"), context.temp_allocator)
+	msg, err := dns.decode_message(scenario_fixture(C3_FIXTURES, "c3_answer"), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 	unsigned := make([dynamic]dns.Record, context.temp_allocator)
 	for rr in msg.answer {
@@ -141,7 +117,7 @@ test_a_signed_cut_below_the_ceiling_is_judged_on_its_own_keys :: proc(t: ^testin
 	wire, _, encode_err := dns.encode_message(msg, context.temp_allocator)
 	testing.expect_value(t, encode_err, dns.Encode_Error.None)
 
-	fresh := make_validator(c3_query, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
+	fresh := make_validator(scenario_query, &C3_FIXTURES, Options{anchors = anchors, max_nsec3_iterations = 5})
 	defer destroy_validator(fresh)
 	forged := validate(fresh, "s.e.c3test.", .A, wire, now)
 	testing.expectf(t, forged.status == .Bogus, "a forgery below a signed cut is bogus, got %v (%q)", forged.status, forged.reason)
@@ -153,13 +129,9 @@ test_a_signed_cut_below_the_ceiling_is_judged_on_its_own_keys :: proc(t: ^testin
 @(private = "file")
 c3_wrong_child_keys :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
 	if type == .DNSKEY && dns.name_equal_fold(name, "s.e.c3test.") {
-		for f in C3_FIXTURES {
-			if f.key == "c3_dnskey" {
-				return decode_hex(f.wire, allocator)
-			}
-		}
+		return decode_hex(fixture("c3_dnskey", C3_FIXTURES).wire, allocator)
 	}
-	return c3_query(ctx, name, type, allocator, nil)
+	return fixture_answer(C3_FIXTURES, name, type, allocator)
 }
 
 /*
@@ -174,14 +146,11 @@ telling whoever debugs a forged or broken key set to look at iteration counts.
 */
 @(test)
 test_a_broken_signed_cut_below_the_ceiling_is_bogus :: proc(t: ^testing.T) {
-	anchor, parsed := parse_trust_anchor(C3_ANCHOR, context.temp_allocator)
-	testing.expect(t, parsed, "the anchor should parse")
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
+	anchors := fixture_anchors(C3_ANCHOR)
 
 	v := make_validator(c3_wrong_child_keys, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
 	defer destroy_validator(v)
-	result := validate(v, "s.e.c3test.", .A, c3_wire("c3_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "s.e.c3test.", .A, scenario_fixture(C3_FIXTURES, "c3_answer"), fixture_now())
 	testing.expectf(t, result.status == .Bogus, "a key set the signed DS does not match is bogus, got %v (%q)", result.status, result.reason)
 	free_all(context.temp_allocator)
 }

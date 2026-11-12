@@ -1,9 +1,6 @@
 package dnssec
 
-import "core:mem"
 import "core:testing"
-import "core:time"
-import "elodin:dns"
 
 /*
 A synthetic NSEC3 zone reproducing a shape real traffic actually sends:
@@ -111,50 +108,16 @@ WILDCARD_FIXTURES := []Fixture{
 	},
 }
 
-@(private = "file")
-wildcard_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in WILDCARD_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-wildcard_fixture :: proc(key: string) -> []u8 {
-	for f in WILDCARD_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
-
-@(private = "file")
-wildcard_validator :: proc() -> ^Validator {
-	anchor, ok := parse_trust_anchor(WILDCARD_ANCHOR, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	return make_validator(wildcard_query, nil, Options{anchors = anchors})
-}
-
 @(test)
 test_wildcard_zone_chain_is_sound :: proc(t: ^testing.T) {
 	// The control, as in test_dname_zone_chain_is_sound: if the canonical form
 	// these fixtures were signed against ever drifts from the one the
 	// validator computes, this is what starts reporting the drift.
-	v := wildcard_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&WILDCARD_FIXTURES, WILDCARD_ANCHOR)
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	status, keys, zone := zone_trust(v, &budget, "wildcardtest.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, keys, zone := zone_trust(v, &budget, "wildcardtest.", fixture_now(), context.temp_allocator)
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, zone, "wildcardtest.")
 	testing.expect(t, len(keys) > 0, "the zone should publish a key")
@@ -174,11 +137,10 @@ test_wildcard_answer_with_apex_closest_encloser_validates :: proc(t: ^testing.T)
 	(confirmed against Quad9's live answer for big.oisd.nl, which sets the AD
 	bit on exactly this shape).
 	*/
-	v := wildcard_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&WILDCARD_FIXTURES, WILDCARD_ANCHOR)
 	defer destroy_validator(v)
 
-	result := validate(v, "sub.wildcardtest.", .A, wildcard_fixture("wc_wildcard_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "sub.wildcardtest.", .A, scenario_fixture(WILDCARD_FIXTURES, "wc_wildcard_answer"), fixture_now())
 	testing.expectf(
 		t,
 		result.status == .Secure,
@@ -198,16 +160,15 @@ test_wildcard_answer_without_next_closer_cover_is_bogus :: proc(t: ^testing.T) {
 	wildcard-signed RRset - genuinely signed, just for the wrong name - stand
 	in for any name in the zone, including ones with real records of their own.
 	*/
-	v := wildcard_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&WILDCARD_FIXTURES, WILDCARD_ANCHOR)
 	defer destroy_validator(v)
 
 	result := validate(
 		v,
 		"other.wildcardtest.",
 		.A,
-		wildcard_fixture("wc_wildcard_answer_no_cover"),
-		time.unix(FIXTURE_TIME, 0),
+		scenario_fixture(WILDCARD_FIXTURES, "wc_wildcard_answer_no_cover"),
+		fixture_now(),
 	)
 	testing.expectf(
 		t,
@@ -234,13 +195,12 @@ apex rather than answering from the DS denial first.
 */
 @(test)
 test_a_wildcard_proof_past_the_ceiling_is_refused :: proc(t: ^testing.T) {
-	v := wildcard_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&WILDCARD_FIXTURES, WILDCARD_ANCHOR)
 	defer destroy_validator(v)
 	v.max_nsec3_iterations = -1
-	non_cut_remember(v, "sub.wildcardtest.", MAX_ZONE_TTL, fixture_moment(time.unix(FIXTURE_TIME, 0)))
+	non_cut_remember(v, "sub.wildcardtest.", MAX_ZONE_TTL, fixture_moment(fixture_now()))
 
-	result := validate(v, "sub.wildcardtest.", .A, wildcard_fixture("wc_wildcard_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "sub.wildcardtest.", .A, scenario_fixture(WILDCARD_FIXTURES, "wc_wildcard_answer"), fixture_now())
 	testing.expectf(t, result.status == .Indeterminate, "got %v (%q)", result.status, result.reason)
 	testing.expect_value(t, result.reason, NSEC3_OVER_CEILING)
 	free_all(context.temp_allocator)

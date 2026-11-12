@@ -266,24 +266,7 @@ dr_query :: proc(
 	if calls != nil && type == .DS && !dns.name_equal_fold(name, "drtest.") && name != "." {
 		calls.below_apex += 1
 	}
-	for f in DR_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-dr_fixture :: proc(key: string) -> []u8 {
-	for f in DR_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
+	return fixture_answer(DR_FIXTURES, name, type, allocator)
 }
 
 // What the walk itself reads: `cache_get` answers for both maps at once, and
@@ -296,23 +279,13 @@ dr_remembered :: proc(v: ^Validator, name: string, now: time.Time) -> bool {
 
 @(private = "file")
 dr_validator :: proc(calls: ^Dr_Calls) -> ^Validator {
-	anchor, parsed := parse_trust_anchor(DR_ANCHOR, context.temp_allocator)
-	if !parsed {
-		return nil
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	v := make_validator(dr_query, calls, Options{anchors = anchors})
+	v := make_validator(dr_query, calls, Options{anchors = fixture_anchors(DR_ANCHOR)})
 	// A fixed seed makes the hash table deterministic, so no pair of names
 	// these tests use lands on the same slot.  Without this, the random seed
 	// drawn at start-up can produce a collision that evicts a name mid-walk
 	// and changes the verdict from what the test asserts - see issue #362.
-	//
-	// Seed 0 is chosen as the simplest constant basis; modulo 1024, the eight
-	// labels of DR_QNAME below the apex and DR_SUB_QNAME map to:
-	//   l8: 1002, l7: 587, l6: 771, l5: 748, l4: 438,
-	//   l3: 775,  l2: 11,  l1: 964, sub: 664.
-	// All nine slots are distinct.
+	// `test_dr_fixture_names_do_not_collide_in_non_cut_table` holds the names
+	// to distinct slots under seed 0.
 	v.non_cut_seed = 0
 	return v
 }
@@ -329,34 +302,14 @@ test_dr_fixture_names_do_not_collide_in_non_cut_table :: proc(t: ^testing.T) {
 	v := dr_validator(nil)
 	defer destroy_validator(v)
 
-	slots: [dynamic]int
-	defer delete(slots)
-
-	// The 8 labels below the apex, DR_QNAME itself first:
-	for i in 1 ..= 8 {
-		name := name_drop_labels(DR_QNAME, i - 1)
-		slot := non_cut_slot(v, name)
-		for existing in slots {
-			testing.expectf(
-				t,
-				existing != slot,
-				"hash collision in non_cut table: %s maps to existing slot %d",
-				name,
-				slot,
-			)
-		}
-		append(&slots, slot)
+	// The 8 labels below the apex, DR_QNAME itself first, and DR_SUB_QNAME.
+	names: [9]string
+	for i in 0 ..< 8 {
+		names[i] = name_drop_labels(DR_QNAME, i)
 	}
-
-	sub_slot := non_cut_slot(v, DR_SUB_QNAME)
-	for existing in slots {
-		testing.expectf(
-			t,
-			existing != sub_slot,
-			"hash collision in non_cut table: DR_SUB_QNAME maps to existing slot %d",
-			sub_slot,
-		)
-	}
+	names[8] = DR_SUB_QNAME
+	expect_distinct_non_cut_slots(t, v, names[:])
+	free_all(context.temp_allocator)
 }
 
 @(test)
@@ -373,11 +326,10 @@ test_a_run_of_non_cuts_is_walked_once :: proc(t: ^testing.T) {
 	*/
 	calls := Dr_Calls{}
 	v := dr_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
-	result := validate(v, DR_QNAME, .A, dr_fixture("dr_nodata"), now)
+	now := fixture_now()
+	result := validate(v, DR_QNAME, .A, scenario_fixture(DR_FIXTURES, "dr_nodata"), now)
 	testing.expectf(
 		t,
 		result.status == .Secure,
@@ -422,10 +374,9 @@ test_a_flood_of_non_cuts_keeps_neither_the_zones_nor_the_slots_it_wants :: proc(
 	*/
 	calls := Dr_Calls{}
 	v := dr_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	cache_put(v, ".", .Secure, nil, MAX_ZONE_TTL, fixture_moment(now))
 
 	// Saturate first, so what follows measures the steady state under attack
@@ -486,17 +437,16 @@ test_a_real_cut_below_the_run_is_still_reached :: proc(t: ^testing.T) {
 	*/
 	calls := Dr_Calls{}
 	v := dr_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	budget := Budget{}
 	status, keys, zone := zone_trust(v, &budget, DR_SUB_QNAME, now, context.temp_allocator)
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, zone, DR_SUB_QNAME)
 	testing.expect(t, len(keys) > 0, "the zone below the run should publish a key")
 
-	result := validate(v, DR_SUB_QNAME, .A, dr_fixture("dr_sub_answer"), now)
+	result := validate(v, DR_SUB_QNAME, .A, scenario_fixture(DR_FIXTURES, "dr_sub_answer"), now)
 	testing.expectf(
 		t,
 		result.status == .Secure,
@@ -520,10 +470,9 @@ test_a_zone_learned_later_replaces_what_the_memo_says :: proc(t: ^testing.T) {
 	*/
 	calls := Dr_Calls{}
 	v := dr_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	non_cut_remember(v, "cut.drtest.", 3600, fixture_moment(now))
 	testing.expect(t, dr_remembered(v, "cut.drtest.", now), "the memo should hold it to begin with")
 
@@ -576,10 +525,9 @@ test_a_broken_step_forgets_the_name_the_walk_skipped :: proc(t: ^testing.T) {
 	*/
 	calls := Dr_Calls{}
 	v := dr_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	budget := Budget{}
 	status, keys, zone := zone_trust(v, &budget, "drtest.", now, context.temp_allocator)
 	testing.expect_value(t, status, Status.Secure)
@@ -632,7 +580,6 @@ test_the_memo_is_believed_for_less_time_than_a_zone :: proc(t: ^testing.T) {
 	*/
 	calls := Dr_Calls{}
 	v := dr_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
 	// One reading of the clock for every step, so the second either side of
@@ -665,10 +612,9 @@ test_a_ds_the_parent_did_not_sign_forgets_the_name_above :: proc(t: ^testing.T) 
 	*/
 	calls := Dr_Calls{}
 	v := dr_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	budget := Budget{}
 	root_status, root_keys := zone_keys(v, &budget, ".", now, context.temp_allocator)
 	testing.expect_value(t, root_status, Status.Secure)
@@ -701,10 +647,9 @@ test_a_delegation_at_a_remembered_name_heals_on_the_next_question :: proc(t: ^te
 	*/
 	calls := Dr_Calls{}
 	v := dr_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	/*
 	Walk the run first, so the table already holds every name below the apex.
 	Without that the validation below inserts those eight names as it goes, and
@@ -714,11 +659,12 @@ test_a_delegation_at_a_remembered_name_heals_on_the_next_question :: proc(t: ^te
 	insert.
 	*/
 	warm := Budget{}
-	zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
+	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
+	testing.expect_value(t, warmed, Status.Secure)
 	non_cut_remember(v, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
 	testing.expect(t, dr_remembered(v, DR_SUB_QNAME, now), "the table should hold the name to begin with")
 
-	first := validate(v, DR_SUB_QNAME, .A, dr_fixture("dr_sub_answer"), now)
+	first := validate(v, DR_SUB_QNAME, .A, scenario_fixture(DR_FIXTURES, "dr_sub_answer"), now)
 	testing.expectf(
 		t,
 		first.status == .Bogus,
@@ -731,7 +677,7 @@ test_a_delegation_at_a_remembered_name_heals_on_the_next_question :: proc(t: ^te
 		"the refused question should have given the name back",
 	)
 
-	second := validate(v, DR_SUB_QNAME, .A, dr_fixture("dr_sub_answer"), now)
+	second := validate(v, DR_SUB_QNAME, .A, scenario_fixture(DR_FIXTURES, "dr_sub_answer"), now)
 	testing.expectf(
 		t,
 		second.status == .Secure,
@@ -754,19 +700,19 @@ test_a_denial_from_a_delegation_at_a_remembered_name_heals_too :: proc(t: ^testi
 	*/
 	calls := Dr_Calls{}
 	v := dr_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	// The run is warmed first for the reason the answer-path test gives: the
 	// walk must have nothing left to insert, or it can evict the very name
 	// under test.
 	warm := Budget{}
-	zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
+	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
+	testing.expect_value(t, warmed, Status.Secure)
 	non_cut_remember(v, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
 	testing.expect(t, dr_remembered(v, DR_SUB_QNAME, now), "the table should hold the name to begin with")
 
-	first := validate(v, DR_SUB_QNAME, .AAAA, dr_fixture("dr_sub_nodata"), now)
+	first := validate(v, DR_SUB_QNAME, .AAAA, scenario_fixture(DR_FIXTURES, "dr_sub_nodata"), now)
 	testing.expectf(
 		t,
 		first.status == .Bogus,
@@ -779,7 +725,7 @@ test_a_denial_from_a_delegation_at_a_remembered_name_heals_too :: proc(t: ^testi
 		"the refused question should have given the name back",
 	)
 
-	second := validate(v, DR_SUB_QNAME, .AAAA, dr_fixture("dr_sub_nodata"), now)
+	second := validate(v, DR_SUB_QNAME, .AAAA, scenario_fixture(DR_FIXTURES, "dr_sub_nodata"), now)
 	testing.expectf(
 		t,
 		second.status == .Secure,
@@ -808,17 +754,17 @@ test_a_parents_delegation_nsec_cannot_deny_a_name_inside_the_child :: proc(t: ^t
 	*/
 	calls := Dr_Calls{}
 	v := dr_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	// Warmed first, as in the heal tests: the walk must not be able to evict
 	// the name under test while it runs.
 	warm := Budget{}
-	zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
+	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
+	testing.expect_value(t, warmed, Status.Secure)
 	non_cut_remember(v, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
 
-	result := validate(v, "www." + DR_SUB_QNAME, .A, dr_fixture("dr_delegation_nsec"), now)
+	result := validate(v, "www." + DR_SUB_QNAME, .A, scenario_fixture(DR_FIXTURES, "dr_delegation_nsec"), now)
 	testing.expectf(
 		t,
 		result.status != .Secure,
@@ -840,7 +786,8 @@ the set lapses, the signature is what has to end it.
 test_a_non_cut_is_not_remembered_past_its_signature :: proc(t: ^testing.T) {
 	last := max(u32)
 	for f in DR_FIXTURES {
-		msg, _ := dns.decode_message(dr_fixture(f.key), context.temp_allocator)
+		msg, derr := dns.decode_message(scenario_fixture(DR_FIXTURES, f.key), context.temp_allocator)
+		testing.expect_value(t, derr, dns.Decode_Error.None)
 		for section in ([][]dns.Record{msg.answer, msg.authority}) {
 			for rec in section {
 				rdata, is_raw := raw_rdata(rec)
@@ -853,13 +800,13 @@ test_a_non_cut_is_not_remembered_past_its_signature :: proc(t: ^testing.T) {
 			}
 		}
 	}
+	testing.expect(t, last != max(u32), "the fixtures carry no signature to lapse")
 	calls := Dr_Calls{}
 	v := dr_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
 	defer destroy_validator(v)
 
 	now := time.unix(i64(last) - 30, 0)
-	result := validate(v, DR_QNAME, .A, dr_fixture("dr_nodata"), now)
+	result := validate(v, DR_QNAME, .A, scenario_fixture(DR_FIXTURES, "dr_nodata"), now)
 	testing.expectf(t, result.status == .Secure, "the minted denial got %v (%q)", result.status, result.reason)
 	// The walk stored it on the zone cache's own clock, thirty seconds before
 	// the signature lapses.
@@ -875,7 +822,7 @@ test_a_non_cut_is_not_remembered_past_its_signature :: proc(t: ^testing.T) {
 // floor, and an Original TTL under the floor does not.
 @(test)
 test_a_zone_entry_does_not_outlive_its_signature_ceiling :: proc(t: ^testing.T) {
-	v := make_validator(dr_query, nil, Options{})
+	v := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(v)
 	// One reading of the clock for every step; see
 	// `test_the_memo_is_believed_for_less_time_than_a_zone`.

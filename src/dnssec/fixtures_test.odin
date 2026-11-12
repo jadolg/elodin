@@ -1,6 +1,12 @@
 package dnssec
 
+import "base:runtime"
+import "core:mem"
+import "core:strings"
+import "core:testing"
+import "core:time"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 Real signed DNS traffic, captured from a public resolver and frozen here.
@@ -13,7 +19,311 @@ canonicalisation bug agree with itself and still pass.
 
 The signatures have fixed validity windows, so the tests pin `now` to
 FIXTURE_TIME, which sits inside every one of them.
+
+The generated tables beside the tests that use them (`DG_FIXTURES`,
+`SH_FIXTURES`, ...) are the output of `testdata/gen/sign_fixtures.py`, signed
+inside the same window. The helpers below read either kind.
 */
+
+/*
+2026-08-02T10:00:00Z, which falls inside the validity period of every signature
+in the fixtures. Passing the time in rather than reading the clock is what keeps
+captured traffic usable as a test vector: the bytes are frozen, so the moment
+they are judged against has to be too.
+*/
+FIXTURE_TIME :: 1785664800
+
+fixture_now :: proc() -> time.Time {
+	return time.unix(FIXTURE_TIME, 0)
+}
+
+/*
+A fixture's instant on the zone cache's clock, for a test that seeds or reads the
+cache by hand. `FIXTURE_TIME` is the moment of the call, so an entry seeded at it
+lies on the same clock as one a walk stores: live to any walk until its lifetime
+has run on the real clock, however long the test binary had run before seeding
+it. A test moving its own clock forward still expires it.
+*/
+fixture_moment :: proc(t: time.Time) -> loop.Moment {
+	return loop.moment_add(loop.moment_now(), time.diff(fixture_now(), t))
+}
+
+holds :: proc(records: []dns.Record, name: string, type: dns.Type) -> bool {
+	for rec in records {
+		if rec.type == type && dns.name_equal_fold(rec.name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// How many RRSIGs at `name` cover `covered`. Asked for by what it covers,
+// because one owner carries signatures over several types at once and "an
+// RRSIG survived" would be answered by any of them.
+holds_signature_over :: proc(records: []dns.Record, name: string, covered: dns.Type) -> int {
+	found := 0
+	for rec in records {
+		if rec.type != .RRSIG || !dns.name_equal_fold(rec.name, name) {
+			continue
+		}
+		rdata, is_raw := raw_rdata(rec)
+		if !is_raw {
+			continue
+		}
+		sig, err := parse_rrsig(rdata, context.temp_allocator)
+		if err == .None && sig.type_covered == covered {
+			found += 1
+		}
+	}
+	return found
+}
+
+// Every name in `names` owns its own slot of `v`'s non-cut table, so a test that
+// remembers them all loses none of them to a collision (issue #362).
+expect_distinct_non_cut_slots :: proc(t: ^testing.T, v: ^Validator, names: []string) {
+	for name, i in names {
+		slot := non_cut_slot(v, name)
+		for other in names[:i] {
+			testing.expectf(t, non_cut_slot(v, other) != slot, "%s and %s share non-cut slot %d", name, other, slot)
+		}
+	}
+}
+
+// An Ed25519 zone key for `example.com.`, the one the signatures in
+// `check_signature_test.odin` and `signing_scratch_test.odin` are made with.
+ED25519_KEY_RDATA :: "0101030fe6087a0da6db23c6753cb6ee6edc1cc7683652baa4d3edf04c5c62bd8cbfc884"
+ED25519_KEY_TAG :: 14506
+
+// `ED25519_KEY_RDATA` as a key set of one. A key that does not decode or parse
+// is a broken test, so it panics.
+ed25519_key :: proc() -> []Dnskey {
+	rdata, ok := decode_hex(ED25519_KEY_RDATA, context.temp_allocator)
+	if !ok {
+		panic("the test key is not hex")
+	}
+	key, err := parse_dnskey(rdata)
+	if err != .None {
+		panic("the test key does not parse")
+	}
+	keys := make([]Dnskey, 1, context.temp_allocator)
+	keys[0] = key
+	return keys
+}
+
+/*
+An RRSIG record at `owner` carrying `sig`, its RDATA laid out as RFC 4034
+section 3.1 has it. What tests forge signatures with: nothing about it has to
+verify, only parse.
+*/
+rrsig_record :: proc(owner: string, sig: Rrsig, ttl := u32(300)) -> dns.Record {
+	name: [dns.MAX_NAME_WIRE]u8
+	n, err := dns.encode_name(sig.signer, name[:])
+	if err != .None {
+		panic("cannot encode the signer")
+	}
+	out := make([dynamic]u8, 0, RRSIG_SIGNER + n + len(sig.signature), context.temp_allocator)
+	append(&out, u8(u16(sig.type_covered) >> 8), u8(u16(sig.type_covered)), sig.algorithm, sig.labels)
+	for v in ([3]u32{sig.original_ttl, sig.expiration, sig.inception}) {
+		append(&out, u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v))
+	}
+	append(&out, u8(sig.key_tag >> 8), u8(sig.key_tag))
+	append(&out, ..name[:n])
+	append(&out, ..sig.signature)
+	return dns.Record{name = owner, type = .RRSIG, class = .IN, ttl = ttl, data = dns.Rdata_Raw{data = out[:]}}
+}
+
+// Where the fields `rrsig_mutant` alters sit in RRSIG RDATA (RFC 4034 section 3.1).
+RRSIG_ORIGINAL_TTL :: 4
+RRSIG_EXPIRATION :: 8
+RRSIG_INCEPTION :: 12
+RRSIG_KEY_TAG :: 16
+RRSIG_SIGNER :: 18
+
+/*
+What `rrsig_mutant` changes in a copy of a genuine signature:
+
+- `Signature`: the last eight bytes of the signature flipped, so it no longer
+  verifies while every field the free pre-checks read stays genuine;
+- `Key_Tag`: the key tag flipped, naming a key the zone never published, which
+  `signature_worth_trying` refuses without doing any work;
+- `Closed_Window`: the expiration set to the inception, a window that closed
+  the moment it opened;
+- `Original_Ttl`: one bit of the Original TTL, which is signed data and not the
+  signature.
+*/
+Rrsig_Damage :: enum {
+	Signature,
+	Key_Tag,
+	Closed_Window,
+	Original_Ttl,
+}
+
+// A copy of the RRSIG `real` with `damage` done to its RDATA. Everything else
+// about the record is kept.
+rrsig_mutant :: proc(real: dns.Record, damage: bit_set[Rrsig_Damage], allocator := context.temp_allocator) -> dns.Record {
+	rdata, is_raw := raw_rdata(real)
+	if !is_raw {
+		panic("the signature to copy did not arrive as raw RDATA")
+	}
+	out := make([]u8, len(rdata), allocator)
+	copy(out, rdata)
+	if .Signature in damage {
+		for i in max(RRSIG_SIGNER, len(out) - 8) ..< len(out) {
+			out[i] ~= 0xff
+		}
+	}
+	if .Key_Tag in damage {
+		out[RRSIG_KEY_TAG] ~= 0xff
+		out[RRSIG_KEY_TAG + 1] ~= 0xff
+	}
+	if .Closed_Window in damage {
+		copy(out[RRSIG_EXPIRATION:RRSIG_INCEPTION], out[RRSIG_INCEPTION:RRSIG_KEY_TAG])
+	}
+	if .Original_Ttl in damage {
+		out[RRSIG_ORIGINAL_TTL] ~= 0x01
+	}
+	return dns.Record{name = real.name, type = .RRSIG, class = real.class, ttl = real.ttl, data = dns.Rdata_Raw{data = out}}
+}
+
+// A type bit map with just these types set. Every type the tests use is below
+// 256, so one window holds them all.
+types_bitmap :: proc(types: []dns.Type) -> []u8 {
+	if len(types) == 0 {
+		return nil
+	}
+	high := 0
+	for type in types {
+		high = max(high, int(type))
+	}
+	length := high / 8 + 1
+	out := make([]u8, 2 + length, context.temp_allocator)
+	out[1] = u8(length)
+	for type in types {
+		out[2 + int(type) / 8] |= 0x80 >> u8(int(type) % 8)
+	}
+	return out
+}
+
+// An NSEC record at `owner` naming `next` and holding `types`.
+nsec_rr :: proc(owner, next: string, types: []dns.Type) -> Nsec_Rr {
+	return Nsec_Rr{owner = owner, rr = Nsec{next = next, types = types_bitmap(types)}}
+}
+
+// What the temporary arena has handed out so far, for a test that measures
+// what a call costs by the difference.
+arena_used :: proc() -> int {
+	return int((cast(^runtime.Arena)context.temp_allocator.data).total_used)
+}
+
+// A request's decode counter already past its budget, so the first charge
+// against it is refused.
+SPENT :: dns.REQUEST_DECODE_BUDGET + 1
+
+// The reason a proof that proves nothing gets. Production writes it as a
+// literal, so the tests name it once here.
+NO_DENIAL :: "no denial of existence"
+
+// Test fixtures are well-formed, so a bad one is nil rather than a second
+// value every caller would drop.
+unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
+	out, ok := decode_hex(text, allocator)
+	if !ok {
+		return nil
+	}
+	return out
+}
+
+// The fixture under `key` in `table`, the captured set when that is nil. A key
+// the table lacks is a broken test.
+fixture :: proc(key: string, table: []Fixture = nil) -> Fixture {
+	for f in (table if table != nil else FIXTURES) {
+		if f.key == key {
+			return f
+		}
+	}
+	panic("no fixture under that key")
+}
+
+// The reply under `key` in `fixtures`, decoded. A missing key or a wire that is
+// not hex is a broken test, not a verdict, so it panics.
+scenario_fixture :: proc(fixtures: []Fixture, key: string) -> []u8 {
+	out, ok := decode_hex(fixture(key, fixtures).wire, context.temp_allocator)
+	if !ok {
+		panic("a fixture's wire is not hex")
+	}
+	return out
+}
+
+// The reply `fixtures` holds for a lookup, the way an upstream would answer it.
+fixture_answer :: proc(fixtures: []Fixture, name: string, type: dns.Type, allocator: mem.Allocator) -> ([]u8, bool) {
+	for f in fixtures {
+		if f.type == type && dns.name_equal_fold(f.name, name) {
+			return decode_hex(f.wire, allocator)
+		}
+	}
+	return nil, false
+}
+
+// Answers from the table `ctx` points at (a `^[]Fixture`), standing in for the
+// upstream the validator would otherwise have to ask.
+scenario_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
+	return fixture_answer((^[]Fixture)(ctx)^, name, type, allocator)
+}
+
+/*
+The trust anchors in `texts`, DS records in presentation form; nil for none,
+which `Options` reads as the built-in root anchors. A fixture anchor that does
+not parse is a broken test, so it panics rather than hand back a nil validator
+every caller would have to check.
+*/
+fixture_anchors :: proc(texts: ..string) -> []Trust_Anchor {
+	if len(texts) == 0 {
+		return nil
+	}
+	anchors := make([]Trust_Anchor, len(texts), context.temp_allocator)
+	for text, i in texts {
+		anchor, ok := parse_trust_anchor(text, context.temp_allocator)
+		if !ok {
+			panic("a fixture trust anchor does not parse")
+		}
+		anchors[i] = anchor
+	}
+	return anchors
+}
+
+// A validator answered from `fixtures` and anchored at `anchors`.
+scenario_validator :: proc(fixtures: ^[]Fixture, anchors: ..string) -> ^Validator {
+	return make_validator(scenario_query, fixtures, Options{anchors = fixture_anchors(..anchors)})
+}
+
+/*
+An upstream that counts what it is asked: every lookup, the lookups no fixture
+answers, and the first name asked. It answers from `fixtures`, so with none it
+answers nothing. A nil ctx refuses without counting, for a test that reaches no
+upstream at all.
+*/
+Counting_Upstream :: struct {
+	fixtures: []Fixture,
+	calls:    int,
+	misses:   int,
+	first:    string,
+}
+
+counting_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	u := (^Counting_Upstream)(ctx)
+	u.calls += 1
+	if u.first == "" {
+		u.first = strings.clone(name, context.temp_allocator)
+	}
+	wire, ok := fixture_answer(u.fixtures, name, type, allocator)
+	if !ok {
+		u.misses += 1
+	}
+	return wire, ok
+}
 
 Fixture :: struct {
 	key:   string,

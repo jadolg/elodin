@@ -1,6 +1,7 @@
 package dnssec
 
 import "core:mem"
+import "core:strings"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
@@ -260,77 +261,42 @@ SH_FIXTURES := []Fixture{
 Sh_Calls :: struct {
 	lookups: int,
 	misses:  int,
+	asked:   [dynamic]Sh_Lookup,
 }
 
 @(private = "file")
-sh_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
+Sh_Lookup :: struct {
+	name: string,
+	type: dns.Type,
+}
+
+// Answers from `SH_FIXTURES`, counting into the `^Sh_Calls` in `ctx`. The list of
+// what was asked lives on the temporary allocator, freed with everything else
+// the test made.
+@(private = "file")
+sh_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
 	calls := (^Sh_Calls)(ctx)
-	if calls != nil {
-		calls.lookups += 1
+	calls.lookups += 1
+	if calls.asked == nil {
+		calls.asked = make([dynamic]Sh_Lookup, context.temp_allocator)
 	}
-	for f in SH_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	if calls != nil {
+	append(&calls.asked, Sh_Lookup{strings.clone(name, context.temp_allocator), type})
+	wire, ok := fixture_answer(SH_FIXTURES, name, type, allocator)
+	if !ok {
 		calls.misses += 1
 	}
-	return nil, false
+	return wire, ok
 }
 
+// Whether the walk asked for `type` at `name`.
 @(private = "file")
-sh_fixture :: proc(key: string) -> []u8 {
-	for f in SH_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
-
-@(private = "file")
-sh_validator :: proc(calls: ^Sh_Calls) -> ^Validator {
-	anchor, ok := parse_trust_anchor(SH_ANCHOR, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	return make_validator(sh_query, calls, Options{anchors = anchors})
-}
-
-@(private = "file")
-sh_holds :: proc(records: []dns.Record, name: string, type: dns.Type) -> bool {
-	for rec in records {
-		if rec.type == type && dns.name_equal_fold(rec.name, name) {
+sh_asked :: proc(calls: Sh_Calls, name: string, type: dns.Type) -> bool {
+	for ask in calls.asked {
+		if ask.type == type && dns.name_equal_fold(ask.name, name) {
 			return true
 		}
 	}
 	return false
-}
-
-// Asked for by what it covers: one owner name carries signatures over several
-// types at once, so "an RRSIG survived" would be answered by any of them.
-@(private = "file")
-sh_holds_signature_over :: proc(records: []dns.Record, name: string, covered: dns.Type) -> int {
-	found := 0
-	for rec in records {
-		if rec.type != .RRSIG || !dns.name_equal_fold(rec.name, name) {
-			continue
-		}
-		rdata, is_raw := raw_rdata(rec)
-		if !is_raw {
-			continue
-		}
-		sig, err := parse_rrsig(rdata, context.temp_allocator)
-		if err == .None && sig.type_covered == covered {
-			found += 1
-		}
-	}
-	return found
 }
 
 // Validate one fixture and hand back the message a client would be sent.
@@ -346,17 +312,25 @@ sh_resolve :: proc(
 	pruned: dns.Message,
 	ok: bool,
 ) {
-	v := sh_validator(calls)
-	if !testing.expect(t, v != nil, "the anchor should parse") {
-		return {}, {}, false
-	}
+	v := make_validator(sh_query, calls, Options{anchors = fixture_anchors(SH_ANCHOR)}) if calls != nil else scenario_validator(&SH_FIXTURES, SH_ANCHOR)
 	defer destroy_validator(v)
+	return sh_prune(t, v, scenario_fixture(SH_FIXTURES, key), qname, qtype)
+}
 
-	wire := sh_fixture(key)
-	if !testing.expectf(t, wire != nil, "no fixture named %s", key) {
-		return {}, {}, false
-	}
-	result = validate(v, qname, qtype, wire, time.unix(FIXTURE_TIME, 0))
+// Validate `wire` and hand back the message a client would be sent.
+@(private = "file")
+sh_prune :: proc(
+	t: ^testing.T,
+	v: ^Validator,
+	wire: []u8,
+	qname: string,
+	qtype: dns.Type,
+) -> (
+	result: Result,
+	pruned: dns.Message,
+	ok: bool,
+) {
+	result = validate(v, qname, qtype, wire, fixture_now())
 	out, stripped := strip_unauthenticated(wire, result, context.temp_allocator, dns.MAX_MESSAGE)
 	if !testing.expect(t, stripped, "the pruned response should rebuild") {
 		return result, {}, false
@@ -369,19 +343,49 @@ sh_resolve :: proc(
 }
 
 /*
+`sh_srv_same_zone` with sixty-four copies of the signature over its A hint,
+each with `damage` done to it, in front of everything in the additional section.
+*/
+@(private = "file")
+sh_pad_hint :: proc(t: ^testing.T, damage: bit_set[Rrsig_Damage]) -> []u8 {
+	msg, derr := dns.decode_message(scenario_fixture(SH_FIXTURES, "sh_srv_same_zone"), context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	padded := make([dynamic]dns.Record, 0, len(msg.additional) + 64, context.temp_allocator)
+	for rec in msg.additional {
+		rdata, is_raw := raw_rdata(rec)
+		if rec.type != .RRSIG || !is_raw {
+			continue
+		}
+		sig, err := parse_rrsig(rdata, context.temp_allocator)
+		if err != .None || sig.type_covered != .A {
+			continue
+		}
+		for _ in 0 ..< 64 {
+			append(&padded, rrsig_mutant(rec, damage))
+		}
+	}
+	testing.expect(t, len(padded) == 64, "the fixture should carry one signature over the A hint")
+	append(&padded, ..msg.additional)
+	msg.additional = padded[:]
+
+	wire, _, enc := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
+	testing.expect_value(t, enc, dns.Encode_Error.None)
+	return wire
+}
+
+/*
 The control. If the canonical form these fixtures were signed against ever drifts
 from the one the validator computes, this says so before every test below starts
 failing for a reason of its own.
 */
 @(test)
 test_sh_zone_chain_is_sound :: proc(t: ^testing.T) {
-	v := sh_validator(nil)
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&SH_FIXTURES, SH_ANCHOR)
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
 	for zone in ([]string{"hinttest.", "other."}) {
-		status, keys, established := zone_trust(v, &budget, zone, time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+		status, keys, established := zone_trust(v, &budget, zone, fixture_now(), context.temp_allocator)
 		testing.expect_value(t, status, Status.Secure)
 		testing.expect_value(t, established, zone)
 		testing.expect(t, len(keys) > 0, "the zone should publish a key")
@@ -407,23 +411,23 @@ test_hints_in_the_answers_own_zone_are_kept :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, result.status, Status.Secure)
-	testing.expect(t, sh_holds(pruned.answer, "_svc._tcp.hinttest.", .SRV), "the answer should survive")
+	testing.expect(t, holds(pruned.answer, "_svc._tcp.hinttest.", .SRV), "the answer should survive")
 
 	testing.expect(
 		t,
-		sh_holds(pruned.additional, "svc.hinttest.", .A),
+		holds(pruned.additional, "svc.hinttest.", .A),
 		"the signed A hint for the SRV target was dropped",
 	)
 	testing.expect(
 		t,
-		sh_holds(pruned.additional, "svc.hinttest.", .AAAA),
+		holds(pruned.additional, "svc.hinttest.", .AAAA),
 		"the signed AAAA hint for the SRV target was dropped",
 	)
 	// A client that validates for itself needs the signature, not just the
 	// address: without it the record is one it has to refuse or re-fetch, which
 	// is the round trip passing hints on exists to save.
-	testing.expect_value(t, sh_holds_signature_over(pruned.additional, "svc.hinttest.", .A), 1)
-	testing.expect_value(t, sh_holds_signature_over(pruned.additional, "svc.hinttest.", .AAAA), 1)
+	testing.expect_value(t, holds_signature_over(pruned.additional, "svc.hinttest.", .A), 1)
+	testing.expect_value(t, holds_signature_over(pruned.additional, "svc.hinttest.", .AAAA), 1)
 
 	// Root DNSKEY, the delegation to hinttest., and its keys. Nothing more: the
 	// target's zone is the answer's zone.
@@ -452,31 +456,26 @@ test_a_hint_in_a_second_zone_is_walked_to :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, result.status, Status.Secure)
-	testing.expect(t, sh_holds(pruned.answer, "alt.hinttest.", .HTTPS), "the answer should survive")
+	testing.expect(t, holds(pruned.answer, "alt.hinttest.", .HTTPS), "the answer should survive")
 
 	testing.expect(
 		t,
-		sh_holds(pruned.additional, "edge.other.", .A),
+		holds(pruned.additional, "edge.other.", .A),
 		"the A hint signed by the target's own zone was dropped",
 	)
 	testing.expect(
 		t,
-		sh_holds(pruned.additional, "edge.other.", .AAAA),
+		holds(pruned.additional, "edge.other.", .AAAA),
 		"the AAAA hint signed by the target's own zone was dropped",
 	)
 
 	// The premise, not just the judgement: the addresses were kept *because* a
 	// second chain was walked, so the walk has to show up in what was asked for.
-	asked_ds := false
-	asked_dnskey := false
-	for f in SH_FIXTURES {
-		if !dns.name_equal_fold(f.name, "other.") {
-			continue
-		}
-		asked_ds ||= f.type == .DS
-		asked_dnskey ||= f.type == .DNSKEY
-	}
-	testing.expect(t, asked_ds && asked_dnskey, "the fixture set should carry the second zone's chain")
+	testing.expect(
+		t,
+		sh_asked(calls, "other.", .DS) && sh_asked(calls, "other.", .DNSKEY),
+		"the walk never asked for the second zone's DS and DNSKEY",
+	)
 	testing.expectf(
 		t,
 		calls.lookups == 5,
@@ -503,7 +502,7 @@ test_a_service_form_target_names_the_owner :: proc(t: ^testing.T) {
 	testing.expect_value(t, result.status, Status.Secure)
 	testing.expect(
 		t,
-		sh_holds(pruned.additional, "hinttest.", .A),
+		holds(pruned.additional, "hinttest.", .A),
 		"an HTTPS record in service form kept no address for its own owner",
 	)
 	free_all(context.temp_allocator)
@@ -526,7 +525,7 @@ test_alias_mode_keeps_no_hint :: proc(t: ^testing.T) {
 	testing.expect_value(t, result.status, Status.Secure)
 	testing.expect(
 		t,
-		!sh_holds(pruned.additional, "edge.other.", .A),
+		!holds(pruned.additional, "edge.other.", .A),
 		"an AliasMode target's address went out under the AD bit",
 	)
 	free_all(context.temp_allocator)
@@ -553,26 +552,26 @@ test_only_the_named_target_keeps_its_addresses :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, result.status, Status.Secure)
-	testing.expect(t, sh_holds(pruned.answer, "hinttest.", .MX), "the answer should survive")
+	testing.expect(t, holds(pruned.answer, "hinttest.", .MX), "the answer should survive")
 
 	testing.expect(
 		t,
-		sh_holds(pruned.additional, "mail.hinttest.", .A),
+		holds(pruned.additional, "mail.hinttest.", .A),
 		"the signed address for the MX exchange was dropped",
 	)
 	testing.expect(
 		t,
-		!sh_holds(pruned.additional, "mail.hinttest.", .AAAA),
+		!holds(pruned.additional, "mail.hinttest.", .AAAA),
 		"an unsigned address for the MX exchange went out under the AD bit",
 	)
 	testing.expect(
 		t,
-		!sh_holds(pruned.additional, "bystander.hinttest.", .A),
+		!holds(pruned.additional, "bystander.hinttest.", .A),
 		"a signed address for a name the answer never named went out under the AD bit",
 	)
 	testing.expect(
 		t,
-		!sh_holds(pruned.additional, "ns.attacker.example.", .A),
+		!holds(pruned.additional, "ns.attacker.example.", .A),
 		"unsigned glue went out under the AD bit",
 	)
 	free_all(context.temp_allocator)
@@ -595,10 +594,10 @@ test_a_forged_hint_is_dropped_and_the_answer_stands :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, result.status, Status.Secure)
-	testing.expect(t, sh_holds(pruned.answer, "_svc._tcp.hinttest.", .SRV), "the answer should survive")
+	testing.expect(t, holds(pruned.answer, "_svc._tcp.hinttest.", .SRV), "the answer should survive")
 	testing.expect(
 		t,
-		!sh_holds(pruned.additional, "svc.hinttest.", .A),
+		!holds(pruned.additional, "svc.hinttest.", .A),
 		"an address the signature beside it does not cover went out under the AD bit",
 	)
 	free_all(context.temp_allocator)
@@ -621,11 +620,10 @@ where it comes back `Secure` and names the encloser it expanded from.
 */
 @(test)
 test_a_wildcard_hint_is_dropped :: proc(t: ^testing.T) {
-	v := sh_validator(nil)
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&SH_FIXTURES, SH_ANCHOR)
 	defer destroy_validator(v)
 
-	wire := sh_fixture("sh_wildcard_hint")
+	wire := scenario_fixture(SH_FIXTURES, "sh_wildcard_hint")
 	msg, derr := dns.decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 
@@ -642,7 +640,7 @@ test_a_wildcard_hint_is_dropped :: proc(t: ^testing.T) {
 		records,
 		sigs,
 		unix,
-		time.unix(FIXTURE_TIME, 0),
+		fixture_now(),
 		context.temp_allocator,
 	)
 	testing.expect_value(t, status, Status.Secure)
@@ -660,7 +658,7 @@ test_a_wildcard_hint_is_dropped :: proc(t: ^testing.T) {
 	testing.expect_value(t, result.status, Status.Secure)
 	testing.expect(
 		t,
-		!sh_holds(pruned.additional, "wild.hinttest.", .A),
+		!holds(pruned.additional, "wild.hinttest.", .A),
 		"a wildcard-expanded address went out under the AD bit with no proof behind it",
 	)
 	free_all(context.temp_allocator)
@@ -681,10 +679,10 @@ test_a_hint_whose_zone_cannot_be_reached_is_dropped :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, result.status, Status.Secure)
-	testing.expect(t, sh_holds(pruned.answer, "alt3.hinttest.", .HTTPS), "the answer should survive")
+	testing.expect(t, holds(pruned.answer, "alt3.hinttest.", .HTTPS), "the answer should survive")
 	testing.expect(
 		t,
-		!sh_holds(pruned.additional, "edge.nosuch.", .A),
+		!holds(pruned.additional, "edge.nosuch.", .A),
 		"an address from a zone with no chain of trust went out under the AD bit",
 	)
 	free_all(context.temp_allocator)
@@ -708,7 +706,7 @@ test_many_targets_do_not_buy_a_walk_apiece :: proc(t: ^testing.T) {
 	}
 	// Whatever the hints cost, they must not cost the answer its verdict.
 	testing.expect_value(t, result.status, Status.Secure)
-	testing.expect(t, sh_holds(pruned.answer, "hinttest.", .MX), "the answer should survive")
+	testing.expect(t, holds(pruned.answer, "hinttest.", .MX), "the answer should survive")
 	testing.expect_value(t, len(result.additional), 0)
 
 	// Every miss is a probe into a target's own zone: no fixture answers for
@@ -742,10 +740,10 @@ tests could not see.
 */
 @(test)
 test_a_denial_keeps_no_hints :: proc(t: ^testing.T) {
-	v := make_validator(sh_denial_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
-	wire, _ := decode_hex(sh_denial_fixture("nodata_cloudflare"), context.temp_allocator)
+	wire := scenario_fixture(FIXTURES, "nodata_cloudflare")
 	msg, derr := dns.decode_message(wire, context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return
@@ -769,42 +767,19 @@ test_a_denial_keeps_no_hints :: proc(t: ^testing.T) {
 	tampered, _, enc := dns.encode_message(msg, context.temp_allocator)
 	testing.expect_value(t, enc, dns.Encode_Error.None)
 
-	result := validate(v, "nosuchname-xq7.cloudflare.com.", .A, tampered, time.unix(FIXTURE_TIME, 0))
+	result, pruned, ok := sh_prune(t, v, tampered, "nosuchname-xq7.cloudflare.com.", .A)
+	if !ok {
+		return
+	}
 	testing.expect_value(t, result.status, Status.Secure)
 	testing.expect_value(t, len(result.additional), 0)
-
-	out, stripped := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
-	testing.expect(t, stripped, "the pruned response should rebuild")
-	pruned, perr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, perr, dns.Decode_Error.None)
 	testing.expect(
 		t,
-		!sh_holds(pruned.additional, "nosuchname-xq7.cloudflare.com.", .A),
+		!holds(pruned.additional, "nosuchname-xq7.cloudflare.com.", .A),
 		"an address bolted onto a denial went out under the AD bit",
 	)
 	testing.expect(t, dns.edns_present(pruned), "the OPT record should survive")
 	free_all(context.temp_allocator)
-}
-
-@(private = "file")
-sh_denial_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-sh_denial_fixture :: proc(key: string) -> string {
-	for f in FIXTURES {
-		if f.key == key {
-			return f.wire
-		}
-	}
-	return ""
 }
 
 /*
@@ -863,13 +838,8 @@ new way in is a new way for the cap to have been missed.
 */
 @(test)
 test_a_padded_hint_keeps_a_bounded_number_of_signatures :: proc(t: ^testing.T) {
-	v := sh_validator(nil)
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&SH_FIXTURES, SH_ANCHOR)
 	defer destroy_validator(v)
-
-	wire := sh_fixture("sh_srv_same_zone")
-	msg, derr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
 
 	/*
 	Forgeries in front of the genuine signature, each a copy of it naming the
@@ -886,57 +856,16 @@ test_a_padded_hint_keeps_a_bounded_number_of_signatures :: proc(t: ^testing.T) {
 	genuine signature is reached, and what is left to decide is how many of the
 	forgeries travel with it.
 	*/
-	padded := make([dynamic]dns.Record, 0, len(msg.additional) + 64, context.temp_allocator)
-	for rec in msg.additional {
-		if rec.type != .RRSIG {
-			continue
-		}
-		rdata, is_raw := raw_rdata(rec)
-		if !is_raw {
-			continue
-		}
-		sig, err := parse_rrsig(rdata, context.temp_allocator)
-		if err != .None || sig.type_covered != .A {
-			continue
-		}
-		for _ in 0 ..< 64 {
-			copied := make([]u8, len(rdata), context.temp_allocator)
-			copy(copied, rdata)
-			// The key tag sits at offset 16, after the fixed fields and
-			// before the signer name.
-			copied[16] ~= 0xff
-			copied[17] ~= 0xff
-			append(
-				&padded,
-				dns.Record {
-					name = rec.name,
-					type = .RRSIG,
-					class = rec.class,
-					ttl = rec.ttl,
-					data = dns.Rdata_Raw{data = copied},
-				},
-			)
-		}
+	result, pruned, ok := sh_prune(t, v, sh_pad_hint(t, {.Key_Tag}), "_svc._tcp.hinttest.", .SRV)
+	if !ok {
+		return
 	}
-	testing.expect(t, len(padded) == 64, "the fixture should carry one signature over the A hint")
-	append(&padded, ..msg.additional)
-	msg.additional = padded[:]
-
-	tampered, _, enc := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
-	testing.expect_value(t, enc, dns.Encode_Error.None)
-
-	result := validate(v, "_svc._tcp.hinttest.", .SRV, tampered, time.unix(FIXTURE_TIME, 0))
 	testing.expect_value(t, result.status, Status.Secure)
-
-	out, stripped := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
-	testing.expect(t, stripped, "the pruned response should rebuild")
-	pruned, perr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, perr, dns.Decode_Error.None)
 
 	// The genuine record survives the padding - that is what makes a cap safe
 	// here, and it is what a plain count cap would fail.
-	testing.expect(t, sh_holds(pruned.additional, "svc.hinttest.", .A), "the authenticated hint was dropped")
-	kept := sh_holds_signature_over(pruned.additional, "svc.hinttest.", .A)
+	testing.expect(t, holds(pruned.additional, "svc.hinttest.", .A), "the authenticated hint was dropped")
+	kept := holds_signature_over(pruned.additional, "svc.hinttest.", .A)
 	testing.expectf(
 		t,
 		kept <= MAX_SIGNATURES_PER_RRSET + 1,
@@ -965,63 +894,20 @@ way to SERVFAIL any name.
 */
 @(test)
 test_padding_a_hint_cannot_take_the_answer_with_it :: proc(t: ^testing.T) {
-	v := sh_validator(nil)
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&SH_FIXTURES, SH_ANCHOR)
 	defer destroy_validator(v)
 
-	wire := sh_fixture("sh_srv_same_zone")
-	msg, derr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
-
-	padded := make([dynamic]dns.Record, 0, len(msg.additional) + 64, context.temp_allocator)
-	for rec in msg.additional {
-		if rec.type != .RRSIG {
-			continue
-		}
-		rdata, is_raw := raw_rdata(rec)
-		if !is_raw {
-			continue
-		}
-		sig, err := parse_rrsig(rdata, context.temp_allocator)
-		if err != .None || sig.type_covered != .A {
-			continue
-		}
-		for _ in 0 ..< 64 {
-			copied := make([]u8, len(rdata), context.temp_allocator)
-			copy(copied, rdata)
-			copied[len(copied) - 1] ~= 0xff
-			append(
-				&padded,
-				dns.Record {
-					name = rec.name,
-					type = .RRSIG,
-					class = rec.class,
-					ttl = rec.ttl,
-					data = dns.Rdata_Raw{data = copied},
-				},
-			)
-		}
+	result, pruned, ok := sh_prune(t, v, sh_pad_hint(t, {.Signature}), "_svc._tcp.hinttest.", .SRV)
+	if !ok {
+		return
 	}
-	testing.expect(t, len(padded) == 64, "the fixture should carry one signature over the A hint")
-	append(&padded, ..msg.additional)
-	msg.additional = padded[:]
-
-	tampered, _, enc := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
-	testing.expect_value(t, enc, dns.Encode_Error.None)
-
-	result := validate(v, "_svc._tcp.hinttest.", .SRV, tampered, time.unix(FIXTURE_TIME, 0))
 	testing.expect_value(t, result.status, Status.Secure)
 
-	out, stripped := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
-	testing.expect(t, stripped, "the pruned response should rebuild")
-	pruned, perr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, perr, dns.Decode_Error.None)
-
-	testing.expect(t, sh_holds(pruned.answer, "_svc._tcp.hinttest.", .SRV), "the answer should survive")
-	testing.expect(t, sh_holds_signature_over(pruned.answer, "_svc._tcp.hinttest.", .SRV) == 1, "the answer's signature should survive")
+	testing.expect(t, holds(pruned.answer, "_svc._tcp.hinttest.", .SRV), "the answer should survive")
+	testing.expect(t, holds_signature_over(pruned.answer, "_svc._tcp.hinttest.", .SRV) == 1, "the answer's signature should survive")
 	testing.expect(
 		t,
-		!sh_holds(pruned.additional, "svc.hinttest.", .A),
+		!holds(pruned.additional, "svc.hinttest.", .A),
 		"a hint whose signature was never reached went out under the AD bit",
 	)
 	free_all(context.temp_allocator)

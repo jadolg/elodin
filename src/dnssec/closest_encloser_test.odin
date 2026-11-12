@@ -1,9 +1,6 @@
 package dnssec
 
-import "core:mem"
 import "core:testing"
-import "core:time"
-import "elodin:dns"
 
 /*
 A synthetic NSEC3 zone for the half of the wildcard proof that is about *which*
@@ -135,50 +132,16 @@ CE_FIXTURES := []Fixture{
 	},
 }
 
-@(private = "file")
-ce_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in CE_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-ce_fixture :: proc(key: string) -> []u8 {
-	for f in CE_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
-
-@(private = "file")
-ce_validator :: proc() -> ^Validator {
-	anchor, ok := parse_trust_anchor(CE_ANCHOR, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	return make_validator(ce_query, nil, Options{anchors = anchors})
-}
-
 @(test)
 test_ce_zone_chain_is_sound :: proc(t: ^testing.T) {
 	// The control: if the canonical form these fixtures were signed against
 	// ever drifts from the one the validator computes, this reports the drift
 	// before the two tests below start failing for reasons of their own.
-	v := ce_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&CE_FIXTURES, CE_ANCHOR)
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	status, keys, zone := zone_trust(v, &budget, "x.y.cetest.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, keys, zone := zone_trust(v, &budget, "x.y.cetest.", fixture_now(), context.temp_allocator)
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, zone, "cetest.")
 	testing.expect(t, len(keys) > 0, "the zone should publish a key")
@@ -189,11 +152,10 @@ test_ce_zone_chain_is_sound :: proc(t: ^testing.T) {
 test_wildcard_answer_from_the_applicable_wildcard_validates :: proc(t: ^testing.T) {
 	// `*.y.cetest.` is the wildcard that applies to `x.y.cetest.`, and its next
 	// closer name is `x.y.cetest.` itself, which the authority section covers.
-	v := ce_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&CE_FIXTURES, CE_ANCHOR)
 	defer destroy_validator(v)
 
-	result := validate(v, "x.y.cetest.", .A, ce_fixture("ce_inner_wildcard"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "x.y.cetest.", .A, scenario_fixture(CE_FIXTURES, "ce_inner_wildcard"), fixture_now())
 	testing.expectf(
 		t,
 		result.status == .Secure,
@@ -215,11 +177,10 @@ test_wildcard_answer_from_a_shallower_wildcard_is_bogus :: proc(t: ^testing.T) {
 	which is exactly the cover an honest answer for a name under `y.cetest.`
 	comes with.
 	*/
-	v := ce_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&CE_FIXTURES, CE_ANCHOR)
 	defer destroy_validator(v)
 
-	result := validate(v, "x.y.cetest.", .A, ce_fixture("ce_outer_wildcard"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "x.y.cetest.", .A, scenario_fixture(CE_FIXTURES, "ce_outer_wildcard"), fixture_now())
 	testing.expectf(
 		t,
 		result.status == .Bogus,

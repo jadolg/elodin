@@ -32,28 +32,6 @@ sorts ahead of any letter.
 */
 
 @(private = "file")
-nsec_rr :: proc(owner, next: string, types: []dns.Type) -> Nsec_Rr {
-	high := 0
-	for type in types {
-		if int(type) > high {
-			high = int(type)
-		}
-	}
-	bitmap: []u8
-	if len(types) > 0 {
-		length := high / 8 + 1
-		out := make([]u8, 2 + length, context.temp_allocator)
-		out[0] = 0
-		out[1] = u8(length)
-		for type in types {
-			out[2 + int(type) / 8] |= 0x80 >> u8(int(type) % 8)
-		}
-		bitmap = out
-	}
-	return Nsec_Rr{owner = owner, rr = Nsec{next = next, types = bitmap}}
-}
-
-@(private = "file")
 e_zone :: proc() -> []Nsec_Rr {
 	zone := make([dynamic]Nsec_Rr, context.temp_allocator)
 	append(&zone, nsec_rr("example.", "a.example.", {.NS, .SOA, .MX, .RRSIG, .NSEC, .DNSKEY}))

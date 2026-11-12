@@ -1,8 +1,6 @@
 package dnssec
 
-import "core:mem"
 import "core:testing"
-import "core:time"
 import "elodin:dns"
 
 /*
@@ -35,7 +33,6 @@ DA_ANCHOR :: ". IN DS 31088 15 2 2E211FFDD1AB5449FB868E6EDB29B34F33FC298FB3D007E
 
 @(private = "file")
 DA_FIXTURES := []Fixture{
-// anchor: . IN DS 31088 15 2 2E211FFDD1AB5449FB868E6EDB29B34F33FC298FB3D007E6CEB82DD714124C2F
 	{
 		key   = "da_root_dnskey",
 		name  = ".",
@@ -195,42 +192,12 @@ DA_FIXTURES := []Fixture{
 	},
 }
 
-@(private = "file")
-da_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	// The genuine DS and DNSKEY fixtures are listed before the denials, so the
-	// chain walk finds the delegation rather than the reply under test.
-	for f in DA_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return decode_hex(f.wire, allocator)
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-da_validator :: proc() -> ^Validator {
-	anchor, ok := parse_trust_anchor(DA_ANCHOR, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	return make_validator(da_query, nil, Options{anchors = anchors})
-}
-
-@(private = "file")
-da_reply :: proc(key: string) -> []u8 {
-	for f in DA_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
+// The genuine DS and DNSKEY fixtures are listed before the denials, so the
+// chain walk, which takes the first match, finds the delegation rather than
+// the reply under test.
 
 /*
-The reason every refusal below has to carry.
+The reason every refusal below has to carry, `NO_DENIAL`.
 
 `Bogus` on its own is a weak thing to assert here, because a fixture chain that
 has quietly come apart produces it too - a lookup that matches the wrong record
@@ -247,16 +214,10 @@ any bit map is read. The bit map guard is what stands behind that, and it is
 two routines directly.
 */
 @(private = "file")
-DA_REFUSED :: "no denial of existence"
-
-@(private = "file")
 da_validate :: proc(key, qname: string) -> Result {
-	v := da_validator()
-	if v == nil {
-		return {status = .Indeterminate, reason = "the anchor did not parse"}
-	}
+	v := scenario_validator(&DA_FIXTURES, DA_ANCHOR)
 	defer destroy_validator(v)
-	return validate(v, qname, .DS, da_reply(key), time.unix(FIXTURE_TIME, 0))
+	return validate(v, qname, .DS, scenario_fixture(DA_FIXTURES, key), fixture_now())
 }
 
 @(test)
@@ -264,7 +225,7 @@ test_a_ds_denial_carried_by_the_childs_own_apex_nsec_is_bogus :: proc(t: ^testin
 	result := da_validate("da_apex_nodata", "dstest.")
 	testing.expectf(
 		t,
-		result.status == .Bogus && result.reason == DA_REFUSED,
+		result.status == .Bogus && result.reason == NO_DENIAL,
 		"a zone's own apex NSEC cannot deny the DS its parent holds, got %v (%q)",
 		result.status,
 		result.reason,
@@ -277,7 +238,7 @@ test_a_ds_denial_carried_by_the_childs_own_apex_nsec3_is_bogus :: proc(t: ^testi
 	result := da_validate("da3_apex_nodata", "dstest3.")
 	testing.expectf(
 		t,
-		result.status == .Bogus && result.reason == DA_REFUSED,
+		result.status == .Bogus && result.reason == NO_DENIAL,
 		"a zone's own apex NSEC3 cannot deny the DS its parent holds, got %v (%q)",
 		result.status,
 		result.reason,
@@ -310,7 +271,7 @@ test_a_ds_denial_from_the_zone_itself_is_bogus_whatever_the_bit_map_says :: proc
 	result := da_validate("bl_apex_nodata", "bltest.")
 	testing.expectf(
 		t,
-		result.status == .Bogus && result.reason == DA_REFUSED,
+		result.status == .Bogus && result.reason == NO_DENIAL,
 		"a zone cannot deny the DS its parent holds, got %v (%q)",
 		result.status,
 		result.reason,
@@ -361,11 +322,10 @@ is the one this NODATA needs. `nsec3_name_error_test` is the name error case.
 @(test)
 test_a_denial_whose_hashing_ran_out_is_indeterminate_not_bogus :: proc(t: ^testing.T) {
 	qname :: "www.dstest3."
-	msg, err := dns.decode_message(da_reply("da3_www_nodata"), context.temp_allocator)
+	msg, err := dns.decode_message(scenario_fixture(DA_FIXTURES, "da3_www_nodata"), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 
-	v := da_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&DA_FIXTURES, DA_ANCHOR)
 	defer destroy_validator(v)
 	// Built the way a question builds one, so the ceiling is the validator's
 	// rather than a zero that would refuse every record asking for any
@@ -373,7 +333,7 @@ test_a_denial_whose_hashing_ran_out_is_indeterminate_not_bogus :: proc(t: ^testi
 	// and would pass this test while proving nothing about it.
 	none := query_budget(v)
 	none.nsec3.rounds = MAX_NSEC3_ROUNDS_PER_QUERY
-	result := validate_denial(v, &none, msg, qname, .DS, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	result := validate_denial(v, &none, msg, qname, .DS, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expectf(
 		t,
 		result.status == .Indeterminate,
@@ -383,10 +343,10 @@ test_a_denial_whose_hashing_ran_out_is_indeterminate_not_bogus :: proc(t: ^testi
 	)
 
 	// The control: the same records, the same question, a whole allowance.
-	fresh_v := da_validator()
+	fresh_v := scenario_validator(&DA_FIXTURES, DA_ANCHOR)
 	defer destroy_validator(fresh_v)
 	fresh := query_budget(fresh_v)
-	held := validate_denial(fresh_v, &fresh, msg, qname, .DS, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	held := validate_denial(fresh_v, &fresh, msg, qname, .DS, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expectf(t, held.status == .Secure, "the denial itself holds up, got %v (%q)", held.status, held.reason)
 	free_all(context.temp_allocator)
 }
@@ -471,11 +431,11 @@ it is, the signer rule reads the type off the records, not off the signature.
 */
 @(test)
 test_check_signature_holds_its_type_rules_itself :: proc(t: ^testing.T) {
-	self_msg, serr := dns.decode_message(da_reply("da_self_ds"), context.temp_allocator)
+	self_msg, serr := dns.decode_message(scenario_fixture(DA_FIXTURES, "da_self_ds"), context.temp_allocator)
 	testing.expect(t, serr == .None, "the fixture should decode")
-	covers_msg, cerr := dns.decode_message(da_reply("da_self_ds_covers_a"), context.temp_allocator)
+	covers_msg, cerr := dns.decode_message(scenario_fixture(DA_FIXTURES, "da_self_ds_covers_a"), context.temp_allocator)
 	testing.expect(t, cerr == .None, "the fixture should decode")
-	keys_msg, kerr := dns.decode_message(da_reply("da_dnskey"), context.temp_allocator)
+	keys_msg, kerr := dns.decode_message(scenario_fixture(DA_FIXTURES, "da_dnskey"), context.temp_allocator)
 	testing.expect(t, kerr == .None, "the key fixture should decode")
 
 	records := records_of(self_msg.answer, "dstest.", .DS, .IN, context.temp_allocator)
