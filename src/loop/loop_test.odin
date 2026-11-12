@@ -18,24 +18,33 @@ events; the timeouts on them only bound a run that has already failed.
 @(private = "file")
 WAIT :: 5 * time.Second
 
-@(private = "file")
+@(private)
 Running :: struct {
 	l:  ^Loop,
 	th: ^thread.Thread,
 }
 
-@(private = "file")
-start :: proc(t: ^testing.T) -> (r: Running, ok: bool) {
+// A loop running on a thread of its own, judging its timers by `clock` when one
+// is given.
+@(private)
+start :: proc(t: ^testing.T, clock: proc "contextless" () -> Tick = nil, loc := #caller_location) -> (r: Running, ok: bool) {
 	l, made := make_loop()
-	if !testing.expect(t, made, "no loop") {
+	if !testing.expect(t, made, "no loop", loc = loc) {
 		return {}, false
+	}
+	if clock != nil {
+		l.clock = clock
 	}
 	r.l = l
 	r.th = spawn_thread(l, run, context)
-	return r, testing.expect(t, r.th != nil, "no loop thread")
+	if !testing.expect(t, r.th != nil, "no loop thread", loc = loc) {
+		destroy(l)
+		return {}, false
+	}
+	return r, true
 }
 
-@(private = "file")
+@(private)
 finish :: proc(r: Running) {
 	stop(r.l)
 	thread.join(r.th)
@@ -307,19 +316,31 @@ socket_pair :: proc(t: ^testing.T) -> (a, b: linux.Fd, ok: bool) {
 	return fds[0], fds[1], true
 }
 
+// A socket pair and a loop to wait on it.
+@(private = "file")
+start_with_pair :: proc(t: ^testing.T) -> (a, b: linux.Fd, r: Running, ok: bool) {
+	a, b = socket_pair(t) or_return
+	if r, ok = start(t); !ok {
+		linux.close(a)
+		linux.close(b)
+	}
+	return
+}
+
+@(private = "file")
+finish_with_pair :: proc(a, b: linux.Fd, r: Running) {
+	finish(r)
+	linux.close(b)
+	linux.close(a)
+}
+
 @(test)
 test_a_wait_on_a_descriptor_ends_when_it_is_readable :: proc(t: ^testing.T) {
-	a, b, paired := socket_pair(t)
-	if !paired {
-		return
-	}
-	defer linux.close(a)
-	defer linux.close(b)
-	r, started := start(t)
+	a, b, r, started := start_with_pair(t)
 	if !started {
 		return
 	}
-	defer finish(r)
+	defer finish_with_pair(a, b, r)
 	Shared :: struct {
 		p:      Probe,
 		fd:     linux.Fd,
@@ -346,17 +367,11 @@ test_a_wait_on_a_descriptor_ends_when_it_is_readable :: proc(t: ^testing.T) {
 
 @(test)
 test_a_wait_on_a_quiet_descriptor_times_out :: proc(t: ^testing.T) {
-	a, b, paired := socket_pair(t)
-	if !paired {
-		return
-	}
-	defer linux.close(a)
-	defer linux.close(b)
-	r, started := start(t)
+	a, b, r, started := start_with_pair(t)
 	if !started {
 		return
 	}
-	defer finish(r)
+	defer finish_with_pair(a, b, r)
 	Shared :: struct {
 		p:  Probe,
 		fd: linux.Fd,
@@ -384,17 +399,11 @@ writer is not held up by the reader's wait.
 */
 @(test)
 test_two_fibers_wait_on_one_descriptor :: proc(t: ^testing.T) {
-	a, b, paired := socket_pair(t)
-	if !paired {
-		return
-	}
-	defer linux.close(a)
-	defer linux.close(b)
-	r, started := start(t)
+	a, b, r, started := start_with_pair(t)
 	if !started {
 		return
 	}
-	defer finish(r)
+	defer finish_with_pair(a, b, r)
 	Shared :: struct {
 		reader, writer: Probe,
 		fd:             linux.Fd,
@@ -428,17 +437,11 @@ shared socket is not the last to get at it every time.
 */
 @(test)
 test_waiters_are_woken_in_the_order_they_parked :: proc(t: ^testing.T) {
-	a, b, paired := socket_pair(t)
-	if !paired {
-		return
-	}
-	defer linux.close(a)
-	defer linux.close(b)
-	r, started := start(t)
+	a, b, r, started := start_with_pair(t)
 	if !started {
 		return
 	}
-	defer finish(r)
+	defer finish_with_pair(a, b, r)
 	Shared :: struct {
 		fd:     linux.Fd,
 		parked: Sema,
@@ -479,17 +482,11 @@ the descriptor is still listed after both.
 */
 @(test)
 test_a_descriptor_stays_registered_between_waits :: proc(t: ^testing.T) {
-	a, b, paired := socket_pair(t)
-	if !paired {
-		return
-	}
-	defer linux.close(a)
-	defer linux.close(b)
-	r, started := start(t)
+	a, b, r, started := start_with_pair(t)
 	if !started {
 		return
 	}
-	defer finish(r)
+	defer finish_with_pair(a, b, r)
 	Shared :: struct {
 		p:       Probe,
 		fd:      linux.Fd,
@@ -716,17 +713,11 @@ back here, armed for nothing.
 */
 @(test)
 test_a_descriptor_epoll_already_holds_is_armed :: proc(t: ^testing.T) {
-	a, b, paired := socket_pair(t)
-	if !paired {
-		return
-	}
-	defer linux.close(a)
-	defer linux.close(b)
-	r, started := start(t)
+	a, b, r, started := start_with_pair(t)
 	if !started {
 		return
 	}
-	defer finish(r)
+	defer finish_with_pair(a, b, r)
 	ev := linux.EPoll_Event {
 		events = {.ONESHOT},
 		data = {fd = a},
@@ -1362,17 +1353,11 @@ already readable still wakes while the other keeps the ready list full.
 */
 @(test)
 test_a_fiber_that_keeps_yielding_does_not_starve_a_descriptor :: proc(t: ^testing.T) {
-	a, b, paired := socket_pair(t)
-	if !paired {
-		return
-	}
-	defer linux.close(a)
-	defer linux.close(b)
-	r, started := start(t)
+	a, b, r, started := start_with_pair(t)
 	if !started {
 		return
 	}
-	defer finish(r)
+	defer finish_with_pair(a, b, r)
 	Shared :: struct {
 		p:       Probe,
 		fd:      linux.Fd,
@@ -1669,17 +1654,11 @@ parked, so `dispatch_event` still wakes the longest waiter first.
 */
 @(test)
 test_a_waiter_leaving_keeps_the_others_order :: proc(t: ^testing.T) {
-	a, b, paired := socket_pair(t)
-	if !paired {
-		return
-	}
-	defer linux.close(a)
-	defer linux.close(b)
-	r, started := start(t)
+	a, b, r, started := start_with_pair(t)
 	if !started {
 		return
 	}
-	defer finish(r)
+	defer finish_with_pair(a, b, r)
 	Shared :: struct {
 		fd:     linux.Fd,
 		parked: Sema,

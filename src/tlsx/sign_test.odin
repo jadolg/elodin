@@ -1,6 +1,7 @@
 package tlsx
 
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 
@@ -40,33 +41,7 @@ signer_cert_ok: bool
 generate_signer_cert :: proc() {
 	signer_cert = CERT_DIR + "/cert.pem"
 	signer_key = CERT_DIR + "/key.pem"
-	if !os.exists(CERT_DIR) {
-		if err := os.make_directory(CERT_DIR); err != nil {
-			return
-		}
-	}
-	code, ok := run_openssl(
-		{
-			"req",
-			"-x509",
-			"-newkey",
-			"ec",
-			"-pkeyopt",
-			"ec_paramgen_curve:prime256v1",
-			"-nodes",
-			"-keyout",
-			signer_key,
-			"-out",
-			signer_cert,
-			"-days",
-			"30",
-			"-subj",
-			"/CN=elodin.local",
-			"-addext",
-			"subjectAltName=DNS:elodin.local,DNS:localhost,IP:127.0.0.1",
-		},
-	)
-	signer_cert_ok = ok && code == 0
+	signer_cert_ok = self_signed(CERT_DIR, signer_cert, signer_key, "30", "/CN=elodin.local", ELODIN_SAN)
 }
 
 @(private = "file")
@@ -75,8 +50,29 @@ ensure_signer_cert :: proc() -> (cert, key: string, ok: bool) {
 	return signer_cert, signer_key, signer_cert_ok
 }
 
+// The names every pair the suites here serve with carries.
+@(private)
+ELODIN_SAN :: "DNS:elodin.local,DNS:localhost,IP:127.0.0.1"
+
+// A self-signed P-256 pair written to `cert` and `key` in `dir`, which is made
+// if missing; `san` is the subjectAltName, or none when empty.
+@(private)
+self_signed :: proc(dir, cert, key, days, subject, san: string) -> bool {
+	if !os.exists(dir) && os.make_directory(dir) != nil {
+		return false
+	}
+	args := make([dynamic]string, context.temp_allocator)
+	append(&args, "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes")
+	append(&args, "-keyout", key, "-out", cert, "-days", days, "-subj", subject)
+	if san != "" {
+		append(&args, "-addext", strings.concatenate({"subjectAltName=", san}, context.temp_allocator))
+	}
+	code, ok := run_openssl(args[:])
+	return ok && code == 0
+}
+
 // Run openssl with its chatter discarded; the exit code is the whole answer.
-@(private = "file")
+@(private)
 run_openssl :: proc(args: []string) -> (code: int, ok: bool) {
 	command := make([dynamic]string, context.temp_allocator)
 	append(&command, "openssl")
@@ -344,32 +340,9 @@ label is a name no client will verify against, so it covers nothing here either.
 */
 @(test)
 test_a_partial_wildcard_covers_nothing :: proc(t: ^testing.T) {
-	if !os.exists(CERT_DIR) {
-		_ = os.make_directory(CERT_DIR)
-	}
 	cert, key := CERT_DIR + "/partial-wild.pem", CERT_DIR + "/partial-wild-key.pem"
-	code, ok := run_openssl(
-		{
-			"req",
-			"-x509",
-			"-newkey",
-			"ec",
-			"-pkeyopt",
-			"ec_paramgen_curve:prime256v1",
-			"-nodes",
-			"-keyout",
-			key,
-			"-out",
-			cert,
-			"-days",
-			"2",
-			"-subj",
-			"/CN=wild",
-			"-addext",
-			"subjectAltName=DNS:d*.example.test,DNS:*.whole.test",
-		},
-	)
-	if !testing.expect(t, ok && code == 0, "openssl could not make the certificate") {
+	made := self_signed(CERT_DIR, cert, key, "2", "/CN=wild", "DNS:d*.example.test,DNS:*.whole.test")
+	if !testing.expect(t, made, "openssl could not make the certificate") {
 		return
 	}
 	covered, read := cert_file_covers_host(cert, "dns.example.test")
@@ -385,30 +358,9 @@ test_a_partial_wildcard_covers_nothing :: proc(t: ^testing.T) {
 // check the certificate read only the SANs (RFC 9525 section 6.3).
 @(test)
 test_a_common_name_covers_nothing :: proc(t: ^testing.T) {
-	if !os.exists(CERT_DIR) {
-		_ = os.make_directory(CERT_DIR)
-	}
 	cert, key := CERT_DIR + "/cn-only.pem", CERT_DIR + "/cn-only-key.pem"
-	code, ok := run_openssl(
-		{
-			"req",
-			"-x509",
-			"-newkey",
-			"ec",
-			"-pkeyopt",
-			"ec_paramgen_curve:prime256v1",
-			"-nodes",
-			"-keyout",
-			key,
-			"-out",
-			cert,
-			"-days",
-			"2",
-			"-subj",
-			"/CN=dns.example.test",
-		},
-	)
-	if !testing.expect(t, ok && code == 0, "openssl could not make the certificate") {
+	made := self_signed(CERT_DIR, cert, key, "2", "/CN=dns.example.test", "")
+	if !testing.expect(t, made, "openssl could not make the certificate") {
 		return
 	}
 	covered, read := cert_file_covers_host(cert, "dns.example.test")

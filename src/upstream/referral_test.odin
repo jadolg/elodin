@@ -3,9 +3,6 @@ package upstream
 import "core:net"
 import "core:sync"
 import "core:testing"
-import "core:thread"
-import "core:time"
-import "elodin:config"
 import "elodin:dns"
 
 /*
@@ -65,80 +62,24 @@ echo_loop :: proc(m: ^Referral_Mock) {
 	}
 }
 
-@(private = "file")
-start_mock :: proc(
-	t: ^testing.T,
-	m: ^Referral_Mock,
-	name: string,
-	loop: proc(_: ^Referral_Mock),
-) -> (
-	^Upstream,
-	^thread.Thread,
-	bool,
-) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "bind: %v", serr) {
-		return nil, nil, false
-	}
-	m.socket = socket
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the responder's port: %v", berr) {
-		net.close(socket)
-		return nil, nil, false
-	}
-	u, uerr := make_upstream(
-		config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port},
-		0,
-		time.Second,
-		context.allocator,
-	)
-	if !testing.expectf(t, uerr == .None, "upstream: %v", uerr) {
-		net.close(socket)
-		return nil, nil, false
-	}
-	return u, thread.create_and_start_with_poly_data(m, loop), true
-}
-
 @(test)
 test_a_referral_is_not_taken_as_an_answer :: proc(t: ^testing.T) {
 	referrer, answerer: Referral_Mock
 	// Neither started means neither closed: a zero socket here is fd 0, which
 	// under `odin test` is another test's.
-	bad, bad_thread, bad_ok := start_mock(t, &referrer, "referrer", referral_loop)
+	bad, bad_thread, bad_ok := start_udp_mock(t, &referrer, referral_loop, "referrer")
 	if !bad_ok {
 		return
 	}
-	good, good_thread, good_ok := start_mock(t, &answerer, "answerer", echo_loop)
+	defer stop_udp_mock(&referrer, bad_thread, bad)
+	good, good_thread, good_ok := start_udp_mock(t, &answerer, echo_loop, "answerer")
 	if !good_ok {
-		sync.atomic_store(&referrer.stop, true)
-		thread.join(bad_thread)
-		thread.destroy(bad_thread)
-		net.close(referrer.socket)
-		destroy(bad)
 		return
 	}
-	defer {
-		sync.atomic_store(&referrer.stop, true)
-		sync.atomic_store(&answerer.stop, true)
-		thread.join(bad_thread)
-		thread.join(good_thread)
-		thread.destroy(bad_thread)
-		thread.destroy(good_thread)
-		net.close(referrer.socket)
-		net.close(answerer.socket)
-		destroy(bad)
-		destroy(good)
-	}
+	defer stop_udp_mock(&answerer, good_thread, good)
 
 	servers := []^Upstream{bad, good}
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers)
 	query := dns.Message{id = 0x4104, question = []dns.Question{{name = "www.example.com.", type = .A, class = .IN}}}
 	query.flags.rd = true
 	wire, _, _ := dns.encode_message(query, context.temp_allocator)

@@ -24,32 +24,14 @@ QNAME :: "example.com."
 
 @(private = "file")
 answer_with :: proc(additional: []Record) -> []u8 {
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-	}
-	answer := make([]Record, 1, context.temp_allocator)
-	answer[0] = Record {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = Rdata_A{addr = {192, 0, 2, 1}},
-	}
 	m := Message {
 		id         = 1,
-		question   = questions,
-		answer     = answer,
+		question   = []Question{{name = QNAME, type = .A, class = .IN}},
+		answer     = []Record{a_answer(QNAME, 60)},
 		additional = additional,
 	}
 	m.flags.qr = true
-	wire, _, err := encode_message(m, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_wire(m)
 }
 
 @(private = "file")

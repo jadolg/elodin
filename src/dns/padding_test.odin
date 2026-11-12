@@ -79,21 +79,43 @@ long_name :: proc(labels: int, tail: int) -> string {
 }
 
 @(private = "file")
-padding_of :: proc(wire: []u8) -> (data: []u8, found: bool) {
-	m, err := decode_message(wire, context.temp_allocator)
-	if err != .None {
-		return nil, false
-	}
-	return find_edns_option(m, .Padding)
-}
-
-@(private = "file")
 all_zero :: proc(data: []u8) -> bool {
 	for b in data {
 		if b != 0 {
 			return false
 		}
 	}
+	return true
+}
+
+// Pads `wire` and checks the result: a whole number of blocks, no shorter than
+// `wire`, zeroes for padding, and `name` still the question. False when the
+// query was not padded at all.
+@(private = "file")
+expect_padded :: proc(t: ^testing.T, wire: []u8, name: string, loc := #caller_location) -> bool {
+	out, ok := pad_query(wire, PAD_QUERY_BLOCK, MAX_MESSAGE, context.temp_allocator)
+	if !testing.expectf(t, ok, "a %d-byte query was not padded", len(wire), loc = loc) {
+		return false
+	}
+	testing.expectf(
+		t,
+		len(out) % PAD_QUERY_BLOCK == 0,
+		"a %d-byte query padded to %d, which is %d past a block",
+		len(wire),
+		len(out),
+		len(out) % PAD_QUERY_BLOCK,
+		loc = loc,
+	)
+	testing.expectf(t, len(out) >= len(wire), "padding made the query shorter: %d -> %d", len(wire), len(out), loc = loc)
+
+	data, found := option_in(out, .Padding)
+	testing.expect(t, found, "the padded query carries no padding option", loc = loc)
+	testing.expect(t, all_zero(data), "the padding is not zeroes", loc = loc)
+
+	// The question still has to survive all of this.
+	q, qok := peek_question(out, context.temp_allocator)
+	testing.expect(t, qok, "the padded query has no readable question", loc = loc)
+	testing.expect(t, name_equal_fold(q.name, name), "the padded query asks something else", loc = loc)
 	return true
 }
 
@@ -110,30 +132,9 @@ test_a_padded_query_lands_on_a_block_boundary :: proc(t: ^testing.T) {
 		if !testing.expect(t, wire != nil, "could not build the query") {
 			return
 		}
-
-		out, ok := pad_query(wire, PAD_QUERY_BLOCK, MAX_MESSAGE, context.temp_allocator)
-		if !testing.expectf(t, ok, "a %d-byte query was not padded", len(wire)) {
+		if !expect_padded(t, wire, long_name(3, tail)) {
 			return
 		}
-		testing.expectf(
-			t,
-			len(out) % PAD_QUERY_BLOCK == 0,
-			"a %d-byte query padded to %d, which is %d past a block",
-			len(wire),
-			len(out),
-			len(out) % PAD_QUERY_BLOCK,
-		)
-		testing.expectf(t, len(out) >= len(wire), "padding made the query shorter: %d -> %d", len(wire), len(out))
-
-		data, found := padding_of(out)
-		testing.expect(t, found, "the padded query carries no padding option")
-		testing.expect(t, all_zero(data), "the padding is not zeroes")
-
-		// The question still has to survive all of this.
-		q, qok := peek_question(out, context.temp_allocator)
-		testing.expect(t, qok, "the padded query has no readable question")
-		testing.expect(t, name_equal_fold(q.name, long_name(3, tail)), "the padded query asks something else")
-
 		free_all(context.temp_allocator)
 	}
 }
@@ -150,23 +151,9 @@ test_padding_survives_an_opt_record_that_is_not_last :: proc(t: ^testing.T) {
 		if !testing.expect(t, wire != nil, "could not build the query") {
 			return
 		}
-
-		out, ok := pad_query(wire, PAD_QUERY_BLOCK, MAX_MESSAGE, context.temp_allocator)
-		if !testing.expectf(t, ok, "a %d-byte query was not padded", len(wire)) {
+		if !expect_padded(t, wire, long_name(2, tail)) {
 			return
 		}
-		testing.expectf(
-			t,
-			len(out) % PAD_QUERY_BLOCK == 0,
-			"a rebuilt %d-byte query padded to %d, %d past a block",
-			len(wire),
-			len(out),
-			len(out) % PAD_QUERY_BLOCK,
-		)
-
-		_, found := padding_of(out)
-		testing.expect(t, found, "the rebuilt query carries no padding option")
-
 		free_all(context.temp_allocator)
 	}
 }

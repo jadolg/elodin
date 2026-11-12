@@ -16,9 +16,8 @@ test_a_default_name_holds_no_query :: proc(t: ^testing.T) {
 		"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{url: \"https://dns.example/dns-query?token=SECRET#frag\"}]\n",
 		"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [\"https://dns.example/dns-query#SECRET\"]\n",
 	}) {
-		cfg, err := load_string(src, context.temp_allocator)
-		if e, has := err.?; has {
-			testing.expectf(t, false, "%q: %v", src, e.messages)
+		cfg, ok := expect_loads(t, src)
+		if !ok {
 			continue
 		}
 		s := cfg.upstream.servers[0]
@@ -27,36 +26,20 @@ test_a_default_name_holds_no_query :: proc(t: ^testing.T) {
 		testing.expect(t, strings.contains(s.path, "SECRET") == strings.contains(src, "?token"))
 	}
 	for list in ([]string{"https://lists.example/hosts?key=SECRET", "{url: \"https://lists.example/hosts?key=SECRET#x\"}"}) {
-		cfg, err := load_string(
-			fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists:\n    - %s\n", list),
-			context.temp_allocator,
-		)
-		if e, has := err.?; has {
-			testing.expectf(t, false, "%s: %v", list, e.messages)
+		cfg, ok := expect_loads(t, fmt.tprintf(MINIMAL + "blocking:\n  lists:\n    - %s\n", list))
+		if !ok {
 			continue
 		}
 		testing.expect_value(t, cfg.blocking.lists[0].name, "https://lists.example/hosts")
 		testing.expect(t, strings.contains(cfg.blocking.lists[0].url, "key=SECRET"))
 	}
 	// A name the file gives is kept as written.
-	cfg, err := load_string(
-		"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{name: \"mine?x\", url: \"https://dns.example/q?token=SECRET\"}]\n",
-		context.temp_allocator,
-	)
-	if e, has := err.?; has {
-		testing.expectf(t, false, "%v", e.messages)
-	} else {
+	if cfg, ok := expect_loads(t, "upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{name: \"mine?x\", url: \"https://dns.example/q?token=SECRET\"}]\n"); ok {
 		testing.expect_value(t, cfg.upstream.servers[0].name, "mine?x")
 	}
 	// A list's given name keys its copy alone, though it spells the url up to
 	// its query: the copy an earlier build cached under that name is still it.
-	cfg, err = load_string(
-		"upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists: [{name: \"https://l.example/h\", url: \"https://l.example/h?k=1\"}]\n",
-		context.temp_allocator,
-	)
-	if e, has := err.?; has {
-		testing.expectf(t, false, "%v", e.messages)
-	} else {
+	if cfg, ok := expect_loads(t, MINIMAL + "blocking:\n  lists: [{name: \"https://l.example/h\", url: \"https://l.example/h?k=1\"}]\n"); ok {
 		testing.expect_value(t, list_cache_file(cfg.blocking.lists[0]), "https___l.example_h.list")
 	}
 	free_all(context.temp_allocator)
@@ -93,15 +76,15 @@ test_a_default_name_names_one_thing :: proc(t: ^testing.T) {
 		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{name: \"https://dns.example/q\", url: \"https://dns.example/q?a=1\"}, \"https://dns.example/q?a=1\", {name: \"https://dns.example/q\", url: \"https://other.example/z\"}]\n", false},
 		{"upstream:\n  servers: [{name: cf, address: 1.1.1.1}, {name: cf, address: 1.0.0.1}]\n", true},
 		{"upstream:\n  servers: [\"1.1.1.1\"]\n  zones:\n    - domains: [corp.example]\n      servers: [{address: 1.1.1.1, verify: false, hostname: x.example}]\n", true},
-		{"upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists: [\"https://l.example/h?k=1\"]\n  allowlists: [\"https://l.example/h?k=2\"]\n", false},
-		{"upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists: [{name: \"https://l.example/h\", url: \"https://l.example/x\"}]\n  allowlists: [\"https://l.example/h\"]\n", false},
-		{"upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists: [{name: x, url: \"https://l.example/a\"}, {name: x, url: \"https://l.example/b\"}]\n", false},
-		{"upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists: [\"https://l.example/a_b\", \"https://l.example/a/b\"]\n", false},
-		{"upstream:\n  servers: [1.1.1.1]\nblocking:\n  enabled: false\n  lists: [\"https://l.example/a_b\", \"https://l.example/a/b\"]\n", true},
-		{"upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists: [\"https://l.example/h?k=1\", {name: two, url: \"https://l.example/h?k=2\"}, {url: \"https://l.example/h?k=3\", enabled: false}]\n", true},
-		{"upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists: [\"https://l.example/h?k=1\"]\n  allowlists: [\"https://l.example/h?k=1\"]\n", true},
-		{"upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists: [\"https://l.example/h?k=1\", \"https://l.example/h?k=1#x\"]\n", true},
-		{"upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists: [{url: \"https://l.example/h?k=1\", file: /a}, {url: \"https://l.example/h?k=2\", file: /b}]\n", true},
+		{MINIMAL + "blocking:\n  lists: [\"https://l.example/h?k=1\"]\n  allowlists: [\"https://l.example/h?k=2\"]\n", false},
+		{MINIMAL + "blocking:\n  lists: [{name: \"https://l.example/h\", url: \"https://l.example/x\"}]\n  allowlists: [\"https://l.example/h\"]\n", false},
+		{MINIMAL + "blocking:\n  lists: [{name: x, url: \"https://l.example/a\"}, {name: x, url: \"https://l.example/b\"}]\n", false},
+		{MINIMAL + "blocking:\n  lists: [\"https://l.example/a_b\", \"https://l.example/a/b\"]\n", false},
+		{MINIMAL + "blocking:\n  enabled: false\n  lists: [\"https://l.example/a_b\", \"https://l.example/a/b\"]\n", true},
+		{MINIMAL + "blocking:\n  lists: [\"https://l.example/h?k=1\", {name: two, url: \"https://l.example/h?k=2\"}, {url: \"https://l.example/h?k=3\", enabled: false}]\n", true},
+		{MINIMAL + "blocking:\n  lists: [\"https://l.example/h?k=1\"]\n  allowlists: [\"https://l.example/h?k=1\"]\n", true},
+		{MINIMAL + "blocking:\n  lists: [\"https://l.example/h?k=1\", \"https://l.example/h?k=1#x\"]\n", true},
+		{MINIMAL + "blocking:\n  lists: [{url: \"https://l.example/h?k=1\", file: /a}, {url: \"https://l.example/h?k=2\", file: /b}]\n", true},
 	}
 	for c in cases {
 		_, err := load_string(c.src, context.temp_allocator)

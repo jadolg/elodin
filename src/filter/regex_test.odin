@@ -11,15 +11,6 @@ without its trailing dot, as AdGuard Home's urlfilter matches it against the
 hostname, and the list's text never gets to choose how long that takes.
 */
 
-@(private = "file")
-engine_of :: proc(text: string, format := Format.Adblock) -> ^Engine {
-	block, allow := set_make(), set_make()
-	parse_list(block, allow, text, format)
-	e := engine_make()
-	engine_swap(e, block, allow)
-	return e
-}
-
 @(test)
 test_regex_rule_matches_the_name :: proc(t: ^testing.T) {
 	e := engine_of("/^ads[0-9]+\\.example\\.com$/\n/tracker/\n")

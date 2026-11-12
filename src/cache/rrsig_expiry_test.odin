@@ -23,8 +23,7 @@ rrsig_record :: proc(name: string, covered: dns.Type, expiration: u32, section_t
 
 @(private = "file")
 stored :: proc(c: ^Cache, m: dns.Message, qtype: dns.Type) -> (e: ^Entry, ok: bool) {
-	wire, _, _ := dns.encode_message(m, context.temp_allocator)
-	msg, _ := dns.decode_message(wire, context.temp_allocator)
+	wire, msg := wire_and_msg(m)
 	kb: [KEY_MAX]u8
 	key := make_key(kb[:], "example.com.", qtype, .IN, true)
 	if !put(c, key, wire, msg) {

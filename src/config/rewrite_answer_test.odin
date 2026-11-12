@@ -15,12 +15,11 @@ the RFC prints them, so a rule can be copied across without being translated.
 @(private = "file")
 rules_from :: proc(t: ^testing.T, answers: string) -> []Rewrite {
 	src := strings.concatenate(
-		{"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: example.com\n    answers: ", answers, "\n"},
+		{MINIMAL + "rewrites:\n  - domain: example.com\n    answers: ", answers, "\n"},
 		context.temp_allocator,
 	)
-	cfg, err := load_string(src, context.temp_allocator)
-	if e, has := err.?; has {
-		testing.expectf(t, false, "config errors: %v", e.messages)
+	cfg, ok := expect_loads(t, src)
+	if !ok {
 		return nil
 	}
 	return cfg.rewrites
@@ -30,7 +29,7 @@ rules_from :: proc(t: ^testing.T, answers: string) -> []Rewrite {
 @(private = "file")
 error_from :: proc(answers: string) -> string {
 	src := strings.concatenate(
-		{"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: example.com\n    answers: ", answers, "\n"},
+		{MINIMAL + "rewrites:\n  - domain: example.com\n    answers: ", answers, "\n"},
 		context.temp_allocator,
 	)
 	_, err := load_string(src, context.temp_allocator)
@@ -270,7 +269,7 @@ has no index to name either.
 */
 @(test)
 test_rewrite_errors_name_the_key_that_was_used :: proc(t: ^testing.T) {
-	singular := "upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: example.com\n    answer: \"MX ten mail.example.com\"\n"
+	singular := MINIMAL + "rewrites:\n  - domain: example.com\n    answer: \"MX ten mail.example.com\"\n"
 	_, serr := load_string(singular, context.temp_allocator)
 	if e, has := serr.?; testing.expect(t, has, "a bad singular answer was accepted") {
 		testing.expectf(
@@ -496,7 +495,7 @@ pass `--check` while doing it.
 */
 @(test)
 test_a_rule_may_not_have_both_answer_keys :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: example.com\n    answer: 192.168.1.50\n    answers: [\"MX 10 mail.example.com\"]\n"
+	src := MINIMAL + "rewrites:\n  - domain: example.com\n    answer: 192.168.1.50\n    answers: [\"MX 10 mail.example.com\"]\n"
 	_, err := load_string(src, context.temp_allocator)
 	if e, has := err.?; testing.expect(t, has, "both keys were accepted") {
 		testing.expect(t, strings.contains(e.messages[0], "both"), "the message should say which mistake this is")
@@ -520,7 +519,7 @@ test_rewrite_domain_must_fit_the_wire :: proc(t: ^testing.T) {
 	)
 	src := strings.concatenate(
 		{
-			"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: ",
+			MINIMAL + "rewrites:\n  - domain: ",
 			long_label,
 			"\n    answer: 192.168.1.50\n",
 		},
@@ -538,7 +537,7 @@ test_rewrite_domain_must_fit_the_wire :: proc(t: ^testing.T) {
 	// A wildcard's suffix is a name as well, and is checked the same way.
 	wild := strings.concatenate(
 		{
-			"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: \"*.",
+			MINIMAL + "rewrites:\n  - domain: \"*.",
 			long_label,
 			"\"\n    answer: 192.168.1.50\n",
 		},
@@ -598,7 +597,7 @@ drops one.
 */
 @(test)
 test_a_bad_answer_drops_its_rule :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: example.com\n    answers: [\"MX ten mail.example.com\", 192.168.1.50]\n  - domain: other.example\n    answer: 192.168.1.51\n"
+	src := MINIMAL + "rewrites:\n  - domain: example.com\n    answers: [\"MX ten mail.example.com\", 192.168.1.50]\n  - domain: other.example\n    answer: 192.168.1.51\n"
 	cfg, err := load_string(src, context.temp_allocator)
 	if _, has := err.?; !testing.expect(t, has, "a bad answer was accepted") {
 		return
@@ -651,7 +650,7 @@ as `upstream.zones` and `rebind.allow_domains` refuse the root.
 @(test)
 test_a_wildcard_on_the_root_is_refused :: proc(t: ^testing.T) {
 	_, err := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: \"*.\"\n    answer: 192.168.1.50\n",
+		MINIMAL + "rewrites:\n  - domain: \"*.\"\n    answer: 192.168.1.50\n",
 		context.temp_allocator,
 	)
 	if e, has := err.?; testing.expect(t, has, "a rewrite of every name was accepted") {

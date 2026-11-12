@@ -26,9 +26,8 @@ test_a_doh_upstream_keeps_its_query :: proc(t: ^testing.T) {
 		{"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [\"https://dns.example:8443?profile=ab12#x\"]\n", "/?profile=ab12", 8443},
 	}
 	for c in cases {
-		cfg, err := load_string(c.src, context.temp_allocator)
-		if e, has := err.?; has {
-			testing.expectf(t, false, "%q: %v", c.src, e.messages)
+		cfg, ok := expect_loads(t, c.src)
+		if !ok {
 			continue
 		}
 		if testing.expectf(t, len(cfg.upstream.servers) == 1, "%q: %d servers", c.src, len(cfg.upstream.servers)) {
@@ -53,20 +52,14 @@ since the fetcher reads no other scheme.
 */
 @(test)
 test_a_scheme_is_read_in_any_case :: proc(t: ^testing.T) {
-	cfg, err := load_string(
-		"upstream:\n  servers: [\"TLS://1.1.1.1#one.one.one.one\"]\nblocking:\n  lists:\n    - HTTPS://lists.example/hosts\n",
-		context.temp_allocator,
-	)
-	if e, has := err.?; has {
-		testing.expectf(t, false, "%v", e.messages)
-	} else {
+	if cfg, ok := expect_loads(t, "upstream:\n  servers: [\"TLS://1.1.1.1#one.one.one.one\"]\nblocking:\n  lists:\n    - HTTPS://lists.example/hosts\n"); ok {
 		testing.expect_value(t, cfg.upstream.servers[0].kind, Upstream_Kind.TLS)
 		testing.expect_value(t, cfg.blocking.lists[0].url, "HTTPS://lists.example/hosts")
 		testing.expect_value(t, cfg.blocking.lists[0].file, "")
 	}
 	for list in ([]string{"{url: \"ftp://lists.example/hosts\"}", "{url: \"lists.example/hosts\"}"}) {
 		_, lerr := load_string(
-			fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nblocking:\n  lists:\n    - %s\n", list),
+			fmt.tprintf(MINIMAL + "blocking:\n  lists:\n    - %s\n", list),
 			context.temp_allocator,
 		)
 		_, has := lerr.?

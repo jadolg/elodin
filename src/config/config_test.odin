@@ -67,9 +67,8 @@ rewrites:
 
 @(test)
 test_load_good_config :: proc(t: ^testing.T) {
-	cfg, err := load_string(GOOD, context.temp_allocator)
-	if e, has := err.?; has {
-		testing.expectf(t, false, "config errors: %v", e.messages)
+	cfg, ok := expect_loads(t, GOOD)
+	if !ok {
 		return
 	}
 
@@ -154,7 +153,7 @@ forgot to set it would silence the whole feature rather than fail.
 @(test)
 test_rewrite_ptr_opt_out :: proc(t: ^testing.T) {
 	src :=
-		"upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: ads.example\n    answer: 192.168.1.10\n    ptr: false\n  - domain: nas.home\n    answer: 192.168.1.50\n"
+		MINIMAL + "rewrites:\n  - domain: ads.example\n    answer: 192.168.1.10\n    ptr: false\n  - domain: nas.home\n    answer: 192.168.1.50\n"
 	cfg, err := load_string(src, context.temp_allocator)
 	testing.expect(t, err == nil)
 	if testing.expect_value(t, len(cfg.rewrites), 2) {
@@ -162,7 +161,7 @@ test_rewrite_ptr_opt_out :: proc(t: ^testing.T) {
 		testing.expect(t, cfg.rewrites[1].ptr, "the key is per rule")
 	}
 
-	bad := "upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: ads.example\n    answer: 192.168.1.10\n    ptr: maybe\n"
+	bad := MINIMAL + "rewrites:\n  - domain: ads.example\n    answer: 192.168.1.10\n    ptr: maybe\n"
 	_, berr := load_string(bad, context.temp_allocator)
 	e, has := berr.?
 	if testing.expect(t, has, "a non-boolean ptr was accepted") {
@@ -184,12 +183,12 @@ of those and is refused rather than read as a third meaning.
 */
 @(test)
 test_cache_stale_timeout :: proc(t: ^testing.T) {
-	base, berr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	base, berr := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, berr == nil, "expected a clean load")
 	testing.expect_value(t, base.cache.stale_timeout, 1800 * time.Millisecond)
 
 	set, serr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ncache:\n  serve_stale: true\n  stale_timeout: 500ms\n",
+		MINIMAL + "cache:\n  serve_stale: true\n  stale_timeout: 500ms\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, serr == nil, "expected a clean load")
@@ -198,21 +197,21 @@ test_cache_stale_timeout :: proc(t: ^testing.T) {
 	// The figure the annotated reference carries, which is fractional: a parser
 	// that read it as one second would quietly halve the documented default.
 	doc, derr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ncache:\n  stale_timeout: 1.8s\n",
+		MINIMAL + "cache:\n  stale_timeout: 1.8s\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, derr == nil, "expected a clean load")
 	testing.expect_value(t, doc.cache.stale_timeout, 1800 * time.Millisecond)
 
 	off, oerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ncache:\n  stale_timeout: 0s\n",
+		MINIMAL + "cache:\n  stale_timeout: 0s\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, oerr == nil, "0 is the escape hatch, not an error")
 	testing.expect_value(t, off.cache.stale_timeout, time.Duration(0))
 
 	_, nerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ncache:\n  stale_timeout: -1s\n",
+		MINIMAL + "cache:\n  stale_timeout: -1s\n",
 		context.temp_allocator,
 	)
 	e, has := nerr.?
@@ -234,13 +233,13 @@ the default, which a file from before the key existed never chose.
 */
 @(test)
 test_cache_prefetch :: proc(t: ^testing.T) {
-	base, berr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	base, berr := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, berr == nil, "expected a clean load")
 	testing.expect(t, base.cache.prefetch, "prefetching is off by default")
 	testing.expect_value(t, base.cache.prefetch_min_ttl, 9)
 
 	set, serr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ncache:\n  prefetch: false\n  prefetch_min_ttl: 1m\n",
+		MINIMAL + "cache:\n  prefetch: false\n  prefetch_min_ttl: 1m\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, serr == nil, "expected a clean load")
@@ -248,14 +247,14 @@ test_cache_prefetch :: proc(t: ^testing.T) {
 	testing.expect_value(t, set.cache.prefetch_min_ttl, 60)
 
 	every, eerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ncache:\n  prefetch_min_ttl: 0\n",
+		MINIMAL + "cache:\n  prefetch_min_ttl: 0\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, eerr == nil, "0 prefetches every entry, and is not an error")
 	testing.expect_value(t, every.cache.prefetch_min_ttl, 0)
 
 	_, nerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ncache:\n  prefetch_min_ttl: -1\n",
+		MINIMAL + "cache:\n  prefetch_min_ttl: -1\n",
 		context.temp_allocator,
 	)
 	if e, has := nerr.?; testing.expect(t, has, "a negative prefetch_min_ttl was accepted") {
@@ -263,7 +262,7 @@ test_cache_prefetch :: proc(t: ^testing.T) {
 	}
 
 	_, aerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ncache:\n  max_ttl: 1h\n  prefetch_min_ttl: 2h\n",
+		MINIMAL + "cache:\n  max_ttl: 1h\n  prefetch_min_ttl: 2h\n",
 		context.temp_allocator,
 	)
 	if e, has := aerr.?; testing.expect(t, has, "a threshold above max_ttl was accepted") {
@@ -272,7 +271,7 @@ test_cache_prefetch :: proc(t: ^testing.T) {
 
 	// `max_ttl: 0` is the cache's day, and a threshold above that is as unreachable.
 	_, zerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ncache:\n  max_ttl: 0\n  prefetch_min_ttl: 100000\n",
+		MINIMAL + "cache:\n  max_ttl: 0\n  prefetch_min_ttl: 100000\n",
 		context.temp_allocator,
 	)
 	if e, has := zerr.?; testing.expect(t, has, "a threshold above the cache's own day was accepted") {
@@ -280,21 +279,21 @@ test_cache_prefetch :: proc(t: ^testing.T) {
 	}
 
 	_, oerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ncache:\n  max_ttl: 1h\n  prefetch: false\n  prefetch_min_ttl: 2h\n",
+		MINIMAL + "cache:\n  max_ttl: 1h\n  prefetch: false\n  prefetch_min_ttl: 2h\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, oerr == nil, "a threshold is refused with prefetching off")
 
 	// A file that caps entries under the default threshold and never names it,
 	// as every file from before the key did, still loads.
-	_, lerr := load_string("upstream:\n  servers: [1.1.1.1]\ncache:\n  max_ttl: 4\n", context.temp_allocator)
+	_, lerr := load_string(MINIMAL + "cache:\n  max_ttl: 4\n", context.temp_allocator)
 	testing.expect(t, lerr == nil, "the default threshold refused a max_ttl below it")
 	free_all(context.temp_allocator)
 }
 
 @(test)
 test_defaults_applied :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect_value(t, cfg.listeners.udp.port, 53)
 	testing.expect_value(t, cfg.upstream.strategy, Strategy.Failover)
@@ -310,13 +309,13 @@ test_defaults_applied :: proc(t: ^testing.T) {
 test_doh_mobileconfig_path :: proc(t: ^testing.T) {
 	// The default is a served path, so a device can be pointed at the resolver
 	// the moment DoH is turned on, without another setting.
-	base, berr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	base, berr := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, berr == nil, "expected a clean load")
 	testing.expect_value(t, base.listeners.doh.mobileconfig_path, "/apple-doh.mobileconfig")
 
 	// A value is read as given.
 	set, serr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  doh:\n    mobileconfig_path: /profile.mobileconfig\n",
+		MINIMAL + "listeners:\n  doh:\n    mobileconfig_path: /profile.mobileconfig\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, serr == nil, "expected a clean load")
@@ -324,7 +323,7 @@ test_doh_mobileconfig_path :: proc(t: ^testing.T) {
 
 	// Empty is how it is withheld.
 	off, oerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  doh:\n    mobileconfig_path: \"\"\n",
+		MINIMAL + "listeners:\n  doh:\n    mobileconfig_path: \"\"\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, oerr == nil, "expected a clean load")
@@ -337,7 +336,7 @@ test_dnssec_can_be_turned_off :: proc(t: ^testing.T) {
 	// The escape hatch for an upstream that cannot return DNSSEC records, where
 	// validating would mean answering nothing rather than answering unverified.
 	cfg, err := load_string(
-		"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: false\n",
+		MINIMAL + "dnssec:\n  enabled: false\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, err == nil, "expected a clean load")
@@ -347,7 +346,7 @@ test_dnssec_can_be_turned_off :: proc(t: ^testing.T) {
 
 @(test)
 test_cookies_defaults_and_overrides :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect(t, cfg.cookies.enabled, "cookies should be answered by default")
 	testing.expect(t, !cfg.cookies.require, "cookies should not be demanded by default")
@@ -355,14 +354,14 @@ test_cookies_defaults_and_overrides :: proc(t: ^testing.T) {
 
 	// `require` is set with `enabled` left on, since the two disagree by
 	// definition; that pairing has its own case below.
-	src := "upstream:\n  servers: [1.1.1.1]\ncookies:\n  require: true\n  upstream: false\n  secret: e5e973e5a6b2a43f48e7dc849e37bfcf\n"
+	src := MINIMAL + "cookies:\n  require: true\n  upstream: false\n  secret: e5e973e5a6b2a43f48e7dc849e37bfcf\n"
 	tuned, terr := load_string(src, context.temp_allocator)
 	testing.expect(t, terr == nil, "expected a clean load")
 	testing.expect(t, tuned.cookies.require, "cookies.require: true should be honoured")
 	testing.expect(t, !tuned.cookies.upstream, "cookies.upstream: false should be honoured")
 	testing.expect_value(t, tuned.cookies.secret, "e5e973e5a6b2a43f48e7dc849e37bfcf")
 
-	off, oerr := load_string("upstream:\n  servers: [1.1.1.1]\ncookies:\n  enabled: false\n", context.temp_allocator)
+	off, oerr := load_string(MINIMAL + "cookies:\n  enabled: false\n", context.temp_allocator)
 	testing.expect(t, oerr == nil, "expected a clean load")
 	testing.expect(t, !off.cookies.enabled, "cookies.enabled: false should be honoured")
 	free_all(context.temp_allocator)
@@ -372,7 +371,7 @@ test_cookies_defaults_and_overrides :: proc(t: ^testing.T) {
 test_cookie_secret_must_be_hex :: proc(t: ^testing.T) {
 	// Caught here rather than at startup, so `--check` says so instead of a
 	// resolver that comes up and refuses to start.
-	src := "upstream:\n  servers: [1.1.1.1]\ncookies:\n  secret: not-a-secret\n"
+	src := MINIMAL + "cookies:\n  secret: not-a-secret\n"
 	_, err := load_string(src, context.temp_allocator)
 	e, has := err.?
 	testing.expect(t, has, "expected an error for a secret that is not hex")
@@ -385,7 +384,7 @@ test_cookie_require_needs_the_client_facing_side :: proc(t: ^testing.T) {
 	// `require` is enforced by the keeper `enabled` builds, so the two together
 	// are a setting that does nothing. Said at `--check` rather than left to be
 	// discovered when the attack it was turned on for arrives.
-	src := "upstream:\n  servers: [1.1.1.1]\ncookies:\n  enabled: false\n  require: true\n"
+	src := MINIMAL + "cookies:\n  enabled: false\n  require: true\n"
 	_, err := load_string(src, context.temp_allocator)
 	e, has := err.?
 	testing.expect(t, has, "expected an error for require without enabled")
@@ -395,7 +394,7 @@ test_cookie_require_needs_the_client_facing_side :: proc(t: ^testing.T) {
 
 @(test)
 test_special_use_defaults_and_overrides :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect(t, cfg.special_use.enabled, "localhost., onion. and invalid. should be answered locally by default")
 	testing.expect(t, cfg.special_use.onion, "onion. should be answered locally by default")
@@ -411,7 +410,7 @@ test_special_use_defaults_and_overrides :: proc(t: ^testing.T) {
 	testing.expect(t, cfg.special_use.private_reverse, "the RFC 6303 reverse zones should be answered locally by default")
 
 	src :=
-		"upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  onion: false\n  local: true\n  test: true\n  home_arpa: true\n  private_reverse: false\n"
+		MINIMAL + "special_use:\n  onion: false\n  local: true\n  test: true\n  home_arpa: true\n  private_reverse: false\n"
 	tuned, terr := load_string(src, context.temp_allocator)
 	testing.expect(t, terr == nil, "expected a clean load")
 	testing.expect(t, tuned.special_use.enabled, "special_use.enabled should survive the other four being set")
@@ -422,7 +421,7 @@ test_special_use_defaults_and_overrides :: proc(t: ^testing.T) {
 	testing.expect(t, !tuned.special_use.private_reverse, "special_use.private_reverse: false should be honoured")
 
 	off, oerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  enabled: false\n",
+		MINIMAL + "special_use:\n  enabled: false\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, oerr == nil, "expected a clean load")
@@ -434,7 +433,7 @@ test_special_use_defaults_and_overrides :: proc(t: ^testing.T) {
 test_special_use_extras_need_the_table :: proc(t: ^testing.T) {
 	// Nothing looks at `local` or `test` with `enabled` off, so the pair reads
 	// as a leak that was stopped and was not. Said at `--check`.
-	src := "upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  enabled: false\n  local: true\n"
+	src := MINIMAL + "special_use:\n  enabled: false\n  local: true\n"
 	_, err := load_string(src, context.temp_allocator)
 	e, has := err.?
 	testing.expect(t, has, "expected an error for local without enabled")
@@ -444,7 +443,7 @@ test_special_use_extras_need_the_table :: proc(t: ^testing.T) {
 	// costs the most: it exists to stop a leak, so an operator who wrote it down
 	// under `enabled: false` believes their own hostnames are staying on the
 	// network while they are being forwarded.
-	hsrc := "upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  enabled: false\n  home_arpa: true\n"
+	hsrc := MINIMAL + "special_use:\n  enabled: false\n  home_arpa: true\n"
 	_, herr := load_string(hsrc, context.temp_allocator)
 	he, has_h := herr.?
 	testing.expect(t, has_h, "expected an error for home_arpa without enabled")
@@ -454,7 +453,7 @@ test_special_use_extras_need_the_table :: proc(t: ^testing.T) {
 	// turning the table off without mentioning it is the ordinary way to do it
 	// rather than a contradiction anybody wrote down.
 	off, oerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nspecial_use:\n  enabled: false\n",
+		MINIMAL + "special_use:\n  enabled: false\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, oerr == nil, "special_use.enabled: false on its own should load")
@@ -488,7 +487,7 @@ Left to a caching server that has switched caching off, it is nothing at all.
 */
 @(test)
 test_cache_byte_budget_is_checked :: proc(t: ^testing.T) {
-	too_small := "upstream:\n  servers: [1.1.1.1]\ncache:\n  max_bytes: 64KiB\n"
+	too_small := MINIMAL + "cache:\n  max_bytes: 64KiB\n"
 	_, err := load_string(too_small, context.temp_allocator)
 	e, has := err.?
 	testing.expect(t, has, "a budget below one maximal answer was accepted")
@@ -496,12 +495,12 @@ test_cache_byte_budget_is_checked :: proc(t: ^testing.T) {
 		testing.expect_value(t, len(e.messages), 1)
 	}
 
-	disabled := "upstream:\n  servers: [1.1.1.1]\ncache:\n  enabled: false\n  max_bytes: 64KiB\n"
+	disabled := MINIMAL + "cache:\n  enabled: false\n  max_bytes: 64KiB\n"
 	_, off_err := load_string(disabled, context.temp_allocator)
 	_, off_has := off_err.?
 	testing.expect(t, !off_has, "a cache that is switched off was sized anyway")
 
-	nonsense := "upstream:\n  servers: [1.1.1.1]\ncache:\n  max_bytes: plenty\n"
+	nonsense := MINIMAL + "cache:\n  max_bytes: plenty\n"
 	_, bad_err := load_string(nonsense, context.temp_allocator)
 	_, bad_has := bad_err.?
 	testing.expect(t, bad_has, "a size that is not a size was accepted")
@@ -515,7 +514,7 @@ and a limiter that is switched off is not sized at all.
 */
 @(test)
 test_rate_limit_settings_are_checked :: proc(t: ^testing.T) {
-	zero := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    responses_per_second: 0\n"
+	zero := MINIMAL + "server:\n  rate_limit:\n    responses_per_second: 0\n"
 	_, err := load_string(zero, context.temp_allocator)
 	e, has := err.?
 	testing.expect(t, has, "a budget of zero responses a second was accepted")
@@ -523,12 +522,12 @@ test_rate_limit_settings_are_checked :: proc(t: ^testing.T) {
 		testing.expect_value(t, len(e.messages), 1)
 	}
 
-	negative := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    slip: -1\n"
+	negative := MINIMAL + "server:\n  rate_limit:\n    slip: -1\n"
 	_, nerr := load_string(negative, context.temp_allocator)
 	_, nhas := nerr.?
 	testing.expect(t, nhas, "a negative slip was accepted")
 
-	off := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: false\n    responses_per_second: 0\n"
+	off := MINIMAL + "server:\n  rate_limit:\n    enabled: false\n    responses_per_second: 0\n"
 	_, oerr := load_string(off, context.temp_allocator)
 	_, ohas := oerr.?
 	testing.expect(t, !ohas, "a limiter that is switched off was sized anyway")
@@ -546,13 +545,13 @@ every answer costs exactly one token and the figure counts answers. That holds a
 */
 @(test)
 test_the_response_size_estimate_defaults_to_the_udp_ceiling :: proc(t: ^testing.T) {
-	unset := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    responses_per_second: 500\n"
+	unset := MINIMAL + "server:\n  rate_limit:\n    responses_per_second: 500\n"
 	cfg, err := load_string(unset, context.temp_allocator)
 	_, has := err.?
 	testing.expect(t, !has, "a file that names no estimate was refused")
 	testing.expect_value(t, cfg.server.rate_limit.response_size_estimate, DEFAULT_MAX_UDP_RESPONSE)
 
-	raised := "upstream:\n  servers: [1.1.1.1]\nserver:\n  max_udp_response: 4096\n  rate_limit:\n    responses_per_second: 500\n"
+	raised := MINIMAL + "server:\n  max_udp_response: 4096\n  rate_limit:\n    responses_per_second: 500\n"
 	rcfg, rerr := load_string(raised, context.temp_allocator)
 	_, rhas := rerr.?
 	testing.expect(t, !rhas, "a raised ceiling with no estimate was refused")
@@ -560,7 +559,7 @@ test_the_response_size_estimate_defaults_to_the_udp_ceiling :: proc(t: ^testing.
 
 	// Written, and written as a size: the same spellings `max_udp_response`
 	// takes, since it is the figure this is measured against.
-	sized := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 1KiB\n"
+	sized := MINIMAL + "server:\n  rate_limit:\n    response_size_estimate: 1KiB\n"
 	scfg, serr := load_string(sized, context.temp_allocator)
 	_, shas := serr.?
 	testing.expect(t, !shas, "an estimate written as a size was refused")
@@ -580,7 +579,7 @@ than a server whose bound is not the one its file states.
 */
 @(test)
 test_a_response_size_estimate_out_of_bounds_is_refused :: proc(t: ^testing.T) {
-	tiny := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 8\n"
+	tiny := MINIMAL + "server:\n  rate_limit:\n    response_size_estimate: 8\n"
 	_, err := load_string(tiny, context.temp_allocator)
 	e, has := err.?
 	testing.expect(t, has, "an estimate below the floor was accepted")
@@ -593,12 +592,12 @@ test_a_response_size_estimate_out_of_bounds_is_refused :: proc(t: ^testing.T) {
 		)
 	}
 
-	huge := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 64KiB\n"
+	huge := MINIMAL + "server:\n  rate_limit:\n    response_size_estimate: 64KiB\n"
 	_, herr := load_string(huge, context.temp_allocator)
 	_, hhas := herr.?
 	testing.expect(t, hhas, "an estimate above the largest datagram was accepted")
 
-	negative := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: -1\n"
+	negative := MINIMAL + "server:\n  rate_limit:\n    response_size_estimate: -1\n"
 	_, nerr := load_string(negative, context.temp_allocator)
 	_, nhas := nerr.?
 	testing.expect(t, nhas, "a negative estimate was accepted")
@@ -610,7 +609,7 @@ test_a_response_size_estimate_out_of_bounds_is_refused :: proc(t: ^testing.T) {
 	setting doing nothing, with nothing said about it - so it is refused rather
 	than read as agreement with the default.
 	*/
-	zero := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 0\n"
+	zero := MINIMAL + "server:\n  rate_limit:\n    response_size_estimate: 0\n"
 	_, zerr := load_string(zero, context.temp_allocator)
 	_, zhas := zerr.?
 	testing.expect(t, zhas, "an estimate written as 0 was accepted")
@@ -624,7 +623,7 @@ test_a_response_size_estimate_out_of_bounds_is_refused :: proc(t: ^testing.T) {
 	0", so a file saying `abc` would be told about a value it does not contain -
 	beside the message that already says what is actually wrong with it.
 	*/
-	unparseable := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: abc\n"
+	unparseable := MINIMAL + "server:\n  rate_limit:\n    response_size_estimate: abc\n"
 	_, uerr := load_string(unparseable, context.temp_allocator)
 	ue, uhas := uerr.?
 	testing.expect(t, uhas, "an estimate that is not a size was accepted")
@@ -645,13 +644,13 @@ test_a_response_size_estimate_out_of_bounds_is_refused :: proc(t: ^testing.T) {
 	figures of, and this key is no different: refusing a start over one of the
 	three and not the other two would be an asymmetry with nothing behind it.
 	*/
-	off := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: false\n    response_size_estimate: 0\n"
+	off := MINIMAL + "server:\n  rate_limit:\n    enabled: false\n    response_size_estimate: 0\n"
 	_, oerr := load_string(off, context.temp_allocator)
 	_, ohas := oerr.?
 	testing.expect(t, !ohas, "an estimate of 0 was refused with the limiter off")
 
 	// The floor and the ceiling themselves are inside, not outside.
-	edges := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    response_size_estimate: 64\n"
+	edges := MINIMAL + "server:\n  rate_limit:\n    response_size_estimate: 64\n"
 	ecfg, eerr := load_string(edges, context.temp_allocator)
 	_, ehas := eerr.?
 	testing.expect(t, !ehas, "the floor itself was refused")
@@ -664,7 +663,7 @@ test_a_response_size_estimate_out_of_bounds_is_refused :: proc(t: ^testing.T) {
 @(private = "file")
 with_overrides :: proc(body: string) -> string {
 	return fmt.tprintf(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    responses_per_second: 500\n    slip: 2\n    overrides:\n%s",
+		MINIMAL + "server:\n  rate_limit:\n    responses_per_second: 500\n    slip: 2\n    overrides:\n%s",
 		body,
 	)
 }
@@ -683,9 +682,8 @@ test_rate_limit_overrides_are_read :: proc(t: ^testing.T) {
 	src := with_overrides(
 		"      - { prefix: 198.51.100.0/24, responses_per_second: 5000, slip: 0 }\n      - { prefix: \"2001:db8::/32\", responses_per_second: 50 }\n",
 	)
-	cfg, err := load_string(src, context.temp_allocator)
-	if e, has := err.?; has {
-		testing.expectf(t, false, "a valid pair of overrides was rejected: %v", e.messages)
+	cfg, ok := expect_loads(t, src)
+	if !ok {
 		return
 	}
 	o := cfg.server.rate_limit.overrides
@@ -811,7 +809,7 @@ test_rate_limit_overrides_are_checked :: proc(t: ^testing.T) {
 
 	// And overrides beside a limiter that is switched off, which is an operator
 	// configuring budgets for a server that will not keep any.
-	disabled := "upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: false\n    overrides:\n      - { prefix: 198.51.100.0/24, responses_per_second: 5000 }\n"
+	disabled := MINIMAL + "server:\n  rate_limit:\n    enabled: false\n    overrides:\n      - { prefix: 198.51.100.0/24, responses_per_second: 5000 }\n"
 	_, derr := load_string(disabled, context.temp_allocator)
 	_, dhas := derr.?
 	testing.expect(t, dhas, "overrides were accepted with the limiter switched off")
@@ -831,9 +829,8 @@ network they had already named.
 @(test)
 test_an_override_prefix_is_masked_not_refused :: proc(t: ^testing.T) {
 	src := with_overrides("      - { prefix: 198.51.100.7/24, responses_per_second: 5000 }\n")
-	cfg, err := load_string(src, context.temp_allocator)
-	if e, has := err.?; has {
-		testing.expectf(t, false, "a /24 written with host bits was rejected: %v", e.messages)
+	cfg, ok := expect_loads(t, src)
+	if !ok {
 		return
 	}
 	o := cfg.server.rate_limit.overrides
@@ -889,7 +886,7 @@ test_prefix_match_takes_the_most_specific :: proc(t: ^testing.T) {
 
 @(test)
 test_tls_listener_requires_cert :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nlisteners:\n  dot:\n    enabled: true\n"
+	src := MINIMAL + "listeners:\n  dot:\n    enabled: true\n"
 	_, err := load_string(src, context.temp_allocator)
 	e, has := err.?
 	testing.expect(t, has, "expected an error when DoT has no certificate")
@@ -944,14 +941,14 @@ test_dot_upstream_hostname_alternatives_are_accepted :: proc(t: ^testing.T) {
 
 @(test)
 test_service_account_is_read :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  user: elodin\n  group: elodin\n"
+	src := MINIMAL + "server:\n  user: elodin\n  group: elodin\n"
 	cfg, err := load_string(src, context.temp_allocator)
 	testing.expect(t, err == nil, "a service account should load cleanly")
 	testing.expect_value(t, cfg.server.user, "elodin")
 	testing.expect_value(t, cfg.server.group, "elodin")
 
 	// Nothing configured stays as started.
-	bare, berr := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	bare, berr := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, berr == nil, "a config without a service account should load")
 	testing.expect_value(t, bare.server.user, "")
 	testing.expect_value(t, bare.server.group, "")
@@ -962,7 +959,7 @@ test_service_account_is_read :: proc(t: ^testing.T) {
 // A group with no user drops nothing, and looks from the file as though it does.
 @(test)
 test_group_without_user_is_an_error :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  group: elodin\n"
+	src := MINIMAL + "server:\n  group: elodin\n"
 	_, err := load_string(src, context.temp_allocator)
 	e, has := err.?
 	testing.expect(t, has, "server.group alone should be refused")
@@ -980,7 +977,7 @@ into an outage or an outage into an open resolver.
 */
 @(test)
 test_allow_from_absent_keeps_the_local_default :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect(t, len(cfg.server.allow_from) > 0, "a file that says nothing should not open the resolver")
 	testing.expect(
@@ -998,7 +995,7 @@ test_allow_from_absent_keeps_the_local_default :: proc(t: ^testing.T) {
 
 @(test)
 test_allow_from_replaces_the_default :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: [\"203.0.113.0/24\", \"2001:db8::/32\"]\n"
+	src := MINIMAL + "server:\n  allow_from: [\"203.0.113.0/24\", \"2001:db8::/32\"]\n"
 	cfg, err := load_string(src, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect_value(t, len(cfg.server.allow_from), 2)
@@ -1021,7 +1018,7 @@ test_allow_from_replaces_the_default :: proc(t: ^testing.T) {
 @(test)
 test_allow_from_empty_is_a_public_resolver :: proc(t: ^testing.T) {
 	cfg, err := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: []\n",
+		MINIMAL + "server:\n  allow_from: []\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, err == nil, "an empty allow_from should load")
@@ -1038,7 +1035,7 @@ test_allow_from_empty_is_a_public_resolver :: proc(t: ^testing.T) {
 // name the entry: a list of eight is not one an operator wants to bisect.
 @(test)
 test_allow_from_reports_every_bad_entry :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: [\"10.0.0.0/8\", \"nonsense\", \"::1/999\"]\n"
+	src := MINIMAL + "server:\n  allow_from: [\"10.0.0.0/8\", \"nonsense\", \"::1/999\"]\n"
 	_, err := load_string(src, context.temp_allocator)
 	e, has := err.?
 	testing.expect(t, has, "an unparseable network should be refused")
@@ -1063,22 +1060,12 @@ test_allow_from_with_no_value_is_an_error :: proc(t: ^testing.T) {
 	sources := []string {
 		// Last key in the mapping, and with another key after it: the same node
 		// either way, but both are what people actually write.
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from:\n",
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from:\n  max_pending: 4\n",
+		MINIMAL + "server:\n  allow_from:\n",
+		MINIMAL + "server:\n  allow_from:\n  max_pending: 4\n",
 	}
 	for src in sources {
-		cfg, err := load_string(src, context.temp_allocator)
-		e, has := err.?
-		if !testing.expectf(t, has, "an empty allow_from value loaded as %v", cfg.server.allow_from) {
-			continue
-		}
-		named := false
-		for m in e.messages {
-			if strings.contains(m, "allow_from") && strings.contains(m, "[]") {
-				named = true
-			}
-		}
-		testing.expectf(t, named, "the message does not offer [] as the way to say it: %v", e.messages)
+		// The message offers [] as the way to say it.
+		expect_refused(t, src, "allow_from", "[]")
 	}
 	free_all(context.temp_allocator)
 }
@@ -1087,7 +1074,7 @@ test_allow_from_with_no_value_is_an_error :: proc(t: ^testing.T) {
 // silently ignored setting.
 @(test)
 test_allow_from_of_the_wrong_shape_is_an_error :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nserver:\n  allow_from: { a: 1 }\n"
+	src := MINIMAL + "server:\n  allow_from: { a: 1 }\n"
 	_, err := load_string(src, context.temp_allocator)
 	_, has := err.?
 	testing.expect(t, has, "a mapping should not be accepted as a list of networks")
@@ -1103,7 +1090,7 @@ ceiling is not the one in its file.
 */
 @(test)
 test_max_udp_response_defaults_to_flag_day :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect_value(t, cfg.server.max_udp_response, DEFAULT_MAX_UDP_RESPONSE)
 	testing.expect_value(t, cfg.server.max_udp_response, 1232)
@@ -1113,7 +1100,7 @@ test_max_udp_response_defaults_to_flag_day :: proc(t: ^testing.T) {
 @(test)
 test_max_udp_response_can_be_raised :: proc(t: ^testing.T) {
 	cfg, err := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_udp_response: 4096\n",
+		MINIMAL + "server:\n  max_udp_response: 4096\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, err == nil, "expected a clean load")
@@ -1121,7 +1108,7 @@ test_max_udp_response_can_be_raised :: proc(t: ^testing.T) {
 
 	// Read as a size, so the suffixed forms the cache settings take work here.
 	sized, serr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_udp_response: 1KiB\n",
+		MINIMAL + "server:\n  max_udp_response: 1KiB\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, serr == nil, "a suffixed size should load")
@@ -1134,21 +1121,10 @@ test_max_udp_response_outside_the_range_is_an_error :: proc(t: ^testing.T) {
 	out_of_range := []string{"8192", "511", "0", "-1"}
 	for value in out_of_range {
 		src := strings.concatenate(
-			{"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_udp_response: ", value, "\n"},
+			{MINIMAL + "server:\n  max_udp_response: ", value, "\n"},
 			context.temp_allocator,
 		)
-		_, err := load_string(src, context.temp_allocator)
-		e, has := err.?
-		testing.expectf(t, has, "max_udp_response: %s was accepted", value)
-		if has {
-			named := false
-			for m in e.messages {
-				if strings.contains(m, "max_udp_response") {
-					named = true
-				}
-			}
-			testing.expectf(t, named, "the error for %s does not name the setting", value)
-		}
+		expect_refused(t, src, "max_udp_response")
 	}
 	free_all(context.temp_allocator)
 }
@@ -1162,7 +1138,7 @@ old configuration file never mentioned.
 */
 @(test)
 test_metrics_is_off_by_default :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect(t, !cfg.metrics.enabled, "the metrics endpoint should be off by default")
 	testing.expect_value(t, cfg.metrics.address, "127.0.0.1")
@@ -1173,7 +1149,7 @@ test_metrics_is_off_by_default :: proc(t: ^testing.T) {
 
 @(test)
 test_metrics_settings_are_honoured :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nmetrics:\n  enabled: true\n  address: \"0.0.0.0\"\n  port: 9999\n  path: /stats\n"
+	src := MINIMAL + "metrics:\n  enabled: true\n  address: \"0.0.0.0\"\n  port: 9999\n  path: /stats\n"
 	cfg, err := load_string(src, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect(t, cfg.metrics.enabled, "metrics.enabled: true should be honoured")
@@ -1206,22 +1182,10 @@ test_unreachable_doh_paths_are_errors :: proc(t: ^testing.T) {
 	}
 	for c in cases {
 		src := strings.concatenate(
-			{"upstream:\n  servers: [1.1.1.1]\nlisteners:\n  doh:\n    enabled: true\n    ", c.key, ": ", c.value, "\n"},
+			{MINIMAL + "listeners:\n  doh:\n    enabled: true\n    ", c.key, ": ", c.value, "\n"},
 			context.temp_allocator,
 		)
-		_, err := load_string(src, context.temp_allocator)
-		e, has := err.?
-		testing.expectf(t, has, "%s: %s was accepted", c.key, c.value)
-		if has {
-			named := false
-			want := strings.concatenate({"listeners.doh.", c.key, ":"}, context.temp_allocator)
-			for m in e.messages {
-				if strings.has_prefix(m, want) {
-					named = true
-				}
-			}
-			testing.expectf(t, named, "%s: %s was refused, but not for the path", c.key, c.value)
-		}
+		expect_refused(t, src, strings.concatenate({"listeners.doh.", c.key, ":"}, context.temp_allocator), prefix = true)
 	}
 	free_all(context.temp_allocator)
 }
@@ -1237,18 +1201,6 @@ of an upstream, the shorthand and the map, and of a block or allow list.
 test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 	// Refused, and for the rule: a bootstrap in each source, so that the URL is
 	// the only thing wrong with it.
-	refused_for :: proc(t: ^testing.T, src, rule: string) {
-		_, err := load_string(src, context.temp_allocator)
-		e, has := err.?
-		if !testing.expectf(t, has, "%q was accepted", src) {
-			return
-		}
-		named := false
-		for m in e.messages {
-			named ||= strings.contains(m, rule)
-		}
-		testing.expectf(t, named, "%q was refused, but not for the url: %v", src, e.messages)
-	}
 	urls := []string {
 		"\"https://dns.example/dns query\"",
 		"\"https://dns.example/dns-query\\tx\"",
@@ -1268,7 +1220,7 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 		_, good := load_string(fmt.tprintf(form, "\"https://dns.example/dns-query\""), context.temp_allocator)
 		testing.expectf(t, good == nil, "%q: an ordinary url was refused: %v", form, good)
 		for url in urls {
-			refused_for(t, fmt.tprintf(form, url), UPSTREAM_URL_RULE)
+			expect_refused(t, fmt.tprintf(form, url), UPSTREAM_URL_RULE)
 		}
 	}
 	// The map spelling can name the `Host` apart from the url.
@@ -1277,7 +1229,7 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 			"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: https://dns.example/dns-query\n      hostname: %s\n",
 			hostname,
 		)
-		refused_for(t, src, UPSTREAM_URL_RULE)
+		expect_refused(t, src, UPSTREAM_URL_RULE)
 	}
 	// The other shorthands are refused the same way, rather than trimmed of
 	// Unicode whitespace or kept with it: an NBSP after `#name` is a certificate
@@ -1286,29 +1238,29 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 	_, good_dot := load_string(fmt.tprintf(SHORTHAND, "\"tls://1.1.1.1:853#dns.example\""), context.temp_allocator)
 	testing.expectf(t, good_dot == nil, "an ordinary DoT shorthand was refused: %v", good_dot)
 	for s in ([]string{"\"tls://1.1.1.1:853#dns.example\u00a0\"", "\"1.1.1.1\u00a0\"", "\"tls://1.1.1.1:853#a.example@b.example\"", "\"tls://a@dns.example:853\""}) {
-		refused_for(t, fmt.tprintf(SHORTHAND, s), "cannot parse")
+		expect_refused(t, fmt.tprintf(SHORTHAND, s), "cannot parse")
 	}
 	// And the map spelling of one: the same name, spelled `hostname:`.
 	DOT_MAP :: "upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - type: tls\n      address: 1.1.1.1\n      hostname: %s\n"
 	_, good_dot_map := load_string(fmt.tprintf(DOT_MAP, "dns.example"), context.temp_allocator)
 	testing.expectf(t, good_dot_map == nil, "an ordinary DoT map was refused: %v", good_dot_map)
 	// With no `hostname:`, a name address is the certificate name as well.
-	refused_for(
+	expect_refused(
 		t,
 		"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - type: tls\n      address: \"dns.example \"\n",
 		"address: must be visible ASCII",
 	)
-	refused_for(t, fmt.tprintf(DOT_MAP, "\"dns.example \""), "hostname: must be visible ASCII")
+	expect_refused(t, fmt.tprintf(DOT_MAP, "\"dns.example \""), "hostname: must be visible ASCII")
 	// And a host: userinfo or a path in one is a name no certificate has, and a
 	// `Host` that a hop routing by it reads its own way.
-	refused_for(t, fmt.tprintf(DOT_MAP, "\"a.example@b.example\""), "hostname: must be visible ASCII")
-	refused_for(
+	expect_refused(t, fmt.tprintf(DOT_MAP, "\"a.example@b.example\""), "hostname: must be visible ASCII")
+	expect_refused(
 		t,
 		"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: https://dns.example/dns-query\n      hostname: a.example/x\n",
 		UPSTREAM_URL_RULE,
 	)
 	// An https upstream's own address is a lookup just the same.
-	refused_for(
+	expect_refused(
 		t,
 		"upstream:\n  bootstrap: [9.9.9.9]\n  servers:\n    - url: https://dns.example/dns-query\n      address: \"dns.example \"\n",
 		"address: must be visible ASCII",
@@ -1334,7 +1286,7 @@ test_upstream_urls_outside_visible_ascii_are_errors :: proc(t: ^testing.T) {
 				"\"https://[lists.example:443/hosts.txt\"",
 				"\"https:///hosts.txt\"",
 			}) {
-			refused_for(t, fmt.tprintf(form, url), LIST_URL_RULE)
+			expect_refused(t, fmt.tprintf(form, url), LIST_URL_RULE)
 		}
 	}
 	free_all(context.temp_allocator)
@@ -1364,21 +1316,10 @@ test_unusable_metrics_settings_are_errors :: proc(t: ^testing.T) {
 	}
 	for tail in cases {
 		src := strings.concatenate(
-			{"upstream:\n  servers: [1.1.1.1]\nmetrics:\n  enabled: true\n", tail},
+			{MINIMAL + "metrics:\n  enabled: true\n", tail},
 			context.temp_allocator,
 		)
-		_, err := load_string(src, context.temp_allocator)
-		e, has := err.?
-		testing.expectf(t, has, "metrics:\n%s was accepted", tail)
-		if has {
-			named := false
-			for m in e.messages {
-				if strings.has_prefix(m, "metrics.") {
-					named = true
-				}
-			}
-			testing.expectf(t, named, "the error for %q does not name the setting", tail)
-		}
+		expect_refused(t, src, "metrics.", prefix = true)
 	}
 	free_all(context.temp_allocator)
 }
@@ -1388,7 +1329,7 @@ test_unusable_metrics_settings_are_errors :: proc(t: ^testing.T) {
 // stops a resolver starting.
 @(test)
 test_metrics_settings_are_not_checked_while_it_is_off :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nmetrics:\n  enabled: false\n  port: 0\n  path: nowhere\n"
+	src := MINIMAL + "metrics:\n  enabled: false\n  port: 0\n  path: nowhere\n"
 	_, err := load_string(src, context.temp_allocator)
 	testing.expect(t, err == nil, "a disabled metrics endpoint should not be validated")
 	free_all(context.temp_allocator)
@@ -1405,13 +1346,13 @@ whether that happens, and it should not be possible to make by accident.
 */
 @(test)
 test_rebind_defaults_to_off_with_nothing_exempt :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, err == nil)
 	testing.expect(t, !cfg.rebind.enabled)
 	testing.expect(t, !cfg.rebind.allow_loopback)
 	testing.expect_value(t, len(cfg.rebind.allow_domains), 0)
 
-	src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  enabled: false\n  allow_loopback: true\n  allow_domains: [Corp.Example., other.example]\n"
+	src := MINIMAL + "rebind:\n  enabled: false\n  allow_loopback: true\n  allow_domains: [Corp.Example., other.example]\n"
 	set, serr := load_string(src, context.temp_allocator)
 	testing.expect(t, serr == nil)
 	testing.expect(t, !set.rebind.enabled)
@@ -1434,7 +1375,7 @@ there is a two-character way to say the other one.
 */
 @(test)
 test_rebind_allow_domains_will_not_take_the_root :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\".\"]\n"
+	src := MINIMAL + "rebind:\n  allow_domains: [\".\"]\n"
 	_, err := load_string(src, context.temp_allocator)
 	e, has := err.?
 	if testing.expect(t, has, "the root was accepted as an exempt domain") {
@@ -1442,7 +1383,7 @@ test_rebind_allow_domains_will_not_take_the_root :: proc(t: ^testing.T) {
 	}
 
 	// A bare star is the root written the other way, and means the same thing.
-	star := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\"*\"]\n"
+	star := MINIMAL + "rebind:\n  allow_domains: [\"*\"]\n"
 	_, serr := load_string(star, context.temp_allocator)
 	_, star_has := serr.?
 	testing.expect(t, star_has, "a bare * was accepted as an exempt domain")
@@ -1461,7 +1402,7 @@ names the zone to write instead.
 */
 @(test)
 test_rebind_allow_domains_will_not_take_a_wildcard :: proc(t: ^testing.T) {
-	src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\"*.corp.example\"]\n"
+	src := MINIMAL + "rebind:\n  allow_domains: [\"*.corp.example\"]\n"
 	_, err := load_string(src, context.temp_allocator)
 	e, has := err.?
 	if testing.expect(t, has, "a wildcard was accepted as an exempt domain, and would match nothing") {
@@ -1471,7 +1412,7 @@ test_rebind_allow_domains_will_not_take_a_wildcard :: proc(t: ^testing.T) {
 
 	// And the plain zone, which is what it should have said, still loads and
 	// still covers everything below itself.
-	ok_src := "upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [corp.example]\n"
+	ok_src := MINIMAL + "rebind:\n  allow_domains: [corp.example]\n"
 	cfg, oerr := load_string(ok_src, context.temp_allocator)
 	testing.expect(t, oerr == nil)
 	if testing.expect_value(t, len(cfg.rebind.allow_domains), 1) {
@@ -1492,8 +1433,8 @@ internal name still answering NODATA after the fix was applied.
 @(test)
 test_rebind_allow_domains_will_not_take_an_empty_label :: proc(t: ^testing.T) {
 	sources := []string {
-		"upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\".corp.example\"]\n",
-		"upstream:\n  servers: [1.1.1.1]\nrebind:\n  allow_domains: [\"corp..example\"]\n",
+		MINIMAL + "rebind:\n  allow_domains: [\".corp.example\"]\n",
+		MINIMAL + "rebind:\n  allow_domains: [\"corp..example\"]\n",
 	}
 	for src in sources {
 		_, err := load_string(src, context.temp_allocator)
@@ -1520,7 +1461,7 @@ Derived at load rather than at startup, for the reason `max_pending` is:
 */
 @(test)
 test_the_connection_share_is_derived_from_the_table :: proc(t: ^testing.T) {
-	cfg, err := load_string("upstream:\n  servers: [1.1.1.1]\n", context.temp_allocator)
+	cfg, err := load_string(MINIMAL, context.temp_allocator)
 	testing.expect(t, err == nil, "expected a clean load")
 	testing.expect_value(t, cfg.server.max_connections, 512)
 	testing.expect_value(t, cfg.server.max_connections_per_prefix, 256)
@@ -1528,7 +1469,7 @@ test_the_connection_share_is_derived_from_the_table :: proc(t: ^testing.T) {
 	// It follows the table rather than the shipped default of it: an operator
 	// who raises one expects a client's share to move with it.
 	raised, rerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_connections: 4096\n",
+		MINIMAL + "server:\n  max_connections: 4096\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, rerr == nil, "expected a clean load")
@@ -1536,7 +1477,7 @@ test_the_connection_share_is_derived_from_the_table :: proc(t: ^testing.T) {
 
 	// A number in the file wins.
 	set, serr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_connections_per_prefix: 8\n",
+		MINIMAL + "server:\n  max_connections_per_prefix: 8\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, serr == nil, "expected a clean load")
@@ -1551,7 +1492,7 @@ test_the_connection_share_is_derived_from_the_table :: proc(t: ^testing.T) {
 	asking for more than the table means.
 	*/
 	over, oerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_connections: 64\n  max_connections_per_prefix: 10000\n",
+		MINIMAL + "server:\n  max_connections: 64\n  max_connections_per_prefix: 10000\n",
 		context.temp_allocator,
 	)
 	testing.expect(t, oerr == nil, "a share larger than the table is not an error")
@@ -1560,7 +1501,7 @@ test_the_connection_share_is_derived_from_the_table :: proc(t: ^testing.T) {
 	// Negative is refused rather than read as one of the two special values it
 	// sits next to.
 	_, nerr := load_string(
-		"upstream:\n  servers: [1.1.1.1]\nserver:\n  max_connections_per_prefix: -1\n",
+		MINIMAL + "server:\n  max_connections_per_prefix: -1\n",
 		context.temp_allocator,
 	)
 	e, has := nerr.?
@@ -1586,7 +1527,7 @@ test_the_connection_table_must_be_at_least_one :: proc(t: ^testing.T) {
 	sources := []string{"max_connections: 0", "max_connections: -5"}
 	for src in sources {
 		_, err := load_string(
-			fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nserver:\n  %s\n", src),
+			fmt.tprintf(MINIMAL + "server:\n  %s\n", src),
 			context.temp_allocator,
 		)
 		e, has := err.?
@@ -1610,7 +1551,6 @@ dropped. Every source of an address or a port is here.
 */
 @(test)
 test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
-	UP :: "upstream:\n  servers: [1.1.1.1]\n"
 	SOURCES := []string {
 		"upstream:\n  servers: [\"]:53\"]\n",
 		"upstream:\n  servers: [\"tls://]:853#dns.example\"]\n",
@@ -1621,35 +1561,35 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 		"upstream:\n  servers: [\"1.1.1.1:18446744073709551669\"]\n",
 		"upstream:\n  servers:\n    - { address: 1.1.1.1, port: -7 }\n",
 		"upstream:\n  servers:\n    - { address: 1.1.1.1, port: 65536 }\n",
-		"upstream:\n  servers: [1.1.1.1]\n  bootstrap: [\"]:53\"]\n",
-		"upstream:\n  servers: [1.1.1.1]\n  bootstrap: [\"a]:]:53\"]\n",
-		"upstream:\n  servers: [1.1.1.1]\n  bootstrap: [dns.example]\n",
+		MINIMAL + "  bootstrap: [\"]:53\"]\n",
+		MINIMAL + "  bootstrap: [\"a]:]:53\"]\n",
+		MINIMAL + "  bootstrap: [dns.example]\n",
 		"upstream:\n  servers:\n    - { address: 1.1.1.1, bootstrap: [\"]:53\"] }\n",
-		UP + "  zones:\n    - domains: [corp.example]\n      servers: [10.0.0.1]\n      bootstrap: [\"]:53\"]\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"A ]:1.2.3.4\"\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"AAAA ]::1\"\n",
-		UP + "metrics:\n  enabled: true\n  address: \"]:\"\n",
-		UP + "listeners:\n  udp: { port: -1 }\n",
+		MINIMAL + "  zones:\n    - domains: [corp.example]\n      servers: [10.0.0.1]\n      bootstrap: [\"]:53\"]\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"A ]:1.2.3.4\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"AAAA ]::1\"\n",
+		MINIMAL + "metrics:\n  enabled: true\n  address: \"]:\"\n",
+		MINIMAL + "listeners:\n  udp: { port: -1 }\n",
 		// A port in an address field: read through `core:net`, it is dropped
 		// for the default one with nothing said.
 		"upstream:\n  servers:\n    - { address: \"1.1.1.1:5353\" }\n",
 		"upstream:\n  servers:\n    - { address: \"dns.example:853\", type: tls }\n",
 		"upstream:\n  servers:\n    - { url: \"https://dns.google/dns-query\", address: \"8.8.8.8:5353\" }\n  bootstrap: [9.9.9.9]\n",
-		UP + "listeners:\n  udp: { enabled: true, address: \"127.0.0.1:5353\" }\n",
-		UP + "listeners:\n  udp: { enabled: true, address: \"]:\" }\n",
-		UP + "metrics:\n  enabled: true\n  address: \"127.0.0.1:9100\"\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"A 1.2.3.4:80\"\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"1.2.3.4:80\"\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"dns.example:53\"\n",
-		UP + "server:\n  allow_from: [\"10.0.0.1:53\"]\n",
+		MINIMAL + "listeners:\n  udp: { enabled: true, address: \"127.0.0.1:5353\" }\n",
+		MINIMAL + "listeners:\n  udp: { enabled: true, address: \"]:\" }\n",
+		MINIMAL + "metrics:\n  enabled: true\n  address: \"127.0.0.1:9100\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"A 1.2.3.4:80\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"1.2.3.4:80\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"dns.example:53\"\n",
+		MINIMAL + "server:\n  allow_from: [\"10.0.0.1:53\"]\n",
 		// A short IPv4 form: `core:net` reads `192.168.1` as 192.168.0.1, so this
 		// would allow another network.
-		UP + "server:\n  allow_from: [\"192.168.1/24\"]\n",
-		UP + "listeners:\n  udp: { enabled: true, address: \"10.20.30\" }\n",
+		MINIMAL + "server:\n  allow_from: [\"192.168.1/24\"]\n",
+		MINIMAL + "listeners:\n  udp: { enabled: true, address: \"10.20.30\" }\n",
 		"upstream:\n  servers:\n    - { address: 10.20.30 }\n  bootstrap: [9.9.9.9]\n",
-		"upstream:\n  servers: [1.1.1.1]\n  bootstrap: [\"10.20.30\"]\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"10.20.30\"\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"A 10.20.30\"\n",
+		MINIMAL + "  bootstrap: [\"10.20.30\"]\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"10.20.30\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"A 10.20.30\"\n",
 		// A port on the certificate name: an SNI and a name check no server passes.
 		"upstream:\n  servers:\n    - { address: 1.1.1.1, hostname: \"dns.example:853\", type: tls }\n",
 		"upstream:\n  servers: [\"tls://1.1.1.1#dns.example:853\"]\n",
@@ -1669,17 +1609,17 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 		"upstream:\n  servers: [\":53\"]\n",
 		"upstream:\n  servers: [\"tls://:853#dns.example\"]\n  bootstrap: [9.9.9.9]\n",
 		// An IPv6 address's IPv4 part has four parts too.
-		UP + "server:\n  allow_from: [\"::ffff:192.168.1./120\"]\n",
-		UP + "listeners:\n  udp: { enabled: true, address: \"::ffff:10.20.30.\" }\n",
+		MINIMAL + "server:\n  allow_from: [\"::ffff:192.168.1./120\"]\n",
+		MINIMAL + "listeners:\n  udp: { enabled: true, address: \"::ffff:10.20.30.\" }\n",
 		// A host in an answer, typed or not, has no port or brackets.
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"[1.2.3.4]\"\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"CNAME dns.example:53\"\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"MX 10 mail.example:25\"\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 10.20.30\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"[1.2.3.4]\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"CNAME dns.example:53\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"MX 10 mail.example:25\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 10.20.30\"\n",
 		// An address where a name goes, either family.
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 2001:db8::1\"\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"MX 10 ::1\"\n",
-		UP + "rewrites:\n  - domain: example.com\n    answers: \"SRV 1 1 53 192.0.2.1\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 2001:db8::1\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"MX 10 ::1\"\n",
+		MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"SRV 1 1 53 192.0.2.1\"\n",
 	}
 	for src in SOURCES {
 		_, err := load_string(src, context.temp_allocator)
@@ -1694,8 +1634,8 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 			"upstream:\n  servers:\n    - { address: \"1.1.1.1:5353\" }\n",
 			"upstream:\n  servers:\n    - { address: \"dns.example:853\", type: tls }\n",
 			"upstream:\n  servers:\n    - { url: \"https://dns.google/dns-query\", address: \"8.8.8.8:5353\" }\n  bootstrap: [9.9.9.9]\n",
-			UP + "listeners:\n  udp: { enabled: true, address: \"127.0.0.1:5353\" }\n",
-			UP + "metrics:\n  enabled: true\n  address: \"127.0.0.1:9100\"\n",
+			MINIMAL + "listeners:\n  udp: { enabled: true, address: \"127.0.0.1:5353\" }\n",
+			MINIMAL + "metrics:\n  enabled: true\n  address: \"127.0.0.1:9100\"\n",
 		}) {
 		_, err := load_string(src, context.temp_allocator)
 		e, has := err.?
@@ -1709,15 +1649,15 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 	}
 	// An address where a name goes is called one.
 	{
-		_, err := load_string(UP + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 1.2.3.4\"\n", context.temp_allocator)
+		_, err := load_string(MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 1.2.3.4\"\n", context.temp_allocator)
 		e, has := err.?
 		testing.expectf(t, has && strings.contains(e.messages[0], "is an address"), "%v", err)
 	}
 	// A bracketed literal is told to drop the brackets, on each source.
 	for src in ([]string {
 			"upstream:\n  servers:\n    - { address: \"[2606:4700::1111]\" }\n",
-			UP + "listeners:\n  udp: { enabled: true, address: \"[::]\" }\n",
-			UP + "metrics:\n  enabled: true\n  address: \"[::1]\"\n",
+			MINIMAL + "listeners:\n  udp: { enabled: true, address: \"[::]\" }\n",
+			MINIMAL + "metrics:\n  enabled: true\n  address: \"[::1]\"\n",
 		}) {
 		_, err := load_string(src, context.temp_allocator)
 		e, has := err.?
@@ -1727,8 +1667,8 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 	// And only when there is one: a bracketed literal has no port to move.
 	for src in ([]string {
 			"upstream:\n  servers:\n    - { address: \"[2606:4700::1111]\" }\n",
-			UP + "listeners:\n  udp: { enabled: true, address: \"[::]\" }\n",
-			UP + "rewrites:\n  - domain: example.com\n    answers: \"[::1]\"\n",
+			MINIMAL + "listeners:\n  udp: { enabled: true, address: \"[::]\" }\n",
+			MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"[::1]\"\n",
 		}) {
 		_, err := load_string(src, context.temp_allocator)
 		e, has := err.?
@@ -1736,13 +1676,13 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 	}
 
 	// A listener that does not bind is not held to an address it never uses.
-	_, lerr := load_string(UP + "listeners:\n  dot: { enabled: false, address: localhost }\n", context.temp_allocator)
+	_, lerr := load_string(MINIMAL + "listeners:\n  dot: { enabled: false, address: localhost }\n", context.temp_allocator)
 	testing.expectf(t, lerr == nil, "a disabled listener's address was checked: %v", lerr)
 
 	// A file list has no url to hold to the url's rule, in either spelling.
 	for src in ([]string {
-			UP + "blocking:\n  lists: [/etc/elodin/ads.txt]\n",
-			UP + "blocking:\n  lists:\n    - { file: /etc/elodin/ads.txt }\n",
+			MINIMAL + "blocking:\n  lists: [/etc/elodin/ads.txt]\n",
+			MINIMAL + "blocking:\n  lists:\n    - { file: /etc/elodin/ads.txt }\n",
 		}) {
 		cfg, ferr := load_string(src, context.temp_allocator)
 		testing.expectf(t, ferr == nil && len(cfg.blocking.lists) == 1, "a file list was refused: %q: %v", src, ferr)
@@ -1760,7 +1700,7 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 	for src in ([]string {
 			"upstream:\n  servers: [\"[2606:4700::1111]\"]\n",
 			"upstream:\n  servers: [\"https://[2606:4700::1111]/dns-query\"]\n",
-			"upstream:\n  servers: [1.1.1.1]\n  bootstrap: [\"[2620:fe::fe]\"]\n",
+			MINIMAL + "  bootstrap: [\"[2620:fe::fe]\"]\n",
 		}) {
 		cfg, berr := load_string(src, context.temp_allocator)
 		testing.expectf(t, berr == nil && cfg.upstream.servers[0].address != "[2606:4700::1111]", "%q: %v", src, berr)

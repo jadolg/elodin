@@ -18,18 +18,8 @@ APPEND_QNAME :: "example.com."
 
 @(private = "file")
 append_fixture :: proc(additional: []Record = nil, raw_len := -1, compress := true) -> []u8 {
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = APPEND_QNAME,
-		type  = .A,
-		class = .IN,
-	}
 	answer := make([dynamic]Record, context.temp_allocator)
-	append(
-		&answer,
-		Record{name = APPEND_QNAME, type = .A, class = .IN, ttl = 60, data = Rdata_A{addr = {192, 0, 2, 1}}},
-		Record{name = "www." + APPEND_QNAME, type = .A, class = .IN, ttl = 60, data = Rdata_A{addr = {192, 0, 2, 2}}},
-	)
+	append(&answer, a_answer(APPEND_QNAME, 60), a_answer("www." + APPEND_QNAME, 60, 2))
 	if raw_len >= 0 {
 		append(
 			&answer,
@@ -44,16 +34,12 @@ append_fixture :: proc(additional: []Record = nil, raw_len := -1, compress := tr
 	}
 	m := Message {
 		id         = 1,
-		question   = questions,
+		question   = []Question{{name = APPEND_QNAME, type = .A, class = .IN}},
 		answer     = answer[:],
 		additional = additional,
 	}
 	m.flags.qr = true
-	wire, _, err := encode_message(m, context.temp_allocator, compress = compress)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_wire(m, compress)
 }
 
 // A message of exactly `size` bytes: the fixture, padded out with one raw record.

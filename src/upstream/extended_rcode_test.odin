@@ -153,35 +153,7 @@ start_canned_mock :: proc(
 		return nil, nil, false
 	}
 	m.reply = reply
-
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
-		return nil, nil, false
-	}
-	m.socket = socket
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		net.close(socket)
-		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
-		return nil, nil, false
-	}
-
-	built, uerr := make_upstream(
-		config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port},
-		0,
-		time.Second,
-		context.allocator,
-	)
-	if uerr != .None {
-		net.close(socket)
-		testing.expectf(t, false, "cannot build the upstream: %v", uerr)
-		return nil, nil, false
-	}
-
-	return built, thread.create_and_start_with_poly_data(m, canned_mock_loop), true
+	return start_udp_mock(t, m, canned_mock_loop, name)
 }
 
 @(test)
@@ -196,43 +168,22 @@ test_a_reply_the_client_cannot_read_is_asked_elsewhere :: proc(t: ^testing.T) {
 	if !bad_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&broken.stop, true)
-		thread.join(bad_thread)
-		thread.destroy(bad_thread)
-		net.close(broken.socket)
-		destroy(bad)
-	}
+	defer stop_udp_mock(&broken, bad_thread, bad)
 
 	good, good_thread, good_ok := start_canned_mock(t, &answerer, "answerer", canned_reply(0))
 	if !good_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&answerer.stop, true)
-		thread.join(good_thread)
-		thread.destroy(good_thread)
-		net.close(answerer.socket)
-		destroy(good)
-	}
+	defer stop_udp_mock(&answerer, good_thread, good)
 
 	// The premise, read off the fixture rather than assumed: an rcode of 16
 	// whose header half a client reads as NOERROR.
 	testing.expect_value(t, dns.peek_rcode(badvers), dns.Rcode.Bad_Vers)
 	testing.expect_value(t, badvers[3] & 0xf, u8(0))
 
-	servers := make([]^Upstream, 2, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = bad
-	servers[1] = good
+	servers := []^Upstream{bad, good}
 
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers)
 
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
@@ -283,25 +234,11 @@ test_an_unreadable_reply_still_comes_back_when_nobody_else_can_answer :: proc(t:
 	if !bad_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&broken.stop, true)
-		thread.join(bad_thread)
-		thread.destroy(bad_thread)
-		net.close(broken.socket)
-		destroy(bad)
-	}
+	defer stop_udp_mock(&broken, bad_thread, bad)
 
-	servers := make([]^Upstream, 1, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = bad
+	servers := []^Upstream{bad}
 
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers)
 
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
@@ -359,38 +296,17 @@ test_the_swept_query_carries_a_transaction_id_of_its_own :: proc(t: ^testing.T) 
 	if !bad_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&broken.stop, true)
-		thread.join(bad_thread)
-		thread.destroy(bad_thread)
-		net.close(broken.socket)
-		destroy(bad)
-	}
+	defer stop_udp_mock(&broken, bad_thread, bad)
 
 	good, good_thread, good_ok := start_canned_mock(t, &answerer, "answerer", canned_reply(0))
 	if !good_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&answerer.stop, true)
-		thread.join(good_thread)
-		thread.destroy(good_thread)
-		net.close(answerer.socket)
-		destroy(good)
-	}
+	defer stop_udp_mock(&answerer, good_thread, good)
 
-	servers := make([]^Upstream, 2, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = bad
-	servers[1] = good
+	servers := []^Upstream{bad, good}
 
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers)
 
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
@@ -463,38 +379,17 @@ test_a_reply_the_clients_question_cannot_use_is_asked_elsewhere :: proc(t: ^test
 		if !bad_ok {
 			return
 		}
-		defer {
-			sync.atomic_store(&broken.stop, true)
-			thread.join(bad_thread)
-			thread.destroy(bad_thread)
-			net.close(broken.socket)
-			destroy(bad)
-		}
+		defer stop_udp_mock(&broken, bad_thread, bad)
 
 		good, good_thread, good_ok := start_canned_mock(t, &answerer, "answerer", canned_reply(0))
 		if !good_ok {
 			return
 		}
-		defer {
-			sync.atomic_store(&answerer.stop, true)
-			thread.join(good_thread)
-			thread.destroy(good_thread)
-			net.close(answerer.socket)
-			destroy(good)
-		}
+		defer stop_udp_mock(&answerer, good_thread, good)
 
-		servers := make([]^Upstream, 2, context.allocator)
-		defer delete(servers, context.allocator)
-		servers[0] = bad
-		servers[1] = good
+		servers := []^Upstream{bad, good}
 
-		g := Group {
-			servers   = servers,
-			strategy  = .Failover,
-			timeout   = time.Second,
-			attempts  = 1,
-			allocator = context.allocator,
-		}
+		g := failover_group(servers)
 
 		wire := canned_query()
 		testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
@@ -588,38 +483,17 @@ test_an_extended_error_that_names_the_reason_is_the_answer :: proc(t: ^testing.T
 		if !bad_ok {
 			return
 		}
-		defer {
-			sync.atomic_store(&broken.stop, true)
-			thread.join(bad_thread)
-			thread.destroy(bad_thread)
-			net.close(broken.socket)
-			destroy(bad)
-		}
+		defer stop_udp_mock(&broken, bad_thread, bad)
 
 		good, good_thread, good_ok := start_canned_mock(t, &answerer, "answerer", canned_reply(0))
 		if !good_ok {
 			return
 		}
-		defer {
-			sync.atomic_store(&answerer.stop, true)
-			thread.join(good_thread)
-			thread.destroy(good_thread)
-			net.close(answerer.socket)
-			destroy(good)
-		}
+		defer stop_udp_mock(&answerer, good_thread, good)
 
-		servers := make([]^Upstream, 2, context.allocator)
-		defer delete(servers, context.allocator)
-		servers[0] = bad
-		servers[1] = good
+		servers := []^Upstream{bad, good}
 
-		g := Group {
-			servers   = servers,
-			strategy  = .Failover,
-			timeout   = time.Second,
-			attempts  = 1,
-			allocator = context.allocator,
-		}
+		g := failover_group(servers)
 
 		wire := canned_query()
 		testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
@@ -685,25 +559,11 @@ test_a_lone_upstreams_servfail_is_still_the_clients_answer :: proc(t: ^testing.T
 	if !bad_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&broken.stop, true)
-		thread.join(bad_thread)
-		thread.destroy(bad_thread)
-		net.close(broken.socket)
-		destroy(bad)
-	}
+	defer stop_udp_mock(&broken, bad_thread, bad)
 
-	servers := make([]^Upstream, 1, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = bad
+	servers := []^Upstream{bad}
 
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = time.Second,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers)
 
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
@@ -739,31 +599,12 @@ skipped exchange, only the wait it would have cost.
 */
 @(test)
 test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testing.T) {
-	dead_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, derr == nil, "cannot bind the dead port: %v", derr) {
-		return
-	}
 	// Held open and never read: silent. Closed, it would refuse (issue #622).
+	dead, dead_socket, dead_ok := silent_upstream(t, "dead")
+	if !dead_ok {
+		return
+	}
 	defer net.close(dead_socket)
-	dead_bound, berr := net.bound_endpoint(dead_socket)
-	if !testing.expectf(t, berr == nil, "cannot read the dead port: %v", berr) {
-		return
-	}
-
-	dead, uerr := make_upstream(
-		config.Upstream_Spec {
-			name = "dead",
-			kind = .UDP,
-			address = "127.0.0.1",
-			port = dead_bound.port,
-		},
-		0,
-		time.Second,
-		context.allocator,
-	)
-	if !testing.expectf(t, uerr == .None, "cannot build the dead upstream: %v", uerr) {
-		return
-	}
 	defer destroy(dead)
 
 	refusing := Canned_Mock{}
@@ -771,27 +612,12 @@ test_the_sweep_does_not_wait_again_on_a_member_that_timed_out :: proc(t: ^testin
 	if !ref_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&refusing.stop, true)
-		thread.join(ref_thread)
-		thread.destroy(ref_thread)
-		net.close(refusing.socket)
-		destroy(ref)
-	}
+	defer stop_udp_mock(&refusing, ref_thread, ref)
 
-	servers := make([]^Upstream, 2, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = dead
-	servers[1] = ref
+	servers := []^Upstream{dead, ref}
 
 	TIMEOUT :: 200 * time.Millisecond
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = TIMEOUT,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, TIMEOUT)
 
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
@@ -840,66 +666,26 @@ test_a_live_spare_behind_a_dead_one_is_reached_once_the_dead_one_parks :: proc(t
 	if !ref_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&refusing.stop, true)
-		thread.join(ref_thread)
-		thread.destroy(ref_thread)
-		net.close(refusing.socket)
-		destroy(ref)
-	}
+	defer stop_udp_mock(&refusing, ref_thread, ref)
 
 	answerer := Canned_Mock{}
 	good, good_thread, good_ok := start_canned_mock(t, &answerer, "answerer", canned_reply(0))
 	if !good_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&answerer.stop, true)
-		thread.join(good_thread)
-		thread.destroy(good_thread)
-		net.close(answerer.socket)
-		destroy(good)
-	}
+	defer stop_udp_mock(&answerer, good_thread, good)
 
-	dead_socket, derr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, derr == nil, "cannot bind the dead port: %v", derr) {
-		return
-	}
 	// Held open and never read: silent. Closed, it would refuse (issue #622).
+	dead, dead_socket, dead_ok := silent_upstream(t, "not-there")
+	if !dead_ok {
+		return
+	}
 	defer net.close(dead_socket)
-	dead_bound, berr := net.bound_endpoint(dead_socket)
-	if !testing.expectf(t, berr == nil, "cannot read the dead port: %v", berr) {
-		return
-	}
-	dead, uerr := make_upstream(
-		config.Upstream_Spec {
-			name = "not-there",
-			kind = .UDP,
-			address = "127.0.0.1",
-			port = dead_bound.port,
-		},
-		0,
-		time.Second,
-		context.allocator,
-	)
-	if !testing.expectf(t, uerr == .None, "cannot build the dead upstream: %v", uerr) {
-		return
-	}
 	defer destroy(dead)
 
-	servers := make([]^Upstream, 3, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = ref
-	servers[1] = dead
-	servers[2] = good
+	servers := []^Upstream{ref, dead, good}
 
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = 400 * time.Millisecond,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, 400 * time.Millisecond)
 
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
@@ -950,71 +736,31 @@ closed, they would refuse at once (issue #622) and prove nothing.
 */
 @(test)
 test_the_sweep_spends_one_timeout_on_the_members_it_has_left :: proc(t: ^testing.T) {
-	// The socket is held open and never read until the caller closes it.
-	dead_upstream :: proc(t: ^testing.T, name: string) -> (^Upstream, net.UDP_Socket, bool) {
-		socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-		if !testing.expectf(t, serr == nil, "cannot bind a dead port: %v", serr) {
-			return nil, {}, false
-		}
-		bound, berr := net.bound_endpoint(socket)
-		if !testing.expectf(t, berr == nil, "cannot read a dead port: %v", berr) {
-			net.close(socket)
-			return nil, {}, false
-		}
-		u, uerr := make_upstream(
-			config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port},
-			0,
-			time.Second,
-			context.allocator,
-		)
-		if !testing.expectf(t, uerr == .None, "cannot build %s: %v", name, uerr) {
-			net.close(socket)
-			return nil, {}, false
-		}
-		return u, socket, true
-	}
-
 	refusing := Canned_Mock{}
 	ref, ref_thread, ref_ok := start_canned_mock(t, &refusing, "refusing", canned_reply(0, .Refused))
 	if !ref_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&refusing.stop, true)
-		thread.join(ref_thread)
-		thread.destroy(ref_thread)
-		net.close(refusing.socket)
-		destroy(ref)
-	}
+	defer stop_udp_mock(&refusing, ref_thread, ref)
 
 	// Silent, not refusing: each socket is bound until the end and never read.
-	first, first_socket, first_ok := dead_upstream(t, "spare-one")
+	first, first_socket, first_ok := silent_upstream(t, "spare-one")
 	if !first_ok {
 		return
 	}
 	defer net.close(first_socket)
 	defer destroy(first)
-	second, second_socket, second_ok := dead_upstream(t, "spare-two")
+	second, second_socket, second_ok := silent_upstream(t, "spare-two")
 	if !second_ok {
 		return
 	}
 	defer net.close(second_socket)
 	defer destroy(second)
 
-	servers := make([]^Upstream, 3, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = ref
-	servers[1] = first
-	servers[2] = second
+	servers := []^Upstream{ref, first, second}
 
 	TIMEOUT :: 200 * time.Millisecond
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = TIMEOUT,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, TIMEOUT)
 
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
@@ -1118,13 +864,7 @@ test_a_member_the_sweep_reaches_is_judged_on_the_groups_timeout :: proc(t: ^test
 	if !ref_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&refusing.stop, true)
-		thread.join(ref_thread)
-		thread.destroy(ref_thread)
-		net.close(refusing.socket)
-		destroy(ref)
-	}
+	defer stop_udp_mock(&refusing, ref_thread, ref)
 
 	// Only ever a deadline: the member answers at once, so nothing waits on it.
 	TIMEOUT :: 2 * time.Second
@@ -1158,18 +898,9 @@ test_a_member_the_sweep_reaches_is_judged_on_the_groups_timeout :: proc(t: ^test
 		net.close(listener)
 	}
 
-	servers := make([]^Upstream, 2, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = ref
-	servers[1] = good
+	servers := []^Upstream{ref, good}
 
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = TIMEOUT,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, TIMEOUT)
 
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
@@ -1229,26 +960,14 @@ test_a_member_that_fails_for_free_does_not_end_the_sweep :: proc(t: ^testing.T) 
 	if !ref_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&refusing.stop, true)
-		thread.join(ref_thread)
-		thread.destroy(ref_thread)
-		net.close(refusing.socket)
-		destroy(ref)
-	}
+	defer stop_udp_mock(&refusing, ref_thread, ref)
 
 	answerer := Canned_Mock{}
 	good, good_thread, good_ok := start_canned_mock(t, &answerer, "answerer", canned_reply(0))
 	if !good_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&answerer.stop, true)
-		thread.join(good_thread)
-		thread.destroy(good_thread)
-		net.close(answerer.socket)
-		destroy(good)
-	}
+	defer stop_udp_mock(&answerer, good_thread, good)
 
 	// A name rather than an address, and no bootstrap servers to turn it into
 	// one: `bootstrap_resolve` gives up without a query, which is the free
@@ -1270,19 +989,9 @@ test_a_member_that_fails_for_free_does_not_end_the_sweep :: proc(t: ^testing.T) 
 	}
 	defer destroy(stuck)
 
-	servers := make([]^Upstream, 3, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = ref
-	servers[1] = stuck
-	servers[2] = good
+	servers := []^Upstream{ref, stuck, good}
 
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = 400 * time.Millisecond,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, 400 * time.Millisecond)
 
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")
@@ -1331,13 +1040,7 @@ test_the_budget_counts_a_slow_refusal_as_time_spent :: proc(t: ^testing.T) {
 	if !ref_ok {
 		return
 	}
-	defer {
-		sync.atomic_store(&refusing.stop, true)
-		thread.join(ref_thread)
-		thread.destroy(ref_thread)
-		net.close(refusing.socket)
-		destroy(ref)
-	}
+	defer stop_udp_mock(&refusing, ref_thread, ref)
 
 	// Heap rather than the stack: the responder threads read their mocks until
 	// they are stopped below, and a slice keeps each one's address stable.
@@ -1377,13 +1080,7 @@ test_the_budget_counts_a_slow_refusal_as_time_spent :: proc(t: ^testing.T) {
 		servers[i + 1] = slow[i]
 	}
 
-	g := Group {
-		servers   = servers,
-		strategy  = .Failover,
-		timeout   = TIMEOUT,
-		attempts  = 1,
-		allocator = context.allocator,
-	}
+	g := failover_group(servers, TIMEOUT)
 
 	wire := canned_query()
 	testing.expect(t, len(wire) > dns.HEADER_SIZE, "the query did not encode")

@@ -54,16 +54,7 @@ test_io_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 
 @(private = "file")
 test_io_write :: proc(user: rawptr, buf: []u8) -> bool {
-	tc := cast(^Test_Conn)user
-	sent := 0
-	for sent < len(buf) {
-		n, err := net.send_tcp(tc.socket, buf[sent:])
-		if err != nil || n <= 0 {
-			return false
-		}
-		sent += n
-	}
-	return true
+	return test_send((^Test_Conn)(user).socket, buf)
 }
 
 @(private = "file")
@@ -111,8 +102,19 @@ test_close_client :: proc(ct: ^thread.Thread, tc: ^Test_Conn) {
 	free(tc)
 }
 
-// Runs a real server-side Conn over one accepted connection, using `handler`
+// Runs a real server-side Conn over an accepted connection, using `handler`
 // to answer every request.
+@(private = "file")
+serve_socket :: proc(socket: net.TCP_Socket, handler: Handler) {
+	tc := new(Test_Conn)
+	tc.socket = socket
+	defer free(tc)
+	hc := make_conn(IO{user = tc, read = test_io_read, write = test_io_write}, handler, nil)
+	serve(hc)
+	conn_wait_idle(hc)
+	conn_unref(hc)
+}
+
 @(private = "file")
 Test_Server :: struct {
 	listener: net.TCP_Socket,
@@ -125,17 +127,71 @@ test_server_once :: proc(s: ^Test_Server) {
 	if err != nil {
 		return
 	}
-	tc := new(Test_Conn)
-	tc.socket = client
-	defer {
-		net.close(client)
-		free(tc)
+	defer net.close(client)
+	serve_socket(client, s.handler)
+}
+
+/*
+The peer a client test dials, on a thread of its own. It accepts one
+connection and either serves it with a real `Conn` on `handler`, or takes the
+client preface and hands the socket to `script` with `data`.
+*/
+@(private = "file")
+Peer :: struct {
+	handler:  Handler,
+	script:   proc(peer: net.TCP_Socket, data: rawptr),
+	data:     rawptr,
+	listener: net.TCP_Socket,
+	server:   ^thread.Thread,
+	c:        ^Client,
+	ct:       ^thread.Thread,
+	tc:       ^Test_Conn,
+}
+
+@(private = "file")
+run_peer :: proc(p: ^Peer) {
+	socket, _, err := net.accept_tcp(p.listener)
+	if err != nil {
+		return
 	}
-	io := IO{user = tc, read = test_io_read, write = test_io_write}
-	hc := make_conn(io, s.handler, nil)
-	serve(hc)
-	conn_wait_idle(hc)
-	conn_unref(hc)
+	defer net.close(socket)
+	if p.handler != nil {
+		serve_socket(socket, p.handler)
+		return
+	}
+	preface: [len(PREFACE)]u8
+	if test_recv_full(socket, preface[:]) {
+		p.script(socket, p.data)
+	}
+}
+
+// Listens, starts the peer, and dials a client to it. `end_peer` undoes it all.
+@(private = "file")
+start_peer :: proc(t: ^testing.T, p: ^Peer) -> bool {
+	bound: net.Endpoint
+	ok: bool
+	p.listener, bound, ok = test_listen(t)
+	if !ok {
+		return false
+	}
+	p.server = thread.create_and_start_with_poly_data(p, run_peer)
+	p.c, p.ct, p.tc, ok = test_dial_client(t, bound)
+	if !ok {
+		thread.join(p.server)
+		thread.destroy(p.server)
+		net.close(p.listener)
+	}
+	return ok
+}
+
+// The client first, so the peer sees it go, then the peer.
+@(private = "file")
+end_peer :: proc(p: ^Peer) {
+	test_close_client(p.ct, p.tc)
+	client_unref(p.c)
+	thread.join(p.server)
+	thread.destroy(p.server)
+	net.close(p.listener)
 }
 
 @(private = "file")
@@ -149,29 +205,14 @@ echo_handler :: proc(conn: ^Conn, req: ^Request) {
 @(test)
 test_client_request_round_trip :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
+	allocator := track_allocations(&track)
 
-	listener, bound, lok := test_listen(t)
-	if !lok {
+	p := Peer{handler = echo_handler}
+	if !start_peer(t, &p) {
 		return
 	}
-	srv := Test_Server{listener = listener, handler = echo_handler}
-	server_thread := thread.create_and_start_with_poly_data(&srv, test_server_once)
-	defer {
-		thread.join(server_thread)
-		thread.destroy(server_thread)
-		net.close(listener)
-	}
-
-	c, ct, tc, cok := test_dial_client(t, bound)
-	if !cok {
-		return
-	}
-	defer {
-		test_close_client(ct, tc)
-		client_unref(c)
-	}
+	defer end_peer(&p)
+	c := p.c
 
 	want := []u8{0xde, 0xad, 0xbe, 0xef}
 	resp, err := client_request(
@@ -186,7 +227,7 @@ test_client_request_round_trip :: proc(t: ^testing.T) {
 			body = want,
 		},
 		2 * time.Second,
-		mem.tracking_allocator(&track),
+		allocator,
 	)
 	testing.expectf(t, err == .None, "request failed: %v", err)
 	testing.expect_value(t, resp.status, 200)
@@ -194,36 +235,20 @@ test_client_request_round_trip :: proc(t: ^testing.T) {
 	if len(resp.body) == len(want) {
 		testing.expect(t, string(resp.body) == string(want), "body was not echoed back unchanged")
 	}
-	delete(resp.body, mem.tracking_allocator(&track))
+	delete(resp.body, allocator)
 
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%d bytes still held, allocated at %v", entry.size, entry.location)
-	}
+	expect_no_leaks(t, &track, "round trip")
 	free_all(context.temp_allocator)
 }
 
 @(test)
 test_client_multiplexes_concurrent_streams :: proc(t: ^testing.T) {
-	listener, bound, lok := test_listen(t)
-	if !lok {
+	p := Peer{handler = echo_handler}
+	if !start_peer(t, &p) {
 		return
 	}
-	srv := Test_Server{listener = listener, handler = echo_handler}
-	server_thread := thread.create_and_start_with_poly_data(&srv, test_server_once)
-	defer {
-		thread.join(server_thread)
-		thread.destroy(server_thread)
-		net.close(listener)
-	}
-
-	c, ct, tc, cok := test_dial_client(t, bound)
-	if !cok {
-		return
-	}
-	defer {
-		test_close_client(ct, tc)
-		client_unref(c)
-	}
+	defer end_peer(&p)
+	c := p.c
 
 	N :: 8
 	Leg :: struct {
@@ -405,20 +430,7 @@ the peer chose (#525).
 */
 @(test)
 test_client_oversized_response_during_upload_is_too_large :: proc(t: ^testing.T) {
-	listener, bound, lok := test_listen(t)
-	if !lok {
-		return
-	}
-	run_script :: proc(listener: net.TCP_Socket) {
-		client, _, err := net.accept_tcp(listener)
-		if err != nil {
-			return
-		}
-		defer net.close(client)
-		preface: [len(PREFACE)]u8
-		if !test_recv_full(client, preface[:]) {
-			return
-		}
+	run_script :: proc(client: net.TCP_Socket, _: rawptr) {
 		if _, ok := test_wait_for_frame_type(client, .Headers); !ok {
 			return
 		}
@@ -437,21 +449,12 @@ test_client_oversized_response_during_upload_is_too_large :: proc(t: ^testing.T)
 		}
 		_, _ = test_wait_for_frame_type(client, .Rst_Stream)
 	}
-	server_thread := thread.create_and_start_with_poly_data(listener, run_script)
-	defer {
-		thread.join(server_thread)
-		thread.destroy(server_thread)
-		net.close(listener)
-	}
-
-	c, ct, tc, cok := test_dial_client(t, bound)
-	if !cok {
+	p := Peer{script = run_script}
+	if !start_peer(t, &p) {
 		return
 	}
-	defer {
-		test_close_client(ct, tc)
-		client_unref(c)
-	}
+	defer end_peer(&p)
+	c := p.c
 
 	// Past the peer's initial window, so the upload waits for credit that never comes.
 	body := make([]u8, 2 * 65535, context.temp_allocator)
@@ -476,51 +479,25 @@ test_client_request_reset_by_peer :: proc(t: ^testing.T) {
 
 @(private = "file")
 expect_client_reset_as :: proc(t: ^testing.T, code: Error_Code, want: Client_Error) {
-	listener, bound, lok := test_listen(t)
-	if !lok {
-		return
-	}
-
-	Script :: struct {
-		listener: net.TCP_Socket,
-		code:     Error_Code,
-	}
-	run_script :: proc(s: ^Script) {
-		client, _, err := net.accept_tcp(s.listener)
-		if err != nil {
-			return
-		}
-		defer net.close(client)
-		// Client preface, then whatever it sends, until its request HEADERS.
-		preface: [len(PREFACE)]u8
-		if !test_recv_full(client, preface[:]) {
-			return
-		}
+	run_script :: proc(client: net.TCP_Socket, data: rawptr) {
+		code := (^Error_Code)(data)^
+		// Whatever the client sends after its preface, until its request HEADERS.
 		_, ok := test_wait_for_frame_type(client, .Headers)
 		if !ok {
 			return
 		}
 		out := make([dynamic]u8, 0, 13, context.temp_allocator)
 		write_frame_header(&out, 4, .Rst_Stream, 0, 1)
-		append_u32(&out, u32(s.code))
+		append_u32(&out, u32(code))
 		_ = test_send(client, out[:])
 	}
-	srv := Script{listener = listener, code = code}
-	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
-	defer {
-		thread.join(server_thread)
-		thread.destroy(server_thread)
-		net.close(listener)
-	}
-
-	c, ct, tc, cok := test_dial_client(t, bound)
-	if !cok {
+	reset_code := code
+	p := Peer{script = run_script, data = &reset_code}
+	if !start_peer(t, &p) {
 		return
 	}
-	defer {
-		test_close_client(ct, tc)
-		client_unref(c)
-	}
+	defer end_peer(&p)
+	c := p.c
 
 	_, err := client_request(
 		c,
@@ -533,24 +510,7 @@ expect_client_reset_as :: proc(t: ^testing.T, code: Error_Code, want: Client_Err
 
 @(test)
 test_client_goaway_closes_the_connection :: proc(t: ^testing.T) {
-	listener, bound, lok := test_listen(t)
-	if !lok {
-		return
-	}
-
-	Script :: struct {
-		listener: net.TCP_Socket,
-	}
-	run_script :: proc(s: ^Script) {
-		client, _, err := net.accept_tcp(s.listener)
-		if err != nil {
-			return
-		}
-		defer net.close(client)
-		preface: [len(PREFACE)]u8
-		if !test_recv_full(client, preface[:]) {
-			return
-		}
+	run_script :: proc(client: net.TCP_Socket, _: rawptr) {
 		_, ok := test_wait_for_frame_type(client, .Headers)
 		if !ok {
 			return
@@ -561,22 +521,12 @@ test_client_goaway_closes_the_connection :: proc(t: ^testing.T) {
 		append_u32(&out, u32(Error_Code.No_Error))
 		_ = test_send(client, out[:])
 	}
-	srv := Script{listener = listener}
-	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
-	defer {
-		thread.join(server_thread)
-		thread.destroy(server_thread)
-		net.close(listener)
-	}
-
-	c, ct, tc, cok := test_dial_client(t, bound)
-	if !cok {
+	p := Peer{script = run_script}
+	if !start_peer(t, &p) {
 		return
 	}
-	defer {
-		test_close_client(ct, tc)
-		client_unref(c)
-	}
+	defer end_peer(&p)
+	c := p.c
 
 	_, err := client_request(
 		c,
@@ -598,39 +548,13 @@ test_client_closes_connection_once_stream_ids_are_exhausted :: proc(t: ^testing.
 	// real requests, this drives the counter to the boundary directly and
 	// checks client_request refuses to allocate past it instead of wrapping
 	// the id and reusing one still live in c.streams.
-	listener, bound, lok := test_listen(t)
-	if !lok {
+	// The peer takes the preface and nothing else.
+	p := Peer{script = proc(client: net.TCP_Socket, _: rawptr) {}}
+	if !start_peer(t, &p) {
 		return
 	}
-
-	Script :: struct {
-		listener: net.TCP_Socket,
-	}
-	run_script :: proc(s: ^Script) {
-		client, _, err := net.accept_tcp(s.listener)
-		if err != nil {
-			return
-		}
-		defer net.close(client)
-		preface: [len(PREFACE)]u8
-		_ = test_recv_full(client, preface[:])
-	}
-	srv := Script{listener = listener}
-	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
-	defer {
-		thread.join(server_thread)
-		thread.destroy(server_thread)
-		net.close(listener)
-	}
-
-	c, ct, tc, cok := test_dial_client(t, bound)
-	if !cok {
-		return
-	}
-	defer {
-		test_close_client(ct, tc)
-		client_unref(c)
-	}
+	defer end_peer(&p)
+	c := p.c
 
 	loop.lock(&c.mu)
 	c.next_stream_id = 0x8000_0001
@@ -654,10 +578,6 @@ test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^te
 	// client_request's wait loop. That waiter must be woken by the close, not
 	// left to fall through on its own deadline and come back as a
 	// misclassified Timeout.
-	listener, bound, lok := test_listen(t)
-	if !lok {
-		return
-	}
 
 	// The mock holds the accepted socket open until the test explicitly
 	// releases it, rather than closing it after a fixed sleep: closing it
@@ -665,20 +585,11 @@ test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^te
 	// the connection, waking stream A for a reason unrelated to the one this
 	// test checks and masking a missing broadcast in the exhaustion branch.
 	Script :: struct {
-		listener:     net.TCP_Socket,
 		headers_seen: bool,
 		stop:         bool,
 	}
-	run_script :: proc(s: ^Script) {
-		client, _, err := net.accept_tcp(s.listener)
-		if err != nil {
-			return
-		}
-		defer net.close(client)
-		preface: [len(PREFACE)]u8
-		if !test_recv_full(client, preface[:]) {
-			return
-		}
+	run_script :: proc(client: net.TCP_Socket, data: rawptr) {
+		s := (^Script)(data)
 		// This is stream A's HEADERS; never respond to it.
 		if _, ok := test_wait_for_frame_type(client, .Headers); ok {
 			sync.atomic_store(&s.headers_seen, true)
@@ -687,26 +598,17 @@ test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^te
 			time.sleep(10 * time.Millisecond)
 		}
 	}
-	srv := Script{listener = listener}
-	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
-	defer {
-		// Set before joining, not just at the end of the happy path: an early
-		// return between here and there would otherwise leave run_script
-		// spinning on `stop` forever and this join hanging with it.
-		sync.atomic_store(&srv.stop, true)
-		thread.join(server_thread)
-		thread.destroy(server_thread)
-		net.close(listener)
-	}
-
-	c, ct, tc, cok := test_dial_client(t, bound)
-	if !cok {
+	srv: Script
+	p := Peer{script = run_script, data = &srv}
+	if !start_peer(t, &p) {
 		return
 	}
-	defer {
-		test_close_client(ct, tc)
-		client_unref(c)
-	}
+	defer end_peer(&p)
+	c := p.c
+	// Set before `end_peer` joins the peer, not just at the end of the happy
+	// path: an early return between here and there would otherwise leave
+	// run_script spinning on `stop` forever and that join hanging with it.
+	defer sync.atomic_store(&srv.stop, true)
 
 	// One id short of exhaustion: stream A's request takes the last valid id,
 	// so a second request right behind it is the one that trips the close.
@@ -734,7 +636,7 @@ test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^te
 		// join is idempotent (checked below too, to read w's fields at a known
 		// point); destroy is not, so it only happens here. Deferred rather
 		// than left to the explicit call below so an early return before that
-		// point can't let the test_close_client/client_unref defer above free
+		// point can't let the `end_peer` defer above free
 		// `c` while `a` is still inside client_request using it.
 		thread.join(a)
 		thread.destroy(a)
@@ -774,28 +676,12 @@ test_client_refuses_frame_larger_than_advertised_max :: proc(t: ^testing.T) {
 	window, 64x that. An upstream told one size and allowed another could send a
 	frame in between; the client should refuse it as a FRAME_SIZE_ERROR.
 	*/
-	listener, bound, lok := test_listen(t)
-	if !lok {
-		return
-	}
-
 	Script :: struct {
-		listener: net.TCP_Socket,
-		done:     sync.Wait_Group,
-		saw:      bool,
-		code:     Error_Code,
+		saw:  bool,
+		code: Error_Code,
 	}
-	run_script :: proc(s: ^Script) {
-		defer sync.wait_group_done(&s.done)
-		client, _, err := net.accept_tcp(s.listener)
-		if err != nil {
-			return
-		}
-		defer net.close(client)
-		preface: [len(PREFACE)]u8
-		if !test_recv_full(client, preface[:]) {
-			return
-		}
+	run_script :: proc(client: net.TCP_Socket, data: rawptr) {
+		s := (^Script)(data)
 		if _, ok := test_wait_for_frame_type(client, .Headers); !ok {
 			return
 		}
@@ -829,23 +715,13 @@ test_client_refuses_frame_larger_than_advertised_max :: proc(t: ^testing.T) {
 			}
 		}
 	}
-	srv := Script{listener = listener}
-	sync.wait_group_add(&srv.done, 1)
-	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
-	defer {
-		thread.join(server_thread)
-		thread.destroy(server_thread)
-		net.close(listener)
-	}
-
-	c, ct, tc, cok := test_dial_client(t, bound)
-	if !cok {
+	srv: Script
+	p := Peer{script = run_script, data = &srv}
+	if !start_peer(t, &p) {
 		return
 	}
-	defer {
-		test_close_client(ct, tc)
-		client_unref(c)
-	}
+	defer end_peer(&p)
+	c := p.c
 
 	_, err := client_request(
 		c,
@@ -854,7 +730,8 @@ test_client_refuses_frame_larger_than_advertised_max :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, err, Client_Error.Closed)
 
-	sync.wait_group_wait(&srv.done)
+	// The peer is done once it has read the GOAWAY or lost the connection.
+	thread.join(p.server)
 	testing.expect(t, srv.saw, "the client did not GOAWAY an oversized frame")
 	testing.expect_value(t, srv.code, Error_Code.Frame_Size_Error)
 	free_all(context.temp_allocator)
@@ -862,47 +739,17 @@ test_client_refuses_frame_larger_than_advertised_max :: proc(t: ^testing.T) {
 
 @(test)
 test_client_request_times_out_on_silence :: proc(t: ^testing.T) {
-	listener, bound, lok := test_listen(t)
-	if !lok {
-		return
-	}
-
-	Script :: struct {
-		listener: net.TCP_Socket,
-		done:     sync.Wait_Group,
-	}
-	run_script :: proc(s: ^Script) {
-		client, _, err := net.accept_tcp(s.listener)
-		defer sync.wait_group_done(&s.done)
-		if err != nil {
-			return
-		}
-		defer net.close(client)
-		preface: [len(PREFACE)]u8
-		if !test_recv_full(client, preface[:]) {
-			return
-		}
+	run_script :: proc(client: net.TCP_Socket, _: rawptr) {
 		_, _ = test_wait_for_frame_type(client, .Headers)
 		// And then say nothing at all.
 		time.sleep(2 * time.Second)
 	}
-	srv := Script{listener = listener}
-	sync.wait_group_add(&srv.done, 1)
-	server_thread := thread.create_and_start_with_poly_data(&srv, run_script)
-	defer {
-		thread.join(server_thread)
-		thread.destroy(server_thread)
-		net.close(listener)
-	}
-
-	c, ct, tc, cok := test_dial_client(t, bound)
-	if !cok {
+	p := Peer{script = run_script}
+	if !start_peer(t, &p) {
 		return
 	}
-	defer {
-		test_close_client(ct, tc)
-		client_unref(c)
-	}
+	defer end_peer(&p)
+	c := p.c
 
 	started := time.tick_now()
 	_, err := client_request(
@@ -918,11 +765,6 @@ test_client_request_times_out_on_silence :: proc(t: ^testing.T) {
 
 @(test)
 test_client_reuses_connection_across_requests :: proc(t: ^testing.T) {
-	listener, bound, lok := test_listen(t)
-	if !lok {
-		return
-	}
-
 	/*
 	Answers each request with the stream ID it arrived on. A connection numbers
 	the client's streams 1, 3, 5, ... (RFC 9113 section 5.1.1), so five requests
@@ -935,38 +777,12 @@ test_client_reuses_connection_across_requests :: proc(t: ^testing.T) {
 		body[0] = u8(req.stream_id)
 		respond(conn, req.stream_id, Response{status = 200, content_type = "application/dns-message", body = body})
 	}
-	serve_one :: proc(listener: net.TCP_Socket) {
-		client, _, err := net.accept_tcp(listener)
-		if err != nil {
-			return
-		}
-		tc := new(Test_Conn)
-		tc.socket = client
-		defer {
-			net.close(client)
-			free(tc)
-		}
-		io := IO{user = tc, read = test_io_read, write = test_io_write}
-		hc := make_conn(io, stream_id_handler, nil)
-		serve(hc)
-		conn_wait_idle(hc)
-		conn_unref(hc)
-	}
-	server_thread := thread.create_and_start_with_poly_data(listener, serve_one)
-	defer {
-		thread.join(server_thread)
-		thread.destroy(server_thread)
-		net.close(listener)
-	}
-
-	c, ct, tc, cok := test_dial_client(t, bound)
-	if !cok {
+	p := Peer{handler = stream_id_handler}
+	if !start_peer(t, &p) {
 		return
 	}
-	defer {
-		test_close_client(ct, tc)
-		client_unref(c)
-	}
+	defer end_peer(&p)
+	c := p.c
 
 	for i in 0 ..< 5 {
 		resp, err := client_request(
@@ -1035,11 +851,6 @@ retire_on_write :: proc(user: rawptr, buf: []u8) -> bool {
 	delete_key(&h.client.streams, h.stream_id)
 	h.retired = s
 	return true
-}
-
-@(private = "file")
-hook_read_nothing :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
-	return 0, false
 }
 
 /*
@@ -1132,21 +943,15 @@ test_data_frame_cannot_touch_an_abandoned_stream :: proc(t: ^testing.T) {
 	the lock.
 	*/
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
 	hook := Client_Close_Hook{}
-	c := client_make(IO{user = &hook, read = hook_read_nothing, write = retire_on_write}, allocator)
+	c := client_make(IO{user = &hook, read = no_read, write = retire_on_write}, allocator)
 	hook.client = c
 	hook.stream_id = 1
 
 	// The stream `client_request` would have opened, without the blocking wait.
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
-	c.streams[1] = s
+	open_test_stream(c, 1, allocator)
 
 	// One byte short of a batch, so this DATA's credit is written: the write
 	// the hook rides in on.
@@ -1163,53 +968,7 @@ test_data_frame_cannot_touch_an_abandoned_stream :: proc(t: ^testing.T) {
 	testing.expect(t, !back_in_map, "the retired stream was put back in the table")
 
 	client_stream_destroy(c, hook.retired)
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "data after abandon: %d bytes leaked, allocated at %v", entry.size, entry.location)
-	}
-}
-
-@(private = "file")
-Client_Frame_Log :: struct {
-	frames:      [dynamic]Frame_Header,
-	// Sum of the connection WINDOW_UPDATE increments written.
-	credit:      int,
-	// Error code of the last GOAWAY written.
-	goaway_code: Error_Code,
-	// Error code of the last RST_STREAM written.
-	rst_code:    Error_Code,
-}
-
-@(private = "file")
-client_log_write :: proc(user: rawptr, buf: []u8) -> bool {
-	log := cast(^Client_Frame_Log)user
-	if log == nil {
-		return true
-	}
-	pos := 0
-	// The preface is not a frame; skip it when it leads the buffer.
-	if len(buf) >= len(PREFACE) && string(buf[:len(PREFACE)]) == PREFACE {
-		pos = len(PREFACE)
-	}
-	for pos + FRAME_HEADER_SIZE <= len(buf) {
-		h, ok := parse_frame_header(buf[pos:])
-		if !ok {
-			break
-		}
-		append(&log.frames, h)
-		if h.type == .Window_Update && h.stream_id == 0 && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
-			log.credit += int(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
-		}
-		if h.type == .Goaway && pos + FRAME_HEADER_SIZE + 8 <= len(buf) {
-			log.goaway_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE + 4:]))
-		}
-		if h.type == .Rst_Stream && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
-			log.rst_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
-		}
-		pos += FRAME_HEADER_SIZE + h.length
-	}
-	return true
+	client_done(t, c, &track, "data after abandon")
 }
 
 @(test)
@@ -1222,41 +981,22 @@ test_oversized_response_returns_connection_credit :: proc(t: ^testing.T) {
 	using it, not just the one that overran.
 	*/
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
-	c.streams[1] = s
+	s := open_test_stream(c, 1, allocator)
 
 	clear(&log.frames)
 	payload := make([]u8, MAX_BODY + 1, context.temp_allocator)
 	client_handle_data(c, Frame_Header{length = len(payload), type = .Data, stream_id = 1}, payload)
 
-	credited := false
-	for f in log.frames {
-		if f.type == .Window_Update && f.stream_id == 0 {
-			credited = true
-		}
-	}
-	testing.expect(t, credited, "the connection window was not replenished for a response that was refused")
+	testing.expect(t, saw_frame(&log, .Window_Update, 0), "the connection window was not replenished for a response that was refused")
 
-	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "oversized response credit: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "oversized response credit", &log)
 }
 
 /*
@@ -1270,20 +1010,12 @@ streams past the maximum a byte at a time.
 @(test)
 test_client_settings_window_change_is_bounded :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
-	c.streams[1] = s
+	s := open_test_stream(c, 1, allocator)
 
 	grant := []u8{0x7f, 0xff, 0x00, 0x00} // MAX_WINDOW - DEFAULT_WINDOW
 	granted := client_handle_window_update(
@@ -1303,22 +1035,11 @@ test_client_settings_window_change_is_bounded :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, !accepted, "a settings change past the maximum window was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for a flow-control violation")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for a flow-control violation")
 
-	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "settings window overflow: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "settings window overflow", &log)
 }
 
 /*
@@ -1330,33 +1051,18 @@ recognizing the connection control stream can never hold one.
 @(test)
 test_client_data_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
 	body := []u8{'x'}
 	ok := client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 0}, body)
 	testing.expect(t, !ok, "DATA on stream 0 was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on stream 0")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for DATA on stream 0")
 
-	delete(log.frames)
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client data on stream zero: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client data on stream zero", &log)
 }
 
 /*
@@ -1370,33 +1076,18 @@ frame on ids this client never opened - the same amplification the server's
 @(test)
 test_client_data_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
 	body := []u8{'x'}
 	ok := client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 3}, body)
 	testing.expect(t, !ok, "DATA on an idle stream was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on an idle stream")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for DATA on an idle stream")
 
-	delete(log.frames)
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client data on an idle stream: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client data on an idle stream", &log)
 }
 
 /*
@@ -1409,34 +1100,19 @@ slips under that bound and reaches the ordinary not-found path.
 @(test)
 test_client_data_on_an_even_stream_is_rejected :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 	c.next_stream_id = 3
 
 	body := []u8{'x'}
 	ok := client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 2}, body)
 	testing.expect(t, !ok, "DATA on an even (server-initiated) stream was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for DATA on an even stream")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for DATA on an even stream")
 
-	delete(log.frames)
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client data on an even stream: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client data on an even stream", &log)
 }
 
 /*
@@ -1449,21 +1125,13 @@ reading as complete.
 @(test)
 test_client_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
+	s := open_test_stream(c, 1, allocator)
 	s.done = true
-	c.streams[1] = s
 
 	clear(&log.frames)
 	// One byte short of a batch, so the refused frame's credit is due on the wire.
@@ -1473,18 +1141,8 @@ test_client_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "DATA after END_STREAM should be a stream error, not a connection error")
 	testing.expect_value(t, len(s.body), 0)
 
-	saw_rst := false
-	saw_credit := false
-	for f in log.frames {
-		if f.type == .Rst_Stream && f.stream_id == 1 {
-			saw_rst = true
-		}
-		if f.type == .Window_Update && f.stream_id == 0 {
-			saw_credit = true
-		}
-	}
-	testing.expect(t, saw_rst, "no RST_STREAM was sent for DATA after END_STREAM")
-	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+	testing.expect(t, saw_frame(&log, .Rst_Stream, 1), "no RST_STREAM was sent for DATA after END_STREAM")
+	testing.expect(t, saw_frame(&log, .Window_Update, 0), "the connection window was not replenished for a frame that was refused")
 
 	/*
 	A peer that keeps sending after the first violation must not draw a fresh
@@ -1495,18 +1153,11 @@ test_client_data_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	clear(&log.frames)
 	ok2 := client_handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)
 	testing.expect(t, ok2, "a repeat violation should still be a stream error, not a connection error")
-	for f in log.frames {
-		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent for a stream already answered once")
-	}
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "a second RST_STREAM was sent for a stream already answered once")
 
-	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client data after end stream: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client data after end stream", &log)
 }
 
 /*
@@ -1517,21 +1168,13 @@ already reset must draw no RST_STREAM back, only its connection credit.
 @(test)
 test_client_data_on_a_peer_reset_stream_is_refused :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
+	s := open_test_stream(c, 1, allocator)
 	s.reset = true
-	c.streams[1] = s
 
 	clear(&log.frames)
 	// One byte short of a batch, so the refused frame's credit is due on the wire.
@@ -1541,23 +1184,12 @@ test_client_data_on_a_peer_reset_stream_is_refused :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "DATA on a peer-reset stream should be a stream error, not a connection error")
 	testing.expect_value(t, len(s.body), 0)
 
-	saw_credit := false
-	for f in log.frames {
-		testing.expectf(t, f.type != .Rst_Stream, "an RST_STREAM was sent answering a stream the peer had already reset")
-		if f.type == .Window_Update && f.stream_id == 0 {
-			saw_credit = true
-		}
-	}
-	testing.expect(t, saw_credit, "the connection window was not replenished for a frame that was refused")
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "an RST_STREAM was sent answering a stream the peer had already reset")
+	testing.expect(t, saw_frame(&log, .Window_Update, 0), "the connection window was not replenished for a frame that was refused")
 
-	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client data on a peer-reset stream: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client data on a peer-reset stream", &log)
 }
 
 /*
@@ -1570,14 +1202,10 @@ stripping and HPACK decode with no such check, unlike the server's
 @(test)
 test_client_headers_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
 	block := make([dynamic]u8, 0, 64, context.temp_allocator)
 	encode_header(&block, ":status", "200")
@@ -1588,20 +1216,9 @@ test_client_headers_on_stream_zero_is_rejected :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, !ok, "HEADERS on stream 0 was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for HEADERS on stream 0")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for HEADERS on stream 0")
 
-	delete(log.frames)
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client headers on stream zero: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client headers on stream zero", &log)
 }
 
 /*
@@ -1617,14 +1234,10 @@ not-found path.
 @(test)
 test_client_headers_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
 	block := make([dynamic]u8, 0, 64, context.temp_allocator)
 	encode_header(&block, ":status", "200")
@@ -1636,20 +1249,9 @@ test_client_headers_on_an_idle_stream_is_rejected :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, !ok, "HEADERS on an idle stream was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for HEADERS on an idle stream")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for HEADERS on an idle stream")
 
-	delete(log.frames)
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client headers on an idle stream: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client headers on an idle stream", &log)
 }
 
 /*
@@ -1664,22 +1266,14 @@ re-acquired.
 @(test)
 test_client_headers_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
+	s := open_test_stream(c, 1, allocator)
 	s.status = 200
 	s.done = true
-	c.streams[1] = s
 
 	clear(&log.frames)
 	block := make([dynamic]u8, 0, 64, context.temp_allocator)
@@ -1690,13 +1284,7 @@ test_client_headers_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "HEADERS after END_STREAM should be a stream error, not a connection error")
 	testing.expect_value(t, s.status, 200)
 
-	saw_rst := false
-	for f in log.frames {
-		if f.type == .Rst_Stream && f.stream_id == 1 {
-			saw_rst = true
-		}
-	}
-	testing.expect(t, saw_rst, "no RST_STREAM was sent for HEADERS after END_STREAM")
+	testing.expect(t, saw_frame(&log, .Rst_Stream, 1), "no RST_STREAM was sent for HEADERS after END_STREAM")
 
 	// A repeat violation must not draw a second RST_STREAM.
 	clear(&log.frames)
@@ -1705,18 +1293,11 @@ test_client_headers_after_end_stream_is_refused :: proc(t: ^testing.T) {
 	ok2 := client_finish_headers(c, 1)
 	testing.expect(t, ok2, "a repeat violation should still be a stream error, not a connection error")
 	testing.expect_value(t, s.status, 200)
-	for f in log.frames {
-		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent for a stream already answered once")
-	}
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "a second RST_STREAM was sent for a stream already answered once")
 
-	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client headers after end stream: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client headers after end stream", &log)
 }
 
 /*
@@ -1730,38 +1311,23 @@ on a stream this connection had itself just reset.
 @(test)
 test_client_send_body_stops_once_the_stream_is_reset_by_us :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
+	s := open_test_stream(c, 1, allocator)
 	s.rst_sent = true
-	c.streams[1] = s
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
 	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), time.Second))
 	testing.expect(t, !sent, "client_send_body wrote a body on a stream this connection had already reset")
-	for f in log.frames {
-		testing.expectf(t, f.type != .Data, "a DATA frame was written on a stream this connection had already reset")
-	}
+	testing.expect(t, !saw_frame(&log, .Data), "a DATA frame was written on a stream this connection had already reset")
 
-	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client send body after reset: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client send body after reset", &log)
 }
 
 /*
@@ -1776,49 +1342,30 @@ correct; reporting that as a failure is not.
 @(test)
 test_client_send_body_stops_successfully_on_an_early_response :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
+	s := open_test_stream(c, 1, allocator)
 	s.status = 413
 	s.done = true
-	c.streams[1] = s
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
 	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), time.Second))
 	testing.expect(t, sent, "an early response should stop the upload successfully, not report it as a failure")
-	saw_rst := false
-	for f in log.frames {
-		testing.expectf(t, f.type != .Data, "a DATA frame was written after the response had already arrived complete")
-		if f.type == .Rst_Stream && f.stream_id == 1 {
-			saw_rst = true
-		}
-	}
+	testing.expect(t, !saw_frame(&log, .Data), "a DATA frame was written after the response had already arrived complete")
 	testing.expect(
 		t,
-		saw_rst,
+		saw_frame(&log, .Rst_Stream, 1),
 		"no RST_STREAM(NO_ERROR) was sent for the abandoned upload - RFC 9113 8.1 asks for one so the peer does not hold the stream open forever",
 	)
 	testing.expect_value(t, s.status, 413)
 
-	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client send body on early response: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client send body on early response", &log)
 }
 
 /*
@@ -1832,40 +1379,25 @@ drew a second RST_STREAM from the very code meant to avoid exactly that.
 @(test)
 test_client_send_body_does_not_double_rst_a_stream_already_reset_by_us :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
+	s := open_test_stream(c, 1, allocator)
 	s.status = 413
 	s.done = true
 	s.rst_sent = true
-	c.streams[1] = s
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
 	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), time.Second))
 	testing.expect(t, sent, "an early response should stop the upload successfully")
-	for f in log.frames {
-		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent on a stream already reset by this connection")
-	}
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "a second RST_STREAM was sent on a stream already reset by this connection")
 
-	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client send body double rst: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client send body double rst", &log)
 }
 
 /*
@@ -1880,44 +1412,26 @@ life.
 @(test)
 test_client_send_body_resets_the_stream_on_a_flow_control_timeout :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
-	s := new(Client_Stream, allocator)
-	s.id = 1
+	s := open_test_stream(c, 1, allocator)
 	// No credit at all, so the wait loop has nothing to do but hit the deadline.
 	s.send_window = 0
 	c.send_window = 0
-	s.body = make([dynamic]u8, 0, 8, allocator)
-	c.streams[1] = s
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
 	sent := client_send_body(c, s, body, time.tick_add(time.tick_now(), -time.Second))
 	testing.expect(t, !sent, "client_send_body should give up once the deadline has passed")
 
-	saw_rst := false
-	for f in log.frames {
-		if f.type == .Rst_Stream && f.stream_id == 1 {
-			saw_rst = true
-		}
-	}
-	testing.expect(t, saw_rst, "no RST_STREAM was sent for an upload abandoned to a flow-control timeout")
+	testing.expect(t, saw_frame(&log, .Rst_Stream, 1), "no RST_STREAM was sent for an upload abandoned to a flow-control timeout")
 
-	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client send body flow control timeout: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client send body flow control timeout", &log)
 }
 
 /*
@@ -1929,33 +1443,18 @@ c.streams[0] - always a miss - and return true.
 @(test)
 test_client_rst_stream_on_stream_zero_is_a_connection_error :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
 	rst := []u8{0, 0, 0, 8} // CANCEL
 	ok := client_handle_frame(c, Frame_Header{length = len(rst), type = .Rst_Stream, stream_id = 0}, rst)
 	testing.expect(t, !ok, "RST_STREAM on stream 0 was accepted")
 
-	saw_goaway := false
-	for f in log.frames {
-		if f.type == .Goaway {
-			saw_goaway = true
-		}
-	}
-	testing.expect(t, saw_goaway, "no GOAWAY was sent for RST_STREAM on stream 0")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY was sent for RST_STREAM on stream 0")
 
-	delete(log.frames)
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client rst_stream on stream zero: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client rst_stream on stream zero", &log)
 }
 
 /*
@@ -1970,22 +1469,14 @@ RST_STREAM(NO_ERROR) - which RFC 9113 5.1 forbids.
 @(test)
 test_client_send_body_early_response_rst_suppresses_a_later_one :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
-	s := new(Client_Stream, allocator)
-	s.id = 1
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
+	s := open_test_stream(c, 1, allocator)
 	s.status = 413
 	s.done = true
-	c.streams[1] = s
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
@@ -1998,18 +1489,11 @@ test_client_send_body_early_response_rst_suppresses_a_later_one :: proc(t: ^test
 	extra := []u8{'x'}
 	dok := client_handle_data(c, Frame_Header{length = len(extra), type = .Data, stream_id = 1}, extra)
 	testing.expect(t, dok, "DATA in flight when the response arrived should still be a stream error, not a connection error")
-	for f in log.frames {
-		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent on a stream already closed with RST(NO_ERROR)")
-	}
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "a second RST_STREAM was sent on a stream already closed with RST(NO_ERROR)")
 
-	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client send body early response rst: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client send body early response rst", &log)
 }
 
 /*
@@ -2024,21 +1508,14 @@ stream closed with RST_STREAM.
 @(test)
 test_client_send_body_flow_control_timeout_rst_is_not_forgotten :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 
-	s := new(Client_Stream, allocator)
-	s.id = 1
+	s := open_test_stream(c, 1, allocator)
 	s.send_window = 0
 	c.send_window = 0
-	s.body = make([dynamic]u8, 0, 8, allocator)
-	c.streams[1] = s
 
 	clear(&log.frames)
 	body := []u8{1, 2, 3, 4}
@@ -2052,24 +1529,12 @@ test_client_send_body_flow_control_timeout_rst_is_not_forgotten :: proc(t: ^test
 	dok := client_handle_data(c, Frame_Header{length = len(extra), type = .Data, stream_id = 1}, extra)
 	testing.expect(t, dok, "DATA in flight when the timeout fired should still be a stream error, not a connection error")
 	testing.expect_value(t, len(s.body), 0)
-	for f in log.frames {
-		testing.expectf(t, f.type != .Rst_Stream, "a second RST_STREAM was sent on a stream already reset by the flow-control timeout")
-		testing.expectf(t, !(f.type == .Window_Update && f.stream_id == 1), "a stream-level WINDOW_UPDATE was written on a stream this end had reset")
-	}
+	testing.expect(t, !saw_frame(&log, .Rst_Stream), "a second RST_STREAM was sent on a stream already reset by the flow-control timeout")
+	testing.expect(t, !saw_frame(&log, .Window_Update, 1), "a stream-level WINDOW_UPDATE was written on a stream this end had reset")
 
-	delete(log.frames)
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client send body flow control timeout rst: %d bytes leaked at %v", entry.size, entry.location)
-	}
-}
-
-@(private = "file")
-write_nothing :: proc(user: rawptr, buf: []u8) -> bool {
-	return true
+	client_done(t, c, &track, "client send body flow control timeout rst", &log)
 }
 
 /*
@@ -2107,17 +1572,11 @@ test_h2_status_is_three_digits :: proc(t: ^testing.T) {
 
 	for c in CASES {
 		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		allocator := mem.tracking_allocator(&track)
+		allocator := track_allocations(&track)
 
-		client := client_make(IO{user = nil, read = hook_read_nothing, write = write_nothing}, allocator)
+		client := client_make(IO{read = no_read, write = discard_write}, allocator)
 
-		s := new(Client_Stream, allocator)
-		s.id = 1
-		s.send_window = client.peer_initial_window
-		s.body = make([dynamic]u8, 0, 8, allocator)
-		client.streams[1] = s
+		s := open_test_stream(client, 1, allocator)
 
 		block := make([dynamic]u8, 0, 64, context.temp_allocator)
 		encode_header(&block, ":status", c.value)
@@ -2127,11 +1586,7 @@ test_h2_status_is_three_digits :: proc(t: ^testing.T) {
 		testing.expectf(t, client_finish_headers(client, 1), "%s: the header block did not decode", c.what)
 		testing.expectf(t, s.status == c.status, "%s: %q came back as status %d, expected %d", c.what, c.value, s.status, c.status)
 
-		client_unref(client)
-		free_all(context.temp_allocator)
-		for _, entry in track.allocation_map {
-			testing.expectf(t, false, "%s: %d bytes leaked at %v", c.what, entry.size, entry.location)
-		}
+		client_done(t, client, &track, c.what)
 	}
 }
 
@@ -2148,11 +1603,9 @@ thread that never serves the responses behind it.
 @(test)
 test_client_empty_continuation_flood_is_refused :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	c := client_make(IO{user = nil, read = hook_read_nothing, write = write_nothing}, allocator)
+	c := client_make(IO{read = no_read, write = discard_write}, allocator)
 	c.continuation_on = 1
 
 	sent := 0
@@ -2166,11 +1619,7 @@ test_client_empty_continuation_flood_is_refused :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, refused, "%d empty CONTINUATION frames were all accepted", sent)
 
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "empty continuation flood")
 }
 
 @(private = "file")
@@ -2213,7 +1662,7 @@ test_client_request_sends_content_length :: proc(t: ^testing.T) {
 	log := Client_Header_Log {
 		block = make([dynamic]u8, 0, 128, context.temp_allocator),
 	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_headers})
+	c := client_make(IO{user = &log, read = no_read, write = client_log_headers})
 	defer client_unref(c)
 
 	body := []u8{0xde, 0xad, 0xbe, 0xef, 0x00}
@@ -2231,7 +1680,7 @@ test_client_request_sends_content_length :: proc(t: ^testing.T) {
 	)
 
 	table: Dynamic_Table
-	dynamic_table_init(&table, 4096, context.temp_allocator)
+	dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, context.temp_allocator)
 	headers, err := decode(&table, log.block[:], context.temp_allocator)
 	testing.expectf(t, err == .None, "the request's header block does not decode: %v", err)
 	length := ""
@@ -2268,14 +1717,10 @@ connection is told ENHANCE_YOUR_CALM and dropped.
 @(private = "file")
 expect_client_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payload: []u8, what: string) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 	// A window that opens in the future cannot roll over mid-burst.
 	c.control.window = time.tick_add(time.tick_now(), time.Hour)
 
@@ -2290,19 +1735,11 @@ expect_client_control_flood_refused :: proc(t: ^testing.T, h: Frame_Header, payl
 	}
 	testing.expectf(t, refused, "%s: %d frames in a burst were all answered", what, sent)
 	testing.expectf(t, sent == MAX_CONTROL_FRAMES_PER_SECOND + 1, "%s: refused at frame %d, not the first one over the budget", what, sent)
-	saw_goaway := false
-	for f in log.frames {
-		saw_goaway ||= f.type == .Goaway
-	}
-	testing.expectf(t, saw_goaway, "%s: the flood was dropped without a GOAWAY", what)
+	testing.expectf(t, saw_frame(&log, .Goaway), "%s: the flood was dropped without a GOAWAY", what)
 	testing.expectf(t, log.goaway_code == .Enhance_Your_Calm, "%s: GOAWAY said %v, not ENHANCE_YOUR_CALM", what, log.goaway_code)
 
 	delete(log.frames)
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%s: %d bytes leaked at %v", what, entry.size, entry.location)
-	}
+	client_done(t, c, &track, what)
 }
 
 @(test)
@@ -2319,7 +1756,7 @@ test_client_settings_flood_is_refused :: proc(t: ^testing.T) {
 // ACKs draw nothing back so are not charged, and a spent budget comes back.
 @(test)
 test_client_control_budget_refills_each_second :: proc(t: ^testing.T) {
-	c := client_make(IO{read = hook_read_nothing, write = client_log_write})
+	c := client_make(IO{read = no_read, write = log_write})
 	defer client_unref(c)
 	ping := Frame_Header{length = 8, type = .Ping}
 	payload := make([]u8, 8, context.temp_allocator)
@@ -2346,14 +1783,10 @@ it is due, and every byte of it is still returned or owed.
 @(test)
 test_client_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 8, allocator),
-	}
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
 	open_test_stream(c, 1, allocator)
 
 	clear(&log.frames)
@@ -2377,12 +1810,7 @@ test_client_tiny_data_frames_are_not_reflected :: proc(t: ^testing.T) {
 	testing.expectf(t, log.credit >= CREDIT_BATCH, "%d bytes read, only %d of credit returned", frames, log.credit)
 	testing.expectf(t, log.credit + c.credit_owed == frames, "%d bytes read, %d returned and %d owed", frames, log.credit, c.credit_owed)
 
-	delete(log.frames)
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client tiny data frames: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client tiny data frames", &log)
 }
 
 /*
@@ -2394,11 +1822,9 @@ rather than left to run it dry and stall its caller until the timeout.
 @(test)
 test_client_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
+	c := client_make(IO{read = no_read, write = log_write}, allocator)
 	s := open_test_stream(c, 1, allocator)
 	// Its response headers are in, so DATA is its body.
 	s.final = true
@@ -2422,11 +1848,7 @@ test_client_padding_cannot_stall_a_stream :: proc(t: ^testing.T) {
 
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client padded stream: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client padded stream")
 }
 
 /*
@@ -2437,11 +1859,9 @@ that many queries a second, and dropping it would fail every one in flight.
 @(test)
 test_client_answers_earn_back_the_control_budget :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
+	c := client_make(IO{read = no_read, write = log_write}, allocator)
 	c.control.window = time.tick_add(time.tick_now(), time.Hour)
 	block := make([dynamic]u8, 0, 16, context.temp_allocator)
 	encode_header(&block, ":status", "200")
@@ -2484,11 +1904,7 @@ test_client_answers_earn_back_the_control_budget :: proc(t: ^testing.T) {
 		doubled += 1
 	}
 	testing.expectf(t, doubled < 4 * MAX_CONTROL_FRAMES_PER_SECOND, "two PINGs per answer were never capped")
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client earned budget: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client earned budget")
 }
 
 /*
@@ -2499,11 +1915,9 @@ like the stream's first answer.
 @(test)
 test_client_one_stream_earns_one_frame :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
+	c := client_make(IO{read = no_read, write = log_write}, allocator)
 	c.control.window = time.tick_add(time.tick_now(), time.Hour)
 	c.control.frames = MAX_CONTROL_FRAMES_PER_SECOND
 	s := open_test_stream(c, 1, allocator)
@@ -2528,11 +1942,7 @@ test_client_one_stream_earns_one_frame :: proc(t: ^testing.T) {
 
 	client_stream_destroy(c, s)
 	delete_key(&c.streams, u32(1))
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client one stream: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client one stream")
 }
 
 // The order answers and PINGs arrive in does not matter: answers that come
@@ -2540,11 +1950,9 @@ test_client_one_stream_earns_one_frame :: proc(t: ^testing.T) {
 @(test)
 test_client_answers_before_pings_still_earn :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
-	mem.tracking_allocator_init(&track, context.allocator)
-	defer mem.tracking_allocator_destroy(&track)
-	allocator := mem.tracking_allocator(&track)
+	allocator := track_allocations(&track)
 
-	c := client_make(IO{read = hook_read_nothing, write = client_log_write}, allocator)
+	c := client_make(IO{read = no_read, write = log_write}, allocator)
 	c.control.window = time.tick_add(time.tick_now(), time.Hour)
 	block := make([dynamic]u8, 0, 16, context.temp_allocator)
 	encode_header(&block, ":status", "200")
@@ -2567,11 +1975,7 @@ test_client_answers_before_pings_still_earn :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, pinged, ANSWERS + MAX_CONTROL_FRAMES_PER_SECOND)
 
-	client_unref(c)
-	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "client answers first: %d bytes leaked at %v", entry.size, entry.location)
-	}
+	client_done(t, c, &track, "client answers first")
 }
 
 @(private = "file")
@@ -2593,7 +1997,7 @@ limit_request_run :: proc(r: ^Limit_Request) {
 
 // How many HEADERS the client has written, and the stream id of the last.
 @(private = "file")
-limit_opened :: proc(c: ^Client, log: ^Client_Frame_Log) -> (n: int, last: u32) {
+limit_opened :: proc(c: ^Client, log: ^Frame_Log) -> (n: int, last: u32) {
 	loop.lock(&c.mu)
 	defer loop.unlock(&c.mu)
 	for f in log.frames {
@@ -2607,7 +2011,7 @@ limit_opened :: proc(c: ^Client, log: ^Client_Frame_Log) -> (n: int, last: u32) 
 
 // Waits for the client to have written `want` HEADERS, for up to two seconds.
 @(private = "file")
-limit_wait_opened :: proc(c: ^Client, log: ^Client_Frame_Log, want: int) -> (last: u32, ok: bool) {
+limit_wait_opened :: proc(c: ^Client, log: ^Frame_Log, want: int) -> (last: u32, ok: bool) {
 	for _ in 0 ..< 400 {
 		n, id := limit_opened(c, log)
 		if n >= want {
@@ -2639,11 +2043,9 @@ working fine (#326). The request past the limit has to wait for a slot.
 */
 @(test)
 test_client_waits_for_a_stream_slot_under_the_peers_limit :: proc(t: ^testing.T) {
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 16),
-	}
+	log: Frame_Log
+	c := logged_client(&log)
 	defer delete(log.frames)
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
 	defer client_unref(c)
 
 	one := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 1}
@@ -2684,11 +2086,9 @@ deadline, and the connection dying. Neither may open a stream.
 */
 @(test)
 test_client_wait_for_a_stream_slot_ends_on_deadline_or_close :: proc(t: ^testing.T) {
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 16),
-	}
+	log: Frame_Log
+	c := logged_client(&log)
 	defer delete(log.frames)
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
 	defer client_unref(c)
 
 	// One slot, held by a stream that is never answered.
@@ -2742,11 +2142,9 @@ given up on at once instead, so the next query dials a fresh one.
 */
 @(test)
 test_client_a_zero_stream_limit_with_nothing_open_closes_the_connection :: proc(t: ^testing.T) {
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 16),
-	}
+	log: Frame_Log
+	c := logged_client(&log)
 	defer delete(log.frames)
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
 	defer client_unref(c)
 
 	zero := []u8{0, u8(Setting.Max_Concurrent_Streams), 0, 0, 0, 0}
@@ -2773,11 +2171,9 @@ before the waiter looks, the complete response still wins.
 */
 @(test)
 test_client_keeps_a_complete_response_reset_after_it_finished :: proc(t: ^testing.T) {
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 16),
-	}
+	log: Frame_Log
+	c := logged_client(&log)
 	defer delete(log.frames)
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
 	defer client_unref(c)
 
 	r := Limit_Request {
@@ -2807,11 +2203,9 @@ stream is answered, or until its own deadline.
 */
 @(test)
 test_client_a_raised_stream_limit_lets_a_waiting_request_in :: proc(t: ^testing.T) {
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 16),
-	}
+	log: Frame_Log
+	c := logged_client(&log)
 	defer delete(log.frames)
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
 	defer client_unref(c)
 
 	// One slot, held by a stream that is never answered.
@@ -2869,11 +2263,9 @@ among them when it shares the loop, and none of them would run again.
 */
 @(test)
 test_client_state_is_read_without_the_connection_lock :: proc(t: ^testing.T) {
-	log := Client_Frame_Log {
-		frames = make([dynamic]Frame_Header, 0, 16),
-	}
+	log: Frame_Log
+	c := logged_client(&log)
 	defer delete(log.frames)
-	c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
 	defer client_unref(c)
 
 	// A writer parked mid-frame, as far as anybody else can tell.
@@ -2919,17 +2311,12 @@ test_client_idle_stream_and_enable_push_protocol_errors :: proc(t: ^testing.T) {
 		{"WINDOW_UPDATE on the connection", {length = 4, type = .Window_Update}, {0, 0, 0x10, 0}, true},
 	}
 	for tc in cases {
-		log := Client_Frame_Log {
-			frames = make([dynamic]Frame_Header, 0, 8),
-		}
-		c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write})
+		log: Frame_Log
+		c := logged_client(&log)
 		// Stream 3 was allocated and has finished.
 		c.next_stream_id = 5
 		ok := client_handle_frame(c, tc.h, tc.payload)
-		saw_goaway := false
-		for f in log.frames {
-			saw_goaway ||= f.type == .Goaway
-		}
+		saw_goaway := saw_frame(&log, .Goaway)
 		if tc.accepted {
 			testing.expectf(t, ok && !saw_goaway, "%s: accepted=%v goaway=%v, want accepted", tc.what, ok, saw_goaway)
 		} else {
@@ -2990,13 +2377,10 @@ test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
 	}
 	for tc in cases {
 		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		allocator := mem.tracking_allocator(&track)
+		allocator := track_allocations(&track)
 
-		log := Client_Frame_Log {
-			frames = make([dynamic]Frame_Header, 0, 8, allocator),
-		}
-		c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+		log: Frame_Log
+		c := logged_client(&log, allocator)
 		s := open_test_stream(c, 1, allocator)
 
 		ok := true
@@ -3021,12 +2405,7 @@ test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
 		testing.expectf(t, s.status == tc.status, "%s: status %d, want %d", tc.what, s.status, tc.status)
 		testing.expectf(t, s.reset == tc.malformed, "%s: reset %v, want %v", tc.what, s.reset, tc.malformed)
 		testing.expectf(t, s.done == !tc.malformed, "%s: done %v, want %v", tc.what, s.done, !tc.malformed)
-		rsts := 0
-		for f in log.frames {
-			if f.type == .Rst_Stream {
-				rsts += 1
-			}
-		}
+		rsts := count_frames(&log, .Rst_Stream)
 		if tc.malformed {
 			testing.expectf(t, rsts == 1 && log.rst_code == .Protocol_Error, "%s: %d RST_STREAM, last %v; want one PROTOCOL_ERROR", tc.what, rsts, log.rst_code)
 			// A REFUSED_STREAM in flight behind this end's reset does not make the
@@ -3041,11 +2420,7 @@ test_client_response_framing_follows_rfc_9113_8_1 :: proc(t: ^testing.T) {
 		delete(log.frames)
 		client_stream_destroy(c, s)
 		delete_key(&c.streams, u32(1))
-		client_unref(c)
-		free_all(context.temp_allocator)
-		for _, entry in track.allocation_map {
-			testing.expectf(t, false, "%s: %d bytes leaked at %v", tc.what, entry.size, entry.location)
-		}
+		client_done(t, c, &track, tc.what)
 		mem.tracking_allocator_destroy(&track)
 	}
 }
@@ -3071,13 +2446,10 @@ test_client_response_head_is_held_to_8_2_and_8_3 :: proc(t: ^testing.T) {
 	}
 	for tc in cases {
 		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		allocator := mem.tracking_allocator(&track)
+		allocator := track_allocations(&track)
 
-		log := Client_Frame_Log {
-			frames = make([dynamic]Frame_Header, 0, 8, allocator),
-		}
-		c := client_make(IO{user = &log, read = hook_read_nothing, write = client_log_write}, allocator)
+		log: Frame_Log
+		c := logged_client(&log, allocator)
 		s := open_test_stream(c, 1, allocator)
 
 		block := make([dynamic]u8, 0, 64, context.temp_allocator)
@@ -3090,11 +2462,7 @@ test_client_response_head_is_held_to_8_2_and_8_3 :: proc(t: ^testing.T) {
 		testing.expectf(t, log.rst_code == .Protocol_Error, "%s: RST code %v, want PROTOCOL_ERROR", tc.what, log.rst_code)
 
 		delete(log.frames)
-		client_unref(c)
-		free_all(context.temp_allocator)
-		for _, entry in track.allocation_map {
-			testing.expectf(t, false, "%s: %d bytes leaked at %v", tc.what, entry.size, entry.location)
-		}
+		client_done(t, c, &track, tc.what)
 		mem.tracking_allocator_destroy(&track)
 	}
 }
@@ -3103,7 +2471,7 @@ test_client_response_head_is_held_to_8_2_and_8_3 :: proc(t: ^testing.T) {
 // a connection error, stream 0 included, and never reaches the HPACK decoder.
 @(test)
 test_client_continuation_on_stream_zero_with_no_block_open_is_refused :: proc(t: ^testing.T) {
-	c := client_make(IO{user = nil, read = hook_read_nothing, write = write_nothing})
+	c := client_make(IO{read = no_read, write = discard_write})
 	// x-t: 1, with incremental indexing: a decoder that took it has an entry.
 	block := []u8{0x40, 0x03, 'x', '-', 't', 0x01, '1'}
 	ok := client_handle_continuation(c, Frame_Header{length = len(block), type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 0}, block)

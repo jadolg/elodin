@@ -2,7 +2,6 @@ package upstream
 
 import "core:net"
 import "core:sync"
-import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -129,37 +128,14 @@ padding_query :: proc(opt: bool) -> []u8 {
 
 @(test)
 test_a_dot_query_goes_out_padded_and_its_reply_comes_back_stripped :: proc(t: ^testing.T) {
-	// As in the DoT retry test: a peer that hangs up mid-handshake raises
-	// SIGPIPE on the write that follows, which the server ignores and the test
-	// runner does not.
-	posix.sigignore(.SIGPIPE)
-
-	sync.once_do(&dot_cert_once, generate_dot_certs)
-	if !dot_cert_ok {
-		testing.expect(t, false, "no certificate available and openssl could not make one")
+	f, fixture_ok := dot_fixture(t)
+	if !fixture_ok {
 		return
 	}
-
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
-		return
-	}
+	defer dot_fixture_destroy(&f)
+	listener, bound, sctx := f.listener, f.bound, f.sctx
 	// So a query that never arrives ends the accept rather than hanging the suite.
 	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
-
-	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path)
-	if serr != .None {
-		testing.expectf(t, false, "server_context: %v", serr)
-		return
-	}
-	defer tlsx.context_destroy(sctx)
 
 	m := Dot_Padding_Mock {
 		listener = listener,

@@ -5,7 +5,6 @@ import "base:runtime"
 import "core:mem"
 import "core:sync"
 import "core:testing"
-import "core:thread"
 import "core:time"
 
 // Under `SCRATCH_DEBUG` every allocation is the heap's: an empty scratch maps
@@ -57,22 +56,13 @@ when !SCRATCH_DEBUG {
 	*/
 	@(test)
 	test_an_idle_fiber_gives_its_empty_scratch_back_with_its_stack :: proc(t: ^testing.T) {
-		l, made := make_loop()
-		if !testing.expect(t, made, "no loop") {
-			return
-		}
-		defer destroy(l)
 		idle_now = time.tick_now()
-		l.clock = idle_clock
-		th := spawn_thread(l, run, context)
-		if !testing.expect(t, th != nil, "no loop thread") {
+		r, started := start(t, idle_clock)
+		if !started {
 			return
 		}
-		defer {
-			stop(l)
-			thread.join(th)
-			thread.destroy(th)
-		}
+		defer finish(r)
+		l := r.l
 		Case :: struct {
 			hold: Scratch_Hold,
 			idle: bool,

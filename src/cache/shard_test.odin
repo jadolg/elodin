@@ -159,8 +159,7 @@ test_a_reload_to_a_small_budget_keeps_room_for_a_large_answer :: proc(t: ^testin
 		answer   = records,
 	}
 	m.flags.qr = true
-	wire, _, _ := dns.encode_message(m, context.temp_allocator)
-	msg, _ := dns.decode_message(wire, context.temp_allocator)
+	wire, msg := wire_and_msg(m)
 	defer free_all(context.temp_allocator)
 	kb: [KEY_MAX]u8
 	key := key_for(kb[:], "big.example.")

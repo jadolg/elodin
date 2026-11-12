@@ -29,21 +29,6 @@ The first is what `NAME_BUDGET` bounds per reading; the other two it never sees.
 @(private = "file")
 READINGS :: 35
 
-// A 255-octet wire name of unprintable octets: 1004 presentation characters,
-// the worst a single name can cost.
-@(private = "file")
-long_name :: proc() -> []u8 {
-	out := make([dynamic]u8, 0, 256)
-	for l in ([]int{63, 63, 63, 61}) {
-		append(&out, u8(l))
-		for _ in 0 ..< l {
-			append(&out, 0x01)
-		}
-	}
-	append(&out, 0)
-	return out[:]
-}
-
 /*
 A reply that spends a whole reading's name budget out of a few kilobytes of wire.
 
@@ -55,7 +40,7 @@ else a reading builds.
 */
 @(private = "file")
 name_bomb :: proc() -> []u8 {
-	name := long_name()
+	name := long_wire_name()
 	defer delete(name)
 	// What one of these costs once escaped, read rather than written down, so
 	// the fixture follows `NAME_BUDGET` and the escaping wherever they go.
@@ -82,34 +67,6 @@ name_bomb :: proc() -> []u8 {
 		count += 1
 	}
 	msg[6], msg[7] = u8(count >> 8), u8(count)
-	return msg[:]
-}
-
-/*
-One TXT record whose RDATA is nothing but length bytes of zero.
-
-A `<character-string>` may be zero bytes long, so one wire byte is one 16-byte
-`string` header: 65,504 of them in a full-length message, and the most memory a
-message can ask for per byte of wire. Issue #351 took this from 32x to 16x by
-counting the list before taking it; what is left is the element itself, and
-nothing bounded how many readings of it one request could make.
-*/
-@(private = "file")
-character_string_bomb :: proc() -> []u8 {
-	msg := make([dynamic]u8, 0, 65535)
-	put_header(&msg, 1)
-	append(&msg, 1, 'x', 0)
-	put_u16(&msg, u16(Type.TXT))
-	put_u16(&msg, u16(Class.IN))
-	append(&msg, 0xc0, 0x0c)
-	put_u16(&msg, u16(Type.TXT))
-	put_u16(&msg, u16(Class.IN))
-	append(&msg, 0, 0, 0x0e, 0x10)
-	rdlength := 65535 - (len(msg) + 2)
-	put_u16(&msg, u16(rdlength))
-	for _ in 0 ..< rdlength {
-		append(&msg, 0)
-	}
 	return msg[:]
 }
 
@@ -184,7 +141,7 @@ test_the_readings_of_one_request_share_one_budget :: proc(t: ^testing.T) {
 			msg:  []u8,
 		} {
 			{"names", name_bomb()},
-			{"character-strings", character_string_bomb()},
+			{"character-strings", txt_of_empty_character_strings()},
 			{"records", record_count_bomb()},
 		}) {
 		defer delete(fixture.msg)
@@ -287,24 +244,7 @@ test_a_reading_past_the_request_budget_is_not_blamed_on_the_message :: proc(t: ^
 // what a large legitimate reply looks like.
 @(private = "file")
 ordinary_answer :: proc() -> []u8 {
-	name := []u8{3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}
-	msg := make([dynamic]u8, 0, 65535)
-	put_header(&msg, 0)
-	append(&msg, ..name)
-	put_u16(&msg, u16(Type.A))
-	put_u16(&msg, u16(Class.IN))
-	count := 0
-	for len(msg) + 16 <= 65535 {
-		append(&msg, 0xc0, 0x0c)
-		put_u16(&msg, u16(Type.A))
-		put_u16(&msg, u16(Class.IN))
-		append(&msg, 0, 0, 0x0e, 0x10)
-		put_u16(&msg, 4)
-		append(&msg, 93, 184, 216, 34)
-		count += 1
-	}
-	msg[6], msg[7] = u8(count >> 8), u8(count)
-	return msg[:]
+	return pointer_owned_rrset({3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0})
 }
 
 // What a chain step answers with: a DNSKEY RRset of the size a rollover reaches.
@@ -388,25 +328,8 @@ primed so that the walk's own buffer is the charge that crosses.
 */
 @(test)
 test_a_raw_expansion_the_request_cannot_pay_for_is_not_the_record_s_fault :: proc(t: ^testing.T) {
-	name := long_name()
-	defer delete(name)
-
-	msg := make([dynamic]u8, 0, 512)
+	msg := px_pointer_record()
 	defer delete(msg)
-	put_header(&msg, 1)
-	// The question's own name is the long one, so the record below can point at
-	// offset 12 for both of its RDATA names.
-	append(&msg, ..name)
-	put_u16(&msg, u16(Type.PX))
-	put_u16(&msg, u16(Class.IN))
-	append(&msg, 0xc0, 0x0c)
-	put_u16(&msg, u16(Type.PX))
-	put_u16(&msg, u16(Class.IN))
-	append(&msg, 0, 0, 0x0e, 0x10)
-	put_u16(&msg, 6)
-	put_u16(&msg, 10) // preference
-	append(&msg, 0xc0, 0x0c)
-	append(&msg, 0xc0, 0x0c)
 
 	backing := make([]u8, 1 << 20)
 	defer delete(backing)

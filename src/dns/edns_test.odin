@@ -4,36 +4,20 @@ import "core:mem"
 import "core:testing"
 
 @(private = "file")
-opt_query :: proc(options: []EDNS_Option, allocator := context.temp_allocator) -> []u8 {
-	q := Question {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-	}
-	questions := make([]Question, 1, allocator)
-	questions[0] = q
-
+opt_query :: proc(options: []EDNS_Option) -> []u8 {
 	opt := make_opt(1232, false)
 	if options != nil {
 		opt.data = Rdata_OPT{options = options}
 	}
-	additional := make([]Record, 1, allocator)
-	additional[0] = opt
-
-	m := Message {
-		id         = 0x1234,
-		question   = questions,
-		additional = additional,
-	}
-	wire, _, err := encode_message(m, allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_wire(
+		{id = 0x1234, question = []Question{{name = "example.com.", type = .A, class = .IN}}, additional = []Record{opt}},
+	)
 }
 
-@(private = "file")
-option_data :: proc(wire: []u8, code: EDNS_Option_Code) -> (data: []u8, found: bool) {
+// The data of the `code` option in `wire`'s OPT record; not found when `wire`
+// does not decode.
+@(private)
+option_in :: proc(wire: []u8, code: EDNS_Option_Code) -> (data: []u8, found: bool) {
 	m, err := decode_message(wire, context.temp_allocator)
 	if err != .None {
 		return nil, false
@@ -50,7 +34,7 @@ test_edns_option_appended_to_empty_opt :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "set_edns_option failed")
 	testing.expect_value(t, len(out), len(wire) + 4 + 8)
 
-	got, found := option_data(out, .Cookie)
+	got, found := option_in(out, .Cookie)
 	testing.expect(t, found, "the option is not readable after the splice")
 	testing.expect(t, mem.compare(got, []u8{1, 2, 3, 4, 5, 6, 7, 8}) == 0, "option data differs")
 
@@ -71,12 +55,12 @@ test_edns_option_replaced_in_place :: proc(t: ^testing.T) {
 	out, ok := set_edns_option(wire, .Cookie, fresh, context.temp_allocator)
 	testing.expect(t, ok, "set_edns_option failed")
 
-	got, found := option_data(out, .Cookie)
+	got, found := option_in(out, .Cookie)
 	testing.expect(t, found, "the option went missing")
 	testing.expect(t, mem.compare(got, fresh) == 0, "the old option was not replaced")
 
 	// The neighbour must survive untouched.
-	nsid, has_nsid := option_data(out, .NSID)
+	nsid, has_nsid := option_in(out, .NSID)
 	testing.expect(t, has_nsid, "the NSID option was lost")
 	testing.expect(t, mem.compare(nsid, []u8{'x'}) == 0, "the NSID option was corrupted")
 
@@ -96,10 +80,10 @@ test_edns_option_removed :: proc(t: ^testing.T) {
 	testing.expect(t, ok, "remove_edns_option failed")
 	testing.expect_value(t, len(out), len(wire) - 4 - 8)
 
-	_, found := option_data(out, .Cookie)
+	_, found := option_in(out, .Cookie)
 	testing.expect(t, !found, "the option is still there")
 
-	nsid, has_nsid := option_data(out, .NSID)
+	nsid, has_nsid := option_in(out, .NSID)
 	testing.expect(t, has_nsid, "the NSID option was lost")
 	testing.expect(t, mem.compare(nsid, []u8{'x'}) == 0, "the NSID option was corrupted")
 
@@ -163,7 +147,7 @@ test_edns_option_with_a_record_after_the_opt :: proc(t: ^testing.T) {
 	out, ok := set_edns_option(wire, .Cookie, []u8{1, 2, 3, 4, 5, 6, 7, 8}, context.temp_allocator)
 	testing.expect(t, ok, "set_edns_option failed")
 
-	got, found := option_data(out, .Cookie)
+	got, found := option_in(out, .Cookie)
 	testing.expect(t, found, "the option is not readable after the rebuild")
 	testing.expect(t, mem.compare(got, []u8{1, 2, 3, 4, 5, 6, 7, 8}) == 0, "option data differs")
 
@@ -230,39 +214,27 @@ test_edns_option_ignores_an_opt_outside_the_additional_section :: proc(t: ^testi
 
 	// The reader sees the cookie in the additional section, so the writer has to
 	// be looking at that same record.
-	_, before := option_data(wire, .Cookie)
+	_, before := option_in(wire, .Cookie)
 	testing.expect(t, before, "the fixture does not carry a readable cookie")
 
 	out, ok := remove_edns_option(wire, .Cookie, context.temp_allocator)
 	testing.expect(t, ok, "remove_edns_option failed")
 
-	_, still := option_data(out, .Cookie)
+	_, still := option_in(out, .Cookie)
 	testing.expect(t, !still, "the cookie survived removal: the decoy OPT was edited instead")
 
 	free_all(context.temp_allocator)
 }
 
 @(private = "file")
-plain_answer :: proc(allocator := context.temp_allocator) -> []u8 {
-	questions := make([]Question, 1, allocator)
-	questions[0] = Question {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-	}
-	answer := make([]Record, 1, allocator)
-	answer[0] = Record {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = Rdata_A{addr = {192, 0, 2, 1}},
-	}
-	wire, _, err := encode_message(Message{id = 1, question = questions, answer = answer}, allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+plain_answer :: proc() -> []u8 {
+	return test_wire(
+		{
+			id = 1,
+			question = []Question{{name = "example.com.", type = .A, class = .IN}},
+			answer = []Record{a_answer("example.com.", 60)},
+		},
+	)
 }
 
 /*
@@ -282,7 +254,7 @@ test_ensure_edns_option_adds_a_missing_opt_record :: proc(t: ^testing.T) {
 	out, ok := ensure_edns_option(wire, .Cookie, cookie, 1232, context.temp_allocator)
 	testing.expect(t, ok, "ensure_edns_option failed")
 
-	got, found := option_data(out, .Cookie)
+	got, found := option_in(out, .Cookie)
 	testing.expect(t, found, "the option is not readable after the rebuild")
 	testing.expect(t, mem.compare(got, cookie) == 0, "option data differs")
 
@@ -438,7 +410,7 @@ test_set_edns_udp_size_keeps_the_options :: proc(t: ^testing.T) {
 	testing.expect(t, set_edns_udp_size(wire, 1232), "set_edns_udp_size failed")
 	testing.expect_value(t, int(peek_udp_size(wire)), 1232)
 
-	nsid, found := option_data(wire, .NSID)
+	nsid, found := option_in(wire, .NSID)
 	testing.expect(t, found, "the NSID option was lost")
 	testing.expect(t, mem.compare(nsid, []u8{'x', 'y'}) == 0, "the NSID option was corrupted")
 
@@ -533,7 +505,7 @@ test_raw_rdata_pointer_survives_cookie_attach :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, found, "the AFSDB record did not survive the cookie attach")
 
-	_, has_cookie := option_data(out, .Cookie)
+	_, has_cookie := option_in(out, .Cookie)
 	testing.expect(t, has_cookie, "the cookie was not attached")
 
 	free_all(context.temp_allocator)

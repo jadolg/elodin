@@ -4,11 +4,20 @@ import "core:sync"
 import "core:testing"
 import "core:thread"
 
-@(private = "file")
+// Parses `text` into a fresh pair of sets.
+@(private)
 build :: proc(text: string, format: Format) -> (^Set, ^Set) {
 	block, allow := set_make(), set_make()
 	parse_list(block, allow, text, format)
 	return block, allow
+}
+
+// An engine holding the rules `text` parses to; `engine_destroy` frees both.
+@(private)
+engine_of :: proc(text: string, format := Format.Adblock) -> ^Engine {
+	e := engine_make()
+	engine_swap(e, build(text, format))
+	return e
 }
 
 @(test)
@@ -20,10 +29,8 @@ test_hosts_format_is_exact :: proc(t: ^testing.T) {
 0.0.0.0 ads.example.com
 0.0.0.0 tracker.example.com metrics.example.com
 `
-	block, allow := build(src, .Hosts)
-	e := engine_make()
+	e := engine_of(src, .Hosts)
 	defer engine_destroy(e)
-	engine_swap(e, block, allow)
 
 	testing.expect_value(t, engine_match(e, "ads.example.com.", .A), Decision.Blocked)
 	testing.expect_value(t, engine_match(e, "metrics.example.com", .A), Decision.Blocked)
@@ -37,10 +44,8 @@ test_hosts_format_is_exact :: proc(t: ^testing.T) {
 @(test)
 test_domains_format_covers_subdomains :: proc(t: ^testing.T) {
 	src := "doubleclick.net\n*.tracking.example\n# comment\n\n"
-	block, allow := build(src, .Domains)
-	e := engine_make()
+	e := engine_of(src, .Domains)
 	defer engine_destroy(e)
-	engine_swap(e, block, allow)
 
 	testing.expect_value(t, engine_match(e, "doubleclick.net.", .A), Decision.Blocked)
 	testing.expect_value(t, engine_match(e, "ad.g.doubleclick.net.", .A), Decision.Blocked)
@@ -64,10 +69,8 @@ address=/dnsmasq.example/0.0.0.0
 /regex-rule.*/
 ||has/path.example^
 `
-	block, allow := build(src, .Adblock)
-	e := engine_make()
+	e := engine_of(src)
 	defer engine_destroy(e)
-	engine_swap(e, block, allow)
 
 	testing.expect_value(t, engine_match(e, "ads.example.", .A), Decision.Blocked)
 	testing.expect_value(t, engine_match(e, "sub.ads.example.", .A), Decision.Blocked)
@@ -96,10 +99,8 @@ test_format_detection :: proc(t: ^testing.T) {
 
 @(test)
 test_case_and_trailing_dot_insensitive :: proc(t: ^testing.T) {
-	block, allow := build("Ads.Example.COM\n", .Domains)
-	e := engine_make()
+	e := engine_of("Ads.Example.COM\n", .Domains)
 	defer engine_destroy(e)
-	engine_swap(e, block, allow)
 
 	testing.expect_value(t, engine_match(e, "ADS.example.com.", .A), Decision.Blocked)
 	testing.expect_value(t, engine_match(e, "ads.example.com", .A), Decision.Blocked)

@@ -87,31 +87,8 @@ developer's own `certs/` pair should not be discarded over a missing tool.
 */
 @(private = "file")
 cert_still_valid :: proc(path: string) -> bool {
-	// `-noout` suppresses the certificate and not the verdict: openssl writes
-	// "Certificate will not expire" on the way to exit 0, and this runs on every
-	// test binary. The exit code is the answer; the line is noise in a suite's
-	// output. Discarded rather than captured - nothing here reads it - and a
-	// /dev/null that will not open is not a reason to fail the check.
-	devnull, nerr := os.open("/dev/null", {.Write})
-	defer if nerr == nil {
-		os.close(devnull)
-	}
-	desc := os.Process_Desc {
-		command = []string{"openssl", "x509", "-in", path, "-noout", "-checkend", "3600"},
-	}
-	if nerr == nil {
-		desc.stdout = devnull
-		desc.stderr = devnull
-	}
-	process, perr := os.process_start(desc)
-	if perr != nil {
-		return true
-	}
-	state, werr := os.process_wait(process)
-	if werr != nil {
-		return true
-	}
-	return state.exit_code == 0
+	code, ran := run_openssl({"x509", "-in", path, "-noout", "-checkend", "3600"})
+	return !ran || code == 0
 }
 
 @(private = "file")
@@ -132,50 +109,28 @@ generate_certs :: proc() {
 		cert_ok = true
 		return
 	}
-	if !os.exists(CERT_DIR) {
-		if err := os.make_directory(CERT_DIR); err != nil {
-			return
-		}
-	}
-
-	process, perr := os.process_start(
-		os.Process_Desc {
-			command = []string {
-				"openssl",
-				"req",
-				"-x509",
-				"-newkey",
-				"ec",
-				"-pkeyopt",
-				"ec_paramgen_curve:prime256v1",
-				"-nodes",
-				"-keyout",
-				key_path,
-				"-out",
-				cert_path,
-				"-days",
-				CERT_DAYS,
-				"-subj",
-				"/CN=elodin.local",
-				"-addext",
-				"subjectAltName=DNS:elodin.local,DNS:localhost,IP:127.0.0.1",
-			},
-		},
-	)
-	if perr != nil {
-		return
-	}
-	state, werr := os.process_wait(process)
-	if werr != nil || state.exit_code != 0 {
-		return
-	}
-	cert_ok = true
+	cert_ok = self_signed(CERT_DIR, cert_path, key_path, CERT_DAYS, "/CN=elodin.local", ELODIN_SAN)
 }
 
 @(private = "file")
 ensure_certs :: proc() -> (cert, key: string, ok: bool) {
 	sync.once_do(&cert_once, generate_certs)
 	return cert_path, key_path, cert_ok
+}
+
+// A listener on a loopback port the kernel picks, and that port.
+@(private = "file")
+listen_loopback :: proc(t: ^testing.T, loc := #caller_location) -> (listener: net.TCP_Socket, bound: net.Endpoint, ok: bool) {
+	sock, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr, loc = loc) {
+		return
+	}
+	ep, berr := net.bound_endpoint(sock)
+	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr, loc = loc) {
+		net.close(sock)
+		return
+	}
+	return sock, ep, true
 }
 
 @(private = "file")
@@ -223,15 +178,8 @@ make_pair :: proc(t: ^testing.T) -> (p: Pair, ok: bool) {
 		testing.expect(t, false, "no certificate available and openssl could not make one")
 		return {}, false
 	}
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return {}, false
-	}
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		net.close(listener)
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
+	listener, bound, listening := listen_loopback(t)
+	if !listening {
 		return {}, false
 	}
 
@@ -515,17 +463,11 @@ verified_handshake :: proc(t: ^testing.T, hostname: string) -> (err: Error, ran:
 		testing.expect(t, false, "no certificate available and openssl could not make one")
 		return .None, false
 	}
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+	listener, bound, listening := listen_loopback(t)
+	if !listening {
 		return .None, false
 	}
 	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return .None, false
-	}
 
 	sctx, serr := server_context(cert, key)
 	if serr != .None {
@@ -628,17 +570,11 @@ test_handshake_reset_by_peer_reports_the_transport_error :: proc(t: ^testing.T) 
 	// runner does not.
 	posix.sigignore(.SIGPIPE)
 
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+	listener, bound, listening := listen_loopback(t)
+	if !listening {
 		return
 	}
 	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
 
 	cctx, cerr := client_context(false)
 	if cerr != .None {
@@ -910,17 +846,11 @@ test_alpn_outlives_the_context_that_installed_it :: proc(t: ^testing.T) {
 	alloc := scribbler_init(&scribbler)
 	defer scribbler_release(&scribbler)
 
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+	listener, bound, listening := listen_loopback(t)
+	if !listening {
 		return
 	}
 	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
 
 	sctx, serr := server_context(cert, key, []string{"h2", "http/1.1"}, alloc)
 	if serr != .None {
@@ -1071,15 +1001,11 @@ test_a_drip_fed_handshake_is_given_up_on_at_the_deadline :: proc(t: ^testing.T) 
 	if !testing.expect(t, have, "no certificate available and openssl could not make one") {
 		return
 	}
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+	listener, bound, listening := listen_loopback(t)
+	if !listening {
 		return
 	}
 	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr) {
-		return
-	}
 
 	sctx, serr := server_context(cert, key)
 	if !testing.expectf(t, serr == .None, "server_context: %v", serr) {
@@ -1160,15 +1086,11 @@ wait held the worker that dialled it for as long as it cared to.
 */
 @(test)
 test_a_drip_fed_server_hello_is_given_up_on_at_the_deadline :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+	listener, bound, listening := listen_loopback(t)
+	if !listening {
 		return
 	}
 	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr) {
-		return
-	}
 
 	cctx, cerr := client_context(false)
 	if !testing.expectf(t, cerr == .None, "client_context: %v", cerr) {
@@ -1260,6 +1182,78 @@ resume_server_worker :: proc(r: ^Resume_Server) {
 	}
 }
 
+/*
+A server context with a `Resume_Server` taking `rounds` handshakes on a loopback
+port, and a client context capped at `version`.
+
+`resume_fixture_done` stops the worker before the join: a client that never
+dialled would otherwise leave it in accept, and the test hung rather than failed.
+*/
+@(private = "file")
+Resume_Fixture :: struct {
+	srv:       Resume_Server,
+	ep:        net.Endpoint,
+	cctx:      ^Context,
+	worker:    ^thread.Thread,
+	listening: bool,
+}
+
+@(private = "file")
+resume_fixture :: proc(t: ^testing.T, f: ^Resume_Fixture, version: c.long, rounds: int, loc := #caller_location) -> (ok: bool) {
+	defer if !ok {
+		resume_fixture_done(f)
+	}
+	cert, key, have := ensure_certs()
+	if !testing.expect(t, have, "no certificate available and openssl could not make one", loc = loc) {
+		return
+	}
+	f.srv.listener, f.ep, f.listening = listen_loopback(t, loc)
+	if !f.listening {
+		return
+	}
+	serr, cerr: Error
+	f.srv.ctx, serr = server_context(cert, key)
+	if !testing.expectf(t, serr == .None, "server_context: %v", serr, loc = loc) {
+		return
+	}
+	f.cctx, cerr = client_context(false)
+	if !testing.expectf(t, cerr == .None, "client_context: %v", cerr, loc = loc) {
+		return
+	}
+	if !testing.expectf(t, ssl_ctx_set_max_proto_version(f.cctx.ptr, version), "cannot cap the client at %x", version, loc = loc) {
+		return
+	}
+	f.srv.rounds = rounds
+	f.worker = thread.create_and_start_with_poly_data(&f.srv, resume_server_worker)
+	return true
+}
+
+// Wakes the worker from an accept no client reached, and waits for it.
+@(private = "file")
+resume_fixture_stop :: proc(f: ^Resume_Fixture) {
+	if f.worker != nil {
+		posix.shutdown(posix.FD(net.Socket(f.srv.listener)), .RDWR)
+		thread.join(f.worker)
+	}
+}
+
+@(private = "file")
+resume_fixture_done :: proc(f: ^Resume_Fixture) {
+	resume_fixture_stop(f)
+	if f.worker != nil {
+		thread.destroy(f.worker)
+	}
+	if f.cctx != nil {
+		context_destroy(f.cctx)
+	}
+	if f.srv.ctx != nil {
+		context_destroy(f.srv.ctx)
+	}
+	if f.listening {
+		net.close(f.srv.listener)
+	}
+}
+
 // One client handshake, offering `offer` for resumption when it is not nil.
 // Driven on the raw `SSL` because `client_connect` never resumes.
 @(private = "file")
@@ -1324,76 +1318,32 @@ resume_twice :: proc(
 	reused: bool,
 	ok: bool,
 ) {
-	cert, key, have := ensure_certs()
-	if !have {
-		testing.expect(t, false, "no certificate available and openssl could not make one")
+	f: Resume_Fixture
+	if !resume_fixture(t, &f, version, 2) {
 		return
 	}
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	ep, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-
-	sctx, serr := server_context(cert, key)
-	if serr != .None {
-		testing.expectf(t, false, "server_context: %v", serr)
-		return
-	}
-	defer context_destroy(sctx)
+	defer resume_fixture_done(&f)
 	if m, set := mode.?; set {
-		ssl_ctx_set_session_cache_mode(sctx.ptr, m)
-	}
-	cctx, cerr := client_context(false)
-	if cerr != .None {
-		testing.expectf(t, false, "client_context: %v", cerr)
-		return
-	}
-	defer context_destroy(cctx)
-	if !ssl_ctx_set_max_proto_version(cctx.ptr, version) {
-		testing.expectf(t, false, "cannot cap the client at %x", version)
-		return
+		ssl_ctx_set_session_cache_mode(f.srv.ctx.ptr, m)
 	}
 	if no_ticket {
-		SSL_CTX_set_options(cctx.ptr, SSL_OP_NO_TICKET)
+		SSL_CTX_set_options(f.cctx.ptr, SSL_OP_NO_TICKET)
 	}
 
-	srv := Resume_Server {
-		listener = listener,
-		ctx      = sctx,
-		rounds   = 2,
-	}
-	worker := thread.create_and_start_with_poly_data(&srv, resume_server_worker)
-	defer thread.destroy(worker)
-
-	_, first, fok := resume_client(t, cctx.ptr, ep, nil)
+	_, first, fok := resume_client(t, f.cctx.ptr, f.ep, nil)
 	defer if first != nil {
 		SSL_SESSION_free(first)
 	}
 	second: ^SSL_SESSION
 	if fok {
-		reused, second, ok = resume_client(t, cctx.ptr, ep, first)
+		reused, second, ok = resume_client(t, f.cctx.ptr, f.ep, first)
 	}
 	if second != nil {
 		SSL_SESSION_free(second)
 	}
-	if !ok {
-		// Unblock whichever accepts the worker still waits in. A connection it
-		// never reaches sits in the backlog until the listener closes.
-		for _ in 0 ..< srv.rounds {
-			if s, err := net.dial_tcp_from_endpoint(ep); err == nil {
-				net.close(s)
-			}
-		}
-	}
-	thread.join(worker)
-	return ssl_ctx_sess_number(sctx.ptr), reused, ok
+	// Every handshake the server counts has finished once its worker is gone.
+	resume_fixture_stop(&f)
+	return ssl_ctx_sess_number(f.srv.ctx.ptr), reused, ok
 }
 
 /*
@@ -1469,27 +1419,14 @@ a clock moved ahead, as an idle listener's would be.
 @(test)
 test_ticket_keys_rotate_and_old_tickets_stop_resuming :: proc(t: ^testing.T) {
 	posix.sigignore(.SIGPIPE)
-	cert, key, have := ensure_certs()
-	if !have {
-		testing.expect(t, false, "no certificate available and openssl could not make one")
-		return
-	}
 
 	for version in ([]c.long{TLS1_2_VERSION, TLS1_3_VERSION}) {
-		listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-		if lerr != nil {
-			testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		f: Resume_Fixture
+		if !resume_fixture(t, &f, version, 4) {
 			return
 		}
-		defer net.close(listener)
-		ep, _ := net.bound_endpoint(listener)
-
-		sctx, serr := server_context(cert, key)
-		if serr != .None {
-			testing.expectf(t, false, "server_context: %v", serr)
-			return
-		}
-		defer context_destroy(sctx)
+		defer resume_fixture_done(&f)
+		sctx, cctx, ep := f.srv.ctx, f.cctx, f.ep
 		k := ticket_keys_of(sctx.ptr)
 		if !testing.expect(t, k != nil, "the server context has no ticket keys of its own") {
 			return
@@ -1500,20 +1437,6 @@ test_ticket_keys_rotate_and_old_tickets_stop_resuming :: proc(t: ^testing.T) {
 			"a ticket lasts %ds, not one key interval",
 			SSL_CTX_get_timeout(sctx.ptr),
 		)
-		cctx, _ := client_context(false)
-		defer context_destroy(cctx)
-		ssl_ctx_set_max_proto_version(cctx.ptr, version)
-
-		srv := Resume_Server {
-			listener = listener,
-			ctx      = sctx,
-			rounds   = 4,
-		}
-		worker := thread.create_and_start_with_poly_data(&srv, resume_server_worker)
-		defer thread.destroy(worker)
-		// Runs before the join: a client that never dialled would otherwise
-		// leave the worker in accept, and the test hung rather than failed.
-		defer posix.shutdown(posix.FD(net.Socket(listener)), .RDWR)
 		start := loop.moment_now()
 
 		_, first, ok := resume_client(t, cctx.ptr, ep, nil)
@@ -1601,43 +1524,18 @@ answers a callback that seals nothing, in TLS 1.2 and 1.3 alike.
 @(test)
 test_retired_ticket_keys_are_erased_and_never_redrawn :: proc(t: ^testing.T) {
 	posix.sigignore(.SIGPIPE)
-	cert, key, have := ensure_certs()
-	if !have {
-		testing.expect(t, false, "no certificate available and openssl could not make one")
-		return
-	}
 
 	for version in ([]c.long{TLS1_2_VERSION, TLS1_3_VERSION}) {
-		listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-		if lerr != nil {
-			testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+		f: Resume_Fixture
+		if !resume_fixture(t, &f, version, 3) {
 			return
 		}
-		defer net.close(listener)
-		ep, _ := net.bound_endpoint(listener)
-
-		sctx, serr := server_context(cert, key)
-		if serr != .None {
-			testing.expectf(t, false, "server_context: %v", serr)
-			return
-		}
-		defer context_destroy(sctx)
+		defer resume_fixture_done(&f)
+		sctx, cctx, ep := f.srv.ctx, f.cctx, f.ep
 		k := ticket_keys_of(sctx.ptr)
 		if !testing.expect(t, k != nil, "the server context has no ticket keys of its own") {
 			return
 		}
-		cctx, _ := client_context(false)
-		defer context_destroy(cctx)
-		ssl_ctx_set_max_proto_version(cctx.ptr, version)
-
-		srv := Resume_Server {
-			listener = listener,
-			ctx      = sctx,
-			rounds   = 3,
-		}
-		worker := thread.create_and_start_with_poly_data(&srv, resume_server_worker)
-		defer thread.destroy(worker)
-		defer posix.shutdown(posix.FD(net.Socket(listener)), .RDWR)
 
 		_, first, ok := resume_client(t, cctx.ptr, ep, nil)
 		defer if first != nil {SSL_SESSION_free(first)}

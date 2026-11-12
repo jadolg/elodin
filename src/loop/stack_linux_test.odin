@@ -4,7 +4,6 @@ package loop
 import "base:intrinsics"
 import "core:sync"
 import "core:testing"
-import "core:thread"
 import "core:time"
 
 // How deep the probe goes before it parks: half a release stack, far more than
@@ -55,22 +54,13 @@ has switched out and moves the loop's clock itself.
 */
 @(test)
 test_an_idle_fiber_gives_its_stack_back_once_its_park_lasts :: proc(t: ^testing.T) {
-	l, made := make_loop()
-	if !testing.expect(t, made, "no loop") {
-		return
-	}
-	defer destroy(l)
 	stack_now = time.tick_now()
-	l.clock = stack_clock
-	th := spawn_thread(l, run, context)
-	if !testing.expect(t, th != nil, "no loop thread") {
+	r, started := start(t, stack_clock)
+	if !started {
 		return
 	}
-	defer {
-		stop(l)
-		thread.join(th)
-		thread.destroy(th)
-	}
+	defer finish(r)
+	l := r.l
 	page := int(kernel_page)
 	for c in ([][2]bool{{false, false}, {true, false}, {true, true}}) {
 		idle, woken := c[0], c[1]

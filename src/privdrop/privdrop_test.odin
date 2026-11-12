@@ -152,15 +152,8 @@ test_apply_refuses_what_it_cannot_do :: proc(t: ^testing.T) {
 
 @(test)
 test_hand_over_covers_the_directory_and_its_entries :: proc(t: ^testing.T) {
-	tmp, terr := os.temp_directory(context.temp_allocator)
-	if terr != nil {
-		testing.expectf(t, false, "no temporary directory: %v", terr)
-		return
-	}
-	dir, _ := filepath.join({tmp, "elodin-privdrop-test"}, context.temp_allocator)
-	os.remove_all(dir)
-	if err := os.make_directory(dir); err != nil {
-		testing.expectf(t, false, "cannot create %s: %v", dir, err)
+	dir, ok := scratch_dir(t, "elodin-privdrop-test")
+	if !ok {
 		return
 	}
 	defer os.remove_all(dir)
@@ -214,13 +207,8 @@ test_can_reopen :: proc(t: ^testing.T) {
 	if skip_when_root() {
 		return
 	}
-	tmp, terr := os.temp_directory(context.temp_allocator)
-	if !testing.expectf(t, terr == nil, "no temporary directory: %v", terr) {
-		return
-	}
-	dir, _ := filepath.join({tmp, fmt.tprintf("elodin-privdrop-reopen-%d", posix.getpid())}, context.temp_allocator)
-	os.remove_all(dir)
-	if !testing.expect(t, os.make_directory(dir) == nil, "cannot create the scratch directory") {
+	dir, ok := scratch_dir(t, "elodin-privdrop-reopen")
+	if !ok {
 		return
 	}
 	defer os.remove_all(dir)
@@ -241,4 +229,21 @@ test_can_reopen :: proc(t: ^testing.T) {
 	testing.expect(t, !can_reopen(read_only, true), "a read-only file is in reach for writing")
 	testing.expect(t, !can_reopen(missing, false), "a missing file is in reach")
 	testing.expect(t, !os.exists(missing), "checking a missing file created it")
+}
+
+// The pid keeps a run in another checkout from removing this one's files.
+@(private = "file")
+scratch_dir :: proc(t: ^testing.T, name: string) -> (dir: string, ok: bool) {
+	tmp, terr := os.temp_directory(context.temp_allocator)
+	if terr != nil {
+		testing.expectf(t, false, "no temporary directory: %v", terr)
+		return
+	}
+	dir, _ = filepath.join({tmp, fmt.tprintf("%s-%d", name, posix.getpid())}, context.temp_allocator)
+	os.remove_all(dir)
+	if err := os.make_directory(dir); err != nil {
+		testing.expectf(t, false, "cannot create %s: %v", dir, err)
+		return
+	}
+	return dir, true
 }

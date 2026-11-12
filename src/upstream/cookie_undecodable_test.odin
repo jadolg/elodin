@@ -486,48 +486,7 @@ probe_mock_reply :: proc(m: ^Probe_Mock, query: []u8) -> (reply: []u8, ok: bool)
 
 @(private = "file")
 start_probe_mock :: proc(t: ^testing.T, m: ^Probe_Mock) -> (u: ^Upstream, worker: ^thread.Thread, ok: bool) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind a loopback responder: %v", serr)
-		return nil, nil, false
-	}
-	m.socket = socket
-	// Without this the responder would sit in recv_udp and never see `stop`.
-	set_socket_timeouts(socket, 50 * time.Millisecond)
-
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		net.close(socket)
-		testing.expectf(t, false, "cannot read the responder's port: %v", berr)
-		return nil, nil, false
-	}
-
-	worker = thread.create_and_start_with_poly_data(m, probe_mock_loop)
-	built, uerr := make_upstream(
-		config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port},
-		0,
-		time.Second,
-		context.allocator,
-		cookies = true,
-	)
-	if uerr != .None {
-		sync.atomic_store(&m.stop, true)
-		thread.join(worker)
-		thread.destroy(worker)
-		net.close(socket)
-		testing.expectf(t, false, "cannot build the upstream: %v", uerr)
-		return nil, nil, false
-	}
-	return built, worker, true
-}
-
-@(private = "file")
-stop_probe_mock :: proc(m: ^Probe_Mock, u: ^Upstream, worker: ^thread.Thread) {
-	sync.atomic_store(&m.stop, true)
-	thread.join(worker)
-	thread.destroy(worker)
-	net.close(m.socket)
-	destroy(u)
+	return start_udp_mock(t, m, probe_mock_loop, cookies = true)
 }
 
 @(private = "file")
@@ -560,7 +519,7 @@ test_upstream_cookie_undecodable_forgery_is_not_taken_as_an_answer :: proc(t: ^t
 	if !ok {
 		return
 	}
-	defer stop_probe_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	_, err := exchange(u, probe_query(), time.Second, context.temp_allocator)
 	testing.expectf(t, err == .None, "the first exchange failed: %v", err)
@@ -597,7 +556,7 @@ test_upstream_cookie_undecodable_reply_is_accepted_when_none_is_owed :: proc(t: 
 	if !ok {
 		return
 	}
-	defer stop_probe_mock(&m, u, worker)
+	defer stop_udp_mock(&m, worker, u)
 
 	response, err := exchange(u, probe_query(), time.Second, context.temp_allocator)
 	testing.expectf(t, err == .None, "a cookie-less server's reply was refused: %v", err)

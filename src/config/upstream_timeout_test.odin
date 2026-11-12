@@ -1,6 +1,5 @@
 package config
 
-import "core:strings"
 import "core:testing"
 import "core:time"
 
@@ -18,19 +17,9 @@ of a timeout past about 1.28 million hours overflow into a spent budget.
 */
 @(test)
 test_an_upstream_timeout_outside_1ms_to_24h_is_refused :: proc(t: ^testing.T) {
-	refused :: proc(t: ^testing.T, doc, key: string) {
-		_, err := load_string(doc, context.temp_allocator)
-		e, has := err.?
-		if testing.expectf(t, has, "%s was accepted from:%s", key, doc) {
-			// The bound's refusal and nothing else: a parse error names the key too.
-			testing.expectf(
-				t,
-				len(e.messages) == 1 && strings.contains(e.messages[0], key) && strings.contains(e.messages[0], "1ms to 24h:"),
-				"the refusal is not one line naming %s and the bounds: %v",
-				key,
-				e.messages,
-			)
-		}
+	// The bound's refusal and nothing else: a parse error names the key too.
+	refused :: proc(t: ^testing.T, doc, key: string, loc := #caller_location) {
+		expect_refused(t, doc, key, "1ms to 24h:", exactly_one = true, loc = loc)
 	}
 	refused(t, "upstream:\n  timeout: 0s\n  servers: [1.1.1.1]\n", "upstream.timeout")
 	refused(t, "upstream:\n  timeout: 0.5ms\n  servers: [1.1.1.1]\n", "upstream.timeout")
@@ -39,7 +28,7 @@ test_an_upstream_timeout_outside_1ms_to_24h_is_refused :: proc(t: ^testing.T) {
 	refused(t, "upstream:\n  timeout: 99999999999999999999h99999999999999999999h5s\n  servers: [1.1.1.1]\n", "upstream.timeout")
 	refused(
 		t,
-		"upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [home.arpa]\n      timeout: 0\n      servers: [192.168.1.1]\n",
+		MINIMAL + "  zones:\n    - domains: [home.arpa]\n      timeout: 0\n      servers: [192.168.1.1]\n",
 		"upstream.zones[0].timeout",
 	)
 
@@ -57,13 +46,7 @@ test_an_upstream_timeout_outside_1ms_to_24h_is_refused :: proc(t: ^testing.T) {
 	}
 
 	// The smallest and largest figures that are a wait, at both levels.
-	cfg, err := load_string(
-		"upstream:\n  timeout: 1ms\n  servers: [1.1.1.1]\n  zones:\n    - domains: [home.arpa]\n      timeout: 24h\n      servers: [192.168.1.1]\n",
-		context.temp_allocator,
-	)
-	if e, has := err.?; has {
-		testing.expectf(t, false, "a 1ms or 24h timeout was refused: %v", e.messages)
-	} else {
+	if cfg, ok := expect_loads(t, "upstream:\n  timeout: 1ms\n  servers: [1.1.1.1]\n  zones:\n    - domains: [home.arpa]\n      timeout: 24h\n      servers: [192.168.1.1]\n"); ok {
 		testing.expect_value(t, cfg.upstream.timeout, time.Millisecond)
 		testing.expect_value(t, cfg.upstream.zones[0].upstream.timeout, 24 * time.Hour)
 	}
