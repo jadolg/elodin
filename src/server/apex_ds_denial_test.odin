@@ -15,33 +15,6 @@ BASE32HEX := [32]byte {
 	'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
 }
 
-// A window-0 type bitmap (RFC 4034 section 4.1.2) holding `types`.
-@(private = "file")
-type_bitmap :: proc(types: ..dns.Type) -> []u8 {
-	bits := make([]u8, 32, context.temp_allocator)
-	top := 0
-	for t in types {
-		bits[int(t) / 8] |= 0x80 >> (uint(t) % 8)
-		top = max(top, int(t) / 8 + 1)
-	}
-	out := make([dynamic]u8, context.temp_allocator)
-	append(&out, 0, u8(top))
-	append(&out, ..bits[:top])
-	return out[:]
-}
-
-// An NSEC at `owner` whose next name is `next`.
-nsec_at :: proc(owner, next: string, types: ..dns.Type) -> dns.Record {
-	rdata := make([dynamic]u8, context.temp_allocator)
-	for label in strings.split(strings.trim_suffix(next, "."), ".", context.temp_allocator) {
-		append(&rdata, u8(len(label)))
-		append(&rdata, label)
-	}
-	append(&rdata, 0)
-	append(&rdata, ..type_bitmap(..types))
-	return dns.Record{name = owner, type = .NSEC, class = .IN, ttl = 300, data = dns.Rdata_Raw{data = rdata[:]}}
-}
-
 /*
 An NSEC3 in `example.com.` for the span from `from` to `to`, no salt. `from` nil
 is the hash of `APEX` at `iterations`, which makes the record the one matching it.
@@ -51,7 +24,9 @@ nsec3_at :: proc(from, to: []u8, flags: u8, iterations: u16, types: ..dns.Type) 
 	owner := from
 	if owner == nil {
 		owner = make([]u8, 20, context.temp_allocator)
-		dnssec.nsec3_hash(APEX, nil, iterations, owner)
+		if !dnssec.nsec3_hash(APEX, nil, iterations, owner) {
+			panic("the apex does not hash")
+		}
 	}
 	rdata := make([dynamic]u8, context.temp_allocator)
 	append(&rdata, 1, flags, u8(iterations >> 8), u8(iterations), 0, 20)
@@ -65,21 +40,6 @@ nsec3_at :: proc(from, to: []u8, flags: u8, iterations: u16, types: ..dns.Type) 
 		ttl = 300,
 		data = dns.Rdata_Raw{data = rdata[:]},
 	}
-}
-
-// A NODATA for `name`'s `DS` carrying `authority`.
-ds_nodata :: proc(name: string, authority: ..dns.Record) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = .DS, class = .IN}
-	msg := dns.Message{question = question, authority = authority}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
 }
 
 /*
@@ -130,14 +90,22 @@ test_an_apex_ds_nodata_is_the_proof_unless_the_denial_shows_no_delegation :: pro
 		}
 		testing.expectf(t, len(m.answer) == 0 && dns.Rcode(m.flags.rcode) == .No_Error, "%s is not a NODATA", c.what)
 	}
-	nsec := ds_nodata(APEX, nsec_at(APEX, "example.", .A, .RRSIG, .NSEC))
-	m, _ := dns.decode_message(nsec, context.temp_allocator)
-	types := m.authority[0].data.(dns.Rdata_Raw).data[9:]
+	m, derr := dns.decode_message(cases[2].reply, context.temp_allocator)
+	if !testing.expectf(t, derr == .None && len(m.authority) == 1, "%s: %v", cases[2].what, derr) {
+		return
+	}
+	// The bitmap follows the next name, `example.`, written out in full.
+	next: [dns.MAX_NAME_WIRE]u8
+	next_len, nerr := dns.encode_name("example.", next[:])
+	if !testing.expectf(t, nerr == .None, "the next name does not encode: %v", nerr) {
+		return
+	}
+	types := m.authority[0].data.(dns.Rdata_Raw).data[next_len:]
 	testing.expect(t, !dnssec.bitmap_has(types, .NS) && dnssec.bitmap_has(types, .A), "the held name's NSEC has the NS bit")
 
 	for c in cases {
 		spent := 0
-		proved, settled := parent_answers_apex_ds(c.reply, APEX, true, &spent, 100, context.temp_allocator)
+		proved, settled := parent_answers_apex_ds(c.reply, APEX, true, &spent, dnssec.DEFAULT_MAX_NSEC3_ITERATIONS, context.temp_allocator)
 		testing.expectf(t, proved == c.proved, "%s: proved %v, want %v", c.what, proved, c.proved)
 		// The proof is settled; what is not the proof is no fact to store against.
 		testing.expectf(t, settled == c.proved, "%s: settled %v", c.what, settled)
@@ -155,7 +123,7 @@ test_an_apex_ds_nodata_is_the_proof_unless_the_denial_shows_no_delegation :: pro
 			APEX,
 			true,
 			&spent,
-			100,
+			dnssec.DEFAULT_MAX_NSEC3_ITERATIONS,
 			context.temp_allocator,
 		)
 		testing.expect(t, !proved, "a compact denial was read as an insecure delegation")

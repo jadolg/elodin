@@ -194,6 +194,16 @@ test_the_descriptor_limit_is_readable :: proc(t: ^testing.T) {
 	)
 }
 
+// `run` after `n` consecutive failures with `err`, each fed to `accept_action`.
+@(private = "file")
+fail_run :: proc(run: Accept_Run, err: net.Accept_Error, n: int) -> Accept_Run {
+	run := run
+	for _ in 0 ..< n {
+		run = accept_action(err, run).run
+	}
+	return run
+}
+
 /*
 The loop's own behaviour, as a sequence, without a socket.
 
@@ -412,10 +422,7 @@ test_a_stream_of_queue_errors_settles_far_below_the_shortage_ceiling :: proc(t: 
 	)
 
 	// The shortage still gets the long one: nothing is drained by waiting there.
-	shortage: Accept_Run
-	for _ in 0 ..< 40 {
-		shortage = accept_action(.Insufficient_Resources, shortage).run
-	}
+	shortage := fail_run({}, .Insufficient_Resources, 40)
 	testing.expect_value(t, accept_action(.Insufficient_Resources, shortage).wait, ACCEPT_BACKOFF)
 }
 
@@ -448,9 +455,7 @@ test_the_warning_waits_for_a_second_of_not_accepting :: proc(t: ^testing.T) {
 	testing.expect(t, run.waited < ACCEPT_REPORT_AFTER, "ten of them are not a second")
 
 	// Kept up, the same condition does earn it.
-	for _ in 0 ..< 60 {
-		run = accept_action(.Unknown, run).run
-	}
+	run = fail_run(run, .Unknown, 60)
 	testing.expect(t, accept_action(.Unknown, run).report, "a run that lasts a second has to be said")
 
 	// And the shortage earns it on the same rule, which is what makes it one
@@ -514,10 +519,7 @@ silenced by an earlier one.
 test_a_burst_that_clears_hands_the_warning_back :: proc(t: ^testing.T) {
 	// Long enough to have reported: only a run that said something has anything
 	// to give back - see `test_a_listener_that_never_reported_does_not_rearm`.
-	run: Accept_Run
-	for _ in 0 ..< 40 {
-		run = accept_action(.Unknown, run).run
-	}
+	run := fail_run({}, .Unknown, 40)
 	testing.expect(t, run.reported, "the run said something")
 	testing.expect(t, run.waited > 0, "and waited something")
 
@@ -554,10 +556,7 @@ have to respect.
 */
 @(test)
 test_the_idle_tick_can_be_what_recovers_a_listener :: proc(t: ^testing.T) {
-	run: Accept_Run
-	for _ in 0 ..< 40 {
-		run = accept_action(.Unknown, run).run
-	}
+	run := fail_run({}, .Unknown, 40)
 	testing.expect(t, run.reported && run.waited > 0, "the burst reported and waited")
 
 	// Nothing but poll ticks from here - no connection arrives at all.
@@ -584,11 +583,8 @@ later trouble could be reported again.
 */
 @(test)
 test_a_long_outage_does_not_become_unrecoverable :: proc(t: ^testing.T) {
-	run: Accept_Run
 	// An hour of solid shortage, at the ceiling for all but the first few.
-	for _ in 0 ..< 3600 {
-		run = accept_action(.Insufficient_Resources, run).run
-	}
+	run := fail_run({}, .Insufficient_Resources, 3600)
 	testing.expect_value(t, run.waited, ACCEPT_REPORT_AFTER)
 
 	recovered := false
@@ -612,10 +608,7 @@ out of descriptors would say both lines again, for the length of the outage.
 */
 @(test)
 test_a_listener_that_never_reported_does_not_rearm :: proc(t: ^testing.T) {
-	quiet: Accept_Run
-	for _ in 0 ..< ACCEPT_FAST_RETRIES + 1 {
-		quiet = accept_action(.Unknown, quiet).run
-	}
+	quiet := fail_run({}, .Unknown, ACCEPT_FAST_RETRIES + 1)
 	testing.expect(t, quiet.waited > 0, "it waited a little")
 	testing.expect(t, !quiet.reported, "but it never reached the threshold")
 
@@ -640,10 +633,7 @@ fifty-millisecond cadence, during a descriptor shortage.
 */
 @(test)
 test_the_report_describes_the_run_not_the_last_attempt :: proc(t: ^testing.T) {
-	run: Accept_Run
-	for _ in 0 ..< 20 {
-		run = accept_action(.Insufficient_Resources, run).run
-	}
+	run := fail_run({}, .Insufficient_Resources, 20)
 	testing.expect(t, run.shortage, "the run has met a shortage")
 
 	// A pending network error lands next, and must not change the diagnosis.
@@ -732,11 +722,20 @@ test_the_map_count_line_is_silent_unless_the_limit_is_short :: proc(t: ^testing.
 	fibers := 512 + 4096 + 4096 * 12 + 8 + 8
 	wanted := fibers * MAPPINGS_PER_FIBER + MAPPING_RESERVE
 	line, short := map_count_line(65530, d)
-	testing.expect(t, short, "the default limit covers a dozen-wide race at the largest derived figures")
-	testing.expect(t, strings.contains(line, "vm.max_map_count"), "the line does not name the setting")
+	testing.expect(t, short, "the default limit has to be short of a dozen-wide race at the largest derived figures")
+	testing.expect(t, strings.contains(line, "vm.max_map_count"), "the line has to name the setting")
 	_, enough := map_count_line(wanted, d)
-	testing.expect(t, !enough, "a limit that exactly covers the fibers is short")
+	testing.expect(t, !enough, "a limit that exactly covers the fibers is enough")
 	_, unread := map_count_line(0, d)
-	testing.expect(t, !unread, "an unreadable limit is called short")
-	testing.expect(t, metrics.map_count_limit() > 0, "vm.max_map_count could not be read here")
+	testing.expect(t, !unread, "an unreadable limit is not called short")
+}
+
+// The figure `map_count_line` is handed, read off this machine.
+@(test)
+test_the_map_count_limit_is_readable :: proc(t: ^testing.T) {
+	testing.expect(
+		t,
+		metrics.map_count_limit() > 0,
+		"vm.max_map_count has to be readable, or the mapping warning can never be printed",
+	)
 }

@@ -33,15 +33,19 @@ holds_until_released :: proc(data: rawptr) {
 	}
 }
 
+// The active count once it reaches `want`, or as it stands after two seconds.
 @(private = "file")
-wait_for_reap :: proc(cm: ^Conn_Manager, want: int) -> int {
-	deadline := time.time_add(time.now(), 2 * time.Second)
-	got := active_connections(cm)
-	for got != want && time.diff(time.now(), deadline) > 0 {
-		time.sleep(time.Millisecond)
-		got = active_connections(cm)
+wait_for_active :: proc(cm: ^Conn_Manager, want: int) -> int {
+	Active :: struct {
+		cm:   ^Conn_Manager,
+		want: int,
 	}
-	return got
+	a := Active{cm, want}
+	_ = wait_until(proc(data: rawptr) -> bool {
+			a := (^Active)(data)
+			return active_connections(a.cm) == a.want
+		}, &a, 2 * time.Second)
+	return active_connections(cm)
 }
 
 /*
@@ -63,7 +67,7 @@ test_a_permanent_entry_leaving_keeps_the_count_honest :: proc(t: ^testing.T) {
 	// A listener loop, as `start_udp` and `start_stream_listener` register one,
 	// that then finishes - which is what shutdown does to all of them.
 	testing.expect_value(t, conn_spawn(&cm, nil, returns_immediately, counted = false), Spawn_Result.Started)
-	testing.expect_value(t, wait_for_reap(&cm, 0), 0)
+	testing.expect_value(t, wait_for_active(&cm, 0), 0)
 
 	// With the tally corrected, the one slot the limit allows is still one slot.
 	held := Held{}
@@ -179,7 +183,7 @@ test_a_finished_connection_gives_its_share_back :: proc(t: ^testing.T) {
 
 	client := client_prefix(net.IP4_Address{192, 0, 2, 1})
 	testing.expect_value(t, conn_spawn(&cm, nil, returns_immediately, client), Spawn_Result.Started)
-	testing.expect_value(t, wait_for_reap(&cm, 0), 0)
+	testing.expect_value(t, wait_for_active(&cm, 0), 0)
 
 	held := Held{}
 	defer sync.atomic_store(&held.go, true)
@@ -286,10 +290,10 @@ test_spawn_after_shutdown_is_refused :: proc(t: ^testing.T) {
 	conn_manager_init(&cm, 4, 0)
 
 	// A listener loop, registered the way start_udp/start_stream_listener do.
-	loop := Held{}
-	testing.expect_value(t, conn_spawn(&cm, &loop, holds_until_released, counted = false), Spawn_Result.Started)
+	listener := Held{}
+	testing.expect_value(t, conn_spawn(&cm, &listener, holds_until_released, counted = false), Spawn_Result.Started)
 
-	sync.atomic_store(&loop.go, true)
+	sync.atomic_store(&listener.go, true)
 	conn_manager_shutdown(&cm)
 	testing.expect_value(t, active_connections(&cm), 0)
 
@@ -314,20 +318,17 @@ test_spawn_after_shutdown_is_refused :: proc(t: ^testing.T) {
 
 // Shutdown started on a thread of its own, returned once it has marked the
 // manager stopped, so the caller can look at the table while it waits.
+// `stopped` is false if it had not within two seconds.
 @(private = "file")
-start_shutdown :: proc(cm: ^Conn_Manager) -> ^thread.Thread {
-	shutdown := thread.create_and_start_with_poly_data(cm, conn_manager_shutdown)
-	deadline := time.time_add(time.now(), 2 * time.Second)
-	for time.diff(time.now(), deadline) > 0 {
-		sync.mutex_lock(&cm.mu)
-		stopped := cm.stopped
-		sync.mutex_unlock(&cm.mu)
-		if stopped {
-			break
-		}
-		time.sleep(time.Millisecond)
-	}
-	return shutdown
+start_shutdown :: proc(cm: ^Conn_Manager) -> (shutdown: ^thread.Thread, stopped: bool) {
+	shutdown = thread.create_and_start_with_poly_data(cm, conn_manager_shutdown)
+	stopped = wait_until(proc(data: rawptr) -> bool {
+			cm := (^Conn_Manager)(data)
+			sync.mutex_lock(&cm.mu)
+			defer sync.mutex_unlock(&cm.mu)
+			return cm.stopped
+		}, cm, 2 * time.Second)
+	return
 }
 
 /*
@@ -342,12 +343,13 @@ test_a_connection_being_joined_is_still_counted :: proc(t: ^testing.T) {
 	cm: Conn_Manager
 	conn_manager_init(&cm, 4, 0)
 
-	loop := Held{go = true}
-	testing.expect_value(t, conn_spawn(&cm, &loop, holds_until_released, counted = false), Spawn_Result.Started)
+	listener := Held{go = true}
+	testing.expect_value(t, conn_spawn(&cm, &listener, holds_until_released, counted = false), Spawn_Result.Started)
 	client := Held{}
 	testing.expect_value(t, conn_spawn(&cm, &client, holds_until_released), Spawn_Result.Started)
 
-	shutdown := start_shutdown(&cm)
+	shutdown, stopped := start_shutdown(&cm)
+	testing.expect(t, stopped, "the shutdown never marked the manager stopped")
 	testing.expect_value(t, active_connections(&cm), 1)
 
 	sync.atomic_store(&client.go, true)
@@ -375,9 +377,10 @@ test_a_connection_closed_during_shutdown_is_not_counted :: proc(t: ^testing.T) {
 	testing.expect_value(t, conn_spawn(&cm, &older, holds_until_released), Spawn_Result.Started)
 	testing.expect_value(t, conn_spawn(&cm, &newer, holds_until_released), Spawn_Result.Started)
 
-	shutdown := start_shutdown(&cm)
+	shutdown, stopped := start_shutdown(&cm)
+	testing.expect(t, stopped, "the shutdown never marked the manager stopped")
 	sync.atomic_store(&older.go, true)
-	testing.expect_value(t, wait_for_reap(&cm, 1), 1)
+	testing.expect_value(t, wait_for_active(&cm, 1), 1)
 
 	sync.atomic_store(&newer.go, true)
 	thread.join(shutdown)

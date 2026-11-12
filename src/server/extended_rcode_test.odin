@@ -3,7 +3,6 @@ package server
 import "core:net"
 import "core:testing"
 import "core:thread"
-import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
@@ -29,43 +28,6 @@ catches it.
 
 @(private = "file")
 TLSA_NAME :: "_25._tcp.mx.example."
-
-@(private = "file")
-Canned_Exchange :: struct {
-	socket:   net.UDP_Socket,
-	reply:    []u8,
-	got:      bool,
-	// The query as it arrived, so a case can assert on what this server
-	// actually forwarded rather than only on what came back. Read after the
-	// thread is joined.
-	seen:     [512]u8,
-	seen_len: int,
-}
-
-/*
-Serve exactly one query with a canned reply.
-
-One query per thread, joined by the caller before it reads `got`: there is
-nothing shared to guard, and a query that never arrives leaves `got` false
-rather than hanging the suite - the socket carries a receive timeout.
-*/
-@(private = "file")
-serve_one_canned :: proc(x: ^Canned_Exchange) {
-	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
-		return
-	}
-	x.got = true
-	x.seen_len = copy(x.seen[:], buf[:n])
-
-	out: [4096]u8
-	copy(out[:], x.reply)
-	// Echo the ID it was asked with. The resolver draws a fresh one for every
-	// query it forwards, so nothing here can know it in advance.
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
-}
 
 /*
 The client's question. `edns` decides whether it offers an OPT record, which is
@@ -106,28 +68,6 @@ tlsa_query :: proc(edns := true, ext: u8 = 0) -> []u8 {
 extended_error_code :: proc(wire: []u8) -> int {
 	code, _ := extended_error(wire)
 	return code
-}
-
-// The info-code and the EXTRA-TEXT of the extended error a response carries,
-// or -1 and "" if it has none.
-@(private = "file")
-extended_error :: proc(wire: []u8) -> (code: int, text: string) {
-	msg, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
-		return -1, ""
-	}
-	for rec in msg.additional {
-		opt, is_opt := rec.data.(dns.Rdata_OPT)
-		if !is_opt {
-			continue
-		}
-		for option in opt.options {
-			if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
-				return int(option.data[0]) << 8 | int(option.data[1]), string(option.data[2:])
-			}
-		}
-	}
-	return -1, ""
 }
 
 /*
@@ -227,42 +167,6 @@ tlsa_answer_reply :: proc() -> []u8 {
 	return wire
 }
 
-// Binds a mock upstream on the loopback and hands back its spec.
-@(private = "file")
-bind_mock :: proc(t: ^testing.T, name: string) -> (socket: net.UDP_Socket, spec: config.Upstream_Spec, ok: bool) {
-	sock, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return {}, {}, false
-	}
-	// Only a bound on a hang, and past the upstream timeout below rather than
-	// under it: see the note on `MOCK_RECV_TIMEOUT`.
-	_ = net.set_option(sock, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(sock)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		net.close(sock)
-		return {}, {}, false
-	}
-	return sock, config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port}, true
-}
-
-// A forwarding server with nothing between the client and the upstream: no
-// cache to answer from or store into, no blocklist, and no validator - which is
-// the arrangement this guard exists for.
-@(private = "file")
-forwarding_config :: proc(specs: []config.Upstream_Spec) -> config.Config {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.upstream.strategy = .Failover
-	// One try, so a case that is going wrong says so instead of retrying.
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	cfg.upstream.servers = specs
-	return cfg
-}
-
 // The premise every case below rests on, asserted against the fixture rather
 // than assumed: rcode 16 with a header a client reads as NOERROR.
 @(private = "file")
@@ -300,7 +204,7 @@ test_an_extended_rcode_is_not_forwarded_to_the_client :: proc(t: ^testing.T) {
 
 	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	specs[0] = spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -314,11 +218,11 @@ test_an_extended_rcode_is_not_forwarded_to_the_client :: proc(t: ^testing.T) {
 		return
 	}
 
-	x := Canned_Exchange {
+	x := Canned_Mock {
 		socket = socket,
 		reply  = reply,
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_canned)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
 	out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
@@ -394,7 +298,7 @@ test_an_extended_rcode_with_a_nonzero_nibble_is_not_forwarded_either :: proc(t: 
 
 	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	specs[0] = spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -416,11 +320,11 @@ test_an_extended_rcode_with_a_nonzero_nibble_is_not_forwarded_either :: proc(t: 
 		dns.peek_rcode(reply),
 	)
 
-	x := Canned_Exchange {
+	x := Canned_Mock {
 		socket = socket,
 		reply  = reply,
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_canned)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
 	// Asked without EDNS, which is the other half of this case: there is no OPT
 	// record in the response to carry an extended error, and the refusal has to
 	// go out as a plain SERVFAIL rather than not at all.
@@ -483,7 +387,7 @@ test_a_broken_upstream_is_asked_past_for_an_extended_rcode :: proc(t: ^testing.T
 	specs := make([]config.Upstream_Spec, 2, context.temp_allocator)
 	specs[0] = broken_spec
 	specs[1] = good_spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -497,16 +401,16 @@ test_a_broken_upstream_is_asked_past_for_an_extended_rcode :: proc(t: ^testing.T
 		return
 	}
 
-	broken := Canned_Exchange {
+	broken := Canned_Mock {
 		socket = broken_socket,
 		reply  = reply,
 	}
-	good := Canned_Exchange {
+	good := Canned_Mock {
 		socket = good_socket,
 		reply  = tlsa_answer_reply(),
 	}
-	broken_mock := thread.create_and_start_with_poly_data(&broken, serve_one_canned)
-	good_mock := thread.create_and_start_with_poly_data(&good, serve_one_canned)
+	broken_mock := thread.create_and_start_with_poly_data(&broken, serve_canned)
+	good_mock := thread.create_and_start_with_poly_data(&good, serve_canned)
 	out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(broken_mock)
 	thread.join(good_mock)
@@ -573,7 +477,7 @@ test_a_readable_rcode_is_still_the_clients_answer :: proc(t: ^testing.T) {
 	specs := make([]config.Upstream_Spec, 2, context.temp_allocator)
 	specs[0] = first_spec
 	specs[1] = second_spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -582,11 +486,11 @@ test_a_readable_rcode_is_still_the_clients_answer :: proc(t: ^testing.T) {
 	defer upstream.destroy_group(group)
 	s := Server{cfg = &cfg, group = group}
 
-	x := Canned_Exchange {
+	x := Canned_Mock {
 		socket = first_socket,
 		reply  = plain_rcode_reply(.NX_Domain),
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_canned)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
 	out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
@@ -633,7 +537,7 @@ test_a_group_with_a_spare_is_asked_past_a_servfail :: proc(t: ^testing.T) {
 		specs := make([]config.Upstream_Spec, 2, context.temp_allocator)
 		specs[0] = broken_spec
 		specs[1] = good_spec
-		cfg := forwarding_config(specs)
+		cfg := test_config(specs)
 
 		group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 		if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -642,16 +546,16 @@ test_a_group_with_a_spare_is_asked_past_a_servfail :: proc(t: ^testing.T) {
 		defer upstream.destroy_group(group)
 		s := Server{cfg = &cfg, group = group}
 
-		broken := Canned_Exchange {
+		broken := Canned_Mock {
 			socket = broken_socket,
 			reply  = plain_rcode_reply(rcode),
 		}
-		good := Canned_Exchange {
+		good := Canned_Mock {
 			socket = good_socket,
 			reply  = tlsa_answer_reply(),
 		}
-		broken_mock := thread.create_and_start_with_poly_data(&broken, serve_one_canned)
-		good_mock := thread.create_and_start_with_poly_data(&good, serve_one_canned)
+		broken_mock := thread.create_and_start_with_poly_data(&broken, serve_canned)
+		good_mock := thread.create_and_start_with_poly_data(&good, serve_canned)
 		out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
 		thread.join(broken_mock)
 		thread.join(good_mock)
@@ -706,7 +610,7 @@ test_an_unnamed_extended_rcode_is_reported_as_a_number :: proc(t: ^testing.T) {
 
 	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	specs[0] = spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -726,11 +630,11 @@ test_an_unnamed_extended_rcode_is_reported_as_a_number :: proc(t: ^testing.T) {
 		return
 	}
 
-	x := Canned_Exchange {
+	x := Canned_Mock {
 		socket = socket,
 		reply  = reply,
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_canned)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
 	out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
@@ -774,7 +678,7 @@ test_a_clients_extended_rcode_byte_is_not_forwarded :: proc(t: ^testing.T) {
 
 	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
 	specs[0] = spec
-	cfg := forwarding_config(specs)
+	cfg := test_config(specs)
 
 	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
@@ -791,11 +695,11 @@ test_a_clients_extended_rcode_byte_is_not_forwarded :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, u16(dns.peek_rcode(query)), u16(64))
 
-	x := Canned_Exchange {
+	x := Canned_Mock {
 		socket = socket,
 		reply  = tlsa_answer_reply(),
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_canned)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
 	out, outcome, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)

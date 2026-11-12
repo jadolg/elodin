@@ -351,18 +351,6 @@ route_reply_alias :: proc(name, target, zone: string) -> []u8 {
 	return wire
 }
 
-// One UDP upstream on loopback, as `upstream.servers` would name it.
-@(private = "file")
-mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, port: int) -> ^upstream.Group {
-	one := cfg
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = port}
-	one.servers = servers
-	group, gerr := upstream.make_group(one, context.allocator, false)
-	testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr)
-	return group
-}
-
 /*
 Two UDP upstreams in one group, in the order `upstream.servers` lists them.
 
@@ -380,19 +368,6 @@ mock_group_pair :: proc(t: ^testing.T, cfg: config.Upstream_Config, first, secon
 	group, gerr := upstream.make_group(two, context.allocator, false)
 	testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr)
 	return group
-}
-
-@(private = "file")
-forwarding_config :: proc() -> config.Config {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = false
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	return cfg
 }
 
 /*
@@ -538,7 +513,7 @@ test_a_routed_question_reaches_its_own_upstream_and_not_the_default :: proc(t: ^
 	_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	route_bound, _ := net.bound_endpoint(route_socket)
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	group := mock_group(t, cfg.upstream, def_bound.port)
 	defer upstream.destroy_group(group)
 	routed := mock_group(t, cfg.upstream, route_bound.port)
@@ -610,7 +585,7 @@ test_an_unrouted_question_still_goes_to_the_default_upstream :: proc(t: ^testing
 	defer net.close(route_socket)
 	route_bound, _ := net.bound_endpoint(route_socket)
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	group := mock_group(t, cfg.upstream, def_bound.port)
 	defer upstream.destroy_group(group)
 	routed := mock_group(t, cfg.upstream, route_bound.port)
@@ -699,7 +674,7 @@ test_a_client_ds_query_at_a_routed_apex_leaves_the_route :: proc(t: ^testing.T) 
 		_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 		route_bound, _ := net.bound_endpoint(route_socket)
 
-		cfg := forwarding_config()
+		cfg := test_config()
 		group := mock_group(t, cfg.upstream, def_bound.port)
 		defer upstream.destroy_group(group)
 		routed := mock_group(t, cfg.upstream, route_bound.port)
@@ -843,7 +818,7 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 		route_bound, _ := net.bound_endpoint(route_socket)
 
-		cfg := forwarding_config()
+		cfg := test_config()
 		group := mock_group(t, cfg.upstream, def_bound.port)
 		defer upstream.destroy_group(group)
 		routed := mock_group(t, cfg.upstream, route_bound.port)
@@ -978,7 +953,7 @@ test_a_referral_nobody_does_better_than_is_a_servfail :: proc(t: ^testing.T) {
 			return
 		}
 
-		cfg := forwarding_config()
+		cfg := test_config()
 		group := mock_group(t, cfg.upstream, bound.port)
 		defer upstream.destroy_group(group)
 		s := Server {
@@ -1048,7 +1023,7 @@ test_a_referral_past_a_cname_into_another_route_is_handed_on :: proc(t: ^testing
 		return
 	}
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	def := mock_group(t, cfg.upstream, lab_bound.port)
 	defer upstream.destroy_group(def)
 	corp := mock_group(t, cfg.upstream, bound.port)
@@ -1103,7 +1078,7 @@ test_a_referral_is_no_chain_lookup :: proc(t: ^testing.T) {
 		return
 	}
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	group := mock_group(t, cfg.upstream, bound.port)
 	defer upstream.destroy_group(group)
 	s := Server {
@@ -1144,7 +1119,7 @@ test_a_malformed_opt_is_no_chain_lookup :: proc(t: ^testing.T) {
 		return
 	}
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	group := mock_group(t, cfg.upstream, bound.port)
 	defer upstream.destroy_group(group)
 	s := Server {
@@ -1203,7 +1178,7 @@ test_a_chain_lookup_answered_servfail_is_reported :: proc(t: ^testing.T) {
 		return
 	}
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	group := mock_group(t, cfg.upstream, bound.port)
 	defer upstream.destroy_group(group)
 	s := Server {
@@ -1255,7 +1230,7 @@ prevent, arriving by the road it opened.
 
 The parent's socket is bound and nobody serves it, which is what an upstream
 that has gone away looks like from here, and the timeout is cut so the case does
-not sit out `forwarding_config`'s three seconds. The control is
+not sit out `test_config`'s three seconds. The control is
 `test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds` above: a
 parent that answers the proof keeps the question, so this is the absence of a
 reply doing the work and not the fallback firing for everything.
@@ -1277,7 +1252,7 @@ test_an_apex_ds_the_parent_could_not_answer_falls_back_to_the_route :: proc(t: ^
 	_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	route_bound, _ := net.bound_endpoint(route_socket)
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	cfg.upstream.timeout = 200 * time.Millisecond
 
 	group := mock_group(t, cfg.upstream, def_bound.port)
@@ -1338,7 +1313,7 @@ around - is the answer, and it is kept like any other. Both arrangements run
 against one fixture and differ only in what the parent managed to say.
 
 The parent's socket is bound and served only for the cases that answer; the
-timeout is cut so the silent one does not sit out `forwarding_config`'s three
+timeout is cut so the silent one does not sit out `test_config`'s three
 seconds.
 */
 @(test)
@@ -1389,7 +1364,7 @@ test_an_apex_ds_the_route_answered_unproven_is_not_cached :: proc(t: ^testing.T)
 		_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 		route_bound, _ := net.bound_endpoint(route_socket)
 
-		cfg := forwarding_config()
+		cfg := test_config()
 		cfg.cache.enabled = true
 		cfg.upstream.timeout = 200 * time.Millisecond
 
@@ -1504,7 +1479,7 @@ test_an_apex_ds_neither_group_could_settle_is_a_servfail :: proc(t: ^testing.T) 
 	defer net.close(route_socket)
 	route_bound, _ := net.bound_endpoint(route_socket)
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	cfg.cache.enabled = true
 	cfg.upstream.timeout = 200 * time.Millisecond
 
@@ -1591,7 +1566,7 @@ test_a_parked_parent_group_is_skipped_for_an_apex_ds :: proc(t: ^testing.T) {
 	_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	route_bound, _ := net.bound_endpoint(route_socket)
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	cfg.upstream.timeout = 100 * time.Millisecond
 	/*
 	Two attempts, which is the default and the figure that makes this case bite.
@@ -1700,7 +1675,7 @@ test_a_parked_parent_is_still_asked_when_the_route_is_parked_too :: proc(t: ^tes
 	defer net.close(route_socket)
 	route_bound, _ := net.bound_endpoint(route_socket)
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	cfg.upstream.timeout = 50 * time.Millisecond
 	// Round 0 skips a parked server and round 1 tries it anyway, so it takes two
 	// attempts for there to be anything here to keep.
@@ -1822,7 +1797,7 @@ test_an_apex_ds_sweeps_the_parents_group_past_a_refusal :: proc(t: ^testing.T) {
 	defer net.close(route_socket)
 	route_bound, _ := net.bound_endpoint(route_socket)
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	// Only the unserved route socket ever waits this out, and only when the
 	// sweep failed to find the proof.
 	cfg.upstream.timeout = 200 * time.Millisecond
@@ -1947,7 +1922,7 @@ test_a_parent_that_settles_nothing_is_not_re_asked_for_every_query :: proc(t: ^t
 		_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 		route_bound, _ := net.bound_endpoint(route_socket)
 
-		cfg := forwarding_config()
+		cfg := test_config()
 		// Cut, so that a second query which should not have gone to the parent
 		// does not sit out three seconds before this case says so.
 		cfg.upstream.timeout = 200 * time.Millisecond
@@ -2088,7 +2063,7 @@ one answer the carve-out went to fetch and nothing else.
 
 The first query is the fixture: a SERVFAIL from the parent is what writes the
 memory the second query is about. The timeout is cut so a route that is not
-serving does not sit out `forwarding_config`'s three seconds.
+serving does not sit out `test_config`'s three seconds.
 */
 @(test)
 test_the_memo_still_asks_the_parent_unless_the_route_answered_the_nodata :: proc(t: ^testing.T) {
@@ -2130,7 +2105,7 @@ test_the_memo_still_asks_the_parent_unless_the_route_answered_the_nodata :: proc
 		_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 		route_bound, _ := net.bound_endpoint(route_socket)
 
-		cfg := forwarding_config()
+		cfg := test_config()
 		cfg.upstream.timeout = 200 * time.Millisecond
 
 		group := mock_group(t, cfg.upstream, def_bound.port)
@@ -2278,7 +2253,7 @@ test_a_parent_that_never_replied_is_asked_again :: proc(t: ^testing.T) {
 	_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	route_bound, _ := net.bound_endpoint(route_socket)
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	cfg.upstream.timeout = 200 * time.Millisecond
 
 	group := mock_group(t, cfg.upstream, def_bound.port)
@@ -2369,7 +2344,7 @@ test_the_memo_fallback_keeps_what_the_parent_settled :: proc(t: ^testing.T) {
 	_ = net.set_option(route_socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 	route_bound, _ := net.bound_endpoint(route_socket)
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	cfg.cache.enabled = true
 	cfg.upstream.timeout = 200 * time.Millisecond
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300})
@@ -2765,7 +2740,7 @@ test_a_routed_zone_may_answer_with_private_addresses :: proc(t: ^testing.T) {
 		_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
 		bound, _ := net.bound_endpoint(socket)
 
-		cfg := forwarding_config()
+		cfg := test_config()
 		cfg.rebind.enabled = true
 
 		/*
@@ -3012,7 +2987,7 @@ test_an_apex_ds_spends_one_budget_across_both_groups :: proc(t: ^testing.T) {
 		net.close(socket)
 	}
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	cfg.upstream.timeout = 400 * time.Millisecond
 
 	// The parent: two members, neither of which answers.
@@ -3057,7 +3032,7 @@ after lookup.
 */
 @(test)
 test_the_question_span_is_the_longest_group_budget :: proc(t: ^testing.T) {
-	cfg := forwarding_config()
+	cfg := test_config()
 	cfg.upstream.timeout = 5 * time.Second
 	group := mock_group(t, cfg.upstream, 9)
 	defer upstream.destroy_group(group)
@@ -3164,7 +3139,7 @@ test_the_memo_fallback_holds_out_for_the_parents_proof :: proc(t: ^testing.T) {
 		ports[i] = bound.port
 	}
 
-	cfg := forwarding_config()
+	cfg := test_config()
 	cfg.upstream.timeout = 200 * time.Millisecond
 
 	group := mock_group_pair(t, cfg.upstream, ports[0], ports[1])

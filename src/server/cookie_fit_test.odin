@@ -2,7 +2,6 @@ package server
 
 import "core:testing"
 import "elodin:cache"
-import "elodin:config"
 import "elodin:dns"
 
 /*
@@ -108,40 +107,13 @@ big_answer :: proc() -> (wire: []u8, records: int) {
 
 @(private = "file")
 client_query :: proc(advertised: u16) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-	}
 	// Eight bytes, which is a client that has not been here before: the verdict
 	// is `Unproven` and a cookie is minted for it.
 	half := make([]u8, 8, context.temp_allocator)
 	for i in 0 ..< len(half) {
 		half[i] = u8(0xa0 + i)
 	}
-	options := make([]dns.EDNS_Option, 1, context.temp_allocator)
-	options[0] = dns.EDNS_Option {
-		code = u16(dns.EDNS_Option_Code.Cookie),
-		data = half,
-	}
-	opt := dns.make_opt(advertised, false)
-	opt.data = dns.Rdata_OPT{options = options}
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = opt
-
-	msg := dns.Message {
-		id         = 0x1234,
-		question   = question,
-		additional = additional,
-	}
-	msg.flags.rd = true
-
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_query(QNAME, id = 0x1234, opt = opt_with(.Cookie, half, advertised))
 }
 
 /*
@@ -150,10 +122,8 @@ end to end with no upstream behind it and the answer's size chosen here.
 */
 @(private = "file")
 answer_once :: proc(t: ^testing.T, stored_wire: []u8, advertised: u16) -> (out: []u8, ok: bool) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.blocking.enabled = false
-	cfg.dnssec.enabled = false
+	cfg := test_config()
+	cfg.cache.enabled = true
 	cfg.cookies.enabled = true
 	cfg.cookies.secret = SECRET
 
@@ -170,12 +140,7 @@ answer_once :: proc(t: ^testing.T, stored_wire: []u8, advertised: u16) -> (out: 
 	}
 	defer stop_cookies(&s)
 
-	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
-	decoded, derr := dns.decode_message(stored_wire, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
-	if !cache.put(answers, key, stored_wire, decoded) {
-		testing.expect(t, false, "the answer was not cached")
+	if !seed_cache(t, answers, QNAME, stored_wire) {
 		return nil, false
 	}
 
@@ -224,12 +189,16 @@ test_a_cookie_that_will_not_fit_does_not_truncate_the_answer :: proc(t: ^testing
 		return
 	}
 	advertised := u16(len(stored) + 20)
-	// Above the 512 floor `dns.edns_udp_size` clamps to, or the arithmetic
-	// above is not the arithmetic under test.
-	if !testing.expectf(t, int(advertised) > 512, "the answer is only %d bytes", len(stored)) {
+	// Above the `dns.MAX_UDP_SIZE` floor `dns.edns_udp_size` clamps to, or the
+	// arithmetic above is not the arithmetic under test.
+	if !testing.expectf(t, int(advertised) > dns.MAX_UDP_SIZE, "the answer is only %d bytes", len(stored)) {
 		return
 	}
-	testing.expect(t, COOKIE_OPTION_LEN > 20, "the cookie fits after all, so this case is not reachable")
+	// A runtime check, not `#assert`: test files are compiled into every build,
+	// and this premise failing is a test's problem, not the binary's.
+	if !testing.expect(t, COOKIE_OPTION_LEN > 20, "the cookie fits after all, so this case is not reachable") {
+		return
+	}
 
 	out, ok := answer_once(t, stored, advertised)
 	if !testing.expect(t, ok, "the query went unanswered") {
@@ -292,11 +261,11 @@ test_an_answer_over_the_buffer_is_truncated_and_keeps_its_opt :: proc(t: ^testin
 	if !testing.expect(t, len(stored) > 0, "the answer would not encode") {
 		return
 	}
-	if !testing.expectf(t, len(stored) > 512 + OPT_LEN, "the answer is only %d bytes", len(stored)) {
+	if !testing.expectf(t, len(stored) > dns.MAX_UDP_SIZE + OPT_LEN, "the answer is only %d bytes", len(stored)) {
 		return
 	}
 
-	out, ok := answer_once(t, stored, 512)
+	out, ok := answer_once(t, stored, dns.MAX_UDP_SIZE)
 	if !testing.expect(t, ok, "the query went unanswered") {
 		return
 	}
@@ -309,7 +278,7 @@ test_an_answer_over_the_buffer_is_truncated_and_keeps_its_opt :: proc(t: ^testin
 	// client still reads what this server can deliver over UDP.
 	testing.expect(t, r.opt, "the truncated answer lost its OPT record")
 	testing.expect(t, !r.cookie, "the cookie fits after all, so this case is not reachable")
-	testing.expectf(t, r.length <= 512, "the answer is %d bytes, past the 512 advertised", r.length)
+	testing.expectf(t, r.length <= dns.MAX_UDP_SIZE, "the answer is %d bytes, past the %d advertised", r.length, dns.MAX_UDP_SIZE)
 
 	free_all(context.temp_allocator)
 }

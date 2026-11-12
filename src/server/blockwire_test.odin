@@ -53,8 +53,8 @@ test_block_wire_is_the_encoders_bytes :: proc(t: ^testing.T) {
 				for typed_only in ([2]bool{false, true}) {
 					for opt in 0 ..< 3 {
 						q := block_query(name, qtype, opt, rd = opt != 1, cd = opt == 1)
-						fast, ok := block_wire(&s, q, q.question[0], context.temp_allocator, 512, typed_only)
-						want := encode_block_response(&s, q, q.question[0], context.temp_allocator, 512, typed_only)
+						fast, ok := block_wire(&s, q, q.question[0], context.temp_allocator, dns.MAX_UDP_SIZE, typed_only)
+						want := encode_block_response(&s, q, q.question[0], context.temp_allocator, dns.MAX_UDP_SIZE, typed_only)
 						what := fmt.tprintf("%v %s %v typed_only=%v opt=%d", mode, name, qtype, typed_only, opt)
 						if testing.expectf(t, ok, "%s: left to the encoder", what) {
 							testing.expectf(t, string(fast) == string(want), "%s:\n got % x\nwant % x", what, fast, want)
@@ -84,7 +84,13 @@ test_block_wire_leaves_the_rest_to_the_encoder :: proc(t: ^testing.T) {
 	cases := []struct {
 		name:  string,
 		limit: int,
-	}{{"x.invalid.", 512}, {"x.LocalHost.", 512}, {"hostmaster.INVALID.", 512}, {".", 512}, {"blocked.bench.test.", 40}}
+	}{
+		{"x.invalid.", dns.MAX_UDP_SIZE},
+		{"x.LocalHost.", dns.MAX_UDP_SIZE},
+		{"hostmaster.INVALID.", dns.MAX_UDP_SIZE},
+		{".", dns.MAX_UDP_SIZE},
+		{"blocked.bench.test.", 40},
+	}
 	for c in cases {
 		q := block_query(c.name, .A, 1, true, false)
 		_, ok := block_wire(&s, q, q.question[0], context.temp_allocator, c.limit, false)
@@ -110,7 +116,7 @@ test_block_response_is_one_allocation :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	q := block_query("blocked.bench.test.", .A, 1, true, false)
 
-	out := build_block_response(&s, q, q.question[0], mem.tracking_allocator(&track), 512)
+	out := build_block_response(&s, q, q.question[0], mem.tracking_allocator(&track), dns.MAX_UDP_SIZE)
 	testing.expectf(t, len(out) > 0, "no block answer")
 	testing.expectf(t, track.total_allocation_count == 1, "a block answer took %d allocations, want 1", track.total_allocation_count)
 	delete(out, mem.tracking_allocator(&track))

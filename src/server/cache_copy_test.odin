@@ -69,25 +69,23 @@ test_a_stale_lend_reads_the_rules_in_force :: proc(t: ^testing.T) {
 	filter.engine_swap(engine, filter.set_make(), filter.set_make())
 	s.filters = engine
 
-	m := dns.Message {
-		question = []dns.Question{{name = STALE_NAME, type = .A, class = .IN}},
-		answer   = []dns.Record {
-			{name = STALE_NAME, type = .CNAME, class = .IN, ttl = 300, data = dns.Rdata_Name{name = "cdn.example.net."}},
-			{name = "cdn.example.net.", type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {192, 0, 2, 1}}},
-		},
-	}
-	m.flags.qr = true
-	m.flags.ra = true
-	wire, _, enc := dns.encode_message(m, context.temp_allocator)
-	decoded, derr := dns.decode_message(wire, context.temp_allocator)
-	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
+	wire := test_reply(
+		STALE_NAME,
+		.A,
+		cname_record(STALE_NAME, "cdn.example.net.", ttl = 300),
+		a_record("cdn.example.net.", {192, 0, 2, 1}, ttl = 300),
+	)
 	before := rules_generation(&s)
-	if !testing.expect(t, enc == .None && derr == .None && cache.put(answers, key, wire, decoded, before), "the answer was not cached") {
+	if !seed_cache(t, answers, STALE_NAME, wire, checked = before) {
 		return
 	}
+	kb: [cache.KEY_MAX]u8
+	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
 	if e, found := answers.shards[0].entries[key]; found {
 		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
+	} else {
+		testing.expect(t, false, "the answer went in under another key")
+		return
 	}
 
 	held, found := stored_answer(&s, key, before, context.temp_allocator)
@@ -108,10 +106,8 @@ without bytes has nothing to serve.
 */
 @(test)
 test_a_standing_refusal_copies_nothing :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
+	cfg := test_config()
 	cfg.cache.enabled = true
-	cfg.dnssec.enabled = false
 	cfg.blocking.enabled = true
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
 	defer cache.destroy(answers)
@@ -135,16 +131,20 @@ test_a_standing_refusal_copies_nothing :: proc(t: ^testing.T) {
 	}
 
 	cfg.blocking.enabled = false
-	msg, _ := dns.decode_message(stale_query(true), context.temp_allocator)
+	query := stale_query(true)
+	msg, derr := dns.decode_message(query, context.temp_allocator)
+	if !testing.expect(t, derr == .None && len(msg.question) == 1, "the query does not decode") {
+		return
+	}
 	spent: int
 	st := Query_State {
 		s         = &s,
-		query     = stale_query(true),
+		query     = query,
 		msg       = msg,
 		q         = msg.question[0],
 		proto     = .UDP,
 		client    = "127.0.0.1:5555",
-		limit     = 512,
+		limit     = dns.MAX_UDP_SIZE,
 		spent     = &spent,
 		allocator = context.temp_allocator,
 	}

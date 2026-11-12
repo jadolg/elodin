@@ -5,7 +5,6 @@ import "core:strings"
 import "core:testing"
 import "core:time"
 import "elodin:config"
-import "elodin:dns"
 
 /*
 A datagram that proves its source with a server cookie is charged to a pool of
@@ -16,6 +15,13 @@ have it dropped (issue #296).
 @(private = "file")
 SECRET :: [COOKIE_SECRET_LEN]u8{0xe5, 0xe9, 0x73, 0xe5, 0xa6, 0xb2, 0xa4, 0x3f, 0x48, 0xe7, 0xdc, 0x84, 0x9e, 0x37, 0xbf, 0xcf}
 
+// The datagram pool's rate, and so its burst, in every case here.
+@(private = "file")
+RATE :: 10
+
+@(private = "file")
+BURST :: RATE * RRL_BURST_SECONDS
+
 @(private = "file")
 tick :: proc(ms: i64) -> time.Tick {
 	return time.Tick{_nsec = (3600 + ms) * i64(time.Millisecond)}
@@ -25,20 +31,10 @@ tick :: proc(ms: i64) -> time.Tick {
 // when `cookie` is nil.
 @(private = "file")
 cookie_query :: proc(cookie: []u8) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = "example.", type = .A, class = .IN}
-	m := dns.Message{id = 0x2960, question = question}
-	if cookie != nil {
-		options := make([]dns.EDNS_Option, 1, context.temp_allocator)
-		options[0] = dns.EDNS_Option{code = u16(dns.EDNS_Option_Code.Cookie), data = cookie}
-		opt := dns.make_opt(1232, false)
-		opt.data = dns.Rdata_OPT{options = options}
-		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = opt
-		m.additional = additional
+	if cookie == nil {
+		return test_query("example.", id = 0x2960, rd = false)
 	}
-	wire, _, _ := dns.encode_message(m, context.temp_allocator)
-	return wire
+	return test_query("example.", id = 0x2960, rd = false, opt = opt_with(.Cookie, cookie))
 }
 
 // The cookie this server would hand `client`, minted through the string path
@@ -48,13 +44,16 @@ cookie_query :: proc(cookie: []u8) -> []u8 {
 issued_to :: proc(k: ^Cookie_Keeper, client: net.Endpoint) -> [COOKIE_REPLY_LEN]u8 {
 	req: Cookie_Request
 	req.client = {0x24, 0x64, 0xc4, 0xab, 0xcf, 0x10, 0xc9, 0x57}
-	req.ip_len, _ = cookie_client_ip(net.endpoint_to_string(client, context.temp_allocator), req.ip[:])
+	ok: bool
+	req.ip_len, ok = cookie_client_ip(net.endpoint_to_string(client, context.temp_allocator), req.ip[:])
+	if !ok {
+		panic("the client's address does not bind a cookie")
+	}
 	return make_cookie(k, req, cookie_now())
 }
 
 @(test)
 test_a_cookie_client_is_not_dropped_with_a_flood_naming_its_prefix :: proc(t: ^testing.T) {
-	RATE :: 10
 	r := make_rate_limiter(RATE, 0)
 	defer destroy_rate_limiter(r)
 	k := Cookie_Keeper{secret = SECRET}
@@ -66,7 +65,7 @@ test_a_cookie_client_is_not_dropped_with_a_flood_naming_its_prefix :: proc(t: ^t
 
 	// The flood empties the prefix's datagram pool.
 	plain := cookie_query(nil)
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS * 4 {
+	for _ in 0 ..< BURST * 4 {
 		datagram_rate_check(r, &k, plain, spoofed, tick(0))
 	}
 	v, proven := datagram_rate_check(r, &k, plain, client, tick(0))
@@ -104,8 +103,6 @@ empty the slip's verdict stands.
 */
 @(test)
 test_a_cookie_client_spends_the_datagram_pool_first :: proc(t: ^testing.T) {
-	RATE :: 10
-	BURST :: RATE * RRL_BURST_SECONDS
 	r := make_rate_limiter(RATE, 2)
 	defer destroy_rate_limiter(r)
 	k := Cookie_Keeper{secret = SECRET}
@@ -152,8 +149,6 @@ test_a_cookie_client_spends_the_datagram_pool_first :: proc(t: ^testing.T) {
 // cookie that outlived its address aims no more bytes at it than a datagram.
 @(test)
 test_a_rescued_answer_is_billed_to_the_proven_pool :: proc(t: ^testing.T) {
-	RATE :: 10
-	BURST :: RATE * RRL_BURST_SECONDS
 	r := make_rate_limiter(RATE, 0, response_size_estimate = 100)
 	defer destroy_rate_limiter(r)
 	client := net.Endpoint{address = net.IP4_Address{192, 0, 2, 5}, port = 30000}
@@ -199,8 +194,6 @@ the stream pool a datagram cannot reach.
 */
 @(test)
 test_a_replayed_cookie_cannot_refuse_the_prefix_connections :: proc(t: ^testing.T) {
-	RATE :: 10
-	BURST :: RATE * RRL_BURST_SECONDS
 	r := make_rate_limiter(RATE, 0)
 	defer destroy_rate_limiter(r)
 	k := Cookie_Keeper{secret = SECRET}
