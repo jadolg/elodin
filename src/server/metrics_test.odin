@@ -18,8 +18,8 @@ import "elodin:upstream"
 /*
 A `Server` with counters and nothing else behind them.
 
-`render_metrics` reaches for the cache, the filter engine, the upstream group
-and the two pools, and every one of those is absent here: what is being tested
+`render_metrics` reaches for the cache, the filter engine and the upstream
+group, and every one of those is absent here: what is being tested
 is what the endpoint says about the numbers, and the components have tests of
 their own. The renderer leaves out the families it has no component for, which
 is why this builds.
@@ -39,7 +39,7 @@ metrics_fixture :: proc(stats: Stats) -> (Server, config.Config) {
 // `limiter` defaults to none, which is what every case about `Stats` wants: the
 // endpoint reads the limiter's counters through `rate_limit_stats`, which answers
 // zeroes for a nil one. A case about those counters passes one in.
-@(private)
+@(private = "file")
 render_fixture :: proc(stats: Stats, limiter: ^Rate_Limiter = nil) -> string {
 	s, cfg := metrics_fixture(stats)
 	s.cfg = &cfg
@@ -346,7 +346,7 @@ test_the_process_family_is_published :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-@(private)
+@(private = "file")
 expect_line :: proc(t: ^testing.T, page: string, line: string, loc := #caller_location) {
 	// With the newline, so that a shorter name is not matched by a longer one
 	// that happens to start with it.

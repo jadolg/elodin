@@ -19,7 +19,7 @@ resolver that quietly serves whatever it is handed.
 */
 
 @(private = "file")
-dnssec_config :: proc(r: ^Runner, udp_port: int, upstream_port: int, extra := "") -> string {
+dnssec_config :: proc(udp_port: int, upstream_port: int, extra := "") -> string {
 	return fmt.tprintf(
 		`log:
   level: info
@@ -63,7 +63,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	srv, ok := start_server(
 		r,
 		Server_Options {
-			config = dnssec_config(r, udp_port, upstream_port, "special_use: {private_reverse: false}\n"),
+			config = dnssec_config(udp_port, upstream_port, "special_use: {private_reverse: false}\n"),
 			udp_port = udp_port,
 		},
 	)
@@ -328,7 +328,7 @@ special_use: {{private_reverse: false}}
 			defer mock_stop(cut_mock)
 			start_case(r, name)
 			cut_udp := next_port(r)
-			config := dnssec_config(r, cut_udp, cut_port, fmt.tprintf("  trust_anchors: [%q]\n", CNAME_CUT_ANCHOR))
+			config := dnssec_config(cut_udp, cut_port, fmt.tprintf("  trust_anchors: [%q]\n", CNAME_CUT_ANCHOR))
 			cut, started := start_server(r, Server_Options{config = config, udp_port = cut_udp})
 			if started {
 				defer stop_server(&cut)

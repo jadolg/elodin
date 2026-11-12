@@ -1578,12 +1578,11 @@ denial_claimed :: proc(msg: dns.Message) -> bool {
 /*
 What the answer section does with the question, as the chain sees it.
 
-`answers_question` folds two different outcomes into one `true`: a record of
-the type asked for, and a CNAME chain that stopped short of it. The second is
-not an answer - it is a redirection, and whatever explains the missing type
-lives in the authority section, signed by the zone at the chain's end. Keeping
-them apart is what lets the caller demand that proof of the second and not of
-the first.
+Two different outcomes are kept apart here: a record of the type asked for, and
+a CNAME chain that stopped short of it. The second is not an answer - it is a
+redirection, and whatever explains the missing type lives in the authority
+section, signed by the zone at the chain's end. Keeping them apart is what lets
+the caller demand that proof of the second and not of the first.
 */
 @(private)
 Answer_Shape :: enum u8 {
@@ -1606,17 +1605,6 @@ get this wrong: an attacker with a signed zone of its own appends
 `x.evil.example. A`, which has nothing to do with the question, and a scan sees
 the type and stops asking.
 */
-@(private)
-chain_shape :: proc(
-	records: []dns.Record,
-	qname: string,
-	qtype: dns.Type,
-	class: dns.Class,
-) -> Answer_Shape {
-	shape, _ := chain_walk(records, qname, qtype, class)
-	return shape
-}
-
 @(private)
 chain_walk :: proc(
 	records: []dns.Record,
@@ -1687,7 +1675,7 @@ appended CNAME redirects the walk to a name the sender chose and empties it, and
 one appended record at the end fills it. Neither is possible over sets that had
 to survive a zone's signature to get into `kept`.
 
-Close to `chain_shape` and not the same question, which is why it is written out
+Close to `chain_walk` and not the same question, which is why it is written out
 rather than borrowed. That one reports whether the question was *answered*; this
 one reports whether a name was *proven*. A chain ending in an AAAA where an A was
 asked for is `.Chain_Only` and no answer at all, and is still a name shown to
@@ -5296,26 +5284,6 @@ answerable_rcode :: proc(msg: dns.Message) -> bool {
 		return true
 	}
 	return false
-}
-
-/*
-Does this answer section address `qname`?
-
-Walks the CNAME chain from the name that was asked about. Reaching the type
-asked for settles it; so does running out of records after at least one hop,
-because a chain that stops before its target is a perfectly ordinary answer -
-the zone at the end may simply hold nothing of that type, and what proves that
-is the denial in the authority section, not anything here.
-
-What this refuses is an answer section with nothing at the queried name at all,
-which is not an answer to this question whatever else it is.
-
-Only the shape is checked: whether the records that led there carried
-signatures from the zones that own them is the caller's to establish.
-*/
-@(private)
-answers_question :: proc(records: []dns.Record, qname: string, qtype: dns.Type, class: dns.Class) -> bool {
-	return chain_shape(records, qname, qtype, class) != .None
 }
 
 @(private)

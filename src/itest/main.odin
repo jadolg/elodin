@@ -387,17 +387,11 @@ report :: proc(r: ^Runner, elapsed: time.Duration) {
 	fmt.println()
 	fmt.printfln("ports used: %d of %d", r.next_port - (r.port_limit - SLOT_PORTS + 1), SLOT_PORTS - 1)
 
-	problems := 0
-	for line in r.failures {
-		if strings.has_prefix(line, "FAIL") || strings.has_prefix(line, "SKIP") {
-			if problems == 0 {
-				fmt.println("details:")
-			}
+	if len(r.failures) > 0 {
+		fmt.println("details:")
+		for line in r.failures {
 			fmt.printfln("  %s", line)
-			problems += 1
 		}
-	}
-	if problems > 0 {
 		fmt.println()
 	}
 

@@ -1267,14 +1267,14 @@ Close_Hook :: struct {
 }
 
 /*
-Stands in for a handler thread completing `respond` inside the window
+Stands in for a handler's fiber completing `respond` inside the window
 `handle_data` leaves open between releasing `c.mu` after appending the body and
 re-acquiring it to record the stream's final state.
 
 `handle_data` reaches here through the WINDOW_UPDATE it writes for the bytes it
 just consumed, which is where the real race lands: `write_all` holds `c.mu` for
-the length of this call, so a `respond` running on a handler-pool worker would
-be parked on that mutex right here and would take it the moment this returns.
+the length of this call, so a `respond` running on a handler's fiber would be
+parked on that mutex right here and would take it the moment this returns.
 Retiring the stream inline reproduces that ordering without asking the scheduler
 to produce it.
 
@@ -1404,7 +1404,7 @@ test_dynamic_table_update_is_bounded_by_the_advertised_limit :: proc(t: ^testing
 		{MAX_HEADER_LIST, false, .Bad_Update, "the largest update that gets this far"},
 		// Past what `read_integer` will read at all, whatever it is for.
 		{MAX_HEADER_LIST + 1, false, .Too_Large, "past the integer cap"},
-		{65536, false, .Too_Large, "the old local cap"},
+		{65536, false, .Too_Large, "a 64 KiB table"},
 	}
 
 	for c in CASES {
@@ -1755,8 +1755,8 @@ test_response_gives_up_when_no_window_is_granted :: proc(t: ^testing.T) {
 	/*
 	A client that advertises a zero window and then says nothing leaves the
 	handler answering it parked on flow control. Nothing else marks the
-	connection dead - its reader is perfectly healthy - so the wait had no end
-	to it, and one connection could pin a worker per stream, up to
+	connection dead - its reader is perfectly healthy - so without a bound the
+	wait has no end, and one connection pins a handler per stream, up to
 	MAX_CONCURRENT of them.
 	*/
 	track: mem.Tracking_Allocator

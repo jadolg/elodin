@@ -232,10 +232,10 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	*/
 	cfg.cache.serve_stale = true
 	cfg.cache.stale_timeout = 2 * time.Second
-	workers: Test_Loop
-	start_test_loop(&workers)
-	defer stop_test_loop(&workers)
-	s.loops = workers.loops[:]
+	tl: Test_Loop
+	start_test_loop(&tl)
+	defer stop_test_loop(&tl)
+	s.loops = tl.loops[:]
 	expire :: proc(answers: ^cache.Cache) {
 		for _, e in answers.shards[0].entries {
 			e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)

@@ -82,7 +82,13 @@ stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}, idle := tim
 
 /*
 How long the next read may wait, on whichever half the stream reads through.
-Never less than a millisecond: a zero `SO_RCVTIMEO` is no timeout at all.
+
+Never under a millisecond, and that is not rounding. `SO_RCVTIMEO` is a
+`timeval`, so core:net turns a duration under a microsecond into a zero one -
+which on Linux does not mean "expire at once" but "no timeout at all", and the
+read that was meant to be the shortest of all would be the one that never
+returned. A caller reaching here with a sliver of its deadline left is
+ordinary: a waiter that woke a hair before its own expiry.
 */
 stream_set_read_timeout :: proc(s: ^Stream, timeout: time.Duration) {
 	bounded := max(timeout, time.Millisecond)
@@ -93,7 +99,8 @@ stream_set_read_timeout :: proc(s: ^Stream, timeout: time.Duration) {
 	_ = net.set_option(s.socket, .Receive_Timeout, bounded)
 }
 
-// The same for the next write.
+// The same for the next write, with the same floor for the same reason:
+// `SO_SNDTIMEO` is a `timeval` too.
 stream_set_write_timeout :: proc(s: ^Stream, timeout: time.Duration) {
 	bounded := max(timeout, time.Millisecond)
 	if s.tls != nil {
@@ -373,8 +380,22 @@ Http_Request :: struct {
 	body:         []u8,
 	content_type: string,
 	accept:       string,
-	// Extra headers, already formatted as "Name: value" without CRLF.
-	extra:        []string,
+}
+
+/*
+RFC 9110 5.5: a field value an HTTP/1.1 request can carry. `h2.field_value_is_valid`
+holds RFC 9113's rule, which refuses only what ends a field (NUL, CR, LF) and
+the whitespace a reader trims; RFC 9110 also refuses every other control but
+HTAB, which may sit between `field-vchar`s, and DEL.
+*/
+@(private = "file")
+request_field_value_is_valid :: proc(value: string) -> bool {
+	for i in 0 ..< len(value) {
+		if (value[i] < ' ' && value[i] != '\t') || value[i] == 0x7f {
+			return false
+		}
+	}
+	return h2.field_value_is_valid(value)
 }
 
 // What `http_exchange` takes for a body unless told otherwise: a blocklist. A
@@ -427,13 +448,19 @@ http_exchange :: proc(
 	err: Error,
 ) {
 	/*
-	The path and host go into the request line and `Host` verbatim, so a byte
-	there the request line cannot hold is a request of this client's making that
-	a server reads some other way - or, given a CR LF, one carrying fields
-	nobody meant to send. Checked here, where every request line is written: a
-	list url comes from config, and a redirect's from whoever answered (#438).
+	Every field goes onto the wire verbatim, so a byte there the request line or
+	a header cannot hold is a request of this client's making that a server reads
+	some other way - or, given a CR LF, one carrying fields nobody meant to send.
+	Checked here, where every request is written: a list url comes from config,
+	and a redirect's from whoever answered (#438). The method and the two header
+	values are held to the same rule, so that a caller passing one through cannot
+	open the same hole.
 	*/
-	if !h2.target_is_valid(req.path) || !h2.authority_is_valid(req.host) {
+	if !h2.is_token(req.method) ||
+	   !h2.target_is_valid(req.path) ||
+	   !h2.authority_is_valid(req.host) ||
+	   !request_field_value_is_valid(req.accept) ||
+	   !request_field_value_is_valid(req.content_type) {
 		return {}, .HTTP_Error
 	}
 	b := strings.builder_make(context.temp_allocator)
@@ -456,10 +483,6 @@ http_exchange :: proc(
 		}
 		strings.write_string(&b, "Content-Length: ")
 		strings.write_int(&b, len(req.body))
-		strings.write_string(&b, "\r\n")
-	}
-	for h in req.extra {
-		strings.write_string(&b, h)
 		strings.write_string(&b, "\r\n")
 	}
 	strings.write_string(&b, "\r\n")

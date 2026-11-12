@@ -19,6 +19,21 @@ here mocks OpenSSL: the property under test is how this package drives it from
 more than one thread at a time, and a mock would define that away.
 */
 
+@(private = "file")
+SSL_CTRL_SESS_NUMBER :: 20
+
+// The mode bits of one connection; `SSL_get_mode` is a macro for this.
+@(private = "file")
+ssl_get_mode :: proc(ssl: ^SSL) -> c.long {
+	return SSL_ctrl(ssl, SSL_CTRL_MODE, 0, nil)
+}
+
+// How many sessions the context's internal cache holds right now.
+@(private = "file")
+ssl_ctx_sess_number :: proc(ctx: ^SSL_CTX) -> int {
+	return int(SSL_CTX_ctrl(ctx, SSL_CTRL_SESS_NUMBER, 0, nil))
+}
+
 /*
 Provide a certificate, the same way the integration suite does.
 
@@ -349,10 +364,10 @@ test_concurrent_read_and_write_on_one_connection :: proc(t: ^testing.T) {
 	One thread writing while another reads, on a single `Conn`.
 
 	This is what HTTP/2 does to every connection it owns: `h2.serve` reads
-	frames on the connection's own thread while responses are written from
-	handler-pool workers. OpenSSL does not allow one `SSL` object to be driven
-	by two threads at once, so without serialisation inside this package the
-	two corrupt each other's view of the session.
+	frames on the connection's own fiber while responses are written from the
+	handlers' fibers, on any loop. OpenSSL does not allow one `SSL` object to be
+	driven by two threads at once, so without serialisation inside this package
+	the two corrupt each other's view of the session.
 
 	The bytes are checked on the way back, so a session that comes apart shows
 	up as a failed read or as data that does not match what was sent.

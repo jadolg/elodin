@@ -210,7 +210,8 @@ test_a_step_whose_hashing_ran_out_is_not_read_as_an_absent_name :: proc(t: ^test
 	measured := Nsec3_Budget {
 		max_iterations = 150,
 	}
-	testing.expect_value(t, denial_step_probe(zone, "ent.example.", &measured), Step.No_Cut)
+	probe, _ := denial_step(nil, zone, "ent.example.", "example.", &measured)
+	testing.expect_value(t, probe, Step.No_Cut)
 	testing.expect(t, measured.rounds > 0, "a step that hashes nothing cannot be starved")
 
 	enough := Nsec3_Budget {
@@ -232,12 +233,6 @@ test_a_step_whose_hashing_ran_out_is_not_read_as_an_absent_name :: proc(t: ^test
 	testing.expect(t, short.spent > 0, "the allowance should have been what stopped this")
 	testing.expectf(t, step != .Absent, "a scan cut short is not a name that is not there, got %v", step)
 	free_all(context.temp_allocator)
-}
-
-@(private = "file")
-denial_step_probe :: proc(zone: []Nsec3_Rr, child: string, budget: ^Nsec3_Budget) -> Step {
-	step, _ := denial_step(nil, zone, child, "example.", budget)
-	return step
 }
 
 /*

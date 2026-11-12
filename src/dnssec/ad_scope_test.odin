@@ -154,7 +154,7 @@ test_unsigned_authority_records_do_not_reach_the_client :: proc(t: ^testing.T) {
 /*
 A denial has to be claimed as well as implied by the chain.
 
-The pair with `chain_shape`: that one says the chain stopped short, this one says
+The pair with `chain_walk`: that one says the chain stopped short, this one says
 the sender is asserting there is nothing more. Both are needed: a DNAME
 redirection is a chain that stops short and is not a denial at all, so refusing
 AD on the shape alone would take the bit off every one of them.
@@ -730,7 +730,8 @@ test_verbatim_copies_of_the_real_signature_are_capped :: proc(t: ^testing.T) {
 	if !testing.expect(t, ok, "the pruned response should rebuild") {
 		return
 	}
-	pruned, _ := dns.decode_message(out, context.temp_allocator)
+	pruned, perr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, perr, dns.Decode_Error.None)
 	sigs := 0
 	for rec in pruned.answer {
 		if rec.type == .RRSIG {
@@ -842,16 +843,18 @@ test_a_near_copy_does_not_evict_the_record_that_verified :: proc(t: ^testing.T) 
 /*
 What the chain does with the question, and what it must not be talked out of.
 
-`chain_shape` decides whether the AD bit may go out over an answer whose chain
+`chain_walk` decides whether the AD bit may go out over an answer whose chain
 stops short of the type asked for, so it is worth testing on its own. A
 predicate that consults something the sender writes - an SOA in the authority
 section, an NSEC, the rcode - is defeated either by adding a record or by
 deleting one. This consults the chain and nothing else.
 
-The cases below are what the predicate has to survive.
+The cases below are what the predicate has to survive. Where the walk ended is
+checked beside the shape: for `.Chain_Only` it is the name a denial beside the
+chain is about.
 */
 @(test)
-test_chain_shape_reads_only_the_chain :: proc(t: ^testing.T) {
+test_chain_walk_reads_only_the_chain :: proc(t: ^testing.T) {
 	cname := dns.Record {
 		name  = "www.brand.example.",
 		type  = .CNAME,
@@ -868,19 +871,23 @@ test_chain_shape_reads_only_the_chain :: proc(t: ^testing.T) {
 	}
 
 	// The chain reaches the type: an answer, and AD may cover it.
-	testing.expect_value(
-		t,
-		chain_shape([]dns.Record{cname, aaaa}, "www.brand.example.", .AAAA, .IN),
-		Answer_Shape.Direct,
-	)
+	shape, end := chain_walk([]dns.Record{cname, aaaa}, "www.brand.example.", .AAAA, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Direct)
+	testing.expect_value(t, end, "target.other.example.")
 
-	// The chain stops short: a redirection, and whatever explains the missing
-	// type was never checked.
-	testing.expect_value(
-		t,
-		chain_shape([]dns.Record{cname}, "www.brand.example.", .AAAA, .IN),
-		Answer_Shape.Chain_Only,
-	)
+	/*
+	The chain stops short: a redirection, and whatever explains the missing type
+	was never checked.
+
+	Deleting records does not make the answer look more complete either. This is
+	the direction an on-path attacker reaches for: strip the AAAA and its
+	signature, and a predicate that asked whether a denial had been *claimed*
+	would see nothing to object to. The chain still stops short, which is all
+	this asks.
+	*/
+	shape, end = chain_walk([]dns.Record{cname}, "www.brand.example.", .AAAA, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Chain_Only)
+	testing.expect_value(t, end, "target.other.example.")
 
 	/*
 	An unrelated record of the right type does not answer the question.
@@ -897,44 +904,21 @@ test_chain_shape_reads_only_the_chain :: proc(t: ^testing.T) {
 		ttl   = 60,
 		data  = dns.Rdata_AAAA{addr = {}},
 	}
-	testing.expect_value(
-		t,
-		chain_shape([]dns.Record{cname, unrelated}, "www.brand.example.", .AAAA, .IN),
-		Answer_Shape.Chain_Only,
-	)
-
-	/*
-	Deleting records does not make the answer look more complete.
-
-	The other direction, and the one an on-path attacker reaches for: strip the
-	AAAA and its signature, strip the authority section, and a predicate that
-	asked whether a denial had been *claimed* would see nothing to object to.
-	The chain still stops short, which is all this asks.
-	*/
-	testing.expect_value(
-		t,
-		chain_shape([]dns.Record{cname}, "www.brand.example.", .AAAA, .IN),
-		Answer_Shape.Chain_Only,
-	)
+	shape, end = chain_walk([]dns.Record{cname, unrelated}, "www.brand.example.", .AAAA, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Chain_Only)
+	testing.expect_value(t, end, "target.other.example.")
 
 	// Nothing addressing the question at all.
-	testing.expect_value(
-		t,
-		chain_shape([]dns.Record{unrelated}, "www.brand.example.", .AAAA, .IN),
-		Answer_Shape.None,
-	)
+	shape, _ = chain_walk([]dns.Record{unrelated}, "www.brand.example.", .AAAA, .IN)
+	testing.expect_value(t, shape, Answer_Shape.None)
 
 	// A CNAME or ANY question is answered by the chain itself.
-	testing.expect_value(
-		t,
-		chain_shape([]dns.Record{cname}, "www.brand.example.", .CNAME, .IN),
-		Answer_Shape.Direct,
-	)
-	testing.expect_value(
-		t,
-		chain_shape([]dns.Record{cname}, "www.brand.example.", .ANY, .IN),
-		Answer_Shape.Direct,
-	)
+	shape, end = chain_walk([]dns.Record{cname}, "www.brand.example.", .CNAME, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Direct)
+	testing.expect_value(t, end, "www.brand.example.")
+	shape, end = chain_walk([]dns.Record{cname}, "www.brand.example.", .ANY, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Direct)
+	testing.expect_value(t, end, "www.brand.example.")
 
 	// Class is part of the question.
 	other_class := dns.Record {
@@ -944,11 +928,9 @@ test_chain_shape_reads_only_the_chain :: proc(t: ^testing.T) {
 		ttl   = 60,
 		data  = dns.Rdata_AAAA{addr = {}},
 	}
-	testing.expect_value(
-		t,
-		chain_shape([]dns.Record{cname, other_class}, "www.brand.example.", .AAAA, .IN),
-		Answer_Shape.Chain_Only,
-	)
+	shape, end = chain_walk([]dns.Record{cname, other_class}, "www.brand.example.", .AAAA, .IN)
+	testing.expect_value(t, shape, Answer_Shape.Chain_Only)
+	testing.expect_value(t, end, "target.other.example.")
 	free_all(context.temp_allocator)
 }
 

@@ -1557,10 +1557,7 @@ parse_upstream_shorthand :: proc(
 }
 
 describe_upstream :: proc(spec: Upstream_Spec, allocator := context.allocator) -> string {
-	if spec.kind == .HTTPS {
-		return strings.clone(url_name(spec.url), allocator)
-	}
-	scheme := "udp"
+	scheme: string
 	switch spec.kind {
 	case .UDP:
 		scheme = "udp"
@@ -1569,7 +1566,7 @@ describe_upstream :: proc(spec: Upstream_Spec, allocator := context.allocator) -
 	case .TLS:
 		scheme = "tls"
 	case .HTTPS:
-		scheme = "https"
+		return strings.clone(url_name(spec.url), allocator)
 	}
 	return fmt.aprintf("%s://%s:%d", scheme, spec.address, spec.port, allocator = allocator)
 }

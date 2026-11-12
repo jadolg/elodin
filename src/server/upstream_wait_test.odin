@@ -137,12 +137,12 @@ test_a_wait_on_a_refresh_holds_a_place :: proc(t: ^testing.T) {
 	s := stale_server(&cfg, answers, &group)
 	cfg.server.max_pending = 8
 	cfg.cache.stale_timeout = 5 * time.Second
-	workers: Test_Loop
-	if !testing.expect(t, start_test_loop(&workers), "no loop") {
+	tl: Test_Loop
+	if !testing.expect(t, start_test_loop(&tl), "no loop") {
 		return
 	}
-	s.loops = workers.loops[:]
-	defer stop_test_loop(&workers)
+	s.loops = tl.loops[:]
+	defer stop_test_loop(&tl)
 	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
 		return
 	}

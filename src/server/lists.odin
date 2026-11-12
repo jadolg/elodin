@@ -597,10 +597,10 @@ make_directories :: proc(path: string) {
 }
 
 /*
-Reload every list and swap the result in.
+Reload every list `cfg` names and swap the result in.
 
-A rebuild calls `reload_filters_from` with its copy of the configuration (see
-`rebuild_rules`); this reads the one in effect. The old rule sets are destroyed
+`cfg` is a rebuild's copy of the configuration rather than a pin on its
+generation; see `Rebuild` and `rebuild_rules`. The old rule sets are destroyed
 only after the swap returns them, at which point no new query can reach them.
 
 A list that loaded last time and is unavailable now - no download and no
@@ -616,12 +616,6 @@ blocks has to lift them, where a download is lost to the network.
 `current` is false when some list is unavailable or stood in for by a stale copy,
 so the caller retries sooner than the interval; see `refresh_retry`.
 */
-reload_filters :: proc(s: ^Server, allow_network: bool) -> (current: bool) {
-	return reload_filters_from(s, live(s).cfg, allow_network)
-}
-
-// `reload_filters` from `cfg`, which a rebuild holds a copy of rather than a
-// pin on its generation; see `Rebuild`.
 reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool) -> (current: bool) {
 	lists := len(cfg.blocking.lists)
 	loads := make([]List_Load, lists + len(cfg.blocking.allow_lists))

@@ -123,7 +123,9 @@ exchange_doh_h2 :: proc(
 				}
 				return nil, .HTTP_Error
 			}
-			dns.set_id_in_place(resp.body, u16(query[0]) << 8 | u16(query[1]))
+			// `exchange_doh` turned away a query shorter than a header.
+			id, _ := dns.peek_id(query)
+			dns.set_id_in_place(resp.body, id)
 			if !response_matches(query, resp.body) {
 				delete(resp.body, allocator)
 				return nil, .Bad_Response
@@ -232,7 +234,9 @@ exchange_doh_h1 :: proc(
 
 		if herr == .None && resp.status == 200 && len(resp.body) >= dns.HEADER_SIZE {
 			// Restore the ID the caller sent so the usual matching applies.
-			dns.set_id_in_place(resp.body, u16(query[0]) << 8 | u16(query[1]))
+			// `exchange_doh` turned away a query shorter than a header.
+			id, _ := dns.peek_id(query)
+			dns.set_id_in_place(resp.body, id)
 			if !response_matches(query, resp.body) {
 				delete(resp.body, allocator)
 				stream_close(&stream)

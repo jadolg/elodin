@@ -87,9 +87,6 @@ Mock :: struct {
 
 	// How this mock treats DNS cookies (RFC 7873).
 	cookies:     Mock_Cookies,
-	// Echo back a client cookie that is not the one the query carried, which is
-	// what an off-path forgery would have to do.
-	forge_cookie: bool,
 
 	/*
 	Set to stop answering anything, leaving the sockets open.
@@ -222,9 +219,9 @@ mock_hold_until :: proc(m: ^Mock, n: int) {
 
 /*
 What the mock can say about a hold left short, so a failure names its cause:
-UDP queries received since the hold was set, those the kernel dropped on the
-mock's socket for want of room since the socket opened, and threads it could
-not start.
+which mock, UDP queries received since the hold was set, those the kernel
+dropped on its socket for want of room since the socket opened, and threads it
+could not start.
 */
 mock_hold_report :: proc(m: ^Mock) -> string {
 	sync.mutex_lock(&m.mu)
@@ -235,7 +232,8 @@ mock_hold_report :: proc(m: ^Mock) -> string {
 	// Unknown rather than 0 when `/proc` would not say, so it is not read as none.
 	dropped := metrics.socket_drops(inode[:], drops[:]) ? fmt.tprint(drops[0]) : "unknown"
 	return fmt.tprintf(
-		"held %d, received %d since the hold, dropped at its socket %s since it opened, failed thread starts %d",
+		"mock %s held %d, received %d since the hold, dropped at its socket %s since it opened, failed thread starts %d",
+		m.name,
 		mock_held(m),
 		received,
 		dropped,
@@ -528,19 +526,19 @@ build_reply :: proc(
 		record_reply(m, reply)
 	}
 	if m.cookies == .Off {
-		return build_answer(m, query, rule, over_tcp, allocator)
+		return build_answer(query, rule, over_tcp, allocator)
 	}
 	sent, has_cookie := query_cookie(query)
 	if !has_cookie {
 		// A client that sends no cookie gets none back (RFC 7873 section 5.2.1).
-		return build_answer(m, query, rule, over_tcp, allocator)
+		return build_answer(query, rule, over_tcp, allocator)
 	}
 	// Nothing but the cookie is looked at until the cookie is right.
-	if m.cookies == .Require && !cookie_is_ours(m, sent) {
-		return with_cookie(m, sent, build_rcode_reply(query, .Bad_Cookie, allocator), allocator), true
+	if m.cookies == .Require && !cookie_is_ours(sent) {
+		return with_cookie(sent, build_rcode_reply(query, .Bad_Cookie, allocator), allocator), true
 	}
-	answer := build_answer(m, query, rule, over_tcp, allocator) or_return
-	return with_cookie(m, sent, answer, allocator), true
+	answer := build_answer(query, rule, over_tcp, allocator) or_return
+	return with_cookie(sent, answer, allocator), true
 }
 
 // The server cookie this mock hands out; fixed, so a test can recognise it.
@@ -557,7 +555,7 @@ query_cookie :: proc(query: []u8) -> (cookie: []u8, found: bool) {
 }
 
 @(private = "file")
-cookie_is_ours :: proc(m: ^Mock, sent: []u8) -> bool {
+cookie_is_ours :: proc(sent: []u8) -> bool {
 	if len(sent) != 8 + len(MOCK_SERVER_COOKIE) {
 		return false
 	}
@@ -571,13 +569,10 @@ cookie_is_ours :: proc(m: ^Mock, sent: []u8) -> bool {
 
 // Echo the client half back with this mock's server cookie behind it.
 @(private = "file")
-with_cookie :: proc(m: ^Mock, sent: []u8, reply: []u8, allocator := context.allocator) -> []u8 {
+with_cookie :: proc(sent: []u8, reply: []u8, allocator := context.allocator) -> []u8 {
 	option := make([]u8, 8 + len(MOCK_SERVER_COOKIE), context.temp_allocator)
 	copy(option[:8], sent[:min(8, len(sent))])
 	copy(option[8:], MOCK_SERVER_COOKIE)
-	if m.forge_cookie {
-		option[0] ~= 0xff
-	}
 	out, ok := dns.ensure_edns_option(reply, .Cookie, option, 1232, allocator)
 	if !ok {
 		return reply
@@ -587,7 +582,6 @@ with_cookie :: proc(m: ^Mock, sent: []u8, reply: []u8, allocator := context.allo
 
 @(private = "file")
 build_answer :: proc(
-	m: ^Mock,
 	query: []u8,
 	rule: Mock_Rule,
 	over_tcp: bool,

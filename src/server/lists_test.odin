@@ -12,6 +12,12 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
 
+// `reload_filters_from` the configuration in effect: a rebuild's reload, for a
+// test that has no rebuild's copy to hand it.
+reload_filters :: proc(s: ^Server, allow_network: bool) -> (current: bool) {
+	return reload_filters_from(s, live(s).cfg, allow_network)
+}
+
 @(test)
 test_a_list_badfilter_does_not_cancel_the_operators_own_rules :: proc(t: ^testing.T) {
 	/*

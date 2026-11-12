@@ -74,13 +74,13 @@ test_a_hit_near_expiry_is_refreshed_behind_the_client :: proc(t: ^testing.T) {
 	}
 	defer upstream.destroy_group(group)
 	s.group = group
-	workers: Test_Loop
-	start_test_loop(&workers)
+	tl: Test_Loop
+	start_test_loop(&tl)
 	joined := false
 	defer if !joined {
-		stop_test_loop(&workers)
+		stop_test_loop(&tl)
 	}
-	s.loops = workers.loops[:]
+	s.loops = tl.loops[:]
 
 	if !testing.expect(t, cache_an_answer(answers, expired = false), "the answer was not cached") {
 		return
@@ -111,7 +111,7 @@ test_a_hit_near_expiry_is_refreshed_behind_the_client :: proc(t: ^testing.T) {
 	thread.join(mock)
 	thread.destroy(mock)
 	testing.expect(t, x.got, "nothing refreshed the entry ahead of its expiry")
-	stop_test_loop(&workers)
+	stop_test_loop(&tl)
 	joined = true
 	s.loops = nil
 
@@ -163,13 +163,13 @@ test_a_failed_prefetch_is_not_retried :: proc(t: ^testing.T) {
 	age_to(answers, 20 * time.Second)
 
 	for _ in 0 ..< 2 {
-		workers: Test_Loop
-		start_test_loop(&workers)
-		s.loops = workers.loops[:]
+		tl: Test_Loop
+		start_test_loop(&tl)
+		s.loops = tl.loops[:]
 		_, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 		testing.expect(t, ok, "the cached answer went unserved")
 		testing.expect_value(t, outcome, Outcome.Cached)
-		stop_test_loop(&workers)
+		stop_test_loop(&tl)
 	}
 	s.loops = nil
 
@@ -200,19 +200,19 @@ test_an_rd_zero_hit_does_not_prefetch :: proc(t: ^testing.T) {
 	}
 	age_to(answers, 20 * time.Second)
 
-	workers: Test_Loop
-	start_test_loop(&workers)
-	s.loops = workers.loops[:]
+	tl: Test_Loop
+	start_test_loop(&tl)
+	s.loops = tl.loops[:]
 	_, _, ok := handle_query(&s, stale_query(false), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expect(t, ok, "the RD=0 query went unserved")
-	stop_test_loop(&workers)
+	stop_test_loop(&tl)
 	testing.expect_value(t, cache.stats(answers).prefetches, 0)
 
-	start_test_loop(&workers)
-	s.loops = workers.loops[:]
+	start_test_loop(&tl)
+	s.loops = tl.loops[:]
 	_, _, ok = handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expect(t, ok, "the RD=1 query went unserved")
-	stop_test_loop(&workers)
+	stop_test_loop(&tl)
 	s.loops = nil
 	testing.expect_value(t, cache.stats(answers).prefetches, 1)
 	free_all(context.temp_allocator)
@@ -237,12 +237,12 @@ test_no_prefetch_past_the_upstream_waits :: proc(t: ^testing.T) {
 	}
 	age_to(answers, 20 * time.Second)
 
-	workers: Test_Loop
-	start_test_loop(&workers)
-	s.loops = workers.loops[:]
+	tl: Test_Loop
+	start_test_loop(&tl)
+	s.loops = tl.loops[:]
 	_, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expect(t, ok && outcome == .Cached, "the hit went unserved")
-	stop_test_loop(&workers)
+	stop_test_loop(&tl)
 	s.loops = nil
 	cs := cache.stats(answers)
 	testing.expect_value(t, cs.prefetches, 0)

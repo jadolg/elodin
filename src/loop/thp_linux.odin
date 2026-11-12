@@ -1,4 +1,3 @@
-#+build linux
 package loop
 
 import "core:sys/linux"

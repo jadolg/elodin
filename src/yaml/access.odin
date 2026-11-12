@@ -13,23 +13,6 @@ get :: proc(n: ^Node, key: string) -> ^Node {
 	return n.fields[key] or_else nil
 }
 
-// Dotted path lookup: at(root, "cache.max_entries").
-at :: proc(n: ^Node, path: string) -> ^Node {
-	cur := n
-	rest := path
-	for len(rest) > 0 && cur != nil {
-		key := rest
-		if idx := strings.index_byte(rest, '.'); idx >= 0 {
-			key = rest[:idx]
-			rest = rest[idx + 1:]
-		} else {
-			rest = ""
-		}
-		cur = get(cur, key)
-	}
-	return cur
-}
-
 items :: proc(n: ^Node) -> []^Node {
 	if n == nil || n.kind != .Sequence {
 		return nil
@@ -54,12 +37,12 @@ is_null :: proc(n: ^Node) -> bool {
 	return n.scalar == "" || n.scalar == "~" || n.scalar == "null" || n.scalar == "Null" || n.scalar == "NULL"
 }
 
-as_string :: proc(n: ^Node, default: string = "") -> (string, bool) {
+as_string :: proc(n: ^Node) -> (string, bool) {
 	if n == nil || n.kind != .Scalar {
-		return default, false
+		return "", false
 	}
 	if is_null(n) {
-		return default, false
+		return "", false
 	}
 	return n.scalar, true
 }
@@ -121,14 +104,6 @@ as_int :: proc(n: ^Node) -> (i64, bool) {
 		v = v * u64(base) + d
 	}
 	return -i64(v) if neg else i64(v), true
-}
-
-as_f64 :: proc(n: ^Node) -> (f64, bool) {
-	s, ok := as_string(n)
-	if !ok {
-		return 0, false
-	}
-	return strconv.parse_f64(strings.trim_space(s))
 }
 
 /*

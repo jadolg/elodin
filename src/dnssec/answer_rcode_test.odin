@@ -191,7 +191,7 @@ test_an_unsigned_rrset_does_not_buy_past_the_rcode_guard :: proc(t: ^testing.T) 
 /*
 And `ANY` is not a way round it either.
 
-`chain_shape` reports whether the question was answered, and for `ANY` it stops
+`chain_walk` reports whether the question was answered, and for `ANY` it stops
 at the first record of any type at the queried name - a CNAME included. Writing
 the guard in terms of that shape meant choosing between two wrong answers:
 refuse an ordinary NXDOMAIN-after-a-CNAME asked as `ANY`, or exempt `ANY`

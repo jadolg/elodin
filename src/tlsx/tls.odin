@@ -14,7 +14,6 @@ import "elodin:loop"
 
 Error :: enum u8 {
 	None,
-	Init_Failed,
 	Context_Failed,
 	Certificate_Failed,
 	Handshake_Failed,
@@ -190,7 +189,7 @@ apart is what lets a caller log the difference between "the upstream hung up on
 us" and "the certificate did not check out".
 */
 @(private)
-classify_handshake :: proc(code: c.int, ret: c.int, saved: posix.Errno) -> Error {
+classify_handshake :: proc(code: c.int, saved: posix.Errno) -> Error {
 	last_handshake_errno = .NONE
 
 	switch code {
@@ -775,7 +774,7 @@ handshake_loop :: proc(conn: ^Conn, side: Handshake_Side) -> Error {
 				return .Timeout
 			}
 		case:
-			return classify_handshake(code, ret, saved)
+			return classify_handshake(code, saved)
 		}
 	}
 }

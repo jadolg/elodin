@@ -178,7 +178,7 @@ test_a_rescued_answer_is_billed_to_the_proven_pool :: proc(t: ^testing.T) {
 }
 
 // `::ffff:a.b.c.d` hashes as the sixteen bytes it arrived as on both paths, so
-// a cookie issued on the worker verifies in the read loop.
+// a cookie issued with an answer verifies in the read loop.
 @(test)
 test_a_mapped_cookie_client_proves_its_source :: proc(t: ^testing.T) {
 	k := Cookie_Keeper{secret = SECRET}

@@ -750,17 +750,3 @@ needs_quoting :: proc(s: string) -> bool {
 	}
 	return false
 }
-
-parse_level :: proc(s: string) -> (Level, bool) {
-	switch strings.to_lower(s, context.temp_allocator) {
-	case "debug":
-		return .Debug, true
-	case "info":
-		return .Info, true
-	case "warn", "warning":
-		return .Warn, true
-	case "error":
-		return .Error, true
-	}
-	return .Info, false
-}

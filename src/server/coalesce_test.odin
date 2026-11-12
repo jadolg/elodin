@@ -475,7 +475,7 @@ test_an_uncacheable_answer_is_shared_with_the_queries_waiting_on_it :: proc(t: ^
 And an upstream that gave the leader nothing is not asked again by every query
 that was waiting on it: the group has already tried every server for every
 attempt, and each follower would wait out the same timeout for the same nothing,
-holding a worker twice as long as the leader did.
+keeping its client waiting twice as long as the leader did.
 */
 @(test)
 test_followers_of_a_failed_exchange_do_not_ask_again :: proc(t: ^testing.T) {
@@ -573,13 +573,14 @@ test_a_refusal_is_shared_only_between_identical_messages :: proc(t: ^testing.T) 
 	for rcode in ([]dns.Rcode{.Form_Err, .Refused}) {
 		mixed: [CLIENTS]Client
 		queries := run_burst(t, &mixed, first = rcode, edns = false, mixed = true)
-		refused, answered := count(mixed, rcode)
+		refused, _ := count(mixed, rcode)
 		testing.expectf(t, queries == 1 && refused == CLIENTS, "%v asked both ways: %d queries and %d refusals, want 1 and %d", rcode, queries, refused, CLIENTS)
 
 		other: [CLIENTS]Client
 		queries = run_burst(t, &other, first = rcode, other_message = true, hold_for = 0, land_after = 50 * time.Millisecond)
 		// The mock answers the first query to reach it with `rcode` too: one
 		// follower's own, not the leader's handed on.
+		answered: int
 		refused, answered = count(other, rcode)
 		testing.expectf(t, queries == CLIENTS && refused == 1 && answered == CLIENTS - 1, "%v for another message: %d queries, %d refusals and %d answers, want %d, 1 and %d", rcode, queries, refused, answered, CLIENTS, CLIENTS - 1)
 	}

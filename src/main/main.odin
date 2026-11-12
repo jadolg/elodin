@@ -998,7 +998,7 @@ the process serves correctly as it is, and a reload logs its own failure too.
 Lists only with blocking on; one turned on later by a reload says so itself. A
 `file:` list is read again by every rebuild, a scheduled refresh as well as a
 SIGHUP, and one it cannot read has its rules lifted rather than kept (see
-`reload_filters`), so that is what its warning says.
+`reload_filters_from`), so that is what its warning says.
 */
 @(private)
 warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {

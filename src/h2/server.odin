@@ -1267,7 +1267,6 @@ nor ends with whitespace. The three characters are what an HTTP/1.1 hop would
 read as the end of the field, or of the message, so a value carrying one is how
 a request smuggled through this end would be written.
 */
-@(private)
 field_value_is_valid :: proc(value: string) -> bool {
 	if len(value) > 0 {
 		first, last := value[0], value[len(value) - 1]

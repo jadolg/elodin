@@ -5,6 +5,24 @@ import "core:strings"
 import "core:testing"
 import "core:time"
 
+// Dotted path lookup: at(root, "cache.max_entries").
+@(private = "file")
+at :: proc(n: ^Node, path: string) -> ^Node {
+	cur := n
+	rest := path
+	for len(rest) > 0 && cur != nil {
+		key := rest
+		if idx := strings.index_byte(rest, '.'); idx >= 0 {
+			key = rest[:idx]
+			rest = rest[idx + 1:]
+		} else {
+			rest = ""
+		}
+		cur = get(cur, key)
+	}
+	return cur
+}
+
 @(private = "file")
 DOC :: `
 # elodin sample

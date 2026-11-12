@@ -921,7 +921,9 @@ pipe_reply_copy :: proc(reply, query: []u8, allocator: mem.Allocator) -> (respon
 		return nil, .Out_Of_Memory
 	}
 	copy(response, reply)
-	dns.set_id_in_place(response, u16(query[0]) << 8 | u16(query[1]))
+	// `pipe_query` turned away a query shorter than a header.
+	id, _ := dns.peek_id(query)
+	dns.set_id_in_place(response, id)
 	return response, .None
 }
 
@@ -1175,7 +1177,8 @@ pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 
 @(private)
 pipe_deliver :: proc(c: ^Pipe_Conn, msg: []u8) {
-	id := u16(msg[0]) << 8 | u16(msg[1])
+	// `pipe_read_one` turned away a reply shorter than a header.
+	id, _ := dns.peek_id(msg)
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)
 
@@ -1225,7 +1228,9 @@ because the timeout underneath is a socket option and bounds one `recv` rather
 than the sequence of them. Left at one setting, a peer dribbling a byte at a
 time just under it would keep this loop running past whatever deadline the
 caller computed - while holding the reading, so no other waiter could take the
-socket on either.
+socket on either. Nor is it set once at dial: what is left of a deadline is
+whatever the caller doing the reading has left, and that caller is whichever one
+happened to find nobody else at it.
 */
 @(private)
 pipe_read_full :: proc(c: ^Pipe_Conn, buf: []u8, deadline: time.Tick) -> (n: int, err: Error) {
@@ -1234,7 +1239,7 @@ pipe_read_full :: proc(c: ^Pipe_Conn, buf: []u8, deadline: time.Tick) -> (n: int
 		if remaining <= 0 {
 			return n, .Timeout
 		}
-		pipe_set_read_timeout(c, remaining)
+		stream_set_read_timeout(&c.stream, remaining)
 		if c.stream.tls != nil {
 			got, terr := tlsx.read(c.stream.tls, buf[n:])
 			if terr != .None {
@@ -1265,32 +1270,6 @@ pipe_read_full :: proc(c: ^Pipe_Conn, buf: []u8, deadline: time.Tick) -> (n: int
 		n += got
 	}
 	return n, .None
-}
-
-/*
-Bound the next read by what the caller doing it has left.
-
-Set per read rather than once at dial, because what is left of a deadline is
-whatever the caller doing the reading has left, and that caller is whichever
-one happened to find nobody else at it.
-
-Never under a millisecond, and that is not rounding. `SO_RCVTIMEO` is a
-`timeval`, so core:net turns a duration under a microsecond into a zero one -
-which on Linux does not mean "expire at once" but "no timeout at all", and the
-read that was meant to be the shortest of all would be the one that never
-returned. The caller reaching here with a sliver of its deadline left is
-ordinary: it is a waiter that woke a hair before its own expiry.
-*/
-@(private)
-pipe_set_read_timeout :: proc(c: ^Pipe_Conn, d: time.Duration) {
-	stream_set_read_timeout(&c.stream, d)
-}
-
-// The write side of `pipe_set_read_timeout`, and the same floor for the same
-// reason: `SO_SNDTIMEO` is a `timeval` too.
-@(private)
-pipe_set_write_timeout :: proc(c: ^Pipe_Conn, d: time.Duration) {
-	stream_set_write_timeout(&c.stream, d)
 }
 
 @(private)
@@ -1417,7 +1396,7 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 		if remaining <= 0 {
 			return sent, .Timeout
 		}
-		pipe_set_write_timeout(c, remaining)
+		stream_set_write_timeout(&c.stream, remaining)
 		n, werr := loop.send_tcp(c.stream.socket, framed[sent:])
 		sent += n
 		if werr == nil {

@@ -31,10 +31,10 @@ same way a client asking for one would, and the only way to build this query
 without going through the reader under test.
 */
 @(private = "file")
-version_query :: proc(version: u8, edns := true, cookie: []u8 = nil, name := REWRITTEN) -> []u8 {
+version_query :: proc(version: u8, edns := true, cookie: []u8 = nil) -> []u8 {
 	questions := make([]dns.Question, 1, context.temp_allocator)
 	questions[0] = dns.Question {
-		name  = name,
+		name  = REWRITTEN,
 		type  = .A,
 		class = .IN,
 	}
