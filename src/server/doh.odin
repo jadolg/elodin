@@ -672,14 +672,14 @@ serve_doh_request :: proc(
 	// gives a source outside the list nothing at all, and a reload that removed
 	// a held connection's network leaves it in the same place. Closed after the
 	// answer, as the accept loop would have.
+	head := req.method == "HEAD"
 	if !stream_source_allowed(s, conn.peer, .DoH) {
-		written := send_http_error(conn, "doh", 403, "forbidden", false, head = req.method == "HEAD")
+		written := send_http_error(conn, "doh", 403, "forbidden", false, head = head)
 		// What the client pipelined behind this request is unread, and the close
 		// would take the 403 back with it - see `http_linger`.
 		http_linger(conn, STREAM_LINGER_IDLE)
 		return written
 	}
-	head := req.method == "HEAD"
 	mc_path := startup_config(s).listeners.doh.mobileconfig_path
 	if mc_path != "" && req.path == mc_path {
 		profile, status, why, ok := doh_profile(s, req.method, req.host, "missing or invalid Host header")
@@ -693,7 +693,7 @@ serve_doh_request :: proc(
 			profile,
 			req.keep_alive,
 			"Content-Disposition",
-			`attachment; filename="elodin-doh.mobileconfig"`,
+			PROFILE_DISPOSITION,
 		)
 	}
 	if req.path != path {
@@ -826,6 +826,9 @@ doh_query_message :: proc(
 	}
 	return message, 0, "", true
 }
+
+// The profile is a download whichever HTTP version asked for it (RFC 6266).
+PROFILE_DISPOSITION :: `attachment; filename="elodin-doh.mobileconfig"`
 
 /*
 The Apple .mobileconfig profile that points a device at this DoH endpoint, over

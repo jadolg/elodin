@@ -479,7 +479,13 @@ build_h2_response :: proc(
 		if !is_profile {
 			return h2_error(status, why, MOBILECONFIG_METHODS if status == 405 else ""), true
 		}
-		return h2.Response{status = 200, content_type = DOH_MOBILECONFIG_CONTENT_TYPE, body = profile}, true
+		return h2.Response {
+				status = 200,
+				content_type = DOH_MOBILECONFIG_CONTENT_TYPE,
+				content_disposition = PROFILE_DISPOSITION,
+				body = profile,
+			},
+			true
 	}
 	if path != ctx.path {
 		return h2_error(404, "not found"), true

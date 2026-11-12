@@ -2069,9 +2069,10 @@ test_doh_a_timeout_near_the_range_limit_keeps_connections :: proc(t: ^testing.T)
 
 /*
 A POST's Content-Type is judged by its media type, whole and without regard to
-ASCII case (RFC 9110 8.3.1), by the check both HTTP versions share. A prefix match would let `application/dns-message-bogus`
-in and a case-sensitive one would turn `Application/DNS-Message` away (#304); a
-Unicode fold would take the long s (U+017F) for an `s`.
+ASCII case (RFC 9110 8.3.1), by the check both HTTP versions share. A prefix
+match would let `application/dns-message-bogus` in and a case-sensitive one
+would turn `Application/DNS-Message` away (#304); a Unicode fold would take the
+long s (U+017F) for an `s`.
 */
 @(test)
 test_doh_content_type_is_the_media_type_folded :: proc(t: ^testing.T) {

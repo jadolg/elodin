@@ -1887,23 +1887,20 @@ stream_job :: proc(data: rawptr) {
 	case .TCP:
 		defer net.close(job.socket)
 		serve_dns_stream(s, {socket = job.socket, peer = job.client}, .TCP, client)
-	case .DoT:
-		conn := stream_tls_accept(job, timeout, client)
-		if conn == nil {
+	case .DoT, .DoH:
+		tls := stream_tls_accept(job, timeout, client)
+		if tls == nil {
 			return
 		}
-		defer tlsx.close(conn)
-		serve_dns_stream(s, {socket = job.socket, tls = conn, peer = job.client}, .DoT, client)
-	case .DoH:
-		conn := stream_tls_accept(job, timeout, client)
-		if conn == nil {
-			return
-		}
-		defer tlsx.close(conn)
-		if tlsx.alpn_protocol(conn) == "h2" {
-			serve_doh2(s, conn, client, job.client)
-		} else {
-			serve_doh(s, {socket = job.socket, tls = conn, peer = job.client}, client)
+		defer tlsx.close(tls)
+		conn := Conn{socket = job.socket, tls = tls, peer = job.client}
+		switch {
+		case job.ctx.proto == .DoT:
+			serve_dns_stream(s, conn, .DoT, client)
+		case tlsx.alpn_protocol(tls) == "h2":
+			serve_doh2(s, tls, client, job.client)
+		case:
+			serve_doh(s, conn, client)
 		}
 	case .UDP:
 	// not reachable: UDP has no accept loop
@@ -1916,8 +1913,8 @@ The TLS handshake a DoT or DoH connection starts with, on the job's own socket.
 The handshake is bounded as a whole, and by `handshake_timeout(timeout)` - not by
 what the connection's reads are given; the connection's own figure is put back
 once it is done. A handshake that fails closes the socket and comes back nil, and
-the caller returns with nothing to release. Counted where a handshake has actually completed - see
-`Stats.handshakes` for what the figure is for.
+the caller returns with nothing to release. Counted where a handshake has
+actually completed - see `Stats.handshakes` for what the figure is for.
 */
 @(private)
 stream_tls_accept :: proc(job: ^Stream_Job, timeout: time.Duration, client: string) -> ^tlsx.Conn {
@@ -2127,12 +2124,6 @@ takes the RST with it, which is no worse than not draining at all.
 Reached only from a connection that has answered something, for the same reason:
 with nothing written there is nothing for the RST to take back, and the drain
 would be time out of one of `max_connections` spent protecting nothing.
-
-The chunk is scratch rather than a local: inlined into the connection loop that
-calls it, a 4 KiB local would join a frame that is live
-under every idle wait, and keep a page of each held connection's stack resident
-for nothing (#596). The connection ends once this returns, and `stream_job`
-frees the scratch on its way out.
 */
 @(private)
 stream_linger :: proc(conn: Conn) {
@@ -2148,6 +2139,12 @@ its constants.
 The read timeout goes through `conn_set_read_timeout` rather than `net.set_option`:
 over DoT and DoH the connection is a TLS one, where the socket option stopped
 applying at the handshake.
+
+The chunk is scratch rather than a local: inlined into the connection loop that
+calls it, a 4 KiB local would join a frame that is live under every idle wait,
+and keep a page of each held connection's stack resident for nothing (#596). The
+connection ends once this returns, and its owner - `stream_job`, or the metrics
+loop after a scrape - frees the scratch on its way out.
 */
 @(private)
 conn_linger :: proc(conn: Conn, idle, timeout: time.Duration, max_bytes: int) {
