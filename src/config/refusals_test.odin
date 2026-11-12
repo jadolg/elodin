@@ -159,7 +159,8 @@ test_rewrite_tokens_fold_ascii_only :: proc(t: ^testing.T) {
 	testing.expect(t, err != nil, "a long s was read as SRV")
 
 	cfg, kerr := load_string(REWRITE + "\"bloc\u212a\"\n", context.temp_allocator)
-	if kerr == nil && len(cfg.rewrites) == 1 {
+	// It loads, as a CNAME to that name: a refusal would leave nothing to check.
+	if testing.expectf(t, kerr == nil && len(cfg.rewrites) == 1, "%v", kerr) {
 		testing.expect(t, cfg.rewrites[0].answers[0].kind != .Block, "a KELVIN SIGN was read as the k of block")
 	}
 

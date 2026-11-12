@@ -416,7 +416,7 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 			"server.rate_limit",
 		)
 		/*
-		0 is the loader's own marker for a key nobody wrote, which `validate`
+		0 is the loader's own marker for a key nobody wrote, which `derive_sizes`
 		turns into `server.max_udp_response`. A file that writes it means
 		something by it, and what it would get is that same resolution: the key
 		doing nothing, silently, which is the one shape this setting is reported
@@ -495,7 +495,7 @@ checked here too: the loader is the only thing that sees an entry beside the lin
 it was written on, and a limiter built out of a bad figure has nothing left to
 complain with.
 
-An entry that names no `slip` carries -1 out of here, and `validate` fills it in
+An entry that names no `slip` carries -1 out of here, and `derive_sizes` fills it in
 from the top-level figure once that is known to be final. Reading it during this
 pass would inherit whatever had been parsed so far, which depends on the order
 the keys happen to appear in the file.
@@ -634,7 +634,7 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 		}
 
 		/*
-		`slip` of -1 is "the entry did not say", which `validate` fills in; 0 is a
+		`slip` of -1 is "the entry did not say", which `derive_sizes` fills in; 0 is a
 		value `slip` can be given on purpose, so it cannot stand for absence.
 
 		`responses_per_second` starts at 1 rather than 0 so that a figure
@@ -1510,7 +1510,7 @@ parse_upstream_shorthand :: proc(
 	// ASCII whitespace only: `trim_space` also eats Unicode spaces such as NBSP,
 	// silently rewriting what the operator wrote; the check below refuses it
 	// instead (#438).
-	s := strings.trim(raw, " \t\r\n")
+	s := strings.trim(raw, ASCII_SPACE)
 
 	if has_scheme(s, "https://") {
 		spec.kind = .HTTPS
@@ -1649,9 +1649,8 @@ parse_v4 :: proc(l: ^Loader, s: string, path: string, dst: ^[4]u8) {
 
 @(private)
 parse_v6 :: proc(l: ^Loader, s: string, path: string, dst: ^[16]u8) {
-	addr := netx.parse_address(s)
-	if _, is_v6 := addr.(net.IP6_Address); is_v6 {
-		dst^, _ = netx.address_bytes(addr)
+	if bytes, is_v6 := netx.address_bytes(netx.parse_address(s)); is_v6 {
+		dst^ = bytes
 		return
 	}
 	errorf(l, "%s: %q is not an IPv6 address", path, s)
@@ -1849,8 +1848,7 @@ load_ddr :: proc(l: ^Loader, cfg: ^Config) {
 	written: string
 	opt_string(l, n, "name", &written, "ddr")
 	// Refused as written: a hostname holds no space, control or byte outside
-	// ASCII anywhere, and `canonical_domain` trims ASCII space from the ends
-	// before `check_ddr` sees the name.
+	// ASCII anywhere, so `canonical_domain` has nothing left to trim or refuse.
 	for c in transmute([]u8)written {
 		if c <= ' ' || c >= 0x7f {
 			errorf(l, "ddr.name: %q must be a hostname, the one the certificate of the DoT or DoH listener covers", written)
