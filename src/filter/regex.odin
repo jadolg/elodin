@@ -119,11 +119,8 @@ regex_add :: proc(s: ^Set, pattern: string, types := ANY_TYPE) -> (stored: bool)
 		held^ = type_keep(s, merged) or_return
 		return true
 	}
-	if s.regex_scratch.curr_block == nil && virtual.arena_init_growing(&s.regex_scratch) != nil {
-		return false
-	}
+	temp := regex_scratch_allocator(s) or_return
 	defer virtual.arena_free_all(&s.regex_scratch)
-	temp := virtual.arena_allocator(&s.regex_scratch)
 
 	tree: parser.Node
 	{
@@ -247,13 +244,20 @@ regex_cancel :: proc(s: ^Set, pattern: string) {
 // Whether `re2_parse` reads `pattern`, parsed in the set's scratch arena.
 @(private)
 regex_parses :: proc(s: ^Set, pattern: string) -> bool {
-	if s.regex_scratch.curr_block == nil && virtual.arena_init_growing(&s.regex_scratch) != nil {
-		return false
-	}
+	context.allocator = regex_scratch_allocator(s) or_return
 	defer virtual.arena_free_all(&s.regex_scratch)
-	context.allocator = virtual.arena_allocator(&s.regex_scratch)
 	_, parsed := re2_parse(pattern)
 	return parsed
+}
+
+// The set's scratch arena, set up on first use. The caller frees what it took
+// with `virtual.arena_free_all` once it is done.
+@(private)
+regex_scratch_allocator :: proc(s: ^Set) -> (allocator: mem.Allocator, ok: bool) {
+	if s.regex_scratch.curr_block == nil && virtual.arena_init_growing(&s.regex_scratch) != nil {
+		return {}, false
+	}
+	return virtual.arena_allocator(&s.regex_scratch), true
 }
 
 /*

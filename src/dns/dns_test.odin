@@ -487,6 +487,46 @@ test_encode_message_releases_its_writer_on_truncation :: proc(t: ^testing.T) {
 	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array))
 }
 
+/*
+An OPT record whose RDATA runs past the end of the message is one
+`find_opt_span` cannot account for, so it states no payload size: the reader
+says 512 and the writer, `set_edns_udp_size`, has no field to write.
+*/
+@(test)
+test_peek_udp_size_reads_no_opt_that_overruns :: proc(t: ^testing.T) {
+	m := Message {
+		id         = 1,
+		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
+		additional = []Record{make_opt(4096, false)},
+	}
+	wire, _, err := encode_message(m, context.temp_allocator)
+	defer free_all(context.temp_allocator)
+	if !testing.expect_value(t, err, Encode_Error.None) {
+		return
+	}
+	// The premise: as encoded, the record states 4096.
+	testing.expect_value(t, peek_udp_size(wire), u16(4096))
+	// The last two bytes are its RDLENGTH, zero; one is a byte the message lacks.
+	wire[len(wire) - 1] = 1
+	testing.expect_value(t, peek_udp_size(wire), u16(MAX_UDP_SIZE))
+	testing.expect(t, !set_edns_udp_size(wire, 1232), "a size was written into a record that overruns")
+}
+
+// ASCII letters are lowered and nothing else is, in place or into a buffer.
+@(test)
+test_fold_into_lowers_ascii_only :: proc(t: ^testing.T) {
+	buf: [32]u8
+	name := "WwW.\\200X\xc3\x89Z[@."
+	folded, ok := fold_into(name, buf[:])
+	testing.expect(t, ok, "a name that fits was refused")
+	testing.expect_value(t, folded, "www.\\200x\xc3\x89z[@.")
+	_, ok = fold_into(name, buf[:len(name) - 1])
+	testing.expect(t, !ok, "a buffer one byte short was written past")
+	own := []u8{'A', 'b', 'C'}
+	folded, ok = fold_into(string(own), own)
+	testing.expect(t, ok && folded == "abc" && string(own) == "abc", "folding in place")
+}
+
 @(test)
 test_peek_udp_size_reads_the_opt_record :: proc(t: ^testing.T) {
 	// No OPT: the 512 bytes a responder has to assume without being told.

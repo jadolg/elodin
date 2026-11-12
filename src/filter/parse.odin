@@ -57,15 +57,9 @@ detect_format :: proc(text: string) -> Format {
 	hosts_like := 0
 	rest := text
 
-	for inspected < 50 {
-		line: string
-		idx := strings.index_byte(rest, '\n')
-		if idx < 0 {
-			line = rest
-			rest = ""
-		} else {
-			line = rest[:idx]
-			rest = rest[idx + 1:]
+	for line in strings.split_lines_iterator(&rest) {
+		if inspected >= 50 {
+			break
 		}
 		trimmed := strings.trim_space(strings.trim_prefix(line, BOM))
 
@@ -76,9 +70,6 @@ detect_format :: proc(text: string) -> Format {
 		// parsed as adblock, where none of its lines is one (#322). A `||`
 		// rule keeps its anchor ahead of any `#` or `!` it carries.
 		if trimmed == "" || trimmed[0] == '#' {
-			if idx < 0 {
-				break
-			}
 			continue
 		}
 		if strings.has_prefix(trimmed, "[Adblock") || strings.has_prefix(trimmed, "!") {
@@ -87,7 +78,7 @@ detect_format :: proc(text: string) -> Format {
 		if strings.contains(strip_line_comment(trimmed), "||") || strings.has_prefix(trimmed, "@@") {
 			return .Adblock
 		}
-		if strings.has_prefix(trimmed, "address=/") || strings.has_prefix(trimmed, "server=/") {
+		if is_dnsmasq_line(trimmed) {
 			return .Adblock
 		}
 
@@ -95,15 +86,19 @@ detect_format :: proc(text: string) -> Format {
 		if first_field_is_ip(trimmed) {
 			hosts_like += 1
 		}
-		if idx < 0 {
-			break
-		}
 	}
 
 	if inspected > 0 && hosts_like * 2 > inspected {
 		return .Hosts
 	}
 	return .Domains
+}
+
+// dnsmasq's `address=/d/...` or `server=/d/...`, which `parse_adblock_line`
+// reads and `detect_format` takes for an adblock list.
+@(private)
+is_dnsmasq_line :: proc(line: string) -> bool {
+	return strings.has_prefix(line, "address=/") || strings.has_prefix(line, "server=/")
 }
 
 @(private)
@@ -151,16 +146,8 @@ parse_list :: proc(block, allow: ^Set, text: string, format: Format) -> (added: 
 	}
 
 	rest := text
-	for len(rest) > 0 {
-		line: string
-		if idx := strings.index_byte(rest, '\n'); idx >= 0 {
-			line = rest[:idx]
-			rest = rest[idx + 1:]
-		} else {
-			line = rest
-			rest = ""
-		}
-		line = strings.trim_right(strings.trim_prefix(line, BOM), "\r \t")
+	for raw in strings.split_lines_iterator(&rest) {
+		line := strings.trim_right(strings.trim_prefix(raw, BOM), "\r \t")
 
 		switch fmt_ {
 		case .Hosts:
@@ -276,7 +263,7 @@ parse_adblock_line :: proc(block, allow: ^Set, raw: string) -> (added: int) {
 	}
 
 	// dnsmasq syntax that shows up in mixed lists.
-	if strings.has_prefix(line, "address=/") || strings.has_prefix(line, "server=/") {
+	if is_dnsmasq_line(line) {
 		body := line[strings.index_byte(line, '/') + 1:]
 		slash := strings.last_index_byte(body, '/')
 		if slash <= 0 {

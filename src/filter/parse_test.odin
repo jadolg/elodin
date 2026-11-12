@@ -805,6 +805,26 @@ test_a_rule_whose_name_is_not_ascii_is_counted :: proc(t: ^testing.T) {
 	testing.expect_value(t, block.not_ascii, 0)
 }
 
+// A list saved on Windows ends its lines in CRLF, and its last line may have no
+// line break at all: each line is still one rule, and the format is still read.
+@(test)
+test_crlf_lines_are_rules_and_sniffed :: proc(t: ^testing.T) {
+	hosts := "\xef\xbb\xbf# a list\r\n0.0.0.0 ads.example\r\n\r\n0.0.0.0 track.example"
+	testing.expect_value(t, detect_format(hosts), Format.Hosts)
+	cases := []struct {
+		text:   string,
+		format: Format,
+	}{{hosts, .Auto}, {"ads.example\r\ntrack.example\r\n", .Domains}, {"||ads.example^\r\n||track.example^", .Adblock}}
+	for c in cases {
+		block, allow := parsed(c.text, c.format)
+		testing.expectf(t, block.count == 2, "%v: count = %d", c.format, block.count)
+		testing.expectf(t, block.not_ascii == 0, "%v: not_ascii = %d", c.format, block.not_ascii)
+		set_destroy(block)
+		set_destroy(allow)
+	}
+	testing.expect_value(t, matches(hosts, .Auto, "track.example."), Decision.Blocked)
+}
+
 @(test)
 test_a_byte_order_mark_is_not_part_of_the_first_rule :: proc(t: ^testing.T) {
 	// A list saved by a Windows editor opens with a UTF-8 BOM, and one built by

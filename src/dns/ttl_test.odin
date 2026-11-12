@@ -141,6 +141,23 @@ test_cap_ttls_bounds_what_it_can_reach :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// A record whose RDATA runs past the end still has its TTL bounded: its fixed
+// fields are inside the message, and the walk ends with it.
+@(test)
+test_cap_ttls_bounds_a_record_whose_rdata_is_cut :: proc(t: ^testing.T) {
+	wire := answer_with_ttls([]u32{86400, 86400})
+	offsets, ok := scan_ttl_offsets(wire, context.temp_allocator)
+	if !testing.expect(t, ok && len(offsets) == 2, "the intact message did not scan") {
+		return
+	}
+	// TTL and RDLENGTH, then one byte of the four the second A record's RDATA holds.
+	cut := wire[:int(offsets[1]) + 4 + 2 + 1]
+	cap_ttls(cut, 3600)
+	testing.expect_value(t, read_ttl_at(cut, int(offsets[0])), u32(3600))
+	testing.expect_value(t, read_ttl_at(cut, int(offsets[1])), u32(3600))
+	free_all(context.temp_allocator)
+}
+
 // A header too short to hold one is left exactly as it stands, and does not
 // take the walk off the end of it.
 @(test)

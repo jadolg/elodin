@@ -21,14 +21,8 @@ form is folded into a stack buffer on the way past.
 */
 canonical_name :: proc(name: string, out: []u8) -> (n: int, ok: bool) {
 	buf: [dns.MAX_NAME_PRESENTATION]u8
-	if len(name) > len(buf) {
-		return 0, false
-	}
-	for i in 0 ..< len(name) {
-		c := name[i]
-		buf[i] = c + 32 if c >= 'A' && c <= 'Z' else c
-	}
-	m, err := dns.encode_name(string(buf[:len(name)]), out)
+	folded := dns.fold_into(name, buf[:]) or_return
+	m, err := dns.encode_name(folded, out)
 	return m, err == .None
 }
 
@@ -148,59 +142,25 @@ downcases_rdata_names :: proc "contextless" (t: dns.Type) -> bool {
 }
 
 /*
-Where the domain names sit inside the RDATA of a type the codec keeps as raw
-bytes: some fixed-width bytes, then some character-strings, then the names.
-Everything after the last name is copied through untouched.
-
-Only types on the lowercasing list above need an entry, and only those whose
-layout is fixed enough to walk. A6 is left out: its layout depends on a prefix
-length, and it has been formally obsolete since 2012. The types the codec models
-natively are listed anyway: one of them still arrives as raw bytes when its RDATA
-failed to parse, and a validation attempt on such a record should compare against
-the same canonical form as any other.
-
-Nearly the same table exists as `raw_rdata_layout` in src/dns/rdata_raw.odin,
-where the decoder walks it to expand compressed names. That one is private to its
-package and this one is private to this, so the two are kept in step by hand -
-but they are not quite the same list. That one asks whether a name in the RDATA
-may have been compressed; this one asks whether a name in the RDATA is lowercased
-for a signature, which only the types in RFC 4034 section 6.2 are. NSAP-PTR,
-NSEC, TALINK, LP, DSYNC, IPSECKEY, AMTRELAY and HIP are walked there and
-deliberately absent here: downcasing them would build a canonical form no signer
-ever computed (RFC 6840 section 5.1 took NSEC off the RFC 4034 list). RRSIG is walked there and absent
-here too, though on the list: no RRSIG set is itself signed, and the validator
-canonicalizes the signer of the one it checks on its own.
-*/
-@(private)
-Raw_Layout :: struct {
-	fixed:   int,
-	strings: int,
-	names:   int,
-}
-
-@(private)
-raw_layout :: proc "contextless" (t: dns.Type) -> (layout: Raw_Layout, ok: bool) {
-	#partial switch t {
-	case .NS, .CNAME, .PTR, .DNAME, .MB, .MG, .MR, .MD, .MF, .NXT:
-		return {0, 0, 1}, true
-	case .SOA, .MINFO, .RP:
-		return {0, 0, 2}, true
-	case .MX, .AFSDB, .RT, .KX:
-		return {2, 0, 1}, true
-	case .PX:
-		return {2, 0, 2}, true
-	case .NAPTR:
-		return {4, 3, 1}, true
-	case .SRV:
-		return {6, 0, 1}, true
-	case .SIG:
-		return {18, 0, 1}, true
-	}
-	return {}, false
-}
-
-/*
 Copy raw RDATA, lowercasing the domain names it is known to contain.
+
+Where the names sit is `dns.raw_rdata_layout`'s table: some fixed-width bytes,
+then some character-strings, then the names, and everything after the last name
+copied through untouched. The types the codec models natively are in it: one of
+them still arrives as raw bytes when its RDATA failed to parse, and a validation
+attempt on such a record should compare against the same canonical form as any
+other.
+
+That table is "a name may be compressed in here", and this asks "is a name in
+here lowercased for a signature", which only the types in RFC 4034 section 6.2
+are (`downcases_rdata_names`). So only those are walked. NSAP-PTR, NSEC, TALINK,
+LP, DSYNC, IPSECKEY, AMTRELAY and HIP are in the table and copied as they are:
+downcasing them would build a canonical form no signer ever computed (RFC 6840
+section 5.1 took NSEC off the RFC 4034 list). RRSIG is copied as it is too,
+though on the list: no RRSIG set is itself signed, and the validator
+canonicalizes the signer of the one it checks on its own. A6 is on the list and
+not in the table: its layout depends on a prefix length, and it has been
+formally obsolete since 2012.
 
 The decoder expands compressed names while the message is still in hand (see
 src/dns/rdata_raw.odin), so what arrives here is the uncompressed form RFC 4034
@@ -210,39 +170,24 @@ which is the honest answer for it.
 */
 @(private)
 write_downcased_raw :: proc(out: ^[dynamic]u8, type: dns.Type, rdata: []u8) {
-	layout, known := raw_layout(type)
-	if !known {
+	layout, known := dns.raw_rdata_layout(type, rdata)
+	if !known || type == .RRSIG || !downcases_rdata_names(type) {
 		append(out, ..rdata)
 		return
 	}
 
 	mark := len(out^)
-	pos := 0
 	fail :: proc(out: ^[dynamic]u8, mark: int, rdata: []u8) {
 		resize(out, mark)
 		append(out, ..rdata)
 	}
 
-	if pos + layout.fixed > len(rdata) {
+	pos, walked := dns.raw_names_start(rdata, layout)
+	if !walked {
 		fail(out, mark, rdata)
 		return
 	}
-	append(out, ..rdata[pos:pos + layout.fixed])
-	pos += layout.fixed
-
-	for _ in 0 ..< layout.strings {
-		if pos >= len(rdata) {
-			fail(out, mark, rdata)
-			return
-		}
-		n := int(rdata[pos])
-		if pos + 1 + n > len(rdata) {
-			fail(out, mark, rdata)
-			return
-		}
-		append(out, ..rdata[pos:pos + 1 + n])
-		pos += 1 + n
-	}
+	append(out, ..rdata[:pos])
 
 	for _ in 0 ..< layout.names {
 		for {
@@ -263,10 +208,11 @@ write_downcased_raw :: proc(out: ^[dynamic]u8, type: dns.Type, rdata: []u8) {
 				fail(out, mark, rdata)
 				return
 			}
-			append(out, l)
-			for c in rdata[pos + 1:pos + 1 + int(l)] {
-				append(out, c + 32 if c >= 'A' && c <= 'Z' else c)
-			}
+			at := len(out^) + 1
+			append(out, ..rdata[pos:pos + 1 + int(l)])
+			// Only what landed is folded: an append that ran dry adds nothing.
+			label := out[min(at, len(out^)):]
+			dns.fold_into(string(label), label)
 			pos += 1 + int(l)
 		}
 		append(out, 0)

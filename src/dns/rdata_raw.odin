@@ -29,7 +29,6 @@ byte for byte, so the only records that come out different are the ones that
 would otherwise have come out wrong.
 */
 
-@(private)
 Raw_Layout :: struct {
 	fixed:   int,
 	strings: int,
@@ -69,19 +68,11 @@ CNAME whose name will not decode: `decode_record` catches the failure and keeps
 the bytes as `Rdata_Raw`, and the compressed name inside is then exactly as stale
 as any other once the message it pointed into is gone.
 
-Nearly the same table exists as `raw_layout` in src/dnssec/canonical.odin, which
-walks these layouts to lowercase the names for canonical form. It cannot reach a
-private helper in this package and this package must not depend on that one, so
-the two are kept in step by hand. The lists are not quite the same list, though,
-and a type added here only belongs there if RFC 4034 section 6.2 names it: this
-one is "a name may be compressed in here", that one is "a name in here is
-lowercased for a signature". NSAP-PTR, NSEC, TALINK, LP, DSYNC, IPSECKEY,
-AMTRELAY and HIP are names this decoder walks and no signer downcases - RFC 6840
-section 5.1 took NSEC back off the RFC 4034 list. RRSIG stays on that list, but
-no RRSIG set is ever itself signed, and the validator canonicalizes the signer
-of the one it checks on its own.
+`dnssec.write_downcased_raw` walks this table too, to lowercase the names for
+canonical form, but only for the types RFC 4034 section 6.2 names
+(`dnssec.downcases_rdata_names`): this table is "a name may be compressed in
+here", that list is "a name in here is lowercased for a signature".
 */
-@(private)
 raw_rdata_layout :: proc "contextless" (t: Type, rdata: []u8) -> (layout: Raw_Layout, ok: bool) {
 	#partial switch t {
 	case .IPSECKEY:
@@ -169,8 +160,7 @@ decode_raw_rdata :: proc(r: ^Reader, type: Type, start, end: int, allocator: mem
 	// overwhelming majority of raw RDATA has no pointer where a name belongs.
 	// Checking that slot rather than every byte matters for RRSIG, whose
 	// signature nearly always holds a byte that looks like one.
-	if raw_rdata_holds_pointer(type, msg[start:end]) {
-		layout, _ := raw_rdata_layout(type, msg[start:end])
+	if layout, known := raw_rdata_layout(type, msg[start:end]); known && raw_rdata_holds_pointer(layout, msg[start:end]) {
 		if expanded, ok := expand_rdata_names(r, layout, start, end, allocator); ok {
 			return Rdata_Raw{data = expanded}
 		}
@@ -214,22 +204,8 @@ expand_rdata_names :: proc(
 
 	// Walk to where the names start. Everything before them is carried through
 	// byte for byte, so its length is all that is needed here.
-	pos := start
-	if pos + layout.fixed > end {
-		return nil, false
-	}
-	pos += layout.fixed
-	for _ in 0 ..< layout.strings {
-		if pos >= end {
-			return nil, false
-		}
-		n := int(msg[pos])
-		if pos + 1 + n > end {
-			return nil, false
-		}
-		pos += 1 + n
-	}
-	head := pos
+	head := start + (raw_names_start(msg[start:end], layout) or_return)
+	pos := head
 
 	/*
 	Expand the names onto the stack before anything is taken from the allocator.
@@ -322,34 +298,40 @@ expand_rdata_names :: proc(
 }
 
 /*
-Whether a raw blob still holds a compression pointer where a name belongs.
-
-Answers only for the types whose layout is known, and only when the walk reaches
-a name; a blob that does not add up is reported as clean because nothing here can
-tell where its names were meant to start. That is the conservative direction: the
-writer refuses what this returns true for, and refusing a record that was fine
-would cost an answer for nothing.
+Where the names start in `rdata` laid out as `layout`: past its fixed bytes and
+its character-strings. False where those run past the end of `rdata`.
 */
-@(private)
-raw_rdata_holds_pointer :: proc "contextless" (type: Type, rdata: []u8) -> bool {
-	layout, known := raw_rdata_layout(type, rdata)
-	if !known {
-		return false
-	}
-
-	pos := layout.fixed
+raw_names_start :: proc "contextless" (rdata: []u8, layout: Raw_Layout) -> (pos: int, ok: bool) {
+	pos = layout.fixed
 	if pos > len(rdata) {
-		return false
+		return 0, false
 	}
 	for _ in 0 ..< layout.strings {
 		if pos >= len(rdata) {
-			return false
+			return 0, false
 		}
-		n := int(rdata[pos])
-		if pos + 1 + n > len(rdata) {
-			return false
+		pos += 1 + int(rdata[pos])
+		if pos > len(rdata) {
+			return 0, false
 		}
-		pos += 1 + n
+	}
+	return pos, true
+}
+
+/*
+Whether a raw blob laid out as `layout` (`raw_rdata_layout`) still holds a
+compression pointer where a name belongs.
+
+Answers only when the walk reaches a name; a blob that does not add up is
+reported as clean because nothing here can tell where its names were meant to
+start. That is the conservative direction: the writer refuses what this returns
+true for, and refusing a record that was fine would cost an answer for nothing.
+*/
+@(private)
+raw_rdata_holds_pointer :: proc "contextless" (layout: Raw_Layout, rdata: []u8) -> bool {
+	pos, walked := raw_names_start(rdata, layout)
+	if !walked {
+		return false
 	}
 
 	for _ in 0 ..< layout.names {

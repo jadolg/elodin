@@ -559,19 +559,9 @@ rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool, not_ascii
 
 @(private)
 normalise :: proc(name: string, buf: []u8) -> (out: string, ok: bool) {
-	s := name
-	if len(s) > 0 && s[len(s) - 1] == '.' {
-		s = s[:len(s) - 1]
-	}
-	if len(s) == 0 || len(s) > len(buf) {
+	s := dns.name_trim_root(name)
+	if len(s) == 0 {
 		return "", false
 	}
-	for i in 0 ..< len(s) {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 32
-		}
-		buf[i] = c
-	}
-	return string(buf[:len(s)]), true
+	return dns.fold_into(s, buf)
 }

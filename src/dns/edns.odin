@@ -95,9 +95,7 @@ ensure_edns_option :: proc(
 	data: []u8,
 	udp_size: u16,
 	allocator := context.allocator,
-	// What the request has taken out of its arena so far, if this message
-	// belongs to one: the rebuild below reads it in like any other reading.
-	// See `REQUEST_DECODE_BUDGET`.
+	// See `set_edns_option`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,
@@ -139,9 +137,7 @@ ensure_opt :: proc(
 	msg: []u8,
 	udp_size: u16,
 	allocator := context.allocator,
-	// What the request has taken out of its arena so far, if this message
-	// belongs to one: the rebuild below reads it in like any other reading.
-	// See `REQUEST_DECODE_BUDGET`.
+	// See `set_edns_option`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,
@@ -170,7 +166,7 @@ ensure_opt_compressed :: proc(
 	msg: []u8,
 	udp_size: u16,
 	allocator := context.allocator,
-	// See `ensure_opt`.
+	// See `set_edns_option`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,
@@ -277,14 +273,21 @@ append_opt :: proc(
 	out[p + 10] = u8(rdlen)
 	p += 11
 	for o in options {
-		out[p] = u8(o.code >> 8)
-		out[p + 1] = u8(o.code)
-		out[p + 2] = u8(len(o.data) >> 8)
-		out[p + 3] = u8(len(o.data))
-		copy(out[p + 4:], o.data)
-		p += 4 + len(o.data)
+		p = put_option(out, p, o.code, o.data)
 	}
 	return out, true
+}
+
+// One option at `out[p:]` - its code, its length, then its data - and where the
+// next one starts. The caller has made the room and bounded `len(data)`.
+@(private)
+put_option :: proc(out: []u8, p: int, code: u16, data: []u8) -> int {
+	out[p] = u8(code >> 8)
+	out[p + 1] = u8(code)
+	out[p + 2] = u8(len(data) >> 8)
+	out[p + 3] = u8(len(data))
+	copy(out[p + 4:], data)
+	return p + 4 + len(data)
 }
 
 /*
@@ -302,7 +305,7 @@ walk_to_end :: proc(msg: []u8) -> (end: int, has_opt: bool) {
 	}
 	before := total - int(u16(msg[10]) << 8 | u16(msg[11]))
 	for i in 0 ..< total {
-		type, next, ok := skip_record(msg, pos)
+		type, _, next, ok := skip_record(msg, pos)
 		if !ok {
 			return -1, false
 		}
@@ -391,9 +394,7 @@ input.
 remove_opt :: proc(
 	msg: []u8,
 	allocator := context.allocator,
-	// What the request has taken out of its arena so far, if this message
-	// belongs to one: the rebuild below reads it in like any other reading.
-	// See `REQUEST_DECODE_BUDGET`.
+	// See `set_edns_option`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,
@@ -474,9 +475,7 @@ remove_edns_option :: proc(
 	msg: []u8,
 	code: EDNS_Option_Code,
 	allocator := context.allocator,
-	// What the request has taken out of its arena so far, if this message
-	// belongs to one: the rebuild below reads it in like any other reading.
-	// See `REQUEST_DECODE_BUDGET`.
+	// See `set_edns_option`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,
@@ -550,10 +549,7 @@ Opt_Span :: struct {
 
 @(private)
 find_opt_span :: proc(msg: []u8) -> (span: Opt_Span, ok: bool) {
-	if len(msg) < HEADER_SIZE {
-		return {}, false
-	}
-	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
+	pos, total := records_start(msg) or_return
 	/*
 	Only the additional section is looked in, because that is the only section
 	`find_opt` looks in. A record of type OPT anywhere else is not the message's
@@ -562,42 +558,20 @@ find_opt_span :: proc(msg: []u8) -> (span: Opt_Span, ok: bool) {
 	never consults quietly rewritten. A client can put one in its answer section
 	for the asking.
 	*/
-	before := int(u16(msg[6]) << 8 | u16(msg[7]))
-	before += int(u16(msg[8]) << 8 | u16(msg[9]))
-	arcount := int(u16(msg[10]) << 8 | u16(msg[11]))
-
-	pos := HEADER_SIZE
-	for _ in 0 ..< qdcount {
-		pos = skip_name(msg, pos) or_return
-		pos += 4
-		if pos > len(msg) {
-			return {}, false
-		}
-	}
-	for i in 0 ..< before + arcount {
-		rec_start := pos
-		pos = skip_name(msg, pos) or_return
-		if pos + 10 > len(msg) {
-			return {}, false
-		}
-		rtype := Type(u16(msg[pos]) << 8 | u16(msg[pos + 1]))
-		rdlength := int(u16(msg[pos + 8]) << 8 | u16(msg[pos + 9]))
-		rd_start := pos + 10
-		rd_end := rd_start + rdlength
-		if rd_end > len(msg) {
-			return {}, false
-		}
-		if rtype == .OPT && i >= before {
+	before := total - int(u16(msg[10]) << 8 | u16(msg[11]))
+	for i in 0 ..< total {
+		type, fixed, next := skip_record(msg, pos) or_return
+		if type == .OPT && i >= before {
 			return Opt_Span {
-					rec_start = rec_start,
-					rdlen_pos = pos + 8,
-					rd_start = rd_start,
-					rd_end = rd_end,
-					last = rd_end == len(msg),
+					rec_start = pos,
+					rdlen_pos = fixed + 8,
+					rd_start = fixed + 10,
+					rd_end = next,
+					last = next == len(msg),
 				},
 				true
 		}
-		pos = rd_end
+		pos = next
 	}
 	return {}, false
 }
@@ -623,24 +597,14 @@ the point where the walk stops: `find_opt_span` cannot reach one there either,
 and nor can a client's decoder. Allocates nothing.
 */
 peek_opt_unreadable :: proc(msg: []u8) -> bool {
-	if len(msg) < HEADER_SIZE {
+	pos, total, walked := records_start(msg)
+	if !walked {
 		return false
 	}
-	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
-	before := int(u16(msg[6]) << 8 | u16(msg[7])) + int(u16(msg[8]) << 8 | u16(msg[9]))
-	arcount := int(u16(msg[10]) << 8 | u16(msg[11]))
-
-	pos := HEADER_SIZE
-	for _ in 0 ..< qdcount {
-		next, ok := skip_name(msg, pos)
-		if !ok || next + 4 > len(msg) {
-			return false
-		}
-		pos = next + 4
-	}
+	before := total - int(u16(msg[10]) << 8 | u16(msg[11]))
 	seen := false
-	for i in 0 ..< before + arcount {
-		type, next, ok := skip_record(msg, pos)
+	for i in 0 ..< total {
+		type, fixed, next, ok := skip_record(msg, pos)
 		if !ok {
 			return false
 		}
@@ -650,7 +614,6 @@ peek_opt_unreadable :: proc(msg: []u8) -> bool {
 			}
 			seen = true
 			// The framing the editors below hold an OPT's RDATA to.
-			fixed, _ := skip_name(msg, pos)
 			if _, framed := scan_edns_option(msg, Opt_Span{rd_start = fixed + 10, rd_end = next}, 0); !framed {
 				return true
 			}
@@ -740,12 +703,7 @@ rewrite_edns_option :: proc(
 	copy(out, msg[:cut_start])
 	p := cut_start
 	if !remove {
-		out[p] = u8(code >> 8)
-		out[p + 1] = u8(code)
-		out[p + 2] = u8(len(data) >> 8)
-		out[p + 3] = u8(len(data))
-		copy(out[p + 4:], data)
-		p += written
+		p = put_option(out, p, code, data)
 	}
 	copy(out[p:], msg[cut_end:])
 
@@ -861,9 +819,7 @@ not the last one cannot be decoded and encoded again whole inside `MAX_MESSAGE`
 strip_edns_options :: proc(
 	msg: []u8,
 	allocator := context.allocator,
-	// What the request has taken out of its arena so far, if this message
-	// belongs to one: the rebuild below reads it in like any other reading.
-	// See `REQUEST_DECODE_BUDGET`.
+	// See `set_edns_option`.
 	spent: ^int = nil,
 ) -> (
 	out: []u8,
@@ -1020,7 +976,7 @@ set_edns_version_and_flags :: proc(msg: []u8, version: u8, do_bit: bool) -> bool
 	// The TTL ends four bytes before RDLENGTH, so its first byte - the extended
 	// rcode, left as it stands - is at `rdlen_pos - 4` and the version follows it.
 	msg[span.rdlen_pos - 3] = version
-	msg[span.rdlen_pos - 2] = 0x80 if do_bit else 0
+	msg[span.rdlen_pos - 2] = u8(EDNS_DO >> 8) if do_bit else 0
 	msg[span.rdlen_pos - 1] = 0
 	return true
 }

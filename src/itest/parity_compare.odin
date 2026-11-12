@@ -1237,22 +1237,7 @@ pc_name_end :: proc(buf: []u8, start: int) -> (end: int, ok: bool) {
 // of the record, where a byte is a byte.
 @(private = "file")
 pc_name_equal_fold :: proc(a, b: []u8) -> bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i in 0 ..< len(a) {
-		x, y := a[i], b[i]
-		if x >= 'A' && x <= 'Z' {
-			x += 32
-		}
-		if y >= 'A' && y <= 'Z' {
-			y += 32
-		}
-		if x != y {
-			return false
-		}
-	}
-	return true
+	return dns.name_equal_fold(string(a), string(b))
 }
 
 @(private = "file")

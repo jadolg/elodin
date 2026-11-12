@@ -26,14 +26,12 @@ edns_present :: proc(m: Message) -> bool {
 	return found
 }
 
-// The DO bit is the top bit of the flags half of the OPT record's TTL field,
-// the low sixteen bits.
 edns_do :: proc(m: Message) -> bool {
 	opt, found := find_opt(m)
 	if !found {
 		return false
 	}
-	return opt.ttl & 0x0000_8000 != 0
+	return opt.ttl & EDNS_DO != 0
 }
 
 /*
@@ -63,7 +61,7 @@ edns_version :: proc(m: Message) -> u8 {
 make_opt :: proc(udp_size: u16, do_bit: bool, ext_rcode: u8 = 0) -> Record {
 	ttl := u32(ext_rcode) << 24
 	if do_bit {
-		ttl |= 0x0000_8000
+		ttl |= EDNS_DO
 	}
 	return Record{name = ".", type = .OPT, class = Class(udp_size), ttl = ttl}
 }
@@ -153,17 +151,7 @@ truncated_response :: proc(query_bytes: []u8, allocator := context.allocator) ->
 
 	buf := alloc_slice([]u8, end, allocator) or_return
 	copy(buf, query_bytes[:end])
-	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
-	flags.qr = true
-	flags.ra = true
-	flags.tc = true
-	// As in `error_response`: every bit here started as the client's, and AD
-	// coming back set would read as this server vouching for something.
-	flags.ad = false
-	flags.rcode = 0
-	fv := transmute(u16)flags
-	buf[2] = u8(fv >> 8)
-	buf[3] = u8(fv)
+	patch_reply_flags(buf, true, 0)
 	buf[4], buf[5] = u8(questions >> 8), u8(questions)
 	// No answer, authority or additional sections, so nothing counts them.
 	for i in 6 ..< HEADER_SIZE {
@@ -246,24 +234,33 @@ error_response :: proc(
 	}
 	buf := alloc_slice([]u8, HEADER_SIZE, allocator) or_return
 	copy(buf, header[:HEADER_SIZE])
-	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
-	flags.qr = true
-	flags.ra = true
-	flags.tc = false
-	// Built out of the query's own header, so every bit in it started as the
-	// client's. AD is the one that must not survive the round trip: coming back
-	// set, it would read as this server vouching for a message it could not
-	// even parse.
-	flags.ad = false
-	flags.rcode = u8(rcode) & 0xf
-	fv := transmute(u16)flags
-	buf[2] = u8(fv >> 8)
-	buf[3] = u8(fv)
+	patch_reply_flags(buf, false, u8(rcode) & 0xf)
 	// Drop every section count; the sections themselves are not copied.
 	for i in 4 ..< HEADER_SIZE {
 		buf[i] = 0
 	}
 	return buf, true
+}
+
+/*
+Turn the query's flags at `buf[2:4]` into a reply's, for the two answers built
+out of the query's own header: QR and RA set, TC and the rcode as given.
+
+Every bit there started as the client's. AD is the one that must not survive
+the round trip: coming back set, it would read as this server vouching for a
+message it may not even have parsed.
+*/
+@(private)
+patch_reply_flags :: proc(buf: []u8, tc: bool, rcode: u8) {
+	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
+	flags.qr = true
+	flags.ra = true
+	flags.tc = tc
+	flags.ad = false
+	flags.rcode = rcode
+	fv := transmute(u16)flags
+	buf[2] = u8(fv >> 8)
+	buf[3] = u8(fv)
 }
 
 @(private)
@@ -326,19 +323,16 @@ cache keeps a copy of the list for as long as it keeps the answer, a quarter of
 what `int`s would take.
 */
 scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets: []u16, ok: bool) {
-	if len(msg) < HEADER_SIZE || len(msg) > MAX_MESSAGE {
+	if len(msg) > MAX_MESSAGE {
 		return nil, false
 	}
-	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
-	total := int(u16(msg[6]) << 8 | u16(msg[7]))
-	total += int(u16(msg[8]) << 8 | u16(msg[9]))
-	total += int(u16(msg[10]) << 8 | u16(msg[11]))
+	pos, total := records_start(msg) or_return
 
 	/*
 	Counts that cannot possibly fit are refused before `total` is spent as a
-	capacity: a question needs at least 5 bytes on the wire and a record at
-	least 11 - a root name plus the fixed fields - which is the same arithmetic
-	`decode_message` makes, for the same reason.
+	capacity: past the question section a record needs at least 11 bytes on the
+	wire - a root name plus the fixed fields - which is the arithmetic
+	`decode_message` makes for records, for the same reason.
 
 	The caller is `cache.put`, which `resolve_query` reaches only with a
 	response it has decoded. A 17-byte reply claiming three sections of 65535 records would
@@ -346,18 +340,8 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 	guard that costs one comparison is not worth removing for a caller that
 	might hand it bytes nothing has checked.
 	*/
-	remaining := len(msg) - HEADER_SIZE
-	if qdcount * 5 + total * 11 > remaining {
+	if total * 11 > len(msg) - pos {
 		return nil, false
-	}
-
-	pos := HEADER_SIZE
-	for _ in 0 ..< qdcount {
-		pos = skip_name(msg, pos) or_return
-		pos += 4
-		if pos > len(msg) {
-			return nil, false
-		}
 	}
 
 	/*
@@ -367,26 +351,15 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 	*/
 	out := alloc_list([dynamic]u16, total, allocator) or_return
 	for _ in 0 ..< total {
-		next, name_ok := skip_name(msg, pos)
-		if !name_ok {
+		type, fixed, next, rec_ok := skip_record(msg, pos)
+		if !rec_ok {
 			delete(out)
 			return nil, false
+		}
+		if type != .OPT {
+			append(&out, u16(fixed + 4))
 		}
 		pos = next
-		if pos + 10 > len(msg) {
-			delete(out)
-			return nil, false
-		}
-		rtype := Type(u16(msg[pos]) << 8 | u16(msg[pos + 1]))
-		if rtype != .OPT {
-			append(&out, u16(pos + 4))
-		}
-		rdlength := int(u16(msg[pos + 8]) << 8 | u16(msg[pos + 9]))
-		pos += 10 + rdlength
-		if pos > len(msg) {
-			delete(out)
-			return nil, false
-		}
 	}
 	return out[:], true
 }
@@ -396,8 +369,10 @@ The EDNS0 payload size a message advertises, read off the wire.
 
 Answers the question a sender has to answer before it can size a receive buffer:
 how large may the reply to this be? Returns MAX_UDP_SIZE when there is no OPT
-record, or when the message cannot be walked — the 512 bytes RFC 1035 says a
-responder must assume without being told otherwise.
+record, or when the message cannot be walked as far as its OPT record and over
+it - the 512 bytes RFC 1035 says a responder must assume without being told
+otherwise. The record is the one `find_opt_span` finds, so this reads the field
+`set_edns_udp_size` writes.
 
 Distinct from `edns_udp_size`, which clamps into the range this server is
 willing to *send*; this reports what the message actually said.
@@ -411,45 +386,14 @@ figure a rewrite writes, off a record the writer never touches and the upstream
 never reads.
 */
 peek_udp_size :: proc(msg: []u8) -> u16 {
-	if len(msg) < HEADER_SIZE {
+	span, found := find_opt_span(msg)
+	if !found {
 		return MAX_UDP_SIZE
 	}
-	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
-	before := int(u16(msg[6]) << 8 | u16(msg[7]))
-	before += int(u16(msg[8]) << 8 | u16(msg[9]))
-	arcount := int(u16(msg[10]) << 8 | u16(msg[11]))
-
-	pos := HEADER_SIZE
-	for _ in 0 ..< qdcount {
-		next, ok := skip_name(msg, pos)
-		if !ok {
-			return MAX_UDP_SIZE
-		}
-		pos = next + 4
-		if pos > len(msg) {
-			return MAX_UDP_SIZE
-		}
-	}
-	for i in 0 ..< before + arcount {
-		next, ok := skip_name(msg, pos)
-		if !ok {
-			return MAX_UDP_SIZE
-		}
-		pos = next
-		if pos + 10 > len(msg) {
-			return MAX_UDP_SIZE
-		}
-		// OPT carries the payload size where every other type carries its class.
-		if i >= before && Type(u16(msg[pos]) << 8 | u16(msg[pos + 1])) == .OPT {
-			return u16(msg[pos + 2]) << 8 | u16(msg[pos + 3])
-		}
-		rdlength := int(u16(msg[pos + 8]) << 8 | u16(msg[pos + 9]))
-		pos += 10 + rdlength
-		if pos > len(msg) {
-			return MAX_UDP_SIZE
-		}
-	}
-	return MAX_UDP_SIZE
+	// OPT carries the payload size where every other type carries its class,
+	// where `set_edns_udp_size` writes it.
+	class_pos := span.rdlen_pos - 6
+	return u16(msg[class_pos]) << 8 | u16(msg[class_pos + 1])
 }
 
 /*
@@ -516,20 +460,13 @@ peek_referral :: proc(msg: []u8) -> bool {
 		return false
 	}
 
-	pos := HEADER_SIZE
-	for _ in 0 ..< qdcount {
-		next, ok := skip_name(msg, pos)
-		if !ok {
-			return false
-		}
-		pos = next + 4
-		if pos > len(msg) {
-			return false
-		}
+	pos, _, walked := records_start(msg)
+	if !walked {
+		return false
 	}
 	// The answer first: an ordinary answer's first record ends this here.
 	for _ in 0 ..< ancount {
-		type, next, ok := skip_record(msg, pos)
+		type, _, next, ok := skip_record(msg, pos)
 		if !ok {
 			return false
 		}
@@ -548,7 +485,7 @@ peek_referral :: proc(msg: []u8) -> bool {
 	ns := false
 	authority_at := pos
 	for _ in 0 ..< nscount {
-		type, next, ok := skip_record(msg, pos)
+		type, _, next, ok := skip_record(msg, pos)
 		if !ok {
 			return false
 		}
@@ -566,18 +503,29 @@ peek_referral :: proc(msg: []u8) -> bool {
 	return referred_past_alias(msg, authority_at, nscount)
 }
 
-// The resource record at `pos`: its type, and where the one after it starts.
+/*
+The resource record at `pos`: its type, where its fixed fields start (TYPE,
+CLASS, TTL, RDLENGTH, so the TTL is at `fixed + 4` and the RDATA at
+`fixed + 10`), and where the record after it starts. `ok` is false where the
+record runs past the end of `msg`.
+
+`type` and `fixed` are set whenever the owner name and the fixed fields lie
+inside `msg`, even where the RDATA runs past it and `ok` is false; `fixed` is
+zero where they do not. `cap_ttls` bounds the TTL of such a record.
+*/
 @(private)
-skip_record :: proc(msg: []u8, pos: int) -> (type: Type, next: int, ok: bool) {
-	fixed, named := skip_name(msg, pos)
-	if !named || fixed + 10 > len(msg) {
+skip_record :: proc(msg: []u8, pos: int) -> (type: Type, fixed: int, next: int, ok: bool) {
+	at, named := skip_name(msg, pos)
+	if !named || at + 10 > len(msg) {
 		return
 	}
-	next = fixed + 10 + int(u16(msg[fixed + 8]) << 8 | u16(msg[fixed + 9]))
-	if next > len(msg) {
+	fixed = at
+	type = Type(u16(msg[at]) << 8 | u16(msg[at + 1]))
+	end := at + 10 + int(u16(msg[at + 8]) << 8 | u16(msg[at + 9]))
+	if end > len(msg) {
 		return
 	}
-	return Type(u16(msg[fixed]) << 8 | u16(msg[fixed + 1])), next, true
+	return type, fixed, end, true
 }
 
 // The most answer or authority records `peek_referral` follows a chain through:
@@ -664,8 +612,8 @@ referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
 	}
 	pos := authority_at
 	for _ in 0 ..< nscount {
-		type, next, _ := skip_record(msg, pos)
-		if type == .NS {
+		type, _, next, ok := skip_record(msg, pos)
+		if ok && type == .NS {
 			zone, _, nerr := decode_name(msg, pos, context.temp_allocator)
 			// Unread for want of memory is "cannot tell", as above.
 			if nerr == .Out_Of_Memory {
@@ -821,23 +769,20 @@ cap_ttls :: proc(msg: []u8, ceiling: u32) {
 		return
 	}
 	for _ in 0 ..< total {
-		next, name_ok := skip_name(msg, pos)
-		if !name_ok {
+		type, fixed, next, rec_ok := skip_record(msg, pos)
+		if fixed == 0 {
+			return
+		}
+		// OPT is skipped: its "TTL" is really the extended rcode and flags. A
+		// record whose RDATA runs past the end still has its TTL bounded, and
+		// ends the walk.
+		if type != .OPT {
+			write_ttl_at(msg, fixed + 4, min(sane_ttl(read_ttl_at(msg, fixed + 4)), ceiling))
+		}
+		if !rec_ok {
 			return
 		}
 		pos = next
-		if pos + 10 > len(msg) {
-			return
-		}
-		// OPT is skipped: its "TTL" is really the extended rcode and flags.
-		if Type(u16(msg[pos]) << 8 | u16(msg[pos + 1])) != .OPT {
-			write_ttl_at(msg, pos + 4, min(sane_ttl(read_ttl_at(msg, pos + 4)), ceiling))
-		}
-		rdlength := int(u16(msg[pos + 8]) << 8 | u16(msg[pos + 9]))
-		pos += 10 + rdlength
-		if pos > len(msg) {
-			return
-		}
 	}
 }
 
@@ -868,25 +813,17 @@ signatures_lapse :: proc(msg: []u8, now: u32) -> (left: u32, signed: bool) {
 		return
 	}
 	for _ in 0 ..< total {
-		next, name_ok := skip_name(msg, pos)
-		if !name_ok {
+		type, fixed, next, rec_ok := skip_record(msg, pos)
+		if !rec_ok {
 			return
 		}
 		pos = next
-		if pos + 10 > len(msg) {
-			return
-		}
-		rdlength := int(u16(msg[pos + 8]) << 8 | u16(msg[pos + 9]))
-		rdata := pos + 10
-		pos = rdata + rdlength
-		if pos > len(msg) {
-			return
-		}
-		if Type(u16(msg[next]) << 8 | u16(msg[next + 1])) != .RRSIG {
+		if type != .RRSIG {
 			continue
 		}
 		signed = true
-		if rdlength < 12 {
+		rdata := fixed + 10
+		if next - rdata < 12 {
 			return 0, true
 		}
 		expiration := read_ttl_at(msg, rdata + 8)

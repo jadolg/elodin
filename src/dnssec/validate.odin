@@ -4729,7 +4729,7 @@ cache_get :: proc(
 	non_cut: bool,
 ) {
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
-	key, key_ok := fold_into(zone, fold_buf[:])
+	key, key_ok := dns.fold_into(zone, fold_buf[:])
 	if !key_ok {
 		return {}, false, false
 	}
@@ -4840,7 +4840,7 @@ non_cut_slot :: proc(v: ^Validator, key: string) -> int {
 @(private)
 non_cut_forget :: proc(v: ^Validator, name: string) {
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
-	key, key_ok := fold_into(name, fold_buf[:])
+	key, key_ok := dns.fold_into(name, fold_buf[:])
 	if !key_ok {
 		return
 	}
@@ -4867,7 +4867,7 @@ non_cut_drop :: proc(v: ^Validator, key: string) {
 @(private)
 non_cut_remember :: proc(v: ^Validator, name: string, ttl: u32, now: loop.Moment, lapses := max(u32)) {
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
-	key, key_ok := fold_into(name, fold_buf[:])
+	key, key_ok := dns.fold_into(name, fold_buf[:])
 	if !key_ok {
 		return
 	}
@@ -4926,7 +4926,7 @@ clear_non_cuts :: proc(v: ^Validator) {
 @(private)
 cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, ttl: u32, now: loop.Moment, lapses := max(u32)) {
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
-	key, key_ok := fold_into(zone, fold_buf[:])
+	key, key_ok := dns.fold_into(zone, fold_buf[:])
 	if !key_ok {
 		return
 	}
@@ -5132,18 +5132,6 @@ sweep_at :: proc(v: ^Validator, clock: loop.Moment) -> (removed: int) {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-
-@(private)
-fold_into :: proc(name: string, buf: []u8) -> (string, bool) {
-	if len(name) > len(buf) {
-		return "", false
-	}
-	for i in 0 ..< len(name) {
-		c := name[i]
-		buf[i] = c + 32 if c >= 'A' && c <= 'Z' else c
-	}
-	return string(buf[:len(name)]), true
-}
 
 /*
 Is this CNAME one that a DNAME in the same answer produced?

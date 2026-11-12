@@ -66,7 +66,7 @@ block_wire :: proc(
 		additional = 1
 		p += copy(buf[p:], []u8{0, 0, u8(dns.Type.OPT)})
 		wire_u16(buf[:], &p, dns.edns_udp_size(query))
-		wire_u32(buf[:], &p, 0x8000 if dns.edns_do(query) else 0)
+		wire_u32(buf[:], &p, dns.EDNS_DO if dns.edns_do(query) else 0)
 		wire_u16(buf[:], &p, 0)
 	}
 	if p > limit {

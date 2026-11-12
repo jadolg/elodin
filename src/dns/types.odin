@@ -6,6 +6,10 @@ MAX_UDP_SIZE :: 512
 MAX_MESSAGE :: 65535
 HEADER_SIZE :: 12
 
+// The DO bit in an OPT record's TTL: the top bit of its flags, the low sixteen
+// bits (RFC 3225 section 3, RFC 6891 section 6.1.3).
+EDNS_DO :: u32(0x8000)
+
 Type :: enum u16 {
 	None       = 0,
 	A          = 1,
