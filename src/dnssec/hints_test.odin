@@ -270,12 +270,15 @@ Sh_Lookup :: struct {
 	type: dns.Type,
 }
 
-// Answers from `SH_FIXTURES`, counting into the `^Sh_Calls` in `ctx`. The list of
-// what was asked lives on the temporary allocator, freed with everything else
-// the test made.
+// Answers from `SH_FIXTURES`, counting into the `^Sh_Calls` in `ctx` when there
+// is one. The list of what was asked lives on the temporary allocator, freed
+// with everything else the test made.
 @(private = "file")
 sh_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
 	calls := (^Sh_Calls)(ctx)
+	if calls == nil {
+		return fixture_answer(SH_FIXTURES, name, type, allocator)
+	}
 	calls.lookups += 1
 	if calls.asked == nil {
 		calls.asked = make([dynamic]Sh_Lookup, context.temp_allocator)
@@ -312,7 +315,7 @@ sh_resolve :: proc(
 	pruned: dns.Message,
 	ok: bool,
 ) {
-	v := make_validator(sh_query, calls, Options{anchors = fixture_anchors(SH_ANCHOR)}) if calls != nil else scenario_validator(&SH_FIXTURES, SH_ANCHOR)
+	v := make_validator(sh_query, calls, Options{anchors = fixture_anchors(SH_ANCHOR)})
 	defer destroy_validator(v)
 	return sh_prune(t, v, scenario_fixture(SH_FIXTURES, key), qname, qtype)
 }

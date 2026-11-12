@@ -141,7 +141,10 @@ WN_FIXTURES := []Fixture{
 wn_validate :: proc(qname: string, type: dns.Type) -> Result {
 	v := scenario_validator(&WN_FIXTURES, WN_ANCHOR)
 	defer destroy_validator(v)
-	reply, _ := fixture_answer(WN_FIXTURES, qname, type, context.temp_allocator)
+	reply, ok := fixture_answer(WN_FIXTURES, qname, type, context.temp_allocator)
+	if !ok {
+		panic("no fixture answers this question")
+	}
 	return validate(v, qname, type, reply, fixture_now())
 }
 

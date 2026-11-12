@@ -53,6 +53,18 @@ longest_name :: proc() -> string {
 	return strings.to_string(b)
 }
 
+// Every suffix of `longest_name()` below the root, the name itself first: the
+// names the longest walk has to rule out.
+@(private = "file")
+longest_suffixes :: proc() -> []string {
+	longest := longest_name()
+	names := make([]string, 127, context.temp_allocator)
+	for &name, i in names {
+		name = name_drop_labels(longest, i)
+	}
+	return names
+}
+
 /*
 The tests below seed the non-cut table with seed 0 and remember a run of names
 in it, assuming each name keeps its own slot: a collision would evict one
@@ -66,12 +78,7 @@ test_reverse_depth_names_do_not_collide_in_non_cut_table :: proc(t: ^testing.T) 
 	v.non_cut_seed = 0
 
 	expect_distinct_non_cut_slots(t, v, ip6_non_cuts())
-	longest := longest_name()
-	suffixes := make([]string, 127, context.temp_allocator)
-	for &name, i in suffixes {
-		name = name_drop_labels(longest, i)
-	}
-	expect_distinct_non_cut_slots(t, v, suffixes)
+	expect_distinct_non_cut_slots(t, v, longest_suffixes())
 	free_all(context.temp_allocator)
 }
 
@@ -229,8 +236,8 @@ test_the_longest_name_the_wire_allows_is_walked_to_the_end :: proc(t: ^testing.T
 	// 127 labels of one character, plus the root: the 255 octets a name gets.
 	testing.expect_value(t, len(longest) + 1, dns.MAX_NAME_WIRE)
 
-	for i in 0 ..< 127 {
-		non_cut_remember(v, name_drop_labels(longest, i), MAX_ZONE_TTL, fixture_moment(now))
+	for name in longest_suffixes() {
+		non_cut_remember(v, name, MAX_ZONE_TTL, fixture_moment(now))
 	}
 
 	budget := query_budget(v)

@@ -81,10 +81,20 @@ holds_signature_over :: proc(records: []dns.Record, name: string, covered: dns.T
 // Every name in `names` owns its own slot of `v`'s non-cut table, so a test that
 // remembers them all loses none of them to a collision (issue #362).
 expect_distinct_non_cut_slots :: proc(t: ^testing.T, v: ^Validator, names: []string) {
+	// Hashed as the table hashes them: folded, so a name's case cannot pick
+	// a different slot from the one the walk would use.
+	slot_of :: proc(v: ^Validator, name: string) -> int {
+		buf: [dns.MAX_NAME_PRESENTATION]u8
+		key, ok := dns.fold_into(name, buf[:])
+		if !ok {
+			panic("a name too long to fold")
+		}
+		return non_cut_slot(v, key)
+	}
 	for name, i in names {
-		slot := non_cut_slot(v, name)
+		slot := slot_of(v, name)
 		for other in names[:i] {
-			testing.expectf(t, non_cut_slot(v, other) != slot, "%s and %s share non-cut slot %d", name, other, slot)
+			testing.expectf(t, slot_of(v, other) != slot, "%s and %s share non-cut slot %d", name, other, slot)
 		}
 	}
 }
@@ -168,7 +178,13 @@ rrsig_mutant :: proc(real: dns.Record, damage: bit_set[Rrsig_Damage], allocator 
 	out := make([]u8, len(rdata), allocator)
 	copy(out, rdata)
 	if .Signature in damage {
-		for i in max(RRSIG_SIGNER, len(out) - 8) ..< len(out) {
+		// The signature starts after the signer name, which RRSIG RDATA carries
+		// uncompressed, so a short signature never takes the signer with it.
+		start := RRSIG_SIGNER
+		for start < len(out) && out[start] != 0 {
+			start += int(out[start]) + 1
+		}
+		for i in max(start + 1, len(out) - 8) ..< len(out) {
 			out[i] ~= 0xff
 		}
 	}
@@ -223,12 +239,12 @@ SPENT :: dns.REQUEST_DECODE_BUDGET + 1
 // literal, so the tests name it once here.
 NO_DENIAL :: "no denial of existence"
 
-// Test fixtures are well-formed, so a bad one is nil rather than a second
-// value every caller would drop.
+// Test hex decoded. Text that is not hex is a broken test, not an input to judge,
+// so it panics rather than hand back a nil every caller would have to check.
 unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
 	out, ok := decode_hex(text, allocator)
 	if !ok {
-		return nil
+		panic("test hex does not decode")
 	}
 	return out
 }
@@ -247,11 +263,7 @@ fixture :: proc(key: string, table: []Fixture = nil) -> Fixture {
 // The reply under `key` in `fixtures`, decoded. A missing key or a wire that is
 // not hex is a broken test, not a verdict, so it panics.
 scenario_fixture :: proc(fixtures: []Fixture, key: string) -> []u8 {
-	out, ok := decode_hex(fixture(key, fixtures).wire, context.temp_allocator)
-	if !ok {
-		panic("a fixture's wire is not hex")
-	}
-	return out
+	return unhex(fixture(key, fixtures).wire)
 }
 
 // The reply `fixtures` holds for a lookup, the way an upstream would answer it.
