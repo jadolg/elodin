@@ -262,40 +262,6 @@ UF_FIXTURES := []Fixture{
 	},
 }
 
-@(private = "file")
-scenario_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	fixtures := (^[]Fixture)(ctx)^
-	for f in fixtures {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-scenario_validator :: proc(anchor_text: string, fixtures: ^[]Fixture) -> ^Validator {
-	anchor, ok := parse_trust_anchor(anchor_text, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	return make_validator(scenario_query, rawptr(fixtures), Options{anchors = anchors})
-}
-
-@(private = "file")
-scenario_fixture :: proc(fixtures: []Fixture, key: string) -> []u8 {
-	for f in fixtures {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
-
 @(test)
 test_a_ds_for_an_unknown_algorithm_does_not_break_a_rollover :: proc(t: ^testing.T) {
 	/*
@@ -305,11 +271,10 @@ test_a_ds_for_an_unknown_algorithm_does_not_break_a_rollover :: proc(t: ^testing
 	unusable because part of it is unusable would take every zone adding an
 	algorithm off the air for the length of its rollover.
 	*/
-	v := scenario_validator(DG_ANCHOR, &DG_FIXTURES)
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&DG_FIXTURES, DG_ANCHOR)
 	defer destroy_validator(v)
 
-	result := validate(v, "www.dgtest.", .A, scenario_fixture(DG_FIXTURES, "dg_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "www.dgtest.", .A, scenario_fixture(DG_FIXTURES, "dg_answer"), fixture_now())
 	testing.expectf(
 		t,
 		result.status == .Secure,
@@ -330,11 +295,10 @@ test_a_ds_set_of_only_unknown_algorithms_is_insecure_not_bogus :: proc(t: ^testi
 	not heard of - the failure mode that keeps validators from ever adopting a
 	new algorithm.
 	*/
-	v := scenario_validator(UA_ANCHOR, &UA_FIXTURES)
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&UA_FIXTURES, UA_ANCHOR)
 	defer destroy_validator(v)
 
-	result := validate(v, "www.uatest.", .A, scenario_fixture(UA_FIXTURES, "ua_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "www.uatest.", .A, scenario_fixture(UA_FIXTURES, "ua_answer"), fixture_now())
 	testing.expectf(
 		t,
 		result.status == .Insecure,
@@ -354,11 +318,10 @@ test_a_ds_set_of_only_unknown_digests_is_insecure_not_bogus :: proc(t: ^testing.
 	algorithm would have this delegation look followable right up to the point
 	the digest fails to match, which is bogus rather than insecure.
 	*/
-	v := scenario_validator(UD_ANCHOR, &UD_FIXTURES)
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&UD_FIXTURES, UD_ANCHOR)
 	defer destroy_validator(v)
 
-	result := validate(v, "www.udtest.", .A, scenario_fixture(UD_FIXTURES, "ud_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "www.udtest.", .A, scenario_fixture(UD_FIXTURES, "ud_answer"), fixture_now())
 	testing.expectf(
 		t,
 		result.status == .Insecure,
@@ -383,11 +346,10 @@ test_a_revoked_apex_key_cannot_carry_the_chain :: proc(t: ^testing.T) {
 	rather than an unsigned one: the parent says there is a chain here, and there
 	is not.
 	*/
-	v := scenario_validator(RV_ANCHOR, &RV_FIXTURES)
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&RV_FIXTURES, RV_ANCHOR)
 	defer destroy_validator(v)
 
-	result := validate(v, "www.rvtest.", .A, scenario_fixture(RV_FIXTURES, "rv_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "www.rvtest.", .A, scenario_fixture(RV_FIXTURES, "rv_answer"), fixture_now())
 	testing.expectf(
 		t,
 		result.status == .Bogus,
@@ -430,11 +392,10 @@ test_an_unfollowable_ds_beside_an_unknown_one_is_bogus :: proc(t: ^testing.T) {
 	Without this scenario the two checks cover for each other: break either one
 	and the other still produces the same verdict, and nothing fails.
 	*/
-	v := scenario_validator(UF_ANCHOR, &UF_FIXTURES)
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&UF_FIXTURES, UF_ANCHOR)
 	defer destroy_validator(v)
 
-	result := validate(v, "www.uftest.", .A, scenario_fixture(UF_FIXTURES, "uf_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "www.uftest.", .A, scenario_fixture(UF_FIXTURES, "uf_answer"), fixture_now())
 	testing.expectf(
 		t,
 		result.status == .Bogus,
@@ -446,24 +407,19 @@ test_an_unfollowable_ds_beside_an_unknown_one_is_bogus :: proc(t: ^testing.T) {
 }
 
 @(private = "file")
-Counting_Ctx :: struct {
+Dnskey_Counter :: struct {
 	fixtures: []Fixture,
 	dnskey:   int,
 }
 
+// Counts the DNSKEY lookups below the root, the one the anchor answers.
 @(private = "file")
-counting_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	counter := (^Counting_Ctx)(ctx)
+dnskey_counting_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
+	counter := (^Dnskey_Counter)(ctx)
 	if type == .DNSKEY && !dns.name_equal_fold(name, ".") {
 		counter.dnskey += 1
 	}
-	for f in counter.fixtures {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	return nil, false
+	return fixture_answer(counter.fixtures, name, type, allocator)
 }
 
 @(test)
@@ -479,18 +435,13 @@ test_a_ds_set_with_nothing_usable_costs_no_dnskey_lookup :: proc(t: ^testing.T) 
 	cannot be checked against anything is how a chain walk runs out of
 	allowance on a name that had a perfectly good answer waiting.
 	*/
-	anchor, ok := parse_trust_anchor(UA_ANCHOR, context.temp_allocator)
-	testing.expect(t, ok, "the anchor should parse")
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-
-	counter := Counting_Ctx {
+	counter := Dnskey_Counter {
 		fixtures = UA_FIXTURES,
 	}
-	v := make_validator(counting_query, &counter, Options{anchors = anchors})
+	v := make_validator(dnskey_counting_query, &counter, Options{anchors = fixture_anchors(UA_ANCHOR)})
 	defer destroy_validator(v)
 
-	result := validate(v, "www.uatest.", .A, scenario_fixture(UA_FIXTURES, "ua_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "www.uatest.", .A, scenario_fixture(UA_FIXTURES, "ua_answer"), fixture_now())
 	testing.expect_value(t, result.status, Status.Insecure)
 	testing.expectf(
 		t,

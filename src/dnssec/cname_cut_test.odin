@@ -1,9 +1,7 @@
 package dnssec
 
-import "core:mem"
 import "core:testing"
 import "core:time"
-import "elodin:dns"
 import "elodin:loop"
 
 /*
@@ -149,50 +147,16 @@ CN_FIXTURES := []Fixture{
 	},
 }
 
-@(private = "file")
-cn_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in CN_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-cn_validator :: proc() -> ^Validator {
-	anchor, ok := parse_trust_anchor(CN_ANCHOR, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	return make_validator(cn_query, nil, Options{anchors = anchors})
-}
-
-@(private = "file")
-cn_fixture :: proc(key: string) -> []u8 {
-	for f in CN_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
-
 @(test)
 test_a_cname_the_parent_signed_is_no_cut :: proc(t: ^testing.T) {
 	// The CNAME is signed by `cntest.` at its own name, so the name is data in
 	// `cntest.` and no delegation: the deepest zone is `cntest.`, and the walk
 	// remembers the non-cut as it would one a denial proved. `alias.` has the
 	// target's proof behind it, `lone.` only an unsigned SOA.
-	v := cn_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&CN_FIXTURES, CN_ANCHOR)
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	for name in ([]string{"alias.cntest.", "lone.cntest."}) {
 		budget := query_budget(v)
 		status, keys, zone := zone_trust(v, &budget, name, now, context.temp_allocator)
@@ -209,11 +173,10 @@ test_a_cname_the_parent_signed_is_no_cut :: proc(t: ^testing.T) {
 test_an_unsigned_delegation_under_a_cname_owner_is_insecure :: proc(t: ^testing.T) {
 	// `seed.bitcoin.sipa.be.` in the issue: the walk has to pass the CNAME owner
 	// to reach the delegation below it, which has no DS.
-	v := cn_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&CN_FIXTURES, CN_ANCHOR)
 	defer destroy_validator(v)
 
-	result := validate(v, "seed.alias.cntest.", .A, cn_fixture("cn_seed_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "seed.alias.cntest.", .A, scenario_fixture(CN_FIXTURES, "cn_seed_answer"), fixture_now())
 	testing.expectf(
 		t,
 		result.status == .Insecure,
@@ -229,11 +192,10 @@ test_a_cname_that_does_not_speak_for_its_owner_is_no_proof :: proc(t: ^testing.T
 	// Unsigned, signed as an expansion of `*.cntest.`, and signed by a key
 	// `cntest.` does not publish: none of them is the parent saying the name is
 	// its own, and the target's proof behind them says nothing about it either.
-	v := cn_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&CN_FIXTURES, CN_ANCHOR)
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	for name in ([]string{"bare.cntest.", "wild.cntest.", "stray.cntest."}) {
 		budget := query_budget(v)
 		status, _, _ := zone_trust(v, &budget, name, now, context.temp_allocator)
@@ -248,11 +210,10 @@ test_a_cname_that_does_not_speak_for_its_owner_is_no_proof :: proc(t: ^testing.T
 test_a_cname_step_out_of_verifications_is_undecided :: proc(t: ^testing.T) {
 	// The CNAME was never checked, which is this server's limit and not the
 	// zone's word: `Indeterminate`, and nothing remembered.
-	v := cn_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&CN_FIXTURES, CN_ANCHOR)
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	budget := query_budget(v)
 	status, keys, _ := zone_trust(v, &budget, "cntest.", now, context.temp_allocator)
 	testing.expect_value(t, status, Status.Secure)
@@ -272,12 +233,11 @@ test_a_cname_step_out_of_verifications_is_undecided :: proc(t: ^testing.T) {
 // broken step carries its window rather than code 6 (issue #360).
 @(test)
 test_a_lapsed_cname_at_a_ds_question_names_its_window :: proc(t: ^testing.T) {
-	v := cn_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&CN_FIXTURES, CN_ANCHOR)
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	status, keys, _ := zone_trust(v, &budget, "cntest.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, keys, _ := zone_trust(v, &budget, "cntest.", fixture_now(), context.temp_allocator)
 	testing.expect_value(t, status, Status.Secure)
 
 	// A month and a day early: the CNAME's inception is thirty days before

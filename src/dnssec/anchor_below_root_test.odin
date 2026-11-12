@@ -1,9 +1,6 @@
 package dnssec
 
-import "core:mem"
 import "core:testing"
-import "core:time"
-import "elodin:dns"
 
 /*
 A trust anchor below the root (issue #226).
@@ -79,54 +76,23 @@ BA_FIXTURES := []Fixture{
 	},
 }
 
-@(private = "file")
-ba_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in BA_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return decode_hex(f.wire, allocator)
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-ba_validator :: proc(anchor_texts: ..string) -> ^Validator {
-	anchors := make([]Trust_Anchor, len(anchor_texts), context.temp_allocator)
-	for text, i in anchor_texts {
-		anchor, ok := parse_trust_anchor(text, context.temp_allocator)
-		if !ok {
-			return nil
-		}
-		anchors[i] = anchor
-	}
-	return make_validator(ba_query, nil, Options{anchors = anchors})
-}
-
-@(private = "file")
-ba_answer :: proc() -> []u8 {
-	out, _ := decode_hex(BA_FIXTURES[3].wire, context.temp_allocator)
-	return out
-}
-
 @(test)
 test_the_public_chain_alone_reads_the_zone_as_insecure :: proc(t: ^testing.T) {
 	// The premise: with the root as the only anchor, the root's NSEC proves
 	// no DS for `corp.`, so the answer is Insecure - not Bogus, not broken.
-	v := ba_validator(BA_ROOT_ANCHOR)
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&BA_FIXTURES, BA_ROOT_ANCHOR)
 	defer destroy_validator(v)
 
-	result := validate(v, "www.corp.", .A, ba_answer(), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "www.corp.", .A, scenario_fixture(BA_FIXTURES, "ba_answer"), fixture_now())
 	testing.expectf(t, result.status == .Insecure, "root anchor only: want Insecure, got %v (%q)", result.status, result.reason)
 	free_all(context.temp_allocator)
 }
 
 @(test)
 test_an_anchor_below_the_root_starts_the_chain :: proc(t: ^testing.T) {
-	v := ba_validator(BA_ROOT_ANCHOR, BA_CORP_ANCHOR)
-	testing.expect(t, v != nil, "the anchors should parse")
+	v := scenario_validator(&BA_FIXTURES, BA_ROOT_ANCHOR, BA_CORP_ANCHOR)
 	defer destroy_validator(v)
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 
 	// The premise: the `corp.` anchor on its own establishes the zone's keys.
 	budget := query_budget(v)
@@ -134,7 +100,7 @@ test_an_anchor_below_the_root_starts_the_chain :: proc(t: ^testing.T) {
 	testing.expectf(t, anchored == .Secure && len(keys) > 0, "the corp. anchor should vouch for its keys, got %v", anchored)
 
 	// The walk must start at the closest anchor, `corp.`, not at the root.
-	fresh := ba_validator(BA_ROOT_ANCHOR, BA_CORP_ANCHOR)
+	fresh := scenario_validator(&BA_FIXTURES, BA_ROOT_ANCHOR, BA_CORP_ANCHOR)
 	defer destroy_validator(fresh)
 	walk := query_budget(fresh)
 	// Walked to the zone the answer's signature names, as `validate` does.
@@ -147,7 +113,7 @@ test_an_anchor_below_the_root_starts_the_chain :: proc(t: ^testing.T) {
 		zone,
 	)
 
-	result := validate(fresh, "www.corp.", .A, ba_answer(), now)
+	result := validate(fresh, "www.corp.", .A, scenario_fixture(BA_FIXTURES, "ba_answer"), now)
 	testing.expectf(t, result.status == .Secure, "www.corp. under a corp. anchor: want Secure, got %v (%q)", result.status, result.reason)
 	free_all(context.temp_allocator)
 }
@@ -158,11 +124,10 @@ test_a_wrong_anchor_below_the_root_is_bogus_not_insecure :: proc(t: ^testing.T) 
 	// publish is a broken chain, and the root's proof that `corp.` has no DS
 	// does not get to turn that into an unsigned zone (RFC 6840 Appendix C.1).
 	wrong := "corp. IN DS 59822 15 2 0000000000000000000000000000000000000000000000000000000000000000"
-	v := ba_validator(BA_ROOT_ANCHOR, wrong)
-	testing.expect(t, v != nil, "the anchors should parse")
+	v := scenario_validator(&BA_FIXTURES, BA_ROOT_ANCHOR, wrong)
 	defer destroy_validator(v)
 
-	result := validate(v, "www.corp.", .A, ba_answer(), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "www.corp.", .A, scenario_fixture(BA_FIXTURES, "ba_answer"), fixture_now())
 	testing.expectf(t, result.status == .Bogus, "a corp. anchor naming the wrong key: want Bogus, got %v (%q)", result.status, result.reason)
 	// And the operator is told it was their anchor, not some parent's DS.
 	testing.expectf(
@@ -179,18 +144,16 @@ test_a_key_above_the_anchor_does_not_vouch_for_a_name_inside_it :: proc(t: ^test
 	// `www.corp. A` signed by the root's key. The `corp.` anchor pins the zone
 	// (RFC 6840 Appendix C.1), so a signer above it - a public ancestor's view
 	// of a split-horizon name - is not a key the zone's names are read against.
-	answer, _ := decode_hex(BA_FIXTURES[4].wire, context.temp_allocator)
-	now := time.unix(FIXTURE_TIME, 0)
+	answer := scenario_fixture(BA_FIXTURES, "ba_root_signed_answer")
+	now := fixture_now()
 
 	// The premise: with only the root anchored, the root's signature holds.
-	public := ba_validator(BA_ROOT_ANCHOR)
-	testing.expect(t, public != nil, "the anchor should parse")
+	public := scenario_validator(&BA_FIXTURES, BA_ROOT_ANCHOR)
 	defer destroy_validator(public)
 	premise := validate(public, "www.corp.", .A, answer, now)
 	testing.expectf(t, premise.status == .Secure, "root anchor only: want Secure, got %v (%q)", premise.status, premise.reason)
 
-	v := ba_validator(BA_ROOT_ANCHOR, BA_CORP_ANCHOR)
-	testing.expect(t, v != nil, "the anchors should parse")
+	v := scenario_validator(&BA_FIXTURES, BA_ROOT_ANCHOR, BA_CORP_ANCHOR)
 	defer destroy_validator(v)
 	result := validate(v, "www.corp.", .A, answer, now)
 	testing.expectf(t, result.status == .Bogus, "a root signature under a corp. anchor: want Bogus, got %v (%q)", result.status, result.reason)
@@ -202,12 +165,11 @@ test_a_ds_at_an_anchored_zone_is_the_parents :: proc(t: ^testing.T) {
 	// A DS lives in the parent (RFC 4035 section 5.3.1), so `corp. DS` is
 	// walked to the root and read against the root's key - the `corp.` anchor
 	// sits below the zone that answers it and has no say.
-	v := ba_validator(BA_ROOT_ANCHOR, BA_CORP_ANCHOR)
-	testing.expect(t, v != nil, "the anchors should parse")
+	v := scenario_validator(&BA_FIXTURES, BA_ROOT_ANCHOR, BA_CORP_ANCHOR)
 	defer destroy_validator(v)
 
-	denial, _ := decode_hex(BA_FIXTURES[1].wire, context.temp_allocator)
-	result := validate(v, "corp.", .DS, denial, time.unix(FIXTURE_TIME, 0))
+	denial := scenario_fixture(BA_FIXTURES, "ba_corp_ds")
+	result := validate(v, "corp.", .DS, denial, fixture_now())
 	testing.expectf(t, result.status == .Secure, "the root's signed denial of corp. DS: want Secure, got %v (%q)", result.status, result.reason)
 	free_all(context.temp_allocator)
 }

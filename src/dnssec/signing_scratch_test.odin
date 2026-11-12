@@ -1,10 +1,9 @@
 package dnssec
 
 import "base:runtime"
-import "core:mem"
+import "core:slice"
 import "core:strings"
 import "core:testing"
-import "core:time"
 import "elodin:dns"
 
 /*
@@ -17,22 +16,7 @@ query.
 */
 
 @(private = "file")
-SS_DNSKEY_RDATA :: "0101030fe6087a0da6db23c6753cb6ee6edc1cc7683652baa4d3edf04c5c62bd8cbfc884"
-@(private = "file")
-SS_KEY_TAG :: 14506
-@(private = "file")
-SS_NOW :: 1785664800
-@(private = "file")
 SS_OWNER :: "big.example.com."
-
-@(private = "file")
-ss_key :: proc() -> []Dnskey {
-	rdata, _ := decode_hex(SS_DNSKEY_RDATA, context.temp_allocator)
-	key, _ := parse_dnskey(rdata)
-	keys := make([]Dnskey, 1, context.temp_allocator)
-	keys[0] = key
-	return keys
-}
 
 // 230 distinct 250-byte TXT records: 61,870 bytes on the wire.
 @(private = "file")
@@ -61,21 +45,18 @@ ss_big_txt :: proc() -> []dns.Record {
 // passes every free check and costs a verification.
 @(private = "file")
 ss_forged_rrsig :: proc() -> dns.Record {
-	rdata := make([dynamic]u8, 0, 128, context.temp_allocator)
-	append(&rdata, u8(u16(dns.Type.TXT) >> 8), u8(u16(dns.Type.TXT)))
-	append(&rdata, ALG_ED25519, 3)
-	append(&rdata, 0, 0, 1, 44) // original TTL
-	for v in ([2]u32{SS_NOW + 86400, SS_NOW - 86400}) { 	// expiration, inception
-		append(&rdata, u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v))
+	sig := Rrsig {
+		type_covered = .TXT,
+		algorithm    = ALG_ED25519,
+		labels       = 3,
+		original_ttl = 300,
+		expiration   = FIXTURE_TIME + 86400,
+		inception    = FIXTURE_TIME - 86400,
+		key_tag      = ED25519_KEY_TAG,
+		signer       = "example.com.",
+		signature    = slice.repeat([]u8{0x41}, 64, context.temp_allocator),
 	}
-	append(&rdata, u8(SS_KEY_TAG >> 8), u8(SS_KEY_TAG & 0xff))
-	name_buf: [dns.MAX_NAME_WIRE]u8
-	n, _ := dns.encode_name("example.com.", name_buf[:])
-	append(&rdata, ..name_buf[:n])
-	for _ in 0 ..< 64 {
-		append(&rdata, 0x41)
-	}
-	return dns.Record{name = SS_OWNER, type = .RRSIG, class = .IN, ttl = 300, data = dns.Rdata_Raw{data = rdata[:]}}
+	return rrsig_record(SS_OWNER, sig)
 }
 
 @(private = "file")
@@ -88,11 +69,6 @@ ss_section :: proc(signatures: int) -> []dns.Record {
 	return section[:]
 }
 
-@(private = "file")
-arena_used :: proc() -> int {
-	return int((cast(^runtime.Arena)context.temp_allocator.data).total_used)
-}
-
 @(test)
 test_signature_attempts_render_the_rrset_once :: proc(t: ^testing.T) {
 	// What one attempt costs and what all of them do, each from an empty arena;
@@ -100,11 +76,11 @@ test_signature_attempts_render_the_rrset_once :: proc(t: ^testing.T) {
 	used: [2]int
 	for signatures, i in ([2]int{1, MAX_VERIFICATIONS_PER_QUERY}) {
 		free_all(context.temp_allocator)
-		keys := ss_key()
+		keys := ed25519_key()
 		section := ss_section(signatures)
 		budget: Budget
 		before := arena_used()
-		_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, SS_NOW, context.temp_allocator)
+		_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, FIXTURE_TIME, context.temp_allocator)
 		used[i] = arena_used() - before
 		// The premise: every forgery reached a verification.
 		testing.expect(t, !ok && !exhausted)
@@ -127,7 +103,7 @@ test_signature_attempts_render_the_rrset_once :: proc(t: ^testing.T) {
 test_signing_input_is_charged_to_the_request :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 	section := ss_section(MAX_VERIFICATIONS_PER_QUERY)
-	keys := ss_key()
+	keys := ed25519_key()
 
 	// Room for the readings and not for the render: refused as our own
 	// allowance, not as a forgery, and before the verifications run out.
@@ -135,7 +111,7 @@ test_signing_input_is_charged_to_the_request :: proc(t: ^testing.T) {
 	budget := Budget {
 		spent = &spent,
 	}
-	_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, SS_NOW, context.temp_allocator)
+	_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", keys, FIXTURE_TIME, context.temp_allocator)
 	testing.expect(t, !ok)
 	testing.expect(t, exhausted, "a render past the request's budget was paid for")
 	testing.expect_value(t, budget.verifications, 1)
@@ -150,10 +126,10 @@ test_signing_input_is_charged_to_the_request :: proc(t: ^testing.T) {
 		budget = Budget {
 			spent = &spent,
 		}
-		_, _, _, ok, exhausted, _ = verified_rrset(&budget, section[:230 + signatures], SS_OWNER, .TXT, .IN, "example.com.", keys, SS_NOW, context.temp_allocator)
+		_, _, _, ok, exhausted, _ = verified_rrset(&budget, section[:230 + signatures], SS_OWNER, .TXT, .IN, "example.com.", keys, FIXTURE_TIME, context.temp_allocator)
 		testing.expect(t, !ok && !exhausted)
 		testing.expect_value(t, budget.verifications, signatures)
-		testing.expect_value(t, exhausted_reason(&budget), "verification budget spent")
+		testing.expect_value(t, exhausted_reason(&budget), VERIFICATIONS_SPENT)
 		charged[i] = spent
 	}
 	testing.expectf(t, charged[0] > 2 * 60_000, "the render charged %d bytes", charged[0])
@@ -246,7 +222,7 @@ test_a_spent_request_renders_nothing :: proc(t: ^testing.T) {
 		labels       = 3,
 		signer       = "example.com.",
 	}
-	spent := dns.REQUEST_DECODE_BUDGET + 1
+	spent := SPENT
 	budget := Budget {
 		spent = &spent,
 	}
@@ -261,23 +237,18 @@ test_a_spent_request_renders_nothing :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-@(private = "file")
-ss_no_query :: proc(_: rawptr, _: string, _: dns.Type, _: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
-	return nil, false
-}
-
 // `validate_rrset` over the big set and `signatures` forgeries under a key the
 // validator already holds for the zone: the arena it took, its verdict, and the
 // verifications it spent.
 @(private = "file")
 ss_answer :: proc(signatures: int, spent: ^int) -> (used: int, status: Status, reason: string, verifications: int) {
 	free_all(context.temp_allocator)
-	now := time.unix(SS_NOW, 0)
-	v := make_validator(ss_no_query, nil, Options{})
+	now := fixture_now()
+	v := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(v)
 	cache_put(v, ".", .Secure, nil, MAX_ZONE_TTL, fixture_moment(now))
 	cache_put(v, "com.", .Secure, nil, MAX_ZONE_TTL, fixture_moment(now))
-	cache_put(v, "example.com.", .Secure, ss_key(), MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, "example.com.", .Secure, ed25519_key(), MAX_ZONE_TTL, fixture_moment(now))
 
 	records := ss_big_txt()
 	sigs := make([]Rrsig, signatures, context.temp_allocator)
@@ -287,9 +258,9 @@ ss_answer :: proc(signatures: int, spent: ^int) -> (used: int, status: Status, r
 			algorithm    = ALG_ED25519,
 			labels       = 3,
 			original_ttl = 300,
-			expiration   = SS_NOW + 86400,
-			inception    = SS_NOW - 86400,
-			key_tag      = SS_KEY_TAG,
+			expiration   = FIXTURE_TIME + 86400,
+			inception    = FIXTURE_TIME - 86400,
+			key_tag      = ED25519_KEY_TAG,
 			signer       = "example.com.",
 			signature    = make([]u8, 64, context.temp_allocator),
 		}
@@ -297,7 +268,7 @@ ss_answer :: proc(signatures: int, spent: ^int) -> (used: int, status: Status, r
 	budget := query_budget(v)
 	budget.spent = spent
 	before := arena_used()
-	status, _, reason, _, _, _ = validate_rrset(v, &budget, SS_OWNER, .TXT, .IN, records, sigs, SS_NOW, now, context.temp_allocator)
+	status, _, reason, _, _, _ = validate_rrset(v, &budget, SS_OWNER, .TXT, .IN, records, sigs, FIXTURE_TIME, now, context.temp_allocator)
 	return arena_used() - before, status, reason, budget.verifications
 }
 
@@ -378,12 +349,12 @@ anything says so, on a request some reading has already taken past its budget.
 test_the_reason_is_what_stopped_the_loop :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 	section := ss_section(MAX_VERIFICATIONS_PER_QUERY)
-	spent := dns.REQUEST_DECODE_BUDGET + 1
+	spent := SPENT
 	budget := Budget {
 		spent         = &spent,
 		verifications = MAX_VERIFICATIONS_PER_QUERY,
 	}
-	_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ss_key(), SS_NOW, context.temp_allocator)
+	_, _, _, ok, exhausted, _ := verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ed25519_key(), FIXTURE_TIME, context.temp_allocator)
 	testing.expect(t, !ok && exhausted)
 	testing.expect_value(t, exhausted_reason(&budget), VERIFICATIONS_SPENT)
 
@@ -393,11 +364,11 @@ test_the_reason_is_what_stopped_the_loop :: proc(t: ^testing.T) {
 	budget = Budget {
 		spent = &spent,
 	}
-	_, _, _, ok, exhausted, _ = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ss_key(), SS_NOW, context.temp_allocator)
+	_, _, _, ok, exhausted, _ = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ed25519_key(), FIXTURE_TIME, context.temp_allocator)
 	testing.expect(t, !ok && exhausted)
 	testing.expect_value(t, exhausted_reason(&budget), READING_OVER_BUDGET)
 	budget.verifications = MAX_VERIFICATIONS_PER_QUERY
-	_, _, _, ok, exhausted, _ = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ss_key(), SS_NOW, context.temp_allocator)
+	_, _, _, ok, exhausted, _ = verified_rrset(&budget, section, SS_OWNER, .TXT, .IN, "example.com.", ed25519_key(), FIXTURE_TIME, context.temp_allocator)
 	testing.expect(t, !ok && exhausted)
 	testing.expect_value(t, exhausted_reason(&budget), VERIFICATIONS_SPENT)
 	free_all(context.temp_allocator)

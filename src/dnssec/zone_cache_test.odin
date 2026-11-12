@@ -1,7 +1,6 @@
 package dnssec
 
 import "core:fmt"
-import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
@@ -19,11 +18,30 @@ cache that threw away every zone in it would let a flood of fresh names take the
 root and the TLDs with it and leave every client re-walking from the top.
 */
 
-// These tests never reach an upstream: what they exercise is the cache itself,
-// reached through `cache_put` and `cache_get` directly.
+// These tests never reach an upstream (`counting_query` with no counter
+// refuses): what they exercise is the cache itself, reached through `cache_put`
+// and `cache_get` directly.
+
+// The worst key set the rest of the validator will admit: as many keys as a
+// zone may publish, each as large as the RSA parser will read.
 @(private = "file")
-no_upstream :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	return nil, false
+huge_key_set :: proc() -> []Dnskey {
+	huge := make([]Dnskey, MAX_KEYS_PER_ZONE, context.temp_allocator)
+	for &key in huge {
+		key = sized_key(4 + MAX_MODULUS_BYTES + MAX_EXPONENT_BYTES)
+	}
+	return huge
+}
+
+// The entries on the eviction list, walked no further than `limit + 1`, so a
+// list that loops comes back longer than any map it could agree with.
+@(private = "file")
+lru_length :: proc(v: ^Validator, limit: int) -> int {
+	count := 0
+	for e := v.lru_head; e != nil && count <= limit; e = e.next {
+		count += 1
+	}
+	return count
 }
 
 // A DNSKEY whose RDATA is `size` bytes, usable unless `flags` says otherwise.
@@ -72,16 +90,10 @@ machines this runs on.
 */
 @(test)
 test_one_zone_cannot_fill_the_cache_by_itself :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{})
+	v := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(v)
 
-	// The worst set the rest of the validator will admit: as many keys as a
-	// zone may publish, each as large as the RSA parser will read.
-	huge := make([dynamic]Dnskey, 0, MAX_KEYS_PER_ZONE, context.temp_allocator)
-	for _ in 0 ..< MAX_KEYS_PER_ZONE {
-		append(&huge, sized_key(4 + MAX_MODULUS_BYTES + MAX_EXPONENT_BYTES))
-	}
-	cache_put(v, "flood.example.", .Secure, huge[:], MAX_ZONE_TTL, loop.moment_now())
+	cache_put(v, "flood.example.", .Secure, huge_key_set(), MAX_ZONE_TTL, loop.moment_now())
 
 	held := cached_key_bytes(v, "flood.example.")
 	testing.expectf(
@@ -98,7 +110,7 @@ test_one_zone_cannot_fill_the_cache_by_itself :: proc(t: ^testing.T) {
 // zone mid-rollover publishes a handful of keys; every one of them stays.
 @(test)
 test_an_ordinary_apex_is_still_cached_whole :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{})
+	v := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(v)
 
 	// Four RSA-2048 keys, which is more than any real zone carries at once.
@@ -127,7 +139,7 @@ with records that do not have to be real keys at all.
 */
 @(test)
 test_the_cache_keeps_only_keys_that_could_sign :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{})
+	v := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(v)
 
 	good := sized_key(4 + 256)
@@ -168,7 +180,7 @@ is being used, it is the last thing to go rather than collateral.
 */
 @(test)
 test_a_flood_of_fresh_zones_does_not_evict_the_root :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{max_cached_zones = 16})
+	v := make_validator(counting_query, nil, Options{max_cached_zones = 16})
 	defer destroy_validator(v)
 
 	now := loop.moment_now()
@@ -201,7 +213,7 @@ zone in it; what makes room is the entry at the cold end of the list.
 */
 @(test)
 test_a_full_cache_evicts_the_least_recently_used_zone :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{max_cached_zones = 3})
+	v := make_validator(counting_query, nil, Options{max_cached_zones = 3})
 	defer destroy_validator(v)
 
 	now := loop.moment_now()
@@ -238,7 +250,7 @@ is read from ends up counting entries that are gone.
 */
 @(test)
 test_refreshing_a_zone_keeps_the_cache_consistent :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{max_cached_zones = 4})
+	v := make_validator(counting_query, nil, Options{max_cached_zones = 4})
 	defer destroy_validator(v)
 
 	now := loop.moment_now()
@@ -251,14 +263,8 @@ test_refreshing_a_zone_keeps_the_cache_consistent :: proc(t: ^testing.T) {
 	// The list has to still be walkable end to end and hold exactly what the
 	// map does, or the next eviction reads something that has been freed.
 	cache_put(v, "other.example.", .Secure, keys, MAX_ZONE_TTL, now)
-	count := 0
-	for e := v.lru_head; e != nil; e = e.next {
-		count += 1
-		testing.expectf(t, count <= 8, "the eviction list loops or outlives its entries")
-		if count > 8 {
-			break
-		}
-	}
+	count := lru_length(v, 8)
+	testing.expectf(t, count <= 8, "the eviction list loops or outlives its entries")
 	testing.expectf(t, count == len(v.zones), "the eviction list holds %d entries, the map %d", count, len(v.zones))
 	free_all(context.temp_allocator)
 }
@@ -271,7 +277,7 @@ left linked is a dangling pointer the next eviction follows.
 */
 @(test)
 test_sweeping_an_expired_zone_leaves_the_eviction_order_intact :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{max_cached_zones = 4})
+	v := make_validator(counting_query, nil, Options{max_cached_zones = 4})
 	defer destroy_validator(v)
 
 	now := loop.moment_now()
@@ -283,13 +289,7 @@ test_sweeping_an_expired_zone_leaves_the_eviction_order_intact :: proc(t: ^testi
 	removed := sweep_at(v, later)
 	testing.expectf(t, removed == 2, "swept %d of 2 expired zones", removed)
 
-	count := 0
-	for e := v.lru_head; e != nil; e = e.next {
-		count += 1
-		if count > 8 {
-			break
-		}
-	}
+	count := lru_length(v, 8)
 	testing.expectf(t, count == 0, "the eviction list still holds %d swept entries", count)
 
 	// And the cache still works afterwards.
@@ -311,18 +311,14 @@ store is the wrong shape whoever can reach it.
 */
 @(test)
 test_an_oversized_key_set_does_not_drop_the_one_already_held :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{})
+	v := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(v)
 
 	now := loop.moment_now()
 	good := []Dnskey{sized_key(4 + 256)}
 	cache_put(v, "example.com.", .Secure, good, MAX_ZONE_TTL, now)
 
-	huge := make([dynamic]Dnskey, 0, MAX_KEYS_PER_ZONE, context.temp_allocator)
-	for _ in 0 ..< MAX_KEYS_PER_ZONE {
-		append(&huge, sized_key(4 + MAX_MODULUS_BYTES + MAX_EXPONENT_BYTES))
-	}
-	cache_put(v, "example.com.", .Secure, huge[:], MAX_ZONE_TTL, now)
+	cache_put(v, "example.com.", .Secure, huge_key_set(), MAX_ZONE_TTL, now)
 
 	entry, found := v.zones["example.com."]
 	testing.expect(t, found, "the validated entry should have survived an oversized reply")
@@ -346,7 +342,7 @@ denial for one of them be proven against the parent's keys.
 */
 @(test)
 test_an_oversized_key_set_still_settles_the_name :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{})
+	v := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(v)
 
 	now := loop.moment_now()
@@ -354,11 +350,7 @@ test_an_oversized_key_set_still_settles_the_name :: proc(t: ^testing.T) {
 	_, _, remembered := cache_get(v, "example.com.", now, context.temp_allocator)
 	testing.expect(t, remembered, "the memo should hold the name to begin with")
 
-	huge := make([dynamic]Dnskey, 0, MAX_KEYS_PER_ZONE, context.temp_allocator)
-	for _ in 0 ..< MAX_KEYS_PER_ZONE {
-		append(&huge, sized_key(4 + MAX_MODULUS_BYTES + MAX_EXPONENT_BYTES))
-	}
-	cache_put(v, "example.com.", .Secure, huge[:], MAX_ZONE_TTL, now)
+	cache_put(v, "example.com.", .Secure, huge_key_set(), MAX_ZONE_TTL, now)
 
 	_, _, still_remembered := cache_get(v, "example.com.", now, context.temp_allocator)
 	testing.expect(t, !still_remembered, "a name settled as a zone is no longer a remembered non-cut")
@@ -375,19 +367,19 @@ built-in number.
 */
 @(test)
 test_an_unset_zone_cache_bound_takes_the_default :: proc(t: ^testing.T) {
-	unset := make_validator(no_upstream, nil, Options{})
+	unset := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(unset)
 	testing.expect_value(t, unset.max_cached_zones, DEFAULT_MAX_CACHED_ZONES)
 
 	// And a figure somebody wrote is the figure they get.
-	named := make_validator(no_upstream, nil, Options{max_cached_zones = 64})
+	named := make_validator(counting_query, nil, Options{max_cached_zones = 64})
 	defer destroy_validator(named)
 	testing.expect_value(t, named.max_cached_zones, 64)
 
 	// A number that cannot be a bound is not one more way of asking for the
 	// default by accident - the loader refuses it - but the validator must not
 	// build a cache of zero entries out of one either.
-	negative := make_validator(no_upstream, nil, Options{max_cached_zones = -1})
+	negative := make_validator(counting_query, nil, Options{max_cached_zones = -1})
 	defer destroy_validator(negative)
 	testing.expect_value(t, negative.max_cached_zones, DEFAULT_MAX_CACHED_ZONES)
 }
@@ -402,7 +394,7 @@ store into nothing.
 */
 @(test)
 test_a_cache_of_one_zone_holds_exactly_one :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{max_cached_zones = 1})
+	v := make_validator(counting_query, nil, Options{max_cached_zones = 1})
 	defer destroy_validator(v)
 
 	now := loop.moment_now()
@@ -422,13 +414,7 @@ test_a_cache_of_one_zone_holds_exactly_one :: proc(t: ^testing.T) {
 	testing.expect(t, !stale, "the first zone should have been evicted long ago")
 
 	// The list has to agree with the map at the extreme too.
-	count := 0
-	for e := v.lru_head; e != nil; e = e.next {
-		count += 1
-		if count > 4 {
-			break
-		}
-	}
+	count := lru_length(v, 4)
 	testing.expectf(t, count == 1, "the eviction list holds %d entries against a map of 1", count)
 	free_all(context.temp_allocator)
 }
@@ -437,16 +423,12 @@ test_a_cache_of_one_zone_holds_exactly_one :: proc(t: ^testing.T) {
 // again on every question and nothing else would say so.
 @(test)
 test_a_refused_key_set_is_counted :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{})
+	v := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(v)
 
 	testing.expect_value(t, oversized_key_sets(v), 0)
 
-	huge := make([dynamic]Dnskey, 0, MAX_KEYS_PER_ZONE, context.temp_allocator)
-	for _ in 0 ..< MAX_KEYS_PER_ZONE {
-		append(&huge, sized_key(4 + MAX_MODULUS_BYTES + MAX_EXPONENT_BYTES))
-	}
-	cache_put(v, "flood.example.", .Secure, huge[:], MAX_ZONE_TTL, loop.moment_now())
+	cache_put(v, "flood.example.", .Secure, huge_key_set(), MAX_ZONE_TTL, loop.moment_now())
 	testing.expect_value(t, oversized_key_sets(v), 1)
 
 	// An ordinary set does not touch it.
@@ -498,7 +480,7 @@ walk runs, rather than being missed and walked for again by the next proof.
 */
 @(test)
 test_a_walk_reads_the_zone_cache_at_its_own_instant :: proc(t: ^testing.T) {
-	v := make_validator(no_upstream, nil, Options{})
+	v := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
@@ -507,7 +489,7 @@ test_a_walk_reads_the_zone_cache_at_its_own_instant :: proc(t: ^testing.T) {
 	budget.began = loop.moment_add(budget.began, -10 * time.Second)
 	cache_put(v, "example.com.", .Secure, []Dnskey{sized_key(4 + 256)}, MAX_ZONE_TTL, budget.began, 5)
 
-	status, keys := zone_keys(v, &budget, "example.com.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, keys := zone_keys(v, &budget, "example.com.", fixture_now(), context.temp_allocator)
 	end_walk(v, &budget)
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, len(keys), 1)

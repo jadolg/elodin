@@ -1,9 +1,6 @@
 package dnssec
 
-import "core:mem"
 import "core:testing"
-import "core:time"
-import "elodin:dns"
 
 /*
 Issue #352, end to end: an NXDOMAIN for a full-length IPv6 reverse name.
@@ -28,16 +25,15 @@ making.
 @(private = "file")
 R6_ANCHOR :: ". IN DS 45303 15 2 A45CBC04489E7B193DFCC29519C119CE099DD65874FA177E2E5020E81E677212"
 
-@(private = "file")
+// The reverse name of 2001:4860:4860::8888, thirty-two nibble labels under
+// `ip6.arpa.`; `reverse_depth_test.odin` walks it too.
 R6_QNAME :: "8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa."
 
 // The zone that holds the address space, and where the walk has to end up.
-@(private = "file")
 R6_APEX :: "0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa."
 
 @(private = "file")
 R6_FIXTURES := []Fixture{
-// anchor: . IN DS 45303 15 2 A45CBC04489E7B193DFCC29519C119CE099DD65874FA177E2E5020E81E677212
 	{
 		key   = "r6_root_dnskey",
 		name  = ".",
@@ -247,57 +243,6 @@ R6_FIXTURES := []Fixture{
 	},
 }
 
-// The upstream, and a count of what the walk asked it for: the reproduction is
-// as much about the questions never asked as about the verdict.
-@(private = "file")
-R6_Calls :: struct {
-	total: int,
-}
-
-@(private = "file")
-r6_query :: proc(
-	ctx: rawptr,
-	name: string,
-	type: dns.Type,
-	allocator: mem.Allocator,
-	_: ^time.Tick,
-) -> (
-	wire: []u8,
-	ok: bool,
-) {
-	calls := cast(^R6_Calls)ctx
-	calls.total += 1
-	for f in R6_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-r6_validator :: proc(calls: ^R6_Calls) -> ^Validator {
-	anchor, parsed := parse_trust_anchor(R6_ANCHOR, context.temp_allocator)
-	if !parsed {
-		return nil
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	return make_validator(r6_query, calls, Options{anchors = anchors})
-}
-
-@(private = "file")
-r6_fixture :: proc(key: string) -> []u8 {
-	for f in R6_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
-
 /*
 The walk reaches the zone that holds the address space.
 
@@ -308,9 +253,10 @@ thirty-four is more than twenty-four.
 */
 @(test)
 test_an_ipv6_reverse_chain_is_walked_to_its_zone :: proc(t: ^testing.T) {
-	calls := R6_Calls{}
-	v := r6_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
+	calls := Counting_Upstream {
+		fixtures = R6_FIXTURES,
+	}
+	v := make_validator(counting_query, &calls, Options{anchors = fixture_anchors(R6_ANCHOR)})
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
@@ -318,7 +264,7 @@ test_an_ipv6_reverse_chain_is_walked_to_its_zone :: proc(t: ^testing.T) {
 		v,
 		&budget,
 		R6_QNAME,
-		time.unix(FIXTURE_TIME, 0),
+		fixture_now(),
 		context.temp_allocator,
 	)
 	testing.expectf(t, status == .Secure, "the chain should be secure, got %v (%q)", status, walk_reason(&budget))
@@ -327,7 +273,7 @@ test_an_ipv6_reverse_chain_is_walked_to_its_zone :: proc(t: ^testing.T) {
 	// The walk really was taken, and it fits in the allowances a question gets:
 	// the root's own keys, three cuts at two lookups apiece, eleven empty
 	// non-terminals, and the one name below the apex that ends it.
-	testing.expect_value(t, calls.total, 1 + 3 * 2 + 11 + 1)
+	testing.expect_value(t, calls.calls, 1 + 3 * 2 + 11 + 1)
 	testing.expect(t, budget.lookups <= MAX_LOOKUPS_PER_QUERY, "the walk spent more lookups than a question has")
 	free_all(context.temp_allocator)
 }
@@ -341,12 +287,13 @@ pipeline gets back for an IPv6 address.
 */
 @(test)
 test_an_ipv6_reverse_name_error_validates :: proc(t: ^testing.T) {
-	calls := R6_Calls{}
-	v := r6_validator(&calls)
-	testing.expect(t, v != nil, "the anchor should parse")
+	calls := Counting_Upstream {
+		fixtures = R6_FIXTURES,
+	}
+	v := make_validator(counting_query, &calls, Options{anchors = fixture_anchors(R6_ANCHOR)})
 	defer destroy_validator(v)
 
-	result := validate(v, R6_QNAME, .PTR, r6_fixture("r6_nxdomain"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, R6_QNAME, .PTR, scenario_fixture(R6_FIXTURES, "r6_nxdomain"), fixture_now())
 	testing.expectf(
 		t,
 		result.status == .Secure,

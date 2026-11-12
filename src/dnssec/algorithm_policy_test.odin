@@ -504,7 +504,7 @@ believed; treating what is left as unsigned believes the attacker instead.
 */
 @(test)
 test_a_refused_signature_does_not_downgrade_an_altered_rrset :: proc(t: ^testing.T) {
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	published := []string{MIGRATING_A_SIG_13, MIGRATING_A_SIG_5}
 	rsa_only := []string{MIGRATING_A_SIG_5}
 	genuine := [4]u8{192, 0, 2, 1}
@@ -577,7 +577,7 @@ answer is unvalidated data rather than a SERVFAIL.
 */
 @(test)
 test_a_zone_signed_only_with_a_refused_algorithm_stays_insecure :: proc(t: ^testing.T) {
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	sigs := []string{LEGACY_A_SIG}
 	addr := [4]u8{192, 0, 2, 2}
 
@@ -635,7 +635,7 @@ test_a_refused_algorithm_is_settled_at_the_delegation :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	status, _, established := zone_trust(v, &budget, "legacy.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, _, established := zone_trust(v, &budget, "legacy.", fixture_now(), context.temp_allocator)
 	testing.expectf(t, status == .Insecure, "the delegation to legacy. came back %v", status)
 	testing.expect_value(t, established, "legacy.")
 	testing.expectf(
@@ -677,7 +677,7 @@ test_one_refused_ds_does_not_make_a_mixed_delegation_insecure :: proc(t: ^testin
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	status, _, _ := zone_trust(v, &budget, "migrating.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, _, _ := zone_trust(v, &budget, "migrating.", fixture_now(), context.temp_allocator)
 	testing.expectf(
 		t,
 		status == .Bogus,
@@ -786,7 +786,7 @@ unpadded one costs, and still validates.
 */
 @(test)
 test_refused_signatures_cannot_spend_the_verification_budget :: proc(t: ^testing.T) {
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	unix := u32(FIXTURE_TIME)
 
 	sig_of :: proc(rdata_hex: string) -> Rrsig {

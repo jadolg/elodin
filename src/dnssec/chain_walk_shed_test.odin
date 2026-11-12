@@ -85,6 +85,23 @@ slow_query :: proc(
 	return nil, false
 }
 
+// The lookups that reached `u`, read under its lock.
+@(private = "file")
+slow_calls :: proc(u: ^Slow_Upstream) -> int {
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	return u.calls
+}
+
+// `example.com.` and the zones above it, secure in the cache the way a first
+// question would have left them.
+@(private = "file")
+warm_example_chain :: proc(v: ^Validator, now: time.Time) {
+	for zone in ([]string{".", "com.", "example.com."}) {
+		cache_put(v, zone, .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
+	}
+}
+
 @(private = "file")
 Walker :: struct {
 	v:      ^Validator,
@@ -100,7 +117,7 @@ walk_once :: proc(w: ^Walker) {
 		w.v,
 		&budget,
 		"a.b.c.example.com.",
-		time.unix(FIXTURE_TIME, 0),
+		fixture_now(),
 		context.temp_allocator,
 	)
 	w.status = status
@@ -214,12 +231,8 @@ test_a_shed_walk_still_answers_from_the_cache :: proc(t: ^testing.T) {
 	v := make_validator(slow_query, &up, Options{max_chain_walks = 1})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
-	// A chain already in the cache, put there the way a first question would.
-	keys := []Dnskey{}
-	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
-	cache_put(v, "com.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
-	cache_put(v, "example.com.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
+	now := fixture_now()
+	warm_example_chain(v, now)
 
 	testing.expect(t, take_walk_slot(v), "the one slot should be free")
 	defer drop_walk_slot(v)
@@ -229,9 +242,7 @@ test_a_shed_walk_still_answers_from_the_cache :: proc(t: ^testing.T) {
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, established, "example.com.")
 
-	sync.mutex_lock(&up.mu)
-	calls := up.calls
-	sync.mutex_unlock(&up.mu)
+	calls := slow_calls(&up)
 	testing.expectf(t, calls == 0, "a cached chain should ask nobody, it asked %d times", calls)
 	// The count, not the budget's flag: `zone_trust` clears that on the way out
 	// whether or not a slot was taken, so it reads false either way. One is the
@@ -258,11 +269,8 @@ test_a_shed_walk_below_a_warm_apex_still_stops :: proc(t: ^testing.T) {
 	v := make_validator(slow_query, &up, Options{max_chain_walks = 1})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
-	keys := []Dnskey{}
-	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
-	cache_put(v, "com.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
-	cache_put(v, "example.com.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
+	now := fixture_now()
+	warm_example_chain(v, now)
 
 	testing.expect(t, take_walk_slot(v), "the one slot should be free")
 	defer drop_walk_slot(v)
@@ -272,9 +280,7 @@ test_a_shed_walk_below_a_warm_apex_still_stops :: proc(t: ^testing.T) {
 	testing.expect_value(t, status, Status.Indeterminate)
 	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
 
-	sync.mutex_lock(&up.mu)
-	calls := up.calls
-	sync.mutex_unlock(&up.mu)
+	calls := slow_calls(&up)
 	testing.expectf(t, calls == 0, "a shed walk should reach no upstream, it reached one %d times", calls)
 	free_all(context.temp_allocator)
 }
@@ -294,7 +300,7 @@ test_a_shed_walk_is_never_a_downgrade :: proc(t: ^testing.T) {
 	v := make_validator(slow_query, &up, Options{max_chain_walks = 1})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	testing.expect(t, take_walk_slot(v), "the one slot should be free")
 	defer drop_walk_slot(v)
 
@@ -303,41 +309,9 @@ test_a_shed_walk_is_never_a_downgrade :: proc(t: ^testing.T) {
 	testing.expect_value(t, status, Status.Indeterminate)
 	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
 
-	sync.mutex_lock(&up.mu)
-	calls := up.calls
-	sync.mutex_unlock(&up.mu)
+	calls := slow_calls(&up)
 	testing.expectf(t, calls == 0, "a shed walk should reach no upstream, it reached one %d times", calls)
 	free_all(context.temp_allocator)
-}
-
-// Answers from the captured set, so the chains below are the real ones, and a
-// count of what was asked for.
-@(private = "file")
-Captured :: struct {
-	calls: int,
-}
-
-@(private = "file")
-captured_query :: proc(
-	ctx: rawptr,
-	name: string,
-	type: dns.Type,
-	allocator: mem.Allocator,
-	_: ^time.Tick,
-) -> (
-	wire: []u8,
-	ok: bool,
-) {
-	if ctx != nil {
-		(cast(^Captured)ctx).calls += 1
-	}
-	for f in FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	return nil, false
 }
 
 /*
@@ -366,11 +340,13 @@ free between the two, which is a race by construction.
 */
 @(test)
 test_a_shed_elsewhere_does_not_excuse_a_forgery :: proc(t: ^testing.T) {
-	seen := Captured{}
-	v := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
+	seen := Counting_Upstream {
+		fixtures = FIXTURES,
+	}
+	v := make_validator(counting_query, &seen, Options{max_chain_walks = 1})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	unix := u32(FIXTURE_TIME)
 	budget := query_budget(v)
 
@@ -442,11 +418,13 @@ and the reason the bound reserves walk slots rather than capping them.
 */
 @(test)
 test_a_shed_walk_cannot_tell_an_unsigned_zone_from_a_signed_one :: proc(t: ^testing.T) {
-	seen := Captured{}
-	v := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
+	seen := Counting_Upstream {
+		fixtures = FIXTURES,
+	}
+	v := make_validator(counting_query, &seen, Options{max_chain_walks = 1})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	/*
 	The chain down to `com.` warmed the way a first question would, by asking
 	one. What is left uncached is the only step that matters here: whether
@@ -493,7 +471,7 @@ test_a_connection_is_held_to_its_own_bound :: proc(t: ^testing.T) {
 	v := make_validator(slow_query, &up, Options{max_chain_walks = 1, max_connection_walks = 1})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	// Every slot of the shared pool taken, which is the flood at its worst.
 	testing.expect(t, take_walk_slot(v, .Shared), "the one shared slot should be free")
 	defer drop_walk_slot(v, .Shared)
@@ -506,9 +484,7 @@ test_a_connection_is_held_to_its_own_bound :: proc(t: ^testing.T) {
 	budget.pool = .Connection
 	status, _, _ := zone_trust(v, &budget, "a.b.c.example.com.", now, context.temp_allocator)
 
-	sync.mutex_lock(&up.mu)
-	calls := up.calls
-	sync.mutex_unlock(&up.mu)
+	calls := slow_calls(&up)
 	testing.expectf(t, calls > 0, "the walk should have reached the upstream, it asked %d times", calls)
 	// The upstream answered nothing, so the walk ends there - but it ends
 	// having asked, and saying so, rather than refused for want of a slot.
@@ -526,7 +502,7 @@ test_a_connection_is_still_bounded :: proc(t: ^testing.T) {
 	v := make_validator(slow_query, &up, Options{max_chain_walks = 1, max_connection_walks = 1})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	testing.expect(t, take_walk_slot(v, .Connection), "the one connection slot should be free")
 	defer drop_walk_slot(v, .Connection)
 
@@ -536,9 +512,7 @@ test_a_connection_is_still_bounded :: proc(t: ^testing.T) {
 	testing.expect_value(t, status, Status.Indeterminate)
 	testing.expect_value(t, walk_reason(&budget), WALKS_IN_FLIGHT)
 
-	sync.mutex_lock(&up.mu)
-	calls := up.calls
-	sync.mutex_unlock(&up.mu)
+	calls := slow_calls(&up)
 	testing.expectf(t, calls == 0, "a shed walk should reach no upstream, it reached one %d times", calls)
 	free_all(context.temp_allocator)
 }
@@ -556,20 +530,14 @@ undecided with a walk of its own turned away.
 */
 @(test)
 test_the_counter_is_questions_the_shedding_cost :: proc(t: ^testing.T) {
-	seen := Captured{}
-	v := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
+	seen := Counting_Upstream {
+		fixtures = FIXTURES,
+	}
+	v := make_validator(counting_query, &seen, Options{max_chain_walks = 1})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
-	answer: []u8
-	for f in FIXTURES {
-		if f.key == "reddit_a" {
-			decoded, ok := decode_hex(f.wire, context.temp_allocator)
-			testing.expect(t, ok, "the fixture should decode")
-			answer = decoded
-		}
-	}
-	testing.expect(t, len(answer) > 0, "the reddit fixture should be in the captured set")
+	now := fixture_now()
+	answer := scenario_fixture(FIXTURES, "reddit_a")
 
 	// Answered without shedding first: an unsigned delegation, which is a
 	// question this resolver answers rather than refuses.
@@ -579,7 +547,7 @@ test_the_counter_is_questions_the_shedding_cost :: proc(t: ^testing.T) {
 
 	// Now with every slot held. The chain is cached by the run above, so a
 	// fresh validator is what makes this a cold question again.
-	cold := make_validator(captured_query, &seen, Options{max_chain_walks = 1})
+	cold := make_validator(counting_query, &seen, Options{max_chain_walks = 1})
 	defer destroy_validator(cold)
 	testing.expect(t, take_walk_slot(cold), "the one slot should be free")
 	defer drop_walk_slot(cold)

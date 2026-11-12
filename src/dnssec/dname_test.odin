@@ -1,8 +1,6 @@
 package dnssec
 
-import "core:mem"
 import "core:testing"
-import "core:time"
 import "elodin:dns"
 
 /*
@@ -86,39 +84,6 @@ DNAME_FIXTURES := []Fixture{
 	},
 }
 
-@(private = "file")
-dname_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in DNAME_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			out, decoded := decode_hex(f.wire, allocator)
-			return out, decoded
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-dname_fixture :: proc(key: string) -> []u8 {
-	for f in DNAME_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
-
-@(private = "file")
-dname_validator :: proc() -> ^Validator {
-	anchor, ok := parse_trust_anchor(DNAME_ANCHOR, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	return make_validator(dname_query, nil, Options{anchors = anchors})
-}
-
 @(test)
 test_dname_zone_chain_is_sound :: proc(t: ^testing.T) {
 	/*
@@ -127,12 +92,11 @@ test_dname_zone_chain_is_sound :: proc(t: ^testing.T) {
 	tests below would start reporting on the drift rather than on DNAME. This
 	walks the synthetic chain on its own: root anchor, DS, DNSKEY.
 	*/
-	v := dname_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&DNAME_FIXTURES, DNAME_ANCHOR)
 	defer destroy_validator(v)
 
 	budget := query_budget(v)
-	status, keys, zone := zone_trust(v, &budget, "dnametest.", time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	status, keys, zone := zone_trust(v, &budget, "dnametest.", fixture_now(), context.temp_allocator)
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, zone, "dnametest.")
 	testing.expect(t, len(keys) > 0, "the zone should publish a key")
@@ -150,11 +114,10 @@ test_dname_redirection_validates :: proc(t: ^testing.T) {
 	inside a signed zone with no signature of its own - and takes the whole
 	response down with it. Every name behind a DNAME then fails to resolve.
 	*/
-	v := dname_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&DNAME_FIXTURES, DNAME_ANCHOR)
 	defer destroy_validator(v)
 
-	result := validate(v, "a.dnametest.", .A, dname_fixture("dname_answer"), time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "a.dnametest.", .A, scenario_fixture(DNAME_FIXTURES, "dname_answer"), fixture_now())
 	testing.expectf(
 		t,
 		result.status == .Secure,
@@ -177,16 +140,15 @@ test_cname_a_dname_does_not_account_for_is_refused :: proc(t: ^testing.T) {
 	DNAME in existence - which is a great deal worse than the bug it set out
 	to fix.
 	*/
-	v := dname_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&DNAME_FIXTURES, DNAME_ANCHOR)
 	defer destroy_validator(v)
 
 	result := validate(
 		v,
 		"a.dnametest.",
 		.A,
-		dname_fixture("dname_answer_mismatched"),
-		time.unix(FIXTURE_TIME, 0),
+		scenario_fixture(DNAME_FIXTURES, "dname_answer_mismatched"),
+		fixture_now(),
 	)
 	testing.expectf(
 		t,
@@ -279,13 +241,10 @@ a second is not one a DNAME produced.
 */
 @(test)
 test_a_second_cname_beside_a_dname_synthesis_is_not_authenticated :: proc(t: ^testing.T) {
-	v := dname_validator()
-	if !testing.expect(t, v != nil, "cannot build the dname validator") {
-		return
-	}
+	v := scenario_validator(&DNAME_FIXTURES, DNAME_ANCHOR)
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(dname_fixture("dname_answer"), context.temp_allocator)
+	msg, derr := dns.decode_message(scenario_fixture(DNAME_FIXTURES, "dname_answer"), context.temp_allocator)
 	if !testing.expect(t, derr == .None, "the fixture did not decode") {
 		return
 	}
@@ -317,14 +276,17 @@ test_a_second_cname_beside_a_dname_synthesis_is_not_authenticated :: proc(t: ^te
 	tampered, _, enc := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
 	testing.expect_value(t, enc, dns.Encode_Error.None)
 
-	result := validate(v, "a.dnametest.", .A, tampered, time.unix(FIXTURE_TIME, 0))
+	result := validate(v, "a.dnametest.", .A, tampered, fixture_now())
 	if result.status == .Secure {
 		// If the verdict stands, the planted record must not be in what it covers.
 		out, ok := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
 		if !testing.expect(t, ok, "the pruned response should rebuild") {
 			return
 		}
-		pruned, _ := dns.decode_message(out, context.temp_allocator)
+		pruned, perr := dns.decode_message(out, context.temp_allocator)
+		if !testing.expect_value(t, perr, dns.Decode_Error.None) {
+			return
+		}
 		for rec in pruned.answer {
 			name, is_name := rec.data.(dns.Rdata_Name)
 			if !is_name {
@@ -348,12 +310,11 @@ with, held to the DNAME's signature, and never with zero for want of one (#337).
 */
 @(test)
 test_a_synthesized_cname_keeps_its_ttl :: proc(t: ^testing.T) {
-	v := dname_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&DNAME_FIXTURES, DNAME_ANCHOR)
 	defer destroy_validator(v)
 
-	wire := dname_fixture("dname_answer")
-	result := validate(v, "a.dnametest.", .A, wire, time.unix(FIXTURE_TIME, 0))
+	wire := scenario_fixture(DNAME_FIXTURES, "dname_answer")
+	result := validate(v, "a.dnametest.", .A, wire, fixture_now())
 	testing.expect_value(t, result.status, Status.Secure)
 	out, ok := strip_unauthenticated(wire, result)
 	testing.expect(t, ok, "the prune failed")

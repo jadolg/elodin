@@ -1,8 +1,6 @@
 package dnssec
 
-import "core:mem"
 import "core:testing"
-import "core:time"
 import "elodin:dns"
 
 /*
@@ -118,53 +116,20 @@ N3_FIXTURES := []Fixture{
 }
 
 @(private = "file")
-n3_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in N3_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return decode_hex(f.wire, allocator)
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-n3_validator :: proc() -> ^Validator {
-	anchor, ok := parse_trust_anchor(N3_ANCHOR, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	return make_validator(n3_query, nil, Options{anchors = anchors})
-}
-
-@(private = "file")
-n3_reply :: proc(key := "n3_nx") -> []u8 {
-	for f in N3_FIXTURES {
-		if f.key == key {
-			out, _ := decode_hex(f.wire, context.temp_allocator)
-			return out
-		}
-	}
-	return nil
-}
-
-@(private = "file")
 N3_QNAME :: "nx.deep.n3test."
 
 @(test)
 test_an_nsec3_name_error_validates_and_says_what_it_hashed :: proc(t: ^testing.T) {
 	// The control, and the measurement the test below is built on: if this
 	// stops proving, everything after it is measuring the wrong thing.
-	v := n3_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&N3_FIXTURES, N3_ANCHOR)
 	defer destroy_validator(v)
 
-	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+	msg, err := dns.decode_message(scenario_fixture(N3_FIXTURES, "n3_nx"), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 
 	budget := query_budget(v)
-	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expectf(t, result.status == .Secure, "the name error should be proven, got %v (%q)", result.status, result.reason)
 	testing.expect(t, budget.nsec3.rounds > 0, "a proof that hashed nothing is not exercising this")
 	testing.expectf(
@@ -184,11 +149,10 @@ test_an_nsec3_name_error_on_unknown_flags_is_bogus :: proc(t: ^testing.T) {
 	section 8.2 has the validator ignore every record in it, so the signatures
 	all verify and there is still nothing to prove the denial with. Issue #335.
 	*/
-	v := n3_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&N3_FIXTURES, N3_ANCHOR)
 	defer destroy_validator(v)
 
-	msg, err := dns.decode_message(n3_reply("n3_nx_unknown_flags"), context.temp_allocator)
+	msg, err := dns.decode_message(scenario_fixture(N3_FIXTURES, "n3_nx_unknown_flags"), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 
 	saw_flags := false
@@ -202,7 +166,7 @@ test_an_nsec3_name_error_on_unknown_flags_is_bogus :: proc(t: ^testing.T) {
 	testing.expect(t, saw_flags, "the fixture should carry the unknown flag, or this proves nothing")
 
 	budget := query_budget(v)
-	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expectf(t, result.status == .Bogus, "a denial resting on ignored records should be bogus, got %v (%q)", result.status, result.reason)
 	// "no denial of existence" would be Bogus too, but for records that did not
 	// verify: this reason says they verified and were then ignored.
@@ -218,28 +182,27 @@ test_an_nsec3_name_error_that_runs_out_of_hashing_is_indeterminate :: proc(t: ^t
 	which runs after the walk. Measured rather than written down, because a
 	number here would rot the first time the fixture or the proof changed.
 	*/
-	measure_v := n3_validator()
-	testing.expect(t, measure_v != nil, "the anchor should parse")
+	measure_v := scenario_validator(&N3_FIXTURES, N3_ANCHOR)
 	defer destroy_validator(measure_v)
 
-	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+	msg, err := dns.decode_message(scenario_fixture(N3_FIXTURES, "n3_nx"), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 
 	whole := query_budget(measure_v)
-	validate_denial(measure_v, &whole, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	validate_denial(measure_v, &whole, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 
 	// A validator of its own, because what the first call learned about the
 	// zone is cached and the second would read the answer rather than work it
 	// out.
-	v := n3_validator()
+	v := scenario_validator(&N3_FIXTURES, N3_ANCHOR)
 	defer destroy_validator(v)
 	short := query_budget(v)
 	short.nsec3.rounds = MAX_NSEC3_ROUNDS_PER_QUERY - whole.nsec3.rounds + 1
-	result := validate_denial(v, &short, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	result := validate_denial(v, &short, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expect_value(t, result.status, Status.Indeterminate)
 	// Named apart from the signature budget: an operator reading this has to be
 	// able to tell which allowance ran out.
-	testing.expect_value(t, result.reason, "nsec3 hashing budget spent")
+	testing.expect_value(t, result.reason, NSEC3_BUDGET_SPENT)
 	free_all(context.temp_allocator)
 }
 
@@ -259,17 +222,17 @@ than either of the ones this is choosing between.
 */
 @(test)
 test_an_iteration_ceiling_past_the_allowance_is_held_down :: proc(t: ^testing.T) {
-	v := make_validator(n3_query, nil, Options{max_nsec3_iterations = MAX_NSEC3_ITERATIONS_LIMIT + 1})
+	v := make_validator(scenario_query, &N3_FIXTURES, Options{max_nsec3_iterations = MAX_NSEC3_ITERATIONS_LIMIT + 1})
 	defer destroy_validator(v)
 	testing.expect_value(t, v.max_nsec3_iterations, MAX_NSEC3_ITERATIONS_LIMIT)
 
-	under := make_validator(n3_query, nil, Options{max_nsec3_iterations = 10})
+	under := make_validator(scenario_query, &N3_FIXTURES, Options{max_nsec3_iterations = 10})
 	defer destroy_validator(under)
 	testing.expect_value(t, under.max_nsec3_iterations, 10)
 
 	// Unset means the shipped default: `make_validator` reads a zero here as
 	// that.
-	unset := make_validator(n3_query, nil, Options{})
+	unset := make_validator(scenario_query, &N3_FIXTURES, Options{})
 	defer destroy_validator(unset)
 	testing.expect_value(t, unset.max_nsec3_iterations, DEFAULT_MAX_NSEC3_ITERATIONS)
 	free_all(context.temp_allocator)
@@ -291,18 +254,15 @@ BIND and Knot do - rather than SERVFAIL for every name under it. Issue #331.
 */
 @(test)
 test_the_configured_iteration_ceiling_reaches_the_proof :: proc(t: ^testing.T) {
-	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+	msg, err := dns.decode_message(scenario_fixture(N3_FIXTURES, "n3_nx"), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 
-	anchor, parsed := parse_trust_anchor(N3_ANCHOR, context.temp_allocator)
-	testing.expect(t, parsed, "the anchor should parse")
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
+	anchors := fixture_anchors(N3_ANCHOR)
 
-	strict := make_validator(n3_query, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
+	strict := make_validator(scenario_query, &N3_FIXTURES, Options{anchors = anchors, max_nsec3_iterations = 5})
 	defer destroy_validator(strict)
 	budget := query_budget(strict)
-	result := validate_denial(strict, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	result := validate_denial(strict, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expectf(t, result.status == .Insecure, "a zone past the ceiling is insecure, got %v (%q)", result.status, result.reason)
 	// The walk down to the name reads these same records, so it is the first
 	// thing the ceiling refuses. The meter is the rest of the journey: the
@@ -314,19 +274,19 @@ test_the_configured_iteration_ceiling_reaches_the_proof :: proc(t: ^testing.T) {
 	// a denial past the ceiling cannot tell a delegation from a name nobody
 	// holds, so remembering it is one entry per name a client makes up.
 	for name in ([]string{"deep.n3test.", N3_QNAME}) {
-		_, cached, non_cut := cache_get(strict, name, fixture_moment(time.unix(FIXTURE_TIME, 0)), context.temp_allocator)
+		_, cached, non_cut := cache_get(strict, name, fixture_moment(fixture_now()), context.temp_allocator)
 		testing.expectf(t, !cached && !non_cut, "%s should not be remembered from a denial past the ceiling", name)
 	}
 
 	// The walk above answered before the denial was read, so the denial's own
 	// verdict needs a walk that ends at the apex: the names below it already
 	// remembered as non-cuts, the way an earlier walk would leave them.
-	unwalked := make_validator(n3_query, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
+	unwalked := make_validator(scenario_query, &N3_FIXTURES, Options{anchors = anchors, max_nsec3_iterations = 5})
 	defer destroy_validator(unwalked)
-	non_cut_remember(unwalked, "deep.n3test.", MAX_ZONE_TTL, fixture_moment(time.unix(FIXTURE_TIME, 0)))
-	non_cut_remember(unwalked, N3_QNAME, MAX_ZONE_TTL, fixture_moment(time.unix(FIXTURE_TIME, 0)))
+	non_cut_remember(unwalked, "deep.n3test.", MAX_ZONE_TTL, fixture_moment(fixture_now()))
+	non_cut_remember(unwalked, N3_QNAME, MAX_ZONE_TTL, fixture_moment(fixture_now()))
 	read := query_budget(unwalked)
-	denied := validate_denial(unwalked, &read, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	denied := validate_denial(unwalked, &read, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expectf(t, denied.status == .Insecure, "a denial past the ceiling is insecure, got %v (%q)", denied.status, denied.reason)
 	testing.expect_value(t, denied.reason, NSEC3_OVER_CEILING)
 	testing.expect(t, read.nsec3.over_ceiling > 0, "the configured ceiling should have refused these records")
@@ -334,10 +294,10 @@ test_the_configured_iteration_ceiling_reaches_the_proof :: proc(t: ^testing.T) {
 
 	// And the same records under the shipped ceiling, which is the control: the
 	// zone is fine, the number was the whole of the difference.
-	ordinary := n3_validator()
+	ordinary := scenario_validator(&N3_FIXTURES, N3_ANCHOR)
 	defer destroy_validator(ordinary)
 	whole := query_budget(ordinary)
-	held := validate_denial(ordinary, &whole, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	held := validate_denial(ordinary, &whole, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expectf(t, held.status == .Secure, "the denial holds up at the default ceiling, got %v (%q)", held.status, held.reason)
 	free_all(context.temp_allocator)
 }
@@ -374,11 +334,10 @@ in those words, rather than the same sentence about a chain every
 */
 @(test)
 test_a_walk_that_ran_out_of_lookups_does_not_blame_the_hashing :: proc(t: ^testing.T) {
-	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+	msg, err := dns.decode_message(scenario_fixture(N3_FIXTURES, "n3_nx"), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 
-	v := n3_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&N3_FIXTURES, N3_ANCHOR)
 	defer destroy_validator(v)
 
 	// A name two labels below the one the fixtures answer for, so the walk
@@ -387,7 +346,7 @@ test_a_walk_that_ran_out_of_lookups_does_not_blame_the_hashing :: proc(t: ^testi
 	// below it, so the walk stops on the allowance that is not the hashing one.
 	budget := query_budget(v)
 	budget.lookups = MAX_LOOKUPS_PER_QUERY - 3
-	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expect_value(t, result.status, Status.Indeterminate)
 	testing.expect_value(t, result.reason, LOOKUPS_SPENT)
 	testing.expect_value(t, budget.nsec3.over_ceiling, 0)
@@ -400,18 +359,17 @@ test_a_walk_that_ran_out_of_lookups_does_not_blame_the_hashing :: proc(t: ^testi
 // question it stopped.
 @(test)
 test_a_walk_out_of_lookups_at_the_keys_says_so :: proc(t: ^testing.T) {
-	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+	msg, err := dns.decode_message(scenario_fixture(N3_FIXTURES, "n3_nx"), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 
-	v := n3_validator()
-	testing.expect(t, v != nil, "the anchor should parse")
+	v := scenario_validator(&N3_FIXTURES, N3_ANCHOR)
 	defer destroy_validator(v)
 
 	// Nothing left, so the first thing the walk asks - the anchored zone's
 	// DNSKEY set - is refused.
 	budget := query_budget(v)
 	budget.lookups = MAX_LOOKUPS_PER_QUERY
-	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), time.unix(FIXTURE_TIME, 0), context.temp_allocator)
+	result := validate_denial(v, &budget, msg, N3_QNAME, .A, .IN, u32(FIXTURE_TIME), fixture_now(), context.temp_allocator)
 	testing.expect_value(t, result.status, Status.Indeterminate)
 	testing.expect_value(t, result.reason, LOOKUPS_SPENT)
 	free_all(context.temp_allocator)
@@ -430,12 +388,9 @@ says so rather than guessing either way.
 */
 @(test)
 test_a_forged_unsigned_answer_past_the_ceiling_is_not_served :: proc(t: ^testing.T) {
-	anchor, parsed := parse_trust_anchor(N3_ANCHOR, context.temp_allocator)
-	testing.expect(t, parsed, "the anchor should parse")
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
+	anchors := fixture_anchors(N3_ANCHOR)
 
-	msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+	msg, err := dns.decode_message(scenario_fixture(N3_FIXTURES, "n3_nx"), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
 	dns.set_rcode(&msg, .No_Error)
 	msg.authority = nil
@@ -445,17 +400,17 @@ test_a_forged_unsigned_answer_past_the_ceiling_is_not_served :: proc(t: ^testing
 	wire, _, encode_err := dns.encode_message(msg, context.temp_allocator)
 	testing.expect_value(t, encode_err, dns.Encode_Error.None)
 
-	strict := make_validator(n3_query, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
+	strict := make_validator(scenario_query, &N3_FIXTURES, Options{anchors = anchors, max_nsec3_iterations = 5})
 	defer destroy_validator(strict)
-	result := validate(strict, N3_QNAME, .A, wire, time.unix(FIXTURE_TIME, 0))
+	result := validate(strict, N3_QNAME, .A, wire, fixture_now())
 	testing.expectf(t, result.status == .Indeterminate, "a forged unsigned answer must not be served, got %v (%q)", result.status, result.reason)
 	testing.expect_value(t, result.reason, NSEC3_OVER_CEILING)
 
 	// The control: at the shipped ceiling the walk reads the denials, the name
 	// is in a signed zone, and an unsigned answer for it is a forgery.
-	ordinary := n3_validator()
+	ordinary := scenario_validator(&N3_FIXTURES, N3_ANCHOR)
 	defer destroy_validator(ordinary)
-	held := validate(ordinary, N3_QNAME, .A, wire, time.unix(FIXTURE_TIME, 0))
+	held := validate(ordinary, N3_QNAME, .A, wire, fixture_now())
 	testing.expectf(t, held.status == .Bogus, "got %v (%q)", held.status, held.reason)
 	free_all(context.temp_allocator)
 }
@@ -471,20 +426,17 @@ than `Bogus` - extended error 6 and a forgery logged over our refusal.
 */
 @(test)
 test_an_unsigned_denial_past_the_ceiling_is_not_called_forged :: proc(t: ^testing.T) {
-	anchor, parsed := parse_trust_anchor(N3_ANCHOR, context.temp_allocator)
-	testing.expect(t, parsed, "the anchor should parse")
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
+	anchors := fixture_anchors(N3_ANCHOR)
 	for rc in ([]dns.Rcode{.No_Error, .NX_Domain}) {
-		msg, err := dns.decode_message(n3_reply(), context.temp_allocator)
+		msg, err := dns.decode_message(scenario_fixture(N3_FIXTURES, "n3_nx"), context.temp_allocator)
 		testing.expect(t, err == .None, "the fixture should decode")
 		dns.set_rcode(&msg, rc)
 		msg.authority = nil
 		msg.answer = nil
 		wire, _, encode_err := dns.encode_message(msg, context.temp_allocator)
 		testing.expect_value(t, encode_err, dns.Encode_Error.None)
-		strict := make_validator(n3_query, nil, Options{anchors = anchors, max_nsec3_iterations = 5})
-		result := validate(strict, N3_QNAME, .A, wire, time.unix(FIXTURE_TIME, 0))
+		strict := make_validator(scenario_query, &N3_FIXTURES, Options{anchors = anchors, max_nsec3_iterations = 5})
+		result := validate(strict, N3_QNAME, .A, wire, fixture_now())
 		testing.expectf(t, result.status == .Indeterminate, "rcode %v: got %v (%q)", rc, result.status, result.reason)
 		testing.expect_value(t, result.reason, NSEC3_OVER_CEILING)
 		destroy_validator(strict)

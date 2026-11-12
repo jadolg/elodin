@@ -401,12 +401,7 @@ cd_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Alloc
 	if ctx != nil && dns.name_equal_fold(name, (^string)(ctx)^) {
 		return nil, false
 	}
-	for f in CD_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return decode_hex(f.wire, allocator)
-		}
-	}
-	return nil, false
+	return fixture_answer(CD_FIXTURES, name, type, allocator)
 }
 
 /*
@@ -416,34 +411,23 @@ touching a signature.
 */
 @(private = "file")
 cd_validate :: proc(key: string, unreachable: ^string = nil, edit: proc(msg: ^dns.Message) = nil) -> Result {
-	anchor, parsed := parse_trust_anchor(CD_ANCHOR, context.temp_allocator)
-	if !parsed {
-		return {status = .Indeterminate, reason = "the anchor did not parse"}
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	v := make_validator(cd_query, unreachable, Options{anchors = anchors})
+	v := make_validator(cd_query, unreachable, Options{anchors = fixture_anchors(CD_ANCHOR)})
 	defer destroy_validator(v)
-	for f in CD_FIXTURES {
-		if f.key != key {
-			continue
+	f := fixture(key, CD_FIXTURES)
+	reply := unhex(f.wire)
+	if edit != nil {
+		msg, derr := dns.decode_message(reply, context.temp_allocator)
+		if derr != .None {
+			return {status = .Indeterminate, reason = "the fixture did not decode"}
 		}
-		reply, _ := decode_hex(f.wire, context.temp_allocator)
-		if edit != nil {
-			msg, derr := dns.decode_message(reply, context.temp_allocator)
-			if derr != .None {
-				return {status = .Indeterminate, reason = "the fixture did not decode"}
-			}
-			edit(&msg)
-			encoded, _, eerr := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
-			if eerr != .None {
-				return {status = .Indeterminate, reason = "the edited fixture did not encode"}
-			}
-			reply = encoded
+		edit(&msg)
+		encoded, _, eerr := dns.encode_message(msg, context.temp_allocator, dns.MAX_MESSAGE)
+		if eerr != .None {
+			return {status = .Indeterminate, reason = "the edited fixture did not encode"}
 		}
-		return validate(v, f.name, f.type, reply, time.unix(FIXTURE_TIME, 0))
+		reply = encoded
 	}
-	return {status = .Indeterminate, reason = "no such fixture"}
+	return validate(v, f.name, f.type, reply, fixture_now())
 }
 
 // One record from the unsigned `cdun.` appended to the answer: no forgery, and

@@ -36,10 +36,6 @@ succeeds and only the rule can refuse it:
 */
 
 @(private = "file")
-CS_DNSKEY_RDATA :: "0101030fe6087a0da6db23c6753cb6ee6edc1cc7683652baa4d3edf04c5c62bd8cbfc884"
-@(private = "file")
-CS_KEY_TAG :: 14506
-@(private = "file")
 CS_PLAIN_SIG ::
 	"800c80cf38a569a0905c7b59170241df08cd21d8e1f2c500cdafea9f80641d70" +
 	"17ac1408528ea0e89b4c5ddf40ff1838db43681ba856095c0bfa5ea6af60ec0b"
@@ -74,24 +70,6 @@ CS_ABOVE_ZONE_SIG ::
 CS_INCEPTION :: 1783072800
 @(private = "file")
 CS_EXPIRATION :: 2101024800
-// A second inside the window above, and the one every case here is judged at.
-@(private = "file")
-CS_NOW :: 1785664800
-
-@(private = "file")
-cs_key :: proc() -> []Dnskey {
-	rdata, ok := decode_hex(CS_DNSKEY_RDATA, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	key, err := parse_dnskey(rdata)
-	if err != .None {
-		return nil
-	}
-	keys := make([]Dnskey, 1, context.temp_allocator)
-	keys[0] = key
-	return keys
-}
 
 @(private = "file")
 cs_sig :: proc(hex_signature: string) -> Rrsig {
@@ -103,7 +81,7 @@ cs_sig :: proc(hex_signature: string) -> Rrsig {
 		original_ttl = 3600,
 		expiration = CS_EXPIRATION,
 		inception = CS_INCEPTION,
-		key_tag = CS_KEY_TAG,
+		key_tag = ED25519_KEY_TAG,
 		signer = "example.com.",
 		signature = signature,
 	}
@@ -171,8 +149,8 @@ test_check_signature_accepts_the_signature_it_should :: proc(t: ^testing.T) {
 		"www.example.com.",
 		.IN,
 		cs_records(),
-		cs_key(),
-		CS_NOW,
+		ed25519_key(),
+		FIXTURE_TIME,
 		context.temp_allocator,
 	)
 	testing.expect_value(t, result, Verify_Result.Ok)
@@ -189,7 +167,7 @@ test_check_signature_reads_the_validity_window_itself :: proc(t: ^testing.T) {
 	who kept a copy would replay.
 	*/
 	records := cs_records()
-	keys := cs_key()
+	keys := ed25519_key()
 
 	lapsed := cs_sig(CS_PLAIN_SIG)
 	result, _ := check_signature(lapsed, "www.example.com.", .IN, records, keys, CS_EXPIRATION + 1, context.temp_allocator)
@@ -226,7 +204,7 @@ test_check_signature_refuses_a_signer_outside_the_owners_zone :: proc(t: ^testin
 		moved := cs_sig(CS_PLAIN_SIG)
 		moved.signer = signer
 		sig, keys := cs_resign(t, moved, "www.example.com.")
-		result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
+		result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
 		testing.expectf(t, result == .Bad, "%q must not be able to sign www.example.com., got %v", signer, result)
 	}
 
@@ -235,7 +213,7 @@ test_check_signature_refuses_a_signer_outside_the_owners_zone :: proc(t: ^testin
 	moved := cs_sig(CS_PLAIN_SIG)
 	moved.signer = "com."
 	sig, keys := cs_resign(t, moved, "www.example.com.")
-	in_bailiwick, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
+	in_bailiwick, _ := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
 	testing.expect_value(t, in_bailiwick, Verify_Result.Ok)
 	free_all(context.temp_allocator)
 }
@@ -254,7 +232,7 @@ test_check_signature_refuses_a_labels_field_the_owner_contradicts :: proc(t: ^te
 		moved := cs_sig(CS_PLAIN_SIG)
 		moved.labels = labels
 		sig, keys := cs_resign(t, moved, "www.example.com.")
-		result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
+		result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
 		testing.expectf(t, result == .Bad, "a labels field of %d over a three-label name must be refused", labels)
 	}
 
@@ -263,7 +241,7 @@ test_check_signature_refuses_a_labels_field_the_owner_contradicts :: proc(t: ^te
 	moved := cs_sig(CS_PLAIN_SIG)
 	moved.labels = 1
 	sig, keys := cs_resign(t, moved, "*.com.")
-	result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, CS_NOW, context.temp_allocator)
+	result, _ := check_signature(sig, "www.example.com.", .IN, records, keys, FIXTURE_TIME, context.temp_allocator)
 	testing.expect_value(t, result, Verify_Result.Bad)
 	free_all(context.temp_allocator)
 }
@@ -288,8 +266,8 @@ test_check_signature_reports_the_encloser_a_wildcard_expansion_claims :: proc(t:
 		"www.example.com.",
 		.IN,
 		cs_records(),
-		cs_key(),
-		CS_NOW,
+		ed25519_key(),
+		FIXTURE_TIME,
 		context.temp_allocator,
 	)
 	testing.expect_value(t, result, Verify_Result.Ok)
@@ -304,8 +282,8 @@ test_check_signature_reports_the_encloser_a_wildcard_expansion_claims :: proc(t:
 		"www.example.com.",
 		.IN,
 		cs_records(),
-		cs_key(),
-		CS_NOW,
+		ed25519_key(),
+		FIXTURE_TIME,
 		context.temp_allocator,
 	)
 	testing.expect_value(t, plain_result, Verify_Result.Bad)
@@ -327,7 +305,7 @@ test_check_signature_counts_a_literal_wildcard_owner_without_its_asterisk :: pro
 	records := cs_records()
 	records[0].name = "*.example.com."
 
-	result, encloser := check_signature(sig, "*.example.com.", .IN, records, cs_key(), CS_NOW, context.temp_allocator)
+	result, encloser := check_signature(sig, "*.example.com.", .IN, records, ed25519_key(), FIXTURE_TIME, context.temp_allocator)
 	// The bytes were signed over `www.`, so this cannot verify - but it must
 	// fail on the signature, not by being mistaken for an expansion.
 	testing.expect_value(t, result, Verify_Result.Bad)
@@ -351,7 +329,7 @@ test_check_signature_refuses_a_consistent_out_of_bailiwick_signature :: proc(t: 
 	*/
 	sig := cs_sig(CS_OUT_OF_BAILIWICK_SIG)
 	sig.signer = "example.org."
-	result, _ := check_signature(sig, "www.example.com.", .IN, cs_records(), cs_key(), CS_NOW, context.temp_allocator)
+	result, _ := check_signature(sig, "www.example.com.", .IN, cs_records(), ed25519_key(), FIXTURE_TIME, context.temp_allocator)
 	testing.expect_value(t, result, Verify_Result.Bad)
 	free_all(context.temp_allocator)
 }
@@ -372,7 +350,7 @@ test_check_signature_refuses_a_consistent_wildcard_above_the_signing_zone :: pro
 	*/
 	sig := cs_sig(CS_ABOVE_ZONE_SIG)
 	sig.labels = 1
-	result, encloser := check_signature(sig, "www.example.com.", .IN, cs_records(), cs_key(), CS_NOW, context.temp_allocator)
+	result, encloser := check_signature(sig, "www.example.com.", .IN, cs_records(), ed25519_key(), FIXTURE_TIME, context.temp_allocator)
 	testing.expect_value(t, result, Verify_Result.Bad)
 	testing.expectf(t, encloser == "", "no encloser should be claimed on a refusal, got %q", encloser)
 	free_all(context.temp_allocator)
@@ -380,10 +358,7 @@ test_check_signature_refuses_a_consistent_wildcard_above_the_signing_zone :: pro
 
 @(private = "file")
 cs_colliding :: proc(decoys: int) -> []Dnskey {
-	real := cs_key()
-	if len(real) != 1 {
-		return nil
-	}
+	real := ed25519_key()
 	keys := make([dynamic]Dnskey, 0, decoys + 1, context.temp_allocator)
 	for i in 0 ..< decoys {
 		// The same tag, algorithm and flags as the key that signed - only the
@@ -431,7 +406,7 @@ test_check_signature_bounds_the_keys_one_signature_is_tried_against :: proc(t: ^
 		.IN,
 		cs_records(),
 		within,
-		CS_NOW,
+		FIXTURE_TIME,
 		context.temp_allocator,
 	)
 	testing.expect_value(t, result, Verify_Result.Ok)
@@ -446,7 +421,7 @@ test_check_signature_bounds_the_keys_one_signature_is_tried_against :: proc(t: ^
 		.IN,
 		cs_records(),
 		padded,
-		CS_NOW,
+		FIXTURE_TIME,
 		context.temp_allocator,
 	)
 	testing.expectf(

@@ -33,11 +33,6 @@ ordinary_reply :: proc(name: string, type: dns.Type) -> []u8 {
 	return wire
 }
 
-@(private = "file")
-spent_counter :: proc() -> int {
-	return dns.REQUEST_DECODE_BUDGET + 1
-}
-
 /*
 A response this server had no allowance left to read is undecided, not forged.
 
@@ -50,13 +45,13 @@ test_a_response_past_the_request_budget_is_not_called_a_forgery :: proc(t: ^test
 	v := make_validator(counting_query, &up, Options{})
 	defer destroy_validator(v)
 
-	spent := spent_counter()
+	spent := SPENT
 	result := validate(
 		v,
 		"www.example.com.",
 		.A,
 		ordinary_reply("www.example.com.", .A),
-		time.unix(FIXTURE_TIME, 0),
+		fixture_now(),
 		context.temp_allocator,
 		spent = &spent,
 	)
@@ -80,10 +75,10 @@ test_a_chain_step_past_the_request_budget_stops_the_walk :: proc(t: ^testing.T) 
 	v := make_validator(answering_query, &up, Options{})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
-	spent := spent_counter()
+	spent := SPENT
 	budget := query_budget(v)
 	budget.spent = &spent
 	status, _, _ := zone_trust(v, &budget, "www.example.com.", now, context.temp_allocator)
@@ -108,7 +103,7 @@ test_a_chain_step_within_the_request_budget_reads_the_reply :: proc(t: ^testing.
 	v := make_validator(answering_query, &up, Options{})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
 	spent := 0
@@ -144,27 +139,6 @@ answering_query :: proc(
 	return ordinary_reply(name, type), true
 }
 
-@(private = "file")
-Counting_Upstream :: struct {
-	calls: int,
-}
-
-@(private = "file")
-counting_query :: proc(
-	ctx: rawptr,
-	name: string,
-	type: dns.Type,
-	allocator: mem.Allocator,
-	_: ^time.Tick,
-) -> (
-	wire: []u8,
-	ok: bool,
-) {
-	u := cast(^Counting_Upstream)ctx
-	u.calls += 1
-	return nil, false
-}
-
 /*
 Nor is a response this server had no memory to read (issue #620).
 
@@ -182,7 +156,7 @@ test_a_response_read_without_memory_is_not_called_a_forgery :: proc(t: ^testing.
 		"www.example.com.",
 		.A,
 		ordinary_reply("www.example.com.", .A),
-		time.unix(FIXTURE_TIME, 0),
+		fixture_now(),
 		mem.nil_allocator(),
 	)
 	testing.expect_value(t, result.status, Status.Indeterminate)
@@ -198,7 +172,7 @@ test_a_chain_step_read_without_memory_stops_the_walk :: proc(t: ^testing.T) {
 	v := make_validator(answering_query, &up, Options{})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
 	budget := query_budget(v)

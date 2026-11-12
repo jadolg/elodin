@@ -1,8 +1,6 @@
 package dnssec
 
-import "core:mem"
 import "core:testing"
-import "core:time"
 import "elodin:dns"
 
 /*
@@ -33,31 +31,6 @@ the rcode asks for: adding or removing records cannot move this, because the
 shape it is checked against was already settled from signed data.
 */
 
-@(private = "file")
-rc_fixture :: proc(key: string) -> Fixture {
-	for f in FIXTURES {
-		if f.key == key {
-			return f
-		}
-	}
-	return {}
-}
-
-@(private = "file")
-rc_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return unhex(f.wire, allocator), true
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
-rc_now :: proc() -> time.Time {
-	return time.unix(FIXTURE_TIME, 0)
-}
-
 // The whole of the attacker's work: the low nibble of the flags' second byte,
 // where the rcode lives. Nothing else in the message is touched, so every
 // signature in it still verifies.
@@ -83,18 +56,18 @@ test_nxdomain_over_a_signed_answer_is_bogus :: proc(t: ^testing.T) {
 		{"ed25519_a", "ed25519.nl."},
 	}
 	for c in cases {
-		v := make_validator(rc_query, nil, Options{})
+		v := scenario_validator(&FIXTURES)
 		defer destroy_validator(v)
 
-		wire := unhex(rc_fixture(c.key).wire)
+		wire := scenario_fixture(FIXTURES, c.key)
 
 		// The capture as it stands: a genuine, signed positive answer. Asserted
 		// first so a fixture that stopped validating for some other reason
 		// cannot be mistaken for the guard below doing its job.
-		honest := validate(v, c.qname, .A, wire, rc_now())
+		honest := validate(v, c.qname, .A, wire, fixture_now())
 		testing.expectf(t, honest.status == .Secure, "%s should validate as captured (%v, %q)", c.key, honest.status, honest.reason)
 
-		forged := validate(v, c.qname, .A, with_rcode(wire, .NX_Domain), rc_now())
+		forged := validate(v, c.qname, .A, with_rcode(wire, .NX_Domain), fixture_now())
 		testing.expectf(
 			t,
 			forged.status == .Bogus,
@@ -119,12 +92,12 @@ record of the type asked for is refused.
 */
 @(test)
 test_the_rcode_guard_leaves_honest_answers_alone :: proc(t: ^testing.T) {
-	v := make_validator(rc_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	// A genuine NXDOMAIN, proven by NSEC in the root, with an empty answer
 	// section - the shape this guard must not touch.
-	denial := validate(v, "zzzz-does-not-exist-xq7.", .A, unhex(rc_fixture("nxdomain_root").wire), rc_now())
+	denial := validate(v, "zzzz-does-not-exist-xq7.", .A, scenario_fixture(FIXTURES, "nxdomain_root"), fixture_now())
 	testing.expect_value(t, denial.status, Status.Secure)
 
 	// And a genuine NODATA, which is NOERROR with an SOA behind it.
@@ -132,8 +105,8 @@ test_the_rcode_guard_leaves_honest_answers_alone :: proc(t: ^testing.T) {
 		v,
 		"nosuchname-xq7.cloudflare.com.",
 		.A,
-		unhex(rc_fixture("nodata_cloudflare").wire),
-		rc_now(),
+		scenario_fixture(FIXTURES, "nodata_cloudflare"),
+		fixture_now(),
 	)
 	testing.expect_value(t, nodata.status, Status.Secure)
 	free_all(context.temp_allocator)
@@ -152,14 +125,14 @@ zone's signed records under a header saying the name does not exist.
 */
 @(test)
 test_an_unsigned_rrset_does_not_buy_past_the_rcode_guard :: proc(t: ^testing.T) {
-	v := make_validator(rc_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
-	signed, serr := dns.decode_message(unhex(rc_fixture("example_a").wire), context.temp_allocator)
+	signed, serr := dns.decode_message(scenario_fixture(FIXTURES, "example_a"), context.temp_allocator)
 	testing.expect(t, serr == .None, "the signed fixture did not decode")
 	// reddit.com has no DS in com in the captured set, so its records are
 	// genuinely unsigned and validate as `Insecure` on their own merits.
-	unsigned, uerr := dns.decode_message(unhex(rc_fixture("reddit_a").wire), context.temp_allocator)
+	unsigned, uerr := dns.decode_message(scenario_fixture(FIXTURES, "reddit_a"), context.temp_allocator)
 	testing.expect(t, uerr == .None, "the unsigned fixture did not decode")
 
 	answer := make([dynamic]dns.Record, 0, len(signed.answer) + len(unsigned.answer), context.temp_allocator)
@@ -176,7 +149,7 @@ test_an_unsigned_rrset_does_not_buy_past_the_rcode_guard :: proc(t: ^testing.T) 
 	wire, _, eerr := dns.encode_message(msg, context.temp_allocator)
 	testing.expect(t, eerr == .None, "the spliced message did not encode")
 
-	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	res := validate(v, "www.example.com.", .A, wire, fixture_now())
 	testing.expectf(
 		t,
 		res.status == .Bogus,
@@ -205,14 +178,14 @@ the client asked about, so neither wrong answer is on offer.
 */
 @(test)
 test_the_rcode_guard_is_not_escaped_by_asking_any :: proc(t: ^testing.T) {
-	v := make_validator(rc_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
-	wire := unhex(rc_fixture("example_a").wire)
-	honest := validate(v, "www.example.com.", .ANY, wire, rc_now())
+	wire := scenario_fixture(FIXTURES, "example_a")
+	honest := validate(v, "www.example.com.", .ANY, wire, fixture_now())
 	testing.expectf(t, honest.status == .Secure, "the capture should validate as ANY (%v, %q)", honest.status, honest.reason)
 
-	forged := validate(v, "www.example.com.", .ANY, with_rcode(wire, .NX_Domain), rc_now())
+	forged := validate(v, "www.example.com.", .ANY, with_rcode(wire, .NX_Domain), fixture_now())
 	testing.expectf(
 		t,
 		forged.status == .Bogus,
@@ -348,7 +321,7 @@ a CNAME anyone can copy out of an unsigned zone.
 */
 @(test)
 test_an_unsigned_record_does_not_reroute_a_forged_denial :: proc(t: ^testing.T) {
-	v := make_validator(rc_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	question := make([]dns.Question, 1, context.temp_allocator)
@@ -360,7 +333,7 @@ test_an_unsigned_record_does_not_reroute_a_forged_denial :: proc(t: ^testing.T) 
 	// Empty, this is already refused: `validate_denial` asks for a proof.
 	bare, _, berr := dns.encode_message(forged, context.temp_allocator)
 	testing.expect(t, berr == .None, "the bare forgery did not encode")
-	testing.expect_value(t, validate(v, "www.example.com.", .A, bare, rc_now()).status, Status.Bogus)
+	testing.expect_value(t, validate(v, "www.example.com.", .A, bare, fixture_now()).status, Status.Bogus)
 
 	// And one unsigned record from an unsigned zone must not change that.
 	// reddit.com has no DS in com in the captured set, so this is a record an
@@ -377,7 +350,7 @@ test_an_unsigned_record_does_not_reroute_a_forged_denial :: proc(t: ^testing.T) 
 	wire, _, err := dns.encode_message(forged, context.temp_allocator)
 	testing.expect(t, err == .None, "the spliced forgery did not encode")
 
-	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	res := validate(v, "www.example.com.", .A, wire, fixture_now())
 	testing.expectf(
 		t,
 		res.status == .Bogus,
@@ -401,10 +374,10 @@ in the answer section and a header saying the name is not there.
 */
 @(test)
 test_the_extended_rcode_is_not_a_way_past_the_guard :: proc(t: ^testing.T) {
-	v := make_validator(rc_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
-	flipped := with_rcode(unhex(rc_fixture("example_a").wire), .NX_Domain)
+	flipped := with_rcode(scenario_fixture(FIXTURES, "example_a"), .NX_Domain)
 	msg, derr := dns.decode_message(flipped, context.temp_allocator)
 	testing.expect(t, derr == .None, "the flipped capture did not decode")
 
@@ -421,7 +394,7 @@ test_the_extended_rcode_is_not_a_way_past_the_guard :: proc(t: ^testing.T) {
 	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.NX_Domain)
 	testing.expect(t, dns.rcode_of(decoded) != .NX_Domain, "the extended rcode should differ from the header's")
 
-	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	res := validate(v, "www.example.com.", .A, wire, fixture_now())
 	testing.expectf(
 		t,
 		res.status == .Indeterminate,
@@ -444,10 +417,10 @@ every answer this server would otherwise have checked.
 */
 @(test)
 test_a_forgery_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.T) {
-	v := make_validator(rc_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(unhex(rc_fixture("example_a").wire), context.temp_allocator)
+	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "example_a"), context.temp_allocator)
 	testing.expect(t, derr == .None, "the capture did not decode")
 
 	// Rewrite the address the client would use, leaving the signature alone.
@@ -469,7 +442,7 @@ test_a_forgery_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.T) {
 	// Plain, this is refused on the signature alone.
 	plain, _, perr := dns.encode_message(msg, context.temp_allocator)
 	testing.expect(t, perr == .None, "the forgery did not encode")
-	testing.expect_value(t, validate(v, "www.example.com.", .A, plain, rc_now()).status, Status.Bogus)
+	testing.expect_value(t, validate(v, "www.example.com.", .A, plain, fixture_now()).status, Status.Bogus)
 
 	// One bit in the OPT's top byte, and the header's own nibble left at 0.
 	extended, has_opt := with_extended_rcode(msg.additional)
@@ -483,7 +456,7 @@ test_a_forgery_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.T) {
 	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
 	testing.expect(t, u16(dns.rcode_of(decoded)) > 0xf, "the extended rcode should be set")
 
-	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	res := validate(v, "www.example.com.", .A, wire, fixture_now())
 	testing.expectf(
 		t,
 		res.status == .Indeterminate,
@@ -510,10 +483,10 @@ same bytes, so the sections cannot separate them and neither is forwarded.
 */
 @(test)
 test_a_forged_nodata_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.T) {
-	v := make_validator(rc_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
-	msg, derr := dns.decode_message(unhex(rc_fixture("example_a").wire), context.temp_allocator)
+	msg, derr := dns.decode_message(scenario_fixture(FIXTURES, "example_a"), context.temp_allocator)
 	testing.expect(t, derr == .None, "the capture did not decode")
 	// Everything the zone signed, taken out. What is left says the name has no
 	// A record, and says it for a name whose A record the attacker just deleted.
@@ -523,7 +496,7 @@ test_a_forged_nodata_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.
 	bare, _, berr := dns.encode_message(msg, context.temp_allocator)
 	testing.expect(t, berr == .None, "the stripped message did not encode")
 	// Refused on its own: `validate_denial` asks for a proof and finds none.
-	testing.expect_value(t, validate(v, "www.example.com.", .A, bare, rc_now()).status, Status.Bogus)
+	testing.expect_value(t, validate(v, "www.example.com.", .A, bare, fixture_now()).status, Status.Bogus)
 
 	extended, has_opt := with_extended_rcode(msg.additional)
 	testing.expect(t, has_opt, "the capture should carry an OPT record")
@@ -531,7 +504,7 @@ test_a_forged_nodata_does_not_hide_behind_an_extended_rcode :: proc(t: ^testing.
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	testing.expect(t, err == .None, "the re-encoded message did not encode")
 
-	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	res := validate(v, "www.example.com.", .A, wire, fixture_now())
 	testing.expectf(
 		t,
 		res.status != .Insecure,
@@ -565,7 +538,7 @@ test could pass while pinning the attack shape itself as acceptable.
 */
 @(test)
 test_badvers_is_refused_without_being_called_a_forgery :: proc(t: ^testing.T) {
-	v := make_validator(rc_query, nil, Options{})
+	v := scenario_validator(&FIXTURES)
 	defer destroy_validator(v)
 
 	question := make([]dns.Question, 1, context.temp_allocator)
@@ -585,9 +558,8 @@ test_badvers_is_refused_without_being_called_a_forgery :: proc(t: ^testing.T) {
 	testing.expect(t, derr == .None, "the BADVERS did not decode")
 	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.Bad_Vers)
 
-	res := validate(v, "www.example.com.", .A, wire, rc_now())
+	res := validate(v, "www.example.com.", .A, wire, fixture_now())
 	testing.expectf(t, res.status == .Indeterminate, "a BADVERS was called %v (%q)", res.status, res.reason)
-	testing.expect(t, res.status != .Bogus, "an EDNS version mismatch was reported as a forgery")
 	free_all(context.temp_allocator)
 }
 

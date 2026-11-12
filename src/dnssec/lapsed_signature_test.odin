@@ -1,10 +1,8 @@
 package dnssec
 
-import "core:mem"
 import "core:strings"
 import "core:testing"
 import "core:time"
-import "elodin:dns"
 
 /*
 Issue #360: a signature outside its validity window is reported by its window.
@@ -496,16 +494,6 @@ LP_FIXTURES := []Fixture{
 }
 
 @(private = "file")
-lp_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	for f in LP_FIXTURES {
-		if f.type == type && dns.name_equal_fold(f.name, name) {
-			return decode_hex(f.wire, allocator)
-		}
-	}
-	return nil, false
-}
-
-@(private = "file")
 lp_validate :: proc(key, qname: string, now := i64(FIXTURE_TIME)) -> Result {
 	return lp_validate_with(key, qname, "", "", now)
 }
@@ -514,25 +502,22 @@ lp_validate :: proc(key, qname: string, now := i64(FIXTURE_TIME)) -> Result {
 // a test alters one signature without a fixture of its own.
 @(private = "file")
 lp_validate_with :: proc(key, qname, old, new: string, now := i64(FIXTURE_TIME)) -> Result {
-	anchor, parsed := parse_trust_anchor(LP_ANCHOR, context.temp_allocator)
-	if !parsed {
-		return {status = .Indeterminate, reason = "the anchor did not parse"}
-	}
-	anchors := make([]Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	v := make_validator(lp_query, nil, Options{anchors = anchors})
+	v := scenario_validator(&LP_FIXTURES, LP_ANCHOR)
 	defer destroy_validator(v)
-	for f in LP_FIXTURES {
-		if f.key == key {
-			hex := f.wire
-			if old != "" {
-				hex, _ = strings.replace(hex, old, new, 1, context.temp_allocator)
-			}
-			wire, _ := decode_hex(hex, context.temp_allocator)
-			return validate(v, qname, .A, wire, time.unix(now, 0))
+	hex := fixture(key, LP_FIXTURES).wire
+	if old != "" {
+		// A miss would validate the untouched message, and the test would be
+		// judging a fixture it never altered.
+		if !strings.contains(hex, old) {
+			panic("the fixture does not hold the text to replace")
 		}
+		hex, _ = strings.replace(hex, old, new, 1, context.temp_allocator)
 	}
-	return {status = .Indeterminate, reason = "no such fixture"}
+	wire, ok := decode_hex(hex, context.temp_allocator)
+	if !ok {
+		panic("the altered fixture is not hex")
+	}
+	return validate(v, qname, .A, wire, time.unix(now, 0))
 }
 
 @(test)
@@ -663,17 +648,17 @@ test_an_inverted_window_is_no_lapse :: proc(t: ^testing.T) {
 	key := Dnskey {
 		flags     = DNSKEY_FLAG_ZONE,
 		protocol  = 3,
-		algorithm = 15,
+		algorithm = ALG_ED25519,
 		tag       = 7,
 	}
 	keys := []Dnskey{key}
 	lapsed: Lapsed
 	// Inside the skew, ending before it starts.
-	note_lapsed(&lapsed, Rrsig{algorithm = 15, key_tag = 7, inception = NOW + 100, expiration = NOW + 50}, keys, NOW)
+	note_lapsed(&lapsed, Rrsig{algorithm = ALG_ED25519, key_tag = 7, inception = NOW + 100, expiration = NOW + 50}, keys, NOW)
 	// Wholly in the past, ending before it starts.
-	note_lapsed(&lapsed, Rrsig{algorithm = 15, key_tag = 7, inception = NOW - 10, expiration = NOW - 20}, keys, NOW)
+	note_lapsed(&lapsed, Rrsig{algorithm = ALG_ED25519, key_tag = 7, inception = NOW - 10, expiration = NOW - 20}, keys, NOW)
 	testing.expectf(t, lapsed.window == .Current, "an inverted window should be no lapse, got %v", lapsed.window)
-	note_lapsed(&lapsed, Rrsig{algorithm = 15, key_tag = 7, inception = NOW - 20, expiration = NOW - 10}, keys, NOW)
+	note_lapsed(&lapsed, Rrsig{algorithm = ALG_ED25519, key_tag = 7, inception = NOW - 20, expiration = NOW - 10}, keys, NOW)
 	testing.expectf(t, lapsed == Lapsed{window = .Expired, at = NOW - 10}, "the control should lapse, got %v", lapsed)
 }
 
@@ -689,7 +674,7 @@ test_a_denial_with_a_failed_current_signature_is_not_a_lapse :: proc(t: ^testing
 	result := lp_validate_with("lp_nope_nxdomain", "nope.lt.", "8bde0c3110e6b0a4", "8bde0c3110e6b0a5")
 	testing.expectf(
 		t,
-		result.status == .Bogus && result.lapsed.window == .Current && result.reason == "no denial of existence",
+		result.status == .Bogus && result.lapsed.window == .Current && result.reason == NO_DENIAL,
 		"a proof missing a set that failed in its window is a forgery, got %v %v %q",
 		result.status,
 		result.lapsed.window,
@@ -705,17 +690,17 @@ test_a_denial_with_a_failed_current_signature_is_not_a_lapse :: proc(t: ^testing
 test_a_lapse_names_the_instant_nearest_now :: proc(t: ^testing.T) {
 	NOW :: u32(1_000_000)
 	SKEW :: u32(SIG_INCEPTION_SKEW)
-	keys := []Dnskey{{flags = DNSKEY_FLAG_ZONE, protocol = 3, algorithm = 15, tag = 7}}
+	keys := []Dnskey{{flags = DNSKEY_FLAG_ZONE, protocol = 3, algorithm = ALG_ED25519, tag = 7}}
 	expired: Lapsed
-	note_lapsed(&expired, Rrsig{algorithm = 15, key_tag = 7, inception = NOW - 90, expiration = NOW - 50}, keys, NOW)
-	note_lapsed(&expired, Rrsig{algorithm = 15, key_tag = 7, inception = NOW - 90, expiration = NOW - 10}, keys, NOW)
-	note_lapsed(&expired, Rrsig{algorithm = 15, key_tag = 7, inception = NOW - 90, expiration = NOW - 30}, keys, NOW)
+	note_lapsed(&expired, Rrsig{algorithm = ALG_ED25519, key_tag = 7, inception = NOW - 90, expiration = NOW - 50}, keys, NOW)
+	note_lapsed(&expired, Rrsig{algorithm = ALG_ED25519, key_tag = 7, inception = NOW - 90, expiration = NOW - 10}, keys, NOW)
+	note_lapsed(&expired, Rrsig{algorithm = ALG_ED25519, key_tag = 7, inception = NOW - 90, expiration = NOW - 30}, keys, NOW)
 	testing.expectf(t, expired == Lapsed{window = .Expired, at = NOW - 10}, "the latest expiration should be named, got %v", expired)
 
 	early: Lapsed
-	note_lapsed(&early, Rrsig{algorithm = 15, key_tag = 7, inception = NOW + SKEW + 50, expiration = NOW + 900_000}, keys, NOW)
-	note_lapsed(&early, Rrsig{algorithm = 15, key_tag = 7, inception = NOW + SKEW + 10, expiration = NOW + 900_000}, keys, NOW)
-	note_lapsed(&early, Rrsig{algorithm = 15, key_tag = 7, inception = NOW + SKEW + 30, expiration = NOW + 900_000}, keys, NOW)
+	note_lapsed(&early, Rrsig{algorithm = ALG_ED25519, key_tag = 7, inception = NOW + SKEW + 50, expiration = NOW + 900_000}, keys, NOW)
+	note_lapsed(&early, Rrsig{algorithm = ALG_ED25519, key_tag = 7, inception = NOW + SKEW + 10, expiration = NOW + 900_000}, keys, NOW)
+	note_lapsed(&early, Rrsig{algorithm = ALG_ED25519, key_tag = 7, inception = NOW + SKEW + 30, expiration = NOW + 900_000}, keys, NOW)
 	testing.expectf(t, early == Lapsed{window = .Not_Yet_Valid, at = NOW + SKEW + 10}, "the earliest inception should be named, got %v", early)
 
 	across := Lapsed{window = .Expired, at = NOW - 50}

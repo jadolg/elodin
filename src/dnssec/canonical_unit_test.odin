@@ -63,6 +63,12 @@ expect_hex :: proc(t: ^testing.T, got: []u8, want_hex: string, label: string) {
 	)
 }
 
+// The signing input for the golden A RRset below, and what every vector in
+// `crypto_unit_test.odin` was signed over.
+SIGNED_DATA ::
+	"00010d0300000e106a000000690000001234076578616d706c6503636f6d0003777777076578616d706c6503636f6d00" +
+	"0001000100000e100004c000020103777777076578616d706c6503636f6d000001000100000e100004c0000202"
+
 @(test)
 test_signing_input_matches_a_golden_a_rrset :: proc(t: ^testing.T) {
 	/*
@@ -76,8 +82,7 @@ test_signing_input_matches_a_golden_a_rrset :: proc(t: ^testing.T) {
 	expect_hex(
 		t,
 		data,
-		"00010d0300000e106a000000690000001234076578616d706c6503636f6d0003777777076578616d706c6503636f6d00" +
-		"0001000100000e100004c000020103777777076578616d706c6503636f6d000001000100000e100004c0000202",
+		SIGNED_DATA,
 		"the A RRset",
 	)
 	free_all(context.temp_allocator)

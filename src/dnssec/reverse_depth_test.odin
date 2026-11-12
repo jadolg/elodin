@@ -1,10 +1,8 @@
 package dnssec
 
 import "core:fmt"
-import "core:mem"
 import "core:strings"
 import "core:testing"
-import "core:time"
 import "elodin:dns"
 
 /*
@@ -30,37 +28,58 @@ itself for the label count - a name is 255 octets and a label costs two, so
 nothing can carry more than 127.
 */
 
-// The reverse name of 2001:4860:4860::8888, from the issue: thirty-two nibble
-// labels under `ip6.arpa.`
-@(private = "file")
-IP6_PTR :: "8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa."
+// The upstream is a `Counting_Upstream` with no fixtures: it answers nothing and
+// counts what it was asked. A walk that refused the name on its label count
+// would ask it nothing, deciding against the name rather than against anything
+// the chain said.
 
-// An upstream that answers nothing and counts what it was asked. A walk that
-// refused the name on its label count would ask it nothing, deciding against
-// the name rather than against anything the chain said.
+// The eleven empty non-terminals between `ip6.arpa.` and `R6_APEX`.
 @(private = "file")
-Counting_Upstream :: struct {
-	calls: int,
-	first: string,
+ip6_non_cuts :: proc() -> []string {
+	names := make([]string, 11, context.temp_allocator)
+	for &name, i in names {
+		name = name_drop_labels(R6_QNAME, 34 - 2 - (i + 1))
+	}
+	return names
 }
 
+// 127 labels of one character: the longest name the wire format carries.
 @(private = "file")
-counting_query :: proc(
-	ctx: rawptr,
-	name: string,
-	type: dns.Type,
-	allocator: mem.Allocator,
-	_: ^time.Tick,
-) -> (
-	wire: []u8,
-	ok: bool,
-) {
-	u := cast(^Counting_Upstream)ctx
-	u.calls += 1
-	if u.first == "" {
-		u.first = strings.clone(name, context.allocator)
+longest_name :: proc() -> string {
+	b := strings.builder_make(context.temp_allocator)
+	for _ in 0 ..< 127 {
+		strings.write_string(&b, "a.")
 	}
-	return nil, false
+	return strings.to_string(b)
+}
+
+// Every suffix of `longest_name()` below the root, the name itself first: the
+// names the longest walk has to rule out.
+@(private = "file")
+longest_suffixes :: proc() -> []string {
+	longest := longest_name()
+	names := make([]string, 127, context.temp_allocator)
+	for &name, i in names {
+		name = name_drop_labels(longest, i)
+	}
+	return names
+}
+
+/*
+The tests below seed the non-cut table with seed 0 and remember a run of names
+in it, assuming each name keeps its own slot: a collision would evict one
+mid-walk and change the verdict (issue #362). This holds them to it, so a seed
+or name change that collides fails here rather than flaking there.
+*/
+@(test)
+test_reverse_depth_names_do_not_collide_in_non_cut_table :: proc(t: ^testing.T) {
+	v := make_validator(counting_query, nil, Options{})
+	defer destroy_validator(v)
+	v.non_cut_seed = 0
+
+	expect_distinct_non_cut_slots(t, v, ip6_non_cuts())
+	expect_distinct_non_cut_slots(t, v, longest_suffixes())
+	free_all(context.temp_allocator)
 }
 
 /*
@@ -74,10 +93,10 @@ question was asked at all.
 */
 @(test)
 test_an_ipv6_reverse_name_reaches_the_chain :: proc(t: ^testing.T) {
-	testing.expect_value(t, label_count(IP6_PTR), 34)
+	testing.expect_value(t, label_count(R6_QNAME), 34)
 	testing.expect(
 		t,
-		label_count(IP6_PTR) > MAX_CHAIN_DEPTH,
+		label_count(R6_QNAME) > MAX_CHAIN_DEPTH,
 		"this test is only worth anything while a reverse name has more labels than the bound",
 	)
 
@@ -85,19 +104,18 @@ test_an_ipv6_reverse_name_reaches_the_chain :: proc(t: ^testing.T) {
 	v := make_validator(counting_query, &up, Options{})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
 	budget := query_budget(v)
-	zone_trust(v, &budget, IP6_PTR, now, context.temp_allocator)
+	zone_trust(v, &budget, R6_QNAME, now, context.temp_allocator)
 	testing.expectf(
 		t,
 		up.calls > 0,
 		"the walk refused %q without asking anybody about it",
-		IP6_PTR,
+		R6_QNAME,
 	)
 	testing.expect_value(t, up.first, "arpa.")
-	delete(up.first)
 	free_all(context.temp_allocator)
 }
 
@@ -114,38 +132,34 @@ right zone when it stops. A walk bounded on labels would never leave `.`.
 test_an_ipv6_reverse_walk_settles_on_the_deepest_cached_zone :: proc(t: ^testing.T) {
 	up := Counting_Upstream{}
 	v := make_validator(counting_query, &up, Options{})
-	// A fixed seed makes the non-cut hash table deterministic so the 11
-	// non-cut names between ip6.arpa. and the apex do not collide.
-	// Modulo 1024 with seed 0, they map to slots:
-	//   589, 483, 669, 884, 674, 568, 372, 806, 544, 874, 294.
-	// All 11 slots are distinct.
+	// A fixed seed makes the non-cut table deterministic, and with it the 11
+	// names below are held to distinct slots by the test above.
 	v.non_cut_seed = 0
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	keys := []Dnskey{}
 	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
 	cache_put(v, "arpa.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
 	cache_put(v, "ip6.arpa.", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
 	// Every empty non-terminal between `ip6.arpa.` and the apex is a name the
 	// walk has to rule out, and a cached non-cut is how it does that for free.
-	for i in 1 ..= 11 {
-		non_cut_remember(v, name_drop_labels(IP6_PTR, 34 - 2 - i), MAX_ZONE_TTL, fixture_moment(now))
+	for name in ip6_non_cuts() {
+		non_cut_remember(v, name, MAX_ZONE_TTL, fixture_moment(now))
 	}
-	apex := name_drop_labels(IP6_PTR, 34 - 14)
-	testing.expect_value(t, apex, "0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa.")
+	apex := name_drop_labels(R6_QNAME, 34 - 14)
+	testing.expect_value(t, apex, R6_APEX)
 	cache_put(v, apex, .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
 
 	budget := query_budget(v)
-	status, _, established := zone_trust(v, &budget, IP6_PTR, now, context.temp_allocator)
+	status, _, established := zone_trust(v, &budget, R6_QNAME, now, context.temp_allocator)
 	testing.expect_value(t, status, Status.Indeterminate)
 	testing.expectf(
 		t,
-		established == apex || established == name_drop_labels(IP6_PTR, 34 - 15),
+		established == apex || established == name_drop_labels(R6_QNAME, 34 - 15),
 		"the walk stopped at %q rather than below the /32 it had keys for",
 		established,
 	)
-	delete(up.first)
 	free_all(context.temp_allocator)
 }
 
@@ -164,7 +178,7 @@ test_a_hierarchy_deeper_than_the_bound_is_still_refused :: proc(t: ^testing.T) {
 	v := make_validator(counting_query, &up, Options{})
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	keys := []Dnskey{}
 	cache_put(v, ".", .Secure, keys, MAX_ZONE_TTL, fixture_moment(now))
 
@@ -188,7 +202,6 @@ test_a_hierarchy_deeper_than_the_bound_is_still_refused :: proc(t: ^testing.T) {
 	ok_status, _, established := zone_trust(v, &budget, shorter, now, context.temp_allocator)
 	testing.expect_value(t, ok_status, Status.Secure)
 	testing.expect_value(t, established, shorter)
-	delete(up.first)
 	free_all(context.temp_allocator)
 }
 
@@ -210,25 +223,21 @@ measures the walk rather than an allowance running out in front of it.
 test_the_longest_name_the_wire_allows_is_walked_to_the_end :: proc(t: ^testing.T) {
 	up := Counting_Upstream{}
 	v := make_validator(counting_query, &up, Options{})
-	// A fixed seed prevents random collisions among the 127 labels;
-	// with seed 0, all 127 suffixes map to distinct slots modulo 1024.
+	// A fixed seed makes the non-cut table deterministic, and with it the 127
+	// suffixes below are held to distinct slots by the test above.
 	v.non_cut_seed = 0
 	defer destroy_validator(v)
 
-	now := time.unix(FIXTURE_TIME, 0)
+	now := fixture_now()
 	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
-	b := strings.builder_make(context.temp_allocator)
-	for _ in 0 ..< 127 {
-		strings.write_string(&b, "a.")
-	}
-	longest := strings.to_string(b)
+	longest := longest_name()
 	testing.expect_value(t, label_count(longest), 127)
 	// 127 labels of one character, plus the root: the 255 octets a name gets.
 	testing.expect_value(t, len(longest) + 1, dns.MAX_NAME_WIRE)
 
-	for i in 0 ..< 127 {
-		non_cut_remember(v, name_drop_labels(longest, i), MAX_ZONE_TTL, fixture_moment(now))
+	for name in longest_suffixes() {
+		non_cut_remember(v, name, MAX_ZONE_TTL, fixture_moment(now))
 	}
 
 	budget := query_budget(v)
@@ -236,6 +245,5 @@ test_the_longest_name_the_wire_allows_is_walked_to_the_end :: proc(t: ^testing.T
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, established, ".")
 	testing.expectf(t, up.calls == 0, "every label was remembered, so nothing should have been asked; %d were", up.calls)
-	delete(up.first)
 	free_all(context.temp_allocator)
 }
