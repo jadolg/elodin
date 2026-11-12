@@ -52,28 +52,6 @@ authority_soa_owner :: proc(r: ^Runner, wire: []u8) -> string {
 	return ""
 }
 
-@(private = "file")
-special_use_config :: proc(udp_port, upstream_port: int, extra: string) -> string {
-	return fmt.tprintf(
-		`log: {{ level: debug, queries: true }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 2s
-  attempts: 1
-  servers:
-    - "127.0.0.1:%d"
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-dnssec: {{ enabled: false }}
-%s`,
-		udp_port,
-		upstream_port,
-		extra,
-	)
-}
-
 run_special_use_cases :: proc(r: ^Runner) {
 	run_special_use_answered_cases(r)
 	run_special_use_default_forwarding_cases(r)
@@ -91,11 +69,8 @@ rewrote the response would pass every assertion but the last.
 */
 @(private = "file")
 run_special_use_answered_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("special-use-answered", upstream_port)
-	mock_synth_all(mock, {198, 51, 100, 7})
-	if !mock_start(mock) {
-		skip_case(r, "special_use: reserved names are answered here", "cannot start the mock")
+	mock, upstream_port, mock_ok := synth_mock(r, "special-use-answered", "special_use: reserved names are answered here", {198, 51, 100, 7})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -103,10 +78,9 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 	udp_port := next_port(r)
 	srv, ok := start_server(
 		r,
-		Server_Options{config = special_use_config(udp_port, upstream_port, ""), udp_port = udp_port},
+		Server_Options{config = logged_config(udp_port, upstream_port), udp_port = udp_port},
 	)
 	if !ok {
-		skip_case(r, "special_use: reserved names are answered here", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -119,36 +93,25 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 	{
 		v4 := query_udp(udp_port, build_query("localhost.", u16(dns.Type.A)))
 		if check(r, v4.ok, "no response for localhost. A") {
-			addrs := answer_addresses(r, v4.wire)
-			if check(r, len(addrs) == 1, "localhost. A returned %d addresses", len(addrs)) {
-				check_eq_str(r, addrs[0], "127.0.0.1", "localhost. A")
-			}
+			check_one_address(r, v4.wire, "127.0.0.1", "localhost. A")
 		}
 		v6 := query_udp(udp_port, build_query("localhost.", u16(dns.Type.AAAA)))
 		if check(r, v6.ok, "no response for localhost. AAAA") {
-			addrs := answer_addresses(r, v6.wire)
-			if check(r, len(addrs) == 1, "localhost. AAAA returned %d addresses", len(addrs)) {
-				// Full form: `answer_addresses` prints every group rather than
-				// compressing the run of zeros.
-				check_eq_str(r, addrs[0], "0000:0000:0000:0000:0000:0000:0000:0001", "localhost. AAAA")
-			}
+			// Full form: `answer_addresses` prints every group rather than
+			// compressing the run of zeros.
+			check_one_address(r, v6.wire, "0000:0000:0000:0000:0000:0000:0000:0001", "localhost. AAAA")
 		}
 		// The reservation is of the subtree, not of the one label.
 		sub := query_udp(udp_port, build_query("dev.localhost.", u16(dns.Type.A)))
 		if check(r, sub.ok, "no response for dev.localhost.") {
-			addrs := answer_addresses(r, sub.wire)
-			if check(r, len(addrs) == 1, "dev.localhost. returned %d addresses", len(addrs)) {
-				check_eq_str(r, addrs[0], "127.0.0.1", "dev.localhost. A")
-			}
+			check_one_address(r, sub.wire, "127.0.0.1", "dev.localhost. A")
 		}
 	}
 	end_case(r)
 
 	start_case(r, "special_use: localhost. is NODATA for a type it has none of")
 	{
-		res := query_udp(udp_port, build_query("localhost.", u16(dns.Type.MX)))
-		if check(r, res.ok, "no response for localhost. MX") {
-			h := parse_header(r, res.wire)
+		if res, h, answered := ask(r, udp_port, "localhost.", u16(dns.Type.MX), "no response for localhost. MX"); answered {
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_int(r, h.ancount, 0, "answer count")
 			// The name exists, so the SOA is its own rather than a parent's.
@@ -168,9 +131,7 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 			{name = "nothing.invalid.", apex = "invalid."},
 		}
 		for c in cases {
-			res := query_udp(udp_port, build_query(c.name, u16(dns.Type.A)))
-			if check(r, res.ok, "no response for %s", c.name) {
-				h := parse_header(r, res.wire)
+			if res, h, answered := ask(r, udp_port, c.name, u16(dns.Type.A), fmt.tprintf("no response for %s", c.name)); answered {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "%s: rcode %d, want NXDOMAIN", c.name, h.rcode)
 				check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
 				// Owned by the apex, so a downstream caches the negative for the
@@ -195,9 +156,7 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 			{name = "1.1.64.100.in-addr.arpa.", apex = "64.100.in-addr.arpa."},
 		}
 		for c in cases {
-			res := query_udp(udp_port, build_query(c.name, u16(dns.Type.PTR)))
-			if check(r, res.ok, "no response for %s", c.name) {
-				h := parse_header(r, res.wire)
+			if res, h, answered := ask(r, udp_port, c.name, u16(dns.Type.PTR), fmt.tprintf("no response for %s", c.name)); answered {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "%s: rcode %d, want NXDOMAIN", c.name, h.rcode)
 				check_eq_int(r, h.ancount, 0, "answers handed to the client")
 				check_eq_str(r, authority_soa_owner(r, res.wire), c.apex, "SOA owner")
@@ -225,11 +184,8 @@ could not have come from the table.
 */
 @(private = "file")
 run_special_use_default_forwarding_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("special-use-default", upstream_port)
-	mock_synth_all(mock, {198, 51, 100, 7})
-	if !mock_start(mock) {
-		skip_case(r, "special_use: the defaults still forward", "cannot start the mock")
+	mock, upstream_port, mock_ok := synth_mock(r, "special-use-default", "special_use: the defaults still forward", {198, 51, 100, 7})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -237,10 +193,9 @@ run_special_use_default_forwarding_cases :: proc(r: ^Runner) {
 	udp_port := next_port(r)
 	srv, ok := start_server(
 		r,
-		Server_Options{config = special_use_config(udp_port, upstream_port, ""), udp_port = udp_port},
+		Server_Options{config = logged_config(udp_port, upstream_port), udp_port = udp_port},
 	)
 	if !ok {
-		skip_case(r, "special_use: the defaults still forward", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -248,14 +203,9 @@ run_special_use_default_forwarding_cases :: proc(r: ^Runner) {
 	start_case(r, "special_use: .local, .test, home.arpa and example.com are forwarded by default")
 	{
 		for name in ([]string{"printer.local.", "internal.test.", "www.example.com.", "printer.home.arpa."}) {
-			res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
-			if check(r, res.ok, "no response for %s", name) {
-				h := parse_header(r, res.wire)
+			if res, h, answered := ask(r, udp_port, name, u16(dns.Type.A), fmt.tprintf("no response for %s", name)); answered {
 				check(r, h.rcode == int(dns.Rcode.No_Error), "%s: rcode %d, want NOERROR", name, h.rcode)
-				addrs := answer_addresses(r, res.wire)
-				if check(r, len(addrs) == 1, "%s returned %d addresses", name, len(addrs)) {
-					check_eq_str(r, addrs[0], "198.51.100.7", "forwarded address")
-				}
+				check_one_address(r, res.wire, "198.51.100.7", "forwarded address")
 			}
 		}
 	}
@@ -275,18 +225,14 @@ half of any of them.
 run_special_use_key_cases :: proc(r: ^Runner) {
 	// --- local: true answers .local, and leaves .test forwarded ---
 	{
-		upstream_port := next_port(r)
-		mock := mock_make("special-use-local", upstream_port)
-		mock_synth_all(mock, {198, 51, 100, 7})
-		if !mock_start(mock) {
-			skip_case(r, "special_use: local: true", "cannot start the mock")
-		} else {
+		mock, upstream_port, mock_ok := synth_mock(r, "special-use-local", "special_use: local: true", {198, 51, 100, 7})
+		if mock_ok {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = special_use_config(udp_port, upstream_port, "special_use: { local: true }\n"),
+					config = logged_config(udp_port, upstream_port, "special_use: { local: true }\n"),
 					udp_port = udp_port,
 				},
 			)
@@ -294,42 +240,31 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 				defer stop_server(&srv)
 				start_case(r, "special_use: local: true answers .local and only .local")
 				{
-					res := query_udp(udp_port, build_query("printer.local.", u16(dns.Type.A)))
-					if check(r, res.ok, "no response for printer.local.") {
-						h := parse_header(r, res.wire)
+					if res, h, answered := ask(r, udp_port, "printer.local.", u16(dns.Type.A), "no response for printer.local."); answered {
 						check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
 						check_eq_str(r, authority_soa_owner(r, res.wire), "local.", "SOA owner")
 					}
 					// The other key is untouched, so this one is not the whole table.
 					other := query_udp(udp_port, build_query("internal.test.", u16(dns.Type.A)))
 					if check(r, other.ok, "no response for internal.test.") {
-						addrs := answer_addresses(r, other.wire)
-						if check(r, len(addrs) == 1, "internal.test. returned %d addresses", len(addrs)) {
-							check_eq_str(r, addrs[0], "198.51.100.7", "forwarded address")
-						}
+						check_one_address(r, other.wire, "198.51.100.7", "forwarded address")
 					}
 				}
 				end_case(r)
-			} else {
-				skip_case(r, "special_use: local: true", "server did not start")
 			}
 		}
 	}
 
 	// --- home_arpa: true serves the empty zone, and still fetches the apex DS ---
 	{
-		upstream_port := next_port(r)
-		mock := mock_make("special-use-home-arpa", upstream_port)
-		mock_synth_all(mock, {198, 51, 100, 7})
-		if !mock_start(mock) {
-			skip_case(r, "special_use: home_arpa: true", "cannot start the mock")
-		} else {
+		mock, upstream_port, mock_ok := synth_mock(r, "special-use-home-arpa", "special_use: home_arpa: true", {198, 51, 100, 7})
+		if mock_ok {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = special_use_config(udp_port, upstream_port, "special_use: { home_arpa: true }\n"),
+					config = logged_config(udp_port, upstream_port, "special_use: { home_arpa: true }\n"),
 					udp_port = udp_port,
 				},
 			)
@@ -338,9 +273,7 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 				start_case(r, "special_use: home_arpa: true serves home.arpa as an empty zone")
 				{
 					// Inside the zone: a name error, cached against the apex.
-					res := query_udp(udp_port, build_query("printer.home.arpa.", u16(dns.Type.A)))
-					if check(r, res.ok, "no response for printer.home.arpa.") {
-						h := parse_header(r, res.wire)
+					if res, h, answered := ask(r, udp_port, "printer.home.arpa.", u16(dns.Type.A), "no response for printer.home.arpa."); answered {
 						check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
 						check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
 						check_eq_str(r, authority_soa_owner(r, res.wire), "home.arpa.", "SOA owner")
@@ -349,9 +282,7 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 					// a signed delegation for it, so a client can prove the name
 					// exists - RFC 8375 section 4 item 4.B, by way of RFC 6303
 					// section 3.
-					apex := query_udp(udp_port, build_query("home.arpa.", u16(dns.Type.A)))
-					if check(r, apex.ok, "no response for home.arpa.") {
-						h := parse_header(r, apex.wire)
+					if apex, h, answered := ask(r, udp_port, "home.arpa.", u16(dns.Type.A), "no response for home.arpa."); answered {
 						check(r, h.rcode == int(dns.Rcode.No_Error), "apex rcode %d, want NOERROR", h.rcode)
 						check_eq_int(r, len(answer_addresses(r, apex.wire)), 0, "addresses at the apex")
 						check_eq_str(r, authority_soa_owner(r, apex.wire), "home.arpa.", "apex SOA owner")
@@ -359,10 +290,7 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 					// The other key is untouched, so this one is not the whole table.
 					other := query_udp(udp_port, build_query("internal.test.", u16(dns.Type.A)))
 					if check(r, other.ok, "no response for internal.test.") {
-						addrs := answer_addresses(r, other.wire)
-						if check(r, len(addrs) == 1, "internal.test. returned %d addresses", len(addrs)) {
-							check_eq_str(r, addrs[0], "198.51.100.7", "forwarded address")
-						}
+						check_one_address(r, other.wire, "198.51.100.7", "forwarded address")
 					}
 				}
 				end_case(r)
@@ -398,26 +326,20 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 					}
 				}
 				end_case(r)
-			} else {
-				skip_case(r, "special_use: home_arpa: true", "server did not start")
 			}
 		}
 	}
 
 	// --- onion: false forwards .onion, and keeps localhost. answered here ---
 	{
-		upstream_port := next_port(r)
-		mock := mock_make("special-use-onion", upstream_port)
-		mock_synth_all(mock, {198, 51, 100, 7})
-		if !mock_start(mock) {
-			skip_case(r, "special_use: onion: false", "cannot start the mock")
-		} else {
+		mock, upstream_port, mock_ok := synth_mock(r, "special-use-onion", "special_use: onion: false", {198, 51, 100, 7})
+		if mock_ok {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = special_use_config(udp_port, upstream_port, "special_use: { onion: false }\n"),
+					config = logged_config(udp_port, upstream_port, "special_use: { onion: false }\n"),
 					udp_port = udp_port,
 				},
 			)
@@ -425,29 +347,19 @@ run_special_use_key_cases :: proc(r: ^Runner) {
 				defer stop_server(&srv)
 				start_case(r, "special_use: onion: false hands .onion to the upstream, and nothing else with it")
 				{
-					res := query_udp(udp_port, build_query("duskgytldkxiuqc6otgh4.onion.", u16(dns.Type.A)))
-					if check(r, res.ok, "no response for the .onion name") {
-						h := parse_header(r, res.wire)
+					if res, h, answered := ask(r, udp_port, "duskgytldkxiuqc6otgh4.onion.", u16(dns.Type.A), "no response for the .onion name"); answered {
 						check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
-						addrs := answer_addresses(r, res.wire)
-						if check(r, len(addrs) == 1, "the .onion name returned %d addresses", len(addrs)) {
-							check_eq_str(r, addrs[0], "198.51.100.7", "the Tor-aware upstream's answer")
-						}
+						check_one_address(r, res.wire, "198.51.100.7", "the Tor-aware upstream's answer")
 					}
 					// The rest of the table is still on: this is the key that
 					// exists so an operator need not reach for `enabled: false`.
 					local := query_udp(udp_port, build_query("localhost.", u16(dns.Type.A)))
 					if check(r, local.ok, "no response for localhost.") {
-						addrs := answer_addresses(r, local.wire)
-						if check(r, len(addrs) == 1, "localhost. returned %d addresses", len(addrs)) {
-							check_eq_str(r, addrs[0], "127.0.0.1", "localhost. A")
-						}
+						check_one_address(r, local.wire, "127.0.0.1", "localhost. A")
 					}
 					check(r, log_contains(&srv, "special_use.onion is off"), "the startup warning was not logged")
 				}
 				end_case(r)
-			} else {
-				skip_case(r, "special_use: onion: false", "server did not start")
 			}
 		}
 	}
@@ -462,11 +374,8 @@ a known number of queries rather than merely for being present.
 */
 @(private = "file")
 run_special_use_counter_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("special-use-counter", upstream_port)
-	mock_synth_all(mock, {198, 51, 100, 7})
-	if !mock_start(mock) {
-		skip_case(r, "special_use: the counter", "cannot start the mock")
+	mock, upstream_port, mock_ok := synth_mock(r, "special-use-counter", "special_use: the counter", {198, 51, 100, 7})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -476,7 +385,7 @@ run_special_use_counter_cases :: proc(r: ^Runner) {
 	srv, ok := start_server(
 		r,
 		Server_Options {
-			config = special_use_config(
+			config = logged_config(
 				udp_port,
 				upstream_port,
 				fmt.tprintf("metrics: {{ enabled: true, address: \"127.0.0.1\", port: %d }}\n", metrics_port),
@@ -485,7 +394,6 @@ run_special_use_counter_cases :: proc(r: ^Runner) {
 		},
 	)
 	if !ok {
-		skip_case(r, "special_use: the counter", "server did not start")
 		return
 	}
 	defer stop_server(&srv)

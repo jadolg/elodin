@@ -106,8 +106,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	big := big_txt_answer("large.example.", 4, context.allocator)
 	defer delete(big)
 	mock_delay(mock, "large.example.", u16(dns.Type.TXT), time.Second, big)
-	if !mock_start(mock) {
-		skip_case(r, "rate limit", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "rate limit") {
 		return
 	}
 	defer mock_stop(mock)
@@ -130,7 +129,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			r,
 			Server_Options{config = config_rate_limit(udp_port, upstream_port, "enabled: false"), udp_port = udp_port},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			res := udp_flood(udp_port, query, QUERIES)
 			check(
@@ -159,7 +158,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				udp_port = udp_port,
 			},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			res := udp_flood(udp_port, query, QUERIES)
 
@@ -241,7 +240,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				udp_port = udp_port,
 			},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			limited := udp_flood(udp_port, query, QUERIES)
 
@@ -253,7 +252,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 					udp_port = port2,
 				},
 			)
-			if check(r, ok2, "the unlimited server did not start") {
+			if ok2 {
 				defer stop_server(&srv2)
 				unlimited := udp_flood(port2, query, QUERIES)
 				check(
@@ -326,7 +325,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				udp_port = sized_port,
 			},
 		)
-		if check(r, sok, "the server charging by size did not start") {
+		if sok {
 			defer stop_server(&sized)
 			/*
 			The burst, which both servers send, and then the flood that
@@ -357,7 +356,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 					udp_port = counted_port,
 				},
 			)
-			if check(r, cok, "the server counting datagrams did not start") {
+			if cok {
 				defer stop_server(&counted)
 				_ = udp_flood(counted_port, big_query, QUERIES)
 				by_count := udp_flood(counted_port, big_query, QUERIES)
@@ -406,7 +405,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				udp_port = small_port,
 			},
 		)
-		if check(r, mok, "the server answering small queries did not start") {
+		if mok {
 			defer stop_server(&small)
 			// The same A query the cases above flood with, whose answer is
 			// well inside the estimate.
@@ -454,7 +453,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				udp_port = inert_port,
 			},
 		)
-		if check(r, iok, "the server with an unreachable estimate did not start") {
+		if iok {
 			defer stop_server(&inert)
 			// The figures are in the needle: a case looking for the setting's
 			// name alone would pass on the error the loader writes for a figure
@@ -501,7 +500,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				tcp_port = tcp_port,
 			},
 		)
-		if check(r, ok, "the unlimited server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			unlimited := tcp_pipeline_flood(tcp_port, query, QUERIES)
 			check(
@@ -528,7 +527,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				tcp_port = limited_tcp_port,
 			},
 		)
-		if check(r, ok2, "the limited server did not start") {
+		if ok2 {
 			defer stop_server(&srv2)
 			limited := tcp_pipeline_flood(limited_tcp_port, query, QUERIES)
 
@@ -616,7 +615,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				// connection, and this case cannot spare the arrival.
 			},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 
 			// A short drain, so the query below arrives while a shared budget would
@@ -679,7 +678,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			},
 		)
 		floor := 0
-		if check(r, lok, "the server on the default alone did not start") {
+		if lok {
 			defer stop_server(&limited)
 			res := udp_flood(udp_port, query, QUERIES)
 			floor = res.answered
@@ -712,7 +711,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				udp_port = override_port,
 			},
 		)
-		if check(r, nok, "the server with an override did not start") {
+		if nok {
 			defer stop_server(&named)
 			res := udp_flood(override_port, query, QUERIES)
 			/*
@@ -787,7 +786,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 					udp_port = udp_port,
 				},
 			)
-			if check(r, ok, "server did not start") {
+			if ok {
 				defer stop_server(&srv)
 
 				res := wildcard_flood(udp_port, query, QUERIES)
@@ -833,19 +832,14 @@ the socket gets `CLIENT_TIMEOUT` for that, as `query_tcp` gives it.
 query_tcp_once_bound :: proc(tcp_port: int, query: []u8, timeout: time.Duration) -> Query_Result {
 	deadline := time.time_add(time.now(), timeout)
 	for {
-		socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
-		if err != nil {
+		conn, dialled := dial_tcp(tcp_port)
+		if !dialled {
 			if time.diff(deadline, time.now()) >= 0 {
 				return {}
 			}
 			continue
 		}
-		defer net.close(socket)
-		_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-		_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
-		conn := Test_Conn {
-			socket = socket,
-		}
+		defer net.close(conn.socket)
 		return stream_query(&conn, query, context.allocator)
 	}
 }

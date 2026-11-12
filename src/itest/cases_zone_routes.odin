@@ -1,7 +1,6 @@
 package itest
 
 import "core:fmt"
-import "core:path/filepath"
 import "core:strings"
 import "elodin:dns"
 
@@ -74,17 +73,7 @@ signed_delegation_reply :: proc(name: string) -> []u8 {
 		ttl   = 3600,
 		data  = dns.Rdata_Raw{data = digest},
 	}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = .DS, class = .IN}
-	msg := dns.Message{question = question, answer = answer}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return encode_reply(name, .DS, {answer = answer})
 }
 
 /*
@@ -98,47 +87,48 @@ held_name_reply :: proc(name: string) -> []u8 {
 	nsec := []u8{0, 0, 6, 0x40, 0, 0, 0, 0, 0x03}
 	authority := make([]dns.Record, 1, context.temp_allocator)
 	authority[0] = dns.Record{name = name, type = .NSEC, class = .IN, ttl = 300, data = dns.Rdata_Raw{data = nsec}}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = .DS, class = .IN}
-	msg := dns.Message{question = question, authority = authority}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return encode_reply(name, .DS, {authority = authority})
 }
 
+// One `upstream.zones` entry: `domains`, a flow list's contents, sent to the
+// mock on `port`.
 @(private = "file")
-routed_config :: proc(udp_port, public_port, internal_port: int, dnssec := DEFAULT_DNSSEC) -> string {
-	return fmt.tprintf(
-		`log:
-  level: info
-listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  timeout: 2s
-  attempts: 1
-  servers:
-    - udp://127.0.0.1:%d
-  zones:
-    - domains: [corp.example]
-      servers:
-        - udp://127.0.0.1:%d
-cache:
-  enabled: false
-blocking:
-  enabled: false
-%srebind:
-  enabled: true
-`,
+zone_route :: proc(domains: string, port: int) -> string {
+	return fmt.tprintf("    - domains: [%s]\n      servers: [udp://127.0.0.1:%d]\n", domains, port)
+}
+
+/*
+A server whose `upstream.servers` are the mocks on `servers`, tried once each,
+with `zones` (`zone_route` entries) routed past them. The cache and blocking are
+off, as everywhere, and the rebinding guard is on unless a case says otherwise.
+*/
+@(private = "file")
+routed_config :: proc(
+	udp_port: int,
+	servers: []int,
+	zones: string,
+	dnssec := DEFAULT_DNSSEC,
+	rebind := true,
+	strategy := "",
+) -> string {
+	list := strings.builder_make(context.temp_allocator)
+	strings.write_byte(&list, '[')
+	for port, i in servers {
+		fmt.sbprintf(&list, "%sudp://127.0.0.1:%d", ", " if i > 0 else "", port)
+	}
+	strings.write_byte(&list, ']')
+	upstream := strings.builder_make(context.temp_allocator)
+	strings.write_string(&upstream, "  attempts: 1\n")
+	if strategy != "" {
+		fmt.sbprintf(&upstream, "  strategy: %s\n", strategy)
+	}
+	fmt.sbprintf(&upstream, "  zones:\n%s", zones)
+	return base_config(
 		udp_port,
-		public_port,
-		internal_port,
-		dnssec,
+		strings.to_string(list),
+		log = "{ level: info }",
+		upstream_extra = strings.to_string(upstream),
+		extra = fmt.tprintf("%srebind: {{ enabled: %v }}\n", dnssec, rebind),
 	)
 }
 
@@ -155,19 +145,13 @@ checks off itself, or it is noise where a real warning should be.
 */
 @(private = "file")
 run_route_warning_cases :: proc(r: ^Runner) {
-	write :: proc(r: ^Runner, name, body: string) -> string {
-		path := filepath.join({r.work_dir, name}, context.temp_allocator) or_else ""
-		write_fixture(r, path, transmute([]u8)body)
-		return path
-	}
-
 	ROUTE :: "upstream:\n  servers: [1.1.1.1]\n  zones:\n    - domains: [corp.example]\n      servers: [10.0.0.1]\n"
 
 	start_case(r, "upstream.zones: --check says what a route gives up")
 	{
 		// dnssec on by default, rebind off by default: one of the two.
-		res := run_binary(r, []string{"--config", write(r, "route-warn.yaml", ROUTE), "--check"}, "route-warn")
-		if check(r, res.ok, "could not run the binary") {
+		res := check_config_text(r, "route-warn", ROUTE)
+		if res.ok {
 			check_eq_int(r, res.exit_code, 0, "exit code")
 			check(r, strings.contains(res.output, "corp.example."), "the warning does not name the routed zone: %q", res.output)
 			check(r, strings.contains(res.output, "insecure"), "the warning does not mention validation: %q", res.output)
@@ -184,8 +168,8 @@ run_route_warning_cases :: proc(r: ^Runner) {
 	start_case(r, "upstream.zones: with both guards on the warning names both")
 	{
 		body := fmt.tprintf("%srebind:\n  enabled: true\n", ROUTE)
-		res := run_binary(r, []string{"--config", write(r, "route-warn-both.yaml", body), "--check"}, "route-warn-both")
-		if check(r, res.ok, "could not run the binary") {
+		res := check_config_text(r, "route-warn-both", body)
+		if res.ok {
 			check(r, strings.contains(res.output, "insecure"), "validation was not named: %q", res.output)
 			check(r, strings.contains(res.output, "rebind protection"), "the rebinding guard was not named: %q", res.output)
 		}
@@ -213,12 +197,8 @@ run_route_warning_cases :: proc(r: ^Runner) {
 			". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
 			"corp.example. IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
 		)
-		res := run_binary(
-			r,
-			[]string{"--config", write(r, "route-warn-anchored.yaml", body), "--check"},
-			"route-warn-anchored",
-		)
-		if check(r, res.ok, "could not run the binary") {
+		res := check_config_text(r, "route-warn-anchored", body)
+		if res.ok {
 			check_eq_int(r, res.exit_code, 0, "exit code")
 			check(
 				r,
@@ -241,8 +221,8 @@ run_route_warning_cases :: proc(r: ^Runner) {
 		// Both off: the route gives up neither, so a line naming either would be
 		// telling the operator they lost something they had already declined.
 		body := fmt.tprintf("%sdnssec:\n  enabled: false\n", ROUTE)
-		res := run_binary(r, []string{"--config", write(r, "route-warn-none.yaml", body), "--check"}, "route-warn-none")
-		if check(r, res.ok, "could not run the binary") {
+		res := check_config_text(r, "route-warn-none", body)
+		if res.ok {
 			check_eq_int(r, res.exit_code, 0, "exit code")
 			check(
 				r,
@@ -278,8 +258,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 	mock_reply(public, "signed.example.", u16(dns.Type.DS), signed_delegation_reply("signed.example."))
 	// And a name it holds itself, which is no delegation for the NODATA to prove.
 	mock_reply(public, "held.example.", u16(dns.Type.DS), held_name_reply("held.example."))
-	if !mock_start(public) {
-		skip_case(r, "upstream.zones", "cannot start the public mock")
+	if !mock_start_or_skip(r, public, "upstream.zones") {
 		return
 	}
 	defer mock_stop(public)
@@ -290,8 +269,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 	for f in ANCHORED_CORP_FIXTURES {
 		mock_reply(internal, f.qname, f.qtype, from_hex(f.response, context.allocator))
 	}
-	if !mock_start(internal) {
-		skip_case(r, "upstream.zones", "cannot start the internal mock")
+	if !mock_start_or_skip(r, internal, "upstream.zones") {
 		return
 	}
 	defer mock_stop(internal)
@@ -299,7 +277,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 	udp_port := next_port(r)
 	srv, ok := start_server(
 		r,
-		Server_Options{config = routed_config(udp_port, public_port, internal_port), udp_port = udp_port},
+		Server_Options{config = routed_config(udp_port, {public_port}, zone_route("corp.example", internal_port)), udp_port = udp_port},
 	)
 	if !ok {
 		return
@@ -321,15 +299,10 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		`rebind.allow_domains` as well.
 		*/
 		mock_reset_counts(public)
-		res := query_udp(udp_port, build_query("nas.corp.example.", u16(dns.Type.A)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if res, h, answered := ask(r, udp_port, "nas.corp.example.", u16(dns.Type.A)); answered {
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a routed name")
 
-			addrs := answer_addresses(r, res.wire)
-			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
-				check_eq_str(r, addrs[0], "10.0.0.7", "address for a routed name")
-			}
+			check_one_address(r, res.wire, "10.0.0.7", "address for a routed name")
 		}
 
 		// The half that closes the issue: the internal name did not also go to
@@ -346,10 +319,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		mock_reset_counts(public)
 		res := query_udp(udp_port, build_query("corp.example.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			addrs := answer_addresses(r, res.wire)
-			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
-				check_eq_str(r, addrs[0], "10.0.0.7", "address for the routed apex")
-			}
+			check_one_address(r, res.wire, "10.0.0.7", "address for the routed apex")
 		}
 		u, t, s := mock_counts(public)
 		check(r, u + t + s == 0, "the routed apex leaked to the public upstream")
@@ -381,9 +351,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		*/
 		mock_reset_counts(public)
 		mock_reset_counts(internal)
-		res := query_udp(udp_port, build_query("corp.example.", u16(dns.Type.DS)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if _, h, answered := ask(r, udp_port, "corp.example.", u16(dns.Type.DS)); answered {
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for the routed apex DS")
 		}
 		check(r, mock_total(public) > 0, "the apex DS never reached the upstream that can answer it")
@@ -419,43 +387,22 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		with the threads reading them.
 		*/
 		denied_port := next_port(r)
-		config := fmt.tprintf(
-			`log:
-  level: info
-listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  timeout: 2s
-  attempts: 1
-  servers:
-    - udp://127.0.0.1:%d
-  zones:
-    - domains: [denied.example]
-      servers:
-        - udp://127.0.0.1:%d
-cache: {{enabled: false}}
-blocking: {{enabled: false}}
-dnssec: {{enabled: false}}
-rebind: {{enabled: false}}
-`,
+		config := routed_config(
 			denied_port,
-			public_port,
-			internal_port,
+			{public_port},
+			zone_route("denied.example", internal_port),
+			dnssec = "dnssec: { enabled: false }\n",
+			rebind = false,
 		)
 		denied, started := start_server(r, Server_Options{config = config, udp_port = denied_port})
 		if started {
 			defer stop_server(&denied)
 			mock_reset_counts(internal)
-			res := query_udp(denied_port, build_query("denied.example.", u16(dns.Type.DS)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if _, h, answered := ask(r, denied_port, "denied.example.", u16(dns.Type.DS)); answered {
 				// The route's answer, not the parent's NXDOMAIN.
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode after the parent denied the zone")
 			}
 			check(r, mock_total(internal) > 0, "the denied apex DS was not put back on the route")
-		} else {
-			skip_case(r, "upstream.zones: denied apex DS", "server did not start")
 		}
 	}
 	end_case(r)
@@ -478,37 +425,18 @@ rebind: {{enabled: false}}
 		delegation, only a NODATA keeps the question there.
 		*/
 		signed_port := next_port(r)
-		config := fmt.tprintf(
-			`log:
-  level: info
-listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  timeout: 2s
-  attempts: 1
-  servers:
-    - udp://127.0.0.1:%d
-  zones:
-    - domains: [signed.example]
-      servers:
-        - udp://127.0.0.1:%d
-cache: {{enabled: false}}
-blocking: {{enabled: false}}
-dnssec: {{enabled: false}}
-rebind: {{enabled: false}}
-`,
+		config := routed_config(
 			signed_port,
-			public_port,
-			internal_port,
+			{public_port},
+			zone_route("signed.example", internal_port),
+			dnssec = "dnssec: { enabled: false }\n",
+			rebind = false,
 		)
 		signed, started := start_server(r, Server_Options{config = config, udp_port = signed_port})
 		if started {
 			defer stop_server(&signed)
 			mock_reset_counts(internal)
-			res := query_udp(signed_port, build_query("signed.example.", u16(dns.Type.DS)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if res, h, answered := ask(r, signed_port, "signed.example.", u16(dns.Type.DS)); answered {
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a signed routed apex")
 				check(
 					r,
@@ -517,13 +445,10 @@ rebind: {{enabled: false}}
 				)
 			}
 			check(r, mock_total(internal) > 0, "the signed apex DS was not put back on the route")
-		} else {
-			skip_case(r, "upstream.zones: signed apex DS", "server did not start")
 		}
 	}
 	end_case(r)
 
-	start_case(r, "upstream.zones: one parent member's denial does not hide another's proof")
 	{
 		/*
 		Issue #245. The parent's group has two members that disagree: the first
@@ -540,41 +465,22 @@ rebind: {{enabled: false}}
 		member. The assertion is the route never being asked: the proof came
 		from the second member every time.
 		*/
+		name :: "upstream.zones: one parent member's denial does not hide another's proof"
 		dissent_port := next_port(r)
 		dissent := mock_make("dissent", dissent_port)
 		mock_rcode(dissent, "split.example.", u16(dns.Type.DS), .NX_Domain)
 		mock_reply(dissent, "split-signed.example.", u16(dns.Type.DS), signed_delegation_reply("split-signed.example."))
-		if !mock_start(dissent) {
-			skip_case(r, "upstream.zones: dissenting parent", "cannot start the dissenting mock")
-		} else {
+		if mock_start_or_skip(r, dissent, name) {
 			defer mock_stop(dissent)
+			start_case(r, name)
 			split_port := next_port(r)
-			config := fmt.tprintf(
-				`log:
-  level: info
-listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  timeout: 2s
-  attempts: 1
-  strategy: round_robin
-  servers:
-    - udp://127.0.0.1:%d
-    - udp://127.0.0.1:%d
-  zones:
-    - domains: [split.example, split-signed.example]
-      servers:
-        - udp://127.0.0.1:%d
-cache: {{enabled: false}}
-blocking: {{enabled: false}}
-dnssec: {{enabled: false}}
-rebind: {{enabled: false}}
-`,
+			config := routed_config(
 				split_port,
-				dissent_port,
-				public_port,
-				internal_port,
+				{dissent_port, public_port},
+				zone_route("split.example, split-signed.example", internal_port),
+				dnssec = "dnssec: { enabled: false }\n",
+				rebind = false,
+				strategy = "round_robin",
 			)
 			split, started := start_server(r, Server_Options{config = config, udp_port = split_port})
 			if started {
@@ -592,9 +498,7 @@ rebind: {{enabled: false}}
 					mock_reset_counts(public)
 					mock_reset_counts(internal)
 					for _ in 0 ..< 2 {
-						res := query_udp(split_port, build_query(apex, u16(dns.Type.DS)))
-						if check(r, res.ok, "no response for %s", apex) {
-							h := parse_header(r, res.wire)
+						if res, h, answered := ask(r, split_port, apex, u16(dns.Type.DS), fmt.tprintf("no response for %s", apex)); answered {
 							check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), fmt.tprintf("rcode for %s", apex))
 							check(r, !answer_has_type(r, res.wire, u16(dns.Type.DS)), "the dissenting member's DS reached the client for %s", apex)
 						}
@@ -604,14 +508,11 @@ rebind: {{enabled: false}}
 					check(r, mock_total(public) > 0, "the member holding the proof was not asked for %s", apex)
 					check(r, mock_total(internal) == 0, "the route answered %s while the parent's group held the proof", apex)
 				}
-			} else {
-				skip_case(r, "upstream.zones: dissenting parent", "server did not start")
 			}
+			end_case(r)
 		}
 	}
-	end_case(r)
 
-	start_case(r, "upstream.zones: a dead parent spare is not waited on past a denial")
 	{
 		/*
 		The other side of the case above. A routed private zone under a public
@@ -622,61 +523,38 @@ rebind: {{enabled: false}}
 		upstream in front of every query for a zone whose authority answers in
 		milliseconds. Asserted on the spare's query count, not the clock.
 		*/
+		name :: "upstream.zones: a dead parent spare is not waited on past a denial"
 		silent_port := next_port(r)
 		silent := mock_make("silent", silent_port)
 		mock_silent(silent)
-		if !mock_start(silent) {
-			skip_case(r, "upstream.zones: dead parent spare", "cannot start the silent mock")
-		} else {
+		if mock_start_or_skip(r, silent, name) {
 			defer mock_stop(silent)
+			start_case(r, name)
 			spare_port := next_port(r)
-			config := fmt.tprintf(
-				`log:
-  level: info
-listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  timeout: 2s
-  attempts: 1
-  strategy: failover
-  servers:
-    - udp://127.0.0.1:%d
-    - udp://127.0.0.1:%d
-  zones:
-    - domains: [denied.example]
-      servers:
-        - udp://127.0.0.1:%d
-cache: {{enabled: false}}
-blocking: {{enabled: false}}
-dnssec: {{enabled: false}}
-rebind: {{enabled: false}}
-`,
+			config := routed_config(
 				spare_port,
-				public_port,
-				silent_port,
-				internal_port,
+				{public_port, silent_port},
+				zone_route("denied.example", internal_port),
+				dnssec = "dnssec: { enabled: false }\n",
+				rebind = false,
+				strategy = "failover",
 			)
 			spare, started := start_server(r, Server_Options{config = config, udp_port = spare_port})
 			if started {
 				defer stop_server(&spare)
 				mock_reset_counts(public)
 				mock_reset_counts(internal)
-				res := query_udp(spare_port, build_query("denied.example.", u16(dns.Type.DS)))
-				if check(r, res.ok, "no response") {
-					h := parse_header(r, res.wire)
+				if _, h, answered := ask(r, spare_port, "denied.example.", u16(dns.Type.DS)); answered {
 					check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode after the parent denied the zone")
 				}
 				// The premise: the public member was asked and denied the zone.
 				check(r, mock_total(public) > 0, "the parent's live member was not asked")
 				check(r, mock_total(silent) == 0, "the sweep waited on a spare that has never answered")
 				check(r, mock_total(internal) > 0, "the denied apex DS was not put back on the route")
-			} else {
-				skip_case(r, "upstream.zones: dead parent spare", "server did not start")
 			}
+			end_case(r)
 		}
 	}
-	end_case(r)
 
 	start_case(r, "upstream.zones: an apex DS for a name the parent holds goes back to the route")
 	{
@@ -689,26 +567,17 @@ rebind: {{enabled: false}}
 		at the parent.
 		*/
 		held_port := next_port(r)
-		config, _ := strings.replace_all(
-			routed_config(held_port, public_port, internal_port, "dnssec: {enabled: false}\n"),
-			"[corp.example]",
-			"[held.example]",
-			context.temp_allocator,
-		)
+		config := routed_config(held_port, {public_port}, zone_route("held.example", internal_port), dnssec = "dnssec: { enabled: false }\n")
 		held, started := start_server(r, Server_Options{config = config, udp_port = held_port})
 		if started {
 			defer stop_server(&held)
 			mock_reset_counts(public)
 			mock_reset_counts(internal)
-			res := query_udp(held_port, build_query("held.example.", u16(dns.Type.DS)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if _, h, answered := ask(r, held_port, "held.example.", u16(dns.Type.DS)); answered {
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a held routed apex")
 			}
 			check(r, mock_total(public) > 0, "the parent was not asked for the held apex DS")
 			check(r, mock_total(internal) > 0, "a NODATA without the NS bit was read as an insecure delegation")
-		} else {
-			skip_case(r, "upstream.zones: held apex DS", "server did not start")
 		}
 	}
 	end_case(r)
@@ -727,9 +596,7 @@ rebind: {{enabled: false}}
 		precisely because the route took it out of this path.
 		*/
 		mock_reset_counts(internal)
-		res := query_udp(udp_port, build_query("www.example.com.", u16(dns.Type.A)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if _, h, answered := ask(r, udp_port, "www.example.com.", u16(dns.Type.A)); answered {
 			check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for an unrouted name")
 		}
 		u, t, s := mock_counts(internal)
@@ -743,9 +610,7 @@ rebind: {{enabled: false}}
 		// bytes as `corp.example` and is a different zone entirely. Routing it
 		// would send a stranger's name to the domain controller.
 		mock_reset_counts(internal)
-		res := query_udp(udp_port, build_query("notcorp.example.", u16(dns.Type.A)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if _, h, answered := ask(r, udp_port, "notcorp.example.", u16(dns.Type.A)); answered {
 			check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for a suffix that is not a subtree")
 		}
 		u, t, s := mock_counts(internal)
@@ -783,7 +648,7 @@ rebind: {{enabled: false}}
 		anchored, started := start_server(
 			r,
 			Server_Options {
-				config = routed_config(anchored_port, public_port, internal_port, anchors),
+				config = routed_config(anchored_port, {public_port}, zone_route("corp.example", internal_port), anchors),
 				udp_port = anchored_port,
 			},
 		)
@@ -796,17 +661,13 @@ rebind: {{enabled: false}}
 			if check(r, res.ok, "no response for the signed routed name") {
 				h := parse_header(r, res.wire)
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a signed routed name")
-				check(r, len(res.wire) >= 4 && res.wire[3] & 0x20 != 0, "the signed routed name does not carry AD")
+				check(r, h.ad, "the signed routed name does not carry AD")
 				addrs := answer_addresses(r, res.wire)
 				check(r, len(addrs) == 1 && addrs[0] == "10.0.0.5", "addresses for the signed routed name: %v", addrs)
 			}
-			unsigned := query_udp(anchored_port, build_query("nas.corp.example.", u16(dns.Type.A)))
-			if check(r, unsigned.ok, "no response for the unsigned routed name") {
-				h := parse_header(r, unsigned.wire)
+			if _, h, answered := ask(r, anchored_port, "nas.corp.example.", u16(dns.Type.A), "no response for the unsigned routed name"); answered {
 				check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for an unsigned name in an anchored route")
 			}
-		} else {
-			skip_case(r, "upstream.zones: anchored route", "server did not start")
 		}
 	}
 	end_case(r)
@@ -821,33 +682,12 @@ rebind: {{enabled: false}}
 		routing table.
 		*/
 		nested_port := next_port(r)
-		config := fmt.tprintf(
-			`log:
-  level: info
-listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  timeout: 2s
-  attempts: 1
-  servers:
-    - udp://127.0.0.1:%d
-  zones:
-    - domains: [corp.example]
-      servers:
-        - udp://127.0.0.1:%d
-    - domains: [dev.corp.example]
-      servers:
-        - udp://127.0.0.1:%d
-cache: {{enabled: false}}
-blocking: {{enabled: false}}
-dnssec: {{enabled: false}}
-rebind: {{enabled: false}}
-`,
+		config := routed_config(
 			nested_port,
-			public_port,
-			internal_port,
-			public_port,
+			{public_port},
+			strings.concatenate({zone_route("corp.example", internal_port), zone_route("dev.corp.example", public_port)}, context.temp_allocator),
+			dnssec = "dnssec: { enabled: false }\n",
+			rebind = false,
 		)
 		nested, started := start_server(r, Server_Options{config = config, udp_port = nested_port})
 		if started {
@@ -857,23 +697,15 @@ rebind: {{enabled: false}}
 			// which here is the one the broader route does not use.
 			deep := query_udp(nested_port, build_query("build.dev.corp.example.", u16(dns.Type.A)))
 			if check(r, deep.ok, "no response for the nested zone") {
-				addrs := answer_addresses(r, deep.wire)
-				if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
-					check_eq_str(r, addrs[0], "198.51.100.9", "address for the nested zone")
-				}
+				check_one_address(r, deep.wire, "198.51.100.9", "address for the nested zone")
 			}
 
 			// Outside it but inside the broader one: still the broader route's
 			// server, so the longer entry took only what it claimed.
 			shallow := query_udp(nested_port, build_query("nas.corp.example.", u16(dns.Type.A)))
 			if check(r, shallow.ok, "no response for the outer zone") {
-				addrs := answer_addresses(r, shallow.wire)
-				if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
-					check_eq_str(r, addrs[0], "10.0.0.7", "address for the outer zone")
-				}
+				check_one_address(r, shallow.wire, "10.0.0.7", "address for the outer zone")
 			}
-		} else {
-			skip_case(r, "upstream.zones: longest match", "server did not start")
 		}
 	}
 	end_case(r)

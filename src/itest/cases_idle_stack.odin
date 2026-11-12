@@ -210,12 +210,7 @@ blocking: {{ enabled: false }}
 idle_hold_one :: proc(transport: Idle_Transport, tcp_port, dot_port, doh_port: int, query: []u8) -> (c: Test_Conn, ok: bool) {
 	switch transport {
 	case .TCP:
-		socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
-		if err != nil {
-			return {}, false
-		}
-		_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-		c = Test_Conn{socket = socket}
+		c = dial_tcp(tcp_port) or_return
 		return c, stream_query(&c, query, context.temp_allocator).ok
 	case .DoT:
 		c = dial_tls(dot_port) or_return

@@ -11,35 +11,47 @@ Listener-side coverage: the four ways a client can reach elodin, plus the DoH
 endpoint's HTTP behaviour.
 */
 
+// A stream answer to a query that asked for edns-tcp-keepalive: it states `want`
+// in 100ms units, and carries `ancount` answers.
+@(private = "file")
+check_keepalive :: proc(r: ^Runner, res: Query_Result, transport: string, want, ancount: int) {
+	if !check(r, res.ok, "no response over %s", transport) {
+		return
+	}
+	timeout, found := find_keepalive(r, res.wire)
+	if check(r, found, "the answer carries no keepalive option") {
+		units, sized := keepalive_units(timeout)
+		if check(r, sized, "the keepalive option is %d bytes, not two", len(timeout)) {
+			check_eq_int(r, int(units), want, "idle timeout in 100ms units")
+		}
+	}
+	h := parse_header(r, res.wire)
+	check_eq_int(r, h.ancount, ancount, "answer count")
+}
+
 @(private = "file")
 config_all_transports :: proc(r: ^Runner, udp_port, dot_port, doh_port, upstream_port: int) -> string {
-	return fmt.tprintf(
-		`log: {{ level: debug, queries: true }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
-  doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}
-server:
+	return base_config(
+		udp_port,
+		upstream_at(upstream_port),
+		log = "{ level: debug, queries: true }",
+		timeout = "3s",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		listeners_extra = fmt.tprintf(
+			`  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
+  doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}`,
+			dot_port,
+			r.cert_file,
+			r.key_file,
+			doh_port,
+			r.cert_file,
+			r.key_file,
+		),
+		extra = `server:
   # Named rather than left at the shipped default, because the keepalive cases
   # below read it back off the wire: what a client is told has to be the idle
   # timeout this server is actually holding its connections for.
-  client_timeout: 10s
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-		udp_port,
-		udp_port,
-		dot_port,
-		r.cert_file,
-		r.key_file,
-		doh_port,
-		r.cert_file,
-		r.key_file,
-		upstream_port,
+  client_timeout: 10s`,
 	)
 }
 
@@ -50,8 +62,7 @@ run_transport_cases :: proc(r: ^Runner) {
 	mock := mock_make("primary", upstream_port)
 	mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
 	mock_reply(mock, "cname-nosoa.example.com.", u16(dns.Type.A), bare_cname_reply("cname-nosoa.example.com."))
-	if !mock_start(mock) {
-		skip_case(r, "transports", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "transports") {
 		return
 	}
 	defer mock_stop(mock)
@@ -70,7 +81,6 @@ run_transport_cases :: proc(r: ^Runner) {
 		},
 	)
 	if !ok {
-		skip_case(r, "transports", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -456,37 +466,11 @@ run_transport_cases :: proc(r: ^Runner) {
 		want := 10 * 1000 / 100
 
 		start_case(r, "tcp: a client that asks is told the idle timeout")
-		{
-			res := query_tcp(udp_port, asking)
-			if check(r, res.ok, "no response over TCP") {
-				timeout, found := find_keepalive(r, res.wire)
-				if check(r, found, "the answer carries no keepalive option") {
-					units, sized := keepalive_units(timeout)
-					if check(r, sized, "the keepalive option is %d bytes, not two", len(timeout)) {
-						check_eq_int(r, int(units), want, "idle timeout in 100ms units")
-					}
-				}
-				h := parse_header(r, res.wire)
-				check_eq_int(r, h.ancount, fix.ancount, "answer count")
-			}
-		}
+		check_keepalive(r, query_tcp(udp_port, asking), "TCP", want, fix.ancount)
 		end_case(r)
 
 		start_case(r, "dot: a client that asks is told the idle timeout")
-		{
-			res := query_dot(dot_port, asking)
-			if check(r, res.ok, "no response over DoT") {
-				timeout, found := find_keepalive(r, res.wire)
-				if check(r, found, "the answer carries no keepalive option") {
-					units, sized := keepalive_units(timeout)
-					if check(r, sized, "the keepalive option is %d bytes, not two", len(timeout)) {
-						check_eq_int(r, int(units), want, "idle timeout in 100ms units")
-					}
-				}
-				h := parse_header(r, res.wire)
-				check_eq_int(r, h.ancount, fix.ancount, "answer count")
-			}
-		}
+		check_keepalive(r, query_dot(dot_port, asking), "DoT", want, fix.ancount)
 		end_case(r)
 
 		start_case(r, "tcp: a client that did not ask is told nothing")
@@ -821,11 +805,11 @@ run_transport_cases :: proc(r: ^Runner) {
 		q := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
 		res := query_udp(udp_port, q)
 		if check(r, res.ok, "no response") {
-			msg, err := dns.decode_message(res.wire, context.temp_allocator)
-			if check(r, err == .None, "cannot decode the response") &&
+			msg, decoded := decode_reply(r, res.wire)
+			if decoded &&
 			   check(r, len(msg.answer) == 1, "expected one answer") {
 				txt, is_txt := msg.answer[0].data.(dns.Rdata_TXT)
-				if check(r, is_txt, "answer is not TXT") {
+				if check(r, is_txt, "answer is not TXT") && check(r, len(txt.strings) > 0, "the TXT answer holds no strings") {
 					check(r, strings.has_prefix(txt.strings[0], "elodin "), "unexpected version text %q", txt.strings[0])
 				}
 			}
@@ -835,7 +819,7 @@ run_transport_cases :: proc(r: ^Runner) {
 
 	start_case(r, "refuses zone transfers")
 	{
-		for qtype in ([]u16{252, 251}) { 	// AXFR, IXFR
+		for qtype in ([]u16{u16(dns.Type.AXFR), u16(dns.Type.IXFR)}) {
 			q := build_query("example.com.", qtype)
 			res := query_udp(udp_port, q)
 			if check(r, res.ok, "no response for type %d", qtype) {

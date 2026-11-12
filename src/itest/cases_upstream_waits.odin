@@ -22,38 +22,23 @@ run_upstream_wait_cases :: proc(r: ^Runner) {
 	mock := mock_make("waits", upstream_port)
 	mock_synth(mock, hit, u16(dns.Type.A), {203, 0, 113, 1}, ttl = 300)
 	mock_synth(mock, old, u16(dns.Type.A), {203, 0, 113, 2}, ttl = 1)
-	if !mock_start(mock) {
-		skip_case(r, "upstream waits", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "upstream waits") {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: error }}
-server:
-  max_pending: 8
-  rate_limit: {{ enabled: false }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 5s
-  attempts: 1
-  servers: ["127.0.0.1:%d"]
-cache:
-  enabled: true
-  max_entries: 100
-  serve_stale: true
-  stale_timeout: 3s
-blocking: {{ enabled: false }}
-`,
+	config := base_config(
 		udp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		log = "{ level: error }",
+		timeout = "5s",
+		upstream_extra = "  attempts: 1",
+		cache = "{ enabled: true, max_entries: 100, serve_stale: true, stale_timeout: 3s }",
+		extra = "server:\n  max_pending: 8\n  rate_limit: { enabled: false }",
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
-		skip_case(r, "upstream waits", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -90,7 +75,7 @@ blocking: {{ enabled: false }}
 
 		res := query_udp(udp_port, build_query(hit, u16(dns.Type.A), id = 3), timeout = time.Second)
 		if check(r, res.ok, "the cache hit was shed with the misses") {
-			check_eq_str(r, waits_address(r, res.wire), "203.0.113.1", "the cached answer")
+			check_eq_str(r, first_address(r, res.wire), "203.0.113.1", "the cached answer")
 		}
 
 		// A miss past the bound is told SERVFAIL now, not held for the timeout.
@@ -105,16 +90,10 @@ blocking: {{ enabled: false }}
 		begun = time.tick_now()
 		stale := query_udp(udp_port, build_query(old, u16(dns.Type.A), id = 5), timeout = 2 * time.Second)
 		if check(r, stale.ok, "the expired entry was shed with the misses") {
-			check_eq_str(r, waits_address(r, stale.wire), "203.0.113.2", "the expired answer")
+			check_eq_str(r, first_address(r, stale.wire), "203.0.113.2", "the expired answer")
 			check(r, time.tick_since(begun) < 500 * time.Millisecond, "the expired entry waited %v", time.tick_since(begun))
 		}
 		check_eq_int(r, mock_total(mock), 6, "queries that reached the silent upstream in all")
 	}
 	end_case(r)
-}
-
-@(private = "file")
-waits_address :: proc(r: ^Runner, wire: []u8) -> string {
-	addrs := answer_addresses(r, wire)
-	return addrs[0] if len(addrs) > 0 else ""
 }

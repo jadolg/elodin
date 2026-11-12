@@ -40,30 +40,24 @@ in `src/server/conns_test.odin` hold that half, and `bench/cmd/rrlexp`'s
 // the case wants both.
 @(private = "file")
 config_conn_limits :: proc(udp_port, tcp_port, metrics_port, upstream_port, max_conns, per_prefix: int) -> string {
-	return fmt.tprintf(
-		`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-server:
+	return base_config(
+		udp_port,
+		upstream_at(upstream_port),
+		log = "{ level: info }",
+		timeout = "3s",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		extra = fmt.tprintf(
+			`server:
   max_connections: %d
   max_connections_per_prefix: %d
   # A connection that is refused is closed on accept, and a connection that is
   # served holds its slot until its client goes away. Left at the shipped ten
   # seconds either way; nothing here waits on it.
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}
-`,
-		udp_port,
-		tcp_port,
-		max_conns,
-		per_prefix,
-		upstream_port,
-		metrics_port,
+metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}`,
+			max_conns,
+			per_prefix,
+			metrics_port,
+		),
 	)
 }
 
@@ -74,11 +68,8 @@ run_connection_limit_cases :: proc(r: ^Runner) {
 	TABLE :: 6
 	SHARE :: 2
 
-	upstream_port := next_port(r)
-	mock := mock_make("connlimit", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 11})
-	if !mock_start(mock) {
-		skip_case(r, "connection limits", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "connlimit", "connection limits", {203, 0, 113, 11})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -110,9 +101,10 @@ run_connection_limit_cases :: proc(r: ^Runner) {
 				tcp_port = tcp_port,
 			},
 		)
-		if check(r, ok, "the uncapped server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			refused_before := conn_refused_count(metrics_port)
+			check(r, refused_before >= 0, "the metrics endpoint published no elodin_connections_refused_total")
 			answered, opened := tcp_hold_and_query(tcp_port, query, CONNS)
 			check_eq_int(r, opened, CONNS, "connections the client could open")
 			check_eq_int(r, answered, CONNS, "answers on connections held at once with no share configured")
@@ -148,9 +140,10 @@ run_connection_limit_cases :: proc(r: ^Runner) {
 				tcp_port = tcp_port,
 			},
 		)
-		if check(r, ok, "the capped server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			refused_before := conn_refused_count(metrics_port)
+			check(r, refused_before >= 0, "the metrics endpoint published no elodin_connections_refused_total")
 			answered, opened := tcp_hold_and_query(tcp_port, query, CONNS)
 			check_eq_int(r, opened, CONNS, "connections the client could open")
 			check(
@@ -222,7 +215,7 @@ run_connection_limit_cases :: proc(r: ^Runner) {
 				tcp_port = tcp_port,
 			},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			log := read_log(&srv)
 			check(
@@ -237,17 +230,11 @@ run_connection_limit_cases :: proc(r: ^Runner) {
 	end_case(r)
 }
 
-// The refusals the server has counted so far, or 0 before the endpoint answers -
-// which is a baseline the case subtracts and not a figure it reports.
+// The refusals the server has counted so far, or -1 when the endpoint does not
+// publish the series. Not clamped to 0: the no-share row asserts a difference of
+// 0, which a missing series read as 0 would satisfy for the wrong reason.
 @(private = "file")
 conn_refused_count :: proc(metrics_port: int) -> int {
-	return max(metric_value(metrics_page(metrics_port), "elodin_connections_refused_total"), 0)
+	return metric_value(metrics_page(metrics_port), "elodin_connections_refused_total")
 }
 
-@(private = "file")
-metrics_page :: proc(metrics_port: int) -> string {
-	if !wait_http(metrics_port, "/metrics") {
-		return ""
-	}
-	return string(http_request(metrics_port, "GET", "/metrics", context.temp_allocator).body)
-}

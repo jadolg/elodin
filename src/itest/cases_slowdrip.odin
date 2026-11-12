@@ -53,26 +53,14 @@ DRIPS_ALLOWED :: 5
 
 @(private = "file")
 config_drip :: proc(r: ^Runner, udp_port, tcp_port, doh_port, upstream_port: int) -> string {
-	return fmt.tprintf(
-		`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}
-server:
-  client_timeout: 1s
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+	return base_config(
 		udp_port,
-		tcp_port,
-		doh_port,
-		r.cert_file,
-		r.key_file,
-		upstream_port,
+		upstream_at(upstream_port),
+		log = "{ level: info }",
+		timeout = "3s",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		listeners_extra = fmt.tprintf("  doh: {{ enabled: true, address: \"127.0.0.1\", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}", doh_port, r.cert_file, r.key_file),
+		extra = "server:\n  client_timeout: 1s",
 	)
 }
 
@@ -105,11 +93,8 @@ drip_until_closed :: proc(conn: ^Test_Conn, message: []u8) -> (sent: int, closed
 }
 
 run_slow_drip_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("drip", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 9})
-	if !mock_start(mock) {
-		skip_case(r, "slow drip", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "drip", "slow drip", {203, 0, 113, 9})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -127,21 +112,16 @@ run_slow_drip_cases :: proc(r: ^Runner) {
 		},
 	)
 	if !ok {
-		skip_case(r, "slow drip", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
 
 	start_case(r, "drip: a trickled TCP message is given up on at client_timeout")
 	{
-		socket, derr := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
-		if check(r, derr == nil, "cannot open a TCP connection: %v", derr) {
-			defer net.close(socket)
-			// The read between the drips waits one drip - see `drip_until_closed`.
-			_ = net.set_option(socket, .Receive_Timeout, DRIP)
-			conn := Test_Conn {
-				socket = socket,
-			}
+		// The read between the drips waits one drip - see `drip_until_closed`.
+		conn, dialled := dial_tcp(tcp_port, DRIP)
+		if check(r, dialled, "cannot open a TCP connection") {
+			defer net.close(conn.socket)
 			// A bare DNS header behind its length prefix. Nothing parses a message
 			// that never finishes arriving, so what it asks does not matter.
 			message: [2 + dns.HEADER_SIZE]u8
@@ -189,32 +169,20 @@ run_upstream_drip_case :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("drip-dot", upstream_port)
 	mock.drip_handshake = true
-	if !mock_start(mock, r.cert_file, r.key_file) {
-		skip_case(r, "drip: upstream", "cannot start the TLS mock")
+	if !mock_start_or_skip(r, mock, "drip: upstream", r.cert_file, r.key_file) {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 1s
-  attempts: 1
-  servers:
-    - {{ name: drip, type: tls, address: 127.0.0.1, port: %d, hostname: elodin.local, verify: false }}
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+	config := base_config(
 		udp_port,
-		upstream_port,
+		fmt.tprintf("[{{ name: drip, type: tls, address: 127.0.0.1, port: %d, hostname: elodin.local, verify: false }}]", upstream_port),
+		timeout = "1s",
+		upstream_extra = "  attempts: 1",
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
-		skip_case(r, "drip: upstream", "server did not start")
 		return
 	}
 	defer stop_server(&srv)

@@ -1,7 +1,7 @@
 package itest
 
 import "core:fmt"
-import "core:strings"
+import "core:slice"
 import "core:time"
 import "elodin:dns"
 
@@ -180,21 +180,13 @@ header_pointer_answer :: proc(allocator := context.allocator) -> []u8 {
 }
 
 @(private = "file")
-config_passthrough :: proc(udp_port, upstream_port: int) -> string {
-	return fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+config_passthrough :: proc(udp_port, upstream_port: int, cache := "{ enabled: false }") -> string {
+	return base_config(
 		udp_port,
-		udp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		timeout = "3s",
+		cache = cache,
 	)
 }
 
@@ -281,8 +273,7 @@ run_wire_cases :: proc(r: ^Runner) {
 	defer delete(header_pointer)
 	mock_reply(mock, HEADER_POINTER_QNAME, u16(dns.Type.A), header_pointer)
 
-	if !mock_start(mock) {
-		skip_case(r, "wire", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "wire") {
 		return
 	}
 	defer mock_stop(mock)
@@ -290,7 +281,6 @@ run_wire_cases :: proc(r: ^Runner) {
 	udp_port := next_port(r)
 	srv, ok := start_server(r, Server_Options{config = config_passthrough(udp_port, upstream_port), udp_port = udp_port, tcp_port = udp_port})
 	if !ok {
-		skip_case(r, "wire", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -346,7 +336,7 @@ run_wire_cases :: proc(r: ^Runner) {
 				if check(r, len(res.wire) == len(expected), "length: got %d, want %d", len(res.wire), len(expected)) {
 					check(
 						r,
-						bytes_equal(res.wire[2:], want[2:]) || bytes_equal(res.wire[2:], want_late[2:]),
+						slice.equal(res.wire[2:], want[2:]) || slice.equal(res.wire[2:], want_late[2:]),
 						"payload differs from what the upstream sent",
 					)
 					check(
@@ -392,9 +382,10 @@ run_wire_cases :: proc(r: ^Runner) {
 				len(res.wire),
 				len(name_bomb),
 			) {
-				want := name_bomb
+				// A copy: the mock's threads read `name_bomb` as its reply.
+				want := slice.clone(name_bomb, context.temp_allocator)
 				want[3] &~= 0x20
-				check(r, bytes_equal(res.wire[2:], want[2:]), "payload differs from what the upstream sent")
+				check(r, slice.equal(res.wire[2:], want[2:]), "payload differs from what the upstream sent")
 			}
 		}
 
@@ -412,8 +403,8 @@ run_wire_cases :: proc(r: ^Runner) {
 		query := from_hex(f.query)
 		res := query_udp(udp_port, query)
 		if check(r, res.ok, "no response") {
-			msg, err := dns.decode_message(res.wire, context.temp_allocator)
-			if check(r, err == .None, "cannot decode") {
+			msg, decoded := decode_reply(r, res.wire)
+			if decoded {
 				found_rrsig := false
 				for rec in msg.answer {
 					if rec.type == .RRSIG {
@@ -438,8 +429,8 @@ run_wire_cases :: proc(r: ^Runner) {
 		if check(r, res.ok, "no response") {
 			seen := mock_last_query(mock)
 			if check(r, seen != nil, "the upstream saw no query") {
-				msg, err := dns.decode_message(seen, context.temp_allocator)
-				if check(r, err == .None, "the forwarded query does not decode") {
+				msg, decoded := decode_reply(r, seen)
+				if decoded {
 					check(r, dns.edns_present(msg), "the OPT record was dropped on the way upstream")
 					check_eq_int(r, int(dns.edns_udp_size(msg)), 1232, "advertised buffer size")
 					check(r, dns.edns_do(msg), "the DO bit was dropped on the way upstream")
@@ -461,14 +452,14 @@ run_wire_cases :: proc(r: ^Runner) {
 			// compressed, so the bytes can be compared directly.
 			check(
 				r,
-				len(res.wire) >= 25 && bytes_equal(res.wire[12:25], query[12:25]),
+				len(res.wire) >= 25 && slice.equal(res.wire[12:25], query[12:25]),
 				"the answer's question is not the client's byte for byte",
 			)
 			seen := mock_last_query(mock)
 			if check(r, seen != nil, "the upstream saw no query") {
 				check(
 					r,
-					len(seen) >= 25 && bytes_equal(seen[12:25], []u8{7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}),
+					len(seen) >= 25 && slice.equal(seen[12:25], []u8{7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}),
 					"the question was not forwarded in lower case",
 				)
 			}
@@ -493,13 +484,13 @@ run_wire_cases :: proc(r: ^Runner) {
 			if check(r, len(res.wire) == len(flat) + 11, "length: got %d, want %d", len(res.wire), len(flat) + 11) {
 				check(
 					r,
-					bytes_equal(res.wire[2:10], flat[2:10]) && bytes_equal(res.wire[12:len(flat)], flat[12:]),
+					slice.equal(res.wire[2:10], flat[2:10]) && slice.equal(res.wire[12:len(flat)], flat[12:]),
 					"the bytes ahead of the minted record are not the upstream's",
 				)
 				check_eq_int(r, int(res.wire[11]), int(flat[11]) + 1, "ARCOUNT")
 			}
-			msg, err := dns.decode_message(res.wire, context.temp_allocator)
-			if check(r, err == .None, "the response does not decode: %v", err) {
+			msg, decoded := decode_reply(r, res.wire)
+			if decoded {
 				check(r, dns.edns_present(msg), "no OPT record went back to an EDNS client")
 			}
 		}
@@ -520,9 +511,9 @@ run_wire_cases :: proc(r: ^Runner) {
 		stored, so the count is the cache's and not the mock's.
 		*/
 		cached_port := next_port(r)
-		cached_cfg, _ := strings.replace(config_passthrough(cached_port, upstream_port), "cache: { enabled: false }", "cache: { enabled: true }", 1, context.temp_allocator)
+		cached_cfg := config_passthrough(cached_port, upstream_port, cache = "{ enabled: true }")
 		cached, started := start_server(r, Server_Options{config = cached_cfg, udp_port = cached_port, tcp_port = cached_port})
-		if check(r, started, "the caching server did not start") {
+		if started {
 			defer stop_server(&cached)
 			asked := proc(r: ^Runner, port: int, mock: ^Mock, qname: string) -> int {
 				before := mock_total(mock)
@@ -630,8 +621,8 @@ run_wire_cases :: proc(r: ^Runner) {
 		query := build_query("manystrings.wire.test.", u16(dns.Type.TXT))
 		res := query_tcp(udp_port, query)
 		if check(r, res.ok, "no response") {
-			msg, err := dns.decode_message(res.wire, context.temp_allocator)
-			if check(r, err == .None, "the response does not decode: %v", err) {
+			msg, decoded := decode_reply(r, res.wire)
+			if decoded {
 				if check_eq_int(r, len(msg.answer), 1, "answer records") {
 					txt, is_txt := msg.answer[0].data.(dns.Rdata_TXT)
 					if check(r, is_txt, "the record came back as %v, not a TXT", msg.answer[0].data) {
@@ -649,7 +640,7 @@ run_wire_cases :: proc(r: ^Runner) {
 			// And byte for byte, since what the upstream sent is what a client
 			// asking a passthrough server has to get.
 			if check(r, len(res.wire) == len(empty_strings), "length: got %d, want %d", len(res.wire), len(empty_strings)) {
-				check(r, bytes_equal(res.wire[2:], empty_strings[2:]), "payload differs from what the upstream sent")
+				check(r, slice.equal(res.wire[2:], empty_strings[2:]), "payload differs from what the upstream sent")
 			}
 		}
 	}

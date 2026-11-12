@@ -144,32 +144,6 @@ env_name_valid :: proc(name: string) -> bool {
 }
 
 /*
-Whether the binary is built with AddressSanitizer, skipping case `name` if so.
-A sanitizer's runtime answers malloc itself and ignores glibc's settings, and
-its quarantine grows every process alike.
-*/
-@(private)
-built_with_asan :: proc(
-	r: ^Runner,
-	name: string,
-	reason := "the binary is built with AddressSanitizer, whose allocator is not glibc's",
-) -> bool {
-	// Heap: the temp allocator is not reset until the next case ends, and a
-	// skip from here ends none.
-	exe, xerr := os.read_entire_file(r.binary, context.allocator)
-	if xerr != nil {
-		fail(r, "%s: cannot read %s: %v", name, r.binary, xerr)
-		return true
-	}
-	asan := strings.contains(string(exe), "__asan_init")
-	delete(exe)
-	if asan {
-		skip_case(r, name, reason)
-	}
-	return asan
-}
-
-/*
 The environments the memory cases start a server with: `control` is this
 process's own without any MALLOC_ setting or GLIBC_TUNABLES of the suite's own
 or an LD_PRELOAD (which can replace the allocator), so it is glibc's defaults;
@@ -199,30 +173,21 @@ glibc_environments :: proc(r: ^Runner, name: string, unit_env: []string) -> (con
 
 @(private = "file")
 list_memory_config :: proc(udp_port: int, list_path: string, timeout_s: int) -> string {
-	return fmt.tprintf(
-		`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: %ds
-  servers: ["127.0.0.1:1"]
-cache: {{ enabled: false }}
-blocking:
-  enabled: true
-  lists:
-    - {{ name: big, file: %s, format: hosts }}
-`,
+	return base_config(
 		udp_port,
-		timeout_s,
-		list_path,
+		`["127.0.0.1:1"]`,
+		log = "{ level: info }",
+		timeout = fmt.tprintf("%ds", timeout_s),
+		blocking = fmt.tprintf("{{ enabled: true, lists: [{{ name: big, file: %s, format: hosts }}] }}", list_path),
 	)
 }
 
-// One numeric field of /proc/<pid>/status, such as `VmRSS` in KiB or `Threads`.
+// One numeric field of /proc/<pid>/`file`, such as `VmRSS` in KiB or `Threads`
+// from `status`, or `AnonHugePages` (KiB, summed over the mappings by the kernel)
+// from `smaps_rollup`.
 @(private = "file")
-proc_status_int :: proc(pid: int, field: string) -> (n: int, ok: bool) {
-	value := proc_status_field(fmt.tprintf("/proc/%d/status", pid), field) or_return
+proc_status_int :: proc(pid: int, field: string, file := "status") -> (n: int, ok: bool) {
+	value := proc_status_field(fmt.tprintf("/proc/%d/%s", pid, file), field) or_return
 	return strconv.parse_int(strings.trim_space(strings.trim_suffix(value, "kB")))
 }
 
@@ -235,14 +200,14 @@ once the old sets are freed.
 @(private = "file")
 rss_across_rebuilds :: proc(r: ^Runner, env: []string, list_path: string) -> (start, end: int, ok: bool) {
 	udp_port := next_port(r)
-	srv, started := start_server_raw(r, list_memory_config(udp_port, list_path, 2), udp_port, env = env)
+	srv, started := start_server(
+		r,
+		Server_Options{config = list_memory_config(udp_port, list_path, 2), udp_port = udp_port, env = env, warmup = 55 * time.Second},
+	)
 	if !started {
 		return
 	}
 	defer stop_server(&srv)
-	if !check(r, wait_ready(&srv, 60 * time.Second), "the server never became ready; log:\n%s", read_log(&srv)) {
-		return
-	}
 	start, ok = proc_status_int(srv.process.pid, "VmRSS")
 	if !check(r, ok, "cannot read the server's VmRSS") {
 		return
@@ -354,13 +319,6 @@ KEPT_KIB_PER_CONN :: 32
 @(private = "file")
 KEPT_HUGE_KIB :: 2048
 
-// The process's huge pages in KiB, summed over its mappings by the kernel.
-@(private = "file")
-anon_huge_kib :: proc(pid: int) -> (kib: int, ok: bool) {
-	value := proc_status_field(fmt.tprintf("/proc/%d/smaps_rollup", pid), "AnonHugePages") or_return
-	return strconv.parse_int(strings.trim_space(strings.trim_suffix(value, "kB")))
-}
-
 /*
 The descriptor count the case below is judged on survives descriptors closing
 while it is taken.
@@ -430,33 +388,22 @@ run_connection_memory_cases :: proc(r: ^Runner) {
 	defer end_case(r)
 	udp_port := next_port(r)
 	tcp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-server:
-  max_connections: %d
-  max_connections_per_prefix: %d
-  rate_limit: {{ enabled: false }}
-upstream:
-  servers: ["127.0.0.1:1"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+	config := base_config(
 		udp_port,
-		tcp_port,
-		CONN_BURST * 2,
-		CONN_BURST * 2,
+		`["127.0.0.1:1"]`,
+		log = "{ level: info }",
+		timeout = "",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		extra = fmt.tprintf("server:\n  max_connections: %d\n  max_connections_per_prefix: %d\n  rate_limit: {{ enabled: false }}", CONN_BURST * 2, CONN_BURST * 2),
 	)
-	srv, started := start_server_raw(r, config, udp_port, env = shipped)
+	srv, started := start_server(
+		r,
+		Server_Options{config = config, udp_port = udp_port, tcp_port = tcp_port, env = shipped, warmup = 5 * time.Second},
+	)
 	if !started {
 		return
 	}
 	defer stop_server(&srv)
-	if !check(r, wait_ready(&srv, 10 * time.Second) && wait_tcp(tcp_port, 10 * time.Second), "the server never became ready; log:\n%s", read_log(&srv)) {
-		return
-	}
 	pid := srv.process.pid
 	// The premise of the huge-page bound, which a host with THP `never` passes
 	// whatever the server does: the server turned them off for itself.
@@ -479,22 +426,17 @@ blocking: {{ enabled: false }}
 		net.close(s)
 	}
 	for _ in 0 ..< CONN_BURST {
-		socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
-		if !check(r, err == nil, "dial %d: %v", len(sockets), err) {
+		conn, dialled := dial_tcp(tcp_port)
+		if !check(r, dialled, "dial %d failed", len(sockets)) {
 			return
 		}
-		_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-		_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
-		append(&sockets, socket)
-		conn := Test_Conn {
-			socket = socket,
-		}
+		append(&sockets, conn.socket)
 		if !check(r, stream_query(&conn, query, context.temp_allocator).ok, "connection %d was not answered; log:\n%s", len(sockets), read_log(&srv)) {
 			return
 		}
 	}
 	held, hok := proc_status_int(pid, "VmRSS")
-	threads1, _ := proc_status_int(pid, "Threads")
+	threads1, t1ok := proc_status_int(pid, "Threads")
 	fds1, f1ok := open_descriptor_count(pid)
 	// The premise: the server is holding every connection - one descriptor
 	// each. One short, as `wait_tcp`'s probe may still have been in the first
@@ -503,7 +445,7 @@ blocking: {{ enabled: false }}
 		return
 	}
 	// And held on the loops' threads, not on threads of their own.
-	if !check(r, threads1 <= threads0, "threads went %d -> %d holding %d connections", threads0, threads1, CONN_BURST) {
+	if !check(r, t1ok && threads1 <= threads0, "threads went %d -> %d (read %v) holding %d connections", threads0, threads1, t1ok, CONN_BURST) {
 		return
 	}
 
@@ -536,7 +478,7 @@ blocking: {{ enabled: false }}
 		time.sleep(100 * time.Millisecond)
 		after, aok = proc_status_int(pid, "VmRSS")
 	}
-	huge, sok := anon_huge_kib(pid)
+	huge, sok := proc_status_int(pid, "AnonHugePages", "smaps_rollup")
 	if !check(r, aok && sok, "cannot read the server's VmRSS or smaps") {
 		return
 	}

@@ -581,7 +581,7 @@ parity_same_options :: proc(x, y: Pw_Msg) -> bool {
 			// differently, so holding the reference to its own text would skip
 			// every name that carries one.
 			ad, bd := a.data, b.data
-			if a.code == 15 && len(ad) >= 2 && len(bd) >= 2 {
+			if a.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(ad) >= 2 && len(bd) >= 2 {
 				ad, bd = ad[:2], bd[:2]
 			}
 			if len(ad) != len(bd) {
@@ -700,6 +700,7 @@ parity_additional_dropped_case :: proc(r: ^Runner) {
 	mock_parity_all(mock)
 	if !mock_start(mock) {
 		fail(r, "the parity mock did not start on port %d", mock_port)
+		mock_stop(mock)
 		return
 	}
 	defer mock_stop(mock)
@@ -724,7 +725,7 @@ parity_additional_dropped_case :: proc(r: ^Runner) {
 	}
 	defer stop_server(&srv)
 
-	q := parity_fixed_query(PARITY_286_NAME, 48, PARITY_286_CEILING)
+	q := parity_fixed_query(PARITY_286_NAME, u16(dns.Type.DNSKEY), PARITY_286_CEILING)
 	mock_reset_replies(mock)
 	res := query_udp(srv.udp_port, q.wire, context.temp_allocator)
 	if !check(r, res.ok, "no answer came back over udp") {
@@ -921,7 +922,7 @@ parity_race_drain_case :: proc(r: ^Runner) {
 	}
 	mock, mock_port, winner_port := ups.mocks[0], ups.ports[0], ups.ports[1]
 
-	q := parity_fixed_query(PARITY_286_NAME, 48, PARITY_286_CEILING)
+	q := parity_fixed_query(PARITY_286_NAME, u16(dns.Type.DNSKEY), PARITY_286_CEILING)
 	parity_upstreams_reset(&ups)
 	check(r, !parity_upstreams_drain(&ups, q, time.tick_now()), "drained before the loser had sent anything")
 

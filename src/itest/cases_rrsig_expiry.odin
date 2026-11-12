@@ -1,6 +1,5 @@
 package itest
 
-import "core:fmt"
 import "core:time"
 import "elodin:dns"
 
@@ -18,62 +17,34 @@ day-long stale copy out; the client is answered SERVFAIL instead.
 @(private = "file")
 RX_QNAME :: "signed.stale.example."
 
-// The answer the mock serves, its RRSIG lapsing at `expiration`.
+// The answer the mock serves, its RRSIG lapsing at `expiration`; nil when it
+// cannot be encoded.
 @(private = "file")
 rx_answer :: proc(expiration: u32) -> []u8 {
-	sig := make([]u8, 31, context.allocator)
+	sig := make([]u8, 31, context.temp_allocator)
 	copy(sig, []u8{0, 1, 13, 3, 0, 0, 0x0e, 0x10})
 	dns.write_ttl_at(sig, 8, expiration)
 	dns.write_ttl_at(sig, 12, expiration - 86400) // inception
 	copy(sig[16:], []u8{0x12, 0x34, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0, 0xde, 0xad, 0xbe, 0xef})
-	question := make([]dns.Question, 1, context.allocator)
-	question[0] = {name = RX_QNAME, type = .A, class = .IN}
-	answer := make([]dns.Record, 2, context.allocator)
+	answer := make([]dns.Record, 2, context.temp_allocator)
 	answer[0] = {name = RX_QNAME, type = .A, class = .IN, ttl = 3600, data = dns.Rdata_A{addr = {203, 0, 113, 65}}}
 	answer[1] = {name = RX_QNAME, type = .RRSIG, class = .IN, ttl = 3600, data = dns.Rdata_Raw{data = sig}}
-	m := dns.Message {
-		id       = 0x1650,
-		question = question,
-		answer   = answer,
-	}
-	m.flags.qr = true
-	m.flags.rd = true
-	m.flags.ra = true
-	wire, _, _ := dns.encode_message(m, context.allocator)
-	return wire
-}
-
-@(private = "file")
-rx_config :: proc(udp_port, upstream_port: int) -> string {
-	return fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 1s
-  attempts: 1
-  servers: ["127.0.0.1:%d"]
-cache:
-  enabled: true
-  max_entries: 100
-  serve_stale: true
-  stale_timeout: 300ms
-dnssec: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-		udp_port,
-		upstream_port,
-	)
+	return encode_reply(RX_QNAME, .A, {id = 0x1650, answer = answer})
 }
 
 run_rrsig_expiry_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	udp_port := next_port(r)
-	config := rx_config(udp_port, upstream_port)
+	config := base_config(
+		udp_port,
+		upstream_at(upstream_port),
+		timeout = "1s",
+		upstream_extra = "  attempts: 1",
+		cache = "{ enabled: true, max_entries: 100, serve_stale: true, stale_timeout: 300ms }",
+		extra = "dnssec: { enabled: false }",
+	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
-		skip_case(r, "cache: rrsig expiry", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -81,10 +52,14 @@ run_rrsig_expiry_cases :: proc(r: ^Runner) {
 	// The clock is read once the server is up, so a slow start cannot spend the
 	// signature before the first query and leave both cases nothing to test.
 	expiration := u32(time.time_to_unix(time.now())) + 3
+	answer := rx_answer(expiration)
+	if answer == nil {
+		fail(r, "cannot encode the signed answer for %s", RX_QNAME)
+		return
+	}
 	mock := mock_make("rrsig-expiry", upstream_port)
-	mock_reply(mock, RX_QNAME, u16(dns.Type.A), rx_answer(expiration))
-	if !mock_start(mock) {
-		skip_case(r, "cache: rrsig expiry", "cannot start the mock upstream")
+	mock_reply(mock, RX_QNAME, u16(dns.Type.A), answer)
+	if !mock_start_or_skip(r, mock, "cache: rrsig expiry") {
 		return
 	}
 	defer mock_stop(mock)

@@ -41,35 +41,17 @@ run_name_cases :: proc(r: ^Runner) {
 	dead_port := next_port(r)
 	udp_port := next_port(r)
 	metrics_port := next_port(r)
-	conf := fmt.tprintf(
-		`log: {{ level: debug }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  strategy: failover
-  servers:
-    - {{ url: "https://127.0.0.1:%d/dns-query?token=SECRET1", verify: false }}
-    - {{ url: "https://127.0.0.1:%d/dns-query?token=SECRET2#frag", verify: false }}
-cache: {{ enabled: false }}
-metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}
-blocking:
-  enabled: true
-  response: nxdomain
-  cache_dir: %s
-  lists: ["http://127.0.0.1:%d/hosts.txt?key=SECRET3"]
-`,
+	conf := base_config(
 		udp_port,
-		dead_port,
-		upstream_port,
-		metrics_port,
-		cache_dir,
-		http_port,
+		fmt.tprintf(`[{{ url: "https://127.0.0.1:%d/dns-query?token=SECRET1", verify: false }}, {{ url: "https://127.0.0.1:%d/dns-query?token=SECRET2#frag", verify: false }}]`, dead_port, upstream_port),
+		log = "{ level: debug }",
+		timeout = "3s",
+		upstream_extra = "  strategy: failover",
+		blocking = fmt.tprintf(`{{ enabled: true, response: nxdomain, cache_dir: %q, lists: ["http://127.0.0.1:%d/hosts.txt?key=SECRET3"] }}`, cache_dir, http_port),
+		extra = fmt.tprintf(`metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}`, metrics_port),
 	)
 	srv, ok := start_server(r, Server_Options{config = conf, udp_port = udp_port, allow_fetch = true})
 	if !ok {
-		skip_case(r, "names: a default name holds no query", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -81,15 +63,13 @@ blocking:
 		if check(r, blocked.ok, "no response for a listed name") {
 			check(r, parse_header(r, blocked.wire).rcode == int(dns.Rcode.NX_Domain), "the list was not applied")
 		}
-		res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
-		if check(r, res.ok, "no response") {
-			check_eq_int(r, parse_header(r, res.wire).ancount, fix.ancount, "answer count")
+		if _, h, asked := ask(r, udp_port, fix.qname, fix.qtype); asked {
+			check_eq_int(r, h.ancount, fix.ancount, "answer count")
 		}
 
 		live := fmt.tprintf("https://127.0.0.1:%d/dns-query", upstream_port)
 		dead := fmt.tprintf("https://127.0.0.1:%d/dns-query", dead_port)
-		if check(r, wait_http(metrics_port, "/metrics"), "the metrics endpoint never answered") {
-			page := string(http_request(metrics_port, "GET", "/metrics", context.temp_allocator).body)
+		if page := metrics_page(metrics_port); check(r, page != "", "the metrics endpoint never answered") {
 			check(r, strings.contains(page, fmt.tprintf("elodin_upstream_queries_total{{upstream=\"%s\"}}", live)), "no series for %s:\n%s", live, page)
 			check(r, strings.contains(page, fmt.tprintf("elodin_upstream_failures_total{{upstream=\"%s\"}}", dead)), "no failures for %s:\n%s", dead, page)
 			check(r, !strings.contains(page, "SECRET"), "the scrape shows a query:\n%s", page)

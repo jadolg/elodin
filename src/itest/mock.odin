@@ -405,7 +405,13 @@ mock_start :: proc(m: ^Mock, cert_file := "", key_file := "") -> bool {
 		m.tls_ctx = ctx
 		m.tcp_socket = sock
 		_ = net.set_option(sock, .Receive_Timeout, POLL_INTERVAL)
-		append(&m.threads, thread.create_and_start_with_poly_data(m, mock_tls_loop))
+		if !track_thread(&m.mu, &m.threads, thread.create_and_start_with_poly_data(m, mock_tls_loop)) {
+			m.tls_ctx = nil
+			m.tcp_socket = 0
+			net.close(sock)
+			tlsx.context_destroy(ctx)
+			return false
+		}
 		return true
 	}
 
@@ -436,8 +442,18 @@ mock_start :: proc(m: ^Mock, cert_file := "", key_file := "") -> bool {
 	_ = net.set_option(udp, .Receive_Timeout, POLL_INTERVAL)
 	_ = net.set_option(tcp, .Receive_Timeout, POLL_INTERVAL)
 
-	append(&m.threads, thread.create_and_start_with_poly_data(m, mock_udp_loop))
-	append(&m.threads, thread.create_and_start_with_poly_data(m, mock_tcp_loop))
+	if !track_thread(&m.mu, &m.threads, thread.create_and_start_with_poly_data(m, mock_udp_loop)) ||
+	   !track_thread(&m.mu, &m.threads, thread.create_and_start_with_poly_data(m, mock_tcp_loop)) {
+		// A loop that did start is told to go and joined, so the sockets close
+		// under nothing that is still reading them.
+		sync.atomic_store(&m.stop, true)
+		net.close(udp)
+		net.close(tcp)
+		m.udp_socket = 0
+		m.tcp_socket = 0
+		join_threads(&m.mu, &m.threads)
+		return false
+	}
 	return true
 }
 
@@ -450,26 +466,7 @@ mock_stop :: proc(m: ^Mock) {
 		net.close(m.tcp_socket)
 	}
 
-	// Connection threads add themselves to the list while running, so take it
-	// under the lock and join the snapshot; anything started after this point
-	// sees the stop flag immediately.
-	for {
-		sync.mutex_lock(&m.mu)
-		pending := m.threads
-		m.threads = make([dynamic]^thread.Thread, 0, 4)
-		sync.mutex_unlock(&m.mu)
-
-		if len(pending) == 0 {
-			delete(pending)
-			break
-		}
-		for t in pending {
-			thread.join(t)
-			thread.destroy(t)
-		}
-		delete(pending)
-	}
-
+	join_threads(&m.mu, &m.threads)
 	delete(m.threads)
 	delete(m.rules)
 	if m.last_query != nil {
@@ -480,6 +477,49 @@ mock_stop :: proc(m: ^Mock) {
 	}
 	tlsx.context_destroy(m.tls_ctx)
 	free(m)
+}
+
+/*
+Join and destroy every thread on `threads`, the three mocks' stop step.
+
+Connection threads add themselves to the list while running, so it is taken
+under `mu` and the snapshot joined, until a pass finds it empty; anything
+started after the stop flag is set sees it at once. `threads` is left empty
+and allocated, for the caller to delete with the rest of its mock.
+*/
+@(private)
+join_threads :: proc(mu: ^sync.Mutex, threads: ^[dynamic]^thread.Thread) {
+	for {
+		sync.mutex_lock(mu)
+		pending := threads^
+		threads^ = make([dynamic]^thread.Thread, 0, 4)
+		sync.mutex_unlock(mu)
+
+		if len(pending) == 0 {
+			delete(pending)
+			return
+		}
+		for t in pending {
+			thread.join(t)
+			thread.destroy(t)
+		}
+		delete(pending)
+	}
+}
+
+/*
+Keep `t` for the stop to join. False, and nothing kept, when it is nil - a
+thread that could not start: `thread.join` on nil would crash the stop.
+*/
+@(private)
+track_thread :: proc(mu: ^sync.Mutex, threads: ^[dynamic]^thread.Thread, t: ^thread.Thread) -> bool {
+	if t == nil {
+		return false
+	}
+	sync.mutex_lock(mu)
+	append(threads, t)
+	sync.mutex_unlock(mu)
+	return true
 }
 
 @(private = "file")
@@ -675,24 +715,22 @@ build_synth_a :: proc(query: []u8, addr: [4]u8, ttl: u32, allocator := context.a
 // A minimal response echoing the question, for rules that carry no payload.
 @(private = "file")
 build_rcode_reply :: proc(query: []u8, rcode: dns.Rcode, allocator := context.allocator) -> []u8 {
-	msg, err := dns.decode_message(query, context.temp_allocator)
-	if err != .None {
-		out := make([]u8, dns.HEADER_SIZE, allocator)
-		copy(out, query[:min(len(query), dns.HEADER_SIZE)])
-		out[2] = 0x81
-		out[3] = u8(rcode) & 0xf
-		for i in 4 ..< dns.HEADER_SIZE {
-			out[i] = 0
+	if msg, err := dns.decode_message(query, context.temp_allocator); err == .None {
+		resp := dns.make_response(msg, rcode, context.temp_allocator)
+		if wire, _, enc_err := dns.encode_message(resp, allocator); enc_err == .None {
+			return wire
 		}
-		return out
 	}
-	resp := dns.make_response(msg, rcode, context.temp_allocator)
-	wire, _, enc_err := dns.encode_message(resp, allocator)
-	if enc_err != .None {
-		out := make([]u8, dns.HEADER_SIZE, allocator)
-		return out
+	// A header alone, carrying the query's ID, QR and the rcode, for a query
+	// that cannot be decoded or a response that cannot be encoded.
+	out := make([]u8, dns.HEADER_SIZE, allocator)
+	copy(out, query[:min(len(query), dns.HEADER_SIZE)])
+	out[2] = 0x81
+	out[3] = u8(rcode) & 0xf
+	for i in 4 ..< dns.HEADER_SIZE {
+		out[i] = 0
 	}
-	return wire
+	return out
 }
 
 @(private = "file")
@@ -754,17 +792,13 @@ mock_udp_loop :: proc(m: ^Mock) {
 				continue
 			}
 
-			t := thread.create_and_start_with_poly_data(job, send_delayed_reply)
-			if t == nil {
+			if !track_thread(&m.mu, &m.threads, thread.create_and_start_with_poly_data(job, send_delayed_reply)) {
 				// No thread to wait on its behalf, so it waits here: late, but
-				// answered, and nothing nil is left for `mock_stop` to join.
+				// answered.
 				sync.atomic_add(&m.failed_starts, 1)
 				send_delayed_reply(job)
 				continue
 			}
-			sync.mutex_lock(&m.mu)
-			append(&m.threads, t)
-			sync.mutex_unlock(&m.mu)
 			free_all(context.temp_allocator)
 			continue
 		}
@@ -839,18 +873,13 @@ mock_tls_loop :: proc(m: ^Mock) {
 
 @(private = "file")
 start_conn_thread :: proc(m: ^Mock, conn: ^Mock_Conn) {
-	t := thread.create_and_start_with_poly_data(conn, mock_tcp_conn)
-	if t == nil {
+	if !track_thread(&m.mu, &m.threads, thread.create_and_start_with_poly_data(conn, mock_tcp_conn)) {
 		// Turned away, as a server out of threads would: the client sees the
-		// connection close, and nothing nil is left for `mock_stop` to join.
+		// connection close.
 		sync.atomic_add(&m.failed_starts, 1)
 		net.close(conn.socket)
 		free(conn)
-		return
 	}
-	sync.mutex_lock(&m.mu)
-	append(&m.threads, t)
-	sync.mutex_unlock(&m.mu)
 }
 
 @(private = "file")

@@ -24,24 +24,7 @@ make_a_response :: proc(name: string, addr: [4]u8, ttl: u32, allocator := contex
 	append(&buf, 0, 1, 0, 1, 0, 0, 0, 0)
 
 	name_start := len(buf)
-	rest := name
-	for len(rest) > 0 && rest != "." {
-		label := rest
-		if idx := index_byte(rest, '.'); idx >= 0 {
-			label = rest[:idx]
-			rest = rest[idx + 1:]
-		} else {
-			rest = ""
-		}
-		if label == "" {
-			continue
-		}
-		append(&buf, u8(len(label)))
-		for i in 0 ..< len(label) {
-			append(&buf, label[i])
-		}
-	}
-	append(&buf, 0)
+	append_name(&buf, name)
 	name_len := len(buf) - name_start
 	append(&buf, 0, 1, 0, 1) // type A, class IN
 
@@ -58,23 +41,7 @@ make_a_response :: proc(name: string, addr: [4]u8, ttl: u32, allocator := contex
 }
 
 @(private = "file")
-index_byte :: proc(s: string, c: u8) -> int {
-	for i in 0 ..< len(s) {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
-}
-
-@(private = "file")
 QNAME :: "probe.test."
-
-@(private = "file")
-first_address :: proc(r: ^Runner, wire: []u8) -> string {
-	addrs := answer_addresses(r, wire)
-	return addrs[0] if len(addrs) > 0 else ""
-}
 
 run_strategy_cases :: proc(r: ^Runner) {
 	/*
@@ -92,9 +59,8 @@ run_strategy_cases :: proc(r: ^Runner) {
 	for i in 0 ..< 3 {
 		mocks[i] = mock_make(fmt.tprintf("up%d", i + 1), ports[i])
 		mock_reply_all(mocks[i], make_a_response(QNAME, addrs[i], 60))
-		if !mock_start(mocks[i]) {
-			skip_case(r, "strategies", "cannot start the mock upstreams")
-			for k in 0 ..= i {
+		if !mock_start_or_skip(r, mocks[i], "strategies") {
+			for k in 0 ..< i {
 				mock_stop(mocks[k])
 			}
 			return
@@ -104,34 +70,17 @@ run_strategy_cases :: proc(r: ^Runner) {
 		mock_stop(m)
 	}
 
-	base_config :: proc(udp_port: int, strategy: string, servers: string, extra := "") -> string {
-		return fmt.tprintf(
-			`log: {{ level: debug, queries: true }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  strategy: %s
-  timeout: 2s
-  attempts: 1
-%s  servers:
-%s
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-			udp_port,
-			strategy,
-			extra,
-			servers,
-		)
-	}
-
-	server_list :: proc(ports: []int) -> string {
-		out := ""
-		for p in ports {
-			out = fmt.tprintf("%s    - \"127.0.0.1:%d\"\n", out, p)
+	strategy_config :: proc(udp_port: int, strategy: string, ports: []int) -> string {
+		servers := "["
+		for p, i in ports {
+			servers = fmt.tprintf("%s%s\"127.0.0.1:%d\"", servers, i > 0 ? ", " : "", p)
 		}
-		return out
+		return base_config(
+			udp_port,
+			fmt.tprintf("%s]", servers),
+			log = "{ level: debug, queries: true }",
+			upstream_extra = fmt.tprintf("  strategy: %s\n  attempts: 1", strategy),
+		)
 	}
 
 	// --- failover ---
@@ -139,7 +88,7 @@ blocking: {{ enabled: false }}
 		udp_port := next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options{config = base_config(udp_port, "failover", server_list(ports[:])), udp_port = udp_port},
+			Server_Options{config = strategy_config(udp_port, "failover", ports[:]), udp_port = udp_port},
 		)
 		if ok {
 			start_case(r, "strategy: failover always prefers the first upstream")
@@ -153,8 +102,6 @@ blocking: {{ enabled: false }}
 			}
 			end_case(r)
 			stop_server(&srv)
-		} else {
-			skip_case(r, "strategy: failover", "server did not start")
 		}
 	}
 
@@ -163,7 +110,7 @@ blocking: {{ enabled: false }}
 		udp_port := next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options{config = base_config(udp_port, "round_robin", server_list(ports[:])), udp_port = udp_port},
+			Server_Options{config = strategy_config(udp_port, "round_robin", ports[:]), udp_port = udp_port},
 		)
 		if ok {
 			start_case(r, "strategy: round_robin visits every upstream in turn")
@@ -183,8 +130,6 @@ blocking: {{ enabled: false }}
 			}
 			end_case(r)
 			stop_server(&srv)
-		} else {
-			skip_case(r, "strategy: round_robin", "server did not start")
 		}
 	}
 
@@ -211,7 +156,7 @@ blocking: {{ enabled: false }}
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = base_config(udp_port, "race", server_list([]int{slow_port, fast_port})),
+					config = strategy_config(udp_port, "race", {slow_port, fast_port}),
 					udp_port = udp_port,
 				},
 			)
@@ -245,8 +190,6 @@ blocking: {{ enabled: false }}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "strategy: race", "server did not start")
 			}
 		}
 	}
@@ -272,7 +215,7 @@ blocking: {{ enabled: false }}
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = base_config(udp_port, "failover", server_list([]int{dead_port, live_port})),
+					config = strategy_config(udp_port, "failover", {dead_port, live_port}),
 					udp_port = udp_port,
 				},
 			)
@@ -310,8 +253,6 @@ blocking: {{ enabled: false }}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "strategy: failover past a dead upstream", "server did not start")
 			}
 		}
 	}
@@ -328,15 +269,13 @@ blocking: {{ enabled: false }}
 		live_port := next_port(r)
 		live := mock_make("live", live_port)
 		mock_reply_all(live, make_a_response(QNAME, {198, 51, 100, 9}, 60))
-		if !mock_start(live) {
-			skip_case(r, "strategy: failover past a refused upstream", "cannot start the mock")
-		} else {
+		if mock_start_or_skip(r, live, "strategy: failover past a refused upstream") {
 			defer mock_stop(live)
 			udp_port := next_port(r)
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = base_config(udp_port, "failover", server_list([]int{closed_port, live_port})),
+					config = strategy_config(udp_port, "failover", {closed_port, live_port}),
 					udp_port = udp_port,
 				},
 			)
@@ -360,8 +299,6 @@ blocking: {{ enabled: false }}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "strategy: failover past a refused upstream", "server did not start")
 			}
 		}
 	}
@@ -375,32 +312,15 @@ run_upstream_transport_cases :: proc(r: ^Runner) {
 		upstream_port := next_port(r)
 		mock := mock_make("tcp-upstream", upstream_port)
 		mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
-		if !mock_start(mock) {
-			skip_case(r, "upstream: tcp", "cannot start the mock")
-		} else {
+		if mock_start_or_skip(r, mock, "upstream: tcp") {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
-			config := fmt.tprintf(
-				`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["tcp://127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-				udp_port,
-				upstream_port,
-			)
+			config := base_config(udp_port, fmt.tprintf(`["tcp://127.0.0.1:%d"]`, upstream_port), timeout = "3s")
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: forwards over TCP")
 				{
-					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
-					if check(r, res.ok, "no response") {
-						h := parse_header(r, res.wire)
+					if _, h, answered := ask(r, udp_port, fix.qname, fix.qtype); answered {
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")
 					}
 					_, tcp_count, _ := mock_counts(mock)
@@ -419,8 +339,6 @@ blocking: {{ enabled: false }}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "upstream: tcp", "server did not start")
 			}
 		}
 	}
@@ -430,34 +348,20 @@ blocking: {{ enabled: false }}
 		upstream_port := next_port(r)
 		mock := mock_make("dot-upstream", upstream_port)
 		mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
-		if !mock_start(mock, r.cert_file, r.key_file) {
-			skip_case(r, "upstream: dot", "cannot start the TLS mock")
-		} else {
+		if mock_start_or_skip(r, mock, "upstream: dot", r.cert_file, r.key_file) {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
 			// verify: false, because the mock uses the suite's self-signed cert.
-			config := fmt.tprintf(
-				`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 5s
-  servers:
-    - {{ name: dot, type: tls, address: 127.0.0.1, port: %d, hostname: elodin.local, verify: false }}
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+			config := base_config(
 				udp_port,
-				upstream_port,
+				fmt.tprintf(`[{{ name: dot, type: tls, address: 127.0.0.1, port: %d, hostname: elodin.local, verify: false }}]`, upstream_port),
+				timeout = "5s",
 			)
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: forwards over DNS-over-TLS")
 				{
-					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
-					if check(r, res.ok, "no response") {
-						h := parse_header(r, res.wire)
+					if _, h, answered := ask(r, udp_port, fix.qname, fix.qtype); answered {
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")
 					}
 					_, _, tls_count := mock_counts(mock)
@@ -476,8 +380,6 @@ blocking: {{ enabled: false }}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "upstream: dot", "server did not start")
 			}
 		}
 	}
@@ -488,9 +390,7 @@ blocking: {{ enabled: false }}
 		full := from_hex(fixture("txt").response, context.allocator)
 		mock := mock_make("truncating", upstream_port)
 		mock_truncate_udp(mock, "google.com.", u16(dns.Type.TXT), full)
-		if !mock_start(mock) {
-			skip_case(r, "upstream: udp to tcp retry", "cannot start the mock")
-		} else {
+		if mock_start_or_skip(r, mock, "upstream: udp to tcp retry") {
 			defer mock_stop(mock)
 			tcp_port := next_port(r)
 			config := fmt.tprintf(
@@ -524,8 +424,6 @@ blocking: {{ enabled: false }}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "upstream: udp to tcp retry", "server did not start")
 			}
 		}
 	}
@@ -535,41 +433,21 @@ blocking: {{ enabled: false }}
 		dead_port := next_port(r)
 		dead := mock_make("all-dead", dead_port)
 		mock_silent(dead)
-		if !mock_start(dead) {
-			skip_case(r, "upstream: total outage", "cannot start the mock")
-		} else {
+		if mock_start_or_skip(r, dead, "upstream: total outage") {
 			defer mock_stop(dead)
 			udp_port := next_port(r)
-			config := fmt.tprintf(
-				`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 1s
-  attempts: 1
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-				udp_port,
-				dead_port,
-			)
+			config := base_config(udp_port, upstream_at(dead_port), timeout = "1s", upstream_extra = "  attempts: 1")
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: a total outage yields SERVFAIL, not silence")
 				{
-					res := query_udp(udp_port, build_query("anything.test.", u16(dns.Type.A)))
-					if check(r, res.ok, "the server went quiet instead of answering") {
-						h := parse_header(r, res.wire)
+					if _, h, answered := ask(r, udp_port, "anything.test.", u16(dns.Type.A), "the server went quiet instead of answering"); answered {
 						check(r, h.rcode == int(dns.Rcode.Serv_Fail), "rcode %d, want SERVFAIL", h.rcode)
 						check_eq_int(r, h.qdcount, 1, "the question was not echoed")
 					}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "upstream: total outage", "server did not start")
 			}
 		}
 	}
@@ -599,23 +477,11 @@ blocking: {{ enabled: false }}
 			skip_case(r, "upstream: bounded wait", "cannot start the mocks")
 		} else {
 			udp_port := next_port(r)
-			config := fmt.tprintf(
-				`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  strategy: failover
-  timeout: 500ms
-  attempts: 2
-  servers: ["127.0.0.1:%d", "127.0.0.1:%d", "127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+			config := base_config(
 				udp_port,
-				ports[0],
-				ports[1],
-				ports[2],
+				fmt.tprintf(`["127.0.0.1:%d", "127.0.0.1:%d", "127.0.0.1:%d"]`, ports[0], ports[1], ports[2]),
+				timeout = "500ms",
+				upstream_extra = "  strategy: failover\n  attempts: 2",
 			)
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
@@ -636,8 +502,6 @@ blocking: {{ enabled: false }}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "upstream: bounded wait", "server did not start")
 			}
 		}
 	}
@@ -692,9 +556,8 @@ run_stale_connection_cases :: proc(r: ^Runner) {
 		// Drop connections after a beat of idleness.
 		mock_close_idle_after(mock, 250 * time.Millisecond)
 
-		started := c.tls ? mock_start(mock, r.cert_file, r.key_file) : mock_start(mock)
-		if !started {
-			skip_case(r, fmt.tprintf("stale connection over %s", c.name), "cannot start the mock")
+		cert, key := c.tls ? r.cert_file : "", c.tls ? r.key_file : ""
+		if !mock_start_or_skip(r, mock, fmt.tprintf("stale connection over %s", c.name), cert, key) {
 			continue
 		}
 		defer mock_stop(mock)
@@ -703,31 +566,21 @@ run_stale_connection_cases :: proc(r: ^Runner) {
 		server_entry :=
 			c.tls \
 			? fmt.tprintf(
-				"    - {{ name: up, type: tls, address: 127.0.0.1, port: %d, hostname: elodin.local, verify: false }}",
+				"{{ name: up, type: tls, address: 127.0.0.1, port: %d, hostname: elodin.local, verify: false }}",
 				upstream_port,
 			) \
-			: fmt.tprintf("    - \"%s127.0.0.1:%d\"", c.scheme, upstream_port)
+			: fmt.tprintf("\"%s127.0.0.1:%d\"", c.scheme, upstream_port)
 
-		config := fmt.tprintf(
-			`log: {{ level: debug }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 4s
-  attempts: 1
-  servers:
-%s
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+		config := base_config(
 			udp_port,
-			server_entry,
+			fmt.tprintf("[%s]", server_entry),
+			log = "{ level: debug }",
+			timeout = "4s",
+			upstream_extra = "  attempts: 1",
 		)
 
 		srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 		if !ok {
-			skip_case(r, fmt.tprintf("stale connection over %s", c.name), "server did not start")
 			continue
 		}
 
@@ -783,32 +636,21 @@ run_upstream_header_cases :: proc(r: ^Runner) {
 	reply := make_a_response(name, {192, 0, 2, 1}, 300)
 	reply[2], reply[3] = 0x85, 0x40 // QR, AA, RD; RA clear, reserved Z set
 	mock_reply(mock, name, u16(dns.Type.A), reply)
-	if !mock_start(mock) {
-		skip_case(r, "upstream: header bits", "cannot start the mock")
+	if !mock_start_or_skip(r, mock, "upstream: header bits") {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-upstream:
-  timeout: 2s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: true }}
-blocking: {{ enabled: false }}
-dnssec: {{ enabled: false }}
-`,
+	config := base_config(
 		udp_port,
-		udp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		cache = "{ enabled: true }",
+		extra = "dnssec: { enabled: false }",
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
-		skip_case(r, "upstream: header bits", "server did not start")
 		return
 	}
 	defer stop_server(&srv)

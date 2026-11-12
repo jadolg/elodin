@@ -3,6 +3,7 @@ package itest
 import "core:fmt"
 import "core:net"
 import "core:time"
+import "elodin:dns"
 import "elodin:h2"
 
 /*
@@ -10,6 +11,12 @@ elodin as a DoH client: ALPN decides between HTTP/2 and HTTP/1.1 against the
 upstream, exactly as it does the other way around for elodin's own DoH
 listener (cases_h2.odin). See src/upstream/h2client.odin.
 */
+// One DoH upstream on loopback, as an entry of `upstream.servers`.
+@(private = "file")
+doh_upstream :: proc(name: string, port: int) -> string {
+	return fmt.tprintf(`{{ name: %s, type: https, url: "https://127.0.0.1:%d/dns-query", verify: false }}`, name, port)
+}
+
 run_upstream_doh2_cases :: proc(r: ^Runner) {
 	fix := fixture("a")
 	payload := from_hex(fix.response, context.allocator)
@@ -23,28 +30,12 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 		} else {
 			defer doh2_mock_stop(mock)
 			udp_port := next_port(r)
-			config := fmt.tprintf(
-				`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 5s
-  servers:
-    - {{ name: doh2up, type: https, url: "https://127.0.0.1:%d/dns-query", verify: false }}
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-				udp_port,
-				upstream_port,
-			)
+			config := base_config(udp_port, fmt.tprintf("[%s]", doh_upstream("doh2up", upstream_port)), timeout = "5s")
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: resolves a query over a DoH/h2 upstream")
 				{
-					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
-					if check(r, res.ok, "no response") {
-						h := parse_header(r, res.wire)
+					if _, h, answered := ask(r, udp_port, fix.qname, fix.qtype); answered {
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")
 					}
 					h2_hits, h1_hits := doh2_mock_counts(mock)
@@ -67,8 +58,6 @@ blocking: {{ enabled: false }}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "upstream: doh over h2", "server did not start")
 			}
 		}
 	}
@@ -82,28 +71,12 @@ blocking: {{ enabled: false }}
 		} else {
 			defer doh2_mock_stop(mock)
 			udp_port := next_port(r)
-			config := fmt.tprintf(
-				`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 5s
-  servers:
-    - {{ name: h1up, type: https, url: "https://127.0.0.1:%d/dns-query", verify: false }}
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-				udp_port,
-				upstream_port,
-			)
+			config := base_config(udp_port, fmt.tprintf("[%s]", doh_upstream("h1up", upstream_port)), timeout = "5s")
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: falls back to http/1.1 when the upstream does not offer h2")
 				{
-					res := query_udp(udp_port, build_query(fix.qname, fix.qtype))
-					if check(r, res.ok, "no response") {
-						h := parse_header(r, res.wire)
+					if _, h, answered := ask(r, udp_port, fix.qname, fix.qtype); answered {
 						check_eq_int(r, h.ancount, fix.ancount, "answer count")
 					}
 					h2_hits, h1_hits := doh2_mock_counts(mock)
@@ -112,8 +85,6 @@ blocking: {{ enabled: false }}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "upstream: doh h2 alpn fallback", "server did not start")
 			}
 		}
 	}
@@ -140,24 +111,7 @@ blocking: {{ enabled: false }}
 			skip_case(r, "upstream: doh h1 503 in a race", "cannot start the mock")
 		} else {
 			udp_port := next_port(r)
-			config := fmt.tprintf(
-				`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 5s
-  strategy: race
-  servers:
-    - {{ name: down, type: https, url: "https://127.0.0.1:%d/dns-query", verify: false }}
-    - {{ name: up, type: https, url: "https://127.0.0.1:%d/dns-query", verify: false }}
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-				udp_port,
-				down_port,
-				up_port,
-			)
+			config := base_config(udp_port, fmt.tprintf("[%s, %s]", doh_upstream("down", down_port), doh_upstream("up", up_port)), timeout = "5s", upstream_extra = "  strategy: race")
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: a race rides through an HTTP/1.1 member answering 503 with a body")
@@ -184,8 +138,6 @@ blocking: {{ enabled: false }}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "upstream: doh h1 503 in a race", "server did not start")
 			}
 		}
 	}
@@ -205,21 +157,7 @@ blocking: {{ enabled: false }}
 		} else {
 			defer doh2_mock_stop(mock)
 			udp_port := next_port(r)
-			config := fmt.tprintf(
-				`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 5s
-  servers:
-    - {{ name: big, type: https, url: "https://127.0.0.1:%d/dns-query", verify: false }}
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-				udp_port,
-				upstream_port,
-			)
+			config := base_config(udp_port, fmt.tprintf("[%s]", doh_upstream("big", upstream_port)), timeout = "5s")
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: a DoH reply over HTTP/1.1 longer than a DNS message is refused")
@@ -227,15 +165,13 @@ blocking: {{ enabled: false }}
 					res := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 0x5250))
 					if check(r, res.ok, "no response") {
 						h := parse_header(r, res.wire)
-						check_eq_int(r, h.rcode, 2, "rcode (SERVFAIL)")
+						check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode")
 					}
 					_, h1_hits := doh2_mock_counts(mock)
 					check(r, h1_hits >= 1, "the oversized member was never asked over HTTP/1.1")
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, "upstream: doh h1 oversized reply", "server did not start")
 			}
 		}
 	}
@@ -256,8 +192,8 @@ blocking: {{ enabled: false }}
 			rcode:    int,
 		}
 		trailer_cases := []Trailer_Case {
-			{"upstream: an h2 answer that ends with trailers is taken", 200, {{name = "x-t", value = "1"}}, 0},
-			{"upstream: a :status in an h2 answer's trailers is no answer", 500, {{name = ":status", value = "200"}}, 2},
+			{"upstream: an h2 answer that ends with trailers is taken", 200, {{name = "x-t", value = "1"}}, int(dns.Rcode.No_Error)},
+			{"upstream: a :status in an h2 answer's trailers is no answer", 500, {{name = ":status", value = "200"}}, int(dns.Rcode.Serv_Fail)},
 		}
 		for tc, i in trailer_cases {
 			upstream_port := next_port(r)
@@ -270,21 +206,7 @@ blocking: {{ enabled: false }}
 				continue
 			}
 			udp_port := next_port(r)
-			config := fmt.tprintf(
-				`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 5s
-  servers:
-    - {{ name: trailers, type: https, url: "https://127.0.0.1:%d/dns-query", verify: false }}
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-				udp_port,
-				upstream_port,
-			)
+			config := base_config(udp_port, fmt.tprintf("[%s]", doh_upstream("trailers", upstream_port)), timeout = "5s")
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, tc.what)
@@ -299,8 +221,6 @@ blocking: {{ enabled: false }}
 				}
 				end_case(r)
 				stop_server(&srv)
-			} else {
-				skip_case(r, tc.what, "server did not start")
 			}
 			doh2_mock_stop(mock)
 		}

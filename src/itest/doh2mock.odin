@@ -2,7 +2,6 @@ package itest
 
 import "core:fmt"
 import "core:net"
-import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -83,7 +82,13 @@ doh2_mock_start :: proc(m: ^Doh2_Mock, cert_file, key_file: string, alpn: []stri
 	m.tls_ctx = ctx
 	m.listener = sock
 	_ = net.set_option(sock, .Receive_Timeout, POLL_INTERVAL)
-	append(&m.threads, thread.create_and_start_with_poly_data(m, doh2_mock_loop))
+	if !track_thread(&m.mu, &m.threads, thread.create_and_start_with_poly_data(m, doh2_mock_loop)) {
+		m.tls_ctx = nil
+		m.listener = 0
+		net.close(sock)
+		tlsx.context_destroy(ctx)
+		return false
+	}
 	return true
 }
 
@@ -92,21 +97,7 @@ doh2_mock_stop :: proc(m: ^Doh2_Mock) {
 	if m.listener != 0 {
 		net.close(m.listener)
 	}
-	for {
-		sync.mutex_lock(&m.mu)
-		pending := m.threads
-		m.threads = make([dynamic]^thread.Thread, 0, 4)
-		sync.mutex_unlock(&m.mu)
-		if len(pending) == 0 {
-			delete(pending)
-			break
-		}
-		for t in pending {
-			thread.join(t)
-			thread.destroy(t)
-		}
-		delete(pending)
-	}
+	join_threads(&m.mu, &m.threads)
 	delete(m.threads)
 	if m.last_reply != nil {
 		delete(m.last_reply)
@@ -154,16 +145,10 @@ doh2_mock_loop :: proc(m: ^Doh2_Mock) {
 		conn := new(Doh2_Conn)
 		conn.mock = m
 		conn.socket = client
-		t := thread.create_and_start_with_poly_data(conn, doh2_mock_conn)
-		if t == nil {
-			// Turned away rather than appended: `thread.join` on nil would crash the stop.
+		if !track_thread(&m.mu, &m.threads, thread.create_and_start_with_poly_data(conn, doh2_mock_conn)) {
 			net.close(client)
 			free(conn)
-			continue
 		}
-		sync.mutex_lock(&m.mu)
-		append(&m.threads, t)
-		sync.mutex_unlock(&m.mu)
 	}
 }
 
@@ -334,12 +319,7 @@ doh2_serve_http1 :: proc(conn: ^Doh2_Conn) {
 	}
 	path := parts[1]
 
-	content_length := 0
-	for line in strings.split_lines_iterator(&head) {
-		if idx := strings.index_byte(line, ':'); idx >= 0 && strings.equal_fold(strings.trim_space(line[:idx]), "content-length") {
-			content_length, _ = strconv.parse_int(strings.trim_space(line[idx + 1:]))
-		}
-	}
+	content_length := header_int(head, "content-length")
 
 	for len(body) < content_length {
 		if sync.atomic_load(&m.stop) {
@@ -387,21 +367,9 @@ doh2_serve_http1 :: proc(conn: ^Doh2_Conn) {
 	strings.write_string(&b, "\r\nConnection: close\r\n\r\n")
 	out := transmute([]u8)strings.to_string(b)
 
-	sent := 0
-	for sent < len(out) {
-		n, err := tlsx.write(conn.tls, out[sent:])
-		if err != .None || n <= 0 {
-			return
-		}
-		sent += n
-	}
-	sent = 0
-	for sent < len(reply) {
-		n, err := tlsx.write(conn.tls, reply[sent:])
-		if err != .None || n <= 0 {
-			return
-		}
-		sent += n
+	// `tlsx.write` writes the whole slice or fails.
+	if _, err := tlsx.write(conn.tls, out); err == .None {
+		_, _ = tlsx.write(conn.tls, reply)
 	}
 }
 

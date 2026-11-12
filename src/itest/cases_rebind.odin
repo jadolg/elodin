@@ -1,6 +1,5 @@
 package itest
 
-import "core:fmt"
 import "elodin:dns"
 
 /*
@@ -19,52 +18,21 @@ A synthesising mock answers whatever name is asked with a chosen address, which
 is exactly the move the attack makes: the name is public, the address is not.
 */
 
-// The info-code of the extended error a response carries, or -1 if it has none.
-@(private = "file")
-extended_error_code :: proc(r: ^Runner, wire: []u8) -> int {
-	msg, ok := decode_reply(r, wire)
-	if !ok {
-		return -1
-	}
-	for rec in msg.additional {
-		opt, is_opt := rec.data.(dns.Rdata_OPT)
-		if !is_opt {
-			continue
-		}
-		for option in opt.options {
-			if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
-				return int(option.data[0]) << 8 | int(option.data[1])
-			}
-		}
-	}
-	return -1
-}
-
 /*
-The configuration for one synthesising upstream and the given `rebind:` block.
+The configuration for one upstream, tried once, and the given top-level `extra`
+sections - a `rebind:` or `special_use:` block, say.
 
-The config is generated per case so the `rebind:` block can vary; caching and
-blocking are off so nothing sits between the upstream's answer and the guard, and
-the query log is on so the `outcome=blocked` line can be asserted.
+Caching and blocking are off so nothing sits between the upstream's answer and
+the decision under test, and the query log is on so its `outcome=` line can be
+asserted. Shared with `cases_special_use.odin`.
 */
-@(private = "file")
-rebind_config :: proc(udp_port, upstream_port: int, rebind_block: string) -> string {
-	return fmt.tprintf(
-		`log: {{ level: debug, queries: true }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 2s
-  attempts: 1
-  servers:
-    - "127.0.0.1:%d"
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-%s`,
+logged_config :: proc(udp_port, upstream_port: int, extra := "") -> string {
+	return base_config(
 		udp_port,
-		upstream_port,
-		rebind_block,
+		upstream_at(upstream_port),
+		log = "{ level: debug, queries: true }",
+		upstream_extra = "  attempts: 1",
+		extra = extra,
 	)
 }
 
@@ -84,36 +52,27 @@ case that would fail loudest if the default were ever flipped by accident.
 */
 @(private = "file")
 run_rebind_default_case :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("rebind-default", upstream_port)
 	// A public name whose upstream answers with an RFC 1918 address - the shape
 	// the guard exists to refuse, forwarded here because the guard is off.
-	mock_synth_all(mock, {192, 168, 1, 1})
-	if !mock_start(mock) {
-		skip_case(r, "rebind: off by default", "cannot start the mock")
+	mock, upstream_port, mock_ok := synth_mock(r, "rebind-default", "rebind: off by default", {192, 168, 1, 1})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
 	// No `rebind:` block at all, so the shipped default is what answers.
-	srv, ok := start_server(r, Server_Options{config = rebind_config(udp_port, upstream_port, ""), udp_port = udp_port})
+	srv, ok := start_server(r, Server_Options{config = logged_config(udp_port, upstream_port), udp_port = udp_port})
 	if !ok {
-		skip_case(r, "rebind: off by default", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
 
 	start_case(r, "rebind: a private address is forwarded when the guard is off by default")
 	{
-		res := query_udp(udp_port, build_query("rebind.attacker.test.", u16(dns.Type.A)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if res, h, answered := ask(r, udp_port, "rebind.attacker.test.", u16(dns.Type.A)); answered {
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
-			addrs := answer_addresses(r, res.wire)
-			if check(r, len(addrs) == 1, "expected the answer forwarded, got %d addresses", len(addrs)) {
-				check_eq_str(r, addrs[0], "192.168.1.1", "forwarded address")
-			}
+			check_one_address(r, res.wire, "192.168.1.1", "forwarded address")
 		}
 		check(r, !log_contains(&srv, "detail=rebind"), "the guard refused an answer while off")
 	}
@@ -133,18 +92,14 @@ useless, so the second says it lets an ordinary answer through untouched.
 run_rebind_refusal_cases :: proc(r: ^Runner) {
 	// --- a private address is refused ---
 	{
-		upstream_port := next_port(r)
-		mock := mock_make("rebind-private", upstream_port)
-		mock_synth_all(mock, {192, 168, 1, 1})
-		if !mock_start(mock) {
-			skip_case(r, "rebind: refuses a private address", "cannot start the mock")
-		} else {
+		mock, upstream_port, mock_ok := synth_mock(r, "rebind-private", "rebind: refuses a private address", {192, 168, 1, 1})
+		if mock_ok {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = rebind_config(udp_port, upstream_port, "rebind: { enabled: true }\n"),
+					config = logged_config(udp_port, upstream_port, "rebind: { enabled: true }\n"),
 					udp_port = udp_port,
 				},
 			)
@@ -162,32 +117,26 @@ run_rebind_refusal_cases :: proc(r: ^Runner) {
 						check_eq_int(r, h.ancount, 0, "answer count")
 						check(r, h.nscount >= 1, "no SOA in the authority section")
 						check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
-						check_eq_int(r, extended_error_code(r, res.wire), 15, "extended error info-code")
+						check_eq_int(r, extended_error(r, res.wire), 15, "extended error info-code")
 					}
 					check(r, log_contains(&srv, "outcome=blocked detail=rebind"), "the query log did not record the refusal")
 					check(r, log_contains(&srv, "rebinding attack"), "no warning was logged for the first refusal")
 				}
 				end_case(r)
-			} else {
-				skip_case(r, "rebind: refuses a private address", "server did not start")
 			}
 		}
 	}
 
 	// --- a public address is forwarded unchanged ---
 	{
-		upstream_port := next_port(r)
-		mock := mock_make("rebind-public", upstream_port)
-		mock_synth_all(mock, {198, 51, 100, 7})
-		if !mock_start(mock) {
-			skip_case(r, "rebind: forwards a public address", "cannot start the mock")
-		} else {
+		mock, upstream_port, mock_ok := synth_mock(r, "rebind-public", "rebind: forwards a public address", {198, 51, 100, 7})
+		if mock_ok {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = rebind_config(udp_port, upstream_port, "rebind: { enabled: true }\n"),
+					config = logged_config(udp_port, upstream_port, "rebind: { enabled: true }\n"),
 					udp_port = udp_port,
 				},
 			)
@@ -195,20 +144,13 @@ run_rebind_refusal_cases :: proc(r: ^Runner) {
 				defer stop_server(&srv)
 				start_case(r, "rebind: a public address is forwarded unchanged with the guard on")
 				{
-					res := query_udp(udp_port, build_query("example.test.", u16(dns.Type.A)))
-					if check(r, res.ok, "no response") {
-						h := parse_header(r, res.wire)
+					if res, h, answered := ask(r, udp_port, "example.test.", u16(dns.Type.A)); answered {
 						check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
-						addrs := answer_addresses(r, res.wire)
-						if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
-							check_eq_str(r, addrs[0], "198.51.100.7", "forwarded address")
-						}
+						check_one_address(r, res.wire, "198.51.100.7", "forwarded address")
 					}
 					check(r, !log_contains(&srv, "detail=rebind"), "a public answer was refused")
 				}
 				end_case(r)
-			} else {
-				skip_case(r, "rebind: forwards a public address", "server did not start")
 			}
 		}
 	}
@@ -228,19 +170,15 @@ address on another name is still refused.
 run_rebind_exemption_cases :: proc(r: ^Runner) {
 	// --- allow_domains ---
 	{
-		upstream_port := next_port(r)
-		mock := mock_make("rebind-exempt", upstream_port)
 		// Any name answers privately; only the exempt zone should be forwarded.
-		mock_synth_all(mock, {192, 168, 1, 50})
-		if !mock_start(mock) {
-			skip_case(r, "rebind: allow_domains", "cannot start the mock")
-		} else {
+		mock, upstream_port, mock_ok := synth_mock(r, "rebind-exempt", "rebind: allow_domains", {192, 168, 1, 50})
+		if mock_ok {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = rebind_config(udp_port, upstream_port, "rebind:\n  enabled: true\n  allow_domains: [corp.test]\n"),
+					config = logged_config(udp_port, upstream_port, "rebind:\n  enabled: true\n  allow_domains: [corp.test]\n"),
 					udp_port = udp_port,
 				},
 			)
@@ -250,10 +188,7 @@ run_rebind_exemption_cases :: proc(r: ^Runner) {
 				{
 					res := query_udp(udp_port, build_query("nas.corp.test.", u16(dns.Type.A)))
 					if check(r, res.ok, "no response") {
-						addrs := answer_addresses(r, res.wire)
-						if check(r, len(addrs) == 1, "expected the exempt answer forwarded, got %d", len(addrs)) {
-							check_eq_str(r, addrs[0], "192.168.1.50", "forwarded address")
-						}
+						check_one_address(r, res.wire, "192.168.1.50", "forwarded address")
 					}
 				}
 				end_case(r)
@@ -262,16 +197,12 @@ run_rebind_exemption_cases :: proc(r: ^Runner) {
 				{
 					// notcorp.test is not below corp.test - the label boundary,
 					// not a substring, decides.
-					res := query_udp(udp_port, build_query("nas.notcorp.test.", u16(dns.Type.A)))
-					if check(r, res.ok, "no response") {
-						h := parse_header(r, res.wire)
+					if res, h, answered := ask(r, udp_port, "nas.notcorp.test.", u16(dns.Type.A)); answered {
 						check_eq_int(r, h.ancount, 0, "answer count")
 						check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
 					}
 				}
 				end_case(r)
-			} else {
-				skip_case(r, "rebind: allow_domains", "server did not start")
 			}
 		}
 	}
@@ -284,15 +215,13 @@ run_rebind_exemption_cases :: proc(r: ^Runner) {
 		// seen to open the first without opening the second.
 		mock_synth(mock, "loop.test.", u16(dns.Type.A), {127, 0, 0, 1})
 		mock_synth(mock, "priv.test.", u16(dns.Type.A), {192, 168, 1, 1})
-		if !mock_start(mock) {
-			skip_case(r, "rebind: allow_loopback", "cannot start the mock")
-		} else {
+		if mock_start_or_skip(r, mock, "rebind: allow_loopback") {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = rebind_config(udp_port, upstream_port, "rebind:\n  enabled: true\n  allow_loopback: true\n"),
+					config = logged_config(udp_port, upstream_port, "rebind:\n  enabled: true\n  allow_loopback: true\n"),
 					udp_port = udp_port,
 				},
 			)
@@ -302,26 +231,19 @@ run_rebind_exemption_cases :: proc(r: ^Runner) {
 				{
 					res := query_udp(udp_port, build_query("loop.test.", u16(dns.Type.A)))
 					if check(r, res.ok, "no response") {
-						addrs := answer_addresses(r, res.wire)
-						if check(r, len(addrs) == 1, "expected loopback forwarded, got %d", len(addrs)) {
-							check_eq_str(r, addrs[0], "127.0.0.1", "forwarded address")
-						}
+						check_one_address(r, res.wire, "127.0.0.1", "forwarded address")
 					}
 				}
 				end_case(r)
 
 				start_case(r, "rebind: allow_loopback does not open RFC 1918")
 				{
-					res := query_udp(udp_port, build_query("priv.test.", u16(dns.Type.A)))
-					if check(r, res.ok, "no response") {
-						h := parse_header(r, res.wire)
+					if res, h, answered := ask(r, udp_port, "priv.test.", u16(dns.Type.A)); answered {
 						check_eq_int(r, h.ancount, 0, "answer count")
 						check_eq_int(r, len(answer_addresses(r, res.wire)), 0, "addresses handed to the client")
 					}
 				}
 				end_case(r)
-			} else {
-				skip_case(r, "rebind: allow_loopback", "server did not start")
 			}
 		}
 	}

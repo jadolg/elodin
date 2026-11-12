@@ -576,6 +576,17 @@ pw_find_option :: proc(m: Pw_Msg, code: u16) -> (data: []u8, found: bool) {
 	return nil, false
 }
 
+// The same search over the options a generated query carried, which holds at
+// most one of each code (`pg_options`).
+pq_find_option :: proc(q: Parity_Query, code: u16) -> (data: []u8, found: bool) {
+	for o in q.options {
+		if o.code == code {
+			return o.data, true
+		}
+	}
+	return nil, false
+}
+
 // --- rendering -------------------------------------------------------------
 
 /*
@@ -700,19 +711,31 @@ pw_fold_rdata_names :: proc(type: u16, rdata: []u8, allocator: mem.Allocator) ->
 		pw_lower_name(out[pos:])
 		// Step over the name this just lowered. Canonical RDATA holds no
 		// pointers, so the walk is label by label to the root.
-		for pos < len(out) {
-			n := int(out[pos])
-			if n == 0 {
-				pos += 1
-				break
-			}
-			if pos + 1 + n > len(out) {
-				return out
-			}
-			pos += 1 + n
+		end, ok := pw_name_end(out, pos)
+		if !ok {
+			return out
 		}
+		pos = end
 	}
 	return out
+}
+
+// Where an uncompressed name starting at `start` ends. A pointer is refused
+// rather than followed: the callers read one record's RDATA, which has no
+// message to follow it into.
+pw_name_end :: proc(buf: []u8, start: int) -> (end: int, ok: bool) {
+	i := start
+	for i < len(buf) {
+		length := int(buf[i])
+		if length == 0 {
+			return i + 1, true
+		}
+		if length >= 0xc0 {
+			return 0, false
+		}
+		i += 1 + length
+	}
+	return 0, false
 }
 
 // The same line without the TTL, for the comparisons that hold a TTL to a range

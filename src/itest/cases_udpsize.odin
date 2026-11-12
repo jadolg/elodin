@@ -21,25 +21,15 @@ reflect and no reason to make a client ask twice.
 
 @(private = "file")
 config_udp_size :: proc(udp_port, tcp_port, upstream_port: int, ceiling: string) -> string {
-	return fmt.tprintf(
-		`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-server:
-  %s
-upstream:
-  timeout: 3s
-  # TCP, so the mock's oversized answer reaches us whole rather than being
-  # clipped on the way in by the thing under test.
-  servers: ["tcp://127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+	return base_config(
 		udp_port,
-		tcp_port,
-		ceiling,
-		upstream_port,
+		// TCP, so the mock's oversized answer reaches us whole rather than being
+		// clipped on the way in by the thing under test.
+		fmt.tprintf(`["tcp://127.0.0.1:%d"]`, upstream_port),
+		log = "{ level: info }",
+		timeout = "3s",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		extra = ceiling == "" ? "" : fmt.tprintf("server:\n  %s", ceiling),
 	)
 }
 
@@ -67,18 +57,7 @@ big_txt_answer :: proc(name: string, count: int, allocator := context.allocator)
 			data  = dns.Rdata_TXT{strings = strs},
 		}
 	}
-	m := dns.Message {
-		question   = []dns.Question{{name = name, type = .TXT, class = .IN}},
-		answer     = answers,
-		additional = []dns.Record{dns.make_opt(4096, false)},
-	}
-	m.flags.qr = true
-	m.flags.ra = true
-	wire, _, err := dns.encode_message(m, allocator, dns.MAX_MESSAGE)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return encode_reply(name, .TXT, {answer = answers, additional = []dns.Record{dns.make_opt(4096, false)}}, allocator)
 }
 
 run_udp_size_cases :: proc(r: ^Runner) {
@@ -94,8 +73,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 	// rest: `mock_synth` appends to the rule list without a lock, and the
 	// serving threads read it.
 	mock_synth(mock, "buffer.example.", u16(dns.Type.A), {192, 0, 2, 11})
-	if !mock_start(mock) {
-		skip_case(r, "max_udp_response", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "max_udp_response") {
 		return
 	}
 	defer mock_stop(mock)
@@ -103,147 +81,121 @@ run_udp_size_cases :: proc(r: ^Runner) {
 	query := build_query("big.example.", u16(dns.Type.TXT), id = 0x60, edns_size = 4096, allocator = context.allocator)
 	defer delete(query)
 
-	start_case(r, "max_udp_response: the default holds a client that asks for 4096 to 1232")
+	// One server per ceiling, and each case below asks it: the default first,
+	// whose log lines the first case reads, then a raised one.
 	{
 		udp_port, tcp_port := next_port(r), next_port(r)
 		srv, ok := start_server(
 			r,
 			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), udp_port = udp_port, tcp_port = tcp_port},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
-			res := query_udp(udp_port, query, context.temp_allocator)
-			if check(r, res.ok, "no answer came back") {
+			start_case(r, "max_udp_response: the default holds a client that asks for 4096 to 1232")
+			{
+				res := query_udp(udp_port, query, context.temp_allocator)
+				if check(r, res.ok, "no answer came back") {
+					check(
+						r,
+						len(res.wire) <= 1232,
+						"the answer is %d bytes, past the 1232 default ceiling",
+						len(res.wire),
+					)
+					h := parse_header(r, res.wire)
+					check(r, h.tc, "the truncated answer does not carry TC, so no client would retry")
+				}
+
+				// And the message an operator needs in order to know which setting
+				// did it, and that it is theirs to change.
+				check(r, log_contains(&srv, "max_udp_response"), "the log does not name the setting; log:\n%s", read_log(&srv))
 				check(
 					r,
-					len(res.wire) <= 1232,
-					"the answer is %d bytes, past the 1232 default ceiling",
-					len(res.wire),
+					log_contains(&srv, "retry over TCP"),
+					"the log does not say what happened to the answer; log:\n%s",
+					read_log(&srv),
 				)
-				h := parse_header(r, res.wire)
-				check(r, h.tc, "the truncated answer does not carry TC, so no client would retry")
+				check(
+					r,
+					log_contains(&srv, "raise server.max_udp_response"),
+					"the log does not say what to change; log:\n%s",
+					read_log(&srv),
+				)
 			}
+			end_case(r)
 
-			// And the message an operator needs in order to know which setting
-			// did it, and that it is theirs to change.
-			check(r, log_contains(&srv, "max_udp_response"), "the log does not name the setting; log:\n%s", read_log(&srv))
-			check(
-				r,
-				log_contains(&srv, "retry over TCP"),
-				"the log does not say what happened to the answer; log:\n%s",
-				read_log(&srv),
-			)
-			check(
-				r,
-				log_contains(&srv, "raise server.max_udp_response"),
-				"the log does not say what to change; log:\n%s",
-				read_log(&srv),
-			)
+			// TCP proves the address before a query arrives, so there is nothing to
+			// reflect and the ceiling does not belong there.
+			start_case(r, "max_udp_response: the ceiling does not apply over tcp")
+			{
+				res := query_tcp(tcp_port, query, context.temp_allocator)
+				if check(r, res.ok, "no answer came back over tcp") {
+					check(r, len(res.wire) > 1232, "tcp answered only %d bytes; the UDP ceiling leaked", len(res.wire))
+					h := parse_header(r, res.wire)
+					check(r, !h.tc, "a tcp answer was truncated")
+				}
+			}
+			end_case(r)
+
+			/*
+			The number in the answer's own OPT record, which is what a downstream
+			forwarder sizes its buffers on.
+
+			RFC 6891 section 6.2.4 makes that field the responder's, not a copy of the
+			requestor's. Echoing the client's 4096 back while sending 1232 tells a
+			forwarder chaining through here to expect an answer that cannot arrive, and
+			it then pays for the TC bit and the TCP round trip it was told it would not
+			need. Both directions are pinned: against the default ceiling the answer
+			reads 1232, and against a raised one it reads 4096.
+			*/
+			start_case(r, "max_udp_response: the answer's OPT reports the ceiling, not the client's figure")
+			{
+				res := query_udp(udp_port, query, context.temp_allocator)
+				if check(r, res.ok, "no answer came back") {
+					check_eq_int(r, int(dns.peek_udp_size(res.wire)), 1232, "the payload size the answer advertises")
+				}
+			}
+			end_case(r)
 		}
 	}
-	end_case(r)
 
-	// The ceiling is a setting, so raising it has to actually deliver the answer
-	// the client asked for rather than only silence the message.
-	start_case(r, "max_udp_response: raising it to 4096 sends the whole answer over UDP")
 	{
 		udp_port, tcp_port := next_port(r), next_port(r)
 		srv, ok := start_server(
 			r,
-			Server_Options {
-				config = config_udp_size(udp_port, tcp_port, upstream_port, "max_udp_response: 4096"),
-				udp_port = udp_port,
-				tcp_port = tcp_port,
-			},
+			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, "max_udp_response: 4096"), udp_port = udp_port, tcp_port = tcp_port},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
-			res := query_udp(udp_port, query, context.temp_allocator)
-			if check(r, res.ok, "no answer came back") {
-				check(r, len(res.wire) > 1232, "the answer is only %d bytes; the ceiling was not lifted", len(res.wire))
-				h := parse_header(r, res.wire)
-				check(r, !h.tc, "the answer carries TC even though it fits")
-				check_eq_int(r, h.ancount, 10, "answer count")
+			// The ceiling is a setting, so raising it has to actually deliver the answer
+			// the client asked for rather than only silence the message.
+			start_case(r, "max_udp_response: raising it to 4096 sends the whole answer over UDP")
+			{
+				res := query_udp(udp_port, query, context.temp_allocator)
+				if check(r, res.ok, "no answer came back") {
+					check(r, len(res.wire) > 1232, "the answer is only %d bytes; the ceiling was not lifted", len(res.wire))
+					h := parse_header(r, res.wire)
+					check(r, !h.tc, "the answer carries TC even though it fits")
+					check_eq_int(r, h.ancount, 10, "answer count")
+				}
+				check(
+					r,
+					!log_contains(&srv, "raise server.max_udp_response"),
+					"an answer that fit still asked the operator to raise the ceiling; log:\n%s",
+					read_log(&srv),
+				)
 			}
-			check(
-				r,
-				!log_contains(&srv, "raise server.max_udp_response"),
-				"an answer that fit still asked the operator to raise the ceiling; log:\n%s",
-				read_log(&srv),
-			)
+			end_case(r)
+
+			start_case(r, "max_udp_response: a raised ceiling is the number the answer reports")
+			{
+				res := query_udp(udp_port, query, context.temp_allocator)
+				if check(r, res.ok, "no answer came back") {
+					check_eq_int(r, int(dns.peek_udp_size(res.wire)), 4096, "the payload size the answer advertises")
+				}
+			}
+			end_case(r)
 		}
 	}
-	end_case(r)
-
-	// TCP proves the address before a query arrives, so there is nothing to
-	// reflect and the ceiling does not belong there.
-	start_case(r, "max_udp_response: the ceiling does not apply over tcp")
-	{
-		udp_port, tcp_port := next_port(r), next_port(r)
-		srv, ok := start_server(
-			r,
-			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), udp_port = udp_port, tcp_port = tcp_port},
-		)
-		if check(r, ok, "server did not start") {
-			defer stop_server(&srv)
-			res := query_tcp(tcp_port, query, context.temp_allocator)
-			if check(r, res.ok, "no answer came back over tcp") {
-				check(r, len(res.wire) > 1232, "tcp answered only %d bytes; the UDP ceiling leaked", len(res.wire))
-				h := parse_header(r, res.wire)
-				check(r, !h.tc, "a tcp answer was truncated")
-			}
-		}
-	}
-	end_case(r)
-
-	/*
-	The number in the answer's own OPT record, which is what a downstream
-	forwarder sizes its buffers on.
-
-	RFC 6891 section 6.2.4 makes that field the responder's, not a copy of the
-	requestor's. Echoing the client's 4096 back while sending 1232 tells a
-	forwarder chaining through here to expect an answer that cannot arrive, and
-	it then pays for the TC bit and the TCP round trip it was told it would not
-	need. Both directions are pinned: against the default ceiling the answer
-	reads 1232, and against a raised one it reads 4096.
-	*/
-	start_case(r, "max_udp_response: the answer's OPT reports the ceiling, not the client's figure")
-	{
-		udp_port, tcp_port := next_port(r), next_port(r)
-		srv, ok := start_server(
-			r,
-			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), udp_port = udp_port, tcp_port = tcp_port},
-		)
-		if check(r, ok, "server did not start") {
-			defer stop_server(&srv)
-			res := query_udp(udp_port, query, context.temp_allocator)
-			if check(r, res.ok, "no answer came back") {
-				check_eq_int(r, int(dns.peek_udp_size(res.wire)), 1232, "the payload size the answer advertises")
-			}
-		}
-	}
-	end_case(r)
-
-	start_case(r, "max_udp_response: a raised ceiling is the number the answer reports")
-	{
-		udp_port, tcp_port := next_port(r), next_port(r)
-		srv, ok := start_server(
-			r,
-			Server_Options {
-				config = config_udp_size(udp_port, tcp_port, upstream_port, "max_udp_response: 4096"),
-				udp_port = udp_port,
-				tcp_port = tcp_port,
-			},
-		)
-		if check(r, ok, "server did not start") {
-			defer stop_server(&srv)
-			res := query_udp(udp_port, query, context.temp_allocator)
-			if check(r, res.ok, "no answer came back") {
-				check_eq_int(r, int(dns.peek_udp_size(res.wire)), 4096, "the payload size the answer advertises")
-			}
-		}
-	}
-	end_case(r)
 
 	// A client that asked for less than the ceiling gets what it asked for, and
 	// nothing is said about a setting that had no part in it.
@@ -254,7 +206,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 			r,
 			Server_Options{config = config_udp_size(udp_port, tcp_port, upstream_port, ""), udp_port = udp_port, tcp_port = tcp_port},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			small := build_query(
 				"big.example.",
@@ -304,22 +256,9 @@ run_udp_size_cases :: proc(r: ^Runner) {
 	start_case(r, "upstream: a client's 65000-byte edns buffer is not forwarded upstream")
 	{
 		udp_port := next_port(r)
-		config := fmt.tprintf(
-			`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["udp://127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-			udp_port,
-			upstream_port,
-		)
+		config := base_config(udp_port, fmt.tprintf(`["udp://127.0.0.1:%d"]`, upstream_port), timeout = "3s")
 		srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			asked := build_query(
 				"buffer.example.",

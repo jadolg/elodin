@@ -73,7 +73,11 @@ http_mock_start :: proc(m: ^Http_Mock) -> bool {
 	}
 	m.socket = sock
 	_ = net.set_option(sock, .Receive_Timeout, POLL_INTERVAL)
-	append(&m.threads, thread.create_and_start_with_poly_data(m, http_mock_loop))
+	if !track_thread(&m.mu, &m.threads, thread.create_and_start_with_poly_data(m, http_mock_loop)) {
+		m.socket = 0
+		net.close(sock)
+		return false
+	}
 	return true
 }
 
@@ -82,22 +86,7 @@ http_mock_stop :: proc(m: ^Http_Mock) {
 	if m.socket != 0 {
 		net.close(m.socket)
 	}
-	for {
-		sync.mutex_lock(&m.mu)
-		pending := m.threads
-		m.threads = make([dynamic]^thread.Thread, 0, 4)
-		sync.mutex_unlock(&m.mu)
-
-		if len(pending) == 0 {
-			delete(pending)
-			break
-		}
-		for t in pending {
-			thread.join(t)
-			thread.destroy(t)
-		}
-		delete(pending)
-	}
+	join_threads(&m.mu, &m.threads)
 	delete(m.threads)
 	for route in m.routes {
 		delete(route.path)
@@ -125,16 +114,10 @@ http_mock_loop :: proc(m: ^Http_Mock) {
 		conn := new(Http_Mock_Conn)
 		conn.mock = m
 		conn.socket = client
-		t := thread.create_and_start_with_poly_data(conn, http_mock_conn)
-		if t == nil {
-			// Turned away rather than appended: `thread.join` on nil would crash the stop.
+		if !track_thread(&m.mu, &m.threads, thread.create_and_start_with_poly_data(conn, http_mock_conn)) {
 			net.close(client)
 			free(conn)
-			continue
 		}
-		sync.mutex_lock(&m.mu)
-		append(&m.threads, t)
-		sync.mutex_unlock(&m.mu)
 	}
 }
 
@@ -213,13 +196,6 @@ http_mock_conn :: proc(conn: ^Http_Mock_Conn) {
 		strings.write_string(&b, body)
 	}
 
-	out := transmute([]u8)strings.to_string(b)
-	sent := 0
-	for sent < len(out) {
-		n, err := net.send_tcp(conn.socket, out[sent:])
-		if err != nil || n <= 0 {
-			return
-		}
-		sent += n
-	}
+	// `send_tcp` writes it all or fails; a failure leaves the client nothing to read.
+	_, _ = net.send_tcp(conn.socket, transmute([]u8)strings.to_string(b))
 }

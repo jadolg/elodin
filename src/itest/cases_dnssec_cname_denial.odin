@@ -1,6 +1,5 @@
 package itest
 
-import "core:fmt"
 import "elodin:dns"
 
 /*
@@ -274,36 +273,16 @@ CD_PADDED :: "bare.cdsrc."
 
 @(private = "file")
 with_unsigned_answer :: proc(wire: []u8) -> ([]u8, bool) {
-	msg, err := dns.decode_message(wire, context.allocator)
+	msg, err := dns.decode_message(wire, context.temp_allocator)
 	if err != .None {
 		return nil, false
 	}
-	answer := make([dynamic]dns.Record, 0, len(msg.answer) + 1, context.allocator)
+	answer := make([dynamic]dns.Record, 0, len(msg.answer) + 1, context.temp_allocator)
 	append(&answer, ..msg.answer)
 	append(&answer, dns.Record{name = "x.cdun.", type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {192, 0, 2, 1}}})
 	msg.answer = answer[:]
 	out, _, eerr := dns.encode_message(msg, context.allocator)
 	return out, eerr == .None
-}
-
-@(private = "file")
-cd_config :: proc(udp_port, upstream_port: int) -> string {
-	return fmt.tprintf(
-		`listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  servers: [udp://127.0.0.1:%d]
-blocking: {{enabled: false}}
-dnssec:
-  enabled: true
-  trust_anchors:
-    - %q
-`,
-		udp_port,
-		upstream_port,
-		CD_ANCHOR,
-	)
 }
 
 run_dnssec_cname_denial_cases :: proc(r: ^Runner) {
@@ -314,20 +293,21 @@ run_dnssec_cname_denial_cases :: proc(r: ^Runner) {
 			padded, padded_ok := with_unsigned_answer(wire)
 			if !padded_ok {
 				skip_case(r, "dnssec: denial after a cname", "cannot append to the unproven denial")
+				mock_stop(mock)
 				return
 			}
 			wire = padded
 		}
 		mock_reply(mock, f.qname, f.qtype, wire)
 	}
-	if !mock_start(mock) {
-		skip_case(r, "dnssec: denial after a cname", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "dnssec: denial after a cname") {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	srv, ok := start_server(r, Server_Options{config = cd_config(udp_port, mock.port), udp_port = udp_port})
+	config := dnssec_config(udp_port, mock.port, []string{CD_ANCHOR}, log = "{ level: info }", cache = "{ enabled: true }")
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
 		return
 	}
@@ -355,8 +335,7 @@ run_dnssec_cname_denial_cases :: proc(r: ^Runner) {
 			check(r, mock_total(mock) == asked, "the repeated question went upstream rather than to the cache")
 		}
 		if check(r, res.ok, "no response") {
-			msg, err := dns.decode_message(res.wire, context.allocator)
-			if check(r, err == .None, "the answer does not decode") {
+			if msg, decoded := decode_reply(r, res.wire); decoded {
 				check_eq_int(r, int(dns.rcode_of(msg)), int(c.rcode), "rcode")
 				secure := c.rcode != .Serv_Fail
 				check(r, msg.flags.ad == secure, "AD is %v", msg.flags.ad)

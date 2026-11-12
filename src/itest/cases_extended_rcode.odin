@@ -28,54 +28,13 @@ DANE_NAME :: "_25._tcp.mx.test."
 
 @(private = "file")
 config_for :: proc(udp_port: int, servers: string, extra := "") -> string {
-	return fmt.tprintf(
-		`log: {{ level: debug, queries: true }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  strategy: failover
-  timeout: 2s
-  attempts: 1
-  servers:
-%s
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-dnssec: {{ enabled: false }}
-%s`,
+	return base_config(
 		udp_port,
 		servers,
-		extra,
+		log = "{ level: debug, queries: true }",
+		upstream_extra = "  strategy: failover\n  attempts: 1",
+		extra = fmt.tprintf("dnssec: {{ enabled: false }}\n%s", extra),
 	)
-}
-
-// The info-code of the extended error a response carries (RFC 8914), or -1 if
-// it has none.
-@(private)
-extended_error :: proc(r: ^Runner, wire: []u8) -> int {
-	code, _ := extended_error_with_text(r, wire)
-	return code
-}
-
-// The extended error a response carries, info-code and extra text, or -1 and "".
-@(private)
-extended_error_with_text :: proc(r: ^Runner, wire: []u8) -> (code: int, text: string) {
-	msg, ok := decode_reply(r, wire)
-	if !ok {
-		return -1, ""
-	}
-	for rec in msg.additional {
-		opt, is_opt := rec.data.(dns.Rdata_OPT)
-		if !is_opt {
-			continue
-		}
-		for option in opt.options {
-			if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
-				return int(option.data[0]) << 8 | int(option.data[1]), string(option.data[2:])
-			}
-		}
-	}
-	return -1, ""
 }
 
 // The certificate association a DANE client is asking for. Raw RDATA because
@@ -92,24 +51,7 @@ tlsa_answer :: proc(allocator := context.allocator) -> []u8 {
 		ttl   = 300,
 		data  = dns.Rdata_Raw{data = rdata},
 	}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = DANE_NAME,
-		type  = .TLSA,
-		class = .IN,
-	}
-	msg := dns.Message {
-		question = question,
-		answer   = answer,
-	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return encode_reply(DANE_NAME, .TLSA, {answer = answer}, allocator)
 }
 
 run_extended_rcode_cases :: proc(r: ^Runner) {
@@ -118,30 +60,25 @@ run_extended_rcode_cases :: proc(r: ^Runner) {
 		mock_port := next_port(r)
 		broken := mock_make("badvers", mock_port)
 		mock_rcode(broken, DANE_NAME, u16(dns.Type.TLSA), .Bad_Vers)
-		if !mock_start(broken) {
-			skip_case(r, "extended rcode: badvers", "cannot start the mock upstream")
-		} else {
+		if mock_start_or_skip(r, broken, "extended rcode: badvers") {
 			defer mock_stop(broken)
 
 			udp_port := next_port(r)
 			srv, ok := start_server(
 				r,
 				Server_Options {
-					config = config_for(udp_port, fmt.tprintf("    - \"127.0.0.1:%d\"\n", mock_port)),
+					config = config_for(udp_port, upstream_at(mock_port)),
 					udp_port = udp_port,
 				},
 			)
-			if !ok {
-				skip_case(r, "extended rcode: badvers", "server did not start")
-			} else {
+			if ok {
 				defer stop_server(&srv)
 
 				start_case(r, "an upstream BADVERS is not passed on as a NODATA")
 				{
 					res := query_udp(udp_port, build_query(DANE_NAME, u16(dns.Type.TLSA), edns_size = 1232))
 					if check(r, res.ok, "no response") {
-						msg, err := dns.decode_message(res.wire, context.temp_allocator)
-						if check(r, err == .None, "the response does not decode") {
+						if msg, decoded := decode_reply(r, res.wire); decoded {
 							// What a stub reads, and the whole of the harm: the
 							// header's own four bits.
 							check_eq_int(
@@ -183,14 +120,12 @@ run_extended_rcode_cases :: proc(r: ^Runner) {
 			skip_case(r, "extended rcode: failover", "cannot start the mock upstreams")
 		} else {
 			udp_port := next_port(r)
-			servers := fmt.tprintf("    - \"127.0.0.1:%d\"\n    - \"127.0.0.1:%d\"\n", broken_port, good_port)
+			servers := fmt.tprintf(`["127.0.0.1:%d", "127.0.0.1:%d"]`, broken_port, good_port)
 			srv, ok := start_server(
 				r,
 				Server_Options{config = config_for(udp_port, servers), udp_port = udp_port},
 			)
-			if !ok {
-				skip_case(r, "extended rcode: failover", "server did not start")
-			} else {
+			if ok {
 				defer stop_server(&srv)
 
 				/*
@@ -205,8 +140,7 @@ run_extended_rcode_cases :: proc(r: ^Runner) {
 				{
 					res := query_udp(udp_port, build_query(DANE_NAME, u16(dns.Type.TLSA), edns_size = 1232))
 					if check(r, res.ok, "no response") {
-						msg, err := dns.decode_message(res.wire, context.temp_allocator)
-						if check(r, err == .None, "the response does not decode") {
+						if msg, decoded := decode_reply(r, res.wire); decoded {
 							check_eq_int(r, int(dns.rcode_of(msg)), int(dns.Rcode.No_Error), "rcode")
 							if check_eq_int(r, len(msg.answer), 1, "answer records") {
 								check_eq_int(r, int(msg.answer[0].type), int(dns.Type.TLSA), "answer type")
@@ -224,8 +158,7 @@ run_extended_rcode_cases :: proc(r: ^Runner) {
 		mock_port := next_port(r)
 		broken := mock_make("badvers", mock_port)
 		mock_rcode(broken, DANE_NAME, u16(dns.Type.TLSA), .Bad_Vers)
-		if !mock_start(broken) {
-			skip_case(r, "extended rcode: counted", "cannot start the mock upstream")
+		if !mock_start_or_skip(r, broken, "extended rcode: counted") {
 			return
 		}
 		defer mock_stop(broken)
@@ -240,21 +173,13 @@ run_extended_rcode_cases :: proc(r: ^Runner) {
 				// entry written as a bare address is the address.
 				config = config_for(
 					udp_port,
-					fmt.tprintf(
-						`    - name: badvers
-      type: udp
-      address: 127.0.0.1
-      port: %d
-`,
-						mock_port,
-					),
+					fmt.tprintf("[{{ name: badvers, type: udp, address: 127.0.0.1, port: %d }}]", mock_port),
 					fmt.tprintf("metrics: {{ enabled: true, address: \"127.0.0.1\", port: %d }}\n", metrics_port),
 				),
 				udp_port = udp_port,
 			},
 		)
 		if !ok {
-			skip_case(r, "extended rcode: counted", "server did not start")
 			return
 		}
 		defer stop_server(&srv)

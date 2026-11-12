@@ -2,7 +2,6 @@ package itest
 
 import "core:fmt"
 import "core:net"
-import "core:strings"
 import "core:time"
 import "elodin:dns"
 
@@ -29,7 +28,17 @@ DELAY :: 600 * time.Millisecond
 WITHIN :: DELAY + DELAY / 2
 
 @(private = "file")
-config_running :: proc(r: ^Runner, udp_port, doh_port, upstream_port: int, server: string, readers := 1) -> string {
+config_running :: proc(
+	r: ^Runner,
+	udp_port, doh_port, upstream_port: int,
+	server: string,
+	readers := 1,
+	// More `upstream:` keys, and the `servers:` value in place of the one
+	// loopback upstream at `upstream_port`.
+	upstream_extra := "",
+	servers := "",
+	cache := "{ enabled: false }",
+) -> string {
 	doh := "doh: { enabled: false }"
 	if doh_port > 0 {
 		doh = fmt.tprintf(
@@ -50,15 +59,17 @@ listeners:
 upstream:
   timeout: 5s
   attempts: 1
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
+%s  servers: %s
+cache: %s
 blocking: {{ enabled: false }}
 `,
 		server,
 		udp_port,
 		readers,
 		doh,
-		upstream_port,
+		upstream_extra,
+		servers if servers != "" else upstream_at(upstream_port),
+		cache,
 	)
 }
 
@@ -130,8 +141,7 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 	// No payload: an empty NOERROR for whatever was asked, so every name is
 	// its own question and its own round trip.
 	mock_delay_all(mock, DELAY, nil)
-	if !mock_start(mock) {
-		skip_case(r, "one loop", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "one loop") {
 		return
 	}
 	defer mock_stop(mock)
@@ -154,7 +164,6 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 		},
 	)
 	if !ok {
-		skip_case(r, "one loop", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -256,25 +265,17 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 		if check(r, mock_start(second), "cannot start the second mock upstream") {
 			defer mock_stop(second)
 			race_port := next_port(r)
-			race_config, _ := strings.replace(
-				config_running(
-					r,
-					race_port,
-					0,
-					upstream_port,
-					"  rate_limit: { enabled: false }",
-				),
-				fmt.tprintf("  servers: [\"127.0.0.1:%d\"]", upstream_port),
-				fmt.tprintf(
-					"  strategy: race\n  servers: [\"127.0.0.1:%d\", \"127.0.0.1:%d\"]",
-					upstream_port,
-					second_port,
-				),
-				1,
-				context.temp_allocator,
+			race_config := config_running(
+				r,
+				race_port,
+				0,
+				upstream_port,
+				"  rate_limit: { enabled: false }",
+				upstream_extra = "  strategy: race\n",
+				servers = fmt.tprintf(`["127.0.0.1:%d", "127.0.0.1:%d"]`, upstream_port, second_port),
 			)
 			rsrv, rok := start_server(r, Server_Options{config = race_config, udp_port = race_port, warmup = DELAY})
-			if check(r, rok, "server did not start") {
+			if rok {
 				defer stop_server(&rsrv)
 				answered, elapsed, _ := udp_burst(race_port, burst_queries("raced", 4, 0x5500))
 				check_eq_int(r, answered, 4, "queries answered")
@@ -306,15 +307,16 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 		if check(r, mock_start(stale_mock), "cannot start the stale mock upstream") {
 			defer mock_stop(stale_mock)
 			udp := next_port(r)
-			stale_config, _ := strings.replace(
-				config_running(r, udp, 0, stale_port, "  rate_limit: { enabled: false }"),
-				"cache: { enabled: false }",
-				"cache: { enabled: true, max_entries: 100, max_ttl: 1, serve_stale: true, stale_timeout: 2s }",
-				1,
-				context.temp_allocator,
+			stale_config := config_running(
+				r,
+				udp,
+				0,
+				stale_port,
+				"  rate_limit: { enabled: false }",
+				cache = "{ enabled: true, max_entries: 100, max_ttl: 1, serve_stale: true, stale_timeout: 2s }",
 			)
 			ssrv, sok := start_server(r, Server_Options{config = stale_config, udp_port = udp, warmup = DELAY})
-			if check(r, sok, "server did not start") {
+			if sok {
 				defer stop_server(&ssrv)
 				first := query_udp(udp, build_query(qname, u16(dns.Type.A), id = 0x5600), context.temp_allocator)
 				if check(r, first.ok, "no answer to fill the cache") {
@@ -404,7 +406,7 @@ run_one_loop_cases :: proc(r: ^Runner, cert_ok: bool) {
 					warmup = DELAY,
 				},
 			)
-			if check(r, dok, "server did not start") {
+			if dok {
 				defer stop_server(&dsrv)
 				mock_hold_until(derived_mock, 500)
 				answered, _, rcodes := udp_burst(derived_port, burst_queries("derived", 500, 0x5400))

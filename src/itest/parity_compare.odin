@@ -3,6 +3,7 @@ package itest
 import "core:encoding/hex"
 import "core:fmt"
 import "core:mem"
+import "core:slice"
 import "core:time"
 import "elodin:dns"
 
@@ -365,7 +366,7 @@ pc_identity :: proc(c: ^Parity_Compare, q: Parity_Query, el: Pw_Msg) {
 		return
 	}
 	got := el.question[0]
-	if !pc_bytes_equal(got.name, q.name) {
+	if !slice.equal(got.name, q.name) {
 		pc_add(
 			c,
 			.Question,
@@ -1157,8 +1158,8 @@ pc_signed_again :: proc(rec: Pw_RR, el_recs: []Pw_RR) -> bool {
 @(private = "file")
 pc_serial_moved :: proc(rec: Pw_RR, el_recs: []Pw_RR) -> bool {
 	a := rec.rdata
-	a_mname, a_ok := pc_name_end(a, 0)
-	a_end, a_ok2 := pc_name_end(a, a_mname)
+	a_mname, a_ok := pw_name_end(a, 0)
+	a_end, a_ok2 := pw_name_end(a, a_mname)
 	if !a_ok || !a_ok2 || len(a) != a_end + 20 {
 		return false
 	}
@@ -1170,11 +1171,11 @@ pc_serial_moved :: proc(rec: Pw_RR, el_recs: []Pw_RR) -> bool {
 		if !pw_names_equal_fold(e.name, rec.name) {
 			continue
 		}
-		b_mname, b_ok := pc_name_end(b, 0)
+		b_mname, b_ok := pw_name_end(b, 0)
 		if !b_ok || b_mname != a_mname {
 			continue
 		}
-		if pw_names_equal_fold(a[:a_end], b[:a_end]) && pc_bytes_equal(a[a_end + 4:], b[a_end + 4:]) {
+		if pw_names_equal_fold(a[:a_end], b[:a_end]) && slice.equal(a[a_end + 4:], b[a_end + 4:]) {
 			return true
 		}
 	}
@@ -1202,34 +1203,15 @@ pc_same_signed_set :: proc(a, b: []u8) -> bool {
 	if len(a) != len(b) {
 		return false
 	}
-	if !pc_bytes_equal(a[:8], b[:8]) || !pc_bytes_equal(a[16:18], b[16:18]) {
+	if !slice.equal(a[:8], b[:8]) || !slice.equal(a[16:18], b[16:18]) {
 		return false
 	}
-	a_end, a_ok := pc_name_end(a, 18)
-	b_end, b_ok := pc_name_end(b, 18)
+	a_end, a_ok := pw_name_end(a, 18)
+	b_end, b_ok := pw_name_end(b, 18)
 	if !a_ok || !b_ok {
 		return false
 	}
 	return pw_names_equal_fold(a[18:a_end], b[18:b_end])
-}
-
-// Where an uncompressed name ends. A pointer is not legal in RRSIG RDATA and is
-// refused rather than followed: this reads one record's rdata and has no
-// message to follow it into.
-@(private = "file")
-pc_name_end :: proc(buf: []u8, start: int) -> (end: int, ok: bool) {
-	i := start
-	for i < len(buf) {
-		length := int(buf[i])
-		if length == 0 {
-			return i + 1, true
-		}
-		if length >= 0xc0 {
-			return 0, false
-		}
-		i += 1 + length
-	}
-	return 0, false
 }
 
 @(private = "file")
@@ -1515,21 +1497,16 @@ pc_client_cookie :: proc(c: ^Parity_Compare, q: Parity_Query, el: Pw_Msg, policy
 		// where the upstream sent one - and with `cookies.upstream` off too it
 		// has none to send. A cookie here is then this server minting one it
 		// was configured not to.
-		if got, found := pw_find_option(el, 10); found {
+		if got, found := pw_find_option(el, u16(dns.EDNS_Option_Code.Cookie)); found {
 			pc_add(c, .Edns, "a cookie on the answer with cookies off", "-", pc_hex(got, c.allocator), "")
 		}
 		return
 	}
-	sent: []u8
-	for o in q.options {
-		if o.code == 10 {
-			sent = o.data
-		}
-	}
+	sent, _ := pq_find_option(q, u16(dns.EDNS_Option_Code.Cookie))
 	if len(sent) < 8 {
 		return
 	}
-	got, found := pw_find_option(el, 10)
+	got, found := pw_find_option(el, u16(dns.EDNS_Option_Code.Cookie))
 	if !found {
 		/*
 		The one answer a cookie is left off: a datagram without room for the
@@ -1560,7 +1537,7 @@ pc_client_cookie :: proc(c: ^Parity_Compare, q: Parity_Query, el: Pw_Msg, policy
 		pc_add(c, .Edns, "no cookie for a client that sent one", pc_hex(sent[:8], c.allocator), "-", "")
 		return
 	}
-	if len(got) < 16 || len(got) > 40 || !pc_bytes_equal(got[:8], sent[:8]) {
+	if len(got) < 16 || len(got) > 40 || !slice.equal(got[:8], sent[:8]) {
 		pc_add(
 			c,
 			.Edns,
@@ -1638,7 +1615,7 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 			answer where both hops padded to the same block. There is nothing
 			for a comparison to learn from it in either direction.
 			*/
-			if u.code == 12 {
+			if u.code == u16(dns.EDNS_Option_Code.Padding) {
 				break
 			}
 			/*
@@ -1655,7 +1632,7 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 			option can be caught crossing on a transport where elodin mints one
 			of its own, and it is free.
 			*/
-			if u.code == 11 && policy.mode != .Mock {
+			if u.code == u16(dns.EDNS_Option_Code.TCP_Keepalive) && policy.mode != .Mock {
 				break
 			}
 			/*
@@ -1665,7 +1642,7 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 			test and the info-code alone is not. The stability check in
 			cases_parity.odin goes the other way, for the opposite reason.
 			*/
-			if pc_bytes_equal(e.data, u.data) {
+			if slice.equal(e.data, u.data) {
 				pc_add(
 					c,
 					.Edns,
@@ -1688,8 +1665,8 @@ pc_opt_contents :: proc(c: ^Parity_Compare, q: Parity_Query, up, el: Pw_Msg, pol
 			values while the upstream's server cookie - the secret half - is
 			still sitting behind it.
 			*/
-			if u.code == 10 && len(u.data) > 8 && len(e.data) > 8 &&
-			   pc_bytes_equal(u.data[8:], e.data[8:]) {
+			if u.code == u16(dns.EDNS_Option_Code.Cookie) && len(u.data) > 8 && len(e.data) > 8 &&
+			   slice.equal(u.data[8:], e.data[8:]) {
 				pc_add(
 					c,
 					.Edns,
@@ -1732,9 +1709,9 @@ which is where a leak would have to show up.
 @(private = "file")
 pc_client_mintable :: proc(code: u16, q: Parity_Query, policy: Parity_Policy) -> bool {
 	switch code {
-	case 10: // COOKIE, issued to this client (src/server/cookie.odin)
+	case u16(dns.EDNS_Option_Code.Cookie): // COOKIE, issued to this client (src/server/cookie.odin)
 		return policy.client_cookies
-	case 11:
+	case u16(dns.EDNS_Option_Code.TCP_Keepalive):
 		/*
 		edns-tcp-keepalive, this connection's idle timeout
 		(src/server/keepalive.odin). Written on the two TCP transports, and
@@ -1745,28 +1722,19 @@ pc_client_mintable :: proc(code: u16, q: Parity_Query, policy: Parity_Policy) ->
 		if policy.transport != .TCP && policy.transport != .DoT {
 			return false
 		}
-		return pc_query_sent_option(q, 11)
-	case 12:
+		_, sent := pq_find_option(q, u16(dns.EDNS_Option_Code.TCP_Keepalive))
+		return sent
+	case u16(dns.EDNS_Option_Code.Padding):
 		// Padding, sized for this client's transport (src/dns/padding.odin):
 		// the encrypted transports, and only for a client that padded its own
 		// query (RFC 7830 section 4, RFC 8467 section 5).
 		if policy.transport != .DoT && !pg_is_doh(policy.transport) {
 			return false
 		}
-		return pc_query_sent_option(q, 12)
-	case 15: // extended DNS error, this server's own (src/server/dnssec.odin)
+		_, sent := pq_find_option(q, u16(dns.EDNS_Option_Code.Padding))
+		return sent
+	case u16(dns.EDNS_Option_Code.Ext_Error): // extended DNS error, this server's own (src/server/dnssec.odin)
 		return true
-	}
-	return false
-}
-
-// Whether the generated query carried `code` in its OPT record.
-@(private = "file")
-pc_query_sent_option :: proc(q: Parity_Query, code: u16) -> bool {
-	for o in q.options {
-		if o.code == code {
-			return true
-		}
 	}
 	return false
 }
@@ -1831,47 +1799,15 @@ pc_same_but_for_id :: proc(a, b: []u8) -> bool {
 	byte inside an RDATA differs in case, and a downcased name inside RDATA is
 	exactly the kind of quiet re-encoding this statistic exists to notice.
 	*/
-	name_end := 12
-	for name_end < len(a) {
-		n := int(a[name_end])
-		if n == 0 || n & 0xc0 != 0 {
-			name_end += 1
-			break
-		}
-		name_end += 1 + n
+	name_end, walked := pw_name_end(a, 12)
+	if !walked {
+		// No question to fold: the bytes have to match as they are.
+		name_end = 12
 	}
-	if name_end > len(a) {
-		name_end = len(a)
-	}
-	for i in 2 ..< len(a) {
-		x, y := a[i], b[i]
-		if i >= 12 && i < name_end {
-			if x >= 'A' && x <= 'Z' {
-				x += 32
-			}
-			if y >= 'A' && y <= 'Z' {
-				y += 32
-			}
-		}
-		if x != y {
-			return false
-		}
-	}
-	return true
+	header_same := slice.equal(a[2:12], b[2:12])
+	return header_same && pw_names_equal_fold(a[12:name_end], b[12:name_end]) && slice.equal(a[name_end:], b[name_end:])
 }
 
-@(private = "file")
-pc_bytes_equal :: proc(a, b: []u8) -> bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i in 0 ..< len(a) {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
 
 @(private = "file")
 pc_hex :: proc(b: []u8, allocator: mem.Allocator) -> string {
