@@ -90,11 +90,15 @@ wrote_a_body :: proc(out: []u8) -> bool {
 	rest := out
 	for {
 		h, ok := h2.parse_frame_header(rest)
-		if !ok || h2.FRAME_HEADER_SIZE + h.length > len(rest) {
+		if !ok {
 			return false
 		}
+		// Ahead of the length check: a body cut short is still a body written.
 		if h.type == .Data && h.length > 0 {
 			return true
+		}
+		if h2.FRAME_HEADER_SIZE + h.length > len(rest) {
+			return false
 		}
 		rest = rest[h2.FRAME_HEADER_SIZE + h.length:]
 	}
@@ -358,13 +362,6 @@ that queues it again should fail this test rather than crash it.
 */
 @(test)
 test_doh2_sheds_when_max_pending_is_full :: proc(t: ^testing.T) {
-	/*
-	A started job is allocated on the connection's reader and released on the
-	request's own fiber, and in the server both run under the default heap
-	allocator. The test runner hands this proc a per-test tracking allocator
-	instead, which would make that pairing a free through an allocator that
-	never made the block.
-	*/
 	cfg := doh2_config(1)
 
 	// A bare 12-byte DNS header, base64url with no padding.

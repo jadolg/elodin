@@ -383,16 +383,9 @@ serve_one_stale :: proc(x: ^Stale_Exchange) {
 	if len(x.reply) > len(buf) {
 		return
 	}
-	remote: net.Endpoint
-	for {
-		n, from, err := net.recv_udp(x.socket, buf[:])
-		if err != nil {
-			return
-		}
-		if dns.same_question(buf[:n], x.reply) {
-			remote = from
-			break
-		}
+	_, remote, asked := recv_question(x.socket, x.reply, buf[:])
+	if !asked {
+		return
 	}
 	x.got = true
 	if x.delay > 0 {

@@ -293,8 +293,26 @@ harness_exchange :: proc(
 	served: bool,
 ) {
 	x.socket = h.socket
-	mock := thread.create_and_start_with_poly_data(x, serve_canned)
-	out, outcome, served = handle_query(&h.srv, query, proto, client, context.temp_allocator)
+	return exchange_with(&h.srv, x, serve_canned, query, proto, client)
+}
+
+// One query through `s`, with `serve` answering it from `x` on a thread of its
+// own, joined before this returns.
+@(private)
+exchange_with :: proc(
+	s: ^Server,
+	x: ^$T,
+	serve: proc(x: ^T),
+	query: []u8,
+	proto := Protocol.UDP,
+	client := "127.0.0.1:5555",
+) -> (
+	out: []u8,
+	outcome: Outcome,
+	served: bool,
+) {
+	mock := thread.create_and_start_with_poly_data(x, serve)
+	out, outcome, served = handle_query(s, query, proto, client, context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
 	return
@@ -387,27 +405,36 @@ serve_canned :: proc(x: ^Canned_Mock) {
 	if len(x.reply) > len(buf) {
 		return
 	}
-	for {
-		n, remote, err := net.recv_udp(x.socket, buf[:])
-		if err != nil {
-			// The receive timeout, which is how this returns when the question
-			// it waits for never arrives.
-			return
-		}
-		// A runt, or another case's question, is skipped rather than taken as
-		// the end of the wait: see the type.
-		if !dns.same_question(buf[:n], x.reply) {
-			continue
-		}
-		x.got = true
-		x.seen_len = copy(x.seen[:], buf[:n])
-		out: [4096]u8
-		copy(out[:], x.reply)
-		// Echo the ID it was asked with. The resolver draws a fresh one for
-		// every query it forwards, so nothing here can know it in advance.
-		out[0], out[1] = buf[0], buf[1]
-		_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
+	n, remote, asked := recv_question(x.socket, x.reply, buf[:])
+	if !asked {
 		return
+	}
+	x.got = true
+	x.seen_len = copy(x.seen[:], buf[:n])
+	out: [4096]u8
+	copy(out[:], x.reply)
+	// Echo the ID it was asked with. The resolver draws a fresh one for every
+	// query it forwards, so nothing here can know it in advance.
+	out[0], out[1] = buf[0], buf[1]
+	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
+}
+
+/*
+The next datagram on `socket` that asks `question`'s question, read into `buf`.
+A runt, or another case's question, is skipped rather than taken as the end of
+the wait: see `Canned_Mock`. `ok` is false once the socket's receive timeout
+passes with nothing that asks it.
+*/
+@(private)
+recv_question :: proc(socket: net.UDP_Socket, question: []u8, buf: []u8) -> (n: int, remote: net.Endpoint, ok: bool) {
+	for {
+		got, from, err := net.recv_udp(socket, buf)
+		if err != nil {
+			return 0, {}, false
+		}
+		if dns.same_question(buf[:got], question) {
+			return got, from, true
+		}
 	}
 }
 
@@ -888,43 +915,37 @@ Option_Mock :: struct {
 @(private)
 serve_option_sniffer :: proc(x: ^Option_Mock) {
 	buf: [4096]u8
-	for {
-		n, remote, err := net.recv_udp(x.socket, buf[:])
-		if err != nil {
-			return
-		}
-		if !dns.same_question(buf[:n], x.reply) {
-			continue
-		}
-		m, derr := dns.decode_message(buf[:n], context.temp_allocator)
-		if derr != .None {
-			return
-		}
-		for rec in m.additional {
-			rdata, is_opt := rec.data.(dns.Rdata_OPT)
-			if rec.type != .OPT || !is_opt {
-				continue
-			}
-			for o in rdata.options {
-				if o.code == u16(x.code) {
-					x.saw = true
-				}
-			}
-		}
-		x.saw_do = dns.edns_do(m)
-		free_all(context.temp_allocator)
-
-		reply := x.reply_seen if x.saw && x.reply_seen != nil else x.reply
-		if len(reply) > len(buf) {
-			return
-		}
-		out: [4096]u8
-		copy(out[:], reply)
-		out[0], out[1] = buf[0], buf[1]
-		_, serr := net.send_udp(x.socket, out[:len(reply)], remote)
-		x.served = serr == nil
+	n, remote, asked := recv_question(x.socket, x.reply, buf[:])
+	if !asked {
 		return
 	}
+	m, derr := dns.decode_message(buf[:n], context.temp_allocator)
+	if derr != .None {
+		return
+	}
+	for rec in m.additional {
+		rdata, is_opt := rec.data.(dns.Rdata_OPT)
+		if rec.type != .OPT || !is_opt {
+			continue
+		}
+		for o in rdata.options {
+			if o.code == u16(x.code) {
+				x.saw = true
+			}
+		}
+	}
+	x.saw_do = dns.edns_do(m)
+	free_all(context.temp_allocator)
+
+	reply := x.reply_seen if x.saw && x.reply_seen != nil else x.reply
+	if len(reply) > len(buf) {
+		return
+	}
+	out: [4096]u8
+	copy(out[:], reply)
+	out[0], out[1] = buf[0], buf[1]
+	_, serr := net.send_udp(x.socket, out[:len(reply)], remote)
+	x.served = serr == nil
 }
 
 /*
@@ -944,11 +965,7 @@ harness_sniff :: proc(
 	ok: bool,
 ) {
 	x.socket = h.socket
-	mock := thread.create_and_start_with_poly_data(x, serve_option_sniffer)
-	out, outcome, ok = handle_query(&h.srv, query, proto, client, context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-	return
+	return exchange_with(&h.srv, x, serve_option_sniffer, query, proto, client)
 }
 
 /*

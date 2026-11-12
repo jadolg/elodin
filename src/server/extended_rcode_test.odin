@@ -100,23 +100,15 @@ tlsa_reply :: proc(nibble: u8 = 0, ext: Maybe(u8) = nil, answer := false) -> []u
 	}
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	if err != .None {
-		return nil
+		panic("the TLSA reply does not encode")
 	}
 	return wire
-}
-
-@(private = "file")
-expect_encoded :: proc(t: ^testing.T, wire: []u8, loc := #caller_location) -> bool {
-	return testing.expect(t, len(wire) > dns.HEADER_SIZE, "the fixture did not encode", loc = loc)
 }
 
 // The premise every case below rests on, asserted against the fixture rather
 // than assumed: rcode 16 with a header a client reads as NOERROR.
 @(private = "file")
 expect_reads_as_noerror :: proc(t: ^testing.T, reply: []u8) -> bool {
-	if !expect_encoded(t, reply) {
-		return false
-	}
 	if !testing.expect_value(t, dns.peek_rcode(reply), dns.Rcode.Bad_Vers) {
 		return false
 	}
@@ -314,9 +306,6 @@ test_an_extended_rcode_with_a_nonzero_nibble_is_not_forwarded_either :: proc(t: 
 	// 16 | 7: an extended rcode this server has no reading for either, and one
 	// whose header half is a rcode in its own right.
 	reply := tlsa_reply(u8(dns.Rcode.YX_RRSet), ext = 1)
-	if !expect_encoded(t, reply) {
-		return
-	}
 	testing.expectf(
 		t,
 		u16(dns.peek_rcode(reply)) == u16(dns.Rcode.Bad_Vers) | u16(dns.Rcode.YX_RRSet),
@@ -516,9 +505,6 @@ test_an_unnamed_extended_rcode_is_reported_as_a_number :: proc(t: ^testing.T) {
 	defer rcode_fixture_stop(&f)
 
 	reply := tlsa_reply(ext = 2)
-	if !expect_encoded(t, reply) {
-		return
-	}
 	// The premise: a composed rcode of 32, which is not a value `Rcode` names.
 	testing.expect_value(t, u16(dns.peek_rcode(reply)), u16(32))
 	if _, named := dns.rcode_name(dns.peek_rcode(reply)); named {
