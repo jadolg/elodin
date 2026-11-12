@@ -6,7 +6,6 @@ import "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
 import "elodin:loop"
-import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -98,8 +97,7 @@ fill_sockaddr :: proc(endpoint: net.Endpoint, storage: ^posix.sockaddr_in6, out_
 		storage^ = {}
 		storage.sin6_family = .INET6
 		storage.sin6_port = posix.in_port_t(u16be(u16(endpoint.port)))
-		bytes, _ := netx.address_bytes(a)
-		storage.sin6_addr = transmute(posix.in6_addr)bytes
+		storage.sin6_addr = transmute(posix.in6_addr)a
 		out_len^ = posix.socklen_t(size_of(posix.sockaddr_in6))
 	}
 }

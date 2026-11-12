@@ -41,7 +41,7 @@ test_io_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 		if err == nil {
 			return got, true
 		}
-		// See h2client.odin's h2_io_read: on Linux, SO_RCVTIMEO expiring on a
+		// See upstream's `timed_out` (http.odin): on Linux, SO_RCVTIMEO expiring on a
 		// blocking recv() is EAGAIN, which core:net reports as .Would_Block,
 		// not .Timeout. Only continuing on .Timeout made every poll tick race
 		// with client_request's own deadline as a spurious connection close.

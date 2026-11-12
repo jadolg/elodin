@@ -203,10 +203,8 @@ address_bytes :: proc(address: net.Address) -> (out: [16]u8, v6: bool) {
 	case net.IP4_Address:
 		out[0], out[1], out[2], out[3] = a[0], a[1], a[2], a[3]
 	case net.IP6_Address:
-		for i in 0 ..< 8 {
-			out[i * 2] = u8(u16(a[i]) >> 8)
-			out[i * 2 + 1] = u8(u16(a[i]))
-		}
+		// The groups are big-endian, so their memory is already network order.
+		out = transmute([16]u8)a
 		v6 = true
 	}
 	return
