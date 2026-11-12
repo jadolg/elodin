@@ -2,7 +2,9 @@
 /certs/
 /.cache/
 *.o
-/.claude
+# Local Claude Code state stays out; the project's skills are tracked.
+/.claude/*
+!/.claude/skills/
 /.idea
 /dist/
 
