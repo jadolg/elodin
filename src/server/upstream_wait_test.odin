@@ -44,17 +44,6 @@ test_upstream_waits_stop_at_the_ceiling :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.upstream_waits, 3)
 }
 
-@(private = "file")
-wait_query :: proc(name: string) -> []u8 {
-	msg := dns.Message {
-		id       = 0x2345,
-		question = []dns.Question{{name = name, type = .A, class = .IN}},
-	}
-	msg.flags.rd = true
-	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
-	return wire
-}
-
 /*
 With every place taken, a miss is answered SERVFAIL at once and counted, and a
 cache hit is still answered: hits need no place. No upstream group is set, so a
@@ -66,9 +55,8 @@ client's failure.
 */
 @(test)
 test_a_miss_past_the_upstream_waits_fails_and_a_hit_is_served :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.blocking.enabled = false
+	cfg := test_config()
+	cfg.cache.enabled = true
 	cfg.server.max_pending = 8
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
 	defer cache.destroy(answers)
@@ -79,26 +67,15 @@ test_a_miss_past_the_upstream_waits_fails_and_a_hit_is_served :: proc(t: ^testin
 	s.upstream_waits = upstream_wait_ceiling(&s)
 
 	hit := "hit.example."
-	reply := dns.Message {
-		id       = 0x2345,
-		question = []dns.Question{{name = hit, type = .A, class = .IN}},
-		answer   = []dns.Record{{name = hit, type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = {192, 0, 2, 1}}}},
-	}
-	reply.flags.qr = true
-	reply.flags.rd = true
-	reply.flags.ra = true
-	wire, _, _ := dns.encode_message(reply, context.temp_allocator)
-	decoded, _ := dns.decode_message(wire, context.temp_allocator)
-	key_buf: [cache.KEY_MAX]u8
-	if !testing.expect(t, cache.put(answers, cache.make_key(key_buf[:], hit, .A, .IN, false, false), wire, decoded), "not cached") {
+	if !seed_cache(t, answers, hit, test_reply(hit, .A, a_record(hit, {192, 0, 2, 1}, 300))) {
 		return
 	}
 
-	_, outcome, ok := handle_query(&s, wait_query(hit), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	_, outcome, ok := handle_query(&s, test_query(hit, id = 0x2345), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expect(t, ok, "the hit went unanswered")
 	testing.expect_value(t, outcome, Outcome.Cached)
 
-	out, missed, answered_miss := handle_query(&s, wait_query("miss.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, missed, answered_miss := handle_query(&s, test_query("miss.example.", id = 0x2345), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if testing.expect(t, answered_miss, "the miss went unanswered") {
 		testing.expect_value(t, missed, Outcome.Failed)
 		testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Serv_Fail)
@@ -107,9 +84,12 @@ test_a_miss_past_the_upstream_waits_fails_and_a_hit_is_served :: proc(t: ^testin
 	testing.expect_value(t, s.stats.failed, 1)
 	testing.expect_value(t, s.upstream_waits, upstream_wait_ceiling(&s))
 
-	msg, _ := dns.decode_message(wait_query("refresh.example."), context.temp_allocator)
+	msg, derr := dns.decode_message(test_query("refresh.example.", id = 0x2345), context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	spent := 0
-	r := resolve_query(&s, wait_query("refresh.example."), msg, .UDP, "", 512, {}, {}, &spent, context.temp_allocator, refresh = true)
+	r := resolve_query(&s, test_query("refresh.example.", id = 0x2345), msg, .UDP, "", 512, {}, {}, &spent, context.temp_allocator, refresh = true)
 	testing.expect(t, r.unanswered, "a refresh with no place counted as a client's failure")
 	testing.expect_value(t, s.stats.failed, 1)
 	testing.expect_value(t, s.stats.upstream_shed, 2)
@@ -158,9 +138,8 @@ test_a_wait_on_a_refresh_holds_a_place :: proc(t: ^testing.T) {
 		// None with none left: the client is served as when `start_refresh`
 		// declines, and starts no refresh. Its refresh's, with one.
 		testing.expectf(t, int(s.stats.upstream_shed - before) == left, "%d left: %d turned away, want %d", left, s.stats.upstream_shed - before, left)
-		for start := time.tick_now(); queries_pending(&s) > 0 && time.tick_since(start) < 2 * time.Second; {
-			time.sleep(time.Millisecond)
-		}
+		drained := wait_until(proc(data: rawptr) -> bool {return queries_pending((^Server)(data)) == 0}, &s, 2 * time.Second)
+		testing.expectf(t, drained, "%d left: queries still pending", left)
 		testing.expectf(t, s.upstream_waits == ceiling - left, "%d left: %d places held after, want %d", left, s.upstream_waits, ceiling - left)
 	}
 	free_all(context.temp_allocator)

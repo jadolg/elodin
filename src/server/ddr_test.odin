@@ -20,43 +20,13 @@ reached the forwarding step would fault rather than answer, which is what makes
 a mistake in the placement loud rather than silent.
 */
 
-@(private = "file")
-ddr_query :: proc(name: string, type := dns.Type.SVCB) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = name,
-		type  = type,
-		class = .IN,
-	}
-	msg := dns.Message {
-		id       = 0x4242,
-		question = questions,
-	}
-	msg.flags.rd = true
-
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-@(private = "file")
-ddr_server :: proc(cfg: ^config.Config) -> Server {
-	cfg^ = config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	return Server{cfg = cfg}
-}
-
 // The name the whole mechanism hangs off, answered here and not forwarded.
 @(test)
 test_ddr_query_is_answered_locally :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := ddr_server(&cfg)
+	s := local_server(&cfg)
 
-	out, outcome, ok := handle_query(&s, ddr_query("_dns.resolver.arpa."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, test_query("_dns.resolver.arpa.", .SVCB), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if !testing.expect(t, ok, "a DDR query went unanswered") {
 		return
 	}
@@ -77,11 +47,11 @@ test_ddr_query_is_answered_locally :: proc(t: ^testing.T) {
 @(test)
 test_ddr_covers_the_whole_zone :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := ddr_server(&cfg)
+	s := local_server(&cfg)
 
 	names := []string{"resolver.arpa.", "_dns.resolver.arpa.", "_dNS.RESolVER.arpA.", "anything.else.resolver.arpa."}
 	for name in names {
-		out, outcome, ok := handle_query(&s, ddr_query(name, .A), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		out, outcome, ok := handle_query(&s, test_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
 		testing.expectf(t, ok && outcome == .Local, "%s was not answered locally", name)
 		decoded, derr := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr, dns.Decode_Error.None)
@@ -120,20 +90,20 @@ trade and not a regression anybody will meet.
 @(test)
 test_a_blocklist_entry_over_arpa_beats_the_ddr_answer :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := ddr_server(&cfg)
+	s := local_server(&cfg)
 	cfg.blocking.enabled = true
 
-	block, allow := filter.set_make(), filter.set_make()
 	// The whole subtree, which is what it takes to reach this name at all.
-	filter.parse_list(block, allow, "||arpa^\n", .Adblock)
-	engine := filter.engine_make()
+	engine, listed := test_filters(t, "||arpa^\n", .Adblock)
 	defer filter.engine_destroy(engine)
-	filter.engine_swap(engine, block, allow)
+	if !listed {
+		return
+	}
 	s.filters = engine
 
 	_, outcome, ok := handle_query(
 		&s,
-		ddr_query("_dns.resolver.arpa."),
+		test_query("_dns.resolver.arpa.", .SVCB),
 		.UDP,
 		"127.0.0.1:5555",
 		context.temp_allocator,
@@ -149,10 +119,10 @@ test_a_blocklist_entry_over_arpa_beats_the_ddr_answer :: proc(t: ^testing.T) {
 	// The control: with nothing listed, the same query is answered from here, so
 	// the above is the list winning rather than DDR having stopped working.
 	clean: config.Config
-	c := ddr_server(&clean)
+	c := local_server(&clean)
 	_, plain, plain_ok := handle_query(
 		&c,
-		ddr_query("_dns.resolver.arpa."),
+		test_query("_dns.resolver.arpa.", .SVCB),
 		.UDP,
 		"127.0.0.1:5555",
 		context.temp_allocator,

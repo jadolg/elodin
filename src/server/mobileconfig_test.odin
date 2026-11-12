@@ -142,99 +142,49 @@ test_valid_mobileconfig_host :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-@(private = "file")
-mc_send_all :: proc(t: ^testing.T, socket: net.TCP_Socket, raw: string) -> bool {
-	sent := 0
-	bytes := transmute([]u8)raw
-	for sent < len(bytes) {
-		n, err := net.send_tcp(socket, bytes[sent:])
-		if err != nil || n <= 0 {
-			testing.expectf(t, false, "cannot send: %v", err)
-			return false
-		}
-		sent += n
-	}
-	return true
-}
-
-@(private = "file")
-Mc_Session :: struct {
-	server: ^Server,
-	conn:   Conn,
-}
-
-@(private = "file")
-run_serve_doh_mc :: proc(d: ^Mc_Session) {
-	serve_doh(d.server, d.conn, "test")
-}
-
 /*
-Run one request through the real `serve_doh` loop and return everything written
-back.
+Run one request through the real `serve_doh` loop, on a server with the default
+configuration and `signer` to sign with, and return everything written back.
 
 The cases below differ only in the request line and in what the server was given
-to sign with, so the loopback pair, the handler thread and the drain are here
-once. What is deliberately not factored out is `serve_doh` itself: these exist
-to catch a break in the wiring between routing, the Host capture and the
+to sign with, so the server, the loopback pair, the handler thread and the drain
+are here once. What is deliberately not factored out is `serve_doh` itself: these
+exist to catch a break in the wiring between routing, the Host capture and the
 signing, and a test that called the builder directly would not see one.
 */
 @(private = "file")
-mc_roundtrip :: proc(t: ^testing.T, s: ^Server, request: string) -> (reply: string, ok: bool) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return "", false
+mc_roundtrip :: proc(t: ^testing.T, request: string, signer: ^Profile_Signer = nil) -> (reply: string, ok: bool) {
+	cfg := config.default_config()
+	s := Server {
+		cfg      = &cfg,
+		profiles = signer,
 	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return "", false
-	}
-
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return "", false
 	}
 	defer net.close(client)
-
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return "", false
-	}
 	defer net.close(accepted)
 	// With nothing following the one request, the handler ends on this rather
 	// than on a close.
 	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
 
-	session := Mc_Session {
-		server = s,
+	session := Doh_Session {
+		server = &s,
 		conn   = Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}},
 	}
-	handler := thread.create_and_start_with_poly_data(&session, run_serve_doh_mc)
+	handler := thread.create_and_start_with_poly_data(&session, run_serve_doh)
 	defer {
 		thread.join(handler)
 		thread.destroy(handler)
 	}
 
-	if !mc_send_all(t, client, request) {
+	if _, serr := net.send_tcp(client, transmute([]u8)request); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		net.shutdown(client, .Send)
 		return "", false
 	}
-
-	_ = net.set_option(client, .Receive_Timeout, 2 * time.Second)
-	answer := strings.builder_make(context.temp_allocator)
-	for {
-		chunk: [4096]u8
-		n, rerr := net.recv_tcp(client, chunk[:])
-		if rerr != nil || n <= 0 {
-			break
-		}
-		strings.write_bytes(&answer, chunk[:n])
-	}
-	return strings.to_string(answer), true
+	reply, _ = read_until_close(client, 2 * time.Second)
+	return reply, true
 }
 
 // The response body, which for a signed profile is DER and so cannot be read as
@@ -247,8 +197,12 @@ mc_body :: proc(reply: string) -> string {
 	return ""
 }
 
+// The default `mobileconfig_path`, which is what `mc_roundtrip`'s server serves.
 @(private = "file")
-GET_PROFILE :: "GET /apple-doh.mobileconfig HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+PROFILE_PATH :: "/apple-doh.mobileconfig"
+
+@(private = "file")
+GET_PROFILE :: "GET " + PROFILE_PATH + " HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
 
 /*
 A GET to the profile path is answered end to end over the HTTP/1.1 endpoint, with
@@ -269,12 +223,7 @@ test_serve_doh_returns_the_signed_profile :: proc(t: ^testing.T) {
 	defer tlsx.context_destroy(ctx)
 	defer destroy_profile_signer(signer)
 
-	cfg := config.default_config()
-	s := Server {
-		cfg      = &cfg,
-		profiles = signer,
-	}
-	reply, ok := mc_roundtrip(t, &s, fmt.tprintf(GET_PROFILE, "elodin.local"))
+	reply, ok := mc_roundtrip(t, fmt.tprintf(GET_PROFILE, "elodin.local"), signer)
 	if !ok {
 		return
 	}
@@ -313,12 +262,7 @@ test_serve_doh_profile_refuses_a_host_outside_the_certificate :: proc(t: ^testin
 	defer tlsx.context_destroy(ctx)
 	defer destroy_profile_signer(signer)
 
-	cfg := config.default_config()
-	s := Server {
-		cfg      = &cfg,
-		profiles = signer,
-	}
-	reply, ok := mc_roundtrip(t, &s, fmt.tprintf(GET_PROFILE, "dns.example"))
+	reply, ok := mc_roundtrip(t, fmt.tprintf(GET_PROFILE, "dns.example"), signer)
 	if !ok {
 		return
 	}
@@ -341,11 +285,7 @@ stopped being usable would have no sign that anything had changed.
 */
 @(test)
 test_serve_doh_profile_is_unavailable_without_a_signer :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	s := Server {
-		cfg = &cfg,
-	}
-	reply, ok := mc_roundtrip(t, &s, fmt.tprintf(GET_PROFILE, "elodin.local"))
+	reply, ok := mc_roundtrip(t, fmt.tprintf(GET_PROFILE, "elodin.local"))
 	if !ok {
 		return
 	}
@@ -366,14 +306,9 @@ than signing a profile for a request that was never going to install one.
 */
 @(test)
 test_serve_doh_profile_rejects_post :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	s := Server {
-		cfg = &cfg,
-	}
 	reply, ok := mc_roundtrip(
 		t,
-		&s,
-		"POST /apple-doh.mobileconfig HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+		"POST " + PROFILE_PATH + " HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
 	)
 	if !ok {
 		return
@@ -394,11 +329,7 @@ connection.
 */
 @(test)
 test_serve_doh_profile_head_refusal_has_no_body :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	s := Server {
-		cfg = &cfg,
-	}
-	reply, ok := mc_roundtrip(t, &s, "HEAD /apple-doh.mobileconfig HTTP/1.1\r\nHost: elodin.local\r\n\r\n")
+	reply, ok := mc_roundtrip(t, "HEAD " + PROFILE_PATH + " HTTP/1.1\r\nHost: elodin.local\r\n\r\n")
 	if !ok {
 		return
 	}
@@ -419,13 +350,8 @@ Pipelined, so the second reply is read exactly where a client reads it.
 */
 @(test)
 test_serve_doh_head_refusals_have_no_body :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	s := Server {
-		cfg = &cfg,
-	}
 	reply, ok := mc_roundtrip(
 		t,
-		&s,
 		"HEAD /dns-query HTTP/1.1\r\nHost: elodin.local\r\n\r\n" +
 		"HEAD /nope HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\n\r\n",
 	)
@@ -448,11 +374,7 @@ refusal, so its 400 to a HEAD carries no content either.
 */
 @(test)
 test_serve_doh_head_reader_refusal_has_no_body :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	s := Server {
-		cfg = &cfg,
-	}
-	reply, ok := mc_roundtrip(t, &s, "HEAD /dns-query HTTP/1.1\r\n\r\n")
+	reply, ok := mc_roundtrip(t, "HEAD /dns-query HTTP/1.1\r\n\r\n")
 	if !ok {
 		return
 	}

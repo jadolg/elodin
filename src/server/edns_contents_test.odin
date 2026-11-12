@@ -1,13 +1,7 @@
 package server
 
-import "core:net"
 import "core:testing"
-import "core:thread"
-import "core:time"
-import "elodin:cache"
-import "elodin:config"
 import "elodin:dns"
-import "elodin:upstream"
 
 /*
 What is written *inside* an answer's OPT record, which is this server's own
@@ -48,7 +42,7 @@ QNAME :: "contents.example.com."
 CLIENT_ID :: u16(0x6262)
 
 @(private = "file")
-ANSWER_ADDR := [4]u8{192, 0, 2, 9}
+ANSWER_ADDR :: [4]u8{192, 0, 2, 9}
 
 /*
 The NSID the mock upstream reports.
@@ -92,31 +86,11 @@ opt_record :: proc(udp_size: u16, version: u8, do_bit: bool, options: []dns.EDNS
 	}
 }
 
+// Version 0 and no options: the client asks in the one version this server
+// implements, and asks for nothing else.
 @(private = "file")
 client_query :: proc(do_bit := false, advertised := CLIENT_ADVERTISED) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-	}
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	// Version 0 and no options: the client asks in the one version this server
-	// implements, and asks for nothing else.
-	additional[0] = opt_record(advertised, 0, do_bit, nil)
-
-	msg := dns.Message {
-		id         = CLIENT_ID,
-		question   = questions,
-		additional = additional,
-	}
-	msg.flags.rd = true
-
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_query(QNAME, id = CLIENT_ID, opt = opt_record(advertised, 0, do_bit, nil))
 }
 
 /*
@@ -132,13 +106,7 @@ mock_reply :: proc(version: u8, do_bit: bool, options: []dns.EDNS_Option) -> []u
 		class = .IN,
 	}
 	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-		ttl   = 300,
-		data  = dns.Rdata_A{addr = ANSWER_ADDR},
-	}
+	answer[0] = a_record(QNAME, ANSWER_ADDR, 300)
 	additional := make([]dns.Record, 1, context.temp_allocator)
 	additional[0] = opt_record(4096, version, do_bit, options)
 
@@ -171,159 +139,22 @@ nsid_reply :: proc() -> []u8 {
 }
 
 @(private = "file")
-Exchange :: struct {
-	socket: net.UDP_Socket,
-	reply:  []u8,
-	got:    bool,
-}
-
-@(private = "file")
-serve_one :: proc(x: ^Exchange) {
-	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
-		return
-	}
-	x.got = true
-
-	out: [4096]u8
-	copy(out[:], x.reply)
-	// Echo the ID it was asked with: the forwarded query carries one of ours.
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
-}
-
-@(private = "file")
-Harness :: struct {
-	socket:  net.UDP_Socket,
-	cfg:     config.Config,
-	group:   ^upstream.Group,
-	answers: ^cache.Cache,
-	srv:     Server,
-}
-
-@(private = "file")
-harness_start :: proc(t: ^testing.T, h: ^Harness, caching := true) -> bool {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind the mock upstream: %v", serr)
-		return false
-	}
-	h.socket = socket
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
-		return false
-	}
-
-	h.cfg = config.default_config()
-	h.cfg.log.queries = false
-	h.cfg.cache.enabled = caching
-	h.cfg.blocking.enabled = false
-	h.cfg.dnssec.enabled = false
-	h.cfg.cookies.enabled = false
-	h.cfg.upstream.strategy = .Failover
-	h.cfg.upstream.attempts = 1
-	h.cfg.upstream.timeout = 5 * time.Second
-
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	h.cfg.upstream.servers = servers
-
-	group, gerr := upstream.make_group(h.cfg.upstream, context.allocator, false)
-	if gerr != .None {
-		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
-		return false
-	}
-	h.group = group
-
-	h.answers = cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	h.srv = Server {
-		cfg     = &h.cfg,
-		group   = h.group,
-		answers = h.answers,
-	}
-	return true
-}
-
-@(private = "file")
-harness_stop :: proc(h: ^Harness) {
-	cache.destroy(h.answers)
-	upstream.destroy_group(h.group)
-	net.close(h.socket)
-}
-
-// One query through the server, with the mock answering it once.
-@(private = "file")
-forward_once :: proc(t: ^testing.T, h: ^Harness, query: []u8, reply: []u8) -> (out: []u8, ok: bool) {
-	x := Exchange {
-		socket = h.socket,
-		reply  = reply,
-	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one)
-	response, outcome, served := handle_query(&h.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-
-	if !testing.expect(t, x.got, "the upstream was never asked") {
-		return nil, false
-	}
-	if !testing.expect(t, served, "the query went unanswered") {
-		return nil, false
-	}
-	testing.expect_value(t, outcome, Outcome.Forwarded)
-	return response, true
-}
-
-// The answer still says what it said, whatever happened to its OPT record.
-@(private = "file")
-expect_the_answer_survived :: proc(t: ^testing.T, m: dns.Message, label: string) {
-	if !testing.expectf(t, len(m.answer) == 1, "%s: the answer section holds %d records, not 1", label, len(m.answer)) {
-		return
-	}
-	addr, is_a := m.answer[0].data.(dns.Rdata_A)
-	if !testing.expectf(t, is_a, "%s: the answer's RDATA did not survive", label) {
-		return
-	}
-	testing.expectf(t, addr.addr == ANSWER_ADDR, "%s: the address came back as %v", label, addr.addr)
-	testing.expectf(t, m.id == CLIENT_ID, "%s: the answer carries ID %d", label, m.id)
-	testing.expectf(t, len(m.question) == 1, "%s: the question did not come back", label)
-}
-
-// Every option the answer's OPT record carries, so a case can name what it found
-// rather than only that it found something.
-@(private = "file")
-options_of :: proc(m: dns.Message) -> []dns.EDNS_Option {
-	for rec in m.additional {
-		if rec.type != .OPT {
-			continue
-		}
-		rdata, is_opt := rec.data.(dns.Rdata_OPT)
-		if !is_opt {
-			continue
-		}
-		return rdata.options
-	}
-	return nil
-}
-
-@(private = "file")
 expect_no_upstream_options :: proc(t: ^testing.T, wire: []u8, label: string) -> (m: dns.Message, ok: bool) {
 	decoded, derr := dns.decode_message(wire, context.temp_allocator)
 	if !testing.expectf(t, derr == .None, "%s did not decode: %v", label, derr) {
 		return {}, false
 	}
-	if !testing.expectf(t, dns.edns_present(decoded), "%s carries no OPT record", label) {
+	opt, found := dns.find_opt(decoded)
+	if !testing.expectf(t, found, "%s carries no OPT record", label) {
 		return decoded, false
 	}
-	for o in options_of(decoded) {
+	rdata, is_opt := opt.data.(dns.Rdata_OPT)
+	if !testing.expectf(t, is_opt, "%s carries an OPT record whose options did not decode", label) {
+		return decoded, false
+	}
+	// Every option it carries, so a case names what it found rather than only
+	// that it found something.
+	for o in rdata.options {
 		testing.expectf(
 			t,
 			false,
@@ -348,7 +179,7 @@ lives, which is a statement about one exchange repeated over every hit.
 @(test)
 test_a_cached_answer_carries_no_option_the_upstream_sent :: proc(t: ^testing.T) {
 	h: Harness
-	if !harness_start(t, &h) {
+	if !harness_start(t, &h, caching = true) {
 		return
 	}
 	defer harness_stop(&h)
@@ -367,7 +198,7 @@ test_a_cached_answer_carries_no_option_the_upstream_sent :: proc(t: ^testing.T) 
 
 	m, decoded := expect_no_upstream_options(t, hit, "the cached answer")
 	if decoded {
-		expect_the_answer_survived(t, m, "the cached answer")
+		expect_the_answer_survived(t, m, "the cached answer", ANSWER_ADDR, CLIENT_ID)
 	}
 
 	free_all(context.temp_allocator)
@@ -383,7 +214,7 @@ server forwards, whether or not anything stored it on the way past.
 @(test)
 test_a_forwarded_answer_carries_no_option_the_upstream_sent :: proc(t: ^testing.T) {
 	h: Harness
-	if !harness_start(t, &h, caching = false) {
+	if !harness_start(t, &h) {
 		return
 	}
 	defer harness_stop(&h)
@@ -395,7 +226,7 @@ test_a_forwarded_answer_carries_no_option_the_upstream_sent :: proc(t: ^testing.
 
 	m, decoded := expect_no_upstream_options(t, out, "the forwarded answer")
 	if decoded {
-		expect_the_answer_survived(t, m, "the forwarded answer")
+		expect_the_answer_survived(t, m, "the forwarded answer", ANSWER_ADDR, CLIENT_ID)
 	}
 
 	free_all(context.temp_allocator)
@@ -415,7 +246,7 @@ version one screen earlier.
 @(test)
 test_a_forwarded_answer_states_version_0_and_the_clients_do_bit :: proc(t: ^testing.T) {
 	h: Harness
-	if !harness_start(t, &h, caching = false) {
+	if !harness_start(t, &h) {
 		return
 	}
 	defer harness_stop(&h)
@@ -444,7 +275,7 @@ test_a_forwarded_answer_states_version_0_and_the_clients_do_bit :: proc(t: ^test
 		)
 		testing.expect(t, !dns.edns_do(m), "the answer claims DO over a client that asked without it")
 	}
-	expect_the_answer_survived(t, m, "the forwarded answer")
+	expect_the_answer_survived(t, m, "the forwarded answer", ANSWER_ADDR, CLIENT_ID)
 
 	free_all(context.temp_allocator)
 }
@@ -459,7 +290,7 @@ copy of the one in the query and nothing else.
 @(test)
 test_a_forwarded_answer_copies_a_do_bit_the_client_set :: proc(t: ^testing.T) {
 	h: Harness
-	if !harness_start(t, &h, caching = false) {
+	if !harness_start(t, &h) {
 		return
 	}
 	defer harness_stop(&h)
@@ -476,7 +307,7 @@ test_a_forwarded_answer_copies_a_do_bit_the_client_set :: proc(t: ^testing.T) {
 	if testing.expect(t, dns.edns_present(m), "the EDNS client got no OPT record back") {
 		testing.expect(t, dns.edns_do(m), "the client set DO and was answered with it clear")
 	}
-	expect_the_answer_survived(t, m, "the forwarded answer")
+	expect_the_answer_survived(t, m, "the forwarded answer", ANSWER_ADDR, CLIENT_ID)
 
 	free_all(context.temp_allocator)
 }
@@ -489,13 +320,12 @@ put_u16 :: proc(b: ^[dynamic]u8, v: u16) {
 // The question's name, which every record below points at rather than repeats.
 @(private = "file")
 put_qname :: proc(b: ^[dynamic]u8) {
-	append(b, 8)
-	append(b, ..transmute([]u8)string("contents"))
-	append(b, 7)
-	append(b, ..transmute([]u8)string("example"))
-	append(b, 3)
-	append(b, ..transmute([]u8)string("com"))
-	append(b, 0)
+	name: [dns.MAX_NAME_WIRE]u8
+	n, err := dns.encode_name(QNAME, name[:])
+	if err != .None {
+		panic("the question's name does not encode")
+	}
+	append(b, ..name[:n])
 }
 
 @(private = "file")
@@ -532,6 +362,7 @@ and `pad_answer` is a no-op on UDP.
 @(private = "file")
 grows_on_rebuild_reply :: proc(srv_count: int, filler: int) -> []u8 {
 	b := make([dynamic]u8, 0, 1024, context.temp_allocator)
+	addr := ANSWER_ADDR
 
 	put_u16(&b, CLIENT_ID)
 	// QR, RD, RA.
@@ -547,7 +378,7 @@ grows_on_rebuild_reply :: proc(srv_count: int, filler: int) -> []u8 {
 	put_u16(&b, u16(dns.Class.IN))
 
 	put_owner_and_head(&b, u16(dns.Type.A), 4)
-	append(&b, ..ANSWER_ADDR[:])
+	append(&b, ..addr[:])
 
 	// An unknown type, so `decode_raw_rdata` finds no layout to walk and copies
 	// the bytes through untouched however many of them there are.
@@ -582,7 +413,7 @@ grows_on_rebuild_reply :: proc(srv_count: int, filler: int) -> []u8 {
 	append(&b, ..transmute([]u8)string(UPSTREAM_NSID))
 
 	put_owner_and_head(&b, u16(dns.Type.A), 4)
-	append(&b, ..ANSWER_ADDR[:])
+	append(&b, ..addr[:])
 
 	return b[:]
 }
@@ -603,8 +434,10 @@ once the rebuild has run.
 */
 @(test)
 test_a_strip_that_rebuilds_still_holds_the_udp_ceiling :: proc(t: ^testing.T) {
+	CEILING :: dns.MAX_UDP_SIZE
+
 	h: Harness
-	if !harness_start(t, &h, caching = false) {
+	if !harness_start(t, &h) {
 		return
 	}
 	defer harness_stop(&h)
@@ -616,31 +449,31 @@ test_a_strip_that_rebuilds_still_holds_the_udp_ceiling :: proc(t: ^testing.T) {
 	part of it is load-bearing and none of it is visible in the assertion below:
 	the reply arrives inside the limit, and an encoding of it is outside.
 	*/
-	testing.expectf(t, len(reply) <= 512, "the fixture is %d bytes, so it is over the limit before anything runs", len(reply))
+	testing.expectf(t, len(reply) <= CEILING, "the fixture is %d bytes, so it is over the limit before anything runs", len(reply))
 	decoded, derr := dns.decode_message(reply, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	reencoded, _, eerr := dns.encode_message(decoded, context.temp_allocator, dns.MAX_MESSAGE)
 	testing.expect_value(t, eerr, dns.Encode_Error.None)
 	testing.expectf(
 		t,
-		len(reencoded) > 512,
+		len(reencoded) > CEILING,
 		"an encoding of the fixture is %d bytes, so the rebuild cannot push it over the limit and this case tests nothing",
 		len(reencoded),
 	)
 
-	out, ok := forward_once(t, &h, client_query(advertised = 512), reply)
+	out, ok := forward_once(t, &h, client_query(advertised = CEILING), reply)
 	if !ok {
 		return
 	}
 
-	testing.expectf(t, len(out) <= 512, "the answer went out at %d bytes against a 512-byte ceiling", len(out))
+	testing.expectf(t, len(out) <= CEILING, "the answer went out at %d bytes against a %d-byte ceiling", len(out), CEILING)
 	// And the strip it was refitted after did what it was there for.
 	_, still_there := dns.peek_edns_option(out, .NSID)
 	testing.expect(t, !still_there, "the upstream's NSID survived the refit")
 
 	m, merr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, merr, dns.Decode_Error.None)
-	expect_the_answer_survived(t, m, "the refitted answer")
+	expect_the_answer_survived(t, m, "the refitted answer", ANSWER_ADDR, CLIENT_ID)
 
 	free_all(context.temp_allocator)
 }

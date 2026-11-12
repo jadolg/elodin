@@ -43,8 +43,6 @@ server:
 @(private = "file")
 boot_fixture :: proc(t: ^testing.T, name: string, text: string) -> (f: ^Gen_Fixture, ok: bool) {
 	f = new(Gen_Fixture)
-	// Per process: other worktrees run this suite on the same box.
-	f.path = fmt.aprintf("/tmp/elodin-server-generation-test-%s-%d.yaml", name, os.get_pid())
 	if err := virtual.arena_init_growing(&f.arena); err != nil {
 		testing.expectf(t, false, "cannot reserve an arena: %v", err)
 		free(f)
@@ -66,6 +64,9 @@ boot_fixture :: proc(t: ^testing.T, name: string, text: string) -> (f: ^Gen_Fixt
 		free(f)
 		return nil, false
 	}
+	// Per process: other worktrees run this suite on the same box. Made last, so
+	// no failure above has it to free.
+	f.path = fmt.aprintf("/tmp/elodin-server-generation-test-%s-%d.yaml", name, os.get_pid())
 	return f, true
 }
 
@@ -78,6 +79,32 @@ close_fixture :: proc(f: ^Gen_Fixture) {
 	os.remove(f.path)
 	delete(f.path)
 	free(f)
+}
+
+// `text` as the loader reads it, into `arena`; `ok` false, and said, when it
+// does not load.
+@(private = "file")
+load :: proc(t: ^testing.T, text: string, arena: ^virtual.Arena, loc := #caller_location) -> (cfg: config.Config, ok: bool) {
+	loaded, err := config.load_string(text, virtual.arena_allocator(arena))
+	if e, has := err.?; has {
+		testing.expectf(t, false, "does not load: %v", e.messages, loc = loc)
+		return {}, false
+	}
+	return loaded, true
+}
+
+/*
+`text` with a root anchor naming an algorithm no build can check, so the file
+loads and its validator cannot be built; with the upstream moved as well, so
+the new upstreams are built first.
+*/
+@(private = "file")
+unbuildable :: proc(text: string) -> string {
+	return swap(
+		swap(text, "127.0.0.1:1", "127.0.0.1:2"),
+		"dnssec: { enabled: false }",
+		"dnssec: { enabled: true, trust_anchors: [\". IN DS 20326 1 1 0000000000000000000000000000000000000000\"] }",
+	)
 }
 
 // `text` with `old` replaced, in the temp arena.
@@ -168,18 +195,7 @@ test_a_reload_that_changes_the_upstreams_rebuilds_them_and_moves_the_policy :: p
 	old_key := cache.make_key(old_buf[:], "cached.test.", .A, .IN, false, policy = old.policy)
 	testing.expect(t, cache.put(old.answers, old_key, wire, msg), "the answer was not stored")
 
-	out := reload_from(
-		t,
-		f,
-		`log: { level: info }
-upstream: { servers: ["127.0.0.1:2"], timeout: 1s }
-dnssec: { enabled: false }
-blocking: { enabled: false }
-cookies: { enabled: true }
-server:
-  rate_limit: { enabled: true, responses_per_second: 100 }
-`,
-	)
+	out := reload_from(t, f, swap(BASE, "127.0.0.1:1", "127.0.0.1:2"))
 	testing.expect(t, out.applied, "the reload was not applied")
 	cur := f.s.gens.current
 	testing.expect(t, cur.group != old.group, "a changed upstream section kept the old group")
@@ -195,60 +211,122 @@ server:
 	testing.expect(t, !found, "an answer stored under the old rules was served under the new ones")
 }
 
-@(test)
-test_a_reload_moves_the_policy_for_rebind_and_dnssec_but_not_rewrites :: proc(t: ^testing.T) {
-	f, ok := boot_fixture(t, "policy", BASE)
-	if !ok {
+/*
+Whether one reload from `BASE` to `text` moved the policy number every cache
+key carries: `ok` false, and said, when the fixture did not boot or the reload
+was not applied, which would leave the number where it was for no reason.
+*/
+@(private = "file")
+policy_moved :: proc(t: ^testing.T, name, text: string, loc := #caller_location) -> (moved, ok: bool) {
+	f, booted := boot_fixture(t, name, BASE)
+	if !booted {
 		return
 	}
 	defer close_fixture(f)
-
 	before := f.s.gens.current.policy
-	reload_from(t, f, BASE + "rewrites:\n  - { domain: r.test, answer: 192.0.2.1 }\n")
-	testing.expect_value(t, f.s.gens.current.policy, before)
+	if !testing.expect(t, reload_from(t, f, text).applied, "the reload was not applied", loc = loc) {
+		return
+	}
+	return f.s.gens.current.policy != before, true
+}
 
-	// Nor an edit to a feature that is off before and after: it judged no
-	// answer under either file.
+@(test)
+test_a_reload_does_not_move_the_policy_for_rewrites :: proc(t: ^testing.T) {
+	moved, ok := policy_moved(t, "policy-rewrites", BASE + "rewrites:\n  - { domain: r.test, answer: 192.0.2.1 }\n")
+	testing.expect(t, ok && !moved, "a rewrite edit moved the policy")
+}
+
+// Nor an edit to a feature that is off before and after: it judged no answer
+// under either file.
+@(test)
+test_a_reload_does_not_move_the_policy_for_a_dormant_edit :: proc(t: ^testing.T) {
 	dormant := swap(
 		BASE,
 		"dnssec: { enabled: false }",
 		"dnssec: { enabled: false, max_nsec3_iterations: 50 }\nrebind: { enabled: false, allow_loopback: true }",
 	)
-	testing.expect(t, reload_from(t, f, dormant).applied, "the dormant edit did not load")
-	testing.expect_value(t, f.s.gens.current.policy, before)
+	moved, ok := policy_moved(t, "policy-dormant", dormant)
+	testing.expect(t, ok && !moved, "an edit to a feature that is off moved the policy")
+}
 
-	// Waiting on the same servers longer changes no answer they give.
+// Waiting on the same servers longer changes no answer they give.
+@(test)
+test_a_reload_does_not_move_the_policy_for_a_timeout :: proc(t: ^testing.T) {
+	f, ok := boot_fixture(t, "policy-timeout", BASE)
+	if !ok {
+		return
+	}
+	defer close_fixture(f)
+	before := f.s.gens.current.policy
 	group := f.s.gens.current.group
-	reload_from(t, f, swap(BASE, "timeout: 1s", "timeout: 2s"))
+	if !testing.expect(t, reload_from(t, f, swap(BASE, "timeout: 1s", "timeout: 2s")).applied, "the timeout change did not load") {
+		return
+	}
 	testing.expect(t, f.s.gens.current.group != group, "a changed timeout was not applied")
 	testing.expect_value(t, f.s.gens.current.policy, before)
-	testing.expect(t, reload_from(t, f, swap(BASE, "timeout: 1s", "timeout: 2s, bootstrap: [\"127.0.0.9\"]")).applied, "the bootstrap change did not load")
-	testing.expect(t, f.s.gens.current.policy != before, "a changed bootstrap left the answers it might have changed")
-	before = f.s.gens.current.policy
+}
 
-	reload_from(t, f, BASE + "rebind: { enabled: true }\n")
-	after_rebind := f.s.gens.current.policy
-	testing.expect(t, after_rebind != before, "turning rebind protection on left cached answers it never read")
+@(test)
+test_a_reload_moves_the_policy_for_a_bootstrap :: proc(t: ^testing.T) {
+	moved, ok := policy_moved(t, "policy-bootstrap", swap(BASE, "timeout: 1s", "timeout: 2s, bootstrap: [\"127.0.0.9\"]"))
+	testing.expect(t, ok && moved, "a changed bootstrap left the answers it might have changed")
+}
 
-	reload_from(t, f, swap(BASE, "dnssec: { enabled: false }", "dnssec: { enabled: true }"))
+@(test)
+test_a_reload_moves_the_policy_for_rebind :: proc(t: ^testing.T) {
+	moved, ok := policy_moved(t, "policy-rebind", BASE + "rebind: { enabled: true }\n")
+	testing.expect(t, ok && moved, "turning rebind protection on left cached answers it never read")
+}
+
+@(test)
+test_a_reload_moves_the_policy_for_dnssec :: proc(t: ^testing.T) {
+	f, ok := boot_fixture(t, "policy-dnssec", BASE)
+	if !ok {
+		return
+	}
+	defer close_fixture(f)
+	before := f.s.gens.current.policy
+	if !testing.expect(t, reload_from(t, f, swap(BASE, "dnssec: { enabled: false }", "dnssec: { enabled: true }")).applied, "the reload was not applied") {
+		return
+	}
 	cur := f.s.gens.current
-	testing.expect(t, cur.policy != after_rebind, "turning validation on left unvalidated answers cached")
+	testing.expect(t, cur.policy != before, "turning validation on left unvalidated answers cached")
 	testing.expect(t, cur.validator != nil, "turning validation on built no validator")
 	testing.expect(t, .Validator in cur.owns, "the new validator is nobody's to release")
+}
 
-	// Nor does how much validation may do at once.
+// Nor does how much validation may do at once.
+@(test)
+test_a_reload_does_not_move_the_policy_for_chain_walks :: proc(t: ^testing.T) {
+	f, ok := boot_fixture(t, "policy-walks", BASE)
+	if !ok {
+		return
+	}
+	defer close_fixture(f)
 	chain_walks := swap(BASE, "dnssec: { enabled: false }", "dnssec: { enabled: true, max_chain_walks: 3 }")
-	testing.expect(t, reload_from(t, f, swap(chain_walks, "max_chain_walks: 3", "max_chain_walks: 5")).applied, "the walk bound did not load")
-	before = f.s.gens.current.policy
+	if !testing.expect(t, reload_from(t, f, swap(chain_walks, "max_chain_walks: 3", "max_chain_walks: 5")).applied, "the walk bound did not load") {
+		return
+	}
+	before := f.s.gens.current.policy
 	testing.expect(t, reload_from(t, f, chain_walks).applied, "the walk bound did not load")
 	testing.expect_value(t, f.s.gens.current.policy, before)
+}
 
-	// Nor does the name a server is logged under.
+// Nor does the name a server is logged under.
+@(test)
+test_a_reload_does_not_move_the_policy_for_a_server_name :: proc(t: ^testing.T) {
 	named :: proc(name: string) -> string {
 		return swap(BASE, "servers: [\"127.0.0.1:1\"]", fmt.tprintf("servers: [{{ name: %s, address: 127.0.0.1, port: 1 }}]", name))
 	}
-	testing.expect(t, reload_from(t, f, named("one")).applied, "the named server did not load")
-	before = f.s.gens.current.policy
+	f, ok := boot_fixture(t, "policy-names", BASE)
+	if !ok {
+		return
+	}
+	defer close_fixture(f)
+	if !testing.expect(t, reload_from(t, f, named("one")).applied, "the named server did not load") {
+		return
+	}
+	before := f.s.gens.current.policy
 	testing.expect(t, reload_from(t, f, named("two")).applied, "the rename did not load")
 	testing.expect_value(t, f.s.gens.current.policy, before)
 }
@@ -365,59 +443,92 @@ test_a_reload_holds_restart_only_keys_at_their_starting_values :: proc(t: ^testi
 @(test)
 test_a_restart_only_key_dropped_from_the_file_is_named :: proc(t: ^testing.T) {
 	arena: virtual.Arena
-	if err := virtual.arena_init_growing(&arena); err != nil {
-		testing.expectf(t, false, "cannot reserve an arena: %v", err)
+	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
 		return
 	}
 	defer virtual.arena_destroy(&arena)
-	load :: proc(t: ^testing.T, text: string, arena: ^virtual.Arena) -> config.Config {
-		cfg, err := config.load_string(text, virtual.arena_allocator(arena))
-		if e, has := err.?; has {
-			testing.expectf(t, false, "does not load: %v", e.messages)
-		}
-		return cfg
+	boot, boot_ok := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n  max_connections_per_prefix: 97\n"), &arena)
+	cfg, cfg_ok := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n"), &arena)
+	if !boot_ok || !cfg_ok {
+		return
 	}
-	boot := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n  max_connections_per_prefix: 97\n"), &arena)
-	cfg := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n"), &arena)
 	testing.expect(t, cfg.server.max_connections_per_prefix != 97, "the derived figure is the written one, so nothing is tested")
 
 	named := keep_restart_only(&boot, &cfg, context.temp_allocator)
 	testing.expectf(t, len(named) == 1 && named[0] == "server.max_connections_per_prefix", "named %v", named)
 	testing.expect_value(t, cfg.server.max_connections_per_prefix, 97)
+}
 
-	// Derived both times, and from the same `max_connections`: nothing to say.
-	first := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n"), &arena)
-	again := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n"), &arena)
+// Derived both times, and from the same `max_connections`: nothing to say.
+@(test)
+test_a_restart_only_key_derived_both_times_is_not_named :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	first, first_ok := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n"), &arena)
+	again, again_ok := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n"), &arena)
+	if !first_ok || !again_ok {
+		return
+	}
 	testing.expect_value(t, len(keep_restart_only(&first, &again, context.temp_allocator)), 0)
+}
 
-	// A bound the file never sized, loaded on a machine whose memory limit moved
-	// since startup: derived again from the starting machine, and nothing the
-	// operator wrote to name.
-	derived := load(t, BASE, &arena)
-	moved := load(t, BASE, &arena)
+/*
+A bound the file never sized, loaded on a machine whose memory limit moved since
+startup: derived again from the starting machine, and nothing the operator wrote
+to name. And UDP readers left to the machine, which shows more CPUs than at
+startup: held, and nothing to name either.
+*/
+@(test)
+test_a_restart_only_key_the_machine_moved_is_held_unnamed :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	derived, derived_ok := load(t, BASE, &arena)
+	moved, moved_ok := load(t, BASE, &arena)
+	readers, readers_ok := load(t, BASE, &arena)
+	more, more_ok := load(t, BASE, &arena)
+	if !derived_ok || !moved_ok || !readers_ok || !more_ok {
+		return
+	}
+
 	testing.expect(t, derived.server.sizing.derived_max_pending, "BASE names max_pending, so nothing is tested")
 	moved.server.sizing.machine.memory = derived.server.sizing.machine.memory * 2 + config.QUERY_MEMORY_BYTES * 64
 	moved.server.max_pending = config.derive_max_pending(moved.server.sizing.machine)
-	named = keep_restart_only(&derived, &moved, context.temp_allocator)
+	named := keep_restart_only(&derived, &moved, context.temp_allocator)
 	testing.expectf(t, len(named) == 0, "named %v for a file that names no max_pending", named)
 	testing.expect_value(t, moved.server.max_pending, derived.server.max_pending)
 
-	// UDP readers left to the machine, which shows more CPUs than at startup:
-	// held, and nothing the operator wrote to name.
-	readers := load(t, BASE, &arena)
-	more := load(t, BASE, &arena)
 	testing.expect(t, readers.server.sizing.derived_udp_readers, "BASE names a reader count, so nothing is tested")
 	more.listeners.udp.readers = readers.listeners.udp.readers + 1
 	named = keep_restart_only(&readers, &more, context.temp_allocator)
 	testing.expectf(t, len(named) == 0, "named %v for a file that names no reader count", named)
 	testing.expect_value(t, more.listeners.udp.readers, readers.listeners.udp.readers)
+}
 
-	// A per-prefix share neither file writes moves with `max_connections`, which
-	// is the one key the operator changed and the one to name.
-	table := load(t, BASE, &arena)
-	halved := load(t, swap(BASE, "server:\n", fmt.tprintf("server:\n  max_connections: %d\n", table.server.max_connections / 2)), &arena)
+// A per-prefix share neither file writes moves with `max_connections`, which is
+// the one key the operator changed and the one to name.
+@(test)
+test_a_restart_only_share_moved_by_max_connections_names_it :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	table, table_ok := load(t, BASE, &arena)
+	if !table_ok {
+		return
+	}
+	halved, halved_ok := load(t, swap(BASE, "server:\n", fmt.tprintf("server:\n  max_connections: %d\n", table.server.max_connections / 2)), &arena)
+	if !halved_ok {
+		return
+	}
 	testing.expect(t, halved.server.max_connections_per_prefix != table.server.max_connections_per_prefix, "the share did not move, so nothing is tested")
-	named = keep_restart_only(&table, &halved, context.temp_allocator)
+	named := keep_restart_only(&table, &halved, context.temp_allocator)
 	testing.expectf(t, len(named) == 1 && named[0] == "server.max_connections", "named %v", named)
 	testing.expect_value(t, halved.server.max_connections_per_prefix, table.server.max_connections_per_prefix)
 }
@@ -519,16 +630,13 @@ dnssec:
   trust_anchors: [". 172800 IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"]
 `
 	arena: virtual.Arena
-	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
-	defer virtual.arena_destroy(&arena)
-	a, aerr := config.load_string(TEXT, virtual.arena_allocator(&arena))
-	b, berr := config.load_string(TEXT, virtual.arena_allocator(&arena))
-	if ea, has := aerr.?; has {
-		testing.expectf(t, false, "%v", ea.messages)
+	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
 		return
 	}
-	if eb, has := berr.?; has {
-		testing.expectf(t, false, "%v", eb.messages)
+	defer virtual.arena_destroy(&arena)
+	a, a_ok := load(t, TEXT, &arena)
+	b, b_ok := load(t, TEXT, &arena)
+	if !a_ok || !b_ok {
 		return
 	}
 	testing.expect_value(t, changed_sections(&a, &b, context.temp_allocator), "")
@@ -636,19 +744,14 @@ test_an_answer_stored_under_a_replaced_policy_is_not_served :: proc(t: ^testing.
 		msg.flags.qr = true
 		msg.flags.rd = true
 		msg.flags.ra = true
-		wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+		wire, _, enc := dns.encode_message(msg, context.temp_allocator)
+		testing.expect_value(t, enc, dns.Encode_Error.None)
 		buf: [cache.KEY_MAX]u8
 		key := cache.make_key(buf[:], name, .A, .IN, false, policy = policy)
 		testing.expect(t, cache.put(c, key, wire, msg), "the answer was not stored")
 	}
 	served :: proc(t: ^testing.T, s: ^Server, name: string) -> int {
-		q := dns.Message {
-			id       = 7,
-			question = []dns.Question{{name = name, type = .A, class = .IN}},
-		}
-		q.flags.rd = true
-		wire, _, _ := dns.encode_message(q, context.temp_allocator)
-		out, _, ok := handle_query(s, wire, .UDP, "127.0.0.1:5555", context.temp_allocator)
+		out, _, ok := handle_query(s, test_query(name, id = 7), .UDP, "127.0.0.1:5555", context.temp_allocator)
 		if !ok {
 			return -1
 		}
@@ -705,12 +808,7 @@ test_a_reload_that_cannot_be_built_releases_what_it_built :: proc(t: ^testing.T)
 	defer close_fixture(f)
 	old := f.s.gens.current
 
-	broken := swap(
-		swap(BASE, "127.0.0.1:1", "127.0.0.1:2"),
-		"dnssec: { enabled: false }",
-		"dnssec: { enabled: true, trust_anchors: [\". IN DS 20326 1 1 0000000000000000000000000000000000000000\"] }",
-	)
-	out := reload_from(t, f, broken)
+	out := reload_from(t, f, unbuildable(BASE))
 	testing.expect(t, !out.applied, "a configuration whose validator could not be built was applied")
 	testing.expect(t, f.s.gens.current == old, "the running generation was replaced")
 	testing.expect(t, f.s.gens.retired == nil, "the running generation was retired")
@@ -732,12 +830,7 @@ test_a_reload_of_max_pending_moves_the_racer_and_pipeline_bounds :: proc(t: ^tes
 	testing.expect_value(t, sync.atomic_load(&f.s.racers.limit), 100)
 
 	raised := swap(boot, "max_pending: 100", "max_pending: 3000")
-	broken := swap(
-		swap(raised, "127.0.0.1:1", "127.0.0.1:2"),
-		"dnssec: { enabled: false }",
-		"dnssec: { enabled: true, trust_anchors: [\". IN DS 20326 1 1 0000000000000000000000000000000000000000\"] }",
-	)
-	out := reload_from(t, f, broken)
+	out := reload_from(t, f, unbuildable(raised))
 	testing.expect(t, !out.applied, "a configuration whose validator could not be built was applied")
 	testing.expect_value(t, sync.atomic_load(&f.s.racers.limit), 100)
 
@@ -1005,7 +1098,10 @@ test_a_rebuild_holds_no_generation_a_reload_replaces :: proc(t: ^testing.T) {
 	defer if listener_open {
 		net.close(listener)
 	}
-	bound, _ := net.bound_endpoint(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
 	_ = net.set_option(listener, .Receive_Timeout, 5 * time.Second)
 
 	stalled := swap(
@@ -1038,10 +1134,10 @@ test_a_rebuild_holds_no_generation_a_reload_replaces :: proc(t: ^testing.T) {
 
 	net.close(listener)
 	listener_open = false
-	for !rebuild_done(&r) {
-		time.sleep(10 * time.Millisecond)
-	}
-	rebuild_collect(&r)
+	// Joined rather than polled: with the listener gone the download fails.
+	thread.join(r.thread)
+	_, over := rebuild_collect(&r)
+	testing.expect(t, over, "the joined rebuild was not collected")
 }
 
 // `server.pin_loops` is read as the loops start, so a reload that turns it on is
@@ -1049,15 +1145,13 @@ test_a_rebuild_holds_no_generation_a_reload_replaces :: proc(t: ^testing.T) {
 @(test)
 test_a_reload_holds_pin_loops :: proc(t: ^testing.T) {
 	arena: virtual.Arena
-	if err := virtual.arena_init_growing(&arena); err != nil {
-		testing.expectf(t, false, "cannot reserve an arena: %v", err)
+	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
 		return
 	}
 	defer virtual.arena_destroy(&arena)
-	boot, boot_err := config.load_string(BASE, virtual.arena_allocator(&arena))
-	cfg, err := config.load_string(swap(BASE, "server:\n", "server:\n  pin_loops: true\n"), virtual.arena_allocator(&arena))
-	if boot_err != nil || err != nil {
-		testing.expectf(t, false, "does not load: %v %v", boot_err, err)
+	boot, boot_ok := load(t, BASE, &arena)
+	cfg, cfg_ok := load(t, swap(BASE, "server:\n", "server:\n  pin_loops: true\n"), &arena)
+	if !boot_ok || !cfg_ok {
 		return
 	}
 	testing.expect(t, !boot.server.pin_loops, "off is not the default")

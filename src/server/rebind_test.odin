@@ -4,7 +4,6 @@ import "core:mem"
 import "core:net"
 import "core:testing"
 import "core:thread"
-import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
@@ -21,57 +20,6 @@ page or a service bound to loopback. dnsmasq calls the guard
 `--stop-dns-rebind`, AdGuard Home calls it rebinding protection, and both drop
 private addresses arriving from an upstream.
 */
-
-@(private = "file")
-Rebind_Mock :: struct {
-	socket: net.UDP_Socket,
-	reply:  []u8,
-	asked:  bool,
-}
-
-@(private = "file")
-serve_rebind :: proc(x: ^Rebind_Mock) {
-	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
-		return
-	}
-	x.asked = true
-	out: [4096]u8
-	copy(out[:], x.reply)
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
-}
-
-@(private = "file")
-rebind_query :: proc(name: string) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question{name = name, type = .A, class = .IN}
-	msg := dns.Message{id = 0x4321, question = questions}
-	msg.flags.rd = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-@(private = "file")
-rebind_reply :: proc(name: string, addr: [4]u8) -> []u8 {
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record{name = name, type = .A, class = .IN, ttl = 60, data = dns.Rdata_A{addr = addr}}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = .A, class = .IN}
-	msg := dns.Message{question = question, answer = answer}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
 
 @(private = "file")
 is_private_v4 :: proc(a: [4]u8) -> bool {
@@ -95,52 +43,19 @@ test_a_public_name_is_not_answered_with_a_private_address :: proc(t: ^testing.T)
 	addresses := [][4]u8{{127, 0, 0, 1}, {192, 168, 1, 1}, {10, 0, 0, 5}, {169, 254, 169, 254}}
 
 	for addr in addresses {
-		socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-		if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-			return
-		}
-		defer net.close(socket)
-		_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-		bound, _ := net.bound_endpoint(socket)
-
-		cfg := config.default_config()
-		cfg.log.queries = false
-		cfg.cache.enabled = false
-		cfg.dnssec.enabled = false
-		cfg.blocking.enabled = false
 		// Off by default, and this is the reproducer for the guard on.
-		cfg.rebind.enabled = true
-		cfg.upstream.strategy = .Failover
-		cfg.upstream.attempts = 1
-		cfg.upstream.timeout = 3 * time.Second
-		servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-		servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-		cfg.upstream.servers = servers
-
-		group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-		if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-			return
-		}
-		defer upstream.destroy_group(group)
-		s := Server{cfg = &cfg, group = group}
-
-		x := Rebind_Mock{socket = socket, reply = rebind_reply("rebind.attacker.example.", addr)}
-		mock := thread.create_and_start_with_poly_data(&x, serve_rebind)
-		out, _, ok := handle_query(
-			&s,
-			rebind_query("rebind.attacker.example."),
-			.UDP,
-			"127.0.0.1:5555",
-			context.temp_allocator,
+		cfg := rebind_config()
+		records := []dns.Record{a_record("rebind.attacker.example.", addr)}
+		decoded, ok := ask_with_reply(
+			t,
+			&cfg,
+			"rebind.attacker.example.",
+			.A,
+			rebind_reply_of("rebind.attacker.example.", .A, records),
 		)
-		thread.join(mock)
-		thread.destroy(mock)
-
-		if !testing.expect(t, ok, "nothing came back at all") {
+		if !ok {
 			return
 		}
-		decoded, derr := dns.decode_message(out, context.temp_allocator)
-		testing.expect_value(t, derr, dns.Decode_Error.None)
 		for rec in decoded.answer {
 			a, is_a := rec.data.(dns.Rdata_A)
 			if !is_a {
@@ -167,23 +82,10 @@ answer that this file decides the contents of.
 */
 
 @(private = "file")
-rebind_query_type :: proc(name: string, type: dns.Type) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question{name = name, type = type, class = .IN}
-	msg := dns.Message{id = 0x4321, question = questions}
-	msg.flags.rd = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-@(private = "file")
-rebind_reply_of :: proc(name: string, type: dns.Type, answers: []dns.Record) -> []u8 {
+rebind_reply_of :: proc(name: string, type: dns.Type, answers: []dns.Record, additional: []dns.Record = nil) -> []u8 {
 	question := make([]dns.Question, 1, context.temp_allocator)
 	question[0] = dns.Question{name = name, type = type, class = .IN}
-	msg := dns.Message{question = question, answer = answers}
+	msg := dns.Message{question = question, answer = answers, additional = additional}
 	msg.flags.qr = true
 	msg.flags.rd = true
 	msg.flags.ra = true
@@ -192,6 +94,16 @@ rebind_reply_of :: proc(name: string, type: dns.Type, answers: []dns.Record) -> 
 		return nil
 	}
 	return wire
+}
+
+// A copy of `wire` claiming `n` additional records. ARCOUNT is the fourth count
+// in the header, bytes 10 and 11.
+@(private = "file")
+with_arcount :: proc(wire: []u8, n: u16) -> []u8 {
+	patched := make([]u8, len(wire), context.temp_allocator)
+	copy(patched, wire)
+	patched[10], patched[11] = u8(n >> 8), u8(n)
+	return patched
 }
 
 @(private = "file")
@@ -267,22 +179,13 @@ ask_raw :: proc(
 	outcome: Outcome,
 	ok: bool,
 ) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	socket, spec, bound := bind_mock(t)
+	if !bound {
 		return nil, .Failed, false
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, _ := net.bound_endpoint(socket)
-
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
+	cfg.upstream.servers = loopback_upstream(spec.port)
+	group, gerr := upstream.make_group(cfg.upstream)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return nil, .Failed, false
 	}
@@ -293,17 +196,22 @@ ask_raw :: proc(
 		answers = answers,
 	}
 
-	x := Rebind_Mock{socket = socket, reply = reply}
+	query := test_query(name, type)
+	x := Canned_Mock {
+		socket = socket,
+		reply  = reply,
+	}
 	mock: ^thread.Thread
 	if forwarded {
-		mock = thread.create_and_start_with_poly_data(&x, serve_rebind)
+		mock = thread.create_and_start_with_poly_data(&x, serve_canned)
 	}
-	out, got, sent := handle_query(&s, rebind_query_type(name, type), .UDP, "127.0.0.1:5555", request)
+	out, got, sent := handle_query(&s, query, .UDP, "127.0.0.1:5555", request)
 	if forwarded {
 		thread.join(mock)
 		thread.destroy(mock)
+		testing.expect(t, x.got, "the upstream was never asked")
 	} else {
-		testing.expect(t, mock_untouched(socket), "the query was forwarded, so the answer did not come from this server")
+		testing.expect(t, mock_untouched(socket, query), "the query was forwarded, so the answer did not come from this server")
 	}
 
 	if !testing.expect(t, sent, "nothing came back at all") {
@@ -317,11 +225,7 @@ ask_raw :: proc(
 // tests are all about what it does once on, and the off case has its own test.
 @(private = "file")
 rebind_config :: proc() -> config.Config {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = false
+	cfg := test_config()
 	cfg.rebind.enabled = true
 	return cfg
 }
@@ -838,22 +742,18 @@ Both families, since `zeroip` answers AAAA with `::` and that is in the set too.
 */
 @(test)
 test_a_zero_ip_block_response_still_reaches_the_client :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = true
-	cfg.blocking.response = .Zero_IP
-	// The guard is turned on here - it is off in the shipped default - because a
+	// The guard is on here - it is off in the shipped default - because a
 	// guard that is off could not collide with blocking, and the collision is
 	// the point of the test.
-	cfg.rebind.enabled = true
+	cfg := rebind_config()
+	cfg.blocking.enabled = true
+	cfg.blocking.response = .Zero_IP
 
-	block, allow := filter.set_make(), filter.set_make()
-	filter.parse_list(block, allow, "0.0.0.0 ads.example.com\n", .Hosts)
-	engine := filter.engine_make()
+	engine, listed := test_filters(t, "0.0.0.0 ads.example.com\n", .Hosts)
 	defer filter.engine_destroy(engine)
-	filter.engine_swap(engine, block, allow)
+	if !listed {
+		return
+	}
 
 	s := Server {
 		cfg     = &cfg,
@@ -864,7 +764,7 @@ test_a_zero_ip_block_response_still_reaches_the_client :: proc(t: ^testing.T) {
 	for type in types {
 		out, outcome, ok := handle_query(
 			&s,
-			rebind_query_type("ads.example.com.", type),
+			test_query("ads.example.com.", type),
 			.UDP,
 			"127.0.0.1:5555",
 			context.temp_allocator,
@@ -916,12 +816,9 @@ test_an_undecodable_answer_is_refused_not_forwarded :: proc(t: ^testing.T) {
 	if !testing.expect(t, len(reply) > dns.HEADER_SIZE, "the reply did not encode") {
 		return
 	}
-	// ARCOUNT is the fourth count in the header, bytes 10 and 11. A hundred
-	// additional records that are not there is more than the remaining bytes
-	// can hold, which is what the decoder refuses.
-	patched := make([]u8, len(reply), context.temp_allocator)
-	copy(patched, reply)
-	patched[10], patched[11] = 0, 100
+	// A hundred additional records that are not there is more than the
+	// remaining bytes can hold, which is what the decoder refuses.
+	patched := with_arcount(reply, 100)
 
 	_, derr := dns.decode_message(patched, context.temp_allocator)
 	if !testing.expect(t, derr != .None, "the premise is gone: this message now decodes") {
@@ -952,9 +849,7 @@ test_an_undecodable_answer_is_refused_not_forwarded :: proc(t: ^testing.T) {
 		data  = dns.Rdata_TXT{strings = []string{"hello"}},
 	}
 	txt_reply := rebind_reply_of("undecodable.attacker.example.", .TXT, txt)
-	txt_patched := make([]u8, len(txt_reply), context.temp_allocator)
-	copy(txt_patched, txt_reply)
-	txt_patched[10], txt_patched[11] = 0, 100
+	txt_patched := with_arcount(txt_reply, 100)
 
 	out, _, sent := ask_raw(t, &cfg, "undecodable.attacker.example.", .TXT, txt_patched)
 	if testing.expect(t, sent, "the TXT answer was not sent at all") {
@@ -996,21 +891,9 @@ test_an_https_answer_cannot_smuggle_an_address_in_the_additional_section :: proc
 		// No parameters at all, so there is no hint to catch it by.
 		data  = dns.Rdata_SVCB{priority = 1, target = "target.attacker.example."},
 	}
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = a_record("target.attacker.example.", {192, 168, 1, 1})
-
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = "svc.attacker.example.", type = .HTTPS, class = .IN}
-	reply_msg := dns.Message {
-		question   = question,
-		answer     = answers,
-		additional = additional,
-	}
-	reply_msg.flags.qr = true
-	reply_msg.flags.rd = true
-	reply_msg.flags.ra = true
-	reply, _, err := dns.encode_message(reply_msg, context.temp_allocator)
-	if !testing.expectf(t, err == .None, "the reply did not encode: %v", err) {
+	additional := []dns.Record{a_record("target.attacker.example.", {192, 168, 1, 1})}
+	reply := rebind_reply_of("svc.attacker.example.", .HTTPS, answers, additional)
+	if !testing.expect(t, reply != nil, "the reply did not encode") {
 		return
 	}
 
@@ -1028,22 +911,10 @@ test_an_https_answer_cannot_smuggle_an_address_in_the_additional_section :: proc
 	way to retrieve it on its own, and refusing on it would mean an answer
 	turned away for a record its client will never read.
 	*/
-	plain := make([]dns.Record, 1, context.temp_allocator)
-	plain[0] = a_record("ok.example.", {93, 184, 216, 34})
-	glue := make([]dns.Record, 1, context.temp_allocator)
-	glue[0] = a_record("ns.somewhere.example.", {192, 168, 1, 1})
-	q2 := make([]dns.Question, 1, context.temp_allocator)
-	q2[0] = dns.Question{name = "ok.example.", type = .A, class = .IN}
-	m2 := dns.Message {
-		question   = q2,
-		answer     = plain,
-		additional = glue,
-	}
-	m2.flags.qr = true
-	m2.flags.rd = true
-	m2.flags.ra = true
-	wire, _, werr := dns.encode_message(m2, context.temp_allocator)
-	if !testing.expectf(t, werr == .None, "the second reply did not encode: %v", werr) {
+	plain := []dns.Record{a_record("ok.example.", {93, 184, 216, 34})}
+	glue := []dns.Record{a_record("ns.somewhere.example.", {192, 168, 1, 1})}
+	wire := rebind_reply_of("ok.example.", .A, plain, glue)
+	if !testing.expect(t, wire != nil, "the second reply did not encode") {
 		return
 	}
 	cfg2 := rebind_config()
@@ -1074,16 +945,10 @@ test_a_broken_additional_section_does_not_refuse_a_readable_answer :: proc(t: ^t
 	// decode, not enough to fail the count check in the prologue - which is the
 	// only reason there is a case to answer here. The hundred-record version
 	// from the test above is refused by both decoders and still is.
-	overrun :: proc(wire: []u8) -> []u8 {
-		patched := make([]u8, len(wire), context.temp_allocator)
-		copy(patched, wire)
-		patched[10], patched[11] = 0, 1
-		return patched
-	}
 
 	public := make([]dns.Record, 1, context.temp_allocator)
 	public[0] = a_record("tail.example.", {93, 184, 216, 34})
-	patched := overrun(rebind_reply_of("tail.example.", .A, public))
+	patched := with_arcount(rebind_reply_of("tail.example.", .A, public), 1)
 
 	_, full := dns.decode_message(patched, context.temp_allocator)
 	if !testing.expect(t, full != .None, "the premise is gone: the whole message decodes") {
@@ -1116,7 +981,7 @@ test_a_broken_additional_section_does_not_refuse_a_readable_answer :: proc(t: ^t
 		&cfg,
 		"tail.attacker.example.",
 		.A,
-		overrun(rebind_reply_of("tail.attacker.example.", .A, private)),
+		with_arcount(rebind_reply_of("tail.attacker.example.", .A, private), 1),
 	)
 	if ok {
 		testing.expect_value(t, len(msg.answer), 0)
@@ -1142,7 +1007,7 @@ test_a_broken_additional_section_does_not_refuse_a_readable_answer :: proc(t: ^t
 		&cfg,
 		"svc.attacker.example.",
 		.HTTPS,
-		overrun(rebind_reply_of("svc.attacker.example.", .HTTPS, service)),
+		with_arcount(rebind_reply_of("svc.attacker.example.", .HTTPS, service), 1),
 	)
 	if svc_ok {
 		testing.expectf(

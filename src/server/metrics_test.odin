@@ -16,36 +16,62 @@ import "elodin:tlsx"
 import "elodin:upstream"
 
 /*
-A `Server` with counters and nothing else behind them.
-
-`render_metrics` reaches for the cache, the filter engine and the upstream
-group, and every one of those is absent here: what is being tested
-is what the endpoint says about the numbers, and the components have tests of
-their own. The renderer leaves out the families it has no component for, which
-is why this builds.
+The page `metrics_fixture` renders with `stats`, and with whichever components a
+case is about. `limiter` defaults to none, which is what every case about `Stats`
+wants: the endpoint reads the limiter's counters through `rate_limit_stats`,
+which answers zeroes for a nil one. A case about those counters passes one in.
 */
-@(private)
-metrics_fixture :: proc(stats: Stats) -> (Server, config.Config) {
-	cfg := config.default_config()
-	cfg.server.max_connections = 512
-	cfg.metrics.enabled = true
-	s := Server {
-		stats   = stats,
-		started = time.now(),
-	}
-	return s, cfg
+@(private = "file")
+render_fixture :: proc(
+	stats: Stats,
+	limiter: ^Rate_Limiter = nil,
+	group: ^upstream.Group = nil,
+	profiles: ^Profile_Signer = nil,
+) -> string {
+	cfg: config.Config
+	s := metrics_fixture(&cfg, stats)
+	s.limiter = limiter
+	s.group = group
+	s.profiles = profiles
+	return render_with(&s)
 }
 
-// `limiter` defaults to none, which is what every case about `Stats` wants: the
-// endpoint reads the limiter's counters through `rate_limit_stats`, which answers
-// zeroes for a nil one. A case about those counters passes one in.
 @(private = "file")
-render_fixture :: proc(stats: Stats, limiter: ^Rate_Limiter = nil) -> string {
-	s, cfg := metrics_fixture(stats)
-	s.cfg = &cfg
-	s.limiter = limiter
+render_with :: proc(s: ^Server) -> string {
 	listeners: Listeners
-	return render_metrics(&s, &listeners, context.temp_allocator)
+	return render_metrics(s, &listeners, context.temp_allocator)
+}
+
+// A failover group of the one upstream `spec` names, which the caller frees with
+// `destroy_one_upstream_group`.
+@(private = "file")
+one_upstream_group :: proc(t: ^testing.T, spec: config.Upstream_Spec, loc := #caller_location) -> (g: upstream.Group, ok: bool) {
+	u, uerr := upstream.make_upstream(spec, 0, time.Second, context.allocator)
+	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr, loc = loc) {
+		return {}, false
+	}
+	servers := make([]^upstream.Upstream, 1, context.allocator)
+	servers[0] = u
+	return upstream.Group{servers = servers, strategy = .Failover, attempts = 1}, true
+}
+
+@(private = "file")
+destroy_one_upstream_group :: proc(g: ^upstream.Group) {
+	upstream.destroy(g.servers[0])
+	delete(g.servers, context.allocator)
+}
+
+// The metric name a `# TYPE` line declares, or false for any other line.
+@(private = "file")
+type_name :: proc(line: string) -> (name: string, ok: bool) {
+	if !strings.has_prefix(line, "# TYPE ") {
+		return "", false
+	}
+	name = line[len("# TYPE "):]
+	if space := strings.index_byte(name, ' '); space > 0 {
+		name = name[:space]
+	}
+	return name, true
 }
 
 /*
@@ -149,16 +175,11 @@ test_a_failed_exchange_is_published_with_its_kind :: proc(t: ^testing.T) {
 		return
 	}
 
-	u, uerr := upstream.make_upstream(
-		config.Upstream_Spec{name = "broken", kind = .TCP, address = "127.0.0.1", port = bound.port},
-		0,
-		time.Second,
-		context.allocator,
-	)
-	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr) {
+	g, gok := one_upstream_group(t, config.Upstream_Spec{name = "broken", kind = .TCP, address = "127.0.0.1", port = bound.port})
+	if !gok {
 		return
 	}
-	defer upstream.destroy(u)
+	defer destroy_one_upstream_group(&g)
 
 	query := dns.Message {
 		id       = 0x7a7a,
@@ -170,25 +191,12 @@ test_a_failed_exchange_is_published_with_its_kind :: proc(t: ^testing.T) {
 		return
 	}
 
-	_, xerr := upstream.exchange(u, wire, 500 * time.Millisecond, context.temp_allocator)
+	_, xerr := upstream.exchange(g.servers[0], wire, 500 * time.Millisecond, context.temp_allocator)
 	if !testing.expectf(t, xerr == .Dial_Failed, "expected a refused dial, got %v", xerr) {
 		return
 	}
 
-	servers := make([]^upstream.Upstream, 1, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = u
-	g := upstream.Group {
-		servers  = servers,
-		strategy = .Failover,
-		attempts = 1,
-	}
-
-	s, cfg := metrics_fixture(Stats{})
-	s.cfg = &cfg
-	s.group = &g
-	listeners: Listeners
-	page := render_metrics(&s, &listeners, context.temp_allocator)
+	page := render_fixture(Stats{}, group = &g)
 
 	expect_line(t, page, `elodin_upstream_failure_kind_total{upstream="broken",error="dial_failed"} 1`)
 	// The total it splits still reads the same, which is what lets the two be
@@ -221,25 +229,12 @@ structure; nothing here sends anything.
 */
 @(test)
 test_an_unreadable_rcode_is_published_against_the_upstream :: proc(t: ^testing.T) {
-	u, uerr := upstream.make_upstream(
-		config.Upstream_Spec{name = "broken", kind = .UDP, address = "127.0.0.1", port = 5353},
-		0,
-		time.Second,
-		context.allocator,
-	)
-	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr) {
+	g, gok := one_upstream_group(t, config.Upstream_Spec{name = "broken", kind = .UDP, address = "127.0.0.1", port = 5353})
+	if !gok {
 		return
 	}
-	defer upstream.destroy(u)
-
-	servers := make([]^upstream.Upstream, 1, context.allocator)
-	defer delete(servers, context.allocator)
-	servers[0] = u
-	g := upstream.Group {
-		servers  = servers,
-		strategy = .Failover,
-		attempts = 1,
-	}
+	defer destroy_one_upstream_group(&g)
+	u := g.servers[0]
 
 	upstream.note_unreadable_rcode(u)
 	upstream.note_unreadable_rcode(u)
@@ -247,11 +242,7 @@ test_an_unreadable_rcode_is_published_against_the_upstream :: proc(t: ^testing.T
 	upstream.note_swept_rcode(u)
 	upstream.note_swept_rcode(u)
 
-	s, cfg := metrics_fixture(Stats{unreadable_rcode = 2})
-	s.cfg = &cfg
-	s.group = &g
-	listeners: Listeners
-	page := render_metrics(&s, &listeners, context.temp_allocator)
+	page := render_fixture(Stats{unreadable_rcode = 2}, group = &g)
 
 	expect_line(t, page, `elodin_upstream_unreadable_rcode_total{upstream="broken"} 2`)
 	// And the swept series beside it, over the same upstream and the same
@@ -278,12 +269,9 @@ test_no_family_is_declared_twice :: proc(t: ^testing.T) {
 	page := render_fixture(Stats{})
 	seen := make(map[string]bool, 64, context.temp_allocator)
 	for line in strings.split_lines_iterator(&page) {
-		if !strings.has_prefix(line, "# TYPE ") {
+		name, declares := type_name(line)
+		if !declares {
 			continue
-		}
-		name := line[len("# TYPE "):]
-		if space := strings.index_byte(name, ' '); space > 0 {
-			name = name[:space]
 		}
 		testing.expectf(t, !seen[name], "%s was declared more than once", name)
 		seen[name] = true
@@ -308,11 +296,8 @@ test_every_sample_belongs_to_a_declared_family :: proc(t: ^testing.T) {
 		if line == "" {
 			continue
 		}
-		if strings.has_prefix(line, "# TYPE ") {
-			name := line[len("# TYPE "):]
-			if space := strings.index_byte(name, ' '); space > 0 {
-				declared[name[:space]] = true
-			}
+		if name, declares := type_name(line); declares {
+			declared[name] = true
 			continue
 		}
 		if strings.has_prefix(line, "#") {
@@ -460,11 +445,7 @@ test_profile_counters_reach_the_endpoint :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, expired, Profile_Status.Unavailable)
 
-	s, cfg := metrics_fixture(Stats{})
-	s.cfg = &cfg
-	s.profiles = signer
-	listeners: Listeners
-	page := render_metrics(&s, &listeners, context.temp_allocator)
+	page := render_fixture(Stats{}, profiles = signer)
 
 	expect_line(t, page, "elodin_mobileconfig_signed_total 1")
 	expect_line(t, page, "elodin_mobileconfig_refused_total 1")
@@ -480,12 +461,11 @@ the wrong one is off by that much.
 */
 @(test)
 test_uptime_is_measured_on_the_moment_clock :: proc(t: ^testing.T) {
-	s, cfg := metrics_fixture({})
-	s.cfg = &cfg
+	cfg: config.Config
+	s := metrics_fixture(&cfg, {})
 	s.started = time.time_add(time.now(), -1000 * 24 * time.Hour)
 	s.up_since = loop.moment_add(loop.moment_now(), -5 * time.Second)
-	listeners: Listeners
-	out := render_metrics(&s, &listeners, context.temp_allocator)
+	out := render_with(&s)
 
 	PREFIX :: "\nelodin_uptime_seconds "
 	at := strings.index(out, PREFIX)

@@ -1,12 +1,7 @@
 package server
 
-import "core:net"
 import "core:testing"
-import "core:thread"
-import "core:time"
-import "elodin:config"
 import "elodin:dns"
-import "elodin:upstream"
 
 /*
 The EDNS payload size this server advertises upstream is its own.
@@ -35,160 +30,32 @@ QNAME :: "www.example."
 @(private = "file")
 CLIENT_ID :: u16(0x5151)
 
-@(private = "file")
-Seen_Query :: struct {
-	socket:   net.UDP_Socket,
-	got:      bool,
-	// The query as it arrived. Read after the thread is joined.
-	seen:     [1024]u8,
-	seen_len: int,
-}
-
-// Serve exactly one query with an answer built from it, and keep what arrived.
-@(private = "file")
-serve_one :: proc(x: ^Seen_Query) {
-	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE {
-		return
-	}
-	x.got = true
-	x.seen_len = copy(x.seen[:], buf[:n])
-
-	reply := answer_reply()
-	out: [4096]u8
-	if len(reply) > len(out) {
-		return
-	}
-	copy(out[:], reply)
-	// Echo the ID it was asked with: the resolver draws a fresh one for every
-	// query it forwards, so nothing here can know it in advance.
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(reply)], remote)
-}
-
 // The client's question, advertising `advertised` bytes of room - or asking
 // without EDNS at all, which has no field to advertise in and is held to 512.
 @(private = "file")
 client_query :: proc(advertised: u16, edns := true) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-	}
-	msg := dns.Message {
-		id       = CLIENT_ID,
-		question = question,
-	}
-	msg.flags.rd = true
+	opt: Maybe(dns.Record)
 	if edns {
-		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = dns.make_opt(advertised, false)
-		msg.additional = additional
+		opt = dns.make_opt(advertised, false)
 	}
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_query(QNAME, id = CLIENT_ID, opt = opt)
 }
 
-@(private = "file")
-answer_reply :: proc() -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-	}
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-		ttl   = 300,
-		data  = dns.Rdata_A{addr = {192, 0, 2, 7}},
-	}
-	msg := dns.Message {
-		question = question,
-		answer   = answer,
-	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-// A forwarding server with nothing between the client and the upstream, and no
-// validator, so the query is the plain path's.
-@(private = "file")
-forwarding_server :: proc(
-	t: ^testing.T,
-) -> (
-	s: Server,
-	cfg: ^config.Config,
-	x: ^Seen_Query,
-	ok: bool,
-) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return {}, nil, nil, false
-	}
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		net.close(socket)
-		return {}, nil, nil, false
-	}
-
-	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	specs[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	cfg = new(config.Config, context.temp_allocator)
-	cfg^ = config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 3 * time.Second
-	cfg.upstream.servers = specs
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		net.close(socket)
-		return {}, nil, nil, false
-	}
-	x = new(Seen_Query, context.temp_allocator)
-	x.socket = socket
-	return Server{cfg = cfg, group = group}, cfg, x, true
-}
-
-// Forward one query and hand back what the upstream was asked, and the answer.
+// Forward one query through a server with nothing between the client and the
+// upstream, and no validator, so the query is the plain path's; hand back what
+// the upstream was asked, and the answer.
 @(private = "file")
 forward_and_see :: proc(t: ^testing.T, query: []u8) -> (seen: []u8, out: []u8, ok: bool) {
-	s, _, x, built := forwarding_server(t)
-	if !built {
+	h: Harness
+	if !harness_start(t, &h) {
 		return nil, nil, false
 	}
-	defer net.close(x.socket)
-	defer upstream.destroy_group(s.group)
+	defer harness_stop(&h)
 
-	mock := thread.create_and_start_with_poly_data(x, serve_one)
-	reply, outcome, answered := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-
+	x := Canned_Mock {
+		reply = test_reply(QNAME, .A, a_record(QNAME, {192, 0, 2, 7}, 300)),
+	}
+	reply, outcome, answered := harness_exchange(&h, &x, query)
 	if !testing.expect(t, x.got, "the upstream was never asked") {
 		return nil, nil, false
 	}
@@ -381,17 +248,16 @@ test_a_query_carrying_an_opt_outside_the_additional_section_is_refused :: proc(t
 		testing.expect_value(t, u16(opt.class), u16(1232))
 	}
 
-	s, _, x, built := forwarding_server(t)
-	if !built {
+	h: Harness
+	if !harness_start(t, &h) {
 		return
 	}
-	defer net.close(x.socket)
-	defer upstream.destroy_group(s.group)
+	defer harness_stop(&h)
 
 	// No mock thread: nothing may be forwarded, and `mock_untouched` reads the
 	// socket after the call has returned rather than racing it.
-	out, outcome, answered := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
-	testing.expect(t, mock_untouched(x.socket), "the decoy was forwarded to the upstream")
+	out, outcome, answered := handle_query(&h.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	testing.expect(t, mock_untouched(h.socket, query), "the decoy was forwarded to the upstream")
 	if !testing.expect(t, answered, "nothing came back at all") {
 		return
 	}

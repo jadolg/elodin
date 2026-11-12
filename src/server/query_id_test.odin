@@ -1,15 +1,7 @@
 package server
 
-import "core:mem"
-import "core:net"
 import "core:testing"
-import "core:thread"
-import "core:time"
-import "elodin:cache"
-import "elodin:config"
 import "elodin:dns"
-import "elodin:dnssec"
-import "elodin:upstream"
 
 /*
 The transaction ID a forwarded query carries is ours, not the client's.
@@ -41,73 +33,12 @@ DRAWS :: 32
 CLIENT_ID :: u16(0x4242)
 
 @(private = "file")
-Exchange :: struct {
-	socket:       net.UDP_Socket,
-	reply:        []u8,
-	// The ID the query arrived with, and whether a query arrived at all.
-	forwarded_id: u16,
-	got:          bool,
-}
-
-/*
-Serve exactly one query, recording the ID it came with.
-
-One query per thread, joined by the caller before it looks at the result: there
-is no shared state to guard, and a query that never arrives leaves `got` false
-rather than hanging the suite - the socket carries a receive timeout.
-*/
-@(private = "file")
-serve_one :: proc(x: ^Exchange) {
-	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
-		return
-	}
-	x.forwarded_id = u16(buf[0]) << 8 | u16(buf[1])
-	x.got = true
-
-	out: [4096]u8
-	copy(out[:], x.reply)
-	// Echo the ID it was asked with, so the reply is accepted as the answer to
-	// it whatever that ID turns out to be.
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
-}
-
-@(private = "file")
 QNAME :: "www.example.com."
 
 // The answer the mock upstream gives, for the question every case here asks.
 @(private = "file")
 mock_reply :: proc() -> []u8 {
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-		ttl   = 300,
-		data  = dns.Rdata_A{addr = {93, 184, 216, 34}},
-	}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-	}
-	msg := dns.Message {
-		id       = CLIENT_ID,
-		question = question,
-		answer   = answer,
-	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_reply(QNAME, .A, a_record(QNAME, {93, 184, 216, 34}, 300))
 }
 
 /*
@@ -119,143 +50,28 @@ outgoing buffer comes about.
 */
 @(private = "file")
 id_client_query :: proc(cookie := false) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-	}
-	msg := dns.Message {
-		id       = CLIENT_ID,
-		question = question,
-	}
-	msg.flags.rd = true
-
+	opt: Maybe(dns.Record)
 	if cookie {
 		client_half := make([]u8, 8, context.temp_allocator)
 		for i in 0 ..< len(client_half) {
 			client_half[i] = u8(0xa0 + i)
 		}
-		options := make([]dns.EDNS_Option, 1, context.temp_allocator)
-		options[0] = dns.EDNS_Option {
-			code = u16(dns.EDNS_Option_Code.Cookie),
-			data = client_half,
-		}
-		opt := dns.make_opt(1232, false)
-		opt.data = dns.Rdata_OPT{options = options}
-
-		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = opt
-		msg.additional = additional
+		opt = opt_with(.Cookie, client_half)
 	}
-
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-/*
-A validator that can fetch nothing.
-
-The verdict is not what these cases are about, and the chain for a name the mock
-invented could not be built from anything it would answer. Refusing to fetch
-makes the answer indeterminate straight away, which is the quick way to reach
-the assertion: what went out on the wire before any of that happened.
-*/
-@(private = "file")
-no_chain :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> (wire: []u8, ok: bool) {
-	return nil, false
-}
-
-@(private = "file")
-Harness :: struct {
-	socket:  net.UDP_Socket,
-	cfg:     config.Config,
-	group:   ^upstream.Group,
-	answers: ^cache.Cache,
-	srv:     Server,
-}
-
-@(private = "file")
-harness_start :: proc(t: ^testing.T, h: ^Harness, validating := false) -> bool {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind the mock upstream: %v", serr)
-		return false
-	}
-	h.socket = socket
-	// Only a bound on a hang, and past the upstream timeout below rather than
-	// under it: see the note on `MOCK_RECV_TIMEOUT`.
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
-		return false
-	}
-
-	h.cfg = config.default_config()
-	h.cfg.log.queries = false
-	// Every query has to reach the upstream for the ID it carried to be seen.
-	h.cfg.cache.enabled = false
-	h.cfg.blocking.enabled = false
-	h.cfg.dnssec.enabled = validating
-	h.cfg.upstream.strategy = .Failover
-	// One try, so a case that is going wrong says so instead of retrying.
-	h.cfg.upstream.attempts = 1
-	h.cfg.upstream.timeout = 5 * time.Second
-
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	h.cfg.upstream.servers = servers
-
-	// Cookies towards the upstream are a separate mechanism and would add an
-	// option to the outgoing query; they have nothing to do with the ID.
-	group, gerr := upstream.make_group(h.cfg.upstream, context.allocator, false)
-	if gerr != .None {
-		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
-		return false
-	}
-	h.group = group
-
-	h.answers = cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	h.srv = Server {
-		cfg     = &h.cfg,
-		group   = h.group,
-		answers = h.answers,
-	}
-	if validating {
-		h.srv.validator = dnssec.make_validator(no_chain, nil, dnssec.Options{})
-	}
-	return true
-}
-
-@(private = "file")
-harness_stop :: proc(h: ^Harness) {
-	if h.srv.validator != nil {
-		dnssec.destroy_validator(h.srv.validator)
-		h.srv.validator = nil
-	}
-	cache.destroy(h.answers)
-	upstream.destroy_group(h.group)
-	net.close(h.socket)
+	return test_query(QNAME, id = CLIENT_ID, opt = opt)
 }
 
 /*
 Put one query through the server and report the ID the upstream saw.
 
-The mock is started before the query and joined after it, rather than left
-running: it reads the reply bytes out of this test's scratch arena.
+The validating case's validator can fetch nothing (`no_chain`): the verdict is
+not what these cases are about, and the chain for a name the mock invented could
+not be built from anything it would answer. Refusing to fetch makes the answer
+indeterminate straight away, which is the quick way to reach the assertion: what
+went out on the wire before any of that happened.
 */
 @(private = "file")
-forward_once :: proc(
+ask_for_id :: proc(
 	t: ^testing.T,
 	h: ^Harness,
 	query: []u8,
@@ -265,19 +81,17 @@ forward_once :: proc(
 	outcome: Outcome,
 	ok: bool,
 ) {
-	x := Exchange {
-		socket = h.socket,
-		reply  = mock_reply(),
+	x := Canned_Mock {
+		reply = mock_reply(),
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one)
-	out, result, served := handle_query(&h.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-
+	out, result, served := harness_exchange(h, &x, query)
 	if !testing.expect(t, x.got, "the upstream was never asked") {
 		return 0, nil, result, false
 	}
-	return x.forwarded_id, out, result, served
+	if !testing.expect(t, served, "the query went unanswered") {
+		return 0, nil, result, false
+	}
+	return u16(x.seen[0]) << 8 | u16(x.seen[1]), out, result, true
 }
 
 @(test)
@@ -297,7 +111,7 @@ test_forwarded_query_id_is_not_the_client_id :: proc(t: ^testing.T) {
 
 	for _ in 0 ..< DRAWS {
 		query := id_client_query()
-		forwarded_id, out, outcome, ok := forward_once(t, &h, query)
+		forwarded_id, out, outcome, ok := ask_for_id(t, &h, query)
 		if !ok {
 			return
 		}
@@ -359,7 +173,7 @@ test_forwarded_query_id_is_replaced_on_the_dnssec_path :: proc(t: ^testing.T) {
 	}
 	defer harness_stop(&h)
 
-	forwarded_id, out, _, ok := forward_once(t, &h, id_client_query())
+	forwarded_id, out, _, ok := ask_for_id(t, &h, id_client_query())
 	if !ok {
 		return
 	}
@@ -393,7 +207,7 @@ test_forwarded_query_id_is_replaced_when_the_cookie_is_stripped :: proc(t: ^test
 	defer harness_stop(&h)
 
 	query := id_client_query(cookie = true)
-	forwarded_id, out, outcome, ok := forward_once(t, &h, query)
+	forwarded_id, out, outcome, ok := ask_for_id(t, &h, query)
 	if !ok {
 		return
 	}

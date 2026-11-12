@@ -1,6 +1,5 @@
 package server
 
-import "core:net"
 import "core:strings"
 import "core:testing"
 import "core:thread"
@@ -9,7 +8,6 @@ import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:loop"
-import "elodin:upstream"
 
 /*
 Move `STALE_NAME`'s entry into the last `left` of a 300-second lifetime.
@@ -19,9 +17,7 @@ Move `STALE_NAME`'s entry into the last `left` of a 300-second lifetime.
 */
 @(private = "file")
 age_to :: proc(answers: ^cache.Cache, left: time.Duration) {
-	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	if e, found := answers.shards[0].entries[key]; found {
+	if e := stale_entry(answers); e != nil {
 		e.expires = loop.moment_add(loop.moment_now(), left)
 		e.inserted = loop.moment_add(e.expires, -300 * time.Second)
 	}
@@ -48,53 +44,22 @@ is neither a miss nor a forwarded answer.
 */
 @(test)
 test_a_hit_near_expiry_is_refreshed_behind_the_client :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, 5 * time.Second, looped = true, expired = false, answers = prefetch_answers()) {
 		return
 	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		return
-	}
-
-	answers := prefetch_answers()
-	defer cache.destroy(answers)
-	cfg: config.Config
-	s := stale_server(&cfg, answers, nil)
-	cfg.cache.serve_stale = false
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 5 * time.Second
-	cfg.upstream.servers = loopback_upstream(bound.port)
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s.group = group
-	tl: Test_Loop
-	start_test_loop(&tl)
-	joined := false
-	defer if !joined {
-		stop_test_loop(&tl)
-	}
-	s.loops = tl.loops[:]
-
-	if !testing.expect(t, cache_an_answer(answers, expired = false), "the answer was not cached") {
-		return
-	}
-	age_to(answers, 20 * time.Second)
+	defer stale_fixture_stop(&f)
+	f.cfg.cache.serve_stale = false
+	age_to(f.answers, 20 * time.Second)
 
 	x := Stale_Exchange {
-		socket = socket,
+		socket = f.socket,
 		reply  = live_reply(),
 		delay  = 400 * time.Millisecond,
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
 
-	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if !testing.expect(t, ok, "the cached answer went unserved") {
 		thread.join(mock)
 		thread.destroy(mock)
@@ -111,21 +76,17 @@ test_a_hit_near_expiry_is_refreshed_behind_the_client :: proc(t: ^testing.T) {
 	thread.join(mock)
 	thread.destroy(mock)
 	testing.expect(t, x.got, "nothing refreshed the entry ahead of its expiry")
-	stop_test_loop(&tl)
-	joined = true
-	s.loops = nil
+	stale_fixture_join(&f)
 
-	cs := cache.stats(answers)
+	cs := cache.stats(f.answers)
 	testing.expect_value(t, cs.prefetches, 1)
 	testing.expect_value(t, cs.prefetch_failures, 0)
 	testing.expect_value(t, cs.hits, 1)
 	testing.expect_value(t, cs.misses, 0)
-	testing.expect_value(t, s.stats.cached, 1)
-	testing.expect_value(t, s.stats.forwarded, 0)
+	testing.expect_value(t, f.srv.stats.cached, 1)
+	testing.expect_value(t, f.srv.stats.forwarded, 0)
 
-	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	wire, _, found := cache.get(answers, key, context.temp_allocator)
+	wire, _, found := stale_get(f.answers)
 	if !testing.expect(t, found, "the entry is gone") {
 		return
 	}
@@ -164,7 +125,9 @@ test_a_failed_prefetch_is_not_retried :: proc(t: ^testing.T) {
 
 	for _ in 0 ..< 2 {
 		tl: Test_Loop
-		start_test_loop(&tl)
+		if !testing.expect(t, start_test_loop(&tl), "no loop") {
+			return
+		}
 		s.loops = tl.loops[:]
 		_, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 		testing.expect(t, ok, "the cached answer went unserved")
@@ -201,14 +164,18 @@ test_an_rd_zero_hit_does_not_prefetch :: proc(t: ^testing.T) {
 	age_to(answers, 20 * time.Second)
 
 	tl: Test_Loop
-	start_test_loop(&tl)
+	if !testing.expect(t, start_test_loop(&tl), "no loop") {
+		return
+	}
 	s.loops = tl.loops[:]
 	_, _, ok := handle_query(&s, stale_query(false), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expect(t, ok, "the RD=0 query went unserved")
 	stop_test_loop(&tl)
 	testing.expect_value(t, cache.stats(answers).prefetches, 0)
 
-	start_test_loop(&tl)
+	if !testing.expect(t, start_test_loop(&tl), "no loop") {
+		return
+	}
 	s.loops = tl.loops[:]
 	_, _, ok = handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expect(t, ok, "the RD=1 query went unserved")
@@ -238,7 +205,9 @@ test_no_prefetch_past_the_upstream_waits :: proc(t: ^testing.T) {
 	age_to(answers, 20 * time.Second)
 
 	tl: Test_Loop
-	start_test_loop(&tl)
+	if !testing.expect(t, start_test_loop(&tl), "no loop") {
+		return
+	}
 	s.loops = tl.loops[:]
 	_, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expect(t, ok && outcome == .Cached, "the hit went unserved")
@@ -258,8 +227,8 @@ test_prefetch_counters_reach_the_endpoint :: proc(t: ^testing.T) {
 	defer cache.destroy(answers)
 	answers.prefetches = 7
 	answers.prefetch_failures = 3
-	s, cfg := metrics_fixture(Stats{})
-	s.cfg = &cfg
+	cfg: config.Config
+	s := metrics_fixture(&cfg, Stats{})
 	s.answers = answers
 	listeners: Listeners
 	page := render_metrics(&s, &listeners, context.temp_allocator)
@@ -288,9 +257,11 @@ test_a_prefetch_does_not_count_a_replayed_verdict :: proc(t: ^testing.T) {
 	}
 	copy(hit.wire, query)
 
-	prefetching = true
-	serve_bogus_verdict(&s, hit, query, msg, msg.question[0], .UDP, "127.0.0.1:5555", time.tick_now())
-	prefetching = false
+	{
+		prefetching = true
+		defer prefetching = false
+		serve_bogus_verdict(&s, hit, query, msg, msg.question[0], .UDP, "127.0.0.1:5555", time.tick_now())
+	}
 	testing.expect_value(t, s.stats.bogus, 0)
 	testing.expect_value(t, s.stats.failed, 0)
 

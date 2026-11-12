@@ -7,7 +7,6 @@ import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
-import "elodin:config"
 import "elodin:dns"
 import "elodin:loop"
 import "elodin:tlsx"
@@ -40,18 +39,6 @@ barrier_job :: proc(data: rawptr) {
 	query_done(b.server)
 }
 
-@(private = "file")
-wait_until :: proc(predicate: proc(data: rawptr) -> bool, data: rawptr, within: time.Duration) -> bool {
-	deadline := time.time_add(time.now(), within)
-	for time.diff(time.now(), deadline) > 0 {
-		if predicate(data) {
-			return true
-		}
-		time.sleep(time.Millisecond)
-	}
-	return false
-}
-
 // Whether the first reader has taken a datagram off its socket.
 @(private = "file")
 datagram_read :: proc(data: rawptr) -> bool {
@@ -76,32 +63,11 @@ defect.
 */
 @(test)
 test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.listeners.udp = config.Listener {
-		enabled = true,
-		address = "127.0.0.1",
-		port    = 0, // ephemeral, so the test never collides with a real server
-	}
-	cfg.listeners.tcp.enabled = false
-	cfg.listeners.dot.enabled = false
-	cfg.listeners.doh.enabled = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.log.queries = false
-	cfg.server.max_connections = 8
-	cfg.server.max_pending = 0
-
-	tl: Test_Loop
-	start_test_loop(&tl)
-	s := Server {
-		cfg          = &cfg,
-		loops        = tl.loops[:],
-	}
-
+	cfg := udp_listener_config(1)
+	s: Server
 	l: Listeners
-	if !start_listeners(&s, &l) {
-		stop_test_loop(&tl)
-		testing.expect(t, false, "could not start the UDP listener")
+	tl: Test_Loop
+	if !start_test_listeners(t, &s, &l, &tl, &cfg) {
 		return
 	}
 
@@ -111,9 +77,7 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 	// Every early return lets the held query go and tears down what started.
 	abandon :: proc(barrier: ^Barrier, l: ^Listeners, tl: ^Test_Loop) {
 		sync.atomic_store(&barrier.go, true)
-		stop_listeners(l)
-		stop_test_loop(tl)
-		destroy_listeners(l)
+		stop_test_listeners(l, tl)
 	}
 	testing.expect(t, submit_query(&s, barrier_job, &barrier, 0) == .Accepted, "could not start the held query")
 	if !wait_until(barrier_started, &barrier, time.Second) {
@@ -207,41 +171,19 @@ slot_taken :: proc(data: rawptr) -> bool {
 
 @(test)
 test_a_connection_past_the_limit_is_counted :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.listeners.udp.enabled = false
-	cfg.listeners.tcp = config.Listener {
-		enabled = true,
-		address = "127.0.0.1",
-		port    = 0,
-	}
-	cfg.listeners.dot.enabled = false
-	cfg.listeners.doh.enabled = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.log.queries = false
+	cfg := tcp_listener_config()
 	cfg.server.max_connections = 1
 	// Long enough that the first connection is still holding its slot when the
 	// second arrives, without leaving a stuck fiber behind if it is not.
 	cfg.server.client_timeout = 5 * time.Second
 
-	tl: Test_Loop
-	start_test_loop(&tl)
-	s := Server {
-		cfg          = &cfg,
-		loops        = tl.loops[:],
-	}
-
+	s: Server
 	l: Listeners
-	if !start_listeners(&s, &l) {
-		stop_test_loop(&tl)
-		testing.expect(t, false, "could not start the TCP listener")
+	tl: Test_Loop
+	if !start_test_listeners(t, &s, &l, &tl, &cfg) {
 		return
 	}
-	defer {
-		stop_listeners(&l)
-		stop_test_loop(&tl)
-		destroy_listeners(&l)
-	}
+	defer stop_test_listeners(&l, &tl)
 
 	bound, berr := net.bound_endpoint(l.tcp_socket)
 	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
@@ -302,18 +244,7 @@ inferred from the counter. Both connections come from 127.0.0.1, which is one
 */
 @(test)
 test_a_connection_over_its_prefix_share_is_refused :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.listeners.udp.enabled = false
-	cfg.listeners.tcp = config.Listener {
-		enabled = true,
-		address = "127.0.0.1",
-		port    = 0,
-	}
-	cfg.listeners.dot.enabled = false
-	cfg.listeners.doh.enabled = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.log.queries = false
+	cfg := tcp_listener_config()
 	cfg.server.max_connections = 4
 	// Set rather than left at the default, which is zero: the derivation from
 	// `max_connections` happens at load, and this configuration never went
@@ -321,24 +252,13 @@ test_a_connection_over_its_prefix_share_is_refused :: proc(t: ^testing.T) {
 	cfg.server.max_connections_per_prefix = 1
 	cfg.server.client_timeout = 5 * time.Second
 
-	tl: Test_Loop
-	start_test_loop(&tl)
-	s := Server {
-		cfg          = &cfg,
-		loops        = tl.loops[:],
-	}
-
+	s: Server
 	l: Listeners
-	if !start_listeners(&s, &l) {
-		stop_test_loop(&tl)
-		testing.expect(t, false, "could not start the TCP listener")
+	tl: Test_Loop
+	if !start_test_listeners(t, &s, &l, &tl, &cfg) {
 		return
 	}
-	defer {
-		stop_listeners(&l)
-		stop_test_loop(&tl)
-		destroy_listeners(&l)
-	}
+	defer stop_test_listeners(&l, &tl)
 
 	bound, berr := net.bound_endpoint(l.tcp_socket)
 	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
@@ -393,40 +313,18 @@ shutdown itself would join that loop first.
 */
 @(test)
 test_a_connection_accepted_during_shutdown_is_dropped :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.listeners.udp.enabled = false
-	cfg.listeners.tcp = config.Listener {
-		enabled = true,
-		address = "127.0.0.1",
-		port    = 0,
-	}
-	cfg.listeners.dot.enabled = false
-	cfg.listeners.doh.enabled = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.log.queries = false
+	cfg := tcp_listener_config()
 	// Long enough that a connection a fiber was started for is still open when
 	// the read below gives up, so EOF can only be the accept loop closing it.
 	cfg.server.client_timeout = 5 * time.Second
 
-	tl: Test_Loop
-	start_test_loop(&tl)
-	s := Server {
-		cfg          = &cfg,
-		loops        = tl.loops[:],
-	}
-
+	s: Server
 	l: Listeners
-	if !start_listeners(&s, &l) {
-		stop_test_loop(&tl)
-		testing.expect(t, false, "could not start the TCP listener")
+	tl: Test_Loop
+	if !start_test_listeners(t, &s, &l, &tl, &cfg) {
 		return
 	}
-	defer {
-		stop_listeners(&l)
-		stop_test_loop(&tl)
-		destroy_listeners(&l)
-	}
+	defer stop_test_listeners(&l, &tl)
 
 	bound, berr := net.bound_endpoint(l.tcp_socket)
 	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
@@ -452,6 +350,8 @@ test_a_connection_accepted_during_shutdown_is_dropped :: proc(t: ^testing.T) {
 	testing.expect_value(t, sync.atomic_load(&s.stats.conn_failed), u64(0))
 }
 
+// A table of its own rather than `month_name`'s: this reads the date back, and a
+// reader sharing the writer's table would agree with it however it was ordered.
 @(private = "file")
 month_number :: proc(name: string) -> int {
 	names := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
@@ -560,24 +460,17 @@ still read afterwards.
 */
 @(test)
 test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+	client, accepted, ok := loopback_tcp_pair(t)
+	if !ok {
 		return
 	}
 	defer net.close(client)
+	// Closed by hand below, ahead of the reads; every return before that closes
+	// it too.
+	accepted_open := true
+	defer if accepted_open {
+		net.close(accepted)
+	}
 	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
 
 	// Bare DNS headers behind the two-byte length prefix, all of them sent before
@@ -591,22 +484,11 @@ test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T)
 		message[1] = u8(dns.HEADER_SIZE)
 		message[2], message[3] = u8(i >> 8), u8(i)
 	}
-	sent := 0
-	for sent < len(pipeline) {
-		n, serr := net.send_tcp(client, pipeline[sent:])
-		if serr != nil || n <= 0 {
-			testing.expectf(t, false, "cannot send the pipeline: %v", serr)
-			return
-		}
-		sent += n
+	if _, serr := net.send_tcp(client, pipeline[:]); !testing.expectf(t, serr == nil, "cannot send the pipeline: %v", serr) {
+		return
 	}
 	_ = net.shutdown(client, .Send)
 
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return
-	}
 	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
 	conn := Conn {
 		socket = accepted,
@@ -632,6 +514,7 @@ test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T)
 	}
 	stream_linger(conn)
 	net.close(accepted)
+	accepted_open = false
 
 	reply: [STRIDE]u8
 	got := 0
@@ -839,41 +722,19 @@ nothing ever parses one of those.
 */
 @(test)
 test_a_drip_fed_message_is_reclaimed_at_the_deadline :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.listeners.udp.enabled = false
-	cfg.listeners.tcp = config.Listener {
-		enabled = true,
-		address = "127.0.0.1",
-		port    = 0,
-	}
-	cfg.listeners.dot.enabled = false
-	cfg.listeners.doh.enabled = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.log.queries = false
+	cfg := tcp_listener_config()
 	// Short, because the case spends it: the drip below is paced off it, and the
 	// whole test takes a couple of multiples of it.
 	cfg.server.client_timeout = 400 * time.Millisecond
 	DRIP :: 150 * time.Millisecond
 
-	tl: Test_Loop
-	start_test_loop(&tl)
-	s := Server {
-		cfg          = &cfg,
-		loops        = tl.loops[:],
-	}
-
+	s: Server
 	l: Listeners
-	if !start_listeners(&s, &l) {
-		stop_test_loop(&tl)
-		testing.expect(t, false, "could not start the TCP listener")
+	tl: Test_Loop
+	if !start_test_listeners(t, &s, &l, &tl, &cfg) {
 		return
 	}
-	defer {
-		stop_listeners(&l)
-		stop_test_loop(&tl)
-		destroy_listeners(&l)
-	}
+	defer stop_test_listeners(&l, &tl)
 
 	bound, berr := net.bound_endpoint(l.tcp_socket)
 	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
@@ -981,15 +842,11 @@ correct code, so it is the one that gets the room.
 */
 @(test)
 test_the_wait_for_a_message_is_not_spent_on_reading_it :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+	listener, bound, ok := loopback_listener(t)
+	if !ok {
 		return
 	}
 	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr) {
-		return
-	}
 
 	message: [2 + dns.HEADER_SIZE]u8
 	message[1] = u8(dns.HEADER_SIZE)
@@ -1172,21 +1029,11 @@ split inside itself, still arrives whole.
 */
 @(test)
 test_a_stream_query_and_its_prefix_are_one_read :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
-		return
-	}
-	defer net.close(listener)
-	bound, _ := net.bound_endpoint(listener)
-	client, derr := net.dial_tcp(bound)
-	if !testing.expectf(t, derr == nil, "cannot connect: %v", derr) {
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return
 	}
 	defer net.close(client)
-	accepted, _, aerr := net.accept_tcp(listener)
-	if !testing.expectf(t, aerr == nil, "nothing connected: %v", aerr) {
-		return
-	}
 	defer net.close(accepted)
 	_ = net.set_option(accepted, .Receive_Timeout, 5 * time.Second)
 

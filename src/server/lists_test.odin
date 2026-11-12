@@ -12,6 +12,33 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
 
+/*
+The default configuration with its list cache in a directory of its own, made
+here: `/tmp/elodin-server-lists-test-<name>-<pid>`, per process since other
+worktrees run this suite on the same box. The caller removes it, and frees the
+temp arena the path is in only after that.
+*/
+@(private = "file")
+list_test_dir :: proc(t: ^testing.T, name: string, loc := #caller_location) -> (cfg: config.Config, dir: string) {
+	dir = fmt.tprintf("/tmp/elodin-server-lists-test-%s-%d", name, os.get_pid())
+	testing.expect(t, os.make_directory(dir) == nil, "cannot make the cache directory", loc = loc)
+	cfg = config.default_config()
+	cfg.blocking.cache_dir = dir
+	return
+}
+
+// A server over `cfg` with an empty filter engine, as a list reload finds one.
+@(private = "file")
+list_server :: proc(cfg: ^config.Config) -> Server {
+	return Server{cfg = cfg, filters = filter.engine_make()}
+}
+
+@(private = "file")
+close_list_server :: proc(s: ^Server) {
+	filter.engine_destroy(s.filters)
+	delete(s.lists_loaded)
+}
+
 // `reload_filters_from` the configuration in effect: a rebuild's reload, for a
 // test that has no rebuild's copy to hand it.
 reload_filters :: proc(s: ^Server, allow_network: bool) -> (current: bool) {
@@ -66,11 +93,11 @@ test_a_query_with_a_slash_in_a_label_is_matched_against_the_lists :: proc(t: ^te
 	anything unprintable, but not `/`, so a query for `x/.blocked.example.` is
 	decoded with the slash in it - and is still under a blocked zone (#398).
 	*/
-	block, allow := filter.set_make(), filter.set_make()
-	filter.parse_list(block, allow, "||blocked.example^\n", .Adblock)
-	engine := filter.engine_make()
+	engine, ok := test_filters(t, "||blocked.example^\n", .Adblock)
 	defer filter.engine_destroy(engine)
-	filter.engine_swap(engine, block, allow)
+	if !ok {
+		return
+	}
 
 	for name in ([]string{"x/.blocked.example.", "a/b.c.blocked.example.", "/.blocked.example."}) {
 		questions := []dns.Question{{name = name, type = .A, class = .IN}}
@@ -99,23 +126,16 @@ test_a_refresh_that_loses_a_list_keeps_the_rules_in_effect :: proc(t: ^testing.T
 	// network reads it; taking the copy away is losing both.
 	// Registered first so it runs last: the removals below read paths it zeroes.
 	defer free_all(context.temp_allocator)
-	dir := fmt.tprintf("/tmp/elodin-server-lists-test-lost-%d", os.get_pid())
-	testing.expect(t, os.make_directory(dir) == nil)
+	cfg, dir := list_test_dir(t, "lost")
 	defer os.remove(dir)
-	cfg := config.default_config()
-	cfg.blocking.cache_dir = dir
 	cfg.blocking.lists = []config.Block_List{{name = "l", url = "http://192.0.2.1/l.txt", format = .Adblock, enabled = true}}
 	path := strings.clone(list_cache_path(&cfg, cfg.blocking.lists[0]), context.temp_allocator)
 	testing.expect(t, os.write_entire_file(path, "||kept.example^\n") == nil)
 	defer os.remove(path)
 
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	s := Server {
-		cfg     = &cfg,
-		filters = engine,
-	}
-	defer delete(s.lists_loaded)
+	s := list_server(&cfg)
+	defer close_list_server(&s)
+	engine := s.filters
 
 	testing.expect(t, reload_filters(&s, false), "the first load was not current")
 	testing.expect(t, filter.engine_match(engine, "kept.example", .A) == .Blocked)
@@ -149,13 +169,9 @@ test_a_list_that_never_loaded_does_not_hold_the_others_back :: proc(t: ^testing.
 		{name = "missing", url = "http://192.0.2.1/l.txt", format = .Adblock, enabled = true},
 		{name = "l", file = path, format = .Adblock, enabled = true},
 	}
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	s := Server {
-		cfg     = &cfg,
-		filters = engine,
-	}
-	defer delete(s.lists_loaded)
+	s := list_server(&cfg)
+	defer close_list_server(&s)
+	engine := s.filters
 
 	testing.expect(t, !reload_filters(&s, false), "a load missing a list was reported current")
 	testing.expect(t, filter.engine_match(engine, "first.example", .A) == .Blocked)
@@ -284,13 +300,9 @@ test_a_deleted_file_list_is_lifted :: proc(t: ^testing.T) {
 
 	cfg := config.default_config()
 	cfg.blocking.lists = []config.Block_List{{name = "l", file = path, format = .Adblock, enabled = true}}
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	s := Server {
-		cfg     = &cfg,
-		filters = engine,
-	}
-	defer delete(s.lists_loaded)
+	s := list_server(&cfg)
+	defer close_list_server(&s)
+	engine := s.filters
 
 	testing.expect(t, reload_filters(&s, false))
 	testing.expect(t, filter.engine_match(engine, "lifted.example", .A) == .Blocked)
@@ -300,24 +312,24 @@ test_a_deleted_file_list_is_lifted :: proc(t: ^testing.T) {
 	testing.expect(t, filter.engine_match(engine, "lifted.example", .A) != .Blocked, "a deleted file list kept its blocks")
 }
 
+// A copy that holds no list is not loaded as one: a page cached by a build that
+// wrote a download before checking it, and an empty download an earlier build
+// cached, or a copy its in-place write truncated before a crash.
 @(test)
-test_a_cached_page_is_not_a_list :: proc(t: ^testing.T) {
-	// A page cached by a build that wrote a download before checking it.
+test_a_cached_copy_that_is_no_list_is_not_loaded :: proc(t: ^testing.T) {
 	// Registered first so it runs last: the removals below read paths it zeroes.
 	defer free_all(context.temp_allocator)
-	dir := fmt.tprintf("/tmp/elodin-server-lists-test-page-%d", os.get_pid())
-	testing.expect(t, os.make_directory(dir) == nil)
+	cfg, dir := list_test_dir(t, "not-a-list")
 	defer os.remove(dir)
-	cfg := config.default_config()
-	cfg.blocking.cache_dir = dir
 	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt", format = .Hosts, enabled = true}
 	path := list_cache_path(&cfg, list)
-	testing.expect(t, os.write_entire_file(path, "<html>\n0.0.0.0 portal.example\n</html>\n") == nil)
 	defer os.remove(path)
-
-	text, load := cached_copy(&cfg, list, .Current)
-	testing.expect_value(t, load, List_Load.Unavailable)
-	testing.expect_value(t, text, "")
+	for body in ([]string{"<html>\n0.0.0.0 portal.example\n</html>\n", " \n\r\n"}) {
+		testing.expect(t, os.write_entire_file(path, body) == nil)
+		text, load := cached_copy(&cfg, list, .Current)
+		testing.expectf(t, load == .Unavailable, "%q was loaded as %v", body, load)
+		testing.expect_value(t, text, "")
+	}
 }
 
 /*
@@ -329,11 +341,8 @@ file that is another list's cache under its own name is not touched (#487).
 @(test)
 test_a_cache_named_by_a_query_moves :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	dir := fmt.tprintf("/tmp/elodin-server-lists-test-move-%d", os.get_pid())
-	testing.expect(t, os.make_directory(dir) == nil)
+	cfg, dir := list_test_dir(t, "move")
 	defer os.remove(dir)
-	cfg := config.default_config()
-	cfg.blocking.cache_dir = dir
 	moved := config.Block_List{name = "http://192.0.2.1/a", url = "http://192.0.2.1/a?key=SECRET", format = .Hosts, enabled = true}
 	stale := config.Block_List{name = "http://192.0.2.1/b", url = "http://192.0.2.1/b?key=SECRET", format = .Hosts, enabled = true}
 	kept := config.Block_List{name = "http://192.0.2.1/c?key=SECRET", url = "http://192.0.2.1/c?key=SECRET", format = .Hosts, enabled = true, named = true}
@@ -350,14 +359,21 @@ test_a_cache_named_by_a_query_moves :: proc(t: ^testing.T) {
 	path_of :: proc(dir, name: string) -> string {
 		return strings.concatenate({dir, "/", config.list_cache_name(name)}, context.temp_allocator)
 	}
-	files := []string{path_of(dir, moved.url), path_of(dir, stale.url), list_cache_path(&cfg, stale), path_of(dir, kept.name), path_of(dir, off.url), path_of(dir, over.url), list_cache_path(&cfg, over)}
+	moved_old := path_of(dir, moved.url)
+	stale_old := path_of(dir, stale.url)
+	stale_current := list_cache_path(&cfg, stale)
+	kept_own := path_of(dir, kept.name)
+	off_old := path_of(dir, off.url)
+	over_old := path_of(dir, over.url)
+	over_bare := list_cache_path(&cfg, over)
+	files := []string{moved_old, stale_old, stale_current, kept_own, off_old, over_old, over_bare}
 	bodies := []string{"0.0.0.0 moved.example\n", "0.0.0.0 stale.example\n", "0.0.0.0 current.example\n", "0.0.0.0 kept.example\n", "0.0.0.0 off.example\n", "0.0.0.0 over.example\n", "0.0.0.0 bare.example\n"}
 	for f, i in files {
 		testing.expect(t, os.write_entire_file(f, bodies[i]) == nil)
 	}
 	// The current copy is the stale list's own, by its fingerprint.
 	src, _ := source_of(stale)
-	testing.expect(t, os.write_entire_file(source_path(files[2]), src) == nil)
+	testing.expect(t, os.write_entire_file(source_path(stale_current), src) == nil)
 	defer {
 		for f in ([]string{list_cache_path(&cfg, moved), list_cache_path(&cfg, other), list_cache_path(&cfg, on)}) {
 			os.remove(f)
@@ -374,15 +390,15 @@ test_a_cache_named_by_a_query_moves :: proc(t: ^testing.T) {
 	defer filter.set_destroy(allow)
 	testing.expect(t, filter.set_lookup(block, "moved.example", .A), "the old copy did not stand in offline")
 	testing.expect(t, filter.set_lookup(block, "current.example", .A), "the current copy was replaced")
-	testing.expect(t, !os.exists(files[0]), "the old copy is still under its url")
+	testing.expect(t, !os.exists(moved_old), "the old copy is still under its url")
 	testing.expect(t, os.exists(list_cache_path(&cfg, moved)), "the old copy did not move to the list's name")
-	testing.expect(t, !os.exists(files[1]), "the old copy beside a current one was kept")
-	testing.expect(t, os.exists(files[3]), "another list's own cache was touched")
+	testing.expect(t, !os.exists(stale_old), "the old copy beside a current one was kept")
+	testing.expect(t, os.exists(kept_own), "another list's own cache was touched")
 	testing.expect(t, !filter.set_lookup(block, "off.example", .A), "a disabled list's old copy loaded as another list")
-	testing.expect(t, os.exists(files[4]), "a disabled list's old copy moved")
+	testing.expect(t, os.exists(off_old), "a disabled list's old copy moved")
 	testing.expect(t, filter.set_lookup(block, "over.example", .A), "the old copy was removed for another url's")
 	testing.expect(t, !filter.set_lookup(block, "bare.example", .A), "the url with no query's copy loaded as the list")
-	testing.expect(t, !os.exists(files[5]), "the old copy is still under its url")
+	testing.expect(t, !os.exists(over_old), "the old copy is still under its url")
 }
 
 /*
@@ -395,11 +411,8 @@ file name, and no fingerprint, holds the query (#487).
 @(test)
 test_a_changed_query_is_not_fresh :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	dir := fmt.tprintf("/tmp/elodin-server-lists-test-query-%d", os.get_pid())
-	testing.expect(t, os.make_directory(dir) == nil)
+	cfg, dir := list_test_dir(t, "query")
 	defer os.remove(dir)
-	cfg := config.default_config()
-	cfg.blocking.cache_dir = dir
 	// Port 1 on loopback refuses at once, so a download that is tried fails fast.
 	a := config.Block_List{name = "http://127.0.0.1:1/l", url = "http://127.0.0.1:1/l?key=SECRET1", format = .Hosts, enabled = true}
 	b := config.Block_List{name = a.name, url = "http://127.0.0.1:1/l?key=SECRET2", format = .Hosts, enabled = true}
@@ -459,11 +472,8 @@ one that reads as a url with no query's.
 @(test)
 test_a_named_lists_copy_survives_the_fingerprint :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	dir := fmt.tprintf("/tmp/elodin-server-lists-test-named-%d", os.get_pid())
-	testing.expect(t, os.make_directory(dir) == nil)
+	cfg, dir := list_test_dir(t, "named")
 	defer os.remove(dir)
-	cfg := config.default_config()
-	cfg.blocking.cache_dir = dir
 	named := config.Block_List{name = "oisd", url = "http://127.0.0.1:1/l?key=SECRET", format = .Hosts, enabled = true, named = true}
 	path := list_cache_path(&cfg, named)
 	defer {
@@ -546,18 +556,44 @@ serve_one_list :: proc(one: ^One_List) {
 	}
 }
 
-// A loopback listener for `serve_one_list`, and the URL that reaches it.
+/*
+`serve_one_list` answering `count` requests with `body` on a loopback listener,
+and the URL that reaches it. `one` is the caller's, so it outlives the thread;
+`stop_one_list` joins the thread and closes the listener.
+*/
 @(private = "file")
-listen_one_list :: proc(t: ^testing.T) -> (listener: net.TCP_Socket, url: string, ok: bool) {
-	err: net.Network_Error
-	listener, err = net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if !testing.expect_value(t, err, nil) {
+start_one_list :: proc(
+	t: ^testing.T,
+	one: ^One_List,
+	body: string,
+	count: int,
+	loc := #caller_location,
+) -> (
+	server: ^thread.Thread,
+	url: string,
+	ok: bool,
+) {
+	listener, err := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expect_value(t, err, nil, loc = loc) {
 		return
 	}
-	bound, _ := net.bound_endpoint(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expect_value(t, berr, nil, loc = loc) {
+		net.close(listener)
+		return
+	}
 	// So a test that returns before dialling ends the accept, not the suite.
 	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
-	return listener, fmt.tprintf("http://127.0.0.1:%d/l.txt", bound.port), true
+	one^ = One_List{listener, body, count}
+	server = thread.create_and_start_with_poly_data(one, serve_one_list)
+	return server, fmt.tprintf("http://127.0.0.1:%d/l.txt", bound.port), true
+}
+
+@(private = "file")
+stop_one_list :: proc(one: ^One_List, server: ^thread.Thread) {
+	thread.join(server)
+	thread.destroy(server)
+	net.close(one.listener)
 }
 
 @(test)
@@ -567,24 +603,18 @@ test_a_fresh_cached_page_is_downloaded_over :: proc(t: ^testing.T) {
 	in - a page an earlier build cached (#317) - is downloaded over, or the list
 	would be out of effect until it aged past the window.
 	*/
-	listener, url, ok := listen_one_list(t)
+	one: One_List
+	server, url, ok := start_one_list(t, &one, "0.0.0.0 fetched.example\n", 1)
 	if !ok {
 		return
 	}
-	defer net.close(listener)
-	one := One_List{listener, "0.0.0.0 fetched.example\n", 1}
-	server := thread.create_and_start_with_poly_data(&one, serve_one_list)
-	defer thread.destroy(server)
-	defer thread.join(server)
+	defer stop_one_list(&one, server)
 
 	// Registered before the removals so it runs after them: they read paths it
 	// zeroes.
 	defer free_all(context.temp_allocator)
-	dir := fmt.tprintf("/tmp/elodin-server-lists-test-fresh-page-%d", os.get_pid())
-	testing.expect(t, os.make_directory(dir) == nil)
+	cfg, dir := list_test_dir(t, "fresh-page")
 	defer os.remove(dir)
-	cfg := config.default_config()
-	cfg.blocking.cache_dir = dir
 	list := config.Block_List {
 		name    = "l",
 		url     = url,
@@ -610,27 +640,21 @@ test_a_refresh_leaves_no_download_in_scratch :: proc(t: ^testing.T) {
 	top of the old and new rule sets.
 	*/
 	LISTS :: 8
-	listener, url, ok := listen_one_list(t)
-	if !ok {
-		return
-	}
-	defer net.close(listener)
 	body := strings.builder_make()
 	defer strings.builder_destroy(&body)
 	for i := 0; strings.builder_len(body) < 512 * 1024; i += 1 {
 		fmt.sbprintf(&body, "0.0.0.0 n%d.example\n", i)
 	}
-	one := One_List{listener, strings.to_string(body), LISTS}
-	server := thread.create_and_start_with_poly_data(&one, serve_one_list)
-	defer thread.destroy(server)
-	defer thread.join(server)
+	one: One_List
+	server, url, ok := start_one_list(t, &one, strings.to_string(body), LISTS)
+	if !ok {
+		return
+	}
+	defer stop_one_list(&one, server)
 
 	defer free_all(context.temp_allocator)
-	dir := fmt.tprintf("/tmp/elodin-server-lists-test-scratch-%d", os.get_pid())
-	testing.expect(t, os.make_directory(dir) == nil)
+	cfg, dir := list_test_dir(t, "scratch")
 	defer os.remove_all(dir)
-	cfg := config.default_config()
-	cfg.blocking.cache_dir = dir
 	lists: [LISTS]config.Block_List
 	for &list, i in lists {
 		list = {name = fmt.tprintf("l%d", i), url = fmt.tprintf("%s%d", url, i), format = .Hosts, enabled = true}
@@ -669,33 +693,23 @@ test_an_empty_download_with_no_copy_does_not_hold_the_others_back :: proc(t: ^te
 	so it is empty rather than lost: the refresh goes through without it, and is
 	not current so it is tried again.
 	*/
-	listener, url, ok := listen_one_list(t)
+	one: One_List
+	server, url, ok := start_one_list(t, &one, "# emptied\n", 1)
 	if !ok {
 		return
 	}
-	defer net.close(listener)
-	one := One_List{listener, "# emptied\n", 1}
-	server := thread.create_and_start_with_poly_data(&one, serve_one_list)
-	defer thread.destroy(server)
-	defer thread.join(server)
+	defer stop_one_list(&one, server)
 
 	// Registered before the removals so it runs after them: they read paths it
 	// zeroes.
 	defer free_all(context.temp_allocator)
-	dir := fmt.tprintf("/tmp/elodin-server-lists-test-emptied-%d", os.get_pid())
-	testing.expect(t, os.make_directory(dir) == nil)
+	cfg, dir := list_test_dir(t, "emptied")
 	defer os.remove(dir)
-	cfg := config.default_config()
-	cfg.blocking.cache_dir = dir
 	cfg.blocking.refresh = 0
 	cfg.blocking.lists = []config.Block_List{{name = "l", url = url, format = .Hosts, enabled = true}}
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	s := Server {
-		cfg     = &cfg,
-		filters = engine,
-	}
-	defer delete(s.lists_loaded)
+	s := list_server(&cfg)
+	defer close_list_server(&s)
+	engine := s.filters
 	// As if it had loaded at the last refresh.
 	key := list_key(cfg.blocking.lists[0], false)
 	s.lists_loaded[key] = true
@@ -724,38 +738,13 @@ test_a_disabled_entry_does_not_lend_its_source_a_history :: proc(t: ^testing.T) 
 		{name = "twin", url = url, format = .Hosts, enabled = true},
 		{name = "twin-off", url = url, format = .Hosts, enabled = false},
 	}
-	engine := filter.engine_make()
-	defer filter.engine_destroy(engine)
-	s := Server {
-		cfg     = &cfg,
-		filters = engine,
-	}
-	defer delete(s.lists_loaded)
+	s := list_server(&cfg)
+	defer close_list_server(&s)
+	engine := s.filters
 
 	testing.expect(t, !reload_filters(&s, true), "an unreachable list was reported current")
 	testing.expect(t, !s.lists_loaded[list_key(cfg.blocking.lists[0], false)], "a list that never loaded was recorded as loaded")
 	generation := filter.engine_generation(engine)
 	reload_filters(&s, true)
 	testing.expect(t, filter.engine_generation(engine) != generation, "a list that never loaded held the refresh back")
-}
-
-@(test)
-test_an_empty_cached_copy_is_not_a_list :: proc(t: ^testing.T) {
-	// An empty download an earlier build cached, or a copy its in-place write
-	// truncated before a crash.
-	// Registered first so it runs last: the removals below read paths it zeroes.
-	defer free_all(context.temp_allocator)
-	dir := fmt.tprintf("/tmp/elodin-server-lists-test-empty-copy-%d", os.get_pid())
-	testing.expect(t, os.make_directory(dir) == nil)
-	defer os.remove(dir)
-	cfg := config.default_config()
-	cfg.blocking.cache_dir = dir
-	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt", format = .Hosts, enabled = true}
-	path := list_cache_path(&cfg, list)
-	testing.expect(t, os.write_entire_file(path, " \n\r\n") == nil)
-	defer os.remove(path)
-
-	text, load := cached_copy(&cfg, list, .Current)
-	testing.expect_value(t, load, List_Load.Unavailable)
-	testing.expect_value(t, text, "")
 }

@@ -1,12 +1,16 @@
 package server
 
+import "core:mem"
 import "core:net"
+import "core:strings"
 import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:dnssec"
+import "elodin:filter"
 import "elodin:upstream"
 
 /*
@@ -173,6 +177,11 @@ blocking on, say - between `harness_start` and the first query.
 The cache, when there is one, takes its TTL bounds from `cfg` rather than from
 literals, and `negative_ttl` is the reason: a cache made without one stores no denial at
 all, so a case about what is or is not remembered could not fail.
+
+`cookies` hands clients server cookies (`start_cookies`); the group never sends
+one upstream, which would add an option to every forwarded query. `validating`
+puts a validator in front of the answers that can fetch no chain (`no_chain`),
+so whatever it judges comes out unproven without reaching the network.
 */
 @(private)
 Harness :: struct {
@@ -184,13 +193,22 @@ Harness :: struct {
 }
 
 @(private)
-harness_start :: proc(t: ^testing.T, h: ^Harness, caching := false, loc := #caller_location) -> bool {
+harness_start :: proc(
+	t: ^testing.T,
+	h: ^Harness,
+	caching := false,
+	cookies := false,
+	validating := false,
+	loc := #caller_location,
+) -> bool {
 	socket, spec, ok := bind_mock(t, loc = loc)
 	if !ok {
 		return false
 	}
 	h.cfg = test_config(loopback_upstream(spec.port))
 	h.cfg.cache.enabled = caching
+	h.cfg.cookies.enabled = cookies
+	h.cfg.dnssec.enabled = validating
 	group, gerr := upstream.make_group(h.cfg.upstream, context.allocator)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr, loc = loc) {
 		net.close(socket)
@@ -214,11 +232,23 @@ harness_start :: proc(t: ^testing.T, h: ^Harness, caching := false, loc := #call
 		group   = h.group,
 		answers = h.answers,
 	}
+	if validating {
+		h.srv.validator = dnssec.make_validator(no_chain, nil, dnssec.Options{})
+	}
+	if !testing.expect(t, start_cookies(&h.srv), "cannot set the cookie secret up", loc = loc) {
+		harness_stop(h)
+		return false
+	}
 	return true
 }
 
 @(private)
 harness_stop :: proc(h: ^Harness) {
+	stop_cookies(&h.srv)
+	if h.srv.validator != nil {
+		dnssec.destroy_validator(h.srv.validator)
+		h.srv.validator = nil
+	}
 	if h.answers != nil {
 		cache.destroy(h.answers)
 	}
@@ -242,14 +272,87 @@ harness_ask :: proc(
 	asked: bool,
 ) {
 	x := Canned_Mock {
-		socket = h.socket,
-		reply  = reply,
+		reply = reply,
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
-	out, outcome, served = handle_query(&h.srv, query, .UDP, client, context.temp_allocator)
+	out, outcome, served = harness_exchange(h, &x, query, client = client)
+	return out, outcome, served, x.got
+}
+
+// As `harness_ask`, with the caller's own mock, for a case that reads what the
+// upstream was sent (`x.seen`) as well as whether it was asked.
+@(private)
+harness_exchange :: proc(
+	h: ^Harness,
+	x: ^Canned_Mock,
+	query: []u8,
+	proto := Protocol.UDP,
+	client := "127.0.0.1:5555",
+) -> (
+	out: []u8,
+	outcome: Outcome,
+	served: bool,
+) {
+	x.socket = h.socket
+	mock := thread.create_and_start_with_poly_data(x, serve_canned)
+	out, outcome, served = handle_query(&h.srv, query, proto, client, context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
-	return out, outcome, served, x.got
+	return
+}
+
+/*
+One query through the harness that has to be forwarded: the mock is asked and
+answers `reply`, the client is answered, and the outcome says it was forwarded.
+`ok` is false when the exchange itself did not happen, so a caller reads no
+answer out of nothing.
+*/
+@(private)
+forward_once :: proc(
+	t: ^testing.T,
+	h: ^Harness,
+	query, reply: []u8,
+	proto := Protocol.UDP,
+	loc := #caller_location,
+) -> (
+	out: []u8,
+	ok: bool,
+) {
+	x := Canned_Mock {
+		reply = reply,
+	}
+	response, outcome, served := harness_exchange(h, &x, query, proto)
+	if !testing.expect(t, x.got, "the upstream was never asked", loc = loc) {
+		return nil, false
+	}
+	if !testing.expect(t, served, "the query went unanswered", loc = loc) {
+		return nil, false
+	}
+	testing.expect_value(t, outcome, Outcome.Forwarded, loc = loc)
+	return response, true
+}
+
+// The one A record answer `addr` still says what it said, to the client that
+// asked with `id`, whatever happened to its OPT record on the way.
+@(private)
+expect_the_answer_survived :: proc(
+	t: ^testing.T,
+	m: dns.Message,
+	label: string,
+	addr: [4]u8,
+	id: u16,
+	loc := #caller_location,
+) {
+	if !testing.expectf(t, len(m.answer) == 1, "%s: the answer section holds %d records, not 1", label, len(m.answer), loc = loc) {
+		return
+	}
+	testing.expectf(t, m.answer[0].type == .A, "%s: the answer is a %v", label, m.answer[0].type, loc = loc)
+	a, is_a := m.answer[0].data.(dns.Rdata_A)
+	if !testing.expectf(t, is_a, "%s: the answer's RDATA did not survive", label, loc = loc) {
+		return
+	}
+	testing.expectf(t, a.addr == addr, "%s: the address came back as %v", label, a.addr, loc = loc)
+	testing.expectf(t, m.id == id, "%s: the answer carries ID %d", label, m.id, loc = loc)
+	testing.expectf(t, len(m.question) == 1, "%s: the question did not come back", label, loc = loc)
 }
 
 /*
@@ -464,4 +567,401 @@ ds_nodata :: proc(name: string, authority: ..dns.Record) -> []u8 {
 		panic("the DS NODATA does not encode")
 	}
 	return wire
+}
+
+// A validator fetch that finds nothing: every chain lookup fails, so whatever
+// a case validates comes out unproven rather than reaching the network.
+@(private)
+no_chain :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
+	return nil, false
+}
+
+/*
+A filter engine holding the rules of `text`. `ok` is false when the list added
+no rule at all, which would leave a case about blocking blocking nothing. The
+engine is the caller's to destroy either way.
+*/
+@(private)
+test_filters :: proc(
+	t: ^testing.T,
+	text: string,
+	format: filter.Format,
+	loc := #caller_location,
+) -> (
+	engine: ^filter.Engine,
+	ok: bool,
+) {
+	block, allow := filter.set_make(), filter.set_make()
+	added := filter.parse_list(block, allow, text, format)
+	engine = filter.engine_make()
+	filter.engine_swap(engine, block, allow)
+	return engine, testing.expectf(t, added > 0, "the list %q added no rule", text, loc = loc)
+}
+
+/*
+A `Server` with counters and nothing else behind them, configured from `cfg`.
+
+`render_metrics` reaches for the cache, the filter engine and the upstream
+group, and every one of those is absent here: what is being tested
+is what the endpoint says about the numbers, and the components have tests of
+their own. The renderer leaves out the families it has no component for, which
+is why this builds.
+*/
+@(private)
+metrics_fixture :: proc(cfg: ^config.Config, stats: Stats) -> Server {
+	cfg^ = config.default_config()
+	cfg.server.max_connections = 512
+	cfg.metrics.enabled = true
+	return Server{cfg = cfg, stats = stats, started = time.now()}
+}
+
+/*
+A loopback TCP listener on an ephemeral port, for a case whose client dials from
+a thread of its own. Closed again on failure.
+*/
+@(private)
+loopback_listener :: proc(
+	t: ^testing.T,
+	loc := #caller_location,
+) -> (
+	listener: net.TCP_Socket,
+	bound: net.Endpoint,
+	ok: bool,
+) {
+	sock, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr, loc = loc) {
+		return {}, {}, false
+	}
+	at, berr := net.bound_endpoint(sock)
+	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr, loc = loc) {
+		net.close(sock)
+		return {}, {}, false
+	}
+	return sock, at, true
+}
+
+/*
+Both ends of one loopback TCP connection: `client` dialled it and `accepted` is
+the server's end. The listener is closed once it has handed `accepted` over, and
+everything opened is closed again on failure, so a caller that gets `ok` false
+has nothing to clean up.
+*/
+@(private)
+loopback_tcp_pair :: proc(
+	t: ^testing.T,
+	loc := #caller_location,
+) -> (
+	client: net.TCP_Socket,
+	accepted: net.TCP_Socket,
+	ok: bool,
+) {
+	listener, bound, lok := loopback_listener(t, loc)
+	if !lok {
+		return {}, {}, false
+	}
+	defer net.close(listener)
+	dialled, derr := net.dial_tcp_from_endpoint(bound)
+	if !testing.expectf(t, derr == nil, "cannot dial the listener: %v", derr, loc = loc) {
+		return {}, {}, false
+	}
+	taken, _, aerr := net.accept_tcp(listener)
+	if !testing.expectf(t, aerr == nil, "nothing connected: %v", aerr, loc = loc) {
+		net.close(dialled)
+		return {}, {}, false
+	}
+	return dialled, taken, true
+}
+
+// Everything `client` reads until the peer closes, an error, or `timeout` passes
+// with nothing new; `err` is what ended the read, nil for a clean close.
+@(private)
+read_until_close :: proc(client: net.TCP_Socket, timeout: time.Duration) -> (got: string, err: net.Network_Error) {
+	_ = net.set_option(client, .Receive_Timeout, timeout)
+	b := strings.builder_make(context.temp_allocator)
+	for {
+		chunk: [4096]u8
+		n, rerr := net.recv_tcp(client, chunk[:])
+		if rerr != nil || n <= 0 {
+			return strings.to_string(b), rerr
+		}
+		strings.write_bytes(&b, chunk[:n])
+	}
+}
+
+// `serve_doh` over one connection, on a thread of its own.
+@(private)
+Doh_Session :: struct {
+	server: ^Server,
+	conn:   Conn,
+}
+
+@(private)
+run_serve_doh :: proc(d: ^Doh_Session) {
+	serve_doh(d.server, d.conn, "test")
+}
+
+/*
+Spend all of `peer`'s stream budget, `RRL_BURST_SECONDS` of it, through
+`stream_rate_check`: the pool a DoH request is charged to, over either HTTP
+version, and one datagrams cannot empty - see `Rate_Class`.
+*/
+@(private)
+spend_stream_budget :: proc(t: ^testing.T, limiter: ^Rate_Limiter, peer: net.Endpoint, loc := #caller_location) {
+	for _ in 0 ..< RRL_BURST_SECONDS {
+		testing.expect(
+			t,
+			stream_rate_check(limiter, peer, time.tick_now()),
+			"the stream budget refused a query it had room for",
+			loc = loc,
+		)
+	}
+}
+
+/*
+A server with no upstream and nothing between it and its own answers: no query
+log, no cache and no blocklist. `s.group` is nil, so a query that reached the
+forwarding step would fault rather than hang, which is what makes a case about
+where something is answered loud when it is answered in the wrong place.
+*/
+@(private)
+local_server :: proc(cfg: ^config.Config) -> Server {
+	cfg^ = config.default_config()
+	cfg.log.queries = false
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+	return Server{cfg = cfg}
+}
+
+/*
+A `local_server`, with no validator either, that answers `domain` from one
+rewrite rule: A 192.0.2.1, TTL 300. What it sends is then something this
+server minted on its own, with nothing in the path that could have echoed it.
+*/
+@(private)
+rewrite_server :: proc(cfg: ^config.Config, domain: string) -> Server {
+	s := local_server(cfg)
+	cfg.dnssec.enabled = false
+	rules := make([]config.Rewrite, 1, context.temp_allocator)
+	rules[0] = config.Rewrite {
+		domain  = domain,
+		answers = answers_of({kind = .A, v4 = {192, 0, 2, 1}}),
+		ttl     = 300,
+	}
+	cfg.rewrites = rules
+	return s
+}
+
+// That `wire` is `rewrite_server`'s answer, whole: NOERROR and its one address.
+@(private)
+answers_the_rewrite :: proc(t: ^testing.T, wire: []u8, loc := #caller_location) {
+	m, err := dns.decode_message(wire, context.temp_allocator)
+	if !testing.expectf(t, err == .None, "the answer does not decode: %v", err, loc = loc) {
+		return
+	}
+	testing.expect_value(t, dns.peek_rcode(wire), dns.Rcode.No_Error, loc = loc)
+	if !testing.expect_value(t, len(m.answer), 1, loc = loc) {
+		return
+	}
+	a, is_a := m.answer[0].data.(dns.Rdata_A)
+	testing.expect(t, is_a, "the answer lost its A record", loc = loc)
+	testing.expect_value(t, a.addr, [4]u8{192, 0, 2, 1}, loc = loc)
+}
+
+/*
+A rewrite's answer list that outlives the procedure that wrote it.
+
+`[]T{...}` slices a temporary the compiler puts in the enclosing frame, so a
+rule set built that way and returned carries slices into a frame that has gone -
+which reads as rules nobody wrote rather than as a crash. Copying into the
+temporary allocator keeps the list alive for as long as the test that asked for it.
+*/
+@(private)
+answers_of :: proc(list: ..config.Rewrite_Answer) -> []config.Rewrite_Answer {
+	out := make([]config.Rewrite_Answer, len(list), context.temp_allocator)
+	copy(out, list)
+	return out
+}
+
+/*
+`name`'s `type` asked of `s` over UDP and read back. RD is clear by default, so
+a name nothing local answers cannot reach the forwarding path - there is no
+upstream - and comes back Refused instead, which names the failure exactly.
+`ok` is false when nothing came back or it would not decode.
+*/
+@(private)
+ask_local :: proc(s: ^Server, name: string, type: dns.Type, rd := false) -> (resp: dns.Message, outcome: Outcome, ok: bool) {
+	out, how, answered := handle_query(s, test_query(name, type, rd = rd), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	if !answered {
+		return {}, how, false
+	}
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	return decoded, how, derr == .None
+}
+
+/*
+The request `resolve_query` holds for `msg` from a UDP client, for running its
+stages one at a time. `msg` is encoded as the query's bytes.
+*/
+@(private)
+stage_state :: proc(s: ^Server, msg: dns.Message, spent: ^int, allocator: mem.Allocator) -> Query_State {
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		panic("the staged query does not encode")
+	}
+	return Query_State {
+		s = s,
+		query = wire,
+		msg = msg,
+		q = msg.question[0],
+		proto = .UDP,
+		client = "127.0.0.1:5555",
+		limit = 512,
+		started = time.tick_now(),
+		spent = spent,
+		allocator = allocator,
+	}
+}
+
+/*
+A client's A query for `name` carrying `additional` as written: two OPT records,
+or one that is not last, go out as they are, which is what a case about a
+malformed EDNS section needs.
+*/
+@(private)
+query_with_records :: proc(name: string, additional: ..dns.Record) -> []u8 {
+	question := [1]dns.Question{{name = name, type = .A, class = .IN}}
+	msg := dns.Message {
+		id         = 0x4242,
+		question   = question[:],
+		additional = additional,
+	}
+	msg.flags.rd = true
+	wire, _, err := dns.encode_with_every_opt(msg, context.temp_allocator)
+	if err != .None {
+		panic("the test query does not encode")
+	}
+	return wire
+}
+
+// An upstream's A answer for `name`, with an OPT record of its own as an EDNS
+// upstream writes one.
+@(private)
+edns_reply :: proc(name: string, addr: [4]u8) -> []u8 {
+	wire, ok := dns.ensure_opt(test_reply(name, .A, a_record(name, addr, 300)), 1232, context.temp_allocator)
+	if !ok {
+		panic("the test reply took no OPT record")
+	}
+	return wire
+}
+
+// An OPT record's encoded length with no options: a root owner name, TYPE,
+// CLASS, TTL and RDLENGTH.
+@(private)
+OPT_RR_LEN :: 11
+
+/*
+A mock upstream that answers one question and reports whether the query carried
+EDNS option `code`.
+
+Every OPT record is walked, not just the first one `find_edns_option` stops at.
+A resolver reading these bytes is under no obligation to stop where this
+server's decoder stops, so a mock that looked only where a strip looks could not
+tell a query the strip cleaned from one still carrying the option somewhere the
+strip never reached.
+
+The question is `reply`'s, and a datagram asking anything else is skipped as
+`Canned_Mock` skips it. `reply_seen`, when set, is answered instead to a query
+that carried the option, so a case can tell from the answer alone which one the
+upstream was asked.
+*/
+@(private)
+Option_Mock :: struct {
+	socket:     net.UDP_Socket,
+	code:       dns.EDNS_Option_Code,
+	reply:      []u8,
+	reply_seen: []u8,
+	saw:        bool,
+	saw_do:     bool,
+	served:     bool,
+}
+
+@(private)
+serve_option_sniffer :: proc(x: ^Option_Mock) {
+	buf: [4096]u8
+	for {
+		n, remote, err := net.recv_udp(x.socket, buf[:])
+		if err != nil {
+			return
+		}
+		if !dns.same_question(buf[:n], x.reply) {
+			continue
+		}
+		m, derr := dns.decode_message(buf[:n], context.temp_allocator)
+		if derr != .None {
+			return
+		}
+		for rec in m.additional {
+			rdata, is_opt := rec.data.(dns.Rdata_OPT)
+			if rec.type != .OPT || !is_opt {
+				continue
+			}
+			for o in rdata.options {
+				if o.code == u16(x.code) {
+					x.saw = true
+				}
+			}
+		}
+		x.saw_do = dns.edns_do(m)
+		free_all(context.temp_allocator)
+
+		reply := x.reply_seen if x.saw && x.reply_seen != nil else x.reply
+		if len(reply) > len(buf) {
+			return
+		}
+		out: [4096]u8
+		copy(out[:], reply)
+		out[0], out[1] = buf[0], buf[1]
+		_, serr := net.send_udp(x.socket, out[:len(reply)], remote)
+		x.served = serr == nil
+		return
+	}
+}
+
+/*
+One query through the harness's server with an `Option_Mock` answering it; `x`
+names the option to look for and the replies.
+*/
+@(private)
+harness_sniff :: proc(
+	h: ^Harness,
+	x: ^Option_Mock,
+	query: []u8,
+	proto := Protocol.UDP,
+	client := "127.0.0.1:5555",
+) -> (
+	out: []u8,
+	outcome: Outcome,
+	ok: bool,
+) {
+	x.socket = h.socket
+	mock := thread.create_and_start_with_poly_data(x, serve_option_sniffer)
+	out, outcome, ok = handle_query(&h.srv, query, proto, client, context.temp_allocator)
+	thread.join(mock)
+	thread.destroy(mock)
+	return
+}
+
+/*
+That `query` is refused FORMERR by the harness's server and never reaches its
+upstream: the shape `edns_opt_readable` turns away. `what` is the failure if it
+was forwarded. Returns the answer for any further check.
+*/
+@(private)
+expect_refused_unforwarded :: proc(t: ^testing.T, h: ^Harness, query: []u8, what: string, loc := #caller_location) -> []u8 {
+	out, outcome, ok := handle_query(&h.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	testing.expect(t, mock_untouched(h.socket, query), what, loc = loc)
+	testing.expect(t, ok, "the client was left with nothing at all", loc = loc)
+	testing.expect_value(t, outcome, Outcome.Failed, loc = loc)
+	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Form_Err, loc = loc)
+	return out
 }

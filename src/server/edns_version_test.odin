@@ -32,84 +32,18 @@ without going through the reader under test.
 */
 @(private = "file")
 version_query :: proc(version: u8, edns := true, cookie: []u8 = nil) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = REWRITTEN,
-		type  = .A,
-		class = .IN,
+	if !edns {
+		return test_query(REWRITTEN, id = 0x4321)
 	}
-	msg := dns.Message {
-		id       = 0x4321,
-		question = questions,
-	}
-	msg.flags.rd = true
-
-	if edns {
-		opt := dns.make_opt(1232, false)
-		opt.ttl |= u32(version) << 16
-		if cookie != nil {
-			options := make([]dns.EDNS_Option, 1, context.temp_allocator)
-			options[0] = dns.EDNS_Option {
-				code = u16(dns.EDNS_Option_Code.Cookie),
-				data = cookie,
-			}
-			opt.data = dns.Rdata_OPT{options = options}
-		}
-		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = opt
-		msg.additional = additional
-	}
-
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-/*
-A server that can answer `REWRITTEN` from its configuration and nothing else, so
-a version this server does implement has somewhere to be answered from.
-
-The rewrite and its answers are allocated rather than written as slice literals:
-a literal lives in the frame that made it, and these have to outlive this call.
-*/
-@(private = "file")
-rewriting_server :: proc(cfg: ^config.Config) -> Server {
-	cfg^ = config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.dnssec.enabled = false
-
-	answers := make([]config.Rewrite_Answer, 1, context.temp_allocator)
-	answers[0] = config.Rewrite_Answer {
-		kind = .A,
-		v4   = {192, 0, 2, 1},
-	}
-	rewrites := make([]config.Rewrite, 1, context.temp_allocator)
-	rewrites[0] = config.Rewrite {
-		domain  = REWRITTEN,
-		answers = answers,
-		ttl     = 300,
-	}
-	cfg.rewrites = rewrites
-	return Server{cfg = cfg}
-}
-
-@(private = "file")
-response_cookie :: proc(wire: []u8) -> (data: []u8, found: bool) {
-	m, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
-		return nil, false
-	}
-	return dns.find_edns_option(m, .Cookie)
+	opt := opt_with(.Cookie, cookie) if cookie != nil else dns.make_opt(1232, false)
+	opt.ttl |= u32(version) << 16
+	return test_query(REWRITTEN, id = 0x4321, opt = opt)
 }
 
 @(test)
 test_edns_version_above_zero_is_refused_with_badvers :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := rewriting_server(&cfg)
+	s := rewrite_server(&cfg, REWRITTEN)
 
 	out, outcome, ok := handle_query(&s, version_query(1), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if !testing.expect(t, ok, "a request in EDNS version 1 went unanswered") {
@@ -152,7 +86,7 @@ zero would refuse every query this server has ever been sent.
 @(test)
 test_edns_version_zero_and_plain_queries_are_untouched :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := rewriting_server(&cfg)
+	s := rewrite_server(&cfg, REWRITTEN)
 
 	out, outcome, ok := handle_query(&s, version_query(0), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if !testing.expect(t, ok, "a request in EDNS version 0 went unanswered") {
@@ -195,7 +129,7 @@ EDNS at all, would rebuild it at rcode 0.
 @(test)
 test_badvers_still_carries_a_cookie_back :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := rewriting_server(&cfg)
+	s := rewrite_server(&cfg, REWRITTEN)
 	cfg.cookies.enabled = true
 	cfg.cookies.secret = "e5e973e5a6b2a43f48e7dc849e37bfcf"
 	if !testing.expect(t, start_cookies(&s), "the cookie keeper would not start") {
@@ -218,7 +152,7 @@ test_badvers_still_carries_a_cookie_back :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, outcome, Outcome.Refused)
 
-	_, found := response_cookie(out)
+	_, found := dns.peek_edns_option(out, .Cookie)
 	testing.expect(t, found, "BADVERS came back without the cookie the client asked for")
 	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Bad_Vers)
 

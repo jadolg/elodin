@@ -2,7 +2,6 @@ package server
 
 import "core:mem"
 import "core:testing"
-import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
@@ -23,28 +22,12 @@ test_a_parked_query_holds_no_key_buffer :: proc(t: ^testing.T) {
 	)
 }
 
+// An RD and CD question for `name`'s AAAA, the shape the key cases read.
 @(private = "file")
-stage_state :: proc(s: ^Server, name: string, spent: ^int, allocator: mem.Allocator) -> Query_State {
+aaaa_question :: proc(name: string) -> dns.Message {
 	questions := make([]dns.Question, 1, context.temp_allocator)
 	questions[0] = {name = name, type = .AAAA, class = .IN}
-	msg := dns.Message {
-		id       = 0x1234,
-		flags    = {rd = true, cd = true},
-		question = questions,
-	}
-	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
-	return Query_State {
-		s = s,
-		query = wire,
-		msg = msg,
-		q = questions[0],
-		proto = .UDP,
-		client = "127.0.0.1:5555",
-		limit = 512,
-		started = time.tick_now(),
-		spent = spent,
-		allocator = allocator,
-	}
+	return dns.Message{id = 0x1234, flags = {rd = true, cd = true}, question = questions}
 }
 
 /*
@@ -54,13 +37,8 @@ as long as the name and the tail.
 */
 @(test)
 test_cache_keys_are_as_long_as_the_name :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	s := Server {
-		cfg = &cfg,
-	}
+	cfg: config.Config
+	s := local_server(&cfg)
 	defer free_all(context.temp_allocator)
 
 	// Labels of 63, 63, 63 and 61 escaped bytes: a 255-byte wire name, and at
@@ -77,7 +55,7 @@ test_cache_keys_are_as_long_as_the_name :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(long), 1004)
 	for name in ([]string{"www.Example.COM.", string(long)}) {
 		spent: int
-		st := stage_state(&s, name, &spent, context.temp_allocator)
+		st := stage_state(&s, aaaa_question(name), &spent, context.temp_allocator)
 		testing.expect(t, !answer_from_cache(&st), "an RD=1 miss with no cache was not handed on")
 
 		want_buf: [cache.KEY_MAX]u8
@@ -112,17 +90,12 @@ it is the length that is checked.
 */
 @(test)
 test_a_request_with_no_room_for_its_keys_fails :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	s := Server {
-		cfg = &cfg,
-	}
+	cfg: config.Config
+	s := local_server(&cfg)
 	defer free_all(context.temp_allocator)
 	for refresh in ([]bool{false, true}) {
 		spent: int
-		st := stage_state(&s, "example.com.", &spent, mem.nil_allocator())
+		st := stage_state(&s, aaaa_question("example.com."), &spent, mem.nil_allocator())
 		st.refresh = refresh
 		testing.expect(t, answer_from_cache(&st), "a question with no keys was handed on")
 		testing.expect(t, !st.ok, "a question with no keys was answered")

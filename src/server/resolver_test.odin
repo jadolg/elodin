@@ -157,22 +157,21 @@ down_upstream :: proc() -> upstream.Group {
 
 @(private)
 stale_query :: proc(rd: bool) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = STALE_NAME,
-		type  = .A,
-		class = .IN,
-	}
-	msg := dns.Message {
-		id       = 0x4321,
-		question = questions,
-	}
-	msg.flags.rd = rd
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_query(STALE_NAME, id = 0x4321, rd = rd)
+}
+
+// The cache's entry for `STALE_NAME`, or nil.
+@(private)
+stale_entry :: proc(answers: ^cache.Cache) -> ^cache.Entry {
+	kb: [cache.KEY_MAX]u8
+	return answers.shards[0].entries[cache.make_key(kb[:], STALE_NAME, .A, .IN, false)]
+}
+
+// What a lookup of `STALE_NAME` finds in `answers`.
+@(private)
+stale_get :: proc(answers: ^cache.Cache) -> (wire: []u8, hit: cache.Hit, found: bool) {
+	kb: [cache.KEY_MAX]u8
+	return cache.get(answers, cache.make_key(kb[:], STALE_NAME, .A, .IN, false), context.temp_allocator)
 }
 
 /*
@@ -185,51 +184,119 @@ not what any of this is about.
 */
 @(private)
 cache_an_answer :: proc(answers: ^cache.Cache, expired: bool) -> bool {
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = STALE_NAME,
-		type  = .A,
-		class = .IN,
-		ttl   = 300,
-		data  = dns.Rdata_A{addr = {192, 0, 2, 1}},
-	}
-	stored := dns.Message {
-		id       = 0x1111,
-		question = []dns.Question{{name = STALE_NAME, type = .A, class = .IN}},
-		answer   = answer,
-	}
-	stored.flags.qr = true
-	stored.flags.ra = true
-	wire, _, enc := dns.encode_message(stored, context.temp_allocator)
-	if enc != .None {
-		return false
-	}
+	wire := test_reply(STALE_NAME, .A, a_record(STALE_NAME, {192, 0, 2, 1}, 300))
 	decoded, derr := dns.decode_message(wire, context.temp_allocator)
 	if derr != .None {
 		return false
 	}
-
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], STALE_NAME, .A, .IN, false, false)
-	if !cache.put(answers, key, wire, decoded) {
+	if !cache.put(answers, cache.make_key(key_buf[:], STALE_NAME, .A, .IN, false), wire, decoded) {
 		return false
 	}
 	if expired {
-		if e, found := answers.shards[0].entries[key]; found {
-			e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
-			e.inserted = loop.moment_add(loop.moment_now(), -3600 * time.Second)
+		e := stale_entry(answers)
+		if e == nil {
+			return false
 		}
+		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
+		e.inserted = loop.moment_add(loop.moment_now(), -3600 * time.Second)
 	}
 	return true
 }
 
 @(private)
 stale_server :: proc(cfg: ^config.Config, answers: ^cache.Cache, group: ^upstream.Group) -> Server {
-	cfg^ = config.default_config()
-	cfg.log.queries = false
-	cfg.blocking.enabled = false
+	cfg^ = test_config()
+	cfg.cache.enabled = true
 	cfg.cache.serve_stale = true
 	return Server{cfg = cfg, answers = answers, group = group}
+}
+
+/*
+A stale-serving server forwarding to one mock upstream on loopback, with
+`STALE_NAME` already in its cache: expired, unless `expired` says otherwise.
+
+The upstream gets `attempts` tries of `timeout` each, and `stale_timeout`, where
+given, replaces the configured response timer. `answers` is the cache to serve
+from, a stale-serving one when nil; the fixture destroys it either way. With
+`looped` the server has a test loop to detach refreshes onto, which
+`stale_fixture_join` stops in the middle of a case and `stale_fixture_stop`
+stops first if it is still running: the loop waits out a refresh that writes to
+the cache and the group on its way out.
+*/
+@(private)
+Stale_Fixture :: struct {
+	socket:  net.UDP_Socket,
+	answers: ^cache.Cache,
+	cfg:     config.Config,
+	group:   ^upstream.Group,
+	srv:     Server,
+	tl:      Test_Loop,
+}
+
+@(private)
+stale_fixture_start :: proc(
+	t: ^testing.T,
+	f: ^Stale_Fixture,
+	timeout: time.Duration,
+	stale_timeout: Maybe(time.Duration) = nil,
+	looped := false,
+	attempts := 1,
+	expired := true,
+	answers: ^cache.Cache = nil,
+	loc := #caller_location,
+) -> bool {
+	f.answers = answers
+	if f.answers == nil {
+		f.answers = cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
+	}
+	socket, spec, ok := bind_mock(t, loc = loc)
+	if !ok {
+		cache.destroy(f.answers)
+		return false
+	}
+	f.socket = socket
+	f.srv = stale_server(&f.cfg, f.answers, nil)
+	f.cfg.upstream.attempts = attempts
+	f.cfg.upstream.timeout = timeout
+	if wait, has := stale_timeout.?; has {
+		f.cfg.cache.stale_timeout = wait
+	}
+	f.cfg.upstream.servers = loopback_upstream(spec.port)
+	group, gerr := upstream.make_group(f.cfg.upstream)
+	f.group = group
+	f.srv.group = group
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr, loc = loc) {
+		stale_fixture_stop(f)
+		return false
+	}
+	if looped {
+		if !testing.expect(t, start_test_loop(&f.tl), "no loop", loc = loc) {
+			stale_fixture_stop(f)
+			return false
+		}
+		f.srv.loops = f.tl.loops[:]
+	}
+	if !testing.expect(t, cache_an_answer(f.answers, expired), "the answer was not cached", loc = loc) {
+		stale_fixture_stop(f)
+		return false
+	}
+	return true
+}
+
+// Stops the loop, so whatever was detached onto it has finished.
+@(private)
+stale_fixture_join :: proc(f: ^Stale_Fixture) {
+	stop_test_loop(&f.tl)
+	f.srv.loops = nil
+}
+
+@(private)
+stale_fixture_stop :: proc(f: ^Stale_Fixture) {
+	stale_fixture_join(f)
+	upstream.destroy_group(f.group)
+	cache.destroy(f.answers)
+	net.close(f.socket)
 }
 
 /*
@@ -302,7 +369,9 @@ Stale_Exchange :: struct {
 }
 
 /*
-Serve exactly one query.
+Serve exactly one query: the one asking `reply`'s question, skipping any other
+datagram as `Canned_Mock` does (a straggler from another case on a reused
+port), with the delay or hold `Canned_Mock` has no room for.
 
 One query per thread, joined by the caller before it reads `got`: there is no
 shared state to guard, and a query that never arrives leaves `got` false rather
@@ -311,9 +380,19 @@ than hanging the suite - the socket carries a receive timeout.
 @(private)
 serve_one_stale :: proc(x: ^Stale_Exchange) {
 	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
+	if len(x.reply) > len(buf) {
 		return
+	}
+	remote: net.Endpoint
+	for {
+		n, from, err := net.recv_udp(x.socket, buf[:])
+		if err != nil {
+			return
+		}
+		if dns.same_question(buf[:n], x.reply) {
+			remote = from
+			break
+		}
 	}
 	x.got = true
 	if x.delay > 0 {
@@ -333,33 +412,7 @@ serve_one_stale :: proc(x: ^Stale_Exchange) {
 
 @(private)
 live_reply :: proc() -> []u8 {
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = STALE_NAME,
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = dns.Rdata_A{addr = LIVE_ADDR},
-	}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = STALE_NAME,
-		type  = .A,
-		class = .IN,
-	}
-	msg := dns.Message {
-		id       = 0,
-		question = question,
-		answer   = answer,
-	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR))
 }
 
 /*
@@ -373,49 +426,15 @@ bound socket nothing reads, so the wait is the timeout and nothing else.
 */
 @(test)
 test_a_stale_copy_is_not_served_past_its_rrsig_after_the_wait :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the silent upstream: %v", serr) {
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, 200 * time.Millisecond) {
 		return
 	}
-	defer net.close(socket)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the upstream's port: %v", berr) {
-		return
-	}
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
-	defer cache.destroy(answers)
-	cfg: config.Config
-	s := stale_server(&cfg, answers, nil)
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 200 * time.Millisecond
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "silent",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s.group = group
-
-	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
-		return
-	}
+	defer stale_fixture_stop(&f)
 	// Live when `get` reads it, lapsed long before the upstream times out.
-	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	if e, found := answers.shards[0].entries[key]; found {
-		e.signed_until = loop.moment_add(loop.moment_now(), 50 * time.Millisecond)
-	}
+	stale_entry(f.answers).signed_until = loop.moment_add(loop.moment_now(), 50 * time.Millisecond)
 
-	out, _, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, _, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if testing.expect(t, ok, "nothing came back at all") {
 		served, derr := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr, dns.Decode_Error.None)
@@ -436,48 +455,15 @@ the same way; nothing here can pass a SERVFAIL.
 */
 @(test)
 test_a_lapsed_stale_copy_waits_for_the_refresh :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, 5 * time.Second, stale_timeout = 100 * time.Millisecond, looped = true) {
 		return
 	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		return
-	}
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
-	defer cache.destroy(answers)
-	cfg: config.Config
-	s := stale_server(&cfg, answers, nil)
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 5 * time.Second
-	cfg.cache.stale_timeout = 100 * time.Millisecond
-	cfg.upstream.servers = loopback_upstream(bound.port)
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s.group = group
-	tl: Test_Loop
-	start_test_loop(&tl)
-	defer stop_test_loop(&tl)
-	s.loops = tl.loops[:]
-
-	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
-		return
-	}
-	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	if e, found := answers.shards[0].entries[key]; found {
-		e.signed_until = loop.moment_add(loop.moment_now(), 50 * time.Millisecond)
-	}
+	defer stale_fixture_stop(&f)
+	stale_entry(f.answers).signed_until = loop.moment_add(loop.moment_now(), 50 * time.Millisecond)
 
 	x := Stale_Exchange {
-		socket = socket,
+		socket = f.socket,
 		reply  = live_reply(),
 		delay  = 400 * time.Millisecond,
 	}
@@ -487,7 +473,7 @@ test_a_lapsed_stale_copy_waits_for_the_refresh :: proc(t: ^testing.T) {
 		thread.destroy(mock)
 	}
 
-	out, _, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, _, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if testing.expect(t, ok, "nothing came back at all") {
 		served, derr := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr, dns.Decode_Error.None)
@@ -518,53 +504,18 @@ again on the next failure.
 */
 @(test)
 test_a_live_upstream_beats_a_stale_entry :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, 5 * time.Second) {
 		return
 	}
-	defer net.close(socket)
-	// Only a bound on a hang, and past the upstream timeout below rather than
-	// under it: see the note on `MOCK_RECV_TIMEOUT`.
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		return
-	}
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
-	defer cache.destroy(answers)
-	cfg: config.Config
-	s := stale_server(&cfg, answers, nil)
-	cfg.upstream.strategy = .Failover
-	// One try, so a case that is going wrong says so instead of retrying.
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 5 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	cfg.upstream.servers = servers
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s.group = group
-
-	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
-		return
-	}
+	defer stale_fixture_stop(&f)
 
 	x := Stale_Exchange {
-		socket = socket,
+		socket = f.socket,
 		reply  = live_reply(),
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
-	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
 
@@ -582,16 +533,14 @@ test_a_live_upstream_beats_a_stale_entry :: proc(t: ^testing.T) {
 		testing.expectf(t, a.addr == LIVE_ADDR, "the client was served %v, which is the expired entry", a.addr)
 	}
 
-	counters := stats_of(&s)
+	counters := stats_of(&f.srv)
 	testing.expect_value(t, counters.forwarded, u64(1))
 	testing.expect_value(t, counters.cached, u64(0))
-	testing.expect_value(t, cache.stats(answers).stale, u64(0))
+	testing.expect_value(t, cache.stats(f.answers).stale, u64(0))
 
 	// And the entry behind it was refreshed rather than left expired, so the next
 	// outage falls back on the answer that was just fetched.
-	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	_, refreshed, found := cache.get(answers, key, context.temp_allocator)
+	_, refreshed, found := stale_get(f.answers)
 	testing.expect(t, found, "the refreshed answer was not cached")
 	testing.expect(t, !refreshed.stale, "the entry is still the expired one")
 	free_all(context.temp_allocator)
@@ -608,42 +557,11 @@ as the answer, and below the failure branch it would never reach the fallback.
 */
 @(test)
 test_a_referral_falls_back_on_a_stale_entry :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, 5 * time.Second) {
 		return
 	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		return
-	}
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
-	defer cache.destroy(answers)
-	cfg: config.Config
-	s := stale_server(&cfg, answers, nil)
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 5 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s.group = group
-
-	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
-		return
-	}
+	defer stale_fixture_stop(&f)
 
 	referral := dns.Message {
 		question  = []dns.Question{{name = STALE_NAME, type = .A, class = .IN}},
@@ -656,11 +574,11 @@ test_a_referral_falls_back_on_a_stale_entry :: proc(t: ^testing.T) {
 		return
 	}
 	x := Stale_Exchange {
-		socket = socket,
+		socket = f.socket,
 		reply  = wire,
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
-	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
 
@@ -673,8 +591,8 @@ test_a_referral_falls_back_on_a_stale_entry :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, dns.Decode_Error.None)
 	testing.expect_value(t, dns.Rcode(served.flags.rcode), dns.Rcode.No_Error)
 	testing.expectf(t, len(served.answer) == 1, "the client got %d answer records, not the expired entry", len(served.answer))
-	testing.expect_value(t, stats_of(&s).failed, u64(0))
-	testing.expect_value(t, cache.stats(answers).stale, u64(1))
+	testing.expect_value(t, stats_of(&f.srv).failed, u64(0))
+	testing.expect_value(t, cache.stats(f.answers).stale, u64(1))
 	free_all(context.temp_allocator)
 }
 
@@ -810,49 +728,14 @@ whole two seconds and fails.
 */
 @(test)
 test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T) {
-	hole, herr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, herr == nil, "cannot bind the blackholed upstream: %v", herr) {
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, 1 * time.Second, stale_timeout = 150 * time.Millisecond, looped = true, attempts = 2) {
 		return
 	}
-	defer net.close(hole)
-	bound, berr := net.bound_endpoint(hole)
-	if !testing.expectf(t, berr == nil, "cannot read the blackhole's port: %v", berr) {
-		return
-	}
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
-	defer cache.destroy(answers)
-	cfg: config.Config
-	s := stale_server(&cfg, answers, nil)
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 2
-	cfg.upstream.timeout = 1 * time.Second
-	cfg.cache.stale_timeout = 150 * time.Millisecond
-	cfg.upstream.servers = loopback_upstream(bound.port)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s.group = group
-
-	/*
-	Declared last so that it is torn down first: `stop_test_loop` waits out the
-	refresh, which is still inside its two-second upstream budget when this
-	returns and which writes to the cache and the group when it comes out.
-	*/
-	tl: Test_Loop
-	start_test_loop(&tl)
-	defer stop_test_loop(&tl)
-	s.loops = tl.loops[:]
-
-	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
-		return
-	}
+	defer stale_fixture_stop(&f)
 
 	begun := time.now()
-	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	waited := time.since(begun)
 
 	if !testing.expect(t, ok, "the stale answer went unserved") {
@@ -864,7 +747,7 @@ test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T)
 		waited < 1 * time.Second,
 		"the client waited %v for an expired entry it could have had at once; the upstream budget is %v",
 		waited,
-		time.Duration(cfg.upstream.attempts) * cfg.upstream.timeout,
+		time.Duration(f.cfg.upstream.attempts) * f.cfg.upstream.timeout,
 	)
 
 	served, serr := dns.decode_message(out, context.temp_allocator)
@@ -876,10 +759,10 @@ test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T)
 
 	// And the failure the refresh is still walking into is not the client's:
 	// it got an answer, so nothing is counted failed for it.
-	counters := stats_of(&s)
+	counters := stats_of(&f.srv)
 	testing.expect_value(t, counters.cached, u64(1))
 	testing.expect_value(t, counters.failed, u64(0))
-	testing.expect_value(t, cache.stats(answers).stale, u64(1))
+	testing.expect_value(t, cache.stats(f.answers).stale, u64(1))
 	free_all(context.temp_allocator)
 }
 
@@ -906,53 +789,19 @@ the number of refreshes rather than a multiple of it.
 */
 @(test)
 test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
-	hole, herr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, herr == nil, "cannot bind the blackholed upstream: %v", herr) {
-		return
-	}
-	defer net.close(hole)
-	bound, berr := net.bound_endpoint(hole)
-	if !testing.expectf(t, berr == nil, "cannot read the blackhole's port: %v", berr) {
-		return
-	}
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
-	defer cache.destroy(answers)
-	cfg: config.Config
-	s := stale_server(&cfg, answers, nil)
-	cfg.upstream.strategy = .Failover
-	// One attempt, so every datagram counted below is a refresh of its own.
-	cfg.upstream.attempts = 1
-	// And long enough that the first refresh is certainly still running when the
+	// One attempt, so every datagram counted below is a refresh of its own, and
+	// long enough that the first refresh is certainly still running when the
 	// second query arrives.
-	cfg.upstream.timeout = 2 * time.Second
-	cfg.cache.stale_timeout = 100 * time.Millisecond
-	cfg.upstream.servers = loopback_upstream(bound.port)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, 2 * time.Second, stale_timeout = 100 * time.Millisecond, looped = true) {
 		return
 	}
-	defer upstream.destroy_group(group)
-	s.group = group
-	tl: Test_Loop
-	start_test_loop(&tl)
-	// Joined in the middle of the case rather than at the end of it; the drain
-	// below says why. The flag is what keeps an early return from leaking it.
-	joined := false
-	defer if !joined {
-		stop_test_loop(&tl)
-	}
-	s.loops = tl.loops[:]
-
-	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
-		return
-	}
+	defer stale_fixture_stop(&f)
 
 	for i in 0 ..< 4 {
 		begun := time.now()
 		_, outcome, ok := handle_query(
-			&s,
+			&f.srv,
 			stale_query(true),
 			.UDP,
 			"127.0.0.1:5555",
@@ -979,11 +828,9 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 	attempt is on the socket or was never going to be. That is a fact about this
 	process rather than a delay long enough to hope.
 	*/
-	stop_test_loop(&tl)
-	joined = true
-	s.loops = nil
+	stale_fixture_join(&f)
 
-	testing.expect_value(t, drain_datagrams(hole), 1)
+	testing.expect_value(t, drain_datagrams(f.socket), 1)
 	free_all(context.temp_allocator)
 }
 
@@ -1004,56 +851,20 @@ ended up holding.
 */
 @(test)
 test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, 5 * time.Second, stale_timeout = 100 * time.Millisecond, looped = true) {
 		return
 	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		return
-	}
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
-	defer cache.destroy(answers)
-	cfg: config.Config
-	s := stale_server(&cfg, answers, nil)
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 5 * time.Second
-	cfg.cache.stale_timeout = 100 * time.Millisecond
-	cfg.upstream.servers = loopback_upstream(bound.port)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s.group = group
-	tl: Test_Loop
-	start_test_loop(&tl)
-	// Joined in the middle of the case rather than at the end of it, since the
-	// store this is about happens on the refresh's way out. The flag is what
-	// keeps an early return from leaking the loop all the same.
-	joined := false
-	defer if !joined {
-		stop_test_loop(&tl)
-	}
-	s.loops = tl.loops[:]
-
-	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
-		return
-	}
+	defer stale_fixture_stop(&f)
 
 	x := Stale_Exchange {
-		socket = socket,
+		socket = f.socket,
 		reply  = live_reply(),
 		delay  = 400 * time.Millisecond,
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
 
-	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if !testing.expect(t, ok, "the stale answer went unserved") {
 		return
 	}
@@ -1072,13 +883,9 @@ test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
 
 	// The refresh is joined rather than slept on: the store happens on its way
 	// out, so the loop going quiet is what says the entry is final.
-	stop_test_loop(&tl)
-	joined = true
-	s.loops = nil
+	stale_fixture_join(&f)
 
-	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	wire, hit, found := cache.get(answers, key, context.temp_allocator)
+	wire, hit, found := stale_get(f.answers)
 	if !testing.expect(t, found, "the entry is gone") {
 		return
 	}
@@ -1108,50 +915,20 @@ for the upstream itself. This is the detached one.
 */
 @(test)
 test_a_refresh_that_beats_the_timer_answers_the_client :: proc(t: ^testing.T) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	// A timer well past what a loopback exchange takes, so a case that goes
+	// wrong says the refresh was not reached rather than that the machine was busy.
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, 5 * time.Second, stale_timeout = 5 * time.Second, looped = true) {
 		return
 	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		return
-	}
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
-	defer cache.destroy(answers)
-	cfg: config.Config
-	s := stale_server(&cfg, answers, nil)
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 5 * time.Second
-	// Well past what a loopback exchange takes, so a case that goes wrong says
-	// the refresh was not reached rather than that the machine was busy.
-	cfg.cache.stale_timeout = 5 * time.Second
-	cfg.upstream.servers = loopback_upstream(bound.port)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s.group = group
-	tl: Test_Loop
-	start_test_loop(&tl)
-	defer stop_test_loop(&tl)
-	s.loops = tl.loops[:]
-
-	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
-		return
-	}
+	defer stale_fixture_stop(&f)
 
 	x := Stale_Exchange {
-		socket = socket,
+		socket = f.socket,
 		reply  = live_reply(),
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
-	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
 
@@ -1171,7 +948,7 @@ test_a_refresh_that_beats_the_timer_answers_the_client :: proc(t: ^testing.T) {
 		testing.expect(t, is_a, "the answer did not carry an A record")
 		testing.expectf(t, a.addr == LIVE_ADDR, "the client was served %v, which is the expired entry", a.addr)
 	}
-	testing.expect_value(t, cache.stats(answers).stale, u64(0))
+	testing.expect_value(t, cache.stats(f.answers).stale, u64(0))
 	free_all(context.temp_allocator)
 }
 
@@ -1202,48 +979,15 @@ thing keeping the refresh on this thread.
 */
 @(test)
 test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
-	hole, herr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, herr == nil, "cannot bind the blackholed upstream: %v", herr) {
-		return
-	}
-	defer net.close(hole)
-	bound, berr := net.bound_endpoint(hole)
-	if !testing.expectf(t, berr == nil, "cannot read the blackhole's port: %v", berr) {
-		return
-	}
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
-	defer cache.destroy(answers)
-	cfg: config.Config
-	s := stale_server(&cfg, answers, nil)
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 400 * time.Millisecond
 	// The escape hatch, and the only thing under test.
-	cfg.cache.stale_timeout = 0
-	cfg.upstream.servers = loopback_upstream(bound.port)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, 400 * time.Millisecond, stale_timeout = 0, looped = true) {
 		return
 	}
-	defer upstream.destroy_group(group)
-	s.group = group
-
-	tl: Test_Loop
-	start_test_loop(&tl)
-	joined := false
-	defer if !joined {
-		stop_test_loop(&tl)
-	}
-	s.loops = tl.loops[:]
-
-	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
-		return
-	}
+	defer stale_fixture_stop(&f)
 
 	begun := time.now()
-	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	waited := time.since(begun)
 
 	if !testing.expect(t, ok, "the stale answer went unserved") {
@@ -1261,7 +1005,7 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 		waited >= 360 * time.Millisecond,
 		"the client waited %v, which is not the %v upstream budget this setting asks it to wait",
 		waited,
-		time.Duration(cfg.upstream.attempts) * cfg.upstream.timeout,
+		time.Duration(f.cfg.upstream.attempts) * f.cfg.upstream.timeout,
 	)
 
 	served, serr := dns.decode_message(out, context.temp_allocator)
@@ -1270,17 +1014,15 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 	if testing.expect(t, len(served.answer) == 1, "the stale answer carried no record") {
 		testing.expect_value(t, served.answer[0].ttl, u32(cache.STALE_TTL))
 	}
-	counters := stats_of(&s)
+	counters := stats_of(&f.srv)
 	testing.expect_value(t, counters.cached, u64(1))
 	testing.expect_value(t, counters.failed, u64(0))
-	testing.expect_value(t, cache.stats(answers).stale, u64(1))
+	testing.expect_value(t, cache.stats(f.answers).stale, u64(1))
 
 	// Nothing was ever submitted, so this stops an idle loop; the count behind
 	// it is the one attempt this thread made for itself.
-	stop_test_loop(&tl)
-	joined = true
-	s.loops = nil
-	testing.expect_value(t, drain_datagrams(hole), 1)
+	stale_fixture_join(&f)
+	testing.expect_value(t, drain_datagrams(f.socket), 1)
 	free_all(context.temp_allocator)
 }
 
@@ -1403,11 +1145,7 @@ from configuration here is a mixed-case query blocked in that deployment.
 */
 @(test)
 test_mixed_case_query_is_answered_by_a_wildcard_rewrite :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-
+	cfg := test_config()
 	cfg.rewrites = make([]config.Rewrite, 1, context.temp_allocator)
 	cfg.rewrites[0] = config.Rewrite {
 		domain   = "lan.",
@@ -1420,20 +1158,7 @@ test_mixed_case_query_is_answered_by_a_wildcard_rewrite :: proc(t: ^testing.T) {
 		cfg = &cfg,
 	}
 
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = "HOST.LaN.",
-		type  = .A,
-		class = .IN,
-	}
-	query := dns.Message {
-		id       = 0x4d21,
-		question = questions,
-	}
-	wire, _, enc := dns.encode_message(query, context.temp_allocator)
-	testing.expect_value(t, enc, dns.Encode_Error.None)
-
-	out, outcome, ok := handle_query(&s, wire, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, test_query("HOST.LaN.", id = 0x4d21, rd = false), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if !testing.expect(t, ok, "a mixed-case query under a wildcard rewrite went unanswered") {
 		return
 	}

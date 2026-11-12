@@ -41,30 +41,6 @@ Superseded_Case :: struct {
 	rebind: bool,
 }
 
-// The question and `answer`, under `rcode`.
-@(private = "file")
-superseded_reply :: proc(rcode: dns.Rcode, answer: ..dns.Record) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = STALE_NAME, type = .A, class = .IN}
-	records := make([]dns.Record, len(answer), context.temp_allocator)
-	copy(records, answer)
-	msg := dns.Message{question = question, answer = records}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	dns.set_rcode(&msg, rcode)
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-@(private = "file")
-superseded_a :: proc(name: string, addr: [4]u8, ttl: u32) -> dns.Record {
-	return dns.Record{name = name, type = .A, class = .IN, ttl = ttl, data = dns.Rdata_A{addr = addr}}
-}
-
 // `wire` with one additional record whose RDLENGTH runs past the end, so only
 // the sections up to the answer decode.
 @(private = "file")
@@ -94,104 +70,100 @@ superseded_lapsed_rrsig :: proc() -> dns.Record {
 superseded_cases :: proc() -> []Superseded_Case {
 	tracker :: "tracker.evil.example."
 	chain := dns.Record{name = STALE_NAME, type = .CNAME, class = .IN, data = dns.Rdata_Name{name = tracker}}
+	private := a_record(STALE_NAME, {10, 0, 0, 1}, 300)
 	cases := make([]Superseded_Case, 14, context.temp_allocator)
-	cases[0] = {"a TTL-0 answer", superseded_reply(.No_Error, superseded_a(STALE_NAME, LIVE_ADDR, 0)), false, "", false}
-	cases[1] = {"a NODATA without a SOA", superseded_reply(.No_Error), false, "", false}
-	cases[2] = {"an NXDOMAIN without a SOA", superseded_reply(.NX_Domain), false, "", false}
-	cases[3] = {"a SERVFAIL", superseded_reply(.Serv_Fail), true, "", false}
-	cases[4] = {"a REFUSED", superseded_reply(.Refused), true, "", false}
+	cases[0] = {name = "a TTL-0 answer", reply = test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR, 0))}
+	cases[1] = {name = "a NODATA without a SOA", reply = test_reply(STALE_NAME, .A)}
+	cases[2] = {name = "an NXDOMAIN without a SOA", reply = test_reply(STALE_NAME, .A, rcode = .NX_Domain)}
+	cases[3] = {name = "a SERVFAIL", reply = test_reply(STALE_NAME, .A, rcode = .Serv_Fail), kept = true}
+	cases[4] = {name = "a REFUSED", reply = test_reply(STALE_NAME, .A, rcode = .Refused), kept = true}
 	cases[5] = {
-		"a TTL-0 chain to a listed name",
-		superseded_reply(.No_Error, chain, superseded_a(tracker, LIVE_ADDR, 0)),
-		false,
-		"tracker.evil.example",
-		false,
+		name  = "a TTL-0 chain to a listed name",
+		reply = test_reply(STALE_NAME, .A, chain, a_record(tracker, LIVE_ADDR, 0)),
+		block = "tracker.evil.example",
 	}
-	cases[6] = {"a private address", superseded_reply(.No_Error, superseded_a(STALE_NAME, {10, 0, 0, 1}, 300)), false, "", true}
+	cases[6] = {name = "a private address", reply = test_reply(STALE_NAME, .A, private), rebind = true}
 	// RFC 2308 section 2.1: a name error carries the chain and nothing else, so
 	// this one contradicts itself and is no answer to supersede anything with.
-	cases[7] = {"an NXDOMAIN carrying an address", superseded_reply(.NX_Domain, superseded_a(STALE_NAME, LIVE_ADDR, 300)), true, "", false}
-	cases[8] = {"an NXDOMAIN carrying a private address", superseded_reply(.NX_Domain, superseded_a(STALE_NAME, {10, 0, 0, 1}, 300)), true, "", true}
+	cases[7] = {
+		name  = "an NXDOMAIN carrying an address",
+		reply = test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR, 300), rcode = .NX_Domain),
+		kept  = true,
+	}
+	cases[8] = {
+		name   = "an NXDOMAIN carrying a private address",
+		reply  = test_reply(STALE_NAME, .A, private, rcode = .NX_Domain),
+		kept   = true,
+		rebind = true,
+	}
 	// Neither is read in full, which is no answer to supersede anything with.
-	cases[9] = {"a TTL-0 answer with junk after it", superseded_junk(superseded_reply(.No_Error, superseded_a(STALE_NAME, LIVE_ADDR, 0))), true, "", false}
-	cases[10] = {"a private address with junk after it", superseded_junk(superseded_reply(.No_Error, superseded_a(STALE_NAME, {10, 0, 0, 1}, 300))), true, "", true}
+	cases[9] = {
+		name  = "a TTL-0 answer with junk after it",
+		reply = superseded_junk(test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR, 0))),
+		kept  = true,
+	}
+	cases[10] = {
+		name   = "a private address with junk after it",
+		reply  = superseded_junk(test_reply(STALE_NAME, .A, private)),
+		kept   = true,
+		rebind = true,
+	}
 	// RFC 4034 section 3.1.5: not to be used, so no answer either.
 	cases[11] = {
-		"a private address whose signature lapsed",
-		superseded_reply(.No_Error, superseded_a(STALE_NAME, {10, 0, 0, 1}, 300), superseded_lapsed_rrsig()),
-		true,
-		"",
-		true,
+		name   = "a private address whose signature lapsed",
+		reply  = test_reply(STALE_NAME, .A, private, superseded_lapsed_rrsig()),
+		kept   = true,
+		rebind = true,
 	}
 	// An answer section with nothing at the question name answers nothing
 	// that was asked, which the cache reads as a denial and rebind refuses.
-	cases[12] = {"a NOERROR about another name", superseded_reply(.No_Error, superseded_a("other.example.", LIVE_ADDR, 300)), true, "", false}
-	cases[13] = {"a private address at another name", superseded_reply(.No_Error, superseded_a("other.example.", {10, 0, 0, 1}, 300)), true, "", true}
+	cases[12] = {
+		name  = "a NOERROR about another name",
+		reply = test_reply(STALE_NAME, .A, a_record("other.example.", LIVE_ADDR, 300)),
+		kept  = true,
+	}
+	cases[13] = {
+		name   = "a private address at another name",
+		reply  = test_reply(STALE_NAME, .A, a_record("other.example.", {10, 0, 0, 1}, 300)),
+		kept   = true,
+		rebind = true,
+	}
 	return cases
 }
 
 @(private = "file")
 run_superseded :: proc(t: ^testing.T, c: Superseded_Case, detached: bool) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return
-	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		return
-	}
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
-	defer cache.destroy(answers)
-	cfg: config.Config
-	s := stale_server(&cfg, answers, nil)
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 5 * time.Second
-	cfg.cache.stale_timeout = 100 * time.Millisecond
-	cfg.upstream.servers = loopback_upstream(bound.port)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s.group = group
+	// Made before the fixture so it is destroyed after it: the loop stops first,
+	// and a refresh still on it reads the filters.
+	engine: ^filter.Engine
 	if c.block != "" {
-		engine := filter.engine_make()
+		engine = filter.engine_make()
 		block := filter.set_make()
 		filter.set_add(block, c.block, {.Apex, .Subdomains})
 		filter.engine_swap(engine, block, filter.set_make())
-		cfg.blocking.enabled = true
-		s.filters = engine
 	}
-	cfg.rebind.enabled = c.rebind
-	defer if s.filters != nil {
-		filter.engine_destroy(s.filters)
+	defer if engine != nil {
+		filter.engine_destroy(engine)
 	}
-	tl: Test_Loop
-	if detached {
-		start_test_loop(&tl)
-		s.loops = tl.loops[:]
-	}
-	defer stop_test_loop(&tl)
-
-	if !testing.expect(t, cache_an_answer(answers, expired = true), "the answer was not cached") {
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, 5 * time.Second, stale_timeout = 100 * time.Millisecond, looped = detached) {
 		return
 	}
+	defer stale_fixture_stop(&f)
+	f.srv.filters = engine
+	f.cfg.blocking.enabled = engine != nil
+	f.cfg.rebind.enabled = c.rebind
 
 	// On the detached road the reply waits for the client to have been lent
 	// the copy, so it reaches the cache alone; prompt where the client waits.
 	lent: sync.Sema
 	x := Stale_Exchange {
-		socket = socket,
+		socket = f.socket,
 		reply  = c.reply,
 		hold   = &lent if detached else nil,
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
-	_, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	_, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	sync.sema_post(&lent)
 	thread.join(mock)
 	thread.destroy(mock)
@@ -203,13 +175,10 @@ run_superseded :: proc(t: ^testing.T, c: Superseded_Case, detached: bool) {
 	if detached {
 		testing.expectf(t, outcome == .Cached, "%s: the client was not lent the copy (%v)", c.name, outcome)
 		// Joined, not slept on: the store happens on the refresh's way out.
-		stop_test_loop(&tl)
-		s.loops = nil
+		stale_fixture_join(&f)
 	}
 
-	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	_, hit, found := cache.get(answers, key, context.temp_allocator)
+	_, hit, found := stale_get(f.answers)
 	if c.kept {
 		testing.expectf(t, found && hit.stale, "%s (detached=%v): the expired copy was dropped", c.name, detached)
 	} else {
@@ -288,8 +257,8 @@ reached.
 */
 @(test)
 test_a_truncated_reply_keeps_the_stale_copy :: proc(t: ^testing.T) {
-	run_truncated(t, superseded_reply(.No_Error, superseded_a(STALE_NAME, LIVE_ADDR, 0)), false)
-	run_truncated(t, superseded_reply(.No_Error, superseded_a(STALE_NAME, {10, 0, 0, 1}, 300)), true)
+	run_truncated(t, test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR, 0)), false)
+	run_truncated(t, test_reply(STALE_NAME, .A, a_record(STALE_NAME, {10, 0, 0, 1}, 300)), true)
 	free_all(context.temp_allocator)
 }
 
@@ -303,20 +272,21 @@ run_truncated :: proc(t: ^testing.T, reply: []u8, rebind: bool) {
 	// Bounds the accept, so a resolver that never connects fails the test
 	// rather than hanging the join.
 	_ = net.set_option(listener, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, _ := net.bound_endpoint(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
 
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
 	defer cache.destroy(answers)
 	cfg: config.Config
 	s := stale_server(&cfg, answers, nil)
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
 	cfg.upstream.timeout = 5 * time.Second
 	cfg.rebind.enabled = rebind
 	servers := loopback_upstream(bound.port)
 	servers[0].kind = .TCP
 	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -342,8 +312,6 @@ run_truncated :: proc(t: ^testing.T, reply: []u8, rebind: bool) {
 		testing.expect(t, out[2] & 0x02 != 0, "the reply that came back was not truncated")
 	}
 
-	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	_, hit, found := cache.get(answers, key, context.temp_allocator)
+	_, hit, found := stale_get(answers)
 	testing.expectf(t, found && hit.stale, "rebind=%v: a truncated reply dropped the expired copy", rebind)
 }

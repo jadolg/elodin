@@ -92,14 +92,8 @@ send_request :: proc(s: ^Sender) {
 		return
 	}
 	defer net.close(socket)
-	sent := 0
-	raw := transmute([]u8)s.request
-	for sent < len(raw) {
-		n, serr := net.send_tcp(socket, raw[sent:])
-		if serr != nil || n <= 0 {
-			return
-		}
-		sent += n
+	if _, serr := net.send_tcp(socket, transmute([]u8)s.request); serr != nil {
+		return
 	}
 	// Held open until the reader has had its turn; closing here would race the
 	// body read.
@@ -109,7 +103,7 @@ send_request :: proc(s: ^Sender) {
 /*
 A request whose headers outgrow the reader's buffer must still parse.
 
-The buffer starts at 4096 bytes, and MAX_HEADER_BYTES allows four times that,
+The buffer starts at `HTTP_BUF_SIZE`, and MAX_HEADER_BYTES allows four times that,
 so a request with a few kilobytes of headers - which any client is free to send
 - grows it after the request line has already been sliced up.
 */
@@ -135,17 +129,11 @@ test_doh_request_survives_a_buffer_that_grows :: proc(t: ^testing.T) {
 	strings.write_string(&b, "Content-Length: 4\r\n\r\nabcd")
 	request := strings.to_string(b)
 
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+	listener, bound, lok := loopback_listener(t)
+	if !lok {
 		return
 	}
 	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
 	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
 
 	sender := Sender {
@@ -186,7 +174,7 @@ test_doh_request_survives_a_buffer_that_grows :: proc(t: ^testing.T) {
 
 	r := Http_Reader {
 		conn = Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}},
-		buf  = make([dynamic]u8, 0, 4096, context.temp_allocator),
+		buf  = make([dynamic]u8, 0, HTTP_BUF_SIZE, context.temp_allocator),
 	}
 	defer delete(r.buf)
 
@@ -224,47 +212,22 @@ rather than only past a header line.
 */
 @(test)
 test_doh_answers_a_pipelined_pair :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return
 	}
 	defer net.close(client)
+	defer net.close(accepted)
 
 	// A few hundred bytes, so both requests are in flight before the server
 	// reads anything and the second arrives in the same read as the first.
 	pipelined :=
 		"POST /not-served HTTP/1.1\r\nHost: dns.example\r\nContent-Length: 4\r\n\r\nabcd" +
 		"GET /not-served HTTP/1.1\r\nHost: dns.example\r\n\r\n"
-	sent := 0
-	raw := transmute([]u8)pipelined
-	for sent < len(raw) {
-		n, serr := net.send_tcp(client, raw[sent:])
-		if serr != nil || n <= 0 {
-			testing.expectf(t, false, "cannot send the requests: %v", serr)
-			return
-		}
-		sent += n
-	}
-
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
+	if _, serr := net.send_tcp(client, transmute([]u8)pipelined); !testing.expectf(t, serr == nil, "cannot send the requests: %v", serr) {
 		return
 	}
-	defer net.close(accepted)
+
 	// Nothing follows the pair, so the handler ends on this rather than on a
 	// close: it stands in for `client_timeout` on a connection kept open.
 	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
@@ -275,18 +238,8 @@ test_doh_answers_a_pipelined_pair :: proc(t: ^testing.T) {
 	}
 	serve_doh(&s, Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}}, "test")
 
-	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
-	answers := strings.builder_make(context.temp_allocator)
-	for {
-		chunk: [4096]u8
-		n, rerr := net.recv_tcp(client, chunk[:])
-		if rerr != nil || n <= 0 {
-			break
-		}
-		strings.write_bytes(&answers, chunk[:n])
-	}
-
-	testing.expect_value(t, strings.count(strings.to_string(answers), "HTTP/1.1 404"), 2)
+	answers, _ := read_until_close(client, 500 * time.Millisecond)
+	testing.expect_value(t, strings.count(answers, "HTTP/1.1 404"), 2)
 	free_all(context.temp_allocator)
 }
 
@@ -315,17 +268,11 @@ test_doh_reader_gives_back_an_oversized_buffer :: proc(t: ^testing.T) {
 		strings.write_byte(&b, 'q')
 	}
 
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+	listener, bound, lok := loopback_listener(t)
+	if !lok {
 		return
 	}
 	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
 
 	// On its own thread, so the test does not depend on the socket buffers
 	// holding all 64 KiB: the send may only finish as the read below drains it.
@@ -366,17 +313,6 @@ test_doh_reader_gives_back_an_oversized_buffer :: proc(t: ^testing.T) {
 	testing.expect_value(t, cap(r.buf), HTTP_BUF_SIZE)
 }
 
-@(private = "file")
-Doh_Session :: struct {
-	server: ^Server,
-	conn:   Conn,
-}
-
-@(private = "file")
-run_serve_doh :: proc(d: ^Doh_Session) {
-	serve_doh(d.server, d.conn, "test")
-}
-
 /*
 The half of the next request that has already arrived is still the front of it.
 
@@ -392,30 +328,11 @@ takes the whole of one request and the beginning of the next.
 */
 @(test)
 test_doh_answers_a_request_that_arrives_split :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return
 	}
 	defer net.close(client)
-
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return
-	}
 	defer net.close(accepted)
 	// Longer than the pause below, so the handler waits for the rest of the
 	// second request rather than timing out on it.
@@ -436,19 +353,19 @@ test_doh_answers_a_request_that_arrives_split :: proc(t: ^testing.T) {
 	}
 
 	// The first request and the request line of the second, cut mid-target.
-	if !send_all(t, client, "GET /not-served HTTP/1.1\r\nHost: dns.example\r\n\r\nGET /not-se") {
+	if _, serr := net.send_tcp(client, transmute([]u8)string("GET /not-served HTTP/1.1\r\nHost: dns.example\r\n\r\nGET /not-se")); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		net.shutdown(client, .Send)
 		return
 	}
 	time.sleep(200 * time.Millisecond)
 	// And cut again between a CR and its LF: `http_line` refuses a bare CR, and
 	// a CR that is only the last byte read so far is not one (#432).
-	if !send_all(t, client, "rved HTTP/1.1\r\nHost: dns.example\r") {
+	if _, serr := net.send_tcp(client, transmute([]u8)string("rved HTTP/1.1\r\nHost: dns.example\r")); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		net.shutdown(client, .Send)
 		return
 	}
 	time.sleep(200 * time.Millisecond)
-	if !send_all(t, client, "\n\r\n") {
+	if _, serr := net.send_tcp(client, transmute([]u8)string("\n\r\n")); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		net.shutdown(client, .Send)
 		return
 	}
@@ -491,36 +408,18 @@ afterwards would not answer 429 here at all.
 */
 @(test)
 test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return
 	}
 	defer net.close(client)
+	defer net.close(accepted)
 
 	// A bare 12-byte DNS header, which is the shortest thing the endpoint takes
 	// for a query and enough to get past the length check ahead of the charge.
 	body := strings.builder_make(context.temp_allocator)
-	strings.write_string(&body, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
-	strings.write_string(&body, "Content-Type: application/dns-message\r\nContent-Length: ")
-	strings.write_int(&body, dns.HEADER_SIZE)
-	strings.write_string(&body, "\r\n\r\n")
-	for _ in 0 ..< dns.HEADER_SIZE {
-		strings.write_byte(&body, 0)
-	}
-	if !send_all(t, client, strings.to_string(body)) {
+	write_doh_post(&body, make([]u8, dns.HEADER_SIZE, context.temp_allocator))
+	if _, serr := net.send_tcp(client, body.buf[:]); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		return
 	}
 	// The refusal keeps the connection, so what ends `serve_doh` is the end of the
@@ -528,52 +427,15 @@ test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
 	// request until the receive timeout below.
 	net.shutdown(client, .Send)
 
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return
-	}
-	defer net.close(accepted)
 	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
 
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	s := Server {
-		cfg = &cfg,
-	}
-	// One response a second, so the pool holds two and both are spent below.
-	// Spent through `stream_rate_check`, because the stream pool is the one a DoH
-	// request is charged to and datagrams cannot empty it - see `Rate_Class`. The
-	// slip is on, which a connection must not use either way.
-	s.limiter = make_rate_limiter(1, 2)
+	cfg: config.Config
+	s, peer := spent_limiter_server(t, &cfg)
 	defer destroy_rate_limiter(s.limiter)
-
-	peer := net.Endpoint {
-		address = net.IP4_Loopback,
-		port    = 40000,
-	}
-	for _ in 0 ..< RRL_BURST_SECONDS {
-		testing.expect(
-			t,
-			stream_rate_check(s.limiter, peer, time.tick_now()),
-			"the stream budget refused a query it had room for",
-		)
-	}
 
 	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")
 
-	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
-	answer := strings.builder_make(context.temp_allocator)
-	for {
-		chunk: [4096]u8
-		n, rerr := net.recv_tcp(client, chunk[:])
-		if rerr != nil || n <= 0 {
-			break
-		}
-		strings.write_bytes(&answer, chunk[:n])
-	}
-
-	head := strings.to_string(answer)
+	head, _ := read_until_close(client, 500 * time.Millisecond)
 	testing.expect(t, strings.contains(head, "HTTP/1.1 429"), "an over-budget query was not answered 429")
 	testing.expect(
 		t,
@@ -618,85 +480,34 @@ The client shuts its send side down after writing, which is what ends
 */
 @(test)
 test_doh_keeps_the_connection_after_a_429 :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return
 	}
 	defer net.close(client)
+	defer net.close(accepted)
 
 	body := strings.builder_make(context.temp_allocator)
 	for _ in 0 ..< 2 {
-		strings.write_string(&body, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
-		strings.write_string(&body, "Content-Type: application/dns-message\r\nContent-Length: ")
-		strings.write_int(&body, dns.HEADER_SIZE)
-		strings.write_string(&body, "\r\n\r\n")
-		for _ in 0 ..< dns.HEADER_SIZE {
-			strings.write_byte(&body, 0)
-		}
+		write_doh_post(&body, make([]u8, dns.HEADER_SIZE, context.temp_allocator))
 	}
-	if !send_all(t, client, strings.to_string(body)) {
+	if _, serr := net.send_tcp(client, body.buf[:]); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		return
 	}
 	net.shutdown(client, .Send)
 
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return
-	}
-	defer net.close(accepted)
 	// Longer than the handler should need for either request, so that a
 	// regression that goes back to closing shows up as a missing second refusal
 	// rather than as a read this test gave up on.
 	_ = net.set_option(accepted, .Receive_Timeout, 2 * time.Second)
 
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	s := Server {
-		cfg = &cfg,
-	}
-	s.limiter = make_rate_limiter(1, 2)
+	cfg: config.Config
+	s, peer := spent_limiter_server(t, &cfg)
 	defer destroy_rate_limiter(s.limiter)
-
-	peer := net.Endpoint {
-		address = net.IP4_Loopback,
-		port    = 40002,
-	}
-	for _ in 0 ..< RRL_BURST_SECONDS {
-		testing.expect(
-			t,
-			stream_rate_check(s.limiter, peer, time.tick_now()),
-			"the stream budget refused a query it had room for",
-		)
-	}
 
 	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")
 
-	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
-	answer := strings.builder_make(context.temp_allocator)
-	for {
-		chunk: [4096]u8
-		n, rerr := net.recv_tcp(client, chunk[:])
-		if rerr != nil || n <= 0 {
-			break
-		}
-		strings.write_bytes(&answer, chunk[:n])
-	}
-
-	head := strings.to_string(answer)
+	head, _ := read_until_close(client, 500 * time.Millisecond)
 	testing.expectf(
 		t,
 		strings.count(head, "HTTP/1.1 429") == 2,
@@ -735,66 +546,26 @@ close to turn into an RST.
 */
 @(test)
 test_doh_429_honours_connection_close :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return
 	}
 	defer net.close(client)
+	defer net.close(accepted)
 
 	body := strings.builder_make(context.temp_allocator)
-	strings.write_string(&body, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\nConnection: close\r\n")
-	strings.write_string(&body, "Content-Type: application/dns-message\r\nContent-Length: ")
-	strings.write_int(&body, dns.HEADER_SIZE)
-	strings.write_string(&body, "\r\n\r\n")
-	for _ in 0 ..< dns.HEADER_SIZE {
-		strings.write_byte(&body, 0)
-	}
-	if !send_all(t, client, strings.to_string(body)) {
+	write_doh_post(&body, make([]u8, dns.HEADER_SIZE, context.temp_allocator), "Connection: close\r\n")
+	if _, serr := net.send_tcp(client, body.buf[:]); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		return
 	}
 
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return
-	}
-	defer net.close(accepted)
 	// Longer than the handler should take, so a regression that reads on shows up
 	// as a slow `serve_doh` rather than as a read that gave up on the request.
 	_ = net.set_option(accepted, .Receive_Timeout, 2 * time.Second)
 
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	s := Server {
-		cfg = &cfg,
-	}
-	s.limiter = make_rate_limiter(1, 2)
+	cfg: config.Config
+	s, peer := spent_limiter_server(t, &cfg)
 	defer destroy_rate_limiter(s.limiter)
-
-	peer := net.Endpoint {
-		address = net.IP4_Loopback,
-		port    = 40003,
-	}
-	for _ in 0 ..< RRL_BURST_SECONDS {
-		testing.expect(
-			t,
-			stream_rate_check(s.limiter, peer, time.tick_now()),
-			"the stream budget refused a query it had room for",
-		)
-	}
 
 	start := time.tick_now()
 	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")
@@ -807,18 +578,7 @@ test_doh_429_honours_connection_close :: proc(t: ^testing.T) {
 		spent,
 	)
 
-	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
-	answer := strings.builder_make(context.temp_allocator)
-	for {
-		chunk: [4096]u8
-		n, rerr := net.recv_tcp(client, chunk[:])
-		if rerr != nil || n <= 0 {
-			break
-		}
-		strings.write_bytes(&answer, chunk[:n])
-	}
-
-	head := strings.to_string(answer)
+	head, _ := read_until_close(client, 500 * time.Millisecond)
 	testing.expect(t, strings.contains(head, "HTTP/1.1 429"), "an over-budget query was not answered 429")
 	testing.expect(
 		t,
@@ -828,19 +588,37 @@ test_doh_429_honours_connection_close :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// A DoH POST of `body` to /dns-query, with `extra` header lines after Host.
 @(private = "file")
-send_all :: proc(t: ^testing.T, socket: net.TCP_Socket, raw: string) -> bool {
-	sent := 0
-	bytes := transmute([]u8)raw
-	for sent < len(bytes) {
-		n, err := net.send_tcp(socket, bytes[sent:])
-		if err != nil || n <= 0 {
-			testing.expectf(t, false, "cannot send: %v", err)
-			return false
-		}
-		sent += n
+write_doh_post :: proc(b: ^strings.Builder, body: []u8, extra := "") {
+	strings.write_string(b, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
+	strings.write_string(b, extra)
+	strings.write_string(b, "Content-Type: application/dns-message\r\nContent-Length: ")
+	strings.write_int(b, len(body))
+	strings.write_string(b, "\r\n\r\n")
+	strings.write_bytes(b, body)
+}
+
+/*
+A DoH server on `cfg` whose one client, `peer`, has already spent its stream
+budget: one response a second, so the pool holds two and both are spent here.
+The slip is on, which a connection must not use either way. The limiter is the
+caller's to destroy.
+*/
+@(private = "file")
+spent_limiter_server :: proc(t: ^testing.T, cfg: ^config.Config, loc := #caller_location) -> (s: Server, peer: net.Endpoint) {
+	cfg^ = config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	s = Server {
+		cfg     = cfg,
+		limiter = make_rate_limiter(1, 2),
 	}
-	return true
+	peer = net.Endpoint {
+		address = net.IP4_Loopback,
+		port    = 40000,
+	}
+	spend_stream_budget(t, s.limiter, peer, loc)
+	return s, peer
 }
 
 /*
@@ -865,49 +643,24 @@ read_request_over_loopback :: proc(
 	status: int,
 	parsed, ok: bool,
 ) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "%s: cannot listen on loopback: %v", what, lerr)
-		return {}, 0, false, false
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "%s: cannot read the bound port: %v", what, berr)
-		return {}, 0, false, false
-	}
-
 	// A few hundred bytes, so the whole request fits in the socket buffer and
 	// this side never has to interleave sending with the reading below.
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "%s: cannot dial the listener: %v", what, derr)
-		return {}, 0, false, false
-	}
-	sent := 0
-	bytes := transmute([]u8)raw
-	for sent < len(bytes) {
-		n, serr := net.send_tcp(client, bytes[sent:])
-		if serr != nil || n <= 0 {
-			net.close(client)
-			testing.expectf(t, false, "%s: cannot send the request: %v", what, serr)
-			return {}, 0, false, false
-		}
-		sent += n
-	}
-	net.close(client)
-
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "%s: nothing connected: %v", what, aerr)
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
+		testing.expectf(t, false, "%s: no loopback connection", what)
 		return {}, 0, false, false
 	}
 	defer net.close(accepted)
+	_, serr := net.send_tcp(client, transmute([]u8)raw)
+	net.close(client)
+	if !testing.expectf(t, serr == nil, "%s: cannot send the request: %v", what, serr) {
+		return {}, 0, false, false
+	}
 	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
 
 	r := Http_Reader {
 		conn = Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}},
-		buf  = make([dynamic]u8, 0, 4096, context.temp_allocator),
+		buf  = make([dynamic]u8, 0, HTTP_BUF_SIZE, context.temp_allocator),
 	}
 	req, status, parsed = read_http_request(&r)
 	return req, status, parsed, true
@@ -1161,10 +914,13 @@ test_content_length_over_the_limit_is_a_413 :: proc(t: ^testing.T) {
 
 	HOST :: "Host: dns.example\r\n"
 	OVER :: "Content-Length: 100000\r\n"
+	// On the stack: the loop below frees the temp allocator after every case.
+	just_over_buf: [64]u8
+	just_over := fmt.bprintf(just_over_buf[:], "Content-Length: %d\r\n", MAX_DOH_BODY + 1)
 
 	CASES := []Case {
 		{"POST", HOST, OVER, 413, "a length well past the limit"},
-		{"POST", HOST, "Content-Length: 65536\r\n", 413, "one byte past the limit"},
+		{"POST", HOST, just_over, 413, "one byte past the limit"},
 		// 2^64 + 4, which a wrapping parser reads as 4: still digits, still too large.
 		{"POST", HOST, "Content-Length: 18446744073709551620\r\n", 413, "a length past 64 bits"},
 		{"HEAD", HOST, OVER, 413, "a HEAD, which keeps its method for the reply"},
@@ -1196,6 +952,17 @@ test_content_length_over_the_limit_is_a_413 :: proc(t: ^testing.T) {
 	testing.expect_value(t, http_refusal_message(413), "content too large")
 }
 
+// The size of the body `junk_head` declares.
+@(private = "file")
+JUNK_BODY :: 16 * 1024
+
+// A POST whose request line is refused on its `JUNK` version, before the reader
+// has looked at the `Content-Length` that says `JUNK_BODY` bytes follow.
+@(private = "file")
+junk_head :: proc() -> string {
+	return fmt.tprintf("POST /dns-query JUNK\r\nHost: dns.example\r\nContent-Length: %d\r\n\r\n", JUNK_BODY)
+}
+
 /*
 A refusal reaches the client even when the request that earned it went on past
 what the reader read.
@@ -1217,52 +984,25 @@ end of the data instead of on its timeout, and can still read afterwards.
 */
 @(test)
 test_a_refusal_outlives_the_close_that_follows_it :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+	// `accepted` is closed by hand, ahead of the client's read.
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return
 	}
 	defer net.close(client)
 	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
 
-	UNREAD :: 16 * 1024
 	b := strings.builder_make(context.temp_allocator)
-	strings.write_string(&b, "POST /dns-query JUNK\r\nHost: dns.example\r\nContent-Length: ")
-	strings.write_int(&b, UNREAD)
-	strings.write_string(&b, "\r\n\r\n")
-	for _ in 0 ..< UNREAD {
+	strings.write_string(&b, junk_head())
+	for _ in 0 ..< JUNK_BODY {
 		strings.write_byte(&b, 'x')
 	}
-	request := transmute([]u8)strings.to_string(b)
-
-	sent := 0
-	for sent < len(request) {
-		n, serr := net.send_tcp(client, request[sent:])
-		if serr != nil || n <= 0 {
-			testing.expectf(t, false, "cannot send the request: %v", serr)
-			return
-		}
-		sent += n
+	if _, serr := net.send_tcp(client, b.buf[:]); !testing.expectf(t, serr == nil, "cannot send the request: %v", serr) {
+		net.close(accepted)
+		return
 	}
 	_ = net.shutdown(client, .Send)
 
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return
-	}
 	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
 	conn := Conn {
 		socket = accepted,
@@ -1270,12 +1010,12 @@ test_a_refusal_outlives_the_close_that_follows_it :: proc(t: ^testing.T) {
 
 	r := Http_Reader {
 		conn = conn,
-		buf  = make([dynamic]u8, 0, 4096, context.temp_allocator),
+		buf  = make([dynamic]u8, 0, HTTP_BUF_SIZE, context.temp_allocator),
 	}
 	_, status, parsed := read_http_request(&r)
 	testing.expect(t, !parsed, "a JUNK version was accepted")
 	testing.expectf(t, status == 400, "answered %d, expected 400", status)
-	testing.expect(t, len(r.buf) - r.pos < UNREAD, "the whole body was read, so nothing is left for the close")
+	testing.expect(t, len(r.buf) - r.pos < JUNK_BODY, "the whole body was read, so nothing is left for the close")
 
 	// What `serve_doh` does with a refused request, in the order it does it: the
 	// answer, the drain, the close. Its return value is `keep_alive`, which is
@@ -1338,45 +1078,18 @@ test_a_200_writes_its_fields_in_one_order :: proc(t: ^testing.T) {
 			"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nCache-Control: no-store\r\nDate: D\r\nServer: elodin/" + VERSION + "\r\nConnection: close\r\n\r\n",
 		},
 	}
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
 	for c in cases {
-		client, derr := net.dial_tcp_from_endpoint(bound)
-		if derr != nil {
-			testing.expectf(t, false, "cannot dial the listener: %v", derr)
+		client, accepted, paired := loopback_tcp_pair(t)
+		if !paired {
 			return
 		}
 		defer net.close(client)
-		_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
-		accepted, _, aerr := net.accept_tcp(listener)
-		if aerr != nil {
-			testing.expectf(t, false, "nothing connected: %v", aerr)
-			return
-		}
 		written := send_http_ok(Conn{socket = accepted}, c.content_type, transmute([]u8)c.body, c.keep_alive, c.field, c.value, c.head)
 		net.close(accepted)
 		testing.expect(t, written, "the 200 was not written")
 
-		reply := make([dynamic]u8, 0, 512, context.temp_allocator)
-		for {
-			chunk: [512]u8
-			n, rerr := net.recv_tcp(client, chunk[:])
-			if rerr != nil || n == 0 {
-				break
-			}
-			append(&reply, ..chunk[:n])
-		}
 		// The date is the clock's; `http_date` has a test of its own.
-		got := string(reply[:])
+		got, _ := read_until_close(client, 3 * time.Second)
 		if at := strings.index(got, "\r\nDate: "); at >= 0 {
 			end := strings.index(got[at + 2:], "\r\n")
 			if end >= 0 {
@@ -1419,15 +1132,7 @@ send_late_body :: proc(lb: ^Late_Body) {
 	sync.sema_post(&lb.ready)
 	sync.sema_wait(&lb.go)
 	time.sleep(lb.delay)
-	sent := 0
-	raw := transmute([]u8)lb.body
-	for sent < len(raw) {
-		n, err := net.send_tcp(lb.socket, raw[sent:])
-		if err != nil || n <= 0 {
-			return
-		}
-		sent += n
-	}
+	_, _ = net.send_tcp(lb.socket, transmute([]u8)lb.body)
 }
 
 /*
@@ -1478,21 +1183,9 @@ drain.
 */
 @(test)
 test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+	// `accepted` is closed by hand, ahead of the client's read.
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return
 	}
 	defer net.close(client)
@@ -1506,27 +1199,19 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	// The head alone. A `JUNK` version is refused on the request line, which is
 	// before `read_http_request` has looked at the Content-Length that says the
 	// rest is coming.
-	LATE :: 16 * 1024
-	head := strings.builder_make(context.temp_allocator)
-	strings.write_string(&head, "POST /dns-query JUNK\r\nHost: dns.example\r\nContent-Length: ")
-	strings.write_int(&head, LATE)
-	strings.write_string(&head, "\r\n\r\n")
-	if !send_all(t, client, strings.to_string(head)) {
+	head := junk_head()
+	if _, serr := net.send_tcp(client, transmute([]u8)head); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
+		net.close(accepted)
 		return
 	}
 
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return
-	}
 	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
 	conn := Conn {
 		socket = accepted,
 	}
 
 	body := strings.builder_make(context.temp_allocator)
-	for _ in 0 ..< LATE {
+	for _ in 0 ..< JUNK_BODY {
 		strings.write_byte(&body, 'x')
 	}
 	/*
@@ -1550,7 +1235,7 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 
 	r := Http_Reader {
 		conn = conn,
-		buf  = make([dynamic]u8, 0, 4096, context.temp_allocator),
+		buf  = make([dynamic]u8, 0, HTTP_BUF_SIZE, context.temp_allocator),
 	}
 	_, status, parsed := read_http_request(&r)
 	testing.expect(t, !parsed, "a JUNK version was accepted")
@@ -1564,7 +1249,7 @@ test_a_refusal_outlives_a_body_that_is_still_arriving :: proc(t: ^testing.T) {
 	*/
 	testing.expectf(
 		t,
-		len(r.buf) - r.pos < len(strings.to_string(head)),
+		len(r.buf) - r.pos < len(head),
 		"%d bytes were left over, which is more than the head: the body arrived before the refusal, and this is the other test",
 		len(r.buf) - r.pos,
 	)
@@ -1783,15 +1468,11 @@ bounded only per read would still be collecting bytes when this case ends.
 */
 @(test)
 test_doh_reader_gives_up_on_a_drip_fed_request :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
+	listener, bound, lok := loopback_listener(t)
+	if !lok {
 		return
 	}
 	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr) {
-		return
-	}
 
 	// A request that would be read and answered if the whole of it ever arrived,
 	// so what ends the read is how it was sent and not what it says.
@@ -1868,28 +1549,11 @@ that, rather than when the peer stops.
 */
 @(test)
 test_doh_lets_go_of_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return
 	}
 	defer net.close(client)
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return
-	}
 	defer net.close(accepted)
 
 	peer := Wrong_Path_Peer {
@@ -1940,34 +1604,17 @@ The upstream here never answers, and gives up after 400ms against a 100ms
 */
 @(test)
 test_doh_a_slow_answer_does_not_count_against_the_connection :: proc(t: ^testing.T) {
-	upstream_socket, userr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, userr == nil, "cannot bind the mock upstream: %v", userr) {
+	upstream_socket, spec, mok := bind_mock(t)
+	if !mok {
 		return
 	}
 	defer net.close(upstream_socket)
-	upstream_bound, ubound_err := net.bound_endpoint(upstream_socket)
-	if !testing.expectf(t, ubound_err == nil, "cannot read the mock's port: %v", ubound_err) {
-		return
-	}
 
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.blocking.enabled = false
-	cfg.cache.enabled = false
+	cfg := test_config(loopback_upstream(spec.port))
 	cfg.listeners.doh.path = "/dns-query"
 	cfg.server.client_timeout = 100 * time.Millisecond
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
 	cfg.upstream.timeout = 400 * time.Millisecond
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = upstream_bound.port,
-	}
-	cfg.upstream.servers = servers
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return
 	}
@@ -1977,69 +1624,34 @@ test_doh_a_slow_answer_does_not_count_against_the_connection :: proc(t: ^testing
 		group = group,
 	}
 
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr) {
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if !testing.expectf(t, berr == nil, "cannot read the bound port: %v", berr) {
-		return
-	}
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if !testing.expectf(t, derr == nil, "cannot dial the listener: %v", derr) {
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return
 	}
 	defer net.close(client)
+	// Closed by hand below, ahead of the read; every return before that closes it
+	// too.
+	accepted_open := true
+	defer if accepted_open {
+		net.close(accepted)
+	}
 
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = "slow.example.",
-		type  = .A,
-		class = .IN,
-	}
-	msg := dns.Message {
-		id       = 0x5150,
-		question = questions,
-	}
-	msg.flags.rd = true
-	query, _, qerr := dns.encode_message(msg, context.temp_allocator)
-	if !testing.expect_value(t, qerr, dns.Encode_Error.None) {
-		return
-	}
 	req := strings.builder_make(context.temp_allocator)
-	strings.write_string(&req, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n")
-	strings.write_string(&req, "Content-Type: application/dns-message\r\nContent-Length: ")
-	strings.write_int(&req, len(query))
-	strings.write_string(&req, "\r\n\r\n")
-	strings.write_bytes(&req, query)
+	write_doh_post(&req, test_query("slow.example.", id = 0x5150))
 	strings.write_string(&req, "GET /not-served HTTP/1.1\r\nHost: dns.example\r\n\r\n")
-	if !send_all(t, client, strings.to_string(req)) {
+	if _, serr := net.send_tcp(client, req.buf[:]); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		return
 	}
 	// What ends `serve_doh` once both are answered.
 	net.shutdown(client, .Send)
 
-	accepted, peer, aerr := net.accept_tcp(listener)
-	if !testing.expectf(t, aerr == nil, "nothing connected: %v", aerr) {
-		return
-	}
-	// With its peer, which `server.allow_from` is read against per request.
-	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")
+	// From loopback, which `server.allow_from` is read against per request.
+	serve_doh(&s, Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}}, "test")
 	// Closed now so the read below ends at EOF, not at its timeout.
 	net.close(accepted)
+	accepted_open = false
 
-	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
-	answers := strings.builder_make(context.temp_allocator)
-	for {
-		chunk: [4096]u8
-		n, rerr := net.recv_tcp(client, chunk[:])
-		if rerr != nil || n <= 0 {
-			break
-		}
-		strings.write_bytes(&answers, chunk[:n])
-	}
-	got := strings.to_string(answers)
+	got, _ := read_until_close(client, 500 * time.Millisecond)
 	testing.expectf(t, strings.contains(got, "HTTP/1.1 200"), "the query went unanswered: %q", got)
 	testing.expectf(
 		t,
@@ -2293,20 +1905,9 @@ test_doh_a_held_connection_outside_the_allow_list_gets_nothing_but_403 :: proc(t
 	connection: a request for a path that is not the endpoint is refused 403,
 	not answered 404 - and the profile is not handed out either.
 	*/
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen: %v", lerr)
-		return
-	}
-	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
-	client, derr := net.dial_tcp_from_endpoint(bound)
-	if derr != nil {
-		testing.expectf(t, false, "cannot dial the listener: %v", derr)
+	// `accepted` is closed by hand, as the listener's connection job closes it.
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
 		return
 	}
 	defer net.close(client)
@@ -2322,15 +1923,11 @@ test_doh_a_held_connection_outside_the_allow_list_gets_nothing_but_403 :: proc(t
 		},
 		context.temp_allocator,
 	)
-	if !send_all(t, client, pipelined) {
+	if _, serr := net.send_tcp(client, transmute([]u8)pipelined); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
+		net.close(accepted)
 		return
 	}
 	net.shutdown(client, .Send)
-	accepted, _, aerr := net.accept_tcp(listener)
-	if aerr != nil {
-		testing.expectf(t, false, "nothing connected: %v", aerr)
-		return
-	}
 	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
 
 	cfg := config.default_config()
@@ -2343,19 +1940,7 @@ test_doh_a_held_connection_outside_the_allow_list_gets_nothing_but_403 :: proc(t
 	// What the listener's connection job does once `serve_doh` returns.
 	net.close(accepted)
 
-	_ = net.set_option(client, .Receive_Timeout, 500 * time.Millisecond)
-	answer := strings.builder_make(context.temp_allocator)
-	last: net.Network_Error
-	for {
-		chunk: [4096]u8
-		n, rerr := net.recv_tcp(client, chunk[:])
-		if rerr != nil || n <= 0 {
-			last = rerr
-			break
-		}
-		strings.write_bytes(&answer, chunk[:n])
-	}
-	head := strings.to_string(answer)
+	head, last := read_until_close(client, 500 * time.Millisecond)
 	// No bytes and no error is the FIN; an RST is an error, the 403 gone with it.
 	testing.expectf(t, last == nil, "the close was not graceful: %v", last)
 	testing.expect(t, strings.contains(head, "HTTP/1.1 403"), "a source outside the allow list was answered on another path")
@@ -2384,17 +1969,11 @@ test_doh_reader_stops_a_header_that_never_ends_within_one_read :: proc(t: ^testi
 		strings.write_byte(&b, 'a')
 	}
 
-	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if lerr != nil {
-		testing.expectf(t, false, "cannot listen on loopback: %v", lerr)
+	listener, bound, lok := loopback_listener(t)
+	if !lok {
 		return
 	}
 	defer net.close(listener)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the bound port: %v", berr)
-		return
-	}
 	sender := Sender {
 		endpoint = bound,
 		request  = strings.to_string(b),

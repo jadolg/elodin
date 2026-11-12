@@ -22,29 +22,6 @@ test is one this server chose on its own.
 @(private = "file")
 PADDED :: "padded.example."
 
-@(private = "file")
-padding_server :: proc(cfg: ^config.Config) -> Server {
-	cfg^ = config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.dnssec.enabled = false
-
-	answers := make([]config.Rewrite_Answer, 1, context.temp_allocator)
-	answers[0] = config.Rewrite_Answer {
-		kind = .A,
-		v4   = {192, 0, 2, 1},
-	}
-	rewrites := make([]config.Rewrite, 1, context.temp_allocator)
-	rewrites[0] = config.Rewrite {
-		domain  = PADDED,
-		answers = answers,
-		ttl     = 300,
-	}
-	cfg.rewrites = rewrites
-	return Server{cfg = cfg}
-}
-
 /*
 A query the way a padding client sends one: an OPT record, and the message
 rounded up to a multiple of 128 octets (RFC 8467 section 4.1).
@@ -54,25 +31,7 @@ EDNS client.
 */
 @(private = "file")
 padding_query :: proc(pad: bool) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = PADDED,
-		type  = .A,
-		class = .IN,
-	}
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(1232, false)
-
-	msg := dns.Message {
-		id         = 0x7f7f,
-		question   = questions,
-		additional = additional,
-	}
-	msg.flags.rd = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
+	wire := test_query(PADDED, id = 0x7f7f, opt = dns.make_opt(1232, false))
 	if !pad {
 		return wire
 	}
@@ -83,34 +42,11 @@ padding_query :: proc(pad: bool) -> []u8 {
 	return out
 }
 
-@(private = "file")
-answer_padding :: proc(wire: []u8) -> (data: []u8, found: bool) {
-	m, err := dns.decode_message(wire, context.temp_allocator)
-	if err != .None {
-		return nil, false
-	}
-	return dns.find_edns_option(m, .Padding)
-}
-
-@(private = "file")
-answers_the_rewrite :: proc(t: ^testing.T, wire: []u8) {
-	m, err := dns.decode_message(wire, context.temp_allocator)
-	if !testing.expectf(t, err == .None, "the padded answer does not decode: %v", err) {
-		return
-	}
-	if !testing.expect_value(t, len(m.answer), 1) {
-		return
-	}
-	a, is_a := m.answer[0].data.(dns.Rdata_A)
-	testing.expect(t, is_a, "the padded answer lost its A record")
-	testing.expect_value(t, a.addr, [4]u8{192, 0, 2, 1})
-}
-
 @(test)
 test_a_padded_query_is_answered_in_whole_blocks_on_the_encrypted_transports :: proc(t: ^testing.T) {
 	for proto in ([]Protocol{.DoT, .DoH}) {
 		cfg: config.Config
-		s := padding_server(&cfg)
+		s := rewrite_server(&cfg, PADDED)
 
 		query := padding_query(true)
 		if !testing.expect(t, query != nil, "could not build the padded query") {
@@ -132,7 +68,7 @@ test_a_padded_query_is_answered_in_whole_blocks_on_the_encrypted_transports :: p
 			len(out) % dns.PAD_RESPONSE_BLOCK,
 		)
 
-		data, found := answer_padding(out)
+		data, found := dns.peek_edns_option(out, .Padding)
 		testing.expectf(t, found, "%v: the answer carries no padding option", proto)
 		for b, i in data {
 			if !testing.expectf(t, b == 0, "%v: padding byte %d is %02x, not zero", proto, i, b) {
@@ -158,7 +94,7 @@ test_the_clear_transports_are_not_padded :: proc(t: ^testing.T) {
 	*/
 	for proto in ([]Protocol{.UDP, .TCP}) {
 		cfg: config.Config
-		s := padding_server(&cfg)
+		s := rewrite_server(&cfg, PADDED)
 
 		query := padding_query(true)
 		if !testing.expect(t, query != nil, "could not build the padded query") {
@@ -170,7 +106,7 @@ test_the_clear_transports_are_not_padded :: proc(t: ^testing.T) {
 			return
 		}
 
-		_, found := answer_padding(out)
+		_, found := dns.peek_edns_option(out, .Padding)
 		testing.expectf(t, !found, "%v: the answer came back padded", proto)
 		testing.expectf(
 			t,
@@ -191,7 +127,7 @@ test_a_client_that_did_not_ask_for_padding_is_not_padded :: proc(t: ^testing.T) 
 	// get 468 bytes because its transport happened to be encrypted.
 	for proto in ([]Protocol{.DoT, .DoH}) {
 		cfg: config.Config
-		s := padding_server(&cfg)
+		s := rewrite_server(&cfg, PADDED)
 
 		query := padding_query(false)
 		if !testing.expect(t, query != nil, "could not build the query") {
@@ -203,7 +139,7 @@ test_a_client_that_did_not_ask_for_padding_is_not_padded :: proc(t: ^testing.T) 
 			return
 		}
 
-		_, found := answer_padding(out)
+		_, found := dns.peek_edns_option(out, .Padding)
 		testing.expectf(t, !found, "%v: an unpadded client was handed padding", proto)
 
 		free_all(context.temp_allocator)

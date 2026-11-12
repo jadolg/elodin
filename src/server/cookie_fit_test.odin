@@ -40,11 +40,6 @@ CLIENT :: "198.51.100.100:9999"
 @(private = "file")
 SECRET :: "e5e973e5a6b2a43f48e7dc849e37bfcf"
 
-// The answer's OPT record before anything is written into it: a root owner name,
-// type, class, TTL and RDLENGTH.
-@(private = "file")
-OPT_LEN :: 11
-
 // Option header plus a 24-byte reply cookie, which is what `attach_cookie` adds.
 @(private = "file")
 COOKIE_OPTION_LEN :: 4 + COOKIE_REPLY_LEN
@@ -261,7 +256,7 @@ test_an_answer_over_the_buffer_is_truncated_and_keeps_its_opt :: proc(t: ^testin
 	if !testing.expect(t, len(stored) > 0, "the answer would not encode") {
 		return
 	}
-	if !testing.expectf(t, len(stored) > dns.MAX_UDP_SIZE + OPT_LEN, "the answer is only %d bytes", len(stored)) {
+	if !testing.expectf(t, len(stored) > dns.MAX_UDP_SIZE + OPT_RR_LEN, "the answer is only %d bytes", len(stored)) {
 		return
 	}
 
