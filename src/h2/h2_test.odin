@@ -1267,14 +1267,14 @@ Close_Hook :: struct {
 }
 
 /*
-Stands in for a handler thread completing `respond` inside the window
+Stands in for a handler's fiber completing `respond` inside the window
 `handle_data` leaves open between releasing `c.mu` after appending the body and
 re-acquiring it to record the stream's final state.
 
 `handle_data` reaches here through the WINDOW_UPDATE it writes for the bytes it
 just consumed, which is where the real race lands: `write_all` holds `c.mu` for
-the length of this call, so a `respond` running on a handler-pool worker would
-be parked on that mutex right here and would take it the moment this returns.
+the length of this call, so a `respond` running on a handler's fiber would be
+parked on that mutex right here and would take it the moment this returns.
 Retiring the stream inline reproduces that ordering without asking the scheduler
 to produce it.
 

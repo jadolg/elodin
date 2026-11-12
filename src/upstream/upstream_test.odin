@@ -4415,22 +4415,31 @@ test_an_idle_bound_holds_without_a_deadline :: proc(t: ^testing.T) {
 A path or host the request line cannot hold is refused before anything is sent
 (#438): a list url comes from config and a redirect's `Location` from whoever
 answered, and either would otherwise be written into the request line and `Host`
-verbatim. The mock answers 200 to anything, so a request that went out succeeds.
+verbatim. The method, `Accept` and `Content-Type` are written verbatim too, and
+are held to the same rule. The mock answers 200 to anything, so a request that
+went out succeeds.
 */
 @(test)
 test_a_request_line_holds_only_visible_ascii :: proc(t: ^testing.T) {
 	Case :: struct {
-		path, host: string,
+		path, host:   string,
+		method:       string,
+		accept:       string,
+		content_type: string,
 	}
 	cases := []Case {
-		{"/a b", "mock.invalid"},
-		{"/a\tb", "mock.invalid"},
-		{"/hosts.txt\r\nX-Injected: 1", "mock.invalid"},
-		{"/hösts.txt", "mock.invalid"},
-		{"/", "mock.invalid\r\nX-Injected: 1"},
-		{"/", "mock invalid"},
+		{"/a b", "mock.invalid", "GET", "", ""},
+		{"/a\tb", "mock.invalid", "GET", "", ""},
+		{"/hosts.txt\r\nX-Injected: 1", "mock.invalid", "GET", "", ""},
+		{"/hösts.txt", "mock.invalid", "GET", "", ""},
+		{"/", "mock.invalid\r\nX-Injected: 1", "GET", "", ""},
+		{"/", "mock invalid", "GET", "", ""},
+		{"/", "mock.invalid", "GET / HTTP/1.1\r\nX-Injected: 1\r\n\r\nGET", "", ""},
+		{"/", "mock.invalid", "", "", ""},
+		{"/", "mock.invalid", "GET", "*/*\r\nX-Injected: 1", ""},
+		{"/", "mock.invalid", "POST", "", "text/plain\r\nX-Injected: 1"},
 		// The control: an ordinary request goes out and is answered.
-		{"/hosts.txt", "mock.invalid"},
+		{"/hosts.txt", "mock.invalid", "POST", "text/plain, */*", "text/plain"},
 	}
 	for c in cases {
 		m, server, port, ok := start_trickle(t, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", "", count = 0)
@@ -4446,9 +4455,17 @@ test_a_request_line_holds_only_visible_ascii :: proc(t: ^testing.T) {
 			socket = socket,
 		}
 		set_socket_timeouts(socket, 3 * time.Second)
-		_, err := http_exchange(&stream, Http_Request{method = "GET", path = c.path, host = c.host}, context.temp_allocator)
+		req := Http_Request {
+			method       = c.method,
+			path         = c.path,
+			host         = c.host,
+			body         = transmute([]u8)string("x"),
+			accept       = c.accept,
+			content_type = c.content_type,
+		}
+		_, err := http_exchange(&stream, req, context.temp_allocator)
 		want: Error = .None if c.path == "/hosts.txt" else .HTTP_Error
-		testing.expectf(t, err == want, "path %q host %q: %v, want %v", c.path, c.host, err, want)
+		testing.expectf(t, err == want, "%v: %v, want %v", c, err, want)
 		// Closed first, so the mock's read of a request that never came ends.
 		stream_close(&stream)
 		stop_trickle(m, server)

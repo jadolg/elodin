@@ -432,13 +432,19 @@ http_exchange :: proc(
 	err: Error,
 ) {
 	/*
-	The path and host go into the request line and `Host` verbatim, so a byte
-	there the request line cannot hold is a request of this client's making that
-	a server reads some other way - or, given a CR LF, one carrying fields
-	nobody meant to send. Checked here, where every request line is written: a
-	list url comes from config, and a redirect's from whoever answered (#438).
+	Every field goes onto the wire verbatim, so a byte there the request line or
+	a header cannot hold is a request of this client's making that a server reads
+	some other way - or, given a CR LF, one carrying fields nobody meant to send.
+	Checked here, where every request is written: a list url comes from config,
+	and a redirect's from whoever answered (#438). The method and the two header
+	values are this package's own today, and are held to the same rule so that a
+	caller passing one through cannot open the same hole.
 	*/
-	if !h2.target_is_valid(req.path) || !h2.authority_is_valid(req.host) {
+	if !h2.is_token(req.method) ||
+	   !h2.target_is_valid(req.path) ||
+	   !h2.authority_is_valid(req.host) ||
+	   !h2.field_value_is_valid(req.accept) ||
+	   !h2.field_value_is_valid(req.content_type) {
 		return {}, .HTTP_Error
 	}
 	b := strings.builder_make(context.temp_allocator)

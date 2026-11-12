@@ -438,7 +438,7 @@ with DNSSEC at all. With the guard taken out, the walk below reaches `.Insecure`
 
 Which makes the real cost of a full table "every cold name", not "every cold
 signed name" - the thing an operator sizing `dnssec.max_chain_walks` has to know,
-and the reason the bound reserves workers rather than capping them.
+and the reason the bound reserves walk slots rather than capping them.
 */
 @(test)
 test_a_shed_walk_cannot_tell_an_unsigned_zone_from_a_signed_one :: proc(t: ^testing.T) {

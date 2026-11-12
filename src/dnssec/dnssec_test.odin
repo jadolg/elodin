@@ -766,9 +766,9 @@ test_one_question_cannot_provoke_unbounded_lookups :: proc(t: ^testing.T) {
 	/*
 	A response carrying many owner names, each naming itself as its signer, asks
 	the validator to walk a separate chain for every one of them. Left alone
-	that turns one client question into hundreds of upstream queries with a
-	worker held for all of them, so the walk is given a budget and the answer
-	fails rather than the resolver.
+	that turns one client question into hundreds of upstream queries, the
+	client's held open for all of them, so the walk is given a budget and the
+	answer fails rather than the resolver.
 	*/
 	counter := Counting_Ctx{}
 	v := make_validator(counting_query, &counter, Options{})

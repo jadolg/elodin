@@ -219,9 +219,9 @@ mock_hold_until :: proc(m: ^Mock, n: int) {
 
 /*
 What the mock can say about a hold left short, so a failure names its cause:
-the mock, UDP queries received since the hold was set, those the kernel dropped on the
-mock's socket for want of room since the socket opened, and threads it could
-not start.
+which mock, UDP queries received since the hold was set, those the kernel
+dropped on its socket for want of room since the socket opened, and threads it
+could not start.
 */
 mock_hold_report :: proc(m: ^Mock) -> string {
 	sync.mutex_lock(&m.mu)
