@@ -1,6 +1,7 @@
 package filter
 
 import "core:strings"
+import "elodin:dns"
 import "elodin:netx"
 
 Format :: enum u8 {
@@ -38,7 +39,7 @@ BOM :: "\xef\xbb\xbf"
 @(private)
 is_housekeeping_name :: proc(s: string) -> bool {
 	for n in LOCALHOST_NAMES {
-		if strings.equal_fold(s, n) {
+		if dns.name_equal_fold(s, n) {
 			return true
 		}
 	}
