@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:sync"
 import "core:time"
 import "elodin:dns"
 
@@ -582,6 +583,9 @@ run_stale_connection_cases :: proc(r: ^Runner) {
 
 		start_case(r, fmt.tprintf("upstream: a dropped %s connection is retried, not reported as failure", c.name))
 		{
+			// Counted from here, so a close from before the first query is not
+			// taken for the pooled connection's.
+			closed_before := sync.atomic_load(&mock.idle_closes)
 			first := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 1))
 			if check(r, first.ok, "the first query failed") {
 				h := parse_header(r, first.wire)
@@ -589,7 +593,7 @@ run_stale_connection_cases :: proc(r: ^Runner) {
 			}
 
 			// The premise: the mock has dropped the pooled connection.
-			if !check(r, mock_wait_idle_closes(mock, 1, 5 * time.Second), "the mock never dropped the idle connection") {
+			if !check(r, mock_wait_idle_closes(mock, closed_before + 1, 5 * time.Second), "the mock never dropped the idle connection") {
 				end_case(r)
 				stop_server(&srv)
 				continue

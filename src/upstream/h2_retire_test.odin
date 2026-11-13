@@ -113,7 +113,7 @@ Replacement :: struct {
 @(private = "file")
 Loop_Hold :: struct {
 	holding: sync.Sema,
-	release: bool,
+	release: sync.Sema,
 }
 
 @(private = "file")
@@ -174,11 +174,12 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 	_, holding := loop.spawn(r.l, proc(data: rawptr) {
 		h := (^Loop_Hold)(data)
 		sync.sema_post(&h.holding)
-		for !sync.atomic_load(&h.release) {
-		}
+		// Blocks the loop's thread itself, which nothing on a loop may do
+		// outside a test.
+		sync.sema_wait(&h.release)
 	}, &hold)
 	if !testing.expect(t, holding && sync.sema_wait_with_timeout(&hold.holding, 5 * time.Second), "cannot hold the reader's loop") {
-		sync.atomic_store(&hold.release, true)
+		sync.sema_post(&hold.release)
 		return
 	}
 	// What the redial comes to is beside the point: the dial is refused.
@@ -191,7 +192,7 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 	})
 	returned := sync.sema_wait_with_timeout(&rep.done, 5 * time.Second)
 	readers := h2_readers_running(u)
-	sync.atomic_store(&hold.release, true)
+	sync.sema_post(&hold.release)
 	if !returned {
 		// Ends the reader's read, which is what the replacement is waiting for.
 		loop.cancel_all(r.l)

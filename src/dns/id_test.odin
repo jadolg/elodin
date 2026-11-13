@@ -44,7 +44,7 @@ test_random_id_is_drawn_fresh :: proc(t: ^testing.T) {
 	Both halves have to come from somewhere: a generator that filled only one
 	of the two bytes would pass the count above on a large enough sample. Not
 	all 256 values of each: about 3970 distinct draws miss a given byte value
-	with odds near 2e-7, and with 512 of them one run in about 18,000 would
+	with odds near 1.1e-7, and with 512 of them one run in about 18,000 would
 	miss one by chance. Seven or more missing has odds near 1e-34, where a byte
 	left unfilled gives one value and a byte filled from seven bits 128.
 	*/

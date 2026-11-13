@@ -514,7 +514,7 @@ test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
 
 	// The deepest a pattern inside `MAX_REGEX_PATTERN` can nest, which is how
 	// deep the parser, the optimizer and `node_bound` recurse. Refused on size
-	// or accepted, what matters is that it comes back.
+	// or accepted, it comes back having used scratch linear in its length.
 	half := MAX_REGEX_PATTERN / 2 - 1
 	deep := []string {
 		fmt.tprintf("/%sa%s/", strings.repeat("(", half, context.temp_allocator), strings.repeat(")", half, context.temp_allocator)),
@@ -528,7 +528,19 @@ test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
 		fmt.tprintf("/%s/", strings.repeat("[", MAX_REGEX_PATTERN, context.temp_allocator)),
 	}
 	for rule in deep {
+		body := scratch[size_of(virtual.Memory_Block):]
+		for &b in body {
+			b = MARK
+		}
 		parse_rule(block, allow, rule)
+		used := len(body)
+		for used > 0 && body[used - 1] == MARK {
+			used -= 1
+		}
+		// Linear in the pattern: about 84 bytes of scratch per pattern byte at
+		// the deepest nesting. Anything that grows faster reaches the 1 MiB
+		// arena well before it reaches this.
+		testing.expectf(t, used <= 128 * len(rule), "%d-byte nesting took %d bytes of scratch", len(rule), used)
 	}
 }
 
