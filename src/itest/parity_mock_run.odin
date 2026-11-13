@@ -3,6 +3,7 @@ package itest
 import "core:fmt"
 import "core:strings"
 import "core:time"
+import "elodin:dns"
 
 /*
 The mock mode, one scenario at a time.
@@ -282,10 +283,8 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 
 // The client cookie a query carried, or nil.
 parity_sent_cookie :: proc(q: Parity_Query) -> []u8 {
-	for o in q.options {
-		if o.code == 10 && len(o.data) >= 8 {
-			return o.data
-		}
+	if data, found := pq_find_option(q, u16(dns.EDNS_Option_Code.Cookie)); found && len(data) >= 8 {
+		return data
 	}
 	return nil
 }
@@ -318,7 +317,7 @@ parity_cookie_handshake :: proc(run: ^Parity_Mock_Run, q: Parity_Query) -> (show
 	_, _, asked := parity_upstreams_reference(run.ups, q)
 	sent := parity_sent_cookie(q)
 	m := pw_parse(answer, context.temp_allocator)
-	got, has := pw_find_option(m, 10)
+	got, has := pw_find_option(m, u16(dns.EDNS_Option_Code.Cookie))
 
 	problem := ""
 	switch {
@@ -348,7 +347,7 @@ parity_cookie_handshake :: proc(run: ^Parity_Mock_Run, q: Parity_Query) -> (show
 	options := make([]Pw_Option, len(q.options), context.temp_allocator)
 	copy(options, q.options)
 	for &o in options {
-		if o.code == 10 {
+		if o.code == u16(dns.EDNS_Option_Code.Cookie) {
 			o.data = got
 		}
 	}
@@ -376,7 +375,7 @@ parity_check_route :: proc(run: ^Parity_Mock_Run, q: Parity_Query, from: int) {
 	parent zone and is asked of the default upstreams so the chain of trust
 	has the parent's answer (src/server/routes.odin, the apex carve-out).
 	*/
-	apex := q.qtype == 43 && pw_names_equal_fold(q.name, pm_name(run.s.route, context.temp_allocator))
+	apex := q.qtype == 43 && pw_names_equal_fold(q.name, pg_encode_name(run.s.route, context.temp_allocator))
 	routed := parity_name_under(q.name, run.s.route) && !apex
 	last := len(run.s.kinds) - 1
 	if routed != (from == last) {

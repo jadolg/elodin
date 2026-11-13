@@ -90,56 +90,17 @@ parity_ask_reference :: proc(host: string, port: int, query: []u8) -> (answer: [
 	return parity_ask_tcp(host, port, query)
 }
 
-// One query over TCP to a resolver somewhere else. Its own rather than
-// `query_tcp`, which only ever dials loopback.
+// One query over TCP to a resolver somewhere else.
 @(private)
 parity_ask_tcp :: proc(host: string, port: int, query: []u8) -> (answer: []u8, ok: bool) {
 	address := net.parse_address(host)
 	if address == nil {
 		return nil, false
 	}
-	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = address, port = port})
-	if err != nil {
-		return nil, false
-	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-	_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
-
-	framed := make([]u8, 2 + len(query), context.temp_allocator)
-	framed[0] = u8(len(query) >> 8)
-	framed[1] = u8(len(query))
-	copy(framed[2:], query)
-	if _, serr := net.send_tcp(socket, framed); serr != nil {
-		return nil, false
-	}
-
-	header: [2]u8
-	if !parity_read_full(socket, header[:]) {
-		return nil, false
-	}
-	length := int(header[0]) << 8 | int(header[1])
-	if length < 12 || length > 65535 {
-		return nil, false
-	}
-	out := make([]u8, length, context.temp_allocator)
-	if !parity_read_full(socket, out) {
-		return nil, false
-	}
-	return out, true
-}
-
-@(private = "file")
-parity_read_full :: proc(socket: net.TCP_Socket, buf: []u8) -> bool {
-	got := 0
-	for got < len(buf) {
-		n, err := net.recv_tcp(socket, buf[got:])
-		if err != nil || n <= 0 {
-			return false
-		}
-		got += n
-	}
-	return true
+	conn := dial_tcp(port, address = address) or_return
+	defer net.close(conn.socket)
+	res := stream_query(&conn, query, context.temp_allocator)
+	return res.wire, res.ok
 }
 
 // One query straight to a resolver somewhere else, over UDP only.
@@ -185,21 +146,13 @@ parity_ask_udp :: proc(host: string, port: int, query: []u8) -> (answer: []u8, o
 		}
 		// A datagram carrying somebody else's transaction id is not this
 		// query's answer, whoever sent it.
-		if u16(buf[0]) << 8 | u16(buf[1]) != peek_id_of(query) {
+		if pw_u16(buf, 0) != pw_u16(query, 0) {
 			continue
 		}
 		out := make([]u8, n, context.temp_allocator)
 		copy(out, buf[:n])
 		return out, true
 	}
-}
-
-@(private = "file")
-peek_id_of :: proc(msg: []u8) -> u16 {
-	if len(msg) < 2 {
-		return 0
-	}
-	return u16(msg[0]) << 8 | u16(msg[1])
 }
 
 /*
@@ -491,7 +444,7 @@ parity_split_host_port :: proc(s: string) -> (host: string, port: int, ok: bool)
 			return "", 0, false
 		}
 		port, ok = strconv.parse_int(rest[1:])
-		if !ok {
+		if !ok || port < 1 || port > 65535 {
 			return "", 0, false
 		}
 		return host, port, true
@@ -503,7 +456,7 @@ parity_split_host_port :: proc(s: string) -> (host: string, port: int, ok: bool)
 		return s, 53, true
 	}
 	port, ok = strconv.parse_int(s[i + 1:])
-	if !ok {
+	if !ok || port < 1 || port > 65535 {
 		return "", 0, false
 	}
 	return s[:i], port, true

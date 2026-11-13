@@ -1,7 +1,8 @@
 package itest
 
 import "core:fmt"
-import "core:path/filepath"
+import "core:slice"
+import "core:strings"
 import "core:time"
 import "elodin:dns"
 
@@ -13,21 +14,19 @@ Policy coverage: sink lists, block response modes, rewrites and the cache.
 // and end_case resets the temp allocator between them.
 @(private = "file")
 write_list :: proc(r: ^Runner, name: string, contents: string) -> string {
-	path := filepath.join({r.work_dir, name}, context.allocator) or_else ""
-	write_fixture(r, path, transmute([]u8)contents)
-	return path
+	// A write that did not land has failed the case already, and the server
+	// it is for then fails on the missing file.
+	path, _ := write_work_file(r, name, contents)
+	return strings.clone(path)
 }
 
 run_blocking_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("policy", upstream_port)
 	// Anything not blocked resolves to this address, so a query that reached
 	// the upstream is distinguishable from one that was sunk. The answer is
 	// synthesised per query because elodin checks that a reply's question
 	// matches what it asked.
-	mock_synth_all(mock, {203, 0, 113, 1})
-	if !mock_start(mock) {
-		skip_case(r, "blocking", "cannot start the mock upstream")
+	mock, upstream_port, started := synth_mock(r, "policy", "blocking", {203, 0, 113, 1})
+	if !started {
 		return
 	}
 	defer mock_stop(mock)
@@ -86,50 +85,37 @@ subtree.test
 		{"nxdomain", "nxdomain", ""},
 		{"nodata", "nodata", ""},
 		{"zeroip", "zeroip", ""},
-		{"custom", "custom", "  custom_ipv4: 10.1.2.3\n  custom_ipv6: \"fd00::abcd\"\n"},
+		{"custom", "custom", "custom_ipv4: 10.1.2.3, custom_ipv6: \"fd00::abcd\", "},
 		{"refused", "refused", ""},
 	}
 
 	for mode in modes {
 		udp_port := next_port(r)
-		config := fmt.tprintf(
-			`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking:
-  enabled: true
-  response: %s
-  block_ttl: 42
-%s  lists:
-    - {{ name: hosts, file: %s, format: hosts }}
-    - {{ name: abp, file: %s, format: adblock }}
-    - {{ name: domains, file: %s, format: domains }}
-`,
+		config := base_config(
 			udp_port,
-			upstream_port,
-			mode.response,
-			mode.extra,
-			hosts_path,
-			abp_path,
-			domains_path,
+			upstream_at(upstream_port),
+			timeout = "3s",
+			blocking = fmt.tprintf(
+				"{{ enabled: true, response: %s, block_ttl: 42, %slists: [" +
+				"{{ name: hosts, file: %s, format: hosts }}, " +
+				"{{ name: abp, file: %s, format: adblock }}, " +
+				"{{ name: domains, file: %s, format: domains }}] }}",
+				mode.response,
+				mode.extra,
+				hosts_path,
+				abp_path,
+				domains_path,
+			),
 		)
 
 		srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 		if !ok {
-			skip_case(r, fmt.tprintf("blocking mode %s", mode.name), "server did not start")
 			continue
 		}
 
 		start_case(r, fmt.tprintf("blocking: response mode %s", mode.name))
 		{
-			res := query_udp(udp_port, build_query("ads.tracker.test.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if res, h, answered := ask(r, udp_port, "ads.tracker.test.", u16(dns.Type.A)); answered {
 				switch mode.response {
 				case "nxdomain":
 					check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
@@ -142,16 +128,10 @@ blocking:
 					check(r, h.rcode == int(dns.Rcode.Refused), "rcode %d, want REFUSED", h.rcode)
 				case "zeroip":
 					check_eq_int(r, h.ancount, 1, "answer count")
-					addrs := answer_addresses(r, res.wire)
-					if check(r, len(addrs) == 1, "expected one address") {
-						check_eq_str(r, addrs[0], "0.0.0.0", "sink address")
-					}
+					check_one_address(r, res.wire, "0.0.0.0", "sink address")
 				case "custom":
 					check_eq_int(r, h.ancount, 1, "answer count")
-					addrs := answer_addresses(r, res.wire)
-					if check(r, len(addrs) == 1, "expected one address") {
-						check_eq_str(r, addrs[0], "10.1.2.3", "sink address")
-					}
+					check_one_address(r, res.wire, "10.1.2.3", "sink address")
 					ttl, has := min_answer_ttl(r, res.wire)
 					check(r, has && ttl == 42, "block TTL: got %d, want 42", ttl)
 				}
@@ -164,10 +144,7 @@ blocking:
 			{
 				res := query_udp(udp_port, build_query("ads.tracker.test.", u16(dns.Type.AAAA)))
 				if check(r, res.ok, "no response") {
-					addrs := answer_addresses(r, res.wire)
-					if check(r, len(addrs) == 1, "expected one address") {
-						check_eq_str(r, addrs[0], "fd00:0000:0000:0000:0000:0000:0000:abcd", "sink address")
-					}
+					check_one_address(r, res.wire, "fd00:0000:0000:0000:0000:0000:0000:abcd", "sink address")
 				}
 			}
 			end_case(r)
@@ -181,14 +158,10 @@ blocking:
 
 		start_case(r, "blocking: hosts entries match exactly, not subtrees")
 		{
-			blocked := query_udp(udp_port, build_query("metrics.tracker.test.", u16(dns.Type.A)))
-			if check(r, blocked.ok, "no response for the listed name") {
-				h := parse_header(r, blocked.wire)
+			if _, h, answered := ask(r, udp_port, "metrics.tracker.test.", u16(dns.Type.A), "no response for the listed name"); answered {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "listed name not blocked")
 			}
-			sub := query_udp(udp_port, build_query("deep.ads.tracker.test.", u16(dns.Type.A)))
-			if check(r, sub.ok, "no response for the subdomain") {
-				h := parse_header(r, sub.wire)
+			if _, h, answered := ask(r, udp_port, "deep.ads.tracker.test.", u16(dns.Type.A), "no response for the subdomain"); answered {
 				check(r, h.rcode == int(dns.Rcode.No_Error), "a hosts entry blocked its subdomain")
 			}
 		}
@@ -196,9 +169,7 @@ blocking:
 
 		start_case(r, "blocking: the list's own localhost lines are not rules")
 		{
-			res := query_udp(udp_port, build_query("localhost.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if _, h, answered := ask(r, udp_port, "localhost.", u16(dns.Type.A)); answered {
 				check(r, h.rcode == int(dns.Rcode.No_Error), "localhost was turned into a block rule")
 			}
 		}
@@ -207,9 +178,7 @@ blocking:
 		start_case(r, "blocking: adblock || covers the domain and its subtree")
 		{
 			for name in ([]string{"evil.test.", "sub.evil.test.", "a.b.evil.test."}) {
-				res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
-				if check(r, res.ok, "no response for %s", name) {
-					h := parse_header(r, res.wire)
+				if _, h, answered := ask(r, udp_port, name, u16(dns.Type.A), fmt.tprintf("no response for %s", name)); answered {
 					check(r, h.rcode == int(dns.Rcode.NX_Domain), "%s was not blocked", name)
 				}
 			}
@@ -219,9 +188,7 @@ blocking:
 		start_case(r, "blocking: allow rules beat block rules")
 		{
 			for name in ([]string{"good.evil.test.", "deeper.good.evil.test."}) {
-				res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
-				if check(r, res.ok, "no response for %s", name) {
-					h := parse_header(r, res.wire)
+				if _, h, answered := ask(r, udp_port, name, u16(dns.Type.A), fmt.tprintf("no response for %s", name)); answered {
 					check(r, h.rcode == int(dns.Rcode.No_Error), "%s should have been allowed", name)
 				}
 			}
@@ -230,9 +197,7 @@ blocking:
 
 		start_case(r, "blocking: modifiers are stripped, the rule still applies")
 		{
-			res := query_udp(udp_port, build_query("modifiers.test.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if _, h, answered := ask(r, udp_port, "modifiers.test.", u16(dns.Type.A)); answered {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "a rule with $modifiers was dropped")
 			}
 		}
@@ -242,9 +207,7 @@ blocking:
 		start_case(r, "blocking: a $third-party or $~third-party rule blocks nothing")
 		{
 			for name in ([]string{"third-party.test.", "a.third-party-regex.test.", "first-party.test."}) {
-				res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
-				if check(r, res.ok, "no response for %s", name) {
-					h := parse_header(r, res.wire)
+				if _, h, answered := ask(r, udp_port, name, u16(dns.Type.A), fmt.tprintf("no response for %s", name)); answered {
 					check(r, h.rcode == int(dns.Rcode.No_Error), "%s was blocked by a rule with a third-party modifier", name)
 				}
 			}
@@ -276,9 +239,7 @@ blocking:
 			}
 			for c in typed {
 				before := mock_total(mock)
-				res := query_udp(udp_port, build_query(c.name, u16(c.qtype)))
-				if check(r, res.ok, "no response for %s %v", c.name, c.qtype) {
-					h := parse_header(r, res.wire)
+				if _, h, answered := ask(r, udp_port, c.name, u16(c.qtype), fmt.tprintf("no response for %s %v", c.name, c.qtype)); answered {
 					asked := mock_total(mock) > before
 					check(r, h.rcode == int(dns.Rcode.No_Error), "%s %v: rcode %d, want NOERROR", c.name, c.qtype, h.rcode)
 					check(r, asked != c.blocked, "%s %v: blocked %v, want %v", c.name, c.qtype, !asked, c.blocked)
@@ -292,14 +253,10 @@ blocking:
 
 		start_case(r, "blocking: | anchors match the exact name only")
 		{
-			exact := query_udp(udp_port, build_query("exact.test.", u16(dns.Type.A)))
-			if check(r, exact.ok, "no response") {
-				h := parse_header(r, exact.wire)
+			if _, h, answered := ask(r, udp_port, "exact.test.", u16(dns.Type.A)); answered {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "the anchored name was not blocked")
 			}
-			sub := query_udp(udp_port, build_query("sub.exact.test.", u16(dns.Type.A)))
-			if check(r, sub.ok, "no response") {
-				h := parse_header(r, sub.wire)
+			if _, h, answered := ask(r, udp_port, "sub.exact.test.", u16(dns.Type.A)); answered {
 				check(r, h.rcode == int(dns.Rcode.No_Error), "an anchored rule blocked a subdomain")
 			}
 		}
@@ -307,9 +264,7 @@ blocking:
 
 		start_case(r, "blocking: dnsmasq address=/ syntax")
 		{
-			res := query_udp(udp_port, build_query("deep.dnsmasq.test.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if _, h, answered := ask(r, udp_port, "deep.dnsmasq.test.", u16(dns.Type.A)); answered {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "address=/ rule was not applied")
 			}
 		}
@@ -340,9 +295,7 @@ blocking:
 					{"a(b.regex.test.", true},
 					{"c(d.regex.test.", false},
 				}) {
-				res := query_udp(udp_port, build_query(w.name, u16(dns.Type.A)))
-				if check(r, res.ok, "no response for %s", w.name) {
-					h := parse_header(r, res.wire)
+				if _, h, answered := ask(r, udp_port, w.name, u16(dns.Type.A), fmt.tprintf("no response for %s", w.name)); answered {
 					want := dns.Rcode.NX_Domain if w.blocked else dns.Rcode.No_Error
 					check(r, h.rcode == int(want), "%s: rcode %d, want %v", w.name, h.rcode, want)
 				}
@@ -354,9 +307,7 @@ blocking:
 		start_case(r, "blocking: bare and leading-dot domains cover their subtree")
 		{
 			for name in ([]string{"subtree.test.", "a.subtree.test.", "dotted.test.", "a.dotted.test."}) {
-				res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
-				if check(r, res.ok, "no response for %s", name) {
-					h := parse_header(r, res.wire)
+				if _, h, answered := ask(r, udp_port, name, u16(dns.Type.A), fmt.tprintf("no response for %s", name)); answered {
 					check(r, h.rcode == int(dns.Rcode.NX_Domain), "%s was not blocked", name)
 				}
 			}
@@ -365,14 +316,10 @@ blocking:
 
 		start_case(r, "blocking: *.name covers subdomains but not the apex")
 		{
-			sub := query_udp(udp_port, build_query("host.wildcard.test.", u16(dns.Type.A)))
-			if check(r, sub.ok, "no response") {
-				h := parse_header(r, sub.wire)
+			if _, h, answered := ask(r, udp_port, "host.wildcard.test.", u16(dns.Type.A)); answered {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "the subdomain was not blocked")
 			}
-			apex := query_udp(udp_port, build_query("wildcard.test.", u16(dns.Type.A)))
-			if check(r, apex.ok, "no response") {
-				h := parse_header(r, apex.wire)
+			if _, h, answered := ask(r, udp_port, "wildcard.test.", u16(dns.Type.A)); answered {
 				check(r, h.rcode == int(dns.Rcode.No_Error), "*.name should not block the apex")
 			}
 		}
@@ -380,9 +327,7 @@ blocking:
 
 		start_case(r, "blocking: matching ignores case")
 		{
-			res := query_udp(udp_port, build_query("ADS.Tracker.TEST.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if _, h, answered := ask(r, udp_port, "ADS.Tracker.TEST.", u16(dns.Type.A)); answered {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "an upper-case name evaded the list")
 			}
 		}
@@ -418,90 +363,63 @@ run_regex_bomb_case :: proc(r: ^Runner, upstream_port: int) {
 `,
 	)
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking:
-  enabled: true
-  lists:
-    - {{ name: bombs, file: %s, format: adblock }}
-`,
+	config := base_config(
 		udp_port,
-		upstream_port,
-		list,
+		upstream_at(upstream_port),
+		timeout = "3s",
+		blocking = fmt.tprintf("{{ enabled: true, lists: [{{ name: bombs, file: %s, format: adblock }}] }}", list),
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
-	if !check(r, ok, "the server did not start on a list of regex bombs") {
+	if !ok {
 		return
 	}
 	defer stop_server(&srv)
 
 	for name in ([]string{"after-the-bombs.test.", "after7.regex.test."}) {
-		res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
-		if check(r, res.ok, "no response for %s", name) {
-			h := parse_header(r, res.wire)
+		if _, h, answered := ask(r, udp_port, name, u16(dns.Type.A), fmt.tprintf("no response for %s", name)); answered {
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "%s was not blocked", name)
 		}
 	}
-	res := query_udp(udp_port, build_query("aaaa.test.", u16(dns.Type.A)))
-	if check(r, res.ok, "no response") {
-		h := parse_header(r, res.wire)
+	if _, h, answered := ask(r, udp_port, "aaaa.test.", u16(dns.Type.A)); answered {
 		check(r, h.rcode == int(dns.Rcode.No_Error), "a refused bomb blocked a name")
 	}
 }
 
 run_rewrite_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("rewrites", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 1})
-	if !mock_start(mock) {
-		skip_case(r, "rewrites", "cannot start the mock upstream")
+	mock, upstream_port, started := synth_mock(r, "rewrites", "rewrites", {203, 0, 113, 1})
+	if !started {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: true, response: nxdomain }}
-# Off, so the "gets no PTR" cases below can prove a reverse name is forwarded
-# rather than invented; with the key on it would be the empty zone's NXDOMAIN.
-special_use: {{ private_reverse: false }}
-rewrites:
-  - {{ domain: nas.home, answer: 192.168.1.50, ttl: 111 }}
-  - {{ domain: nas6.home, answer: "fd00::50" }}
-  - {{ domain: mail.lab, answers: ["MX 10 mx.lab"] }}
-  - {{ domain: "*.lab", answers: [10.0.0.1, "fd00::1"] }}
-  - {{ domain: old.example.org, answer: new.example.org }}
-  - {{ domain: telemetry.example.org, answer: block }}
-  - {{ domain: cloak.example.org, answer: telemetry.example.org }}
-  - {{ domain: www.example.org, answer: 203.0.113.9 }}
-  - {{ domain: shadowed.lab, answer: 192.168.1.70 }}
-  - {{ domain: sink.example.org, answers: [block, 192.168.1.60] }}
-  - {{ domain: blockpage.example.org, answer: 192.168.1.80, ptr: false }}
-  - {{ domain: mail.example.org, answers: ["MX 10 mx1.example.org", "MX 20 mx2.example.org", "TXT v=spf1 -all"] }}
-  - {{ domain: _sip._tcp.example.org, answer: "SRV 0 5 5060 sip.example.org" }}
-`,
+	config := base_config(
 		udp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		timeout = "3s",
+		blocking = "{ enabled: true, response: nxdomain }",
+		extra = `# Off, so the "gets no PTR" cases below can prove a reverse name is forwarded
+# rather than invented; with the key on it would be the empty zone's NXDOMAIN.
+special_use: { private_reverse: false }
+rewrites:
+  - { domain: nas.home, answer: 192.168.1.50, ttl: 111 }
+  - { domain: nas6.home, answer: "fd00::50" }
+  - { domain: mail.lab, answers: ["MX 10 mx.lab"] }
+  - { domain: "*.lab", answers: [10.0.0.1, "fd00::1"] }
+  - { domain: old.example.org, answer: new.example.org }
+  - { domain: telemetry.example.org, answer: block }
+  - { domain: cloak.example.org, answer: telemetry.example.org }
+  - { domain: www.example.org, answer: 203.0.113.9 }
+  - { domain: shadowed.lab, answer: 192.168.1.70 }
+  - { domain: sink.example.org, answers: [block, 192.168.1.60] }
+  - { domain: blockpage.example.org, answer: 192.168.1.80, ptr: false }
+  - { domain: mail.example.org, answers: ["MX 10 mx1.example.org", "MX 20 mx2.example.org", "TXT v=spf1 -all"] }
+  - { domain: _sip._tcp.example.org, answer: "SRV 0 5 5060 sip.example.org" }
+`,
 	)
 
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
-		skip_case(r, "rewrites", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -510,10 +428,7 @@ rewrites:
 	{
 		res := query_udp(udp_port, build_query("nas.home.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			addrs := answer_addresses(r, res.wire)
-			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
-				check_eq_str(r, addrs[0], "192.168.1.50", "rewritten address")
-			}
+			check_one_address(r, res.wire, "192.168.1.50", "rewritten address")
 			ttl, has := min_answer_ttl(r, res.wire)
 			check(r, has && ttl == 111, "TTL: got %d, want 111", ttl)
 		}
@@ -524,17 +439,11 @@ rewrites:
 	{
 		v4 := query_udp(udp_port, build_query("host1.lab.", u16(dns.Type.A)))
 		if check(r, v4.ok, "no A response") {
-			addrs := answer_addresses(r, v4.wire)
-			if check(r, len(addrs) == 1, "expected one A record") {
-				check_eq_str(r, addrs[0], "10.0.0.1", "A answer")
-			}
+			check_one_address(r, v4.wire, "10.0.0.1", "A answer")
 		}
 		v6 := query_udp(udp_port, build_query("host2.lab.", u16(dns.Type.AAAA)))
 		if check(r, v6.ok, "no AAAA response") {
-			addrs := answer_addresses(r, v6.wire)
-			if check(r, len(addrs) == 1, "expected one AAAA record") {
-				check_eq_str(r, addrs[0], "fd00:0000:0000:0000:0000:0000:0000:0001", "AAAA answer")
-			}
+			check_one_address(r, v6.wire, "fd00:0000:0000:0000:0000:0000:0000:0001", "AAAA answer")
 		}
 	}
 	end_case(r)
@@ -543,11 +452,8 @@ rewrites:
 	{
 		res := query_udp(udp_port, build_query("lab.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			addrs := answer_addresses(r, res.wire)
 			// It should have fallen through to the upstream instead.
-			if check(r, len(addrs) == 1, "expected the upstream answer, got %d records", len(addrs)) {
-				check_eq_str(r, addrs[0], "203.0.113.1", "answer source")
-			}
+			check_one_address(r, res.wire, "203.0.113.1", "answer source")
 		}
 	}
 	end_case(r)
@@ -559,10 +465,7 @@ rewrites:
 		res := query_udp(udp_port, build_query("old.example.org.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
 			check_eq_str(r, first_cname_or_name(r, res.wire), "new.example.org.", "CNAME target")
-			addrs := answer_addresses(r, res.wire)
-			if check(r, len(addrs) == 1, "expected the target's address after the CNAME, got %d", len(addrs)) {
-				check_eq_str(r, addrs[0], "203.0.113.1", "target address")
-			}
+			check_one_address(r, res.wire, "203.0.113.1", "target address")
 		}
 	}
 	end_case(r)
@@ -570,9 +473,7 @@ rewrites:
 	// The target is put to the same rules a question for it by name would be.
 	start_case(r, "rewrite: a CNAME to a sunk name is sunk")
 	{
-		res := query_udp(udp_port, build_query("cloak.example.org.", u16(dns.Type.A)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if res, h, answered := ask(r, udp_port, "cloak.example.org.", u16(dns.Type.A)); answered {
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
 			check_eq_str(r, first_cname_or_name(r, res.wire), "telemetry.example.org.", "CNAME target")
 		}
@@ -581,9 +482,7 @@ rewrites:
 
 	start_case(r, "rewrite: answer 'block' sinks the name")
 	{
-		res := query_udp(udp_port, build_query("telemetry.example.org.", u16(dns.Type.A)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if _, h, answered := ask(r, udp_port, "telemetry.example.org.", u16(dns.Type.A)); answered {
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "rcode %d, want NXDOMAIN", h.rcode)
 		}
 	}
@@ -591,9 +490,7 @@ rewrites:
 
 	start_case(r, "rewrite: an unmatched type gets NODATA, not a wrong answer")
 	{
-		res := query_udp(udp_port, build_query("nas.home.", u16(dns.Type.MX)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if _, h, answered := ask(r, udp_port, "nas.home.", u16(dns.Type.MX)); answered {
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_int(r, h.ancount, 0, "answer count")
 		}
@@ -604,8 +501,8 @@ rewrites:
 	{
 		res := query_udp(udp_port, build_query("mail.example.org.", u16(dns.Type.MX)))
 		if check(r, res.ok, "no response") {
-			msg, derr := dns.decode_message(res.wire, context.temp_allocator)
-			if check(r, derr == .None, "response did not decode: %v", derr) &&
+			msg, decoded := decode_reply(r, res.wire)
+			if decoded &&
 			   check(r, len(msg.answer) == 2, "expected two MX records, got %d", len(msg.answer)) {
 				for rec, i in msg.answer {
 					mx, is_mx := rec.data.(dns.Rdata_MX)
@@ -626,8 +523,8 @@ rewrites:
 	{
 		res := query_udp(udp_port, build_query("mail.example.org.", u16(dns.Type.TXT)))
 		if check(r, res.ok, "no response") {
-			msg, derr := dns.decode_message(res.wire, context.temp_allocator)
-			if check(r, derr == .None, "response did not decode: %v", derr) &&
+			msg, decoded := decode_reply(r, res.wire)
+			if decoded &&
 			   check(r, len(msg.answer) == 1, "expected one TXT record, got %d", len(msg.answer)) {
 				txt, is_txt := msg.answer[0].data.(dns.Rdata_TXT)
 				if check(r, is_txt, "the answer is not a TXT record") &&
@@ -643,8 +540,8 @@ rewrites:
 	{
 		res := query_udp(udp_port, build_query("_sip._tcp.example.org.", u16(dns.Type.SRV)))
 		if check(r, res.ok, "no response") {
-			msg, derr := dns.decode_message(res.wire, context.temp_allocator)
-			if check(r, derr == .None, "response did not decode: %v", derr) &&
+			msg, decoded := decode_reply(r, res.wire)
+			if decoded &&
 			   check(r, len(msg.answer) == 1, "expected one SRV record, got %d", len(msg.answer)) {
 				srv, is_srv := msg.answer[0].data.(dns.Rdata_SRV)
 				if check(r, is_srv, "the answer is not an SRV record") {
@@ -668,10 +565,7 @@ rewrites:
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("mail.example.org.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			addrs := answer_addresses(r, res.wire)
-			if check(r, len(addrs) == 1, "expected the upstream answer, got %d records", len(addrs)) {
-				check_eq_str(r, addrs[0], "203.0.113.1", "answer source")
-			}
+			check_one_address(r, res.wire, "203.0.113.1", "answer source")
 			check(r, mock_total(mock) >= 1, "the query should have been forwarded")
 		}
 	}
@@ -688,18 +582,15 @@ rewrites:
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("mail.lab.", u16(dns.Type.A)))
 		if check(r, res.ok, "no response") {
-			addrs := answer_addresses(r, res.wire)
-			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
-				check_eq_str(r, addrs[0], "10.0.0.1", "the wildcard should have answered")
-			}
+			check_one_address(r, res.wire, "10.0.0.1", "the wildcard should have answered")
 			check_eq_int(r, mock_total(mock), 0, "upstream queries for a name answered here")
 		}
 
 		// And its own type is still answered by the rule that holds it.
 		mx := query_udp(udp_port, build_query("mail.lab.", u16(dns.Type.MX)))
 		if check(r, mx.ok, "no response for the MX query") {
-			msg, derr := dns.decode_message(mx.wire, context.temp_allocator)
-			if check(r, derr == .None, "response did not decode: %v", derr) &&
+			msg, decoded := decode_reply(r, mx.wire)
+			if decoded &&
 			   check(r, len(msg.answer) == 1, "expected one MX record, got %d", len(msg.answer)) {
 				rec, is_mx := msg.answer[0].data.(dns.Rdata_MX)
 				if check(r, is_mx, "the answer is not an MX record") {
@@ -717,9 +608,7 @@ rewrites:
 		// than a question for the upstream. Same assertion as the MX case
 		// further up, made here against the rule that has both kinds in play.
 		mock_reset_counts(mock)
-		res := query_udp(udp_port, build_query("nas.home.", u16(dns.Type.SRV)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if _, h, answered := ask(r, udp_port, "nas.home.", u16(dns.Type.SRV)); answered {
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_int(r, h.ancount, 0, "answer count")
 			check_eq_int(r, h.nscount, 1, "authority count")
@@ -735,9 +624,7 @@ rewrites:
 		// real answer out there is the blackhole servers' NXDOMAIN. The TTL is
 		// the rule's own, so the two directions expire together.
 		mock_reset_counts(mock)
-		res := query_udp(udp_port, build_query("50.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if res, h, answered := ask(r, udp_port, "50.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)); answered {
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_str(r, first_cname_or_name(r, res.wire), "nas.home.", "PTR target")
 			ttl, has := min_answer_ttl(r, res.wire)
@@ -800,10 +687,7 @@ rewrites:
 		// disagreeing with itself across two answers.
 		v4 := query_udp(udp_port, build_query("shadowed.lab.", u16(dns.Type.A)))
 		if check(r, v4.ok, "no response for the shadowed name") {
-			addrs := answer_addresses(r, v4.wire)
-			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
-				check_eq_str(r, addrs[0], "10.0.0.1", "the wildcard is what answers")
-			}
+			check_one_address(r, v4.wire, "10.0.0.1", "the wildcard is what answers")
 		}
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("70.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
@@ -834,10 +718,7 @@ rewrites:
 		// address in the other direction.
 		fwd := query_udp(udp_port, build_query("blockpage.example.org.", u16(dns.Type.A)))
 		if check(r, fwd.ok, "no response for the opted-out name") {
-			addrs := answer_addresses(r, fwd.wire)
-			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
-				check_eq_str(r, addrs[0], "192.168.1.80", "the forward answer is unaffected")
-			}
+			check_one_address(r, fwd.wire, "192.168.1.80", "the forward answer is unaffected")
 		}
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("80.1.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
@@ -853,9 +734,7 @@ rewrites:
 		// The name exists - its PTR was just answered - so another type is
 		// "there is none" rather than a forwarded query. The upstream would have
 		// synthesised an A for it, so an empty answer is the proof it stayed.
-		res := query_udp(udp_port, build_query("50.1.168.192.in-addr.arpa.", u16(dns.Type.A)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if _, h, answered := ask(r, udp_port, "50.1.168.192.in-addr.arpa.", u16(dns.Type.A)); answered {
 			check(r, h.rcode == int(dns.Rcode.No_Error), "rcode %d, want NOERROR", h.rcode)
 			check_eq_int(r, h.ancount, 0, "answer count")
 			check_eq_int(r, h.nscount, 1, "authority count")
@@ -877,36 +756,22 @@ run_cache_cases :: proc(r: ^Runner) {
 	// Any other question (the AAAA case below) gets a matching synthesised
 	// answer rather than a canned one for the wrong name.
 	mock_synth_all(mock, {203, 0, 113, 2})
-	if !mock_start(mock) {
-		skip_case(r, "cache", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "cache") {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache:
-  enabled: true
-  max_entries: 100
-  min_ttl: 30
-  negative_ttl: 60
-blocking: {{ enabled: false }}
-`,
+	config := base_config(
 		udp_port,
-		udp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		timeout = "3s",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		cache = "{ enabled: true, max_entries: 100, min_ttl: 30, negative_ttl: 60 }",
 	)
 
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, tcp_port = udp_port})
 	if !ok {
-		skip_case(r, "cache", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -963,7 +828,7 @@ blocking: {{ enabled: false }}
 		if check(r, res.ok, "no response") {
 			check(
 				r,
-				len(res.wire) > 25 && bytes_equal(res.wire[12:25], query[12:25]),
+				len(res.wire) > 25 && slice.equal(res.wire[12:25], query[12:25]),
 				"the cached answer did not echo the client's spelling",
 			)
 		}
@@ -1214,8 +1079,6 @@ denial_reply :: proc(name: string, rcode: dns.Rcode, data: bool) -> []u8 {
 			data  = dns.Rdata_A{addr = {203, 0, 113, 9}},
 		}
 	}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = .A, class = .IN}
 	// The zone's SOA beside it, as the genuine denial the attacker could lift
 	// it from carries: without one the cache would turn the reply away for
 	// that alone, and the case would pass without the data ever being read.
@@ -1228,19 +1091,11 @@ denial_reply :: proc(name: string, rcode: dns.Rcode, data: bool) -> []u8 {
 		data = dns.Rdata_SOA{ns = "ns.example.com.", mbox = "hostmaster.example.com.", serial = 1, minimum = 600},
 	}
 	msg := dns.Message {
-		question  = question,
 		answer    = answer,
 		authority = authority,
 	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
 	msg.flags.rcode = u8(rcode)
-	wire, _, err := dns.encode_message(msg, context.allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return encode_reply(name, .A, msg)
 }
 
 // An answer with `records` A records under one owner name: the shape of a
@@ -1260,18 +1115,7 @@ bulk_answer :: proc(name: string, records: int, allocator := context.allocator) 
 			data  = dns.Rdata_A{addr = {198, 51, u8(i >> 8), u8(i)}},
 		}
 	}
-	m := dns.Message {
-		id       = 0x4242,
-		question = []dns.Question{{name = name, type = .A, class = .IN}},
-		answer   = answers,
-	}
-	m.flags.qr = true
-	m.flags.ra = true
-	wire, _, err := dns.encode_message(m, allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return encode_reply(name, .A, {id = 0x4242, answer = answers}, allocator)
 }
 
 /*
@@ -1298,40 +1142,34 @@ run_cache_bytes_cases :: proc(r: ^Runner) {
 	mock := mock_make("cache-bytes", upstream_port)
 
 	names := make([]string, NAMES, context.allocator)
-	defer delete(names)
+	// Deferred ahead of `mock_stop`, so it runs after the mock that reads the
+	// names is gone.
+	defer {
+		for name in names {
+			delete(name)
+		}
+		delete(names)
+	}
 	for i in 0 ..< NAMES {
 		names[i] = fmt.aprintf("bulk%d.example.com.", i)
 		mock_reply(mock, names[i], u16(dns.Type.A), bulk_answer(names[i], RECORDS, context.allocator))
 	}
-	if !mock_start(mock) {
-		skip_case(r, "cache bytes", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "cache bytes") {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache:
-  enabled: true
-  max_entries: 100000
-  max_bytes: 1MiB
-blocking: {{ enabled: false }}
-`,
+	config := base_config(
 		udp_port,
-		udp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		timeout = "3s",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		cache = "{ enabled: true, max_entries: 100000, max_bytes: 1MiB }",
 	)
 
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
-		skip_case(r, "cache bytes", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -1397,36 +1235,22 @@ run_serve_stale_cases :: proc(r: ^Runner) {
 	// A one-second TTL, so the entry expires inside the case rather than the
 	// clock being what the case is about.
 	mock_synth_all(mock, {203, 0, 113, 9}, ttl = 1)
-	if !mock_start(mock) {
-		skip_case(r, "serve_stale", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "serve_stale") {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 5s
-  attempts: 1
-  servers: ["127.0.0.1:%d"]
-cache:
-  enabled: true
-  max_entries: 100
-  serve_stale: true
-  stale_timeout: 300ms
-blocking: {{ enabled: false }}
-`,
+	config := base_config(
 		udp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		timeout = "5s",
+		upstream_extra = "  attempts: 1",
+		cache = "{ enabled: true, max_entries: 100, serve_stale: true, stale_timeout: 300ms }",
 	)
 
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
-		skip_case(r, "serve_stale", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -1438,7 +1262,7 @@ blocking: {{ enabled: false }}
 			end_case(r)
 			return
 		}
-		check_eq_str(r, first_stale_address(r, first.wire), "203.0.113.9", "the answer that was cached")
+		check_eq_str(r, first_address(r, first.wire), "203.0.113.9", "the answer that was cached")
 
 		// Past the one-second TTL, so the entry is expired and `serve_stale` is
 		// all that is keeping it.
@@ -1450,7 +1274,7 @@ blocking: {{ enabled: false }}
 		res := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 2))
 		waited := time.tick_since(begun)
 		if check(r, res.ok, "the expired entry was never served") {
-			check_eq_str(r, first_stale_address(r, res.wire), "203.0.113.9", "the expired answer")
+			check_eq_str(r, first_address(r, res.wire), "203.0.113.9", "the expired answer")
 			ttl, has_ttl := min_answer_ttl(r, res.wire)
 			if check(r, has_ttl, "no TTL in the stale answer") {
 				// The short fixed TTL a stale answer goes out with, so the
@@ -1477,7 +1301,7 @@ blocking: {{ enabled: false }}
 		res := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 3))
 		waited := time.tick_since(begun)
 		if check(r, res.ok, "the second client went unanswered") {
-			check_eq_str(r, first_stale_address(r, res.wire), "203.0.113.9", "the expired answer")
+			check_eq_str(r, first_address(r, res.wire), "203.0.113.9", "the expired answer")
 			check(r, waited < 2 * time.Second, "the second client waited %v", waited)
 		}
 		check_eq_int(r, mock_total(mock), 0, "upstream queries while a refresh is already running")
@@ -1517,37 +1341,22 @@ run_stale_refresh_cases :: proc(r: ^Runner) {
 		1200 * time.Millisecond,
 		make_a_response(qname, {203, 0, 113, 8}, 60, context.allocator),
 	)
-	if !mock_start(mock) {
-		skip_case(r, "serve_stale refresh", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "serve_stale refresh") {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 5s
-  attempts: 1
-  servers: ["127.0.0.1:%d"]
-cache:
-  enabled: true
-  max_entries: 100
-  max_ttl: 4
-  serve_stale: true
-  stale_timeout: 300ms
-blocking: {{ enabled: false }}
-`,
+	config := base_config(
 		udp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		timeout = "5s",
+		upstream_extra = "  attempts: 1",
+		cache = "{ enabled: true, max_entries: 100, max_ttl: 4, serve_stale: true, stale_timeout: 300ms }",
 	)
 
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
-		skip_case(r, "serve_stale refresh", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -1559,7 +1368,7 @@ blocking: {{ enabled: false }}
 			end_case(r)
 			return
 		}
-		check_eq_str(r, first_stale_address(r, first.wire), "203.0.113.8", "the answer that was cached")
+		check_eq_str(r, first_address(r, first.wire), "203.0.113.8", "the answer that was cached")
 
 		// Past `max_ttl`, which is what the entry was stored under.
 		time.sleep(4300 * time.Millisecond)
@@ -1587,7 +1396,7 @@ blocking: {{ enabled: false }}
 
 		third := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 13))
 		if check(r, third.ok, "no response after the refresh") {
-			check_eq_str(r, first_stale_address(r, third.wire), "203.0.113.8", "the refreshed answer")
+			check_eq_str(r, first_address(r, third.wire), "203.0.113.8", "the refreshed answer")
 			check_eq_int(
 				r,
 				mock_total(mock),
@@ -1599,17 +1408,9 @@ blocking: {{ enabled: false }}
 	end_case(r)
 }
 
-@(private = "file")
-first_stale_address :: proc(r: ^Runner, wire: []u8) -> string {
-	addrs := answer_addresses(r, wire)
-	return addrs[0] if len(addrs) > 0 else ""
-}
-
 // NOERROR whose answer is a CNAME out of the zone and nothing else: no record at
 // the target, and nothing in authority.
 bare_cname_reply :: proc(name: string) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = .A, class = .IN}
 	answer := make([]dns.Record, 1, context.temp_allocator)
 	answer[0] = dns.Record {
 		name  = name,
@@ -1618,17 +1419,7 @@ bare_cname_reply :: proc(name: string) -> []u8 {
 		ttl   = 3600,
 		data  = dns.Rdata_Name{name = "cdn.example.net."},
 	}
-	msg := dns.Message {
-		question = question,
-		answer   = answer,
-	}
-	msg.flags.qr = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return encode_reply(name, .A, {answer = answer})
 }
 
 // A referral: NOERROR, RA clear, the zone's NS in authority and no SOA - what a

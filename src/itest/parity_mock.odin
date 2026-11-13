@@ -238,7 +238,7 @@ pm_question :: proc(
 	if len(query) < 12 {
 		return nil, 0, 0, 0, false
 	}
-	if pm_u16(query, 4) != 1 {
+	if pw_u16(query, 4) != 1 {
 		return nil, 0, 0, 0, false
 	}
 	n, next, name_ok := pw_name(query, 12, allocator)
@@ -246,7 +246,7 @@ pm_question :: proc(
 		return nil, 0, 0, 0, false
 	}
 	pw_lower_name(n)
-	return n, pm_u16(query, next), pm_u16(query, next + 2), next + 4, true
+	return n, pw_u16(query, next), pw_u16(query, next + 2), next + 4, true
 }
 
 // What the query said it could receive: its EDNS payload size, or the 512 bytes
@@ -340,7 +340,7 @@ pm_cname_chain :: proc(
 	// Half the chains end at a name a `$dnstype` rule lists, so the walk is
 	// judged on the question's type (PARITY_BLOCKED_TYPED). Picked by where the
 	// record lands rather than drawn, so a seed replays the stream it found.
-	alias := pm_name("typed-alias." + PM_ZONE if base & 1 == 1 else "alias." + PM_ZONE, allocator)
+	alias := pg_encode_name("typed-alias." + PM_ZONE if base & 1 == 1 else "alias." + PM_ZONE, allocator)
 	pm_rr(body, PM_PTR_Q, 5, 1, 600, alias, allocator)
 	if qtype == 5 {
 		return 1
@@ -391,7 +391,7 @@ pm_compress_name :: proc(rdata: []u8, at, target: int, allocator: mem.Allocator)
 
 @(private = "file")
 pm_soa_authority :: proc(body: ^[dynamic]u8, r: ^Pg_Rand, allocator: mem.Allocator) -> u16 {
-	pm_rr(body, pm_name(PM_ZONE, allocator), 6, 1, 900, pm_rdata(r, 6, allocator), allocator)
+	pm_rr(body, pg_encode_name(PM_ZONE, allocator), 6, 1, 900, pm_rdata(r, 6, allocator), allocator)
 	return 1
 }
 
@@ -399,11 +399,11 @@ pm_soa_authority :: proc(body: ^[dynamic]u8, r: ^Pg_Rand, allocator: mem.Allocat
 pm_ns_authority :: proc(body: ^[dynamic]u8, allocator: mem.Allocator) -> u16 {
 	pm_rr(
 		body,
-		pm_name(PM_ZONE, allocator),
+		pg_encode_name(PM_ZONE, allocator),
 		2,
 		1,
 		1800,
-		pm_name("ns1." + PM_ZONE, allocator),
+		pg_encode_name("ns1." + PM_ZONE, allocator),
 		allocator,
 	)
 	return 1
@@ -411,7 +411,7 @@ pm_ns_authority :: proc(body: ^[dynamic]u8, allocator: mem.Allocator) -> u16 {
 
 @(private = "file")
 pm_glue :: proc(body: ^[dynamic]u8, r: ^Pg_Rand, allocator: mem.Allocator) -> u16 {
-	ns := pm_name("ns1." + PM_ZONE, allocator)
+	ns := pg_encode_name("ns1." + PM_ZONE, allocator)
 	pm_rr(body, ns, 1, 1, 1800, pm_rdata(r, 1, allocator), allocator)
 	pm_rr(body, ns, 28, 1, 1800, pm_rdata(r, 28, allocator), allocator)
 	return 2
@@ -524,24 +524,6 @@ pm_rr :: proc(
 }
 
 @(private)
-pm_name :: proc(text: string, allocator: mem.Allocator) -> []u8 {
-	out := make([]u8, len(text) + 1, allocator)
-	pos := 0
-	start := 0
-	for i in 0 ..< len(text) {
-		if text[i] != '.' {
-			continue
-		}
-		out[pos] = u8(i - start)
-		copy(out[pos + 1:], text[start:i])
-		pos += 1 + (i - start)
-		start = i + 1
-	}
-	out[pos] = 0
-	return out[:pos + 1]
-}
-
-@(private)
 pm_bytes :: proc(r: ^Pg_Rand, n: int, allocator: mem.Allocator) -> []u8 {
 	out := make([]u8, n, allocator)
 	for i in 0 ..< n {
@@ -560,11 +542,6 @@ pm_hash :: proc(name: []u8, qtype: u16) -> u64 {
 	}
 	h = (h ~ u64(qtype)) * 0x100000001b3
 	return h
-}
-
-@(private = "file")
-pm_u16 :: proc(b: []u8, off: int) -> u16 {
-	return u16(b[off]) << 8 | u16(b[off + 1])
 }
 
 @(private = "file")

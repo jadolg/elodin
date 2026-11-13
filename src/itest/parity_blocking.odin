@@ -22,7 +22,7 @@ it. A judge that consulted the implementation could not catch it being wrong.
 // Whether `name` (wire form) is `zone` or below it, compared without case on
 // label boundaries - the way a `||zone^` rule reads.
 parity_name_under :: proc(name: []u8, zone: string) -> bool {
-	want := pm_name(zone, context.temp_allocator)
+	want := pg_encode_name(zone, context.temp_allocator)
 	pos := 0
 	for pos < len(name) {
 		if len(name) - pos == len(want) && pw_names_equal_fold(name[pos:], want) {
@@ -39,7 +39,7 @@ parity_name_under :: proc(name: []u8, zone: string) -> bool {
 
 // Whether `name` (wire form) is strictly below `zone`: under it, and not it.
 parity_name_below :: proc(name: []u8, zone: string) -> bool {
-	return parity_name_under(name, zone) && !pw_names_equal_fold(name, pm_name(zone, context.temp_allocator))
+	return parity_name_under(name, zone) && !pw_names_equal_fold(name, pg_encode_name(zone, context.temp_allocator))
 }
 
 /*

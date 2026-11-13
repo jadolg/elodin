@@ -349,22 +349,14 @@ pg_name :: proc(g: ^Parity_Gen, allocator: mem.Allocator) -> []u8 {
 
 	case pg_chance(r, 3):
 		// One label of the full 63 bytes, under a pool zone.
-		label := make([]u8, 63, allocator)
-		for i in 0 ..< 63 {
-			label[i] = PG_LABEL_ALPHABET[pg_int(r, len(PG_LABEL_ALPHABET))]
-		}
-		return pg_join(g, [][]u8{label}, allocator)
+		return pg_join(g, [][]u8{pg_label(r, 63, allocator)}, allocator)
 
 	case pg_chance(r, 3):
 		// A name near the 255-byte ceiling: three 60-byte labels leave room for
 		// a short zone and the root.
 		labels := make([][]u8, 3, allocator)
 		for j in 0 ..< 3 {
-			label := make([]u8, 60, allocator)
-			for i in 0 ..< 60 {
-				label[i] = PG_LABEL_ALPHABET[pg_int(r, len(PG_LABEL_ALPHABET))]
-			}
-			labels[j] = label
+			labels[j] = pg_label(r, 60, allocator)
 		}
 		return pg_join(g, labels, allocator)
 
@@ -384,12 +376,7 @@ pg_name :: proc(g: ^Parity_Gen, allocator: mem.Allocator) -> []u8 {
 		depth := 1 + pg_int(r, 3)
 		labels := make([][]u8, depth, allocator)
 		for j in 0 ..< depth {
-			n := 1 + pg_int(r, 12)
-			label := make([]u8, n, allocator)
-			for i in 0 ..< n {
-				label[i] = PG_LABEL_ALPHABET[pg_int(r, len(PG_LABEL_ALPHABET))]
-			}
-			labels[j] = label
+			labels[j] = pg_label(r, 1 + pg_int(r, 12), allocator)
 		}
 		return pg_join(g, labels, allocator)
 	}
@@ -423,7 +410,17 @@ pg_join :: proc(g: ^Parity_Gen, labels: [][]u8, allocator: mem.Allocator) -> []u
 	return out
 }
 
+// `n` bytes drawn from the hostname alphabet.
 @(private = "file")
+pg_label :: proc(r: ^Pg_Rand, n: int, allocator: mem.Allocator) -> []u8 {
+	label := make([]u8, n, allocator)
+	for i in 0 ..< n {
+		label[i] = PG_LABEL_ALPHABET[pg_int(r, len(PG_LABEL_ALPHABET))]
+	}
+	return label
+}
+
+@(private)
 pg_encode_name :: proc(text: string, allocator: mem.Allocator) -> []u8 {
 	trimmed := strings.trim_suffix(text, ".")
 	if trimmed == "" {
@@ -492,40 +489,35 @@ pg_encode :: proc(q: Parity_Query, allocator: mem.Allocator) -> []u8 {
 		flags |= 0x0010
 	}
 
-	pg_put16(&buf, q.id)
-	pg_put16(&buf, flags)
-	pg_put16(&buf, 1)
-	pg_put16(&buf, 0)
-	pg_put16(&buf, 0)
-	pg_put16(&buf, q.edns ? 1 : 0)
+	pm_put16(&buf, q.id)
+	pm_put16(&buf, flags)
+	pm_put16(&buf, 1)
+	pm_put16(&buf, 0)
+	pm_put16(&buf, 0)
+	pm_put16(&buf, q.edns ? 1 : 0)
 
 	append(&buf, ..q.name)
-	pg_put16(&buf, q.qtype)
-	pg_put16(&buf, q.qclass)
+	pm_put16(&buf, q.qtype)
+	pm_put16(&buf, q.qclass)
 
 	if q.edns {
 		append(&buf, 0) // root owner name
-		pg_put16(&buf, 41)
-		pg_put16(&buf, q.udp_size)
+		pm_put16(&buf, 41)
+		pm_put16(&buf, q.udp_size)
 		append(&buf, 0) // extended rcode: a query never carries one
 		append(&buf, q.version)
-		pg_put16(&buf, q.do_bit ? PW_DO : 0)
+		pm_put16(&buf, q.do_bit ? PW_DO : 0)
 
 		rdata := make([dynamic]u8, 0, 32, allocator)
 		for o in q.options {
-			pg_put16(&rdata, o.code)
-			pg_put16(&rdata, u16(len(o.data)))
+			pm_put16(&rdata, o.code)
+			pm_put16(&rdata, u16(len(o.data)))
 			append(&rdata, ..o.data)
 		}
-		pg_put16(&buf, u16(len(rdata)))
+		pm_put16(&buf, u16(len(rdata)))
 		append(&buf, ..rdata[:])
 	}
 	return buf[:]
-}
-
-@(private = "file")
-pg_put16 :: proc(buf: ^[dynamic]u8, v: u16) {
-	append(buf, u8(v >> 8), u8(v))
 }
 
 @(private = "file")

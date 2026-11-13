@@ -3,7 +3,6 @@ package itest
 import "core:fmt"
 import "core:net"
 import "core:os"
-import "core:path/filepath"
 import "core:strings"
 import "core:sync"
 import "core:sys/posix"
@@ -22,54 +21,33 @@ with and sending the signal an operator's `systemctl reload` sends.
 */
 
 @(private = "file")
-config_reload_text :: proc(udp_port, upstream_port: int, extra: string) -> string {
-	return fmt.tprintf(
-		`log: {{ level: debug, queries: true }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-upstream:
-  timeout: 2s
-  attempts: 1
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: true }}
-blocking: {{ enabled: false }}
-server:
-  rate_limit: {{ enabled: false }}
-%s`,
+config_reload_text :: proc(
+	udp_port, upstream_port: int,
+	extra: string,
+	log := "{ level: debug, queries: true }",
+	rate_limit := false,
+) -> string {
+	return base_config(
 		udp_port,
-		udp_port,
-		upstream_port,
-		extra,
+		upstream_at(upstream_port),
+		log = log,
+		upstream_extra = "  attempts: 1",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		cache = "{ enabled: true }",
+		extra = fmt.tprintf("server:\n  rate_limit: {{ enabled: %v }}\n%s", rate_limit, extra),
 	)
 }
 
-/*
-Rewrite the server's file, send SIGHUP, and wait for `needle` to be logged once
-more than it was: the line that says this reload, rather than an earlier one,
-is over.
-*/
-@(private)
-reload_to :: proc(r: ^Runner, srv: ^Server, config: string, needle: string, timeout := 5 * time.Second) -> bool {
-	path := filepath.join({r.work_dir, fmt.tprintf("elodin-%d.yaml", srv.udp_port)}, context.temp_allocator) or_else ""
-	before := log_count(srv, needle)
-	written := without_dnssec(config)
-	if os.write_entire_file(path, transmute([]u8)written) != nil {
-		return false
-	}
-	return signal_reload(srv) && wait_for_log_count(srv, needle, before + 1, timeout)
-}
-
+// The first address of a reply, or what stood in its way, for `check_eq_str`.
 @(private = "file")
-first_address :: proc(r: ^Runner, res: Query_Result) -> string {
+reply_address :: proc(r: ^Runner, res: Query_Result) -> string {
 	if !res.ok {
 		return "(no reply)"
 	}
-	addrs := answer_addresses(r, res.wire)
-	if len(addrs) == 0 {
-		return "(no address)"
+	if addr := first_address(r, res.wire); addr != "" {
+		return addr
 	}
-	return addrs[0]
+	return "(no address)"
 }
 
 run_config_reload_cases :: proc(r: ^Runner) {
@@ -94,7 +72,6 @@ run_config_reload_cases :: proc(r: ^Runner) {
 	udp_port := next_port(r)
 	srv, ok := start_server(r, Server_Options{config = config_reload_text(udp_port, a_port, ""), udp_port = udp_port})
 	if !ok {
-		skip_case(r, "config reload", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -103,12 +80,12 @@ run_config_reload_cases :: proc(r: ^Runner) {
 
 	start_case(r, "config reload: a rewrite edit applies without a restart, and the cache it left alone keeps its answers")
 	{
-		got := first_address(r, query_udp(udp_port, build_query("cached.reload.test.", u16(dns.Type.A))))
+		got := reply_address(r, query_udp(udp_port, build_query("cached.reload.test.", u16(dns.Type.A))))
 		check_eq_str(r, got, "192.0.2.1", "the first answer")
 		asked := mock_total(a)
 		if check(r, reload_to(r, &srv, config_reload_text(udp_port, a_port, REWRITE), "msg=reloaded"), "the reload was never logged") {
-			check_eq_str(r, first_address(r, query_udp(udp_port, build_query("rw.reload.test.", u16(dns.Type.A)))), "198.51.100.7", "the new rewrite")
-			check_eq_str(r, first_address(r, query_udp(udp_port, build_query("cached.reload.test.", u16(dns.Type.A)))), "192.0.2.1", "the cached answer")
+			check_eq_str(r, reply_address(r, query_udp(udp_port, build_query("rw.reload.test.", u16(dns.Type.A)))), "198.51.100.7", "the new rewrite")
+			check_eq_str(r, reply_address(r, query_udp(udp_port, build_query("cached.reload.test.", u16(dns.Type.A)))), "192.0.2.1", "the cached answer")
 			check_eq_int(r, mock_total(a), asked, "upstream queries after the reload")
 			check(r, log_contains(&srv, "changed=rewrites rebuilt=none cache=kept"), "the reload line does not say what it did")
 		}
@@ -117,20 +94,15 @@ run_config_reload_cases :: proc(r: ^Runner) {
 
 	start_case(r, "config reload: a connection held across a reload is answered under the new configuration")
 	{
-		socket, derr := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = udp_port})
-		if check(r, derr == nil, "cannot connect over tcp") {
-			defer net.close(socket)
-			_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-			_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
-			conn := Test_Conn {
-				socket = socket,
-			}
+		conn, dialled := dial_tcp(udp_port)
+		if check(r, dialled, "cannot connect over tcp") {
+			defer net.close(conn.socket)
 			before := stream_query(&conn, build_query("rw.reload.test.", u16(dns.Type.A)), context.temp_allocator)
-			check_eq_str(r, first_address(r, before), "198.51.100.7", "the rewrite before the reload")
+			check_eq_str(r, reply_address(r, before), "198.51.100.7", "the rewrite before the reload")
 			moved := strings.concatenate({config_reload_text(udp_port, a_port, ""), "rewrites:\n  - { domain: rw.reload.test, answer: 198.51.100.8 }\n"}, context.temp_allocator)
 			if check(r, reload_to(r, &srv, moved, "msg=reloaded"), "the reload was never logged") {
 				after := stream_query(&conn, build_query("rw.reload.test.", u16(dns.Type.A)), context.temp_allocator)
-				check_eq_str(r, first_address(r, after), "198.51.100.8", "the rewrite after the reload, on the same connection")
+				check_eq_str(r, reply_address(r, after), "198.51.100.8", "the rewrite after the reload, on the same connection")
 			}
 		}
 	}
@@ -140,14 +112,9 @@ run_config_reload_cases :: proc(r: ^Runner) {
 	// it has to reach the connections already open as well.
 	start_case(r, "config reload: a connection held across a reload that drops its network from allow_from is refused")
 	{
-		socket, derr := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = udp_port})
-		if check(r, derr == nil, "cannot connect over tcp") {
-			defer net.close(socket)
-			_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-			_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
-			conn := Test_Conn {
-				socket = socket,
-			}
+		conn, dialled := dial_tcp(udp_port)
+		if check(r, dialled, "cannot connect over tcp") {
+			defer net.close(conn.socket)
 			check(r, stream_query(&conn, build_query("rw.reload.test.", u16(dns.Type.A)), context.temp_allocator).ok, "no answer before the reload")
 			narrowed := config_reload_text(udp_port, a_port, "  allow_from: [\"192.0.2.0/24\"]\n")
 			if check(r, reload_to(r, &srv, narrowed, "msg=reloaded"), "the reload was never logged") {
@@ -161,7 +128,7 @@ run_config_reload_cases :: proc(r: ^Runner) {
 	start_case(r, "config reload: a changed upstream is asked from then on, and its predecessor's cached answers are not served")
 	{
 		if check(r, reload_to(r, &srv, config_reload_text(udp_port, b_port, REWRITE), "msg=reloaded"), "the reload was never logged") {
-			check_eq_str(r, first_address(r, query_udp(udp_port, build_query("cached.reload.test.", u16(dns.Type.A)))), "192.0.2.2", "the answer after the upstream changed")
+			check_eq_str(r, reply_address(r, query_udp(udp_port, build_query("cached.reload.test.", u16(dns.Type.A)))), "192.0.2.2", "the answer after the upstream changed")
 			check(r, log_contains(&srv, "rebuilt=upstreams cache=flushed"), "the reload line does not say the cache was flushed")
 		}
 	}
@@ -175,7 +142,7 @@ run_config_reload_cases :: proc(r: ^Runner) {
 	*/
 	start_case(r, "config reload: turning rebind protection on covers names already in the cache")
 	{
-		got := first_address(r, query_udp(udp_port, build_query("inside.reload.test.", u16(dns.Type.A))))
+		got := reply_address(r, query_udp(udp_port, build_query("inside.reload.test.", u16(dns.Type.A))))
 		check_eq_str(r, got, "10.0.0.2", "the private answer while the guard is off")
 		guarded := strings.concatenate({config_reload_text(udp_port, b_port, REWRITE), "rebind: { enabled: true }\n"}, context.temp_allocator)
 		if check(r, reload_to(r, &srv, guarded, "msg=reloaded"), "the reload was never logged") {
@@ -189,12 +156,12 @@ run_config_reload_cases :: proc(r: ^Runner) {
 
 	start_case(r, "config reload: a file that does not load leaves the running configuration serving")
 	{
-		path := filepath.join({r.work_dir, fmt.tprintf("elodin-%d.yaml", udp_port)}, context.temp_allocator) or_else ""
+		path := config_path(r, udp_port)
 		before := log_count(&srv, "keeping the configuration already in effect")
 		if check(r, os.write_entire_file(path, transmute([]u8)string("upstream: { servers: [\n")) == nil, "cannot break the file") &&
 		   check(r, signal_reload(&srv), "could not deliver SIGHUP") &&
 		   check(r, wait_for_log_count(&srv, "keeping the configuration already in effect", before + 1, 5 * time.Second), "the refusal was never logged") {
-			check_eq_str(r, first_address(r, query_udp(udp_port, build_query("rw.reload.test.", u16(dns.Type.A)))), "198.51.100.7", "the rewrite in effect")
+			check_eq_str(r, reply_address(r, query_udp(udp_port, build_query("rw.reload.test.", u16(dns.Type.A)))), "198.51.100.7", "the rewrite in effect")
 		}
 	}
 	end_case(r)
@@ -262,22 +229,17 @@ run_config_reload_cases :: proc(r: ^Runner) {
 	*/
 	start_case(r, "config reload: a shorter client_timeout reaches a connection held across the reload")
 	{
-		socket, derr := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = udp_port})
-		if check(r, derr == nil, "cannot connect over tcp") {
-			defer net.close(socket)
-			_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-			_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
-			conn := Test_Conn {
-				socket = socket,
-			}
+		conn, dialled := dial_tcp(udp_port)
+		if check(r, dialled, "cannot connect over tcp") {
+			defer net.close(conn.socket)
 			check(r, stream_query(&conn, build_query("rw.reload.test.", u16(dns.Type.A)), context.temp_allocator).ok, "no answer before the reload")
 			shorter := config_reload_text(udp_port, a_port, "  client_timeout: 1s\n")
 			if check(r, reload_to(r, &srv, shorter, "msg=reloaded"), "the reload was never logged") {
 				check(r, stream_query(&conn, build_query("rw.reload.test.", u16(dns.Type.A)), context.temp_allocator).ok, "no answer after the reload")
-				_ = net.set_option(socket, .Receive_Timeout, 5 * time.Second)
+				_ = net.set_option(conn.socket, .Receive_Timeout, 5 * time.Second)
 				buf: [1]u8
-				n, rerr := net.recv_tcp(socket, buf[:])
-				check(r, n == 0 && rerr == nil, fmt.tprintf("the idle connection was not closed on the new client_timeout (read %d, %v)", n, rerr))
+				n, rerr := net.recv_tcp(conn.socket, buf[:])
+				check(r, n == 0 && rerr == nil, "the idle connection was not closed on the new client_timeout (read %d, %v)", n, rerr)
 			}
 		}
 	}
@@ -298,15 +260,9 @@ run_log_reopen_case :: proc(r: ^Runner, upstream_port: int) {
 	udp_port := next_port(r)
 	log_file := fmt.aprintf("%s/reload-%d.log", r.work_dir, udp_port)
 	defer delete(log_file)
-	config := strings.concatenate(
-		{config_reload_text(udp_port, upstream_port, ""), fmt.tprintf("log: {{ level: info, file: %q }}\n", log_file)},
-		context.temp_allocator,
-	)
-	// The `log:` above is the second one in the file; keep only the last.
-	config, _ = strings.replace(config, "log: { level: debug, queries: true }\n", "", 1, context.temp_allocator)
+	config := config_reload_text(udp_port, upstream_port, "", log = fmt.tprintf("{{ level: info, file: %q }}", log_file))
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
-		skip_case(r, "config reload: the log is reopened", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -357,18 +313,10 @@ budget is refilled.
 run_cookie_limit_reload_case :: proc(r: ^Runner, upstream_port: int) {
 	udp_port := next_port(r)
 	text :: proc(udp_port, upstream_port: int, cookies: bool) -> string {
-		base, _ := strings.replace(
-			config_reload_text(udp_port, upstream_port, fmt.tprintf("cookies: {{ enabled: %v }}\n", cookies)),
-			"rate_limit: { enabled: false }",
-			"rate_limit: { enabled: true }",
-			1,
-			context.temp_allocator,
-		)
-		return base
+		return config_reload_text(udp_port, upstream_port, fmt.tprintf("cookies: {{ enabled: %v }}\n", cookies), rate_limit = true)
 	}
 	srv, ok := start_server(r, Server_Options{config = text(udp_port, upstream_port, false), udp_port = udp_port})
 	if !ok {
-		skip_case(r, "config reload: the rate limit line follows cookies", "server did not start")
 		return
 	}
 	defer stop_server(&srv)

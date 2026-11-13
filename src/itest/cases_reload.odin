@@ -18,27 +18,21 @@ than reading the log would.
 
 @(private = "file")
 config_for_reload :: proc(udp_port, dot_port, doh_port: int, cert_file, key_file: string) -> string {
-	return fmt.tprintf(
-		`log: {{ level: debug }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
-  doh: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
-upstream:
-  timeout: 2s
-  servers: ["127.0.0.1:1"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+	return base_config(
 		udp_port,
-		udp_port,
-		dot_port,
-		cert_file,
-		key_file,
-		doh_port,
-		cert_file,
-		key_file,
+		`["127.0.0.1:1"]`,
+		log = "{ level: debug }",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		listeners_extra = fmt.tprintf(
+			`  dot: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}
+  doh: {{ enabled: true, address: "127.0.0.1", port: %d, cert_file: %s, key_file: %s }}`,
+			dot_port,
+			cert_file,
+			key_file,
+			doh_port,
+			cert_file,
+			key_file,
+		),
 	)
 }
 
@@ -95,10 +89,11 @@ install_cert :: proc(dst, src: string) -> bool {
 // "it is not".
 @(private = "file")
 dot_handshake_verifies :: proc(dot_port: int, ca_file, hostname: string) -> bool {
-	socket, derr := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = dot_port})
-	if derr != nil {
+	plain, dialled := dial_tcp(dot_port)
+	if !dialled {
 		return false
 	}
+	socket := plain.socket
 	// Closed here only while no session owns it: `tlsx.close` closes it too,
 	// and a second close of the same number can take a descriptor another
 	// thread has opened in between.
@@ -106,8 +101,6 @@ dot_handshake_verifies :: proc(dot_port: int, ca_file, hostname: string) -> bool
 	defer if !handshaken {
 		net.close(socket)
 	}
-	_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-	_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
 
 	ctx, cerr := tlsx.client_context(true, ca_file, nil, context.temp_allocator)
 	if cerr != .None {
@@ -177,7 +170,6 @@ run_reload_cases :: proc(r: ^Runner) {
 		},
 	)
 	if !ok {
-		skip_case(r, "tls reload", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -298,8 +290,9 @@ run_reload_cases :: proc(r: ^Runner) {
 		the displaced one whether or not the certificate is new, which is the
 		whole of what this case needs.
 		*/
-		socket, derr := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = dot_port})
-		if check(r, derr == nil, "cannot open a connection to the DoT port") {
+		plain, dialled := dial_tcp(dot_port)
+		if check(r, dialled, "cannot open a connection to the DoT port") {
+			socket := plain.socket
 			held: ^tlsx.Conn
 			defer {
 				if held != nil {
@@ -308,8 +301,6 @@ run_reload_cases :: proc(r: ^Runner) {
 					net.close(socket)
 				}
 			}
-			_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-			_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
 
 			// A whole handshake on a second connection, to place the one above
 			// well inside the server. One accept loop serves this listener and

@@ -21,28 +21,17 @@ insists all of them parse, rather than checking the ones it went looking for.
 
 @(private = "file")
 config_logfmt :: proc(udp_port, upstream_port: int) -> string {
-	return fmt.tprintf(
-		`log: {{ level: info, queries: true }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+	return base_config(
 		udp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		log = "{ level: info, queries: true }",
+		timeout = "3s",
 	)
 }
 
 run_logfmt_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("logfmt", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 5})
-	if !mock_start(mock) {
-		skip_case(r, "logfmt", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "logfmt", "logfmt", {203, 0, 113, 5})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -50,7 +39,6 @@ run_logfmt_cases :: proc(r: ^Runner) {
 	udp_port := next_port(r)
 	srv, ok := start_server(r, Server_Options{config = config_logfmt(udp_port, upstream_port), udp_port = udp_port})
 	if !ok {
-		skip_case(r, "logfmt", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -141,7 +129,7 @@ log_file_case :: proc(r: ^Runner, upstream_port: int) {
 	_ = os.remove(log_path)
 	// A tracer that cannot attach here - absent, ptrace refused, or older than
 	// 6.6 and so without --kill-on-exit - is no evidence either way.
-	if !runs_ok({"strace", "--kill-on-exit", "-o", "/dev/null", "true"}) {
+	if !runs_ok(r, {"strace", "--kill-on-exit", "-o", "/dev/null", "true"}) {
 		skip_case(r, NAME, "strace 6.6 or later is not installed or cannot trace here")
 		return
 	}
@@ -166,42 +154,31 @@ log_file_case :: proc(r: ^Runner, upstream_port: int) {
 	append(&env, fmt.tprintf("ASAN_OPTIONS=%s:detect_leaks=0", asan_options))
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: info, queries: true, file: %q }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-		log_path,
+	config := base_config(
 		udp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		log = fmt.tprintf("{{ level: info, queries: true, file: %q }}", log_path),
+		timeout = "3s",
 	)
-	srv, ok := start_server_raw(
+	// strace is known to work here, so a server that does not answer under it
+	// is a failure, not a skip - which `start_server` has recorded.
+	srv, ok := start_server(
 		r,
-		config,
-		udp_port,
-		env = env[:],
-		// --kill-on-exit: `stop_server` kills strace, and a tracee outlives its
-		// tracer otherwise, still bound to the port. --seccomp-bpf: the server
-		// stops only at the traced calls, not at every syscall of every thread.
-		wrap = {"strace", "--kill-on-exit", "--seccomp-bpf", "-f", "-qq", "-e", "trace=fsync,fdatasync,sync_file_range", "-o", trace_path},
+		Server_Options {
+			config = config,
+			udp_port = udp_port,
+			env = env[:],
+			// --kill-on-exit: `stop_server` kills strace, and a tracee outlives its
+			// tracer otherwise, still bound to the port. --seccomp-bpf: the server
+			// stops only at the traced calls, not at every syscall of every thread.
+			wrap = {"strace", "--kill-on-exit", "--seccomp-bpf", "-f", "-qq", "-e", "trace=fsync,fdatasync,sync_file_range", "-o", trace_path},
+			warmup = 5 * time.Second,
+		},
 	)
 	if !ok {
-		// start_server_raw has failed the run already.
 		return
 	}
 	defer stop_server(&srv)
-	// strace is known to work here, so a server that does not answer under it
-	// is a failure, not a skip.
-	if !wait_ready(&srv, 10 * time.Second) {
-		fail(r, "server on port %d never became ready under strace; log:\n%s", udp_port, read_log(&srv))
-		return
-	}
 
 	for i in 0 ..< QUERIES {
 		_ = query_udp(udp_port, build_query(fmt.tprintf("sync-%d.example.", i), u16(dns.Type.A)), context.temp_allocator)
@@ -243,14 +220,11 @@ blocking: {{ enabled: false }}
 	end_case(r)
 }
 
+// Whether `command` runs and exits 0, its output kept out of the suite's own.
 @(private = "file")
-runs_ok :: proc(command: []string) -> bool {
-	process, perr := os.process_start(os.Process_Desc{command = command})
-	if perr != nil {
-		return false
-	}
-	state, werr := os.process_wait(process)
-	return werr == nil && state.exit_code == 0
+runs_ok :: proc(r: ^Runner, command: []string) -> bool {
+	res := run_command(command, nil, filepath.join({r.work_dir, "runs-ok.txt"}, context.temp_allocator) or_else "")
+	return res.ok && res.exit_code == 0
 }
 
 /*

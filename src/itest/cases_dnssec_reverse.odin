@@ -1,6 +1,5 @@
 package itest
 
-import "core:fmt"
 import "elodin:dns"
 
 /*
@@ -229,30 +228,13 @@ run_dnssec_reverse_cases :: proc(r: ^Runner) {
 	for f in R6_FIXTURES {
 		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
 	}
-	if !mock_start(mock) {
-		skip_case(r, "dnssec: ipv6 reverse", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "dnssec: ipv6 reverse") {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  servers: [udp://127.0.0.1:%d]
-cache: {{enabled: false}}
-blocking: {{enabled: false}}
-dnssec:
-  enabled: true
-  trust_anchors:
-    - %q
-`,
-		udp_port,
-		upstream_port,
-		R6_ANCHOR,
-	)
+	config := dnssec_config(udp_port, upstream_port, []string{R6_ANCHOR}, log = "{ level: info }")
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
 		return
@@ -269,7 +251,7 @@ dnssec:
 			// checked against the zone's own key. SERVFAIL here is #352, and a
 			// NOERROR or an NXDOMAIN without AD would mean the walk was skipped
 			// rather than taken.
-			check(r, len(res.wire) >= 4 && res.wire[3] & 0x20 != 0, "the answer does not carry the AD bit")
+			check(r, h.ad, "the answer does not carry the AD bit")
 		}
 	}
 	end_case(r)

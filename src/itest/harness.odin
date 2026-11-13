@@ -93,6 +93,8 @@ Server :: struct {
 	running:   bool,
 	// See `Runner.graceful_stop`.
 	graceful:  bool,
+	// Started on its configuration as written, which `reload_to` keeps to.
+	verbatim:  bool,
 }
 
 next_port :: proc(r: ^Runner) -> int {
@@ -232,6 +234,37 @@ write_fixture :: proc(r: ^Runner, path: string, data: []u8) -> bool {
 	return true
 }
 
+/*
+Write `body` to `name` in the run's work directory and hand back the path, failing
+the case when the write does not land (see `write_fixture`).
+*/
+write_work_file :: proc(r: ^Runner, name: string, body: string) -> (path: string, ok: bool) {
+	path = filepath.join({r.work_dir, name}, context.temp_allocator) or_else ""
+	return path, write_fixture(r, path, transmute([]u8)body)
+}
+
+// `--check` on `path`. A binary that did not run fails the case here, since a
+// zero exit code and empty output would otherwise pass any case that expects
+// success.
+new_check :: proc(r: ^Runner, path: string, tag: string) -> Run_Result {
+	res := run_binary(r, []string{"--config", path, "--check"}, tag)
+	check(r, res.ok, "could not run the binary")
+	return res
+}
+
+/*
+`--check` on a configuration written out as `<tag>.yaml`. Neither a write that
+did not land nor a binary that did not run is mistaken for the rejection a case
+may be looking for: both fail the case and come back with `ok` false.
+*/
+check_config_text :: proc(r: ^Runner, tag: string, body: string) -> Run_Result {
+	path, written := write_work_file(r, fmt.tprintf("%s.yaml", tag), body)
+	if !written {
+		return {}
+	}
+	return new_check(r, path, tag)
+}
+
 // Run the binary to completion with `args` and collect what it printed. For the
 // one-shot modes - `--version`, `--check` - that never bind a socket.
 run_binary :: proc(r: ^Runner, args: []string, tag: string) -> Run_Result {
@@ -290,6 +323,10 @@ Server_Options :: struct {
 	// Let the server download remote blocklists. Off by default so the suite
 	// stays hermetic; the list cases point it at a local HTTP mock.
 	allow_fetch: bool,
+	// Passed through to `start_server_raw`; see there.
+	verbatim:  bool,
+	env:       []string,
+	wrap:      []string,
 }
 
 /*
@@ -306,34 +343,99 @@ racing a bind, and for the TLS endpoints losing that race is not a lone red
 case - the dial fails, and every case behind it in the group fails with it.
 */
 start_server :: proc(r: ^Runner, opts: Server_Options) -> (srv: Server, ok: bool) {
-	srv, ok = start_server_raw(r, opts.config, opts.udp_port, opts.allow_fetch)
-	if !ok {
-		return srv, false
-	}
+	srv = start_server_raw(r, opts.config, opts.udp_port, opts.allow_fetch, opts.verbatim, opts.env, opts.wrap) or_return
 	srv.dot_port = opts.dot_port
 	srv.doh_port = opts.doh_port
 
-	if !wait_ready(&srv, 5 * time.Second + opts.warmup) {
-		fail(r, "server on port %d never became ready; log:\n%s", opts.udp_port, read_log(&srv))
-		stop_server(&srv)
-		return srv, false
+	budget := 5 * time.Second + opts.warmup
+	never := ""
+	switch {
+	case !wait_ready(&srv, budget):
+		never = "became ready"
+	case opts.tcp_port > 0 && !wait_tcp(opts.tcp_port, budget):
+		never = "answered over tcp"
+	case opts.dot_port > 0 && !wait_dot(opts.dot_port, budget):
+		never = "answered over dot"
+	case opts.doh_port > 0 && !wait_doh(opts.doh_port, budget):
+		never = "handshook over doh"
 	}
-	if opts.tcp_port > 0 && !wait_tcp(opts.tcp_port, 5 * time.Second + opts.warmup) {
-		fail(r, "server on port %d never answered over tcp; log:\n%s", opts.udp_port, read_log(&srv))
-		stop_server(&srv)
-		return srv, false
-	}
-	if opts.dot_port > 0 && !wait_dot(opts.dot_port, 5 * time.Second + opts.warmup) {
-		fail(r, "server on port %d never answered over dot; log:\n%s", opts.udp_port, read_log(&srv))
-		stop_server(&srv)
-		return srv, false
-	}
-	if opts.doh_port > 0 && !wait_doh(opts.doh_port, 5 * time.Second + opts.warmup) {
-		fail(r, "server on port %d never handshook over doh; log:\n%s", opts.udp_port, read_log(&srv))
+	if never != "" {
+		fail(r, "server on port %d never %s; log:\n%s", opts.udp_port, never, read_log(&srv))
 		stop_server(&srv)
 		return srv, false
 	}
 	return srv, true
+}
+
+// Where `start_server_raw` writes the configuration for the server on `udp_port`,
+// and so where a reload has to write the one it moves to.
+config_path :: proc(r: ^Runner, udp_port: int) -> string {
+	return filepath.join({r.work_dir, fmt.tprintf("elodin-%d.yaml", udp_port)}, context.temp_allocator) or_else ""
+}
+
+/*
+The configuration most cases start from: UDP on loopback and nothing else
+listening, `servers` as the upstreams, and the cache and blocking off so nothing
+sits between an upstream's answer and the client.
+
+Each section a case varies is a parameter rather than text appended after, since
+the loader refuses a key given twice. `servers` is the `upstream.servers` value
+(`upstream_at` for one loopback mock); `listeners_extra` and `upstream_extra` are
+more keys inside those sections, indented two spaces; `extra` is more top-level
+sections. An empty `timeout` leaves the key out.
+*/
+base_config :: proc(
+	udp_port: int,
+	servers: string,
+	log := "{ level: warn }",
+	timeout := "2s",
+	upstream_extra := "",
+	listeners_extra := "",
+	tcp := "{ enabled: false }",
+	cache := "{ enabled: false }",
+	blocking := "{ enabled: false }",
+	extra := "",
+) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	fmt.sbprintf(&b, "log: %s\nlisteners:\n  udp: {{ enabled: true, address: \"127.0.0.1\", port: %d }}\n  tcp: %s\n", log, udp_port, tcp)
+	write_lines(&b, listeners_extra)
+	strings.write_string(&b, "upstream:\n")
+	if timeout != "" {
+		fmt.sbprintf(&b, "  timeout: %s\n", timeout)
+	}
+	write_lines(&b, upstream_extra)
+	fmt.sbprintf(&b, "  servers: %s\ncache: %s\nblocking: %s\n", servers, cache, blocking)
+	write_lines(&b, extra)
+	return strings.to_string(b)
+}
+
+// `text` on lines of its own: a newline after it when it has none.
+@(private = "file")
+write_lines :: proc(b: ^strings.Builder, text: string) {
+	if text == "" {
+		return
+	}
+	strings.write_string(b, text)
+	if !strings.has_suffix(text, "\n") {
+		strings.write_byte(b, '\n')
+	}
+}
+
+// One loopback upstream, as a `servers` value for `base_config`.
+upstream_at :: proc(port: int) -> string {
+	return fmt.tprintf(`["127.0.0.1:%d"]`, port)
+}
+
+// Loopback upstreams on `ports`, in order and each under `scheme` ("udp://",
+// say, or none), as a `servers` value for `base_config`.
+upstreams_at :: proc(ports: []int, scheme := "") -> string {
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_byte(&b, '[')
+	for port, i in ports {
+		fmt.sbprintf(&b, "%s\"%s127.0.0.1:%d\"", ", " if i > 0 else "", scheme, port)
+	}
+	strings.write_byte(&b, ']')
+	return strings.to_string(b)
 }
 
 /*
@@ -372,7 +474,7 @@ start_server_raw :: proc(
 	srv: Server,
 	ok: bool,
 ) {
-	cfg_path := filepath.join({r.work_dir, fmt.tprintf("elodin-%d.yaml", udp_port)}, context.temp_allocator) or_else ""
+	cfg_path := config_path(r, udp_port)
 	log_path := filepath.join({r.work_dir, fmt.tprintf("elodin-%d.log", udp_port)}, context.temp_allocator) or_else ""
 
 	written := config if verbatim else without_dnssec(config)
@@ -413,6 +515,7 @@ start_server_raw :: proc(
 		// Carried on the server rather than looked up at stop time, so a case
 		// that keeps one past the runner's frame still ends it the same way.
 		graceful = r.graceful_stop,
+		verbatim = verbatim,
 	}
 	return srv, true
 }
@@ -428,13 +531,24 @@ the probe has to be retried rather than waited on.
 @(private)
 PROBE_TIMEOUT :: 250 * time.Millisecond
 
+// The CHAOS version.bind query every readiness probe sends.
+@(private)
+probe_query :: proc() -> []u8 {
+	return build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
+}
+
 @(private)
 wait_ready :: proc(srv: ^Server, timeout: time.Duration) -> bool {
-	probe := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
-	deadline := time.time_add(time.now(), timeout)
+	return wait_answer(srv.udp_port, timeout, tcp = false)
+}
 
+// Retry the probe over one transport until it is answered or `timeout` passes.
+@(private = "file")
+wait_answer :: proc(port: int, timeout: time.Duration, tcp: bool) -> bool {
+	probe := probe_query()
+	deadline := time.time_add(time.now(), timeout)
 	for time.diff(deadline, time.now()) < 0 {
-		res := query_udp(srv.udp_port, probe, context.temp_allocator, PROBE_TIMEOUT)
+		res := tcp ? query_tcp(port, probe, context.temp_allocator, PROBE_TIMEOUT) : query_udp(port, probe, context.temp_allocator, PROBE_TIMEOUT)
 		if res.ok {
 			return true
 		}
@@ -454,15 +568,7 @@ locally, retried until the deadline.
 */
 @(private)
 wait_tcp :: proc(tcp_port: int, timeout: time.Duration) -> bool {
-	probe := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
-	deadline := time.time_add(time.now(), timeout)
-	for time.diff(deadline, time.now()) < 0 {
-		res := query_tcp(tcp_port, probe, context.temp_allocator, PROBE_TIMEOUT)
-		if res.ok {
-			return true
-		}
-	}
-	return false
+	return wait_answer(tcp_port, timeout, tcp = true)
 }
 
 /*
@@ -489,7 +595,7 @@ reachable and no fixture is spent.
 */
 @(private)
 wait_dot :: proc(dot_port: int, timeout: time.Duration) -> bool {
-	probe := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
+	probe := probe_query()
 	deadline := time.time_add(time.now(), timeout)
 	for time.diff(deadline, time.now()) < 0 {
 		res := query_dot(dot_port, probe, context.temp_allocator)
@@ -585,16 +691,7 @@ the suite.
 */
 stop_server :: proc(srv: ^Server) {
 	if srv.running && srv.graceful {
-		if posix.kill(posix.pid_t(srv.process.pid), .SIGTERM) == .OK {
-			deadline := time.time_add(time.now(), GRACEFUL_STOP_TIMEOUT)
-			for time.diff(time.now(), deadline) > 0 {
-				state, werr := os.process_wait(srv.process, 100 * time.Millisecond)
-				if werr == nil && state.exited {
-					srv.running = false
-					break
-				}
-			}
-		}
+		_, _ = signal_shutdown(srv, GRACEFUL_STOP_TIMEOUT)
 	}
 	if srv.running {
 		_ = os.process_kill(srv.process)
@@ -649,6 +746,20 @@ signal_reload :: proc(srv: ^Server) -> bool {
 	return posix.kill(posix.pid_t(srv.process.pid), .SIGHUP) == .OK
 }
 
+/*
+Rewrite the server's file, send SIGHUP, and wait for `needle` to be logged once
+more than it was: the line that says this reload, rather than an earlier one,
+is over.
+*/
+reload_to :: proc(r: ^Runner, srv: ^Server, config: string, needle: string, timeout := 5 * time.Second) -> bool {
+	before := log_count(srv, needle)
+	written := config if srv.verbatim else without_dnssec(config)
+	if !write_fixture(r, config_path(r, srv.udp_port), transmute([]u8)written) {
+		return false
+	}
+	return signal_reload(srv) && wait_for_log_count(srv, needle, before + 1, timeout)
+}
+
 read_log :: proc(srv: ^Server) -> string {
 	data, err := os.read_entire_file(srv.log_path, context.temp_allocator)
 	if err != nil {
@@ -667,17 +778,7 @@ log_contains :: proc(srv: ^Server, needle: string) -> bool {
 // Counts how often a substring appears in the server log; used to observe which
 // upstream answered.
 log_count :: proc(srv: ^Server, needle: string) -> int {
-	text := read_log(srv)
-	count := 0
-	rest := text
-	for {
-		idx := strings.index(rest, needle)
-		if idx < 0 {
-			return count
-		}
-		count += 1
-		rest = rest[idx + len(needle):]
-	}
+	return strings.count(read_log(srv), needle)
 }
 
 /*
@@ -783,22 +884,7 @@ build_query :: proc(
 	append(&buf, 0, 0, 0, 0) // ancount, nscount
 	append(&buf, u8(arcount >> 8), u8(arcount))
 
-	trimmed := strings.trim_suffix(name, ".")
-	if trimmed != "" {
-		rest := trimmed
-		for len(rest) > 0 {
-			label := rest
-			if idx := strings.index_byte(rest, '.'); idx >= 0 {
-				label = rest[:idx]
-				rest = rest[idx + 1:]
-			} else {
-				rest = ""
-			}
-			append(&buf, u8(len(label)))
-			append(&buf, ..transmute([]u8)label)
-		}
-	}
-	append(&buf, 0)
+	append_name(&buf, name)
 	append(&buf, u8(qtype >> 8), u8(qtype))
 	append(&buf, u8(class >> 8), u8(class))
 
@@ -835,6 +921,67 @@ build_query :: proc(
 		}
 	}
 	return buf[:]
+}
+
+// `name` in wire form, label by label to the root, by hand for the same reason.
+append_name :: proc(buf: ^[dynamic]u8, name: string) {
+	rest := strings.trim_suffix(name, ".")
+	for len(rest) > 0 {
+		label := rest
+		if idx := strings.index_byte(rest, '.'); idx >= 0 {
+			label = rest[:idx]
+			rest = rest[idx + 1:]
+		} else {
+			rest = ""
+		}
+		append(buf, u8(len(label)))
+		append(buf, ..transmute([]u8)label)
+	}
+	append(buf, 0)
+}
+
+/*
+Encode `msg` as the reply to one `name`/`qtype` question: the question is set
+and QR, RD and RA are on, whatever else `msg` carries. Nil when it cannot be
+encoded, which a mock serves as no reply at all.
+*/
+encode_reply :: proc(name: string, qtype: dns.Type, msg: dns.Message, allocator := context.allocator) -> []u8 {
+	msg := msg
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = dns.Question {
+		name  = name,
+		type  = qtype,
+		class = .IN,
+	}
+	msg.question = question
+	msg.flags.qr = true
+	msg.flags.rd = true
+	msg.flags.ra = true
+	wire, _, err := dns.encode_message(msg, allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
+}
+
+// The info-code of the extended error a response carries (RFC 8914), or -1 if
+// it has none.
+extended_error :: proc(r: ^Runner, wire: []u8) -> int {
+	code, _ := extended_error_with_text(r, wire)
+	return code
+}
+
+// The extended error a response carries, info-code and extra text, or -1 and "".
+extended_error_with_text :: proc(r: ^Runner, wire: []u8) -> (code: int, text: string) {
+	msg, ok := decode_reply(r, wire)
+	if !ok {
+		return -1, ""
+	}
+	data, found := dns.find_edns_option(msg, .Ext_Error)
+	if !found || len(data) < 2 {
+		return -1, ""
+	}
+	return int(data[0]) << 8 | int(data[1]), string(data[2:])
 }
 
 // The COOKIE option carried in a message, if it has one.
@@ -883,6 +1030,8 @@ Header :: struct {
 	tc:       bool,
 	rd:       bool,
 	ra:       bool,
+	ad:       bool,
+	cd:       bool,
 	rcode:    int,
 	qdcount:  int,
 	ancount:  int,
@@ -911,6 +1060,8 @@ parse_header :: proc(r: ^Runner, wire: []u8) -> (h: Header) {
 	h.tc = wire[2] & 0x02 != 0
 	h.rd = wire[2] & 0x01 != 0
 	h.ra = wire[3] & 0x80 != 0
+	h.ad = wire[3] & 0x20 != 0
+	h.cd = wire[3] & 0x10 != 0
 	h.rcode = int(wire[3] & 0x0f)
 	h.qdcount = int(u16(wire[4]) << 8 | u16(wire[5]))
 	h.ancount = int(u16(wire[6]) << 8 | u16(wire[7]))
@@ -962,6 +1113,34 @@ answer_addresses :: proc(r: ^Runner, wire: []u8, allocator := context.temp_alloc
 	return out[:]
 }
 
+/*
+Ask the server `name`/`qtype` over UDP and read the reply's header: `ok` is
+false, and the case failed with `what`, when nothing came back.
+*/
+ask :: proc(r: ^Runner, udp_port: int, name: string, qtype: u16, what := "no response") -> (res: Query_Result, h: Header, ok: bool) {
+	// Temp: every caller reads the reply inside the case that asked.
+	res = query_udp(udp_port, build_query(name, qtype), context.temp_allocator)
+	if !check(r, res.ok, "%s", what) {
+		return res, {}, false
+	}
+	return res, parse_header(r, res.wire), true
+}
+
+// That the reply carries exactly one address, and that it is `want`.
+check_one_address :: proc(r: ^Runner, wire: []u8, want: string, what: string) -> bool {
+	addrs := answer_addresses(r, wire)
+	if !check(r, len(addrs) == 1, "%s: got %d addresses %v, want only %s", what, len(addrs), addrs, want) {
+		return false
+	}
+	return check_eq_str(r, addrs[0], want, what)
+}
+
+// The first address in a reply's answer section, or "" when it has none.
+first_address :: proc(r: ^Runner, wire: []u8) -> string {
+	addrs := answer_addresses(r, wire)
+	return addrs[0] if len(addrs) > 0 else ""
+}
+
 // Whether the answer section carries a record of this type, for assertions about
 // which upstream's answer came back rather than about what is in it.
 answer_has_type :: proc(r: ^Runner, wire: []u8, qtype: u16, allocator := context.temp_allocator) -> bool {
@@ -1000,18 +1179,6 @@ first_cname_or_name :: proc(r: ^Runner, wire: []u8) -> string {
 	return ""
 }
 
-bytes_equal :: proc(a, b: []u8) -> bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i in 0 ..< len(a) {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 /*
 Verify a CMS SignedData structure with `openssl` and hand back what was inside it.
 
@@ -1031,35 +1198,9 @@ cms_verify :: proc(r: ^Runner, der: []u8, ca_file: string) -> (payload: string, 
 		return "", false
 	}
 
-	devnull, nerr := os.open("/dev/null", {.Write})
-	defer if nerr == nil {
-		os.close(devnull)
-	}
-	desc := os.Process_Desc {
-		command = []string {
-			"openssl",
-			"cms",
-			"-verify",
-			"-inform",
-			"der",
-			"-in",
-			der_path,
-			"-CAfile",
-			ca_file,
-			"-out",
-			out_path,
-		},
-	}
-	if nerr == nil {
-		desc.stdout = devnull
-		desc.stderr = devnull
-	}
-	process, perr := os.process_start(desc)
-	if perr != nil {
-		return "", false
-	}
-	state, werr := os.process_wait(process)
-	if werr != nil || state.exit_code != 0 {
+	command := []string{"openssl", "cms", "-verify", "-inform", "der", "-in", der_path, "-CAfile", ca_file, "-out", out_path}
+	res := run_command(command, nil, fmt.tprintf("%s/cms-verify.log", r.work_dir))
+	if !res.ok || res.exit_code != 0 {
 		return "", false
 	}
 	data, rerr := os.read_entire_file(out_path, context.temp_allocator)
@@ -1067,6 +1208,57 @@ cms_verify :: proc(r: ^Runner, der: []u8, ca_file: string) -> (payload: string, 
 		return "", false
 	}
 	return string(data), true
+}
+
+/*
+Whether the binary is built with AddressSanitizer, skipping case `name` if so.
+A sanitizer's runtime answers malloc itself and ignores glibc's settings, and
+its quarantine grows every process alike.
+*/
+built_with_asan :: proc(
+	r: ^Runner,
+	name: string,
+	reason := "the binary is built with AddressSanitizer, whose allocator is not glibc's",
+) -> bool {
+	// Heap: the temp allocator is not reset until the next case ends, and a
+	// skip from here ends none.
+	exe, xerr := os.read_entire_file(r.binary, context.allocator)
+	if xerr != nil {
+		fail(r, "%s: cannot read %s: %v", name, r.binary, xerr)
+		return true
+	}
+	asan := strings.contains(string(exe), "__asan_init")
+	delete(exe)
+	if asan {
+		skip_case(r, name, reason)
+	}
+	return asan
+}
+
+/*
+Start `m`, or skip `group` when it will not: a mock that cannot bind says
+nothing about the server. The mock is stopped and freed on the way out, so a
+caller only defers `mock_stop` once this has said yes.
+*/
+mock_start_or_skip :: proc(r: ^Runner, m: ^Mock, group: string, cert_file := "", key_file := "") -> bool {
+	if mock_start(m, cert_file, key_file) {
+		return true
+	}
+	skip_case(r, group, fmt.tprintf("cannot start the mock %q on port %d", m.name, m.port))
+	mock_stop(m)
+	return false
+}
+
+// A started mock on a port of its own that answers every name with `addr`, or
+// `group` skipped (see `mock_start_or_skip`).
+synth_mock :: proc(r: ^Runner, name, group: string, addr: [4]u8) -> (m: ^Mock, port: int, ok: bool) {
+	port = next_port(r)
+	m = mock_make(name, port)
+	mock_synth_all(m, addr)
+	if !mock_start_or_skip(r, m, group) {
+		return nil, port, false
+	}
+	return m, port, true
 }
 
 /*

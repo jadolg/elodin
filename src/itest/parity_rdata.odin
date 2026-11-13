@@ -37,14 +37,14 @@ pm_rdata :: proc(r: ^Pg_Rand, qtype: u16, allocator: mem.Allocator) -> []u8 {
 		// A full name rather than a pointer at the question: a CNAME whose
 		// target is its own owner is a loop, and the loop check is a different
 		// test's business.
-		return pm_name("target.parity.test.", allocator)
+		return pg_encode_name("target.parity.test.", allocator)
 
 	case 39: // DNAME - same reasoning as CNAME
-		return pm_name("elsewhere.parity.test.", allocator)
+		return pg_encode_name("elsewhere.parity.test.", allocator)
 
 	case 6: // SOA
-		append(&buf, ..pm_name("ns1.parity.test.", allocator))
-		append(&buf, ..pm_name("hostmaster.parity.test.", allocator))
+		append(&buf, ..pg_encode_name("ns1.parity.test.", allocator))
+		append(&buf, ..pg_encode_name("hostmaster.parity.test.", allocator))
 		pm_put32(&buf, 2026090801) // serial
 		pm_put32(&buf, 7200) // refresh
 		pm_put32(&buf, 3600) // retry
@@ -154,12 +154,12 @@ pm_rdata :: proc(r: ^Pg_Rand, qtype: u16, allocator: mem.Allocator) -> []u8 {
 		pm_put32(&buf, 1785000000) // inception
 		pm_put16(&buf, 12345) // key tag
 		// RFC 4034 section 3.1.7: the signer's name is never compressed.
-		append(&buf, ..pm_name("parity.test.", allocator))
+		append(&buf, ..pg_encode_name("parity.test.", allocator))
 		append(&buf, ..pm_bytes(r, 64, allocator))
 		return buf[:]
 
 	case 47: // NSEC
-		append(&buf, ..pm_name("next.parity.test.", allocator))
+		append(&buf, ..pg_encode_name("next.parity.test.", allocator))
 		pm_type_bitmap(&buf)
 		return buf[:]
 
@@ -215,7 +215,7 @@ come back with an expanded pointer.
 pm_svcb :: proc(r: ^Pg_Rand, allocator: mem.Allocator) -> []u8 {
 	buf := make([dynamic]u8, 0, 64, allocator)
 	pm_put16(&buf, 1) // priority
-	append(&buf, ..pm_name("svc.parity.test.", allocator))
+	append(&buf, ..pg_encode_name("svc.parity.test.", allocator))
 
 	// alpn: two length-prefixed protocol ids inside the one parameter, which is
 	// how the list is written (RFC 9460 section 7.1.1).

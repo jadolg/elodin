@@ -25,36 +25,23 @@ run_prefetch_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("prefetch", upstream_port)
 	mock_synth_all(mock, {203, 0, 113, 7}, ttl = 5)
-	if !mock_start(mock) {
-		skip_case(r, "prefetch", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "prefetch") {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
 	tcp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-upstream:
-  timeout: 3s
-  attempts: 1
-  servers: ["127.0.0.1:%d"]
-cache:
-  enabled: true
-  max_entries: 100
-  prefetch_min_ttl: 0
-blocking: {{ enabled: false }}
-`,
+	config := base_config(
 		udp_port,
-		tcp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		timeout = "3s",
+		upstream_extra = "  attempts: 1",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		cache = "{ enabled: true, max_entries: 100, prefetch_min_ttl: 0 }",
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, tcp_port = tcp_port})
 	if !ok {
-		skip_case(r, "prefetch", "server did not start")
 		return
 	}
 	defer stop_server(&srv)

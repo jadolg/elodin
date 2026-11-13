@@ -2,7 +2,6 @@ package itest
 
 import "core:fmt"
 import "core:net"
-import "core:path/filepath"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
@@ -23,25 +22,15 @@ list is the thing being tested, and this is the only way to be one.
 
 @(private = "file")
 config_acl :: proc(udp_port, tcp_port, upstream_port: int, allow_from: string) -> string {
-	return fmt.tprintf(
+	return base_config(
+		udp_port,
+		upstream_at(upstream_port),
 		// info, not warn: the denied cases establish readiness from the line the
 		// listeners print when they bind, since they cannot ask a question.
-		`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-server:
-  %s
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-		udp_port,
-		tcp_port,
-		allow_from,
-		upstream_port,
+		log = "{ level: info }",
+		timeout = "3s",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		extra = fmt.tprintf("server:\n  %s", allow_from),
 	)
 }
 
@@ -55,13 +44,9 @@ and the write attempted first, and only the read is expected to come back empty.
 */
 @(private = "file")
 tcp_closed_without_answer :: proc(tcp_port: int) -> (connected: bool, answered: bool) {
-	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
-	if err != nil {
-		return false, false
-	}
+	conn := dial_tcp(tcp_port, 2 * time.Second) or_return
+	socket := conn.socket
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
-	_ = net.set_option(socket, .Send_Timeout, 2 * time.Second)
 
 	query := build_query("acl.example.", u16(dns.Type.A), id = 0x51, allocator = context.temp_allocator)
 	framed := make([]u8, 2 + len(query), context.temp_allocator)
@@ -91,7 +76,7 @@ start_denying_server :: proc(r: ^Runner, upstream_port: int) -> (srv: Server, tc
 	udp_port := next_port(r)
 	tcp_port = next_port(r)
 	cfg := config_acl(udp_port, tcp_port, upstream_port, `allow_from: ["10.0.0.0/8"]`)
-	srv, ok = start_server_raw(r, without_dnssec(cfg), udp_port)
+	srv, ok = start_server_raw(r, cfg, udp_port)
 	if !ok {
 		return srv, tcp_port, false
 	}
@@ -106,11 +91,8 @@ start_denying_server :: proc(r: ^Runner, upstream_port: int) -> (srv: Server, tc
 }
 
 run_acl_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("acl", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 20})
-	if !mock_start(mock) {
-		skip_case(r, "allow_from", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "acl", "allow_from", {203, 0, 113, 20})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -128,7 +110,7 @@ run_acl_cases :: proc(r: ^Runner) {
 	start_case(r, "allow_from: a source outside the list gets no answer over udp")
 	{
 		srv, _, ok := start_denying_server(r, upstream_port)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			check(r, expect_no_udp_reply(srv.udp_port, query), "the server answered a source outside allow_from")
 		}
@@ -140,7 +122,7 @@ run_acl_cases :: proc(r: ^Runner) {
 	start_case(r, "allow_from: a source outside the list gets no answer over tcp")
 	{
 		srv, tcp_port, ok := start_denying_server(r, upstream_port)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			connected, answered := tcp_closed_without_answer(tcp_port)
 			check(r, connected, "the tcp listener is not accepting at all, so the case proves nothing")
@@ -165,7 +147,7 @@ run_acl_cases :: proc(r: ^Runner) {
 	start_case(r, "allow_from: a refusal names the source and the setting, once")
 	{
 		srv, _, ok := start_denying_server(r, upstream_port)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			check(r, expect_no_udp_reply(srv.udp_port, query), "the server answered a source outside allow_from")
 			// A second refusal, which must not produce a second line.
@@ -215,7 +197,7 @@ run_acl_cases :: proc(r: ^Runner) {
 	start_case(r, "allow_from: a refused tcp connection is logged as a connection")
 	{
 		srv, tcp_port, ok := start_denying_server(r, upstream_port)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			connected, answered := tcp_closed_without_answer(tcp_port)
 			check(r, connected, "the tcp listener is not accepting at all, so the case proves nothing")
@@ -254,7 +236,7 @@ run_acl_cases :: proc(r: ^Runner) {
 				tcp_port = tcp_port,
 			},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			res := query_udp(udp_port, query, context.temp_allocator)
 			check(r, res.ok, "a source inside allow_from was not answered over udp")
@@ -273,7 +255,7 @@ run_acl_cases :: proc(r: ^Runner) {
 			r,
 			Server_Options{config = config_acl(udp_port, tcp_port, upstream_port, `allow_from: []`), udp_port = udp_port},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			res := query_udp(udp_port, query, context.temp_allocator)
 			check(r, res.ok, "an empty allow_from refused a query instead of allowing everything")
@@ -290,7 +272,7 @@ run_acl_cases :: proc(r: ^Runner) {
 			r,
 			Server_Options{config = config_acl(udp_port, tcp_port, upstream_port, ""), udp_port = udp_port},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			res := query_udp(udp_port, query, context.temp_allocator)
 			check(r, res.ok, "the default allow_from refused a query from loopback")
@@ -304,10 +286,8 @@ run_acl_cases :: proc(r: ^Runner) {
 	{
 		udp_port, tcp_port := next_port(r), next_port(r)
 		cfg := config_acl(udp_port, tcp_port, upstream_port, `allow_from: ["192.168.0.0/33"]`)
-		path := filepath.join({r.work_dir, "acl-bad.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r, path, transmute([]u8)cfg)
-		res := run_binary(r, []string{"--config", path, "--check"}, "acl-bad")
-		if check(r, res.ok, "could not run the binary") {
+		res := check_config_text(r, "acl-bad", cfg)
+		if res.ok {
 			check(r, res.exit_code != 0, "--check accepted an impossible prefix length")
 			check(
 				r,

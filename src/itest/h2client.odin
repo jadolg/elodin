@@ -31,10 +31,7 @@ H2_Stream_Result :: struct {
 }
 
 // A request field beyond the four pseudo-headers every request carries.
-H2_Field :: struct {
-	name:  string,
-	value: string,
-}
+H2_Field :: h2.Header_Field
 
 H2_Client :: struct {
 	conn:        Test_Conn,
@@ -71,6 +68,7 @@ h2_connect :: proc(port: int, settings: H2_Settings = {}, allocator := context.t
 	h2.dynamic_table_init(&c.decoder, 4096, allocator)
 
 	if !conn_write(&c.conn, transmute([]u8)string(h2.PREFACE)) {
+		close_tls(&c.conn)
 		return nil, false
 	}
 
@@ -91,6 +89,7 @@ h2_connect :: proc(port: int, settings: H2_Settings = {}, allocator := context.t
 	h2.write_frame_header(&out, len(payload), .Settings, 0, 0)
 	append(&out, ..payload[:])
 	if !conn_write(&c.conn, out[:]) {
+		close_tls(&c.conn)
 		return nil, false
 	}
 	return c, true

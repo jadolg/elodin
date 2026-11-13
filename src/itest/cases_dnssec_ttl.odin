@@ -1,6 +1,5 @@
 package itest
 
-import "core:fmt"
 import "core:strings"
 import "elodin:dns"
 
@@ -175,7 +174,7 @@ TTL_FIXTURES := []Fixture{
 // The answer with every TTL raised, and the Original TTL its RRSIG carries.
 @(private = "file")
 raised_answer :: proc(wire: []u8) -> (out: []u8, original: u32, ok: bool) {
-	msg, err := dns.decode_message(wire, context.allocator)
+	msg, err := dns.decode_message(wire, context.temp_allocator)
 	if err != .None {
 		return nil, 0, false
 	}
@@ -190,7 +189,7 @@ raised_answer :: proc(wire: []u8) -> (out: []u8, original: u32, ok: bool) {
 	return encoded, original, eerr == .None && original < TTL_RAISED
 }
 
-// The mock serving the chain, with the answer's ttls raised.
+// The mock serving the chain, with the answer's ttls raised; not started.
 @(private = "file")
 ttl_mock :: proc(r: ^Runner) -> (mock: ^Mock, reference: []u8, original: u32, ok: bool) {
 	mock = mock_make("dnssec-ttl", next_port(r))
@@ -202,40 +201,24 @@ ttl_mock :: proc(r: ^Runner) -> (mock: ^Mock, reference: []u8, original: u32, ok
 		}
 		mock_reply(mock, f.qname, f.qtype, wire)
 	}
-	return mock, reference, original, mock_start(mock)
-}
-
-@(private = "file")
-ttl_config :: proc(udp_port, upstream_port: int) -> string {
-	return fmt.tprintf(
-		`listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  servers: [udp://127.0.0.1:%d]
-blocking: {{enabled: false}}
-dnssec:
-  enabled: true
-  trust_anchors:
-    - %q
-`,
-		udp_port,
-		upstream_port,
-		TTL_ANCHOR,
-	)
+	return mock, reference, original, true
 }
 
 run_dnssec_ttl_cases :: proc(r: ^Runner) {
-	mock, reference, original, started := ttl_mock(r)
-	if !started {
-		skip_case(r, "dnssec: served ttl", "cannot start the mock upstream with the raised answer")
+	mock, reference, original, built := ttl_mock(r)
+	if !built {
+		// The codec's failure or the fixture's, not a busy port: failed.
+		fail(r, "dnssec: served ttl: cannot raise the answer's ttls")
+		mock_stop(mock)
+		return
+	}
+	if !mock_start_or_skip(r, mock, "dnssec: served ttl") {
 		return
 	}
 	defer mock_stop(mock)
-	upstream_port := mock.port
 
 	udp_port := next_port(r)
-	config := ttl_config(udp_port, upstream_port)
+	config := dnssec_config(udp_port, mock.port, []string{TTL_ANCHOR}, log = "{ level: info }", cache = "{ enabled: true }")
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
 		return
@@ -260,8 +243,7 @@ run_dnssec_ttl_cases :: proc(r: ^Runner) {
 			check(r, mock_total(mock) == asked, "the repeated question went upstream rather than to the cache")
 		}
 		if check(r, res.ok, "no response") {
-			msg, err := dns.decode_message(res.wire, context.allocator)
-			if check(r, err == .None, "the answer does not decode") {
+			if msg, decoded := decode_reply(r, res.wire); decoded {
 				check_eq_int(r, int(dns.rcode_of(msg)), int(dns.Rcode.No_Error), "rcode")
 				// A client that set neither DO nor AD is not told (RFC 6840 section 5.8).
 				check(r, msg.flags.ad == c.dnssec_ok, "AD is %v for a client with DO %v", msg.flags.ad, c.dnssec_ok)
@@ -324,7 +306,29 @@ parity_signed_ttl_case :: proc(r: ^Runner, udp_port: int, reference: []u8, origi
 		cache             = true,
 		cache_age         = 5,
 	}
-	c := parity_compare(q, up, res.wire, policy)
+	signed := signed_diffs(r, parity_compare(q, up, res.wire, policy))
+	check(r, signed == 2, "%d of the answer's two lowered ttls were put down to the signature", signed)
+
+	/*
+	And the set's own received TTLs, the other half of the same minimum: an
+	upstream that sent the RRSIG at 200 gets its A back at 200 too. Built from
+	the answer above rather than asked for, since the mock serves one copy.
+	*/
+	low_up, lowered := lowered_rrsig(up, 200)
+	if !check(r, lowered, "the reference could not be rewritten with a lower rrsig ttl") {
+		return
+	}
+	low_el := make([]u8, len(res.wire), context.temp_allocator)
+	copy(low_el, res.wire)
+	dns.cap_ttls(low_el, 200)
+	signed = signed_diffs(r, parity_compare(q, low_up, low_el, policy))
+	check(r, signed == 1, "%d of the set's ttls were put down to the rrsig's received one", signed)
+}
+
+// How many of a comparison's differences are put down to RFC 4035 section 5.3.3,
+// failing the case on any difference left unexplained.
+@(private = "file")
+signed_diffs :: proc(r: ^Runner, c: Parity_Compare) -> int {
 	signed := 0
 	for d in c.diffs {
 		if d.reason == "" {
@@ -333,40 +337,22 @@ parity_signed_ttl_case :: proc(r: ^Runner, udp_port: int, reference: []u8, origi
 			signed += 1
 		}
 	}
-	check(r, signed == 2, "%d of the answer's two lowered ttls were put down to the signature", signed)
-
-	/*
-	And the set's own received TTLs, the other half of the same minimum: an
-	upstream that sent the RRSIG at 200 gets its A back at 200 too. Built from
-	the answer above rather than asked for, since the mock serves one copy.
-	*/
-	low_up, low_el := lowered_rrsig(up, 200), make([]u8, len(res.wire), context.temp_allocator)
-	copy(low_el, res.wire)
-	dns.cap_ttls(low_el, 200)
-	c = parity_compare(q, low_up, low_el, policy)
-	signed = 0
-	for d in c.diffs {
-		if d.reason == "" {
-			fail(r, "%s: upstream %s, elodin %s", d.what, d.upstream, d.elodin)
-		} else if strings.contains(d.reason, "RFC 4035 section 5.3.3") {
-			signed += 1
-		}
-	}
-	check(r, signed == 1, "%d of the set's ttls were put down to the rrsig's received one", signed)
+	return signed
 }
 
-// The reply with its RRSIGs' TTLs set to `ttl` and nothing else changed.
+// The reply with its RRSIGs' TTLs set to `ttl` and nothing else changed; not ok
+// when it cannot be decoded or encoded again.
 @(private = "file")
-lowered_rrsig :: proc(wire: []u8, ttl: u32) -> []u8 {
+lowered_rrsig :: proc(wire: []u8, ttl: u32) -> (out: []u8, ok: bool) {
 	msg, err := dns.decode_message(wire, context.temp_allocator)
 	if err != .None {
-		return wire
+		return nil, false
 	}
 	for &rec in msg.answer {
 		if rec.type == .RRSIG {
 			rec.ttl = ttl
 		}
 	}
-	out, _, _ := dns.encode_message(msg, context.temp_allocator)
-	return out
+	encoded, _, eerr := dns.encode_message(msg, context.temp_allocator)
+	return encoded, eerr == .None
 }

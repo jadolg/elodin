@@ -36,30 +36,24 @@ which can pick source addresses freely.
 
 @(private = "file")
 config_conn_rate :: proc(udp_port, tcp_port, metrics_port, upstream_port: int, limiter: string) -> string {
-	return fmt.tprintf(
-		`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-server:
+	return base_config(
+		udp_port,
+		upstream_at(upstream_port),
+		log = "{ level: info }",
+		timeout = "3s",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		extra = fmt.tprintf(
+			`server:
   # A table far larger than the burst below, so nothing here is the connection
   # table filling up: a refusal has to be the arrival budget or the case proves
   # the wrong thing. Same for the share.
   max_connections: 256
   max_connections_per_prefix: 256
   rate_limit: {{ %s }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}
-`,
-		udp_port,
-		tcp_port,
-		limiter,
-		upstream_port,
-		metrics_port,
+metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}`,
+			limiter,
+			metrics_port,
+		),
 	)
 }
 
@@ -72,11 +66,8 @@ CONN_RATE :: 4
 DIALS :: 24
 
 run_connection_rate_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("connrate", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 12})
-	if !mock_start(mock) {
-		skip_case(r, "connection rate", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "connrate", "connection rate", {203, 0, 113, 12})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -106,7 +97,7 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 				tcp_port = tcp_port,
 			},
 		)
-		if check(r, ok, "the unlimited server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			answered := dial_and_query(tcp_port, query, DIALS)
 			check_eq_int(r, answered, DIALS, "connections answered with the limiter off")
@@ -146,7 +137,7 @@ run_connection_rate_cases :: proc(r: ^Runner) {
 				tcp_port = tcp_port,
 			},
 		)
-		if check(r, ok, "the limited server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			/*
 			Read as a difference, because the readiness probe got here first.
@@ -260,10 +251,7 @@ Conn_Counters :: struct {
 
 @(private = "file")
 conn_counters :: proc(metrics_port: int) -> Conn_Counters {
-	page := ""
-	if wait_http(metrics_port, "/metrics") {
-		page = string(http_request(metrics_port, "GET", "/metrics", context.temp_allocator).body)
-	}
+	page := metrics_page(metrics_port)
 	return {
 		rate_limited = metric_value(page, "elodin_connections_rate_limited_total"),
 		refused = metric_value(page, "elodin_connections_refused_total"),

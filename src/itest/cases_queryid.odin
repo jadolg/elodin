@@ -27,12 +27,9 @@ CLIENT_ID :: u16(0x4242)
 FORWARDS :: 24
 
 run_query_id_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("id-upstream", upstream_port)
 	// Any name, so each query can ask a different one and still be answered.
-	mock_synth_all(mock, {192, 0, 2, 9})
-	if !mock_start(mock) {
-		skip_case(r, "upstream: transaction ids", "cannot start the mock")
+	mock, upstream_port, started := synth_mock(r, "id-upstream", "upstream: transaction ids", {192, 0, 2, 9})
+	if !started {
 		return
 	}
 	defer mock_stop(mock)
@@ -41,24 +38,14 @@ run_query_id_cases :: proc(r: ^Runner) {
 	// The cache is off so every query reaches the upstream, and cookies too:
 	// they close this same hole by another route, and what is under test is the
 	// ID on its own.
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["udp://127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-cookies: {{ enabled: false, upstream: false }}
-`,
+	config := base_config(
 		udp_port,
-		upstream_port,
+		fmt.tprintf(`["udp://127.0.0.1:%d"]`, upstream_port),
+		timeout = "3s",
+		extra = "cookies: { enabled: false, upstream: false }",
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
-		skip_case(r, "upstream: transaction ids", "server did not start")
 		return
 	}
 	defer stop_server(&srv)

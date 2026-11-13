@@ -2,7 +2,6 @@ package itest
 
 import "core:fmt"
 import "core:os"
-import "core:path/filepath"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
@@ -18,30 +17,40 @@ exactly the case an operator would rather find out about from a test than from a
 resolver that quietly serves whatever it is handed.
 */
 
-@(private = "file")
-dnssec_config :: proc(udp_port: int, upstream_port: int, extra := "") -> string {
-	return fmt.tprintf(
-		`log:
-  level: info
-  queries: true
-listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  servers:
-    - udp://127.0.0.1:%d
-cache:
-  enabled: false
-blocking:
-  enabled: false
-dnssec:
-  enabled: true
-%s`,
+/*
+A validating server forwarding to the mock on `upstream_port`, with the cache and
+blocking off unless a case says otherwise. `anchors` are the trust anchors as DS
+lines, none for the built-in root; `extra` is more top-level sections.
+*/
+dnssec_config :: proc(
+	udp_port, upstream_port: int,
+	anchors: []string = nil,
+	log := "{ level: info, queries: true }",
+	cache := "{ enabled: false }",
+	extra := "",
+) -> string {
+	block := strings.builder_make(context.temp_allocator)
+	strings.write_string(&block, "dnssec:\n  enabled: true\n")
+	if len(anchors) > 0 {
+		strings.write_string(&block, "  trust_anchors:\n")
+		for a in anchors {
+			fmt.sbprintf(&block, "    - %q\n", a)
+		}
+	}
+	strings.write_string(&block, extra)
+	return base_config(
 		udp_port,
-		upstream_port,
-		extra,
+		fmt.tprintf("[udp://127.0.0.1:%d]", upstream_port),
+		log = log,
+		timeout = "",
+		cache = cache,
+		extra = strings.to_string(block),
 	)
 }
+
+// The root's DS, the anchor a validating server holds when none is configured.
+@(private = "file")
+ROOT_DS :: ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
 
 run_dnssec_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
@@ -50,8 +59,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	for f in ANCHORED_REVERSE_FIXTURES {
 		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
 	}
-	if !mock_start(mock) {
-		skip_case(r, "dnssec", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "dnssec") {
 		return
 	}
 	defer mock_stop(mock)
@@ -60,14 +68,14 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	// `private_reverse` off: the private reverse cases below are about what the
 	// validator does with a forwarded answer, and with the key on - the
 	// default - those names are answered here and never reach it.
-	srv, ok := start_server(
+	srv, srv_ok := start_server(
 		r,
 		Server_Options {
-			config = dnssec_config(udp_port, upstream_port, "special_use: {private_reverse: false}\n"),
+			config = dnssec_config(udp_port, upstream_port, extra = "special_use: {private_reverse: false}\n"),
 			udp_port = udp_port,
 		},
 	)
-	if !ok {
+	if !srv_ok {
 		return
 	}
 	defer stop_server(&srv)
@@ -77,9 +85,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		// The mock has no root DNSKEY to offer, so the chain cannot be built and
 		// the answer must not be served. Failing open here would make the whole
 		// feature decorative.
-		res := query_udp(udp_port, build_query("unsigned.test.", u16(dns.Type.A)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if _, h, answered := ask(r, udp_port, "unsigned.test.", u16(dns.Type.A)); answered {
 			check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode")
 			check_eq_int(r, h.ancount, 0, "answers in a refused response")
 		}
@@ -154,9 +160,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		before := log_count(&srv, "did not validate")
 		if check(r, before == 1, "expected one refusal warning before this case, found %d", before) {
 			for name in ([]string{"second.test.", "third.test."}) {
-				res := query_udp(udp_port, build_query(name, u16(dns.Type.A)))
-				if check(r, res.ok, "no response for %s", name) {
-					h := parse_header(r, res.wire)
+				if _, h, answered := ask(r, udp_port, name, u16(dns.Type.A), fmt.tprintf("no response for %s", name)); answered {
 					check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for a later refusal")
 				}
 			}
@@ -175,10 +179,9 @@ run_dnssec_cases :: proc(r: ^Runner) {
 
 		forwarded := mock_last_query(mock)
 		if check(r, len(forwarded) > 12, "the mock saw no query") {
-			check(r, forwarded[3] & 0x10 != 0, "the forwarded query does not set CD")
+			check(r, parse_header(r, forwarded).cd, "the forwarded query does not set CD")
 
-			msg, derr := dns.decode_message(forwarded, context.temp_allocator)
-			if check(r, derr == .None, "the forwarded query does not decode: %v", derr) {
+			if msg, ok := decode_reply(r, forwarded); ok {
 				check(r, dns.edns_present(msg), "the forwarded query carries no OPT record")
 				check(r, dns.edns_do(msg), "the forwarded query does not set DO")
 			}
@@ -196,11 +199,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a CD query")
 			check_eq_int(r, h.ancount, 1, "answers for a CD query")
-
-			addrs := answer_addresses(r, res.wire)
-			if check(r, len(addrs) == 1, "expected one address, got %d", len(addrs)) {
-				check_eq_str(r, addrs[0], "203.0.113.55", "address")
-			}
+			check_one_address(r, res.wire, "203.0.113.55", "address")
 		}
 	}
 	end_case(r)
@@ -213,9 +212,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		// chain of trust would SERVFAIL a LAN PTR lookup. It must come back
 		// NoError instead - the same escape hatch the code gives these zones by
 		// default, proven end to end while validation is on everywhere else.
-		res := query_udp(udp_port, build_query("20.2.168.192.in-addr.arpa.", u16(dns.Type.PTR)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if _, h, answered := ask(r, udp_port, "20.2.168.192.in-addr.arpa.", u16(dns.Type.PTR)); answered {
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for a private reverse name")
 		}
 	}
@@ -226,9 +223,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		// The counterpart: a public reverse name has a real chain, so this mock's
 		// unsigned answer for it must fail closed exactly as any other public name
 		// does. The gate is narrow, not a hole for every in-addr.arpa name.
-		res := query_udp(udp_port, build_query("8.8.8.8.in-addr.arpa.", u16(dns.Type.PTR)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if _, h, answered := ask(r, udp_port, "8.8.8.8.in-addr.arpa.", u16(dns.Type.PTR)); answered {
 			check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode for a public reverse name")
 		}
 	}
@@ -259,24 +254,12 @@ run_dnssec_cases :: proc(r: ^Runner) {
 				{"168.192.in-addr.arpa. IN DS 18109 15 2 0000000000000000000000000000000000000000000000000000000000000000", .Serv_Fail, false, 6},
 			}) {
 			anchored_port := next_port(r)
-			config := fmt.tprintf(
-				`listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  servers: [udp://127.0.0.1:%d]
-cache: {{enabled: false}}
-blocking: {{enabled: false}}
-dnssec:
-  enabled: true
-  trust_anchors:
-    - ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
-    - %q
-special_use: {{private_reverse: false}}
-`,
+			config := dnssec_config(
 				anchored_port,
 				upstream_port,
-				c.anchor,
+				[]string{ROOT_DS, c.anchor},
+				log = "{ level: info }",
+				extra = "special_use: {private_reverse: false}\n",
 			)
 			anchored, started := start_server(r, Server_Options{config = config, udp_port = anchored_port})
 			if !started {
@@ -291,13 +274,11 @@ special_use: {{private_reverse: false}}
 			if check(r, covered.ok, "no response for the anchored name") {
 				h := parse_header(r, covered.wire)
 				check_eq_int(r, h.rcode, int(c.rcode), "rcode for an anchored private name")
-				check(r, (len(covered.wire) >= 4 && covered.wire[3] & 0x20 != 0) == c.ad, "AD for an anchored private name: want %v", c.ad)
+				check(r, h.ad == c.ad, "AD for an anchored private name: want %v", c.ad)
 				check_eq_int(r, extended_error(r, covered.wire), c.ede, "extended DNS error for an anchored private name")
 			}
 
-			uncovered := query_udp(anchored_port, build_query("1.1.10.in-addr.arpa.", u16(dns.Type.PTR)))
-			if check(r, uncovered.ok, "no response for the unanchored name") {
-				h := parse_header(r, uncovered.wire)
+			if _, h, answered := ask(r, anchored_port, "1.1.10.in-addr.arpa.", u16(dns.Type.PTR), "no response for the unanchored name"); answered {
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode for an unanchored private name")
 			}
 		}
@@ -322,13 +303,11 @@ special_use: {{private_reverse: false}}
 		for qname in ([]string{"seed.alias.cntest.", "x.bare.cntest.", "x.wild.cntest.", "x.stray.cntest."}) {
 			mock_synth(cut_mock, qname, u16(dns.Type.A), {192, 0, 2, 1})
 		}
-		if !mock_start(cut_mock) {
-			skip_case(r, name, "cannot start the mock upstream")
-		} else {
+		if mock_start_or_skip(r, cut_mock, name) {
 			defer mock_stop(cut_mock)
 			start_case(r, name)
 			cut_udp := next_port(r)
-			config := dnssec_config(cut_udp, cut_port, fmt.tprintf("  trust_anchors: [%q]\n", CNAME_CUT_ANCHOR))
+			config := dnssec_config(cut_udp, cut_port, []string{CNAME_CUT_ANCHOR})
 			cut, started := start_server(r, Server_Options{config = config, udp_port = cut_udp})
 			if started {
 				defer stop_server(&cut)
@@ -346,7 +325,7 @@ special_use: {{private_reverse: false}}
 					if check(r, res.ok, "no response for %s", c.name) {
 						h := parse_header(r, res.wire)
 						check_eq_int(r, h.rcode, int(c.rcode), fmt.tprintf("rcode for %s", c.name))
-						check(r, len(res.wire) >= 4 && res.wire[3] & 0x20 == 0, "AD for %s, which is not secure", c.name)
+						check(r, len(res.wire) >= 12 && !h.ad, "AD for %s, which is not secure", c.name)
 						check_eq_int(r, extended_error(r, res.wire), c.ede, fmt.tprintf("extended DNS error for %s", c.name))
 					}
 				}
@@ -359,11 +338,10 @@ special_use: {{private_reverse: false}}
 	{
 		res := query_udp(udp_port, build_query("ede.test.", u16(dns.Type.A), edns_size = 1232))
 		if check(r, res.ok, "no response") {
-			msg, derr := dns.decode_message(res.wire, context.temp_allocator)
-			if check(r, derr == .None, "response does not decode: %v", derr) {
-				opt, found := dns.find_opt(msg)
+			if msg, ok := decode_reply(r, res.wire); ok {
+				_, found := dns.find_opt(msg)
 				if check(r, found, "no OPT record came back") {
-					check(r, has_extended_error(opt), "no extended DNS error in the OPT record")
+					check(r, extended_error(r, res.wire) >= 0, "no extended DNS error in the OPT record")
 				}
 			}
 		}
@@ -378,25 +356,17 @@ special_use: {{private_reverse: false}}
 		// the alternative for those deployments is a resolver that answers
 		// nothing.
 		plain_port := next_port(r)
-		config := fmt.tprintf(
-			`listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  servers: [udp://127.0.0.1:%d]
-cache: {{enabled: false}}
-blocking: {{enabled: false}}
-dnssec: {{enabled: false}}
-`,
+		config := base_config(
 			plain_port,
-			upstream_port,
+			fmt.tprintf("[udp://127.0.0.1:%d]", upstream_port),
+			log = "{ level: info }",
+			timeout = "",
+			extra = "dnssec: { enabled: false }",
 		)
 		plain, started := start_server(r, Server_Options{config = config, udp_port = plain_port})
 		if started {
 			defer stop_server(&plain)
-			res := query_udp(plain_port, build_query("unsigned.test.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if _, h, answered := ask(r, plain_port, "unsigned.test.", u16(dns.Type.A)); answered {
 				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode with validation off")
 				check_eq_int(r, h.ancount, 1, "answers with validation off")
 			}
@@ -410,31 +380,13 @@ dnssec: {{enabled: false}}
 		// at all: the server should come up validating, and this mock cannot
 		// satisfy a validator, so the answer has to be refused.
 		default_port := next_port(r)
-		config := fmt.tprintf(
-			`listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  servers: [udp://127.0.0.1:%d]
-cache: {{enabled: false}}
-blocking: {{enabled: false}}
-`,
-			default_port,
-			upstream_port,
-		)
-		defaulted, started := start_server_raw(r, config, default_port, verbatim = true)
+		config := base_config(default_port, fmt.tprintf("[udp://127.0.0.1:%d]", upstream_port), log = "{ level: info }", timeout = "")
+		defaulted, started := start_server(r, Server_Options{config = config, udp_port = default_port, verbatim = true})
 		if started {
 			defer stop_server(&defaulted)
-			if wait_ready(&defaulted, 5 * time.Second) {
-				check(r, log_contains(&defaulted, "dnssec: validating"), "the server did not start a validator")
-
-				res := query_udp(default_port, build_query("default.test.", u16(dns.Type.A)))
-				if check(r, res.ok, "no response") {
-					h := parse_header(r, res.wire)
-					check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode under the shipped defaults")
-				}
-			} else {
-				fail(r, "the server never became ready")
+			check(r, log_contains(&defaulted, "dnssec: validating"), "the server did not start a validator")
+			if _, h, answered := ask(r, default_port, "default.test.", u16(dns.Type.A)); answered {
+				check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode under the shipped defaults")
 			}
 		}
 	}
@@ -444,53 +396,27 @@ blocking: {{enabled: false}}
 }
 
 @(private = "file")
-has_extended_error :: proc(opt: dns.Record) -> bool {
-	options, ok := opt.data.(dns.Rdata_OPT)
-	if !ok {
-		return false
-	}
-	for option in options.options {
-		if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
-			return true
-		}
-	}
-	return false
-}
-
-@(private = "file")
 run_dnssec_config_cases :: proc(r: ^Runner) {
-	// A file that was not written or a binary that did not run fails the case,
-	// rather than coming back as a non-zero exit a rejection case would accept.
-	check_config :: proc(r: ^Runner, tag: string, body: string) -> (exit_code: int, output: string) {
-		path := filepath.join({r.work_dir, fmt.tprintf("%s.yaml", tag)}, context.temp_allocator) or_else ""
-		if !write_fixture(r, path, transmute([]u8)body) {
-			return 0, ""
-		}
-		res := new_check(r, path, tag)
-		return res.exit_code, res.output
-	}
-
 	start_case(r, "dnssec: --check accepts a configured trust anchor")
 	{
-		code, _ := check_config(
+		res := check_config_text(
 			r,
 			"dnssec-anchor-ok",
-			"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: true\n  trust_anchors:\n" +
-			"    - \". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\"\n",
+			fmt.tprintf("upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: true\n  trust_anchors:\n    - %q\n", ROOT_DS),
 		)
-		check_eq_int(r, code, 0, "exit code")
+		check_eq_int(r, res.exit_code, 0, "exit code")
 	}
 	end_case(r)
 
 	start_case(r, "dnssec: --check rejects an unreadable trust anchor")
 	{
-		code, output := check_config(
+		res := check_config_text(
 			r,
 			"dnssec-anchor-bad",
 			"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: true\n  trust_anchors: [\"not a ds record\"]\n",
 		)
-		check(r, code != 0, "a broken trust anchor exited 0")
-		check(r, strings.contains(output, "trust_anchors"), "the error does not name the setting: %q", output)
+		check(r, res.exit_code != 0, "a broken trust anchor exited 0")
+		check(r, strings.contains(res.output, "trust_anchors"), "the error does not name the setting: %q", res.output)
 	}
 	end_case(r)
 
@@ -512,11 +438,12 @@ upstream:
 dnssec:
   enabled: true
   trust_anchors:
-    - ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
+    - %q
     - "corp. IN DS 1 200 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
 `,
 			port,
 			next_port(r),
+			ROOT_DS,
 		)
 		srv, started := start_server_raw(r, config, port)
 		if check(r, started, "cannot start the binary") {
@@ -536,17 +463,17 @@ dnssec:
 	// memory the operator knows and this server does not needs to reach it.
 	start_case(r, "dnssec: --check accepts a zone-cache bound")
 	{
-		code, output := check_config(
+		res := check_config_text(
 			r,
 			"dnssec-zone-cache-ok",
 			"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: true\n  max_cached_zones: 512\n",
 		)
-		check_eq_int(r, code, 0, "exit code")
+		check_eq_int(r, res.exit_code, 0, "exit code")
 		check(
 			r,
-			!strings.contains(output, "max_cached_zones"),
+			!strings.contains(res.output, "max_cached_zones"),
 			"a valid zone-cache bound was complained about: %q",
-			output,
+			res.output,
 		)
 	}
 	end_case(r)
@@ -555,17 +482,17 @@ dnssec:
 	// asking for the default would leave a typo running the cache unbounded.
 	start_case(r, "dnssec: --check rejects a negative zone-cache bound")
 	{
-		code, output := check_config(
+		res := check_config_text(
 			r,
 			"dnssec-zone-cache-bad",
 			"upstream:\n  servers: [1.1.1.1]\ndnssec:\n  enabled: true\n  max_cached_zones: -1\n",
 		)
-		check(r, code != 0, "a negative zone-cache bound exited 0")
+		check(r, res.exit_code != 0, "a negative zone-cache bound exited 0")
 		check(
 			r,
-			strings.contains(output, "max_cached_zones"),
+			strings.contains(res.output, "max_cached_zones"),
 			"the error does not name the setting: %q",
-			output,
+			res.output,
 		)
 	}
 	end_case(r)

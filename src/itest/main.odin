@@ -103,12 +103,8 @@ main :: proc() {
 			i += 1
 			parity_opts.scenario = str_arg(args, i, "--parity-scenario")
 		case "--binary":
-			if i + 1 >= len(args) {
-				fmt.eprintln("itest: --binary needs a path")
-				os.exit(2)
-			}
 			i += 1
-			binary = args[i]
+			binary = str_arg(args, i, "--binary")
 		case "-h", "--help":
 			fmt.print(USAGE)
 			os.exit(0)

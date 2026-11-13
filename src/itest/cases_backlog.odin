@@ -36,35 +36,22 @@ run_tc_backlog_cases :: proc(r: ^Runner) {
 	// Every name, since the queries are for names of their own: the same name
 	// asked again while it is in flight would join it rather than the queue.
 	mock_truncate_udp(mock, "", 0, nil, SERVICE)
-	if !mock_start(mock) {
-		skip_case(r, name, "cannot start the mock")
+	if !mock_start_or_skip(r, mock, name) {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
 	metrics_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 1s
-  attempts: 1
-  servers:
-    - {{ name: slow, type: udp, address: 127.0.0.1, port: %d }}
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-metrics: {{ enabled: true, address: 127.0.0.1, port: %d }}
-`,
+	config := base_config(
 		udp_port,
-		upstream_port,
-		metrics_port,
+		fmt.tprintf("[{{ name: slow, type: udp, address: 127.0.0.1, port: %d }}]", upstream_port),
+		timeout = "1s",
+		upstream_extra = "  attempts: 1",
+		extra = fmt.tprintf("metrics: {{ enabled: true, address: 127.0.0.1, port: %d }}", metrics_port),
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
-		skip_case(r, name, "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -73,7 +60,7 @@ metrics: {{ enabled: true, address: 127.0.0.1, port: %d }}
 	answered := paced_big_queries(udp_port)
 	check(r, answered > 0, "nothing was answered")
 	backlogged := metric_value(
-		string(http_request(metrics_port, "GET", "/metrics", context.temp_allocator).body),
+		metrics_page(metrics_port),
 		`elodin_upstream_failure_kind_total{upstream="slow",error="backlogged"}`,
 	)
 	check(r, backlogged > 0, "no failure was counted as backlogged: %d", backlogged)

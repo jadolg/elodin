@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "elodin:config"
 import "elodin:dns"
 
 /*
@@ -19,29 +20,18 @@ back.
 
 @(private = "file")
 config_metrics :: proc(udp_port, upstream_port: int, metrics: string) -> string {
-	return fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: true, max_entries: 100 }}
-blocking: {{ enabled: false }}
-%s`,
+	return base_config(
 		udp_port,
-		upstream_port,
-		metrics,
+		upstream_at(upstream_port),
+		timeout = "3s",
+		cache = "{ enabled: true, max_entries: 100 }",
+		extra = metrics,
 	)
 }
 
 run_metrics_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("metrics", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 21})
-	if !mock_start(mock) {
-		skip_case(r, "metrics", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "metrics", "metrics", {203, 0, 113, 21})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -62,7 +52,7 @@ run_metrics_cases :: proc(r: ^Runner) {
 			r,
 			Server_Options{config = config_metrics(udp_port, upstream_port, ""), udp_port = udp_port},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			check(r, !tcp_port_open(9153), "something is listening on the default metrics port with metrics off")
 			check(r, !tcp_port_open(metrics_port), "the metrics port is open with metrics off")
@@ -85,7 +75,7 @@ run_metrics_cases :: proc(r: ^Runner) {
 				udp_port = udp_port,
 			},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			if check(r, wait_http(metrics_port, "/metrics"), "the metrics endpoint never answered") {
 				QUERIES :: 4
@@ -93,10 +83,7 @@ run_metrics_cases :: proc(r: ^Runner) {
 				// asking a question of its own and that question is a query
 				// like any other. What is being checked is the difference the
 				// four below make.
-				before := metric_value(
-					string(http_request(metrics_port, "GET", "/metrics", context.temp_allocator).body),
-					"elodin_queries_total",
-				)
+				before := metric_value(metrics_page(metrics_port), "elodin_queries_total")
 				for i in 0 ..< QUERIES {
 					// The same name every time, so all but the first are cache
 					// hits and both counters below have something to say.
@@ -156,7 +143,7 @@ run_metrics_cases :: proc(r: ^Runner) {
 						time.sleep(10 * time.Millisecond)
 					}
 					check_eq_int(r, inflight, 0, "elodin_queries_inflight once the four were answered")
-					check(r, metric_value(page, "elodin_queries_inflight_max") >= 64, "elodin_queries_inflight_max is missing or below the derived floor")
+					check(r, metric_value(page, "elodin_queries_inflight_max") >= config.MIN_DERIVED_PENDING, "elodin_queries_inflight_max is missing or below the derived floor")
 				}
 
 				// Anything but the configured path is a 404, and anything that
@@ -199,7 +186,7 @@ run_metrics_cases :: proc(r: ^Runner) {
 				udp_port = udp_port,
 			},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			if check(r, wait_http(metrics_port, "/internal/prom"), "the metrics endpoint never answered") {
 				check_eq_int(
@@ -240,6 +227,14 @@ wait_http :: proc(port: int, path: string) -> bool {
 check_metric :: proc(r: ^Runner, page: string, name: string, want: int) {
 	wanted := fmt.tprintf("\n%s %d\n", name, want)
 	check(r, strings.contains(page, wanted), "%s is not %d in the scrape", name, want)
+}
+
+// The page the metrics endpoint serves, once it answers; "" when it never does.
+metrics_page :: proc(metrics_port: int) -> string {
+	if !wait_http(metrics_port, "/metrics") {
+		return ""
+	}
+	return string(http_request(metrics_port, "GET", "/metrics", context.temp_allocator).body)
 }
 
 // -1 when the sample is not there, which no counter on the page can be. Shared

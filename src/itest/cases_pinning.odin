@@ -84,11 +84,8 @@ run_pinning_cases :: proc(r: ^Runner) {
 		skip_case(r, "server.pin_loops", "this run may use fewer than two CPUs, so a pinned thread looks like any other")
 		return
 	}
-	upstream_port := next_port(r)
-	mock := mock_make("pinning", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 45})
-	if !mock_start(mock) {
-		skip_case(r, "server.pin_loops", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "pinning", "server.pin_loops", {203, 0, 113, 45})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -97,7 +94,7 @@ run_pinning_cases :: proc(r: ^Runner) {
 	{
 		udp_port := next_port(r)
 		srv, ok := start_server(r, Server_Options{config = config_pinning(udp_port, upstream_port, 2, true), udp_port = udp_port})
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			check(r, query_udp(udp_port, build_query("pin.example.", 1, id = 0x610, allocator = context.temp_allocator), context.temp_allocator).ok, "a query was not answered")
 			cpus, read := wait_pinned(srv.process.pid, allowed[:2])
@@ -120,7 +117,7 @@ run_pinning_cases :: proc(r: ^Runner) {
 		start_case(r, "server.pin_loops: with more loops than CPUs, none is pinned")
 		udp_port := next_port(r)
 		srv, ok := start_server(r, Server_Options{config = config_pinning(udp_port, upstream_port, len(allowed) + 1, true), udp_port = udp_port})
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			check(r, query_udp(udp_port, build_query("pin.example.", 1, id = 0x611, allocator = context.temp_allocator), context.temp_allocator).ok, "a query was not answered")
 			cpus, read := pinned_thread_cpus(srv.process.pid)
@@ -136,7 +133,7 @@ run_pinning_cases :: proc(r: ^Runner) {
 	{
 		udp_port := next_port(r)
 		srv, ok := start_server(r, Server_Options{config = config_pinning(udp_port, upstream_port, 2, false), udp_port = udp_port})
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			cpus, read := pinned_thread_cpus(srv.process.pid)
 			if check(r, read, "the server's threads could not be listed") {

@@ -1,6 +1,5 @@
 package itest
 
-import "core:fmt"
 import "elodin:dns"
 
 /*
@@ -282,39 +281,19 @@ LP_FIXTURES := []Fixture{
 	},
 }
 
-@(private = "file")
-lp_config :: proc(udp_port, upstream_port: int) -> string {
-	return fmt.tprintf(
-		`listeners:
-  udp: {{enabled: true, address: 127.0.0.1, port: %d}}
-  tcp: {{enabled: false}}
-upstream:
-  servers: [udp://127.0.0.1:%d]
-blocking: {{enabled: false}}
-dnssec:
-  enabled: true
-  trust_anchors:
-    - %q
-`,
-		udp_port,
-		upstream_port,
-		LP_ANCHOR,
-	)
-}
-
 run_dnssec_lapsed_cases :: proc(r: ^Runner) {
 	mock := mock_make("dnssec-lapsed", next_port(r))
 	for f in LP_FIXTURES {
 		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
 	}
-	if !mock_start(mock) {
-		skip_case(r, "dnssec: a lapsed signature is named by its window", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "dnssec: a lapsed signature is named by its window") {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	srv, ok := start_server(r, Server_Options{config = lp_config(udp_port, mock.port), udp_port = udp_port})
+	config := dnssec_config(udp_port, mock.port, []string{LP_ANCHOR}, log = "{ level: info }", cache = "{ enabled: true }")
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
 		return
 	}
@@ -350,8 +329,7 @@ run_dnssec_lapsed_cases :: proc(r: ^Runner) {
 			check(r, mock_total(mock) == asked, "the repeated question went upstream rather than to the remembered verdict")
 		}
 		if check(r, res.ok, "no response") {
-			msg, err := dns.decode_message(res.wire, context.allocator)
-			if check(r, err == .None, "the answer does not decode") {
+			if msg, decoded := decode_reply(r, res.wire); decoded {
 				check_eq_int(r, int(dns.rcode_of(msg)), int(c.rcode), "rcode")
 				check(r, msg.flags.ad == (c.rcode == .No_Error), "AD is %v", msg.flags.ad)
 				code, text := extended_error_with_text(r, res.wire)

@@ -79,18 +79,27 @@ expect_no_udp_reply :: proc(udp_port: int, query: []u8, wait := 400 * time.Milli
 	return rerr != nil
 }
 
-query_tcp :: proc(tcp_port: int, query: []u8, allocator := context.allocator, timeout := CLIENT_TIMEOUT) -> Query_Result {
-	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
+/*
+A TCP connection to the server on loopback, or to `address`, with both socket
+timeouts set: a dial that left either unset would hang the suite on a server
+that stopped reading or writing. The caller closes `conn.socket`.
+*/
+dial_tcp :: proc(port: int, timeout := CLIENT_TIMEOUT, address: net.Address = net.IP4_Loopback) -> (conn: Test_Conn, ok: bool) {
+	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = address, port = port})
 	if err != nil {
-		return {}
+		return {}, false
 	}
-	defer net.close(socket)
 	_ = net.set_option(socket, .Receive_Timeout, timeout)
 	_ = net.set_option(socket, .Send_Timeout, timeout)
+	return Test_Conn{socket = socket}, true
+}
 
-	conn := Test_Conn {
-		socket = socket,
+query_tcp :: proc(tcp_port: int, query: []u8, allocator := context.allocator, timeout := CLIENT_TIMEOUT) -> Query_Result {
+	conn, ok := dial_tcp(tcp_port, timeout)
+	if !ok {
+		return {}
 	}
+	defer net.close(conn.socket)
 	return stream_query(&conn, query, allocator)
 }
 
@@ -98,16 +107,11 @@ query_tcp :: proc(tcp_port: int, query: []u8, allocator := context.allocator, ti
 // client does and what the server's per-connection loop has to handle.
 query_tcp_multi :: proc(tcp_port: int, queries: [][]u8, allocator := context.allocator) -> []Query_Result {
 	results := make([]Query_Result, len(queries), allocator)
-	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
-	if err != nil {
+	conn, ok := dial_tcp(tcp_port)
+	if !ok {
 		return results
 	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-
-	conn := Test_Conn {
-		socket = socket,
-	}
+	defer net.close(conn.socket)
 	for q, i in queries {
 		results[i] = stream_query(&conn, q, allocator)
 		if !results[i].ok {
@@ -133,12 +137,8 @@ Test_Conn :: struct {
 
 @(private)
 dial_tls :: proc(port: int, alpn: []string = nil) -> (conn: Test_Conn, ok: bool) {
-	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
-	if err != nil {
-		return {}, false
-	}
-	_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-	_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
+	plain := dial_tcp(port) or_return
+	socket := plain.socket
 
 	// The test certificate is self-signed, so verification is off here; the
 	// point of these cases is the protocol, not the PKI.
@@ -171,15 +171,8 @@ conn_write :: proc(c: ^Test_Conn, buf: []u8) -> bool {
 		_, err := tlsx.write(c.tls, buf)
 		return err == .None
 	}
-	sent := 0
-	for sent < len(buf) {
-		n, err := net.send_tcp(c.socket, buf[sent:])
-		if err != nil || n <= 0 {
-			return false
-		}
-		sent += n
-	}
-	return true
+	_, err := net.send_tcp(c.socket, buf)
+	return err == nil
 }
 
 @(private)
@@ -261,22 +254,32 @@ udp_flood :: proc(udp_port: int, query: []u8, count: int, drain := 700 * time.Mi
 	_ = net.set_option(socket, .Send_Timeout, time.Second)
 	set_receive_buffer(socket, 4 << 20)
 
-	endpoint := net.Endpoint {
-		address = net.IP4_Loopback,
-		port    = udp_port,
-	}
+	send_burst(socket, query, count, net.Endpoint{address = net.IP4_Loopback, port = udp_port})
+	return drain_answers(socket, drain, want)
+}
 
+/*
+`count` copies of `query` from `socket` to `to`, each with a transaction ID of
+its own as a real client's would be, stopping at the first send that fails.
+Hands back the copy it sent, for a caller that sends it again.
+*/
+@(private = "file")
+send_burst :: proc(socket: net.UDP_Socket, query: []u8, count: int, to: net.Endpoint) -> []u8 {
 	out := make([]u8, len(query), context.temp_allocator)
 	copy(out, query)
 	for i in 0 ..< count {
-		// A transaction ID of its own per query, as a real client would.
 		out[0], out[1] = u8(i >> 8), u8(i)
-		if _, serr := net.send_udp(socket, out, endpoint); serr != nil {
+		if _, serr := net.send_udp(socket, out, to); serr != nil {
 			break
 		}
 	}
+	return out
+}
 
-	res: Flood_Result
+// Count the answers that reach `socket` until `drain` is over, or until `want`
+// are in when it is set.
+@(private = "file")
+drain_answers :: proc(socket: net.UDP_Socket, drain: time.Duration, want := 0) -> (res: Flood_Result) {
 	buf := make([]u8, 65535, context.temp_allocator)
 	deadline := time.time_add(time.now(), drain)
 	for time.diff(deadline, time.now()) < 0 && (want == 0 || res.answered < want) {
@@ -314,13 +317,13 @@ does not arrive arrives as the end of the connection. A run that is never cut of
 ends on the receive timeout instead.
 */
 tcp_pipeline_flood :: proc(tcp_port: int, query: []u8, count: int, drain := 700 * time.Millisecond) -> Flood_Result {
-	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
-	if err != nil {
+	conn, dialed := dial_tcp(tcp_port)
+	if !dialed {
 		return {}
 	}
+	socket := conn.socket
 	defer net.close(socket)
 	_ = net.set_option(socket, .Receive_Timeout, drain)
-	_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
 
 	stride := 2 + len(query)
 	framed := make([]u8, count * stride, context.temp_allocator)
@@ -332,14 +335,8 @@ tcp_pipeline_flood :: proc(tcp_port: int, query: []u8, count: int, drain := 700 
 		// A transaction ID of its own per query, as a real client would.
 		message[2], message[3] = u8(i >> 8), u8(i)
 	}
-	sent := 0
-	for sent < len(framed) {
-		n, serr := net.send_tcp(socket, framed[sent:])
-		if serr != nil || n <= 0 {
-			break
-		}
-		sent += n
-	}
+	// What did not go out is read as what was not answered.
+	_, _ = net.send_tcp(socket, framed)
 
 	res: Flood_Result
 	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
@@ -393,28 +390,23 @@ tcp_hold_and_query :: proc(
 	answered: int,
 	opened: int,
 ) {
-	sockets := make([]net.TCP_Socket, count, context.temp_allocator)
+	conns := make([]Test_Conn, count, context.temp_allocator)
 	for i in 0 ..< count {
-		socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = tcp_port})
-		if err != nil {
+		conn, ok := dial_tcp(tcp_port, timeout)
+		if !ok {
 			break
 		}
-		_ = net.set_option(socket, .Receive_Timeout, timeout)
-		_ = net.set_option(socket, .Send_Timeout, timeout)
-		sockets[i] = socket
+		conns[i] = conn
 		opened += 1
 	}
 	defer {
 		for i in 0 ..< opened {
-			net.close(sockets[i])
+			net.close(conns[i].socket)
 		}
 	}
 
 	for i in 0 ..< opened {
-		conn := Test_Conn {
-			socket = sockets[i],
-		}
-		if stream_query(&conn, query, context.temp_allocator).ok {
+		if stream_query(&conns[i], query, context.temp_allocator).ok {
 			answered += 1
 		}
 	}
@@ -684,17 +676,11 @@ request per connection and closes, which is why nothing here tries to reuse the
 socket.
 */
 http_request :: proc(port: int, method: string, target: string, allocator := context.allocator) -> Http_Result {
-	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
-	if err != nil {
+	conn, ok := dial_tcp(port)
+	if !ok {
 		return {}
 	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-	_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
-
-	conn := Test_Conn {
-		socket = socket,
-	}
+	defer net.close(conn.socket)
 	if !conn_write(&conn, build_http_request(method, target, "", nil)) {
 		return {}
 	}
@@ -704,11 +690,8 @@ http_request :: proc(port: int, method: string, target: string, allocator := con
 // Whether anything is listening at all, which is what the "off by default" case
 // is asking.
 tcp_port_open :: proc(port: int) -> bool {
-	socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
-	if err != nil {
-		return false
-	}
-	net.close(socket)
+	conn := dial_tcp(port) or_return
+	net.close(conn.socket)
 	return true
 }
 
@@ -769,20 +752,7 @@ wildcard_flood :: proc(udp_port: int, query: []u8, count: int, drain := 700 * ti
 		set_receive_buffer(socket, 4 << 20)
 	}
 
-	out := make([]u8, len(query), context.temp_allocator)
-	copy(out, query)
-
-	to_v4 := net.Endpoint {
-		address = net.IP4_Loopback,
-		port    = udp_port,
-	}
-	for i in 0 ..< count {
-		// A transaction ID of its own per query, as a real client would.
-		out[0], out[1] = u8(i >> 8), u8(i)
-		if _, serr := net.send_udp(v4, out, to_v4); serr != nil {
-			break
-		}
-	}
+	out := send_burst(v4, query, count, net.Endpoint{address = net.IP4_Loopback, port = udp_port})
 
 	// Straight after it, same port, other family.
 	out[0], out[1] = 0xff, 0xff
@@ -795,19 +765,8 @@ wildcard_flood :: proc(udp_port: int, query: []u8, count: int, drain := 700 * ti
 	}
 	res.v6_sent = true
 
+	res.v4_answered = drain_answers(v4, drain).answered
 	buf := make([]u8, 65535, context.temp_allocator)
-	deadline := time.time_add(time.now(), drain)
-	for time.diff(deadline, time.now()) < 0 {
-		n, _, rerr := net.recv_udp(v4, buf)
-		if rerr != nil {
-			// The receive timeout expiring is how this notices the quiet.
-			continue
-		}
-		if n < dns.HEADER_SIZE {
-			continue
-		}
-		res.v4_answered += 1
-	}
 	if n, _, rerr := net.recv_udp(v6, buf); rerr == nil && n >= dns.HEADER_SIZE {
 		res.v6_answered = true
 	}
@@ -833,13 +792,12 @@ tls_resumes :: proc(port: int, version: int, alpn: []string, request: []u8) -> (
 	session: ^tlsx.SSL_SESSION
 	defer if session != nil {tlsx.SSL_SESSION_free(session)}
 	for round in 0 ..< 2 {
-		socket, err := net.dial_tcp_from_endpoint(net.Endpoint{address = net.IP4_Loopback, port = port})
-		if err != nil {
+		conn, dialed := dial_tcp(port)
+		if !dialed {
 			return
 		}
+		socket := conn.socket
 		defer net.close(socket)
-		_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-		_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
 		ssl := tlsx.SSL_new(ctx.ptr)
 		if ssl == nil {
 			return

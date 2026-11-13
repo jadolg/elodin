@@ -1,7 +1,6 @@
 package itest
 
 import "core:fmt"
-import "core:path/filepath"
 import "core:strings"
 import "elodin:dns"
 
@@ -38,11 +37,8 @@ blocking: {{ enabled: false }}
 }
 
 run_udp_reader_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("udpreaders", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 44})
-	if !mock_start(mock) {
-		skip_case(r, "listeners.udp.readers", "cannot start the mock upstream")
+	mock, upstream_port, started := synth_mock(r, "udpreaders", "listeners.udp.readers", {203, 0, 113, 44})
+	if !started {
 		return
 	}
 	defer mock_stop(mock)
@@ -62,7 +58,7 @@ run_udp_reader_cases :: proc(r: ^Runner) {
 				udp_port = udp_port,
 			},
 		)
-		if check(r, ok, "server did not start") {
+		if ok {
 			defer stop_server(&srv)
 			check(
 				r,
@@ -94,8 +90,7 @@ run_udp_reader_cases :: proc(r: ^Runner) {
 			}
 			check_eq_int(r, answered, QUERIES, "queries answered across the readers")
 
-			if check(r, wait_http(metrics_port, "/metrics"), "the metrics endpoint never answered") {
-				page := string(http_request(metrics_port, "GET", "/metrics", context.temp_allocator).body)
+			if page := metrics_page(metrics_port); check(r, page != "", "the metrics endpoint never answered") {
 				total := 0
 				busy := 0
 				for i in 0 ..< 4 {
@@ -136,10 +131,8 @@ run_udp_reader_cases :: proc(r: ^Runner) {
 
 	start_case(r, "listeners.udp.readers: --check reports the count and where it came from")
 	{
-		path := filepath.join({r.work_dir, "readers-derived.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r, path, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\n"))
-		res := run_binary(r, []string{"--config", path, "--check"}, "readers-derived")
-		if check(r, res.ok, "could not run the binary") {
+		res := check_config_text(r, "readers-derived", "upstream:\n  servers: [1.1.1.1]\n")
+		if res.ok {
 			check_eq_int(r, res.exit_code, 0, "exit code")
 			// The shipped file names no reader count, so this is the only place
 			// an operator can read the number the next start will use.
@@ -161,13 +154,8 @@ run_udp_reader_cases :: proc(r: ^Runner) {
 
 	start_case(r, "listeners.udp.readers: --check refuses a count this server will not honour")
 	{
-		path := filepath.join({r.work_dir, "readers-absurd.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp:\n    readers: 4096\n"),
-		)
-		res := run_binary(r, []string{"--config", path, "--check"}, "readers-absurd")
-		if check(r, res.ok, "could not run the binary") {
+		res := check_config_text(r, "readers-absurd", "upstream:\n  servers: [1.1.1.1]\nlisteners:\n  udp:\n    readers: 4096\n")
+		if res.ok {
 			check(r, res.exit_code != 0, "a reader count of 4096 exited 0")
 			check(
 				r,

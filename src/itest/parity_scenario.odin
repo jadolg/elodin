@@ -490,53 +490,50 @@ parity_server_line :: proc(
 	ends: Parity_Endpoints,
 ) {
 	port := ends.ports[i]
-	if ends.live {
-		switch kind {
-		case .UDP:
-			fmt.sbprintf(sb, "%s- {{ name: p%d, type: udp, address: %s, port: %d }}\n", indent, i, ends.host, port)
-		case .TCP:
-			fmt.sbprintf(sb, "%s- {{ name: p%d, type: tcp, address: %s, port: %d }}\n", indent, i, ends.host, port)
-		case .TLS:
+	host := ends.host if ends.live else "127.0.0.1"
+	switch kind {
+	case .UDP:
+		fmt.sbprintf(sb, "%s- {{ name: p%d, type: udp, address: %s, port: %d }}\n", indent, i, host, port)
+	case .TCP:
+		fmt.sbprintf(sb, "%s- {{ name: p%d, type: tcp, address: %s, port: %d }}\n", indent, i, host, port)
+	case .TLS:
+		if ends.live {
 			fmt.sbprintf(
 				sb,
 				"%s- {{ name: p%d, type: tls, address: %s, port: 853, hostname: %s }}\n",
 				indent,
 				i,
-				ends.host,
+				host,
 				ends.resolver.hostname,
 			)
-		case .HTTPS:
+		} else {
+			fmt.sbprintf(
+				sb,
+				"%s- {{ name: p%d, type: tls, address: %s, port: %d, hostname: elodin.local, verify: false }}\n",
+				indent,
+				i,
+				host,
+				port,
+			)
+		}
+	case .HTTPS:
+		if ends.live {
 			fmt.sbprintf(
 				sb,
 				"%s- {{ name: p%d, type: https, url: \"%s\", bootstrap: [%s] }}\n",
 				indent,
 				i,
 				ends.resolver.url,
-				ends.host,
+				host,
+			)
+		} else {
+			fmt.sbprintf(
+				sb,
+				"%s- {{ name: p%d, type: https, url: \"https://127.0.0.1:%d/dns-query\", verify: false }}\n",
+				indent,
+				i,
+				port,
 			)
 		}
-		return
-	}
-	switch kind {
-	case .UDP:
-		fmt.sbprintf(sb, "%s- {{ name: p%d, type: udp, address: 127.0.0.1, port: %d }}\n", indent, i, port)
-	case .TCP:
-		fmt.sbprintf(sb, "%s- {{ name: p%d, type: tcp, address: 127.0.0.1, port: %d }}\n", indent, i, port)
-	case .TLS:
-		fmt.sbprintf(
-			sb,
-			"%s- {{ name: p%d, type: tls, address: 127.0.0.1, port: %d, hostname: elodin.local, verify: false }}\n",
-			indent,
-			i,
-			port,
-		)
-	case .HTTPS:
-		fmt.sbprintf(
-			sb,
-			"%s- {{ name: p%d, type: https, url: \"https://127.0.0.1:%d/dns-query\", verify: false }}\n",
-			indent,
-			i,
-			port,
-		)
 	}
 }

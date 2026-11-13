@@ -18,24 +18,17 @@ splitting, RST_STREAM, PING) and the error paths.
 
 @(private = "file")
 config_h2 :: proc(r: ^Runner, udp_port, doh_port, upstream_port: int, upstream_scheme := "") -> string {
-	server := fmt.tprintf("\"%s127.0.0.1:%d\"", upstream_scheme, upstream_port)
-	return fmt.tprintf(
-		`log: {{ level: debug, queries: true }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-  doh: {{ enabled: true, address: "127.0.0.1", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}
-upstream:
-  timeout: 5s
-  servers: [%s]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
+	return base_config(
 		udp_port,
-		doh_port,
-		r.cert_file,
-		r.key_file,
-		server,
+		fmt.tprintf(`["%s127.0.0.1:%d"]`, upstream_scheme, upstream_port),
+		log = "{ level: debug, queries: true }",
+		timeout = "5s",
+		listeners_extra = fmt.tprintf(
+			"  doh: {{ enabled: true, address: \"127.0.0.1\", port: %d, path: /dns-query, cert_file: %s, key_file: %s }}",
+			doh_port,
+			r.cert_file,
+			r.key_file,
+		),
 	)
 }
 
@@ -45,8 +38,7 @@ run_h2_cases :: proc(r: ^Runner) {
 	mock := mock_make("h2", upstream_port)
 	mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
 	mock_synth_all(mock, {203, 0, 113, 5})
-	if !mock_start(mock) {
-		skip_case(r, "doh/h2", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "doh/h2") {
 		return
 	}
 	defer mock_stop(mock)
@@ -62,7 +54,6 @@ run_h2_cases :: proc(r: ^Runner) {
 		},
 	)
 	if !ok {
-		skip_case(r, "doh/h2", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -351,48 +342,47 @@ run_h2_cases :: proc(r: ^Runner) {
 		slow_port := next_port(r)
 		slow := mock_make("h2-slow", slow_port)
 		mock_delay_all(slow, 300 * time.Millisecond, nil)
-		if !check(r, mock_start(slow), "cannot start the slow mock") {
-			end_case(r)
-			return
-		}
+		// Stopped whether or not it started: `mock_stop` frees a failed start too.
+		slow_ok := mock_start(slow)
 		defer mock_stop(slow)
+		if check(r, slow_ok, "cannot start the slow mock") {
+			slow_dns := next_port(r)
+			slow_doh := next_port(r)
+			slow_srv, sok := start_server(
+				r,
+				Server_Options {
+					config = config_h2(r, slow_dns, slow_doh, slow_port),
+					udp_port = slow_dns,
+					doh_port = slow_doh,
+				},
+			)
+			if sok {
+				defer stop_server(&slow_srv)
 
-		slow_dns := next_port(r)
-		slow_doh := next_port(r)
-		slow_srv, sok := start_server(
-			r,
-			Server_Options {
-				config = config_h2(r, slow_dns, slow_doh, slow_port),
-				udp_port = slow_dns,
-				doh_port = slow_doh,
-			},
-		)
-		if check(r, sok, "the slow server did not start") {
-			defer stop_server(&slow_srv)
+				c, cok := h2_connect(slow_doh)
+				if check(r, cok, "cannot open an h2 connection") {
+					defer h2_close(c)
 
-			c, cok := h2_connect(slow_doh)
-			if check(r, cok, "cannot open an h2 connection") {
-				defer h2_close(c)
-
-				started := time.now()
-				ids := []u32{1, 3, 5, 7}
-				for id, i in ids {
-					q := build_query(fmt.tprintf("s%d.parallel.test.", i), u16(dns.Type.A), id = u16(id))
-					check(r, h2_send_request(c, id, "POST", "/dns-query", q), "cannot send stream %d", id)
-				}
-				if check(r, h2_collect(c, ids), "not every stream completed") {
-					elapsed := time.diff(started, time.now())
-					for id in ids {
-						res, _ := h2_stream(c, id)
-						check(r, res.status == 200, "stream %d status %d", id, res.status)
+					started := time.now()
+					ids := []u32{1, 3, 5, 7}
+					for id, i in ids {
+						q := build_query(fmt.tprintf("s%d.parallel.test.", i), u16(dns.Type.A), id = u16(id))
+						check(r, h2_send_request(c, id, "POST", "/dns-query", q), "cannot send stream %d", id)
 					}
-					// Four 300ms queries: serial would be about 1.2s.
-					check(
-						r,
-						elapsed < 900 * time.Millisecond,
-						"took %.0fms for four 300ms queries, so they were serialised",
-						time.duration_milliseconds(elapsed),
-					)
+					if check(r, h2_collect(c, ids), "not every stream completed") {
+						elapsed := time.diff(started, time.now())
+						for id in ids {
+							res, _ := h2_stream(c, id)
+							check(r, res.status == 200, "stream %d status %d", id, res.status)
+						}
+						// Four 300ms queries: serial would be about 1.2s.
+						check(
+							r,
+							elapsed < 900 * time.Millisecond,
+							"took %.0fms for four 300ms queries, so they were serialised",
+							time.duration_milliseconds(elapsed),
+						)
+					}
 				}
 			}
 		}
@@ -703,10 +693,9 @@ frame size.
 run_h2_large_response_case :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("h2-large", upstream_port)
-	big := build_large_txt_response("big.test.", 100, context.allocator)
+	big := big_txt_answer("big.test.", 100, context.allocator)
 	mock_reply(mock, "big.test.", u16(dns.Type.TXT), big)
-	if !mock_start(mock) {
-		skip_case(r, "h2: large response", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "h2: large response") {
 		return
 	}
 	defer mock_stop(mock)
@@ -722,7 +711,6 @@ run_h2_large_response_case :: proc(r: ^Runner) {
 		},
 	)
 	if !ok {
-		skip_case(r, "h2: large response", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -746,37 +734,4 @@ run_h2_large_response_case :: proc(r: ^Runner) {
 		}
 	}
 	end_case(r)
-}
-
-// A DNS response carrying `count` TXT records of one 255-byte string each.
-@(private = "file")
-build_large_txt_response :: proc(name: string, count: int, allocator := context.allocator) -> []u8 {
-	answers := make([]dns.Record, count, context.temp_allocator)
-	for i in 0 ..< count {
-		chunk := make([]u8, 400, context.temp_allocator)
-		for j in 0 ..< len(chunk) {
-			chunk[j] = u8('a' + (i + j) % 26)
-		}
-		strs := make([]string, 1, context.temp_allocator)
-		strs[0] = string(chunk[:255])
-		answers[i] = dns.Record {
-			name  = name,
-			type  = .TXT,
-			class = .IN,
-			ttl   = 300,
-			data  = dns.Rdata_TXT{strings = strs},
-		}
-	}
-	m := dns.Message {
-		question   = []dns.Question{{name = name, type = .TXT, class = .IN}},
-		answer     = answers,
-		additional = []dns.Record{dns.make_opt(4096, false)},
-	}
-	m.flags.qr = true
-	m.flags.ra = true
-	wire, _, err := dns.encode_message(m, allocator, dns.MAX_MESSAGE)
-	if err != .None {
-		return nil
-	}
-	return wire
 }

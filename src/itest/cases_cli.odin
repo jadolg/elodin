@@ -45,13 +45,8 @@ run_cli_cases :: proc(r: ^Runner) {
 
 	start_case(r, "cli: --check accepts a valid config")
 	{
-		path := filepath.join({r.work_dir, "valid.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nblocking:\n  rules: [\"||a.test^\"]\n"),
-		)
-		res := run_binary(r, []string{"--config", path, "--check"}, "check-ok")
-		if check(r, res.ok, "could not run the binary") {
+		res := check_config_text(r, "check-ok", "upstream:\n  servers: [1.1.1.1]\nblocking:\n  rules: [\"||a.test^\"]\n")
+		if res.ok {
 			check_eq_int(r, res.exit_code, 0, "exit code")
 			check(r, strings.contains(res.output, "is valid"), "no confirmation was printed")
 		}
@@ -74,15 +69,12 @@ run_cli_cases :: proc(r: ^Runner) {
 	*/
 	start_case(r, "cli: --check reports an estimate no answer can reach")
 	{
-		path := filepath.join({r.work_dir, "inert-estimate.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)string(
-				"upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: true\n    response_size_estimate: 2048\n",
-			),
+		res := check_config_text(
+			r,
+			"check-inert-estimate",
+			"upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: true\n    response_size_estimate: 2048\n",
 		)
-		res := run_binary(r, []string{"--config", path, "--check"}, "check-inert-estimate")
-		if check(r, res.ok, "could not run the binary") {
+		if res.ok {
 			// Valid, which is the point: it loads, and the warning is the only
 			// thing that says the setting is doing nothing.
 			check_eq_int(r, res.exit_code, 0, "exit code for an estimate above the ceiling")
@@ -97,15 +89,12 @@ run_cli_cases :: proc(r: ^Runner) {
 		// And the estimate that does bite is multiplied out here, which is the
 		// figure an operator is confirming before they restart: 500/s at 128
 		// bytes is 64,000 bytes a second at one prefix.
-		biting := filepath.join({r.work_dir, "biting-estimate.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			biting,
-			transmute([]u8)string(
-				"upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: true\n    responses_per_second: 500\n    response_size_estimate: 128\n",
-			),
+		bres := check_config_text(
+			r,
+			"check-biting-estimate",
+			"upstream:\n  servers: [1.1.1.1]\nserver:\n  rate_limit:\n    enabled: true\n    responses_per_second: 500\n    response_size_estimate: 128\n",
 		)
-		bres := run_binary(r, []string{"--config", biting, "--check"}, "check-biting-estimate")
-		if check(r, bres.ok, "could not run the binary") {
+		if bres.ok {
 			check_eq_int(r, bres.exit_code, 0, "exit code for an estimate under the ceiling")
 			check(
 				r,
@@ -117,10 +106,8 @@ run_cli_cases :: proc(r: ^Runner) {
 
 		// And the file that does not name one is not warned at: the loader
 		// resolves an unset estimate to the ceiling itself.
-		quiet := filepath.join({r.work_dir, "default-estimate.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r, quiet, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\n"))
-		qres := run_binary(r, []string{"--config", quiet, "--check"}, "check-default-estimate")
-		if check(r, qres.ok, "could not run the binary") {
+		qres := check_config_text(r, "check-default-estimate", "upstream:\n  servers: [1.1.1.1]\n")
+		if qres.ok {
 			check(
 				r,
 				!strings.contains(qres.output, "response_size_estimate"),
@@ -133,10 +120,8 @@ run_cli_cases :: proc(r: ^Runner) {
 
 	start_case(r, "cli: --check rejects a config with no upstreams")
 	{
-		path := filepath.join({r.work_dir, "no-upstream.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r, path, transmute([]u8)string("log:\n  level: info\n"))
-		res := run_binary(r, []string{"--config", path, "--check"}, "check-empty")
-		if check(r, res.ok, "could not run the binary") {
+		res := check_config_text(r, "check-empty", "log:\n  level: info\n")
+		if res.ok {
 			check(r, res.exit_code != 0, "an unusable config exited 0")
 			check(r, strings.contains(res.output, "upstream"), "the error does not mention upstreams")
 		}
@@ -147,15 +132,12 @@ run_cli_cases :: proc(r: ^Runner) {
 	// (#499). Refused at the top level and on a route.
 	start_case(r, "cli: --check rejects an upstream timeout of zero")
 	{
-		path := filepath.join({r.work_dir, "zero-timeout.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)string(
-				"upstream:\n  timeout: 0s\n  servers: [1.1.1.1]\n  zones:\n    - domains: [home.arpa]\n      timeout: 0ms\n      servers: [192.168.1.1]\n",
-			),
+		res := check_config_text(
+			r,
+			"check-zero-timeout",
+			"upstream:\n  timeout: 0s\n  servers: [1.1.1.1]\n  zones:\n    - domains: [home.arpa]\n      timeout: 0ms\n      servers: [192.168.1.1]\n",
 		)
-		res := run_binary(r, []string{"--config", path, "--check"}, "check-zero-timeout")
-		if check(r, res.ok, "could not run the binary") {
+		if res.ok {
 			check(r, res.exit_code != 0, "a zero upstream timeout exited 0")
 			check(r, strings.contains(res.output, "upstream.timeout"), "the top-level timeout was not reported")
 			check(r, strings.contains(res.output, "upstream.zones[0].timeout"), "the route's timeout was not reported")
@@ -167,17 +149,14 @@ run_cli_cases :: proc(r: ^Runner) {
 	// than a port picked by the kernel and a TTL cast to 4294967295.
 	start_case(r, "cli: --check rejects ports, TTLs and timeouts out of range")
 	{
-		path := filepath.join({r.work_dir, "out-of-range.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)string(
-				"listeners:\n  udp: {enabled: true, address: 127.0.0.1, port: 106837}\n  tcp: {enabled: true, address: 127.0.0.1, port: 0}\n" +
-				"server:\n  client_timeout: 0s\nupstream:\n  timeout: 0s\n  servers:\n    - {name: none, type: udp, address: 127.0.0.1, port: 41302}\n" +
-				"blocking:\n  enabled: false\nrewrites:\n  - domain: nas.home\n    answer: 192.168.1.50\n    ttl: -1\n",
-			),
+		res := check_config_text(
+			r,
+			"check-out-of-range",
+			"listeners:\n  udp: {enabled: true, address: 127.0.0.1, port: 106837}\n  tcp: {enabled: true, address: 127.0.0.1, port: 0}\n" +
+			"server:\n  client_timeout: 0s\nupstream:\n  timeout: 0s\n  servers:\n    - {name: none, type: udp, address: 127.0.0.1, port: 41302}\n" +
+			"blocking:\n  enabled: false\nrewrites:\n  - domain: nas.home\n    answer: 192.168.1.50\n    ttl: -1\n",
 		)
-		res := run_binary(r, []string{"--config", path, "--check"}, "check-out-of-range")
-		if check(r, res.ok, "could not run the binary") {
+		if res.ok {
 			check(r, res.exit_code != 0, "an out-of-range config exited 0")
 			for key in ([]string{"listeners.udp.port", "listeners.tcp.port", "server.client_timeout", "upstream.timeout", "rewrites[0].ttl"}) {
 				check(r, strings.contains(res.output, key), "%s was not reported: %q", key, res.output)
@@ -188,13 +167,8 @@ run_cli_cases :: proc(r: ^Runner) {
 
 	start_case(r, "cli: --check reports every problem at once, with line numbers")
 	{
-		path := filepath.join({r.work_dir, "bad.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)string("upstream:\n  strategy: teleport\n  servers: [1.1.1.1]\nblocking:\n  response: explode\n"),
-		)
-		res := run_binary(r, []string{"--config", path, "--check"}, "check-bad")
-		if check(r, res.ok, "could not run the binary") {
+		res := check_config_text(r, "check-bad", "upstream:\n  strategy: teleport\n  servers: [1.1.1.1]\nblocking:\n  response: explode\n")
+		if res.ok {
 			check(r, res.exit_code != 0, "a bad config exited 0")
 			check(r, strings.contains(res.output, "teleport"), "the unknown strategy was not reported")
 			check(r, strings.contains(res.output, "explode"), "the unknown block mode was not reported")
@@ -214,9 +188,7 @@ run_cli_cases :: proc(r: ^Runner) {
 
 	start_case(r, "cli: malformed YAML is reported with a line number")
 	{
-		path := filepath.join({r.work_dir, "malformed.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r, path, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nthis is not a mapping\n"))
-		res := new_check(r, path, "check-yaml")
+		res := check_config_text(r, "check-yaml", "upstream:\n  servers: [1.1.1.1]\nthis is not a mapping\n")
 		check(r, res.exit_code != 0, "malformed YAML exited 0")
 		check(r, strings.contains(res.output, "line 3"), "the failing line was not identified: %q", res.output)
 	}
@@ -226,9 +198,7 @@ run_cli_cases :: proc(r: ^Runner) {
 	// it unquoted means something else to every other YAML reader.
 	start_case(r, "cli: a plain value starting with a YAML indicator is refused")
 	{
-		path := filepath.join({r.work_dir, "indicator.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r, path, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: *.lan\n    answer: 192.168.1.10\n"))
-		res := new_check(r, path, "check-yaml-indicator")
+		res := check_config_text(r, "check-yaml-indicator", "upstream:\n  servers: [1.1.1.1]\nrewrites:\n  - domain: *.lan\n    answer: 192.168.1.10\n")
 		check(r, res.exit_code != 0, "an unquoted *.lan exited 0: %q", res.output)
 		check(r, strings.contains(res.output, "line 4") && strings.contains(res.output, "quote"), "the line and the remedy were not given: %q", res.output)
 	}
@@ -236,12 +206,7 @@ run_cli_cases :: proc(r: ^Runner) {
 
 	start_case(r, "cli: a DoT listener without a certificate is refused")
 	{
-		path := filepath.join({r.work_dir, "nocert.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nlisteners:\n  dot:\n    enabled: true\n"),
-		)
-		res := new_check(r, path, "check-nocert")
+		res := check_config_text(r, "check-nocert", "upstream:\n  servers: [1.1.1.1]\nlisteners:\n  dot:\n    enabled: true\n")
 		check(r, res.exit_code != 0, "a DoT listener with no certificate exited 0")
 		check(r, strings.contains(res.output, "cert_file"), "the missing certificate was not reported")
 	}
@@ -249,12 +214,7 @@ run_cli_cases :: proc(r: ^Runner) {
 
 	start_case(r, "cli: --check rejects a service account nobody has")
 	{
-		path := filepath.join({r.work_dir, "baduser.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nserver:\n  user: elodin-no-such-user\n"),
-		)
-		res := new_check(r, path, "check-baduser")
+		res := check_config_text(r, "check-baduser", "upstream:\n  servers: [1.1.1.1]\nserver:\n  user: elodin-no-such-user\n")
 		check(r, res.exit_code != 0, "an unknown server.user exited 0")
 		check(r, strings.contains(res.output, "no such user"), "the unknown account was not reported: %q", res.output)
 	}
@@ -268,23 +228,14 @@ run_cli_cases :: proc(r: ^Runner) {
 	start_case(r, "cli: --check does not create the log file")
 	{
 		log_path := filepath.join({r.work_dir, "check-nolog.log"}, context.temp_allocator) or_else ""
-		path := filepath.join({r.work_dir, "nolog.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", log_path),
-		)
-		res := new_check(r, path, "check-nolog")
+		res := check_config_text(r, "check-nolog", fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", log_path))
 		check(r, res.exit_code == 0, "--check with a log file exited %d: %q", res.exit_code, res.output)
 		check(r, !os.exists(log_path), "--check created the log file")
 		check(r, !strings.contains(res.output, "cannot open the log file"), "--check warned about a log file it can create: %q", res.output)
 
 		// One the start could not open is still said, though nothing is opened.
 		missing := filepath.join({r.work_dir, "no-such-dir", "check.log"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", missing),
-		)
-		res = new_check(r, path, "check-nolog-dir")
+		res = check_config_text(r, "check-nolog-dir", fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", missing))
 		check(r, res.exit_code == 0, "--check with a log file in a missing directory exited %d: %q", res.exit_code, res.output)
 		check(r, strings.contains(res.output, "cannot open the log file"), "--check did not say the log file cannot be opened: %q", res.output)
 
@@ -295,11 +246,7 @@ run_cli_cases :: proc(r: ^Runner) {
 			_ = os.chmod(ro, {.Read_User, .Execute_User})
 			defer _ = os.chmod(ro, {.Read_User, .Write_User, .Execute_User})
 			in_ro := filepath.join({ro, "check.log"}, context.temp_allocator) or_else ""
-			write_fixture(r,
-				path,
-				transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", in_ro),
-			)
-			res = new_check(r, path, "check-nolog-ro")
+			res = check_config_text(r, "check-nolog-ro", fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nlog:\n  file: %q\n", in_ro))
 			check(r, res.exit_code == 0, "--check with a log file in a read-only directory exited %d: %q", res.exit_code, res.output)
 			check(r, strings.contains(res.output, "cannot open the log file"), "--check did not say a log file in a read-only directory cannot be created: %q", res.output)
 		}
@@ -308,12 +255,7 @@ run_cli_cases :: proc(r: ^Runner) {
 
 	start_case(r, "cli: --check rejects a group with no user")
 	{
-		path := filepath.join({r.work_dir, "groupalone.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r,
-			path,
-			transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\nserver:\n  group: elodin\n"),
-		)
-		res := new_check(r, path, "check-groupalone")
+		res := check_config_text(r, "check-groupalone", "upstream:\n  servers: [1.1.1.1]\nserver:\n  group: elodin\n")
 		check(r, res.exit_code != 0, "server.group without server.user exited 0")
 		check(r, strings.contains(res.output, "server.group"), "the lone group was not reported: %q", res.output)
 	}
@@ -332,32 +274,26 @@ run_cli_cases :: proc(r: ^Runner) {
 	} else {
 		start_case(r, "cli: a privilege drop that cannot happen stops the server")
 		{
-			cfg := fmt.tprintf(
-				`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  servers: ["127.0.0.1:%d"]
-blocking: {{ enabled: false }}
-dnssec: {{ enabled: false }}
-server: {{ user: root }}
-`,
+			cfg := base_config(
 				next_port(r),
-				next_port(r),
+				upstream_at(next_port(r)),
+				log = "{ level: info }",
+				timeout = "",
+				cache = "{ enabled: true }",
+				extra = "dnssec: { enabled: false }\nserver: { user: root }",
 			)
-			path := filepath.join({r.work_dir, "cannotdrop.yaml"}, context.temp_allocator) or_else ""
-			write_fixture(r, path, transmute([]u8)cfg)
-
-			res := run_binary(r, []string{"--config", path}, "cannot-drop")
-			if check(r, res.ok, "could not run the binary") {
-				check(r, res.exit_code != 0, "the server kept running after a failed drop")
-				check(
-					r,
-					strings.contains(res.output, "cannot drop privileges"),
-					"the failed drop was not reported: %q",
-					res.output,
-				)
+			// A write that did not land has failed the case already.
+			if path, written := write_work_file(r, "cannotdrop.yaml", cfg); written {
+				res := run_binary(r, []string{"--config", path}, "cannot-drop")
+				if check(r, res.ok, "could not run the binary") {
+					check(r, res.exit_code != 0, "the server kept running after a failed drop")
+					check(
+						r,
+						strings.contains(res.output, "cannot drop privileges"),
+						"the failed drop was not reported: %q",
+						res.output,
+					)
+				}
 			}
 		}
 		end_case(r)
@@ -391,15 +327,11 @@ server: {{ user: root }}
 	start_case(r, "cli: --check refuses the removed worker keys and names each")
 	{
 		for key in ([]string{"workers", "upstream_workers", "running_workers"}) {
-			path := filepath.join({r.work_dir, fmt.tprintf("removed-%s.yaml", key)}, context.temp_allocator) or_else ""
-			write_fixture(r, path, transmute([]u8)fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nserver:\n  %s: 8\n", key))
-			res := new_check(r, path, fmt.tprintf("check-removed-%s", key))
+			res := check_config_text(r, fmt.tprintf("check-removed-%s", key), fmt.tprintf("upstream:\n  servers: [1.1.1.1]\nserver:\n  %s: 8\n", key))
 			check(r, res.exit_code != 0, "a file naming server.%s passed --check", key)
 			check(r, strings.contains(res.output, fmt.tprintf("server.%s: unknown key", key)), "server.%s was not named: %q", key, res.output)
 		}
-		path := filepath.join({r.work_dir, "connection-walks.yaml"}, context.temp_allocator) or_else ""
-		write_fixture(r, path, transmute([]u8)string("upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: 24\n"))
-		res := new_check(r, path, "check-connection-walks")
+		res := check_config_text(r, "check-connection-walks", "upstream:\n  servers: [1.1.1.1]\ndnssec:\n  max_connection_walks: 24\n")
 		check_eq_int(r, res.exit_code, 0, "exit code for dnssec.max_connection_walks")
 		check(r, strings.contains(res.output, "connection_walks=24"), "the configured connection walk bound was not printed: %q", res.output)
 	}
@@ -480,10 +412,7 @@ server: {{ user: root }}
 				r.key_file,
 				context.temp_allocator,
 			)
-			path := filepath.join({r.work_dir, "public-with-certs.yaml"}, context.temp_allocator) or_else ""
-			write_fixture(r, path, transmute([]u8)text)
-
-			res = new_check(r, path, "check-public-example-certs")
+			res = check_config_text(r, "check-public-example-certs", text)
 			check_eq_int(r, res.exit_code, 0, "exit code for public.yaml with a certificate it has")
 			check(
 				r,
@@ -494,15 +423,6 @@ server: {{ user: root }}
 		}
 	}
 	end_case(r)
-}
-
-// `--check` on `path`. A binary that did not run fails the case here, since a
-// zero exit code and empty output would otherwise pass any case that expects
-// success.
-new_check :: proc(r: ^Runner, path: string, tag: string) -> Run_Result {
-	res := run_binary(r, []string{"--config", path, "--check"}, tag)
-	check(r, res.ok, "could not run the binary")
-	return res
 }
 
 /*
@@ -516,20 +436,12 @@ all.
 */
 @(private = "file")
 config_for_shutdown :: proc(udp_port, upstream_port: int) -> string {
-	return fmt.tprintf(
-		`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-upstream:
-  timeout: 2s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: true }}
-blocking: {{ enabled: false }}
-`,
+	return base_config(
 		udp_port,
-		udp_port,
-		upstream_port,
+		upstream_at(upstream_port),
+		log = "{ level: info }",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		cache = "{ enabled: true }",
 	)
 }
 
@@ -579,8 +491,7 @@ run_shutdown_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("shutdown", upstream_port)
 	mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
-	if !mock_start(mock) {
-		skip_case(r, "shutdown", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, mock, "shutdown") {
 		return
 	}
 	defer mock_stop(mock)
@@ -591,7 +502,6 @@ run_shutdown_cases :: proc(r: ^Runner) {
 		Server_Options{config = config_for_shutdown(udp_port, upstream_port), udp_port = udp_port},
 	)
 	if !ok {
-		skip_case(r, "shutdown", "server did not start")
 		return
 	}
 	defer stop_server(&srv)

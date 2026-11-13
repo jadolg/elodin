@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
+import "core:strings"
 import "core:time"
 import "elodin:dns"
 
@@ -32,11 +33,8 @@ run_list_download_cases :: proc(r: ^Runner) {
 	}
 	defer http_mock_stop(http)
 
-	upstream_port := next_port(r)
-	mock := mock_make("lists", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 9})
-	if !mock_start(mock) {
-		skip_case(r, "lists: download", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "lists", "lists: download", {203, 0, 113, 9})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -45,36 +43,16 @@ run_list_download_cases :: proc(r: ^Runner) {
 	defer delete(cache_dir)
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: debug }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking:
-  enabled: true
-  response: nxdomain
-  cache_dir: %s
-  refresh: 24h
-  lists:
-    - {{ name: hosts-list, url: "http://127.0.0.1:%d/hosts.txt", format: hosts }}
-    - {{ name: abp-list, url: "http://127.0.0.1:%d/abp.txt", format: adblock }}
-    - {{ name: auto-list, url: "http://127.0.0.1:%d/auto.txt" }}
-`,
+	config := config_lists(
 		udp_port,
 		upstream_port,
-		cache_dir,
-		http_port,
-		http_port,
-		http_port,
+		{list_entry("hosts-list", http_port, "/hosts.txt"), list_entry("abp-list", http_port, "/abp.txt", "adblock"), list_entry("auto-list", http_port, "/auto.txt", "")},
+		cache_dir = cache_dir,
+		refresh = "24h",
 	)
 
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, allow_fetch = true})
 	if !ok {
-		skip_case(r, "lists: download", "server did not start")
 		return
 	}
 
@@ -85,9 +63,7 @@ blocking:
 		check_eq_int(r, http_mock_hits(http, "/hosts.txt"), 1, "fetches of the hosts list")
 		check_eq_int(r, http_mock_hits(http, "/abp.txt"), 1, "fetches of the adblock list")
 
-		res := query_udp(udp_port, build_query("downloaded.test.", u16(dns.Type.A)))
-		if check(r, res.ok, "no response for a name from the first list") {
-			h := parse_header(r, res.wire)
+		if _, h, asked := ask(r, udp_port, "downloaded.test.", u16(dns.Type.A), "no response for a name from the first list"); asked {
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "the first list was not applied")
 		}
 		res2 := query_udp(udp_port, build_query("sub.fetched.test.", u16(dns.Type.A)))
@@ -113,9 +89,7 @@ blocking:
 
 	start_case(r, "lists: a comment that mentions adblock syntax leaves a hosts list a hosts list")
 	{
-		res := query_udp(udp_port, build_query("sniffed.test.", u16(dns.Type.A)))
-		if check(r, res.ok, "no response for a name from the auto-detected list") {
-			h := parse_header(r, res.wire)
+		if _, h, asked := ask(r, udp_port, "sniffed.test.", u16(dns.Type.A), "no response for a name from the auto-detected list"); asked {
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "the hosts list was read as adblock and blocked nothing")
 		}
 		check(r, log_contains(&srv, "list auto-list: 2 rules"), "the auto-detected list did not count its two entries")
@@ -137,36 +111,18 @@ blocking:
 	{
 		// The refresh window has not elapsed, so nothing should be re-fetched.
 		port2 := next_port(r)
-		config2 := fmt.tprintf(
-			`log: {{ level: debug }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking:
-  enabled: true
-  cache_dir: %s
-  refresh: 24h
-  lists:
-    - {{ name: hosts-list, url: "http://127.0.0.1:%d/hosts.txt", format: hosts }}
-    - {{ name: abp-list, url: "http://127.0.0.1:%d/abp.txt", format: adblock }}
-`,
+		config2 := config_lists(
 			port2,
 			upstream_port,
-			cache_dir,
-			http_port,
-			http_port,
+			{list_entry("hosts-list", http_port, "/hosts.txt"), list_entry("abp-list", http_port, "/abp.txt", "adblock")},
+			cache_dir = cache_dir,
+			refresh = "24h",
 		)
 		srv2, ok2 := start_server(r, Server_Options{config = config2, udp_port = port2, allow_fetch = true})
-		if check(r, ok2, "the second server did not start") {
+		if ok2 {
 			defer stop_server(&srv2)
 			check_eq_int(r, http_mock_hits(http, "/hosts.txt"), 1, "fetches after a restart")
-			res := query_udp(port2, build_query("downloaded.test.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if _, h, asked := ask(r, port2, "downloaded.test.", u16(dns.Type.A)); asked {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "the cached list was not applied")
 			}
 			check(r, log_contains(&srv2, "using the cached copy"), "the cache was not reported as used")
@@ -177,34 +133,16 @@ blocking:
 	start_case(r, "lists: an unwritable cache directory is a warning, not a failure")
 	{
 		port3 := next_port(r)
-		config3 := fmt.tprintf(
-			`log: {{ level: debug }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking:
-  enabled: true
-  cache_dir: /proc/elodin-cannot-write-here
-  refresh: 24h
-  lists:
-    - {{ name: hosts-list, url: "http://127.0.0.1:%d/hosts.txt", format: hosts }}
-    - {{ name: abp-list, url: "http://127.0.0.1:%d/abp.txt", format: adblock }}
-`,
+		config3 := config_lists(
 			port3,
 			upstream_port,
-			http_port,
-			http_port,
+			{list_entry("hosts-list", http_port, "/hosts.txt"), list_entry("abp-list", http_port, "/abp.txt", "adblock")},
+			refresh = "24h",
 		)
 		srv3, ok3 := start_server(r, Server_Options{config = config3, udp_port = port3, allow_fetch = true})
-		if check(r, ok3, "the server did not start with an unwritable cache directory") {
+		if ok3 {
 			defer stop_server(&srv3)
-			res := query_udp(port3, build_query("downloaded.test.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if _, h, asked := ask(r, port3, "downloaded.test.", u16(dns.Type.A)); asked {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "the list was not applied")
 			}
 			check(r, log_contains(&srv3, "is not writable"), "no warning about the cache directory")
@@ -234,41 +172,17 @@ run_list_refresh_cases :: proc(r: ^Runner) {
 		http_mock_stop(http)
 	}
 
-	upstream_port := next_port(r)
-	mock := mock_make("lists-refresh", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 9})
-	if !mock_start(mock) {
-		skip_case(r, "lists: refresh", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "lists-refresh", "lists: refresh", {203, 0, 113, 9})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
 
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: debug }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking:
-  enabled: true
-  response: nxdomain
-  cache_dir: /proc/elodin-cannot-write-here
-  refresh: 1s
-  lists:
-    - {{ name: hosts-list, url: "http://127.0.0.1:%d/hosts.txt", format: hosts }}
-`,
-		udp_port,
-		upstream_port,
-		http_port,
-	)
+	config := config_lists(udp_port, upstream_port, {list_entry("hosts-list", http_port, "/hosts.txt")})
 
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, allow_fetch = true})
 	if !ok {
-		skip_case(r, "lists: refresh", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -284,14 +198,64 @@ blocking:
 		if check(r, wait_for_log(&srv, "download failed", 45 * time.Second), "no refresh ran") {
 			check(r, wait_for_log(&srv, "trying again in", 5 * time.Second), "the failed refresh was not retried early")
 			check(r, log_contains(&srv, "keeping the rules already in effect"), "the refresh did not keep the rules")
-			res := query_udp(udp_port, build_query("refreshed.test.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if _, h, asked := ask(r, udp_port, "refreshed.test.", u16(dns.Type.A)); asked {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "the list's rules were lost in the refresh")
 			}
 		}
 	}
 	end_case(r)
+}
+
+/*
+A blocking configuration over `lists`, each a `list_entry`, with an upstream at
+`upstream_port` and the cache off. The default `cache_dir` cannot be written, so
+a case that wants the cached copy names one of its own.
+*/
+@(private = "file")
+config_lists :: proc(
+	udp_port, upstream_port: int,
+	lists: []string,
+	cache_dir := "/proc/elodin-cannot-write-here",
+	refresh := "1s",
+	log := "{ level: debug }",
+	extra := "",
+) -> string {
+	return base_config(
+		udp_port,
+		upstream_at(upstream_port),
+		log = log,
+		timeout = "3s",
+		blocking = fmt.tprintf(
+			"{{ enabled: true, response: nxdomain, cache_dir: %q, refresh: %s, lists: [%s] }}",
+			cache_dir,
+			refresh,
+			strings.join(lists, ", ", context.temp_allocator),
+		),
+		extra = extra,
+	)
+}
+
+// One `blocking.lists` entry, fetched from the HTTP mock at `path`; an empty
+// `format` leaves it to be sniffed.
+@(private = "file")
+list_entry :: proc(name: string, http_port: int, path: string, format := "hosts") -> string {
+	entry := fmt.tprintf(`{{ name: %s, url: "http://127.0.0.1:%d%s"`, name, http_port, path)
+	return fmt.tprintf("%s, format: %s }}", entry, format) if format != "" else fmt.tprintf("%s }}", entry)
+}
+
+// The signal cases: one list on the HTTP mock, the shipped log level.
+@(private = "file")
+config_for_refresh_signals :: proc(udp_port, upstream_port, http_port: int, extra_lists: []string = nil, extra := "") -> string {
+	lists := make([dynamic]string, context.temp_allocator)
+	append(&lists, list_entry("hosts-list", http_port, "/hosts.txt"))
+	append(&lists, ..extra_lists)
+	return config_lists(udp_port, upstream_port, lists[:], log = "{ level: info }", extra = extra)
+}
+
+@(private = "file")
+listen_silent :: proc(r: ^Runner, port: int) -> (net.TCP_Socket, bool) {
+	sock, err := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = port})
+	return sock, check(r, err == nil, "cannot listen on port %d: %v", port, err)
 }
 
 /*
@@ -304,44 +268,9 @@ failed one, as it would on a thread that took it. A silent host is a socket that
 listens and never accepts: the kernel completes the handshake, and nothing is
 sent. Closing it resets the connection, which ends the download at once.
 */
-@(private = "file")
-config_for_refresh_signals :: proc(udp_port, upstream_port, http_port: int, extra: string) -> string {
-	return fmt.tprintf(
-		`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking:
-  enabled: true
-  response: nxdomain
-  cache_dir: /proc/elodin-cannot-write-here
-  refresh: 1s
-  lists:
-    - {{ name: hosts-list, url: "http://127.0.0.1:%d/hosts.txt", format: hosts }}
-%s`,
-		udp_port,
-		upstream_port,
-		http_port,
-		extra,
-	)
-}
-
-@(private = "file")
-listen_silent :: proc(r: ^Runner, port: int) -> (net.TCP_Socket, bool) {
-	sock, err := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = port})
-	return sock, check(r, err == nil, "cannot listen on port %d: %v", port, err)
-}
-
 run_list_refresh_signal_cases :: proc(r: ^Runner) {
-	upstream_port := next_port(r)
-	mock := mock_make("lists-refresh-signals", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 9})
-	if !mock_start(mock) {
-		skip_case(r, "lists: signals during a download", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "lists-refresh-signals", "lists: signals during a download", {203, 0, 113, 9})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -353,8 +282,8 @@ run_list_refresh_signal_cases :: proc(r: ^Runner) {
 		silent, listening := listen_silent(r, silent_port)
 		if listening {
 			defer net.close(silent)
-			config := config_for_refresh_signals(udp_port, upstream_port, silent_port, "")
-			if srv, ok := start_server_raw(r, config, udp_port, true); check(r, ok, "the server did not start") {
+			config := config_for_refresh_signals(udp_port, upstream_port, silent_port)
+			if srv, ok := start_server_raw(r, config, udp_port, true); ok {
 				defer stop_server(&srv)
 				if check(r, wait_for_log(&srv, "list hosts-list: downloading", 5 * time.Second), "no download started") {
 					time.sleep(300 * time.Millisecond)
@@ -384,10 +313,9 @@ run_list_refresh_signal_cases :: proc(r: ^Runner) {
 	stalled_port := next_port(r)
 	srv, ok := start_server(
 		r,
-		Server_Options{config = config_for_refresh_signals(udp_port, upstream_port, http_port, ""), udp_port = udp_port, allow_fetch = true},
+		Server_Options{config = config_for_refresh_signals(udp_port, upstream_port, http_port), udp_port = udp_port, allow_fetch = true},
 	)
 	if !ok {
-		skip_case(r, "lists: signals during a refresh", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -411,26 +339,26 @@ run_list_refresh_signal_cases :: proc(r: ^Runner) {
 			check(r, !log_contains(&srv, "download failed"), "the download did not wait")
 
 			// A list added by the reload, from a host that stays silent.
-			added := fmt.tprintf(
-				"    - {{ name: stalled-list, url: \"http://127.0.0.1:%d/hosts.txt\", format: hosts }}\nrewrites:\n  - {{ domain: during.test, answer: 192.0.2.7 }}\n",
-				stalled_port,
+			added := config_for_refresh_signals(
+				udp_port,
+				upstream_port,
+				http_port,
+				{list_entry("stalled-list", stalled_port, "/hosts.txt")},
+				"rewrites:\n  - { domain: during.test, answer: 192.0.2.7 }",
 			)
 			// Applied at once, its rule change left for after the refresh.
 			check(
 				r,
-				reload_to(r, &srv, config_for_refresh_signals(udp_port, upstream_port, http_port, added), "changed=blocking,rewrites", 3 * time.Second),
+				reload_to(r, &srv, added, "changed=blocking,rewrites", 3 * time.Second),
 				"the reload waited for the refresh",
 			)
 			// Logged after the `reloaded` line, so waited for rather than read at once.
 			check(r, wait_for_log(&srv, "rebuilt once the rebuild in progress is over", 2 * time.Second), "the reload's rebuild did not wait for the refresh")
 			check(r, !log_contains(&srv, "download failed"), "SIGHUP cut the download short")
 			if res := query_udp(udp_port, build_query("during.test.", u16(dns.Type.A))); check(r, res.ok, "no response during the refresh") {
-				addrs := answer_addresses(r, res.wire)
-				check(r, len(addrs) == 1 && addrs[0] == "192.0.2.7", "the reloaded rewrite is not in effect during the refresh: %v", addrs)
+				check_one_address(r, res.wire, "192.0.2.7", "the reloaded rewrite during the refresh")
 			}
-			res := query_udp(udp_port, build_query("refreshed.test.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response during the refresh") {
-				h := parse_header(r, res.wire)
+			if _, h, asked := ask(r, udp_port, "refreshed.test.", u16(dns.Type.A), "no response during the refresh"); asked {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "the list's rules are not in effect during the refresh")
 			}
 
@@ -476,11 +404,8 @@ run_list_bad_download_cases :: proc(r: ^Runner) {
 	}
 	defer http_mock_stop(http)
 
-	upstream_port := next_port(r)
-	mock := mock_make("lists-bad", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 9})
-	if !mock_start(mock) {
-		skip_case(r, "lists: bad download", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "lists-bad", "lists: bad download", {203, 0, 113, 9})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -510,36 +435,12 @@ run_list_bad_download_cases :: proc(r: ^Runner) {
 			time.sleep(1100 * time.Millisecond)
 		}
 		udp_port := next_port(r)
-		config := fmt.tprintf(
-			`log: {{ level: debug }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking:
-  enabled: true
-  response: nxdomain
-  cache_dir: %s
-  refresh: 1s
-  lists:
-    - {{ name: the-list, url: "http://127.0.0.1:%d%s", format: hosts }}
-`,
-			udp_port,
-			upstream_port,
-			cache_dir,
-			http_port,
-			step.path,
-		)
+		config := config_lists(udp_port, upstream_port, {list_entry("the-list", http_port, step.path)}, cache_dir = cache_dir)
 		srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, allow_fetch = true})
-		if check(r, ok, "the server did not start") {
+		if ok {
 			// The premise: this start downloaded the body under test.
 			check_eq_int(r, http_mock_hits(http, step.path), 1, "downloads of the body under test")
-			res := query_udp(udp_port, build_query("cached.test.", u16(dns.Type.A)))
-			if check(r, res.ok, "no response") {
-				h := parse_header(r, res.wire)
+			if _, h, asked := ask(r, udp_port, "cached.test.", u16(dns.Type.A)); asked {
 				check(r, h.rcode == int(dns.Rcode.NX_Domain), "the list went out of effect")
 			}
 			if i > 0 {
@@ -572,11 +473,8 @@ run_list_redirect_cases :: proc(r: ^Runner) {
 	}
 	defer http_mock_stop(http)
 
-	upstream_port := next_port(r)
-	mock := mock_make("lists-redirect", upstream_port)
-	mock_synth_all(mock, {203, 0, 113, 9})
-	if !mock_start(mock) {
-		skip_case(r, "lists: relative redirect", "cannot start the mock upstream")
+	mock, upstream_port, mock_ok := synth_mock(r, "lists-redirect", "lists: relative redirect", {203, 0, 113, 9})
+	if !mock_ok {
 		return
 	}
 	defer mock_stop(mock)
@@ -586,35 +484,12 @@ run_list_redirect_cases :: proc(r: ^Runner) {
 
 	start_case(r, "lists: a relative redirect is followed, query and all")
 	udp_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: debug }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking:
-  enabled: true
-  response: nxdomain
-  cache_dir: %s
-  refresh: 24h
-  lists:
-    - {{ name: moved-list, url: "http://127.0.0.1:%d/old/hosts.txt?v=1", format: hosts }}
-`,
-		udp_port,
-		upstream_port,
-		cache_dir,
-		http_port,
-	)
+	config := config_lists(udp_port, upstream_port, {list_entry("moved-list", http_port, "/old/hosts.txt?v=1")}, cache_dir = cache_dir, refresh = "24h")
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, allow_fetch = true})
-	if check(r, ok, "the server did not start") {
+	if ok {
 		check_eq_int(r, http_mock_hits(http, "/old/hosts.txt?v=1"), 1, "requests for the list url, query and all")
 		check_eq_int(r, http_mock_hits(http, "/new/hosts.txt?v=2"), 1, "requests for where it moved")
-		res := query_udp(udp_port, build_query("moved.test.", u16(dns.Type.A)))
-		if check(r, res.ok, "no response") {
-			h := parse_header(r, res.wire)
+		if _, h, asked := ask(r, udp_port, "moved.test.", u16(dns.Type.A)); asked {
 			check(r, h.rcode == int(dns.Rcode.NX_Domain), "the moved list was not loaded")
 		}
 		stop_server(&srv)

@@ -22,39 +22,23 @@ run_stale_superseded_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	udp_port := next_port(r)
 	metrics_port := next_port(r)
-	config := fmt.tprintf(
-		`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  attempts: 1
-  servers: ["127.0.0.1:%d"]
-cache:
-  enabled: true
-  max_entries: 100
-  max_ttl: 1
-  serve_stale: true
-  stale_timeout: 300ms
-blocking: {{ enabled: false }}
-metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}
-`,
+	config := base_config(
 		udp_port,
-		upstream_port,
-		metrics_port,
+		upstream_at(upstream_port),
+		timeout = "3s",
+		upstream_extra = "  attempts: 1",
+		cache = "{ enabled: true, max_entries: 100, max_ttl: 1, serve_stale: true, stale_timeout: 300ms }",
+		extra = fmt.tprintf(`metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}`, metrics_port),
 	)
 
 	before := mock_make("superseded-before", upstream_port)
 	mock_synth_all(before, {203, 0, 113, 41})
-	if !mock_start(before) {
-		skip_case(r, "serve_stale superseded", "cannot start the mock upstream")
+	if !mock_start_or_skip(r, before, "serve_stale superseded") {
 		return
 	}
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
 		mock_stop(before)
-		skip_case(r, "serve_stale superseded", "server did not start")
 		return
 	}
 	defer stop_server(&srv)
@@ -67,7 +51,7 @@ metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}
 	if !check(r, first.ok, "no response to the query that filled the cache") {
 		return
 	}
-	check_eq_str(r, superseded_address(r, first.wire), "203.0.113.41", "the answer that was cached")
+	check_eq_str(r, first_address(r, first.wire), "203.0.113.41", "the answer that was cached")
 
 	// Past `max_ttl`, which is what the entry was stored under: the clock is
 	// what this waits for.
@@ -75,10 +59,11 @@ metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}
 
 	after := mock_make("superseded-after", upstream_port)
 	mock_delay_all(after, 800 * time.Millisecond, make_a_response(qname, {203, 0, 113, 42}, 0, context.allocator))
+	// Stopped whether or not it started: `mock_stop` frees a failed start too.
+	defer mock_stop(after)
 	if !check(r, mock_start(after), "cannot restart the mock upstream") {
 		return
 	}
-	defer mock_stop(after)
 	held := superseded_entries(metrics_port)
 	if !check(r, held >= 1, "elodin_cache_entries read %d with the expired copy held", held) {
 		return
@@ -89,7 +74,7 @@ metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}
 	if !check(r, lent.ok, "the expired copy was never lent") {
 		return
 	}
-	check_eq_str(r, superseded_address(r, lent.wire), "203.0.113.41", "the lent copy")
+	check_eq_str(r, first_address(r, lent.wire), "203.0.113.41", "the lent copy")
 
 	deadline := time.tick_now()
 	for v := superseded_entries(metrics_port); (v < 0 || v >= held) && time.tick_since(deadline) < 5 * time.Second; v = superseded_entries(metrics_port) {
@@ -103,21 +88,12 @@ metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}
 
 	again := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 43))
 	if check(r, again.ok, "no response once the refresh had landed") {
-		check_eq_str(r, superseded_address(r, again.wire), "203.0.113.42", "the answer after the refresh")
+		check_eq_str(r, first_address(r, again.wire), "203.0.113.42", "the answer after the refresh")
 	}
-}
-
-@(private = "file")
-superseded_address :: proc(r: ^Runner, wire: []u8) -> string {
-	addrs := answer_addresses(r, wire)
-	return addrs[0] if len(addrs) > 0 else ""
 }
 
 @(private = "file")
 superseded_entries :: proc(metrics_port: int) -> int {
-	if !wait_http(metrics_port, "/metrics") {
-		return -1
-	}
-	page := string(http_request(metrics_port, "GET", "/metrics", context.temp_allocator).body)
-	return metric_value(page, "elodin_cache_entries")
+	// -1 when the endpoint never answers: `metric_value` finds nothing in "".
+	return metric_value(metrics_page(metrics_port), "elodin_cache_entries")
 }
