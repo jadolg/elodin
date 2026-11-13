@@ -492,6 +492,12 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 		}
 	}
 
+	// Before the body is waited for: a request this server cannot keep is not
+	// answered whatever follows.
+	if !held {
+		return {}, 0, false
+	}
+
 	// RFC 9112 3.2 again: Host carries the authority for an origin-form target,
 	// so an HTTP/1.1 request without one is a 400. HTTP/1.0 predates the field
 	// and is allowed to leave it out.
@@ -517,9 +523,6 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 		// read, so nothing grows the buffer under it before the caller's
 		// `http_compact`, which is what ends it.
 		req.body = http_exact(r, content_length) or_return
-	}
-	if !held {
-		return {}, 0, false
 	}
 	return req, 0, true
 }

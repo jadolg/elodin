@@ -4996,12 +4996,11 @@ clear_non_cuts :: proc(v: ^Validator) {
 // `Budget.began`, the instant `lapses` is counted from and the walk reads the
 // cache at. It is in the past, so an entry whose lifetime the walk has already
 // outrun is stored expired to every later walk and to `sweep`. Nothing is
-// stored for a question that has run dry (`ran_dry`).
+// stored for a question that has run dry (`ran_dry`), but the name is still
+// taken out of the non-cut memo, which needs no memory and costs at most a
+// lookup.
 @(private)
 cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, keys: []Dnskey, ttl: u32, now: loop.Moment, lapses := max(u32)) {
-	if ran_dry(budget) {
-		return
-	}
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
 	key, key_ok := dns.fold_into(zone, fold_buf[:])
 	if !key_ok {
@@ -5024,8 +5023,14 @@ cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, 
 	held_dry := false
 	watch := dns.Dry_Watch{backing = v.allocator, dry = &held_dry}
 	stored := dns.dry_watch_allocator(&watch)
-	entry := new(Zone_Entry, stored)
+	entry: ^Zone_Entry
+	if !ran_dry(budget) {
+		entry = new(Zone_Entry, stored)
+	}
 	if entry == nil {
+		sync.mutex_lock(&v.mu)
+		non_cut_drop(v, key)
+		sync.mutex_unlock(&v.mu)
 		return
 	}
 	// Before the lock, and before anything is evicted to make room for it.
@@ -5079,11 +5084,6 @@ cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, 
 		entry.keys = owned[:]
 	}
 
-	if held_dry {
-		free_entry(v, entry)
-		return
-	}
-
 	sync.mutex_lock(&v.mu)
 	defer sync.mutex_unlock(&v.mu)
 
@@ -5100,6 +5100,10 @@ cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, 
 	SERVFAIL for every name in it until the memo ages out.
 	*/
 	non_cut_drop(v, key)
+	if held_dry {
+		free_entry(v, entry)
+		return
+	}
 
 	/*
 	Past `MAX_CACHED_ZONE_KEY_BYTES` nothing is stored, and anything already

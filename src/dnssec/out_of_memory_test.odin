@@ -344,8 +344,12 @@ test_a_question_that_ran_dry_settles_nothing :: proc(t: ^testing.T) {
 		budget := query_budget(v)
 		ran := dry
 		budget.dry = &ran
+		// A memo for the zone, which settling it ends either way.
+		non_cut_remember(v, nil, "example.com.", MIN_ZONE_TTL, now)
 		cache_put(v, &budget, "example.com.", .Insecure, nil, MAX_ZONE_TTL, now)
 		non_cut_remember(v, &budget, "www.example.com.", MIN_ZONE_TTL, now)
+		_, _, memo := cache_get(v, "example.com.", now, context.temp_allocator)
+		testing.expectf(t, !memo, "ran dry %v: the zone settled is still a memoised no cut", dry)
 		_, zone_found, _ := cache_get(v, "example.com.", now, context.temp_allocator)
 		_, _, name_found := cache_get(v, "www.example.com.", now, context.temp_allocator)
 		testing.expectf(t, zone_found == !dry, "ran dry %v: the zone cached %v", dry, zone_found)
@@ -524,4 +528,32 @@ test_a_zone_the_map_cannot_take_is_not_listed :: proc(t: ^testing.T) {
 	cache_put(v, nil, "unmapped.example.", .Insecure, nil, MAX_ZONE_TTL, loop.moment_now())
 	testing.expect_value(t, len(v.zones), 0)
 	testing.expect(t, v.lru_head == nil && v.lru_tail == nil, "an entry the map refused is on the eviction list")
+}
+
+/*
+A zone the heap has no room to cache is still settled as a zone: the memo that
+called the name no cut goes, as it does for a zone that is cached, since
+dropping it needs no memory. Left, it would refuse the zone's own signatures
+until it expired.
+*/
+@(test)
+test_a_zone_the_heap_cannot_cache_still_ends_its_memo :: proc(t: ^testing.T) {
+	v := make_validator(counting_query, nil, Options{})
+	defer destroy_validator(v)
+	defer free_all(context.temp_allocator)
+	now := loop.moment_now()
+	non_cut_remember(v, nil, "sub.example.", MIN_ZONE_TTL, now)
+	_, _, remembered := cache_get(v, "sub.example.", now, context.temp_allocator)
+	if !testing.expect(t, remembered, "the memo did not hold the name to begin with") {
+		return
+	}
+	heap := v.allocator
+	f := Fail_Nth{backing = heap, fail_at = 1, fail_for = 1}
+	v.allocator = mem.Allocator{procedure = fail_nth_proc, data = &f}
+	cache_put(v, nil, "sub.example.", .Insecure, nil, MAX_ZONE_TTL, now)
+	v.allocator = heap
+	_, cached, still := cache_get(v, "sub.example.", now, context.temp_allocator)
+	testing.expect(t, f.seen >= 1, "the cache took no copy to refuse")
+	testing.expect(t, !cached, "a zone the heap refused was cached")
+	testing.expect(t, !still, "the memo still calls a settled zone no cut")
 }
