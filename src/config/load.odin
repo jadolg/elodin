@@ -327,7 +327,7 @@ load_log :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	check_keys(l, n, "log", "level", "queries", "file")
 	if s: string; opt_string(l, n, "level", &s, "log") {
-		switch strings.to_lower(s, l.allocator) {
+		switch dns.name_fold(s, l.allocator) {
 		case "debug":
 			cfg.log.level = .Debug
 		case "info":
@@ -842,7 +842,7 @@ load_strategy :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Strategy, path: string) {
 	if !opt_string(l, n, "strategy", &s, path) {
 		return
 	}
-	switch strings.to_lower(s, l.allocator) {
+	switch dns.name_fold(s, l.allocator) {
 	case "failover", "first":
 		dst^ = .Failover
 	case "round_robin", "round-robin", "rr":
@@ -1372,7 +1372,7 @@ load_upstream_spec :: proc(
 
 	kind_str: string
 	if opt_string(l, n, "type", &kind_str, path) {
-		switch strings.to_lower(kind_str, l.allocator) {
+		switch dns.name_fold(kind_str, l.allocator) {
 		case "udp", "plain", "dns":
 			spec.kind = .UDP
 		case "tcp":
@@ -1705,7 +1705,7 @@ load_block_lists :: proc(l: ^Loader, n: ^yaml.Node, path: string) -> []Block_Lis
 		opt_string(l, e, "file", &bl.file, item_path)
 		opt_bool(l, e, "enabled", &bl.enabled, item_path)
 		if f: string; opt_string(l, e, "format", &f, item_path) {
-			switch strings.to_lower(f, l.allocator) {
+			switch dns.name_fold(f, l.allocator) {
 			case "auto":
 				bl.format = .Auto
 			case "hosts":
@@ -1770,7 +1770,7 @@ load_blocking :: proc(l: ^Loader, cfg: ^Config) {
 		response, has_response = r.scalar, true
 	}
 	if has_response {
-		switch strings.to_lower(response, l.allocator) {
+		switch dns.name_fold(response, l.allocator) {
 		case "nxdomain", "nx_domain":
 			cfg.blocking.response = .NX_Domain
 		case "nodata", "no_data", "empty":

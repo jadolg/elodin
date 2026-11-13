@@ -51,8 +51,9 @@ Do all the work there. Don't use `Agent` with `isolation: "worktree"`, because t
   - other transports: UDP, TCP, DoT, DoH over h1 and h2, client side and upstream side;
   - the client path and the DNSSEC chain-lookup path;
   - refresh, serve-stale, coalesced followers, rewrites, zone routes;
-  - both thread models: the pool, and thread-per-connection.
-  All of them get fixed in this PR.
+  - both thread models: the pool, and thread-per-connection;
+  - every source of a value a guard checks: request field, pseudo-header, config key, url component, network reply.
+  All of them get fixed in this PR. Write them down as the PR's `## Variants` table (step 9) before the first review round: one row per road, each marked *fixed, test `<name>`* or *not reachable, because …*. Review rounds that each found one more road were the main cost of long loops; the table is how the first round sees them all.
 - Make every design choice (behaviour, rcode, limits, what to refuse) in this order:
   1. **RFCs come first, always, and the goal is maximum RFC compliance.** Read the relevant RFC and its updates and errata; MUST/SHOULD beat anything below. Cite the section in code comments, in the PR, and in the Decisions entry. Don't trade compliance for convenience, a smaller diff or a matching competitor.
   2. **If the RFCs don't settle it** (silent, MAY, or implementation-defined), compare how other implementations do it. Read their source or docs, not memory: Unbound, BIND, Knot Resolver and PowerDNS Recursor for resolver behaviour; dnsmasq, CoreDNS, AdGuard Home and blocky for forwarder, blocking and DoH behaviour. The better solution wins, judged as in the feature-request bullet below; elodin is a small, hardened forwarder with safe defaults on small devices. Record which implementations do what, and why you chose yours.
@@ -171,16 +172,13 @@ The docs are an operator reference. Update each place the change reaches:
 Run these in the worktree before every push:
 
 ```
-mise run check
-odin check src/<pkg> -collection:elodin=src -vet -strict-style -no-entry-point   # each touched package, including src/itest
-mise run test
-mise run itest          # serial, never alongside another run; read the total, not just pass/fail
-mise run parity-regression
-mise run fuzz-regression   # if a parser changed
-mise run leakcheck         # if the change allocates or frees
-# audit patterns in the lines this branch adds; fix each hit or say in the PR why it stays
-git diff -U0 origin/main -- '*.odin' | grep -E '^\+[^+]' | grep -nE 'used to|no longer|\bnow\b|before this|the fix\b|\btoday\b|time\.sleep|time\.now\(|, _ :?=|^\+\s*_ = |testing\.expect\(t, [^)]*%|\.odin:[0-9]+'
+scripts/push-gate.sh [--leak] [--fuzz]   # check (vet on every package, lint), test, itest, parity-regression; pushes only if all pass
 ```
+
+- `--leak` when the change allocates or frees (runs `leakcheck` under a 3 GB memory cap), `--fuzz` when a parser changed. Never commit and push on a separate step from the gates: the script is the gate.
+- `mise run check` runs `scripts/lint.py`. Its rules are the review findings that kept coming back. Fix a hit; a deliberate exception carries `lint:allow <reason>` on the line. When a review round confirms a finding a pattern could have caught, add the rule to `scripts/lint.py` in the same PR.
+- The lint can't see narration that needs judgement (`used to`, `no longer`, `now`). Read the comments in the diff for it.
+- `mise run itest-release` runs the suite against the optimised build. Run it for anything about inlining, stack depth or release-only memory; CI runs it on every PR.
 
 - **Another session's itest collides on ports.** Check with a `/proc` walk for cmdline starting with `./bin/itest`, not `pgrep -f`, which matches itself. Wait it out, and never kill it.
 - **Deadline tests failing in a batch:** check `chronyc tracking`, then run the package on a detached `origin/main` worktree before blaming the diff. If it isn't the diff, it's still a flake to fix, not to rerun past (see step 11.5).
@@ -228,11 +226,12 @@ A follow-up issue is filed only for a defect you've proven, by the same bar as a
 ## 9. Commit and PR
 
 - **Commit subject:** `<pkg>: <the behaviour as it now is> (#$ARGUMENTS)`, e.g. `upstream: a referral is not an answer (#410)`. The body gives the problem and the fix in prose, and ends with the attribution line.
-- **Before every push:** `git diff --stat origin/main`. More files than you touched means the base moved. Rebase, and never `reset --soft origin/main`.
+- **Before every push:** push through `scripts/push-gate.sh`, which prints `git diff --stat` against the merge base. More files than you touched means the base moved. Rebase, and never `reset --soft origin/main` (the project hook refuses it).
 - **PR title:** the same as the commit subject.
 - **PR body:**
   - `Closes #$ARGUMENTS`, plus a `Closes` line for any other issue it fixes;
   - `## Problem`: the RFC quote if there is one, and each road to the bug;
+  - `## Variants`: the table from step 2;
   - `## Fix`: by symbol;
   - `## Tests`: each test and what it proves, including the revert run;
   - `## Parity`: what was run, and any allowance added;
@@ -254,7 +253,7 @@ Each round:
    - Reproduce it at your head: a failing test (preferred), or a command or script whose output shows the defect. Assert the premise: if it rests on "the platform, peer or RFC does X", observe X in the test or quote the section.
    - Give it a verdict. **Confirmed** means you hold that evidence; it gets fixed here, or becomes a follow-up issue if step 8's bar is met. **Rejected** means it doesn't hold, and no code changes. A finding you couldn't reproduce is rejected, never fixed "to be safe".
 6. Fix only the confirmed findings; the failing test from step 5 is the fix's test. Then remove the fix's main guard again and confirm the unit test and the itest still fail. A refactor can leave the guard untested.
-7. Post a round comment on the PR with one entry per finding: the finding, its verdict, and the evidence.
+7. Post a round comment on the PR. It opens with a tally line, `Round K: confirmed high/medium/low a/b/c, rejected d, in round K-1's own code e, new variant f`, then one entry per finding: the finding, its verdict, and the evidence. A confirmed finding that is a missing variant goes into the `## Variants` table, and its siblings get grepped for in the same round.
    - Confirmed: the test or command, and its output before and after the fix. A follow-up links its issue.
    - Rejected: why it doesn't hold, shown, not asserted. Link the code that refutes it (`https://github.com/jadolg/elodin/blob/<sha>/<path>#L<n>`), give the test or command that would fail if the claim were true and its passing output, quote the RFC section with its rfc-editor.org link, or name the Decisions entry it contradicts.
 8. Update the docs and comments the round's fixes reach (steps 4 and 6). Run the gates, then commit as `<pkg>: review round K - <what changed>` and push.
@@ -269,8 +268,12 @@ Each round:
 **When to stop:**
 
 - Stop after a round with no confirmed high or medium findings. Rejected findings don't count. In that round, fix only confirmed lows that change behaviour or would mislead an operator; the round comment covers the rest.
-- If most of a round's findings are defects in the previous round's fix, batch them rather than start another cycle.
-- **At round 10, stop and ask the user what to do.** Do not merge.
+- If every confirmed finding of a round is in the previous round's own code, fix them and stop, unless one is high. Most of them in that code: batch them rather than start another cycle.
+- **The round budget depends on the PR's risk.** At the budget, stop and ask the user what to do, with "keep looping" as one option. Do not merge.
+  - Security label, or a change to a parser, DNSSEC, memory management or the event loop: round 10.
+  - Any other behaviour change: round 6.
+  - Tests, docs, CI or tooling only: round 3.
+- Read the tally lines across rounds before starting one more. Confirmed findings that don't fall, or a rising `in round K-1's own code`, mean the loop is chasing its own fixes; say so to the user with the numbers.
 
 ## 11. Merge
 
@@ -279,18 +282,13 @@ Each round:
 3. Run the gates in step 7 on the rebased head, and push.
 4. Wait for every CI check to go green on that head, including Codacy. Codacy gates on Lizard size (file around 1000 NLOC, function over 50 NLOC); read its issue list through the public API.
 5. A flake, known or new (every TLS case at once, mock port errors, `tls reload` under ASan, the query-id birthday case, the Package live-DNS step, a deadline test), may get one `gh run rerun <id> --failed`, and only if the diff can't reach that code. That rerun is only a diagnosis, never the fix. Then fix the flake on its own branch off `main`: for a timing flake, take the test off the wall clock with a fake or tick clock, or wait on an event instead of a duration. A longer timeout or a wider margin is not a fix. Say in the report that a pass came from a rerun, and link the flake's fix.
-6. Merge only through a gate that fails when the branch is behind:
-   ```
-   git fetch origin && [ "$(git rev-list --count HEAD..origin/main)" = 0 ] && \
-   [ "$(git rev-parse HEAD)" = "$(gh pr view <PR> --json headRefOid -q .headRefOid)" ] && \
-   gh pr merge <PR> --merge --delete-branch
-   ```
-   If it fails, go back to step 1.
+6. Merge only through `scripts/merge-gate.sh <PR>`. It refuses a branch behind `origin/main`, a local head that isn't the PR's, and any check on that head that isn't green, then merges and confirms the PR's state. The project hook refuses a bare `gh pr merge`. If it fails, go back to step 1.
 
 After the merge:
 
 - Check that the issue closed. If it didn't, comment on it and close it.
 - Remove the worktree (`git worktree remove $WT`) and delete the local branch.
+- Check whether an audit is due: find the newest issue labelled `audit` (`gh issue list --label audit --state all --limit 1 --json number,body`), take the commit its body names on its `Audited at <sha>` line, and count `git rev-list --count --merges --first-parent <sha>..origin/main`. At 50 or more, say in the report that an audit is due and suggest `/audit`. Don't start one unasked.
 - Report:
   - the PR link;
   - the root cause, in one line;

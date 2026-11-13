@@ -10,7 +10,12 @@ jobs:
     name: Style check
     runs-on: ubuntu-latest
     steps:
+      # Two commits deep: the lint's rules for added lines diff against the
+      # first parent, which on a pull request's merge commit, and on a merge
+      # into main, is main as it was before the change.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
       - uses: ./.github/actions/core-dumps
         with:
           mode: setup
@@ -21,6 +26,33 @@ jobs:
           install: true
           cache: true
       - run: mise run check
+        env:
+          LINT_BASE: HEAD^1
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
+
+  itest-release:
+    name: Integration (release build)
+    # `itest` and `leakcheck` drive the debug and ASan builds. This runs the
+    # suite against the -o:speed binary that ships, so a guard that holds only
+    # without optimisation (or only with it) fails here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
+      - name: Install OpenSSL headers and strace
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev strace
+      - uses: jdx/mise-action@v5
+        with:
+          install: true
+          cache: true
+      - run: sudo sysctl -w net.core.rmem_max=4194304
+      - run: mise run itest-release
+        timeout-minutes: 30
       - if: failure()
         uses: ./.github/actions/core-dumps
         with:

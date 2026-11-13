@@ -127,7 +127,7 @@ parse_trust_anchor :: proc(text: string, allocator := context.allocator) -> (anc
 	zone := "."
 	start := 0
 	for field, i in fields {
-		if strings.equal_fold(field, "DS") {
+		if dns.name_equal_fold(field, "DS") {
 			if i > 0 {
 				zone = fields[0]
 			}

@@ -52,7 +52,15 @@ as_bool :: proc(n: ^Node) -> (bool, bool) {
 	if !ok {
 		return false, false
 	}
-	switch strings.to_lower(s, context.temp_allocator) {
+	// An ASCII fold: `strings.to_lower` maps other letters (`İ`, U+0130) onto ASCII ones.
+	folded: [len("false")]u8
+	if len(s) > len(folded) {
+		return false, false
+	}
+	for c, i in transmute([]u8)s {
+		folded[i] = c + 32 if c >= 'A' && c <= 'Z' else c
+	}
+	switch string(folded[:len(s)]) {
 	case "true", "yes", "on", "y":
 		return true, true
 	case "false", "no", "off", "n":

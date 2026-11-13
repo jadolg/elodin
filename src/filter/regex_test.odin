@@ -156,6 +156,9 @@ test_regex_rule_needs_its_shortcut :: proc(t: ^testing.T) {
 	testing.expect_value(t, regex_shortcut(`^ADS\d+`, context.temp_allocator), "ads")
 	testing.expect_value(t, regex_shortcut(`a{2}b\{c}d`, context.temp_allocator), "")
 	testing.expect_value(t, regex_shortcut(`x\(ab)`, context.temp_allocator), "ab")
+	// The shortcut folds ASCII only: Unicode lowering would turn `İ` (U+0130)
+	// into `i`, a run no name holding the `İ` contains.
+	testing.expect_value(t, regex_shortcut("^ADS\u0130X", context.temp_allocator), "ads\u0130x")
 }
 
 // urlfilter reads a `$$` or `$@$` at the first `$` as an HTML filtering rule,
@@ -759,4 +762,15 @@ test_regex_badfilter_of_a_refused_pattern :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(block.cancelled), 0)
 	parse_rule(block, allow, `/^a{02}$/$badfilter`)
 	testing.expect_value(t, block.cancels, 1)
+}
+
+@(test)
+test_a_regex_holding_non_ascii_is_not_kept :: proc(t: ^testing.T) {
+	// So `regex_shortcut` never sees a non-ASCII run from a list; the test of
+	// its ASCII fold above holds the procedure on its own.
+	block, allow := build("/ads\u0130x/\n/adsix/\n", .Adblock)
+	defer set_destroy(block)
+	defer set_destroy(allow)
+	testing.expect_value(t, len(block.regexes), 1)
+	testing.expect_value(t, block.regexes[0].pattern, "adsix")
 }

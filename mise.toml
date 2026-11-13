@@ -93,6 +93,19 @@ run = "packaging/build-deb.sh"
 description = "Type-check every package without emitting a binary"
 run = [
   "odin check src/main -collection:elodin=src -vet -strict-style",
+  # Checking src/main never compiles another package's tests, and `odin test`
+  # compiles them without -vet, so each package is checked on its own as well,
+  # its *_test.odin files included.
+  """
+  for p in $(find src -name '*.odin' -printf '%h\\n' | sort -u) scripts/re2diff/elodin; do
+    odin check "$p" -collection:elodin=src -vet -strict-style -no-entry-point || exit 1
+  done
+  """,
+  # The patterns review rounds kept finding; see the script for each rule. The
+  # two tests hold the lint's rules and the Claude Code guard hook's.
+  "python3 scripts/lint.py",
+  "python3 scripts/lint_test.py",
+  "python3 .claude/hooks/guard_test.py",
   """
   if grep -rnE '\\bnet\\.(split_port|aton|parse_address|parse_ip4_address|parse_ip6_address|parse_endpoint|parse_hostname_or_endpoint|resolve|resolve_ip4|resolve_ip6|join_port|split_url|dial_tcp|dial_tcp_from_hostname[a-z_]*|parse_hosts|parse_resolv_conf)\\(' src \\
       --include='*.odin' --exclude='*_test.odin' --exclude-dir=netx --exclude-dir=itest --exclude-dir=fuzz; then
@@ -259,6 +272,13 @@ run = [
 [tasks.itest]
 description = "Integration tests: run the built binary against mock upstreams"
 depends = ["build", "prepare"]
+run = "odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES && ./bin/itest"
+
+# The same suite against the optimised build, which is what ships: a guard that
+# holds only in one of the two (inlining, frame size) is otherwise ungated.
+[tasks.itest-release]
+description = "Integration tests against the optimised build"
+depends = ["release", "prepare"]
 run = "odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES && ./bin/itest"
 
 # Does the answer that reaches the client say what the upstream's answer said?

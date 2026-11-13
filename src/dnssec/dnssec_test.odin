@@ -180,6 +180,19 @@ test_parse_trust_anchor :: proc(t: ^testing.T) {
 	testing.expect_value(t, bare.ds.key_tag, u16(38696))
 	testing.expect_value(t, len(bare.ds.digest), 32)
 
+	// The type is matched with an ASCII fold: `ds` is DS, but `Dſ` (U+017F,
+	// which Unicode folds to `s`) is not, so the line is no anchor.
+	_, lower_ok := parse_trust_anchor(
+		". IN ds 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+		context.temp_allocator,
+	)
+	testing.expect(t, lower_ok, "a lower-case type should parse")
+	_, long_s_ok := parse_trust_anchor(
+		". IN D\u017f 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+		context.temp_allocator,
+	)
+	testing.expect(t, !long_s_ok, "a type spelled with U+017F must not read as DS")
+
 	_, junk := parse_trust_anchor("not an anchor", context.temp_allocator)
 	testing.expect(t, !junk, "nonsense should not parse")
 

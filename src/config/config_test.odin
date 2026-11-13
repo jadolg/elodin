@@ -1724,3 +1724,21 @@ test_the_certificate_check_can_be_left_to_the_listener :: proc(t: ^testing.T) {
 	e, refused := lenient.?
 	testing.expectf(t, !refused, "refused with the certificate check off: %v", e.messages)
 }
+
+@(test)
+test_keywords_fold_ascii_only :: proc(t: ^testing.T) {
+	// A keyword matches with an ASCII fold. Under Unicode, `İ` (U+0130) lowers
+	// to `i`, so it would spell one.
+	UP :: "upstream:\n  servers: [1.1.1.1]\n"
+	_, upper := load_string(UP + "  strategy: FIRST\nlog:\n  level: INFO\n", context.temp_allocator)
+	testing.expectf(t, upper == nil, "ASCII upper case should spell a keyword: %v", upper)
+	expect_refused(t, UP + "log:\n  level: \u0130nfo\n", "log.level: unknown level")
+	expect_refused(t, UP + "  strategy: f\u0130rst\n", "upstream.strategy: unknown strategy")
+	expect_refused(t, UP + "blocking:\n  response: nxdoma\u0130n\n", "blocking.response: unknown mode")
+	expect_refused(
+		t,
+		UP + "blocking:\n  lists:\n    - url: https://lists.example/hosts.txt\n      format: doma\u0130ns\n",
+		"format: unknown format",
+	)
+	free_all(context.temp_allocator)
+}

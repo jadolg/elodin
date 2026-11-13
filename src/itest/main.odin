@@ -422,16 +422,13 @@ make_work_dir :: proc() -> string {
 	return dir
 }
 
+// Removes the working directory and everything the cases wrote in it, the
+// caches' subdirectories included; says so on stderr when it cannot.
 @(private)
 remove_work_dir :: proc(dir: string) {
-	// Best effort: remove the files we created, then the directory itself.
-	entries, err := os.read_directory_by_path(dir, -1, context.temp_allocator)
-	if err == nil {
-		for entry in entries {
-			_ = os.remove(entry.fullpath)
-		}
+	if err := os.remove_all(dir); err != nil {
+		fmt.eprintfln("itest: cannot remove %s: %v", dir, err)
 	}
-	_ = os.remove(dir)
 }
 
 /*
