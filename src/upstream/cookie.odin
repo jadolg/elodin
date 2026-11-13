@@ -64,10 +64,12 @@ Put our cookie for this upstream into a copy of the query.
 
 `ok` is false when the query has no OPT record to carry it, and the query goes
 out as it is. Every query the server forwards carries one
-(`server.upstream_query`); this is for one built by hand.
+(`server.upstream_query`); this is for one built by hand. `dry` is true where
+the copy failed for want of memory instead, and the query must not go out
+without the cookie for that.
 */
 @(private)
-attach_cookie :: proc(u: ^Upstream, query: []u8, allocator: mem.Allocator) -> (out: []u8, ok: bool) {
+attach_cookie :: proc(u: ^Upstream, query: []u8, allocator: mem.Allocator) -> (out: []u8, ok: bool, dry: bool) {
 	option: [COOKIE_CLIENT_LEN + COOKIE_SERVER_MAX]u8
 	n := 0
 
@@ -76,7 +78,11 @@ attach_cookie :: proc(u: ^Upstream, query: []u8, allocator: mem.Allocator) -> (o
 	n += copy(option[n:], u.cookie.server[:u.cookie.server_len])
 	sync.mutex_unlock(&u.mu)
 
-	return dns.set_edns_option(query, .Cookie, option[:n], allocator)
+	watched := dns.Dry_Watch{backing = allocator, dry = &dry}
+	scratch := dns.Dry_Watch{backing = context.temp_allocator, dry = &dry}
+	context.temp_allocator = dns.dry_watch_allocator(&scratch)
+	out, ok = dns.set_edns_option(query, .Cookie, option[:n], dns.dry_watch_allocator(&watched))
+	return out, ok, dry
 }
 
 /*
@@ -235,7 +241,10 @@ exchange_with_cookie :: proc(
 	response: []u8,
 	err: Error,
 ) {
-	asked, attached := attach_cookie(u, query, context.temp_allocator)
+	asked, attached, dry := attach_cookie(u, query, context.temp_allocator)
+	if dry && !attached {
+		return nil, .Out_Of_Memory
+	}
 	if !attached {
 		return send(u, query, timeout, deadline, allocator)
 	}
@@ -244,17 +253,17 @@ exchange_with_cookie :: proc(
 	learn_cookie(u, response)
 
 	if dns.peek_rcode(response) == .Bad_Cookie {
-		// Unreachable in practice: the same `query` carried a cookie a moment ago
-		// at the top of this proc, and nothing about it has changed since. Kept as
-		// a refusal rather than an assertion because the alternative is sending
-		// the query on without the cookie the server has just insisted on.
-		retry, retried := attach_cookie(u, query, context.temp_allocator)
+		// Reached only for want of memory: the same `query` carried a cookie a
+		// moment ago at the top of this proc, and nothing about it has changed
+		// since. A refusal rather than an assertion because the alternative is
+		// sending the query on without the cookie the server has just insisted on.
+		retry, retried, retry_dry := attach_cookie(u, query, context.temp_allocator)
 		if !retried {
 			// `response` came out of `allocator`, which on the race path is the
 			// process heap: dropping it here would leak it for the life of the
 			// process, so free it before turning the reply away.
 			delete(response, allocator)
-			return nil, .Bad_Response
+			return nil, .Out_Of_Memory if retry_dry else .Bad_Response
 		}
 		// The retry supersedes this reply; free it before it is overwritten. Null
 		// the named result in between: `send` can bail through `or_return`, and a
@@ -271,13 +280,22 @@ exchange_with_cookie :: proc(
 		}
 	}
 
-	/*
-	The cookie goes no further than this.
+	return strip_cookie(u, response, allocator)
+}
 
-	It belongs to the conversation between this server and that upstream. Left
-	in, it would reach a client that never asked for one and, worse, be stored
-	in the cache and handed to every client that asks the same question later.
-	*/
+/*
+The cookie goes no further than this.
+
+It belongs to the conversation between this server and that upstream. Left
+in, it would reach a client that never asked for one and, worse, be stored
+in the cache and handed to every client that asks the same question later.
+
+Takes `response`, which came out of `allocator`, and hands back the reply to
+use. `Bad_Response` where the cookie cannot be taken out, and `Out_Of_Memory`
+where that was for want of memory: neither hands the reply on as it stands.
+*/
+@(private)
+strip_cookie :: proc(u: ^Upstream, response: []u8, allocator: mem.Allocator) -> (out: []u8, err: Error) {
 	if _, carried := reply_cookie(response); !carried {
 		/*
 		Nothing to take out, which is where a server that does not do cookies
@@ -295,18 +313,28 @@ exchange_with_cookie :: proc(
 	reclaims it on `free_all` regardless. But on the race path `allocator` is the
 	process heap (a racer can outlive the caller's arena), and there
 	nothing else ever frees it: left behind, it leaks one buffer per forwarded
-	query for the life of the process. Deleted before `return`, not on a defer:
-	`response` is a named result, so `return stripped` would rebind it and a
-	deferred delete would free the buffer we just handed back.
+	query for the life of the process.
 	*/
-	stripped, ok := dns.remove_edns_option(response, .Cookie, allocator)
+	strip_dry := false
+	stripped: []u8
+	ok: bool
+	{
+		watched := dns.Dry_Watch{backing = allocator, dry = &strip_dry}
+		scratch := dns.Dry_Watch{backing = context.temp_allocator, dry = &strip_dry}
+		context.temp_allocator = dns.dry_watch_allocator(&scratch)
+		stripped, ok = dns.remove_edns_option(response, .Cookie, dns.dry_watch_allocator(&watched))
+	}
 	if !ok {
 		// Failing closed, the way the client-facing side does when it cannot take
 		// the client's cookie back out. Handing the answer over as it stands is
 		// the one outcome the paragraph above exists to prevent, and losing it is
-		// the cheaper mistake: the group still has other servers to ask.
-		logx.warnf("upstream %s: could not strip the server cookie from a reply", u.spec.name)
+		// the cheaper mistake: the group still has other servers to ask. A strip
+		// this server had no memory for is not the upstream's doing.
 		delete(response, allocator)
+		if strip_dry {
+			return nil, .Out_Of_Memory
+		}
+		logx.warnf("upstream %s: could not strip the server cookie from a reply", u.spec.name)
 		return nil, .Bad_Response
 	}
 	/*

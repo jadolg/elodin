@@ -769,13 +769,13 @@ test_bootstrap_ignores_a_reply_from_another_port :: proc(t: ^testing.T) {
 	}
 	defer stop_udp_mock(&m, responder)
 
-	addr, found := bootstrap_query(
+	addr, err := bootstrap_query(
 		net.endpoint_to_string(bound, context.temp_allocator),
 		"mock.invalid",
 		.A,
 		time.tick_add(time.tick_now(), 200 * time.Millisecond),
 	)
-	testing.expect(t, !found, "an answer from a port we never asked was accepted")
+	testing.expect_value(t, err, Error.Not_Resolved)
 	testing.expect(t, addr == nil, "a rejected answer still produced an address")
 	free_all(context.temp_allocator)
 }
@@ -790,13 +790,13 @@ test_bootstrap_ignores_a_reply_to_another_question :: proc(t: ^testing.T) {
 	}
 	defer stop_udp_mock(&m, responder)
 
-	addr, found := bootstrap_query(
+	addr, err := bootstrap_query(
 		net.endpoint_to_string(bound, context.temp_allocator),
 		"mock.invalid",
 		.A,
 		time.tick_add(time.tick_now(), 200 * time.Millisecond),
 	)
-	testing.expect(t, !found, "an answer to a question we never asked was accepted")
+	testing.expect_value(t, err, Error.Not_Resolved)
 	testing.expect(t, addr == nil, "a rejected answer still produced an address")
 	free_all(context.temp_allocator)
 }
@@ -812,13 +812,13 @@ test_bootstrap_accepts_the_server_it_asked :: proc(t: ^testing.T) {
 	}
 	defer stop_udp_mock(&m, responder)
 
-	addr, found := bootstrap_query(
+	addr, err := bootstrap_query(
 		net.endpoint_to_string(bound, context.temp_allocator),
 		"mock.invalid",
 		.A,
 		time.tick_add(time.tick_now(), 200 * time.Millisecond),
 	)
-	testing.expect(t, found, "the honest responder's answer was refused")
+	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, addr, net.Address(net.IP4_Address{203, 0, 113, 7}))
 	free_all(context.temp_allocator)
 }
@@ -912,9 +912,9 @@ test_bootstrap_query_id_does_not_follow_the_clock :: proc(t: ^testing.T) {
 	sent_at: [TRIALS]i64
 	for i in 0 ..< TRIALS {
 		sent_at[i] = time.now()._nsec
-		addr, found := bootstrap_query(address, "mock.invalid", .A, time.tick_add(time.tick_now(), 200 * time.Millisecond))
+		addr, err := bootstrap_query(address, "mock.invalid", .A, time.tick_add(time.tick_now(), 200 * time.Millisecond))
 		free_all(context.temp_allocator)
-		if !found || addr == nil {
+		if err != .None || addr == nil {
 			testing.expectf(t, false, "trial %d: the honest responder's answer was refused", i)
 			return
 		}
@@ -988,8 +988,8 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	// What the test holds before the cache allocates anything, which is what
 	// `bootstrap_destroy` must bring it back to.
 	baseline := len(track.allocation_map)
-	addr, ok := bootstrap_resolve(servers, HOST)
-	testing.expect(t, ok, "the first lookup failed")
+	addr, err := bootstrap_resolve(servers, HOST)
+	testing.expect_value(t, err, Error.None)
 	testing.expect(t, addr != nil, "the first lookup returned no address")
 	settled := len(track.allocation_map)
 
@@ -1001,8 +1001,8 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	bootstrap_cache.entries[HOST + "."] = entry
 	sync.mutex_unlock(&bootstrap_cache.mu)
 
-	addr2, ok2 := bootstrap_resolve(servers, HOST)
-	testing.expect(t, ok2, "the refresh failed")
+	addr2, err2 := bootstrap_resolve(servers, HOST)
+	testing.expect_value(t, err2, Error.None)
 	testing.expect(t, addr2 != nil, "the refresh returned no address")
 
 	testing.expectf(
@@ -1019,8 +1019,8 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	bootstrap_forget()
 	testing.expect_value(t, len(bootstrap_cache.entries), 0)
 	testing.expect_value(t, len(track.allocation_map), settled - 1)
-	_, ok3 := bootstrap_resolve(servers, HOST)
-	testing.expect(t, ok3, "the lookup after forgetting failed")
+	_, err3 := bootstrap_resolve(servers, HOST)
+	testing.expect_value(t, err3, Error.None)
 	testing.expect_value(t, len(track.allocation_map), settled)
 
 	/*
@@ -1030,8 +1030,8 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	*/
 	HOPS :: []string{"hop1.invalid", "hop2.invalid"}
 	for hop in HOPS {
-		_, hop_ok := bootstrap_resolve(servers, hop)
-		testing.expectf(t, hop_ok, "%s did not resolve", hop)
+		_, hop_err := bootstrap_resolve(servers, hop)
+		testing.expectf(t, hop_err == .None, "%s did not resolve: %v", hop, hop_err)
 	}
 	testing.expect_value(t, len(bootstrap_cache.entries), 1 + len(HOPS))
 	sync.mutex_lock(&bootstrap_cache.mu)
@@ -1039,13 +1039,13 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 		e.expires = loop.moment_add(loop.moment_now(), -time.Minute)
 	}
 	sync.mutex_unlock(&bootstrap_cache.mu)
-	_, ok4 := bootstrap_resolve(servers, "hop3.invalid")
-	testing.expect(t, ok4, "hop3.invalid did not resolve")
+	_, err4 := bootstrap_resolve(servers, "hop3.invalid")
+	testing.expect_value(t, err4, Error.None)
 	testing.expect_value(t, len(bootstrap_cache.entries), 1)
 	testing.expect(t, "hop3.invalid." in bootstrap_cache.entries, "the new hostname was swept with the expired")
 	// Another spelling of the same name is the same entry.
-	_, ok5 := bootstrap_resolve(servers, "HOP3.Invalid.")
-	testing.expect(t, ok5, "HOP3.Invalid. did not resolve")
+	_, err5 := bootstrap_resolve(servers, "HOP3.Invalid.")
+	testing.expect_value(t, err5, Error.None)
 	testing.expect_value(t, len(bootstrap_cache.entries), 1)
 	testing.expect_value(t, len(track.allocation_map), settled)
 
@@ -1055,12 +1055,12 @@ test_bootstrap_refresh_does_not_orphan_its_key :: proc(t: ^testing.T) {
 	// below rather than spinning here.
 	for i := 1; i <= BOOTSTRAP_MAX_ENTRIES && len(bootstrap_cache.entries) < BOOTSTRAP_MAX_ENTRIES; i += 1 {
 		name := fmt.tprintf("fill%d.invalid", i)
-		if _, fill_ok := bootstrap_resolve(servers, name); !testing.expectf(t, fill_ok, "%s did not resolve", name) {
+		if _, fill_err := bootstrap_resolve(servers, name); !testing.expectf(t, fill_err == .None, "%s did not resolve: %v", name, fill_err) {
 			break
 		}
 	}
-	_, over_ok := bootstrap_resolve(servers, "over.invalid")
-	testing.expect(t, over_ok, "a name past the cap was not answered")
+	_, over_err := bootstrap_resolve(servers, "over.invalid")
+	testing.expect_value(t, over_err, Error.None)
 	testing.expect_value(t, len(bootstrap_cache.entries), BOOTSTRAP_MAX_ENTRIES)
 	testing.expect(t, !("over.invalid." in bootstrap_cache.entries), "a name past the cap was kept")
 
@@ -4269,7 +4269,7 @@ test_a_late_resolved_endpoint_is_published_once :: proc(t: ^testing.T) {
 	// The upstream owns its spec's strings, so the replacement is one too.
 	delete(u.spec.address, u.allocator)
 	u.spec.address = strings.clone("127.0.0.2", u.allocator)
-	testing.expect(t, resolve_endpoint(u), "a lookup after the endpoint was published")
+	testing.expect_value(t, resolve_endpoint(u), Error.None)
 	ep, _ = endpoint_of(u)
 	testing.expect(t, ep.address == net.Address(net.IP4_Loopback), "the published endpoint was written over")
 }
@@ -4295,7 +4295,7 @@ test_a_failed_resolution_does_not_unpublish_the_endpoint :: proc(t: ^testing.T) 
 	// The upstream owns its spec's strings, so the replacement is one too.
 	delete(u.spec.address, u.allocator)
 	u.spec.address = strings.clone("kept-347.test", u.allocator)
-	testing.expect(t, resolve_endpoint(u), "the endpoint published before the failed lookup does not stand")
+	testing.expect_value(t, resolve_endpoint(u), Error.None)
 
 	ep, eerr := endpoint_of(u)
 	testing.expect_value(t, eerr, Error.None)

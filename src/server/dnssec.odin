@@ -451,8 +451,13 @@ present_response :: proc(
 	// again, into the same arena. See `dns.REQUEST_DECODE_BUDGET`.
 	spent: ^int,
 	allocator: mem.Allocator,
-) -> []u8 {
-	out := wire
+) -> (
+	out: []u8,
+	// False where the prune ran out of memory: nothing to send, and nothing
+	// to cache, rather than the answer without AD for the life of the entry.
+	ok: bool,
+) #optional_ok {
+	out = wire
 	secure := result.status == .Secure
 	if secure {
 		/*
@@ -464,7 +469,12 @@ present_response :: proc(
 		outright would let a message we merely failed to re-encode take down a
 		name that validated perfectly well.
 		*/
-		if pruned, ok := dnssec.strip_unauthenticated(out, result, allocator, dns.MAX_MESSAGE, spent); ok {
+		dry: bool
+		pruned, pruned_ok := dnssec.strip_unauthenticated(out, result, allocator, dns.MAX_MESSAGE, spent, &dry)
+		if dry {
+			return nil, false
+		}
+		if pruned_ok {
 			out = pruned
 		} else {
 			/*
@@ -530,7 +540,7 @@ present_response :: proc(
 	it goes back to.
 	*/
 	set_cd_bit(out, query.flags.cd)
-	return out
+	return out, true
 }
 
 /*

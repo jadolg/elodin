@@ -349,6 +349,8 @@ it first, several at once while others are dialling, so the endpoint is
 published once: written under `mu` by the first lookup to succeed, then
 `resolved` is set with release ordering, and the endpoint is never written
 again. A lookup that fails leaves alone whatever another thread published.
+`Not_Resolved` where the bootstrap servers gave no address, `Out_Of_Memory`
+where this server could not ask them.
 */
 @(private)
 resolve_endpoint :: proc(
@@ -356,20 +358,22 @@ resolve_endpoint :: proc(
 	// The exchange's, which the bootstrap queries spend; zero at startup, where
 	// each has `BOOTSTRAP_TIMEOUT` of its own.
 	deadline := time.Tick{},
-) -> bool {
+) -> Error {
 	addr := netx.parse_address(u.spec.address)
 	literal := addr != nil
 	if !literal {
-		ok: bool
-		addr, ok = bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
-		if !ok {
+		err: Error
+		addr, err = bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
+		if err != .None {
 			// Another thread's lookup may have published meanwhile, and then
 			// the upstream is not unresolvable.
 			if sync.atomic_load_explicit(&u.resolved, .Acquire) {
-				return true
+				return .None
 			}
-			logx.warnf("upstream %s: cannot resolve %q via bootstrap resolvers", u.spec.name, u.spec.address)
-			return false
+			if err == .Not_Resolved {
+				logx.warnf("upstream %s: cannot resolve %q via bootstrap resolvers", u.spec.name, u.spec.address)
+			}
+			return err
 		}
 	}
 	sync.mutex_lock(&u.mu)
@@ -387,7 +391,7 @@ resolve_endpoint :: proc(
 	if published && !literal {
 		logx.debugf("upstream %s: resolved %s to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
 	}
-	return true
+	return .None
 }
 
 /*
@@ -766,14 +770,17 @@ take several, and every bound above - a group's budget, a question's
 	bootstrap resolver gone quiet, finding that out takes the timeout, and
 	a member that never parked would be asked - and waited on - by every query
 	for as long as the bootstrap stayed down (issue #327). With no bootstrap
-servers to ask the refusal costs nothing, and is left unrecorded.
+servers to ask the refusal costs nothing, and is left unrecorded. A lookup this
+	server had no memory for is counted and not charged (`charges_member`).
 	*/
 	resolving := !sync.atomic_load_explicit(&u.resolved, .Acquire)
-	if resolving && !resolve_endpoint(u, deadline) {
-		if len(u.spec.bootstrap) > 0 {
-			record_failure(u, .Not_Resolved)
+	if resolving {
+		if rerr := resolve_endpoint(u, deadline); rerr != .None {
+			if len(u.spec.bootstrap) > 0 {
+				record_failure(u, rerr, charge = charges_member(rerr, resolving))
+			}
+			return nil, rerr
 		}
-		return nil, .Not_Resolved
 	}
 
 	start := loop.tick_now()
@@ -935,11 +942,19 @@ close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 	closed += close_pipe(u, all)
 
 	now := loop.moment_now()
-	stale := make([dynamic]Idle_Conn, 0, len(u.idle), context.temp_allocator)
+	// Reserved whole: a connection the list dropped would be taken off `idle`
+	// below and never closed. Without the room, each is closed here, under the
+	// lock.
+	stale, listed := dns.alloc_list([dynamic]Idle_Conn, len(u.idle), context.temp_allocator)
 	kept := 0
-	for conn in u.idle {
+	for &conn in u.idle {
 		if all || time.Duration(now - conn.since) >= u.idle_timeout {
-			append(&stale, conn)
+			if listed {
+				append(&stale, conn)
+			} else {
+				stream_close(&conn.stream)
+				closed += 1
+			}
 		} else {
 			u.idle[kept] = conn
 			kept += 1

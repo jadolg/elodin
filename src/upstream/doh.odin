@@ -36,7 +36,10 @@ exchange_doh :: proc(
 	if len(query) < dns.HEADER_SIZE {
 		return nil, .Bad_Response
 	}
-	body := make([]u8, len(query), context.temp_allocator)
+	body, built := dns.alloc_slice([]u8, len(query), context.temp_allocator)
+	if !built {
+		return nil, .Out_Of_Memory
+	}
 	copy(body, query)
 	dns.set_id_in_place(body, 0)
 

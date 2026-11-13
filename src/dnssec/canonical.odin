@@ -401,8 +401,11 @@ render_rdatas :: proc(scratch: ^Signing_Scratch, records: []dns.Record, allocato
 	if !charge_scratch(scratch, len(records) * (size_of(int) + size_of([]u8)) + 2 * STORE_START) {
 		return
 	}
-	ends := make([]int, len(records), allocator)
-	rdatas := make([][]u8, len(records), allocator)
+	ends, ends_built := dns.alloc_slice([]int, len(records), allocator)
+	rdatas, rdatas_built := dns.alloc_slice([][]u8, len(records), allocator)
+	if !ends_built || !rdatas_built {
+		return
+	}
 	store := make([dynamic]u8, 0, STORE_START, allocator)
 	charged := 2 * STORE_START
 	for rec, i in records {

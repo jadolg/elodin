@@ -1,7 +1,9 @@
 package server
 
 import "core:mem"
+import "core:net"
 import "core:testing"
+import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
@@ -554,4 +556,147 @@ test_a_refreshed_answer_that_cannot_be_copied_is_not_taken :: proc(t: ^testing.T
 	out, _, _, taken := refresh_take(&r, 0, mem.nil_allocator())
 	testing.expect(t, !taken, "a refreshed answer copied into nothing was taken")
 	testing.expect_value(t, len(out), 0)
+}
+
+/*
+Issue #636: a stream message this server has no room to read ends the
+connection. Handed back empty, the message's bytes would be read as the next
+length prefix, and every message after it out of frame.
+*/
+@(test)
+test_a_stream_message_without_room_ends_the_connection :: proc(t: ^testing.T) {
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
+		return
+	}
+	defer net.close(client)
+	defer net.close(accepted)
+	if oerr := net.set_option(accepted, .Receive_Timeout, 5 * time.Second); !testing.expect_value(t, oerr, nil) {
+		return
+	}
+	// Two, each longer than the read-ahead, so each is read into the temp
+	// allocator rather than viewed in the reader.
+	LONG :: STREAM_READ_AHEAD + 100
+	wire := make([]u8, 2 * (2 + LONG), context.allocator)
+	defer delete(wire)
+	for at in ([]int{0, 2 + LONG}) {
+		wire[at], wire[at + 1] = u8(LONG >> 8), u8(LONG & 0xff)
+	}
+	if _, serr := net.send_tcp(client, wire); !testing.expect_value(t, serr, nil) {
+		return
+	}
+	conn := Conn {
+		socket = accepted,
+	}
+	reader: Stream_Reader
+	budget := Read_Budget {
+		idle = 5 * time.Second,
+	}
+	first, first_ok := stream_read_message(conn, &reader, &budget)
+	testing.expect(t, first_ok, "the first message was not read")
+	testing.expect_value(t, len(first), LONG)
+
+	budget.deadline = {}
+	temp := context.temp_allocator
+	context.temp_allocator = mem.nil_allocator()
+	second, second_ok := stream_read_message(conn, &reader, &budget)
+	context.temp_allocator = temp
+	testing.expectf(t, !second_ok, "a message with no room to read it was read as %d bytes", len(second))
+	free_all(context.temp_allocator)
+}
+
+// An HTTP/2 error this server has no room to write the text of still goes out
+// with its status.
+@(test)
+test_an_h2_error_without_room_keeps_its_status :: proc(t: ^testing.T) {
+	temp := context.temp_allocator
+	context.temp_allocator = mem.nil_allocator()
+	dry := h2_error(415, "unsupported media type")
+	context.temp_allocator = temp
+	testing.expect_value(t, dry.status, 415)
+	testing.expect_value(t, len(dry.body), 0)
+
+	whole := h2_error(415, "unsupported media type")
+	defer free_all(context.temp_allocator)
+	testing.expect_value(t, whole.status, 415)
+	testing.expect_value(t, string(whole.body), "unsupported media type\n")
+}
+
+/*
+An HTTP/1.1 request whose fields this server has no room to keep ends
+unanswered, rather than reading as a request with an empty path, query or
+content type: those draw a 404 or a 415 the client did not earn.
+*/
+@(test)
+test_an_http_request_without_room_is_not_read_short :: proc(t: ^testing.T) {
+	RAW :: "GET /dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE HTTP/1.1\r\nHost: dns.example\r\n\r\n"
+	for dry in ([]bool{false, true}) {
+		client, accepted, paired := loopback_tcp_pair(t)
+		if !paired {
+			return
+		}
+		defer net.close(accepted)
+		_, serr := net.send_tcp(client, transmute([]u8)string(RAW))
+		net.close(client)
+		if !testing.expect_value(t, serr, nil) {
+			return
+		}
+		if oerr := net.set_option(accepted, .Receive_Timeout, 3 * time.Second); !testing.expect_value(t, oerr, nil) {
+			return
+		}
+		// On the heap, sized for the whole request: only the fields are refused.
+		buf, buf_err := make([dynamic]u8, 0, HTTP_BUF_SIZE, context.allocator)
+		if !testing.expect_value(t, buf_err, nil) {
+			return
+		}
+		defer delete(buf)
+		r := Http_Reader {
+			conn = Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}},
+			buf  = buf,
+		}
+		temp := context.temp_allocator
+		context.temp_allocator = mem.nil_allocator() if dry else temp
+		req, status, ok := read_http_request(&r)
+		context.temp_allocator = temp
+		buf = r.buf
+		if dry {
+			testing.expectf(t, !ok, "read with no room as %s %q, status %d", req.method, req.path, status)
+		} else {
+			testing.expect(t, ok, "the request was not read")
+			testing.expect_value(t, req.path, "/dns-query")
+		}
+		free_all(context.temp_allocator)
+	}
+}
+
+/*
+A refresh the heap has no room for - the refresh, or its copy of the key, the
+query or the client - is declined, as a full table declines one: started, it
+would ask the upstream an empty query and be charged for the answer.
+*/
+@(test)
+test_a_refresh_without_room_is_declined :: proc(t: ^testing.T) {
+	f: Stale_Fixture
+	if !stale_fixture_start(t, &f, time.Second, looped = true) {
+		return
+	}
+	defer stale_fixture_stop(&f)
+	query := stale_query(true)
+	for n in 1 ..= 4 {
+		fail := Fail_Nth{fail_at = n, fail_for = 1}
+		heap := context.allocator
+		context.allocator = mem.Allocator{procedure = fail_nth_proc, data = &fail}
+		r := start_refresh(&f.srv, "refresh.example.", query, .UDP, "192.0.2.1", dns.MAX_UDP_SIZE, time.tick_now())
+		context.allocator = heap
+		if !testing.expectf(t, r == nil, "allocation %d refused: a refresh was started", n) {
+			// The caller's reference, so the job can finish and the loop stop.
+			refresh_release(r)
+			return
+		}
+		testing.expectf(t, fail.seen >= n, "allocation %d refused, of %d", n, fail.seen)
+		for slot in f.srv.refreshes.slots {
+			testing.expectf(t, slot == nil, "allocation %d refused: a refresh holds a slot", n)
+		}
+	}
+	free_all(context.temp_allocator)
 }

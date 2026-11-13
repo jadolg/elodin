@@ -120,7 +120,7 @@ slow_calls :: proc(u: ^Slow_Upstream) -> int {
 @(private = "file")
 warm_example_chain :: proc(v: ^Validator, now: time.Time) {
 	for zone in ([]string{".", "com.", "example.com."}) {
-		cache_put(v, zone, .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
+		cache_put(v, nil, zone, .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 	}
 }
 

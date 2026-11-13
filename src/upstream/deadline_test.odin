@@ -23,40 +23,6 @@ seconds and two attempts: four times what a stub waits.
 @(private = "file")
 DEADLINE_TIMEOUT :: 200 * time.Millisecond
 
-// Answers every query by echoing it back as a response after `delay`, or reads
-// it and says nothing when `mute` is set. Counts what it was asked either way.
-@(private = "file")
-Echo_Mock :: struct {
-	socket: net.UDP_Socket,
-	stop:   bool,
-	mute:   bool,
-	delay:  time.Duration,
-	// The header rcode of the echo, NOERROR unless set.
-	rcode:  u8,
-	hits:   int,
-}
-
-@(private = "file")
-echo_mock_loop :: proc(m: ^Echo_Mock) {
-	buf: [512]u8
-	for !sync.atomic_load(&m.stop) {
-		n, client, err := net.recv_udp(m.socket, buf[:])
-		if err != nil || n < dns.HEADER_SIZE {
-			continue
-		}
-		sync.atomic_add(&m.hits, 1)
-		if m.mute {
-			continue
-		}
-		if m.delay > 0 {
-			time.sleep(m.delay)
-		}
-		buf[2] |= 0x80
-		buf[3] = 0x80 | (buf[3] & 0x70) | (m.rcode & 0xf)
-		_, _ = net.send_udp(m.socket, buf[:n], client)
-	}
-}
-
 @(private = "file")
 start_echo_mock :: proc(t: ^testing.T, m: ^Echo_Mock, name: string) -> (u: ^Upstream, worker: ^thread.Thread, ok: bool) {
 	return start_udp_mock(t, m, echo_mock_loop, name, DEADLINE_TIMEOUT)
@@ -584,11 +550,11 @@ test_a_stray_datagram_does_not_extend_a_bootstrap_query :: proc(t: ^testing.T) {
 
 	udp_waits_reset()
 	started := time.tick_now()
-	_, ok := bootstrap_query(fmt.tprintf("127.0.0.1:%d", bound.port), "dns.example", .A, time.tick_add(started, DEADLINE_TIMEOUT))
+	_, err := bootstrap_query(fmt.tprintf("127.0.0.1:%d", bound.port), "dns.example", .A, time.tick_add(started, DEADLINE_TIMEOUT))
 	thread.join(worker)
 	thread.destroy(worker)
 
-	testing.expect(t, !ok, "the bootstrap query resolved from a silent server")
+	testing.expect_value(t, err, Error.Not_Resolved)
 	expect_udp_waits_share(t, started, DEADLINE_TIMEOUT, 3)
 	free_all(context.temp_allocator)
 }

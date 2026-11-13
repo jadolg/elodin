@@ -485,3 +485,41 @@ test_upstream_cookie_differs_per_upstream :: proc(t: ^testing.T) {
 	zero: [COOKIE_CLIENT_LEN]u8
 	testing.expect(t, mem.compare(a.cookie.client[:], zero[:]) != 0, "the client cookie was never drawn")
 }
+
+/*
+A BADCOOKIE answered by a retry this server has no memory to attach the new
+cookie to is this server's failure, not the upstream's: whichever allocation of
+the conversation is refused, the exchange never comes back `Bad_Response`.
+*/
+@(test)
+test_a_cookie_retry_without_memory_is_not_a_bad_response :: proc(t: ^testing.T) {
+	refused := 0
+	for n := 1; ; n += 1 {
+		m := Cookie_Mock {
+			server = {1, 2, 3, 4, 5, 6, 7, 8},
+			demand = true,
+		}
+		u, worker, ok := start_cookie_mock(t, &m)
+		if !ok {
+			return
+		}
+		defer stop_udp_mock(&m, worker, u)
+		query := edns_query("retry.example.")
+		f := Fail_Nth{backing = context.temp_allocator, fail_at = n, fail_for = 1}
+		temp := context.temp_allocator
+		context.temp_allocator = fail_nth(&f)
+		_, err := exchange(u, query, time.Second, temp)
+		context.temp_allocator = temp
+		free_all(context.temp_allocator)
+		if f.seen < n {
+			testing.expect_value(t, err, Error.None)
+			sync.mutex_lock(&m.mu)
+			testing.expectf(t, m.queries == 2, "%d queries, where the BADCOOKIE and its retry were expected", m.queries)
+			sync.mutex_unlock(&m.mu)
+			break
+		}
+		refused += 1
+		testing.expectf(t, err != .Bad_Response, "allocation %d refused: the upstream was blamed with %v", n, err)
+	}
+	testing.expect(t, refused > 0, "the exchange allocated nothing to refuse")
+}

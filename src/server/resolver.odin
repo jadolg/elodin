@@ -1550,23 +1550,12 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	fifteen bytes, so they cost what the name does and not two `cache.KEY_MAX`
 	of every parked query's stack (#614). One allocation for both.
 
-	An arena that cannot give them is out of memory, and a SERVFAIL built in it
-	can trap in the encoder (#620), so the question fails with no response,
-	counted and logged as `shape_forwarded` counts and logs its own failure. A
-	detached refresh counts and logs nothing: it reports `unanswered`, and the
-	client holding the entry is counted for the answer it gets, as `judge_reply`
-	has it.
+	An arena that cannot give them is out of memory (`answered_dry`).
 	*/
 	size := cache.key_size(st.q.name)
-	keys, _ := make([]u8, 2 * size, st.allocator)
-	if len(keys) < 2 * size {
-		if st.refresh {
-			st.unanswered = true
-		} else {
-			count_answer(&st.s.stats.failed)
-			log_query(st.s, st.client, st.proto, st.q, .Failed, "query", st.started)
-		}
-		return answered(st, nil, .Failed, false)
+	keys, keys_built := dns.alloc_slice([]u8, 2 * size, st.allocator)
+	if !keys_built {
+		return answered_dry(st, "query")
 	}
 	st.key = cache.make_key(keys[:size], st.q.name, st.q.type, st.q.class, dns.edns_do(st.msg), st.msg.flags.cd, policy = policy)
 	// Where a `Bogus` verdict for this question is remembered, if one was
@@ -2520,6 +2509,25 @@ judge_reply :: proc(st: ^Query_State) -> bool {
 }
 
 /*
+The question fails with no response where this server ran out of memory: a
+SERVFAIL built in a dry arena can trap in the encoder (#620). Counted and
+logged as `shape_forwarded` counts and logs its own failure, `reason` naming
+the step. A detached refresh counts and logs nothing: it reports `unanswered`,
+and the client holding the entry is counted for the answer it gets, as
+`judge_reply` has it.
+*/
+@(private)
+answered_dry :: proc(st: ^Query_State, reason: string) -> bool {
+	if st.refresh {
+		st.unanswered = true
+	} else {
+		count_answer(&st.s.stats.failed)
+		log_query(st.s, st.client, st.proto, st.q, .Failed, reason, st.started)
+	}
+	return answered(st, nil, .Failed, false)
+}
+
+/*
 DNSSEC validation of the reply, when this query is validating. Answers only to
 refuse a Bogus or Indeterminate one.
 */
@@ -2592,7 +2600,11 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 		case .Secure:
 			sync.atomic_add(&st.s.stats.secure, 1)
 		}
-		st.resp = present_response(st.resp, st.msg, st.q.type, result, st.spent, st.allocator)
+		presented, built := present_response(st.resp, st.msg, st.q.type, result, st.spent, st.allocator)
+		if !built {
+			return answered_dry(st, "dnssec")
+		}
+		st.resp = presented
 		st.answer_ede = ceiling_ede(result)
 		st.ede = st.answer_ede
 	}

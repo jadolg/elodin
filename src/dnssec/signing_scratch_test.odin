@@ -246,9 +246,9 @@ ss_answer :: proc(signatures: int, spent: ^int) -> (used: int, status: Status, r
 	now := fixture_now()
 	v := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(v)
-	cache_put(v, ".", .Secure, nil, MAX_ZONE_TTL, fixture_moment(now))
-	cache_put(v, "com.", .Secure, nil, MAX_ZONE_TTL, fixture_moment(now))
-	cache_put(v, "example.com.", .Secure, ed25519_key(), MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, nil, ".", .Secure, nil, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, nil, "com.", .Secure, nil, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, nil, "example.com.", .Secure, ed25519_key(), MAX_ZONE_TTL, fixture_moment(now))
 
 	records := ss_big_txt()
 	sigs := make([]Rrsig, signatures, context.temp_allocator)

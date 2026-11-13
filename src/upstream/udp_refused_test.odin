@@ -24,71 +24,6 @@ with a RST an off-path sender cannot forge, and a live one answers the query.
 @(private = "file")
 R_TIMEOUT :: 2 * time.Second
 
-/*
-UDP `port` on loopback held, but refusing: bound, so no other socket can be
-handed it while a test runs, and connected to a peer that never sends, so a
-datagram from anyone else matches no socket and draws ICMP port unreachable -
-the closed port, without releasing it for a parallel test to take.
-*/
-@(private = "file")
-refusing_udp :: proc(t: ^testing.T, port: int) -> (linux.Fd, bool) {
-	fd, err := linux.socket(.INET, .DGRAM, {.CLOEXEC}, .UDP)
-	if !testing.expectf(t, err == .NONE, "cannot open a udp socket: %v", err) {
-		return -1, false
-	}
-	at := linux.Sock_Addr_In{sin_family = .INET, sin_port = u16be(u16(port)), sin_addr = {127, 0, 0, 1}}
-	peer := linux.Sock_Addr_In{sin_family = .INET, sin_port = 9, sin_addr = {127, 0, 0, 1}}
-	if berr := linux.bind(fd, &at); berr != .NONE {
-		linux.close(fd)
-		return -1, false
-	}
-	if cerr := linux.connect(fd, &peer); !testing.expectf(t, cerr == .NONE, "cannot connect the refusing socket: %v", cerr) {
-		linux.close(fd)
-		return -1, false
-	}
-	return fd, true
-}
-
-// A loopback port closed on UDP and on TCP, held for the test: a TCP socket
-// bound and never listening answers a SYN with a RST. The caller closes both.
-@(private = "file")
-Closed_Port :: struct {
-	port: int,
-	tcp:  linux.Fd,
-	udp:  linux.Fd,
-}
-
-@(private = "file")
-closed_port :: proc(t: ^testing.T) -> (c: Closed_Port, ok: bool) {
-	// The TCP port is the kernel's pick; its UDP twin is usually free too, and
-	// a few picks find one that is.
-	for _ in 0 ..< 16 {
-		fd, err := linux.socket(.INET, .STREAM, {.CLOEXEC}, .TCP)
-		if !testing.expectf(t, err == .NONE, "cannot open a tcp socket: %v", err) {
-			return
-		}
-		any := linux.Sock_Addr_In{sin_family = .INET, sin_addr = {127, 0, 0, 1}}
-		bound: linux.Sock_Addr_Any
-		if linux.bind(fd, &any) != .NONE || linux.getsockname(fd, &bound) != .NONE {
-			linux.close(fd)
-			continue
-		}
-		port := int(bound.sin_port)
-		if udp, held := refusing_udp(t, port); held {
-			return Closed_Port{port = port, tcp = fd, udp = udp}, true
-		}
-		linux.close(fd)
-	}
-	testing.expect(t, false, "no loopback port is free on both TCP and UDP")
-	return
-}
-
-@(private = "file")
-release_port :: proc(c: Closed_Port) {
-	linux.close(c.tcp)
-	linux.close(c.udp)
-}
-
 @(private = "file")
 refused_query :: proc() -> []u8 {
 	query := dns.Message {
@@ -313,9 +248,9 @@ test_a_bootstrap_query_waits_past_a_refusal :: proc(t: ^testing.T) {
 	WAIT :: 200 * time.Millisecond
 	server := fmt.tprintf("127.0.0.1:%d", port)
 	started := time.tick_now()
-	_, found := bootstrap_query(server, "example.com.", .A, time.tick_add(started, WAIT))
+	_, err := bootstrap_query(server, "example.com.", .A, time.tick_add(started, WAIT))
 	spent := time.tick_since(started)
-	testing.expect(t, !found, "a closed bootstrap port produced an address")
+	testing.expect_value(t, err, Error.Not_Resolved)
 	testing.expectf(t, spent >= WAIT, "the bootstrap query ended after %v, on a refusal, before its %v", spent, WAIT)
 	free_all(context.temp_allocator)
 }

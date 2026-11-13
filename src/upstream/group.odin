@@ -619,8 +619,14 @@ resolve_insisting :: proc(
 			logx.debugf("upstream %s is not known to be answering, not held out for", u.spec.name)
 			continue
 		}
+		// No room for the copy is this server's memory and not the member's:
+		// the sweep stops, and the reply in hand stands.
+		asked, copied := sweep_query(query)
+		if !copied {
+			break
+		}
 		before := loop.tick_now()
-		resp, xerr := exchange(u, sweep_query(query), g.timeout, allocator)
+		resp, xerr := exchange(u, asked, g.timeout, allocator)
 		// Charged whatever the exchange did, because what is being bounded is
 		// the client's wait and an upstream can spend the time either way: a
 		// member that recurses for most of the timeout and then says SERVFAIL
@@ -741,17 +747,18 @@ per upstream. Scratch space, as `exchange` itself uses for the cookie copy: the
 sweep runs in the request's own scratch, which the caller resets.
 
 A message too short to hold a header is handed on untouched. `exchange` is where
-that is refused; inventing bytes for it here would only hide it.
+that is refused; inventing bytes for it here would only hide it. `ok` is false
+where the copy cannot be had.
 */
 @(private)
-sweep_query :: proc(query: []u8) -> []u8 {
+sweep_query :: proc(query: []u8) -> (out: []u8, ok: bool) {
 	if len(query) < dns.HEADER_SIZE {
-		return query
+		return query, true
 	}
-	out := make([]u8, len(query), context.temp_allocator)
+	out = dns.alloc_slice([]u8, len(query), context.temp_allocator) or_return
 	copy(out, query)
 	dns.set_id_in_place(out, dns.random_id())
-	return out
+	return out, true
 }
 
 /*
@@ -1015,7 +1022,10 @@ resolve_sequential :: proc(
 	spent: time.Duration
 	// The round, from 1, in which this query asked each member; 0 for not yet.
 	// Scratch, like `resolve_race`'s candidates: the caller resets the arena.
-	asked := make([]int, len(g.servers), context.temp_allocator)
+	asked, asked_built := dns.alloc_slice([]int, len(g.servers), context.temp_allocator)
+	if !asked_built {
+		return nil, nil, .Out_Of_Memory
+	}
 
 	for round in 1 ..= g.attempts {
 		/*
@@ -1180,7 +1190,11 @@ resolve_race :: proc(
 	winner: ^Upstream,
 	err: Error,
 ) {
-	candidates := make([dynamic]^Upstream, 0, len(g.servers), context.temp_allocator)
+	// Reserved whole, so no append below can drop a member.
+	candidates, listed := dns.alloc_list([dynamic]^Upstream, len(g.servers), context.temp_allocator)
+	if !listed {
+		return nil, nil, .Out_Of_Memory
+	}
 	for u in g.servers {
 		if healthy(u) {
 			append(&candidates, u)
@@ -1197,14 +1211,21 @@ resolve_race :: proc(
 	}
 
 	st := new(Race_State)
+	if st == nil {
+		return nil, nil, .Out_Of_Memory
+	}
 	st.refs = 1
 	st.last_err = .Timeout
 	st.timeout = g.timeout
-	st.query = make([]u8, len(query))
-	copy(st.query, query)
-	st.jobs = make([]Race_Job, len(candidates))
 	st.group = g
 	defer race_state_release(st)
+	query_built, jobs_built: bool
+	st.query, query_built = dns.alloc_slice([]u8, len(query), context.allocator)
+	st.jobs, jobs_built = dns.alloc_slice([]Race_Job, len(candidates), context.allocator)
+	if !query_built || !jobs_built {
+		return nil, nil, .Out_Of_Memory
+	}
+	copy(st.query, query)
 
 	submitted := 0
 	for u, i in candidates {

@@ -292,12 +292,26 @@ start_refresh :: proc(
 		return nil
 	}
 
+	// Declined, like a full table, where the heap has no room for what the job
+	// holds: a refresh of an empty query would be charged to the upstream.
 	r := new(Refresh)
+	if r == nil {
+		sync.mutex_unlock(&s.refreshes.mu)
+		return nil
+	}
 	r.allocator = context.allocator
-	r.key = strings.clone(key, r.allocator)
-	r.query = make([]u8, len(query), r.allocator)
+	key_err, client_err: mem.Allocator_Error
+	query_built: bool
+	r.key, key_err = strings.clone(key, r.allocator)
+	r.query, query_built = dns.alloc_slice([]u8, len(query), r.allocator)
+	r.client, client_err = strings.clone(client, r.allocator)
+	if key_err != nil || !query_built || client_err != nil {
+		sync.mutex_unlock(&s.refreshes.mu)
+		r.refs = 1
+		refresh_release(r)
+		return nil
+	}
 	copy(r.query, query)
-	r.client = strings.clone(client, r.allocator)
 	r.server = s
 	r.proto = proto
 	r.limit = limit

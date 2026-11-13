@@ -314,8 +314,13 @@ handed. The copies live in the same scratch space and go the same way.
 */
 @(private)
 read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int, ok: bool) {
-	hold :: proc(s: string) -> string {
-		return strings.clone(s, context.temp_allocator)
+	// A field this server has no room to keep ends the request unanswered,
+	// rather than reading as an empty one the client sent.
+	held := true
+	hold :: proc(s: string, held: ^bool) -> string {
+		out, err := strings.clone(s, context.temp_allocator)
+		held^ &&= err == nil && len(out) == len(s)
+		return out
 	}
 	line := http_line(r) or_return
 
@@ -368,15 +373,15 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	if !h2.is_token(line[:first]) || !h2.target_is_valid(target) {
 		return {}, 400, false
 	}
-	req.method = hold(line[:first])
+	req.method = hold(line[:first], &held)
 	http_1_0 := version == "HTTP/1.0"
 	req.keep_alive = !http_1_0
 
 	if q := strings.index_byte(target, '?'); q >= 0 {
-		req.path = hold(target[:q])
-		req.query = hold(target[q + 1:])
+		req.path = hold(target[:q], &held)
+		req.query = hold(target[q + 1:], &held)
 	} else {
-		req.path = hold(target)
+		req.path = hold(target, &held)
 	}
 
 	// -1 rather than 0, so a second Content-Length can be told from the first.
@@ -462,7 +467,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 				malformed = true
 				continue
 			}
-			req.content_type = hold(value)
+			req.content_type = hold(value, &held)
 		case dns.name_equal_fold(name, "host"):
 			/*
 			RFC 9112 3.2: a request carrying more than one Host is a 400, whether
@@ -479,12 +484,18 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 				malformed = true
 				continue
 			}
-			req.host = hold(value)
+			req.host = hold(value, &held)
 		case dns.name_equal_fold(name, "transfer-encoding"):
 			// Chunked request bodies are not accepted; DoH clients send a
 			// Content-Length.
 			return {}, 0, false
 		}
+	}
+
+	// Before the body is waited for: a request this server cannot keep is not
+	// answered whatever follows.
+	if !held {
+		return {}, 0, false
 	}
 
 	// RFC 9112 3.2 again: Host carries the authority for an origin-form target,

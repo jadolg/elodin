@@ -244,8 +244,8 @@ test_a_bootstrap_query_waits_to_the_deadline_it_is_given :: proc(t: ^testing.T) 
 
 	udp_waits_reset()
 	deadline := time.tick_add(time.tick_now(), X_TIMEOUT)
-	_, ok := bootstrap_resolve(servers, "given.example.test", deadline)
-	testing.expect(t, !ok, "resolved with nothing answering")
+	_, err := bootstrap_resolve(servers, "given.example.test", deadline)
+	testing.expect_value(t, err, Error.Not_Resolved)
 	if testing.expectf(t, udp_wait_count >= 2, "%d UDP waits, where A's send and read were expected", udp_wait_count) {
 		testing.expectf(t, udp_waits[0].deadline == deadline, "A waited %v past the deadline it was given", time.tick_diff(deadline, udp_waits[0].deadline))
 	}
@@ -278,8 +278,8 @@ test_a_dead_bootstrap_server_leaves_time_for_the_next :: proc(t: ^testing.T) {
 		net.endpoint_to_string(b, context.temp_allocator),
 	}
 
-	_, ok := bootstrap_resolve(servers, "failover.example.test", time.tick_add(time.tick_now(), X_TIMEOUT))
-	testing.expect(t, !ok, "resolved with nothing answering")
+	_, err := bootstrap_resolve(servers, "failover.example.test", time.tick_add(time.tick_now(), X_TIMEOUT))
+	testing.expect_value(t, err, Error.Not_Resolved)
 
 	set_socket_timeouts(second, 10 * time.Millisecond)
 	buf: [512]u8
@@ -304,8 +304,8 @@ test_a_bootstrap_servers_a_query_has_its_whole_share :: proc(t: ^testing.T) {
 	defer net.close(socket)
 	servers := []string{net.endpoint_to_string(bound, context.temp_allocator)}
 
-	_, ok := bootstrap_resolve(servers, "share.example.test", time.tick_add(time.tick_now(), X_TIMEOUT))
-	testing.expect(t, !ok, "resolved with nothing answering")
+	_, err := bootstrap_resolve(servers, "share.example.test", time.tick_add(time.tick_now(), X_TIMEOUT))
+	testing.expect_value(t, err, Error.Not_Resolved)
 
 	set_socket_timeouts(socket, 10 * time.Millisecond)
 	buf: [512]u8
