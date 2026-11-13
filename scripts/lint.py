@@ -35,7 +35,7 @@ TREE = [
      "strings.equal_fold folds Unicode (ſ matches s); use dns.name_equal_fold"),
     ("trim-space-http", r"\bstrings\.trim_space\(", is_http,
      "strings.trim_space strips NBSP, VT and FF, which are not HTTP OWS; use trim_ows"),
-    ("strconv-int", r"\bstrconv\.parse_(int|uint|i(8|16|32|64|128)|u(8|16|32|64|128))\(",
+    ("strconv-int", r"\bstrconv\.(parse_(int|uint|i(8|16|32|64|128)|u(8|16|32|64|128))(_of_base|_maybe_prefixed)?|atoi)\(",
      lambda p: not is_test(p) and not p.startswith(KERNEL_READERS),
      "strconv's integer parsers take + and _ and wrap on overflow; read digits-only and bounded (parse_rdata_u16)"),
     ("case-map", r"\bstrings\.to_(lower|upper)\(", lambda p: not is_test(p),
@@ -65,7 +65,9 @@ def odin_files():
 
 
 def added_lines(base):
-    diff = subprocess.run(["git", "diff", "-U0", "--no-color", base, "--", "*.odin"], cwd=ROOT,  # nosec B603 B607
+    # Prefixes fixed, so a user's diff.noprefix or diff.mnemonicPrefix can't hide the paths.
+    diff = subprocess.run(["git", "diff", "-U0", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/",
+                           base, "--", "*.odin"], cwd=ROOT,  # nosec B603 B607
                           capture_output=True, text=True, check=True).stdout
     path, line = None, 0
     for text in diff.splitlines():
@@ -89,12 +91,19 @@ def check(rules, path, n, text, hits):
 def expect_formats(path, source, hits):
     """`testing.expect` calls, however many lines they span, whose last argument is a string holding `%`."""
     for m in re.finditer(r"\btesting\.expect\(", source):
+        line_start = source.rfind("\n", 0, m.start()) + 1
+        if "//" in source[line_start:m.start()]:
+            continue
         depth, i, args, start = 1, m.end(), [], m.end()
         while i < len(source) and depth:
             c = source[i]
             if c == '"':
                 i += 1
                 while i < len(source) and source[i] != '"':
+                    i += 2 if source[i] == "\\" else 1
+            elif c == "'":
+                i += 1
+                while i < len(source) and source[i] != "'":
                     i += 2 if source[i] == "\\" else 1
             elif c == "`":
                 i = source.find("`", i + 1)
@@ -109,7 +118,8 @@ def expect_formats(path, source, hits):
                 start = i + 1
             i += 1
         args.append(source[start:i - 1])
-        last = [a.strip() for a in args if a.strip()][-1]
+        given = [a.strip() for a in args if a.strip()]
+        last = given[-1] if given else ""
         n = source.count("\n", 0, m.start()) + 1
         line = source.splitlines()[n - 1]
         if re.fullmatch(r'"(?:[^"\\]|\\.)*%(?:[^"\\]|\\.)*"', last) and not ALLOW.search(line):

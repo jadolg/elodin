@@ -18,6 +18,9 @@ LINES = [
     (lint.TREE, PROD, 'n, ok := strconv.parse_uint(s)', "strconv-int"),
     (lint.TREE, "src/metrics/x.odin", 'n, ok := strconv.parse_u64(s)', None),
     (lint.TREE, PROD, 'v, ok := strconv.parse_f64(s)', None),
+    (lint.TREE, PROD, 'n, ok := strconv.parse_i64_of_base(s, 10)', "strconv-int"),
+    (lint.TREE, PROD, 'n, ok := strconv.parse_u64_maybe_prefixed(s)', "strconv-int"),
+    (lint.TREE, PROD, 'n := strconv.atoi(s)', "strconv-int"),
     (lint.TREE, PROD, 'switch strings.to_lower(s, a) {', "case-map"),
     (lint.TREE, PROD, "// see resolver.odin:12", "line-number"),
     (lint.TREE, PROD, "/* see resolver.odin:12 */", "line-number"),
@@ -42,6 +45,11 @@ SOURCES = [
     ('testing.expect(t, ok, "100\\" done")\n', False),
     ('testing.expect(t, ok, "a \\") b %v")\n', True),
     ('testing.expectf(t, ok, "got %v", x)\n', False),
+    ('// call testing.expect() here\n', False),
+    ('// testing.expect(t, ok, "got %v")\n', False),
+    ('testing.expect()\n', False),
+    ("testing.expect(t, c == '(', \"got %v\")\n", True),
+    ("testing.expect(t, c == '\\'', \"got %v\")\n", True),
     ('testing.expect(t, ok, "got %v") // lint:allow a literal percent\n', False),
 ]
 
