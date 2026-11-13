@@ -69,7 +69,7 @@ ff02::3 ip6-allhosts
 
 	// The fold is ASCII: `ſ` (U+017F) folds to `s` under Unicode, but a name
 	// spelled with it is no housekeeping name. It is refused as not ASCII.
-	long_s, long_s_allow := build("0.0.0.0 localhoſt\n", .Hosts)
+	long_s, long_s_allow := build("0.0.0.0 localho\u017ft\n", .Hosts)
 	defer set_destroy(long_s)
 	defer set_destroy(long_s_allow)
 	testing.expect_value(t, long_s.count, 0)

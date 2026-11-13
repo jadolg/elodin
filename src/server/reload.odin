@@ -6,6 +6,7 @@ import "core:reflect"
 import "core:strings"
 import "elodin:cache"
 import "elodin:config"
+import "elodin:dns"
 import "elodin:filter"
 import "elodin:logx"
 
@@ -319,7 +320,7 @@ parts_text :: proc(parts: Parts, allocator := context.allocator) -> string {
 	for part in Part {
 		if part in parts {
 			name, _ := reflect.enum_name_from_value(part)
-			append(&names, strings.to_lower(name, context.temp_allocator))
+			append(&names, dns.name_fold(name, context.temp_allocator))
 		}
 	}
 	if len(names) == 0 {

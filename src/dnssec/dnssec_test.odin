@@ -188,7 +188,7 @@ test_parse_trust_anchor :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, lower_ok, "a lower-case type should parse")
 	_, long_s_ok := parse_trust_anchor(
-		". IN Dſ 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+		". IN D\u017f 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
 		context.temp_allocator,
 	)
 	testing.expect(t, !long_s_ok, "a type spelled with U+017F must not read as DS")

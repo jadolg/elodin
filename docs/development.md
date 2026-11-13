@@ -98,13 +98,16 @@ with `--leak`, `fuzz-regression` with `--fuzz`) and pushes only if all pass;
 whose every check passed.
 
 **Lint** (`scripts/lint.py`, part of `check`) refuses patterns that reviews kept
-finding. Some rules hold for the whole tree (`strings.equal_fold` outside tests,
-`strings.trim_space` in HTTP code, `strconv`'s integer parsers on config and wire
-input, a format in `testing.expect`, a line number in a comment); others only for
+finding. Some rules hold for the whole tree (`strings.equal_fold` and
+`strings.to_lower` outside tests, `strings.trim_space` in HTTP code, `strconv`'s
+integer parsers on config and wire input, a format in `testing.expect`, a
+`.odin:<line>` reference); others only for
 lines a branch adds, diffed against `LINT_BASE` (default: the merge base with
 `origin/main`): a discarded error or `ok` in a test, `time.sleep` and `time.now`
 in tests, and comments narrating history. A deliberate exception carries
-`lint:allow <reason>` on its line.
+`lint:allow <reason>` on its line. `scripts/lint_test.py` holds each rule to what
+it refuses and allows, and `.claude/hooks/guard_test.py` does the same for the
+Claude Code hook; `check` runs both.
 
 **Unit tests** (`mise run test`) run per package, so a failure names one. One
 test on its own is `odin test src/<pkg> -collection:elodin=src

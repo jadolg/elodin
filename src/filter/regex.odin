@@ -410,7 +410,7 @@ regex_shortcut :: proc(pattern: string, allocator: mem.Allocator) -> string {
 	if len(longest) <= 1 {
 		return ""
 	}
-	return strings.to_lower(longest, allocator)
+	return dns.name_fold(longest, allocator)
 }
 
 /*

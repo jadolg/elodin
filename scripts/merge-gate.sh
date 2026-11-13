@@ -20,8 +20,8 @@ pr_head=$(gh pr view "$pr" --json headRefOid -q .headRefOid)
 [ "$head" = "$pr_head" ] || fail "local HEAD $head is not the PR head $pr_head: push first"
 
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-# Every check run on the head: none pending, none failed, and CI's own jobs among
-# them, so a head whose workflow has not registered yet does not pass on an
+# Every check run on the head: none pending, none failed, and the ones every PR
+# gets among them, so a head nothing has reported on yet does not pass on an
 # empty list.
 gh api --paginate "repos/$repo/commits/$head/check-runs?per_page=100" \
 	-q '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv' > "${TMPDIR:-/tmp}/merge-gate-$pr.tsv"
@@ -31,8 +31,12 @@ rows = [line.rstrip("\n").split("\t") for line in open(sys.argv[1]) if line.stri
 bad = [r for r in rows if r[1] != "completed" or r[2] not in ("success", "skipped", "neutral")]
 for name, status, conclusion in bad:
     print(f"  {name}: {status} {conclusion}", file=sys.stderr)
-if not any(r[0] == "Style check" for r in rows):
-    print("  no 'Style check' run on this head yet", file=sys.stderr)
+# CI's jobs register together, so its Style check stands for all of them; the
+# apps report on their own and may not have started yet.
+missing = {"Style check", "Codacy Static Code Analysis", "GitGuardian Security Checks"} - {r[0] for r in rows}
+for name in sorted(missing):
+    print(f"  {name}: no run on this head yet", file=sys.stderr)
+if missing:
     sys.exit(1)
 sys.exit(1 if bad else 0)
 EOF
