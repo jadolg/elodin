@@ -88,41 +88,45 @@ def check(rules, path, n, text, hits):
             hits.append(f"{path}:{n}: {name}: {message}\n    {text.strip()}")
 
 
+def skip_literal(source, i):
+    """The index of the quote closing the literal opened at `i`, escapes and raw strings respected."""
+    quote = source[i]
+    if quote == "`":
+        end = source.find("`", i + 1)
+        return len(source) if end < 0 else end
+    i += 1
+    while i < len(source) and source[i] != quote:
+        i += 2 if source[i] == "\\" else 1
+    return i
+
+
+def call_args(source, i):
+    """The arguments of the call whose `(` ends just before `i`, as written."""
+    depth, args, start = 1, [], i
+    while i < len(source) and depth:
+        c = source[i]
+        if c in "\"'`":
+            i = skip_literal(source, i)
+        elif c in "([{)]}":
+            depth += 1 if c in "([{" else -1
+        elif c == "," and depth == 1:
+            args.append(source[start:i])
+            start = i + 1
+        i += 1
+    args.append(source[start:i - 1])
+    return [a.strip() for a in args if a.strip()]
+
+
 def expect_formats(path, source, hits):
     """`testing.expect` calls, however many lines they span, whose last argument is a string holding `%`."""
     for m in re.finditer(r"\btesting\.expect\(", source):
         line_start = source.rfind("\n", 0, m.start()) + 1
         if "//" in source[line_start:m.start()]:
             continue
-        depth, i, args, start = 1, m.end(), [], m.end()
-        while i < len(source) and depth:
-            c = source[i]
-            if c == '"':
-                i += 1
-                while i < len(source) and source[i] != '"':
-                    i += 2 if source[i] == "\\" else 1
-            elif c == "'":
-                i += 1
-                while i < len(source) and source[i] != "'":
-                    i += 2 if source[i] == "\\" else 1
-            elif c == "`":
-                i = source.find("`", i + 1)
-                if i < 0:
-                    break
-            elif c in "([{":
-                depth += 1
-            elif c in ")]}":
-                depth -= 1
-            elif c == "," and depth == 1:
-                args.append(source[start:i])
-                start = i + 1
-            i += 1
-        args.append(source[start:i - 1])
-        given = [a.strip() for a in args if a.strip()]
-        last = given[-1] if given else ""
+        given = call_args(source, m.end())
         n = source.count("\n", 0, m.start()) + 1
         line = source.splitlines()[n - 1]
-        if re.fullmatch(r'"(?:[^"\\]|\\.)*%(?:[^"\\]|\\.)*"', last) and not ALLOW.search(line):
+        if given and re.fullmatch(r'"(?:[^"\\]|\\.)*%(?:[^"\\]|\\.)*"', given[-1]) and not ALLOW.search(line):
             hits.append(f"{path}:{n}: expect-format: testing.expect does not format its message; use testing.expectf\n    {line.strip()}")
 
 

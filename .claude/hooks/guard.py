@@ -42,28 +42,34 @@ def segments(command):
     command = re.sub(r"(<<-?\s*(['\"]?)(\w+)\2[^\n]*\n).*?\n\s*\3\s*(\n|$)", r"\1", command, flags=re.S)
     out = []
     for line in command.split("\n"):
-        if line.lstrip().startswith("#"):
-            continue
-        lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        try:
-            words = list(lexer)
-        except ValueError:  # an unclosed quote: judge the line's words as written
-            words = line.split()
-        seg = []
-        for w in words:
-            # shlex keeps a run of punctuation as one word (`);`, `)&&`).
-            if w and set(w) <= set(";&|()"):
-                if seg:
-                    out.append(seg)
-                seg = []
-                out.extend(c for c in w if c in SUBSHELL)
-            else:
-                seg.append(w)
-        if seg:
-            out.append(seg)
+        if not line.lstrip().startswith("#"):
+            out.extend(split_at_operators(line_words(line)))
     return out
+
+
+def line_words(line):
+    """One line's words, operators apart; `#` is a comment only at the start of a line."""
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:  # an unclosed quote: judge the line's words as written
+        return line.split()
+
+
+def split_at_operators(words):
+    """`words` cut into simple commands at operators, keeping "(" and ")"."""
+    out, seg = [], []
+    for w in words:
+        # shlex keeps a run of punctuation as one word (`);`, `)&&`).
+        if w and set(w) <= set(";&|()"):
+            out.extend([seg] if seg else [])
+            out.extend(c for c in w if c in SUBSHELL)
+            seg = []
+        else:
+            seg.append(w)
+    return out + ([seg] if seg else [])
 
 
 def skip_options(words, i, wrapper):
@@ -141,34 +147,36 @@ def names_a_commit(where, target):
     return False
 
 
-def git_switch_dir(words, cwd):
-    """The directory a `git switch`/`git checkout` that changes branch runs in, else None."""
+def git_subcommand(words, cwd):
+    """A git command's directory (after any -C), subcommand and its arguments; None for another command."""
     if not words or words[0] != "git":
         return None
     i, where = 1, cwd
     while i < len(words) and words[i].startswith("-"):
         if words[i] == "-C" and i + 1 < len(words):
             where = os.path.join(where, os.path.expanduser(words[i + 1]))
-            i += 2
-        elif words[i] in ("-c", "--git-dir", "--work-tree"):
-            i += 2
-        else:
-            i += 1
-    if i >= len(words):
-        return None
-    sub, args = words[i], words[i + 1:]
-    if sub == "switch":
-        return where
+        i += 2 if words[i] in ("-C", "-c", "--git-dir", "--work-tree") else 1
+    return (where, words[i], words[i + 1:]) if i < len(words) else None
+
+
+NEW_BRANCH = {"-b", "-B", "--detach", "--orphan"}
+
+
+def changes_branch(where, sub, args):
+    """Whether a `switch`/`checkout` changes branch. A checkout with one target naming a commit
+    does; a path, a deleted file, `--` or more than one target is a restore."""
+    if sub == "switch" or (sub == "checkout" and NEW_BRANCH & set(args)):
+        return True
     if sub != "checkout" or "--" in args:
-        return None
-    if any(a in ("-b", "-B", "--detach", "--orphan") for a in args):
-        return where
+        return False
     targets = [a for a in args if not a.startswith("-")]
-    # One target naming a commit is a switch; a path, a deleted file or more
-    # than one target is a restore.
-    if len(targets) == 1 and os.path.isdir(where) and names_a_commit(where, targets[0]):
-        return where
-    return None
+    return len(targets) == 1 and os.path.isdir(where) and names_a_commit(where, targets[0])
+
+
+def git_switch_dir(words, cwd):
+    """The directory a `git switch`/`git checkout` that changes branch runs in, else None."""
+    git = git_subcommand(words, cwd)
+    return git[0] if git and changes_branch(*git) else None
 
 
 def is_asan_run(words):
