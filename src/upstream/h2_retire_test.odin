@@ -259,10 +259,7 @@ test_finished_h2_readers_leave_no_count_behind :: proc(t: ^testing.T) {
 			retire_h2_conn(old)
 		}
 		_ = net.shutdown(socket, .Receive)
-		start := time.tick_now()
-		for h2_readers_running(u) > 0 && time.tick_since(start) < 3 * time.Second {
-			time.sleep(time.Millisecond)
-		}
+		_ = readers_gone(u)
 	}
 	testing.expect_value(t, h2_readers_running(u), 0)
 }

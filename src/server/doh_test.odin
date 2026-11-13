@@ -1554,8 +1554,9 @@ inside every idle wait could hold a connection and one of `max_connections`
 forever, and the rate limiter would never see it. It is let go once twice
 `client_timeout` passes with no question asked - see `doh_question_overdue`.
 
-The peer here keeps asking for three seconds; the server must hang up before
-that, rather than when the peer stops.
+The peer here keeps asking until the server hangs up, or for a second, which is
+over three times what `doh_question_overdue` allows at this `client_timeout`;
+the server must hang up before that, rather than when the peer stops.
 */
 @(test)
 test_doh_lets_go_of_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
@@ -1572,7 +1573,7 @@ test_doh_lets_go_of_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
 	asker := thread.create_and_start_with_poly_data(&peer, ask_the_wrong_path)
 	// Only there to end the case when the server never hangs up, which is the bug.
 	stopper := thread.create_and_start_with_poly_data(&peer, proc(p: ^Wrong_Path_Peer) {
-		if !sync.sema_wait_with_timeout(&p.returned, 3 * time.Second) {
+		if !sync.sema_wait_with_timeout(&p.returned, time.Second) {
 			sync.atomic_store(&p.forced, true)
 		}
 		sync.atomic_store(&p.stop, true)
