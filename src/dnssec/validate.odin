@@ -516,6 +516,38 @@ readings is bounded only by its own length. Borrowed from the caller
 	its lifetime, rather than missed and walked for again by the next proof.
 	*/
 	began:         loop.Moment,
+	/*
+	Set where an allocation of this question's is refused, or nil where nobody
+	is watching. A walk that ran dry may have judged a set an append dropped a
+	record from, so nothing it settles is cached; `validate` reports the whole
+	question undecided.
+	*/
+	dry:           ^bool,
+	/*
+	The temp allocator the question came with, under `validate`'s watch, or
+	zero where nobody is watching. `look_up` hands it back to the lookup, which
+	can start work that outlives the validation - a race's legs - and the watch
+	lives in `validate`'s frame.
+	*/
+	scratch:       mem.Allocator,
+}
+
+/*
+Ask `v.query` for `name`, with the temp allocator the question came with rather
+than the watch over it; see `Budget.scratch`. A lookup refused memory reports
+its own failure.
+*/
+@(private)
+look_up :: proc(v: ^Validator, budget: ^Budget, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+	// Not in an `if`: a context assignment lasts only to the end of its block.
+	context.temp_allocator = budget.scratch if budget.scratch.procedure != nil else context.temp_allocator
+	return v.query(v.query_ctx, name, type, allocator, budget.deadline)
+}
+
+// Whether this question has been refused memory; see `Budget.dry`.
+@(private)
+ran_dry :: proc(budget: ^Budget) -> bool {
+	return budget != nil && budget.dry != nil && budget.dry^
 }
 
 // `Budget.began`, or the clock for a budget built without one.
@@ -541,7 +573,8 @@ Why a step stopped when the request had already taken what it may to read what
 it was sent.
 
 A reading refused for `dns.REQUEST_DECODE_BUDGET`, or for the memory to hold it
-(`dns.reading_refused`), is this server declining to read any more of what it
+(`dns.reading_refused`), or any allocation of the validation refused (see
+`validate`), is this server declining to read any more of what it
 was sent, so the step established nothing - the same report an unanswered lookup
 gets, code 22, and deliberately not `Bogus`. The reply may be perfectly genuine;
 what ran out is ours. See issues #354 and #620.
@@ -1262,6 +1295,12 @@ Decide whether a response is authentic.
 `wire` is the upstream's answer to the client's question, fetched with DO and CD
 set. `now` is passed in rather than read here so the tests can pin it inside the
 validity window of the captured signatures.
+
+A validation that is refused memory - by `allocator` or the temp allocator,
+anywhere in it - is `Indeterminate` for `READING_OVER_BUDGET` whatever its steps
+reached, and leaves the zone cache as it was: a refused allocation can drop a
+DS, a key or a signature from the set a step judges, and the verdict on what was
+left is not about the zone (issue #636).
 */
 validate :: proc(
 	v: ^Validator,
@@ -1294,9 +1333,39 @@ validate :: proc(
 	// The client question's upstream deadline, for the lookups; see `Query_Proc`.
 	deadline: ^time.Tick = nil,
 ) -> Result {
+	dry := false
+	outer := context.temp_allocator
+	answers := dns.Dry_Watch{backing = allocator, dry = &dry}
+	scratch := dns.Dry_Watch{backing = outer, dry = &dry}
+	context.temp_allocator = dns.dry_watch_allocator(&scratch)
+	result := validate_watched(v, qname, qtype, wire, now, dns.dry_watch_allocator(&answers), pool, spent, deadline, &dry, outer)
+	if dry {
+		return {status = .Indeterminate, reason = READING_OVER_BUDGET}
+	}
+	return result
+}
+
+// `validate`'s body, with `dry` set where an allocation is refused; see
+// `Budget.dry` and `Budget.scratch`.
+@(private)
+validate_watched :: proc(
+	v: ^Validator,
+	qname: string,
+	qtype: dns.Type,
+	wire: []u8,
+	now: time.Time,
+	allocator: mem.Allocator,
+	pool: Walk_Pool,
+	spent: ^int,
+	deadline: ^time.Tick,
+	dry: ^bool,
+	scratch: mem.Allocator,
+) -> Result {
 	// Read before the decode, so the walk's moment trails `now` by as little
 	// as it can; see `Budget.began`.
 	budget := query_budget(v)
+	budget.dry = dry
+	budget.scratch = scratch
 	msg, derr := dns.decode_message(wire, allocator, spent)
 	if derr != .None {
 		/*
@@ -1541,13 +1610,21 @@ strip_unauthenticated :: proc(
 	if result.status != .Secure {
 		return wire, true
 	}
-	msg, derr := dns.decode_message(wire, allocator, spent)
+	// A signature whose signer cannot be read for want of memory is dropped
+	// like one that does not parse, so a prune that ran dry is no prune.
+	dry := false
+	watched := dns.Dry_Watch{backing = allocator, dry = &dry}
+	scratch := dns.Dry_Watch{backing = context.temp_allocator, dry = &dry}
+	context.temp_allocator = dns.dry_watch_allocator(&scratch)
+	watching := dns.dry_watch_allocator(&watched)
+
+	msg, derr := dns.decode_message(wire, watching, spent)
 	if derr != .None {
 		return nil, false
 	}
-	msg.answer = authenticated_only(msg.answer, result.answer, allocator)
-	msg.authority = authenticated_only(msg.authority, result.authority, allocator)
-	msg.additional = authenticated_and_opt(msg.additional, result.additional, allocator)
+	msg.answer = authenticated_only(msg.answer, result.answer, watching) or_return
+	msg.authority = authenticated_only(msg.authority, result.authority, watching) or_return
+	msg.additional = authenticated_and_opt(msg.additional, result.additional, watching) or_return
 
 	/*
 	A truncated rebuild is a failure, not a result. `encode_message` drops
@@ -1566,8 +1643,8 @@ strip_unauthenticated :: proc(
 	Which is not a limit this is called with: the one caller in the server passes
 	`dns.MAX_MESSAGE`, and so does the default here.
 	*/
-	encoded, truncated, enc := dns.encode_message(msg, allocator, limit)
-	if enc != .None || truncated {
+	encoded, truncated, enc := dns.encode_message(msg, watching, limit)
+	if enc != .None || truncated || dry {
 		return nil, false
 	}
 	return encoded, true
@@ -1770,18 +1847,21 @@ authenticated_only :: proc(
 	section: []dns.Record,
 	kept: []Authenticated_Set,
 	allocator: mem.Allocator,
-) -> []dns.Record {
+) -> (
+	records: []dns.Record,
+	ok: bool,
+) {
 	// Nothing in this section was authenticated, so nothing in it survives. Worth
 	// saying up front: a denial names no RRsets in the answer section, and the
 	// loop below would otherwise parse and allocate a signer name for every RRSIG
 	// sitting there before dropping the lot.
 	if len(kept) == 0 {
-		return nil
+		return nil, true
 	}
 	// Signatures kept for each authenticated RRset beyond the one that verified,
 	// and whether that one has been kept already.
-	sigs_kept := make([]int, len(kept), allocator)
-	verified_kept := make([]bool, len(kept), allocator)
+	sigs_kept := dns.alloc_slice([]int, len(kept), allocator) or_return
+	verified_kept := dns.alloc_slice([]bool, len(kept), allocator) or_return
 	/*
 	RFC 4035 section 5.3.3: the set and its RRSIGs go out with one TTL, no more
 	than the least of the set's received TTLs, the verified RRSIG's received
@@ -1790,12 +1870,12 @@ authenticated_only :: proc(
 	received would let an on-path sender keep a signed answer cached long after
 	its signer meant. `owner` is the set each kept record belongs to.
 	*/
-	set_ttl := make([]u32, len(kept), allocator)
+	set_ttl := dns.alloc_slice([]u32, len(kept), allocator) or_return
 	for k, i in kept {
 		set_ttl[i] = k.ttl
 	}
-	owner := make([dynamic]int, 0, len(section), allocator)
-	out := make([dynamic]dns.Record, 0, len(section), allocator)
+	owner := dns.alloc_list([dynamic]int, len(section), allocator) or_return
+	out := dns.alloc_list([dynamic]dns.Record, len(section), allocator) or_return
 	for rec in section {
 		covered := rec.type
 		signer: string
@@ -1848,8 +1928,8 @@ authenticated_only :: proc(
 			signer = sig.signer
 			parsed = sig
 		}
-		idx, ok := authenticated_rrset(kept, rec.name, covered, rec.class)
-		if !ok {
+		idx, vouched := authenticated_rrset(kept, rec.name, covered, rec.class)
+		if !vouched {
 			continue
 		}
 		if rec.type == .RRSIG {
@@ -1885,7 +1965,7 @@ authenticated_only :: proc(
 	for &rec, i in out {
 		rec.ttl = set_ttl[owner[i]]
 	}
-	return out[:]
+	return out[:], true
 }
 
 /*
@@ -1914,16 +1994,21 @@ authenticated_and_opt :: proc(
 	section: []dns.Record,
 	kept: []Authenticated_Set,
 	allocator: mem.Allocator,
-) -> []dns.Record {
-	hints := authenticated_only(section, kept, allocator)
-	out := make([dynamic]dns.Record, 0, len(hints) + 1, allocator)
+) -> (
+	records: []dns.Record,
+	ok: bool,
+) {
+	hints := authenticated_only(section, kept, allocator) or_return
+	out := dns.alloc_list([dynamic]dns.Record, len(hints) + 1, allocator) or_return
 	append(&out, ..hints)
 	for rec in section {
 		if rec.type == .OPT {
-			append(&out, rec)
+			if _, aerr := append(&out, rec); aerr != nil {
+				return nil, false
+			}
 		}
 	}
-	return out[:]
+	return out[:], true
 }
 
 // Like `already_seen`, but the class is part of the question here: a record of
@@ -4006,7 +4091,7 @@ zone_step :: proc(
 	if !spend_lookup(budget) {
 		return walk_gave_up(budget, LOOKUPS_SPENT), nil
 	}
-	wire, ok := v.query(v.query_ctx, child, .DS, allocator, budget.deadline)
+	wire, ok := look_up(v, budget, child, .DS, allocator)
 	if !ok {
 		return walk_gave_up(budget, CHAIN_UNAVAILABLE), nil
 	}
@@ -4104,7 +4189,7 @@ zone_step :: proc(
 		}
 		switch kstatus {
 		case .Insecure:
-			cache_put(v, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), walk_began(budget), sig_lapses(ds_sig, unix))
+			cache_put(v, budget, child, .Insecure, nil, min(rrset_ttl(ds_records), ds_sig.original_ttl), walk_began(budget), sig_lapses(ds_sig, unix))
 			return .Insecure, nil
 		case .Bogus:
 			return .Bogus, nil
@@ -4134,7 +4219,7 @@ zone_step :: proc(
 		// Held to both RRsets the keys rest on and the signatures over them:
 		// the parent's over the DS and the zone's own over its DNSKEY set.
 		ttl := min(rrset_ttl(ds_records), ds_sig.original_ttl, keys_ttl, keys_sig.original_ttl)
-		cache_put(v, child, .Secure, child_keys, ttl, walk_began(budget), min(sig_lapses(ds_sig, unix), sig_lapses(keys_sig, unix)))
+		cache_put(v, budget, child, .Secure, child_keys, ttl, walk_began(budget), min(sig_lapses(ds_sig, unix), sig_lapses(keys_sig, unix)))
 		return .Secure, child_keys
 	}
 
@@ -4158,7 +4243,7 @@ zone_step :: proc(
 		return walk_gave_up(budget, exhausted_reason(budget)), nil
 	}
 	if cname_ok {
-		non_cut_remember(v, child, min(rrset_ttl(cname), cname_sig.original_ttl), walk_began(budget), sig_lapses(cname_sig, unix))
+		non_cut_remember(v, budget, child, min(rrset_ttl(cname), cname_sig.original_ttl), walk_began(budget), sig_lapses(cname_sig, unix))
 		return .No_Cut, nil
 	}
 
@@ -4238,7 +4323,7 @@ zone_step :: proc(
 	}
 	switch step {
 	case .Insecure:
-		cache_put(v, child, .Insecure, nil, min(negative_ttl(msg), sets_original_ttl(proved)), walk_began(budget), sets_lapse(proved, unix))
+		cache_put(v, budget, child, .Insecure, nil, min(negative_ttl(msg), sets_original_ttl(proved)), walk_began(budget), sets_lapse(proved, unix))
 	case .No_Cut:
 		/*
 		Remembered for the denial's own negative TTL, held to the Original TTL
@@ -4263,7 +4348,7 @@ zone_step :: proc(
 		is nothing to win: the answer cache holds the NXDOMAIN, so the same
 		question does not come back here anyway.
 		*/
-		non_cut_remember(v, child, min(negative_ttl(msg), sets_original_ttl(proved)), walk_began(budget), sets_lapse(proved, unix))
+		non_cut_remember(v, budget, child, min(negative_ttl(msg), sets_original_ttl(proved)), walk_began(budget), sets_lapse(proved, unix))
 	case .Secure, .Absent, .Bogus, .Indeterminate:
 	}
 	return step, nil
@@ -4412,7 +4497,7 @@ fetch_keys :: proc(
 		budget.walk_stopped = LOOKUPS_SPENT
 		return nil, .Indeterminate, {}, 0
 	}
-	wire, ok := v.query(v.query_ctx, zone, .DNSKEY, allocator, budget.deadline)
+	wire, ok := look_up(v, budget, zone, .DNSKEY, allocator)
 	if !ok {
 		return nil, .Indeterminate, {}, 0
 	}
@@ -4648,7 +4733,7 @@ zone_keys :: proc(
 	if fstatus != .Secure {
 		return fstatus, nil
 	}
-	cache_put(v, zone, .Secure, fetched, min(keys_ttl, vouched.original_ttl), walk_began(budget), sig_lapses(vouched, unix))
+	cache_put(v, budget, zone, .Secure, fetched, min(keys_ttl, vouched.original_ttl), walk_began(budget), sig_lapses(vouched, unix))
 	return .Secure, fetched
 }
 
@@ -4814,9 +4899,13 @@ non_cut_drop :: proc(v: ^Validator, key: string) {
 
 // Remember one, clamped so a denial naming no TTL still expires and one naming
 // a year is not believed for one. The name in the slot gives way, which is the
-// whole of the replacement policy; see `Validator.non_cuts`.
+// whole of the replacement policy; see `Validator.non_cuts`. Nothing, for a
+// question that has run dry (`ran_dry`).
 @(private)
-non_cut_remember :: proc(v: ^Validator, name: string, ttl: u32, now: loop.Moment, lapses := max(u32)) {
+non_cut_remember :: proc(v: ^Validator, budget: ^Budget, name: string, ttl: u32, now: loop.Moment, lapses := max(u32)) {
+	if ran_dry(budget) {
+		return
+	}
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
 	key, key_ok := dns.fold_into(name, fold_buf[:])
 	if !key_ok {
@@ -4873,9 +4962,13 @@ clear_non_cuts :: proc(v: ^Validator) {
 // `now` is on the moment clock `cache_get` and `sweep` read: the walk's
 // `Budget.began`, the instant `lapses` is counted from and the walk reads the
 // cache at. It is in the past, so an entry whose lifetime the walk has already
-// outrun is stored expired to every later walk and to `sweep`.
+// outrun is stored expired to every later walk and to `sweep`. Nothing is
+// stored for a question that has run dry (`ran_dry`).
 @(private)
-cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, ttl: u32, now: loop.Moment, lapses := max(u32)) {
+cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, keys: []Dnskey, ttl: u32, now: loop.Moment, lapses := max(u32)) {
+	if ran_dry(budget) {
+		return
+	}
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
 	key, key_ok := dns.fold_into(zone, fold_buf[:])
 	if !key_ok {
@@ -4890,7 +4983,18 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 	*/
 	lifetime := min(clamp(ttl, MIN_ZONE_TTL, MAX_ZONE_TTL), lapses)
 
-	entry := new(Zone_Entry, v.allocator)
+	/*
+	Watched, so a copy the heap refused - a key, the list, the name - stores
+	nothing rather than an entry short of a key, which would refuse every
+	signature that key makes until the entry expires.
+	*/
+	held_dry := false
+	watch := dns.Dry_Watch{backing = v.allocator, dry = &held_dry}
+	stored := dns.dry_watch_allocator(&watch)
+	entry := new(Zone_Entry, stored)
+	if entry == nil {
+		return
+	}
 	entry.status = status
 	entry.expires = loop.moment_add(now, time.Duration(lifetime) * time.Second)
 	oversized := false
@@ -4901,7 +5005,7 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 		// with nothing to check it against is reported unsupported - which
 		// `validate_rrset` reads as insecure. A cache holding entries that
 		// quietly mean "treat this zone as unsigned" fails the wrong way.
-		owned := make([dynamic]Dnskey, 0, len(keys), v.allocator)
+		owned := make([dynamic]Dnskey, 0, len(keys), stored)
 		held := 0
 		for k in keys {
 			/*
@@ -4920,7 +5024,11 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 				oversized = true
 				break
 			}
-			rdata := make([]u8, len(k.rdata), v.allocator)
+			rdata := make([]u8, len(k.rdata), stored)
+			if held_dry {
+				delete(rdata, v.allocator)
+				break
+			}
 			copy(rdata, k.rdata)
 			parsed, perr := parse_dnskey(rdata)
 			if perr != .None {
@@ -4928,9 +5036,17 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 				continue
 			}
 			held += len(rdata)
-			append(&owned, parsed)
+			if _, aerr := append(&owned, parsed); aerr != nil {
+				delete(rdata, v.allocator)
+				break
+			}
 		}
 		entry.keys = owned[:]
+	}
+
+	if held_dry {
+		free_entry(v, entry)
+		return
 	}
 
 	sync.mutex_lock(&v.mu)
@@ -4982,7 +5098,11 @@ cache_put :: proc(v: ^Validator, zone: string, status: Status, keys: []Dnskey, t
 	for len(v.zones) >= v.max_cached_zones && v.lru_tail != nil {
 		drop_zone(v, v.lru_tail)
 	}
-	entry.zone = strings.clone(key, v.allocator)
+	entry.zone = strings.clone(key, stored)
+	if held_dry {
+		free_entry(v, entry)
+		return
+	}
 	v.zones[entry.zone] = entry
 	zone_push_front(v, entry)
 }

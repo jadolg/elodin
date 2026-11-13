@@ -377,12 +377,12 @@ test_a_flood_of_non_cuts_keeps_neither_the_zones_nor_the_slots_it_wants :: proc(
 	defer destroy_validator(v)
 
 	now := fixture_now()
-	cache_put(v, ".", .Secure, nil, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, nil, ".", .Secure, nil, MAX_ZONE_TTL, fixture_moment(now))
 
 	// Saturate first, so what follows measures the steady state under attack
 	// rather than a table with room left in it.
 	for i in 0 ..< MAX_CACHED_NON_CUTS {
-		non_cut_remember(v, fmt.tprintf("fill%d.flood.drtest.", i), 300, fixture_moment(now))
+		non_cut_remember(v, nil, fmt.tprintf("fill%d.flood.drtest.", i), 300, fixture_moment(now))
 	}
 
 	/*
@@ -398,10 +398,10 @@ test_a_flood_of_non_cuts_keeps_neither_the_zones_nor_the_slots_it_wants :: proc(
 			name := fmt.tprintf("e%d.run.drtest.", label)
 			if !dr_remembered(v, name, now) {
 				lookups += 1
-				non_cut_remember(v, name, 300, fixture_moment(now))
+				non_cut_remember(v, nil, name, 300, fixture_moment(now))
 			}
 		}
-		non_cut_remember(v, fmt.tprintf("q%d.run.drtest.", q), 300, fixture_moment(now))
+		non_cut_remember(v, nil, fmt.tprintf("q%d.run.drtest.", q), 300, fixture_moment(now))
 	}
 
 	// Eight to learn the run, and after that only what the flood collides
@@ -473,10 +473,10 @@ test_a_zone_learned_later_replaces_what_the_memo_says :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	now := fixture_now()
-	non_cut_remember(v, "cut.drtest.", 3600, fixture_moment(now))
+	non_cut_remember(v, nil, "cut.drtest.", 3600, fixture_moment(now))
 	testing.expect(t, dr_remembered(v, "cut.drtest.", now), "the memo should hold it to begin with")
 
-	cache_put(v, "cut.drtest.", .Secure, nil, MIN_ZONE_TTL, fixture_moment(now))
+	cache_put(v, nil, "cut.drtest.", .Secure, nil, MIN_ZONE_TTL, fixture_moment(now))
 	testing.expect(
 		t,
 		!dr_remembered(v, "cut.drtest.", now),
@@ -495,8 +495,8 @@ test_a_zone_learned_later_replaces_what_the_memo_says :: proc(t: ^testing.T) {
 	expired zone entry is still in the map it shadows the memo, so the damage
 	only surfaces once housekeeping has been round.
 	*/
-	cache_put(v, "other.drtest.", .Secure, nil, MIN_ZONE_TTL, fixture_moment(now))
-	non_cut_remember(v, "other.drtest.", MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, nil, "other.drtest.", .Secure, nil, MIN_ZONE_TTL, fixture_moment(now))
+	non_cut_remember(v, nil, "other.drtest.", MAX_ZONE_TTL, fixture_moment(now))
 	expired := time.time_add(now, time.Duration(MIN_ZONE_TTL + 1) * time.Second)
 	sweep_at(v, fixture_moment(expired))
 	_, still_a_zone, _ := cache_get(v, "other.drtest.", fixture_moment(expired), context.temp_allocator)
@@ -533,7 +533,7 @@ test_a_broken_step_forgets_the_name_the_walk_skipped :: proc(t: ^testing.T) {
 	testing.expect_value(t, status, Status.Secure)
 	testing.expect_value(t, zone, "drtest.")
 
-	non_cut_remember(v, "c.drtest.", MAX_ZONE_TTL, fixture_moment(now))
+	non_cut_remember(v, nil, "c.drtest.", MAX_ZONE_TTL, fixture_moment(now))
 	testing.expect(t, dr_remembered(v, "c.drtest.", now), "the memo should hold it to begin with")
 
 	step, _ := zone_step(v, &budget, "drtest.", keys, "b.c.drtest.", now, context.temp_allocator)
@@ -553,7 +553,7 @@ test_a_broken_step_forgets_the_name_the_walk_skipped :: proc(t: ^testing.T) {
 	comes before the one above, so it needs its own way out of the memo or the
 	new zone stays refused until the entry ages out.
 	*/
-	non_cut_remember(v, "f.drtest.", MAX_NON_CUT_TTL, fixture_moment(now))
+	non_cut_remember(v, nil, "f.drtest.", MAX_NON_CUT_TTL, fixture_moment(now))
 	testing.expect(t, dr_remembered(v, "f.drtest.", now), "the memo should hold it to begin with")
 
 	bare, _ := zone_step(v, &budget, "drtest.", keys, "e.f.drtest.", now, context.temp_allocator)
@@ -585,7 +585,7 @@ test_the_memo_is_believed_for_less_time_than_a_zone :: proc(t: ^testing.T) {
 	// One reading of the clock for every step, so the second either side of
 	// the ceiling is not eaten by the test's own running time.
 	base := loop.moment_now()
-	non_cut_remember(v, "long.drtest.", MAX_ZONE_TTL, base)
+	non_cut_remember(v, nil, "long.drtest.", MAX_ZONE_TTL, base)
 
 	within := loop.moment_add(base, time.Duration(MAX_NON_CUT_TTL - 1) * time.Second)
 	_, _, remembered := cache_get(v, "long.drtest.", within, context.temp_allocator)
@@ -619,7 +619,7 @@ test_a_ds_the_parent_did_not_sign_forgets_the_name_above :: proc(t: ^testing.T) 
 	root_status, root_keys := zone_keys(v, &budget, ".", now, context.temp_allocator)
 	testing.expect_value(t, root_status, Status.Secure)
 
-	non_cut_remember(v, DR_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
+	non_cut_remember(v, nil, DR_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
 	testing.expect(t, dr_remembered(v, DR_QNAME, now), "the memo should hold it to begin with")
 
 	step, _ := zone_step(v, &budget, ".", root_keys, DR_SUB_QNAME, now, context.temp_allocator)
@@ -661,7 +661,7 @@ test_a_delegation_at_a_remembered_name_heals_on_the_next_question :: proc(t: ^te
 	warm := Budget{}
 	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
 	testing.expect_value(t, warmed, Status.Secure)
-	non_cut_remember(v, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
+	non_cut_remember(v, nil, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
 	testing.expect(t, dr_remembered(v, DR_SUB_QNAME, now), "the table should hold the name to begin with")
 
 	first := validate(v, DR_SUB_QNAME, .A, scenario_fixture(DR_FIXTURES, "dr_sub_answer"), now)
@@ -709,7 +709,7 @@ test_a_denial_from_a_delegation_at_a_remembered_name_heals_too :: proc(t: ^testi
 	warm := Budget{}
 	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
 	testing.expect_value(t, warmed, Status.Secure)
-	non_cut_remember(v, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
+	non_cut_remember(v, nil, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
 	testing.expect(t, dr_remembered(v, DR_SUB_QNAME, now), "the table should hold the name to begin with")
 
 	first := validate(v, DR_SUB_QNAME, .AAAA, scenario_fixture(DR_FIXTURES, "dr_sub_nodata"), now)
@@ -762,7 +762,7 @@ test_a_parents_delegation_nsec_cannot_deny_a_name_inside_the_child :: proc(t: ^t
 	warm := Budget{}
 	warmed, _, _ := zone_trust(v, &warm, DR_QNAME, now, context.temp_allocator)
 	testing.expect_value(t, warmed, Status.Secure)
-	non_cut_remember(v, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
+	non_cut_remember(v, nil, DR_SUB_QNAME, MAX_NON_CUT_TTL, fixture_moment(now))
 
 	result := validate(v, "www." + DR_SUB_QNAME, .A, scenario_fixture(DR_FIXTURES, "dr_delegation_nsec"), now)
 	testing.expectf(
@@ -827,7 +827,7 @@ test_a_zone_entry_does_not_outlive_its_signature_ceiling :: proc(t: ^testing.T) 
 	// One reading of the clock for every step; see
 	// `test_the_memo_is_believed_for_less_time_than_a_zone`.
 	base := loop.moment_now()
-	cache_put(v, "unsigned.drtest.", .Insecure, nil, MAX_ZONE_TTL, base, 10)
+	cache_put(v, nil, "unsigned.drtest.", .Insecure, nil, MAX_ZONE_TTL, base, 10)
 	_, found, _ := cache_get(v, "unsigned.drtest.", loop.moment_add(base, 9 * time.Second), context.temp_allocator)
 	testing.expect(t, found, "the entry went before its ceiling")
 	_, found, _ = cache_get(v, "unsigned.drtest.", loop.moment_add(base, 11 * time.Second), context.temp_allocator)
@@ -835,7 +835,7 @@ test_a_zone_entry_does_not_outlive_its_signature_ceiling :: proc(t: ^testing.T) 
 
 	// A zone whose owner signed its records with an Original TTL of zero, an
 	// hour before they lapse: held for the floor, or every question walks it.
-	cache_put(v, "zero.drtest.", .Insecure, nil, 0, base, 3600)
+	cache_put(v, nil, "zero.drtest.", .Insecure, nil, 0, base, 3600)
 	_, found, _ = cache_get(v, "zero.drtest.", loop.moment_add(base, (MIN_ZONE_TTL - 1) * time.Second), context.temp_allocator)
 	testing.expect(t, found, "an Original TTL of zero beat the floor")
 	free_all(context.temp_allocator)

@@ -198,7 +198,7 @@ test_a_wildcard_proof_past_the_ceiling_is_refused :: proc(t: ^testing.T) {
 	v := scenario_validator(&WILDCARD_FIXTURES, WILDCARD_ANCHOR)
 	defer destroy_validator(v)
 	v.max_nsec3_iterations = -1
-	non_cut_remember(v, "sub.wildcardtest.", MAX_ZONE_TTL, fixture_moment(fixture_now()))
+	non_cut_remember(v, nil, "sub.wildcardtest.", MAX_ZONE_TTL, fixture_moment(fixture_now()))
 
 	result := validate(v, "sub.wildcardtest.", .A, scenario_fixture(WILDCARD_FIXTURES, "wc_wildcard_answer"), fixture_now())
 	testing.expectf(t, result.status == .Indeterminate, "got %v (%q)", result.status, result.reason)

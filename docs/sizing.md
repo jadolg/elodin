@@ -271,8 +271,10 @@ refused as `conn_failed=`. Raise it (`sysctl vm.max_map_count=262144`) or lower
 A query whose scratch cannot grow, past this limit, `RLIMIT_AS` or the
 machine's memory, fails on its own and the server keeps running. It is
 answered SERVFAIL where there is room left to build one and gets no answer
-where there is not. A DNSSEC reply there was no memory to read is reported
-undecided (EDE 22), not bogus.
+where there is not. A TCP, DoT or HTTP/1.1 DoH connection whose next request
+there is no room to read is closed. A DNSSEC validation refused memory anywhere is
+reported undecided (EDE 22), not bogus, and caches nothing about the zones it
+walked.
 
 ## Refused and failed connections
 

@@ -76,7 +76,7 @@ test_a_chain_step_past_the_request_budget_stops_the_walk :: proc(t: ^testing.T) 
 	defer destroy_validator(v)
 
 	now := fixture_now()
-	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, nil, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
 	spent := SPENT
 	budget := query_budget(v)
@@ -104,7 +104,7 @@ test_a_chain_step_within_the_request_budget_reads_the_reply :: proc(t: ^testing.
 	defer destroy_validator(v)
 
 	now := fixture_now()
-	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, nil, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
 	spent := 0
 	budget := query_budget(v)
@@ -173,7 +173,7 @@ test_a_chain_step_read_without_memory_stops_the_walk :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	now := fixture_now()
-	cache_put(v, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
+	cache_put(v, nil, ".", .Secure, []Dnskey{}, MAX_ZONE_TTL, fixture_moment(now))
 
 	budget := query_budget(v)
 	status, _, _ := zone_trust(v, &budget, "www.example.com.", now, mem.nil_allocator())

@@ -1558,8 +1558,8 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	has it.
 	*/
 	size := cache.key_size(st.q.name)
-	keys, _ := make([]u8, 2 * size, st.allocator)
-	if len(keys) < 2 * size {
+	keys, keys_built := dns.alloc_slice([]u8, 2 * size, st.allocator)
+	if !keys_built {
 		if st.refresh {
 			st.unanswered = true
 		} else {

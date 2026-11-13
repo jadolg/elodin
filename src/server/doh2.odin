@@ -4,6 +4,7 @@ import "core:net"
 import "core:strings"
 import "core:sync"
 import "core:time"
+import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:h2"
 import "elodin:logx"
@@ -534,7 +535,11 @@ h2_split_path :: proc(path: string) -> (endpoint: string, query: string) {
 @(private)
 h2_error :: proc(status: int, message: string, allow := "") -> h2.Response {
 	logx.debugf("doh/h2: replying %d %s", status, message)
-	body := make([]u8, len(message) + 1, context.temp_allocator)
+	// Without room for the text, the status alone says it.
+	body, built := dns.alloc_slice([]u8, len(message) + 1, context.temp_allocator)
+	if !built {
+		return h2.Response{status = status, allow = allow}
+	}
 	copy(body, transmute([]u8)message)
 	body[len(message)] = '\n'
 	return h2.Response{status = status, content_type = "text/plain", allow = allow, body = body}

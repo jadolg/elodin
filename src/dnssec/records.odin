@@ -36,6 +36,8 @@ Parse_Error :: enum u8 {
 	Short_Rdata,
 	Bad_Name,
 	Bad_Rdata,
+	// The allocator ran dry reading a name: about this server, not the record.
+	Out_Of_Memory,
 }
 
 Rrsig :: struct {
@@ -158,6 +160,9 @@ rd_name :: proc(r: ^Rd, allocator: mem.Allocator) -> (name: string, err: Parse_E
 	}
 
 	decoded, _, derr := dns.decode_name(r.buf[r.pos:pos], 0, allocator)
+	if derr == .Out_Of_Memory {
+		return "", .Out_Of_Memory
+	}
 	if derr != .None {
 		return "", .Bad_Name
 	}

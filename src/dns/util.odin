@@ -978,6 +978,45 @@ alloc_slice :: proc($T: typeid/[]$E, n: int, allocator: mem.Allocator) -> (out: 
 }
 
 /*
+An allocator that hands every request to `backing` and sets `dry^` when one is
+refused: an error, or less than was asked for. For a caller whose callees report
+a refusal each their own way, or not at all - an append that drops its element,
+a string that comes back empty - and so cannot tell a result built short from
+one built whole.
+*/
+Dry_Watch :: struct {
+	backing: mem.Allocator,
+	dry:     ^bool,
+}
+
+dry_watch_allocator :: proc(w: ^Dry_Watch) -> mem.Allocator {
+	return {procedure = dry_watch_proc, data = w}
+}
+
+@(private)
+dry_watch_proc :: proc(
+	data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	loc := #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	w := cast(^Dry_Watch)data
+	out, err := w.backing.procedure(w.backing.data, mode, size, alignment, old_memory, old_size, loc)
+	#partial switch mode {
+	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
+		if err != nil || len(out) < size {
+			w.dry^ = true
+		}
+	}
+	return out, err
+}
+
+/*
 An empty list with room for `n` from `allocator`, or false where it ran dry.
 Reserved whole, so no append within it can fail and drop an element.
 */

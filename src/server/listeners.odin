@@ -2392,7 +2392,12 @@ stream_read_message :: proc(c: Conn, r: ^Stream_Reader, b: ^Read_Budget) -> (msg
 		r.start += length
 		return msg, true
 	}
-	msg = make([]u8, length, context.temp_allocator)
+	// A message with no room to read it into cannot be read past either, so
+	// the connection ends here.
+	built: bool
+	if msg, built = dns.alloc_slice([]u8, length, context.temp_allocator); !built {
+		return nil, false
+	}
 	got := copy(msg, r.buf[r.start:r.end])
 	r.start, r.end = 0, 0
 	return msg, conn_read_full(c, msg[got:], b)

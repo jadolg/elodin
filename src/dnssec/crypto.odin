@@ -2,6 +2,7 @@ package dnssec
 
 import "core:c"
 import "core:mem"
+import "elodin:dns"
 
 /*
 The cryptography DNSSEC needs, bound straight to libcrypto.
@@ -254,11 +255,11 @@ ED25519_PREFIX := []u8{0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x0
 ED448_PREFIX := []u8{0x30, 0x43, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x3a, 0x00}
 
 @(private)
-ec_spki :: proc(key: []u8, prefix: []u8, key_len: int, allocator: mem.Allocator) -> ([]u8, bool) {
+ec_spki :: proc(key: []u8, prefix: []u8, key_len: int, allocator: mem.Allocator) -> (out: []u8, ok: bool) {
 	if len(key) != key_len {
 		return nil, false
 	}
-	out := make([]u8, len(prefix) + key_len, allocator)
+	out = dns.alloc_slice([]u8, len(prefix) + key_len, allocator) or_return
 	copy(out, prefix)
 	copy(out[len(prefix):], key)
 	return out, true

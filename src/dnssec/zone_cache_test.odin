@@ -93,7 +93,7 @@ test_one_zone_cannot_fill_the_cache_by_itself :: proc(t: ^testing.T) {
 	v := make_validator(counting_query, nil, Options{})
 	defer destroy_validator(v)
 
-	cache_put(v, "flood.example.", .Secure, huge_key_set(), MAX_ZONE_TTL, loop.moment_now())
+	cache_put(v, nil, "flood.example.", .Secure, huge_key_set(), MAX_ZONE_TTL, loop.moment_now())
 
 	held := cached_key_bytes(v, "flood.example.")
 	testing.expectf(
@@ -118,7 +118,7 @@ test_an_ordinary_apex_is_still_cached_whole :: proc(t: ^testing.T) {
 	for _ in 0 ..< 4 {
 		append(&ordinary, sized_key(4 + 256 + 3))
 	}
-	cache_put(v, "example.com.", .Secure, ordinary[:], MAX_ZONE_TTL, loop.moment_now())
+	cache_put(v, nil, "example.com.", .Secure, ordinary[:], MAX_ZONE_TTL, loop.moment_now())
 
 	entry, found := v.zones["example.com."]
 	testing.expect(t, found, "an ordinary apex should be cached")
@@ -152,7 +152,7 @@ test_the_cache_keeps_only_keys_that_could_sign :: proc(t: ^testing.T) {
 		// Protocol is fixed at 3; anything else is not a DNSSEC key.
 		sized_key(4 + 256, protocol = 4),
 	}
-	cache_put(v, "example.com.", .Secure, set, MAX_ZONE_TTL, loop.moment_now())
+	cache_put(v, nil, "example.com.", .Secure, set, MAX_ZONE_TTL, loop.moment_now())
 
 	entry, found := v.zones["example.com."]
 	testing.expect(t, found, "the zone should have been cached")
@@ -185,7 +185,7 @@ test_a_flood_of_fresh_zones_does_not_evict_the_root :: proc(t: ^testing.T) {
 
 	now := loop.moment_now()
 	root_keys := []Dnskey{sized_key(4 + 256)}
-	cache_put(v, ".", .Secure, root_keys, MAX_ZONE_TTL, now)
+	cache_put(v, nil, ".", .Secure, root_keys, MAX_ZONE_TTL, now)
 
 	for i in 0 ..< 64 {
 		// What every walk does before it descends, and what makes the root the
@@ -196,7 +196,7 @@ test_a_flood_of_fresh_zones_does_not_evict_the_root :: proc(t: ^testing.T) {
 			return
 		}
 		zone := fmt.tprintf("z%d.example.", i)
-		cache_put(v, zone, .Secure, root_keys, MAX_ZONE_TTL, now)
+		cache_put(v, nil, zone, .Secure, root_keys, MAX_ZONE_TTL, now)
 	}
 
 	_, found, _ := cache_get(v, ".", now, context.temp_allocator)
@@ -219,14 +219,14 @@ test_a_full_cache_evicts_the_least_recently_used_zone :: proc(t: ^testing.T) {
 	now := loop.moment_now()
 	keys := []Dnskey{sized_key(4 + 256)}
 	for zone in ([]string{"a.example.", "b.example.", "c.example."}) {
-		cache_put(v, zone, .Secure, keys, MAX_ZONE_TTL, now)
+		cache_put(v, nil, zone, .Secure, keys, MAX_ZONE_TTL, now)
 	}
 
 	// `a` is used again, so `b` becomes the coldest entry.
 	_, a_found, _ := cache_get(v, "a.example.", now, context.temp_allocator)
 	testing.expect(t, a_found, "a.example. should still be cached")
 
-	cache_put(v, "d.example.", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, nil, "d.example.", .Secure, keys, MAX_ZONE_TTL, now)
 
 	testing.expectf(t, len(v.zones) == 3, "the cache holds %d zones against a bound of 3", len(v.zones))
 	_, still_a := v.zones["a.example."]
@@ -256,13 +256,13 @@ test_refreshing_a_zone_keeps_the_cache_consistent :: proc(t: ^testing.T) {
 	now := loop.moment_now()
 	keys := []Dnskey{sized_key(4 + 256)}
 	for _ in 0 ..< 10 {
-		cache_put(v, "example.com.", .Secure, keys, MAX_ZONE_TTL, now)
+		cache_put(v, nil, "example.com.", .Secure, keys, MAX_ZONE_TTL, now)
 	}
 	testing.expectf(t, len(v.zones) == 1, "ten refreshes of one zone left %d entries", len(v.zones))
 
 	// The list has to still be walkable end to end and hold exactly what the
 	// map does, or the next eviction reads something that has been freed.
-	cache_put(v, "other.example.", .Secure, keys, MAX_ZONE_TTL, now)
+	cache_put(v, nil, "other.example.", .Secure, keys, MAX_ZONE_TTL, now)
 	count := lru_length(v, 8)
 	testing.expectf(t, count <= 8, "the eviction list loops or outlives its entries")
 	testing.expectf(t, count == len(v.zones), "the eviction list holds %d entries, the map %d", count, len(v.zones))
@@ -282,8 +282,8 @@ test_sweeping_an_expired_zone_leaves_the_eviction_order_intact :: proc(t: ^testi
 
 	now := loop.moment_now()
 	keys := []Dnskey{sized_key(4 + 256)}
-	cache_put(v, "a.example.", .Secure, keys, MIN_ZONE_TTL, now)
-	cache_put(v, "b.example.", .Secure, keys, MIN_ZONE_TTL, now)
+	cache_put(v, nil, "a.example.", .Secure, keys, MIN_ZONE_TTL, now)
+	cache_put(v, nil, "b.example.", .Secure, keys, MIN_ZONE_TTL, now)
 
 	later := loop.moment_add(now, time.Duration(MIN_ZONE_TTL + 1) * time.Second)
 	removed := sweep_at(v, later)
@@ -293,7 +293,7 @@ test_sweeping_an_expired_zone_leaves_the_eviction_order_intact :: proc(t: ^testi
 	testing.expectf(t, count == 0, "the eviction list still holds %d swept entries", count)
 
 	// And the cache still works afterwards.
-	cache_put(v, "c.example.", .Secure, keys, MAX_ZONE_TTL, later)
+	cache_put(v, nil, "c.example.", .Secure, keys, MAX_ZONE_TTL, later)
 	_, found, _ := cache_get(v, "c.example.", later, context.temp_allocator)
 	testing.expect(t, found, "the cache should still take entries after a sweep")
 	free_all(context.temp_allocator)
@@ -316,9 +316,9 @@ test_an_oversized_key_set_does_not_drop_the_one_already_held :: proc(t: ^testing
 
 	now := loop.moment_now()
 	good := []Dnskey{sized_key(4 + 256)}
-	cache_put(v, "example.com.", .Secure, good, MAX_ZONE_TTL, now)
+	cache_put(v, nil, "example.com.", .Secure, good, MAX_ZONE_TTL, now)
 
-	cache_put(v, "example.com.", .Secure, huge_key_set(), MAX_ZONE_TTL, now)
+	cache_put(v, nil, "example.com.", .Secure, huge_key_set(), MAX_ZONE_TTL, now)
 
 	entry, found := v.zones["example.com."]
 	testing.expect(t, found, "the validated entry should have survived an oversized reply")
@@ -346,11 +346,11 @@ test_an_oversized_key_set_still_settles_the_name :: proc(t: ^testing.T) {
 	defer destroy_validator(v)
 
 	now := loop.moment_now()
-	non_cut_remember(v, "example.com.", MIN_ZONE_TTL, now)
+	non_cut_remember(v, nil, "example.com.", MIN_ZONE_TTL, now)
 	_, _, remembered := cache_get(v, "example.com.", now, context.temp_allocator)
 	testing.expect(t, remembered, "the memo should hold the name to begin with")
 
-	cache_put(v, "example.com.", .Secure, huge_key_set(), MAX_ZONE_TTL, now)
+	cache_put(v, nil, "example.com.", .Secure, huge_key_set(), MAX_ZONE_TTL, now)
 
 	_, _, still_remembered := cache_get(v, "example.com.", now, context.temp_allocator)
 	testing.expect(t, !still_remembered, "a name settled as a zone is no longer a remembered non-cut")
@@ -400,7 +400,7 @@ test_a_cache_of_one_zone_holds_exactly_one :: proc(t: ^testing.T) {
 	now := loop.moment_now()
 	keys := []Dnskey{sized_key(4 + 256)}
 	for i in 0 ..< 8 {
-		cache_put(v, fmt.tprintf("z%d.example.", i), .Secure, keys, MAX_ZONE_TTL, now)
+		cache_put(v, nil, fmt.tprintf("z%d.example.", i), .Secure, keys, MAX_ZONE_TTL, now)
 		testing.expectf(t, len(v.zones) == 1, "after %d inserts the cache holds %d zones, not 1", i + 1, len(v.zones))
 	}
 
@@ -428,11 +428,11 @@ test_a_refused_key_set_is_counted :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, oversized_key_sets(v), 0)
 
-	cache_put(v, "flood.example.", .Secure, huge_key_set(), MAX_ZONE_TTL, loop.moment_now())
+	cache_put(v, nil, "flood.example.", .Secure, huge_key_set(), MAX_ZONE_TTL, loop.moment_now())
 	testing.expect_value(t, oversized_key_sets(v), 1)
 
 	// An ordinary set does not touch it.
-	cache_put(v, "example.com.", .Secure, []Dnskey{sized_key(4 + 256)}, MAX_ZONE_TTL, loop.moment_now())
+	cache_put(v, nil, "example.com.", .Secure, []Dnskey{sized_key(4 + 256)}, MAX_ZONE_TTL, loop.moment_now())
 	testing.expect_value(t, oversized_key_sets(v), 1)
 	free_all(context.temp_allocator)
 }
@@ -487,7 +487,7 @@ test_a_walk_reads_the_zone_cache_at_its_own_instant :: proc(t: ^testing.T) {
 	// Began ten seconds ago and stored keys good for five: past on the clock,
 	// live to the walk that stored them.
 	budget.began = loop.moment_add(budget.began, -10 * time.Second)
-	cache_put(v, "example.com.", .Secure, []Dnskey{sized_key(4 + 256)}, MAX_ZONE_TTL, budget.began, 5)
+	cache_put(v, nil, "example.com.", .Secure, []Dnskey{sized_key(4 + 256)}, MAX_ZONE_TTL, budget.began, 5)
 
 	status, keys := zone_keys(v, &budget, "example.com.", fixture_now(), context.temp_allocator)
 	end_walk(v, &budget)

@@ -73,8 +73,20 @@ exchange_padded :: proc(
 	reclaim a padded copy of a query. The scratch is freed when the fiber that
 	owns it returns, the same way `exchange_with_cookie` builds its query.
 	*/
-	asked, padded := dns.pad_query(query, dns.PAD_QUERY_BLOCK, dns.MAX_MESSAGE, context.temp_allocator)
+	dry := false
+	asked: []u8
+	padded: bool
+	{
+		scratch := dns.Dry_Watch{backing = context.temp_allocator, dry = &dry}
+		context.temp_allocator = dns.dry_watch_allocator(&scratch)
+		asked, padded = dns.pad_query(query, dns.PAD_QUERY_BLOCK, dns.MAX_MESSAGE, context.temp_allocator)
+	}
 	if !padded {
+		// Unpadded only where the query cannot carry the option, never for want
+		// of memory: its length would name it on the encrypted transport.
+		if dry {
+			return nil, .Out_Of_Memory
+		}
 		asked = query
 	}
 

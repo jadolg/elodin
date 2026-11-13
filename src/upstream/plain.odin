@@ -29,16 +29,6 @@ exchange_udp :: proc(
 	err: Error,
 ) {
 	endpoint := endpoint_of(u) or_return
-	socket, opened := open_udp(endpoint)
-	if !opened {
-		return nil, .Dial_Failed
-	}
-	defer net.close(socket)
-
-	if _, send_err := udp_send_until(socket, query, deadline); send_err != nil {
-		return nil, .IO_Error
-	}
-
 	/*
 	Sized from what the query itself advertised, not from a fixed number.
 
@@ -57,10 +47,23 @@ exchange_udp :: proc(
 	buffer.
 
 	One byte over, so a datagram that ignores the advertised size is
-	recognisable rather than merely truncated.
+	recognisable rather than merely truncated. Taken before the query is sent,
+	so a query whose answer this server has no room for is not asked.
 	*/
 	limit := clamp(int(dns.peek_udp_size(query)), dns.MAX_UDP_SIZE, dns.MAX_MESSAGE)
-	buf := make([]u8, limit + 1, context.temp_allocator)
+	buf, built := dns.alloc_slice([]u8, limit + 1, context.temp_allocator)
+	if !built {
+		return nil, .Out_Of_Memory
+	}
+	socket, opened := open_udp(endpoint)
+	if !opened {
+		return nil, .Dial_Failed
+	}
+	defer net.close(socket)
+
+	if _, send_err := udp_send_until(socket, query, deadline); send_err != nil {
+		return nil, .IO_Error
+	}
 
 	/*
 	Whether anything arrived from the server and was thrown away.
@@ -152,7 +155,11 @@ exchange_udp :: proc(
 		if flags.tc {
 			return exchange_pipelined(u, query, timeout, deadline, allocator)
 		}
-		out := make([]u8, n, allocator)
+		// An empty copy would leave as an answer with no error beside it.
+		out, copied := dns.alloc_slice([]u8, n, allocator)
+		if !copied {
+			return nil, .Out_Of_Memory
+		}
 		copy(out, buf[:n])
 		return out, .None
 	}

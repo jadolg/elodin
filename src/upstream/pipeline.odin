@@ -1162,7 +1162,12 @@ pipe_read_one :: proc(c: ^Pipe_Conn, budget: time.Duration) -> Error {
 	// The connection's allocator rather than any caller's: this is read before
 	// it is known whose it is, and the waiter it goes to may be on another loop,
 	// with scratch this one has no business allocating from.
-	msg := make([]u8, length, c.allocator)
+	// One that cannot be had cannot be read past either, so the connection
+	// goes, and its waiters are told it was this server's memory.
+	msg, built := dns.alloc_slice([]u8, length, c.allocator)
+	if !built {
+		return .Out_Of_Memory
+	}
 	if _, merr := pipe_read_full(c, msg, framing); merr != .None {
 		delete(msg, c.allocator)
 		return .IO_Error
