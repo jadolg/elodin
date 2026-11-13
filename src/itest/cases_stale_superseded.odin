@@ -76,8 +76,8 @@ run_stale_superseded_cases :: proc(r: ^Runner) {
 	}
 	check_eq_str(r, first_address(r, lent.wire), "203.0.113.41", "the lent copy")
 
-	deadline := time.tick_now()
-	for v := superseded_entries(metrics_port); (v < 0 || v >= held) && time.tick_since(deadline) < 5 * time.Second; v = superseded_entries(metrics_port) {
+	start := time.tick_now()
+	for v := superseded_entries(metrics_port); (v < 0 || v >= held) && time.tick_since(start) < 5 * time.Second; v = superseded_entries(metrics_port) {
 		time.sleep(50 * time.Millisecond)
 	}
 	check_eq_int(r, mock_total(after), 1, "upstream queries for the refresh")

@@ -24,24 +24,25 @@ Script :: struct {
 	input:  []u8,
 	read:   int,
 	await:  string,
-	mu:     sync.Mutex,
-	output: [dynamic]u8,
+	mu:      sync.Mutex,
+	output:  [dynamic]u8,
+	// Signalled by every write, under `mu`.
+	written: sync.Cond,
 }
 
 @(private = "file")
 script_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 	s := cast(^Script)user
 	if s.read >= len(s.input) {
-		deadline := time.time_add(time.now(), 2 * time.Second)
-		for time.diff(time.now(), deadline) > 0 {
-			sync.mutex_lock(&s.mu)
-			answered := strings.contains(string(s.output[:]), s.await)
-			sync.mutex_unlock(&s.mu)
-			if answered {
+		deadline := time.tick_add(time.tick_now(), 2 * time.Second)
+		sync.mutex_lock(&s.mu)
+		for !strings.contains(string(s.output[:]), s.await) {
+			left := time.tick_diff(time.tick_now(), deadline)
+			if left <= 0 || !sync.cond_wait_with_timeout(&s.written, &s.mu, left) {
 				break
 			}
-			time.sleep(time.Millisecond)
 		}
+		sync.mutex_unlock(&s.mu)
 		// Out of script: the peer has gone, which is what ends `h2.serve`.
 		return 0, false
 	}
@@ -57,6 +58,7 @@ script_write :: proc(user: rawptr, buf: []u8) -> bool {
 	sync.mutex_lock(&s.mu)
 	defer sync.mutex_unlock(&s.mu)
 	append(&s.output, ..buf)
+	sync.cond_broadcast(&s.written)
 	return true
 }
 
@@ -143,7 +145,7 @@ response_status :: proc(block: []u8) -> string {
 
 @(private = "file")
 Gate :: struct {
-	open:   bool,
+	open:   loop.Sema,
 	server: ^Server,
 }
 
@@ -151,9 +153,7 @@ Gate :: struct {
 @(private = "file")
 gate_job :: proc(data: rawptr) {
 	g := cast(^Gate)data
-	for !sync.atomic_load(&g.open) {
-		_ = loop.sleep(time.Millisecond)
-	}
+	loop.sema_wait(&g.open)
 	query_done(g.server)
 }
 
@@ -268,7 +268,7 @@ serve_one :: proc(
 	}
 
 	opened := time.tick_now()
-	sync.atomic_store(&gate.open, true)
+	loop.sema_post(&gate.open)
 	h2.conn_wait_idle(hc)
 	h2.conn_unref(hc)
 	stop_test_loop(&tl)

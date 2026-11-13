@@ -40,8 +40,14 @@ test_random_id_is_drawn_fresh :: proc(t: ^testing.T) {
 	// draws, so a handful here would already be remarkable.
 	testing.expectf(t, sequential < 8, "%d of %d ids were the previous one plus one", sequential, DRAWS)
 
-	// Both halves have to come from somewhere: a generator that filled only one
-	// of the two bytes would pass the count above on a large enough sample.
+	/*
+	Both halves have to come from somewhere: a generator that filled only one
+	of the two bytes would pass the count above on a large enough sample. Not
+	all 256 values of each: about 3970 distinct draws miss a given byte value
+	with odds near 2e-7, and with 512 of them one run in about 18,000 would
+	miss one by chance. Seven or more missing has odds near 1e-34, where a byte
+	left unfilled gives one value and a byte filled from seven bits 128.
+	*/
 	high, low: map[u8]bool
 	defer delete(high)
 	defer delete(low)
@@ -49,6 +55,6 @@ test_random_id_is_drawn_fresh :: proc(t: ^testing.T) {
 		high[u8(id >> 8)] = true
 		low[u8(id)] = true
 	}
-	testing.expectf(t, len(high) == 256, "only %d distinct high bytes", len(high))
-	testing.expectf(t, len(low) == 256, "only %d distinct low bytes", len(low))
+	testing.expectf(t, len(high) >= 250, "only %d distinct high bytes", len(high))
+	testing.expectf(t, len(low) >= 250, "only %d distinct low bytes", len(low))
 }

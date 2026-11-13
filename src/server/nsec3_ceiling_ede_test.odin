@@ -91,6 +91,8 @@ Ceiling_Mock :: struct {
 	stop:   bool,
 	// Reads queries and answers none, for the upstream being down.
 	silent: bool,
+	// Every question it read, answered or not.
+	asked:  int,
 }
 
 @(private = "file")
@@ -102,7 +104,11 @@ ceiling_mock_serve :: proc(m: ^Ceiling_Mock) {
 			continue
 		}
 		query, derr := dns.decode_message(buf[:n], context.temp_allocator)
-		if derr != .None || len(query.question) != 1 || sync.atomic_load(&m.silent) {
+		if derr != .None || len(query.question) != 1 {
+			continue
+		}
+		sync.atomic_add(&m.asked, 1)
+		if sync.atomic_load(&m.silent) {
 			continue
 		}
 		for f in C_FIXTURES {
@@ -385,12 +391,15 @@ test_the_chain_lookups_spend_what_is_left_of_the_query_budget :: proc(t: ^testin
 	defer ceiling_stop(&f)
 	wire := ceiling_query(C_QNAME, 0x4390)
 
-	started := time.tick_now()
 	_, _, served := handle_query(&f.srv, wire, .UDP, "test", context.temp_allocator)
-	spent := time.tick_since(started)
 	testing.expect(t, served, "no response at all")
-	// Two timeouts and slack for a loaded runner; a budget per lookup would
-	// wait three, one per lookup until the silent member parked.
-	testing.expectf(t, spent < 5 * f.cfg.upstream.timeout / 2, "the query waited %v, where its budget is two timeouts of %v", spent, f.cfg.upstream.timeout)
+	/*
+	Counted rather than timed. The client's question is the one thing the
+	serving member hears: the first lookup meets the silent member with what is
+	left of the budget and ends there. A lookup with a budget of its own outlasts
+	the silent member and asks the serving one too.
+	*/
+	asked := sync.atomic_load(&f.mock.asked)
+	testing.expectf(t, asked == 1, "the serving member was asked %d questions, where the budget leaves room for the client's alone", asked)
 	free_all(context.temp_allocator)
 }

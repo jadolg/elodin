@@ -1560,9 +1560,7 @@ test_data_after_end_stream_wakes_a_parked_responder :: proc(t: ^testing.T) {
 	}
 	worker := thread.create_and_start_with_poly_data(&r, respond_worker)
 
-	// Give the worker a moment to reach the wait - the HEADERS write ahead of
-	// it is unwindowed, so it gets there in well under this.
-	time.sleep(50 * time.Millisecond)
+	testing.expect(t, wait_for_waiter(&c.cond), "the responder never parked waiting for credit")
 
 	body := []u8{'x'}
 	handle_data(c, Frame_Header{length = len(body), type = .Data, stream_id = 1}, body)

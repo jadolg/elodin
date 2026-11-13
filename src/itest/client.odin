@@ -281,8 +281,8 @@ send_burst :: proc(socket: net.UDP_Socket, query: []u8, count: int, to: net.Endp
 @(private = "file")
 drain_answers :: proc(socket: net.UDP_Socket, drain: time.Duration, want := 0) -> (res: Flood_Result) {
 	buf := make([]u8, 65535, context.temp_allocator)
-	deadline := time.time_add(time.now(), drain)
-	for time.diff(deadline, time.now()) < 0 && (want == 0 || res.answered < want) {
+	deadline := time.tick_add(time.tick_now(), drain)
+	for time.tick_diff(time.tick_now(), deadline) > 0 && (want == 0 || res.answered < want) {
 		n, _, rerr := net.recv_udp(socket, buf)
 		if rerr != nil {
 			// The receive timeout expiring is how this notices the quiet.

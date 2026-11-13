@@ -277,9 +277,9 @@ run_log_reopen_case :: proc(r: ^Runner, upstream_port: int) {
 	{
 		rotated := strings.concatenate({log_file, ".1"}, context.temp_allocator)
 		if check(r, os.rename(log_file, rotated) == nil, "cannot rotate the log") && check(r, signal_reload(&srv), "could not deliver SIGHUP") {
-			deadline := time.time_add(time.now(), 5 * time.Second)
+			deadline := time.tick_add(time.tick_now(), 5 * time.Second)
 			reopened := false
-			for !reopened && time.diff(deadline, time.now()) < 0 {
+			for !reopened && time.tick_diff(time.tick_now(), deadline) > 0 {
 				data, err := os.read_entire_file(log_file, context.temp_allocator)
 				reopened = err == nil && strings.contains(string(data), "SIGHUP received")
 				if !reopened {

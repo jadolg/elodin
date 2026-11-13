@@ -84,6 +84,9 @@ Mock :: struct {
 	// When set, a connection is closed after this much idle time, the way a
 	// public DoT resolver drops connections a client has stopped using.
 	idle_close:  time.Duration,
+	// Connections `idle_close` has closed, counted once each is closed.
+	// Atomic: the connection threads bump it while a case reads it.
+	idle_closes: int,
 
 	// How this mock treats DNS cookies (RFC 7873).
 	cookies:     Mock_Cookies,
@@ -297,6 +300,18 @@ mock_reset_counts :: proc(m: ^Mock) {
 // stale exactly as it would against a real server.
 mock_close_idle_after :: proc(m: ^Mock, d: time.Duration) {
 	m.idle_close = d
+}
+
+// Wait until `idle_close` has closed `want` connections in all, or give up.
+mock_wait_idle_closes :: proc(m: ^Mock, want: int, timeout: time.Duration) -> bool {
+	start := time.tick_now()
+	for time.tick_since(start) < timeout {
+		if sync.atomic_load(&m.idle_closes) >= want {
+			return true
+		}
+		time.sleep(PROBE_RETRY_PAUSE)
+	}
+	return false
 }
 
 // A copy of the last query the mock received, or nil if it has had none.
@@ -888,6 +903,12 @@ start_conn_thread :: proc(m: ^Mock, conn: ^Mock_Conn) {
 mock_tcp_conn :: proc(conn: ^Mock_Conn) {
 	m := conn.mock
 	defer free(conn)
+	// Declared before the cleanup below, so it runs after it: the count says
+	// the connection is closed, not about to be.
+	idled := false
+	defer if idled {
+		sync.atomic_add(&m.idle_closes, 1)
+	}
 
 	tls_conn: ^tlsx.Conn
 	if conn.tls && m.drip_handshake {
@@ -921,13 +942,13 @@ mock_tcp_conn :: proc(conn: ^Mock_Conn) {
 	// An idle connection must survive that: elodin pools upstream connections
 	// and expects to reuse one minutes later, so a timeout only means "nothing
 	// yet", and the loop keeps waiting until the peer actually goes away.
-	read_full :: proc(conn: ^Mock_Conn, tls: ^tlsx.Conn, buf: []u8, deadline: time.Time) -> bool {
+	read_full :: proc(conn: ^Mock_Conn, tls: ^tlsx.Conn, buf: []u8, deadline: time.Tick) -> bool {
 		got := 0
 		for got < len(buf) {
 			if sync.atomic_load(&conn.mock.stop) {
 				return false
 			}
-			if conn.mock.idle_close > 0 && time.diff(deadline, time.now()) > 0 {
+			if conn.mock.idle_close > 0 && time.tick_diff(time.tick_now(), deadline) < 0 {
 				return false
 			}
 			n: int
@@ -962,9 +983,10 @@ mock_tcp_conn :: proc(conn: ^Mock_Conn) {
 	}
 
 	for !sync.atomic_load(&m.stop) {
-		deadline := time.time_add(time.now(), m.idle_close)
+		deadline := time.tick_add(time.tick_now(), m.idle_close)
 		length_buf: [2]u8
 		if !read_full(conn, tls_conn, length_buf[:], deadline) {
+			idled = m.idle_close > 0 && time.tick_diff(time.tick_now(), deadline) < 0
 			return
 		}
 		length := int(length_buf[0]) << 8 | int(length_buf[1])
@@ -972,7 +994,7 @@ mock_tcp_conn :: proc(conn: ^Mock_Conn) {
 			return
 		}
 		query := make([]u8, length, context.temp_allocator)
-		if !read_full(conn, tls_conn, query, time.time_add(time.now(), 5 * time.Second)) {
+		if !read_full(conn, tls_conn, query, time.tick_add(time.tick_now(), 5 * time.Second)) {
 			return
 		}
 

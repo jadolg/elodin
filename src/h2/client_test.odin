@@ -648,14 +648,12 @@ test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^te
 		thread.destroy(a)
 	}
 
-	// Wait for stream A's HEADERS to land, then give it a little longer to
-	// re-acquire the lock and settle into its cond_wait - both comfortably
-	// short next to the 4s timeout that would mask a missing broadcast.
+	// Wait for stream A's HEADERS to land and for A to park on its response.
 	for i := 0; i < 200 && !sync.atomic_load(&srv.headers_seen); i += 1 {
 		time.sleep(5 * time.Millisecond)
 	}
 	testing.expect(t, sync.atomic_load(&srv.headers_seen), "stream A's HEADERS frame was never observed")
-	time.sleep(100 * time.Millisecond)
+	testing.expect(t, wait_for_waiter(&c.cond), "stream A never waited for its response")
 
 	_, berr := client_request(
 		c,
@@ -745,16 +743,19 @@ test_client_refuses_frame_larger_than_advertised_max :: proc(t: ^testing.T) {
 
 @(test)
 test_client_request_times_out_on_silence :: proc(t: ^testing.T) {
-	run_script :: proc(client: net.TCP_Socket, _: rawptr) {
+	// Says nothing at all until the test is done with it, or for two seconds,
+	// after which it hangs up and a request still waiting ends as Closed.
+	run_script :: proc(client: net.TCP_Socket, data: rawptr) {
 		_, _ = test_wait_for_frame_type(client, .Headers)
-		// And then say nothing at all.
-		time.sleep(2 * time.Second)
+		_ = sync.sema_wait_with_timeout((^sync.Sema)(data), 2 * time.Second)
 	}
-	p := Peer{script = run_script}
+	done: sync.Sema
+	p := Peer{script = run_script, data = &done}
 	if !start_peer(t, &p) {
 		return
 	}
 	defer end_peer(&p)
+	defer sync.sema_post(&done)
 	c := p.c
 
 	started := time.tick_now()
@@ -2064,8 +2065,7 @@ test_client_waits_for_a_stream_slot_under_the_peers_limit :: proc(t: ^testing.T)
 
 	first, ok := limit_wait_opened(c, &log, 1)
 	testing.expect(t, ok, "no request opened a stream")
-	// Long enough for the second request to have opened one too, had it not waited.
-	time.sleep(200 * time.Millisecond)
+	testing.expect(t, wait_for_waiter(&c.slot_cond), "the second request never waited for a slot")
 	opened, _ := limit_opened(c, &log)
 	testing.expect_value(t, opened, 1)
 
@@ -2120,7 +2120,7 @@ test_client_wait_for_a_stream_slot_ends_on_deadline_or_close :: proc(t: ^testing
 		c = c,
 	}
 	th := thread.create_and_start_with_poly_data(&r, limit_request_run)
-	time.sleep(100 * time.Millisecond)
+	testing.expect(t, wait_for_waiter(&c.slot_cond), "the request never waited for a slot")
 	start = time.tick_now()
 	// What client_serve does on its way out.
 	loop.lock(&c.mu)
@@ -2226,7 +2226,7 @@ test_client_a_raised_stream_limit_lets_a_waiting_request_in :: proc(t: ^testing.
 		c = c,
 	}
 	th := thread.create_and_start_with_poly_data(&r, limit_request_run)
-	time.sleep(100 * time.Millisecond)
+	testing.expect(t, wait_for_waiter(&c.slot_cond), "the request never waited for a slot")
 	opened, _ := limit_opened(c, &log)
 	testing.expect_value(t, opened, 0)
 

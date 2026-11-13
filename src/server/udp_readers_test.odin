@@ -3,6 +3,7 @@ package server
 import "core:net"
 import "core:strings"
 import "core:sync"
+import "core:sys/linux"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
@@ -471,20 +472,20 @@ test_a_reader_lets_its_queries_run_between_batches :: proc(t: ^testing.T) {
 	sync.sema_post(&gate.go)
 
 	// Until the reader has taken everything the kernel kept and every query it
-	// started has been answered.
-	start := time.tick_now()
-	last := u64(0)
-	steady := time.tick_now()
-	for time.tick_since(start) < 5 * time.Second {
-		got := sync.atomic_load(&l.udp[0].received)
-		if got != last {
-			last = got
-			steady = time.tick_now()
-		} else if queries_pending(&s) == 0 && time.tick_since(steady) > 200 * time.Millisecond {
-			break
-		}
-		time.sleep(5 * time.Millisecond)
+	// started has been answered. The queue was built before the loop was let
+	// go, so once it is empty nothing more is coming.
+	Drained :: struct {
+		s: ^Server,
+		l: ^Listeners,
 	}
+	drained := Drained{&s, &l}
+	testing.expect(t, wait_until(proc(data: rawptr) -> bool {
+			d := (^Drained)(data)
+			return sync.atomic_load(&d.l.udp[0].received) > 0 &&
+				unread_bytes(linux.Fd(d.l.udp[0].socket)) == 0 &&
+				queries_pending(d.s) == 0
+		}, &drained, 5 * time.Second), "the reader never worked through its queue")
+	last := sync.atomic_load(&l.udp[0].received)
 	// The premise: more arrived than may be in flight, so reading them all before
 	// answering any would have had to drop some.
 	testing.expectf(t, last > LIMIT, "only %d of %d datagrams reached the reader; the case needs more than %d", last, SENT, LIMIT)

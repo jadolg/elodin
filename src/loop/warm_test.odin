@@ -49,10 +49,7 @@ burst :: proc(t: ^testing.T, l: ^Loop, n: int) -> bool {
 			return false
 		}
 	}
-	for fibers_alive(l) != 0 {
-		time.sleep(time.Millisecond)
-	}
-	return true
+	return testing.expect(t, fibers_gone(l), "finished fibers were never put back")
 }
 
 @(private = "file")
@@ -111,6 +108,54 @@ test_a_busy_loop_keeps_the_stacks_it_uses :: proc(t: ^testing.T) {
 		time.sleep(time.Millisecond)
 	}
 	testing.expectf(t, warm_count(l) == M, "%d stacks warm, want the %d the last window used", warm_count(l), M)
+}
+
+// The loop's clock in the idle test below, moved by its test thread.
+@(private = "file")
+idle_now: i64
+
+@(private = "file")
+idle_clock :: proc "contextless" () -> Tick {
+	return Tick{sync.atomic_load(&idle_now)}
+}
+
+/*
+A burst's warm stacks are given back once the loop has had nothing to do, down
+to `WARM_IDLE_KEEP`: a whole window with none of them used. On a clock this
+test moves, as above.
+*/
+@(test)
+test_an_idle_loop_gives_back_its_warm_stacks :: proc(t: ^testing.T) {
+	sync.atomic_store(&idle_now, time.tick_now()._nsec)
+	r, started := start(t, idle_clock)
+	if !started {
+		return
+	}
+	defer finish(r)
+	l := r.l
+	N :: 40
+	if !burst(t, l, N) {
+		return
+	}
+	// The premise: the burst left more than a quiet loop keeps.
+	testing.expectf(t, warm_count(l) > WARM_IDLE_KEEP, "only %d stacks were kept after a burst of %d", warm_count(l), N)
+
+	// The burst's window ends, then a window the loop spends idle; a fiber
+	// started wakes the loop to see each end.
+	for _ in 0 ..< 2 {
+		sync.atomic_add(&idle_now, i64(TRIM_AFTER))
+		if _, ok := spawn(l, noop, nil); !testing.expect(t, ok) {
+			return
+		}
+		if !testing.expect(t, fibers_gone(l), "the waking fiber never finished") {
+			return
+		}
+	}
+	start := time.tick_now()
+	for warm_count(l) > WARM_IDLE_KEEP && time.tick_since(start) < 5 * time.Second {
+		time.sleep(time.Millisecond)
+	}
+	testing.expectf(t, warm_count(l) <= WARM_IDLE_KEEP, "%d stacks still warm after an idle window", warm_count(l))
 }
 
 /*

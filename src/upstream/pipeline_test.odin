@@ -380,7 +380,7 @@ test_a_full_connection_does_not_shut_callers_out :: proc(t: ^testing.T) {
 	it. Harmless in itself - the overshoot is bounded by the number of callers,
 	which is what the figure was bounding - but it would make this test's
 	question ("did anyone past the bound get a connection of their own?") one
-	the code does not actually promise. Letting the first wave register first
+	the code does not actually promise. Waiting for the first wave to register
 	asks the question the branch exists to answer instead of racing it.
 	*/
 	legs := make([]Pipe_Leg, LEGS)
@@ -396,7 +396,10 @@ test_a_full_connection_does_not_shut_callers_out :: proc(t: ^testing.T) {
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&legs[i], pipe_leg)
 		if i == BOUND - 1 {
-			time.sleep(150 * time.Millisecond)
+			full := handoff_await(u, proc(c: ^Pipe_Conn) -> bool {
+				return len(c.waiters) == BOUND
+			})
+			testing.expect(t, full != nil, "the first wave never filled the connection")
 		}
 	}
 	for th in threads {
@@ -1118,7 +1121,11 @@ half_read_case :: proc(t: ^testing.T, split_prefix: bool) {
 		timeout = PATIENT,
 	}
 	first := thread.create_and_start_with_poly_data(&quitter, pipe_leg)
-	time.sleep(50 * time.Millisecond)
+	// The quitter is the one reading when the patient leg arrives.
+	reading := handoff_await(u, proc(c: ^Pipe_Conn) -> bool {
+		return len(c.waiters) == 1 && c.reading
+	})
+	testing.expect(t, reading != nil, "the impatient caller never took the reading")
 	second := thread.create_and_start_with_poly_data(&patient, pipe_leg)
 	for th in ([]^thread.Thread{first, second}) {
 		thread.join(th)
@@ -2237,9 +2244,17 @@ test_a_timeout_does_not_teach_an_idle_ceiling :: proc(t: ^testing.T) {
 	_, e1 := exchange(u, wire, 200 * time.Millisecond, context.temp_allocator)
 	testing.expectf(t, e1 == .Timeout, "the silent server answered: %v", e1)
 
-	// Past `PIPE_IDLE_FLOOR`, so this is a gap the ceiling would believe if a
-	// timeout were allowed to teach it.
-	time.sleep(PIPE_IDLE_FLOOR + 300 * time.Millisecond)
+	// Aged past `PIPE_IDLE_FLOOR`, so this is a gap the ceiling would believe
+	// if a timeout were allowed to teach it.
+	sync.mutex_lock(&u.mu)
+	c := u.pipe
+	sync.mutex_unlock(&u.mu)
+	if !testing.expect(t, c != nil, "the first timeout took the connection down") {
+		return
+	}
+	sync.mutex_lock(&c.mu)
+	c.last = loop.moment_add(c.last, -(PIPE_IDLE_FLOOR + 300 * time.Millisecond))
+	sync.mutex_unlock(&c.mu)
 
 	// `PIPE_SILENT_TIMEOUTS` reached: this one takes the connection down, on a
 	// timeout rather than a hang-up.

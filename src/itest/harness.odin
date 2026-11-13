@@ -546,8 +546,8 @@ wait_ready :: proc(srv: ^Server, timeout: time.Duration) -> bool {
 @(private = "file")
 wait_answer :: proc(port: int, timeout: time.Duration, tcp: bool) -> bool {
 	probe := probe_query()
-	deadline := time.time_add(time.now(), timeout)
-	for time.diff(deadline, time.now()) < 0 {
+	deadline := time.tick_add(time.tick_now(), timeout)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
 		res := tcp ? query_tcp(port, probe, context.temp_allocator, PROBE_TIMEOUT) : query_udp(port, probe, context.temp_allocator, PROBE_TIMEOUT)
 		if res.ok {
 			return true
@@ -596,8 +596,8 @@ reachable and no fixture is spent.
 @(private)
 wait_dot :: proc(dot_port: int, timeout: time.Duration) -> bool {
 	probe := probe_query()
-	deadline := time.time_add(time.now(), timeout)
-	for time.diff(deadline, time.now()) < 0 {
+	deadline := time.tick_add(time.tick_now(), timeout)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
 		res := query_dot(dot_port, probe, context.temp_allocator)
 		if res.ok {
 			return true
@@ -624,8 +624,8 @@ offer, so the probe negotiates what they go on to negotiate.
 */
 @(private)
 wait_doh :: proc(doh_port: int, timeout: time.Duration) -> bool {
-	deadline := time.time_add(time.now(), timeout)
-	for time.diff(deadline, time.now()) < 0 {
+	deadline := time.tick_add(time.tick_now(), timeout)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
 		conn, ok := dial_tls(doh_port, []string{"h2", "http/1.1"})
 		if ok {
 			close_tls(&conn)
@@ -669,8 +669,8 @@ before this server has done anything. So it takes `log_count` before acting and
 waits for one more than that.
 */
 wait_for_log_count :: proc(srv: ^Server, needle: string, want: int, timeout: time.Duration) -> bool {
-	deadline := time.time_add(time.now(), timeout)
-	for time.diff(deadline, time.now()) < 0 {
+	deadline := time.tick_add(time.tick_now(), timeout)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
 		if log_count(srv, needle) >= want {
 			return true
 		}
@@ -720,8 +720,8 @@ signal_shutdown :: proc(srv: ^Server, within: time.Duration) -> (state: os.Proce
 	if posix.kill(posix.pid_t(srv.process.pid), .SIGTERM) != .OK {
 		return {}, false
 	}
-	deadline := time.time_add(time.now(), within)
-	for time.diff(time.now(), deadline) > 0 {
+	deadline := time.tick_add(time.tick_now(), within)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
 		s, err := os.process_wait(srv.process, 100 * time.Millisecond)
 		if err == nil && s.exited {
 			srv.running = false
