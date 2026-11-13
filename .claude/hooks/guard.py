@@ -163,8 +163,9 @@ NEW_BRANCH = {"-b", "-B", "--detach", "--orphan"}
 
 
 def changes_branch(where, sub, args):
-    """Whether a `switch`/`checkout` changes branch. A checkout with one target naming a commit
-    does; a path, a deleted file, `--` or more than one target is a restore."""
+    """Whether a `switch` or `checkout` changes branch."""
+    # A checkout with one target naming a commit does; a path, a deleted file,
+    # `--` or more than one target is a restore.
     if sub == "switch" or (sub == "checkout" and NEW_BRANCH & set(args)):
         return True
     if sub != "checkout" or "--" in args:
