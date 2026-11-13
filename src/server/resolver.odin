@@ -293,14 +293,16 @@ handle_query :: proc(
 	allocator := context.allocator,
 	/*
 	Which queries this one is among: `.Shared` for those counted against
-	`server.max_pending` - UDP and HTTP/2, which `submit_query` starts on fibers
-	of their own - and `.Connection` for TCP, DoT and HTTP/1.1, which answer on
-	the connection's fiber and are bounded by `max_connections` instead. Read by
+	`server.max_pending` - UDP, HTTP/2 and the TCP and DoT queries beside a
+	connection's own place, which `submit_query` starts on fibers of their own -
+	and `.Connection` for a connection's own place, one per connection and
+	bounded by `max_connections` instead. Read by
 	the DNSSEC chain-walk bound and the follower ceiling, each of which keeps a
 	reserve per population; see `dnssec.Walk_Pool`.
 
 	Defaulted to the counted reading so that a caller which has not thought
-	about it gets the tighter guard; the two that answer on a connection say so.
+	about it gets the tighter guard; those that answer in a connection's own place
+	say so.
 	*/
 	pool := dnssec.Walk_Pool.Shared,
 	/*
@@ -3152,7 +3154,7 @@ cache answers, so hits keep being admitted whatever the upstream is doing.
 Every wait is counted - leading an exchange, following a leader, walking the
 chain, waiting on an expired entry's refresh - because each holds a place in
 flight as long as the others do, and leaving any one out lets a flood shaped to
-it fill the reservation. Queries answered on a connection's fiber are not:
+it fill the reservation. Queries in a connection's own place are not:
 `max_connections` bounds those, and `max_pending` does not count them.
 */
 @(private)

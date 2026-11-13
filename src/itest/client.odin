@@ -207,7 +207,12 @@ stream_query :: proc(c: ^Test_Conn, query: []u8, allocator: mem.Allocator) -> Qu
 	if !conn_write(c, framed) {
 		return {}
 	}
+	return stream_read_answer(c, allocator)
+}
 
+// The next length-prefixed message on the stream.
+@(private)
+stream_read_answer :: proc(c: ^Test_Conn, allocator: mem.Allocator) -> Query_Result {
 	length_buf: [2]u8
 	if !conn_read_full(c, length_buf[:]) {
 		return {}

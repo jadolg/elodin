@@ -275,7 +275,7 @@ zone it has cached, and it cannot call a zone unsigned without one either - so
 while every slot is held, what still answers is what the caches hold, and every
 other cold name is SERVFAIL, signed or not.
 
-A query answered on a connection's fiber is held to `dnssec.max_connection_walks`
+A query in a connection's own place is held to `dnssec.max_connection_walks`
 instead, a share of `server.max_connections`, so a flood on one population cannot
 spend the other's walks. See `Validator.walks`, `dnssec.Walk_Pool` and issue #356.
 */

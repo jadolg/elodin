@@ -101,10 +101,22 @@ elodin's.
 
 `server.max_pending` bounds the queries in flight on fibers of their own: every
 UDP query and DoH-over-HTTP/2 request from the moment it is admitted until it is
-answered, and every cache refresh. Past it a datagram is dropped - the client
-retries - and an HTTP/2 request is answered `503`, counted as `dropped=`.
-TCP, DoT and DoH over HTTP/1.1 answer one query at a time on their connection,
-in order, so `max_connections` bounds them instead.
+answered, every TCP or DoT query beyond the first one in flight on its
+connection, and every cache refresh. Past it a datagram is dropped - the client
+retries - and an HTTP/2 request is answered `503`, counted as `dropped=`; a TCP
+or DoT connection falls back to one query at a time until a place frees.
+
+Each TCP or DoT connection keeps one query in flight outside `max_pending`, and
+each DoH-over-HTTP/1.1 connection answers one query at a time, so
+`max_connections` bounds those instead.
+
+### Pipelined queries on TCP and DoT
+
+A client may send several queries down one TCP or DoT connection without
+waiting (Android's Private DNS does). Each is answered as soon as it is ready,
+in whatever order that is (RFC 7766 section 7), so a cache hit is not held up
+behind a miss sent before it. At most 16 are in flight per connection; past
+that elodin stops reading the connection until one is answered.
 
 The derived figure is memory over what a query can come to hold: the stack and
 scratch it uses (a few kilobytes for a cache hit, about 20 KB for a miss that
@@ -184,10 +196,10 @@ them.
 - **TCP, DoT and DoH**: one fiber per connection, capped together by
   `server.max_connections` (512) and per client by
   [`max_connections_per_prefix`](connections.md#how-many-connections-one-client-may-hold)
-  (half of it). TCP, DoT and HTTP/1.1 answer one query at a time per connection;
-  **HTTP/2 multiplexes**, each request on a fiber of its own counted against
-  `max_pending`. Connections are reused, so the cap bounds concurrent clients,
-  not queries per second.
+  (half of it). HTTP/1.1 answers one query at a time per connection; **TCP,
+  DoT and HTTP/2 answer concurrently**, each query on a fiber of its own (see
+  [pipelined queries](#pipelined-queries-on-tcp-and-dot)). Connections are
+  reused, so the cap bounds concurrent clients, not queries per second.
 
 A held TCP connection costs about 5 KB resident after a query - the page of
 stack its fiber is parked on and the fiber itself, since a connection that has

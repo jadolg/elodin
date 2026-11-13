@@ -144,8 +144,8 @@ below one still costs a DS lookup per label.
 
 | setting | covers | default (0) |
 |---|---|---|
-| `max_chain_walks` | queries counted in `server.max_pending`: UDP, DoH over HTTP/2, cache refreshes | `server.max_pending` less a reserved quarter (at least two): 307 of 409 on a 1 GiB machine |
-| `max_connection_walks` | queries on a connection: TCP, DoT and DoH over HTTP/1.1 | the same from `server.max_connections`: 384 of 512 connections |
+| `max_chain_walks` | queries counted in `server.max_pending`: UDP, DoH over HTTP/2, TCP and DoT queries beyond a connection's first in flight, cache refreshes | `server.max_pending` less a reserved quarter (at least two): 307 of 409 on a 1 GiB machine |
+| `max_connection_walks` | a connection's first query in flight on TCP and DoT, and DoH over HTTP/1.1 | the same from `server.max_connections`: 384 of 512 connections |
 
 The two are counted separately, so a flood on one transport cannot spend the
 other's allowance, and lowering one does nothing for the other. To cap the

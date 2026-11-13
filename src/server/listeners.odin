@@ -1934,15 +1934,20 @@ stream_tls_accept :: proc(job: ^Stream_Job, timeout: time.Duration, client: stri
 /*
 Serve DNS messages on a stream, framed with the two-byte length prefix.
 
-Queries on one connection are answered in order. Pipelining clients are rare
-enough that the extra machinery to answer out of order is not worth the
-complexity here.
+This fiber reads; each query is answered on a fiber of its own, so a client that
+pipelines has its answers back as each is ready, in whatever order that is (RFC
+7766 sections 6.2.1.1 and 7) - see `Stream_Session`. Returns once every query it read
+has been answered.
 */
 @(private)
 serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string) {
-	// Whether this connection has anything the close could take back, which is
-	// what decides whether the refusal below drains first - see `stream_linger`.
-	answered := false
+	session := Stream_Session {
+		server = s,
+		conn   = conn,
+		proto  = proto,
+		client = client,
+	}
+	defer stream_settle(&session)
 	reader: Stream_Reader
 	budget: Read_Budget
 	// A client pipelining queries the cache answers never lets this fiber park;
@@ -1957,8 +1962,22 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		*/
 		budget.idle = client_timeout(s)
 		budget.deadline = {}
+		between := reader.start == reader.end
 		query, read := stream_read_message(conn, &reader, &budget)
 		if !read {
+			/*
+			An idle wait that ran out with queries still in flight is waited out
+			again from the last answer: a connection waiting on its answers is
+			not idle (RFC 7766 section 6.2.3). Only a wait between messages - no
+			byte of the next one read, so the deadline never started - and a
+			connection that has ended reads its end again.
+			*/
+			if between && budget.idle > 0 && budget.deadline == (time.Tick{}) && stream_settle(&session) {
+				continue
+			}
+			return
+		}
+		if sync.atomic_load(&session.broken) {
 			return
 		}
 
@@ -2017,42 +2036,14 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		}
 		if !stream_admits(s, conn.peer) {
 			report_rate_limited(client, proto, true)
-			if answered {
+			stream_settle(&session)
+			if sync.atomic_load(&session.answered) {
 				stream_linger(conn)
 			}
 			return
 		}
 
-		// TCP and DoT: this is the connection's own fiber, so an answer waiting on
-		// the network here costs nobody but this client. On the connection's fiber,
-		// outside `max_pending`; see `handle_query`'s `pool`.
-		response, _, ok := handle_query(s, query, proto, client, context.temp_allocator, pool = .Connection)
-		if !ok || len(response) == 0 {
-			free_all(context.temp_allocator)
-			continue
-		}
-
-		/*
-		An answer that cannot be framed cannot be sent, and the query it
-		answers is one the client is waiting on: closed rather than left
-		unanswered, so it asks again on a new connection now (RFC 7766 section
-		6.2.4) rather than at its timeout. Drained first where answers have
-		gone out, as for the rate-limit close above: a pipelining client's
-		unread queries would turn the close into an RST that takes them back.
-		The scratch is freed so the drain has room for its chunk.
-		*/
-		framed, framed_built := stream_frame(response, context.temp_allocator)
-		if !framed_built {
-			if answered {
-				free_all(context.temp_allocator)
-				stream_linger(conn)
-			}
-			return
-		}
-		if !conn_write_all(conn, framed) {
-			return
-		}
-		answered = true
+		stream_dispatch(&session, query)
 		free_all(context.temp_allocator)
 	}
 }

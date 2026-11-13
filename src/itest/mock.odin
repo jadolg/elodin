@@ -130,6 +130,8 @@ Mock :: struct {
 	failed_starts: int,
 
 	mu:          sync.Mutex,
+	// Broadcast whenever a query arrives or a reply is held; see `mock_wait_until`.
+	changed:     sync.Cond,
 	udp_queries: int,
 	// `udp_queries` when the hold was set, so a report counts only what came after.
 	udp_before_hold: int,
@@ -374,6 +376,25 @@ record_query :: proc(m: ^Mock, query: []u8) {
 	}
 	m.last_query = make([]u8, len(query))
 	copy(m.last_query, query)
+	sync.cond_broadcast(&m.changed)
+}
+
+/*
+Wait until `ready(m, want)` holds, rechecked each time a query arrives or a reply
+is held, for at most `timeout`; true when it held in time. `ready` runs under
+`m.mu`, so it reads the counts directly.
+*/
+mock_wait_until :: proc(m: ^Mock, ready: proc(m: ^Mock, want: int) -> bool, want: int, timeout: time.Duration) -> bool {
+	deadline := time.tick_add(time.tick_now(), timeout)
+	sync.mutex_lock(&m.mu)
+	defer sync.mutex_unlock(&m.mu)
+	for !ready(m, want) {
+		left := time.tick_diff(time.tick_now(), deadline)
+		if left <= 0 || !sync.cond_wait_with_timeout(&m.changed, &m.mu, left) {
+			return ready(m, want)
+		}
+	}
+	return true
 }
 
 /*
@@ -797,7 +818,11 @@ mock_udp_loop :: proc(m: ^Mock) {
 			// Only until the hold is reached: a reply after it keeps its delay.
 			if hold := sync.atomic_load(&m.hold_until); hold > 0 && sync.atomic_load(&m.held) < hold {
 				append(&held, job)
-				if sync.atomic_add(&m.held, 1) + 1 >= hold {
+				reached := sync.atomic_add(&m.held, 1) + 1 >= hold
+				sync.mutex_lock(&m.mu)
+				sync.cond_broadcast(&m.changed)
+				sync.mutex_unlock(&m.mu)
+				if reached {
 					// The hold stands in for the rule's delay: all of them go out now.
 					for h in held {
 						h.rule.delay = 0
