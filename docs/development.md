@@ -18,9 +18,10 @@ mise run build            # bin/elodin, with debug info
 mise run release          # bin/elodin, optimised
 mise run test             # unit tests
 mise run itest            # integration tests against the built binary
+mise run itest-release    # the same suite against the optimised build
 mise run leakcheck        # the same suite under AddressSanitizer
 mise run verify           # check + test + itest
-mise run check            # type-check with -vet -strict-style
+mise run check            # -vet -strict-style on every package (tests included), and scripts/lint.py
 mise run fuzz             # build the libFuzzer targets in src/fuzz
 mise run fuzz-regression  # replay the committed corpus through each of them
 mise run parity           # compare answers with the upstream's, synthetic upstream
@@ -64,8 +65,10 @@ testdata/      fuzz corpus and dictionary, committed so a found crash stays
                found, the parity seeds that have found a divergence, plus
                gen/ - the generator behind the DNSSEC fixtures
 bench/         benchmark harness and DNSSEC survey, in Go, with committed results
-scripts/       fuzz and leak-check helpers, and re2diff/: regex rules against
-               urlfilter, a Go generator and oracle with the Odin driver it runs
+scripts/       fuzz and leak-check helpers; lint.py, the patterns `check` refuses;
+               push-gate.sh and merge-gate.sh, which push and merge only past the
+               gates; and re2diff/: regex rules against urlfilter, a Go generator
+               and oracle with the Odin driver it runs
 examples/      the annotated reference configuration, one per deployment (local-only,
                lan, small-device, public, container), a development one, and a
                Grafana dashboard
@@ -89,6 +92,19 @@ handshake errno) are saved and restored with it (`loop.register_local`).
 
 `mise run verify` runs the type check, unit and integration tests. Leak checking
 and fuzz regression run in CI; `mise run bench` measures rather than asserts.
+`scripts/push-gate.sh` runs `verify` and `parity-regression` (plus `leakcheck`
+with `--leak`, `fuzz-regression` with `--fuzz`) and pushes only if all pass;
+`scripts/merge-gate.sh <pr>` merges only a head that is not behind `main` and
+whose every check passed.
+
+**Lint** (`scripts/lint.py`, part of `check`) refuses patterns that reviews kept
+finding. Some rules hold for the whole tree (`strings.equal_fold` outside tests,
+`strings.trim_space` in HTTP code, `strconv`'s integer parsers on config and wire
+input, a format in `testing.expect`, a line number in a comment); others only for
+lines a branch adds, diffed against `LINT_BASE` (default: the merge base with
+`origin/main`): a discarded error or `ok` in a test, `time.sleep` and `time.now`
+in tests, and comments narrating history. A deliberate exception carries
+`lint:allow <reason>` on its line.
 
 **Unit tests** (`mise run test`) run per package, so a failure names one. One
 test on its own is `odin test src/<pkg> -collection:elodin=src
@@ -333,7 +349,8 @@ by hand: `curl --http2 -k -H 'content-type: application/dns-message'
 **CI** (`.github/workflows/ci.yml`) runs on every pull request and every push to
 `main`:
 
-- once: `mise run check`, `fuzz-regression`, `parity-regression`, `leakcheck`
+- once: `mise run check`, `fuzz-regression`, `parity-regression`, `leakcheck`,
+  `itest-release`
 - on both architectures: `mise run test`, `itest`, `build`, and `mise run deb`,
   whose package is installed on the runner, made to resolve a handful of names
   through the resolver takeover it performs, then removed, checking the runner
