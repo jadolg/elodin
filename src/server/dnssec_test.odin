@@ -1,5 +1,6 @@
 package server
 
+import "core:mem"
 import "core:testing"
 import "core:time"
 import "elodin:cache"
@@ -983,4 +984,40 @@ test_an_unrebuildable_answer_still_has_its_ttl_held :: proc(t: ^testing.T) {
 		testing.expectf(t, rec.ttl <= 300, "%v went out with TTL %d over a ceiling of 300", rec.type, rec.ttl)
 	}
 	free_all(context.temp_allocator)
+}
+
+/*
+A Secure answer whose prune runs out of memory is not presented at all (#636):
+the fallback for a prune that fails on the message - the answer without AD - is
+what the cache would keep for the life of the entry, and the refusal was this
+server's, for a moment. Every allocation of the prune refused in turn.
+*/
+@(test)
+test_a_prune_that_runs_dry_presents_nothing :: proc(t: ^testing.T) {
+	wire, encoded := encode(t, signed_response())
+	if !encoded {
+		return
+	}
+	defer free_all(context.temp_allocator)
+	whole, whole_ok := present_response(wire, client_query(true), .A, secure_verdict(), nil, context.temp_allocator)
+	if !testing.expect(t, whole_ok, "the answer was not presented with nothing refused") {
+		return
+	}
+	testing.expect(t, whole[3] & 0x20 != 0, "AD did not record a secure verdict with nothing refused")
+	query, verdict := client_query(true), secure_verdict()
+	refused := 0
+	for n := 1; ; n += 1 {
+		// The request's arena; `Fail_Nth` hands what it passes on to the temp
+		// allocator, so that one is left alone.
+		f := Fail_Nth{fail_at = n, fail_for = 1}
+		out, ok := present_response(wire, query, .A, verdict, nil, mem.Allocator{procedure = fail_nth_proc, data = &f})
+		if f.seen < n {
+			break
+		}
+		refused += 1
+		// A refusal past the prune - the AD-less copy's own rebuild - is not
+		// this test's; the prune's are the ones that leave AD off.
+		testing.expectf(t, !ok || out[3] & 0x20 != 0, "allocation %d refused: presented without AD", n)
+	}
+	testing.expect(t, refused > 0, "the prune allocated nothing to refuse")
 }

@@ -1,7 +1,9 @@
 package dnssec
 
 import "core:mem"
+import "core:sync"
 import "core:testing"
+import "core:thread"
 import "core:time"
 import "elodin:dns"
 import "elodin:loop"
@@ -387,4 +389,139 @@ test_a_lookup_runs_on_the_questions_own_scratch :: proc(t: ^testing.T) {
 	testing.expect_value(t, result.status, Status.Secure)
 	testing.expect(t, seen.calls > 0, "the walk asked nobody")
 	testing.expect_value(t, seen.others, 0)
+}
+
+// `copying_query`, after taking scratch of its own from the temp allocator, as
+// the server's lookup takes the query it sends.
+@(private = "file")
+scratch_taking_query :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, deadline: ^time.Tick) -> ([]u8, bool) {
+	if _, took := dns.alloc_slice([]u8, dns.MAX_UDP_SIZE, context.temp_allocator); !took {
+		return nil, false
+	}
+	return copying_query(ctx, name, type, allocator, deadline)
+}
+
+@(private = "file")
+Loop_Sweep :: struct {
+	done:     sync.Sema,
+	refused:  int,
+	wrong:    int,
+	first:    Result,
+	first_at: int,
+}
+
+/*
+On a loop, where the server validates, a lookup refused memory is this server's
+reading refused, not an unreachable chain: every allocation of the walk refused
+in turn, the lookups' own scratch included, is `READING_OVER_BUDGET`.
+*/
+@(test)
+test_a_lookup_that_runs_dry_on_a_loop_is_this_servers :: proc(t: ^testing.T) {
+	l, made := loop.make_loop()
+	if !testing.expect(t, made, "no loop") {
+		return
+	}
+	th := loop.spawn_thread(l, loop.run, context)
+	if !testing.expect(t, th != nil, "no loop thread") {
+		loop.destroy(l)
+		return
+	}
+	defer {
+		loop.stop(l)
+		thread.join(th)
+		thread.destroy(th)
+		loop.destroy(l)
+	}
+	s: Loop_Sweep
+	_, spawned := loop.spawn(l, proc(data: rawptr) {
+		s := (^Loop_Sweep)(data)
+		defer sync.sema_post(&s.done)
+		wire := unhex(fixture("example_a").wire, context.allocator)
+		defer delete(wire)
+		scratch := context.temp_allocator
+		for n := 1; ; n += 1 {
+			v := make_validator(scratch_taking_query, nil, Options{})
+			defer destroy_validator(v)
+			f := Fail_Nth{backing = scratch, fail_at = n, fail_for = 1}
+			result: Result
+			{
+				failing := mem.Allocator{procedure = fail_nth_proc, data = &f}
+				context.temp_allocator = failing
+				result = validate(v, "www.example.com.", .A, wire, fixture_now(), failing)
+			}
+			free_all(scratch)
+			if f.seen < n {
+				break
+			}
+			s.refused += 1
+			if result.status != .Indeterminate || result.reason != READING_OVER_BUDGET {
+				if s.wrong == 0 {
+					s.first, s.first_at = result, n
+				}
+				s.wrong += 1
+			}
+		}
+	}, &s)
+	if !testing.expect(t, spawned, "the sweep did not start") {
+		return
+	}
+	if !testing.expect(t, sync.sema_wait_with_timeout(&s.done, 60 * time.Second), "the sweep never finished") {
+		return
+	}
+	testing.expect(t, s.refused > 0, "the walk allocated nothing to refuse")
+	testing.expectf(t, s.wrong == 0, "%d of %d refusals not this server's, the first at %d: %v (%s)", s.wrong, s.refused, s.first_at, s.first.status, s.first.reason)
+}
+
+/*
+A zone `cache_put` cannot copy the name of evicts nothing to make room for it: a
+full cache keeps its coldest entry rather than trading it for nothing.
+*/
+@(test)
+test_a_zone_that_cannot_be_named_evicts_nothing :: proc(t: ^testing.T) {
+	v := make_validator(counting_query, nil, Options{max_cached_zones = 1})
+	defer destroy_validator(v)
+	now := loop.moment_now()
+	cache_put(v, nil, "kept.example.", .Insecure, nil, MAX_ZONE_TTL, now)
+	_, kept, _ := cache_get(v, "kept.example.", now, context.temp_allocator)
+	if !testing.expect(t, kept, "the first zone was not cached") {
+		return
+	}
+	refused := 0
+	for n := 1; ; n += 1 {
+		heap := v.allocator
+		f := Fail_Nth{backing = heap, fail_at = n, fail_for = 1}
+		v.allocator = mem.Allocator{procedure = fail_nth_proc, data = &f}
+		cache_put(v, nil, "new.example.", .Insecure, nil, MAX_ZONE_TTL, now)
+		v.allocator = heap
+		_, stored, _ := cache_get(v, "new.example.", now, context.temp_allocator)
+		if f.seen < n {
+			testing.expect(t, stored, "the new zone was not cached with nothing refused")
+			break
+		}
+		refused += 1
+		_, still, _ := cache_get(v, "kept.example.", now, context.temp_allocator)
+		testing.expectf(t, still && !stored, "allocation %d refused: kept %v, new %v", n, still, stored)
+	}
+	testing.expect(t, refused > 0, "the cache took no copy to refuse")
+	free_all(context.temp_allocator)
+}
+
+/*
+An entry the zone map has no room to take is not linked into the eviction list
+either, where it could never be found or swept.
+*/
+@(test)
+test_a_zone_the_map_cannot_take_is_not_listed :: proc(t: ^testing.T) {
+	v := make_validator(counting_query, nil, Options{})
+	defer destroy_validator(v)
+	// An empty map that cannot grow: the next new zone is the insert that fails.
+	delete(v.zones)
+	zones, zerr := make(map[string]^Zone_Entry, 0, mem.nil_allocator())
+	if !testing.expect_value(t, zerr, nil) {
+		return
+	}
+	v.zones = zones
+	cache_put(v, nil, "unmapped.example.", .Insecure, nil, MAX_ZONE_TTL, loop.moment_now())
+	testing.expect_value(t, len(v.zones), 0)
+	testing.expect(t, v.lru_head == nil && v.lru_tail == nil, "an entry the map refused is on the eviction list")
 }

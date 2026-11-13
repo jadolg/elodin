@@ -525,22 +525,25 @@ readings is bounded only by its own length. Borrowed from the caller
 	dry:           ^bool,
 	/*
 	The temp allocator the question came with, under `validate`'s watch, or
-	zero where nobody is watching. `look_up` hands it back to the lookup, which
-	can start work that outlives the validation - a race's legs - and the watch
-	lives in `validate`'s frame.
+	zero where nobody is watching. `look_up` hands it back to a lookup made off
+	a loop; see there.
 	*/
 	scratch:       mem.Allocator,
 }
 
 /*
-Ask `v.query` for `name`, with the temp allocator the question came with rather
-than the watch over it; see `Budget.scratch`. A lookup refused memory reports
-its own failure.
+Ask `v.query` for `name`. On a loop, under the watch: what the lookup starts
+runs on the loop's fibers, with the loop's context, and a lookup refused memory
+is this server's failure rather than an unreachable chain. Off a loop, with the
+temp allocator the question came with (`Budget.scratch`): there what it starts
+- a race's legs - runs on threads with the caller's context, and would hold the
+watch past `validate`'s frame.
 */
 @(private)
 look_up :: proc(v: ^Validator, budget: ^Budget, name: string, type: dns.Type, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
 	// Not in an `if`: a context assignment lasts only to the end of its block.
-	context.temp_allocator = budget.scratch if budget.scratch.procedure != nil else context.temp_allocator
+	unwatched := loop.current_loop() == nil && budget.scratch.procedure != nil
+	context.temp_allocator = budget.scratch if unwatched else context.temp_allocator
 	return v.query(v.query_ctx, name, type, allocator, budget.deadline)
 }
 
@@ -1298,9 +1301,9 @@ validity window of the captured signatures.
 
 A validation that is refused memory - by `allocator` or the temp allocator,
 anywhere in it - is `Indeterminate` for `READING_OVER_BUDGET` whatever its steps
-reached, and leaves the zone cache as it was: a refused allocation can drop a
-DS, a key or a signature from the set a step judges, and the verdict on what was
-left is not about the zone (issue #636).
+reached, and caches nothing it settles from then on: a refused allocation can
+drop a DS, a key or a signature from the set a step judges, and the verdict on
+what was left is not about the zone (issue #636).
 */
 validate :: proc(
 	v: ^Validator,
@@ -1603,6 +1606,8 @@ strip_unauthenticated :: proc(
 	// The request's counter, as in `validate`: this is one more reading of the
 	// same response into the same arena. See issue #354.
 	spent: ^int = nil,
+	// Set where the prune failed for want of memory, rather than on the message.
+	refused: ^bool = nil,
 ) -> (
 	out: []u8,
 	ok: bool,
@@ -1610,9 +1615,12 @@ strip_unauthenticated :: proc(
 	if result.status != .Secure {
 		return wire, true
 	}
+	dry := false
+	defer if refused != nil {
+		refused^ = dry
+	}
 	// A signature whose signer cannot be read for want of memory is dropped
 	// like one that does not parse, so a prune that ran dry is no prune.
-	dry := false
 	watched := dns.Dry_Watch{backing = allocator, dry = &dry}
 	scratch := dns.Dry_Watch{backing = context.temp_allocator, dry = &dry}
 	context.temp_allocator = dns.dry_watch_allocator(&scratch)
@@ -1622,9 +1630,14 @@ strip_unauthenticated :: proc(
 	if derr != .None {
 		return nil, false
 	}
-	msg.answer = authenticated_only(msg.answer, result.answer, watching) or_return
-	msg.authority = authenticated_only(msg.authority, result.authority, watching) or_return
-	msg.additional = authenticated_and_opt(msg.additional, result.additional, watching) or_return
+	answer, answer_kept := authenticated_only(msg.answer, result.answer, watching)
+	authority, authority_kept := authenticated_only(msg.authority, result.authority, watching)
+	additional, additional_kept := authenticated_and_opt(msg.additional, result.additional, watching)
+	if !answer_kept || !authority_kept || !additional_kept {
+		dry = true
+		return nil, false
+	}
+	msg.answer, msg.authority, msg.additional = answer, authority, additional
 
 	/*
 	A truncated rebuild is a failure, not a result. `encode_message` drops
@@ -2907,6 +2920,9 @@ validate_rrset :: proc(
 	unsupported := false
 	exhausted := false
 	skipped_for_shed := false
+	// Why a signer's walk stopped short, for the first signature skipped for
+	// it other than by shedding; see the return that reads it.
+	unreached: string
 	// Whether a signature inside its window named a key and was tried, which
 	// keeps a lapsed one beside it from being what the verdict is put down to.
 	tried := false
@@ -2938,6 +2954,8 @@ validate_rrset :: proc(
 		// than stopped by anything about the zone. Read below, where a
 		// signature it would have judged is skipped.
 		shed:        bool,
+		// Why it stopped, where it came back `Indeterminate`.
+		stopped:     string,
 	}
 	walked := make([dynamic]Walked, 0, 4, allocator)
 	/*
@@ -2967,10 +2985,11 @@ validate_rrset :: proc(
 		established: string
 		seen_walk := false
 		walk_shed := false
+		stopped: string
 		for w in walked {
 			if dns.name_equal_fold(w.signer, sig.signer) {
 				zone_status, keys, established = w.status, w.keys, w.established
-				walk_shed = w.shed
+				walk_shed, stopped = w.shed, w.stopped
 				seen_walk = true
 				break
 			}
@@ -2980,6 +2999,7 @@ validate_rrset :: proc(
 			// Exact for this walk: `zone_trust` clears the reason on the way in,
 			// so what is there afterwards is this walk's own.
 			walk_shed = budget.walk_stopped == WALKS_IN_FLIGHT
+			stopped = walk_reason(budget) if zone_status == .Indeterminate else ""
 			// The walk held up and still did not reach the zone this signature
 			// names; see `forget_unreached_non_cut`. The signer is the
 			// response's to choose rather than the client's, so what it can
@@ -2995,6 +3015,7 @@ validate_rrset :: proc(
 					keys = keys,
 					established = established,
 					shed = walk_shed,
+					stopped = stopped,
 				},
 			)
 		}
@@ -3004,6 +3025,9 @@ validate_rrset :: proc(
 			// so the verdict below cannot call the set forged on the strength
 			// of one that was not tried; see that return.
 			skipped_for_shed ||= walk_shed
+			if zone_status == .Indeterminate && !walk_shed && unreached == "" {
+				unreached = stopped
+			}
 			continue
 		}
 		/*
@@ -3135,6 +3159,15 @@ validate_rrset :: proc(
 	*/
 	if skipped_for_shed {
 		return .Indeterminate, "", WALKS_IN_FLIGHT, "", {}, {}
+	}
+	/*
+	The same for a signer walk that stopped for any other reason - a lookup
+	that failed, an allowance spent - and a later walk to the owner that held
+	up. A single lost reply is enough: the signature went untried, and might
+	have been the genuine one. An upstream that did not answer is not a forgery.
+	*/
+	if unreached != "" {
+		return .Indeterminate, "", unreached, "", {}, {}
 	}
 	// Unsigned, below a DS denial nobody could read: an unsigned delegation or
 	// a forgery, and nothing here says which. See `Budget.walk_past_ceiling`.
@@ -4995,6 +5028,8 @@ cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, 
 	if entry == nil {
 		return
 	}
+	// Before the lock, and before anything is evicted to make room for it.
+	entry.zone = strings.clone(key, stored)
 	entry.status = status
 	entry.expires = loop.moment_add(now, time.Duration(lifetime) * time.Second)
 	oversized := false
@@ -5075,15 +5110,14 @@ cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, 
 	*/
 	if oversized {
 		sync.atomic_add(&v.oversized, 1)
-		entry.zone = ""
 		free_entry(v, entry)
 		return
 	}
 
 	if old, exists := v.zones[key]; exists {
-		// Reuse the string the map is already keyed by. Re-inserting under the
-		// caller's stack-backed `key` would leave the map holding a pointer
-		// into a frame that is about to go away.
+		// Reuse the string the map is already keyed by, and drop this one's: the
+		// map's key must not change under it while it holds the entry.
+		delete(entry.zone, v.allocator)
 		entry.zone = old.zone
 		old.zone = ""
 		zone_unlink(v, old)
@@ -5098,12 +5132,13 @@ cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, 
 	for len(v.zones) >= v.max_cached_zones && v.lru_tail != nil {
 		drop_zone(v, v.lru_tail)
 	}
-	entry.zone = strings.clone(key, stored)
-	if held_dry {
+	// A map that could not grow takes nothing, and says so only by not holding
+	// the key; an entry linked without it would never be found or swept.
+	v.zones[entry.zone] = entry
+	if entry.zone not_in v.zones {
 		free_entry(v, entry)
 		return
 	}
-	v.zones[entry.zone] = entry
 	zone_push_front(v, entry)
 }
 

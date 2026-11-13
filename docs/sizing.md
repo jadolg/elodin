@@ -273,8 +273,8 @@ machine's memory, fails on its own and the server keeps running. It is
 answered SERVFAIL where there is room left to build one and gets no answer
 where there is not. A TCP, DoT or HTTP/1.1 DoH connection whose next request
 there is no room to read is closed. A DNSSEC validation refused memory anywhere is
-reported undecided (EDE 22), not bogus, and caches nothing about the zones it
-walked.
+reported undecided (EDE 22), not bogus, and caches nothing it settles after
+the refusal.
 
 ## Refused and failed connections
 
