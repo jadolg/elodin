@@ -2,7 +2,6 @@ package server
 
 import "core:mem"
 import "core:testing"
-import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
@@ -14,15 +13,6 @@ own, and never traps. The arena runs dry when the process is out of memory, an
 `RLIMIT_AS` is hit, or `vm.max_map_count` is reached; one query must not take
 the server down with it.
 */
-
-@(private = "file")
-oom_server :: proc(cfg: ^config.Config) -> Server {
-	cfg^ = config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	return Server{cfg = cfg}
-}
 
 @(private = "file")
 oom_query :: proc(t: ^testing.T) -> (wire: []u8, msg: dns.Message, ok: bool) {
@@ -52,8 +42,8 @@ then cannot build either.
 @(test)
 test_a_forward_that_cannot_be_built_fails_on_its_own :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := oom_server(&cfg)
-	wire, msg, ok := oom_query(t)
+	s := local_server(&cfg)
+	_, msg, ok := oom_query(t)
 	if !ok {
 		return
 	}
@@ -62,19 +52,8 @@ test_a_forward_that_cannot_be_built_fails_on_its_own :: proc(t: ^testing.T) {
 
 	for refresh in ([]bool{true, false}) {
 		before := s.stats.failed
-		st := Query_State {
-			s         = &s,
-			query     = wire,
-			msg       = msg,
-			q         = msg.question[0],
-			proto     = .UDP,
-			client    = "127.0.0.1:5555",
-			limit     = 512,
-			started   = time.tick_now(),
-			spent     = &spent,
-			allocator = mem.nil_allocator(),
-			refresh   = refresh,
-		}
+		st := stage_state(&s, msg, &spent, mem.nil_allocator())
+		st.refresh = refresh
 		testing.expect(t, shape_forwarded(&st), "a query with nothing to forward was handed on")
 		testing.expect_value(t, st.outcome, Outcome.Failed)
 		testing.expectf(t, !st.ok, "refresh=%v: an answer was reported built with no memory to build it", refresh)
@@ -98,7 +77,7 @@ nothing where there is not.
 @(test)
 test_a_query_read_without_memory_is_not_a_format_error :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := oom_server(&cfg)
+	s := local_server(&cfg)
 	wire, _, ok := oom_query(t)
 	if !ok {
 		return
@@ -135,8 +114,8 @@ test_a_query_read_without_memory_is_not_a_format_error :: proc(t: ^testing.T) {
 @(test)
 test_local_answers_with_no_memory :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := oom_server(&cfg)
-	_, msg, ok := oom_query(t)
+	s := local_server(&cfg)
+	query_wire, msg, ok := oom_query(t)
 	if !ok {
 		return
 	}
@@ -158,7 +137,6 @@ test_local_answers_with_no_memory :: proc(t: ^testing.T) {
 	_, block_dry_built := block_wire(&s, msg, msg.question[0], none, 512, false)
 	testing.expect(t, !block_dry_built, "a fast block answer was reported built with no memory to build it")
 
-	query_wire, _, _ := dns.encode_message(msg, context.temp_allocator)
 	_, refusal_built := upstream_refusal(query_wire, msg, "test", 512, none)
 	testing.expect(t, !refusal_built, "a refusal was reported built with no memory to build it")
 
@@ -203,49 +181,27 @@ so it is not built - or, for a refusal, built whole by `error_response`.
 */
 @(test)
 test_local_answers_with_their_opt_record_refused :: proc(t: ^testing.T) {
-	_, msg, ok := oom_query(t)
+	query_wire, msg, ok := oom_query(t)
 	if !ok {
 		return
 	}
 	defer free_all(context.temp_allocator)
-	query_wire, _, _ := dns.encode_message(msg, context.temp_allocator)
-	failed := false
-	first := mem.Allocator{procedure = fail_first_proc, data = &failed}
+	f := Fail_Nth{fail_at = 1, fail_for = 1}
+	first := mem.Allocator{procedure = fail_nth_proc, data = &f}
 	_, first_built := dnssec_failure_response(msg, dnssec.Result{status = .Bogus}, first, 512)
-	testing.expect(t, failed, "the allocator was never asked for anything")
+	testing.expect(t, f.seen >= 1, "the allocator was never asked for anything")
 	testing.expect(t, !first_built, "a DNSSEC failure was built without the client's OPT record")
 
 	// A refusal falls back to `error_response`, which builds it whole.
-	failed = false
+	f = Fail_Nth{fail_at = 1, fail_for = 1}
 	refusal, refusal_first_built := upstream_refusal(query_wire, msg, "test", 512, first)
-	testing.expect(t, failed, "the allocator was never asked for anything")
+	testing.expect(t, f.seen >= 1, "the allocator was never asked for anything")
 	if testing.expect(t, refusal_first_built, "a refusal was not built once there was memory for it") {
 		testing.expect_value(t, dns.peek_rcode(refusal), dns.Rcode.Serv_Fail)
 		read, rerr := dns.decode_message(refusal, context.temp_allocator)
 		testing.expect_value(t, rerr, dns.Decode_Error.None)
 		testing.expect(t, dns.edns_present(read), "a refusal was built without the client's OPT record")
 	}
-}
-
-// Fails the first request it is given and hands the rest to the heap.
-@(private = "file")
-fail_first_proc :: proc(
-	data: rawptr,
-	mode: mem.Allocator_Mode,
-	size, alignment: int,
-	old_memory: rawptr,
-	old_size: int,
-	loc := #caller_location,
-) -> (
-	[]byte,
-	mem.Allocator_Error,
-) {
-	failed := cast(^bool)data
-	if (mode == .Alloc || mode == .Alloc_Non_Zeroed) && !failed^ {
-		failed^ = true
-		return nil, .Out_Of_Memory
-	}
-	return context.temp_allocator.procedure(context.temp_allocator.data, mode, size, alignment, old_memory, old_size, loc)
 }
 
 /*
@@ -256,16 +212,17 @@ the root.
 @(test)
 test_an_upstream_query_whose_name_cannot_be_folded_is_not_built :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	failed := false
-	first := mem.Allocator{procedure = fail_first_proc, data = &failed}
+	f := Fail_Nth{fail_at = 1, fail_for = 1}
+	first := mem.Allocator{procedure = fail_nth_proc, data = &f}
 	q := dns.Question{name = "Example.COM.", type = .A, class = .IN}
 	wire, built := upstream_query(q, false, false, first)
-	testing.expect(t, failed, "the allocator was never asked for anything")
+	testing.expect(t, f.seen >= 1, "the allocator was never asked for anything")
 	testing.expectf(t, !built, "a query was built without its name: %v", wire)
 }
 
 // Fails `fail_for` requests from its `fail_at`th on and hands every other to
-// the temp arena.
+// the temp arena. src/dns/out_of_memory_test.odin keeps its own copy over its own
+// arena: test files cannot be shared across packages.
 @(private)
 Fail_Nth :: struct {
 	seen:     int,
@@ -307,7 +264,7 @@ cannot use.
 @(test)
 test_a_ddr_answer_keeps_its_opt_record_whatever_runs_dry :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := oom_server(&cfg)
+	s := local_server(&cfg)
 	// One designation, so the addresses are concatenated behind the OPT record.
 	cfg.ddr.name = "dns.example."
 	s.ddr.dot = true
@@ -441,15 +398,15 @@ test_a_dnssec_strip_that_runs_dry_is_whole_or_untouched :: proc(t: ^testing.T) {
 @(test)
 test_a_special_use_answer_that_built_nothing_is_counted_failed :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := oom_server(&cfg)
+	s := local_server(&cfg)
 	defer free_all(context.temp_allocator)
 	// And a blocked name, which is answered locally as well.
 	cfg.blocking.enabled = true
-	block, allow := filter.set_make(), filter.set_make()
-	filter.parse_list(block, allow, "||ads.example^\n", .Adblock)
-	engine := filter.engine_make()
+	engine, listed := test_filters(t, "||ads.example^\n", .Adblock)
 	defer filter.engine_destroy(engine)
-	filter.engine_swap(engine, block, allow)
+	if !listed {
+		return
+	}
 	s.filters = engine
 	Asked :: struct {
 		name:  string,
@@ -460,21 +417,8 @@ test_a_special_use_answer_that_built_nothing_is_counted_failed :: proc(t: ^testi
 		name := a.name
 		questions := make([]dns.Question, 1, context.temp_allocator)
 		questions[0] = dns.Question{name = name, type = a.type, class = a.class}
-		msg := dns.Message{id = 0x620, question = questions}
-		wire, _, _ := dns.encode_message(msg, context.temp_allocator)
 		spent: int
-		st := Query_State {
-			s         = &s,
-			query     = wire,
-			msg       = msg,
-			q         = msg.question[0],
-			proto     = .UDP,
-			client    = "127.0.0.1:5555",
-			limit     = 512,
-			started   = time.tick_now(),
-			spent     = &spent,
-			allocator = mem.nil_allocator(),
-		}
+		st := stage_state(&s, dns.Message{id = 0x620, question = questions}, &spent, mem.nil_allocator())
 		before := s.stats.failed
 		testing.expectf(t, answer_locally(&st), "%s was not answered locally", name)
 		testing.expectf(t, !st.ok, "%s: an answer was reported built with nothing to build it", name)
@@ -533,7 +477,7 @@ would hand back an empty list and the index into it would trap.
 @(test)
 test_a_bogus_verdict_remembered_without_memory_does_not_trap :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := oom_server(&cfg)
+	s := local_server(&cfg)
 	cfg.cache.enabled = true
 	msg := dns.Message {
 		id       = 0x620,
@@ -554,7 +498,7 @@ SERVFAIL, not the NODATA a client caches, and not counted as a rebind.
 @(test)
 test_a_rebind_check_read_without_memory_is_servfail_not_nodata :: proc(t: ^testing.T) {
 	cfg: config.Config
-	s := oom_server(&cfg)
+	s := local_server(&cfg)
 	cfg.rebind.enabled = true
 	defer free_all(context.temp_allocator)
 	_, msg, ok := oom_query(t)

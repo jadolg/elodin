@@ -5,7 +5,6 @@ import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:time"
-import "elodin:config"
 import "elodin:dns"
 import "elodin:logx"
 import "elodin:loop"
@@ -31,26 +30,6 @@ READERS :: 4
 SOURCES :: 64
 
 @(private = "file")
-fixture :: proc(cfg: ^config.Config, readers: int) {
-	cfg^ = config.default_config()
-	cfg.listeners.udp = config.Listener {
-		enabled        = true,
-		address        = "127.0.0.1",
-		port           = 0, // ephemeral, so the test never collides with a real server
-		readers        = readers,
-		receive_buffer = config.DEFAULT_UDP_RECEIVE_BUFFER,
-	}
-	cfg.listeners.tcp.enabled = false
-	cfg.listeners.dot.enabled = false
-	cfg.listeners.doh.enabled = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	cfg.log.queries = false
-	cfg.server.max_connections = 8
-	cfg.server.max_pending = 0
-}
-
-@(private = "file")
 Received_Probe :: struct {
 	listeners: ^Listeners,
 	want:      u64,
@@ -64,18 +43,6 @@ received_reached :: proc(data: rawptr) -> bool {
 		total += sync.atomic_load(&reader.received)
 	}
 	return total >= p.want
-}
-
-@(private = "file")
-wait_for :: proc(predicate: proc(data: rawptr) -> bool, data: rawptr, within: time.Duration) -> bool {
-	deadline := time.time_add(time.now(), within)
-	for time.diff(time.now(), deadline) > 0 {
-		if predicate(data) {
-			return true
-		}
-		time.sleep(time.Millisecond)
-	}
-	return predicate(data)
 }
 
 /*
@@ -93,26 +60,14 @@ machine has.
 */
 @(test)
 test_every_reader_binds_the_same_port :: proc(t: ^testing.T) {
-	cfg: config.Config
-	fixture(&cfg, READERS)
-	tl: Test_Loop
-	start_test_loop(&tl)
-	s := Server {
-		cfg          = &cfg,
-		loops        = tl.loops[:],
-	}
-
+	cfg := udp_listener_config(READERS)
+	s: Server
 	l: Listeners
-	if !start_listeners(&s, &l) {
-		stop_test_loop(&tl)
-		testing.expect(t, false, "could not start the UDP listener")
+	tl: Test_Loop
+	if !start_test_listeners(t, &s, &l, &tl, &cfg) {
 		return
 	}
-	defer {
-		stop_listeners(&l)
-		stop_test_loop(&tl)
-		destroy_listeners(&l)
-	}
+	defer stop_test_listeners(&l, &tl)
 
 	if !testing.expect_value(t, len(l.udp), READERS) {
 		return
@@ -159,26 +114,14 @@ reaching the cache, the filters or an upstream, none of which are wired up here.
 */
 @(test)
 test_the_kernel_spreads_datagrams_over_the_readers :: proc(t: ^testing.T) {
-	cfg: config.Config
-	fixture(&cfg, READERS)
-	tl: Test_Loop
-	start_test_loop(&tl)
-	s := Server {
-		cfg          = &cfg,
-		loops        = tl.loops[:],
-	}
-
+	cfg := udp_listener_config(READERS)
+	s: Server
 	l: Listeners
-	if !start_listeners(&s, &l) {
-		stop_test_loop(&tl)
-		testing.expect(t, false, "could not start the UDP listener")
+	tl: Test_Loop
+	if !start_test_listeners(t, &s, &l, &tl, &cfg) {
 		return
 	}
-	defer {
-		stop_listeners(&l)
-		stop_test_loop(&tl)
-		destroy_listeners(&l)
-	}
+	defer stop_test_listeners(&l, &tl)
 
 	bound := l.udp_bound
 	clients: [SOURCES]net.UDP_Socket
@@ -210,7 +153,7 @@ test_the_kernel_spreads_datagrams_over_the_readers :: proc(t: ^testing.T) {
 		listeners = &l,
 		want      = u64(opened),
 	}
-	if !testing.expect(t, wait_for(received_reached, &probe, 5 * time.Second), "not every datagram was read") {
+	if !testing.expect(t, wait_until(received_reached, &probe, 5 * time.Second), "not every datagram was read") {
 		return
 	}
 
@@ -250,26 +193,14 @@ worked only in a plural is one nobody would notice was broken until they set
 */
 @(test)
 test_one_reader_is_a_whole_listener :: proc(t: ^testing.T) {
-	cfg: config.Config
-	fixture(&cfg, 1)
-	tl: Test_Loop
-	start_test_loop(&tl)
-	s := Server {
-		cfg          = &cfg,
-		loops        = tl.loops[:],
-	}
-
+	cfg := udp_listener_config(1)
+	s: Server
 	l: Listeners
-	if !start_listeners(&s, &l) {
-		stop_test_loop(&tl)
-		testing.expect(t, false, "could not start the UDP listener")
+	tl: Test_Loop
+	if !start_test_listeners(t, &s, &l, &tl, &cfg) {
 		return
 	}
-	defer {
-		stop_listeners(&l)
-		stop_test_loop(&tl)
-		destroy_listeners(&l)
-	}
+	defer stop_test_listeners(&l, &tl)
 
 	if !testing.expect_value(t, len(l.udp), 1) {
 		return
@@ -319,27 +250,14 @@ reader drops the first datagram and is still there to read the second.
 */
 @(test)
 test_a_refused_start_drops_the_datagram_and_keeps_the_reader :: proc(t: ^testing.T) {
-	cfg: config.Config
-	fixture(&cfg, 1)
-	tl: Test_Loop
-	if !testing.expect(t, start_test_loop(&tl), "no loop") {
-		return
-	}
-	s := Server {
-		cfg   = &cfg,
-		loops = tl.loops[:],
-	}
+	cfg := udp_listener_config(1)
+	s: Server
 	l: Listeners
-	if !start_listeners(&s, &l) {
-		stop_test_loop(&tl)
-		testing.expect(t, false, "could not start the UDP listener")
+	tl: Test_Loop
+	if !start_test_listeners(t, &s, &l, &tl, &cfg) {
 		return
 	}
-	defer {
-		stop_listeners(&l)
-		stop_test_loop(&tl)
-		destroy_listeners(&l)
-	}
+	defer stop_test_listeners(&l, &tl)
 	// Every start from here on is refused; the reader, already running, runs on.
 	loop.stop(tl.loops[0])
 
@@ -358,7 +276,7 @@ test_a_refused_start_drops_the_datagram_and_keeps_the_reader :: proc(t: ^testing
 		probe.received, probe.dropped = u64(i), u64(i)
 		if !testing.expectf(
 			t,
-			wait_for(reader_counts_reached, &probe, 5 * time.Second),
+			wait_until(reader_counts_reached, &probe, 5 * time.Second),
 			"datagram %d: received %d, dropped %d",
 			i,
 			sync.atomic_load(&l.udp[0].received),
@@ -442,49 +360,47 @@ test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
 		return
 	}
 
-	cfg: config.Config
-	fixture(&cfg, READERS)
+	cfg := udp_listener_config(READERS)
 	cfg.listeners.udp.port = bound.port
 	tl: Test_Loop
-	start_test_loop(&tl)
+	if !testing.expect(t, start_test_loop(&tl), "no loop") {
+		return
+	}
 	s := Server {
-		cfg          = &cfg,
-		loops        = tl.loops[:],
+		cfg   = &cfg,
+		loops = tl.loops[:],
 	}
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
 		// The port was taken between the probe and here, which is nobody's bug.
-		stop_test_loop(&tl)
+		// The connection manager was built before the bind failed, and is given
+		// back with the rest.
+		stop_test_listeners(&l, &tl)
 		logx.infof("the free port %d was taken before the listener could bind it", bound.port)
 		return
 	}
-	defer {
-		stop_listeners(&l)
-		stop_test_loop(&tl)
-		destroy_listeners(&l)
-	}
+	defer stop_test_listeners(&l, &tl)
 	testing.expect_value(t, len(l.udp), READERS)
 
 	// The second server is the one this is about: a whole listener of its own,
 	// asking for a port the first one is holding.
-	second_cfg: config.Config
-	fixture(&second_cfg, READERS)
+	second_cfg := udp_listener_config(READERS)
 	second_cfg.listeners.udp.port = bound.port
 	second_tl: Test_Loop
-	start_test_loop(&second_tl)
+	if !testing.expect(t, start_test_loop(&second_tl), "no loop") {
+		return
+	}
 	second := Server {
-		cfg          = &second_cfg,
-		loops        = second_tl.loops[:],
+		cfg   = &second_cfg,
+		loops = second_tl.loops[:],
 	}
 	second_l: Listeners
 	started := start_listeners(&second, &second_l)
 	// Whether or not it got anywhere: `start_listeners` builds the connection
 	// manager before it binds anything, and `stop_listeners` is what gives it
 	// back.
-	stop_listeners(&second_l)
-	stop_test_loop(&second_tl)
-	destroy_listeners(&second_l)
+	stop_test_listeners(&second_l, &second_tl)
 	testing.expect(t, !started, "a second listener joined the running one's port and took a share of its datagrams")
 }
 
@@ -502,8 +418,7 @@ nothing is in flight beyond a batch, and nothing is dropped.
 */
 @(test)
 test_a_reader_lets_its_queries_run_between_batches :: proc(t: ^testing.T) {
-	cfg: config.Config
-	fixture(&cfg, 1)
+	cfg := udp_listener_config(1)
 	LIMIT :: 80
 	SENT :: 150
 	cfg.server.max_pending = LIMIT
@@ -536,15 +451,11 @@ test_a_reader_lets_its_queries_run_between_batches :: proc(t: ^testing.T) {
 	l: Listeners
 	if !start_listeners(&s, &l) {
 		sync.sema_post(&gate.go)
-		stop_test_loop(&tl)
+		stop_test_listeners(&l, &tl)
 		testing.expect(t, false, "could not start the UDP listener")
 		return
 	}
-	defer {
-		stop_listeners(&l)
-		stop_test_loop(&tl)
-		destroy_listeners(&l)
-	}
+	defer stop_test_listeners(&l, &tl)
 
 	client, cerr := net.make_unbound_udp_socket(.IP4)
 	if !testing.expectf(t, cerr == nil, "no client socket: %v", cerr) {
@@ -592,20 +503,11 @@ bind to it, which a socket still open there refuses.
 */
 @(test)
 test_a_udp_socket_closes_with_its_last_user :: proc(t: ^testing.T) {
-	cfg: config.Config
-	fixture(&cfg, 1)
-	tl: Test_Loop
-	if !testing.expect(t, start_test_loop(&tl), "no loop") {
-		return
-	}
-	s := Server {
-		cfg   = &cfg,
-		loops = tl.loops[:],
-	}
+	cfg := udp_listener_config(1)
+	s: Server
 	l: Listeners
-	if !start_listeners(&s, &l) {
-		stop_test_loop(&tl)
-		testing.expect(t, false, "could not start the UDP listener")
+	tl: Test_Loop
+	if !start_test_listeners(t, &s, &l, &tl, &cfg) {
 		return
 	}
 	stopped := false

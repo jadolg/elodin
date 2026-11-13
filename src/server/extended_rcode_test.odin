@@ -29,140 +29,78 @@ catches it.
 @(private = "file")
 TLSA_NAME :: "_25._tcp.mx.example."
 
+@(private = "file")
+CLIENT_ID :: u16(0x7d1e)
+
 /*
 The client's question. `edns` decides whether it offers an OPT record, which is
 the only place a response can put an extended DNS error: a client that asked
 without one has nowhere to be told why, and gets the bare refusal.
+
+`ext` is the EXTENDED-RCODE byte, which RFC 6891 section 6.1.3 says a request
+must leave at zero - so a non-zero one is a client doing something it may not,
+which is the point of the case that passes one.
 */
 @(private = "file")
-tlsa_query :: proc(edns := true, ext: u8 = 0) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = TLSA_NAME,
-		type  = .TLSA,
-		class = .IN,
-	}
-	msg := dns.Message {
-		id       = 0x7d1e,
-		question = question,
-	}
-	msg.flags.rd = true
+tlsa_query :: proc(edns := true, ext: u8 = 0, advertised: u16 = 1232) -> []u8 {
+	opt: Maybe(dns.Record)
 	if edns {
-		additional := make([]dns.Record, 1, context.temp_allocator)
-		// `ext` is the EXTENDED-RCODE byte, which RFC 6891 section 6.1.3 says a
-		// request must leave at zero - so a non-zero one is a client doing
-		// something it may not, which is the point of the case that passes one.
-		additional[0] = dns.make_opt(1232, false, ext)
-		msg.additional = additional
+		opt = dns.make_opt(advertised, false, ext)
 	}
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-// The info-code of the extended error a response carries (RFC 8914), or -1 if
-// it has none.
-@(private = "file")
-extended_error_code :: proc(wire: []u8) -> int {
-	code, _ := extended_error(wire)
-	return code
+	return test_query(TLSA_NAME, .TLSA, id = CLIENT_ID, opt = opt)
 }
 
 /*
-What an upstream that will not answer in the EDNS version it was asked in sends
-back: the question, an OPT record, and nothing it looked up.
+An upstream's reply to the TLSA question: `nibble` in the header's rcode, and
+`ext` - when there is one - as the extended byte of an OPT record.
 
-The header's own nibble is left at zero, which is not a detail of the fixture but
-the whole of the case: rcode 16 is four zero bits in the header and a one in the
-OPT record's extended byte, and the client reads the header. Both readers are
-checked on the way in by every caller below, so a fixture that stopped carrying
-an extended rcode - a codec that dropped the TTL, say - would fail rather than
-quietly assert about an ordinary NOERROR.
+With `ext`, it is what an upstream that will not answer in the EDNS version it
+was asked in sends back: the question, an OPT record, and nothing it looked up.
+The header's own nibble is then left at zero, which is not a detail of the
+fixture but the whole of the case: rcode 16 is four zero bits in the header and
+a one in the OPT record's extended byte (RFC 6891 section 6.1.3), and the client
+reads the header. Both readers are checked on the way in by every caller below,
+so a fixture that stopped carrying an extended rcode - a codec that dropped the
+TTL, say - would fail rather than quietly assert about an ordinary NOERROR.
+
+Without it, a plain rcode in the header and no OPT record at all: what a server
+that declines to answer sends, and the reply the client is owed as it stands.
+
+`answer` carries the certificate association a DANE client is asking for. Kept
+as raw RDATA because this codec models only a handful of RR types, and TLSA is
+not one of them; what matters here is that the answer section carries the record.
 */
 @(private = "file")
-extended_rcode_reply :: proc(nibble: u8 = 0, ext: u8 = 1) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = TLSA_NAME,
-		type  = .TLSA,
-		class = .IN,
-	}
-	// The upper eight bits of the extended rcode live in the OPT record's TTL
-	// (RFC 6891 section 6.1.3). The lowest of them on its own is BADVERS.
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(1232, true, ext)
+tlsa_reply :: proc(nibble: u8 = 0, ext: Maybe(u8) = nil, answer := false) -> []u8 {
+	question := [1]dns.Question{{name = TLSA_NAME, type = .TLSA, class = .IN}}
 	msg := dns.Message {
-		question   = question,
-		additional = additional,
+		question = question[:],
 	}
 	msg.flags.qr = true
 	msg.flags.rd = true
 	msg.flags.ra = true
 	msg.flags.rcode = nibble & 0xf
+	if ext_byte, has := ext.?; has {
+		additional := make([]dns.Record, 1, context.temp_allocator)
+		additional[0] = dns.make_opt(1232, true, ext_byte)
+		msg.additional = additional
+	}
+	if answer {
+		rdata := make([]u8, 7, context.temp_allocator)
+		copy(rdata, []u8{3, 1, 1, 0xde, 0xad, 0xbe, 0xef})
+		records := make([]dns.Record, 1, context.temp_allocator)
+		records[0] = dns.Record {
+			name  = TLSA_NAME,
+			type  = .TLSA,
+			class = .IN,
+			ttl   = 300,
+			data  = dns.Rdata_Raw{data = rdata},
+		}
+		msg.answer = records
+	}
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-// A plain rcode in the header and no OPT record at all: what a server that
-// declines to answer sends, and the reply the client is owed as it stands.
-@(private = "file")
-plain_rcode_reply :: proc(rcode: dns.Rcode) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = TLSA_NAME,
-		type  = .TLSA,
-		class = .IN,
-	}
-	msg := dns.Message {
-		question = question,
-	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	msg.flags.rcode = u8(rcode) & 0xf
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-// The certificate association a DANE client is asking for. Kept as raw RDATA
-// because this codec models only a handful of RR types, and TLSA is not one of
-// them; what matters here is that the answer section carries the record.
-@(private = "file")
-tlsa_answer_reply :: proc() -> []u8 {
-	rdata := make([]u8, 7, context.temp_allocator)
-	copy(rdata, []u8{3, 1, 1, 0xde, 0xad, 0xbe, 0xef})
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = TLSA_NAME,
-		type  = .TLSA,
-		class = .IN,
-		ttl   = 300,
-		data  = dns.Rdata_Raw{data = rdata},
-	}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = TLSA_NAME,
-		type  = .TLSA,
-		class = .IN,
-	}
-	msg := dns.Message {
-		question = question,
-		answer   = answer,
-	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
+		panic("the TLSA reply does not encode")
 	}
 	return wire
 }
@@ -171,9 +109,6 @@ tlsa_answer_reply :: proc() -> []u8 {
 // than assumed: rcode 16 with a header a client reads as NOERROR.
 @(private = "file")
 expect_reads_as_noerror :: proc(t: ^testing.T, reply: []u8) -> bool {
-	if !testing.expect(t, len(reply) > dns.HEADER_SIZE, "the fixture did not encode") {
-		return false
-	}
 	if !testing.expect_value(t, dns.peek_rcode(reply), dns.Rcode.Bad_Vers) {
 		return false
 	}
@@ -183,6 +118,96 @@ expect_reads_as_noerror :: proc(t: ^testing.T, reply: []u8) -> bool {
 		"the fixture's header nibble is %d, so nothing about this case is about a client reading it as NOERROR",
 		reply[3] & 0xf,
 	)
+}
+
+/*
+A server whose group is one mock upstream per name, asked in that order. The
+caller keeps the fixture where it declared it: `srv` points at `cfg`.
+*/
+@(private = "file")
+Rcode_Fixture :: struct {
+	sockets: [2]net.UDP_Socket,
+	bound:   int,
+	cfg:     config.Config,
+	group:   ^upstream.Group,
+	srv:     Server,
+}
+
+@(private = "file")
+rcode_fixture_start :: proc(t: ^testing.T, f: ^Rcode_Fixture, names: ..string, loc := #caller_location) -> bool {
+	assert(len(names) <= len(f.sockets))
+	specs := make([]config.Upstream_Spec, len(names), context.temp_allocator)
+	for name, i in names {
+		socket, spec, ok := bind_mock(t, name, loc = loc)
+		if !ok {
+			rcode_fixture_stop(f)
+			return false
+		}
+		f.sockets[i] = socket
+		f.bound += 1
+		specs[i] = spec
+	}
+	f.cfg = test_config(specs)
+	group, gerr := upstream.make_group(f.cfg.upstream)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr, loc = loc) {
+		rcode_fixture_stop(f)
+		return false
+	}
+	f.group = group
+	f.srv = Server {
+		cfg   = &f.cfg,
+		group = f.group,
+	}
+	return true
+}
+
+@(private = "file")
+rcode_fixture_stop :: proc(f: ^Rcode_Fixture) {
+	if f.group != nil {
+		upstream.destroy_group(f.group)
+		f.group = nil
+	}
+	for socket in f.sockets[:f.bound] {
+		net.close(socket)
+	}
+	f.bound = 0
+}
+
+/*
+One query through the fixture, the mock at each position answering the reply at
+the same position. A nil reply starts no mock there, for a member that must be
+left alone: it is read with `mock_untouched` once this has returned.
+*/
+@(private = "file")
+rcode_ask :: proc(
+	f: ^Rcode_Fixture,
+	query: []u8,
+	replies: ..[]u8,
+) -> (
+	out: []u8,
+	outcome: Outcome,
+	served: bool,
+	mocks: [2]Canned_Mock,
+) {
+	threads: [2]^thread.Thread
+	for reply, i in replies {
+		if reply == nil {
+			continue
+		}
+		mocks[i] = Canned_Mock {
+			socket = f.sockets[i],
+			reply  = reply,
+		}
+		threads[i] = thread.create_and_start_with_poly_data(&mocks[i], serve_canned)
+	}
+	out, outcome, served = handle_query(&f.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	for th in threads {
+		if th != nil {
+			thread.join(th)
+			thread.destroy(th)
+		}
+	}
+	return
 }
 
 /*
@@ -196,38 +221,19 @@ the header's would still be a NODATA to everything that receives it.
 */
 @(test)
 test_an_extended_rcode_is_not_forwarded_to_the_client :: proc(t: ^testing.T) {
-	socket, spec, bound := bind_mock(t, "broken")
-	if !bound {
+	f: Rcode_Fixture
+	if !rcode_fixture_start(t, &f, "broken") {
 		return
 	}
-	defer net.close(socket)
+	defer rcode_fixture_stop(&f)
 
-	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	specs[0] = spec
-	cfg := test_config(specs)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s := Server{cfg = &cfg, group = group}
-
-	reply := extended_rcode_reply()
+	reply := tlsa_reply(ext = 1)
 	if !expect_reads_as_noerror(t, reply) {
 		return
 	}
 
-	x := Canned_Mock {
-		socket = socket,
-		reply  = reply,
-	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
-	out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-
-	testing.expect(t, x.got, "the upstream was never asked")
+	out, outcome, ok, mocks := rcode_ask(&f, tlsa_query(), reply)
+	testing.expect(t, mocks[0].got, "the upstream was never asked")
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
@@ -252,7 +258,7 @@ test_an_extended_rcode_is_not_forwarded_to_the_client :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.Serv_Fail)
 	testing.expect_value(t, len(decoded.answer), 0)
-	testing.expect_value(t, decoded.id, u16(0x7d1e))
+	testing.expect_value(t, decoded.id, CLIENT_ID)
 
 	/*
 	And the client is told why, the way the rebinding guard and the validator
@@ -262,9 +268,10 @@ test_an_extended_rcode_is_not_forwarded_to_the_client :: proc(t: ^testing.T) {
 	unreachable authority - would say something untrue about an upstream that
 	answered.
 	*/
-	testing.expect_value(t, extended_error_code(out), 0)
+	code, _ := extended_error(out)
+	testing.expect_value(t, code, 0)
 
-	counters := stats_of(&s)
+	counters := stats_of(&f.srv)
 	testing.expect_value(t, counters.failed, u64(1))
 	testing.expect_value(t, counters.forwarded, u64(0))
 	/*
@@ -290,55 +297,27 @@ four bits spell.
 */
 @(test)
 test_an_extended_rcode_with_a_nonzero_nibble_is_not_forwarded_either :: proc(t: ^testing.T) {
-	socket, spec, bound := bind_mock(t, "broken")
-	if !bound {
+	f: Rcode_Fixture
+	if !rcode_fixture_start(t, &f, "broken") {
 		return
 	}
-	defer net.close(socket)
-
-	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	specs[0] = spec
-	cfg := test_config(specs)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s := Server{cfg = &cfg, group = group}
+	defer rcode_fixture_stop(&f)
 
 	// 16 | 7: an extended rcode this server has no reading for either, and one
 	// whose header half is a rcode in its own right.
-	reply := extended_rcode_reply(u8(dns.Rcode.YX_RRSet))
-	if !testing.expect(t, len(reply) > dns.HEADER_SIZE, "the fixture did not encode") {
-		return
-	}
+	reply := tlsa_reply(u8(dns.Rcode.YX_RRSet), ext = 1)
 	testing.expectf(
 		t,
-		u16(dns.peek_rcode(reply)) == 16 | u16(dns.Rcode.YX_RRSet),
+		u16(dns.peek_rcode(reply)) == u16(dns.Rcode.Bad_Vers) | u16(dns.Rcode.YX_RRSet),
 		"the fixture composed %v rather than an extended rcode over YXRRSET",
 		dns.peek_rcode(reply),
 	)
 
-	x := Canned_Mock {
-		socket = socket,
-		reply  = reply,
-	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
 	// Asked without EDNS, which is the other half of this case: there is no OPT
 	// record in the response to carry an extended error, and the refusal has to
 	// go out as a plain SERVFAIL rather than not at all.
-	out, outcome, ok := handle_query(
-		&s,
-		tlsa_query(edns = false),
-		.UDP,
-		"127.0.0.1:5555",
-		context.temp_allocator,
-	)
-	thread.join(mock)
-	thread.destroy(mock)
-
-	testing.expect(t, x.got, "the upstream was never asked")
+	out, outcome, ok, mocks := rcode_ask(&f, tlsa_query(edns = false), reply)
+	testing.expect(t, mocks[0].got, "the upstream was never asked")
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
@@ -353,9 +332,10 @@ test_an_extended_rcode_with_a_nonzero_nibble_is_not_forwarded_either :: proc(t: 
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.Serv_Fail)
-	testing.expect_value(t, decoded.id, u16(0x7d1e))
+	testing.expect_value(t, decoded.id, CLIENT_ID)
 	testing.expect_value(t, len(decoded.answer), 0)
-	testing.expect_value(t, extended_error_code(out), -1)
+	code, _ := extended_error(out)
+	testing.expect_value(t, code, -1)
 
 	free_all(context.temp_allocator)
 }
@@ -373,52 +353,20 @@ The client gets the answer the second server had all along.
 */
 @(test)
 test_a_broken_upstream_is_asked_past_for_an_extended_rcode :: proc(t: ^testing.T) {
-	broken_socket, broken_spec, broken_ok := bind_mock(t, "broken")
-	if !broken_ok {
+	f: Rcode_Fixture
+	if !rcode_fixture_start(t, &f, "broken", "good") {
 		return
 	}
-	defer net.close(broken_socket)
-	good_socket, good_spec, good_ok := bind_mock(t, "good")
-	if !good_ok {
-		return
-	}
-	defer net.close(good_socket)
+	defer rcode_fixture_stop(&f)
 
-	specs := make([]config.Upstream_Spec, 2, context.temp_allocator)
-	specs[0] = broken_spec
-	specs[1] = good_spec
-	cfg := test_config(specs)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s := Server{cfg = &cfg, group = group}
-
-	reply := extended_rcode_reply()
+	reply := tlsa_reply(ext = 1)
 	if !expect_reads_as_noerror(t, reply) {
 		return
 	}
 
-	broken := Canned_Mock {
-		socket = broken_socket,
-		reply  = reply,
-	}
-	good := Canned_Mock {
-		socket = good_socket,
-		reply  = tlsa_answer_reply(),
-	}
-	broken_mock := thread.create_and_start_with_poly_data(&broken, serve_canned)
-	good_mock := thread.create_and_start_with_poly_data(&good, serve_canned)
-	out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(broken_mock)
-	thread.join(good_mock)
-	thread.destroy(broken_mock)
-	thread.destroy(good_mock)
-
-	testing.expect(t, broken.got, "the first upstream was never asked")
-	testing.expect(t, good.got, "the second upstream was never asked, so the group was not swept")
+	out, outcome, ok, mocks := rcode_ask(&f, tlsa_query(), reply, tlsa_reply(answer = true))
+	testing.expect(t, mocks[0].got, "the first upstream was never asked")
+	testing.expect(t, mocks[1].got, "the second upstream was never asked, so the group was not swept")
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
@@ -432,7 +380,7 @@ test_a_broken_upstream_is_asked_past_for_an_extended_rcode :: proc(t: ^testing.T
 		testing.expect_value(t, decoded.answer[0].type, dns.Type.TLSA)
 	}
 
-	counters := stats_of(&s)
+	counters := stats_of(&f.srv)
 	testing.expect_value(t, counters.forwarded, u64(1))
 	testing.expect_value(t, counters.failed, u64(0))
 
@@ -463,46 +411,22 @@ returned rather than raced, which is both exact and quick. See `mock_untouched`.
 */
 @(test)
 test_a_readable_rcode_is_still_the_clients_answer :: proc(t: ^testing.T) {
-	first_socket, first_spec, first_ok := bind_mock(t, "declining")
-	if !first_ok {
+	f: Rcode_Fixture
+	if !rcode_fixture_start(t, &f, "declining", "spare") {
 		return
 	}
-	defer net.close(first_socket)
-	second_socket, second_spec, second_ok := bind_mock(t, "spare")
-	if !second_ok {
-		return
-	}
-	defer net.close(second_socket)
+	defer rcode_fixture_stop(&f)
 
-	specs := make([]config.Upstream_Spec, 2, context.temp_allocator)
-	specs[0] = first_spec
-	specs[1] = second_spec
-	cfg := test_config(specs)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s := Server{cfg = &cfg, group = group}
-
-	x := Canned_Mock {
-		socket = first_socket,
-		reply  = plain_rcode_reply(.NX_Domain),
-	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
-	out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-
-	testing.expect(t, x.got, "the first upstream was never asked")
+	query := tlsa_query()
+	out, outcome, ok, mocks := rcode_ask(&f, query, tlsa_reply(u8(dns.Rcode.NX_Domain)))
+	testing.expect(t, mocks[0].got, "the first upstream was never asked")
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
 
 	testing.expect_value(t, outcome, Outcome.Forwarded)
 	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.NX_Domain)
-	testing.expect(t, mock_untouched(second_socket), "a readable rcode sent the group a second query")
+	testing.expect(t, mock_untouched(f.sockets[1], query), "a readable rcode sent the group a second query")
 
 	free_all(context.temp_allocator)
 }
@@ -522,67 +446,39 @@ question went to the group and an answer came back.
 */
 @(test)
 test_a_group_with_a_spare_is_asked_past_a_servfail :: proc(t: ^testing.T) {
-	for rcode in ([]dns.Rcode{.Serv_Fail, .Refused}) {
-		broken_socket, broken_spec, broken_ok := bind_mock(t, "broken")
-		if !broken_ok {
-			return
-		}
-		defer net.close(broken_socket)
-		good_socket, good_spec, good_ok := bind_mock(t, "good")
-		if !good_ok {
-			return
-		}
-		defer net.close(good_socket)
+	asked_past(t, .Serv_Fail)
+	asked_past(t, .Refused)
+}
 
-		specs := make([]config.Upstream_Spec, 2, context.temp_allocator)
-		specs[0] = broken_spec
-		specs[1] = good_spec
-		cfg := test_config(specs)
-
-		group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-		if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-			return
-		}
-		defer upstream.destroy_group(group)
-		s := Server{cfg = &cfg, group = group}
-
-		broken := Canned_Mock {
-			socket = broken_socket,
-			reply  = plain_rcode_reply(rcode),
-		}
-		good := Canned_Mock {
-			socket = good_socket,
-			reply  = tlsa_answer_reply(),
-		}
-		broken_mock := thread.create_and_start_with_poly_data(&broken, serve_canned)
-		good_mock := thread.create_and_start_with_poly_data(&good, serve_canned)
-		out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
-		thread.join(broken_mock)
-		thread.join(good_mock)
-		thread.destroy(broken_mock)
-		thread.destroy(good_mock)
-
-		testing.expect(t, broken.got, "the first upstream was never asked")
-		testing.expectf(t, good.got, "a %v ended the search with a spare upstream standing by", rcode)
-		if !testing.expect(t, ok, "nothing came back at all") {
-			return
-		}
-
-		testing.expect_value(t, outcome, Outcome.Forwarded)
-		testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.No_Error)
-
-		decoded, derr := dns.decode_message(out, context.temp_allocator)
-		testing.expect_value(t, derr, dns.Decode_Error.None)
-		if testing.expect(t, len(decoded.answer) == 1, "the client was not served the record the second upstream had") {
-			testing.expect_value(t, decoded.answer[0].type, dns.Type.TLSA)
-		}
-
-		counters := stats_of(&s)
-		testing.expect_value(t, counters.forwarded, u64(1))
-		testing.expect_value(t, counters.failed, u64(0))
-
-		free_all(context.temp_allocator)
+@(private = "file")
+asked_past :: proc(t: ^testing.T, rcode: dns.Rcode) {
+	f: Rcode_Fixture
+	if !rcode_fixture_start(t, &f, "broken", "good") {
+		return
 	}
+	defer rcode_fixture_stop(&f)
+
+	out, outcome, ok, mocks := rcode_ask(&f, tlsa_query(), tlsa_reply(u8(rcode)), tlsa_reply(answer = true))
+	testing.expectf(t, mocks[0].got, "%v: the first upstream was never asked", rcode)
+	testing.expectf(t, mocks[1].got, "a %v ended the search with a spare upstream standing by", rcode)
+	if !testing.expectf(t, ok, "%v: nothing came back at all", rcode) {
+		return
+	}
+
+	testing.expect_value(t, outcome, Outcome.Forwarded)
+	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.No_Error)
+
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if testing.expectf(t, len(decoded.answer) == 1, "%v: the client was not served the record the second upstream had", rcode) {
+		testing.expect_value(t, decoded.answer[0].type, dns.Type.TLSA)
+	}
+
+	counters := stats_of(&f.srv)
+	testing.expect_value(t, counters.forwarded, u64(1))
+	testing.expect_value(t, counters.failed, u64(0))
+
+	free_all(context.temp_allocator)
 }
 
 /*
@@ -602,27 +498,13 @@ the client has to be told is the number.
 */
 @(test)
 test_an_unnamed_extended_rcode_is_reported_as_a_number :: proc(t: ^testing.T) {
-	socket, spec, bound := bind_mock(t, "broken")
-	if !bound {
+	f: Rcode_Fixture
+	if !rcode_fixture_start(t, &f, "broken") {
 		return
 	}
-	defer net.close(socket)
+	defer rcode_fixture_stop(&f)
 
-	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	specs[0] = spec
-	cfg := test_config(specs)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s := Server{cfg = &cfg, group = group}
-
-	reply := extended_rcode_reply(ext = 2)
-	if !testing.expect(t, len(reply) > dns.HEADER_SIZE, "the fixture did not encode") {
-		return
-	}
+	reply := tlsa_reply(ext = 2)
 	// The premise: a composed rcode of 32, which is not a value `Rcode` names.
 	testing.expect_value(t, u16(dns.peek_rcode(reply)), u16(32))
 	if _, named := dns.rcode_name(dns.peek_rcode(reply)); named {
@@ -630,16 +512,8 @@ test_an_unnamed_extended_rcode_is_reported_as_a_number :: proc(t: ^testing.T) {
 		return
 	}
 
-	x := Canned_Mock {
-		socket = socket,
-		reply  = reply,
-	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
-	out, outcome, ok := handle_query(&s, tlsa_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-
-	testing.expect(t, x.got, "the upstream was never asked")
+	out, outcome, ok, mocks := rcode_ask(&f, tlsa_query(), reply)
+	testing.expect(t, mocks[0].got, "the upstream was never asked")
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
@@ -670,40 +544,24 @@ the same reasoning `cases_queryid.odin` gives for the ID beside it.
 */
 @(test)
 test_a_clients_extended_rcode_byte_is_not_forwarded :: proc(t: ^testing.T) {
-	socket, spec, bound := bind_mock(t, "echoing")
-	if !bound {
+	f: Rcode_Fixture
+	if !rcode_fixture_start(t, &f, "echoing") {
 		return
 	}
-	defer net.close(socket)
-
-	specs := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	specs[0] = spec
-	cfg := test_config(specs)
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(group)
-	s := Server{cfg = &cfg, group = group}
+	defer rcode_fixture_stop(&f)
 
 	// Extended byte 4 on the client's own query: composed rcode 64 to anything
-	// that reads the OPT record, and nothing at all to the version gate.
-	query := tlsa_query(ext = 4)
+	// that reads the OPT record, and nothing at all to the version gate. And a
+	// payload size of its own, so the forwarded figure below can only be ours.
+	query := tlsa_query(ext = 4, advertised = 4096)
 	if !testing.expect(t, len(query) > dns.HEADER_SIZE, "the query did not encode") {
 		return
 	}
 	testing.expect_value(t, u16(dns.peek_rcode(query)), u16(64))
+	testing.expect_value(t, dns.peek_udp_size(query), u16(4096))
 
-	x := Canned_Mock {
-		socket = socket,
-		reply  = tlsa_answer_reply(),
-	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
-	out, outcome, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-
+	out, outcome, ok, mocks := rcode_ask(&f, query, tlsa_reply(answer = true))
+	x := &mocks[0]
 	if !testing.expect(t, x.got, "the upstream was never asked") {
 		return
 	}
@@ -714,13 +572,14 @@ test_a_clients_extended_rcode_byte_is_not_forwarded :: proc(t: ^testing.T) {
 		u16(dns.peek_rcode(x.seen[:x.seen_len])),
 	)
 	// And the rest of the query, which `upstream_query` rebuilds, still asks the
-	// same question and still carries an OPT record for the upstream to answer into.
+	// same question and carries an OPT record for the upstream to answer into -
+	// with this server's payload size rather than the client's.
 	seen, serr := dns.decode_message(x.seen[:x.seen_len], context.temp_allocator)
 	testing.expect_value(t, serr, dns.Decode_Error.None)
 	if testing.expect(t, len(seen.question) == 1, "the forwarded query lost its question") {
 		testing.expect(t, dns.name_equal_fold(seen.question[0].name, TLSA_NAME), "the forwarded question changed")
 	}
-	testing.expect_value(t, dns.edns_udp_size(seen), u16(1232))
+	testing.expect_value(t, dns.edns_udp_size(seen), u16(UPSTREAM_UDP_SIZE))
 
 	// And the client gets the answer rather than the SERVFAIL its own byte
 	// would have earned it against an echoing upstream.

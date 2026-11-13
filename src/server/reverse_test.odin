@@ -15,8 +15,10 @@ pass: the parser demands exactly thirty-two of them, so a typo fails the test
 rather than hiding in it. The second is upper case because DNS names compare
 without regard to it (RFC 4343) and a client is free to ask that way.
 */
+@(private = "file")
 FD00_1_REVERSE ::
 	"1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa."
+@(private = "file")
 FE80_1_REVERSE ::
 	"1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.E.F.IP6.ARPA."
 
@@ -104,22 +106,6 @@ test_reverse_v6_rejects_names_that_are_not_a_host :: proc(t: ^testing.T) {
 		_, ok := parse_reverse_v6(name)
 		testing.expectf(t, !ok, "%s must not parse as a host's reverse name", name)
 	}
-}
-
-/*
-An answer list that outlives the procedure that wrote it.
-
-`[]T{...}` slices a temporary the compiler puts in the enclosing frame, so a
-rule set built that way and returned carries slices into a frame that has gone -
-which reads as rules matching addresses nobody configured rather than as a
-crash. Copying into the temporary allocator keeps the list alive for as long as
-the test that asked for it.
-*/
-@(private = "file")
-answers_of :: proc(list: ..config.Rewrite_Answer) -> []config.Rewrite_Answer {
-	out := make([]config.Rewrite_Answer, len(list), context.temp_allocator)
-	copy(out, list)
-	return out
 }
 
 // The rules the itest and the example config are written against: one host, one
@@ -513,7 +499,7 @@ test_an_anchor_over_the_reverse_zone_stops_the_synthesis :: proc(t: ^testing.T) 
 		ttl     = 111,
 		ptr     = true,
 	}
-	cfg := reverse_test_server(rules)
+	cfg := reverse_config(rules)
 
 	anchors := make([]string, 1, context.temp_allocator)
 	anchors[0] = "168.192.in-addr.arpa."
@@ -602,11 +588,9 @@ test_locally_served_zone_names_the_apex :: proc(t: ^testing.T) {
 }
 
 @(private = "file")
-reverse_test_server :: proc(rules: []config.Rewrite) -> config.Config {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+reverse_config :: proc(rules: []config.Rewrite) -> config.Config {
+	cfg: config.Config
+	_ = local_server(&cfg)
 	cfg.rewrites = rules
 	return cfg
 }
@@ -631,39 +615,14 @@ ask_anchored :: proc(
 		cfg          = cfg,
 		anchor_zones = anchor_zones,
 	}
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = name,
-		type  = type,
-		class = .IN,
-	}
-	// RD=0, so a name this does not answer cannot reach the forwarding path -
-	// there is no upstream here - and comes back Refused instead, which names
-	// the failure exactly.
-	query := dns.Message {
-		id       = 0x2c11,
-		question = questions,
-	}
-	wire, _, enc := dns.encode_message(query, context.temp_allocator)
-	if enc != .None {
-		return {}, .Failed, false
-	}
-	out, outcome, ok := handle_query(&s, wire, .UDP, "127.0.0.1:5555", context.temp_allocator)
-	if !ok {
-		return {}, outcome, false
-	}
-	resp, derr := dns.decode_message(out, context.temp_allocator)
-	if derr != .None {
-		return {}, outcome, false
-	}
-	return resp, outcome, true
+	return ask_local(&s, name, type)
 }
 
 // The whole path, which is what says the synthesis is actually reachable rather
 // than only that the helper agrees with itself.
 @(test)
 test_query_for_a_rewritten_address_is_answered_with_its_name :: proc(t: ^testing.T) {
-	cfg := reverse_test_server(sample_rules())
+	cfg := reverse_config(sample_rules())
 
 	resp, outcome, ok := ask(&cfg, "50.1.168.192.in-addr.arpa.", .PTR)
 	if !testing.expect(t, ok, "the PTR for a rewritten address went unanswered") {
@@ -690,7 +649,7 @@ the SOA is what lets a client remember that there is nothing else there.
 */
 @(test)
 test_a_synthesised_name_is_nodata_for_other_types :: proc(t: ^testing.T) {
-	cfg := reverse_test_server(sample_rules())
+	cfg := reverse_config(sample_rules())
 
 	resp, outcome, ok := ask(&cfg, "50.1.168.192.in-addr.arpa.", .A)
 	if !testing.expect(t, ok, "an A query for a synthesised name went unanswered") {
@@ -716,7 +675,7 @@ NXDOMAIN, still with nothing invented in it.
 */
 @(test)
 test_an_unnamed_private_address_is_not_answered_here :: proc(t: ^testing.T) {
-	cfg := reverse_test_server(sample_rules())
+	cfg := reverse_config(sample_rules())
 
 	resp, outcome, _ := ask(&cfg, "51.1.168.192.in-addr.arpa.", .PTR)
 	testing.expect_value(t, outcome, Outcome.Local)
@@ -749,7 +708,7 @@ test_an_explicit_rule_for_a_reverse_name_outranks_the_synthesis :: proc(t: ^test
 		ttl     = 111,
 		ptr     = true,
 	}
-	cfg := reverse_test_server(rules)
+	cfg := reverse_config(rules)
 
 	resp, outcome, ok := ask(&cfg, "50.1.168.192.in-addr.arpa.", .PTR)
 	if !testing.expect(t, ok, "the explicit rule went unanswered") {

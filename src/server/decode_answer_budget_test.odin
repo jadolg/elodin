@@ -1,6 +1,7 @@
 package server
 
 import "core:mem"
+import "core:slice"
 import "core:testing"
 import "elodin:dns"
 
@@ -11,7 +12,7 @@ name costs four characters an octet and every record buys two fresh copies.
 */
 @(private = "file")
 name_budget_bomb :: proc(records := 0, trailing_authority := false) -> []u8 {
-	msg := make([dynamic]u8, 0, 65535)
+	msg := make([dynamic]u8, 0, dns.MAX_MESSAGE)
 	append(&msg, 0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0)
 	for l in ([]int{63, 63, 63, 61}) {
 		append(&msg, u8(l))
@@ -23,7 +24,7 @@ name_budget_bomb :: proc(records := 0, trailing_authority := false) -> []u8 {
 	append(&msg, 0, u8(dns.Type.MX), 0, u8(dns.Class.IN))
 
 	count := 0
-	for len(msg) + 16 <= 65535 && (records == 0 || count < records) {
+	for len(msg) + 16 <= dns.MAX_MESSAGE && (records == 0 || count < records) {
 		append(&msg, 0xc0, 0x0c)
 		append(&msg, 0, u8(dns.Type.MX), 0, u8(dns.Class.IN))
 		append(&msg, 0, 0, 0x0e, 0x10)
@@ -63,10 +64,22 @@ budget_ceiling :: proc(msg_len: int) -> int {
 }
 
 @(private = "file")
+expect_within_ceiling :: proc(t: ^testing.T, msg: []u8, arena: ^mem.Arena, loc := #caller_location) {
+	testing.expectf(
+		t,
+		arena.offset <= budget_ceiling(len(msg)),
+		"reading a %d-byte reply cost %d bytes of arena",
+		len(msg),
+		arena.offset,
+		loc = loc,
+	)
+}
+
+@(private = "file")
 read_answer :: proc(msg: []u8, arena: ^mem.Arena) -> Decoded_Answer {
 	backing := make([]u8, 16 << 20)
 	mem.arena_init(arena, backing)
-	return decode_answer(msg, true, nil, mem.arena_allocator(arena))
+	return decode_answer(msg, answer_section = true, spent = nil, allocator = mem.arena_allocator(arena))
 }
 
 @(private = "file")
@@ -95,13 +108,7 @@ test_reading_a_reply_twice_costs_two_budgets_at_most :: proc(t: ^testing.T) {
 	testing.expect(t, !out.full && !out.partial, "the reply should not have read at all")
 	testing.expect_value(t, out.full_err, dns.Decode_Error.Name_Budget)
 	testing.expect_value(t, out.partial_err, dns.Decode_Error.Name_Budget)
-	testing.expectf(
-		t,
-		arena.offset <= budget_ceiling(len(msg)),
-		"reading a %d-byte reply cost %d bytes of arena",
-		len(msg),
-		arena.offset,
-	)
+	expect_within_ceiling(t, msg, &arena)
 }
 
 /*
@@ -140,13 +147,7 @@ test_a_near_budget_answer_read_twice_stays_within_the_pair :: proc(t: ^testing.T
 		records,
 		arena.offset,
 	)
-	testing.expectf(
-		t,
-		arena.offset <= budget_ceiling(len(msg)),
-		"reading a %d-byte reply cost %d bytes of arena",
-		len(msg),
-		arena.offset,
-	)
+	expect_within_ceiling(t, msg, &arena)
 }
 
 /*
@@ -164,15 +165,14 @@ test_a_cheap_answer_survives_an_expensive_additional_section :: proc(t: ^testing
 
 	// The same bytes, with the answer count moved to the additional count: one
 	// MX record answers, the rest of the reply is somebody else's problem.
-	msg := make([dynamic]u8, 0, len(bomb) + 16)
+	msg := slice.clone(bomb)
 	defer delete(msg)
-	append(&msg, ..bomb[:])
 	an := (int(msg[6]) << 8 | int(msg[7])) - 1
 	msg[6], msg[7] = 0, 1
 	msg[10], msg[11] = u8(an >> 8), u8(an)
 
 	arena: mem.Arena
-	out := read_answer(msg[:], &arena)
+	out := read_answer(msg, &arena)
 	defer free_arena(&arena)
 
 	testing.expect_value(t, out.full_err, dns.Decode_Error.Name_Budget)

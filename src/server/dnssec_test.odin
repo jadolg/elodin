@@ -1,14 +1,10 @@
 package server
 
-import "core:net"
 import "core:testing"
 import "core:time"
-import "core:thread"
 import "elodin:cache"
-import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
-import "elodin:upstream"
 
 /*
 The parts of the DNSSEC path that shape what the client sees.
@@ -22,14 +18,33 @@ goes out on the wire to ask the upstream in the first place.
 // A slice literal lives only as long as the scope that wrote it, so anything a
 // helper hands back has to be allocated rather than composed in place.
 @(private = "file")
-question :: proc() -> []dns.Question {
+question :: proc(type := dns.Type.A) -> []dns.Question {
 	out := make([]dns.Question, 1, context.temp_allocator)
 	out[0] = dns.Question {
 		name  = "www.example.com.",
-		type  = .A,
+		type  = type,
 		class = .IN,
 	}
 	return out
+}
+
+// `msg` on the wire, or `ok` false with the failure reported.
+@(private = "file")
+encode :: proc(t: ^testing.T, msg: dns.Message, loc := #caller_location) -> (wire: []u8, ok: bool) {
+	out, _, err := dns.encode_message(msg, context.temp_allocator)
+	return out, testing.expect_value(t, err, dns.Encode_Error.None, loc = loc)
+}
+
+// The cache key a client's query `q` is looked up under.
+@(private = "file")
+key_of :: proc(buf: []u8, q: dns.Message) -> string {
+	return cache.make_key(buf, q.question[0].name, q.question[0].type, q.question[0].class, dns.edns_do(q), q.flags.cd)
+}
+
+// An RRset the validator vouched for, signed by `TEST_SIGNER`.
+@(private = "file")
+auth_set :: proc(name: string, type: dns.Type) -> dnssec.Authenticated_Set {
+	return dnssec.Authenticated_Set{name = name, type = type, class = .IN, signer = TEST_SIGNER, ttl = 86400}
 }
 
 /*
@@ -126,29 +141,17 @@ so a `Result` that names nothing strips the message to its OPT record.
 @(private = "file")
 secure_verdict :: proc() -> dnssec.Result {
 	answer := make([]dnssec.Authenticated_Set, 1, context.temp_allocator)
-	answer[0] = dnssec.Authenticated_Set {
-		name   = "www.example.com.",
-		type   = .A,
-		class  = .IN,
-		signer = TEST_SIGNER,
-		ttl    = 86400,
-	}
+	answer[0] = auth_set("www.example.com.", .A)
 	authority := make([]dnssec.Authenticated_Set, 1, context.temp_allocator)
-	authority[0] = dnssec.Authenticated_Set {
-		name   = "example.com.",
-		type   = .NSEC,
-		class  = .IN,
-		signer = TEST_SIGNER,
-		ttl    = 86400,
-	}
+	authority[0] = auth_set("example.com.", .NSEC)
 	return dnssec.Result{status = .Secure, answer = answer, authority = authority}
 }
 
 @(private = "file")
-client_query :: proc(dnssec_ok: bool, with_edns := true) -> dns.Message {
+client_query :: proc(dnssec_ok: bool, with_edns := true, type := dns.Type.A) -> dns.Message {
 	msg := dns.Message {
 		id       = 0x2b2b,
-		question = question(),
+		question = question(type),
 	}
 	msg.flags.rd = true
 	if with_edns {
@@ -161,8 +164,10 @@ client_query :: proc(dnssec_ok: bool, with_edns := true) -> dns.Message {
 
 @(test)
 test_strip_removes_dnssec_records :: proc(t: ^testing.T) {
-	wire, _, err := dns.encode_message(signed_response(), context.temp_allocator)
-	testing.expect_value(t, err, dns.Encode_Error.None)
+	wire, encoded := encode(t, signed_response())
+	if !encoded {
+		return
+	}
 
 	stripped := strip_dnssec_records(wire, client_query(false), .A, nil, context.temp_allocator, dns.MAX_MESSAGE)
 	msg, derr := dns.decode_message(stripped, context.temp_allocator)
@@ -183,7 +188,10 @@ test_strip_removes_dnssec_records :: proc(t: ^testing.T) {
 @(test)
 test_strip_keeps_records_that_were_asked_for :: proc(t: ^testing.T) {
 	// A client asking for RRSIG records wants RRSIG records.
-	wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
+	wire, encoded := encode(t, signed_response())
+	if !encoded {
+		return
+	}
 	stripped := strip_dnssec_records(wire, client_query(false), .RRSIG, nil, context.temp_allocator, dns.MAX_MESSAGE)
 
 	msg, derr := dns.decode_message(stripped, context.temp_allocator)
@@ -194,7 +202,10 @@ test_strip_keeps_records_that_were_asked_for :: proc(t: ^testing.T) {
 
 @(test)
 test_strip_omits_opt_for_a_client_without_edns :: proc(t: ^testing.T) {
-	wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
+	wire, encoded := encode(t, signed_response())
+	if !encoded {
+		return
+	}
 	stripped := strip_dnssec_records(
 		wire,
 		client_query(false, with_edns = false),
@@ -213,12 +224,18 @@ test_strip_omits_opt_for_a_client_without_edns :: proc(t: ^testing.T) {
 @(test)
 test_ad_bit_records_the_verdict :: proc(t: ^testing.T) {
 	// What goes into the cache says what was established, whoever asked.
-	wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
+	wire, encoded := encode(t, signed_response())
+	if !encoded {
+		return
+	}
 	secure := present_response(wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
 	testing.expect(t, secure[3] & 0x20 != 0, "AD should record a secure verdict")
 
 	// Not secure: the bit must come off even though the upstream may have set it.
-	insecure_wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
+	insecure_wire, insecure_encoded := encode(t, signed_response())
+	if !insecure_encoded {
+		return
+	}
 	insecure_wire[3] |= 0x20
 	insecure := present_response(
 		insecure_wire,
@@ -235,7 +252,10 @@ test_ad_bit_records_the_verdict :: proc(t: ^testing.T) {
 @(test)
 test_ad_bit_only_reaches_clients_that_asked :: proc(t: ^testing.T) {
 	// RFC 6840 section 5.8. The same stored bytes, three clients.
-	wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
+	wire, encoded := encode(t, signed_response())
+	if !encoded {
+		return
+	}
 	wire[3] |= 0x20
 
 	with_do := make([]u8, len(wire), context.temp_allocator)
@@ -261,17 +281,45 @@ test_ad_bit_only_reaches_clients_that_asked :: proc(t: ^testing.T) {
 test_cd_bit_is_not_echoed_back :: proc(t: ^testing.T) {
 	// Our own upstream query sets CD, and the upstream echoes it. Passing that
 	// on would tell a client that its answer went unchecked.
-	wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
+	wire, encoded := encode(t, signed_response())
+	if !encoded {
+		return
+	}
 	wire[3] |= 0x10
 
 	out := present_response(wire, client_query(true), .A, secure_verdict(), nil, context.temp_allocator)
 	testing.expect(t, out[3] & 0x10 == 0, "CD should be clear for a client that did not set it")
 
-	stripped_wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
+	stripped_wire, stripped_encoded := encode(t, signed_response())
+	if !stripped_encoded {
+		return
+	}
 	stripped_wire[3] |= 0x10
 	stripped := present_response(stripped_wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
 	testing.expect(t, stripped[3] & 0x10 == 0, "CD should be clear on a stripped answer too")
 	free_all(context.temp_allocator)
+}
+
+// `msg` with an unsigned NS for `example.com.` naming `ns.attacker.example.`
+// added to its authority section, and `also` after it.
+@(private = "file")
+with_forged_ns :: proc(msg: dns.Message, also: ..dns.Record) -> dns.Message {
+	out := msg
+	authority := make([dynamic]dns.Record, 0, len(msg.authority) + 1 + len(also), context.temp_allocator)
+	append(&authority, ..msg.authority)
+	append(
+		&authority,
+		dns.Record {
+			name = "example.com.",
+			type = .NS,
+			class = .IN,
+			ttl = 86400,
+			data = dns.Rdata_Name{name = "ns.attacker.example."},
+		},
+	)
+	append(&authority, ..also)
+	out.authority = authority[:]
+	return out
 }
 
 @(test)
@@ -287,19 +335,6 @@ test_ad_never_goes_out_over_records_the_verdict_missed :: proc(t: ^testing.T) {
 	NSEC3PARAM and hands on every other type it finds, so a forged NS and the
 	address to go with it walk straight through it.
 	*/
-	msg := signed_response()
-	authority := make([dynamic]dns.Record, 0, len(msg.authority) + 1, context.temp_allocator)
-	append(&authority, ..msg.authority)
-	append(
-		&authority,
-		dns.Record {
-			name = "example.com.",
-			type = .NS,
-			class = .IN,
-			ttl = 86400,
-			data = dns.Rdata_Name{name = "ns.attacker.example."},
-		},
-	)
 	/*
 	And the same question asked sideways: an address for the name that *was*
 	authenticated, in the section that was not. The verdict names an RRset in a
@@ -307,17 +342,7 @@ test_ad_never_goes_out_over_records_the_verdict_missed :: proc(t: ^testing.T) {
 	the signature that held up was checked over the answer section's records and
 	says nothing about these.
 	*/
-	append(
-		&authority,
-		dns.Record {
-			name = "www.example.com.",
-			type = .A,
-			class = .IN,
-			ttl = 300,
-			data = dns.Rdata_A{addr = {203, 0, 113, 67}},
-		},
-	)
-	msg.authority = authority[:]
+	msg := with_forged_ns(signed_response(), a_record("www.example.com.", {203, 0, 113, 67}, 300))
 
 	additional := make([dynamic]dns.Record, 0, len(msg.additional) + 1, context.temp_allocator)
 	append(&additional, ..msg.additional)
@@ -333,8 +358,10 @@ test_ad_never_goes_out_over_records_the_verdict_missed :: proc(t: ^testing.T) {
 	)
 	msg.additional = additional[:]
 
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, err, dns.Encode_Error.None)
+	wire, encoded := encode(t, msg)
+	if !encoded {
+		return
+	}
 
 	out := present_response(wire, client_query(true), .A, secure_verdict(), nil, context.temp_allocator)
 	testing.expect(t, out[3] & 0x20 != 0, "AD should record the secure verdict")
@@ -375,23 +402,12 @@ record back.
 */
 @(test)
 test_a_pruned_answer_survives_the_strip_for_a_client_without_do :: proc(t: ^testing.T) {
-	msg := signed_response()
-	authority := make([dynamic]dns.Record, 0, len(msg.authority) + 1, context.temp_allocator)
-	append(&authority, ..msg.authority)
-	append(
-		&authority,
-		dns.Record {
-			name = "example.com.",
-			type = .NS,
-			class = .IN,
-			ttl = 86400,
-			data = dns.Rdata_Name{name = "ns.attacker.example."},
-		},
-	)
-	msg.authority = authority[:]
+	msg := with_forged_ns(signed_response())
 
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, err, dns.Encode_Error.None)
+	wire, encoded := encode(t, msg)
+	if !encoded {
+		return
+	}
 
 	out := present_response(wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
 	testing.expect(t, out[3] & 0x20 != 0, "AD should record the secure verdict")
@@ -411,30 +427,6 @@ test_a_pruned_answer_survives_the_strip_for_a_client_without_do :: proc(t: ^test
 	testing.expect(t, !dns.edns_do(decoded), "DO should be clear for a client that did not set it")
 	testing.expect_value(t, dns.edns_udp_size(decoded), u16(1232))
 	free_all(context.temp_allocator)
-}
-
-@(private = "file")
-aaaa_question :: proc() -> []dns.Question {
-	out := make([]dns.Question, 1, context.temp_allocator)
-	out[0] = dns.Question {
-		name  = "www.example.com.",
-		type  = .AAAA,
-		class = .IN,
-	}
-	return out
-}
-
-@(private = "file")
-aaaa_query :: proc() -> dns.Message {
-	msg := dns.Message {
-		id       = 0x2b2b,
-		question = aaaa_question(),
-	}
-	msg.flags.rd = true
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(1232, true)
-	msg.additional = additional
-	return msg
 }
 
 /*
@@ -495,7 +487,7 @@ cname_nodata_response :: proc() -> dns.Message {
 
 	msg := dns.Message {
 		id         = 0x2b2b,
-		question   = aaaa_question(),
+		question   = question(.AAAA),
 		answer     = answer,
 		authority  = authority,
 		additional = additional,
@@ -525,23 +517,19 @@ test_a_pruned_denial_after_a_cname_is_not_cached :: proc(t: ^testing.T) {
 	for rcode in ([]dns.Rcode{.No_Error, .NX_Domain}) {
 		msg := cname_nodata_response()
 		msg.flags.rcode = u8(rcode)
-		wire, _, err := dns.encode_message(msg, context.temp_allocator)
-		testing.expect_value(t, err, dns.Encode_Error.None)
+		wire, encoded := encode(t, msg)
+		if !encoded {
+			return
+		}
 
 		covered := make([]dnssec.Authenticated_Set, 1, context.temp_allocator)
-		covered[0] = dnssec.Authenticated_Set {
-			name   = "www.example.com.",
-			type   = .CNAME,
-			class  = .IN,
-			signer = TEST_SIGNER,
-			ttl    = 86400,
-		}
+		covered[0] = auth_set("www.example.com.", .CNAME)
 		verdict := dnssec.Result {
 			status = .Secure,
 			answer = covered,
 		}
 
-		out := present_response(wire, aaaa_query(), .AAAA, verdict, nil, context.temp_allocator)
+		out := present_response(wire, client_query(true, type = .AAAA), .AAAA, verdict, nil, context.temp_allocator)
 		decoded, derr := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr, dns.Decode_Error.None)
 		testing.expect_value(t, dns.rcode_of(decoded), rcode)
@@ -559,7 +547,8 @@ test_a_pruned_denial_after_a_cname_is_not_cached :: proc(t: ^testing.T) {
 
 		// The same message unpruned, SOA and all, is kept: the refusal is the
 		// missing SOA and not the shape.
-		full, _ := dns.decode_message(wire, context.temp_allocator)
+		full, ferr := dns.decode_message(wire, context.temp_allocator)
+		testing.expect_value(t, ferr, dns.Decode_Error.None)
 		testing.expectf(t, cache.put(answers, key, wire, full), "cache.put refused an unpruned %v after a CNAME", rcode)
 	}
 	free_all(context.temp_allocator)
@@ -584,30 +573,20 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 		data = dns.Rdata_AAAA{addr = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
 	}
 	msg.answer = answer
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, err, dns.Encode_Error.None)
+	wire, encoded := encode(t, msg)
+	if !encoded {
+		return
+	}
 
 	covered := make([]dnssec.Authenticated_Set, 2, context.temp_allocator)
-	covered[0] = dnssec.Authenticated_Set {
-		name   = "www.example.com.",
-		type   = .CNAME,
-		class  = .IN,
-		signer = TEST_SIGNER,
-		ttl    = 86400,
-	}
-	covered[1] = dnssec.Authenticated_Set {
-		name   = "cdn.example.net.",
-		type   = .AAAA,
-		class  = .IN,
-		signer = TEST_SIGNER,
-		ttl    = 86400,
-	}
+	covered[0] = auth_set("www.example.com.", .CNAME)
+	covered[1] = auth_set("cdn.example.net.", .AAAA)
 	verdict := dnssec.Result {
 		status = .Secure,
 		answer = covered,
 	}
 
-	out := present_response(wire, aaaa_query(), .AAAA, verdict, nil, context.temp_allocator)
+	out := present_response(wire, client_query(true, type = .AAAA), .AAAA, verdict, nil, context.temp_allocator)
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect_value(t, len(decoded.answer), 3)
@@ -621,8 +600,8 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 		return
 	}
 
-	cfg := config.default_config()
-	cfg.log.queries = false
+	cfg := test_config()
+	cfg.cache.enabled = true
 	s := Server {
 		cfg     = &cfg,
 		answers = answers,
@@ -632,8 +611,10 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 	s.validator = dnssec.make_validator(nil, nil, dnssec.Options{})
 	defer dnssec.destroy_validator(s.validator)
 
-	query_wire, _, qenc := dns.encode_message(aaaa_query(), context.temp_allocator)
-	testing.expect_value(t, qenc, dns.Encode_Error.None)
+	query_wire, query_encoded := encode(t, client_query(true, type = .AAAA))
+	if !query_encoded {
+		return
+	}
 
 	served, outcome, ok := handle_query(&s, query_wire, .UDP, "test", context.temp_allocator)
 	testing.expect(t, ok, "no response was produced")
@@ -677,11 +658,13 @@ serve_cached_with_ad :: proc(t: ^testing.T, c: Ad_Case) -> (response: []u8, ok: 
 	stored := signed_response()
 	stored.flags.ad = true
 	stored.flags.cd = c.stored_cd
-	wire, _, enc := dns.encode_message(stored, context.temp_allocator)
-	testing.expect_value(t, enc, dns.Encode_Error.None)
+	wire, encoded := encode(t, stored)
+	if !encoded {
+		return nil, false
+	}
 
-	cfg := config.default_config()
-	cfg.log.queries = false
+	cfg := test_config()
+	cfg.cache.enabled = true
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
 	defer cache.destroy(answers)
 
@@ -700,18 +683,13 @@ serve_cached_with_ad :: proc(t: ^testing.T, c: Ad_Case) -> (response: []u8, ok: 
 
 	query := client_query(false, with_edns = false)
 	query.flags.cd = c.cd
-	query_wire, _, qenc := dns.encode_message(query, context.temp_allocator)
-	testing.expect_value(t, qenc, dns.Encode_Error.None)
+	query_wire, qencoded := encode(t, query)
+	if !qencoded {
+		return nil, false
+	}
 
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(
-		key_buf[:],
-		query.question[0].name,
-		query.question[0].type,
-		query.question[0].class,
-		dns.edns_do(query),
-		query.flags.cd,
-	)
+	key := key_of(key_buf[:], query)
 	decoded, derr := dns.decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	if !cache.put(answers, key, wire, decoded) {
@@ -771,9 +749,7 @@ test_formerr_for_an_unparseable_query_carries_its_id :: proc(t: ^testing.T) {
 	_, derr := dns.decode_message(query, context.temp_allocator)
 	testing.expect(t, derr != .None, "the fixture parsed, so it is not testing the unparseable path")
 
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
+	cfg := test_config()
 	s := Server {
 		cfg = &cfg,
 	}
@@ -808,100 +784,33 @@ path to check it: a miss, forwarded to an upstream that sets AD, with CD on the
 client's query so no verdict of ours is ever reached.
 */
 
-@(private = "file")
-Udp_Mock :: struct {
-	socket: net.UDP_Socket,
-	reply:  []u8,
-}
-
-@(private = "file")
-udp_mock_once :: proc(m: ^Udp_Mock) {
-	buf: [4096]u8
-	n, remote, err := net.recv_udp(m.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE || len(m.reply) > len(buf) {
-		return
-	}
-	out: [4096]u8
-	copy(out[:], m.reply)
-	// Echo the query's transaction id, so the reply is matched to it.
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(m.socket, out[:len(m.reply)], remote)
-}
-
 @(test)
 test_unvalidated_answer_is_not_cached_with_ad :: proc(t: ^testing.T) {
 	// The answer as an upstream sent it, AD set. Nothing here established that.
 	from_upstream := signed_response()
 	from_upstream.flags.ad = true
-	reply, _, enc := dns.encode_message(from_upstream, context.temp_allocator)
-	testing.expect_value(t, enc, dns.Encode_Error.None)
-
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind the mock upstream: %v", serr)
-		return
-	}
-	defer net.close(socket)
-	// The mock has no timeout of its own and the join below waits for it, so
-	// without this a query that never arrives hangs the run instead of failing
-	// it. See the note on `MOCK_RECV_TIMEOUT`.
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
+	reply, reply_encoded := encode(t, from_upstream)
+	if !reply_encoded {
 		return
 	}
 
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = true
-	cfg.dnssec.enabled = true
-	cfg.upstream.strategy = .Failover
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	cfg.upstream.servers = servers
-
-	g, gerr := upstream.make_group(cfg.upstream)
-	if gerr != .None {
-		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
-		return
-	}
-	defer upstream.destroy_group(g)
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	defer cache.destroy(answers)
-
-	s := Server {
-		cfg     = &cfg,
-		group   = g,
-		answers = answers,
-	}
+	h: Harness
 	// A validator that is never asked anything: CD below keeps it out of the way.
-	s.validator = dnssec.make_validator(nil, nil, dnssec.Options{})
-	defer dnssec.destroy_validator(s.validator)
+	if !harness_start(t, &h, caching = true, validating = true) {
+		return
+	}
+	defer harness_stop(&h)
 
 	// CD set, so `validating` is false and we reach no verdict of our own.
 	query := client_query(false, with_edns = false)
 	query.flags.cd = true
-	query_wire, _, qenc := dns.encode_message(query, context.temp_allocator)
-	testing.expect_value(t, qenc, dns.Encode_Error.None)
-
-	m := Udp_Mock {
-		socket = socket,
-		reply  = reply,
+	query_wire, query_encoded := encode(t, query)
+	if !query_encoded {
+		return
 	}
-	server := thread.create_and_start_with_poly_data(&m, udp_mock_once)
-	out, outcome, served := handle_query(&s, query_wire, .UDP, "test", context.temp_allocator)
-	// Joined here rather than deferred: the mock reads `reply` out of the scratch
-	// arena this test resets on its way out.
-	thread.join(server)
-	thread.destroy(server)
 
+	out, outcome, served, asked := harness_ask(&h, query_wire, reply, client = "test")
+	testing.expect(t, asked, "the upstream was never asked")
 	testing.expect(t, served, "no response was produced")
 	testing.expectf(t, outcome == .Forwarded, "expected the forwarded path, got %v", outcome)
 	// The client's copy carries no AD either.
@@ -913,15 +822,7 @@ test_unvalidated_answer_is_not_cached_with_ad :: proc(t: ^testing.T) {
 
 	// What the entry carries is the point.
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(
-		key_buf[:],
-		query.question[0].name,
-		query.question[0].type,
-		query.question[0].class,
-		dns.edns_do(query),
-		query.flags.cd,
-	)
-	stored, _, found := cache.get(answers, key, context.temp_allocator)
+	stored, _, found := cache.get(h.answers, key_of(key_buf[:], query), context.temp_allocator)
 	testing.expect(t, found, "the answer was not cached, so nothing was stored to check")
 	if found {
 		testing.expect(
@@ -964,7 +865,10 @@ test_settle_header_states_this_servers_rd_ra_aa_z :: proc(t: ^testing.T) {
 	// RFC 1035 section 4.1.1. An authoritative-only upstream's answer - AA set,
 	// RA clear, and Z set by a careless one - stored for a client that set RD,
 	// then served to one that did not.
-	wire, _, _ := dns.encode_message(signed_response(), context.temp_allocator)
+	wire, encoded := encode(t, signed_response())
+	if !encoded {
+		return
+	}
 	wire[2] |= 0x04 | 0x01
 	wire[3] = (wire[3] &~ 0x80) | 0x40
 
@@ -987,6 +891,15 @@ test_settle_header_states_this_servers_rd_ra_aa_z :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// `signed_response` with the A record's and its signature's TTLs raised to a week.
+@(private = "file")
+raised_ttl_response :: proc() -> dns.Message {
+	msg := signed_response()
+	msg.answer[0].ttl = 604800
+	msg.answer[1].ttl = 604800
+	return msg
+}
+
 /*
 RFC 4035 section 5.3.3, at the point the answer leaves for the client and the
 cache: an A record whose unsigned TTL was raised on the path goes out under AD
@@ -994,14 +907,15 @@ with no more than the verified signature's ceiling (#337).
 */
 @(test)
 test_a_served_ttl_is_held_to_the_signature :: proc(t: ^testing.T) {
-	msg := signed_response()
-	msg.answer[0].ttl = 604800
-	msg.answer[1].ttl = 604800
-	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+	wire, encoded := encode(t, raised_ttl_response())
+	if !encoded {
+		return
+	}
 	verdict := secure_verdict()
 	verdict.answer[0].ttl = 300
 	out := present_response(wire, client_query(true), .A, verdict, nil, context.temp_allocator)
-	served, _ := dns.decode_message(out, context.temp_allocator)
+	served, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect(t, served.flags.ad, "a secure verdict lost its AD bit")
 	testing.expect_value(t, len(served.answer), 2)
 	for rec in served.answer {
@@ -1018,10 +932,11 @@ the same problem by another road.
 */
 @(test)
 test_an_unrebuildable_answer_still_has_its_ttl_held :: proc(t: ^testing.T) {
-	msg := signed_response()
-	msg.answer[0].ttl = 604800
-	msg.answer[1].ttl = 604800
-	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+	msg := raised_ttl_response()
+	wire, encoded := encode(t, msg)
+	if !encoded {
+		return
+	}
 	/*
 	An authenticated MX whose exchange is a compression pointer the decoder
 	could not follow (it points past the message), so it stays raw RDATA and
@@ -1042,7 +957,10 @@ test_an_unrebuildable_answer_still_has_its_ttl_held :: proc(t: ^testing.T) {
 		head := msg
 		head.authority = nil
 		head.additional = nil
-		head_wire, _, _ := dns.encode_message(head, context.temp_allocator)
+		head_wire, head_encoded := encode(t, head)
+		if !head_encoded {
+			return
+		}
 		answer_end = len(head_wire)
 	}
 	broken := make([dynamic]u8, 0, len(wire) + len(mx), context.temp_allocator)

@@ -62,15 +62,15 @@ max_age_of :: proc(rcode: dns.Rcode, cname_ttl: u32, target_a, soa: bool) -> u32
 @(test)
 test_doh_max_age_for_a_denial_is_the_soa_figure :: proc(t: ^testing.T) {
 	// A plain NODATA and NXDOMAIN: the MINIMUM, not the SOA record's TTL.
-	testing.expect_value(t, max_age_of(.No_Error, 0, false, true), u32(300))
-	testing.expect_value(t, max_age_of(.NX_Domain, 0, false, true), u32(300))
+	testing.expect_value(t, max_age_of(.No_Error, cname_ttl = 0, target_a = false, soa = true), u32(300))
+	testing.expect_value(t, max_age_of(.NX_Domain, cname_ttl = 0, target_a = false, soa = true), u32(300))
 	// NODATA after a CNAME: the SOA figure, or the CNAME where it is shorter.
-	testing.expect_value(t, max_age_of(.No_Error, 86400, false, true), u32(300))
-	testing.expect_value(t, max_age_of(.No_Error, 60, false, true), u32(60))
+	testing.expect_value(t, max_age_of(.No_Error, cname_ttl = 86400, target_a = false, soa = true), u32(300))
+	testing.expect_value(t, max_age_of(.No_Error, cname_ttl = 60, target_a = false, soa = true), u32(60))
 	// And none at all without a SOA.
-	testing.expect_value(t, max_age_of(.No_Error, 86400, false, false), u32(0))
+	testing.expect_value(t, max_age_of(.No_Error, cname_ttl = 86400, target_a = false, soa = false), u32(0))
 	// An answer that reaches the type gets its smallest TTL.
-	testing.expect_value(t, max_age_of(.No_Error, 86400, true, false), u32(600))
+	testing.expect_value(t, max_age_of(.No_Error, cname_ttl = 86400, target_a = true, soa = false), u32(600))
 	free_all(context.temp_allocator)
 }
 

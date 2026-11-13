@@ -50,11 +50,6 @@ EXTRA_NAME :: "ns.other.example."
 @(private = "file")
 CLIENT :: "198.51.100.7:9999"
 
-// The OPT record's own encoded length: a root owner name, TYPE, CLASS, TTL and
-// RDLENGTH. What this server sends, and what it should therefore reserve.
-@(private = "file")
-OPT_LEN :: 11
-
 /*
 The NSID an upstream wrote into the record it answered with: four bytes of
 option header and twenty of payload.
@@ -145,29 +140,10 @@ upstream_answer :: proc(records: int, extra: bool) -> []u8 {
 
 @(private = "file")
 client_query :: proc(advertised: u16, edns: bool) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
+	if !edns {
+		return test_query(QNAME, id = 0x1234)
 	}
-
-	msg := dns.Message {
-		id       = 0x1234,
-		question = question,
-	}
-	msg.flags.rd = true
-	if edns {
-		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = dns.make_opt(advertised, false)
-		msg.additional = additional
-	}
-
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_query(QNAME, id = 0x1234, opt = dns.make_opt(advertised, false))
 }
 
 /*
@@ -180,10 +156,8 @@ in `cookie_fit_test.odin`.
 */
 @(private = "file")
 answer_once :: proc(t: ^testing.T, stored: []u8, query: []u8) -> (out: []u8, ok: bool) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.blocking.enabled = false
-	cfg.dnssec.enabled = false
+	cfg := test_config()
+	cfg.cache.enabled = true
 	cfg.cookies.enabled = false
 
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
@@ -193,15 +167,7 @@ answer_once :: proc(t: ^testing.T, stored: []u8, query: []u8) -> (out: []u8, ok:
 		cfg     = &cfg,
 		answers = answers,
 	}
-
-	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
-	decoded, derr := dns.decode_message(stored, context.temp_allocator)
-	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
-		return nil, false
-	}
-	if !cache.put(answers, key, stored, decoded) {
-		testing.expect(t, false, "the answer was not cached")
+	if !seed_cache(t, answers, QNAME, stored) {
 		return nil, false
 	}
 
@@ -396,7 +362,7 @@ test_a_client_without_edns_is_cut_to_its_own_datagram :: proc(t: ^testing.T) {
 	// without EDNS can read, which is what makes this a truncation.
 	if !testing.expectf(
 		t,
-		len(stored) - OPT_LEN - OPTION_LEN > 512,
+		len(stored) - OPT_RR_LEN - OPTION_LEN > 512,
 		"the answer is %d bytes, so a 512-byte datagram holds it and nothing is cut",
 		len(stored),
 	) {

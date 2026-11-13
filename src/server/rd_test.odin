@@ -17,41 +17,17 @@ makes a mistake in the gate's placement loud instead of a timeout.
 */
 
 @(private = "file")
-rd_query :: proc(rd: bool, name := "example.com.", type := dns.Type.A, edns := false) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = name,
-		type  = type,
-		class = .IN,
-	}
-	msg := dns.Message {
-		id       = 0x1234,
-		question = questions,
-	}
-	msg.flags.rd = rd
-
+rd_query :: proc(rd: bool, name := "example.com.", edns := false) -> []u8 {
 	if edns {
-		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = dns.make_opt(1232, false)
-		msg.additional = additional
+		return test_query(name, id = 0x1234, rd = rd, opt = dns.make_opt(1232, false))
 	}
-
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_query(name, id = 0x1234, rd = rd)
 }
 
 @(test)
 test_rd_zero_is_refused_without_forwarding :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	s := Server {
-		cfg = &cfg,
-	}
+	cfg: config.Config
+	s := local_server(&cfg)
 
 	out, outcome, ok := handle_query(&s, rd_query(false), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if !testing.expect(t, ok, "an RD=0 query went unanswered") {
@@ -75,13 +51,8 @@ test_rd_zero_is_refused_without_forwarding :: proc(t: ^testing.T) {
 // answer the same way it would for the class or cookie checks beside it.
 @(test)
 test_rd_zero_refusal_echoes_edns :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-	s := Server {
-		cfg = &cfg,
-	}
+	cfg: config.Config
+	s := local_server(&cfg)
 
 	out, outcome, ok := handle_query(&s, rd_query(false, edns = true), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if !testing.expect(t, ok, "an RD=0 query with EDNS went unanswered") {
@@ -107,16 +78,12 @@ made.
 */
 @(test)
 test_rd_zero_is_still_served_from_cache :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.blocking.enabled = false
+	cfg: config.Config
+	s := local_server(&cfg)
+	cfg.cache.enabled = true
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
 	defer cache.destroy(answers)
-
-	s := Server {
-		cfg     = &cfg,
-		answers = answers,
-	}
+	s.answers = answers
 
 	name := "example.com."
 	answer := make([]dns.Record, 1, context.temp_allocator)
@@ -135,15 +102,12 @@ test_rd_zero_is_still_served_from_cache :: proc(t: ^testing.T) {
 	stored.flags.qr = true
 	stored.flags.ra = true
 	wire, _, enc := dns.encode_message(stored, context.temp_allocator)
-	testing.expect_value(t, enc, dns.Encode_Error.None)
-
+	if !testing.expect_value(t, enc, dns.Encode_Error.None) {
+		return
+	}
 	// RD plays no part in `cache.make_key` - stored under a key an RD=1 lookup
 	// would have made too, which is what makes this hit reachable at all.
-	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], name, .A, .IN, false, false)
-	decoded, derr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
-	if !testing.expect(t, cache.put(answers, key, wire, decoded), "the answer was not cached") {
+	if !seed_cache(t, answers, name, wire) {
 		return
 	}
 
@@ -174,9 +138,8 @@ did not expect.
 */
 @(test)
 test_rd_zero_still_gets_blocked_and_rewritten_answers :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
+	cfg: config.Config
+	s := local_server(&cfg)
 	cfg.blocking.enabled = true
 
 	cfg.rewrites = make([]config.Rewrite, 1, context.temp_allocator)
@@ -186,16 +149,13 @@ test_rd_zero_still_gets_blocked_and_rewritten_answers :: proc(t: ^testing.T) {
 		ttl     = 300,
 	}
 
-	block, allow := filter.set_make(), filter.set_make()
-	filter.parse_list(block, allow, "0.0.0.0 blocked.example.com\n", .Hosts)
-	engine := filter.engine_make()
+	engine, listed := test_filters(t, "0.0.0.0 blocked.example.com\n", .Hosts)
 	defer filter.engine_destroy(engine)
-	filter.engine_swap(engine, block, allow)
-
-	s := Server {
-		cfg     = &cfg,
-		filters = engine,
+	if !listed {
+		return
 	}
+
+	s.filters = engine
 
 	_, blocked_outcome, blocked_ok := handle_query(
 		&s,

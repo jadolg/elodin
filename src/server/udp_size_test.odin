@@ -1,13 +1,8 @@
 package server
 
-import "core:net"
 import "core:testing"
-import "core:thread"
-import "core:time"
-import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
-import "elodin:upstream"
 
 /*
 What the OPT record in an answer says this server's UDP payload size is.
@@ -67,12 +62,7 @@ client_query :: proc(
 			for i in 0 ..< len(half) {
 				half[i] = u8(0xa0 + i)
 			}
-			options := make([]dns.EDNS_Option, 1, context.temp_allocator)
-			options[0] = dns.EDNS_Option {
-				code = u16(dns.EDNS_Option_Code.Cookie),
-				data = half,
-			}
-			opt.data = dns.Rdata_OPT{options = options}
+			opt = opt_with(.Cookie, half, advertised)
 		}
 		additional := make([]dns.Record, 1, context.temp_allocator)
 		additional[0] = opt
@@ -102,13 +92,7 @@ mock_reply :: proc() -> []u8 {
 		class = .IN,
 	}
 	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-		ttl   = 300,
-		data  = dns.Rdata_A{addr = {192, 0, 2, 1}},
-	}
+	answer[0] = a_record(QNAME, {192, 0, 2, 1}, 300)
 	additional := make([]dns.Record, 1, context.temp_allocator)
 	additional[0] = dns.make_opt(4096, false)
 
@@ -129,119 +113,6 @@ mock_reply :: proc() -> []u8 {
 	return wire
 }
 
-@(private = "file")
-Exchange :: struct {
-	socket: net.UDP_Socket,
-	reply:  []u8,
-	got:    bool,
-}
-
-@(private = "file")
-serve_one :: proc(x: ^Exchange) {
-	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
-		return
-	}
-	x.got = true
-
-	out: [4096]u8
-	copy(out[:], x.reply)
-	// Echo the ID it was asked with: the forwarded query carries one of ours.
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
-}
-
-@(private = "file")
-Harness :: struct {
-	socket:  net.UDP_Socket,
-	cfg:     config.Config,
-	group:   ^upstream.Group,
-	answers: ^cache.Cache,
-	srv:     Server,
-}
-
-@(private = "file")
-harness_start :: proc(t: ^testing.T, h: ^Harness, caching := false, cookies := false) -> bool {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind the mock upstream: %v", serr)
-		return false
-	}
-	h.socket = socket
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
-		return false
-	}
-
-	h.cfg = config.default_config()
-	h.cfg.log.queries = false
-	h.cfg.cache.enabled = caching
-	h.cfg.blocking.enabled = false
-	h.cfg.dnssec.enabled = false
-	h.cfg.cookies.enabled = cookies
-	h.cfg.upstream.strategy = .Failover
-	h.cfg.upstream.attempts = 1
-	h.cfg.upstream.timeout = 5 * time.Second
-
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	h.cfg.upstream.servers = servers
-
-	group, gerr := upstream.make_group(h.cfg.upstream, context.allocator, false)
-	if gerr != .None {
-		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
-		return false
-	}
-	h.group = group
-
-	h.answers = cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	h.srv = Server {
-		cfg     = &h.cfg,
-		group   = h.group,
-		answers = h.answers,
-	}
-	if !start_cookies(&h.srv) {
-		testing.expect(t, false, "cannot set the cookie secret up")
-		return false
-	}
-	return true
-}
-
-@(private = "file")
-harness_stop :: proc(h: ^Harness) {
-	stop_cookies(&h.srv)
-	cache.destroy(h.answers)
-	upstream.destroy_group(h.group)
-	net.close(h.socket)
-}
-
-// One query through the server with the mock upstream answering it.
-@(private = "file")
-forward_once :: proc(t: ^testing.T, h: ^Harness, query: []u8, proto := Protocol.UDP) -> (out: []u8, ok: bool) {
-	x := Exchange {
-		socket = h.socket,
-		reply  = mock_reply(),
-	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one)
-	response, _, served := handle_query(&h.srv, query, proto, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
-
-	if !testing.expect(t, x.got, "the upstream was never asked") {
-		return nil, false
-	}
-	return response, served
-}
-
 /*
 A locally built answer is the plainest case: `make_response` echoes the client's
 own advertised size straight into the OPT record it puts back, so left at that,
@@ -253,10 +124,7 @@ or an upstream - so what the OPT says is the only thing under test.
 */
 @(test)
 test_a_local_answer_advertises_the_ceiling :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+	cfg := test_config()
 	s := Server {
 		cfg = &cfg,
 	}
@@ -290,10 +158,7 @@ have spared it.
 */
 @(test)
 test_a_client_below_the_ceiling_is_still_told_the_ceiling :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+	cfg := test_config()
 	s := Server {
 		cfg = &cfg,
 	}
@@ -312,10 +177,7 @@ test_a_client_below_the_ceiling_is_still_told_the_ceiling :: proc(t: ^testing.T)
 // invents one to write a number into.
 @(test)
 test_a_query_without_edns_gets_no_opt_back :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+	cfg := test_config()
 	s := Server {
 		cfg = &cfg,
 	}
@@ -344,7 +206,7 @@ test_a_forwarded_answer_advertises_the_ceiling :: proc(t: ^testing.T) {
 	}
 	defer harness_stop(&h)
 
-	out, ok := forward_once(t, &h, client_query(CLIENT_ADVERTISED))
+	out, ok := forward_once(t, &h, client_query(CLIENT_ADVERTISED), mock_reply())
 	if !testing.expect(t, ok, "the query went unanswered") {
 		return
 	}
@@ -369,7 +231,7 @@ test_a_cached_answer_advertises_the_ceiling_of_the_request :: proc(t: ^testing.T
 	defer harness_stop(&h)
 
 	// Fills the cache; the entry stores the upstream's 4096.
-	if _, ok := forward_once(t, &h, client_query(CLIENT_ADVERTISED)); !ok {
+	if _, ok := forward_once(t, &h, client_query(CLIENT_ADVERTISED), mock_reply()); !ok {
 		return
 	}
 
@@ -401,7 +263,7 @@ test_an_answer_carrying_a_cookie_advertises_the_ceiling :: proc(t: ^testing.T) {
 	}
 	defer harness_stop(&h)
 
-	out, ok := forward_once(t, &h, client_query(CLIENT_ADVERTISED, cookie = true))
+	out, ok := forward_once(t, &h, client_query(CLIENT_ADVERTISED, cookie = true), mock_reply())
 	if !testing.expect(t, ok, "the query went unanswered") {
 		return
 	}
@@ -426,10 +288,7 @@ echoing the client's figure, which is what `make_response` put there.
 */
 @(test)
 test_a_stream_answer_leaves_a_local_opt_alone :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+	cfg := test_config()
 	s := Server {
 		cfg = &cfg,
 	}
@@ -468,7 +327,7 @@ test_a_forwarded_stream_answer_keeps_the_upstream_opt :: proc(t: ^testing.T) {
 	}
 	defer harness_stop(&h)
 
-	out, ok := forward_once(t, &h, client_query(1232), .TCP)
+	out, ok := forward_once(t, &h, client_query(1232), mock_reply(), .TCP)
 	if !testing.expect(t, ok, "the query went unanswered") {
 		return
 	}
@@ -486,10 +345,7 @@ did.
 */
 @(test)
 test_an_error_response_advertises_the_ceiling :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+	cfg := test_config()
 	s := Server {
 		cfg = &cfg,
 	}

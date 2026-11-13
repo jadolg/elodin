@@ -60,50 +60,23 @@ script_write :: proc(user: rawptr, buf: []u8) -> bool {
 	return true
 }
 
-@(private = "file")
-write_frame :: proc(out: ^[dynamic]u8, length: int, type: u8, flags: u8, stream_id: u32) {
-	append(
-		out,
-		u8(length >> 16),
-		u8(length >> 8),
-		u8(length),
-		type,
-		flags,
-		u8(stream_id >> 24),
-		u8(stream_id >> 16),
-		u8(stream_id >> 8),
-		u8(stream_id),
-	)
-}
-
-// HPACK literal without indexing, new name - the encoding that needs no table
-// state, so the block can be built here without an encoder.
-@(private = "file")
-write_field :: proc(out: ^[dynamic]u8, name, value: string) {
-	append(out, 0x00)
-	append(out, u8(len(name)))
-	append(out, ..transmute([]u8)name)
-	append(out, u8(len(value)))
-	append(out, ..transmute([]u8)value)
-}
-
 // Everything a client sends for `requests` complete GETs: the preface, the
 // SETTINGS it opens with, and a HEADERS frame carrying each whole request.
 @(private = "file")
 one_get_request :: proc(path: string, requests := 1) -> [dynamic]u8 {
 	block := make([dynamic]u8, 0, 128, context.allocator)
 	defer delete(block)
-	write_field(&block, ":method", "GET")
-	write_field(&block, ":scheme", "https")
-	write_field(&block, ":authority", "dns.example")
-	write_field(&block, ":path", path)
+	h2.encode_header(&block, ":method", "GET")
+	h2.encode_header(&block, ":scheme", "https")
+	h2.encode_header(&block, ":authority", "dns.example")
+	h2.encode_header(&block, ":path", path)
 
 	out := make([dynamic]u8, 0, 256, context.allocator)
 	append(&out, ..transmute([]u8)string(h2.PREFACE))
-	write_frame(&out, 0, 0x4, 0, 0)
+	h2.write_frame_header(&out, 0, .Settings, 0, 0)
 	for i in 0 ..< requests {
-		// END_STREAM | END_HEADERS: a complete request in one frame.
-		write_frame(&out, len(block), 0x1, 0x5, u32(2 * i + 1))
+		// A complete request in one frame.
+		h2.write_frame_header(&out, len(block), .Headers, h2.FLAG_END_STREAM | h2.FLAG_END_HEADERS, u32(2 * i + 1))
 		append(&out, ..block[:])
 	}
 	return out
@@ -114,15 +87,21 @@ one_get_request :: proc(path: string, requests := 1) -> [dynamic]u8 {
 // fiber writing it.
 @(private = "file")
 wrote_a_body :: proc(out: []u8) -> bool {
-	pos := 0
-	for pos + 9 <= len(out) {
-		length := int(out[pos]) << 16 | int(out[pos + 1]) << 8 | int(out[pos + 2])
-		if out[pos + 3] == 0x0 && length > 0 {
+	rest := out
+	for {
+		h, ok := h2.parse_frame_header(rest)
+		if !ok {
+			return false
+		}
+		// Ahead of the length check: a body cut short is still a body written.
+		if h.type == .Data && h.length > 0 {
 			return true
 		}
-		pos += 9 + length
+		if h2.FRAME_HEADER_SIZE + h.length > len(rest) {
+			return false
+		}
+		rest = rest[h2.FRAME_HEADER_SIZE + h.length:]
 	}
-	return false
 }
 
 // How many frames of `type` the connection wrote, and the payload of the first.
@@ -217,6 +196,7 @@ other transport's absent one means too.
 */
 @(private = "file")
 serve_one :: proc(
+	t: ^testing.T,
 	cfg: ^config.Config,
 	path: string,
 	await: string,
@@ -227,9 +207,21 @@ serve_one :: proc(
 	refuse_starts := false,
 	peer := H2_PEER,
 	requests := 1,
+	loc := #caller_location,
 ) -> Result {
+	/*
+	A started job is allocated on the connection's reader and released on the
+	request's own fiber, and in the server both run under the default heap
+	allocator. The test runner hands a test a per-test tracking allocator
+	instead, which would make that pairing a free through an allocator that
+	never made the block. Set before the loop starts, which takes its context
+	from here.
+	*/
+	context.allocator = runtime.heap_allocator()
 	tl: Test_Loop
-	start_test_loop(&tl)
+	if !testing.expect(t, start_test_loop(&tl), "no loop", loc = loc) {
+		return {}
+	}
 	if refuse_starts {
 		loop.stop(tl.loops[0])
 	}
@@ -292,6 +284,20 @@ serve_one :: proc(
 	}
 }
 
+// The default configuration serving DoH at /dns-query, with nothing behind the
+// resolver to answer from, and `max_pending` when one is given.
+@(private = "file")
+doh2_config :: proc(max_pending: Maybe(int) = nil) -> config.Config {
+	cfg := config.default_config()
+	cfg.listeners.doh.path = "/dns-query"
+	cfg.cache.enabled = false
+	cfg.blocking.enabled = false
+	if bound, ok := max_pending.?; ok {
+		cfg.server.max_pending = bound
+	}
+	return cfg
+}
+
 /*
 A reload can take a held connection's network out of `server.allow_from`, and its
 next request is refused 403 and the connection closed, as over HTTP/1.1 (#642).
@@ -301,15 +307,11 @@ request is never read, so it is neither answered nor counted.
 */
 @(test)
 test_doh2_a_held_connection_outside_the_allow_list_gets_403 :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
-	context.allocator = runtime.heap_allocator()
-
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
+	cfg := doh2_config()
 
 	// TEST-NET-3: in no range the default allow list names.
 	outside := net.Endpoint{address = net.IP4_Address{203, 0, 113, 9}, port = 1}
-	got := serve_one(&cfg, "/not-the-endpoint", "403", occupy = false, peer = outside, requests = 2)
+	got := serve_one(t, &cfg, "/not-the-endpoint", "403", occupy = false, peer = outside, requests = 2)
 	defer delete(got.output)
 
 	answered, headers := frames_of(got.output[:], .Headers)
@@ -335,15 +337,9 @@ park on a WINDOW_UPDATE only that reader could read.
 */
 @(test)
 test_doh2_sheds_a_request_it_cannot_start :: proc(t: ^testing.T) {
-	context.allocator = runtime.heap_allocator()
+	cfg := doh2_config(8)
 
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	cfg.server.max_pending = 8
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
-
-	got := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = false, refuse_starts = true)
+	got := serve_one(t, &cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = false, refuse_starts = true)
 	defer delete(got.output)
 
 	testing.expect(t, strings.contains(string(got.output[:]), "503"), "the request was not shed")
@@ -366,23 +362,10 @@ that queues it again should fail this test rather than crash it.
 */
 @(test)
 test_doh2_sheds_when_max_pending_is_full :: proc(t: ^testing.T) {
-	/*
-	A started job is allocated on the connection's reader and released on the
-	request's own fiber, and in the server both run under the default heap
-	allocator. The test runner hands this proc a per-test tracking allocator
-	instead, which would make that pairing a free through an allocator that
-	never made the block.
-	*/
-	context.allocator = runtime.heap_allocator()
-
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	cfg.server.max_pending = 1
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+	cfg := doh2_config(1)
 
 	// A bare 12-byte DNS header, base64url with no padding.
-	got := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true)
+	got := serve_one(t, &cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true)
 	defer delete(got.output)
 
 	testing.expectf(t, got.queued == 0, "%d requests were queued past max_pending", got.queued)
@@ -406,14 +389,9 @@ test_doh2_sheds_when_max_pending_is_full :: proc(t: ^testing.T) {
 // request is started on a fiber of its own and answered there.
 @(test)
 test_doh2_queues_while_max_pending_has_room :: proc(t: ^testing.T) {
-	// See the note in the test above.
-	context.allocator = runtime.heap_allocator()
+	cfg := doh2_config(8)
 
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	cfg.server.max_pending = 8
-
-	got := serve_one(&cfg, "/not-the-endpoint", "not found", occupy = false)
+	got := serve_one(t, &cfg, "/not-the-endpoint", "not found", occupy = false)
 	defer delete(got.output)
 
 	answer := string(got.output[:])
@@ -447,29 +425,16 @@ pending for `queued` to find, and the answer would be 503 rather than 429.
 */
 @(test)
 test_doh2_refuses_a_request_over_the_rate_limit :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
-	context.allocator = runtime.heap_allocator()
-
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	cfg.server.max_pending = 8
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+	cfg := doh2_config(8)
 
 	// One response a second, so the pool holds two; spent through
 	// `stream_rate_check`, which is the pool an h2 request is charged to - see
 	// `Rate_Class`. The slip is on, which a connection must not use.
 	limiter := make_rate_limiter(1, 2)
 	defer destroy_rate_limiter(limiter)
-	for _ in 0 ..< RRL_BURST_SECONDS {
-		testing.expect(
-			t,
-			stream_rate_check(limiter, H2_PEER, time.tick_now()),
-			"the stream budget refused a query it had room for",
-		)
-	}
+	spend_stream_budget(t, limiter, H2_PEER)
 
-	got := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true, limiter = limiter)
+	got := serve_one(t, &cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true, limiter = limiter)
 	defer delete(got.output)
 
 	answer := string(got.output[:])
@@ -504,22 +469,15 @@ clients being served. The same argument `h2_shed` counts by, one step earlier.
 */
 @(test)
 test_doh2_rate_limit_charges_only_queries :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
-	context.allocator = runtime.heap_allocator()
-
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	cfg.server.max_pending = 8
+	cfg := doh2_config(8)
 
 	limiter := make_rate_limiter(1, 0)
 	defer destroy_rate_limiter(limiter)
 	// Nothing left for a query, let alone for anything that is not one. The stream
 	// pool, which is the one an h2 request is charged to - see `Rate_Class`.
-	for _ in 0 ..< RRL_BURST_SECONDS {
-		stream_rate_check(limiter, H2_PEER, time.tick_now())
-	}
+	spend_stream_budget(t, limiter, H2_PEER)
 
-	got := serve_one(&cfg, "/not-the-endpoint", "not found", occupy = false, limiter = limiter)
+	got := serve_one(t, &cfg, "/not-the-endpoint", "not found", occupy = false, limiter = limiter)
 	defer delete(got.output)
 
 	answer := string(got.output[:])
@@ -540,14 +498,9 @@ inflating the figure an operator reads as "this server cannot keep up".
 */
 @(test)
 test_doh2_shed_counts_only_queries :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
-	context.allocator = runtime.heap_allocator()
+	cfg := doh2_config(1)
 
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	cfg.server.max_pending = 1
-
-	got := serve_one(&cfg, "/not-the-endpoint", "", occupy = true)
+	got := serve_one(t, &cfg, "/not-the-endpoint", "", occupy = true)
 	defer delete(got.output)
 
 	testing.expectf(t, got.queued == 0, "%d requests were queued past max_pending", got.queued)
@@ -574,23 +527,17 @@ checks the request's fiber answers by, so the two cannot come apart.
 */
 @(test)
 test_doh2_rate_limit_charges_only_well_formed_queries :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
-	context.allocator = runtime.heap_allocator()
-
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	cfg.server.max_pending = 8
+	cfg := doh2_config(8)
 
 	limiter := make_rate_limiter(1, 0)
 	defer destroy_rate_limiter(limiter)
 	// Nothing left for a query, let alone for something that is not one. The stream
 	// pool, which is the one an h2 request is charged to - see `Rate_Class`.
-	for _ in 0 ..< RRL_BURST_SECONDS {
-		stream_rate_check(limiter, H2_PEER, time.tick_now())
-	}
+	spend_stream_budget(t, limiter, H2_PEER)
 
 	// The endpoint, and a parameter with no base64 in it at all.
 	got := serve_one(
+		t,
 		&cfg,
 		"/dns-query?dns=%%%%",
 		"malformed dns parameter",
@@ -668,24 +615,17 @@ connection either, or the 404 is the free way to hold one.
 */
 @(test)
 test_doh2_only_a_question_keeps_the_connection :: proc(t: ^testing.T) {
-	// See the note in `test_doh2_sheds_when_max_pending_is_full`.
-	context.allocator = runtime.heap_allocator()
-
-	cfg := config.default_config()
-	cfg.listeners.doh.path = "/dns-query"
-	cfg.server.max_pending = 8
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+	cfg := doh2_config(8)
 
 	limiter := make_rate_limiter(100, 0)
 	defer destroy_rate_limiter(limiter)
 
-	scanned := serve_one(&cfg, "/not-the-endpoint", "not found", occupy = false, limiter = limiter)
+	scanned := serve_one(t, &cfg, "/not-the-endpoint", "not found", occupy = false, limiter = limiter)
 	defer delete(scanned.output)
 	testing.expect(t, !scanned.asked, "a request for another path counted as a question")
 
 	// Held behind the gate (`occupy`), so the answer comes well after the question.
-	queried := serve_one(&cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true, limiter = limiter)
+	queried := serve_one(t, &cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true, limiter = limiter)
 	defer delete(queried.output)
 	testing.expect(t, queried.asked, "a query did not count as a question")
 	// Left counted, the connection could never again be let go.

@@ -3,9 +3,7 @@ package server
 import "core:net"
 import "core:testing"
 import "core:thread"
-import "core:time"
 import "elodin:cache"
-import "elodin:config"
 import "elodin:dns"
 import "elodin:upstream"
 
@@ -24,85 +22,14 @@ because the whole point is a response that came from off this machine.
 HOSTILE_NAME :: "hostile.example."
 
 @(private = "file")
-Ttl_Exchange :: struct {
-	socket: net.UDP_Socket,
-	reply:  []u8,
-	got:    bool,
-}
-
-// One query, then done; joined by the caller before `got` is read. The socket
-// carries a receive timeout, so a query that never arrives ends the thread
-// rather than the run.
-@(private = "file")
-serve_one_ttl :: proc(x: ^Ttl_Exchange) {
-	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
-		return
-	}
-	x.got = true
-
-	out: [4096]u8
-	copy(out[:], x.reply)
-	// The resolver draws a fresh ID for every query it forwards, so the reply
-	// has to echo what arrived rather than carry an ID fixed in advance.
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
-}
-
-@(private = "file")
-hostile_query :: proc() -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = HOSTILE_NAME,
-		type  = .A,
-		class = .IN,
-	}
-	msg := dns.Message {
-		id       = 0x2468,
-		question = questions,
-	}
-	msg.flags.rd = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-@(private = "file")
 upstream_reply :: proc(ttl: u32) -> []u8 {
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = HOSTILE_NAME,
-		type  = .A,
-		class = .IN,
-		ttl   = ttl,
-		data  = dns.Rdata_A{addr = {192, 0, 2, 7}},
-	}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question {
-		name  = HOSTILE_NAME,
-		type  = .A,
-		class = .IN,
-	}
-	msg := dns.Message {
-		question = question,
-		answer   = answer,
-	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_reply(HOSTILE_NAME, .A, a_record(HOSTILE_NAME, {192, 0, 2, 7}, ttl))
 }
 
 /*
 Put one query through `handle_query` against a mock upstream that answers with
-`reply`, and report what came back.
+`reply`, and report what came back. The cache is on and bounded by `max_ttl`, as
+`cache.max_ttl` bounds it.
 
 `ok` false means the exchange itself did not happen, which the caller reports
 rather than reading an answer out of nothing.
@@ -117,57 +44,36 @@ exchange_once :: proc(
 	outcome: Outcome,
 	ok: bool,
 ) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	socket, spec, bound := bind_mock(t)
+	if !bound {
 		return nil, .Failed, false
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		return nil, .Failed, false
-	}
 
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = max_ttl})
-	defer cache.destroy(answers)
-
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.blocking.enabled = false
+	cfg := test_config(loopback_upstream(spec.port))
+	cfg.cache.enabled = true
 	cfg.cache.max_ttl = max_ttl
-	cfg.upstream.strategy = .Failover
-	// One try, so a case that is going wrong says so instead of retrying.
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 5 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	cfg.upstream.servers = servers
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
+	group, gerr := upstream.make_group(cfg.upstream)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return nil, .Failed, false
 	}
 	defer upstream.destroy_group(group)
-
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = max_ttl})
+	defer cache.destroy(answers)
 	s := Server {
 		cfg     = &cfg,
 		answers = answers,
 		group   = group,
 	}
 
-	x := Ttl_Exchange {
+	x := Canned_Mock {
 		socket = socket,
 		reply  = reply,
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_ttl)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
 	response, got_outcome, done := handle_query(
 		&s,
-		hostile_query(),
+		test_query(HOSTILE_NAME, id = 0x2468),
 		.UDP,
 		"127.0.0.1:5555",
 		context.temp_allocator,

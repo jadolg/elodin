@@ -14,16 +14,6 @@ none" for the others rather than answering with the wrong one.
 */
 
 @(private = "file")
-answers_of :: proc(list: ..config.Rewrite_Answer) -> []config.Rewrite_Answer {
-	// See `reverse_test.odin`: a `[]T{...}` literal is a temporary in the
-	// enclosing frame, so a rule set built from one and returned is a dangling
-	// slice that reads as rules nobody wrote.
-	out := make([]config.Rewrite_Answer, len(list), context.temp_allocator)
-	copy(out, list)
-	return out
-}
-
-@(private = "file")
 strings_of :: proc(list: ..string) -> []string {
 	out := make([]string, len(list), context.temp_allocator)
 	copy(out, list)
@@ -50,42 +40,14 @@ record_rules :: proc() -> []config.Rewrite {
 	return rules
 }
 
+// `name`'s `type` asked of a `local_server` answering from `rules`, with RD
+// clear: see `ask_local`.
 @(private = "file")
 ask :: proc(rules: []config.Rewrite, name: string, type: dns.Type) -> (dns.Message, Outcome, bool) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+	cfg: config.Config
+	s := local_server(&cfg)
 	cfg.rewrites = rules
-
-	s := Server {
-		cfg = &cfg,
-	}
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = name,
-		type  = type,
-		class = .IN,
-	}
-	// RD=0, so a name the rules do not answer cannot reach the forwarding path -
-	// there is no upstream here - and comes back Refused instead.
-	query := dns.Message {
-		id       = 0x51a0,
-		question = questions,
-	}
-	wire, _, enc := dns.encode_message(query, context.temp_allocator)
-	if enc != .None {
-		return {}, .Failed, false
-	}
-	out, outcome, ok := handle_query(&s, wire, .UDP, "127.0.0.1:5555", context.temp_allocator)
-	if !ok {
-		return {}, outcome, false
-	}
-	resp, derr := dns.decode_message(out, context.temp_allocator)
-	if derr != .None {
-		return {}, outcome, false
-	}
-	return resp, outcome, true
+	return ask_local(&s, name, type)
 }
 
 /*

@@ -23,6 +23,70 @@ at :: proc(ms: i64) -> time.Tick {
 	return time.Tick{_nsec = (3600 + ms) * i64(time.Millisecond)}
 }
 
+// How many of `n` datagrams from `client`, at `ms`, are given `want`.
+@(private = "file")
+count_verdict :: proc(r: ^Rate_Limiter, client: net.Endpoint, ms: i64, n: int, want: Rate_Verdict) -> (count: int) {
+	for _ in 0 ..< n {
+		if rate_check(r, client, at(ms)) == want {
+			count += 1
+		}
+	}
+	return
+}
+
+// How many of `n` queries on a connection from `client`, at `ms`, are answered.
+@(private = "file")
+count_stream :: proc(r: ^Rate_Limiter, client: net.Endpoint, ms: i64, n: int) -> (count: int) {
+	for _ in 0 ..< n {
+		if stream_rate_check(r, client, at(ms)) {
+			count += 1
+		}
+	}
+	return
+}
+
+// How many of `n` connections from `client`, at `ms`, are let in.
+@(private = "file")
+count_conn :: proc(r: ^Rate_Limiter, client: net.Endpoint, ms: i64, n: int) -> (count: int) {
+	for _ in 0 ..< n {
+		if conn_rate_check(r, client, at(ms)) {
+			count += 1
+		}
+	}
+	return
+}
+
+/*
+A full bucket at `rate` admitted and then billed, every answer at 1232 bytes:
+the order the server works in, and the only one that leaves the datagram pool
+owing rather than at zero.
+*/
+@(private = "file")
+overdraw :: proc(t: ^testing.T, r: ^Rate_Limiter, client: net.Endpoint, rate: int, loc := #caller_location) {
+	for _ in 0 ..< rate * RRL_BURST_SECONDS {
+		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow, loc = loc)
+	}
+	for _ in 0 ..< rate * RRL_BURST_SECONDS {
+		rate_charge_response(r, client, 1232, at(0))
+	}
+}
+
+// A source, whether `plausible_source` should take it for a client, and why.
+@(private = "file")
+Plausible_Case :: struct {
+	client:    net.Endpoint,
+	plausible: bool,
+	what:      string,
+}
+
+@(private = "file")
+check_plausible :: proc(t: ^testing.T, l: ^Listeners, cases: []Plausible_Case, loc := #caller_location) {
+	for c in cases {
+		got := plausible_source(l, c.client)
+		testing.expectf(t, got == c.plausible, "bound to %v: %s: plausible_source said %v", l.udp_bound, c.what, got, loc = loc)
+	}
+}
+
 @(private = "file")
 v4 :: proc(a, b, c, d: u8, port: int = 30000) -> net.Endpoint {
 	return net.Endpoint{address = net.IP4_Address{a, b, c, d}, port = port}
@@ -81,12 +145,7 @@ test_rate_limit_spends_and_refills :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(203, 0, 113, 7)
-	allowed := 0
-	for _ in 0 ..< 1000 {
-		if rate_check(r, client, at(0)) == .Allow {
-			allowed += 1
-		}
-	}
+	allowed := count_verdict(r, client, 0, 1000, .Allow)
 	testing.expectf(
 		t,
 		allowed == RATE * RRL_BURST_SECONDS,
@@ -99,21 +158,11 @@ test_rate_limit_spends_and_refills :: proc(t: ^testing.T) {
 	testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Drop)
 
 	// A quarter of a second is a quarter of the rate, and not a token more.
-	refilled := 0
-	for _ in 0 ..< 1000 {
-		if rate_check(r, client, at(250)) == .Allow {
-			refilled += 1
-		}
-	}
+	refilled := count_verdict(r, client, 250, 1000, .Allow)
 	testing.expectf(t, refilled == RATE / 4, "a quarter second refilled %d, expected %d", refilled, RATE / 4)
 
 	// Long enough to have refilled many times over, capped at the burst.
-	banked := 0
-	for _ in 0 ..< 10000 {
-		if rate_check(r, client, at(60_000)) == .Allow {
-			banked += 1
-		}
-	}
+	banked := count_verdict(r, client, 60_000, 10000, .Allow)
 	testing.expectf(
 		t,
 		banked == RATE * RRL_BURST_SECONDS,
@@ -712,12 +761,7 @@ truncated_under_flood :: proc(rate, slip, offered: int) -> int {
 		rate_check(r, client, at(0))
 	}
 
-	truncated := 0
-	for _ in 0 ..< offered {
-		if rate_check(r, client, at(0)) == .Truncate {
-			truncated += 1
-		}
-	}
+	truncated := count_verdict(r, client, 0, offered, .Truncate)
 	return truncated
 }
 
@@ -758,22 +802,12 @@ test_the_slip_budget_is_a_pool_of_its_own :: proc(t: ^testing.T) {
 	}
 
 	// The pool, to the token, against a flood far larger than it.
-	truncated := 0
-	for _ in 0 ..< 10_000 {
-		if rate_check(r, client, at(0)) == .Truncate {
-			truncated += 1
-		}
-	}
+	truncated := count_verdict(r, client, 0, 10_000, .Truncate)
 	testing.expectf(t, truncated == SLIPS, "%d truncated answers came out of a pool holding %d", truncated, SLIPS)
 
 	// A second on, and the response budget is the whole of what an operator
 	// configured: the slips were not taken out of it.
-	allowed := 0
-	for _ in 0 ..< RATE {
-		if rate_check(r, client, at(1000)) == .Allow {
-			allowed += 1
-		}
-	}
+	allowed := count_verdict(r, client, 1000, RATE, .Allow)
 	testing.expectf(
 		t,
 		allowed == RATE,
@@ -791,12 +825,7 @@ test_the_slip_budget_is_a_pool_of_its_own :: proc(t: ^testing.T) {
 
 	// And the slip pool refills too: a second of it, and no more, for the flood
 	// that is still arriving.
-	refilled := 0
-	for _ in 0 ..< 10_000 {
-		if rate_check(r, client, at(1000)) == .Truncate {
-			refilled += 1
-		}
-	}
+	refilled := count_verdict(r, client, 1000, 10_000, .Truncate)
 	testing.expectf(
 		t,
 		refilled == RATE / RRL_SLIP_SHARE,
@@ -1051,20 +1080,10 @@ test_the_size_charge_is_the_datagram_pool_alone :: proc(t: ^testing.T) {
 	// The datagram pool spent and overspent: a full bucket of large answers,
 	// admitted and then billed, which is both the order the server does it in and
 	// the only one that leaves the pool owing rather than at zero.
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
-	}
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		rate_charge_response(r, client, 1232, at(0))
-	}
+	overdraw(t, r, client, RATE)
 	testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Drop)
 
-	streamed := 0
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		if stream_rate_check(r, client, at(0)) {
-			streamed += 1
-		}
-	}
+	streamed := count_stream(r, client, 0, RATE * RRL_BURST_SECONDS)
 	testing.expectf(
 		t,
 		streamed == RATE * RRL_BURST_SECONDS,
@@ -1073,12 +1092,7 @@ test_the_size_charge_is_the_datagram_pool_alone :: proc(t: ^testing.T) {
 		RATE * RRL_BURST_SECONDS,
 	)
 
-	opened := 0
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		if conn_rate_check(r, client, at(0)) {
-			opened += 1
-		}
-	}
+	opened := count_conn(r, client, 0, RATE * RRL_BURST_SECONDS)
 	testing.expectf(
 		t,
 		opened == RATE * RRL_BURST_SECONDS,
@@ -1127,21 +1141,11 @@ test_a_prefix_in_debt_is_still_offered_its_slip :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(203, 0, 113, 68)
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
-	}
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		rate_charge_response(r, client, 1232, at(0))
-	}
+	overdraw(t, r, client, RATE)
 
 	// A second later the prefix owes some sixteen more, so every one of these is
 	// over the budget - and one in `SLIP` of them comes back truncated anyway.
-	slipped := 0
-	for _ in 0 ..< 10 {
-		if rate_check(r, client, at(1000)) == .Truncate {
-			slipped += 1
-		}
-	}
+	slipped := count_verdict(r, client, 1000, 10, .Truncate)
 	testing.expectf(
 		t,
 		slipped == 10 / SLIP,
@@ -1178,12 +1182,7 @@ test_the_debt_from_a_burst_is_carried_until_it_is_repaid :: proc(t: ^testing.T) 
 	// A full bucket admitted and then billed, which is the order the read loop
 	// and the query fibers do it in when a flood arrives faster than it is
 	// answered.
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, client, at(0)), Rate_Verdict.Allow)
-	}
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		rate_charge_response(r, client, 1232, at(0))
-	}
+	overdraw(t, r, client, RATE)
 
 	/*
 	Two hundred answers at ten tokens each is two thousand, of which the admits
@@ -1224,12 +1223,7 @@ test_a_prefix_in_debt_keeps_its_bucket :: proc(t: ^testing.T) {
 	answer. Overdrawn is the precondition here, so it is set up as a flood sets
 	it up.
 	*/
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, victim, at(0)), Rate_Verdict.Allow)
-	}
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		rate_charge_response(r, victim, 1232, at(0))
-	}
+	overdraw(t, r, victim, RATE)
 	testing.expect_value(t, rate_check(r, victim, at(0)), Rate_Verdict.Drop)
 
 	/*
@@ -1348,13 +1342,7 @@ test_implausible_sources_are_refused :: proc(t: ^testing.T) {
 		udp_bound = bound,
 	}
 
-	Case :: struct {
-		client:    net.Endpoint,
-		plausible: bool,
-		what:      string,
-	}
-
-	CASES := []Case {
+	CASES := []Plausible_Case {
 		{net.Endpoint{address = net.IP4_Address{192, 0, 2, 1}, port = 40000}, true, "an ordinary client"},
 		{net.Endpoint{address = net.IP4_Address{192, 0, 2, 1}, port = 0}, false, "source port zero"},
 		{net.Endpoint{address = net.IP4_Loopback, port = bound.port}, false, "our own endpoint"},
@@ -1365,10 +1353,7 @@ test_implausible_sources_are_refused :: proc(t: ^testing.T) {
 		{net.Endpoint{address = net.IP4_Address{192, 0, 2, 1}, port = bound.port}, true, "another host on our port"},
 	}
 
-	for c in CASES {
-		got := plausible_source(&l, c.client)
-		testing.expectf(t, got == c.plausible, "%s: plausible_source said %v", c.what, got)
-	}
+	check_plausible(t, &l, CASES)
 }
 
 /*
@@ -1397,13 +1382,7 @@ test_non_unicast_sources_are_refused :: proc(t: ^testing.T) {
 		{udp_bound = v4(192, 0, 2, 53, 53)},
 	}
 
-	Case :: struct {
-		client:    net.Endpoint,
-		plausible: bool,
-		what:      string,
-	}
-
-	CASES := []Case {
+	CASES := []Plausible_Case {
 		{v4(0, 0, 0, 0, PORT), false, "0.0.0.0"},
 		{mapped(0, 0, 0, 0, PORT), false, "::ffff:0.0.0.0"},
 		{net.Endpoint{address = net.IP6_Any, port = PORT}, false, "::"},
@@ -1431,10 +1410,7 @@ test_non_unicast_sources_are_refused :: proc(t: ^testing.T) {
 	}
 
 	for &l in binds {
-		for c in CASES {
-			got := plausible_source(&l, c.client)
-			testing.expectf(t, got == c.plausible, "bound to %v: %s: plausible_source said %v", l.udp_bound, c.what, got)
-		}
+		check_plausible(t, &l, CASES)
 	}
 }
 
@@ -1505,13 +1481,7 @@ test_mapped_loopback_on_our_own_port_is_not_a_client :: proc(t: ^testing.T) {
 		udp_bound = net.Endpoint{address = net.IP6_Any, port = PORT},
 	}
 
-	Case :: struct {
-		client:    net.Endpoint,
-		plausible: bool,
-		what:      string,
-	}
-
-	CASES := []Case {
+	CASES := []Plausible_Case {
 		{mapped(127, 0, 0, 1, PORT), false, "our own datagram to an IPv4 destination"},
 		{mapped(127, 1, 2, 3, PORT), false, "the rest of 127/8, mapped"},
 		{mapped(127, 255, 255, 254, PORT), false, "the top of 127/8, mapped"},
@@ -1539,10 +1509,7 @@ test_mapped_loopback_on_our_own_port_is_not_a_client :: proc(t: ^testing.T) {
 		{mapped(192, 0, 2, 1, 40000), true, "an ordinary mapped client"},
 	}
 
-	for c in CASES {
-		got := plausible_source(&l, c.client)
-		testing.expectf(t, got == c.plausible, "%s: plausible_source said %v", c.what, got)
-	}
+	check_plausible(t, &l, CASES)
 }
 
 /*
@@ -1636,12 +1603,7 @@ test_stream_queries_are_refused_rather_than_truncated :: proc(t: ^testing.T) {
 	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
 		rate_check(r, over_udp, at(0))
 	}
-	truncated := 0
-	for _ in 0 ..< 10 {
-		if rate_check(r, over_udp, at(0)) == .Truncate {
-			truncated += 1
-		}
-	}
+	truncated := count_verdict(r, over_udp, 0, 10, .Truncate)
 	testing.expectf(t, truncated == 10 / SLIP, "%d of 10 over-limit datagrams were truncated, expected %d", truncated, 10 / SLIP)
 }
 
@@ -1772,12 +1734,7 @@ test_the_stream_budget_is_not_the_datagram_one :: proc(t: ^testing.T) {
 
 	// A real client in the same /24, over a connection: a budget of its own, and
 	// the whole of it.
-	answered := 0
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		if stream_rate_check(r, v4(203, 0, 113, 21), at(0)) {
-			answered += 1
-		}
-	}
+	answered := count_stream(r, v4(203, 0, 113, 21), 0, RATE * RRL_BURST_SECONDS)
 	testing.expectf(
 		t,
 		answered == RATE * RRL_BURST_SECONDS,
@@ -1822,12 +1779,7 @@ test_connections_are_charged_to_a_budget_of_their_own :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(203, 0, 113, 40)
-	opened := 0
-	for _ in 0 ..< 1000 {
-		if conn_rate_check(r, client, at(0)) {
-			opened += 1
-		}
-	}
+	opened := count_conn(r, client, 0, 1000)
 	testing.expectf(
 		t,
 		opened == RATE * RRL_BURST_SECONDS,
@@ -1838,12 +1790,7 @@ test_connections_are_charged_to_a_budget_of_their_own :: proc(t: ^testing.T) {
 	testing.expect(t, !conn_rate_check(r, client, at(0)), "a connection was accepted past what the pool holds")
 
 	// A quarter of a second is a quarter of the rate, and not a connection more.
-	refilled := 0
-	for _ in 0 ..< 1000 {
-		if conn_rate_check(r, client, at(250)) {
-			refilled += 1
-		}
-	}
+	refilled := count_conn(r, client, 250, 1000)
 	testing.expectf(t, refilled == RATE / 4, "a quarter second refilled %d connections, expected %d", refilled, RATE / 4)
 
 	// Counted, and counted apart from the queries: nothing was asked here, so
@@ -1887,12 +1834,7 @@ test_a_datagram_flood_cannot_stop_a_prefix_connecting :: proc(t: ^testing.T) {
 	testing.expect_value(t, rate_check(r, victim, at(0)), Rate_Verdict.Drop)
 
 	// A real client in the same /24 opens its prefix's whole allowance anyway.
-	opened := 0
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		if conn_rate_check(r, v4(198, 51, 100, 31), at(0)) {
-			opened += 1
-		}
-	}
+	opened := count_conn(r, v4(198, 51, 100, 31), 0, RATE * RRL_BURST_SECONDS)
 	testing.expectf(
 		t,
 		opened == RATE * RRL_BURST_SECONDS,
@@ -2122,13 +2064,7 @@ How many datagrams a prefix is answered in full, out of a bucket brought to
 */
 @(private = "file")
 drain :: proc(r: ^Rate_Limiter, client: net.Endpoint, ms: i64 = 0) -> int {
-	allowed := 0
-	for _ in 0 ..< 20_000 {
-		if rate_check(r, client, at(ms)) == .Allow {
-			allowed += 1
-		}
-	}
-	return allowed
+	return count_verdict(r, client, ms, 20_000, .Allow)
 }
 
 /*

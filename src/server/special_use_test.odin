@@ -1,9 +1,7 @@
 package server
 
-import "core:mem"
 import "core:net"
 import "core:testing"
-import "core:thread"
 import "core:time"
 import "elodin:cache"
 import "elodin:config"
@@ -37,77 +35,16 @@ a fix that dropped these queries on the floor, or answered `localhost.` with the
 upstream's idea of it, would satisfy the first half and be wrong.
 */
 
-@(private = "file")
-Leak_Mock :: struct {
-	socket: net.UDP_Socket,
-	reply:  []u8,
-	asked:  bool,
-	name:   string,
-}
-
-@(private = "file")
-serve_leak :: proc(x: ^Leak_Mock) {
-	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE || len(x.reply) > len(buf) {
-		return
-	}
-	x.asked = true
-	if q, ok := dns.peek_question(buf[:n], context.allocator); ok {
-		x.name = q.name
-	}
-	out: [4096]u8
-	copy(out[:], x.reply)
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
-}
-
-@(private = "file")
-leak_query :: proc(name: string, type := dns.Type.A, do_bit := false) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question{name = name, type = type, class = .IN}
-	msg := dns.Message{id = 0x4321, question = questions}
-	msg.flags.rd = true
-	if do_bit {
-		extra := make([]dns.Record, 1, context.temp_allocator)
-		extra[0] = dns.make_opt(1232, true)
-		msg.additional = extra
-	}
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
+// An address for an A question, and NODATA for anything else: the cases that
+// reach this only care that the upstream answered at all, and a canned A record
+// under a question of some other type is a reply no forwarder should accept in
+// the first place.
 @(private = "file")
 leak_reply :: proc(name: string, type := dns.Type.A) -> []u8 {
-	// An address for an A question, and NODATA for anything else: the cases
-	// that reach this only care that the upstream answered at all, and a canned
-	// A record under a question of some other type is a reply no forwarder
-	// should accept in the first place.
-	answer := make([]dns.Record, 0, context.temp_allocator)
 	if type == .A {
-		answer = make([]dns.Record, 1, context.temp_allocator)
-		answer[0] = dns.Record {
-			name  = name,
-			type  = .A,
-			class = .IN,
-			ttl   = 60,
-			data  = dns.Rdata_A{addr = {203, 0, 113, 1}},
-		}
+		return test_reply(name, .A, a_record(name, {203, 0, 113, 1}))
 	}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = type, class = .IN}
-	msg := dns.Message{question = question, answer = answer}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_reply(name, type)
 }
 
 /*
@@ -127,32 +64,19 @@ leak_server :: proc(
 	type := dns.Type.A,
 ) -> (
 	s: Server,
-	mock: ^Leak_Mock,
+	mock: ^Canned_Mock,
 	ok: bool,
 ) {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return {}, nil, false
-	}
 	// A bound on a hang in the cases that expect an exchange: the mock runs on
 	// its own thread there, and the resolver's own `upstream.timeout` is what
 	// gives up first - see the note on `MOCK_RECV_TIMEOUT`. The cases that expect
 	// nothing do not wait this out at all - see `nothing_reached`.
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, _ := net.bound_endpoint(socket)
-
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.dnssec.enabled = false
-	cfg.blocking.enabled = false
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 2 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
-
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator, false)
+	socket, spec, bound := bind_mock(t)
+	if !bound {
+		return {}, nil, false
+	}
+	cfg.upstream.servers = loopback_upstream(spec.port)
+	group, gerr := upstream.make_group(cfg.upstream)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		net.close(socket)
 		return {}, nil, false
@@ -172,8 +96,8 @@ leak_server :: proc(
 	starts: the victim then sees its own socket stop working for no reason it
 	can see. It cost an afternoon once; the copy is one line.
 	*/
-	x := new(Leak_Mock, context.temp_allocator)
-	x^ = Leak_Mock {
+	x := new(Canned_Mock, context.temp_allocator)
+	x^ = Canned_Mock {
 		socket = socket,
 		reply  = leak_reply(name, type),
 	}
@@ -192,12 +116,28 @@ mock is kept only where an answer has to come back.
 
 Not zero milliseconds: `SO_RCVTIMEO` reads zero as "no timeout", which on a
 socket nothing is going to send to is the one value that hangs.
+
+Any datagram naming `query`'s name counts, whatever type it asks: the name is
+what must not leave, and a fix that sent it out under another type leaks it as
+surely. A datagram about another name is a straggler from another case on a
+reused port, and is skipped. `asked` is the question that did arrive, read into
+the test's own temporary memory.
 */
 @(private = "file")
-nothing_reached :: proc(x: ^Leak_Mock) -> bool {
+nothing_reached :: proc(x: ^Canned_Mock, query: []u8) -> (clean: bool, asked: dns.Question) {
 	_ = net.set_option(x.socket, .Receive_Timeout, 20 * time.Millisecond)
-	serve_leak(x)
-	return !x.asked
+	want, _ := dns.peek_question(query, context.temp_allocator)
+	buf: [4096]u8
+	for {
+		n, _, err := net.recv_udp(x.socket, buf[:])
+		if err != nil {
+			return true, {}
+		}
+		q, ok := dns.peek_question(buf[:n], context.temp_allocator)
+		if ok && dns.name_equal_fold(q.name, want.name) {
+			return false, q
+		}
+	}
 }
 
 @(private = "file")
@@ -331,7 +271,7 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 	}
 
 	for c in cases {
-		cfg := config.default_config()
+		cfg := test_config()
 		cfg.special_use.local = c.local
 		cfg.special_use.test = c.test
 		cfg.special_use.home_arpa = c.home_arpa
@@ -344,15 +284,11 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		out, outcome, ok := handle_query(&s, leak_query(c.name, c.type), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		query := test_query(c.name, c.type)
+		out, outcome, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
 
-		testing.expectf(
-			t,
-			nothing_reached(x),
-			"%s was sent to the public upstream, which asked for %q",
-			c.name,
-			x.name,
-		)
+		clean, asked := nothing_reached(x, query)
+		testing.expectf(t, clean, "%s was sent to the public upstream, which was asked %s %v", c.name, asked.name, asked.type)
 		if !testing.expectf(t, ok, "%s went unanswered", c.name) {
 			continue
 		}
@@ -460,7 +396,7 @@ test_a_default_configuration_still_forwards_local_test_and_example :: proc(t: ^t
 	names := []string{"printer.local.", "internal.test.", "www.example.com.", "printer.home.arpa."}
 
 	for name in names {
-		cfg := config.default_config()
+		cfg := test_config()
 		s, x, built := leak_server(t, &cfg, name)
 		if !built {
 			return
@@ -469,12 +405,9 @@ test_a_default_configuration_still_forwards_local_test_and_example :: proc(t: ^t
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		mock := thread.create_and_start_with_poly_data(x, serve_leak)
-		_, outcome, _ := handle_query(&s, leak_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
-		thread.join(mock)
-		thread.destroy(mock)
+		_, outcome, _ := exchange_with(&s, x, serve_canned, test_query(name))
 
-		testing.expectf(t, x.asked, "%s was answered locally by a default configuration", name)
+		testing.expectf(t, x.got, "%s was answered locally by a default configuration", name)
 		testing.expectf(t, outcome == .Forwarded, "%s came back as %v rather than forwarded", name, outcome)
 	}
 	free_all(context.temp_allocator)
@@ -503,7 +436,7 @@ and cached there by any downstream resolver that asked without it.
 @(test)
 test_the_home_arpa_apex_ds_is_still_forwarded :: proc(t: ^testing.T) {
 	for do_bit in ([]bool{true, false}) {
-		cfg := config.default_config()
+		cfg := test_config()
 		cfg.special_use.home_arpa = true
 
 		s, x, built := leak_server(t, &cfg, "home.arpa.", .DS)
@@ -514,20 +447,15 @@ test_the_home_arpa_apex_ds_is_still_forwarded :: proc(t: ^testing.T) {
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		mock := thread.create_and_start_with_poly_data(x, serve_leak)
-		_, outcome, _ := handle_query(
-			&s,
-			leak_query("home.arpa.", .DS, do_bit),
-			.UDP,
-			"127.0.0.1:5555",
-			context.temp_allocator,
-		)
-		thread.join(mock)
-		thread.destroy(mock)
+		opt: Maybe(dns.Record)
+		if do_bit {
+			opt = dns.make_opt(1232, true)
+		}
+		_, outcome, _ := exchange_with(&s, x, serve_canned, test_query("home.arpa.", .DS, opt = opt))
 
 		testing.expectf(
 			t,
-			x.asked,
+			x.got,
 			"the home.arpa. DS (DO=%v) was answered from the table, leaving a validating client below with no proof",
 			do_bit,
 		)
@@ -613,7 +541,7 @@ test_private_reverse_stands_down_where_it_must :: proc(t: ^testing.T) {
 				continue
 			}
 			type := c.type if pass == 0 else dns.Type.PTR
-			cfg := config.default_config()
+			cfg := test_config()
 			cfg.special_use.private_reverse = !c.key_off
 			s, x, built := leak_server(t, &cfg, name, type)
 			if !built {
@@ -639,15 +567,14 @@ test_private_reverse_stands_down_where_it_must :: proc(t: ^testing.T) {
 			}
 
 			if pass == 0 {
-				mock := thread.create_and_start_with_poly_data(x, serve_leak)
-				_, outcome, _ := handle_query(&s, leak_query(name, type), .UDP, "127.0.0.1:5555", context.temp_allocator)
-				thread.join(mock)
-				thread.destroy(mock)
-				testing.expectf(t, x.asked, "%s: %s %v was answered from the table", c.what, name, type)
+				_, outcome, _ := exchange_with(&s, x, serve_canned, test_query(name, type))
+				testing.expectf(t, x.got, "%s: %s %v was answered from the table", c.what, name, type)
 				testing.expectf(t, outcome == .Forwarded, "%s: %s came back as %v", c.what, name, outcome)
 			} else {
-				_, outcome, _ := handle_query(&s, leak_query(name, type), .UDP, "127.0.0.1:5555", context.temp_allocator)
-				testing.expectf(t, nothing_reached(x), "%s: the sibling %s was sent to the upstream", c.what, name)
+				query := test_query(name, type)
+				_, outcome, _ := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+				clean, _ := nothing_reached(x, query)
+				testing.expectf(t, clean, "%s: the sibling %s was sent to the upstream", c.what, name)
 				testing.expectf(t, outcome == .Local, "%s: the sibling %s came back as %v", c.what, name, outcome)
 			}
 		}
@@ -801,7 +728,7 @@ half on its own.
 */
 @(test)
 test_a_tor_aware_upstream_can_be_given_onion_back :: proc(t: ^testing.T) {
-	cfg := config.default_config()
+	cfg := test_config()
 	cfg.special_use.onion = false
 
 	s, x, built := leak_server(t, &cfg, "duskgytldkxiuqc6otgh4.onion.")
@@ -812,22 +739,13 @@ test_a_tor_aware_upstream_can_be_given_onion_back :: proc(t: ^testing.T) {
 	defer net.close(x_socket)
 	defer upstream.destroy_group(s.group)
 
-	mock := thread.create_and_start_with_poly_data(x, serve_leak)
-	_, outcome, _ := handle_query(
-		&s,
-		leak_query("duskgytldkxiuqc6otgh4.onion."),
-		.UDP,
-		"127.0.0.1:5555",
-		context.temp_allocator,
-	)
-	thread.join(mock)
-	thread.destroy(mock)
+	_, outcome, _ := exchange_with(&s, x, serve_canned, test_query("duskgytldkxiuqc6otgh4.onion."))
 
-	testing.expect(t, x.asked, "special_use.onion: false did not hand the query to the upstream")
+	testing.expect(t, x.got, "special_use.onion: false did not hand the query to the upstream")
 	testing.expectf(t, outcome == .Forwarded, "the .onion query came back as %v rather than forwarded", outcome)
 
 	// The rest of the table is untouched by that key.
-	_, local_outcome, _ := handle_query(&s, leak_query("localhost."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	_, local_outcome, _ := handle_query(&s, test_query("localhost."), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expectf(
 		t,
 		local_outcome == .Local,
@@ -836,20 +754,6 @@ test_a_tor_aware_upstream_can_be_given_onion_back :: proc(t: ^testing.T) {
 	)
 
 	free_all(context.temp_allocator)
-}
-
-/*
-A validator that can fetch nothing, which is what a Tor-aware upstream is.
-
-`tor`'s `DNSPort` answers A and AAAA and knows nothing of DS or DNSKEY, so a
-chain walk over it produces no records whatever the name. The verdict that
-follows - Indeterminate rather than Bogus - is not the point; either one is
-SERVFAIL to the client, and the point is that the validator is never consulted
-about a name the operator handed over on purpose.
-*/
-@(private = "file")
-tor_has_no_chain :: proc(ctx: rawptr, name: string, type: dns.Type, allocator: mem.Allocator, _: ^time.Tick) -> ([]u8, bool) {
-	return nil, false
 }
 
 /*
@@ -898,7 +802,7 @@ test_a_deferred_onion_answer_is_not_held_to_the_public_chain :: proc(t: ^testing
 @(private = "file")
 check_onion_is_not_validated :: proc(t: ^testing.T, label: string, apply: proc(cfg: ^config.Config)) {
 	name := "duskgytldkxiuqc6otgh4.onion."
-	cfg := config.default_config()
+	cfg := test_config()
 	apply(&cfg)
 
 	s, x, built := leak_server(t, &cfg, name)
@@ -909,15 +813,17 @@ check_onion_is_not_validated :: proc(t: ^testing.T, label: string, apply: proc(c
 	defer net.close(x_socket)
 	defer upstream.destroy_group(s.group)
 
-	s.validator = dnssec.make_validator(tor_has_no_chain, nil, dnssec.Options{})
+	// A validator that can fetch nothing, which is what a Tor-aware upstream
+	// is: `tor`'s `DNSPort` answers A and AAAA and knows nothing of DS or
+	// DNSKEY. Indeterminate or Bogus, either is SERVFAIL to the client; the
+	// point is that the validator is never consulted about a name handed over
+	// on purpose.
+	s.validator = dnssec.make_validator(no_chain, nil, dnssec.Options{})
 	defer dnssec.destroy_validator(s.validator)
 
-	mock := thread.create_and_start_with_poly_data(x, serve_leak)
-	out, _, ok := handle_query(&s, leak_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
+	out, _, ok := exchange_with(&s, x, serve_canned, test_query(name))
 
-	testing.expectf(t, x.asked, "%s: the .onion query never reached the Tor-aware upstream", label)
+	testing.expectf(t, x.got, "%s: the .onion query never reached the Tor-aware upstream", label)
 	if !testing.expectf(t, ok, "%s: the .onion query went unanswered", label) {
 		return
 	}
@@ -956,10 +862,7 @@ quietly produce the right-looking answer from the wrong place.
 */
 @(test)
 test_a_rewrite_wins_over_the_special_use_table :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+	cfg := test_config()
 	cfg.special_use.local = true
 
 	cfg.rewrites = make([]config.Rewrite, 1, context.temp_allocator)
@@ -974,14 +877,11 @@ test_a_rewrite_wins_over_the_special_use_table :: proc(t: ^testing.T) {
 		cfg = &cfg,
 	}
 
-	out, outcome, ok := handle_query(&s, leak_query("nas.local."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	resp, outcome, ok := ask_local(&s, "nas.local.", .A, rd = true)
 	if !testing.expect(t, ok, "a rewritten name under local. went unanswered") {
 		return
 	}
 	testing.expect_value(t, outcome, Outcome.Rewritten)
-
-	resp, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
 	if !testing.expect(t, len(resp.answer) == 1, "the rewrite under local. produced no answer record") {
 		return
 	}
@@ -1004,9 +904,8 @@ said.
 */
 @(test)
 test_special_use_answers_do_not_enter_the_cache :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.blocking.enabled = false
+	cfg := test_config()
+	cfg.cache.enabled = true
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
 	defer cache.destroy(answers)
 
@@ -1018,7 +917,7 @@ test_special_use_answers_do_not_enter_the_cache :: proc(t: ^testing.T) {
 	for i in 0 ..< 2 {
 		_, outcome, ok := handle_query(
 			&s,
-			leak_query("duskgytldkxiuqc6otgh4.onion."),
+			test_query("duskgytldkxiuqc6otgh4.onion."),
 			.UDP,
 			"127.0.0.1:5555",
 			context.temp_allocator,
@@ -1046,7 +945,7 @@ answers, which would report a leak stopped every time one was not.
 test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^testing.T) {
 	// Answered from the table: two names, one query each.
 	for name in ([]string{"localhost.", "nothing.invalid."}) {
-		cfg := config.default_config()
+		cfg := test_config()
 		s, x, built := leak_server(t, &cfg, name)
 		if !built {
 			return
@@ -1055,7 +954,7 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		_, _, _ = handle_query(&s, leak_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		_, _, _ = handle_query(&s, test_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
 		testing.expectf(
 			t,
 			s.stats.special_use == 1,
@@ -1069,7 +968,7 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 	// the count: every LAN PTR lands there and would drown the `.onion` signal.
 	{
 		name := "1.1.168.192.in-addr.arpa."
-		cfg := config.default_config()
+		cfg := test_config()
 		s, x, built := leak_server(t, &cfg, name, .PTR)
 		if !built {
 			return
@@ -1078,7 +977,7 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		_, outcome, _ := handle_query(&s, leak_query(name, .PTR), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		_, outcome, _ := handle_query(&s, test_query(name, .PTR), .UDP, "127.0.0.1:5555", context.temp_allocator)
 		testing.expectf(t, outcome == .Local, "%s came back as %v rather than local", name, outcome)
 		testing.expectf(t, s.stats.special_use == 0, "%s left the counter at %d, want 0", name, s.stats.special_use)
 	}
@@ -1090,7 +989,7 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 	*/
 	{
 		name := "printer.local."
-		cfg := config.default_config()
+		cfg := test_config()
 		s, x, built := leak_server(t, &cfg, name)
 		if !built {
 			return
@@ -1099,10 +998,7 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		mock := thread.create_and_start_with_poly_data(x, serve_leak)
-		_, outcome, _ := handle_query(&s, leak_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
-		thread.join(mock)
-		thread.destroy(mock)
+		_, outcome, _ := exchange_with(&s, x, serve_canned, test_query(name))
 
 		testing.expectf(t, outcome == .Forwarded, "%s came back as %v rather than forwarded", name, outcome)
 		testing.expectf(
@@ -1131,16 +1027,14 @@ table to make the two look alike, this test is what would fail.
 */
 @(test)
 test_a_blocklist_entry_for_a_reserved_name_wins :: proc(t: ^testing.T) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
+	cfg := test_config()
 	cfg.blocking.enabled = true
 
-	block, allow := filter.set_make(), filter.set_make()
-	filter.parse_list(block, allow, "0.0.0.0 duskgytldkxiuqc6otgh4.onion\n", .Hosts)
-	engine := filter.engine_make()
+	engine, listed := test_filters(t, "0.0.0.0 duskgytldkxiuqc6otgh4.onion\n", .Hosts)
 	defer filter.engine_destroy(engine)
-	filter.engine_swap(engine, block, allow)
+	if !listed {
+		return
+	}
 
 	s := Server {
 		cfg     = &cfg,
@@ -1149,7 +1043,7 @@ test_a_blocklist_entry_for_a_reserved_name_wins :: proc(t: ^testing.T) {
 
 	_, outcome, ok := handle_query(
 		&s,
-		leak_query("duskgytldkxiuqc6otgh4.onion."),
+		test_query("duskgytldkxiuqc6otgh4.onion."),
 		.UDP,
 		"127.0.0.1:5555",
 		context.temp_allocator,
@@ -1172,7 +1066,7 @@ test_a_blocklist_entry_for_a_reserved_name_wins :: proc(t: ^testing.T) {
 	// the above is the list winning rather than blocking swallowing the zone.
 	_, other, other_ok := handle_query(
 		&s,
-		leak_query("unlisted.onion."),
+		test_query("unlisted.onion."),
 		.UDP,
 		"127.0.0.1:5555",
 		context.temp_allocator,
@@ -1202,7 +1096,7 @@ NOERROR is the evidence it was not.
 @(test)
 test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) {
 	name := "duskgytldkxiuqc6otgh4.onion."
-	cfg := config.default_config()
+	cfg := test_config()
 	cfg.special_use.onion = false
 
 	s, x, built := leak_server(t, &cfg, name)
@@ -1213,17 +1107,14 @@ test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) 
 	defer net.close(x_socket)
 	defer upstream.destroy_group(s.group)
 
-	s.validator = dnssec.make_validator(tor_has_no_chain, nil, dnssec.Options{})
+	s.validator = dnssec.make_validator(no_chain, nil, dnssec.Options{})
 	defer dnssec.destroy_validator(s.validator)
 
 	anchors := make([]string, 1, context.temp_allocator)
 	anchors[0] = "onion."
 	s.anchor_zones = anchors
 
-	mock := thread.create_and_start_with_poly_data(x, serve_leak)
-	out, _, ok := handle_query(&s, leak_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	thread.join(mock)
-	thread.destroy(mock)
+	out, _, ok := exchange_with(&s, x, serve_canned, test_query(name))
 
 	if !testing.expect(t, ok, "the anchored .onion query went unanswered") {
 		return
@@ -1242,7 +1133,7 @@ test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) 
 	// And the label boundary holds here too: an anchor over `onion.` is not an
 	// anchor over somebody else's `notonion.`, so that name keeps the bypass.
 	other := "x.notonion."
-	ocfg := config.default_config()
+	ocfg := test_config()
 	ocfg.special_use.onion = false
 	os_, ox, obuilt := leak_server(t, &ocfg, other)
 	if !obuilt {

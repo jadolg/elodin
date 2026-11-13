@@ -1,6 +1,5 @@
 package server
 
-import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -18,83 +17,9 @@ callers now see, and a certificate that fails to load leaves the working one
 in place rather than tearing it down.
 */
 
-@(private = "file")
-CERT_DIR :: "/tmp/elodin-server-reload-test"
-
-@(private = "file")
-cert_once: sync.Once
-@(private = "file")
-cert_path: string
-@(private = "file")
-key_path: string
-@(private = "file")
-cert_ok: bool
-
-@(private = "file")
-generate_cert :: proc() {
-	if os.exists("certs/cert.pem") && os.exists("certs/key.pem") {
-		cert_path, key_path, cert_ok = "certs/cert.pem", "certs/key.pem", true
-		return
-	}
-	cert_path = CERT_DIR + "/cert.pem"
-	key_path = CERT_DIR + "/key.pem"
-	if !os.exists(CERT_DIR) {
-		if err := os.make_directory(CERT_DIR); err != nil {
-			return
-		}
-	}
-	process, perr := os.process_start(
-		os.Process_Desc {
-			command = []string {
-				"openssl",
-				"req",
-				"-x509",
-				"-newkey",
-				"ec",
-				"-pkeyopt",
-				"ec_paramgen_curve:prime256v1",
-				"-nodes",
-				"-keyout",
-				key_path,
-				"-out",
-				cert_path,
-				"-days",
-				"2",
-				"-subj",
-				"/CN=elodin.local",
-				// The DDR tests need the name in a SAN; a CN covers nothing.
-				"-addext",
-				"subjectAltName=DNS:elodin.local,DNS:localhost,IP:127.0.0.1",
-			},
-		},
-	)
-	if perr != nil {
-		return
-	}
-	state, werr := os.process_wait(process)
-	if werr != nil || state.exit_code != 0 {
-		return
-	}
-	cert_ok = true
-}
-
-// A certificate this test can point `reload_tls` at, reusing the one a
-// developer already has in `certs/` and otherwise generating one - the same
-// fallback `tlsx`'s own tests use, kept local because that helper is private
-// to its package.
-//
-// Generated once and shared: the test runner runs these concurrently, and two
-// threads racing `openssl` over the same output files corrupted them often
-// enough in CI to fail a test that never touches the generation path itself.
-@(private = "file")
-ensure_cert :: proc() -> (cert, key: string, ok: bool) {
-	sync.once_do(&cert_once, generate_cert)
-	return cert_path, key_path, cert_ok
-}
-
 @(test)
 test_reload_tls_swaps_in_a_fresh_context :: proc(t: ^testing.T) {
-	cert, key, ok := ensure_cert()
+	cert, key, ok := ensure_profile_certs()
 	if !ok {
 		testing.expect(t, false, "no certificate available and openssl could not make one")
 		return
@@ -138,7 +63,7 @@ test_reload_tls_swaps_in_a_fresh_context :: proc(t: ^testing.T) {
 
 @(test)
 test_reload_tls_keeps_the_working_context_when_the_new_certificate_does_not_load :: proc(t: ^testing.T) {
-	cert, key, ok := ensure_cert()
+	cert, key, ok := ensure_profile_certs()
 	if !ok {
 		testing.expect(t, false, "no certificate available and openssl could not make one")
 		return
@@ -213,7 +138,7 @@ so this cannot report a failure that is not there.
 */
 @(test)
 test_reload_tls_waits_for_a_connection_holding_the_context :: proc(t: ^testing.T) {
-	cert, key, ok := ensure_cert()
+	cert, key, ok := ensure_profile_certs()
 	if !ok {
 		testing.expect(t, false, "no certificate available and openssl could not make one")
 		return
@@ -268,7 +193,7 @@ test_reload_tls_waits_for_a_connection_holding_the_context :: proc(t: ^testing.T
 // The maintenance tick's rotation reaches both encrypted listeners' keys.
 @(test)
 test_rotate_ticket_keys_reaches_dot_and_doh :: proc(t: ^testing.T) {
-	cert, key, ok := ensure_cert()
+	cert, key, ok := ensure_profile_certs()
 	if !ok {
 		testing.expect(t, false, "no certificate available and openssl could not make one")
 		return
@@ -300,7 +225,7 @@ leave an expiring certificate serving every client - but stops the designation.
 */
 @(test)
 test_reload_tls_designates_only_while_the_certificate_covers_ddr_name :: proc(t: ^testing.T) {
-	cert, key, ok := ensure_cert()
+	cert, key, ok := ensure_profile_certs()
 	if !ok {
 		testing.expect(t, false, "no certificate available and openssl could not make one")
 		return
@@ -344,7 +269,7 @@ configuration.
 */
 @(test)
 test_ddr_check_reads_the_certificate_only_and_stays_offline :: proc(t: ^testing.T) {
-	cert, _, ok := ensure_cert()
+	cert, _, ok := ensure_profile_certs()
 	if !ok {
 		testing.expect(t, false, "no certificate available and openssl could not make one")
 		return

@@ -34,9 +34,14 @@ test_a_rebuild_does_not_take_the_signals_main_acts_on :: proc(t: ^testing.T) {
 	defer if listener_open {
 		net.close(listener)
 	}
-	bound, _ := net.bound_endpoint(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
 	_ = net.set_option(listener, .Receive_Timeout, 5 * time.Second)
 
+	// Process-wide, and the suite runs in parallel: harmless while no other test
+	// sends SIGHUP, and put back as this one ends.
 	act, old_act: posix.sigaction_t
 	act.sa_handler = on_test_signal
 	posix.sigaction(.SIGHUP, &act, &old_act)

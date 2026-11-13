@@ -3,7 +3,6 @@ package server
 import "core:fmt"
 import "core:mem"
 import "core:testing"
-import "core:time"
 import "elodin:config"
 import "elodin:dns"
 
@@ -20,52 +19,43 @@ that is itself a rewrite is answered here, and the forwarding of one that is not
 is the integration suite's business, against a mock that can say it was asked.
 */
 
-// Allocated rather than written as a slice literal, which would live in the
-// frame of `chase_rules` and not outlive it.
-@(private = "file")
-one_answer :: proc(a: config.Rewrite_Answer) -> []config.Rewrite_Answer {
-	answers := make([]config.Rewrite_Answer, 1, context.temp_allocator)
-	answers[0] = a
-	return answers
-}
-
 @(private = "file")
 chase_rules :: proc() -> []config.Rewrite {
 	rules := make([]config.Rewrite, 7, context.temp_allocator)
 	rules[0] = config.Rewrite {
 		domain  = "old.lan.",
-		answers = one_answer({kind = .CNAME, name = "nas.lan."}),
+		answers = answers_of({kind = .CNAME, name = "nas.lan."}),
 		ttl     = 60,
 	}
 	rules[1] = config.Rewrite {
 		domain  = "nas.lan.",
-		answers = one_answer({kind = .A, v4 = {192, 168, 1, 50}}),
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
 		ttl     = 300,
 	}
 	// A loop the loader cannot see coming once wildcards are involved.
 	rules[2] = config.Rewrite {
 		domain  = "ping.lan.",
-		answers = one_answer({kind = .CNAME, name = "pong.lan."}),
+		answers = answers_of({kind = .CNAME, name = "pong.lan."}),
 		ttl     = 60,
 	}
 	rules[3] = config.Rewrite {
 		domain  = "pong.lan.",
-		answers = one_answer({kind = .CNAME, name = "ping.lan."}),
+		answers = answers_of({kind = .CNAME, name = "ping.lan."}),
 		ttl     = 60,
 	}
 	rules[4] = config.Rewrite {
 		domain  = "ext.lan.",
-		answers = one_answer({kind = .CNAME, name = "target.example.com."}),
+		answers = answers_of({kind = .CNAME, name = "target.example.com."}),
 		ttl     = 60,
 	}
 	rules[5] = config.Rewrite {
 		domain  = "refused.lan.",
-		answers = one_answer({kind = .CNAME, name = "sunk.lan."}),
+		answers = answers_of({kind = .CNAME, name = "sunk.lan."}),
 		ttl     = 60,
 	}
 	rules[6] = config.Rewrite {
 		domain  = "sunk.lan.",
-		answers = one_answer({kind = .Block}),
+		answers = answers_of({kind = .Block}),
 		ttl     = 60,
 	}
 	return rules
@@ -85,53 +75,19 @@ chase_ask :: proc(
 	ok: bool,
 ) {
 	cfg := new(config.Config, context.temp_allocator)
-	cfg^ = config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.blocking.enabled = false
+	s := local_server(cfg)
 	cfg.blocking.response = block
 	cfg.rewrites = rules if rules != nil else chase_rules()
-	s := Server {
-		cfg = cfg,
-	}
 
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question{name = name, type = type, class = .IN}
-	query := dns.Message{id = 0x3200, question = questions}
-	query.flags.rd = rd
-	wire, _, enc := dns.encode_message(query, context.temp_allocator)
-	testing.expect_value(t, enc, dns.Encode_Error.None)
-
-	out, outcome, answered := handle_query(&s, wire, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	msg, outcome, answered := ask_local(&s, name, type, rd = rd)
 	if rewritten != nil {
 		rewritten^ = s.stats.rewritten
 	}
-	if !testing.expect(t, answered, "the rewrite went unanswered") {
+	if !testing.expect(t, answered, "the rewrite went unanswered or would not decode") {
 		return {}, false
 	}
 	testing.expect_value(t, outcome, Outcome.Rewritten)
-	msg, derr := dns.decode_message(out, context.temp_allocator)
-	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
-		return {}, false
-	}
 	return msg, true
-}
-
-// The request `resolve_query` holds for `msg` from a UDP client, for calling
-// `chase_rewrite_alias` directly.
-chase_state :: proc(s: ^Server, msg: dns.Message, spent: ^int, allocator: mem.Allocator) -> Query_State {
-	return Query_State {
-		s = s,
-		msg = msg,
-		q = msg.question[0],
-		proto = .UDP,
-		client = "127.0.0.1:5555",
-		limit = 512,
-		started = time.tick_now(),
-		spent = spent,
-		allocator = allocator,
-		pool = .Shared,
-	}
 }
 
 @(test)
@@ -206,7 +162,7 @@ test_a_long_rewrite_chain_stops_at_the_bound :: proc(t: ^testing.T) {
 	for i in 0 ..< len(rules) {
 		rules[i] = config.Rewrite {
 			domain  = fmt.aprintf("c%d.lan.", i, allocator = context.temp_allocator),
-			answers = one_answer({kind = .CNAME, name = fmt.aprintf("c%d.lan.", i + 1, allocator = context.temp_allocator)}),
+			answers = answers_of({kind = .CNAME, name = fmt.aprintf("c%d.lan.", i + 1, allocator = context.temp_allocator)}),
 			ttl     = 60,
 		}
 	}
@@ -268,7 +224,7 @@ test_a_chased_target_that_cannot_be_read_back_is_servfail :: proc(t: ^testing.T)
 		return
 	}
 	spent := dns.REQUEST_DECODE_BUDGET + 1
-	st := chase_state(&s, msg, &spent, context.temp_allocator)
+	st := stage_state(&s, msg, &spent, context.temp_allocator)
 	out, _ := chase_rewrite_alias(&st, plain, cname)
 	resp, derr := dns.decode_message(out, context.temp_allocator)
 	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
@@ -315,13 +271,13 @@ test_a_chase_that_runs_dry_is_never_the_bare_alias :: proc(t: ^testing.T) {
 	for i in 0 ..< 6 {
 		long[i] = config.Rewrite {
 			domain  = fmt.tprintf("a%d.lan.", i),
-			answers = one_answer({kind = .CNAME, name = fmt.tprintf("a%d.lan.", i + 1)}),
+			answers = answers_of({kind = .CNAME, name = fmt.tprintf("a%d.lan.", i + 1)}),
 			ttl     = 60,
 		}
 	}
 	long[6] = config.Rewrite {
 		domain  = "a6.lan.",
-		answers = one_answer({kind = .A, v4 = {192, 168, 1, 60}}),
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 60}}),
 		ttl     = 60,
 	}
 	chase_dry_sweep(t, long, "a0.lan.", 7)
@@ -332,7 +288,7 @@ test_a_chase_that_runs_dry_is_never_the_bare_alias :: proc(t: ^testing.T) {
 	dead := make([]config.Rewrite, 1, context.temp_allocator)
 	dead[0] = config.Rewrite {
 		domain  = "dead.lan.",
-		answers = one_answer({kind = .CNAME, name = "gone.invalid."}),
+		answers = answers_of({kind = .CNAME, name = "gone.invalid."}),
 		ttl     = 60,
 	}
 	chase_dry_sweep(t, dead, "dead.lan.", 1, final = .NX_Domain)
@@ -374,7 +330,7 @@ chase_dry_sweep :: proc(
 		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
 		spent := 0
 		before := chase_answers_counted(&s)
-		st := chase_state(&s, msg, &spent, one)
+		st := stage_state(&s, msg, &spent, one)
 		out, counted := chase_rewrite_alias(&st, plain, cname)
 		if f.seen < n {
 			break
@@ -464,17 +420,7 @@ test_a_rewrite_that_built_nothing_is_counted_failed :: proc(t: ^testing.T) {
 	msg := dns.Message{id = 0x3204, question = questions}
 	msg.flags.rd = true
 	spent: int
-	st := Query_State {
-		s         = &s,
-		msg       = msg,
-		q         = questions[0],
-		proto     = .UDP,
-		client    = "127.0.0.1:5555",
-		limit     = 512,
-		started   = time.tick_now(),
-		spent     = &spent,
-		allocator = mem.nil_allocator(),
-	}
+	st := stage_state(&s, msg, &spent, mem.nil_allocator())
 	testing.expect(t, answer_locally(&st), "the rewrite was handed on")
 	testing.expect(t, !st.ok, "an answer was reported built with no memory to build it")
 	testing.expect_value(t, s.stats.rewritten, 0)
@@ -494,7 +440,7 @@ test_a_reverse_rewrite_that_runs_dry_stays_matched :: proc(t: ^testing.T) {
 	rules := make([]config.Rewrite, 1, context.temp_allocator)
 	rules[0] = config.Rewrite {
 		domain  = "nas.lan.",
-		answers = one_answer({kind = .A, v4 = {192, 168, 1, 50}}),
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
 		ttl     = 300,
 		ptr     = true,
 	}

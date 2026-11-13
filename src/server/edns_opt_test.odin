@@ -1,13 +1,7 @@
 package server
 
-import "core:net"
 import "core:testing"
-import "core:thread"
-import "core:time"
-import "elodin:cache"
-import "elodin:config"
 import "elodin:dns"
-import "elodin:upstream"
 
 /*
 EDNS this server cannot account for, refused before it is read.
@@ -31,84 +25,6 @@ of the same gate is in `ecs_test.odin`.
 @(private = "file")
 SERVED :: [4]u8{192, 0, 2, 7}
 
-@(private = "file")
-Opt_Mock :: struct {
-	socket:     net.UDP_Socket,
-	name:       string,
-	saw_cookie: bool,
-	served:     bool,
-}
-
-@(private = "file")
-serve_opt :: proc(x: ^Opt_Mock) {
-	buf: [4096]u8
-	n, remote, err := net.recv_udp(x.socket, buf[:])
-	if err != nil || n < dns.HEADER_SIZE {
-		return
-	}
-	m, derr := dns.decode_message(buf[:n], context.temp_allocator)
-	if derr != .None {
-		return
-	}
-	for rec in m.additional {
-		if rec.type != .OPT {
-			continue
-		}
-		rdata, is_opt := rec.data.(dns.Rdata_OPT)
-		if !is_opt {
-			continue
-		}
-		for o in rdata.options {
-			if o.code == u16(dns.EDNS_Option_Code.Cookie) {
-				x.saw_cookie = true
-			}
-		}
-	}
-
-	reply := opt_reply(x.name)
-	if len(reply) > len(buf) {
-		return
-	}
-	out: [4096]u8
-	copy(out[:], reply)
-	out[0], out[1] = buf[0], buf[1]
-	_, serr := net.send_udp(x.socket, out[:len(reply)], remote)
-	x.served = serr == nil
-	free_all(context.temp_allocator)
-}
-
-@(private = "file")
-opt_reply :: proc(name: string) -> []u8 {
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record{name = name, type = .A, class = .IN, ttl = 300, data = dns.Rdata_A{addr = SERVED}}
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = .A, class = .IN}
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(1232, false)
-	msg := dns.Message{question = question, answer = answer, additional = additional}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
-@(private = "file")
-opt_query :: proc(name: string, additional: []dns.Record) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question{name = name, type = .A, class = .IN}
-	msg := dns.Message{id = 0x4242, question = questions, additional = additional}
-	msg.flags.rd = true
-	wire, _, err := dns.encode_with_every_opt(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
-}
-
 // An OPT record carrying one eight-byte client cookie.
 @(private = "file")
 cookie_opt :: proc() -> dns.Record {
@@ -116,11 +32,19 @@ cookie_opt :: proc() -> dns.Record {
 	for i in 0 ..< len(payload) {
 		payload[i] = u8(0xa0 + i)
 	}
-	options := make([]dns.EDNS_Option, 1, context.temp_allocator)
-	options[0] = dns.EDNS_Option{code = u16(dns.EDNS_Option_Code.Cookie), data = payload}
-	opt := dns.make_opt(1232, false)
-	opt.data = dns.Rdata_OPT{options = options}
-	return opt
+	return opt_with(.Cookie, payload)
+}
+
+// A query for `name` with two OPT records, the client's cookie in the second.
+@(private = "file")
+two_opts_with_cookie :: proc(name: string) -> []u8 {
+	return query_with_records(name, dns.make_opt(1232, false), cookie_opt())
+}
+
+// The mock: it answers `name` with SERVED and reports a cookie that reached it.
+@(private = "file")
+cookie_mock :: proc(name: string) -> Option_Mock {
+	return Option_Mock{code = .Cookie, reply = edns_reply(name, SERVED)}
 }
 
 /*
@@ -143,66 +67,6 @@ truncated_opt :: proc() -> dns.Record {
 	return opt
 }
 
-@(private = "file")
-Opt_Fixture :: struct {
-	socket:  net.UDP_Socket,
-	cfg:     config.Config,
-	group:   ^upstream.Group,
-	answers: ^cache.Cache,
-	srv:     Server,
-}
-
-@(private = "file")
-opt_fixture_start :: proc(t: ^testing.T, f: ^Opt_Fixture) -> bool {
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if serr != nil {
-		testing.expectf(t, false, "cannot bind the mock upstream: %v", serr)
-		return false
-	}
-	f.socket = socket
-	_ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	bound, berr := net.bound_endpoint(socket)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the mock's port: %v", berr)
-		return false
-	}
-
-	f.cfg = config.default_config()
-	f.cfg.log.queries = false
-	f.cfg.cache.enabled = true
-	f.cfg.dnssec.enabled = false
-	f.cfg.blocking.enabled = false
-	f.cfg.upstream.strategy = .Failover
-	f.cfg.upstream.attempts = 1
-	f.cfg.upstream.timeout = 3 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	f.cfg.upstream.servers = servers
-
-	// No cookie of this server's own towards the upstream: the only cookie
-	// these cases are about is the client's.
-	group, gerr := upstream.make_group(f.cfg.upstream, context.allocator, false)
-	if gerr != .None {
-		testing.expectf(t, false, "cannot build the upstream group: %v", gerr)
-		return false
-	}
-	f.group = group
-	f.answers = cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	f.srv = Server {
-		cfg     = &f.cfg,
-		group   = f.group,
-		answers = f.answers,
-	}
-	return true
-}
-
-@(private = "file")
-opt_fixture_stop :: proc(f: ^Opt_Fixture) {
-	cache.destroy(f.answers)
-	upstream.destroy_group(f.group)
-	net.close(f.socket)
-}
-
 /*
 A cookie in a second OPT record does not reach the upstream.
 
@@ -220,30 +84,19 @@ by turning away every client that uses cookies.
 */
 @(test)
 test_a_cookie_in_a_second_opt_record_is_not_forwarded :: proc(t: ^testing.T) {
-	f: Opt_Fixture
-	if !opt_fixture_start(t, &f) {
+	h: Harness
+	if !harness_start(t, &h, caching = true) {
 		return
 	}
-	defer opt_fixture_stop(&f)
+	defer harness_stop(&h)
 
 	// One OPT record, a cookie in it: answered, and stripped on the way out.
 	{
-		x := Opt_Mock{socket = f.socket, name = "cookie.example."}
-		mock := thread.create_and_start_with_poly_data(&x, serve_opt)
-		single := make([]dns.Record, 1, context.temp_allocator)
-		single[0] = cookie_opt()
-		out, outcome, ok := handle_query(
-			&f.srv,
-			opt_query("cookie.example.", single),
-			.UDP,
-			"127.0.0.1:5555",
-			context.temp_allocator,
-		)
-		thread.join(mock)
-		thread.destroy(mock)
+		x := cookie_mock("cookie.example.")
+		out, outcome, ok := harness_sniff(&h, &x, query_with_records("cookie.example.", cookie_opt()))
 
 		testing.expect(t, x.served, "the mock upstream never answered an ordinary cookie query")
-		testing.expect(t, !x.saw_cookie, "the client's cookie was forwarded to the upstream")
+		testing.expect(t, !x.saw, "the client's cookie was forwarded to the upstream")
 		testing.expect(t, ok, "an ordinary cookie query produced nothing at all")
 		testing.expect_value(t, outcome, Outcome.Forwarded)
 		testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.No_Error)
@@ -251,22 +104,8 @@ test_a_cookie_in_a_second_opt_record_is_not_forwarded :: proc(t: ^testing.T) {
 
 	// Two OPT records, the cookie in the second: refused, and nothing sent.
 	{
-		pair := make([]dns.Record, 2, context.temp_allocator)
-		pair[0] = dns.make_opt(1232, false)
-		pair[1] = cookie_opt()
-		out, outcome, ok := handle_query(
-			&f.srv,
-			opt_query("hidden.example.", pair),
-			.UDP,
-			"127.0.0.1:5555",
-			context.temp_allocator,
-		)
-
 		// Nothing arrived, so neither did the cookie in the second record.
-		testing.expect(t, mock_untouched(f.socket), "the query was forwarded instead of being refused")
-		testing.expect(t, ok, "the client was left with nothing at all")
-		testing.expect_value(t, outcome, Outcome.Failed)
-		testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Form_Err)
+		expect_refused_unforwarded(t, &h, two_opts_with_cookie("hidden.example."), "the query was forwarded instead of being refused")
 	}
 	free_all(context.temp_allocator)
 }
@@ -280,27 +119,15 @@ the cache, a block or a local zone with EDNS, and forwarded on a miss. Issue #30
 */
 @(test)
 test_an_opt_with_a_non_root_owner_is_refused :: proc(t: ^testing.T) {
-	f: Opt_Fixture
-	if !opt_fixture_start(t, &f) {
+	h: Harness
+	if !harness_start(t, &h, caching = true) {
 		return
 	}
-	defer opt_fixture_stop(&f)
+	defer harness_stop(&h)
 
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(1232, false)
-	additional[0].name = "example."
-	out, outcome, ok := handle_query(
-		&f.srv,
-		opt_query("owner.example.", additional),
-		.UDP,
-		"127.0.0.1:5555",
-		context.temp_allocator,
-	)
-
-	testing.expect(t, mock_untouched(f.socket), "a query with a non-root OPT owner was forwarded")
-	testing.expect(t, ok, "the client was left with nothing at all")
-	testing.expect_value(t, outcome, Outcome.Failed)
-	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Form_Err)
+	opt := dns.make_opt(1232, false)
+	opt.name = "example."
+	expect_refused_unforwarded(t, &h, query_with_records("owner.example.", opt), "a query with a non-root OPT owner was forwarded")
 	free_all(context.temp_allocator)
 }
 
@@ -317,26 +144,18 @@ should fail loudly if anyone narrows it by accident.
 */
 @(test)
 test_an_unreadable_opt_is_refused_with_nothing_hidden_in_it :: proc(t: ^testing.T) {
-	f: Opt_Fixture
-	if !opt_fixture_start(t, &f) {
+	h: Harness
+	if !harness_start(t, &h, caching = true) {
 		return
 	}
-	defer opt_fixture_stop(&f)
+	defer harness_stop(&h)
 
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = truncated_opt()
-	out, outcome, ok := handle_query(
-		&f.srv,
-		opt_query("stump.example.", additional),
-		.UDP,
-		"127.0.0.1:5555",
-		context.temp_allocator,
+	expect_refused_unforwarded(
+		t,
+		&h,
+		query_with_records("stump.example.", truncated_opt()),
+		"an OPT record this server cannot read was forwarded",
 	)
-
-	testing.expect(t, mock_untouched(f.socket), "an OPT record this server cannot read was forwarded")
-	testing.expect(t, ok, "the client was left with nothing at all")
-	testing.expect_value(t, outcome, Outcome.Failed)
-	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Form_Err)
 	free_all(context.temp_allocator)
 }
 
@@ -351,26 +170,15 @@ message, decided by what some other client asked for earlier.
 */
 @(test)
 test_a_second_opt_record_is_refused_whatever_the_cache_holds :: proc(t: ^testing.T) {
-	f: Opt_Fixture
-	if !opt_fixture_start(t, &f) {
+	h: Harness
+	if !harness_start(t, &h, caching = true) {
 		return
 	}
-	defer opt_fixture_stop(&f)
+	defer harness_stop(&h)
 
 	// A plain query for the name first, so there is an entry to be tempted by.
-	warm := Opt_Mock{socket = f.socket, name = "warm.example."}
-	mock := thread.create_and_start_with_poly_data(&warm, serve_opt)
-	plain := make([]dns.Record, 1, context.temp_allocator)
-	plain[0] = dns.make_opt(1232, false)
-	_, first, _ := handle_query(
-		&f.srv,
-		opt_query("warm.example.", plain),
-		.UDP,
-		"127.0.0.1:5555",
-		context.temp_allocator,
-	)
-	thread.join(mock)
-	thread.destroy(mock)
+	warm := cookie_mock("warm.example.")
+	_, first, _ := harness_sniff(&h, &warm, query_with_records("warm.example.", dns.make_opt(1232, false)))
 	if !testing.expect(t, warm.served, "the mock upstream never answered the first query") {
 		return
 	}
@@ -379,19 +187,7 @@ test_a_second_opt_record_is_refused_whatever_the_cache_holds :: proc(t: ^testing
 	// The same name, now cached, asked with two OPT records. No mock is
 	// listening, so a query that got past the gate would be answered from the
 	// entry rather than time out - which is the mistake being guarded against.
-	pair := make([]dns.Record, 2, context.temp_allocator)
-	pair[0] = dns.make_opt(1232, false)
-	pair[1] = cookie_opt()
-	out, outcome, ok := handle_query(
-		&f.srv,
-		opt_query("warm.example.", pair),
-		.UDP,
-		"127.0.0.1:5555",
-		context.temp_allocator,
-	)
-	testing.expect(t, ok, "the client was left with nothing at all")
-	testing.expect_value(t, outcome, Outcome.Failed)
-	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Form_Err)
+	out := expect_refused_unforwarded(t, &h, two_opts_with_cookie("warm.example."), "a cached name's malformed query was forwarded")
 	if m, derr := dns.decode_message(out, context.temp_allocator); derr == .None {
 		testing.expect_value(t, len(m.answer), 0)
 	}

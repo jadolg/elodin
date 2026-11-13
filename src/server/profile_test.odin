@@ -131,12 +131,23 @@ make_cert :: proc(cert, key: string, name := "") -> bool {
 }
 
 // Generated once per run: `mobileconfig_test` and `metrics_test` drive the same
-// certificate through `make_test_profile_signer`, and a second copy of the
-// generation would be a second `openssl` racing this one over its own output
-// files.
+// certificate through `make_test_profile_signer`, and `reload_tls_test` loads
+// it directly, and a second copy of the generation would be a second `openssl`
+// racing this one over its own output files.
 ensure_profile_certs :: proc() -> (cert, key: string, ok: bool) {
 	sync.once_do(&cert_once, generate_certs)
 	return cert_path, key_path, cert_ok
+}
+
+// How many profiles `p`'s cache holds.
+@(private = "file")
+profile_cache_held :: proc(p: ^Profile_Signer) -> (held: int) {
+	for entry in p.entries {
+		if len(entry.authority) > 0 {
+			held += 1
+		}
+	}
+	return
 }
 
 // A signer over the first certificate, with everything the tests need to drive
@@ -352,13 +363,7 @@ test_profile_cache_is_bounded :: proc(t: ^testing.T) {
 		profile_for_host(p, authority, at(i64(i)), context.temp_allocator)
 	}
 
-	held := 0
-	for entry in p.entries {
-		if len(entry.authority) > 0 {
-			held += 1
-		}
-	}
-	testing.expect_value(t, held, PROFILE_CACHE_ENTRIES)
+	testing.expect_value(t, profile_cache_held(p), PROFILE_CACHE_ENTRIES)
 }
 
 /*
@@ -508,13 +513,7 @@ test_profile_folds_the_case_of_the_authority :: proc(t: ^testing.T) {
 	// port is a second authority and so a second.
 	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(2))
 
-	held := 0
-	for entry in p.entries {
-		if len(entry.authority) > 0 {
-			held += 1
-		}
-	}
-	testing.expect_value(t, held, 2)
+	testing.expect_value(t, profile_cache_held(p), 2)
 }
 
 /*

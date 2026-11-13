@@ -120,6 +120,115 @@ ceiling_mock_serve :: proc(m: ^Ceiling_Mock) {
 	}
 }
 
+/*
+A validating server over the `n3test.` fixtures: anchored at the root key, and
+accepting five NSEC3 iterations, so the zone's twelve are over the ceiling.
+
+`silent` puts a member that reads nothing in front of the mock, for the upstream
+being down. The mock looks at its stop flag every `poll`, which is how long
+`ceiling_stop` waits for it at most. The caller keeps the fixture where it
+declared it: `srv` points at `cfg`.
+*/
+@(private = "file")
+Ceiling_Fixture :: struct {
+	mock:   Ceiling_Mock,
+	quiet:  Maybe(net.UDP_Socket),
+	bound:  bool,
+	cfg:    config.Config,
+	group:  ^upstream.Group,
+	srv:    Server,
+	worker: ^thread.Thread,
+}
+
+@(private = "file")
+ceiling_start :: proc(
+	t: ^testing.T,
+	f: ^Ceiling_Fixture,
+	timeout: time.Duration,
+	poll: time.Duration,
+	answers: ^cache.Cache = nil,
+	silent := false,
+	loc := #caller_location,
+) -> bool {
+	specs := make([dynamic]config.Upstream_Spec, context.temp_allocator)
+	if silent {
+		quiet, quiet_spec, ok := bind_mock(t, "silent", loc = loc)
+		if !ok {
+			return false
+		}
+		f.quiet = quiet
+		append(&specs, quiet_spec)
+	}
+	socket, spec, ok := bind_mock(t, "chain" if silent else "mock", poll, loc = loc)
+	if !ok {
+		ceiling_stop(f)
+		return false
+	}
+	f.mock.socket = socket
+	f.bound = true
+	append(&specs, spec)
+
+	f.cfg = test_config(specs[:])
+	f.cfg.cache.enabled = answers != nil
+	f.cfg.dnssec.enabled = true
+	f.cfg.upstream.timeout = timeout
+	group, gerr := upstream.make_group(f.cfg.upstream)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr, loc = loc) {
+		ceiling_stop(f)
+		return false
+	}
+	f.group = group
+	f.srv = Server {
+		cfg     = &f.cfg,
+		group   = f.group,
+		answers = answers,
+	}
+
+	anchor, parsed := dnssec.parse_trust_anchor(C_ANCHOR, context.temp_allocator)
+	if !testing.expect(t, parsed, "the anchor should parse", loc = loc) {
+		ceiling_stop(f)
+		return false
+	}
+	anchors := make([]dnssec.Trust_Anchor, 1, context.temp_allocator)
+	anchors[0] = anchor
+	f.srv.validator = dnssec.make_validator(validator_query, &f.srv, dnssec.Options{anchors = anchors, max_nsec3_iterations = 5})
+	f.worker = thread.create_and_start_with_poly_data(&f.mock, ceiling_mock_serve)
+	return true
+}
+
+@(private = "file")
+ceiling_stop :: proc(f: ^Ceiling_Fixture) {
+	if f.worker != nil {
+		sync.atomic_store(&f.mock.stop, true)
+		thread.join(f.worker)
+		thread.destroy(f.worker)
+		f.worker = nil
+	}
+	if f.srv.validator != nil {
+		dnssec.destroy_validator(f.srv.validator)
+		f.srv.validator = nil
+	}
+	if f.group != nil {
+		upstream.destroy_group(f.group)
+		f.group = nil
+	}
+	if f.bound {
+		net.close(f.mock.socket)
+		f.bound = false
+	}
+	if quiet, has := f.quiet.?; has {
+		net.close(quiet)
+		f.quiet = nil
+	}
+}
+
+// A client's query for `name` that offers an OPT record with DO set.
+@(private = "file")
+ceiling_query :: proc(name: string, id: u16 = 0x3131) -> []u8 {
+	return test_query(name, id = id, opt = dns.make_opt(1232, true))
+}
+
+// The extended error an insecure NXDOMAIN from the fixture zone carries.
 @(private = "file")
 ceiling_ede_of :: proc(t: ^testing.T, wire: []u8) -> (code: u16, found: bool) {
 	msg, err := dns.decode_message(wire, context.temp_allocator)
@@ -128,88 +237,25 @@ ceiling_ede_of :: proc(t: ^testing.T, wire: []u8) -> (code: u16, found: bool) {
 	}
 	testing.expect_value(t, dns.rcode_of(msg), dns.Rcode.NX_Domain)
 	testing.expect(t, !msg.flags.ad, "an insecure answer carries no AD bit")
-	opt, has := dns.find_opt(msg)
-	if !has {
+	info, _ := extended_error(wire)
+	if info < 0 {
 		return 0, false
 	}
-	options, _ := opt.data.(dns.Rdata_OPT)
-	for option in options.options {
-		if option.code == u16(dns.EDNS_Option_Code.Ext_Error) && len(option.data) >= 2 {
-			return u16(option.data[0]) << 8 | u16(option.data[1]), true
-		}
-	}
-	return 0, false
+	return u16(info), true
 }
 
 @(test)
 test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^testing.T) {
-	mock: Ceiling_Mock
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
-		return
-	}
-	mock.socket = socket
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		return
-	}
-
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = true
-	cfg.dnssec.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 1 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec {
-		name    = "mock",
-		kind    = .UDP,
-		address = "127.0.0.1",
-		port    = bound.port,
-	}
-	cfg.upstream.servers = servers
-
-	g, gerr := upstream.make_group(cfg.upstream)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(g)
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 300, serve_stale = true})
 	defer cache.destroy(answers)
-	s := Server {
-		cfg     = &cfg,
-		group   = g,
-		answers = answers,
+	f: Ceiling_Fixture
+	if !ceiling_start(t, &f, 1 * time.Second, 100 * time.Millisecond, answers) {
+		return
 	}
-	anchor, parsed := dnssec.parse_trust_anchor(C_ANCHOR, context.temp_allocator)
-	testing.expect(t, parsed, "the anchor should parse")
-	anchors := make([]dnssec.Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	s.validator = dnssec.make_validator(validator_query, &s, dnssec.Options{anchors = anchors, max_nsec3_iterations = 5})
-	defer dnssec.destroy_validator(s.validator)
+	defer ceiling_stop(&f)
+	wire := ceiling_query(C_QNAME)
 
-	worker := thread.create_and_start_with_poly_data(&mock, ceiling_mock_serve)
-	defer {
-		sync.atomic_store(&mock.stop, true)
-		thread.join(worker)
-		thread.destroy(worker)
-	}
-
-	query := dns.Message {
-		id       = 0x3131,
-		question = []dns.Question{{name = C_QNAME, type = .A, class = .IN}},
-	}
-	query.flags.rd = true
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(1232, true)
-	query.additional = additional
-	wire, _, eerr := dns.encode_message(query, context.temp_allocator)
-	testing.expect_value(t, eerr, dns.Encode_Error.None)
-
-	first, outcome, served := handle_query(&s, wire, .UDP, "test", context.temp_allocator)
+	first, outcome, served := handle_query(&f.srv, wire, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served, "no response for the first query")
 	testing.expect_value(t, outcome, Outcome.Forwarded)
 	code, found := ceiling_ede_of(t, first)
@@ -217,7 +263,7 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	testing.expect_value(t, code, u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS))
 
 	// And from the cache, which is where the next client gets it.
-	second, again, served_again := handle_query(&s, wire, .UDP, "test", context.temp_allocator)
+	second, again, served_again := handle_query(&f.srv, wire, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served_again, "no response for the second query")
 	testing.expect_value(t, again, Outcome.Cached)
 	code, found = ceiling_ede_of(t, second)
@@ -230,12 +276,14 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	not. Declared last so it is torn down first: `stop_test_loop` waits out a refresh
 	still waiting on the silent upstream.
 	*/
-	cfg.cache.serve_stale = true
-	cfg.cache.stale_timeout = 2 * time.Second
+	f.cfg.cache.serve_stale = true
+	f.cfg.cache.stale_timeout = 2 * time.Second
 	tl: Test_Loop
-	start_test_loop(&tl)
+	if !testing.expect(t, start_test_loop(&tl), "no loop") {
+		return
+	}
 	defer stop_test_loop(&tl)
-	s.loops = tl.loops[:]
+	f.srv.loops = tl.loops[:]
 	expire :: proc(answers: ^cache.Cache) {
 		for _, e in answers.shards[0].entries {
 			e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
@@ -243,7 +291,7 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	}
 
 	expire(answers)
-	refreshed, refreshed_outcome, served_refresh := handle_query(&s, wire, .UDP, "test", context.temp_allocator)
+	refreshed, refreshed_outcome, served_refresh := handle_query(&f.srv, wire, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served_refresh, "no response for the refreshed query")
 	testing.expect_value(t, refreshed_outcome, Outcome.Forwarded)
 	code, found = ceiling_ede_of(t, refreshed)
@@ -251,9 +299,9 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	testing.expect_value(t, code, u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS))
 
 	expire(answers)
-	sync.atomic_store(&mock.silent, true)
-	cfg.cache.stale_timeout = 100 * time.Millisecond
-	stale, stale_outcome, served_stale := handle_query(&s, wire, .UDP, "test", context.temp_allocator)
+	sync.atomic_store(&f.mock.silent, true)
+	f.cfg.cache.stale_timeout = 100 * time.Millisecond
+	stale, stale_outcome, served_stale := handle_query(&f.srv, wire, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served_stale, "no response for the stale query")
 	testing.expect_value(t, stale_outcome, Outcome.Cached)
 	code, found = ceiling_ede_of(t, stale)
@@ -293,29 +341,11 @@ the forwarded target, which carries it beside its bytes rather than in them.
 @(test)
 test_a_cname_rewrite_to_an_answer_over_the_ceiling_keeps_ede_27 :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	mock: Ceiling_Mock
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	f: Ceiling_Fixture
+	if !ceiling_start(t, &f, 1 * time.Second, 100 * time.Millisecond) {
 		return
 	}
-	mock.socket = socket
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond)
-	bound, berr := net.bound_endpoint(socket)
-	if !testing.expectf(t, berr == nil, "cannot read the mock's port: %v", berr) {
-		return
-	}
-
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.dnssec.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 1 * time.Second
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
+	defer ceiling_stop(&f)
 	first_hop := make([]config.Rewrite_Answer, 1, context.temp_allocator)
 	first_hop[0] = {kind = .CNAME, name = "hop.lan."}
 	last_hop := make([]config.Rewrite_Answer, 1, context.temp_allocator)
@@ -323,37 +353,10 @@ test_a_cname_rewrite_to_an_answer_over_the_ceiling_keeps_ede_27 :: proc(t: ^test
 	rules := make([]config.Rewrite, 2, context.temp_allocator)
 	rules[0] = config.Rewrite{domain = "alias.lan.", answers = first_hop, ttl = 60}
 	rules[1] = config.Rewrite{domain = "hop.lan.", answers = last_hop, ttl = 60}
-	cfg.rewrites = rules
+	f.cfg.rewrites = rules
 
-	g, gerr := upstream.make_group(cfg.upstream)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(g)
-	s := Server{cfg = &cfg, group = g}
-	anchor, parsed := dnssec.parse_trust_anchor(C_ANCHOR, context.temp_allocator)
-	testing.expect(t, parsed, "the anchor should parse")
-	anchors := make([]dnssec.Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	s.validator = dnssec.make_validator(validator_query, &s, dnssec.Options{anchors = anchors, max_nsec3_iterations = 5})
-	defer dnssec.destroy_validator(s.validator)
-
-	worker := thread.create_and_start_with_poly_data(&mock, ceiling_mock_serve)
-	defer {
-		sync.atomic_store(&mock.stop, true)
-		thread.join(worker)
-		thread.destroy(worker)
-	}
-
-	query := dns.Message{id = 0x3131, question = []dns.Question{{name = "alias.lan.", type = .A, class = .IN}}}
-	query.flags.rd = true
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(1232, true)
-	query.additional = additional
-	wire, _, eerr := dns.encode_message(query, context.temp_allocator)
-	testing.expect_value(t, eerr, dns.Encode_Error.None)
-
-	out, outcome, served := handle_query(&s, wire, .UDP, "test", context.temp_allocator)
+	wire := ceiling_query("alias.lan.")
+	out, outcome, served := handle_query(&f.srv, wire, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served, "no response")
 	testing.expect_value(t, outcome, Outcome.Rewritten)
 	code, found := ceiling_ede_of(t, out)
@@ -375,73 +378,19 @@ silent member ends the query there, SERVFAIL, at two.
 */
 @(test)
 test_the_chain_lookups_spend_what_is_left_of_the_query_budget :: proc(t: ^testing.T) {
-	mock: Ceiling_Mock
-	socket, serr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, serr == nil, "cannot bind the mock upstream: %v", serr) {
+	f: Ceiling_Fixture
+	if !ceiling_start(t, &f, 400 * time.Millisecond, 50 * time.Millisecond, silent = true) {
 		return
 	}
-	mock.socket = socket
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, 50 * time.Millisecond)
-	bound, _ := net.bound_endpoint(socket)
-	quiet, qerr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if !testing.expectf(t, qerr == nil, "cannot bind the silent upstream: %v", qerr) {
-		return
-	}
-	defer net.close(quiet)
-	quiet_bound, _ := net.bound_endpoint(quiet)
-
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
-	cfg.dnssec.enabled = true
-	cfg.upstream.strategy = .Failover
-	cfg.upstream.attempts = 1
-	cfg.upstream.timeout = 400 * time.Millisecond
-	servers := make([]config.Upstream_Spec, 2, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "silent", kind = .UDP, address = "127.0.0.1", port = quiet_bound.port}
-	servers[1] = config.Upstream_Spec{name = "chain", kind = .UDP, address = "127.0.0.1", port = bound.port}
-	cfg.upstream.servers = servers
-
-	g, gerr := upstream.make_group(cfg.upstream)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return
-	}
-	defer upstream.destroy_group(g)
-	s := Server {
-		cfg   = &cfg,
-		group = g,
-	}
-	anchor, parsed := dnssec.parse_trust_anchor(C_ANCHOR, context.temp_allocator)
-	testing.expect(t, parsed, "the anchor should parse")
-	anchors := make([]dnssec.Trust_Anchor, 1, context.temp_allocator)
-	anchors[0] = anchor
-	s.validator = dnssec.make_validator(validator_query, &s, dnssec.Options{anchors = anchors, max_nsec3_iterations = 5})
-	defer dnssec.destroy_validator(s.validator)
-
-	worker := thread.create_and_start_with_poly_data(&mock, ceiling_mock_serve)
-	defer {
-		sync.atomic_store(&mock.stop, true)
-		thread.join(worker)
-		thread.destroy(worker)
-	}
-
-	query := dns.Message {
-		id       = 0x4390,
-		question = []dns.Question{{name = C_QNAME, type = .A, class = .IN}},
-	}
-	query.flags.rd = true
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(1232, true)
-	query.additional = additional
-	wire, _, _ := dns.encode_message(query, context.temp_allocator)
+	defer ceiling_stop(&f)
+	wire := ceiling_query(C_QNAME, 0x4390)
 
 	started := time.tick_now()
-	_, _, served := handle_query(&s, wire, .UDP, "test", context.temp_allocator)
+	_, _, served := handle_query(&f.srv, wire, .UDP, "test", context.temp_allocator)
 	spent := time.tick_since(started)
 	testing.expect(t, served, "no response at all")
 	// Two timeouts and slack for a loaded runner; a budget per lookup would
 	// wait three, one per lookup until the silent member parked.
-	testing.expectf(t, spent < 5 * cfg.upstream.timeout / 2, "the query waited %v, where its budget is two timeouts of %v", spent, cfg.upstream.timeout)
+	testing.expectf(t, spent < 5 * f.cfg.upstream.timeout / 2, "the query waited %v, where its budget is two timeouts of %v", spent, f.cfg.upstream.timeout)
 	free_all(context.temp_allocator)
 }
