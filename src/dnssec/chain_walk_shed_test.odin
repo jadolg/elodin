@@ -47,6 +47,8 @@ other one is shed - whatever order the threads happen to start in.
 @(private = "file")
 Slow_Upstream :: struct {
 	mu:        sync.Mutex,
+	// Broadcast when a call arrives and when the test releases them.
+	changed:   sync.Cond,
 	in_flight: int,
 	peak:      int,
 	calls:     int,
@@ -71,18 +73,38 @@ slow_query :: proc(
 	if u.in_flight > u.peak {
 		u.peak = u.in_flight
 	}
-	sync.mutex_unlock(&u.mu)
-
-	for !sync.atomic_load(&u.released) {
-		time.sleep(time.Millisecond)
+	sync.cond_broadcast(&u.changed)
+	for !u.released {
+		sync.cond_wait(&u.changed, &u.mu)
 	}
-
-	sync.mutex_lock(&u.mu)
 	u.in_flight -= 1
 	sync.mutex_unlock(&u.mu)
 	// Nothing came back, which is where a walk that reached the upstream and
 	// waited ends up. What this measures is the waiting, not the answer.
 	return nil, false
+}
+
+// Lets every call waiting on `u`, and every one after, return.
+@(private = "file")
+release_slow :: proc(u: ^Slow_Upstream) {
+	sync.mutex_lock(&u.mu)
+	u.released = true
+	sync.cond_broadcast(&u.changed)
+	sync.mutex_unlock(&u.mu)
+}
+
+// Waits up to ten seconds for `n` lookups to have reached `u`.
+@(private = "file")
+wait_for_calls :: proc(u: ^Slow_Upstream, n: int) {
+	deadline := time.tick_add(time.tick_now(), 10 * time.Second)
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	for u.calls < n {
+		left := time.tick_diff(time.tick_now(), deadline)
+		if left <= 0 || !sync.cond_wait_with_timeout(&u.changed, &u.mu, left) {
+			return
+		}
+	}
 }
 
 // The lookups that reached `u`, read under its lock.
@@ -104,10 +126,12 @@ warm_example_chain :: proc(v: ^Validator, now: time.Time) {
 
 @(private = "file")
 Walker :: struct {
-	v:      ^Validator,
-	status: Status,
-	reason: string,
-	done:   bool,
+	v:        ^Validator,
+	// Posted by every walker as it finishes.
+	finished: ^sync.Sema,
+	status:   Status,
+	reason:   string,
+	done:     bool,
 }
 
 @(private = "file")
@@ -124,6 +148,7 @@ walk_once :: proc(w: ^Walker) {
 	w.reason = walk_reason(&budget)
 	free_all(context.temp_allocator)
 	sync.atomic_store(&w.done, true)
+	sync.sema_post(w.finished)
 }
 
 /*
@@ -145,49 +170,46 @@ test_only_so_many_chain_walks_block_at_once :: proc(t: ^testing.T) {
 	v := make_validator(slow_query, &up, Options{max_chain_walks = SLOTS})
 	defer destroy_validator(v)
 
+	finished_one: sync.Sema
 	walkers: [WALKERS]Walker
 	threads: [WALKERS]^thread.Thread
 	for i in 0 ..< WALKERS {
 		walkers[i].v = v
+		walkers[i].finished = &finished_one
 		threads[i] = thread.create_and_start_with_poly_data(&walkers[i], walk_once)
 	}
 
 	// The walks that found no slot should come back while the upstream is still
 	// silent. Waiting for them is the measurement: unfixed, they are queued
 	// behind it instead and none of them does.
-	finished := 0
-	calls := 0
-	peak := 0
-	start := time.now()
-	for time.since(start) < 10 * time.Second {
-		finished = 0
-		for i in 0 ..< WALKERS {
-			if sync.atomic_load(&walkers[i].done) {
-				finished += 1
-			}
-		}
-		sync.mutex_lock(&up.mu)
-		peak = up.peak
-		calls = up.calls
-		sync.mutex_unlock(&up.mu)
-		/*
-		Both, not just the first. A walk that takes a slot has raised
-		`Validator.walks` before it reaches the upstream - there is a
-		`spend_lookup`, an encode and a call in between - so a loop that stopped
-		as soon as the losers were counted could read `calls` while a winner was
-		still on its way to the mutex, and fail on a loaded box for no reason.
-		The upstream is silent until this loop is done, so waiting for both
-		cannot deadlock on anything but the bug.
-		*/
-		if finished >= WALKERS - SLOTS && calls >= SLOTS {
+	for _ in 0 ..< WALKERS - SLOTS {
+		if !sync.sema_wait_with_timeout(&finished_one, 10 * time.Second) {
 			break
 		}
-		time.sleep(time.Millisecond)
 	}
+	/*
+	And the winners at the upstream, not just the losers back. A walk that takes
+	a slot has raised `Validator.walks` before it reaches the upstream - there
+	is a `spend_lookup`, an encode and a call in between - so a count read as
+	soon as the losers were back could miss a winner still on its way. The
+	upstream is silent until it is released below, so waiting for both cannot
+	deadlock on anything but the bug.
+	*/
+	wait_for_calls(&up, SLOTS)
+	finished := 0
+	for &w in walkers {
+		if sync.atomic_load(&w.done) {
+			finished += 1
+		}
+	}
+	sync.mutex_lock(&up.mu)
+	peak := up.peak
+	calls := up.calls
+	sync.mutex_unlock(&up.mu)
 
 	// Let the two that took a slot go, so the threads can be joined whatever the
 	// result above was.
-	sync.atomic_store(&up.released, true)
+	release_slow(&up)
 	for th in threads {
 		thread.join(th)
 		thread.destroy(th)
@@ -478,7 +500,7 @@ test_a_connection_is_held_to_its_own_bound :: proc(t: ^testing.T) {
 
 	// Released before the walk, so this reaches the upstream rather than
 	// waiting on it: what is on trial is whether it was allowed to ask at all.
-	sync.atomic_store(&up.released, true)
+	release_slow(&up)
 
 	budget := query_budget(v)
 	budget.pool = .Connection

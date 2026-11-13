@@ -2,7 +2,11 @@ package h2
 
 import "core:encoding/hex"
 import "core:mem"
+import "core:sync"
 import "core:testing"
+import "core:time"
+
+import "elodin:loop"
 
 /*
 Fixtures shared by the server and client tests: a tracking allocator for the
@@ -115,6 +119,21 @@ count_frames :: proc(log: ^Frame_Log, type: Frame_Type, stream_id: Maybe(u32) = 
 	return n
 }
 
+@(test)
+test_count_frames_keeps_to_the_stream_asked_for :: proc(t: ^testing.T) {
+	log := Frame_Log {
+		frames = make([dynamic]Frame_Header, 0, 4, context.temp_allocator),
+	}
+	append(&log.frames, Frame_Header{type = .Rst_Stream, stream_id = 1})
+	append(&log.frames, Frame_Header{type = .Rst_Stream, stream_id = 3})
+	append(&log.frames, Frame_Header{type = .Data, stream_id = 3})
+	testing.expect_value(t, count_frames(&log, .Rst_Stream), 2)
+	testing.expect_value(t, count_frames(&log, .Rst_Stream, 1), 1)
+	testing.expect_value(t, count_frames(&log, .Rst_Stream, 5), 0)
+	testing.expect_value(t, count_frames(&log, .Data, 1), 0)
+	free_all(context.temp_allocator)
+}
+
 @(private)
 saw_frame :: proc(log: ^Frame_Log, type: Frame_Type, stream_id: Maybe(u32) = nil) -> bool {
 	return count_frames(log, type, stream_id) > 0
@@ -154,4 +173,23 @@ client_done :: proc(t: ^testing.T, c: ^Client, track: ^mem.Tracking_Allocator, w
 	client_unref(c)
 	free_all(context.temp_allocator)
 	expect_no_leaks(t, track, what, loc)
+}
+
+/*
+Waits for somebody to be parked on `c`: a thread in `cond_wait` is on its list
+from before it lets its lock go until it is woken. False after five seconds.
+*/
+@(private)
+wait_for_waiter :: proc(c: ^loop.Cond) -> bool {
+	deadline := time.tick_add(time.tick_now(), 5 * time.Second)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
+		sync.mutex_lock(&c.mu)
+		parked := c.waiters.head != nil
+		sync.mutex_unlock(&c.mu)
+		if parked {
+			return true
+		}
+		time.sleep(time.Millisecond)
+	}
+	return false
 }

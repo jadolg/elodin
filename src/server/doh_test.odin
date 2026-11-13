@@ -6,6 +6,7 @@ import "core:mem/virtual"
 import "core:net"
 import "core:strings"
 import "core:sync"
+import "core:sys/linux"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -92,12 +93,9 @@ send_request :: proc(s: ^Sender) {
 		return
 	}
 	defer net.close(socket)
-	if _, serr := net.send_tcp(socket, transmute([]u8)s.request); serr != nil {
-		return
-	}
-	// Held open until the reader has had its turn; closing here would race the
-	// body read.
-	time.sleep(250 * time.Millisecond)
+	// The close behind the send is a FIN after the bytes, which the reader takes
+	// in order.
+	_, _ = net.send_tcp(socket, transmute([]u8)s.request)
 }
 
 /*
@@ -227,16 +225,17 @@ test_doh_answers_a_pipelined_pair :: proc(t: ^testing.T) {
 	if _, serr := net.send_tcp(client, transmute([]u8)pipelined); !testing.expectf(t, serr == nil, "cannot send the requests: %v", serr) {
 		return
 	}
-
-	// Nothing follows the pair, so the handler ends on this rather than on a
-	// close: it stands in for `client_timeout` on a connection kept open.
-	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
+	// Nothing follows the pair, so the end of the stream ends the handler: it
+	// stands in for `client_timeout` on a connection kept open.
+	net.shutdown(client, .Send)
 
 	cfg := config.default_config()
 	s := Server {
 		cfg = &cfg,
 	}
 	serve_doh(&s, Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}}, "test")
+	// The listener's close, so the read below ends at the FIN.
+	net.shutdown(accepted, .Send)
 
 	answers, _ := read_until_close(client, 500 * time.Millisecond)
 	testing.expect_value(t, strings.count(answers, "HTTP/1.1 404"), 2)
@@ -323,8 +322,9 @@ socket resumes - the middle of the request line - so what the server read would
 not be the request the client sent. It would parse as garbage and the connection
 would be closed under a client that did nothing wrong.
 
-The pause between the two writes is what puts the split there: the first read
-takes the whole of one request and the beginning of the next.
+Each write waits for the handler to have read the one before it, which is what
+puts the split there: the first read takes the whole of one request and the
+beginning of the next.
 */
 @(test)
 test_doh_answers_a_request_that_arrives_split :: proc(t: ^testing.T) {
@@ -334,10 +334,6 @@ test_doh_answers_a_request_that_arrives_split :: proc(t: ^testing.T) {
 	}
 	defer net.close(client)
 	defer net.close(accepted)
-	// Longer than the pause below, so the handler waits for the rest of the
-	// second request rather than timing out on it.
-	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
-
 	cfg := config.default_config()
 	s := Server {
 		cfg = &cfg,
@@ -351,20 +347,36 @@ test_doh_answers_a_request_that_arrives_split :: proc(t: ^testing.T) {
 		thread.join(handler)
 		thread.destroy(handler)
 	}
+	// Everything the client wrote has reached the handler's socket and been read
+	// off it.
+	Pair :: struct {
+		client, accepted: net.TCP_Socket,
+	}
+	pair := Pair{client, accepted}
+	all_read :: proc(data: rawptr) -> bool {
+		p := (^Pair)(data)
+		return unacked_bytes(linux.Fd(p.client)) == 0 && unread_bytes(linux.Fd(p.accepted)) == 0
+	}
 
 	// The first request and the request line of the second, cut mid-target.
 	if _, serr := net.send_tcp(client, transmute([]u8)string("GET /not-served HTTP/1.1\r\nHost: dns.example\r\n\r\nGET /not-se")); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		net.shutdown(client, .Send)
 		return
 	}
-	time.sleep(200 * time.Millisecond)
+	if !testing.expect(t, wait_until(all_read, &pair, 2 * time.Second), "the handler never read the first write") {
+		net.shutdown(client, .Send)
+		return
+	}
 	// And cut again between a CR and its LF: `http_line` refuses a bare CR, and
 	// a CR that is only the last byte read so far is not one (#432).
 	if _, serr := net.send_tcp(client, transmute([]u8)string("rved HTTP/1.1\r\nHost: dns.example\r")); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		net.shutdown(client, .Send)
 		return
 	}
-	time.sleep(200 * time.Millisecond)
+	if !testing.expect(t, wait_until(all_read, &pair, 2 * time.Second), "the handler never read the second write") {
+		net.shutdown(client, .Send)
+		return
+	}
 	if _, serr := net.send_tcp(client, transmute([]u8)string("\n\r\n")); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		net.shutdown(client, .Send)
 		return
@@ -424,16 +436,16 @@ test_doh_refuses_a_query_over_the_rate_limit :: proc(t: ^testing.T) {
 	}
 	// The refusal keeps the connection, so what ends `serve_doh` is the end of the
 	// stream rather than the refusal: without this the handler waits for a second
-	// request until the receive timeout below.
+	// request until `client_timeout`.
 	net.shutdown(client, .Send)
-
-	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
 
 	cfg: config.Config
 	s, peer := spent_limiter_server(t, &cfg)
 	defer destroy_rate_limiter(s.limiter)
 
 	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")
+	// The listener's close, so the read below ends at the FIN.
+	net.shutdown(accepted, .Send)
 
 	head, _ := read_until_close(client, 500 * time.Millisecond)
 	testing.expect(t, strings.contains(head, "HTTP/1.1 429"), "an over-budget query was not answered 429")
@@ -496,16 +508,13 @@ test_doh_keeps_the_connection_after_a_429 :: proc(t: ^testing.T) {
 	}
 	net.shutdown(client, .Send)
 
-	// Longer than the handler should need for either request, so that a
-	// regression that goes back to closing shows up as a missing second refusal
-	// rather than as a read this test gave up on.
-	_ = net.set_option(accepted, .Receive_Timeout, 2 * time.Second)
-
 	cfg: config.Config
 	s, peer := spent_limiter_server(t, &cfg)
 	defer destroy_rate_limiter(s.limiter)
 
 	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")
+	// The listener's close, so the read below ends at the FIN.
+	net.shutdown(accepted, .Send)
 
 	head, _ := read_until_close(client, 500 * time.Millisecond)
 	testing.expectf(
@@ -537,11 +546,11 @@ client asked for it. RFC 9112 9.6: a recipient that reads the field sends no
 further requests on that connection, and answering it `keep-alive` would leave
 this end waiting out `client_timeout` for a request that is never coming.
 
-The client here does not shut its send side down, so a handler that ignored the
-field and went back to reading would sit on the receive timeout below rather than
-return; that is the regression this measures, and why the wait is timed. Nothing
-is drained on the way out: the request was read in full, body included, so a
-client that meant the field it sent left nothing in the receive queue for the
+A second request, pipelined behind the first, is the probe: a handler that
+ignored the field and went back to reading would answer it too, so the count of
+refusals is what tells the two apart. The client shuts its send side down after
+both, which ends either handler at once. Nothing is drained on the way out: the
+two requests arrived in one read, so nothing is left in the receive queue for the
 close to turn into an RST.
 */
 @(test)
@@ -555,31 +564,27 @@ test_doh_429_honours_connection_close :: proc(t: ^testing.T) {
 
 	body := strings.builder_make(context.temp_allocator)
 	write_doh_post(&body, make([]u8, dns.HEADER_SIZE, context.temp_allocator), "Connection: close\r\n")
+	write_doh_post(&body, make([]u8, dns.HEADER_SIZE, context.temp_allocator))
 	if _, serr := net.send_tcp(client, body.buf[:]); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		return
 	}
-
-	// Longer than the handler should take, so a regression that reads on shows up
-	// as a slow `serve_doh` rather than as a read that gave up on the request.
-	_ = net.set_option(accepted, .Receive_Timeout, 2 * time.Second)
+	net.shutdown(client, .Send)
 
 	cfg: config.Config
 	s, peer := spent_limiter_server(t, &cfg)
 	defer destroy_rate_limiter(s.limiter)
 
-	start := time.tick_now()
 	serve_doh(&s, Conn{socket = accepted, peer = peer}, "test")
-	spent := time.tick_since(start)
-
-	testing.expectf(
-		t,
-		spent < time.Second,
-		"the refusal took %v, which is the handler reading on past a `Connection: close`",
-		spent,
-	)
+	// The listener's close, so the read below ends at the FIN.
+	net.shutdown(accepted, .Send)
 
 	head, _ := read_until_close(client, 500 * time.Millisecond)
-	testing.expect(t, strings.contains(head, "HTTP/1.1 429"), "an over-budget query was not answered 429")
+	testing.expectf(
+		t,
+		strings.count(head, "HTTP/1.1 429") == 1,
+		"the handler read on past a `Connection: close` and answered what followed it: %q",
+		head,
+	)
 	testing.expect(
 		t,
 		strings.contains(head, "Connection: close"),
@@ -1517,8 +1522,13 @@ test_doh_reader_gives_up_on_a_drip_fed_request :: proc(t: ^testing.T) {
 
 @(private = "file")
 Wrong_Path_Peer :: struct {
-	socket: net.TCP_Socket,
-	stop:   bool,
+	socket:   net.TCP_Socket,
+	stop:     bool,
+	// Posted once `serve_doh` has returned.
+	returned: sync.Sema,
+	// Set when the server had not hung up by the stopper's bound, which then
+	// ended the connection itself.
+	forced:   bool,
 }
 
 // Asks for a path this server does not serve every 40ms - well inside the idle
@@ -1544,8 +1554,9 @@ inside every idle wait could hold a connection and one of `max_connections`
 forever, and the rate limiter would never see it. It is let go once twice
 `client_timeout` passes with no question asked - see `doh_question_overdue`.
 
-The peer here keeps asking for three seconds; the server must hang up long before
-that, rather than when the peer stops.
+The peer here keeps asking until the server hangs up, or for a second, which is
+over three times what `doh_question_overdue` allows at this `client_timeout`;
+the server must hang up before that, rather than when the peer stops.
 */
 @(test)
 test_doh_lets_go_of_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
@@ -1562,9 +1573,8 @@ test_doh_lets_go_of_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
 	asker := thread.create_and_start_with_poly_data(&peer, ask_the_wrong_path)
 	// Only there to end the case when the server never hangs up, which is the bug.
 	stopper := thread.create_and_start_with_poly_data(&peer, proc(p: ^Wrong_Path_Peer) {
-		start := time.tick_now()
-		for !sync.atomic_load(&p.stop) && time.tick_since(start) < 3 * time.Second {
-			time.sleep(10 * time.Millisecond)
+		if !sync.sema_wait_with_timeout(&p.returned, time.Second) {
+			sync.atomic_store(&p.forced, true)
 		}
 		sync.atomic_store(&p.stop, true)
 		net.shutdown(p.socket, .Both)
@@ -1575,9 +1585,8 @@ test_doh_lets_go_of_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
 	s := Server {
 		cfg = &cfg,
 	}
-	start := time.tick_now()
 	serve_doh(&s, Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}}, "test")
-	held := time.tick_since(start)
+	sync.sema_post(&peer.returned)
 
 	sync.atomic_store(&peer.stop, true)
 	thread.join(asker)
@@ -1585,7 +1594,7 @@ test_doh_lets_go_of_a_connection_that_asks_nothing :: proc(t: ^testing.T) {
 	thread.join(stopper)
 	thread.destroy(stopper)
 
-	testing.expectf(t, held < time.Second, "a connection that asked nothing was held for %v", held)
+	testing.expect(t, !sync.atomic_load(&peer.forced), "a connection that asked nothing was held until the peer gave up")
 	free_all(context.temp_allocator)
 }
 

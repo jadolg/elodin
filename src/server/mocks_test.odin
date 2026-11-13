@@ -3,6 +3,7 @@ package server
 import "core:mem"
 import "core:net"
 import "core:strings"
+import "core:sys/linux"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -725,6 +726,36 @@ Doh_Session :: struct {
 @(private)
 run_serve_doh :: proc(d: ^Doh_Session) {
 	serve_doh(d.server, d.conn, "test")
+	// The FIN the listener's close sends once `serve_doh` returns, so a client
+	// reading until close stops here rather than at its timeout. The caller
+	// still owns the descriptor.
+	net.shutdown(d.conn.socket, .Send)
+}
+
+/*
+Bytes `fd` holds that its reader has not taken: `FIONREAD`, which on a UDP
+socket is the next datagram's. -1 when the kernel will not say.
+*/
+@(private)
+unread_bytes :: proc(fd: linux.Fd) -> int {
+	FIONREAD :: 0x541B
+	n: i32
+	if i32(linux.ioctl(fd, FIONREAD, uintptr(&n))) < 0 {
+		return -1
+	}
+	return int(n)
+}
+
+// Bytes `fd` sent that its peer has not acknowledged: `SIOCOUTQ`. -1 when the
+// kernel will not say.
+@(private)
+unacked_bytes :: proc(fd: linux.Fd) -> int {
+	SIOCOUTQ :: 0x5411
+	n: i32
+	if i32(linux.ioctl(fd, SIOCOUTQ, uintptr(&n))) < 0 {
+		return -1
+	}
+	return int(n)
 }
 
 /*

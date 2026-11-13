@@ -212,8 +212,8 @@ Shared with `cases_special_use.odin`, which scrapes the endpoint for a counter o
 its own; the waiting is the same and the reason for it is the same.
 */
 wait_http :: proc(port: int, path: string) -> bool {
-	deadline := time.time_add(time.now(), 5 * time.Second)
-	for time.diff(deadline, time.now()) < 0 {
+	deadline := time.tick_add(time.tick_now(), 5 * time.Second)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
 		if http_request(port, "GET", path, context.temp_allocator).status == 200 {
 			return true
 		}

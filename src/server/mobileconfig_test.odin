@@ -165,9 +165,6 @@ mc_roundtrip :: proc(t: ^testing.T, request: string, signer: ^Profile_Signer = n
 	}
 	defer net.close(client)
 	defer net.close(accepted)
-	// With nothing following the one request, the handler ends on this rather
-	// than on a close.
-	_ = net.set_option(accepted, .Receive_Timeout, 500 * time.Millisecond)
 
 	session := Doh_Session {
 		server = &s,
@@ -179,8 +176,11 @@ mc_roundtrip :: proc(t: ^testing.T, request: string, signer: ^Profile_Signer = n
 		thread.destroy(handler)
 	}
 
-	if _, serr := net.send_tcp(client, transmute([]u8)request); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
-		net.shutdown(client, .Send)
+	// Nothing follows the one request, so the end of the stream is what ends
+	// the handler, rather than `client_timeout`.
+	_, serr := net.send_tcp(client, transmute([]u8)request)
+	net.shutdown(client, .Send)
+	if !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		return "", false
 	}
 	reply, _ = read_until_close(client, 2 * time.Second)

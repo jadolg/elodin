@@ -122,8 +122,8 @@ dot_handshake_verifies :: proc(dot_port: int, ca_file, hostname: string) -> bool
 // instant, and a fixed sleep would either race it or pad every run.
 @(private = "file")
 wait_for_handshake :: proc(dot_port: int, ca_file, hostname: string, within: time.Duration) -> bool {
-	deadline := time.time_add(time.now(), within)
-	for time.diff(time.now(), deadline) > 0 {
+	deadline := time.tick_add(time.tick_now(), within)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
 		if dot_handshake_verifies(dot_port, ca_file, hostname) {
 			return true
 		}

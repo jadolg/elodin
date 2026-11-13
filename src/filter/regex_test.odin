@@ -2,8 +2,8 @@ package filter
 
 import "core:fmt"
 import "core:strings"
+import "core:mem/virtual"
 import "core:testing"
-import "core:time"
 
 /*
 Adblock regex rules (#405): `/re/` is matched against the lowercased query name
@@ -459,15 +459,25 @@ test_regex_syntax_both_engines_share :: proc(t: ^testing.T) {
 Repetition is where a pattern's size stops being its length: Odin's compiler
 writes `e{N}` out N times, and checks the program's size only once it has
 written all of it. So the bound has to be known before compiling, and these must
-come back refused, quickly, and without the memory the expansion would take.
-Each takes microseconds; a second is room for a loaded runner, and what the
-guard's absence costs is minutes.
+come back refused without the memory the expansion would take.
+
+What a refusal cost is read off the scratch it ran in: a buffer the test fills
+with a mark, where whatever was handed out is zeroed on the way out, so the
+first byte still marked from the end is how far the scratch was used. Parsing a
+pattern this short takes under two kilobytes; compiling the one a count lets
+through takes tens of them.
 */
 @(test)
 test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
+	MARK :: 0xa5
+	scratch := make([]u8, 1 << 20)
+	defer delete(scratch)
 	block, allow := set_make(), set_make()
 	defer set_destroy(block)
 	defer set_destroy(allow)
+	if !testing.expect(t, virtual.arena_init_buffer(&block.regex_scratch, scratch) == nil, "cannot set up the scratch") {
+		return
+	}
 
 	bombs := []string {
 		"/a{99999999999}/",
@@ -482,19 +492,29 @@ test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
 		"/a{0,18446744073709551615}/",
 		// Past RE2's 1000, which urlfilter would not compile either.
 		"/a{1001}/",
+		// Within every count, and refused only on `program_bound`: compiled,
+		// tens of thousands of instructions.
+		"/(abcdefghijklmnopqrstuvwxyzabcdef){1000}/",
 	}
 	for rule in bombs {
-		start := time.tick_now()
+		// Past the arena's own header at the front of the buffer.
+		body := scratch[size_of(virtual.Memory_Block):]
+		for &b in body {
+			b = MARK
+		}
 		n := parse_rule(block, allow, rule)
-		took := time.tick_since(start)
+		used := len(body)
+		for used > 0 && body[used - 1] == MARK {
+			used -= 1
+		}
 		testing.expectf(t, n == 0, "%q was added", rule)
-		testing.expectf(t, took < time.Second, "%q took %v to refuse", rule, took)
+		testing.expectf(t, used < 8 * 1024, "%q took %d bytes of scratch to refuse", rule, used)
 	}
 	testing.expect_value(t, block.regex_bytes, 0)
 
 	// The deepest a pattern inside `MAX_REGEX_PATTERN` can nest, which is how
 	// deep the parser, the optimizer and `node_bound` recurse. Refused on size
-	// or accepted, what matters is that it comes back.
+	// or accepted, it comes back having used scratch linear in its length.
 	half := MAX_REGEX_PATTERN / 2 - 1
 	deep := []string {
 		fmt.tprintf("/%sa%s/", strings.repeat("(", half, context.temp_allocator), strings.repeat(")", half, context.temp_allocator)),
@@ -508,10 +528,19 @@ test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
 		fmt.tprintf("/%s/", strings.repeat("[", MAX_REGEX_PATTERN, context.temp_allocator)),
 	}
 	for rule in deep {
-		start := time.tick_now()
+		body := scratch[size_of(virtual.Memory_Block):]
+		for &b in body {
+			b = MARK
+		}
 		parse_rule(block, allow, rule)
-		took := time.tick_since(start)
-		testing.expectf(t, took < time.Second, "%d-byte pattern took %v", len(rule), took)
+		used := len(body)
+		for used > 0 && body[used - 1] == MARK {
+			used -= 1
+		}
+		// Linear in the pattern: about 84 bytes of scratch per pattern byte at
+		// the deepest nesting. Anything that grows faster reaches the 1 MiB
+		// arena well before it reaches this.
+		testing.expectf(t, used <= 128 * len(rule), "%d-byte nesting took %d bytes of scratch", len(rule), used)
 	}
 }
 

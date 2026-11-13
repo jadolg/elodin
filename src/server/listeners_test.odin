@@ -816,10 +816,9 @@ send_late_and_split :: proc(s: ^Late_Sender) {
 		return
 	}
 	time.sleep(s.wait)
+	// The close behind the send is a FIN after the bytes, which the reader takes
+	// in order.
 	_, _ = net.send_tcp(socket, s.message[s.split:])
-	// Held open until the reader has had its turn; closing here would race the
-	// second half off the wire.
-	time.sleep(500 * time.Millisecond)
 }
 
 /*

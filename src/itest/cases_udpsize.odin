@@ -1,7 +1,6 @@
 package itest
 
 import "core:fmt"
-import "core:time"
 import "elodin:dns"
 
 /*
@@ -223,9 +222,9 @@ run_udp_size_cases :: proc(r: ^Runner) {
 				// not the size of the datagram it happens to be riding on.
 				check_eq_int(r, int(dns.peek_udp_size(res.wire)), 1232, "the payload size the answer advertises")
 			}
-			// Give the line a moment to reach the file before concluding it is
-			// not there.
-			time.sleep(200 * time.Millisecond)
+			// Read once, and soundly: the line is written in `fit_response`,
+			// one write(2) before the answer goes to the socket, so an answer in
+			// hand means a line that was going to be logged for it already is.
 			check(
 				r,
 				!log_contains(&srv, "raise server.max_udp_response"),

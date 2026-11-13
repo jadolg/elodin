@@ -6,6 +6,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:config"
+import "elodin:h2"
 import "elodin:loop"
 import "elodin:tlsx"
 
@@ -18,19 +19,101 @@ held to.
 
 The connection here is handed to the upstream the way `get_h2_conn` would,
 over plain TCP to a listener that never accepts: the kernel completes the
-handshake, so the reader sits in its poll with nothing to read. The upstream
-itself points at a port nobody listens on, so the redial ends at once and
-the time `get_h2_conn` takes is the time it spent on the old connection.
+handshake, so the reader sits in its read with nothing to read. The upstream's
+dials are refused at once, so the redial ends there and what `get_h2_conn` does
+is all on the old connection.
 */
 @(private = "file")
-dead_port :: proc(t: ^testing.T) -> (port: int, ok: bool) {
-	l, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
-	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
-		return 0, false
+refuse_dial :: proc(endpoint: net.Endpoint, timeout: time.Duration) -> (net.TCP_Socket, Error) {
+	return {}, .Dial_Failed
+}
+
+/*
+A loop of the test's own, on a thread, with a connection's reader one of its
+fibers and in its read once `start_reader` returns: a fiber started from its own
+loop runs before the one that started it and then yielded, and with nothing to
+read its first park is its read. The loop's clock stands still, so that read's
+poll never runs out and the reader leaves only when something wakes it.
+*/
+@(private = "file")
+Reader_Loop :: struct {
+	l:  ^loop.Loop,
+	th: ^thread.Thread,
+	hc: ^H2_Conn,
+}
+
+@(private = "file")
+frozen_clock :: proc "contextless" () -> loop.Tick {
+	return loop.Tick{_nsec = 1}
+}
+
+@(private = "file")
+start_reader :: proc(t: ^testing.T, u: ^Upstream, stream: Stream) -> (r: Reader_Loop, ok: bool) {
+	l, made := loop.make_loop()
+	if !testing.expect(t, made, "no loop") {
+		return
 	}
-	bound, _ := net.bound_endpoint(l)
-	net.close(l)
-	return bound.port, true
+	l.clock = frozen_clock
+	r.l = l
+	r.th = loop.spawn_thread(l, loop.run, context)
+	Start :: struct {
+		u:       ^Upstream,
+		stream:  Stream,
+		hc:      ^H2_Conn,
+		started: sync.Sema,
+	}
+	st := Start {
+		u      = u,
+		stream = stream,
+	}
+	_, spawned := loop.spawn(l, proc(data: rawptr) {
+		st := (^Start)(data)
+		sync.mutex_lock(&st.u.mu)
+		st.hc = start_h2_conn(st.u, st.stream)
+		sync.mutex_unlock(&st.u.mu)
+		loop.yield()
+		sync.sema_post(&st.started)
+	}, &st)
+	ok = testing.expect(t, spawned, "cannot start a fiber") && testing.expect(t, sync.sema_wait_with_timeout(&st.started, 5 * time.Second), "the reader never started")
+	if !ok {
+		// Stopped here, while `st` is still in scope for the fiber.
+		stop_reader(&r)
+		return {}, false
+	}
+	r.hc = st.hc
+	return r, true
+}
+
+@(private = "file")
+stop_reader :: proc(r: ^Reader_Loop) {
+	loop.cancel_all(r.l)
+	loop.stop(r.l)
+	thread.join(r.th)
+	thread.destroy(r.th)
+	loop.destroy(r.l)
+}
+
+// Waits up to five seconds for every reader counted against `u` to have gone.
+@(private = "file")
+readers_gone :: proc(u: ^Upstream) -> bool {
+	start := time.tick_now()
+	for h2_readers_running(u) > 0 && time.tick_since(start) < 5 * time.Second {
+		time.sleep(time.Millisecond)
+	}
+	return h2_readers_running(u) == 0
+}
+
+@(private = "file")
+Replacement :: struct {
+	u:    ^Upstream,
+	conn: ^h2.Client,
+	done: sync.Sema,
+}
+
+@(private = "file")
+Loop_Hold :: struct {
+	holding: sync.Sema,
+	release: sync.Sema,
 }
 
 @(private = "file")
@@ -41,13 +124,9 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 	}
 	defer net.close(listener)
 	bound, _ := net.bound_endpoint(listener)
-	port, pok := dead_port(t)
-	if !pok {
-		return
-	}
 
 	u, uerr := make_upstream(
-		config.Upstream_Spec{name = "retire", kind = .TCP, address = "127.0.0.1", port = port, hostname = "doh.invalid", path = "/dns-query"},
+		config.Upstream_Spec{name = "retire", kind = .TCP, address = "127.0.0.1", port = bound.port, hostname = "doh.invalid", path = "/dns-query"},
 		8,
 		30 * time.Second,
 	)
@@ -55,6 +134,7 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 		return
 	}
 	defer destroy(u)
+	u.dial = refuse_dial
 
 	socket, derr := dial_tcp_timeout(bound, time.Second)
 	if !testing.expectf(t, derr == .None, "cannot dial the listener: %v", derr) {
@@ -62,9 +142,14 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 	}
 	// What `get_h2_conn` builds once ALPN says h2, minus the TLS.
 	_ = net.set_option(socket, .Receive_Timeout, H2_POLL_INTERVAL)
+	r, started := start_reader(t, u, Stream{socket = socket})
+	if !started {
+		return
+	}
+	defer stop_reader(&r)
+	hc := r.hc
 	sync.mutex_lock(&u.mu)
 	u.proto = .H2
-	hc := start_h2_conn(u, Stream{socket = socket})
 	u.h2 = hc
 	sync.mutex_unlock(&u.mu)
 
@@ -73,30 +158,50 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 		// is then closed before anyone retires it, and the last reference is
 		// the caller's rather than the reader's.
 		_ = net.shutdown(socket, .Receive)
-		for h2_readers_running(u) > 0 {
-			time.sleep(time.Millisecond)
-		}
+		testing.expect(t, readers_gone(u), "the reader did not leave when the peer hung up")
 	} else {
 		// A writer finding the connection dead, which is what leaves the
-		// reader still in its poll when the next caller comes to replace it.
-		// Given time to get there first: a reader not yet in its read sees
-		// `stopping` straight away, and the join cost nothing.
-		time.sleep(50 * time.Millisecond)
+		// reader still in its read when the next caller comes to replace it.
 		loop.lock(&hc.client.mu)
 		hc.client.closed = true
 		loop.unlock(&hc.client.mu)
-		testing.expect(t, h2_readers_running(u) > 0, "the premise: the reader is still polling")
 	}
 
-	start := time.tick_now()
-	// What the redial comes to is beside the point, and not asserted: tests
-	// run in parallel, and another may have bound the freed port since. The
-	// budget is short so a redial that does not fail at once cannot eat the
-	// margin below.
-	conn, _, _ := get_h2_conn(u, 200 * time.Millisecond, 20 * time.Millisecond)
-	took := time.tick_since(start)
-	testing.expect(t, conn == nil)
-	testing.expectf(t, took < H2_POLL_INTERVAL / 4, "replacing the connection took %v", took)
+	// The reader's loop is held while the connection is replaced, so the reader
+	// cannot run until the replacement is over: one that waited for the reader
+	// would wait for good, and is given five seconds to fail rather than hang.
+	hold: Loop_Hold
+	_, holding := loop.spawn(r.l, proc(data: rawptr) {
+		h := (^Loop_Hold)(data)
+		sync.sema_post(&h.holding)
+		// Blocks the loop's thread itself, which nothing on a loop may do
+		// outside a test.
+		sync.sema_wait(&h.release)
+	}, &hold)
+	if !testing.expect(t, holding && sync.sema_wait_with_timeout(&hold.holding, 5 * time.Second), "cannot hold the reader's loop") {
+		sync.sema_post(&hold.release)
+		return
+	}
+	// What the redial comes to is beside the point: the dial is refused.
+	rep := Replacement {
+		u = u,
+	}
+	th := thread.create_and_start_with_poly_data(&rep, proc(rep: ^Replacement) {
+		rep.conn, _, _ = get_h2_conn(rep.u, 200 * time.Millisecond, 20 * time.Millisecond)
+		sync.sema_post(&rep.done)
+	})
+	returned := sync.sema_wait_with_timeout(&rep.done, 5 * time.Second)
+	readers := h2_readers_running(u)
+	sync.sema_post(&hold.release)
+	if !returned {
+		// Ends the reader's read, which is what the replacement is waiting for.
+		loop.cancel_all(r.l)
+	}
+	thread.join(th)
+	thread.destroy(th)
+	testing.expect(t, returned, "replacing the connection waited for its reader")
+	testing.expect_value(t, readers, 0 if reader_gone else 1)
+	testing.expect(t, rep.conn == nil)
 	sync.mutex_lock(&u.mu)
 	testing.expect(t, u.h2 == nil)
 	sync.mutex_unlock(&u.mu)
@@ -104,11 +209,8 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 	// Nor does the retired reader sit out its poll: with no join to throttle
 	// replacements, each reader left polling would hold a fiber and a socket
 	// for up to H2_POLL_INTERVAL, as many as the upstream can be dialled in
-	// that time.
-	for h2_readers_running(u) > 0 && time.tick_since(start) < H2_POLL_INTERVAL / 2 {
-		time.sleep(time.Millisecond)
-	}
-	testing.expectf(t, h2_readers_running(u) == 0, "the retired reader was still polling after %v", time.tick_since(start))
+	// that time. Its loop's clock stands still, so only a wake ends its read.
+	testing.expect(t, readers_gone(u), "the retired reader was never woken from its read")
 }
 
 @(test)
@@ -158,10 +260,7 @@ test_finished_h2_readers_leave_no_count_behind :: proc(t: ^testing.T) {
 			retire_h2_conn(old)
 		}
 		_ = net.shutdown(socket, .Receive)
-		start := time.tick_now()
-		for h2_readers_running(u) > 0 && time.tick_since(start) < 3 * time.Second {
-			time.sleep(time.Millisecond)
-		}
+		_ = readers_gone(u)
 	}
 	testing.expect_value(t, h2_readers_running(u), 0)
 }
@@ -209,13 +308,11 @@ read_until_closed :: proc(p: ^Close_Notify_Peer) {
 Every h2 upstream is TLS, and retiring one shuts its socket down to wake the
 reader. With nothing sent first, the reader's EOF is a fatal error that stops
 `tlsx.close` sending close_notify (RFC 8446 6.1), and the alert that error
-writes onto the shut side raised SIGPIPE, which kills a process that has not
-ignored it.
+writes goes onto the shut side.
 */
 @(test)
 test_retiring_a_tls_h2_conn_sends_close_notify :: proc(t: ^testing.T) {
-	// SIGPIPE left alone: the close under test must not raise it.
-	f, fixture_ok := dot_fixture(t, client = true, ignore_sigpipe = false)
+	f, fixture_ok := dot_fixture(t, client = true)
 	if !fixture_ok {
 		return
 	}
@@ -255,18 +352,16 @@ test_retiring_a_tls_h2_conn_sends_close_notify :: proc(t: ^testing.T) {
 	// What `get_h2_conn` sets once ALPN says h2.
 	_ = net.set_option(stream.socket, .Receive_Timeout, H2_POLL_INTERVAL)
 	tlsx.set_timeouts(stream.tls, H2_POLL_INTERVAL, time.Second)
-	sync.mutex_lock(&u.mu)
-	hc := start_h2_conn(u, stream)
-	sync.mutex_unlock(&u.mu)
+	r, started := start_reader(t, u, stream)
+	if !started {
+		return
+	}
+	defer stop_reader(&r)
 
-	// In its poll, as in `replace_dead_h2`.
-	time.sleep(50 * time.Millisecond)
-	retire_h2_conn(hc)
+	retire_h2_conn(r.hc)
 	thread.join(peer_thread)
 	testing.expect_value(t, peer.ended, tlsx.Error.Closed)
-	for h2_readers_running(u) > 0 {
-		time.sleep(time.Millisecond)
-	}
+	testing.expect(t, readers_gone(u), "the retired reader was never woken from its read")
 }
 
 /*

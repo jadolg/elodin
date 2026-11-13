@@ -363,14 +363,14 @@ run_h2_cases :: proc(r: ^Runner) {
 				if check(r, cok, "cannot open an h2 connection") {
 					defer h2_close(c)
 
-					started := time.now()
+					started := time.tick_now()
 					ids := []u32{1, 3, 5, 7}
 					for id, i in ids {
 						q := build_query(fmt.tprintf("s%d.parallel.test.", i), u16(dns.Type.A), id = u16(id))
 						check(r, h2_send_request(c, id, "POST", "/dns-query", q), "cannot send stream %d", id)
 					}
 					if check(r, h2_collect(c, ids), "not every stream completed") {
-						elapsed := time.diff(started, time.now())
+						elapsed := time.tick_since(started)
 						for id in ids {
 							res, _ := h2_stream(c, id)
 							check(r, res.status == 200, "stream %d status %d", id, res.status)
@@ -415,8 +415,8 @@ run_h2_cases :: proc(r: ^Runner) {
 			never be the thing that fires.
 			*/
 			stalled := false
-			deadline := time.time_add(time.now(), CLIENT_TIMEOUT + 2 * time.Second)
-			for time.diff(deadline, time.now()) < 0 {
+			deadline := time.tick_add(time.tick_now(), CLIENT_TIMEOUT + 2 * time.Second)
+			for time.tick_diff(time.tick_now(), deadline) > 0 {
 				if res, found := h2_stream(c, 1); found && res.data_frames >= 1 {
 					stalled = true
 					break

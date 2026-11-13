@@ -1819,7 +1819,7 @@ or DoH mock to serve on, and with `client` a client context that does not verify
 it (the certificate is self-signed), offering `alpn`. The caller ends it with
 `dot_fixture_destroy`.
 
-`ignore_sigpipe` because a peer hanging up mid-handshake raises SIGPIPE on the
+SIGPIPE is ignored because a peer hanging up mid-handshake raises it on the
 write that follows, which the server ignores (see main.odin) and the test runner
 does not.
 */
@@ -1836,14 +1836,11 @@ dot_fixture :: proc(
 	t: ^testing.T,
 	client := false,
 	alpn: []string = nil,
-	ignore_sigpipe := true,
 ) -> (
 	f: Dot_Fixture,
 	ok: bool,
 ) {
-	if ignore_sigpipe {
-		posix.sigignore(.SIGPIPE)
-	}
+	posix.sigignore(.SIGPIPE)
 	sync.once_do(&dot_cert_once, generate_dot_certs)
 	if !testing.expect(t, dot_cert_ok, "no certificate available and openssl could not make one") {
 		return

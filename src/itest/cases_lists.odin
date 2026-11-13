@@ -5,6 +5,7 @@ import "core:net"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
 
@@ -259,6 +260,33 @@ listen_silent :: proc(r: ^Runner, port: int) -> (net.TCP_Socket, bool) {
 }
 
 /*
+Wait until the server's download has reached a silent host.
+
+The kernel completes the handshake and queues the connection, which nothing
+accepts, so a queued connection is the download parked on a reply that never
+comes. `tcpi_unacked` in a listening socket's TCP_INFO is that queue's depth;
+it sits 24 bytes in, behind eight one-byte fields and four u32s.
+*/
+@(private = "file")
+wait_parked :: proc(sock: net.TCP_Socket, timeout: time.Duration) -> bool {
+	start := time.tick_now()
+	for time.tick_since(start) < timeout {
+		info: [104]u8
+		size := posix.socklen_t(len(info))
+		if posix.getsockopt(posix.FD(sock), posix.IPPROTO_TCP, posix.Sock_Option(TCP_INFO), &info, &size) == .OK && size >= 28 {
+			if (^u32le)(&info[24])^ > 0 {
+				return true
+			}
+		}
+		time.sleep(PROBE_RETRY_PAUSE)
+	}
+	return false
+}
+
+@(private = "file")
+TCP_INFO :: 11
+
+/*
 Signals while a list download waits on a host that has stopped answering (#416).
 
 The rule sets are rebuilt off the maintenance loop, so a SIGHUP is acted on and a
@@ -285,8 +313,8 @@ run_list_refresh_signal_cases :: proc(r: ^Runner) {
 			config := config_for_refresh_signals(udp_port, upstream_port, silent_port)
 			if srv, ok := start_server_raw(r, config, udp_port, true); ok {
 				defer stop_server(&srv)
-				if check(r, wait_for_log(&srv, "list hosts-list: downloading", 5 * time.Second), "no download started") {
-					time.sleep(300 * time.Millisecond)
+				if check(r, wait_for_log(&srv, "list hosts-list: downloading", 5 * time.Second), "no download started") &&
+				   check(r, wait_parked(silent, 5 * time.Second), "the download never reached the silent host") {
 					state, exited := signal_shutdown(&srv, 5 * time.Second)
 					if check(r, exited, "the server did not exit within 5s of SIGTERM during the startup download") {
 						check(r, state.success && state.exit_code == 0, "exited with code %d (success=%v)", state.exit_code, state.success)
@@ -334,8 +362,8 @@ run_list_refresh_signal_cases :: proc(r: ^Runner) {
 			net.close(silent)
 		}
 		// The premise: a refresh has started its download and is waiting on it.
-		if listening && stalling && check(r, wait_for_log_count(&srv, "list hosts-list: downloading", 2, 45 * time.Second), "no refresh ran") {
-			time.sleep(500 * time.Millisecond)
+		if listening && stalling && check(r, wait_for_log_count(&srv, "list hosts-list: downloading", 2, 45 * time.Second), "no refresh ran") &&
+		   check(r, wait_parked(silent, 5 * time.Second), "the refresh never reached the silent host") {
 			check(r, !log_contains(&srv, "download failed"), "the download did not wait")
 
 			// A list added by the reload, from a host that stays silent.
@@ -368,7 +396,7 @@ run_list_refresh_signal_cases :: proc(r: ^Runner) {
 			net.close(silent)
 			listening = false
 			check(r, wait_for_log(&srv, "list stalled-list: downloading", 5 * time.Second), "the reload's rebuild did not download the added list")
-			time.sleep(300 * time.Millisecond)
+			check(r, wait_parked(stalled, 5 * time.Second), "the rebuild's download never reached the silent host")
 
 			state, exited := signal_shutdown(&srv, 5 * time.Second)
 			if check(r, exited, "the server did not exit within 5s of SIGTERM during a rebuild") {
@@ -387,8 +415,8 @@ mirror's error page served as a 200, or an empty file mid-publish (#317). None
 may be written over the cached copy: the list would go out of effect and the
 copy every later fallback reads with it. The page carries a line that parses as
 a hosts rule, so it is refused for being a page rather than for holding no
-rules. Each start here comes after the 1s refresh window, so each one downloads
-again, under the same list name and so the same cached copy.
+rules. Each start here finds the cached copy aged past the 1s refresh window, so
+each one downloads again, under the same list name and so the same cached copy.
 */
 run_list_bad_download_cases :: proc(r: ^Runner) {
 	http_port := next_port(r)
@@ -431,8 +459,13 @@ run_list_bad_download_cases :: proc(r: ^Runner) {
 	for step, i in steps {
 		start_case(r, step.name)
 		if i > 0 {
-			// Past the refresh window, so this start downloads again.
-			time.sleep(1100 * time.Millisecond)
+			// Aged past the refresh window, so this start downloads again: the
+			// window is read off the cached copy's mtime.
+			aged := time.time_add(time.now(), -time.Hour)
+			if err := os.change_times(cached, aged, aged); !check(r, err == nil, "cannot age the cached copy: %v", err) {
+				end_case(r)
+				continue
+			}
 		}
 		udp_port := next_port(r)
 		config := config_lists(udp_port, upstream_port, {list_entry("the-list", http_port, step.path)}, cache_dir = cache_dir)

@@ -1,6 +1,7 @@
 package server
 
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -34,9 +35,9 @@ behind it (issue #468).
 
 Without this, the first query after a popular name's entry expires waits a full
 upstream round trip - which a monitoring probe asking every fifteen seconds sees
-as a peak once in every TTL. The upstream here sits on the refresh for 400 ms,
-so a client that waited for it would get its address; the one served here gets
-the old one, and the cache ends up holding the new one.
+as a peak once in every TTL. The upstream here sits on the refresh until the
+client has been served, so a client that waited for it would get its address;
+the one served here gets the old one, and the cache ends up holding the new one.
 
 The client's lookup is one cache hit and one cached answer. The refresh is
 counted as a prefetch and nothing else: it is not a query anybody sent, so it
@@ -52,14 +53,18 @@ test_a_hit_near_expiry_is_refreshed_behind_the_client :: proc(t: ^testing.T) {
 	f.cfg.cache.serve_stale = false
 	age_to(f.answers, 20 * time.Second)
 
+	// The refresh's answer waits until the client has been served, so it
+	// cannot be what the client was served.
+	served_first: sync.Sema
 	x := Stale_Exchange {
 		socket = f.socket,
 		reply  = live_reply(),
-		delay  = 400 * time.Millisecond,
+		hold   = &served_first,
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
 
 	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	sync.sema_post(&served_first)
 	if !testing.expect(t, ok, "the cached answer went unserved") {
 		thread.join(mock)
 		thread.destroy(mock)

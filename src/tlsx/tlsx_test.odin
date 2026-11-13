@@ -1,12 +1,14 @@
 package tlsx
 
 import "core:c"
+import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:os"
 import "core:slice"
 import "core:strings"
 import "core:sync"
+import "core:sys/linux"
 import "core:sys/posix"
 import "core:testing"
 import "core:thread"
@@ -403,7 +405,7 @@ test_idle_reader_does_not_block_a_writer :: proc(t: ^testing.T) {
 	defer destroy_pair(&p)
 
 	// The client reads from a server that says nothing, so this parks until the
-	// receive timeout fires.
+	// server echoes the write below, or until the ten-second receive timeout.
 	idle := Idle_Ctx {
 		conn = p.client,
 	}
@@ -413,40 +415,64 @@ test_idle_reader_does_not_block_a_writer :: proc(t: ^testing.T) {
 		thread.destroy(idle_thread)
 	}
 
-	// Long enough for the reader to be inside its wait.
-	time.sleep(200 * time.Millisecond)
+	testing.expect(t, sync.sema_wait_with_timeout(&idle.reading, 5 * time.Second), "the reader never started")
+	testing.expect(t, wait_until_asleep(idle.tid), "the reader never parked in its wait")
 
 	payload := [8]u8{1, 2, 3, 4, 5, 6, 7, 8}
-	started := time.now()
 	_, werr := write(p.client, payload[:])
-	elapsed := time.diff(started, time.now())
-
 	testing.expect_value(t, werr, Error.None)
-	testing.expectf(
-		t,
-		elapsed < 2 * time.Second,
-		"the write waited %v behind a parked reader; it must not be serialised against one",
-		elapsed,
-	)
 
-	// Let the server drain, so the reader above is released rather than sitting
-	// out its full timeout.
+	// The echo is what ends the parked read. A write serialised behind that
+	// read goes out only once the read has timed out, and the echo then
+	// arrives for nobody.
 	echoed: [8]u8
 	read(p.server, echoed[:])
 	write(p.server, echoed[:])
+	thread.join(idle_thread)
+	testing.expect_value(t, idle.err, Error.None)
+	testing.expect_value(t, idle.n, len(payload))
 }
 
 @(private = "file")
 Idle_Ctx :: struct {
-	conn: ^Conn,
-	done: bool,
+	conn:    ^Conn,
+	tid:     linux.Pid,
+	reading: sync.Sema,
+	n:       int,
+	err:     Error,
 }
 
 @(private = "file")
 idle_worker :: proc(i: ^Idle_Ctx) {
-	defer sync.atomic_store(&i.done, true)
+	i.tid = linux.gettid()
+	sync.sema_post(&i.reading)
 	buf: [64]u8
-	read(i.conn, buf[:])
+	i.n, i.err = read(i.conn, buf[:])
+}
+
+/*
+Waits for thread `tid` of this process to be asleep, as `/proc` reports it:
+nothing it runs before the wait blocks, so asleep is in the wait. False after
+five seconds.
+*/
+@(private = "file")
+wait_until_asleep :: proc(tid: linux.Pid) -> bool {
+	path_buf: [64]u8
+	path := fmt.bprintf(path_buf[:], "/proc/self/task/%d/stat", tid)
+	deadline := time.tick_add(time.tick_now(), 5 * time.Second)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
+		data, err := os.read_entire_file(path, context.temp_allocator)
+		if err == nil {
+			// The state follows the command name, which may hold anything but
+			// ends at the last ')'.
+			stat := string(data)
+			if end := strings.last_index_byte(stat, ')'); end >= 0 && end + 2 < len(stat) && stat[end + 2] == 'S' {
+				return true
+			}
+		}
+		time.sleep(time.Millisecond)
+	}
+	return false
 }
 
 /*

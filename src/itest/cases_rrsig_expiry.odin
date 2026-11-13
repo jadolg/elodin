@@ -89,9 +89,15 @@ run_rrsig_expiry_cases :: proc(r: ^Runner) {
 	start_case(r, "cache: serve_stale does not serve an answer past its rrsig")
 	{
 		// Wait for the clock, not a duration: the case is about the expiration
-		// second having passed.
-		for u32(time.time_to_unix(time.now())) <= expiration {
+		// second having passed. Bounded on the tick clock, so a wall clock
+		// stepped back fails the case rather than hanging the run.
+		deadline := time.tick_add(time.tick_now(), 10 * time.Second)
+		for u32(time.time_to_unix(time.now())) <= expiration && time.tick_diff(time.tick_now(), deadline) > 0 {
 			time.sleep(100 * time.Millisecond)
+		}
+		if !check(r, u32(time.time_to_unix(time.now())) > expiration, "the wall clock never passed the rrsig's expiration") {
+			end_case(r)
+			return
 		}
 		mock_go_silent(mock)
 		res := query_udp(udp_port, build_query(RX_QNAME, u16(dns.Type.A), id = 2, edns_size = 1232, dnssec_ok = true))

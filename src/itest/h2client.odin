@@ -263,9 +263,9 @@ h2_send_window_update :: proc(c: ^H2_Client, stream_id: u32, increment: int) -> 
 Read frames until every stream in `wanted` has ended, or the deadline passes.
 */
 h2_collect :: proc(c: ^H2_Client, wanted: []u32, timeout := 10 * time.Second) -> bool {
-	deadline := time.time_add(time.now(), timeout)
+	deadline := time.tick_add(time.tick_now(), timeout)
 
-	for time.diff(deadline, time.now()) < 0 {
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
 		if h2_all_done(c, wanted) {
 			return true
 		}

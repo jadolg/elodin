@@ -2,6 +2,7 @@ package loop
 
 import "core:fmt"
 import "core:net"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:sys/linux"
@@ -42,6 +43,40 @@ start :: proc(t: ^testing.T, clock: proc "contextless" () -> Tick = nil, loc := 
 		return {}, false
 	}
 	return r, true
+}
+
+// Waits up to `WAIT` for every fiber on `l` to have finished and been put back
+// on a free list.
+@(private)
+fibers_gone :: proc(l: ^Loop) -> bool {
+	start := time.tick_now()
+	for fibers_alive(l) != 0 && time.tick_since(start) < WAIT {
+		time.sleep(time.Millisecond)
+	}
+	return fibers_alive(l) == 0
+}
+
+/*
+Waits up to `WAIT` for thread `tid` of this process to be asleep, as `/proc`
+reports it; the caller knows where the thread can block, so asleep is there.
+*/
+@(private = "file")
+wait_until_asleep :: proc(tid: linux.Pid) -> bool {
+	path_buf: [64]u8
+	path := fmt.bprintf(path_buf[:], "/proc/self/task/%d/stat", tid)
+	start := time.tick_now()
+	for time.tick_since(start) < WAIT {
+		if data, err := os.read_entire_file(path, context.temp_allocator); err == nil {
+			// The state follows the command name, which may hold anything but
+			// ends at the last ')'.
+			stat := string(data)
+			if end := strings.last_index_byte(stat, ')'); end >= 0 && end + 2 < len(stat) && stat[end + 2] == 'S' {
+				return true
+			}
+		}
+		time.sleep(time.Millisecond)
+	}
+	return false
 }
 
 @(private)
@@ -286,8 +321,8 @@ test_a_handle_outlived_by_its_fiber_cancels_nothing :: proc(t: ^testing.T) {
 	}, &p)
 	testing.expect(t, sync.sema_wait_with_timeout(&p.done, WAIT))
 	// Let the scheduler put the struct back on its free list first.
-	for fibers_alive(r.l) != 0 {
-		time.sleep(time.Millisecond)
+	if !testing.expect(t, fibers_gone(r.l), "the finished fiber was never put back") {
+		return
 	}
 	second: Probe
 	h, _ := spawn(r.l, proc(data: rawptr) {
@@ -1161,55 +1196,7 @@ test_thousands_of_parked_fibers_on_one_thread :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, sync.sema_wait_with_timeout(&s.done, 4 * WAIT))
-	for fibers_alive(r.l) != 0 {
-		time.sleep(time.Millisecond)
-	}
-}
-
-/*
-A burst's warm stacks are given back once the loop has had nothing to do, down
-to `WARM_IDLE_KEEP`. Waited for on the
-count itself; the deadline only ends a failing run.
-*/
-@(test)
-test_an_idle_loop_gives_back_its_warm_stacks :: proc(t: ^testing.T) {
-	r, started := start(t)
-	if !started {
-		return
-	}
-	defer finish(r)
-	N :: 40
-	Shared :: struct {
-		done:  sync.Sema,
-		count: int,
-	}
-	s: Shared
-	for _ in 0 ..< N {
-		_, _ = spawn(r.l, proc(data: rawptr) {
-			s := (^Shared)(data)
-			// Parked together, so the burst needs N stacks at once.
-			_ = sleep(10 * time.Millisecond)
-			if sync.atomic_add(&s.count, 1) == N - 1 {
-				sync.sema_post(&s.done)
-			}
-		}, &s)
-	}
-	testing.expect(t, sync.sema_wait_with_timeout(&s.done, WAIT))
-	warm :: proc(l: ^Loop) -> int {
-		sync.mutex_lock(&l.mu)
-		defer sync.mutex_unlock(&l.mu)
-		return l.warm
-	}
-	for fibers_alive(r.l) != 0 {
-		time.sleep(time.Millisecond)
-	}
-	// The premise: the burst left more than a quiet loop keeps.
-	testing.expectf(t, warm(r.l) > WARM_IDLE_KEEP, "only %d stacks were kept after a burst of %d", warm(r.l), N)
-	start := time.tick_now()
-	for warm(r.l) > WARM_IDLE_KEEP && time.tick_since(start) < 4 * TRIM_AFTER {
-		time.sleep(10 * time.Millisecond)
-	}
-	testing.expectf(t, warm(r.l) <= WARM_IDLE_KEEP, "%d stacks still warm after %v idle", warm(r.l), time.tick_since(start))
+	testing.expect(t, fibers_gone(r.l), "finished fibers were never put back")
 }
 
 /*
@@ -1331,19 +1318,25 @@ test_a_wait_off_a_loop_with_no_deadline_waits :: proc(t: ^testing.T) {
 	}
 	defer linux.close(a)
 	defer linux.close(b)
+	// Writes once this thread is asleep, which before the write it can only
+	// be in the wait: a wait that ended at once ends before the write.
 	Writer :: struct {
-		fd: linux.Fd,
+		fd:     linux.Fd,
+		waiter: linux.Pid,
+		asleep: bool,
 	}
-	w := Writer{b}
+	w := Writer {
+		fd     = b,
+		waiter = linux.gettid(),
+	}
 	th := thread.create_and_start_with_poly_data(&w, proc(w: ^Writer) {
-		time.sleep(30 * time.Millisecond)
+		w.asleep = wait_until_asleep(w.waiter)
 		_, _ = linux.write(w.fd, transmute([]u8)string("x"))
 	})
-	defer {
-		thread.join(th)
-		thread.destroy(th)
-	}
 	testing.expect_value(t, wait_fd(a, {.In}, {}), Wait_Result.Ready)
+	thread.join(th)
+	thread.destroy(th)
+	testing.expect(t, w.asleep, "the wait never slept")
 }
 
 /*

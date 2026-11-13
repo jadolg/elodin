@@ -713,11 +713,11 @@ a port nobody is listening on draws an ICMP refusal, and the exchange fails at
 once, which is the *fast* failure `serve_stale` already covered. Here nothing
 comes back and nothing is refused, so only the timeout ends the attempt.
 
-The budget below is two seconds and the timer is 150 ms, so the assertion has
-850 ms of slack in it - enough that a loaded runner cannot fail it without also
-being a second behind, and tight enough that waiting out the upstream cannot
-pass. Set `cache.stale_timeout` to 0 - the escape hatch - and this case takes the
-whole two seconds and fails.
+Asserted as an order rather than a duration: the client is answered while the
+refresh it started is still out (`queries_pending`), which a client that waited
+the upstream out cannot see, since the refresh ends with the budget. Set
+`cache.stale_timeout` to 0 - the escape hatch - and nothing is detached, the
+client waits the whole two seconds, and this fails.
 */
 @(test)
 test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T) {
@@ -727,9 +727,8 @@ test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T)
 	}
 	defer stale_fixture_stop(&f)
 
-	begun := time.now()
 	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	waited := time.since(begun)
+	refreshing := queries_pending(&f.srv)
 
 	if !testing.expect(t, ok, "the stale answer went unserved") {
 		return
@@ -737,9 +736,9 @@ test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T)
 	testing.expect_value(t, outcome, Outcome.Cached)
 	testing.expectf(
 		t,
-		waited < 1 * time.Second,
-		"the client waited %v for an expired entry it could have had at once; the upstream budget is %v",
-		waited,
+		refreshing == 1,
+		"the client was answered with %d refreshes out, want the one still waiting on the %v upstream budget",
+		refreshing,
 		time.Duration(f.cfg.upstream.attempts) * f.cfg.upstream.timeout,
 	)
 
@@ -791,8 +790,9 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 	}
 	defer stale_fixture_stop(&f)
 
+	// Each client is answered while the one refresh is still out, so none of
+	// them waited the upstream out.
 	for i in 0 ..< 4 {
-		begun := time.now()
 		_, outcome, ok := handle_query(
 			&f.srv,
 			stale_query(true),
@@ -800,10 +800,9 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 			"127.0.0.1:5555",
 			context.temp_allocator,
 		)
-		waited := time.since(begun)
 		testing.expectf(t, ok, "query %d went unanswered", i)
 		testing.expect_value(t, outcome, Outcome.Cached)
-		testing.expectf(t, waited < 1 * time.Second, "query %d waited %v", i, waited)
+		testing.expectf(t, queries_pending(&f.srv) == 1, "query %d was answered with %d refreshes out, want 1", i, queries_pending(&f.srv))
 	}
 
 	/*
@@ -837,10 +836,10 @@ over again. Without it a slow upstream - one that answers, but later than the
 timer - would leave a name stale for the whole of `MAX_STALE`, since every
 client would be answered from the entry and every refresh abandoned.
 
-The upstream here answers 400 ms after it is asked, against a 100 ms timer, so
-the client is certainly served from the entry and the refresh certainly
-succeeds. The two addresses differ, which is what says which of them the cache
-ended up holding.
+The upstream here holds its answer until the client has been served, so the
+client is certainly served from the entry when the 100 ms timer fires and the
+refresh certainly succeeds after it. The two addresses differ, which is what says
+which of them the cache ended up holding.
 */
 @(test)
 test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
@@ -850,15 +849,19 @@ test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
 	}
 	defer stale_fixture_stop(&f)
 
+	served_first: sync.Sema
 	x := Stale_Exchange {
 		socket = f.socket,
 		reply  = live_reply(),
-		delay  = 400 * time.Millisecond,
+		hold   = &served_first,
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
 
 	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	sync.sema_post(&served_first)
 	if !testing.expect(t, ok, "the stale answer went unserved") {
+		thread.join(mock)
+		thread.destroy(mock)
 		return
 	}
 	testing.expect_value(t, outcome, Outcome.Cached)
@@ -956,13 +959,14 @@ and by nothing at all downstream of it - which is the half an operator actually
 relies on when they decide they would rather wait than be handed data known to
 be out of date.
 
-Asserted as the wait rather than as an absence, because the wait is the whole of
-what the setting buys. The upstream is the same blackholed socket the case above
-uses and the budget is one 400 ms attempt, so a client on the timer path would
-have been answered in a fraction of it; this one has to still be waiting when
-the attempt times out. The datagram count says the upstream was asked at all -
-it cannot tell the two paths apart, since either way exactly one query goes out,
-which is why the clock is what carries this.
+Asserted as where the attempt ran rather than as how long it took. The upstream
+is the same blackholed socket the case above uses, so only its timeout ends an
+attempt. Nothing is detached - `queries_pending` is zero as the client is
+answered, where the timer path leaves its refresh still out - so the one query
+the upstream was sent is this thread's own, and the stale answer could only come
+after that attempt had timed out. The datagram count says the upstream was
+asked at all; on its own it cannot tell the two paths apart, since either way
+exactly one query goes out.
 
 An event loop is built and handed over, which is the point of the case: with
 no loop there is nothing to detach onto and the fall-through happens for a
@@ -979,25 +983,18 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 	}
 	defer stale_fixture_stop(&f)
 
-	begun := time.now()
 	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	waited := time.since(begun)
+	detached := queries_pending(&f.srv)
 
 	if !testing.expect(t, ok, "the stale answer went unserved") {
 		return
 	}
 	testing.expect_value(t, outcome, Outcome.Cached)
-	/*
-	The attempt cannot come back before its own timeout: there is nothing at the
-	other end to answer it and nothing to refuse it, so `SO_RCVTIMEO` is what
-	ends it. A margin of a tenth for the clock, which still leaves this an order
-	of magnitude away from what the timer path would have measured.
-	*/
 	testing.expectf(
 		t,
-		waited >= 360 * time.Millisecond,
-		"the client waited %v, which is not the %v upstream budget this setting asks it to wait",
-		waited,
+		detached == 0,
+		"the client was answered with %d refreshes still out, where this setting has it wait the %v upstream budget itself",
+		detached,
 		time.Duration(f.cfg.upstream.attempts) * f.cfg.upstream.timeout,
 	)
 

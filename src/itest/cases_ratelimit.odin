@@ -830,11 +830,11 @@ the socket gets `CLIENT_TIMEOUT` for that, as `query_tcp` gives it.
 */
 @(private = "file")
 query_tcp_once_bound :: proc(tcp_port: int, query: []u8, timeout: time.Duration) -> Query_Result {
-	deadline := time.time_add(time.now(), timeout)
+	deadline := time.tick_add(time.tick_now(), timeout)
 	for {
 		conn, dialled := dial_tcp(tcp_port)
 		if !dialled {
-			if time.diff(deadline, time.now()) >= 0 {
+			if time.tick_diff(time.tick_now(), deadline) <= 0 {
 				return {}
 			}
 			continue

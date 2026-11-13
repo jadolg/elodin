@@ -135,9 +135,9 @@ parity_ask_udp :: proc(host: string, port: int, query: []u8) -> (answer: []u8, o
 	// timeout restarts on every `recv_udp`, so a stream of datagrams carrying
 	// other transaction ids would keep this loop alive indefinitely; the
 	// equivalent loop in src/upstream/plain.odin is bounded the same way.
-	deadline := time.time_add(time.now(), CLIENT_TIMEOUT)
+	deadline := time.tick_add(time.tick_now(), CLIENT_TIMEOUT)
 	for {
-		if time.diff(deadline, time.now()) > 0 {
+		if time.tick_diff(time.tick_now(), deadline) < 0 {
 			return nil, false
 		}
 		n, _, rerr := net.recv_udp(socket, buf)

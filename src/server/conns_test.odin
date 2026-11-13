@@ -20,17 +20,20 @@ share one client may hold every slot there is.
 @(private = "file")
 returns_immediately :: proc(data: rawptr) {}
 
+// Every connection spawned on one `Held` runs until `release` wakes them all.
 @(private = "file")
 Held :: struct {
-	go: bool,
+	go: sync.One_Shot_Event,
 }
 
 @(private = "file")
 holds_until_released :: proc(data: rawptr) {
-	h := cast(^Held)data
-	for !sync.atomic_load(&h.go) {
-		time.sleep(time.Millisecond)
-	}
+	sync.one_shot_event_wait(&(^Held)(data).go)
+}
+
+@(private = "file")
+release :: proc(h: ^Held) {
+	sync.one_shot_event_signal(&h.go)
 }
 
 // The active count once it reaches `want`, or as it stands after two seconds.
@@ -71,7 +74,7 @@ test_a_permanent_entry_leaving_keeps_the_count_honest :: proc(t: ^testing.T) {
 
 	// With the tally corrected, the one slot the limit allows is still one slot.
 	held := Held{}
-	defer sync.atomic_store(&held.go, true)
+	defer release(&held)
 	testing.expect_value(t, conn_spawn(&cm, &held, holds_until_released), Spawn_Result.Started)
 	testing.expect_value(t, active_connections(&cm), 1)
 	/*
@@ -109,7 +112,7 @@ test_one_prefix_cannot_hold_every_slot :: proc(t: ^testing.T) {
 	defer conn_manager_shutdown(&cm)
 
 	held := Held{}
-	defer sync.atomic_store(&held.go, true)
+	defer release(&held)
 
 	// Two addresses in one /24 and one in the next, which is the granularity
 	// `client_prefix` reads a client at - so the first two are the same client
@@ -146,7 +149,7 @@ test_the_prefix_share_holds_for_v6_too :: proc(t: ^testing.T) {
 	defer conn_manager_shutdown(&cm)
 
 	held := Held{}
-	defer sync.atomic_store(&held.go, true)
+	defer release(&held)
 
 	// 2001:db8::1 and 2001:db8::dead:beef, which differ below the /64 and are
 	// therefore one client; then 2001:db8:0:1::1, which is the next /64 along.
@@ -186,7 +189,7 @@ test_a_finished_connection_gives_its_share_back :: proc(t: ^testing.T) {
 	testing.expect_value(t, wait_for_active(&cm, 0), 0)
 
 	held := Held{}
-	defer sync.atomic_store(&held.go, true)
+	defer release(&held)
 	testing.expect_value(t, conn_spawn(&cm, &held, holds_until_released, client), Spawn_Result.Started)
 }
 
@@ -208,7 +211,7 @@ test_a_full_table_is_not_blamed_on_the_client :: proc(t: ^testing.T) {
 	defer conn_manager_shutdown(&cm)
 
 	held := Held{}
-	defer sync.atomic_store(&held.go, true)
+	defer release(&held)
 
 	client := client_prefix(net.IP4_Address{192, 0, 2, 1})
 	testing.expect_value(t, conn_spawn(&cm, &held, holds_until_released, client), Spawn_Result.Started)
@@ -232,7 +235,7 @@ test_no_share_lets_one_client_have_the_table :: proc(t: ^testing.T) {
 	defer conn_manager_shutdown(&cm)
 
 	held := Held{}
-	defer sync.atomic_store(&held.go, true)
+	defer release(&held)
 
 	client := client_prefix(net.IP4_Address{192, 0, 2, 1})
 	for i in 0 ..< 3 {
@@ -263,7 +266,7 @@ test_the_listener_loops_spend_nobodys_share :: proc(t: ^testing.T) {
 	defer conn_manager_shutdown(&cm)
 
 	held := Held{}
-	defer sync.atomic_store(&held.go, true)
+	defer release(&held)
 
 	testing.expect_value(
 		t,
@@ -293,7 +296,7 @@ test_spawn_after_shutdown_is_refused :: proc(t: ^testing.T) {
 	listener := Held{}
 	testing.expect_value(t, conn_spawn(&cm, &listener, holds_until_released, counted = false), Spawn_Result.Started)
 
-	sync.atomic_store(&listener.go, true)
+	release(&listener)
 	conn_manager_shutdown(&cm)
 	testing.expect_value(t, active_connections(&cm), 0)
 
@@ -312,7 +315,7 @@ test_spawn_after_shutdown_is_refused :: proc(t: ^testing.T) {
 	testing.expect_value(t, active_connections(&cm), 0)
 	// Released before the second shutdown rather than deferred past it, so a
 	// late thread that did start fails the case instead of hanging the join.
-	sync.atomic_store(&late.go, true)
+	release(&late)
 	conn_manager_shutdown(&cm)
 }
 
@@ -343,7 +346,8 @@ test_a_connection_being_joined_is_still_counted :: proc(t: ^testing.T) {
 	cm: Conn_Manager
 	conn_manager_init(&cm, 4, 0)
 
-	listener := Held{go = true}
+	listener: Held
+	release(&listener)
 	testing.expect_value(t, conn_spawn(&cm, &listener, holds_until_released, counted = false), Spawn_Result.Started)
 	client := Held{}
 	testing.expect_value(t, conn_spawn(&cm, &client, holds_until_released), Spawn_Result.Started)
@@ -352,7 +356,7 @@ test_a_connection_being_joined_is_still_counted :: proc(t: ^testing.T) {
 	testing.expect(t, stopped, "the shutdown never marked the manager stopped")
 	testing.expect_value(t, active_connections(&cm), 1)
 
-	sync.atomic_store(&client.go, true)
+	release(&client)
 	thread.join(shutdown)
 	thread.destroy(shutdown)
 	testing.expect_value(t, active_connections(&cm), 0)
@@ -379,10 +383,10 @@ test_a_connection_closed_during_shutdown_is_not_counted :: proc(t: ^testing.T) {
 
 	shutdown, stopped := start_shutdown(&cm)
 	testing.expect(t, stopped, "the shutdown never marked the manager stopped")
-	sync.atomic_store(&older.go, true)
+	release(&older)
 	testing.expect_value(t, wait_for_active(&cm, 1), 1)
 
-	sync.atomic_store(&newer.go, true)
+	release(&newer)
 	thread.join(shutdown)
 	thread.destroy(shutdown)
 	testing.expect_value(t, active_connections(&cm), 0)

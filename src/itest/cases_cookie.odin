@@ -267,8 +267,8 @@ run_cookie_rate_limit_cases :: proc(r: ^Runner, upstream_port: int) {
 			answer: []u8
 			plain_answered := false
 			buf: [4096]u8
-			deadline := time.time_add(time.now(), 2 * time.Second)
-			for time.diff(time.now(), deadline) > 0 {
+			deadline := time.tick_add(time.tick_now(), 2 * time.Second)
+			for time.tick_diff(time.tick_now(), deadline) > 0 {
 				n, _, rerr := net.recv_udp(probe, buf[:])
 				if rerr != nil {
 					if answer != nil {
@@ -440,9 +440,9 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 			timeout produces a datagram too. So this checks the rcode, and that
 			it did not take an upstream timeout to produce it.
 			*/
-			started := time.now()
+			started := time.tick_now()
 			res := query_udp(udp_port, build_query("plain.example.", u16(dns.Type.A), id = 0x4248))
-			elapsed := time.diff(started, time.now())
+			elapsed := time.tick_since(started)
 			if check(r, res.ok, "no response") {
 				h := parse_header(r, res.wire)
 				check(

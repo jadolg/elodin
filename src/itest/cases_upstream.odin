@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:sync"
 import "core:time"
 import "elodin:dns"
 
@@ -159,9 +160,9 @@ run_strategy_cases :: proc(r: ^Runner) {
 			if ok {
 				start_case(r, "strategy: race returns the first answer to arrive")
 				{
-					started := time.now()
+					started := time.tick_now()
 					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A)))
-					elapsed := time.diff(started, time.now())
+					elapsed := time.tick_since(started)
 					if check(r, res.ok, "no response") {
 						check_eq_str(r, first_address(r, res.wire), "198.51.100.8", "winning upstream")
 						check(
@@ -232,9 +233,9 @@ run_strategy_cases :: proc(r: ^Runner) {
 					for i in 0 ..< 3 {
 						_ = query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = u16(100 + i)))
 					}
-					started := time.now()
+					started := time.tick_now()
 					res := query_udp(udp_port, build_query(QNAME, u16(dns.Type.A), id = 200))
-					elapsed := time.diff(started, time.now())
+					elapsed := time.tick_since(started)
 
 					if check(r, res.ok, "no response after the cooldown started") {
 						check_eq_str(r, first_address(r, res.wire), "198.51.100.7", "answering upstream")
@@ -582,14 +583,21 @@ run_stale_connection_cases :: proc(r: ^Runner) {
 
 		start_case(r, fmt.tprintf("upstream: a dropped %s connection is retried, not reported as failure", c.name))
 		{
+			// Counted from here, so a close from before the first query is not
+			// taken for the pooled connection's.
+			closed_before := sync.atomic_load(&mock.idle_closes)
 			first := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 1))
 			if check(r, first.ok, "the first query failed") {
 				h := parse_header(r, first.wire)
 				check_eq_int(r, h.ancount, fix.ancount, "answer count on the first query")
 			}
 
-			// Let the mock drop the pooled connection.
-			time.sleep(600 * time.Millisecond)
+			// The premise: the mock has dropped the pooled connection.
+			if !check(r, mock_wait_idle_closes(mock, closed_before + 1, 5 * time.Second), "the mock never dropped the idle connection") {
+				end_case(r)
+				stop_server(&srv)
+				continue
+			}
 
 			second := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 2))
 			if check(r, second.ok, "no response after the pooled connection went stale") {

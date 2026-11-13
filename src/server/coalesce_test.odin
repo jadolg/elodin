@@ -484,7 +484,7 @@ failure.
 @(test)
 test_followers_of_another_message_ask_for_themselves :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, other_message = true, silent = true, timeout = 1 * time.Second, hold_for = 0, land_after = 50 * time.Millisecond)
+	queries := run_burst(t, &clients, other_message = true, silent = true, timeout = 1 * time.Second, hold_for = 0)
 	testing.expectf(t, queries == CLIENTS, "the upstream saw %d queries for %d clients, want %d", queries, CLIENTS, CLIENTS)
 }
 
@@ -536,7 +536,7 @@ test_a_refusal_is_shared_only_between_identical_messages :: proc(t: ^testing.T) 
 		testing.expectf(t, queries == 1 && refused == CLIENTS, "%v asked both ways: %d queries and %d refusals, want 1 and %d", rcode, queries, refused, CLIENTS)
 
 		other: [CLIENTS]Client
-		queries = run_burst(t, &other, first = rcode, other_message = true, hold_for = 0, land_after = 50 * time.Millisecond)
+		queries = run_burst(t, &other, first = rcode, other_message = true, hold_for = 0)
 		// The mock answers the first query to reach it with `rcode` too: one
 		// follower's own, not the leader's handed on.
 		answered: int
@@ -762,7 +762,7 @@ test_with_the_cache_off_only_identical_messages_share_an_answer :: proc(t: ^test
 	queries := run_burst(t, &alike, cache_on = false, mixed = true)
 	testing.expectf(t, queries == 1, "identical: the upstream saw %d queries, want 1", queries)
 	apart: [CLIENTS]Client
-	queries = run_burst(t, &apart, cache_on = false, other_message = true, hold_for = 0, land_after = 50 * time.Millisecond)
+	queries = run_burst(t, &apart, cache_on = false, other_message = true, hold_for = 0)
 	testing.expectf(t, queries == CLIENTS, "different: the upstream saw %d queries, want %d", queries, CLIENTS)
 	for c, i in apart {
 		testing.expectf(t, c.ok && c.addr == {192, 0, 2, 7}, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
@@ -957,8 +957,8 @@ Late_Leader :: struct {
 // exchange came back just past the deadline would.
 @(private = "file")
 land_late :: proc(l: ^Late_Leader) {
-	for time.tick_diff(time.tick_now(), l.at) > 0 {
-		time.sleep(time.Millisecond)
+	if left := time.tick_diff(time.tick_now(), l.at); left > 0 {
+		time.sleep(left)
 	}
 	l.flight.answer = l.answer
 	flight_land(l.srv, l.flight)

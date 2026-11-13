@@ -169,7 +169,7 @@ main :: proc() {
 	}
 	fmt.println()
 
-	started := time.now()
+	started := time.tick_now()
 
 	if parity {
 		/*
@@ -192,7 +192,7 @@ main :: proc() {
 		fmt.printfln("  parity seed: %d", parity_opts.seed)
 		section(&r, "response parity with the upstream")
 		run_parity_cases(&r, parity_opts)
-		elapsed := time.diff(started, time.now())
+		elapsed := time.tick_since(started)
 		report(&r, elapsed)
 		if r.failed > 0 {
 			os.exit(1)
@@ -341,7 +341,7 @@ main :: proc() {
 	section(&r, "response parity: the live run's clock check")
 	run_parity_clock_cases(&r)
 
-	elapsed := time.diff(started, time.now())
+	elapsed := time.tick_since(started)
 	report(&r, elapsed)
 
 	if r.failed > 0 {
