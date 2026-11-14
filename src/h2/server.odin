@@ -186,6 +186,9 @@ Conn :: struct {
 	decoder:        Dynamic_Table,
 	streams:        map[u32]^Stream,
 	last_stream_id: u32,
+	// The highest stream a handler has been given: what a GOAWAY for this
+	// end's own memory names as the last stream it may have acted on.
+	last_dispatched: u32,
 	goaway_sent:    bool,
 	/*
 	How many more DATA frames for a stream that was opened and has since
@@ -355,8 +358,9 @@ serve :: proc(c: ^Conn) {
 	for {
 		h, payload, refuse, ok := read_frame(c.io, c.continuation_on)
 		if !ok {
+			// INTERNAL_ERROR is a payload this end had no room for.
 			if code, bad := refuse.?; bad {
-				goaway(c, code)
+				goaway(c, code, dry = code == .Internal_Error)
 			}
 			return
 		}
@@ -700,7 +704,6 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			return false
 		}
 	} else {
-		prev_stream_id := c.last_stream_id
 		c.last_stream_id = h.stream_id
 
 		/*
@@ -721,11 +724,8 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		// decoded in step with the peer's encoder: the connection ends.
 		if s == nil || map_insert(&c.streams, h.stream_id, s) == nil {
 			free(s, c.allocator)
-			// Never acted on, so the GOAWAY leaves the client free to retry it
-			// (RFC 9113 6.8).
-			c.last_stream_id = prev_stream_id
 			loop.unlock(&c.mu)
-			goaway(c, .Internal_Error)
+			goaway(c, .Internal_Error, dry = true)
 			return false
 		}
 		s.id = h.stream_id
@@ -750,7 +750,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		delete(c.header_block)
 		c.header_block = make([dynamic]u8, 0, len(block), c.allocator)
 		if !append_whole(&c.header_block, block) {
-			goaway_dry(c, c.block_stream)
+			goaway(c, .Internal_Error, dry = true)
 			return false
 		}
 		c.continuation_on = h.stream_id
@@ -764,11 +764,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	complete, refuse := continue_header_block(&c.continuation_on, &c.continuation_frames, &c.header_block, h, payload)
 	if code, bad := refuse.?; bad {
-		if code == .Internal_Error {
-			goaway_dry(c, c.block_stream)
-		} else {
-			goaway(c, code)
-		}
+		goaway(c, code, dry = code == .Internal_Error)
 		return false
 	}
 	if !complete {
@@ -1029,12 +1025,9 @@ finish_headers :: proc(c: ^Conn, s: ^Stream, block: []u8) -> bool {
 	delete(c.header_block)
 	c.header_block = nil
 	c.block_stream = nil
-	if err == .Out_Of_Memory {
-		goaway_dry(c, s)
-		return false
-	}
 	if err != .None {
-		goaway(c, .Compression_Error)
+		dry := err == .Out_Of_Memory
+		goaway(c, .Internal_Error if dry else .Compression_Error, dry = dry)
 		return false
 	}
 
@@ -1385,6 +1378,7 @@ dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
 	// as one nobody was ever given.
 	loop.lock(&c.mu)
 	s.dispatched = true
+	c.last_dispatched = max(c.last_dispatched, s.id)
 	loop.unlock(&c.mu)
 	c.handler(c, req)
 	// A handler can end the connection too, through `shutdown`, and nothing is
@@ -1486,34 +1480,22 @@ was_reset_here :: proc(c: ^Conn, stream_id: u32, forget := false) -> bool {
 }
 
 @(private)
-goaway :: proc(c: ^Conn, code: Error_Code) {
+goaway :: proc(c: ^Conn, code: Error_Code, dry := false) {
 	loop.lock(&c.mu)
 	if c.goaway_sent {
 		loop.unlock(&c.mu)
 		return
 	}
 	c.goaway_sent = true
-	last := c.last_stream_id
+	/*
+	`dry`: this end has no room to go on. A stream that was only read, or
+	parked for its body, was not acted on, and the last stream id leaves it out
+	so the client may retry it (RFC 9113 6.8).
+	*/
+	last := c.last_dispatched if dry else c.last_stream_id
 	loop.unlock(&c.mu)
 	frame := goaway_frame(last, code)
 	_ = write_all(c, frame[:])
-}
-
-/*
-End the connection for want of room to read the header block that opens `s`, or
-continues it (nil for one no stream is waiting on): GOAWAY(INTERNAL_ERROR), no
-fault of the peer's (RFC 9113 7). A stream nothing has acted on is taken off the
-last stream id, so the client may retry it (RFC 9113 6.8); the ids below it, odd
-and increasing, all still fall under the one that replaces it.
-*/
-@(private)
-goaway_dry :: proc(c: ^Conn, s: ^Stream) {
-	loop.lock(&c.mu)
-	if s != nil && s.id == c.last_stream_id && s.pending == nil && !s.dispatched {
-		c.last_stream_id = s.id - 2 if s.id > 2 else 0
-	}
-	loop.unlock(&c.mu)
-	goaway(c, .Internal_Error)
 }
 
 /*
@@ -1667,6 +1649,7 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 			if s, found := c.streams[stream_id]; found {
 				s.send_window += chunk
 			}
+			loop.cond_broadcast(&c.cond)
 			loop.unlock(&c.mu)
 			abandon_response(c, stream_id)
 			return false

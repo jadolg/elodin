@@ -87,8 +87,9 @@ Client_Stream :: struct {
 	// Set once the response is complete (headers with END_STREAM, or the DATA
 	// frame that carries it).
 	done:        bool,
-	// Set when the peer resets the stream; `refused` when it did so with
-	// REFUSED_STREAM, which says the request was never processed.
+	// Set when either end resets the stream, which fails the request;
+	// `refused` when the peer did so with REFUSED_STREAM, which says the
+	// request was never processed.
 	reset:       bool,
 	refused:     bool,
 	send_window: int,
@@ -736,6 +737,7 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 			}
 			if dry {
 				s.reset = true
+				s.rst_sent = true
 				s.dry = true
 			} else {
 				append(&s.body, ..data)

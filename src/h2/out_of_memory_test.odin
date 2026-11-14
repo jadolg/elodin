@@ -1,7 +1,10 @@
 package h2
 
 import "core:mem"
+import "core:sync"
 import "core:testing"
+import "core:thread"
+import "core:time"
 
 import "elodin:loop"
 
@@ -1014,8 +1017,8 @@ test_control_frames_need_no_room :: proc(t: ^testing.T) {
 /*
 A CONTINUATION the server has no room to add ends the connection with
 GOAWAY(INTERNAL_ERROR), and leaves the request it was continuing free to retry
-(RFC 9113 6.8): nothing acted on it. With room, the block completes and the
-request is served.
+(RFC 9113 6.8): nothing acted on it, though a stream the handler was given
+before it is named. With room, the block completes and the request is served.
 */
 @(test)
 test_a_header_block_continued_without_room_can_be_retried :: proc(t: ^testing.T) {
@@ -1036,24 +1039,205 @@ test_a_header_block_continued_without_room_can_be_retried :: proc(t: ^testing.T)
 			delete(log.frames)
 			return
 		}
-		opened := handle_headers(c, Frame_Header{length = half, type = .Headers, flags = FLAG_END_STREAM, stream_id = 1}, block[:half])
+		served := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+		testing.expect(t, served && seen.whole == 1, "the first request was not served")
+		opened := handle_headers(c, Frame_Header{length = half, type = .Headers, flags = FLAG_END_STREAM, stream_id = 3}, block[:half])
 		testing.expect(t, opened, "the block was not opened")
 		if refuse {
 			// The held block grows to take the rest.
 			arm(&f, 1, 1)
 		}
 		rest := block[half:]
-		ok := handle_continuation(c, Frame_Header{length = len(rest), type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 1}, rest)
+		ok := handle_continuation(c, Frame_Header{length = len(rest), type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 3}, rest)
 		if refuse {
 			testing.expect(t, !ok && refused_any(&f), "a CONTINUATION without room was added")
 			testing.expect_value(t, log.goaway_code, Error_Code.Internal_Error)
-			testing.expect_value(t, log.goaway_last, u32(0))
+			testing.expect_value(t, log.goaway_last, u32(1))
 		} else {
 			testing.expect(t, ok, "a CONTINUATION with room was refused")
-			testing.expect_value(t, seen.whole, 1)
+			testing.expect_value(t, seen.whole, 2)
 		}
 		conn_unref(c)
 		delete(log.frames)
 	}
 	expect_no_leaks(t, &track, "continuation without room")
+}
+
+/*
+A frame the server has no room to read ends the connection with
+GOAWAY(INTERNAL_ERROR) and leaves the request it belonged to free to retry
+(RFC 9113 6.8): here a CONTINUATION, whose payload `read_frame` is the first to
+need room for, so the refusal lands before the block it would continue. Swept
+over the temp arena `serve` reads frames into.
+*/
+@(test)
+test_a_frame_the_server_has_no_room_to_read_leaves_its_request_retryable :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	defer free_all(context.temp_allocator)
+	block := request_block()
+	half := len(block) / 2
+	// Not in the temp arena, which `serve` frees after every frame.
+	input := make([dynamic]u8, 0, 128, allocator)
+	// The preface ends with the client's SETTINGS (RFC 9113 3.4).
+	append(&input, PREFACE)
+	write_frame_header(&input, 0, .Settings, 0, 0)
+	write_frame_header(&input, half, .Headers, FLAG_END_STREAM, 1)
+	append(&input, ..block[:half])
+	write_frame_header(&input, len(block) - half, .Continuation, FLAG_END_HEADERS, 1)
+	append(&input, ..block[half:])
+
+	ended := 0
+	for run in RUNS {
+		for at in 1 ..= MAX_SWEEP {
+			h := Serve_Harness {
+				in_data = input[:],
+				written = make([dynamic]u8, 0, 64, allocator),
+			}
+			seen: Seen_Requests
+			c := make_conn(IO{user = &h, read = serve_harness_read, write = serve_harness_write}, check_request, &seen, allocator)
+			if !testing.expect(t, c != nil, "cannot make the connection") {
+				delete(h.written)
+				delete(input)
+				return
+			}
+			f := Fail_Nth {
+				backing = context.temp_allocator,
+			}
+			arm(&f, at, run)
+			{
+				context.temp_allocator = fail_nth(&f)
+				serve(c)
+			}
+			refused := refused_any(&f)
+			conn_unref(c)
+			delete(h.written)
+			if !refused {
+				testing.expectf(t, seen.whole == 1, "with room: %d served, GOAWAY %v %v, %d allocations", seen.whole, h.saw_goaway, h.code, f.seen)
+				break
+			}
+			if h.saw_goaway && h.code == .Internal_Error {
+				ended += 1
+				testing.expectf(t, h.last == 0, "run %d at %d: GOAWAY names stream %d, which nothing acted on", run, at, h.last)
+			}
+			testing.expect_value(t, seen.dispatched, 0)
+		}
+	}
+	testing.expectf(t, ended > 0, "no refusal ended the connection")
+	delete(input)
+	expect_no_leaks(t, &track, "frame without room to read")
+}
+
+// A fragment the block has no room for leaves none of it behind, though the
+// block had spare room for part of it.
+@(test)
+test_a_fragment_without_room_leaves_no_part_of_it :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	f := Fail_Nth {
+		backing = context.temp_allocator,
+	}
+	block := make([dynamic]u8, 0, 4, fail_nth(&f))
+	append(&block, 1, 2)
+	arm(&f, 1, 1)
+	testing.expect(t, !append_whole(&block, []u8{3, 4, 5, 6, 7, 8}), "a fragment without room was taken")
+	testing.expectf(t, string(block[:]) == "\x01\x02", "block holds %v", block[:])
+	testing.expect(t, append_whole(&block, []u8{3, 4, 5, 6, 7, 8}), "a fragment with room was refused")
+	testing.expectf(t, string(block[:]) == "\x01\x02\x03\x04\x05\x06\x07\x08", "block holds %v", block[:])
+}
+
+@(private = "file")
+Gated_Response :: struct {
+	c:         ^Conn,
+	stream_id: u32,
+	gate:      ^Gate,
+	sent:      bool,
+}
+
+@(private = "file")
+run_gated_response :: proc(r: ^Gated_Response) {
+	// Assigned outside any block, which would undo it at its end.
+	if r.gate != nil {
+		r.gate.backing = context.temp_allocator
+	}
+	context.temp_allocator = mem.Allocator{procedure = gate_proc, data = r.gate} if r.gate != nil else context.temp_allocator
+	body := [3]u8{1, 2, 3}
+	r.sent = respond(r.c, r.stream_id, Response{status = 200, body = body[:]})
+	free_all(context.temp_allocator)
+}
+
+/*
+Connection credit a response took for a DATA frame it had no room to build goes
+back, and the responses waiting for credit are woken to it, whether or not the
+stream is still there to reset: left parked, one would wait out its write
+timeout beside credit it could use.
+*/
+@(test)
+test_credit_a_response_had_no_room_to_send_wakes_the_next :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	defer free_all(context.temp_allocator)
+	sig: Frame_Signal
+	c := make_conn(IO{user = &sig, read = no_read, write = signal_write}, drop_request, nil, allocator)
+	if !testing.expect(t, c != nil, "cannot make the connection") {
+		return
+	}
+	block := request_block()
+	for id in ([]u32{1, 3}) {
+		opened := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = id}, block)
+		testing.expectf(t, opened, "stream %d was not opened", id)
+	}
+	// Room on the connection for one three-byte body.
+	c.send_window = 3
+
+	// The first response's third temp allocation is its DATA frame: the header
+	// block and the HEADERS frame come before it.
+	gate := Gate {
+		block_at = 3,
+	}
+	first := Gated_Response {
+		c         = c,
+		stream_id = 1,
+		gate      = &gate,
+	}
+	ft := thread.create_and_start_with_poly_data(&first, run_gated_response)
+	if !testing.expect(t, ft != nil && sync.sema_wait_with_timeout(&gate.reached, 5 * time.Second), "the first response never built its DATA frame") {
+		sync.sema_post(&gate.release)
+		if ft != nil {
+			thread.join(ft)
+			thread.destroy(ft)
+		}
+		conn_unref(c)
+		return
+	}
+	// The peer resets it meanwhile, so nothing is left to reset.
+	close_stream(c, 1)
+	second := Gated_Response {
+		c         = c,
+		stream_id = 3,
+	}
+	st := thread.create_and_start_with_poly_data(&second, run_gated_response)
+	waiting := st != nil && wait_for_waiter(&c.cond)
+	testing.expect(t, waiting, "the second response is not waiting for credit")
+	sync.sema_post(&gate.release)
+
+	// Well inside the write timeout.
+	sent := waiting && sync.sema_wait_with_timeout(&sig.data, 2 * time.Second)
+	testing.expect(t, sent, "the second response never sent its body")
+	if !sent {
+		// Ends the second response's wait.
+		loop.lock(&c.mu)
+		c.closed = true
+		loop.cond_broadcast(&c.cond)
+		loop.unlock(&c.mu)
+	}
+	thread.join(ft)
+	thread.destroy(ft)
+	if st != nil {
+		thread.join(st)
+		thread.destroy(st)
+	}
+	testing.expect(t, !first.sent, "the first response was reported sent")
+	testing.expect_value(t, c.send_window, 0)
+	conn_unref(c)
+	expect_no_leaks(t, &track, "response credit passed on")
 }

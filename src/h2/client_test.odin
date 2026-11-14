@@ -2594,28 +2594,6 @@ test_client_request_cut_short_by_this_ends_memory_is_out_of_memory :: proc(t: ^t
 	free_all(context.temp_allocator)
 }
 
-// Counts the frames a client writes, and posts `headers` and `data` as each kind
-// goes out, for a test on another thread to wait on.
-@(private = "file")
-Frame_Signal :: struct {
-	headers: sync.Sema,
-	data:    sync.Sema,
-}
-
-@(private = "file")
-signal_write :: proc(user: rawptr, buf: []u8) -> bool {
-	sig := cast(^Frame_Signal)user
-	if h, ok := parse_frame_header(buf); ok {
-		#partial switch h.type {
-		case .Headers:
-			sync.sema_post(&sig.headers)
-		case .Data:
-			sync.sema_post(&sig.data)
-		}
-	}
-	return true
-}
-
 @(private = "file")
 Pending_Request :: struct {
 	c:    ^Client,
@@ -2709,42 +2687,6 @@ test_a_request_with_no_room_passes_its_slot_on :: proc(t: ^testing.T) {
 	client_unref(c)
 	expect_no_leaks(t, &track, "slot passed on")
 	free_all(context.temp_allocator)
-}
-
-// Hands every request to `backing`, but holds the `block_at`th until `release`
-// is posted, and then refuses it, posting `reached` first.
-@(private = "file")
-Gate :: struct {
-	backing:  mem.Allocator,
-	seen:     int,
-	block_at: int,
-	reached:  sync.Sema,
-	release:  sync.Sema,
-}
-
-@(private = "file")
-gate_proc :: proc(
-	data: rawptr,
-	mode: mem.Allocator_Mode,
-	size, alignment: int,
-	old_memory: rawptr,
-	old_size: int,
-	loc := #caller_location,
-) -> (
-	[]byte,
-	mem.Allocator_Error,
-) {
-	g := cast(^Gate)data
-	#partial switch mode {
-	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
-		g.seen += 1
-		if g.seen == g.block_at {
-			sync.sema_post(&g.reached)
-			sync.sema_wait(&g.release)
-			return nil, .Out_Of_Memory
-		}
-	}
-	return g.backing.procedure(g.backing.data, mode, size, alignment, old_memory, old_size, loc)
 }
 
 @(private = "file")

@@ -226,6 +226,8 @@ Serve_Harness :: struct {
 	written:    [dynamic]u8,
 	saw_goaway: bool,
 	code:       Error_Code,
+	// The last GOAWAY's last stream id.
+	last:       u32,
 }
 
 @(private)
@@ -262,6 +264,7 @@ serve_harness_write :: proc(user: rawptr, buf: []u8) -> bool {
 			if len(body) >= 8 {
 				h.saw_goaway = true
 				h.code = Error_Code(read_u32(body[4:]))
+				h.last = read_u32(body)
 			}
 		}
 		pos += FRAME_HEADER_SIZE + fh.length
@@ -335,4 +338,62 @@ open_test_stream :: proc(c: ^Client, id: u32, allocator: mem.Allocator) -> ^Clie
 	c.streams[id] = s
 	c.next_stream_id = id + 2
 	return s
+}
+
+// Posts `headers` and `data` as each kind of frame goes out, for a test on
+// another thread to wait on.
+@(private)
+Frame_Signal :: struct {
+	headers: sync.Sema,
+	data:    sync.Sema,
+}
+
+@(private)
+signal_write :: proc(user: rawptr, buf: []u8) -> bool {
+	sig := cast(^Frame_Signal)user
+	if h, ok := parse_frame_header(buf); ok {
+		#partial switch h.type {
+		case .Headers:
+			sync.sema_post(&sig.headers)
+		case .Data:
+			sync.sema_post(&sig.data)
+		}
+	}
+	return true
+}
+
+// Hands every request to `backing`, but holds the `block_at`th until `release`
+// is posted, and then refuses it, posting `reached` first.
+@(private)
+Gate :: struct {
+	backing:  mem.Allocator,
+	seen:     int,
+	block_at: int,
+	reached:  sync.Sema,
+	release:  sync.Sema,
+}
+
+@(private)
+gate_proc :: proc(
+	data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	loc := #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	g := cast(^Gate)data
+	#partial switch mode {
+	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
+		g.seen += 1
+		if g.seen == g.block_at {
+			sync.sema_post(&g.reached)
+			sync.sema_wait(&g.release)
+			return nil, .Out_Of_Memory
+		}
+	}
+	return g.backing.procedure(g.backing.data, mode, size, alignment, old_memory, old_size, loc)
 }

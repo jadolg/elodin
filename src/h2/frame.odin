@@ -413,13 +413,19 @@ take_send_credit :: proc(conn_window, stream_window: ^int, peer_max_frame, remai
 	return chunk
 }
 
-// Appends `bytes` to `out`, or leaves it as it was and returns false where it
-// has no room.
+/*
+Appends `bytes` to `out`, or leaves it as it was and returns false where it has
+no room. Reserved first: an `append` whose growth is refused still copies what
+fits in the room already there.
+*/
 @(private)
 append_whole :: proc(out: ^[dynamic]u8, bytes: []u8) -> bool {
-	before := len(out^)
+	need := len(out^) + len(bytes)
+	if need > cap(out^) && reserve(out, max(need, 2 * cap(out^))) != nil {
+		return false
+	}
 	append(out, ..bytes)
-	return len(out^) == before + len(bytes)
+	return true
 }
 
 /*
