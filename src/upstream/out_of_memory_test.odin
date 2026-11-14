@@ -1,13 +1,18 @@
 package upstream
 
+import "base:runtime"
 import "core:mem"
 import "core:net"
+import "core:strings"
 import "core:sync"
 import "core:sys/linux"
 import "core:testing"
+import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:h2"
+import "elodin:tlsx"
 
 /*
 Issue #620: a query this server cannot allocate the buffers for is not sent, and
@@ -510,4 +515,166 @@ test_a_cookie_strip_without_memory_is_not_the_upstreams :: proc(t: ^testing.T) {
 			delete(out)
 		}
 	}
+}
+
+/*
+An h2 connection there is no room to build is this server's failing, whichever
+part was refused: nothing is half built, and the connection struct is not kept
+without its client.
+*/
+@(test)
+test_an_h2_connection_without_room_is_not_built :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "dry", kind = .HTTPS, address = "127.0.0.1", port = 443, hostname = "localhost", path = "/dns-query"},
+		0,
+		time.Second,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+	heap := u.allocator
+	// The connection, then its client: neither writes anything, so the stream
+	// is never touched.
+	for at in 1 ..= 2 {
+		f := Fail_Nth {
+			backing  = mem.tracking_allocator(&track),
+			fail_at  = at,
+			fail_for = 1,
+		}
+		u.allocator = fail_nth(&f)
+		hc := make_h2_conn(u, Stream{})
+		u.allocator = heap
+		testing.expectf(t, hc == nil, "built with allocation %d refused", at)
+		testing.expectf(t, f.seen == at, "allocation %d refused after %d", at, f.seen)
+	}
+	testing.expectf(t, len(track.allocation_map) == 0, "%d allocations kept", len(track.allocation_map))
+}
+
+@(private = "file")
+H2_Dial_Peer :: struct {
+	listener: net.TCP_Socket,
+	ctx:      ^tlsx.Context,
+	// What each connection's handshake chose, and how its reading ended.
+	alpn:     [2]string,
+	ended:    [2]tlsx.Error,
+}
+
+@(private = "file")
+h2_dial_peer_run :: proc(p: ^H2_Dial_Peer) {
+	for i in 0 ..< len(p.alpn) {
+		socket, _, aerr := net.accept_tcp(p.listener)
+		if aerr != nil {
+			return
+		}
+		if net.set_option(socket, .Receive_Timeout, 3 * time.Second) != nil {
+			net.close(socket)
+			return
+		}
+		conn, terr := tlsx.server_accept(p.ctx, socket)
+		if terr != .None {
+			net.close(socket)
+			return
+		}
+		// The test's thread frees it, which tracks a heap of its own.
+		p.alpn[i] = strings.clone(tlsx.alpn_protocol(conn), runtime.heap_allocator())
+		buf: [1024]u8
+		for {
+			if _, err := tlsx.read(conn, buf[:]); err != .None {
+				p.ended[i] = err
+				break
+			}
+		}
+		tlsx.close(conn)
+	}
+}
+
+/*
+A dial that negotiated h2 and then had no room for the connection reports
+`Out_Of_Memory` and closes the stream it dialled, rather than keep a connection
+nothing reads; the next query dials afresh.
+*/
+@(test)
+test_an_h2_dial_without_room_is_closed :: proc(t: ^testing.T) {
+	fx, fixture_ok := dot_fixture(t)
+	if !fixture_ok {
+		return
+	}
+	defer dot_fixture_destroy(&fx)
+	sctx, serr := tlsx.server_context(dot_cert_path, dot_key_path, []string{"h2"})
+	if !testing.expectf(t, serr == .None, "server_context: %v", serr) {
+		return
+	}
+	defer tlsx.context_destroy(sctx)
+	cctx, cerr := tlsx.client_context(false, "", []string{"h2"})
+	if !testing.expectf(t, cerr == .None, "client_context: %v", cerr) {
+		return
+	}
+
+	p := H2_Dial_Peer {
+		listener = fx.listener,
+		ctx      = sctx,
+	}
+	peer := thread.create_and_start_with_poly_data(&p, h2_dial_peer_run)
+	if !testing.expect(t, peer != nil, "cannot start the peer") {
+		tlsx.context_destroy(cctx)
+		return
+	}
+	defer {
+		thread.join(peer)
+		thread.destroy(peer)
+		delete(p.alpn[0], runtime.heap_allocator())
+		delete(p.alpn[1], runtime.heap_allocator())
+	}
+	// Dialled twice below; on an early return, the peer is woken from its accept.
+	dials := 0
+	defer if dials < len(p.alpn) {
+		net.shutdown(fx.listener, .Both)
+	}
+
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "dry", kind = .HTTPS, address = "127.0.0.1", port = fx.bound.port, hostname = "localhost", path = "/dns-query"},
+		0,
+		2 * time.Second,
+		context.allocator,
+	)
+	if !testing.expectf(t, uerr == .None, "cannot build the upstream: %v", uerr) {
+		tlsx.context_destroy(cctx)
+		return
+	}
+	// One that takes the self-signed certificate; `destroy` frees it.
+	tlsx.context_destroy(u.tls_ctx)
+	u.tls_ctx = cctx
+
+	heap := u.allocator
+	f := Fail_Nth {
+		backing  = heap,
+		fail_at  = 1,
+		fail_for = 1,
+	}
+	u.allocator = fail_nth(&f)
+	_, is_h2, err := get_h2_conn(u, 2 * time.Second, 2 * time.Second)
+	u.allocator = heap
+	testing.expect_value(t, err, Error.Out_Of_Memory)
+	testing.expect(t, !is_h2 && u.h2 == nil, "a connection without room was kept")
+	testing.expect_value(t, f.seen, 1)
+
+	conn, again, aerr := get_h2_conn(u, 2 * time.Second, 2 * time.Second)
+	testing.expectf(t, aerr == .None && again, "with room: %v", aerr)
+	if again {
+		h2.client_unref(conn)
+	}
+	dials = 2
+	// Ends the second connection's read, so the peer is done by the join.
+	destroy(u)
+	thread.join(peer)
+
+	// The premise: the refused dial is the one that negotiated h2, and its
+	// stream was closed (close_notify) rather than left open.
+	testing.expectf(t, p.alpn[0] == "h2" && p.alpn[1] == "h2", "negotiated %v", p.alpn)
+	testing.expect_value(t, p.ended[0], tlsx.Error.Closed)
 }

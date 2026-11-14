@@ -175,10 +175,17 @@ io_read_exact :: proc(io: IO, buf: []u8, starts_frame := true) -> bool {
 	return true
 }
 
-// One write to the transport under `mu`, so frames from concurrent writers do
-// not interleave; refused once `closed` is set.
+/*
+One write to the transport under `mu`, so frames from concurrent writers do not
+interleave; refused once `closed` is set. Refused as well for an empty `buf`,
+which is what a frame builder returns where it had no room: every frame carries
+at least its header, so nothing is ever a write of nothing.
+*/
 @(private)
 io_write_locked :: proc(io: IO, mu: ^loop.Mutex, closed: ^bool, buf: []u8) -> bool {
+	if len(buf) == 0 {
+		return false
+	}
 	loop.lock(mu)
 	defer loop.unlock(mu)
 	if closed^ {
@@ -190,7 +197,9 @@ io_write_locked :: proc(io: IO, mu: ^loop.Mutex, closed: ^bool, buf: []u8) -> bo
 /*
 The next frame off the wire, client and server alike, its payload in
 `context.temp_allocator`. False once nothing more can be read; `refuse` set as well is the GOAWAY code
-the caller sends before it stops.
+the caller sends before it stops. A payload there is no room for is
+INTERNAL_ERROR: its bytes are still on the wire, and the next frame header cannot
+be found without reading them.
 
 Bounded at the frame size this end advertises, not at the receive window:
 neither end sends SETTINGS_MAX_FRAME_SIZE, so the peer is held to the RFC 9113
@@ -226,7 +235,11 @@ read_frame :: proc(
 		return h, nil, .Frame_Size_Error, false
 	}
 	if h.length > 0 {
-		payload = make([]u8, h.length, context.temp_allocator)
+		room: bool
+		payload, room = dns.alloc_slice([]u8, h.length, context.temp_allocator)
+		if !room {
+			return h, nil, .Internal_Error, false
+		}
 		if !io_read_exact(io, payload, starts_frame = false) {
 			return h, nil, nil, false
 		}
@@ -314,9 +327,22 @@ header_fragment :: proc(payload: []u8, flags: u8) -> (block: []u8, code: Error_C
 }
 
 /*
+The GOAWAY code a header block that does not decode draws, client and server
+alike: COMPRESSION_ERROR for the peer's block (RFC 9113 4.3), and INTERNAL_ERROR
+where this end had no room to decode it, which is no fault of the peer's (RFC
+9113 7).
+*/
+@(private)
+hpack_goaway_code :: proc(err: Hpack_Error) -> Error_Code {
+	return .Internal_Error if err == .Out_Of_Memory else .Compression_Error
+}
+
+/*
 Add a CONTINUATION frame to the header block open on `on^`, client and server
 alike. `complete` once END_HEADERS closes it, which clears `on^`; `refuse` is
-the GOAWAY code a frame that may not continue it draws.
+the GOAWAY code a frame that may not continue it draws, and INTERNAL_ERROR where
+the block has no room for it: a block decoded short would leave HPACK out of
+step with the peer's encoder.
 
 RFC 9113 6.10: only behind a HEADERS without END_HEADERS, on its stream; with
 no block open, `on^` is 0, which is no stream either.
@@ -355,7 +381,9 @@ continue_header_block :: proc(
 	if len(block^) + len(payload) > MAX_HEADER_LIST {
 		return false, .Compression_Error
 	}
-	append(block, ..payload)
+	if !append_whole(block, payload) {
+		return false, .Internal_Error
+	}
 	if h.flags & FLAG_END_HEADERS == 0 {
 		return false, nil
 	}
@@ -380,44 +408,109 @@ take_send_credit :: proc(conn_window, stream_window: ^int, peer_max_frame, remai
 	return chunk
 }
 
-// Frames this end writes, each built in `context.temp_allocator`.
+// Appends `bytes` to `out`, or leaves it as it was and returns false where it
+// has no room.
+@(private)
+append_whole :: proc(out: ^[dynamic]u8, bytes: []u8) -> bool {
+	before := len(out^)
+	append(out, ..bytes)
+	return len(out^) == before + len(bytes)
+}
+
+/*
+Frames this end writes, each built in `context.temp_allocator`, or nil where it
+has no room for one; `io_write_locked` refuses nil, so a frame that could not be
+built is a write that failed, never a short frame on the wire. Each is reserved
+whole, so no append within it can fail.
+*/
+
+// A frame header followed by `payload`.
+@(private)
+build_frame :: proc(type: Frame_Type, flags: u8, stream_id: u32, payload: ..[]u8) -> []u8 {
+	length := 0
+	for p in payload {
+		length += len(p)
+	}
+	out, ok := dns.alloc_list([dynamic]u8, FRAME_HEADER_SIZE + length, context.temp_allocator)
+	if !ok {
+		return nil
+	}
+	write_frame_header(&out, length, type, flags, stream_id)
+	for p in payload {
+		append(&out, ..p)
+	}
+	return out[:]
+}
+
+@(private)
+u32_bytes :: proc(v: u32) -> [4]u8 {
+	return {u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v)}
+}
 
 @(private)
 data_frame :: proc(stream_id: u32, chunk: []u8, end_stream: bool) -> []u8 {
-	out := make([dynamic]u8, 0, len(chunk) + FRAME_HEADER_SIZE, context.temp_allocator)
-	write_frame_header(&out, len(chunk), .Data, u8(FLAG_END_STREAM) if end_stream else 0, stream_id)
-	append(&out, ..chunk)
-	return out[:]
+	return build_frame(.Data, u8(FLAG_END_STREAM) if end_stream else 0, stream_id, chunk)
+}
+
+@(private)
+headers_frame :: proc(stream_id: u32, block: []u8, end_stream: bool) -> []u8 {
+	return build_frame(.Headers, FLAG_END_HEADERS | (u8(FLAG_END_STREAM) if end_stream else 0), stream_id, block)
 }
 
 @(private)
 rst_stream_frame :: proc(stream_id: u32, code: Error_Code) -> []u8 {
-	out := make([dynamic]u8, 0, 13, context.temp_allocator)
-	write_frame_header(&out, 4, .Rst_Stream, 0, stream_id)
-	append_u32(&out, u32(code))
-	return out[:]
+	c := u32_bytes(u32(code))
+	return build_frame(.Rst_Stream, 0, stream_id, c[:])
 }
 
 @(private)
 goaway_frame :: proc(last_stream_id: u32, code: Error_Code) -> []u8 {
-	out := make([dynamic]u8, 0, 17, context.temp_allocator)
-	write_frame_header(&out, 8, .Goaway, 0, 0)
-	append_u32(&out, last_stream_id)
-	append_u32(&out, u32(code))
-	return out[:]
+	last, c := u32_bytes(last_stream_id), u32_bytes(u32(code))
+	return build_frame(.Goaway, 0, 0, last[:], c[:])
 }
 
 @(private)
 ping_ack_frame :: proc(payload: []u8) -> []u8 {
-	out := make([dynamic]u8, 0, 17, context.temp_allocator)
-	write_frame_header(&out, 8, .Ping, FLAG_ACK, 0)
-	append(&out, ..payload)
-	return out[:]
+	return build_frame(.Ping, FLAG_ACK, 0, payload)
 }
 
 @(private)
 settings_ack_frame :: proc() -> []u8 {
-	out := make([dynamic]u8, 0, FRAME_HEADER_SIZE, context.temp_allocator)
-	write_frame_header(&out, 0, .Settings, FLAG_ACK, 0)
+	return build_frame(.Settings, FLAG_ACK, 0)
+}
+
+@(private)
+Setting_Value :: struct {
+	id:    Setting,
+	value: u32,
+}
+
+/*
+What each end opens a connection with: `prefix` (the client's preface, or
+nothing), a SETTINGS frame of `settings`, and the WINDOW_UPDATE that raises the
+connection's receive window from DEFAULT_WINDOW to RECV_WINDOW. Nil where there
+is no room, as the frame builders below.
+*/
+@(private)
+opening_frames :: proc(prefix: string, settings: []Setting_Value) -> []u8 {
+	size := len(prefix) + FRAME_HEADER_SIZE + 6 * len(settings) + FRAME_HEADER_SIZE + 4
+	out, ok := dns.alloc_list([dynamic]u8, size, context.temp_allocator)
+	if !ok {
+		return nil
+	}
+	append(&out, prefix)
+	write_frame_header(&out, 6 * len(settings), .Settings, 0, 0)
+	for st in settings {
+		append(&out, u8(u16(st.id) >> 8), u8(st.id))
+		append_u32(&out, st.value)
+	}
+	write_frame_header(&out, 4, .Window_Update, 0, 0)
+	append_u32(&out, RECV_WINDOW - DEFAULT_WINDOW)
 	return out[:]
+}
+
+@(private)
+window_update_frame :: proc(increment: int) -> []u8 {
+	inc := u32_bytes(u32(increment))
+	return build_frame(.Window_Update, 0, 0, inc[:])
 }

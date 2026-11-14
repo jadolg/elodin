@@ -4,6 +4,7 @@ import "core:mem"
 import "core:strconv"
 import "core:sync"
 import "core:time"
+import "elodin:dns"
 import "elodin:loop"
 
 /*
@@ -45,6 +46,9 @@ Client :: struct {
 	*/
 	refs:      int,
 	closed:    bool,
+	// The connection ended with INTERNAL_ERROR, for want of memory on this
+	// end: what a request it cut short reports. Under `mu`.
+	dry:       bool,
 	// When a reference was last let go of, which is when a request on the
 	// connection last ended; see `client_idle_for`. A `loop.Moment`, so neither
 	// a step of the wall clock nor a suspend keeps an idle connection or
@@ -106,6 +110,9 @@ Client_Stream :: struct {
 	refunded:    bool,
 	// This end reset the stream for sending too much; see Client_Error.Too_Large.
 	oversized:   bool,
+	// This end reset the stream for want of room for its request or response;
+	// see Client_Error.Out_Of_Memory.
+	dry:         bool,
 	// A final (non-1xx) header section has been taken, so the next block is
 	// the trailers; see client_finish_headers.
 	final:       bool,
@@ -142,10 +149,18 @@ Client_Error :: enum u8 {
 	// so the caller can report it as the HTTP/1.1 client does. The response
 	// carries the status, and no body.
 	Too_Large,
+	// This end had no room for the request, the response, or the connection's
+	// own state: a statement about this end, not the peer.
+	Out_Of_Memory,
 }
 
+// A client on `io`, its preface sent, or nil where `allocator` has no room for
+// one.
 client_make :: proc(io: IO, allocator := context.allocator) -> ^Client {
 	c := new(Client, allocator)
+	if c == nil {
+		return nil
+	}
 	c.io = io
 	c.allocator = allocator
 	c.refs = 1
@@ -257,32 +272,21 @@ client_write_all :: proc(c: ^Client, buf: []u8) -> bool {
 
 @(private)
 client_send_preface :: proc(c: ^Client) -> bool {
-	out := make([dynamic]u8, 0, len(PREFACE) + 32, context.temp_allocator)
-	append(&out, ..transmute([]u8)string(PREFACE))
-
-	// SETTINGS_ENABLE_PUSH=0: a DNS client has no use for server push, and
-	// disabling it up front turns a PUSH_PROMISE we then see into a clear
-	// protocol violation rather than something to handle.
-	// SETTINGS_INITIAL_WINDOW_SIZE raised to match the connection window
-	// below, so the peer is never throttled sending us a response.
-	// SETTINGS_HEADER_TABLE_SIZE states the size this end's decoder was built
-	// with, which is the ceiling `decode` holds an upstream's table size
-	// updates to.
-	write_frame_header(&out, 24, .Settings, 0, 0)
-	append(&out, 0, u8(Setting.Header_Table_Size))
-	append_u32(&out, DEFAULT_HEADER_TABLE_SIZE)
-	append(&out, 0, u8(Setting.Enable_Push))
-	append_u32(&out, 0)
-	append(&out, 0, u8(Setting.Initial_Window_Size))
-	append_u32(&out, RECV_WINDOW)
-	// So an upstream is told the header bound rather than discovering it as a
-	// connection error.
-	append(&out, 0, u8(Setting.Max_Header_List_Size))
-	append_u32(&out, MAX_HEADER_LIST)
-
-	write_frame_header(&out, 4, .Window_Update, 0, 0)
-	append_u32(&out, RECV_WINDOW - DEFAULT_WINDOW)
-	return client_write_all(c, out[:])
+	// ENABLE_PUSH=0: a DNS client has no use for server push, and disabling it
+	// up front turns a PUSH_PROMISE we then see into a clear protocol violation
+	// rather than something to handle. INITIAL_WINDOW_SIZE matches the
+	// connection window, so the peer is never throttled sending us a response.
+	// HEADER_TABLE_SIZE states the size this end's decoder was built with,
+	// which is the ceiling `decode` holds an upstream's table size updates to.
+	// MAX_HEADER_LIST_SIZE, so an upstream is told the header bound rather than
+	// discovering it as a connection error.
+	settings := [?]Setting_Value {
+		{.Header_Table_Size, DEFAULT_HEADER_TABLE_SIZE},
+		{.Enable_Push, 0},
+		{.Initial_Window_Size, RECV_WINDOW},
+		{.Max_Header_List_Size, MAX_HEADER_LIST},
+	}
+	return client_write_all(c, opening_frames(PREFACE, settings[:]))
 }
 
 @(private)
@@ -475,7 +479,10 @@ client_handle_headers :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> boo
 	}
 
 	clear(&c.header_scratch)
-	append(&c.header_scratch, ..block)
+	if !append_whole(&c.header_scratch, block) {
+		client_goaway(c, .Internal_Error)
+		return false
+	}
 
 	loop.lock(&c.mu)
 	// A stream already done or reset only takes the already_ended path in
@@ -548,7 +555,7 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 	headers, err := decode(&c.decoder, c.header_scratch[:], context.temp_allocator)
 	clear(&c.header_scratch)
 	if err != .None {
-		client_goaway(c, .Compression_Error)
+		client_goaway(c, hpack_goaway_code(err))
 		return false
 	}
 
@@ -700,7 +707,7 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	if already_ended {
 		s.rst_sent = true
 	}
-	oversized := false
+	oversized, dry := false, false
 	// RFC 9113 8.1: DATA follows the final header section, so DATA ahead of it -
 	// before any response, or behind an interim (1xx) one - is malformed, a
 	// stream error of type PROTOCOL_ERROR the client MUST NOT accept.
@@ -719,15 +726,25 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 			// Doubled, but never past MAX_BODY: left to `append`, a
 			// 65535-byte body in 16 KiB frames is held in a 116 KiB buffer.
 			if need := len(s.body) + len(data); need > cap(s.body) {
-				reserve(&s.body, min(max(2 * cap(s.body), need), MAX_BODY))
+				dry = reserve(&s.body, min(max(2 * cap(s.body), need), MAX_BODY)) != nil
 			}
-			append(&s.body, ..data)
+			if dry {
+				s.reset = true
+				s.dry = true
+			} else {
+				append(&s.body, ..data)
+			}
 		}
 	}
-	if oversized {
+	if oversized || dry {
 		loop.cond_broadcast(&c.cond)
 	}
 	loop.unlock(&c.mu)
+
+	// No room for the body: the stream fails, and the connection carries on.
+	if dry {
+		return client_rst_stream(c, h.stream_id, .Internal_Error) && client_give_connection_credit(c, len(payload))
+	}
 
 	if early {
 		return client_rst_stream(c, h.stream_id, .Protocol_Error) && client_give_connection_credit(c, len(payload))
@@ -789,8 +806,8 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 // up.
 @(private)
 client_give_connection_credit :: proc(c: ^Client, n: int) -> bool {
-	frame := owe_connection_credit(&c.credit_owed, n)
-	return frame == nil || client_write_all(c, frame)
+	frame, due := owe_connection_credit(&c.credit_owed, n)
+	return !due || client_write_all(c, frame)
 }
 
 @(private)
@@ -798,8 +815,15 @@ client_rst_stream :: proc(c: ^Client, stream_id: u32, code: Error_Code) -> bool 
 	return client_write_all(c, rst_stream_frame(stream_id, code))
 }
 
-// Nothing is sent on a connection already closed.
+// Nothing is sent on a connection already closed. INTERNAL_ERROR is what this
+// end sends where it has no room to go on, and `dry` records it for the
+// requests the close cuts short.
 client_goaway :: proc(c: ^Client, code: Error_Code) {
+	if code == .Internal_Error {
+		loop.lock(&c.mu)
+		c.dry = true
+		loop.unlock(&c.mu)
+	}
 	// Streams are always client-initiated and push is refused, so we never
 	// process a peer-initiated stream; the last-stream-id field is vestigial.
 	_ = client_write_all(c, goaway_frame(0, code))
@@ -823,7 +847,12 @@ client_request :: proc(
 	err: Client_Error,
 ) {
 	// Built before any lock is taken: it does not depend on the stream id.
-	block := make([dynamic]u8, 0, 128, context.temp_allocator)
+	block_dry := false
+	watch := dns.Dry_Watch {
+		backing = context.temp_allocator,
+		dry     = &block_dry,
+	}
+	block := make([dynamic]u8, 0, 128, dns.dry_watch_allocator(&watch))
 	encode_header(&block, ":method", req.method)
 	encode_header(&block, ":scheme", req.scheme)
 	encode_header(&block, ":authority", req.authority)
@@ -843,7 +872,9 @@ client_request :: proc(
 		digits: [20]u8
 		encode_header(&block, "content-length", strconv.write_int(digits[:], i64(len(req.body)), 10))
 	}
-	end_stream: u8 = FLAG_END_STREAM if len(req.body) == 0 else 0
+	if block_dry {
+		return {}, .Out_Of_Memory
+	}
 	// A `Tick`, not a `Time`: this bounds waiting, and the wall clock steps.
 	deadline := time.tick_add(loop.tick_now(), timeout)
 
@@ -901,14 +932,18 @@ client_request :: proc(
 		loop.unlock(&c.mu)
 		return {}, .Closed
 	}
-	sync.atomic_add(&c.refs, 1)
 	stream_id := c.next_stream_id
-	c.next_stream_id += 2
 	s := new(Client_Stream, c.allocator)
+	if s == nil || map_insert(&c.streams, stream_id, s) == nil {
+		free(s, c.allocator)
+		loop.unlock(&c.mu)
+		return {}, .Out_Of_Memory
+	}
+	sync.atomic_add(&c.refs, 1)
+	c.next_stream_id += 2
 	s.id = stream_id
 	s.send_window = c.peer_initial_window
 	s.body = make([dynamic]u8, 0, 512, c.allocator)
-	c.streams[stream_id] = s
 
 	/*
 	The HEADERS write happens in the same critical section as the id
@@ -920,10 +955,9 @@ client_request :: proc(
 	violation and kills the whole connection out from under every stream on
 	it, not just the two that raced.
 	*/
-	out := make([dynamic]u8, 0, len(block) + FRAME_HEADER_SIZE, context.temp_allocator)
-	write_frame_header(&out, len(block), .Headers, FLAG_END_HEADERS | end_stream, stream_id)
-	append(&out, ..block[:])
-	sent := c.io.write(c.io.user, out[:])
+	frame := headers_frame(stream_id, block[:], end_stream = len(req.body) == 0)
+	s.dry = frame == nil
+	sent := !s.dry && c.io.write(c.io.user, frame)
 	loop.unlock(&c.mu)
 
 	/*
@@ -956,12 +990,15 @@ client_request :: proc(
 		refused := s.refused
 		oversized := s.oversized
 		status := s.status
+		dry := s.dry || c.dry
 		loop.unlock(&c.mu)
 		switch {
 		// A response that overran while the body was still going up is the
 		// same `Too_Large` as one that overran after it; see below.
 		case oversized:
 			return Client_Response{status = status}, .Too_Large
+		case dry:
+			return {}, .Out_Of_Memory
 		case dead:
 			return {}, .Closed
 		case refused:
@@ -988,21 +1025,30 @@ client_request :: proc(
 	// A reset after a complete response is the peer ending the upload early
 	// (RFC 9113 8.1), and the client MUST NOT discard that response.
 	case s.reset && !s.done:
-		refused, oversized, status := s.refused, s.oversized, s.status
+		refused, oversized, dry, status := s.refused, s.oversized, s.dry, s.status
 		loop.unlock(&c.mu)
-		if oversized {
+		switch {
+		case oversized:
 			return Client_Response{status = status}, .Too_Large
+		case dry:
+			return {}, .Out_Of_Memory
 		}
 		return {}, .Refused if refused else .Reset
 	case c.closed && !s.done:
+		dry := c.dry
 		loop.unlock(&c.mu)
-		return {}, .Closed
+		return {}, .Out_Of_Memory if dry else .Closed
 	}
 
 	status := s.status
-	body := make([]u8, len(s.body), allocator)
-	copy(body, s.body[:])
+	body, room := dns.alloc_slice([]u8, len(s.body), allocator)
+	if room {
+		copy(body, s.body[:])
+	}
 	loop.unlock(&c.mu)
+	if !room {
+		return {}, .Out_Of_Memory
+	}
 	return Client_Response{status = status, body = body}, .None
 }
 
@@ -1078,7 +1124,18 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 		}
 		loop.unlock(&c.mu)
 
-		if !client_write_all(c, data_frame(s.id, body[sent:sent + chunk], sent + chunk >= len(body))) {
+		frame := data_frame(s.id, body[sent:sent + chunk], end_stream = sent + chunk >= len(body))
+		if frame == nil {
+			// No room for the rest of the body: reset rather than leave the
+			// peer waiting on it, and marked first, as the timeout above is.
+			loop.lock(&c.mu)
+			s.dry = true
+			s.rst_sent = true
+			loop.unlock(&c.mu)
+			client_rst_stream(c, s.id, .Internal_Error)
+			return false
+		}
+		if !client_write_all(c, frame) {
 			return false
 		}
 		sent += chunk

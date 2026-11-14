@@ -146,6 +146,8 @@ exchange_doh_h2 :: proc(
 			return nil, .Peer_Closed
 		case .Reset:
 			return nil, .HTTP_Error
+		case .Out_Of_Memory:
+			return nil, .Out_Of_Memory
 		case .Too_Large:
 			// Reported as HTTP/1.1 reports it, so health and the failure kind do
 			// not depend on what ALPN chose: a non-200 is the server's answer

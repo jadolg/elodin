@@ -171,6 +171,10 @@ get_h2_conn :: proc(
 			tlsx.set_timeouts(stream.tls, H2_POLL_INTERVAL, timeout)
 		}
 		hc = make_h2_conn(u, stream)
+		if hc == nil {
+			stream_close(&stream)
+			derr = .Out_Of_Memory
+		}
 	}
 
 	sync.mutex_lock(&u.mu)
@@ -212,15 +216,23 @@ get_h2_conn :: proc(
 	return conn, true, .None
 }
 
-// The connection and its client, which writes the preface. Not under `u.mu`.
+// The connection and its client, which writes the preface, or nil where there
+// is no room for them. Not under `u.mu`.
 @(private)
 make_h2_conn :: proc(u: ^Upstream, stream: Stream) -> ^H2_Conn {
 	hc := new(H2_Conn, u.allocator)
+	if hc == nil {
+		return nil
+	}
 	hc.stream = stream
 	hc.allocator = u.allocator
 	hc.refs = 2
 	hc.upstream = u
 	hc.client = h2.client_make(h2.IO{user = hc, read = h2_io_read, write = h2_io_write}, u.allocator)
+	if hc.client == nil {
+		free(hc, u.allocator)
+		return nil
+	}
 	return hc
 }
 

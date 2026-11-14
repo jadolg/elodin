@@ -284,7 +284,11 @@ A query whose scratch cannot grow, past this limit, `RLIMIT_AS` or the
 machine's memory, fails on its own and the server keeps running. It is
 answered SERVFAIL where there is room left to build one and gets no answer
 where there is not. A TCP, DoT or HTTP/1.1 DoH connection whose next request
-there is no room to read is closed. A DNSSEC validation refused memory anywhere is
+there is no room to read is closed. Over HTTP/2 a DoH request whose fields or
+body there is no room for is reset with REFUSED_STREAM, which the client may
+retry; a response there is no room to write is reset with INTERNAL_ERROR; and a
+frame or header compression state there is no room for ends the connection with
+GOAWAY(INTERNAL_ERROR). A DNSSEC validation refused memory anywhere is
 reported undecided (EDE 22), not bogus, and caches nothing it settles after
 the refusal.
 

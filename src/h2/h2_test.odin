@@ -1721,59 +1721,6 @@ test_settings_window_change_is_bounded :: proc(t: ^testing.T) {
 // Frame size bound
 // ---------------------------------------------------------------------------
 
-// Feeds `serve` a scripted byte stream and records the code of any GOAWAY the
-// connection writes back, so the frame loop can be driven end to end.
-@(private = "file")
-Serve_Harness :: struct {
-	in_data:    []u8,
-	in_pos:     int,
-	// Every byte written, so a frame split across writes is still parsed whole.
-	written:    [dynamic]u8,
-	saw_goaway: bool,
-	code:       Error_Code,
-}
-
-@(private = "file")
-serve_harness_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
-	h := cast(^Serve_Harness)user
-	if h.in_pos >= len(h.in_data) {
-		return 0, false
-	}
-	n = copy(buf, h.in_data[h.in_pos:])
-	h.in_pos += n
-	return n, true
-}
-
-// Accumulates writes and scans complete frames from the whole buffer, so a
-// GOAWAY that lands across two writes is still seen once its tail arrives
-// rather than dropped with the mid-frame tail of a single call.
-@(private = "file")
-serve_harness_write :: proc(user: rawptr, buf: []u8) -> bool {
-	h := cast(^Serve_Harness)user
-	append(&h.written, ..buf)
-	pos := 0
-	for pos + FRAME_HEADER_SIZE <= len(h.written) {
-		fh, ok := parse_frame_header(h.written[pos:])
-		if !ok {
-			break
-		}
-		// The frame's body has not all arrived yet; wait for the write that
-		// carries the rest.
-		if pos + FRAME_HEADER_SIZE + fh.length > len(h.written) {
-			break
-		}
-		if fh.type == .Goaway {
-			body := h.written[pos + FRAME_HEADER_SIZE:]
-			if len(body) >= 8 {
-				h.saw_goaway = true
-				h.code = Error_Code(read_u32(body[4:]))
-			}
-		}
-		pos += FRAME_HEADER_SIZE + fh.length
-	}
-	return true
-}
-
 @(test)
 test_frame_larger_than_advertised_max_is_refused :: proc(t: ^testing.T) {
 	/*
@@ -1967,59 +1914,6 @@ test_data_on_a_refused_stream_returns_connection_credit :: proc(t: ^testing.T) {
 // ---------------------------------------------------------------------------
 // Malformed requests (RFC 9113 sections 8.2 and 8.3)
 // ---------------------------------------------------------------------------
-
-/*
-Records what a connection wrote back and how many requests reached the handler,
-which together say whether a header list was served or turned away.
-*/
-@(private = "file")
-Request_Log :: struct {
-	rsts:       int,
-	rst_code:   Error_Code,
-	goaway:     bool,
-	dispatched: int,
-	// The last dispatched request's, cloned onto the temporary allocator.
-	authority:  string,
-	body:       string,
-}
-
-@(private = "file")
-request_log_write :: proc(user: rawptr, buf: []u8) -> bool {
-	log := cast(^Request_Log)user
-	if log == nil {
-		return true
-	}
-	pos := 0
-	for pos + FRAME_HEADER_SIZE <= len(buf) {
-		h, ok := parse_frame_header(buf[pos:])
-		if !ok {
-			break
-		}
-		body := buf[pos + FRAME_HEADER_SIZE:]
-		#partial switch h.type {
-		case .Rst_Stream:
-			if len(body) >= 4 {
-				log.rsts += 1
-				log.rst_code = Error_Code(read_u32(body))
-			}
-		case .Goaway:
-			log.goaway = true
-		}
-		pos += FRAME_HEADER_SIZE + h.length
-	}
-	return true
-}
-
-@(private = "file")
-counting_handler :: proc(conn: ^Conn, req: ^Request) {
-	log := cast(^Request_Log)conn.user
-	if log != nil {
-		log.dispatched += 1
-		log.authority = strings.clone(req.authority, context.temp_allocator)
-		log.body = strings.clone(string(req.body), context.temp_allocator)
-	}
-	request_destroy(conn, req)
-}
 
 // HPACK literal without indexing, new name: no table state, so a block with any
 // field name at all can be built here without going through the encoder - which

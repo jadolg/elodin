@@ -1701,21 +1701,6 @@ test_client_request_sends_content_length :: proc(t: ^testing.T) {
 }
 
 /*
-A stream this end opened as `id`, with its body and window as client_request
-would leave them.
-*/
-@(private = "file")
-open_test_stream :: proc(c: ^Client, id: u32, allocator: mem.Allocator) -> ^Client_Stream {
-	s := new(Client_Stream, allocator)
-	s.id = id
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
-	c.streams[id] = s
-	c.next_stream_id = id + 2
-	return s
-}
-
-/*
 The client side of #308: each PING and non-ACK SETTINGS from an upstream draws
 a frame back, so one that sends nothing else keeps a pooled connection's
 reader echoing for as long as it likes. Past the per-second budget the
@@ -2480,5 +2465,131 @@ test_client_continuation_on_stream_zero_with_no_block_open_is_refused :: proc(t:
 	testing.expect(t, !ok, "a CONTINUATION on stream 0 with no block open was accepted")
 	testing.expect_value(t, len(c.decoder.entries), 0)
 	client_unref(c)
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+DOH_REQUEST :: Client_Request {
+	method       = "POST",
+	scheme       = "https",
+	authority    = "mock.invalid",
+	path         = "/dns-query",
+	content_type = "application/dns-message",
+	accept       = "application/dns-message",
+	body         = {0xde, 0xad, 0xbe, 0xef},
+}
+
+/*
+A response the caller has no room to be handed, or whose body the stream has no
+room to hold, is `Out_Of_Memory`: this end's, not the peer's, and not an empty
+answer. The stream fails and the connection carries on, so the next request is
+answered.
+*/
+@(test)
+test_client_response_without_room_is_this_ends :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+
+	p := Peer{handler = echo_handler}
+	if !start_peer(t, &p) {
+		return
+	}
+	defer end_peer(&p)
+	c := p.c
+
+	// The copy handed to the caller.
+	f := Fail_Nth {
+		backing = allocator,
+	}
+	arm(&f, 1, 1)
+	_, err := client_request(c, DOH_REQUEST, 2 * time.Second, fail_nth(&f))
+	testing.expect_value(t, err, Client_Error.Out_Of_Memory)
+	testing.expect(t, refused_any(&f), "nothing was refused")
+
+	// The body the stream holds: its buffer, then the room to grow it.
+	heap := c.allocator
+	arm(&f, 2, 2)
+	f.backing = heap
+	c.allocator = fail_nth(&f)
+	_, err = client_request(c, DOH_REQUEST, 2 * time.Second, allocator)
+	c.allocator = heap
+	testing.expect_value(t, err, Client_Error.Out_Of_Memory)
+	testing.expect_value(t, f.seen, 3)
+
+	resp, again := client_request(c, DOH_REQUEST, 2 * time.Second, allocator)
+	testing.expect_value(t, again, Client_Error.None)
+	want := DOH_REQUEST.body
+	testing.expectf(t, string(resp.body) == string(want), "answered %x", resp.body)
+	delete(resp.body, allocator)
+	expect_no_leaks(t, &track, "response without room")
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+Dry_Answer :: struct {
+	// The GOAWAY the client sent once it could not decode the answer.
+	goaway: Error_Code,
+	sent:   bool,
+}
+
+/*
+A request on a connection that ended because this end had no room for its HPACK
+state is `Out_Of_Memory`, not `Closed`: the peer did nothing wrong, and the
+client told it so with GOAWAY(INTERNAL_ERROR).
+*/
+@(test)
+test_client_request_cut_short_by_this_ends_memory_is_out_of_memory :: proc(t: ^testing.T) {
+	run_script :: proc(client: net.TCP_Socket, data: rawptr) {
+		answer := (^Dry_Answer)(data)
+		h, ok := test_wait_for_frame_type(client, .Headers)
+		if !ok {
+			return
+		}
+		// :status 200, and a literal with incremental indexing for the table.
+		block := []u8{0x88, 0x40, 3, 'x', '-', 'a', 1, 'b'}
+		out := make([dynamic]u8, 0, FRAME_HEADER_SIZE + len(block), context.temp_allocator)
+		write_frame_header(&out, len(block), .Headers, FLAG_END_HEADERS | FLAG_END_STREAM, h.stream_id)
+		append(&out, ..block)
+		if !test_send(client, out[:]) {
+			return
+		}
+		for {
+			hdr: [FRAME_HEADER_SIZE]u8
+			if !test_recv_full(client, hdr[:]) {
+				return
+			}
+			fh, fok := parse_frame_header(hdr[:])
+			if !fok {
+				return
+			}
+			payload := make([]u8, fh.length, context.temp_allocator)
+			if !test_recv_full(client, payload) {
+				return
+			}
+			if fh.type == .Goaway && len(payload) >= 8 {
+				answer.goaway = Error_Code(read_u32(payload[4:]))
+				answer.sent = true
+				return
+			}
+		}
+	}
+	answer: Dry_Answer
+	p := Peer{script = run_script, data = &answer}
+	if !start_peer(t, &p) {
+		return
+	}
+	c := p.c
+	f := Fail_Nth {
+		backing = c.decoder.allocator,
+	}
+	arm(&f, 1, 1)
+	// Set before the request goes out, and so before the reader decodes its answer.
+	c.decoder.allocator = fail_nth(&f)
+
+	_, err := client_request(c, DOH_REQUEST, 2 * time.Second)
+	testing.expect_value(t, err, Client_Error.Out_Of_Memory)
+	end_peer(&p)
+	testing.expect(t, answer.sent, "the client sent no GOAWAY")
+	testing.expect_value(t, answer.goaway, Error_Code.Internal_Error)
 	free_all(context.temp_allocator)
 }

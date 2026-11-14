@@ -253,8 +253,13 @@ Conn :: struct {
 	closed_held:         int,
 }
 
+// A connection on `io` for `serve` to run, or nil where `allocator` has no room
+// for one.
 make_conn :: proc(io: IO, handler: Handler, user: rawptr, allocator := context.allocator) -> ^Conn {
 	c := new(Conn, allocator)
+	if c == nil {
+		return nil
+	}
 	c.io = io
 	c.handler = handler
 	c.user = user
@@ -378,28 +383,19 @@ write_all :: proc(c: ^Conn, buf: []u8) -> bool {
 
 @(private)
 send_initial_settings :: proc(c: ^Conn) -> bool {
-	out := make([dynamic]u8, 0, 64, context.temp_allocator)
-	// SETTINGS_HEADER_TABLE_SIZE, ENABLE_PUSH=0, MAX_CONCURRENT_STREAMS,
+	// HEADER_TABLE_SIZE, ENABLE_PUSH=0, MAX_CONCURRENT_STREAMS,
 	// INITIAL_WINDOW_SIZE and MAX_HEADER_LIST_SIZE - the bounds stated rather
 	// than left for a peer to discover as a connection error. The table size is
 	// the RFC 9113 6.5.2 default, which would apply anyway; sending it puts the
 	// number `decode` holds a peer to on the wire where the peer can read it.
-	write_frame_header(&out, 30, .Settings, 0, 0)
-	append(&out, 0, u8(Setting.Header_Table_Size))
-	append_u32(&out, DEFAULT_HEADER_TABLE_SIZE)
-	append(&out, 0, u8(Setting.Enable_Push))
-	append_u32(&out, 0)
-	append(&out, 0, u8(Setting.Max_Concurrent_Streams))
-	append_u32(&out, MAX_CONCURRENT)
-	append(&out, 0, u8(Setting.Initial_Window_Size))
-	append_u32(&out, RECV_WINDOW)
-	append(&out, 0, u8(Setting.Max_Header_List_Size))
-	append_u32(&out, MAX_HEADER_LIST)
-
-	// Raise the connection-level receive window to match.
-	write_frame_header(&out, 4, .Window_Update, 0, 0)
-	append_u32(&out, RECV_WINDOW - DEFAULT_WINDOW)
-	return write_all(c, out[:])
+	settings := [?]Setting_Value {
+		{.Header_Table_Size, DEFAULT_HEADER_TABLE_SIZE},
+		{.Enable_Push, 0},
+		{.Max_Concurrent_Streams, MAX_CONCURRENT},
+		{.Initial_Window_Size, RECV_WINDOW},
+		{.Max_Header_List_Size, MAX_HEADER_LIST},
+	}
+	return write_all(c, opening_frames("", settings[:]))
 }
 
 @(private)
@@ -717,6 +713,14 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		refused := len(c.streams) - c.closed_held >= MAX_CONCURRENT || len(c.streams) >= MAX_HELD_STREAMS
 
 		s := new(Stream, c.allocator)
+		// No room to track the stream, and its header block still has to be
+		// decoded in step with the peer's encoder: the connection ends.
+		if s == nil || map_insert(&c.streams, h.stream_id, s) == nil {
+			free(s, c.allocator)
+			loop.unlock(&c.mu)
+			goaway(c, .Internal_Error)
+			return false
+		}
 		s.id = h.stream_id
 		s.state = .Open
 		s.refused = refused
@@ -724,7 +728,6 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		// Nothing allocated until DATA arrives, where `handle_data` charges it.
 		s.body = make([dynamic]u8, 0, 0, c.allocator)
 		s.end_stream = h.flags & FLAG_END_STREAM != 0
-		c.streams[h.stream_id] = s
 		c.block_stream = s
 	}
 	loop.unlock(&c.mu)
@@ -739,7 +742,10 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		// Held for the CONTINUATION frames that bring the rest of it.
 		delete(c.header_block)
 		c.header_block = make([dynamic]u8, 0, len(block), c.allocator)
-		append(&c.header_block, ..block)
+		if !append_whole(&c.header_block, block) {
+			goaway(c, .Internal_Error)
+			return false
+		}
 		c.continuation_on = h.stream_id
 		c.continuation_frames = 0
 		return true
@@ -1013,7 +1019,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream, block: []u8) -> bool {
 	c.header_block = nil
 	c.block_stream = nil
 	if err != .None {
-		goaway(c, .Compression_Error)
+		goaway(c, hpack_goaway_code(err))
 		return false
 	}
 
@@ -1050,35 +1056,45 @@ finish_headers :: proc(c: ^Conn, s: ^Stream, block: []u8) -> bool {
 	}
 
 	req := new(Request, c.allocator)
+	if req == nil {
+		return refuse_stream(c, s)
+	}
 	req.stream_id = s.id
 	req.allocator = c.allocator
 	// The first of a repeated field is the one kept, and only it is cloned, so
 	// a peer repeating one holds no more of the connection's memory than one.
-	take :: proc(dst: ^string, value: string, allocator: mem.Allocator) {
+	// `dry` where a clone was refused, which leaves the field empty.
+	take :: proc(dst: ^string, value: string, allocator: mem.Allocator, dry: ^bool) {
 		if dst^ != "" {
 			return
 		}
 		dst^ = strings.clone(value, allocator)
+		dry^ ||= len(dst^) != len(value)
 	}
+	dry := false
 
 	for f in headers {
 		switch f.name {
 		case ":method":
-			take(&req.method, f.value, c.allocator)
+			take(&req.method, f.value, c.allocator, &dry)
 		case ":path":
-			take(&req.path, f.value, c.allocator)
+			take(&req.path, f.value, c.allocator, &dry)
 		case ":authority", "host":
 			// 8.3.1: `host` stands in for an absent `:authority`. Both present
 			// means they agree (`request_is_malformed`), and the pseudo-header,
 			// coming first, is the one kept.
-			take(&req.authority, f.value, c.allocator)
+			take(&req.authority, f.value, c.allocator, &dry)
 		case ":scheme":
-			take(&req.scheme, f.value, c.allocator)
+			take(&req.scheme, f.value, c.allocator, &dry)
 		case "content-type":
-			take(&req.content_type, f.value, c.allocator)
+			take(&req.content_type, f.value, c.allocator, &dry)
 		case "accept":
-			take(&req.accept, f.value, c.allocator)
+			take(&req.accept, f.value, c.allocator, &dry)
 		}
+	}
+	if dry {
+		request_destroy(c, req)
+		return refuse_stream(c, s)
 	}
 
 	// Charged like body bytes: a stream parked for its body holds its fields as
@@ -1096,9 +1112,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream, block: []u8) -> bool {
 	loop.unlock(&c.mu)
 	if over {
 		request_destroy(c, req)
-		sent := stream_error(c, s.id, .Refused_Stream)
-		close_stream(c, s.id, peer_sending = !s.end_stream)
-		return sent
+		return refuse_stream(c, s)
 	}
 
 	if !complete {
@@ -1232,7 +1246,12 @@ ignored.
 		if need > cap(s.body) {
 			grow = min(max(need, 2 * cap(s.body)), MAX_BODY) - cap(s.body)
 		}
-		if oversized || c.request_bytes + grow > MAX_CONN_REQUEST {
+		refused := c.request_bytes + grow > MAX_CONN_REQUEST
+		// A body there is no room for is refused as one over the budget is.
+		if !oversized && !refused && grow > 0 {
+			refused = reserve(&s.body, cap(s.body) + grow) != nil
+		}
+		if oversized || refused {
 			loop.unlock(&c.mu)
 			// No handler behind this reset either, so it is budgeted like a refused
 			// HEADERS: see stream_error.
@@ -1249,7 +1268,6 @@ ignored.
 			*/
 			return sent && give_connection_credit(c, len(payload))
 		}
-		reserve(&s.body, cap(s.body) + grow)
 		append(&s.body, ..data)
 		s.charged += grow
 		c.request_bytes += grow
@@ -1329,6 +1347,17 @@ mark_stream_closed :: proc(c: ^Conn, s: ^Stream) -> (need_rst: bool) {
 	return
 }
 
+/*
+Reset a stream no handler has been given, as safe to retry (RFC 9113 8.7), and
+retire it: a request this connection has no room or no budget for.
+*/
+@(private)
+refuse_stream :: proc(c: ^Conn, s: ^Stream) -> bool {
+	sent := stream_error(c, s.id, .Refused_Stream)
+	close_stream(c, s.id, peer_sending = !s.end_stream)
+	return sent
+}
+
 @(private)
 dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
 	// Handed over rather than copied, so it is held once; the stream keeps the
@@ -1390,24 +1419,22 @@ MAX_CONN_REQUEST :: 2 * (MAX_BODY + MAX_HEADER_LIST)
 // CREDIT_BATCH has built up.
 @(private)
 give_connection_credit :: proc(c: ^Conn, n: int) -> bool {
-	frame := owe_connection_credit(&c.credit_owed, n)
-	return frame == nil || write_all(c, frame)
+	frame, due := owe_connection_credit(&c.credit_owed, n)
+	return !due || write_all(c, frame)
 }
 
-// Adds `n` to `owed` and, once CREDIT_BATCH has built up, returns the
-// connection WINDOW_UPDATE that pays it all back; nil until then. Server and
-// client alike.
+// Adds `n` to `owed` and, once CREDIT_BATCH has built up, is `due` with the
+// connection WINDOW_UPDATE that pays it all back: nil where there was no room for
+// it, which `io_write_locked` refuses. Server and client alike.
 @(private)
-owe_connection_credit :: proc(owed: ^int, n: int) -> []u8 {
+owe_connection_credit :: proc(owed: ^int, n: int) -> (frame: []u8, due: bool) {
 	owed^ += n
 	if owed^ < CREDIT_BATCH {
-		return nil
+		return nil, false
 	}
-	out := make([dynamic]u8, 0, 13, context.temp_allocator)
-	write_frame_header(&out, 4, .Window_Update, 0, 0)
-	append_u32(&out, u32(owed^))
+	frame = window_update_frame(owed^)
 	owed^ = 0
-	return out[:]
+	return frame, true
 }
 
 // A RST_STREAM the peer drew without a handler behind it, charged against
@@ -1495,7 +1522,12 @@ respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
 		return true
 	}
 
-	block := make([dynamic]u8, 0, 128, context.temp_allocator)
+	dry := false
+	watch := dns.Dry_Watch {
+		backing = context.temp_allocator,
+		dry     = &dry,
+	}
+	block := make([dynamic]u8, 0, 128, dns.dry_watch_allocator(&watch))
 	status: [3]u8
 	encode_header(&block, ":status", status_text(&status, resp.status))
 	if resp.content_type != "" {
@@ -1516,11 +1548,13 @@ respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
 	}
 	encode_header(&block, "server", "elodin")
 
-	out := make([dynamic]u8, 0, len(block) + 32, context.temp_allocator)
-	end_stream := u8(FLAG_END_STREAM) if len(resp.body) == 0 else 0
-	write_frame_header(&out, len(block), .Headers, FLAG_END_HEADERS | end_stream, stream_id)
-	append(&out, ..block[:])
-	if !write_all(c, out[:]) {
+	frame := headers_frame(stream_id, block[:], end_stream = len(resp.body) == 0)
+	if dry || frame == nil {
+		abandon_response(c, stream_id)
+		close_stream(c, stream_id)
+		return false
+	}
+	if !write_all(c, frame) {
 		close_stream(c, stream_id)
 		return false
 	}
@@ -1592,12 +1626,33 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 		}
 		loop.unlock(&c.mu)
 
-		if !write_all(c, data_frame(stream_id, body[sent:sent + chunk], sent + chunk >= len(body))) {
+		frame := data_frame(stream_id, body[sent:sent + chunk], end_stream = sent + chunk >= len(body))
+		if frame == nil {
+			abandon_response(c, stream_id)
+			return false
+		}
+		if !write_all(c, frame) {
 			return false
 		}
 		sent += chunk
 	}
 	return true
+}
+
+/*
+Reset a stream whose response this end has no room to build: INTERNAL_ERROR
+(RFC 9113 7), so the peer is not left waiting on a response that never comes,
+and nothing short of it goes out. The caller retires the stream.
+*/
+@(private)
+abandon_response :: proc(c: ^Conn, stream_id: u32) {
+	loop.lock(&c.mu)
+	s, found := c.streams[stream_id]
+	need_rst := found && mark_stream_closed(c, s)
+	loop.unlock(&c.mu)
+	if need_rst {
+		rst_stream(c, stream_id, .Internal_Error)
+	}
 }
 
 /*
