@@ -245,7 +245,7 @@ answers_arrive_whole :: proc(t: ^testing.T, dry: bool) {
 			}
 		}
 	}
-	testing.expect(t, sync.atomic_load(&session.answered), "no answer was counted as written")
+	testing.expect(t, stream_answered(&session), "no answer was counted as written")
 	testing.expect(t, !sync.atomic_load(&session.broken), "a write failed")
 }
 
@@ -289,7 +289,7 @@ test_a_broken_stream_is_not_written_to :: proc(t: ^testing.T) {
 		if !testing.expect(t, started, "a writer did not start") {
 			return
 		}
-		testing.expect(t, sync.atomic_load(&session.answered) != sync.atomic_load(&session.broken), "answered and broken agree")
+		testing.expect(t, stream_answered(&session) != sync.atomic_load(&session.broken), "answered and broken agree")
 		session.broken = false
 	}
 	got: [2 + len(written)]u8

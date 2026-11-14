@@ -2043,7 +2043,7 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		if !stream_admits(s, conn.peer) {
 			report_rate_limited(client, proto, true)
 			stream_settle(&session)
-			if sync.atomic_load(&session.answered) {
+			if stream_answered(&session) {
 				stream_linger(conn)
 			}
 			return

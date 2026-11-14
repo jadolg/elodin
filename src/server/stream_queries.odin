@@ -46,11 +46,10 @@ Stream_Session :: struct {
 	own_busy:  bool,
 	// Held across one whole answer, prefix and body, so two never interleave.
 	write_mu:  loop.Mutex,
-	// Set under `write_mu`, read by the reader: whether an answer has gone out,
-	// and whether a write has failed, after which nothing more is written.
-	answered:  bool,
-	broken:    bool,
-	// When the last answer went out, for `stream_awaited`. Atomic, by `_nsec`.
+	// Set under `write_mu`, read by the reader: whether a write has failed,
+	// after which nothing more is written, and when the last answer went out -
+	// zero before the first (`stream_answered`). Atomic, the tick by `_nsec`.
+	broken:      bool,
 	last_answer: time.Tick,
 }
 
@@ -179,8 +178,8 @@ lock, so answers written from several fibers never interleave.
 
 An answer the scratch has no room to frame goes out as its prefix and then its
 body, still under the lock and so still whole on the wire. A write that fails
-marks the connection broken, and every answer after it is dropped; the reader
-ends the connection at its next message.
+marks the connection broken, drops every answer after it, and shuts the read
+side, so the reader ends the connection at once.
 */
 @(private)
 stream_write_answer :: proc(session: ^Stream_Session, response: []u8) {
@@ -199,7 +198,6 @@ stream_write_answer :: proc(session: ^Stream_Session, response: []u8) {
 		written = conn_write_all(session.conn, prefix[:]) && conn_write_all(session.conn, response)
 	}
 	if written {
-		sync.atomic_store(&session.answered, true)
 		sync.atomic_store(&session.last_answer._nsec, loop.tick_now()._nsec)
 		return
 	}
@@ -208,6 +206,12 @@ stream_write_answer :: proc(session: ^Stream_Session, response: []u8) {
 	// on the client's next message, sees the end of the stream at once rather than
 	// at the end of its idle wait.
 	net.shutdown(session.conn.socket, .Receive)
+}
+
+// Whether an answer has gone out on the connection.
+@(private)
+stream_answered :: proc(session: ^Stream_Session) -> bool {
+	return sync.atomic_load(&session.last_answer._nsec) != 0
 }
 
 /*
@@ -224,7 +228,7 @@ stream_awaited :: proc(session: ^Stream_Session, idle: time.Duration) -> bool {
 	in_flight := session.in_flight
 	sync.mutex_unlock(&session.mu)
 	last := time.Tick{sync.atomic_load(&session.last_answer._nsec)}
-	return in_flight > 0 || (last != (time.Tick{}) && loop.tick_since(last) < idle)
+	return in_flight > 0 || (stream_answered(session) && loop.tick_since(last) < idle)
 }
 
 /*

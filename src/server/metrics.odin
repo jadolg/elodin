@@ -974,8 +974,10 @@ The event loops, and the queries in flight on them.
 is keeping up: every UDP and HTTP/2 query, every TCP or DoT query beyond its
 connection's own place, and every refresh is counted from the
 moment it is admitted until it is answered, and a figure that sits at
-`elodin_queries_inflight_max` is `server.max_pending` turning queries away - the
-same moment `elodin_queries_dropped_total` starts counting. `elodin_fibers` is
+`elodin_queries_inflight_max` is `server.max_pending` turning queries away: a
+datagram or an HTTP/2 request is dropped and counted in
+`elodin_queries_dropped_total`, and a TCP or DoT query waits for its
+connection's own place, which nothing counts since nothing is lost. `elodin_fibers` is
 everything each loop is running: those queries, the connections it serves, and
 the racers and upstream readers they started.
 */
