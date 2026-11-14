@@ -558,7 +558,10 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 	headers, err := decode(&c.decoder, c.header_scratch[:], context.temp_allocator)
 	clear(&c.header_scratch)
 	if err != .None {
-		client_goaway(c, hpack_goaway_code(err))
+		// INTERNAL_ERROR where this end had no room to decode it, which is no
+		// fault of the peer's (RFC 9113 7); COMPRESSION_ERROR for the peer's
+		// block (RFC 9113 4.3).
+		client_goaway(c, .Internal_Error if err == .Out_Of_Memory else .Compression_Error)
 		return false
 	}
 
@@ -941,6 +944,9 @@ client_request :: proc(
 	s := new(Client_Stream, c.allocator)
 	if s == nil || map_insert(&c.streams, stream_id, s) == nil {
 		free(s, c.allocator)
+		// Leaving without the slot, so the wake that may have let this request
+		// through goes to the next waiter rather than with it.
+		loop.cond_signal(&c.slot_cond)
 		loop.unlock(&c.mu)
 		return {}, .Out_Of_Memory
 	}
@@ -1133,10 +1139,12 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 		if frame == nil {
 			// No room for the rest of the body: reset rather than leave the
 			// peer waiting on it, and marked first, as the timeout above is.
-			// The credit was not spent (RFC 9113 6.9.1), and goes back.
+			// The credit was not spent (RFC 9113 6.9.1), and goes back to
+			// whoever is waiting for it.
 			loop.lock(&c.mu)
 			c.send_window += chunk
 			s.send_window += chunk
+			loop.cond_broadcast(&c.cond)
 			s.dry = true
 			s.rst_sent = true
 			loop.unlock(&c.mu)

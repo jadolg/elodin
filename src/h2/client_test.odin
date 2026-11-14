@@ -2593,3 +2593,232 @@ test_client_request_cut_short_by_this_ends_memory_is_out_of_memory :: proc(t: ^t
 	testing.expect_value(t, answer.goaway, Error_Code.Internal_Error)
 	free_all(context.temp_allocator)
 }
+
+// Counts the frames a client writes, and posts `headers` and `data` as each kind
+// goes out, for a test on another thread to wait on.
+@(private = "file")
+Frame_Signal :: struct {
+	headers: sync.Sema,
+	data:    sync.Sema,
+}
+
+@(private = "file")
+signal_write :: proc(user: rawptr, buf: []u8) -> bool {
+	sig := cast(^Frame_Signal)user
+	if h, ok := parse_frame_header(buf); ok {
+		#partial switch h.type {
+		case .Headers:
+			sync.sema_post(&sig.headers)
+		case .Data:
+			sync.sema_post(&sig.data)
+		}
+	}
+	return true
+}
+
+@(private = "file")
+Pending_Request :: struct {
+	c:    ^Client,
+	body: []u8,
+	err:  Client_Error,
+}
+
+@(private = "file")
+run_request :: proc(r: ^Pending_Request) {
+	req := DOH_REQUEST
+	req.body = r.body
+	_, r.err = client_request(r.c, req, 5 * time.Second)
+	free_all(context.temp_allocator)
+}
+
+// Ends the client's requests as a closing reader would.
+@(private = "file")
+close_client :: proc(c: ^Client) {
+	loop.lock(&c.mu)
+	sync.atomic_store(&c.closed, true)
+	loop.cond_broadcast(&c.cond)
+	loop.cond_broadcast(&c.slot_cond)
+	loop.unlock(&c.mu)
+}
+
+/*
+A request woken for a free stream slot that then has no room to open a stream
+passes the wake on: `client_request`'s cleanup wakes one waiter per slot, and
+one spent on a request that leaves without the slot would leave the next one
+parked beside it until its deadline, a Timeout charged to the upstream.
+*/
+@(test)
+test_a_request_with_no_room_passes_its_slot_on :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	sig: Frame_Signal
+	c := client_make(IO{user = &sig, read = no_read, write = signal_write}, allocator)
+	if !testing.expect(t, c != nil, "cannot make the client") {
+		return
+	}
+	// One slot, taken.
+	c.peer_max_streams = 1
+	held := open_test_stream(c, 1, allocator)
+
+	reqs: [2]Pending_Request
+	threads: [2]^thread.Thread
+	for &r, i in reqs {
+		r.c = c
+		threads[i] = thread.create_and_start_with_poly_data(&r, run_request)
+		if !testing.expectf(t, threads[i] != nil && wait_for_waiter(&c.slot_cond, n = i + 1), "request %d is not waiting for a slot", i) {
+			close_client(c)
+			for th in threads[:i + 1] {
+				if th != nil {
+					thread.join(th)
+					thread.destroy(th)
+				}
+			}
+			client_unref(c)
+			return
+		}
+	}
+
+	// Whichever wakes first has no room for its stream.
+	f := Fail_Nth {
+		backing  = allocator,
+		fail_at  = 1,
+		fail_for = 1,
+	}
+	loop.lock(&c.mu)
+	c.allocator = fail_nth(&f)
+	// The slot freed as `client_request`'s cleanup frees it.
+	delete_key(&c.streams, u32(1))
+	client_stream_destroy(c, held)
+	loop.cond_signal(&c.slot_cond)
+	loop.unlock(&c.mu)
+
+	// Well inside the waiters' own five seconds.
+	sent := sync.sema_wait_with_timeout(&sig.headers, 2 * time.Second)
+	testing.expect(t, sent, "the other request never took the freed slot")
+	close_client(c)
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	testing.expect(t, refused_any(&f), "nothing was refused")
+	errs := [2]Client_Error{reqs[0].err, reqs[1].err}
+	testing.expectf(t, errs == {.Out_Of_Memory, .Closed} || errs == {.Closed, .Out_Of_Memory}, "requests ended %v", errs)
+	loop.lock(&c.mu)
+	c.allocator = allocator
+	loop.unlock(&c.mu)
+	client_unref(c)
+	expect_no_leaks(t, &track, "slot passed on")
+	free_all(context.temp_allocator)
+}
+
+// Hands every request to `backing`, but holds the `block_at`th until `release`
+// is posted, and then refuses it, posting `reached` first.
+@(private = "file")
+Gate :: struct {
+	backing:  mem.Allocator,
+	seen:     int,
+	block_at: int,
+	reached:  sync.Sema,
+	release:  sync.Sema,
+}
+
+@(private = "file")
+gate_proc :: proc(
+	data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	loc := #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	g := cast(^Gate)data
+	#partial switch mode {
+	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
+		g.seen += 1
+		if g.seen == g.block_at {
+			sync.sema_post(&g.reached)
+			sync.sema_wait(&g.release)
+			return nil, .Out_Of_Memory
+		}
+	}
+	return g.backing.procedure(g.backing.data, mode, size, alignment, old_memory, old_size, loc)
+}
+
+@(private = "file")
+Gated_Request :: struct {
+	using r: Pending_Request,
+	gate:    ^Gate,
+}
+
+@(private = "file")
+run_gated_request :: proc(r: ^Gated_Request) {
+	r.gate.backing = context.temp_allocator
+	context.temp_allocator = mem.Allocator{procedure = gate_proc, data = r.gate}
+	run_request(&r.r)
+}
+
+/*
+Connection credit a body took for a DATA frame it had no room to build goes
+back, and the uploads waiting for credit are woken to it: left parked, one would
+wait out its deadline beside credit it could use.
+*/
+@(test)
+test_credit_a_body_had_no_room_to_send_wakes_the_next :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	sig: Frame_Signal
+	c := client_make(IO{user = &sig, read = no_read, write = signal_write}, allocator)
+	if !testing.expect(t, c != nil, "cannot make the client") {
+		return
+	}
+	// Room on the connection for one three-byte body.
+	c.send_window = 3
+
+	// The first request's third temp allocation is its DATA frame: the header
+	// block and the HEADERS frame come before it.
+	gate := Gate {
+		block_at = 3,
+	}
+	first := Gated_Request {
+		r = {c = c, body = []u8{1, 2, 3}},
+		gate = &gate,
+	}
+	ft := thread.create_and_start_with_poly_data(&first, run_gated_request)
+	if !testing.expect(t, ft != nil && sync.sema_wait_with_timeout(&gate.reached, 5 * time.Second), "the first request never built its DATA frame") {
+		sync.sema_post(&gate.release)
+		close_client(c)
+		if ft != nil {
+			thread.join(ft)
+			thread.destroy(ft)
+		}
+		client_unref(c)
+		return
+	}
+	// It holds the connection's credit; the second waits for some.
+	second := Pending_Request {
+		c    = c,
+		body = []u8{4, 5, 6},
+	}
+	st := thread.create_and_start_with_poly_data(&second, run_request)
+	waiting := st != nil && wait_for_waiter(&c.cond)
+	testing.expect(t, waiting, "the second request is not waiting for credit")
+	sync.sema_post(&gate.release)
+
+	sent := waiting && sync.sema_wait_with_timeout(&sig.data, 2 * time.Second)
+	testing.expect(t, sent, "the second request never sent its body")
+	close_client(c)
+	thread.join(ft)
+	thread.destroy(ft)
+	if st != nil {
+		thread.join(st)
+		thread.destroy(st)
+	}
+	testing.expect_value(t, first.err, Client_Error.Out_Of_Memory)
+	testing.expect_value(t, second.err, Client_Error.Closed)
+	client_unref(c)
+	expect_no_leaks(t, &track, "credit passed on")
+	free_all(context.temp_allocator)
+}

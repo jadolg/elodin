@@ -409,7 +409,9 @@ serve_one :: proc(
 	_, open := c.streams[1]
 	switch {
 	// Or with nothing written, where the GOAWAY or RST_STREAM had no room either.
-	case !ok && seen.dispatched == 0 && (log.goaway_code == .Internal_Error || len(log.frames) == 0):
+	// Stream 1 was never acted on, so the GOAWAY leaves the client free to
+	// retry it (RFC 9113 6.8).
+	case !ok && seen.dispatched == 0 && (log.goaway_code == .Internal_Error && log.goaway_last == 0 || len(log.frames) == 0):
 		return .Connection_Ended, refused
 	case ok && log.rst_code == .Refused_Stream && !open && seen.dispatched == 0:
 		return .Stream_Refused, refused
@@ -923,6 +925,9 @@ test_hpack_state_without_room_ends_the_connection_as_this_ends :: proc(t: ^testi
 		sc.decoder.allocator = fail_nth(&f)
 		testing.expectf(t, !handle_headers(sc, h, c.block), "server: %v kept the connection", c.want)
 		testing.expect_value(t, slog.goaway_code, c.want)
+		// A request this end had no room to decode was not acted on, and may be
+		// retried (RFC 9113 6.8); one the peer got wrong is its own.
+		testing.expect_value(t, slog.goaway_last, u32(0) if c.dry else 1)
 		sc.decoder.allocator = allocator
 		conn_done(t, sc, &track, "server HPACK", &slog)
 
@@ -1004,4 +1009,51 @@ test_control_frames_need_no_room :: proc(t: ^testing.T) {
 	delete(clog.frames)
 	client_unref(cc)
 	conn_done(t, sc, &track, "control frames", &slog)
+}
+
+/*
+A CONTINUATION the server has no room to add ends the connection with
+GOAWAY(INTERNAL_ERROR), and leaves the request it was continuing free to retry
+(RFC 9113 6.8): nothing acted on it. With room, the block completes and the
+request is served.
+*/
+@(test)
+test_a_header_block_continued_without_room_can_be_retried :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	defer free_all(context.temp_allocator)
+	block := request_block()
+	half := len(block) / 2
+	for refuse in ([]bool{false, true}) {
+		f := Fail_Nth {
+			backing = allocator,
+		}
+		log: Frame_Log
+		log.frames = make([dynamic]Frame_Header, 0, 8, allocator)
+		seen: Seen_Requests
+		c := make_conn(IO{user = &log, read = no_read, write = log_write}, check_request, &seen, fail_nth(&f))
+		if !testing.expect(t, c != nil, "cannot make the connection") {
+			delete(log.frames)
+			return
+		}
+		opened := handle_headers(c, Frame_Header{length = half, type = .Headers, flags = FLAG_END_STREAM, stream_id = 1}, block[:half])
+		testing.expect(t, opened, "the block was not opened")
+		if refuse {
+			// The held block grows to take the rest.
+			arm(&f, 1, 1)
+		}
+		rest := block[half:]
+		ok := handle_continuation(c, Frame_Header{length = len(rest), type = .Continuation, flags = FLAG_END_HEADERS, stream_id = 1}, rest)
+		if refuse {
+			testing.expect(t, !ok && refused_any(&f), "a CONTINUATION without room was added")
+			testing.expect_value(t, log.goaway_code, Error_Code.Internal_Error)
+			testing.expect_value(t, log.goaway_last, u32(0))
+		} else {
+			testing.expect(t, ok, "a CONTINUATION with room was refused")
+			testing.expect_value(t, seen.whole, 1)
+		}
+		conn_unref(c)
+		delete(log.frames)
+	}
+	expect_no_leaks(t, &track, "continuation without room")
 }

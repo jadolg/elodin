@@ -69,8 +69,9 @@ Frame_Log :: struct {
 	frames:      [dynamic]Frame_Header,
 	// Sum of the connection WINDOW_UPDATE increments written.
 	credit:      int,
-	// Error code of the last GOAWAY written.
+	// Error code and last stream id of the last GOAWAY written.
 	goaway_code: Error_Code,
+	goaway_last: u32,
 	// Error code of the last RST_STREAM written.
 	rst_code:    Error_Code,
 }
@@ -98,6 +99,7 @@ log_write :: proc(user: rawptr, buf: []u8) -> bool {
 		}
 		if h.type == .Goaway && pos + FRAME_HEADER_SIZE + 8 <= len(buf) {
 			log.goaway_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE + 4:]))
+			log.goaway_last = read_u32(buf[pos + FRAME_HEADER_SIZE:])
 		}
 		if h.type == .Rst_Stream && pos + FRAME_HEADER_SIZE + 4 <= len(buf) {
 			log.rst_code = Error_Code(read_u32(buf[pos + FRAME_HEADER_SIZE:]))
@@ -177,17 +179,21 @@ client_done :: proc(t: ^testing.T, c: ^Client, track: ^mem.Tracking_Allocator, w
 }
 
 /*
-Waits for somebody to be parked on `c`: a thread in `cond_wait` is on its list
-from before it lets its lock go until it is woken. False after five seconds.
+Waits for `n` waiters to be parked on `c`: a thread in `cond_wait` is on its
+list from before it lets its lock go until it is woken. False after five
+seconds.
 */
 @(private)
-wait_for_waiter :: proc(c: ^loop.Cond) -> bool {
+wait_for_waiter :: proc(c: ^loop.Cond, n := 1) -> bool {
 	deadline := time.tick_add(time.tick_now(), 5 * time.Second)
 	for time.tick_diff(time.tick_now(), deadline) > 0 {
 		sync.mutex_lock(&c.mu)
-		parked := c.waiters.head != nil
+		parked := 0
+		for w := c.waiters.head; w != nil; w = w.next {
+			parked += 1
+		}
 		sync.mutex_unlock(&c.mu)
-		if parked {
+		if parked >= n {
 			return true
 		}
 		time.sleep(time.Millisecond)

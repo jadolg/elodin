@@ -343,17 +343,6 @@ header_fragment :: proc(payload: []u8, flags: u8) -> (block: []u8, code: Error_C
 }
 
 /*
-The GOAWAY code a header block that does not decode draws, client and server
-alike: COMPRESSION_ERROR for the peer's block (RFC 9113 4.3), and INTERNAL_ERROR
-where this end had no room to decode it, which is no fault of the peer's (RFC
-9113 7).
-*/
-@(private)
-hpack_goaway_code :: proc(err: Hpack_Error) -> Error_Code {
-	return .Internal_Error if err == .Out_Of_Memory else .Compression_Error
-}
-
-/*
 Add a CONTINUATION frame to the header block open on `on^`, client and server
 alike. `complete` once END_HEADERS closes it, which clears `on^`; `refuse` is
 the GOAWAY code a frame that may not continue it draws, and INTERNAL_ERROR where

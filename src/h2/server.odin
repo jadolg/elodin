@@ -700,6 +700,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 			return false
 		}
 	} else {
+		prev_stream_id := c.last_stream_id
 		c.last_stream_id = h.stream_id
 
 		/*
@@ -720,6 +721,9 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		// decoded in step with the peer's encoder: the connection ends.
 		if s == nil || map_insert(&c.streams, h.stream_id, s) == nil {
 			free(s, c.allocator)
+			// Never acted on, so the GOAWAY leaves the client free to retry it
+			// (RFC 9113 6.8).
+			c.last_stream_id = prev_stream_id
 			loop.unlock(&c.mu)
 			goaway(c, .Internal_Error)
 			return false
@@ -746,7 +750,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		delete(c.header_block)
 		c.header_block = make([dynamic]u8, 0, len(block), c.allocator)
 		if !append_whole(&c.header_block, block) {
-			goaway(c, .Internal_Error)
+			goaway_dry(c, c.block_stream)
 			return false
 		}
 		c.continuation_on = h.stream_id
@@ -760,7 +764,11 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	complete, refuse := continue_header_block(&c.continuation_on, &c.continuation_frames, &c.header_block, h, payload)
 	if code, bad := refuse.?; bad {
-		goaway(c, code)
+		if code == .Internal_Error {
+			goaway_dry(c, c.block_stream)
+		} else {
+			goaway(c, code)
+		}
 		return false
 	}
 	if !complete {
@@ -1021,8 +1029,12 @@ finish_headers :: proc(c: ^Conn, s: ^Stream, block: []u8) -> bool {
 	delete(c.header_block)
 	c.header_block = nil
 	c.block_stream = nil
+	if err == .Out_Of_Memory {
+		goaway_dry(c, s)
+		return false
+	}
 	if err != .None {
-		goaway(c, hpack_goaway_code(err))
+		goaway(c, .Compression_Error)
 		return false
 	}
 
@@ -1485,6 +1497,23 @@ goaway :: proc(c: ^Conn, code: Error_Code) {
 	loop.unlock(&c.mu)
 	frame := goaway_frame(last, code)
 	_ = write_all(c, frame[:])
+}
+
+/*
+End the connection for want of room to read the header block that opens `s`, or
+continues it (nil for one no stream is waiting on): GOAWAY(INTERNAL_ERROR), no
+fault of the peer's (RFC 9113 7). A stream nothing has acted on is taken off the
+last stream id, so the client may retry it (RFC 9113 6.8); the ids below it, odd
+and increasing, all still fall under the one that replaces it.
+*/
+@(private)
+goaway_dry :: proc(c: ^Conn, s: ^Stream) {
+	loop.lock(&c.mu)
+	if s != nil && s.id == c.last_stream_id && s.pending == nil && !s.dispatched {
+		c.last_stream_id = s.id - 2 if s.id > 2 else 0
+	}
+	loop.unlock(&c.mu)
+	goaway(c, .Internal_Error)
 }
 
 /*
