@@ -100,16 +100,16 @@ test_a_frame_with_no_room_for_its_payload_is_not_read :: proc(t: ^testing.T) {
 		backing = context.temp_allocator,
 	}
 	h, payload, refuse, ok, unread := read_with(wire[:], fail_nth(&f))
-	testing.expect(t, ok, "a PING with room for it was not read")
+	testing.expectf(t, ok && refuse == nil, "a PING with room for it was not read: %v", refuse)
 	testing.expect_value(t, h.type, Frame_Type.Ping)
 	testing.expectf(t, string(payload) == string(wire[FRAME_HEADER_SIZE:]), "payload %v", payload)
 	testing.expect_value(t, unread, 0)
 
 	arm(&f, 1, 1)
-	_, _, refuse, ok, _ = read_with(wire[:], fail_nth(&f))
-	testing.expect(t, !ok, "a PING without room for its payload was read")
-	code, bad := refuse.?
-	testing.expectf(t, bad && code == .Internal_Error, "drew %v", refuse)
+	dry_h, dry_payload, dry_refuse, dry_ok, dry_unread := read_with(wire[:], fail_nth(&f))
+	testing.expectf(t, !dry_ok && dry_payload == nil, "a %v without room for its payload was read, %d bytes left", dry_h.type, dry_unread)
+	code, bad := dry_refuse.?
+	testing.expectf(t, bad && code == .Internal_Error, "drew %v", dry_refuse)
 }
 
 @(private = "file")
@@ -119,72 +119,62 @@ count_writes :: proc(user: rawptr, buf: []u8) -> bool {
 }
 
 /*
-Every frame this end writes is built whole or not at all, and one not built is a
-write that fails: a frame cut short would put the rest of the connection out of
-step. Each is checked byte for byte with room, so a nil without room is the
-builder refusing and not a builder that never builds.
+Every frame this end writes, byte for byte. DATA and HEADERS are built whole or
+not at all, and one not built is a write that fails: a frame cut short would put
+the rest of the connection out of step. The rest need no memory; see
+`test_control_frames_need_no_room`.
 */
 @(test)
 test_a_frame_with_no_room_is_not_built :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	Builder :: enum {
-		Data,
-		Headers,
-		Rst_Stream,
-		Goaway,
-		Ping_Ack,
-		Settings_Ack,
-		Window_Update,
-		Opening,
-	}
+	ping := [8]u8{1, 2, 3, 4, 5, 6, 7, 8}
+	chunk := []u8{'a', 'b', 'c'}
+	settings := [?]Setting_Value{{.Enable_Push, 0}}
+	rst := rst_stream_frame(5, .Cancel)
+	goaway := goaway_frame(7, .Internal_Error)
+	ack := ping_ack_frame(ping[:])
+	settings_ack := settings_ack_frame()
+	window := window_update_frame(0x10000)
+	opening_buf: [len("PRI ") + 2 * FRAME_HEADER_SIZE + SETTING_SIZE * len(settings) + 4]u8
+	opening := opening_frames(opening_buf[:], "PRI ", settings[:])
 	// RFC 9113 4.1: length (3), type, flags, stream (4), then the payload.
-	want := [Builder]string {
-		.Data          = "000003000100000001616263",
-		.Headers       = "000003010400000003616263",
-		.Rst_Stream    = "00000403000000000500000008",
-		.Goaway        = "0000080700000000000000000700000002",
-		.Ping_Ack      = "0000080601000000000102030405060708",
-		.Settings_Ack  = "000000040100000000",
-		.Window_Update = "00000408000000000000010000",
+	fixed := []struct {
+		name:  string,
+		frame: []u8,
+		want:  string,
+	} {
+		{"RST_STREAM", rst[:], "00000403000000000500000008"},
+		{"GOAWAY", goaway[:], "0000080700000000000000000700000002"},
+		{"PING ACK", ack[:], "0000080601000000000102030405060708"},
+		{"SETTINGS ACK", settings_ack[:], "000000040100000000"},
+		{"WINDOW_UPDATE", window[:], "00000408000000000000010000"},
 		// "PRI ", SETTINGS ENABLE_PUSH=0, WINDOW_UPDATE of RECV_WINDOW - DEFAULT_WINDOW.
-		.Opening       = "50524920" + "000006040000000000" + "000200000000" + "000004080000000000" + "000f0001",
+		{"opening", opening, "50524920" + "000006040000000000" + "000200000000" + "000004080000000000" + "000f0001"},
 	}
-	build :: proc(b: Builder) -> []u8 {
-		ping := [8]u8{1, 2, 3, 4, 5, 6, 7, 8}
-		chunk := "abc"
-		settings := [?]Setting_Value{{.Enable_Push, 0}}
-		switch b {
-		case .Data:
-			return data_frame(1, transmute([]u8)chunk, end_stream = true)
-		case .Headers:
-			return headers_frame(3, transmute([]u8)chunk, end_stream = false)
-		case .Rst_Stream:
-			return rst_stream_frame(5, .Cancel)
-		case .Goaway:
-			return goaway_frame(7, .Internal_Error)
-		case .Ping_Ack:
-			return ping_ack_frame(ping[:])
-		case .Settings_Ack:
-			return settings_ack_frame()
-		case .Window_Update:
-			return window_update_frame(0x10000)
-		case .Opening:
-			return opening_frames("PRI ", settings[:])
-		}
-		return nil
+	for c in fixed {
+		want := from_hex(c.want)
+		testing.expectf(t, want != nil && string(c.frame) == string(want), "%s built as %x", c.name, c.frame)
 	}
-	for b in Builder {
+
+	for end_stream in ([]bool{true, false}) {
 		f := Fail_Nth {
 			backing = context.temp_allocator,
 		}
-		context.temp_allocator = fail_nth(&f)
-		whole := build(b)
-		arm(&f, 1, 1)
-		refused := build(b)
-		context.temp_allocator = f.backing
-		got := from_hex(want[b])
-		testing.expectf(t, got != nil && string(whole) == string(got), "%v built as %x", b, whole)
-		testing.expectf(t, refused == nil, "%v built without room: %x", b, refused)
+		data, headers, refused_data, refused_headers: []u8
+		{
+			context.temp_allocator = fail_nth(&f)
+			data = data_frame(1, chunk, end_stream = end_stream)
+			headers = headers_frame(3, chunk, end_stream = end_stream)
+			arm(&f, 1, 1)
+			refused_data = data_frame(1, chunk, end_stream = end_stream)
+			arm(&f, 1, 1)
+			refused_headers = headers_frame(3, chunk, end_stream = end_stream)
+		}
+		want_data := from_hex("000003000100000001616263" if end_stream else "000003000000000001616263")
+		want_headers := from_hex("000003010500000003616263" if end_stream else "000003010400000003616263")
+		testing.expectf(t, string(data) == string(want_data), "DATA built as %x", data)
+		testing.expectf(t, string(headers) == string(want_headers), "HEADERS built as %x", headers)
+		testing.expectf(t, refused_data == nil && refused_headers == nil, "built without room: %x, %x", refused_data, refused_headers)
 	}
 
 	// And a frame not built is not written.
@@ -198,8 +188,7 @@ test_a_frame_with_no_room_is_not_built :: proc(t: ^testing.T) {
 	closed := false
 	testing.expect(t, !io_write_locked(io, &mu, &closed, nil), "a frame not built was written")
 	testing.expect_value(t, writes, 0)
-	ack := settings_ack_frame()
-	testing.expect(t, io_write_locked(io, &mu, &closed, ack), "a frame was not written")
+	testing.expect(t, io_write_locked(io, &mu, &closed, settings_ack[:]), "a frame was not written")
 	testing.expect_value(t, writes, 1)
 }
 
@@ -605,6 +594,12 @@ test_a_response_without_room_is_reset_not_cut_short :: proc(t: ^testing.T) {
 			}
 			frames, parsed := written_frames(&h)
 			testing.expectf(t, parsed, "run %d at %d: a frame was cut short", run, at)
+			// Only DATA written spends the window (RFC 9113 6.9.1).
+			spent := 0
+			for fh in frames {
+				spent += fh.length if fh.type == .Data else 0
+			}
+			testing.expectf(t, c.send_window == DEFAULT_WINDOW - spent, "run %d at %d: window %d after %d bytes of DATA", run, at, c.send_window, spent)
 			if at == 0 {
 				testing.expect(t, sent, "a response with room was not sent")
 				if len(reference) == 0 {
@@ -642,10 +637,8 @@ test_a_response_without_room_is_reset_not_cut_short :: proc(t: ^testing.T) {
 	expect_no_leaks(t, &track, "response without room")
 }
 
-/*
-A client with no room for itself is not made, and one with no room for its
-preface goes out closed rather than writing part of it.
-*/
+// A client with no room for itself is not made. Its preface needs no memory;
+// see `test_control_frames_need_no_room`.
 @(test)
 test_a_client_without_room_is_not_made :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
@@ -658,37 +651,19 @@ test_a_client_without_room_is_not_made :: proc(t: ^testing.T) {
 		read  = no_read,
 		write = log_write,
 	}
-
 	f := Fail_Nth {
 		backing = allocator,
 	}
 	arm(&f, 1, 1)
 	testing.expect(t, client_make(io, fail_nth(&f)) == nil, "a client with no room for itself was made")
-
-	tf := Fail_Nth {
-		backing = context.temp_allocator,
-	}
-	arm(&tf, 1, 1)
-	c: ^Client
-	{
-		context.temp_allocator = fail_nth(&tf)
-		c = client_make(io, allocator)
-	}
-	if !testing.expect(t, c != nil, "the client was not made") {
-		delete(log.frames)
-		return
-	}
-	testing.expect(t, client_closed(c), "a client with no room for its preface is open")
 	testing.expect_value(t, len(log.frames), 0)
-	client_unref(c)
 
-	// With room, the preface goes out.
-	c = client_make(io, allocator)
-	if !testing.expect(t, c != nil, "the client was not made") {
+	c := client_make(io, fail_nth(&f))
+	if !testing.expect(t, c != nil, "a client with room was not made") {
 		delete(log.frames)
 		return
 	}
-	testing.expect(t, !client_closed(c), "a client with room for its preface is closed")
+	testing.expect(t, !client_closed(c), "a client with room is closed")
 	testing.expect(t, saw_frame(&log, .Settings), "no SETTINGS")
 	client_unref(c)
 	delete(log.frames)
@@ -891,6 +866,12 @@ test_a_request_without_room_is_not_sent_short :: proc(t: ^testing.T) {
 					testing.expectf(t, log.frames[i] == reference[i], "run %d at %d: frame %d is %v, not %v", run, at, i, log.frames[i], reference[i])
 				}
 				testing.expectf(t, w.untracked == 0, "run %d at %d: %d HEADERS for a stream the client does not track", run, at, w.untracked)
+				// Only DATA written spends the window (RFC 9113 6.9.1).
+				spent := 0
+				for fh in log.frames {
+					spent += fh.length if fh.type == .Data else 0
+				}
+				testing.expectf(t, c.send_window == DEFAULT_WINDOW - spent, "run %d at %d: window %d after %d bytes of DATA", run, at, c.send_window, spent)
 				client_unref(c)
 				delete(log.frames)
 				if at > 0 && !refused {
@@ -963,41 +944,64 @@ test_hpack_state_without_room_ends_the_connection_as_this_ends :: proc(t: ^testi
 }
 
 /*
-Connection credit there is no room to return is a write that fails, client and
-server alike, not credit nobody owes: the peer would be left short of window
-for good (RFC 9113 6.9.1).
+The frames that keep a connection going - its opening SETTINGS, the ACKs, the
+connection WINDOW_UPDATE, RST_STREAM and GOAWAY - need no memory, client and
+server alike: they are what tells the peer a stream or connection is over, so
+one that could not be built would leave the peer waiting, short of window for
+good (RFC 9113 6.9.1), or seeing the connection end with no reason given.
 */
 @(test)
-test_credit_without_room_to_return_it_is_a_failed_write :: proc(t: ^testing.T) {
+test_control_frames_need_no_room :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator
 	allocator := track_allocations(&track)
 	defer free_all(context.temp_allocator)
-	for refuse in ([]bool{false, true}) {
-		f := Fail_Nth {
-			backing = context.temp_allocator,
-		}
-		slog, clog: Frame_Log
-		sc := logged_conn(&slog, drop_request, allocator)
-		cc := logged_client(&clog, allocator)
-		// The preface's own WINDOW_UPDATE.
-		clog.credit = 0
-		server_ok, client_ok: bool
-		{
-			context.temp_allocator = fail_nth(&f)
-			if refuse {
-				arm(&f, 1, 1)
-			}
-			server_ok = give_connection_credit(sc, CREDIT_BATCH)
-			if refuse {
-				arm(&f, 1, 1)
-			}
-			client_ok = client_give_connection_credit(cc, CREDIT_BATCH)
-		}
-		testing.expectf(t, server_ok == !refuse && client_ok == !refuse, "refuse %v: server %v, client %v", refuse, server_ok, client_ok)
-		testing.expect_value(t, slog.credit, 0 if refuse else CREDIT_BATCH)
-		testing.expect_value(t, clog.credit, 0 if refuse else CREDIT_BATCH)
-		delete(clog.frames)
-		client_unref(cc)
-		conn_done(t, sc, &track, "credit without room", &slog)
+	ping := [8]u8{1, 2, 3, 4, 5, 6, 7, 8}
+	f := Fail_Nth {
+		backing  = context.temp_allocator,
+		fail_at  = 1,
+		fail_for = max(int) / 2,
 	}
+	slog, clog: Frame_Log
+	slog.frames = make([dynamic]Frame_Header, 0, 8, allocator)
+	clog.frames = make([dynamic]Frame_Header, 0, 8, allocator)
+	sc := make_conn(IO{user = &slog, read = no_read, write = log_write}, drop_request, nil, allocator)
+	cc: ^Client
+	server_ok, client_ok: [5]bool
+	{
+		context.temp_allocator = fail_nth(&f)
+		server_ok = {
+			send_initial_settings(sc),
+			handle_frame(sc, Frame_Header{length = 8, type = .Ping}, ping[:]),
+			handle_frame(sc, Frame_Header{type = .Settings}, nil),
+			give_connection_credit(sc, CREDIT_BATCH),
+			rst_stream(sc, 1, .Internal_Error),
+		}
+		goaway(sc, .Internal_Error)
+		cc = client_make(IO{user = &clog, read = no_read, write = log_write}, allocator)
+		clog.credit = 0
+		client_ok = {
+			!client_closed(cc),
+			client_handle_frame(cc, Frame_Header{length = 8, type = .Ping}, ping[:]),
+			client_handle_frame(cc, Frame_Header{type = .Settings}, nil),
+			client_give_connection_credit(cc, CREDIT_BATCH),
+			client_rst_stream(cc, 1, .Internal_Error),
+		}
+		client_goaway(cc, .Internal_Error)
+	}
+	// Not refused and recovered from: never asked for.
+	testing.expectf(t, f.seen == 0, "%d allocations asked for", f.seen)
+	testing.expectf(t, server_ok == {true, true, true, true, true}, "server: %v", server_ok)
+	testing.expectf(t, client_ok == {true, true, true, true, true}, "client: %v", client_ok)
+	for log, i in ([]^Frame_Log{&slog, &clog}) {
+		end := "server" if i == 0 else "client"
+		testing.expectf(t, count_frames(log, .Settings) == 2, "%s: %d SETTINGS", end, count_frames(log, .Settings))
+		testing.expectf(t, saw_frame(log, .Ping), "%s: no PING ACK", end)
+		testing.expectf(t, count_frames(log, .Window_Update) == 2, "%s: %d WINDOW_UPDATE", end, count_frames(log, .Window_Update))
+		testing.expectf(t, log.credit == (RECV_WINDOW - DEFAULT_WINDOW) + CREDIT_BATCH || i == 1, "%s: credit %d", end, log.credit)
+		testing.expectf(t, log.rst_code == .Internal_Error && log.goaway_code == .Internal_Error, "%s: RST %v, GOAWAY %v", end, log.rst_code, log.goaway_code)
+	}
+	testing.expect_value(t, clog.credit, CREDIT_BATCH)
+	delete(clog.frames)
+	client_unref(cc)
+	conn_done(t, sc, &track, "control frames", &slog)
 }

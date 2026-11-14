@@ -99,13 +99,29 @@ parse_frame_header :: proc(buf: []u8) -> (h: Frame_Header, ok: bool) {
 }
 
 write_frame_header :: proc(out: ^[dynamic]u8, length: int, type: Frame_Type, flags: u8, stream_id: u32) {
-	append(out, u8(length >> 16), u8(length >> 8), u8(length))
-	append(out, u8(type), flags)
-	append(out, u8(stream_id >> 24) & 0x7f, u8(stream_id >> 16), u8(stream_id >> 8), u8(stream_id))
+	h: [FRAME_HEADER_SIZE]u8
+	put_frame_header(h[:], length, type, flags, stream_id)
+	append(out, ..h[:])
 }
 
 append_u32 :: proc(out: ^[dynamic]u8, v: u32) {
-	append(out, u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v))
+	b: [4]u8
+	put_u32(b[:], v)
+	append(out, ..b[:])
+}
+
+// A frame header into the first FRAME_HEADER_SIZE bytes of `out`.
+@(private)
+put_frame_header :: proc(out: []u8, length: int, type: Frame_Type, flags: u8, stream_id: u32) {
+	out[0], out[1], out[2] = u8(length >> 16), u8(length >> 8), u8(length)
+	out[3], out[4] = u8(type), flags
+	put_u32(out[5:], stream_id & 0x7fff_ffff)
+}
+
+// `v` into the first four bytes of `out`, in network byte order.
+@(private)
+put_u32 :: proc(out: []u8, v: u32) {
+	out[0], out[1], out[2], out[3] = u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v)
 }
 
 read_u32 :: proc(b: []u8) -> u32 {
@@ -418,33 +434,20 @@ append_whole :: proc(out: ^[dynamic]u8, bytes: []u8) -> bool {
 }
 
 /*
-Frames this end writes, each built in `context.temp_allocator`, or nil where it
-has no room for one; `io_write_locked` refuses nil, so a frame that could not be
-built is a write that failed, never a short frame on the wire. Each is reserved
-whole, so no append within it can fail.
+DATA and HEADERS, the frames this end writes that carry a payload of any size,
+are built in `context.temp_allocator`, reserved whole, or nil where there is no
+room; `io_write_locked` refuses nil, so a frame not built is a write that
+failed, never a short frame on the wire.
 */
-
-// A frame header followed by `payload`.
 @(private)
-build_frame :: proc(type: Frame_Type, flags: u8, stream_id: u32, payload: ..[]u8) -> []u8 {
-	length := 0
-	for p in payload {
-		length += len(p)
-	}
-	out, ok := dns.alloc_list([dynamic]u8, FRAME_HEADER_SIZE + length, context.temp_allocator)
+build_frame :: proc(type: Frame_Type, flags: u8, stream_id: u32, payload: []u8) -> []u8 {
+	out, ok := dns.alloc_list([dynamic]u8, FRAME_HEADER_SIZE + len(payload), context.temp_allocator)
 	if !ok {
 		return nil
 	}
-	write_frame_header(&out, length, type, flags, stream_id)
-	for p in payload {
-		append(&out, ..p)
-	}
+	write_frame_header(&out, len(payload), type, flags, stream_id)
+	append(&out, ..payload)
 	return out[:]
-}
-
-@(private)
-u32_bytes :: proc(v: u32) -> [4]u8 {
-	return {u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v)}
 }
 
 @(private)
@@ -457,26 +460,47 @@ headers_frame :: proc(stream_id: u32, block: []u8, end_stream: bool) -> []u8 {
 	return build_frame(.Headers, FLAG_END_HEADERS | (u8(FLAG_END_STREAM) if end_stream else 0), stream_id, block)
 }
 
+/*
+The frames that end a stream or connection, acknowledge the peer's, or return
+its window: fixed in size, so built on the stack and never short of memory. One
+that could not be built would leave the peer waiting on a stream, short of
+window for good, or seeing the connection end with no reason given.
+*/
+
 @(private)
-rst_stream_frame :: proc(stream_id: u32, code: Error_Code) -> []u8 {
-	c := u32_bytes(u32(code))
-	return build_frame(.Rst_Stream, 0, stream_id, c[:])
+rst_stream_frame :: proc(stream_id: u32, code: Error_Code) -> (f: [FRAME_HEADER_SIZE + 4]u8) {
+	put_frame_header(f[:], 4, .Rst_Stream, 0, stream_id)
+	put_u32(f[FRAME_HEADER_SIZE:], u32(code))
+	return
 }
 
 @(private)
-goaway_frame :: proc(last_stream_id: u32, code: Error_Code) -> []u8 {
-	last, c := u32_bytes(last_stream_id), u32_bytes(u32(code))
-	return build_frame(.Goaway, 0, 0, last[:], c[:])
+goaway_frame :: proc(last_stream_id: u32, code: Error_Code) -> (f: [FRAME_HEADER_SIZE + 8]u8) {
+	put_frame_header(f[:], 8, .Goaway, 0, 0)
+	put_u32(f[FRAME_HEADER_SIZE:], last_stream_id & 0x7fff_ffff)
+	put_u32(f[FRAME_HEADER_SIZE + 4:], u32(code))
+	return
+}
+
+// `payload` is the PING's eight bytes, which the caller has checked.
+@(private)
+ping_ack_frame :: proc(payload: []u8) -> (f: [FRAME_HEADER_SIZE + 8]u8) {
+	put_frame_header(f[:], 8, .Ping, FLAG_ACK, 0)
+	copy(f[FRAME_HEADER_SIZE:], payload)
+	return
 }
 
 @(private)
-ping_ack_frame :: proc(payload: []u8) -> []u8 {
-	return build_frame(.Ping, FLAG_ACK, 0, payload)
+settings_ack_frame :: proc() -> (f: [FRAME_HEADER_SIZE]u8) {
+	put_frame_header(f[:], 0, .Settings, FLAG_ACK, 0)
+	return
 }
 
 @(private)
-settings_ack_frame :: proc() -> []u8 {
-	return build_frame(.Settings, FLAG_ACK, 0)
+window_update_frame :: proc(increment: int) -> (f: [FRAME_HEADER_SIZE + 4]u8) {
+	put_frame_header(f[:], 4, .Window_Update, 0, 0)
+	put_u32(f[FRAME_HEADER_SIZE:], u32(increment))
+	return
 }
 
 @(private)
@@ -485,32 +509,28 @@ Setting_Value :: struct {
 	value: u32,
 }
 
+// The bytes one SETTINGS entry takes (RFC 9113 6.5.1).
+@(private)
+SETTING_SIZE :: 6
+
 /*
-What each end opens a connection with: `prefix` (the client's preface, or
-nothing), a SETTINGS frame of `settings`, and the WINDOW_UPDATE that raises the
-connection's receive window from DEFAULT_WINDOW to RECV_WINDOW. Nil where there
-is no room, as the frame builders below.
+What each end opens a connection with, into `buf`: `prefix` (the client's
+preface, or nothing), a SETTINGS frame of `settings`, and the WINDOW_UPDATE that
+raises the connection's receive window from DEFAULT_WINDOW to RECV_WINDOW.
+Returns the bytes written; `buf` has room for `len(prefix) + 2 *
+FRAME_HEADER_SIZE + SETTING_SIZE * len(settings) + 4`.
 */
 @(private)
-opening_frames :: proc(prefix: string, settings: []Setting_Value) -> []u8 {
-	size := len(prefix) + FRAME_HEADER_SIZE + 6 * len(settings) + FRAME_HEADER_SIZE + 4
-	out, ok := dns.alloc_list([dynamic]u8, size, context.temp_allocator)
-	if !ok {
-		return nil
-	}
-	append(&out, prefix)
-	write_frame_header(&out, 6 * len(settings), .Settings, 0, 0)
+opening_frames :: proc(buf: []u8, prefix: string, settings: []Setting_Value) -> []u8 {
+	n := copy(buf, prefix)
+	put_frame_header(buf[n:], SETTING_SIZE * len(settings), .Settings, 0, 0)
+	n += FRAME_HEADER_SIZE
 	for st in settings {
-		append(&out, u8(u16(st.id) >> 8), u8(st.id))
-		append_u32(&out, st.value)
+		buf[n], buf[n + 1] = u8(u16(st.id) >> 8), u8(st.id)
+		put_u32(buf[n + 2:], st.value)
+		n += SETTING_SIZE
 	}
-	write_frame_header(&out, 4, .Window_Update, 0, 0)
-	append_u32(&out, RECV_WINDOW - DEFAULT_WINDOW)
-	return out[:]
-}
-
-@(private)
-window_update_frame :: proc(increment: int) -> []u8 {
-	inc := u32_bytes(u32(increment))
-	return build_frame(.Window_Update, 0, 0, inc[:])
+	put_frame_header(buf[n:], 4, .Window_Update, 0, 0)
+	put_u32(buf[n + FRAME_HEADER_SIZE:], RECV_WINDOW - DEFAULT_WINDOW)
+	return buf[:n + FRAME_HEADER_SIZE + 4]
 }

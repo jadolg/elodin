@@ -286,7 +286,8 @@ client_send_preface :: proc(c: ^Client) -> bool {
 		{.Initial_Window_Size, RECV_WINDOW},
 		{.Max_Header_List_Size, MAX_HEADER_LIST},
 	}
-	return client_write_all(c, opening_frames(PREFACE, settings[:]))
+	buf: [len(PREFACE) + 2 * FRAME_HEADER_SIZE + SETTING_SIZE * len(settings) + 4]u8
+	return client_write_all(c, opening_frames(buf[:], PREFACE, settings[:]))
 }
 
 @(private)
@@ -308,7 +309,8 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 		if h.flags & FLAG_ACK != 0 {
 			return true
 		}
-		return client_write_all(c, ping_ack_frame(payload))
+		ack := ping_ack_frame(payload)
+		return client_write_all(c, ack[:])
 
 	case .Window_Update:
 		return client_handle_window_update(c, h, payload)
@@ -417,7 +419,8 @@ client_handle_settings :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bo
 		}
 	}
 	loop.unlock(&c.mu)
-	return client_write_all(c, settings_ack_frame())
+	ack := settings_ack_frame()
+	return client_write_all(c, ack[:])
 }
 
 @(private)
@@ -807,12 +810,13 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 @(private)
 client_give_connection_credit :: proc(c: ^Client, n: int) -> bool {
 	frame, due := owe_connection_credit(&c.credit_owed, n)
-	return !due || client_write_all(c, frame)
+	return !due || client_write_all(c, frame[:])
 }
 
 @(private)
 client_rst_stream :: proc(c: ^Client, stream_id: u32, code: Error_Code) -> bool {
-	return client_write_all(c, rst_stream_frame(stream_id, code))
+	frame := rst_stream_frame(stream_id, code)
+	return client_write_all(c, frame[:])
 }
 
 // Nothing is sent on a connection already closed. INTERNAL_ERROR is what this
@@ -826,7 +830,8 @@ client_goaway :: proc(c: ^Client, code: Error_Code) {
 	}
 	// Streams are always client-initiated and push is refused, so we never
 	// process a peer-initiated stream; the last-stream-id field is vestigial.
-	_ = client_write_all(c, goaway_frame(0, code))
+	frame := goaway_frame(0, code)
+	_ = client_write_all(c, frame[:])
 }
 
 /*
@@ -1128,7 +1133,10 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 		if frame == nil {
 			// No room for the rest of the body: reset rather than leave the
 			// peer waiting on it, and marked first, as the timeout above is.
+			// The credit was not spent (RFC 9113 6.9.1), and goes back.
 			loop.lock(&c.mu)
+			c.send_window += chunk
+			s.send_window += chunk
 			s.dry = true
 			s.rst_sent = true
 			loop.unlock(&c.mu)

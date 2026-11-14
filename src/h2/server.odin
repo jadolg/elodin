@@ -395,7 +395,8 @@ send_initial_settings :: proc(c: ^Conn) -> bool {
 		{.Initial_Window_Size, RECV_WINDOW},
 		{.Max_Header_List_Size, MAX_HEADER_LIST},
 	}
-	return write_all(c, opening_frames("", settings[:]))
+	buf: [2 * FRAME_HEADER_SIZE + SETTING_SIZE * len(settings) + 4]u8
+	return write_all(c, opening_frames(buf[:], "", settings[:]))
 }
 
 @(private)
@@ -415,7 +416,8 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		if h.flags & FLAG_ACK != 0 {
 			return true
 		}
-		return write_all(c, ping_ack_frame(payload))
+		ack := ping_ack_frame(payload)
+		return write_all(c, ack[:])
 
 	case .Window_Update:
 		return handle_window_update(c, h, payload)
@@ -604,7 +606,8 @@ handle_settings :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		}
 	}
 	loop.unlock(&c.mu)
-	return write_all(c, settings_ack_frame())
+	ack := settings_ack_frame()
+	return write_all(c, ack[:])
 }
 
 @(private)
@@ -1031,9 +1034,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream, block: []u8) -> bool {
 	// above, which is the whole reason it was carried this far. Reset it and let
 	// it go without ever handing it to a handler.
 	if s.refused {
-		sent := stream_error(c, s.id, .Refused_Stream)
-		close_stream(c, s.id, peer_sending = !s.end_stream)
-		return sent
+		return refuse_stream(c, s)
 	}
 	// Only a request parked for its body has one, so this block is its trailers.
 	if s.pending != nil {
@@ -1349,7 +1350,8 @@ mark_stream_closed :: proc(c: ^Conn, s: ^Stream) -> (need_rst: bool) {
 
 /*
 Reset a stream no handler has been given, as safe to retry (RFC 9113 8.7), and
-retire it: a request this connection has no room or no budget for.
+retire it: a request over the concurrency limit, or one this connection has
+no room or no budget for.
 */
 @(private)
 refuse_stream :: proc(c: ^Conn, s: ^Stream) -> bool {
@@ -1420,17 +1422,16 @@ MAX_CONN_REQUEST :: 2 * (MAX_BODY + MAX_HEADER_LIST)
 @(private)
 give_connection_credit :: proc(c: ^Conn, n: int) -> bool {
 	frame, due := owe_connection_credit(&c.credit_owed, n)
-	return !due || write_all(c, frame)
+	return !due || write_all(c, frame[:])
 }
 
 // Adds `n` to `owed` and, once CREDIT_BATCH has built up, is `due` with the
-// connection WINDOW_UPDATE that pays it all back: nil where there was no room for
-// it, which `io_write_locked` refuses. Server and client alike.
+// connection WINDOW_UPDATE that pays it all back. Server and client alike.
 @(private)
-owe_connection_credit :: proc(owed: ^int, n: int) -> (frame: []u8, due: bool) {
+owe_connection_credit :: proc(owed: ^int, n: int) -> (frame: [FRAME_HEADER_SIZE + 4]u8, due: bool) {
 	owed^ += n
 	if owed^ < CREDIT_BATCH {
-		return nil, false
+		return {}, false
 	}
 	frame = window_update_frame(owed^)
 	owed^ = 0
@@ -1449,7 +1450,8 @@ stream_error :: proc(c: ^Conn, stream_id: u32, code: Error_Code) -> bool {
 
 @(private)
 rst_stream :: proc(c: ^Conn, stream_id: u32, code: Error_Code) -> bool {
-	return write_all(c, rst_stream_frame(stream_id, code))
+	frame := rst_stream_frame(stream_id, code)
+	return write_all(c, frame[:])
 }
 
 // Whether `stream_id` is in Conn.reset_ids, struck off as well with `forget`.
@@ -1481,7 +1483,8 @@ goaway :: proc(c: ^Conn, code: Error_Code) {
 	c.goaway_sent = true
 	last := c.last_stream_id
 	loop.unlock(&c.mu)
-	_ = write_all(c, goaway_frame(last, code))
+	frame := goaway_frame(last, code)
+	_ = write_all(c, frame[:])
 }
 
 /*
@@ -1628,6 +1631,14 @@ write_body :: proc(c: ^Conn, stream_id: u32, body: []u8) -> bool {
 
 		frame := data_frame(stream_id, body[sent:sent + chunk], end_stream = sent + chunk >= len(body))
 		if frame == nil {
+			// Not sent, so not spent (RFC 9113 6.9.1): the window is the
+			// connection's, and every other stream on it would be short of it.
+			loop.lock(&c.mu)
+			c.send_window += chunk
+			if s, found := c.streams[stream_id]; found {
+				s.send_window += chunk
+			}
+			loop.unlock(&c.mu)
 			abandon_response(c, stream_id)
 			return false
 		}
