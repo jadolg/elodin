@@ -115,17 +115,10 @@ test_a_frame_with_no_room_for_its_payload_is_not_read :: proc(t: ^testing.T) {
 	testing.expectf(t, bad && code == .Internal_Error, "drew %v", dry_refuse)
 }
 
-@(private = "file")
-count_writes :: proc(user: rawptr, buf: []u8) -> bool {
-	(^int)(user)^ += 1
-	return true
-}
-
 /*
 Every frame this end writes, byte for byte. DATA and HEADERS are built whole or
-not at all, and one not built is a write that fails: a frame cut short would put
-the rest of the connection out of step. The rest need no memory; see
-`test_control_frames_need_no_room`.
+not at all: a frame cut short would put the rest of the connection out of step.
+The rest need no memory; see `test_control_frames_need_no_room`.
 */
 @(test)
 test_a_frame_with_no_room_is_not_built :: proc(t: ^testing.T) {
@@ -179,20 +172,6 @@ test_a_frame_with_no_room_is_not_built :: proc(t: ^testing.T) {
 		testing.expectf(t, string(headers) == string(want_headers), "HEADERS built as %x", headers)
 		testing.expectf(t, refused_data == nil && refused_headers == nil, "built without room: %x, %x", refused_data, refused_headers)
 	}
-
-	// And a frame not built is not written.
-	writes := 0
-	io := IO {
-		user  = &writes,
-		read  = no_read,
-		write = count_writes,
-	}
-	mu: loop.Mutex
-	closed := false
-	testing.expect(t, !io_write_locked(io, &mu, &closed, nil), "a frame not built was written")
-	testing.expect_value(t, writes, 0)
-	testing.expect(t, io_write_locked(io, &mu, &closed, settings_ack[:]), "a frame was not written")
-	testing.expect_value(t, writes, 1)
 }
 
 /*

@@ -2596,16 +2596,20 @@ test_client_request_cut_short_by_this_ends_memory_is_out_of_memory :: proc(t: ^t
 
 @(private = "file")
 Pending_Request :: struct {
-	c:    ^Client,
-	body: []u8,
-	err:  Client_Error,
+	c:      ^Client,
+	body:   []u8,
+	err:    Client_Error,
+	status: int,
 }
 
 @(private = "file")
 run_request :: proc(r: ^Pending_Request) {
 	req := DOH_REQUEST
 	req.body = r.body
-	_, r.err = client_request(r.c, req, 5 * time.Second)
+	resp: Client_Response
+	resp, r.err = client_request(r.c, req, 5 * time.Second)
+	r.status = resp.status
+	delete(resp.body)
 	free_all(context.temp_allocator)
 }
 
@@ -2763,4 +2767,44 @@ test_credit_a_body_had_no_room_to_send_wakes_the_next :: proc(t: ^testing.T) {
 	client_unref(c)
 	expect_no_leaks(t, &track, "credit passed on")
 	free_all(context.temp_allocator)
+}
+
+/*
+A response that completes while the client is building a DATA frame it then has
+no room for is the answer, not this end's failure: RFC 9113 8.1 lets a server
+answer before the upload ends, and the client MUST NOT discard that response.
+The stream is closed with RST_STREAM(NO_ERROR), as when the response arrives
+between chunks.
+*/
+@(test)
+test_a_response_that_beat_an_unbuilt_body_is_kept :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
+	gate := Gate {
+		block_at = 3,
+	}
+	upload := Gated_Request {
+		r = {c = c, body = []u8{1, 2, 3}},
+		gate = &gate,
+	}
+	th := thread.create_and_start_with_poly_data(&upload, run_gated_request)
+	reached := th != nil && sync.sema_wait_with_timeout(&gate.reached, 5 * time.Second)
+	if testing.expect(t, reached, "the upload never built its DATA frame") {
+		// The whole answer, :status 200 with END_STREAM, while the frame is built.
+		block := []u8{0x88}
+		answered := client_handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+		testing.expect(t, answered, "the answer was refused")
+	}
+	sync.sema_post(&gate.release)
+	if th != nil {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	testing.expect_value(t, upload.err, Client_Error.None)
+	testing.expect_value(t, upload.status, 200)
+	testing.expect(t, saw_frame(&log, .Rst_Stream, 1), "the stream was not closed")
+	testing.expect_value(t, log.rst_code, Error_Code.No_Error)
+	client_done(t, c, &track, "answer beat the body", &log)
 }

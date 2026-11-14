@@ -358,9 +358,8 @@ serve :: proc(c: ^Conn) {
 	for {
 		h, payload, refuse, ok := read_frame(c.io, c.continuation_on)
 		if !ok {
-			// INTERNAL_ERROR is a payload this end had no room for.
 			if code, bad := refuse.?; bad {
-				goaway(c, code, dry = code == .Internal_Error)
+				goaway(c, code)
 			}
 			return
 		}
@@ -725,7 +724,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		if s == nil || map_insert(&c.streams, h.stream_id, s) == nil {
 			free(s, c.allocator)
 			loop.unlock(&c.mu)
-			goaway(c, .Internal_Error, dry = true)
+			goaway(c, .Internal_Error)
 			return false
 		}
 		s.id = h.stream_id
@@ -750,7 +749,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		delete(c.header_block)
 		c.header_block = make([dynamic]u8, 0, len(block), c.allocator)
 		if !append_whole(&c.header_block, block) {
-			goaway(c, .Internal_Error, dry = true)
+			goaway(c, .Internal_Error)
 			return false
 		}
 		c.continuation_on = h.stream_id
@@ -764,7 +763,7 @@ handle_headers :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 handle_continuation :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 	complete, refuse := continue_header_block(&c.continuation_on, &c.continuation_frames, &c.header_block, h, payload)
 	if code, bad := refuse.?; bad {
-		goaway(c, code, dry = code == .Internal_Error)
+		goaway(c, code)
 		return false
 	}
 	if !complete {
@@ -1026,8 +1025,7 @@ finish_headers :: proc(c: ^Conn, s: ^Stream, block: []u8) -> bool {
 	c.header_block = nil
 	c.block_stream = nil
 	if err != .None {
-		dry := err == .Out_Of_Memory
-		goaway(c, .Internal_Error if dry else .Compression_Error, dry = dry)
+		goaway(c, .Internal_Error if err == .Out_Of_Memory else .Compression_Error)
 		return false
 	}
 
@@ -1480,7 +1478,7 @@ was_reset_here :: proc(c: ^Conn, stream_id: u32, forget := false) -> bool {
 }
 
 @(private)
-goaway :: proc(c: ^Conn, code: Error_Code, dry := false) {
+goaway :: proc(c: ^Conn, code: Error_Code) {
 	loop.lock(&c.mu)
 	if c.goaway_sent {
 		loop.unlock(&c.mu)
@@ -1488,11 +1486,11 @@ goaway :: proc(c: ^Conn, code: Error_Code, dry := false) {
 	}
 	c.goaway_sent = true
 	/*
-	`dry`: this end has no room to go on. A stream that was only read, or
-	parked for its body, was not acted on, and the last stream id leaves it out
-	so the client may retry it (RFC 9113 6.8).
+	INTERNAL_ERROR is this end with no room to go on. A stream that was only
+	read, or parked for its body, was not acted on, and the last stream id
+	leaves it out so the client may retry it (RFC 9113 6.8).
 	*/
-	last := c.last_dispatched if dry else c.last_stream_id
+	last := c.last_dispatched if code == .Internal_Error else c.last_stream_id
 	loop.unlock(&c.mu)
 	frame := goaway_frame(last, code)
 	_ = write_all(c, frame[:])

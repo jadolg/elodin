@@ -191,17 +191,10 @@ io_read_exact :: proc(io: IO, buf: []u8, starts_frame := true) -> bool {
 	return true
 }
 
-/*
-One write to the transport under `mu`, so frames from concurrent writers do not
-interleave; refused once `closed` is set. Refused as well for an empty `buf`,
-which is what a frame builder returns where it had no room: every frame carries
-at least its header, so nothing is ever a write of nothing.
-*/
+// One write to the transport under `mu`, so frames from concurrent writers do
+// not interleave; refused once `closed` is set.
 @(private)
 io_write_locked :: proc(io: IO, mu: ^loop.Mutex, closed: ^bool, buf: []u8) -> bool {
-	if len(buf) == 0 {
-		return false
-	}
 	loop.lock(mu)
 	defer loop.unlock(mu)
 	if closed^ {
@@ -431,8 +424,8 @@ append_whole :: proc(out: ^[dynamic]u8, bytes: []u8) -> bool {
 /*
 DATA and HEADERS, the frames this end writes that carry a payload of any size,
 are built in `context.temp_allocator`, reserved whole, or nil where there is no
-room; `io_write_locked` refuses nil, so a frame not built is a write that
-failed, never a short frame on the wire.
+room, never a short frame. A caller resets the stream it was for rather than
+write nil.
 */
 @(private)
 build_frame :: proc(type: Frame_Type, flags: u8, stream_id: u32, payload: []u8) -> []u8 {

@@ -1147,6 +1147,12 @@ client_send_body :: proc(c: ^Client, s: ^Client_Stream, body: []u8, deadline: ti
 			c.send_window += chunk
 			s.send_window += chunk
 			loop.cond_broadcast(&c.cond)
+			// Answered or reset while the lock was let go: settled at the top
+			// of the loop, as between any two chunks.
+			if s.done || s.reset || s.rst_sent {
+				loop.unlock(&c.mu)
+				continue
+			}
 			s.dry = true
 			s.rst_sent = true
 			loop.unlock(&c.mu)
