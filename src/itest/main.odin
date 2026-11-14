@@ -300,6 +300,14 @@ main :: proc() {
 		skip_case(&r, "slow drip", "no certificate")
 	}
 
+	if cert_ok {
+		section(&r, "pipelining")
+		run_pipeline_cases(&r)
+		run_pipeline_pending_cases(&r)
+	} else {
+		skip_case(&r, "pipelining", "no certificate")
+	}
+
 	section(&r, "upstream transports")
 	run_upstream_transport_cases(&r)
 	run_upstream_header_cases(&r)

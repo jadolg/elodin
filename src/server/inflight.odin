@@ -145,8 +145,8 @@ validating a slow chain holds one of `dnssec.max_chain_walks` - so without a
 ceiling, one flood of a single cold signed name would park everything in flight
 behind one walk, which is the exhaustion that bound exists to prevent (issue
 #356). Past the ceiling a query forwards on its own and meets that bound like
-any other. Queries answered on a connection's fiber are not counted:
-`max_connections` bounds them, one at a time per connection, and a share of
+any other. Queries in a connection's own place are not counted:
+`max_connections` bounds them, one per connection, and a share of
 `max_pending` that they could fill would leave the datagrams for a hot name to
 forward on their own. No bound - a `Server` built as a literal - is no ceiling.
 */

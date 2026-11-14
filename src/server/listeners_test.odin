@@ -991,8 +991,8 @@ test_parse_bind_refuses_a_stray_bracket :: proc(t: ^testing.T) {
 }
 
 /*
-#533: a datagram's job and its bytes are one heap block, so the reader makes one
-allocation per datagram and the query's fiber one `free`.
+#533: a datagram's job and its bytes are one heap block (`new_with_bytes`), so the
+reader makes one allocation per datagram and the query's fiber one `free`.
 */
 @(test)
 test_udp_job_is_one_allocation :: proc(t: ^testing.T) {
@@ -1002,7 +1002,11 @@ test_udp_job_is_one_allocation :: proc(t: ^testing.T) {
 	context.allocator = mem.tracking_allocator(&track)
 
 	datagram := []u8{0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0}
-	job := new_udp_job(datagram)
+	job, copied := new_with_bytes(Udp_Job, datagram)
+	if !testing.expect(t, job != nil, "no block") {
+		return
+	}
+	job.data = copied
 	testing.expect_value(t, track.total_allocation_count, 1)
 	testing.expect_value(t, string(job.data), string(datagram))
 	testing.expect(t, job.ctx == nil, "the block was not zeroed")

@@ -229,10 +229,10 @@ Validator :: struct {
 Which queries a question is one of, and so which bound it is held to.
 
 Two, because a server bounds two populations by different things. A query on a
-fiber of its own - a datagram, an HTTP/2 request, a refresh - is counted against
-the server's bound on queries in flight; one answered on its connection's fiber
-is not, since the connection answers one at a time and `max_connections` bounds
-those. A walk bound that is a share of one of them is wrong for the other:
+fiber of its own - a datagram, an HTTP/2 request, a TCP or DoT query beside its
+connection's own place, a refresh - is counted against the server's bound on
+queries in flight; one in a connection's own place is not, since there is one
+per connection and `max_connections` bounds those. A walk bound that is a share of one of them is wrong for the other:
 a share of the queries in flight lets the connections take every walk, and a
 share of both leaves the queries in flight with no reserve at all.
 
@@ -240,9 +240,11 @@ Counted apart rather than together for the same reason: a flood on one transport
 must not spend the other's allowance.
 */
 Walk_Pool :: enum u8 {
-	// Counted among the server's queries in flight: UDP, HTTP/2, refreshes.
+	// Counted among the server's queries in flight: UDP, HTTP/2, TCP and DoT
+	// beside a connection's own place, refreshes.
 	Shared,
-	// Answered on its connection's fiber: TCP, DoT and HTTP/1.1.
+	// In a connection's own place: one per TCP or DoT connection, and every
+	// HTTP/1.1 query.
 	Connection,
 }
 

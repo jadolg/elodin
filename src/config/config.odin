@@ -381,12 +381,12 @@ Dnssec_Config :: struct {
 	*/
 	max_chain_walks:      int,
 	/*
-	The same, for the queries answered on their connection's fiber: TCP, DoT and
-	DoH over HTTP/1.1.
+	The same, for the queries in a connection's own place: one per TCP or DoT
+	connection, and every DoH query over HTTP/1.1.
 
 	A bound of its own because those queries are not counted in
-	`server.max_pending` - a connection answers one at a time, so
-	`max_connections` bounds them - and a share of either figure is wrong for the
+	`server.max_pending` - one per connection, so `max_connections` bounds
+	them - and a share of either figure is wrong for the
 	other: a share of `max_pending` lets the connections take every walk, and a
 	share of both together leaves the queries in flight no reserve. Zero derives
 	it from `server.max_connections` the way `max_chain_walks` is derived from
@@ -669,9 +669,10 @@ Server_Config :: struct {
 
 	It bounds what runs on a fiber of its own: a UDP query, whose datagram is
 	dropped past it, an HTTP/2 DoH request, which is answered 503 - there is a
-	client on an open connection there to tell - and a refresh. TCP, DoT and
-	HTTP/1.1 DoH answer on their connection's own fiber, one query at a time
-	per connection, and are bounded by `max_connections` instead.
+	client on an open connection there to tell - a TCP or DoT query beside its
+	connection's own place, which waits for that place past it, and a refresh.
+	A connection's own place - one query per TCP or DoT connection, and every
+	HTTP/1.1 DoH one - is bounded by `max_connections` instead.
 	*/
 	max_pending:                int,
 	/*

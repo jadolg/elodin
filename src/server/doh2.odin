@@ -24,10 +24,10 @@ reader fiber, so the two lookups a browser issues for one name run at the same
 time instead of one behind the other. Responses are written back under the
 connection's write lock and may complete in any order.
 
-Being the only stream transport that starts a query of its own per request, it is
-also the only one that has to shed: past `server.max_pending` a request is
-answered 503 here instead of adding to the queries the server is already behind
-on. See `h2_handler`.
+Past `server.max_pending` a request is answered 503 here instead of adding to the
+queries the server is already behind on: the reader cannot stop to answer it
+itself, since it reads the WINDOW_UPDATEs the requests' bodies wait on. See
+`h2_handler`.
 */
 
 @(private)
@@ -234,11 +234,10 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	Shed rather than start once `max_pending` queries are in flight, the same
 	bound the UDP read loop applies before it starts one.
 
-	This is the only stream transport that starts a query of its own per request
-	- the others answer on their connection's own fiber, one at a time, so
-	`max_connections` is what bounds them. Without this the operator's bound
-	sheds UDP at a few hundred while HTTP/2 runs up to `max_connections` x
-	`MAX_HELD_STREAMS` queries, each holding its buffered body, beside it.
+	Without this the operator's bound sheds UDP at a few hundred while HTTP/2
+	runs up to `max_connections` x `MAX_HELD_STREAMS` queries, each holding its
+	buffered body, beside it. TCP and DoT count their queries past a connection's
+	own place the same way; see `Stream_Session`.
 
 	`submit_query` decides and counts in one step: there is a reader per
 	connection here, on every loop, and a check followed by a start is a gap all

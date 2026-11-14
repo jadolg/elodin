@@ -35,7 +35,9 @@ server:
   # pinned. Takes a restart. See docs/sizing.md.
   pin_loops: false
   # Queries in flight at once - every UDP query and DoH/2 request from arrival
-  # to answer - before new ones are dropped (DoH/2: answered 503). A query
+  # to answer, and every TCP/DoT query beyond a connection's first in flight -
+  # before new ones are dropped (DoH/2: answered 503; TCP/DoT: the connection
+  # waits and answers one at a time). A query
   # waiting on an upstream holds no thread, so this is about memory, not cores:
   # 0 works it out at startup as an eighth of the memory this machine has over
   # what one query can come to hold, 64 to 4096 (409 on a 1 GiB machine). A
@@ -488,10 +490,11 @@ dnssec:
   # that quarter out of the walk, so it comes back in a round trip rather than
   # in the thirty a walk may take, not to cap what this resolver validates.
   #
-  # This is the bound for UDP, DoH/2 and cache refreshes, the queries counted in
-  # max_pending. TCP, DoT and DoH/1.1 answer on their connection, outside
-  # max_pending, and get max_connection_walks below, counted apart so a flood on
-  # one transport cannot spend the other's allowance.
+  # This is the bound for the queries counted in max_pending: UDP, DoH/2, TCP
+  # and DoT queries beyond a connection's first in flight, and cache refreshes.
+  # A connection's first query in flight on TCP or DoT, and every DoH/1.1 one,
+  # is outside max_pending and gets max_connection_walks below, counted apart so
+  # a flood on one transport cannot spend the other's allowance.
   #
   # While it binds, every cold name is SERVFAIL — including names in unsigned
   # zones, since a zone cannot be known to be unsigned without the DS lookup

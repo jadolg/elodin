@@ -70,7 +70,7 @@ scrape_configs:
 | `elodin_udp_receive_drops_total{reader}` | counter | datagrams the kernel dropped on that reader's receive queue before they could be read; absent where `/proc` cannot be read |
 | `elodin_loops` | gauge | event loops, one thread each |
 | `elodin_fibers{loop}` | gauge | what each loop is running: queries, connections, racers, upstream readers |
-| `elodin_queries_inflight` / `_max` | gauge | queries in flight on fibers of their own (UDP, DoH/2, refreshes), and `server.max_pending`; sitting at the maximum while `elodin_queries_dropped_total` rises is the server turning queries away |
+| `elodin_queries_inflight` / `_max` | gauge | queries in flight on fibers of their own (UDP, DoH/2, TCP and DoT queries beyond a connection's first in flight, refreshes), and `server.max_pending`; sitting at the maximum while `elodin_queries_dropped_total` rises is the server turning queries away |
 | `elodin_decode_heavy_requests` / `_max` | gauge | requests decoding past the ordinary allowance, and the slots there are for them; see [heavy decodes](sizing.md#heavy-decodes) |
 | `elodin_mobileconfig_signed_total` | counter | Apple configuration profiles signed, one per authority per certificate. Present only while the profile endpoint exists |
 | `elodin_mobileconfig_refused_total` | counter | profile requests answered 503: the certificate was outside its validity window, or the signing budget was spent. The only sign that a lapsed certificate took the endpoint down |
