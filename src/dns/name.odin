@@ -3,6 +3,7 @@ package dns
 import "core:mem"
 import "core:strings"
 import "core:unicode"
+import "core:unicode/utf8"
 
 // Domain names are carried around in escaped presentation form, always fully
 // qualified: "www.example.com." and "." for the root. Any byte that is not a
@@ -396,18 +397,24 @@ name_canonical :: proc(name: string, allocator := context.allocator) -> (canonic
 IDN_HINT :: "an international name matches only when written in punycode (xn--...)"
 
 /*
-Whether `r`, a character outside ASCII, has a place in an international name,
-so that its A-label (RFC 5890 section 2.3.2.1) is what a client asks for: a
-letter, number or mark, which a label holds; a joiner or punctuation mark RFC
-5892 appendix A admits in context (the joiners, the middle dot, keraia, geresh,
-gershayim and katakana middle dot); or an ideographic, fullwidth or halfwidth
-full stop, which a lookup reads as a dot (RFC 3490 section 3.1). A no-break or
-zero-width space, a BOM, a symbol, and U+FFFD, which stands for a byte that is
-not UTF-8, have none.
+Whether `r`, a character outside ASCII that follows `before` in its label ('.'
+at a label's start), has a place in an international name, so that its A-label
+(RFC 5890 section 2.3.2.1) is what a client asks for: a letter, number or mark,
+which a label holds; a joiner or punctuation mark RFC 5892 appendix A admits in
+context; or an ideographic, fullwidth or halfwidth full stop, which a lookup
+reads as a dot (RFC 3490 section 3.1). A no-break or zero-width space, a BOM, a
+symbol, and U+FFFD, which stands for a byte that is not UTF-8, have none.
+
+The joiners, geresh and gershayim follow a Virama, a joining letter or a Hebrew
+letter (appendix A.1, A.2, A.5, A.6), so after ASCII they have no place either.
+Past ASCII, `before` is taken to be one of those: the tables that would say are
+not linked.
 */
-idn_holds :: proc(r: rune) -> bool {
+idn_holds :: proc(r: rune, before: rune) -> bool {
 	switch r {
-	case 0x200c, 0x200d, 0x00b7, 0x0375, 0x05f3, 0x05f4, 0x30fb, 0x3002, 0xff0e, 0xff61:
+	case 0x200c, 0x200d, 0x05f3, 0x05f4:
+		return before >= utf8.RUNE_SELF
+	case 0x00b7, 0x0375, 0x30fb, 0x3002, 0xff0e, 0xff61:
 		return true
 	}
 	return unicode.is_letter(r) || unicode.is_number(r) || unicode.is_nonspacing_mark(r) || unicode.is_spacing_mark(r)

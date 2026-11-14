@@ -522,6 +522,7 @@ rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool, not_ascii
 	// so it alone may not pass the wire's 63 and 255 bytes.
 	after_stop := true
 	label, wire := 0, 1
+	before := '.'
 	for r in key {
 		stop := r == '.' || r == 0x3002 || r == 0xff0e || r == 0xff61
 		if stop && after_stop {
@@ -539,10 +540,11 @@ rule_key :: proc(domain: string, buf: []u8) -> (key: string, ok: bool, not_ascii
 		case 'a' ..= 'z', '0' ..= '9', '-', '_', '.':
 		case:
 			// Any other ASCII is a symbol, which `idn_holds` refuses too.
-			if !dns.idn_holds(r) {
+			if !dns.idn_holds(r, before) {
 				return "", false, false
 			}
 		}
+		before = '.' if stop else r
 	}
 	if after_stop && strings.has_suffix(domain, ".") {
 		return "", false, false

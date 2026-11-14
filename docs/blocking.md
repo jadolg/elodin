@@ -126,8 +126,8 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   how many of those it skipped (`list NAME: N names skipped as not ASCII; an
   international name matches only when written in punycode (xn--...)`),
   leaving out a name refused for something punycode cannot carry: a no-break
-  or zero-width space, a symbol, a byte that is not UTF-8, or ASCII no label
-  holds, such as `*` or `:`.
+  or zero-width space, a joiner straight after ASCII, a symbol, a byte that is
+  not UTF-8, or ASCII no label holds, such as `*` or `:`.
 - A name with an empty label (`*..com`, `||.com^`, `a..com`, `a。。com`), a
   label past 63 bytes, a name past 255 bytes on the wire, or a `\` escape
   that is broken or that a query never spells (a query writes only a dot, a

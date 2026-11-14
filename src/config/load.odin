@@ -1858,7 +1858,7 @@ load_ddr :: proc(l: ^Loader, cfg: ^Config) {
 		}
 	}
 	if written != "" {
-		if name, ok := canonical_domain(l, written, "ddr.name"); ok {
+		if name, ok := canonical_domain(l, written, fmt.tprintf("ddr.name: %q", written)); ok {
 			cfg.ddr.name = name
 		}
 	}
@@ -2738,12 +2738,8 @@ canonical_domain :: proc(l: ^Loader, s, what: string) -> (domain: string, ok: bo
 ascii_only :: proc(l: ^Loader, s, what: string) -> bool {
 	for r, i in s {
 		if r >= utf8.RUNE_SELF {
-			// A joiner follows the character it joins (RFC 5892 appendix A.1,
-			// A.2), so one at a label's edge was pasted with the name.
-			joiner := r == 0x200c || r == 0x200d
-			end := i + utf8.rune_size(r)
-			pasted := joiner && (i == 0 || s[i - 1] == '.' || end == len(s) || s[end] == '.')
-			hint := dns.IDN_HINT if dns.idn_holds(r) && !pasted else DELETE_HINT
+			before := rune(s[i - 1]) if i > 0 else '.'
+			hint := dns.IDN_HINT if dns.idn_holds(r, before) else DELETE_HINT
 			errorf(l, "%s holds U+%04X, which is outside ASCII; %s", what, u32(r), hint)
 			return false
 		}
@@ -3047,17 +3043,17 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	parsed_anchors := make([dynamic]dnssec.Trust_Anchor, 0, len(cfg.dnssec.trust_anchors), context.temp_allocator)
 	all_anchors_read := true
 	for anchor, i in cfg.dnssec.trust_anchors {
-		// The owner is a name a chain walk meets as its A-label. The fields
-		// split as `dnssec.parse_trust_anchor` splits them.
-		rest := anchor
-		owner, has_owner := strings.fields_iterator(&rest)
-		if has_owner && !ascii_only(l, owner, fmt.tprintf("dnssec.trust_anchors[%d]: %q", i, anchor)) {
-			all_anchors_read = false
-			continue
-		}
 		read, ok := dnssec.parse_trust_anchor(anchor, context.temp_allocator)
 		if !ok {
 			errorf(l, "dnssec.trust_anchors[%d]: %q is not a DS record", i, anchor)
+			all_anchors_read = false
+			continue
+		}
+		// The first field is the owner, a name a chain walk meets as its
+		// A-label, or in the bare form the key tag the parser read as digits.
+		rest := anchor
+		owner, has_owner := strings.fields_iterator(&rest)
+		if has_owner && !ascii_only(l, owner, fmt.tprintf("dnssec.trust_anchors[%d]: %q", i, anchor)) {
 			all_anchors_read = false
 			continue
 		}

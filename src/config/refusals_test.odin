@@ -169,14 +169,13 @@ test_a_name_outside_ascii_is_refused :: proc(t: ^testing.T) {
 		{MINIMAL + "  zones:\n    - domains: [\"c\u00f6rp.lan\"]\n      servers: [10.0.0.1]\n", "upstream.zones[0].domains[0]: \"c\u00f6rp.lan\" holds U+00F6, which is outside ASCII; " + dns.IDN_HINT},
 		{MINIMAL + "rebind:\n  allow_domains: [\"h\u00f6me.example\"]\n", "rebind.allow_domains[0]: \"h\u00f6me.example\" holds U+00F6, which is outside ASCII; " + dns.IDN_HINT},
 		{REWRITE + "\"a\xffb.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"a\\xffb.lan\" holds U+FFFD, which is outside ASCII; " + DELETE_HINT},
-		// A joiner follows the character it joins (RFC 5892 appendix A.1, A.2),
-		// so one at a label's edge was pasted with the name; inside, it may be
-		// part of a word.
+		// A joiner, geresh or gershayim follows a character past ASCII (RFC 5892
+		// appendix A.1, A.2, A.5, A.6), so the first one past ASCII was pasted.
 		{REWRITE + "\"nas.lan\u200d\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"nas.lan\\u200d\" holds U+200D, which is outside ASCII; " + DELETE_HINT},
 		{REWRITE + "\"\u200cnas.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"\\u200cnas.lan\" holds U+200C, which is outside ASCII; " + DELETE_HINT},
-		{REWRITE + "\"nas\u200d.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"nas\\u200d.lan\" holds U+200D, which is outside ASCII; " + DELETE_HINT},
-		{REWRITE + "\"a\u200db.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"a\\u200db.lan\" holds U+200D, which is outside ASCII; " + dns.IDN_HINT},
-		{MINIMAL + "ddr:\n  name: \"d\u00f6t.example\"\n", "ddr.name holds U+00F6, which is outside ASCII; " + dns.IDN_HINT},
+		{REWRITE + "\"a\u200db.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"a\\u200db.lan\" holds U+200D, which is outside ASCII; " + DELETE_HINT},
+		{REWRITE + "\"a\u05f3b.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"a\\u05f3b.lan\" holds U+05F3, which is outside ASCII; " + DELETE_HINT},
+		{MINIMAL + "ddr:\n  name: \"d\u00f6t.example\"\n", "ddr.name: \"d\u00f6t.example\" holds U+00F6, which is outside ASCII; " + dns.IDN_HINT},
 		{
 			MINIMAL + "dnssec:\n  trust_anchors: [\"" + ROOT_ANCHOR + "\", \"b\u00fccher.lan. IN DS 1 8 2 " + ROOT_DIGEST + "\"]\n",
 			"dnssec.trust_anchors[1]: \"b\u00fccher.lan. IN DS 1 8 2 " + ROOT_DIGEST + "\" holds U+00FC, which is outside ASCII; " + dns.IDN_HINT,
@@ -195,6 +194,13 @@ test_a_name_outside_ascii_is_refused :: proc(t: ^testing.T) {
 	// between two is a separator.
 	_, aerr := load_string(MINIMAL + "dnssec:\n  trust_anchors: [\". IN DS 20326\\_8 2 " + ROOT_DIGEST + "\"]\n", context.temp_allocator)
 	testing.expectf(t, aerr == nil, "a no-break space between DS fields was refused: %v", aerr)
+	// The bare form has no owner: its first field is the key tag, and a digit
+	// past ASCII there is no DS record, not a name.
+	refused_with(
+		t,
+		MINIMAL + "dnssec:\n  trust_anchors: [\"\uff12\uff10326 8 2 " + ROOT_DIGEST + "\"]\n",
+		"dnssec.trust_anchors[0]: \"\\uff12\\uff10326 8 2 " + ROOT_DIGEST + "\" is not a DS record",
+	)
 
 	// The A-label loads, and so does a name of raw octets written as `\DDD`,
 	// which is the spelling a query with those octets is compared in.
