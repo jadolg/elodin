@@ -54,7 +54,8 @@ rebind:
 
 - Each entry covers itself and everything below it, like dnsmasq's
   `--rebind-domain-ok=/corp.example/`. Write the zone: a wildcard such as
-  `*.corp.example` is refused at load.
+  `*.corp.example` is refused at load, as is a character outside ASCII: write
+  an international name in punycode (`xn--...`).
 - Matching is against the name asked for, so a CNAME from an attacker's name into
   an exempt zone exempts nothing.
 - `allow_loopback: true` opens loopback for every name. Prefer `allow_domains`:

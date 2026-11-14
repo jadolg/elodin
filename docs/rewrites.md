@@ -16,9 +16,13 @@ rewrites:
 - Wildcards match subdomains only: `*.lan` covers `host.lan`, not `lan`.
   Quote them: unquoted, `*` starts a YAML alias and the file is refused.
   A wildcard on the root (`*.`) would match every name and is refused.
-- Names are compared ignoring ASCII case only. A name with a space outside
-  ASCII at either end, such as a no-break space, is refused; ordinary spaces
-  around it are trimmed.
+- Names are compared ignoring ASCII case only. Ordinary spaces around a name
+  are trimmed.
+- A domain or answer name holding a character outside ASCII is refused, and
+  the error names it (`U+00FC`). A client asks for an international name in
+  punycode, so write `bücher.lan` as `xn--bcher-kva.lan`; delete a no-break
+  space, zero-width space or BOM pasted with the name. A name of raw octets is
+  written in `\DDD` escapes (`b\195\188cher.lan`).
 - `ttl` sets the answer's TTL: 0 to 2147483647 seconds (RFC 2181 §8), as a
   number or a duration such as `5m`; the default is 300 seconds.
 

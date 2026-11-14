@@ -2,6 +2,7 @@ package dns
 
 import "core:mem"
 import "core:strings"
+import "core:unicode"
 
 // Domain names are carried around in escaped presentation form, always fully
 // qualified: "www.example.com." and "." for the root. Any byte that is not a
@@ -388,4 +389,22 @@ name_canonical :: proc(name: string, allocator := context.allocator) -> (canonic
 	buf[len(trimmed)] = '.'
 	fold_into(string(buf), buf)
 	return string(buf), true
+}
+
+/*
+Whether `r`, a character outside ASCII, has a place in an international name,
+so that its A-label (RFC 5890 section 2.3.2.1) is what a client asks for: a
+letter, number or mark, which a label holds; a joiner or punctuation mark RFC
+5892 appendix A admits in context (the joiners, the middle dot, keraia, geresh,
+gershayim and katakana middle dot); or an ideographic, fullwidth or halfwidth
+full stop, which a lookup reads as a dot (RFC 3490 section 3.1). A no-break or
+zero-width space, a BOM, a symbol, and U+FFFD, which stands for a byte that is
+not UTF-8, have none.
+*/
+idn_holds :: proc(r: rune) -> bool {
+	switch r {
+	case 0x200c, 0x200d, 0x00b7, 0x0375, 0x05f3, 0x05f4, 0x30fb, 0x3002, 0xff0e, 0xff61:
+		return true
+	}
+	return unicode.is_letter(r) || unicode.is_number(r) || unicode.is_nonspacing_mark(r) || unicode.is_spacing_mark(r)
 }
