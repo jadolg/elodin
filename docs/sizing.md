@@ -289,8 +289,9 @@ body there is no room for is reset with REFUSED_STREAM, which the client may
 retry; a response there is no room to write is reset with INTERNAL_ERROR; and a
 frame or header block there is no room to read, a stream there is no room to
 track, or header compression state there is no room to keep, ends the
-connection with GOAWAY(INTERNAL_ERROR), leaving the request that drew it free
-to retry. A DNSSEC validation refused memory anywhere is reported undecided
+connection with GOAWAY(INTERNAL_ERROR), whose last stream id is the highest one
+elodin handed on to be answered, so the client may retry every request above
+it. A DNSSEC validation refused memory anywhere is reported undecided
 (EDE 22), not bogus, and caches nothing it settles after the refusal.
 
 ## Refused and failed connections

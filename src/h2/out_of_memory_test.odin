@@ -239,6 +239,8 @@ test_an_entry_the_table_has_no_room_for_fails_the_block :: proc(t: ^testing.T) {
 			if refused_any(&f) {
 				refusals += 1
 				testing.expectf(t, err == .Out_Of_Memory, "run %d at %d: %v", run, at, err)
+				// A refused name asks for nothing more.
+				testing.expectf(t, at != 1 || f.seen == 1, "run %d: %d allocations after the name was refused", run, f.seen)
 				testing.expectf(t, table.size == 0 && len(table.entries) == 0, "run %d at %d: table holds %d", run, at, table.size)
 			} else {
 				testing.expectf(t, err == .None, "with room: %v", err)

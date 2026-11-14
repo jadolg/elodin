@@ -423,19 +423,19 @@ append_whole :: proc(out: ^[dynamic]u8, bytes: []u8) -> bool {
 
 /*
 DATA and HEADERS, the frames this end writes that carry a payload of any size,
-are built in `context.temp_allocator`, reserved whole, or nil where there is no
-room, never a short frame. A caller resets the stream it was for rather than
+are built in `context.temp_allocator`, whole, or nil where there is no room,
+never a short frame. A caller resets the stream it was for rather than
 write nil.
 */
 @(private)
 build_frame :: proc(type: Frame_Type, flags: u8, stream_id: u32, payload: []u8) -> []u8 {
-	out, ok := dns.alloc_list([dynamic]u8, FRAME_HEADER_SIZE + len(payload), context.temp_allocator)
+	out, ok := dns.alloc_slice([]u8, FRAME_HEADER_SIZE + len(payload), context.temp_allocator)
 	if !ok {
 		return nil
 	}
-	write_frame_header(&out, len(payload), type, flags, stream_id)
-	append(&out, ..payload)
-	return out[:]
+	put_frame_header(out, len(payload), type, flags, stream_id)
+	copy(out[FRAME_HEADER_SIZE:], payload)
+	return out
 }
 
 @(private)

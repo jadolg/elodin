@@ -128,10 +128,12 @@ dynamic_table_add :: proc(t: ^Dynamic_Table, name, value: string) -> bool {
 		return true
 	}
 	n, nok := dns.alloc_slice([]u8, len(name), t.allocator)
+	if !nok {
+		return false
+	}
 	v, vok := dns.alloc_slice([]u8, len(value), t.allocator)
-	if !nok || !vok {
+	if !vok {
 		delete(n, t.allocator)
-		delete(v, t.allocator)
 		return false
 	}
 	copy(n, name)
