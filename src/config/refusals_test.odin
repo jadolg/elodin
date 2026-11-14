@@ -2,6 +2,7 @@ package config
 
 import "core:strings"
 import "core:testing"
+import "elodin:dns"
 
 // Whether loading `doc` fails with `wanted` as one of its messages, word for word.
 @(private = "file")
@@ -158,24 +159,42 @@ test_a_name_outside_ascii_is_refused :: proc(t: ^testing.T) {
 	}
 	REWRITE :: MINIMAL + "rewrites:\n  - domain: "
 	cases := [?]Case {
-		{REWRITE + "\"b\u00fccher.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"b\u00fccher.lan\" holds U+00FC, which is outside ASCII; " + PUNYCODE_HINT},
-		{REWRITE + "\"*.b\u00fccher.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"*.b\u00fccher.lan\" holds U+00FC, which is outside ASCII; " + PUNYCODE_HINT},
+		{REWRITE + "\"b\u00fccher.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"b\u00fccher.lan\" holds U+00FC, which is outside ASCII; " + dns.IDN_HINT},
+		{REWRITE + "\"*.b\u00fccher.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"*.b\u00fccher.lan\" holds U+00FC, which is outside ASCII; " + dns.IDN_HINT},
 		{REWRITE + "\"nas.lan\u200b\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"nas.lan\\u200b\" holds U+200B, which is outside ASCII; " + DELETE_HINT},
 		{REWRITE + "\"\ufeffnas.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"\\ufeffnas.lan\" holds U+FEFF, which is outside ASCII; " + DELETE_HINT},
 		{REWRITE + "\"a\u2603.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"a\\u2603.lan\" holds U+2603, which is outside ASCII; " + DELETE_HINT},
-		{REWRITE + "lan.example\n    answer: \"n\u00e4s.example.com\"\n", "rewrites[0].answer: an answer host \"n\u00e4s.example.com\" holds U+00E4, which is outside ASCII; " + PUNYCODE_HINT},
-		{REWRITE + "lan.example\n    answer: \"MX 10 m\u00e4il.example\"\n", "rewrites[0].answer: MX host \"m\u00e4il.example\" holds U+00E4, which is outside ASCII; " + PUNYCODE_HINT},
-		{MINIMAL + "  zones:\n    - domains: [\"c\u00f6rp.lan\"]\n      servers: [10.0.0.1]\n", "upstream.zones[0].domains[0]: \"c\u00f6rp.lan\" holds U+00F6, which is outside ASCII; " + PUNYCODE_HINT},
-		{MINIMAL + "rebind:\n  allow_domains: [\"h\u00f6me.example\"]\n", "rebind.allow_domains[0]: \"h\u00f6me.example\" holds U+00F6, which is outside ASCII; " + PUNYCODE_HINT},
+		{REWRITE + "lan.example\n    answer: \"n\u00e4s.example.com\"\n", "rewrites[0].answer: an answer host \"n\u00e4s.example.com\" holds U+00E4, which is outside ASCII; " + dns.IDN_HINT},
+		{REWRITE + "lan.example\n    answer: \"MX 10 m\u00e4il.example\"\n", "rewrites[0].answer: MX host \"m\u00e4il.example\" holds U+00E4, which is outside ASCII; " + dns.IDN_HINT},
+		{MINIMAL + "  zones:\n    - domains: [\"c\u00f6rp.lan\"]\n      servers: [10.0.0.1]\n", "upstream.zones[0].domains[0]: \"c\u00f6rp.lan\" holds U+00F6, which is outside ASCII; " + dns.IDN_HINT},
+		{MINIMAL + "rebind:\n  allow_domains: [\"h\u00f6me.example\"]\n", "rebind.allow_domains[0]: \"h\u00f6me.example\" holds U+00F6, which is outside ASCII; " + dns.IDN_HINT},
 		{REWRITE + "\"a\xffb.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"a\\xffb.lan\" holds U+FFFD, which is outside ASCII; " + DELETE_HINT},
+		// A joiner follows the character it joins (RFC 5892 appendix A.1, A.2),
+		// so one at a label's edge was pasted with the name; inside, it may be
+		// part of a word.
+		{REWRITE + "\"nas.lan\u200d\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"nas.lan\\u200d\" holds U+200D, which is outside ASCII; " + DELETE_HINT},
+		{REWRITE + "\"\u200cnas.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"\\u200cnas.lan\" holds U+200C, which is outside ASCII; " + DELETE_HINT},
+		{REWRITE + "\"nas\u200d.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"nas\\u200d.lan\" holds U+200D, which is outside ASCII; " + DELETE_HINT},
+		{REWRITE + "\"a\u200db.lan\"\n    answer: 10.0.0.1\n", "rewrites[0].domain: \"a\\u200db.lan\" holds U+200D, which is outside ASCII; " + dns.IDN_HINT},
+		{MINIMAL + "ddr:\n  name: \"d\u00f6t.example\"\n", "ddr.name holds U+00F6, which is outside ASCII; " + dns.IDN_HINT},
 		{
 			MINIMAL + "dnssec:\n  trust_anchors: [\"" + ROOT_ANCHOR + "\", \"b\u00fccher.lan. IN DS 1 8 2 " + ROOT_DIGEST + "\"]\n",
-			"dnssec.trust_anchors[1]: \"b\u00fccher.lan. IN DS 1 8 2 " + ROOT_DIGEST + "\" holds U+00FC, which is outside ASCII; " + PUNYCODE_HINT,
+			"dnssec.trust_anchors[1]: \"b\u00fccher.lan. IN DS 1 8 2 " + ROOT_DIGEST + "\" holds U+00FC, which is outside ASCII; " + dns.IDN_HINT,
 		},
 	}
 	for c in cases {
 		refused_with(t, c.doc, c.wanted)
 	}
+
+	// A space outside ASCII between an answer's fields is a field split, not a
+	// character to delete: deleted, `CNAMEhost.example` would load.
+	refused_with(t, REWRITE + "lan.example\n    answer: \"CNAME\\_host.example\"\n", "rewrites[0].answer: an answer needs one host name, got \"CNAME\\u00a0host.example\"")
+
+	// A trust anchor's owner is the name checked; its fields split on any
+	// space, as `dnssec.parse_trust_anchor` reads them, so a no-break space
+	// between two is a separator.
+	_, aerr := load_string(MINIMAL + "dnssec:\n  trust_anchors: [\". IN DS 20326\\_8 2 " + ROOT_DIGEST + "\"]\n", context.temp_allocator)
+	testing.expectf(t, aerr == nil, "a no-break space between DS fields was refused: %v", aerr)
 
 	// The A-label loads, and so does a name of raw octets written as `\DDD`,
 	// which is the spelling a query with those octets is compared in.
@@ -205,7 +224,7 @@ test_rewrite_tokens_fold_ascii_only :: proc(t: ^testing.T) {
 	refused_with(
 		t,
 		REWRITE + "\"bloc\u212a\"\n",
-		"rewrites[0].answer: an answer host \"bloc\\u212a\" holds U+212A, which is outside ASCII; " + PUNYCODE_HINT,
+		"rewrites[0].answer: an answer host \"bloc\\u212a\" holds U+212A, which is outside ASCII; " + dns.IDN_HINT,
 	)
 
 	// And a TXT string keeps a space outside ASCII at its end: it is text, and

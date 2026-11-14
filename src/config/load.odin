@@ -6,6 +6,7 @@ import "core:net"
 import "core:os"
 import "core:strings"
 import "core:time"
+import "core:unicode"
 import "core:unicode/utf8"
 import "elodin:cache"
 import "elodin:dns"
@@ -1847,16 +1848,19 @@ load_ddr :: proc(l: ^Loader, cfg: ^Config) {
 	check_keys(l, n, "ddr", "name")
 	written: string
 	opt_string(l, n, "name", &written, "ddr")
-	// Refused as written: a hostname holds no space, control or byte outside
-	// ASCII anywhere, so `canonical_domain` has nothing left to trim or refuse.
+	// Refused as written: a hostname holds no space or control anywhere, so
+	// `canonical_domain` has nothing left to trim, and refuses what is outside
+	// ASCII.
 	for c in transmute([]u8)written {
-		if c <= ' ' || c >= 0x7f {
+		if c <= ' ' || c == 0x7f {
 			errorf(l, "ddr.name: %q must be a hostname, the one the certificate of the DoT or DoH listener covers", written)
 			return
 		}
 	}
 	if written != "" {
-		cfg.ddr.name, _ = canonical_domain(l, written, "ddr.name")
+		if name, ok := canonical_domain(l, written, "ddr.name"); ok {
+			cfg.ddr.name = name
+		}
 	}
 }
 
@@ -2587,7 +2591,9 @@ name that cannot be sent is a startup error instead.
 @(private)
 rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: bool) {
 	trimmed := strings.trim(text, ASCII_SPACE)
-	if trimmed == "" || strings.index_any(trimmed, ASCII_SPACE) >= 0 {
+	// A space inside, outside ASCII too, splits two fields meant to be one; one
+	// at an edge is `canonical_domain`'s to refuse.
+	if trimmed == "" || strings.index_proc(strings.trim_space(trimmed), unicode.is_space) >= 0 {
 		errorf(l, "%s: %s needs one host name, got %q", path, type, text)
 		return "", false
 	}
@@ -2704,11 +2710,7 @@ parse_rdata_u16 :: proc(s: string) -> (v: u16, ok: bool) {
 @(private)
 ASCII_SPACE :: " \t\n\v\f\r"
 
-// What a name holding a character outside ASCII is told to do instead: a
-// client asks for an international name as its A-label (RFC 5891 section 5).
-@(private)
-PUNYCODE_HINT :: "a client asks for an international name in punycode, so write it that way (xn--...)"
-// The same for a character no label of an international name holds.
+// What a name holding a character no international name holds is told to do.
 @(private)
 DELETE_HINT :: "no international name holds it, so delete it"
 
@@ -2734,9 +2736,14 @@ canonical_domain :: proc(l: ^Loader, s, what: string) -> (domain: string, ok: bo
 // named U+FFFD.
 @(private)
 ascii_only :: proc(l: ^Loader, s, what: string) -> bool {
-	for r in s {
+	for r, i in s {
 		if r >= utf8.RUNE_SELF {
-			hint := PUNYCODE_HINT if dns.idn_holds(r) else DELETE_HINT
+			// A joiner follows the character it joins (RFC 5892 appendix A.1,
+			// A.2), so one at a label's edge was pasted with the name.
+			joiner := r == 0x200c || r == 0x200d
+			end := i + utf8.rune_size(r)
+			pasted := joiner && (i == 0 || s[i - 1] == '.' || end == len(s) || s[end] == '.')
+			hint := dns.IDN_HINT if dns.idn_holds(r) && !pasted else DELETE_HINT
 			errorf(l, "%s holds U+%04X, which is outside ASCII; %s", what, u32(r), hint)
 			return false
 		}
@@ -3040,9 +3047,11 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	parsed_anchors := make([dynamic]dnssec.Trust_Anchor, 0, len(cfg.dnssec.trust_anchors), context.temp_allocator)
 	all_anchors_read := true
 	for anchor, i in cfg.dnssec.trust_anchors {
-		// A DS record is ASCII in every field, and its owner a name a chain
-		// walk meets as the A-label.
-		if !ascii_only(l, anchor, fmt.tprintf("dnssec.trust_anchors[%d]: %q", i, anchor)) {
+		// The owner is a name a chain walk meets as its A-label. The fields
+		// split as `dnssec.parse_trust_anchor` splits them.
+		rest := anchor
+		owner, has_owner := strings.fields_iterator(&rest)
+		if has_owner && !ascii_only(l, owner, fmt.tprintf("dnssec.trust_anchors[%d]: %q", i, anchor)) {
 			all_anchors_read = false
 			continue
 		}

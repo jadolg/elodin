@@ -391,6 +391,10 @@ name_canonical :: proc(name: string, allocator := context.allocator) -> (canonic
 	return string(buf), true
 }
 
+// What to write instead of a name holding a character `idn_holds` admits: a
+// client asks for an international name as its A-label (RFC 5891 section 5).
+IDN_HINT :: "an international name matches only when written in punycode (xn--...)"
+
 /*
 Whether `r`, a character outside ASCII, has a place in an international name,
 so that its A-label (RFC 5890 section 2.3.2.1) is what a client asks for: a
