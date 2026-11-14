@@ -8,6 +8,7 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 import "elodin:config"
+import "elodin:dns"
 import "elodin:filter"
 import "elodin:logx"
 import "elodin:loop"
@@ -270,7 +271,7 @@ IDNA2008 and NFC tables RFC 5891 section 5 asks of a lookup.
 @(private)
 warn_not_ascii :: proc(name: string, skipped: int) {
 	if skipped > 0 {
-		logx.warnf("list %s: %d names skipped as not ASCII; an international name matches only when written in punycode (xn--...)", name, skipped)
+		logx.warnf("list %s: %d names skipped as not ASCII; %s", name, skipped, dns.IDN_HINT)
 	}
 }
 

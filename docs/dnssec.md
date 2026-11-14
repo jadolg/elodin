@@ -94,6 +94,9 @@ dnssec:
     - "corp.example. IN DS 54707 15 2 FF085C4C1865D42641957E67182575E9DCB20BF2D9DD001D7BB9C5C4D2AC5384"
 ```
 
+An anchor whose owner name holds a character outside ASCII is refused; write an
+international name in punycode (`xn--...`).
+
 An anchor for a zone below the root validates that zone against your own key.
 A name is checked from the closest anchor at or above it (RFC 6840 Appendix
 C.1), so the public tree is not asked about `corp.example` at all: a zone signed

@@ -377,7 +377,7 @@ the routed zone, which leaves the rest of the zone insecure.
 */
 @(test)
 test_a_route_knows_whether_an_anchor_covers_it :: proc(t: ^testing.T) {
-	ROOT :: `". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"`
+	ROOT :: `"` + ROOT_ANCHOR + `"`
 	DS :: `IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF`
 
 	load :: proc(t: ^testing.T, anchors: string, domains := "[corp.example]") -> (Config, bool) {
@@ -459,7 +459,7 @@ configuration checked on one machine is often deployed on another.
 */
 @(test)
 test_a_trust_anchor_set_without_the_root_is_refused :: proc(t: ^testing.T) {
-	ROOT :: `". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"`
+	ROOT :: `"` + ROOT_ANCHOR + `"`
 	DS :: `IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF`
 
 	src :: proc(anchors: string) -> string {

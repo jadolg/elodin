@@ -7,6 +7,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 import "core:unicode"
+import "core:unicode/utf8"
 import "elodin:cache"
 import "elodin:dns"
 import "elodin:dnssec"
@@ -1847,16 +1848,19 @@ load_ddr :: proc(l: ^Loader, cfg: ^Config) {
 	check_keys(l, n, "ddr", "name")
 	written: string
 	opt_string(l, n, "name", &written, "ddr")
-	// Refused as written: a hostname holds no space, control or byte outside
-	// ASCII anywhere, so `canonical_domain` has nothing left to trim or refuse.
+	// Refused as written: a hostname holds no space or control anywhere, so
+	// `canonical_domain` has nothing left to trim, and refuses what is outside
+	// ASCII.
 	for c in transmute([]u8)written {
-		if c <= ' ' || c >= 0x7f {
+		if c <= ' ' || c == 0x7f {
 			errorf(l, "ddr.name: %q must be a hostname, the one the certificate of the DoT or DoH listener covers", written)
 			return
 		}
 	}
 	if written != "" {
-		cfg.ddr.name, _ = canonical_domain(l, written, "ddr.name")
+		if name, ok := canonical_domain(l, written, fmt.tprintf("ddr.name: %q", written)); ok {
+			cfg.ddr.name = name
+		}
 	}
 }
 
@@ -2571,10 +2575,9 @@ v6_rewrite_answer :: proc(v: net.IP6_Address) -> (ans: Rewrite_Answer) {
 /*
 A domain name out of an RDATA field, checked for being one.
 
-`canonical_domain` refuses only a space outside ASCII at an end, so both checks
-are here. A field with a space in it is two fields that were meant to be one,
-and the message says which record was being written rather than leaving the
-operator to find it.
+A field with a space in it is two fields that were meant to be one, and the
+message says which record was being written rather than leaving the operator to
+find it.
 
 The second check is that the wire can carry it, and it is here because of what
 happens when it cannot: `encode_message` fails on the record, `apply_rewrite`
@@ -2588,7 +2591,9 @@ name that cannot be sent is a startup error instead.
 @(private)
 rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: bool) {
 	trimmed := strings.trim(text, ASCII_SPACE)
-	if trimmed == "" || strings.index_any(trimmed, " \t") >= 0 {
+	// A space inside, outside ASCII too, splits two fields meant to be one; one
+	// at an edge is `canonical_domain`'s to refuse.
+	if trimmed == "" || strings.index_proc(strings.trim_space(trimmed), unicode.is_space) >= 0 {
 		errorf(l, "%s: %s needs one host name, got %q", path, type, text)
 		return "", false
 	}
@@ -2613,12 +2618,6 @@ rdata_name :: proc(l: ^Loader, text, path, type: string) -> (name: string, ok: b
 	}
 	what := fmt.tprintf("%s: %s host %q", path, type, trimmed)
 	canonical := canonical_domain(l, trimmed, what) or_return
-	// A space outside ASCII inside it splits two fields just as one at the
-	// check above does: "TXT hello" is no name to point at.
-	if strings.index_proc(trimmed, unicode.is_space) >= 0 {
-		errorf(l, "%s: %s needs one host name, got %q", path, type, text)
-		return "", false
-	}
 	if !name_fits_the_wire(l, canonical, what) {
 		return "", false
 	}
@@ -2711,20 +2710,41 @@ parse_rdata_u16 :: proc(s: string) -> (v: u16, ok: bool) {
 @(private)
 ASCII_SPACE :: " \t\n\v\f\r"
 
+// What a name holding a character no international name holds is told to do.
+@(private)
+DELETE_HINT :: "no international name holds it, so delete it"
+
 /*
 `dns.name_canonical` past the surrounding ASCII space: the spelling the resolver
-compares against. A space outside ASCII at either end - a no-break space pasted
-from a web page, or YAML's `\_` - is refused under `what` rather than trimmed,
-so a name means the bytes it was written with or nothing (#438).
+compares against. A character outside ASCII anywhere is refused under `what`,
+named: a client asks for an international name as its A-label (RFC 5891
+section 5), so a U-label never matches, and a no-break or zero-width space or
+a BOM pasted at an edge misses the same way (#438, #661). A name of raw octets
+is written in `\DDD` escapes, the spelling a query is compared in.
 */
 @(private)
 canonical_domain :: proc(l: ^Loader, s, what: string) -> (domain: string, ok: bool) {
 	trimmed := strings.trim(s, ASCII_SPACE)
-	if strings.trim_space(trimmed) != trimmed {
-		errorf(l, "%s has a space outside ASCII at one end, such as a no-break space; delete it", what)
+	if !ascii_only(l, trimmed, what) {
 		return "", false
 	}
 	return dns.name_canonical(trimmed, l.allocator), true
+}
+
+// Whether `s` is ASCII throughout. The first character outside it is refused
+// under `what`, named, with what to write instead; a byte that is not UTF-8 is
+// named U+FFFD.
+@(private)
+ascii_only :: proc(l: ^Loader, s, what: string) -> bool {
+	for r, i in s {
+		if r >= utf8.RUNE_SELF {
+			before := rune(s[i - 1]) if i > 0 else '.'
+			hint := dns.IDN_HINT if dns.idn_holds(r, before) else DELETE_HINT
+			errorf(l, "%s holds U+%04X, which is outside ASCII; %s", what, u32(r), hint)
+			return false
+		}
+	}
+	return true
 }
 
 @(private)
@@ -3026,6 +3046,14 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 		read, ok := dnssec.parse_trust_anchor(anchor, context.temp_allocator)
 		if !ok {
 			errorf(l, "dnssec.trust_anchors[%d]: %q is not a DS record", i, anchor)
+			all_anchors_read = false
+			continue
+		}
+		// The first field is the owner, a name a chain walk meets as its
+		// A-label, or in the bare form the key tag the parser read as digits.
+		rest := anchor
+		owner, has_owner := strings.fields_iterator(&rest)
+		if has_owner && !ascii_only(l, owner, fmt.tprintf("dnssec.trust_anchors[%d]: %q", i, anchor)) {
 			all_anchors_read = false
 			continue
 		}

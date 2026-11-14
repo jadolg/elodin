@@ -793,10 +793,12 @@ test_a_rule_whose_name_is_not_ascii_is_counted :: proc(t: ^testing.T) {
 	// A name refused for a `/` or a control byte is not counted even when it
 	// holds a byte past ASCII too: punycode would not make it match. Nor is one
 	// whose bytes past ASCII are no letter: a no-break or zero-width space, a
-	// BOM, or a byte that is not UTF-8, as a Latin-1 file holds. Nor is one
-	// holding ASCII no label holds, such as a `*` or a `:`.
+	// BOM, or a byte that is not UTF-8, as a Latin-1 file holds; nor a joiner,
+	// geresh or gershayim after ASCII, which RFC 5892 appendix A admits only
+	// after a Virama, a joining letter or a Hebrew one. Nor is one holding
+	// ASCII no label holds, such as a `*` or a `:`.
 	block, allow := build(
-		"0.0.0.0 a\x01b.example example.com/path example.de/über ads.example\u00a0x.example \u200bads.example \ufeffads.example b\xfccher.example bü\x01cher.example bü*cher.example bücher.example:8080\n",
+		"0.0.0.0 a\x01b.example example.com/path example.de/über ads.example\u00a0x.example \u200bads.example \ufeffads.example b\xfccher.example bü\x01cher.example bü*cher.example bücher.example:8080 ads\u200d.example \u200cads.example a\u05f4b.example\n",
 		.Hosts,
 	)
 	defer set_destroy(block)

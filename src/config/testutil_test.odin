@@ -7,6 +7,12 @@ import "core:testing"
 @(private)
 MINIMAL :: "upstream:\n  servers: [1.1.1.1]\n"
 
+// The root's KSK-2017 digest, and the DS record that anchors it.
+@(private)
+ROOT_DIGEST :: "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
+@(private)
+ROOT_ANCHOR :: ". IN DS 20326 8 2 " + ROOT_DIGEST
+
 // Loads `src`, failing the test with its refusals when it does not load.
 @(private)
 expect_loads :: proc(t: ^testing.T, src: string, loc := #caller_location) -> (cfg: Config, ok: bool) {
