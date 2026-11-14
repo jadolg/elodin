@@ -700,3 +700,25 @@ test_a_refresh_without_room_is_declined :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+A DoH connection over HTTP/2 there is no room to serve ends before anything is
+read from it or written to it: the connection is the server's first allocation,
+and nothing else is touched without it.
+*/
+@(test)
+test_a_doh2_connection_without_room_is_not_served :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := local_server(&cfg)
+	defer free_all(context.temp_allocator)
+	f := Fail_Nth {
+		fail_at  = 1,
+		fail_for = 1,
+	}
+	{
+		context.allocator = mem.Allocator{procedure = fail_nth_proc, data = &f}
+		// No TLS connection: one touched before the refusal would trap.
+		serve_doh2(&s, nil, "dry", {})
+	}
+	testing.expect_value(t, f.seen, 1)
+}

@@ -40,6 +40,9 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	if data[0] & 1 == 0 {
 		input.preface = h2.PREFACE
 		c := h2.make_conn(io, answer, nil, heap)
+		if c == nil {
+			return 0
+		}
 		// A peer that grants no window is answered at once rather than waited on
 		// for a real connection's write timeout.
 		c.write_timeout = 0
@@ -48,6 +51,9 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 		h2.conn_unref(c)
 	} else {
 		c := h2.client_make(io, heap)
+		if c == nil {
+			return 0
+		}
 		// Stream 1 is a request in flight, so a response on it reaches the
 		// response path rather than stopping at the idle-stream check; the
 		// client frees it with the rest of its table.

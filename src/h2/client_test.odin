@@ -1701,21 +1701,6 @@ test_client_request_sends_content_length :: proc(t: ^testing.T) {
 }
 
 /*
-A stream this end opened as `id`, with its body and window as client_request
-would leave them.
-*/
-@(private = "file")
-open_test_stream :: proc(c: ^Client, id: u32, allocator: mem.Allocator) -> ^Client_Stream {
-	s := new(Client_Stream, allocator)
-	s.id = id
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 8, allocator)
-	c.streams[id] = s
-	c.next_stream_id = id + 2
-	return s
-}
-
-/*
 The client side of #308: each PING and non-ACK SETTINGS from an upstream draws
 a frame back, so one that sends nothing else keeps a pooled connection's
 reader echoing for as long as it likes. Past the per-second budget the
@@ -2481,4 +2466,345 @@ test_client_continuation_on_stream_zero_with_no_block_open_is_refused :: proc(t:
 	testing.expect_value(t, len(c.decoder.entries), 0)
 	client_unref(c)
 	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+DOH_REQUEST :: Client_Request {
+	method       = "POST",
+	scheme       = "https",
+	authority    = "mock.invalid",
+	path         = "/dns-query",
+	content_type = "application/dns-message",
+	accept       = "application/dns-message",
+	body         = {0xde, 0xad, 0xbe, 0xef},
+}
+
+/*
+A response the caller has no room to be handed, or whose body the stream has no
+room to hold, is `Out_Of_Memory`: this end's, not the peer's, and not an empty
+answer. The stream fails and the connection carries on, so the next request is
+answered.
+*/
+@(test)
+test_client_response_without_room_is_this_ends :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+
+	p := Peer{handler = echo_handler}
+	if !start_peer(t, &p) {
+		return
+	}
+	defer end_peer(&p)
+	c := p.c
+
+	// The copy handed to the caller.
+	f := Fail_Nth {
+		backing = allocator,
+	}
+	arm(&f, 1, 1)
+	_, err := client_request(c, DOH_REQUEST, 2 * time.Second, fail_nth(&f))
+	testing.expect_value(t, err, Client_Error.Out_Of_Memory)
+	testing.expect(t, refused_any(&f), "nothing was refused")
+
+	// The body the stream holds: its buffer, then the room to grow it.
+	heap := c.allocator
+	arm(&f, 2, 2)
+	f.backing = heap
+	c.allocator = fail_nth(&f)
+	_, err = client_request(c, DOH_REQUEST, 2 * time.Second, allocator)
+	c.allocator = heap
+	testing.expect_value(t, err, Client_Error.Out_Of_Memory)
+	testing.expect_value(t, f.seen, 3)
+
+	resp, again := client_request(c, DOH_REQUEST, 2 * time.Second, allocator)
+	testing.expect_value(t, again, Client_Error.None)
+	want := DOH_REQUEST.body
+	testing.expectf(t, string(resp.body) == string(want), "answered %x", resp.body)
+	delete(resp.body, allocator)
+	expect_no_leaks(t, &track, "response without room")
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+Dry_Answer :: struct {
+	// The GOAWAY the client sent once it could not decode the answer.
+	goaway: Error_Code,
+	sent:   bool,
+}
+
+/*
+A request on a connection that ended because this end had no room for its HPACK
+state is `Out_Of_Memory`, not `Closed`: the peer did nothing wrong, and the
+client told it so with GOAWAY(INTERNAL_ERROR).
+*/
+@(test)
+test_client_request_cut_short_by_this_ends_memory_is_out_of_memory :: proc(t: ^testing.T) {
+	run_script :: proc(client: net.TCP_Socket, data: rawptr) {
+		answer := (^Dry_Answer)(data)
+		h, ok := test_wait_for_frame_type(client, .Headers)
+		if !ok {
+			return
+		}
+		// :status 200, and a literal with incremental indexing for the table.
+		block := []u8{0x88, 0x40, 3, 'x', '-', 'a', 1, 'b'}
+		out := make([dynamic]u8, 0, FRAME_HEADER_SIZE + len(block), context.temp_allocator)
+		write_frame_header(&out, len(block), .Headers, FLAG_END_HEADERS | FLAG_END_STREAM, h.stream_id)
+		append(&out, ..block)
+		if !test_send(client, out[:]) {
+			return
+		}
+		for {
+			hdr: [FRAME_HEADER_SIZE]u8
+			if !test_recv_full(client, hdr[:]) {
+				return
+			}
+			fh, fok := parse_frame_header(hdr[:])
+			if !fok {
+				return
+			}
+			payload := make([]u8, fh.length, context.temp_allocator)
+			if !test_recv_full(client, payload) {
+				return
+			}
+			if fh.type == .Goaway && len(payload) >= 8 {
+				answer.goaway = Error_Code(read_u32(payload[4:]))
+				answer.sent = true
+				return
+			}
+		}
+	}
+	answer: Dry_Answer
+	p := Peer{script = run_script, data = &answer}
+	if !start_peer(t, &p) {
+		return
+	}
+	c := p.c
+	f := Fail_Nth {
+		backing = c.decoder.allocator,
+	}
+	arm(&f, 1, 1)
+	// Set before the request goes out, and so before the reader decodes its answer.
+	c.decoder.allocator = fail_nth(&f)
+
+	_, err := client_request(c, DOH_REQUEST, 2 * time.Second)
+	testing.expect_value(t, err, Client_Error.Out_Of_Memory)
+	end_peer(&p)
+	testing.expect(t, answer.sent, "the client sent no GOAWAY")
+	testing.expect_value(t, answer.goaway, Error_Code.Internal_Error)
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+Pending_Request :: struct {
+	c:      ^Client,
+	body:   []u8,
+	err:    Client_Error,
+	status: int,
+}
+
+@(private = "file")
+run_request :: proc(r: ^Pending_Request) {
+	req := DOH_REQUEST
+	req.body = r.body
+	resp: Client_Response
+	resp, r.err = client_request(r.c, req, 5 * time.Second)
+	r.status = resp.status
+	delete(resp.body)
+	free_all(context.temp_allocator)
+}
+
+// Ends the client's requests as a closing reader would.
+@(private = "file")
+close_client :: proc(c: ^Client) {
+	loop.lock(&c.mu)
+	sync.atomic_store(&c.closed, true)
+	loop.cond_broadcast(&c.cond)
+	loop.cond_broadcast(&c.slot_cond)
+	loop.unlock(&c.mu)
+}
+
+/*
+A request woken for a free stream slot that then has no room to open a stream
+passes the wake on: `client_request`'s cleanup wakes one waiter per slot, and
+one spent on a request that leaves without the slot would leave the next one
+parked beside it until its deadline, a Timeout charged to the upstream.
+*/
+@(test)
+test_a_request_with_no_room_passes_its_slot_on :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	sig: Frame_Signal
+	c := client_make(IO{user = &sig, read = no_read, write = signal_write}, allocator)
+	if !testing.expect(t, c != nil, "cannot make the client") {
+		return
+	}
+	// One slot, taken.
+	c.peer_max_streams = 1
+	held := open_test_stream(c, 1, allocator)
+
+	reqs: [2]Pending_Request
+	threads: [2]^thread.Thread
+	for &r, i in reqs {
+		r.c = c
+		threads[i] = thread.create_and_start_with_poly_data(&r, run_request)
+		if !testing.expectf(t, threads[i] != nil && wait_for_waiter(&c.slot_cond, n = i + 1), "request %d is not waiting for a slot", i) {
+			close_client(c)
+			for th in threads[:i + 1] {
+				if th != nil {
+					thread.join(th)
+					thread.destroy(th)
+				}
+			}
+			client_unref(c)
+			return
+		}
+	}
+
+	// Whichever wakes first has no room for its stream.
+	f := Fail_Nth {
+		backing  = allocator,
+		fail_at  = 1,
+		fail_for = 1,
+	}
+	loop.lock(&c.mu)
+	c.allocator = fail_nth(&f)
+	// The slot freed as `client_request`'s cleanup frees it.
+	delete_key(&c.streams, u32(1))
+	client_stream_destroy(c, held)
+	loop.cond_signal(&c.slot_cond)
+	loop.unlock(&c.mu)
+
+	// Well inside the waiters' own five seconds.
+	sent := sync.sema_wait_with_timeout(&sig.headers, 2 * time.Second)
+	testing.expect(t, sent, "the other request never took the freed slot")
+	close_client(c)
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	testing.expect(t, refused_any(&f), "nothing was refused")
+	errs := [2]Client_Error{reqs[0].err, reqs[1].err}
+	testing.expectf(t, errs == {.Out_Of_Memory, .Closed} || errs == {.Closed, .Out_Of_Memory}, "requests ended %v", errs)
+	loop.lock(&c.mu)
+	c.allocator = allocator
+	loop.unlock(&c.mu)
+	client_unref(c)
+	expect_no_leaks(t, &track, "slot passed on")
+	free_all(context.temp_allocator)
+}
+
+@(private = "file")
+Gated_Request :: struct {
+	using r: Pending_Request,
+	gate:    ^Gate,
+}
+
+@(private = "file")
+run_gated_request :: proc(r: ^Gated_Request) {
+	r.gate.backing = context.temp_allocator
+	context.temp_allocator = mem.Allocator{procedure = gate_proc, data = r.gate}
+	run_request(&r.r)
+}
+
+/*
+Connection credit a body took for a DATA frame it had no room to build goes
+back, and the uploads waiting for credit are woken to it: left parked, one would
+wait out its deadline beside credit it could use.
+*/
+@(test)
+test_credit_a_body_had_no_room_to_send_wakes_the_next :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	sig: Frame_Signal
+	c := client_make(IO{user = &sig, read = no_read, write = signal_write}, allocator)
+	if !testing.expect(t, c != nil, "cannot make the client") {
+		return
+	}
+	// Room on the connection for one three-byte body.
+	c.send_window = 3
+
+	// The first request's third temp allocation is its DATA frame: the header
+	// block and the HEADERS frame come before it.
+	gate := Gate {
+		block_at = 3,
+	}
+	first := Gated_Request {
+		r = {c = c, body = []u8{1, 2, 3}},
+		gate = &gate,
+	}
+	ft := thread.create_and_start_with_poly_data(&first, run_gated_request)
+	if !testing.expect(t, ft != nil && sync.sema_wait_with_timeout(&gate.reached, 5 * time.Second), "the first request never built its DATA frame") {
+		sync.sema_post(&gate.release)
+		close_client(c)
+		if ft != nil {
+			thread.join(ft)
+			thread.destroy(ft)
+		}
+		client_unref(c)
+		return
+	}
+	// It holds the connection's credit; the second waits for some.
+	second := Pending_Request {
+		c    = c,
+		body = []u8{4, 5, 6},
+	}
+	st := thread.create_and_start_with_poly_data(&second, run_request)
+	waiting := st != nil && wait_for_waiter(&c.cond)
+	testing.expect(t, waiting, "the second request is not waiting for credit")
+	sync.sema_post(&gate.release)
+
+	sent := waiting && sync.sema_wait_with_timeout(&sig.data, 2 * time.Second)
+	testing.expect(t, sent, "the second request never sent its body")
+	close_client(c)
+	thread.join(ft)
+	thread.destroy(ft)
+	if st != nil {
+		thread.join(st)
+		thread.destroy(st)
+	}
+	testing.expect_value(t, first.err, Client_Error.Out_Of_Memory)
+	testing.expect_value(t, second.err, Client_Error.Closed)
+	client_unref(c)
+	expect_no_leaks(t, &track, "credit passed on")
+	free_all(context.temp_allocator)
+}
+
+/*
+A response that completes while the client is building a DATA frame it then has
+no room for is the answer, not this end's failure: RFC 9113 8.1 lets a server
+answer before the upload ends, and the client MUST NOT discard that response.
+The stream is closed with RST_STREAM(NO_ERROR), as when the response arrives
+between chunks.
+*/
+@(test)
+test_a_response_that_beat_an_unbuilt_body_is_kept :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
+	gate := Gate {
+		block_at = 3,
+	}
+	upload := Gated_Request {
+		r = {c = c, body = []u8{1, 2, 3}},
+		gate = &gate,
+	}
+	th := thread.create_and_start_with_poly_data(&upload, run_gated_request)
+	reached := th != nil && sync.sema_wait_with_timeout(&gate.reached, 5 * time.Second)
+	if testing.expect(t, reached, "the upload never built its DATA frame") {
+		// The whole answer, :status 200 with END_STREAM, while the frame is built.
+		block := []u8{0x88}
+		answered := client_handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+		testing.expect(t, answered, "the answer was refused")
+	}
+	sync.sema_post(&gate.release)
+	if th != nil {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	testing.expect_value(t, upload.err, Client_Error.None)
+	testing.expect_value(t, upload.status, 200)
+	testing.expect(t, saw_frame(&log, .Rst_Stream, 1), "the stream was not closed")
+	testing.expect_value(t, log.rst_code, Error_Code.No_Error)
+	client_done(t, c, &track, "answer beat the body", &log)
 }

@@ -136,6 +136,9 @@ serve_doh2 :: proc(s: ^Server, conn: ^tlsx.Conn, client: string, peer: net.Endpo
 		begin = h2_begin,
 	}
 	hc := h2.make_conn(io, h2_handler, &ctx)
+	if hc == nil {
+		return
+	}
 	// A response waits no longer for flow-control credit than the connection
 	// waits for anything else, so a client that stops reading cannot hold a
 	// query in flight past its welcome.

@@ -95,7 +95,7 @@ refusing_peer_run :: proc(p: ^Refusing_Peer) {
 }
 
 @(private = "file")
-exchange_with_refusals :: proc(t: ^testing.T, refuse: int) -> (err: Error, headers: int) {
+exchange_with_refusals :: proc(t: ^testing.T, refuse: int, allocator := context.temp_allocator) -> (err: Error, headers: int) {
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
 		return .IO_Error, 0
@@ -155,7 +155,7 @@ exchange_with_refusals :: proc(t: ^testing.T, refuse: int) -> (err: Error, heade
 	dns.set_id_in_place(body, 0)
 
 	resp: []u8
-	resp, err = exchange_doh_h2(u, wire, body, 3 * time.Second, time.tick_add(time.tick_now(), 3 * time.Second), context.temp_allocator)
+	resp, err = exchange_doh_h2(u, wire, body, 3 * time.Second, time.tick_add(time.tick_now(), 3 * time.Second), allocator)
 	if err == .None {
 		testing.expect_value(t, u16(resp[0]) << 8 | u16(resp[1]), query.id)
 	}
@@ -182,4 +182,22 @@ test_a_doh_stream_refused_twice_is_not_charged_as_a_failing_server :: proc(t: ^t
 	err, headers := exchange_with_refusals(t, 2)
 	testing.expect_value(t, err, Error.Peer_Closed)
 	testing.expect_value(t, headers, 2)
+}
+
+/*
+An answer there is no room to hand the caller is `Out_Of_Memory`, as over
+HTTP/1.1: this server's failing, which `charges_member` does not hold against
+the upstream, and not an empty answer.
+*/
+@(test)
+test_a_doh_answer_without_room_is_this_servers :: proc(t: ^testing.T) {
+	f := Fail_Nth {
+		backing  = context.temp_allocator,
+		fail_at  = 1,
+		fail_for = 1,
+	}
+	err, headers := exchange_with_refusals(t, 0, fail_nth(&f))
+	testing.expect_value(t, err, Error.Out_Of_Memory)
+	testing.expect_value(t, headers, 1)
+	testing.expect_value(t, f.seen, 1)
 }

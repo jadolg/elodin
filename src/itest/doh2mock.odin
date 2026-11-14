@@ -214,6 +214,9 @@ doh2_io_write :: proc(user: rawptr, buf: []u8) -> bool {
 doh2_serve_h2 :: proc(conn: ^Doh2_Conn) {
 	io := h2.IO{user = conn, read = doh2_io_read, write = doh2_io_write}
 	hc := h2.make_conn(io, doh2_handler, conn)
+	if hc == nil {
+		return
+	}
 	h2.serve(hc)
 	h2.conn_wait_idle(hc)
 	h2.conn_unref(hc)

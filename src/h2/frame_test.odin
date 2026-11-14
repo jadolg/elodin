@@ -2,21 +2,6 @@ package h2
 
 import "core:testing"
 
-// Bytes for `read_frame` to read, as the wire would hand them over.
-@(private = "file")
-Wire :: struct {
-	bytes: []u8,
-	pos:   int,
-}
-
-@(private = "file")
-wire_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
-	w := cast(^Wire)user
-	n = copy(buf, w.bytes[w.pos:])
-	w.pos += n
-	return n, n > 0
-}
-
 @(private = "file")
 frame_bytes :: proc(type: Frame_Type, flags: u8, stream_id: u32, payload: []u8) -> []u8 {
 	out := make([dynamic]u8, 0, FRAME_HEADER_SIZE + len(payload), context.temp_allocator)

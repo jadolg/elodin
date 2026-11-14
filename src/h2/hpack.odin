@@ -2,6 +2,7 @@ package h2
 
 import "core:mem"
 import "core:strings"
+import "elodin:dns"
 
 /*
 HPACK header compression (RFC 7541).
@@ -41,6 +42,11 @@ Hpack_Error :: enum u8 {
 	Bad_Huffman,
 	Too_Large,
 	Bad_Update,
+	// This end had no room for the list or for the dynamic table's new entry:
+	// not the peer's doing, but the block was not decoded to its end, so the
+	// table may be out of step with the peer's encoder and the connection
+	// cannot go on.
+	Out_Of_Memory,
 }
 
 /*
@@ -111,23 +117,36 @@ evict :: proc(t: ^Dynamic_Table) {
 	}
 }
 
+// Adds an entry as RFC 7541 4.4 does, or false where the table has no room to
+// store it, which leaves the table as it was.
 @(private)
-dynamic_table_add :: proc(t: ^Dynamic_Table, name, value: string) {
-	f := Header_Field {
-		name  = strings.clone(name, t.allocator),
-		value = strings.clone(value, t.allocator),
-	}
-	size := entry_size(f)
+dynamic_table_add :: proc(t: ^Dynamic_Table, name, value: string) -> bool {
+	size := entry_size({name, value})
 	// An entry larger than the whole table empties it and is not stored.
 	if size > t.max_size {
 		table_clear(t)
-		delete(f.name, t.allocator)
-		delete(f.value, t.allocator)
-		return
+		return true
 	}
-	inject_at(&t.entries, 0, f)
+	n, nok := dns.alloc_slice([]u8, len(name), t.allocator)
+	if !nok {
+		return false
+	}
+	v, vok := dns.alloc_slice([]u8, len(value), t.allocator)
+	if !vok {
+		delete(n, t.allocator)
+		return false
+	}
+	copy(n, name)
+	copy(v, value)
+	f := Header_Field{string(n), string(v)}
+	if _, err := inject_at(&t.entries, 0, f); err != nil {
+		delete(n, t.allocator)
+		delete(v, t.allocator)
+		return false
+	}
 	t.size += size
 	evict(t)
+	return true
 }
 
 // Index 1..61 is the static table; anything above indexes the dynamic table.
@@ -214,7 +233,10 @@ read_string :: proc(r: ^Bit_Reader, allocator: mem.Allocator) -> (s: string, err
 Decode a header block.
 
 Returns the header list allocated from `allocator`. `table` carries the dynamic
-table across calls on the same connection, as HPACK requires.
+table across calls on the same connection, as HPACK requires. `Out_Of_Memory`
+where `allocator` or the table refused anything: a field cloned short, or an
+entry the peer's encoder added that this table could not, decodes later fields
+to the wrong headers.
 */
 decode :: proc(
 	table: ^Dynamic_Table,
@@ -227,14 +249,20 @@ decode :: proc(
 	r := Bit_Reader {
 		buf = block,
 	}
-	out := make([dynamic]Header_Field, 0, 16, allocator)
+	dry := false
+	watch := dns.Dry_Watch {
+		backing = allocator,
+		dry     = &dry,
+	}
+	watched := dns.dry_watch_allocator(&watch)
+	out := make([dynamic]Header_Field, 0, 16, watched)
 	// Every failure below abandons the whole list, and there are several ways to
 	// reach one. Releasing the fields decoded so far here rather than at each
 	// return keeps a peer from leaking a header block per rejected connection.
 	defer if err != .None {
 		for f in out {
-			delete(f.name, allocator)
-			delete(f.value, allocator)
+			delete(f.name, watched)
+			delete(f.value, watched)
 		}
 		delete(out)
 	}
@@ -246,21 +274,23 @@ decode :: proc(
 		}
 		b := r.buf[r.pos]
 
+		f: Header_Field
 		switch {
 		case b & 0x80 != 0:
 			// Indexed header field.
 			index := read_integer(&r, 7) or_return
-			f, ok := table_lookup(table, index)
+			entry, ok := table_lookup(table, index)
 			if !ok {
 				return nil, .Bad_Index
 			}
-			append(&out, Header_Field{strings.clone(f.name, allocator), strings.clone(f.value, allocator)})
+			f = {strings.clone(entry.name, watched), strings.clone(entry.value, watched)}
 
 		case b & 0xc0 == 0x40:
 			// Literal with incremental indexing.
-			f := read_literal(&r, table, 6, allocator) or_return
-			dynamic_table_add(table, f.name, f.value)
-			append(&out, f)
+			f = read_literal(&r, table, 6, watched) or_return
+			if !dry && !dynamic_table_add(table, f.name, f.value) {
+				dry = true
+			}
 
 		case b & 0xe0 == 0x20:
 			/*
@@ -288,16 +318,22 @@ decode :: proc(
 			// Literal without indexing (0x00) or never indexed (0x10). Both are
 			// read the same way; the distinction only matters to intermediaries
 			// that re-encode, which we do not.
-			f := read_literal(&r, table, 4, allocator) or_return
-			append(&out, f)
+			f = read_literal(&r, table, 4, watched) or_return
 		}
 
-		// Guarded, since an append that could not allocate leaves `out` as it was.
-		if len(out) > 0 {
-			total += entry_size(out[len(out) - 1])
-			if total > MAX_HEADER_LIST {
-				return nil, .Too_Large
-			}
+		before := len(out)
+		if !dry {
+			append(&out, f)
+		}
+		if len(out) == before {
+			// Not in `out`, so the release above would miss it.
+			delete(f.name, watched)
+			delete(f.value, watched)
+			return nil, .Out_Of_Memory
+		}
+		total += entry_size(f)
+		if total > MAX_HEADER_LIST {
+			return nil, .Too_Large
 		}
 	}
 	return out[:], .None
