@@ -298,3 +298,43 @@ test_a_broken_stream_is_not_written_to :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, got[2] == 'w', "the first answer to arrive starts with %q, the one written while broken", got[2])
 }
+
+/*
+A write that fails ends the connection's reads too: the reader, parked waiting
+for the client's next message, is woken at once rather than at the end of its
+idle wait, so a connection nothing more can be written to does not keep its
+place in `max_connections`.
+*/
+@(test)
+test_a_failed_write_ends_the_reads :: proc(t: ^testing.T) {
+	pair: Stall_Pair
+	defer stall_pair_destroy(&pair)
+	if !stall_pair(t, &pair) {
+		return
+	}
+	// Long enough that a read waiting it out is told apart from one ended.
+	tlsx.set_timeouts(pair.writer, STALL_TIMEOUT, 100 * time.Millisecond)
+	session := Stream_Session {
+		conn = Conn{socket = pair.writer.socket, tls = pair.writer},
+	}
+	// Never read, so the write stalls past its timeout.
+	response: [STALL_ANSWER]u8
+	job := Write_Job{&session, response[:], false}
+	tl: Test_Loop
+	if !testing.expect(t, start_test_loop(&tl), "no loop") {
+		return
+	}
+	_, started := loop.spawn(tl.loops[0], write_job, &job)
+	stop_test_loop(&tl)
+	if !testing.expect(t, started, "the writer did not start") {
+		return
+	}
+	// The premise: the write failed.
+	if !testing.expect(t, sync.atomic_load(&session.broken), "the stalled write did not fail") {
+		return
+	}
+	buf: [64]u8
+	start := time.tick_now()
+	_, err := tlsx.read(pair.writer, buf[:])
+	testing.expectf(t, err != .None && err != .Timeout, "the read ended %v after %v, not at once", err, time.tick_since(start))
+}

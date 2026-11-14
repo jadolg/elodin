@@ -1,7 +1,8 @@
 package server
 
-import "core:mem"
+import "core:net"
 import "core:sync"
+import "core:time"
 import "elodin:dnssec"
 import "elodin:loop"
 
@@ -21,7 +22,7 @@ count and `server.max_connections` bounds, as it bounds the connection; the
 queries beside it are counted in `max_pending`, as an HTTP/2 stream's are, so a
 flood of pipelined queries is shed with the datagrams rather than beside them.
 Past this many on one connection the reader stops reading until one is answered,
-so one client cannot take every place in `max_pending` for itself.
+so one connection cannot take every place in `max_pending` for itself.
 */
 STREAM_MAX_IN_FLIGHT :: 16
 
@@ -49,28 +50,17 @@ Stream_Session :: struct {
 	// and whether a write has failed, after which nothing more is written.
 	answered:  bool,
 	broken:    bool,
+	// When the last answer went out, for `stream_awaited`. Atomic, by `_nsec`.
+	last_answer: time.Tick,
 }
 
-// A query and its message in one block, the bytes trailing the struct, so a
-// plain `free` releases both; see `new_udp_job`.
+// A query and its message in one block (`new_with_bytes`).
 @(private)
 Stream_Query :: struct {
 	session: ^Stream_Session,
 	// In the connection's own place rather than counted in `max_pending`.
 	own:     bool,
 	message: []u8,
-}
-
-@(private)
-new_stream_query :: proc(message: []u8) -> ^Stream_Query {
-	raw, err := mem.alloc(size_of(Stream_Query) + len(message), align_of(Stream_Query))
-	if err != .None {
-		return nil
-	}
-	q := cast(^Stream_Query)raw
-	q.message = ([^]u8)(raw)[size_of(Stream_Query):][:len(message)]
-	copy(q.message, message)
-	return q
 }
 
 /*
@@ -85,7 +75,8 @@ and in order, as a connection with no room to spare is answered.
 @(private)
 stream_dispatch :: proc(session: ^Stream_Session, message: []u8) {
 	own := stream_take_place(session)
-	if q := new_stream_query(message); q != nil {
+	if q, copied := new_with_bytes(Stream_Query, message); q != nil {
+		q.message = copied
 		q.session = session
 		q.own = own
 		if stream_start(session, q) {
@@ -209,22 +200,41 @@ stream_write_answer :: proc(session: ^Stream_Session, response: []u8) {
 	}
 	if written {
 		sync.atomic_store(&session.answered, true)
-	} else {
-		sync.atomic_store(&session.broken, true)
+		sync.atomic_store(&session.last_answer._nsec, loop.tick_now()._nsec)
+		return
 	}
+	sync.atomic_store(&session.broken, true)
+	// Nothing more can be written, so nothing more is read: the reader, parked
+	// on the client's next message, sees the end of the stream at once rather than
+	// at the end of its idle wait.
+	net.shutdown(session.conn.socket, .Receive)
 }
 
 /*
-Wait until every query `stream_dispatch` started has been answered; true when
-any had to be waited for.
+Whether a reader whose idle wait has just run out should wait again: a query
+still in flight, or an answer written within the last `idle`, and no write
+failed.
 */
 @(private)
-stream_settle :: proc(session: ^Stream_Session) -> (waited: bool) {
+stream_awaited :: proc(session: ^Stream_Session, idle: time.Duration) -> bool {
+	if sync.atomic_load(&session.broken) {
+		return false
+	}
+	sync.mutex_lock(&session.mu)
+	in_flight := session.in_flight
+	sync.mutex_unlock(&session.mu)
+	last := time.Tick{sync.atomic_load(&session.last_answer._nsec)}
+	return in_flight > 0 || (last != (time.Tick{}) && loop.tick_since(last) < idle)
+}
+
+/*
+Wait until every query `stream_dispatch` started has been answered.
+*/
+@(private)
+stream_settle :: proc(session: ^Stream_Session) {
 	sync.mutex_lock(&session.mu)
 	defer sync.mutex_unlock(&session.mu)
 	for session.in_flight > 0 {
-		waited = true
 		loop.cond_wait(&session.done, &session.mu)
 	}
-	return waited
 }

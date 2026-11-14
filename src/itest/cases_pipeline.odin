@@ -2,6 +2,9 @@ package itest
 
 import "core:fmt"
 import "core:net"
+import "core:os"
+import "core:strings"
+import "core:sys/posix"
 import "core:sync"
 import "core:time"
 import "elodin:dns"
@@ -22,13 +25,26 @@ HIT :: "hit.pipeline.test."
 @(private = "file")
 SLOW :: "slow.pipeline.test."
 @(private = "file")
+BRIEF :: "brief.pipeline.test."
+@(private = "file")
 HIT_ID :: 0xffff
 // Long enough past `client_timeout` below that the server's idle wait ends
 // while the answer to `SLOW` is still on its way.
 @(private = "file")
 SLOW_DELAY :: 3 * time.Second
+// Between one `PIPELINE_CLIENT_TIMEOUT` and two, so the answer lands inside the
+// second idle wait and that wait ends with nothing in flight.
+@(private = "file")
+BRIEF_DELAY :: 1500 * time.Millisecond
+// Past the end of that second wait, and well inside a client_timeout of the
+// answer.
+@(private = "file")
+AFTER_BRIEF :: 700 * time.Millisecond
 @(private = "file")
 PIPELINE_CLIENT_TIMEOUT :: "1s"
+// Past `PIPELINE_CLIENT_TIMEOUT` and well short of `SLOW_DELAY`.
+@(private = "file")
+IDLE_WAIT_PASSED :: 1500 * time.Millisecond
 @(private = "file")
 HOLD_WAIT :: 5 * time.Second
 
@@ -38,6 +54,7 @@ run_pipeline_cases :: proc(r: ^Runner) {
 	mock := mock_make(group, upstream_port)
 	mock_synth(mock, HIT, u16(dns.Type.A), {192, 0, 2, 1})
 	mock_delay(mock, SLOW, u16(dns.Type.A), SLOW_DELAY, nil)
+	mock_delay(mock, BRIEF, u16(dns.Type.A), BRIEF_DELAY, nil)
 	// Every other name waits on the hold; with none set it is answered at once.
 	mock_delay_all(mock, 0, nil)
 	if !mock_start_or_skip(r, mock, group) {
@@ -104,6 +121,49 @@ run_pipeline_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	/*
+	A query sent after the idle wait has ended, while a slow one is still in
+	flight, is read and answered at once: the reader goes back to reading, not
+	to waiting for the slow one.
+	*/
+	start_case(r, "tcp: a hit sent after the idle wait ended, with a slow query in flight, is answered first")
+	if conn, dialled := dial_tcp(tcp_port); check(r, dialled, "cannot connect over tcp") {
+		defer net.close(conn.socket)
+		hit_after_the_idle_wait(r, &conn)
+	}
+	end_case(r)
+
+	/*
+	An idle wait that ends with nothing in flight, but less than a
+	client_timeout after the last answer, is waited again: the connection is
+	idle from that answer, not from the last question.
+	*/
+	start_case(r, "tcp: the idle wait counts from the last answer")
+	if conn, dialled := dial_tcp(tcp_port); check(r, dialled, "cannot connect over tcp") {
+		defer net.close(conn.socket)
+		brief := stream_query(&conn, build_query(BRIEF, u16(dns.Type.A), id = 1), context.temp_allocator)
+		if check(r, brief.ok, "the brief query was not answered") {
+			// No event says the server's wait has ended; a late timer can only
+			// make the case pass for the wrong reason.
+			time.sleep(AFTER_BRIEF) // lint:allow the idle wait has no observable end
+			next := stream_query(&conn, build_query(HIT, u16(dns.Type.A), id = 2), context.temp_allocator)
+			check(r, next.ok, "the connection was closed less than client_timeout after its last answer")
+		}
+	}
+	end_case(r)
+
+	/*
+	A client that half-closes with a query in flight has the read end at once,
+	not time out: it gets its answer, and the reader does not go round reading
+	the end of the stream while it waits.
+	*/
+	start_case(r, "tcp: a half-closed connection with a query in flight is answered without spinning")
+	if conn, dialled := dial_tcp(tcp_port); check(r, dialled, "cannot connect over tcp") {
+		defer net.close(conn.socket)
+		half_closed_with_a_query_in_flight(r, &conn, srv.process.pid)
+	}
+	end_case(r)
+
+	/*
 	The idle wait is waited out again only between messages. A message whose
 	first byte is in when the wait ends is held to the deadline it started,
 	which nothing extends (RFC 7766 section 6.2.3): the connection ends once
@@ -135,9 +195,9 @@ run_pipeline_cases :: proc(r: ^Runner) {
 
 /*
 Ask `SLOW` and send `part` behind it - in the same write, or `separately` once the
-query has reached the upstream - wait out its answer, which the mock delays past
-`client_timeout`, and then send `rest`: the connection has to be over by then,
-`rest` unanswered.
+query has reached the upstream - and the rest of the message once the idle wait
+has ended, while `SLOW` is still in flight: the reader has to have stopped by
+then, so `SLOW`'s answer is the only one and the connection ends behind it.
 */
 @(private = "file")
 part_read_past_the_wait :: proc(r: ^Runner, tcp_port: int, mock: ^Mock, part, rest: []u8, separately := false) {
@@ -161,18 +221,110 @@ part_read_past_the_wait :: proc(r: ^Runner, tcp_port: int, mock: ^Mock, part, re
 			return
 		}
 	}
+	// Inside the one more idle wait a reader that held the part to no deadline
+	// would give it. No event says the first has ended; a late timer can only
+	// make the case pass for the wrong reason.
+	time.sleep(IDLE_WAIT_PASSED) // lint:allow the idle wait has no observable end
+	if !check(r, conn_write(&conn, rest), "the rest was not sent") {
+		return
+	}
 	slow := stream_read_answer(&conn, context.temp_allocator)
 	if !check(r, slow.ok, "the slow query was not answered") {
 		return
 	}
-	check_eq_int(r, int(parse_header(r, slow.wire).id), 1, "id of the slow answer")
-	// Refused is the connection already over, which is the outcome asked for. A
-	// write the kernel takes says nothing either way; the read below does.
-	if !conn_write(&conn, rest) {
-		return
-	}
+	check_eq_int(r, int(parse_header(r, slow.wire).id), 1, "id of the first answer (the slow one)")
 	after := stream_read_answer(&conn, context.temp_allocator)
 	check(r, !after.ok, "the rest was read as a query of its own and answered")
+}
+
+// The CPU the process `pid` has used, in clock ticks, from `/proc/<pid>/stat`.
+@(private = "file")
+process_cpu_ticks :: proc(pid: int) -> (ticks: int, ok: bool) {
+	data, err := os.read_entire_file(fmt.tprintf("/proc/%d/stat", pid), context.temp_allocator)
+	if err != nil {
+		return
+	}
+	text := string(data)
+	// The name field can hold spaces; everything after its last ')' is numbers.
+	close_paren := strings.last_index_byte(text, ')')
+	if close_paren < 0 {
+		return
+	}
+	fields := strings.fields(text[close_paren + 1:], context.temp_allocator)
+	// utime and stime, the 14th and 15th fields of the line.
+	if len(fields) < 13 {
+		return
+	}
+	utime := parse_decimal(fields[11]) or_return
+	stime := parse_decimal(fields[12]) or_return
+	return utime + stime, true
+}
+
+@(private = "file")
+parse_decimal :: proc(s: string) -> (n: int, ok: bool) {
+	if len(s) == 0 || len(s) > 18 {
+		return
+	}
+	for c in transmute([]u8)s {
+		if c < '0' || c > '9' {
+			return
+		}
+		n = n * 10 + int(c - '0')
+	}
+	return n, true
+}
+
+@(private = "file")
+half_closed_with_a_query_in_flight :: proc(r: ^Runner, c: ^Test_Conn, pid: int) {
+	// A reader going round on the end of the stream for `SLOW_DELAY` uses all of
+	// it; one parked uses next to none. A quarter is far from both.
+	hz := int(posix.sysconf(._CLK_TCK))
+	if !check(r, hz > 0, "cannot read the clock tick rate") {
+		return
+	}
+	spin_ticks := int(SLOW_DELAY / time.Millisecond) * hz / 1000 / 4
+	before, read_before := process_cpu_ticks(pid)
+	if !check(r, read_before, "cannot read the server's CPU time") {
+		return
+	}
+	if !check(r, conn_write(c, frame_all({build_query(SLOW, u16(dns.Type.A), id = 1)})), "the slow query was not sent") {
+		return
+	}
+	if !check(r, net.shutdown(c.socket, .Send) == nil, "cannot half-close the connection") {
+		return
+	}
+	answer := stream_read_answer(c, context.temp_allocator)
+	if !check(r, answer.ok, "the query on the half-closed connection was not answered") {
+		return
+	}
+	check_eq_int(r, int(parse_header(r, answer.wire).id), 1, "id of the answer")
+	after, read_after := process_cpu_ticks(pid)
+	if check(r, read_after, "cannot read the server's CPU time") {
+		check(r, after - before < spin_ticks, "the server used %d ticks of CPU waiting %v on one answer", after - before, SLOW_DELAY)
+	}
+}
+
+@(private = "file")
+hit_after_the_idle_wait :: proc(r: ^Runner, c: ^Test_Conn) {
+	SLOW_ID :: 1
+	if !check(r, conn_write(c, frame_all({build_query(SLOW, u16(dns.Type.A), id = SLOW_ID)})), "the slow query was not sent") {
+		return
+	}
+	// The server's idle wait has no event to wait on. A timer that fires late
+	// only makes the case pass for the wrong reason; it cannot fail it.
+	time.sleep(IDLE_WAIT_PASSED) // lint:allow the idle wait has no observable end
+	if !check(r, conn_write(c, frame_all({build_query(HIT, u16(dns.Type.A), id = HIT_ID)})), "the hit was not sent") {
+		return
+	}
+	first := stream_read_answer(c, context.temp_allocator)
+	if !check(r, first.ok, "no answer arrived") {
+		return
+	}
+	check_eq_int(r, int(parse_header(r, first.wire).id), HIT_ID, "id of the first answer (the hit)")
+	second := stream_read_answer(c, context.temp_allocator)
+	if check(r, second.ok, "the slow query was not answered") {
+		check_eq_int(r, int(parse_header(r, second.wire).id), SLOW_ID, "id of the second answer (the slow one)")
+	}
 }
 
 @(private = "file")

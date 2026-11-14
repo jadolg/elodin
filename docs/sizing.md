@@ -110,14 +110,6 @@ Each TCP or DoT connection keeps one query in flight outside `max_pending`, and
 each DoH-over-HTTP/1.1 connection answers one query at a time, so
 `max_connections` bounds those instead.
 
-### Pipelined queries on TCP and DoT
-
-A client may send several queries down one TCP or DoT connection without
-waiting (Android's Private DNS does). Each is answered as soon as it is ready,
-in whatever order that is (RFC 7766 section 7), so a cache hit is not held up
-behind a miss sent before it. At most 16 are in flight per connection; past
-that elodin stops reading the connection until one is answered.
-
 The derived figure is memory over what a query can come to hold: the stack and
 scratch it uses (a few kilobytes for a cache hit, about 20 KB for a miss that
 walks a DNSSEC chain) and up to 256 KiB of decoded answers, which is the most a
@@ -254,6 +246,14 @@ cheap rather than free. **If you expose DoT or DoH to the internet, rate-limit n
 connections per source in front of the resolver**: see [a connection rate limit in
 front](public-resolver.md#a-connection-rate-limit-in-front). The handshake-flood
 figures are on [the same page](public-resolver.md#handshake-floods).
+
+### Pipelined queries on TCP and DoT
+
+A client may send several queries down one TCP or DoT connection without
+waiting (Android's Private DNS does). Each is answered as soon as it is ready,
+in whatever order that is (RFC 7766 section 7), so a cache hit is not held up
+behind a miss sent before it. At most 16 are in flight per connection; past
+that elodin stops reading the connection until one is answered.
 
 ## Descriptors
 

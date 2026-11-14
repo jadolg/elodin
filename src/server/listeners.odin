@@ -381,21 +381,21 @@ Udp_Job :: struct {
 }
 
 /*
-A job and its datagram in one block, the bytes trailing the struct, so the
-reader makes one heap allocation per datagram and the query's fiber, on the
-reader's own loop, one `free`. `data` is a view into the block and dies with
-it - a plain `free(job)` releases both.
+A zeroed `T` and a copy of `bytes` in one block, the bytes trailing the struct,
+so a reader makes one heap allocation per message and the query's fiber one
+`free`. `copied` is a view into the block and dies with it - a plain `free`
+of the `T` releases both. Nil where the allocator has no room.
 */
 @(private)
-new_udp_job :: proc(datagram: []u8) -> ^Udp_Job {
-	raw, err := mem.alloc(size_of(Udp_Job) + len(datagram), align_of(Udp_Job))
+new_with_bytes :: proc($T: typeid, bytes: []u8) -> (header: ^T, copied: []u8) {
+	raw, err := mem.alloc(size_of(T) + len(bytes), align_of(T))
 	if err != .None {
-		return nil
+		return nil, nil
 	}
-	job := cast(^Udp_Job)raw
-	job.data = ([^]u8)(raw)[size_of(Udp_Job):][:len(datagram)]
-	copy(job.data, datagram)
-	return job
+	header = cast(^T)raw
+	copied = ([^]u8)(raw)[size_of(T):][:len(bytes)]
+	copy(copied, bytes)
+	return header, copied
 }
 
 @(private)
@@ -819,11 +819,12 @@ udp_loop :: proc(data: rawptr) {
 			continue
 		}
 
-		job := new_udp_job(buf[:n])
+		job, datagram := new_with_bytes(Udp_Job, buf[:n])
 		if job == nil {
 			sync.atomic_add(&ctx.server.stats.dropped, 1)
 			continue
 		}
+		job.data = datagram
 		job.ctx = ctx
 		job.client = client
 		job.socket = socket
@@ -1963,16 +1964,20 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		budget.idle = client_timeout(s)
 		budget.deadline = {}
 		between := reader.start == reader.end
+		waited := loop.tick_now()
 		query, read := stream_read_message(conn, &reader, &budget)
 		if !read {
 			/*
-			An idle wait that ran out with queries still in flight is waited out
-			again from the last answer: a connection waiting on its answers is
-			not idle (RFC 7766 section 6.2.3). Only a wait between messages - no
-			byte of the next one read, so the deadline never started - and a
-			connection that has ended reads its end again.
+			An idle wait that ran its whole length while the connection still has
+			a query in flight, or had one answered inside the wait, is waited
+			again: a connection waiting on its answers is not idle (RFC 7766
+			section 6.2.3), and the reader goes on reading meanwhile. Only a wait
+			between messages - no byte of the next one read, so the deadline
+			never started - and one that timed out rather than ended early, as
+			the end of the stream or a cancel does.
 			*/
-			if between && budget.idle > 0 && budget.deadline == (time.Tick{}) && stream_settle(&session) {
+			idled := between && budget.idle > 0 && budget.deadline == (time.Tick{}) && loop.tick_since(waited) >= budget.idle
+			if idled && stream_awaited(&session, budget.idle) {
 				continue
 			}
 			return
@@ -2013,7 +2018,8 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		leaves a client that framed a correct query waiting for an answer that is
 		never coming, until `client_timeout` closes the connection anyway, and
 		leaves this fiber reading the rest of the flood in the meantime; closing
-		says so now and hands the slot back to `max_connections`. RFC 7766 6.2.3
+		says so now and hands the slot back to `max_connections`, once the
+		queries already admitted on it are answered. RFC 7766 6.2.3
 		has a server free to hold connections open for no time at all when it is
 		under heavy load or attack, which is the case this is, and a client that
 		wants another answer is free to open one - which costs it a handshake, and
