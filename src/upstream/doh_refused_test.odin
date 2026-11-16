@@ -281,13 +281,22 @@ test_a_doh_answer_without_room_is_this_servers :: proc(t: ^testing.T) {
 }
 
 /*
-A member whose 429 asked this query to leave it alone is not asked again in the
-query's second round (RFC 9110 10.2.3): the group's other member timing out is
-no reason to go back to a server that has just said it will refuse. The DoH
-member goes through `exchange` and a real group, on the scripted peer.
+A member that answered this query 429 is not asked it again in the query's
+second round, with a `Retry-After` (RFC 9110 10.2.3) or without: the group's
+other member timing out is no reason to go back to a server that has just said
+it will refuse. The DoH member goes through `exchange` and a real group, on the
+scripted peer; the other is a silent UDP mock.
 */
 @(test)
 test_a_member_that_refused_is_not_asked_again_in_the_same_query :: proc(t: ^testing.T) {
+	for retry_after in ([]string{"120", ""}) {
+		asked := ask_a_refusing_member_and_a_silent_one(t, retry_after)
+		testing.expectf(t, asked == 1, "a member that answered 429 (Retry-After %q) in this query was asked %d times in it", retry_after, asked)
+	}
+}
+
+@(private = "file")
+ask_a_refusing_member_and_a_silent_one :: proc(t: ^testing.T, retry_after: string) -> (asked: int) {
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
 		return
@@ -299,7 +308,9 @@ test_a_member_that_refused_is_not_asked_again_in_the_same_query :: proc(t: ^test
 	}
 	head := make([dynamic]u8, 0, 64, context.temp_allocator)
 	h2.encode_header(&head, ":status", "429")
-	h2.encode_header(&head, "retry-after", "120")
+	if retry_after != "" {
+		h2.encode_header(&head, "retry-after", retry_after)
+	}
 	p := Refusing_Peer{listener = listener, head = head[:]}
 	peer := thread.create_and_start_with_poly_data(&p, refusing_peer_run)
 	a, aerr := make_upstream(config.Upstream_Spec{name = "refusing", kind = .HTTPS, address = "127.0.0.1", port = bound.port, hostname = "doh.invalid", path = "/dns-query", url = "https://doh.invalid/dns-query"}, 8, 30 * time.Second)
@@ -339,11 +350,13 @@ test_a_member_that_refused_is_not_asked_again_in_the_same_query :: proc(t: ^test
 		g := failover_group(ups, 300 * time.Millisecond, attempts = 2)
 		resp, _, rerr := resolve(&g, query, context.allocator)
 		delete(resp, context.allocator)
-		testing.expectf(t, sync.atomic_load(&p.headers) == 1, "a member that answered 429 Retry-After 120 in this query was asked %d times in it (err %v)", sync.atomic_load(&p.headers), rerr)
+		testing.expectf(t, rerr != .None, "a group of a refusing and a silent member answered")
+		asked = sync.atomic_load(&p.headers)
 		stop_udp_mock(&m, worker, b)
 	}
 	destroy(a)
 	thread.join(peer)
 	thread.destroy(peer)
 	free_all(context.temp_allocator)
+	return
 }

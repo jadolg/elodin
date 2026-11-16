@@ -153,6 +153,18 @@ test_a_throttled_doh_h1_reply_parks_for_its_retry_after :: proc(t: ^testing.T) {
 			window = 0,
 		},
 		{
+			what = "HTTP/1.0 429 framed with chunks, which its head may not be",
+			reply = "HTTP/1.0 429 Too Many Requests\r\nRetry-After: 120\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+			err = .HTTP_Error,
+			window = 0,
+		},
+		{
+			what = "429 whose chunked body is broken",
+			reply = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nzz\r\n",
+			err = .Throttled,
+			window = 2 * time.Minute,
+		},
+		{
 			what = "429 asking twice, the first longer",
 			reply = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nRetry-After: 15\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
 			err = .Throttled,
@@ -242,7 +254,7 @@ test_only_an_answer_sent_after_the_refusal_lifts_a_retry_after :: proc(t: ^testi
 	wait := -loop.moment_since(u.throttled_until)
 	testing.expectf(t, wait > 5 * time.Minute - time.Second && wait <= 5 * time.Minute, "left alone for %v, want 5m", wait)
 
-	record_success(&u, time.Millisecond, sent = loop.tick_now())
+	record_success(&u, time.Millisecond, sent = time.tick_add(u.refused_at, time.Millisecond))
 	testing.expect(t, healthy(&u), "an answer to a query sent after the refusal did not lift it")
 	testing.expect(t, answering(&u), "a member answering again is not counted as answering")
 }
@@ -410,7 +422,7 @@ test_reopened_windows_share_one_gate :: proc(t: ^testing.T) {
 		if !testing.expect(t, !healthy(&u), "the refusal did not open a window") {
 			return
 		}
-		record_success(&u, time.Millisecond, sent = loop.tick_now())
+		record_success(&u, time.Millisecond, sent = time.tick_add(u.refused_at, time.Millisecond))
 		if !testing.expect(t, healthy(&u), "the answer did not close the window") {
 			return
 		}

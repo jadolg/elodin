@@ -380,8 +380,9 @@ Http_Response :: struct {
 	// status is one `h2.status_asks_to_wait` names; zero for none, or one that
 	// did not parse. See `h2.retry_after_of`.
 	retry_after: u32,
-	// The final response's header section was read to its end, so `status` and
-	// its fields are the server's whole word whatever became of the body.
+	// The final response's header section was read to its end and its framing
+	// accepted, so `status` and its fields are the server's whole word whatever
+	// became of the body.
 	whole_head:  bool,
 }
 
@@ -631,7 +632,6 @@ http_exchange :: proc(
 			}
 		}
 		if resp.status >= 200 {
-			resp.whole_head = true
 			break
 		}
 		/*
@@ -661,6 +661,8 @@ http_exchange :: proc(
 	if chunked && content_length >= 0 {
 		resp.keep_alive = false
 	}
+	// The head has been read and its framing accepted; what follows is the body.
+	resp.whole_head = true
 
 	switch {
 	case resp.status == 204 || resp.status == 304:

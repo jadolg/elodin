@@ -440,7 +440,7 @@ alone (`note_throttled`).
 healthy :: proc(u: ^Upstream) -> bool {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
-	if loop.moment_since(u.throttled_until) < 0 {
+	if throttled_locked(u) {
 		return false
 	}
 	if u.failures < FAILURE_THRESHOLD {
@@ -454,6 +454,12 @@ healthy :: proc(u: ^Upstream) -> bool {
 throttled :: proc(u: ^Upstream) -> bool {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
+	return throttled_locked(u)
+}
+
+// `throttled`, for a caller that holds `u.mu`.
+@(private = "file")
+throttled_locked :: proc(u: ^Upstream) -> bool {
 	return loop.moment_since(u.throttled_until) < 0
 }
 
@@ -477,7 +483,7 @@ there.
 answering :: proc(u: ^Upstream) -> bool {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
-	return u.failures == 0 && u.stats.queries > u.stats.failures && loop.moment_since(u.throttled_until) >= 0
+	return u.failures == 0 && u.stats.queries > u.stats.failures && !throttled_locked(u)
 }
 
 /*

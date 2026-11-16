@@ -906,6 +906,11 @@ usable_rcode :: proc(response: []u8) -> bool {
 	return u16(rcode) <= 0xf
 }
 
+// In `resolve_sequential`'s `asked`: the member refused this query with a 429
+// or 503, and is not asked it again.
+@(private = "file")
+REFUSED_IN_QUERY :: -1
+
 /*
 Say once, at warn, that a REFUSED carrying no policy extended error was swept.
 
@@ -1051,10 +1056,11 @@ resolve_sequential :: proc(
 					skip = asked[i] != 0 || round == 1 && !healthy(u)
 				} else {
 					// Then those it asked in an earlier round, asked again -
-					// except one whose refusal asked this query to leave it
-					// alone (RFC 9110 10.2.3), which is not a failure another
-					// try may get past.
-					skip = asked[i] == round || throttled(u)
+					// except one that refused this query (`REFUSED_IN_QUERY`), or
+					// whose `Retry-After` from another asks to be left alone
+					// (RFC 9110 10.2.3): neither is a failure another try may get
+					// past.
+					skip = asked[i] == round || asked[i] == REFUSED_IN_QUERY || throttled(u)
 				}
 				if skip {
 					continue
@@ -1064,6 +1070,11 @@ resolve_sequential :: proc(
 				resp, xerr := exchange(u, query, g.timeout, allocator)
 				if xerr == .None {
 					return resp, u, .None
+				}
+				// A 429 or 503, with a `Retry-After` or without, is the server
+				// turning this query away, not one more try may get past.
+				if xerr == .Throttled || xerr == .Unavailable {
+					asked[i] = REFUSED_IN_QUERY
 				}
 				// Charged whatever it was, a hostname the bootstrap spent the
 				// member's timeout failing on included; `exchange` records that
