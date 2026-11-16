@@ -376,6 +376,14 @@ Http_Response :: struct {
 	location: string,
 	// Whether the server agreed to keep the connection open.
 	keep_alive: bool,
+	// The final response's `Retry-After` in seconds from its arrival, when its
+	// status is one `h2.status_asks_to_wait` names; zero for none, or one that
+	// did not parse. See `h2.retry_after_of`.
+	retry_after: u32,
+	// The final response's header section was read to its end and its framing
+	// accepted, so `status` and its fields are the server's whole word whatever
+	// became of the body.
+	whole_head:  bool,
 }
 
 Http_Request :: struct {
@@ -533,6 +541,7 @@ http_exchange :: proc(
 	content_length: int
 	chunked: bool
 	headers := 0
+	seen_retry := false
 	// A close announced by any response of the exchange, interim ones included,
 	// holds for the connection: keeping it costs a dial at most.
 	resp.keep_alive = true
@@ -613,6 +622,13 @@ http_exchange :: proc(
 				if resp.location == "" && resp.status >= 200 {
 					resp.location = strings.clone(value, context.temp_allocator)
 				}
+			case dns.name_equal_fold(name, "retry-after"):
+				// Not a list (RFC 9110 10.2.3), so the first one is the one. An
+				// interim response's has no status that asks to wait.
+				if !seen_retry && resp.status >= 200 {
+					seen_retry = true
+					resp.retry_after = h2.retry_after_of(resp.status, value)
+				}
 			}
 		}
 		if resp.status >= 200 {
@@ -645,6 +661,8 @@ http_exchange :: proc(
 	if chunked && content_length >= 0 {
 		resp.keep_alive = false
 	}
+	// The head has been read and its framing accepted; what follows is the body.
+	resp.whole_head = true
 
 	switch {
 	case resp.status == 204 || resp.status == 304:

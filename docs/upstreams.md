@@ -95,6 +95,17 @@ member is in that state they are tried anyway, as far as the budget allows — o
 the second attempt, so `attempts: 1` gives up instead, or all at once under
 `race`.
 
+An `https` upstream answering 429 Too Many Requests is refusing elodin
+(`Throttled`), and one answering 503 Service Unavailable cannot serve for now:
+overloaded, in maintenance, or a proxy with no backend left (`Unavailable`).
+Neither is an `HTTP_Error`. One that sends a `Retry-After` (a number of seconds
+or a date) is skipped at once for as long as it asks, at least ten seconds and
+at most five minutes, until it answers a query sent after the refusal. Either
+way it is not asked again on a later attempt of the query it refused. One
+without counts towards the three failures like any other. With `attempts: 1`
+a group whose every member is skipped asks none of them, so a lone upstream
+that sends a `Retry-After` is not asked for that long.
+
 A dial that fails, a handshake that fails and a timeout all count. A peer that
 hangs up before sending a byte of the reply does not, on its own: DNS-over-TCP
 servers recycle idle connections, so the query is simply retried at once on a
@@ -121,6 +132,7 @@ line is the only place it shows up.
 ```
 level=warn msg="upstream quad9-dot (TLS 9.9.9.9): Timeout"
 level=warn msg="upstream quad9-dot: TLS handshake with \"dns.quad9.net\" failed: certificate has expired"
+level=warn msg="upstream cloudflare-doh (HTTPS 1.1.1.1): Throttled, HTTP 429, Retry-After 2m0s, pausing it for 2m0s"
 ```
 
 | kind | meaning |
@@ -130,8 +142,10 @@ level=warn msg="upstream quad9-dot: TLS handshake with \"dns.quad9.net\" failed:
 | `Peer_Closed` | the peer hung up before a byte of the reply arrived, and hung up again on the retry |
 | `IO_Error` | the transport failed on an established session, including a reply cut off partway |
 | `Bad_Response` | a reply arrived and was thrown away: it did not echo the question, or on `udp://`/`tcp://` lacked the DNS cookie the query carried |
-| `Too_Large` | an `https` 200 longer than a DNS message (65535 bytes, RFC 8484 section 6), over HTTP/2 or HTTP/1.1; over HTTP/2 also a stream whose DATA, padding included, passes half the 1 MiB receive window. A declared `Content-Length` past it is refused before the body is read; it is not retried on a fresh connection. Any other status is `HTTP_Error` whatever the size of its body |
-| `HTTP_Error` | an `https` reply that is not a 200 with at least a DNS header; over HTTP/2 also a stream the upstream reset with anything but REFUSED_STREAM, and a response RFC 9113 sections 8.1 to 8.3 make malformed: a missing, malformed or second `:status`, another pseudo-header, or a field section 8.2 refuses in its header section; a pseudo-header such as `:status` or a field 8.2 refuses in its trailers; trailers that do not end the stream, an interim (1xx) response that does, or DATA ahead of the final response |
+| `Too_Large` | an `https` 200 longer than a DNS message (65535 bytes, RFC 8484 section 6), over HTTP/2 or HTTP/1.1; over HTTP/2 also a stream whose DATA, padding included, passes half the 1 MiB receive window. A declared `Content-Length` past it is refused before the body is read; it is not retried on a fresh connection. Any other status is `Throttled`, `Unavailable` or `HTTP_Error` whatever the size of its body |
+| `Throttled` | an `https` 429 (RFC 6585 section 4): the upstream refusing elodin for the rate it asks at, including one whose body then breaks off, stalls, is framed wrongly or is reset, whose HTTP/2 trailers are malformed, or whose connection closes. The log line gives the `Retry-After` it sent, if any, which skips the upstream as above |
+| `Unavailable` | an `https` 503 (RFC 9110 section 15.6.4): the upstream, or a proxy in front of it, cannot serve for now; its body may break off as a 429's may. Its `Retry-After`, if any, skips the upstream as above |
+| `HTTP_Error` | an `https` reply that is not a 200 with at least a DNS header, nor a 429 or 503; over HTTP/1.1 also a 429 or 503 whose head the reader refuses (its framing fields, or a head cut off); over HTTP/2 also a stream the upstream reset with anything but REFUSED_STREAM before a 429 or 503 head arrived, and a response (a 429 or 503 included) that RFC 9113 sections 8.1 to 8.3 make malformed: a missing, malformed or second `:status`, another pseudo-header, or a field section 8.2 refuses in its header section; a pseudo-header such as `:status` or a field 8.2 refuses in its trailers; trailers that do not end the stream, an interim (1xx) response that does, or DATA ahead of the final response |
 | `TLS_Failed`, `Verify_Failed` | the handshake; the log line carries OpenSSL's reason |
 | `Backlogged` | not sent: the pipelined connection's queue would outlast the query's timeout (see [connections](#connections)); never counts towards the cooldown |
 | `Out_Of_Memory` | elodin could not allocate what the exchange needed: the query's buffer, the copy carrying its cookie or padding, or the lookup of the upstream's hostname, so nothing was sent; or the copy of the reply, or the reply with its cookie taken out; over HTTP/2 also the connection, the request's frames, the response's body or header compression state (process out of memory, `RLIMIT_AS`, `vm.max_map_count`; see [sizing](sizing.md#memory-mappings)); never counts towards the cooldown |

@@ -1988,7 +1988,7 @@ test_a_hang_up_is_counted_but_does_not_park_the_upstream :: proc(t: ^testing.T) 
 		for _ in 0 ..< FAILURE_THRESHOLD - 1 {
 			record_failure(u, .Peer_Closed)
 		}
-		record_success(u, time.Millisecond)
+		record_success(u, time.Millisecond, sent = loop.tick_now())
 	}
 	testing.expect(t, healthy(u), "hang-ups parked an upstream that is still answering")
 

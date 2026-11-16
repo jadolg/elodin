@@ -297,7 +297,7 @@ An HTTP responder that serves exactly one connection and then returns.
 One connection is all any test here needs, and it keeps the mock free of the
 accept timeouts and stop flags a long-running loop would want.
 */
-@(private = "file")
+@(private)
 Http_Mock :: struct {
 	listener: net.TCP_Socket,
 	reply:    string,
@@ -306,7 +306,7 @@ Http_Mock :: struct {
 	hold:     bool,
 }
 
-@(private = "file")
+@(private)
 http_mock_once :: proc(m: ^Http_Mock) {
 	client, _, err := net.accept_tcp(m.listener)
 	if err != nil {
@@ -343,7 +343,7 @@ Bounded by a quiet period rather than by parsing the request, because some of
 the callers here dial the mock and send nothing at all: whatever shape the
 client is, a short silence means it has finished.
 */
-@(private = "file")
+@(private)
 drain_request :: proc(client: net.TCP_Socket) {
 	_ = net.set_option(client, .Receive_Timeout, 50 * time.Millisecond)
 	buf: [4096]u8
@@ -362,7 +362,7 @@ left holding.
 `http_exchange` documents the body as the only thing the caller owns, so once
 that is released a correct exchange has nothing outstanding.
 */
-@(private = "file")
+@(private)
 exchange_against :: proc(
 	t: ^testing.T,
 	reply: string,
@@ -2674,13 +2674,18 @@ out the deadline.
 */
 @(test)
 test_a_refused_doh_h1_reply_releases_its_body :: proc(t: ^testing.T) {
-	replies := []string {
-		"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
-		"HTTP/1.1 429 Too Many Requests\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nslow!\r\n0\r\n\r\n",
-		"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+	Refusal :: struct {
+		reply: string,
+		err:   Error,
+	}
+	refusals := []Refusal {
+		{reply = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", err = .Unavailable},
+		{reply = "HTTP/1.1 429 Too Many Requests\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nslow!\r\n0\r\n\r\n", err = .Throttled},
+		{reply = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", err = .HTTP_Error},
 	}
 	query := []u8{0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1}
-	for reply in replies {
+	for refusal in refusals {
+		reply := refusal.reply
 		for pooled in ([]bool{false, true}) {
 			listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 			if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
@@ -2718,7 +2723,7 @@ test_a_refused_doh_h1_reply_releases_its_body :: proc(t: ^testing.T) {
 					}
 				}
 				resp, err := exchange_doh_h1(u, query, query, time.tick_add(loop.tick_now(), 2 * time.Second), mem.tracking_allocator(&track))
-				testing.expectf(t, err == .HTTP_Error, "%q pooled=%v: got %v", reply[:12], pooled, err)
+				testing.expectf(t, err == refusal.err, "%q pooled=%v: got %v, want %v", reply[:12], pooled, err, refusal.err)
 				testing.expect(t, resp == nil, "a refused reply came back as an answer")
 				expect_caller_holds_nothing(t, &track, reply[:12])
 				destroy(u)

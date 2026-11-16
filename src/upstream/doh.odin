@@ -121,7 +121,7 @@ exchange_doh_h2 :: proc(
 				if len(resp.body) > 0 {
 					delete(resp.body, allocator)
 				}
-				return nil, .HTTP_Error
+				return nil, doh_refusal(u, resp.status, resp.retry_after)
 			}
 			if !doh_reply_matches(query, resp.body) {
 				delete(resp.body, allocator)
@@ -129,6 +129,12 @@ exchange_doh_h2 :: proc(
 			}
 			return resp.body, .None
 		case .Closed, .Refused:
+			// A refusal's head that came before the connection went is the
+			// server's word, not a stale connection to ask again on. A refused
+			// stream is never one: RFC 9113 8.7 has it unprocessed.
+			if herr == .Closed && h2.status_asks_to_wait(resp.status) {
+				return nil, doh_refusal(u, resp.status, resp.retry_after)
+			}
 			/*
 			REFUSED_STREAM is a server at its stream limit saying it never
 			processed the request (RFC 9113 8.7), so it is asked again the same
@@ -145,15 +151,20 @@ exchange_doh_h2 :: proc(
 			// not park it.
 			return nil, .Peer_Closed
 		case .Reset:
-			return nil, .HTTP_Error
+			// A refusal's head that came before the reset is still the
+			// server's word, as on HTTP/1.1.
+			return nil, doh_refusal(u, resp.status, resp.retry_after)
 		case .Out_Of_Memory:
 			return nil, .Out_Of_Memory
 		case .Too_Large:
 			// Reported as HTTP/1.1 reports it, so health and the failure kind do
 			// not depend on what ALPN chose: a non-200 is the server's answer
 			// whatever the size of the body nobody reads.
-			return nil, .Too_Large if resp.status == 200 else .HTTP_Error
+			return nil, .Too_Large if resp.status == 200 else doh_refusal(u, resp.status, resp.retry_after)
 		case .Timeout:
+			if h2.status_asks_to_wait(resp.status) {
+				return nil, doh_refusal(u, resp.status, resp.retry_after)
+			}
 			return nil, .Timeout
 		}
 	}
@@ -247,9 +258,19 @@ exchange_doh_h1 :: proc(
 			delete(resp.body, allocator)
 		}
 		stream_close(&stream)
+		// A 429 or 503 whose head arrived whole and whose body was then lost -
+		// broken off, stalled, framed wrongly, or with no room here to hold it -
+		// is still the server asking to be left alone, as on HTTP/2 where the
+		// connection fails after the head: it is not asked again on a fresh
+		// dial, and its `Retry-After` is kept. Not a head `http_exchange` refused,
+		// which is no response, nor one cut off partway, whose `Retry-After` may
+		// not have come yet.
+		if resp.whole_head && herr != .None && h2.status_asks_to_wait(resp.status) {
+			return nil, doh_refusal(u, resp.status, resp.retry_after)
+		}
 		// A non-200 is the server's answer whatever the size of its body, which
-		// nobody reads: a 408 is still retried, and an error page is still an
-		// `HTTP_Error`, as on HTTP/2.
+		// nobody reads: a 408 is still retried, and an error page is still what
+		// `doh_refusal` makes of its status, as on HTTP/2.
 		if herr == .None || (herr == .Too_Large && resp.status != 200) {
 			/*
 			A 408 on a pooled connection is the server closing one it found
@@ -266,7 +287,7 @@ exchange_doh_h1 :: proc(
 			// a body too short to be a DNS message - is the server's answer, so
 			// it is not retried; and it is the kind the HTTP/2 twin reports, so
 			// health does not depend on what ALPN chose.
-			return nil, .HTTP_Error
+			return nil, doh_refusal(u, resp.status, resp.retry_after)
 		}
 		/*
 		A hang-up is retried whether this query found the connection or dialled
@@ -433,6 +454,22 @@ redirect_allowed :: proc(origin_scheme: string, origin_public: bool, scheme: str
 		return false
 	}
 	return true
+}
+
+/*
+What a whole DoH reply that is not a usable answer reports: `Throttled` for a
+429 (RFC 6585 4) and `Unavailable` for a 503 (RFC 9110 15.6.4), each with its
+`Retry-After` noted against `u`, and `HTTP_Error` for anything else, a 200 too
+short to be a DNS message included.
+*/
+@(private)
+doh_refusal :: proc(u: ^Upstream, status: int, retry_after: u32) -> Error {
+	if !h2.status_asks_to_wait(status) {
+		return .HTTP_Error
+	}
+	kind: Error = .Throttled if status == 429 else .Unavailable
+	note_throttled(u, kind, status, retry_after)
+	return kind
 }
 
 /*

@@ -9,6 +9,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:h2"
 import "elodin:logx"
 import "elodin:loop"
 import "elodin:metrics"
@@ -2454,37 +2455,7 @@ epoch explicitly would be indistinguishable from passing nothing.
 */
 @(private)
 http_date :: proc(clock: time.Time, allocator := context.allocator) -> string {
-	// RFC 1123 date for the Date header. Callers only need something valid.
-	y, m, d := time.date(clock)
-	h, mi, sec := time.clock_from_time(clock)
-	return fmt.aprintf(
-		"%s, %02d %s %04d %02d:%02d:%02d GMT",
-		weekday_name(time.weekday(clock)),
-		d,
-		month_name(int(m)),
-		y,
-		h,
-		mi,
-		sec,
-		allocator = allocator,
-	)
-}
-
-@(private)
-month_name :: proc(m: int) -> string {
-	names := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
-	if m >= 1 && m <= 12 {
-		return names[m - 1]
-	}
-	return "Jan"
-}
-
-// Shared with listeners_test.odin so the two cannot drift apart and still
-// agree with each other by accident.
-@(private)
-WEEKDAY_NAMES := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
-
-@(private)
-weekday_name :: proc(wd: time.Weekday) -> string {
-	return WEEKDAY_NAMES[int(wd)]
+	// Every `time.Time` converts: its nanoseconds span years 1677 to 2262.
+	at, _ := time.time_to_datetime(clock)
+	return h2.format_http_date(at, allocator)
 }

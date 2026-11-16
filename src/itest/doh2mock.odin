@@ -43,9 +43,12 @@ Doh2_Mock :: struct {
 	last_reply: []u8,
 	replies:    int,
 
-	// Over HTTP/1.1, answer every query with this status and a short text
-	// body instead, as a resolver behind a maintenance page does. Zero for 200.
+	// Answer every query with this status instead, as a resolver behind a
+	// maintenance page or over its rate limit does: over HTTP/1.1 with a short
+	// text body, over h2 with none. Zero for 200.
 	status:     int,
+	// With `status`, the `Retry-After` value to send with it. Empty for none.
+	retry_after: string,
 	// Over HTTP/1.1, stretch each 200's body to this many bytes with zeros after
 	// the real reply, so it still answers the query's header and question.
 	pad:        int,
@@ -241,6 +244,10 @@ doh2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	m.h2_hits += 1
 	sync.mutex_unlock(&m.mu)
 
+	if m.status != 0 {
+		doh2_respond_status(hc, req.stream_id, m.status, m.retry_after)
+		return
+	}
 	body := doh2_reply_body(m, req.body, context.temp_allocator)
 	if m.trailer_head != 0 {
 		doh2_respond_with_trailers(hc, req.stream_id, m.trailer_head, body, m.trailers)
@@ -271,6 +278,26 @@ doh2_respond_with_trailers :: proc(hc: ^h2.Conn, stream_id: u32, status: int, bo
 	append(&out, ..body)
 	h2.write_frame_header(&out, len(tail), .Headers, h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM, stream_id)
 	append(&out, ..tail[:])
+	loop.lock(&hc.mu)
+	hc.io.write(hc.io.user, out[:])
+	loop.unlock(&hc.mu)
+}
+
+/*
+A bodiless `status`, with `retry-after` when that is not empty, which
+`h2.Response` has no field for: raw frames, as `doh2_respond_with_trailers`
+writes them.
+*/
+@(private = "file")
+doh2_respond_status :: proc(hc: ^h2.Conn, stream_id: u32, status: int, retry_after: string) {
+	head := make([dynamic]u8, 0, 64, context.temp_allocator)
+	h2.encode_header(&head, ":status", fmt.tprint(status))
+	if retry_after != "" {
+		h2.encode_header(&head, "retry-after", retry_after)
+	}
+	out := make([dynamic]u8, 0, len(head) + h2.FRAME_HEADER_SIZE, context.temp_allocator)
+	h2.write_frame_header(&out, len(head), .Headers, h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM, stream_id)
+	append(&out, ..head[:])
 	loop.lock(&hc.mu)
 	hc.io.write(hc.io.user, out[:])
 	loop.unlock(&hc.mu)
@@ -351,8 +378,9 @@ doh2_serve_http1 :: proc(conn: ^Doh2_Conn) {
 
 	if m.status != 0 {
 		page := fmt.tprintf(
-			"HTTP/1.1 %d Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nmaintenance",
+			"HTTP/1.1 %d Unavailable\r\nContent-Type: text/plain\r\n%sContent-Length: 11\r\nConnection: close\r\n\r\nmaintenance",
 			m.status,
+			fmt.tprintf("Retry-After: %s\r\n", m.retry_after) if m.retry_after != "" else "",
 		)
 		_, _ = tlsx.write(conn.tls, transmute([]u8)page)
 		return

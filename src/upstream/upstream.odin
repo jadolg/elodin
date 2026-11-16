@@ -1,5 +1,6 @@
 package upstream
 
+import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:strings"
@@ -47,6 +48,21 @@ Error :: enum u8 {
 	// problem, the other is usually the network.
 	Verify_Failed,
 	HTTP_Error,
+	/*
+	A DoH upstream answered 429 Too Many Requests (RFC 6585 4): it is up, and
+	refusing this server for the rate it asks at. Kept apart from `HTTP_Error`
+	so the figures tell an upstream turning this server away from one that is
+	broken. It counts towards the cooldown as any failure does, and one that
+	carries a `Retry-After` parks the member at once (see `note_throttled`).
+	*/
+	Throttled,
+	/*
+	A DoH upstream answered 503 Service Unavailable (RFC 9110 15.6.4): it cannot
+	serve anyone for now - overloaded, in maintenance, or a proxy in front of
+	it with no backend left (HAProxy's own 503). Apart from `Throttled`, which is
+	about this server, and from `HTTP_Error`; parked like `Throttled`.
+	*/
+	Unavailable,
 	Too_Large,
 	Unhealthy,
 	/*
@@ -195,6 +211,12 @@ Upstream :: struct {
 	// A `loop.Moment`, so a step of the wall clock neither holds a member parked
 	// for the length of the step nor lets it out early.
 	down_until:   loop.Moment,
+	// Until when this upstream's 429s and 503s asked to be left alone, a
+	// `loop.Moment` as `down_until` is; and when the latest of them arrived, a
+	// `time.Tick` because all it is compared with is the tick a query was sent
+	// at. See `note_throttled`.
+	throttled_until:  loop.Moment,
+	refused_at:       time.Tick,
 	// One gate per kind of failure, so each is said at `warn` once a window and
 	// left to `debug` between; see `record_failure`.
 	reported:     [Error]logx.Gate,
@@ -246,6 +268,8 @@ Stats :: struct {
 // After this many consecutive failures an upstream is skipped for COOLDOWN.
 FAILURE_THRESHOLD :: 3
 COOLDOWN :: 10 * time.Second
+// The longest a `Retry-After` parks an upstream for; see `note_throttled`.
+MAX_RETRY_AFTER :: 5 * time.Minute
 
 make_upstream :: proc(
 	spec: config.Upstream_Spec,
@@ -408,18 +432,49 @@ endpoint_of :: proc(u: ^Upstream) -> (endpoint: net.Endpoint, err: Error) {
 	return u.endpoint, .None
 }
 
+/*
+Whether `u` is out of its cooldown: fewer than `FAILURE_THRESHOLD` failures in a
+row or that run's `COOLDOWN` over, and no `Retry-After` still asking to be left
+alone (`note_throttled`).
+*/
 healthy :: proc(u: ^Upstream) -> bool {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
+	if throttled_locked(u) {
+		return false
+	}
 	if u.failures < FAILURE_THRESHOLD {
 		return true
 	}
 	return loop.moment_since(u.down_until) >= 0
 }
 
+// Whether a `Retry-After` from `u` still asks to be left alone; see `note_throttled`.
+@(private)
+throttled :: proc(u: ^Upstream) -> bool {
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	return throttled_locked(u)
+}
+
+// `throttled`, for a caller that holds `u.mu`.
+@(private = "file")
+throttled_locked :: proc(u: ^Upstream) -> bool {
+	return loop.moment_since(u.throttled_until) < 0
+}
+
+// What is left of `u`'s `Retry-After` window, to the second, for the lines that
+// say how long it is skipped; zero or less when none is open. The caller holds
+// `u.mu`.
+@(private = "file")
+window_left_locked :: proc(u: ^Upstream) -> time.Duration {
+	return time.duration_round(-loop.moment_since(u.throttled_until), time.Second)
+}
+
 /*
-Whether `u` is known to be answering: it has answered at least once, and no
-failure that counts toward its cooldown has come since its last answer.
+Whether `u` is known to be answering: it has answered at least once, no
+failure that counts toward its cooldown has come since its last answer, and no
+`Retry-After` still asks to be left alone.
 
 The ones that do not count are not the repeated wait this guards against: a
 hang-up below `record_failure`'s run and a dial refused for a full queue fail at
@@ -436,13 +491,21 @@ there.
 answering :: proc(u: ^Upstream) -> bool {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
-	return u.failures == 0 && u.stats.queries > u.stats.failures
+	return u.failures == 0 && u.stats.queries > u.stats.failures && !throttled_locked(u)
 }
 
+/*
+Count an answer from `u`, `elapsed` after the query was sent at `sent`. An
+answer to a query sent after its latest 429 or 503 ends what that asked for: the
+server is taking queries again. One sent before it says nothing of the sort.
+*/
 @(private)
-record_success :: proc(u: ^Upstream, elapsed: time.Duration) {
+record_success :: proc(u: ^Upstream, elapsed: time.Duration, sent: time.Tick) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
+	if time.tick_diff(u.refused_at, sent) > 0 {
+		u.throttled_until = {}
+	}
 	u.failures = 0
 	u.closed_run = 0
 	u.stats.queries += 1
@@ -530,8 +593,12 @@ record_failure :: proc(
 	u.stats.queries += 1
 	u.stats.failures += 1
 	u.stats.failure_kinds[err] += 1
-	if loud, held := note_failure_kind(u, err); loud {
-		logx.warnf_held(held, "upstream %s (%v %s): %v", u.spec.name, u.spec.kind, u.spec.address, err)
+	// A refusal's line is `note_throttled`'s, which has the reply's own
+	// status and `Retry-After` in hand, and asks this kind's gate for it.
+	if err != .Throttled && err != .Unavailable {
+		if loud, held := note_failure_kind(u, err); loud {
+			logx.warnf_held(held, "upstream %s (%v %s): %v", u.spec.name, u.spec.kind, u.spec.address, err)
+		}
 	}
 	if !charge {
 		return
@@ -598,13 +665,59 @@ record_failure :: proc(
 		forget_cookie(u)
 	}
 	if u.failures == FAILURE_THRESHOLD {
-		logx.warnf(
-			"upstream %s: %d consecutive failures (last: %v), pausing it for %v",
-			u.spec.name,
-			u.failures,
-			err,
-			COOLDOWN,
-		)
+		// What the member is skipped for, which a `Retry-After` may make longer.
+		pause := max(COOLDOWN, window_left_locked(u))
+		logx.warnf("upstream %s: %d consecutive failures (last: %v), pausing it for %v", u.spec.name, u.failures, err, pause)
+	}
+}
+
+/*
+Note that `u` refused this server with `status`, the failure of kind `kind` it
+is reported as, asking by its `Retry-After` to be left alone for `retry_after`
+seconds from now - zero when it did not say.
+
+A wait parks `u` at once, apart from the run of failures that parks it for
+`COOLDOWN`: RFC 9110 10.2.3 has the client wait before asking again, so the next
+queries go to the rest of the group rather than to a server that has said it
+will refuse them, however many in between it answers. For no less than
+`COOLDOWN`, which is compliant - longer than asked - and keeps a server asking
+for a second from being asked again a second later, and no more than
+`MAX_RETRY_AFTER`, so a server asking for days does not bench a member for the
+life of the process - nor, under `attempts: 1`, leave a group whose every
+member is parked answering nothing for longer than that. The longest wait any
+reply asks for stands until it is over, or until an answer to a query sent
+after the latest refusal (see `record_success`).
+
+A parked member is still asked when the rest of its group cannot answer, as for
+the cooldown (see `resolve_sequential`).
+
+Writes the kind's line, once a `logx.GATE_WINDOW`, with this reply's own status
+and `Retry-After` and how long the member is skipped for: one gate however often
+a window opens, which an answer between refusals can make as often as the
+server answers.
+*/
+@(private)
+note_throttled :: proc(u: ^Upstream, kind: Error, status: int, retry_after: u32) {
+	asked := time.Duration(retry_after) * time.Second
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	// Read under the lock, so refusals land in the order of their moments and
+	// `refused_at` only moves forward.
+	now := loop.moment_now()
+	u.refused_at = loop.tick_now()
+	if retry_after > 0 {
+		u.throttled_until = max(u.throttled_until, loop.moment_add(now, clamp(asked, COOLDOWN, MAX_RETRY_AFTER)))
+	}
+	if loud, held := note_failure_kind(u, kind); loud {
+		// Which refusal, what it asked for, and what that does to the member is
+		// the diagnosis: an operator over quota and one whose upstream is in
+		// maintenance act differently.
+		said := fmt.tprintf(", Retry-After %v", asked) if retry_after > 0 else ""
+		// The pause only on a reply that asked for one, so a bare refusal's line
+		// does not read as the cause of a window another reply opened.
+		pause := window_left_locked(u)
+		pausing := fmt.tprintf(", pausing it for %v", pause) if retry_after > 0 && pause > 0 else ""
+		logx.warnf_held(held, "upstream %s (%v %s): %v, HTTP %d%s%s", u.spec.name, u.spec.kind, u.spec.address, kind, status, said, pausing)
 	}
 }
 
@@ -716,6 +829,10 @@ error_label :: proc(e: Error) -> string {
 		return "verify_failed"
 	case .HTTP_Error:
 		return "http_error"
+	case .Throttled:
+		return "throttled"
+	case .Unavailable:
+		return "unavailable"
 	case .Too_Large:
 		return "too_large"
 	case .Unhealthy:
@@ -820,7 +937,7 @@ servers to ask the refusal costs nothing, and is left unrecorded. A lookup this
 		)
 		return nil, err
 	}
-	record_success(u, loop.tick_since(start))
+	record_success(u, loop.tick_since(start), sent = start)
 	return response, .None
 }
 
