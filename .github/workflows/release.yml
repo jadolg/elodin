@@ -99,6 +99,73 @@ jobs:
           mode: report
           name: release
 
+  static:
+    name: Build static (linux-${{ matrix.arch }})
+    # One binary per architecture carrying musl and OpenSSL, for Alpine, OpenWrt
+    # and any other Linux (see scripts/build-static.sh). Odin compiles on the
+    # runner; the link happens in an Alpine container, so no OpenSSL headers
+    # are needed here.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+        with:
+          install: true
+          cache: true
+      - run: mise run release-static
+        env:
+          ELODIN_VERSION: ${{ github.event.release.tag_name }}
+
+      # The architecture, as for the dynamic build, and that it is static: the
+      # script refuses an interpreter or a NEEDED entry, and `file` says so too.
+      - name: Verify binary architecture and linking
+        run: |
+          case ${{ matrix.arch }} in
+            amd64) expected=x86-64 ;;
+            arm64) expected=aarch64 ;;
+          esac
+          info=$(file -b bin/static/elodin)
+          echo "$info"
+          echo "$info" | grep -q "$expected" || { echo "expected $expected" >&2; exit 1; }
+          echo "$info" | grep -q 'static-pie linked' || { echo "expected a static-pie binary" >&2; exit 1; }
+
+      # It starts on the glibc runner and on musl, and says it is the static build.
+      - name: Run it on glibc and on musl
+        run: |
+          bin/static/elodin --version | tee /dev/stderr | grep -q ', static)$'
+          eval "$(mise env -s bash)"
+          docker run --rm -v "$PWD/bin/static:/b:ro" "$ELODIN_ALPINE" /b/elodin --version | grep -q ', static)$'
+
+      - name: Package
+        run: |
+          stage=elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}-static
+          mkdir "$stage"
+          cp bin/static/elodin "$stage"/
+          cp packaging/elodin.service "$stage"/
+          cp examples/elodin.yaml "$stage"/
+          cp README.md "$stage"/
+          cp -r docs "$stage"/
+          cp LICENSE "$stage"/
+          tar -czf "$stage.tar.gz" "$stage"
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} \
+            elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}-static.tar.gz \
+            --clobber
+
   publish-deb:
     name: Publish deb to repository
     # Runs once, after every arch's .deb has landed in the release. Triggering

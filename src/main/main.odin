@@ -16,6 +16,7 @@ import "elodin:logx"
 import "elodin:loop"
 import "elodin:privdrop"
 import "elodin:server"
+import "elodin:tlsx"
 import "elodin:upstream"
 
 USAGE :: `elodin - a filtering DNS forwarder
@@ -416,6 +417,8 @@ main :: proc() {
 	if !ok {
 		os.exit(2)
 	}
+	// Before the configuration is read and before any thread: see `tlsx.init`.
+	openssl_problem := tlsx.init()
 
 	/*
 	The configuration gets an arena, and is released as one thing at the end.
@@ -497,6 +500,9 @@ main :: proc() {
 		}
 	}
 	defer logx.shutdown()
+	if openssl_problem != "" {
+		logx.warnf("%s", openssl_init_warning(openssl_problem, context.temp_allocator))
+	}
 
 	if opts.check_only {
 		// The certificates are read here, which the loader does not do.
@@ -614,7 +620,7 @@ main :: proc() {
 		return
 	}
 
-	logx.eventf(.Info, "starting", "version=%s", logx.quote(server.VERSION))
+	logx.eventf(.Info, "starting", "version=%s openssl=%s", logx.quote(server.VERSION), logx.quote(openssl_build(context.temp_allocator)))
 	logx.eventf(
 		.Info,
 		"sizing",
@@ -627,6 +633,28 @@ main :: proc() {
 	// process-wide and a reload does not move them.
 	dns.set_heavy_decodes(cfg.server.heavy_decodes)
 	run(&cfg, opts, service)
+}
+
+/*
+The OpenSSL this binary runs with, and "static" when it carries its own (see
+`tlsx.STATIC`): what an operator checks an OpenSSL advisory against.
+*/
+@(private)
+openssl_build :: proc(allocator := context.allocator) -> string {
+	if tlsx.STATIC {
+		return strings.concatenate({tlsx.openssl_version(), ", static"}, allocator)
+	}
+	return tlsx.openssl_version()
+}
+
+// Said at startup when OpenSSL refused its configuration file; see `tlsx.init`.
+@(private)
+openssl_init_warning :: proc(problem: string, allocator := context.allocator) -> string {
+	return fmt.aprintf(
+		"OpenSSL could not apply its configuration (the system openssl.cnf, or OPENSSL_CONF): %s; what that file sets, such as a system-wide crypto policy, may not be in force",
+		problem,
+		allocator = allocator,
+	)
 }
 
 /*
@@ -1322,7 +1350,7 @@ parse_args :: proc() -> (opts: Options, ok: bool) {
 			fmt.print(USAGE)
 			os.exit(0)
 		case arg == "-v" || arg == "--version":
-			fmt.printfln("elodin %s", server.VERSION)
+			fmt.printfln("elodin %s (%s)", server.VERSION, openssl_build(context.temp_allocator))
 			os.exit(0)
 		case arg == "--check":
 			opts.check_only = true

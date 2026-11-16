@@ -117,19 +117,61 @@ ssl_leave :: proc(conn: ^Conn) {
 	}
 }
 
+/*
+Whether this binary carries its own OpenSSL, linked statically against musl
+(`scripts/build-static.sh` sets it). Such a build does not read the host's
+`openssl.cnf`: that file is written for the host's OpenSSL, and one this library
+rejects - openSUSE's names a vendor-patched EVP property - fails OpenSSL's
+one-time initialisation, and with it a context another thread creates at the
+same moment.
+*/
+STATIC :: #config(ELODIN_STATIC, false)
+
+@(private)
+INIT_FLAGS :: OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS | (OPENSSL_INIT_NO_LOAD_CONFIG when STATIC else 0)
+
 @(private)
 init_once: sync.Once
 
+// OpenSSL's reason, when its initialisation failed; `init_problem_len` 0 otherwise.
+@(private)
+init_problem_buf: [256]u8
+@(private)
+init_problem_len: int
+
 @(private)
 do_init :: proc() {
-	OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, nil)
+	if OPENSSL_init_ssl(INIT_FLAGS, nil) != 1 {
+		// The first error is the cause; the rest are the layers that reported it.
+		if code := ERR_get_error(); code != 0 {
+			ERR_error_string_n(code, raw_data(init_problem_buf[:]), len(init_problem_buf))
+			init_problem_len = len(cstring(raw_data(init_problem_buf[:])))
+		} else {
+			init_problem_len = copy(init_problem_buf[:], "no OpenSSL error recorded")
+		}
+		ERR_clear_error()
+	}
 	alpn_ex_index = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL_CTX, 0, nil, nil, nil, alpn_ex_free)
 	tickets_ex_index = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL_CTX, 0, nil, nil, nil, tickets_ex_free)
 }
 
-// Safe to call from any thread and any number of times.
-init :: proc() {
+/*
+Initialise OpenSSL, once. Safe to call from any thread and any number of times.
+`main` calls it before it starts a thread or reaches libcrypto any other way,
+since libcrypto initialises itself with the host's configuration otherwise.
+
+`problem` is OpenSSL's reason when initialisation failed - for a dynamic build,
+the host's `openssl.cnf` refused - and "" when it succeeded. It is the same on
+every call, and stays valid for the life of the process.
+*/
+init :: proc() -> (problem: string) {
 	sync.once_do(&init_once, do_init)
+	return string(init_problem_buf[:init_problem_len])
+}
+
+// The OpenSSL this binary runs with, as OpenSSL names itself.
+openssl_version :: proc() -> string {
+	return string(OpenSSL_version(OPENSSL_VERSION))
 }
 
 // The last OpenSSL error as text. Always call while the error is fresh; OpenSSL

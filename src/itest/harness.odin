@@ -275,6 +275,22 @@ run_binary :: proc(r: ^Runner, args: []string, tag: string) -> Run_Result {
 	return run_command(command[:], nil, out_path)
 }
 
+// How a static build's `--version` line ends; see `openssl_build` in src/main.
+STATIC_MARK :: ", static)"
+
+/*
+Whether the binary under test is the static build, which carries musl and its
+own OpenSSL, as its `--version` says. `ok` false is a failure already reported.
+*/
+binary_is_static :: proc(r: ^Runner, name: string) -> (static, ok: bool) {
+	res := run_binary(r, []string{"--version"}, "version-static")
+	if !res.ok || res.exit_code != 0 {
+		fail(r, "%s: cannot run %s --version: %s", name, r.binary, res.output)
+		return
+	}
+	return strings.contains(res.output, STATIC_MARK), true
+}
+
 /*
 Run `command` to completion, its output collected through `out_path`; `env` nil
 inherits this process's environment. Into a file and waited on rather than

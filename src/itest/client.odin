@@ -828,6 +828,38 @@ tls_resumes :: proc(port: int, version: int, alpn: []string, request: []u8) -> (
 }
 
 /*
+The TLS version a handshake with `port` settles on, offering every version up to
+TLS 1.3, so the answer is the server's ceiling. Driven on the raw `SSL` for
+`SSL_version`, which `tlsx.Conn` does not expose.
+*/
+tls_version_at :: proc(port: int) -> (version: int, ok: bool) {
+	ctx, cerr := tlsx.client_context(false, "", nil, context.temp_allocator)
+	if cerr != .None {
+		return
+	}
+	defer tlsx.context_destroy(ctx)
+	if !tlsx.ssl_ctx_set_max_proto_version(ctx.ptr, tlsx.TLS1_3_VERSION) {
+		return
+	}
+	conn, dialed := dial_tcp(port)
+	if !dialed {
+		return
+	}
+	defer net.close(conn.socket)
+	ssl := tlsx.SSL_new(ctx.ptr)
+	if ssl == nil {
+		return
+	}
+	defer tlsx.SSL_free(ssl)
+	if tlsx.SSL_set_fd(ssl, c.int(net.Socket(conn.socket))) != 1 || tlsx.SSL_connect(ssl) != 1 {
+		return
+	}
+	version = int(tlsx.SSL_version(ssl))
+	tlsx.SSL_shutdown(ssl)
+	return version, true
+}
+
+/*
 Ask for a receive buffer of `bytes`, which the kernel caps at `rmem_max`, and
 say what it granted: the room datagrams are charged against on the queue, which
 Linux reports as twice what was asked for (socket(7)). 0 if it would not say.

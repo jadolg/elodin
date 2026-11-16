@@ -214,6 +214,7 @@ main :: proc() {
 		section(&r, "listeners: udp, tcp, dot, doh")
 		run_transport_cases(&r)
 		run_ddr_cases(&r)
+		run_openssl_conf_cases(&r)
 	} else {
 		skip_case(&r, "listeners", "no certificate")
 	}

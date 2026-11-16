@@ -39,7 +39,8 @@ sudo apt update && sudo apt install elodin
 
 The package runs elodin as a systemd service and offers to take over as the
 system resolver. [Installing and running](docs/install.md) covers that, a
-release `.deb` or tarball, the unit for a source build, and dropping privileges.
+release `.deb` or tarball (static ones run on Alpine, OpenWrt and any other
+Linux), the unit for a source build, and dropping privileges.
 
 ## Configuring
 
