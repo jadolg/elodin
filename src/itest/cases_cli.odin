@@ -19,6 +19,8 @@ run_cli_cases :: proc(r: ^Runner) {
 		if check(r, res.ok, "could not run the binary") {
 			check_eq_int(r, res.exit_code, 0, "exit code")
 			check(r, strings.has_prefix(res.output, "elodin "), "unexpected output %q", res.output)
+			// The OpenSSL it runs with, which an advisory is checked against.
+			check(r, strings.contains(res.output, " (OpenSSL "), "the OpenSSL is not named: %q", res.output)
 		}
 	}
 	end_case(r)

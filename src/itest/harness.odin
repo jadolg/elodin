@@ -10,6 +10,7 @@ import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
 import "elodin:metrics"
+import "elodin:tlsx"
 
 /*
 Test harness.
@@ -46,6 +47,9 @@ Runner :: struct {
 	process that was killed never has one. See `mise run leakcheck`.
 	*/
 	graceful_stop: bool,
+	// The binary is the static build, musl and its own OpenSSL linked in; read
+	// once from its `--version` (see `binary_is_static`).
+	static:    bool,
 }
 
 /*
@@ -273,6 +277,44 @@ run_binary :: proc(r: ^Runner, args: []string, tag: string) -> Run_Result {
 	append(&command, r.binary)
 	append(&command, ..args)
 	return run_command(command[:], nil, out_path)
+}
+
+// How a static build's `--version` line ends; see `openssl_build` in src/main.
+STATIC_MARK :: ", " + tlsx.STATIC_LABEL + ")"
+
+/*
+Whether the binary under test is the static build, which carries musl and its
+own OpenSSL, as its `--version` says. `ok` false when it would not say.
+*/
+binary_is_static :: proc(r: ^Runner) -> (static, ok: bool) {
+	res := run_binary(r, []string{"--version"}, "version-static")
+	if !res.ok || res.exit_code != 0 {
+		return false, false
+	}
+	return strings.contains(res.output, STATIC_MARK), true
+}
+
+/*
+This process's environment less every variable whose `NAME=VALUE` starts with
+one of `drop`, with room for `extra` more. `ok` false is a failure already
+reported, under `name`.
+*/
+environ_without :: proc(r: ^Runner, name: string, drop: []string, extra := 0) -> (env: [dynamic]string, ok: bool) {
+	inherited, eerr := os.environ(context.temp_allocator)
+	if eerr != nil {
+		fail(r, "%s: cannot read the environment: %v", name, eerr)
+		return
+	}
+	env = make([dynamic]string, 0, len(inherited) + extra, context.temp_allocator)
+	outer: for kv in inherited {
+		for prefix in drop {
+			if strings.has_prefix(kv, prefix) {
+				continue outer
+			}
+		}
+		append(&env, kv)
+	}
+	return env, true
 }
 
 /*

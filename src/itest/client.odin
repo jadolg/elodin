@@ -786,45 +786,102 @@ handshake. Driven on the raw `SSL`, because `tlsx.client_connect` never resumes.
 */
 @(private)
 tls_resumes :: proc(port: int, version: int, alpn: []string, request: []u8) -> (reused, ok: bool) {
-	ctx, cerr := tlsx.client_context(false, "", alpn, context.temp_allocator)
-	if cerr != .None {
-		return
-	}
+	ctx := raw_tls_context(version, alpn) or_return
 	defer tlsx.context_destroy(ctx)
-	if !tlsx.ssl_ctx_set_max_proto_version(ctx.ptr, c.long(version)) {
-		return
-	}
 	session: ^tlsx.SSL_SESSION
 	defer if session != nil {tlsx.SSL_SESSION_free(session)}
 	for round in 0 ..< 2 {
-		conn, dialed := dial_tcp(port)
-		if !dialed {
-			return
-		}
-		socket := conn.socket
-		defer net.close(socket)
-		ssl := tlsx.SSL_new(ctx.ptr)
-		if ssl == nil {
-			return
-		}
-		defer tlsx.SSL_free(ssl)
-		if tlsx.SSL_set_fd(ssl, c.int(net.Socket(socket))) != 1 ||
-		   (session != nil && tlsx.SSL_set_session(ssl, session) != 1) ||
-		   tlsx.SSL_connect(ssl) != 1 ||
-		   tlsx.SSL_write(ssl, raw_data(request), c.int(len(request))) != c.int(len(request)) {
+		conn := raw_tls_connect(ctx, port, session) or_return
+		// close_notify only after a round that went through: SSL_shutdown(3)
+		// is not to follow a fatal error.
+		completed := false
+		defer raw_tls_close(conn, shutdown = completed)
+		if tlsx.SSL_write(conn.ssl, raw_data(request), c.int(len(request))) != c.int(len(request)) {
 			return
 		}
 		b: [1]u8
-		if tlsx.SSL_read(ssl, &b, 1) != 1 {
+		if tlsx.SSL_read(conn.ssl, &b, 1) != 1 {
 			return
 		}
-		reused = tlsx.SSL_session_reused(ssl) == 1
+		completed = true
+		reused = tlsx.SSL_session_reused(conn.ssl) == 1
 		if round == 0 {
-			session = tlsx.SSL_get1_session(ssl)
+			session = tlsx.SSL_get1_session(conn.ssl)
 		}
-		tlsx.SSL_shutdown(ssl)
 	}
 	return reused, true
+}
+
+/*
+The TLS version a handshake with `port` settles on, offering every version up to
+TLS 1.3, so the answer is the server's ceiling.
+*/
+tls_version_at :: proc(port: int) -> (version: int, ok: bool) {
+	ctx := raw_tls_context(tlsx.TLS1_3_VERSION, nil) or_return
+	defer tlsx.context_destroy(ctx)
+	conn := raw_tls_connect(ctx, port) or_return
+	defer raw_tls_close(conn)
+	return int(tlsx.SSL_version(conn.ssl)), true
+}
+
+// A client session driven on the raw `SSL`, for what `tlsx.Conn` does not
+// offer: resumption and the negotiated version. See `raw_tls_connect`.
+@(private)
+Raw_TLS :: struct {
+	ssl:    ^tlsx.SSL,
+	socket: net.TCP_Socket,
+}
+
+// An unverified client context offering at most `max_version`.
+@(private)
+raw_tls_context :: proc(max_version: int, alpn: []string) -> (ctx: ^tlsx.Context, ok: bool) {
+	cerr: tlsx.Error
+	ctx, cerr = tlsx.client_context(false, "", alpn, context.temp_allocator)
+	if cerr != .None {
+		return nil, false
+	}
+	if !tlsx.ssl_ctx_set_max_proto_version(ctx.ptr, c.long(max_version)) {
+		tlsx.context_destroy(ctx)
+		return nil, false
+	}
+	return ctx, true
+}
+
+/*
+A completed handshake with `port` from `ctx`, offering `session` when it is not
+nil. Everything is released on failure; on success the caller hands the result
+to `raw_tls_close`.
+*/
+@(private)
+raw_tls_connect :: proc(ctx: ^tlsx.Context, port: int, session: ^tlsx.SSL_SESSION = nil) -> (conn: Raw_TLS, ok: bool) {
+	dialed, dial_ok := dial_tcp(port)
+	if !dial_ok {
+		return
+	}
+	ssl := tlsx.SSL_new(ctx.ptr)
+	if ssl == nil {
+		net.close(dialed.socket)
+		return
+	}
+	conn = Raw_TLS{ssl = ssl, socket = dialed.socket}
+	if tlsx.SSL_set_fd(ssl, c.int(net.Socket(dialed.socket))) != 1 ||
+	   (session != nil && tlsx.SSL_set_session(ssl, session) != 1) ||
+	   tlsx.SSL_connect(ssl) != 1 {
+		raw_tls_close(conn, shutdown = false)
+		return {}, false
+	}
+	return conn, true
+}
+
+// Send close_notify (unless `shutdown` is false, for a session that never
+// completed its handshake), free the session and close the connection.
+@(private)
+raw_tls_close :: proc(conn: Raw_TLS, shutdown := true) {
+	if shutdown {
+		tlsx.SSL_shutdown(conn.ssl)
+	}
+	tlsx.SSL_free(conn.ssl)
+	net.close(conn.socket)
 }
 
 /*

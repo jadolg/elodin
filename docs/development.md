@@ -19,6 +19,8 @@ mise run release          # bin/elodin, optimised
 mise run test             # unit tests
 mise run itest            # integration tests against the built binary
 mise run itest-release    # the same suite against the optimised build
+mise run release-static   # bin/static/elodin: musl and OpenSSL linked in (needs docker)
+mise run itest-static     # the suite against it, inside Alpine (needs docker)
 mise run leakcheck        # the same suite under AddressSanitizer
 mise run verify           # check + test + itest
 mise run check            # -vet -strict-style on every package (tests included), and scripts/lint.py
@@ -354,7 +356,7 @@ by hand: `curl --http2 -k -H 'content-type: application/dns-message'
 
 - once: `mise run check`, `fuzz-regression`, `parity-regression`, `leakcheck`,
   `itest-release`
-- on both architectures: `mise run test`, `itest`, `build`, and `mise run deb`,
+- on both architectures: `mise run test`, `itest`, `itest-static`, `build`, and `mise run deb`,
   whose package is installed on the runner, made to resolve a handful of names
   through the resolver takeover it performs, then removed, checking the runner
   gets its own resolver back

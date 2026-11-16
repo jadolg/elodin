@@ -66,6 +66,10 @@ OPENSSL_STACK :: struct {}
 
 OPENSSL_INIT_LOAD_SSL_STRINGS :: 0x0020_0000
 OPENSSL_INIT_LOAD_CRYPTO_STRINGS :: 0x0000_0002
+OPENSSL_INIT_NO_LOAD_CONFIG :: 0x0000_0080
+
+// `OpenSSL_version`'s selector for the version text ("OpenSSL 3.5.9 29 Sep 2026").
+OPENSSL_VERSION :: 0
 
 SSL_FILETYPE_PEM :: 1
 
@@ -202,6 +206,7 @@ foreign libssl {
 	SSL_set_session :: proc(ssl: ^SSL, session: ^SSL_SESSION) -> c.int ---
 	SSL_SESSION_free :: proc(session: ^SSL_SESSION) ---
 	SSL_session_reused :: proc(ssl: ^SSL) -> c.int ---
+	SSL_version :: proc(ssl: ^SSL) -> c.int ---
 	SSL_CTX_set_options :: proc(ctx: ^SSL_CTX, op: u64) -> u64 ---
 	SSL_SESSION_get0_ticket :: proc(s: ^SSL_SESSION, tick: ^[^]u8, len: ^c.size_t) ---
 
@@ -216,6 +221,7 @@ foreign libcrypto {
 	CRYPTO_get_ex_new_index :: proc(class_index: c.int, argl: c.long, argp: rawptr, new_func: rawptr, dup_func: rawptr, free_func: CRYPTO_EX_Free) -> c.int ---
 
 	ERR_get_error :: proc() -> c.ulong ---
+	OpenSSL_version :: proc(type: c.int) -> cstring ---
 
 	RAND_bytes :: proc(buf: [^]u8, num: c.int) -> c.int ---
 	RAND_priv_bytes :: proc(buf: [^]u8, num: c.int) -> c.int ---

@@ -29,7 +29,10 @@ environment `packaging/elodin.service` sets, which has to stay near the RSS it
 started with, and one without it - the premise, which has to grow. A control
 that does not grow fails the case: the check would pass whatever the unit set,
 so the list's size needs moving back into the band where glibc keeps the
-memory. Under a sanitizer, whose allocator is not glibc's, it is skipped.
+memory. Under a sanitizer, whose allocator is not glibc's, it is skipped. Against
+the static build, whose allocator is musl's, only the process with the unit's
+environment runs: musl gives the memory back without the setting, so there is no
+premise to hold.
 */
 
 /*
@@ -154,17 +157,7 @@ is the suite's own, MALLOC_ settings included.
 */
 @(private = "file")
 glibc_environments :: proc(r: ^Runner, name: string, unit_env: []string) -> (control, shipped: []string, ok: bool) {
-	inherited, eerr := os.environ(context.temp_allocator)
-	if eerr != nil {
-		fail(r, "%s: cannot read the environment: %v", name, eerr)
-		return
-	}
-	kept := make([dynamic]string, 0, len(inherited), context.temp_allocator)
-	for kv in inherited {
-		if !strings.has_prefix(kv, "MALLOC_") && !strings.has_prefix(kv, "GLIBC_TUNABLES=") && !strings.has_prefix(kv, "LD_PRELOAD=") {
-			append(&kept, kv)
-		}
-	}
+	kept := environ_without(r, name, {"MALLOC_", "GLIBC_TUNABLES=", "LD_PRELOAD="}) or_return
 	with_unit := make([dynamic]string, context.temp_allocator)
 	append(&with_unit, ..unit_env)
 	append(&with_unit, ..kept[:])
@@ -257,33 +250,43 @@ run_list_memory_cases :: proc(r: ^Runner) {
 	if !env_ok {
 		return
 	}
+	static := r.static
 
 	start_case(r, NAME)
-	c0, c1, cok := rss_across_rebuilds(r, control[:], list_path)
-	// The premise: the defaults keep a rebuild's peak, here at least half as
-	// much again as the process started with.
-	premise :=
-		cok &&
-		check(
-			r,
-			c1 * 2 >= c0 * 3,
-			"without the unit's environment RSS went only %d -> %d KiB over %d rebuilds, so this cannot tell whether the unit's setting works; move MEMORY_RULES back to a size glibc keeps",
-			c0,
-			c1,
-			MEMORY_RELOADS,
-		)
+	/*
+	The premise is glibc's: its defaults keep a rebuild's peak, here at least
+	half as much again as the process started with. musl's allocator, which the
+	static build carries, gives the memory back without the unit's setting, so
+	there the claim is only that the unit's environment does too.
+	*/
+	c0, c1: int
+	cok: bool
+	premise := static
+	if !static {
+		c0, c1, cok = rss_across_rebuilds(r, control[:], list_path)
+		premise =
+			cok &&
+			check(
+				r,
+				c1 * 2 >= c0 * 3,
+				"without the unit's environment RSS went only %d -> %d KiB over %d rebuilds, so this cannot tell whether the unit's setting works; move MEMORY_RULES back to a size glibc keeps",
+				c0,
+				c1,
+				MEMORY_RELOADS,
+			)
+	}
 	if premise {
 		if u0, u1, uok := rss_across_rebuilds(r, shipped[:], list_path); uok {
+			control_line := "" if static else fmt.tprintf(" (%d -> %d KiB without it)", c0, c1)
 			check(
 				r,
 				u1 * 4 <= u0 * 5,
-				"RSS went %d -> %d KiB over %d rebuilds with the unit's environment %v (%d -> %d KiB without it)",
+				"RSS went %d -> %d KiB over %d rebuilds with the unit's environment %v%s",
 				u0,
 				u1,
 				MEMORY_RELOADS,
 				unit_env[:],
-				c0,
-				c1,
+				control_line,
 			)
 		}
 	}

@@ -76,6 +76,57 @@ instead.
 GitHub releases also carry `linux-amd64` and `linux-arm64` tarballs of the
 binary, the unit and the example configuration.
 
+## Static tarballs, for musl systems and any other Linux
+
+The binary in the tarballs above, like the `.deb`'s, links against glibc and the
+system OpenSSL, so it does not start on Alpine, OpenWrt or another musl system.
+Each release also carries `elodin-<tag>-linux-amd64-static.tar.gz` and
+`elodin-<tag>-linux-arm64-static.tar.gz`, with the same contents and a binary
+that carries musl and OpenSSL inside it. It runs on any Linux of its
+architecture, glibc distributions included. Where systemd runs it, it installs
+as [above](#from-source-as-a-service). `elodin --version` names the OpenSSL it
+carries, with `static` after it:
+
+```
+elodin 0.28.0 (OpenSSL 3.5.9 29 Sep 2026, static)
+```
+
+Where it differs from the dynamic build:
+
+- **OpenSSL fixes arrive only with an elodin release.** The system's package
+  manager does not update an OpenSSL linked into the binary. Check an OpenSSL
+  advisory against the version `--version` prints.
+- **Trusted certificates.** Blocklist downloads over HTTPS and DoT and DoH
+  upstreams with `verify` on check the peer against `/etc/ssl/cert.pem` and the
+  hashed directory `/etc/ssl/certs`. Debian, Ubuntu, Fedora, openSUSE, Arch,
+  Alpine and OpenWrt keep their bundle there, once their `ca-certificates`
+  (OpenWrt: `ca-bundle`) package is installed. Elsewhere, name the bundle in the
+  service's environment, `Environment=SSL_CERT_FILE=/path/to/bundle.pem` (or
+  `SSL_CERT_DIR` for a hashed directory). Without one, every list download
+  fails with `download failed (TLS_Failed)` and every verified upstream with
+  `certificate verify failed`.
+- **The system's `openssl.cnf` is not read**, nor a file `OPENSSL_CONF` names:
+  it is written for the system's own OpenSSL, and the embedded one can refuse
+  it (openSUSE's names an option only openSUSE's OpenSSL knows). A system-wide
+  crypto policy does not apply; elodin's own floor of TLS 1.2 does. A dynamic
+  build applies the file, and logs `OpenSSL could not apply its configuration`
+  with OpenSSL's reason when it cannot.
+- **Accounts come from `/etc/passwd` and `/etc/group` only.** musl has no NSS,
+  so a `server.user` or `server.group` that LDAP, SSSD or systemd-userdb
+  provides is `no such user` to the static build and its `--check`. Use a local
+  account, or leave `server.user` empty and start unprivileged, as the systemd
+  unit does.
+- **It is larger on disk, smaller in memory and slower under TLS load.** The
+  binary is about 8.5 MB against 1.8 MB. musl's allocator costs the
+  TLS transports most: on a 4-core x86 machine, `mise run bench -- -only
+  transports` measured DoT at 46,000 queries a second against the dynamic
+  build's 77,000 and DoH at about three quarters of its rate, with UDP and TCP
+  within 8%. Idle, it held 6.3 MB resident against 10.5 MB. On a glibc system
+  with a busy DoT or DoH listener, prefer the dynamic build.
+
+The unit's `MALLOC_MMAP_THRESHOLD_` is glibc's, and musl ignores it; musl's
+allocator gives a blocklist refresh's memory back without it.
+
 ## Privileges
 
 Binding a port below 1024 is the only thing elodin needs root for. Either of two

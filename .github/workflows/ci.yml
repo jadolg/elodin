@@ -104,6 +104,42 @@ jobs:
         with:
           mode: report
 
+  itest-static:
+    name: Integration (static, ${{ matrix.arch }})
+    # The static release binary, musl and OpenSSL linked in, under the suite
+    # linked the same way, both inside Alpine: a host with no glibc at all. On
+    # both architectures, since struct layouts musl and glibc disagree on can
+    # differ between them. As root in the container, so the case that needs a
+    # failing privilege drop skips.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      # Its pipe runs in the host's namespaces, so a crash inside the container
+      # is kept too.
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
+      - uses: jdx/mise-action@v5
+        with:
+          install: true
+          cache: true
+      # Not namespaced: the container's sockets take the host's cap (#568).
+      - run: sudo sysctl -w net.core.rmem_max=4194304
+      - run: mise run itest-static
+        timeout-minutes: 30
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
+
   leakcheck:
     name: Memory (AddressSanitizer)
     # The integration suite again, this time against a binary built with

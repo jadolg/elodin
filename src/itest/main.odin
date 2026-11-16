@@ -153,12 +153,24 @@ main :: proc() {
 		graceful_stop = graceful_stop,
 	}
 
+	static, static_ok := binary_is_static(&r)
+	if !static_ok {
+		fmt.eprintfln("itest: %s --version failed", r.binary)
+		// os.exit runs no defers.
+		if !keep {
+			remove_work_dir(work_dir)
+		}
+		os.exit(2)
+	}
+	r.static = static
+
 	cert, key, cert_ok := ensure_certificate(work_dir)
 	r.cert_file = cert
 	r.key_file = key
 
 	fmt.printfln("elodin integration tests")
 	fmt.printfln("  binary:    %s", r.binary)
+	fmt.printfln("  static:    %v", r.static)
 	fmt.printfln("  work dir:  %s", work_dir)
 	fmt.printfln("  ports:     %d-%d", base_port, r.port_limit - 1)
 	if !cert_ok {
@@ -214,6 +226,7 @@ main :: proc() {
 		section(&r, "listeners: udp, tcp, dot, doh")
 		run_transport_cases(&r)
 		run_ddr_cases(&r)
+		run_openssl_conf_cases(&r)
 	} else {
 		skip_case(&r, "listeners", "no certificate")
 	}

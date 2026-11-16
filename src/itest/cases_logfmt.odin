@@ -137,20 +137,11 @@ log_file_case :: proc(r: ^Runner, upstream_port: int) {
 	// LeakSanitizer cannot run under a tracer: on exit it writes a fatal-error
 	// report instead of a leak check, and `mise run leakcheck` fails on any
 	// report. The leak check is off for this one traced process, and only that.
-	inherited, eerr := os.environ(context.temp_allocator)
-	if eerr != nil {
-		fail(r, "%s: cannot read the environment: %v", NAME, eerr)
+	env, env_ok := environ_without(r, NAME, {"ASAN_OPTIONS="}, extra = 1)
+	if !env_ok {
 		return
 	}
-	env := make([dynamic]string, 0, len(inherited) + 1, context.temp_allocator)
-	asan_options := ""
-	for kv in inherited {
-		if strings.has_prefix(kv, "ASAN_OPTIONS=") {
-			asan_options = kv[len("ASAN_OPTIONS="):]
-		} else {
-			append(&env, kv)
-		}
-	}
+	asan_options := os.get_env("ASAN_OPTIONS", context.temp_allocator)
 	append(&env, fmt.tprintf("ASAN_OPTIONS=%s:detect_leaks=0", asan_options))
 
 	udp_port := next_port(r)

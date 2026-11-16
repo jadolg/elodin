@@ -25,12 +25,23 @@ while [ $# -gt 0 ]; do
 done
 
 # A slow clock fails gh's TLS, live DNSSEC and every deadline test.
-if command -v chronyc >/dev/null; then
-	off=$(chronyc tracking | awk '/^System time/ {print $4}')
+# chronyc is asked only while chronyd answers it; a host whose clock another
+# daemon keeps (systemd-timesyncd) is asked through timedatectl instead.
+if command -v chronyc >/dev/null && tracking=$(chronyc tracking 2>/dev/null); then
+	off=$(awk '/^System time/ {print $4}' <<<"$tracking")
 	if awk -v o="${off:-0}" 'BEGIN {exit !(o > 1)}'; then
 		echo "push-gate: the clock is ${off}s off NTP; run: sudo chronyc makestep" >&2
 		exit 1
 	fi
+elif command -v timedatectl >/dev/null; then
+	# Only chronyc measures an offset, so only it refuses. timedatectl says
+	# whether the kernel was told it is synchronised, which a correct clock
+	# kept by a hypervisor or openntpd is not, so its "no" is a warning.
+	case "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" in
+	yes) ;;
+	no) echo "push-gate: timedatectl says the clock is not NTP-synchronised; deadline tests and gh's TLS fail on a skewed one" >&2 ;;
+	*) echo "push-gate: neither chronyc nor timedatectl can say how the clock stands; not checking it" >&2 ;;
+	esac
 fi
 
 if [ -n "$(git status --porcelain)" ]; then
