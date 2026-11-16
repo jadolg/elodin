@@ -37,6 +37,8 @@ Refusing_Peer :: struct {
 	// or leave it open and send nothing more.
 	reset:    bool,
 	stall:    bool,
+	// Or close the connection after `head`, without ending the stream.
+	hang_up:  bool,
 }
 
 @(private = "file")
@@ -100,7 +102,7 @@ refusing_peer_run :: proc(p: ^Refusing_Peer) {
 					h2.write_frame_header(&out, len(p.interim), .Headers, h2.FLAG_END_HEADERS, h.stream_id)
 					append(&out, ..p.interim)
 				}
-				ends := p.body == 0 && !p.reset && !p.stall
+				ends := p.body == 0 && !p.reset && !p.stall && !p.hang_up
 				h2.write_frame_header(&out, len(p.head), .Headers, h2.FLAG_END_HEADERS | (h2.FLAG_END_STREAM if ends else 0), h.stream_id)
 				append(&out, ..p.head)
 				if p.reset {
@@ -115,6 +117,9 @@ refusing_peer_run :: proc(p: ^Refusing_Peer) {
 					resize(&out, len(out) + n)
 				}
 				peer_send(client, out)
+				if p.hang_up {
+					return
+				}
 				continue
 			}
 			// The query as its own answer, QR set: all `response_matches` asks.
@@ -141,8 +146,8 @@ One exchange answered by the header block `head`, after the interim block
 the upstream to wait, or zero.
 */
 @(private)
-exchange_with_head :: proc(t: ^testing.T, interim, head: []u8, body: int, reset := false, stall := false) -> (err: Error, wait: time.Duration) {
-	err, _, wait = exchange_with_peer(t, 0, interim, head, body, context.temp_allocator, reset = reset, stall = stall)
+exchange_with_head :: proc(t: ^testing.T, interim, head: []u8, body: int, reset := false, stall := false, hang_up := false) -> (err: Error, wait: time.Duration) {
+	err, _, wait = exchange_with_peer(t, 0, interim, head, body, context.temp_allocator, reset = reset, stall = stall, hang_up = hang_up)
 	return
 }
 
@@ -155,6 +160,7 @@ exchange_with_peer :: proc(
 	allocator: mem.Allocator,
 	reset := false,
 	stall := false,
+	hang_up := false,
 ) -> (
 	err: Error,
 	headers: int,
@@ -177,6 +183,7 @@ exchange_with_peer :: proc(
 		body     = body,
 		reset    = reset,
 		stall    = stall,
+		hang_up  = hang_up,
 	}
 	peer := thread.create_and_start_with_poly_data(&p, refusing_peer_run)
 

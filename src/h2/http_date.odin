@@ -25,7 +25,7 @@ retry_after_now :: proc(value: string) -> (seconds: u32, ok: bool) {
 		return s, true
 	}
 	now := time.time_to_datetime(loop.now()) or_return // wall-clock: an HTTP-date is an instant on it
-	return parse_retry_after(value, now)
+	return date_retry_after(value, now)
 }
 
 /*
@@ -41,6 +41,12 @@ parse_retry_after :: proc(value: string, now: dt.DateTime) -> (seconds: u32, ok:
 	if s, is_delay := delay_seconds(value); is_delay {
 		return s, true
 	}
+	return date_retry_after(value, now)
+}
+
+// The HTTP-date half of `parse_retry_after`.
+@(private = "file")
+date_retry_after :: proc(value: string, now: dt.DateTime) -> (seconds: u32, ok: bool) {
 	at := parse_http_date(value, now) or_return
 	delta, err := dt.sub(at, now)
 	if err != .None {

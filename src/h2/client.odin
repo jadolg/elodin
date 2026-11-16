@@ -136,8 +136,8 @@ Client_Request :: struct {
 
 /*
 What `client_request` hands back. `status` and `retry_after` are the final
-response head's whenever one arrived, with `.None`, `.Too_Large`, `.Reset` and
-`.Timeout` alike, so a caller can tell a server that answered 429 and then
+response head's whenever one arrived, with `.None`, `.Too_Large`, `.Reset`,
+`.Timeout` and `.Closed` alike, so a caller can tell a server that answered 429 and then
 stopped from one that never answered; the body only with `.None`.
 */
 Client_Response :: struct {
@@ -1055,8 +1055,10 @@ client_request :: proc(
 			return Client_Response{status = status, retry_after = retry_after}, .Too_Large
 		case dry:
 			return {}, .Out_Of_Memory
-		case dead:
+		case dead && malformed:
 			return {}, .Closed
+		case dead:
+			return Client_Response{status = status, retry_after = retry_after}, .Closed
 		case refused:
 			return {}, .Refused
 		case reset && malformed:
@@ -1102,9 +1104,15 @@ client_request :: proc(
 		}
 		return Client_Response{status = status, retry_after = retry_after}, .Reset
 	case c.closed && !s.done:
-		dry := c.dry
+		dry, malformed, status, retry_after := c.dry, s.malformed, s.status, s.retry_after
 		loop.unlock(&c.mu)
-		return {}, .Out_Of_Memory if dry else .Closed
+		if dry {
+			return {}, .Out_Of_Memory
+		}
+		if malformed {
+			return {}, .Closed
+		}
+		return Client_Response{status = status, retry_after = retry_after}, .Closed
 	}
 
 	status, retry_after := s.status, s.retry_after

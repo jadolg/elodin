@@ -212,9 +212,10 @@ Upstream :: struct {
 	// for the length of the step nor lets it out early.
 	down_until:   loop.Moment,
 	// Until when this upstream's 429s and 503s asked to be left alone, and when
-	// the latest of them arrived; see `note_throttled`.
+	// the latest of them arrived - on the tick clock, as the moment a query is
+	// sent is, which is all it is compared with; see `note_throttled`.
 	throttled_until:  loop.Moment,
-	refused_at:       loop.Moment,
+	refused_at:       time.Tick,
 	// One gate per kind of failure, so each is said at `warn` once a window and
 	// left to `debug` between; see `record_failure`.
 	reported:     [Error]logx.Gate,
@@ -476,10 +477,10 @@ answer to a query sent after its latest 429 or 503 ends what that asked for: the
 server is taking queries again. One sent before it says nothing of the sort.
 */
 @(private)
-record_success :: proc(u: ^Upstream, elapsed: time.Duration, sent: loop.Moment) {
+record_success :: proc(u: ^Upstream, elapsed: time.Duration, sent: time.Tick) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
-	if sent > u.refused_at {
+	if time.tick_diff(u.refused_at, sent) > 0 {
 		u.throttled_until = {}
 	}
 	u.failures = 0
@@ -680,7 +681,9 @@ note_throttled :: proc(u: ^Upstream, kind: Error, status: int, retry_after: u32)
 	// Read under the lock, so refusals land in the order of their moments and
 	// `refused_at` only moves forward.
 	now := loop.moment_now()
-	u.refused_at = max(u.refused_at, now)
+	if at := loop.tick_now(); time.tick_diff(u.refused_at, at) > 0 {
+		u.refused_at = at
+	}
 	if retry_after > 0 {
 		u.throttled_until = max(u.throttled_until, loop.moment_add(now, clamp(asked, COOLDOWN, MAX_RETRY_AFTER)))
 	}
@@ -875,7 +878,6 @@ servers to ask the refusal costs nothing, and is left unrecorded. A lookup this
 	}
 
 	start := loop.tick_now()
-	sent := loop.moment_now()
 	// Never both: a cookie is for the transports with nothing authenticating
 	// the peer, padding for the transports where a length is the only thing
 	// left showing. `cookies_wanted` and `padding_wanted` name disjoint kinds.
@@ -912,7 +914,7 @@ servers to ask the refusal costs nothing, and is left unrecorded. A lookup this
 		)
 		return nil, err
 	}
-	record_success(u, loop.tick_since(start), sent = sent)
+	record_success(u, loop.tick_since(start), sent = start)
 	return response, .None
 }
 

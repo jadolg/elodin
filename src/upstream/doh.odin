@@ -129,6 +129,12 @@ exchange_doh_h2 :: proc(
 			}
 			return resp.body, .None
 		case .Closed, .Refused:
+			// A refusal's head that came before the connection went is the
+			// server's word, not a stale connection to ask again on. A refused
+			// stream is never one: RFC 9113 8.7 has it unprocessed.
+			if herr == .Closed && h2.status_asks_to_wait(resp.status) {
+				return nil, doh_refusal(u, resp.status, resp.retry_after)
+			}
 			/*
 			REFUSED_STREAM is a server at its stream limit saying it never
 			processed the request (RFC 9113 8.7), so it is asked again the same
@@ -252,9 +258,12 @@ exchange_doh_h1 :: proc(
 			delete(resp.body, allocator)
 		}
 		stream_close(&stream)
-		// A 429 or 503 whose body then broke off is still the server asking to
-		// be left alone: not retried on a fresh dial, and its `Retry-After` kept.
-		if herr != .None && h2.status_asks_to_wait(resp.status) {
+		// A 429 or 503 whose body was then lost - broken off, stalled, or with
+		// no room here to hold it - is still the server asking to be left
+		// alone: its head says so whole, it is not asked again on a fresh dial,
+		// and its `Retry-After` is kept. Not one `http_exchange` refused as
+		// malformed, which is no response, as on HTTP/2.
+		if herr != .None && herr != .HTTP_Error && h2.status_asks_to_wait(resp.status) {
 			return nil, doh_refusal(u, resp.status, resp.retry_after)
 		}
 		// A non-200 is the server's answer whatever the size of its body, which
