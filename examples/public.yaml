@@ -110,6 +110,11 @@ server:
   # answers between 1232 and what the client asked for.
   max_udp_response: 1232
 
+  # Name no build to strangers: version.bind and its siblings are refused, and
+  # DoH answers carry no Server field. The build is still in --version, the
+  # startup line and elodin_build_info on the metrics endpoint.
+  identity: off
+
   rate_limit:
     enabled: true
     # Left at the shipped 500 per client prefix, in both directions of the

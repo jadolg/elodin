@@ -1083,13 +1083,15 @@ test_a_200_writes_its_fields_in_one_order :: proc(t: ^testing.T) {
 			"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nCache-Control: no-store\r\nDate: D\r\nServer: elodin/" + VERSION + "\r\nConnection: close\r\n\r\n",
 		},
 	}
+	cfg: config.Config
+	s := local_server(&cfg)
 	for c in cases {
 		client, accepted, paired := loopback_tcp_pair(t)
 		if !paired {
 			return
 		}
 		defer net.close(client)
-		written := send_http_ok(Conn{socket = accepted}, c.content_type, transmute([]u8)c.body, c.keep_alive, c.field, c.value, c.head)
+		written := send_http_ok(&s, Conn{socket = accepted}, c.content_type, transmute([]u8)c.body, c.keep_alive, c.field, c.value, c.head)
 		net.close(accepted)
 		testing.expect(t, written, "the 200 was not written")
 

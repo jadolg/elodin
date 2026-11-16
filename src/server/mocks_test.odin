@@ -447,8 +447,9 @@ test_query :: proc(
 	id: u16 = 0x4242,
 	rd := true,
 	opt: Maybe(dns.Record) = nil,
+	class := dns.Class.IN,
 ) -> []u8 {
-	question := [1]dns.Question{{name = name, type = type, class = .IN}}
+	question := [1]dns.Question{{name = name, type = type, class = class}}
 	additional: [1]dns.Record
 	m := dns.Message {
 		id       = id,
@@ -847,8 +848,18 @@ upstream - and comes back Refused instead, which names the failure exactly.
 `ok` is false when nothing came back or it would not decode.
 */
 @(private)
-ask_local :: proc(s: ^Server, name: string, type: dns.Type, rd := false) -> (resp: dns.Message, outcome: Outcome, ok: bool) {
-	out, how, answered := handle_query(s, test_query(name, type, rd = rd), .UDP, "127.0.0.1:5555", context.temp_allocator)
+ask_local :: proc(
+	s: ^Server,
+	name: string,
+	type: dns.Type,
+	rd := false,
+	class := dns.Class.IN,
+) -> (
+	resp: dns.Message,
+	outcome: Outcome,
+	ok: bool,
+) {
+	out, how, answered := handle_query(s, test_query(name, type, rd = rd, class = class), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	if !answered {
 		return {}, how, false
 	}

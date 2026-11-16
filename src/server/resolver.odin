@@ -1336,15 +1336,8 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		return answered(st, out, .Refused, built)
 	}
 
-	if st.q.class == .CH {
-		if out, handled := answer_chaos(st.s, st.msg, st.q, st.allocator, st.limit); handled {
-			// Nothing built is a failure, as for every local answer.
-			if len(out) == 0 {
-				count_answer(&st.s.stats.failed)
-			}
-			log_query(st.s, st.client, st.proto, st.q, .Local if len(out) > 0 else .Failed, "chaos", st.started)
-			return answered(st, out, .Local, len(out) > 0)
-		}
+	if st.q.class == .CH && answer_chaos(st) {
+		return true
 	}
 	if st.q.class != .IN && st.q.class != .ANY {
 		out, built := dns.error_response(st.query, st.msg, .Refused, st.allocator, st.limit)
@@ -4765,46 +4758,62 @@ find_rewrite_index :: proc(
 	return 0, false
 }
 
-// CHAOS-class queries used by monitoring tools: version.bind and hostname.bind.
+/*
+The CHAOS-class TXT names monitoring tools ask a server about itself:
+version.bind and version.server, hostname.bind and id.server. Answered as
+`server.identity` says - see `config.Identity` - and logged `detail=chaos`
+whichever way, a refusal included. False for any other query, which is left to
+the class refusal after it.
+*/
 @(private)
-answer_chaos :: proc(
-	s: ^Server,
-	query: dns.Message,
-	q: dns.Question,
-	allocator: mem.Allocator,
-	limit: int,
-) -> (
-	response: []u8,
-	handled: bool,
-) {
-	if q.type != .TXT && q.type != .ANY {
-		return nil, false
+answer_chaos :: proc(st: ^Query_State) -> bool {
+	if st.q.type != .TXT && st.q.type != .ANY {
+		return false
 	}
-	text: string
+	is_version: bool
 	switch {
-	case dns.name_equal_fold(q.name, "version.bind."), dns.name_equal_fold(q.name, "version.server."):
-		text = "elodin " + VERSION
-	case dns.name_equal_fold(q.name, "hostname.bind."), dns.name_equal_fold(q.name, "id.server."):
-		text = "elodin"
+	case dns.name_equal_fold(st.q.name, "version.bind."), dns.name_equal_fold(st.q.name, "version.server."):
+		is_version = true
+	case dns.name_equal_fold(st.q.name, "hostname.bind."), dns.name_equal_fold(st.q.name, "id.server."):
 	case:
-		return nil, false
+		return false
+	}
+
+	cfg := &live(st.s).cfg.server
+	text: string
+	switch cfg.identity {
+	case .Off:
+		out, built := dns.error_response(st.query, st.msg, .Refused, st.allocator, st.limit)
+		log_query(st.s, st.client, st.proto, st.q, .Refused, "chaos", st.started)
+		return answered(st, out, .Refused, built)
+	case .Text:
+		text = cfg.identity_text
+	case .Version:
+		text = "elodin " + VERSION if is_version else "elodin"
 	}
 
 	// On the stack, as in `answer_special_use`: the encode below is their only
 	// reader.
 	strs := [1]string{text}
-	answers := [1]dns.Record{{name = q.name, type = .TXT, class = .CH, ttl = 0, data = dns.Rdata_TXT{strings = strs[:]}}}
-
-	resp := dns.make_response(query, .No_Error, allocator)
+	answers := [1]dns.Record{{name = st.q.name, type = .TXT, class = .CH, ttl = 0, data = dns.Rdata_TXT{strings = strs[:]}}}
+	resp := dns.make_response(st.msg, .No_Error, st.allocator)
 	resp.answer = answers[:]
-	out, _, err := dns.encode_message(resp, allocator, limit)
+	out, _, err := dns.encode_message(resp, st.allocator, st.limit)
 	if err != .None {
-		// Still handled where the allocator ran dry: the name is ours, and
+		// Still answered where the allocator ran dry: the name is ours, and
 		// falling through would answer it REFUSED, which says something untrue
-		// about it.
-		return nil, err == .Out_Of_Memory
+		// about it. Any other error is the class refusal's to answer.
+		if err != .Out_Of_Memory {
+			return false
+		}
+		out = nil
 	}
-	return out, true
+	// Nothing built is a failure, as for every local answer.
+	if len(out) == 0 {
+		count_answer(&st.s.stats.failed)
+	}
+	log_query(st.s, st.client, st.proto, st.q, .Local if len(out) > 0 else .Failed, "chaos", st.started)
+	return answered(st, out, .Local, len(out) > 0)
 }
 
 /*

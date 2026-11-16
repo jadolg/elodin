@@ -4,6 +4,8 @@ MAX_LABEL_LEN :: 63
 MAX_NAME_WIRE :: 255
 MAX_UDP_SIZE :: 512
 MAX_MESSAGE :: 65535
+// The longest <character-string>: one length octet's worth (RFC 1035 3.3).
+MAX_CHARACTER_STRING :: 255
 HEADER_SIZE :: 12
 
 // The DO bit in an OPT record's TTL: the top bit of its flags, the low sixteen
