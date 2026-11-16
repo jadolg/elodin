@@ -699,6 +699,7 @@ serve_doh_request :: proc(
 			return send_http_error(conn, "doh", status, why, req.keep_alive, allow, head)
 		}
 		return send_http_ok(
+			s,
 			conn,
 			DOH_MOBILECONFIG_CONTENT_TYPE,
 			profile,
@@ -778,6 +779,7 @@ serve_doh_request :: proc(
 		return send_http_error(conn, "doh", 500, "no response", req.keep_alive)
 	}
 	return send_http_ok(
+		s,
 		conn,
 		DOH_CONTENT_TYPE,
 		response,
@@ -1076,13 +1078,36 @@ refuse_http_request :: proc(conn: Conn, who: string, status: int, method: string
 }
 
 /*
+The `Server` field's value under `server.identity: version`: the build on an
+HTTP/1.1 200, and the product alone on every HTTP/2 response.
+*/
+@(private)
+SERVER_FIELD :: PRODUCT + "/" + VERSION
+@(private)
+H2_SERVER_FIELD :: PRODUCT
+
+/*
+The `Server` field an HTTP/1.1 200 carries: `SERVER_FIELD` under
+`server.identity: version`, and "" - no field - under any other setting,
+which RFC 9110 section 10.2.4 allows. A text the operator chose for the CHAOS
+names is not a `product` token, and is not put in a header field.
+*/
+@(private)
+server_field :: proc(s: ^Server) -> string {
+	pin_scope(s)
+	return SERVER_FIELD if live(s).cfg.server.identity == .Version else ""
+}
+
+/*
 A 200 carrying `body`, and the one field beside the common ones that each answer
 has its own reason for: Cache-Control on a DoH answer and on the metrics page,
-Content-Disposition on the profile. A reply to `head` is its fields alone (RFC
+Content-Disposition on the profile. `Server` is sent as
+`server_field` says. A reply to `head` is its fields alone (RFC
 9112 6.3), carrying the Content-Length GET would have (RFC 9110 8.6).
 */
 @(private)
 send_http_ok :: proc(
+	s: ^Server,
 	conn: Conn,
 	content_type: string,
 	body: []u8,
@@ -1102,8 +1127,10 @@ send_http_ok :: proc(
 	strings.write_string(&b, value)
 	strings.write_string(&b, "\r\nDate: ")
 	strings.write_string(&b, now_http_date(context.temp_allocator))
-	strings.write_string(&b, "\r\nServer: elodin/")
-	strings.write_string(&b, VERSION)
+	if server := server_field(s); server != "" {
+		strings.write_string(&b, "\r\nServer: ")
+		strings.write_string(&b, server)
+	}
 	strings.write_string(&b, "\r\nConnection: ")
 	strings.write_string(&b, "keep-alive" if keep_alive else "close")
 	strings.write_string(&b, "\r\n\r\n")

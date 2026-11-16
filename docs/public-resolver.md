@@ -18,6 +18,11 @@ live on this page; each names its report under `bench/results/`.
 - A per-source connection rate limit: see [a connection rate limit in
   front](#a-connection-rate-limit-in-front).
 
+**Set in the configuration:**
+
+- `server.identity: off`, so the CHAOS names and the DoH `Server` field name no
+  build ([what it says about itself](access-control.md#what-it-says-about-itself)).
+
 **Tune in the kernel:**
 
 - `net.core.rmem_max` — 208 KiB untuned, which clamps

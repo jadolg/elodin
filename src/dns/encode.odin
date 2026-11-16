@@ -95,7 +95,7 @@ w_bytes :: proc(w: ^Writer, v: []u8) {
 
 @(private)
 w_char_string :: proc(w: ^Writer, s: string) -> Encode_Error {
-	if len(s) > 255 {
+	if len(s) > MAX_CHARACTER_STRING {
 		return .Too_Large
 	}
 	w_u8(w, u8(len(s)))

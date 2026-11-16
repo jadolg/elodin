@@ -93,6 +93,22 @@ server:
     - fc00::/7
     - fe80::/10
 
+  # What this server says about itself: the CHAOS TXT answers to version.bind,
+  # version.server, hostname.bind and id.server, and the Server field on DoH
+  # and metrics answers.
+  #
+  #   version     "elodin <version>" on the version names, "elodin" on the
+  #               others, and Server: elodin/<version> (elodin over
+  #               HTTP/2). The default.
+  #   "text"      that text on all four names, and no Server field. Quoted;
+  #               printable ASCII, 1 to 255 bytes.
+  #   off         all four names refused (REFUSED, logged detail=chaos), and no
+  #               Server field.
+  #
+  # On a resolver strangers can reach, the exact build tells them which of this
+  # project's published fixes it lacks: use off there.
+  identity: version
+
   # Largest UDP response this server will send, whatever the client's OPT
   # record asked for. 512–4096; 1232 is the DNS Flag Day 2020 figure and the
   # default.

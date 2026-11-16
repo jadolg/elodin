@@ -725,10 +725,40 @@ Server_Config :: struct {
 	it. Below 512 there is nothing sensible to send, so that is the floor.
 	*/
 	max_udp_response:           int,
+	/*
+	What this server says about itself: the CHAOS TXT answers to version.bind,
+	version.server, hostname.bind and id.server, and the `Server` field on the
+	HTTP answers DoH and the metrics endpoint send. See `Identity`.
+	*/
+	identity:                   Identity,
+	// The text `Identity.Text` answers with: printable ASCII, from 1 to
+	// `dns.MAX_CHARACTER_STRING` bytes.
+	identity_text:              string,
 	rate_limit:                 Rate_Limit_Config,
 	// What the derived sizes were derived from, when they were. Not a setting:
 	// filled in at load so startup and `--check` can report it.
 	sizing:                     Sizing,
+}
+
+// The bare words `server.identity` takes for `Identity.Version` and `Identity.Off`.
+IDENTITY_VERSION :: "version"
+IDENTITY_OFF :: "off"
+
+/*
+`server.identity`.
+
+`Version` answers the CHAOS names with the build and sends `Server:
+elodin/<version>`, for a LAN where telling a monitoring tool the build is the
+point. `Text` answers every CHAOS name with `Server_Config.identity_text` and
+sends no `Server` field. `Off` refuses the CHAOS names as any other non-IN class
+is refused, and sends no `Server` field: RFC 4892 sections 3 and 5 ask that
+server identification be easy to disable, and RFC 9110 section 10.2.4 that an
+origin not send needlessly fine-grained detail in `Server`.
+*/
+Identity :: enum u8 {
+	Version,
+	Text,
+	Off,
 }
 
 /*

@@ -57,6 +57,33 @@ first.
 Write the `[]`: `allow_from:` with nothing after it is a YAML null and a
 configuration error, since it could mean either the default or its opposite.
 
+## What it says about itself
+
+`server.identity` decides the CHAOS TXT answers to `version.bind`,
+`version.server`, `hostname.bind` and `id.server`, and the `Server` field on
+DoH and metrics answers. It applies on reload.
+
+| Value | CHAOS names | `Server` field |
+|---|---|---|
+| `version` (default) | `elodin <version>` on the version names, `elodin` on the others | `elodin/<version>` on an HTTP/1.1 answer, `elodin` over HTTP/2 |
+| `"text"` (quoted) | the text, on all four | none |
+| `off` | REFUSED, logged `outcome=refused detail=chaos` | none |
+
+```yaml
+server:
+  identity: off
+```
+
+- A text is quoted, printable ASCII, 1 to 255 bytes. Quoting is what makes
+  `"off"` or `"version"` a text; a bare word that is neither mode is refused.
+- On a resolver strangers can reach, use `off`: the exact build tells them which
+  of this project's published fixes it lacks. RFC 4892 asks that server
+  identification be easy to disable, and RFC 9110 section 10.2.4 that `Server`
+  not carry needless detail.
+- The build stays in `--version`, the startup line and the `elodin_build_info`
+  metric: the [metrics endpoint](metrics.md) binds loopback by default and is
+  for the operator, not for clients.
+
 ## Recursion only when asked
 
 elodin forwards to an upstream only when the query has RD set (RFC 1035 section

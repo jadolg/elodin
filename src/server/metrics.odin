@@ -291,6 +291,7 @@ serve_metrics :: proc(s: ^Server, l: ^Listeners, socket: net.TCP_Socket, client:
 	// Nothing here may be cached: a scraper that re-read a stored copy would
 	// draw a flat line over a server that had stopped answering.
 	_ = send_http_ok(
+		s,
 		conn,
 		metrics.CONTENT_TYPE,
 		transmute([]u8)body,

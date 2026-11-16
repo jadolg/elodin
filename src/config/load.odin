@@ -364,6 +364,7 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 		"user",
 		"group",
 		"allow_from",
+		"identity",
 		"rate_limit",
 	)
 	opt_int(l, n, "max_connections", &cfg.server.max_connections, "server")
@@ -393,6 +394,7 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	opt_string(l, n, "user", &cfg.server.user, "server")
 	opt_string(l, n, "group", &cfg.server.group, "server")
 	load_allow_from(l, n, cfg)
+	load_identity(l, n, cfg)
 
 	if rl := yaml.get(n, "rate_limit"); rl != nil {
 		check_keys(
@@ -684,6 +686,55 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 		append(&out, o)
 	}
 	cfg.server.rate_limit.overrides = out[:]
+}
+
+/*
+Read `server.identity`: bare `version`, bare `off`, or a quoted text. Null, as
+for every optional scalar, leaves the default.
+
+A text is quoted so that one reading "off" or "version" can be written, as
+BIND's `version` statement tells `none` from `"none"`. A bare word that is
+neither mode, in any case, is refused rather than taken as a text or as
+whatever YAML would read it as: a misspelt `of` would otherwise be answered to
+every client, and a stray `n` would withhold what the operator meant to show.
+The text is printable ASCII, so that it reads the same in a TXT answer, a log
+line and a terminal, and fits one <character-string> (RFC 1035 3.3).
+*/
+@(private)
+load_identity :: proc(l: ^Loader, n: ^yaml.Node, cfg: ^Config) {
+	child := yaml.get(n, "identity")
+	if yaml.is_null(child) {
+		return
+	}
+	if child.kind != .Scalar {
+		errorf(l, "server.identity: expected version, off, or a quoted text")
+		return
+	}
+	if !child.quoted {
+		if child.scalar == IDENTITY_VERSION {
+			cfg.server.identity = .Version
+			return
+		}
+		if child.scalar == IDENTITY_OFF {
+			cfg.server.identity = .Off
+			return
+		}
+		errorf(l, "server.identity: %q is neither version nor off; quote it to answer with it as text", child.scalar)
+		return
+	}
+	text := child.scalar
+	if len(text) == 0 || len(text) > dns.MAX_CHARACTER_STRING {
+		errorf(l, "server.identity: a text is 1 to %d bytes; write off to answer with nothing", dns.MAX_CHARACTER_STRING)
+		return
+	}
+	for c in transmute([]u8)text {
+		if c < ' ' || c > '~' {
+			errorf(l, "server.identity: a text is printable ASCII, and this one holds byte 0x%02x", c)
+			return
+		}
+	}
+	cfg.server.identity = .Text
+	cfg.server.identity_text = text
 }
 
 /*

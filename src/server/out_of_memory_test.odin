@@ -124,11 +124,14 @@ test_local_answers_with_no_memory :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	none := mem.nil_allocator()
 
-	chaos_q := dns.Question{name = "version.bind.", type = .TXT, class = .CH}
 	// Ours to answer whether or not it could be built, so not refused as a class.
-	chaos, handled := answer_chaos(&s, msg, chaos_q, none, 512)
-	testing.expect(t, handled, "a CHAOS name was handed on for want of memory to answer it")
-	testing.expect_value(t, len(chaos), 0)
+	chaos_msg := msg
+	chaos_msg.question = []dns.Question{{name = "version.bind.", type = .TXT, class = .CH}}
+	spent: int
+	chaos := stage_state(&s, chaos_msg, &spent, none)
+	testing.expect(t, answer_chaos(&chaos), "a CHAOS name was handed on for want of memory to answer it")
+	testing.expect(t, len(chaos.response) == 0 && !chaos.ok, "a CHAOS answer was built with no memory to build it")
+	testing.expect_value(t, chaos.outcome, Outcome.Local)
 
 	_, failed_built := dnssec_failure_response(msg, dnssec.Result{status = .Bogus}, none, 512)
 	testing.expect(t, !failed_built, "a DNSSEC failure was reported built with no memory to build it")
