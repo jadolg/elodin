@@ -153,12 +153,20 @@ main :: proc() {
 		graceful_stop = graceful_stop,
 	}
 
+	static, static_ok := binary_is_static(&r)
+	if !static_ok {
+		fmt.eprintfln("itest: %s --version failed", r.binary)
+		os.exit(2)
+	}
+	r.static = static
+
 	cert, key, cert_ok := ensure_certificate(work_dir)
 	r.cert_file = cert
 	r.key_file = key
 
 	fmt.printfln("elodin integration tests")
 	fmt.printfln("  binary:    %s", r.binary)
+	fmt.printfln("  static:    %v", r.static)
 	fmt.printfln("  work dir:  %s", work_dir)
 	fmt.printfln("  ports:     %d-%d", base_port, r.port_limit - 1)
 	if !cert_ok {

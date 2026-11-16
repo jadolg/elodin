@@ -118,6 +118,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
       - uses: jdx/mise-action@v5
         with:
           install: true
@@ -165,6 +168,11 @@ jobs:
           gh release upload ${{ github.event.release.tag_name }} \
             elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}-static.tar.gz \
             --clobber
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
+          name: release-static
 
   publish-deb:
     name: Publish deb to repository

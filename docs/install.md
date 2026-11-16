@@ -111,6 +111,11 @@ Where it differs from the dynamic build:
   crypto policy does not apply; elodin's own floor of TLS 1.2 does. A dynamic
   build applies the file, and logs `OpenSSL could not apply its configuration`
   with OpenSSL's reason when it cannot.
+- **Accounts come from `/etc/passwd` and `/etc/group` only.** musl has no NSS,
+  so a `server.user` or `server.group` that LDAP, SSSD or systemd-userdb
+  provides is `no such user` to the static build and its `--check`. Use a local
+  account, or leave `server.user` empty and start unprivileged, as the systemd
+  unit does.
 - **It is larger on disk, smaller in memory and slower under TLS load.** The
   binary is about 8.5 MB against 1.8 MB. musl's allocator costs the
   TLS transports most: on a 4-core x86 machine, `mise run bench -- -only

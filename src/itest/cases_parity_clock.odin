@@ -128,15 +128,9 @@ parity_clock_child :: proc(r: ^Runner, tag, first, after: string, args: []string
 	// That run was the script's first; the child's is to be.
 	_ = os.remove(count)
 
-	inherited, eerr := os.environ(context.temp_allocator)
-	if !check(r, eerr == nil, "cannot read the environment: %v", eerr) {
+	env, env_ok := environ_without(r, tag, {"PATH=", "TMPDIR="}, extra = 2)
+	if !env_ok {
 		return
-	}
-	env := make([dynamic]string, 0, len(inherited) + 2, context.temp_allocator)
-	for kv in inherited {
-		if !strings.has_prefix(kv, "PATH=") && !strings.has_prefix(kv, "TMPDIR=") {
-			append(&env, kv)
-		}
 	}
 	// An empty element would put the working directory on the PATH.
 	path := os.get_env("PATH", context.temp_allocator)

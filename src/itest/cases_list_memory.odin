@@ -157,17 +157,7 @@ is the suite's own, MALLOC_ settings included.
 */
 @(private = "file")
 glibc_environments :: proc(r: ^Runner, name: string, unit_env: []string) -> (control, shipped: []string, ok: bool) {
-	inherited, eerr := os.environ(context.temp_allocator)
-	if eerr != nil {
-		fail(r, "%s: cannot read the environment: %v", name, eerr)
-		return
-	}
-	kept := make([dynamic]string, 0, len(inherited), context.temp_allocator)
-	for kv in inherited {
-		if !strings.has_prefix(kv, "MALLOC_") && !strings.has_prefix(kv, "GLIBC_TUNABLES=") && !strings.has_prefix(kv, "LD_PRELOAD=") {
-			append(&kept, kv)
-		}
-	}
+	kept := environ_without(r, name, {"MALLOC_", "GLIBC_TUNABLES=", "LD_PRELOAD="}) or_return
 	with_unit := make([dynamic]string, context.temp_allocator)
 	append(&with_unit, ..unit_env)
 	append(&with_unit, ..kept[:])
@@ -260,10 +250,7 @@ run_list_memory_cases :: proc(r: ^Runner) {
 	if !env_ok {
 		return
 	}
-	static, static_ok := binary_is_static(r, NAME)
-	if !static_ok {
-		return
-	}
+	static := r.static
 
 	start_case(r, NAME)
 	/*

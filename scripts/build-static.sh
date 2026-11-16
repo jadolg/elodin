@@ -22,7 +22,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-
 itest=0
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -34,7 +33,9 @@ done
 
 : "${ELODIN_DEFINES:?run through mise, which sets ELODIN_DEFINES}"
 : "${ELODIN_ALPINE:?run through mise, which sets ELODIN_ALPINE}"
-command -v docker >/dev/null || { echo "build-static: needs docker" >&2; exit 1; }
+for tool in docker readelf file; do
+	command -v "$tool" >/dev/null || { echo "build-static: needs $tool" >&2; exit 1; }
+done
 
 out=bin/static
 rm -rf "$out"
@@ -58,8 +59,9 @@ if [ "$itest" = 1 ]; then
 fi
 
 # The container runs as root to install packages; what it writes is handed back
-# to whoever ran this.
-docker run --rm -v "$PWD:/src" -w /src \
+# to whoever ran this. The checkout is mounted at its own path, so a path the
+# container names is one on the host too.
+docker run --rm -v "$PWD:$PWD" -w "$PWD" \
 	-e OBJECTS="$objects" -e OWNER="$(id -u):$(id -g)" -e OUT="$out" \
 	"$ELODIN_ALPINE" sh -euc '
 		apk add --no-cache -q gcc musl-dev openssl-dev openssl-libs-static >/dev/null
@@ -74,10 +76,14 @@ docker run --rm -v "$PWD:/src" -w /src \
 # Static means no program interpreter and nothing to load: a binary that asks
 # for either would fail on the hosts this build exists for.
 for o in $objects; do
-	if readelf -lW "$out/$o" | grep -q 'INTERP' || readelf -dW "$out/$o" | grep -q '(NEEDED)'; then
+	# Captured before they are searched: a readelf that fails stops the script
+	# here (set -e) rather than leaving the search nothing to find.
+	headers=$(readelf -lW "$out/$o")
+	dynamic=$(readelf -dW "$out/$o")
+	if grep -q 'INTERP' <<<"$headers" || grep -q '(NEEDED)' <<<"$dynamic"; then
 		echo "build-static: $out/$o is not static:" >&2
-		readelf -lW "$out/$o" | grep -A1 INTERP >&2 || true
-		readelf -dW "$out/$o" | grep NEEDED >&2 || true
+		grep -A1 INTERP <<<"$headers" >&2 || true
+		grep NEEDED <<<"$dynamic" >&2 || true
 		exit 1
 	fi
 	file -b "$out/$o"

@@ -34,10 +34,16 @@ if command -v chronyc >/dev/null && tracking=$(chronyc tracking 2>/dev/null); th
 		exit 1
 	fi
 elif command -v timedatectl >/dev/null; then
-	if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != yes ]; then
+	# Only a "no" refuses: a timedatectl that cannot answer (no systemd as PID
+	# 1, a container) says nothing about the clock, as a missing chronyc does not.
+	case "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" in
+	no)
 		echo "push-gate: the clock is not NTP-synchronised (timedatectl); synchronise it first" >&2
 		exit 1
-	fi
+		;;
+	yes) ;;
+	*) echo "push-gate: neither chronyc nor timedatectl can say how the clock stands; not checking it" >&2 ;;
+	esac
 fi
 
 if [ -n "$(git status --porcelain)" ]; then

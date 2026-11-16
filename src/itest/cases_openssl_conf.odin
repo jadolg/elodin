@@ -1,9 +1,6 @@
 package itest
 
 import "core:fmt"
-import "core:os"
-import "core:path/filepath"
-import "core:strings"
 import "elodin:dns"
 import "elodin:tlsx"
 
@@ -64,50 +61,19 @@ openssl_conf_config :: proc(r: ^Runner, udp_port, dot_port: int) -> string {
 }
 
 /*
-This process's environment with OPENSSL_CONF naming `path`, and with no
-OPENSSL_CONF of its own, so the server reads the case's file whatever the suite
-was started with.
-*/
-@(private = "file")
-env_with_openssl_conf :: proc(r: ^Runner, name, path: string) -> (env: []string, ok: bool) {
-	inherited, eerr := os.environ(context.temp_allocator)
-	if eerr != nil {
-		fail(r, "%s: cannot read the environment: %v", name, eerr)
-		return
-	}
-	kept := make([dynamic]string, 0, len(inherited) + 1, context.temp_allocator)
-	for kv in inherited {
-		if !strings.has_prefix(kv, "OPENSSL_CONF=") {
-			append(&kept, kv)
-		}
-	}
-	append(&kept, fmt.tprintf("OPENSSL_CONF=%s", path))
-	return kept[:], true
-}
-
-// Write `text` to `file` in the work directory and return its path.
-@(private = "file")
-write_conf :: proc(r: ^Runner, name, file, text: string) -> (path: string, ok: bool) {
-	path = filepath.join({r.work_dir, file}, context.temp_allocator) or_else ""
-	if werr := os.write_entire_file(path, transmute([]u8)text); werr != nil {
-		fail(r, "%s: cannot write %s: %v", name, path, werr)
-		return "", false
-	}
-	return path, true
-}
-
-/*
 Start the server with OPENSSL_CONF naming `conf`, and check its DoT listener
 answers. `srv` is the started server for the caller to stop; `ok` false means
 the case has already failed.
 */
 @(private = "file")
 start_with_conf :: proc(r: ^Runner, name, conf: string) -> (srv: Server, ok: bool) {
-	env := env_with_openssl_conf(r, name, conf) or_return
+	// The suite's own OPENSSL_CONF, if it has one, is dropped for the case's.
+	env := environ_without(r, name, {"OPENSSL_CONF="}, extra = 1) or_return
+	append(&env, fmt.tprintf("OPENSSL_CONF=%s", conf))
 	udp_port, dot_port := next_port(r), next_port(r)
 	srv = start_server(
 		r,
-		Server_Options{config = openssl_conf_config(r, udp_port, dot_port), udp_port = udp_port, dot_port = dot_port, env = env},
+		Server_Options{config = openssl_conf_config(r, udp_port, dot_port), udp_port = udp_port, dot_port = dot_port, env = env[:]},
 	) or_return
 	res := query_dot(dot_port, build_query("conf.test.", u16(dns.Type.A), allocator = context.temp_allocator), context.temp_allocator)
 	if !check(r, res.ok, "%s: no answer over DoT; log:\n%s", name, read_log(&srv)) {
@@ -120,9 +86,8 @@ start_with_conf :: proc(r: ^Runner, name, conf: string) -> (srv: Server, ok: boo
 run_openssl_conf_cases :: proc(r: ^Runner) {
 	{
 		NAME :: "tls: a dynamic build applies the host's openssl.cnf, the static build does not (#512)"
-		static, static_ok := binary_is_static(r, NAME)
-		conf, conf_ok := write_conf(r, NAME, "openssl-capped.cnf", CAPPED_CONF)
-		if static_ok && conf_ok {
+		static := r.static
+		if conf, conf_ok := write_work_file(r, "openssl-capped.cnf", CAPPED_CONF); conf_ok {
 			start_case(r, NAME)
 			if srv, ok := start_with_conf(r, NAME, conf); ok {
 				defer stop_server(&srv)
@@ -137,9 +102,8 @@ run_openssl_conf_cases :: proc(r: ^Runner) {
 	}
 	{
 		NAME :: "tls: an openssl.cnf OpenSSL refuses is warned about by a dynamic build, and DoT still serves (#512)"
-		static, static_ok := binary_is_static(r, NAME)
-		conf, conf_ok := write_conf(r, NAME, "openssl-refused.cnf", REFUSED_CONF)
-		if static_ok && conf_ok {
+		static := r.static
+		if conf, conf_ok := write_work_file(r, "openssl-refused.cnf", REFUSED_CONF); conf_ok {
 			start_case(r, NAME)
 			if srv, ok := start_with_conf(r, NAME, conf); ok {
 				defer stop_server(&srv)
