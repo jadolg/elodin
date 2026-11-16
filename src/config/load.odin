@@ -689,7 +689,8 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 }
 
 /*
-Read `server.identity`: bare `version`, bare `off`, or a quoted text - quoted, so that a text of "off" or "version" can
+Read `server.identity`: bare `version`, bare `off`, or a quoted text; null, as
+for every optional scalar, leaves the default - quoted, so that a text of "off" or "version" can
 be written, as BIND's `version` statement tells `none` from `"none"`. A bare
 word that is neither, in any case, is refused rather than taken as a text or as
 whatever YAML would read it as: a misspelt `of` would otherwise be answered to
@@ -700,10 +701,10 @@ terminal, and fits one <character-string> (RFC 1035 3.3).
 @(private)
 load_identity :: proc(l: ^Loader, n: ^yaml.Node, cfg: ^Config) {
 	child := yaml.get(n, "identity")
-	if child == nil {
+	if yaml.is_null(child) {
 		return
 	}
-	if child.kind != .Scalar || yaml.is_null(child) {
+	if child.kind != .Scalar {
 		errorf(l, "server.identity: expected version, off, or a quoted text")
 		return
 	}

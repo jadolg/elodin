@@ -37,7 +37,7 @@ directions, [EDNS(0) padding](edns.md#edns-padding) in both directions on DoT an
 on neither of the clear transports, the
 [connection idle timeout](edns.md#telling-a-client-how-long-its-connection-is-held) told
 to a TCP or DoT client that asks for it, truncation with the TC bit and the
-UDP→TCP retry, `version.bind`/`hostname.bind` in the CHAOS class (or withheld, see
+UDP→TCP retry, `version.bind`/`version.server`/`hostname.bind`/`id.server` in the CHAOS class (or withheld, see
 [`server.identity`](access-control.md#what-it-says-about-itself)), local answers for
 `resolver.arpa`, with this server's own DoT/DoH endpoints designated over
 [DDR](doh.md#discovery-by-clients-ddr) when `ddr.name` is set, refusal of zone-transfer requests, and the reserved names of

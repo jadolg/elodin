@@ -98,7 +98,8 @@ server:
   # and metrics answers.
   #
   #   version     "elodin <version>" on the version names, "elodin" on the
-  #               others, and Server: elodin/<version>. The default.
+  #               others, and Server: elodin/<version> (elodin over
+  #               HTTP/2). The default.
   #   "text"      that text on all four names, and no Server field. Quoted;
   #               printable ASCII, 1 to 255 bytes.
   #   off         all four names refused (REFUSED, logged detail=chaos), and no

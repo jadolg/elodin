@@ -1077,13 +1077,18 @@ refuse_http_request :: proc(conn: Conn, who: string, status: int, method: string
 	http_linger(conn, HTTP_LINGER_BODY_IDLE)
 }
 
-// The `Server` field's value under `server.identity: version`.
+/*
+The `Server` field's value under `server.identity: version`: the build on an
+HTTP/1.1 200, and the product alone on every HTTP/2 response.
+*/
 @(private)
 SERVER_FIELD :: "elodin/" + VERSION
+@(private)
+H2_SERVER_FIELD :: "elodin"
 
 /*
-The `Server` field a 200 carries, over HTTP/1.1 and HTTP/2 alike: `SERVER_FIELD`
-under `server.identity: version`, and "" - no field - under any other setting,
+The `Server` field an HTTP/1.1 200 carries: `SERVER_FIELD` under
+`server.identity: version`, and "" - no field - under any other setting,
 which RFC 9110 section 10.2.4 allows. A text the operator chose for the CHAOS
 names is not a `product` token, and is not put in a header field.
 */

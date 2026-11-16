@@ -65,7 +65,7 @@ DoH and metrics answers. It applies on reload.
 
 | Value | CHAOS names | `Server` field |
 |---|---|---|
-| `version` (default) | `elodin <version>` on the version names, `elodin` on the others | `elodin/<version>` |
+| `version` (default) | `elodin <version>` on the version names, `elodin` on the others | `elodin/<version>` on an HTTP/1.1 answer, `elodin` over HTTP/2 |
 | `"text"` (quoted) | the text, on all four | none |
 | `off` | REFUSED, logged `outcome=refused detail=chaos` | none |
 

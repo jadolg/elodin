@@ -164,7 +164,7 @@ h2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	// The access list in effect, which a reload may have narrowed since this
 	// connection was accepted; see `stream_source_allowed`.
 	if !stream_source_allowed(ctx.server, ctx.peer, .DoH) {
-		h2.respond(hc, req.stream_id, h2.Response{status = 403})
+		h2_respond(ctx, hc, req.stream_id, h2.Response{status = 403})
 		h2.request_destroy(hc, req)
 		// Then closed, as over HTTP/1.1 and as the accept loop would have: a
 		// source outside the list does not keep one of `max_connections`. On the
@@ -338,7 +338,7 @@ h2_shed :: proc(
 			max_pending,
 		)
 	}
-	h2.respond(hc, req.stream_id, h2.Response{status = 503})
+	h2_respond(ctx, hc, req.stream_id, h2.Response{status = 503})
 	h2.request_destroy(hc, req)
 }
 
@@ -379,7 +379,7 @@ h2_rate_limited :: proc(ctx: ^H2_Context, hc: ^h2.Conn, req: ^h2.Request) {
 		"doh/h2: refusing a request from %s, its prefix is over server.rate_limit.responses_per_second - or, where server.rate_limit.overrides names this client's network, over that entry's figure",
 		ctx.client,
 	)
-	h2.respond(hc, req.stream_id, h2.Response{status = 429})
+	h2_respond(ctx, hc, req.stream_id, h2.Response{status = 429})
 	h2.request_destroy(hc, req)
 }
 
@@ -427,7 +427,20 @@ h2_answer :: proc(data: rawptr, pool := dnssec.Walk_Pool.Shared) {
 	// A body waits on the client's flow-control credit, up to the write timeout,
 	// parked: a client that stops reading holds this query in flight and its
 	// fiber, and nothing else.
-	h2.respond(hc, req.stream_id, resp)
+	h2_respond(ctx, hc, req.stream_id, resp)
+}
+
+/*
+`h2.respond`, with the `server` field `server.identity` decides: `H2_SERVER_FIELD`
+on every response under `version`, and none under any other setting.
+*/
+@(private)
+h2_respond :: proc(ctx: ^H2_Context, hc: ^h2.Conn, stream_id: u32, resp: h2.Response) {
+	resp := resp
+	if server_field(ctx.server) != "" {
+		resp.server = H2_SERVER_FIELD
+	}
+	h2.respond(hc, stream_id, resp)
 }
 
 /*
@@ -486,7 +499,6 @@ build_h2_response :: proc(
 				status = 200,
 				content_type = DOH_MOBILECONFIG_CONTENT_TYPE,
 				content_disposition = PROFILE_DISPOSITION,
-				server = server_field(ctx.server),
 				body = profile,
 			},
 			true
@@ -521,7 +533,6 @@ build_h2_response :: proc(
 			status = 200,
 			content_type = DOH_CONTENT_TYPE,
 			cache_control = doh_cache_control(max_age),
-			server = server_field(ctx.server),
 			body = answer,
 		},
 		true

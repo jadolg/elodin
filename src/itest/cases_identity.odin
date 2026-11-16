@@ -16,11 +16,12 @@ run_identity_cases :: proc(r: ^Runner) {
 		// `prefix`; "" is REFUSED.
 		text:          string,
 		prefix:        bool,
-		// What a DoH answer's `Server` field starts with; "" is no field.
-		server:        string,
+		// What a DoH/1.1 answer's `Server` field starts with, and what DoH/2's
+		// `server` is; "" is no field.
+		server, h2:    string,
 	}
 	cases := []Case {
-		{name = "server.identity unset: the build, on both (#261)", text = "elodin ", prefix = true, server = "elodin/"},
+		{name = "server.identity unset: the build, on both (#261)", text = "elodin ", prefix = true, server = "elodin/", h2 = "elodin"},
 		{name = "server.identity text: the text, and no Server field (#261)", setting = `"resolver"`, text = "resolver"},
 		{name = "server.identity off: REFUSED with detail=chaos, and no Server field (#261)", setting = "off"},
 	}
@@ -90,11 +91,7 @@ run_identity_cases :: proc(r: ^Runner) {
 			res, found := h2_stream(c2, 1)
 			if check(r, found && res.status == 200, "DoH/2: stream 1 (found %v) is not a 200", found) {
 				server := h2_header_value(res, "server")
-				if c.server != "" {
-					check(r, strings.has_prefix(server, c.server), "DoH/2: server field %q, want %q...", server, c.server)
-				} else {
-					check(r, server == "", "DoH/2: sends a server field %q", server)
-				}
+				check(r, server == c.h2, "DoH/2: server field %q, want %q", server, c.h2)
 			}
 		}
 	}

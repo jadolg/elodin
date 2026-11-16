@@ -30,9 +30,12 @@ test_server_identity_reads_its_three_modes :: proc(t: ^testing.T) {
 		testing.expectf(t, cfg.server.identity_text == c.text, "%s: text %q, want %q", c.value, cfg.server.identity_text, c.text)
 	}
 
-	cfg, ok := expect_loads(t, MINIMAL)
-	if ok {
-		testing.expectf(t, cfg.server.identity == .Version, "unset: mode %v, want Version", cfg.server.identity)
+	// Unset and null both leave the default.
+	for src in ([]string{MINIMAL, MINIMAL + "server:\n  identity: ~\n", MINIMAL + "server:\n  identity:\n"}) {
+		cfg, ok := expect_loads(t, src)
+		if ok {
+			testing.expectf(t, cfg.server.identity == .Version, "%q: mode %v, want Version", src, cfg.server.identity)
+		}
 	}
 }
 
@@ -56,7 +59,6 @@ test_server_identity_refuses_what_it_cannot_answer :: proc(t: ^testing.T) {
 		{"\"café\"", "byte 0xc3"},
 		{"[x]", "expected version, off, or a quoted text"},
 		{"{x: y}", "expected version, off, or a quoted text"},
-		{"~", "expected version, off, or a quoted text"},
 	}
 	for c in cases {
 		src := strings.concatenate({MINIMAL, "server:\n  identity: ", c.value, "\n"}, context.temp_allocator)
