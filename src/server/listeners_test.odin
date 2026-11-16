@@ -8,6 +8,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:dns"
+import "elodin:h2"
 import "elodin:loop"
 import "elodin:tlsx"
 
@@ -350,7 +351,7 @@ test_a_connection_accepted_during_shutdown_is_dropped :: proc(t: ^testing.T) {
 	testing.expect_value(t, sync.atomic_load(&s.stats.conn_failed), u64(0))
 }
 
-// A table of its own rather than `month_name`'s: this reads the date back, and a
+// A table of its own rather than `h2.MONTH_NAMES`: this reads the date back, and a
 // reader sharing the writer's table would agree with it however it was ordered.
 @(private = "file")
 month_number :: proc(name: string) -> int {
@@ -408,7 +409,8 @@ test_now_http_date_weekday_matches_the_date :: proc(t: ^testing.T) {
 	// reordered the same way in both places would otherwise still agree with
 	// itself. test_now_http_date_epoch_is_a_known_thursday below is what
 	// actually catches that.
-	expected := WEEKDAY_NAMES[int(time.weekday(parsed))]
+	day_names := h2.DAY_NAMES
+	expected := day_names[int(time.weekday(parsed))]
 
 	testing.expectf(
 		t,
@@ -420,7 +422,7 @@ test_now_http_date_weekday_matches_the_date :: proc(t: ^testing.T) {
 }
 
 /*
-An oracle independent of `weekday_name`'s own table: the Unix epoch is a well
+An oracle independent of `h2.DAY_NAMES`: the Unix epoch is a well
 known Thursday, so the expected string here is a literal, not anything
 derived from the table under test. A table that agrees with itself while
 being wrong - every name shifted one place, say - would pass the test above

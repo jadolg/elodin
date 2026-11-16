@@ -362,7 +362,7 @@ left holding.
 `http_exchange` documents the body as the only thing the caller owns, so once
 that is released a correct exchange has nothing outstanding.
 */
-@(private = "file")
+@(private)
 exchange_against :: proc(
 	t: ^testing.T,
 	reply: string,

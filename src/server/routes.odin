@@ -704,9 +704,11 @@ first while the memory holds. The client is handed what it would have been hande
 after the wait, `unproven_apex_ds` travels with it exactly as it does when the
 parent's group is parked, and the store refuses it for the same reason - so
 nothing reaches the cache that the no-store rule would have kept out of it. The
-window is `upstream.COOLDOWN`, the clock the parked-group skip already runs on,
-so a parent that recovers is asked again within ten seconds of doing so and the
-proof is back in the client's hands.
+window is `upstream.COOLDOWN`, the shortest a parked member is skipped for, so
+a parent that recovers is asked again within ten seconds of doing so and the
+proof is back in the client's hands. A parent whose `Retry-After` skips it for
+longer leaves the memo to expire first, and the parked-group skip carries on
+from there.
 
 A parent that does settle clears its slot rather than leaving it to expire: the
 question was asked, the answer arrived, and the memory of the last failure has

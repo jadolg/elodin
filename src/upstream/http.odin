@@ -376,8 +376,9 @@ Http_Response :: struct {
 	location: string,
 	// Whether the server agreed to keep the connection open.
 	keep_alive: bool,
-	// The final response's `Retry-After` in seconds from its arrival, or zero
-	// for none or one that did not parse; see `h2.parse_retry_after`.
+	// The final response's `Retry-After` in seconds from its arrival, when its
+	// status is one `h2.status_asks_to_wait` names; zero for none, or one that
+	// did not parse. See `h2.parse_retry_after`.
 	retry_after: u32,
 }
 
@@ -619,10 +620,11 @@ http_exchange :: proc(
 				}
 			case dns.name_equal_fold(name, "retry-after"):
 				// Not a list (RFC 9110 10.2.3), so the first one is the one; and
-				// an interim response's is not the answer's.
-				if !seen_retry && resp.status >= 200 {
+				// read only where the status gives it a meaning, which an interim
+				// response's never does.
+				if !seen_retry && h2.status_asks_to_wait(resp.status) {
 					seen_retry = true
-					resp.retry_after, _ = h2.parse_retry_after(value, loop.now()) // lint:allow an HTTP-date is a wall-clock instant (RFC 9110 5.6.7)
+					resp.retry_after, _ = h2.retry_after_now(value)
 				}
 			}
 		}

@@ -135,7 +135,8 @@ Client_Response :: struct {
 	status:      int,
 	body:        []u8,
 	// The final response's `retry-after` (RFC 9110 10.2.3) in seconds from its
-	// arrival, or zero for none or one that did not parse; see `parse_retry_after`.
+	// arrival, when its status is one `status_asks_to_wait` names; zero for none,
+	// or one that did not parse. See `parse_retry_after`.
 	retry_after: u32,
 }
 
@@ -610,7 +611,6 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 			ordinary fields are held to 8.2 as the trailers are.
 			*/
 			s.status = 0
-			s.retry_after = 0
 			seen_status, seen_regular, seen_retry := false, false, false
 			for f in headers {
 				if len(f.name) > 0 && f.name[0] == ':' {
@@ -625,10 +625,12 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 					if field_is_malformed(f) {
 						malformed = true
 					}
-					// Not a list (RFC 9110 10.2.3), so the first one is the one.
-					if f.name == "retry-after" && !seen_retry {
+					// Not a list (RFC 9110 10.2.3), so the first one is the one; and
+					// read only where the status gives it a meaning, which `:status`,
+					// ahead of every ordinary field, has already said.
+					if f.name == "retry-after" && !seen_retry && status_asks_to_wait(s.status) {
 						seen_retry = true
-						s.retry_after, _ = parse_retry_after(f.value, loop.now()) // lint:allow an HTTP-date is a wall-clock instant (RFC 9110 5.6.7)
+						s.retry_after, _ = retry_after_now(f.value)
 					}
 				}
 			}

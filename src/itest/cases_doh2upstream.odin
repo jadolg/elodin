@@ -234,9 +234,9 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 	/*
 	RFC 6585 4 and RFC 9110 15.6.4: the upstream is up and refusing this server.
 	Its failures are a kind of their own, the log names the status and the
-	`Retry-After` it sent, and the run that parks it parks it for that long
-	(RFC 9110 10.2.3) rather than the fixed cooldown (#258). Over both versions
-	of the protocol, each with its own way of carrying the field.
+	`Retry-After` it sent, and that parks it at once for as long as it asks (RFC
+	9110 10.2.3), so the queries after the first are not sent to it (#258). Over
+	both versions of the protocol, each with its own way of carrying the field.
 	*/
 	{
 		Throttle_Case :: struct {
@@ -285,11 +285,14 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 					)
 					check(
 						r,
-						wait_for_log(&srv, "upstream busy: 3 consecutive failures (last: Throttled), pausing it for 2m0s", 3 * time.Second),
+						wait_for_log(&srv, fmt.tprintf("upstream busy: HTTP %d asks to be left for 2m0s, pausing it for 2m0s", tc.status), 3 * time.Second),
 						"the upstream was not parked for its Retry-After",
 					)
-					// Every refusal the mock sent, and nothing else: an absent kind is -1.
+					// Asked once: the refusal parked it, and `attempts: 1` gives up on a
+					// group whose every member is parked rather than asking it again.
 					h2_hits, h1_hits := doh2_mock_counts(mock)
+					check_eq_int(r, h2_hits + h1_hits, 1, "queries sent to an upstream that asked to be left alone")
+					// Every refusal the mock sent, and nothing else: an absent kind is -1.
 					page := metrics_page(metrics_port)
 					check_eq_int(r, metric_value(page, `elodin_upstream_failure_kind_total{upstream="busy",error="throttled"}`), h2_hits + h1_hits, "throttled failures")
 					check_eq_int(r, metric_value(page, `elodin_upstream_failure_kind_total{upstream="busy",error="http_error"}`), -1, "http_error failures")

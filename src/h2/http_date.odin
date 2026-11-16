@@ -1,18 +1,39 @@
 package h2
 
+import "core:fmt"
 import "core:time"
 import dt "core:time/datetime"
+import "elodin:loop"
+
+/*
+Whether a response with this status is the server declining the request for
+now, so that its `Retry-After` says how long to wait: 429 Too Many Requests
+(RFC 6585 4) and 503 Service Unavailable (RFC 9110 15.6.4).
+*/
+status_asks_to_wait :: proc(status: int) -> bool {
+	return status == 429 || status == 503
+}
+
+/*
+`parse_retry_after` against the wall clock as it reads now, which is when the
+response carrying `value` was received. The one place either HTTP client reads
+that clock: an HTTP-date names an instant on it (RFC 9110 5.6.7).
+*/
+retry_after_now :: proc(value: string) -> (seconds: u32, ok: bool) {
+	now := time.time_to_datetime(loop.now()) or_return // wall-clock: an HTTP-date is an instant on it
+	return parse_retry_after(value, now)
+}
 
 /*
 RFC 9110 10.2.3: a `Retry-After` value, `HTTP-date / delay-seconds`, as the
 whole seconds from `now` it names. `now` is when the response was received,
-which delay-seconds counts from; a date is measured from it on the wall clock.
+which delay-seconds counts from.
 
 A date already past is zero, and a wait past what a `u32` holds comes back as
 `max(u32)`, so a caller's own bound sees it and nothing wraps on the way. A value
 that is neither form is refused.
 */
-parse_retry_after :: proc(value: string, now: time.Time) -> (seconds: u32, ok: bool) { // lint:allow an HTTP-date is a wall-clock instant
+parse_retry_after :: proc(value: string, now: dt.DateTime) -> (seconds: u32, ok: bool) {
 	if digits_only(value) {
 		// RFC 9110 10.2.3: `delay-seconds = 1*DIGIT`, read without the sign,
 		// base prefix and separators `strconv` would take.
@@ -23,8 +44,7 @@ parse_retry_after :: proc(value: string, now: time.Time) -> (seconds: u32, ok: b
 		return u32(s), true
 	}
 	at := parse_http_date(value, now) or_return
-	from := time.time_to_datetime(now) or_return
-	delta, err := dt.sub(at, from)
+	delta, err := dt.sub(at, now)
 	if err != .None {
 		return 0, false
 	}
@@ -42,10 +62,11 @@ as a calendar moment in UTC.
 The names are case-sensitive, as the grammar's `%s` strings are. The day name is
 held to the list and not to the date, which the RFC does not ask a recipient to
 check. A second of 60 is the leap second the grammar allows, read as the first
-second of the next minute. `now` decides the century of the RFC 850 form's two
+second of the next minute. A moment past year 9999, which four digits of
+year cannot hold, is refused. `now` decides the century of the RFC 850 form's two
 digit year.
 */
-parse_http_date :: proc(value: string, now: time.Time) -> (moment: dt.DateTime, ok: bool) { // lint:allow an HTTP-date is a wall-clock instant
+parse_http_date :: proc(value: string, now: dt.DateTime) -> (moment: dt.DateTime, ok: bool) {
 	year, month, day: i64
 	clock: string
 	switch {
@@ -86,11 +107,10 @@ parse_http_date :: proc(value: string, now: time.Time) -> (moment: dt.DateTime, 
 		it is read as the one year with those digits from 49 years back to 50
 		on. Judged by year, which is as fine as two digits can be read.
 		*/
-		this_year, _, _ := time.date(now)
-		year = i64(this_year) / 100 * 100 + yy
-		if year > i64(this_year) + 50 {
+		year = now.year / 100 * 100 + yy
+		if year > now.year + 50 {
 			year -= 100
-		} else if year < i64(this_year) - 49 {
+		} else if year < now.year - 49 {
 			year += 100
 		}
 		clock = rest[12:20]
@@ -115,17 +135,42 @@ parse_http_date :: proc(value: string, now: time.Time) -> (moment: dt.DateTime, 
 			return
 		}
 	}
+	// Past 9999 is a moment no HTTP-date can write: the leap second of its last
+	// minute, or an RFC 850 year read into the next century.
+	if m.year > 9999 {
+		return
+	}
 	return m, true
 }
 
-@(private = "file")
-DAY_NAMES :: [7]string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
+/*
+`at` as an RFC 9110 5.6.7 IMF-fixdate, the form a sender generates. `at` is a
+valid date in years 0 to 9999, which is what the four digits hold.
+*/
+format_http_date :: proc(at: dt.DateTime, allocator := context.allocator) -> string {
+	ordinal, _ := dt.date_to_ordinal(at.date)
+	day_names, month_names := DAY_NAMES, MONTH_NAMES
+	return fmt.aprintf(
+		"%s, %02d %s %04d %02d:%02d:%02d GMT",
+		day_names[int(dt.day_of_week(ordinal))],
+		at.day,
+		month_names[at.month - 1],
+		at.year,
+		at.hour,
+		at.minute,
+		at.second,
+		allocator = allocator,
+	)
+}
 
-@(private = "file")
-DAY_NAMES_LONG :: [7]string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
+// RFC 9110 5.6.7's `day-name`, indexed by `time.Weekday` and `datetime.Weekday`.
+DAY_NAMES :: [7]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
 
-@(private = "file")
+// RFC 9110 5.6.7's `month`, January first.
 MONTH_NAMES :: [12]string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+
+@(private = "file")
+DAY_NAMES_LONG :: [7]string{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"}
 
 @(private = "file")
 day_name_is :: proc(s: string, long: bool) -> bool {

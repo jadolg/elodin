@@ -168,7 +168,7 @@ run = [
   # short or long. Deadlines are `time.Tick`; stored moments `loop.Moment`.
   # `loop.now` and `loop.since` are the same wall clock read through the vDSO.
   # A line reading a wall-clock instant rather than a duration, such as an
-  # HTTP-date, says so with `lint:allow <reason>`.
+  # HTTP-date, says so with `wall-clock: <reason>`.
   """
   rc=0
   hits=$(grep -rnE '\\b(time|loop)\\.(now|since)\\(|\\btime\\.(diff|time_add)\\(|\\btime\\.Time\\b' src/upstream src/h2 \\
@@ -177,7 +177,7 @@ run = [
     echo 'the tick-clock gate could not search src' >&2
     exit 1
   fi
-  hits=$(printf '%s\\n' "$hits" | grep -vE 'lint:allow[[:space:]]+[^[:space:]]') || true
+  hits=$(printf '%s\\n' "$hits" | grep -vE 'wall-clock:[[:space:]]+[^[:space:]]') || true
   if [ -n "$hits" ]; then
     printf '%s\\n' "$hits" >&2
     echo 'measure durations in upstream and h2 on time.Tick or loop.Moment, not the wall clock' >&2

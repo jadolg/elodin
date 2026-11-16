@@ -443,7 +443,7 @@ a 200 too short to be a DNS message included.
 */
 @(private)
 doh_refusal :: proc(u: ^Upstream, status: int, retry_after: u32) -> Error {
-	if status != 429 && status != 503 {
+	if !h2.status_asks_to_wait(status) {
 		return .HTTP_Error
 	}
 	note_throttled(u, status, retry_after)
