@@ -10,6 +10,7 @@ import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
 import "elodin:metrics"
+import "elodin:tlsx"
 
 /*
 Test harness.
@@ -279,7 +280,7 @@ run_binary :: proc(r: ^Runner, args: []string, tag: string) -> Run_Result {
 }
 
 // How a static build's `--version` line ends; see `openssl_build` in src/main.
-STATIC_MARK :: ", static)"
+STATIC_MARK :: ", " + tlsx.STATIC_LABEL + ")"
 
 /*
 Whether the binary under test is the static build, which carries musl and its

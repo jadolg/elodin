@@ -127,6 +127,10 @@ same moment.
 */
 STATIC :: #config(ELODIN_STATIC, false)
 
+// What `--version` puts after a static build's OpenSSL version, and what tells
+// the integration suite which build it is driving.
+STATIC_LABEL :: "static"
+
 @(private)
 INIT_FLAGS :: OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS | (OPENSSL_INIT_NO_LOAD_CONFIG when STATIC else 0)
 

@@ -156,6 +156,10 @@ main :: proc() {
 	static, static_ok := binary_is_static(&r)
 	if !static_ok {
 		fmt.eprintfln("itest: %s --version failed", r.binary)
+		// os.exit runs no defers.
+		if !keep {
+			remove_work_dir(work_dir)
+		}
 		os.exit(2)
 	}
 	r.static = static

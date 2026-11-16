@@ -109,10 +109,11 @@ run_openssl_conf_cases :: proc(r: ^Runner) {
 				defer stop_server(&srv)
 				warned := log_contains(&srv, REFUSED_WARNING)
 				check(r, warned == !static, "static %v: warned %v; log:\n%s", static, warned, read_log(&srv))
-				if !static {
-					// OpenSSL's own reason rides along, so the operator knows what to fix.
-					check(r, log_contains(&srv, "unknown option"), "the warning does not carry OpenSSL's reason; log:\n%s", read_log(&srv))
-				}
+				// OpenSSL's own reason rides along, so the operator knows what to
+				// fix; a static build, which never reads the file, has none to log
+				// under any wording.
+				reason := log_contains(&srv, "unknown option")
+				check(r, reason == !static, "static %v: OpenSSL's reason logged %v; log:\n%s", static, reason, read_log(&srv))
 			}
 			end_case(r)
 		}

@@ -642,14 +642,21 @@ The OpenSSL this binary runs with, and "static" when it carries its own (see
 @(private)
 openssl_build :: proc(allocator := context.allocator) -> string {
 	if tlsx.STATIC {
-		return strings.concatenate({tlsx.openssl_version(), ", static"}, allocator)
+		return strings.concatenate({tlsx.openssl_version(), ", ", tlsx.STATIC_LABEL}, allocator)
 	}
 	return tlsx.openssl_version()
 }
 
-// Said at startup when OpenSSL refused its configuration file; see `tlsx.init`.
+/*
+Said at startup when OpenSSL's initialisation failed; see `tlsx.init`. A dynamic
+build reads the host's configuration file, the usual cause; a static build
+reads none, so its warning names no file.
+*/
 @(private)
 openssl_init_warning :: proc(problem: string, allocator := context.allocator) -> string {
+	if tlsx.STATIC {
+		return fmt.aprintf("OpenSSL could not initialise: %s", problem, allocator = allocator)
+	}
 	return fmt.aprintf(
 		"OpenSSL could not apply its configuration (the system openssl.cnf, or OPENSSL_CONF): %s; what that file sets, such as a system-wide crypto policy, may not be in force",
 		problem,

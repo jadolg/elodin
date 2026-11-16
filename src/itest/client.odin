@@ -792,7 +792,10 @@ tls_resumes :: proc(port: int, version: int, alpn: []string, request: []u8) -> (
 	defer if session != nil {tlsx.SSL_SESSION_free(session)}
 	for round in 0 ..< 2 {
 		conn := raw_tls_connect(ctx, port, session) or_return
-		defer raw_tls_close(conn)
+		// close_notify only after a round that went through: SSL_shutdown(3)
+		// is not to follow a fatal error.
+		completed := false
+		defer raw_tls_close(conn, shutdown = completed)
 		if tlsx.SSL_write(conn.ssl, raw_data(request), c.int(len(request))) != c.int(len(request)) {
 			return
 		}
@@ -800,6 +803,7 @@ tls_resumes :: proc(port: int, version: int, alpn: []string, request: []u8) -> (
 		if tlsx.SSL_read(conn.ssl, &b, 1) != 1 {
 			return
 		}
+		completed = true
 		reused = tlsx.SSL_session_reused(conn.ssl) == 1
 		if round == 0 {
 			session = tlsx.SSL_get1_session(conn.ssl)

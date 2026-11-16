@@ -34,14 +34,12 @@ if command -v chronyc >/dev/null && tracking=$(chronyc tracking 2>/dev/null); th
 		exit 1
 	fi
 elif command -v timedatectl >/dev/null; then
-	# Only a "no" refuses: a timedatectl that cannot answer (no systemd as PID
-	# 1, a container) says nothing about the clock, as a missing chronyc does not.
+	# Only chronyc measures an offset, so only it refuses. timedatectl says
+	# whether the kernel was told it is synchronised, which a correct clock
+	# kept by a hypervisor or openntpd is not, so its "no" is a warning.
 	case "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" in
-	no)
-		echo "push-gate: the clock is not NTP-synchronised (timedatectl); synchronise it first" >&2
-		exit 1
-		;;
 	yes) ;;
+	no) echo "push-gate: timedatectl says the clock is not NTP-synchronised; deadline tests and gh's TLS fail on a skewed one" >&2 ;;
 	*) echo "push-gate: neither chronyc nor timedatectl can say how the clock stands; not checking it" >&2 ;;
 	esac
 fi
