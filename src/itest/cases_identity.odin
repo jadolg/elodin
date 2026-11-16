@@ -12,15 +12,17 @@ the query log records it, and whether a DoH answer names the build in `Server`.
 run_identity_cases :: proc(r: ^Runner) {
 	Case :: struct {
 		name, setting: string,
-		// The TXT version.bind answers with; "" is REFUSED.
+		// The TXT version.bind answers with, or what it starts with given
+		// `prefix`; "" is REFUSED.
 		text:          string,
-		// What a DoH answer's `Server` field is; "" is no field.
+		prefix:        bool,
+		// What a DoH answer's `Server` field starts with; "" is no field.
 		server:        string,
 	}
 	cases := []Case {
-		{"server.identity unset: the build, on both (#261)", "", "elodin ", "Server: elodin/"},
-		{"server.identity text: the text, and no Server field (#261)", `"resolver"`, "resolver", ""},
-		{"server.identity off: REFUSED with detail=chaos, and no Server field (#261)", "off", "", ""},
+		{name = "server.identity unset: the build, on both (#261)", text = "elodin ", prefix = true, server = "elodin/"},
+		{name = "server.identity text: the text, and no Server field (#261)", setting = `"resolver"`, text = "resolver"},
+		{name = "server.identity off: REFUSED with detail=chaos, and no Server field (#261)", setting = "off"},
 	}
 	for c in cases {
 		start_case(r, c.name)
@@ -60,19 +62,39 @@ run_identity_cases :: proc(r: ^Runner) {
 			} else if decoded && check(r, len(msg.answer) == 1, "%d answers, want one TXT", len(msg.answer)) {
 				txt, is_txt := msg.answer[0].data.(dns.Rdata_TXT)
 				if check(r, is_txt && len(txt.strings) == 1, "the answer is not one TXT string: %v", msg.answer[0]) {
-					check(r, strings.has_prefix(txt.strings[0], c.text), "version.bind answered %q, want %q", txt.strings[0], c.text)
+					matched := strings.has_prefix(txt.strings[0], c.text) if c.prefix else txt.strings[0] == c.text
+					check(r, matched, "version.bind answered %q, want %q (prefix %v)", txt.strings[0], c.text, c.prefix)
 				}
 			}
 		}
 		check(r, wait_for_log_count(&srv, want_line, before + 1, 5 * time.Second), "no query line with %q:\n%s", want_line, read_log(&srv))
 
-		// A DoH answer from the cache-free local path: the same CHAOS query.
-		doh := doh_post(doh_port, "/dns-query", build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH)), context.temp_allocator)
-		if check(r, doh.ok && doh.status == 200, "DoH: status %d (ok %v), want 200", doh.status, doh.ok) {
+		// DoH answers to the same local query, over HTTP/1.1 and HTTP/2.
+		query := build_query("version.bind.", u16(dns.Type.TXT), class = u16(dns.Class.CH))
+		doh := doh_post(doh_port, "/dns-query", query, context.temp_allocator)
+		if check(r, doh.ok && doh.status == 200, "DoH/1.1: status %d (ok %v), want 200", doh.status, doh.ok) {
 			if c.server != "" {
-				check(r, strings.contains(doh.headers, c.server), "DoH: the fields %q hold no %q", doh.headers, c.server)
+				want := strings.concatenate({"\r\nServer: ", c.server}, context.temp_allocator)
+				check(r, strings.contains(doh.headers, want), "DoH/1.1: the fields %q hold no %q", doh.headers, want)
 			} else {
-				check(r, !strings.contains(doh.headers, "Server:"), "DoH: the fields %q send a Server field", doh.headers)
+				check(r, !strings.contains(doh.headers, "Server:"), "DoH/1.1: the fields %q send a Server field", doh.headers)
+			}
+		}
+		c2, connected := h2_connect(doh_port)
+		if !check(r, connected, "DoH/2: cannot open a connection") {
+			continue
+		}
+		defer h2_close(c2)
+		if check(r, h2_send_request(c2, 1, "POST", "/dns-query", query), "DoH/2: cannot send the request") &&
+		   check(r, h2_collect(c2, []u32{1}), "DoH/2: stream 1 never completed") {
+			res, found := h2_stream(c2, 1)
+			if check(r, found && res.status == 200, "DoH/2: stream 1 (found %v) is not a 200", found) {
+				server := h2_header_value(res, "server")
+				if c.server != "" {
+					check(r, strings.has_prefix(server, c.server), "DoH/2: server field %q, want %q...", server, c.server)
+				} else {
+					check(r, server == "", "DoH/2: sends a server field %q", server)
+				}
 			}
 		}
 	}

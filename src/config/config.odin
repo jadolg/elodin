@@ -740,8 +740,9 @@ Server_Config :: struct {
 	sizing:                     Sizing,
 }
 
-// The bare word `server.identity` takes for `Identity.Version`.
+// The bare words `server.identity` takes for `Identity.Version` and `Identity.Off`.
 IDENTITY_VERSION :: "version"
+IDENTITY_OFF :: "off"
 
 /*
 `server.identity`.

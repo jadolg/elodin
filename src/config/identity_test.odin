@@ -15,7 +15,6 @@ test_server_identity_reads_its_three_modes :: proc(t: ^testing.T) {
 	cases := []Case {
 		{"version", .Version, ""},
 		{"off", .Off, ""},
-		{"false", .Off, ""},
 		{"\"resolver\"", .Text, "resolver"},
 		{"'off'", .Text, "off"},
 		{"\"version\"", .Text, "version"},
@@ -48,6 +47,9 @@ test_server_identity_refuses_what_it_cannot_answer :: proc(t: ^testing.T) {
 		{"true", "neither version nor off"},
 		{"of", "neither version nor off"},
 		{"Version", "neither version nor off"},
+		{"OFF", "neither version nor off"},
+		{"false", "neither version nor off"},
+		{"n", "neither version nor off"},
 		{"\"\"", "a text is 1 to"},
 		{strings.concatenate({"\"", strings.repeat("x", dns.MAX_CHARACTER_STRING + 1, context.temp_allocator), "\""}, context.temp_allocator), "a text is 1 to"},
 		{"\"tab\there\"", "byte 0x09"},

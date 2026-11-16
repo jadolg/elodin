@@ -689,11 +689,11 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 }
 
 /*
-Read `server.identity`: bare `version`, bare `off` (or another word YAML reads
-as false), or a quoted text - quoted, so that a text of "off" or "version" can
+Read `server.identity`: bare `version`, bare `off`, or a quoted text - quoted, so that a text of "off" or "version" can
 be written, as BIND's `version` statement tells `none` from `"none"`. A bare
-word that is neither is refused rather than taken as a text, since a misspelt
-`of` or a bare `true` would otherwise be answered to every client. The text is
+word that is neither, in any case, is refused rather than taken as a text or as
+whatever YAML would read it as: a misspelt `of` would otherwise be answered to
+every client, and a stray `n` would withhold what the operator meant to show. The text is
 printable ASCII, so that it reads the same in a TXT answer, a log line and a
 terminal, and fits one <character-string> (RFC 1035 3.3).
 */
@@ -712,7 +712,7 @@ load_identity :: proc(l: ^Loader, n: ^yaml.Node, cfg: ^Config) {
 			cfg.server.identity = .Version
 			return
 		}
-		if b, ok := yaml.as_bool(child); ok && !b {
+		if child.scalar == IDENTITY_OFF {
 			cfg.server.identity = .Off
 			return
 		}

@@ -486,6 +486,7 @@ build_h2_response :: proc(
 				status = 200,
 				content_type = DOH_MOBILECONFIG_CONTENT_TYPE,
 				content_disposition = PROFILE_DISPOSITION,
+				server = server_field(ctx.server),
 				body = profile,
 			},
 			true
@@ -520,6 +521,7 @@ build_h2_response :: proc(
 			status = 200,
 			content_type = DOH_CONTENT_TYPE,
 			cache_control = doh_cache_control(max_age),
+			server = server_field(ctx.server),
 			body = answer,
 		},
 		true

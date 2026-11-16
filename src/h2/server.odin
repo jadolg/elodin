@@ -72,6 +72,8 @@ Response :: struct {
 	content_disposition: string,
 	// The methods the target supports, which RFC 9110 15.5.6 requires on a 405.
 	allow:         string,
+	// The `server` field (RFC 9110 10.2.4); empty sends none.
+	server:        string,
 	// A reply to HEAD: no content (RFC 9110 9.3.2), and no content-length,
 	// which RFC 9110 8.6 allows only when it is what GET would have sent.
 	head:          bool,
@@ -1558,7 +1560,9 @@ respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
 		digits: [20]u8
 		encode_header(&block, "content-length", strconv.write_int(digits[:], i64(len(resp.body)), 10))
 	}
-	encode_header(&block, "server", "elodin")
+	if resp.server != "" {
+		encode_header(&block, "server", resp.server)
+	}
 
 	frame := headers_frame(stream_id, block[:], end_stream = len(resp.body) == 0)
 	if dry || frame == nil {
