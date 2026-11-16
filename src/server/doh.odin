@@ -1082,9 +1082,9 @@ The `Server` field's value under `server.identity: version`: the build on an
 HTTP/1.1 200, and the product alone on every HTTP/2 response.
 */
 @(private)
-SERVER_FIELD :: "elodin/" + VERSION
+SERVER_FIELD :: PRODUCT + "/" + VERSION
 @(private)
-H2_SERVER_FIELD :: "elodin"
+H2_SERVER_FIELD :: PRODUCT
 
 /*
 The `Server` field an HTTP/1.1 200 carries: `SERVER_FIELD` under

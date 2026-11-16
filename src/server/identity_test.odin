@@ -47,33 +47,34 @@ test_server_identity_decides_every_chaos_name :: proc(t: ^testing.T) {
 	s := local_server(&cfg)
 	defer free_all(context.temp_allocator)
 
-	for c in CHAOS_NAMES {
+	for c in CHAOS_NAMES do for type in ([]dns.Type{.TXT, .ANY}) {
 		cfg.server.identity, cfg.server.identity_text = .Version, ""
-		resp, outcome, ok := ask_local(&s, c.name, .TXT, class = .CH)
-		if !testing.expectf(t, ok, "%s, version: no answer", c.name) {
+		resp, outcome, ok := ask_local(&s, c.name, type, class = .CH)
+		if !testing.expectf(t, ok, "%s %v, version: no answer", c.name, type) {
 			continue
 		}
 		text, one := only_txt(resp)
-		testing.expectf(t, outcome == .Local && one && text == c.version_text, "%s, version: %v %q, want Local %q", c.name, outcome, text, c.version_text)
+		testing.expectf(t, outcome == .Local && one && text == c.version_text, "%s %v, version: %v %q, want Local %q", c.name, type, outcome, text, c.version_text)
 
 		cfg.server.identity, cfg.server.identity_text = .Text, "resolver"
-		resp, outcome, ok = ask_local(&s, c.name, .TXT, class = .CH)
-		if !testing.expectf(t, ok, "%s, text: no answer", c.name) {
+		resp, outcome, ok = ask_local(&s, c.name, type, class = .CH)
+		if !testing.expectf(t, ok, "%s %v, text: no answer", c.name, type) {
 			continue
 		}
 		text, one = only_txt(resp)
-		testing.expectf(t, outcome == .Local && one && text == "resolver", "%s, text: %v %q, want Local \"resolver\"", c.name, outcome, text)
+		testing.expectf(t, outcome == .Local && one && text == "resolver", "%s %v, text: %v %q, want Local \"resolver\"", c.name, type, outcome, text)
 
 		cfg.server.identity, cfg.server.identity_text = .Off, ""
-		resp, outcome, ok = ask_local(&s, c.name, .TXT, class = .CH)
-		if !testing.expectf(t, ok, "%s, off: no answer", c.name) {
+		resp, outcome, ok = ask_local(&s, c.name, type, class = .CH)
+		if !testing.expectf(t, ok, "%s %v, off: no answer", c.name, type) {
 			continue
 		}
 		testing.expectf(
 			t,
 			outcome == .Refused && resp.flags.rcode == u8(dns.Rcode.Refused) && len(resp.answer) == 0,
-			"%s, off: %v rcode %v with %d answers, want Refused and none",
+			"%s %v, off: %v rcode %v with %d answers, want Refused and none",
 			c.name,
+			type,
 			outcome,
 			resp.flags.rcode,
 			len(resp.answer),

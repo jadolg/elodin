@@ -689,14 +689,16 @@ load_rate_limit_overrides :: proc(l: ^Loader, rl: ^yaml.Node, cfg: ^Config) {
 }
 
 /*
-Read `server.identity`: bare `version`, bare `off`, or a quoted text; null, as
-for every optional scalar, leaves the default - quoted, so that a text of "off" or "version" can
-be written, as BIND's `version` statement tells `none` from `"none"`. A bare
-word that is neither, in any case, is refused rather than taken as a text or as
+Read `server.identity`: bare `version`, bare `off`, or a quoted text. Null, as
+for every optional scalar, leaves the default.
+
+A text is quoted so that one reading "off" or "version" can be written, as
+BIND's `version` statement tells `none` from `"none"`. A bare word that is
+neither mode, in any case, is refused rather than taken as a text or as
 whatever YAML would read it as: a misspelt `of` would otherwise be answered to
-every client, and a stray `n` would withhold what the operator meant to show. The text is
-printable ASCII, so that it reads the same in a TXT answer, a log line and a
-terminal, and fits one <character-string> (RFC 1035 3.3).
+every client, and a stray `n` would withhold what the operator meant to show.
+The text is printable ASCII, so that it reads the same in a TXT answer, a log
+line and a terminal, and fits one <character-string> (RFC 1035 3.3).
 */
 @(private)
 load_identity :: proc(l: ^Loader, n: ^yaml.Node, cfg: ^Config) {

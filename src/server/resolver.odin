@@ -155,7 +155,7 @@ Stats :: struct {
 
 	Counted, where the other things this server answers from itself are not,
 	because this one is a privacy control and the count is the only aggregate
-	evidence it worked. `answer_chaos` serves a version string and DDR serves a
+	evidence it worked. `answer_chaos` serves an identity and DDR serves a
 	discovery probe, and nobody needs to know how many of either went by; a
 	rising `special_use` says something specific and worth seeing, that clients
 	on this network are asking for `.onion` or `localhost.` names and that those
@@ -206,6 +206,8 @@ Stats :: struct {
 // Stamped at build time from the git tag; see ELODIN_VERSION in mise.toml. A
 // build that bypasses mise reports "dev" rather than claiming a release number.
 VERSION :: #config(ELODIN_VERSION, "dev")
+// The name this server gives itself, in its CHAOS answers and `Server` fields.
+PRODUCT :: "elodin"
 
 Server :: struct {
 	/*
@@ -1469,8 +1471,8 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 	Counted in `stats.special_use`, and shown in the query log as `outcome=local
 	detail=special-use` - except the private reverse zones, which log as
 	`detail=private-reverse` and are not counted. That is a departure from `answer_chaos` and the DDR
-	probe, which are answered from here too and counted nowhere: those two are a
-	version string and a discovery probe, while a stopped `.onion` query is the
+	probe, which are answered from here too and counted nowhere: those two are an
+	identity and a discovery probe, while a stopped `.onion` query is the
 	one thing here an operator has a reason to watch, and the counter is the only
 	way to see it without running the query log.
 	*/
@@ -4789,7 +4791,7 @@ answer_chaos :: proc(st: ^Query_State) -> bool {
 	case .Text:
 		text = cfg.identity_text
 	case .Version:
-		text = "elodin " + VERSION if is_version else "elodin"
+		text = PRODUCT + " " + VERSION if is_version else PRODUCT
 	}
 
 	// On the stack, as in `answer_special_use`: the encode below is their only
