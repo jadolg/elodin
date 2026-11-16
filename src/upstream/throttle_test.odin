@@ -147,6 +147,12 @@ test_a_throttled_doh_h1_reply_parks_for_its_retry_after :: proc(t: ^testing.T) {
 			window = 0,
 		},
 		{
+			what = "503 whose head is cut off after its status line",
+			reply = "HTTP/1.1 503 Service Unavailable\r\nRetry-",
+			err = .IO_Error,
+			window = 0,
+		},
+		{
 			what = "429 asking twice, the first longer",
 			reply = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nRetry-After: 15\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
 			err = .Throttled,

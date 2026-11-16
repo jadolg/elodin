@@ -279,3 +279,71 @@ test_a_doh_answer_without_room_is_this_servers :: proc(t: ^testing.T) {
 	testing.expect_value(t, headers, 1)
 	testing.expect_value(t, f.seen, 1)
 }
+
+/*
+A member whose 429 asked this query to leave it alone is not asked again in the
+query's second round (RFC 9110 10.2.3): the group's other member timing out is
+no reason to go back to a server that has just said it will refuse. The DoH
+member goes through `exchange` and a real group, on the scripted peer.
+*/
+@(test)
+test_a_member_that_refused_is_not_asked_again_in_the_same_query :: proc(t: ^testing.T) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
+	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
+		return
+	}
+	defer net.close(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
+		return
+	}
+	head := make([dynamic]u8, 0, 64, context.temp_allocator)
+	h2.encode_header(&head, ":status", "429")
+	h2.encode_header(&head, "retry-after", "120")
+	p := Refusing_Peer{listener = listener, head = head[:]}
+	peer := thread.create_and_start_with_poly_data(&p, refusing_peer_run)
+	a, aerr := make_upstream(config.Upstream_Spec{name = "refusing", kind = .HTTPS, address = "127.0.0.1", port = bound.port, hostname = "doh.invalid", path = "/dns-query", url = "https://doh.invalid/dns-query"}, 8, 30 * time.Second)
+	if !testing.expectf(t, aerr == .None, "cannot make the upstream: %v", aerr) {
+		thread.join(peer)
+		thread.destroy(peer)
+		return
+	}
+	socket, derr := dial_tcp_timeout(bound, time.Second)
+	if !testing.expectf(t, derr == .None, "cannot dial the peer: %v", derr) {
+		destroy(a)
+		thread.join(peer)
+		thread.destroy(peer)
+		return
+	}
+	if serr := net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond); !testing.expectf(t, serr == nil, "cannot bound the reader: %v", serr) {
+		net.close(socket)
+		destroy(a)
+		thread.join(peer)
+		thread.destroy(peer)
+		return
+	}
+	sync.mutex_lock(&a.mu)
+	a.proto = .H2
+	a.h2 = start_h2_conn(a, Stream{socket = socket})
+	sync.mutex_unlock(&a.mu)
+
+	m: Echo_Mock
+	m.mute = true
+	b, worker, ok := start_udp_mock(t, &m, echo_mock_loop, "silent", 300 * time.Millisecond)
+	if ok {
+		msg := dns.Message{id = 0x3272, question = []dns.Question{{name = "r5.example.test.", type = .A, class = .IN}}}
+		msg.flags.rd = true
+		query, _, enc := dns.encode_message(msg, context.temp_allocator)
+		testing.expect_value(t, enc, dns.Encode_Error.None)
+		ups := []^Upstream{a, b}
+		g := failover_group(ups, 300 * time.Millisecond, attempts = 2)
+		resp, _, rerr := resolve(&g, query, context.allocator)
+		delete(resp, context.allocator)
+		testing.expectf(t, sync.atomic_load(&p.headers) == 1, "a member that answered 429 Retry-After 120 in this query was asked %d times in it (err %v)", sync.atomic_load(&p.headers), rerr)
+		stop_udp_mock(&m, worker, b)
+	}
+	destroy(a)
+	thread.join(peer)
+	thread.destroy(peer)
+	free_all(context.temp_allocator)
+}

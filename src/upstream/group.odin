@@ -1050,8 +1050,11 @@ resolve_sequential :: proc(
 					// only those out of their cooldown.
 					skip = asked[i] != 0 || round == 1 && !healthy(u)
 				} else {
-					// Then those it asked in an earlier round, asked again.
-					skip = asked[i] == round
+					// Then those it asked in an earlier round, asked again -
+					// except one whose refusal asked this query to leave it
+					// alone (RFC 9110 10.2.3), which is not a failure another
+					// try may get past.
+					skip = asked[i] == round || throttled(u)
 				}
 				if skip {
 					continue

@@ -100,7 +100,8 @@ An `https` upstream answering 429 Too Many Requests is refusing elodin
 overloaded, in maintenance, or a proxy with no backend left (`Unavailable`).
 Neither is an `HTTP_Error`. One that sends a `Retry-After` (a number of seconds
 or a date) is skipped at once for as long as it asks, at least ten seconds and
-at most five minutes, until it answers a query sent after the refusal. One
+at most five minutes, until it answers a query sent after the refusal, and
+is not asked again on a later attempt of the query it refused. One
 without counts towards the three failures like any other. With `attempts: 1`
 a group whose every member is skipped asks none of them, so a lone upstream
 that sends a `Retry-After` is not asked for that long.

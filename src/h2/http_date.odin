@@ -15,11 +15,28 @@ status_asks_to_wait :: proc(status: int) -> bool {
 }
 
 /*
+A `Retry-After` field value as the response with `status` means it: its seconds
+when `status_asks_to_wait`, and zero otherwise or where it does not parse. Both
+HTTP clients read the field through this, the first of it in the final
+response's section.
+*/
+retry_after_of :: proc(status: int, value: string) -> u32 {
+	if !status_asks_to_wait(status) {
+		return 0
+	}
+	if seconds, ok := retry_after_now(value); ok {
+		return seconds
+	}
+	return 0
+}
+
+/*
 `parse_retry_after` against the wall clock as it reads now, which is when the
 response carrying `value` was received. The one place either HTTP client reads
 that clock, and only for a date: an HTTP-date names an instant on it (RFC 9110
 5.6.7), where delay-seconds needs no clock at all.
 */
+@(private = "file")
 retry_after_now :: proc(value: string) -> (seconds: u32, ok: bool) {
 	if s, is_delay := delay_seconds(value); is_delay {
 		return s, true

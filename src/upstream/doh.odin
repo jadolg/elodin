@@ -260,10 +260,11 @@ exchange_doh_h1 :: proc(
 		stream_close(&stream)
 		// A 429 or 503 whose body was then lost - broken off, stalled, or with
 		// no room here to hold it - is still the server asking to be left
-		// alone: its head says so whole, it is not asked again on a fresh dial,
-		// and its `Retry-After` is kept. Not one `http_exchange` refused as
-		// malformed, which is no response, as on HTTP/2.
-		if herr != .None && herr != .HTTP_Error && h2.status_asks_to_wait(resp.status) {
+		// alone, once its head has arrived whole: it is not asked again on a
+		// fresh dial, and its `Retry-After` is kept. Not one `http_exchange`
+		// refused as malformed, which is no response, as on HTTP/2; nor a head
+		// cut off partway, whose `Retry-After` may not have come yet.
+		if resp.whole_head && herr != .None && herr != .HTTP_Error && h2.status_asks_to_wait(resp.status) {
 			return nil, doh_refusal(u, resp.status, resp.retry_after)
 		}
 		// A non-200 is the server's answer whatever the size of its body, which

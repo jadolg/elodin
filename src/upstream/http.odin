@@ -378,8 +378,11 @@ Http_Response :: struct {
 	keep_alive: bool,
 	// The final response's `Retry-After` in seconds from its arrival, when its
 	// status is one `h2.status_asks_to_wait` names; zero for none, or one that
-	// did not parse. See `h2.parse_retry_after`.
+	// did not parse. See `h2.retry_after_of`.
 	retry_after: u32,
+	// The final response's header section was read to its end, so `status` and
+	// its fields are the server's whole word whatever became of the body.
+	whole_head:  bool,
 }
 
 Http_Request :: struct {
@@ -619,16 +622,16 @@ http_exchange :: proc(
 					resp.location = strings.clone(value, context.temp_allocator)
 				}
 			case dns.name_equal_fold(name, "retry-after"):
-				// Not a list (RFC 9110 10.2.3), so the first one is the one; and
-				// read only where the status gives it a meaning, which an interim
-				// response's never does.
-				if !seen_retry && h2.status_asks_to_wait(resp.status) {
+				// Not a list (RFC 9110 10.2.3), so the first one is the one. An
+				// interim response's has no status that asks to wait.
+				if !seen_retry && resp.status >= 200 {
 					seen_retry = true
-					resp.retry_after, _ = h2.retry_after_now(value)
+					resp.retry_after = h2.retry_after_of(resp.status, value)
 				}
 			}
 		}
 		if resp.status >= 200 {
+			resp.whole_head = true
 			break
 		}
 		/*

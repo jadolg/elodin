@@ -559,6 +559,19 @@ parse_status :: proc(value: string) -> int {
 }
 
 /*
+What a failed request hands back of `s`'s response: the final head's status and
+`retry-after`, or nothing for a response this end failed as malformed, which is
+not one (RFC 9113 8.1.1). The caller holds `c.mu`.
+*/
+@(private = "file")
+stream_head :: proc(s: ^Client_Stream) -> Client_Response {
+	if s.malformed {
+		return {}
+	}
+	return Client_Response{status = s.status, retry_after = s.retry_after}
+}
+
+/*
 The `retry-after` a header section carries, in seconds, when its `:status` -
 first, as RFC 9113 8.3 has it - is one `status_asks_to_wait` names; zero
 otherwise. Not a list (RFC 9110 10.2.3), so the first one is the one.
@@ -570,10 +583,7 @@ section_retry_after :: proc(headers: []Header_Field) -> u32 {
 	}
 	for f in headers[1:] {
 		if f.name == "retry-after" {
-			if seconds, ok := retry_after_now(f.value); ok {
-				return seconds
-			}
-			return 0
+			return retry_after_of(parse_status(headers[0].value), f.value)
 		}
 	}
 	return 0
@@ -1043,30 +1053,24 @@ client_request :: proc(
 		reset := s.reset
 		refused := s.refused
 		oversized := s.oversized
-		status := s.status
-		retry_after := s.retry_after
-		malformed := s.malformed
+		head := stream_head(s)
 		dry := s.dry || c.dry
 		loop.unlock(&c.mu)
 		switch {
 		// A response that overran while the body was still going up is the
 		// same `Too_Large` as one that overran after it; see below.
 		case oversized:
-			return Client_Response{status = status, retry_after = retry_after}, .Too_Large
+			return head, .Too_Large
 		case dry:
 			return {}, .Out_Of_Memory
-		case dead && malformed:
-			return {}, .Closed
 		case dead:
-			return Client_Response{status = status, retry_after = retry_after}, .Closed
+			return head, .Closed
 		case refused:
 			return {}, .Refused
-		case reset && malformed:
-			return {}, .Reset
 		case reset:
-			return Client_Response{status = status, retry_after = retry_after}, .Reset
+			return head, .Reset
 		case:
-			return Client_Response{status = status, retry_after = retry_after}, .Timeout
+			return head, .Timeout
 		}
 	}
 
@@ -1075,10 +1079,10 @@ client_request :: proc(
 		remaining := time.tick_diff(loop.tick_now(), deadline)
 		if remaining <= 0 {
 			// A final response's head may have come without its body.
-			status, retry_after := s.status, s.retry_after
+			head := stream_head(s)
 			loop.unlock(&c.mu)
 			client_rst_stream(c, stream_id, .Cancel)
-			return Client_Response{status = status, retry_after = retry_after}, .Timeout
+			return head, .Timeout
 		}
 		loop.cond_wait_with_timeout(&c.cond, &c.mu, remaining)
 	}
@@ -1087,32 +1091,24 @@ client_request :: proc(
 	// A reset after a complete response is the peer ending the upload early
 	// (RFC 9113 8.1), and the client MUST NOT discard that response.
 	case s.reset && !s.done:
-		refused, oversized, dry, malformed, status, retry_after := s.refused, s.oversized, s.dry, s.malformed, s.status, s.retry_after
+		refused, oversized, dry, head := s.refused, s.oversized, s.dry, stream_head(s)
 		loop.unlock(&c.mu)
 		switch {
 		case oversized:
-			return Client_Response{status = status, retry_after = retry_after}, .Too_Large
+			return head, .Too_Large
 		case dry:
 			return {}, .Out_Of_Memory
-		}
-		if refused {
+		case refused:
 			return {}, .Refused
 		}
-		// A response that is not one (8.1.1) has no head to hand on.
-		if malformed {
-			return {}, .Reset
-		}
-		return Client_Response{status = status, retry_after = retry_after}, .Reset
+		return head, .Reset
 	case c.closed && !s.done:
-		dry, malformed, status, retry_after := c.dry, s.malformed, s.status, s.retry_after
+		dry, head := c.dry, stream_head(s)
 		loop.unlock(&c.mu)
 		if dry {
 			return {}, .Out_Of_Memory
 		}
-		if malformed {
-			return {}, .Closed
-		}
-		return Client_Response{status = status, retry_after = retry_after}, .Closed
+		return head, .Closed
 	}
 
 	status, retry_after := s.status, s.retry_after

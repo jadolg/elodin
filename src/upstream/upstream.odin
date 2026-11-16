@@ -211,9 +211,10 @@ Upstream :: struct {
 	// A `loop.Moment`, so a step of the wall clock neither holds a member parked
 	// for the length of the step nor lets it out early.
 	down_until:   loop.Moment,
-	// Until when this upstream's 429s and 503s asked to be left alone, and when
-	// the latest of them arrived - on the tick clock, as the moment a query is
-	// sent is, which is all it is compared with; see `note_throttled`.
+	// Until when this upstream's 429s and 503s asked to be left alone, a
+	// `loop.Moment` as `down_until` is; and when the latest of them arrived, a
+	// `time.Tick` because all it is compared with is the tick a query was sent
+	// at. See `note_throttled`.
 	throttled_until:  loop.Moment,
 	refused_at:       time.Tick,
 	// One gate per kind of failure, so each is said at `warn` once a window and
@@ -446,6 +447,14 @@ healthy :: proc(u: ^Upstream) -> bool {
 		return true
 	}
 	return loop.moment_since(u.down_until) >= 0
+}
+
+// Whether a `Retry-After` from `u` still asks to be left alone; see `note_throttled`.
+@(private)
+throttled :: proc(u: ^Upstream) -> bool {
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	return loop.moment_since(u.throttled_until) < 0
 }
 
 /*
