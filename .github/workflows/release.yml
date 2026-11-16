@@ -54,16 +54,7 @@ jobs:
           }
 
       - name: Package
-        run: |
-          stage=elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}
-          mkdir "$stage"
-          cp bin/elodin "$stage"/
-          cp packaging/elodin.service "$stage"/
-          cp examples/elodin.yaml "$stage"/
-          cp README.md "$stage"/
-          cp -r docs "$stage"/
-          cp LICENSE "$stage"/
-          tar -czf "$stage.tar.gz" "$stage"
+        run: packaging/build-tarball.sh elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }} bin/elodin
 
       # The same binary, packaged for the distributions that can install one.
       # Built after the tarball so both name the identical file.
@@ -150,16 +141,7 @@ jobs:
           docker run --rm -v "$PWD/bin/static:/b:ro" "$ELODIN_ALPINE" /b/elodin --version | grep -q ', static)$'
 
       - name: Package
-        run: |
-          stage=elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}-static
-          mkdir "$stage"
-          cp bin/static/elodin "$stage"/
-          cp packaging/elodin.service "$stage"/
-          cp examples/elodin.yaml "$stage"/
-          cp README.md "$stage"/
-          cp -r docs "$stage"/
-          cp LICENSE "$stage"/
-          tar -czf "$stage.tar.gz" "$stage"
+        run: packaging/build-tarball.sh elodin-${{ github.event.release.tag_name }}-linux-${{ matrix.arch }}-static bin/static/elodin
 
       - name: Upload release assets
         env:

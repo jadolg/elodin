@@ -95,7 +95,9 @@ run = "scripts/build-static.sh"
 # The integration suite, linked the same way, against the static binary inside
 # Alpine: a host with no glibc, where the musl build is the one that has to work.
 # Runs as root in the container, so the case that needs a failing privilege
-# drop skips. strace is installed for the log.file case. The checkout is mounted
+# drop skips. strace is installed for the log.file case. `--init` puts tini at
+# PID 1, which forwards Ctrl-C to the suite; as PID 1 the suite would ignore it.
+# The checkout is mounted
 # at its own path, so the executable a core names (.github/actions/core-dumps)
 # is one on the host.
 [tasks.itest-static]
@@ -103,7 +105,7 @@ description = "Integration tests against the static build, inside Alpine"
 depends = ["prepare"]
 run = """
 scripts/build-static.sh --itest
-docker run --rm -v "$PWD:$PWD" -w "$PWD" "$ELODIN_ALPINE" sh -euc '
+docker run --rm --init -v "$PWD:$PWD" -w "$PWD" "$ELODIN_ALPINE" sh -euc '
   apk add --no-cache -q openssl strace >/dev/null
   ./bin/static/itest --binary bin/static/elodin
 '
