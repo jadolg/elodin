@@ -39,6 +39,8 @@ Refusing_Peer :: struct {
 	stall:    bool,
 	// Or close the connection after `head`, without ending the stream.
 	hang_up:  bool,
+	// Or end the stream with this trailer section after `head`.
+	trailers: []u8,
 }
 
 @(private = "file")
@@ -102,9 +104,13 @@ refusing_peer_run :: proc(p: ^Refusing_Peer) {
 					h2.write_frame_header(&out, len(p.interim), .Headers, h2.FLAG_END_HEADERS, h.stream_id)
 					append(&out, ..p.interim)
 				}
-				ends := p.body == 0 && !p.reset && !p.stall && !p.hang_up
+				ends := p.body == 0 && !p.reset && !p.stall && !p.hang_up && p.trailers == nil
 				h2.write_frame_header(&out, len(p.head), .Headers, h2.FLAG_END_HEADERS | (h2.FLAG_END_STREAM if ends else 0), h.stream_id)
 				append(&out, ..p.head)
+				if p.trailers != nil {
+					h2.write_frame_header(&out, len(p.trailers), .Headers, h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM, h.stream_id)
+					append(&out, ..p.trailers)
+				}
 				if p.reset {
 					h2.write_frame_header(&out, 4, .Rst_Stream, 0, h.stream_id)
 					h2.append_u32(&out, u32(h2.Error_Code.Internal_Error))
@@ -146,8 +152,8 @@ One exchange answered by the header block `head`, after the interim block
 the upstream to wait, or zero.
 */
 @(private)
-exchange_with_head :: proc(t: ^testing.T, interim, head: []u8, body: int, reset := false, stall := false, hang_up := false) -> (err: Error, wait: time.Duration) {
-	err, _, wait = exchange_with_peer(t, 0, interim, head, body, context.temp_allocator, reset = reset, stall = stall, hang_up = hang_up)
+exchange_with_head :: proc(t: ^testing.T, interim, head: []u8, body: int, reset := false, stall := false, hang_up := false, trailers: []u8 = nil) -> (err: Error, wait: time.Duration) {
+	err, _, wait = exchange_with_peer(t, 0, interim, head, body, context.temp_allocator, reset = reset, stall = stall, hang_up = hang_up, trailers = trailers)
 	return
 }
 
@@ -161,6 +167,7 @@ exchange_with_peer :: proc(
 	reset := false,
 	stall := false,
 	hang_up := false,
+	trailers: []u8 = nil,
 ) -> (
 	err: Error,
 	headers: int,
@@ -184,6 +191,7 @@ exchange_with_peer :: proc(
 		reset    = reset,
 		stall    = stall,
 		hang_up  = hang_up,
+		trailers = trailers,
 	}
 	peer := thread.create_and_start_with_poly_data(&p, refusing_peer_run)
 

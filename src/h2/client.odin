@@ -119,8 +119,8 @@ Client_Stream :: struct {
 	final:       bool,
 	// The `retry-after` of the section that set `status`; see Client_Response.
 	retry_after: u32,
-	// This end failed the response as malformed (RFC 9113 8.1.1), so it has no
-	// status a caller may act on; see client_finish_headers.
+	// This end failed the response's head as malformed (RFC 9113 8.1.1), so it
+	// has no status a caller may act on; see client_finish_headers.
 	malformed:   bool,
 }
 
@@ -578,12 +578,16 @@ otherwise. Not a list (RFC 9110 10.2.3), so the first one is the one.
 */
 @(private = "file")
 section_retry_after :: proc(headers: []Header_Field) -> u32 {
-	if len(headers) == 0 || headers[0].name != ":status" || !status_asks_to_wait(parse_status(headers[0].value)) {
+	if len(headers) == 0 || headers[0].name != ":status" {
+		return 0
+	}
+	status := parse_status(headers[0].value)
+	if !status_asks_to_wait(status) {
 		return 0
 	}
 	for f in headers[1:] {
 		if f.name == "retry-after" {
-			return retry_after_of(parse_status(headers[0].value), f.value)
+			return retry_after_of(status, f.value)
 		}
 	}
 	return 0
@@ -642,7 +646,9 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 	*/
 	malformed := false
 	if found && !already_ended {
-		if s.final {
+		// Whether this block is the trailers, after a final head already taken.
+		trailing := s.final
+		if trailing {
 			// What the server refuses in a request's trailers.
 			malformed = trailers_are_malformed(headers, s.end_stream)
 		} else {
@@ -678,7 +684,9 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 			malformed ||= s.status == 0 || !s.final && s.end_stream
 		}
 		if malformed {
-			s.malformed = true
+			// Trailers that fail the stream leave the head it already had
+			// standing: a refusal's status was the server's whole word.
+			s.malformed ||= !trailing
 			s.reset = true
 			loop.cond_broadcast(&c.cond)
 		} else {

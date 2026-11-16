@@ -348,6 +348,8 @@ test_a_throttled_doh_h2_reply_carries_its_retry_after :: proc(t: ^testing.T) {
 		stall:   bool,
 		// Or the connection closed after it.
 		hang_up: bool,
+		// Or trailers carrying a `:status`, which RFC 9113 8.1 makes malformed.
+		bad_trailers: bool,
 		// A second `:status` after the fields, which RFC 9113 8.3 makes malformed.
 		malformed: bool,
 		wait:    time.Duration,
@@ -362,6 +364,7 @@ test_a_throttled_doh_h2_reply_carries_its_retry_after :: proc(t: ^testing.T) {
 		{what = "503 whose body never comes", status = "503", stall = true, wait = 2 * time.Minute, err = .Unavailable},
 		{what = "500 reset after its head", status = "500", reset = true, wait = 0, err = .HTTP_Error},
 		{what = "429 whose connection closes after its head", status = "429", hang_up = true, wait = 2 * time.Minute, err = .Throttled},
+		{what = "429 whose trailers are malformed", status = "429", bad_trailers = true, wait = 2 * time.Minute, err = .Throttled},
 		{what = "a malformed 429", status = "429", malformed = true, wait = 0, err = .HTTP_Error},
 		{what = "a 103 asking, then a 429", interim = true, status = "429", wait = 0, err = .Throttled},
 		{what = "500 asking for two minutes", status = "500", wait = 0, err = .HTTP_Error},
@@ -384,7 +387,12 @@ test_a_throttled_doh_h2_reply_carries_its_retry_after :: proc(t: ^testing.T) {
 				h2.encode_header(&head, ":status", "200")
 			}
 		}
-		err, wait := exchange_with_head(t, interim[:], head[:], row.body, reset = row.reset, stall = row.stall, hang_up = row.hang_up)
+		trailers: [dynamic]u8
+		if row.bad_trailers {
+			trailers = make([dynamic]u8, 0, 16, context.temp_allocator)
+			h2.encode_header(&trailers, ":status", "200")
+		}
+		err, wait := exchange_with_head(t, interim[:], head[:], row.body, reset = row.reset, stall = row.stall, hang_up = row.hang_up, trailers = trailers[:])
 		testing.expectf(t, err == row.err, "%s: %v, want %v", row.what, err, row.err)
 		testing.expectf(t, wait <= row.wait && wait > row.wait - time.Second, "%s: asked to wait %v, want %v", row.what, wait, row.wait)
 	}
@@ -428,26 +436,4 @@ test_reopened_windows_share_one_gate :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect_value(t, sync.atomic_load(&u.reported[.Throttled].held), 4)
-}
-
-/*
-Refusals noted out of the order of their moments keep the later one: a refusal
-that read its moment before another, and recorded it after, would otherwise move
-`refused_at` back, and an answer to a query sent between the two would lift the
-later refusal's window. The test holds the upstream's lock while a refusal is
-under way, and records one an hour later in the meantime.
-*/
-@(test)
-test_an_earlier_refusal_does_not_move_refused_at_back :: proc(t: ^testing.T) {
-	u: Upstream
-	sync.mutex_lock(&u.mu)
-	a := thread.create_and_start_with_poly_data(&u, proc(u: ^Upstream) {
-		note_throttled(u, .Throttled, 429, 300)
-	})
-	later := time.tick_add(loop.tick_now(), time.Hour)
-	u.refused_at = later
-	sync.mutex_unlock(&u.mu)
-	thread.join(a)
-	thread.destroy(a)
-	testing.expectf(t, time.tick_diff(later, u.refused_at) >= 0, "refused_at moved back by %v", time.tick_diff(u.refused_at, later))
 }

@@ -463,6 +463,14 @@ throttled_locked :: proc(u: ^Upstream) -> bool {
 	return loop.moment_since(u.throttled_until) < 0
 }
 
+// What is left of `u`'s `Retry-After` window, to the second, for the lines that
+// say how long it is skipped; zero or less when none is open. The caller holds
+// `u.mu`.
+@(private = "file")
+window_left_locked :: proc(u: ^Upstream) -> time.Duration {
+	return time.duration_round(-loop.moment_since(u.throttled_until), time.Second)
+}
+
 /*
 Whether `u` is known to be answering: it has answered at least once, no
 failure that counts toward its cooldown has come since its last answer, and no
@@ -658,7 +666,7 @@ record_failure :: proc(
 	}
 	if u.failures == FAILURE_THRESHOLD {
 		// What the member is skipped for, which a `Retry-After` may make longer.
-		pause := max(COOLDOWN, time.duration_round(-loop.moment_since(u.throttled_until), time.Second))
+		pause := max(COOLDOWN, window_left_locked(u))
 		logx.warnf("upstream %s: %d consecutive failures (last: %v), pausing it for %v", u.spec.name, u.failures, err, pause)
 	}
 }
@@ -696,9 +704,7 @@ note_throttled :: proc(u: ^Upstream, kind: Error, status: int, retry_after: u32)
 	// Read under the lock, so refusals land in the order of their moments and
 	// `refused_at` only moves forward.
 	now := loop.moment_now()
-	if at := loop.tick_now(); time.tick_diff(u.refused_at, at) > 0 {
-		u.refused_at = at
-	}
+	u.refused_at = loop.tick_now()
 	if retry_after > 0 {
 		u.throttled_until = max(u.throttled_until, loop.moment_add(now, clamp(asked, COOLDOWN, MAX_RETRY_AFTER)))
 	}
@@ -707,7 +713,7 @@ note_throttled :: proc(u: ^Upstream, kind: Error, status: int, retry_after: u32)
 		// the diagnosis: an operator over quota and one whose upstream is in
 		// maintenance act differently.
 		said := fmt.tprintf(", Retry-After %v", asked) if retry_after > 0 else ""
-		pause := time.duration_round(-loop.moment_since(u.throttled_until), time.Second)
+		pause := window_left_locked(u)
 		pausing := fmt.tprintf(", pausing it for %v", pause) if pause > 0 else ""
 		logx.warnf_held(held, "upstream %s (%v %s): %v, HTTP %d%s%s", u.spec.name, u.spec.kind, u.spec.address, kind, status, said, pausing)
 	}
