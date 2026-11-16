@@ -713,8 +713,10 @@ note_throttled :: proc(u: ^Upstream, kind: Error, status: int, retry_after: u32)
 		// the diagnosis: an operator over quota and one whose upstream is in
 		// maintenance act differently.
 		said := fmt.tprintf(", Retry-After %v", asked) if retry_after > 0 else ""
+		// The pause only on a reply that asked for one, so a bare refusal's line
+		// does not read as the cause of a window another reply opened.
 		pause := window_left_locked(u)
-		pausing := fmt.tprintf(", pausing it for %v", pause) if pause > 0 else ""
+		pausing := fmt.tprintf(", pausing it for %v", pause) if retry_after > 0 && pause > 0 else ""
 		logx.warnf_held(held, "upstream %s (%v %s): %v, HTTP %d%s%s", u.spec.name, u.spec.kind, u.spec.address, kind, status, said, pausing)
 	}
 }
