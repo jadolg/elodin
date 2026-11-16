@@ -47,6 +47,14 @@ Error :: enum u8 {
 	// problem, the other is usually the network.
 	Verify_Failed,
 	HTTP_Error,
+	/*
+	A DoH upstream answered 429 Too Many Requests (RFC 6585 4) or 503 Service
+	Unavailable (RFC 9110 15.6.4): it is up, and refusing this server. Kept
+	apart from `HTTP_Error` so the figures tell an upstream turning this server
+	away from one that is broken; it parks the member as any failure does, for at
+	least as long as its `Retry-After` asks (see `note_throttled`).
+	*/
+	Throttled,
 	Too_Large,
 	Unhealthy,
 	/*
@@ -195,6 +203,10 @@ Upstream :: struct {
 	// A `loop.Moment`, so a step of the wall clock neither holds a member parked
 	// for the length of the step nor lets it out early.
 	down_until:   loop.Moment,
+	// Until when this upstream's last 429 or 503 asked to be left alone, and
+	// that reply's status; see `note_throttled`.
+	throttled_until:  loop.Moment,
+	throttled_status: int,
 	// One gate per kind of failure, so each is said at `warn` once a window and
 	// left to `debug` between; see `record_failure`.
 	reported:     [Error]logx.Gate,
@@ -243,9 +255,11 @@ Stats :: struct {
 	failure_kinds:    [Error]u64,
 }
 
-// After this many consecutive failures an upstream is skipped for COOLDOWN.
+// After this many consecutive failures an upstream is skipped for COOLDOWN, or
+// for as long as a `Retry-After` asks up to MAX_RETRY_AFTER; see `note_throttled`.
 FAILURE_THRESHOLD :: 3
 COOLDOWN :: 10 * time.Second
+MAX_RETRY_AFTER :: time.Hour
 
 make_upstream :: proc(
 	spec: config.Upstream_Spec,
@@ -445,6 +459,8 @@ record_success :: proc(u: ^Upstream, elapsed: time.Duration) {
 	defer sync.mutex_unlock(&u.mu)
 	u.failures = 0
 	u.closed_run = 0
+	// The zero `Moment` is always past.
+	u.throttled_until = {}
 	u.stats.queries += 1
 	u.stats.latency_ns_total += u64(elapsed)
 }
@@ -531,7 +547,25 @@ record_failure :: proc(
 	u.stats.failures += 1
 	u.stats.failure_kinds[err] += 1
 	if loud, held := note_failure_kind(u, err); loud {
-		logx.warnf_held(held, "upstream %s (%v %s): %v", u.spec.name, u.spec.kind, u.spec.address, err)
+		// Which refusal, and for how long, is the diagnosis: an operator over
+		// quota and one whose upstream is in maintenance act differently.
+		wait := time.duration_round(-loop.moment_since(u.throttled_until), time.Second)
+		if err == .Throttled && wait > 0 {
+			logx.warnf_held(
+				held,
+				"upstream %s (%v %s): %v, HTTP %d, Retry-After %v",
+				u.spec.name,
+				u.spec.kind,
+				u.spec.address,
+				err,
+				u.throttled_status,
+				wait,
+			)
+		} else if err == .Throttled {
+			logx.warnf_held(held, "upstream %s (%v %s): %v, HTTP %d", u.spec.name, u.spec.kind, u.spec.address, err, u.throttled_status)
+		} else {
+			logx.warnf_held(held, "upstream %s (%v %s): %v", u.spec.name, u.spec.kind, u.spec.address, err)
+		}
 	}
 	if !charge {
 		return
@@ -589,8 +623,10 @@ record_failure :: proc(
 		u.closed_run = 0
 	}
 	u.failures += 1
+	// At least as long as a `Retry-After` still asks; see `note_throttled`.
+	cooldown := max(COOLDOWN, -loop.moment_since(u.throttled_until))
 	if u.failures >= FAILURE_THRESHOLD {
-		u.down_until = loop.moment_add(loop.moment_now(), COOLDOWN)
+		u.down_until = loop.moment_add(loop.moment_now(), cooldown)
 		// A server that stopped sending cookies is a server whose every reply is
 		// now discarded for the want of one, and that arrives here looking like
 		// any other outage. Let the cooldown decide what it does rather than
@@ -603,9 +639,29 @@ record_failure :: proc(
 			u.spec.name,
 			u.failures,
 			err,
-			COOLDOWN,
+			time.duration_round(cooldown, time.Second),
 		)
 	}
+}
+
+/*
+Note that `u` refused this server with `status`, asking, by its `Retry-After`,
+to be left alone for `retry_after` seconds from now - zero when it did not say.
+
+The run of failures that parks `u` then parks it for that long when it is longer
+than `COOLDOWN` (see `record_failure`), up to `MAX_RETRY_AFTER`: RFC 9110 10.2.3
+has a client wait at least what the server asks, and the bound keeps a server
+asking for days from leaving a member benched for the life of the process. The
+latest moment any reply asks for stands until an answer clears it.
+*/
+@(private)
+note_throttled :: proc(u: ^Upstream, status: int, retry_after: u32) {
+	wait := min(time.Duration(retry_after) * time.Second, MAX_RETRY_AFTER)
+	until := loop.moment_add(loop.moment_now(), wait)
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	u.throttled_until = max(u.throttled_until, until)
+	u.throttled_status = status
 }
 
 /*
@@ -716,6 +772,8 @@ error_label :: proc(e: Error) -> string {
 		return "verify_failed"
 	case .HTTP_Error:
 		return "http_error"
+	case .Throttled:
+		return "throttled"
 	case .Too_Large:
 		return "too_large"
 	case .Unhealthy:

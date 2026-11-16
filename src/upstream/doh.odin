@@ -121,7 +121,7 @@ exchange_doh_h2 :: proc(
 				if len(resp.body) > 0 {
 					delete(resp.body, allocator)
 				}
-				return nil, .HTTP_Error
+				return nil, doh_refusal(u, resp.status, resp.retry_after)
 			}
 			if !doh_reply_matches(query, resp.body) {
 				delete(resp.body, allocator)
@@ -152,7 +152,7 @@ exchange_doh_h2 :: proc(
 			// Reported as HTTP/1.1 reports it, so health and the failure kind do
 			// not depend on what ALPN chose: a non-200 is the server's answer
 			// whatever the size of the body nobody reads.
-			return nil, .Too_Large if resp.status == 200 else .HTTP_Error
+			return nil, .Too_Large if resp.status == 200 else doh_refusal(u, resp.status, resp.retry_after)
 		case .Timeout:
 			return nil, .Timeout
 		}
@@ -248,8 +248,8 @@ exchange_doh_h1 :: proc(
 		}
 		stream_close(&stream)
 		// A non-200 is the server's answer whatever the size of its body, which
-		// nobody reads: a 408 is still retried, and an error page is still an
-		// `HTTP_Error`, as on HTTP/2.
+		// nobody reads: a 408 is still retried, and an error page is still what
+		// `doh_refusal` makes of its status, as on HTTP/2.
 		if herr == .None || (herr == .Too_Large && resp.status != 200) {
 			/*
 			A 408 on a pooled connection is the server closing one it found
@@ -266,7 +266,7 @@ exchange_doh_h1 :: proc(
 			// a body too short to be a DNS message - is the server's answer, so
 			// it is not retried; and it is the kind the HTTP/2 twin reports, so
 			// health does not depend on what ALPN chose.
-			return nil, .HTTP_Error
+			return nil, doh_refusal(u, resp.status, resp.retry_after)
 		}
 		/*
 		A hang-up is retried whether this query found the connection or dialled
@@ -433,6 +433,21 @@ redirect_allowed :: proc(origin_scheme: string, origin_public: bool, scheme: str
 		return false
 	}
 	return true
+}
+
+/*
+What a whole DoH reply that is not a usable answer reports: `Throttled` for the
+upstream refusing this server - 429 (RFC 6585 4) or 503 (RFC 9110 15.6.4) -
+with its `Retry-After` noted against `u`, and `HTTP_Error` for anything else,
+a 200 too short to be a DNS message included.
+*/
+@(private)
+doh_refusal :: proc(u: ^Upstream, status: int, retry_after: u32) -> Error {
+	if status != 429 && status != 503 {
+		return .HTTP_Error
+	}
+	note_throttled(u, status, retry_after)
+	return .Throttled
 }
 
 /*

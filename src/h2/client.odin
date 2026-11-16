@@ -117,6 +117,8 @@ Client_Stream :: struct {
 	// A final (non-1xx) header section has been taken, so the next block is
 	// the trailers; see client_finish_headers.
 	final:       bool,
+	// The `retry-after` of the section that set `status`; see Client_Response.
+	retry_after: u32,
 }
 
 Client_Request :: struct {
@@ -130,8 +132,11 @@ Client_Request :: struct {
 }
 
 Client_Response :: struct {
-	status: int,
-	body:   []u8,
+	status:      int,
+	body:        []u8,
+	// The final response's `retry-after` (RFC 9110 10.2.3) in seconds from its
+	// arrival, or zero for none or one that did not parse; see `parse_retry_after`.
+	retry_after: u32,
 }
 
 Client_Error :: enum u8 {
@@ -605,7 +610,8 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 			ordinary fields are held to 8.2 as the trailers are.
 			*/
 			s.status = 0
-			seen_status, seen_regular := false, false
+			s.retry_after = 0
+			seen_status, seen_regular, seen_retry := false, false, false
 			for f in headers {
 				if len(f.name) > 0 && f.name[0] == ':' {
 					if f.name != ":status" || seen_status || seen_regular {
@@ -618,6 +624,11 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 					seen_regular = true
 					if field_is_malformed(f) {
 						malformed = true
+					}
+					// Not a list (RFC 9110 10.2.3), so the first one is the one.
+					if f.name == "retry-after" && !seen_retry {
+						seen_retry = true
+						s.retry_after, _ = parse_retry_after(f.value, loop.now()) // lint:allow an HTTP-date is a wall-clock instant (RFC 9110 5.6.7)
 					}
 				}
 			}
@@ -1003,13 +1014,14 @@ client_request :: proc(
 		refused := s.refused
 		oversized := s.oversized
 		status := s.status
+		retry_after := s.retry_after
 		dry := s.dry || c.dry
 		loop.unlock(&c.mu)
 		switch {
 		// A response that overran while the body was still going up is the
 		// same `Too_Large` as one that overran after it; see below.
 		case oversized:
-			return Client_Response{status = status}, .Too_Large
+			return Client_Response{status = status, retry_after = retry_after}, .Too_Large
 		case dry:
 			return {}, .Out_Of_Memory
 		case dead:
@@ -1038,11 +1050,11 @@ client_request :: proc(
 	// A reset after a complete response is the peer ending the upload early
 	// (RFC 9113 8.1), and the client MUST NOT discard that response.
 	case s.reset && !s.done:
-		refused, oversized, dry, status := s.refused, s.oversized, s.dry, s.status
+		refused, oversized, dry, status, retry_after := s.refused, s.oversized, s.dry, s.status, s.retry_after
 		loop.unlock(&c.mu)
 		switch {
 		case oversized:
-			return Client_Response{status = status}, .Too_Large
+			return Client_Response{status = status, retry_after = retry_after}, .Too_Large
 		case dry:
 			return {}, .Out_Of_Memory
 		}
@@ -1053,7 +1065,7 @@ client_request :: proc(
 		return {}, .Out_Of_Memory if dry else .Closed
 	}
 
-	status := s.status
+	status, retry_after := s.status, s.retry_after
 	body, room := dns.alloc_slice([]u8, len(s.body), allocator)
 	if room {
 		copy(body, s.body[:])
@@ -1062,7 +1074,7 @@ client_request :: proc(
 	if !room {
 		return {}, .Out_Of_Memory
 	}
-	return Client_Response{status = status, body = body}, .None
+	return Client_Response{status = status, body = body, retry_after = retry_after}, .None
 }
 
 // Write a request body, honouring flow control and the peer's frame size

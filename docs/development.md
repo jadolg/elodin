@@ -62,7 +62,7 @@ src/privdrop/  giving up root once the listeners hold their ports
 src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures,
                and the upstream-parity check with its own independent wire walker
 src/fuzz/      libFuzzer targets for the DNS, DNSSEC, HPACK, h2, HTTP/1.1, DoH, blocklist,
-               regex, url and YAML parsers, and their shared harness
+               regex, url, Retry-After and YAML parsers, and their shared harness
 testdata/      fuzz corpus and dictionary, committed so a found crash stays
                found, the parity seeds that have found a divergence, plus
                gen/ - the generator behind the DNSSEC fixtures
@@ -213,6 +213,7 @@ each under `src/fuzz/`:
 | `h2conn` | the h2 frame layer and stream state machine, server and client side |
 | `doh` | the HTTP/1.1 request parser DoH clients write into |
 | `url` | `netx.split_url` and `netx.resolve_reference`, which a list download's redirect `Location` goes through |
+| `retry_after` | `h2.parse_retry_after`, the delay-seconds and three HTTP-date forms of a DoH upstream's `Retry-After` |
 
 The two HTTP readers take a socket, so their targets feed them one end of a
 socket pair holding the input.

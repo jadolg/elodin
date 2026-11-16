@@ -1,5 +1,6 @@
 package upstream
 
+import "core:mem"
 import "core:net"
 import "core:sync"
 import "core:testing"
@@ -8,6 +9,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:h2"
+import "elodin:loop"
 
 /*
 RST_STREAM(REFUSED_STREAM) says the server never processed the request - RFC
@@ -25,6 +27,12 @@ Refusing_Peer :: struct {
 	listener: net.TCP_Socket,
 	refuse:   int,
 	headers:  int,
+	// When set, the answer is this header block with no body, after `interim`'s
+	// block when that is set too, rather than the query echoed with a 200.
+	interim:  []u8,
+	head:     []u8,
+	// Bytes of zeros sent as the body after `head`.
+	body:     int,
 }
 
 @(private = "file")
@@ -82,6 +90,24 @@ refusing_peer_run :: proc(p: ^Refusing_Peer) {
 			if was_refused || h.flags & h2.FLAG_END_STREAM == 0 || len(payload) < dns.HEADER_SIZE {
 				continue
 			}
+			if p.head != nil {
+				clear(&out)
+				if p.interim != nil {
+					h2.write_frame_header(&out, len(p.interim), .Headers, h2.FLAG_END_HEADERS, h.stream_id)
+					append(&out, ..p.interim)
+				}
+				h2.write_frame_header(&out, len(p.head), .Headers, h2.FLAG_END_HEADERS | (h2.FLAG_END_STREAM if p.body == 0 else 0), h.stream_id)
+				append(&out, ..p.head)
+				// In frames no larger than the default SETTINGS_MAX_FRAME_SIZE.
+				for sent := 0; sent < p.body; {
+					n := min(p.body - sent, h2.DEFAULT_MAX_FRAME)
+					sent += n
+					h2.write_frame_header(&out, n, .Data, h2.FLAG_END_STREAM if sent == p.body else 0, h.stream_id)
+					resize(&out, len(out) + n)
+				}
+				peer_send(client, out)
+				continue
+			}
 			// The query as its own answer, QR set: all `response_matches` asks.
 			payload[2] |= 0x80
 			clear(&out)
@@ -96,18 +122,48 @@ refusing_peer_run :: proc(p: ^Refusing_Peer) {
 
 @(private = "file")
 exchange_with_refusals :: proc(t: ^testing.T, refuse: int, allocator := context.temp_allocator) -> (err: Error, headers: int) {
+	err, headers, _ = exchange_with_peer(t, refuse, nil, nil, 0, allocator) // lint:allow a wait, not an error: only the throttling cases read it
+	return
+}
+
+/*
+One exchange answered by the header block `head`, after the interim block
+`interim` when that is not nil, and how long a `Retry-After` it carried asks
+the upstream to wait, or zero.
+*/
+@(private)
+exchange_with_head :: proc(t: ^testing.T, interim, head: []u8, body: int) -> (err: Error, wait: time.Duration) {
+	err, _, wait = exchange_with_peer(t, 0, interim, head, body, context.temp_allocator)
+	return
+}
+
+@(private = "file")
+exchange_with_peer :: proc(
+	t: ^testing.T,
+	refuse: int,
+	interim, head: []u8,
+	body: int,
+	allocator: mem.Allocator,
+) -> (
+	err: Error,
+	headers: int,
+	wait: time.Duration,
+) {
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 	if !testing.expectf(t, lerr == nil, "cannot listen: %v", lerr) {
-		return .IO_Error, 0
+		return .IO_Error, 0, 0
 	}
 	defer net.close(listener)
 	bound, berr := net.bound_endpoint(listener)
 	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
-		return .IO_Error, 0
+		return .IO_Error, 0, 0
 	}
 	p := Refusing_Peer {
 		listener = listener,
 		refuse   = refuse,
+		interim  = interim,
+		head     = head,
+		body     = body,
 	}
 	peer := thread.create_and_start_with_poly_data(&p, refusing_peer_run)
 
@@ -126,7 +182,7 @@ exchange_with_refusals :: proc(t: ^testing.T, refuse: int, allocator := context.
 	if !testing.expectf(t, uerr == .None, "cannot make the upstream: %v", uerr) {
 		thread.join(peer)
 		thread.destroy(peer)
-		return .IO_Error, 0
+		return .IO_Error, 0, 0
 	}
 
 	socket, derr := dial_tcp_timeout(bound, time.Second)
@@ -134,7 +190,7 @@ exchange_with_refusals :: proc(t: ^testing.T, refuse: int, allocator := context.
 		destroy(u)
 		thread.join(peer)
 		thread.destroy(peer)
-		return .IO_Error, 0
+		return .IO_Error, 0, 0
 	}
 	// What `get_h2_conn` builds once ALPN says h2, minus the TLS.
 	_ = net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond)
@@ -160,12 +216,14 @@ exchange_with_refusals :: proc(t: ^testing.T, refuse: int, allocator := context.
 		testing.expect_value(t, u16(resp[0]) << 8 | u16(resp[1]), query.id)
 	}
 
+	wait = max(-loop.moment_since(u.throttled_until), 0)
+
 	// Tears the connection down, which ends the peer's read loop.
 	destroy(u)
 	thread.join(peer)
 	thread.destroy(peer)
 	free_all(context.temp_allocator)
-	return err, sync.atomic_load(&p.headers)
+	return err, sync.atomic_load(&p.headers), wait
 }
 
 @(test)

@@ -230,6 +230,78 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 		}
 	}
 
+	// --- an upstream answering 429 or 503 is throttling, not down ---
+	/*
+	RFC 6585 4 and RFC 9110 15.6.4: the upstream is up and refusing this server.
+	Its failures are a kind of their own, the log names the status and the
+	`Retry-After` it sent, and the run that parks it parks it for that long
+	(RFC 9110 10.2.3) rather than the fixed cooldown (#258). Over both versions
+	of the protocol, each with its own way of carrying the field.
+	*/
+	{
+		Throttle_Case :: struct {
+			what:   string,
+			alpn:   []string,
+			status: int,
+		}
+		throttle_cases := []Throttle_Case {
+			{what = "upstream: an h2 DoH upstream answering 429 parks for its Retry-After", alpn = {"h2"}, status = 429},
+			{what = "upstream: an http/1.1 DoH upstream answering 503 parks for its Retry-After", alpn = {"http/1.1"}, status = 503},
+		}
+		for tc, i in throttle_cases {
+			upstream_port := next_port(r)
+			mock := doh2_mock_make(upstream_port, "/dns-query", payload)
+			mock.status = tc.status
+			mock.retry_after = "120"
+			if !doh2_mock_start(mock, r.cert_file, r.key_file, tc.alpn) {
+				skip_case(r, tc.what, "cannot start the mock")
+				doh2_mock_stop(mock)
+				continue
+			}
+			udp_port := next_port(r)
+			metrics_port := next_port(r)
+			config := base_config(
+				udp_port,
+				fmt.tprintf("[%s]", doh_upstream("busy", upstream_port)),
+				timeout = "5s",
+				upstream_extra = "  attempts: 1",
+				extra = fmt.tprintf("metrics: {{ enabled: true, address: 127.0.0.1, port: %d }}", metrics_port),
+			)
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+			if ok {
+				start_case(r, tc.what)
+				{
+					for q in 0 ..< 3 {
+						res := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = u16(0x5270 + 4 * i + q)))
+						if check(r, res.ok, "query %d: no response", q) {
+							h := parse_header(r, res.wire)
+							check_eq_int(r, h.rcode, int(dns.Rcode.Serv_Fail), "rcode")
+						}
+					}
+					check(
+						r,
+						wait_for_log(&srv, fmt.tprintf("upstream busy (HTTPS 127.0.0.1): Throttled, HTTP %d, Retry-After 2m0s", tc.status), 3 * time.Second),
+						"the throttled line did not name the status and the Retry-After",
+					)
+					check(
+						r,
+						wait_for_log(&srv, "upstream busy: 3 consecutive failures (last: Throttled), pausing it for 2m0s", 3 * time.Second),
+						"the upstream was not parked for its Retry-After",
+					)
+					// Every refusal the mock sent, and nothing else: an absent kind is -1.
+					h2_hits, h1_hits := doh2_mock_counts(mock)
+					page := metrics_page(metrics_port)
+					check_eq_int(r, metric_value(page, `elodin_upstream_failure_kind_total{upstream="busy",error="throttled"}`), h2_hits + h1_hits, "throttled failures")
+					check_eq_int(r, metric_value(page, `elodin_upstream_failure_kind_total{upstream="busy",error="http_error"}`), -1, "http_error failures")
+					check_eq_int(r, metric_value(page, `elodin_upstream_up{upstream="busy"}`), 0, "up")
+				}
+				end_case(r)
+				stop_server(&srv)
+			}
+			doh2_mock_stop(mock)
+		}
+	}
+
 	// --- a mock that cannot bind its port can still be stopped ---
 	/*
 	Another run on the box holding the port is how a parity scenario's mock

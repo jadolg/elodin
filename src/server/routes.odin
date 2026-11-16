@@ -676,7 +676,7 @@ that is not a rounding error (issue #243):
 
   - An uplink that blackholes packets. `group_reachable` passes over the parent's
     group only while every member is parked, and `healthy` goes true again the
-    moment `COOLDOWN` elapses however many failures stand against the server, so
+    moment its cooldown elapses however many failures stand against the server, so
     the first apex `DS` after each expiry runs the group to the end of its budget
     - two timeouts, ten seconds at the defaults. A
     validating stub gives up in two to five, so it SERVFAILs the apex `DS` and
