@@ -2679,7 +2679,7 @@ test_a_refused_doh_h1_reply_releases_its_body :: proc(t: ^testing.T) {
 		err:   Error,
 	}
 	refusals := []Refusal {
-		{reply = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", err = .Throttled},
+		{reply = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", err = .Unavailable},
 		{reply = "HTTP/1.1 429 Too Many Requests\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nslow!\r\n0\r\n\r\n", err = .Throttled},
 		{reply = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", err = .HTTP_Error},
 	}

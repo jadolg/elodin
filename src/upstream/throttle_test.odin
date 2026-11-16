@@ -3,12 +3,14 @@ package upstream
 import "core:fmt"
 import "core:mem"
 import "core:net"
+import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:h2"
+import "elodin:logx"
 import "elodin:loop"
 
 /*
@@ -69,8 +71,9 @@ throttle_on_h1_reply :: proc(t: ^testing.T, reply: string) -> (err: Error, windo
 }
 
 /*
-A 429 or a 503 is the upstream refusing this server, not failing: it is its own
-kind (#258). One that carries a `Retry-After`, in either form RFC 9110 10.2.3
+A 429 is the upstream refusing this server and a 503 one that cannot serve for
+now, not a broken reply: each is a kind of its own (#258). One that carries a
+`Retry-After`, in either form RFC 9110 10.2.3
 allows, parks the upstream at once for that long, never less than `COOLDOWN`
 nor more than `MAX_RETRY_AFTER`. One without, or whose value does not parse, or
 a `Retry-After` on anything else or on an interim response, parks nothing.
@@ -83,11 +86,11 @@ test_a_throttled_doh_h1_reply_parks_for_its_retry_after :: proc(t: ^testing.T) {
 		err:    Error,
 		window: time.Duration,
 	}
-	at, built := time.time_to_datetime(time.time_add(loop.now(), 5 * time.Minute))
+	at, built := time.time_to_datetime(time.time_add(loop.now(), 4 * time.Minute))
 	if !testing.expect(t, built, "cannot read the clock as a date") {
 		return
 	}
-	in_five_minutes := h2.format_http_date(at, context.temp_allocator)
+	in_four_minutes := h2.format_http_date(at, context.temp_allocator)
 	rows := []Row {
 		{
 			what = "429 asking for two minutes",
@@ -96,15 +99,15 @@ test_a_throttled_doh_h1_reply_parks_for_its_retry_after :: proc(t: ^testing.T) {
 			window = 2 * time.Minute,
 		},
 		{
-			what = "503 asking for five minutes by date",
-			reply = fmt.tprintf("HTTP/1.1 503 Service Unavailable\r\nRetry-After: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", in_five_minutes),
-			err = .Throttled,
-			window = 5 * time.Minute,
+			what = "503 asking for four minutes by date",
+			reply = fmt.tprintf("HTTP/1.1 503 Service Unavailable\r\nRetry-After: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", in_four_minutes),
+			err = .Unavailable,
+			window = 4 * time.Minute,
 		},
 		{
 			what = "503 with a maintenance page and no Retry-After",
 			reply = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 11\r\nConnection: close\r\n\r\nmaintenance",
-			err = .Throttled,
+			err = .Unavailable,
 			window = 0,
 		},
 		{
@@ -114,7 +117,7 @@ test_a_throttled_doh_h1_reply_parks_for_its_retry_after :: proc(t: ^testing.T) {
 			window = COOLDOWN,
 		},
 		{
-			what = "429 asking for years",
+			what = "429 asking for longer than the bound",
 			reply = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 99999999999\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
 			err = .Throttled,
 			window = MAX_RETRY_AFTER,
@@ -204,20 +207,59 @@ test_retry_after_is_read_only_where_the_status_asks_to_wait :: proc(t: ^testing.
 /*
 A `Retry-After` stops the next queries going to the upstream, even one that
 answers some of them (RFC 9110 10.2.3): a token bucket answering one query in
-three is still asked to be left alone, and an answer to a query sent before the
-refusal does not lift what the refusal asked for.
+three is still asked to be left alone. An answer to a query sent before the
+refusal does not lift what it asked for; an answer to one sent after it does,
+since the server is taking queries again.
 */
 @(test)
-test_an_answer_does_not_lift_a_retry_after :: proc(t: ^testing.T) {
+test_only_an_answer_sent_after_the_refusal_lifts_a_retry_after :: proc(t: ^testing.T) {
 	u: Upstream
-	note_throttled(&u, 429, 300)
+	before := loop.moment_now()
+	note_throttled(&u, .Throttled, 429, 300)
 	record_failure(&u, .Throttled)
 	testing.expect(t, !healthy(&u), "asked to wait 300s, the upstream is still asked first")
-	record_success(&u, time.Millisecond)
-	testing.expect(t, !healthy(&u), "an answer lifted what a Retry-After asked for")
+	record_success(&u, time.Millisecond, sent = before)
+	testing.expect(t, !healthy(&u), "an answer to a query sent before the refusal lifted it")
 	testing.expect(t, !answering(&u), "a member asked to be left alone is counted as answering")
 	wait := -loop.moment_since(u.throttled_until)
 	testing.expectf(t, wait > 5 * time.Minute - time.Second && wait <= 5 * time.Minute, "left alone for %v, want 5m", wait)
+
+	record_success(&u, time.Millisecond, sent = loop.moment_now())
+	testing.expect(t, healthy(&u), "an answer to a query sent after the refusal did not lift it")
+	testing.expect(t, answering(&u), "a member answering again is not counted as answering")
+}
+
+/*
+Through a group: a member parked by a `Retry-After` is still asked when the
+group has nobody else (`attempts: 2`, round 2), and its answer ends the window,
+so a lone upstream that throttled once is not shown down for the rest of it.
+*/
+@(test)
+test_a_parked_member_that_answers_its_group_is_back :: proc(t: ^testing.T) {
+	m: Echo_Mock
+	u, worker, ok := start_udp_mock(t, &m, echo_mock_loop, "throttled", time.Second)
+	if !ok {
+		return
+	}
+	defer stop_udp_mock(&m, worker, u)
+	note_throttled(u, .Throttled, 429, 300)
+	if !testing.expect(t, !healthy(u), "the Retry-After did not park the member") {
+		return
+	}
+	msg := dns.Message{id = 0x3271, question = []dns.Question{{name = "throttled.example.test.", type = .A, class = .IN}}}
+	msg.flags.rd = true
+	query, _, encoded := dns.encode_message(msg, context.temp_allocator)
+	if !testing.expect_value(t, encoded, dns.Encode_Error.None) {
+		return
+	}
+	ups := []^Upstream{u}
+	g := failover_group(ups, time.Second, attempts = 2)
+	resp, _, err := resolve(&g, query, context.allocator)
+	delete(resp, context.allocator)
+	testing.expectf(t, err == .None, "the parked member's answer did not come back: %v", err)
+	testing.expect_value(t, sync.atomic_load(&m.hits), 1)
+	testing.expect(t, healthy(u), "a member that answered is still parked by the Retry-After")
+	free_all(context.temp_allocator)
 }
 
 /*
@@ -227,7 +269,7 @@ timeouts after it park the upstream for `COOLDOWN`, as any timeouts do.
 @(test)
 test_a_retry_after_does_not_lengthen_a_later_cooldown :: proc(t: ^testing.T) {
 	u: Upstream
-	note_throttled(&u, 429, 3600)
+	note_throttled(&u, .Throttled, 429, 300)
 	record_failure(&u, .Throttled)
 	record_failure(&u, .Timeout)
 	record_failure(&u, .Timeout)
@@ -238,27 +280,22 @@ test_a_retry_after_does_not_lengthen_a_later_cooldown :: proc(t: ^testing.T) {
 
 /*
 Replies arriving together each ask for their own wait, and the longest stands:
-a later 503 that says nothing does not cut short what a 429 asked for. The line
-about the kind names one reply, status and `Retry-After` together, rather than
-the last status beside the longest wait.
+neither a later 503 that says nothing nor a later 429 asking for less cuts short
+what an earlier one asked for.
 */
 @(test)
 test_a_later_shorter_retry_after_does_not_cut_a_longer_one :: proc(t: ^testing.T) {
 	u: Upstream
-	note_throttled(&u, 429, 120)
-	note_throttled(&u, 503, 0)
+	note_throttled(&u, .Throttled, 429, 120)
+	note_throttled(&u, .Unavailable, 503, 0)
 	wait := -loop.moment_since(u.throttled_until)
 	testing.expectf(t, wait <= 2 * time.Minute && wait > 2 * time.Minute - time.Second, "asked to wait %v after a 120s and a bare 503", wait)
-	testing.expect_value(t, u.throttled_status, 503)
-	testing.expect_value(t, u.throttled_retry, 0)
 
-	// Nor does a later one asking for less.
 	v: Upstream
-	note_throttled(&v, 429, 300)
-	note_throttled(&v, 429, 120)
+	note_throttled(&v, .Throttled, 429, 300)
+	note_throttled(&v, .Throttled, 429, 120)
 	wait = -loop.moment_since(v.throttled_until)
 	testing.expectf(t, wait <= 5 * time.Minute && wait > 5 * time.Minute - time.Second, "asked to wait %v after a 300s and a 120s", wait)
-	testing.expect_value(t, v.throttled_retry, 120)
 }
 
 /*
@@ -281,7 +318,7 @@ test_a_throttled_doh_h2_reply_carries_its_retry_after :: proc(t: ^testing.T) {
 	}
 	rows := []Row {
 		{what = "429 asking for two minutes", status = "429", wait = 2 * time.Minute, err = .Throttled},
-		{what = "503 asking for two minutes", status = "503", wait = 2 * time.Minute, err = .Throttled},
+		{what = "503 asking for two minutes", status = "503", wait = 2 * time.Minute, err = .Unavailable},
 		{what = "429 asking twice, the first longer", status = "429", twice = true, wait = 2 * time.Minute, err = .Throttled},
 		{what = "429 whose body is past a DNS message", status = "429", body = dns.MAX_MESSAGE + 1, wait = 2 * time.Minute, err = .Throttled},
 		{what = "a 103 asking, then a 429", interim = true, status = "429", wait = 0, err = .Throttled},
@@ -307,4 +344,22 @@ test_a_throttled_doh_h2_reply_carries_its_retry_after :: proc(t: ^testing.T) {
 		testing.expectf(t, wait <= row.wait && wait > row.wait - time.Second, "%s: asked to wait %v, want %v", row.what, wait, row.wait)
 	}
 	free_all(context.temp_allocator)
+}
+
+/*
+A refusal is one event and asks its kind's gate once: `note_throttled` writes
+the line with the reply's own status and `Retry-After`, and `record_failure`,
+counting the same event a moment later, does not ask again. Asked twice, the
+second would count the event as held and could take the line for itself.
+*/
+@(test)
+test_a_refusal_asks_its_kinds_gate_once :: proc(t: ^testing.T) {
+	for kind in ([]Error{.Throttled, .Unavailable}) {
+		u: Upstream
+		note_throttled(&u, kind, 429 if kind == .Throttled else 503, 120)
+		record_failure(&u, kind)
+		testing.expectf(t, logx.gate_shut(&u.reported[kind], loop.tick_now()._nsec), "%v: the refusal did not pass its gate", kind)
+		testing.expectf(t, sync.atomic_load(&u.reported[kind].held) == 0, "%v: one refusal was counted as held", kind)
+		testing.expect_value(t, u.stats.failure_kinds[kind], 1)
+	}
 }

@@ -95,12 +95,15 @@ member is in that state they are tried anyway, as far as the budget allows — o
 the second attempt, so `attempts: 1` gives up instead, or all at once under
 `race`.
 
-An `https` upstream answering 429 Too Many Requests or 503 Service Unavailable
-is up and refusing elodin: its failures are `Throttled` rather than
-`HTTP_Error`. One that sends a `Retry-After` (a number of seconds or a date) is
-skipped at once for as long as it asks, at least ten seconds and at most an
-hour, even if it answers some queries in between; one without counts towards
-the three failures like any other.
+An `https` upstream answering 429 Too Many Requests is refusing elodin
+(`Throttled`), and one answering 503 Service Unavailable cannot serve for now:
+overloaded, in maintenance, or a proxy with no backend left (`Unavailable`).
+Neither is an `HTTP_Error`. One that sends a `Retry-After` (a number of seconds
+or a date) is skipped at once for as long as it asks, at least ten seconds and
+at most five minutes, until it answers a query sent after the refusal. One
+without counts towards the three failures like any other. With `attempts: 1`
+a group whose every member is skipped asks none of them, so a lone upstream
+that sends a `Retry-After` is not asked for that long.
 
 A dial that fails, a handshake that fails and a timeout all count. A peer that
 hangs up before sending a byte of the reply does not, on its own: DNS-over-TCP
@@ -139,8 +142,9 @@ level=warn msg="upstream cloudflare-doh: HTTP 429 asks to be left for 2m0s, paus
 | `Peer_Closed` | the peer hung up before a byte of the reply arrived, and hung up again on the retry |
 | `IO_Error` | the transport failed on an established session, including a reply cut off partway |
 | `Bad_Response` | a reply arrived and was thrown away: it did not echo the question, or on `udp://`/`tcp://` lacked the DNS cookie the query carried |
-| `Too_Large` | an `https` 200 longer than a DNS message (65535 bytes, RFC 8484 section 6), over HTTP/2 or HTTP/1.1; over HTTP/2 also a stream whose DATA, padding included, passes half the 1 MiB receive window. A declared `Content-Length` past it is refused before the body is read; it is not retried on a fresh connection. Any other status is `Throttled` or `HTTP_Error` whatever the size of its body |
-| `Throttled` | an `https` 429 (RFC 6585 section 4) or 503 (RFC 9110 section 15.6.4): the upstream refusing elodin rather than failing. The log line gives the status and the `Retry-After` it sent, if any, which skips the upstream as above |
+| `Too_Large` | an `https` 200 longer than a DNS message (65535 bytes, RFC 8484 section 6), over HTTP/2 or HTTP/1.1; over HTTP/2 also a stream whose DATA, padding included, passes half the 1 MiB receive window. A declared `Content-Length` past it is refused before the body is read; it is not retried on a fresh connection. Any other status is `Throttled`, `Unavailable` or `HTTP_Error` whatever the size of its body |
+| `Throttled` | an `https` 429 (RFC 6585 section 4): the upstream refusing elodin for the rate it asks at. The log line gives the `Retry-After` it sent, if any, which skips the upstream as above |
+| `Unavailable` | an `https` 503 (RFC 9110 section 15.6.4): the upstream, or a proxy in front of it, cannot serve for now. Its `Retry-After`, if any, skips the upstream as above |
 | `HTTP_Error` | an `https` reply that is not a 200 with at least a DNS header, nor a 429 or 503; over HTTP/2 also a stream the upstream reset with anything but REFUSED_STREAM, and a response RFC 9113 sections 8.1 to 8.3 make malformed: a missing, malformed or second `:status`, another pseudo-header, or a field section 8.2 refuses in its header section; a pseudo-header such as `:status` or a field 8.2 refuses in its trailers; trailers that do not end the stream, an interim (1xx) response that does, or DATA ahead of the final response |
 | `TLS_Failed`, `Verify_Failed` | the handshake; the log line carries OpenSSL's reason |
 | `Backlogged` | not sent: the pipelined connection's queue would outlast the query's timeout (see [connections](#connections)); never counts towards the cooldown |

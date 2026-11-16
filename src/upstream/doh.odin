@@ -436,18 +436,19 @@ redirect_allowed :: proc(origin_scheme: string, origin_public: bool, scheme: str
 }
 
 /*
-What a whole DoH reply that is not a usable answer reports: `Throttled` for the
-upstream refusing this server - 429 (RFC 6585 4) or 503 (RFC 9110 15.6.4) -
-with its `Retry-After` noted against `u`, and `HTTP_Error` for anything else,
-a 200 too short to be a DNS message included.
+What a whole DoH reply that is not a usable answer reports: `Throttled` for a
+429 (RFC 6585 4) and `Unavailable` for a 503 (RFC 9110 15.6.4), each with its
+`Retry-After` noted against `u`, and `HTTP_Error` for anything else, a 200 too
+short to be a DNS message included.
 */
 @(private)
 doh_refusal :: proc(u: ^Upstream, status: int, retry_after: u32) -> Error {
 	if !h2.status_asks_to_wait(status) {
 		return .HTTP_Error
 	}
-	note_throttled(u, status, retry_after)
-	return .Throttled
+	kind: Error = .Throttled if status == 429 else .Unavailable
+	note_throttled(u, kind, status, retry_after)
+	return kind
 }
 
 /*

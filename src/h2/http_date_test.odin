@@ -34,7 +34,8 @@ test_retry_after_reads_every_form_rfc_9110_allows :: proc(t: ^testing.T) {
 		{value = "-5", ok = false},
 		{value = "1_0", ok = false},
 		{value = "0x10", ok = false},
-		{value = "5 ", ok = false},
+		// OWS is the field value's own (RFC 9110 5.5), as for a Content-Length.
+		{value = "5 ", ok = true, seconds = 5},
 		{value = "5.0", ok = false},
 		// IMF-fixdate, two minutes on; a date already past is no wait at all.
 		{value = "Sun, 06 Nov 1994 08:51:37 GMT", ok = true, seconds = 120},

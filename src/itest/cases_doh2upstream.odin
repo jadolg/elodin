@@ -230,10 +230,11 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 		}
 	}
 
-	// --- an upstream answering 429 or 503 is throttling, not down ---
+	// --- an upstream answering 429 or 503 asks to be left alone ---
 	/*
-	RFC 6585 4 and RFC 9110 15.6.4: the upstream is up and refusing this server.
-	Its failures are a kind of their own, the log names the status and the
+	RFC 6585 4 and RFC 9110 15.6.4: a 429 is the upstream refusing this server,
+	a 503 one that cannot serve for now. Each is a kind of its own, not an
+	`http_error`; the log names the status and the
 	`Retry-After` it sent, and that parks it at once for as long as it asks (RFC
 	9110 10.2.3), so the queries after the first are not sent to it (#258). Over
 	both versions of the protocol, each with its own way of carrying the field.
@@ -243,10 +244,13 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 			what:   string,
 			alpn:   []string,
 			status: int,
+			// The kind as the log names it, and as the metric labels it.
+			kind:   string,
+			label:  string,
 		}
 		throttle_cases := []Throttle_Case {
-			{what = "upstream: an h2 DoH upstream answering 429 parks for its Retry-After", alpn = {"h2"}, status = 429},
-			{what = "upstream: an http/1.1 DoH upstream answering 503 parks for its Retry-After", alpn = {"http/1.1"}, status = 503},
+			{what = "upstream: an h2 DoH upstream answering 429 parks for its Retry-After", alpn = {"h2"}, status = 429, kind = "Throttled", label = "throttled"},
+			{what = "upstream: an http/1.1 DoH upstream answering 503 parks for its Retry-After", alpn = {"http/1.1"}, status = 503, kind = "Unavailable", label = "unavailable"},
 		}
 		for tc, i in throttle_cases {
 			upstream_port := next_port(r)
@@ -280,7 +284,7 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 					}
 					check(
 						r,
-						wait_for_log(&srv, fmt.tprintf("upstream busy (HTTPS 127.0.0.1): Throttled, HTTP %d, Retry-After 2m0s", tc.status), 3 * time.Second),
+						wait_for_log(&srv, fmt.tprintf("upstream busy (HTTPS 127.0.0.1): %s, HTTP %d, Retry-After 2m0s", tc.kind, tc.status), 3 * time.Second),
 						"the throttled line did not name the status and the Retry-After",
 					)
 					check(
@@ -294,7 +298,7 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 					check_eq_int(r, h2_hits + h1_hits, 1, "queries sent to an upstream that asked to be left alone")
 					// Every refusal the mock sent, and nothing else: an absent kind is -1.
 					page := metrics_page(metrics_port)
-					check_eq_int(r, metric_value(page, `elodin_upstream_failure_kind_total{upstream="busy",error="throttled"}`), h2_hits + h1_hits, "throttled failures")
+					check_eq_int(r, metric_value(page, fmt.tprintf(`elodin_upstream_failure_kind_total{{upstream="busy",error="%s"}}`, tc.label)), h2_hits + h1_hits, "refusals counted under their kind")
 					check_eq_int(r, metric_value(page, `elodin_upstream_failure_kind_total{upstream="busy",error="http_error"}`), -1, "http_error failures")
 					check_eq_int(r, metric_value(page, `elodin_upstream_up{upstream="busy"}`), 0, "up")
 				}

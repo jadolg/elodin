@@ -1,5 +1,6 @@
 package fuzz_retry_after
 
+import "core:strings"
 import dt "core:time/datetime"
 import "elodin:fuzz/harness"
 import "elodin:h2"
@@ -9,7 +10,8 @@ The `Retry-After` reader a DoH upstream's 429 or 503 writes into: delay-seconds
 and the three HTTP-date forms. The input is the field value.
 
 What is checked, against oracles of the target's own:
-  - delay-seconds is read exactly, saturating at `max(u32)`, whatever `now` is;
+  - delay-seconds is read exactly, OWS around it, saturating at `max(u32)`,
+    whatever `now` is;
   - a date read back through `h2.format_http_date` is the same moment;
   - an RFC 850 date's year ends in its two digits and lies from 49 years
     before `now` to 50 after (RFC 9110 5.6.7);
@@ -22,14 +24,16 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	defer harness.teardown(&f)
 
 	value := string(data[:size])
-	digits := len(value) > 0
+	// Delay-seconds with the OWS a field value may carry around it.
+	number := strings.trim(value, " \t")
+	digits := len(number) > 0
 	want: u64
-	for i in 0 ..< len(value) {
-		if value[i] < '0' || value[i] > '9' {
+	for i in 0 ..< len(number) {
+		if number[i] < '0' || number[i] > '9' {
 			digits = false
 			break
 		}
-		want = min(want * 10 + u64(value[i] - '0'), u64(max(u32)))
+		want = min(want * 10 + u64(number[i] - '0'), u64(max(u32)))
 	}
 
 	// Mid-year, so a day earlier is the same year and the RFC 850 window
