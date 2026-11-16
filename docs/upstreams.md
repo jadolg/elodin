@@ -131,8 +131,7 @@ line is the only place it shows up.
 ```
 level=warn msg="upstream quad9-dot (TLS 9.9.9.9): Timeout"
 level=warn msg="upstream quad9-dot: TLS handshake with \"dns.quad9.net\" failed: certificate has expired"
-level=warn msg="upstream cloudflare-doh (HTTPS 1.1.1.1): Throttled, HTTP 429, Retry-After 2m0s"
-level=warn msg="upstream cloudflare-doh: HTTP 429 asks to be left for 2m0s, pausing it for 2m0s"
+level=warn msg="upstream cloudflare-doh (HTTPS 1.1.1.1): Throttled, HTTP 429, Retry-After 2m0s, pausing it for 2m0s"
 ```
 
 | kind | meaning |

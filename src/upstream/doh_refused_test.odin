@@ -33,6 +33,10 @@ Refusing_Peer :: struct {
 	head:     []u8,
 	// Bytes of zeros sent as the body after `head`.
 	body:     int,
+	// Instead of ending the stream after `head`, reset it with INTERNAL_ERROR,
+	// or leave it open and send nothing more.
+	reset:    bool,
+	stall:    bool,
 }
 
 @(private = "file")
@@ -96,8 +100,13 @@ refusing_peer_run :: proc(p: ^Refusing_Peer) {
 					h2.write_frame_header(&out, len(p.interim), .Headers, h2.FLAG_END_HEADERS, h.stream_id)
 					append(&out, ..p.interim)
 				}
-				h2.write_frame_header(&out, len(p.head), .Headers, h2.FLAG_END_HEADERS | (h2.FLAG_END_STREAM if p.body == 0 else 0), h.stream_id)
+				ends := p.body == 0 && !p.reset && !p.stall
+				h2.write_frame_header(&out, len(p.head), .Headers, h2.FLAG_END_HEADERS | (h2.FLAG_END_STREAM if ends else 0), h.stream_id)
 				append(&out, ..p.head)
+				if p.reset {
+					h2.write_frame_header(&out, 4, .Rst_Stream, 0, h.stream_id)
+					h2.append_u32(&out, u32(h2.Error_Code.Internal_Error))
+				}
 				// In frames no larger than the default SETTINGS_MAX_FRAME_SIZE.
 				for sent := 0; sent < p.body; {
 					n := min(p.body - sent, h2.DEFAULT_MAX_FRAME)
@@ -132,8 +141,8 @@ One exchange answered by the header block `head`, after the interim block
 the upstream to wait, or zero.
 */
 @(private)
-exchange_with_head :: proc(t: ^testing.T, interim, head: []u8, body: int) -> (err: Error, wait: time.Duration) {
-	err, _, wait = exchange_with_peer(t, 0, interim, head, body, context.temp_allocator)
+exchange_with_head :: proc(t: ^testing.T, interim, head: []u8, body: int, reset := false, stall := false) -> (err: Error, wait: time.Duration) {
+	err, _, wait = exchange_with_peer(t, 0, interim, head, body, context.temp_allocator, reset = reset, stall = stall)
 	return
 }
 
@@ -144,6 +153,8 @@ exchange_with_peer :: proc(
 	interim, head: []u8,
 	body: int,
 	allocator: mem.Allocator,
+	reset := false,
+	stall := false,
 ) -> (
 	err: Error,
 	headers: int,
@@ -164,6 +175,8 @@ exchange_with_peer :: proc(
 		interim  = interim,
 		head     = head,
 		body     = body,
+		reset    = reset,
+		stall    = stall,
 	}
 	peer := thread.create_and_start_with_poly_data(&p, refusing_peer_run)
 

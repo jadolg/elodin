@@ -18,7 +18,7 @@ Run one DoH exchange over HTTP/1.1 against `reply`, and charge the upstream
 for it as `exchange` would. Hands back the kind, how long a `Retry-After` has
 the upstream left alone for, and whether it is still asked first.
 */
-@(private = "file")
+@(private)
 throttle_on_h1_reply :: proc(t: ^testing.T, reply: string) -> (err: Error, window: time.Duration, up: bool, ok: bool) {
 	query := []u8{0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1}
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
@@ -131,6 +131,12 @@ test_a_throttled_doh_h1_reply_parks_for_its_retry_after :: proc(t: ^testing.T) {
 		{
 			what = "429 whose body is past a DNS message",
 			reply = fmt.tprintf("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", dns.MAX_MESSAGE + 1),
+			err = .Throttled,
+			window = 2 * time.Minute,
+		},
+		{
+			what = "429 whose body breaks off",
+			reply = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 50\r\nConnection: close\r\n\r\n0123456789",
 			err = .Throttled,
 			window = 2 * time.Minute,
 		},
@@ -313,6 +319,11 @@ test_a_throttled_doh_h2_reply_carries_its_retry_after :: proc(t: ^testing.T) {
 		twice:   bool,
 		// Bytes of body after the header block.
 		body:    int,
+		// The stream reset after the header block, or left open with nothing more.
+		reset:   bool,
+		stall:   bool,
+		// A second `:status` after the fields, which RFC 9113 8.3 makes malformed.
+		malformed: bool,
 		wait:    time.Duration,
 		err:     Error,
 	}
@@ -321,6 +332,10 @@ test_a_throttled_doh_h2_reply_carries_its_retry_after :: proc(t: ^testing.T) {
 		{what = "503 asking for two minutes", status = "503", wait = 2 * time.Minute, err = .Unavailable},
 		{what = "429 asking twice, the first longer", status = "429", twice = true, wait = 2 * time.Minute, err = .Throttled},
 		{what = "429 whose body is past a DNS message", status = "429", body = dns.MAX_MESSAGE + 1, wait = 2 * time.Minute, err = .Throttled},
+		{what = "429 reset after its head", status = "429", reset = true, wait = 2 * time.Minute, err = .Throttled},
+		{what = "503 whose body never comes", status = "503", stall = true, wait = 2 * time.Minute, err = .Unavailable},
+		{what = "500 reset after its head", status = "500", reset = true, wait = 0, err = .HTTP_Error},
+		{what = "a malformed 429", status = "429", malformed = true, wait = 0, err = .HTTP_Error},
 		{what = "a 103 asking, then a 429", interim = true, status = "429", wait = 0, err = .Throttled},
 		{what = "500 asking for two minutes", status = "500", wait = 0, err = .HTTP_Error},
 	}
@@ -338,8 +353,11 @@ test_a_throttled_doh_h2_reply_carries_its_retry_after :: proc(t: ^testing.T) {
 			if row.twice {
 				h2.encode_header(&head, "retry-after", "15")
 			}
+			if row.malformed {
+				h2.encode_header(&head, ":status", "200")
+			}
 		}
-		err, wait := exchange_with_head(t, interim[:], head[:], row.body)
+		err, wait := exchange_with_head(t, interim[:], head[:], row.body, reset = row.reset, stall = row.stall)
 		testing.expectf(t, err == row.err, "%s: %v, want %v", row.what, err, row.err)
 		testing.expectf(t, wait <= row.wait && wait > row.wait - time.Second, "%s: asked to wait %v, want %v", row.what, wait, row.wait)
 	}
@@ -362,4 +380,47 @@ test_a_refusal_asks_its_kinds_gate_once :: proc(t: ^testing.T) {
 		testing.expectf(t, sync.atomic_load(&u.reported[kind].held) == 0, "%v: one refusal was counted as held", kind)
 		testing.expect_value(t, u.stats.failure_kinds[kind], 1)
 	}
+}
+
+/*
+An answer between refusals closes each window, so a token bucket can open one
+per answer. The line that says so is the kind's, behind its gate, so five
+refusals write one line and count four as held, however often windows open.
+*/
+@(test)
+test_reopened_windows_share_one_gate :: proc(t: ^testing.T) {
+	u: Upstream
+	for _ in 0 ..< 5 {
+		note_throttled(&u, .Throttled, 429, 30)
+		if !testing.expect(t, !healthy(&u), "the refusal did not open a window") {
+			return
+		}
+		record_success(&u, time.Millisecond, sent = loop.moment_now())
+		if !testing.expect(t, healthy(&u), "the answer did not close the window") {
+			return
+		}
+	}
+	testing.expect_value(t, sync.atomic_load(&u.reported[.Throttled].held), 4)
+}
+
+/*
+Refusals noted out of the order of their moments keep the later one: a refusal
+that read its moment before another, and recorded it after, would otherwise move
+`refused_at` back, and an answer to a query sent between the two would lift the
+later refusal's window. The test holds the upstream's lock while a refusal is
+under way, and records one an hour later in the meantime.
+*/
+@(test)
+test_an_earlier_refusal_does_not_move_refused_at_back :: proc(t: ^testing.T) {
+	u: Upstream
+	sync.mutex_lock(&u.mu)
+	a := thread.create_and_start_with_poly_data(&u, proc(u: ^Upstream) {
+		note_throttled(u, .Throttled, 429, 300)
+	})
+	later := loop.moment_add(loop.moment_now(), time.Hour)
+	u.refused_at = later
+	sync.mutex_unlock(&u.mu)
+	thread.join(a)
+	thread.destroy(a)
+	testing.expectf(t, u.refused_at >= later, "refused_at moved back by %v", time.Duration(later - u.refused_at))
 }

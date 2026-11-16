@@ -119,6 +119,9 @@ Client_Stream :: struct {
 	final:       bool,
 	// The `retry-after` of the section that set `status`; see Client_Response.
 	retry_after: u32,
+	// This end failed the response as malformed (RFC 9113 8.1.1), so it has no
+	// status a caller may act on; see client_finish_headers.
+	malformed:   bool,
 }
 
 Client_Request :: struct {
@@ -131,6 +134,12 @@ Client_Request :: struct {
 	body:         []u8,
 }
 
+/*
+What `client_request` hands back. `status` and `retry_after` are the final
+response head's whenever one arrived, with `.None`, `.Too_Large`, `.Reset` and
+`.Timeout` alike, so a caller can tell a server that answered 429 and then
+stopped from one that never answered; the body only with `.None`.
+*/
 Client_Response :: struct {
 	status:      int,
 	body:        []u8,
@@ -550,6 +559,27 @@ parse_status :: proc(value: string) -> int {
 }
 
 /*
+The `retry-after` a header section carries, in seconds, when its `:status` -
+first, as RFC 9113 8.3 has it - is one `status_asks_to_wait` names; zero
+otherwise. Not a list (RFC 9110 10.2.3), so the first one is the one.
+*/
+@(private = "file")
+section_retry_after :: proc(headers: []Header_Field) -> u32 {
+	if len(headers) == 0 || headers[0].name != ":status" || !status_asks_to_wait(parse_status(headers[0].value)) {
+		return 0
+	}
+	for f in headers[1:] {
+		if f.name == "retry-after" {
+			if seconds, ok := retry_after_now(f.value); ok {
+				return seconds
+			}
+			return 0
+		}
+	}
+	return 0
+}
+
+/*
 Decode a completed response header block and, if the stream is still tracked,
 record its status and completion.
 
@@ -571,6 +601,9 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 		client_goaway(c, .Internal_Error if err == .Out_Of_Memory else .Compression_Error)
 		return false
 	}
+
+	// Read before the lock every stream on the connection waits on.
+	retry_after := section_retry_after(headers)
 
 	loop.lock(&c.mu)
 	s, found := c.streams[stream_id]
@@ -611,7 +644,7 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 			ordinary fields are held to 8.2 as the trailers are.
 			*/
 			s.status = 0
-			seen_status, seen_regular, seen_retry := false, false, false
+			seen_status, seen_regular := false, false
 			for f in headers {
 				if len(f.name) > 0 && f.name[0] == ':' {
 					if f.name != ":status" || seen_status || seen_regular {
@@ -625,15 +658,9 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 					if field_is_malformed(f) {
 						malformed = true
 					}
-					// Not a list (RFC 9110 10.2.3), so the first one is the one; and
-					// read only where the status gives it a meaning, which `:status`,
-					// ahead of every ordinary field, has already said.
-					if f.name == "retry-after" && !seen_retry && status_asks_to_wait(s.status) {
-						seen_retry = true
-						s.retry_after, _ = retry_after_now(f.value)
-					}
 				}
 			}
+			s.retry_after = retry_after
 			// A missing or malformed `:status` reads as 0, which is no interim
 			// response; nor is a 101, which HTTP/2 has no use for (8.6). Final,
 			// so no later block supplies the status, and malformed (8.3.2).
@@ -641,6 +668,7 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 			malformed ||= s.status == 0 || !s.final && s.end_stream
 		}
 		if malformed {
+			s.malformed = true
 			s.reset = true
 			loop.cond_broadcast(&c.cond)
 		} else {
@@ -1017,6 +1045,7 @@ client_request :: proc(
 		oversized := s.oversized
 		status := s.status
 		retry_after := s.retry_after
+		malformed := s.malformed
 		dry := s.dry || c.dry
 		loop.unlock(&c.mu)
 		switch {
@@ -1030,10 +1059,12 @@ client_request :: proc(
 			return {}, .Closed
 		case refused:
 			return {}, .Refused
-		case reset:
+		case reset && malformed:
 			return {}, .Reset
+		case reset:
+			return Client_Response{status = status, retry_after = retry_after}, .Reset
 		case:
-			return {}, .Timeout
+			return Client_Response{status = status, retry_after = retry_after}, .Timeout
 		}
 	}
 
@@ -1041,9 +1072,11 @@ client_request :: proc(
 	for !s.done && !s.reset && !c.closed {
 		remaining := time.tick_diff(loop.tick_now(), deadline)
 		if remaining <= 0 {
+			// A final response's head may have come without its body.
+			status, retry_after := s.status, s.retry_after
 			loop.unlock(&c.mu)
 			client_rst_stream(c, stream_id, .Cancel)
-			return {}, .Timeout
+			return Client_Response{status = status, retry_after = retry_after}, .Timeout
 		}
 		loop.cond_wait_with_timeout(&c.cond, &c.mu, remaining)
 	}
@@ -1052,7 +1085,7 @@ client_request :: proc(
 	// A reset after a complete response is the peer ending the upload early
 	// (RFC 9113 8.1), and the client MUST NOT discard that response.
 	case s.reset && !s.done:
-		refused, oversized, dry, status, retry_after := s.refused, s.oversized, s.dry, s.status, s.retry_after
+		refused, oversized, dry, malformed, status, retry_after := s.refused, s.oversized, s.dry, s.malformed, s.status, s.retry_after
 		loop.unlock(&c.mu)
 		switch {
 		case oversized:
@@ -1060,7 +1093,14 @@ client_request :: proc(
 		case dry:
 			return {}, .Out_Of_Memory
 		}
-		return {}, .Refused if refused else .Reset
+		if refused {
+			return {}, .Refused
+		}
+		// A response that is not one (8.1.1) has no head to hand on.
+		if malformed {
+			return {}, .Reset
+		}
+		return Client_Response{status = status, retry_after = retry_after}, .Reset
 	case c.closed && !s.done:
 		dry := c.dry
 		loop.unlock(&c.mu)

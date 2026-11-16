@@ -145,7 +145,9 @@ exchange_doh_h2 :: proc(
 			// not park it.
 			return nil, .Peer_Closed
 		case .Reset:
-			return nil, .HTTP_Error
+			// A refusal's head that came before the reset is still the
+			// server's word, as on HTTP/1.1.
+			return nil, doh_refusal(u, resp.status, resp.retry_after)
 		case .Out_Of_Memory:
 			return nil, .Out_Of_Memory
 		case .Too_Large:
@@ -154,6 +156,9 @@ exchange_doh_h2 :: proc(
 			// whatever the size of the body nobody reads.
 			return nil, .Too_Large if resp.status == 200 else doh_refusal(u, resp.status, resp.retry_after)
 		case .Timeout:
+			if h2.status_asks_to_wait(resp.status) {
+				return nil, doh_refusal(u, resp.status, resp.retry_after)
+			}
 			return nil, .Timeout
 		}
 	}
@@ -247,6 +252,11 @@ exchange_doh_h1 :: proc(
 			delete(resp.body, allocator)
 		}
 		stream_close(&stream)
+		// A 429 or 503 whose body then broke off is still the server asking to
+		// be left alone: not retried on a fresh dial, and its `Retry-After` kept.
+		if herr != .None && h2.status_asks_to_wait(resp.status) {
+			return nil, doh_refusal(u, resp.status, resp.retry_after)
+		}
 		// A non-200 is the server's answer whatever the size of its body, which
 		// nobody reads: a 408 is still retried, and an error page is still what
 		// `doh_refusal` makes of its status, as on HTTP/2.

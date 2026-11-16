@@ -476,7 +476,7 @@ answer to a query sent after its latest 429 or 503 ends what that asked for: the
 server is taking queries again. One sent before it says nothing of the sort.
 */
 @(private)
-record_success :: proc(u: ^Upstream, elapsed: time.Duration, sent: loop.Moment = {}) {
+record_success :: proc(u: ^Upstream, elapsed: time.Duration, sent: loop.Moment) {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 	if sent > u.refused_at {
@@ -648,15 +648,16 @@ record_failure :: proc(
 }
 
 /*
-Note that `u` refused this server with `status`, asking, by its `Retry-After`,
-to be left alone for `retry_after` seconds from now - zero when it did not say.
+Note that `u` refused this server with `status`, the failure of kind `kind` it
+is reported as, asking by its `Retry-After` to be left alone for `retry_after`
+seconds from now - zero when it did not say.
 
 A wait parks `u` at once, apart from the run of failures that parks it for
 `COOLDOWN`: RFC 9110 10.2.3 has the client wait before asking again, so the next
 queries go to the rest of the group rather than to a server that has said it
 will refuse them, however many in between it answers. For no less than
 `COOLDOWN`, which is compliant - longer than asked - and keeps a server asking
-for a second from opening a window per second, and no more than
+for a second from being asked again a second later, and no more than
 `MAX_RETRY_AFTER`, so a server asking for days does not bench a member for the
 life of the process - nor, under `attempts: 1`, leave a group whose every
 member is parked answering nothing for longer than that. The longest wait any
@@ -667,34 +668,31 @@ A parked member is still asked when the rest of its group cannot answer, as for
 the cooldown (see `resolve_sequential`).
 
 Writes the kind's line, once a `logx.GATE_WINDOW`, with this reply's own status
-and `Retry-After`; and a line each time a window opens, which is at most once a
-`COOLDOWN`.
+and `Retry-After` and how long the member is skipped for: one gate however often
+a window opens, which an answer between refusals can make as often as the
+server answers.
 */
 @(private)
 note_throttled :: proc(u: ^Upstream, kind: Error, status: int, retry_after: u32) {
-	now := loop.moment_now()
 	asked := time.Duration(retry_after) * time.Second
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
-	u.refused_at = now
+	// Read under the lock, so refusals land in the order of their moments and
+	// `refused_at` only moves forward.
+	now := loop.moment_now()
+	u.refused_at = max(u.refused_at, now)
+	if retry_after > 0 {
+		u.throttled_until = max(u.throttled_until, loop.moment_add(now, clamp(asked, COOLDOWN, MAX_RETRY_AFTER)))
+	}
 	if loud, held := note_failure_kind(u, kind); loud {
-		// Which refusal, and what it asked for, is the diagnosis: an operator
-		// over quota and one whose upstream is in maintenance act differently.
+		// Which refusal, what it asked for, and what that does to the member is
+		// the diagnosis: an operator over quota and one whose upstream is in
+		// maintenance act differently.
 		said := fmt.tprintf(", Retry-After %v", asked) if retry_after > 0 else ""
-		logx.warnf_held(held, "upstream %s (%v %s): %v, HTTP %d%s", u.spec.name, u.spec.kind, u.spec.address, kind, status, said)
+		pause := time.duration_round(-loop.moment_since(u.throttled_until), time.Second)
+		pausing := fmt.tprintf(", pausing it for %v", pause) if pause > 0 else ""
+		logx.warnf_held(held, "upstream %s (%v %s): %v, HTTP %d%s%s", u.spec.name, u.spec.kind, u.spec.address, kind, status, said, pausing)
 	}
-	if retry_after == 0 {
-		return
-	}
-	wait := clamp(asked, COOLDOWN, MAX_RETRY_AFTER)
-	until := loop.moment_add(now, wait)
-	if until <= u.throttled_until {
-		return
-	}
-	if loop.moment_since(u.throttled_until) >= 0 {
-		logx.warnf("upstream %s: HTTP %d asks to be left for %v, pausing it for %v", u.spec.name, status, asked, wait)
-	}
-	u.throttled_until = until
 }
 
 /*

@@ -2455,8 +2455,7 @@ epoch explicitly would be indistinguishable from passing nothing.
 */
 @(private)
 http_date :: proc(clock: time.Time, allocator := context.allocator) -> string {
-	// A wall clock past year 9999, which is no IMF-fixdate, is not one this
-	// process meets: the epoch is its zero.
+	// Every `time.Time` converts: its nanoseconds span years 1677 to 2262.
 	at, _ := time.time_to_datetime(clock)
 	return h2.format_http_date(at, allocator)
 }

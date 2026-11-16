@@ -165,3 +165,30 @@ test_client_reads_retry_after_only_where_the_status_asks_to_wait :: proc(t: ^tes
 		free_all(context.temp_allocator)
 	}
 }
+
+/*
+A response RFC 9113 8.1.1 makes malformed is not one: the stream is failed as
+malformed, which `client_request` reads to hand on no status with the reset.
+*/
+@(test)
+test_a_malformed_429_carries_no_status :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
+	s := open_test_stream(c, 1, allocator)
+	block := make([dynamic]u8, 0, 64, context.temp_allocator)
+	encode_header(&block, ":status", "429")
+	encode_header(&block, "retry-after", "120")
+	// A second `:status` makes the section malformed (8.3).
+	encode_header(&block, ":status", "200")
+	clear(&c.header_scratch)
+	append(&c.header_scratch, ..block[:])
+	ok := client_finish_headers(c, 1)
+	testing.expect(t, ok, "a malformed response should be a stream error, not a connection error")
+	testing.expect(t, s.reset && s.malformed, "the malformed response was not failed as one")
+	client_stream_destroy(c, s)
+	delete_key(&c.streams, u32(1))
+	client_done(t, c, &track, "malformed 429", &log)
+	free_all(context.temp_allocator)
+}

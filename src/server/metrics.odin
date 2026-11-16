@@ -962,7 +962,7 @@ render_upstream_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 		)
 	}
 
-	metrics.family(b, "elodin_upstream_up", .Gauge, "1 while an upstream is being used, 0 while it is in its failure cooldown.")
+	metrics.family(b, "elodin_upstream_up", .Gauge, "1 while an upstream is being used, 0 while it is in its failure cooldown or skipped for a Retry-After.")
 	for u in all {
 		metrics.sample(b, "elodin_upstream_up", u64(1) if u.up else u64(0), metrics.Label{"upstream", u.name})
 	}

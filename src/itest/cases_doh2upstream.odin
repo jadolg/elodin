@@ -284,13 +284,12 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 					}
 					check(
 						r,
-						wait_for_log(&srv, fmt.tprintf("upstream busy (HTTPS 127.0.0.1): %s, HTTP %d, Retry-After 2m0s", tc.kind, tc.status), 3 * time.Second),
-						"the throttled line did not name the status and the Retry-After",
-					)
-					check(
-						r,
-						wait_for_log(&srv, fmt.tprintf("upstream busy: HTTP %d asks to be left for 2m0s, pausing it for 2m0s", tc.status), 3 * time.Second),
-						"the upstream was not parked for its Retry-After",
+						wait_for_log(
+							&srv,
+							fmt.tprintf("upstream busy (HTTPS 127.0.0.1): %s, HTTP %d, Retry-After 2m0s, pausing it for 2m0s", tc.kind, tc.status),
+							3 * time.Second,
+						),
+						"the refusal's line did not name the status, the Retry-After and the pause",
 					)
 					// Asked once: the refusal parked it, and `attempts: 1` gives up on a
 					// group whose every member is parked rather than asking it again.
