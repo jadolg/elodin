@@ -157,84 +157,16 @@ jobs:
           name: release-static
 
   image:
-    name: Container image (linux-${{ matrix.arch }})
-    # The image for one architecture, built on a runner of that architecture
-    # (see scripts/build-image.sh), run as a user would run it, and pushed under
-    # a tag naming the architecture. publish-image joins the two under the
-    # release's own tags once both are there.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-26.04-arm
-    runs-on: ${{ matrix.runner }}
+    name: Container image
+    # Built, checked and pushed per architecture, then joined and signed: see
+    # image.yml, which image-refresh.yml also calls.
+    uses: ./.github/workflows/image.yml
+    with:
+      tag: ${{ github.event.release.tag_name }}
     permissions:
       contents: read
       packages: write
-    env:
-      ELODIN_IMAGE: ghcr.io/${{ github.repository }}:${{ github.event.release.tag_name }}-${{ matrix.arch }}
-      ELODIN_VERSION: ${{ github.event.release.tag_name }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/core-dumps
-        with:
-          mode: setup
-      - name: Install a DNS client
-        run: sudo apt-get update && sudo apt-get install -y dnsutils
-      - uses: jdx/mise-action@v5
-        with:
-          install: true
-          cache: true
-      - run: mise run image
-
-      # It says it is the release, and it resolves, blocks, reloads and stops
-      # unprivileged on a read-only root. The full suite ran on this commit in
-      # CI; this is the image about to be published.
-      - name: Check the image
-        run: |
-          docker run --rm "$ELODIN_IMAGE" --version | tee /dev/stderr | grep -q "^elodin $ELODIN_VERSION "
-          scripts/image-smoke.sh "$ELODIN_IMAGE"
-
-      - name: Push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker push "$ELODIN_IMAGE"
-      - if: failure()
-        uses: ./.github/actions/core-dumps
-        with:
-          mode: report
-          name: release-image
-
-  publish-image:
-    name: Publish the container image
-    # One tag for both architectures, made only once both are pushed, so a pull
-    # of the release tag never finds one architecture missing. `latest` and the
-    # minor version (0.28) move only for a full release, not a prerelease.
-    needs: image
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    env:
-      REPO: ghcr.io/${{ github.repository }}
-      TAG: ${{ github.event.release.tag_name }}
-      PRERELEASE: ${{ github.event.release.prerelease }}
-    steps:
-      - name: Join the architectures under the release's tags
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          tags=(-t "$REPO:$TAG")
-          if [ "$PRERELEASE" != true ]; then
-            tags+=(-t "$REPO:${TAG%.*}" -t "$REPO:latest")
-          fi
-          docker buildx imagetools create "${tags[@]}" "$REPO:$TAG-amd64" "$REPO:$TAG-arm64"
-          docker buildx imagetools inspect "$REPO:$TAG"
+      id-token: write
 
   publish-deb:
     name: Publish deb to repository

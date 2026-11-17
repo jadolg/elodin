@@ -143,20 +143,47 @@ docker run -d --name elodin --restart unless-stopped --ulimit nofile=65536 \
 Compose, with a read-only root, every capability dropped and
 `no-new-privileges`, none of which the image needs.
 
-**What is in it.** The image is built `FROM scratch` and holds about 12 MB:
+**What is in it.** elodin on Google's [distroless](https://github.com/GoogleContainerTools/distroless)
+Debian 13 base (`base-debian13:nonroot`), about 10 MB to pull. The base carries
+glibc, OpenSSL and the CA bundle, and nothing that runs: no shell, no package
+manager, no busybox. elodin adds:
 
 | path | what |
 |---|---|
-| `/usr/bin/elodin` | the binary, linked against musl, with OpenSSL as shared libraries |
-| `/lib/ld-musl-*.so.1`, `/usr/lib/libssl.so.3`, `/usr/lib/libcrypto.so.3` | musl and OpenSSL, from the Alpine release in `ELODIN_ALPINE` |
-| `/etc/ssl/cert.pem` | the CA bundle, which upstream TLS and list downloads are checked against |
+| `/usr/bin/elodin` | the binary, linked in Debian 13 against the base's glibc and OpenSSL |
 | `/etc/elodin/elodin.yaml` | [`examples/docker.yaml`](../examples/docker.yaml) |
-| `/etc/passwd`, `/etc/group` | the account it runs as, `elodin`, uid and gid 65532 |
-| `/var/cache/elodin/` | the blocklist cache, owned by that account |
+| `/var/cache/elodin/` | the blocklist cache, owned by the account it runs as, `nonroot` (uid and gid 65532) |
 
-There is no shell, no package manager and nothing else to run: `docker exec`
-has nothing to execute. The build checks the image's files against this table
-and fails on anything more.
+`docker exec` has nothing to execute. The build fails if the image holds any
+program but elodin and its shared libraries, so a shell arriving with a base
+update is caught before it is published. For a shell beside a running
+container, `docker debug`, or the base's `:debug-nonroot` variant with busybox,
+are the tools.
+
+**Updates and verification.** The base is pinned by digest in
+`packaging/Dockerfile`, so a commit builds the same image whenever it is
+built, and its labels name the base it was built on
+(`org.opencontainers.image.base.digest`). Dependabot moves the pin when Google
+rebuilds the base for a Debian security update; a weekly job then rebuilds the
+newest release on it and moves its tags, so an OpenSSL or glibc fix reaches the
+image without waiting for an elodin release. The base's package metadata is in
+the image, so scanners such as Trivy and Grype see glibc and OpenSSL and their
+versions; each image also carries an SBOM and build provenance:
+
+```sh
+docker buildx imagetools inspect ghcr.io/jadolg/elodin:latest --format '{{json .SBOM}}'
+```
+
+Images are signed with cosign, keyless, by the workflow that built them:
+
+```sh
+cosign verify ghcr.io/jadolg/elodin:latest \
+  --certificate-identity-regexp '^https://github\.com/jadolg/elodin/\.github/workflows/image\.yml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+`latest` moves only to the highest release, and `0.28` only to the highest
+`0.28.x`, so publishing a fix for an older line never moves either backwards.
 
 **Your own configuration.** Mount it over the default, read-only, and check it
 first with the image that will run it:
@@ -177,27 +204,19 @@ container's own network namespace. Publish on the host's LAN address rather
 than on every address: systemd-resolved holds `127.0.0.53:53`, and Docker
 cannot publish `0.0.0.0:53` beside it. With `--network host` the host's rule for
 ports below 1024 applies instead; start it as root with `--user 0` and set
-`server.user: elodin`, and it drops to the image's account once its ports are
+`server.user: nonroot`, and it drops to the image's account once its ports are
 bound ([below](#privileges)).
 
 **Descriptors.** Docker's default limit of 1,024 is short of what the default
 configuration can want, which elodin warns about at startup (`descriptors:
 the limit is 1024`); `--ulimit nofile=65536` raises it.
 
-**How it differs from the other builds.** It is the dynamic build's linking on
-the [static build's](#static-tarballs-for-musl-systems-and-any-other-linux) C
-library:
-
-- OpenSSL is a pair of files beside the binary rather than code inside it, but
-  the image is published with each release, so an OpenSSL fix reaches the
-  published image with the next release. `mise run image` builds one on the
-  current Alpine packages at any time.
-- musl's allocator, as in the static build: smaller at rest, slower under DoT
-  and DoH load than the glibc build.
-- Accounts come from the image's `/etc/passwd` only.
-- OpenSSL applies `/etc/ssl/openssl.cnf`, which the image does not carry, or
-  the file `OPENSSL_CONF` names, as the dynamic build does.
-- `SSL_CERT_FILE` names a different CA bundle, mounted into the container.
+**How it differs from the `.deb`'s build.** The same glibc and dynamically
+linked OpenSSL, at Debian 13's versions rather than your distribution's. The
+image sets `MALLOC_MMAP_THRESHOLD_=131072`, as the systemd unit does, and
+`SSL_CERT_FILE` names the base's CA bundle; mount another bundle and point
+`SSL_CERT_FILE` at it to change what upstreams are checked against. OpenSSL
+applies the file `OPENSSL_CONF` names, if any; the image carries none.
 
 ## Privileges
 

@@ -144,9 +144,9 @@ jobs:
     name: Container image (${{ matrix.arch }})
     # The image a release publishes (packaging/Dockerfile), built for each
     # architecture on a runner of that architecture, as the binaries are. The
-    # integration suite runs against the binary and the shared musl and OpenSSL
-    # the image carries, a combination no other job has: dynamic like the .deb's
-    # build, musl like the static one. Then the image itself is run the way
+    # integration suite runs against the image's binary, linked in Debian 13 on
+    # the glibc and OpenSSL the image's base carries, which are not the
+    # runner's. Then the image itself is run the way
     # examples/compose.yaml runs it - unprivileged, read-only, no capabilities -
     # and has to resolve, validate, block, reload and stop (scripts/image-smoke.sh).
     strategy:

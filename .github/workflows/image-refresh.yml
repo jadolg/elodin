@@ -1,0 +1,72 @@
+name: Refresh the container image
+
+# The published image of the newest release, rebuilt on main's base pins when
+# they have moved past the ones it was built on.
+#
+# The image's OpenSSL, glibc and CA bundle come from the distroless base, whose
+# pin in packaging/Dockerfile Dependabot moves when Google rebuilds it for a
+# Debian security update. Without this, that fix would reach users only with
+# the next elodin release. The release's own source is built - same elodin,
+# same configuration - with main's Dockerfile for its pins, and goes through
+# the same checks and smoke test as a release before it replaces the tags.
+#
+# Only a release that already has an image is refreshed: one from before the
+# image existed has nothing to build it with.
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+jobs:
+  decide:
+    name: Is the newest release on main's base?
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      stale: ${{ steps.check.outputs.stale }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compare the base digests
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ghcr.io/${{ github.repository }}
+        run: |
+          tag=$(gh release list --exclude-pre-releases --exclude-drafts --limit 1000 --json tagName -q '.[].tagName' | sort -V | tail -1)
+          want=$(sed -nE 's/^FROM [^ ]+@(sha256:[0-9a-f]{64}) AS image$/\1/p' packaging/Dockerfile)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if ! config=$(docker buildx imagetools inspect "$REPOSITORY:$tag" --format '{{json .Image}}' 2>/dev/null); then
+            echo "$tag has no image; nothing to refresh"
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # One configuration per platform; any of them names the base.
+          have=$(jq -r '[.. | objects | .config?.Labels?["org.opencontainers.image.base.digest"]? // empty] | first // ""' <<<"$config")
+          echo "$tag is on ${have:-an unrecorded base}; main pins $want"
+          if [ "$have" = "$want" ]; then
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  refresh:
+    name: Rebuild ${{ needs.decide.outputs.tag }}
+    needs: decide
+    if: needs.decide.outputs.stale == 'true'
+    uses: ./.github/workflows/image.yml
+    with:
+      tag: ${{ needs.decide.outputs.tag }}
+      dockerfile-ref: ${{ github.sha }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write

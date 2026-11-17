@@ -112,8 +112,9 @@ docker run --rm --init -v "$PWD:$PWD" -w "$PWD" "$ELODIN_ALPINE" sh -euc '
 """
 
 # The container image for this machine's architecture, tagged $ELODIN_IMAGE
-# (default elodin:dev): elodin and the musl and OpenSSL it links as shared
-# libraries, on `scratch`. Needs docker: see the script and packaging/Dockerfile.
+# (default elodin:dev): elodin on the distroless Debian base, which carries the
+# glibc and OpenSSL it links. Needs docker: see the script and
+# packaging/Dockerfile.
 [tasks.image]
 description = "Build the container image for this architecture (elodin:dev)"
 depends = ["prepare"]
@@ -121,8 +122,8 @@ run = "scripts/build-image.sh"
 
 # The integration suite against the image's binary and libraries, then the image
 # itself run the way examples/compose.yaml runs it (scripts/image-smoke.sh).
-# The suite runs in the image's link stage, which carries the same libssl and
-# libcrypto plus the openssl CLI and strace the suite needs and the image does
+# The suite runs in the image's link stage, the Debian release the base is
+# built from, plus the openssl CLI and strace the suite needs and the image does
 # not. As root, so the case that needs a failing privilege drop skips; `--init`
 # for Ctrl-C, as in itest-static.
 [tasks.itest-image]

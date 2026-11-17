@@ -1,67 +1,63 @@
-# The container image: elodin, the musl loader and the OpenSSL it links, the CA
-# bundle, and nothing else - no shell, no package manager, no busybox.
+# The container image: elodin on Google's distroless Debian base, which carries
+# glibc, OpenSSL, the CA bundle and an unprivileged account, and no shell,
+# package manager or any other program.
 #
 # Not buildable from the checkout alone: Odin compiles on the host, as for every
 # other build, and scripts/build-image.sh hands this file a context holding the
-# objects (obj/), the default configuration and nothing else. Run it as
-# `mise run image`.
+# objects (obj/), the default configuration, an empty cache/ and nothing else.
+# Run it as `mise run image`.
 #
-# The link stage is the one scripts/build-static.sh uses, with `-pie` in place
-# of `-static-pie`: OpenSSL stays a pair of shared libraries beside the binary
-# rather than being linked into it, so an image rebuilt after Alpine ships an
-# OpenSSL fix carries the fix without elodin being compiled again, and the
-# library's version is a file anyone can look at.
+# The objects link in a Debian container of the release the base is built from,
+# against the same glibc and libssl-dev the base's libraries come from. Linking
+# on the runner instead would tie the binary to the runner's glibc, which is
+# newer than Debian's and would leave it asking for symbol versions the image
+# does not have.
+#
+# Both images are pinned by digest, so a commit builds the same image whenever
+# it is built; Dependabot moves the pins (.github/dependabot.yml), and each move
+# goes through CI's image job like any other change. The base's digest is also
+# written into the image's labels (scripts/build-image.sh), which is what
+# .github/workflows/image-refresh.yml compares to decide a published release
+# needs rebuilding on a newer base.
 
-ARG ALPINE=alpine:3.24
-
-FROM ${ALPINE} AS link
-RUN apk add --no-cache -q gcc musl-dev openssl-dev ca-certificates
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS link
+RUN apt-get update -qq \
+	&& apt-get install -y -qq --no-install-recommends gcc libc6-dev libssl-dev >/dev/null \
+	&& rm -rf /var/lib/apt/lists/*
 COPY obj/ /obj/
-# The binary, then every library its dynamic section names, each at the path
-# the loader will look for it, found by asking the loader. Each line of musl's
-# ldd is either `name => path (addr)` or, for the loader itself, `path (addr)`.
-# No list of file names is kept here, so an OpenSSL soname change or a new
-# dependency is picked up rather than missed.
-#
-# The CA bundle goes to /etc/ssl/cert.pem, the file Alpine's OpenSSL reads by
-# default. The Debian path (/etc/ssl/certs/ca-certificates.crt) would be
-# ignored, and every verified upstream would fail its handshake.
-#
-# The account exists so `docker exec`, `ps` and a log line name it; elodin
-# itself never looks it up, since it starts as that uid rather than dropping to
-# it. /var/cache/elodin is where `blocking.cache_dir` points by default, and
-# belongs to the account so a named volume mounted there inherits that.
-RUN set -eu; \
-	gcc -pie -Wl,--strip-debug /obj/elodin/*.o /obj/elodin_switch.o -o /elodin -lssl -lcrypto -lm -lpthread; \
-	install -D -m 0755 /elodin /rootfs/usr/bin/elodin; \
-	ldd /elodin | awk '$2 == "=>" { print $3; next } { print $1 }' | sort -u | while read -r lib; do \
-		install -D -m 0755 "$(readlink -f "$lib")" "/rootfs$lib"; \
-	done; \
-	install -D -m 0644 "$(readlink -f /etc/ssl/cert.pem)" /rootfs/etc/ssl/cert.pem; \
-	printf 'elodin:x:65532:65532:elodin:/var/cache/elodin:/sbin/nologin\n' > /rootfs/etc/passwd; \
-	printf 'elodin:x:65532:\n' > /rootfs/etc/group; \
-	install -d -m 0755 -o 65532 -g 65532 /rootfs/var/cache/elodin; \
-	echo "linked against $(apk info -e -v musl libssl3 libcrypto3 | tr '\n' ' ')"
-COPY elodin.yaml /rootfs/etc/elodin/elodin.yaml
+RUN gcc -pie -Wl,--strip-debug /obj/elodin/*.o /obj/elodin_switch.o -o /elodin -lssl -lcrypto -lm -lpthread \
+	&& echo "linked against $(dpkg-query -W -f '${Package} ${Version}  ' libc6 libssl3t64)"
 
 # The integration suite, linked the same way and run against the binary above,
-# on the same libraries: this stage is the link stage, whose libssl and
-# libcrypto are the files the image carries. The suite needs the openssl CLI
-# and strace, which the image itself never will. scripts/build-image.sh builds
-# it only when asked (--itest).
+# on the same Debian release. It needs the openssl CLI and strace, which the
+# image itself never will. scripts/build-image.sh builds it only when asked
+# (--itest).
 FROM link AS itest
-RUN set -eu; \
-	apk add --no-cache -q openssl strace; \
-	gcc -pie /obj/itest/*.o /obj/elodin_switch.o -o /usr/local/bin/itest -lssl -lcrypto -lm -lpthread; \
-	cp /elodin /usr/bin/elodin
+RUN apt-get update -qq \
+	&& apt-get install -y -qq --no-install-recommends openssl strace ca-certificates >/dev/null \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& gcc -pie /obj/itest/*.o /obj/elodin_switch.o -o /usr/local/bin/itest -lssl -lcrypto -lm -lpthread \
+	&& cp /elodin /usr/bin/elodin
 
-FROM scratch AS image
+# The `nonroot` variant runs as uid and gid 65532 (`nonroot`), and sets
+# SSL_CERT_FILE to its CA bundle, which is where upstream TLS and list downloads
+# are checked: Debian's OpenSSL would otherwise look under /usr/lib/ssl, which
+# the base does not have.
+FROM gcr.io/distroless/base-debian13:nonroot@sha256:a08d9054afbaf1af9b90fd02cdc7b32236319b5376d374505a41548d42b0c5db AS image
 ARG VERSION=dev
 ARG REVISION=unknown
-# --chown keeps the cache directory the account's; COPY otherwise gives every
-# file to root.
-COPY --from=link /rootfs/ /
-COPY --from=link --chown=65532:65532 /rootfs/var/cache/elodin/ /var/cache/elodin/
+ARG BASE_NAME=unknown
+ARG BASE_DIGEST=unknown
+COPY --from=link /elodin /usr/bin/elodin
+COPY elodin.yaml /etc/elodin/elodin.yaml
+# The blocklist cache (`blocking.cache_dir`), the account's, so a named volume
+# mounted there takes that ownership. --chown because COPY otherwise gives what
+# it creates to root.
+COPY --chown=65532:65532 cache/ /var/cache/elodin/
+# glibc keeps the memory a blocklist refresh frees unless its mmap threshold is
+# pinned; packaging/elodin.service sets the same, and docs/blocking.md says why.
+ENV MALLOC_MMAP_THRESHOLD_=131072
+WORKDIR /
 USER 65532:65532
 # Documentation only; publishing is `-p`. 9153 is the metrics endpoint the
 # default configuration serves.
@@ -72,4 +68,6 @@ LABEL org.opencontainers.image.title="elodin" \
 	org.opencontainers.image.source="https://github.com/jadolg/elodin" \
 	org.opencontainers.image.licenses="MIT" \
 	org.opencontainers.image.version="${VERSION}" \
-	org.opencontainers.image.revision="${REVISION}"
+	org.opencontainers.image.revision="${REVISION}" \
+	org.opencontainers.image.base.name="${BASE_NAME}" \
+	org.opencontainers.image.base.digest="${BASE_DIGEST}"

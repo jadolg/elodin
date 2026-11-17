@@ -25,7 +25,7 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - A Prometheus endpoint, off by default
 - Configuration reloads on `SIGHUP`, keeping the cache, cookies and connections
 - Ships as a systemd service, a `.deb` with optional system-resolver takeover,
-  or a container image holding nothing but elodin and the libraries it links
+  or a distroless container image in which elodin is the only program
 
 ## Installing
 
