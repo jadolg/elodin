@@ -21,6 +21,13 @@
 # needs rebuilding on a newer base.
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS link
+# Unversioned on purpose (DL3008). The release is fixed by the digest above,
+# and within it Debian keeps only the current version of a package: a version
+# pinned here would vanish from the archive with the next security update and
+# fail every build of this commit from then on. What has to hold - the binary
+# loads against the base's glibc and OpenSSL - is checked where it matters:
+# scripts/build-image.sh runs it inside the image before anything is published.
+# hadolint ignore=DL3008
 RUN apt-get update -qq \
 	&& apt-get install -y -qq --no-install-recommends gcc libc6-dev libssl-dev >/dev/null \
 	&& rm -rf /var/lib/apt/lists/*
@@ -33,6 +40,7 @@ RUN gcc -pie -Wl,--strip-debug /obj/elodin/*.o /obj/elodin_switch.o -o /elodin -
 # image itself never will. scripts/build-image.sh builds it only when asked
 # (--itest).
 FROM link AS itest
+# hadolint ignore=DL3008
 RUN apt-get update -qq \
 	&& apt-get install -y -qq --no-install-recommends openssl strace ca-certificates >/dev/null \
 	&& rm -rf /var/lib/apt/lists/* \
