@@ -127,6 +127,78 @@ Where it differs from the dynamic build:
 The unit's `MALLOC_MMAP_THRESHOLD_` is glibc's, and musl ignores it; musl's
 allocator gives a blocklist refresh's memory back without it.
 
+## Container image
+
+Each release publishes an image for amd64 and arm64 to the GitHub Container
+Registry, tagged with the release (`0.28.0`), its minor version (`0.28`) and
+`latest`:
+
+```sh
+docker run -d --name elodin --restart unless-stopped --ulimit nofile=65536 \
+  -p 192.168.1.2:53:53/udp -p 192.168.1.2:53:53/tcp \
+  -v elodin-cache:/var/cache/elodin ghcr.io/jadolg/elodin:latest
+```
+
+[`examples/compose.yaml`](../examples/compose.yaml) is the same for Docker
+Compose, with a read-only root, every capability dropped and
+`no-new-privileges`, none of which the image needs.
+
+**What is in it.** The image is built `FROM scratch` and holds about 12 MB:
+
+| path | what |
+|---|---|
+| `/usr/bin/elodin` | the binary, linked against musl, with OpenSSL as shared libraries |
+| `/lib/ld-musl-*.so.1`, `/usr/lib/libssl.so.3`, `/usr/lib/libcrypto.so.3` | musl and OpenSSL, from the Alpine release in `ELODIN_ALPINE` |
+| `/etc/ssl/cert.pem` | the CA bundle, which upstream TLS and list downloads are checked against |
+| `/etc/elodin/elodin.yaml` | [`examples/docker.yaml`](../examples/docker.yaml) |
+| `/etc/passwd`, `/etc/group` | the account it runs as, `elodin`, uid and gid 65532 |
+| `/var/cache/elodin/` | the blocklist cache, owned by that account |
+
+There is no shell, no package manager and nothing else to run: `docker exec`
+has nothing to execute. The build checks the image's files against this table
+and fails on anything more.
+
+**Your own configuration.** Mount it over the default, read-only, and check it
+first with the image that will run it:
+
+```sh
+docker run --rm -v "$PWD/elodin.yaml:/etc/elodin/elodin.yaml:ro" ghcr.io/jadolg/elodin --check
+```
+
+Certificates for DoT or DoH and `file:` lists are mounted the same way; the
+account has to be able to read them. `docker kill -s HUP elodin` reloads as
+`SIGHUP` does [below](#signals). Allow `docker stop` more than
+`server.client_timeout` (`-t 15`), or an idle connection's wait is cut short by
+SIGKILL.
+
+**Ports.** The image runs as uid 65532 from the start, and binds port 53 without
+any capability because Docker lets an unprivileged process bind low ports in a
+container's own network namespace. Publish on the host's LAN address rather
+than on every address: systemd-resolved holds `127.0.0.53:53`, and Docker
+cannot publish `0.0.0.0:53` beside it. With `--network host` the host's rule for
+ports below 1024 applies instead; start it as root with `--user 0` and set
+`server.user: elodin`, and it drops to the image's account once its ports are
+bound ([below](#privileges)).
+
+**Descriptors.** Docker's default limit of 1,024 is short of what the default
+configuration can want, which elodin warns about at startup (`descriptors:
+the limit is 1024`); `--ulimit nofile=65536` raises it.
+
+**How it differs from the other builds.** It is the dynamic build's linking on
+the [static build's](#static-tarballs-for-musl-systems-and-any-other-linux) C
+library:
+
+- OpenSSL is a pair of files beside the binary rather than code inside it, but
+  the image is published with each release, so an OpenSSL fix reaches the
+  published image with the next release. `mise run image` builds one on the
+  current Alpine packages at any time.
+- musl's allocator, as in the static build: smaller at rest, slower under DoT
+  and DoH load than the glibc build.
+- Accounts come from the image's `/etc/passwd` only.
+- OpenSSL applies `/etc/ssl/openssl.cnf`, which the image does not carry, or
+  the file `OPENSSL_CONF` names, as the dynamic build does.
+- `SSL_CERT_FILE` names a different CA bundle, mounted into the container.
+
 ## Privileges
 
 Binding a port below 1024 is the only thing elodin needs root for. Either of two

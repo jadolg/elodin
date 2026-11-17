@@ -1,0 +1,48 @@
+# elodin with Docker Compose, as the resolver for one network.
+#
+#   docker compose -f examples/compose.yaml up -d
+#
+# Runs the image with its default configuration, examples/docker.yaml. To use
+# your own, uncomment the volume under `volumes:` that mounts it read-only.
+#
+# Publish port 53 on the host's LAN address, as below, rather than on every
+# address. On a machine running systemd-resolved, whose stub holds
+# 127.0.0.53:53, publishing on 0.0.0.0 fails with "address already in use";
+# a specific address does not conflict with it.
+
+services:
+  elodin:
+    image: ghcr.io/jadolg/elodin:latest
+    restart: unless-stopped
+    ports:
+      # The address your devices use for DNS. Use 0.0.0.0 only on a host
+      # nothing public can reach.
+      - "192.168.1.2:53:53/udp"
+      - "192.168.1.2:53:53/tcp"
+      # Metrics, for a Prometheus on this host only.
+      - "127.0.0.1:9153:9153/tcp"
+    volumes:
+      # The blocklist cache, so a restart does not download the lists again.
+      - elodin-cache:/var/cache/elodin
+      # - ./elodin.yaml:/etc/elodin/elodin.yaml:ro
+    # Nothing in the image is written except the cache volume, and elodin needs
+    # no capability at all: binding port 53 inside the container's network
+    # namespace is open to an unprivileged process.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # A SIGTERM stops the listeners and lets queries in flight finish; an idle
+    # client connection is only noticed when its read times out, up to
+    # `server.client_timeout` (10 s by default). Docker's own default is the
+    # same 10 s, so give it a little longer before SIGKILL.
+    stop_grace_period: 15s
+    # Docker's default of 1,024 descriptors is short of what this configuration
+    # can want (512 connections, plus a descriptor for each query in flight),
+    # which elodin warns about at startup.
+    ulimits:
+      nofile: 65536
+    # `docker compose kill -s HUP elodin` reloads the configuration, the
+    # certificates and the lists without dropping the cache.
+
+volumes:
+  elodin-cache:

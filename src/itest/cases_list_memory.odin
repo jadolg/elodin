@@ -30,9 +30,9 @@ started with, and one without it - the premise, which has to grow. A control
 that does not grow fails the case: the check would pass whatever the unit set,
 so the list's size needs moving back into the band where glibc keeps the
 memory. Under a sanitizer, whose allocator is not glibc's, it is skipped. Against
-the static build, whose allocator is musl's, only the process with the unit's
-environment runs: musl gives the memory back without the setting, so there is no
-premise to hold.
+a musl build - the static one, or the container image's - only the process with
+the unit's environment runs: musl gives the memory back without the setting, so
+there is no premise to hold.
 */
 
 /*
@@ -250,19 +250,20 @@ run_list_memory_cases :: proc(r: ^Runner) {
 	if !env_ok {
 		return
 	}
-	static := r.static
+	musl := r.musl
 
 	start_case(r, NAME)
 	/*
 	The premise is glibc's: its defaults keep a rebuild's peak, here at least
 	half as much again as the process started with. musl's allocator, which the
-	static build carries, gives the memory back without the unit's setting, so
-	there the claim is only that the unit's environment does too.
+	static build and the container image carry, gives the memory back without
+	the unit's setting, so there the claim is only that the unit's environment
+	does too.
 	*/
 	c0, c1: int
 	cok: bool
-	premise := static
-	if !static {
+	premise := musl
+	if !musl {
 		c0, c1, cok = rss_across_rebuilds(r, control[:], list_path)
 		premise =
 			cok &&
@@ -277,7 +278,7 @@ run_list_memory_cases :: proc(r: ^Runner) {
 	}
 	if premise {
 		if u0, u1, uok := rss_across_rebuilds(r, shipped[:], list_path); uok {
-			control_line := "" if static else fmt.tprintf(" (%d -> %d KiB without it)", c0, c1)
+			control_line := "" if musl else fmt.tprintf(" (%d -> %d KiB without it)", c0, c1)
 			check(
 				r,
 				u1 * 4 <= u0 * 5,

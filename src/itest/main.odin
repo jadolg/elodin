@@ -163,6 +163,15 @@ main :: proc() {
 		os.exit(2)
 	}
 	r.static = static
+	musl, musl_ok := binary_is_musl(&r)
+	if !musl_ok {
+		fmt.eprintfln("itest: cannot read %s", r.binary)
+		if !keep {
+			remove_work_dir(work_dir)
+		}
+		os.exit(2)
+	}
+	r.musl = musl
 
 	cert, key, cert_ok := ensure_certificate(work_dir)
 	r.cert_file = cert
@@ -171,6 +180,7 @@ main :: proc() {
 	fmt.printfln("elodin integration tests")
 	fmt.printfln("  binary:    %s", r.binary)
 	fmt.printfln("  static:    %v", r.static)
+	fmt.printfln("  musl:      %v", r.musl)
 	fmt.printfln("  work dir:  %s", work_dir)
 	fmt.printfln("  ports:     %d-%d", base_port, r.port_limit - 1)
 	if !cert_ok {

@@ -8,6 +8,7 @@ changes, with a comment on why; anything they leave out is the shipped default.
 |---|---|
 | [`local-only.yaml`](../examples/local-only.yaml) | one machine resolving for itself, bound to loopback |
 | [`lan.yaml`](../examples/lan.yaml) | the resolver a home or small-office network points at |
+| [`docker.yaml`](../examples/docker.yaml) | the same, in the container image, where it is the configuration the image ships with; [`compose.yaml`](../examples/compose.yaml) runs it |
 | [`small-device.yaml`](../examples/small-device.yaml) | a router or a small board, where memory and CPU are the constraint |
 | [`public.yaml`](../examples/public.yaml) | a resolver on the internet that anybody may query |
 | [`container.yaml`](../examples/container.yaml) | a container or DaemonSet in front of a cluster's own DNS |
@@ -37,6 +38,18 @@ one prefix's budget and the allow list already bounds the clients. It turns
 [rebinding protection](rebinding.md#dns-rebinding-protection) on, answers the
 network's own names from `rewrites`, and turns `special_use.home_arpa` on so
 those names stop leaking to the public DNS.
+
+**`docker.yaml`** is `lan.yaml` for the [container image](install.md#container-image),
+and what the image runs when no configuration is mounted. Its `allow_from` keeps
+every private range rather than one `/24`: a query from the Docker host, every
+query under Docker Desktop and IPv6 through Docker's userland proxy arrive from
+the bridge's gateway rather than from the device that asked. `server.user` is
+empty, since the image never runs as root. The metrics endpoint is bound wide
+inside the container, whose loopback nothing else can reach, so publishing
+9153 is what decides who can scrape it. The blocklist cache is
+`/var/cache/elodin`, which the image's account owns, for a volume.
+`compose.yaml` runs it with a read-only root, no capabilities, the cache volume
+and a descriptor limit above Docker's default of 1,024.
 
 **`small-device.yaml`** is the LAN setup sized for memory. It pins 32 queries in
 flight and 1 reader - one event loop - with a 256 KiB receive buffer, and carries one blocklist

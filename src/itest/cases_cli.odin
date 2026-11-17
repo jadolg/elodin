@@ -353,6 +353,7 @@ run_cli_cases :: proc(r: ^Runner) {
 		for path in ([]string {
 			"examples/local-only.yaml",
 			"examples/lan.yaml",
+			"examples/docker.yaml",
 			"examples/small-device.yaml",
 			"examples/container.yaml",
 			"examples/dev.yaml",

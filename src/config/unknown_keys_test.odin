@@ -133,6 +133,11 @@ test_examples_load :: proc(t: ^testing.T) {
 	paths, _ := filepath.glob("examples/*.yaml", context.temp_allocator)
 	testing.expect(t, len(paths) > 0, "no examples found; run from the repository root")
 	for p in paths {
+		// Docker Compose's file, which runs the image with examples/docker.yaml
+		// and is no configuration of elodin's.
+		if filepath.base(p) == "compose.yaml" {
+			continue
+		}
 		// Any refusal but a missing file: an example naming a certificate that is
 		// not on this machine is refused for that, and rightly. Matching only
 		// "unknown key" would let a duplicate key (a parse error) or a section in

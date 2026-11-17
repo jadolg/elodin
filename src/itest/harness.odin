@@ -50,6 +50,10 @@ Runner :: struct {
 	// The binary is the static build, musl and its own OpenSSL linked in; read
 	// once from its `--version` (see `binary_is_static`).
 	static:    bool,
+	// Its C library is musl: the static build, or the container image's, which
+	// links musl and OpenSSL as shared libraries (see `binary_is_musl`). What an
+	// allocator gives back is musl's question here, not linking's.
+	musl:      bool,
 }
 
 /*
@@ -292,6 +296,22 @@ binary_is_static :: proc(r: ^Runner) -> (static, ok: bool) {
 		return false, false
 	}
 	return strings.contains(res.output, STATIC_MARK), true
+}
+
+/*
+Whether the binary under test runs on musl: the static build carries it, and a
+dynamic one names musl's loader as its interpreter (`/lib/ld-musl-<arch>.so.1`)
+where a glibc build names `ld-linux`. `ok` false when the binary cannot be read.
+*/
+binary_is_musl :: proc(r: ^Runner) -> (musl, ok: bool) {
+	if r.static {
+		return true, true
+	}
+	data, err := os.read_entire_file(r.binary, context.temp_allocator)
+	if err != nil {
+		return false, false
+	}
+	return strings.contains(string(data), "/ld-musl-"), true
 }
 
 /*
