@@ -83,22 +83,50 @@ start
 q() { dig +time=5 +tries=2 @127.0.0.1 "$@"; }
 
 uid=$(docker top "$name" -o pid,uid,comm | awk '$3 == "elodin" { print $2 }')
-[ "$uid" = 65532 ] && pass "runs as uid 65532" || fail "runs as uid ${uid:-?}, want 65532"
+if [ "$uid" = 65532 ]; then
+	pass "runs as uid 65532"
+else
+	fail "runs as uid ${uid:-?}, want 65532"
+fi
 
-q -p "$dns_port" +short example.com A | grep -qE '^[0-9]+\.' && pass "UDP answers" || fail "no A for example.com over UDP"
-q -p "$tcp_port" +tcp +short example.org A | grep -qE '^[0-9]+\.' && pass "TCP answers" || fail "no A for example.org over TCP"
+if q -p "$dns_port" +short example.com A | grep -qE '^[0-9]+\.'; then
+	pass "UDP answers"
+else
+	fail "no A for example.com over UDP"
+fi
+if q -p "$tcp_port" +tcp +short example.org A | grep -qE '^[0-9]+\.'; then
+	pass "TCP answers"
+else
+	fail "no A for example.org over TCP"
+fi
 # The AD bit needs both upstream TLS checked against the image's CA bundle and
 # DNSSEC validated with the image's libcrypto.
-q -p "$dns_port" +dnssec cloudflare.com A | grep -q 'flags:.* ad;' && pass "DNSSEC validates" || fail "no AD bit for cloudflare.com"
-q -p "$dns_port" doubleclick.net A | grep -q 'status: NXDOMAIN' && pass "blocks" || fail "doubleclick.net was not blocked"
+if q -p "$dns_port" +dnssec cloudflare.com A | grep -q 'flags:.* ad;'; then
+	pass "DNSSEC validates"
+else
+	fail "no AD bit for cloudflare.com"
+fi
+if q -p "$dns_port" doubleclick.net A | grep -q 'status: NXDOMAIN'; then
+	pass "blocks"
+else
+	fail "doubleclick.net was not blocked"
+fi
 
 # Every list downloaded over HTTPS, and was written into the volume as the
 # image's account.
 docker logs "$name" 2>&1 | grep -q 'download failed' && fail "a blocklist download failed: $(docker logs "$name" 2>&1 | grep 'download failed' | head -1)"
 cached=$(docker cp "$name:/var/cache/elodin" - | tar -tv --numeric-owner | awk '$NF ~ /\.list$/ && $2 == "65532/65532"' | wc -l)
-[ "$cached" -ge 1 ] && pass "$cached blocklists cached in the volume" || fail "no blocklist was cached in /var/cache/elodin"
+if [ "$cached" -ge 1 ]; then
+	pass "$cached blocklists cached in the volume"
+else
+	fail "no blocklist was cached in /var/cache/elodin"
+fi
 
-curl -fsS "http://127.0.0.1:$metrics_port/metrics" | grep -q '^elodin_' && pass "metrics served" || fail "no elodin_ metrics on 9153"
+if curl -fsS "http://127.0.0.1:$metrics_port/metrics" | grep -q '^elodin_'; then
+	pass "metrics served"
+else
+	fail "no elodin_ metrics on 9153"
+fi
 
 # Nothing but elodin to run: no shell for an exec, or for anything that got in.
 if docker exec "$name" /bin/sh -c true >/dev/null 2>&1; then
@@ -108,7 +136,11 @@ else
 fi
 
 docker kill -s HUP "$name" >/dev/null
-wait_log 20 'msg="reload: ' && pass "reloads on SIGHUP" || fail "no reload after SIGHUP"
+if wait_log 20 'msg="reload: '; then
+	pass "reloads on SIGHUP"
+else
+	fail "no reload after SIGHUP"
+fi
 
 # A restart keeps the volume, so the lists come from it rather than the network.
 docker restart -t 15 "$name" >/dev/null
@@ -124,11 +156,19 @@ started=$SECONDS
 docker stop -t 15 "$name" >/dev/null
 code=$(docker inspect -f '{{.State.ExitCode}}' "$name")
 took=$((SECONDS - started))
-[ "$code" = 0 ] && pass "stops cleanly on SIGTERM (${took}s)" || fail "exit code $code after SIGTERM"
+if [ "$code" = 0 ]; then
+	pass "stops cleanly on SIGTERM (${took}s)"
+else
+	fail "exit code $code after SIGTERM"
+fi
 
 # The compose sample parses, against the image under test.
 if docker compose version >/dev/null 2>&1; then
-	docker compose -f examples/compose.yaml config -q && pass "examples/compose.yaml is valid" || fail "examples/compose.yaml does not parse"
+	if docker compose -f examples/compose.yaml config -q; then
+		pass "examples/compose.yaml is valid"
+	else
+		fail "examples/compose.yaml does not parse"
+	fi
 fi
 
 if [ "$failed" != 0 ]; then
