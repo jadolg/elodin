@@ -4,7 +4,7 @@ name: Refresh the container image
 # they have moved past the ones it was built on.
 #
 # The image's OpenSSL, glibc and CA bundle come from the distroless base, whose
-# pin in packaging/Dockerfile Dependabot moves when Google rebuilds it for a
+# pin in the Dockerfile Dependabot moves when Google rebuilds it for a
 # Debian security update. Without this, that fix would reach users only with
 # the next elodin release. The release's own source is built - same elodin,
 # same configuration - with main's Dockerfile for its pins, and goes through
@@ -35,26 +35,42 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Compare the base digests
+      # Whether the published image sits on the base main pins: the base's
+      # layers are the image's first layers exactly when it was built on that
+      # base. Read from the registry for linux/amd64; both architectures are
+      # built from the one pin.
+      - name: Compare the base layers
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ghcr.io/${{ github.repository }}
         run: |
+          # The layers of `ref`'s linux/amd64 image, one digest a line.
+          layers() {
+            local raw repo d
+            raw=$(docker buildx imagetools inspect --raw "$1") || return 1
+            if jq -e '.manifests' <<<"$raw" >/dev/null; then
+              repo=${1%@*}
+              case ${repo##*/} in *:*) repo=${repo%:*} ;; esac
+              d=$(jq -r '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")][0].digest' <<<"$raw")
+              raw=$(docker buildx imagetools inspect --raw "$repo@$d") || return 1
+            fi
+            jq -r '.layers[].digest' <<<"$raw"
+          }
           tag=$(gh release list --exclude-pre-releases --exclude-drafts --limit 1000 --json tagName -q '.[].tagName' | sort -V | tail -1)
-          want=$(sed -nE 's/^FROM [^ ]+@(sha256:[0-9a-f]{64}) AS image$/\1/p' packaging/Dockerfile)
+          base=$(sed -nE 's/^FROM ([^ ]+@sha256:[0-9a-f]{64}) AS image$/\1/p' Dockerfile)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if ! config=$(docker buildx imagetools inspect "$REPOSITORY:$tag" --format '{{json .Image}}' 2>/dev/null); then
+          if ! ours=$(layers "$REPOSITORY:$tag" 2>/dev/null); then
             echo "$tag has no image; nothing to refresh"
             echo "stale=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # One configuration per platform; any of them names the base.
-          have=$(jq -r '[.. | objects | .config?.Labels?["org.opencontainers.image.base.digest"]? // empty] | first // ""' <<<"$config")
-          echo "$tag is on ${have:-an unrecorded base}; main pins $want"
-          if [ "$have" = "$want" ]; then
+          theirs=$(layers "$base")
+          if [ "$(head -n "$(wc -l <<<"$theirs")" <<<"$ours")" = "$theirs" ]; then
+            echo "$tag is on $base"
             echo "stale=false" >> "$GITHUB_OUTPUT"
           else
+            echo "$tag is not on $base"
             echo "stale=true" >> "$GITHUB_OUTPUT"
           fi
 

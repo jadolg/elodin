@@ -21,8 +21,8 @@ mise run itest            # integration tests against the built binary
 mise run itest-release    # the same suite against the optimised build
 mise run release-static   # bin/static/elodin: musl and OpenSSL linked in (needs docker)
 mise run itest-static     # the suite against it, inside Alpine (needs docker)
-mise run image            # the container image, elodin:dev, for this architecture (needs docker)
-mise run itest-image      # the suite against its binary and libraries, then scripts/image-smoke.sh
+mise run image            # the container image, elodin:dev: docker build . and its verify target
+mise run itest-image      # the suite against the image's binary, then scripts/image-smoke.sh
 mise run leakcheck        # the same suite under AddressSanitizer
 mise run verify           # check + test + itest
 mise run check            # -vet -strict-style on every package (tests included), and scripts/lint.py

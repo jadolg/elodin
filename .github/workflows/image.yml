@@ -4,9 +4,10 @@ name: Container image
 # arm64. Called by release.yml when a release is published, and by
 # image-refresh.yml to rebuild the newest release on a newer base.
 #
-# Each architecture builds natively on its own runner (scripts/build-image.sh),
+# Each architecture builds natively on its own runner with
+# docker/build-push-action - elodin compiles inside the build (see Dockerfile) -
 # is run as a user would run it (scripts/image-smoke.sh), and only then is
-# pushed - by digest, with no tag, carrying an SBOM and build provenance. The
+# pushed: by digest, with no tag, carrying an SBOM and build provenance. The
 # publish job joins the two digests under the release's tags once both exist,
 # so a tag never names one architecture without the other and no per-arch tag
 # is left behind, then signs the result with cosign (keyless, through this
@@ -20,7 +21,7 @@ on:
         required: true
         type: string
       dockerfile-ref:
-        description: a ref whose packaging/Dockerfile replaces the release's own, for its newer base pins; empty keeps the release's
+        description: a ref whose Dockerfile replaces the release's own, for its newer base pins; empty keeps the release's
         required: false
         type: string
         default: ''
@@ -44,8 +45,7 @@ jobs:
       contents: read
       packages: write
     env:
-      ELODIN_IMAGE: elodin:release
-      ELODIN_VERSION: ${{ inputs.tag }}
+      TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -54,30 +54,47 @@ jobs:
         if: inputs.dockerfile-ref != ''
         run: |
           git fetch --depth 1 origin "${{ inputs.dockerfile-ref }}"
-          git checkout FETCH_HEAD -- packaging/Dockerfile
-          grep '^FROM ' packaging/Dockerfile
+          git checkout FETCH_HEAD -- Dockerfile
+          grep '^FROM ' Dockerfile
+      # The labels name the release's commit, not this workflow's, which for a
+      # refresh is main's.
+      - name: Describe the source
+        id: src
+        run: |
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - uses: ./.github/actions/core-dumps
         with:
           mode: setup
       - name: Install a DNS client
         run: sudo apt-get update && sudo apt-get install -y dnsutils
-      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
-        with:
-          install: true
-          cache: true
-      # A docker-container builder: the SBOM and provenance attestations need
-      # one, and the push below reuses its cache, so it sends the layers built
-      # and checked here rather than building them again.
+      # A docker-container builder: the attestations need one, and every build
+      # below shares its cache, so the push sends the layers checked here.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - run: mise run image
+
+      - name: Verify
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: verify
+          build-args: ELODIN_VERSION=${{ inputs.tag }}
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: image
+          build-args: ELODIN_VERSION=${{ inputs.tag }}
+          load: true
+          tags: elodin:release
 
       # It says it is the release, and it resolves, validates, blocks, reloads
       # and stops, unprivileged on a read-only root. The full suite ran on the
       # release's commit in CI; this is the image about to be published.
       - name: Check the image
         run: |
-          docker run --rm "$ELODIN_IMAGE" --version | tee /dev/stderr | grep -q "^elodin $ELODIN_VERSION "
-          scripts/image-smoke.sh "$ELODIN_IMAGE"
+          docker run --rm elodin:release --version | tee /dev/stderr | grep -q "^elodin $TAG "
+          scripts/image-smoke.sh elodin:release
 
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
@@ -85,11 +102,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push by digest
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: image
+          build-args: ELODIN_VERSION=${{ inputs.tag }}
+          labels: |
+            org.opencontainers.image.version=${{ inputs.tag }}
+            org.opencontainers.image.revision=${{ steps.src.outputs.revision }}
+            org.opencontainers.image.created=${{ steps.src.outputs.created }}
+          sbom: true
+          provenance: mode=max
+          outputs: type=image,name=${{ env.REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+      - name: Keep the digest
         run: |
-          eval "$(mise env -s bash)"
-          scripts/build-image.sh --push "$REPOSITORY"
           mkdir -p "$RUNNER_TEMP/digests"
-          cp bin/image/digest "$RUNNER_TEMP/digests/${{ matrix.arch }}"
+          echo "${{ steps.push.outputs.digest }}" > "$RUNNER_TEMP/digests/${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7
         with:
           name: image-digest-${{ matrix.arch }}

@@ -1,0 +1,7 @@
+# Only what the Dockerfile copies: the toolchain pin, the source and the image's
+# default configuration. Everything else stays out of the build and its cache
+# key, bin/ above all, which holds host builds the image must not pick up.
+*
+!mise.toml
+!src/
+!examples/docker.yaml

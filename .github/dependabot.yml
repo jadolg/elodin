@@ -12,11 +12,11 @@ updates:
     schedule:
       interval: "weekly"
 
-  # The container image's pinned bases (packaging/Dockerfile): the distroless
-  # runtime and the Debian it links in. Each bump goes through CI's image job;
-  # .github/workflows/image-refresh.yml then rebuilds the published release on
-  # it.
+  # The container image's pinned images (Dockerfile): the distroless runtime,
+  # the Debian elodin compiles in and the mise it compiles with. Each bump goes
+  # through CI's image job; .github/workflows/image-refresh.yml then rebuilds
+  # the published release on a moved base.
   - package-ecosystem: "docker"
-    directory: "/packaging"
+    directory: "/"
     schedule:
       interval: "weekly"

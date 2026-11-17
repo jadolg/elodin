@@ -160,15 +160,15 @@ update is caught before it is published. For a shell beside a running
 container, `docker debug`, or the base's `:debug-nonroot` variant with busybox,
 are the tools.
 
-**Updates and verification.** The base is pinned by digest in
-`packaging/Dockerfile`, so a commit builds the same image whenever it is
-built, and its labels name the base it was built on
-(`org.opencontainers.image.base.digest`). Dependabot moves the pin when Google
-rebuilds the base for a Debian security update; a weekly job then rebuilds the
-newest release on it and moves its tags, so an OpenSSL or glibc fix reaches the
-image without waiting for an elodin release. The base's package metadata is in
-the image, so scanners such as Trivy and Grype see glibc and OpenSSL and their
-versions; each image also carries an SBOM and build provenance:
+**Updates and verification.** The base is pinned by digest in the
+`Dockerfile`, so a commit builds the same image whenever it is built.
+Dependabot moves the pin when Google rebuilds the base for a Debian security
+update; a weekly job then checks whether the newest release's image still sits
+on the pinned base, and if not rebuilds it and moves its tags, so an OpenSSL or
+glibc fix reaches the image without waiting for an elodin release. The base's
+package metadata is in the image, so scanners such as Trivy and Grype see glibc
+and OpenSSL and their versions; each image also carries an SBOM and build
+provenance:
 
 ```sh
 docker buildx imagetools inspect ghcr.io/jadolg/elodin:latest --format '{{json .SBOM}}'
@@ -184,6 +184,12 @@ cosign verify ghcr.io/jadolg/elodin:latest \
 
 `latest` moves only to the highest release, and `0.28` only to the highest
 `0.28.x`, so publishing a fix for an older line never moves either backwards.
+
+**Building it yourself.** `docker build -t elodin .` in a checkout is the
+whole build: elodin compiles inside it, with the Odin release `mise.toml` pins,
+in the Debian release the base is built from, so the host needs nothing but
+Docker. It builds for the host's architecture. `--target verify` also checks
+what the image holds.
 
 **Your own configuration.** Mount it over the default, read-only, and check it
 first with the image that will run it:
