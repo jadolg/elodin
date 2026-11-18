@@ -1,7 +1,8 @@
 name: Refresh the container image
 
 # The published image of the newest release, rebuilt on main's base pins when
-# they have moved past the ones it was built on.
+# they have moved past the ones it was built on, or published again when
+# `latest` is not it.
 #
 # The image's OpenSSL, glibc and CA bundle come from the distroless base, whose
 # pin in the Dockerfile Dependabot moves when Google rebuilds it for a
@@ -96,7 +97,19 @@ jobs:
           fi
           if [ "$(head -n "$(wc -l <<<"$theirs")" <<<"$ours")" = "$theirs" ]; then
             echo "$tag is on $base"
-            echo "stale=false" >> "$GITHUB_OUTPUT"
+            # And `latest` is it. A prerelease promoted to a release fires no
+            # `published`, so its first run tagged it as a prerelease, and only
+            # a publish moves `latest` and the minor tag to it.
+            want=$(docker buildx imagetools inspect "$REPOSITORY:$tag" --format '{{.Manifest.Digest}}')
+            if have=$(docker buildx imagetools inspect "$REPOSITORY:latest" --format '{{.Manifest.Digest}}' 2>"$RUNNER_TEMP/inspect.err") && [ "$have" = "$want" ]; then
+              echo "stale=false" >> "$GITHUB_OUTPUT"
+            elif [ -z "$have" ] && ! grep -q ': not found' "$RUNNER_TEMP/inspect.err"; then
+              cat "$RUNNER_TEMP/inspect.err" >&2
+              exit 1
+            else
+              echo "latest is not $tag; publishing it again"
+              echo "stale=true" >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "$tag is not on $base"
             echo "stale=true" >> "$GITHUB_OUTPUT"

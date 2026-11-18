@@ -137,6 +137,14 @@ jobs:
           path: ${{ runner.temp }}/digests/${{ matrix.arch }}
           # Long enough to re-run a failed publish after a weekend.
           retention-days: 7
+      # A core names its binary by the path inside the container, which the
+      # report looks for on the runner, as in ci.yml's image job.
+      - name: Put the binary where a core names it
+        if: failure()
+        run: |
+          id=$(docker create elodin:release) || exit 0
+          sudo docker cp "$id:/usr/bin/elodin" /usr/bin/elodin || true
+          docker rm "$id" >/dev/null
       - if: failure()
         uses: ./.github/actions/core-dumps
         with:

@@ -145,7 +145,7 @@ Compose, with a read-only root, every capability dropped and
 
 **What is in it.** elodin on Google's [distroless](https://github.com/GoogleContainerTools/distroless)
 Debian 13 base (`base-debian13:nonroot`), about 10 MB to pull. The base carries
-glibc, OpenSSL and the CA bundle, and nothing that runs: no shell, no package
+glibc, OpenSSL and the CA bundle, and no other program: no shell, no package
 manager, no busybox. elodin adds:
 
 | path | what |
@@ -154,9 +154,13 @@ manager, no busybox. elodin adds:
 | `/etc/elodin/elodin.yaml` | [`examples/docker.yaml`](../examples/docker.yaml) |
 | `/var/cache/elodin/` | the blocklist cache, owned by the account it runs as, `nonroot` (uid and gid 65532) |
 
-`docker exec` has nothing to execute. The build fails if the image holds any
-program but elodin and its shared libraries, so a shell arriving with a base
-update is caught before it is published. For a shell beside a running
+`docker exec` finds nothing to run but elodin and the shared libraries, two of
+which are executable as every dynamically linked image's are: glibc's
+`libc.so.6`, which only prints its version, and the dynamic loader, which starts
+an ELF file it is given. With the root read-only, the only place such a file
+could be written is the cache volume. The build fails if the image holds any
+other program, so a shell arriving with a base update is caught before it is
+published. For a shell beside a running
 container, `docker debug`, or the base's `:debug-nonroot` variant with busybox,
 are the tools.
 
@@ -165,7 +169,9 @@ are the tools.
 Dependabot moves the pin when Google rebuilds the base for a Debian security
 update; a weekly job then checks whether the newest release's image still sits
 on the pinned base, and if not rebuilds it and moves its tags, so an OpenSSL or
-glibc fix reaches the image without waiting for an elodin release. The base's
+glibc fix reaches the image without waiting for an elodin release. Only the
+newest release is refreshed: the tag of an older line (`0.27`) keeps the base it
+was published on, so follow `latest` or the newest minor tag. The base's
 package metadata is in the image, so scanners such as Trivy and Grype see glibc
 and OpenSSL and their versions; each image also carries an SBOM and build
 provenance:

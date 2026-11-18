@@ -96,12 +96,15 @@ LABEL org.opencontainers.image.title="elodin" \
 
 # The image's filesystem, checked from outside it, since it has no shell to
 # check itself with:
-#   - nothing in it can run but elodin: every program - an ELF file or a `#!`
-#     script, read from the files, since the base marks some data executable -
-#     is elodin or a shared library under usr/lib, which a process has to be
-#     running already to load. The base's update-motd script is the one
-#     exception, and with no shell nothing can run it. A shell, busybox or a
-#     package manager arriving with a base update fails here.
+#   - no program but elodin: every program - an ELF file or a `#!` script, read
+#     from the files, since the base marks some data executable - is elodin or
+#     a shared library under usr/lib. Two of those run as well, as in every
+#     dynamically linked image: libc.so.6 prints its version, and the dynamic
+#     loader starts an ELF file it is given. The base's update-motd script is
+#     the other exception, and with no shell nothing can run it. A shell,
+#     busybox or a package manager arriving with a base update fails here. The
+#     scan has to find elodin itself, so a scan that broke fails rather than
+#     finding nothing.
 #   - the cache directory is the account's.
 #   - the binary starts on the image's own libraries, chrooted into it. Only
 #     `--version`: a build step has no /proc to give the chroot, which reading
@@ -112,16 +115,17 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 COPY --from=image / /rootfs/
 WORKDIR /rootfs
 RUN set -eu; \
-	found=$(find . -type f -exec sh -c 'for f; do \
+	programs=$(find . -type f -exec sh -c 'for f; do \
 		case "$(head -c 4 "$f" | od -An -c | tr -d " ")" in \
 		"177ELF"|"#!"*) printf "%s\n" "${f#./}" ;; \
-		esac; done' sh {} + \
-		| grep -Ev '^(usr/bin/elodin|etc/update-motd\.d/10-uname)$|^usr/lib(64)?/.*\.so(\.[0-9.]+)?$' || true); \
+		esac; done' sh {} +); \
+	grep -qx usr/bin/elodin <<<"$programs" || { echo "the scan did not find usr/bin/elodin; it is broken"; exit 1; }; \
+	found=$(grep -Ev '^(usr/bin/elodin|etc/update-motd\.d/10-uname)$|^usr/lib(64)?/.*\.so(\.[0-9.]+)?$' <<<"$programs" || true); \
 	if [ -n "$found" ]; then echo "the image holds programs other than elodin:"; echo "$found"; exit 1; fi; \
 	owner=$(stat -c %u:%g var/cache/elodin); \
 	[ "$owner" = 65532:65532 ] || { echo "var/cache/elodin is owned by $owner, want 65532:65532"; exit 1; }; \
 	chroot --userspec=65532:65532 /rootfs /usr/bin/elodin --version; \
-	echo "verify: the image holds elodin and nothing else that runs"
+	echo "verify: the image holds no program but elodin"
 
 # The default target is the image, not the check above.
 FROM image
