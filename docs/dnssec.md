@@ -248,7 +248,7 @@ still wins.
   requires RSA keys of at least 2048 bits. The probe uses a 2048-bit key, so RSA
   reports runnable, and a zone with a 1024-bit RSA zone-signing key then fails its
   signature check inside a secure zone: SERVFAIL, not an unvalidated answer.
-- **The [static build](install.md#static-tarballs-for-musl-systems-and-any-other-linux)
+- **The [static build](install.md#static-tarballs-for-musl-systems-and-any-other-amd64-or-arm64-linux)
   reads no host crypto policy**: on Fedora and RHEL it verifies RSA/SHA-1
   (algorithms 5 and 7), and the startup probe warns about neither.
 - **NS records in the authority section of a positive answer need not be signed**;

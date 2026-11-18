@@ -1,9 +1,14 @@
-# elodin on a router or a small board
+# elodin on a small board
 #
-# The deployment: elodin is the DNS on a home router, a Raspberry Pi or any
-# box where memory is counted in tens of megabytes and the CPU is an ARM or
-# MIPS core rather than a server's. It serves the LAN behind it, the way
-# examples/lan.yaml does, and every difference from that file is about fitting.
+# The deployment: elodin is the DNS on a small arm64 or amd64 box - a 64-bit
+# Raspberry Pi, an arm64 OpenWrt router, any box where memory is counted in
+# tens of megabytes and the CPU is a small core rather than a server's. It
+# serves the LAN behind it, the way examples/lan.yaml does, and every
+# difference from that file is about fitting.
+#
+# Releases are built for amd64 and arm64 only. MIPS and 32-bit ARM, the CPUs
+# in most consumer routers and in a Raspberry Pi running a 32-bit OS, are not
+# supported: Odin has no MIPS target at all.
 #
 # What is expensive on such a box, in the order it will hurt:
 #

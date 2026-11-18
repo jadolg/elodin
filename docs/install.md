@@ -76,7 +76,7 @@ instead.
 GitHub releases also carry `linux-amd64` and `linux-arm64` tarballs of the
 binary, the unit and the example configuration.
 
-## Static tarballs, for musl systems and any other Linux
+## Static tarballs, for musl systems and any other amd64 or arm64 Linux
 
 The binary in the tarballs above, like the `.deb`'s, links against glibc and the
 system OpenSSL, so it does not start on Alpine, OpenWrt or another musl system.
