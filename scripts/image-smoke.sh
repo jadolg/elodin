@@ -53,6 +53,9 @@ wait_log() {
 wait_ready_count() {
 	local deadline=$((SECONDS + 90))
 	until [ "$(docker logs "$name" 2>&1 | grep -c 'msg=ready')" -ge "$1" ]; do
+		if [ "$(docker inspect -f '{{.State.Running}}' "$name")" != true ]; then
+			return 1
+		fi
 		[ $SECONDS -lt $deadline ] || return 1
 		sleep 0.5
 	done
@@ -129,10 +132,14 @@ else
 fi
 
 # Nothing but elodin to run: no shell for an exec, or for anything that got in.
-if docker exec "$name" /bin/sh -c true >/dev/null 2>&1; then
+# Only the runtime's "no such file" counts; an exec refused for any other
+# reason, a container that stopped say, proves nothing.
+if out=$(docker exec "$name" /bin/sh -c true 2>&1); then
 	fail "the image has a shell"
-else
+elif grep -q 'stat /bin/sh: no such file or directory' <<<"$out"; then
 	pass "no shell"
+else
+	fail "could not tell whether the image has a shell: $out"
 fi
 
 # The configuration is the one it started with and its lists are all URLs, so a

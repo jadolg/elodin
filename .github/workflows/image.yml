@@ -68,6 +68,14 @@ jobs:
           done < "$RUNNER_TEMP/pins"
           git diff --stat -- Dockerfile
           grep '^FROM ' Dockerfile
+          # The image stage has to have taken main's base, or the rebuild would
+          # publish the old one again and the next refresh would find it stale.
+          want=$(git show FETCH_HEAD:Dockerfile | grep -E ' AS image$')
+          have=$(grep -E ' AS image$' Dockerfile)
+          if [ "$have" != "$want" ]; then
+            printf 'the image stage did not take the pin from %s:\n  release: %s\n  wanted:  %s\n' "$REF" "$have" "$want" >&2
+            exit 1
+          fi
       # The labels name the release's commit, not this workflow's, which for a
       # refresh is main's.
       - name: Describe the source
