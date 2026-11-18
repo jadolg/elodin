@@ -39,9 +39,11 @@ log:
 server:
   # Every private range, as the shipped default has it, rather than your LAN's
   # /24: see the top of this file for why a container cannot be sure which
-  # address its clients arrive from. Publishing port 53 only on the LAN
-  # address (`-p 192.168.1.2:53:53/udp`) is what keeps the resolver off a
-  # public interface; this list is the second check.
+  # address its clients arrive from. For the same reason this list cannot
+  # keep the internet out: a client Docker's proxy relays - over IPv6, say -
+  # arrives from the gateway, which it admits. Publishing port 53 only on the
+  # LAN address (`-p 192.168.1.2:53:53/udp`) is what keeps the resolver off a
+  # public interface; never publish it on a public address or on all of them.
   allow_from:
     - 127.0.0.0/8
     - 10.0.0.0/8

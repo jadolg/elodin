@@ -165,7 +165,8 @@ else
 	fail "exit code $code after SIGTERM"
 fi
 
-# The compose sample parses, against the image under test.
+# The compose sample parses. Only its syntax: it names the published image,
+# not the one under test, whose settings the run above has already exercised.
 if docker compose version >/dev/null 2>&1; then
 	if docker compose -f examples/compose.yaml config -q; then
 		pass "examples/compose.yaml is valid"

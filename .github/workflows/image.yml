@@ -135,7 +135,8 @@ jobs:
         with:
           name: image-digest-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/${{ matrix.arch }}
-          retention-days: 1
+          # Long enough to re-run a failed publish after a weekend.
+          retention-days: 7
       - if: failure()
         uses: ./.github/actions/core-dumps
         with:
@@ -146,11 +147,15 @@ jobs:
     name: Publish
     needs: build
     runs-on: ubuntu-latest
-    # One at a time across every run, release or refresh: the tags are chosen
-    # from the release list and then moved, and a run that chose before another
-    # moved `latest` would move it back.
+    # One at a time per release: a refresh of a release whose own run is
+    # publishing waits for it. Per release and not one group for all, since
+    # GitHub keeps one pending run per group and cancels an older pending one,
+    # which would drop a release's publish. Runs for different releases need no
+    # order: a release is in the list the tags are chosen from from the moment
+    # it is published, minutes before its own image is, and a run moves its
+    # tags seconds after choosing them.
     concurrency:
-      group: image-publish
+      group: image-publish-${{ inputs.tag }}
       cancel-in-progress: false
     permissions:
       contents: read

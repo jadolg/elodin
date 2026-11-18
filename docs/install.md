@@ -210,7 +210,10 @@ SIGKILL.
 any capability because Docker lets an unprivileged process bind low ports in a
 container's own network namespace. Publish on the host's LAN address rather
 than on every address: systemd-resolved holds `127.0.0.53:53`, and Docker
-cannot publish `0.0.0.0:53` beside it. With `--network host` the host's rule for
+cannot publish `0.0.0.0:53` beside it. Never publish it on a public address:
+a client Docker's proxy relays (every IPv6 client, on a bridge without IPv6) arrives
+from the bridge's gateway, which the default `allow_from` admits as private, so
+the list does not keep the internet out. With `--network host` the host's rule for
 ports below 1024 applies instead; start it as root with `--user 0` and set
 `server.user: nonroot`, and it drops to the image's account once its ports are
 bound ([below](#privileges)).

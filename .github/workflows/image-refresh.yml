@@ -12,7 +12,7 @@ name: Refresh the container image
 #
 # A release from before the image existed (no Dockerfile in its tree) has
 # nothing to build it with and is left alone. One that has a Dockerfile and no
-# image - its release job failed - gets one. Anything else the registry says
+# image a day after it was published - its release job failed - gets one. Anything else the registry says
 # fails the run, so that a refresh that cannot look is seen, not taken for
 # "nothing to do".
 
@@ -79,6 +79,14 @@ jobs:
           if ! ours=$(layers "$REPOSITORY:$tag" 2>"$RUNNER_TEMP/inspect.err"); then
             cat "$RUNNER_TEMP/inspect.err" >&2
             if grep -q ': not found' "$RUNNER_TEMP/inspect.err"; then
+              # A release published in the last day may still have its own
+              # run building the image; a build here would race it.
+              published=$(gh release view "$tag" --json publishedAt -q .publishedAt)
+              if [ "$(date -d "$published" +%s)" -gt "$(date -d '1 day ago' +%s)" ]; then
+                echo "$tag has no image yet, and was published at $published; left to its release run"
+                echo "stale=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
               echo "$tag has no image; building it"
               echo "stale=true" >> "$GITHUB_OUTPUT"
               exit 0
