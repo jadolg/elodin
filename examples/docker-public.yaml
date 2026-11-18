@@ -19,9 +19,9 @@
 #     unprivileged process bind 443 and 853 inside the container's own network
 #     namespace, so there is no root to drop and `server.user` stays empty.
 #   * The certificate and its key are one file, pair.pem, which
-#     examples/compose-public.yaml keeps in the certs volume, mounted read-only
-#     at /etc/elodin/certs and owned by the image's account, so a SIGHUP after
-#     a renewal can open the new key. One file, replaced by a single rename, so
+#     examples/compose-public.yaml writes, owned by the image's account, into
+#     the certs volume mounted read-only at /etc/elodin/certs, so a SIGHUP
+#     after a renewal can open the new key. One file, replaced by a single rename, so
 #     elodin never loads a new key beside an old certificate: `cert_file` and
 #     `key_file` both name it, and each reads its own part.
 #   * The metrics endpoint is bound to every address inside the container,

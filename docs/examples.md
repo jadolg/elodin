@@ -76,8 +76,10 @@ what has to hold around it:
 DNS turned off: DoT on 853 and DoH on 443 only, so there is no UDP to reflect
 and the datagram settings drop out. `compose-public.yaml` runs it beside
 certbot. certbot starts first, obtains the certificate over HTTP-01 on port 80,
-and writes it with its key as one file, `pair.pem`, into a volume owned by the
-image's account; elodin waits for that. One file replaced by one rename means
+and writes it with its key as one file, `pair.pem`, owned by the image's
+account, into a volume elodin mounts read-only; elodin waits for that. If the
+first issue fails, `up` starts elodin anyway after about 5 minutes and it
+restarts until the certificate arrives. One file replaced by one rename means
 elodin never loads a new key beside an old certificate. certbot then tries a
 renewal twice a day, writes a new file and sends elodin `SIGHUP`. The two share
 a PID namespace held by a `pause` container, so the signal needs no Docker

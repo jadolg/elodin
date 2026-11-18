@@ -408,11 +408,18 @@ run_cli_cases :: proc(r: ^Runner) {
 			src, read_err := os.read_entire_file(ex.path, context.temp_allocator)
 			have_cert := r.cert_file != "" && r.key_file != ""
 			if have_cert && check(r, read_err == nil, "could not read %s: %v", ex.path, read_err) {
-				// `replace_all` reports whether it allocated rather than whether it
-				// matched, so the flag says nothing useful here and the text is
-				// taken as it comes back either way.
-				text, _ := strings.replace_all(string(src), ex.cert, r.cert_file, context.temp_allocator) // lint:allow the flag is allocation, not a match
-				text, _ = strings.replace_all(text, ex.key, r.key_file, context.temp_allocator) // lint:allow the flag is allocation, not a match
+				// Matched with the key in front, since docker-public.yaml names the
+				// same file for both: by path alone, the first replacement would
+				// point `key_file` at the certificate too. `replace_all` reports
+				// whether it allocated rather than whether it matched, so the flag
+				// says nothing useful here; the counts below check the matches.
+				cert_line := fmt.tprintf("cert_file: %s", ex.cert)
+				key_line := fmt.tprintf("key_file: %s", ex.key)
+				check_eq_int(r, strings.count(string(src), cert_line), 2, fmt.tprintf("%s lines in %s", cert_line, ex.path))
+				check_eq_int(r, strings.count(string(src), key_line), 2, fmt.tprintf("%s lines in %s", key_line, ex.path))
+				text, _ := strings.replace_all(string(src), cert_line, fmt.tprintf("cert_file: %s", r.cert_file), context.temp_allocator) // lint:allow the flag is allocation, not a match
+				text, _ = strings.replace_all(text, key_line, fmt.tprintf("key_file: %s", r.key_file), context.temp_allocator) // lint:allow the flag is allocation, not a match
+				check(r, !strings.contains(text, ex.key), "%s still names %s after the rewrite", ex.path, ex.key)
 				res = check_config_text(r, fmt.tprintf("check-%s-example-certs", stem), text)
 				check_eq_int(r, res.exit_code, 0, fmt.tprintf("exit code for %s with a certificate it has", ex.path))
 				check(
