@@ -140,6 +140,88 @@ jobs:
         with:
           mode: report
 
+  image:
+    name: Container image (${{ matrix.arch }})
+    # The image a release publishes (Dockerfile), built for each architecture
+    # on a runner of that architecture, as the binaries are, by plain
+    # docker/build-push-action: elodin compiles inside the build, so nothing on
+    # the runner reaches the image. The `verify` target checks what the image
+    # holds; the integration suite runs against its binary in the `itest`
+    # target; then the image itself is run the way examples/compose.yaml runs it
+    # - unprivileged, read-only, no capabilities - and has to resolve, validate,
+    # block, reload and stop (scripts/image-smoke.sh).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      # Its pipe runs in the host's namespaces, so a crash inside a container is
+      # kept too.
+      - uses: ./.github/actions/core-dumps
+        with:
+          mode: setup
+      - name: Install a DNS client
+        run: sudo apt-get update && sudo apt-get install -y dnsutils
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Verify
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: verify
+          build-args: ELODIN_VERSION=dev-${{ github.sha }}
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: image
+          build-args: ELODIN_VERSION=dev-${{ github.sha }}
+          load: true
+          tags: elodin:ci
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+      - name: Build the suite
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: itest
+          build-args: ELODIN_VERSION=dev-${{ github.sha }}
+          load: true
+          tags: elodin:ci-itest
+          # A scope of its own: two writers to one scope replace each other's.
+          cache-from: |
+            type=gha,scope=image-${{ matrix.arch }}
+            type=gha,scope=image-itest-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-itest-${{ matrix.arch }}
+      # Not namespaced: the container's sockets take the host's cap (#568).
+      - run: sudo sysctl -w net.core.rmem_max=4194304
+      - name: Integration tests against the image's binary
+        run: docker run --rm --init -v "$PWD:$PWD" -w "$PWD" elodin:ci-itest /src/bin/itest --binary /src/bin/elodin
+        timeout-minutes: 30
+      - run: scripts/image-smoke.sh elodin:ci
+      # A core names its binary by the path inside the container, which the
+      # report looks for on the runner: put the images' binaries there.
+      - name: Put the binaries where the cores name them
+        if: failure()
+        run: |
+          for spec in elodin:ci-itest:/src/bin elodin:ci:/usr/bin/elodin; do
+            image=${spec%:*} path=${spec##*:}
+            id=$(docker create "$image") || continue
+            sudo mkdir -p "$(dirname "$path")"
+            sudo docker cp "$id:$path" "$(dirname "$path")/" || true
+            docker rm "$id" >/dev/null
+          done
+      - if: failure()
+        uses: ./.github/actions/core-dumps
+        with:
+          mode: report
+
   leakcheck:
     name: Memory (AddressSanitizer)
     # The integration suite again, this time against a binary built with

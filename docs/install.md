@@ -127,6 +127,114 @@ Where it differs from the dynamic build:
 The unit's `MALLOC_MMAP_THRESHOLD_` is glibc's, and musl ignores it; musl's
 allocator gives a blocklist refresh's memory back without it.
 
+## Container image
+
+Each release publishes an image for amd64 and arm64 to the GitHub Container
+Registry, tagged with the release (`0.28.0`), its minor version (`0.28`) and
+`latest`:
+
+```sh
+docker run -d --name elodin --restart unless-stopped --ulimit nofile=65536 \
+  -p 192.168.1.2:53:53/udp -p 192.168.1.2:53:53/tcp \
+  -v elodin-cache:/var/cache/elodin ghcr.io/jadolg/elodin:latest
+```
+
+[`examples/compose.yaml`](../examples/compose.yaml) is the same for Docker
+Compose, with a read-only root, every capability dropped and
+`no-new-privileges`, none of which the image needs.
+
+**What is in it.** elodin on Google's [distroless](https://github.com/GoogleContainerTools/distroless)
+Debian 13 base (`base-debian13:nonroot`), about 10 MB to pull. The base carries
+glibc, OpenSSL and the CA bundle, and no other program: no shell, no package
+manager, no busybox. elodin adds:
+
+| path | what |
+|---|---|
+| `/usr/bin/elodin` | the binary, linked in Debian 13 against the base's glibc and OpenSSL |
+| `/etc/elodin/elodin.yaml` | [`examples/docker.yaml`](../examples/docker.yaml) |
+| `/var/cache/elodin/` | the blocklist cache, owned by the account it runs as, `nonroot` (uid and gid 65532) |
+
+`docker exec` finds nothing to run but elodin and the shared libraries, two of
+which are executable as every dynamically linked image's are: glibc's
+`libc.so.6`, which only prints its version, and the dynamic loader, which starts
+an ELF file it is given. With the root read-only, the only place such a file
+could be written is the cache volume. The build fails if the image holds any
+other program, so a shell arriving with a base update is caught before it is
+published. For a shell beside a running
+container, `docker debug`, or the base's `:debug-nonroot` variant with busybox,
+are the tools.
+
+**Updates and verification.** The base is pinned by digest in the
+`Dockerfile`, so a commit builds the same image whenever it is built.
+Dependabot moves the pin when Google rebuilds the base for a Debian security
+update; a weekly job then checks whether the newest release's image still sits
+on the pinned base, and if not rebuilds it and moves its tags, so an OpenSSL or
+glibc fix reaches the image without waiting for an elodin release. Only the
+newest release is refreshed: the tag of an older line (`0.27`) keeps the base it
+was published on, so follow `latest` or the newest minor tag. The base's
+package metadata is in the image, so scanners such as Trivy and Grype see glibc
+and OpenSSL and their versions; each image also carries an SBOM and build
+provenance:
+
+```sh
+docker buildx imagetools inspect ghcr.io/jadolg/elodin:latest --format '{{json .SBOM}}'
+```
+
+Images are signed with cosign, keyless, by the workflow that built them, run
+for a release tag or, for a refresh, from `main`; a signature made from any
+other branch does not verify:
+
+```sh
+cosign verify ghcr.io/jadolg/elodin:latest \
+  --certificate-identity-regexp '^https://github\.com/jadolg/elodin/\.github/workflows/image\.yml@refs/(tags/[^/]+|heads/main)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+`latest` moves only to the highest release, and `0.28` only to the highest
+`0.28.x`, so publishing a fix for an older line never moves either backwards.
+
+**Building it yourself.** `docker build -t elodin .` in a checkout is the
+whole build: elodin compiles inside it, with the Odin release `mise.toml` pins,
+in the Debian release the base is built from, so the host needs nothing but
+Docker. It builds for the host's architecture. `--target verify` also checks
+what the image holds.
+
+**Your own configuration.** Mount it over the default, read-only, and check it
+first with the image that will run it:
+
+```sh
+docker run --rm -v "$PWD/elodin.yaml:/etc/elodin/elodin.yaml:ro" ghcr.io/jadolg/elodin --check
+```
+
+Certificates for DoT or DoH and `file:` lists are mounted the same way; the
+account has to be able to read them. `docker kill -s HUP elodin` reloads as
+`SIGHUP` does [below](#signals). Allow `docker stop` more than
+`server.client_timeout` (`-t 15`), or an idle connection's wait is cut short by
+SIGKILL.
+
+**Ports.** The image runs as uid 65532 from the start, and binds port 53 without
+any capability because Docker lets an unprivileged process bind low ports in a
+container's own network namespace. Publish on the host's LAN address rather
+than on every address: systemd-resolved holds `127.0.0.53:53`, and Docker
+cannot publish `0.0.0.0:53` beside it. Never publish it on a public address:
+a client Docker's proxy relays (every IPv6 client, on a bridge without IPv6) arrives
+from the bridge's gateway, which the default `allow_from` admits as private, so
+the list does not keep the internet out. With `--network host` the host's rule for
+ports below 1024 applies instead; start it as root with `--user 0` and set
+`server.user: nonroot`, and it drops to the image's account once its ports are
+bound ([below](#privileges)).
+
+**Descriptors.** Docker's default limit of 1,024 is short of what the default
+configuration can want, which elodin warns about at startup (`descriptors:
+the limit is 1024`); `--ulimit nofile=65536` raises it.
+
+**How it differs from the `.deb`'s build.** The same glibc and dynamically
+linked OpenSSL, at Debian 13's versions rather than your distribution's. The
+image sets `MALLOC_MMAP_THRESHOLD_=131072`, as the systemd unit does, and
+`SSL_CERT_FILE` names the base's CA bundle; mount another bundle and point
+`SSL_CERT_FILE` at it to change what upstreams are checked against. OpenSSL
+applies the file `OPENSSL_CONF` names, if any; the image carries none.
+
 ## Privileges
 
 Binding a port below 1024 is the only thing elodin needs root for. Either of two

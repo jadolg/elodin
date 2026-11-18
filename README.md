@@ -24,7 +24,9 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Discovery of its own DoT/DoH endpoints over DDR (RFC 9462), off by default
 - A Prometheus endpoint, off by default
 - Configuration reloads on `SIGHUP`, keeping the cache, cookies and connections
-- Ships as a systemd service or a `.deb`, with optional system-resolver takeover
+- Ships as a systemd service, a `.deb` with optional system-resolver takeover,
+  or a distroless container image with no shell, package manager or other
+  tool beside elodin
 
 ## Installing
 
@@ -41,6 +43,22 @@ The package runs elodin as a systemd service and offers to take over as the
 system resolver. [Installing and running](docs/install.md) covers that, a
 release `.deb` or tarball (static ones run on Alpine, OpenWrt and any other
 Linux), the unit for a source build, and dropping privileges.
+
+Or run the container image, amd64 or arm64, with a Pi-hole-style configuration
+built in ([`examples/docker.yaml`](examples/docker.yaml)):
+
+```sh
+docker run -d --name elodin --restart unless-stopped --ulimit nofile=65536 \
+  -p 192.168.1.2:53:53/udp -p 192.168.1.2:53:53/tcp \
+  -v elodin-cache:/var/cache/elodin ghcr.io/jadolg/elodin:latest
+```
+
+with `192.168.1.2` replaced by the host's LAN address, which is also what keeps
+it clear of systemd-resolved's stub on `127.0.0.53:53`.
+
+[`examples/compose.yaml`](examples/compose.yaml) is the same with the hardening
+spelt out; [Container image](docs/install.md#container-image) says what is in
+the image and how to give it your own configuration.
 
 ## Configuring
 
@@ -94,8 +112,8 @@ tasks, the layout of the source and how it is tested.
 
 | page | what it covers |
 |---|---|
-| [Installing and running](docs/install.md) | the apt repository, the `.deb` and resolver takeover, the systemd unit, dropping privileges, signals |
-| [Example configurations](docs/examples.md) | which settings a loopback, LAN, small-device, public or container deployment changes, and why |
+| [Installing and running](docs/install.md) | the apt repository, the `.deb` and resolver takeover, the systemd unit, the container image, dropping privileges, signals |
+| [Example configurations](docs/examples.md) | which settings a loopback, LAN, Docker, small-device, public or container deployment changes, and why |
 | [Logs](docs/logging.md) | the logfmt format, the stats line, the query log |
 | [Upstreams](docs/upstreams.md) | strategies, timeouts, failover, bootstrap, and per-domain routes |
 | [Sink lists](docs/blocking.md) | list formats, allow rules, CNAME inspection |

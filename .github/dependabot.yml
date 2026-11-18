@@ -11,3 +11,12 @@ updates:
     directory: "/bench"
     schedule:
       interval: "weekly"
+
+  # The container image's pinned images (Dockerfile): the distroless runtime,
+  # the Debian elodin compiles in and the mise it compiles with. Each bump goes
+  # through CI's image job; .github/workflows/image-refresh.yml then rebuilds
+  # the published release on a moved base.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"

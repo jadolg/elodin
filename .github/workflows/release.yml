@@ -156,6 +156,18 @@ jobs:
           mode: report
           name: release-static
 
+  image:
+    name: Container image
+    # Built, checked and pushed per architecture, then joined and signed: see
+    # image.yml, which image-refresh.yml also calls.
+    uses: ./.github/workflows/image.yml
+    with:
+      tag: ${{ github.event.release.tag_name }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
   publish-deb:
     name: Publish deb to repository
     # Runs once, after every arch's .deb has landed in the release. Triggering

@@ -111,6 +111,31 @@ docker run --rm --init -v "$PWD:$PWD" -w "$PWD" "$ELODIN_ALPINE" sh -euc '
 '
 """
 
+# The container image for this machine's architecture, tagged $ELODIN_IMAGE
+# (default elodin:dev), and the Dockerfile's checks on it. Plain docker build:
+# elodin compiles inside it (see Dockerfile), so this needs nothing but docker.
+[tasks.image]
+description = "Build the container image for this architecture (elodin:dev)"
+run = """
+docker build --build-arg ELODIN_VERSION="$ELODIN_VERSION" --target verify .
+docker build --build-arg ELODIN_VERSION="$ELODIN_VERSION" -t "${ELODIN_IMAGE:-elodin:dev}" .
+"""
+
+# The integration suite against the image's binary, in the Dockerfile's itest
+# stage - the same binary, beside the openssl CLI and strace the suite needs and
+# the image does not - with the checkout mounted for its fixtures. Then the
+# image itself, run the way examples/compose.yaml runs it
+# (scripts/image-smoke.sh). As root, so the case that needs a failing privilege
+# drop skips; `--init` for Ctrl-C, as in itest-static.
+[tasks.itest-image]
+description = "Integration and smoke tests against the container image"
+depends = ["image"]
+run = """
+docker build --build-arg ELODIN_VERSION="$ELODIN_VERSION" --target itest -t "${ELODIN_IMAGE:-elodin:dev}-itest" .
+docker run --rm --init -v "$PWD:$PWD" -w "$PWD" "${ELODIN_IMAGE:-elodin:dev}-itest" /src/bin/itest --binary /src/bin/elodin
+scripts/image-smoke.sh "${ELODIN_IMAGE:-elodin:dev}"
+"""
+
 [tasks.deb]
 description = "Build a .deb from the optimised binary (dist/)"
 depends = ["release"]

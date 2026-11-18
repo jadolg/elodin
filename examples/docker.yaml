@@ -1,0 +1,191 @@
+# elodin in Docker, as the resolver for one network
+#
+# The deployment: the container image (ghcr.io/jadolg/elodin) on a home or
+# small-office box, which every device on the network points at - Pi-hole's
+# job, without the web interface. It filters ads and malware for the whole
+# network and forwards everything else over DoT. This is the configuration the
+# image starts with when none is mounted; examples/compose.yaml runs it.
+#
+# It is examples/lan.yaml, changed where a container changes the facts:
+#
+#   * Who a query comes from. With Docker's default bridge network, a device on
+#     the LAN usually arrives under its own address - but a query from the
+#     Docker host itself, every query under Docker Desktop, and IPv6 through
+#     the userland proxy arrive from the bridge's gateway (172.17.0.1 or
+#     similar). So `allow_from` keeps every private range rather than naming
+#     your LAN, and the per-prefix budgets assume the whole network may be one
+#     address.
+#   * Privileges. The image runs as uid 65532 from the start, and Docker lets
+#     an unprivileged process bind port 53 inside the container's own network
+#     namespace, so there is no root to drop and `server.user` stays empty.
+#   * The metrics endpoint is bound to every address inside the container,
+#     since the container's loopback is unreachable from anywhere else. Who can
+#     reach it is decided by how you publish 9153 - publish it on 127.0.0.1, or
+#     not at all.
+#   * The blocklist cache is /var/cache/elodin, which the image's account owns.
+#     Mount a volume there and a restart reuses the lists instead of
+#     downloading them again.
+#
+# Anything not written here is the shipped default; examples/elodin.yaml is the
+# annotated reference for all of them.
+
+log:
+  level: info
+  # Off: on a shared resolver the query log is a record of everybody's
+  # browsing. `docker logs` keeps whatever is written here for as long as the
+  # container exists, so turn it on to debug and off again.
+  queries: false
+
+server:
+  # Every private range, as the shipped default has it, rather than your LAN's
+  # /24: see the top of this file for why a container cannot be sure which
+  # address its clients arrive from. For the same reason this list cannot
+  # keep the internet out: a client Docker's proxy relays - over IPv6, say -
+  # arrives from the gateway, which it admits. Publishing port 53 only on the
+  # LAN address (`-p 192.168.1.2:53:53/udp`) is what keeps the resolver off a
+  # public interface; never publish it on a public address or on all of them.
+  allow_from:
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 169.254.0.0/16
+    - ::1/128
+    - fc00::/7
+    - fe80::/10
+
+  # As in lan.yaml: the clients are trusted and may all be one prefix (here,
+  # possibly one address - the bridge gateway), so the whole connection table
+  # is theirs and the response budget is the network's rather than a device's.
+  max_connections: 512
+  max_connections_per_prefix: 512
+  rate_limit:
+    enabled: true
+    responses_per_second: 1000
+    slip: 2
+
+  # Empty: the image never runs as root, so there is nothing to drop.
+  user: ""
+
+listeners:
+  # Inside the container's network namespace, so 0.0.0.0 is the container's
+  # own interface; `-p` decides which of the host's addresses lead here.
+  udp:
+    enabled: true
+    address: "0.0.0.0"
+    port: 53
+  tcp:
+    enabled: true
+    address: "0.0.0.0"
+    port: 53
+  # Off until there is a certificate to serve; see lan.yaml. Mount the pair
+  # read-only (`-v /path/to/certs:/etc/elodin/certs:ro`), point these at it,
+  # and publish 853 or 443.
+  dot:
+    enabled: false
+    address: "0.0.0.0"
+    port: 853
+    cert_file: /etc/elodin/certs/cert.pem
+    key_file: /etc/elodin/certs/key.pem
+  doh:
+    enabled: false
+    address: "0.0.0.0"
+    port: 443
+    path: /dns-query
+    cert_file: /etc/elodin/certs/cert.pem
+    key_file: /etc/elodin/certs/key.pem
+
+upstream:
+  # Alternating, as in lan.yaml, so neither company sees all of the network's
+  # browsing. The image's CA bundle is what these handshakes are checked
+  # against.
+  strategy: round_robin
+  timeout: 5s
+  attempts: 2
+  servers:
+    - name: cloudflare-dot
+      type: tls
+      address: 1.1.1.1
+      port: 853
+      hostname: cloudflare-dns.com
+    - name: quad9-dot
+      type: tls
+      address: 9.9.9.9
+      port: 853
+      hostname: dns.quad9.net
+  # Blocklist downloads resolve their hosts through these, not through the
+  # container's /etc/resolv.conf, which Docker may have pointed back at this
+  # very container.
+  bootstrap: [1.1.1.1, 9.9.9.9]
+
+  # A zone your router or NAS serves goes to it rather than to the internet.
+  # Needs `special_use.home_arpa: false` below for home.arpa.
+  # zones:
+  #   - domains: [home.arpa]
+  #     servers: [192.168.1.1]
+
+cache:
+  enabled: true
+  # One cache in front of the whole network: about 23 MB at 50,000 answers,
+  # with 128 MiB as the ceiling. Give the container a memory limit above
+  # that and the derived sizes follow it (see docs/sizing.md).
+  max_entries: 50000
+  max_bytes: 128MiB
+  serve_stale: true
+
+blocking:
+  enabled: true
+  response: nxdomain
+  block_ttl: 60
+  cache_dir: /var/cache/elodin
+  refresh: 24h
+  lists:
+    - name: steven-black
+      url: https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+      format: hosts
+    - name: adguard-dns
+      url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+      format: adblock
+    - name: android-tracking
+      url: https://raw.githubusercontent.com/Perflyst/PiHoleBlocklist/master/android-tracking.txt
+      format: domains
+    - name: cyberhost-malware
+      url: https://lists.cyberhost.uk/malware.txt
+      format: domains
+    # Your own additions, from a file mounted into the container:
+    # - name: local
+    #   file: /etc/elodin/blocklist.txt
+  rules:
+    - "||doubleclick.net^"
+  # Exceptions, which outrank every list.
+  # allow:
+  #   - "||some-shop.example^"
+
+dnssec:
+  enabled: true
+
+rebind:
+  # On, as in lan.yaml: a public name answered with a LAN address is refused.
+  # Names in `rewrites` are answered here and need nothing.
+  enabled: true
+
+# The network's own names, answered here and never forwarded.
+# rewrites:
+#   - domain: nas.home.arpa
+#     answer: 192.168.1.50
+#   - domain: printer.home.arpa
+#     answer: 192.168.1.60
+
+special_use:
+  enabled: true
+  # A lookup under home.arpa. is answered here rather than sent to a public
+  # resolver. Turn it off if your router serves the zone, and route it above.
+  home_arpa: true
+
+metrics:
+  enabled: true
+  # Every address in the container; see the top of this file. elodin warns
+  # about it at startup, which is the reminder to publish 9153 narrowly.
+  address: "0.0.0.0"
+  port: 9153
+  path: /metrics
