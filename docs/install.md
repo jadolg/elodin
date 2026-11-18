@@ -174,11 +174,13 @@ provenance:
 docker buildx imagetools inspect ghcr.io/jadolg/elodin:latest --format '{{json .SBOM}}'
 ```
 
-Images are signed with cosign, keyless, by the workflow that built them:
+Images are signed with cosign, keyless, by the workflow that built them, run
+for a release tag or, for a refresh, from `main`; a signature made from any
+other branch does not verify:
 
 ```sh
 cosign verify ghcr.io/jadolg/elodin:latest \
-  --certificate-identity-regexp '^https://github\.com/jadolg/elodin/\.github/workflows/image\.yml@' \
+  --certificate-identity-regexp '^https://github\.com/jadolg/elodin/\.github/workflows/image\.yml@refs/(tags/[^/]+|heads/main)$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 

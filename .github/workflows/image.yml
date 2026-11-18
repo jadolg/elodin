@@ -21,7 +21,7 @@ on:
         required: true
         type: string
       dockerfile-ref:
-        description: a ref whose Dockerfile replaces the release's own, for its newer base pins; empty keeps the release's
+        description: a ref whose image pins (its `FROM ... AS <stage>` lines) replace those of the release's Dockerfile; empty keeps the release's
         required: false
         type: string
         default: ''
@@ -50,11 +50,23 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
+      # Only the pins: each `FROM <image> AS <stage>` line of the release's
+      # Dockerfile takes the image the ref names for that stage. The rest of
+      # the build - stages, .dockerignore, mise.toml, source - stays the
+      # release's, so a later change to how main builds cannot break the
+      # rebuild of an older release, nor change what it holds.
       - name: Take the newer base pins
         if: inputs.dockerfile-ref != ''
+        env:
+          REF: ${{ inputs.dockerfile-ref }}
         run: |
-          git fetch --depth 1 origin "${{ inputs.dockerfile-ref }}"
-          git checkout FETCH_HEAD -- Dockerfile
+          git fetch --depth 1 origin "$REF"
+          git show FETCH_HEAD:Dockerfile |
+            sed -nE 's/^FROM ([^ ]+) AS ([A-Za-z0-9_.-]+)$/\2 \1/p' > "$RUNNER_TEMP/pins"
+          while read -r stage ref; do
+            sed -i -E "s|^FROM [^ ]+ AS ${stage}\$|FROM ${ref} AS ${stage}|" Dockerfile
+          done < "$RUNNER_TEMP/pins"
+          git diff --stat -- Dockerfile
           grep '^FROM ' Dockerfile
       # The labels name the release's commit, not this workflow's, which for a
       # refresh is main's.
@@ -134,6 +146,12 @@ jobs:
     name: Publish
     needs: build
     runs-on: ubuntu-latest
+    # One at a time across every run, release or refresh: the tags are chosen
+    # from the release list and then moved, and a run that chose before another
+    # moved `latest` would move it back.
+    concurrency:
+      group: image-publish
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write

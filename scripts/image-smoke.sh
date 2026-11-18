@@ -135,8 +135,11 @@ else
 	pass "no shell"
 fi
 
+# The configuration is the one it started with and its lists are all URLs, so a
+# reload that read and accepted the file says exactly this. A refused one
+# (`reload: ... is not usable`) starts with `reload: ` too.
 docker kill -s HUP "$name" >/dev/null
-if wait_log 20 'msg="reload: '; then
+if wait_log 20 'msg="reload: nothing a reload puts into effect has changed"'; then
 	pass "reloads on SIGHUP"
 else
 	fail "no reload after SIGHUP"

@@ -7,11 +7,14 @@ name: Refresh the container image
 # pin in the Dockerfile Dependabot moves when Google rebuilds it for a
 # Debian security update. Without this, that fix would reach users only with
 # the next elodin release. The release's own source is built - same elodin,
-# same configuration - with main's Dockerfile for its pins, and goes through
-# the same checks and smoke test as a release before it replaces the tags.
+# same configuration - with main's image pins, and goes through the same checks
+# and smoke test as a release before it replaces the tags.
 #
-# Only a release that already has an image is refreshed: one from before the
-# image existed has nothing to build it with.
+# A release from before the image existed (no Dockerfile in its tree) has
+# nothing to build it with and is left alone. One that has a Dockerfile and no
+# image - its release job failed - gets one. Anything else the registry says
+# fails the run, so that a refresh that cannot look is seen, not taken for
+# "nothing to do".
 
 on:
   schedule:
@@ -21,6 +24,9 @@ on:
 jobs:
   decide:
     name: Is the newest release on main's base?
+    # From main only: the signature names the ref the run came from, and
+    # docs/install.md's `cosign verify` accepts a release tag or main.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -57,15 +63,29 @@ jobs:
             fi
             jq -r '.layers[].digest' <<<"$raw"
           }
+          set -o pipefail
           tag=$(gh release list --exclude-pre-releases --exclude-drafts --limit 1000 --json tagName -q '.[].tagName' | sort -V | tail -1)
+          [ -n "$tag" ] || { echo "no release" >&2; exit 1; }
           base=$(sed -nE 's/^FROM ([^ ]+@sha256:[0-9a-f]{64}) AS image$/\1/p' Dockerfile)
+          [ -n "$base" ] || { echo "no pinned 'FROM ... AS image' in the Dockerfile" >&2; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if ! ours=$(layers "$REPOSITORY:$tag" 2>/dev/null); then
-            echo "$tag has no image; nothing to refresh"
+          git fetch --depth 1 origin "refs/tags/$tag:refs/tags/$tag"
+          if ! git cat-file -e "$tag:Dockerfile" 2>/dev/null; then
+            echo "$tag predates the image; nothing to refresh"
             echo "stale=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           theirs=$(layers "$base")
+          if ! ours=$(layers "$REPOSITORY:$tag" 2>"$RUNNER_TEMP/inspect.err"); then
+            cat "$RUNNER_TEMP/inspect.err" >&2
+            if grep -q ': not found' "$RUNNER_TEMP/inspect.err"; then
+              echo "$tag has no image; building it"
+              echo "stale=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "could not read $REPOSITORY:$tag" >&2
+            exit 1
+          fi
           if [ "$(head -n "$(wc -l <<<"$theirs")" <<<"$ours")" = "$theirs" ]; then
             echo "$tag is on $base"
             echo "stale=false" >> "$GITHUB_OUTPUT"
