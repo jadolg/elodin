@@ -26,7 +26,9 @@
 
 FROM jdxcode/mise:2026.11.8@sha256:5c6e71a86c8c997c32d30a169b4269bec9d4681a804e29078bac8f44109f2edc AS mise
 
-FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS build
+# The compiler and the libraries elodin links against: what `build` and
+# `itest` share, and nothing a commit's source changes.
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS toolchain
 # Unversioned on purpose (DL3008). The release is fixed by the digest above,
 # and within it Debian keeps only the current version of a package: a version
 # pinned here would vanish from the archive with the next security update and
@@ -48,6 +50,8 @@ ENV MISE_TRUSTED_CONFIG_PATHS=/src \
 # The toolchain, in a layer of its own that only a change to mise.toml rebuilds.
 COPY mise.toml ./
 RUN mise install odin
+
+FROM toolchain AS build
 COPY src/ src/
 # The checkout's git history is not in the build, so the version comes in as an
 # argument; mise.toml's own derivation defers to it.
@@ -59,12 +63,17 @@ RUN mise run release \
 
 # The integration suite, compiled the same way, beside the binary above, with
 # the openssl CLI and strace it needs and the image never will. It reads its
-# fixtures from a checkout mounted at run time.
-FROM build AS itest
+# fixtures from a checkout mounted at run time. The tools go in before the
+# source, so a commit reuses their layer rather than installing them again.
+FROM toolchain AS itest
 # hadolint ignore=DL3008
 RUN apt-get update -qq \
 	&& apt-get install -y -qq --no-install-recommends openssl strace >/dev/null \
 	&& rm -rf /var/lib/apt/lists/*
+COPY src/ src/
+ARG ELODIN_VERSION=dev
+ENV ELODIN_VERSION=${ELODIN_VERSION}
+COPY --from=build /src/bin/ bin/
 # The variables are lists of flags, split on purpose, and expanded by the
 # inner shell mise starts with them set, hence the single quotes.
 # hadolint ignore=SC2016,SC2086
