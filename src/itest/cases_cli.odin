@@ -365,64 +365,61 @@ run_cli_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	/*
-	`examples/public.yaml` is the one that cannot pass here, and that is the
-	file behaving as it says: it enables DoT and DoH against a certificate at
-	an installed path, and `--check` refuses a listener whose certificate is
-	not there rather than starting a resolver that cannot serve it. The rest of
-	the file is held to the bar above by pointing those paths at this tree's own
-	test certificate.
+	`examples/public.yaml` and `examples/docker-public.yaml` are the ones that
+	cannot pass here, and that is the files behaving as they say: they enable
+	DoT and DoH against a certificate at an installed path, and `--check`
+	refuses a listener whose certificate is not there rather than starting a
+	resolver that cannot serve it. The rest of each file is held to the bar
+	above by pointing those paths at this tree's own test certificate.
 	*/
-	start_case(r, "cli: the public example needs its certificate")
+	start_case(r, "cli: the public examples need their certificate")
 	{
-		res := new_check(r, "examples/public.yaml", "check-public-example")
-		check(r, res.exit_code != 0, "public.yaml passed --check without its certificate")
-		check(
-			r,
-			strings.contains(res.output, "listeners.dot.cert_file"),
-			"the missing certificate was not named: %q",
-			res.output,
-		)
-
-		/*
-		The rest of the file, checked with the certificate this suite already
-		has - `r.cert_file`, which is `certs/cert.pem` when the tree has one and
-		a freshly generated pair in the work directory otherwise. Written as an
-		absolute path, since `--check` resolves these against elodin's own
-		working directory rather than this test's.
-
-		Only when there is a certificate to name: a machine with no `openssl`
-		leaves the harness without one and skips every TLS case, and the first
-		half above is the assertion that does not need it.
-		*/
-		src, read_err := os.read_entire_file(
-			"examples/public.yaml",
-			context.temp_allocator,
-		)
-		have_cert := r.cert_file != "" && r.key_file != ""
-		if have_cert && check(r, read_err == nil, "could not read examples/public.yaml: %v", read_err) {
-			// `replace_all` reports whether it allocated rather than whether it
-			// matched, so the flag says nothing useful here and the text is
-			// taken as it comes back either way.
-			text, _ := strings.replace_all(
-				string(src),
-				"/etc/elodin/cert.pem",
-				r.cert_file,
-				context.temp_allocator,
-			)
-			text, _ = strings.replace_all(
-				text,
-				"/etc/elodin/key.pem",
-				r.key_file,
-				context.temp_allocator,
-			)
-			res = check_config_text(r, "check-public-example-certs", text)
-			check_eq_int(r, res.exit_code, 0, "exit code for public.yaml with a certificate it has")
+		Public_Example :: struct {
+			path, cert, key: string,
+		}
+		for ex in ([]Public_Example {
+			{"examples/public.yaml", "/etc/elodin/cert.pem", "/etc/elodin/key.pem"},
+			{"examples/docker-public.yaml", "/etc/elodin/certs/cert.pem", "/etc/elodin/certs/key.pem"},
+		}) {
+			res := new_check(r, ex.path, "check-public-example")
+			check(r, res.exit_code != 0, "%s passed --check without its certificate", ex.path)
 			check(
 				r,
-				strings.contains(res.output, "server.allow_from is empty"),
-				"the open-resolver warning was not reported: %q",
+				strings.contains(res.output, "listeners.dot.cert_file"),
+				"%s: the missing certificate was not named: %q",
+				ex.path,
 				res.output,
 			)
+
+			/*
+			The rest of the file, checked with the certificate this suite already
+			has - `r.cert_file`, which is `certs/cert.pem` when the tree has one and
+			a freshly generated pair in the work directory otherwise. Written as an
+			absolute path, since `--check` resolves these against elodin's own
+			working directory rather than this test's.
+
+			Only when there is a certificate to name: a machine with no `openssl`
+			leaves the harness without one and skips every TLS case, and the first
+			half above is the assertion that does not need it.
+			*/
+			src, read_err := os.read_entire_file(ex.path, context.temp_allocator)
+			have_cert := r.cert_file != "" && r.key_file != ""
+			if have_cert && check(r, read_err == nil, "could not read %s: %v", ex.path, read_err) {
+				// `replace_all` reports whether it allocated rather than whether it
+				// matched, so the flag says nothing useful here and the text is
+				// taken as it comes back either way.
+				text, _ := strings.replace_all(string(src), ex.cert, r.cert_file, context.temp_allocator) // lint:allow the flag is allocation, not a match
+				text, _ = strings.replace_all(text, ex.key, r.key_file, context.temp_allocator) // lint:allow the flag is allocation, not a match
+				res = check_config_text(r, "check-public-example-certs", text)
+				check_eq_int(r, res.exit_code, 0, fmt.tprintf("exit code for %s with a certificate it has", ex.path))
+				check(
+					r,
+					strings.contains(res.output, "server.allow_from is empty"),
+					"%s: the open-resolver warning was not reported: %q",
+					ex.path,
+					res.output,
+				)
+			}
 		}
 	}
 	end_case(r)

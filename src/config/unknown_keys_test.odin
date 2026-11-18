@@ -133,9 +133,9 @@ test_examples_load :: proc(t: ^testing.T) {
 	paths, _ := filepath.glob("examples/*.yaml", context.temp_allocator)
 	testing.expect(t, len(paths) > 0, "no examples found; run from the repository root")
 	for p in paths {
-		// Docker Compose's file, which runs the image with examples/docker.yaml
-		// and is no configuration of elodin's.
-		if filepath.base(p) == "compose.yaml" {
+		// Docker Compose's files, which run the image with examples/docker.yaml
+		// and examples/docker-public.yaml and are no configuration of elodin's.
+		if strings.has_prefix(filepath.base(p), "compose") {
 			continue
 		}
 		// Any refusal but a missing file: an example naming a certificate that is

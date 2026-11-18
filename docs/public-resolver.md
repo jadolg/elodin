@@ -3,8 +3,11 @@
 `allow_from: []` (see [Who may ask](access-control.md#who-may-ask)) opens the
 resolver to anybody, and every default elodin ships is sized for a household.
 [`examples/public.yaml`](../examples/public.yaml) is a configuration that already
-makes the choices below. The measured figures behind every bound in these docs
-live on this page; each names its report under `bench/results/`.
+makes the choices below, and
+[`examples/compose-public.yaml`](../examples/compose-public.yaml) runs its
+DoT-and-DoH-only variant in Docker, certificate included. The measured figures
+behind every bound in these docs live on this page; each names its report under
+`bench/results/`.
 
 ## Checklist
 

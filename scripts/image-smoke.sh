@@ -172,14 +172,18 @@ else
 	fail "exit code $code after SIGTERM"
 fi
 
-# The compose sample parses. Only its syntax: it names the published image,
+# The compose samples parse. Only their syntax: they name the published image,
 # not the one under test, whose settings the run above has already exercised.
+# compose-public.yaml refuses to load without the two names it asks for.
 if docker compose version >/dev/null 2>&1; then
-	if docker compose -f examples/compose.yaml config -q; then
-		pass "examples/compose.yaml is valid"
-	else
-		fail "examples/compose.yaml does not parse"
-	fi
+	for f in examples/compose.yaml examples/compose-public.yaml; do
+		if ELODIN_DOMAIN=dns.example.com ELODIN_ACME_EMAIL=admin@example.com \
+			docker compose -f "$f" config -q; then
+			pass "$f is valid"
+		else
+			fail "$f does not parse"
+		fi
+	done
 fi
 
 if [ "$failed" != 0 ]; then
