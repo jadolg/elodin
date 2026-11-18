@@ -9,7 +9,7 @@ changes, with a comment on why; anything they leave out is the shipped default.
 | [`local-only.yaml`](../examples/local-only.yaml) | one machine resolving for itself, bound to loopback |
 | [`lan.yaml`](../examples/lan.yaml) | the resolver a home or small-office network points at |
 | [`docker.yaml`](../examples/docker.yaml) | the same, in the container image, where it is the configuration the image ships with; [`compose.yaml`](../examples/compose.yaml) runs it |
-| [`small-device.yaml`](../examples/small-device.yaml) | a router or a small board, where memory and CPU are the constraint |
+| [`small-device.yaml`](../examples/small-device.yaml) | a small arm64 or amd64 board, where memory and CPU are the constraint |
 | [`public.yaml`](../examples/public.yaml) | a resolver on the internet that anybody may query |
 | [`container.yaml`](../examples/container.yaml) | a container or DaemonSet in front of a cluster's own DNS |
 | [`dev.yaml`](../examples/dev.yaml) | working on elodin itself: unprivileged ports, debug logging |

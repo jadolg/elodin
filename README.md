@@ -41,8 +41,8 @@ sudo apt update && sudo apt install elodin
 
 The package runs elodin as a systemd service and offers to take over as the
 system resolver. [Installing and running](docs/install.md) covers that, a
-release `.deb` or tarball (static ones run on Alpine, OpenWrt and any other
-Linux), the unit for a source build, and dropping privileges.
+release `.deb` or tarball (static ones run on any amd64 or arm64 Linux, Alpine
+and OpenWrt included), the unit for a source build, and dropping privileges.
 
 Or run the container image, amd64 or arm64, with a Pi-hole-style configuration
 built in ([`examples/docker.yaml`](examples/docker.yaml)):
