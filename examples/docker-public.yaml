@@ -151,9 +151,11 @@ dnssec:
   max_nsec3_iterations: 100
 
 cookies:
-  # Cookies are a UDP defence and this resolver has no UDP, but the upstream
-  # half still applies to the queries it forwards.
-  upstream: true
+  # The default: clients that send a cookie get one back, over DoT and DoH as
+  # well. `upstream` is left at its default too, though it does nothing here:
+  # it covers plain UDP and TCP upstreams, and the TLS of the DoT upstreams
+  # below already authenticates them.
+  enabled: true
 
 rebind:
   # On: a public name answered with a private address is refused.

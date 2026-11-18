@@ -35,3 +35,6 @@
 
 # Python bytecode from testdata/gen/
 __pycache__/
+
+# The variables for examples/compose-public.yaml: an operator's own domain.
+/examples/.env

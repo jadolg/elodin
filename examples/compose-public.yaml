@@ -1,10 +1,14 @@
 # elodin with Docker Compose, as a public DoT and DoH resolver, with its own
 # Let's Encrypt certificate.
 #
-#   ELODIN_DOMAIN=dns.example.com ELODIN_ACME_EMAIL=you@example.com \
-#     docker compose -f examples/compose-public.yaml up -d
+#   echo ELODIN_DOMAIN=dns.example.com > examples/.env
+#   docker compose -f examples/compose-public.yaml up -d
 #
-# (or put the two variables in a .env file beside this one). Runs
+# The variables go in examples/.env, beside this file, rather than on the
+# command line, because every command on this file needs them: `logs`, `ps` and
+# `down` as much as `up`. ELODIN_ACME_EMAIL is optional (see below), and so is
+# ELODIN_ACME_SERVER. The project is named elodin-public, so it does not share
+# containers or volumes with compose.yaml beside it. Runs
 # examples/docker-public.yaml: DoT on 853, DoH on 443, no plain DNS, open to
 # anybody. Read examples/public.yaml and docs/public-resolver.md before putting
 # it on the internet.
@@ -22,8 +26,13 @@
 #     does not spend the production rate limit:
 #       ELODIN_ACME_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 #     Clients will refuse the staging certificate; once it issues, run
-#     `docker compose ... down -v` to drop it and `up -d` again without the
-#     variable.
+#     `docker compose -f examples/compose-public.yaml down -v` to drop it,
+#     take the variable out of .env and `up -d` again.
+#   * Something that watches the certificate's expiry from outside, such as a
+#     probe of https://ELODIN_DOMAIN/. Let's Encrypt stopped sending expiry
+#     emails in June 2025, and a renewal that keeps failing only shows in
+#     certbot's log. ELODIN_ACME_EMAIL, if set, registers the account with that
+#     address, which Let's Encrypt uses for policy notices only.
 #
 # How the certificate gets to elodin:
 #
@@ -36,7 +45,8 @@
 #     validations per name an hour. `up` then stops waiting after about 5
 #     minutes, warns that certbot is unhealthy and starts elodin anyway, which
 #     exits and is restarted until the certificate is there
-#     (`docker compose logs certbot` says why it is not).
+#     (`docker compose -f examples/compose-public.yaml logs certbot` says
+#     why it is not).
 #   * elodin reads that file from the volume, read-only.
 #   * certbot stays up and tries a renewal twice a day. When the certificate
 #     changes it writes the new file and sends elodin a SIGHUP, which reloads
@@ -54,6 +64,8 @@
 #
 # A certificate for several names: ELODIN_DOMAIN=dns.example.com,doh.example.com.
 # The first name is the one the certificate is filed under.
+
+name: elodin-public
 
 services:
   # Holds the PID namespace certbot and elodin share; the pause image is what
@@ -75,7 +87,7 @@ services:
     pid: service:pidns
     environment:
       DOMAIN: ${ELODIN_DOMAIN:?set ELODIN_DOMAIN to the name clients will use, e.g. dns.example.com}
-      EMAIL: ${ELODIN_ACME_EMAIL:?set ELODIN_ACME_EMAIL to the address Let's Encrypt writes to about expiry}
+      EMAIL: ${ELODIN_ACME_EMAIL:-}
       ACME_SERVER: ${ELODIN_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
     volumes:
       # certbot's account, its renewal settings and the certificates it issued.
@@ -138,12 +150,20 @@ services:
           echo "installed the certificate for $$DOMAIN, expiring $$(openssl x509 -noout -enddate -in "$$live/fullchain.pem" | cut -d= -f2)"
         }
 
+        # An account with an address only if one was given; it is used for
+        # policy notices, not expiry.
+        if [ -n "$$EMAIL" ]; then
+          set -- --email "$$EMAIL" --no-eff-email
+        else
+          set -- --register-unsafely-without-email
+        fi
+
         # Idempotent: a certificate that is not due is kept without asking
         # Let's Encrypt anything, and a changed ELODIN_DOMAIN replaces the
         # names on it. ECDSA keys, which halve what a TLS handshake costs
         # elodin (see public.yaml).
         if ! run certbot certonly --standalone --non-interactive --agree-tos \
-          --email "$$EMAIL" --no-eff-email --server "$$ACME_SERVER" \
+          "$$@" --server "$$ACME_SERVER" \
           --key-type ecdsa --cert-name "$$name" -d "$$DOMAIN" \
           --keep-until-expiring; then
           if [ ! -s "$$live/fullchain.pem" ]; then
@@ -160,8 +180,10 @@ services:
           if ! pair_current; then
             install_pair
             # Not running yet on the first pass; it reads the new file when
-            # it starts. Not `-x`: busybox matches that against the full
-            # path, and nothing else in this namespace is called elodin.
+            # it starts. One that is still starting, before it handles
+            # SIGHUP, is ended by the signal instead, and restarts with the
+            # new file. Not `-x`: busybox matches that against the full path,
+            # and nothing else in this namespace is called elodin.
             if pkill -HUP elodin; then
               echo "sent elodin SIGHUP to reload the certificate"
             fi
