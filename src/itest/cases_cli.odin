@@ -379,9 +379,12 @@ run_cli_cases :: proc(r: ^Runner) {
 		}
 		for ex in ([]Public_Example {
 			{"examples/public.yaml", "/etc/elodin/cert.pem", "/etc/elodin/key.pem"},
-			{"examples/docker-public.yaml", "/etc/elodin/certs/cert.pem", "/etc/elodin/certs/key.pem"},
+			// One file for both: the certificate and its key, as compose-public.yaml writes it.
+			{"examples/docker-public.yaml", "/etc/elodin/certs/pair.pem", "/etc/elodin/certs/pair.pem"},
 		}) {
-			res := new_check(r, ex.path, "check-public-example")
+			// Tagged per file, so each run keeps its own output in the work directory.
+			stem := filepath.stem(ex.path)
+			res := new_check(r, ex.path, fmt.tprintf("check-%s-example", stem))
 			check(r, res.exit_code != 0, "%s passed --check without its certificate", ex.path)
 			check(
 				r,
@@ -410,7 +413,7 @@ run_cli_cases :: proc(r: ^Runner) {
 				// taken as it comes back either way.
 				text, _ := strings.replace_all(string(src), ex.cert, r.cert_file, context.temp_allocator) // lint:allow the flag is allocation, not a match
 				text, _ = strings.replace_all(text, ex.key, r.key_file, context.temp_allocator) // lint:allow the flag is allocation, not a match
-				res = check_config_text(r, "check-public-example-certs", text)
+				res = check_config_text(r, fmt.tprintf("check-%s-example-certs", stem), text)
 				check_eq_int(r, res.exit_code, 0, fmt.tprintf("exit code for %s with a certificate it has", ex.path))
 				check(
 					r,

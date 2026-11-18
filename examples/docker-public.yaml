@@ -18,9 +18,12 @@
 #   * Privileges. The image runs as uid 65532 from the start, and Docker lets an
 #     unprivileged process bind 443 and 853 inside the container's own network
 #     namespace, so there is no root to drop and `server.user` stays empty.
-#   * The certificate is the pair examples/compose-public.yaml keeps in the
-#     certs volume, mounted read-only at /etc/elodin/certs and owned by the
-#     image's account, so a SIGHUP after a renewal can open the new key.
+#   * The certificate and its key are one file, pair.pem, which
+#     examples/compose-public.yaml keeps in the certs volume, mounted read-only
+#     at /etc/elodin/certs and owned by the image's account, so a SIGHUP after
+#     a renewal can open the new key. One file, replaced by a single rename, so
+#     elodin never loads a new key beside an old certificate: `cert_file` and
+#     `key_file` both name it, and each reads its own part.
 #   * The metrics endpoint is bound to every address inside the container,
 #     since the container's loopback is unreachable from anywhere else. Who can
 #     reach it is decided by how you publish 9153 - on 127.0.0.1, or not at all.
@@ -80,16 +83,16 @@ listeners:
     enabled: true
     address: "::"
     port: 853
-    cert_file: /etc/elodin/certs/cert.pem
-    key_file: /etc/elodin/certs/key.pem
+    cert_file: /etc/elodin/certs/pair.pem
+    key_file: /etc/elodin/certs/pair.pem
   # Over HTTP/2 or HTTP/1.1 by ALPN; browsers only use HTTP/2.
   doh:
     enabled: true
     address: "::"
     port: 443
     path: /dns-query
-    cert_file: /etc/elodin/certs/cert.pem
-    key_file: /etc/elodin/certs/key.pem
+    cert_file: /etc/elodin/certs/pair.pem
+    key_file: /etc/elodin/certs/pair.pem
     # The Apple profile, built from the host the request arrived on. Set it to
     # "" to withhold it.
     mobileconfig_path: /apple-doh.mobileconfig

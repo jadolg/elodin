@@ -76,13 +76,18 @@ what has to hold around it:
 DNS turned off: DoT on 853 and DoH on 443 only, so there is no UDP to reflect
 and the datagram settings drop out. `compose-public.yaml` runs it beside
 certbot. certbot starts first, obtains the certificate over HTTP-01 on port 80,
-and copies the pair into a volume owned by the image's account; elodin waits
-for that. certbot then tries a renewal twice a day, copies a new pair in and
-sends elodin `SIGHUP`. elodin runs in certbot's PID namespace, so the signal
-needs no Docker socket. The compose network has IPv6 enabled and the listeners
-are on `::`, so IPv6 clients reach elodin under their own addresses rather than
-the bridge gateway's, and the per-prefix rate limit and connection share apply
-to each of them.
+and writes it with its key as one file, `pair.pem`, into a volume owned by the
+image's account; elodin waits for that. One file replaced by one rename means
+elodin never loads a new key beside an old certificate. certbot then tries a
+renewal twice a day, writes a new file and sends elodin `SIGHUP`. The two share
+a PID namespace held by a `pause` container, so the signal needs no Docker
+socket and certbot exiting leaves elodin running. With no certificate and a
+failed issue, certbot waits 15 minutes before trying again, under Let's
+Encrypt's limit of 5 failed validations per name an hour. The compose network
+has IPv6 enabled (Docker Engine 27 or later) and the listeners are on `::`, so
+IPv6 clients reach elodin under their own addresses rather than the bridge
+gateway's, and the per-prefix rate limit and connection share apply to each of
+them.
 
 **`container.yaml`** leaves the sizes to the derivation, which reads the
 container's cgroup limits: a pod limited to one CPU and 512 MiB derives one loop

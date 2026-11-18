@@ -16,6 +16,8 @@
 #     is only for Let's Encrypt's HTTP-01 challenge, answered by certbot; elodin
 #     never listens on it.
 #   * Nothing else on the host bound to 80, 443 or 853.
+#   * Docker Engine 27 or later, for the IPv6 network at the bottom of this
+#     file.
 #   * Try it against Let's Encrypt's staging environment first, so a mistake
 #     does not spend the production rate limit:
 #       ELODIN_ACME_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
@@ -26,27 +28,48 @@
 # How the certificate gets to elodin:
 #
 #   * certbot starts first. It obtains the certificate if there is none (or
-#     the one there is due), copies the pair into the `certs` volume owned by
-#     the image's account, uid 65532, and reports healthy. elodin will not
-#     start without a certificate to serve, so it waits for that.
-#   * elodin reads the pair from that volume, read-only.
+#     the one there is due), writes it and its key as one file into the
+#     `certs` volume, owned by the image's account, uid 65532, and reports
+#     healthy. elodin will not start without a certificate to serve, so it
+#     waits for that. If there is no certificate and certbot cannot get one,
+#     it waits 15 minutes before trying again: Let's Encrypt allows 5 failed
+#     validations per name an hour.
+#   * elodin reads that file from the volume, read-only.
 #   * certbot stays up and tries a renewal twice a day. When the certificate
-#     changes it copies the new pair in and sends elodin a SIGHUP, which
-#     reloads the certificate without dropping a connection. elodin runs in
-#     certbot's PID namespace (`pid:` below) so the signal needs no access to
-#     the Docker socket.
+#     changes it writes the new file and sends elodin a SIGHUP, which reloads
+#     the certificate without dropping a connection.
+#   * The signal needs no access to the Docker socket: certbot and elodin share
+#     a PID namespace, held by a third container, `pidns`, that does nothing
+#     else. It is that container's rather than certbot's so that certbot
+#     exiting - a failed renewal, a new image - leaves elodin running.
 #
 # The copy is the point of the arrangement: certbot keeps its keys root-only,
 # and elodin, which never runs as root, re-reads its key on every SIGHUP, so it
-# needs a copy it owns (docs/install.md, "Privileges").
+# needs a copy it owns (docs/install.md, "Privileges"). It is one file holding
+# the certificate and the key, renamed into place, so elodin never loads a new
+# key beside an old certificate.
 #
 # A certificate for several names: ELODIN_DOMAIN=dns.example.com,doh.example.com.
 # The first name is the one the certificate is filed under.
 
 services:
+  # Holds the PID namespace certbot and elodin share; the pause image is what
+  # Kubernetes uses for the same job in a pod. It runs as an unprivileged user,
+  # reaps orphans, and exits on SIGTERM. Restarting or recreating it ends the
+  # namespace and stops certbot and elodin with it; `restart:` brings them
+  # back into the new one, and `docker compose up -d` recreates them.
+  pidns:
+    image: registry.k8s.io/pause:3.10
+    restart: unless-stopped
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
   certbot:
     image: certbot/certbot:v5.10.0
     restart: unless-stopped
+    pid: service:pidns
     environment:
       DOMAIN: ${ELODIN_DOMAIN:?set ELODIN_DOMAIN to the name clients will use, e.g. dns.example.com}
       EMAIL: ${ELODIN_ACME_EMAIL:?set ELODIN_ACME_EMAIL to the address Let's Encrypt writes to about expiry}
@@ -54,7 +77,7 @@ services:
     volumes:
       # certbot's account, its renewal settings and the certificates it issued.
       - letsencrypt:/etc/letsencrypt
-      # The pair elodin serves, as elodin's account can read it.
+      # The file elodin serves, as elodin's account can read it.
       - certs:/certs
     # Let's Encrypt connects here to check the challenge. Every address: it
     # comes from the internet.
@@ -65,12 +88,11 @@ services:
     cap_drop: [ALL]
     cap_add: [CHOWN, KILL]
     security_opt: [no-new-privileges:true]
-    # Healthy once there is a pair for elodin to load.
+    # Healthy once there is a certificate for elodin to load.
     healthcheck:
-      test: ["CMD", "test", "-s", "/certs/cert.pem"]
-      interval: 1m
+      test: ["CMD", "test", "-s", "/certs/pair.pem"]
+      interval: 10s
       start_period: 5m
-      start_interval: 2s
     entrypoint:
       - /bin/sh
       - -euc
@@ -78,39 +100,58 @@ services:
         name=$${DOMAIN%%,*}
         live=/etc/letsencrypt/live/$$name
 
+        # Every long command runs in the background and is waited for, so a
+        # SIGTERM (`docker compose down`) reaches the trap at once rather than
+        # after the command, and is passed on to certbot to finish cleanly.
+        child=
+        trap 'if [ -n "$$child" ]; then kill -TERM "$$child" 2>/dev/null || true; wait "$$child" || true; fi; exit 0' TERM INT
+        run() {
+          "$$@" &
+          child=$$!
+          wait "$$child"
+        }
+
         # Whether /certs already holds what certbot has.
         pair_current() {
-          cmp -s "$$live/fullchain.pem" /certs/cert.pem
+          [ -s /certs/pair.pem ] &&
+            [ "$$(cat "$$live/fullchain.pem" "$$live/privkey.pem")" = "$$(cat /certs/pair.pem)" ]
         }
-        # Copies the pair into /certs for uid 65532, each file renamed into
-        # place so elodin never opens half of one. The mode is set before the
-        # owner: once a file is 65532's, root without CAP_FOWNER cannot
-        # change it.
+        # Writes the certificate and the key as one file for uid 65532, and
+        # renames it into place. Group 0 and 0440, so this root, which has no
+        # CAP_DAC_OVERRIDE, can still read it back above. The mode is set
+        # before the owner: once the file is 65532's, root without
+        # CAP_FOWNER cannot change it.
         install_pair() {
-          install -m 0400 "$$live/privkey.pem" /certs/key.pem.new
-          install -m 0444 "$$live/fullchain.pem" /certs/cert.pem.new
-          chown 65532:65532 /certs/key.pem.new /certs/cert.pem.new
-          mv -f /certs/key.pem.new /certs/key.pem
-          mv -f /certs/cert.pem.new /certs/cert.pem
-          echo "installed the certificate for $$DOMAIN, expiring $$(openssl x509 -noout -enddate -in /certs/cert.pem | cut -d= -f2)"
+          rm -f /certs/pair.pem.new
+          (umask 077 && cat "$$live/fullchain.pem" "$$live/privkey.pem" > /certs/pair.pem.new)
+          chmod 0440 /certs/pair.pem.new
+          chown 65532:0 /certs/pair.pem.new
+          mv -f /certs/pair.pem.new /certs/pair.pem
+          echo "installed the certificate for $$DOMAIN, expiring $$(openssl x509 -noout -enddate -in "$$live/fullchain.pem" | cut -d= -f2)"
         }
 
         # Idempotent: a certificate that is not due is kept without asking
         # Let's Encrypt anything, and a changed ELODIN_DOMAIN replaces the
         # names on it. ECDSA keys, which halve what a TLS handshake costs
-        # elodin (see public.yaml). A failure with a certificate already on
-        # hand is not fatal: the renewals below try again.
-        certbot certonly --standalone --non-interactive --agree-tos \
+        # elodin (see public.yaml).
+        if ! run certbot certonly --standalone --non-interactive --agree-tos \
           --email "$$EMAIL" --no-eff-email --server "$$ACME_SERVER" \
           --key-type ecdsa --cert-name "$$name" -d "$$DOMAIN" \
-          --keep-until-expiring \
-          || [ -s "$$live/fullchain.pem" ]
+          --keep-until-expiring; then
+          if [ ! -s "$$live/fullchain.pem" ]; then
+            # Nothing to serve yet, so wait before the restart tries again.
+            echo "no certificate for $$DOMAIN yet; trying again in 15 minutes"
+            run sleep 15m || true
+            exit 1
+          fi
+          # A certificate is on hand; the renewals below try again.
+          echo "certbot certonly failed; serving the certificate on hand"
+        fi
 
-        trap 'exit 0' TERM INT
         while :; do
           if ! pair_current; then
             install_pair
-            # Not running yet on the first pass; it reads the new pair when
+            # Not running yet on the first pass; it reads the new file when
             # it starts. Not `-x`: busybox matches that against the full
             # path, and nothing else in this namespace is called elodin.
             if pkill -HUP elodin; then
@@ -118,10 +159,10 @@ services:
             fi
           fi
           # A sleep cut short is just an earlier round.
-          sleep 12h & wait $$! || true
+          run sleep 12h || true
           # Renews once the certificate is within 30 days of expiry, with the
           # settings the first issue saved. A failure is retried next round.
-          certbot renew --non-interactive --quiet || echo "certbot renew failed; retrying in 12h"
+          run certbot renew --non-interactive --quiet || echo "certbot renew failed; retrying in 12h"
         done
 
   elodin:
@@ -130,12 +171,8 @@ services:
     depends_on:
       certbot:
         condition: service_healthy
-    # certbot's PID namespace, so its renewal can signal elodin. Restarting or
-    # recreating certbot ends that namespace and stops elodin with it, and
-    # `restart:` brings it back into the new one. After recreating certbot
-    # (a new image), run `docker compose up -d` without naming a service, so
-    # elodin is recreated against it too.
-    pid: service:certbot
+    # The namespace certbot signals into.
+    pid: service:pidns
     networks: [elodin]
     ports:
       # Every address: this is the public endpoint. DoT, then DoH.
@@ -170,7 +207,8 @@ networks:
   # all of them would share one /64's rate limit and connection share. With it,
   # Docker forwards them as it does IPv4, to the container's own IPv6 address
   # (which is why docker-public.yaml listens on "::"), and elodin sees each
-  # client's own address. Harmless on a host without IPv6.
+  # client's own address. With no subnet given, Docker Engine 27 and later
+  # allocate one; an older engine needs an `ipam:` subnet here.
   elodin:
     enable_ipv6: true
 
