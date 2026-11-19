@@ -84,11 +84,11 @@ test_the_plan_grants_a_symlinked_logs_target_directory_only :: proc(t: ^testing.
 	cfg := config.default_config()
 	cfg.server.sandbox = .Basic
 	plan, pinned := sandbox_plan(&cfg, tree.real_file, tree.link, context.temp_allocator)
-	testing.expectf(t, slice.equal(plan.log_dirs, []string{tree.real_dir}), "log grants %v, want only %q", plan.log_dirs, tree.real_dir)
+	testing.expectf(t, plan.log_dir == tree.real_dir, "log grants %q, want only %q", plan.log_dir, tree.real_dir)
 	testing.expectf(t, len(pinned) == 0, "pinned %v", pinned)
 
 	plan, pinned = sandbox_plan(&cfg, tree.real_file, "", context.temp_allocator)
-	testing.expectf(t, len(plan.log_dirs) == 0 && len(pinned) == 0, "logging to stderr: grants %v, pinned %v", plan.log_dirs, pinned)
+	testing.expectf(t, plan.log_dir == "" && len(pinned) == 0, "logging to stderr: grants %q, pinned %v", plan.log_dir, pinned)
 }
 
 /*
@@ -131,7 +131,7 @@ test_the_plan_pins_files_directly_in_shared_directories :: proc(t: ^testing.T) {
 	}
 	for dir in PINNED_DIRS {
 		testing.expectf(t, !slice.contains(plan.readable, dir), "%v grants %s", plan.readable, dir)
-		testing.expectf(t, !slice.contains(plan.log_dirs, dir), "log grants %v include %s", plan.log_dirs, dir)
+		testing.expectf(t, plan.log_dir != dir, "the log grants %s", dir)
 	}
 	testing.expectf(t, slice.contains(pinned, "/etc/elodin-test.yaml") && slice.contains(pinned, "/elodin-test.log"), "pinned %v", pinned)
 }
@@ -176,12 +176,12 @@ test_the_plan_grants_only_a_regular_or_new_log :: proc(t: ^testing.T) {
 	cfg.server.sandbox = .Basic
 	for path in ([]string{"/dev/null", fifo}) {
 		plan, pinned := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", path, context.temp_allocator)
-		testing.expectf(t, len(plan.log_dirs) == 0 && len(pinned) == 0, "a log at %s grants %v, pins %v", path, plan.log_dirs, pinned)
+		testing.expectf(t, plan.log_dir == "" && len(pinned) == 0, "a log at %s grants %q, pins %v", path, plan.log_dir, pinned)
 	}
 	not_yet := strings.concatenate({tree.real_dir, "/new.log"}, context.temp_allocator)
 	for path in ([]string{tree.real_file, not_yet}) {
 		plan, pinned := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", path, context.temp_allocator)
-		testing.expectf(t, slice.equal(plan.log_dirs, []string{tree.real_dir}) && len(pinned) == 0, "a log at %s grants %v, pins %v, want %q", path, plan.log_dirs, pinned, tree.real_dir)
+		testing.expectf(t, plan.log_dir == tree.real_dir && len(pinned) == 0, "a log at %s grants %q, pins %v, want %q", path, plan.log_dir, pinned, tree.real_dir)
 	}
 }
 
@@ -233,4 +233,41 @@ test_the_strict_plan_reads_lists_resolver_and_cert_targets :: proc(t: ^testing.T
 	testing.expectf(t, slice.contains(readable[:], certs), "%v lacks the directory itself", readable)
 	testing.expectf(t, slice.contains(readable[:], tree.real_dir), "%v lacks where its entries lead", readable)
 	testing.expectf(t, !slice.contains(readable[:], tree.dir), "%v grants the directory's parent", readable)
+}
+
+// OpenSSL's bundle is reached where it leads: its name's directory, where the
+// host's private keys are, is not granted; one that is itself in such a
+// directory is granted alone.
+@(test)
+test_the_bundle_is_reached_where_it_leads :: proc(t: ^testing.T) {
+	tree, ok := make_tree(t)
+	defer remove_tree(t, tree)
+	if !ok {
+		return
+	}
+	out := make([dynamic]string, context.temp_allocator)
+	pins := make([dynamic]string, context.temp_allocator)
+	add_bundle(&out, &pins, tree.link, context.temp_allocator)
+	testing.expectf(t, slice.equal(out[:], []string{tree.real_dir}) && len(pins) == 0, "grants %v, pins %v, want only %q", out, pins, tree.real_dir)
+
+	for dir in ([]string{"/etc/ssl", "/etc/pki/tls"}) {
+		testing.expectf(t, is_pinned(dir), "%s, which holds private keys, is not pinned", dir)
+	}
+}
+
+// A directory that is not there gets no rule, and so no warning that it is out
+// of reach: OpenSSL's built-in paths often are not.
+@(test)
+test_a_missing_directory_is_not_granted :: proc(t: ^testing.T) {
+	tree, ok := make_tree(t)
+	defer remove_tree(t, tree)
+	if !ok {
+		return
+	}
+	out := make([dynamic]string, context.temp_allocator)
+	pins := make([dynamic]string, context.temp_allocator)
+	absent := strings.concatenate({tree.dir, "/absent"}, context.temp_allocator)
+	grant_dir(&out, &pins, absent, strings.concatenate({absent, "/cert.pem"}, context.temp_allocator), context.temp_allocator)
+	grant_dir(&out, &pins, tree.real_dir, tree.real_file, context.temp_allocator)
+	testing.expectf(t, slice.equal(out[:], []string{tree.real_dir}) && len(pins) == 0, "grants %v, pins %v, want only %q", out, pins, tree.real_dir)
 }

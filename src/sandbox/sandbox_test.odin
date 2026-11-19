@@ -2,6 +2,7 @@ package sandbox
 
 import "base:runtime"
 import "core:fmt"
+import "core:io"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -130,6 +131,12 @@ SOCK_RAW :: 3
 @(private = "file")
 IPPROTO_ICMP :: 1
 @(private = "file")
+IPPROTO_SCTP :: 132
+@(private = "file")
+IPPROTO_UDPLITE :: 136
+@(private = "file")
+SCHED_IDLE :: 5
+@(private = "file")
 SOCK_NONBLOCK :: 0o4000
 @(private = "file")
 SOCK_CLOEXEC :: 0o2000000
@@ -170,6 +177,16 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 		}
 		if errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_UNIX), uintptr(SOCK_DGRAM), uintptr(0))) != .EAFNOSUPPORT {
 			failed |= 1 << 2
+		}
+		// A protocol of its own module refused; TCP named outright allowed.
+		if errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_STREAM), uintptr(IPPROTO_SCTP))) != .EPERM ||
+		   errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_INET6), uintptr(SOCK_DGRAM), uintptr(IPPROTO_UDPLITE))) != .EPERM {
+			failed |= 1 << 2
+		}
+		if fd := linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_STREAM), uintptr(IPPROTO_TCP)); fd < 0 {
+			failed |= 1 << 2
+		} else {
+			linux.close(linux.Fd(fd))
 		}
 		// Raw refused whoever asks; a datagram socket with its flags allowed.
 		if errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_RAW), uintptr(IPPROTO_ICMP))) != .EPERM {
@@ -271,6 +288,12 @@ test_the_filter_lets_threads_start_and_refuses_a_fork :: proc(t: ^testing.T) {
 		info: linux.Sys_Info
 		if linux.sysinfo(&info) != .NONE {
 			failed |= 1 << 3
+		}
+		// A thread's policy may be set as glibc sets it, and only to that.
+		param: [1]i32
+		if linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(SCHED_OTHER), &param) != 0 ||
+		   errno_of(linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(SCHED_IDLE), &param)) != .EPERM {
+			failed |= 1 << 4
 		}
 		return failed
 	}
@@ -443,7 +466,7 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 	}
 	strict :: proc() -> u8 {
 		missing := strings.concatenate({landlock_outside, "/missing"}, context.temp_allocator)
-		report, ok := confine({mode = .Strict, log_dirs = {landlock_outside}, readable = {landlock_inside, "/proc/meminfo", missing}})
+		report, ok := confine({mode = .Strict, log_dir = landlock_outside, readable = {landlock_inside, "/proc/meminfo", missing}})
 		if report.landlock == .Unavailable {
 			return SKIP_STATUS
 		}
@@ -511,11 +534,24 @@ test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^test
 		{in_force = true, reads = false, write = false, err = eacces, hinted = false},
 		{in_force = true, reads = true, write = false, err = eacces, hinted = true},
 		{in_force = true, reads = true, write = true, err = enoent, hinted = false},
+		// As `core:os` reports EACCES.
+		{in_force = true, reads = false, write = true, err = io.Error.Permission_Denied, hinted = true},
 	}
 	for c in cases {
 		sync.atomic_store(&landlock_in_force, c.in_force)
 		sync.atomic_store(&landlock_reads, c.reads)
 		testing.expectf(t, (refusal_hint(c.err, write = c.write) == REFUSAL_HINT) == c.hinted, "%v", c)
+	}
+}
+
+// The program fits the buffer it is built in, with room: one that outgrew it
+// would refuse every strict start.
+@(test)
+test_the_program_fits_its_buffer :: proc(t: ^testing.T) {
+	when AUDIT_ARCH != 0 {
+		program: [PROGRAM_MAX]Sock_Filter
+		n := build_program(program[:], 1)
+		testing.expectf(t, n > 0 && n <= len(program), "%d instructions for a buffer of %d", n, len(program))
 	}
 }
 

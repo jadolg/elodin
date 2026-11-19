@@ -1,5 +1,6 @@
 package sandbox
 
+import "core:io"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -152,12 +153,12 @@ confine :: proc(plan: Plan, allocator := context.allocator) -> (report: Report, 
 	}
 	defer linux.close(linux.Fd(ruleset))
 
-	grants := make([dynamic]Grant, 0, 1 + len(plan.log_dirs) + len(plan.readable), context.temp_allocator)
+	grants := make([dynamic]Grant, 0, 2 + len(plan.readable), context.temp_allocator)
 	if plan.cache_dir != "" {
 		append(&grants, Grant{plan.cache_dir, CACHE_ACCESS})
 	}
-	for dir in plan.log_dirs {
-		append(&grants, Grant{dir, LOG_ACCESS})
+	if plan.log_dir != "" {
+		append(&grants, Grant{plan.log_dir, LOG_ACCESS})
 	}
 	for path in plan.readable {
 		append(&grants, Grant{path, READ_ACCESS})
@@ -202,7 +203,8 @@ REFUSAL_HINT :: " (or server.sandbox refuses it: its Landlock rules reach only t
 // the access refused - writing, or reading under `.Strict` - "" otherwise.
 refusal_hint :: proc(err: os.Error, write: bool) -> string {
 	confined := sync.atomic_load(&landlock_in_force) && (write || sync.atomic_load(&landlock_reads))
-	if confined && err == os.Platform_Error(linux.Errno.EACCES) {
+	// `core:os` reports EACCES as `Permission_Denied`; a raw open, as itself.
+	if confined && (err == os.Platform_Error(linux.Errno.EACCES) || err == io.Error.Permission_Denied) {
 		return REFUSAL_HINT
 	}
 	return ""

@@ -199,9 +199,7 @@ sandbox_plan :: proc(
 				grant = resolve(log_file, allocator) or_else ""
 				append(&pins, log_file)
 			}
-			if grant != "" {
-				plan.log_dirs = slice.clone([]string{grant}, allocator)
-			}
+			plan.log_dir = grant
 		}
 	}
 	if plan.mode != .Strict {
@@ -217,7 +215,7 @@ sandbox_plan :: proc(
 	}
 	ca := tlsx.default_ca_locations(context.temp_allocator)
 	// The bundle is a file; the rest are directories of certificates.
-	add_dirs_of(&readable, &pins, ca[0], allocator)
+	add_bundle(&readable, &pins, ca[0], allocator)
 	for dir in ca[1:] {
 		add_cert_dir(&readable, &pins, dir, allocator)
 	}
@@ -243,11 +241,13 @@ log_dir_of :: proc(file: string, allocator := context.allocator) -> (string, boo
 }
 
 /*
-Directories whose every file a strict read grant would expose: a re-read file
-directly in one is granted alone (`add_dirs_of`), and named at startup.
+Directories whose every file a strict read grant would expose - the host's
+secrets, its TLS private keys among them (`/etc/ssl/private`,
+`/etc/pki/tls/private`): a file directly in one is granted alone
+(`grant_dir`), and named at startup.
 */
 @(private)
-PINNED_DIRS :: [?]string{"/", "/etc"}
+PINNED_DIRS :: [?]string{"/", "/etc", "/etc/ssl", "/etc/pki", "/etc/pki/tls"}
 
 @(private)
 is_pinned :: proc(dir: string) -> bool {
@@ -284,11 +284,16 @@ add_dirs_of :: proc(out, pinned: ^[dynamic]string, file: string, allocator := co
 /*
 Append `dir` as the rule will open it - resolved, so a relative name or a
 symlink is the directory it is - unless that is in `PINNED_DIRS`: then `file`,
-which is in it, goes on `out` instead, and on `pinned`.
+which is in it, goes on `out` instead, and on `pinned`. Nothing for a directory
+that is not there, which no file the process reads can be in: OpenSSL's
+built-in paths often are not.
 */
 @(private)
 grant_dir :: proc(out, pinned: ^[dynamic]string, dir, file: string, allocator := context.allocator) {
-	real := resolve(dir, allocator) or_else dir
+	real, found := resolve(dir, allocator)
+	if !found {
+		return
+	}
 	path := real
 	if is_pinned(real) {
 		path = file
@@ -313,6 +318,18 @@ add_file_rule :: proc(out, pinned: ^[dynamic]string, file: string, allocator := 
 		append(out, file)
 	}
 	if target, ok := resolve(file, allocator); ok && target != file {
+		grant_dir(out, pinned, filepath.dir(target), target, allocator)
+	}
+}
+
+/*
+Append where OpenSSL's bundle file leads, and nothing for its name: that is in
+`/etc/ssl` or `/etc/pki/tls` beside the host's private keys, while the file it
+links to - Alpine's, Arch's, Fedora's - sits in a directory of certificates.
+*/
+@(private)
+add_bundle :: proc(out, pinned: ^[dynamic]string, bundle: string, allocator := context.allocator) {
+	if target, found := resolve(bundle, allocator); found {
 		grant_dir(out, pinned, filepath.dir(target), target, allocator)
 	}
 }

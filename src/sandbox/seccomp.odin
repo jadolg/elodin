@@ -21,7 +21,11 @@ call is fine with other arguments:
   user namespace is how an unprivileged process reaches kernel code otherwise
   reserved for root, and a new process is nothing the server makes.
 - `socket` outside AF_INET and AF_INET6 returns EAFNOSUPPORT, and one that is
-  neither a stream nor a datagram socket - raw - EPERM.
+  neither a stream nor a datagram socket - raw - or names a protocol other than
+  TCP or UDP, EPERM.
+- `sched_setscheduler` to any policy but SCHED_OTHER returns EPERM: glibc sets
+  a new thread's on its tid, which a filter cannot tell from another
+  process's pid, so the policy is what is held - SCHED_IDLE would starve one.
 - `kill` and `tgkill` aimed at any process but this one, and `prlimit64` and
   `sched_setaffinity` aimed at anything but the caller, return EPERM.
 - `setsockopt` returns EPERM for any option but those in `SOCKET_OPTIONS`.
@@ -35,6 +39,9 @@ filter_syscalls :: proc() -> linux.Errno {
 	} else {
 		program: [PROGRAM_MAX]Sock_Filter
 		n := build_program(program[:], u32(linux.getpid()))
+		if n > len(program) {
+			return .E2BIG
+		}
 		prog := Sock_Fprog {
 			len    = u16(n),
 			filter = &program[0],
@@ -134,6 +141,10 @@ SOCK_DGRAM :: 2
 // The type's bits in `socket`'s second argument; the flags are above them.
 @(private)
 SOCK_TYPE_MASK :: 0xf
+@(private)
+IPPROTO_UDP :: 17
+@(private)
+SCHED_OTHER :: 0
 
 /*
 The socket options a serving process sets: the read and write timeouts in both
@@ -169,14 +180,16 @@ SO_RCVTIMEO_NEW :: 66
 SO_SNDTIMEO_NEW :: 67
 
 // Two instructions per allowed call, five per socket option, and the fixed
-// head, tail and argument checks, which come to fewer than `PROGRAM_HEAD`.
+// head, tail and argument checks, which come to fewer than `PROGRAM_HEAD`; a
+// program that outgrows it is refused (`filter_syscalls`), which a test sees.
 @(private)
-PROGRAM_HEAD :: 48
+PROGRAM_HEAD :: 80
 @(private)
 PROGRAM_MAX :: 2 * (len(ALLOWED) + len(ALLOWED_ARCH)) + 5 * len(SOCKET_OPTIONS) + PROGRAM_HEAD
 
 /*
-Write the filter into `out` and return its length. `pid` is the one process
+Write the filter into `out` and return its length, which is more than
+`len(out)` when it did not fit and nothing past that was written. `pid` is the one process
 `kill` and `tgkill` may name.
 
 The head refuses a foreign architecture before any number is read: an x86_64
@@ -187,8 +200,12 @@ number on the list is one of its calls.
 @(private)
 build_program :: proc(out: []Sock_Filter, pid: u32) -> int {
 	n := 0
+	// Past the end, counted and not written: the caller refuses a program
+	// longer than `out`.
 	emit :: proc(out: []Sock_Filter, n: ^int, code: u16, k: u32, jt: u8 = 0, jf: u8 = 0) {
-		out[n^] = Sock_Filter{code, jt, jf, k}
+		if n^ < len(out) {
+			out[n^] = Sock_Filter{code, jt, jf, k}
+		}
 		n^ += 1
 	}
 	ret :: proc(out: []Sock_Filter, n: ^int, action: u32) {
@@ -219,14 +236,20 @@ build_program :: proc(out: []Sock_Filter, pid: u32) -> int {
 
 	// The family, then the type less SOCK_NONBLOCK and SOCK_CLOEXEC: a raw
 	// socket is the kernel's packet code to a root process with no user.
-	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_socket), jf = 10)
+	// And the protocol: 0, TCP or UDP - another, SCTP or UDP-Lite, is a kernel
+	// module of its own, loaded on demand.
+	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_socket), jf = 14)
 	emit(out, &n, BPF_LD_W_ABS, DATA_ARG0_LOW)
 	emit(out, &n, BPF_JEQ_K, AF_INET, jt = 1)
-	emit(out, &n, BPF_JEQ_K, AF_INET6, jf = 5)
+	emit(out, &n, BPF_JEQ_K, AF_INET6, jf = 9)
 	emit(out, &n, BPF_LD_W_ABS, DATA_ARG1_LOW)
 	emit(out, &n, BPF_AND_K, SOCK_TYPE_MASK)
-	emit(out, &n, BPF_JEQ_K, SOCK_STREAM, jt = 3)
-	emit(out, &n, BPF_JEQ_K, SOCK_DGRAM, jt = 2)
+	emit(out, &n, BPF_JEQ_K, SOCK_STREAM, jt = 1)
+	emit(out, &n, BPF_JEQ_K, SOCK_DGRAM, jf = 4)
+	emit(out, &n, BPF_LD_W_ABS, DATA_ARG2_LOW)
+	emit(out, &n, BPF_JEQ_K, 0, jt = 4)
+	emit(out, &n, BPF_JEQ_K, IPPROTO_TCP, jt = 3)
+	emit(out, &n, BPF_JEQ_K, IPPROTO_UDP, jt = 2)
 	ret(out, &n, errno(.EPERM))
 	ret(out, &n, errno(.EAFNOSUPPORT))
 	ret(out, &n, RET_ALLOW)
@@ -251,6 +274,12 @@ build_program :: proc(out: []Sock_Filter, pid: u32) -> int {
 		ret(out, &n, errno(.EPERM))
 		ret(out, &n, RET_ALLOW)
 	}
+
+	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_sched_setscheduler), jf = 4)
+	emit(out, &n, BPF_LD_W_ABS, DATA_ARG1_LOW)
+	emit(out, &n, BPF_JEQ_K, SCHED_OTHER, jt = 1)
+	ret(out, &n, errno(.EPERM))
+	ret(out, &n, RET_ALLOW)
 
 	// Each pair: a level that is not this one skips the three after it, an
 	// option that is not this one the return.
@@ -340,7 +369,6 @@ ALLOWED :: [?]uintptr {
 	linux.SYS_sched_yield,
 	linux.SYS_sched_getaffinity,
 	linux.SYS_sched_getscheduler,
-	linux.SYS_sched_setscheduler,
 	linux.SYS_sched_get_priority_min,
 	linux.SYS_sched_get_priority_max,
 	linux.SYS_getrandom,

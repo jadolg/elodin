@@ -84,7 +84,9 @@ RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
-SystemCallFilter=@system-service
+# @sandbox is what server.sandbox calls to narrow the process further: Landlock,
+# and seccomp under strict (docs/install.md#sandbox). Not in @system-service.
+SystemCallFilter=@system-service @sandbox
 
 [Install]
 WantedBy=multi-user.target

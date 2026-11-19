@@ -64,7 +64,8 @@ sudo systemctl enable --now elodin
 ```
 
 The unit binds :53 through `AmbientCapabilities=CAP_NET_BIND_SERVICE` rather
-than as root, and runs under `DynamicUser=yes` with `ProtectSystem=strict`.
+than as root, and runs under `DynamicUser=yes` with `ProtectSystem=strict`; its
+`SystemCallFilter=` names `@sandbox` for [`server.sandbox`](#sandbox).
 `Restart=on-failure` with `StartLimitBurst=5` retries a start that fails for a
 passing reason and gives up in `failed` on one that does not — a port it cannot
 have, a certificate it cannot read. `systemctl reset-failed elodin` clears that.
@@ -316,7 +317,8 @@ and they last for the life of the process: `server.sandbox` takes a restart.
   cache directory removed while the process runs cannot be made again until a
   restart, for the same reason.
 - A file the sandbox would reach through its directory that sits directly in
-  `/` or `/etc` (by its name or by where a symlink leads) is reached alone
+  `/`, `/etc`, `/etc/ssl`, `/etc/pki` or `/etc/pki/tls` (by its name or by
+  where a symlink leads) is reached alone
   instead, and startup names it: one that replaces it - an editor, a renewal, a
   log rotation - is not seen until a restart, so give it a directory of its own.
 - A file the sandbox refuses is reported as for any other file that cannot be
@@ -356,10 +358,11 @@ Under `strict`, reading is confined to these:
   that replaces `/etc/resolv.conf` by renaming a new file over it (NetworkManager
   without systemd-resolved, dhclient) leaves the rule on the old file, so with
   hosts to look up and no `upstream.bootstrap`, startup says to set one;
-- OpenSSL's trust store: its bundle file's directory, its certificate
-  directory, and every directory that directory's entries point into
-  (`/usr/share/ca-certificates/mozilla` on Debian and Ubuntu), or what
-  `SSL_CERT_FILE` and `SSL_CERT_DIR` name;
+- OpenSSL's trust store, or what `SSL_CERT_FILE` and `SSL_CERT_DIR` name: the
+  directory the bundle file leads to (not the one its name is in, `/etc/ssl` or
+  `/etc/pki/tls`, beside the host's private keys), the certificate directory,
+  and every directory that directory's entries point into
+  (`/usr/share/ca-certificates/mozilla` on Debian and Ubuntu);
 - `/proc` and `/sys/fs/cgroup`, which the metrics and the sizing read. Both are
   granted whole: procfs makes a new inode each time it looks up an entry it
   had let go of, so a rule on `/proc/<pid>` would stop matching. Only the
@@ -372,8 +375,9 @@ on any call off the list. The calls a serving process makes on glibc and musl,
 on x86_64 and arm64, are on it. A libc that makes another one ends the process
 with `SIGSYS`; set `basic` and report it. `execve`, `ptrace`, `bind`, `ioctl`,
 new processes (a `clone` that is not a thread) and namespaces, sockets other
-than IPv4 and IPv6 streams and datagrams (no raw sockets), and socket options other than the read and write timeouts and
-`TCP_NODELAY` are not on it.
+than IPv4 and IPv6 streams and datagrams over TCP or UDP (no raw sockets, no
+SCTP), scheduling policies other than the default, and socket options other
+than the read and write timeouts and `TCP_NODELAY` are not on it.
 `strict` refuses to start where the filter cannot be installed, which includes
 any architecture other than x86_64 and arm64.
 

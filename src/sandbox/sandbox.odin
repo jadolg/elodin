@@ -42,9 +42,9 @@ Plan :: struct {
 	mode:      Mode,
 	// Read, write, create and replace files beneath; the blocklist cache.
 	cache_dir: string,
-	// Write and create files beneath: the directory the log file is in, and
-	// the one it resolves to when that is elsewhere.
-	log_dirs:  []string,
+	// Write and create files beneath: the directory of the file the log leads
+	// to. A file rather than a directory is written alone.
+	log_dir:   string,
 	// Read beneath, under `.Strict`: a file or a directory.
 	readable:  []string,
 }
