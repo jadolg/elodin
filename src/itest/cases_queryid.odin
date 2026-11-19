@@ -26,6 +26,24 @@ CLIENT_ID :: u16(0x4242)
 @(private = "file")
 FORWARDS :: 24
 
+/*
+How often a server drawing every ID at random may still be seen to do what a
+broken one does, before the case says so. A random draw is the client's ID one
+time in 65,536: requiring none of 24 to be failed a correct server about once
+in 2,700 runs. Three or more is C(24,3)/65536^3, under 1e-11, while a server
+that copies the ID copies it 24 times.
+*/
+@(private = "file")
+REUSED_ALLOWED :: 2
+
+/*
+24 draws from 16 bits make about 276/65536 = 0.0042 colliding pairs, so four or
+more IDs lost to collisions is about 0.0042^4/24, under 1e-10, while one fresh
+ID used for every query loses 23.
+*/
+@(private = "file")
+REPEATS_ALLOWED :: 3
+
 run_query_id_cases :: proc(r: ^Runner) {
 	// Any name, so each query can ask a different one and still be answered.
 	mock, upstream_port, started := synth_mock(r, "id-upstream", "upstream: transaction ids", {192, 0, 2, 9})
@@ -85,16 +103,15 @@ run_query_id_cases :: proc(r: ^Runner) {
 		}
 
 		check_eq_int(r, answered, FORWARDS, "queries answered")
-		check_eq_int(r, reused, 0, "forwarded queries carrying the client's own id")
+		check(r, reused <= REUSED_ALLOWED, "%d of %d forwarded queries carried the client's own id", reused, answered)
 		/*
 		Distinctness is the other half of it: one fresh ID reused for every
 		query afterwards is as good as the client's to an attacker who has seen
-		a single answer. 24 draws from 16 bits collide about 0.4% of the time,
-		so one repeat is not a failure - several are.
+		a single answer.
 		*/
 		check(
 			r,
-			len(seen) >= answered - 2,
+			len(seen) >= answered - REPEATS_ALLOWED,
 			"only %d distinct transaction ids across %d forwarded queries",
 			len(seen),
 			answered,
