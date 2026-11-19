@@ -29,14 +29,22 @@ Mode :: enum u8 {
 	Strict,
 }
 
-// What `confine` grants. Paths that do not exist when it runs are skipped and
-// listed in `Report.missing`.
+// What `server.sandbox` calls each mode, in the file and in the log.
+MODE_NAMES :: [Mode]string {
+	.Off    = "off",
+	.Basic  = "basic",
+	.Strict = "strict",
+}
+
+// What `confine` grants. A path that cannot be opened when it runs gets no rule
+// and is listed in `Report.unreachable`.
 Plan :: struct {
 	mode:      Mode,
 	// Read, write, create and replace files beneath; the blocklist cache.
 	cache_dir: string,
-	// Write and create files beneath; the directory the log file is in.
-	log_dir:   string,
+	// Write and create files beneath: the directory the log file is in, and
+	// the one it resolves to when that is elsewhere.
+	log_dirs:  []string,
 	// Read beneath, under `.Strict`: a file or a directory.
 	readable:  []string,
 }
@@ -52,11 +60,17 @@ Landlock_Status :: enum u8 {
 	Failed,
 }
 
+// A path of the plan that could not be opened, and why.
+Unreachable :: struct {
+	path:  string,
+	errno: i32,
+}
+
 Report :: struct {
-	landlock: Landlock_Status,
-	// The Landlock ABI version the kernel reports, 0 when it has none.
-	abi:      int,
-	errno:    i32,
-	// The plan's paths that could not be opened, so carry no rule.
-	missing:  [dynamic]string,
+	landlock:    Landlock_Status,
+	// The Landlock ABI version the kernel reports, 0 when it has none. Whether
+	// a ruleset is in force is `landlock`.
+	abi:         int,
+	errno:       i32,
+	unreachable: [dynamic]Unreachable,
 }

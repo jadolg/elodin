@@ -193,6 +193,9 @@ because root, once given up, cannot be had back - nor, with it, the handover of
 the blocklist cache directory to that account. The certificates under
 `listeners.dot` and `listeners.doh` are still read again on every SIGHUP, from
 the paths the process started with.
+And `log.file` under a sandbox, whose Landlock rules grant writing to the
+directory of the log the process started with and nowhere else, and the
+sandbox itself, which nothing takes off a thread.
 
 Held at the starting value rather than at the previous reload's, which is the
 same value for every key here - none of them has ever changed while running -
@@ -234,6 +237,11 @@ keep_restart_only :: proc(boot, cfg: ^config.Config, allocator := context.alloca
 	hold(&changed, "server.group", boot.server.group, &cfg.server.group)
 	// Put on every thread before the first loop started, and never taken off.
 	hold(&changed, "server.sandbox", boot.server.sandbox, &cfg.server.sandbox)
+	// Landlock grants writing to the directory of the log the process started
+	// with; one moved elsewhere could not be opened.
+	if boot.server.sandbox != .Off {
+		hold(&changed, "log.file", boot.log.file, &cfg.log.file)
+	}
 	// Handed to `server.user` at startup, as root; a directory named afterwards
 	// would be one the process cannot write its cached lists into.
 	hold(&changed, "blocking.cache_dir", boot.blocking.cache_dir, &cfg.blocking.cache_dir)

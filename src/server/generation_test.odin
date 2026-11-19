@@ -497,6 +497,33 @@ test_a_changed_sandbox_is_held_and_named :: proc(t: ^testing.T) {
 	testing.expect_value(t, cfg.server.sandbox, sandbox.Mode.Strict)
 }
 
+// Under a sandbox the log can only be reopened in the directory Landlock
+// granted, so a moved `log.file` is named and held; with it off, it moves.
+@(test)
+test_a_moved_log_is_held_only_under_a_sandbox :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	for mode in ([]string{"basic", "off"}) {
+		server := fmt.tprintf("server:\n  sandbox: %s\n", mode)
+		with_mode := swap(BASE, "server:\n", server)
+		boot, boot_ok := load(t, swap(with_mode, "log: { level: info }", "log: { level: info, file: /var/log/a.log }"), &arena)
+		cfg, cfg_ok := load(t, swap(with_mode, "log: { level: info }", "log: { level: info, file: /srv/b.log }"), &arena)
+		if !boot_ok || !cfg_ok {
+			return
+		}
+		named := keep_restart_only(&boot, &cfg, context.temp_allocator)
+		if mode == "off" {
+			testing.expectf(t, len(named) == 0 && cfg.log.file == "/srv/b.log", "off: named %v, log %q", named, cfg.log.file)
+		} else {
+			testing.expectf(t, len(named) == 1 && named[0] == "log.file", "%s: named %v", mode, named)
+			testing.expectf(t, cfg.log.file == "/var/log/a.log", "%s: log %q, want the starting one", mode, cfg.log.file)
+		}
+	}
+}
+
 /*
 A bound the file never sized, loaded on a machine whose memory limit moved since
 startup: derived again from the starting machine, and nothing the operator wrote

@@ -63,8 +63,8 @@ server:
   # blocking.cache_dir and the log's directory. strict: basic, reads confined to
   # the files the configuration names, and a system-call allowlist that kills
   # the process on anything else; a reload cannot reach a file in a directory
-  # it did not name at startup. off: neither. Takes a restart. See
-  # docs/install.md#sandbox.
+  # it did not name at startup. off: neither. Takes a restart, and so does
+  # log.file unless this is off. See docs/install.md#sandbox.
   sandbox: basic
 
   # Networks a query is accepted from. Anything else is dropped over UDP and

@@ -118,10 +118,10 @@ an error: the process is then as confined as it was without this package. The
 filesystem is never half-restricted - a ruleset is put in force whole, after
 every rule was added, or not at all.
 
-`report.missing` is allocated with `allocator`.
+`report.unreachable` is allocated with `allocator`.
 */
 confine :: proc(plan: Plan, allocator := context.allocator) -> (report: Report, ok: bool) {
-	report.missing = make([dynamic]string, allocator)
+	report.unreachable = make([dynamic]Unreachable, allocator)
 	if plan.mode == .Off {
 		return report, true
 	}
@@ -150,20 +150,20 @@ confine :: proc(plan: Plan, allocator := context.allocator) -> (report: Report, 
 	}
 	defer linux.close(linux.Fd(ruleset))
 
-	grants := make([dynamic]Grant, 0, 2 + len(plan.readable), context.temp_allocator)
+	grants := make([dynamic]Grant, 0, 1 + len(plan.log_dirs) + len(plan.readable), context.temp_allocator)
 	if plan.cache_dir != "" {
 		append(&grants, Grant{plan.cache_dir, CACHE_ACCESS})
 	}
-	if plan.log_dir != "" {
-		append(&grants, Grant{plan.log_dir, LOG_ACCESS})
+	for dir in plan.log_dirs {
+		append(&grants, Grant{dir, LOG_ACCESS})
 	}
 	for path in plan.readable {
 		append(&grants, Grant{path, READ_ACCESS})
 	}
 	for g in grants {
-		missing, errno := add_rule(linux.Fd(ruleset), g, attr.handled_access_fs)
-		if missing {
-			append(&report.missing, g.path)
+		unopened, errno := add_rule(linux.Fd(ruleset), g, attr.handled_access_fs)
+		if unopened {
+			append(&report.unreachable, Unreachable{g.path, i32(errno)})
 		} else if errno != .NONE {
 			report.landlock = .Failed
 			report.errno = i32(errno)
@@ -187,10 +187,10 @@ Grant :: struct {
 }
 
 // Add a rule for `g`, cut to what the ruleset handles and, on a file, to what a
-// file rule may hold. `missing` when the path cannot be opened, which is the
-// path's doing; any other failure is Landlock's, in `errno`.
+// file rule may hold. `unopened` when the path cannot be opened, which is the
+// path's doing, with why in `errno`; any other failure is Landlock's.
 @(private)
-add_rule :: proc(ruleset: linux.Fd, g: Grant, handled: Access_Set) -> (missing: bool, errno: linux.Errno) {
+add_rule :: proc(ruleset: linux.Fd, g: Grant, handled: Access_Set) -> (unopened: bool, errno: linux.Errno) {
 	cpath := strings.clone_to_cstring(g.path, context.temp_allocator)
 	fd, err := linux.open(cpath, {.PATH, .CLOEXEC})
 	if err != .NONE {

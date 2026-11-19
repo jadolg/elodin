@@ -209,30 +209,60 @@ test_a_call_off_the_list_kills_the_process :: proc(t: ^testing.T) {
 
 // An x86_64 process can still make i386 calls through `int 0x80`, by numbers
 // that mean other calls: i386's 20, getpid, is x86_64's writev, on the list.
+// Where the i386 entry is off (`ia32_emulation=0`) the call faults with or
+// without a filter, so that is checked first.
 @(test)
 test_a_foreign_architecture_kills_the_process :: proc(t: ^testing.T) {
 	when ODIN_ARCH != .amd64 {
 		return
 	} else {
-		body :: proc() -> u8 {
-			// mov eax, 20; int 0x80; ret - on a page of its own, as Odin has no
-			// inline way to reach the i386 entry.
-			code := [?]u8{0xB8, I386_GETPID, 0, 0, 0, 0xCD, 0x80, 0xC3}
-			page, err := linux.mmap(0, 4096, {.READ, .WRITE, .EXEC}, {.PRIVATE, .ANONYMOUS})
-			if err != .NONE {
+		unfiltered :: proc() -> u8 {
+			page, ok := i386_getpid_page()
+			if !ok {
 				return 4
 			}
-			mem.copy(page, &code, len(code))
+			page()
+			return 0
+		}
+		filtered :: proc() -> u8 {
+			page, ok := i386_getpid_page()
+			if !ok {
+				return 4
+			}
 			if !install_filter() {
 				return 1
 			}
-			(cast(proc "c" ())page)()
+			page()
 			return 2
 		}
-		if out, ok := run_child(t, body); ok {
+		premise, premise_ok := run_child(t, unfiltered)
+		if !premise_ok {
+			return
+		}
+		if !premise.exited {
+			fmt.eprintfln("sandbox: the i386 entry is off here (an unfiltered int 0x80 ends in %v), so it is not tested", premise.signal)
+			return
+		}
+		if !testing.expectf(t, premise.status == 0, "the unfiltered child's failed checks: %b", premise.status) {
+			return
+		}
+		if out, ok := run_child(t, filtered); ok {
 			testing.expectf(t, !out.exited && out.signal == .SIGSYS, "exited %v with %d, signal %v", out.exited, out.status, out.signal)
 		}
 	}
+}
+
+// mov eax, 20; int 0x80; ret - on a page of its own, as Odin has no inline way
+// to reach the i386 entry.
+@(private = "file")
+i386_getpid_page :: proc() -> (call: proc "c" (), ok: bool) {
+	code := [?]u8{0xB8, I386_GETPID, 0, 0, 0, 0xCD, 0x80, 0xC3}
+	page, err := linux.mmap(0, 4096, {.READ, .WRITE, .EXEC}, {.PRIVATE, .ANONYMOUS})
+	if err != .NONE {
+		return nil, false
+	}
+	mem.copy(page, &code, len(code))
+	return cast(proc "c" ())page, true
 }
 
 @(private = "file")
@@ -326,7 +356,7 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 	}
 	strict :: proc() -> u8 {
 		missing := strings.concatenate({landlock_outside, "/missing"}, context.temp_allocator)
-		report, ok := confine({mode = .Strict, log_dir = landlock_outside, readable = {landlock_inside, "/proc/meminfo", missing}})
+		report, ok := confine({mode = .Strict, log_dirs = {landlock_outside}, readable = {landlock_inside, "/proc/meminfo", missing}})
 		if report.landlock == .Unavailable {
 			return SKIP_STATUS
 		}
@@ -340,7 +370,7 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 		meminfo, err := linux.open("/proc/meminfo", {.CLOEXEC})
 		failed |= u8(err != .NONE) << 5
 		linux.close(meminfo)
-		failed |= u8(len(report.missing) != 1 || report.missing[0] != missing) << 6
+		failed |= u8(len(report.unreachable) != 1 || report.unreachable[0] != {missing, i32(linux.Errno.ENOENT)}) << 6
 		return failed
 	}
 	for body, i in ([2]Child{basic, strict}) {

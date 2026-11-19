@@ -811,7 +811,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	that waits on the network runs on them - see `loop` - and each takes one UDP
 	reader. Started before anything that could spawn on one.
 	*/
-	confine_process(cfg, opts.config_path)
+	landlock_abi := confine_process(cfg, opts.config_path)
 	loops, loop_threads := start_loops(cfg.listeners.udp.readers, cfg.server.pin_loops)
 
 	filters := filter.engine_make()
@@ -937,7 +937,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	}
 
 	drop_privileges(cfg, service, opts.config_path)
-	filter_process(cfg)
+	filter_process(cfg, landlock_abi)
 
 	logx.eventf(
 		.Info,
@@ -1035,13 +1035,34 @@ warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
 	warn :: proc(cfg: ^config.Config, setting, path, what: string) {
 		logx.warnf("%s: %s cannot open %q, so %s", setting, cfg.server.user, path, what)
 	}
-	if !privdrop.can_reopen(config_path, false) {
-		warn(cfg, "configuration", config_path, "a SIGHUP will not reload the configuration")
-	}
 	// Only a file in use: one that failed at startup is already said, on stderr.
 	if logx.writing_to_file() && !privdrop.can_reopen(cfg.log.file, true) {
 		warn(cfg, "log.file", cfg.log.file, "a SIGHUP will keep logging to the file already open, renamed or not")
 	}
+	for f in reread_files(cfg, config_path, context.temp_allocator) {
+		if !privdrop.can_reopen(f.path, false) {
+			warn(cfg, f.setting, f.path, f.consequence)
+		}
+	}
+}
+
+// A file a SIGHUP or a list refresh reads again by name, the setting that
+// names it, and what follows when it cannot be read.
+@(private)
+Reread :: struct {
+	setting, path, consequence: string,
+}
+
+/*
+Every file that is read again after startup, by name: the configuration, the
+DoT and DoH certificates and keys of the listeners in use, and the `file:`
+lists in use with blocking on. Both `warn_out_of_reach` and `sandbox_plan` go
+by it, so a file one checks is a file the other grants.
+*/
+@(private)
+reread_files :: proc(cfg: ^config.Config, config_path: string, allocator := context.allocator) -> []Reread {
+	out := make([dynamic]Reread, allocator)
+	append(&out, Reread{"configuration", config_path, "a SIGHUP will not reload the configuration"})
 	tls := [?]struct {
 		name: string,
 		ln:   config.Listener,
@@ -1050,22 +1071,21 @@ warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
 		if !l.ln.enabled {
 			continue
 		}
-		if !privdrop.can_reopen(l.ln.cert_file, false) {
-			warn(cfg, fmt.tprintf("listeners.%s.cert_file", l.name), l.ln.cert_file, "a SIGHUP will keep the certificate loaded now")
-		}
-		if !privdrop.can_reopen(l.ln.key_file, false) {
-			warn(cfg, fmt.tprintf("listeners.%s.key_file", l.name), l.ln.key_file, "a SIGHUP will keep the certificate loaded now")
-		}
+		keep := "a SIGHUP will keep the certificate loaded now"
+		append(&out, Reread{fmt.aprintf("listeners.%s.cert_file", l.name, allocator = allocator), l.ln.cert_file, keep})
+		append(&out, Reread{fmt.aprintf("listeners.%s.key_file", l.name, allocator = allocator), l.ln.key_file, keep})
 	}
 	if cfg.blocking.enabled {
 		for set in ([?][]config.Block_List{cfg.blocking.lists, cfg.blocking.allow_lists}) {
 			for list in set {
-				if list.enabled && list.file != "" && !privdrop.can_reopen(list.file, false) {
-					warn(cfg, fmt.tprintf("list %s", list.name), list.file, "the next refresh or SIGHUP will drop the rules built from it")
+				if list.enabled && list.file != "" {
+					setting := fmt.aprintf("list %s", list.name, allocator = allocator)
+					append(&out, Reread{setting, list.file, "the next refresh or SIGHUP will drop the rules built from it"})
 				}
 			}
 		}
 	}
+	return out[:]
 }
 
 /*

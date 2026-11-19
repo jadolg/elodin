@@ -10,6 +10,7 @@ import "core:unicode"
 import "core:unicode/utf8"
 import "elodin:cache"
 import "elodin:dns"
+import "elodin:sandbox"
 import "elodin:dnssec"
 import "elodin:h2"
 import "elodin:netx"
@@ -395,14 +396,14 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	opt_string(l, n, "user", &cfg.server.user, "server")
 	opt_string(l, n, "group", &cfg.server.group, "server")
 	if s: string; opt_string(l, n, "sandbox", &s, "server") {
-		switch dns.name_fold(s, l.allocator) {
-		case "off":
-			cfg.server.sandbox = .Off
-		case "basic":
-			cfg.server.sandbox = .Basic
-		case "strict":
-			cfg.server.sandbox = .Strict
-		case:
+		folded := dns.name_fold(s, l.allocator)
+		known := false
+		for name, mode in sandbox.MODE_NAMES {
+			if folded == name {
+				cfg.server.sandbox, known = mode, true
+			}
+		}
+		if !known {
 			errorf(l, "server.sandbox: unknown mode %q (want off, basic or strict)", s)
 		}
 	}
