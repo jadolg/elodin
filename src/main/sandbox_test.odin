@@ -246,9 +246,8 @@ test_the_bundle_is_reached_where_it_leads :: proc(t: ^testing.T) {
 		return
 	}
 	out := make([dynamic]string, context.temp_allocator)
-	pins := make([dynamic]string, context.temp_allocator)
-	add_bundle(&out, &pins, tree.link, context.temp_allocator)
-	testing.expectf(t, slice.equal(out[:], []string{tree.real_dir}) && len(pins) == 0, "grants %v, pins %v, want only %q", out, pins, tree.real_dir)
+	add_bundle(&out, tree.link, context.temp_allocator)
+	testing.expectf(t, slice.equal(out[:], []string{tree.real_dir}), "grants %v, want only %q", out, tree.real_dir)
 
 	for dir in ([]string{"/etc/ssl", "/etc/ssl/private", "/etc/pki/tls", "/etc/pki/tls/private"}) {
 		testing.expectf(t, is_pinned(dir), "%s, which holds private keys, is not pinned", dir)
@@ -270,4 +269,16 @@ test_a_missing_directory_is_not_granted :: proc(t: ^testing.T) {
 	grant_dir(&out, &pins, absent, strings.concatenate({absent, "/cert.pem"}, context.temp_allocator), context.temp_allocator)
 	grant_dir(&out, &pins, tree.real_dir, tree.real_file, context.temp_allocator)
 	testing.expectf(t, slice.equal(out[:], []string{tree.real_dir}) && len(pins) == 0, "grants %v, pins %v, want only %q", out, pins, tree.real_dir)
+}
+
+// A file directly in root's home, an account's home, or one of the roots other
+// services keep data in is granted alone: the directory would expose them.
+@(test)
+test_the_plan_pins_homes_and_shared_roots :: proc(t: ^testing.T) {
+	for dir in ([]string{"/root", "/home/someone", "/tmp", "/var/lib", "/srv"}) {
+		testing.expectf(t, is_pinned(dir), "%s is not pinned", dir)
+	}
+	for dir in ([]string{"/etc/elodin", "/home/someone/elodin", "/var/lib/elodin"}) {
+		testing.expectf(t, !is_pinned(dir), "%s, a directory of its own, is pinned", dir)
+	}
 }

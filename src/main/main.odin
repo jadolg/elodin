@@ -1038,7 +1038,9 @@ warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
 		logx.warnf("%s: %s cannot open %q (%s)%s, so %s", setting, cfg.server.user, path, posix.strerror(err), hint, what)
 	}
 	// Only a file in use: one that failed at startup is already said, on stderr.
-	if logx.writing_to_file() {
+	// A device, FIFO or socket is written through the descriptor `logx` keeps,
+	// never opened again (`logx.reopen`).
+	if logx.writing_to_file() && regular_or_missing(cfg.log.file) {
 		if err := privdrop.reopen_error(cfg.log.file, true); err != .NONE {
 			warn(cfg, "log.file", cfg.log.file, "a SIGHUP will keep logging to the file already open, renamed or not", err, write = true)
 		}

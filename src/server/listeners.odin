@@ -3,6 +3,7 @@ package server
 import "core:fmt"
 import "core:mem"
 import "core:net"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -11,6 +12,8 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
+import "elodin:privdrop"
+import "elodin:sandbox"
 import "elodin:loop"
 import "elodin:metrics"
 import "elodin:netx"
@@ -1589,12 +1592,19 @@ reload_tls_ctx :: proc(
 ) -> bool {
 	fresh, err := tlsx.server_context(cfg.cert_file, cfg.key_file, alpn)
 	if err != .None {
+		// OpenSSL's error says nothing of why a file would not open; asked again,
+		// the open does, and the sandbox may be it.
+		hint := sandbox.refusal_hint(os.Platform_Error(privdrop.reopen_error(cfg.cert_file, false)), write = false)
+		if hint == "" {
+			hint = sandbox.refusal_hint(os.Platform_Error(privdrop.reopen_error(cfg.key_file, false)), write = false)
+		}
 		logx.errorf(
-			"listeners.%s: keeping the certificate already in use, %s and %s did not load: %s",
+			"listeners.%s: keeping the certificate already in use, %s and %s did not load: %s%s",
 			name,
 			cfg.cert_file,
 			cfg.key_file,
 			tlsx.describe_error(err, context.temp_allocator),
+			hint,
 		)
 		return false
 	}

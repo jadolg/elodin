@@ -84,9 +84,10 @@ READ_ACCESS :: Access_Set{.Read_File, .Read_Dir}
 FILE_ACCESS :: Access_Set{.Execute, .Write_File, .Read_File, .Truncate, .Ioctl_Dev}
 
 // The cache is replaced by a rename over the old copy, which removes it, and
-// written through `.tmp` files it creates and truncates.
+// written through `.tmp` files it creates and truncates; a stray directory in
+// it is removed as a file would be (`os.remove`).
 @(private)
-CACHE_ACCESS :: READ_ACCESS + Access_Set{.Write_File, .Remove_File, .Make_Reg, .Truncate}
+CACHE_ACCESS :: READ_ACCESS + Access_Set{.Write_File, .Remove_File, .Remove_Dir, .Make_Reg, .Truncate}
 // A SIGHUP reopens the log by name, creating it when logrotate moved it away.
 @(private)
 LOG_ACCESS :: Access_Set{.Write_File, .Make_Reg}

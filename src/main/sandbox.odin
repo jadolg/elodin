@@ -215,12 +215,15 @@ sandbox_plan :: proc(
 	}
 	ca := tlsx.default_ca_locations(context.temp_allocator)
 	// The bundle is a file; the rest are directories of certificates.
-	add_bundle(&readable, &pins, ca[0], allocator)
+	add_bundle(&readable, ca[0], allocator)
 	for dir in ca[1:] {
 		add_cert_dir(&readable, &pins, dir, allocator)
 	}
 	for path in MOUNT_READS {
-		append(&readable, path)
+		// A container may have no cgroup tree mounted: nothing to read there.
+		if os.exists(path) {
+			append(&readable, path)
+		}
 	}
 	plan.readable = readable[:]
 	return plan, pins[:]
@@ -241,14 +244,34 @@ log_dir_of :: proc(file: string, allocator := context.allocator) -> (string, boo
 }
 
 /*
-Directories whose every file a strict read grant would expose - the host's
-secrets, its TLS private keys among them (`/etc/ssl/private`,
-`/etc/pki/tls/private`): a file directly in one is granted alone
-(`grant_dir`), and named at startup.
+Directories whose every file a grant would expose - the host's secrets, its TLS
+private keys (`/etc/ssl/private`, `/etc/pki/tls/private`), root's and every
+account's home, the roots that hold other services' data: a file directly in
+one is granted alone (`grant_dir`), and named at startup.
 */
 @(private)
-PINNED_DIRS :: [?]string{"/", "/etc", "/etc/ssl", "/etc/ssl/private", "/etc/pki", "/etc/pki/tls", "/etc/pki/tls/private"}
+PINNED_DIRS :: [?]string {
+	"/",
+	"/etc",
+	"/etc/ssl",
+	"/etc/ssl/private",
+	"/etc/pki",
+	"/etc/pki/tls",
+	"/etc/pki/tls/private",
+	"/root",
+	"/home",
+	"/tmp",
+	"/var",
+	"/var/lib",
+	"/var/tmp",
+	"/srv",
+	"/opt",
+	"/usr",
+	"/run",
+}
 
+// Whether `dir` is in `PINNED_DIRS`, or is a home directory - one in `/home` -
+// whose `.ssh` and the rest a grant there would expose.
 @(private)
 is_pinned :: proc(dir: string) -> bool {
 	for pinned in PINNED_DIRS {
@@ -256,7 +279,7 @@ is_pinned :: proc(dir: string) -> bool {
 			return true
 		}
 	}
-	return false
+	return filepath.dir(dir) == "/home"
 }
 
 // What the metrics and `config.probe_machine` read, granted at the mount.
@@ -328,9 +351,11 @@ Append where OpenSSL's bundle file leads, and nothing for its name: that is in
 links to - Alpine's, Arch's, Fedora's - sits in a directory of certificates.
 */
 @(private)
-add_bundle :: proc(out, pinned: ^[dynamic]string, bundle: string, allocator := context.allocator) {
+add_bundle :: proc(out: ^[dynamic]string, bundle: string, allocator := context.allocator) {
 	if target, found := resolve(bundle, allocator); found {
-		grant_dir(out, pinned, filepath.dir(target), target, allocator)
+		// Pinned or not, not the operator's to move: never named at startup.
+		unnamed := make([dynamic]string, context.temp_allocator)
+		grant_dir(out, &unnamed, filepath.dir(target), target, allocator)
 	}
 }
 

@@ -65,10 +65,9 @@ sudo systemctl enable --now elodin
 
 The unit binds :53 through `AmbientCapabilities=CAP_NET_BIND_SERVICE` rather
 than as root, and runs under `DynamicUser=yes` with `ProtectSystem=strict`; its
-`SystemCallFilter=` names `@sandbox` for [`server.sandbox`](#sandbox), and
-`SystemCallErrorNumber=EPERM` makes a call it refuses fail rather than kill: a
-systemd older than 249, which does not know `@sandbox`, leaves Landlock to be
-reported unavailable and `strict` to refuse to start, each with a line saying so.
+`SystemCallFilter=` names the Landlock and `seccomp` calls
+[`server.sandbox`](#sandbox) makes, one by one: `@system-service` has none of
+them, and `@sandbox`, which does, is only known to systemd 254 and later.
 `Restart=on-failure` with `StartLimitBurst=5` retries a start that fails for a
 passing reason and gives up in `failed` on one that does not — a port it cannot
 have, a certificate it cannot read. `systemctl reset-failed elodin` clears that.
@@ -320,8 +319,10 @@ and they last for the life of the process: `server.sandbox` takes a restart.
   cache directory removed while the process runs cannot be made again until a
   restart, for the same reason.
 - A file the sandbox would reach through its directory that sits directly in
-  `/`, `/etc`, `/etc/ssl`, `/etc/ssl/private`, `/etc/pki`, `/etc/pki/tls` or
-  `/etc/pki/tls/private` (by its name or by where a symlink leads) is reached alone
+  `/`, `/etc`, `/etc/ssl` and `/etc/pki` and their private-key directories,
+  `/root`, an account's home under `/home`, or one of `/home`, `/tmp`, `/var`,
+  `/var/lib`, `/var/tmp`, `/srv`, `/opt`, `/usr` and `/run` (by its name or by
+  where a symlink leads) is reached alone
   instead, and startup names it: one that replaces it - an editor, a renewal, a
   log rotation - is not seen until a restart, so give it a directory of its own.
 - A file the sandbox refuses is reported as for any other file that cannot be

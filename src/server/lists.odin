@@ -319,7 +319,7 @@ list_contents :: proc(
 	if list.file != "" {
 		data, err := os.read_entire_file(list.file, context.allocator)
 		if err != nil {
-			logx.warnf("list %s: cannot read %q (%v)", list.name, list.file, err)
+			logx.warnf("list %s: cannot read %q (%v)%s", list.name, list.file, err, sandbox.refusal_hint(err, write = false))
 			return "", .Unavailable, false
 		}
 		return string(data), .Current, false
