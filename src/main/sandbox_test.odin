@@ -282,3 +282,37 @@ test_the_plan_pins_homes_and_shared_roots :: proc(t: ^testing.T) {
 		testing.expectf(t, !is_pinned(dir), "%s, a directory of its own, is pinned", dir)
 	}
 }
+
+// A log led by a link into a pinned directory is named at startup as the file
+// it is, in that directory - not by the link's name, somewhere else.
+@(test)
+test_a_pinned_log_is_named_by_the_file_it_is :: proc(t: ^testing.T) {
+	tree, ok := make_tree(t)
+	defer remove_tree(t, tree)
+	if !ok {
+		return
+	}
+	target := fmt.tprintf("/tmp/elodin-pinned-log-%d.log", posix.getpid())
+	if !testing.expect(t, os.write_entire_file(target, nil) == nil, "cannot make the log") {
+		return
+	}
+	defer os.remove(target)
+	link := strings.concatenate({tree.dir, "/elodin.log"}, context.temp_allocator)
+	if !testing.expect(t, os.symlink(target, link) == nil, "cannot link the log") {
+		return
+	}
+	cfg := config.default_config()
+	cfg.server.sandbox = .Basic
+	plan, pinned := sandbox_plan(&cfg, tree.real_file, link, context.temp_allocator)
+	testing.expectf(t, slice.equal(pinned, []string{target}), "pinned %v, want the file %q", pinned, target)
+	testing.expectf(t, plan.log_dir == target, "the log grants %q, want the file alone", plan.log_dir)
+}
+
+// A resolver file a container does not have gets no rule, so no warning.
+@(test)
+test_a_missing_resolver_file_is_not_granted :: proc(t: ^testing.T) {
+	out := make([dynamic]string, context.temp_allocator)
+	pins := make([dynamic]string, context.temp_allocator)
+	add_file_rule(&out, &pins, fmt.tprintf("/tmp/elodin-absent-hosts-%d", posix.getpid()), context.temp_allocator)
+	testing.expectf(t, len(out) == 0 && len(pins) == 0, "grants %v, pins %v", out, pins)
+}

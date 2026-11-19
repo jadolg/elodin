@@ -195,9 +195,11 @@ sandbox_plan :: proc(
 		if dir, ok := log_dir_of(log_file, allocator); ok {
 			grant := dir
 			if is_pinned(dir) {
-				// Written as it is; a rotation cannot make it again there.
-				grant = resolve(log_file, allocator) or_else ""
-				append(&pins, log_file)
+				// Written as it is; a rotation cannot make it again there. Named
+				// as the file it is, which is in the pinned directory.
+				target, found := resolve(log_file, allocator)
+				grant = target if found else ""
+				append(&pins, target if found else log_file)
 			}
 			plan.log_dir = grant
 		}
@@ -307,9 +309,9 @@ add_dirs_of :: proc(out, pinned: ^[dynamic]string, file: string, allocator := co
 /*
 Append `dir` as the rule will open it - resolved, so a relative name or a
 symlink is the directory it is - unless that is in `PINNED_DIRS`: then `file`,
-which is in it, goes on `out` instead, and on `pinned`. Nothing for a directory
-that is not there, which no file the process reads can be in: OpenSSL's
-built-in paths often are not.
+which is in it, goes on `out` instead, and on `pinned` unless that is nil.
+Nothing for a directory that is not there, which no file the process reads can
+be in: OpenSSL's built-in paths often are not.
 */
 @(private)
 grant_dir :: proc(out, pinned: ^[dynamic]string, dir, file: string, allocator := context.allocator) {
@@ -320,7 +322,7 @@ grant_dir :: proc(out, pinned: ^[dynamic]string, dir, file: string, allocator :=
 	path := real
 	if is_pinned(real) {
 		path = file
-		if !slice.contains(pinned[:], file) {
+		if pinned != nil && !slice.contains(pinned[:], file) {
 			append(pinned, file)
 		}
 	}
@@ -337,6 +339,10 @@ replaces its `resolv.conf` beside the old one.
 */
 @(private)
 add_file_rule :: proc(out, pinned: ^[dynamic]string, file: string, allocator := context.allocator) {
+	// A container may have neither; then nothing reads them.
+	if !os.exists(file) {
+		return
+	}
 	if !slice.contains(out[:], file) {
 		append(out, file)
 	}
@@ -354,8 +360,7 @@ links to - Alpine's, Arch's, Fedora's - sits in a directory of certificates.
 add_bundle :: proc(out: ^[dynamic]string, bundle: string, allocator := context.allocator) {
 	if target, found := resolve(bundle, allocator); found {
 		// Pinned or not, not the operator's to move: never named at startup.
-		unnamed := make([dynamic]string, context.temp_allocator)
-		grant_dir(out, &unnamed, filepath.dir(target), target, allocator)
+		grant_dir(out, nil, filepath.dir(target), target, allocator)
 	}
 }
 

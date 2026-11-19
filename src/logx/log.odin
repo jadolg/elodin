@@ -8,6 +8,7 @@ import "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
 import "elodin:loop"
+import "elodin:sandbox"
 
 /*
 Not `core:log`: its file logger writes `[LEVEL] --- [date]` lines, where these are
@@ -137,17 +138,30 @@ reopen :: proc(path: string) -> os.Error {
 	return nil
 }
 
+/*
+What a warning that the log could not be opened again adds to the error: why a
+guarded open refused it (`guard_hint`), or that the sandbox may have
+(`sandbox.refusal_hint`). Both reopen warnings - a SIGHUP's and a reload's that
+moves the file - go by it.
+*/
+reopen_hints :: proc(err: os.Error) -> string {
+	return strings.concatenate({guard_hint(err), sandbox.refusal_hint(err, write = true)}, context.temp_allocator)
+}
+
 // Whether `path` leads to the file the log is writing to now.
 @(private)
 leads_to_open_file :: proc(path: string) -> bool {
+	open, named: linux.Stat
+	// The descriptor under the lock, the name after it: a path on a hung
+	// network filesystem would otherwise hold every thread's next line.
 	sync.mutex_lock(&state.mu)
-	defer sync.mutex_unlock(&state.mu)
-	if !state.to_file {
+	in_use := state.to_file && linux.fstat(linux.Fd(os.fd(state.file)), &open) == .NONE
+	sync.mutex_unlock(&state.mu)
+	if !in_use {
 		return false
 	}
-	open, named: linux.Stat
 	cpath := strings.clone_to_cstring(path, context.temp_allocator)
-	if linux.fstat(linux.Fd(os.fd(state.file)), &open) != .NONE || linux.stat(cpath, &named) != .NONE {
+	if linux.stat(cpath, &named) != .NONE {
 		return false
 	}
 	return open.dev == named.dev && open.ino == named.ino

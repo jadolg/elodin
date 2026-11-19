@@ -9,7 +9,6 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
 import "elodin:logx"
-import "elodin:sandbox"
 
 /*
 What a configuration reload did, for the caller's bookkeeping.
@@ -129,13 +128,7 @@ reload_config :: proc(s: ^Server, path: string) -> (out: Reload_Outcome) {
 	logx.set_level(g.cfg.log.level)
 	if log_file_moved {
 		if err := logx.reopen(g.cfg.log.file); err != nil {
-			logx.warnf(
-				"reload: cannot open the log file %q (%s)%s%s; logging where it was",
-				g.cfg.log.file,
-				os.error_string(err),
-				logx.guard_hint(err),
-				sandbox.refusal_hint(err, write = true),
-			)
+			logx.warnf("reload: cannot open the log file %q (%s)%s; logging where it was", g.cfg.log.file, os.error_string(err), logx.reopen_hints(err))
 		}
 	}
 

@@ -1198,13 +1198,7 @@ reload :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m
 	reopen_err := logx.reopen(file)
 	logx.infof("SIGHUP received, reloading the configuration and the TLS certificates")
 	if reopen_err != nil {
-		logx.warnf(
-			"cannot open the log file %q again (%s)%s%s; logging where it was",
-			file,
-			os.error_string(reopen_err),
-			logx.guard_hint(reopen_err),
-			sandbox.refusal_hint(reopen_err, write = true),
-		)
+		logx.warnf("cannot open the log file %q again (%s)%s; logging where it was", file, os.error_string(reopen_err), logx.reopen_hints(reopen_err))
 	}
 
 	out := server.reload_config(s, opts.config_path)

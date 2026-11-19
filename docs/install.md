@@ -67,7 +67,11 @@ The unit binds :53 through `AmbientCapabilities=CAP_NET_BIND_SERVICE` rather
 than as root, and runs under `DynamicUser=yes` with `ProtectSystem=strict`; its
 `SystemCallFilter=` names the Landlock and `seccomp` calls
 [`server.sandbox`](#sandbox) makes, one by one: `@system-service` has none of
-them, and `@sandbox`, which does, is only known to systemd 254 and later.
+them, and `@sandbox`, which does, is only known to systemd 254 and later. On
+a host whose libseccomp is older than 2.5.2 (Debian 11, Ubuntu 20.04), systemd
+cannot name the Landlock calls and the unit stops the process at its first one
+(`status=31/SYS` in `systemctl status`); there, a drop-in with
+`SystemCallErrorNumber=EPERM`, or `server.sandbox: off`, starts it.
 `Restart=on-failure` with `StartLimitBurst=5` retries a start that fails for a
 passing reason and gives up in `failed` on one that does not — a port it cannot
 have, a certificate it cannot read. `systemctl reset-failed elodin` clears that.
