@@ -11,6 +11,7 @@ changes, with a comment on why; anything they leave out is the shipped default.
 | [`docker.yaml`](../examples/docker.yaml) | the same, in the container image, where it is the configuration the image ships with; [`compose.yaml`](../examples/compose.yaml) runs it |
 | [`small-device.yaml`](../examples/small-device.yaml) | a small arm64 or amd64 board, where memory and CPU are the constraint |
 | [`public.yaml`](../examples/public.yaml) | a resolver on the internet that anybody may query |
+| [`docker-public.yaml`](../examples/docker-public.yaml) | the same in the container image, DoT and DoH only; [`compose-public.yaml`](../examples/compose-public.yaml) runs it with a Let's Encrypt certificate |
 | [`container.yaml`](../examples/container.yaml) | a container or DaemonSet in front of a cluster's own DNS |
 | [`dev.yaml`](../examples/dev.yaml) | working on elodin itself: unprivileged ports, debug logging |
 
@@ -70,6 +71,25 @@ what has to hold around it:
 - the reserved-name zones `local.`, `test.` and `home.arpa.` answered locally,
   since a public resolver is nobody's local authority
 - filtering narrowed to malware
+
+**`docker-public.yaml`** is `public.yaml` for the container image, with plain
+DNS turned off: DoT on 853 and DoH on 443 only, so there is no UDP to reflect
+and the datagram settings drop out. `compose-public.yaml` runs it beside
+certbot. certbot starts first, obtains the certificate over HTTP-01 on port 80,
+and writes it with its key as one file, `pair.pem`, owned by the image's
+account, into a volume elodin mounts read-only; elodin waits for that. If the
+first issue fails, `up` starts elodin anyway after about 5 minutes and it
+restarts until the certificate arrives. One file replaced by one rename means
+elodin never loads a new key beside an old certificate. certbot then tries a
+renewal twice a day, writes a new file and sends elodin `SIGHUP`. The two share
+a PID namespace held by a `pause` container, so the signal needs no Docker
+socket and certbot exiting leaves elodin running. With no certificate and a
+failed issue, certbot waits 15 minutes before trying again, under Let's
+Encrypt's limit of 5 failed validations per name an hour. The compose network
+has IPv6 enabled (Docker Engine 27 or later) and the listeners are on `::`, so
+IPv6 clients reach elodin under their own addresses rather than the bridge
+gateway's, and the per-prefix rate limit and connection share apply to each of
+them.
 
 **`container.yaml`** leaves the sizes to the derivation, which reads the
 container's cgroup limits: a pod limited to one CPU and 512 MiB derives one loop

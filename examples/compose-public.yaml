@@ -1,0 +1,261 @@
+# elodin with Docker Compose, as a public DoT and DoH resolver, with its own
+# Let's Encrypt certificate.
+#
+#   echo ELODIN_DOMAIN=dns.example.com > examples/.env
+#   docker compose -f examples/compose-public.yaml up -d
+#
+# The variables go in examples/.env, beside this file, rather than on the
+# command line, because every command on this file needs them: `logs`, `ps` and
+# `down` as much as `up`. ELODIN_ACME_EMAIL is optional (see below), and so is
+# ELODIN_ACME_SERVER. The project is named elodin-public, so it does not share
+# containers or volumes with compose.yaml beside it. Runs
+# examples/docker-public.yaml: DoT on 853, DoH on 443, no plain DNS, open to
+# anybody. Read examples/public.yaml and docs/public-resolver.md before putting
+# it on the internet.
+#
+# Before the first `up`:
+#
+#   * An A (and AAAA, if the host has IPv6) record for ELODIN_DOMAIN pointing at
+#     this host, and ports 80, 443 and 853 reachable from the internet. Port 80
+#     is only for Let's Encrypt's HTTP-01 challenge, answered by certbot; elodin
+#     never listens on it.
+#   * Nothing else on the host bound to 80, 443 or 853.
+#   * Docker Engine 27 or later, for the IPv6 network at the bottom of this
+#     file.
+#   * Try it against Let's Encrypt's staging environment first, so a mistake
+#     does not spend the production rate limit:
+#       ELODIN_ACME_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
+#     Clients will refuse the staging certificate; once it issues, run
+#     `docker compose -f examples/compose-public.yaml down -v` to drop it,
+#     take the variable out of .env and `up -d` again.
+#   * Something that watches the certificate's expiry from outside, such as a
+#     probe of https://ELODIN_DOMAIN/. Let's Encrypt stopped sending expiry
+#     emails in June 2025, and a renewal that keeps failing only shows in
+#     certbot's log. ELODIN_ACME_EMAIL, if set, registers the account with that
+#     address, which Let's Encrypt uses for policy notices only.
+#
+# How the certificate gets to elodin:
+#
+#   * certbot starts first. It obtains the certificate if there is none (or
+#     the one there is due), writes it and its key as one file into the
+#     `certs` volume, owned by the image's account, uid 65532, and reports
+#     healthy. elodin will not start without a certificate to serve, so it
+#     waits for that. If there is no certificate and certbot cannot get one,
+#     it waits 15 minutes before trying again: Let's Encrypt allows 5 failed
+#     validations per name an hour. `up` then stops waiting after about 5
+#     minutes, warns that certbot is unhealthy and starts elodin anyway, which
+#     exits and is restarted until the certificate is there
+#     (`docker compose -f examples/compose-public.yaml logs certbot` says
+#     why it is not).
+#   * elodin reads that file from the volume, read-only.
+#   * certbot stays up and tries a renewal twice a day. When the certificate
+#     changes it writes the new file and sends elodin a SIGHUP, which reloads
+#     the certificate without dropping a connection.
+#   * The signal needs no access to the Docker socket: certbot and elodin share
+#     a PID namespace, held by a third container, `pidns`, that does nothing
+#     else. It is that container's rather than certbot's so that certbot
+#     exiting - a failed renewal, a new image - leaves elodin running.
+#
+# The copy is the point of the arrangement: certbot keeps its keys root-only,
+# and elodin, which never runs as root, re-reads its key on every SIGHUP, so it
+# needs a copy it owns (docs/install.md, "Privileges"). It is one file holding
+# the certificate and the key, renamed into place, so elodin never loads a new
+# key beside an old certificate.
+#
+# A certificate for several names: ELODIN_DOMAIN=dns.example.com,doh.example.com.
+# The first name is the one the certificate is filed under.
+
+name: elodin-public
+
+services:
+  # Holds the PID namespace certbot and elodin share; the pause image is what
+  # Kubernetes uses for the same job in a pod. It runs as an unprivileged user,
+  # reaps orphans, and exits on SIGTERM. Restarting or recreating it ends the
+  # namespace and stops certbot and elodin with it; `restart:` brings them
+  # back into the new one, and `docker compose up -d` recreates them.
+  pidns:
+    image: registry.k8s.io/pause:3.10
+    restart: unless-stopped
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  certbot:
+    image: certbot/certbot:v5.10.0
+    restart: unless-stopped
+    pid: service:pidns
+    environment:
+      DOMAIN: ${ELODIN_DOMAIN:?set ELODIN_DOMAIN to the name clients will use, e.g. dns.example.com}
+      EMAIL: ${ELODIN_ACME_EMAIL:-}
+      ACME_SERVER: ${ELODIN_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+    volumes:
+      # certbot's account, its renewal settings and the certificates it issued.
+      - letsencrypt:/etc/letsencrypt
+      # The file elodin serves, as elodin's account can read it.
+      - certs:/certs
+    # Let's Encrypt connects here to check the challenge. Every address: it
+    # comes from the internet.
+    ports:
+      - "80:80/tcp"
+    # Root inside the container, but only with what this needs: to hand the
+    # copy to uid 65532 and to signal a process of that uid.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, KILL]
+    security_opt: [no-new-privileges:true]
+    # Healthy once there is a certificate for elodin to load, and one for the
+    # first name in ELODIN_DOMAIN: after a change of name fails to issue, the
+    # old certificate is still there, and elodin goes on serving it.
+    healthcheck:
+      test: ["CMD-SHELL", "openssl x509 -noout -checkhost \"$${DOMAIN%%,*}\" -in /certs/pair.pem 2>/dev/null | grep -q ' does match '"]
+      interval: 10s
+      start_period: 5m
+    entrypoint:
+      - /bin/sh
+      - -euc
+      - |
+        name=$${DOMAIN%%,*}
+        live=/etc/letsencrypt/live/$$name
+
+        # Every long command runs in the background and is waited for, so a
+        # SIGTERM (`docker compose down`) reaches the trap at once rather than
+        # after the command, and is passed on to certbot to finish cleanly.
+        child=
+        trap 'if [ -n "$$child" ]; then kill -TERM "$$child" 2>/dev/null || true; wait "$$child" || true; fi; exit 0' TERM INT
+        # `child` is cleared as soon as the command ends, so a SIGTERM between
+        # commands does not signal its PID after the kernel has handed it to
+        # another process - elodin, say, restarted into this namespace.
+        run() {
+          "$$@" &
+          child=$$!
+          rc=0
+          wait "$$child" || rc=$$?
+          child=
+          return "$$rc"
+        }
+
+        # Whether /certs already holds what certbot has, byte for byte.
+        pair_current() {
+          cat "$$live/fullchain.pem" "$$live/privkey.pem" | cmp -s - /certs/pair.pem
+        }
+        # Writes the certificate and the key as one file for uid 65532, and
+        # renames it into place. Group 0 and 0440, so this root, which has no
+        # CAP_DAC_OVERRIDE, can still read it back above. The mode is set
+        # before the owner: once the file is 65532's, root without
+        # CAP_FOWNER cannot change it.
+        install_pair() {
+          rm -f /certs/pair.pem.new
+          (umask 077 && cat "$$live/fullchain.pem" "$$live/privkey.pem" > /certs/pair.pem.new)
+          chmod 0440 /certs/pair.pem.new
+          chown 65532:0 /certs/pair.pem.new
+          mv -f /certs/pair.pem.new /certs/pair.pem
+          echo "installed the certificate for $$DOMAIN, expiring $$(openssl x509 -noout -enddate -in "$$live/fullchain.pem" | cut -d= -f2)"
+        }
+
+        # An account with an address only if one was given; it is used for
+        # policy notices, not expiry.
+        if [ -n "$$EMAIL" ]; then
+          set -- --email "$$EMAIL" --no-eff-email
+        else
+          set -- --register-unsafely-without-email
+        fi
+
+        # Idempotent: a certificate that is not due is kept without asking
+        # Let's Encrypt anything, and a changed ELODIN_DOMAIN replaces the
+        # names on it. ECDSA keys, which halve what a TLS handshake costs
+        # elodin (see public.yaml).
+        if ! run certbot certonly --standalone --non-interactive --agree-tos \
+          "$$@" --server "$$ACME_SERVER" \
+          --key-type ecdsa --cert-name "$$name" -d "$$DOMAIN" \
+          --keep-until-expiring; then
+          if [ ! -s "$$live/fullchain.pem" ]; then
+            # Nothing to serve yet, so wait before the restart tries again.
+            echo "no certificate for $$DOMAIN yet; trying again in 15 minutes"
+            run sleep 15m || true
+            exit 1
+          fi
+          # A certificate is on hand; the renewals below try again.
+          echo "certbot certonly failed; serving the certificate on hand"
+        fi
+
+        while :; do
+          if ! pair_current; then
+            install_pair
+            # Not running yet on the first pass; it reads the new file when
+            # it starts. One that is still starting, before it handles
+            # SIGHUP, is ended by the signal instead, and restarts with the
+            # new file. Not `-x`: busybox matches that against the full path,
+            # and nothing else in this namespace is called elodin.
+            if pkill -HUP elodin; then
+              echo "sent elodin SIGHUP to reload the certificate"
+            fi
+          fi
+          # A sleep cut short is just an earlier round.
+          run sleep 12h || true
+          # Renews once the certificate is within 30 days of expiry, with the
+          # settings the first issue saved. A failure is retried next round.
+          # Only this certificate: one filed under an earlier first name in
+          # ELODIN_DOMAIN would otherwise be renewed too, and fail once the name
+          # points elsewhere, spending the failed-validation limit.
+          run certbot renew --non-interactive --quiet --cert-name "$$name" ||
+            echo "certbot renew failed; retrying in 12h"
+        done
+
+  elodin:
+    image: ghcr.io/jadolg/elodin:latest
+    restart: unless-stopped
+    # Started once certbot has the certificate. If it cannot get one, `up`
+    # stops waiting after certbot's start_period, warns, and starts elodin
+    # anyway: elodin exits without a certificate and Docker restarts it, so it
+    # comes up on its own, within a minute, once certbot succeeds. A required
+    # dependency would instead leave elodin created but never started, which
+    # Docker's restart policy does not cover.
+    depends_on:
+      certbot:
+        condition: service_healthy
+        required: false
+    # The namespace certbot signals into.
+    pid: service:pidns
+    networks: [elodin]
+    ports:
+      # Every address: this is the public endpoint. DoT, then DoH.
+      - "853:853/tcp"
+      - "443:443/tcp"
+      # Metrics, for a Prometheus on this host only.
+      - "127.0.0.1:9153:9153/tcp"
+    volumes:
+      - ./docker-public.yaml:/etc/elodin/elodin.yaml:ro
+      - certs:/etc/elodin/certs:ro
+      # The blocklist cache, so a restart does not download the list again.
+      - elodin-cache:/var/cache/elodin
+    # As in compose.yaml: nothing is written but the cache volume, and no
+    # capability is needed to bind 443 and 853 inside the container.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # Longer than `server.client_timeout`, so an idle connection's wait is not
+    # cut short by SIGKILL.
+    stop_grace_period: 15s
+    # 2,048 connections and the queries in flight need more than Docker's
+    # default of 1,024 descriptors.
+    ulimits:
+      nofile: 65536
+    # The cache's 256 MiB ceiling plus room for connections and the blocklist.
+    # The derived sizes follow this limit (docs/sizing.md).
+    mem_limit: 1g
+
+networks:
+  # IPv6 on the bridge. Without it, Docker relays IPv6 clients through its
+  # userland proxy and every one of them arrives from the bridge's gateway:
+  # all of them would share one /64's rate limit and connection share. With it,
+  # Docker forwards them as it does IPv4, to the container's own IPv6 address
+  # (which is why docker-public.yaml listens on "::"), and elodin sees each
+  # client's own address. With no subnet given, Docker Engine 27 and later
+  # allocate one; an older engine needs an `ipam:` subnet here.
+  elodin:
+    enable_ipv6: true
+
+volumes:
+  letsencrypt:
+  certs:
+  elodin-cache:

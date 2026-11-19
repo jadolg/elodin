@@ -1,0 +1,180 @@
+# elodin in Docker, as a public encrypted-DNS resolver
+#
+# The deployment: a resolver on the internet that anybody may query over DoT
+# (port 853, what a phone's private-DNS setting speaks) and DoH (port 443,
+# what browsers and most stub resolvers speak), and over nothing else. There
+# is no plain DNS on port 53, so there is no UDP to reflect off this box and no
+# amplification to bound. examples/compose-public.yaml runs it, with the
+# certificate it needs.
+#
+# It is examples/public.yaml, changed where a container and the missing port 53
+# change the facts. Read that file for why each choice below is made; the
+# comments here only say where this one differs.
+#
+#   * Plain DNS is off. UDP and TCP on 53 are both disabled, so the UDP answer
+#     ceiling, the reader count and the receive buffer have nothing to bound and
+#     are left out. `rate_limit` stays: every answer over DoT and DoH is charged
+#     to it as well.
+#   * Privileges. The image runs as uid 65532 from the start, and Docker lets an
+#     unprivileged process bind 443 and 853 inside the container's own network
+#     namespace, so there is no root to drop and `server.user` stays empty.
+#   * The certificate and its key are one file, pair.pem, which
+#     examples/compose-public.yaml writes, owned by the image's account, into
+#     the certs volume mounted read-only at /etc/elodin/certs, so a SIGHUP
+#     after a renewal can open the new key. One file, replaced by a single rename, so
+#     elodin never loads a new key beside an old certificate: `cert_file` and
+#     `key_file` both name it, and each reads its own part.
+#   * The metrics endpoint is bound to every address inside the container,
+#     since the container's loopback is unreachable from anywhere else. Who can
+#     reach it is decided by how you publish 9153 - on 127.0.0.1, or not at all.
+#
+# Anything not written here is the shipped default; examples/elodin.yaml is the
+# annotated reference for all of them.
+
+log:
+  level: info
+  # Off: these are strangers' queries. See public.yaml.
+  queries: false
+
+server:
+  # Public: anybody may ask. See public.yaml for what still stands between
+  # "anybody may ask" and abuse, and docs/public-resolver.md for what to put
+  # in front of it.
+  allow_from: []
+
+  # As in public.yaml: a table sized for strangers, and a small share of it for
+  # any one /24 or /64. The share only means something if elodin sees each
+  # client's own address; examples/compose-public.yaml says how Docker is set
+  # up so that it does.
+  max_connections: 2048
+  max_connections_per_prefix: 24
+
+  # Name no build to strangers: version.bind and its siblings are refused, and
+  # DoH answers carry no Server field.
+  identity: off
+
+  # The shipped budget per client prefix. Over DoT and DoH there is no slip to
+  # TCP - a client over budget is already on a connection - so this is purely
+  # how much one /24 or /64 may ask of the resolver. See public.yaml for when
+  # to add `overrides` for a carrier NAT's ranges.
+  rate_limit:
+    enabled: true
+    responses_per_second: 500
+
+  # Empty: the image never runs as root, so there is nothing to drop.
+  user: ""
+
+listeners:
+  # No plain DNS. A client that only speaks Do53 cannot use this resolver,
+  # which is the point of this file; turn both on together, and publish 53,
+  # for a resolver that serves those too - and then take public.yaml's
+  # `max_udp_response` and `readers` with them.
+  udp:
+    enabled: false
+  tcp:
+    enabled: false
+  # Inside the container's network namespace, so these are the container's
+  # own addresses; the compose file's `ports:` decides what leads here. "::"
+  # rather than 0.0.0.0, because with IPv6 on the compose network Docker
+  # forwards an IPv6 client to the container's IPv6 address, and a listener on
+  # 0.0.0.0 refuses it. "::" takes IPv4 as well (bindv6only is 0 in a
+  # container).
+  dot:
+    enabled: true
+    address: "::"
+    port: 853
+    cert_file: /etc/elodin/certs/pair.pem
+    key_file: /etc/elodin/certs/pair.pem
+  # Over HTTP/2 or HTTP/1.1 by ALPN; browsers only use HTTP/2.
+  doh:
+    enabled: true
+    address: "::"
+    port: 443
+    path: /dns-query
+    cert_file: /etc/elodin/certs/pair.pem
+    key_file: /etc/elodin/certs/pair.pem
+    # The Apple profile, built from the host the request arrived on. Set it to
+    # "" to withhold it.
+    mobileconfig_path: /apple-doh.mobileconfig
+
+upstream:
+  # As in public.yaml: failover over two DoT resolvers, names pinned. The
+  # image's CA bundle is what these handshakes are checked against.
+  strategy: failover
+  timeout: 5s
+  attempts: 2
+  max_idle: 32
+  idle_timeout: 30s
+  servers:
+    - name: cloudflare-dot
+      type: tls
+      address: 1.1.1.1
+      port: 853
+      hostname: cloudflare-dns.com
+    - name: quad9-dot
+      type: tls
+      address: 9.9.9.9
+      port: 853
+      hostname: dns.quad9.net
+  # Blocklist downloads resolve their hosts through these, not through the
+  # container's /etc/resolv.conf.
+  bootstrap: [1.1.1.1, 9.9.9.9]
+
+cache:
+  enabled: true
+  # As in public.yaml: about 220 MiB of average answers at 500,000 entries,
+  # with 256 MiB as the ceiling. Give the container a memory limit above that.
+  max_entries: 500000
+  max_bytes: 256MiB
+  min_ttl: 0
+  max_ttl: 24h
+  negative_ttl: 300
+  serve_stale: true
+
+blocking:
+  # Deliberately narrow, as in public.yaml: malware only, and publish the list
+  # you run. `enabled: false` filters nothing, which is fine too.
+  enabled: true
+  response: nxdomain
+  block_ttl: 60
+  # The image's account owns it; the compose file mounts a volume here.
+  cache_dir: /var/cache/elodin
+  refresh: 24h
+  lists:
+    - name: cyberhost-malware
+      url: https://lists.cyberhost.uk/malware.txt
+      format: domains
+  allowlists: []
+
+dnssec:
+  enabled: true
+  max_nsec3_iterations: 100
+
+cookies:
+  # The default: clients that send a cookie get one back, over DoT and DoH as
+  # well. `upstream` is left at its default too, though it does nothing here:
+  # it covers plain UDP and TCP upstreams, and the TLS of the DoT upstreams
+  # above already authenticates them.
+  enabled: true
+
+rebind:
+  # On: a public name answered with a private address is refused.
+  enabled: true
+  allow_loopback: false
+
+special_use:
+  # All three answered here, as in public.yaml: a public resolver is nobody's
+  # local authority.
+  enabled: true
+  onion: true
+  local: true
+  test: true
+  home_arpa: true
+
+metrics:
+  enabled: true
+  # Every address in the container; see the top of this file. elodin warns
+  # about it at startup, which is the reminder to publish 9153 narrowly.
+  address: "0.0.0.0"
+  port: 9153
+  path: /metrics

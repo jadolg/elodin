@@ -142,6 +142,9 @@ docker run -d --name elodin --restart unless-stopped --ulimit nofile=65536 \
 [`examples/compose.yaml`](../examples/compose.yaml) is the same for Docker
 Compose, with a read-only root, every capability dropped and
 `no-new-privileges`, none of which the image needs.
+[`examples/compose-public.yaml`](../examples/compose-public.yaml) runs it as a
+public DoT and DoH resolver instead, with certbot obtaining and renewing a
+Let's Encrypt certificate and reloading elodin when it changes.
 
 **What is in it.** elodin on Google's [distroless](https://github.com/GoogleContainerTools/distroless)
 Debian 13 base (`base-debian13:nonroot`), about 10 MB to pull. The base carries

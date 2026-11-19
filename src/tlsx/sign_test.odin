@@ -134,6 +134,44 @@ test_server_context_carries_a_signer :: proc(t: ^testing.T) {
 	testing.expect(t, signer_present(ctx.signer), "a server context should carry a signer")
 }
 
+/*
+One file holding the chain and then the key serves as both `cert_file` and
+`key_file`.
+
+The layout examples/compose-public.yaml writes, so that one rename replaces the
+pair: the chain is read from the certificate blocks and the key from the key
+block, and the host check that `--check` makes reads past the key too.
+*/
+@(test)
+test_server_context_loads_a_combined_pair :: proc(t: ^testing.T) {
+	dir := sign_dir()
+	cert, key, ok := signer_pair(dir)
+	if !ok {
+		testing.expect(t, false, "openssl could not make a certificate")
+		return
+	}
+	cert_pem, cerr := os.read_entire_file(cert, context.temp_allocator)
+	key_pem, kerr := os.read_entire_file(key, context.temp_allocator)
+	if !testing.expect(t, cerr == nil && kerr == nil, "cannot read the pair back") {
+		return
+	}
+	pair := in_dir(dir, "pair.pem")
+	pair_pem := strings.concatenate({string(cert_pem), string(key_pem)}, context.temp_allocator)
+	if !testing.expect(t, os.write_entire_file(pair, pair_pem) == nil, "cannot write the combined pair") {
+		return
+	}
+
+	ctx, err := server_context(pair, pair)
+	if err != .None {
+		testing.expectf(t, false, "a combined pair should load: %v", err)
+		return
+	}
+	defer context_destroy(ctx)
+	testing.expect(t, signer_covers_host(ctx.signer, "elodin.local"), "the combined pair's certificate should be the one served")
+	covered, read := cert_file_covers_host(pair, "elodin.local")
+	testing.expect(t, read && covered, "the host check should read the certificate out of a combined pair")
+}
+
 // A client context signs nothing: it has no certificate of its own to sign with.
 @(test)
 test_client_context_has_no_signer :: proc(t: ^testing.T) {
