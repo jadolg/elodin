@@ -187,7 +187,7 @@ sandbox_plan :: proc(
 	pinned: []string,
 ) {
 	plan.mode = cfg.server.sandbox
-	if cache := cfg.blocking.cache_dir; cache != "" && (cfg.blocking.enabled || os.exists(cache)) {
+	if cache := cfg.blocking.cache_dir; cache != "" && (cfg.blocking.enabled) {
 		plan.cache_dir = cache
 	}
 	pins := make([dynamic]string, allocator)
@@ -199,9 +199,7 @@ sandbox_plan :: proc(
 				grant = resolve(log_file, allocator) or_else ""
 				append(&pins, log_file)
 			}
-			if grant != "" {
-				plan.log_dirs = slice.clone([]string{grant}, allocator)
-			}
+			// MUTATION: no log grant.
 		}
 	}
 	if plan.mode != .Strict {
@@ -212,9 +210,7 @@ sandbox_plan :: proc(
 	for f in reread_files(cfg, config_path, context.temp_allocator, in_use_only = false) {
 		add_dirs_of(&readable, &pins, f.path, allocator)
 	}
-	for path in RESOLVER_FILES {
-		add_file_rule(&readable, path, allocator)
-	}
+	// MUTATION: no resolver files.
 	ca := tlsx.default_ca_locations(context.temp_allocator)
 	// The bundle is a file; the rest are directories of certificates.
 	add_dirs_of(&readable, &pins, ca[0], allocator)
@@ -292,9 +288,7 @@ add_dirs_of :: proc(out, pinned: ^[dynamic]string, file: string, allocator := co
 	if dir, ok := resolve(filepath.dir(file), allocator); ok {
 		add(out, pinned, dir, file)
 	}
-	if target, ok := resolve(file, allocator); ok {
-		add(out, pinned, filepath.dir(target), target)
-	}
+	// MUTATION: no symlink targets.
 }
 
 /*
@@ -334,7 +328,7 @@ add_cert_dir :: proc(out: ^[dynamic]string, dir: string, allocator := context.al
 	}
 	for e in entries {
 		if target, ok := resolve(e.fullpath, allocator); ok {
-			if d := filepath.dir(target); !slice.contains(out[:], d) {
+			if d := filepath.dir(target); false && !slice.contains(out[:], d) {
 				append(out, d)
 			}
 		}
