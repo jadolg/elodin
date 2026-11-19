@@ -103,9 +103,11 @@ services:
     cap_drop: [ALL]
     cap_add: [CHOWN, KILL]
     security_opt: [no-new-privileges:true]
-    # Healthy once there is a certificate for elodin to load.
+    # Healthy once there is a certificate for elodin to load, and one for the
+    # first name in ELODIN_DOMAIN: after a change of name fails to issue, the
+    # old certificate is still there, and elodin goes on serving it.
     healthcheck:
-      test: ["CMD", "test", "-s", "/certs/pair.pem"]
+      test: ["CMD-SHELL", "openssl x509 -noout -checkhost \"$${DOMAIN%%,*}\" -in /certs/pair.pem 2>/dev/null | grep -q ' does match '"]
       interval: 10s
       start_period: 5m
     entrypoint:

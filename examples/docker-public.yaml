@@ -154,7 +154,7 @@ cookies:
   # The default: clients that send a cookie get one back, over DoT and DoH as
   # well. `upstream` is left at its default too, though it does nothing here:
   # it covers plain UDP and TCP upstreams, and the TLS of the DoT upstreams
-  # below already authenticates them.
+  # above already authenticates them.
   enabled: true
 
 rebind:
