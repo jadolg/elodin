@@ -11,6 +11,7 @@ import "core:thread"
 import "core:time"
 import "elodin:cache"
 import "elodin:config"
+import "elodin:sandbox"
 import "elodin:dns"
 import "elodin:filter"
 import "elodin:upstream"
@@ -473,6 +474,46 @@ test_a_restart_only_key_derived_both_times_is_not_named :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, len(keep_restart_only(&first, &again, context.temp_allocator)), 0)
+}
+
+// The sandbox went on before the first loop started and cannot come off, so a
+// reload that changes it is named and held.
+@(test)
+test_a_changed_sandbox_is_held_and_named :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	boot, boot_ok := load(t, swap(BASE, "server:\n", "server:\n  sandbox: strict\n"), &arena)
+	cfg, cfg_ok := load(t, swap(BASE, "server:\n", "server:\n  sandbox: off\n"), &arena)
+	if !boot_ok || !cfg_ok {
+		return
+	}
+	testing.expect_value(t, cfg.server.sandbox, sandbox.Mode.Off)
+
+	named := keep_restart_only(&boot, &cfg, context.temp_allocator)
+	testing.expectf(t, len(named) == 1 && named[0] == "server.sandbox", "named %v", named)
+	testing.expect_value(t, cfg.server.sandbox, sandbox.Mode.Strict)
+}
+
+// A moved log is applied by a reload under any sandbox: a reopen Landlock
+// refuses fails as any other does, and logging stays where it was.
+@(test)
+test_a_moved_log_is_not_held_under_a_sandbox :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	sandboxed := swap(BASE, "server:\n", "server:\n  sandbox: strict\n")
+	boot, boot_ok := load(t, swap(sandboxed, "log: { level: info }", "log: { level: info, file: /var/log/a.log }"), &arena)
+	cfg, cfg_ok := load(t, swap(sandboxed, "log: { level: info }", "log: { level: info, file: /srv/b.log }"), &arena)
+	if !boot_ok || !cfg_ok {
+		return
+	}
+	named := keep_restart_only(&boot, &cfg, context.temp_allocator)
+	testing.expectf(t, len(named) == 0 && cfg.log.file == "/srv/b.log", "named %v, log %q", named, cfg.log.file)
 }
 
 /*

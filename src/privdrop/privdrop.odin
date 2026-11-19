@@ -13,7 +13,8 @@ which catches one class of that surface's bugs and no others.
 systemd binds the port through `AmbientCapabilities` and runs the process under
 `DynamicUser`. This package is for every other way of starting it — a bare
 `sudo elodin`, a container, an init system without that machinery — where the
-process has to put the privilege down itself.
+process has to put the privilege down itself. What the account may do once it
+is that account is narrowed further by `sandbox`.
 */
 package privdrop
 
@@ -330,14 +331,19 @@ created when missing, and O_NONBLOCK so a FIFO named by mistake does not hang
 the start.
 */
 can_reopen :: proc(path: string, write: bool) -> bool {
+	return reopen_error(path, write) == .NONE
+}
+
+// Why `can_reopen` would say no: the error the open failed with, or NONE.
+reopen_error :: proc(path: string, write: bool) -> posix.Errno {
 	cpath := strings.clone_to_cstring(path, context.temp_allocator)
 	// NOCTTY as `logx.open_log` sets it: a tty opened here by a session leader
 	// would become its controlling terminal, and closing it does not undo that.
 	flags: posix.O_Flags = {.NONBLOCK, .CLOEXEC, .NOCTTY}
 	fd := posix.open(cpath, flags + ({.WRONLY, .APPEND} if write else {}))
 	if fd < 0 {
-		return false
+		return posix.errno()
 	}
 	posix.close(fd)
-	return true
+	return .NONE
 }

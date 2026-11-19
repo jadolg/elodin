@@ -24,6 +24,8 @@ Pi-hole and AdGuard Home, minus the web interface. One binary, one YAML file.
 - Discovery of its own DoT/DoH endpoints over DDR (RFC 9462), off by default
 - A Prometheus endpoint, off by default
 - Configuration reloads on `SIGHUP`, keeping the cache, cookies and connections
+- Narrows itself once serving, however it was started: no new privileges and
+  Landlock on writes by default, reads and a syscall allowlist under `strict`
 - Ships as a systemd service, a `.deb` with optional system-resolver takeover,
   or a distroless container image with no shell, package manager or other
   tool beside elodin

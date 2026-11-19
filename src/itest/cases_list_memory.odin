@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
-import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:sys/posix"
@@ -173,15 +172,6 @@ list_memory_config :: proc(udp_port: int, list_path: string, timeout_s: int) -> 
 		timeout = fmt.tprintf("%ds", timeout_s),
 		blocking = fmt.tprintf("{{ enabled: true, lists: [{{ name: big, file: %s, format: hosts }}] }}", list_path),
 	)
-}
-
-// One numeric field of /proc/<pid>/`file`, such as `VmRSS` in KiB or `Threads`
-// from `status`, or `AnonHugePages` (KiB, summed over the mappings by the kernel)
-// from `smaps_rollup`.
-@(private = "file")
-proc_status_int :: proc(pid: int, field: string, file := "status") -> (n: int, ok: bool) {
-	value := proc_status_field(fmt.tprintf("/proc/%d/%s", pid, file), field) or_return
-	return strconv.parse_int(strings.trim_space(strings.trim_suffix(value, "kB")))
 }
 
 /*

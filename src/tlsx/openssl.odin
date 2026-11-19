@@ -221,6 +221,13 @@ foreign libcrypto {
 	CRYPTO_get_ex_new_index :: proc(class_index: c.int, argl: c.long, argp: rawptr, new_func: rawptr, dup_func: rawptr, free_func: CRYPTO_EX_Free) -> c.int ---
 
 	ERR_get_error :: proc() -> c.ulong ---
+
+	// The trust store `SSL_CTX_set_default_verify_paths` reads, and the names
+	// of the environment variables that move it.
+	X509_get_default_cert_file :: proc() -> cstring ---
+	X509_get_default_cert_dir :: proc() -> cstring ---
+	X509_get_default_cert_file_env :: proc() -> cstring ---
+	X509_get_default_cert_dir_env :: proc() -> cstring ---
 	OpenSSL_version :: proc(type: c.int) -> cstring ---
 
 	RAND_bytes :: proc(buf: [^]u8, num: c.int) -> c.int ---

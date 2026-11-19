@@ -11,6 +11,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
 import "elodin:logx"
+import "elodin:sandbox"
 import "elodin:loop"
 import "elodin:upstream"
 
@@ -318,7 +319,7 @@ list_contents :: proc(
 	if list.file != "" {
 		data, err := os.read_entire_file(list.file, context.allocator)
 		if err != nil {
-			logx.warnf("list %s: cannot read %q (%v)", list.name, list.file, err)
+			logx.warnf("list %s: cannot read %q (%v)%s", list.name, list.file, err, sandbox.refusal_hint(err, write = false))
 			return "", .Unavailable, false
 		}
 		return string(data), .Current, false
@@ -568,15 +569,16 @@ warn_cache_unwritable :: proc(cfg: ^config.Config, cache_path: string, err: os.E
 		return
 	}
 	logx.warnf(
-		"blocking.cache_dir %q is not writable (%v); lists are loaded but will be re-downloaded on each start",
+		"blocking.cache_dir %q is not writable (%v)%s; lists are loaded but will be re-downloaded on each start",
 		cfg.blocking.cache_dir,
 		err,
+		sandbox.refusal_hint(err, write = true),
 	)
 }
 
-@(private)
+// Create `path` and every directory above it that is missing; an existing
+// directory is not an error, and nothing is reported.
 make_directories :: proc(path: string) {
-	// Create each component in turn; an existing directory is not an error.
 	if path == "" || path == "/" {
 		return
 	}

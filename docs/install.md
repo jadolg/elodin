@@ -64,7 +64,14 @@ sudo systemctl enable --now elodin
 ```
 
 The unit binds :53 through `AmbientCapabilities=CAP_NET_BIND_SERVICE` rather
-than as root, and runs under `DynamicUser=yes` with `ProtectSystem=strict`.
+than as root, and runs under `DynamicUser=yes` with `ProtectSystem=strict`; its
+`SystemCallFilter=` names the Landlock and `seccomp` calls
+[`server.sandbox`](#sandbox) makes, one by one: `@system-service` has none of
+them, and `@sandbox`, which does, is only known to systemd 254 and later. On
+a host whose libseccomp is older than 2.5.2 (Debian 11, Ubuntu 20.04), systemd
+cannot name the Landlock calls and the unit stops the process at its first one
+(`status=31/SYS` in `systemctl status`); there, a drop-in with
+`SystemCallErrorNumber=EPERM`, or `server.sandbox: off`, starts it.
 `Restart=on-failure` with `StartLimitBurst=5` retries a start that fails for a
 passing reason and gives up in `failed` on one that does not — a port it cannot
 have, a certificate it cannot read. `systemctl reset-failed elodin` clears that.
@@ -286,11 +293,102 @@ can read. Each file out of reach is named
 in a `warn` right after the drop:
 
 ```
-ts=2026-11-03T15:41:14Z level=warn msg="listeners.dot.key_file: elodin cannot open \"/etc/letsencrypt/live/dns.example/privkey.pem\", so a SIGHUP will keep the certificate loaded now"
+ts=2026-11-03T15:41:14Z level=warn msg="listeners.dot.key_file: elodin cannot open \"/etc/letsencrypt/live/dns.example/privkey.pem\" (Permission denied), so a SIGHUP will keep the certificate loaded now"
 ```
 
 The [systemd unit](#from-source-as-a-service) never starts as root, so it reads them as its own
 account from the start, and a key it cannot read fails the start instead.
+
+### Sandbox
+
+`server.sandbox` narrows what the process may do once it serves, however it
+was started, as root or not:
+
+```yaml
+server:
+  sandbox: basic      # off, basic (the default) or strict
+```
+
+| Mode | What it applies |
+|---|---|
+| `off` | nothing |
+| `basic` | `no_new_privs`, and [Landlock](https://docs.kernel.org/userspace-api/landlock.html) on writes: the process can create, write and remove files only in `blocking.cache_dir` (with blocking on, or when the directory exists at startup), and create and write them only there and in the directory `log.file` is in (the directory of the file it resolves to, not of a symlink's name). Only for a regular file: a log on a device, FIFO or socket, such as `/dev/stdout`, is written through the descriptor already open, and a `SIGHUP` keeps it. Nothing can be executed. Reads are not confined. On Landlock ABI 6 kernels it also cannot signal another process or connect to an abstract unix socket outside itself |
+| `strict` | `basic`, with Landlock on reads too, and a seccomp allowlist of system calls installed after the privilege drop |
+
+Both layers are set before the event loops start, so every thread has them,
+and they last for the life of the process: `server.sandbox` takes a restart.
+
+- With blocking off and `blocking.cache_dir` not there yet, startup says that a
+  reload turning blocking on will not be able to keep copies of the lists. A
+  cache directory removed while the process runs cannot be made again until a
+  restart, for the same reason.
+- A file the sandbox would reach through its directory that sits directly in
+  `/`, `/etc`, `/etc/ssl` and `/etc/pki` and their private-key directories,
+  `/root`, an account's home under `/home`, or one of `/home`, `/tmp`, `/var`,
+  `/var/lib`, `/var/tmp`, `/srv`, `/opt`, `/usr` and `/run` (by its name or by
+  where a symlink leads) is reached alone
+  instead, and startup names it: one that replaces it - an editor, a renewal, a
+  log rotation - is not seen until a restart, so give it a directory of its own.
+- A file the sandbox refuses is reported as for any other file that cannot be
+  opened, with `(or server.sandbox refuses it: ...)` added where the sandbox
+  confines that access. A reload that moves `log.file` somewhere it refuses
+  keeps logging where it was.
+
+Landlock needs Linux 5.13 or later with `landlock` among the kernel's `lsm=`
+modules, and a container runtime that allows its system calls. Without it
+the rest applies and startup warns:
+
+```
+ts=2026-11-19T08:59:48Z level=warn msg="server.sandbox: Landlock is unavailable (Operation not supported), so writing files is not confined; it needs Linux 5.13 with landlock among the lsm= modules, and a container runtime that allows its system calls"
+```
+
+A path the sandbox would grant that cannot be opened at startup is named in a
+warning with the reason, and stays out of reach until a restart, even once it
+can be. Under `strict`, startup lists every path reads are granted on
+(`server.sandbox: strict reads ...`). The line after the drop says what is in
+force:
+
+```
+ts=2026-11-19T08:59:48Z level=info msg=sandbox mode=strict no_new_privs=true landlock_abi=6 seccomp=true
+```
+
+Under `strict`, reading is confined to these:
+
+- the directories of the configuration file, the DoT and DoH `cert_file` and
+  `key_file`, and every `file:` list (enabled or not, and with blocking off
+  too), and, when one is a symlink, the directory of what it points to. A file
+  directly in `/` is granted alone rather than through its directory;
+- `blocking.cache_dir`;
+- `/etc/resolv.conf` and `/etc/hosts` themselves, and the directory of what
+  either links to (`/run/systemd/resolve` under systemd-resolved), which a list
+  download reads when `upstream.bootstrap` does not answer for its host. The
+  files and not `/etc`, which holds every other secret on the host; a resolver
+  that replaces `/etc/resolv.conf` by renaming a new file over it (NetworkManager
+  without systemd-resolved, dhclient) leaves the rule on the old file, so with
+  hosts to look up and no `upstream.bootstrap`, startup says to set one;
+- OpenSSL's trust store, or what `SSL_CERT_FILE` and `SSL_CERT_DIR` name: the
+  directory the bundle file leads to (not the one its name is in, `/etc/ssl` or
+  `/etc/pki/tls`, beside the host's private keys), the certificate directory,
+  and every directory that directory's entries point into
+  (`/usr/share/ca-certificates/mozilla` on Debian and Ubuntu);
+- `/proc` and `/sys/fs/cgroup`, which the metrics and the sizing read. Both are
+  granted whole: procfs makes a new inode each time it looks up an entry it
+  had let go of, so a rule on `/proc/<pid>` would stop matching. Only the
+  mount's root lasts.
+
+A reload that names a file outside those, such as a certificate moved to a new
+directory or a new `file:` list elsewhere, cannot read it until a restart, and
+says so as for any file it cannot open. The syscall allowlist kills the process
+on any call off the list. The calls a serving process makes on glibc and musl,
+on x86_64 and arm64, are on it. A libc that makes another one ends the process
+with `SIGSYS`; set `basic` and report it. `execve`, `ptrace`, `bind`, `ioctl`,
+new processes (a `clone` that is not a thread) and namespaces, sockets other
+than IPv4 and IPv6 streams and datagrams over TCP or UDP (no raw sockets, no
+SCTP), scheduling policies other than the default and the one the process was started
+under, and socket options other
+than the read and write timeouts and `TCP_NODELAY` are not on it.
+`strict` refuses to start where the filter cannot be installed, which includes
+any architecture other than x86_64 and arm64.
 
 ## Signals
 
@@ -345,7 +443,7 @@ rules in effect` when turned off), or keep the rules in effect;
 | `dnssec` | a change rebuilds the validator, which fetches its zone keys again |
 | `cookies` | applied; the secret is kept unless `cookies.secret` changes |
 | `blocking` | a change to `enabled`, the lists or the rules rebuilds the rule sets, and a list whose cached copy is within `refresh` is not downloaded again; `response`, `custom_ipv4`, `custom_ipv6`, `block_ttl` and `refresh` apply from the next query or tick. Lists read from a `file:` are read again on every SIGHUP, changed configuration or not. If a list that loaded before cannot be had, the rules in effect are kept, as on a refresh, and the change applies at the retry |
-| `listeners` (including `udp.readers`, the loop count), `ddr`, `metrics`, `max_connections`, `max_connections_per_prefix`, `pin_loops`, `user`, `group`, `blocking.cache_dir` | need a restart; each one changed is named in a warning and keeps the value it started with |
+| `listeners` (including `udp.readers`, the loop count), `ddr`, `metrics`, `max_connections`, `max_connections_per_prefix`, `pin_loops`, `user`, `group`, `sandbox`, `blocking.cache_dir` | need a restart; each one changed is named in a warning and keeps the value it started with |
 
 A change to which upstreams are asked (`upstream.servers`, `upstream.bootstrap`,
 `upstream.zones` and their servers), to `dnssec.enabled`, `trust_anchors` or

@@ -128,7 +128,7 @@ reload_config :: proc(s: ^Server, path: string) -> (out: Reload_Outcome) {
 	logx.set_level(g.cfg.log.level)
 	if log_file_moved {
 		if err := logx.reopen(g.cfg.log.file); err != nil {
-			logx.warnf("reload: cannot open the log file %q (%s)%s; logging where it was", g.cfg.log.file, os.error_string(err), logx.guard_hint(err))
+			logx.warnf("reload: cannot open the log file %q (%s)%s; logging where it was", g.cfg.log.file, os.error_string(err), logx.reopen_hints(err))
 		}
 	}
 
@@ -193,6 +193,7 @@ because root, once given up, cannot be had back - nor, with it, the handover of
 the blocklist cache directory to that account. The certificates under
 `listeners.dot` and `listeners.doh` are still read again on every SIGHUP, from
 the paths the process started with.
+And the sandbox itself, which nothing takes off a thread.
 
 Held at the starting value rather than at the previous reload's, which is the
 same value for every key here - none of them has ever changed while running -
@@ -232,6 +233,8 @@ keep_restart_only :: proc(boot, cfg: ^config.Config, allocator := context.alloca
 	hold(&changed, "server.pin_loops", boot.server.pin_loops, &cfg.server.pin_loops)
 	hold(&changed, "server.user", boot.server.user, &cfg.server.user)
 	hold(&changed, "server.group", boot.server.group, &cfg.server.group)
+	// Put on every thread before the first loop started, and never taken off.
+	hold(&changed, "server.sandbox", boot.server.sandbox, &cfg.server.sandbox)
 	// Handed to `server.user` at startup, as root; a directory named afterwards
 	// would be one the process cannot write its cached lists into.
 	hold(&changed, "blocking.cache_dir", boot.blocking.cache_dir, &cfg.blocking.cache_dir)
@@ -343,3 +346,4 @@ clear_filters :: proc(s: ^Server) {
 	delete(s.lists_loaded)
 	s.lists_loaded = nil
 }
+

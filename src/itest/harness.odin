@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
+import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
@@ -50,6 +51,8 @@ Runner :: struct {
 	// The binary is the static build, musl and its own OpenSSL linked in; read
 	// once from its `--version` (see `binary_is_static`).
 	static:    bool,
+	// The binary is built with AddressSanitizer (`binary_has_asan`).
+	asan:      bool,
 }
 
 /*
@@ -496,6 +499,62 @@ without_dnssec :: proc(config: string, allocator := context.temp_allocator) -> s
 	return strings.concatenate({config, "\ndnssec:\n  enabled: false\n"}, allocator)
 }
 
+/*
+Run the case under `server.sandbox: mode` unless it names a mode itself: the
+suite is how the syscall allowlist and the Landlock rules are known to cover
+every path the server takes (#417). Added to the `server:` section the case
+wrote, in the block or flow style it wrote it in, or as a section of its own.
+*/
+with_sandbox :: proc(config, mode: string, allocator := context.temp_allocator) -> string {
+	if strings.contains(config, "sandbox:") {
+		return config
+	}
+	lines := strings.split_lines(config, context.temp_allocator)
+	for line, i in lines {
+		if !strings.has_prefix(line, "server:") {
+			continue
+		}
+		rest := strings.trim_space(line[len("server:"):])
+		if strings.has_prefix(rest, "{") {
+			inner := strings.trim_space(rest[1:])
+			sep := "" if strings.has_prefix(inner, "}") else ","
+			lines[i] = fmt.aprintf("server: {{ sandbox: %s%s %s", mode, sep, inner, allocator = context.temp_allocator)
+		} else {
+			// The siblings' indent, from the first line that has content.
+			indent := "  "
+			for next in lines[i + 1:] {
+				body := strings.trim_left(next, " ")
+				if body == "" || strings.has_prefix(body, "#") {
+					continue
+				}
+				if width := len(next) - len(body); width > 0 {
+					indent = next[:width]
+				}
+				break
+			}
+			lines[i] = fmt.aprintf("server:\n%ssandbox: %s", indent, mode, allocator = context.temp_allocator)
+		}
+		return strings.join(lines, "\n", allocator)
+	}
+	return fmt.aprintf("%s\nserver:\n  sandbox: %s\n", config, mode, allocator = allocator)
+}
+
+// What the suite writes for `config`, at a start and at every reload alike, so a
+// reload changes only what the case changed.
+@(private = "file")
+as_written :: proc(r: ^Runner, config: string, verbatim: bool) -> string {
+	return config if verbatim else with_sandbox(without_dnssec(config), suite_sandbox(r))
+}
+
+/*
+The mode every case runs under unless it names one: `strict`, except for a
+binary built with AddressSanitizer, whose LeakSanitizer stops the process with
+`ptrace` at exit and runs a symbolizer, neither of which the allowlist has.
+*/
+suite_sandbox :: proc(r: ^Runner) -> string {
+	return "basic" if r.asan else "strict"
+}
+
 // Start the process without probing it. Callers that cannot use the UDP probe
 // establish readiness themselves.
 start_server_raw :: proc(
@@ -519,7 +578,7 @@ start_server_raw :: proc(
 	cfg_path := config_path(r, udp_port)
 	log_path := filepath.join({r.work_dir, fmt.tprintf("elodin-%d.log", udp_port)}, context.temp_allocator) or_else ""
 
-	written := config if verbatim else without_dnssec(config)
+	written := as_written(r, config, verbatim)
 	if werr := os.write_entire_file(cfg_path, transmute([]u8)written); werr != nil {
 		fail(r, "cannot write the config to %s: %v", cfg_path, werr)
 		return {}, false
@@ -795,7 +854,7 @@ is over.
 */
 reload_to :: proc(r: ^Runner, srv: ^Server, config: string, needle: string, timeout := 5 * time.Second) -> bool {
 	before := log_count(srv, needle)
-	written := config if srv.verbatim else without_dnssec(config)
+	written := as_written(r, config, srv.verbatim)
 	if !write_fixture(r, config_path(r, srv.udp_port), transmute([]u8)written) {
 		return false
 	}
@@ -848,6 +907,14 @@ task_ids :: proc(pid: int, allocator := context.temp_allocator) -> (ids: []strin
 			append(&found, strings.clone(name, allocator))
 		}
 	}
+}
+
+// One numeric field of /proc/<pid>/`file`, such as `VmRSS` in KiB or `Threads`
+// from `status`, or `AnonHugePages` (KiB, summed over the mappings by the kernel)
+// from `smaps_rollup`.
+proc_status_int :: proc(pid: int, field: string, file := "status") -> (n: int, ok: bool) {
+	value := proc_status_field(fmt.tprintf("/proc/%d/%s", pid, file), field) or_return
+	return strconv.parse_int(strings.trim_space(strings.trim_suffix(value, "kB")))
 }
 
 // One field of a /proc status file, such as `VmRSS` or `SigBlk`, trimmed; not
@@ -1262,19 +1329,19 @@ built_with_asan :: proc(
 	name: string,
 	reason := "the binary is built with AddressSanitizer, whose allocator is not glibc's",
 ) -> bool {
-	// Heap: the temp allocator is not reset until the next case ends, and a
-	// skip from here ends none.
-	exe, xerr := os.read_entire_file(r.binary, context.allocator)
-	if xerr != nil {
-		fail(r, "%s: cannot read %s: %v", name, r.binary, xerr)
-		return true
-	}
-	asan := strings.contains(string(exe), "__asan_init")
-	delete(exe)
-	if asan {
+	if r.asan {
 		skip_case(r, name, reason)
 	}
-	return asan
+	return r.asan
+}
+
+// Whether the binary at `path` carries AddressSanitizer's runtime.
+binary_has_asan :: proc(path: string) -> (asan: bool, err: os.Error) {
+	// Heap: the binary is megabytes, and the temp allocator lives to the end of
+	// a case.
+	exe := os.read_entire_file(path, context.allocator) or_return
+	defer delete(exe)
+	return strings.contains(string(exe), "__asan_init"), nil
 }
 
 /*
@@ -1318,4 +1385,131 @@ open_descriptor_count :: proc(pid: int = 0) -> (n: int, ok: bool) {
 	path: cstring = "/proc/self/fd" if pid == 0 else fmt.ctprintf("/proc/%d/fd", pid)
 	count, count_ok := metrics.descriptor_count(path)
 	return int(count), count_ok
+}
+
+// A self-signed pair naming `name` in both CN and SAN, so a verifying client
+// dialling `name` accepts one and refuses the other.
+generate_named_cert :: proc(cert_path, key_path, name: string) -> bool {
+	process, perr := os.process_start(
+		os.Process_Desc {
+			command = []string {
+				"openssl",
+				"req",
+				"-x509",
+				"-newkey",
+				"ec",
+				"-pkeyopt",
+				"ec_paramgen_curve:prime256v1",
+				"-nodes",
+				"-keyout",
+				key_path,
+				"-out",
+				cert_path,
+				"-days",
+				"2",
+				"-subj",
+				fmt.tprintf("/CN=%s", name),
+				"-addext",
+				fmt.tprintf("subjectAltName=DNS:%s", name),
+			},
+		},
+	)
+	if perr != nil {
+		return false
+	}
+	state, werr := os.process_wait(process)
+	return werr == nil && state.exit_code == 0
+}
+
+// Complete a DoT handshake verifying the peer against `ca_file`, under the
+// name the corresponding certificate was issued for. `false` covers both "no
+// connection" and "the certificate presented was not the one trusted" - the
+// suite only ever needs to tell "the expected certificate is live" from
+// "it is not".
+dot_handshake_verifies :: proc(dot_port: int, ca_file, hostname: string) -> bool {
+	plain, dialled := dial_tcp(dot_port)
+	if !dialled {
+		return false
+	}
+	socket := plain.socket
+	// Closed here only while no session owns it: `tlsx.close` closes it too,
+	// and a second close of the same number can take a descriptor another
+	// thread has opened in between.
+	handshaken := false
+	defer if !handshaken {
+		net.close(socket)
+	}
+
+	ctx, cerr := tlsx.client_context(true, ca_file, nil, context.temp_allocator)
+	if cerr != .None {
+		return false
+	}
+	defer tlsx.context_destroy(ctx)
+
+	conn, terr := tlsx.client_connect(ctx, socket, hostname)
+	if terr != .None {
+		return false
+	}
+	handshaken = true
+	tlsx.close(conn)
+	return true
+}
+
+// Retries the probe rather than sleeping a fixed amount: the reload is
+// noticed on the maintenance loop's 200ms poll, which is fast but not
+// instant, and a fixed sleep would either race it or pad every run.
+wait_for_handshake :: proc(dot_port: int, ca_file, hostname: string, within: time.Duration) -> bool {
+	deadline := time.tick_add(time.tick_now(), within)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
+		if dot_handshake_verifies(dot_port, ca_file, hostname) {
+			return true
+		}
+		time.sleep(50 * time.Millisecond) // lint:allow a poll of another process's listener, bounded by the deadline above
+	}
+	return false
+}
+
+// One `blocking.lists` entry, fetched from the HTTP mock at `path`; an empty
+// `format` leaves it to be sniffed.
+list_entry :: proc(name: string, http_port: int, path: string, format := "hosts") -> string {
+	entry := fmt.tprintf(`{{ name: %s, url: "http://127.0.0.1:%d%s"`, name, http_port, path)
+	return fmt.tprintf("%s, format: %s }}", entry, format) if format != "" else fmt.tprintf("%s }}", entry)
+}
+
+/*
+A blocking configuration over `lists`, each a `list_entry`, with an upstream at
+`upstream_port` and the cache off. The default `cache_dir` cannot be written, so
+a case that wants the cached copy names one of its own.
+*/
+config_lists :: proc(
+	udp_port, upstream_port: int,
+	lists: []string,
+	cache_dir := "/proc/elodin-cannot-write-here",
+	refresh := "1s",
+	log := "{ level: debug }",
+	extra := "",
+) -> string {
+	return base_config(
+		udp_port,
+		upstream_at(upstream_port),
+		log = log,
+		timeout = "3s",
+		blocking = fmt.tprintf(
+			"{{ enabled: true, response: nxdomain, cache_dir: %q, refresh: %s, lists: [%s] }}",
+			cache_dir,
+			refresh,
+			strings.join(lists, ", ", context.temp_allocator),
+		),
+		extra = extra,
+	)
+}
+
+// Overwrite `dst` with `src`'s bytes, the way a renewal tool replaces a
+// certificate file in place.
+install_cert :: proc(dst, src: string) -> bool {
+	data, err := os.read_entire_file(src, context.temp_allocator)
+	if err != nil {
+		return false
+	}
+	return os.write_entire_file(dst, data) == nil
 }

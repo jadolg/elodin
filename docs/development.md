@@ -61,6 +61,7 @@ src/netx/      core:net's address parsers, held to what an address and a port ar
                refuses core:net's own outside the tests, itest and fuzz
 src/metrics/   Prometheus exposition format, and process figures out of /proc
 src/privdrop/  giving up root once the listeners hold their ports
+src/sandbox/   no_new_privs, Landlock and the syscall allowlist (server.sandbox)
 src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), clients, fixtures,
                and the upstream-parity check with its own independent wire walker
 src/fuzz/      libFuzzer targets for the DNS, DNSSEC, HPACK, h2, HTTP/1.1, DoH, blocklist,

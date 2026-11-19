@@ -10,6 +10,7 @@ import "core:unicode"
 import "core:unicode/utf8"
 import "elodin:cache"
 import "elodin:dns"
+import "elodin:sandbox"
 import "elodin:dnssec"
 import "elodin:h2"
 import "elodin:netx"
@@ -363,6 +364,7 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 		"pin_loops",
 		"user",
 		"group",
+		"sandbox",
 		"allow_from",
 		"identity",
 		"rate_limit",
@@ -393,6 +395,18 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	opt_string(l, n, "user", &cfg.server.user, "server")
 	opt_string(l, n, "group", &cfg.server.group, "server")
+	if s: string; opt_string(l, n, "sandbox", &s, "server") {
+		folded := dns.name_fold(s, l.allocator)
+		known := false
+		for name, mode in sandbox.MODE_NAMES {
+			if folded == name {
+				cfg.server.sandbox, known = mode, true
+			}
+		}
+		if !known {
+			errorf(l, "server.sandbox: unknown mode %q (want off, basic or strict)", s)
+		}
+	}
 	load_allow_from(l, n, cfg)
 	load_identity(l, n, cfg)
 
