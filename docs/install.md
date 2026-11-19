@@ -65,7 +65,10 @@ sudo systemctl enable --now elodin
 
 The unit binds :53 through `AmbientCapabilities=CAP_NET_BIND_SERVICE` rather
 than as root, and runs under `DynamicUser=yes` with `ProtectSystem=strict`; its
-`SystemCallFilter=` names `@sandbox` for [`server.sandbox`](#sandbox).
+`SystemCallFilter=` names `@sandbox` for [`server.sandbox`](#sandbox), and
+`SystemCallErrorNumber=EPERM` makes a call it refuses fail rather than kill: a
+systemd older than 249, which does not know `@sandbox`, leaves Landlock to be
+reported unavailable and `strict` to refuse to start, each with a line saying so.
 `Restart=on-failure` with `StartLimitBurst=5` retries a start that fails for a
 passing reason and gives up in `failed` on one that does not — a port it cannot
 have, a certificate it cannot read. `systemctl reset-failed elodin` clears that.
@@ -317,8 +320,8 @@ and they last for the life of the process: `server.sandbox` takes a restart.
   cache directory removed while the process runs cannot be made again until a
   restart, for the same reason.
 - A file the sandbox would reach through its directory that sits directly in
-  `/`, `/etc`, `/etc/ssl`, `/etc/pki` or `/etc/pki/tls` (by its name or by
-  where a symlink leads) is reached alone
+  `/`, `/etc`, `/etc/ssl`, `/etc/ssl/private`, `/etc/pki`, `/etc/pki/tls` or
+  `/etc/pki/tls/private` (by its name or by where a symlink leads) is reached alone
   instead, and startup names it: one that replaces it - an editor, a renewal, a
   log rotation - is not seen until a restart, so give it a directory of its own.
 - A file the sandbox refuses is reported as for any other file that cannot be
@@ -376,7 +379,8 @@ on x86_64 and arm64, are on it. A libc that makes another one ends the process
 with `SIGSYS`; set `basic` and report it. `execve`, `ptrace`, `bind`, `ioctl`,
 new processes (a `clone` that is not a thread) and namespaces, sockets other
 than IPv4 and IPv6 streams and datagrams over TCP or UDP (no raw sockets, no
-SCTP), scheduling policies other than the default, and socket options other
+SCTP), scheduling policies other than the default and the one the process was started
+under, and socket options other
 than the read and write timeouts and `TCP_NODELAY` are not on it.
 `strict` refuses to start where the filter cannot be installed, which includes
 any architecture other than x86_64 and arm64.

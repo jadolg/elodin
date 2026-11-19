@@ -137,6 +137,8 @@ IPPROTO_UDPLITE :: 136
 @(private = "file")
 SCHED_IDLE :: 5
 @(private = "file")
+SCHED_BATCH :: 3
+@(private = "file")
 SOCK_NONBLOCK :: 0o4000
 @(private = "file")
 SOCK_CLOEXEC :: 0o2000000
@@ -550,9 +552,63 @@ test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^test
 test_the_program_fits_its_buffer :: proc(t: ^testing.T) {
 	when AUDIT_ARCH != 0 {
 		program: [PROGRAM_MAX]Sock_Filter
-		n := build_program(program[:], 1)
+		n := build_program(program[:], 1, SCHED_OTHER)
 		testing.expectf(t, n > 0 && n <= len(program), "%d instructions for a buffer of %d", n, len(program))
 	}
+}
+
+/*
+A process started under another policy - `chrt --batch` - gives it to every
+thread glibc starts, by `sched_setscheduler` on the new tid, so that policy is
+allowed too; another still is not.
+*/
+@(test)
+test_the_filter_lets_threads_start_under_the_processs_policy :: proc(t: ^testing.T) {
+	body :: proc() -> u8 {
+		param: [1]i32
+		if linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(SCHED_BATCH), &param) != 0 {
+			return 4
+		}
+		if !install_filter() {
+			return 1
+		}
+		failed: u8
+		started := thread.create_and_start(proc() {})
+		if started == nil {
+			failed |= 1 << 1
+		} else {
+			thread.join(started)
+			thread.destroy(started)
+		}
+		if linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(SCHED_BATCH), &param) != 0 ||
+		   errno_of(linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(SCHED_IDLE), &param)) != .EPERM {
+			failed |= 1 << 2
+		}
+		return failed
+	}
+	if out, ok := run_child(t, body); ok {
+		expect_passed(t, out)
+	}
+}
+
+// `os.remove` on a directory is rmdir, on x86_64 a call of its own.
+@(test)
+test_the_filter_lets_a_directory_be_removed :: proc(t: ^testing.T) {
+	dir := fmt.tprintf("/tmp/elodin-sandbox-rmdir-%d", posix.getpid())
+	if !testing.expect(t, os.make_directory(dir) == nil, "cannot make the directory") {
+		return
+	}
+	landlock_inside = dir
+	body :: proc() -> u8 {
+		if !install_filter() {
+			return 1
+		}
+		return u8(os.remove(landlock_inside) != nil) << 1
+	}
+	if out, ok := run_child(t, body); ok {
+		expect_passed(t, out)
+	}
+	testing.expect(t, !os.exists(dir), "the directory is still there")
 }
 
 // What the raw-socket check is about: without a filter, this run can open one.

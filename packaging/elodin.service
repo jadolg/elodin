@@ -86,7 +86,10 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 # @sandbox is what server.sandbox calls to narrow the process further: Landlock,
 # and seccomp under strict (docs/install.md#sandbox). Not in @system-service.
+# A systemd older than 249 does not know the group; refusing with EPERM rather
+# than killing lets server.sandbox see Landlock as unavailable and say so.
 SystemCallFilter=@system-service @sandbox
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

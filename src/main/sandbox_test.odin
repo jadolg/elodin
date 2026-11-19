@@ -250,7 +250,7 @@ test_the_bundle_is_reached_where_it_leads :: proc(t: ^testing.T) {
 	add_bundle(&out, &pins, tree.link, context.temp_allocator)
 	testing.expectf(t, slice.equal(out[:], []string{tree.real_dir}) && len(pins) == 0, "grants %v, pins %v, want only %q", out, pins, tree.real_dir)
 
-	for dir in ([]string{"/etc/ssl", "/etc/pki/tls"}) {
+	for dir in ([]string{"/etc/ssl", "/etc/ssl/private", "/etc/pki/tls", "/etc/pki/tls/private"}) {
 		testing.expectf(t, is_pinned(dir), "%s, which holds private keys, is not pinned", dir)
 	}
 }

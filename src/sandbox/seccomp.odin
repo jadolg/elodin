@@ -23,9 +23,10 @@ call is fine with other arguments:
 - `socket` outside AF_INET and AF_INET6 returns EAFNOSUPPORT, and one that is
   neither a stream nor a datagram socket - raw - or names a protocol other than
   TCP or UDP, EPERM.
-- `sched_setscheduler` to any policy but SCHED_OTHER returns EPERM: glibc sets
-  a new thread's on its tid, which a filter cannot tell from another
-  process's pid, so the policy is what is held - SCHED_IDLE would starve one.
+- `sched_setscheduler` to any policy but SCHED_OTHER and the one the process
+  runs under returns EPERM: glibc sets a new thread's on its tid, which a
+  filter cannot tell from another process's pid, so the policy is what is held
+  - SCHED_IDLE would starve one.
 - `kill` and `tgkill` aimed at any process but this one, and `prlimit64` and
   `sched_setaffinity` aimed at anything but the caller, return EPERM.
 - `setsockopt` returns EPERM for any option but those in `SOCKET_OPTIONS`.
@@ -38,7 +39,11 @@ filter_syscalls :: proc() -> linux.Errno {
 		return .ENOSYS
 	} else {
 		program: [PROGRAM_MAX]Sock_Filter
-		n := build_program(program[:], u32(linux.getpid()))
+		policy := linux.syscall(linux.SYS_sched_getscheduler, uintptr(0))
+		if policy < 0 {
+			return linux.Errno(-policy)
+		}
+		n := build_program(program[:], u32(linux.getpid()), u32(policy))
 		if n > len(program) {
 			return .E2BIG
 		}
@@ -190,7 +195,8 @@ PROGRAM_MAX :: 2 * (len(ALLOWED) + len(ALLOWED_ARCH)) + 5 * len(SOCKET_OPTIONS) 
 /*
 Write the filter into `out` and return its length, which is more than
 `len(out)` when it did not fit and nothing past that was written. `pid` is the one process
-`kill` and `tgkill` may name.
+`kill` and `tgkill` may name, and `policy` the scheduling policy the process
+runs under, which glibc gives every thread it starts.
 
 The head refuses a foreign architecture before any number is read: an x86_64
 process can enter the kernel by the i386 table, where 11 is `execve` and not
@@ -198,7 +204,7 @@ process can enter the kernel by the i386 table, where 11 is `execve` and not
 number on the list is one of its calls.
 */
 @(private)
-build_program :: proc(out: []Sock_Filter, pid: u32) -> int {
+build_program :: proc(out: []Sock_Filter, pid: u32, policy: u32) -> int {
 	n := 0
 	// Past the end, counted and not written: the caller refuses a program
 	// longer than `out`.
@@ -275,9 +281,10 @@ build_program :: proc(out: []Sock_Filter, pid: u32) -> int {
 		ret(out, &n, RET_ALLOW)
 	}
 
-	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_sched_setscheduler), jf = 4)
+	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_sched_setscheduler), jf = 5)
 	emit(out, &n, BPF_LD_W_ABS, DATA_ARG1_LOW)
-	emit(out, &n, BPF_JEQ_K, SCHED_OTHER, jt = 1)
+	emit(out, &n, BPF_JEQ_K, SCHED_OTHER, jt = 2)
+	emit(out, &n, BPF_JEQ_K, policy, jt = 1)
 	ret(out, &n, errno(.EPERM))
 	ret(out, &n, RET_ALLOW)
 
@@ -411,6 +418,8 @@ when ODIN_ARCH == .amd64 {
 		linux.SYS_rename,
 		linux.SYS_mkdir,
 		linux.SYS_unlink,
+		// `os.remove` of a directory, a stray one in the cache.
+		linux.SYS_rmdir,
 	}
 } else when ODIN_ARCH == .arm64 {
 	@(private)

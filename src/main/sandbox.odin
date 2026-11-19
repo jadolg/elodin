@@ -247,7 +247,7 @@ secrets, its TLS private keys among them (`/etc/ssl/private`,
 (`grant_dir`), and named at startup.
 */
 @(private)
-PINNED_DIRS :: [?]string{"/", "/etc", "/etc/ssl", "/etc/pki", "/etc/pki/tls"}
+PINNED_DIRS :: [?]string{"/", "/etc", "/etc/ssl", "/etc/ssl/private", "/etc/pki", "/etc/pki/tls", "/etc/pki/tls/private"}
 
 @(private)
 is_pinned :: proc(dir: string) -> bool {
