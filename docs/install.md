@@ -305,12 +305,12 @@ server:
 | Mode | What it applies |
 |---|---|
 | `off` | nothing |
-| `basic` | `no_new_privs`, and [Landlock](https://docs.kernel.org/userspace-api/landlock.html) on writes: the process can create, write and remove files only in `blocking.cache_dir` (with blocking on, or when the directory exists at startup), and create and write them only there and in the directory `log.file` is in (and the one it resolves to). Nothing can be executed. Reads are not confined. On Landlock ABI 6 kernels it also cannot signal another process or connect to an abstract unix socket outside itself |
+| `basic` | `no_new_privs`, and [Landlock](https://docs.kernel.org/userspace-api/landlock.html) on writes: the process can create, write and remove files only in `blocking.cache_dir` (with blocking on, or when the directory exists at startup), and create and write them only there and in the directory `log.file` is in (and the one it resolves to; nothing for a character device such as `/dev/stdout`, which is written through the descriptor already open). Nothing can be executed. Reads are not confined. On Landlock ABI 6 kernels it also cannot signal another process or connect to an abstract unix socket outside itself |
 | `strict` | `basic`, with Landlock on reads too, and a seccomp allowlist of system calls installed after the privilege drop |
 
 Both layers are set before the event loops start, so every thread has them,
 and they last for the life of the process: `server.sandbox` takes a restart,
-and so does `log.file` while it is on.
+and so does moving `log.file` to another directory while Landlock is in force.
 
 Landlock needs Linux 5.13 or later with `landlock` among the kernel's `lsm=`
 modules, and a container runtime that allows its system calls. Without it
@@ -332,11 +332,17 @@ ts=2026-11-19T08:59:48Z level=info msg=sandbox mode=strict no_new_privs=true lan
 Under `strict`, reading is confined to these:
 
 - the directories of the configuration file, the DoT and DoH `cert_file` and
-  `key_file`, and `file:` lists, and, when one is a symlink, the directory of
-  what it points to;
+  `key_file`, and every `file:` list (enabled or not, and with blocking off
+  too), and, when one is a symlink, the directory of what it points to. A file
+  directly in `/` is granted alone rather than through its directory;
 - `blocking.cache_dir`;
-- OpenSSL's trust store (its bundle file's directory and its certificate
-  directory, or what `SSL_CERT_FILE` and `SSL_CERT_DIR` name);
+- the directories of `/etc/resolv.conf` and `/etc/hosts` (and of what they
+  point to), which a list download reads when `upstream.bootstrap` does not
+  answer for its host. That is `/etc` on most systems;
+- OpenSSL's trust store: its bundle file's directory, its certificate
+  directory, and every directory that directory's entries point into
+  (`/usr/share/ca-certificates/mozilla` on Debian and Ubuntu), or what
+  `SSL_CERT_FILE` and `SSL_CERT_DIR` name;
 - `/proc` and `/sys/fs/cgroup`, which the metrics and the sizing read. Both are
   granted whole: procfs makes a new inode each time it looks up an entry it
   had let go of, so a rule on `/proc/<pid>` would stop matching. Only the
@@ -398,7 +404,7 @@ rules in effect` when turned off), or keep the rules in effect;
 
 | section | on reload |
 |---|---|
-| `log`, `rewrites`, `special_use`, `rebind` | applied from the next query; `log.file` takes a restart under `server.sandbox` |
+| `log`, `rewrites`, `special_use`, `rebind` | applied from the next query; `log.file` moved to another directory takes a restart while Landlock is in force ([Sandbox](#sandbox)) |
 | `server.allow_from`, `max_pending`, `max_udp_response`, `client_timeout` | applied from the next query or read |
 | `server.rate_limit` | a change rebuilds the limiter, so every prefix starts again from a full budget |
 | `upstream`, `cookies.upstream` | a change rebuilds every group and route: new connections, new upstream cookies |

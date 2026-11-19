@@ -39,11 +39,11 @@ the next root start at any file, or hang it. Name the real path (`/run/...`, not
 `/var/run/...`). On kernels before 5.6, or under a seccomp profile that does not
 allow `openat2`, only a symlink at the file itself is refused.
 
-Under `server.sandbox` (`basic` by default), the file is reopened only in the
-directory it was in at startup, and in the directory it resolves to where that
-is elsewhere: those are the only places Landlock lets the process create a
-file ([Sandbox](install.md#sandbox)). A changed `log.file` therefore takes a
-restart there, and a reload names it in a warning.
+Under `server.sandbox` (`basic` by default) with Landlock in force, the file is
+reopened only in the directory it was in at startup, and in the directory it
+resolves to where that is elsewhere: those are the only places the process may
+create a file ([Sandbox](install.md#sandbox)). Moving `log.file` to another
+directory therefore takes a restart there, and a reload names it in a warning.
 
 With `log.file` set, each line is one write to the file, not followed by a
 sync: `tail` and a shipper see it at once and a killed process loses none of

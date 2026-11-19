@@ -1039,7 +1039,7 @@ warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
 	if logx.writing_to_file() && !privdrop.can_reopen(cfg.log.file, true) {
 		warn(cfg, "log.file", cfg.log.file, "a SIGHUP will keep logging to the file already open, renamed or not")
 	}
-	for f in reread_files(cfg, config_path, context.temp_allocator) {
+	for f in reread_files(cfg, config_path, context.temp_allocator, in_use_only = true) {
 		if !privdrop.can_reopen(f.path, false) {
 			warn(cfg, f.setting, f.path, f.consequence)
 		}
@@ -1056,11 +1056,12 @@ Reread :: struct {
 /*
 Every file that is read again after startup, by name: the configuration, the
 DoT and DoH certificates and keys of the listeners in use, and the `file:`
-lists in use with blocking on. Both `warn_out_of_reach` and `sandbox_plan` go
+lists - with `in_use_only`, the enabled ones with blocking on; without, every
+one, which a reload may turn on. Both `warn_out_of_reach` and `sandbox_plan` go
 by it, so a file one checks is a file the other grants.
 */
 @(private)
-reread_files :: proc(cfg: ^config.Config, config_path: string, allocator := context.allocator) -> []Reread {
+reread_files :: proc(cfg: ^config.Config, config_path: string, allocator := context.allocator, in_use_only: bool) -> []Reread {
 	out := make([dynamic]Reread, allocator)
 	append(&out, Reread{"configuration", config_path, "a SIGHUP will not reload the configuration"})
 	tls := [?]struct {
@@ -1075,10 +1076,10 @@ reread_files :: proc(cfg: ^config.Config, config_path: string, allocator := cont
 		append(&out, Reread{fmt.aprintf("listeners.%s.cert_file", l.name, allocator = allocator), l.ln.cert_file, keep})
 		append(&out, Reread{fmt.aprintf("listeners.%s.key_file", l.name, allocator = allocator), l.ln.key_file, keep})
 	}
-	if cfg.blocking.enabled {
+	if cfg.blocking.enabled || !in_use_only {
 		for set in ([?][]config.Block_List{cfg.blocking.lists, cfg.blocking.allow_lists}) {
 			for list in set {
-				if list.enabled && list.file != "" {
+				if (list.enabled || !in_use_only) && list.file != "" {
 					setting := fmt.aprintf("list %s", list.name, allocator = allocator)
 					append(&out, Reread{setting, list.file, "the next refresh or SIGHUP will drop the rules built from it"})
 				}

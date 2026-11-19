@@ -2,6 +2,7 @@ package main
 
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 import "core:strings"
 import "core:sys/posix"
 import "elodin:config"
@@ -47,6 +48,7 @@ confine_process :: proc(cfg: ^config.Config, config_path: string) -> (landlock_a
 	case .Off:
 	case .Applied:
 		landlock_abi = report.abi
+		cfg.server.landlock = true
 	case .Unavailable:
 		logx.warnf(
 			"server.sandbox: Landlock is unavailable (%s), so %s not confined; it needs Linux 5.13 with landlock among the lsm= modules, and a container runtime that allows its system calls",
@@ -97,16 +99,19 @@ What the configuration in `cfg` needs from the filesystem once it is serving;
 `log_file` is the log file in use, "" for stderr.
 
 Writes: the blocklist cache, when blocking is on or the directory is there for
-a reload that turns it on, and the directory of the log file in use, which a
-SIGHUP reopens by name. Reads, which only `.Strict` confines: the directory of
-every file in `reread_files` and of OpenSSL's default trust store. Where a path
-is a symlink, the directory of what it points to as well, because Landlock
-judges the file reached, not the name. A directory rather than the file:
-certbot renews by pointing the symlink at a new file beside the old one. Then
-`/proc` and `/sys/fs/cgroup`, which the metrics and the sizing read, whole:
-procfs makes a new inode at every lookup of an entry the kernel has let go of,
-which a rule on `/proc/<pid>` would no longer match, and only a mount's root
-stays.
+a reload that turns it on, and where the log file is, which a SIGHUP reopens by
+name - nothing for a character device such as `/dev/stdout`, which is written
+through the descriptor already open and would otherwise grant all of `/dev`.
+Reads, which only `.Strict` confines: where every file in `reread_files` is,
+listed or not and with blocking on or not, as a reload may turn either on; the
+system resolver's `/etc/resolv.conf` and `/etc/hosts`, which a list download
+falls back to; OpenSSL's default trust store, with the directories its hashed
+entries point into; `/proc` and `/sys/fs/cgroup`, which the metrics and the
+sizing read. See `add_dirs_of` for what "where a file is" grants.
+
+`/proc` and `/sys/fs/cgroup` are granted whole: procfs makes a new inode at
+every lookup of an entry the kernel has let go of, which a rule on
+`/proc/<pid>` would no longer match, and only a mount's root stays.
 */
 @(private)
 sandbox_plan :: proc(cfg: ^config.Config, config_path, log_file: string, allocator := context.allocator) -> sandbox.Plan {
@@ -116,12 +121,9 @@ sandbox_plan :: proc(cfg: ^config.Config, config_path, log_file: string, allocat
 	if cache := cfg.blocking.cache_dir; cache != "" && (cfg.blocking.enabled || os.exists(cache)) {
 		plan.cache_dir = cache
 	}
-	if log_file != "" {
+	if log_file != "" && !is_character_device(log_file) {
 		log_dirs := make([dynamic]string, allocator)
-		add_with_target(&log_dirs, filepath.dir(log_file), allocator)
-		if target, ok := resolve(log_file, allocator); ok && filepath.dir(target) != filepath.dir(log_file) {
-			append(&log_dirs, filepath.dir(target))
-		}
+		add_dirs_of(&log_dirs, log_file, allocator)
 		plan.log_dirs = log_dirs[:]
 	}
 	if plan.mode != .Strict {
@@ -129,21 +131,17 @@ sandbox_plan :: proc(cfg: ^config.Config, config_path, log_file: string, allocat
 	}
 
 	readable := make([dynamic]string, allocator)
-	files := make([dynamic]string, context.temp_allocator)
-	for f in reread_files(cfg, config_path, context.temp_allocator) {
-		append(&files, f.path)
+	for f in reread_files(cfg, config_path, context.temp_allocator, in_use_only = false) {
+		add_dirs_of(&readable, f.path, allocator)
+	}
+	for path in RESOLVER_FILES {
+		add_dirs_of(&readable, path, allocator)
 	}
 	ca := tlsx.default_ca_locations(context.temp_allocator)
 	// The bundle is a file; the rest are directories of certificates.
-	append(&files, ca[0])
-	for path in files {
-		add_with_target(&readable, filepath.dir(path), allocator)
-		if target, ok := resolve(path, allocator); ok {
-			append(&readable, filepath.dir(target))
-		}
-	}
+	add_dirs_of(&readable, ca[0], allocator)
 	for dir in ca[1:] {
-		add_with_target(&readable, strings.clone(dir, allocator), allocator)
+		add_cert_dir(&readable, dir, allocator)
 	}
 	for path in MOUNT_READS {
 		append(&readable, path)
@@ -156,13 +154,66 @@ sandbox_plan :: proc(cfg: ^config.Config, config_path, log_file: string, allocat
 @(private)
 MOUNT_READS :: [?]string{"/proc", "/sys/fs/cgroup"}
 
-// Append `path`, and where it resolves elsewhere, what it resolves to.
+// What `netx.resolve` reads, for a list download nothing bootstraps.
 @(private)
-add_with_target :: proc(out: ^[dynamic]string, path: string, allocator := context.allocator) {
-	append(out, path)
-	if target, ok := resolve(path, allocator); ok && target != path {
-		append(out, target)
+RESOLVER_FILES :: [?]string{"/etc/resolv.conf", "/etc/hosts"}
+
+/*
+Append where `file` is: its directory, and, where that or the file is reached
+through a symlink, the directory it resolves to - Landlock judges the file
+reached, not the name, and a directory rather than the file outlives a
+renewal that re-points the link, as certbot's does. A file directly in `/` is
+granted alone, since its directory would be everything.
+*/
+@(private)
+add_dirs_of :: proc(out: ^[dynamic]string, file: string, allocator := context.allocator) {
+	add :: proc(out: ^[dynamic]string, dir, file: string) {
+		path := file if dir == "/" else dir
+		if !slice.contains(out[:], path) {
+			append(out, path)
+		}
 	}
+	add(out, filepath.dir(file), file)
+	if dir, ok := resolve(filepath.dir(file), allocator); ok {
+		add(out, dir, file)
+	}
+	if target, ok := resolve(file, allocator); ok {
+		add(out, filepath.dir(target), target)
+	}
+}
+
+/*
+Append a directory of hashed certificates and every directory its entries
+resolve into. On Debian and Ubuntu each `/etc/ssl/certs/<hash>.0` leads to
+`/usr/share/ca-certificates/mozilla`, and a build whose bundle file is absent -
+the static one on those systems - verifies through those links alone.
+*/
+@(private)
+add_cert_dir :: proc(out: ^[dynamic]string, dir: string, allocator := context.allocator) {
+	for d in ([2]string{dir, resolve(dir, allocator) or_else dir}) {
+		if !slice.contains(out[:], d) {
+			append(out, d)
+		}
+	}
+	entries, err := os.read_directory_by_path(dir, -1, context.temp_allocator)
+	if err != nil {
+		return
+	}
+	for e in entries {
+		if target, ok := resolve(e.fullpath, allocator); ok {
+			if d := filepath.dir(target); !slice.contains(out[:], d) {
+				append(out, d)
+			}
+		}
+	}
+}
+
+// Whether `path` is, or leads to, a character device.
+@(private)
+is_character_device :: proc(path: string) -> bool {
+	st: posix.stat_t
+	cpath := strings.clone_to_cstring(path, context.temp_allocator)
+	return posix.stat(cpath, &st) == .OK && posix.S_ISCHR(st.st_mode)
 }
 
 // `path` with every symlink in it followed, or false when it does not resolve.

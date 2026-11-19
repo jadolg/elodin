@@ -115,3 +115,63 @@ test_the_strict_plan_reads_targets_and_mounts :: proc(t: ^testing.T) {
 	plan = sandbox_plan(&cfg, tree.link, "", context.temp_allocator)
 	testing.expectf(t, len(plan.readable) == 0, "basic lists reads: %v", plan.readable)
 }
+
+// A file directly in `/` is granted alone: its directory would be every path.
+@(test)
+test_the_plan_never_grants_the_root :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.server.sandbox = .Strict
+	plan := sandbox_plan(&cfg, "/elodin.yaml", "/elodin.log", context.temp_allocator)
+	testing.expectf(t, slice.contains(plan.readable, "/elodin.yaml"), "%v lacks the file itself", plan.readable)
+	testing.expectf(t, !slice.contains(plan.readable, "/"), "%v grants every read", plan.readable)
+	testing.expectf(t, slice.equal(plan.log_dirs, []string{"/elodin.log"}), "log grants %v, want the file alone", plan.log_dirs)
+}
+
+// A log on a character device is written through the descriptor already open,
+// and its directory is all of /dev.
+@(test)
+test_the_plan_grants_nothing_for_a_device_log :: proc(t: ^testing.T) {
+	if !testing.expect(t, is_character_device("/dev/null"), "/dev/null is not a character device here") {
+		return
+	}
+	cfg := config.default_config()
+	cfg.server.sandbox = .Basic
+	plan := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", "/dev/null", context.temp_allocator)
+	testing.expectf(t, len(plan.log_dirs) == 0, "a device log grants %v", plan.log_dirs)
+}
+
+/*
+Under strict: every `file:` list, disabled or with blocking off, since a reload
+may turn it on; the resolver's files; and the directories a hashed certificate
+directory's entries lead into.
+*/
+@(test)
+test_the_strict_plan_reads_lists_resolver_and_cert_targets :: proc(t: ^testing.T) {
+	tree, ok := make_tree(t)
+	defer remove_tree(t, tree)
+	if !ok {
+		return
+	}
+	cfg := config.default_config()
+	cfg.server.sandbox = .Strict
+	cfg.blocking.enabled = false
+	cfg.blocking.lists = []config.Block_List{{name = "off", file = tree.real_file, enabled = false}}
+	plan := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", "", context.temp_allocator)
+	testing.expectf(t, slice.contains(plan.readable, tree.real_dir), "%v lacks a disabled list's directory", plan.readable)
+	testing.expectf(t, slice.contains(plan.readable, "/etc"), "%v lacks the resolver's directory", plan.readable)
+
+	// A hashed entry in a certificate directory that leads elsewhere.
+	certs := strings.concatenate({tree.dir, "/certs"}, context.temp_allocator)
+	if err := os.make_directory(certs); !testing.expectf(t, err == nil, "cannot make %s: %v", certs, err) {
+		return
+	}
+	hashed := strings.concatenate({certs, "/0000abcd.0"}, context.temp_allocator)
+	if err := os.symlink(tree.real_file, hashed); !testing.expectf(t, err == nil, "cannot link %s: %v", hashed, err) {
+		return
+	}
+	readable := make([dynamic]string, context.temp_allocator)
+	add_cert_dir(&readable, certs, context.temp_allocator)
+	testing.expectf(t, slice.contains(readable[:], certs), "%v lacks the directory itself", readable)
+	testing.expectf(t, slice.contains(readable[:], tree.real_dir), "%v lacks where its entries lead", readable)
+	testing.expectf(t, !slice.contains(readable[:], tree.dir), "%v grants the directory's parent", readable)
+}

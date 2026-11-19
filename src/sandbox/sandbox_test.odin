@@ -192,6 +192,33 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 	}
 }
 
+// A loop thread pins itself with `sched_setaffinity(0, ...)` when
+// `server.pin_loops` is on, and may not have run yet when the filter goes on;
+// another process is not its to move.
+@(test)
+test_the_filter_lets_a_thread_pin_itself_and_no_other :: proc(t: ^testing.T) {
+	body :: proc() -> u8 {
+		mask: [16]u64
+		if linux.syscall(linux.SYS_sched_getaffinity, uintptr(0), uintptr(size_of(mask)), &mask) < 0 {
+			return 4
+		}
+		if !install_filter() {
+			return 1
+		}
+		failed: u8
+		if linux.syscall(linux.SYS_sched_setaffinity, uintptr(0), uintptr(size_of(mask)), &mask) != 0 {
+			failed |= 1 << 1
+		}
+		if errno_of(linux.syscall(linux.SYS_sched_setaffinity, uintptr(1), uintptr(size_of(mask)), &mask)) != .EPERM {
+			failed |= 1 << 2
+		}
+		return failed
+	}
+	if out, ok := run_child(t, body); ok {
+		expect_passed(t, out)
+	}
+}
+
 // A call off the list ends the process, and the kill reaches it as SIGSYS.
 @(test)
 test_a_call_off_the_list_kills_the_process :: proc(t: ^testing.T) {

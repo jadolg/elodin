@@ -520,12 +520,17 @@ with_sandbox :: proc(config, mode: string, allocator := context.temp_allocator) 
 			sep := "" if strings.has_prefix(inner, "}") else ","
 			lines[i] = fmt.aprintf("server: {{ sandbox: %s%s %s", mode, sep, inner, allocator = context.temp_allocator)
 		} else {
+			// The siblings' indent, from the first line that has content.
 			indent := "  "
-			if i + 1 < len(lines) {
-				next := lines[i + 1]
-				if width := len(next) - len(strings.trim_left(next, " ")); width > 0 {
+			for next in lines[i + 1:] {
+				body := strings.trim_left(next, " ")
+				if body == "" || strings.has_prefix(body, "#") {
+					continue
+				}
+				if width := len(next) - len(body); width > 0 {
 					indent = next[:width]
 				}
+				break
 			}
 			lines[i] = fmt.aprintf("server:\n%ssandbox: %s", indent, mode, allocator = context.temp_allocator)
 		}
