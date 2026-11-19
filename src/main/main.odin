@@ -811,6 +811,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	that waits on the network runs on them - see `loop` - and each takes one UDP
 	reader. Started before anything that could spawn on one.
 	*/
+	confine_process(cfg, opts.config_path)
 	loops, loop_threads := start_loops(cfg.listeners.udp.readers, cfg.server.pin_loops)
 
 	filters := filter.engine_make()
@@ -936,6 +937,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	}
 
 	drop_privileges(cfg, service, opts.config_path)
+	filter_process(cfg)
 
 	logx.eventf(
 		.Info,

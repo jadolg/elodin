@@ -5,6 +5,7 @@ import "core:c/libc"
 import "core:fmt"
 import "core:mem"
 import "core:net"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:sys/linux"
@@ -375,6 +376,30 @@ install_alpn :: proc(ptr: ^SSL_CTX, protocols: []string) -> Error {
 	}
 	SSL_CTX_set_alpn_select_cb(ptr, alpn_select, raw)
 	return .None
+}
+
+/*
+Where `client_context` reads the system trust store from: OpenSSL's built-in
+bundle file and certificate directory, or what `SSL_CERT_FILE` and
+`SSL_CERT_DIR` name instead. The directory variable is a colon-separated list,
+returned split. The slice, and what is read from the environment, are allocated
+with `allocator`.
+*/
+default_ca_locations :: proc(allocator := context.allocator) -> []string {
+	out := make([dynamic]string, allocator)
+	file := os.get_env(string(X509_get_default_cert_file_env()), allocator)
+	append(&out, file if file != "" else string(X509_get_default_cert_file()))
+	dirs := os.get_env(string(X509_get_default_cert_dir_env()), allocator)
+	if dirs == "" {
+		append(&out, string(X509_get_default_cert_dir()))
+	} else {
+		for dir in strings.split_iterator(&dirs, ":") {
+			if dir != "" {
+				append(&out, dir)
+			}
+		}
+	}
+	return out[:]
 }
 
 /*

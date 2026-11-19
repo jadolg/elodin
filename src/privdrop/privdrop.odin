@@ -13,7 +13,8 @@ which catches one class of that surface's bugs and no others.
 systemd binds the port through `AmbientCapabilities` and runs the process under
 `DynamicUser`. This package is for every other way of starting it — a bare
 `sudo elodin`, a container, an init system without that machinery — where the
-process has to put the privilege down itself.
+process has to put the privilege down itself. What the account may do once it
+is that account is narrowed further by `sandbox`.
 */
 package privdrop
 

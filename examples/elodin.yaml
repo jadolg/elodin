@@ -58,6 +58,14 @@ server:
   #
   user: ""
   group: ""
+  # How far the process narrows itself once it serves, root or not. basic: no
+  # new privileges, and (Linux 5.13+ with Landlock) files can be written only in
+  # blocking.cache_dir and the log's directory. strict: basic, reads confined to
+  # the files the configuration names, and a system-call allowlist that kills
+  # the process on anything else; a reload cannot reach a file in a directory
+  # it did not name at startup. off: neither. Takes a restart. See
+  # docs/install.md#sandbox.
+  sandbox: basic
 
   # Networks a query is accepted from. Anything else is dropped over UDP and
   # has its connection closed over TCP, DoT and DoH — before the message is

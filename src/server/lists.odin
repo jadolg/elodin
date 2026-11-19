@@ -574,9 +574,9 @@ warn_cache_unwritable :: proc(cfg: ^config.Config, cache_path: string, err: os.E
 	)
 }
 
-@(private)
+// Create `path` and every directory above it that is missing; an existing
+// directory is not an error, and nothing is reported.
 make_directories :: proc(path: string) {
-	// Create each component in turn; an existing directory is not an error.
 	if path == "" || path == "/" {
 		return
 	}

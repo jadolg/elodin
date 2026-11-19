@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
+import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
@@ -50,6 +51,8 @@ Runner :: struct {
 	// The binary is the static build, musl and its own OpenSSL linked in; read
 	// once from its `--version` (see `binary_is_static`).
 	static:    bool,
+	// The binary is built with AddressSanitizer (`binary_has_asan`).
+	asan:      bool,
 }
 
 /*
@@ -496,6 +499,57 @@ without_dnssec :: proc(config: string, allocator := context.temp_allocator) -> s
 	return strings.concatenate({config, "\ndnssec:\n  enabled: false\n"}, allocator)
 }
 
+/*
+Run the case under `server.sandbox: mode` unless it names a mode itself: the
+suite is how the syscall allowlist and the Landlock rules are known to cover
+every path the server takes (#417). Added to the `server:` section the case
+wrote, in the block or flow style it wrote it in, or as a section of its own.
+*/
+with_sandbox :: proc(config, mode: string, allocator := context.temp_allocator) -> string {
+	if strings.contains(config, "sandbox:") {
+		return config
+	}
+	lines := strings.split_lines(config, context.temp_allocator)
+	for line, i in lines {
+		if !strings.has_prefix(line, "server:") {
+			continue
+		}
+		rest := strings.trim_space(line[len("server:"):])
+		if strings.has_prefix(rest, "{") {
+			inner := strings.trim_space(rest[1:])
+			sep := "" if strings.has_prefix(inner, "}") else ","
+			lines[i] = fmt.aprintf("server: {{ sandbox: %s%s %s", mode, sep, inner, allocator = context.temp_allocator)
+		} else {
+			indent := "  "
+			if i + 1 < len(lines) {
+				next := lines[i + 1]
+				if width := len(next) - len(strings.trim_left(next, " ")); width > 0 {
+					indent = next[:width]
+				}
+			}
+			lines[i] = fmt.aprintf("server:\n%ssandbox: %s", indent, mode, allocator = context.temp_allocator)
+		}
+		return strings.join(lines, "\n", allocator)
+	}
+	return fmt.aprintf("%s\nserver:\n  sandbox: %s\n", config, mode, allocator = allocator)
+}
+
+// What the suite writes for `config`, at a start and at every reload alike, so a
+// reload changes only what the case changed.
+@(private = "file")
+as_written :: proc(r: ^Runner, config: string, verbatim: bool) -> string {
+	return config if verbatim else with_sandbox(without_dnssec(config), suite_sandbox(r))
+}
+
+/*
+The mode every case runs under unless it names one: `strict`, except for a
+binary built with AddressSanitizer, whose LeakSanitizer stops the process with
+`ptrace` at exit and runs a symbolizer, neither of which the allowlist has.
+*/
+suite_sandbox :: proc(r: ^Runner) -> string {
+	return "basic" if r.asan else "strict"
+}
+
 // Start the process without probing it. Callers that cannot use the UDP probe
 // establish readiness themselves.
 start_server_raw :: proc(
@@ -519,7 +573,7 @@ start_server_raw :: proc(
 	cfg_path := config_path(r, udp_port)
 	log_path := filepath.join({r.work_dir, fmt.tprintf("elodin-%d.log", udp_port)}, context.temp_allocator) or_else ""
 
-	written := config if verbatim else without_dnssec(config)
+	written := as_written(r, config, verbatim)
 	if werr := os.write_entire_file(cfg_path, transmute([]u8)written); werr != nil {
 		fail(r, "cannot write the config to %s: %v", cfg_path, werr)
 		return {}, false
@@ -795,7 +849,7 @@ is over.
 */
 reload_to :: proc(r: ^Runner, srv: ^Server, config: string, needle: string, timeout := 5 * time.Second) -> bool {
 	before := log_count(srv, needle)
-	written := config if srv.verbatim else without_dnssec(config)
+	written := as_written(r, config, srv.verbatim)
 	if !write_fixture(r, config_path(r, srv.udp_port), transmute([]u8)written) {
 		return false
 	}
@@ -848,6 +902,14 @@ task_ids :: proc(pid: int, allocator := context.temp_allocator) -> (ids: []strin
 			append(&found, strings.clone(name, allocator))
 		}
 	}
+}
+
+// One numeric field of /proc/<pid>/`file`, such as `VmRSS` in KiB or `Threads`
+// from `status`, or `AnonHugePages` (KiB, summed over the mappings by the kernel)
+// from `smaps_rollup`.
+proc_status_int :: proc(pid: int, field: string, file := "status") -> (n: int, ok: bool) {
+	value := proc_status_field(fmt.tprintf("/proc/%d/%s", pid, file), field) or_return
+	return strconv.parse_int(strings.trim_space(strings.trim_suffix(value, "kB")))
 }
 
 // One field of a /proc status file, such as `VmRSS` or `SigBlk`, trimmed; not
@@ -1262,19 +1324,19 @@ built_with_asan :: proc(
 	name: string,
 	reason := "the binary is built with AddressSanitizer, whose allocator is not glibc's",
 ) -> bool {
-	// Heap: the temp allocator is not reset until the next case ends, and a
-	// skip from here ends none.
-	exe, xerr := os.read_entire_file(r.binary, context.allocator)
-	if xerr != nil {
-		fail(r, "%s: cannot read %s: %v", name, r.binary, xerr)
-		return true
-	}
-	asan := strings.contains(string(exe), "__asan_init")
-	delete(exe)
-	if asan {
+	if r.asan {
 		skip_case(r, name, reason)
 	}
-	return asan
+	return r.asan
+}
+
+// Whether the binary at `path` carries AddressSanitizer's runtime.
+binary_has_asan :: proc(path: string) -> (asan: bool, err: os.Error) {
+	// Heap: the binary is megabytes, and the temp allocator lives to the end of
+	// a case.
+	exe := os.read_entire_file(path, context.allocator) or_return
+	defer delete(exe)
+	return strings.contains(string(exe), "__asan_init"), nil
 }
 
 /*

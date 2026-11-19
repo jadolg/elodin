@@ -363,6 +363,7 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 		"pin_loops",
 		"user",
 		"group",
+		"sandbox",
 		"allow_from",
 		"identity",
 		"rate_limit",
@@ -393,6 +394,18 @@ load_server :: proc(l: ^Loader, cfg: ^Config) {
 	}
 	opt_string(l, n, "user", &cfg.server.user, "server")
 	opt_string(l, n, "group", &cfg.server.group, "server")
+	if s: string; opt_string(l, n, "sandbox", &s, "server") {
+		switch dns.name_fold(s, l.allocator) {
+		case "off":
+			cfg.server.sandbox = .Off
+		case "basic":
+			cfg.server.sandbox = .Basic
+		case "strict":
+			cfg.server.sandbox = .Strict
+		case:
+			errorf(l, "server.sandbox: unknown mode %q (want off, basic or strict)", s)
+		}
+	}
 	load_allow_from(l, n, cfg)
 	load_identity(l, n, cfg)
 

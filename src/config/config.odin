@@ -4,6 +4,7 @@ import "core:encoding/hex"
 import "core:time"
 import "elodin:cache"
 import "elodin:logx"
+import "elodin:sandbox"
 
 // The logger's own levels, so `log.level` is handed to it as read.
 Log_Level :: logx.Level
@@ -695,6 +696,12 @@ Server_Config :: struct {
 	// Group to go with `user`. Empty takes the user's primary group.
 	group:                      string,
 	/*
+	How far the process narrows itself before it serves: `.Basic` by default.
+	See `sandbox.Mode` and the Sandbox section of `docs/install.md`. Set once,
+	at startup.
+	*/
+	sandbox:                    sandbox.Mode,
+	/*
 	Networks a query is accepted from, in CIDR form. See `acl.odin`.
 
 	Defaults to the local networks, so an installation nobody has configured
@@ -1159,6 +1166,7 @@ default_config :: proc() -> Config {
 	}
 	c.server = Server_Config {
 		client_timeout             = 10 * time.Second,
+		sandbox                    = .Basic,
 		max_connections            = DEFAULT_MAX_CONNECTIONS,
 		// Zero, and worked out from `max_connections` at load: an operator who
 		// raises the table expects one client's share to move with it, and a

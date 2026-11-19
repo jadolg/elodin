@@ -163,6 +163,15 @@ main :: proc() {
 		os.exit(2)
 	}
 	r.static = static
+	asan, aerr := binary_has_asan(r.binary)
+	if aerr != nil {
+		fmt.eprintfln("itest: cannot read %s: %v", r.binary, aerr)
+		if !keep {
+			remove_work_dir(work_dir)
+		}
+		os.exit(2)
+	}
+	r.asan = asan
 
 	cert, key, cert_ok := ensure_certificate(work_dir)
 	r.cert_file = cert
@@ -171,6 +180,7 @@ main :: proc() {
 	fmt.printfln("elodin integration tests")
 	fmt.printfln("  binary:    %s", r.binary)
 	fmt.printfln("  static:    %v", r.static)
+	fmt.printfln("  sandbox:   %s", suite_sandbox(&r))
 	fmt.printfln("  work dir:  %s", work_dir)
 	fmt.printfln("  ports:     %d-%d", base_port, r.port_limit - 1)
 	if !cert_ok {
@@ -215,6 +225,9 @@ main :: proc() {
 	section(&r, "command line")
 	run_cli_cases(&r)
 	run_shutdown_cases(&r)
+
+	section(&r, "sandbox")
+	run_sandbox_cases(&r)
 
 	section(&r, "log format")
 	run_logfmt_cases(&r)
