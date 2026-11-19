@@ -702,12 +702,6 @@ Server_Config :: struct {
 	*/
 	sandbox:                    sandbox.Mode,
 	/*
-	Whether Landlock rules are in force. Not a key: set at startup once
-	`sandbox.confine` has applied them, and carried from the starting
-	configuration by every reload, which holds what they would refuse.
-	*/
-	landlock:                   bool,
-	/*
 	Networks a query is accepted from, in CIDR form. See `acl.odin`.
 
 	Defaults to the local networks, so an installation nobody has configured

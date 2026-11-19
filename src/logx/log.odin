@@ -98,10 +98,12 @@ init :: proc(level: Level, path: string = "", owner: Maybe(Owner) = nil) -> os.E
 Open `path` afresh and write to it from here on, or to stderr when `path` is
 empty; what a SIGHUP does to the log.
 
-Opened by name every time, even when the name is the one already in use: that is
+Opened by name whenever the name no longer leads to the file in use: that is
 what logrotate's default `create` arrangement relies on - it renames the file and
 sends the signal, and the process goes on appending to the renamed one until it
-opens the name again.
+opens the name again. A name that still leads to the open file - no rotation
+happened, or it is a device such as `/dev/stdout` - keeps it: there is nothing
+to gain by opening it, and a sandbox may not allow opening it (#417).
 
 Returns the error, leaving the log where it was, when the file cannot be opened -
 most likely because privileges were dropped after the old one was opened as
@@ -109,6 +111,10 @@ root, or a `guarded` refusal (see `init`). Nothing is lost that way, and the
 caller says so through the log that is still working.
 */
 reopen :: proc(path: string) -> os.Error {
+	if path != "" && leads_to_open_file(path) {
+		warn_if_readable(path)
+		return nil
+	}
 	f: ^os.File
 	if path != "" {
 		err: os.Error
@@ -129,6 +135,22 @@ reopen :: proc(path: string) -> os.Error {
 	}
 	warn_if_readable(path)
 	return nil
+}
+
+// Whether `path` leads to the file the log is writing to now.
+@(private)
+leads_to_open_file :: proc(path: string) -> bool {
+	sync.mutex_lock(&state.mu)
+	defer sync.mutex_unlock(&state.mu)
+	if !state.to_file {
+		return false
+	}
+	open, named: linux.Stat
+	cpath := strings.clone_to_cstring(path, context.temp_allocator)
+	if linux.fstat(linux.Fd(os.fd(state.file)), &open) != .NONE || linux.stat(cpath, &named) != .NONE {
+		return false
+	}
+	return open.dev == named.dev && open.ino == named.ino
 }
 
 /*

@@ -20,8 +20,8 @@ call is fine with other arguments:
 - `clone` with a namespace flag returns EPERM: a new user namespace is how an
   unprivileged process reaches kernel code otherwise reserved for root.
 - `socket` outside AF_INET and AF_INET6 returns EAFNOSUPPORT.
-- `kill`, `tgkill`, `prlimit64` and `sched_setaffinity` aimed at any process
-  but this one return EPERM.
+- `kill` and `tgkill` aimed at any process but this one, and `prlimit64` and
+  `sched_setaffinity` aimed at anything but the caller, return EPERM.
 - `setsockopt` returns EPERM for any option but those in `SOCKET_OPTIONS`.
 
 Returns the errno of the `seccomp` call, or ENOSYS on an architecture the
@@ -164,7 +164,7 @@ PROGRAM_MAX :: 2 * (len(ALLOWED) + len(ALLOWED_ARCH)) + 5 * len(SOCKET_OPTIONS) 
 
 /*
 Write the filter into `out` and return its length. `pid` is the one process
-`kill`, `tgkill`, `prlimit64` and `sched_setaffinity` may name.
+`kill` and `tgkill` may name.
 
 The head refuses a foreign architecture before any number is read: an x86_64
 process can enter the kernel by the i386 table, where 11 is `execve` and not
@@ -208,14 +208,23 @@ build_program :: proc(out: []Sock_Filter, pid: u32) -> int {
 	ret(out, &n, errno(.EAFNOSUPPORT))
 	ret(out, &n, RET_ALLOW)
 
-	for nr in ([4]uintptr{linux.SYS_kill, linux.SYS_tgkill, linux.SYS_prlimit64, linux.SYS_sched_setaffinity}) {
-		// 0 is the caller to prlimit64 and sched_setaffinity, the thread a loop
-		// pins; to kill it is the process group.
-		zero_is_self := nr == linux.SYS_prlimit64 || nr == linux.SYS_sched_setaffinity
-		emit(out, &n, BPF_JEQ_K, u32(nr), jf = 5)
+	// kill and tgkill name this process; prlimit64 and sched_setaffinity, the
+	// caller by 0, which is all glibc, musl and `loop.pin_current_thread` pass -
+	// a pid there would be the main thread's, another thread's to move.
+	Target :: struct {
+		nr:    uintptr,
+		value: u32,
+	}
+	targets := [4]Target {
+		{linux.SYS_kill, pid},
+		{linux.SYS_tgkill, pid},
+		{linux.SYS_prlimit64, 0},
+		{linux.SYS_sched_setaffinity, 0},
+	}
+	for target in targets {
+		emit(out, &n, BPF_JEQ_K, u32(target.nr), jf = 4)
 		emit(out, &n, BPF_LD_W_ABS, DATA_ARG0_LOW)
-		emit(out, &n, BPF_JEQ_K, pid, jt = 2)
-		emit(out, &n, BPF_JEQ_K, 0 if zero_is_self else pid, jt = 1)
+		emit(out, &n, BPF_JEQ_K, target.value, jt = 1)
 		ret(out, &n, errno(.EPERM))
 		ret(out, &n, RET_ALLOW)
 	}

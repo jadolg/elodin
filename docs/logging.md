@@ -39,11 +39,15 @@ the next root start at any file, or hang it. Name the real path (`/run/...`, not
 `/var/run/...`). On kernels before 5.6, or under a seccomp profile that does not
 allow `openat2`, only a symlink at the file itself is refused.
 
-Under `server.sandbox` (`basic` by default) with Landlock in force, the file is
-reopened only in the directory it was in at startup, and in the directory it
+A `SIGHUP` opens the name again only when it no longer leads to the file in
+use: after logrotate renamed it, not when nothing moved, and never for a device,
+FIFO or socket such as `/dev/stdout`, which keeps the descriptor it has.
+
+Under `server.sandbox` (`basic` by default) with Landlock in force, a log file
+is made only in the directory it was in at startup, and in the directory it
 resolves to where that is elsewhere: those are the only places the process may
-create a file ([Sandbox](install.md#sandbox)). Moving `log.file` to another
-directory therefore takes a restart there, and a reload names it in a warning.
+create a file ([Sandbox](install.md#sandbox)). Moving `log.file` anywhere else
+takes a restart there, and a reload names it in a warning.
 
 With `log.file` set, each line is one write to the file, not followed by a
 sync: `tail` and a shipper see it at once and a killed process loses none of

@@ -1,10 +1,8 @@
 package itest
 
-import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
-import "core:strings"
 import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
@@ -205,43 +203,6 @@ run_list_refresh_cases :: proc(r: ^Runner) {
 		}
 	}
 	end_case(r)
-}
-
-/*
-A blocking configuration over `lists`, each a `list_entry`, with an upstream at
-`upstream_port` and the cache off. The default `cache_dir` cannot be written, so
-a case that wants the cached copy names one of its own.
-*/
-@(private = "file")
-config_lists :: proc(
-	udp_port, upstream_port: int,
-	lists: []string,
-	cache_dir := "/proc/elodin-cannot-write-here",
-	refresh := "1s",
-	log := "{ level: debug }",
-	extra := "",
-) -> string {
-	return base_config(
-		udp_port,
-		upstream_at(upstream_port),
-		log = log,
-		timeout = "3s",
-		blocking = fmt.tprintf(
-			"{{ enabled: true, response: nxdomain, cache_dir: %q, refresh: %s, lists: [%s] }}",
-			cache_dir,
-			refresh,
-			strings.join(lists, ", ", context.temp_allocator),
-		),
-		extra = extra,
-	)
-}
-
-// One `blocking.lists` entry, fetched from the HTTP mock at `path`; an empty
-// `format` leaves it to be sniffed.
-@(private = "file")
-list_entry :: proc(name: string, http_port: int, path: string, format := "hosts") -> string {
-	entry := fmt.tprintf(`{{ name: %s, url: "http://127.0.0.1:%d%s"`, name, http_port, path)
-	return fmt.tprintf("%s, format: %s }}", entry, format) if format != "" else fmt.tprintf("%s }}", entry)
 }
 
 // The signal cases: one list on the HTTP mock, the shipped log level.

@@ -811,7 +811,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	that waits on the network runs on them - see `loop` - and each takes one UDP
 	reader. Started before anything that could spawn on one.
 	*/
-	landlock_abi := confine_process(cfg, opts.config_path)
+	landlock_abi, log_grants := confine_process(cfg, opts.config_path)
 	loops, loop_threads := start_loops(cfg.listeners.udp.readers, cfg.server.pin_loops)
 
 	filters := filter.engine_make()
@@ -823,6 +823,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		started      = loop.now(),
 		up_since     = loop.moment_now(),
 		running      = true,
+		log_grants   = log_grants,
 	}
 
 	/*

@@ -36,41 +36,6 @@ config_for_reload :: proc(udp_port, dot_port, doh_port: int, cert_file, key_file
 	)
 }
 
-// A self-signed pair naming `name` in both CN and SAN, so a verifying client
-// dialling `name` accepts one and refuses the other.
-@(private = "file")
-generate_named_cert :: proc(cert_path, key_path, name: string) -> bool {
-	process, perr := os.process_start(
-		os.Process_Desc {
-			command = []string {
-				"openssl",
-				"req",
-				"-x509",
-				"-newkey",
-				"ec",
-				"-pkeyopt",
-				"ec_paramgen_curve:prime256v1",
-				"-nodes",
-				"-keyout",
-				key_path,
-				"-out",
-				cert_path,
-				"-days",
-				"2",
-				"-subj",
-				fmt.tprintf("/CN=%s", name),
-				"-addext",
-				fmt.tprintf("subjectAltName=DNS:%s", name),
-			},
-		},
-	)
-	if perr != nil {
-		return false
-	}
-	state, werr := os.process_wait(process)
-	return werr == nil && state.exit_code == 0
-}
-
 // Overwrite `dst` with `src`'s bytes, the way a renewal tool replaces a
 // certificate file in place.
 @(private = "file")
@@ -80,56 +45,6 @@ install_cert :: proc(dst, src: string) -> bool {
 		return false
 	}
 	return os.write_entire_file(dst, data) == nil
-}
-
-// Complete a DoT handshake verifying the peer against `ca_file`, under the
-// name the corresponding certificate was issued for. `false` covers both "no
-// connection" and "the certificate presented was not the one trusted" - the
-// suite only ever needs to tell "the expected certificate is live" from
-// "it is not".
-@(private = "file")
-dot_handshake_verifies :: proc(dot_port: int, ca_file, hostname: string) -> bool {
-	plain, dialled := dial_tcp(dot_port)
-	if !dialled {
-		return false
-	}
-	socket := plain.socket
-	// Closed here only while no session owns it: `tlsx.close` closes it too,
-	// and a second close of the same number can take a descriptor another
-	// thread has opened in between.
-	handshaken := false
-	defer if !handshaken {
-		net.close(socket)
-	}
-
-	ctx, cerr := tlsx.client_context(true, ca_file, nil, context.temp_allocator)
-	if cerr != .None {
-		return false
-	}
-	defer tlsx.context_destroy(ctx)
-
-	conn, terr := tlsx.client_connect(ctx, socket, hostname)
-	if terr != .None {
-		return false
-	}
-	handshaken = true
-	tlsx.close(conn)
-	return true
-}
-
-// Retries the probe rather than sleeping a fixed amount: the reload is
-// noticed on the maintenance loop's 200ms poll, which is fast but not
-// instant, and a fixed sleep would either race it or pad every run.
-@(private = "file")
-wait_for_handshake :: proc(dot_port: int, ca_file, hostname: string, within: time.Duration) -> bool {
-	deadline := time.tick_add(time.tick_now(), within)
-	for time.tick_diff(time.tick_now(), deadline) > 0 {
-		if dot_handshake_verifies(dot_port, ca_file, hostname) {
-			return true
-		}
-		time.sleep(50 * time.Millisecond)
-	}
-	return false
 }
 
 run_reload_cases :: proc(r: ^Runner) {

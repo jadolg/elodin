@@ -75,27 +75,29 @@ no_new_privs :: proc() -> bool {
 	return linux.syscall(linux.SYS_prctl, uintptr(PR_GET_NO_NEW_PRIVS), uintptr(0), uintptr(0), uintptr(0), uintptr(0)) == 1
 }
 
-// No new privileges under every mode but off, which leaves the process as it was.
+// No new privileges under basic and strict; off leaves it as it was, which a
+// run under a sandbox of its own may already have set.
 @(test)
 test_confine_sets_no_new_privs_unless_off :: proc(t: ^testing.T) {
-	for mode in Mode {
-		body: Child
-		switch mode {
-		case .Off:
-			body = proc() -> u8 {
-				before := no_new_privs()
-				_, ok := confine({mode = .Off})
-				return u8(before) | u8(!ok) << 1 | u8(no_new_privs()) << 2
-			}
-		case .Basic, .Strict:
-			body = proc() -> u8 {
-				// Strict and basic set it the same way; the first layer is not
-				// mode-dependent past off.
-				before := no_new_privs()
-				_, ok := confine({mode = .Basic})
-				return u8(before) | u8(!ok) << 1 | u8(!no_new_privs()) << 2
-			}
-		}
+	off :: proc() -> u8 {
+		before := no_new_privs()
+		_, ok := confine({mode = .Off})
+		return u8(!ok) << 1 | u8(no_new_privs() != before) << 2
+	}
+	basic :: proc() -> u8 {
+		_, ok := confine({mode = .Basic})
+		return u8(!ok) << 1 | u8(!no_new_privs()) << 2
+	}
+	strict :: proc() -> u8 {
+		_, ok := confine({mode = .Strict})
+		return u8(!ok) << 1 | u8(!no_new_privs()) << 2
+	}
+	bodies := [Mode]Child {
+		.Off    = off,
+		.Basic  = basic,
+		.Strict = strict,
+	}
+	for body, mode in bodies {
 		if out, ok := run_child(t, body); ok {
 			testing.expectf(t, out.exited && out.status == 0, "%v: killed by %v, failed checks %b", mode, out.signal, out.status)
 		}
@@ -182,7 +184,8 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 		}
 		limit: [2]u64
 		if linux.syscall(linux.SYS_prlimit64, uintptr(0), uintptr(RLIMIT_NOFILE), uintptr(0), &limit) != 0 ||
-		   errno_of(linux.syscall(linux.SYS_prlimit64, uintptr(1), uintptr(RLIMIT_NOFILE), uintptr(0), &limit)) != .EPERM {
+		   errno_of(linux.syscall(linux.SYS_prlimit64, uintptr(1), uintptr(RLIMIT_NOFILE), uintptr(0), &limit)) != .EPERM ||
+		   errno_of(linux.syscall(linux.SYS_prlimit64, self, uintptr(RLIMIT_NOFILE), uintptr(0), &limit)) != .EPERM {
 			failed |= 1 << 6
 		}
 		return failed
@@ -209,7 +212,10 @@ test_the_filter_lets_a_thread_pin_itself_and_no_other :: proc(t: ^testing.T) {
 		if linux.syscall(linux.SYS_sched_setaffinity, uintptr(0), uintptr(size_of(mask)), &mask) != 0 {
 			failed |= 1 << 1
 		}
-		if errno_of(linux.syscall(linux.SYS_sched_setaffinity, uintptr(1), uintptr(size_of(mask)), &mask)) != .EPERM {
+		// Its own pid is the main thread's tid, which another thread is not to move.
+		self := uintptr(linux.getpid())
+		if errno_of(linux.syscall(linux.SYS_sched_setaffinity, uintptr(1), uintptr(size_of(mask)), &mask)) != .EPERM ||
+		   errno_of(linux.syscall(linux.SYS_sched_setaffinity, self, uintptr(size_of(mask)), &mask)) != .EPERM {
 			failed |= 1 << 2
 		}
 		return failed

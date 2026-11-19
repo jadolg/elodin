@@ -190,6 +190,7 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, strings.contains(lines[20], `level=warn msg="log.file:`), "a reopen of a 0644 log did not warn")
 
+
 	// And so does a start on one, without its caller having to ask.
 	shutdown()
 	testing.expect(t, init(.Info, path) == nil, "cannot open the log again")
@@ -206,6 +207,23 @@ test_every_line_is_logfmt :: proc(t: ^testing.T) {
 	testing.expect(t, init(.Info, path, Owner{posix.getuid(), posix.getgid()}) == nil, "cannot open the log guarded")
 	testing.expect_value(t, guard_hint(symlinked), GUARD_HINT)
 	testing.expect_value(t, guard_hint(os.Platform_Error(linux.Errno.EACCES)), "")
+
+	// A name that still leads to the open file keeps it; one logrotate moved
+	// away is opened afresh, and the lines go to the new file.
+	{
+		before := state.file
+		testing.expect(t, reopen(path) == nil, "cannot reopen the log")
+		testing.expect(t, state.file == before, "a reopen of the same file opened it again")
+		rotated := strings.concatenate({path, ".1"}, context.temp_allocator)
+		testing.expect(t, os.rename(path, rotated) == nil, "cannot rotate the log")
+		testing.expect(t, reopen(path) == nil, "cannot reopen the log after a rotation")
+		testing.expect(t, state.file != before, "a reopen after a rotation kept the renamed file")
+		infof("after rotation")
+		fresh := log_lines(t, path)
+		testing.expectf(t, len(fresh) >= 1 && strings.contains(fresh[len(fresh) - 1], "after rotation"), "the new file holds %v", fresh)
+		testing.expect(t, os.rename(rotated, path) == nil, "cannot put the log back")
+		testing.expect(t, reopen(path) == nil, "cannot reopen the restored log")
+	}
 }
 
 /*

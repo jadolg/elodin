@@ -1386,3 +1386,120 @@ open_descriptor_count :: proc(pid: int = 0) -> (n: int, ok: bool) {
 	count, count_ok := metrics.descriptor_count(path)
 	return int(count), count_ok
 }
+
+// A self-signed pair naming `name` in both CN and SAN, so a verifying client
+// dialling `name` accepts one and refuses the other.
+generate_named_cert :: proc(cert_path, key_path, name: string) -> bool {
+	process, perr := os.process_start(
+		os.Process_Desc {
+			command = []string {
+				"openssl",
+				"req",
+				"-x509",
+				"-newkey",
+				"ec",
+				"-pkeyopt",
+				"ec_paramgen_curve:prime256v1",
+				"-nodes",
+				"-keyout",
+				key_path,
+				"-out",
+				cert_path,
+				"-days",
+				"2",
+				"-subj",
+				fmt.tprintf("/CN=%s", name),
+				"-addext",
+				fmt.tprintf("subjectAltName=DNS:%s", name),
+			},
+		},
+	)
+	if perr != nil {
+		return false
+	}
+	state, werr := os.process_wait(process)
+	return werr == nil && state.exit_code == 0
+}
+
+// Complete a DoT handshake verifying the peer against `ca_file`, under the
+// name the corresponding certificate was issued for. `false` covers both "no
+// connection" and "the certificate presented was not the one trusted" - the
+// suite only ever needs to tell "the expected certificate is live" from
+// "it is not".
+dot_handshake_verifies :: proc(dot_port: int, ca_file, hostname: string) -> bool {
+	plain, dialled := dial_tcp(dot_port)
+	if !dialled {
+		return false
+	}
+	socket := plain.socket
+	// Closed here only while no session owns it: `tlsx.close` closes it too,
+	// and a second close of the same number can take a descriptor another
+	// thread has opened in between.
+	handshaken := false
+	defer if !handshaken {
+		net.close(socket)
+	}
+
+	ctx, cerr := tlsx.client_context(true, ca_file, nil, context.temp_allocator)
+	if cerr != .None {
+		return false
+	}
+	defer tlsx.context_destroy(ctx)
+
+	conn, terr := tlsx.client_connect(ctx, socket, hostname)
+	if terr != .None {
+		return false
+	}
+	handshaken = true
+	tlsx.close(conn)
+	return true
+}
+
+// Retries the probe rather than sleeping a fixed amount: the reload is
+// noticed on the maintenance loop's 200ms poll, which is fast but not
+// instant, and a fixed sleep would either race it or pad every run.
+wait_for_handshake :: proc(dot_port: int, ca_file, hostname: string, within: time.Duration) -> bool {
+	deadline := time.tick_add(time.tick_now(), within)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
+		if dot_handshake_verifies(dot_port, ca_file, hostname) {
+			return true
+		}
+		time.sleep(50 * time.Millisecond) // lint:allow a poll of another process's listener, bounded by the deadline above
+	}
+	return false
+}
+
+// One `blocking.lists` entry, fetched from the HTTP mock at `path`; an empty
+// `format` leaves it to be sniffed.
+list_entry :: proc(name: string, http_port: int, path: string, format := "hosts") -> string {
+	entry := fmt.tprintf(`{{ name: %s, url: "http://127.0.0.1:%d%s"`, name, http_port, path)
+	return fmt.tprintf("%s, format: %s }}", entry, format) if format != "" else fmt.tprintf("%s }}", entry)
+}
+
+/*
+A blocking configuration over `lists`, each a `list_entry`, with an upstream at
+`upstream_port` and the cache off. The default `cache_dir` cannot be written, so
+a case that wants the cached copy names one of its own.
+*/
+config_lists :: proc(
+	udp_port, upstream_port: int,
+	lists: []string,
+	cache_dir := "/proc/elodin-cannot-write-here",
+	refresh := "1s",
+	log := "{ level: debug }",
+	extra := "",
+) -> string {
+	return base_config(
+		udp_port,
+		upstream_at(upstream_port),
+		log = log,
+		timeout = "3s",
+		blocking = fmt.tprintf(
+			"{{ enabled: true, response: nxdomain, cache_dir: %q, refresh: %s, lists: [%s] }}",
+			cache_dir,
+			refresh,
+			strings.join(lists, ", ", context.temp_allocator),
+		),
+		extra = extra,
+	)
+}

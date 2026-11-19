@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:path/filepath"
 import "core:slice"
 import "core:strings"
 import "core:sys/posix"
@@ -127,17 +128,32 @@ test_the_plan_never_grants_the_root :: proc(t: ^testing.T) {
 	testing.expectf(t, slice.equal(plan.log_dirs, []string{"/elodin.log"}), "log grants %v, want the file alone", plan.log_dirs)
 }
 
-// A log on a character device is written through the descriptor already open,
-// and its directory is all of /dev.
+// A log on a device, FIFO or socket is written through the descriptor already
+// open, and its directory would be all of /dev; a regular file, or one not made
+// yet, is granted where it is.
 @(test)
-test_the_plan_grants_nothing_for_a_device_log :: proc(t: ^testing.T) {
-	if !testing.expect(t, is_character_device("/dev/null"), "/dev/null is not a character device here") {
+test_the_plan_grants_only_a_regular_or_new_log :: proc(t: ^testing.T) {
+	tree, ok := make_tree(t)
+	defer remove_tree(t, tree)
+	if !ok {
+		return
+	}
+	fifo := strings.concatenate({tree.dir, "/fifo"}, context.temp_allocator)
+	cfifo := strings.clone_to_cstring(fifo, context.temp_allocator)
+	if !testing.expectf(t, posix.mkfifo(cfifo, {.IRUSR, .IWUSR}) == .OK, "cannot make %s: %v", fifo, posix.errno()) {
 		return
 	}
 	cfg := config.default_config()
 	cfg.server.sandbox = .Basic
-	plan := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", "/dev/null", context.temp_allocator)
-	testing.expectf(t, len(plan.log_dirs) == 0, "a device log grants %v", plan.log_dirs)
+	for path in ([]string{"/dev/null", fifo}) {
+		plan := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", path, context.temp_allocator)
+		testing.expectf(t, len(plan.log_dirs) == 0, "a log at %s grants %v", path, plan.log_dirs)
+	}
+	not_yet := strings.concatenate({tree.real_dir, "/new.log"}, context.temp_allocator)
+	for path in ([]string{tree.real_file, not_yet}) {
+		plan := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", path, context.temp_allocator)
+		testing.expectf(t, slice.contains(plan.log_dirs, tree.real_dir), "a log at %s grants %v, want %q", path, plan.log_dirs, tree.real_dir)
+	}
 }
 
 /*
@@ -158,7 +174,18 @@ test_the_strict_plan_reads_lists_resolver_and_cert_targets :: proc(t: ^testing.T
 	cfg.blocking.lists = []config.Block_List{{name = "off", file = tree.real_file, enabled = false}}
 	plan := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", "", context.temp_allocator)
 	testing.expectf(t, slice.contains(plan.readable, tree.real_dir), "%v lacks a disabled list's directory", plan.readable)
-	testing.expectf(t, slice.contains(plan.readable, "/etc"), "%v lacks the resolver's directory", plan.readable)
+	// The resolver's files by themselves: their directory, /etc, holds every
+	// other secret on the host. Unless a symlink leads into /etc itself.
+	for file in ([]string{"/etc/resolv.conf", "/etc/hosts"}) {
+		testing.expectf(t, slice.contains(plan.readable, file), "%v lacks %s", plan.readable, file)
+	}
+	etc_by_link := false
+	for file in ([]string{"/etc/resolv.conf", "/etc/hosts"}) {
+		if target, resolved := resolve(file, context.temp_allocator); resolved && target != file && filepath.dir(target) == "/etc" {
+			etc_by_link = true
+		}
+	}
+	testing.expectf(t, etc_by_link || !slice.contains(plan.readable, "/etc"), "%v grants all of /etc", plan.readable)
 
 	// A hashed entry in a certificate directory that leads elsewhere.
 	certs := strings.concatenate({tree.dir, "/certs"}, context.temp_allocator)
