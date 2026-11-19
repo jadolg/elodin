@@ -9,6 +9,7 @@ import "core:sync"
 import "core:sys/linux"
 import "core:sys/posix"
 import "core:testing"
+import "core:thread"
 
 /*
 Each test sandboxes a forked child, since neither layer can be taken off the
@@ -121,6 +122,8 @@ errno_of :: proc(ret: int) -> linux.Errno {
 @(private = "file")
 CLONE_NEWUSER :: 0x10000000
 @(private = "file")
+SIGCHLD :: 17
+@(private = "file")
 AF_UNIX :: 1
 @(private = "file")
 SOCK_RAW :: 3
@@ -182,7 +185,7 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 		}
 		// SIGCHLD as the exit signal; a filter that let it through would have
 		// made a child, which leaves at once.
-		ret := linux.syscall(linux.SYS_clone, uintptr(CLONE_NEWUSER | 17), uintptr(0), uintptr(0), uintptr(0), uintptr(0))
+		ret := linux.syscall(linux.SYS_clone, uintptr(CLONE_NEWUSER | SIGCHLD), uintptr(0), uintptr(0), uintptr(0), uintptr(0))
 		if ret == 0 {
 			linux.exit_group(0)
 		}
@@ -231,6 +234,43 @@ test_the_filter_lets_a_thread_pin_itself_and_no_other :: proc(t: ^testing.T) {
 		if errno_of(linux.syscall(linux.SYS_sched_setaffinity, uintptr(1), uintptr(size_of(mask)), &mask)) != .EPERM ||
 		   errno_of(linux.syscall(linux.SYS_sched_setaffinity, self, uintptr(size_of(mask)), &mask)) != .EPERM {
 			failed |= 1 << 2
+		}
+		return failed
+	}
+	if out, ok := run_child(t, body); ok {
+		expect_passed(t, out)
+	}
+}
+
+/*
+What a serving process makes threads with is allowed - `pthread_create`, through
+`clone` with CLONE_THREAD - and a process is not: `clone(SIGCHLD)` is fork. And
+`sysinfo`, which sizing falls back to where `/proc/meminfo` cannot be read.
+*/
+@(test)
+test_the_filter_lets_threads_start_and_refuses_a_fork :: proc(t: ^testing.T) {
+	body :: proc() -> u8 {
+		if !install_filter() {
+			return 1
+		}
+		failed: u8
+		ret := linux.syscall(linux.SYS_clone, uintptr(SIGCHLD), uintptr(0), uintptr(0), uintptr(0), uintptr(0))
+		if ret == 0 {
+			linux.exit_group(0)
+		}
+		if errno_of(ret) != .EPERM {
+			failed |= 1 << 1
+		}
+		started := thread.create_and_start(proc() {})
+		if started == nil {
+			failed |= 1 << 2
+		} else {
+			thread.join(started)
+			thread.destroy(started)
+		}
+		info: linux.Sys_Info
+		if linux.sysinfo(&info) != .NONE {
+			failed |= 1 << 3
 		}
 		return failed
 	}
@@ -450,18 +490,33 @@ test_landlock_handles_only_what_the_abi_knows :: proc(t: ^testing.T) {
 	testing.expect_value(t, supported_scopes(6), Scope_Set{.Abstract_Unix_Socket, .Signal})
 }
 
-// The hint is for a refusal Landlock may have made: EACCES, with it in force.
+// The hint is for a refusal Landlock may have made: EACCES, with it in force,
+// on writing, or on reading where it confines reads too.
 @(test)
 test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^testing.T) {
 	eacces, enoent := os.Platform_Error(linux.Errno.EACCES), os.Platform_Error(linux.Errno.ENOENT)
-	was := sync.atomic_load(&landlock_in_force)
-	defer sync.atomic_store(&landlock_in_force, was)
-
-	sync.atomic_store(&landlock_in_force, false)
-	testing.expect_value(t, refusal_hint(eacces), "")
-	sync.atomic_store(&landlock_in_force, true)
-	testing.expect_value(t, refusal_hint(eacces), REFUSAL_HINT)
-	testing.expect_value(t, refusal_hint(enoent), "")
+	was_in_force, was_reads := sync.atomic_load(&landlock_in_force), sync.atomic_load(&landlock_reads)
+	defer {
+		sync.atomic_store(&landlock_in_force, was_in_force)
+		sync.atomic_store(&landlock_reads, was_reads)
+	}
+	Case :: struct {
+		in_force, reads, write: bool,
+		err:                    os.Error,
+		hinted:                 bool,
+	}
+	cases := []Case {
+		{in_force = false, reads = true, write = true, err = eacces, hinted = false},
+		{in_force = true, reads = false, write = true, err = eacces, hinted = true},
+		{in_force = true, reads = false, write = false, err = eacces, hinted = false},
+		{in_force = true, reads = true, write = false, err = eacces, hinted = true},
+		{in_force = true, reads = true, write = true, err = enoent, hinted = false},
+	}
+	for c in cases {
+		sync.atomic_store(&landlock_in_force, c.in_force)
+		sync.atomic_store(&landlock_reads, c.reads)
+		testing.expectf(t, (refusal_hint(c.err, write = c.write) == REFUSAL_HINT) == c.hinted, "%v", c)
+	}
 }
 
 // What the raw-socket check is about: without a filter, this run can open one.

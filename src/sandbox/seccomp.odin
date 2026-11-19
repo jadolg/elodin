@@ -17,8 +17,9 @@ call is fine with other arguments:
 
 - `clone3` returns ENOSYS, because its flags are in memory a filter cannot read,
   and glibc then makes the same thread with `clone`.
-- `clone` with a namespace flag returns EPERM: a new user namespace is how an
-  unprivileged process reaches kernel code otherwise reserved for root.
+- `clone` with a namespace flag, or without CLONE_THREAD, returns EPERM: a new
+  user namespace is how an unprivileged process reaches kernel code otherwise
+  reserved for root, and a new process is nothing the server makes.
 - `socket` outside AF_INET and AF_INET6 returns EAFNOSUPPORT, and one that is
   neither a stream nor a datagram socket - raw - EPERM.
 - `kill` and `tgkill` aimed at any process but this one, and `prlimit64` and
@@ -118,6 +119,8 @@ when ODIN_ARCH == .amd64 {
 }
 
 @(private)
+CLONE_THREAD :: 0x00010000
+@(private)
 CLONE_NAMESPACES :: 0x00000080 | 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x10000000 | 0x20000000 | 0x40000000
 
 @(private)
@@ -205,9 +208,12 @@ build_program :: proc(out: []Sock_Filter, pid: u32) -> int {
 	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_clone3), jf = 1)
 	ret(out, &n, errno(.ENOSYS))
 
-	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_clone), jf = 4)
+	// A thread, as pthread_create makes one, and nothing else: no namespace,
+	// and no process - the server never forks.
+	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_clone), jf = 5)
 	emit(out, &n, BPF_LD_W_ABS, DATA_ARG0_LOW)
-	emit(out, &n, BPF_JSET_K, CLONE_NAMESPACES, jf = 1)
+	emit(out, &n, BPF_JSET_K, CLONE_NAMESPACES, jt = 1)
+	emit(out, &n, BPF_JSET_K, CLONE_THREAD, jt = 1)
 	ret(out, &n, errno(.EPERM))
 	ret(out, &n, RET_ALLOW)
 
@@ -338,6 +344,8 @@ ALLOWED :: [?]uintptr {
 	linux.SYS_sched_get_priority_min,
 	linux.SYS_sched_get_priority_max,
 	linux.SYS_getrandom,
+	// What `config.probe_machine` falls back to where /proc/meminfo is not there.
+	linux.SYS_sysinfo,
 	linux.SYS_getuid,
 	linux.SYS_geteuid,
 	linux.SYS_getgid,

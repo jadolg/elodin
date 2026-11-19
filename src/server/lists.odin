@@ -11,6 +11,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
 import "elodin:logx"
+import "elodin:sandbox"
 import "elodin:loop"
 import "elodin:upstream"
 
@@ -568,9 +569,10 @@ warn_cache_unwritable :: proc(cfg: ^config.Config, cache_path: string, err: os.E
 		return
 	}
 	logx.warnf(
-		"blocking.cache_dir %q is not writable (%v); lists are loaded but will be re-downloaded on each start",
+		"blocking.cache_dir %q is not writable (%v)%s; lists are loaded but will be re-downloaded on each start",
 		cfg.blocking.cache_dir,
 		err,
+		sandbox.refusal_hint(err, write = true),
 	)
 }
 

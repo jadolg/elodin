@@ -213,13 +213,13 @@ sandbox_plan :: proc(
 		add_dirs_of(&readable, &pins, f.path, allocator)
 	}
 	for path in RESOLVER_FILES {
-		add_file_rule(&readable, path, allocator)
+		add_file_rule(&readable, &pins, path, allocator)
 	}
 	ca := tlsx.default_ca_locations(context.temp_allocator)
 	// The bundle is a file; the rest are directories of certificates.
 	add_dirs_of(&readable, &pins, ca[0], allocator)
 	for dir in ca[1:] {
-		add_cert_dir(&readable, dir, allocator)
+		add_cert_dir(&readable, &pins, dir, allocator)
 	}
 	for path in MOUNT_READS {
 		append(&readable, path)
@@ -268,32 +268,36 @@ MOUNT_READS :: [?]string{"/proc", "/sys/fs/cgroup"}
 RESOLVER_FILES :: [?]string{"/etc/resolv.conf", "/etc/hosts"}
 
 /*
-Append where `file` is: its directory, and, where that or the file is reached
-through a symlink, the directory it resolves to - Landlock judges the file
-reached, not the name, and a directory rather than the file outlives a
-renewal that re-points the link, as certbot's does. A directory in
-`PINNED_DIRS` is never granted: the file itself is, and goes on `pinned`.
+Append where `file` is: its directory, and the directory of the file it
+resolves to - Landlock judges the file reached, not the name, and a directory
+rather than the file outlives a renewal that re-points a link, as certbot's
+does. See `grant_dir`.
 */
 @(private)
 add_dirs_of :: proc(out, pinned: ^[dynamic]string, file: string, allocator := context.allocator) {
-	add :: proc(out, pinned: ^[dynamic]string, dir, file: string) {
-		path := dir
-		if is_pinned(dir) {
-			path = file
-			if !slice.contains(pinned[:], file) {
-				append(pinned, file)
-			}
-		}
-		if !slice.contains(out[:], path) {
-			append(out, path)
-		}
-	}
-	add(out, pinned, filepath.dir(file), file)
-	if dir, ok := resolve(filepath.dir(file), allocator); ok {
-		add(out, pinned, dir, file)
-	}
+	grant_dir(out, pinned, filepath.dir(file), file, allocator)
 	if target, ok := resolve(file, allocator); ok {
-		add(out, pinned, filepath.dir(target), target)
+		grant_dir(out, pinned, filepath.dir(target), target, allocator)
+	}
+}
+
+/*
+Append `dir` as the rule will open it - resolved, so a relative name or a
+symlink is the directory it is - unless that is in `PINNED_DIRS`: then `file`,
+which is in it, goes on `out` instead, and on `pinned`.
+*/
+@(private)
+grant_dir :: proc(out, pinned: ^[dynamic]string, dir, file: string, allocator := context.allocator) {
+	real := resolve(dir, allocator) or_else dir
+	path := real
+	if is_pinned(real) {
+		path = file
+		if !slice.contains(pinned[:], file) {
+			append(pinned, file)
+		}
+	}
+	if !slice.contains(out[:], path) {
+		append(out, path)
 	}
 }
 
@@ -304,14 +308,12 @@ in `/etc`, whose directory would be every secret there, and systemd-resolved
 replaces its `resolv.conf` beside the old one.
 */
 @(private)
-add_file_rule :: proc(out: ^[dynamic]string, file: string, allocator := context.allocator) {
+add_file_rule :: proc(out, pinned: ^[dynamic]string, file: string, allocator := context.allocator) {
 	if !slice.contains(out[:], file) {
 		append(out, file)
 	}
 	if target, ok := resolve(file, allocator); ok && target != file {
-		if d := filepath.dir(target); !slice.contains(out[:], d) {
-			append(out, d)
-		}
+		grant_dir(out, pinned, filepath.dir(target), target, allocator)
 	}
 }
 
@@ -322,11 +324,9 @@ resolve into. On Debian and Ubuntu each `/etc/ssl/certs/<hash>.0` leads to
 the static one on those systems - verifies through those links alone.
 */
 @(private)
-add_cert_dir :: proc(out: ^[dynamic]string, dir: string, allocator := context.allocator) {
-	for d in ([2]string{dir, resolve(dir, allocator) or_else dir}) {
-		if !slice.contains(out[:], d) {
-			append(out, d)
-		}
+add_cert_dir :: proc(out, pinned: ^[dynamic]string, dir: string, allocator := context.allocator) {
+	if real, ok := resolve(dir, allocator); ok && !is_pinned(real) && !slice.contains(out[:], real) {
+		append(out, real)
 	}
 	entries, err := os.read_directory_by_path(dir, -1, context.temp_allocator)
 	if err != nil {
@@ -334,9 +334,7 @@ add_cert_dir :: proc(out: ^[dynamic]string, dir: string, allocator := context.al
 	}
 	for e in entries {
 		if target, ok := resolve(e.fullpath, allocator); ok {
-			if d := filepath.dir(target); !slice.contains(out[:], d) {
-				append(out, d)
-			}
+			grant_dir(out, pinned, filepath.dir(target), target, allocator)
 		}
 	}
 }

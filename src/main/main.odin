@@ -1033,17 +1033,19 @@ SIGHUP, and one it cannot read has its rules lifted rather than kept (see
 */
 @(private)
 warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
-	warn :: proc(cfg: ^config.Config, setting, path, what: string) {
-		hint := sandbox.refusal_hint(os.Platform_Error(posix.Errno.EACCES))
-		logx.warnf("%s: %s cannot open %q%s, so %s", setting, cfg.server.user, path, hint, what)
+	warn :: proc(cfg: ^config.Config, setting, path, what: string, err: posix.Errno, write: bool) {
+		hint := sandbox.refusal_hint(os.Platform_Error(err), write = write)
+		logx.warnf("%s: %s cannot open %q (%s)%s, so %s", setting, cfg.server.user, path, posix.strerror(err), hint, what)
 	}
 	// Only a file in use: one that failed at startup is already said, on stderr.
-	if logx.writing_to_file() && !privdrop.can_reopen(cfg.log.file, true) {
-		warn(cfg, "log.file", cfg.log.file, "a SIGHUP will keep logging to the file already open, renamed or not")
+	if logx.writing_to_file() {
+		if err := privdrop.reopen_error(cfg.log.file, true); err != .NONE {
+			warn(cfg, "log.file", cfg.log.file, "a SIGHUP will keep logging to the file already open, renamed or not", err, write = true)
+		}
 	}
 	for f in reread_files(cfg, config_path, context.temp_allocator, in_use_only = true) {
-		if !privdrop.can_reopen(f.path, false) {
-			warn(cfg, f.setting, f.path, f.consequence)
+		if err := privdrop.reopen_error(f.path, false); err != .NONE {
+			warn(cfg, f.setting, f.path, f.consequence, err, write = false)
 		}
 	}
 }
@@ -1199,7 +1201,7 @@ reload :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m
 			file,
 			os.error_string(reopen_err),
 			logx.guard_hint(reopen_err),
-			sandbox.refusal_hint(reopen_err),
+			sandbox.refusal_hint(reopen_err, write = true),
 		)
 	}
 

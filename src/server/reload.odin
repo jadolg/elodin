@@ -134,7 +134,7 @@ reload_config :: proc(s: ^Server, path: string) -> (out: Reload_Outcome) {
 				g.cfg.log.file,
 				os.error_string(err),
 				logx.guard_hint(err),
-				sandbox.refusal_hint(err),
+				sandbox.refusal_hint(err, write = true),
 			)
 		}
 	}

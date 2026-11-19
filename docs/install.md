@@ -286,7 +286,7 @@ can read. Each file out of reach is named
 in a `warn` right after the drop:
 
 ```
-ts=2026-11-03T15:41:14Z level=warn msg="listeners.dot.key_file: elodin cannot open \"/etc/letsencrypt/live/dns.example/privkey.pem\", so a SIGHUP will keep the certificate loaded now"
+ts=2026-11-03T15:41:14Z level=warn msg="listeners.dot.key_file: elodin cannot open \"/etc/letsencrypt/live/dns.example/privkey.pem\" (Permission denied), so a SIGHUP will keep the certificate loaded now"
 ```
 
 The [systemd unit](#from-source-as-a-service) never starts as root, so it reads them as its own
@@ -309,15 +309,20 @@ server:
 | `strict` | `basic`, with Landlock on reads too, and a seccomp allowlist of system calls installed after the privilege drop |
 
 Both layers are set before the event loops start, so every thread has them,
-and they last for the life of the process: `server.sandbox` takes a restart,
-With blocking off and `blocking.cache_dir` not there yet, startup says that a
-reload turning blocking on will not be able to keep copies of the lists. A file
-the sandbox would reach through its directory that sits directly in `/` or
-`/etc` is reached alone instead, and startup names it: one that replaces it - an
-editor, a renewal, a log rotation - is not seen until a restart, so give it a
-directory of its own. A file the sandbox refuses is reported as for any other
-file that cannot be opened, with `(or server.sandbox refuses it: ...)` added;
-a reload that moves `log.file` somewhere it refuses keeps logging where it was.
+and they last for the life of the process: `server.sandbox` takes a restart.
+
+- With blocking off and `blocking.cache_dir` not there yet, startup says that a
+  reload turning blocking on will not be able to keep copies of the lists. A
+  cache directory removed while the process runs cannot be made again until a
+  restart, for the same reason.
+- A file the sandbox would reach through its directory that sits directly in
+  `/` or `/etc` (by its name or by where a symlink leads) is reached alone
+  instead, and startup names it: one that replaces it - an editor, a renewal, a
+  log rotation - is not seen until a restart, so give it a directory of its own.
+- A file the sandbox refuses is reported as for any other file that cannot be
+  opened, with `(or server.sandbox refuses it: ...)` added where the sandbox
+  confines that access. A reload that moves `log.file` somewhere it refuses
+  keeps logging where it was.
 
 Landlock needs Linux 5.13 or later with `landlock` among the kernel's `lsm=`
 modules, and a container runtime that allows its system calls. Without it
@@ -366,8 +371,8 @@ says so as for any file it cannot open. The syscall allowlist kills the process
 on any call off the list. The calls a serving process makes on glibc and musl,
 on x86_64 and arm64, are on it. A libc that makes another one ends the process
 with `SIGSYS`; set `basic` and report it. `execve`, `ptrace`, `bind`, `ioctl`,
-namespaces, sockets other than IPv4 and IPv6 streams and datagrams (no raw
-sockets), and socket options other than the read and write timeouts and
+new processes (a `clone` that is not a thread) and namespaces, sockets other
+than IPv4 and IPv6 streams and datagrams (no raw sockets), and socket options other than the read and write timeouts and
 `TCP_NODELAY` are not on it.
 `strict` refuses to start where the filter cannot be installed, which includes
 any architecture other than x86_64 and arm64.

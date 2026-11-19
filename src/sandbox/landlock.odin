@@ -179,6 +179,7 @@ confine :: proc(plan: Plan, allocator := context.allocator) -> (report: Report, 
 		return report, true
 	}
 	report.landlock = .Applied
+	sync.atomic_store(&landlock_reads, plan.mode == .Strict)
 	sync.atomic_store(&landlock_in_force, true)
 	return report, true
 }
@@ -189,14 +190,19 @@ process starts any thread, and never cleared.
 */
 @(private)
 landlock_in_force: bool
+// Whether that ruleset confines reading too, as `.Strict`'s does.
+@(private)
+landlock_reads: bool
 
 // What a warning about a file the process could not open adds when Landlock
 // may be the reason: it refuses with EACCES, as a mode or an owner would.
 REFUSAL_HINT :: " (or server.sandbox refuses it: its Landlock rules reach only the paths named at startup)"
 
-// `REFUSAL_HINT` when `err` is EACCES and Landlock is in force, "" otherwise.
-refusal_hint :: proc(err: os.Error) -> string {
-	if sync.atomic_load(&landlock_in_force) && err == os.Platform_Error(linux.Errno.EACCES) {
+// `REFUSAL_HINT` when `err` is EACCES and the Landlock rules in force confine
+// the access refused - writing, or reading under `.Strict` - "" otherwise.
+refusal_hint :: proc(err: os.Error, write: bool) -> string {
+	confined := sync.atomic_load(&landlock_in_force) && (write || sync.atomic_load(&landlock_reads))
+	if confined && err == os.Platform_Error(linux.Errno.EACCES) {
 		return REFUSAL_HINT
 	}
 	return ""

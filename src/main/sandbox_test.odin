@@ -136,6 +136,27 @@ test_the_plan_pins_files_directly_in_shared_directories :: proc(t: ^testing.T) {
 	testing.expectf(t, slice.contains(pinned, "/etc/elodin-test.yaml") && slice.contains(pinned, "/elodin-test.log"), "pinned %v", pinned)
 }
 
+// A shared directory reached through a symlink is the shared directory: the
+// rule is put on what the name opens.
+@(test)
+test_the_plan_pins_a_shared_directory_reached_through_a_link :: proc(t: ^testing.T) {
+	tree, ok := make_tree(t)
+	defer remove_tree(t, tree)
+	if !ok {
+		return
+	}
+	etc := strings.concatenate({tree.dir, "/etc-link"}, context.temp_allocator)
+	if err := os.symlink("/etc", etc); !testing.expectf(t, err == nil, "cannot link %s: %v", etc, err) {
+		return
+	}
+	cfg := config.default_config()
+	cfg.server.sandbox = .Strict
+	config_path := strings.concatenate({etc, "/elodin-test.yaml"}, context.temp_allocator)
+	plan, pinned := sandbox_plan(&cfg, config_path, "", context.temp_allocator)
+	testing.expectf(t, !slice.contains(plan.readable, etc) && !slice.contains(plan.readable, "/etc"), "%v grants /etc through %s", plan.readable, etc)
+	testing.expectf(t, len(pinned) == 1, "pinned %v, want the configuration", pinned)
+}
+
 // A log on a device, FIFO or socket is written through the descriptor already
 // open, and its directory would be all of /dev; a regular file, or one not made
 // yet, is granted where it is.
@@ -206,7 +227,9 @@ test_the_strict_plan_reads_lists_resolver_and_cert_targets :: proc(t: ^testing.T
 		return
 	}
 	readable := make([dynamic]string, context.temp_allocator)
-	add_cert_dir(&readable, certs, context.temp_allocator)
+	pins := make([dynamic]string, context.temp_allocator)
+	add_cert_dir(&readable, &pins, certs, context.temp_allocator)
+	testing.expectf(t, len(pins) == 0, "pinned %v", pins)
 	testing.expectf(t, slice.contains(readable[:], certs), "%v lacks the directory itself", readable)
 	testing.expectf(t, slice.contains(readable[:], tree.real_dir), "%v lacks where its entries lead", readable)
 	testing.expectf(t, !slice.contains(readable[:], tree.dir), "%v grants the directory's parent", readable)
