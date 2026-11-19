@@ -2,8 +2,6 @@ package server
 
 import "core:mem/virtual"
 import "core:os"
-import "core:sys/posix"
-import "core:path/filepath"
 import "core:reflect"
 import "core:strings"
 import "elodin:cache"
@@ -11,6 +9,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
 import "elodin:logx"
+import "elodin:sandbox"
 
 /*
 What a configuration reload did, for the caller's bookkeeping.
@@ -78,7 +77,7 @@ reload_config :: proc(s: ^Server, path: string) -> (out: Reload_Outcome) {
 	g.config = loaded
 	g.cfg = &g.config
 
-	for key in keep_restart_only(s.gens.boot, g.cfg, context.temp_allocator, log_grants = s.log_grants) {
+	for key in keep_restart_only(s.gens.boot, g.cfg, context.temp_allocator) {
 		logx.warnf("reload: %s changed, which takes a restart; it keeps the value the process started with until then", key)
 	}
 	if !differs(cur.cfg^, g.config) {
@@ -130,7 +129,13 @@ reload_config :: proc(s: ^Server, path: string) -> (out: Reload_Outcome) {
 	logx.set_level(g.cfg.log.level)
 	if log_file_moved {
 		if err := logx.reopen(g.cfg.log.file); err != nil {
-			logx.warnf("reload: cannot open the log file %q (%s)%s; logging where it was", g.cfg.log.file, os.error_string(err), logx.guard_hint(err))
+			logx.warnf(
+				"reload: cannot open the log file %q (%s)%s%s; logging where it was",
+				g.cfg.log.file,
+				os.error_string(err),
+				logx.guard_hint(err),
+				sandbox.refusal_hint(err),
+			)
 		}
 	}
 
@@ -195,15 +200,14 @@ because root, once given up, cannot be had back - nor, with it, the handover of
 the blocklist cache directory to that account. The certificates under
 `listeners.dot` and `listeners.doh` are still read again on every SIGHUP, from
 the paths the process started with.
-And `log.file` moved where the Landlock rules in force - `log_grants` - would
-refuse it, and the sandbox itself, which nothing takes off a thread.
+And the sandbox itself, which nothing takes off a thread.
 
 Held at the starting value rather than at the previous reload's, which is the
 same value for every key here - none of them has ever changed while running -
 and is the one whose strings live as long as the process.
 */
 @(private)
-keep_restart_only :: proc(boot, cfg: ^config.Config, allocator := context.allocator, log_grants := Log_Grants{}) -> []string {
+keep_restart_only :: proc(boot, cfg: ^config.Config, allocator := context.allocator) -> []string {
 	changed := make([dynamic]string, allocator)
 	// A reader count both files leave to the machine moves with the CPUs it can
 	// see, and nothing the operator wrote changed. It is the loop count, which is
@@ -238,11 +242,6 @@ keep_restart_only :: proc(boot, cfg: ^config.Config, allocator := context.alloca
 	hold(&changed, "server.group", boot.server.group, &cfg.server.group)
 	// Put on every thread before the first loop started, and never taken off.
 	hold(&changed, "server.sandbox", boot.server.sandbox, &cfg.server.sandbox)
-	// A log Landlock would not let be opened is held where it was; stderr and
-	// the starting log need no grant of their own (see `logx.reopen`).
-	if log_grants.in_force && cfg.log.file != "" && cfg.log.file != boot.log.file && !log_grants_cover(log_grants, cfg.log.file) {
-		hold(&changed, "log.file", boot.log.file, &cfg.log.file)
-	}
 	// Handed to `server.user` at startup, as root; a directory named afterwards
 	// would be one the process cannot write its cached lists into.
 	hold(&changed, "blocking.cache_dir", boot.blocking.cache_dir, &cfg.blocking.cache_dir)
@@ -355,38 +354,3 @@ clear_filters :: proc(s: ^Server) {
 	s.lists_loaded = nil
 }
 
-/*
-Where Landlock lets the log be created, as `sandbox.Plan.log_dirs` granted it:
-the directories `log_file`'s name and target are in. `in_force` is false
-without Landlock, where every log can be opened. Set once before the first
-generation, and read by every reload.
-*/
-Log_Grants :: struct {
-	in_force: bool,
-	dirs:     []string,
-}
-
-// Whether a log at `path` - by its name or by what it resolves to - is one
-// `grants` lets the process create or write.
-@(private)
-log_grants_cover :: proc(grants: Log_Grants, path: string) -> bool {
-	for candidate in ([2]string{path, resolved(path) or_else path}) {
-		for dir in grants.dirs {
-			if dir == candidate || dir == filepath.dir(candidate) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// `path` with every symlink followed, or false when it does not resolve.
-@(private)
-resolved :: proc(path: string) -> (string, bool) {
-	buf: [posix.PATH_MAX]u8
-	cpath := strings.clone_to_cstring(path, context.temp_allocator)
-	if posix.realpath(cpath, raw_data(buf[:])) == nil {
-		return "", false
-	}
-	return strings.clone_from_cstring(cstring(raw_data(buf[:])), context.temp_allocator), true
-}

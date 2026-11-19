@@ -44,10 +44,11 @@ use: after logrotate renamed it, not when nothing moved, and never for a device,
 FIFO or socket such as `/dev/stdout`, which keeps the descriptor it has.
 
 Under `server.sandbox` (`basic` by default) with Landlock in force, a log file
-is made only in the directory it was in at startup, and in the directory it
-resolves to where that is elsewhere: those are the only places the process may
-create a file ([Sandbox](install.md#sandbox)). Moving `log.file` anywhere else
-takes a restart there, and a reload names it in a warning.
+can be made only in the directory the log led to at startup: the only place the
+process may create a file besides the blocklist cache
+([Sandbox](install.md#sandbox)). A reload that moves `log.file` anywhere else
+cannot open it, says so with `(or server.sandbox refuses it: ...)`, and logging
+stays where it was until a restart.
 
 With `log.file` set, each line is one write to the file, not followed by a
 sync: `tail` and a shipper see it at once and a killed process loses none of

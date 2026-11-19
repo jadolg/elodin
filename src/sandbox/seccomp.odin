@@ -19,7 +19,8 @@ call is fine with other arguments:
   and glibc then makes the same thread with `clone`.
 - `clone` with a namespace flag returns EPERM: a new user namespace is how an
   unprivileged process reaches kernel code otherwise reserved for root.
-- `socket` outside AF_INET and AF_INET6 returns EAFNOSUPPORT.
+- `socket` outside AF_INET and AF_INET6 returns EAFNOSUPPORT, and one that is
+  neither a stream nor a datagram socket - raw - EPERM.
 - `kill` and `tgkill` aimed at any process but this one, and `prlimit64` and
   `sched_setaffinity` aimed at anything but the caller, return EPERM.
 - `setsockopt` returns EPERM for any option but those in `SOCKET_OPTIONS`.
@@ -76,6 +77,8 @@ BPF_JEQ_K :: 0x15
 @(private)
 BPF_JSET_K :: 0x45
 @(private)
+BPF_AND_K :: 0x54
+@(private)
 BPF_RET_K :: 0x06
 
 @(private)
@@ -121,6 +124,13 @@ CLONE_NAMESPACES :: 0x00000080 | 0x00020000 | 0x02000000 | 0x04000000 | 0x080000
 AF_INET :: 2
 @(private)
 AF_INET6 :: 10
+@(private)
+SOCK_STREAM :: 1
+@(private)
+SOCK_DGRAM :: 2
+// The type's bits in `socket`'s second argument; the flags are above them.
+@(private)
+SOCK_TYPE_MASK :: 0xf
 
 /*
 The socket options a serving process sets: the read and write timeouts in both
@@ -201,10 +211,17 @@ build_program :: proc(out: []Sock_Filter, pid: u32) -> int {
 	ret(out, &n, errno(.EPERM))
 	ret(out, &n, RET_ALLOW)
 
-	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_socket), jf = 5)
+	// The family, then the type less SOCK_NONBLOCK and SOCK_CLOEXEC: a raw
+	// socket is the kernel's packet code to a root process with no user.
+	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_socket), jf = 10)
 	emit(out, &n, BPF_LD_W_ABS, DATA_ARG0_LOW)
-	emit(out, &n, BPF_JEQ_K, AF_INET, jt = 2)
-	emit(out, &n, BPF_JEQ_K, AF_INET6, jt = 1)
+	emit(out, &n, BPF_JEQ_K, AF_INET, jt = 1)
+	emit(out, &n, BPF_JEQ_K, AF_INET6, jf = 5)
+	emit(out, &n, BPF_LD_W_ABS, DATA_ARG1_LOW)
+	emit(out, &n, BPF_AND_K, SOCK_TYPE_MASK)
+	emit(out, &n, BPF_JEQ_K, SOCK_STREAM, jt = 3)
+	emit(out, &n, BPF_JEQ_K, SOCK_DGRAM, jt = 2)
+	ret(out, &n, errno(.EPERM))
 	ret(out, &n, errno(.EAFNOSUPPORT))
 	ret(out, &n, RET_ALLOW)
 

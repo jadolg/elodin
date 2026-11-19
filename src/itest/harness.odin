@@ -1503,3 +1503,13 @@ config_lists :: proc(
 		extra = extra,
 	)
 }
+
+// Overwrite `dst` with `src`'s bytes, the way a renewal tool replaces a
+// certificate file in place.
+install_cert :: proc(dst, src: string) -> bool {
+	data, err := os.read_entire_file(src, context.temp_allocator)
+	if err != nil {
+		return false
+	}
+	return os.write_entire_file(dst, data) == nil
+}

@@ -62,19 +62,20 @@ test_the_plan_grants_an_existing_cache_with_blocking_off :: proc(t: ^testing.T) 
 	cfg.server.sandbox = .Basic
 
 	cfg.blocking.cache_dir = tree.real_dir
-	plan := sandbox_plan(&cfg, tree.real_file, "", context.temp_allocator)
+	plan, pinned := sandbox_plan(&cfg, tree.real_file, "", context.temp_allocator)
+	testing.expectf(t, len(pinned) == 0, "pinned %v", pinned)
 	testing.expectf(t, plan.cache_dir == tree.real_dir, "an existing cache: %q, want %q", plan.cache_dir, tree.real_dir)
 
 	cfg.blocking.cache_dir = strings.concatenate({tree.dir, "/absent"}, context.temp_allocator)
-	plan = sandbox_plan(&cfg, tree.real_file, "", context.temp_allocator)
+	plan, pinned = sandbox_plan(&cfg, tree.real_file, "", context.temp_allocator)
 	testing.expectf(t, plan.cache_dir == "", "an absent cache with blocking off: %q, want none", plan.cache_dir)
 	testing.expect(t, !os.exists(cfg.blocking.cache_dir), "the plan made the cache directory")
 }
 
-// A log file that is a symlink is written where it points, so that directory is
-// granted as well as the one that names it.
+// A log reached through a symlink is made where it points, and only there: the
+// link's own directory - `/dev` for `/dev/stdout` led to a file - is not granted.
 @(test)
-test_the_plan_grants_a_symlinked_logs_target_directory :: proc(t: ^testing.T) {
+test_the_plan_grants_a_symlinked_logs_target_directory_only :: proc(t: ^testing.T) {
 	tree, ok := make_tree(t)
 	defer remove_tree(t, tree)
 	if !ok {
@@ -82,12 +83,12 @@ test_the_plan_grants_a_symlinked_logs_target_directory :: proc(t: ^testing.T) {
 	}
 	cfg := config.default_config()
 	cfg.server.sandbox = .Basic
-	plan := sandbox_plan(&cfg, tree.real_file, tree.link, context.temp_allocator)
-	testing.expectf(t, slice.contains(plan.log_dirs, tree.dir), "%v lacks the link's directory %q", plan.log_dirs, tree.dir)
-	testing.expectf(t, slice.contains(plan.log_dirs, tree.real_dir), "%v lacks the target's directory %q", plan.log_dirs, tree.real_dir)
+	plan, pinned := sandbox_plan(&cfg, tree.real_file, tree.link, context.temp_allocator)
+	testing.expectf(t, slice.equal(plan.log_dirs, []string{tree.real_dir}), "log grants %v, want only %q", plan.log_dirs, tree.real_dir)
+	testing.expectf(t, len(pinned) == 0, "pinned %v", pinned)
 
-	plan = sandbox_plan(&cfg, tree.real_file, "", context.temp_allocator)
-	testing.expectf(t, len(plan.log_dirs) == 0, "logging to stderr: %v, want none", plan.log_dirs)
+	plan, pinned = sandbox_plan(&cfg, tree.real_file, "", context.temp_allocator)
+	testing.expectf(t, len(plan.log_dirs) == 0 && len(pinned) == 0, "logging to stderr: grants %v, pinned %v", plan.log_dirs, pinned)
 }
 
 /*
@@ -104,7 +105,8 @@ test_the_strict_plan_reads_targets_and_mounts :: proc(t: ^testing.T) {
 	}
 	cfg := config.default_config()
 	cfg.server.sandbox = .Strict
-	plan := sandbox_plan(&cfg, tree.link, "", context.temp_allocator)
+	plan, pinned := sandbox_plan(&cfg, tree.link, "", context.temp_allocator)
+	testing.expectf(t, len(pinned) == 0, "pinned %v", pinned)
 	for want in ([]string{tree.dir, tree.real_dir, "/proc", "/sys/fs/cgroup"}) {
 		testing.expectf(t, slice.contains(plan.readable, want), "%v lacks %q", plan.readable, want)
 	}
@@ -113,19 +115,25 @@ test_the_strict_plan_reads_targets_and_mounts :: proc(t: ^testing.T) {
 	}
 
 	cfg.server.sandbox = .Basic
-	plan = sandbox_plan(&cfg, tree.link, "", context.temp_allocator)
-	testing.expectf(t, len(plan.readable) == 0, "basic lists reads: %v", plan.readable)
+	plan, pinned = sandbox_plan(&cfg, tree.link, "", context.temp_allocator)
+	testing.expectf(t, len(plan.readable) == 0 && len(pinned) == 0, "basic lists reads %v, pins %v", plan.readable, pinned)
 }
 
-// A file directly in `/` is granted alone: its directory would be every path.
+// A file directly in `/` or `/etc` is granted alone and named: the directory
+// would be every path, or every secret on the host.
 @(test)
-test_the_plan_never_grants_the_root :: proc(t: ^testing.T) {
+test_the_plan_pins_files_directly_in_shared_directories :: proc(t: ^testing.T) {
 	cfg := config.default_config()
 	cfg.server.sandbox = .Strict
-	plan := sandbox_plan(&cfg, "/elodin.yaml", "/elodin.log", context.temp_allocator)
-	testing.expectf(t, slice.contains(plan.readable, "/elodin.yaml"), "%v lacks the file itself", plan.readable)
-	testing.expectf(t, !slice.contains(plan.readable, "/"), "%v grants every read", plan.readable)
-	testing.expectf(t, slice.equal(plan.log_dirs, []string{"/elodin.log"}), "log grants %v, want the file alone", plan.log_dirs)
+	plan, pinned := sandbox_plan(&cfg, "/etc/elodin-test.yaml", "/elodin-test.log", context.temp_allocator)
+	for file in ([]string{"/etc/elodin-test.yaml"}) {
+		testing.expectf(t, slice.contains(plan.readable, file), "%v lacks the file itself", plan.readable)
+	}
+	for dir in PINNED_DIRS {
+		testing.expectf(t, !slice.contains(plan.readable, dir), "%v grants %s", plan.readable, dir)
+		testing.expectf(t, !slice.contains(plan.log_dirs, dir), "log grants %v include %s", plan.log_dirs, dir)
+	}
+	testing.expectf(t, slice.contains(pinned, "/etc/elodin-test.yaml") && slice.contains(pinned, "/elodin-test.log"), "pinned %v", pinned)
 }
 
 // A log on a device, FIFO or socket is written through the descriptor already
@@ -146,13 +154,13 @@ test_the_plan_grants_only_a_regular_or_new_log :: proc(t: ^testing.T) {
 	cfg := config.default_config()
 	cfg.server.sandbox = .Basic
 	for path in ([]string{"/dev/null", fifo}) {
-		plan := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", path, context.temp_allocator)
-		testing.expectf(t, len(plan.log_dirs) == 0, "a log at %s grants %v", path, plan.log_dirs)
+		plan, pinned := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", path, context.temp_allocator)
+		testing.expectf(t, len(plan.log_dirs) == 0 && len(pinned) == 0, "a log at %s grants %v, pins %v", path, plan.log_dirs, pinned)
 	}
 	not_yet := strings.concatenate({tree.real_dir, "/new.log"}, context.temp_allocator)
 	for path in ([]string{tree.real_file, not_yet}) {
-		plan := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", path, context.temp_allocator)
-		testing.expectf(t, slice.contains(plan.log_dirs, tree.real_dir), "a log at %s grants %v, want %q", path, plan.log_dirs, tree.real_dir)
+		plan, pinned := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", path, context.temp_allocator)
+		testing.expectf(t, slice.equal(plan.log_dirs, []string{tree.real_dir}) && len(pinned) == 0, "a log at %s grants %v, pins %v, want %q", path, plan.log_dirs, pinned, tree.real_dir)
 	}
 }
 
@@ -172,7 +180,8 @@ test_the_strict_plan_reads_lists_resolver_and_cert_targets :: proc(t: ^testing.T
 	cfg.server.sandbox = .Strict
 	cfg.blocking.enabled = false
 	cfg.blocking.lists = []config.Block_List{{name = "off", file = tree.real_file, enabled = false}}
-	plan := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", "", context.temp_allocator)
+	plan, pinned := sandbox_plan(&cfg, "/etc/elodin/elodin.yaml", "", context.temp_allocator)
+	testing.expectf(t, len(pinned) == 0, "pinned %v", pinned)
 	testing.expectf(t, slice.contains(plan.readable, tree.real_dir), "%v lacks a disabled list's directory", plan.readable)
 	// The resolver's files by themselves: their directory, /etc, holds every
 	// other secret on the host. Unless a symlink leads into /etc itself.

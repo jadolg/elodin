@@ -6,7 +6,6 @@ import "core:net"
 import "core:os"
 import "core:strings"
 import "core:sync"
-import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -498,69 +497,23 @@ test_a_changed_sandbox_is_held_and_named :: proc(t: ^testing.T) {
 	testing.expect_value(t, cfg.server.sandbox, sandbox.Mode.Strict)
 }
 
-// With Landlock in force a log is held where it was if the grants would refuse
-// it: by its name's directory or its target's, while stderr, the starting log,
-// a log within a granted directory and any move without Landlock go through.
+// A moved log is applied by a reload under any sandbox: a reopen Landlock
+// refuses fails as any other does, and logging stays where it was.
 @(test)
-test_a_moved_log_is_held_only_where_landlock_would_refuse_it :: proc(t: ^testing.T) {
+test_a_moved_log_is_not_held_under_a_sandbox :: proc(t: ^testing.T) {
 	arena: virtual.Arena
 	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
 		return
 	}
 	defer virtual.arena_destroy(&arena)
-	grants := Log_Grants {
-		in_force = true,
-		dirs     = {"/var/log", "/data/logs"},
-	}
-	Case :: struct {
-		in_force: bool,
-		moved_to: string,
-		held:     bool,
-	}
-	cases := []Case {
-		{in_force = true, moved_to = "/srv/b.log", held = true},
-		{in_force = true, moved_to = "/var/log/b.log", held = false},
-		{in_force = true, moved_to = "/data/logs/b.log", held = false},
-		{in_force = true, moved_to = "", held = false},
-		{in_force = true, moved_to = "/dev/stderr", held = true},
-		{in_force = false, moved_to = "/srv/b.log", held = false},
-	}
-	for c in cases {
-		boot, boot_ok := load(t, swap(BASE, "log: { level: info }", "log: { level: info, file: /var/log/a.log }"), &arena)
-		moved := fmt.tprintf("log: {{ level: info, file: %q }}", c.moved_to)
-		cfg, cfg_ok := load(t, swap(BASE, "log: { level: info }", moved), &arena)
-		if !boot_ok || !cfg_ok {
-			return
-		}
-		g := grants
-		g.in_force = c.in_force
-		named := keep_restart_only(&boot, &cfg, context.temp_allocator, log_grants = g)
-		want := "/var/log/a.log" if c.held else c.moved_to
-		testing.expectf(t, cfg.log.file == want, "%v: log %q, want %q", c, cfg.log.file, want)
-		testing.expectf(t, (len(named) == 1 && named[0] == "log.file") == c.held, "%v: named %v", c, named)
-	}
-}
-
-// A log moved to a name in a directory nothing granted, that links into one
-// that is: Landlock judges the file reached, so it goes through.
-@(test)
-test_a_log_moved_through_a_link_into_a_grant_goes_through :: proc(t: ^testing.T) {
-	root := fmt.tprintf("/tmp/elodin-log-grant-%d", posix.getpid())
-	granted, elsewhere := fmt.tprintf("%s/granted", root), fmt.tprintf("%s/elsewhere", root)
-	if !testing.expect(t, os.make_directory_all(granted) == nil && os.make_directory_all(elsewhere) == nil, "cannot make the directories") {
+	sandboxed := swap(BASE, "server:\n", "server:\n  sandbox: strict\n")
+	boot, boot_ok := load(t, swap(sandboxed, "log: { level: info }", "log: { level: info, file: /var/log/a.log }"), &arena)
+	cfg, cfg_ok := load(t, swap(sandboxed, "log: { level: info }", "log: { level: info, file: /srv/b.log }"), &arena)
+	if !boot_ok || !cfg_ok {
 		return
 	}
-	defer os.remove_all(root)
-	target, link := fmt.tprintf("%s/b.log", granted), fmt.tprintf("%s/b.log", elsewhere)
-	if !testing.expect(t, os.write_entire_file(target, nil) == nil && os.symlink(target, link) == nil, "cannot make the log and its link") {
-		return
-	}
-	grants := Log_Grants {
-		in_force = true,
-		dirs     = {granted},
-	}
-	testing.expect(t, log_grants_cover(grants, link), "a link into a granted directory is not covered")
-	testing.expect(t, !log_grants_cover(grants, fmt.tprintf("%s/c.log", elsewhere)), "a file beside the link is covered")
+	named := keep_restart_only(&boot, &cfg, context.temp_allocator)
+	testing.expectf(t, len(named) == 0 && cfg.log.file == "/srv/b.log", "named %v, log %q", named, cfg.log.file)
 }
 
 /*

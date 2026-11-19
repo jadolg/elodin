@@ -305,15 +305,19 @@ server:
 | Mode | What it applies |
 |---|---|
 | `off` | nothing |
-| `basic` | `no_new_privs`, and [Landlock](https://docs.kernel.org/userspace-api/landlock.html) on writes: the process can create, write and remove files only in `blocking.cache_dir` (with blocking on, or when the directory exists at startup), and create and write them only there and in the directory `log.file` is in (and the one it resolves to). Only for a regular file: a log on a device, FIFO or socket, such as `/dev/stdout`, is written through the descriptor already open, and a `SIGHUP` keeps it. Nothing can be executed. Reads are not confined. On Landlock ABI 6 kernels it also cannot signal another process or connect to an abstract unix socket outside itself |
+| `basic` | `no_new_privs`, and [Landlock](https://docs.kernel.org/userspace-api/landlock.html) on writes: the process can create, write and remove files only in `blocking.cache_dir` (with blocking on, or when the directory exists at startup), and create and write them only there and in the directory `log.file` is in (the directory of the file it resolves to, not of a symlink's name). Only for a regular file: a log on a device, FIFO or socket, such as `/dev/stdout`, is written through the descriptor already open, and a `SIGHUP` keeps it. Nothing can be executed. Reads are not confined. On Landlock ABI 6 kernels it also cannot signal another process or connect to an abstract unix socket outside itself |
 | `strict` | `basic`, with Landlock on reads too, and a seccomp allowlist of system calls installed after the privilege drop |
 
 Both layers are set before the event loops start, so every thread has them,
 and they last for the life of the process: `server.sandbox` takes a restart,
-and so does moving `log.file` to a directory Landlock does not grant while it
-is in force. With blocking off and `blocking.cache_dir` not there yet, startup
-says that a reload turning blocking on will not be able to keep copies of the
-lists.
+With blocking off and `blocking.cache_dir` not there yet, startup says that a
+reload turning blocking on will not be able to keep copies of the lists. A file
+the sandbox would reach through its directory that sits directly in `/` or
+`/etc` is reached alone instead, and startup names it: one that replaces it - an
+editor, a renewal, a log rotation - is not seen until a restart, so give it a
+directory of its own. A file the sandbox refuses is reported as for any other
+file that cannot be opened, with `(or server.sandbox refuses it: ...)` added;
+a reload that moves `log.file` somewhere it refuses keeps logging where it was.
 
 Landlock needs Linux 5.13 or later with `landlock` among the kernel's `lsm=`
 modules, and a container runtime that allows its system calls. Without it
@@ -325,8 +329,9 @@ ts=2026-11-19T08:59:48Z level=warn msg="server.sandbox: Landlock is unavailable 
 
 A path the sandbox would grant that cannot be opened at startup is named in a
 warning with the reason, and stays out of reach until a restart, even once it
-can be. The line after the drop says
-what is in force:
+can be. Under `strict`, startup lists every path reads are granted on
+(`server.sandbox: strict reads ...`). The line after the drop says what is in
+force:
 
 ```
 ts=2026-11-19T08:59:48Z level=info msg=sandbox mode=strict no_new_privs=true landlock_abi=6 seccomp=true
@@ -361,8 +366,9 @@ says so as for any file it cannot open. The syscall allowlist kills the process
 on any call off the list. The calls a serving process makes on glibc and musl,
 on x86_64 and arm64, are on it. A libc that makes another one ends the process
 with `SIGSYS`; set `basic` and report it. `execve`, `ptrace`, `bind`, `ioctl`,
-namespaces, sockets other than IPv4 and IPv6, and socket options other than the
-read and write timeouts and `TCP_NODELAY` are not on it.
+namespaces, sockets other than IPv4 and IPv6 streams and datagrams (no raw
+sockets), and socket options other than the read and write timeouts and
+`TCP_NODELAY` are not on it.
 `strict` refuses to start where the filter cannot be installed, which includes
 any architecture other than x86_64 and arm64.
 
@@ -411,7 +417,7 @@ rules in effect` when turned off), or keep the rules in effect;
 
 | section | on reload |
 |---|---|
-| `log`, `rewrites`, `special_use`, `rebind` | applied from the next query; `log.file` moved where Landlock grants no writing takes a restart ([Sandbox](#sandbox)) |
+| `log`, `rewrites`, `special_use`, `rebind` | applied from the next query |
 | `server.allow_from`, `max_pending`, `max_udp_response`, `client_timeout` | applied from the next query or read |
 | `server.rate_limit` | a change rebuilds the limiter, so every prefix starts again from a full budget |
 | `upstream`, `cookies.upstream` | a change rebuilds every group and route: new connections, new upstream cookies |

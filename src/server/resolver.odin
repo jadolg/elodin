@@ -219,9 +219,6 @@ Server :: struct {
 	using live:   Live,
 	gens:         Generations,
 	filters:      ^filter.Engine,
-	// Where Landlock lets the log be created, set once before the first
-	// generation; see `Log_Grants`.
-	log_grants:   Log_Grants,
 	// Which lists the rules in `filters` were built with, by `list_key`: by
 	// where a list comes from rather than its position, so a reload that adds,
 	// removes or moves lists leaves it as it is and never touches it beside a

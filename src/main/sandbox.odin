@@ -30,7 +30,7 @@ A process that cannot set `PR_SET_NO_NEW_PRIVS` ends: the operator asked for a
 sandbox, and the layers after it depend on it. A missing Landlock is a warning.
 */
 @(private)
-confine_process :: proc(cfg: ^config.Config, config_path: string) -> (landlock_abi: int, log_grants: server.Log_Grants) {
+confine_process :: proc(cfg: ^config.Config, config_path: string) -> (landlock_abi: int) {
 	if cfg.server.sandbox == .Off {
 		return
 	}
@@ -38,7 +38,7 @@ confine_process :: proc(cfg: ^config.Config, config_path: string) -> (landlock_a
 		server.make_directories(cfg.blocking.cache_dir)
 	}
 	log_file := cfg.log.file if logx.writing_to_file() else ""
-	plan := sandbox_plan(cfg, config_path, log_file, context.temp_allocator)
+	plan, pinned := sandbox_plan(cfg, config_path, log_file, context.temp_allocator)
 	report, ok := sandbox.confine(plan, context.temp_allocator)
 	if !ok {
 		logx.errorf("server.sandbox: cannot set no_new_privs; not starting without it")
@@ -49,9 +49,17 @@ confine_process :: proc(cfg: ^config.Config, config_path: string) -> (landlock_a
 	case .Off:
 	case .Applied:
 		landlock_abi = report.abi
-		// Kept for the life of the process: every reload reads it.
-		log_grants = {in_force = true, dirs = clone_strings(plan.log_dirs)}
 		warn_unreachable_later(cfg)
+		for file in pinned {
+			logx.warnf(
+				"server.sandbox: %q is directly in %s, so the sandbox reaches only that file and not the directory; one that replaces it - an editor, a renewal, a log rotation - is not seen until a restart: give it a directory of its own",
+				file,
+				filepath.dir(file),
+			)
+		}
+		if plan.mode == .Strict {
+			logx.infof("server.sandbox: strict reads %s", strings.join(plan.readable, ", ", context.temp_allocator))
+		}
 	case .Unavailable:
 		logx.warnf(
 			"server.sandbox: Landlock is unavailable (%s), so %s not confined; it needs Linux 5.13 with landlock among the lsm= modules, and a container runtime that allows its system calls",
@@ -117,15 +125,6 @@ system_resolved_list_host :: proc(cfg: ^config.Config) -> (host: string, found: 
 	return
 }
 
-@(private)
-clone_strings :: proc(in_: []string, allocator := context.allocator) -> []string {
-	out := make([]string, len(in_), allocator)
-	for v, i in in_ {
-		out[i] = strings.clone(v, allocator)
-	}
-	return out
-}
-
 /*
 Install `server.sandbox: strict`'s syscall allowlist, after the drop, and say
 what the process now runs under, with the Landlock ABI `confine_process` put in
@@ -161,48 +160,64 @@ What the configuration in `cfg` needs from the filesystem once it is serving;
 `log_file` is the log file in use, "" for stderr.
 
 Writes: the blocklist cache, when blocking is on or the directory is there for
-a reload that turns it on, and where the log file is, which a SIGHUP reopens by
-name - only for a regular file or one not made yet: a device, FIFO or socket,
-such as `/dev/stdout`, is written through the descriptor already open, and its
-directory would be all of `/dev`.
+a reload that turns it on, and the directory of the file the log leads to,
+which a SIGHUP makes again after a rotation (`log_dir_of`) - only for a regular
+file or one not made yet: a device, FIFO or socket, such as `/dev/stdout`, is
+written through the descriptor already open.
 Reads, which only `.Strict` confines: where every file in `reread_files` is,
 listed or not and with blocking on or not, as a reload may turn either on; the
 system resolver's `/etc/resolv.conf` and `/etc/hosts`, which a list download
 falls back to, by the files themselves (`add_file_rule`); OpenSSL's default trust store, with the directories its hashed
 entries point into; `/proc` and `/sys/fs/cgroup`, which the metrics and the
-sizing read. See `add_dirs_of` for what "where a file is" grants.
+sizing read. See `add_dirs_of` for what "where a file is" grants; `pinned` lists
+the files - a log among them - granted alone, being directly in a directory in
+`PINNED_DIRS`.
 
 `/proc` and `/sys/fs/cgroup` are granted whole: procfs makes a new inode at
 every lookup of an entry the kernel has let go of, which a rule on
 `/proc/<pid>` would no longer match, and only a mount's root stays.
 */
 @(private)
-sandbox_plan :: proc(cfg: ^config.Config, config_path, log_file: string, allocator := context.allocator) -> sandbox.Plan {
-	plan := sandbox.Plan {
-		mode = cfg.server.sandbox,
-	}
+sandbox_plan :: proc(
+	cfg: ^config.Config,
+	config_path, log_file: string,
+	allocator := context.allocator,
+) -> (
+	plan: sandbox.Plan,
+	pinned: []string,
+) {
+	plan.mode = cfg.server.sandbox
 	if cache := cfg.blocking.cache_dir; cache != "" && (cfg.blocking.enabled || os.exists(cache)) {
 		plan.cache_dir = cache
 	}
+	pins := make([dynamic]string, allocator)
 	if log_file != "" && regular_or_missing(log_file) {
-		log_dirs := make([dynamic]string, allocator)
-		add_dirs_of(&log_dirs, log_file, allocator)
-		plan.log_dirs = log_dirs[:]
+		if dir, ok := log_dir_of(log_file, allocator); ok {
+			grant := dir
+			if is_pinned(dir) {
+				// Written as it is; a rotation cannot make it again there.
+				grant = resolve(log_file, allocator) or_else ""
+				append(&pins, log_file)
+			}
+			if grant != "" {
+				plan.log_dirs = slice.clone([]string{grant}, allocator)
+			}
+		}
 	}
 	if plan.mode != .Strict {
-		return plan
+		return plan, pins[:]
 	}
 
 	readable := make([dynamic]string, allocator)
 	for f in reread_files(cfg, config_path, context.temp_allocator, in_use_only = false) {
-		add_dirs_of(&readable, f.path, allocator)
+		add_dirs_of(&readable, &pins, f.path, allocator)
 	}
 	for path in RESOLVER_FILES {
 		add_file_rule(&readable, path, allocator)
 	}
 	ca := tlsx.default_ca_locations(context.temp_allocator)
 	// The bundle is a file; the rest are directories of certificates.
-	add_dirs_of(&readable, ca[0], allocator)
+	add_dirs_of(&readable, &pins, ca[0], allocator)
 	for dir in ca[1:] {
 		add_cert_dir(&readable, dir, allocator)
 	}
@@ -210,7 +225,38 @@ sandbox_plan :: proc(cfg: ^config.Config, config_path, log_file: string, allocat
 		append(&readable, path)
 	}
 	plan.readable = readable[:]
-	return plan
+	return plan, pins[:]
+}
+
+/*
+The directory a log at `file` is made in: that of the file it resolves to, or,
+not made yet, of the directory it would be made in, resolved. Never the name's
+own directory, which for `/dev/stdout` led to a regular file is all of `/dev`:
+Landlock judges the file reached, not the name.
+*/
+@(private)
+log_dir_of :: proc(file: string, allocator := context.allocator) -> (string, bool) {
+	if target, ok := resolve(file, allocator); ok {
+		return filepath.dir(target), true
+	}
+	return resolve(filepath.dir(file), allocator)
+}
+
+/*
+Directories whose every file a strict read grant would expose: a re-read file
+directly in one is granted alone (`add_dirs_of`), and named at startup.
+*/
+@(private)
+PINNED_DIRS :: [?]string{"/", "/etc"}
+
+@(private)
+is_pinned :: proc(dir: string) -> bool {
+	for pinned in PINNED_DIRS {
+		if dir == pinned {
+			return true
+		}
+	}
+	return false
 }
 
 // What the metrics and `config.probe_machine` read, granted at the mount.
@@ -225,23 +271,29 @@ RESOLVER_FILES :: [?]string{"/etc/resolv.conf", "/etc/hosts"}
 Append where `file` is: its directory, and, where that or the file is reached
 through a symlink, the directory it resolves to - Landlock judges the file
 reached, not the name, and a directory rather than the file outlives a
-renewal that re-points the link, as certbot's does. A file directly in `/` is
-granted alone, since its directory would be everything.
+renewal that re-points the link, as certbot's does. A directory in
+`PINNED_DIRS` is never granted: the file itself is, and goes on `pinned`.
 */
 @(private)
-add_dirs_of :: proc(out: ^[dynamic]string, file: string, allocator := context.allocator) {
-	add :: proc(out: ^[dynamic]string, dir, file: string) {
-		path := file if dir == "/" else dir
+add_dirs_of :: proc(out, pinned: ^[dynamic]string, file: string, allocator := context.allocator) {
+	add :: proc(out, pinned: ^[dynamic]string, dir, file: string) {
+		path := dir
+		if is_pinned(dir) {
+			path = file
+			if !slice.contains(pinned[:], file) {
+				append(pinned, file)
+			}
+		}
 		if !slice.contains(out[:], path) {
 			append(out, path)
 		}
 	}
-	add(out, filepath.dir(file), file)
+	add(out, pinned, filepath.dir(file), file)
 	if dir, ok := resolve(filepath.dir(file), allocator); ok {
-		add(out, dir, file)
+		add(out, pinned, dir, file)
 	}
 	if target, ok := resolve(file, allocator); ok {
-		add(out, filepath.dir(target), target)
+		add(out, pinned, filepath.dir(target), target)
 	}
 }
 

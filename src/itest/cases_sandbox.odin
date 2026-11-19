@@ -116,6 +116,7 @@ run_sandbox_path_cases :: proc(r: ^Runner) {
 	}
 	sandbox_system_resolver_case(r)
 	sandbox_log_rotation_case(r)
+	sandbox_relative_log_reload_case(r)
 	sandbox_cache_turned_on_case(r)
 }
 
@@ -135,13 +136,21 @@ sandbox_hashed_ca_case :: proc(r: ^Runner) {
 		fail(r, "%s: openssl could not hash the certificate", NAME)
 		return
 	}
+	// The hashed entry leads into a directory nothing else grants, as
+	// /etc/ssl/certs leads into /usr/share/ca-certificates.
+	shared, shared_ok := outside_work_dir(r, "sandbox-ca-shared")
+	if !shared_ok {
+		return
+	}
+	defer remove_outside(r, shared)
 	// Heap: read in every case below, and `end_case` frees the temp allocator.
 	hashed := fmt.aprintf("%s/sandbox-hashed", r.work_dir)
 	defer delete(hashed)
 	empty := fmt.aprintf("%s/sandbox-hashed-empty", r.work_dir)
 	defer delete(empty)
+	real := fmt.tprintf("%s/elodin-test.crt", shared)
 	link := fmt.tprintf("%s/%s.0", hashed, strings.trim_space(string(hash)))
-	if os.make_directory(hashed) != nil || os.make_directory(empty) != nil || os.symlink(r.cert_file, link) != nil {
+	if !install_cert(real, r.cert_file) || os.make_directory(hashed) != nil || os.make_directory(empty) != nil || os.symlink(real, link) != nil {
 		fail(r, "%s: cannot stage the certificate directories", NAME)
 		return
 	}
@@ -227,6 +236,31 @@ sandbox_system_resolver_case :: proc(r: ^Runner) {
 	}
 }
 
+/*
+A directory beside the run's work directory, not in it: the work directory
+holds each server's configuration file, so strict grants reads beneath it, and
+a case about a grant of its own would pass whatever that grant was. Heap, for
+the caller to remove and free.
+*/
+@(private = "file")
+outside_work_dir :: proc(r: ^Runner, name: string) -> (dir: string, ok: bool) {
+	dir = fmt.aprintf("%s-%s", r.work_dir, name)
+	if err := os.make_directory_all(dir); err != nil {
+		fail(r, "cannot make %s: %v", dir, err)
+		delete(dir)
+		return "", false
+	}
+	return dir, true
+}
+
+@(private = "file")
+remove_outside :: proc(r: ^Runner, dir: string) {
+	if err := os.remove_all(dir); err != nil {
+		fail(r, "cannot remove %s: %v", dir, err)
+	}
+	delete(dir)
+}
+
 // Whether `hosts` maps `localhost` to 127.0.0.1, as a resolver reading it would.
 @(private = "file")
 hosts_maps_localhost :: proc(hosts: string) -> bool {
@@ -249,8 +283,14 @@ link led to at startup would not.
 @(private = "file")
 sandbox_certbot_renewal_case :: proc(r: ^Runner) {
 	NAME :: "server.sandbox: a certbot renewal through live/ symlinks is served after SIGHUP (#417)"
-	live := fmt.tprintf("%s/sandbox-le/live", r.work_dir)
-	archive := fmt.tprintf("%s/sandbox-le/archive", r.work_dir)
+	// As /etc/letsencrypt is: nothing else the server reads is in it.
+	le, le_ok := outside_work_dir(r, "sandbox-le")
+	if !le_ok {
+		return
+	}
+	defer remove_outside(r, le)
+	live := fmt.tprintf("%s/live", le)
+	archive := fmt.tprintf("%s/archive", le)
 	if os.make_directory_all(live) != nil || os.make_directory_all(archive) != nil {
 		fail(r, "%s: cannot make the certbot tree", NAME)
 		return
@@ -370,4 +410,28 @@ sandbox_cache_turned_on_case :: proc(r: ^Runner) {
 	cached := fmt.tprintf("%s/sandbox-list.list", cache)
 	check(r, file_comes_to_hold(cached, "sandboxed.test", 5 * time.Second), "the list was not kept at %s:\n%s", cached, read_log(&srv))
 	check(r, !log_contains(&srv, "is not writable"), "the cache was refused:\n%s", read_log(&srv))
+}
+
+/*
+A reload that moves `log.file` to a relative name: nothing after the filter may
+resolve it, as `realpath` would through `getcwd`, which the allowlist does not
+have. The directory named is not there, so the reopen fails as any other does
+and the log stays where it was - without a file made in the suite's directory.
+*/
+@(private = "file")
+sandbox_relative_log_reload_case :: proc(r: ^Runner) {
+	NAME :: "server.sandbox: a reload to a relative log.file keeps the server serving (#417)"
+	start_case(r, NAME)
+	defer end_case(r)
+	udp_port, upstream_port := next_port(r), next_port(r)
+	srv, ok := start_server(r, Server_Options{config = base_config(udp_port, upstream_at(upstream_port), log = "{ level: info }"), udp_port = udp_port})
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+	moved := base_config(udp_port, upstream_at(upstream_port), log = `{ level: info, file: "elodin-sandbox-absent/elodin.log" }`)
+	if !check(r, reload_to(r, &srv, moved, "cannot open the log file"), "the reopen of a relative log was not reported:\n%s", read_log(&srv)) {
+		return
+	}
+	check(r, wait_ready(&srv, 2 * time.Second), "the server stopped answering after the reload:\n%s", read_log(&srv))
 }

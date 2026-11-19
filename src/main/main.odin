@@ -15,6 +15,7 @@ import "elodin:filter"
 import "elodin:logx"
 import "elodin:loop"
 import "elodin:privdrop"
+import "elodin:sandbox"
 import "elodin:server"
 import "elodin:tlsx"
 import "elodin:upstream"
@@ -811,7 +812,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	that waits on the network runs on them - see `loop` - and each takes one UDP
 	reader. Started before anything that could spawn on one.
 	*/
-	landlock_abi, log_grants := confine_process(cfg, opts.config_path)
+	landlock_abi := confine_process(cfg, opts.config_path)
 	loops, loop_threads := start_loops(cfg.listeners.udp.readers, cfg.server.pin_loops)
 
 	filters := filter.engine_make()
@@ -823,7 +824,6 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 		started      = loop.now(),
 		up_since     = loop.moment_now(),
 		running      = true,
-		log_grants   = log_grants,
 	}
 
 	/*
@@ -1034,7 +1034,8 @@ SIGHUP, and one it cannot read has its rules lifted rather than kept (see
 @(private)
 warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
 	warn :: proc(cfg: ^config.Config, setting, path, what: string) {
-		logx.warnf("%s: %s cannot open %q, so %s", setting, cfg.server.user, path, what)
+		hint := sandbox.refusal_hint(os.Platform_Error(posix.Errno.EACCES))
+		logx.warnf("%s: %s cannot open %q%s, so %s", setting, cfg.server.user, path, hint, what)
 	}
 	// Only a file in use: one that failed at startup is already said, on stderr.
 	if logx.writing_to_file() && !privdrop.can_reopen(cfg.log.file, true) {
@@ -1193,7 +1194,13 @@ reload :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m
 	reopen_err := logx.reopen(file)
 	logx.infof("SIGHUP received, reloading the configuration and the TLS certificates")
 	if reopen_err != nil {
-		logx.warnf("cannot open the log file %q again (%s)%s; logging where it was", file, os.error_string(reopen_err), logx.guard_hint(reopen_err))
+		logx.warnf(
+			"cannot open the log file %q again (%s)%s%s; logging where it was",
+			file,
+			os.error_string(reopen_err),
+			logx.guard_hint(reopen_err),
+			sandbox.refusal_hint(reopen_err),
+		)
 	}
 
 	out := server.reload_config(s, opts.config_path)

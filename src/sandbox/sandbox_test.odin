@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:sys/linux"
 import "core:sys/posix"
 import "core:testing"
@@ -122,9 +123,13 @@ CLONE_NEWUSER :: 0x10000000
 @(private = "file")
 AF_UNIX :: 1
 @(private = "file")
-SOCK_DGRAM :: 2
+SOCK_RAW :: 3
 @(private = "file")
-SOCK_STREAM :: 1
+IPPROTO_ICMP :: 1
+@(private = "file")
+SOCK_NONBLOCK :: 0o4000
+@(private = "file")
+SOCK_CLOEXEC :: 0o2000000
 // An option off the list at both levels: SO_KEEPALIVE under SOL_SOCKET, and
 // TCP_DEFER_ACCEPT, the same number, under IPPROTO_TCP. TCP_NODELAY's
 // number under SOL_SOCKET is SO_DEBUG: an option on the list, at the wrong level.
@@ -162,6 +167,15 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 		}
 		if errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_UNIX), uintptr(SOCK_DGRAM), uintptr(0))) != .EAFNOSUPPORT {
 			failed |= 1 << 2
+		}
+		// Raw refused whoever asks; a datagram socket with its flags allowed.
+		if errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_RAW), uintptr(IPPROTO_ICMP))) != .EPERM {
+			failed |= 1 << 2
+		}
+		if fd := linux.syscall(linux.SYS_socket, uintptr(AF_INET6), uintptr(SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC), uintptr(0)); fd < 0 {
+			failed |= 1 << 2
+		} else {
+			linux.close(linux.Fd(fd))
 		}
 		if errno_of(linux.syscall(linux.SYS_clone3, uintptr(0), uintptr(0))) != .ENOSYS {
 			failed |= 1 << 3
@@ -434,4 +448,29 @@ test_landlock_handles_only_what_the_abi_knows :: proc(t: ^testing.T) {
 	testing.expect(t, .Ioctl_Dev in supported_access(5), "ABI 5 has Ioctl_Dev")
 	testing.expect_value(t, supported_scopes(5), Scope_Set{})
 	testing.expect_value(t, supported_scopes(6), Scope_Set{.Abstract_Unix_Socket, .Signal})
+}
+
+// The hint is for a refusal Landlock may have made: EACCES, with it in force.
+@(test)
+test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^testing.T) {
+	eacces, enoent := os.Platform_Error(linux.Errno.EACCES), os.Platform_Error(linux.Errno.ENOENT)
+	was := sync.atomic_load(&landlock_in_force)
+	defer sync.atomic_store(&landlock_in_force, was)
+
+	sync.atomic_store(&landlock_in_force, false)
+	testing.expect_value(t, refusal_hint(eacces), "")
+	sync.atomic_store(&landlock_in_force, true)
+	testing.expect_value(t, refusal_hint(eacces), REFUSAL_HINT)
+	testing.expect_value(t, refusal_hint(enoent), "")
+}
+
+// What the raw-socket check is about: without a filter, this run can open one.
+@(test)
+test_a_raw_socket_opens_without_the_filter :: proc(t: ^testing.T) {
+	fd := linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_RAW), uintptr(IPPROTO_ICMP))
+	if fd < 0 {
+		fmt.eprintfln("sandbox: this run cannot open a raw socket (%v), so refusing one proves less here", linux.Errno(-fd))
+		return
+	}
+	linux.close(linux.Fd(fd))
 }

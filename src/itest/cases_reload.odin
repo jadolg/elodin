@@ -36,17 +36,6 @@ config_for_reload :: proc(udp_port, dot_port, doh_port: int, cert_file, key_file
 	)
 }
 
-// Overwrite `dst` with `src`'s bytes, the way a renewal tool replaces a
-// certificate file in place.
-@(private = "file")
-install_cert :: proc(dst, src: string) -> bool {
-	data, err := os.read_entire_file(src, context.temp_allocator)
-	if err != nil {
-		return false
-	}
-	return os.write_entire_file(dst, data) == nil
-}
-
 run_reload_cases :: proc(r: ^Runner) {
 	// Heap, not scratch: end_case resets the temp allocator between cases and
 	// these paths are read again by every case in this function.

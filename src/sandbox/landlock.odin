@@ -1,6 +1,8 @@
 package sandbox
 
+import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:sys/linux"
 
 // <linux/landlock.h>: the access rights, by the ABI version that added them.
@@ -177,7 +179,27 @@ confine :: proc(plan: Plan, allocator := context.allocator) -> (report: Report, 
 		return report, true
 	}
 	report.landlock = .Applied
+	sync.atomic_store(&landlock_in_force, true)
 	return report, true
+}
+
+/*
+Whether a Landlock ruleset `confine` applied is in force. Set once, before the
+process starts any thread, and never cleared.
+*/
+@(private)
+landlock_in_force: bool
+
+// What a warning about a file the process could not open adds when Landlock
+// may be the reason: it refuses with EACCES, as a mode or an owner would.
+REFUSAL_HINT :: " (or server.sandbox refuses it: its Landlock rules reach only the paths named at startup)"
+
+// `REFUSAL_HINT` when `err` is EACCES and Landlock is in force, "" otherwise.
+refusal_hint :: proc(err: os.Error) -> string {
+	if sync.atomic_load(&landlock_in_force) && err == os.Platform_Error(linux.Errno.EACCES) {
+		return REFUSAL_HINT
+	}
+	return ""
 }
 
 @(private)
