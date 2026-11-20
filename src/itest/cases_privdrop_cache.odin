@@ -86,7 +86,7 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 	}
 	// The positive half: the directory itself was handed over.
 	if dir_uid, read := owner(cache_dir); check(r, read, "cannot stat %s", cache_dir) {
-		check(r, dir_uid != 0, "the cache directory was not handed over: still uid %d", dir_uid)
+		check(r, dir_uid == nobody_uid, "the cache directory is uid %d's, not nobody's (%d)", dir_uid, nobody_uid)
 	}
 	if out_uid, read := owner(outside); check(r, read, "cannot stat %s", outside) {
 		check(r, out_uid == 0, "the file the link points at was given to uid %d", out_uid)
@@ -101,7 +101,7 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 			}
 			own += 1
 			if uid, read := owner(entry.fullpath); check(r, read, "cannot stat %s", entry.fullpath) {
-				check(r, uid != 0, "%s, which elodin wrote, was not handed over", entry.name)
+				check(r, uid == nobody_uid, "%s, which elodin wrote, is uid %d's, not nobody's (%d)", entry.name, uid, nobody_uid)
 			}
 		}
 		check(r, own > 0, "elodin cached nothing in %s", cache_dir)
@@ -186,12 +186,16 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 @(private = "file")
 traversable_by_all :: proc(path: string) -> bool {
 	dir := path
-	for dir != "" && dir != "/" {
+	for {
 		st: posix.stat_t
 		if posix.stat(strings.clone_to_cstring(dir, context.temp_allocator), &st) != .OK || .IXOTH not_in st.st_mode {
 			return false
 		}
-		dir = filepath.dir(dir)
+		// Up to `/`, or `.` for a relative path, which is its own parent.
+		up := filepath.dir(dir)
+		if up == dir {
+			return true
+		}
+		dir = up
 	}
-	return true
 }

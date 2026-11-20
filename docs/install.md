@@ -284,7 +284,9 @@ hand over the file it links to, wherever that file is. For the same reason a
 root start reads a cached list only as a plain file with one link that belongs
 to the account, never through a symlink; any other is not read (the log says
 why) and is downloaded again. A copy an earlier version cached as root is one of
-those, once. On a filesystem with no owners (vfat, including one mounted
+those, once: the first root start after upgrading has no cached lists to fall
+back on, so if it cannot download them it serves without them until a refresh
+succeeds (`chown -R` the directory to the account before upgrading to avoid it). On a filesystem with no owners (vfat, including one mounted
 `quiet`, or an NFS export that squashes root) no copy can belong to the account:
 each start uses what it downloads and downloads the lists again at the next
 start rather than read them, so a start with no network has none. Started as

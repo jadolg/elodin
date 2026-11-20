@@ -19,7 +19,6 @@ is that account is narrowed further by `sandbox`.
 package privdrop
 
 import "core:c"
-import "core:path/filepath"
 import "core:strings"
 import "core:sys/posix"
 import "elodin:netx"
@@ -299,18 +298,32 @@ its place is not followed.
 A path that does not exist is not a failure: nothing has been cached yet, and
 the process creates the directory itself, under its own account.
 */
+/*
+`path` without its trailing slashes and `/.`: with either, the kernel resolves
+a symlink at what reads as the last component before O_NOFOLLOW is looked at.
+Only those: `..` is resolved after the links before it, so taking it out by
+text would name another directory than the one the process writes to.
+*/
+last_component_path :: proc(path: string) -> string {
+	p := path
+	for len(p) > 1 {
+		switch {
+		case strings.has_suffix(p, "/"):
+			p = p[:len(p) - 1]
+		case strings.has_suffix(p, "/."):
+			p = p[:len(p) - 2]
+		case:
+			return p
+		}
+	}
+	return p if p != "" else path
+}
+
 hand_over :: proc(path: string, id: Identity) -> bool {
 	if path == "" {
 		return true
 	}
-	// Cleaned of trailing slashes and `.`: with either, the kernel resolves a
-	// symlink at what reads as the last component before O_NOFOLLOW is looked
-	// at.
-	cleaned, cerr := filepath.clean(path, context.temp_allocator)
-	if cerr != nil {
-		return false
-	}
-	cpath := strings.clone_to_cstring(cleaned, context.temp_allocator)
+	cpath := strings.clone_to_cstring(last_component_path(path), context.temp_allocator)
 	// Missing by its own name, not by a link's target: a dangling symlink is
 	// there, and is refused below.
 	st: posix.stat_t

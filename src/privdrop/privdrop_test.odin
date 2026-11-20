@@ -293,6 +293,23 @@ test_hand_over_follows_no_symlinked_directory :: proc(t: ^testing.T) {
 	testing.expect(t, !hand_over(dangling, self), "a dangling symlink read as a cache directory not made yet")
 }
 
+// Trailing slashes and `/.` go; `..` stays, as the kernel resolves it after the
+// links before it.
+@(test)
+test_last_component_path :: proc(t: ^testing.T) {
+	cases := [][2]string {
+		{"/var/cache/elodin", "/var/cache/elodin"},
+		{"/var/cache/elodin/", "/var/cache/elodin"},
+		{"/var/cache/elodin//./", "/var/cache/elodin"},
+		{"/srv/link/../cache", "/srv/link/../cache"},
+		{"/", "/"},
+		{"cache/.", "cache"},
+	}
+	for c in cases {
+		testing.expectf(t, last_component_path(c[0]) == c[1], "%q: got %q, want %q", c[0], last_component_path(c[0]), c[1])
+	}
+}
+
 @(test)
 test_hand_over_ignores_a_path_that_is_not_there :: proc(t: ^testing.T) {
 	self := Identity {

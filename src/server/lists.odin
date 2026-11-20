@@ -364,7 +364,10 @@ cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Loa
 	// A copy of another query is another list: `?category=ads` does not stand
 	// in for `?category=malware`.
 	if !copy_is_of(list, cache_path) {
-		if os.exists(cache_path) {
+		// A fingerprint that is refused is not one of another url.
+		if why := fingerprint_refusal(cache_path); why != "" {
+			logx.warnf("list %s: the fingerprint at %s is not read: %s", list.name, source_path(cache_path), why)
+		} else if os.exists(cache_path) {
 			logx.infof("list %s: the cached copy at %s is of another url", list.name, cache_path)
 		}
 		return "", .Unavailable
@@ -468,12 +471,16 @@ copy_is_of :: proc(list: config.Block_List, cache_path: string) -> bool {
 	if !has {
 		return false
 	}
-	data, why, read := read_cache_file(source_path(cache_path), context.temp_allocator)
-	if !read && why != "" {
-		// Or the copy reads as another url's, which is not why it is refused.
-		logx.warnf("list %s: the fingerprint at %s is not read: %s", list.name, source_path(cache_path), why)
-	}
+	data, _, read := read_cache_file(source_path(cache_path), context.temp_allocator) // lint:allow why is `fingerprint_refusal`'s to report
 	return read && string(data) == src
+}
+
+// Why the fingerprint beside the copy at `cache_path` is there and not read, or
+// "" when it is read or not there; see `read_cache_file`.
+@(private)
+fingerprint_refusal :: proc(cache_path: string) -> string {
+	_, why, _ := read_cache_file(source_path(cache_path), context.temp_allocator) // lint:allow only the reason is wanted
+	return why
 }
 
 // When the file at `path` was modified, if it is one `read_cache_file` reads.

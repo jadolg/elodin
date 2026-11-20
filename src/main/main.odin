@@ -3,7 +3,6 @@ package main
 import "core:fmt"
 import "core:mem/virtual"
 import "core:os"
-import "core:path/filepath"
 import "core:strings"
 import "core:sync"
 import "core:sys/posix"
@@ -1513,13 +1512,9 @@ stop_loops :: proc(loops: []^loop.Loop, threads: []^thread.Thread) {
 	delete(loops)
 }
 
-// Whether `path`, cleaned of trailing slashes and `.`, names a symlink.
+// Whether `path`, as `privdrop.hand_over` opens it, names a symlink.
 @(private = "file")
 is_symlink :: proc(path: string) -> bool {
-	cleaned, cerr := filepath.clean(path, context.temp_allocator)
-	if cerr != nil {
-		return false
-	}
-	info, err := os.lstat(cleaned, context.temp_allocator)
+	info, err := os.lstat(privdrop.last_component_path(path), context.temp_allocator)
 	return err == nil && info.type == .Symlink
 }
