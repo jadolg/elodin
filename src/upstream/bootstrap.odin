@@ -113,7 +113,7 @@ bootstrap_resolve :: proc(
 	if entry, found := bootstrap_cache.entries[key]; found && (keep == nil || netx.addresses_equal(entry.address, keep)) {
 		if left := -loop.moment_since(entry.expires); left > 0 {
 			sync.mutex_unlock(&bootstrap_cache.mu)
-			return entry.address, left, .None
+			return entry.address, max(left, BOOTSTRAP_MIN_TTL), .None
 		}
 	}
 	sync.mutex_unlock(&bootstrap_cache.mu)

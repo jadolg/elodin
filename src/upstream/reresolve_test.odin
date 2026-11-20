@@ -1,6 +1,7 @@
 package upstream
 
 import "core:net"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -227,16 +228,13 @@ test_an_upstream_hostname_is_asked_again_once_its_ttl_is_past :: proc(t: ^testin
 	testing.expect_value(t, ttl_mock_asked(&m), 2)
 	testing.expect(t, address_of(u) == net.Address(net.IP4_Address{127, 0, 0, 3}), "the address was not asked for again past its TTL")
 
-	// A lookup that finds the address moved lets go of the shared connection
-	// to the old one; one that finds it where it was keeps it. Asked directly,
-	// since an exchange would dial past the stand-in connection. One reference
-	// is the test's, so the drop leaves it for the test to free.
-	c := new(Pipe_Conn)
-	defer free(c)
-	c.refs = 2
+	// A lookup that finds the address moved starts a new epoch, so the
+	// connections to the old one are not reached for again (see
+	// `test_a_connection_from_before_a_move_is_not_used_again`); one that finds
+	// it where it was does not.
 	for moved in ([]bool{false, true}) {
 		sync.mutex_lock(&u.mu)
-		u.pipe = c
+		epoch := u.epoch
 		// A server cookie learned from the address held.
 		u.cookie.server_len = 8
 		client := u.cookie.client
@@ -246,10 +244,9 @@ test_an_upstream_hostname_is_asked_again_once_its_ttl_is_past :: proc(t: ^testin
 		expire_address(u, HOST + ".")
 		testing.expect_value(t, resolve_endpoint(u, refresh = true), Error.None)
 		sync.mutex_lock(&u.mu)
-		kept := u.pipe == c
-		u.pipe = nil
+		next := u.epoch != epoch
 		sync.mutex_unlock(&u.mu)
-		testing.expectf(t, kept != moved, "moved %v: the connection was kept %v", moved, kept)
+		testing.expectf(t, next == moved, "moved %v: a new epoch %v", moved, next)
 		// RFC 7873 section 5.1, RFC 9018 section 3: cookies are per server
 		// address, so a move starts afresh.
 		sync.mutex_lock(&u.mu)
@@ -259,7 +256,6 @@ test_an_upstream_hostname_is_asked_again_once_its_ttl_is_past :: proc(t: ^testin
 		testing.expectf(t, relearn == moved, "moved %v: the protocol is to be learned again %v", moved, relearn)
 		testing.expectf(t, forgot == moved && redrawn == moved, "moved %v: server cookie forgotten %v, client cookie drawn afresh %v", moved, forgot, redrawn)
 	}
-	testing.expect_value(t, sync.atomic_load(&c.refs), 1)
 	testing.expect(t, address_of(u) == net.Address(net.IP4_Address{127, 0, 0, 5}), "the moved address was not published")
 
 	// A bootstrap gone quiet: the address held is kept, the exchange is not
@@ -571,10 +567,12 @@ cookied_reply :: proc(t: ^testing.T, query: []u8, client: [COOKIE_CLIENT_LEN]u8)
 }
 
 /*
-A move draws a fresh client cookie while queries sent with the old one are
-still out: their replies echo the old one and are taken (the cookie checked is
-the one the query carried), but the server cookie they carry is the old
-address's and is not learned.
+A move draws a fresh client cookie and forgets the server cookie while queries
+sent with the old ones are still out. Their replies echo the old client cookie
+and are taken (the cookie checked is the one the query carried), but the server
+cookie they carry is the old address's and is not learned; and one that comes
+back without a cookie is refused, as the server cookie the query carried owes
+one.
 */
 @(test)
 test_replies_to_queries_from_before_a_move_keep_their_cookie :: proc(t: ^testing.T) {
@@ -583,17 +581,27 @@ test_replies_to_queries_from_before_a_move_keep_their_cookie :: proc(t: ^testing
 		return
 	}
 	defer destroy(u)
+	sync.mutex_lock(&u.mu)
+	u.cookie.server_len = copy(u.cookie.server[:], []u8{1, 2, 3, 4, 5, 6, 7, 8})
+	old := u.cookie.client
+	sync.mutex_unlock(&u.mu)
 	query, qok := cookied_query(t, u)
 	if !qok {
 		return
 	}
+	// The move: the literal changes, which a refresh publishes.
+	delete(u.spec.address, u.allocator)
+	u.spec.address = strings.clone("127.0.0.2", u.allocator)
+	testing.expect_value(t, resolve_endpoint(u, refresh = true), Error.None)
 	sync.mutex_lock(&u.mu)
-	old := u.cookie.client
-	init_cookie(u)
-	redrawn := u.cookie.client != old
+	redrawn, forgot := u.cookie.client != old, u.cookie.server_len == 0
 	sync.mutex_unlock(&u.mu)
-	if !testing.expect(t, redrawn, "the premise: the client cookie was drawn afresh") {
+	if !testing.expect(t, redrawn && forgot, "the premise: the move drew the cookies afresh") {
 		return
+	}
+	bare, _, bare_err := dns.encode_message(dns.Message{id = 0x6914, flags = {qr = true}, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}, context.temp_allocator)
+	if testing.expectf(t, bare_err == .None, "cannot encode the reply: %v", bare_err) {
+		testing.expect(t, !cookie_matches(u, query, bare), "a cookie-less reply to a query that carried a server cookie was taken")
 	}
 	reply, rok := cookied_reply(t, query, old)
 	if !rok {
@@ -651,5 +659,14 @@ test_a_refresh_keeps_to_the_family_it_holds :: proc(t: ^testing.T) {
 	addr, _, first_err := bootstrap_resolve(servers, "family.invalid", deadline)
 	_, v6 := addr.(net.IP6_Address)
 	testing.expectf(t, first_err == .None && v6, "a first lookup did not go on to AAAA: %v (%v)", addr, first_err)
+
+	// An entry about to lapse is still held for the floor by whoever finds it.
+	sync.mutex_lock(&bootstrap_cache.mu)
+	if entry, found := &bootstrap_cache.entries["family.invalid."]; found {
+		entry.expires = loop.moment_add(loop.moment_now(), time.Millisecond)
+	}
+	sync.mutex_unlock(&bootstrap_cache.mu)
+	_, held, held_err := bootstrap_resolve(servers, "family.invalid", deadline)
+	testing.expectf(t, held_err == .None && held >= BOOTSTRAP_MIN_TTL, "a cached address was held %v (%v)", held, held_err)
 	free_all(context.temp_allocator)
 }

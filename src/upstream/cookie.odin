@@ -38,6 +38,10 @@ Cookie :: struct {
 	// What the server last gave us, empty until it has.
 	server:     [COOKIE_SERVER_MAX]u8,
 	server_len: int,
+	// A move forgot a server cookie that queries still out may carry, and
+	// their replies still owe one (`cookie_matches`). Until a cookie is learned
+	// from the address moved to.
+	moved:      bool,
 }
 
 /*
@@ -121,6 +125,7 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	sync.mutex_lock(&u.mu)
 	echoed := u.cookie.client
 	held := u.cookie.server_len > 0
+	moved := u.cookie.moved
 	sync.mutex_unlock(&u.mu)
 
 	/*
@@ -152,10 +157,12 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	// upstream this server holds no cookie for - every cookie-less one - this
 	// would otherwise re-walk the query for each datagram of a spoofing flood
 	// to reach a verdict `held` had already settled.
+	// Just after a move a query may have gone out with the server cookie the
+	// move forgot: its reply owes one all the same.
 	expected := false
-	if held {
-		_, asked_with_cookie := dns.peek_edns_option(query, .Cookie)
-		expected = asked_with_cookie
+	if held || moved {
+		sent, asked_with_cookie := dns.peek_edns_option(query, .Cookie)
+		expected = asked_with_cookie && (held || len(sent) > COOKIE_CLIENT_LEN)
 	}
 
 	raw, found := reply_cookie(response)
@@ -231,6 +238,7 @@ learn_cookie :: proc(u: ^Upstream, response: []u8) {
 		return
 	}
 	u.cookie.server_len = copy(u.cookie.server[:], server)
+	u.cookie.moved = false
 }
 
 /*

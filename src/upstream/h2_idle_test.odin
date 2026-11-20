@@ -244,3 +244,41 @@ test_an_h2_conn_from_before_a_move_is_not_handed_out :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, !h2_idle_kept(&f), "the connection to the old address stayed shared")
 }
+
+/*
+One from before a move that still carries streams is not cut off: it is set
+aside to finish them, and retired once it has.
+*/
+@(test)
+test_a_busy_h2_conn_from_before_a_move_is_let_finish :: proc(t: ^testing.T) {
+	f: H2_Idle_Fixture
+	if !h2_idle_setup(t, &f) {
+		return
+	}
+	defer h2_idle_teardown(&f)
+
+	// A caller still holding it is a stream still open.
+	held, ok, err := get_h2_conn(f.u, time.Second, 200 * time.Millisecond)
+	if !testing.expectf(t, ok && held == f.hc.client, "the premise: the current connection is handed out (%v)", err) {
+		return
+	}
+	sync.mutex_lock(&f.u.mu)
+	f.u.epoch += 1
+	sync.mutex_unlock(&f.u.mu)
+	conn, fresh, _ := get_h2_conn(f.u, time.Second, 200 * time.Millisecond) // lint:allow the listener never accepts; only what became of the old connection is checked
+	if fresh && conn != nil {
+		h2.client_unref(conn)
+	}
+	sync.mutex_lock(&f.u.mu)
+	draining := f.u.h2_draining == f.hc
+	sync.mutex_unlock(&f.u.mu)
+	testing.expect(t, draining, "the busy connection was not set aside")
+	testing.expect(t, !sync.atomic_load(&f.hc.stopping), "the busy connection was cut off")
+
+	h2.client_unref(held)
+	close_idle(f.u)
+	sync.mutex_lock(&f.u.mu)
+	draining = f.u.h2_draining != nil
+	sync.mutex_unlock(&f.u.mu)
+	testing.expect(t, !draining, "the connection set aside was kept once it was done")
+}

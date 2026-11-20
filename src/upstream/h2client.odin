@@ -134,6 +134,12 @@ get_h2_conn :: proc(
 	u.connecting = true
 	stale := u.h2
 	u.h2 = nil
+	// One from before a move, still carrying streams: left to finish them.
+	if stale != nil && !h2.client_closed(stale.client) && !dialled_current_locked(u, stale.stream) {
+		if _, busy := h2.client_idle_for(stale.client); busy {
+			stale, u.h2_draining = u.h2_draining, stale
+		}
+	}
 	sync.mutex_unlock(&u.mu)
 
 	// Handed to its reader rather than joined here (#454): the reader only
@@ -350,11 +356,14 @@ release_h2_conn :: proc(hc: ^H2_Conn) {
 @(private)
 teardown_h2 :: proc(u: ^Upstream) {
 	sync.mutex_lock(&u.mu)
-	hc := u.h2
-	u.h2 = nil
+	hc, draining := u.h2, u.h2_draining
+	u.h2, u.h2_draining = nil, nil
 	sync.mutex_unlock(&u.mu)
 	if hc != nil {
 		retire_h2_conn(hc)
+	}
+	if draining != nil {
+		retire_h2_conn(draining)
 	}
 	sync.mutex_lock(&u.mu)
 	for u.h2_readers > 0 {

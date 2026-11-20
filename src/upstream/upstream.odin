@@ -184,6 +184,10 @@ Upstream :: struct {
 	// back.
 	proto:      Protocol,
 	h2:         ^H2_Conn,
+	// The shared connection a move left with streams still open on it, let
+	// finish rather than cut off; retired once idle (`close_idle`), or at
+	// teardown. Under `mu`.
+	h2_draining: ^H2_Conn,
 	/*
 	Readers still running, `h2`'s and those of connections it replaced, and the
 	cond the last of them broadcasts on as it leaves. Under `mu`. A reader is a
@@ -436,6 +440,7 @@ resolve_endpoint :: proc(
 		// ones; a query that attached its cookie just before may still take
 		// the old ones to the new address, which answers BADCOOKIE and is
 		// asked again (`exchange_with_cookie`).
+		u.cookie.moved = u.cookie.server_len > 0
 		forget_cookie(u)
 		init_cookie(u)
 		// What ALPN chose was the old address's choice.
@@ -446,8 +451,9 @@ resolve_endpoint :: proc(
 	sync.atomic_store_explicit(&u.resolved, true, .Release)
 	sync.mutex_unlock(&u.mu)
 	if moved {
+		// Connections to the old address go as each is next reached for
+		// (`dialled_current_locked`), so none dialled to the new one is lost.
 		logx.infof("upstream %s: %s now resolves to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
-		close_idle(u, all = true)
 	} else if first && ttl != 0 {
 		logx.debugf("upstream %s: resolved %s to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
 	}
@@ -1159,7 +1165,19 @@ close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 	resize(&u.idle, kept)
 
 	stale_h2 := take_idle_h2_locked(u, all)
+	drained := u.h2_draining
+	if drained != nil {
+		if _, busy := h2.client_idle_for(drained.client); busy && !h2.client_closed(drained.client) {
+			drained = nil
+		} else {
+			u.h2_draining = nil
+		}
+	}
 	sync.mutex_unlock(&u.mu)
+	if drained != nil {
+		retire_h2_conn(drained)
+		closed += 1
+	}
 	// Closed once the lock is let go, as `get_h2_conn` retires the h2
 	// connection it replaces: a TLS close writes a close_notify, nothing in
 	// closing needs `u.mu`, and every query on this upstream waits on it to
