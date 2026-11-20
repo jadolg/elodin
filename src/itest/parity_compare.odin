@@ -209,10 +209,15 @@ parity_compare :: proc(
 	return c
 }
 
-// Whether two records are of one RRset: one owner, case aside, type and class.
+// Whether two records are of one RRset: one owner, case aside, type and class,
+// and for signatures one type covered (RDATA's first two bytes), as the
+// encoder groups them.
 @(private = "file")
 pc_same_rrset :: proc(a, b: Pw_RR) -> bool {
 	if a.type != b.type || a.class != b.class || len(a.name) != len(b.name) {
+		return false
+	}
+	if a.type == 46 && (len(a.rdata) < 2 || len(b.rdata) < 2 || a.rdata[0] != b.rdata[0] || a.rdata[1] != b.rdata[1]) {
 		return false
 	}
 	for i in 0 ..< len(a.name) {

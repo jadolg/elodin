@@ -763,3 +763,69 @@ test_past_the_rrsets_it_tracks_the_rest_of_the_section_goes :: proc(t: ^testing.
 	testing.expectf(t, !truncated && len(got.additional) == 1, "at %d RRsets left out, the address did not go out: %v", DROPPED_RRSETS, got.additional)
 	free_all(context.temp_allocator)
 }
+
+/*
+Past `DROPPED_RRSETS` the rest of the additional section is left out, but glue
+a referral cannot be read without still truncates (RFC 9471 section 3.3): a
+referral whose in-domain glue sits behind nine RRsets too big to fit goes out
+with TC set, not as a delegation the client cannot follow.
+*/
+@(test)
+test_glue_past_the_tracked_rrsets_still_truncates :: proc(t: ^testing.T) {
+	text := make([]u8, 200, context.temp_allocator)
+	for j in 0 ..< len(text) {
+		text[j] = 'x'
+	}
+	strs := make([]string, 1, context.temp_allocator)
+	strs[0] = string(text)
+	OWNERS :: [?]string {
+		"r0.elsewhere.test.",
+		"r1.elsewhere.test.",
+		"r2.elsewhere.test.",
+		"r3.elsewhere.test.",
+		"r4.elsewhere.test.",
+		"r5.elsewhere.test.",
+		"r6.elsewhere.test.",
+		"r7.elsewhere.test.",
+		"r8.elsewhere.test.",
+	}
+	#assert(len(OWNERS) == DROPPED_RRSETS + 1)
+	owners := OWNERS
+	glue := make([dynamic]Record, 0, len(owners) + 1, context.temp_allocator)
+	for owner in owners {
+		append(&glue, Record{name = owner, type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = strs}})
+	}
+	in_domain := address("ns1.sub.example.com.", 53)
+	append(&glue, in_domain)
+	room := encoded_size(t, referral([]Record{in_domain})) + 32
+
+	got, truncated := encode_within(t, referral(glue[:]), room)
+	testing.expect(t, truncated && got.flags.tc, "in-domain glue past the tracked RRsets went missing with TC clear")
+	free_all(context.temp_allocator)
+}
+
+/*
+Signatures over two types at one owner are two RRsets: one that will not fit
+takes none of the other's with it.
+*/
+@(test)
+test_a_signature_over_another_type_is_another_rrset :: proc(t: ^testing.T) {
+	sig := proc(covered: Type, size: int) -> Record {
+		rdata := make([]u8, size, context.temp_allocator)
+		rdata[0], rdata[1] = u8(u16(covered) >> 8), u8(covered)
+		return Record{name = QNAME, type = .RRSIG, class = .IN, ttl = 300, data = Rdata_Raw{data = rdata}}
+	}
+	small := sig(.A, 20)
+	whole := []Record{address(QNAME, 7), small, sig(.AAAA, 300)}
+	room := encoded_size(t, message_with([]Record{address(QNAME, 7), small}))
+	got, truncated := encode_within(t, message_with(whole), room)
+	testing.expect(t, !truncated && !got.flags.tc, "TC set for additional data")
+	signed := 0
+	for rec in got.additional {
+		if rec.type == .RRSIG {
+			signed += 1
+		}
+	}
+	testing.expectf(t, signed == 1, "%d signatures went out, want the one over A: %v", signed, got.additional)
+	free_all(context.temp_allocator)
+}

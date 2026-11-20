@@ -414,10 +414,25 @@ w_readd_opt :: proc(
 }
 
 // Whether two records are of one RRset: one owner, type and class (RFC 2181
-// section 5).
+// section 5), and for signatures one type covered, so a signature that will not
+// fit takes none over another type with it.
 @(private)
 same_rrset :: proc(a, b: Record) -> bool {
-	return a.type == b.type && a.class == b.class && name_equal_fold(a.name, b.name)
+	if a.type != b.type || a.class != b.class || !name_equal_fold(a.name, b.name) {
+		return false
+	}
+	return a.type != .RRSIG || rrsig_covers(a) == rrsig_covers(b)
+}
+
+// The type an RRSIG covers: the first two bytes of its RDATA (RFC 4034 section
+// 3.1.1). Zero where the RDATA is too short to hold it.
+@(private)
+rrsig_covers :: proc(sig: Record) -> Type {
+	raw, is_raw := sig.data.(Rdata_Raw)
+	if !is_raw || len(raw.data) < 2 {
+		return Type(0)
+	}
+	return Type(u16(raw.data[0]) << 8 | u16(raw.data[1]))
 }
 
 // How many RRsets left out of the additional section `encode_message` keeps
@@ -436,11 +451,7 @@ left_out :: proc(dropped: []^Record, rec: Record) -> bool {
 		if same_rrset(d^, rec) {
 			return true
 		}
-		if rec.type != .RRSIG || rec.class != d.class || !name_equal_fold(rec.name, d.name) {
-			continue
-		}
-		raw, is_raw := rec.data.(Rdata_Raw)
-		if is_raw && len(raw.data) >= 2 && Type(u16(raw.data[0]) << 8 | u16(raw.data[1])) == d.type {
+		if rec.type == .RRSIG && rec.class == d.class && name_equal_fold(rec.name, d.name) && rrsig_covers(rec) == d.type {
 			return true
 		}
 	}
@@ -620,8 +631,11 @@ encode_message :: proc(
 	nil before the section's first record.
 
 	`dropped` holds the RRsets left out, so a later record of one - adjacent or
-	not - is passed over, and so is a signature over one (RFC 4035 section
-	3.1.1 lets a signature go and its RRset stay, not the other way round).
+	not - is passed over, and so is a signature over one written behind it (RFC
+	4035 section 3.1.1 lets a signature go and its RRset stay, not the other
+	way round). A record of one already written before another RRset, or a
+	signature written ahead of its RRset, is not taken back: that would mean
+	regrouping the section before writing it.
 	Bounded, because every record behind a drop is compared against each: past
 	`DROPPED_RRSETS` the rest of the section but its OPT record is left out,
 	which is additional data and so the reply's to do without.
@@ -652,6 +666,12 @@ encode_message :: proc(
 				// The OPT record is the message's own, re-added below if it
 				// does not fit; it is never another record's to drop.
 				if rec.type != .OPT && (dropped_n > len(dropped) || left_out(dropped[:dropped_n], rec)) {
+					// Glue a referral cannot be read without is a truncation
+					// however it is left out (RFC 9471 section 3.3).
+					if omitted_glue_truncates(m, rec) {
+						truncated = true
+						break outer
+					}
 					continue
 				}
 				if run_start == nil || !same_rrset(run_start^, rec) {
