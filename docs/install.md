@@ -119,8 +119,10 @@ Where it differs from the dynamic build:
   build applies the file, and logs `OpenSSL could not apply its configuration`
   with OpenSSL's reason when it cannot. The file can narrow elodin's TLS 1.2
   suites (see [what is implemented](protocol-support.md#what-is-implemented))
-  and raise its TLS 1.2 floor with `CipherString` and `MinProtocol`, never widen
-  or lower them.
+  and raise its TLS 1.2 floor with `CipherString`, `Ciphersuites` and
+  `MinProtocol`, never widen or lower them. A file that leaves none of the TLS
+  1.2 suites and caps TLS below 1.3 stops the server at startup, with
+  `No_Suite` and the reason in the log.
 - **Accounts come from `/etc/passwd` and `/etc/group` only.** musl has no NSS,
   so a `server.user` or `server.group` that LDAP, SSSD or systemd-userdb
   provides is `no such user` to the static build and its `--check`. Use a local

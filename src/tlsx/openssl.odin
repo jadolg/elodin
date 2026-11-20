@@ -91,6 +91,7 @@ SSL_CTRL_GET_CHAIN_CERTS :: 115
 SSL_CTRL_SET_MIN_PROTO_VERSION :: 123
 SSL_CTRL_SET_MAX_PROTO_VERSION :: 124
 SSL_CTRL_GET_MIN_PROTO_VERSION :: 130
+SSL_CTRL_GET_MAX_PROTO_VERSION :: 131
 
 SSL_MODE_RELEASE_BUFFERS :: 0x10
 
@@ -213,6 +214,7 @@ foreign libssl {
 	SSL_version :: proc(ssl: ^SSL) -> c.int ---
 	SSL_CTX_set_options :: proc(ctx: ^SSL_CTX, op: u64) -> u64 ---
 	SSL_CTX_set_cipher_list :: proc(ctx: ^SSL_CTX, list: cstring) -> c.int ---
+	SSL_CTX_set_ciphersuites :: proc(ctx: ^SSL_CTX, list: cstring) -> c.int ---
 	SSL_CTX_get_ciphers :: proc(ctx: ^SSL_CTX) -> ^OPENSSL_STACK ---
 	SSL_CTX_get_options :: proc(ctx: ^SSL_CTX) -> u64 ---
 	SSL_CIPHER_get_name :: proc(cipher: ^SSL_CIPHER) -> cstring ---
@@ -288,6 +290,10 @@ ssl_ctx_set_min_proto_version :: proc(ctx: ^SSL_CTX, version: c.long) -> bool {
 
 ssl_ctx_get_min_proto_version :: proc(ctx: ^SSL_CTX) -> c.long {
 	return SSL_CTX_ctrl(ctx, SSL_CTRL_GET_MIN_PROTO_VERSION, 0, nil)
+}
+
+ssl_ctx_get_max_proto_version :: proc(ctx: ^SSL_CTX) -> c.long {
+	return SSL_CTX_ctrl(ctx, SSL_CTRL_GET_MAX_PROTO_VERSION, 0, nil)
 }
 
 ssl_ctx_set_max_proto_version :: proc(ctx: ^SSL_CTX, version: c.long) -> bool {

@@ -942,26 +942,41 @@ set_receive_buffer :: proc(socket: net.UDP_Socket, bytes: int) -> (granted: int)
 }
 
 /*
-One TLS 1.2 handshake with `port` offering `offered`, and the suite and ALPN
-protocol agreed; an empty suite is a handshake the server refused. `failed`
-says why no handshake could be attempted at all - the client could not be
-built, could not offer that list, or could not reach the port - which says
-nothing about the server's suites.
+One TLS 1.2 handshake with `port` offering `offered`, or a TLS 1.3 one with
+`tls13`, and the suite and ALPN protocol agreed; an empty suite is a handshake
+the server refused. `failed` says why no handshake could be attempted at all -
+the client could not be built, could not offer that list, or could not reach
+the port - which says nothing about the server's suites.
 */
-tls12_handshake :: proc(port: int, offered: cstring, alpn: []string) -> (chosen, agreed, failed: string) {
-	ctx, built := raw_tls_context(tlsx.TLS1_2_VERSION, alpn)
+tls_handshake :: proc(port: int, offered: cstring, alpn: []string, tls13 := false) -> (chosen, agreed, failed: string) {
+	version := tlsx.TLS1_3_VERSION if tls13 else tlsx.TLS1_2_VERSION
+	ctx, built := raw_tls_context(version, alpn)
 	if !built {
-		return "", "", "a TLS 1.2 client context could not be built"
+		return "", "", fmt.tprintf("a TLS %x client context could not be built", version)
 	}
 	defer tlsx.context_destroy(ctx)
-	if tlsx.SSL_CTX_set_cipher_list(ctx.ptr, offered) != 1 {
+	if tls13 {
+		if !tlsx.ssl_ctx_set_min_proto_version(ctx.ptr, c.long(version)) || tlsx.SSL_CTX_set_ciphersuites(ctx.ptr, offered) != 1 {
+			return "", "", fmt.tprintf("this client cannot offer %s over TLS 1.3 alone", offered)
+		}
+	} else if tlsx.SSL_CTX_set_cipher_list(ctx.ptr, offered) != 1 {
 		return "", "", fmt.tprintf("this client cannot offer %s", offered)
 	}
 	if !tcp_port_open(port) {
 		return "", "", fmt.tprintf("nothing listens on port %d", port)
 	}
+	tlsx.ERR_clear_error()
 	conn, connected := raw_tls_connect(ctx, port)
 	if !connected {
+		// A refusal is the server's alert; anything else is no answer at all.
+		refused := false
+		for e := tlsx.ERR_get_error(); e != 0; e = tlsx.ERR_get_error() {
+			reason := e & ERR_REASON_MASK
+			refused ||= reason == SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE || reason == SSL_R_TLSV1_ALERT_PROTOCOL_VERSION
+		}
+		if !refused {
+			return "", "", "the handshake failed without the server refusing it with an alert"
+		}
 		return "", "", ""
 	}
 	defer raw_tls_close(conn)
@@ -971,6 +986,16 @@ tls12_handshake :: proc(port: int, offered: cstring, alpn: []string) -> (chosen,
 	chosen = strings.clone_from_cstring(tlsx.SSL_CIPHER_get_name(SSL_get_current_cipher(conn.ssl)), context.temp_allocator)
 	return chosen, strings.clone(string(data[:n]), context.temp_allocator), ""
 }
+
+// From `<openssl/err.h>` and `<openssl/sslerr.h>`: the reason in an error code,
+// and the two alerts a server refuses a handshake with - no suite in common, or
+// a version it will not speak.
+@(private = "file")
+ERR_REASON_MASK :: 0x7FFFFF
+@(private = "file")
+SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE :: 1040
+@(private = "file")
+SSL_R_TLSV1_ALERT_PROTOCOL_VERSION :: 1070
 
 foreign import cipher_ssl "system:ssl"
 

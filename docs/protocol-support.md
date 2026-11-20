@@ -46,7 +46,8 @@ RFC 6761 and RFC 7686 answered here instead of forwarded.
 TLS is 1.2 or 1.3, on the DoT and DoH listeners and towards upstreams and list
 hosts alike. Over TLS 1.2 the only suites are ECDHE with AES-GCM or
 ChaCha20-Poly1305 (RFC 9325 section 4.2), and the listeners pick by their own
-order, keeping ChaCha20 for a client that puts it first. A peer that offers
+order, keeping ChaCha20 for a client that puts it first. TLS 1.3 follows the
+same order: AES-128-GCM, AES-256-GCM, then ChaCha20-Poly1305. A peer that offers
 only static RSA or CBC suites, which RFC 9325 section 4.1 and, for DoH over
 HTTP/2, RFC 9113 Appendix A rule out, cannot connect.
 

@@ -1,6 +1,8 @@
 package itest
 
 import "core:fmt"
+import "core:os"
+import "core:time"
 import "elodin:dns"
 import "elodin:tlsx"
 
@@ -49,6 +51,19 @@ ssl_conf = elodin_ssl
 system_default = elodin_system
 [elodin_system]
 MinProtocol = TLSv1.3
+`
+
+// A host policy that leaves elodin nothing: no suite of its own over TLS 1.2,
+// and no TLS 1.3 (#687).
+@(private = "file")
+NOTHING_LEFT_CONF :: `openssl_conf = elodin_itest
+[elodin_itest]
+ssl_conf = elodin_ssl
+[elodin_ssl]
+system_default = elodin_system
+[elodin_system]
+CipherString = ECDHE-ECDSA-AES128-SHA
+MaxProtocol = TLSv1.2
 `
 
 // An EVP property no OpenSSL knows. `config_diagnostics`, which openSUSE's file
@@ -148,12 +163,12 @@ run_openssl_conf_cases :: proc(r: ^Runner) {
 			if srv, ok := start_with_conf(r, NAME, conf); ok {
 				defer stop_server(&srv)
 				// The policy's own suite, which elodin's list holds too.
-				chosen, _, failed := tls12_handshake(srv.dot_port, "ECDHE-ECDSA-AES256-GCM-SHA384", nil)
+				chosen, _, failed := tls_handshake(srv.dot_port, "ECDHE-ECDSA-AES256-GCM-SHA384", nil)
 				if check(r, failed == "", "%s", failed) {
 					check(r, chosen == "ECDHE-ECDSA-AES256-GCM-SHA384", "the policy's own suite: negotiated %q", chosen)
 				}
 				// One elodin's list holds and the policy does not.
-				chosen, _, failed = tls12_handshake(srv.dot_port, "ECDHE-ECDSA-AES128-GCM-SHA256", nil)
+				chosen, _, failed = tls_handshake(srv.dot_port, "ECDHE-ECDSA-AES128-GCM-SHA256", nil)
 				if check(r, failed == "", "%s", failed) {
 					want := "ECDHE-ECDSA-AES128-GCM-SHA256" if static else ""
 					check(r, chosen == want, "static %v: a suite the policy left out: negotiated %q, want %q", static, chosen, want)
@@ -169,10 +184,36 @@ run_openssl_conf_cases :: proc(r: ^Runner) {
 			start_case(r, NAME)
 			if srv, ok := start_with_conf(r, NAME, conf); ok {
 				defer stop_server(&srv)
-				chosen, _, failed := tls12_handshake(srv.dot_port, "ECDHE-ECDSA-AES128-GCM-SHA256", nil)
+				chosen, _, failed := tls_handshake(srv.dot_port, "ECDHE-ECDSA-AES128-GCM-SHA256", nil)
 				if check(r, failed == "", "%s", failed) {
 					want := "ECDHE-ECDSA-AES128-GCM-SHA256" if static else ""
 					check(r, chosen == want, "static %v: a TLS 1.2 client negotiated %q, want %q", static, chosen, want)
+				}
+			}
+			end_case(r)
+		}
+	}
+	{
+		NAME :: "tls: a host policy leaving no suite and no tls 1.3 stops a dynamic build at startup, naming why (#687)"
+		if conf, conf_ok := write_work_file(r, "openssl-nothing-left.cnf", NOTHING_LEFT_CONF); conf_ok {
+			start_case(r, NAME)
+			if r.static {
+				// The static build reads no openssl.cnf, so it serves as ever.
+				if srv, ok := start_with_conf(r, NAME, conf); ok {
+					stop_server(&srv)
+				}
+			} else if env, env_ok := environ_without(r, NAME, {"OPENSSL_CONF="}, extra = 1); env_ok {
+				append(&env, fmt.tprintf("OPENSSL_CONF=%s", conf))
+				udp_port, dot_port := next_port(r), next_port(r)
+				srv, started := start_server_raw(r, openssl_conf_config(r, udp_port, dot_port), udp_port, env = env[:])
+				if check(r, started, "cannot start the binary") {
+					defer stop_server(&srv)
+					state, werr := os.process_wait(srv.process, 10 * time.Second)
+					if check(r, werr == nil && state.exited, "the server started with no TLS it could speak") {
+						srv.running = false
+						check(r, state.exit_code != 0, "the refusal exited 0")
+						check(r, log_contains(&srv, "No_Suite"), "the refusal does not say why:\n%s", read_log(&srv))
+					}
 				}
 			}
 			end_case(r)
