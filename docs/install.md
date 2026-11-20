@@ -277,7 +277,11 @@ saved — and the real and effective ids are read back from the kernel before th
 drop is reported. A drop that was configured and did not happen ends the
 process. A misspelt account name fails `--check`; running as root with no
 `server.user` logs a warning. `blocking.cache_dir` changes owner along with the
-process, since a refresh hours later has to reopen it. Started this way, elodin
+process, since a refresh hours later has to reopen it: the directory and,
+one level down, its subdirectories and files with a single link. Anything else
+in there - a hard link, a symlink, a FIFO - keeps its owner and is named in a
+warning, since a chown of a hard link as root would hand over the file it links
+to, wherever that file is. Started this way, elodin
 downloads and parses the blocklists before it binds, so that much happens as
 root; the first arrangement avoids it.
 

@@ -21,6 +21,7 @@ package privdrop
 import "core:c"
 import "core:os"
 import "core:strings"
+import "core:sys/linux"
 import "core:sys/posix"
 import "elodin:netx"
 
@@ -288,32 +289,100 @@ not taken over; see `can_reopen`.
 
 One level deep, because that is the shape of the directory - a flat set of
 `.list` files - and a recursive chown as root over a path an operator supplied
-is a much larger thing to get right. `lchown` rather than `chown` so a symlink
-planted in there is retargeted rather than followed.
+is a much larger thing to get right.
+
+The directory is the account's after the first start, so anything running as it
+can put entries in. Only a directory, or a regular file with one link, is taken:
+a hard link is the same inode as a file anywhere else on the filesystem, and
+chowning it as root would hand that file over too. That is the check
+systemd-tmpfiles makes before a chown of its own. Symlinks, devices, FIFOs and
+sockets are left alone as well. Every entry is looked at and chowned through
+one descriptor (`O_PATH`, `O_NOFOLLOW`), so it cannot be swapped between the
+two, and root never opens it for reading. `skipped` names the entries left as
+they were, in `allocator`.
 
 A path that does not exist is not a failure: nothing has been cached yet, and
 the process creates the directory itself, under its own account.
 */
-hand_over :: proc(path: string, id: Identity) -> bool {
+hand_over :: proc(path: string, id: Identity, allocator := context.temp_allocator) -> (ok: bool, skipped: []string) {
 	if path == "" || !os.exists(path) {
-		return true
+		return true, nil
 	}
-
-	ok := take(path, id)
-	entries, err := os.read_directory_by_path(path, -1, context.temp_allocator)
-	if err != nil {
-		return ok
+	cpath := strings.clone_to_cstring(path, context.temp_allocator)
+	dir := posix.open(cpath, {.DIRECTORY, .NOFOLLOW, .CLOEXEC})
+	if dir == -1 {
+		return false, nil
 	}
-	for entry in entries {
-		ok = take(entry.fullpath, id) && ok
+	ok = posix.fchown(dir, id.uid, id.gid) == .OK
+	// `fdopendir` owns the descriptor from here; `closedir` closes it.
+	stream := posix.fdopendir(dir)
+	if stream == nil {
+		posix.close(dir)
+		return false, nil
 	}
-	return ok
+	defer posix.closedir(stream)
+	left := make([dynamic]string, allocator)
+	for {
+		entry := posix.readdir(stream)
+		if entry == nil {
+			break
+		}
+		name := cstring(&entry.d_name[0])
+		if name == "." || name == ".." {
+			continue
+		}
+		switch take(linux.Fd(dir), name, id) {
+		case .Taken:
+		case .Skipped:
+			append(&left, strings.clone_from_cstring(name, allocator))
+		case .Failed:
+			ok = false
+		}
+	}
+	return ok, left[:]
 }
 
 @(private)
-take :: proc(path: string, id: Identity) -> bool {
-	cpath := strings.clone_to_cstring(path, context.temp_allocator)
-	return posix.lchown(cpath, id.uid, id.gid) == .OK
+Take :: enum {
+	Taken,
+	Skipped,
+	Failed,
+}
+
+/*
+Give one entry of `dir` to `id`, if it is a directory or a regular file with a
+single link; see `hand_over`.
+*/
+@(private)
+take :: proc(dir: linux.Fd, name: cstring, id: Identity) -> Take {
+	fd, oerr := linux.openat(dir, name, {.PATH, .NOFOLLOW, .CLOEXEC})
+	if oerr != .NONE {
+		return .Failed
+	}
+	defer linux.close(fd)
+	st: linux.Stat
+	if linux.fstat(fd, &st) != .NONE {
+		return .Failed
+	}
+	if !may_take(st) {
+		return .Skipped
+	}
+	// `fchown` refuses an `O_PATH` descriptor; `fchownat` with an empty name
+	// and AT_EMPTY_PATH takes it. `core:sys/linux`'s wrapper passes no flags.
+	empty: cstring = ""
+	ret := linux.syscall(linux.SYS_fchownat, fd, rawptr(empty), id.uid, id.gid, AT_EMPTY_PATH)
+	return .Taken if ret == 0 else .Failed
+}
+
+// `<fcntl.h>`: a `*at` call on the descriptor itself rather than on a name in it.
+@(private)
+AT_EMPTY_PATH :: 0x1000
+
+// A directory, or a regular file no other name points at.
+@(private)
+may_take :: proc(st: linux.Stat) -> bool {
+	kind := st.mode & linux.S_IFMT
+	return kind == linux.S_IFDIR || (kind == linux.S_IFREG && st.nlink == 1)
 }
 
 /*

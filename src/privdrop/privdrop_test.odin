@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:log"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 import "core:sys/posix"
 import "core:testing"
 
@@ -171,7 +172,9 @@ test_hand_over_covers_the_directory_and_its_entries :: proc(t: ^testing.T) {
 		gid  = posix.getegid(),
 		name = "self",
 	}
-	testing.expect(t, hand_over(dir, self), "handing a path to its own owner should succeed")
+	handed, skipped := hand_over(dir, self)
+	testing.expect(t, handed, "handing a path to its own owner should succeed")
+	testing.expectf(t, len(skipped) == 0, "a plain file was left as it was: %v", skipped)
 
 	if skip_when_root() {
 		return
@@ -181,7 +184,124 @@ test_hand_over_covers_the_directory_and_its_entries :: proc(t: ^testing.T) {
 		gid  = 0,
 		name = "root",
 	}
-	testing.expect(t, !hand_over(dir, other), "an unprivileged chown to root should be reported as failed")
+	handed, skipped = hand_over(dir, other)
+	testing.expect(t, !handed, "an unprivileged chown to root should be reported as failed")
+	testing.expectf(t, len(skipped) == 0, "a plain file was left as it was: %v", skipped)
+}
+
+/*
+Only a directory, or a regular file with a single link, is handed over (#688).
+A hard link is the same inode as a file elsewhere, which a chown as root would
+hand over too; a symlink, a FIFO and the like are not elodin's output either.
+Handed to its own owner, which any user can do, so what the test reads is which
+entries `hand_over` took and which it left.
+*/
+@(test)
+test_hand_over_takes_only_directories_and_singly_linked_files :: proc(t: ^testing.T) {
+	dir, ok := scratch_dir(t, "elodin-privdrop-kinds")
+	if !ok {
+		return
+	}
+	defer os.remove_all(dir)
+	elsewhere, eok := scratch_dir(t, "elodin-privdrop-elsewhere")
+	if !eok {
+		return
+	}
+	defer os.remove_all(elsewhere)
+
+	path := proc(dir, name: string) -> cstring {
+		return fmt.ctprintf("%s/%s", dir, name)
+	}
+	outside := path(elsewhere, "outside")
+	if !testing.expect(t, os.write_entire_file(string(outside), []u8{'x'}) == nil, "cannot write the file outside") {
+		return
+	}
+	if !testing.expect(t, os.write_entire_file(string(path(dir, "plain.list")), []u8{'x'}) == nil, "cannot write plain.list") {
+		return
+	}
+	if !testing.expect(t, posix.mkdir(path(dir, "sub"), {.IRUSR, .IWUSR, .IXUSR}) == .OK, "cannot make sub") {
+		return
+	}
+	if !testing.expect(t, posix.symlink(outside, path(dir, "symlink.list")) == .OK, "cannot make symlink.list") {
+		return
+	}
+	if !testing.expect(t, posix.mkfifo(path(dir, "fifo.list"), {.IRUSR, .IWUSR}) == .OK, "cannot make fifo.list") {
+		return
+	}
+	// A hard link to a file of this user's own, which `fs.protected_hardlinks`
+	// allows: what matters is the second link, not whose file it is.
+	if !testing.expect(t, posix.link(outside, path(dir, "hardlink.list")) == .OK, "cannot make hardlink.list") {
+		return
+	}
+
+	self := Identity {
+		uid  = posix.geteuid(),
+		gid  = posix.getegid(),
+		name = "self",
+	}
+	handed, skipped := hand_over(dir, self)
+	testing.expect(t, handed, "handing the directory over failed")
+	slice.sort(skipped)
+	testing.expectf(t, slice.equal(skipped, []string{"fifo.list", "hardlink.list", "symlink.list"}), "left as they were: %v", skipped)
+}
+
+/*
+As root, the same directory handed to another account: the file a hard link and
+a symlink in it point at keeps its owner, and the plain file is the account's.
+*/
+@(test)
+test_hand_over_as_root_leaves_a_linked_file_alone :: proc(t: ^testing.T) {
+	if posix.geteuid() != 0 {
+		log.info("skipped: handing a file to another account needs root")
+		return
+	}
+	dir, ok := scratch_dir(t, "elodin-privdrop-root")
+	if !ok {
+		return
+	}
+	defer os.remove_all(dir)
+	elsewhere, eok := scratch_dir(t, "elodin-privdrop-root-elsewhere")
+	if !eok {
+		return
+	}
+	defer os.remove_all(elsewhere)
+
+	path := proc(dir, name: string) -> cstring {
+		return fmt.ctprintf("%s/%s", dir, name)
+	}
+	outside := path(elsewhere, "outside")
+	plain := path(dir, "plain.list")
+	for p in ([]cstring{outside, plain}) {
+		if !testing.expectf(t, os.write_entire_file(string(p), []u8{'x'}) == nil, "cannot write %s", p) {
+			return
+		}
+	}
+	if !testing.expect(t, posix.link(outside, path(dir, "hardlink.list")) == .OK, "cannot make hardlink.list") {
+		return
+	}
+	if !testing.expect(t, posix.symlink(outside, path(dir, "symlink.list")) == .OK, "cannot make symlink.list") {
+		return
+	}
+
+	nobody := Identity {
+		uid  = 65534,
+		gid  = 65534,
+		name = "nobody",
+	}
+	handed, skipped := hand_over(dir, nobody)
+	testing.expect(t, handed, "handing the directory over failed")
+	slice.sort(skipped)
+	testing.expectf(t, slice.equal(skipped, []string{"hardlink.list", "symlink.list"}), "left as they were: %v", skipped)
+	owner := proc(p: cstring) -> posix.uid_t {
+		st: posix.stat_t
+		if posix.stat(p, &st) != .OK {
+			return max(posix.uid_t)
+		}
+		return st.st_uid
+	}
+	testing.expectf(t, owner(outside) == 0, "the file outside was given to uid %d", owner(outside))
+	// The positive half: the handing over did happen.
+	testing.expectf(t, owner(plain) == nobody.uid, "the plain file is uid %d's", owner(plain))
 }
 
 @(test)
@@ -193,7 +313,9 @@ test_hand_over_ignores_a_path_that_is_not_there :: proc(t: ^testing.T) {
 	}
 	// A cache directory that was never created is not something to fail over:
 	// the process makes it itself on the next refresh, under its own account.
-	testing.expect(t, hand_over("/nonexistent/elodin-cache", self), "a missing path should not be an error")
+	handed, skipped := hand_over("/nonexistent/elodin-cache", self)
+	testing.expect(t, handed, "a missing path should not be an error")
+	testing.expectf(t, len(skipped) == 0, "a missing path left entries: %v", skipped)
 }
 
 /*
