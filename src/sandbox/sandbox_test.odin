@@ -521,7 +521,8 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 			fmt.eprintfln("sandbox: Landlock is not available here, so %s is not tested", names[i])
 			continue
 		}
-		testing.expectf(t, out.exited && out.status == 0, "%s: the child's failed checks: %b, killed by %v", names[i], out.status, out.signal)
+		testing.expectf(t, out.exited, "%s: the child was killed by %v", names[i], out.signal)
+		testing.expectf(t, out.status == 0, "%s: the child's failed checks: %b", names[i], out.status)
 	}
 }
 
