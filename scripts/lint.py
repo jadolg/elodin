@@ -42,7 +42,10 @@ TREE = [
      "strings.to_lower maps non-ASCII letters onto ASCII ones (U+0130 to i); use dns.name_fold"),
     ("line-number", r"\.odin:[0-9]+", lambda p: True,
      "name the symbol, not a line number, which goes stale"),
-    ("posix-open-flags", r"posix\.(open|openat)\(.*\.(DIRECTORY|NOFOLLOW|DIRECT|LARGEFILE)\b|posix\.O_Flags\{.*\.(DIRECTORY|NOFOLLOW|DIRECT|LARGEFILE)\b", lambda p: True,
+    ("posix-open-flags",
+     r"posix\.(open|openat)\(.*\.(DIRECTORY|NOFOLLOW|DIRECT|LARGEFILE)\b"
+     r"|posix\.O_Flags\{.*\.(DIRECTORY|NOFOLLOW|DIRECT|LARGEFILE)\b",
+     lambda p: True,
      "core:sys/posix's O_DIRECTORY, O_NOFOLLOW, O_DIRECT and O_LARGEFILE are the x86 values on every architecture; open with core:sys/linux"),
 ]
 
