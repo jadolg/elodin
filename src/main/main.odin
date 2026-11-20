@@ -1013,7 +1013,7 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 			)
 		} else if !handed {
 			logx.warnf(
-				"could not give %q to %s; the lists are in effect but will be re-downloaded on each start",
+				"could not give %q to %s; the lists are in effect, but the refreshes after the drop cannot update the cached copies",
 				cfg.blocking.cache_dir,
 				cfg.server.user,
 			)

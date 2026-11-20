@@ -875,6 +875,16 @@ test_a_cached_copy_is_written_for_its_owner :: proc(t: ^testing.T) {
 	}
 	if posix.geteuid() == 0 {
 		owner = {uid = 65534, gid = 65534, set = true}
+		// Not where no chown to 65534 can succeed - a user namespace mapping
+		// no such uid - which `test_a_copy_that_cannot_be_given_is_kept` is for.
+		probe := fmt.tprintf("%s/probe", dir)
+		if !testing.expect(t, os.write_entire_file(probe, "x") == nil, "cannot write the probe") {
+			return
+		}
+		if posix.chown(strings.clone_to_cstring(probe, context.temp_allocator), owner.uid, owner.gid) != .OK {
+			log.info("skipped: a chown to 65534 fails here")
+			return
+		}
 	}
 	testing.expect_value(t, write_cache_file(path, transmute([]byte)string("0.0.0.0 o.example\n"), owner), nil)
 	st: posix.stat_t

@@ -468,7 +468,11 @@ copy_is_of :: proc(list: config.Block_List, cache_path: string) -> bool {
 	if !has {
 		return false
 	}
-	data, _, read := read_cache_file(source_path(cache_path), context.temp_allocator) // lint:allow the reason is for the copy, not its fingerprint
+	data, why, read := read_cache_file(source_path(cache_path), context.temp_allocator)
+	if !read && why != "" {
+		// Or the copy reads as another url's, which is not why it is refused.
+		logx.warnf("list %s: the fingerprint at %s is not read: %s", list.name, source_path(cache_path), why)
+	}
 	return read && string(data) == src
 }
 
@@ -511,27 +515,36 @@ read_cache_file :: proc(path: string, allocator := context.allocator, owner := c
 		}
 		return nil, fmt.tprintf("it cannot be opened (%v)", errno), false
 	}
+	defer posix.close(fd)
 	st: posix.stat_t
 	if posix.fstat(fd, &st) != .OK {
-		posix.close(fd)
 		return nil, "it cannot be read", false
 	}
 	if refusal := cache_refusal(st, owner); refusal != "" {
-		posix.close(fd)
 		return nil, refusal, false
 	}
-	// `os` closes the descriptor with the file.
-	f := os.new_file(uintptr(fd), path)
-	if f == nil {
-		posix.close(fd)
-		return nil, "it cannot be read", false
+	/*
+	Read from the descriptor itself. `os.new_file` would wrap it, but panics
+	where it cannot name it through /proc - a chroot without one - which would
+	stop the start over a copy it can do without.
+	*/
+	out := make([dynamic]byte, 0, int(st.st_size) + 1, allocator)
+	chunk: [16 * 1024]byte
+	for {
+		n := posix.read(fd, &chunk[0], len(chunk))
+		if n < 0 && posix.errno() == .EINTR {
+			continue
+		}
+		if n < 0 {
+			delete(out)
+			return nil, fmt.tprintf("it cannot be read (%v)", posix.errno()), false
+		}
+		if n == 0 {
+			break
+		}
+		append(&out, ..chunk[:n])
 	}
-	defer os.close(f)
-	bytes, err := os.read_entire_file_from_file(f, allocator)
-	if err != nil {
-		return nil, fmt.tprintf("it cannot be read (%v)", err), false
-	}
-	return bytes, "", true
+	return out[:], "", true
 }
 
 /*

@@ -231,6 +231,15 @@ test_hand_over_as_root_takes_the_directory_alone :: proc(t: ^testing.T) {
 		gid  = 65534,
 		name = "nobody",
 	}
+	// Not where no chown to 65534 can succeed: a user namespace mapping no
+	// such uid.
+	if posix.chown(plain, nobody.uid, nobody.gid) != .OK {
+		log.info("skipped: a chown to 65534 fails here")
+		return
+	}
+	if !testing.expect(t, posix.chown(plain, 0, 0) == .OK, "cannot give the probe back") {
+		return
+	}
 	testing.expect(t, hand_over(dir, nobody), "handing the directory over failed")
 	owner := proc(p: cstring) -> posix.uid_t {
 		st: posix.stat_t

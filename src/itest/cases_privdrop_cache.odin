@@ -59,6 +59,12 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 		blocking = fmt.tprintf(`{{ enabled: true, cache_dir: %q, lists: ["http://127.0.0.1:%d/hosts.txt"] }}`, cache_dir, http_port),
 		extra = "server: { user: nobody }",
 	)
+	// Whatever uid `nobody` is here: 65534 on most systems, 99 on older ones.
+	account := posix.getpwnam("nobody")
+	if !check(r, account != nil, "there is no nobody account") {
+		return
+	}
+	nobody_uid := account.pw_uid
 	srv, ok := start_server(r, Server_Options{config = conf, udp_port = udp_port, allow_fetch = true})
 	if !ok {
 		return
@@ -114,7 +120,9 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 	)
 	if check(r, reload_to(r, &srv, later, "later.txt: 1 rules"), "the reload never downloaded the second list:\n%s", read_log(&srv)) {
 		res := query_udp(udp_port, build_query("later.test.", u16(dns.Type.A)))
-		check(r, res.ok, "no answer after a download as the account; log:\n%s", read_log(&srv))
+		if check(r, res.ok, "no answer after a download as the account; log:\n%s", read_log(&srv)) {
+			check(r, parse_header(r, res.wire).rcode == int(dns.Rcode.NX_Domain), "the list downloaded after the drop was not applied")
+		}
 		// The copy was written, by the account: the write after the drop is
 		// what reached the `fchown` this case exists for.
 		cached := false
@@ -126,7 +134,7 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 				}
 				cached = true
 				if uid, read := owner(entry.fullpath); check(r, read, "cannot stat %s", entry.fullpath) {
-					check(r, uid == 65534, "%s, written after the drop, is uid %d's", entry.name, uid)
+					check(r, uid == nobody_uid, "%s, written after the drop, is uid %d's, not nobody's (%d)", entry.name, uid, nobody_uid)
 				}
 			}
 		}
