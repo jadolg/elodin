@@ -2,6 +2,7 @@ package dnssec
 
 import "core:fmt"
 import "core:log"
+import "core:strings"
 import "core:testing"
 
 /*
@@ -230,8 +231,7 @@ DD_FIXTURES := []Fixture{
 
 @(test)
 test_a_sha1_ds_is_ignored_beside_a_stronger_one :: proc(t: ^testing.T) {
-	if !digest_supported(DIGEST_SHA1) {
-		log.info("skipped: this host's crypto policy refuses SHA-1 digests")
+	if !dd_supported() {
 		return
 	}
 	cases := []struct {
@@ -251,14 +251,16 @@ test_a_sha1_ds_is_ignored_beside_a_stronger_one :: proc(t: ^testing.T) {
 		answer := scenario_fixture(DD_FIXTURES, fmt.tprintf("dd_%s_answer", c.zone[2:]))
 		result := validate(v, qname, .A, answer, fixture_now())
 		testing.expectf(t, result.status == c.status, "%s: got %v (%q / %q), want %v", qname, result.status, result.reason, result.detail, c.status)
+		if c.status == .Bogus {
+			testing.expectf(t, strings.contains(result.detail, SHA1_DS_IGNORED), "%s: the detail does not say SHA-1 was set aside: %q", qname, result.detail)
+		}
 	}
 	free_all(context.temp_allocator)
 }
 
 @(test)
 test_a_sha1_trust_anchor_is_ignored_beside_a_stronger_one :: proc(t: ^testing.T) {
-	if !digest_supported(DIGEST_SHA1) {
-		log.info("skipped: this host's crypto policy refuses SHA-1 digests")
+	if !dd_supported() {
 		return
 	}
 	answer := scenario_fixture(DD_FIXTURES, "dd_sha1_answer")
@@ -273,6 +275,7 @@ test_a_sha1_trust_anchor_is_ignored_beside_a_stronger_one :: proc(t: ^testing.T)
 		defer destroy_validator(v)
 		result := validate(v, "www.ddsha1.", .A, answer, fixture_now())
 		testing.expectf(t, result.status == .Bogus, "a SHA-1 anchor beside a SHA-256 one: got %v (%q)", result.status, result.reason)
+		testing.expectf(t, strings.contains(result.detail, SHA1_DS_IGNORED), "the detail does not say SHA-1 was set aside: %q", result.detail)
 	}
 	free_all(context.temp_allocator)
 }
@@ -280,8 +283,7 @@ test_a_sha1_trust_anchor_is_ignored_beside_a_stronger_one :: proc(t: ^testing.T)
 // Only a usable SHA-256 or SHA-384 DS of its type's length puts SHA-1 aside.
 @(test)
 test_ds_set_reading :: proc(t: ^testing.T) {
-	if !digest_supported(DIGEST_SHA1) || !digest_supported(DIGEST_SHA256) || !digest_supported(DIGEST_SHA384) {
-		log.info("skipped: this host's crypto policy refuses a DS digest")
+	if !dd_supported() {
 		return
 	}
 	testing.expect(t, !algorithm_supported(253), "premise: algorithm 253 is one nothing implements")
@@ -305,4 +307,26 @@ test_ds_set_reading :: proc(t: ^testing.T) {
 		checkable, skip_sha1 := ds_set_reading(c.set)
 		testing.expectf(t, checkable == c.checkable && skip_sha1 == c.skip_sha1, "%s: checkable %v, skip SHA-1 %v", c.name, checkable, skip_sha1)
 	}
+}
+
+/*
+Whether this host's crypto policy runs everything the fixtures need: Ed25519
+and the three DS digests. A host refusing SHA-384, say, reads `ddwrong384.`'s
+SHA-384 DS as unusable and follows the SHA-1 one, which is right there and
+wrong here.
+*/
+@(private = "file")
+dd_supported :: proc() -> bool {
+	probe_algorithms()
+	for digest in ([]u8{DIGEST_SHA1, DIGEST_SHA256, DIGEST_SHA384}) {
+		if !digest_supported(digest) {
+			log.infof("skipped: this host's crypto policy refuses DS digest type %d", digest)
+			return false
+		}
+	}
+	if !algorithm_supported(ALG_ED25519) {
+		log.info("skipped: this host's crypto policy refuses Ed25519")
+		return false
+	}
+	return true
 }

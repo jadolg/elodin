@@ -4604,8 +4604,13 @@ fetch_keys :: proc(
 	scratch := Signing_Scratch {
 		budget = budget,
 	}
+	set_aside := false
 	ds_loop: for ds in ds_set {
-		if !ds_usable(ds) || (skip_sha1 && ds.digest_type == DIGEST_SHA1) {
+		if !ds_usable(ds) {
+			continue
+		}
+		if skip_sha1 && ds.digest_type == DIGEST_SHA1 {
+			set_aside = true
 			continue
 		}
 		for key in parsed {
@@ -4697,11 +4702,19 @@ fetch_keys :: proc(
 		if dns.name_equal_fold(closest_anchor(v.anchors, zone), zone) {
 			why = "no DNSKEY both matches a trust anchor and signs the DNSKEY set"
 		}
+		if set_aside {
+			why = strings.concatenate({why, SHA1_DS_IGNORED}, allocator)
+		}
 		broke_at(budget, zone, why, allocator, Lapsed{} if tried else lapsed)
 		return nil, .Bogus, {}, 0
 	}
 	return nil, .Insecure, {}, 0
 }
+
+// Said beside a bogus verdict reached with SHA-1 records set aside, which a
+// key matching one of them would otherwise not explain.
+@(private)
+SHA1_DS_IGNORED :: "; a SHA-1 DS is ignored beside a SHA-256 or SHA-384 one (RFC 4509 section 3)"
 
 /*
 What a DS set offers to `fetch_keys`: whether anything in it names something

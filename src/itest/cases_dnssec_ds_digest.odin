@@ -222,6 +222,9 @@ run_dnssec_ds_digest_cases :: proc(r: ^Runner) {
 		qname: string,
 		rcode: dns.Rcode,
 	} {
+		// The premise: this host follows a SHA-1 DS at all, or the bogus
+		// cases below would be bogus for that alone.
+		{"www.ddsha1.", .No_Error},
 		{"www.ddboth.", .No_Error},
 		{"www.ddwrong.", .Serv_Fail},
 		{"www.ddwrong384.", .Serv_Fail},

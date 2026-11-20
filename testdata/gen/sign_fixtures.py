@@ -95,11 +95,9 @@ class Key:
         acc += (acc >> 16) & 0xFFFF
         return acc & 0xFFFF
 
-    def ds(self, digest_type=DIGEST_SHA256):
-        """The DS RDATA for this key, as its parent would publish it."""
-        data = canonical_name(self.zone) + self.rdata
-        digest = hashlib.sha256(data).digest()
-        return struct.pack("!HBB", self.tag, self.algorithm, digest_type) + digest
+    def ds(self):
+        """The SHA-256 DS RDATA for this key, as its parent would publish it."""
+        return digest_ds(self, DIGEST_SHA256)
 
     def ds_text(self):
         """The same DS in presentation form, for a trust anchor in the tests."""
