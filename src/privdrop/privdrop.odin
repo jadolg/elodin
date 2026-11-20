@@ -19,8 +19,8 @@ is that account is narrowed further by `sandbox`.
 package privdrop
 
 import "core:c"
-import "core:os"
 import "core:strings"
+import "core:sys/linux"
 import "core:sys/posix"
 import "elodin:netx"
 
@@ -279,41 +279,66 @@ already :: proc(id: Identity) -> bool {
 /*
 Hand a directory the process keeps writing to over to `id`.
 
-The blocklist cache is elodin's own output and opened by name after the drop:
+The blocklist cache is elodin's own output and written by name after the drop:
 the lists are downloaded before the listeners bind, so the files land under
 whoever started the process, and a refresh hours later would then fail on every
 one of them. Ownership moves with the process; a log file the process creates is
 the account's from the start (`logx.init`). The files an operator names and SIGHUP reads again are
 not taken over; see `can_reopen`.
 
-One level deep, because that is the shape of the directory - a flat set of
-`.list` files - and a recursive chown as root over a path an operator supplied
-is a much larger thing to get right. `lchown` rather than `chown` so a symlink
-planted in there is retargeted rather than followed.
+The directory alone, and nothing in it. Owning the directory is what a refresh
+needs - it writes each copy afresh and renames it into place - and the files
+elodin writes there are given to the account as they are written
+(`server.set_cache_owner`). Anything else in there, once the directory is the
+account's, may be anything at all: a hard link is the same inode as a file
+elsewhere, and no test of what is found there - its type, its links, its owner,
+its name - tells a copy elodin wrote from a file the account linked in. Opened
+`O_DIRECTORY|O_NOFOLLOW` and chowned through that descriptor, so a symlink in
+its place is not followed.
 
 A path that does not exist is not a failure: nothing has been cached yet, and
 the process creates the directory itself, under its own account.
 */
-hand_over :: proc(path: string, id: Identity) -> bool {
-	if path == "" || !os.exists(path) {
-		return true
+/*
+`path` without its trailing slashes and `/.`: with either, the kernel resolves
+a symlink at what reads as the last component before O_NOFOLLOW is looked at.
+Only those: `..` is resolved after the links before it, so taking it out by
+text would name another directory than the one the process writes to.
+*/
+last_component_path :: proc(path: string) -> string {
+	p := path
+	for len(p) > 1 {
+		switch {
+		case strings.has_suffix(p, "/"):
+			p = p[:len(p) - 1]
+		case strings.has_suffix(p, "/."):
+			p = p[:len(p) - 2]
+		case:
+			return p
+		}
 	}
-
-	ok := take(path, id)
-	entries, err := os.read_directory_by_path(path, -1, context.temp_allocator)
-	if err != nil {
-		return ok
-	}
-	for entry in entries {
-		ok = take(entry.fullpath, id) && ok
-	}
-	return ok
+	return p if p != "" else path
 }
 
-@(private)
-take :: proc(path: string, id: Identity) -> bool {
-	cpath := strings.clone_to_cstring(path, context.temp_allocator)
-	return posix.lchown(cpath, id.uid, id.gid) == .OK
+hand_over :: proc(path: string, id: Identity) -> bool {
+	if path == "" {
+		return true
+	}
+	cpath := strings.clone_to_cstring(last_component_path(path), context.temp_allocator)
+	// Missing by its own name, not by a link's target: a dangling symlink is
+	// there, and is refused below.
+	st: posix.stat_t
+	if posix.lstat(cpath, &st) != .OK && posix.errno() == .ENOENT {
+		return true
+	}
+	// `core:sys/linux`'s flags, not `core:sys/posix`'s, which are the x86
+	// values on every architecture: on arm64 they ask for O_DIRECT instead.
+	dir, oerr := linux.open(cpath, {.DIRECTORY, .NOFOLLOW, .CLOEXEC})
+	if oerr != .NONE {
+		return false
+	}
+	defer linux.close(dir)
+	return linux.fchown(dir, linux.Uid(id.uid), linux.Gid(id.gid)) == .NONE
 }
 
 /*

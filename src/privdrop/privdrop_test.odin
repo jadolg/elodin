@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:log"
 import "core:os"
 import "core:path/filepath"
+import "core:strings"
 import "core:sys/posix"
 import "core:testing"
 
@@ -151,7 +152,7 @@ test_apply_refuses_what_it_cannot_do :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_hand_over_covers_the_directory_and_its_entries :: proc(t: ^testing.T) {
+test_hand_over_to_its_own_owner_and_not_to_root :: proc(t: ^testing.T) {
 	dir, ok := scratch_dir(t, "elodin-privdrop-test")
 	if !ok {
 		return
@@ -182,6 +183,131 @@ test_hand_over_covers_the_directory_and_its_entries :: proc(t: ^testing.T) {
 		name = "root",
 	}
 	testing.expect(t, !hand_over(dir, other), "an unprivileged chown to root should be reported as failed")
+}
+
+/*
+As root, a directory handed to another account changes owner, and nothing in
+it does: a plain file, and a hard link to a file elsewhere, which a chown would
+hand over wherever it lives (#688). No test of what is found in the directory
+tells the two apart - an inode whose other name was replaced since has one link
+left, and that one is in here - so none is chowned; elodin's own copies are
+given to the account as they are written.
+*/
+@(test)
+test_hand_over_as_root_takes_the_directory_alone :: proc(t: ^testing.T) {
+	if posix.geteuid() != 0 {
+		log.info("skipped: handing a file to another account needs root")
+		return
+	}
+	dir, ok := scratch_dir(t, "elodin-privdrop-root")
+	if !ok {
+		return
+	}
+	defer os.remove_all(dir)
+	elsewhere, eok := scratch_dir(t, "elodin-privdrop-root-elsewhere")
+	if !eok {
+		return
+	}
+	defer os.remove_all(elsewhere)
+
+	outside := fmt.ctprintf("%s/outside", elsewhere)
+	plain := fmt.ctprintf("%s/plain.list", dir)
+	for p in ([]cstring{outside, plain}) {
+		if !testing.expectf(t, os.write_entire_file(string(p), []u8{'x'}) == nil, "cannot write %s", p) {
+			return
+		}
+	}
+	if !testing.expect(t, posix.link(outside, fmt.ctprintf("%s/hardlink.list", dir)) == .OK, "cannot make hardlink.list") {
+		return
+	}
+	// The other name replaced, as `passwd` replaces /etc/shadow: the link in
+	// the directory is now the inode's only one.
+	if !testing.expect(t, os.remove(string(outside)) == nil, "cannot remove the other name") {
+		return
+	}
+
+	nobody := Identity {
+		uid  = 65534,
+		gid  = 65534,
+		name = "nobody",
+	}
+	// Not where no chown to 65534 can succeed: a user namespace mapping no
+	// such uid.
+	if posix.chown(plain, nobody.uid, nobody.gid) != .OK {
+		log.info("skipped: a chown to 65534 fails here")
+		return
+	}
+	if !testing.expect(t, posix.chown(plain, 0, 0) == .OK, "cannot give the probe back") {
+		return
+	}
+	testing.expect(t, hand_over(dir, nobody), "handing the directory over failed")
+	owner := proc(p: cstring) -> posix.uid_t {
+		st: posix.stat_t
+		if posix.stat(p, &st) != .OK {
+			return max(posix.uid_t)
+		}
+		return st.st_uid
+	}
+	// The positive half: the directory itself was handed over.
+	testing.expectf(t, owner(fmt.ctprintf("%s", dir)) == nobody.uid, "the directory is uid %d's", owner(fmt.ctprintf("%s", dir)))
+	for name in ([]string{"plain.list", "hardlink.list"}) {
+		uid := owner(fmt.ctprintf("%s/%s", dir, name))
+		testing.expectf(t, uid == 0, "%s in the directory was given to uid %d", name, uid)
+	}
+}
+
+/*
+A cache directory that is itself a symlink is not followed, with or without a
+trailing slash: a slash would have the kernel resolve the link before
+O_NOFOLLOW looks at it.
+*/
+@(test)
+test_hand_over_follows_no_symlinked_directory :: proc(t: ^testing.T) {
+	real, ok := scratch_dir(t, "elodin-privdrop-real")
+	if !ok {
+		return
+	}
+	defer os.remove_all(real)
+	link := fmt.tprintf("%s-link", real)
+	if !testing.expect(t, posix.symlink(strings.clone_to_cstring(real, context.temp_allocator), strings.clone_to_cstring(link, context.temp_allocator)) == .OK, "cannot make the link") {
+		return
+	}
+	defer os.remove(link)
+	self := Identity {
+		uid  = posix.geteuid(),
+		gid  = posix.getegid(),
+		name = "self",
+	}
+	for path in ([]string{link, fmt.tprintf("%s/", link), fmt.tprintf("%s/.", link)}) {
+		testing.expectf(t, !hand_over(path, self), "%q, a symlink, was followed", path)
+	}
+	// The premise: the directory itself, named, is handed over.
+	testing.expect(t, hand_over(real, self), "the real directory was not handed over")
+
+	// A symlink to nothing is there, not missing: refused, not "nothing yet".
+	dangling := fmt.tprintf("%s-dangling", real)
+	if !testing.expect(t, posix.symlink(fmt.ctprintf("%s-nowhere", real), strings.clone_to_cstring(dangling, context.temp_allocator)) == .OK, "cannot make the dangling link") {
+		return
+	}
+	defer os.remove(dangling)
+	testing.expect(t, !hand_over(dangling, self), "a dangling symlink read as a cache directory not made yet")
+}
+
+// Trailing slashes and `/.` go; `..` stays, as the kernel resolves it after the
+// links before it.
+@(test)
+test_last_component_path :: proc(t: ^testing.T) {
+	cases := [][2]string {
+		{"/var/cache/elodin", "/var/cache/elodin"},
+		{"/var/cache/elodin/", "/var/cache/elodin"},
+		{"/var/cache/elodin//./", "/var/cache/elodin"},
+		{"/srv/link/../cache", "/srv/link/../cache"},
+		{"/", "/"},
+		{"cache/.", "cache"},
+	}
+	for c in cases {
+		testing.expectf(t, last_component_path(c[0]) == c[1], "%q: got %q, want %q", c[0], last_component_path(c[0]), c[1])
+	}
 }
 
 @(test)

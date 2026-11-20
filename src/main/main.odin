@@ -852,6 +852,13 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	// Here rather than in the loop, as a rebuild a stop leaves running writes
 	// to it until the process ends; see the deferred stop below.
 	rebuild: server.Rebuild
+	// A root start downloads the lists before the drop; each copy it caches is
+	// the account's as it is written, so the refreshes after the drop can
+	// replace it (see `privdrop.hand_over`).
+	// The writer gives copies away only while euid is 0; see `write_cache_file`.
+	if posix.geteuid() == 0 && service.uid != 0 {
+		server.set_cache_owner(service.uid, service.gid)
+	}
 	if cfg.blocking.enabled {
 		/*
 		On the rebuild thread, as at every refresh, so a SIGTERM is not held by
@@ -998,9 +1005,16 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 	}
 
 	if cfg.blocking.enabled && cfg.blocking.cache_dir != "" {
-		if !privdrop.hand_over(cfg.blocking.cache_dir, service) {
+		handed := privdrop.hand_over(cfg.blocking.cache_dir, service)
+		if !handed && is_symlink(cfg.blocking.cache_dir) {
 			logx.warnf(
-				"could not give %q to %s; the lists are in effect but will be re-downloaded on each start",
+				"blocking.cache_dir %q is a symlink, which is not followed when it is given to %s; name the directory it points at, or the refreshes after the drop cannot update the cached lists",
+				cfg.blocking.cache_dir,
+				cfg.server.user,
+			)
+		} else if !handed {
+			logx.warnf(
+				"could not give %q to %s; the lists are in effect, but the refreshes after the drop cannot update the cached copies",
 				cfg.blocking.cache_dir,
 				cfg.server.user,
 			)
@@ -1011,6 +1025,7 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 		logx.errorf("cannot drop privileges to %s: %s", cfg.server.user, privdrop.explain(err))
 		os.exit(1)
 	}
+	server.clear_cache_owner()
 	logx.infof("running as %s (uid=%d gid=%d)", cfg.server.user, service.uid, service.gid)
 	warn_out_of_reach(cfg, config_path)
 }
@@ -1495,4 +1510,11 @@ stop_loops :: proc(loops: []^loop.Loop, threads: []^thread.Thread) {
 	}
 	delete(threads)
 	delete(loops)
+}
+
+// Whether `path`, as `privdrop.hand_over` opens it, names a symlink.
+@(private = "file")
+is_symlink :: proc(path: string) -> bool {
+	info, err := os.lstat(privdrop.last_component_path(path), context.temp_allocator)
+	return err == nil && info.type == .Symlink
 }

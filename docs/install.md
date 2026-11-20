@@ -277,9 +277,24 @@ saved — and the real and effective ids are read back from the kernel before th
 drop is reported. A drop that was configured and did not happen ends the
 process. A misspelt account name fails `--check`; running as root with no
 `server.user` logs a warning. `blocking.cache_dir` changes owner along with the
-process, since a refresh hours later has to reopen it. Started this way, elodin
-downloads and parses the blocklists before it binds, so that much happens as
-root; the first arrangement avoids it.
+process, since a refresh hours later has to write there: the directory itself,
+and each list elodin caches as it writes it. Nothing else in the directory
+changes owner, since a chown as root of a hard link the account put there would
+hand over the file it links to, wherever that file is. For the same reason a
+root start reads a cached list only as a plain file with one link that belongs
+to the account, never through a symlink; any other is not read (the log says
+why) and is downloaded again. A copy an earlier version cached as root is one of
+those, once: the first root start after upgrading has no cached lists to fall
+back on, so if it cannot download them it serves without them until a refresh
+succeeds (`chown -R` the directory to the account before upgrading to avoid it). On a filesystem with no owners (vfat, including one mounted
+`quiet`, or an NFS export that squashes root) no copy can belong to the account:
+each start uses what it downloads and downloads the lists again at the next
+start rather than read them, so a start with no network has none. Started as
+anyone but root, and after the drop, elodin reads its copies however they are
+linked or owned, since it reads nothing more through a link than by name. A `cache_dir` that is itself
+a symlink is not followed, and so not handed over: name the directory it points
+at. Started this way, elodin downloads and parses the blocklists before it
+binds, so that much happens as root; the first arrangement avoids it.
 
 The files a [`SIGHUP`](#signals) opens again by name are opened as that account,
 not as root: the configuration file, the DoT/DoH `cert_file` and `key_file`,
