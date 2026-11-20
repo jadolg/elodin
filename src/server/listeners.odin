@@ -606,7 +606,7 @@ bind_udp_reader :: proc(
 	if is_wildcard(address) {
 		if errno := loop.want_destination(socket, net.family_from_address(address) == .IP6); errno != .NONE {
 			net.close(socket)
-			logx.errorf("listeners.udp: the kernel refused IP_PKTINFO (%v), so an answer could not leave from the address asked", errno)
+			logx.errorf("listeners.udp: the kernel refused IP_PKTINFO or IPV6_RECVPKTINFO (%v), so an answer could not leave from the address asked", errno)
 			return {}, 0, net.Bind_Error.Unknown
 		}
 	}
@@ -1354,15 +1354,6 @@ is_loopback :: proc(a: net.Address) -> bool {
 	return config.address_in(config.LOOPBACK_NETWORKS, bytes, v6)
 }
 
-/*
-Whether an address could be one host's: not multicast (224.0.0.0/4, ff00::/8),
-not the limited broadcast, not unspecified. Mapped forms are judged as the IPv4
-address they carry, which is how the ACL and the limiter read them.
-
-The rest of 0.0.0.0/8 and all of 240.0.0.0/4 are left to the kernel: stacks with
-the unicast extensions route them, and the others drop them as martians before a
-socket sees them.
-*/
 // Whether a bind address is `0.0.0.0` or `::`.
 @(private)
 is_wildcard :: proc(a: net.Address) -> bool {
@@ -1375,6 +1366,15 @@ is_wildcard :: proc(a: net.Address) -> bool {
 	return false
 }
 
+/*
+Whether an address could be one host's: not multicast (224.0.0.0/4, ff00::/8),
+not the limited broadcast, not unspecified. Mapped forms are judged as the IPv4
+address they carry, which is how the ACL and the limiter read them.
+
+The rest of 0.0.0.0/8 and all of 240.0.0.0/4 are left to the kernel: stacks with
+the unicast extensions route them, and the others drop them as martians before a
+socket sees them.
+*/
 @(private)
 is_unicast :: proc(a: net.Address) -> bool {
 	switch x in netx.unmap(a) {

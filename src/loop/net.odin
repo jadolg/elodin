@@ -240,6 +240,7 @@ recv_udp_armed :: proc(
 /*
 Send one datagram to `to`. With `from`'s address known it is a `sendmsg` that
 leaves from it (see `Udp_Local`), and otherwise a `sendto`, which costs less.
+A `from` the kernel refuses as a source falls back to the `sendto`.
 */
 send_udp :: proc(socket: net.UDP_Socket, buf: []u8, to: net.Endpoint, from: Udp_Local = {}) -> (int, net.UDP_Send_Error) {
 	assert_nonblocking(linux.Fd(socket))
@@ -251,7 +252,15 @@ send_udp :: proc(socket: net.UDP_Socket, buf: []u8, to: net.Endpoint, from: Udp_
 		err: net.UDP_Send_Error
 		if from.address != nil {
 			n, err = sendmsg_udp(socket, buf, to, from)
-		} else {
+		}
+		/*
+		A source the kernel will not send from costs the source, not the answer:
+		an address a local route serves but no interface holds (AnyIP), or one
+		removed since the query arrived. Linux refuses one with EINVAL over IPv6
+		and ENETUNREACH over IPv4, so any failure but a full queue is retried as a
+		`sendto`, which leaves from the address the route picks.
+		*/
+		if from.address == nil || (err != nil && err != .Would_Block) {
 			n, err = net.send_udp(socket, buf, to)
 		}
 		if err != .Would_Block {

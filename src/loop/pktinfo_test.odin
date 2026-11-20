@@ -1,5 +1,6 @@
 package loop
 
+import "core:log"
 import "core:net"
 import "core:sys/linux"
 import "core:testing"
@@ -17,6 +18,10 @@ the route picks, which for a loopback client is 127.0.0.1.
 @(test)
 test_a_wildcard_socket_answers_from_the_address_asked :: proc(t: ^testing.T) {
 	for family in ([]net.Address_Family{.IP4, .IP6}) {
+		if family == .IP6 && !dual_stack_available() {
+			log.info("skipped: a `::` bind is not reachable over IPv4 on this machine")
+			continue
+		}
 		server, err := net.make_unbound_udp_socket(family)
 		if !testing.expectf(t, err == nil, "socket: %v", err) {
 			return
@@ -87,6 +92,10 @@ and the interface it came in on, which for `::1` is the loopback's, never 0.
 */
 @(test)
 test_an_ipv6_datagram_reports_its_destination_and_interface :: proc(t: ^testing.T) {
+	if !ipv6_loopback_available() {
+		log.info("skipped: no `::1` on this machine")
+		return
+	}
 	server, err := net.make_unbound_udp_socket(.IP6)
 	if !testing.expectf(t, err == nil, "socket: %v", err) {
 		return
@@ -202,4 +211,104 @@ test_send_ifindex_is_named_only_for_a_link_local_end :: proc(t: ^testing.T) {
 		got := send_ifindex({address = c.local, ifindex = 7}, c.to)
 		testing.expectf(t, got == c.ifindex, "%v -> %v: interface %d, want %d", c.local, c.to, got, c.ifindex)
 	}
+}
+
+/*
+A source the kernel will not send from is not the end of the answer: 203.0.113.9
+(TEST-NET-3) and 2001:db8::9 are no address of this host, so the `sendmsg`
+naming one is refused, and `send_udp` sends from the address the route picks
+instead.
+*/
+@(test)
+test_a_source_the_kernel_refuses_falls_back_to_the_route :: proc(t: ^testing.T) {
+	cases := []struct {
+		wildcard, loopback, elsewhere: net.Address,
+	} {
+		{wildcard = net.IP4_Address{}, loopback = net.IP4_Loopback, elsewhere = net.IP4_Address{203, 0, 113, 9}},
+		{wildcard = net.IP6_Address{}, loopback = net.IP6_Loopback, elsewhere = net.IP6_Address{0 = 0x2001, 1 = 0xdb8, 7 = 9}},
+	}
+	for c in cases {
+		if _, v6 := c.loopback.(net.IP6_Address); v6 && !ipv6_loopback_available() {
+			log.info("skipped: no `::1` on this machine")
+			continue
+		}
+		server, err := net.make_bound_udp_socket(c.wildcard, 0)
+		if !testing.expectf(t, err == nil, "socket: %v", err) {
+			return
+		}
+		defer net.close(server)
+		if serr := net.set_blocking(server, false); !testing.expectf(t, serr == nil, "set_blocking: %v", serr) {
+			return
+		}
+		client, cerr := net.make_bound_udp_socket(c.loopback, 0)
+		if !testing.expectf(t, cerr == nil, "client socket: %v", cerr) {
+			return
+		}
+		defer net.close(client)
+		if oerr := net.set_option(client, .Receive_Timeout, WAIT); !testing.expectf(t, oerr == nil, "set_option: %v", oerr) {
+			return
+		}
+		to, terr := net.bound_endpoint(client)
+		if !testing.expectf(t, terr == nil, "bound_endpoint: %v", terr) {
+			return
+		}
+		elsewhere := Udp_Local{address = c.elsewhere}
+
+		// The premise: the kernel refuses that source.
+		_, refused := sendmsg_udp(server, []u8{1}, to, elsewhere)
+		testing.expectf(t, refused != nil && refused != .Would_Block, "the kernel took %v as a source: %v", c.elsewhere, refused)
+
+		_, serr := send_udp(server, []u8{2}, to, elsewhere)
+		if !testing.expectf(t, serr == nil, "send_udp from %v: %v", c.elsewhere, serr) {
+			return
+		}
+		buf: [4]u8
+		n, source, rerr := net.recv_udp(client, buf[:])
+		if !testing.expectf(t, rerr == nil, "client recv: %v", rerr) {
+			return
+		}
+		testing.expectf(t, n == 1 && buf[0] == 2 && source.address == c.loopback, "got %d bytes from %v, want 1 from %v", n, source.address, c.loopback)
+	}
+}
+
+// Whether this machine has `::1`; a container without IPv6 does not.
+@(private = "file")
+ipv6_loopback_available :: proc() -> bool {
+	socket, err := net.make_unbound_udp_socket(.IP6)
+	if err != nil {
+		return false
+	}
+	defer net.close(socket)
+	return net.bind(socket, {net.IP6_Loopback, 0}) == nil
+}
+
+/*
+Whether a `::` socket receives IPv4 here: not where `net.ipv6.bindv6only` is set
+or IPv6 is off. Probed with `core:net` alone, so nothing under test decides it.
+*/
+@(private = "file")
+dual_stack_available :: proc() -> bool {
+	server, err := net.make_bound_udp_socket(net.IP6_Address{}, 0)
+	if err != nil {
+		return false
+	}
+	defer net.close(server)
+	if net.set_option(server, .Receive_Timeout, WAIT) != nil {
+		return false
+	}
+	bound, berr := net.bound_endpoint(server)
+	if berr != nil {
+		return false
+	}
+	client, cerr := net.make_unbound_udp_socket(.IP4)
+	if cerr != nil {
+		return false
+	}
+	defer net.close(client)
+	if _, serr := net.send_udp(client, []u8{0}, {net.IP4_Loopback, bound.port}); serr != nil {
+		return false
+	}
+	buf: [1]u8
+	_, _, rerr := net.recv_udp(server, buf[:])
+	return rerr == nil
 }
