@@ -6,14 +6,13 @@ import "elodin:server"
 /*
 Issue #684: a covering NSEC whose next name lies below the question shows the
 question is an empty non-terminal, a name that exists (RFC 4592 section
-2.2.2). Served by the binary over UDP, neither of these may go out as a
+2.2.2). Served by the binary over UDP, none of these may go out as a
 validated answer:
 
 - the zone's genuine NODATA for `b.enxtest.`, with its rcode flipped to
   NXDOMAIN on the way (RFC 4035 section 3.1.3);
 - `*.enxtest.` answering `x.b.enxtest.`, with that span as the next closer
-  cover, though `b.enxtest.` is closer.
-
+  cover, though `b.enxtest.` is closer;
 - an NXDOMAIN for `ny.exwild.`, where `x.*.exwild.` makes `*.exwild.` an empty
   non-terminal wildcard that answers it.
 
