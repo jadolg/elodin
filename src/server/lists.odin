@@ -468,11 +468,25 @@ copy_is_of :: proc(list: config.Block_List, cache_path: string) -> bool {
 }
 
 /*
-Read a file of the list cache, if it is a regular file and its name is not a
-symlink. The directory is the service account's, and a root start reads it
-before the drop (#688): a link there to a file only root can read would load
-that file as a list. O_NONBLOCK so a FIFO put there does not hold the start.
+Read a file of the list cache, if it is a regular file with a single link and
+its name is not a symlink. The directory is the service account's, and a root
+start reads it before the drop (#688): a symlink or a hard link there to a file
+only root can read would load that file as a list. O_NONBLOCK so a FIFO put
+there does not hold the start.
 */
+// When the file at `path` was modified, if it is one `read_cache_file` reads.
+@(private)
+plain_cache_file :: proc(path: string) -> (modified: time.Time, ok: bool) {
+	st: posix.stat_t
+	if posix.lstat(strings.clone_to_cstring(path, context.temp_allocator), &st) != .OK {
+		return {}, false
+	}
+	if !posix.S_ISREG(st.st_mode) || st.st_nlink != 1 {
+		return {}, false
+	}
+	return time.unix(i64(st.st_mtim.tv_sec), i64(st.st_mtim.tv_nsec)), true
+}
+
 @(private)
 read_cache_file :: proc(path: string, allocator := context.allocator) -> (data: []byte, ok: bool) {
 	fd := posix.open(strings.clone_to_cstring(path, context.temp_allocator), {.NOFOLLOW, .NONBLOCK, .CLOEXEC})
@@ -480,7 +494,7 @@ read_cache_file :: proc(path: string, allocator := context.allocator) -> (data: 
 		return nil, false
 	}
 	st: posix.stat_t
-	if posix.fstat(fd, &st) != .OK || !posix.S_ISREG(st.st_mode) {
+	if posix.fstat(fd, &st) != .OK || !posix.S_ISREG(st.st_mode) || st.st_nlink != 1 {
 		posix.close(fd)
 		return nil, false
 	}
@@ -506,8 +520,10 @@ Fetch :: enum u8 {
 fetch_list :: proc(cfg: ^config.Config, list: config.Block_List, ignore_fresh := false) -> (text: string, fetch: Fetch) {
 	// Skip the download when the cached copy is still within the refresh window.
 	path := list_cache_path(cfg, list)
-	if info, err := os.stat(path, context.temp_allocator); err == nil && !ignore_fresh {
-		age := time.diff(info.modification_time, loop.now())
+	// Fresh only as a copy `read_cache_file` will read: one it would refuse,
+	// read as fresh, would be neither downloaded again nor loaded.
+	if modified, plain := plain_cache_file(path); plain && !ignore_fresh {
+		age := time.diff(modified, loop.now())
 		if age < cfg.blocking.refresh && copy_is_of(list, path) {
 			return "", .Cache_Is_Fresh
 		}

@@ -310,7 +310,10 @@ hand_over :: proc(path: string, id: Identity, allocator := context.temp_allocato
 	if path == "" || !os.exists(path) {
 		return true, nil, 0
 	}
-	cpath := strings.clone_to_cstring(path, context.temp_allocator)
+	// Without its trailing slashes: with one, the kernel resolves a symlink at
+	// the last component before O_NOFOLLOW is looked at.
+	trimmed := strings.trim_right(path, "/")
+	cpath := strings.clone_to_cstring(trimmed if trimmed != "" else path, context.temp_allocator)
 	dir := posix.open(cpath, {.DIRECTORY, .NOFOLLOW, .CLOEXEC})
 	if dir == -1 {
 		return false, nil, 0

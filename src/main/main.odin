@@ -999,7 +999,13 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 
 	if cfg.blocking.enabled && cfg.blocking.cache_dir != "" {
 		handed, named, skipped := privdrop.hand_over(cfg.blocking.cache_dir, service)
-		if !handed {
+		if !handed && is_symlink(cfg.blocking.cache_dir) {
+			logx.warnf(
+				"blocking.cache_dir %q is a symlink, which is not followed when it is given to %s; name the directory it points at, or the lists will be re-downloaded on each start",
+				cfg.blocking.cache_dir,
+				cfg.server.user,
+			)
+		} else if !handed {
 			logx.warnf(
 				"could not give %q to %s; the lists are in effect but will be re-downloaded on each start",
 				cfg.blocking.cache_dir,
@@ -1506,4 +1512,12 @@ stop_loops :: proc(loops: []^loop.Loop, threads: []^thread.Thread) {
 	}
 	delete(threads)
 	delete(loops)
+}
+
+// Whether `path`, without its trailing slashes, names a symlink.
+@(private = "file")
+is_symlink :: proc(path: string) -> bool {
+	trimmed := strings.trim_right(path, "/")
+	info, err := os.lstat(trimmed if trimmed != "" else path, context.temp_allocator)
+	return err == nil && info.type == .Symlink
 }

@@ -282,7 +282,8 @@ one level down, its subdirectories and files with a single link. Anything else
 in there - a hard link, a symlink, a FIFO - keeps its owner and is counted in a
 warning that names the first few, since a chown of a hard link as root would
 hand over the file it links to, wherever that file is. For the same reason the
-cached lists are written and read without following a symlink. A `cache_dir` that is itself a symlink is not
+cached lists are written and read only as plain files, never through a symlink
+or a hard link; a copy that is either is downloaded again. A `cache_dir` that is itself a symlink is not
 followed, and so not handed over: name the directory it points at. Started this way, elodin
 downloads and parses the blocklists before it binds, so that much happens as
 root; the first arrangement avoids it.

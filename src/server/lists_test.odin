@@ -802,6 +802,36 @@ test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
 	testing.expectf(t, load == .Unavailable && text == "", "a linked copy was read: %v %q", load, text)
 	delete(text)
 
+	// Nor a hard link, which is the file it links to, wherever that is.
+	testing.expect_value(t, os.remove(path), nil)
+	if !testing.expect(t, posix.link(strings.clone_to_cstring(victim, context.temp_allocator), strings.clone_to_cstring(path, context.temp_allocator)) == .OK, "cannot plant the hard link") {
+		return
+	}
+	text, load = cached_copy(&cfg, list, .Stale)
+	testing.expectf(t, load == .Unavailable && text == "", "a hard-linked copy was read: %v %q", load, text)
+	delete(text)
+
+	// A copy that cannot be read is not fresh either, or it would be neither
+	// downloaded again nor loaded, for good.
+	recent := config.Block_List{name = "r", url = "http://127.0.0.1:1/r.txt", format = .Hosts, enabled = true}
+	rpath := list_cache_path(&cfg, recent)
+	if !testing.expect(t, link(victim, rpath), "cannot plant the fresh-looking link") {
+		return
+	}
+	_, fetched := fetch_list(&cfg, recent)
+	testing.expectf(t, fetched != .Cache_Is_Fresh, "a linked copy read as fresh")
+	testing.expect_value(t, os.remove(rpath), nil)
+	if !testing.expect(t, posix.link(strings.clone_to_cstring(victim, context.temp_allocator), strings.clone_to_cstring(rpath, context.temp_allocator)) == .OK, "cannot plant the fresh-looking hard link") {
+		return
+	}
+	_, fetched = fetch_list(&cfg, recent)
+	testing.expectf(t, fetched != .Cache_Is_Fresh, "a hard-linked copy read as fresh")
+	// The premise: the same copy, plain, is fresh.
+	testing.expect_value(t, os.remove(rpath), nil)
+	testing.expect(t, os.write_entire_file(rpath, "0.0.0.0 r.example\n") == nil)
+	_, fetched = fetch_list(&cfg, recent)
+	testing.expect_value(t, fetched, Fetch.Cache_Is_Fresh)
+
 	// A FIFO in the copy's place is neither waited on nor read.
 	testing.expect_value(t, os.remove(path), nil)
 	if !testing.expect(t, posix.mkfifo(strings.clone_to_cstring(path, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {

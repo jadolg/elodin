@@ -354,6 +354,37 @@ test_take_reads_a_vanished_entry_as_gone :: proc(t: ^testing.T) {
 	testing.expect_value(t, take(linux.Fd(fd), "not-there.list", self), Take.Gone)
 }
 
+/*
+A cache directory that is itself a symlink is not followed, with or without a
+trailing slash: a slash would have the kernel resolve the link before
+O_NOFOLLOW looks at it.
+*/
+@(test)
+test_hand_over_follows_no_symlinked_directory :: proc(t: ^testing.T) {
+	real, ok := scratch_dir(t, "elodin-privdrop-real")
+	if !ok {
+		return
+	}
+	defer os.remove_all(real)
+	link := fmt.tprintf("%s-link", real)
+	if !testing.expect(t, posix.symlink(strings.clone_to_cstring(real, context.temp_allocator), strings.clone_to_cstring(link, context.temp_allocator)) == .OK, "cannot make the link") {
+		return
+	}
+	defer os.remove(link)
+	self := Identity {
+		uid  = posix.geteuid(),
+		gid  = posix.getegid(),
+		name = "self",
+	}
+	for path in ([]string{link, fmt.tprintf("%s/", link)}) {
+		handed, named, skipped := hand_over(path, self)
+		testing.expectf(t, !handed && skipped == 0 && len(named) == 0, "%q, a symlink, was followed: %v %d %v", path, handed, skipped, named)
+	}
+	// The premise: the directory itself, named, is handed over.
+	handed, named, skipped := hand_over(real, self)
+	testing.expectf(t, handed && skipped == 0 && len(named) == 0, "the real directory was not handed over: %v %d %v", handed, skipped, named)
+}
+
 @(test)
 test_hand_over_ignores_a_path_that_is_not_there :: proc(t: ^testing.T) {
 	self := Identity {
