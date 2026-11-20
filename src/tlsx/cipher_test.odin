@@ -92,6 +92,8 @@ test_hold_to_floor_never_widens_a_host_policy :: proc(t: ^testing.T) {
 		ciphers:   cstring,
 		min:       c.long,
 		max:       c.long,
+		// The TLS 1.3 suites the policy left; nil leaves OpenSSL's.
+		suites:    Maybe(cstring),
 		want_err:  Error,
 		want_min:  c.long,
 		want_list: []string,
@@ -116,8 +118,12 @@ test_hold_to_floor_never_widens_a_host_policy :: proc(t: ^testing.T) {
 		},
 		{name = "a policy holding TLS 1.3 at least", min = TLS1_3_VERSION, want_min = TLS1_3_VERSION},
 		{name = "a policy with none of ours over TLS 1.2", ciphers = "AES128-SHA", want_min = TLS1_3_VERSION},
-		// Nothing left: none of ours over TLS 1.2, and no TLS 1.3.
+		// Nothing left: no TLS 1.2 suite of ours within the bounds, and no
+		// TLS 1.3.
 		{name = "a CBC-only policy capped at TLS 1.2", ciphers = "ECDHE-RSA-AES128-SHA", max = TLS1_2_VERSION, want_err = .No_Suite},
+		{name = "a CBC-only policy with no TLS 1.3 suite", ciphers = "ECDHE-RSA-AES128-SHA", suites = "", want_err = .No_Suite},
+		{name = "a policy capped at TLS 1.1", max = 0x0302, want_err = .No_Suite},
+		{name = "a TLS 1.3 floor with no TLS 1.3 suite", min = TLS1_3_VERSION, suites = "", want_err = .No_Suite},
 	}
 	for tc in cases {
 		ptr := SSL_CTX_new(TLS_server_method())
@@ -135,6 +141,9 @@ test_hold_to_floor_never_widens_a_host_policy :: proc(t: ^testing.T) {
 			continue
 		}
 		if tc.max != 0 && !testing.expectf(t, ssl_ctx_set_max_proto_version(ptr, tc.max), "%s: the fixture's ceiling was refused", tc.name) {
+			continue
+		}
+		if suites, set := tc.suites.?; set && !testing.expectf(t, SSL_CTX_set_ciphersuites(ptr, suites) == 1, "%s: the fixture's TLS 1.3 suites were refused", tc.name) {
 			continue
 		}
 		if err := hold_to_floor(ptr); !testing.expectf(t, err == tc.want_err, "%s: %v, want %v", tc.name, err, tc.want_err) || err != .None {

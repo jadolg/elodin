@@ -506,9 +506,11 @@ new_ssl_ctx :: proc(server: bool) -> (^SSL_CTX, Error) {
 Hold a context to TLS 1.2 or later and, over TLS 1.2, to `TLS12_CIPHERS`, only
 ever narrowing what it already allows: a host policy stricter than either (a
 dynamic build's `openssl.cnf`, with `MinProtocol` or `CipherString`) stays as
-strict. A policy that leaves none of the suites leaves TLS 1.3 alone, and one
-that also caps TLS below 1.3 leaves nothing: `No_Suite`, so the context is
-refused where it is built rather than every handshake failing later.
+strict. A policy that leaves none of the suites leaves TLS 1.3 alone.
+
+A context left able to speak nothing - no TLS 1.2 suite of ours between its
+floor and ceiling, and no TLS 1.3 suite below its ceiling - is `No_Suite`, so it
+is refused where it is built rather than every handshake failing later.
 `Context_Failed` when OpenSSL refuses a setting.
 */
 @(private)
@@ -530,15 +532,41 @@ hold_to_floor :: proc(ptr: ^SSL_CTX) -> Error {
 		}
 		n += copy(kept[n:], name)
 	}
+	// 0 is no ceiling.
+	ceiling := ssl_ctx_get_max_proto_version(ptr)
+	below := proc(ceiling, version: c.long) -> bool {
+		return ceiling != 0 && ceiling < version
+	}
+	tls12 := n > 0 && ssl_ctx_get_min_proto_version(ptr) <= TLS1_2_VERSION && !below(ceiling, TLS1_2_VERSION)
+	tls13 := !below(ceiling, TLS1_3_VERSION) && lists_tls13(allowed)
+	if !tls12 && !tls13 {
+		return .No_Suite
+	}
 	if n == 0 {
-		// 0 is no ceiling.
-		ceiling := ssl_ctx_get_max_proto_version(ptr)
-		if ceiling != 0 && ceiling < TLS1_3_VERSION {
-			return .No_Suite
-		}
 		return .None if ssl_ctx_set_min_proto_version(ptr, TLS1_3_VERSION) else .Context_Failed
 	}
 	return .None if SSL_CTX_set_cipher_list(ptr, cstring(&kept[0])) == 1 else .Context_Failed
+}
+
+// Whether `stack`, a context's cipher list, holds any TLS 1.3 suite.
+@(private = "file")
+lists_tls13 :: proc(stack: ^OPENSSL_STACK) -> bool {
+	if stack == nil {
+		return false
+	}
+	for i in 0 ..< OPENSSL_sk_num(stack) {
+		if is_tls13_name(string(SSL_CIPHER_get_name((^SSL_CIPHER)(OPENSSL_sk_value(stack, i))))) {
+			return true
+		}
+	}
+	return false
+}
+
+// OpenSSL names its TLS 1.3 suites by their RFC 8446 names, and only those
+// start so.
+@(private = "file")
+is_tls13_name :: proc(name: string) -> bool {
+	return strings.has_prefix(name, "TLS_")
 }
 
 /*
@@ -574,9 +602,7 @@ order_tls13 :: proc(ptr: ^SSL_CTX) -> Error {
 	if allowed != nil {
 		for i in 0 ..< OPENSSL_sk_num(allowed) {
 			name := string(SSL_CIPHER_get_name((^SSL_CIPHER)(OPENSSL_sk_value(allowed, i))))
-			// OpenSSL names its TLS 1.3 suites by their RFC 8446 names, and
-			// only those start so.
-			if !strings.has_prefix(name, "TLS_") || strings.contains(TLS13_FIRST, name) {
+			if !is_tls13_name(name) || strings.contains(TLS13_FIRST, name) {
 				continue
 			}
 			if !put(order[:], &n, name) {
@@ -604,21 +630,22 @@ cipher_listed :: proc(stack: ^OPENSSL_STACK, name: string) -> bool {
 	return false
 }
 
-/*
-The TLS 1.2 suites either end offers: ECDHE key exchange and an AEAD cipher,
-RFC 9325 section 4.2's four in its order and then ChaCha20-Poly1305. No static
-RSA, which gives no forward secrecy (RFC 9325 section 4.1), and no CBC, which
-RFC 9113 Appendix A forbids for HTTP/2 and RFC 8310 section 9 holds DoT to BCP
-195 for. TLS 1.3's suites are OpenSSL's own and all of that shape already.
-*/
 // The TLS 1.3 suites first in a context's order; see `order_tls13`.
 @(private)
 TLS13_FIRST :: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"
 
 // Why a `No_Suite` context is refused, as `describe_error` says it.
 @(private)
-NO_SUITE_REASON :: "the host's OpenSSL policy (openssl.cnf) leaves none of the TLS 1.2 suites this server uses (ECDHE with AES-GCM or ChaCha20-Poly1305) and caps TLS below 1.3"
+NO_SUITE_REASON :: "the host's OpenSSL policy (openssl.cnf) leaves no TLS this server will speak: none of its TLS 1.2 suites (ECDHE with AES-GCM or ChaCha20-Poly1305) within the version bounds, and no TLS 1.3 suite"
 
+/*
+The TLS 1.2 suites either end offers: ECDHE key exchange and an AEAD cipher,
+RFC 9325 section 4.2's four in its order and then ChaCha20-Poly1305. No static
+RSA, which gives no forward secrecy (RFC 9325 section 4.1), and no CBC, which
+RFC 9113 Appendix A forbids for HTTP/2 and RFC 8310 section 9 holds DoT to BCP
+195 for. TLS 1.3's suites are all of that shape already; `order_tls13` orders
+them.
+*/
 @(private)
 TLS12_CIPHERS :: "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:" +
 	"ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:" +
