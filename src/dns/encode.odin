@@ -413,6 +413,51 @@ w_readd_opt :: proc(
 	return false, .None
 }
 
+// Whether two records are of one RRset: one owner, type and class (RFC 2181
+// section 5), and for signatures one type covered, so a signature that will not
+// fit takes none over another type with it.
+@(private)
+same_rrset :: proc(a, b: Record) -> bool {
+	if a.type != b.type || a.class != b.class || !name_equal_fold(a.name, b.name) {
+		return false
+	}
+	return a.type != .RRSIG || rrsig_covers(a) == rrsig_covers(b)
+}
+
+// The type an RRSIG covers: the first two bytes of its RDATA (RFC 4034 section
+// 3.1.1). Zero where the RDATA is too short to hold it.
+@(private)
+rrsig_covers :: proc(sig: Record) -> Type {
+	raw, is_raw := sig.data.(Rdata_Raw)
+	if !is_raw || len(raw.data) < 2 {
+		return Type(0)
+	}
+	return Type(u16(raw.data[0]) << 8 | u16(raw.data[1]))
+}
+
+// How many RRsets left out of the additional section `encode_message` keeps
+// track of before it leaves out the rest of the section.
+@(private)
+DROPPED_RRSETS :: 8
+
+/*
+Whether `rec` belongs to one of the RRsets `dropped` holds, or is a signature
+over one: an RRSIG at the same owner and class whose type covered (the first
+two bytes of its RDATA, RFC 4034 section 3.1.1) is the RRset's type.
+*/
+@(private)
+left_out :: proc(dropped: []^Record, rec: Record) -> bool {
+	for d in dropped {
+		if same_rrset(d^, rec) {
+			return true
+		}
+		if rec.type == .RRSIG && rec.class == d.class && name_equal_fold(rec.name, d.name) && rrsig_covers(rec) == d.type {
+			return true
+		}
+	}
+	return false
+}
+
 /*
 Whether a record left out of the additional section is glue a referral cannot be
 read without (RFC 9471 section 3.3).
@@ -478,7 +523,11 @@ fit and to ask again over TCP. So a record dropped from those two sections sets
 `truncated` and the TC bit, and a record dropped from the additional section
 does not - a responder that could not fit a glue address or an OPT record behind
 a complete answer has answered the question, and a client sent to TCP over it
-gets the same records one round trip later.
+gets the same records one round trip later. What the additional section drops
+is a whole RRset (section 9 again): the records of it already written in its
+run go with the one that overflowed, and its later records and signatures are
+passed over. A record of it written before another RRset came between is the
+exception; see `dropped` below.
 
 The OPT record is re-appended after a cut so the client still sees our EDNS
 parameters, and the additional section keeps its room as it fills rather than
@@ -576,8 +625,31 @@ encode_message :: proc(
 	// is the message's own. See the skip below.
 	opt_seen := false
 
+	/*
+	Where the additional section's current RRset began, and the count there: an
+	RRset that will not fit is left out whole (RFC 2181 section 9), so a record
+	that overflows takes the ones of its RRset already written with it. An
+	RRset is the run of records with one owner, type and class; `run_start` is
+	nil before the section's first record.
+
+	`dropped` holds the RRsets left out, so a later record of one - adjacent or
+	not - is passed over, and so is a signature over one written behind it (RFC
+	4035 section 3.1.1 lets a signature go and its RRset stay, not the other
+	way round). A record of one already written before another RRset, or a
+	signature written ahead of its RRset, is not taken back: that would mean
+	regrouping the section before writing it.
+	Bounded, because every record behind a drop is compared against each: past
+	`DROPPED_RRSETS` the rest of the section but its OPT record is left out,
+	which is additional data and so the reply's to do without.
+	*/
+	run_start: ^Record
+	run_mark := 0
+	run_count: u16
+	dropped: [DROPPED_RRSETS]^Record
+	dropped_n := 0
+
 	outer: for section, si in sections {
-		for rec in section {
+		for rec, ri in section {
 			/*
 			One OPT record per message (RFC 6891 section 6.1.1), and it is the
 			first: the record `find_opt` reads, `opt_wire_len` measures and
@@ -591,6 +663,24 @@ encode_message :: proc(
 					continue
 				}
 				opt_seen = true
+			}
+			if si == 2 {
+				// The OPT record is the message's own, re-added below if it
+				// does not fit; it is never another record's to drop.
+				if rec.type != .OPT && (dropped_n > len(dropped) || left_out(dropped[:dropped_n], rec)) {
+					// Glue a referral cannot be read without is a truncation
+					// however it is left out (RFC 9471 section 3.3).
+					if omitted_glue_truncates(m, rec) {
+						truncated = true
+						break outer
+					}
+					continue
+				}
+				if run_start == nil || !same_rrset(run_start^, rec) {
+					run_start = &sections[si][ri]
+					run_mark = len(w.buf)
+					run_count = counts[si]
+				}
 			}
 			/*
 			The additional section keeps the OPT record's room as it fills.
@@ -647,6 +737,16 @@ encode_message :: proc(
 					additional_dropped = true
 					clear(&w.comp)
 					w.compress = false
+				}
+				// The whole RRset, not this record alone: back to where it
+				// began, and past the rest of it and its signatures.
+				resize(&w.buf, run_mark)
+				counts[si] = run_count
+				if rec.type != .OPT {
+					if dropped_n < len(dropped) {
+						dropped[dropped_n] = run_start
+					}
+					dropped_n += 1
 				}
 				continue
 			}

@@ -412,10 +412,32 @@ pm_ns_authority :: proc(body: ^[dynamic]u8, allocator: mem.Allocator) -> u16 {
 @(private = "file")
 pm_glue :: proc(body: ^[dynamic]u8, r: ^Pg_Rand, allocator: mem.Allocator) -> u16 {
 	ns := pg_encode_name("ns1." + PM_ZONE, allocator)
-	pm_rr(body, ns, 1, 1, 1800, pm_rdata(r, 1, allocator), allocator)
+	/*
+	One address, or now and then a run of them: an RRset too big for a client
+	without EDNS, which has to be left out whole rather than cut where the
+	datagram ran out (RFC 2181 section 9). See `pc_whole_rrsets`.
+
+	Decided by the first address, already drawn, and the rest of the run fixed,
+	so the generator draws exactly what it drew before: a recorded seed in
+	testdata/parity-seeds asks the same queries. A reply whose first address
+	starts a run is a larger one than it was when the seed was recorded.
+	*/
+	first := pm_rdata(r, 1, allocator)
+	pm_rr(body, ns, 1, 1, 1800, first, allocator)
+	addresses := 1
+	if len(first) == 4 && first[3] % 4 == 0 {
+		for i in 1 ..< PM_GLUE_RUN {
+			pm_rr(body, ns, 1, 1, 1800, []u8{198, 51, 100, u8(i)}, allocator)
+		}
+		addresses = PM_GLUE_RUN
+	}
 	pm_rr(body, ns, 28, 1, 1800, pm_rdata(r, 28, allocator), allocator)
-	return 2
+	return u16(addresses + 1)
 }
+
+// Enough A records for one name to pass 512 bytes on their own.
+@(private = "file")
+PM_GLUE_RUN :: 40
 
 /*
 The response's OPT record.

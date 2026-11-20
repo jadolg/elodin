@@ -221,20 +221,32 @@ test_ddr_wildcard_v6_listener_takes_v4_unless_v6only :: proc(t: ^testing.T) {
 /*
 The addresses go in behind the client's OPT record, not over it, so the encoder
 keeps that record's room as it fills the section: a client that asked with EDNS
-gets its OPT record back however many addresses the rewrite holds.
+gets its OPT record back however many addresses the rewrite holds. They are one
+RRset, which goes in whole or not at all (RFC 2181 section 9): forty of them do
+not fit beside the designation, so none goes, and four do, so all go.
 */
 @(test)
 test_ddr_addresses_keep_the_opt_record :: proc(t: ^testing.T) {
-	cfg: config.Config
-	s := designating_server(&cfg)
-	rewrite_many_addresses(&cfg, 40)
+	for c in ([]struct {
+			addresses: int,
+			sent:      int,
+		}{{addresses = 40, sent = 0}, {addresses = 4, sent = 4}}) {
+		cfg: config.Config
+		s := designating_server(&cfg)
+		rewrite_many_addresses(&cfg, c.addresses)
 
-	resp := ask(t, &s, "_dns.resolver.arpa.", .SVCB, dns.make_opt(1232, false))
+		resp := ask(t, &s, "_dns.resolver.arpa.", .SVCB, dns.make_opt(1232, false))
 
-	testing.expect_value(t, len(resp.answer), 2)
-	testing.expect(t, dns.edns_present(resp), "the addresses took the OPT record's place")
-	testing.expect(t, len(resp.additional) > 1, "no address came back")
-	testing.expect(t, !resp.flags.tc, "the designation came back truncated")
-
+		testing.expect_value(t, len(resp.answer), 2)
+		testing.expectf(t, dns.edns_present(resp), "%d addresses took the OPT record's place", c.addresses)
+		testing.expectf(t, !resp.flags.tc, "the designation with %d addresses came back truncated", c.addresses)
+		sent := 0
+		for rec in resp.additional {
+			if rec.type == .AAAA {
+				sent += 1
+			}
+		}
+		testing.expectf(t, sent == c.sent, "%d of %d addresses went out, want %d", sent, c.addresses, c.sent)
+	}
 	free_all(context.temp_allocator)
 }

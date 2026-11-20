@@ -605,3 +605,229 @@ test_a_root_referral_that_drops_glue_is_truncated :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+An additional RRset that does not fit whole is left out whole, with TC clear
+(RFC 2181 section 9: "the entire RRSet that will not fit in the response should
+be omitted, and the reply sent as is, with the TC bit clear"). Not the records
+of it that happened to fit ahead of the one that overflowed: a client or a cache
+reading two of a name's three addresses has no way to know there was a third.
+An RRset is the run of records with one owner, type and class.
+*/
+@(test)
+test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing.T) {
+	mail := proc(last: u8) -> Record {
+		return address("mail.example.com.", last)
+	}
+	other := address("other.example.com.", 9)
+	// An RRSIG at the TXT records' owner covering `covered`: the type covered
+	// is its RDATA's first two bytes, and the rest is padding to a size that
+	// fits where a long TXT record was taken back from.
+	rrsig_over := proc(covered: Type) -> Record {
+		rdata := make([]u8, 20, context.temp_allocator)
+		rdata[0], rdata[1] = u8(u16(covered) >> 8), u8(covered)
+		return Record{name = QNAME, type = .RRSIG, class = .IN, ttl = 300, data = Rdata_Raw{data = rdata}}
+	}
+	// One TXT RRset: a short record, one past the room, and a short one again,
+	// which would fit where the long one was taken back to.
+	txt := proc(text: string) -> Record {
+		strs := make([]string, 1, context.temp_allocator)
+		strs[0] = text
+		return Record{name = QNAME, type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = strs}}
+	}
+	cases := []struct {
+		name:      string,
+		// The additional section, and the one whose size is the room.
+		whole:     []Record,
+		fits:      []Record,
+		// What goes out, by owner and last address byte.
+		kept:      []Record,
+		with_opt:  bool,
+	} {
+		{name = "two of one RRset, room for one", whole = {mail(1), mail(2)}, fits = {mail(1)}, kept = {}},
+		{
+			name = "an RRset that fit, then one that straddles the room",
+			whole = {other, mail(1), mail(2)},
+			fits = {other, mail(1)},
+			kept = {other},
+		},
+		{
+			name = "an RRset that will not fit, then a smaller one that does",
+			whole = {mail(1), mail(2), mail(3), other},
+			fits = {mail(1), other},
+			kept = {other},
+		},
+		{
+			name = "the rest of an RRset that will not fit, short enough to",
+			whole = {txt("a"), big_txt(), txt("b"), other},
+			fits = {txt("a"), txt("b"), other},
+			kept = {other},
+		},
+		{
+			name = "a later record of an RRset left out, not next to it",
+			whole = {txt("a"), big_txt(), other, txt("b")},
+			fits = {txt("a"), other, txt("b")},
+			kept = {other},
+		},
+		{
+			name = "a signature over an RRset left out",
+			whole = {txt("a"), big_txt(), rrsig_over(.TXT), other},
+			fits = {txt("a"), rrsig_over(.TXT), other},
+			kept = {other},
+		},
+		{
+			name = "another type at the same owner is another RRset",
+			whole = {address(QNAME, 7), big_txt()},
+			fits = {address(QNAME, 7)},
+			kept = {address(QNAME, 7)},
+		},
+		{
+			name = "an RRset that will not fit ahead of the OPT record",
+			whole = opt_records(before = []Record{mail(1), mail(2)}),
+			fits = opt_records(before = []Record{mail(1)}),
+			kept = {},
+			with_opt = true,
+		},
+	}
+	for c in cases {
+		room := encoded_size(t, message_with(c.fits))
+		got, truncated := encode_within(t, message_with(c.whole), room)
+		testing.expectf(t, !truncated && !got.flags.tc, "%s: TC set for additional data", c.name)
+		testing.expectf(t, len(got.answer) == 2, "%s: %d answer records", c.name, len(got.answer))
+		addresses := 0
+		for rec in got.additional {
+			if rec.type == .A {
+				addresses += 1
+			}
+		}
+		testing.expectf(t, addresses == len(c.kept), "%s: %d address records went out, want %d: %v", c.name, addresses, len(c.kept), got.additional)
+		for rec in got.additional {
+			testing.expectf(t, rec.type != .TXT, "%s: part of the TXT RRset went out: %v", c.name, got.additional)
+			testing.expectf(t, rec.type != .RRSIG, "%s: a signature went out without its RRset: %v", c.name, got.additional)
+		}
+		for want in c.kept {
+			found := false
+			for rec in got.additional {
+				got_a, got_ok := rec.data.(Rdata_A)
+				want_a, want_ok := want.data.(Rdata_A)
+				found ||= rec.type == .A && name_equal_fold(rec.name, want.name) && got_ok && want_ok && got_a.addr == want_a.addr
+			}
+			testing.expectf(t, found, "%s: %s %v was left out", c.name, want.name, want.data)
+		}
+		testing.expectf(t, edns_present(got) == c.with_opt, "%s: the OPT record is %v, want %v", c.name, edns_present(got), c.with_opt)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The RRsets left out are held up to `DROPPED_RRSETS`, as every record behind a
+drop is compared against each; one more, and the rest of the additional section
+but its OPT record is left out with them, which is the reply's to do without.
+Each of these RRsets is one address too big for the room behind the one before.
+*/
+@(test)
+test_past_the_rrsets_it_tracks_the_rest_of_the_section_goes :: proc(t: ^testing.T) {
+	OWNERS :: [?]string {
+		"r0.example.com.",
+		"r1.example.com.",
+		"r2.example.com.",
+		"r3.example.com.",
+		"r4.example.com.",
+		"r5.example.com.",
+		"r6.example.com.",
+		"r7.example.com.",
+		"r8.example.com.",
+	}
+	#assert(len(OWNERS) == DROPPED_RRSETS + 1)
+	owners := OWNERS
+	text := make([]u8, 200, context.temp_allocator)
+	for j in 0 ..< len(text) {
+		text[j] = 'x'
+	}
+	strs := make([]string, 1, context.temp_allocator)
+	strs[0] = string(text)
+	whole := make([dynamic]Record, 0, len(owners) + 1, context.temp_allocator)
+	for owner in owners {
+		append(&whole, Record{name = owner, type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = strs}})
+	}
+	small := address("last.example.com.", 1)
+	append(&whole, small)
+	room := encoded_size(t, message_with([]Record{small})) + 32
+
+	got, truncated := encode_within(t, message_with(whole[:]), room)
+	testing.expect(t, !truncated && !got.flags.tc, "TC set for additional data")
+	// One RRset past the bound left out: the address behind them, which would
+	// have fitted, goes with them.
+	testing.expectf(t, len(got.additional) == 0, "past %d RRsets left out, %v still went out", DROPPED_RRSETS, got.additional)
+
+	// The premise: one RRset fewer, and the address goes out.
+	got, truncated = encode_within(t, message_with(whole[1:]), room)
+	testing.expectf(t, !truncated && len(got.additional) == 1, "at %d RRsets left out, the address did not go out: %v", DROPPED_RRSETS, got.additional)
+	free_all(context.temp_allocator)
+}
+
+/*
+Past `DROPPED_RRSETS` the rest of the additional section is left out, but glue
+a referral cannot be read without still truncates (RFC 9471 section 3.3): a
+referral whose in-domain glue sits behind nine RRsets too big to fit goes out
+with TC set, not as a delegation the client cannot follow.
+*/
+@(test)
+test_glue_past_the_tracked_rrsets_still_truncates :: proc(t: ^testing.T) {
+	text := make([]u8, 200, context.temp_allocator)
+	for j in 0 ..< len(text) {
+		text[j] = 'x'
+	}
+	strs := make([]string, 1, context.temp_allocator)
+	strs[0] = string(text)
+	OWNERS :: [?]string {
+		"r0.elsewhere.test.",
+		"r1.elsewhere.test.",
+		"r2.elsewhere.test.",
+		"r3.elsewhere.test.",
+		"r4.elsewhere.test.",
+		"r5.elsewhere.test.",
+		"r6.elsewhere.test.",
+		"r7.elsewhere.test.",
+		"r8.elsewhere.test.",
+	}
+	#assert(len(OWNERS) == DROPPED_RRSETS + 1)
+	owners := OWNERS
+	glue := make([dynamic]Record, 0, len(owners) + 1, context.temp_allocator)
+	for owner in owners {
+		append(&glue, Record{name = owner, type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = strs}})
+	}
+	in_domain := address("ns1.sub.example.com.", 53)
+	append(&glue, in_domain)
+	room := encoded_size(t, referral([]Record{in_domain})) + 32
+
+	got, truncated := encode_within(t, referral(glue[:]), room)
+	testing.expect(t, truncated && got.flags.tc, "in-domain glue past the tracked RRsets went missing with TC clear")
+	free_all(context.temp_allocator)
+}
+
+/*
+Signatures over two types at one owner are two RRsets: one that will not fit
+takes none of the other's with it.
+*/
+@(test)
+test_a_signature_over_another_type_is_another_rrset :: proc(t: ^testing.T) {
+	sig := proc(covered: Type, size: int) -> Record {
+		rdata := make([]u8, size, context.temp_allocator)
+		rdata[0], rdata[1] = u8(u16(covered) >> 8), u8(covered)
+		return Record{name = QNAME, type = .RRSIG, class = .IN, ttl = 300, data = Rdata_Raw{data = rdata}}
+	}
+	small := sig(.A, 20)
+	whole := []Record{address(QNAME, 7), small, sig(.AAAA, 300)}
+	room := encoded_size(t, message_with([]Record{address(QNAME, 7), small}))
+	got, truncated := encode_within(t, message_with(whole), room)
+	testing.expect(t, !truncated && !got.flags.tc, "TC set for additional data")
+	signed := 0
+	for rec in got.additional {
+		if rec.type == .RRSIG {
+			signed += 1
+		}
+	}
+	testing.expectf(t, signed == 1, "%d signatures went out, want the one over A: %v", signed, got.additional)
+	free_all(context.temp_allocator)
+}
