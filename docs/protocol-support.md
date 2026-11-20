@@ -47,9 +47,10 @@ TLS is 1.2 or 1.3, on the DoT and DoH listeners and towards upstreams and list
 hosts alike. Over TLS 1.2 the only suites are ECDHE with AES-GCM or
 ChaCha20-Poly1305 (RFC 9325 section 4.2), and the listeners pick by their own
 order, keeping ChaCha20 for a client that puts it first. TLS 1.3 follows the
-same order: AES-128-GCM, AES-256-GCM, then ChaCha20-Poly1305. A peer that offers
-only static RSA or CBC suites, which RFC 9325 section 4.1 and, for DoH over
-HTTP/2, RFC 9113 Appendix A rule out, cannot connect.
+same order: AES-128-GCM, AES-256-GCM, then ChaCha20-Poly1305. A peer that speaks
+TLS 1.2 only, with none of those suites, cannot connect: static RSA, CBC and
+finite-field DHE are not offered (RFC 9325 sections 4.1 and 4.2, and RFC 9113
+Appendix A for DoH over HTTP/2).
 
 A UDP answer leaves from the address its query was sent to, also on a
 wildcard bind (`0.0.0.0` or `::`), as RFC 1123 section 2.3 asks of a

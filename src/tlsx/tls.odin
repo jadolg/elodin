@@ -510,7 +510,9 @@ strict. A policy that leaves none of the suites leaves TLS 1.3 alone.
 
 A context left able to speak nothing - no TLS 1.2 suite of ours between its
 floor and ceiling, and no TLS 1.3 suite below its ceiling - is `No_Suite`, so it
-is refused where it is built rather than every handshake failing later.
+is refused where it is built rather than every handshake failing later. Read
+before any certificate is loaded: a policy whose only suites need a key the
+certificate does not have still fails at the handshake.
 `Context_Failed` when OpenSSL refuses a setting.
 */
 @(private)
