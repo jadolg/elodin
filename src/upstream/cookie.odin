@@ -225,9 +225,11 @@ Send one query with a cookie on it, and deal with what comes back.
 
 BADCOOKIE means the server cookie we held is no longer one this server accepts —
 it has rotated its secret, or we have never had one and it insists. The reply
-carries a fresh one, so the question is asked again with it. Once: a server that
-refuses twice is not going to answer, and the group is better off trying the
-next one than looping here (RFC 7873 section 5.3).
+carries a fresh one, so the question is asked again with it. A UDP member that
+refuses that too is asked once more over TCP, where the handshake vouches for
+the client (RFC 7873 section 5.3). Past that `Bad_Response`: a server that
+refuses on every road is not going to answer, and the group is better off trying
+the next one than looping here.
 */
 @(private)
 exchange_with_cookie :: proc(
@@ -273,6 +275,14 @@ exchange_with_cookie :: proc(
 		response = nil
 		response = send(u, retry, timeout, deadline, allocator) or_return
 		learn_cookie(u, response)
+		// RFC 7873 section 5.3: "If the reply to a retried request with a fresh
+		// Server Cookie is BADCOOKIE, the client SHOULD retry using TCP".
+		if u.spec.kind == .UDP && dns.peek_rcode(response) == .Bad_Cookie {
+			delete(response, allocator)
+			response = nil
+			response = exchange_pipelined(u, retry, timeout, deadline, allocator) or_return
+			learn_cookie(u, response)
+		}
 		if dns.peek_rcode(response) == .Bad_Cookie {
 			logx.debugf("upstream %s: still BADCOOKIE after a fresh cookie", u.spec.name)
 			delete(response, allocator)

@@ -484,6 +484,32 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 	}
 
 	{
+		mock, srv, udp_port, ok := start_cookie_pair(r, "upstream-refuse-udp", "cookies: upstream refuses udp", .Refuse_Udp, true)
+		if !ok {
+			return
+		}
+		defer mock_stop(mock)
+		defer stop_server(&srv)
+
+		start_case(r, "cookies: a second BADCOOKIE from a UDP upstream is asked again over TCP")
+		{
+			// RFC 7873 section 5.3: the retry with a fresh server cookie refused
+			// too, the client SHOULD retry using TCP.
+			res := query_udp(udp_port, build_query(f.qname, f.qtype, edns_size = 1232))
+			if check(r, res.ok, "no response") {
+				h := parse_header(r, res.wire)
+				check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode")
+				check(r, h.ancount > 0, "the answer never arrived")
+				udp, tcp, tls := mock_counts(mock)
+				check_eq_int(r, udp, 2, "UDP queries the upstream saw")
+				check_eq_int(r, tcp, 1, "TCP queries the upstream saw")
+				check_eq_int(r, tls, 0, "TLS queries the upstream saw")
+			}
+		}
+		end_case(r)
+	}
+
+	{
 		// The two settings are independent. This is the combination where the
 		// client's cookie is not taken out on the way in, so what keeps it off
 		// the wire is our own cookie for this upstream replacing it.
