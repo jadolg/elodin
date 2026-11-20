@@ -15,15 +15,18 @@ import "core:thread"
 /*
 Each test sandboxes a forked child, since neither layer can be taken off the
 process that has it. The child reports through its exit status: the bits of the
-checks that failed, or `SKIP_STATUS` when the kernel lacks what is tested. It
+checks that failed, bits 0 to 6 only, or `SKIP_STATUS` when the kernel lacks
+what is tested, which no set of failed checks can equal. It
 allocates only from an arena over its own stack, as the parent's other threads
 may hold the heap's lock at the fork.
 */
 @(private = "file")
-SKIP_STATUS :: 77
+SKIP_STATUS :: 1 << 7
 
+// A child's body. `dirs` is what its test passed to `run_child`: tests run in
+// parallel, so a package variable would hand it another test's paths.
 @(private = "file")
-Child :: #type proc() -> u8
+Child :: #type proc(dirs: []string) -> u8
 
 @(private = "file")
 Outcome :: struct {
@@ -33,7 +36,7 @@ Outcome :: struct {
 }
 
 @(private = "file")
-run_child :: proc(t: ^testing.T, body: Child, loc := #caller_location) -> (out: Outcome, ok: bool) {
+run_child :: proc(t: ^testing.T, body: Child, dirs: []string = nil, loc := #caller_location) -> (out: Outcome, ok: bool) {
 	pid := posix.fork()
 	if pid < 0 {
 		testing.expectf(t, false, "fork: %v", posix.errno(), loc = loc)
@@ -46,7 +49,7 @@ run_child :: proc(t: ^testing.T, body: Child, loc := #caller_location) -> (out: 
 		context = runtime.default_context()
 		context.allocator = mem.arena_allocator(&arena)
 		context.temp_allocator = context.allocator
-		linux.exit_group(i32(body()))
+		linux.exit_group(i32(body(dirs)))
 	}
 	status: i32
 	if posix.waitpid(pid, &status, {}) != pid {
@@ -65,9 +68,9 @@ run_child :: proc(t: ^testing.T, body: Child, loc := #caller_location) -> (out: 
 
 // The child's checks all passed: it exited, with no bit set.
 @(private = "file")
-expect_passed :: proc(t: ^testing.T, out: Outcome, loc := #caller_location) {
-	testing.expectf(t, out.exited, "the child was killed by %v", out.signal, loc = loc)
-	testing.expectf(t, out.status == 0, "the child's failed checks: %b", out.status, loc = loc)
+expect_passed :: proc(t: ^testing.T, out: Outcome, child := "the child", loc := #caller_location) {
+	testing.expectf(t, out.exited, "%s was killed by %v", child, out.signal, loc = loc)
+	testing.expectf(t, out.status == 0, "%s's failed checks: %b", child, out.status, loc = loc)
 }
 
 @(private = "file")
@@ -82,16 +85,16 @@ no_new_privs :: proc() -> bool {
 // run under a sandbox of its own may already have set.
 @(test)
 test_confine_sets_no_new_privs_unless_off :: proc(t: ^testing.T) {
-	off :: proc() -> u8 {
+	off :: proc(_: []string) -> u8 {
 		before := no_new_privs()
 		_, ok := confine({mode = .Off})
 		return u8(!ok) << 1 | u8(no_new_privs() != before) << 2
 	}
-	basic :: proc() -> u8 {
+	basic :: proc(_: []string) -> u8 {
 		_, ok := confine({mode = .Basic})
 		return u8(!ok) << 1 | u8(!no_new_privs()) << 2
 	}
-	strict :: proc() -> u8 {
+	strict :: proc(_: []string) -> u8 {
 		_, ok := confine({mode = .Strict})
 		return u8(!ok) << 1 | u8(!no_new_privs()) << 2
 	}
@@ -154,12 +157,13 @@ RLIMIT_NOFILE :: 7
 // error rather than the kill.
 @(test)
 test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
-	body :: proc() -> u8 {
+	body :: proc(_: []string) -> u8 {
 		if !install_filter() {
 			return 1
 		}
 		failed: u8
 		self := uintptr(linux.getpid())
+		// Bit 1: the stream socket, or the options set on it.
 		if fd := linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_STREAM), uintptr(0)); fd < 0 {
 			failed |= 1 << 1
 		} else {
@@ -174,7 +178,7 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 			   set(fd, SOL_SOCKET, SO_KEEPALIVE, &one, size_of(one)) != .EPERM ||
 			   set(fd, IPPROTO_TCP, SO_KEEPALIVE, &one, size_of(one)) != .EPERM ||
 			   set(fd, SOL_SOCKET, TCP_NODELAY, &one, size_of(one)) != .EPERM {
-				failed |= 1 << 7
+				failed |= 1 << 1
 			}
 		}
 		if errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_UNIX), uintptr(SOCK_DGRAM), uintptr(0))) != .EAFNOSUPPORT {
@@ -236,7 +240,7 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 // another process is not its to move.
 @(test)
 test_the_filter_lets_a_thread_pin_itself_and_no_other :: proc(t: ^testing.T) {
-	body :: proc() -> u8 {
+	body :: proc(_: []string) -> u8 {
 		mask: [16]u64
 		if linux.syscall(linux.SYS_sched_getaffinity, uintptr(0), uintptr(size_of(mask)), &mask) < 0 {
 			return 4
@@ -268,7 +272,7 @@ What a serving process makes threads with is allowed - `pthread_create`, through
 */
 @(test)
 test_the_filter_lets_threads_start_and_refuses_a_fork :: proc(t: ^testing.T) {
-	body :: proc() -> u8 {
+	body :: proc(_: []string) -> u8 {
 		if !install_filter() {
 			return 1
 		}
@@ -307,7 +311,7 @@ test_the_filter_lets_threads_start_and_refuses_a_fork :: proc(t: ^testing.T) {
 // A call off the list ends the process, and the kill reaches it as SIGSYS.
 @(test)
 test_a_call_off_the_list_kills_the_process :: proc(t: ^testing.T) {
-	body :: proc() -> u8 {
+	body :: proc(_: []string) -> u8 {
 		if !install_filter() {
 			return 1
 		}
@@ -328,7 +332,7 @@ test_a_foreign_architecture_kills_the_process :: proc(t: ^testing.T) {
 	when ODIN_ARCH != .amd64 {
 		return
 	} else {
-		unfiltered :: proc() -> u8 {
+		unfiltered :: proc(_: []string) -> u8 {
 			page, ok := i386_getpid_page()
 			if !ok {
 				return 4
@@ -336,7 +340,7 @@ test_a_foreign_architecture_kills_the_process :: proc(t: ^testing.T) {
 			page()
 			return 0
 		}
-		filtered :: proc() -> u8 {
+		filtered :: proc(_: []string) -> u8 {
 			page, ok := i386_getpid_page()
 			if !ok {
 				return 4
@@ -411,10 +415,6 @@ remove_scratch :: proc(t: ^testing.T, dir: string) {
 	testing.expectf(t, derr == nil, "cannot remove %s: %v", dir, derr)
 }
 
-// The paths the child reads, set by the parent before the fork.
-@(private = "file")
-landlock_inside, landlock_outside: string
-
 @(private = "file")
 can_create :: proc(dir: string) -> bool {
 	path := strings.clone_to_cstring(strings.concatenate({dir, "/new"}, context.temp_allocator), context.temp_allocator)
@@ -442,6 +442,8 @@ Basic confines writing to the cache and log directories and leaves reading
 alone; strict confines reading to its readable paths too. A readable path that
 is a file - `/proc/meminfo` in the plan - takes a file rule rather than failing
 the ruleset, and one that does not exist is reported rather than failing it.
+Once it is in force, `refusal_hint` names it for what it confines: a write under
+either, a read only under strict.
 */
 @(test)
 test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
@@ -452,41 +454,70 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 	if !in_ok || !out_ok {
 		return
 	}
-	landlock_inside, landlock_outside = inside, outside
+	// The children's `dirs`: inside, then outside.
+	dirs := []string{inside, outside}
 
-	basic :: proc() -> u8 {
-		report, ok := confine({mode = .Basic, cache_dir = landlock_inside})
+	basic :: proc(dirs: []string) -> u8 {
+		inside, outside := dirs[0], dirs[1]
+		report, ok := confine({mode = .Basic, cache_dir = inside})
 		if report.landlock == .Unavailable {
 			return SKIP_STATUS
 		}
 		failed: u8
 		failed |= u8(!ok || report.landlock != .Applied)
-		failed |= u8(!can_create(landlock_inside)) << 1
-		failed |= u8(can_create(landlock_outside)) << 2
-		failed |= u8(!can_read(landlock_outside)) << 3
+		failed |= u8(!can_create(inside)) << 1
+		failed |= u8(can_create(outside)) << 2
+		failed |= u8(!can_read(outside)) << 3
+		if report.landlock != .Applied {
+			return failed
+		}
+		eacces := os.Platform_Error(linux.Errno.EACCES)
+		failed |= u8(refusal_hint(eacces, write = true) != REFUSAL_HINT) << 4
+		failed |= u8(refusal_hint(eacces, write = false) != "") << 5
+		failed |= u8(refusal_hint(os.Platform_Error(linux.Errno.ENOENT), write = true) != "") << 6
 		return failed
 	}
-	strict :: proc() -> u8 {
-		missing := strings.concatenate({landlock_outside, "/missing"}, context.temp_allocator)
-		report, ok := confine({mode = .Strict, log_dir = landlock_outside, readable = {landlock_inside, "/proc/meminfo", missing}})
+	strict :: proc(dirs: []string) -> u8 {
+		inside, outside := dirs[0], dirs[1]
+		missing := strings.concatenate({outside, "/missing"}, context.temp_allocator)
+		report, ok := confine({mode = .Strict, log_dir = outside, readable = {inside, "/proc/meminfo", missing}})
 		if report.landlock == .Unavailable {
 			return SKIP_STATUS
 		}
 		failed: u8
 		failed |= u8(!ok || report.landlock != .Applied)
-		failed |= u8(!can_read(landlock_inside)) << 1
-		failed |= u8(can_read(landlock_outside)) << 2
+		failed |= u8(!can_read(inside)) << 1
+		failed |= u8(can_read(outside)) << 2
 		// The log directory is written to, never read.
-		failed |= u8(!can_create(landlock_outside)) << 3
-		failed |= u8(can_create(landlock_inside)) << 4
+		failed |= u8(!can_create(outside)) << 3
+		failed |= u8(can_create(inside)) << 4
 		meminfo, err := linux.open("/proc/meminfo", {.CLOEXEC})
 		failed |= u8(err != .NONE) << 5
 		linux.close(meminfo)
 		failed |= u8(len(report.unreachable) != 1 || report.unreachable[0] != {missing, i32(linux.Errno.ENOENT)}) << 6
 		return failed
 	}
-	for body, i in ([2]Child{basic, strict}) {
-		out, ok := run_child(t, body)
+	strict_hints :: proc(_: []string) -> u8 {
+		report, ok := confine({mode = .Strict})
+		if report.landlock == .Unavailable {
+			return SKIP_STATUS
+		}
+		if !ok || report.landlock != .Applied {
+			return 1
+		}
+		eacces := os.Platform_Error(linux.Errno.EACCES)
+		failed: u8
+		failed |= u8(refusal_hint(eacces, write = false) != REFUSAL_HINT) << 1
+		failed |= u8(refusal_hint(eacces, write = true) != REFUSAL_HINT) << 2
+		failed |= u8(refusal_hint(os.Platform_Error(linux.Errno.ENOENT), write = false) != "") << 3
+		return failed
+	}
+	children := [?]struct {
+		name: string,
+		body: Child,
+	}{{"basic", basic}, {"strict", strict}, {"strict's hints", strict_hints}}
+	for c in children {
+		out, ok := run_child(t, c.body, dirs)
 		if !ok {
 			continue
 		}
@@ -496,10 +527,10 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 			if !testing.expectf(t, abi <= 0, "the child found no Landlock where this process finds ABI %d", abi) {
 				continue
 			}
-			fmt.eprintfln("sandbox: Landlock is not available here, so %s is not tested", "basic" if i == 0 else "strict")
+			fmt.eprintfln("sandbox: Landlock is not available here, so %s is not tested", c.name)
 			continue
 		}
-		expect_passed(t, out)
+		expect_passed(t, out, child = c.name)
 	}
 }
 
@@ -516,15 +547,13 @@ test_landlock_handles_only_what_the_abi_knows :: proc(t: ^testing.T) {
 }
 
 // The hint is for a refusal Landlock may have made: EACCES, with it in force,
-// on writing, or on reading where it confines reads too.
+// on writing, or on reading where it confines reads too. `refusal_hint` asks
+// `hint_for` with the flags `confine` sets: checked here in a child, which may
+// set them without another test seeing it, and under a real ruleset by the
+// Landlock test.
 @(test)
 test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^testing.T) {
 	eacces, enoent := os.Platform_Error(linux.Errno.EACCES), os.Platform_Error(linux.Errno.ENOENT)
-	was_in_force, was_reads := sync.atomic_load(&landlock_in_force), sync.atomic_load(&landlock_reads)
-	defer {
-		sync.atomic_store(&landlock_in_force, was_in_force)
-		sync.atomic_store(&landlock_reads, was_reads)
-	}
 	Case :: struct {
 		in_force, reads, write: bool,
 		err:                    os.Error,
@@ -540,9 +569,27 @@ test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^test
 		{in_force = true, reads = false, write = true, err = io.Error.Permission_Denied, hinted = true},
 	}
 	for c in cases {
-		sync.atomic_store(&landlock_in_force, c.in_force)
-		sync.atomic_store(&landlock_reads, c.reads)
-		testing.expectf(t, (refusal_hint(c.err, write = c.write) == REFUSAL_HINT) == c.hinted, "%v", c)
+		hint := hint_for(c.err, write = c.write, in_force = c.in_force, reads = c.reads)
+		testing.expectf(t, (hint == REFUSAL_HINT) == c.hinted, "%v", c)
+	}
+
+	// Exits with the first case whose hints differ, plus one: bit 0 in force,
+	// 1 reads, 2 write, 3 EACCES rather than ENOENT.
+	wiring :: proc(_: []string) -> u8 {
+		for bits in 0 ..< 16 {
+			in_force, reads, write := bits & 1 != 0, bits & 2 != 0, bits & 4 != 0
+			err := os.Platform_Error(linux.Errno.EACCES if bits & 8 != 0 else linux.Errno.ENOENT)
+			sync.atomic_store(&landlock_in_force, in_force)
+			sync.atomic_store(&landlock_reads, reads)
+			if refusal_hint(err, write = write) != hint_for(err, write = write, in_force = in_force, reads = reads) {
+				return u8(bits + 1)
+			}
+		}
+		return 0
+	}
+	if out, ok := run_child(t, wiring); ok {
+		testing.expectf(t, out.exited, "the wiring child was killed by %v", out.signal)
+		testing.expectf(t, out.status == 0, "refusal_hint and hint_for differ, first at case %04b", out.status - 1)
 	}
 }
 
@@ -564,7 +611,7 @@ allowed too; another still is not.
 */
 @(test)
 test_the_filter_lets_threads_start_under_the_processs_policy :: proc(t: ^testing.T) {
-	body :: proc() -> u8 {
+	body :: proc(_: []string) -> u8 {
 		param: [1]i32
 		if linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(SCHED_BATCH), &param) != 0 {
 			return 4
@@ -598,14 +645,17 @@ test_the_filter_lets_a_directory_be_removed :: proc(t: ^testing.T) {
 	if !testing.expect(t, os.make_directory(dir) == nil, "cannot make the directory") {
 		return
 	}
-	landlock_inside = dir
-	body :: proc() -> u8 {
+	defer if os.exists(dir) {
+		err := os.remove(dir)
+		testing.expectf(t, err == nil, "cannot remove %s: %v", dir, err)
+	}
+	body :: proc(dirs: []string) -> u8 {
 		if !install_filter() {
 			return 1
 		}
-		return u8(os.remove(landlock_inside) != nil) << 1
+		return u8(os.remove(dirs[0]) != nil) << 1
 	}
-	if out, ok := run_child(t, body); ok {
+	if out, ok := run_child(t, body, {dir}); ok {
 		expect_passed(t, out)
 	}
 	testing.expect(t, !os.exists(dir), "the directory is still there")
