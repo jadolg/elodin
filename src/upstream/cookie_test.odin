@@ -26,6 +26,12 @@ Cookie_Mock :: struct {
 	forge:      bool,
 	// Answer BADCOOKIE until a query turns up carrying the server cookie.
 	demand:     bool,
+	// Answer BADCOOKIE to every query, server cookie or not: an anycast node
+	// whose secret is not the one that issued it (RFC 7873 section 5.3).
+	always_bad: bool,
+	// Give each reply a server cookie of its own: the last byte of `server` is
+	// the reply's count, the way a node with a rotating secret would.
+	rotate:     bool,
 	/*
 	Stop putting a COOKIE option in replies once this many have carried one.
 
@@ -80,7 +86,7 @@ cookie_mock_reply :: proc(m: ^Cookie_Mock, query: []u8, count: int) -> (reply: [
 	sent, has_cookie := dns.find_edns_option(msg, .Cookie)
 
 	rcode := dns.Rcode.No_Error
-	if m.demand && len(sent) < 16 {
+	if (m.demand && len(sent) < 16) || m.always_bad {
 		rcode = .Bad_Cookie
 	}
 	resp := dns.make_response(msg, rcode, context.temp_allocator)
@@ -101,6 +107,9 @@ cookie_mock_reply :: proc(m: ^Cookie_Mock, query: []u8, count: int) -> (reply: [
 		option[0] ~= 0xff
 	}
 	copy(option[8:], m.server[:])
+	if m.rotate {
+		option[15] = u8(count)
+	}
 	written := option[:12] if m.short else option[:]
 	out, set_ok := dns.set_edns_option(wire, .Cookie, written, context.temp_allocator)
 	if !set_ok {
@@ -522,4 +531,193 @@ test_a_cookie_retry_without_memory_is_not_a_bad_response :: proc(t: ^testing.T) 
 		testing.expectf(t, err != .Bad_Response, "allocation %d refused: the upstream was blamed with %v", n, err)
 	}
 	testing.expect(t, refused > 0, "the exchange allocated nothing to refuse")
+}
+
+/*
+A TCP responder that accepts one connection and answers each framed query on it
+(RFC 7766 section 8) with `server` as its server cookie, BADCOOKIE when `bad`,
+until the client hangs up or a read times out.
+*/
+@(private = "file")
+Tcp_Answerer :: struct {
+	listener: net.TCP_Socket,
+	server:   [8]u8,
+	bad:      bool,
+	answered: int,
+	mu:       sync.Mutex,
+	// The server half of the cookie on the last query answered.
+	seen:     [8]u8,
+}
+
+@(private = "file")
+tcp_answerer_serve :: proc(m: ^Tcp_Answerer) {
+	conn, _, aerr := net.accept_tcp(m.listener)
+	if aerr != nil {
+		return
+	}
+	defer net.close(conn)
+	if net.set_option(conn, .Receive_Timeout, 2 * time.Second) != nil {
+		return
+	}
+	read_exact :: proc(conn: net.TCP_Socket, buf: []u8) -> bool {
+		got := 0
+		for got < len(buf) {
+			n, err := net.recv_tcp(conn, buf[got:])
+			if err != nil || n == 0 {
+				return false
+			}
+			got += n
+		}
+		return true
+	}
+	answer := Cookie_Mock {
+		server     = m.server,
+		always_bad = m.bad,
+	}
+	for {
+		defer free_all(context.temp_allocator)
+		size: [2]u8
+		if !read_exact(conn, size[:]) {
+			return
+		}
+		query := make([]u8, int(size[0]) << 8 | int(size[1]), context.temp_allocator)
+		if !read_exact(conn, query) {
+			return
+		}
+		wire, ok := cookie_mock_reply(&answer, query, 1)
+		if !ok {
+			return
+		}
+		framed := make([]u8, 2 + len(wire), context.temp_allocator)
+		framed[0], framed[1] = u8(len(wire) >> 8), u8(len(wire))
+		copy(framed[2:], wire)
+		// Before the send: the client reads these as soon as it has the reply.
+		msg, derr := dns.decode_message(query, context.temp_allocator)
+		if derr != .None {
+			return
+		}
+		if sent, found := dns.find_edns_option(msg, .Cookie); found && len(sent) == 16 {
+			sync.mutex_lock(&m.mu)
+			copy(m.seen[:], sent[8:])
+			sync.mutex_unlock(&m.mu)
+		}
+		sync.atomic_add(&m.answered, 1)
+		if _, serr := net.send_tcp(conn, framed); serr != nil {
+			return
+		}
+	}
+}
+
+// A loopback TCP listener on `port`, any free one for zero, with a bounded
+// accept and an answerer serving it; `bound` is the port it holds.
+@(private = "file")
+start_tcp_answerer :: proc(t: ^testing.T, m: ^Tcp_Answerer, port: int) -> (server: ^thread.Thread, bound: int, ok: bool) {
+	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = port})
+	if !testing.expectf(t, lerr == nil, "cannot listen on TCP %d: %v", port, lerr) {
+		return nil, 0, false
+	}
+	if !testing.expect(t, net.set_option(listener, .Receive_Timeout, 2 * time.Second) == nil, "cannot bound the accept") {
+		net.close(listener)
+		return nil, 0, false
+	}
+	endpoint, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the port bound: %v", berr) {
+		net.close(listener)
+		return nil, 0, false
+	}
+	m.listener = listener
+	server = thread.create_and_start_with_poly_data(m, tcp_answerer_serve)
+	if !testing.expect(t, server != nil, "cannot start the TCP responder") {
+		net.close(listener)
+		return nil, 0, false
+	}
+	return server, endpoint.port, true
+}
+
+// The upstream first: closing its connection ends the answerer's read.
+@(private = "file")
+stop_tcp_answerer :: proc(m: ^Tcp_Answerer, server: ^thread.Thread, u: ^Upstream) {
+	destroy(u)
+	thread.join(server)
+	thread.destroy(server)
+	net.close(m.listener)
+}
+
+/*
+RFC 7873 section 5.3: "If the reply to a retried request with a fresh Server
+Cookie is BADCOOKIE, the client SHOULD retry using TCP as the transport". A UDP
+member that answers BADCOOKIE to the retry as well is asked once more over TCP,
+on the same exchange, with the server cookie that refusal carried, and that
+answer is the exchange's.
+*/
+@(test)
+test_a_second_badcookie_is_asked_again_over_tcp :: proc(t: ^testing.T) {
+	m := Cookie_Mock {
+		server     = {9, 9, 9, 9, 9, 9, 9, 9},
+		always_bad = true,
+		rotate     = true,
+	}
+	u, worker, ok := start_cookie_mock(t, &m)
+	if !ok {
+		return
+	}
+	defer stop_udp_mock(&m, worker)
+	tcp := Tcp_Answerer {
+		server = m.server,
+	}
+	server, _, started := start_tcp_answerer(t, &tcp, u.spec.port)
+	if !started {
+		destroy(u)
+		return
+	}
+	defer stop_tcp_answerer(&tcp, server, u)
+
+	response, err := exchange(u, edns_query("example.com."), time.Second, context.temp_allocator)
+	testing.expectf(t, err == .None, "a second BADCOOKIE ended the exchange: %v", err)
+	if response != nil {
+		testing.expect_value(t, dns.peek_rcode(response), dns.Rcode.No_Error)
+	}
+	sync.mutex_lock(&m.mu)
+	seen := m.queries
+	sync.mutex_unlock(&m.mu)
+	testing.expectf(t, seen == 2, "%d UDP queries, want the first and its retry", seen)
+	testing.expectf(t, sync.atomic_load(&tcp.answered) == 1, "%d TCP answers, want the one retry", sync.atomic_load(&tcp.answered))
+	// The cookie the second refusal carried, not the one it refused.
+	sync.mutex_lock(&tcp.mu)
+	carried := tcp.seen
+	sync.mutex_unlock(&tcp.mu)
+	testing.expectf(t, carried == [8]u8{9, 9, 9, 9, 9, 9, 9, 2}, "the TCP ask carried server cookie %v", carried)
+	free_all(context.temp_allocator)
+}
+
+/*
+A TCP member already speaks the transport RFC 7873 section 5.3 falls back to:
+BADCOOKIE to the query and to its retry with the fresh cookie fails the exchange
+as `Bad_Response`, with no third ask.
+*/
+@(test)
+test_a_tcp_member_refusing_twice_is_not_asked_a_third_time :: proc(t: ^testing.T) {
+	tcp := Tcp_Answerer {
+		server = {9, 9, 9, 9, 9, 9, 9, 9},
+		bad    = true,
+	}
+	server, port, started := start_tcp_answerer(t, &tcp, 0)
+	if !started {
+		return
+	}
+	u, uerr := make_upstream(
+		config.Upstream_Spec{name = "refusing", kind = .TCP, address = "127.0.0.1", port = port},
+		0,
+		time.Second,
+		cookies = true,
+	)
+	defer stop_tcp_answerer(&tcp, server, u)
+	if !testing.expectf(t, uerr == .None, "cannot build the member: %v", uerr) {
+		return
+	}
+
+	_, err := exchange(u, edns_query("example.com."), time.Second, context.temp_allocator)
+	testing.expect_value(t, err, Error.Bad_Response)
+	testing.expectf(t, sync.atomic_load(&tcp.answered) == 2, "%d TCP answers, want the query and its retry", sync.atomic_load(&tcp.answered))
+	free_all(context.temp_allocator)
 }

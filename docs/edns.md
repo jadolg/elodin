@@ -58,7 +58,10 @@ cookie that server last issued.
   same way (RFC 7873 §5.3). A server that never sent one is treated as not
   supporting cookies.
 - A BADCOOKIE reply carries a fresh server cookie, and the query is retried once
-  with it.
+  with it. A `udp` upstream that answers the retry with BADCOOKIE too is asked
+  once more over TCP, with the cookie that refusal carried (RFC 7873 §5.3). A
+  `tcp` upstream refusing twice, or a `udp` one refusing over TCP too or whose
+  TCP fails, fails the exchange and the group moves on.
 - Every forwarded query carries an OPT record of elodin's own (see
   [What reaches the upstream](#what-reaches-the-upstream)), so every one gets a
   cookie.

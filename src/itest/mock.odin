@@ -52,6 +52,10 @@ Mock_Cookies :: enum u8 {
 	// The same, but refuse to answer anything until the query shows the server
 	// cookie this mock issued.
 	Require,
+	// Answer BADCOOKIE to every UDP query, server cookie or not, and answer
+	// over TCP: an anycast node holding a secret other than the one that
+	// issued the cookie (RFC 7873 section 5.3).
+	Refuse_Udp,
 }
 
 Mock_Rule :: struct {
@@ -612,7 +616,7 @@ build_reply :: proc(
 		return build_answer(query, rule, over_tcp, allocator)
 	}
 	// Nothing but the cookie is looked at until the cookie is right.
-	if m.cookies == .Require && !cookie_is_ours(sent) {
+	if (m.cookies == .Require && !cookie_is_ours(sent)) || (m.cookies == .Refuse_Udp && !over_tcp) {
 		return with_cookie(sent, build_rcode_reply(query, .Bad_Cookie, allocator), allocator), true
 	}
 	answer := build_answer(query, rule, over_tcp, allocator) or_return
