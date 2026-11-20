@@ -122,6 +122,11 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	echoed := u.cookie.client
 	held := u.cookie.server_len > 0
 	sync.mutex_unlock(&u.mu)
+	// The client cookie the query went out with, which a move may since have
+	// drawn afresh (`resolve_endpoint`): the reply echoes that one.
+	if sent, carried := dns.peek_edns_option(query, .Cookie); carried && len(sent) >= COOKIE_CLIENT_LEN {
+		copy(echoed[:], sent[:COOKIE_CLIENT_LEN])
+	}
 
 	/*
 	A cookie is owed on a reply to a query that carried one, and only then.
@@ -203,20 +208,27 @@ reply_cookie :: proc(response: []u8) -> (raw: []u8, found: bool) {
 	return dns.peek_edns_option(response, .Cookie)
 }
 
-// Keep the server cookie a reply carried, for the next query to this upstream.
+/*
+Keep the server cookie a reply carried, for the next query to this upstream.
+Not one echoing a client cookie other than the one held: that reply answered a
+query sent before the address moved, and its server cookie is the old one's.
+*/
 @(private)
 learn_cookie :: proc(u: ^Upstream, response: []u8) {
 	raw, found := reply_cookie(response)
-	if !found {
+	if !found || len(raw) < COOKIE_CLIENT_LEN {
 		return
 	}
-	server := raw[min(COOKIE_CLIENT_LEN, len(raw)):]
+	server := raw[COOKIE_CLIENT_LEN:]
 	if len(server) < COOKIE_SERVER_MIN || len(server) > COOKIE_SERVER_MAX {
 		return
 	}
 
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
+	if mem.compare(raw[:COOKIE_CLIENT_LEN], u.cookie.client[:]) != 0 {
+		return
+	}
 	u.cookie.server_len = copy(u.cookie.server[:], server)
 }
 

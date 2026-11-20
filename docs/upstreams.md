@@ -40,11 +40,13 @@ for them, since on a machine where elodin *is* the system resolver that would
 loop back to a server that has not started yet. Each entry is an IP address with
 an optional port (`9.9.9.9`, `[2620:fe::fe]:53`); a name there is a config error.
 
-An upstream's hostname is resolved at startup to the lowest address in the
-answer, and held for the shortest TTL in it (CNAMEs included), no less than 10
+An upstream's hostname is resolved at startup to the lowest address the
+answer gives for it (following CNAMEs), and held for the shortest TTL on that
+chain, no less than 10
 seconds and no more than an hour. The first query after that asks `bootstrap`
 again, spending at most a quarter of its `timeout` on it, while the others go
-on to the address held. When the address has moved, the log says so at
+on to the address held; with a `timeout` too short for the bootstrap servers to
+answer in that quarter, the address held is kept. When the address has moved, the log says so at
 `info`; connections to the old one are not used again, and the DNS cookies for
 it are dropped. A lookup that fails is logged at `warn`, keeps the address
 held, and is tried again 10 seconds later.

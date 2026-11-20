@@ -26,6 +26,8 @@ Ttl_Mock :: struct {
 	also:   [4]u8,
 	// When set, the A records hang off a CNAME with this TTL.
 	cname:  u32,
+	// When set, an A record owned by a name off the chain, first in the answer.
+	stray:  [4]u8,
 }
 
 @(private = "file")
@@ -43,7 +45,7 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 		}
 		sync.mutex_lock(&m.mu)
 		m.asked += 1
-		silent, addr, ttl, delay, also, cname, turn := m.silent, m.addr, m.ttl, m.delay, m.also, m.cname, m.asked % 2 == 0
+		silent, addr, ttl, delay, also, cname, stray, turn := m.silent, m.addr, m.ttl, m.delay, m.also, m.cname, m.stray, m.asked % 2 == 0
 		sync.mutex_unlock(&m.mu)
 		if silent {
 			continue
@@ -55,6 +57,9 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 		q := msg.question[0]
 		if q.type == .A {
 			answer := make([dynamic]dns.Record, context.temp_allocator)
+			if stray != {} {
+				append(&answer, dns.Record{name = "stray.invalid.", type = .A, class = .IN, ttl = 1, data = dns.Rdata_A{addr = stray}})
+			}
 			owner := q.name
 			if cname != 0 {
 				owner = "target.invalid."
@@ -390,12 +395,24 @@ test_a_connection_from_before_a_move_is_not_used_again :: proc(t: ^testing.T) {
 		sync.mutex_unlock(&u.mu)
 		testing.expectf(t, pooled == (1 if current else 0), "current %v: %d pooled", current, pooled)
 	}
+	// And one pooled before a move is not taken after it.
+	sync.mutex_lock(&u.mu)
+	u.epoch += 1
+	sync.mutex_unlock(&u.mu)
+	_, taken := take_idle(u)
+	testing.expect(t, !taken, "a pooled connection to the old address was taken")
+	sync.mutex_lock(&u.mu)
+	left := len(u.idle)
+	sync.mutex_unlock(&u.mu)
+	testing.expect_value(t, left, 0)
 }
 
 /*
 A server that turns the order of an RRset with each answer does not make the
-address look moved: the lowest is taken every time. The address is held for
-the shortest TTL in the answer, the CNAME that leads to it included.
+address look moved: the lowest is taken every time. Only records on the chain
+from the name asked count, so a lower address under another owner is passed
+over. The address is held for the shortest TTL on the chain, the CNAME that
+leads to it included, not the stray record's.
 */
 @(test)
 test_a_bootstrap_answer_is_read_the_same_whatever_its_order :: proc(t: ^testing.T) {
@@ -404,6 +421,7 @@ test_a_bootstrap_answer_is_read_the_same_whatever_its_order :: proc(t: ^testing.
 		also  = {127, 0, 0, 7},
 		ttl   = 3600,
 		cname = 30,
+		stray = {10, 0, 0, 1},
 	}
 	bound, responder, ok := serve_udp_mock(t, &m, ttl_mock_loop)
 	if !ok {
@@ -479,5 +497,94 @@ test_a_quiet_bootstrap_does_not_cost_a_query_its_answer :: proc(t: ^testing.T) {
 	testing.expectf(t, err == .None && response != nil, "the query failed on a quiet bootstrap: %v", err)
 	testing.expect(t, ttl_mock_asked(&boot) > 1, "the premise: the bootstrap was asked again")
 	testing.expectf(t, took < TIMEOUT / 2, "the query took %v, where the refresh may spend %v", took, TIMEOUT / REFRESH_SHARE)
+	free_all(context.temp_allocator)
+}
+
+// A query carrying an OPT record, with this upstream's cookie attached.
+@(private = "file")
+cookied_query :: proc(t: ^testing.T, u: ^Upstream) -> (query: []u8, ok: bool) {
+	q := dns.Message {
+		id       = 0x6914,
+		question = []dns.Question{{name = "example.com.", type = .A, class = .IN}},
+	}
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = dns.make_opt(1232, false)
+	q.additional = additional
+	wire, _, eerr := dns.encode_message(q, context.temp_allocator)
+	if !testing.expectf(t, eerr == .None, "cannot encode the query: %v", eerr) {
+		return nil, false
+	}
+	attached, attach_ok, dry := attach_cookie(u, wire, context.temp_allocator)
+	return attached, testing.expectf(t, attach_ok, "cannot attach the cookie (out of memory: %v)", dry)
+}
+
+// A reply to `query` echoing `client`, with a server cookie behind it.
+@(private = "file")
+cookied_reply :: proc(t: ^testing.T, query: []u8, client: [COOKIE_CLIENT_LEN]u8) -> (reply: []u8, ok: bool) {
+	msg, derr := dns.decode_message(query, context.temp_allocator)
+	if !testing.expectf(t, derr == .None, "cannot decode the query: %v", derr) {
+		return nil, false
+	}
+	wire, _, eerr := dns.encode_message(dns.make_response(msg, .No_Error, context.temp_allocator), context.temp_allocator)
+	if !testing.expectf(t, eerr == .None, "cannot encode the reply: %v", eerr) {
+		return nil, false
+	}
+	option: [16]u8
+	echoed := client
+	copy(option[:COOKIE_CLIENT_LEN], echoed[:])
+	option[8], option[15] = 0x5e, 0x5e
+	out, set_ok := dns.set_edns_option(wire, .Cookie, option[:], context.temp_allocator)
+	return out, testing.expect(t, set_ok, "cannot set the reply's cookie")
+}
+
+/*
+A move draws a fresh client cookie while queries sent with the old one are
+still out: their replies echo the old one and are taken (the cookie checked is
+the one the query carried), but the server cookie they carry is the old
+address's and is not learned.
+*/
+@(test)
+test_replies_to_queries_from_before_a_move_keep_their_cookie :: proc(t: ^testing.T) {
+	u, uerr := make_upstream(config.Upstream_Spec{name = "cookied", kind = .UDP, address = "127.0.0.1", port = 9}, 0, time.Second, cookies = true)
+	if !testing.expectf(t, uerr == .None, "cannot build the member: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+	query, qok := cookied_query(t, u)
+	if !qok {
+		return
+	}
+	sync.mutex_lock(&u.mu)
+	old := u.cookie.client
+	init_cookie(u)
+	redrawn := u.cookie.client != old
+	sync.mutex_unlock(&u.mu)
+	if !testing.expect(t, redrawn, "the premise: the client cookie was drawn afresh") {
+		return
+	}
+	reply, rok := cookied_reply(t, query, old)
+	if !rok {
+		return
+	}
+	testing.expect(t, cookie_matches(u, query, reply), "the reply to a query sent before the move was refused")
+	learn_cookie(u, reply)
+	sync.mutex_lock(&u.mu)
+	learned := u.cookie.server_len
+	sync.mutex_unlock(&u.mu)
+	testing.expect_value(t, learned, 0)
+
+	// The premise for both: a reply echoing the cookie held now is learned.
+	sync.mutex_lock(&u.mu)
+	current := u.cookie.client
+	sync.mutex_unlock(&u.mu)
+	fresh, fok := cookied_reply(t, query, current)
+	if !fok {
+		return
+	}
+	learn_cookie(u, fresh)
+	sync.mutex_lock(&u.mu)
+	learned = u.cookie.server_len
+	sync.mutex_unlock(&u.mu)
+	testing.expect_value(t, learned, 8)
 	free_all(context.temp_allocator)
 }

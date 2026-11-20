@@ -416,6 +416,11 @@ resolve_endpoint :: proc(
 	moved := !first && !came_from(endpoint, u.endpoint)
 	if moved {
 		u.epoch += 1
+		// A server cookie is the old address's (RFC 7873 section 5.1), and the
+		// client cookie is drawn afresh for the new one (RFC 9018 section 3).
+		// With the epoch, so no query dials the new address with the old ones.
+		forget_cookie(u)
+		init_cookie(u)
 	}
 	u.endpoint = endpoint
 	sync.atomic_store(&u.expires, 0 if ttl == 0 else loop.moment_add(loop.moment_now(), ttl))
@@ -423,12 +428,6 @@ resolve_endpoint :: proc(
 	sync.mutex_unlock(&u.mu)
 	if moved {
 		logx.infof("upstream %s: %s now resolves to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
-		// A server cookie is the old address's (RFC 7873 section 5.1), and the
-		// client cookie is drawn afresh for the new one (RFC 9018 section 3).
-		sync.mutex_lock(&u.mu)
-		forget_cookie(u)
-		init_cookie(u)
-		sync.mutex_unlock(&u.mu)
 		close_idle(u, all = true)
 	} else if first && ttl != 0 {
 		logx.debugf("upstream %s: resolved %s to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
@@ -455,7 +454,7 @@ endpoint_of :: proc(u: ^Upstream) -> (endpoint: net.Endpoint, epoch: int, err: E
 /*
 Whether `stream` was dialled to the address held now, rather than one a refresh
 has since moved away from: a connection to the old address is not handed out or
-pooled again (`get_pipe`, `get_h2_conn`, `put_idle`). Under `u.mu`.
+pooled again (`get_pipe`, `get_h2_conn`, `put_idle`, `take_idle`). Under `u.mu`.
 */
 @(private)
 dialled_current_locked :: proc(u: ^Upstream, stream: Stream) -> bool {
@@ -1086,8 +1085,9 @@ take_idle :: proc(u: ^Upstream) -> (conn: Idle_Conn, ok: bool) {
 			return {}, false
 		}
 		conn = pop(&u.idle)
+		current := dialled_current_locked(u, conn.stream)
 		sync.mutex_unlock(&u.mu)
-		if time.Duration(now - conn.since) < u.idle_timeout {
+		if current && time.Duration(now - conn.since) < u.idle_timeout {
 			return conn, true
 		}
 		// Closed with the lock let go, for the reason `close_idle` gives.

@@ -366,22 +366,40 @@ bootstrap_query :: proc(
 		}
 		/*
 		The lowest address of the type asked, so a server that rotates the
-		order of an RRset does not look like a move on every refresh. Held for
-		the shortest TTL in the answer, CNAMEs included: the chain is only as
-		good as its first record to expire.
+		order of an RRset does not look like a move on every refresh, owned by
+		the name asked or by a CNAME followed from it; a record off that chain
+		is not about this name. Held for the shortest TTL on the chain: it is
+		only as good as its first record to expire.
 		*/
 		lowest: []u8
 		shortest := dns.TTL_MAX
+		owner := name
 		for &rec in msg.answer {
-			shortest = min(shortest, dns.sane_ttl(rec.ttl))
+			if !dns.name_equal_fold(rec.name, owner) {
+				continue
+			}
 			raw: []u8
 			#partial switch &d in rec.data {
+			case dns.Rdata_Name:
+				if rec.type != .CNAME {
+					continue
+				}
+				owner = d.name
 			case dns.Rdata_A:
+				if qtype != .A {
+					continue
+				}
 				raw = d.addr[:]
 			case dns.Rdata_AAAA:
+				if qtype != .AAAA {
+					continue
+				}
 				raw = d.addr[:]
+			case:
+				continue
 			}
-			if raw != nil && (lowest == nil || (len(raw) == len(lowest) && mem.compare(raw, lowest) < 0)) {
+			shortest = min(shortest, dns.sane_ttl(rec.ttl))
+			if raw != nil && (lowest == nil || mem.compare(raw, lowest) < 0) {
 				lowest = raw
 			}
 		}
