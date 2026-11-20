@@ -6,7 +6,6 @@ import "core:io"
 import "core:mem"
 import "core:os"
 import "core:strings"
-import "core:sync"
 import "core:sys/linux"
 import "core:sys/posix"
 import "core:testing"
@@ -440,6 +439,8 @@ Basic confines writing to the cache and log directories and leaves reading
 alone; strict confines reading to its readable paths too. A readable path that
 is a file - `/proc/meminfo` in the plan - takes a file rule rather than failing
 the ruleset, and one that does not exist is reported rather than failing it.
+Once it is in force, `refusal_hint` names it for what it confines: a write under
+either, a read only under strict.
 */
 @(test)
 test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
@@ -464,6 +465,8 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 		failed |= u8(!can_create(inside)) << 1
 		failed |= u8(can_create(outside)) << 2
 		failed |= u8(!can_read(outside)) << 3
+		eacces := os.Platform_Error(linux.Errno.EACCES)
+		failed |= u8(refusal_hint(eacces, write = true) != REFUSAL_HINT || refusal_hint(eacces, write = false) != "") << 4
 		return failed
 	}
 	strict :: proc(dirs: []string) -> u8 {
@@ -484,6 +487,7 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 		failed |= u8(err != .NONE) << 5
 		linux.close(meminfo)
 		failed |= u8(len(report.unreachable) != 1 || report.unreachable[0] != {missing, i32(linux.Errno.ENOENT)}) << 6
+		failed |= u8(refusal_hint(os.Platform_Error(linux.Errno.EACCES), write = false) != REFUSAL_HINT) << 7
 		return failed
 	}
 	for body, i in ([2]Child{basic, strict}) {
@@ -517,15 +521,11 @@ test_landlock_handles_only_what_the_abi_knows :: proc(t: ^testing.T) {
 }
 
 // The hint is for a refusal Landlock may have made: EACCES, with it in force,
-// on writing, or on reading where it confines reads too.
+// on writing, or on reading where it confines reads too. That `refusal_hint`
+// knows what `confine` put in force is the Landlock test's.
 @(test)
 test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^testing.T) {
 	eacces, enoent := os.Platform_Error(linux.Errno.EACCES), os.Platform_Error(linux.Errno.ENOENT)
-	was_in_force, was_reads := sync.atomic_load(&landlock_in_force), sync.atomic_load(&landlock_reads)
-	defer {
-		sync.atomic_store(&landlock_in_force, was_in_force)
-		sync.atomic_store(&landlock_reads, was_reads)
-	}
 	Case :: struct {
 		in_force, reads, write: bool,
 		err:                    os.Error,
@@ -541,9 +541,8 @@ test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^test
 		{in_force = true, reads = false, write = true, err = io.Error.Permission_Denied, hinted = true},
 	}
 	for c in cases {
-		sync.atomic_store(&landlock_in_force, c.in_force)
-		sync.atomic_store(&landlock_reads, c.reads)
-		testing.expectf(t, (refusal_hint(c.err, write = c.write) == REFUSAL_HINT) == c.hinted, "%v", c)
+		hint := hint_for(c.err, write = c.write, in_force = c.in_force, reads = c.reads)
+		testing.expectf(t, (hint == REFUSAL_HINT) == c.hinted, "%v", c)
 	}
 }
 
@@ -598,6 +597,10 @@ test_the_filter_lets_a_directory_be_removed :: proc(t: ^testing.T) {
 	dir := fmt.tprintf("/tmp/elodin-sandbox-rmdir-%d", posix.getpid())
 	if !testing.expect(t, os.make_directory(dir) == nil, "cannot make the directory") {
 		return
+	}
+	defer if os.exists(dir) {
+		err := os.remove(dir)
+		testing.expectf(t, err == nil, "cannot remove %s: %v", dir, err)
 	}
 	body :: proc(dirs: []string) -> u8 {
 		if !install_filter() {

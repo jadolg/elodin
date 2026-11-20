@@ -203,7 +203,14 @@ REFUSAL_HINT :: " (or server.sandbox refuses it: its Landlock rules reach only t
 // `REFUSAL_HINT` when `err` is EACCES and the Landlock rules in force confine
 // the access refused - writing, or reading under `.Strict` - "" otherwise.
 refusal_hint :: proc(err: os.Error, write: bool) -> string {
-	confined := sync.atomic_load(&landlock_in_force) && (write || sync.atomic_load(&landlock_reads))
+	return hint_for(err, write = write, in_force = sync.atomic_load(&landlock_in_force), reads = sync.atomic_load(&landlock_reads))
+}
+
+// `refusal_hint` for a process whose ruleset is `in_force` and confines reading
+// as `reads` says.
+@(private)
+hint_for :: proc(err: os.Error, write, in_force, reads: bool) -> string {
+	confined := in_force && (write || reads)
 	// `core:os` reports EACCES as `Permission_Denied`; a raw open, as itself.
 	if confined && (err == os.Platform_Error(linux.Errno.EACCES) || err == io.Error.Permission_Denied) {
 		return REFUSAL_HINT
