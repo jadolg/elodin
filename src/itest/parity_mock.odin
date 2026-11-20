@@ -419,7 +419,8 @@ pm_glue :: proc(body: ^[dynamic]u8, r: ^Pg_Rand, allocator: mem.Allocator) -> u1
 
 	Decided by the first address, already drawn, and the rest of the run fixed,
 	so the generator draws exactly what it drew before: a recorded seed in
-	testdata/parity-seeds still produces the exchange it was recorded for.
+	testdata/parity-seeds asks the same queries. A reply whose first address
+	starts a run is a larger one than it was when the seed was recorded.
 	*/
 	first := pm_rdata(r, 1, allocator)
 	pm_rr(body, ns, 1, 1, 1800, first, allocator)

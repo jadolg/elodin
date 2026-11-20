@@ -620,6 +620,14 @@ test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing
 		return address("mail.example.com.", last)
 	}
 	other := address("other.example.com.", 9)
+	// An RRSIG at the TXT records' owner covering `covered`: the type covered
+	// is its RDATA's first two bytes, and the rest is padding to a size that
+	// fits where a long TXT record was taken back from.
+	rrsig_over := proc(covered: Type) -> Record {
+		rdata := make([]u8, 20, context.temp_allocator)
+		rdata[0], rdata[1] = u8(u16(covered) >> 8), u8(covered)
+		return Record{name = QNAME, type = .RRSIG, class = .IN, ttl = 300, data = Rdata_Raw{data = rdata}}
+	}
 	// One TXT RRset: a short record, one past the room, and a short one again,
 	// which would fit where the long one was taken back to.
 	txt := proc(text: string) -> Record {
@@ -656,6 +664,18 @@ test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing
 			kept = {other},
 		},
 		{
+			name = "a later record of an RRset left out, not next to it",
+			whole = {txt("a"), big_txt(), other, txt("b")},
+			fits = {txt("a"), other, txt("b")},
+			kept = {other},
+		},
+		{
+			name = "a signature over an RRset left out",
+			whole = {txt("a"), big_txt(), rrsig_over(.TXT), other},
+			fits = {txt("a"), rrsig_over(.TXT), other},
+			kept = {other},
+		},
+		{
 			name = "another type at the same owner is another RRset",
 			whole = {address(QNAME, 7), big_txt()},
 			fits = {address(QNAME, 7)},
@@ -683,6 +703,7 @@ test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing
 		testing.expectf(t, addresses == len(c.kept), "%s: %d address records went out, want %d: %v", c.name, addresses, len(c.kept), got.additional)
 		for rec in got.additional {
 			testing.expectf(t, rec.type != .TXT, "%s: part of the TXT RRset went out: %v", c.name, got.additional)
+			testing.expectf(t, rec.type != .RRSIG, "%s: a signature went out without its RRset: %v", c.name, got.additional)
 		}
 		for want in c.kept {
 			found := false
@@ -693,5 +714,52 @@ test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing
 		}
 		testing.expectf(t, edns_present(got) == c.with_opt, "%s: the OPT record is %v, want %v", c.name, edns_present(got), c.with_opt)
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The RRsets left out are held up to `DROPPED_RRSETS`, as every record behind a
+drop is compared against each; one more, and the rest of the additional section
+but its OPT record is left out with them, which is the reply's to do without.
+Each of these RRsets is one address too big for the room behind the one before.
+*/
+@(test)
+test_past_the_rrsets_it_tracks_the_rest_of_the_section_goes :: proc(t: ^testing.T) {
+	OWNERS :: [?]string {
+		"r0.example.com.",
+		"r1.example.com.",
+		"r2.example.com.",
+		"r3.example.com.",
+		"r4.example.com.",
+		"r5.example.com.",
+		"r6.example.com.",
+		"r7.example.com.",
+		"r8.example.com.",
+	}
+	#assert(len(OWNERS) == DROPPED_RRSETS + 1)
+	owners := OWNERS
+	text := make([]u8, 200, context.temp_allocator)
+	for j in 0 ..< len(text) {
+		text[j] = 'x'
+	}
+	strs := make([]string, 1, context.temp_allocator)
+	strs[0] = string(text)
+	whole := make([dynamic]Record, 0, len(owners) + 1, context.temp_allocator)
+	for owner in owners {
+		append(&whole, Record{name = owner, type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = strs}})
+	}
+	small := address("last.example.com.", 1)
+	append(&whole, small)
+	room := encoded_size(t, message_with([]Record{small})) + 32
+
+	got, truncated := encode_within(t, message_with(whole[:]), room)
+	testing.expect(t, !truncated && !got.flags.tc, "TC set for additional data")
+	// One RRset past the bound left out: the address behind them, which would
+	// have fitted, goes with them.
+	testing.expectf(t, len(got.additional) == 0, "past %d RRsets left out, %v still went out", DROPPED_RRSETS, got.additional)
+
+	// The premise: one RRset fewer, and the address goes out.
+	got, truncated = encode_within(t, message_with(whole[1:]), room)
+	testing.expectf(t, !truncated && len(got.additional) == 1, "at %d RRsets left out, the address did not go out: %v", DROPPED_RRSETS, got.additional)
 	free_all(context.temp_allocator)
 }

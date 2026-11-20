@@ -628,13 +628,17 @@ pc_records :: proc(
 	pc_section(c, q, .Answer, "answer", up.answer, el.answer, up, el, policy)
 	pc_section(c, q, .Authority, "authority", up.authority, el.authority, up, el, policy)
 	pc_section(c, q, .Additional, "additional", up.additional, el.additional, up, el, policy)
-	pc_whole_rrsets(c, up.additional, el.additional)
+	// A reply with TC set was cut rather than filled, and a cut may stop inside
+	// an RRset: referral glue (RFC 9471 section 3.3) is the case that does.
+	if !el.tc {
+		pc_whole_rrsets(c, up.additional, el.additional)
+	}
 }
 
 /*
-An RRset in elodin's additional section that holds fewer records than the
-upstream sent for it: part of a set, which RFC 2181 section 9 has left out
-whole when it will not fit. The per-record allowance in `pc_missing` excuses a
+An RRset in elodin's additional section, in a reply with TC clear, that holds
+fewer records than the upstream sent for it: part of a set, which RFC 2181
+section 9 has left out whole when it will not fit. The per-record allowance in `pc_missing` excuses a
 dropped record that had no room, and a set cut partway drops records that had
 none, so it cannot see this; the count can. Never allowed.
 */

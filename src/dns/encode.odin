@@ -420,6 +420,33 @@ same_rrset :: proc(a, b: Record) -> bool {
 	return a.type == b.type && a.class == b.class && name_equal_fold(a.name, b.name)
 }
 
+// How many RRsets left out of the additional section `encode_message` keeps
+// track of before it leaves out the rest of the section.
+@(private)
+DROPPED_RRSETS :: 8
+
+/*
+Whether `rec` belongs to one of the RRsets `dropped` holds, or is a signature
+over one: an RRSIG at the same owner and class whose type covered (the first
+two bytes of its RDATA, RFC 4034 section 3.1.1) is the RRset's type.
+*/
+@(private)
+left_out :: proc(dropped: []^Record, rec: Record) -> bool {
+	for d in dropped {
+		if same_rrset(d^, rec) {
+			return true
+		}
+		if rec.type != .RRSIG || rec.class != d.class || !name_equal_fold(rec.name, d.name) {
+			continue
+		}
+		raw, is_raw := rec.data.(Rdata_Raw)
+		if is_raw && len(raw.data) >= 2 && Type(u16(raw.data[0]) << 8 | u16(raw.data[1])) == d.type {
+			return true
+		}
+	}
+	return false
+}
+
 /*
 Whether a record left out of the additional section is glue a referral cannot be
 read without (RFC 9471 section 3.3).
@@ -590,13 +617,20 @@ encode_message :: proc(
 	RRset that will not fit is left out whole (RFC 2181 section 9), so a record
 	that overflows takes the ones of its RRset already written with it. An
 	RRset is the run of records with one owner, type and class; `run_start` is
-	nil before the section's first record. `skipping` is the RRset left out,
-	whose remaining records are passed over.
+	nil before the section's first record.
+
+	`dropped` holds the RRsets left out, so a later record of one - adjacent or
+	not - is passed over, and so is a signature over one (RFC 4035 section
+	3.1.1 lets a signature go and its RRset stay, not the other way round).
+	Bounded, because every record behind a drop is compared against each: past
+	`DROPPED_RRSETS` the rest of the section but its OPT record is left out,
+	which is additional data and so the reply's to do without.
 	*/
 	run_start: ^Record
 	run_mark := 0
 	run_count: u16
-	skipping: ^Record
+	dropped: [DROPPED_RRSETS]^Record
+	dropped_n := 0
 
 	outer: for section, si in sections {
 		for rec, ri in section {
@@ -615,10 +649,11 @@ encode_message :: proc(
 				opt_seen = true
 			}
 			if si == 2 {
-				if skipping != nil && same_rrset(skipping^, rec) {
+				// The OPT record is the message's own, re-added below if it
+				// does not fit; it is never another record's to drop.
+				if rec.type != .OPT && (dropped_n > len(dropped) || left_out(dropped[:dropped_n], rec)) {
 					continue
 				}
-				skipping = nil
 				if run_start == nil || !same_rrset(run_start^, rec) {
 					run_start = &sections[si][ri]
 					run_mark = len(w.buf)
@@ -682,10 +717,15 @@ encode_message :: proc(
 					w.compress = false
 				}
 				// The whole RRset, not this record alone: back to where it
-				// began, and past the rest of it.
+				// began, and past the rest of it and its signatures.
 				resize(&w.buf, run_mark)
 				counts[si] = run_count
-				skipping = run_start
+				if rec.type != .OPT {
+					if dropped_n < len(dropped) {
+						dropped[dropped_n] = run_start
+					}
+					dropped_n += 1
+				}
 				continue
 			}
 			counts[si] += 1
