@@ -30,6 +30,8 @@ run_bootstrap_cases :: proc(r: ^Runner) {
 		return
 	}
 	udp_port := next_port(r)
+	// Before the server starts, which is where its first lookup is.
+	started := time.tick_now()
 	srv, ok := start_server(
 		r,
 		Server_Options {
@@ -45,7 +47,6 @@ run_bootstrap_cases :: proc(r: ^Runner) {
 		return
 	}
 	defer stop_server(&srv)
-	started := time.tick_now()
 
 	start_case(r, "bootstrap: an upstream's hostname is asked for again once its TTL is past")
 	{

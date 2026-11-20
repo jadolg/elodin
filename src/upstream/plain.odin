@@ -28,7 +28,7 @@ exchange_udp :: proc(
 	response: []u8,
 	err: Error,
 ) {
-	endpoint := endpoint_of(u) or_return
+	endpoint, _ := endpoint_of(u) or_return
 	/*
 	Sized from what the query itself advertised, not from a fixed number.
 

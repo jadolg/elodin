@@ -1,6 +1,7 @@
 package upstream
 
 import "core:net"
+import "core:mem"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -363,13 +364,32 @@ bootstrap_query :: proc(
 		if dec_err != .None {
 			return nil, 0, .Not_Resolved
 		}
-		for rec in msg.answer {
-			#partial switch d in rec.data {
+		/*
+		The lowest address of the type asked, so a server that rotates the
+		order of an RRset does not look like a move on every refresh. Held for
+		the shortest TTL in the answer, CNAMEs included: the chain is only as
+		good as its first record to expire.
+		*/
+		lowest: []u8
+		shortest := dns.TTL_MAX
+		for &rec in msg.answer {
+			shortest = min(shortest, dns.sane_ttl(rec.ttl))
+			raw: []u8
+			#partial switch &d in rec.data {
 			case dns.Rdata_A:
-				return net.IP4_Address(d.addr), bootstrap_ttl(rec.ttl), .None
+				raw = d.addr[:]
 			case dns.Rdata_AAAA:
-				return netx.ip6_from_bytes(d.addr), bootstrap_ttl(rec.ttl), .None
+				raw = d.addr[:]
 			}
+			if raw != nil && (lowest == nil || (len(raw) == len(lowest) && mem.compare(raw, lowest) < 0)) {
+				lowest = raw
+			}
+		}
+		switch len(lowest) {
+		case 4:
+			return net.IP4_Address{lowest[0], lowest[1], lowest[2], lowest[3]}, bootstrap_ttl(shortest), .None
+		case 16:
+			return netx.ip6_from_bytes((^[16]u8)(raw_data(lowest))^), bootstrap_ttl(shortest), .None
 		}
 		return nil, 0, .Not_Resolved
 	}

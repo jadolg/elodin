@@ -23,6 +23,9 @@ ALPN showed does not speak h2 — see h2client.odin for the one that does.
 Stream :: struct {
 	socket: net.TCP_Socket,
 	tls:    ^tlsx.Conn,
+	// `Upstream.epoch` when the address dialled was read, which a refresh
+	// may since have moved away from (`dialled_current_locked`).
+	epoch:  int,
 }
 
 @(private)
@@ -908,6 +911,8 @@ open_stream :: proc(
 	hostname: string,
 	timeout: time.Duration,
 	u: ^Upstream = nil,
+	// What `endpoint_of` gave with `endpoint`; the stream carries it.
+	epoch := 0,
 ) -> (
 	stream: Stream,
 	err: Error,
@@ -933,11 +938,11 @@ open_stream :: proc(
 		_ = net.set_option(socket, .TCP_Nodelay, true)
 
 		if tls_ctx == nil {
-			return Stream{socket = socket}, .None
+			return Stream{socket = socket, epoch = epoch}, .None
 		}
 		conn, terr := tlsx.client_connect(tls_ctx, socket, hostname)
 		if terr == .None {
-			return Stream{socket = socket, tls = conn}, .None
+			return Stream{socket = socket, tls = conn, epoch = epoch}, .None
 		}
 		// OpenSSL keeps its reason on a per-thread queue, so it has to be read
 		// here rather than at the point the error surfaces.

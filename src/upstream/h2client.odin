@@ -64,8 +64,8 @@ handshake it would otherwise have to throw away and repeat.
 */
 @(private)
 negotiate_https :: proc(u: ^Upstream, timeout: time.Duration) -> (stream: Stream, proto: Protocol, err: Error) {
-	endpoint := endpoint_of(u) or_return
-	stream, err = open_stream(endpoint, u.tls_ctx, u.spec.hostname, timeout, u)
+	endpoint, epoch := endpoint_of(u) or_return
+	stream, err = open_stream(endpoint, u.tls_ctx, u.spec.hostname, timeout, u, epoch = epoch)
 	if err != .None {
 		return {}, .Unknown, err
 	}
@@ -109,7 +109,7 @@ get_h2_conn :: proc(
 			sync.mutex_unlock(&u.mu)
 			return nil, false, .None
 		}
-		if u.h2 != nil && !h2.client_closed(u.h2.client) {
+		if u.h2 != nil && !h2.client_closed(u.h2.client) && dialled_current_locked(u, u.h2.stream) {
 			conn = u.h2.client
 			h2.client_ref(conn)
 			sync.mutex_unlock(&u.mu)

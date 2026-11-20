@@ -193,7 +193,7 @@ exchange_doh_h1 :: proc(
 	A `Tick` rather than a `Time`, because it is a bound on waiting rather than
 	a moment anyone reads off a clock, and the wall clock steps.
 	*/
-	endpoint := endpoint_of(u) or_return
+	endpoint, epoch := endpoint_of(u) or_return
 
 	// Pooled connection first, then a fresh one; see exchange_pipelined for why a
 	// dead pooled connection must not count as an upstream failure.
@@ -214,7 +214,7 @@ exchange_doh_h1 :: proc(
 			// had; `http_exchange` replaces them with this query's deadline
 			// before every write and read.
 		} else {
-			s, oerr := open_stream(endpoint, u.tls_ctx, u.spec.hostname, remaining, u)
+			s, oerr := open_stream(endpoint, u.tls_ctx, u.spec.hostname, remaining, u, epoch = epoch)
 			if oerr != .None {
 				return nil, oerr
 			}

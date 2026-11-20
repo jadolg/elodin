@@ -4264,7 +4264,7 @@ test_a_late_resolved_endpoint_is_published_whole :: proc(t: ^testing.T) {
 		thread.destroy(w)
 	}
 
-	ep, eerr := endpoint_of(u)
+	ep, _, eerr := endpoint_of(u)
 	testing.expect_value(t, eerr, Error.None)
 	// The socket's own port, not the spec the endpoint was built from.
 	bound, berr := net.bound_endpoint(socket)
@@ -4277,7 +4277,7 @@ test_a_late_resolved_endpoint_is_published_whole :: proc(t: ^testing.T) {
 	delete(u.spec.address, u.allocator)
 	u.spec.address = strings.clone("127.0.0.2", u.allocator)
 	testing.expect_value(t, resolve_endpoint(u), Error.None)
-	ep, eerr = endpoint_of(u)
+	ep, _, eerr = endpoint_of(u)
 	testing.expect_value(t, eerr, Error.None)
 	testing.expect(t, ep.address == net.Address(net.IP4_Address{127, 0, 0, 2}) && ep.port == bound.port, "the later lookup was not published whole")
 }
@@ -4305,7 +4305,7 @@ test_a_failed_resolution_does_not_unpublish_the_endpoint :: proc(t: ^testing.T) 
 	u.spec.address = strings.clone("kept-347.test", u.allocator)
 	testing.expect_value(t, resolve_endpoint(u), Error.None)
 
-	ep, eerr := endpoint_of(u)
+	ep, _, eerr := endpoint_of(u)
 	testing.expect_value(t, eerr, Error.None)
 	testing.expect_value(t, ep.port, 41154)
 }

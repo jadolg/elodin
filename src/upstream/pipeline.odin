@@ -584,10 +584,10 @@ dial_pipe :: proc(u: ^Upstream, timeout, budget: time.Duration) -> (c: ^Pipe_Con
 	// A caller whose deadline went while it was getting here still makes one
 	// bounded attempt rather than handing a negative timeval to the socket.
 	spend := max(budget, time.Millisecond)
-	endpoint := endpoint_of(u) or_return
+	endpoint, epoch := endpoint_of(u) or_return
 	// `tls_ctx` is nil for `tcp` and for a `udp` upstream's retry, which then
 	// dial plain, with the same retry of a reset dial as `tls`.
-	stream := open_stream(endpoint, u.tls_ctx, u.spec.hostname, spend, u) or_return
+	stream := open_stream(endpoint, u.tls_ctx, u.spec.hostname, spend, u, epoch = epoch) or_return
 	// `open_stream` left the stream on the dial's budget; what it carries from
 	// here is the connection's.
 	if stream.tls != nil {
@@ -669,7 +669,11 @@ get_pipe :: proc(
 			return nil, .Timeout
 		}
 		if u.pipe != nil {
-			switch pipe_state(u.pipe, pipe_idle_ceiling_locked(u), sync.atomic_load(&u.max_outstanding)) {
+			state := pipe_state(u.pipe, pipe_idle_ceiling_locked(u), sync.atomic_load(&u.max_outstanding))
+			if !dialled_current_locked(u, u.pipe.stream) {
+				state = .Gone
+			}
+			switch state {
 			case .Ready:
 				c = u.pipe
 				pipe_ref(c)

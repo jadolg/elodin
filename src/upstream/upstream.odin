@@ -149,6 +149,9 @@ Upstream :: struct {
 	expires:      loop.Moment,
 	// Held by the one exchange refreshing the address (see `exchange`). Atomic.
 	refreshing:   bool,
+	// How many times the address has moved; under `mu`. A connection dialled
+	// in an earlier one is not used again (`dialled_current_locked`).
+	epoch:        int,
 	tls_ctx:      ^tlsx.Context,
 	// What `open_stream` dials this upstream's connections with; nil is
 	// `dial_tcp_timeout`. Set by tests, to stand in for a peer that resets a
@@ -390,9 +393,13 @@ resolve_endpoint :: proc(
 	addr, ttl, err := bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
 	if err != .None {
 		// Held already, by an earlier lookup or another thread's: kept, and
-		// the upstream is not unresolvable.
+		// the upstream is not unresolvable. Asked again `BOOTSTRAP_MIN_TTL`
+		// on, unless another lookup has just set a later time.
 		if sync.atomic_load_explicit(&u.resolved, .Acquire) {
-			sync.atomic_store(&u.expires, loop.moment_add(loop.moment_now(), BOOTSTRAP_MIN_TTL))
+			if expires := sync.atomic_load(&u.expires); expires != 0 && loop.moment_since(expires) >= 0 {
+				_, _ = sync.atomic_compare_exchange_strong(&u.expires, expires, loop.moment_add(loop.moment_now(), BOOTSTRAP_MIN_TTL)) // lint:allow lost only to a lookup that set the time itself
+				logx.warnf("upstream %s: cannot resolve %q again via bootstrap resolvers (%v); keeping the address held", u.spec.name, u.spec.address, err)
+			}
 			return .None
 		}
 		if err == .Not_Resolved {
@@ -407,12 +414,21 @@ resolve_endpoint :: proc(
 	sync.mutex_lock(&u.mu)
 	first := !sync.atomic_load_explicit(&u.resolved, .Relaxed)
 	moved := !first && !came_from(endpoint, u.endpoint)
+	if moved {
+		u.epoch += 1
+	}
 	u.endpoint = endpoint
 	sync.atomic_store(&u.expires, 0 if ttl == 0 else loop.moment_add(loop.moment_now(), ttl))
 	sync.atomic_store_explicit(&u.resolved, true, .Release)
 	sync.mutex_unlock(&u.mu)
 	if moved {
 		logx.infof("upstream %s: %s now resolves to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
+		// A server cookie is the old address's (RFC 7873 section 5.1), and the
+		// client cookie is drawn afresh for the new one (RFC 9018 section 3).
+		sync.mutex_lock(&u.mu)
+		forget_cookie(u)
+		init_cookie(u)
+		sync.mutex_unlock(&u.mu)
 		close_idle(u, all = true)
 	} else if first && ttl != 0 {
 		logx.debugf("upstream %s: resolved %s to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
@@ -421,19 +437,35 @@ resolve_endpoint :: proc(
 }
 
 /*
-The address to dial, or `Not_Resolved` while there is none yet. A copy, taken
-under `mu` since a refresh may write it, so one exchange sends to and checks
-replies against the same address.
+The address to dial, or `Not_Resolved` while there is none yet, and the `epoch`
+it belongs to, for a connection to carry. A copy, taken under `mu` since a
+refresh may write it, so one exchange sends to and checks replies against the
+same address.
 */
 @(private)
-endpoint_of :: proc(u: ^Upstream) -> (endpoint: net.Endpoint, err: Error) {
+endpoint_of :: proc(u: ^Upstream) -> (endpoint: net.Endpoint, epoch: int, err: Error) {
 	if !sync.atomic_load_explicit(&u.resolved, .Acquire) {
-		return {}, .Not_Resolved
+		return {}, 0, .Not_Resolved
 	}
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
-	return u.endpoint, .None
+	return u.endpoint, u.epoch, .None
 }
+
+/*
+Whether `stream` was dialled to the address held now, rather than one a refresh
+has since moved away from: a connection to the old address is not handed out or
+pooled again (`get_pipe`, `get_h2_conn`, `put_idle`). Under `u.mu`.
+*/
+@(private)
+dialled_current_locked :: proc(u: ^Upstream, stream: Stream) -> bool {
+	return stream.epoch == u.epoch
+}
+
+// The part of an exchange's timeout a refresh of the address may spend: one in
+// this many.
+@(private)
+REFRESH_SHARE :: 4
 
 /*
 Whether this exchange is the one to ask for a held address again: its TTL is
@@ -916,10 +948,15 @@ servers to ask the refusal costs nothing, and is left unrecorded. A lookup this
 			return nil, rerr
 		}
 	} else if refresh_due(u) {
-		// One exchange asks; the rest dial the address held. A failure keeps
-		// that address, so only the time it spent shows, as `resolving` does.
+		/*
+		One exchange asks; the rest dial the address held. Held to a share
+		of this exchange's time, so a bootstrap gone quiet does not cost the
+		query its answer from the address held. A failure keeps that address,
+		so only the time it spent shows, as `resolving` does.
+		*/
 		resolving = true
-		_ = resolve_endpoint(u, deadline) // lint:allow a failed refresh keeps the address held, which resolve_endpoint logs
+		share := time.tick_add(entered, timeout / REFRESH_SHARE)
+		_ = resolve_endpoint(u, share) // lint:allow a failed refresh keeps the address held, which resolve_endpoint logs
 		sync.atomic_store(&u.refreshing, false)
 	}
 
@@ -1064,7 +1101,7 @@ put_idle :: proc(u: ^Upstream, stream: Stream) {
 		stream = stream,
 	}
 	sync.mutex_lock(&u.mu)
-	if len(u.idle) >= u.max_idle {
+	if len(u.idle) >= u.max_idle || !dialled_current_locked(u, stream) {
 		sync.mutex_unlock(&u.mu)
 		stream_close(&c.stream)
 		return
