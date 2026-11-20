@@ -279,6 +279,7 @@ exchange_with_cookie :: proc(
 		// RFC 7873 section 5.3: "If the reply to a retried request with a fresh
 		// Server Cookie is BADCOOKIE, the client SHOULD retry using TCP".
 		if u.spec.kind == .UDP && dns.peek_rcode(response) == .Bad_Cookie {
+			logx.debugf("upstream %s: BADCOOKIE after a fresh cookie, asking over TCP", u.spec.name)
 			delete(response, allocator)
 			response = nil
 			over_tcp, attached_tcp, tcp_dry := attach_cookie(u, query, context.temp_allocator)
