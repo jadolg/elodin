@@ -174,11 +174,10 @@ v4_mapped :: proc(a: [16]u8) -> bool {
 
 /*
 One `sendmsg` to `to`, from `from` when its address is known: an IPv4 one as
-`IP_PKTINFO`'s `ipi_spec_dst` with no interface, so the route still picks the
-way out, and an IPv6 one as `IPV6_PKTINFO` with the interface it came in on,
-which a link-local address needs. An IPv4 source suits a mapped `to` on an
-IPv6 socket as well: the kernel sends that datagram as IPv4 and reads the
-`IP_PKTINFO` there.
+`IP_PKTINFO`'s `ipi_spec_dst`, an IPv6 one as `IPV6_PKTINFO`. The interface is
+left to the route, except where `send_ifindex` says otherwise. An IPv4 source
+suits a mapped `to` on an IPv6 socket as well: the kernel sends that datagram
+as IPv4 and reads the `IP_PKTINFO` there.
 */
 @(private)
 sendmsg_udp :: proc(socket: net.UDP_Socket, buf: []u8, to: net.Endpoint, from: Udp_Local) -> (int, net.UDP_Send_Error) {
@@ -201,7 +200,11 @@ sendmsg_udp :: proc(socket: net.UDP_Socket, buf: []u8, to: net.Endpoint, from: U
 	case net.IP4_Address:
 		used = put_cmsg(bytes, IPPROTO_IP, IP_PKTINFO, In_Pktinfo{spec_dst = ([4]u8)(a)})
 	case net.IP6_Address:
-		used = put_cmsg(bytes, IPPROTO_IPV6, IPV6_PKTINFO, In6_Pktinfo{addr = transmute([16]u8)a, ifindex = from.ifindex})
+		info := In6_Pktinfo {
+			addr    = transmute([16]u8)a,
+			ifindex = send_ifindex(from, to.address),
+		}
+		used = put_cmsg(bytes, IPPROTO_IPV6, IPV6_PKTINFO, info)
 	}
 	iov := [1]linux.IO_Vec{{base = raw_data(buf), len = uint(len(buf))}}
 	hdr := linux.Msg_Hdr {
@@ -218,6 +221,20 @@ sendmsg_udp :: proc(socket: net.UDP_Socket, buf: []u8, to: net.Endpoint, from: U
 		return 0, .Would_Block
 	}
 	return 0, .Unknown
+}
+
+/*
+The interface an IPv6 reply names: the one its query came in on when either end
+is link-local (fe80::/10), which is ambiguous without it, and otherwise 0, so
+the routing table still picks the way out.
+*/
+@(private)
+send_ifindex :: proc(from: Udp_Local, to: net.Address) -> u32 {
+	link_local :: proc(a: net.Address) -> bool {
+		x, v6 := a.(net.IP6_Address)
+		return v6 && u16(x[0]) & 0xffc0 == 0xfe80
+	}
+	return from.ifindex if link_local(from.address) || link_local(to) else 0
 }
 
 // Write one control message at the start of `bytes`, and say how much it took.

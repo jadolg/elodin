@@ -181,3 +181,25 @@ test_local_of_reads_the_pktinfo_messages :: proc(t: ^testing.T) {
 	control[0] = uint(CMSG_DATA - 1)
 	testing.expectf(t, local_of(bytes[:n]).address == nil, "a length short of the header was read")
 }
+
+// The arrival interface goes back only where either end is link-local.
+@(test)
+test_send_ifindex_is_named_only_for_a_link_local_end :: proc(t: ^testing.T) {
+	global := net.IP6_Address{0 = 0x2001, 1 = 0xdb8, 7 = 1}
+	link_local := net.IP6_Address{0 = 0xfe80, 7 = 1}
+	cases := []struct {
+		local, to: net.Address,
+		ifindex:   u32,
+	} {
+		{local = global, to = net.IP6_Address{0 = 0x2001, 1 = 0xdb8, 7 = 2}, ifindex = 0},
+		{local = link_local, to = net.IP6_Address{0 = 0xfe80, 7 = 2}, ifindex = 7},
+		{local = global, to = net.IP6_Address{0 = 0xfebf, 7 = 2}, ifindex = 7},
+		{local = link_local, to = global, ifindex = 7},
+		// fec0::/10 is not link-local.
+		{local = global, to = net.IP6_Address{0 = 0xfec0, 7 = 2}, ifindex = 0},
+	}
+	for c in cases {
+		got := send_ifindex({address = c.local, ifindex = 7}, c.to)
+		testing.expectf(t, got == c.ifindex, "%v -> %v: interface %d, want %d", c.local, c.to, got, c.ifindex)
+	}
+}
