@@ -274,6 +274,14 @@ test_hand_over_follows_no_symlinked_directory :: proc(t: ^testing.T) {
 	}
 	// The premise: the directory itself, named, is handed over.
 	testing.expect(t, hand_over(real, self), "the real directory was not handed over")
+
+	// A symlink to nothing is there, not missing: refused, not "nothing yet".
+	dangling := fmt.tprintf("%s-dangling", real)
+	if !testing.expect(t, posix.symlink(fmt.ctprintf("%s-nowhere", real), strings.clone_to_cstring(dangling, context.temp_allocator)) == .OK, "cannot make the dangling link") {
+		return
+	}
+	defer os.remove(dangling)
+	testing.expect(t, !hand_over(dangling, self), "a dangling symlink read as a cache directory not made yet")
 }
 
 @(test)

@@ -115,5 +115,21 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 	if check(r, reload_to(r, &srv, later, "later.txt: 1 rules"), "the reload never downloaded the second list:\n%s", read_log(&srv)) {
 		res := query_udp(udp_port, build_query("later.test.", u16(dns.Type.A)))
 		check(r, res.ok, "no answer after a download as the account; log:\n%s", read_log(&srv))
+		// The copy was written, by the account: the write after the drop is
+		// what reached the `fchown` this case exists for.
+		cached := false
+		after, aerr := os.read_directory_by_path(cache_dir, -1, context.temp_allocator)
+		if check(r, aerr == nil, "cannot list %s: %v", cache_dir, aerr) {
+			for entry in after {
+				if !strings.contains(entry.name, "later.txt") {
+					continue
+				}
+				cached = true
+				if uid, read := owner(entry.fullpath); check(r, read, "cannot stat %s", entry.fullpath) {
+					check(r, uid == 65534, "%s, written after the drop, is uid %d's", entry.name, uid)
+				}
+			}
+		}
+		check(r, cached, "the list downloaded after the drop was not cached")
 	}
 }

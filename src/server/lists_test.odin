@@ -2,6 +2,7 @@ package server
 
 import "base:runtime"
 import "core:fmt"
+import "core:log"
 import "core:net"
 import "core:os"
 import "core:strings"
@@ -754,11 +755,13 @@ test_a_disabled_entry_does_not_lend_its_source_a_history :: proc(t: ^testing.T) 
 }
 
 /*
-The cache directory is the service account's, and a root start downloads and
-reads the lists before the drop (#688), so neither the write nor the reads
-follow a symlink there: a `.tmp` planted as a link to another file is replaced,
-not written through, and a cached copy or fingerprint that is a link is not
-read.
+The cache directory is the service account's, and a root start that drops to it
+writes and reads the lists there before the drop (#688). The write follows no
+symlink whoever writes: a `.tmp` planted as a link to another file is replaced,
+not written through. With a cache owner - that root start - a copy is read, and
+fresh, only as a regular file with one link that belongs to the owner, never
+through a symlink; without one, any regular file is, however it is linked or
+owned, as a process that is not root reads nothing more through a link.
 */
 @(test)
 test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
@@ -773,113 +776,84 @@ test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
 	}
 	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt", format = .Hosts, enabled = true}
 	path := list_cache_path(&cfg, list)
-	link := proc(target, at: string) -> bool {
-		return posix.symlink(strings.clone_to_cstring(target, context.temp_allocator), strings.clone_to_cstring(at, context.temp_allocator)) == .OK
+	cpath := proc(p: string) -> cstring {
+		return strings.clone_to_cstring(p, context.temp_allocator)
+	}
+	// A root start's rules, with this process as the owner it writes for.
+	strict := Cache_Owner {
+		uid = posix.geteuid(),
+		gid = posix.getegid(),
+		set = true,
 	}
 
-	if !testing.expect(t, link(victim, fmt.tprintf("%s.tmp", path)), "cannot plant the .tmp link") {
+	// The write.
+	if !testing.expect(t, posix.symlink(cpath(victim), cpath(fmt.tprintf("%s.tmp", path))) == .OK, "cannot plant the .tmp link") {
 		return
 	}
 	testing.expect_value(t, write_cache_file(path, transmute([]byte)string("0.0.0.0 new.example\n")), nil)
 	after, verr := os.read_entire_file(victim, context.temp_allocator)
 	testing.expect_value(t, verr, nil)
 	testing.expectf(t, string(after) == "0.0.0.0 secret.example\n", "the file the .tmp linked to was written: %q", string(after))
-	// The positive half: the copy itself was written.
 	written, werr := os.read_entire_file(path, context.temp_allocator)
 	testing.expect_value(t, werr, nil)
 	testing.expect_value(t, string(written), "0.0.0.0 new.example\n")
 
-	// The premise of the read: as a plain file, the copy loads.
-	text, load := cached_copy(&cfg, list, .Stale)
-	testing.expectf(t, load == .Stale && text == "0.0.0.0 new.example\n", "a plain copy did not load: %v %q", load, text)
-	delete(text)
-
-	testing.expect_value(t, os.remove(path), nil)
-	if !testing.expect(t, link(victim, path), "cannot plant the copy link") {
-		return
+	// A plain copy: read and fresh, under either rule.
+	for owner in ([]Cache_Owner{{}, strict}) {
+		_, why, read := read_cache_file(path, context.temp_allocator, owner)
+		testing.expectf(t, read, "a plain copy was not read (owner set %v): %q", owner.set, why)
+		_, fresh := plain_cache_file(path, owner)
+		testing.expectf(t, fresh, "a plain copy is not fresh (owner set %v)", owner.set)
 	}
-	text, load = cached_copy(&cfg, list, .Stale)
-	testing.expectf(t, load == .Unavailable && text == "", "a linked copy was read: %v %q", load, text)
-	delete(text)
 
-	// Nor a hard link, which is the file it links to, wherever that is.
-	testing.expect_value(t, os.remove(path), nil)
-	if !testing.expect(t, posix.link(strings.clone_to_cstring(victim, context.temp_allocator), strings.clone_to_cstring(path, context.temp_allocator)) == .OK, "cannot plant the hard link") {
-		return
+	// Linked copies: refused, and not fresh, by a root start; read by any other.
+	links := []struct {
+		name: string,
+		make: proc "c" (target, at: cstring) -> posix.result,
+		why:  string,
+	} {
+		{name = "symlink", make = posix.symlink, why = "it is a symlink"},
+		{name = "hard link", make = posix.link, why = "it is a hard link"},
 	}
-	text, load = cached_copy(&cfg, list, .Stale)
-	testing.expectf(t, load == .Unavailable && text == "", "a hard-linked copy was read: %v %q", load, text)
-	delete(text)
+	for l in links {
+		testing.expect_value(t, os.remove(path), nil)
+		if !testing.expectf(t, l.make(cpath(victim), cpath(path)) == .OK, "cannot plant the %s", l.name) {
+			return
+		}
+		_, why, read := read_cache_file(path, context.temp_allocator, strict)
+		testing.expectf(t, !read && why == l.why, "a root start read the %s: %v %q", l.name, read, why)
+		_, fresh := plain_cache_file(path, strict)
+		testing.expectf(t, !fresh, "a root start took the %s as fresh", l.name)
+		data, owhy, oread := read_cache_file(path, context.temp_allocator)
+		testing.expectf(t, oread && string(data) == "0.0.0.0 secret.example\n", "a start with no owner did not read the %s: %q", l.name, owhy)
+	}
 
-	// A copy that cannot be read is not fresh either, or it would be neither
-	// downloaded again nor loaded, for good.
-	recent := config.Block_List{name = "r", url = "http://127.0.0.1:1/r.txt", format = .Hosts, enabled = true}
-	rpath := list_cache_path(&cfg, recent)
-	if !testing.expect(t, link(victim, rpath), "cannot plant the fresh-looking link") {
-		return
-	}
-	_, fetched := fetch_list(&cfg, recent)
-	testing.expectf(t, fetched != .Cache_Is_Fresh, "a linked copy read as fresh")
-	testing.expect_value(t, os.remove(rpath), nil)
-	if !testing.expect(t, posix.link(strings.clone_to_cstring(victim, context.temp_allocator), strings.clone_to_cstring(rpath, context.temp_allocator)) == .OK, "cannot plant the fresh-looking hard link") {
-		return
-	}
-	_, fetched = fetch_list(&cfg, recent)
-	testing.expectf(t, fetched != .Cache_Is_Fresh, "a hard-linked copy read as fresh")
-	// The premise: the same copy, plain, is fresh.
-	testing.expect_value(t, os.remove(rpath), nil)
-	testing.expect(t, os.write_entire_file(rpath, "0.0.0.0 r.example\n") == nil)
-	_, fetched = fetch_list(&cfg, recent)
-	testing.expect_value(t, fetched, Fetch.Cache_Is_Fresh)
-
-	// A FIFO in the copy's place is neither waited on nor read.
-	testing.expect_value(t, os.remove(path), nil)
-	if !testing.expect(t, posix.mkfifo(strings.clone_to_cstring(path, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {
-		return
-	}
-	_, fifo_why, fifo_read := read_cache_file(path, context.temp_allocator)
-	testing.expectf(t, !fifo_read && fifo_why == "it is not a regular file", "a FIFO was read as a cached copy: %v %q", fifo_read, fifo_why)
-
-	// A plain file with one link that belongs to someone other than the
-	// copies' owner: a hard link whose other name was replaced since looks
-	// just so, and is not read, nor fresh.
+	// Another uid's copy: refused by a root start, read by any other.
 	testing.expect_value(t, os.remove(path), nil)
 	testing.expect(t, os.write_entire_file(path, "0.0.0.0 mine.example\n") == nil)
-	other := Cache_Owner {
-		uid = posix.geteuid() + 1,
-		gid = posix.getegid(),
-		set = true,
-	}
+	other := strict
+	other.uid += 1
 	_, owner_why, owner_read := read_cache_file(path, context.temp_allocator, other)
-	testing.expectf(t, !owner_read && strings.has_prefix(owner_why, "it belongs to uid"), "another uid's copy was read: %v %q", owner_read, owner_why)
+	testing.expectf(t, !owner_read && strings.has_prefix(owner_why, "it belongs to uid"), "a root start read another uid's copy: %v %q", owner_read, owner_why)
 	_, fresh_for_other := plain_cache_file(path, other)
-	testing.expect(t, !fresh_for_other, "another uid's copy read as fresh")
-	// The premise: the same file, for its own owner, is read and fresh.
-	mine, mine_why, mine_read := read_cache_file(path, context.temp_allocator)
-	testing.expectf(t, mine_read && string(mine) == "0.0.0.0 mine.example\n", "the process's own copy was not read: %q", mine_why)
-	_, fresh_for_self := plain_cache_file(path)
-	testing.expect(t, fresh_for_self, "the process's own copy did not read as fresh")
+	testing.expect(t, !fresh_for_other, "a root start took another uid's copy as fresh")
 
-	// A fingerprint that is a link: the copy of a url with a query is the one
-	// whose fingerprint matches, and a linked one is not read to match it.
-	queried := config.Block_List{name = "q", url = "http://192.0.2.1/q.txt?key=K", format = .Hosts, enabled = true}
-	qpath := list_cache_path(&cfg, queried)
-	src, has := source_of(queried)
-	if !testing.expect(t, has, "premise: a url with a query has a fingerprint") {
+	// A FIFO in the copy's place is neither waited on nor read, by anyone.
+	testing.expect_value(t, os.remove(path), nil)
+	if !testing.expect(t, posix.mkfifo(cpath(path), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {
 		return
 	}
-	if !testing.expect(t, os.write_entire_file(victim, src) == nil, "cannot write the fingerprint") {
-		return
+	for owner in ([]Cache_Owner{{}, strict}) {
+		_, fifo_why, fifo_read := read_cache_file(path, context.temp_allocator, owner)
+		testing.expectf(t, !fifo_read && fifo_why == "it is not a regular file", "a FIFO was read (owner set %v): %q", owner.set, fifo_why)
 	}
-	testing.expect(t, os.write_entire_file(qpath, "0.0.0.0 q.example\n") == nil)
-	if !testing.expect(t, link(victim, source_path(qpath)), "cannot plant the fingerprint link") {
-		return
-	}
-	testing.expect(t, !copy_is_of(queried, qpath), "a linked fingerprint was read")
-	// The premise: the same fingerprint as a plain file matches.
-	testing.expect_value(t, os.remove(source_path(qpath)), nil)
-	testing.expect(t, os.write_entire_file(source_path(qpath), src) == nil)
-	testing.expect(t, copy_is_of(queried, qpath), "a plain fingerprint did not match")
+
+	// The cached copy as the list loads it, with no owner: what the log says
+	// for a copy it refuses.
+	testing.expect_value(t, os.remove(path), nil)
+	text, load := cached_copy(&cfg, list, .Stale)
+	testing.expectf(t, load == .Unavailable && text == "", "a missing copy loaded: %v %q", load, text)
+	delete(text)
 }
 
 /*
@@ -909,4 +883,36 @@ test_a_cached_copy_is_written_for_its_owner :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, st.st_uid == owner.uid && st.st_gid == owner.gid, "the copy is %d:%d's, want %d:%d", st.st_uid, st.st_gid, owner.uid, owner.gid)
 	testing.expect(t, !os.exists(fmt.tprintf("%s.tmp", path)), "the temporary copy was left behind")
+}
+
+/*
+Where a root start cannot give a copy to the account - a filesystem with no
+owners (vfat, an NFS export that squashes root), or a user namespace that maps
+no such uid - the copy is kept for this start rather than thrown away. Runs
+only where such a chown fails, which the test probes for first: in a user
+namespace (`unshare -U -r`), say.
+*/
+@(test)
+test_a_copy_that_cannot_be_given_is_kept :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	_, dir := list_test_dir(t, "unowned")
+	defer os.remove_all(dir)
+	owner := Cache_Owner {
+		uid = 65534,
+		gid = 65534,
+		set = true,
+	}
+	probe := fmt.tprintf("%s/probe", dir)
+	if !testing.expect(t, os.write_entire_file(probe, "x") == nil, "cannot write the probe") {
+		return
+	}
+	if posix.geteuid() != 0 || posix.chown(strings.clone_to_cstring(probe, context.temp_allocator), owner.uid, owner.gid) == .OK {
+		log.info("skipped: a chown to 65534 does not fail here")
+		return
+	}
+	path := fmt.tprintf("%s/kept.list", dir)
+	testing.expect_value(t, write_cache_file(path, transmute([]byte)string("0.0.0.0 kept.example\n"), owner), nil)
+	kept, kerr := os.read_entire_file(path, context.temp_allocator)
+	testing.expect_value(t, kerr, nil)
+	testing.expect_value(t, string(kept), "0.0.0.0 kept.example\n")
 }

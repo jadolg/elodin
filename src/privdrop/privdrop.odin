@@ -19,7 +19,6 @@ is that account is narrowed further by `sandbox`.
 package privdrop
 
 import "core:c"
-import "core:os"
 import "core:strings"
 import "core:sys/posix"
 import "elodin:netx"
@@ -300,13 +299,19 @@ A path that does not exist is not a failure: nothing has been cached yet, and
 the process creates the directory itself, under its own account.
 */
 hand_over :: proc(path: string, id: Identity) -> bool {
-	if path == "" || !os.exists(path) {
+	if path == "" {
 		return true
 	}
 	// Without its trailing slashes: with one, the kernel resolves a symlink at
 	// the last component before O_NOFOLLOW is looked at.
 	trimmed := strings.trim_right(path, "/")
 	cpath := strings.clone_to_cstring(trimmed if trimmed != "" else path, context.temp_allocator)
+	// Missing by its own name, not by a link's target: a dangling symlink is
+	// there, and is refused below.
+	st: posix.stat_t
+	if posix.lstat(cpath, &st) != .OK && posix.errno() == .ENOENT {
+		return true
+	}
 	dir := posix.open(cpath, {.DIRECTORY, .NOFOLLOW, .CLOEXEC})
 	if dir == -1 {
 		return false

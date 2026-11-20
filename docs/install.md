@@ -284,7 +284,11 @@ hand over the file it links to, wherever that file is. For the same reason a
 cached list is read only as a plain file with one link that belongs to the
 account, never through a symlink; any other is not read (the log says why) and
 is downloaded again. A copy an earlier version cached as root is one of those,
-once. A `cache_dir` that is itself a symlink is not followed, and so
+once. On a filesystem with no owners (vfat, an NFS export that squashes root)
+the copies cannot be given to the account: each start uses what it downloads,
+says so once, and downloads the lists again at the next start rather than read
+them. Started as anyone but root, elodin reads its copies however they are
+linked or owned, since it reads nothing more through a link than by name. A `cache_dir` that is itself a symlink is not followed, and so
 not handed over: name the directory it points at. Started this way, elodin
 downloads and parses the blocklists before it binds, so that much happens as
 root; the first arrangement avoids it.

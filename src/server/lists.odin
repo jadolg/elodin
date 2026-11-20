@@ -476,7 +476,8 @@ copy_is_of :: proc(list: config.Block_List, cache_path: string) -> bool {
 @(private)
 plain_cache_file :: proc(path: string, owner := cache_owner) -> (modified: time.Time, ok: bool) {
 	st: posix.stat_t
-	if posix.lstat(strings.clone_to_cstring(path, context.temp_allocator), &st) != .OK {
+	cpath := strings.clone_to_cstring(path, context.temp_allocator)
+	if (posix.lstat(cpath, &st) if owner.set else posix.stat(cpath, &st)) != .OK {
 		return {}, false
 	}
 	if cache_refusal(st, owner) != "" {
@@ -486,16 +487,20 @@ plain_cache_file :: proc(path: string, owner := cache_owner) -> (modified: time.
 }
 
 /*
-Read a file of the list cache, if `cache_refusal` takes it and its name is not a
-symlink. The directory is the service account's, and a root start reads it
-before the drop (#688): a link there to a file only root can read would load
-that file as a list. O_NONBLOCK so a FIFO put there does not hold the start.
-`why` says why a file that is there was not read, and is empty for one that is
-not there.
+Read a file of the list cache, if `cache_refusal` takes it. O_NONBLOCK so a FIFO
+put there does not hold the start. With a cache owner - a root start that drops
+to the account whose directory it is (#688) - the name may not be a symlink
+either: a link there to a file only root can read would load that file as a
+list. `why` says why a file that is there was not read, and is empty for one
+that is not there.
 */
 @(private)
 read_cache_file :: proc(path: string, allocator := context.allocator, owner := cache_owner) -> (data: []byte, why: string, ok: bool) {
-	fd := posix.open(strings.clone_to_cstring(path, context.temp_allocator), {.NOFOLLOW, .NONBLOCK, .CLOEXEC})
+	flags := posix.O_Flags{.NONBLOCK, .CLOEXEC}
+	if owner.set {
+		flags += {.NOFOLLOW}
+	}
+	fd := posix.open(strings.clone_to_cstring(path, context.temp_allocator), flags)
 	if fd == -1 {
 		errno := posix.errno()
 		#partial switch errno {
@@ -531,22 +536,27 @@ read_cache_file :: proc(path: string, allocator := context.allocator, owner := c
 
 /*
 Why a file in the list cache is not one of its copies, or "" for one that is: a
-regular file, with one link, belonging to whoever the copies are written for -
-`owner` when set, the process otherwise. A hard link is the file it links to,
-and one whose other name was replaced since has a single link left, but it is
-still its owner's, not the copies' (#688).
+regular file and, with a cache owner, one with a single link that belongs to
+the owner. Those two are a root start's (#688), which reads what the account
+put in its own directory before the drop: a hard link is the file it links to,
+and one whose other name was replaced since has a single link left, but is
+still its original owner's. A process that is not root reads nothing more
+through a link than it could by name, so it reads a copy however it is linked
+or owned.
 */
 @(private)
 cache_refusal :: proc(st: posix.stat_t, owner: Cache_Owner) -> string {
 	if !posix.S_ISREG(st.st_mode) {
 		return "it is not a regular file"
 	}
+	if !owner.set {
+		return ""
+	}
 	if st.st_nlink != 1 {
 		return "it is a hard link"
 	}
-	want := owner.uid if owner.set else posix.geteuid()
-	if st.st_uid != want {
-		return fmt.tprintf("it belongs to uid %d, not %d", st.st_uid, want)
+	if st.st_uid != owner.uid {
+		return fmt.tprintf("it belongs to uid %d, not %d", st.st_uid, owner.uid)
 	}
 	return ""
 }
@@ -637,10 +647,10 @@ write_cache_file :: proc(path: string, body: []byte, owner := cache_owner) -> (e
 	// Only while still root: after the drop the account writes its own, and
 	// the strict sandbox does not allow `fchown`.
 	if owner.set && posix.geteuid() == 0 && posix.fchown(posix.FD(os.fd(f)), owner.uid, owner.gid) != .OK {
-		err = os.Platform_Error(posix.errno())
-		os.close(f)
-		os.remove(tmp)
-		return
+		// Kept, and said once: a filesystem with no owners (vfat, an NFS
+		// export that squashes root) cannot give it, and the copy still
+		// serves this start; the next root start reads it as another's.
+		warn_cache_unowned(path, os.Platform_Error(posix.errno()))
 	}
 	_, err = os.write(f, body)
 	if err == nil {
@@ -672,6 +682,18 @@ Cache_Owner :: struct {
 // Written once at startup, before any list is loaded, and only read after.
 @(private)
 cache_owner: Cache_Owner
+
+@(private)
+cache_unowned_warned: bool
+
+// Report a copy that could not be given to the cache owner once, not per list.
+@(private)
+warn_cache_unowned :: proc(path: string, err: os.Error) {
+	if sync.atomic_exchange(&cache_unowned_warned, true) {
+		return
+	}
+	logx.warnf("the cached list %s cannot be given to the account (%v), as no copy on this filesystem can; the next root start will download the lists again rather than read them", path, err)
+}
 
 // Name the account the list cache's files are given to; see `Cache_Owner`.
 set_cache_owner :: proc(uid: posix.uid_t, gid: posix.gid_t) {
