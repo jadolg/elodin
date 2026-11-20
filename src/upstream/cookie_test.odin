@@ -29,6 +29,9 @@ Cookie_Mock :: struct {
 	// Answer BADCOOKIE to every query, server cookie or not: an anycast node
 	// whose secret is not the one that issued it (RFC 7873 section 5.3).
 	always_bad: bool,
+	// Give each reply a server cookie of its own: the last byte of `server` is
+	// the reply's count, the way a node with a rotating secret would.
+	rotate:     bool,
 	/*
 	Stop putting a COOKIE option in replies once this many have carried one.
 
@@ -104,6 +107,9 @@ cookie_mock_reply :: proc(m: ^Cookie_Mock, query: []u8, count: int) -> (reply: [
 		option[0] ~= 0xff
 	}
 	copy(option[8:], m.server[:])
+	if m.rotate {
+		option[15] = u8(count)
+	}
 	written := option[:12] if m.short else option[:]
 	out, set_ok := dns.set_edns_option(wire, .Cookie, written, context.temp_allocator)
 	if !set_ok {
@@ -538,6 +544,9 @@ Tcp_Answerer :: struct {
 	server:   [8]u8,
 	bad:      bool,
 	answered: int,
+	mu:       sync.Mutex,
+	// The server half of the cookie on the last query answered.
+	seen:     [8]u8,
 }
 
 @(private = "file")
@@ -582,10 +591,20 @@ tcp_answerer_serve :: proc(m: ^Tcp_Answerer) {
 		framed := make([]u8, 2 + len(wire), context.temp_allocator)
 		framed[0], framed[1] = u8(len(wire) >> 8), u8(len(wire))
 		copy(framed[2:], wire)
+		// Before the send: the client reads these as soon as it has the reply.
+		msg, derr := dns.decode_message(query, context.temp_allocator)
+		if derr != .None {
+			return
+		}
+		if sent, found := dns.find_edns_option(msg, .Cookie); found && len(sent) == 16 {
+			sync.mutex_lock(&m.mu)
+			copy(m.seen[:], sent[8:])
+			sync.mutex_unlock(&m.mu)
+		}
+		sync.atomic_add(&m.answered, 1)
 		if _, serr := net.send_tcp(conn, framed); serr != nil {
 			return
 		}
-		sync.atomic_add(&m.answered, 1)
 	}
 }
 
@@ -628,13 +647,15 @@ stop_tcp_answerer :: proc(m: ^Tcp_Answerer, server: ^thread.Thread, u: ^Upstream
 RFC 7873 section 5.3: "If the reply to a retried request with a fresh Server
 Cookie is BADCOOKIE, the client SHOULD retry using TCP as the transport". A UDP
 member that answers BADCOOKIE to the retry as well is asked once more over TCP,
-on the same exchange, and that answer is the exchange's.
+on the same exchange, with the server cookie that refusal carried, and that
+answer is the exchange's.
 */
 @(test)
 test_a_second_badcookie_is_asked_again_over_tcp :: proc(t: ^testing.T) {
 	m := Cookie_Mock {
 		server     = {9, 9, 9, 9, 9, 9, 9, 9},
 		always_bad = true,
+		rotate     = true,
 	}
 	u, worker, ok := start_cookie_mock(t, &m)
 	if !ok {
@@ -661,6 +682,11 @@ test_a_second_badcookie_is_asked_again_over_tcp :: proc(t: ^testing.T) {
 	sync.mutex_unlock(&m.mu)
 	testing.expectf(t, seen == 2, "%d UDP queries, want the first and its retry", seen)
 	testing.expectf(t, sync.atomic_load(&tcp.answered) == 1, "%d TCP answers, want the one retry", sync.atomic_load(&tcp.answered))
+	// The cookie the second refusal carried, not the one it refused.
+	sync.mutex_lock(&tcp.mu)
+	carried := tcp.seen
+	sync.mutex_unlock(&tcp.mu)
+	testing.expectf(t, carried == [8]u8{9, 9, 9, 9, 9, 9, 9, 2}, "the TCP ask carried server cookie %v", carried)
 	free_all(context.temp_allocator)
 }
 
