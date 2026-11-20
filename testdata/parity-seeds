@@ -32,6 +32,9 @@
 # Fixed in src/server/resolver.odin, where the record is settled before the answer
 # is fitted rather than after (#281), and named in
 # src/server/opt_reservation_test.odin.
+# Seed 4 also draws an additional RRset too big for a 512-byte client - the
+# mock's run of forty addresses for ns1.parity.test. - which RFC 2181 section 9
+# leaves out whole (#689); `pc_whole_rrsets` is the check.
 4
 5
 
@@ -60,9 +63,3 @@
 # An upstream OPT record owned by a name other than the root (#301): handed
 # to the client as the reply's EDNS record.
 1792584408197143947
-
-# An additional RRset too big for a 512-byte client - the mock's run of forty
-# addresses for ns1.parity.test. - was cut where the datagram ran out, so part
-# of it went out with TC clear. RFC 2181 section 9 leaves it out whole (#689);
-# `pc_whole_rrsets` is the check.
-4

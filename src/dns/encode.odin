@@ -524,8 +524,10 @@ fit and to ask again over TCP. So a record dropped from those two sections sets
 does not - a responder that could not fit a glue address or an OPT record behind
 a complete answer has answered the question, and a client sent to TCP over it
 gets the same records one round trip later. What the additional section drops
-is a whole RRset (section 9 again): the records of it already written go with
-the one that overflowed, so no RRset goes out in part.
+is a whole RRset (section 9 again): the records of it already written in its
+run go with the one that overflowed, and its later records and signatures are
+passed over. A record of it written before another RRset came between is the
+exception; see `dropped` below.
 
 The OPT record is re-appended after a cut so the client still sees our EDNS
 parameters, and the additional section keeps its room as it fills rather than

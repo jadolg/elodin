@@ -708,9 +708,11 @@ test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing
 		for want in c.kept {
 			found := false
 			for rec in got.additional {
-				found ||= rec.type == .A && name_equal_fold(rec.name, want.name)
+				got_a, got_ok := rec.data.(Rdata_A)
+				want_a, want_ok := want.data.(Rdata_A)
+				found ||= rec.type == .A && name_equal_fold(rec.name, want.name) && got_ok && want_ok && got_a.addr == want_a.addr
 			}
-			testing.expectf(t, found, "%s: %s was left out", c.name, want.name)
+			testing.expectf(t, found, "%s: %s %v was left out", c.name, want.name, want.data)
 		}
 		testing.expectf(t, edns_present(got) == c.with_opt, "%s: the OPT record is %v, want %v", c.name, edns_present(got), c.with_opt)
 	}
