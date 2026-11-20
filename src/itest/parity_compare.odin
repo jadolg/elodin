@@ -209,6 +209,27 @@ parity_compare :: proc(
 	return c
 }
 
+// Whether two records are of one RRset: one owner, case aside, type and class.
+@(private = "file")
+pc_same_rrset :: proc(a, b: Pw_RR) -> bool {
+	if a.type != b.type || a.class != b.class || len(a.name) != len(b.name) {
+		return false
+	}
+	for i in 0 ..< len(a.name) {
+		x, y := a.name[i], b.name[i]
+		if x >= 'A' && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if y >= 'A' && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
+}
+
 /*
 What a record would have cost the message that left it out, in bytes.
 
@@ -607,6 +628,45 @@ pc_records :: proc(
 	pc_section(c, q, .Answer, "answer", up.answer, el.answer, up, el, policy)
 	pc_section(c, q, .Authority, "authority", up.authority, el.authority, up, el, policy)
 	pc_section(c, q, .Additional, "additional", up.additional, el.additional, up, el, policy)
+	pc_whole_rrsets(c, up.additional, el.additional)
+}
+
+/*
+An RRset in elodin's additional section that holds fewer records than the
+upstream sent for it: part of a set, which RFC 2181 section 9 has left out
+whole when it will not fit. The per-record allowance in `pc_missing` excuses a
+dropped record that had no room, and a set cut partway drops records that had
+none, so it cannot see this; the count can. Never allowed.
+*/
+@(private = "file")
+pc_whole_rrsets :: proc(c: ^Parity_Compare, up_recs, el_recs: []Pw_RR) {
+	for rec, i in el_recs {
+		// Once per set: at its first record in elodin's section.
+		first := true
+		for j in 0 ..< i {
+			first &&= !pc_same_rrset(el_recs[j], rec)
+		}
+		if !first {
+			continue
+		}
+		sent, kept := 0, 0
+		for u in up_recs {
+			sent += 1 if pc_same_rrset(u, rec) else 0
+		}
+		for e in el_recs {
+			kept += 1 if pc_same_rrset(e, rec) else 0
+		}
+		if kept < sent {
+			pc_add(
+				c,
+				.Additional,
+				fmt.aprintf("part of an RRset: %d of its %d records", kept, sent, allocator = c.allocator),
+				pw_rr_key(rec, c.allocator),
+				"-",
+				"",
+			)
+		}
+	}
 }
 
 @(private = "file")
@@ -876,10 +936,12 @@ pc_missing :: proc(
 	not cut but filled as far as it goes: the encoder drops a record that will
 	not fit and keeps writing the ones behind it.
 
-	So the cost is this record's own - `pc_first_dropped`'s figure would judge
-	a whole section by whichever record was lost first - and the room is what
-	stood written when this record's turn came rather than the finished
-	message's length. The finished length is the high-water mark, and against
+	So the cost is this record's RRset's - the encoder leaves an RRset out
+	whole, the records of it that fitted with the one that did not - and the
+	room is what stood written when that RRset's turn came rather than the
+	finished message's length. Not the section's first dropped record:
+	`pc_first_dropped`'s figure would judge a whole section by whichever record
+	was lost first. The finished length is the high-water mark, and against
 	it a record dropped early with room to spare is excused the moment the
 	records written after it bring the total near the ceiling. That is the
 	data loss this comparison exists to catch, in the one section it is being
@@ -921,7 +983,13 @@ pc_missing :: proc(
 	if kind == .Additional && policy.transport == .UDP && !el.tc && !pc_referral(el) {
 		// Costed inside the guard rather than beside it: `index` is an index
 		// into this section, and `pc_written_before` walks the additional one.
-		written, after_a_drop := pc_written_before(c, index, up, el)
+		// From where this record's RRset began, which is where the encoder
+		// took it back to.
+		start := index
+		for start > 0 && pc_same_rrset(up.additional[start - 1], rec) {
+			start -= 1
+		}
+		written, after_a_drop := pc_written_before(c, start, up, el)
 		/*
 		Costed with its owner name written out where a record ahead of it in
 		this section was dropped: `encode_message` turns compression off at
@@ -932,9 +1000,10 @@ pc_missing :: proc(
 		pointer it never got would read a record that did not fit as one that
 		did, which is a run failing on something nobody did wrong.
 		*/
-		cost := pc_rr_cost(rec)
-		if after_a_drop {
-			cost = len(rec.name) + 10 + len(rec.rdata)
+		cost := 0
+		for i := start; i < len(up.additional) && pc_same_rrset(up.additional[i], rec); i += 1 {
+			member := up.additional[i]
+			cost += len(member.name) + 10 + len(member.rdata) if after_a_drop else pc_rr_cost(member)
 		}
 		/*
 		The room the encoder was holding back at this point, which is the OPT

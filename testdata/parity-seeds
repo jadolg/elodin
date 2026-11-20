@@ -60,3 +60,9 @@
 # An upstream OPT record owned by a name other than the root (#301): handed
 # to the client as the reply's EDNS record.
 1792584408197143947
+
+# An additional RRset too big for a 512-byte client - the mock's run of forty
+# addresses for ns1.parity.test. - was cut where the datagram ran out, so part
+# of it went out with TC clear. RFC 2181 section 9 leaves it out whole (#689);
+# `pc_whole_rrsets` is the check.
+4
