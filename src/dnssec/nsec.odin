@@ -277,7 +277,9 @@ types_deny :: proc(types: []u8, qname: string, qtype: dns.Type) -> bool {
 Prove that `qname` exists but has no records of `qtype` (RFC 4035 section 5.4).
 
 Either an NSEC sits on the name with the type missing from its bit map, or the
-name is covered and a wildcard NSEC answers for it with the type missing.
+name is covered and a wildcard answers for it without the type: an NSEC on the
+wildcard with the type missing, or a cover showing the wildcard is an empty
+non-terminal.
 */
 nsec_proves_no_data :: proc(
 	nsecs: []Nsec_Rr,
@@ -299,9 +301,13 @@ nsec_proves_no_data :: proc(
 	if nsec_shows_node(nsecs, qname) {
 		return .Proven
 	}
-	wildcard, wfound := nsec_matching(nsecs, wildcard_of(nsec_encloser(qname, covering), allocator))
+	wname := wildcard_of(nsec_encloser(qname, covering), allocator)
+	wildcard, wfound := nsec_matching(nsecs, wname)
 	if !wfound {
-		return .Failed
+		// A wildcard that is itself an empty non-terminal holds no type at all
+		// and still answers for the name (RFC 4592 section 2.2.2).
+		wc, wcovered := nsec_covering(nsecs, wname)
+		return .Proven if wcovered && nsec_speaks_for(wc, wname) && nsec_shows_node(nsecs, wname) else .Failed
 	}
 	return .Proven if types_deny(wildcard.rr.types, qname, qtype) else .Failed
 }

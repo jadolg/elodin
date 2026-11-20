@@ -36,7 +36,7 @@ first query into a zone.
 | DS digests | SHA-1, SHA-256, SHA-384 |
 | denial of existence | NSEC and NSEC3, including closest-encloser proofs and opt-out |
 | wildcards | a wildcard answer must come with a proof that the name had nothing of its own |
-| an empty non-terminal | an NSEC span whose next name is below the name shows the name exists (RFC 4592 section 2.2.2): it proves NODATA there, and an NXDOMAIN or a wildcard answer resting on it is bogus |
+| an empty non-terminal | an NSEC span whose next name is below the name shows the name exists (RFC 4592 section 2.2.2): it proves NODATA there, and an NXDOMAIN or a wildcard answer resting on it is bogus. A wildcard that is an empty non-terminal answers the names under its parent with NODATA |
 | a CNAME chain ending in NODATA or NXDOMAIN | the denial is checked in the zone holding the chain's last name, the name the rcode is about (RFC 6604 section 3): proven, it gets AD with its NSEC or NSEC3 and SOA (RFC 6840 section 5.8); unproven in a signed zone, SERVFAIL, whether or not the CNAMEs before it are signed; in an unsigned zone, insecure. It costs at most one more chain walk per answer, inside the same per-question bounds |
 | a name owning a CNAME on the way down | not a zone cut, so the walk carries on below it, when the parent signed the CNAME at that name (RFC 1034 section 3.6.2, RFC 4035 section 2.2); a CNAME there that is unsigned, expanded from a wildcard or signed by any other key proves nothing, and the chain is broken unless a signed denial of that name itself comes with it; the proof for the CNAME's target says nothing about it |
 | unsigned zones | insecure: served, no AD bit |

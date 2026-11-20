@@ -1420,6 +1420,28 @@ def empty_non_terminal_denials():
          message("x.b.enxtest.", A, forged + [sign(forged, zone, labels=1)], span))
     emit("ex_xb_ds", "x.b.enxtest.", "DS", message("x.b.enxtest.", DS, [], tail + span + soa, rcode=3))
 
+    # `x.*.exwild.` makes `*.exwild.` an empty non-terminal wildcard, so a name
+    # it answers for gets NODATA, and the same proof under rcode 3 denies
+    # nothing.
+    wzone = Key("exwild.", "ent-denial-wildcard")
+    ds_set = [RR("exwild.", DS, wzone.ds())]
+    emit("ex_wild_ds", "exwild.", "DS", message("exwild.", DS, ds_set + [sign(ds_set, root)]))
+    keys = [RR("exwild.", DNSKEY, wzone.rdata)]
+    emit("ex_wild_dnskey", "exwild.", "DNSKEY", message("exwild.", DNSKEY, keys + [sign(keys, wzone)]))
+    proof = []
+    for owner, next_name, types in (
+        ("exwild.", "x.*.exwild.", [NS, SOA, RRSIG, NSEC, DNSKEY]),
+        ("a.exwild.", "exwild.", [A, RRSIG, NSEC]),
+    ):
+        rrset = [RR(owner, NSEC, nsec_rdata(next_name, types))]
+        proof += rrset + [sign(rrset, wzone)]
+    wsoa = [soa_rr("exwild.")]
+    proof += wsoa + [sign(wsoa, wzone)]
+    for name in ("nx.exwild.", "ny.exwild."):
+        emit("ex_%s_ds" % name[:2], name, "DS", message(name, DS, [], proof))
+    emit("ex_nx_nodata", "nx.exwild.", "A", message("nx.exwild.", A, [], proof))
+    emit("ex_ny_nx", "ny.exwild.", "A", message("ny.exwild.", A, [], proof, rcode=3))
+
 
 def cd_cname(src, owner, target):
     """A CNAME signed by the source zone, as the `cname_denial` answers carry it."""
