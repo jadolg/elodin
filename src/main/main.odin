@@ -852,6 +852,12 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	// Here rather than in the loop, as a rebuild a stop leaves running writes
 	// to it until the process ends; see the deferred stop below.
 	rebuild: server.Rebuild
+	// A root start downloads the lists before the drop; each copy it caches is
+	// the account's as it is written, so the refreshes after the drop can
+	// replace it (see `privdrop.hand_over`).
+	if privdrop.is_root() && service.uid != 0 {
+		server.set_cache_owner(service.uid, service.gid)
+	}
 	if cfg.blocking.enabled {
 		/*
 		On the rebuild thread, as at every refresh, so a SIGTERM is not held by
@@ -998,7 +1004,7 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 	}
 
 	if cfg.blocking.enabled && cfg.blocking.cache_dir != "" {
-		handed, named, skipped := privdrop.hand_over(cfg.blocking.cache_dir, service)
+		handed := privdrop.hand_over(cfg.blocking.cache_dir, service)
 		if !handed && is_symlink(cfg.blocking.cache_dir) {
 			logx.warnf(
 				"blocking.cache_dir %q is a symlink, which is not followed when it is given to %s; name the directory it points at, or the lists will be re-downloaded on each start",
@@ -1009,16 +1015,6 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 			logx.warnf(
 				"could not give %q to %s; the lists are in effect but will be re-downloaded on each start",
 				cfg.blocking.cache_dir,
-				cfg.server.user,
-			)
-		}
-		if skipped > 0 {
-			logx.warnf(
-				"left %d entries in %q as they are (%s%s) rather than give them to %s: only directories and files with one link are handed over",
-				skipped,
-				cfg.blocking.cache_dir,
-				strings.join(named, ", ", context.temp_allocator),
-				", ..." if skipped > len(named) else "",
 				cfg.server.user,
 			)
 		}

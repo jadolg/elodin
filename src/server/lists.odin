@@ -371,6 +371,12 @@ cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Loa
 	}
 	data, read := read_cache_file(cache_path, context.allocator)
 	if !read {
+		// There, and not read: say why, or a copy restored from a hard-link
+		// backup, or put in place as a symlink, is just "unavailable".
+		st: posix.stat_t
+		if posix.lstat(strings.clone_to_cstring(cache_path, context.temp_allocator), &st) == .OK {
+			logx.warnf("list %s: the cached copy at %s is not read: only a regular file with one link is, never a symlink or a hard link", list.name, cache_path)
+		}
 		return "", .Unavailable
 	}
 	// A page an earlier build cached before downloads were checked (#317).
@@ -467,13 +473,6 @@ copy_is_of :: proc(list: config.Block_List, cache_path: string) -> bool {
 	return read && string(data) == src
 }
 
-/*
-Read a file of the list cache, if it is a regular file with a single link and
-its name is not a symlink. The directory is the service account's, and a root
-start reads it before the drop (#688): a symlink or a hard link there to a file
-only root can read would load that file as a list. O_NONBLOCK so a FIFO put
-there does not hold the start.
-*/
 // When the file at `path` was modified, if it is one `read_cache_file` reads.
 @(private)
 plain_cache_file :: proc(path: string) -> (modified: time.Time, ok: bool) {
@@ -487,6 +486,13 @@ plain_cache_file :: proc(path: string) -> (modified: time.Time, ok: bool) {
 	return time.unix(i64(st.st_mtim.tv_sec), i64(st.st_mtim.tv_nsec)), true
 }
 
+/*
+Read a file of the list cache, if it is a regular file with a single link and
+its name is not a symlink. The directory is the service account's, and a root
+start reads it before the drop (#688): a symlink or a hard link there to a file
+only root can read would load that file as a list. O_NONBLOCK so a FIFO put
+there does not hold the start.
+*/
 @(private)
 read_cache_file :: proc(path: string, allocator := context.allocator) -> (data: []byte, ok: bool) {
 	fd := posix.open(strings.clone_to_cstring(path, context.temp_allocator), {.NOFOLLOW, .NONBLOCK, .CLOEXEC})
@@ -572,7 +578,7 @@ rename(2) replaces the name atomically. The temporary name ends in
 cannot be another list's.
 */
 @(private)
-write_cache_file :: proc(path: string, body: []byte) -> (err: os.Error) {
+write_cache_file :: proc(path: string, body: []byte, owner := cache_owner) -> (err: os.Error) {
 	tmp := fmt.tprintf("%s.tmp", path)
 	/*
 	Created afresh, O_EXCL: the directory is the service account's, and a root
@@ -590,6 +596,14 @@ write_cache_file :: proc(path: string, body: []byte) -> (err: os.Error) {
 	} else if oerr != nil {
 		return oerr
 	}
+	// Given to the account through the descriptor that created it, so it is
+	// this copy and nothing else that changes owner; see `privdrop.hand_over`.
+	if owner.set && posix.fchown(posix.FD(os.fd(f)), owner.uid, owner.gid) != .OK {
+		err = os.Platform_Error(posix.errno())
+		os.close(f)
+		os.remove(tmp)
+		return
+	}
 	_, err = os.write(f, body)
 	if err == nil {
 		err = os.sync(f)
@@ -604,6 +618,26 @@ write_cache_file :: proc(path: string, body: []byte) -> (err: os.Error) {
 		os.remove(tmp)
 	}
 	return
+}
+
+/*
+Who the files of the list cache are given to as `write_cache_file` writes them:
+the account a root start drops to, which `main` names before the startup
+downloads run, as root. Unset, a file stays whoever wrote it.
+*/
+Cache_Owner :: struct {
+	uid: posix.uid_t,
+	gid: posix.gid_t,
+	set: bool,
+}
+
+// Written once at startup, before any list is loaded, and only read after.
+@(private)
+cache_owner: Cache_Owner
+
+// Name the account the list cache's files are given to; see `Cache_Owner`.
+set_cache_owner :: proc(uid: posix.uid_t, gid: posix.gid_t) {
+	cache_owner = {uid = uid, gid = gid, set = true}
 }
 
 @(private)

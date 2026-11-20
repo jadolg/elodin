@@ -861,3 +861,32 @@ test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
 	testing.expect(t, os.write_entire_file(source_path(qpath), src) == nil)
 	testing.expect(t, copy_is_of(queried, qpath), "a plain fingerprint did not match")
 }
+
+/*
+A copy written for an account is the account's from the moment it exists: a
+root start gives each one it caches to the account it drops to, through the
+descriptor that created it, rather than chowning what it later finds there
+(#688). Handed to its own owner, which any user can do; as root, to another.
+*/
+@(test)
+test_a_cached_copy_is_written_for_its_owner :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	_, dir := list_test_dir(t, "owner")
+	defer os.remove_all(dir)
+	path := fmt.tprintf("%s/owned.list", dir)
+	owner := Cache_Owner {
+		uid = posix.geteuid(),
+		gid = posix.getegid(),
+		set = true,
+	}
+	if posix.geteuid() == 0 {
+		owner = {uid = 65534, gid = 65534, set = true}
+	}
+	testing.expect_value(t, write_cache_file(path, transmute([]byte)string("0.0.0.0 o.example\n"), owner), nil)
+	st: posix.stat_t
+	if !testing.expect(t, posix.stat(strings.clone_to_cstring(path, context.temp_allocator), &st) == .OK, "cannot stat the copy") {
+		return
+	}
+	testing.expectf(t, st.st_uid == owner.uid && st.st_gid == owner.gid, "the copy is %d:%d's, want %d:%d", st.st_uid, st.st_gid, owner.uid, owner.gid)
+	testing.expect(t, !os.exists(fmt.tprintf("%s.tmp", path)), "the temporary copy was left behind")
+}

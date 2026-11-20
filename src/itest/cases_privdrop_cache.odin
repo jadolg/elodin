@@ -11,8 +11,8 @@ Issue #688: started as root with `server.user` set, elodin hands the blocklist
 cache directory to the account before the drop. The directory is the account's
 after the first start, so anything running as it can put a hard link to a file
 elsewhere in there, and a chown of that link as root would hand the file over
-too. Only directories and singly linked files are handed over, and the rest are
-named in a warning.
+too. The directory alone is handed over, and each copy elodin caches is the
+account's as it is written.
 
 The link is made as root here, which `fs.protected_hardlinks` allows; the
 account making it is not what the case is about.
@@ -77,7 +77,6 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 	if out_uid, read := owner(outside); check(r, read, "cannot stat %s", outside) {
 		check(r, out_uid == 0, "the file the link points at was given to uid %d", out_uid)
 	}
-	check(r, log_contains(&srv, "x.list"), "the link left alone was not named:\n%s", read_log(&srv))
 	// And what elodin wrote there itself was handed over with the directory.
 	entries, rerr := os.read_directory_by_path(cache_dir, -1, context.temp_allocator)
 	if check(r, rerr == nil, "cannot list %s: %v", cache_dir, rerr) {

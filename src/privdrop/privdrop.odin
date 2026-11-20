@@ -21,7 +21,6 @@ package privdrop
 import "core:c"
 import "core:os"
 import "core:strings"
-import "core:sys/linux"
 import "core:sys/posix"
 import "elodin:netx"
 
@@ -280,35 +279,29 @@ already :: proc(id: Identity) -> bool {
 /*
 Hand a directory the process keeps writing to over to `id`.
 
-The blocklist cache is elodin's own output and opened by name after the drop:
+The blocklist cache is elodin's own output and written by name after the drop:
 the lists are downloaded before the listeners bind, so the files land under
 whoever started the process, and a refresh hours later would then fail on every
 one of them. Ownership moves with the process; a log file the process creates is
 the account's from the start (`logx.init`). The files an operator names and SIGHUP reads again are
 not taken over; see `can_reopen`.
 
-One level deep, because that is the shape of the directory - a flat set of
-`.list` files - and a recursive chown as root over a path an operator supplied
-is a much larger thing to get right.
-
-The directory is the account's after the first start, so anything running as it
-can put entries in. Only a directory, or a regular file with one link, is taken:
-a hard link is the same inode as a file anywhere else on the filesystem, and
-chowning it as root would hand that file over too. That is the check
-systemd-tmpfiles makes before a chown of its own. Symlinks, devices, FIFOs and
-sockets are left alone as well. Every entry is looked at and chowned through
-one descriptor (`O_PATH`, `O_NOFOLLOW`), so it cannot be swapped between the
-two, and root never opens it for reading. `skipped` counts the entries left as
-they were, and `named` names the first `HAND_OVER_NAMED` of them, in `allocator`:
-the account decides how many there are. An entry gone before it is looked at is
-neither.
+The directory alone, and nothing in it. Owning the directory is what a refresh
+needs - it writes each copy afresh and renames it into place - and the files
+elodin writes there are given to the account as they are written
+(`server.set_cache_owner`). Anything else in there, once the directory is the
+account's, may be anything at all: a hard link is the same inode as a file
+elsewhere, and no test of what is found there - its type, its links, its owner,
+its name - tells a copy elodin wrote from a file the account linked in. Opened
+`O_DIRECTORY|O_NOFOLLOW` and chowned through that descriptor, so a symlink in
+its place is not followed.
 
 A path that does not exist is not a failure: nothing has been cached yet, and
 the process creates the directory itself, under its own account.
 */
-hand_over :: proc(path: string, id: Identity, allocator := context.temp_allocator) -> (ok: bool, named: []string, skipped: int) {
+hand_over :: proc(path: string, id: Identity) -> bool {
 	if path == "" || !os.exists(path) {
-		return true, nil, 0
+		return true
 	}
 	// Without its trailing slashes: with one, the kernel resolves a symlink at
 	// the last component before O_NOFOLLOW is looked at.
@@ -316,89 +309,10 @@ hand_over :: proc(path: string, id: Identity, allocator := context.temp_allocato
 	cpath := strings.clone_to_cstring(trimmed if trimmed != "" else path, context.temp_allocator)
 	dir := posix.open(cpath, {.DIRECTORY, .NOFOLLOW, .CLOEXEC})
 	if dir == -1 {
-		return false, nil, 0
+		return false
 	}
-	ok = posix.fchown(dir, id.uid, id.gid) == .OK
-	// `fdopendir` owns the descriptor from here; `closedir` closes it.
-	stream := posix.fdopendir(dir)
-	if stream == nil {
-		posix.close(dir)
-		return false, nil, 0
-	}
-	defer posix.closedir(stream)
-	left := make([dynamic]string, 0, HAND_OVER_NAMED, allocator)
-	for {
-		entry := posix.readdir(stream)
-		if entry == nil {
-			break
-		}
-		name := cstring(&entry.d_name[0])
-		if name == "." || name == ".." {
-			continue
-		}
-		switch take(linux.Fd(dir), name, id) {
-		case .Taken, .Gone:
-		case .Skipped:
-			skipped += 1
-			if len(left) < HAND_OVER_NAMED {
-				append(&left, strings.clone_from_cstring(name, allocator))
-			}
-		case .Failed:
-			ok = false
-		}
-	}
-	return ok, left[:], skipped
-}
-
-// How many of the entries `hand_over` leaves alone it names.
-HAND_OVER_NAMED :: 8
-
-@(private)
-Take :: enum {
-	Taken,
-	Skipped,
-	// Removed between the listing and the look: nothing to hand over.
-	Gone,
-	Failed,
-}
-
-/*
-Give one entry of `dir` to `id`, if it is a directory or a regular file with a
-single link; see `hand_over`.
-*/
-@(private)
-take :: proc(dir: linux.Fd, name: cstring, id: Identity) -> Take {
-	fd, oerr := linux.openat(dir, name, {.PATH, .NOFOLLOW, .CLOEXEC})
-	if oerr == .ENOENT {
-		return .Gone
-	}
-	if oerr != .NONE {
-		return .Failed
-	}
-	defer linux.close(fd)
-	st: linux.Stat
-	if linux.fstat(fd, &st) != .NONE {
-		return .Failed
-	}
-	if !may_take(st) {
-		return .Skipped
-	}
-	// `fchown` refuses an `O_PATH` descriptor; `fchownat` with an empty name
-	// and AT_EMPTY_PATH takes it. `core:sys/linux`'s wrapper passes no flags.
-	empty: cstring = ""
-	ret := linux.syscall(linux.SYS_fchownat, fd, rawptr(empty), id.uid, id.gid, AT_EMPTY_PATH)
-	return .Taken if ret == 0 else .Failed
-}
-
-// `<fcntl.h>`: a `*at` call on the descriptor itself rather than on a name in it.
-@(private)
-AT_EMPTY_PATH :: 0x1000
-
-// A directory, or a regular file no other name points at.
-@(private)
-may_take :: proc(st: linux.Stat) -> bool {
-	kind := st.mode & linux.S_IFMT
-	return kind == linux.S_IFDIR || (kind == linux.S_IFREG && st.nlink == 1)
+	defer posix.close(dir)
+	return posix.fchown(dir, id.uid, id.gid) == .OK
 }
 
 /*
