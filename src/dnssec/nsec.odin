@@ -199,12 +199,18 @@ nsec_proves_name_error :: proc(nsecs: []Nsec_Rr, qname: string, allocator := con
 	if !nsec_speaks_for(covering, qname) {
 		return .Failed
 	}
+	// A span whose next name is under `qname` shows an empty non-terminal, a
+	// name that exists (RFC 4592 section 2.2.2), so it denies nothing (RFC 4035
+	// section 3.1.3). The wildcard's cover below is held to the same.
+	if nsec_shows_node(nsecs, qname) {
+		return .Failed
+	}
 
 	wildcard := wildcard_of(nsec_encloser(qname, covering), allocator)
 	// And the same of the record that swallows the wildcard: a delegation's
 	// span reaches `*.<child>` as readily as anything else under the cut.
 	wc, covered := nsec_covering(nsecs, wildcard)
-	if !covered || !nsec_speaks_for(wc, wildcard) {
+	if !covered || !nsec_speaks_for(wc, wildcard) || nsec_shows_node(nsecs, wildcard) {
 		return .Failed
 	}
 	return .Proven

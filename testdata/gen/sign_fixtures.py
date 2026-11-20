@@ -1378,6 +1378,49 @@ def wildcard_nodata():
     emit("wn_delegation_ds", "foo.wntest.", "DS", message("foo.wntest.", DS, [], authority))
 
 
+@scenario
+def empty_non_terminal_denials():
+    """Cover denials whose covering NSEC shows the name is an empty non-terminal."""
+    # `b.enxtest.` exists only because `c.b.enxtest.` does, so the span
+    # `a.enxtest. NSEC c.b.enxtest.` is its NODATA proof (RFC 7129 section 5.4).
+    # The same records under rcode 3 deny nothing (RFC 4035 section 3.1.3), and
+    # the same span is no next closer cover for `*.enxtest.` answering
+    # `x.b.enxtest.`, since `b.enxtest.` is closer (RFC 4592 section 2.2.2).
+    root = Key(".", "ent-denial-root")
+    zone = Key("enxtest.", "ent-denial-zone")
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("ex_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+    ds_set = [RR("enxtest.", DS, zone.ds())]
+    emit("ex_ds", "enxtest.", "DS", message("enxtest.", DS, ds_set + [sign(ds_set, root)]))
+    keys = [RR("enxtest.", DNSKEY, zone.rdata)]
+    emit("ex_dnskey", "enxtest.", "DNSKEY", message("enxtest.", DNSKEY, keys + [sign(keys, zone)]))
+
+    def nsec(owner, next_name, types):
+        rrset = [RR(owner, NSEC, nsec_rdata(next_name, types))]
+        return rrset + [sign(rrset, zone)]
+
+    apex = nsec("enxtest.", "*.enxtest.", [NS, SOA, RRSIG, NSEC, DNSKEY])
+    wild = nsec("*.enxtest.", "a.enxtest.", [A, RRSIG, NSEC])
+    span = nsec("a.enxtest.", "c.b.enxtest.", [A, RRSIG, NSEC])
+    tail = nsec("c.b.enxtest.", "enxtest.", [A, RRSIG, NSEC])
+    soa = [soa_rr("enxtest.")]
+    soa += [sign(soa, zone)]
+
+    emit("ex_b_ds", "b.enxtest.", "DS", message("b.enxtest.", DS, [], span + soa))
+    emit("ex_b_nodata", "b.enxtest.", "A", message("b.enxtest.", A, [], span + soa))
+    emit("ex_b_nx", "b.enxtest.", "A", message("b.enxtest.", A, [], span + soa, rcode=3))
+
+    expanded = [a_rr("x.enxtest.", "192.0.2.1")]
+    emit("ex_x_wildcard", "x.enxtest.", "A",
+         message("x.enxtest.", A, expanded + [sign(expanded, zone, labels=1)], tail))
+    emit("ex_x_ds", "x.enxtest.", "DS", message("x.enxtest.", DS, [], wild + tail + soa))
+    forged = [a_rr("x.b.enxtest.", "192.0.2.1")]
+    emit("ex_xb_wildcard", "x.b.enxtest.", "A",
+         message("x.b.enxtest.", A, forged + [sign(forged, zone, labels=1)], span))
+    emit("ex_xb_ds", "x.b.enxtest.", "DS", message("x.b.enxtest.", DS, [], tail + span + soa, rcode=3))
+
+
 def cd_cname(src, owner, target):
     """A CNAME signed by the source zone, as the `cname_denial` answers carry it."""
     rrset = [RR(owner, CNAME, wire_name(target))]
