@@ -23,6 +23,9 @@ CLIENT_TIMEOUT :: 8 * time.Second
 Query_Result :: struct {
 	wire: []u8,
 	ok:   bool,
+	// Where a UDP answer came from. The socket is unconnected, so an answer from
+	// an address other than the one asked is read, not filtered by the kernel.
+	from: net.Endpoint,
 }
 
 query_udp :: proc(
@@ -30,8 +33,9 @@ query_udp :: proc(
 	query: []u8,
 	allocator := context.allocator,
 	timeout := CLIENT_TIMEOUT,
+	address: net.Address = net.IP4_Loopback,
 ) -> Query_Result {
-	socket, err := net.make_unbound_udp_socket(.IP4)
+	socket, err := net.make_unbound_udp_socket(net.family_from_address(address))
 	if err != nil {
 		return {}
 	}
@@ -40,21 +44,21 @@ query_udp :: proc(
 	_ = net.set_option(socket, .Send_Timeout, timeout)
 
 	endpoint := net.Endpoint {
-		address = net.IP4_Loopback,
+		address = address,
 		port    = udp_port,
 	}
 	if _, serr := net.send_udp(socket, query, endpoint); serr != nil {
 		return {}
 	}
 
-	buf := make([]u8, 65535, context.temp_allocator)
-	n, _, rerr := net.recv_udp(socket, buf)
+	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
+	n, from, rerr := net.recv_udp(socket, buf)
 	if rerr != nil || n < dns.HEADER_SIZE {
 		return {}
 	}
 	out := make([]u8, n, allocator)
 	copy(out, buf[:n])
-	return Query_Result{wire = out, ok = true}
+	return Query_Result{wire = out, ok = true, from = from}
 }
 
 // Confirms the server sends nothing at all, which is the correct answer to some

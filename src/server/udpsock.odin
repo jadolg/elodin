@@ -5,7 +5,8 @@ import "core:sys/posix"
 import "elodin:logx"
 
 /*
-The two socket options the UDP listener needs and `core:net` will not set.
+Socket options the UDP listener needs and `core:net` will not set. The
+pktinfo ones are `loop.want_destination`'s, beside the code that reads them.
 
 `net.set_option` knows the name `Reuse_Port` and refuses it - the option is in
 its enum and not in the switch that implements one - and it sets

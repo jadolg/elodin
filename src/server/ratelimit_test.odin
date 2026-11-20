@@ -1319,9 +1319,9 @@ Two things a datagram's source can say that no answer could ever reach.
 Port 0 receives nothing. Our own listening endpoint is this server talking to
 itself: every answer arrives as the next query, and the loop runs at whatever
 rate the socket sustains. The wildcard bind is the case that needs care - the
-source of our own datagrams is then whichever local address the route picked,
-not the 0.0.0.0 we bound - so a source on our port from a loopback address is
-refused too.
+source of our own datagrams is then whichever local address their query was
+sent to, not the 0.0.0.0 we bound - so a source on our port from a loopback
+address is refused too.
 */
 @(test)
 test_implausible_sources_are_refused :: proc(t: ^testing.T) {

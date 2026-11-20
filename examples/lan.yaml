@@ -110,7 +110,9 @@ listeners:
     # the LAN wants and is safe because `allow_from` above is what decides who
     # is answered. If the box also has a public address, binding the LAN
     # address (192.168.1.2) is the belt to that braces - nothing is then
-    # listening on the public side at all.
+    # listening on the public side at all. Each answer leaves from the address
+    # its query was sent to, so a box with several addresses is answered at any
+    # of them.
     address: "0.0.0.0"
     port: 53
     # Left to derive: one reader - one event loop - per usable CPU, to eight. A
