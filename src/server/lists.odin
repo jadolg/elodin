@@ -369,13 +369,12 @@ cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Loa
 		}
 		return "", .Unavailable
 	}
-	data, read := read_cache_file(cache_path, context.allocator)
+	data, why, read := read_cache_file(cache_path, context.allocator)
 	if !read {
 		// There, and not read: say why, or a copy restored from a hard-link
 		// backup, or put in place as a symlink, is just "unavailable".
-		st: posix.stat_t
-		if posix.lstat(strings.clone_to_cstring(cache_path, context.temp_allocator), &st) == .OK {
-			logx.warnf("list %s: the cached copy at %s is not read: only a regular file with one link is, never a symlink or a hard link", list.name, cache_path)
+		if why != "" {
+			logx.warnf("list %s: the cached copy at %s is not read: %s", list.name, cache_path, why)
 		}
 		return "", .Unavailable
 	}
@@ -469,50 +468,87 @@ copy_is_of :: proc(list: config.Block_List, cache_path: string) -> bool {
 	if !has {
 		return false
 	}
-	data, read := read_cache_file(source_path(cache_path), context.temp_allocator)
+	data, _, read := read_cache_file(source_path(cache_path), context.temp_allocator) // lint:allow the reason is for the copy, not its fingerprint
 	return read && string(data) == src
 }
 
 // When the file at `path` was modified, if it is one `read_cache_file` reads.
 @(private)
-plain_cache_file :: proc(path: string) -> (modified: time.Time, ok: bool) {
+plain_cache_file :: proc(path: string, owner := cache_owner) -> (modified: time.Time, ok: bool) {
 	st: posix.stat_t
 	if posix.lstat(strings.clone_to_cstring(path, context.temp_allocator), &st) != .OK {
 		return {}, false
 	}
-	if !posix.S_ISREG(st.st_mode) || st.st_nlink != 1 {
+	if cache_refusal(st, owner) != "" {
 		return {}, false
 	}
 	return time.unix(i64(st.st_mtim.tv_sec), i64(st.st_mtim.tv_nsec)), true
 }
 
 /*
-Read a file of the list cache, if it is a regular file with a single link and
-its name is not a symlink. The directory is the service account's, and a root
-start reads it before the drop (#688): a symlink or a hard link there to a file
-only root can read would load that file as a list. O_NONBLOCK so a FIFO put
-there does not hold the start.
+Read a file of the list cache, if `cache_refusal` takes it and its name is not a
+symlink. The directory is the service account's, and a root start reads it
+before the drop (#688): a link there to a file only root can read would load
+that file as a list. O_NONBLOCK so a FIFO put there does not hold the start.
+`why` says why a file that is there was not read, and is empty for one that is
+not there.
 */
 @(private)
-read_cache_file :: proc(path: string, allocator := context.allocator) -> (data: []byte, ok: bool) {
+read_cache_file :: proc(path: string, allocator := context.allocator, owner := cache_owner) -> (data: []byte, why: string, ok: bool) {
 	fd := posix.open(strings.clone_to_cstring(path, context.temp_allocator), {.NOFOLLOW, .NONBLOCK, .CLOEXEC})
 	if fd == -1 {
-		return nil, false
+		errno := posix.errno()
+		#partial switch errno {
+		case .ENOENT:
+			return nil, "", false
+		case .ELOOP:
+			return nil, "it is a symlink", false
+		}
+		return nil, fmt.tprintf("it cannot be opened (%v)", errno), false
 	}
 	st: posix.stat_t
-	if posix.fstat(fd, &st) != .OK || !posix.S_ISREG(st.st_mode) || st.st_nlink != 1 {
+	if posix.fstat(fd, &st) != .OK {
 		posix.close(fd)
-		return nil, false
+		return nil, "it cannot be read", false
+	}
+	if refusal := cache_refusal(st, owner); refusal != "" {
+		posix.close(fd)
+		return nil, refusal, false
 	}
 	// `os` closes the descriptor with the file.
 	f := os.new_file(uintptr(fd), path)
 	if f == nil {
 		posix.close(fd)
-		return nil, false
+		return nil, "it cannot be read", false
 	}
 	defer os.close(f)
 	bytes, err := os.read_entire_file_from_file(f, allocator)
-	return bytes, err == nil
+	if err != nil {
+		return nil, fmt.tprintf("it cannot be read (%v)", err), false
+	}
+	return bytes, "", true
+}
+
+/*
+Why a file in the list cache is not one of its copies, or "" for one that is: a
+regular file, with one link, belonging to whoever the copies are written for -
+`owner` when set, the process otherwise. A hard link is the file it links to,
+and one whose other name was replaced since has a single link left, but it is
+still its owner's, not the copies' (#688).
+*/
+@(private)
+cache_refusal :: proc(st: posix.stat_t, owner: Cache_Owner) -> string {
+	if !posix.S_ISREG(st.st_mode) {
+		return "it is not a regular file"
+	}
+	if st.st_nlink != 1 {
+		return "it is a hard link"
+	}
+	want := owner.uid if owner.set else posix.geteuid()
+	if st.st_uid != want {
+		return fmt.tprintf("it belongs to uid %d, not %d", st.st_uid, want)
+	}
+	return ""
 }
 
 @(private)
@@ -598,7 +634,9 @@ write_cache_file :: proc(path: string, body: []byte, owner := cache_owner) -> (e
 	}
 	// Given to the account through the descriptor that created it, so it is
 	// this copy and nothing else that changes owner; see `privdrop.hand_over`.
-	if owner.set && posix.fchown(posix.FD(os.fd(f)), owner.uid, owner.gid) != .OK {
+	// Only while still root: after the drop the account writes its own, and
+	// the strict sandbox does not allow `fchown`.
+	if owner.set && posix.geteuid() == 0 && posix.fchown(posix.FD(os.fd(f)), owner.uid, owner.gid) != .OK {
 		err = os.Platform_Error(posix.errno())
 		os.close(f)
 		os.remove(tmp)

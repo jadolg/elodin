@@ -280,10 +280,11 @@ process. A misspelt account name fails `--check`; running as root with no
 process, since a refresh hours later has to write there: the directory itself,
 and each list elodin caches as it writes it. Nothing else in the directory
 changes owner, since a chown as root of a hard link the account put there would
-hand over the file it links to, wherever that file is. For the same reason the
-cached lists are written and read only as plain files, never through a symlink
-or a hard link; a copy that is either is not read (the log says so) and is
-downloaded again. A `cache_dir` that is itself a symlink is not followed, and so
+hand over the file it links to, wherever that file is. For the same reason a
+cached list is read only as a plain file with one link that belongs to the
+account, never through a symlink; any other is not read (the log says why) and
+is downloaded again. A copy an earlier version cached as root is one of those,
+once. A `cache_dir` that is itself a symlink is not followed, and so
 not handed over: name the directory it points at. Started this way, elodin
 downloads and parses the blocklists before it binds, so that much happens as
 root; the first arrangement avoids it.

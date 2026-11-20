@@ -1007,7 +1007,7 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 		handed := privdrop.hand_over(cfg.blocking.cache_dir, service)
 		if !handed && is_symlink(cfg.blocking.cache_dir) {
 			logx.warnf(
-				"blocking.cache_dir %q is a symlink, which is not followed when it is given to %s; name the directory it points at, or the lists will be re-downloaded on each start",
+				"blocking.cache_dir %q is a symlink, which is not followed when it is given to %s; name the directory it points at, or the refreshes after the drop cannot update the cached lists",
 				cfg.blocking.cache_dir,
 				cfg.server.user,
 			)

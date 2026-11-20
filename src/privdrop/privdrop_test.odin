@@ -152,7 +152,7 @@ test_apply_refuses_what_it_cannot_do :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_hand_over_covers_the_directory_and_its_entries :: proc(t: ^testing.T) {
+test_hand_over_to_its_own_owner_and_not_to_root :: proc(t: ^testing.T) {
 	dir, ok := scratch_dir(t, "elodin-privdrop-test")
 	if !ok {
 		return

@@ -5,6 +5,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:sys/posix"
+import "elodin:dns"
 
 /*
 Issue #688: started as root with `server.user` set, elodin hands the blocklist
@@ -27,6 +28,7 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 	http_port := next_port(r)
 	http := http_mock_make(http_port)
 	http_mock_serve(http, "/hosts.txt", "0.0.0.0 cached.test\n")
+	http_mock_serve(http, "/later.txt", "0.0.0.0 later.test\n")
 	http_ok := http_mock_start(http)
 	defer http_mock_stop(http)
 	if !http_ok {
@@ -91,5 +93,27 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 			}
 		}
 		check(r, own > 0, "elodin cached nothing in %s", cache_dir)
+	}
+
+	/*
+	A download after the drop, under the suite's strict sandbox: the account
+	writes its own copy, so nothing calls `fchown`, which the sandbox kills the
+	process for.
+	*/
+	later := base_config(
+		udp_port,
+		upstream_at(next_port(r)),
+		log = "{ level: info }",
+		blocking = fmt.tprintf(
+			`{{ enabled: true, cache_dir: %q, lists: ["http://127.0.0.1:%d/hosts.txt", "http://127.0.0.1:%d/later.txt"] }}`,
+			cache_dir,
+			http_port,
+			http_port,
+		),
+		extra = "server: { user: nobody }",
+	)
+	if check(r, reload_to(r, &srv, later, "later.txt: 1 rules"), "the reload never downloaded the second list:\n%s", read_log(&srv)) {
+		res := query_udp(udp_port, build_query("later.test.", u16(dns.Type.A)))
+		check(r, res.ok, "no answer after a download as the account; log:\n%s", read_log(&srv))
 	}
 }

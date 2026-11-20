@@ -837,8 +837,28 @@ test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
 	if !testing.expect(t, posix.mkfifo(strings.clone_to_cstring(path, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {
 		return
 	}
-	_, fifo_read := read_cache_file(path, context.temp_allocator)
-	testing.expect(t, !fifo_read, "a FIFO was read as a cached copy")
+	_, fifo_why, fifo_read := read_cache_file(path, context.temp_allocator)
+	testing.expectf(t, !fifo_read && fifo_why == "it is not a regular file", "a FIFO was read as a cached copy: %v %q", fifo_read, fifo_why)
+
+	// A plain file with one link that belongs to someone other than the
+	// copies' owner: a hard link whose other name was replaced since looks
+	// just so, and is not read, nor fresh.
+	testing.expect_value(t, os.remove(path), nil)
+	testing.expect(t, os.write_entire_file(path, "0.0.0.0 mine.example\n") == nil)
+	other := Cache_Owner {
+		uid = posix.geteuid() + 1,
+		gid = posix.getegid(),
+		set = true,
+	}
+	_, owner_why, owner_read := read_cache_file(path, context.temp_allocator, other)
+	testing.expectf(t, !owner_read && strings.has_prefix(owner_why, "it belongs to uid"), "another uid's copy was read: %v %q", owner_read, owner_why)
+	_, fresh_for_other := plain_cache_file(path, other)
+	testing.expect(t, !fresh_for_other, "another uid's copy read as fresh")
+	// The premise: the same file, for its own owner, is read and fresh.
+	mine, mine_why, mine_read := read_cache_file(path, context.temp_allocator)
+	testing.expectf(t, mine_read && string(mine) == "0.0.0.0 mine.example\n", "the process's own copy was not read: %q", mine_why)
+	_, fresh_for_self := plain_cache_file(path)
+	testing.expect(t, fresh_for_self, "the process's own copy did not read as fresh")
 
 	// A fingerprint that is a link: the copy of a url with a query is the one
 	// whose fingerprint matches, and a linked one is not read to match it.
