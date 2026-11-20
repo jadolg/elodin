@@ -6,6 +6,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:sync"
+import "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
 import "elodin:config"
@@ -507,22 +508,24 @@ that is not there.
 */
 @(private)
 read_cache_file :: proc(path: string, allocator := context.allocator, owner := cache_owner) -> (data: []byte, why: string, ok: bool) {
-	flags := posix.O_Flags{.NONBLOCK, .CLOEXEC}
+	// `core:sys/linux`'s flags, not `core:sys/posix`'s: those are the x86
+	// values on every architecture, and arm64's O_NOFOLLOW is another bit.
+	flags := linux.Open_Flags{.NONBLOCK, .CLOEXEC}
 	if owner.set {
 		flags += {.NOFOLLOW}
 	}
-	fd := posix.open(strings.clone_to_cstring(path, context.temp_allocator), flags)
-	if fd == -1 {
-		errno := posix.errno()
-		#partial switch errno {
-		case .ENOENT:
-			return nil, "", false
-		case .ELOOP:
-			return nil, "it is a symlink", false
-		}
+	lfd, errno := linux.open(strings.clone_to_cstring(path, context.temp_allocator), flags)
+	#partial switch errno {
+	case .NONE:
+	case .ENOENT:
+		return nil, "", false
+	case .ELOOP:
+		return nil, "it is a symlink", false
+	case:
 		return nil, fmt.tprintf("it cannot be opened (%v)", errno), false
 	}
-	defer posix.close(fd)
+	defer linux.close(lfd)
+	fd := posix.FD(lfd)
 	st: posix.stat_t
 	if posix.fstat(fd, &st) != .OK {
 		return nil, "it cannot be read", false

@@ -20,6 +20,7 @@ package privdrop
 
 import "core:c"
 import "core:strings"
+import "core:sys/linux"
 import "core:sys/posix"
 import "elodin:netx"
 
@@ -330,12 +331,14 @@ hand_over :: proc(path: string, id: Identity) -> bool {
 	if posix.lstat(cpath, &st) != .OK && posix.errno() == .ENOENT {
 		return true
 	}
-	dir := posix.open(cpath, {.DIRECTORY, .NOFOLLOW, .CLOEXEC})
-	if dir == -1 {
+	// `core:sys/linux`'s flags, not `core:sys/posix`'s, which are the x86
+	// values on every architecture: on arm64 they ask for O_DIRECT instead.
+	dir, oerr := linux.open(cpath, {.DIRECTORY, .NOFOLLOW, .CLOEXEC})
+	if oerr != .NONE {
 		return false
 	}
-	defer posix.close(dir)
-	return posix.fchown(dir, id.uid, id.gid) == .OK
+	defer linux.close(dir)
+	return linux.fchown(dir, linux.Uid(id.uid), linux.Gid(id.gid)) == .NONE
 }
 
 /*
