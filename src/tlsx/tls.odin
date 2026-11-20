@@ -23,6 +23,9 @@ Error :: enum u8 {
 	Timeout,
 	IO_Error,
 	Alpn_Failed,
+	// The host's OpenSSL policy leaves no version and suite this server will
+	// use; see `hold_to_floor`.
+	No_Suite,
 }
 
 Context :: struct {
@@ -418,9 +421,9 @@ client_context :: proc(
 	ctx: ^Context,
 	err: Error,
 ) {
-	ptr := new_ssl_ctx(server = false)
-	if ptr == nil {
-		return nil, .Context_Failed
+	ptr, perr := new_ssl_ctx(server = false)
+	if perr != .None {
+		return nil, perr
 	}
 	ok := false
 	defer if !ok {
@@ -462,7 +465,8 @@ client_context :: proc(
 }
 
 /*
-A fresh `SSL_CTX` for either end, held to TLS 1.2 or later, or nil.
+A fresh `SSL_CTX` for either end, held to `hold_to_floor`, or the reason there
+is none. A server picks the suite by its own order.
 
 Idle connections hand their record buffers back. Without the mode OpenSSL keeps
 its record buffers, ~17 KB each, for the connection's whole life; with it a
@@ -474,19 +478,180 @@ sent. Measured on 1,000 idle DoT and DoH/2 connections it saves ~20 KB each
 Pooled upstream connections sit idle too, so the client sets it as well.
 */
 @(private)
-new_ssl_ctx :: proc(server: bool) -> ^SSL_CTX {
+new_ssl_ctx :: proc(server: bool) -> (^SSL_CTX, Error) {
 	init()
 	ptr := SSL_CTX_new(TLS_server_method() if server else TLS_client_method())
 	if ptr == nil {
-		return nil
+		return nil, .Context_Failed
 	}
-	if !ssl_ctx_set_min_proto_version(ptr, TLS1_2_VERSION) {
+	if err := hold_to_floor(ptr); err != .None {
 		SSL_CTX_free(ptr)
-		return nil
+		return nil, err
+	}
+	if err := order_tls13(ptr); err != .None {
+		SSL_CTX_free(ptr)
+		return nil, err
+	}
+	if server {
+		// RFC 9325 section 4.2 asks a server to prefer the suites above; a
+		// client that puts ChaCha20 first, as one without AES instructions
+		// does, keeps it.
+		SSL_CTX_set_options(ptr, SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_PRIORITIZE_CHACHA)
 	}
 	ssl_ctx_set_mode(ptr, SSL_MODE_RELEASE_BUFFERS)
-	return ptr
+	return ptr, .None
 }
+
+/*
+Hold a context to TLS 1.2 or later and, over TLS 1.2, to `TLS12_CIPHERS`, only
+ever narrowing what it already allows: a host policy stricter than either (a
+dynamic build's `openssl.cnf`, with `MinProtocol` or `CipherString`) stays as
+strict. A policy that leaves none of the suites leaves TLS 1.3 alone.
+
+A context left able to speak nothing - no TLS 1.2 suite of ours between its
+floor and ceiling, and no TLS 1.3 suite below its ceiling - is `No_Suite`, so it
+is refused where it is built rather than every handshake failing later. Read
+before any certificate is loaded: a policy whose only suites need a key the
+certificate does not have still fails at the handshake.
+`Context_Failed` when OpenSSL refuses a setting.
+*/
+@(private)
+hold_to_floor :: proc(ptr: ^SSL_CTX) -> Error {
+	if ssl_ctx_get_min_proto_version(ptr) < TLS1_2_VERSION && !ssl_ctx_set_min_proto_version(ptr, TLS1_2_VERSION) {
+		return .Context_Failed
+	}
+	allowed := SSL_CTX_get_ciphers(ptr)
+	kept: [len(TLS12_CIPHERS) + 1]u8
+	n := 0
+	names := TLS12_CIPHERS
+	for name in strings.split_iterator(&names, ":") {
+		if !cipher_listed(allowed, name) {
+			continue
+		}
+		if n > 0 {
+			kept[n] = ':'
+			n += 1
+		}
+		n += copy(kept[n:], name)
+	}
+	// 0 is no ceiling.
+	ceiling := ssl_ctx_get_max_proto_version(ptr)
+	below := proc(ceiling, version: c.long) -> bool {
+		return ceiling != 0 && ceiling < version
+	}
+	tls12 := n > 0 && ssl_ctx_get_min_proto_version(ptr) <= TLS1_2_VERSION && !below(ceiling, TLS1_2_VERSION)
+	tls13 := !below(ceiling, TLS1_3_VERSION) && lists_tls13(allowed)
+	if !tls12 && !tls13 {
+		return .No_Suite
+	}
+	if n == 0 {
+		return .None if ssl_ctx_set_min_proto_version(ptr, TLS1_3_VERSION) else .Context_Failed
+	}
+	return .None if SSL_CTX_set_cipher_list(ptr, cstring(&kept[0])) == 1 else .Context_Failed
+}
+
+// Whether `stack`, a context's cipher list, holds any TLS 1.3 suite.
+@(private = "file")
+lists_tls13 :: proc(stack: ^OPENSSL_STACK) -> bool {
+	if stack == nil {
+		return false
+	}
+	for i in 0 ..< OPENSSL_sk_num(stack) {
+		if is_tls13_name(string(SSL_CIPHER_get_name((^SSL_CIPHER)(OPENSSL_sk_value(stack, i))))) {
+			return true
+		}
+	}
+	return false
+}
+
+// OpenSSL names its TLS 1.3 suites by their RFC 8446 names, and only those
+// start so.
+@(private = "file")
+is_tls13_name :: proc(name: string) -> bool {
+	return strings.has_prefix(name, "TLS_")
+}
+
+/*
+Put the TLS 1.3 suites a context allows in `TLS13_FIRST`'s order, then any
+others it allows in their own, so a server picking by its order (`new_ssl_ctx`)
+lands on AES-128-GCM as it does over TLS 1.2. Only reorders: a suite the
+context does not allow, a host policy's `Ciphersuites` having left it out,
+stays out. Nothing to do for a context with no TLS 1.3.
+*/
+@(private)
+order_tls13 :: proc(ptr: ^SSL_CTX) -> Error {
+	allowed := SSL_CTX_get_ciphers(ptr)
+	// Room for every TLS 1.3 suite OpenSSL has and its separators.
+	order: [256]u8
+	n := 0
+	put := proc(order: []u8, n: ^int, name: string) -> bool {
+		if n^ + len(name) + 1 >= len(order) {
+			return false
+		}
+		if n^ > 0 {
+			order[n^] = ':'
+			n^ += 1
+		}
+		n^ += copy(order[n^:], name)
+		return true
+	}
+	names := TLS13_FIRST
+	for name in strings.split_iterator(&names, ":") {
+		if cipher_listed(allowed, name) && !put(order[:], &n, name) {
+			return .Context_Failed
+		}
+	}
+	if allowed != nil {
+		for i in 0 ..< OPENSSL_sk_num(allowed) {
+			name := string(SSL_CIPHER_get_name((^SSL_CIPHER)(OPENSSL_sk_value(allowed, i))))
+			if !is_tls13_name(name) || strings.contains(TLS13_FIRST, name) {
+				continue
+			}
+			if !put(order[:], &n, name) {
+				return .Context_Failed
+			}
+		}
+	}
+	if n == 0 {
+		return .None
+	}
+	return .None if SSL_CTX_set_ciphersuites(ptr, cstring(&order[0])) == 1 else .Context_Failed
+}
+
+// Whether `stack`, a context's cipher list, holds the suite named `name`.
+@(private = "file")
+cipher_listed :: proc(stack: ^OPENSSL_STACK, name: string) -> bool {
+	if stack == nil {
+		return false
+	}
+	for i in 0 ..< OPENSSL_sk_num(stack) {
+		if string(SSL_CIPHER_get_name((^SSL_CIPHER)(OPENSSL_sk_value(stack, i)))) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// The TLS 1.3 suites first in a context's order; see `order_tls13`.
+@(private)
+TLS13_FIRST :: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"
+
+// Why a `No_Suite` context is refused, as `describe_error` says it.
+@(private)
+NO_SUITE_REASON :: "the host's OpenSSL policy (openssl.cnf) leaves no TLS this server will speak: none of its TLS 1.2 suites (ECDHE with AES-GCM or ChaCha20-Poly1305) within the version bounds, and no TLS 1.3 suite"
+
+/*
+The TLS 1.2 suites either end offers: ECDHE key exchange and an AEAD cipher,
+RFC 9325 section 4.2's four in its order and then ChaCha20-Poly1305. No static
+RSA, which gives no forward secrecy (RFC 9325 section 4.1), and no CBC, which
+RFC 9113 Appendix A forbids for HTTP/2 and RFC 8310 section 9 holds DoT to BCP
+195 for. TLS 1.3's suites are all of that shape already; `order_tls13` orders
+them.
+*/
+@(private)
+TLS12_CIPHERS :: "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:" +
+	"ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:" +
+	"ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"
 
 /*
 Pick a protocol, server preference first.
@@ -559,9 +724,9 @@ server_context :: proc(
 	ctx: ^Context,
 	err: Error,
 ) {
-	ptr := new_ssl_ctx(server = true)
-	if ptr == nil {
-		return nil, .Context_Failed
+	ptr, perr := new_ssl_ctx(server = true)
+	if perr != .None {
+		return nil, perr
 	}
 	ok := false
 	defer if !ok {
@@ -1108,6 +1273,8 @@ alpn_protocol :: proc(conn: ^Conn) -> string {
 
 describe_error :: proc(err: Error, allocator := context.allocator) -> string {
 	#partial switch err {
+	case .No_Suite:
+		return fmt.aprintf("%v: %s", err, NO_SUITE_REASON, allocator = allocator)
 	case .Handshake_Failed, .Certificate_Failed, .Context_Failed:
 		detail := last_error(context.temp_allocator)
 		return fmt.aprintf("%v: %s", err, detail, allocator = allocator)

@@ -63,6 +63,7 @@ ASN1_TIME :: struct {}
 // STACK_OF(X509). OpenSSL's stacks are one implementation behind per-type
 // macros, so there is a single opaque type here rather than one per element.
 OPENSSL_STACK :: struct {}
+SSL_CIPHER :: struct {}
 
 OPENSSL_INIT_LOAD_SSL_STRINGS :: 0x0020_0000
 OPENSSL_INIT_LOAD_CRYPTO_STRINGS :: 0x0000_0002
@@ -89,6 +90,8 @@ SSL_CTRL_SET_TLSEXT_HOSTNAME :: 55
 SSL_CTRL_GET_CHAIN_CERTS :: 115
 SSL_CTRL_SET_MIN_PROTO_VERSION :: 123
 SSL_CTRL_SET_MAX_PROTO_VERSION :: 124
+SSL_CTRL_GET_MIN_PROTO_VERSION :: 130
+SSL_CTRL_GET_MAX_PROTO_VERSION :: 131
 
 SSL_MODE_RELEASE_BUFFERS :: 0x10
 
@@ -118,6 +121,8 @@ CMS_NOSMIMECAP :: 0x200
 TLSEXT_NAMETYPE_host_name :: 0
 
 SSL_OP_NO_TICKET :: u64(1) << 14
+SSL_OP_PRIORITIZE_CHACHA :: u64(1) << 21
+SSL_OP_CIPHER_SERVER_PREFERENCE :: u64(1) << 22
 
 SSL_SESS_CACHE_OFF :: 0x0000
 SSL_SESS_CACHE_SERVER :: 0x0002
@@ -208,6 +213,11 @@ foreign libssl {
 	SSL_session_reused :: proc(ssl: ^SSL) -> c.int ---
 	SSL_version :: proc(ssl: ^SSL) -> c.int ---
 	SSL_CTX_set_options :: proc(ctx: ^SSL_CTX, op: u64) -> u64 ---
+	SSL_CTX_set_cipher_list :: proc(ctx: ^SSL_CTX, list: cstring) -> c.int ---
+	SSL_CTX_set_ciphersuites :: proc(ctx: ^SSL_CTX, list: cstring) -> c.int ---
+	SSL_CTX_get_ciphers :: proc(ctx: ^SSL_CTX) -> ^OPENSSL_STACK ---
+	SSL_CTX_get_options :: proc(ctx: ^SSL_CTX) -> u64 ---
+	SSL_CIPHER_get_name :: proc(cipher: ^SSL_CIPHER) -> cstring ---
 	SSL_SESSION_get0_ticket :: proc(s: ^SSL_SESSION, tick: ^[^]u8, len: ^c.size_t) ---
 
 	// The material a context was loaded with, borrowed back out of it. `get0`
@@ -257,6 +267,8 @@ foreign libcrypto {
 	EVP_PKEY_up_ref :: proc(pkey: ^EVP_PKEY) -> c.int ---
 
 	OPENSSL_sk_pop_free :: proc(st: ^OPENSSL_STACK, free_func: rawptr) ---
+	OPENSSL_sk_num :: proc(st: ^OPENSSL_STACK) -> c.int ---
+	OPENSSL_sk_value :: proc(st: ^OPENSSL_STACK, i: c.int) -> rawptr ---
 
 	BIO_new :: proc(type: ^BIO_METHOD) -> ^BIO ---
 	BIO_new_mem_buf :: proc(buf: rawptr, len: c.int) -> ^BIO ---
@@ -274,6 +286,14 @@ foreign libcrypto {
 
 ssl_ctx_set_min_proto_version :: proc(ctx: ^SSL_CTX, version: c.long) -> bool {
 	return SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, version, nil) == 1
+}
+
+ssl_ctx_get_min_proto_version :: proc(ctx: ^SSL_CTX) -> c.long {
+	return SSL_CTX_ctrl(ctx, SSL_CTRL_GET_MIN_PROTO_VERSION, 0, nil)
+}
+
+ssl_ctx_get_max_proto_version :: proc(ctx: ^SSL_CTX) -> c.long {
+	return SSL_CTX_ctrl(ctx, SSL_CTRL_GET_MAX_PROTO_VERSION, 0, nil)
 }
 
 ssl_ctx_set_max_proto_version :: proc(ctx: ^SSL_CTX, version: c.long) -> bool {

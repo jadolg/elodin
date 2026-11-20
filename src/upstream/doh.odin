@@ -7,6 +7,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:h2"
+import "elodin:logx"
 import "elodin:loop"
 import "elodin:netx"
 import "elodin:tlsx"
@@ -380,6 +381,7 @@ fetch_url :: proc(
 		if scheme == "https" {
 			ctx, terr := tlsx.client_context(true, "", []string{"http/1.1"}, context.temp_allocator)
 			if terr != .None {
+				logx.warnf("fetch %s: cannot create TLS context: %s", host_only, tlsx.describe_error(terr, context.temp_allocator))
 				return nil, .TLS_Failed
 			}
 			tls_ctx = ctx
