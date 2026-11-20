@@ -605,3 +605,93 @@ test_a_root_referral_that_drops_glue_is_truncated :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+An additional RRset that does not fit whole is left out whole, with TC clear
+(RFC 2181 section 9: "the entire RRSet that will not fit in the response should
+be omitted, and the reply sent as is, with the TC bit clear"). Not the records
+of it that happened to fit ahead of the one that overflowed: a client or a cache
+reading two of a name's three addresses has no way to know there was a third.
+An RRset is the run of records with one owner, type and class.
+*/
+@(test)
+test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing.T) {
+	mail := proc(last: u8) -> Record {
+		return address("mail.example.com.", last)
+	}
+	other := address("other.example.com.", 9)
+	// One TXT RRset: a short record, one past the room, and a short one again,
+	// which would fit where the long one was taken back to.
+	txt := proc(text: string) -> Record {
+		strs := make([]string, 1, context.temp_allocator)
+		strs[0] = text
+		return Record{name = QNAME, type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = strs}}
+	}
+	cases := []struct {
+		name:      string,
+		// The additional section, and the one whose size is the room.
+		whole:     []Record,
+		fits:      []Record,
+		// What goes out, by owner and last address byte.
+		kept:      []Record,
+		with_opt:  bool,
+	} {
+		{name = "two of one RRset, room for one", whole = {mail(1), mail(2)}, fits = {mail(1)}, kept = {}},
+		{
+			name = "an RRset that fit, then one that straddles the room",
+			whole = {other, mail(1), mail(2)},
+			fits = {other, mail(1)},
+			kept = {other},
+		},
+		{
+			name = "an RRset that will not fit, then a smaller one that does",
+			whole = {mail(1), mail(2), mail(3), other},
+			fits = {mail(1), other},
+			kept = {other},
+		},
+		{
+			name = "the rest of an RRset that will not fit, short enough to",
+			whole = {txt("a"), big_txt(), txt("b"), other},
+			fits = {txt("a"), txt("b"), other},
+			kept = {other},
+		},
+		{
+			name = "another type at the same owner is another RRset",
+			whole = {address(QNAME, 7), big_txt()},
+			fits = {address(QNAME, 7)},
+			kept = {address(QNAME, 7)},
+		},
+		{
+			name = "an RRset that will not fit ahead of the OPT record",
+			whole = opt_records(before = []Record{mail(1), mail(2)}),
+			fits = opt_records(before = []Record{mail(1)}),
+			kept = {},
+			with_opt = true,
+		},
+	}
+	for c in cases {
+		room := encoded_size(t, message_with(c.fits))
+		got, truncated := encode_within(t, message_with(c.whole), room)
+		testing.expectf(t, !truncated && !got.flags.tc, "%s: TC set for additional data", c.name)
+		testing.expectf(t, len(got.answer) == 2, "%s: %d answer records", c.name, len(got.answer))
+		addresses := 0
+		for rec in got.additional {
+			if rec.type == .A {
+				addresses += 1
+			}
+		}
+		testing.expectf(t, addresses == len(c.kept), "%s: %d address records went out, want %d: %v", c.name, addresses, len(c.kept), got.additional)
+		for rec in got.additional {
+			testing.expectf(t, rec.type != .TXT, "%s: part of the TXT RRset went out: %v", c.name, got.additional)
+		}
+		for want in c.kept {
+			found := false
+			for rec in got.additional {
+				found ||= rec.type == .A && name_equal_fold(rec.name, want.name)
+			}
+			testing.expectf(t, found, "%s: %s was left out", c.name, want.name)
+		}
+		testing.expectf(t, edns_present(got) == c.with_opt, "%s: the OPT record is %v, want %v", c.name, edns_present(got), c.with_opt)
+	}
+	free_all(context.temp_allocator)
+}

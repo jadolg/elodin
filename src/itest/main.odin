@@ -277,6 +277,7 @@ main :: proc() {
 
 	section(&r, "udp readers")
 	run_udp_reader_cases(&r)
+	run_additional_rrset_cases(&r)
 	run_udp_source_cases(&r)
 	run_pinning_cases(&r)
 

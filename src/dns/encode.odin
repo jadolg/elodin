@@ -413,6 +413,13 @@ w_readd_opt :: proc(
 	return false, .None
 }
 
+// Whether two records are of one RRset: one owner, type and class (RFC 2181
+// section 5).
+@(private)
+same_rrset :: proc(a, b: Record) -> bool {
+	return a.type == b.type && a.class == b.class && name_equal_fold(a.name, b.name)
+}
+
 /*
 Whether a record left out of the additional section is glue a referral cannot be
 read without (RFC 9471 section 3.3).
@@ -478,7 +485,9 @@ fit and to ask again over TCP. So a record dropped from those two sections sets
 `truncated` and the TC bit, and a record dropped from the additional section
 does not - a responder that could not fit a glue address or an OPT record behind
 a complete answer has answered the question, and a client sent to TCP over it
-gets the same records one round trip later.
+gets the same records one round trip later. What the additional section drops
+is a whole RRset (section 9 again): the records of it already written go with
+the one that overflowed, so no RRset goes out in part.
 
 The OPT record is re-appended after a cut so the client still sees our EDNS
 parameters, and the additional section keeps its room as it fills rather than
@@ -576,8 +585,21 @@ encode_message :: proc(
 	// is the message's own. See the skip below.
 	opt_seen := false
 
+	/*
+	Where the additional section's current RRset began, and the count there: an
+	RRset that will not fit is left out whole (RFC 2181 section 9), so a record
+	that overflows takes the ones of its RRset already written with it. An
+	RRset is the run of records with one owner, type and class; `run_start` is
+	nil before the section's first record. `skipping` is the RRset left out,
+	whose remaining records are passed over.
+	*/
+	run_start: ^Record
+	run_mark := 0
+	run_count: u16
+	skipping: ^Record
+
 	outer: for section, si in sections {
-		for rec in section {
+		for rec, ri in section {
 			/*
 			One OPT record per message (RFC 6891 section 6.1.1), and it is the
 			first: the record `find_opt` reads, `opt_wire_len` measures and
@@ -591,6 +613,17 @@ encode_message :: proc(
 					continue
 				}
 				opt_seen = true
+			}
+			if si == 2 {
+				if skipping != nil && same_rrset(skipping^, rec) {
+					continue
+				}
+				skipping = nil
+				if run_start == nil || !same_rrset(run_start^, rec) {
+					run_start = &sections[si][ri]
+					run_mark = len(w.buf)
+					run_count = counts[si]
+				}
 			}
 			/*
 			The additional section keeps the OPT record's room as it fills.
@@ -648,6 +681,11 @@ encode_message :: proc(
 					clear(&w.comp)
 					w.compress = false
 				}
+				// The whole RRset, not this record alone: back to where it
+				// began, and past the rest of it.
+				resize(&w.buf, run_mark)
+				counts[si] = run_count
+				skipping = run_start
 				continue
 			}
 			counts[si] += 1
