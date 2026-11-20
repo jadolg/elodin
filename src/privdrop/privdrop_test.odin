@@ -278,7 +278,7 @@ test_hand_over_follows_no_symlinked_directory :: proc(t: ^testing.T) {
 		gid  = posix.getegid(),
 		name = "self",
 	}
-	for path in ([]string{link, fmt.tprintf("%s/", link)}) {
+	for path in ([]string{link, fmt.tprintf("%s/", link), fmt.tprintf("%s/.", link)}) {
 		testing.expectf(t, !hand_over(path, self), "%q, a symlink, was followed", path)
 	}
 	// The premise: the directory itself, named, is handed over.

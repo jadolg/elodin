@@ -19,6 +19,7 @@ is that account is narrowed further by `sandbox`.
 package privdrop
 
 import "core:c"
+import "core:path/filepath"
 import "core:strings"
 import "core:sys/posix"
 import "elodin:netx"
@@ -302,10 +303,14 @@ hand_over :: proc(path: string, id: Identity) -> bool {
 	if path == "" {
 		return true
 	}
-	// Without its trailing slashes: with one, the kernel resolves a symlink at
-	// the last component before O_NOFOLLOW is looked at.
-	trimmed := strings.trim_right(path, "/")
-	cpath := strings.clone_to_cstring(trimmed if trimmed != "" else path, context.temp_allocator)
+	// Cleaned of trailing slashes and `.`: with either, the kernel resolves a
+	// symlink at what reads as the last component before O_NOFOLLOW is looked
+	// at.
+	cleaned, cerr := filepath.clean(path, context.temp_allocator)
+	if cerr != nil {
+		return false
+	}
+	cpath := strings.clone_to_cstring(cleaned, context.temp_allocator)
 	// Missing by its own name, not by a link's target: a dangling symlink is
 	// there, and is refused below.
 	st: posix.stat_t

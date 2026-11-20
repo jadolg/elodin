@@ -848,10 +848,13 @@ test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
 		testing.expectf(t, !fifo_read && fifo_why == "it is not a regular file", "a FIFO was read (owner set %v): %q", owner.set, fifo_why)
 	}
 
-	// The cached copy as the list loads it, with no owner: what the log says
-	// for a copy it refuses.
-	testing.expect_value(t, os.remove(path), nil)
+	// The list loads no copy that is refused - the FIFO, still in place - nor
+	// one that is missing.
 	text, load := cached_copy(&cfg, list, .Stale)
+	testing.expectf(t, load == .Unavailable && text == "", "a refused copy loaded: %v %q", load, text)
+	delete(text)
+	testing.expect_value(t, os.remove(path), nil)
+	text, load = cached_copy(&cfg, list, .Stale)
 	testing.expectf(t, load == .Unavailable && text == "", "a missing copy loaded: %v %q", load, text)
 	delete(text)
 }

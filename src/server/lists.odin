@@ -713,6 +713,16 @@ set_cache_owner :: proc(uid: posix.uid_t, gid: posix.gid_t) {
 	cache_owner = {uid = uid, gid = gid, set = true}
 }
 
+/*
+Forget the cache owner, once the process has become it: from then on it writes
+copies that are its own and reads nothing through a link that it could not by
+name, so its own copies are read however they are linked or owned. Called after
+the drop, before anything else reads the cache.
+*/
+clear_cache_owner :: proc() {
+	cache_owner = {}
+}
+
 @(private)
 list_cache_path :: proc(cfg: ^config.Config, list: config.Block_List) -> string {
 	joined, _ := filepath.join({cfg.blocking.cache_dir, config.list_cache_file(list)}, context.temp_allocator)

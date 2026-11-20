@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:mem/virtual"
 import "core:os"
+import "core:path/filepath"
 import "core:strings"
 import "core:sync"
 import "core:sys/posix"
@@ -855,7 +856,8 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	// A root start downloads the lists before the drop; each copy it caches is
 	// the account's as it is written, so the refreshes after the drop can
 	// replace it (see `privdrop.hand_over`).
-	if privdrop.is_root() && service.uid != 0 {
+	// The writer gives copies away only while euid is 0; see `write_cache_file`.
+	if posix.geteuid() == 0 && service.uid != 0 {
 		server.set_cache_owner(service.uid, service.gid)
 	}
 	if cfg.blocking.enabled {
@@ -1024,6 +1026,7 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 		logx.errorf("cannot drop privileges to %s: %s", cfg.server.user, privdrop.explain(err))
 		os.exit(1)
 	}
+	server.clear_cache_owner()
 	logx.infof("running as %s (uid=%d gid=%d)", cfg.server.user, service.uid, service.gid)
 	warn_out_of_reach(cfg, config_path)
 }
@@ -1510,10 +1513,13 @@ stop_loops :: proc(loops: []^loop.Loop, threads: []^thread.Thread) {
 	delete(loops)
 }
 
-// Whether `path`, without its trailing slashes, names a symlink.
+// Whether `path`, cleaned of trailing slashes and `.`, names a symlink.
 @(private = "file")
 is_symlink :: proc(path: string) -> bool {
-	trimmed := strings.trim_right(path, "/")
-	info, err := os.lstat(trimmed if trimmed != "" else path, context.temp_allocator)
+	cleaned, cerr := filepath.clean(path, context.temp_allocator)
+	if cerr != nil {
+		return false
+	}
+	info, err := os.lstat(cleaned, context.temp_allocator)
 	return err == nil && info.type == .Symlink
 }

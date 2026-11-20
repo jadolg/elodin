@@ -36,6 +36,12 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 		return
 	}
 
+	// `nobody` has to reach the cache after the drop: not through a work
+	// directory a 077 umask or a private TMPDIR made root's alone.
+	if !traversable_by_all(r.work_dir) {
+		skip_case(r, NAME, "nobody cannot reach the work directory")
+		return
+	}
 	start_case(r, NAME)
 	defer end_case(r)
 	cache_dir := filepath.join({r.work_dir, "privcache"}, context.temp_allocator) or_else ""
@@ -140,4 +146,52 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 		}
 		check(r, cached, "the list downloaded after the drop was not cached")
 	}
+
+	/*
+	After the drop the process is the account, and reads nothing through a
+	link it could not by name: a copy that is a hard link - as a backup tool
+	that links its snapshots leaves - still stands in for a list whose download
+	fails. The root start's rules would refuse it.
+	*/
+	linked := filepath.join({r.work_dir, "privcache-gone"}, context.temp_allocator) or_else ""
+	if !write_fixture(r, linked, transmute([]u8)string("0.0.0.0 gone.test\n")) {
+		return
+	}
+	gone_copy := fmt.ctprintf("%s/http___127.0.0.1_%d_gone.txt.list", cache_dir, http_port)
+	if !check(r, posix.link(strings.clone_to_cstring(linked, context.temp_allocator), gone_copy) == .OK, "cannot link the copy for gone.txt") {
+		return
+	}
+	gone := base_config(
+		udp_port,
+		upstream_at(next_port(r)),
+		log = "{ level: info }",
+		blocking = fmt.tprintf(
+			`{{ enabled: true, cache_dir: %q, lists: ["http://127.0.0.1:%d/hosts.txt", "http://127.0.0.1:%d/later.txt", "http://127.0.0.1:%d/gone.txt"] }}`,
+			cache_dir,
+			http_port,
+			http_port,
+			http_port,
+		),
+		extra = "server: { user: nobody }",
+	)
+	if check(r, reload_to(r, &srv, gone, "gone.txt: 1 rules"), "the hard-linked copy of gone.txt was not loaded after the drop:\n%s", read_log(&srv)) {
+		res := query_udp(udp_port, build_query("gone.test.", u16(dns.Type.A)))
+		if check(r, res.ok, "no answer for gone.test") {
+			check(r, parse_header(r, res.wire).rcode == int(dns.Rcode.NX_Domain), "the hard-linked copy of gone.txt was not applied")
+		}
+	}
+}
+
+// Whether every directory on `path` lets anyone through (o+x).
+@(private = "file")
+traversable_by_all :: proc(path: string) -> bool {
+	dir := path
+	for dir != "" && dir != "/" {
+		st: posix.stat_t
+		if posix.stat(strings.clone_to_cstring(dir, context.temp_allocator), &st) != .OK || .IXOTH not_in st.st_mode {
+			return false
+		}
+		dir = filepath.dir(dir)
+	}
+	return true
 }

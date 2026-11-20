@@ -288,8 +288,8 @@ those, once. On a filesystem with no owners (vfat, including one mounted
 `quiet`, or an NFS export that squashes root) no copy can belong to the account:
 each start uses what it downloads and downloads the lists again at the next
 start rather than read them, so a start with no network has none. Started as
-anyone but root, elodin reads its copies however they are linked or owned, since
-it reads nothing more through a link than by name. A `cache_dir` that is itself
+anyone but root, and after the drop, elodin reads its copies however they are
+linked or owned, since it reads nothing more through a link than by name. A `cache_dir` that is itself
 a symlink is not followed, and so not handed over: name the directory it points
 at. Started this way, elodin downloads and parses the blocklists before it
 binds, so that much happens as root; the first arrangement avoids it.
