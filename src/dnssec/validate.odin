@@ -3513,7 +3513,9 @@ validate_wildcard_proof :: proc(
 	if denial.exhausted {
 		return .Indeterminate, nil, exhausted_reason(budget), {}
 	}
-	if len(denial.nsecs) > 0 {
+	// A cover that shows the next closer name is an empty non-terminal says it
+	// exists, so the wildcard could not have answered (RFC 4592 section 2.2.2).
+	if len(denial.nsecs) > 0 && !nsec_shows_node(denial.nsecs, next_closer) {
 		if _, covered := nsec_covering(denial.nsecs, next_closer); covered {
 			return .Secure, denial.verified, "", {}
 		}

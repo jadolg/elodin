@@ -353,6 +353,7 @@ main :: proc() {
 	section(&r, "dnssec validation")
 	run_dnssec_cases(&r)
 	run_dnssec_reverse_cases(&r)
+	run_dnssec_ent_denial_cases(&r)
 	run_dnssec_ttl_cases(&r)
 	run_dnssec_cname_denial_cases(&r)
 	run_dnssec_lapsed_cases(&r)
