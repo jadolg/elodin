@@ -2,6 +2,7 @@ package itest
 
 import "core:c"
 import "core:encoding/base64"
+import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:strconv"
@@ -938,4 +939,44 @@ set_receive_buffer :: proc(socket: net.UDP_Socket, bytes: int) -> (granted: int)
 		return 0
 	}
 	return int(got)
+}
+
+/*
+One TLS 1.2 handshake with `port` offering `offered`, and the suite and ALPN
+protocol agreed; an empty suite is a handshake the server refused. `failed`
+says why no handshake could be attempted at all - the client could not be
+built, could not offer that list, or could not reach the port - which says
+nothing about the server's suites.
+*/
+tls12_handshake :: proc(port: int, offered: cstring, alpn: []string) -> (chosen, agreed, failed: string) {
+	ctx, built := raw_tls_context(tlsx.TLS1_2_VERSION, alpn)
+	if !built {
+		return "", "", "a TLS 1.2 client context could not be built"
+	}
+	defer tlsx.context_destroy(ctx)
+	if tlsx.SSL_CTX_set_cipher_list(ctx.ptr, offered) != 1 {
+		return "", "", fmt.tprintf("this client cannot offer %s", offered)
+	}
+	if !tcp_port_open(port) {
+		return "", "", fmt.tprintf("nothing listens on port %d", port)
+	}
+	conn, connected := raw_tls_connect(ctx, port)
+	if !connected {
+		return "", "", ""
+	}
+	defer raw_tls_close(conn)
+	data: [^]u8
+	n: c.uint
+	tlsx.SSL_get0_alpn_selected(conn.ssl, &data, &n)
+	chosen = strings.clone_from_cstring(tlsx.SSL_CIPHER_get_name(SSL_get_current_cipher(conn.ssl)), context.temp_allocator)
+	return chosen, strings.clone(string(data[:n]), context.temp_allocator), ""
+}
+
+foreign import cipher_ssl "system:ssl"
+
+@(default_calling_convention = "c")
+foreign cipher_ssl {
+	// Only what this suite asks of a session; `tlsx` binds the rest.
+	@(private = "file")
+	SSL_get_current_cipher :: proc(ssl: ^tlsx.SSL) -> ^tlsx.SSL_CIPHER ---
 }

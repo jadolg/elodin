@@ -462,8 +462,8 @@ client_context :: proc(
 }
 
 /*
-A fresh `SSL_CTX` for either end, held to TLS 1.2 or later and, over TLS 1.2,
-to `TLS12_CIPHERS`, or nil. A server picks the suite by its own order.
+A fresh `SSL_CTX` for either end, held to `hold_to_floor`, or nil. A server
+picks the suite by its own order.
 
 Idle connections hand their record buffers back. Without the mode OpenSSL keeps
 its record buffers, ~17 KB each, for the connection's whole life; with it a
@@ -481,7 +481,7 @@ new_ssl_ctx :: proc(server: bool) -> ^SSL_CTX {
 	if ptr == nil {
 		return nil
 	}
-	if !ssl_ctx_set_min_proto_version(ptr, TLS1_2_VERSION) || SSL_CTX_set_cipher_list(ptr, TLS12_CIPHERS) != 1 {
+	if !hold_to_floor(ptr) {
 		SSL_CTX_free(ptr)
 		return nil
 	}
@@ -493,6 +493,52 @@ new_ssl_ctx :: proc(server: bool) -> ^SSL_CTX {
 	}
 	ssl_ctx_set_mode(ptr, SSL_MODE_RELEASE_BUFFERS)
 	return ptr
+}
+
+/*
+Hold a context to TLS 1.2 or later and, over TLS 1.2, to `TLS12_CIPHERS`, only
+ever narrowing what it already allows: a host policy stricter than either (a
+dynamic build's `openssl.cnf`, with `MinProtocol` or `CipherString`) stays as
+strict. A policy that leaves none of the suites leaves TLS 1.3 alone. False
+when OpenSSL refuses a setting.
+*/
+@(private)
+hold_to_floor :: proc(ptr: ^SSL_CTX) -> bool {
+	if ssl_ctx_get_min_proto_version(ptr) < TLS1_2_VERSION && !ssl_ctx_set_min_proto_version(ptr, TLS1_2_VERSION) {
+		return false
+	}
+	allowed := SSL_CTX_get_ciphers(ptr)
+	kept: [len(TLS12_CIPHERS) + 1]u8
+	n := 0
+	names := TLS12_CIPHERS
+	for name in strings.split_iterator(&names, ":") {
+		if !cipher_listed(allowed, name) {
+			continue
+		}
+		if n > 0 {
+			kept[n] = ':'
+			n += 1
+		}
+		n += copy(kept[n:], name)
+	}
+	if n == 0 {
+		return ssl_ctx_set_min_proto_version(ptr, TLS1_3_VERSION)
+	}
+	return SSL_CTX_set_cipher_list(ptr, cstring(&kept[0])) == 1
+}
+
+// Whether `stack`, a context's cipher list, holds the suite named `name`.
+@(private = "file")
+cipher_listed :: proc(stack: ^OPENSSL_STACK, name: string) -> bool {
+	if stack == nil {
+		return false
+	}
+	for i in 0 ..< OPENSSL_sk_num(stack) {
+		if string(SSL_CIPHER_get_name((^SSL_CIPHER)(OPENSSL_sk_value(stack, i)))) == name {
+			return true
+		}
+	}
+	return false
 }
 
 /*

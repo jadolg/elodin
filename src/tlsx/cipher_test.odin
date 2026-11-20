@@ -1,6 +1,7 @@
 package tlsx
 
 import "core:c"
+import "core:slice"
 import "core:testing"
 
 /*
@@ -36,7 +37,7 @@ test_tls12_offers_only_ecdhe_with_aead :: proc(t: ^testing.T) {
 		}
 		tls12 := 0
 		for j in 0 ..< OPENSSL_sk_num(ciphers) {
-			cipher := OPENSSL_sk_value(ciphers, j)
+			cipher := (^SSL_CIPHER)(OPENSSL_sk_value(ciphers, j))
 			kx := SSL_CIPHER_get_kx_nid(cipher)
 			if kx == NID_KX_ANY {
 				continue
@@ -62,29 +63,78 @@ NID_KX_ECDHE :: 1038
 @(private = "file")
 NID_KX_ANY :: 1063
 
-@(private = "file")
-SSL_CIPHER :: struct {}
-
 foreign import cipher_ssl "system:ssl"
-foreign import cipher_crypto "system:crypto"
 
 @(default_calling_convention = "c")
 foreign cipher_ssl {
-	SSL_CTX_get_ciphers :: proc(ctx: ^SSL_CTX) -> rawptr ---
-	SSL_CTX_get_options :: proc(ctx: ^SSL_CTX) -> u64 ---
 	SSL_CIPHER_get_kx_nid :: proc(cipher: ^SSL_CIPHER) -> c.int ---
 	SSL_CIPHER_is_aead :: proc(cipher: ^SSL_CIPHER) -> c.int ---
-	SSL_CIPHER_get_name :: proc(cipher: ^SSL_CIPHER) -> cstring ---
 }
 
-@(default_calling_convention = "c")
-foreign cipher_crypto {
-	OPENSSL_sk_num :: proc(stack: rawptr) -> c.int ---
-	@(link_name = "OPENSSL_sk_value")
-	sk_cipher_value :: proc(stack: rawptr, i: c.int) -> ^SSL_CIPHER ---
-}
-
-@(private = "file")
-OPENSSL_sk_value :: proc(stack: rawptr, i: c.int) -> ^SSL_CIPHER {
-	return sk_cipher_value(stack, i)
+/*
+`hold_to_floor` only ever narrows: a context a host policy already holds to
+fewer suites, or to TLS 1.3, keeps that, and one that allows none of ours goes
+to TLS 1.3 rather than to OpenSSL's default list.
+*/
+@(test)
+test_hold_to_floor_never_widens_a_host_policy :: proc(t: ^testing.T) {
+	cases := []struct {
+		name:      string,
+		// What the host policy left the context with; "" leaves OpenSSL's.
+		ciphers:   cstring,
+		min:       c.long,
+		want_min:  c.long,
+		want_list: []string,
+	} {
+		{
+			name = "OpenSSL's defaults",
+			want_min = TLS1_2_VERSION,
+			want_list = {
+				"ECDHE-ECDSA-AES128-GCM-SHA256",
+				"ECDHE-RSA-AES128-GCM-SHA256",
+				"ECDHE-ECDSA-AES256-GCM-SHA384",
+				"ECDHE-RSA-AES256-GCM-SHA384",
+				"ECDHE-ECDSA-CHACHA20-POLY1305",
+				"ECDHE-RSA-CHACHA20-POLY1305",
+			},
+		},
+		{
+			name = "a policy without AES-128 or ChaCha20",
+			ciphers = "ECDHE+AES256+AESGCM:AES256-SHA",
+			want_min = TLS1_2_VERSION,
+			want_list = {"ECDHE-ECDSA-AES256-GCM-SHA384", "ECDHE-RSA-AES256-GCM-SHA384"},
+		},
+		{name = "a policy holding TLS 1.3 at least", min = TLS1_3_VERSION, want_min = TLS1_3_VERSION},
+		{name = "a policy with none of ours over TLS 1.2", ciphers = "AES128-SHA", want_min = TLS1_3_VERSION},
+	}
+	for tc in cases {
+		ptr := SSL_CTX_new(TLS_server_method())
+		if !testing.expectf(t, ptr != nil, "%s: no context", tc.name) {
+			return
+		}
+		defer SSL_CTX_free(ptr)
+		if tc.ciphers != "" && !testing.expectf(t, SSL_CTX_set_cipher_list(ptr, tc.ciphers) == 1, "%s: the fixture's list was refused", tc.name) {
+			continue
+		}
+		if tc.min != 0 && !testing.expectf(t, ssl_ctx_set_min_proto_version(ptr, tc.min), "%s: the fixture's floor was refused", tc.name) {
+			continue
+		}
+		if !testing.expectf(t, hold_to_floor(ptr), "%s: refused", tc.name) {
+			continue
+		}
+		testing.expectf(t, ssl_ctx_get_min_proto_version(ptr) == tc.want_min, "%s: floor %x, want %x", tc.name, ssl_ctx_get_min_proto_version(ptr), tc.want_min)
+		if tc.want_min == TLS1_3_VERSION {
+			continue
+		}
+		got: [dynamic]string
+		defer delete(got)
+		ciphers := SSL_CTX_get_ciphers(ptr)
+		for j in 0 ..< OPENSSL_sk_num(ciphers) {
+			cipher := (^SSL_CIPHER)(OPENSSL_sk_value(ciphers, j))
+			if SSL_CIPHER_get_kx_nid(cipher) != NID_KX_ANY {
+				append(&got, string(SSL_CIPHER_get_name(cipher)))
+			}
+		}
+		testing.expectf(t, slice.equal(got[:], tc.want_list), "%s: TLS 1.2 list %v, want %v", tc.name, got[:], tc.want_list)
+	}
 }

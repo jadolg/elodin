@@ -29,6 +29,28 @@ system_default = elodin_system
 MaxProtocol = TLSv1.2
 `
 
+// A host policy stricter than elodin's TLS 1.2 list: AES-256-GCM only (#687).
+@(private = "file")
+NARROWED_CONF :: `openssl_conf = elodin_itest
+[elodin_itest]
+ssl_conf = elodin_ssl
+[elodin_ssl]
+system_default = elodin_system
+[elodin_system]
+CipherString = ECDHE+AES256+AESGCM
+`
+
+// A host policy stricter than elodin's floor: TLS 1.3 only (#687).
+@(private = "file")
+FLOOR_CONF :: `openssl_conf = elodin_itest
+[elodin_itest]
+ssl_conf = elodin_ssl
+[elodin_ssl]
+system_default = elodin_system
+[elodin_system]
+MinProtocol = TLSv1.3
+`
+
 // An EVP property no OpenSSL knows. `config_diagnostics`, which openSUSE's file
 // also sets, makes that an initialisation failure rather than a module skipped.
 @(private = "file")
@@ -114,6 +136,44 @@ run_openssl_conf_cases :: proc(r: ^Runner) {
 				// under any wording.
 				reason := log_contains(&srv, "unknown option")
 				check(r, reason == !static, "static %v: OpenSSL's reason logged %v; log:\n%s", static, reason, read_log(&srv))
+			}
+			end_case(r)
+		}
+	}
+	{
+		NAME :: "tls: a host policy narrower than elodin's tls 1.2 suites stays narrow in a dynamic build (#687)"
+		static := r.static
+		if conf, conf_ok := write_work_file(r, "openssl-narrowed.cnf", NARROWED_CONF); conf_ok {
+			start_case(r, NAME)
+			if srv, ok := start_with_conf(r, NAME, conf); ok {
+				defer stop_server(&srv)
+				// The policy's own suite, which elodin's list holds too.
+				chosen, _, failed := tls12_handshake(srv.dot_port, "ECDHE-ECDSA-AES256-GCM-SHA384", nil)
+				if check(r, failed == "", "%s", failed) {
+					check(r, chosen == "ECDHE-ECDSA-AES256-GCM-SHA384", "the policy's own suite: negotiated %q", chosen)
+				}
+				// One elodin's list holds and the policy does not.
+				chosen, _, failed = tls12_handshake(srv.dot_port, "ECDHE-ECDSA-AES128-GCM-SHA256", nil)
+				if check(r, failed == "", "%s", failed) {
+					want := "ECDHE-ECDSA-AES128-GCM-SHA256" if static else ""
+					check(r, chosen == want, "static %v: a suite the policy left out: negotiated %q, want %q", static, chosen, want)
+				}
+			}
+			end_case(r)
+		}
+	}
+	{
+		NAME :: "tls: a host policy's tls 1.3 floor stays in a dynamic build (#687)"
+		static := r.static
+		if conf, conf_ok := write_work_file(r, "openssl-floor.cnf", FLOOR_CONF); conf_ok {
+			start_case(r, NAME)
+			if srv, ok := start_with_conf(r, NAME, conf); ok {
+				defer stop_server(&srv)
+				chosen, _, failed := tls12_handshake(srv.dot_port, "ECDHE-ECDSA-AES128-GCM-SHA256", nil)
+				if check(r, failed == "", "%s", failed) {
+					want := "ECDHE-ECDSA-AES128-GCM-SHA256" if static else ""
+					check(r, chosen == want, "static %v: a TLS 1.2 client negotiated %q, want %q", static, chosen, want)
+				}
 			}
 			end_case(r)
 		}

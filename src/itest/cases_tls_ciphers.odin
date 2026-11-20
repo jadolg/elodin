@@ -1,9 +1,6 @@
 package itest
 
-import "core:c"
 import "core:fmt"
-import "core:strings"
-import "elodin:tlsx"
 
 /*
 Issue #687: over TLS 1.2 the DoT and DoH listeners negotiate ECDHE with an AEAD
@@ -73,8 +70,8 @@ run_tls_cipher_cases :: proc(r: ^Runner) {
 			verdict := fmt.tprintf("gets %s", row.chosen) if row.chosen != "" else "is refused"
 			start_case(r, fmt.tprintf("%s: tls 1.2 offering %s %s", listener, row.offered, verdict))
 			alpn: []string = {"h2"} if doh else nil
-			chosen, agreed, ran := tls12_handshake(doh_port if doh else dot_port, row.offered, alpn)
-			if check(r, ran, "this client could not offer %s", row.offered) {
+			chosen, agreed, failed := tls12_handshake(doh_port if doh else dot_port, row.offered, alpn)
+			if check(r, failed == "", "%s", failed) {
 				check(r, chosen == row.chosen, "negotiated %q, want %q", chosen, row.chosen)
 				if chosen != "" && doh {
 					check(r, agreed == "h2", "ALPN agreed %q, not h2", agreed)
@@ -83,42 +80,4 @@ run_tls_cipher_cases :: proc(r: ^Runner) {
 			end_case(r)
 		}
 	}
-}
-
-/*
-One TLS 1.2 handshake with `port` offering `offered`, and the suite and ALPN
-protocol agreed; an empty suite is a refused handshake. `ran` is false when
-this client could not be made to offer that list at all, which says nothing
-about the server.
-*/
-@(private = "file")
-tls12_handshake :: proc(port: int, offered: cstring, alpn: []string) -> (chosen, agreed: string, ran: bool) {
-	ctx := raw_tls_context(tlsx.TLS1_2_VERSION, alpn) or_return
-	defer tlsx.context_destroy(ctx)
-	if tlsx.SSL_CTX_set_cipher_list(ctx.ptr, offered) != 1 {
-		return "", "", false
-	}
-	conn, connected := raw_tls_connect(ctx, port)
-	if !connected {
-		return "", "", true
-	}
-	defer raw_tls_close(conn)
-	data: [^]u8
-	n: c.uint
-	tlsx.SSL_get0_alpn_selected(conn.ssl, &data, &n)
-	chosen = strings.clone_from_cstring(SSL_CIPHER_get_name(SSL_get_current_cipher(conn.ssl)), context.temp_allocator)
-	return chosen, strings.clone(string(data[:n]), context.temp_allocator), true
-}
-
-@(private = "file")
-SSL_CIPHER :: struct {}
-
-foreign import cipher_ssl "system:ssl"
-
-@(default_calling_convention = "c")
-foreign cipher_ssl {
-	@(private = "file")
-	SSL_get_current_cipher :: proc(ssl: ^tlsx.SSL) -> ^SSL_CIPHER ---
-	@(private = "file")
-	SSL_CIPHER_get_name :: proc(cipher: ^SSL_CIPHER) -> cstring ---
 }
