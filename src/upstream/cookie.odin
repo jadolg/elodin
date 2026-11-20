@@ -122,11 +122,6 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	echoed := u.cookie.client
 	held := u.cookie.server_len > 0
 	sync.mutex_unlock(&u.mu)
-	// The client cookie the query went out with, which a move may since have
-	// drawn afresh (`resolve_endpoint`): the reply echoes that one.
-	if sent, carried := dns.peek_edns_option(query, .Cookie); carried && len(sent) >= COOKIE_CLIENT_LEN {
-		copy(echoed[:], sent[:COOKIE_CLIENT_LEN])
-	}
 
 	/*
 	A cookie is owed on a reply to a query that carried one, and only then.
@@ -166,6 +161,12 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	raw, found := reply_cookie(response)
 	if !found {
 		return !expected
+	}
+	// The client cookie the query went out with, which a move may since have
+	// drawn afresh (`resolve_endpoint`): the reply echoes that one. Read only
+	// for a reply that carries a cookie, for the reason `held` gives above.
+	if sent, carried := dns.peek_edns_option(query, .Cookie); carried && len(sent) >= COOKIE_CLIENT_LEN {
+		copy(echoed[:], sent[:COOKIE_CLIENT_LEN])
 	}
 	if len(raw) != COOKIE_CLIENT_LEN &&
 	   (len(raw) < COOKIE_CLIENT_LEN + COOKIE_SERVER_MIN || len(raw) > COOKIE_CLIENT_LEN + COOKIE_SERVER_MAX) {

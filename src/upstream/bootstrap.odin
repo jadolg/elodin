@@ -373,33 +373,43 @@ bootstrap_query :: proc(
 		*/
 		lowest: []u8
 		shortest := dns.TTL_MAX
+		// The chain first, in whatever order its CNAMEs came, one hop per
+		// record at most so a loop ends.
 		owner := name
+		for _ in msg.answer {
+			next, found := "", false
+			for &rec in msg.answer {
+				if d, is_name := rec.data.(dns.Rdata_Name); is_name && rec.type == .CNAME && dns.name_equal_fold(rec.name, owner) {
+					next, found = d.name, true
+					shortest = min(shortest, dns.sane_ttl(rec.ttl))
+					break
+				}
+			}
+			if !found {
+				break
+			}
+			owner = next
+		}
 		for &rec in msg.answer {
 			if !dns.name_equal_fold(rec.name, owner) {
 				continue
 			}
 			raw: []u8
 			#partial switch &d in rec.data {
-			case dns.Rdata_Name:
-				if rec.type != .CNAME {
-					continue
-				}
-				owner = d.name
 			case dns.Rdata_A:
-				if qtype != .A {
-					continue
+				if qtype == .A {
+					raw = d.addr[:]
 				}
-				raw = d.addr[:]
 			case dns.Rdata_AAAA:
-				if qtype != .AAAA {
-					continue
+				if qtype == .AAAA {
+					raw = d.addr[:]
 				}
-				raw = d.addr[:]
-			case:
+			}
+			if raw == nil {
 				continue
 			}
 			shortest = min(shortest, dns.sane_ttl(rec.ttl))
-			if raw != nil && (lowest == nil || mem.compare(raw, lowest) < 0) {
+			if lowest == nil || mem.compare(raw, lowest) < 0 {
 				lowest = raw
 			}
 		}

@@ -28,6 +28,8 @@ Ttl_Mock :: struct {
 	cname:  u32,
 	// When set, an A record owned by a name off the chain, first in the answer.
 	stray:  [4]u8,
+	// The CNAME after the records it leads to rather than before.
+	cname_last: bool,
 }
 
 @(private = "file")
@@ -45,7 +47,7 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 		}
 		sync.mutex_lock(&m.mu)
 		m.asked += 1
-		silent, addr, ttl, delay, also, cname, stray, turn := m.silent, m.addr, m.ttl, m.delay, m.also, m.cname, m.stray, m.asked % 2 == 0
+		silent, addr, ttl, delay, also, cname, stray, cname_last, turn := m.silent, m.addr, m.ttl, m.delay, m.also, m.cname, m.stray, m.cname_last, m.asked % 2 == 0
 		sync.mutex_unlock(&m.mu)
 		if silent {
 			continue
@@ -63,7 +65,9 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 			owner := q.name
 			if cname != 0 {
 				owner = "target.invalid."
-				append(&answer, dns.Record{name = q.name, type = .CNAME, class = .IN, ttl = cname, data = dns.Rdata_Name{name = owner}})
+				if !cname_last {
+					append(&answer, dns.Record{name = q.name, type = .CNAME, class = .IN, ttl = cname, data = dns.Rdata_Name{name = owner}})
+				}
 			}
 			first, second := addr, also
 			if also != {} && turn {
@@ -72,6 +76,9 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 			append(&answer, dns.Record{name = owner, type = .A, class = .IN, ttl = ttl, data = dns.Rdata_A{addr = first}})
 			if also != {} {
 				append(&answer, dns.Record{name = owner, type = .A, class = .IN, ttl = ttl, data = dns.Rdata_A{addr = second}})
+			}
+			if cname != 0 && cname_last {
+				append(&answer, dns.Record{name = q.name, type = .CNAME, class = .IN, ttl = cname, data = dns.Rdata_Name{name = owner}})
 			}
 			resp.answer = answer[:]
 		}
@@ -226,7 +233,7 @@ test_an_upstream_hostname_is_asked_again_once_its_ttl_is_past :: proc(t: ^testin
 		sync.mutex_unlock(&u.mu)
 		ttl_mock_set(&m, {127, 0, 0, 5} if moved else {127, 0, 0, 3})
 		expire_address(u, HOST + ".")
-		testing.expect_value(t, resolve_endpoint(u), Error.None)
+		testing.expect_value(t, resolve_endpoint(u, refresh = true), Error.None)
 		sync.mutex_lock(&u.mu)
 		kept := u.pipe == c
 		u.pipe = nil
@@ -255,7 +262,7 @@ test_an_upstream_hostname_is_asked_again_once_its_ttl_is_past :: proc(t: ^testin
 	// A lookup that fails while the time to ask again is still ahead, as one
 	// racing a refresh that succeeded does, leaves that time where it is.
 	before := sync.atomic_load(&u.expires)
-	testing.expect_value(t, resolve_endpoint(u, time.tick_add(time.tick_now(), 100 * time.Millisecond)), Error.None)
+	testing.expect_value(t, resolve_endpoint(u, time.tick_add(time.tick_now(), 100 * time.Millisecond), refresh = true), Error.None)
 	testing.expect(t, sync.atomic_load(&u.expires) == before, "a failed lookup moved a time to ask again that was still ahead")
 	free_all(context.temp_allocator)
 }
@@ -429,12 +436,16 @@ test_a_bootstrap_answer_is_read_the_same_whatever_its_order :: proc(t: ^testing.
 	}
 	defer stop_udp_mock(&m, responder)
 	server := net.endpoint_to_string(bound, context.temp_allocator)
-	for i in 0 ..< 2 {
+	// The last answer puts the CNAME after the records it leads to.
+	for i in 0 ..< 3 {
+		sync.mutex_lock(&m.mu)
+		m.cname_last = i == 2
+		sync.mutex_unlock(&m.mu)
 		addr, held, err := bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second))
 		testing.expectf(t, err == .None && addr == net.Address(net.IP4_Address{127, 0, 0, 7}), "answer %d: got %v (%v)", i, addr, err)
 		testing.expectf(t, held == 30 * time.Second, "answer %d: held %v, where the CNAME's TTL is 30s", i, held)
 	}
-	testing.expect_value(t, ttl_mock_asked(&m), 2)
+	testing.expect_value(t, ttl_mock_asked(&m), 3)
 	free_all(context.temp_allocator)
 }
 

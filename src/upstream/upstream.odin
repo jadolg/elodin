@@ -389,6 +389,10 @@ resolve_endpoint :: proc(
 	// The exchange's, which the bootstrap queries spend; zero at startup, where
 	// each has `BOOTSTRAP_TIMEOUT` of its own.
 	deadline := time.Tick{},
+	// Asking again past the TTL, which may replace the address held. A first
+	// lookup that finds one already published by a lookup racing it leaves
+	// that one, rather than counting the difference as a move.
+	refresh := false,
 ) -> Error {
 	addr, ttl, err := bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
 	if err != .None {
@@ -413,6 +417,10 @@ resolve_endpoint :: proc(
 	}
 	sync.mutex_lock(&u.mu)
 	first := !sync.atomic_load_explicit(&u.resolved, .Relaxed)
+	if !first && !refresh {
+		sync.mutex_unlock(&u.mu)
+		return .None
+	}
 	moved := !first && !came_from(endpoint, u.endpoint)
 	if moved {
 		u.epoch += 1
@@ -955,7 +963,7 @@ servers to ask the refusal costs nothing, and is left unrecorded. A lookup this
 		*/
 		resolving = true
 		share := time.tick_add(entered, timeout / REFRESH_SHARE)
-		_ = resolve_endpoint(u, share) // lint:allow a failed refresh keeps the address held, which resolve_endpoint logs
+		_ = resolve_endpoint(u, share, refresh = true) // lint:allow a failed refresh keeps the address held, which resolve_endpoint logs
 		sync.atomic_store(&u.refreshing, false)
 	}
 

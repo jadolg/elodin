@@ -4237,7 +4237,8 @@ An upstream whose hostname did not resolve at startup is resolved by whichever
 queries reach it first, several at once, while others are already reading the
 endpoint to dial it (issue #347). Run under `-sanitize:thread` to see the race;
 without it, this checks what every thread ends up with, and that a later lookup
-that finds another address replaces it whole.
+that races it leaves it, while a refresh that finds another address replaces it
+whole.
 
 Marked unresolved by hand over an address literal rather than resolved through
 the bootstrap cache, which is package-global and owned by another test while it
@@ -4271,15 +4272,20 @@ test_a_late_resolved_endpoint_is_published_whole :: proc(t: ^testing.T) {
 	testing.expectf(t, berr == nil && ep.port == bound.port, "the endpoint is on port %d, the member's socket on %d (%v)", ep.port, bound.port, berr)
 	testing.expect(t, ep.address == net.Address(net.IP4_Loopback), "the endpoint is not the address the name resolved to")
 
-	// A later lookup, as a refresh past the TTL is, publishes what it found,
-	// on the member's port.
+	// A first lookup that finishes after another published leaves that one:
+	// the two raced, and nothing moved.
 	// The upstream owns its spec's strings, so the replacement is one too.
 	delete(u.spec.address, u.allocator)
 	u.spec.address = strings.clone("127.0.0.2", u.allocator)
 	testing.expect_value(t, resolve_endpoint(u), Error.None)
 	ep, _, eerr = endpoint_of(u)
 	testing.expect_value(t, eerr, Error.None)
-	testing.expect(t, ep.address == net.Address(net.IP4_Address{127, 0, 0, 2}) && ep.port == bound.port, "the later lookup was not published whole")
+	testing.expect(t, ep.address == net.Address(net.IP4_Loopback), "a racing first lookup replaced the one published")
+	// A refresh past the TTL publishes what it found, on the member's port.
+	testing.expect_value(t, resolve_endpoint(u, refresh = true), Error.None)
+	ep, _, eerr = endpoint_of(u)
+	testing.expect_value(t, eerr, Error.None)
+	testing.expect(t, ep.address == net.Address(net.IP4_Address{127, 0, 0, 2}) && ep.port == bound.port, "the refresh was not published whole")
 }
 
 /*
