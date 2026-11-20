@@ -43,6 +43,12 @@ UDP→TCP retry, `version.bind`/`version.server`/`hostname.bind`/`id.server` in 
 [DDR](doh.md#discovery-by-clients-ddr) when `ddr.name` is set, refusal of zone-transfer requests, and the reserved names of
 RFC 6761 and RFC 7686 answered here instead of forwarded.
 
+A UDP answer leaves from the address its query was sent to, also on a
+wildcard bind (`0.0.0.0` or `::`), as RFC 1123 section 2.3 asks of a
+multihomed host. A host with several addresses, a VIP, or IPv6 temporary
+addresses can be asked at any of them, and a client that checks where an answer
+came from accepts it.
+
 ## Known limitations
 
 - Where the host's crypto policy forbids SHA-1, zones signed only with RSA/SHA-1 (algorithms 5 and 7) validate as insecure delegations; see [DNSSEC](dnssec.md#watch-out).

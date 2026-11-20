@@ -25,56 +25,6 @@ the clients who live at the address it is naming. See the note at the top of
 one-shared-budget version it replaced is written down.
 */
 
-// `tcp_port` of 0 leaves the stream listener off, which is what every case that
-// is about datagrams wants: a listener nothing connects to would only be a port
-// for the suite to collide on.
-@(private = "file")
-config_rate_limit :: proc(
-	udp_port, upstream_port: int,
-	limit: string,
-	tcp_port := 0,
-	// `::` for the case that needs both families on one port; loopback otherwise,
-	// so the rest of the suite binds no more than it is asking about.
-	udp_address := "127.0.0.1",
-	// `warn` for every case that only reads answers, which is all of them but
-	// the one asserting a startup line: what the limiter was configured with is
-	// reported at `info`, and the rest of the suite has no use for those lines
-	// or for the other dozen a start writes at that level. A refused datagram
-	// logs nothing at any level short of debug, so this is about what a failing
-	// case has to be read out of and not about the volume a flood produces.
-	log_level := "warn",
-) -> string {
-	tcp := "{ enabled: false }"
-	if tcp_port > 0 {
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port)
-	}
-	return fmt.tprintf(
-		`log: {{ level: %s }}
-listeners:
-  udp: {{ enabled: true, address: "%s", port: %d }}
-  tcp: %s
-server:
-  # Pinned rather than derived from whatever machine the suite is running on:
-  # the flood below has to fit inside max_pending for the unlimited run to be
-  # the baseline it claims to be. Otherwise the case measures this machine's
-  # shed threshold instead of the limiter.
-  max_pending: 256
-  rate_limit: {{ %s }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: true, max_entries: 100 }}
-blocking: {{ enabled: false }}
-`,
-		log_level,
-		udp_address,
-		udp_port,
-		tcp,
-		limit,
-		upstream_port,
-	)
-}
-
 run_rate_limit_cases :: proc(r: ^Runner) {
 	QUERIES :: 200
 	// Small enough that the burst is reached in a fraction of the run, and the
@@ -768,8 +718,8 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	times is the flood having arrived and been cut to the budget, and without that
 	the IPv6 answer below would only be saying the limiter was never reached.
 	*/
-	if !ipv6_loopback_available() {
-		skip_case(r, "rate limit: a `::` listener tells the families apart", "no IPv6 loopback on this machine")
+	if !ipv6_loopback_available() || !dual_stack_available() {
+		skip_case(r, "rate limit: a `::` listener tells the families apart", "no IPv6 loopback, or a `::` socket takes no IPv4, on this machine")
 	} else {
 		start_case(r, "rate limit: a `::` listener tells the families apart")
 		{

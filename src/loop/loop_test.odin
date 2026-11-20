@@ -16,7 +16,7 @@ made, since tests run in parallel. The waits that decide an outcome are on
 events; the timeouts on them only bound a run that has already failed.
 */
 
-@(private = "file")
+@(private)
 WAIT :: 5 * time.Second
 
 @(private)

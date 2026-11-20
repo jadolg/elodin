@@ -379,6 +379,8 @@ Udp_Job :: struct {
 	// any of them would put the same thing on the wire; replying on the one
 	// that received keeps a query's send queue and its receive queue together.
 	socket: net.UDP_Socket,
+	// The address the datagram was sent to, which the answer leaves from.
+	local:  loop.Udp_Local,
 	// Admitted on the `Proven` pool for a valid server cookie, so its answer's
 	// size is billed there. See `datagram_rate_check`.
 	proven: bool,
@@ -573,9 +575,10 @@ port to have been bound by the same effective uid, so a share of this server's
 datagrams is available to whoever can already run as this server's user - who
 could read the answers off the wire in any case.
 
-`net.set_option` cannot set either of the two options here - it knows the name
-`Reuse_Port` but refuses it, and `Receive_Buffer_Size` it does set without
-saying what the kernel granted - so both go through `setsockopt` directly.
+`net.set_option` cannot set the options here - it knows the name `Reuse_Port`
+but refuses it, sets `Receive_Buffer_Size` without saying what the kernel
+granted, and has no name for `IP_PKTINFO` - so they go through `setsockopt`
+directly.
 */
 @(private)
 bind_udp_reader :: proc(
@@ -594,6 +597,18 @@ bind_udp_reader :: proc(
 		// the address it was for, and the socket is no more usable than one
 		// whose bind failed.
 		return {}, 0, net.Bind_Error.Unknown
+	}
+	// So an answer can leave from the address its query was sent to, which a
+	// wildcard bind does not otherwise do; see `loop.Udp_Local`. Not asked of a
+	// concrete bind, which answers from its one address anyway: the `recvmsg`
+	// and `sendmsg` it would cost are dearer per query than `recvfrom` and
+	// `sendto`.
+	if is_wildcard(address) {
+		if errno := loop.want_destination(socket, net.family_from_address(address) == .IP6); errno != .NONE {
+			net.close(socket)
+			logx.errorf("listeners.udp: the kernel refused IP_PKTINFO or IPV6_RECVPKTINFO (%v), so an answer could not leave from the address asked", errno)
+			return {}, 0, net.Bind_Error.Unknown
+		}
 	}
 	// A large receive buffer absorbs query bursts that arrive while the loop is
 	// busy. What the kernel actually granted is reported at startup:
@@ -700,6 +715,9 @@ udp_loop :: proc(data: rawptr) {
 	socket := ctx.reader.socket
 	buf := make([]u8, dns.MAX_MESSAGE)
 	defer delete(buf)
+	// Only a wildcard socket was asked for each datagram's local end; see
+	// `bind_udp_reader`.
+	wildcard := is_wildcard(l.udp_bound.address)
 
 	// Labelled for the submit below, whose `break` would otherwise leave only
 	// the switch it sits in.
@@ -710,7 +728,8 @@ udp_loop :: proc(data: rawptr) {
 	not wait, which bounds how far reading can get ahead of answering.
 	*/
 	reading: for !sync.atomic_load(&l.stop) {
-		n, client, err := loop.recv_udp(socket, buf)
+		local: loop.Udp_Local
+		n, client, err := loop.recv_udp(socket, buf, &local if wildcard else nil)
 		if err != nil {
 			if sync.atomic_load(&l.stop) || loop.cancelled() {
 				break
@@ -798,7 +817,7 @@ udp_loop :: proc(data: rawptr) {
 		case .Allow:
 		case .Truncate:
 			if tc, built := dns.truncated_response(buf[:n], context.temp_allocator); built {
-				_, _ = loop.send_udp(socket, tc, client)
+				_, _ = loop.send_udp(socket, tc, client, local)
 			}
 			free_all(context.temp_allocator)
 			continue
@@ -832,6 +851,7 @@ udp_loop :: proc(data: rawptr) {
 		job.ctx = ctx
 		job.client = client
 		job.socket = socket
+		job.local = local
 		job.proven = proven
 
 		// The query's use of the socket, given back once it has answered on it.
@@ -1279,8 +1299,8 @@ Our own listening endpoint is the other. A datagram spoofed as coming from the
 address and port this server is answering on makes it talk to itself - every
 answer arriving as a new query, forever, at whatever rate the loop sustains. A
 source port equal to ours from a loopback address is the same thing under a
-wildcard bind, where our own datagrams come from whichever local address the
-route picked rather than the 0.0.0.0 we asked for.
+wildcard bind, where our own datagrams come from whichever local address their
+query was sent to rather than the 0.0.0.0 we asked for.
 
 The same shape aimed at *another* resolver is what a loop between two servers
 would be, and this is not what stops that: a client's source port is essentially
@@ -1312,8 +1332,8 @@ plausible_source :: proc(l: ^Listeners, client: net.Endpoint) -> bool {
 	if netx.addresses_equal(client.address, bound.address) {
 		return false
 	}
-	// Bound to the wildcard, where the source of our own datagrams is whichever
-	// local address the route picked rather than the address we bound.
+	// Bound to the wildcard, where our own datagrams leave from whichever local
+	// address their query was sent to rather than from the address we bound.
 	return !is_loopback(client.address)
 }
 
@@ -1332,6 +1352,19 @@ our own datagrams to a v4 destination carry under a `::` bind.
 is_loopback :: proc(a: net.Address) -> bool {
 	bytes, v6 := netx.address_bytes(a)
 	return config.address_in(config.LOOPBACK_NETWORKS, bytes, v6)
+}
+
+// Whether a bind address is `0.0.0.0` or `::`, or `::ffff:0.0.0.0`, which Linux
+// binds as the IPv4 wildcard on an IPv6 socket.
+@(private)
+is_wildcard :: proc(a: net.Address) -> bool {
+	switch x in netx.unmap(a) {
+	case net.IP4_Address:
+		return x == net.IP4_Address{}
+	case net.IP6_Address:
+		return x == net.IP6_Address{}
+	}
+	return false
 }
 
 /*
@@ -1398,7 +1431,7 @@ udp_job :: proc(data: rawptr) {
 		loop.tick_now(),
 		.Proven if job.proven else .Datagram,
 	)
-	_, _ = loop.send_udp(job.socket, response, job.client)
+	_, _ = loop.send_udp(job.socket, response, job.client, job.local)
 }
 
 // --- TCP and DoT ----------------------------------------------------------

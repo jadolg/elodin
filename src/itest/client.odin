@@ -23,6 +23,9 @@ CLIENT_TIMEOUT :: 8 * time.Second
 Query_Result :: struct {
 	wire: []u8,
 	ok:   bool,
+	// Where a UDP answer came from. The socket is unconnected, so an answer from
+	// an address other than the one asked is read, not filtered by the kernel.
+	from: net.Endpoint,
 }
 
 query_udp :: proc(
@@ -30,8 +33,9 @@ query_udp :: proc(
 	query: []u8,
 	allocator := context.allocator,
 	timeout := CLIENT_TIMEOUT,
+	address: net.Address = net.IP4_Loopback,
 ) -> Query_Result {
-	socket, err := net.make_unbound_udp_socket(.IP4)
+	socket, err := net.make_unbound_udp_socket(net.family_from_address(address))
 	if err != nil {
 		return {}
 	}
@@ -40,21 +44,21 @@ query_udp :: proc(
 	_ = net.set_option(socket, .Send_Timeout, timeout)
 
 	endpoint := net.Endpoint {
-		address = net.IP4_Loopback,
+		address = address,
 		port    = udp_port,
 	}
 	if _, serr := net.send_udp(socket, query, endpoint); serr != nil {
 		return {}
 	}
 
-	buf := make([]u8, 65535, context.temp_allocator)
-	n, _, rerr := net.recv_udp(socket, buf)
+	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
+	n, from, rerr := net.recv_udp(socket, buf)
 	if rerr != nil || n < dns.HEADER_SIZE {
 		return {}
 	}
 	out := make([]u8, n, allocator)
 	copy(out, buf[:n])
-	return Query_Result{wire = out, ok = true}
+	return Query_Result{wire = out, ok = true, from = from}
 }
 
 // Confirms the server sends nothing at all, which is the correct answer to some
@@ -698,6 +702,38 @@ tcp_port_open :: proc(port: int) -> bool {
 	conn := dial_tcp(port) or_return
 	net.close(conn.socket)
 	return true
+}
+
+/*
+Whether a `::` listener here takes IPv4 as well: not where
+`net.ipv6.bindv6only` is set, or IPv6 is off. A case that asks a `::` or
+`::ffff:0.0.0.0` listener over IPv4 needs it, and so does the readiness probe,
+which asks over IPv4.
+*/
+dual_stack_available :: proc() -> bool {
+	server, err := net.make_bound_udp_socket(net.IP6_Address{}, 0)
+	if err != nil {
+		return false
+	}
+	defer net.close(server)
+	if net.set_option(server, .Receive_Timeout, CLIENT_TIMEOUT) != nil {
+		return false
+	}
+	bound, berr := net.bound_endpoint(server)
+	if berr != nil {
+		return false
+	}
+	client, cerr := net.make_unbound_udp_socket(.IP4)
+	if cerr != nil {
+		return false
+	}
+	defer net.close(client)
+	if _, serr := net.send_udp(client, []u8{0}, {net.IP4_Loopback, bound.port}); serr != nil {
+		return false
+	}
+	buf: [1]u8
+	_, _, rerr := net.recv_udp(server, buf[:])
+	return rerr == nil
 }
 
 /*
