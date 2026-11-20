@@ -1354,10 +1354,11 @@ is_loopback :: proc(a: net.Address) -> bool {
 	return config.address_in(config.LOOPBACK_NETWORKS, bytes, v6)
 }
 
-// Whether a bind address is `0.0.0.0` or `::`.
+// Whether a bind address is `0.0.0.0` or `::`, or `::ffff:0.0.0.0`, which Linux
+// binds as the IPv4 wildcard on an IPv6 socket.
 @(private)
 is_wildcard :: proc(a: net.Address) -> bool {
-	switch x in a {
+	switch x in netx.unmap(a) {
 	case net.IP4_Address:
 		return x == net.IP4_Address{}
 	case net.IP6_Address:

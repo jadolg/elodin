@@ -718,8 +718,8 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	times is the flood having arrived and been cut to the budget, and without that
 	the IPv6 answer below would only be saying the limiter was never reached.
 	*/
-	if !ipv6_loopback_available() {
-		skip_case(r, "rate limit: a `::` listener tells the families apart", "no IPv6 loopback on this machine")
+	if !ipv6_loopback_available() || !dual_stack_available() {
+		skip_case(r, "rate limit: a `::` listener tells the families apart", "no IPv6 loopback, or a `::` socket takes no IPv4, on this machine")
 	} else {
 		start_case(r, "rate limit: a `::` listener tells the families apart")
 		{

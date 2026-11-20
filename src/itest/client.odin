@@ -705,6 +705,38 @@ tcp_port_open :: proc(port: int) -> bool {
 }
 
 /*
+Whether a `::` listener here takes IPv4 as well: not where
+`net.ipv6.bindv6only` is set, or IPv6 is off. A case that asks a `::` or
+`::ffff:0.0.0.0` listener over IPv4 needs it, and so does the readiness probe,
+which asks over IPv4.
+*/
+dual_stack_available :: proc() -> bool {
+	server, err := net.make_bound_udp_socket(net.IP6_Address{}, 0)
+	if err != nil {
+		return false
+	}
+	defer net.close(server)
+	if net.set_option(server, .Receive_Timeout, CLIENT_TIMEOUT) != nil {
+		return false
+	}
+	bound, berr := net.bound_endpoint(server)
+	if berr != nil {
+		return false
+	}
+	client, cerr := net.make_unbound_udp_socket(.IP4)
+	if cerr != nil {
+		return false
+	}
+	defer net.close(client)
+	if _, serr := net.send_udp(client, []u8{0}, {net.IP4_Loopback, bound.port}); serr != nil {
+		return false
+	}
+	buf: [1]u8
+	_, _, rerr := net.recv_udp(server, buf[:])
+	return rerr == nil
+}
+
+/*
 Whether this machine can be an IPv6 client at all.
 
 Asked before a case that needs one, so a container without IPv6 skips it rather

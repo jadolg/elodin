@@ -32,10 +32,14 @@ run_udp_source_cases :: proc(r: ^Runner) {
 	defer mock_stop(mock)
 
 	udp_source_answer_cases(r, upstream_port, "0.0.0.0")
-	if ipv6_loopback_available() {
+	switch {
+	case !dual_stack_available():
+		skip_case(r, "udp: bound to :: or ::ffff:0.0.0.0, an answer comes from the address asked", "a `::` socket takes no IPv4 here")
+	case !ipv6_loopback_available():
+		skip_case(r, "udp: bound to :: or ::ffff:0.0.0.0, an answer comes from the address asked", "no IPv6 loopback on this machine")
+	case:
 		udp_source_answer_cases(r, upstream_port, "::")
-	} else {
-		skip_case(r, "udp: bound to ::, an answer comes from the address asked", "no IPv6 loopback on this machine")
+		udp_source_answer_cases(r, upstream_port, "::ffff:0.0.0.0")
 	}
 	udp_source_slip_case(r, upstream_port)
 }

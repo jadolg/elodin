@@ -2,6 +2,7 @@ package loop
 
 import "core:log"
 import "core:net"
+import "core:os"
 import "core:sys/linux"
 import "core:testing"
 
@@ -228,9 +229,17 @@ test_a_source_the_kernel_refuses_falls_back_to_the_route :: proc(t: ^testing.T) 
 		{wildcard = net.IP6_Address{}, loopback = net.IP6_Loopback, elsewhere = net.IP6_Address{0 = 0x2001, 1 = 0xdb8, 7 = 9}},
 	}
 	for c in cases {
-		if _, v6 := c.loopback.(net.IP6_Address); v6 && !ipv6_loopback_available() {
-			log.info("skipped: no `::1` on this machine")
-			continue
+		if _, v6 := c.loopback.(net.IP6_Address); v6 {
+			if !ipv6_loopback_available() {
+				log.info("skipped: no `::1` on this machine")
+				continue
+			}
+			// The sysctl lets an IPv6 socket send from any address at all.
+			nonlocal, rerr := os.read_entire_file("/proc/sys/net/ipv6/ip_nonlocal_bind", context.temp_allocator)
+			if rerr == nil && len(nonlocal) > 0 && nonlocal[0] == '1' {
+				log.info("skipped: net.ipv6.ip_nonlocal_bind is set on this machine")
+				continue
+			}
 		}
 		server, err := net.make_bound_udp_socket(c.wildcard, 0)
 		if !testing.expectf(t, err == nil, "socket: %v", err) {
