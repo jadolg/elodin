@@ -200,14 +200,13 @@ landlock_reads: bool
 // may be the reason: it refuses with EACCES, as a mode or an owner would.
 REFUSAL_HINT :: " (or server.sandbox refuses it: its Landlock rules reach only the paths named at startup)"
 
-// `REFUSAL_HINT` when `err` is EACCES and the Landlock rules in force confine
-// the access refused - writing, or reading under `.Strict` - "" otherwise.
+// `hint_for` this process: with the ruleset `confine` put in force, if any.
 refusal_hint :: proc(err: os.Error, write: bool) -> string {
 	return hint_for(err, write = write, in_force = sync.atomic_load(&landlock_in_force), reads = sync.atomic_load(&landlock_reads))
 }
 
-// `refusal_hint` for a process whose ruleset is `in_force` and confines reading
-// as `reads` says.
+// `REFUSAL_HINT` when `err` is EACCES and a ruleset `in_force` confines the
+// access refused - writing, or reading where it `reads` - "" otherwise.
 @(private)
 hint_for :: proc(err: os.Error, write, in_force, reads: bool) -> string {
 	confined := in_force && (write || reads)

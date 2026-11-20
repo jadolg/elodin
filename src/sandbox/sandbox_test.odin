@@ -68,9 +68,9 @@ run_child :: proc(t: ^testing.T, body: Child, dirs: []string = nil, loc := #call
 
 // The child's checks all passed: it exited, with no bit set.
 @(private = "file")
-expect_passed :: proc(t: ^testing.T, out: Outcome, loc := #caller_location) {
-	testing.expectf(t, out.exited, "the child was killed by %v", out.signal, loc = loc)
-	testing.expectf(t, out.status == 0, "the child's failed checks: %b", out.status, loc = loc)
+expect_passed :: proc(t: ^testing.T, out: Outcome, child := "the child", loc := #caller_location) {
+	testing.expectf(t, out.exited, "%s was killed by %v", child, out.signal, loc = loc)
+	testing.expectf(t, out.status == 0, "%s's failed checks: %b", child, out.status, loc = loc)
 }
 
 @(private = "file")
@@ -163,6 +163,7 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 		}
 		failed: u8
 		self := uintptr(linux.getpid())
+		// Bit 1: the stream socket, or the options set on it.
 		if fd := linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_STREAM), uintptr(0)); fd < 0 {
 			failed |= 1 << 1
 		} else {
@@ -467,6 +468,9 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 		failed |= u8(!can_create(inside)) << 1
 		failed |= u8(can_create(outside)) << 2
 		failed |= u8(!can_read(outside)) << 3
+		if report.landlock != .Applied {
+			return failed
+		}
 		eacces := os.Platform_Error(linux.Errno.EACCES)
 		failed |= u8(refusal_hint(eacces, write = true) != REFUSAL_HINT) << 4
 		failed |= u8(refusal_hint(eacces, write = false) != "") << 5
@@ -493,22 +497,27 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 		failed |= u8(len(report.unreachable) != 1 || report.unreachable[0] != {missing, i32(linux.Errno.ENOENT)}) << 6
 		return failed
 	}
-	strict_hints :: proc(dirs: []string) -> u8 {
-		report, ok := confine({mode = .Strict, readable = {dirs[0]}})
+	strict_hints :: proc(_: []string) -> u8 {
+		report, ok := confine({mode = .Strict})
 		if report.landlock == .Unavailable {
 			return SKIP_STATUS
 		}
+		if !ok || report.landlock != .Applied {
+			return 1
+		}
 		eacces := os.Platform_Error(linux.Errno.EACCES)
 		failed: u8
-		failed |= u8(!ok || report.landlock != .Applied)
 		failed |= u8(refusal_hint(eacces, write = false) != REFUSAL_HINT) << 1
 		failed |= u8(refusal_hint(eacces, write = true) != REFUSAL_HINT) << 2
 		failed |= u8(refusal_hint(os.Platform_Error(linux.Errno.ENOENT), write = false) != "") << 3
 		return failed
 	}
-	names := [3]string{"basic", "strict", "strict's hints"}
-	for body, i in ([3]Child{basic, strict, strict_hints}) {
-		out, ok := run_child(t, body, dirs)
+	children := [?]struct {
+		name: string,
+		body: Child,
+	}{{"basic", basic}, {"strict", strict}, {"strict's hints", strict_hints}}
+	for c in children {
+		out, ok := run_child(t, c.body, dirs)
 		if !ok {
 			continue
 		}
@@ -518,11 +527,10 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 			if !testing.expectf(t, abi <= 0, "the child found no Landlock where this process finds ABI %d", abi) {
 				continue
 			}
-			fmt.eprintfln("sandbox: Landlock is not available here, so %s is not tested", names[i])
+			fmt.eprintfln("sandbox: Landlock is not available here, so %s is not tested", c.name)
 			continue
 		}
-		testing.expectf(t, out.exited, "%s: the child was killed by %v", names[i], out.signal)
-		testing.expectf(t, out.status == 0, "%s: the child's failed checks: %b", names[i], out.status)
+		expect_passed(t, out, child = c.name)
 	}
 }
 
@@ -565,21 +573,23 @@ test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^test
 		testing.expectf(t, (hint == REFUSAL_HINT) == c.hinted, "%v", c)
 	}
 
+	// Exits with the first case whose hints differ, plus one: bit 0 in force,
+	// 1 reads, 2 write, 3 EACCES rather than ENOENT.
 	wiring :: proc(_: []string) -> u8 {
-		failed: u8
 		for bits in 0 ..< 16 {
 			in_force, reads, write := bits & 1 != 0, bits & 2 != 0, bits & 4 != 0
 			err := os.Platform_Error(linux.Errno.EACCES if bits & 8 != 0 else linux.Errno.ENOENT)
 			sync.atomic_store(&landlock_in_force, in_force)
 			sync.atomic_store(&landlock_reads, reads)
 			if refusal_hint(err, write = write) != hint_for(err, write = write, in_force = in_force, reads = reads) {
-				failed |= 1 << uint(bits & 3)
+				return u8(bits + 1)
 			}
 		}
-		return failed
+		return 0
 	}
 	if out, ok := run_child(t, wiring); ok {
-		expect_passed(t, out)
+		testing.expectf(t, out.exited, "the wiring child was killed by %v", out.signal)
+		testing.expectf(t, out.status == 0, "refusal_hint and hint_for differ, first at case %04b", out.status - 1)
 	}
 }
 
