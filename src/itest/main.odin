@@ -239,6 +239,7 @@ main :: proc() {
 	if cert_ok {
 		section(&r, "listeners: udp, tcp, dot, doh")
 		run_transport_cases(&r)
+		run_tls_cipher_cases(&r)
 		run_ddr_cases(&r)
 		run_identity_cases(&r)
 		run_openssl_conf_cases(&r)

@@ -43,6 +43,13 @@ UDP→TCP retry, `version.bind`/`version.server`/`hostname.bind`/`id.server` in 
 [DDR](doh.md#discovery-by-clients-ddr) when `ddr.name` is set, refusal of zone-transfer requests, and the reserved names of
 RFC 6761 and RFC 7686 answered here instead of forwarded.
 
+TLS is 1.2 or 1.3, on the DoT and DoH listeners and towards upstreams and list
+hosts alike. Over TLS 1.2 the only suites are ECDHE with AES-GCM or
+ChaCha20-Poly1305 (RFC 9325 section 4.2), and the listeners pick by their own
+order, keeping ChaCha20 for a client that puts it first. A peer that offers
+only static RSA or CBC suites, which RFC 9325 section 4.1 and, for DoH over
+HTTP/2, RFC 9113 Appendix A rule out, cannot connect.
+
 A UDP answer leaves from the address its query was sent to, also on a
 wildcard bind (`0.0.0.0` or `::`), as RFC 1123 section 2.3 asks of a
 multihomed host. A host with several addresses, a VIP, or IPv6 temporary

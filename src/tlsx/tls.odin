@@ -462,7 +462,8 @@ client_context :: proc(
 }
 
 /*
-A fresh `SSL_CTX` for either end, held to TLS 1.2 or later, or nil.
+A fresh `SSL_CTX` for either end, held to TLS 1.2 or later and, over TLS 1.2,
+to `TLS12_CIPHERS`, or nil. A server picks the suite by its own order.
 
 Idle connections hand their record buffers back. Without the mode OpenSSL keeps
 its record buffers, ~17 KB each, for the connection's whole life; with it a
@@ -480,13 +481,31 @@ new_ssl_ctx :: proc(server: bool) -> ^SSL_CTX {
 	if ptr == nil {
 		return nil
 	}
-	if !ssl_ctx_set_min_proto_version(ptr, TLS1_2_VERSION) {
+	if !ssl_ctx_set_min_proto_version(ptr, TLS1_2_VERSION) || SSL_CTX_set_cipher_list(ptr, TLS12_CIPHERS) != 1 {
 		SSL_CTX_free(ptr)
 		return nil
+	}
+	if server {
+		// RFC 9325 section 4.2 asks a server to prefer the suites above; a
+		// client that puts ChaCha20 first, as one without AES instructions
+		// does, keeps it.
+		SSL_CTX_set_options(ptr, SSL_OP_CIPHER_SERVER_PREFERENCE | SSL_OP_PRIORITIZE_CHACHA)
 	}
 	ssl_ctx_set_mode(ptr, SSL_MODE_RELEASE_BUFFERS)
 	return ptr
 }
+
+/*
+The TLS 1.2 suites either end offers: ECDHE key exchange and an AEAD cipher,
+RFC 9325 section 4.2's four in its order and then ChaCha20-Poly1305. No static
+RSA, which gives no forward secrecy (RFC 9325 section 4.1), and no CBC, which
+RFC 9113 Appendix A forbids for HTTP/2 and RFC 8310 section 9 holds DoT to BCP
+195 for. TLS 1.3's suites are OpenSSL's own and all of that shape already.
+*/
+@(private)
+TLS12_CIPHERS :: "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:" +
+	"ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:" +
+	"ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"
 
 /*
 Pick a protocol, server preference first.

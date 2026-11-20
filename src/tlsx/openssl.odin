@@ -118,6 +118,8 @@ CMS_NOSMIMECAP :: 0x200
 TLSEXT_NAMETYPE_host_name :: 0
 
 SSL_OP_NO_TICKET :: u64(1) << 14
+SSL_OP_PRIORITIZE_CHACHA :: u64(1) << 21
+SSL_OP_CIPHER_SERVER_PREFERENCE :: u64(1) << 22
 
 SSL_SESS_CACHE_OFF :: 0x0000
 SSL_SESS_CACHE_SERVER :: 0x0002
@@ -208,6 +210,7 @@ foreign libssl {
 	SSL_session_reused :: proc(ssl: ^SSL) -> c.int ---
 	SSL_version :: proc(ssl: ^SSL) -> c.int ---
 	SSL_CTX_set_options :: proc(ctx: ^SSL_CTX, op: u64) -> u64 ---
+	SSL_CTX_set_cipher_list :: proc(ctx: ^SSL_CTX, list: cstring) -> c.int ---
 	SSL_SESSION_get0_ticket :: proc(s: ^SSL_SESSION, tick: ^[^]u8, len: ^c.size_t) ---
 
 	// The material a context was loaded with, borrowed back out of it. `get0`

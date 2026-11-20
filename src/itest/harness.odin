@@ -1388,32 +1388,28 @@ open_descriptor_count :: proc(pid: int = 0) -> (n: int, ok: bool) {
 }
 
 // A self-signed pair naming `name` in both CN and SAN, so a verifying client
-// dialling `name` accepts one and refuses the other.
-generate_named_cert :: proc(cert_path, key_path, name: string) -> bool {
-	process, perr := os.process_start(
-		os.Process_Desc {
-			command = []string {
-				"openssl",
-				"req",
-				"-x509",
-				"-newkey",
-				"ec",
-				"-pkeyopt",
-				"ec_paramgen_curve:prime256v1",
-				"-nodes",
-				"-keyout",
-				key_path,
-				"-out",
-				cert_path,
-				"-days",
-				"2",
-				"-subj",
-				fmt.tprintf("/CN=%s", name),
-				"-addext",
-				fmt.tprintf("subjectAltName=DNS:%s", name),
-			},
-		},
+// dialling `name` accepts one and refuses the other. P-256 unless `rsa`, which
+// is RSA-2048: the key static-RSA key exchange needs.
+generate_named_cert :: proc(cert_path, key_path, name: string, rsa := false) -> bool {
+	key_args := []string{"-newkey", "rsa:2048"} if rsa else []string{"-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1"}
+	command := make([dynamic]string, context.temp_allocator)
+	append(&command, "openssl", "req", "-x509")
+	append(&command, ..key_args)
+	append(
+		&command,
+		"-nodes",
+		"-keyout",
+		key_path,
+		"-out",
+		cert_path,
+		"-days",
+		"2",
+		"-subj",
+		fmt.tprintf("/CN=%s", name),
+		"-addext",
+		fmt.tprintf("subjectAltName=DNS:%s", name),
 	)
+	process, perr := os.process_start(os.Process_Desc{command = command[:]})
 	if perr != nil {
 		return false
 	}

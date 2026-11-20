@@ -114,7 +114,7 @@ generate_certs :: proc() {
 	cert_ok = self_signed(CERT_DIR, cert_path, key_path, CERT_DAYS, "/CN=elodin.local", ELODIN_SAN)
 }
 
-@(private = "file")
+@(private)
 ensure_certs :: proc() -> (cert, key: string, ok: bool) {
 	sync.once_do(&cert_once, generate_certs)
 	return cert_path, key_path, cert_ok
