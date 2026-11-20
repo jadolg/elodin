@@ -6,6 +6,7 @@ import "core:io"
 import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:sys/linux"
 import "core:sys/posix"
 import "core:testing"
@@ -14,12 +15,13 @@ import "core:thread"
 /*
 Each test sandboxes a forked child, since neither layer can be taken off the
 process that has it. The child reports through its exit status: the bits of the
-checks that failed, or `SKIP_STATUS` when the kernel lacks what is tested. It
+checks that failed, bits 0 to 6 only, or `SKIP_STATUS` when the kernel lacks
+what is tested, which no set of failed checks can equal. It
 allocates only from an arena over its own stack, as the parent's other threads
 may hold the heap's lock at the fork.
 */
 @(private = "file")
-SKIP_STATUS :: 77
+SKIP_STATUS :: 1 << 7
 
 // A child's body. `dirs` is what its test passed to `run_child`: tests run in
 // parallel, so a package variable would hand it another test's paths.
@@ -175,7 +177,7 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 			   set(fd, SOL_SOCKET, SO_KEEPALIVE, &one, size_of(one)) != .EPERM ||
 			   set(fd, IPPROTO_TCP, SO_KEEPALIVE, &one, size_of(one)) != .EPERM ||
 			   set(fd, SOL_SOCKET, TCP_NODELAY, &one, size_of(one)) != .EPERM {
-				failed |= 1 << 7
+				failed |= 1 << 1
 			}
 		}
 		if errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_UNIX), uintptr(SOCK_DGRAM), uintptr(0))) != .EAFNOSUPPORT {
@@ -466,7 +468,9 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 		failed |= u8(can_create(outside)) << 2
 		failed |= u8(!can_read(outside)) << 3
 		eacces := os.Platform_Error(linux.Errno.EACCES)
-		failed |= u8(refusal_hint(eacces, write = true) != REFUSAL_HINT || refusal_hint(eacces, write = false) != "") << 4
+		failed |= u8(refusal_hint(eacces, write = true) != REFUSAL_HINT) << 4
+		failed |= u8(refusal_hint(eacces, write = false) != "") << 5
+		failed |= u8(refusal_hint(os.Platform_Error(linux.Errno.ENOENT), write = true) != "") << 6
 		return failed
 	}
 	strict :: proc(dirs: []string) -> u8 {
@@ -487,10 +491,23 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 		failed |= u8(err != .NONE) << 5
 		linux.close(meminfo)
 		failed |= u8(len(report.unreachable) != 1 || report.unreachable[0] != {missing, i32(linux.Errno.ENOENT)}) << 6
-		failed |= u8(refusal_hint(os.Platform_Error(linux.Errno.EACCES), write = false) != REFUSAL_HINT) << 7
 		return failed
 	}
-	for body, i in ([2]Child{basic, strict}) {
+	strict_hints :: proc(dirs: []string) -> u8 {
+		report, ok := confine({mode = .Strict, readable = {dirs[0]}})
+		if report.landlock == .Unavailable {
+			return SKIP_STATUS
+		}
+		eacces := os.Platform_Error(linux.Errno.EACCES)
+		failed: u8
+		failed |= u8(!ok || report.landlock != .Applied)
+		failed |= u8(refusal_hint(eacces, write = false) != REFUSAL_HINT) << 1
+		failed |= u8(refusal_hint(eacces, write = true) != REFUSAL_HINT) << 2
+		failed |= u8(refusal_hint(os.Platform_Error(linux.Errno.ENOENT), write = false) != "") << 3
+		return failed
+	}
+	names := [3]string{"basic", "strict", "strict's hints"}
+	for body, i in ([3]Child{basic, strict, strict_hints}) {
 		out, ok := run_child(t, body, dirs)
 		if !ok {
 			continue
@@ -501,10 +518,10 @@ test_landlock_confines_writes_and_under_strict_reads :: proc(t: ^testing.T) {
 			if !testing.expectf(t, abi <= 0, "the child found no Landlock where this process finds ABI %d", abi) {
 				continue
 			}
-			fmt.eprintfln("sandbox: Landlock is not available here, so %s is not tested", "basic" if i == 0 else "strict")
+			fmt.eprintfln("sandbox: Landlock is not available here, so %s is not tested", names[i])
 			continue
 		}
-		expect_passed(t, out)
+		testing.expectf(t, out.exited && out.status == 0, "%s: the child's failed checks: %b, killed by %v", names[i], out.status, out.signal)
 	}
 }
 
@@ -521,8 +538,10 @@ test_landlock_handles_only_what_the_abi_knows :: proc(t: ^testing.T) {
 }
 
 // The hint is for a refusal Landlock may have made: EACCES, with it in force,
-// on writing, or on reading where it confines reads too. That `refusal_hint`
-// knows what `confine` put in force is the Landlock test's.
+// on writing, or on reading where it confines reads too. `refusal_hint` asks
+// `hint_for` with the flags `confine` sets: checked here in a child, which may
+// set them without another test seeing it, and under a real ruleset by the
+// Landlock test.
 @(test)
 test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^testing.T) {
 	eacces, enoent := os.Platform_Error(linux.Errno.EACCES), os.Platform_Error(linux.Errno.ENOENT)
@@ -543,6 +562,23 @@ test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^test
 	for c in cases {
 		hint := hint_for(c.err, write = c.write, in_force = c.in_force, reads = c.reads)
 		testing.expectf(t, (hint == REFUSAL_HINT) == c.hinted, "%v", c)
+	}
+
+	wiring :: proc(_: []string) -> u8 {
+		failed: u8
+		for bits in 0 ..< 16 {
+			in_force, reads, write := bits & 1 != 0, bits & 2 != 0, bits & 4 != 0
+			err := os.Platform_Error(linux.Errno.EACCES if bits & 8 != 0 else linux.Errno.ENOENT)
+			sync.atomic_store(&landlock_in_force, in_force)
+			sync.atomic_store(&landlock_reads, reads)
+			if refusal_hint(err, write = write) != hint_for(err, write = write, in_force = in_force, reads = reads) {
+				failed |= 1 << uint(bits & 3)
+			}
+		}
+		return failed
+	}
+	if out, ok := run_child(t, wiring); ok {
+		expect_passed(t, out)
 	}
 }
 
