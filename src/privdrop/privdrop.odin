@@ -298,30 +298,32 @@ chowning it as root would hand that file over too. That is the check
 systemd-tmpfiles makes before a chown of its own. Symlinks, devices, FIFOs and
 sockets are left alone as well. Every entry is looked at and chowned through
 one descriptor (`O_PATH`, `O_NOFOLLOW`), so it cannot be swapped between the
-two, and root never opens it for reading. `skipped` names the entries left as
-they were, in `allocator`.
+two, and root never opens it for reading. `skipped` counts the entries left as
+they were, and `named` names the first `HAND_OVER_NAMED` of them, in `allocator`:
+the account decides how many there are. An entry gone before it is looked at is
+neither.
 
 A path that does not exist is not a failure: nothing has been cached yet, and
 the process creates the directory itself, under its own account.
 */
-hand_over :: proc(path: string, id: Identity, allocator := context.temp_allocator) -> (ok: bool, skipped: []string) {
+hand_over :: proc(path: string, id: Identity, allocator := context.temp_allocator) -> (ok: bool, named: []string, skipped: int) {
 	if path == "" || !os.exists(path) {
-		return true, nil
+		return true, nil, 0
 	}
 	cpath := strings.clone_to_cstring(path, context.temp_allocator)
 	dir := posix.open(cpath, {.DIRECTORY, .NOFOLLOW, .CLOEXEC})
 	if dir == -1 {
-		return false, nil
+		return false, nil, 0
 	}
 	ok = posix.fchown(dir, id.uid, id.gid) == .OK
 	// `fdopendir` owns the descriptor from here; `closedir` closes it.
 	stream := posix.fdopendir(dir)
 	if stream == nil {
 		posix.close(dir)
-		return false, nil
+		return false, nil, 0
 	}
 	defer posix.closedir(stream)
-	left := make([dynamic]string, allocator)
+	left := make([dynamic]string, 0, HAND_OVER_NAMED, allocator)
 	for {
 		entry := posix.readdir(stream)
 		if entry == nil {
@@ -332,20 +334,28 @@ hand_over :: proc(path: string, id: Identity, allocator := context.temp_allocato
 			continue
 		}
 		switch take(linux.Fd(dir), name, id) {
-		case .Taken:
+		case .Taken, .Gone:
 		case .Skipped:
-			append(&left, strings.clone_from_cstring(name, allocator))
+			skipped += 1
+			if len(left) < HAND_OVER_NAMED {
+				append(&left, strings.clone_from_cstring(name, allocator))
+			}
 		case .Failed:
 			ok = false
 		}
 	}
-	return ok, left[:]
+	return ok, left[:], skipped
 }
+
+// How many of the entries `hand_over` leaves alone it names.
+HAND_OVER_NAMED :: 8
 
 @(private)
 Take :: enum {
 	Taken,
 	Skipped,
+	// Removed between the listing and the look: nothing to hand over.
+	Gone,
 	Failed,
 }
 
@@ -356,6 +366,9 @@ single link; see `hand_over`.
 @(private)
 take :: proc(dir: linux.Fd, name: cstring, id: Identity) -> Take {
 	fd, oerr := linux.openat(dir, name, {.PATH, .NOFOLLOW, .CLOEXEC})
+	if oerr == .ENOENT {
+		return .Gone
+	}
 	if oerr != .NONE {
 		return .Failed
 	}

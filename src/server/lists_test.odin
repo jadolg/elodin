@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:strings"
+import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -479,7 +480,7 @@ test_a_named_lists_copy_survives_the_fingerprint :: proc(t: ^testing.T) {
 	defer {
 		os.remove(path)
 		os.remove(source_path(path))
-		os.remove(fmt.tprintf("%s.tmp", path))
+		os.remove_all(fmt.tprintf("%s.tmp", path))
 	}
 	testing.expect(t, os.write_entire_file(path, "0.0.0.0 named.example\n") == nil)
 	_, fresh := fetch_list(&cfg, named)
@@ -491,7 +492,10 @@ test_a_named_lists_copy_survives_the_fingerprint :: proc(t: ^testing.T) {
 	// A query copy, then a write of the same name for the url with none fails.
 	save_cached_copy(&cfg, named, "0.0.0.0 named.example\n")
 	testing.expect(t, os.exists(source_path(path)))
+	// A non-empty directory in the `.tmp`'s place, which the write cannot
+	// remove to create its own.
 	testing.expect(t, os.make_directory(fmt.tprintf("%s.tmp", path)) == nil)
+	testing.expect(t, os.write_entire_file(fmt.tprintf("%s.tmp/keep", path), "x") == nil)
 	bare := config.Block_List{name = "oisd", url = "http://127.0.0.1:1/l", format = .Hosts, enabled = true, named = true}
 	save_cached_copy(&cfg, bare, "0.0.0.0 bare.example\n")
 	testing.expect(t, os.exists(source_path(path)), "a failed write dropped the old copy's fingerprint")
@@ -747,4 +751,83 @@ test_a_disabled_entry_does_not_lend_its_source_a_history :: proc(t: ^testing.T) 
 	generation := filter.engine_generation(engine)
 	reload_filters(&s, true)
 	testing.expect(t, filter.engine_generation(engine) != generation, "a list that never loaded held the refresh back")
+}
+
+/*
+The cache directory is the service account's, and a root start downloads and
+reads the lists before the drop (#688), so neither the write nor the reads
+follow a symlink there: a `.tmp` planted as a link to another file is replaced,
+not written through, and a cached copy or fingerprint that is a link is not
+read.
+*/
+@(test)
+test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
+	// Registered first so it runs last: the removals below read paths it zeroes.
+	defer free_all(context.temp_allocator)
+	cfg, dir := list_test_dir(t, "symlinks")
+	defer os.remove_all(dir)
+	victim := fmt.tprintf("%s-victim", dir)
+	defer os.remove(victim)
+	if !testing.expect(t, os.write_entire_file(victim, "0.0.0.0 secret.example\n") == nil, "cannot write the victim") {
+		return
+	}
+	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt", format = .Hosts, enabled = true}
+	path := list_cache_path(&cfg, list)
+	link := proc(target, at: string) -> bool {
+		return posix.symlink(strings.clone_to_cstring(target, context.temp_allocator), strings.clone_to_cstring(at, context.temp_allocator)) == .OK
+	}
+
+	if !testing.expect(t, link(victim, fmt.tprintf("%s.tmp", path)), "cannot plant the .tmp link") {
+		return
+	}
+	testing.expect_value(t, write_cache_file(path, transmute([]byte)string("0.0.0.0 new.example\n")), nil)
+	after, verr := os.read_entire_file(victim, context.temp_allocator)
+	testing.expect_value(t, verr, nil)
+	testing.expectf(t, string(after) == "0.0.0.0 secret.example\n", "the file the .tmp linked to was written: %q", string(after))
+	// The positive half: the copy itself was written.
+	written, werr := os.read_entire_file(path, context.temp_allocator)
+	testing.expect_value(t, werr, nil)
+	testing.expect_value(t, string(written), "0.0.0.0 new.example\n")
+
+	// The premise of the read: as a plain file, the copy loads.
+	text, load := cached_copy(&cfg, list, .Stale)
+	testing.expectf(t, load == .Stale && text == "0.0.0.0 new.example\n", "a plain copy did not load: %v %q", load, text)
+	delete(text)
+
+	testing.expect_value(t, os.remove(path), nil)
+	if !testing.expect(t, link(victim, path), "cannot plant the copy link") {
+		return
+	}
+	text, load = cached_copy(&cfg, list, .Stale)
+	testing.expectf(t, load == .Unavailable && text == "", "a linked copy was read: %v %q", load, text)
+	delete(text)
+
+	// A FIFO in the copy's place is neither waited on nor read.
+	testing.expect_value(t, os.remove(path), nil)
+	if !testing.expect(t, posix.mkfifo(strings.clone_to_cstring(path, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {
+		return
+	}
+	_, fifo_read := read_cache_file(path, context.temp_allocator)
+	testing.expect(t, !fifo_read, "a FIFO was read as a cached copy")
+
+	// A fingerprint that is a link: the copy of a url with a query is the one
+	// whose fingerprint matches, and a linked one is not read to match it.
+	queried := config.Block_List{name = "q", url = "http://192.0.2.1/q.txt?key=K", format = .Hosts, enabled = true}
+	qpath := list_cache_path(&cfg, queried)
+	src, has := source_of(queried)
+	if !testing.expect(t, has, "premise: a url with a query has a fingerprint") {
+		return
+	}
+	if !testing.expect(t, os.write_entire_file(victim, src) == nil, "cannot write the fingerprint") {
+		return
+	}
+	testing.expect(t, os.write_entire_file(qpath, "0.0.0.0 q.example\n") == nil)
+	if !testing.expect(t, link(victim, source_path(qpath)), "cannot plant the fingerprint link") {
+		return
+	}
+	testing.expect(t, !copy_is_of(queried, qpath), "a linked fingerprint was read")
+	// The premise: the same fingerprint as a plain file matches.
+	testing.expect_value(t, os.remove(source_path(qpath)), nil)
+	testing.expect(t, os.write_entire_file(source_path(qpath), src) == nil)
+	testing.expect(t, copy_is_of(queried, qpath), "a plain fingerprint did not match")
 }

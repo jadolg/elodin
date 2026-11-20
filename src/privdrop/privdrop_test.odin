@@ -5,6 +5,8 @@ import "core:log"
 import "core:os"
 import "core:path/filepath"
 import "core:slice"
+import "core:strings"
+import "core:sys/linux"
 import "core:sys/posix"
 import "core:testing"
 
@@ -172,9 +174,9 @@ test_hand_over_covers_the_directory_and_its_entries :: proc(t: ^testing.T) {
 		gid  = posix.getegid(),
 		name = "self",
 	}
-	handed, skipped := hand_over(dir, self)
+	handed, named, skipped := hand_over(dir, self)
 	testing.expect(t, handed, "handing a path to its own owner should succeed")
-	testing.expectf(t, len(skipped) == 0, "a plain file was left as it was: %v", skipped)
+	testing.expectf(t, skipped == 0 && len(named) == 0, "a plain file was left as it was: %d %v", skipped, named)
 
 	if skip_when_root() {
 		return
@@ -184,9 +186,9 @@ test_hand_over_covers_the_directory_and_its_entries :: proc(t: ^testing.T) {
 		gid  = 0,
 		name = "root",
 	}
-	handed, skipped = hand_over(dir, other)
+	handed, named, skipped = hand_over(dir, other)
 	testing.expect(t, !handed, "an unprivileged chown to root should be reported as failed")
-	testing.expectf(t, len(skipped) == 0, "a plain file was left as it was: %v", skipped)
+	testing.expectf(t, skipped == 0 && len(named) == 0, "a plain file was left as it was: %d %v", skipped, named)
 }
 
 /*
@@ -239,10 +241,10 @@ test_hand_over_takes_only_directories_and_singly_linked_files :: proc(t: ^testin
 		gid  = posix.getegid(),
 		name = "self",
 	}
-	handed, skipped := hand_over(dir, self)
+	handed, named, skipped := hand_over(dir, self)
 	testing.expect(t, handed, "handing the directory over failed")
-	slice.sort(skipped)
-	testing.expectf(t, slice.equal(skipped, []string{"fifo.list", "hardlink.list", "symlink.list"}), "left as they were: %v", skipped)
+	slice.sort(named)
+	testing.expectf(t, skipped == 3 && slice.equal(named, []string{"fifo.list", "hardlink.list", "symlink.list"}), "left as they were: %d %v", skipped, named)
 }
 
 /*
@@ -288,10 +290,10 @@ test_hand_over_as_root_leaves_a_linked_file_alone :: proc(t: ^testing.T) {
 		gid  = 65534,
 		name = "nobody",
 	}
-	handed, skipped := hand_over(dir, nobody)
+	handed, named, skipped := hand_over(dir, nobody)
 	testing.expect(t, handed, "handing the directory over failed")
-	slice.sort(skipped)
-	testing.expectf(t, slice.equal(skipped, []string{"hardlink.list", "symlink.list"}), "left as they were: %v", skipped)
+	slice.sort(named)
+	testing.expectf(t, skipped == 2 && slice.equal(named, []string{"hardlink.list", "symlink.list"}), "left as they were: %d %v", skipped, named)
 	owner := proc(p: cstring) -> posix.uid_t {
 		st: posix.stat_t
 		if posix.stat(p, &st) != .OK {
@@ -304,6 +306,54 @@ test_hand_over_as_root_leaves_a_linked_file_alone :: proc(t: ^testing.T) {
 	testing.expectf(t, owner(plain) == nobody.uid, "the plain file is uid %d's", owner(plain))
 }
 
+/*
+The account decides how many entries the directory holds, so `hand_over` names
+at most `HAND_OVER_NAMED` of those it leaves and counts the rest.
+*/
+@(test)
+test_hand_over_names_a_bounded_number_of_what_it_leaves :: proc(t: ^testing.T) {
+	dir, ok := scratch_dir(t, "elodin-privdrop-many")
+	if !ok {
+		return
+	}
+	defer os.remove_all(dir)
+	FIFOS :: HAND_OVER_NAMED * 3
+	for i in 0 ..< FIFOS {
+		if !testing.expectf(t, posix.mkfifo(fmt.ctprintf("%s/f%d", dir, i), {.IRUSR, .IWUSR}) == .OK, "cannot make FIFO %d", i) {
+			return
+		}
+	}
+	self := Identity {
+		uid  = posix.geteuid(),
+		gid  = posix.getegid(),
+		name = "self",
+	}
+	handed, named, skipped := hand_over(dir, self)
+	testing.expect(t, handed, "handing the directory over failed")
+	testing.expectf(t, skipped == FIFOS && len(named) == HAND_OVER_NAMED, "left %d, named %d", skipped, len(named))
+}
+
+// An entry removed between the listing and the look is gone, not a failure.
+@(test)
+test_take_reads_a_vanished_entry_as_gone :: proc(t: ^testing.T) {
+	dir, ok := scratch_dir(t, "elodin-privdrop-gone")
+	if !ok {
+		return
+	}
+	defer os.remove_all(dir)
+	fd := posix.open(strings.clone_to_cstring(dir, context.temp_allocator), {.DIRECTORY, .CLOEXEC})
+	if !testing.expect(t, fd != -1, "cannot open the directory") {
+		return
+	}
+	defer posix.close(fd)
+	self := Identity {
+		uid  = posix.geteuid(),
+		gid  = posix.getegid(),
+		name = "self",
+	}
+	testing.expect_value(t, take(linux.Fd(fd), "not-there.list", self), Take.Gone)
+}
+
 @(test)
 test_hand_over_ignores_a_path_that_is_not_there :: proc(t: ^testing.T) {
 	self := Identity {
@@ -313,9 +363,9 @@ test_hand_over_ignores_a_path_that_is_not_there :: proc(t: ^testing.T) {
 	}
 	// A cache directory that was never created is not something to fail over:
 	// the process makes it itself on the next refresh, under its own account.
-	handed, skipped := hand_over("/nonexistent/elodin-cache", self)
+	handed, named, skipped := hand_over("/nonexistent/elodin-cache", self)
 	testing.expect(t, handed, "a missing path should not be an error")
-	testing.expectf(t, len(skipped) == 0, "a missing path left entries: %v", skipped)
+	testing.expectf(t, skipped == 0 && len(named) == 0, "a missing path left entries: %d %v", skipped, named)
 }
 
 /*

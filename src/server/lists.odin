@@ -6,6 +6,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:sync"
+import "core:sys/posix"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
@@ -368,8 +369,8 @@ cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Loa
 		}
 		return "", .Unavailable
 	}
-	data, err := os.read_entire_file(cache_path, context.allocator)
-	if err != nil {
+	data, read := read_cache_file(cache_path, context.allocator)
+	if !read {
 		return "", .Unavailable
 	}
 	// A page an earlier build cached before downloads were checked (#317).
@@ -462,8 +463,36 @@ copy_is_of :: proc(list: config.Block_List, cache_path: string) -> bool {
 	if !has {
 		return false
 	}
-	data, err := os.read_entire_file(source_path(cache_path), context.temp_allocator)
-	return err == nil && string(data) == src
+	data, read := read_cache_file(source_path(cache_path), context.temp_allocator)
+	return read && string(data) == src
+}
+
+/*
+Read a file of the list cache, if it is a regular file and its name is not a
+symlink. The directory is the service account's, and a root start reads it
+before the drop (#688): a link there to a file only root can read would load
+that file as a list. O_NONBLOCK so a FIFO put there does not hold the start.
+*/
+@(private)
+read_cache_file :: proc(path: string, allocator := context.allocator) -> (data: []byte, ok: bool) {
+	fd := posix.open(strings.clone_to_cstring(path, context.temp_allocator), {.NOFOLLOW, .NONBLOCK, .CLOEXEC})
+	if fd == -1 {
+		return nil, false
+	}
+	st: posix.stat_t
+	if posix.fstat(fd, &st) != .OK || !posix.S_ISREG(st.st_mode) {
+		posix.close(fd)
+		return nil, false
+	}
+	// `os` closes the descriptor with the file.
+	f := os.new_file(uintptr(fd), path)
+	if f == nil {
+		posix.close(fd)
+		return nil, false
+	}
+	defer os.close(f)
+	bytes, err := os.read_entire_file_from_file(f, allocator)
+	return bytes, err == nil
 }
 
 @(private)
@@ -529,7 +558,22 @@ cannot be another list's.
 @(private)
 write_cache_file :: proc(path: string, body: []byte) -> (err: os.Error) {
 	tmp := fmt.tprintf("%s.tmp", path)
-	f := os.open(tmp, {.Write, .Create, .Trunc}, os.Permissions_Read_All + {.Write_User}) or_return
+	/*
+	Created afresh, O_EXCL: the directory is the service account's, and a root
+	start writes here before the drop (#688). An O_EXCL create fails on a symlink
+	rather than following it. One already there - left by a stop mid-write, or
+	planted - is removed and the create tried once more, which fails, writing
+	nothing elsewhere, if one is put back in between.
+	*/
+	flags :: os.File_Flags{.Write, .Create, .Excl}
+	perms :: os.Permissions_Read_All + {.Write_User}
+	f, oerr := os.open(tmp, flags, perms)
+	if oerr == .Exist {
+		os.remove(tmp) or_return
+		f = os.open(tmp, flags, perms) or_return
+	} else if oerr != nil {
+		return oerr
+	}
 	_, err = os.write(f, body)
 	if err == nil {
 		err = os.sync(f)

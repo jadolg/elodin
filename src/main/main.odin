@@ -998,7 +998,7 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 	}
 
 	if cfg.blocking.enabled && cfg.blocking.cache_dir != "" {
-		handed, skipped := privdrop.hand_over(cfg.blocking.cache_dir, service)
+		handed, named, skipped := privdrop.hand_over(cfg.blocking.cache_dir, service)
 		if !handed {
 			logx.warnf(
 				"could not give %q to %s; the lists are in effect but will be re-downloaded on each start",
@@ -1006,11 +1006,13 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 				cfg.server.user,
 			)
 		}
-		if len(skipped) > 0 {
+		if skipped > 0 {
 			logx.warnf(
-				"left %v in %q as they are rather than give them to %s: only directories and files with one link are handed over",
+				"left %d entries in %q as they are (%s%s) rather than give them to %s: only directories and files with one link are handed over",
 				skipped,
 				cfg.blocking.cache_dir,
+				strings.join(named, ", ", context.temp_allocator),
+				", ..." if skipped > len(named) else "",
 				cfg.server.user,
 			)
 		}

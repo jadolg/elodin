@@ -78,4 +78,19 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 		check(r, out_uid == 0, "the file the link points at was given to uid %d", out_uid)
 	}
 	check(r, log_contains(&srv, "x.list"), "the link left alone was not named:\n%s", read_log(&srv))
+	// And what elodin wrote there itself was handed over with the directory.
+	entries, rerr := os.read_directory_by_path(cache_dir, -1, context.temp_allocator)
+	if check(r, rerr == nil, "cannot list %s: %v", cache_dir, rerr) {
+		own := 0
+		for entry in entries {
+			if entry.name == "x.list" {
+				continue
+			}
+			own += 1
+			if uid, read := owner(entry.fullpath); check(r, read, "cannot stat %s", entry.fullpath) {
+				check(r, uid != 0, "%s, which elodin wrote, was not handed over", entry.name)
+			}
+		}
+		check(r, own > 0, "elodin cached nothing in %s", cache_dir)
+	}
 }
