@@ -394,7 +394,13 @@ resolve_endpoint :: proc(
 	// that one, rather than counting the difference as a move.
 	refresh := false,
 ) -> Error {
-	addr, ttl, err := bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
+	keep: net.Address
+	if refresh {
+		sync.mutex_lock(&u.mu)
+		keep = u.endpoint.address
+		sync.mutex_unlock(&u.mu)
+	}
+	addr, ttl, err := bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline, keep)
 	if err != .None {
 		// Held already, by an earlier lookup or another thread's: kept, and
 		// the upstream is not unresolvable. Asked again `BOOTSTRAP_MIN_TTL`
@@ -426,9 +432,14 @@ resolve_endpoint :: proc(
 		u.epoch += 1
 		// A server cookie is the old address's (RFC 7873 section 5.1), and the
 		// client cookie is drawn afresh for the new one (RFC 9018 section 3).
-		// With the epoch, so no query dials the new address with the old ones.
+		// With the epoch, so a connection dialled from here on carries the new
+		// ones; a query that attached its cookie just before may still take
+		// the old ones to the new address, which answers BADCOOKIE and is
+		// asked again (`exchange_with_cookie`).
 		forget_cookie(u)
 		init_cookie(u)
+		// What ALPN chose was the old address's choice.
+		u.proto = .Unknown
 	}
 	u.endpoint = endpoint
 	sync.atomic_store(&u.expires, 0 if ttl == 0 else loop.moment_add(loop.moment_now(), ttl))

@@ -30,6 +30,10 @@ Ttl_Mock :: struct {
 	stray:  [4]u8,
 	// The CNAME after the records it leads to rather than before.
 	cname_last: bool,
+	// When set, AAAA is answered with it; A is answered with nothing while
+	// `no_a`.
+	addr6:  [16]u8,
+	no_a:   bool,
 }
 
 @(private = "file")
@@ -48,6 +52,7 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 		sync.mutex_lock(&m.mu)
 		m.asked += 1
 		silent, addr, ttl, delay, also, cname, stray, cname_last, turn := m.silent, m.addr, m.ttl, m.delay, m.also, m.cname, m.stray, m.cname_last, m.asked % 2 == 0
+		addr6, no_a := m.addr6, m.no_a
 		sync.mutex_unlock(&m.mu)
 		if silent {
 			continue
@@ -57,7 +62,12 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 		}
 		resp := dns.make_response(msg, .No_Error, context.temp_allocator)
 		q := msg.question[0]
-		if q.type == .A {
+		if q.type == .AAAA && addr6 != {} {
+			answer := make([]dns.Record, 1, context.temp_allocator)
+			answer[0] = dns.Record{name = q.name, type = .AAAA, class = .IN, ttl = ttl, data = dns.Rdata_AAAA{addr = addr6}}
+			resp.answer = answer
+		}
+		if q.type == .A && !no_a {
 			answer := make([dynamic]dns.Record, context.temp_allocator)
 			if stray != {} {
 				append(&answer, dns.Record{name = "stray.invalid.", type = .A, class = .IN, ttl = 1, data = dns.Rdata_A{addr = stray}})
@@ -230,6 +240,7 @@ test_an_upstream_hostname_is_asked_again_once_its_ttl_is_past :: proc(t: ^testin
 		// A server cookie learned from the address held.
 		u.cookie.server_len = 8
 		client := u.cookie.client
+		u.proto = .H1
 		sync.mutex_unlock(&u.mu)
 		ttl_mock_set(&m, {127, 0, 0, 5} if moved else {127, 0, 0, 3})
 		expire_address(u, HOST + ".")
@@ -243,7 +254,9 @@ test_an_upstream_hostname_is_asked_again_once_its_ttl_is_past :: proc(t: ^testin
 		// address, so a move starts afresh.
 		sync.mutex_lock(&u.mu)
 		forgot, redrawn := u.cookie.server_len == 0, u.cookie.client != client
+		relearn := u.proto == .Unknown
 		sync.mutex_unlock(&u.mu)
+		testing.expectf(t, relearn == moved, "moved %v: the protocol is to be learned again %v", moved, relearn)
 		testing.expectf(t, forgot == moved && redrawn == moved, "moved %v: server cookie forgotten %v, client cookie drawn afresh %v", moved, forgot, redrawn)
 	}
 	testing.expect_value(t, sync.atomic_load(&c.refs), 1)
@@ -446,6 +459,15 @@ test_a_bootstrap_answer_is_read_the_same_whatever_its_order :: proc(t: ^testing.
 		testing.expectf(t, held == 30 * time.Second, "answer %d: held %v, where the CNAME's TTL is 30s", i, held)
 	}
 	testing.expect_value(t, ttl_mock_asked(&m), 3)
+
+	// A refresh that holds an address the answer still gives keeps it, lowest
+	// or not; one the answer no longer gives is let go for the lowest.
+	held_addr := net.Address(net.IP4_Address{127, 0, 0, 9})
+	addr, _, err := bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second), held_addr)
+	testing.expectf(t, err == .None && addr == held_addr, "an address still in the answer was let go for %v (%v)", addr, err)
+	gone := net.Address(net.IP4_Address{127, 0, 0, 8})
+	addr, _, err = bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second), gone)
+	testing.expectf(t, err == .None && addr == net.Address(net.IP4_Address{127, 0, 0, 7}), "an address gone from the answer was kept: %v (%v)", addr, err)
 	free_all(context.temp_allocator)
 }
 
@@ -597,5 +619,37 @@ test_replies_to_queries_from_before_a_move_keep_their_cookie :: proc(t: ^testing
 	learned = u.cookie.server_len
 	sync.mutex_unlock(&u.mu)
 	testing.expect_value(t, learned, 8)
+	free_all(context.temp_allocator)
+}
+
+/*
+A refresh asks for the family of the address it holds: a bootstrap that has no
+A answer for the moment does not move an IPv4 member to IPv6. A first lookup
+goes on to AAAA.
+*/
+@(test)
+test_a_refresh_keeps_to_the_family_it_holds :: proc(t: ^testing.T) {
+	sync.mutex_lock(&bootstrap_cache_owner)
+	defer sync.mutex_unlock(&bootstrap_cache_owner)
+	defer bootstrap_destroy()
+
+	m := Ttl_Mock {
+		ttl   = 300,
+		addr6 = {0 = 0x20, 1 = 0x01, 2 = 0x0d, 3 = 0xb8, 15 = 1},
+		no_a  = true,
+	}
+	bound, responder, ok := serve_udp_mock(t, &m, ttl_mock_loop)
+	if !ok {
+		return
+	}
+	defer stop_udp_mock(&m, responder)
+	servers := []string{net.endpoint_to_string(bound, context.temp_allocator)}
+	deadline := time.tick_add(time.tick_now(), time.Second)
+
+	_, _, err := bootstrap_resolve(servers, "family.invalid", deadline, net.IP4_Address{127, 0, 0, 1})
+	testing.expect_value(t, err, Error.Not_Resolved)
+	addr, _, first_err := bootstrap_resolve(servers, "family.invalid", deadline)
+	_, v6 := addr.(net.IP6_Address)
+	testing.expectf(t, first_err == .None && v6, "a first lookup did not go on to AAAA: %v (%v)", addr, first_err)
 	free_all(context.temp_allocator)
 }

@@ -70,9 +70,12 @@ bootstrap_ttl :: proc(ttl: u32) -> time.Duration {
 /*
 Resolve `hostname` using `servers` (plain "IP" or "IP:port" strings).
 
-A and AAAA are tried in that order; the first usable address wins. `ttl` is how
-much longer the address may be used (`bootstrap_ttl`), zero for an IP literal,
-which never needs asking again. `Not_Resolved` where no server gave one, and
+A and AAAA are tried in that order; the first usable address wins. A refresh
+passes the address it holds as `keep`: only its family is asked for, so one
+failed A lookup does not move a member to IPv6, and while the answer still
+gives it, it is the address returned. `ttl` is how much longer the address may
+be used (`bootstrap_ttl`), zero for an IP literal, which never needs asking
+again. `Not_Resolved` where no server gave one, and
 `Out_Of_Memory` where this server could not build a query or read an answer,
 which says nothing about the bootstrap servers.
 */
@@ -88,6 +91,7 @@ bootstrap_resolve :: proc(
 	Zero, as at startup and for list downloads, is no deadline.
 	*/
 	deadline := time.Tick{},
+	keep: net.Address = nil,
 ) -> (
 	addr: net.Address,
 	ttl: time.Duration,
@@ -104,7 +108,9 @@ bootstrap_resolve :: proc(
 		return nil, 0, .Out_Of_Memory
 	}
 	sync.mutex_lock(&bootstrap_cache.mu)
-	if entry, found := bootstrap_cache.entries[key]; found {
+	// An entry that gives another address than `keep` may be one of several
+	// the name has; the bootstrap servers say whether `keep` is still one.
+	if entry, found := bootstrap_cache.entries[key]; found && (keep == nil || netx.addresses_equal(entry.address, keep)) {
 		if left := -loop.moment_since(entry.expires); left > 0 {
 			sync.mutex_unlock(&bootstrap_cache.mu)
 			return entry.address, left, .None
@@ -134,7 +140,14 @@ bootstrap_resolve :: proc(
 			}
 			share_end = time.tick_add(now, left / time.Duration(len(servers) - i))
 		}
-		for qtype in ([]dns.Type{.A, .AAAA}) {
+		qtypes := []dns.Type{.A, .AAAA}
+		#partial switch _ in keep {
+		case net.IP4_Address:
+			qtypes = qtypes[:1]
+		case net.IP6_Address:
+			qtypes = qtypes[1:]
+		}
+		for qtype in qtypes {
 			// Handed down as a deadline, not as what is left of it: one worked
 			// out again inside the query would run past the share by the time
 			// between the two readings of the clock.
@@ -148,7 +161,7 @@ bootstrap_resolve :: proc(
 					query_end = share_end
 				}
 			}
-			result, held, qerr := bootstrap_query(server, hostname, qtype, query_end)
+			result, held, qerr := bootstrap_query(server, hostname, qtype, query_end, keep)
 			if qerr == .Out_Of_Memory {
 				return nil, 0, qerr
 			}
@@ -264,6 +277,8 @@ bootstrap_query :: proc(
 	qtype: dns.Type,
 	// When the query gives up, sent or not.
 	deadline: time.Tick,
+	// Returned in preference to the lowest while the answer still gives it.
+	keep: net.Address = nil,
 ) -> (
 	addr: net.Address,
 	// How long the address may be held (`bootstrap_ttl`).
@@ -365,14 +380,18 @@ bootstrap_query :: proc(
 			return nil, 0, .Not_Resolved
 		}
 		/*
-		The lowest address of the type asked, so a server that rotates the
-		order of an RRset does not look like a move on every refresh, owned by
+		`keep` while the answer gives it, else the lowest address of the type
+		asked, so a server that rotates the order of an RRset, or gives a
+		different part of it each time, does not look like a move on every
+		refresh; owned by
 		the name asked or by a CNAME followed from it; a record off that chain
 		is not about this name. Held for the shortest TTL on the chain: it is
 		only as good as its first record to expire.
 		*/
 		lowest: []u8
 		shortest := dns.TTL_MAX
+		kept := false
+		keep_raw, keep_len := address_raw(keep)
 		// The chain first, in whatever order its CNAMEs came, one hop per
 		// record at most so a loop ends.
 		owner := name
@@ -409,9 +428,15 @@ bootstrap_query :: proc(
 				continue
 			}
 			shortest = min(shortest, dns.sane_ttl(rec.ttl))
+			if len(raw) == keep_len && mem.compare(raw, keep_raw[:keep_len]) == 0 {
+				kept = true
+			}
 			if lowest == nil || mem.compare(raw, lowest) < 0 {
 				lowest = raw
 			}
+		}
+		if kept {
+			return keep, bootstrap_ttl(shortest), .None
 		}
 		switch len(lowest) {
 		case 4:
@@ -454,4 +479,17 @@ split_http_url :: proc(url: string) -> (scheme, host, path: string, port: int, h
 		resolved_port = 443 if s == "https" else 80
 	}
 	return s, h, netx.origin_form(p), resolved_port, name, true
+}
+
+// An address's bytes in network order, and how many there are; none for nil.
+@(private)
+address_raw :: proc(a: net.Address) -> (raw: [16]u8, n: int) {
+	switch v in a {
+	case net.IP4_Address:
+		raw[0], raw[1], raw[2], raw[3] = v[0], v[1], v[2], v[3]
+		return raw, 4
+	case net.IP6_Address:
+		return transmute([16]u8)v, 16
+	}
+	return raw, 0
 }
