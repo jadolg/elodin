@@ -1,0 +1,42 @@
+name: Probe hint bits
+on: pull_request
+jobs:
+  mutant:
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [none, never_stored, reads_hinted, any_error]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - uses: jdx/mise-action@v5
+        with:
+          install: true
+          cache: true
+      - run: mise run prepare
+      - name: apply mutant
+        env:
+          MUTANT: ${{ matrix.mutant }}
+        run: |
+          python3 - <<'PY'
+          import os
+          p = 'src/sandbox/landlock.odin'
+          s = open(p).read()
+          subs = {
+            'none': [],
+            'never_stored': [('\tsync.atomic_store(&landlock_in_force, true)\n', '')],
+            'reads_hinted': [('confined := in_force && (write || reads)', 'confined := in_force')],
+            'any_error': [('if confined && (err == os.Platform_Error(linux.Errno.EACCES) || err == io.Error.Permission_Denied) {', 'if confined {')],
+          }[os.environ['MUTANT']]
+          for a, b in subs:
+              assert s.count(a) == 1, a
+              s = s.replace(a, b)
+          open(p, 'w').write(s)
+          PY
+          git diff
+      - name: test
+        run: |
+          set -o pipefail
+          mise exec -- bash -c 'odin test src/sandbox -collection:elodin=src -out:bin/test_sandbox -define:ODIN_TEST_NAMES=sandbox.test_landlock_confines_writes_and_under_strict_reads -extra-linker-flags:"$ELODIN_LDFLAGS" $ELODIN_DEFINES $ELODIN_TEST_DEFINES' 2>&1 | tee out.txt
+          if grep -q 'not available' out.txt; then echo "SKIPPED"; exit 2; fi
