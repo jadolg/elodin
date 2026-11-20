@@ -35,6 +35,8 @@ Ttl_Mock :: struct {
 	// `no_a`.
 	addr6:  [16]u8,
 	no_a:   bool,
+	// A is answered SERVFAIL: a failure to say, not an answer.
+	servfail_a: bool,
 }
 
 @(private = "file")
@@ -53,7 +55,7 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 		sync.mutex_lock(&m.mu)
 		m.asked += 1
 		silent, addr, ttl, delay, also, cname, stray, cname_last, turn := m.silent, m.addr, m.ttl, m.delay, m.also, m.cname, m.stray, m.cname_last, m.asked % 2 == 0
-		addr6, no_a := m.addr6, m.no_a
+		addr6, no_a, servfail_a := m.addr6, m.no_a, m.servfail_a
 		sync.mutex_unlock(&m.mu)
 		if silent {
 			continue
@@ -61,14 +63,14 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 		if delay > 0 {
 			time.sleep(delay) // lint:allow stands in for a slow bootstrap server; nothing is ordered on it
 		}
-		resp := dns.make_response(msg, .No_Error, context.temp_allocator)
+		resp := dns.make_response(msg, .Serv_Fail if servfail_a && msg.question[0].type == .A else .No_Error, context.temp_allocator)
 		q := msg.question[0]
 		if q.type == .AAAA && addr6 != {} {
 			answer := make([]dns.Record, 1, context.temp_allocator)
 			answer[0] = dns.Record{name = q.name, type = .AAAA, class = .IN, ttl = ttl, data = dns.Rdata_AAAA{addr = addr6}}
 			resp.answer = answer
 		}
-		if q.type == .A && !no_a {
+		if q.type == .A && !no_a && !servfail_a {
 			answer := make([dynamic]dns.Record, context.temp_allocator)
 			if stray != {} {
 				append(&answer, dns.Record{name = "stray.invalid.", type = .A, class = .IN, ttl = 1, data = dns.Rdata_A{addr = stray}})
@@ -268,11 +270,17 @@ test_an_upstream_hostname_is_asked_again_once_its_ttl_is_past :: proc(t: ^testin
 	testing.expect(t, address_of(u) == net.Address(net.IP4_Address{127, 0, 0, 5}), "a failed refresh lost the address held")
 	left = expires_in(u)
 	testing.expectf(t, left > 0 && left <= BOOTSTRAP_MIN_TTL, "a failed refresh is asked again in %v", left)
+	testing.expect(t, sync.atomic_load(&u.refresh_failing), "a failed refresh was not marked, so the next would warn again")
 	// A lookup that fails while the time to ask again is still ahead, as one
 	// racing a refresh that succeeded does, leaves that time where it is.
 	before := sync.atomic_load(&u.expires)
 	testing.expect_value(t, resolve_endpoint(u, time.tick_add(time.tick_now(), 100 * time.Millisecond), refresh = true), Error.None)
 	testing.expect(t, sync.atomic_load(&u.expires) == before, "a failed lookup moved a time to ask again that was still ahead")
+	// One that succeeds ends the run, so the next failure warns again.
+	ttl_mock_set(&m, {127, 0, 0, 5})
+	expire_address(u, HOST + ".")
+	testing.expect_value(t, resolve_endpoint(u, refresh = true), Error.None)
+	testing.expect(t, !sync.atomic_load(&u.refresh_failing), "a refresh that succeeded left the run of failures marked")
 	free_all(context.temp_allocator)
 }
 
@@ -450,7 +458,7 @@ test_a_bootstrap_answer_is_read_the_same_whatever_its_order :: proc(t: ^testing.
 		sync.mutex_lock(&m.mu)
 		m.cname_last = i == 2
 		sync.mutex_unlock(&m.mu)
-		addr, held, err := bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second))
+		addr, held, _, err := bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second))
 		testing.expectf(t, err == .None && addr == net.Address(net.IP4_Address{127, 0, 0, 7}), "answer %d: got %v (%v)", i, addr, err)
 		testing.expectf(t, held == 30 * time.Second, "answer %d: held %v, where the CNAME's TTL is 30s", i, held)
 	}
@@ -459,10 +467,10 @@ test_a_bootstrap_answer_is_read_the_same_whatever_its_order :: proc(t: ^testing.
 	// A refresh that holds an address the answer still gives keeps it, lowest
 	// or not; one the answer no longer gives is let go for the lowest.
 	held_addr := net.Address(net.IP4_Address{127, 0, 0, 9})
-	addr, _, err := bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second), held_addr)
+	addr, _, _, err := bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second), held_addr)
 	testing.expectf(t, err == .None && addr == held_addr, "an address still in the answer was let go for %v (%v)", addr, err)
 	gone := net.Address(net.IP4_Address{127, 0, 0, 8})
-	addr, _, err = bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second), gone)
+	addr, _, _, err = bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second), gone)
 	testing.expectf(t, err == .None && addr == net.Address(net.IP4_Address{127, 0, 0, 7}), "an address gone from the answer was kept: %v (%v)", addr, err)
 	free_all(context.temp_allocator)
 }
@@ -592,7 +600,7 @@ test_replies_to_queries_from_before_a_move_keep_their_cookie :: proc(t: ^testing
 	// The move: the literal changes, which a refresh publishes.
 	delete(u.spec.address, u.allocator)
 	u.spec.address = strings.clone("127.0.0.2", u.allocator)
-	testing.expect_value(t, resolve_endpoint(u, refresh = true), Error.None)
+	testing.expect_value(t, resolve_endpoint(u, refresh = true, in_flight = time.Minute), Error.None)
 	sync.mutex_lock(&u.mu)
 	redrawn, forgot := u.cookie.client != old, u.cookie.server_len == 0
 	sync.mutex_unlock(&u.mu)
@@ -602,6 +610,17 @@ test_replies_to_queries_from_before_a_move_keep_their_cookie :: proc(t: ^testing
 	bare, _, bare_err := dns.encode_message(dns.Message{id = 0x6914, flags = {qr = true}, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}, context.temp_allocator)
 	if testing.expectf(t, bare_err == .None, "cannot encode the reply: %v", bare_err) {
 		testing.expect(t, !cookie_matches(u, query, bare), "a cookie-less reply to a query that carried a server cookie was taken")
+		// A second move before any cookie is learned keeps that open.
+		delete(u.spec.address, u.allocator)
+		u.spec.address = strings.clone("127.0.0.3", u.allocator)
+		testing.expect_value(t, resolve_endpoint(u, refresh = true, in_flight = time.Minute), Error.None)
+		testing.expect(t, !cookie_matches(u, query, bare), "a second move let a cookie-less reply through")
+		// Past the time any query from before the move could still wait, the
+		// query is not walked for it any more.
+		sync.mutex_lock(&u.mu)
+		u.cookie.moved_until = loop.moment_add(loop.moment_now(), -time.Second)
+		sync.mutex_unlock(&u.mu)
+		testing.expect(t, cookie_matches(u, query, bare), "the window after a move did not close")
 	}
 	reply, rok := cookied_reply(t, query, old)
 	if !rok {
@@ -631,9 +650,10 @@ test_replies_to_queries_from_before_a_move_keep_their_cookie :: proc(t: ^testing
 }
 
 /*
-A refresh asks for the family of the address it holds: a bootstrap that has no
-A answer for the moment does not move an IPv4 member to IPv6. A first lookup
-goes on to AAAA.
+A refresh asks for the family of the address it holds first. A bootstrap that
+fails to answer A (SERVFAIL) does not move an IPv4 member to IPv6; one that
+answers that the name has no A any more (NOERROR, no address) does. A first
+lookup goes on to AAAA either way.
 */
 @(test)
 test_a_refresh_keeps_to_the_family_it_holds :: proc(t: ^testing.T) {
@@ -644,7 +664,7 @@ test_a_refresh_keeps_to_the_family_it_holds :: proc(t: ^testing.T) {
 	m := Ttl_Mock {
 		ttl   = 300,
 		addr6 = {0 = 0x20, 1 = 0x01, 2 = 0x0d, 3 = 0xb8, 15 = 1},
-		no_a  = true,
+		servfail_a = true,
 	}
 	bound, responder, ok := serve_udp_mock(t, &m, ttl_mock_loop)
 	if !ok {
@@ -654,8 +674,14 @@ test_a_refresh_keeps_to_the_family_it_holds :: proc(t: ^testing.T) {
 	servers := []string{net.endpoint_to_string(bound, context.temp_allocator)}
 	deadline := time.tick_add(time.tick_now(), time.Second)
 
-	_, _, err := bootstrap_resolve(servers, "family.invalid", deadline, net.IP4_Address{127, 0, 0, 1})
+	_, _, err := bootstrap_resolve(servers, "failing.invalid", deadline, net.IP4_Address{127, 0, 0, 1})
 	testing.expect_value(t, err, Error.Not_Resolved)
+	sync.mutex_lock(&m.mu)
+	m.servfail_a, m.no_a = false, true
+	sync.mutex_unlock(&m.mu)
+	gone_addr, _, gone_err := bootstrap_resolve(servers, "gone.invalid", deadline, net.IP4_Address{127, 0, 0, 1})
+	_, gone_v6 := gone_addr.(net.IP6_Address)
+	testing.expectf(t, gone_err == .None && gone_v6, "a name with no A any more kept its refresh on A: %v (%v)", gone_addr, gone_err)
 	addr, _, first_err := bootstrap_resolve(servers, "family.invalid", deadline)
 	_, v6 := addr.(net.IP6_Address)
 	testing.expectf(t, first_err == .None && v6, "a first lookup did not go on to AAAA: %v (%v)", addr, first_err)

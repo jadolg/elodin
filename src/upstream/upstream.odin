@@ -149,6 +149,9 @@ Upstream :: struct {
 	expires:      loop.Moment,
 	// Held by the one exchange refreshing the address (see `exchange`). Atomic.
 	refreshing:   bool,
+	// A refresh has failed since the last that succeeded; see
+	// `resolve_endpoint`. Atomic.
+	refresh_failing: bool,
 	// How many times the address has moved; under `mu`. A connection dialled
 	// in an earlier one is not used again (`dialled_current_locked`).
 	epoch:        int,
@@ -397,6 +400,9 @@ resolve_endpoint :: proc(
 	// lookup that finds one already published by a lookup racing it leaves
 	// that one, rather than counting the difference as a move.
 	refresh := false,
+	// How long a query sent before a move may still be waiting on its reply:
+	// the exchange's timeout. Cookies are owed on those replies that long.
+	in_flight := time.Duration(0),
 ) -> Error {
 	keep: net.Address
 	if refresh {
@@ -412,7 +418,13 @@ resolve_endpoint :: proc(
 		if sync.atomic_load_explicit(&u.resolved, .Acquire) {
 			if expires := sync.atomic_load(&u.expires); expires != 0 && loop.moment_since(expires) >= 0 {
 				_, _ = sync.atomic_compare_exchange_strong(&u.expires, expires, loop.moment_add(loop.moment_now(), BOOTSTRAP_MIN_TTL)) // lint:allow lost only to a lookup that set the time itself
-				logx.warnf("upstream %s: cannot resolve %q again via bootstrap resolvers (%v); keeping the address held", u.spec.name, u.spec.address, err)
+				// At warn the first time in a run, so a bootstrap that stays
+				// down is not a line every `BOOTSTRAP_MIN_TTL` for good.
+				if _, first_failure := sync.atomic_compare_exchange_strong(&u.refresh_failing, false, true); first_failure {
+					logx.warnf("upstream %s: cannot resolve %q again via bootstrap resolvers (%v); keeping the address held", u.spec.name, u.spec.address, err)
+				} else {
+					logx.debugf("upstream %s: still cannot resolve %q again (%v)", u.spec.name, u.spec.address, err)
+				}
 			}
 			return .None
 		}
@@ -431,6 +443,7 @@ resolve_endpoint :: proc(
 		sync.mutex_unlock(&u.mu)
 		return .None
 	}
+	sync.atomic_store(&u.refresh_failing, false)
 	moved := !first && !came_from(endpoint, u.endpoint)
 	if moved {
 		u.epoch += 1
@@ -440,7 +453,11 @@ resolve_endpoint :: proc(
 		// ones; a query that attached its cookie just before may still take
 		// the old ones to the new address, which answers BADCOOKIE and is
 		// asked again (`exchange_with_cookie`).
-		u.cookie.moved = u.cookie.server_len > 0
+		// A second move with no cookie learned since leaves the first's
+		// window as it is: it is a time, not a flag the move could clear.
+		if u.cookie.server_len > 0 {
+			u.cookie.moved_until = max(u.cookie.moved_until, loop.moment_add(loop.moment_now(), in_flight))
+		}
 		forget_cookie(u)
 		init_cookie(u)
 		// What ALPN chose was the old address's choice.
@@ -980,7 +997,7 @@ servers to ask the refusal costs nothing, and is left unrecorded. A lookup this
 		*/
 		resolving = true
 		share := time.tick_add(entered, timeout / REFRESH_SHARE)
-		_ = resolve_endpoint(u, share, refresh = true) // lint:allow a failed refresh keeps the address held, which resolve_endpoint logs
+		_ = resolve_endpoint(u, share, refresh = true, in_flight = timeout) // lint:allow a failed refresh keeps the address held, which resolve_endpoint logs
 		sync.atomic_store(&u.refreshing, false)
 	}
 

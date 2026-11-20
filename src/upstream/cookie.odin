@@ -6,6 +6,7 @@ import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:logx"
+import "elodin:loop"
 
 /*
 DNS cookies, from the asking side (RFC 7873 section 5.3).
@@ -38,10 +39,10 @@ Cookie :: struct {
 	// What the server last gave us, empty until it has.
 	server:     [COOKIE_SERVER_MAX]u8,
 	server_len: int,
-	// A move forgot a server cookie that queries still out may carry, and
-	// their replies still owe one (`cookie_matches`). Until a cookie is learned
-	// from the address moved to.
-	moved:      bool,
+	// Until when a move's forgotten server cookie may still be on queries
+	// waiting for replies, which owe one (`cookie_matches`); zero once a cookie
+	// is learned from the address moved to. See `cookie_moved_locked`.
+	moved_until: loop.Moment,
 }
 
 /*
@@ -125,7 +126,7 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	sync.mutex_lock(&u.mu)
 	echoed := u.cookie.client
 	held := u.cookie.server_len > 0
-	moved := u.cookie.moved
+	moved := cookie_moved_locked(u)
 	sync.mutex_unlock(&u.mu)
 
 	/*
@@ -160,9 +161,11 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	// Just after a move a query may have gone out with the server cookie the
 	// move forgot: its reply owes one all the same.
 	expected := false
+	sent: []u8
+	carried := false
 	if held || moved {
-		sent, asked_with_cookie := dns.peek_edns_option(query, .Cookie)
-		expected = asked_with_cookie && (held || len(sent) > COOKIE_CLIENT_LEN)
+		sent, carried = dns.peek_edns_option(query, .Cookie)
+		expected = carried && (held || len(sent) > COOKIE_CLIENT_LEN)
 	}
 
 	raw, found := reply_cookie(response)
@@ -172,7 +175,10 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	// The client cookie the query went out with, which a move may since have
 	// drawn afresh (`resolve_endpoint`): the reply echoes that one. Read only
 	// for a reply that carries a cookie, for the reason `held` gives above.
-	if sent, carried := dns.peek_edns_option(query, .Cookie); carried && len(sent) >= COOKIE_CLIENT_LEN {
+	if !held && !moved {
+		sent, carried = dns.peek_edns_option(query, .Cookie)
+	}
+	if carried && len(sent) >= COOKIE_CLIENT_LEN {
 		copy(echoed[:], sent[:COOKIE_CLIENT_LEN])
 	}
 	if len(raw) != COOKIE_CLIENT_LEN &&
@@ -185,6 +191,12 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 		}
 	}
 	return true
+}
+
+// Whether a move's forgotten server cookie may still be out. Under `u.mu`.
+@(private)
+cookie_moved_locked :: proc(u: ^Upstream) -> bool {
+	return u.cookie.moved_until != 0 && loop.moment_since(u.cookie.moved_until) < 0
 }
 
 /*
@@ -238,7 +250,7 @@ learn_cookie :: proc(u: ^Upstream, response: []u8) {
 		return
 	}
 	u.cookie.server_len = copy(u.cookie.server[:], server)
-	u.cookie.moved = false
+	u.cookie.moved_until = 0
 }
 
 /*

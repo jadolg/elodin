@@ -190,7 +190,11 @@ get_h2_conn :: proc(
 		sync.mutex_unlock(&u.mu)
 		return nil, false, derr
 	}
-	u.proto = proto
+	// Not from a dial that started before a move: that was the old
+	// address's choice, and the new one is to be asked.
+	if stream.epoch == u.epoch {
+		u.proto = proto
+	}
 	if proto != .H2 {
 		loop.cond_broadcast(&u.conn_cond)
 		sync.mutex_unlock(&u.mu)

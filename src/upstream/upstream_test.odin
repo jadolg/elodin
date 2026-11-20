@@ -769,7 +769,7 @@ test_bootstrap_ignores_a_reply_from_another_port :: proc(t: ^testing.T) {
 	}
 	defer stop_udp_mock(&m, responder)
 
-	addr, _, err := bootstrap_query(
+	addr, _, _, err := bootstrap_query(
 		net.endpoint_to_string(bound, context.temp_allocator),
 		"mock.invalid",
 		.A,
@@ -790,7 +790,7 @@ test_bootstrap_ignores_a_reply_to_another_question :: proc(t: ^testing.T) {
 	}
 	defer stop_udp_mock(&m, responder)
 
-	addr, _, err := bootstrap_query(
+	addr, _, _, err := bootstrap_query(
 		net.endpoint_to_string(bound, context.temp_allocator),
 		"mock.invalid",
 		.A,
@@ -812,7 +812,7 @@ test_bootstrap_accepts_the_server_it_asked :: proc(t: ^testing.T) {
 	}
 	defer stop_udp_mock(&m, responder)
 
-	addr, _, err := bootstrap_query(
+	addr, _, _, err := bootstrap_query(
 		net.endpoint_to_string(bound, context.temp_allocator),
 		"mock.invalid",
 		.A,
@@ -912,7 +912,7 @@ test_bootstrap_query_id_does_not_follow_the_clock :: proc(t: ^testing.T) {
 	sent_at: [TRIALS]i64
 	for i in 0 ..< TRIALS {
 		sent_at[i] = time.now()._nsec
-		addr, _, err := bootstrap_query(address, "mock.invalid", .A, time.tick_add(time.tick_now(), 200 * time.Millisecond))
+		addr, _, _, err := bootstrap_query(address, "mock.invalid", .A, time.tick_add(time.tick_now(), 200 * time.Millisecond))
 		free_all(context.temp_allocator)
 		if err != .None || addr == nil {
 			testing.expectf(t, false, "trial %d: the honest responder's answer was refused", i)

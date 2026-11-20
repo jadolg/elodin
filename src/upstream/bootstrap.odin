@@ -71,9 +71,10 @@ bootstrap_ttl :: proc(ttl: u32) -> time.Duration {
 Resolve `hostname` using `servers` (plain "IP" or "IP:port" strings).
 
 A and AAAA are tried in that order; the first usable address wins. A refresh
-passes the address it holds as `keep`: only its family is asked for, so one
-failed A lookup does not move a member to IPv6, and while the answer still
-gives it, it is the address returned. `ttl` is how much longer the address may
+passes the address it holds as `keep`: its family is asked for first, and the
+other only when the name has none of it any more, so one failed lookup does not
+move a member to the other family; while the answer still gives `keep`, it is
+the address returned. `ttl` is how much longer the address may
 be used (`bootstrap_ttl`), zero for an IP literal, which never needs asking
 again. `Not_Resolved` where no server gave one, and
 `Out_Of_Memory` where this server could not build a query or read an answer,
@@ -140,14 +141,18 @@ bootstrap_resolve :: proc(
 			}
 			share_end = time.tick_add(now, left / time.Duration(len(servers) - i))
 		}
+		// A refresh asks the family it holds first, and the other only when
+		// the name has none of that one any more (`empty`): a failure to answer
+		// is not a reason to change family.
 		qtypes := []dns.Type{.A, .AAAA}
-		#partial switch _ in keep {
-		case net.IP4_Address:
-			qtypes = qtypes[:1]
-		case net.IP6_Address:
-			qtypes = qtypes[1:]
+		if _, v6 := keep.(net.IP6_Address); v6 {
+			qtypes = []dns.Type{.AAAA, .A}
 		}
-		for qtype in qtypes {
+		gone := true
+		for qtype, q in qtypes {
+			if keep != nil && q > 0 && !gone {
+				break
+			}
 			// Handed down as a deadline, not as what is left of it: one worked
 			// out again inside the query would run past the share by the time
 			// between the two readings of the clock.
@@ -161,11 +166,12 @@ bootstrap_resolve :: proc(
 					query_end = share_end
 				}
 			}
-			result, held, qerr := bootstrap_query(server, hostname, qtype, query_end, keep)
+			result, held, empty, qerr := bootstrap_query(server, hostname, qtype, query_end, keep)
 			if qerr == .Out_Of_Memory {
 				return nil, 0, qerr
 			}
 			if qerr != .None {
+				gone = empty
 				continue
 			}
 			entry := Bootstrap_Entry {
@@ -283,12 +289,16 @@ bootstrap_query :: proc(
 	addr: net.Address,
 	// How long the address may be held (`bootstrap_ttl`).
 	ttl: time.Duration,
+	// With `Not_Resolved`: the server answered, NOERROR, with no address of
+	// the type asked, so the name has none of that family, rather than the
+	// server failing to say.
+	empty: bool,
 	err: Error,
 ) {
 	endpoint, parsed := netx.parse_endpoint(server)
 	if !parsed {
 		logx.warnf("bootstrap resolver %q is not an IP address", server)
-		return nil, 0, .Not_Resolved
+		return nil, 0, false, .Not_Resolved
 	}
 	if endpoint.port == 0 {
 		endpoint.port = 53
@@ -296,7 +306,7 @@ bootstrap_query :: proc(
 
 	name, canonical := dns.name_canonical(hostname, context.temp_allocator)
 	if !canonical {
-		return nil, 0, .Out_Of_Memory
+		return nil, 0, false, .Out_Of_Memory
 	}
 	query := dns.Message {
 		// From the entropy source rather than from the clock: the low bits of a
@@ -311,25 +321,25 @@ bootstrap_query :: proc(
 
 	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
 	if enc_err == .Out_Of_Memory {
-		return nil, 0, .Out_Of_Memory
+		return nil, 0, false, .Out_Of_Memory
 	}
 	if enc_err != .None {
-		return nil, 0, .Not_Resolved
+		return nil, 0, false, .Not_Resolved
 	}
 	// Taken before the query is sent, as `exchange_udp` takes its own.
 	buf, built := dns.alloc_slice([]u8, 4096, context.temp_allocator)
 	if !built {
-		return nil, 0, .Out_Of_Memory
+		return nil, 0, false, .Out_Of_Memory
 	}
 
 	socket, opened := open_udp(endpoint)
 	if !opened {
-		return nil, 0, .Not_Resolved
+		return nil, 0, false, .Not_Resolved
 	}
 	defer net.close(socket)
 
 	if _, send_err := udp_send_until(socket, wire, deadline); send_err != nil {
-		return nil, 0, .Not_Resolved
+		return nil, 0, false, .Not_Resolved
 	}
 
 	/*
@@ -357,7 +367,7 @@ bootstrap_query :: proc(
 		server's share of the timeout.
 		*/
 		if recv_err == .Would_Block {
-			return nil, 0, .Not_Resolved
+			return nil, 0, false, .Not_Resolved
 		}
 		if recv_err != nil {
 			continue
@@ -374,10 +384,10 @@ bootstrap_query :: proc(
 
 		msg, dec_err := dns.decode_message(buf[:n], context.temp_allocator)
 		if dec_err == .Out_Of_Memory {
-			return nil, 0, .Out_Of_Memory
+			return nil, 0, false, .Out_Of_Memory
 		}
 		if dec_err != .None {
-			return nil, 0, .Not_Resolved
+			return nil, 0, false, .Not_Resolved
 		}
 		/*
 		`keep` while the answer gives it, else the lowest address of the type
@@ -436,17 +446,17 @@ bootstrap_query :: proc(
 			}
 		}
 		if kept {
-			return keep, bootstrap_ttl(shortest), .None
+			return keep, bootstrap_ttl(shortest), false, .None
 		}
 		switch len(lowest) {
 		case 4:
-			return net.IP4_Address{lowest[0], lowest[1], lowest[2], lowest[3]}, bootstrap_ttl(shortest), .None
+			return net.IP4_Address{lowest[0], lowest[1], lowest[2], lowest[3]}, bootstrap_ttl(shortest), false, .None
 		case 16:
-			return netx.ip6_from_bytes((^[16]u8)(raw_data(lowest))^), bootstrap_ttl(shortest), .None
+			return netx.ip6_from_bytes((^[16]u8)(raw_data(lowest))^), bootstrap_ttl(shortest), false, .None
 		}
-		return nil, 0, .Not_Resolved
+		return nil, 0, dns.rcode_of(msg) == .No_Error, .Not_Resolved
 	}
-	return nil, 0, .Not_Resolved
+	return nil, 0, false, .Not_Resolved
 }
 
 /*
