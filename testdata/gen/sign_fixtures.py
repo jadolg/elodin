@@ -1441,8 +1441,7 @@ def empty_non_terminal_denials():
 
 
 def digest_ds(key, digest_type, digest=None):
-    """A DS for `key` under `digest_type`, its digest computed with that hash
-    unless `digest` is given."""
+    """Build a DS for `key` under `digest_type`, hashed with it unless `digest` is given."""
     if digest is None:
         hasher = {1: hashlib.sha1, 2: hashlib.sha256, 4: hashlib.sha384}[digest_type]
         digest = hasher(canonical_name(key.zone) + key.rdata).digest()
