@@ -18,13 +18,41 @@ Asserted here on the query as the upstream received it, through the binary that
 ships, because that is the only place the number in question is observable.
 */
 
+// The ID the client puts on its first query; each one after takes the next.
 @(private = "file")
-CLIENT_ID :: u16(0x4242)
+FIRST_CLIENT_ID :: u16(0x4242)
 
-// Enough forwards that a fixed or counting ID cannot pass by chance, few enough
-// that 16-bit collisions stay unlikely.
+// Enough forwards that a fixed, repeated, copied or counting ID cannot pass by
+// chance, few enough that 16-bit collisions stay unlikely.
 @(private = "file")
 FORWARDS :: 24
+
+/*
+Forwards that carried their client's ID: a copying server's 24, and a random
+draw's one time in 65,536 - three or more of 24 is C(24,3)/65536^3, under 1e-11,
+where allowing none failed a correct server about once in 2,700 runs.
+*/
+@(private = "file")
+COPIES_ALLOWED :: 2
+
+/*
+24 draws from 16 bits make about lambda = 276/65536 = 0.0042 colliding pairs.
+Each lost ID is one more pair, or a triple: three lost - three pairs
+(lambda^3/6 = 1.2e-8) or a triple and a pair (C(24,3)/65536^2 * lambda = 2e-9) -
+is too likely to fail on. Four or more lost takes four pairs (lambda^4/24 =
+1.3e-11) or a triple and two pairs (4.7e-7 * lambda^2/2 = 4e-12): under 1e-10
+together. One fresh ID used for every query loses 23.
+*/
+@(private = "file")
+REPEATS_ALLOWED :: 3
+
+/*
+Forwards whose ID is the one before it plus the same step as the one before
+that: a counter's 22, by whatever step and in either direction, and a random
+draw's one time in 65,536 - three or more of 22 is C(22,3)/65536^3, under 1e-11.
+*/
+@(private = "file")
+STEADY_STEPS_ALLOWED :: 2
 
 run_query_id_cases :: proc(r: ^Runner) {
 	// Any name, so each query can ask a different one and still be answered.
@@ -53,52 +81,73 @@ run_query_id_cases :: proc(r: ^Runner) {
 	start_case(r, "upstream: a forwarded query does not carry the client's transaction id")
 	{
 		seen := make(map[u16]bool, FORWARDS, context.temp_allocator)
-		reused := 0
-		answered := 0
+		copied := 0
+		steady := 0
+		previous, step: Maybe(u16)
+		recorded := 0
 
 		for i in 0 ..< FORWARDS {
 			// A different name each time, so nothing can be served from
 			// anywhere but the upstream.
 			qname := fmt.tprintf("id-%d.probe.test.", i)
-			res := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = CLIENT_ID))
-			if !check(r, res.ok, "no response to query %d", i) {
+			client_id := FIRST_CLIENT_ID + u16(i)
+			id, forwarded := forward_id(r, mock, udp_port, qname, client_id)
+			if !forwarded {
 				break
 			}
-			answered += 1
-
-			// The client is waiting on the ID it wrote.
-			h := parse_header(r, res.wire)
-			check(r, h.id == CLIENT_ID, "the client got id %04x back, not its own %04x", h.id, CLIENT_ID)
-
-			// Length, not just presence: `parse_header` hands back a zeroed
-			// header for anything shorter, and every short query drawing the
-			// same id 0 would report a collision that never happened.
-			forwarded := mock_last_query(mock)
-			if !check(r, len(forwarded) >= dns.HEADER_SIZE, "the upstream saw no readable query") {
-				break
+			if id == client_id {
+				copied += 1
 			}
-			fh := parse_header(r, forwarded)
-			if fh.id == CLIENT_ID {
-				reused += 1
+			if before, has := previous.?; has {
+				if last, stepped := step.?; stepped && id - before == last {
+					steady += 1
+				}
+				step = id - before
 			}
-			seen[fh.id] = true
+			previous = id
+			seen[id] = true
+			recorded += 1
 		}
 
-		check_eq_int(r, answered, FORWARDS, "queries answered")
-		check_eq_int(r, reused, 0, "forwarded queries carrying the client's own id")
+		check_eq_int(r, recorded, FORWARDS, "forwarded queries recorded")
+		check(r, copied <= COPIES_ALLOWED, "%d of %d forwarded queries carried the client's ID", copied, recorded)
 		/*
 		Distinctness is the other half of it: one fresh ID reused for every
 		query afterwards is as good as the client's to an attacker who has seen
-		a single answer. 24 draws from 16 bits collide about 0.4% of the time,
-		so one repeat is not a failure - several are.
+		a single answer, and a counter's next is as good as known.
 		*/
+		check(r, steady <= STEADY_STEPS_ALLOWED, "%d of %d forwarded queries stepped from the one before as it had from its own", steady, max(recorded - 2, 0))
 		check(
 			r,
-			len(seen) >= answered - 2,
+			len(seen) >= recorded - REPEATS_ALLOWED,
 			"only %d distinct transaction ids across %d forwarded queries",
 			len(seen),
-			answered,
+			recorded,
 		)
 	}
 	end_case(r)
+}
+
+/*
+Ask `qname` under `client_id` and return the ID the upstream saw, checking on
+the way that the client got its own ID back and that the query the upstream
+saw last is this one, not one before it. False, with the case failed,
+when either is not so.
+*/
+@(private = "file")
+forward_id :: proc(r: ^Runner, mock: ^Mock, udp_port: int, qname: string, client_id: u16) -> (id: u16, ok: bool) {
+	res := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = client_id), allocator = context.temp_allocator)
+	if !check(r, res.ok, "no response to %s", qname) {
+		return
+	}
+	h := parse_header(r, res.wire)
+	check(r, h.id == client_id, "the client got id %04x back, not its own %04x", h.id, client_id)
+	msg, decoded := decode_reply(r, mock_last_query(mock))
+	if !decoded {
+		return
+	}
+	if !check(r, len(msg.question) == 1 && dns.name_equal_fold(msg.question[0].name, qname), "%s was not the last query the upstream saw: %v", qname, msg.question) {
+		return
+	}
+	return msg.id, true
 }
