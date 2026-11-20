@@ -33,7 +33,7 @@ first query into a zone.
 |---|---|
 | chain of trust | root → TLD → zone, DS against DNSKEY at every step |
 | algorithms | RSA/SHA-1, RSA/SHA-256, RSA/SHA-512, ECDSA P-256 and P-384, Ed25519, Ed448 |
-| DS digests | SHA-1, SHA-256, SHA-384 |
+| DS digests | SHA-1, SHA-256, SHA-384; a SHA-1 DS is ignored when the set holds a usable SHA-256 or SHA-384 one (RFC 4509 section 3), for trust anchors too, and a zone bogus for that says so in its log `detail` |
 | denial of existence | NSEC and NSEC3, including closest-encloser proofs and opt-out |
 | wildcards | a wildcard answer must come with a proof that the name had nothing of its own |
 | an empty non-terminal | an NSEC span whose next name is below the name shows the name exists (RFC 4592 section 2.2.2): it proves NODATA there, and an NXDOMAIN or a wildcard answer resting on it is bogus. A wildcard that is an empty non-terminal answers the names under its parent with NODATA |

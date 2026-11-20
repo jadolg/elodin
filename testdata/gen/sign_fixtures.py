@@ -95,11 +95,9 @@ class Key:
         acc += (acc >> 16) & 0xFFFF
         return acc & 0xFFFF
 
-    def ds(self, digest_type=DIGEST_SHA256):
-        """The DS RDATA for this key, as its parent would publish it."""
-        data = canonical_name(self.zone) + self.rdata
-        digest = hashlib.sha256(data).digest()
-        return struct.pack("!HBB", self.tag, self.algorithm, digest_type) + digest
+    def ds(self):
+        """The SHA-256 DS RDATA for this key, as its parent would publish it."""
+        return digest_ds(self, DIGEST_SHA256)
 
     def ds_text(self):
         """The same DS in presentation form, for a trust anchor in the tests."""
@@ -1440,6 +1438,58 @@ def empty_non_terminal_denials():
         emit("ex_%s_ds" % name[:2], name, "DS", message(name, DS, [], proof))
     emit("ex_nx_nodata", "nx.exwild.", "A", message("nx.exwild.", A, [], proof))
     emit("ex_ny_nx", "ny.exwild.", "A", message("ny.exwild.", A, [], proof, rcode=3))
+
+
+def digest_ds(key, digest_type, digest=None):
+    """Build a DS for `key` under `digest_type`, hashed with it unless `digest` is given."""
+    if digest is None:
+        hasher = {1: hashlib.sha1, 2: hashlib.sha256, 4: hashlib.sha384}[digest_type]
+        digest = hasher(canonical_name(key.zone) + key.rdata).digest()
+    return struct.pack("!HBB", key.tag, key.algorithm, digest_type) + digest
+
+
+def ds_text_of(zone, rdata):
+    """A DS RDATA in presentation form, for a trust anchor in the tests."""
+    tag, algorithm, digest_type = struct.unpack("!HBB", rdata[:4])
+    return "%s IN DS %d %d %d %s" % (zone, tag, algorithm, digest_type, rdata[4:].hex().upper())
+
+
+@scenario
+def ds_digest_preference():
+    """Cover DS sets naming a key by SHA-1 beside a SHA-256 or SHA-384 DS."""
+    # RFC 4509 section 3: a validator SHOULD ignore a SHA-1 DS when the set
+    # holds a SHA-256 one. Each zone's DS set holds a SHA-1 DS that matches its
+    # key; beside it, nothing, a SHA-256 DS that matches too, a SHA-256 or
+    # SHA-384 DS that matches nothing, or a SHA-256 DS one byte short. The root
+    # is anchored by a SHA-1 DS beside a SHA-256 one that matches nothing, for
+    # the trust anchor road.
+    root = Key(".", "dsdigest-root")
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    print("// anchor sha1: %s" % ds_text_of(".", digest_ds(root, 1)))
+    print("// anchor wrong sha256: %s" % ds_text_of(".", digest_ds(root, 2, hashlib.sha256(b"not the key").digest())))
+    emit("dd_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+    nowhere256 = hashlib.sha256(b"not the key").digest()
+    nowhere384 = hashlib.sha384(b"not the key").digest()
+    zones = (
+        ("ddsha1.", lambda k: [digest_ds(k, 1)]),
+        ("ddboth.", lambda k: [digest_ds(k, 1), digest_ds(k, 2)]),
+        ("ddwrong.", lambda k: [digest_ds(k, 1), digest_ds(k, 2, nowhere256)]),
+        ("ddwrong384.", lambda k: [digest_ds(k, 1), digest_ds(k, 4, nowhere384)]),
+        ("ddshort.", lambda k: [digest_ds(k, 1), digest_ds(k, 2, digest_ds(k, 2)[4:-1])]),
+    )
+    for zone, published in zones:
+        tag = zone[2:-1]
+        key = Key(zone, "dsdigest-" + tag)
+        ds_set = [RR(zone, DS, rdata) for rdata in published(key)]
+        emit("dd_%s_ds" % tag, zone, "DS", message(zone, DS, ds_set + [sign(ds_set, root)]))
+        keys = [RR(zone, DNSKEY, key.rdata)]
+        emit("dd_%s_dnskey" % tag, zone, "DNSKEY", message(zone, DNSKEY, keys + [sign(keys, key)]))
+        www = "www." + zone
+        answer = [a_rr(www, "192.0.2.1")]
+        emit("dd_%s_answer" % tag, www, "A", message(www, A, answer + [sign(answer, key)]))
+        nsec = [RR(www, NSEC, nsec_rdata(zone, [A, RRSIG, NSEC]))]
+        emit("dd_%s_www_ds" % tag, www, "DS", message(www, DS, [], nsec + [sign(nsec, key)]))
 
 
 def cd_cname(src, owner, target):

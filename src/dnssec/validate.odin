@@ -4590,14 +4590,11 @@ fetch_keys :: proc(
 	against the DS we *could* check would come back insecure rather than bogus,
 	which is a tampered DNSKEY response taking a signed zone out of validation -
 	and `zone_step` would cache that for the DS TTL, so it would stay out.
+
+	The same pass says whether the SHA-1 records are passed over; see
+	`ds_set_reading`.
 	*/
-	checkable := false
-	for ds in ds_set {
-		if ds_usable(ds) {
-			checkable = true
-			break
-		}
-	}
+	checkable, skip_sha1 := ds_set_reading(ds_set)
 
 	exhausted := false
 	lapsed: Lapsed
@@ -4607,8 +4604,13 @@ fetch_keys :: proc(
 	scratch := Signing_Scratch {
 		budget = budget,
 	}
+	set_aside := false
 	ds_loop: for ds in ds_set {
 		if !ds_usable(ds) {
+			continue
+		}
+		if skip_sha1 && ds.digest_type == DIGEST_SHA1 {
+			set_aside = true
 			continue
 		}
 		for key in parsed {
@@ -4700,10 +4702,41 @@ fetch_keys :: proc(
 		if dns.name_equal_fold(closest_anchor(v.anchors, zone), zone) {
 			why = "no DNSKEY both matches a trust anchor and signs the DNSKEY set"
 		}
+		if set_aside {
+			why = strings.concatenate({why, SHA1_DS_IGNORED}, allocator)
+		}
 		broke_at(budget, zone, why, allocator, Lapsed{} if tried else lapsed)
 		return nil, .Bogus, {}, 0
 	}
 	return nil, .Insecure, {}, 0
+}
+
+// Said beside a bogus verdict reached with SHA-1 records set aside, which a
+// key matching one of them would otherwise not explain.
+@(private)
+SHA1_DS_IGNORED :: "; a SHA-1 DS is ignored beside a SHA-256 or SHA-384 one (RFC 4509 section 3)"
+
+/*
+What a DS set offers to `fetch_keys`: whether anything in it names something
+this build can check (RFC 6840 section 5.2), and whether its SHA-1 records are
+to be passed over because a usable SHA-256 or SHA-384 one sits beside them (RFC
+4509 section 3), so a key colliding with a SHA-1 digest cannot stand in for the
+key the stronger digest names. A stronger DS whose digest is not its type's
+length does not count, as BIND reads the rule.
+*/
+@(private)
+ds_set_reading :: proc(ds_set: []Ds) -> (checkable: bool, skip_sha1: bool) {
+	for ds in ds_set {
+		if !ds_usable(ds) {
+			continue
+		}
+		checkable = true
+		stronger := ds.digest_type == DIGEST_SHA256 || ds.digest_type == DIGEST_SHA384
+		if stronger && len(ds.digest) == digest_size(ds.digest_type) {
+			skip_sha1 = true
+		}
+	}
+	return
 }
 
 // Does this DNSKEY hash to this DS? The digest runs over the owner name in
