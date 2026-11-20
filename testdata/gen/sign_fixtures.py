@@ -1400,7 +1400,6 @@ def empty_non_terminal_denials():
         rrset = [RR(owner, NSEC, nsec_rdata(next_name, types))]
         return rrset + [sign(rrset, zone)]
 
-    apex = nsec("enxtest.", "*.enxtest.", [NS, SOA, RRSIG, NSEC, DNSKEY])
     wild = nsec("*.enxtest.", "a.enxtest.", [A, RRSIG, NSEC])
     span = nsec("a.enxtest.", "c.b.enxtest.", [A, RRSIG, NSEC])
     tail = nsec("c.b.enxtest.", "enxtest.", [A, RRSIG, NSEC])
