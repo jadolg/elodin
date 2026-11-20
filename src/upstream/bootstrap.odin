@@ -15,12 +15,20 @@ Hostname resolution that does not go through the system resolver.
 On a machine where elodin is the system resolver, asking libc to resolve an
 upstream's hostname during startup would come straight back to a server that is
 not listening yet. Bootstrap addresses are queried directly over plain UDP
-instead, and results are cached for BOOTSTRAP_TTL, at most
+instead, and results are cached for the answer's TTL (`bootstrap_ttl`), at most
 BOOTSTRAP_MAX_ENTRIES names at once.
 */
 
+// The longest an answer is kept, whatever its TTL.
 @(private)
 BOOTSTRAP_TTL :: 1 * time.Hour
+
+/*
+The shortest: a TTL of zero or one would send every exchange on an upstream
+named by it to the bootstrap servers first.
+*/
+@(private)
+BOOTSTRAP_MIN_TTL :: 10 * time.Second
 
 @(private)
 BOOTSTRAP_TIMEOUT :: 3 * time.Second
@@ -29,8 +37,8 @@ BOOTSTRAP_TIMEOUT :: 3 * time.Second
 At most this many hostnames cached at once. The sweep holds the map to what was
 resolved within `BOOTSTRAP_TTL`, but a short `blocking.refresh` fetches many
 times an hour, and each redirect is a name the list host chooses. A name
-resolved while the map is full is answered and not kept: an upstream publishes
-its endpoint once, and a list is fetched again a refresh later.
+resolved while the map is full is answered and not kept: an upstream holds its
+own address until the TTL, and a list is fetched again a refresh later.
 */
 @(private)
 BOOTSTRAP_MAX_ENTRIES :: 256
@@ -49,11 +57,23 @@ bootstrap_cache: struct {
 }
 
 /*
+How long a bootstrap answer is held: its record's TTL (RFC 1035 section 3.2.1),
+read as RFC 2181 section 8 asks (`dns.sane_ttl`), within `BOOTSTRAP_MIN_TTL` and
+`BOOTSTRAP_TTL`.
+*/
+@(private)
+bootstrap_ttl :: proc(ttl: u32) -> time.Duration {
+	return clamp(time.Duration(dns.sane_ttl(ttl)) * time.Second, BOOTSTRAP_MIN_TTL, BOOTSTRAP_TTL)
+}
+
+/*
 Resolve `hostname` using `servers` (plain "IP" or "IP:port" strings).
 
-A and AAAA are tried in that order; the first usable address wins. `Not_Resolved`
-where no server gave one, and `Out_Of_Memory` where this server could not build
-a query or read an answer, which says nothing about the bootstrap servers.
+A and AAAA are tried in that order; the first usable address wins. `ttl` is how
+much longer the address may be used (`bootstrap_ttl`), zero for an IP literal,
+which never needs asking again. `Not_Resolved` where no server gave one, and
+`Out_Of_Memory` where this server could not build a query or read an answer,
+which says nothing about the bootstrap servers.
 */
 @(private)
 bootstrap_resolve :: proc(
@@ -69,29 +89,30 @@ bootstrap_resolve :: proc(
 	deadline := time.Tick{},
 ) -> (
 	addr: net.Address,
+	ttl: time.Duration,
 	err: Error,
 ) {
 	if literal := netx.parse_address(hostname); literal != nil {
-		return literal, .None
+		return literal, 0, .None
 	}
 
 	// Keyed by the canonical name, which is the name asked: `Hop.example` and
 	// `hop.example.` are one entry, not two of `BOOTSTRAP_MAX_ENTRIES`.
 	key, canonical := dns.name_canonical(hostname, context.temp_allocator)
 	if !canonical {
-		return nil, .Out_Of_Memory
+		return nil, 0, .Out_Of_Memory
 	}
 	sync.mutex_lock(&bootstrap_cache.mu)
 	if entry, found := bootstrap_cache.entries[key]; found {
-		if loop.moment_since(entry.expires) < 0 {
+		if left := -loop.moment_since(entry.expires); left > 0 {
 			sync.mutex_unlock(&bootstrap_cache.mu)
-			return entry.address, .None
+			return entry.address, left, .None
 		}
 	}
 	sync.mutex_unlock(&bootstrap_cache.mu)
 
 	if len(servers) == 0 {
-		return nil, .Not_Resolved
+		return nil, 0, .Not_Resolved
 	}
 
 	for server, i in servers {
@@ -108,7 +129,7 @@ bootstrap_resolve :: proc(
 			now := loop.tick_now()
 			left := time.tick_diff(now, deadline)
 			if left <= 0 {
-				return nil, .Not_Resolved
+				return nil, 0, .Not_Resolved
 			}
 			share_end = time.tick_add(now, left / time.Duration(len(servers) - i))
 		}
@@ -126,16 +147,16 @@ bootstrap_resolve :: proc(
 					query_end = share_end
 				}
 			}
-			result, qerr := bootstrap_query(server, hostname, qtype, query_end)
+			result, held, qerr := bootstrap_query(server, hostname, qtype, query_end)
 			if qerr == .Out_Of_Memory {
-				return nil, qerr
+				return nil, 0, qerr
 			}
 			if qerr != .None {
 				continue
 			}
 			entry := Bootstrap_Entry {
 				address = result,
-				expires = loop.moment_add(loop.moment_now(), BOOTSTRAP_TTL),
+				expires = loop.moment_add(loop.moment_now(), held),
 			}
 			sync.mutex_lock(&bootstrap_cache.mu)
 			if bootstrap_cache.entries == nil {
@@ -149,7 +170,7 @@ bootstrap_resolve :: proc(
 			} else {
 				/*
 				A new key sweeps out the expired ones first, so the map holds
-				only what was resolved within the last `BOOTSTRAP_TTL` (#530).
+				only what is still within its TTL (#530).
 				The hostnames are not only the configured upstreams': every
 				redirect a blocklist download follows is resolved here, under
 				names the list host picks.
@@ -160,10 +181,10 @@ bootstrap_resolve :: proc(
 				}
 			}
 			sync.mutex_unlock(&bootstrap_cache.mu)
-			return result, .None
+			return result, held, .None
 		}
 	}
-	return nil, .Not_Resolved
+	return nil, 0, .Not_Resolved
 }
 
 /*
@@ -216,7 +237,7 @@ bootstrap_prune :: proc() {
 @(private)
 resolve_address :: proc(host: string, bootstrap: []string) -> (addr: net.Address, ok: bool) {
 	// An IP literal is returned as it stands, by `bootstrap_resolve` first.
-	if resolved, err := bootstrap_resolve(bootstrap, host); err == .None {
+	if resolved, _, err := bootstrap_resolve(bootstrap, host); err == .None {
 		return resolved, true
 	}
 	// Nothing configured to bootstrap with, or nothing the bootstrap servers
@@ -244,12 +265,14 @@ bootstrap_query :: proc(
 	deadline: time.Tick,
 ) -> (
 	addr: net.Address,
+	// How long the address may be held (`bootstrap_ttl`).
+	ttl: time.Duration,
 	err: Error,
 ) {
 	endpoint, parsed := netx.parse_endpoint(server)
 	if !parsed {
 		logx.warnf("bootstrap resolver %q is not an IP address", server)
-		return nil, .Not_Resolved
+		return nil, 0, .Not_Resolved
 	}
 	if endpoint.port == 0 {
 		endpoint.port = 53
@@ -257,13 +280,13 @@ bootstrap_query :: proc(
 
 	name, canonical := dns.name_canonical(hostname, context.temp_allocator)
 	if !canonical {
-		return nil, .Out_Of_Memory
+		return nil, 0, .Out_Of_Memory
 	}
 	query := dns.Message {
 		// From the entropy source rather than from the clock: the low bits of a
 		// timestamp carry only as much unpredictability as the platform's clock
 		// resolution puts there, and what this query's answer decides - the
-		// address every later query to this upstream is sent to, cached for
+		// address every later query to this upstream is sent to, up to
 		// BOOTSTRAP_TTL - is worth more than that.
 		id       = dns.random_id(),
 		question = []dns.Question{{name = name, type = qtype, class = .IN}},
@@ -272,32 +295,32 @@ bootstrap_query :: proc(
 
 	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
 	if enc_err == .Out_Of_Memory {
-		return nil, .Out_Of_Memory
+		return nil, 0, .Out_Of_Memory
 	}
 	if enc_err != .None {
-		return nil, .Not_Resolved
+		return nil, 0, .Not_Resolved
 	}
 	// Taken before the query is sent, as `exchange_udp` takes its own.
 	buf, built := dns.alloc_slice([]u8, 4096, context.temp_allocator)
 	if !built {
-		return nil, .Out_Of_Memory
+		return nil, 0, .Out_Of_Memory
 	}
 
 	socket, opened := open_udp(endpoint)
 	if !opened {
-		return nil, .Not_Resolved
+		return nil, 0, .Not_Resolved
 	}
 	defer net.close(socket)
 
 	if _, send_err := udp_send_until(socket, wire, deadline); send_err != nil {
-		return nil, .Not_Resolved
+		return nil, 0, .Not_Resolved
 	}
 
 	/*
 	Same checks the main exchange path applies in `exchange_udp`: the datagram
 	has to come from the server that was asked and answer the question that was
 	sent. The ID on its own is 16 bits an off-path attacker can guess inside the
-	receive window, and what it would land in is cached for BOOTSTRAP_TTL and
+	receive window, and what it would land in is cached for up to BOOTSTRAP_TTL and
 	consulted for blocklist hosts as well as upstream addresses.
 
 	A datagram that fails them is dropped and the wait resumes, so a forgery
@@ -318,7 +341,7 @@ bootstrap_query :: proc(
 		server's share of the timeout.
 		*/
 		if recv_err == .Would_Block {
-			return nil, .Not_Resolved
+			return nil, 0, .Not_Resolved
 		}
 		if recv_err != nil {
 			continue
@@ -335,22 +358,22 @@ bootstrap_query :: proc(
 
 		msg, dec_err := dns.decode_message(buf[:n], context.temp_allocator)
 		if dec_err == .Out_Of_Memory {
-			return nil, .Out_Of_Memory
+			return nil, 0, .Out_Of_Memory
 		}
 		if dec_err != .None {
-			return nil, .Not_Resolved
+			return nil, 0, .Not_Resolved
 		}
 		for rec in msg.answer {
 			#partial switch d in rec.data {
 			case dns.Rdata_A:
-				return net.IP4_Address(d.addr), .None
+				return net.IP4_Address(d.addr), bootstrap_ttl(rec.ttl), .None
 			case dns.Rdata_AAAA:
-				return netx.ip6_from_bytes(d.addr), .None
+				return netx.ip6_from_bytes(d.addr), bootstrap_ttl(rec.ttl), .None
 			}
 		}
-		return nil, .Not_Resolved
+		return nil, 0, .Not_Resolved
 	}
-	return nil, .Not_Resolved
+	return nil, 0, .Not_Resolved
 }
 
 /*

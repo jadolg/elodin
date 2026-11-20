@@ -50,6 +50,13 @@ serve_udp_mock :: proc(t: ^testing.T, m: ^$M, serve: proc(_: ^M)) -> (bound: net
 	return bound, worker, true
 }
 
+/*
+Held by every test that puts entries in the package-global bootstrap cache: one
+counts the entries and destroys the cache, which another's would upset.
+*/
+@(private)
+bootstrap_cache_owner: sync.Mutex
+
 // `serve_udp_mock`, and a UDP upstream named `name` pointing at it.
 @(private)
 start_udp_mock :: proc(
