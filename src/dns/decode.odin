@@ -719,9 +719,12 @@ decode_rdata :: proc(
 		RDATA's end. Issue #351.
 
 		An element running past the RDATA is refused here rather than half way
-		through the read, which is the same refusal by a shorter route. Either
-		way `decode_record` keeps the record as raw bytes rather than rejecting
-		the message.
+		through the read, which is the same refusal by a shorter route. So is an
+		empty RDATA: RFC 1035 section 3.3.14 asks for "One or more
+		<character-string>s", and a list of none would encode back as one empty
+		string, which RFC 3597 section 3's "exactly preserve the RDATA" rules
+		out. Either way `decode_record` keeps the record as raw bytes rather
+		than rejecting the message.
 		*/
 		count := 0
 		for p := start; p < end; count += 1 {
@@ -729,6 +732,9 @@ decode_rdata :: proc(
 			if p > end {
 				return nil, .Bad_Rdata
 			}
+		}
+		if count == 0 {
+			return nil, .Bad_Rdata
 		}
 		charge_bytes(r, size_of(string) * count) or_return
 		parts, built := alloc_slice([]string, count, allocator)
