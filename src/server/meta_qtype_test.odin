@@ -15,7 +15,6 @@ here, without an upstream (RFC 6895 section 3.1 sets the 128-255 range apart).
   implement: NOTIMP, "does not support the requested kind of query" (RFC 1035
   section 4.1.1), as BIND answers.
 - ANY is forwarded (RFC 8482), and an ordinary type above the range is too.
-
 */
 @(test)
 test_meta_qtypes_are_answered_without_forwarding :: proc(t: ^testing.T) {
@@ -26,8 +25,9 @@ test_meta_qtypes_are_answered_without_forwarding :: proc(t: ^testing.T) {
 	defer harness_stop(&h)
 
 	Case :: struct {
-		type:  dns.Type,
-		rcode: dns.Rcode,
+		type:      dns.Type,
+		class:     dns.Class,
+		rcode:     dns.Rcode,
 		ede:       int,
 		forwarded: bool,
 	}
@@ -38,6 +38,9 @@ test_meta_qtypes_are_answered_without_forwarding :: proc(t: ^testing.T) {
 		{type = dns.Type(248), rcode = .Form_Err, ede = EDE_INVALID_QUERY_TYPE},
 		{type = .TKEY, rcode = .Form_Err, ede = EDE_INVALID_QUERY_TYPE},
 		{type = .TSIG, rcode = .Form_Err, ede = EDE_INVALID_QUERY_TYPE},
+		// Whatever the class: RFC 9824 section 3.5's MUST is for any query.
+		{type = .TSIG, class = .CH, rcode = .Form_Err, ede = EDE_INVALID_QUERY_TYPE},
+		{type = .NXNAME, class = .HS, rcode = .Form_Err, ede = EDE_INVALID_QUERY_TYPE},
 		{type = .MAILB, rcode = .Not_Impl, ede = -1},
 		{type = .MAILA, rcode = .Not_Impl, ede = -1},
 		{type = .AXFR, rcode = .Refused, ede = -1},
@@ -47,7 +50,7 @@ test_meta_qtypes_are_answered_without_forwarding :: proc(t: ^testing.T) {
 	}
 
 	for c in CASES {
-		query := test_query("example.com.", type = c.type, opt = dns.make_opt(1232, false))
+		query := test_query("example.com.", type = c.type, opt = dns.make_opt(1232, false), class = c.class if c.class != dns.Class(0) else .IN)
 		out: []u8
 		outcome: Outcome
 		ok, asked: bool
@@ -77,4 +80,3 @@ test_meta_qtypes_are_answered_without_forwarding :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
-

@@ -52,14 +52,15 @@ UDP→TCP retry, `version.bind`/`version.server`/`hostname.bind`/`id.server` in 
 [DDR](doh.md#discovery-by-clients-ddr) when `ddr.name` is set, refusal of zone-transfer requests, and the reserved names of
 RFC 6761 and RFC 7686 answered here instead of forwarded.
 
-Some question types are answered here and never forwarded:
+Some question types are answered here and never forwarded. Each is logged as
+`outcome=refused`, whatever its rcode, with the detail below:
 
-- AXFR and IXFR: REFUSED, logged with `detail=xfr`.
-- OPT, TKEY, TSIG and the rest of types 128 to 250, NXNAME included: FORMERR
-  with extended error 30 (Invalid Query Type), logged with `detail=meta-type`.
+- OPT, TKEY, TSIG and the rest of types 128 to 250, NXNAME included, in any
+  class: FORMERR with extended error 30 (Invalid Query Type), `detail=meta-type`.
   These types describe one message on one hop and mean nothing to an upstream
   (RFC 6895 section 3.1, RFC 9824 section 3.5).
-- MAILA and MAILB: NOTIMP, logged with `detail=qtype`.
+- AXFR and IXFR: REFUSED, `detail=xfr`.
+- MAILA and MAILB: NOTIMP, `detail=qtype`.
 
 ANY is forwarded ([RFC 8482](https://www.rfc-editor.org/rfc/rfc8482)).
 

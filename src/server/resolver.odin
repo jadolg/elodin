@@ -1363,6 +1363,19 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		return answered(st, out, .Refused, built)
 	}
 
+	if dns.is_meta_type(st.q.type) {
+		/*
+		A question about a record that describes one message on one hop means
+		nothing to the next hop, so it is not forwarded: FORMERR with extended
+		error 30, which RFC 9824 section 3.5 makes a MUST for NXNAME and Unbound
+		(`worker_handle_request`) and BIND (`ns_query_start`) answer for the range.
+		Ahead of the class gates, since that MUST is for any query.
+		*/
+		out, built := meta_type_refusal(st.query, st.msg, st.limit, st.allocator)
+		log_query(st.s, st.client, st.proto, st.q, .Refused, "meta-type", st.started)
+		return answered(st, out, .Refused, built)
+	}
+
 	if st.q.class == .CH && answer_chaos(st) {
 		return true
 	}
@@ -1383,17 +1396,6 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		// "does not support the requested kind of query" (section 4.1.1).
 		out, built := dns.error_response(st.query, st.msg, .Not_Impl, st.allocator, st.limit)
 		log_query(st.s, st.client, st.proto, st.q, .Refused, "qtype", st.started)
-		return answered(st, out, .Refused, built)
-	}
-	if dns.is_meta_type(st.q.type) {
-		/*
-		A question about a record that describes one message on one hop means
-		nothing to the next hop, so it is not forwarded: FORMERR with extended
-		error 30, which RFC 9824 section 3.5 makes a MUST for NXNAME and Unbound
-		(`worker_handle_request`) and BIND (`ns_query_start`) answer for the range.
-		*/
-		out, built := meta_type_refusal(st.query, st.msg, st.limit, st.allocator)
-		log_query(st.s, st.client, st.proto, st.q, .Refused, "meta-type", st.started)
 		return answered(st, out, .Refused, built)
 	}
 
