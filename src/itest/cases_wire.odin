@@ -319,6 +319,9 @@ run_wire_cases :: proc(r: ^Runner) {
 				*/
 				want := expected
 				want[3] &~= 0x20
+				// An RRset whose TTLs arrive unequal leaves at its lowest (RFC
+				// 2181 section 5.2): a fixture taken from the wild may hold one.
+				dns.cap_ttls(want, dns.TTL_MAX)
 				/*
 				And the TTLs a signed answer may not be told past its RRSIGs
 				(RFC 4034 section 3.1.5, issue #165). Elodin read the clock

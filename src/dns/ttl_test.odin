@@ -15,8 +15,11 @@ it plus a ceiling to a message on its way out.
 @(private = "file")
 answer_with_ttls :: proc(ttls: []u32, ext_rcode: u8 = 0) -> []u8 {
 	answer := make([]Record, len(ttls), context.temp_allocator)
+	// An owner each: one RRset of several TTLs would be brought to its lowest
+	// (`test_cap_ttls_gives_an_rrset_its_lowest_ttl`), which is not what these ask.
+	owners := []string{"r1.example.com.", "r2.example.com.", "r3.example.com.", "r4.example.com."}
 	for ttl, i in ttls {
-		answer[i] = a_answer("example.com.", ttl, u8(i + 1))
+		answer[i] = a_answer(owners[i % len(owners)], ttl, u8(i + 1))
 	}
 	m := Message {
 		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
@@ -265,4 +268,119 @@ test_scan_refuses_when_its_list_cannot_be_reserved :: proc(t: ^testing.T) {
 
 	offsets, ok = scan_ttl_offsets(msg, mem.Allocator{procedure = refuse})
 	testing.expectf(t, !ok, "scanned into a list of %d offsets for a message with one TTL", len(offsets))
+}
+
+@(private = "file")
+answer_records :: proc(answer: []Record, authority: []Record = nil) -> []u8 {
+	m := Message {
+		question  = []Question{{name = "set.example.", type = .A, class = .IN}},
+		answer    = answer,
+		authority = authority,
+	}
+	m.flags.qr = true
+	return test_wire(m)
+}
+
+@(private = "file")
+answer_ttls :: proc(t: ^testing.T, wire: []u8) -> (ttls: [dynamic]u32, ok: bool) {
+	m, err := decode_message(wire, context.temp_allocator)
+	if !testing.expectf(t, err == .None, "the message did not decode: %v", err) {
+		return nil, false
+	}
+	ttls = make([dynamic]u32, context.temp_allocator)
+	for r in m.answer {
+		append(&ttls, r.ttl)
+	}
+	for r in m.authority {
+		append(&ttls, r.ttl)
+	}
+	return ttls, true
+}
+
+/*
+RFC 2181 section 5.2: "In no case may a server send an RRSet with TTLs not all
+equal", and one that arrives so is treated "as if all TTLs in the RRSet had been
+set to the value of the lowest TTL in the RRSet". An owner spelled in another
+case, or reached through a compression pointer, is the same owner; another
+owner, type or section is another RRset; an RRSIG keeps its own.
+*/
+@(test)
+test_cap_ttls_gives_an_rrset_its_lowest_ttl :: proc(t: ^testing.T) {
+	// Two RRSIGs on one owner, one covering A (type 1) and one AAAA (type 28).
+	sig := Record{name = "set.example.", type = .RRSIG, class = .IN, ttl = 900, data = Rdata_Raw{data = []u8{0, 1}}}
+	other_sig := Record{name = "set.example.", type = .RRSIG, class = .IN, ttl = 300, data = Rdata_Raw{data = []u8{0, 28}}}
+	wire := answer_records(
+		[]Record {
+			a_answer("set.example.", 3600, 1),
+			a_answer("SET.Example.", 10, 2),
+			a_answer("set.example.", 600, 3),
+			sig,
+			other_sig,
+			a_answer("other.example.", 3600, 4),
+			a_answer("other.example.", 300, 5),
+			a_answer("set.example.", 50, 6),
+		},
+		// Right after the answer's last record, with its owner and type: another
+		// section, so another RRset.
+		authority = []Record{a_answer("set.example.", 3600, 7)},
+	)
+	cap_ttls(wire, TTL_MAX)
+	ttls, ok := answer_ttls(t, wire)
+	if !ok || !testing.expect_value(t, len(ttls), 9) {
+		return
+	}
+	// The RRSIG covering A takes the A RRset's TTL (RFC 4034 section 3); the one
+	// covering AAAA keeps its own.
+	want := [9]u32{10, 10, 10, 10, 300, 300, 300, 50, 3600}
+	for got, i in ttls {
+		testing.expectf(t, got == want[i], "record %d: TTL %d, want %d", i, got, want[i])
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+An RRset is the run of its records next to each other: a member that turns up
+apart from the rest is not gathered back, as `encode_message` does not gather
+one either.
+*/
+@(test)
+test_cap_ttls_reads_an_rrset_as_its_run :: proc(t: ^testing.T) {
+	wire := answer_records([]Record{a_answer("set.example.", 3600, 1), a_answer("between.example.", 60, 2), a_answer("set.example.", 10, 3)})
+	cap_ttls(wire, TTL_MAX)
+	ttls, ok := answer_ttls(t, wire)
+	if !ok || !testing.expect_value(t, len(ttls), 3) {
+		return
+	}
+	testing.expect_value(t, ttls[0], u32(3600))
+	testing.expect_value(t, ttls[2], u32(10))
+	free_all(context.temp_allocator)
+}
+
+// Names compared on the wire: case, pointers, a mismatch, and pointers that
+// go forwards, at themselves or into the header, none of which is followed.
+@(test)
+test_wire_names_equal :: proc(t: ^testing.T) {
+	H :: HEADER_SIZE
+	msg := make([dynamic]u8, context.temp_allocator)
+	resize(&msg, H)
+	// H+0: "a.b." ; H+5: "A.B." ; H+10: pointer to H+0 ; H+12: "a.c." ;
+	// H+17: pointer forwards to H+19 ; H+19: pointer to itself ; H+21: pointer into the header,
+	// which spells "a.b." there.
+	append(&msg, 1, 'a', 1, 'b', 0, 1, 'A', 1, 'B', 0, 0xC0, H, 1, 'a', 1, 'c', 0, 0xC0, H + 19, 0xC0, H + 19, 0xC0, 2)
+	// H+23: pointer forwards to H+25, which spells "a.b." - equal, were it followed.
+	append(&msg, 0xC0, H + 25, 1, 'a', 1, 'b', 0)
+	// The header spells "a.b." from its third byte, which H+21 points at.
+	copy(msg[2:7], []u8{1, 'a', 1, 'b', 0})
+	testing.expect(t, wire_names_equal(msg[:], H, H + 5), "a case difference made two names")
+	testing.expect(t, wire_names_equal(msg[:], H + 5, H + 10), "a pointer made two names")
+	testing.expect(t, !wire_names_equal(msg[:], H, H + 12), "a.b. and a.c. read as one")
+	testing.expect(t, !wire_names_equal(msg[:], H, H + 17), "a forward pointer was followed")
+	testing.expect(t, !wire_names_equal(msg[:], H, H + 19), "a pointer to itself was followed")
+	testing.expect(t, !wire_names_equal(msg[:], H, H + 21), "a pointer into the header was followed")
+	testing.expect(t, !wire_names_equal(msg[:], H, H + 23), "a forward pointer to the same name was followed")
+	// And with the pointer on the other side.
+	testing.expect(t, !wire_names_equal(msg[:], H + 21, H), "a pointer into the header was followed, as the first name")
+	testing.expect(t, !wire_names_equal(msg[:], H + 23, H), "a forward pointer was followed, as the first name")
+	testing.expect(t, !wire_names_equal(msg[:], H, len(msg)), "a name past the end read as one")
+	free_all(context.temp_allocator)
 }

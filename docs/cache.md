@@ -49,6 +49,11 @@ rewritten in place on each hit.
   cache's does.
 - A TTL with its top bit set is read as zero (RFC 2181 section 8), forwarded
   answers included, so it is uncacheable unless `min_ttl` raises it.
+- An RRset whose records arrive with different TTLs goes out, and is cached,
+  with the lowest of them on every record (RFC 2181 section 5.2), forwarded
+  answers included. An RRset is the records next to each other with one owner,
+  type and class in one section. An RRSIG right after it, covering its type,
+  goes out with the same TTL (RFC 4034 section 3); other RRSIGs keep their own.
 - **Signed answers.** An entry carrying RRSIGs, in any section, is kept no longer
   than the first of them stays valid, and no copy, fresh, stale or forwarded, is
   told a longer TTL. `min_ttl` extends neither. One whose signature has already

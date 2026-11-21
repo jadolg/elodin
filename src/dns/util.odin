@@ -733,7 +733,8 @@ records_start :: proc(msg: []u8) -> (pos: int, total: int, ok: bool) {
 }
 
 /*
-Bound every TTL a message carries, on the wire, in place.
+Bound every TTL a message carries, on the wire, in place, and give each RRset
+the lowest TTL among its records (RFC 2181 section 5.2; see the body).
 
 For the answers that never pass through the cache - a miss is forwarded to the
 client from the upstream's own bytes, and with `cache.enabled: false` no answer
@@ -774,22 +775,177 @@ cap_ttls :: proc(msg: []u8, ceiling: u32) {
 	if !ok {
 		return
 	}
-	for _ in 0 ..< total {
+	// Where each section ends, counted in records.
+	answers := int(u16(msg[6]) << 8 | u16(msg[7]))
+	authority := answers + int(u16(msg[8]) << 8 | u16(msg[9]))
+	section_of :: proc(i, answers, authority: int) -> int {
+		return 0 if i < answers else 1 if i < authority else 2
+	}
+
+	/*
+	RFC 2181 section 5.2: "the TTLs of all RRs in an RRSet must be the same", and
+	one that arrives otherwise is to be treated "as if all TTLs in the RRSet had
+	been set to the value of the lowest TTL in the RRSet. In no case may a server
+	send an RRSet with TTLs not all equal." Unbound gives a parsed RRset the
+	lowest of its TTLs as well. The cache stores the TTLs this leaves, so what it
+	serves later agrees with what is forwarded now.
+
+	An RRset is a run of records next to each other with one owner, type and
+	class in one section, as `encode_message` keeps one whole (RFC 2181 section
+	9): regrouping members scattered through a section would cost a comparison
+	per pair, quadratic in a reply of thousands. RRSIG and OPT never join one:
+	an RRSIG's TTL follows the RRset it covers, which another RRSIG beside it
+	need not share, and OPT's "TTL" is the extended rcode and flags. An RRSIG
+	right after a run, on its owner and covering its type, is held to the run's
+	TTL instead: RFC 4034 section 3, "The TTL value of an RRSIG RR MUST match the
+	TTL value of the RRset it covers".
+	*/
+	run := Ttl_Run{}
+	// The run the RRSIGs being walked follow, settled when the first of them
+	// ended it; empty once any other record comes.
+	signed := Ttl_Run{}
+	for i in 0 ..< total {
 		type, fixed, next, rec_ok := skip_record(msg, pos)
 		if fixed == 0 {
-			return
+			break
 		}
-		// OPT is skipped: its "TTL" is really the extended rcode and flags. A
-		// record whose RDATA runs past the end still has its TTL bounded, and
+		// A record whose RDATA runs past the end still has its TTL bounded, and
 		// ends the walk.
 		if type != .OPT {
-			write_ttl_at(msg, fixed + 4, min(sane_ttl(read_ttl_at(msg, fixed + 4)), ceiling))
+			ttl := min(sane_ttl(read_ttl_at(msg, fixed + 4)), ceiling)
+			class := u16(msg[fixed + 2]) << 8 | u16(msg[fixed + 3])
+			section := section_of(i, answers, authority)
+			if type == .RRSIG {
+				if run.count > 0 {
+					ttl_run_settle(msg, run)
+					signed, run = run, Ttl_Run{}
+				}
+				if rec_ok && fixed + 12 <= len(msg) && signed.count > 0 && class == signed.class && section == signed.section {
+					covered := Type(u16(msg[fixed + 10]) << 8 | u16(msg[fixed + 11]))
+					if covered == signed.type && wire_names_equal(msg, pos, signed.owner) {
+						ttl = min(ttl, signed.lowest)
+					}
+				}
+				write_ttl_at(msg, fixed + 4, ttl)
+				if !rec_ok {
+					break
+				}
+				pos = next
+				continue
+			}
+			signed = Ttl_Run{}
+			write_ttl_at(msg, fixed + 4, ttl)
+			if run.count > 0 && type == run.type && class == run.class && section == run.section && wire_names_equal(msg, pos, run.owner) {
+				run.count += 1
+				run.lowest = min(run.lowest, ttl)
+			} else {
+				ttl_run_settle(msg, run)
+				run = Ttl_Run{owner = pos, type = type, class = class, section = section, count = 1, lowest = ttl}
+			}
+		} else {
+			ttl_run_settle(msg, run)
+			run, signed = Ttl_Run{}, Ttl_Run{}
 		}
 		if !rec_ok {
-			return
+			break
 		}
 		pos = next
 	}
+	ttl_run_settle(msg, run)
+}
+
+// One run of an RRset's records as `cap_ttls` walks them: where its first
+// record starts, what makes a record one of it, how many it has so far and the
+// lowest TTL among them.
+@(private)
+Ttl_Run :: struct {
+	owner:   int,
+	type:    Type,
+	class:   u16,
+	section: int,
+	count:   int,
+	lowest:  u32,
+}
+
+// Give every record of `run` its lowest TTL. Each record was already walked
+// once, so this walks them again from the first; nothing to do for one alone.
+@(private)
+ttl_run_settle :: proc(msg: []u8, run: Ttl_Run) {
+	if run.count < 2 {
+		return
+	}
+	pos := run.owner
+	for _ in 0 ..< run.count {
+		_, fixed, next, _ := skip_record(msg, pos)
+		if fixed == 0 {
+			return
+		}
+		write_ttl_at(msg, fixed + 4, run.lowest)
+		pos = next
+	}
+}
+
+/*
+Whether the names at `a` and `b` in `msg` are one name, compression pointers
+followed and letters compared without regard to ASCII case (RFC 4343). False
+for any that cannot be read, or that points forwards, at itself or into the
+header, which `decode_name` refuses too. Bounded by `2 * MAX_NAME_WIRE` steps besides, as a
+name holds at most `MAX_NAME_WIRE` bytes.
+*/
+@(private)
+wire_names_equal :: proc(msg: []u8, a, b: int) -> bool {
+	pa, pb := a, b
+	for _ in 0 ..< 2 * MAX_NAME_WIRE {
+		// The same bytes from here on are the same name from here on.
+		if pa == pb {
+			return true
+		}
+		if pa >= len(msg) || pb >= len(msg) {
+			return false
+		}
+		// Backwards only, as `decode_name` follows them: each hop lands
+		// earlier, so a loop cannot form and the walk is bounded by the bytes.
+		if msg[pa] & 0xC0 == 0xC0 {
+			if pa + 1 >= len(msg) {
+				return false
+			}
+			target := int(msg[pa] & 0x3F) << 8 | int(msg[pa + 1])
+			if target >= pa || target < HEADER_SIZE {
+				return false
+			}
+			pa = target
+			continue
+		}
+		if msg[pb] & 0xC0 == 0xC0 {
+			if pb + 1 >= len(msg) {
+				return false
+			}
+			target := int(msg[pb] & 0x3F) << 8 | int(msg[pb + 1])
+			if target >= pb || target < HEADER_SIZE {
+				return false
+			}
+			pb = target
+			continue
+		}
+		la, lb := int(msg[pa]), int(msg[pb])
+		if la != lb || la & 0xC0 != 0 {
+			return false
+		}
+		if la == 0 {
+			return true
+		}
+		if pa + 1 + la > len(msg) || pb + 1 + lb > len(msg) {
+			return false
+		}
+		for k in 1 ..= la {
+			if fold_byte(msg[pa + k]) != fold_byte(msg[pb + k]) {
+				return false
+			}
+		}
+		pa += 1 + la
+		pb += 1 + lb
+	}
+	return false
 }
 
 /*
