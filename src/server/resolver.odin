@@ -1676,12 +1676,11 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	rather than silently dropped, matching the other policy refusals above -
 	the allow-list is what keeps this from being a free reflection.
 
-	An expired entry held back for the upstream is served here rather than
-	refused. It is something this server already knows and no recursion is needed
-	to produce it, so the reason for the refusal does not reach it - and the
-	forwarding path that would have refreshed it is closed to this query anyway.
-	Refusing would withhold the fallback from exactly the clients that asked for
-	local knowledge and nothing else.
+	An expired entry is refused too. RFC 8767 section 5: "If it finds no relevant
+	unexpired data and the Recursion Desired flag is not set in the request, it
+	should immediately return the response without consulting the cache for
+	expired records." Section 4 lets expired data stand in only when it "is
+	unable to be authoritatively refreshed", and this query never tries.
 
 	No counter of its own, again matching the class, XFR and cookie refusals
 	beside it: `Stats.refused` is `server.allow_from` turning away a datagram or
@@ -1692,9 +1691,6 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	`log.queries` is on.
 	*/
 	if !st.msg.flags.rd {
-		if lent, found := lend_stale(st.s, st.stale_hit, st.allocator); found {
-			return answered(st, serve_from_cache(st, lent))
-		}
 		out, built := dns.error_response(st.query, st.msg, .Refused, st.allocator, st.limit)
 		log_query(st.s, st.client, st.proto, st.q, .Refused, "rd", st.started)
 		return answered(st, out, .Refused, built)
@@ -1707,8 +1703,7 @@ answer_from_cache :: proc(st: ^Query_State) -> bool {
 	what it means. This is the last thing before the query goes to an upstream,
 	which is the cost it exists to save: a live answer is served above without
 	ever reaching it, and an RD=0 query - which makes no upstream call to save -
-	keeps the reading the gate above gives it, down to the expired answer it is
-	handed rather than refused.
+	is refused by the gate above whatever verdict is held.
 
 	That ordering also says what happens when a verdict and a fresh answer exist
 	at once: the answer wins, which is the right way round for a zone that has

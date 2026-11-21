@@ -660,21 +660,19 @@ test_an_expired_entry_is_no_fallback_without_serve_stale :: proc(t: ^testing.T) 
 }
 
 /*
-RD=0 is answered from a stale entry rather than refused.
+RD=0 that finds only an expired entry is refused as any other miss with RD clear.
 
-RD=0 asks for whatever this server already knows and forbids it from recursing
-on the client's behalf - RFC 1035 section 4.1.1 - which is why `resolve_query`
-refuses one it would have to forward. An expired entry is something this server
-already knows, so the refusal does not apply to it: there is an answer in hand
-and no recursion needed to produce it. Refusing here would be the fallback
-withheld from precisely the clients - monitoring probes, other resolvers - that
-asked for local knowledge and nothing else.
+RFC 8767 section 5: "If it finds no relevant unexpired data and the Recursion
+Desired flag is not set in the request, it should immediately return the
+response without consulting the cache for expired records." Section 4 lets
+expired data stand in only when it "is unable to be authoritatively refreshed",
+and an RD=0 query never tries.
 
 `s.group` is left nil, so a query that reached the forwarding step would crash
 rather than quietly refuse.
 */
 @(test)
-test_rd_zero_is_answered_from_a_stale_entry :: proc(t: ^testing.T) {
+test_rd_zero_is_refused_from_a_stale_entry :: proc(t: ^testing.T) {
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
 	defer cache.destroy(answers)
 	cfg: config.Config
@@ -687,12 +685,11 @@ test_rd_zero_is_answered_from_a_stale_entry :: proc(t: ^testing.T) {
 	if !testing.expect(t, ok, "an RD=0 query went unanswered") {
 		return
 	}
-	testing.expect_value(t, outcome, Outcome.Cached)
-
+	testing.expect_value(t, outcome, Outcome.Refused)
 	served, serr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, serr, dns.Decode_Error.None)
-	if testing.expect(t, len(served.answer) == 1, "the stale answer carried no record") {
-		testing.expect_value(t, served.answer[0].ttl, u32(cache.STALE_TTL))
+	if testing.expect_value(t, serr, dns.Decode_Error.None) {
+		testing.expect_value(t, dns.rcode_of(served), dns.Rcode.Refused)
+		testing.expectf(t, len(served.answer) == 0, "the expired answer was served: %v", served.answer)
 	}
 	free_all(context.temp_allocator)
 }

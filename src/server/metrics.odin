@@ -692,8 +692,7 @@ render_cache_metrics :: proc(b: ^strings.Builder, s: ^Server) {
 	the absence of the traffic that stopped.
 
 	Counted where the answer reaches a client rather than where an upstream
-	fails, so an expired entry served to an RD=0 query - which is answered from
-	what this server already knows, without asking anybody - is in here too.
+	fails.
 	*/
 	metrics.scalar(
 		b,

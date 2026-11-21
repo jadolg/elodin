@@ -436,17 +436,11 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 	testing.expect_value(t, sync.atomic_load(&f.mock.seen), asked)
 
 	/*
-	And the client that asked for local knowledge and nothing else still gets
-	it.
-
-	RD=0 is answered from what this server already holds or refused, and the
-	expired answer is something it holds - which is why the gate hands it over
-	rather than refusing, and why the verdict is looked for below that gate
-	rather than above it. There is no upstream call on this path for a verdict
-	to save, so reading one here would only take the fallback away from the
-	clients the gate was written for.
+	An RD=0 client is refused at the RD gate, above the verdict, and the expired
+	answer is not served to it (RFC 8767 section 5): the refusal is REFUSED with
+	`detail=rd`, not the verdict's SERVFAIL.
 	*/
-	local, from_cache, answered := handle_query(
+	local, refused, answered := handle_query(
 		&f.server,
 		bogus_client_query(rd = false),
 		.UDP,
@@ -454,12 +448,8 @@ test_a_verdict_is_remembered_without_taking_the_answer_kept_for_an_outage :: pro
 		context.temp_allocator,
 	)
 	testing.expect(t, answered, "no response was produced for the RD=0 query")
-	testing.expect_value(t, from_cache, Outcome.Cached)
-	testing.expect(
-		t,
-		len(local) >= dns.HEADER_SIZE && dns.peek_rcode(local) == .No_Error && local[7] == 1,
-		"the RD=0 client was refused from the verdict instead of served what this server holds",
-	)
+	testing.expect_value(t, refused, Outcome.Refused)
+	testing.expect_value(t, dns.peek_rcode(local), dns.Rcode.Refused)
 	testing.expect_value(t, sync.atomic_load(&f.mock.seen), asked)
 
 	free_all(context.temp_allocator)

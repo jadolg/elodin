@@ -87,8 +87,10 @@ server:
 ## Recursion only when asked
 
 elodin forwards to an upstream only when the query has RD set (RFC 1035 section
-4.1.1). A query with RD=0 gets what is already cached, and otherwise REFUSED
-rather than a silent drop, so the client finds out instead of timing out.
+4.1.1). A query with RD=0 gets what is already cached and unexpired, and
+otherwise REFUSED rather than a silent drop, so the client finds out instead of
+timing out. An expired entry kept by `cache.serve_stale` is not served to it
+(RFC 8767 section 5).
 
 - Logged as `outcome=refused detail=rd`. It does not add to `refused=`, which
   counts sources turned away before a query exists.

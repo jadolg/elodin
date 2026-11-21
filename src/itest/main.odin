@@ -293,6 +293,7 @@ main :: proc() {
 	run_rrsig_expiry_cases(&r)
 	run_stale_refresh_cases(&r)
 	run_stale_superseded_cases(&r)
+	run_stale_rd_cases(&r)
 	run_prefetch_cases(&r)
 
 	section(&r, "blocklist downloads")
