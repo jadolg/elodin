@@ -20,11 +20,13 @@ says:
 | `invalid.` and below | NXDOMAIN | RFC 6761 6.4; it cannot exist |
 
 These answers carry a 10-minute TTL and a synthesised SOA so a downstream
-resolver can cache the negative, and are not put in elodin's own cache. Every
-zone on this page is served as RFC 6303 section 3 describes: answers set AA, and
-the SOA names the zone itself as MNAME (the target of its NS, with no address,
-so a dynamic-update client has nowhere to send its update) and
-`nobody.invalid.` as RNAME. They log
+resolver can cache the negative, and are not put in elodin's own cache. The
+answers set AA, and the SOA names the zone itself as MNAME and `nobody.invalid.`
+as RNAME (RFC 6303 section 3). Outside `localhost.`, that MNAME has no address,
+so a dynamic-update client has nowhere to send its update. `localhost.`,
+`home.arpa.` and the private reverse zones answer their SOA and NS at the apex;
+`onion.`, `invalid.`, `local.` and `test.` are NXDOMAIN throughout, apex
+included (RFC 6761, RFC 7686). They log
 as `outcome=local detail=special-use` and count as `special_use=` and
 `elodin_special_use_total`. That counter climbing where nobody uses `.onion`
 means either somebody does, or `localhost.` lookups are reaching this resolver

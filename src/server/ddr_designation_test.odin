@@ -250,3 +250,28 @@ test_ddr_addresses_keep_the_opt_record :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+The designated name's addresses go only with the designation: the zone's own
+SOA and NS at the apex carry nothing in the additional section, which would be
+out-of-zone data sent with AA set.
+*/
+@(test)
+test_ddr_addresses_go_only_with_the_designation :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := designating_server(&cfg)
+	cfg.rewrites = []config.Rewrite {
+		{domain = "dns.example.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {192, 168, 1, 2}}}},
+	}
+
+	// The premise: the designation carries the address.
+	designation := ask(t, &s, "_dns.resolver.arpa.", .SVCB)
+	testing.expect_value(t, len(designation.additional), 1)
+
+	for type in ([]dns.Type{.SOA, .NS, .ANY}) {
+		resp := ask(t, &s, "resolver.arpa.", type)
+		testing.expectf(t, len(resp.answer) > 0, "resolver.arpa. %v: no apex answer", type)
+		testing.expectf(t, len(resp.additional) == 0, "resolver.arpa. %v: additional %v", type, resp.additional)
+	}
+	free_all(context.temp_allocator)
+}

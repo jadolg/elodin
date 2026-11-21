@@ -757,3 +757,37 @@ test_a_reverse_rewrite_answers_authoritatively :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+With `special_use.private_reverse` off the zone is not served here, so the PTR
+is a rewrite's answer in somebody else's zone: AA clear, and a NODATA under the
+SOA every rewrite carries rather than RFC 6303's.
+*/
+@(test)
+test_a_reverse_rewrite_outside_a_served_zone_is_not_authoritative :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := local_server(&cfg)
+	cfg.rewrites = sample_rules()
+	cfg.special_use.private_reverse = false
+
+	for type in ([]dns.Type{.PTR, .TXT}) {
+		out, _, ok := handle_query(&s, test_query("50.1.168.192.in-addr.arpa.", type), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		if !testing.expectf(t, ok, "%v went unanswered", type) {
+			continue
+		}
+		m, derr := dns.decode_message(out, context.temp_allocator)
+		if !testing.expectf(t, derr == .None, "%v: the answer does not decode: %v", type, derr) {
+			continue
+		}
+		testing.expectf(t, !m.flags.aa, "%v: AA set on a zone not served here", type)
+		if type == .PTR {
+			testing.expectf(t, len(m.answer) == 1, "PTR: %d answers, so the rewrite did not answer", len(m.answer))
+			continue
+		}
+		if testing.expectf(t, len(m.authority) == 1, "TXT: no SOA in authority") {
+			soa, is_soa := m.authority[0].data.(dns.Rdata_SOA)
+			testing.expectf(t, is_soa && soa.ns == SYNTH_SOA_NS, "TXT: SOA %v, want the rewrite's", m.authority[0].data)
+		}
+	}
+	free_all(context.temp_allocator)
+}

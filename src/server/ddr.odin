@@ -173,6 +173,7 @@ build_resolver_arpa_response :: proc(
 		append_apex_records(&apex, RESOLVER_ARPA, q.type, RESOLVER_ARPA_TTL)
 		resp.answer = apex[:]
 	}
+	designated := false
 	if q.type == .SVCB && dns.name_equal_fold(q.name, DDR_QNAME) {
 		// Nothing where the designation could not be built whole: a lost record
 		// would go out as a NODATA the client caches, and lost params as a
@@ -182,12 +183,13 @@ build_resolver_arpa_response :: proc(
 			return nil
 		}
 		resp.answer = answer
+		designated = len(answer) > 0
 	}
 	soa: [1]dns.Record
 	if len(resp.answer) == 0 {
 		soa[0] = local_zone_soa(RESOLVER_ARPA, RESOLVER_ARPA_TTL)
 		resp.authority = soa[:]
-	} else {
+	} else if designated {
 		// Behind the client's OPT record rather than over it, so the encoder keeps
 		// that record's room as the addresses fill the section.
 		// Kept as it was where the allocator ran dry, so the client's OPT record

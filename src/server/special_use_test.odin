@@ -153,6 +153,8 @@ Want :: enum {
 	// RFC 6303 section 3 has an apex answer rather than decline.
 	Zone_Soa,
 	Zone_Ns,
+	// ANY at the `localhost.` apex: both addresses, the SOA and the NS.
+	Apex_Any,
 }
 
 @(private = "file")
@@ -187,6 +189,7 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		// NODATA that carries the very SOA it denies.
 		{name = "localhost.", type = .SOA, want = .Zone_Soa},
 		{name = "localhost.", type = .NS, want = .Zone_Ns},
+		{name = "localhost.", type = .ANY, want = .Apex_Any},
 		// Below the apex, NODATA as for any type the name has nothing of.
 		{name = "dev.localhost.", type = .SOA, want = .No_Data, soa = "localhost."},
 		// RFC 7686 section 2. The SOA sits at the apex of the reserved zone, not
@@ -368,6 +371,19 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 					ns.name,
 				)
 			}
+		case .Apex_Any:
+			testing.expectf(t, dns.rcode_of(resp) == .No_Error, "%s ANY is not NOERROR", c.name)
+			want := [4]dns.Type{.A, .AAAA, .SOA, .NS}
+			found := 0
+			for w in want {
+				for rec in resp.answer {
+					if rec.type == w {
+						found += 1
+						break
+					}
+				}
+			}
+			testing.expectf(t, len(resp.answer) == 4 && found == 4, "%s ANY answered %v", c.name, resp.answer)
 		case .No_Data, .Nx_Domain:
 			want_rcode := dns.Rcode.No_Error if c.want == .No_Data else dns.Rcode.NX_Domain
 			testing.expectf(t, dns.rcode_of(resp) == want_rcode, "%s is %v, want %v", c.name, dns.rcode_of(resp), want_rcode)
@@ -1167,8 +1183,7 @@ test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) 
 
 /*
 That `rec`, where it is an SOA, has the RFC 6303 section 3 names for the zone
-`zone`: MNAME the zone itself, which has no address record, so an UPDATE client
-has nowhere to send its update, and RNAME `nobody.invalid.`.
+`zone`: MNAME the zone itself and RNAME `nobody.invalid.`.
 */
 @(private)
 expect_local_zone_soa :: proc(t: ^testing.T, rec: dns.Record, zone: string, loc := #caller_location) {
