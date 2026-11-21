@@ -512,6 +512,9 @@ build_h2_response :: proc(
 	// the message - and not again by `h2_charged` on the reader fiber.
 	message, status, why, is_query := doh_query_message(req.method, req.content_type, req.body, query)
 	if !is_query {
+		if why == DOH_NOT_A_QUERY {
+			sync.atomic_add(&ctx.server.stats.dropped, 1)
+		}
 		return h2_error(status, why, DOH_METHODS if status == 405 else ""), true
 	}
 

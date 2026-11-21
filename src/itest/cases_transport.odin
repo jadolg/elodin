@@ -2,6 +2,7 @@ package itest
 
 import "core:encoding/base64"
 import "core:fmt"
+import "core:slice"
 import "core:strings"
 import "elodin:dns"
 import "elodin:tlsx"
@@ -280,6 +281,25 @@ run_transport_cases :: proc(r: ^Runner) {
 		)
 		if check(r, res.ok, "no HTTP response") {
 			check_eq_int(r, res.status, 400, "status")
+		}
+	}
+	end_case(r)
+
+	/*
+	A response is the client's error: 400 (RFC 9110 section 15.5.1), not the
+	500 that has a client retry or fail over.
+	*/
+	start_case(r, "doh: a message with QR set is a 400")
+	{
+		response := slice.clone(query, context.temp_allocator)
+		response[2] |= 0x80
+		post := doh_post(doh_port, "/dns-query", response)
+		if check(r, post.ok, "no HTTP response to a POST") {
+			check_eq_int(r, post.status, 400, "POST status")
+		}
+		get := doh_get(doh_port, "/dns-query", response)
+		if check(r, get.ok, "no HTTP response to a GET") {
+			check_eq_int(r, get.status, 400, "GET status")
 		}
 	}
 	end_case(r)

@@ -17,6 +17,12 @@ flags that describe this server rather than the data: AA and the reserved Z bit
 are cleared, RA is set, and RD and CD are the client's own (RFC 1035 section
 4.1.1, RFC 4035 section 3.2.2). The AD bit is covered under [DNSSEC](dnssec.md).
 
+A message with the QR bit set is a response (RFC 1035 section 4.1.1), and one
+arriving on a listener is dropped off its header before anything else is read:
+over UDP and TCP/DoT it gets no reply, not even FORMERR, and over UDP it is not
+charged to the [rate limit](rate-limiting.md), so it never draws a slip. Over DoH it
+is answered **400**. It counts in `elodin_queries_dropped_total`, not as a query.
+
 A name whose compression pointer aims into the 12-byte header is not read as a
 name. Those bytes are ones elodin writes per client (the ID, AD, and ARCOUNT
 when an OPT record is added or removed), so the client would read a different

@@ -761,6 +761,12 @@ udp_loop :: proc(data: rawptr) {
 			sync.atomic_add(&ctx.server.stats.dropped, 1)
 			continue
 		}
+		// A response is not answered, so it is not charged to a rate-limit
+		// budget either, whose slip would answer it (see `handle_query`).
+		if dns.peek_is_response(buf[:n]) {
+			sync.atomic_add(&ctx.server.stats.dropped, 1)
+			continue
+		}
 
 		// The checks below read the configuration, so the generation is pinned
 		// for this datagram only and let go before the next read blocks: a reader
@@ -2053,10 +2059,12 @@ serve_dns_stream :: proc(s: ^Server, conn: Conn, proto: Protocol, client: string
 		is answered - `handle_query` builds it a FORMERR out of its own header - so
 		it spends the budget on a response, like everything else the budget counts.
 		The one length-legal message that goes unanswered is a response arriving
-		where queries are read, and the DoH paths charge for that one too before
-		turning it into a 500. Which leaves the parse buying nothing but a rule that
-		differed from the UDP loop's, and that loop charges a datagram before it has
-		looked at it at all.
+		where queries are read (QR set), and that one is charged here though the
+		UDP loop and the DoH paths turn it away uncharged: there an uncharged
+		response costs a header read and nothing is sent, while here the handshake
+		has shown who is sending, and a client sending nothing else spends its
+		budget and has its connection closed like any other. Which leaves the parse
+		buying nothing but a rule that differed from the UDP loop's.
 
 		The connection ends rather than this query being skipped. Skipping it
 		leaves a client that framed a correct query waiting for an answer that is

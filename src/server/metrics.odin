@@ -377,7 +377,7 @@ render_metrics :: proc(s: ^Server, l: ^Listeners, allocator := context.allocator
 		&b,
 		"elodin_queries_dropped_total",
 		.Counter,
-		"Queries turned away before any work was done: server.max_pending was reached, the query could not be started, or the source could not be answered.",
+		"Queries turned away before any work was done: server.max_pending was reached, the query could not be started, the source could not be answered, or the message was a response (QR set).",
 		st.dropped,
 	)
 	metrics.scalar(

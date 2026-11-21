@@ -2,6 +2,7 @@ package itest
 
 import "core:fmt"
 import "core:net"
+import "core:slice"
 import "core:time"
 import "elodin:dns"
 
@@ -90,6 +91,47 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				QUERIES,
 			)
 			check_eq_int(r, res.truncated, 0, "truncated answers with the limiter off")
+		}
+	}
+	end_case(r)
+
+	/*
+	A response from a prefix past its budget is not answered with the slip's
+	truncated reply: it is dropped before it is charged (RFC 1035 section 4.1.1,
+	QR=1 is a response), which is what keeps two servers from bouncing slips at
+	each other off one spoofed datagram.
+	*/
+	start_case(r, "rate limit: a response from a prefix over its budget gets no slip")
+	{
+		udp_port := next_port(r)
+		srv, ok := start_server(
+			r,
+			Server_Options {
+				config = config_rate_limit(udp_port, upstream_port, fmt.tprintf("enabled: true, responses_per_second: %d, slip: 1", RATE)),
+				udp_port = udp_port,
+			},
+		)
+		if ok {
+			defer stop_server(&srv)
+			// As many responses as the flood case sends queries: before the
+			// fix, those past the budget drew slips.
+			response := slice.clone(query, context.temp_allocator)
+			response[2] |= 0x80
+			bounced := udp_flood(udp_port, response, QUERIES)
+			check_eq_int(r, bounced.answered, 0, "responses answered")
+			// The premise, and that the responses spent none of the budget: the
+			// same flood as queries is answered in part, and slipped past it.
+			flood := udp_flood(udp_port, query, QUERIES)
+			// The whole burst, give or take: responses that had spent it would
+			// leave only what the drain refilled, about a third of it.
+			check(
+				r,
+				flood.answered - flood.truncated >= BURST - 5,
+				"%d full answers after the responses, where the burst is %d: the responses spent the budget",
+				flood.answered - flood.truncated,
+				BURST,
+			)
+			check(r, flood.truncated > 0, "the premise: nothing over the budget came back truncated")
 		}
 	}
 	end_case(r)

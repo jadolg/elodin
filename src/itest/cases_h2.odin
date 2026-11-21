@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:slice"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
@@ -82,6 +83,23 @@ run_h2_cases :: proc(r: ^Runner) {
 					h := parse_header(r, res.body)
 					check_eq_int(r, h.ancount, fix.ancount, "answer count")
 					check(r, h.id == 0x2222, "transaction ID not echoed: %04x", h.id)
+				}
+			}
+		}
+	}
+	end_case(r)
+
+	start_case(r, "h2: a message with QR set is a 400")
+	{
+		response := slice.clone(query, context.temp_allocator)
+		response[2] |= 0x80
+		c, cok := h2_connect(doh_port)
+		if check(r, cok, "cannot open an h2 connection") {
+			defer h2_close(c)
+			check(r, h2_send_get(c, 1, "/dns-query", response), "cannot send the request")
+			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
+				if res, found := h2_stream(c, 1); check(r, found, "stream 1 has no result") {
+					check_eq_int(r, res.status, 400, "status")
 				}
 			}
 		}
@@ -597,8 +615,9 @@ run_h2_cases :: proc(r: ^Runner) {
 			defer h2_close(c)
 			check(r, h2_send_request(c, 1, "GET", "/dns-query", nil), "cannot send")
 			if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
-				res, _ := h2_stream(c, 1)
-				check_eq_int(r, res.status, 400, "status")
+				if res, found := h2_stream(c, 1); check(r, found, "stream 1 has no result") {
+					check_eq_int(r, res.status, 400, "status")
+				}
 			}
 		}
 	}
