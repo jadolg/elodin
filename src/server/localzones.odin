@@ -611,10 +611,10 @@ special_use_deferred :: proc(s: ^Server, name: string) -> bool {
 The answer for a name that is never forwarded.
 
 `localhost.` gets 127.0.0.1 for A and ::1 for AAAA (RFC 6761 section 6.3), its
-SOA and NS at the apex (RFC 6303 section 3), and NODATA for every other type - not NXDOMAIN, because the name exists, and not a
-made-up record of some other type, because this server has no zone to invent
-one from. An MX or a TXT for `localhost.` is a question with a real answer of
-"there is none", and NODATA is how that is spelled.
+SOA and NS at the apex (RFC 6303 section 3), and NODATA for every other type -
+not NXDOMAIN, because the name exists. An MX or a TXT for `localhost.` is a
+question with a real answer of "there is none", and NODATA is how that is
+spelled.
 
 `home.arpa.` and the private reverse zones get the empty zone RFC 6303 section
 3 describes - the shape that RFC asks for, and for `home.arpa.` the one its
