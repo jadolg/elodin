@@ -15,12 +15,18 @@ says:
 
 | name | answer | why |
 |---|---|---|
-| `localhost.` and below | 127.0.0.1 for A, `::1` for AAAA, NODATA otherwise | RFC 6761 6.3; forwarded, the upstream could point it anywhere |
+| `localhost.` and below | 127.0.0.1 for A, `::1` for AAAA, the zone's SOA and NS at `localhost.` itself, NODATA otherwise | RFC 6761 6.3; forwarded, the upstream could point it anywhere |
 | `onion.` and below | NXDOMAIN | RFC 7686 2; forwarding it tells the upstream and the path which hidden service is wanted |
 | `invalid.` and below | NXDOMAIN | RFC 6761 6.4; it cannot exist |
 
 These answers carry a 10-minute TTL and a synthesised SOA so a downstream
-resolver can cache the negative, and are not put in elodin's own cache. They log
+resolver can cache the negative, and are not put in elodin's own cache. The
+answers set AA, and the SOA names the zone itself as MNAME and `nobody.invalid.`
+as RNAME (RFC 6303 section 3). Outside `localhost.`, that MNAME has no address,
+so a dynamic-update client has nowhere to send its update. `localhost.`,
+`home.arpa.` and the private reverse zones answer their SOA and NS at the apex;
+`onion.`, `invalid.`, `local.` and `test.` are NXDOMAIN throughout, apex
+included (RFC 6761, RFC 7686). They log
 as `outcome=local detail=special-use` and count as `special_use=` and
 `elodin_special_use_total`. That counter climbing where nobody uses `.onion`
 means either somebody does, or `localhost.` lookups are reaching this resolver

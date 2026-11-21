@@ -165,6 +165,53 @@ run_special_use_answered_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	RFC 6303 section 3, which RFC 9462 section 6.4 applies to `resolver.arpa`:
+	answers from a locally served zone set AA, the apex answers its SOA and NS,
+	and the SOA names the zone as MNAME and `nobody.invalid.` as RNAME.
+	*/
+	start_case(r, "special_use: locally served zones answer authoritatively, in the RFC 6303 shape")
+	{
+		Ask :: struct {
+			name:    string,
+			type:    dns.Type,
+			zone:    string,
+			answers: int,
+		}
+		ASKS := []Ask {
+			{name = "localhost.", type = .SOA, zone = "localhost.", answers = 1},
+			{name = "localhost.", type = .NS, zone = "localhost.", answers = 1},
+			{name = "resolver.arpa.", type = .SOA, zone = "resolver.arpa.", answers = 1},
+			{name = "resolver.arpa.", type = .NS, zone = "resolver.arpa.", answers = 1},
+			{name = "1.1.168.192.in-addr.arpa.", type = .PTR, zone = "168.192.in-addr.arpa."},
+		}
+		for a in ASKS {
+			what := fmt.tprintf("%s %v", a.name, a.type)
+			res, h, answered := ask(r, udp_port, a.name, u16(a.type), fmt.tprintf("no response for %s", what))
+			if !answered {
+				continue
+			}
+			check(r, h.aa, "%s: AA clear", what)
+			check_eq_int(r, h.ancount, a.answers, fmt.tprintf("%s: answers", what))
+			m, derr := dns.decode_message(res.wire, context.temp_allocator)
+			if !check(r, derr == .None, "%s: the answer does not decode: %v", what, derr) {
+				continue
+			}
+			for rec in m.answer {
+				if soa, is_soa := rec.data.(dns.Rdata_SOA); is_soa {
+					check(r, dns.name_equal_fold(soa.ns, a.zone), "%s: MNAME %s, want the zone", what, soa.ns)
+					check(r, dns.name_equal_fold(soa.mbox, "nobody.invalid."), "%s: RNAME %s", what, soa.mbox)
+				}
+			}
+			for rec in m.authority {
+				if soa, is_soa := rec.data.(dns.Rdata_SOA); is_soa {
+					check(r, dns.name_equal_fold(soa.ns, a.zone), "%s: MNAME %s, want the zone", what, soa.ns)
+				}
+			}
+		}
+	}
+	end_case(r)
+
 	start_case(r, "special_use: none of that reached the upstream")
 	{
 		check_eq_int(r, mock_total(mock) - before, 0, "queries the upstream was sent")

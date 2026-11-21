@@ -153,6 +153,8 @@ Want :: enum {
 	// RFC 6303 section 3 has an apex answer rather than decline.
 	Zone_Soa,
 	Zone_Ns,
+	// ANY at the `localhost.` apex: both addresses, the SOA and the NS.
+	Apex_Any,
 }
 
 @(private = "file")
@@ -183,6 +185,13 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		// The name exists, so a type it has nothing of is NODATA rather than
 		// NXDOMAIN, and there is no invented MX for a zone we do not have.
 		{name = "localhost.", type = .MX, want = .No_Data, soa = "localhost."},
+		// The apex answers its SOA and NS (RFC 6303 section 3) rather than a
+		// NODATA that carries the very SOA it denies.
+		{name = "localhost.", type = .SOA, want = .Zone_Soa},
+		{name = "localhost.", type = .NS, want = .Zone_Ns},
+		{name = "localhost.", type = .ANY, want = .Apex_Any},
+		// Below the apex, NODATA as for any type the name has nothing of.
+		{name = "dev.localhost.", type = .SOA, want = .No_Data, soa = "localhost."},
 		// RFC 7686 section 2. The SOA sits at the apex of the reserved zone, not
 		// at the parent of the queried name, so a resolver downstream can cache
 		// the negative answer for the tree rather than for one hidden service.
@@ -298,6 +307,14 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		if !testing.expectf(t, derr == .None, "%s produced a response that will not decode: %v", c.name, derr) {
 			continue
 		}
+		// RFC 6303 section 3: a locally served zone answers "authoritatively (AA=1)".
+		testing.expectf(t, resp.flags.aa, "%s %v: AA clear on a locally served answer", c.name, c.type)
+		for rec in resp.answer {
+			expect_local_zone_soa(t, rec, c.name)
+		}
+		for rec in resp.authority {
+			expect_local_zone_soa(t, rec, c.soa)
+		}
 
 		switch c.want {
 		case .Loopback_4:
@@ -354,6 +371,19 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 					ns.name,
 				)
 			}
+		case .Apex_Any:
+			testing.expectf(t, dns.rcode_of(resp) == .No_Error, "%s ANY is not NOERROR", c.name)
+			want := [4]dns.Type{.A, .AAAA, .SOA, .NS}
+			found := 0
+			for w in want {
+				for rec in resp.answer {
+					if rec.type == w {
+						found += 1
+						break
+					}
+				}
+			}
+			testing.expectf(t, len(resp.answer) == 4 && found == 4, "%s ANY answered %v", c.name, resp.answer)
 		case .No_Data, .Nx_Domain:
 			want_rcode := dns.Rcode.No_Error if c.want == .No_Data else dns.Rcode.NX_Domain
 			testing.expectf(t, dns.rcode_of(resp) == want_rcode, "%s is %v, want %v", c.name, dns.rcode_of(resp), want_rcode)
@@ -1149,4 +1179,18 @@ test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) 
 	)
 
 	free_all(context.temp_allocator)
+}
+
+/*
+That `rec`, where it is an SOA, has the RFC 6303 section 3 names for the zone
+`zone`: MNAME the zone itself and RNAME `nobody.invalid.`.
+*/
+@(private)
+expect_local_zone_soa :: proc(t: ^testing.T, rec: dns.Record, zone: string, loc := #caller_location) {
+	soa, is_soa := rec.data.(dns.Rdata_SOA)
+	if !is_soa {
+		return
+	}
+	testing.expectf(t, dns.name_equal_fold(soa.ns, zone), "the SOA for %s names %q as MNAME, want the zone", zone, soa.ns, loc = loc)
+	testing.expectf(t, dns.name_equal_fold(soa.mbox, "nobody.invalid."), "the SOA for %s names %q as RNAME, want nobody.invalid.", zone, soa.mbox, loc = loc)
 }

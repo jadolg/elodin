@@ -165,6 +165,15 @@ apply_reverse_rewrite :: proc(
 	}
 
 	resp := dns.make_response(query, .No_Error, allocator)
+	/*
+	AA and the RFC 6303 SOA only where the special-use table serves the zone
+	(RFC 6303 section 3). With `special_use.private_reverse` off, or the zone
+	routed to a server of its own, the PTR is a rewrite's answer in somebody
+	else's zone, as every rewrite is.
+	*/
+	_, kind := special_use_zone(s, q.name, q.type)
+	served_here := kind != .None
+	resp.flags.aa = served_here
 	resp.answer = answers[:]
 	soa: [1]dns.Record
 	if len(answers) == 0 {
@@ -179,7 +188,7 @@ apply_reverse_rewrite :: proc(
 		name's parent, `1.168.192.in-addr.arpa.` being a zone nobody was ever
 		authoritative for.
 		*/
-		soa[0] = synth_soa(q.name, ttl, zone)
+		soa[0] = local_zone_soa(zone, ttl) if served_here else synth_soa(q.name, ttl, zone)
 		resp.authority = soa[:]
 	}
 

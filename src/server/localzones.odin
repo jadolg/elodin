@@ -610,11 +610,11 @@ special_use_deferred :: proc(s: ^Server, name: string) -> bool {
 /*
 The answer for a name that is never forwarded.
 
-`localhost.` gets 127.0.0.1 for A and ::1 for AAAA (RFC 6761 section 6.3), and
-NODATA for every other type - not NXDOMAIN, because the name exists, and not a
-made-up record of some other type, because this server has no zone to invent
-one from. An MX or a TXT for `localhost.` is a question with a real answer of
-"there is none", and NODATA is how that is spelled.
+`localhost.` gets 127.0.0.1 for A and ::1 for AAAA (RFC 6761 section 6.3), its
+SOA and NS at the apex (RFC 6303 section 3), and NODATA for every other type -
+not NXDOMAIN, because the name exists. An MX or a TXT for `localhost.` is a
+question with a real answer of "there is none", and NODATA is how that is
+spelled.
 
 `home.arpa.` and the private reverse zones get the empty zone RFC 6303 section
 3 describes - the shape that RFC asks for, and for `home.arpa.` the one its
@@ -643,9 +643,10 @@ answer_special_use :: proc(
 	limit: int,
 ) -> []u8 {
 	rcode := dns.Rcode.No_Error
-	// On the stack: at most two records (A and AAAA, or SOA and NS, for ANY),
-	// so no append can run dry and turn the answer into a NODATA.
-	answer_buf: [2]dns.Record
+	// On the stack: at most four records (A, AAAA, SOA and NS, for ANY at the
+	// `localhost.` apex), so no append can run dry and turn the answer into a
+	// NODATA.
+	answer_buf: [4]dns.Record
 	answers := slice.into_dynamic(answer_buf[:])
 
 	switch kind {
@@ -676,6 +677,9 @@ answer_special_use :: proc(
 				},
 			)
 		}
+		if dns.name_equal_fold(q.name, zone) {
+			append_apex_records(&answers, zone, q.type, SPECIAL_USE_TTL)
+		}
 	case .Nonexistent:
 		rcode = .NX_Domain
 	case .Empty_Nonterminal:
@@ -691,28 +695,16 @@ answer_special_use :: proc(
 			rcode = .NX_Domain
 			break
 		}
-		if q.type == .SOA || q.type == .ANY {
-			append(&answers, synth_soa_for_zone(zone, SPECIAL_USE_TTL))
-		}
-		if q.type == .NS || q.type == .ANY {
-			append(
-				&answers,
-				dns.Record {
-					name = zone,
-					type = .NS,
-					class = .IN,
-					ttl = SPECIAL_USE_TTL,
-					data = dns.Rdata_Name{name = zone},
-				},
-			)
-		}
+		append_apex_records(&answers, zone, q.type, SPECIAL_USE_TTL)
 	}
 
 	resp := dns.make_response(query, rcode, allocator)
+	// RFC 6303 section 3: a locally served zone answers "authoritatively (AA=1)".
+	resp.flags.aa = true
 	resp.answer = answers[:]
 	soa: [1]dns.Record
 	if len(answers) == 0 {
-		soa[0] = synth_soa(q.name, SPECIAL_USE_TTL, zone)
+		soa[0] = local_zone_soa(zone, SPECIAL_USE_TTL)
 		resp.authority = soa[:]
 	}
 
@@ -728,4 +720,40 @@ answer_special_use :: proc(
 		return fallback
 	}
 	return out
+}
+
+/*
+The SOA of a zone this server serves itself, with the names RFC 6303 section 3
+recommends: MNAME the zone, which is also the target of its NS, and RNAME
+`nobody.invalid.`. For every zone but `localhost.` that name has no address
+record, so an RFC 2136 UPDATE client finds no primary to send to; `localhost.`
+is its own loopback address whatever its SOA says.
+*/
+@(private)
+local_zone_soa :: proc(zone: string, ttl: u32) -> dns.Record {
+	rec := synth_soa_for_zone(zone, ttl)
+	soa := rec.data.(dns.Rdata_SOA)
+	soa.ns = zone
+	soa.mbox = LOCAL_ZONE_SOA_MBOX
+	rec.data = soa
+	return rec
+}
+
+@(private)
+LOCAL_ZONE_SOA_MBOX :: "nobody.invalid."
+
+/*
+What the apex of a locally served zone answers for `type`: its SOA, its NS, both
+for ANY, and nothing otherwise (RFC 6303 section 3: "SOA, NS, and 'no data'
+responses ... as appropriate to the query type"). The NS names the zone.
+`answers` has room for both.
+*/
+@(private)
+append_apex_records :: proc(answers: ^[dynamic]dns.Record, zone: string, type: dns.Type, ttl: u32) {
+	if type == .SOA || type == .ANY {
+		append(answers, local_zone_soa(zone, ttl))
+	}
+	if type == .NS || type == .ANY {
+		append(answers, dns.Record{name = zone, type = .NS, class = .IN, ttl = ttl, data = dns.Rdata_Name{name = zone}})
+	}
 }
