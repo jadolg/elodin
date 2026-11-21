@@ -55,7 +55,8 @@ answers a `Content-Length` that declares more with **413** and closes the
 connection, first discarding about 80 KiB of the body for up to a second so that
 the 413 is not lost to a reset. A client that streams more than that without
 `Expect: 100-continue` can still see the reset instead. A missing, repeated or
-invalid `Host`, or a repeated `Content-Type`, is answered 400 ahead of the 413. A `Content-Length` that is not
+invalid `Host`, or a repeated `Content-Type`, is answered 400 ahead of the 413. So is a DNS message
+with the QR bit set, which is a response rather than a query. A `Content-Length` that is not
 plain decimal, or one beside a second `Content-Length` or a `Transfer-Encoding`,
 gets no answer at all, whatever else is wrong with the request.
 

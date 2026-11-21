@@ -837,6 +837,11 @@ doh_query_message :: proc(
 	if len(message) < dns.HEADER_SIZE {
 		return nil, 400, "message too short", false
 	}
+	// The client's error, so 400 (RFC 9110 section 15.5.1) rather than the 500
+	// `handle_query` dropping it would give; see there.
+	if dns.peek_is_response(message) {
+		return nil, 400, "not a query", false
+	}
 	return message, 0, "", true
 }
 

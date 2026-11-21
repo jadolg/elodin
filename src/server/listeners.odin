@@ -761,6 +761,12 @@ udp_loop :: proc(data: rawptr) {
 			sync.atomic_add(&ctx.server.stats.dropped, 1)
 			continue
 		}
+		// A response is not answered, so it is not charged to a rate-limit
+		// budget either, whose slip would answer it (see `handle_query`).
+		if dns.peek_is_response(buf[:n]) {
+			sync.atomic_add(&ctx.server.stats.dropped, 1)
+			continue
+		}
 
 		// The checks below read the configuration, so the generation is pinned
 		// for this datagram only and let go before the next read blocks: a reader

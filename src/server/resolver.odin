@@ -41,8 +41,8 @@ Stats :: struct {
 	rewritten:    u64,
 	/*
 	Queries refused before any work was done: `server.max_pending` was reached
-	or the query could not be started, or the source was one no answer could
-	reach - see `plausible_source`. Queries the rate limiter withheld are counted
+	or the query could not be started, the source was one no answer could
+	reach - see `plausible_source` - or the message was a response (QR set). Queries the rate limiter withheld are counted
 	by the limiter itself.
 	*/
 	dropped:      u64,
@@ -324,6 +324,17 @@ handle_query :: proc(
 	// whatever transport brought the query; see `generation.odin`.
 	pin_scope(s)
 	started := loop.tick_now()
+	/*
+	A response arriving on a listener port is not something to answer, and is
+	not a query to count (RFC 1035 section 4.1.1). Dropped off the header before
+	it is decoded, as Unbound and BIND do: whatever it decodes to, even a
+	FORMERR, would answer it all the same, and answering responses is what lets
+	two servers bounce one spoofed datagram between them.
+	*/
+	if dns.peek_is_response(query) {
+		sync.atomic_add(&s.stats.dropped, 1)
+		return nil, .Failed, false
+	}
 	sync.atomic_add(&s.stats.queries, 1)
 
 	if len(query) < dns.HEADER_SIZE {
@@ -355,10 +366,6 @@ handle_query :: proc(
 		rcode := query_decode_rcode(derr)
 		out, built := dns.error_response(query, {}, rcode, allocator, limit)
 		return advertise_udp_size(out, advertise, proto), .Failed, built
-	}
-	// A response arriving on a listener port is not something to answer.
-	if msg.flags.qr {
-		return nil, .Failed, false
 	}
 
 	/*

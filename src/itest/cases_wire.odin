@@ -543,6 +543,24 @@ run_wire_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	RFC 1035 section 4.1.1: QR=1 is a response. One that does not decode is
+	dropped as one that does is, before it is read: answering it FORMERR would
+	answer a response all the same.
+	*/
+	start_case(r, "malformed: a response that does not decode is ignored, over UDP and TCP")
+	{
+		garbled := []u8{0x42, 0x42, 0x81, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 5, 'a', 'b', 'c'}
+		check(r, expect_no_udp_reply(udp_port, garbled), "the server answered a garbled response over UDP")
+		res := query_tcp(udp_port, garbled, context.temp_allocator, 400 * time.Millisecond)
+		check(r, !res.ok, "the server answered a garbled response over TCP")
+		// The premise: as a query, the same bytes are answered.
+		as_query := garbled
+		as_query[2] = 0x01
+		check(r, query_udp(udp_port, as_query).ok, "the premise: the same bytes as a query were not answered")
+	}
+	end_case(r)
+
 	start_case(r, "malformed: a truncated question yields FORMERR")
 	{
 		// A header claiming one question, with the name cut off mid-label.

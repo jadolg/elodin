@@ -812,6 +812,14 @@ peek_id :: proc(msg: []u8) -> (id: u16, ok: bool) {
 	return u16(msg[0]) << 8 | u16(msg[1]), true
 }
 
+/*
+Whether `msg` is a response (QR=1, RFC 1035 section 4.1.1), read off the header
+without parsing anything; false for one too short to have the bit.
+*/
+peek_is_response :: proc(msg: []u8) -> bool {
+	return len(msg) > 2 && msg[2] & 0x80 != 0
+}
+
 set_id_in_place :: proc(msg: []u8, id: u16) {
 	if len(msg) >= 2 {
 		msg[0] = u8(id >> 8)
