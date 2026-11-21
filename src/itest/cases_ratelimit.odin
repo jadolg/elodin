@@ -122,7 +122,15 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 			// The premise, and that the responses spent none of the budget: the
 			// same flood as queries is answered in part, and slipped past it.
 			flood := udp_flood(udp_port, query, QUERIES)
-			check(r, flood.answered - flood.truncated > 0, "the responses spent the prefix's budget")
+			// The whole burst, give or take: responses that had spent it would
+			// leave only what the drain refilled, about a third of it.
+			check(
+				r,
+				flood.answered - flood.truncated >= BURST - 5,
+				"%d full answers after the responses, where the burst is %d: the responses spent the budget",
+				flood.answered - flood.truncated,
+				BURST,
+			)
 			check(r, flood.truncated > 0, "the premise: nothing over the budget came back truncated")
 		}
 	}

@@ -2,6 +2,7 @@ package server
 
 import "core:encoding/base64"
 import "core:strings"
+import "core:sync"
 import "core:time"
 import "elodin:cache"
 import "elodin:dns"
@@ -714,6 +715,9 @@ serve_doh_request :: proc(
 
 	query, status, why, is_query := doh_query_message(req.method, req.content_type, req.body, req.query)
 	if !is_query {
+		if why == DOH_NOT_A_QUERY {
+			sync.atomic_add(&s.stats.dropped, 1)
+		}
 		return send_http_error(conn, "doh", status, why, req.keep_alive, DOH_METHODS if status == 405 else "", head)
 	}
 
@@ -789,6 +793,10 @@ serve_doh_request :: proc(
 	)
 }
 
+// Why a DoH request carrying a response (QR set) is a 400; counted as dropped
+// by whichever version answers it, as `handle_query` counts the others.
+DOH_NOT_A_QUERY :: "not a query"
+
 /*
 The DNS message a request to the DoH endpoint is asking about, over either HTTP
 version, or the status and reason that say it was not asking about one.
@@ -840,7 +848,7 @@ doh_query_message :: proc(
 	// The client's error, so 400 (RFC 9110 section 15.5.1) rather than the 500
 	// `handle_query` dropping it would give; see there.
 	if dns.peek_is_response(message) {
-		return nil, 400, "not a query", false
+		return nil, 400, DOH_NOT_A_QUERY, false
 	}
 	return message, 0, "", true
 }

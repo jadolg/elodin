@@ -557,7 +557,8 @@ run_wire_cases :: proc(r: ^Runner) {
 		// The premise: as a query, the same bytes are answered.
 		as_query := garbled
 		as_query[2] = 0x01
-		check(r, query_udp(udp_port, as_query).ok, "the premise: the same bytes as a query were not answered")
+		check(r, query_udp(udp_port, as_query).ok, "the premise: the same bytes as a query were not answered over UDP")
+		check(r, query_tcp(udp_port, as_query, context.temp_allocator).ok, "the premise: the same bytes as a query were not answered over TCP")
 	}
 	end_case(r)
 
