@@ -101,14 +101,29 @@ international name in punycode (`xn--...`).
 An anchor for a zone below the root validates that zone against your own key.
 A name is checked from the closest anchor at or above it (RFC 6840 Appendix
 C.1), so the public tree is not asked about `corp.example` at all: a zone signed
-only internally validates, and a public DS for it is not used. An anchor left
-behind after the zone changes its key makes every name in the zone SERVFAIL.
+only internally validates, and a public DS for it is not used.
 
 - The list must still name the root, or `--check` and startup refuse it.
 - The server refuses to start if every anchor for a zone names an algorithm
   or digest this build cannot check.
 - For a zone routed under [`upstream.zones`](upstreams.md#per-domain-upstreams),
   the zone's keys are fetched from the route's servers.
+
+Anchors are not updated in-band: elodin does not implement RFC 5011 automated
+trust-anchor maintenance, which Unbound, BIND and Knot Resolver do. The one
+part of RFC 5011 it reads is the REVOKE bit, which makes a revoked key unusable.
+
+- A root KSK after KSK-2024 needs an elodin release that carries it, or a
+  `trust_anchors` list naming it. The list replaces the built-in anchors, so it
+  must also name the root keys still in use (KSK-2024), and it must name the
+  root whatever else it holds.
+- An anchor for your own zone has to be changed by hand in `trust_anchors` when
+  that zone rolls its KSK; no release can do it. Names whose closest anchor it
+  is go SERVFAIL once the anchored key no longer signs the zone's DNSKEY set,
+  or is revoked; while the old key still signs, as in a double-signature
+  rollover, they validate.
+- A changed `trust_anchors` takes effect on [`SIGHUP`](install.md#signals),
+  with no restart.
 
 ## max_nsec3_iterations
 
