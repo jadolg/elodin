@@ -236,6 +236,7 @@ main :: proc() {
 	section(&r, "wire format and message handling")
 	run_wire_cases(&r)
 	run_rrset_ttl_cases(&r)
+	run_highbit_ttl_cases(&r)
 
 	if cert_ok {
 		section(&r, "listeners: udp, tcp, dot, doh")

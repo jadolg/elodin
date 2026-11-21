@@ -679,34 +679,35 @@ referred_past_alias :: proc(msg: []u8, authority_at, nscount: int) -> bool {
 }
 
 /*
-The largest TTL a message may carry.
+The largest TTL this server writes or acts on: 2^31-1.
 
-The field is 32 bits wide on the wire, but RFC 2181 section 8 narrows the value
-to an unsigned 31-bit number: the top bit is not part of it. Doubles as the "no
-ceiling" argument to `cap_ttls`, since no TTL that has been through `sane_ttl`
-is above it.
+RFC 8767 section 4 reads the 32-bit field as unsigned, but a resolver that still
+follows RFC 2181 section 8 reads a value with the top bit set as zero, so
+nothing here goes out above this. Doubles as the "no ceiling" argument to
+`cap_ttls`, since no TTL that has been through `sane_ttl` is above it.
 */
 TTL_MAX :: u32(0x7fff_ffff)
 
 /*
-A TTL as this server is willing to read it, per RFC 2181 section 8:
+The ceiling on a TTL when no cache is configured: seven days, the cap RFC 8767
+section 4 recommends ("Values SHOULD be capped on the order of days to weeks,
+with a recommended cap of 604,800 seconds"). With a cache, `cache.max_ttl` is
+the ceiling instead.
+*/
+TTL_CAP :: u32(604_800)
 
-	Implementations should treat TTL values received with the most significant
-	bit set as if the entire value received was zero.
-
-Zero rather than the low 31 bits, which is what the RFC asks for and is the only
-reading that is safe to act on anyway. A sender that sets the top bit is either
-getting the field wrong or nailing the record into every cache below it for the
-life of the machine - 2^31 seconds is sixty-eight years - and nothing else in
-the message tells the two apart. Zero says "use this for the query in hand and
-come back", which is the right answer to both.
+/*
+A TTL as this server reads it, per RFC 8767 section 4: an unsigned value, so
+one with the top bit set is positive ("Interpreting values that have the
+high-order bit set as being positive, rather than 0, is a change from
+[RFC2181]"), capped at `TTL_MAX`.
 
 Applied where a TTL is acted on rather than in `decode_message`, which goes on
 reporting the field as it stands: a decoded message is also what the DNSSEC
 validator and the query log read, and those want to see what arrived.
 */
 sane_ttl :: proc(v: u32) -> u32 {
-	return 0 if v > TTL_MAX else v
+	return min(v, TTL_MAX)
 }
 
 /*

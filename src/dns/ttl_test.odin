@@ -6,10 +6,10 @@ import "core:testing"
 /*
 Reading and bounding the TTL field.
 
-RFC 2181 section 8 makes the field an unsigned 31-bit number and says a value
-arriving with the top bit set is to be treated as zero. `sane_ttl` is that
-reading, `read_ttls` applies it to what the cache stores, and `cap_ttls` applies
-it plus a ceiling to a message on its way out.
+RFC 8767 section 4 reads the field as an unsigned 32-bit number, a value with
+the top bit set included, and caps it. `sane_ttl` is that reading, capped at
+`TTL_MAX`; `read_ttls` applies it to what the cache stores, and `cap_ttls`
+applies it plus a ceiling to a message on its way out.
 */
 
 @(private = "file")
@@ -31,16 +31,18 @@ answer_with_ttls :: proc(ttls: []u32, ext_rcode: u8 = 0) -> []u8 {
 }
 
 @(test)
-test_sane_ttl_zeroes_the_top_bit :: proc(t: ^testing.T) {
+test_sane_ttl_reads_the_top_bit_as_positive :: proc(t: ^testing.T) {
+	testing.expect_value(t, sane_ttl(0), u32(0))
 	testing.expect_value(t, sane_ttl(300), u32(300))
 	testing.expect_value(t, sane_ttl(TTL_MAX), TTL_MAX)
-	// Zero, not the low 31 bits: RFC 2181 section 8 discards the whole value.
-	testing.expect_value(t, sane_ttl(0x8000_0000), u32(0))
-	testing.expect_value(t, sane_ttl(max(u32)), u32(0))
+	// Positive and capped, not zero and not the low 31 bits (RFC 8767 section 4).
+	testing.expect_value(t, sane_ttl(0x8000_0000), TTL_MAX)
+	testing.expect_value(t, sane_ttl(0x8000_0010), TTL_MAX)
+	testing.expect_value(t, sane_ttl(max(u32)), TTL_MAX)
 }
 
 @(test)
-test_read_ttls_applies_section_8 :: proc(t: ^testing.T) {
+test_read_ttls_reads_the_top_bit_as_positive :: proc(t: ^testing.T) {
 	wire := answer_with_ttls([]u32{300, 0x8000_0001})
 	offsets, ok := scan_ttl_offsets(wire, context.temp_allocator)
 	if !testing.expect(t, ok, "the message could not be walked") {
@@ -51,7 +53,7 @@ test_read_ttls_applies_section_8 :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, ttls[0], u32(300))
-	testing.expect_value(t, ttls[1], u32(0))
+	testing.expect_value(t, ttls[1], TTL_MAX)
 	free_all(context.temp_allocator)
 }
 
@@ -61,7 +63,7 @@ test_read_ttls_applies_section_8 :: proc(t: ^testing.T) {
 The last of those is the one worth a test. What sits in an OPT record's TTL
 field is the extended rcode and the DO bit rather than a lifetime - RFC 6891
 section 6.1.3 - and the header this test builds has the top bit of it set, so a
-pass that treated it as a TTL would zero it and take the client's DNSSEC-OK
+pass that treated it as a TTL would cap it and take the client's DNSSEC-OK
 answer flag and the top half of its rcode with it. `scan_ttl_offsets` skips OPT
 for exactly this reason and `cap_ttls` inherits that; the test is here so the
 two cannot drift apart.
@@ -78,7 +80,7 @@ test_cap_ttls_bounds_the_wire_and_spares_the_opt :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect_value(t, m.answer[0].ttl, u32(3600))
-	testing.expect_value(t, m.answer[1].ttl, u32(0))
+	testing.expect_value(t, m.answer[1].ttl, u32(3600))
 	// Below the ceiling and left where it was: this is a bound, not a rewrite.
 	testing.expect_value(t, m.answer[2].ttl, u32(30))
 
@@ -121,7 +123,7 @@ test_cap_ttls_bounds_what_it_can_reach :: proc(t: ^testing.T) {
 
 	cap_ttls(wire, 3600)
 	testing.expect_value(t, read_ttl_at(wire, int(offsets[0])), u32(3600))
-	testing.expect_value(t, read_ttl_at(wire, int(offsets[1])), u32(0))
+	testing.expect_value(t, read_ttl_at(wire, int(offsets[1])), u32(3600))
 	free_all(context.temp_allocator)
 }
 

@@ -55,54 +55,28 @@ test_max_ttl_bounds_the_ttl_the_client_is_given :: proc(t: ^testing.T) {
 }
 
 /*
-RFC 2181 section 8: a TTL arriving with the top bit set is taken as zero.
-
-Zero is not a TTL an answer can be cached under at the default `min_ttl` of
-zero, so the answer is refused outright rather than stored with the top bit
-masked off - which is the whole of what the RFC asks for, since a record nobody
-keeps is a record nobody has pinned. Before this it was stored, and then served
-verbatim: 2^31 seconds, sixty-eight years. An operator who set a floor gets the
-answer kept for that floor instead, which is the test below.
-
-What the client is told on the way past is not this package's to decide - the
-answer was never cached, so nothing here serves it - and is checked over in
-`server`, where `dns.cap_ttls` bounds the forwarded copy.
+RFC 8767 section 4: a TTL with the top bit set is positive ("Interpreting
+values that have the high-order bit set as being positive, rather than 0, is a
+change from [RFC2181]"), so the answer is cached and served at `max_ttl`.
 */
 @(test)
-test_a_ttl_with_the_high_bit_set_is_not_cached :: proc(t: ^testing.T) {
+test_a_ttl_with_the_high_bit_set_is_cached_at_max_ttl :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 8, max_ttl = 86400})
 	defer destroy(c)
 
-	wire, msg := build_answer("hostile.example.", 0x8000_0000, context.temp_allocator)
-	kb: [KEY_MAX]u8
-	key := key_for(kb[:], "hostile.example.")
-	testing.expect(t, !put(c, key, wire, msg), "an answer with the top TTL bit set was stored")
-	_, _, found := get(c, key, context.temp_allocator)
-	testing.expect(t, !found, "an answer with the top TTL bit set can be served")
-	free_all(context.temp_allocator)
-}
-
-/*
-`cache.min_ttl` still raises a zero.
-
-A TTL of zero reaching a floor an operator set is old behaviour and not
-something section 8 changes: the operator has said how long the shortest answer
-this cache keeps is good for, and a zeroed TTL is a short answer like any other.
-The point of the pair is that both ends now reach the client - the floor through
-`patch_ttls`, the ceiling through what `put` stores - so the hostile figure is
-gone either way.
-*/
-@(test)
-test_a_zeroed_ttl_is_still_raised_by_min_ttl :: proc(t: ^testing.T) {
-	c := make_cache(Options{max_entries = 8, min_ttl = 300, max_ttl = 3600})
-	defer destroy(c)
-
-	ttl, ok := served_ttl(t, c, "floored.example.", 0x8000_0000)
+	ttl, ok := served_ttl(t, c, "highbit.example.", 0x8000_0010)
 	if !ok {
 		return
 	}
-	testing.expect_value(t, ttl, u32(300))
+	testing.expect_value(t, ttl, u32(86400))
 	free_all(context.temp_allocator)
+}
+
+// With no cache, the ceiling is the RFC 8767 section 4 cap.
+@(test)
+test_no_cache_caps_at_the_rfc_8767_figure :: proc(t: ^testing.T) {
+	testing.expect_value(t, ttl_ceiling(nil), dns.TTL_CAP)
+	testing.expect_value(t, dns.TTL_CAP, u32(7 * 24 * 60 * 60))
 }
 
 /*

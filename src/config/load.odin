@@ -217,9 +217,9 @@ opt_int :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^int, path: string)
 }
 
 /*
-A TTL, which RFC 2181 section 8 makes 0 to 2^31-1 seconds: a receiver treats one
-with the top bit set as zero, so a figure past it is not the long TTL it was
-written as but none at all.
+A TTL, which RFC 2181 section 8 makes 0 to 2^31-1 seconds: a receiver that
+follows it treats one with the top bit set as zero, so a figure past it is not
+the long TTL it was written as but none at all.
 */
 MAX_TTL :: 1 << 31 - 1
 

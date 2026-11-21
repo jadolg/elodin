@@ -945,12 +945,12 @@ The `Cache-Control: max-age` for a response: the smallest TTL it carries, and
 for a denial no more than its SOA says.
 
 Reads the answer as it is about to be sent, which is the answer after
-`handle_query` has bounded its TTLs: RFC 2181 section 8 applied and
-`cache.max_ttl` on top of it, whether the bytes came out of the cache or
+`handle_query` has bounded its TTLs: `dns.sane_ttl` applied and
+`cache.max_ttl` (or `dns.TTL_CAP`) on top of it, whether the bytes came out of the cache or
 straight from an upstream. So the header cannot outlive the DNS data it is
 mirroring, and a hostile TTL cannot be laundered through it into every HTTP
 cache between here and the client - which recomputing the figure from what the
-upstream sent would do. `sane_ttl` applies section 8 again on the way past,
+upstream sent would do. `sane_ttl` applies again on the way past,
 which costs nothing and means this holds for any caller that reaches it with
 bytes from somewhere else.
 

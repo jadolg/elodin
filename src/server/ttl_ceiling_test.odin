@@ -21,6 +21,10 @@ because the whole point is a response that came from off this machine.
 @(private = "file")
 HOSTILE_NAME :: "hostile.example."
 
+// `exchange_once`'s `max_ttl` for a server with no cache.
+@(private = "file")
+CACHE_OFF :: max(u32)
+
 @(private = "file")
 upstream_reply :: proc(ttl: u32) -> []u8 {
 	return test_reply(HOSTILE_NAME, .A, a_record(HOSTILE_NAME, {192, 0, 2, 7}, ttl))
@@ -29,7 +33,7 @@ upstream_reply :: proc(ttl: u32) -> []u8 {
 /*
 Put one query through `handle_query` against a mock upstream that answers with
 `reply`, and report what came back. The cache is on and bounded by `max_ttl`, as
-`cache.max_ttl` bounds it.
+`cache.max_ttl` bounds it, or off when `max_ttl` is `CACHE_OFF`.
 
 `ok` false means the exchange itself did not happen, which the caller reports
 rather than reading an answer out of nothing.
@@ -51,14 +55,17 @@ exchange_once :: proc(
 	defer net.close(socket)
 
 	cfg := test_config(loopback_upstream(spec.port))
-	cfg.cache.enabled = true
+	cfg.cache.enabled = max_ttl != CACHE_OFF
 	cfg.cache.max_ttl = max_ttl
 	group, gerr := upstream.make_group(cfg.upstream)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
 		return nil, .Failed, false
 	}
 	defer upstream.destroy_group(group)
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = max_ttl})
+	answers: ^cache.Cache
+	if cfg.cache.enabled {
+		answers = cache.make_cache(cache.Options{max_entries = 8, max_ttl = max_ttl})
+	}
 	defer cache.destroy(answers)
 	s := Server {
 		cfg     = &cfg,
@@ -113,24 +120,39 @@ forwarded_ttl :: proc(t: ^testing.T, ttl: u32, max_ttl: u32) -> (served: u32, ok
 }
 
 /*
-RFC 2181 section 8, on the path that does not go through the cache:
-
-	Implementations should treat TTL values received with the most significant
-	bit set as if the entire value received was zero.
-
-`cache.put` refuses such an answer, which is section 8 as far as this server's
-own storage goes, but refusing to keep it is not the same as refusing to pass it
-on: the client that caused the fetch still gets the response, and 2^31 seconds
-is sixty-eight years in whatever holds it next. One answer, no follow-up
-traffic, and nothing in the operator's logs to say it happened.
+RFC 8767 section 4, on the path that does not go through the cache: a TTL with
+the top bit set is positive and capped, by `cache.max_ttl`, or by `dns.TTL_CAP`
+with no cache. Read as zero, the record would be forwarded with TTL 0 and never
+cached, so every query for it would go upstream.
 */
 @(test)
-test_a_forwarded_high_bit_ttl_reaches_the_client_as_zero :: proc(t: ^testing.T) {
-	ttl, ok := forwarded_ttl(t, 0x8000_0000, 86400)
+test_a_forwarded_high_bit_ttl_is_capped_not_zeroed :: proc(t: ^testing.T) {
+	ttl, ok := forwarded_ttl(t, 0x8000_0010, 86400)
 	if !ok {
 		return
 	}
-	testing.expect_value(t, ttl, u32(0))
+	testing.expect_value(t, ttl, u32(86400))
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_with_no_cache_a_forwarded_ttl_is_capped_at_seven_days :: proc(t: ^testing.T) {
+	Row :: struct {
+		upstream: u32,
+		want:     u32,
+	}
+	rows := []Row {
+		{upstream = 0x8000_0010, want = dns.TTL_CAP},
+		{upstream = 30 * 86400, want = dns.TTL_CAP},
+		{upstream = 3600, want = 3600},
+	}
+	for row in rows {
+		ttl, ok := forwarded_ttl(t, row.upstream, CACHE_OFF)
+		if !ok {
+			return
+		}
+		testing.expectf(t, ttl == row.want, "upstream TTL %d: forwarded %d, want %d", row.upstream, ttl, row.want)
+	}
 	free_all(context.temp_allocator)
 }
 
@@ -161,8 +183,7 @@ it, but its ARCOUNT claims a record that is not there: `scan_ttl_offsets` refuse
 it outright, and `cache.put` with it, so nothing about this answer is ever
 stored. What is left is the copy handed to the client, and the section that copy
 is read for - the answer - sits before the point the walk gives up at. So it is
-bounded, and section 8 turns `max(u32)` into a zero that tells the client to come
-back rather than to keep the record for as long as the machine lasts.
+bounded: `max(u32)` goes out at `cache.max_ttl`.
 
 Refused outright for a round, and three tests in this package say why it is not:
 an upstream or a middlebox mangling a section this server never reads is not
@@ -195,6 +216,6 @@ test_an_unbounded_answer_is_forwarded_with_what_could_be_bounded :: proc(t: ^tes
 	if !testing.expect(t, len(out) == len(reply), "the answer was not forwarded as it stood") {
 		return
 	}
-	testing.expect_value(t, dns.read_ttl_at(out, int(offsets[0])), u32(0))
+	testing.expect_value(t, dns.read_ttl_at(out, int(offsets[0])), u32(86400))
 	free_all(context.temp_allocator)
 }
