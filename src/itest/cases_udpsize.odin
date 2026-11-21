@@ -59,13 +59,20 @@ big_txt_answer :: proc(name: string, count: int, allocator := context.allocator)
 	return encode_reply(name, .TXT, {answer = answers, additional = []dns.Record{dns.make_opt(4096, false)}}, allocator)
 }
 
+// Additional records behind the empty TXT: at about 260 bytes each, more than a
+// 512-byte answer holds.
+@(private = "file")
+EMPTY_TXT_FILLER :: 3
+
 // One TXT of RDLENGTH 0 in the answer, behind enough additional records to be
 // over 512 bytes, so a client asking without EDNS gets it cut to fit.
 @(private = "file")
 empty_txt_answer :: proc(name: string, allocator := context.allocator) -> []u8 {
-	filler := big_txt_answer("filler.example.", 3, context.temp_allocator)
+	filler := big_txt_answer("filler.example.", EMPTY_TXT_FILLER, context.temp_allocator)
 	fm, derr := dns.decode_message(filler, context.temp_allocator)
-	assert(derr == .None, "the filler did not decode")
+	if derr != .None || len(fm.answer) != EMPTY_TXT_FILLER {
+		panic("the filler for the empty TXT answer did not decode")
+	}
 	answer := []dns.Record{{name = name, type = .TXT, class = .IN, ttl = 300, data = dns.Rdata_Raw{}}}
 	return encode_reply(name, .TXT, {answer = answer, additional = fm.answer}, allocator)
 }
@@ -159,11 +166,16 @@ run_udp_size_cases :: proc(r: ^Runner) {
 				q := build_query("empty-txt.example.", u16(dns.Type.TXT), id = 0x61)
 				res := query_udp(udp_port, q, context.temp_allocator)
 				if check(r, res.ok, "no answer came back") {
-					// The premise: the answer was cut to fit, so it was re-encoded.
-					check(r, len(res.wire) <= dns.MAX_UDP_SIZE, "a %d-byte answer, so it was not cut to fit", len(res.wire))
 					m, derr := dns.decode_message(res.wire, context.temp_allocator)
 					if check(r, derr == .None, "the answer does not decode: %v", derr) &&
 					   check(r, len(m.answer) == 1, "%d answers, want the TXT", len(m.answer)) {
+						// The premise: filler was dropped, so the answer was cut and re-encoded.
+						check(
+							r,
+							len(m.additional) < EMPTY_TXT_FILLER,
+							"all %d filler records came back, so the answer was not cut to fit",
+							len(m.additional),
+						)
 						raw, is_raw := m.answer[0].data.(dns.Rdata_Raw)
 						check(r, is_raw && len(raw.data) == 0, "the empty TXT came back as %v", m.answer[0].data)
 					}
