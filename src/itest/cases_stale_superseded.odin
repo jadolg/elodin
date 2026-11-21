@@ -97,3 +97,58 @@ superseded_entries :: proc(metrics_port: int) -> int {
 	// -1 when the endpoint never answers: `metric_value` finds nothing in "".
 	return metric_value(metrics_page(metrics_port), "elodin_cache_entries")
 }
+
+/*
+RFC 8767 section 5: with RD clear and no unexpired data, the answer is given
+"without consulting the cache for expired records". The upstream is healthy and
+the entry has expired: an RD=0 query is REFUSED and asks nobody, and an RD=1
+query that follows goes upstream for a fresh answer.
+*/
+run_stale_rd_cases :: proc(r: ^Runner) {
+	qname := "rd-stale.example."
+	upstream_port := next_port(r)
+	udp_port := next_port(r)
+	config := base_config(
+		udp_port,
+		upstream_at(upstream_port),
+		cache = "{ enabled: true, max_entries: 100, max_ttl: 1, serve_stale: true, stale_timeout: 300ms }",
+	)
+	mock := mock_make("stale-rd", upstream_port)
+	mock_synth_all(mock, {203, 0, 113, 51})
+	if !mock_start_or_skip(r, mock, "serve_stale rd") {
+		return
+	}
+	defer mock_stop(mock)
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+
+	start_case(r, "serve_stale: an RD=0 query is refused from an expired entry while the upstream is healthy")
+	defer end_case(r)
+
+	first := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 51))
+	if !check(r, first.ok, "no response to the query that filled the cache") {
+		return
+	}
+	// Past `max_ttl`, which is what the entry was stored under.
+	time.sleep(1500 * time.Millisecond) // lint:allow the event awaited is the entry's expiry, which only the clock brings
+
+	before := mock_total(mock)
+	norec := build_query(qname, u16(dns.Type.A), id = 52)
+	norec[2] &~= 0x01 // RD
+	res := query_udp(udp_port, norec)
+	if check(r, res.ok, "no response to the RD=0 query") {
+		h := parse_header(r, res.wire)
+		check(r, h.rcode == int(dns.Rcode.Refused), "rcode %d, want REFUSED", h.rcode)
+		check_eq_int(r, h.ancount, 0, "answers served to the RD=0 query")
+	}
+	check_eq_int(r, mock_total(mock) - before, 0, "upstream queries for the RD=0 query")
+
+	// The premise: the upstream is healthy, so RD=1 gets a fresh answer from it.
+	fresh := query_udp(udp_port, build_query(qname, u16(dns.Type.A), id = 53))
+	if check(r, fresh.ok, "no response to the RD=1 query") {
+		check_eq_int(r, mock_total(mock) - before, 1, "upstream queries for the RD=1 query")
+	}
+}
