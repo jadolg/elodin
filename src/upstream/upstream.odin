@@ -187,10 +187,10 @@ Upstream :: struct {
 	// back.
 	proto:      Protocol,
 	h2:         ^H2_Conn,
-	// The shared connection a move left with streams still open on it, let
-	// finish rather than cut off; retired once idle (`close_idle`), or at
-	// teardown. Under `mu`.
-	h2_draining: ^H2_Conn,
+	// The shared connections moves left with streams still open on them, let
+	// finish rather than cut off; each retired once idle (`close_idle`), all
+	// at teardown. In `allocator`, under `mu`.
+	h2_draining: [dynamic]^H2_Conn,
 	/*
 	Readers still running, `h2`'s and those of connections it replaced, and the
 	cond the last of them broadcasts on as it leaves. Under `mu`. A reader is a
@@ -384,8 +384,9 @@ deadlock at boot.
 The address is held for the TTL it was answered with (RFC 1035 section 3.2.1,
 `bootstrap_ttl`), and `exchange` asks again once that is past. Each lookup that
 succeeds writes the endpoint under `mu`, then sets `resolved` with release
-ordering. An address that moves drops the connections to the old one that are
-not in use (`close_idle`). A lookup that fails leaves alone whatever was
+ordering. An address that moves starts a new `epoch`: connections to the old
+one are not handed out again (`dialled_current_locked`), and idle ones close as
+they are reached for or idle out. A lookup that fails leaves alone whatever was
 published, and an address already held is kept and asked for again
 `BOOTSTRAP_MIN_TTL` later. `Not_Resolved` where the bootstrap servers gave no
 address and none is held, `Out_Of_Memory` where this server could not ask them.
@@ -1182,19 +1183,25 @@ close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 	resize(&u.idle, kept)
 
 	stale_h2 := take_idle_h2_locked(u, all)
-	drained := u.h2_draining
-	if drained != nil {
-		if _, busy := h2.client_idle_for(drained.client); busy && !h2.client_closed(drained.client) {
-			drained = nil
+	// Reserved whole, as `stale` is: with no room each is retired under the lock.
+	drained, drained_listed := dns.alloc_list([dynamic]^H2_Conn, len(u.h2_draining), context.temp_allocator)
+	#reverse for hc, i in u.h2_draining {
+		if _, busy := h2.client_idle_for(hc.client); busy && !h2.client_closed(hc.client) {
+			continue
+		}
+		unordered_remove(&u.h2_draining, i)
+		if drained_listed {
+			append(&drained, hc)
 		} else {
-			u.h2_draining = nil
+			retire_h2_conn(hc)
+			closed += 1
 		}
 	}
 	sync.mutex_unlock(&u.mu)
-	if drained != nil {
-		retire_h2_conn(drained)
-		closed += 1
+	for hc in drained {
+		retire_h2_conn(hc)
 	}
+	closed += len(drained)
 	// Closed once the lock is let go, as `get_h2_conn` retires the h2
 	// connection it replaces: a TLS close writes a close_notify, nothing in
 	// closing needs `u.mu`, and every query on this upstream waits on it to

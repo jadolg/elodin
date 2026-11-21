@@ -390,15 +390,15 @@ bootstrap_query :: proc(
 			return nil, 0, false, .Not_Resolved
 		}
 		/*
-		`keep` while the answer gives it, else the lowest address of the type
-		asked, so a server that rotates the order of an RRset, or gives a
-		different part of it each time, does not look like a move on every
-		refresh; owned by
+		`keep` while the answer gives it, so a server that rotates the order
+		of an RRset, or gives a different part of it each time, does not look
+		like a move on every refresh; else the first address of the type asked,
+		so instances spread over the RRset as the server orders it. Owned by
 		the name asked or by a CNAME followed from it; a record off that chain
 		is not about this name. Held for the shortest TTL on the chain: it is
 		only as good as its first record to expire.
 		*/
-		lowest: []u8
+		first: []u8
 		shortest := dns.TTL_MAX
 		kept := false
 		keep_raw, keep_len := address_raw(keep)
@@ -441,20 +441,21 @@ bootstrap_query :: proc(
 			if len(raw) == keep_len && mem.compare(raw, keep_raw[:keep_len]) == 0 {
 				kept = true
 			}
-			if lowest == nil || mem.compare(raw, lowest) < 0 {
-				lowest = raw
+			if first == nil {
+				first = raw
 			}
 		}
 		if kept {
 			return keep, bootstrap_ttl(shortest), false, .None
 		}
-		switch len(lowest) {
+		switch len(first) {
 		case 4:
-			return net.IP4_Address{lowest[0], lowest[1], lowest[2], lowest[3]}, bootstrap_ttl(shortest), false, .None
+			return net.IP4_Address{first[0], first[1], first[2], first[3]}, bootstrap_ttl(shortest), false, .None
 		case 16:
-			return netx.ip6_from_bytes((^[16]u8)(raw_data(lowest))^), bootstrap_ttl(shortest), false, .None
+			return netx.ip6_from_bytes((^[16]u8)(raw_data(first))^), bootstrap_ttl(shortest), false, .None
 		}
-		return nil, 0, dns.rcode_of(msg) == .No_Error, .Not_Resolved
+		// A truncated reply says nothing about what the name lacks.
+		return nil, 0, dns.rcode_of(msg) == .No_Error && !msg.flags.tc, .Not_Resolved
 	}
 	return nil, 0, false, .Not_Resolved
 }

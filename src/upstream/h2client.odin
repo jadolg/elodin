@@ -137,7 +137,13 @@ get_h2_conn :: proc(
 	// One from before a move, still carrying streams: left to finish them.
 	if stale != nil && !h2.client_closed(stale.client) && !dialled_current_locked(u, stale.stream) {
 		if _, busy := h2.client_idle_for(stale.client); busy {
-			stale, u.h2_draining = u.h2_draining, stale
+			if u.h2_draining == nil {
+				u.h2_draining = make([dynamic]^H2_Conn, u.allocator)
+			}
+			// With no room it is retired, as it was before moves were let finish.
+			if _, aerr := append(&u.h2_draining, stale); aerr == nil {
+				stale = nil
+			}
 		}
 	}
 	sync.mutex_unlock(&u.mu)
@@ -366,9 +372,10 @@ teardown_h2 :: proc(u: ^Upstream) {
 	if hc != nil {
 		retire_h2_conn(hc)
 	}
-	if draining != nil {
-		retire_h2_conn(draining)
+	for d in draining {
+		retire_h2_conn(d)
 	}
+	delete(draining)
 	sync.mutex_lock(&u.mu)
 	for u.h2_readers > 0 {
 		loop.cond_wait(&u.h2_readers_done, &u.mu)

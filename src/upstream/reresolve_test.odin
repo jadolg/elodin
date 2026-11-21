@@ -37,6 +37,8 @@ Ttl_Mock :: struct {
 	no_a:   bool,
 	// A is answered SERVFAIL: a failure to say, not an answer.
 	servfail_a: bool,
+	// A is answered NOERROR, empty and truncated: no answer either.
+	truncated_a: bool,
 }
 
 @(private = "file")
@@ -55,7 +57,7 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 		sync.mutex_lock(&m.mu)
 		m.asked += 1
 		silent, addr, ttl, delay, also, cname, stray, cname_last, turn := m.silent, m.addr, m.ttl, m.delay, m.also, m.cname, m.stray, m.cname_last, m.asked % 2 == 0
-		addr6, no_a, servfail_a := m.addr6, m.no_a, m.servfail_a
+		addr6, no_a, servfail_a, truncated_a := m.addr6, m.no_a, m.servfail_a, m.truncated_a
 		sync.mutex_unlock(&m.mu)
 		if silent {
 			continue
@@ -70,7 +72,10 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 			answer[0] = dns.Record{name = q.name, type = .AAAA, class = .IN, ttl = ttl, data = dns.Rdata_AAAA{addr = addr6}}
 			resp.answer = answer
 		}
-		if q.type == .A && !no_a && !servfail_a {
+		if q.type == .A && truncated_a {
+			resp.flags.tc = true
+		}
+		if q.type == .A && !no_a && !servfail_a && !truncated_a {
 			answer := make([dynamic]dns.Record, context.temp_allocator)
 			if stray != {} {
 				append(&answer, dns.Record{name = "stray.invalid.", type = .A, class = .IN, ttl = 1, data = dns.Rdata_A{addr = stray}})
@@ -432,8 +437,10 @@ test_a_connection_from_before_a_move_is_not_used_again :: proc(t: ^testing.T) {
 }
 
 /*
-A server that turns the order of an RRset with each answer does not make the
-address look moved: the lowest is taken every time. Only records on the chain
+A first lookup takes the first address the server lists, so instances spread
+over an RRset as the server orders it; a refresh that holds an address the
+answer still gives keeps it, whatever the order, so a server that turns the
+order with each answer does not make the address look moved. Only records on the chain
 from the name asked count, so a lower address under another owner is passed
 over. The address is held for the shortest TTL on the chain, the CNAME that
 leads to it included, not the stray record's.
@@ -453,24 +460,28 @@ test_a_bootstrap_answer_is_read_the_same_whatever_its_order :: proc(t: ^testing.
 	}
 	defer stop_udp_mock(&m, responder)
 	server := net.endpoint_to_string(bound, context.temp_allocator)
-	// The last answer puts the CNAME after the records it leads to.
+	// The last answer puts the CNAME after the records it leads to. The mock
+	// lists .9 first in its odd answers and .7 in its even ones.
+	listed_first := [3]net.Address{net.IP4_Address{127, 0, 0, 9}, net.IP4_Address{127, 0, 0, 7}, net.IP4_Address{127, 0, 0, 9}}
 	for i in 0 ..< 3 {
 		sync.mutex_lock(&m.mu)
 		m.cname_last = i == 2
 		sync.mutex_unlock(&m.mu)
 		addr, held, _, err := bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second))
-		testing.expectf(t, err == .None && addr == net.Address(net.IP4_Address{127, 0, 0, 7}), "answer %d: got %v (%v)", i, addr, err)
+		testing.expectf(t, err == .None && addr == listed_first[i], "answer %d: got %v, want %v (%v)", i, addr, listed_first[i], err)
 		testing.expectf(t, held == 30 * time.Second, "answer %d: held %v, where the CNAME's TTL is 30s", i, held)
 	}
 	testing.expect_value(t, ttl_mock_asked(&m), 3)
 
-	// A refresh that holds an address the answer still gives keeps it, lowest
-	// or not; one the answer no longer gives is let go for the lowest.
-	held_addr := net.Address(net.IP4_Address{127, 0, 0, 9})
-	addr, _, _, err := bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second), held_addr)
-	testing.expectf(t, err == .None && addr == held_addr, "an address still in the answer was let go for %v (%v)", addr, err)
+	// A refresh that holds an address the answer still gives keeps it, listed
+	// first or not; one the answer no longer gives is let go for the first.
+	for held_addr in ([]net.Address{net.IP4_Address{127, 0, 0, 9}, net.IP4_Address{127, 0, 0, 7}}) {
+		addr, _, _, err := bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second), held_addr)
+		testing.expectf(t, err == .None && addr == held_addr, "%v, still in the answer, was let go for %v (%v)", held_addr, addr, err)
+	}
+	// The sixth answer, which lists .7 first.
 	gone := net.Address(net.IP4_Address{127, 0, 0, 8})
-	addr, _, _, err = bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second), gone)
+	addr, _, _, err := bootstrap_query(server, "turning.invalid", .A, time.tick_add(time.tick_now(), time.Second), gone)
 	testing.expectf(t, err == .None && addr == net.Address(net.IP4_Address{127, 0, 0, 7}), "an address gone from the answer was kept: %v (%v)", addr, err)
 	free_all(context.temp_allocator)
 }
@@ -677,7 +688,12 @@ test_a_refresh_keeps_to_the_family_it_holds :: proc(t: ^testing.T) {
 	_, _, err := bootstrap_resolve(servers, "failing.invalid", deadline, net.IP4_Address{127, 0, 0, 1})
 	testing.expect_value(t, err, Error.Not_Resolved)
 	sync.mutex_lock(&m.mu)
-	m.servfail_a, m.no_a = false, true
+	m.servfail_a, m.truncated_a = false, true
+	sync.mutex_unlock(&m.mu)
+	_, _, truncated_err := bootstrap_resolve(servers, "truncated.invalid", deadline, net.IP4_Address{127, 0, 0, 1})
+	testing.expectf(t, truncated_err == .Not_Resolved, "a truncated empty A answer moved the refresh to AAAA (%v)", truncated_err)
+	sync.mutex_lock(&m.mu)
+	m.truncated_a, m.no_a = false, true
 	sync.mutex_unlock(&m.mu)
 	gone_addr, _, gone_err := bootstrap_resolve(servers, "gone.invalid", deadline, net.IP4_Address{127, 0, 0, 1})
 	_, gone_v6 := gone_addr.(net.IP6_Address)
