@@ -47,6 +47,8 @@ run_bootstrap_cases :: proc(r: ^Runner) {
 		return
 	}
 	defer stop_server(&srv)
+	// The poll's deadline from here, so a slow start does not eat its margin.
+	ready := time.tick_now()
 
 	start_case(r, "bootstrap: an upstream's hostname is asked for again once its TTL is past")
 	{
@@ -58,7 +60,7 @@ run_bootstrap_cases :: proc(r: ^Runner) {
 
 		// Only an exchange looks again, so queries go on until it has, or
 		// well past the floor.
-		deadline := time.tick_add(started, FLOOR + 5 * time.Second)
+		deadline := time.tick_add(ready, FLOOR + 5 * time.Second)
 		asked_at: time.Duration
 		for time.tick_diff(time.tick_now(), deadline) > 0 {
 			res = query_udp(udp_port, build_query(f.qname, f.qtype, id = 0x6912))

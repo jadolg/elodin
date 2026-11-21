@@ -521,8 +521,16 @@ refresh_due :: proc(u: ^Upstream) -> bool {
 	if expires == 0 || loop.moment_since(expires) < 0 {
 		return false
 	}
-	_, won := sync.atomic_compare_exchange_strong(&u.refreshing, false, true)
-	return won
+	if _, won := sync.atomic_compare_exchange_strong(&u.refreshing, false, true); !won {
+		return false
+	}
+	// Read again once claimed: a refresh that finished between the two reads
+	// has set a time still ahead.
+	if loop.moment_since(sync.atomic_load(&u.expires)) < 0 {
+		sync.atomic_store(&u.refreshing, false)
+		return false
+	}
+	return true
 }
 
 /*
