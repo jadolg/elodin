@@ -582,6 +582,13 @@ advertised_udp_size :: proc(s: ^Server, query: dns.Message, proto: Protocol) -> 
 	if proto != .UDP {
 		return dns.edns_udp_size(query)
 	}
+	return udp_advertised(s)
+}
+
+// The payload size this server states on a UDP answer: `udp_ceiling` as the
+// two-byte field.
+@(private)
+udp_advertised :: proc(s: ^Server) -> u16 {
 	// `udp_ceiling` already lands in [512, 4096] for every `Config` this server
 	// runs on. Clamped anyway, because what is being written is two bytes of a
 	// field with its own range, and a number from outside it would be truncated

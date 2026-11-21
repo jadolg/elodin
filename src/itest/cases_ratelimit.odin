@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:net"
 import "core:slice"
 import "core:time"
+import "elodin:config"
 import "elodin:dns"
 
 /*
@@ -132,6 +133,45 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 				BURST,
 			)
 			check(r, flood.truncated > 0, "the premise: nothing over the budget came back truncated")
+		}
+	}
+	end_case(r)
+
+	/*
+	The slipped reply to a query with EDNS carries an OPT record (RFC 6891
+	section 6.1.1) with the query's DO bit (RFC 3225 section 3), and clears the
+	AA and Z bits the query set (RFC 1035 section 4.1.1).
+	*/
+	start_case(r, "rate limit: a slipped reply keeps the query's EDNS and clears AA and Z")
+	{
+		udp_port := next_port(r)
+		srv, ok := start_server(
+			r,
+			Server_Options {
+				config = config_rate_limit(udp_port, upstream_port, "enabled: true, responses_per_second: 1, slip: 1"),
+				udp_port = udp_port,
+			},
+		)
+		if ok {
+			defer stop_server(&srv)
+			edns := build_query("flood.example.", u16(dns.Type.A), edns_size = 1232, dnssec_ok = true)
+			edns[2] |= 0x04 // AA
+			edns[3] |= 0x40 // Z
+			tc, found := first_slipped_reply(udp_port, edns, QUERIES)
+			if check(r, found, "no truncated reply to %d queries over a budget of one a second", QUERIES) {
+				check(r, tc[2] & 0x04 == 0, "AA echoed on the slipped reply: flags %02x%02x", tc[2], tc[3])
+				check(r, tc[3] & 0x40 == 0, "Z echoed on the slipped reply: flags %02x%02x", tc[2], tc[3])
+				msg, derr := dns.decode_message(tc, context.temp_allocator)
+				if check(r, derr == .None, "the slipped reply does not decode: %v", derr) {
+					check_eq_int(r, len(msg.question), 1, "questions echoed")
+					opt, has_opt := dns.find_opt(msg)
+					if check(r, has_opt, "the slipped reply to an EDNS query carries no OPT record") {
+						check(r, dns.edns_do(msg), "DO not copied onto the slipped reply")
+						check_eq_int(r, int(dns.edns_version(msg)), 0, "EDNS version")
+						check_eq_int(r, int(opt.class), config.DEFAULT_MAX_UDP_RESPONSE, "payload size, against the max_udp_response default")
+					}
+				}
+			}
 		}
 	}
 	end_case(r)
@@ -833,5 +873,37 @@ query_tcp_once_bound :: proc(tcp_port: int, query: []u8, timeout: time.Duration)
 		}
 		defer net.close(conn.socket)
 		return stream_query(&conn, query, context.allocator)
+	}
+}
+
+/*
+The first reply with TC set to a burst of `count` copies of `query`, read until
+the replies stop coming. The burst spends the budget, so what follows is slips.
+*/
+@(private = "file")
+first_slipped_reply :: proc(udp_port: int, query: []u8, count: int) -> (reply: []u8, found: bool) {
+	socket, err := net.make_unbound_udp_socket(.IP4)
+	if err != nil {
+		return nil, false
+	}
+	defer net.close(socket)
+	if net.set_option(socket, .Receive_Timeout, 500 * time.Millisecond) != nil {
+		return nil, false
+	}
+	to := net.Endpoint{address = net.IP4_Loopback, port = udp_port}
+	for _ in 0 ..< count {
+		if _, serr := net.send_udp(socket, query, to); serr != nil {
+			return nil, false
+		}
+	}
+	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
+	for {
+		n, _, rerr := net.recv_udp(socket, buf)
+		if rerr != nil {
+			return nil, false
+		}
+		if n >= dns.HEADER_SIZE && buf[2] & 0x02 != 0 {
+			return buf[:n], true
+		}
 	}
 }

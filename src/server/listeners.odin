@@ -822,7 +822,7 @@ udp_loop :: proc(data: rawptr) {
 		switch verdict {
 		case .Allow:
 		case .Truncate:
-			if tc, built := dns.truncated_response(buf[:n], context.temp_allocator); built {
+			if tc, built := dns.truncated_response(buf[:n], udp_advertised(ctx.server), context.temp_allocator); built {
 				_, _ = loop.send_udp(socket, tc, client, local)
 			}
 			free_all(context.temp_allocator)

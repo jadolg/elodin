@@ -389,9 +389,12 @@ test_error_responses_at_every_budget :: proc(t: ^testing.T) {
 		return error_response(query, {}, .Form_Err, a)
 	})
 
-	want_tc, _ := truncated_response(query, context.temp_allocator)
+	want_tc, want_tc_ok := truncated_response(query, MAX_UDP_SIZE, context.temp_allocator)
+	if !testing.expect(t, want_tc_ok, "truncated_response built nothing with memory to spare") {
+		return
+	}
 	oom_sweep(t, "truncated_response", want_tc, proc(a: mem.Allocator) -> ([]u8, bool) {
-		return truncated_response(query, a)
+		return truncated_response(query, MAX_UDP_SIZE, a)
 	})
 }
 

@@ -123,8 +123,15 @@ on the read loop while a flood is in progress, and decoding is work the flood
 would be paying us to do. The question is copied only if it is there and
 uncompressed - a pointer in a question is not legal and not worth echoing - and
 otherwise the answer is the header alone, which a client still reads as TC.
+
+A query with a readable OPT record in version 0 gets one back, stating
+`udp_size`, version 0 and the query's DO bit: RFC 6891 section 6.1.1 has a
+responder answer EDNS with EDNS, and RFC 3225 section 3 copies DO. Any other
+OPT record - unreadable, or in a later version - leaves the reply without one,
+since the full path answers those FORMERR or BADVERS and a slip does not
+compose either.
 */
-truncated_response :: proc(query_bytes: []u8, allocator := context.allocator) -> (out: []u8, ok: bool) {
+truncated_response :: proc(query_bytes: []u8, udp_size: u16, allocator := context.allocator) -> (out: []u8, ok: bool) {
 	if len(query_bytes) < HEADER_SIZE {
 		return nil, false
 	}
@@ -151,15 +158,48 @@ truncated_response :: proc(query_bytes: []u8, allocator := context.allocator) ->
 		}
 	}
 
-	buf := alloc_slice([]u8, end, allocator) or_return
+	do_bit, with_opt := slip_opt(query_bytes)
+	buf := alloc_slice([]u8, end + (EMPTY_OPT_SIZE if with_opt else 0), allocator) or_return
 	copy(buf, query_bytes[:end])
 	patch_reply_flags(buf, true, 0)
 	buf[4], buf[5] = u8(questions >> 8), u8(questions)
-	// No answer, authority or additional sections, so nothing counts them.
 	for i in 6 ..< HEADER_SIZE {
 		buf[i] = 0
 	}
+	if with_opt {
+		ttl := EDNS_DO if do_bit else 0
+		opt := buf[end:]
+		// Owner the root, TYPE OPT, CLASS the payload size, TTL, RDLENGTH 0.
+		opt[0] = 0
+		opt[1], opt[2] = u8(u16(Type.OPT) >> 8), u8(Type.OPT)
+		opt[3], opt[4] = u8(udp_size >> 8), u8(udp_size)
+		opt[5], opt[6], opt[7], opt[8] = u8(ttl >> 24), u8(ttl >> 16), u8(ttl >> 8), u8(ttl)
+		opt[9], opt[10] = 0, 0
+		buf[11] = 1
+	}
 	return buf, true
+}
+
+// An OPT record with no options: the root, TYPE, CLASS, TTL and RDLENGTH.
+@(private)
+EMPTY_OPT_SIZE :: 1 + 2 + 2 + 4 + 2
+
+/*
+Whether the slipped reply to `query_bytes` carries an OPT record, and its DO
+bit: only when the query's own OPT record is readable and in version 0 (see
+`truncated_response`). Walks the query without decoding it.
+*/
+@(private)
+slip_opt :: proc(query_bytes: []u8) -> (do_bit: bool, ok: bool) {
+	if peek_opt_unreadable(query_bytes) {
+		return false, false
+	}
+	span := find_opt_span(query_bytes) or_return
+	// The TTL ends at RDLENGTH: extended rcode, version, then the flags' top byte.
+	if query_bytes[span.rdlen_pos - 3] != 0 {
+		return false, false
+	}
+	return query_bytes[span.rdlen_pos - 2] & u8(EDNS_DO >> 8) != 0, true
 }
 
 /*
@@ -246,11 +286,13 @@ error_response :: proc(
 
 /*
 Turn the query's flags at `buf[2:4]` into a reply's, for the two answers built
-out of the query's own header: QR and RA set, TC and the rcode as given.
+out of the query's own header: QR and RA set, AD, AA and Z clear, TC and the
+rcode as given.
 
-Every bit there started as the client's. AD is the one that must not survive
-the round trip: coming back set, it would read as this server vouching for a
-message it may not even have parsed.
+Every bit there started as the client's. AD, AA and Z must not survive the
+round trip: AD would read as this server vouching for a message it may not even
+have parsed, AA as this forwarder claiming authority, and Z "Must be zero in all
+queries and responses" (RFC 1035 section 4.1.1).
 */
 @(private)
 patch_reply_flags :: proc(buf: []u8, tc: bool, rcode: u8) {
@@ -259,6 +301,8 @@ patch_reply_flags :: proc(buf: []u8, tc: bool, rcode: u8) {
 	flags.ra = true
 	flags.tc = tc
 	flags.ad = false
+	flags.aa = false
+	flags.z = false
 	flags.rcode = rcode
 	fv := transmute(u16)flags
 	buf[2] = u8(fv >> 8)
