@@ -283,7 +283,7 @@ bootstrap_query :: proc(
 	qtype: dns.Type,
 	// When the query gives up, sent or not.
 	deadline: time.Tick,
-	// Returned in preference to the lowest while the answer still gives it.
+	// Returned in preference to the first listed while the answer still gives it.
 	keep: net.Address = nil,
 ) -> (
 	addr: net.Address,
