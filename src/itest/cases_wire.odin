@@ -594,7 +594,9 @@ run_wire_cases :: proc(r: ^Runner) {
 				continue
 			}
 			check(r, dns.rcode_of(msg) == .Form_Err, "%s: rcode %v, want FORMERR", ask.what, dns.rcode_of(msg))
-			check(r, len(msg.question) <= 1, "%s: %d questions echoed", ask.what, len(msg.question))
+			if check(r, len(msg.question) == 1, "%s: %d questions echoed", ask.what, len(msg.question)) {
+				check(r, msg.question[0].name == "two.test.", "%s: echoed %s, not the first question", ask.what, msg.question[0].name)
+			}
 		}
 	}
 	end_case(r)

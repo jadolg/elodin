@@ -57,7 +57,10 @@ test_two_questions_are_formerr_with_one_echoed :: proc(t: ^testing.T) {
 			continue
 		}
 		testing.expectf(t, dns.rcode_of(msg) == .Form_Err, "%s: rcode %v, want FORMERR", row.what, dns.rcode_of(msg))
-		testing.expectf(t, len(msg.question) <= 1, "%s: %d questions echoed", row.what, len(msg.question))
+		// The first question, so the client can match the answer to what it asked.
+		if testing.expectf(t, len(msg.question) == 1, "%s: %d questions echoed", row.what, len(msg.question)) {
+			testing.expectf(t, msg.question[0].name == TWO_QUESTIONS, "%s: echoed %q, not the first question", row.what, msg.question[0].name)
+		}
 		testing.expectf(t, dns.edns_present(msg) == row.edns, "%s: EDNS in the answer %v", row.what, dns.edns_present(msg))
 	}
 	free_all(context.temp_allocator)
