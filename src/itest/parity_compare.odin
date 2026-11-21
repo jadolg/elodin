@@ -1302,6 +1302,43 @@ pc_dnssec_type :: proc(t: u16) -> bool {
 	return false
 }
 
+/*
+The lowest TTL among the records of `u`'s RRset in the section `recs` holds,
+as `dns.cap_ttls` reads one: the run of records next to each other with one
+owner (case aside), type and class, RRSIGs never part of one, each TTL read as
+RFC 2181 section 8 asks. `grouped` is false for a record alone in its run.
+*/
+@(private = "file")
+pc_rrset_lowest_ttl :: proc(u: Pw_RR, recs: []Pw_RR) -> (lowest: u32, grouped: bool) {
+	same :: proc(a, b: Pw_RR) -> bool {
+		return a.type != 46 && a.type == b.type && a.class == b.class && pw_names_equal_fold(a.name, b.name)
+	}
+	sane :: proc(ttl: u32) -> u32 {
+		return 0 if ttl & 0x8000_0000 != 0 else ttl
+	}
+	for r, i in recs {
+		if r.start != u.start {
+			continue
+		}
+		first, last := i, i
+		for first > 0 && same(recs[first - 1], r) {
+			first -= 1
+		}
+		for last + 1 < len(recs) && same(recs[last + 1], r) {
+			last += 1
+		}
+		if first == last || r.type == 46 {
+			return 0, false
+		}
+		lowest = max(u32)
+		for k in first ..= last {
+			lowest = min(lowest, sane(recs[k].ttl))
+		}
+		return lowest, true
+	}
+	return 0, false
+}
+
 @(private = "file")
 pc_ttl :: proc(
 	c: ^Parity_Compare,
@@ -1316,7 +1353,22 @@ pc_ttl :: proc(
 		return
 	}
 	reason := ""
-	if policy.dnssec_validation && ad {
+	// The record's RRset as elodin hands it on: every member at the lowest TTL
+	// of its run (RFC 2181 section 5.2, `dns.cap_ttls`). Read against that
+	// figure from here on, where the run has a lower one than this record.
+	if lowest, grouped := pc_rrset_lowest_ttl(u, up_recs); grouped && lowest < u.ttl {
+		if e.ttl == lowest {
+			reason = "an RRset that arrives with TTLs not all equal leaves with its lowest (RFC 2181 section 5.2)"
+		}
+		u := u
+		u.ttl = lowest
+		if reason == "" && policy.cache {
+			if cached := pc_cached_ttl(u, e, policy); cached != "" {
+				reason = fmt.aprintf("its RRset's lowest TTL (RFC 2181 section 5.2), and %s", cached, allocator = c.allocator)
+			}
+		}
+	}
+	if reason == "" && policy.dnssec_validation && ad {
 		reason = pc_signed_ttl(u, e, up_recs, el_recs, policy)
 	}
 	if reason == "" {
