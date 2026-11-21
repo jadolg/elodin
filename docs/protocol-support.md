@@ -52,6 +52,17 @@ UDP→TCP retry, `version.bind`/`version.server`/`hostname.bind`/`id.server` in 
 [DDR](doh.md#discovery-by-clients-ddr) when `ddr.name` is set, refusal of zone-transfer requests, and the reserved names of
 RFC 6761 and RFC 7686 answered here instead of forwarded.
 
+Some question types are answered here and never forwarded:
+
+- AXFR and IXFR: REFUSED, logged with `detail=xfr`.
+- OPT, TKEY, TSIG and the rest of types 128 to 250, NXNAME included: FORMERR
+  with extended error 30 (Invalid Query Type), logged with `detail=meta-type`.
+  These types describe one message on one hop and mean nothing to an upstream
+  (RFC 6895 section 3.1, RFC 9824 section 3.5).
+- MAILA and MAILB: NOTIMP, logged with `detail=qtype`.
+
+ANY is forwarded ([RFC 8482](https://www.rfc-editor.org/rfc/rfc8482)).
+
 TLS is 1.2 or 1.3, on the DoT and DoH listeners and towards upstreams and list
 hosts alike. Over TLS 1.2 the only suites are ECDHE with AES-GCM or
 ChaCha20-Poly1305 (RFC 9325 section 4.2), and the listeners pick by their own
