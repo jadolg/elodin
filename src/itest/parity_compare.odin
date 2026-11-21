@@ -1305,13 +1305,15 @@ pc_dnssec_type :: proc(t: u16) -> bool {
 /*
 The lowest TTL among the records of `u`'s RRset in the section `recs` holds,
 as `dns.cap_ttls` reads one: the run of records next to each other with one
-owner (case aside), type and class, RRSIGs never part of one, each TTL read as
-RFC 2181 section 8 asks. `grouped` is false for a record alone in its run.
+owner (case aside), type and class, RRSIG and OPT never part of one, each TTL read as
+RFC 2181 section 8 asks. `grouped` is false for a record alone in its run. For
+an RRSIG, the lowest of the run it follows and covers, which `cap_ttls` holds
+it to.
 */
 @(private = "file")
 pc_rrset_lowest_ttl :: proc(u: Pw_RR, recs: []Pw_RR) -> (lowest: u32, grouped: bool) {
 	same :: proc(a, b: Pw_RR) -> bool {
-		return a.type != 46 && a.type == b.type && a.class == b.class && pw_names_equal_fold(a.name, b.name)
+		return a.type != 46 && a.type != 41 && a.type == b.type && a.class == b.class && pw_names_equal_fold(a.name, b.name)
 	}
 	sane :: proc(ttl: u32) -> u32 {
 		return 0 if ttl & 0x8000_0000 != 0 else ttl
@@ -1327,7 +1329,25 @@ pc_rrset_lowest_ttl :: proc(u: Pw_RR, recs: []Pw_RR) -> (lowest: u32, grouped: b
 		for last + 1 < len(recs) && same(recs[last + 1], r) {
 			last += 1
 		}
-		if first == last || r.type == 46 {
+		// An RRSIG takes the run just before it (past any other RRSIGs) when it
+		// covers that run's type on its owner (RFC 4034 section 3).
+		if r.type == 46 {
+			if len(r.rdata) < 2 {
+				return 0, false
+			}
+			covered := u16(r.rdata[0]) << 8 | u16(r.rdata[1])
+			k := i - 1
+			for k >= 0 && recs[k].type == 46 {
+				k -= 1
+			}
+			if k < 0 || recs[k].type != covered || recs[k].class != r.class || !pw_names_equal_fold(recs[k].name, r.name) {
+				return 0, false
+			}
+			first, last = k, k
+			for first > 0 && same(recs[first - 1], recs[k]) {
+				first -= 1
+			}
+		} else if first == last {
 			return 0, false
 		}
 		lowest = max(u32)
@@ -1356,27 +1376,28 @@ pc_ttl :: proc(
 	// The record's RRset as elodin hands it on: every member at the lowest TTL
 	// of its run (RFC 2181 section 5.2, `dns.cap_ttls`). Read against that
 	// figure from here on, where the run has a lower one than this record.
+	// What the checks below read; `u` stays the upstream's own, as reported.
+	ref := u
 	if lowest, grouped := pc_rrset_lowest_ttl(u, up_recs); grouped && lowest < u.ttl {
+		ref.ttl = lowest
 		if e.ttl == lowest {
 			reason = "an RRset that arrives with TTLs not all equal leaves with its lowest (RFC 2181 section 5.2)"
 		}
-		u := u
-		u.ttl = lowest
 		if reason == "" && policy.cache {
-			if cached := pc_cached_ttl(u, e, policy); cached != "" {
+			if cached := pc_cached_ttl(ref, e, policy); cached != "" {
 				reason = fmt.aprintf("its RRset's lowest TTL (RFC 2181 section 5.2), and %s", cached, allocator = c.allocator)
 			}
 		}
 	}
 	if reason == "" && policy.dnssec_validation && ad {
-		reason = pc_signed_ttl(u, e, up_recs, el_recs, policy)
+		reason = pc_signed_ttl(ref, e, up_recs, el_recs, policy)
 	}
 	if reason == "" {
-		reason = pc_lapsing_ttl(c, u, e, policy)
+		reason = pc_lapsing_ttl(c, ref, e, policy)
 	}
 	if reason == "" {
 		if policy.cache {
-			reason = pc_cached_ttl(u, e, policy)
+			reason = pc_cached_ttl(ref, e, policy)
 		} else if !policy.ttl_exact {
 			// See `Parity_Policy.ttl_exact`.
 			reason = "the reference and this answer are two separate fetches, so their ttls have been counting down since two different moments"

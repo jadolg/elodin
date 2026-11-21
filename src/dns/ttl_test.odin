@@ -306,7 +306,7 @@ owner, type or section is another RRset; an RRSIG keeps its own.
 */
 @(test)
 test_cap_ttls_gives_an_rrset_its_lowest_ttl :: proc(t: ^testing.T) {
-	// Two RRSIGs on one owner, covering what may be RRsets of different TTLs.
+	// Two RRSIGs on one owner, one covering A (type 1) and one AAAA (type 28).
 	sig := Record{name = "set.example.", type = .RRSIG, class = .IN, ttl = 900, data = Rdata_Raw{data = []u8{0, 1}}}
 	other_sig := Record{name = "set.example.", type = .RRSIG, class = .IN, ttl = 300, data = Rdata_Raw{data = []u8{0, 28}}}
 	wire := answer_records(
@@ -329,7 +329,9 @@ test_cap_ttls_gives_an_rrset_its_lowest_ttl :: proc(t: ^testing.T) {
 	if !ok || !testing.expect_value(t, len(ttls), 9) {
 		return
 	}
-	want := [9]u32{10, 10, 10, 900, 300, 300, 300, 50, 3600}
+	// The RRSIG covering A takes the A RRset's TTL (RFC 4034 section 3); the one
+	// covering AAAA keeps its own.
+	want := [9]u32{10, 10, 10, 10, 300, 300, 300, 50, 3600}
 	for got, i in ttls {
 		testing.expectf(t, got == want[i], "record %d: TTL %d, want %d", i, got, want[i])
 	}
@@ -354,15 +356,31 @@ test_cap_ttls_reads_an_rrset_as_its_run :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// Names compared on the wire: case, pointers, a mismatch, and a pointer loop
-// that has to end.
+// Names compared on the wire: case, pointers, a mismatch, and pointers that
+// go forwards, at themselves or into the header, none of which is followed.
 @(test)
 test_wire_names_equal :: proc(t: ^testing.T) {
-	// 0: "a.b." ; 5: "A.B." ; 10: pointer to 0 ; 12: "a.c." ; 17: pointer to 19, which points back to 17.
-	msg := []u8{1, 'a', 1, 'b', 0, 1, 'A', 1, 'B', 0, 0xC0, 0, 1, 'a', 1, 'c', 0, 0xC0, 19, 0xC0, 17}
-	testing.expect(t, wire_names_equal(msg, 0, 5), "a case difference made two names")
-	testing.expect(t, wire_names_equal(msg, 5, 10), "a pointer made two names")
-	testing.expect(t, !wire_names_equal(msg, 0, 12), "a.b. and a.c. read as one")
-	testing.expect(t, !wire_names_equal(msg, 0, 17), "a pointer loop read as a name")
-	testing.expect(t, !wire_names_equal(msg, 0, len(msg)), "a name past the end read as one")
+	H :: HEADER_SIZE
+	msg := make([dynamic]u8, context.temp_allocator)
+	resize(&msg, H)
+	// H+0: "a.b." ; H+5: "A.B." ; H+10: pointer to H+0 ; H+12: "a.c." ;
+	// H+17: pointer forwards to H+19 ; H+19: pointer to itself ; H+21: pointer into the header,
+	// which spells "a.b." there.
+	append(&msg, 1, 'a', 1, 'b', 0, 1, 'A', 1, 'B', 0, 0xC0, H, 1, 'a', 1, 'c', 0, 0xC0, H + 19, 0xC0, H + 19, 0xC0, 2)
+	// H+23: pointer forwards to H+25, which spells "a.b." - equal, were it followed.
+	append(&msg, 0xC0, H + 25, 1, 'a', 1, 'b', 0)
+	// The header spells "a.b." from its third byte, which H+21 points at.
+	copy(msg[2:7], []u8{1, 'a', 1, 'b', 0})
+	testing.expect(t, wire_names_equal(msg[:], H, H + 5), "a case difference made two names")
+	testing.expect(t, wire_names_equal(msg[:], H + 5, H + 10), "a pointer made two names")
+	testing.expect(t, !wire_names_equal(msg[:], H, H + 12), "a.b. and a.c. read as one")
+	testing.expect(t, !wire_names_equal(msg[:], H, H + 17), "a forward pointer was followed")
+	testing.expect(t, !wire_names_equal(msg[:], H, H + 19), "a pointer to itself was followed")
+	testing.expect(t, !wire_names_equal(msg[:], H, H + 21), "a pointer into the header was followed")
+	testing.expect(t, !wire_names_equal(msg[:], H, H + 23), "a forward pointer to the same name was followed")
+	// And with the pointer on the other side.
+	testing.expect(t, !wire_names_equal(msg[:], H + 21, H), "a pointer into the header was followed, as the first name")
+	testing.expect(t, !wire_names_equal(msg[:], H + 23, H), "a forward pointer was followed, as the first name")
+	testing.expect(t, !wire_names_equal(msg[:], H, len(msg)), "a name past the end read as one")
+	free_all(context.temp_allocator)
 }
