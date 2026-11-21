@@ -91,7 +91,9 @@ make_response :: proc(
 	resp.flags.ra = true
 	resp.flags.cd = query.flags.cd
 	resp.flags.rcode = u8(rcode) & 0xf
-	resp.question = query.question
+	// One question at most: RFC 9619 section 4 forbids more in any message with
+	// OPCODE 0, a response to a query that asked two included.
+	resp.question = query.question[:min(len(query.question), 1)]
 
 	if _, found := find_opt(query); found {
 		// Without its OPT record the answer would state a different rcode

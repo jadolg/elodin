@@ -442,7 +442,12 @@ handle_query :: proc(
 	account for them are answers an operator has no way to trace back to here.
 	*/
 	ede: u16
-	if dns.edns_version(msg) > 0 {
+	/*
+	Not for a QUERY asking more than one question, which is FORMERR whatever
+	version it asks in (RFC 9619 section 4): the count is read before the EDNS, as
+	Unbound reads it, and `answer_locally` answers it.
+	*/
+	if dns.edns_version(msg) > 0 && !(msg.flags.opcode == .Query && len(msg.question) > 1) {
 		out, built := dns.error_response(query, msg, .Bad_Vers, allocator, limit)
 		// This gate runs before the question count is checked, so there may be no
 		// question to name; one that arrives without any is refused for its

@@ -23,6 +23,9 @@ over UDP and TCP/DoT it gets no reply, not even FORMERR, and over UDP it is not
 charged to the [rate limit](rate-limiting.md), so it never draws a slip. Over DoH it
 is answered **400**. It counts in `elodin_queries_dropped_total`, not as a query.
 
+A query asking more than one question is answered FORMERR (RFC 9619 section 4),
+whatever EDNS version it asks in, and no answer echoes more than one question.
+
 A name whose compression pointer aims into the 12-byte header is not read as a
 name. Those bytes are ones elodin writes per client (the ID, AD, and ARCOUNT
 when an OPT record is added or removed), so the client would read a different

@@ -1590,3 +1590,23 @@ test_name_canonical_is_the_decoders_spelling :: proc(t: ^testing.T) {
 	testing.expectf(t, tok && tail == "a..", "name_canonical(\"A..\") is %q", tail)
 	free_all(context.temp_allocator)
 }
+
+/*
+RFC 9619 section 4: no message with OPCODE 0 carries more than one question,
+the response to a query that asked two included. The first is echoed; a query
+with none gets none back.
+*/
+@(test)
+test_make_response_echoes_one_question_at_most :: proc(t: ^testing.T) {
+	two := Message {
+		id       = 0x6932,
+		question = []Question{{name = "a.example.", type = .A, class = .IN}, {name = "b.example.", type = .A, class = .IN}},
+	}
+	resp := make_response(two, .Form_Err, context.temp_allocator)
+	if testing.expect_value(t, len(resp.question), 1) {
+		testing.expect_value(t, resp.question[0].name, "a.example.")
+	}
+	none := make_response(Message{id = 0x6933}, .Form_Err, context.temp_allocator)
+	testing.expect_value(t, len(none.question), 0)
+	free_all(context.temp_allocator)
+}
