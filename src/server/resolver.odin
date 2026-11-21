@@ -442,11 +442,16 @@ handle_query :: proc(
 	account for them are answers an operator has no way to trace back to here.
 	*/
 	ede: u16
-	if dns.edns_version(msg) > 0 {
+	/*
+	Not for a QUERY asking more than one question, which is FORMERR whatever
+	version it asks in (RFC 9619 section 4): the count is read before the EDNS, as
+	Unbound reads it, and `answer_locally` answers it.
+	*/
+	if dns.edns_version(msg) > 0 && !(msg.flags.opcode == .Query && len(msg.question) > 1) {
 		out, built := dns.error_response(query, msg, .Bad_Vers, allocator, limit)
-		// This gate runs before the question count is checked, so there may be no
-		// question to name; one that arrives without any is refused for its
-		// version all the same.
+		// A QUERY with more than one question is let through to `answer_locally`
+		// above, so the one that reaches here with nothing to name is one with
+		// no question, which is refused for its version all the same.
 		q: dns.Question
 		if len(msg.question) > 0 {
 			q = msg.question[0]
@@ -1318,6 +1323,12 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		rcode, priming := cookie_priming_rcode(st.msg, st.cookie)
 		out, built := dns.error_response(st.query, st.msg, rcode, st.allocator, st.limit)
 		if !priming {
+			// Named by its first question, if it has one: the one echoed.
+			q: dns.Question
+			if len(st.msg.question) > 0 {
+				q = st.msg.question[0]
+			}
+			log_query(st.s, st.client, st.proto, q, .Failed, "qdcount", st.started)
 			return answered(st, out, .Failed, built)
 		}
 		primed := Outcome.Local if rcode == .No_Error else Outcome.Refused

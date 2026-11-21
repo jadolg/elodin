@@ -562,6 +562,45 @@ run_wire_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	RFC 9619 section 4: a QUERY with two questions is FORMERR, and no message with
+	OPCODE 0 - the response included - carries more than one question. Read
+	before the EDNS version, so asking in version 1 is no way past it.
+	*/
+	start_case(r, "malformed: a query with two questions is FORMERR with one echoed, whatever its EDNS version")
+	{
+		two := []u8{
+			0x69, 0x31, 0x01, 0x00, 0, 2, 0, 0, 0, 0, 0, 0,
+			3, 't', 'w', 'o', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1,
+			5, 'o', 't', 'h', 'e', 'r', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1,
+		}
+		// The same, with an OPT record in EDNS version 1.
+		v1 := make([dynamic]u8, context.temp_allocator)
+		append(&v1, ..two)
+		v1[11] = 1
+		append(&v1, 0, 0, 41, 0x04, 0xd0, 0, 1, 0, 0, 0, 0)
+		Ask :: struct {
+			what:    string,
+			wire:    []u8,
+			tcp:     bool,
+		}
+		for ask in ([]Ask{{what = "udp", wire = two}, {what = "tcp", wire = two, tcp = true}, {what = "udp, EDNS 1", wire = v1[:]}}) {
+			res := query_tcp(udp_port, ask.wire, context.temp_allocator) if ask.tcp else query_udp(udp_port, ask.wire)
+			if !check(r, res.ok, "%s: no response", ask.what) {
+				continue
+			}
+			msg, decoded := decode_reply(r, res.wire)
+			if !decoded {
+				continue
+			}
+			check(r, dns.rcode_of(msg) == .Form_Err, "%s: rcode %v, want FORMERR", ask.what, dns.rcode_of(msg))
+			if check(r, len(msg.question) == 1, "%s: %d questions echoed", ask.what, len(msg.question)) {
+				check(r, msg.question[0].name == "two.test.", "%s: echoed %s, not the first question", ask.what, msg.question[0].name)
+			}
+		}
+	}
+	end_case(r)
+
 	start_case(r, "malformed: a truncated question yields FORMERR")
 	{
 		// A header claiming one question, with the name cut off mid-label.
