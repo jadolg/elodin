@@ -95,6 +95,16 @@ dnssec:
     - "corp.example. IN DS 54707 15 2 FF085C4C1865D42641957E67182575E9DCB20BF2D9DD001D7BB9C5C4D2AC5384"
 ```
 
+Anchors are not updated in-band: elodin does not implement RFC 5011 automated
+trust-anchor maintenance, which Unbound, BIND and Knot Resolver do. The one
+part of RFC 5011 it reads is the REVOKE bit, which makes a revoked key unusable.
+So a root KSK after KSK-2024 needs an elodin release that carries it or a
+`trust_anchors` list naming it (the list replaces the built-in anchors, so it
+names KSK-2024 too while both are in use), and an anchor for your own zone has to be
+changed by hand when that zone rolls its KSK. Until it is, every name under that
+anchor is SERVFAIL. A changed `trust_anchors` takes effect on
+[`SIGHUP`](install.md#signals), with no restart.
+
 An anchor whose owner name holds a character outside ASCII is refused; write an
 international name in punycode (`xn--...`).
 

@@ -69,6 +69,7 @@ came from accepts it.
 
 ## Known limitations
 
+- DNSSEC trust anchors are not updated in-band (no RFC 5011): a root KSK after KSK-2024, or a new KSK for a zone you anchor yourself, needs a new release or a `trust_anchors` change; see [trust anchors](dnssec.md#trust-anchors).
 - Where the host's crypto policy forbids SHA-1, zones signed only with RSA/SHA-1 (algorithms 5 and 7) validate as insecure delegations; see [DNSSEC](dnssec.md#watch-out).
 - [Rebinding protection](rebinding.md#dns-rebinding-protection) covers A, AAAA, ANY, SVCB and HTTPS questions only.
 - TCP, DoT and DoH hold a fiber per connection, capped by `server.max_connections` and per prefix by `server.max_connections_per_prefix` (UDP holds no per-client state); see [sizing](sizing.md#transports).
