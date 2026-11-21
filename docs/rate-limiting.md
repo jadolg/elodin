@@ -87,9 +87,10 @@ a refused source use up the budget of the clients in its /24.
 ### Over budget
 
 - **UDP.** At most every `slip`th over-budget query gets back a header and the
-  question with TC set, plus an OPT record (no options, the query's DO bit) when
-  the query carried a readable one in EDNS version 0: too small to be worth
-  reflecting, and it tells a real client to retry over TCP. `slip: 0` drops them all. These truncated answers
+  question with TC set: too small to be worth reflecting, and it tells a real
+  client to retry over TCP. A query with a readable EDNS version 0 OPT record
+  also gets one back, stating `max_udp_response` and the query's DO bit, with
+  no options (so no cookie). `slip: 0` drops them all. These truncated answers
   have their own budget, an eighth of `responses_per_second` per prefix (62 a
   second by default), so a flood cannot make elodin send one per two datagrams
   it receives.

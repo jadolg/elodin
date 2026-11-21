@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:net"
 import "core:slice"
 import "core:time"
+import "elodin:config"
 import "elodin:dns"
 
 /*
@@ -167,7 +168,7 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 					if check(r, has_opt, "the slipped reply to an EDNS query carries no OPT record") {
 						check(r, dns.edns_do(msg), "DO not copied onto the slipped reply")
 						check_eq_int(r, int(dns.edns_version(msg)), 0, "EDNS version")
-						check(r, u16(opt.class) >= dns.MAX_UDP_SIZE, "payload size %d, below 512", u16(opt.class))
+						check_eq_int(r, int(opt.class), config.DEFAULT_MAX_UDP_RESPONSE, "payload size, against the max_udp_response default")
 					}
 				}
 			}
