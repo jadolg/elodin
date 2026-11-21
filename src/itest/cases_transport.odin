@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:slice"
 import "core:strings"
 import "elodin:dns"
+import "elodin:server"
 import "elodin:tlsx"
 
 /*
@@ -846,6 +847,41 @@ run_transport_cases :: proc(r: ^Runner) {
 				h := parse_header(r, res.wire)
 				check(r, h.rcode == int(dns.Rcode.Refused), "type %d: rcode %d, want REFUSED", qtype, h.rcode)
 			}
+		}
+	}
+	end_case(r)
+
+	/*
+	A question for a meta-type is answered here and never forwarded: FORMERR with
+	extended error 30 (RFC 9824 section 3.5 for NXNAME, as Unbound and BIND answer
+	the range). MAILA and MAILB are NOTIMP (RFC 1035 section 4.1.1).
+	*/
+	start_case(r, "meta-type and obsolete QTYPE questions are answered without the upstream")
+	{
+		Ask :: struct {
+			qtype: u16,
+			rcode: dns.Rcode,
+			ede:   int,
+		}
+		ASKS := []Ask {
+			{qtype = u16(dns.Type.OPT), rcode = .Form_Err, ede = server.EDE_INVALID_QUERY_TYPE},
+			{qtype = u16(dns.Type.NXNAME), rcode = .Form_Err, ede = server.EDE_INVALID_QUERY_TYPE},
+			{qtype = 200, rcode = .Form_Err, ede = server.EDE_INVALID_QUERY_TYPE},
+			{qtype = u16(dns.Type.TKEY), rcode = .Form_Err, ede = server.EDE_INVALID_QUERY_TYPE},
+			{qtype = u16(dns.Type.TSIG), rcode = .Form_Err, ede = server.EDE_INVALID_QUERY_TYPE},
+			{qtype = u16(dns.Type.MAILB), rcode = .Not_Impl, ede = -1},
+			{qtype = u16(dns.Type.MAILA), rcode = .Not_Impl, ede = -1},
+		}
+		for a in ASKS {
+			before := mock_total(mock)
+			q := build_query("meta.example.", a.qtype, edns_size = 1232)
+			res := query_udp(udp_port, q)
+			if check(r, res.ok, "type %d: no response", a.qtype) {
+				h := parse_header(r, res.wire)
+				check(r, h.rcode == int(a.rcode), "type %d: rcode %d, want %v", a.qtype, h.rcode, a.rcode)
+				check(r, extended_error(r, res.wire) == a.ede, "type %d: extended error %d, want %d", a.qtype, extended_error(r, res.wire), a.ede)
+			}
+			check_eq_int(r, mock_total(mock) - before, 0, fmt.tprintf("type %d: queries forwarded", a.qtype))
 		}
 	}
 	end_case(r)

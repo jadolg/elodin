@@ -38,6 +38,9 @@ EDE_SIGNATURE_NOT_YET_VALID :: 8
 EDE_BLOCKED :: 15
 EDE_NO_REACHABLE_AUTHORITY :: 22
 EDE_UNSUPPORTED_NSEC3_ITERATIONS :: 27
+// Code 30, "Invalid Query Type" (RFC 9824 section 3.5): a question for a type
+// that ought not appear in a query.
+EDE_INVALID_QUERY_TYPE :: 30
 
 /*
 Build the validator and wire it to the upstream group.

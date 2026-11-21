@@ -1363,6 +1363,19 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		return answered(st, out, .Refused, built)
 	}
 
+	if dns.is_meta_type(st.q.type) {
+		/*
+		A question about a record that describes one message on one hop means
+		nothing to the next hop, so it is not forwarded: FORMERR with extended
+		error 30, which RFC 9824 section 3.5 makes a MUST for NXNAME and Unbound
+		(`worker_handle_request`) and BIND (`ns_query_start`) answer for the range.
+		Ahead of the class gates, since that MUST is for any query.
+		*/
+		out, built := meta_type_refusal(st.query, st.msg, st.limit, st.allocator)
+		log_query(st.s, st.client, st.proto, st.q, .Refused, "meta-type", st.started)
+		return answered(st, out, .Refused, built)
+	}
+
 	if st.q.class == .CH && answer_chaos(st) {
 		return true
 	}
@@ -1372,11 +1385,17 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		return answered(st, out, .Refused, built)
 	}
 
-	// Zone transfers make no sense against a forwarder.
 	#partial switch st.q.type {
 	case .AXFR, .IXFR:
+		// Zone transfers make no sense against a forwarder.
 		out, built := dns.error_response(st.query, st.msg, .Refused, st.allocator, st.limit)
 		log_query(st.s, st.client, st.proto, st.q, .Refused, "xfr", st.started)
+		return answered(st, out, .Refused, built)
+	case .MAILA, .MAILB:
+		// QTYPEs RFC 1035 defines and this server does not implement: NOTIMP,
+		// "does not support the requested kind of query" (section 4.1.1).
+		out, built := dns.error_response(st.query, st.msg, .Not_Impl, st.allocator, st.limit)
+		log_query(st.s, st.client, st.proto, st.q, .Refused, "qtype", st.started)
 		return answered(st, out, .Refused, built)
 	}
 
@@ -3589,6 +3608,21 @@ upstream_refusal :: proc(
 	a SERVFAIL.
 	*/
 	return dns.error_response(query, msg, .Serv_Fail, allocator, limit)
+}
+
+/*
+FORMERR for a question about a meta-type (see `dns.is_meta_type`), explained by
+RFC 8914 extended error 30. Without room for the explanation, or where the
+message will not build, the FORMERR goes out bare through `error_response`.
+*/
+@(private)
+meta_type_refusal :: proc(query: []u8, msg: dns.Message, limit: int, allocator: mem.Allocator) -> (out: []u8, built: bool) {
+	refusal := dns.make_response(msg, .Form_Err, allocator)
+	attach_extended_error(&refusal, EDE_INVALID_QUERY_TYPE, "", allocator)
+	if encoded, truncated, enc_err := dns.encode_message(refusal, allocator, limit); enc_err == .None && !truncated {
+		return encoded, true
+	}
+	return dns.error_response(query, msg, .Form_Err, allocator, limit)
 }
 
 /*

@@ -1227,3 +1227,15 @@ alloc_list :: proc($T: typeid/[dynamic]$E, n: int, allocator: mem.Allocator) -> 
 	out, err = make(T, 0, n, allocator)
 	return out, err == nil && cap(out) >= n
 }
+
+/*
+Whether `t` is a type a question must not ask for: OPT, and the meta range from
+NXNAME (128) through TSIG (250), which holds TKEY, TSIG and the unassigned rest
+of RFC 6895 section 3.1's "Q and Meta" block below the QTYPEs. Each describes
+one message on one hop, or nothing a server stores (RFC 9824 section 3.5 for
+NXNAME). The QTYPEs above it - IXFR, AXFR, MAILB, MAILA and ANY - are questions
+a client may ask, and are not included.
+*/
+is_meta_type :: proc(t: Type) -> bool {
+	return t == .OPT || (u16(t) >= u16(Type.NXNAME) && u16(t) <= u16(Type.TSIG))
+}
