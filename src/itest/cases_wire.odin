@@ -604,14 +604,18 @@ run_wire_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
-	start_case(r, "malformed: a truncated question yields FORMERR")
+	start_case(r, "malformed: a truncated question yields FORMERR, with the AA and Z it set cleared")
 	{
-		// A header claiming one question, with the name cut off mid-label.
-		bad := []u8{0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 7, 'e', 'x'}
+		// A header claiming one question, with the name cut off mid-label, and
+		// RD, AA and the reserved Z bit set (RFC 1035 section 4.1.1: Z "Must be
+		// zero in all queries and responses", and a forwarder is no authority).
+		bad := []u8{0x12, 0x34, 0x05, 0x40, 0, 1, 0, 0, 0, 0, 0, 0, 7, 'e', 'x'}
 		res := query_udp(udp_port, bad)
 		if check(r, res.ok, "no response to a truncated question") {
 			h := parse_header(r, res.wire)
 			check(r, h.rcode == int(dns.Rcode.Form_Err), "rcode %d, want FORMERR", h.rcode)
+			check(r, res.wire[2] & 0x04 == 0, "AA echoed: flags %02x%02x", res.wire[2], res.wire[3])
+			check(r, res.wire[3] & 0x40 == 0, "Z echoed: flags %02x%02x", res.wire[2], res.wire[3])
 		}
 	}
 	end_case(r)

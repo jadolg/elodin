@@ -635,7 +635,7 @@ test_truncated_response :: proc(t: ^testing.T) {
 	wire, _, err := encode_message(query, context.temp_allocator)
 	testing.expect_value(t, err, Encode_Error.None)
 
-	out, ok := truncated_response(wire, context.temp_allocator)
+	out, ok := truncated_response(wire, MAX_UDP_SIZE, context.temp_allocator)
 	testing.expect(t, ok, "a well-formed query got no truncated answer")
 	testing.expect(t, len(out) < 64, "the answer is meant to be too small to reflect")
 
@@ -689,7 +689,7 @@ test_truncated_response :: proc(t: ^testing.T) {
 	}
 
 	for c in CASES {
-		got, built := truncated_response(c.wire, context.temp_allocator)
+		got, built := truncated_response(c.wire, MAX_UDP_SIZE, context.temp_allocator)
 		testing.expectf(t, built == c.ok, "%s: built=%v", c.what, built)
 		if !built {
 			continue
@@ -759,11 +759,11 @@ test_ra_is_a_capability_flag_not_tied_to_rd :: proc(t: ^testing.T) {
 	testing.expect(t, err_no_rd_ok, "error_response built nothing for an RD=0 query")
 	testing.expect(t, err_no_rd[3] & 0x80 != 0, "RA not set in error_response for an RD=0 query")
 
-	trunc_rd, trunc_rd_ok := truncated_response(rd_wire, context.temp_allocator)
+	trunc_rd, trunc_rd_ok := truncated_response(rd_wire, MAX_UDP_SIZE, context.temp_allocator)
 	testing.expect(t, trunc_rd_ok, "truncated_response built nothing for an RD=1 query")
 	testing.expect(t, trunc_rd[3] & 0x80 != 0, "RA not set in truncated_response for an RD=1 query")
 
-	trunc_no_rd, trunc_no_rd_ok := truncated_response(no_rd_wire, context.temp_allocator)
+	trunc_no_rd, trunc_no_rd_ok := truncated_response(no_rd_wire, MAX_UDP_SIZE, context.temp_allocator)
 	testing.expect(t, trunc_no_rd_ok, "truncated_response built nothing for an RD=0 query")
 	testing.expect(t, trunc_no_rd[3] & 0x80 != 0, "RA not set in truncated_response for an RD=0 query")
 

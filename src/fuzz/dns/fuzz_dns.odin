@@ -16,7 +16,7 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	// Reached from the UDP read loop for a rate-limited query, on the bytes as
 	// they arrived and without decoding them first, so it is its own parser of
 	// hostile input and gets its own turn here.
-	_, _ = dns.truncated_response(data[:size])
+	_, _ = dns.truncated_response(data[:size], dns.MAX_UDP_SIZE) // lint:allow the driver looks for crashes, not answers
 	/*
 	The padding writer walks the OPT record of a message this server did not
 	write - an upstream's reply on its way out to a DoT or DoH client - and
