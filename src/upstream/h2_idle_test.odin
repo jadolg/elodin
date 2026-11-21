@@ -215,3 +215,120 @@ test_close_idle_keeps_only_fresh_pooled_conns :: proc(t: ^testing.T) {
 		testing.expect(t, f.u.idle[0].stream.socket == fresh, "the fresh pooled connection was not the one kept")
 	}
 }
+
+/*
+The shared HTTP/2 connection is not handed out once the address it was dialled
+to has moved; the next caller gets a connection of its own to the address held.
+*/
+@(test)
+test_an_h2_conn_from_before_a_move_is_not_handed_out :: proc(t: ^testing.T) {
+	f: H2_Idle_Fixture
+	if !h2_idle_setup(t, &f) {
+		return
+	}
+	defer h2_idle_teardown(&f)
+
+	conn, ok, err := get_h2_conn(f.u, time.Second, 200 * time.Millisecond)
+	if testing.expectf(t, ok && conn == f.hc.client, "the premise: the current connection is handed out (%v)", err) {
+		h2.client_unref(conn)
+	}
+
+	sync.mutex_lock(&f.u.mu)
+	f.u.epoch += 1
+	sync.mutex_unlock(&f.u.mu)
+	testing.expect(t, h2_idle_kept(&f), "the premise: the upstream still holds it")
+	conn, ok, err = get_h2_conn(f.u, time.Second, 200 * time.Millisecond)
+	testing.expect(t, !(ok && conn == f.hc.client), "a connection to the old address was handed out")
+	if ok && conn != nil {
+		h2.client_unref(conn)
+	}
+	testing.expect(t, !h2_idle_kept(&f), "the connection to the old address stayed shared")
+}
+
+/*
+One from before a move that still carries streams is not cut off: it is set
+aside to finish them, and retired once it has. A second move sets aside the
+connection then busy too, without cutting off the first.
+*/
+@(test)
+test_a_busy_h2_conn_from_before_a_move_is_let_finish :: proc(t: ^testing.T) {
+	f: H2_Idle_Fixture
+	if !h2_idle_setup(t, &f) {
+		return
+	}
+	defer h2_idle_teardown(&f)
+
+	draining :: proc(u: ^Upstream, hc: ^H2_Conn) -> bool {
+		sync.mutex_lock(&u.mu)
+		defer sync.mutex_unlock(&u.mu)
+		for d in u.h2_draining {
+			if d == hc {
+				return true
+			}
+		}
+		return false
+	}
+
+	// A caller still holding it is a stream still open.
+	held, ok, err := get_h2_conn(f.u, time.Second, 200 * time.Millisecond)
+	if !testing.expectf(t, ok && held == f.hc.client, "the premise: the current connection is handed out (%v)", err) {
+		return
+	}
+	sync.mutex_lock(&f.u.mu)
+	f.u.epoch += 1
+	sync.mutex_unlock(&f.u.mu)
+	next, next_ok, _ := get_h2_conn(f.u, time.Second, 200 * time.Millisecond) // lint:allow the listener speaks no TLS; only what became of the old connection is checked
+	if next_ok && next != nil {
+		h2.client_unref(next)
+	}
+	testing.expect(t, draining(f.u, f.hc), "the busy connection was not set aside")
+	testing.expect(t, !sync.atomic_load(&f.hc.stopping), "the busy connection was cut off")
+
+	// A second shared connection, dialled in this epoch and held busy, as the
+	// first was.
+	bound, berr := net.bound_endpoint(f.listener)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		h2.client_unref(held)
+		return
+	}
+	socket, derr := dial_tcp_timeout(bound, time.Second)
+	if !testing.expectf(t, derr == .None, "cannot dial the listener: %v", derr) {
+		h2.client_unref(held)
+		return
+	}
+	if !testing.expect(t, net.set_option(socket, .Receive_Timeout, H2_POLL_INTERVAL) == nil, "cannot bound the reader's poll") {
+		net.close(socket)
+		h2.client_unref(held)
+		return
+	}
+	sync.mutex_lock(&f.u.mu)
+	f.u.proto = .H2
+	second_hc := start_h2_conn(f.u, Stream{socket = socket, epoch = f.u.epoch})
+	f.u.h2 = second_hc
+	sync.mutex_unlock(&f.u.mu)
+	if !testing.expect(t, second_hc != nil, "cannot start the second connection") {
+		h2.client_unref(held)
+		return
+	}
+	second := second_hc.client
+	h2.client_ref(second)
+
+	// A second move while both are busy.
+	sync.mutex_lock(&f.u.mu)
+	f.u.epoch += 1
+	sync.mutex_unlock(&f.u.mu)
+	third, third_ok, _ := get_h2_conn(f.u, time.Second, 200 * time.Millisecond) // lint:allow only what became of the earlier connections is checked
+	if third_ok && third != nil {
+		h2.client_unref(third)
+	}
+	testing.expect(t, draining(f.u, f.hc) && draining(f.u, second_hc), "a second move cut off a connection set aside")
+	testing.expect(t, !sync.atomic_load(&f.hc.stopping), "the first connection set aside was cut off")
+
+	h2.client_unref(held)
+	h2.client_unref(second)
+	close_idle(f.u)
+	sync.mutex_lock(&f.u.mu)
+	left := len(f.u.h2_draining)
+	sync.mutex_unlock(&f.u.mu)
+	testing.expect_value(t, left, 0)
+}

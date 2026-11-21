@@ -11,7 +11,6 @@ import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
 import "elodin:loop"
-import "elodin:netx"
 import "elodin:tlsx"
 
 Error :: enum u8 {
@@ -141,11 +140,21 @@ H2_Conn :: struct {
 
 Upstream :: struct {
 	spec:         config.Upstream_Spec,
-	// Published once and read without a lock, so only `resolve_endpoint`
-	// writes them, `endpoint` is read through `endpoint_of`, and `resolved`
-	// only with an acquire load.
+	// Written by `resolve_endpoint` under `mu` and read through `endpoint_of`;
+	// `resolved`, once set, is never cleared, and is read with an acquire load.
 	endpoint:     net.Endpoint,
 	resolved:     bool,
+	// When a hostname's address is to be asked for again (`bootstrap_ttl`);
+	// zero for an IP literal. Atomic.
+	expires:      loop.Moment,
+	// Held by the one exchange refreshing the address (see `exchange`). Atomic.
+	refreshing:   bool,
+	// A refresh has failed since the last that succeeded; see
+	// `resolve_endpoint`. Atomic.
+	refresh_failing: bool,
+	// How many times the address has moved; under `mu`. A connection dialled
+	// in an earlier one is not used again (`dialled_current_locked`).
+	epoch:        int,
 	tls_ctx:      ^tlsx.Context,
 	// What `open_stream` dials this upstream's connections with; nil is
 	// `dial_tcp_timeout`. Set by tests, to stand in for a peer that resets a
@@ -178,6 +187,10 @@ Upstream :: struct {
 	// back.
 	proto:      Protocol,
 	h2:         ^H2_Conn,
+	// The shared connections moves left with streams still open on them, let
+	// finish rather than cut off; each retired once idle (`close_idle`), all
+	// at teardown. In `allocator`, under `mu`.
+	h2_draining: [dynamic]^H2_Conn,
 	/*
 	Readers still running, `h2`'s and those of connections it replaced, and the
 	cond the last of them broadcasts on as it leaves. Under `mu`. A reader is a
@@ -368,13 +381,15 @@ bootstrap resolvers rather than the system resolver, because on a machine where
 elodin *is* the system resolver, asking it to resolve its own upstream would
 deadlock at boot.
 
-A name that did not resolve at startup is resolved by whichever queries reach
-it first, several at once while others are dialling, so the endpoint is
-published once: written under `mu` by the first lookup to succeed, then
-`resolved` is set with release ordering, and the endpoint is never written
-again. A lookup that fails leaves alone whatever another thread published.
-`Not_Resolved` where the bootstrap servers gave no address, `Out_Of_Memory`
-where this server could not ask them.
+The address is held for the TTL it was answered with (RFC 1035 section 3.2.1,
+`bootstrap_ttl`), and `exchange` asks again once that is past. Each lookup that
+succeeds writes the endpoint under `mu`, then sets `resolved` with release
+ordering. An address that moves starts a new `epoch`: connections to the old
+one are not handed out again (`dialled_current_locked`), and idle ones close as
+they are reached for or idle out. A lookup that fails leaves alone whatever was
+published, and an address already held is kept and asked for again
+`BOOTSTRAP_MIN_TTL` later. `Not_Resolved` where the bootstrap servers gave no
+address and none is held, `Out_Of_Memory` where this server could not ask them.
 */
 @(private)
 resolve_endpoint :: proc(
@@ -382,54 +397,140 @@ resolve_endpoint :: proc(
 	// The exchange's, which the bootstrap queries spend; zero at startup, where
 	// each has `BOOTSTRAP_TIMEOUT` of its own.
 	deadline := time.Tick{},
+	// Asking again past the TTL, which may replace the address held. A first
+	// lookup that finds one already published by a lookup racing it leaves
+	// that one, rather than counting the difference as a move.
+	refresh := false,
+	// How long a query sent before a move may still be waiting on its reply:
+	// the exchange's timeout. Cookies are owed on those replies that long.
+	in_flight := time.Duration(0),
 ) -> Error {
-	addr := netx.parse_address(u.spec.address)
-	literal := addr != nil
-	if !literal {
-		err: Error
-		addr, err = bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline)
-		if err != .None {
-			// Another thread's lookup may have published meanwhile, and then
-			// the upstream is not unresolvable.
-			if sync.atomic_load_explicit(&u.resolved, .Acquire) {
-				return .None
+	keep: net.Address
+	if refresh {
+		sync.mutex_lock(&u.mu)
+		keep = u.endpoint.address
+		sync.mutex_unlock(&u.mu)
+	}
+	addr, ttl, err := bootstrap_resolve(u.spec.bootstrap, u.spec.address, deadline, keep)
+	if err != .None {
+		// Held already, by an earlier lookup or another thread's: kept, and
+		// the upstream is not unresolvable. Asked again `BOOTSTRAP_MIN_TTL`
+		// on, unless another lookup has just set a later time.
+		if sync.atomic_load_explicit(&u.resolved, .Acquire) {
+			if expires := sync.atomic_load(&u.expires); expires != 0 && loop.moment_since(expires) >= 0 {
+				_, _ = sync.atomic_compare_exchange_strong(&u.expires, expires, loop.moment_add(loop.moment_now(), BOOTSTRAP_MIN_TTL)) // lint:allow lost only to a lookup that set the time itself
+				// At warn the first time in a run, so a bootstrap that stays
+				// down is not a line every `BOOTSTRAP_MIN_TTL` for good.
+				if _, first_failure := sync.atomic_compare_exchange_strong(&u.refresh_failing, false, true); first_failure {
+					logx.warnf("upstream %s: cannot resolve %q again via bootstrap resolvers (%v); keeping the address held", u.spec.name, u.spec.address, err)
+				} else {
+					logx.debugf("upstream %s: still cannot resolve %q again (%v)", u.spec.name, u.spec.address, err)
+				}
 			}
-			if err == .Not_Resolved {
-				logx.warnf("upstream %s: cannot resolve %q via bootstrap resolvers", u.spec.name, u.spec.address)
-			}
-			return err
+			return .None
 		}
+		if err == .Not_Resolved {
+			logx.warnf("upstream %s: cannot resolve %q via bootstrap resolvers", u.spec.name, u.spec.address)
+		}
+		return err
+	}
+	endpoint := net.Endpoint {
+		address = addr,
+		port    = u.spec.port,
 	}
 	sync.mutex_lock(&u.mu)
-	published := !sync.atomic_load_explicit(&u.resolved, .Relaxed)
-	if published {
-		u.endpoint = net.Endpoint {
-			address = addr,
-			port    = u.spec.port,
-		}
-		sync.atomic_store_explicit(&u.resolved, true, .Release)
+	first := !sync.atomic_load_explicit(&u.resolved, .Relaxed)
+	if !first && !refresh {
+		sync.mutex_unlock(&u.mu)
+		return .None
 	}
+	sync.atomic_store(&u.refresh_failing, false)
+	moved := !first && !came_from(endpoint, u.endpoint)
+	if moved {
+		u.epoch += 1
+		// A server cookie is the old address's (RFC 7873 section 5.1), and the
+		// client cookie is drawn afresh for the new one (RFC 9018 section 3).
+		// With the epoch, so a connection dialled from here on carries the new
+		// ones; a query that attached its cookie just before may still take
+		// the old ones to the new address, which answers BADCOOKIE and is
+		// asked again (`exchange_with_cookie`).
+		// A second move with no cookie learned since leaves the first's
+		// window as it is: it is a time, not a flag the move could clear.
+		if u.cookie.server_len > 0 {
+			u.cookie.moved_until = max(u.cookie.moved_until, loop.moment_add(loop.moment_now(), in_flight))
+		}
+		forget_cookie(u)
+		init_cookie(u)
+		// What ALPN chose, and when idle connections were found hung up on,
+		// were the old address's.
+		u.proto = .Unknown
+		u.idle_died, u.idle_learned = 0, 0
+	}
+	u.endpoint = endpoint
+	sync.atomic_store(&u.expires, 0 if ttl == 0 else loop.moment_add(loop.moment_now(), ttl))
+	sync.atomic_store_explicit(&u.resolved, true, .Release)
 	sync.mutex_unlock(&u.mu)
-	// Only the address dialled is logged, not one a lookup that lost the race
-	// found.
-	if published && !literal {
+	if moved {
+		// Connections to the old address go as each is next reached for
+		// (`dialled_current_locked`), so none dialled to the new one is lost.
+		logx.infof("upstream %s: %s now resolves to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
+	} else if first && ttl != 0 {
 		logx.debugf("upstream %s: resolved %s to %s", u.spec.name, u.spec.address, net.address_to_string(addr, context.temp_allocator))
 	}
 	return .None
 }
 
 /*
-The address to dial, or `Not_Resolved` while there is none yet. Read without a
-lock: the endpoint is written once, before `resolved` is released (see
-`resolve_endpoint`). A copy, so one exchange sends to and checks replies against
-the same address.
+The address to dial, or `Not_Resolved` while there is none yet, and the `epoch`
+it belongs to, for a connection to carry. A copy, taken under `mu` since a
+refresh may write it, so one exchange sends to and checks replies against the
+same address.
 */
 @(private)
-endpoint_of :: proc(u: ^Upstream) -> (endpoint: net.Endpoint, err: Error) {
+endpoint_of :: proc(u: ^Upstream) -> (endpoint: net.Endpoint, epoch: int, err: Error) {
 	if !sync.atomic_load_explicit(&u.resolved, .Acquire) {
-		return {}, .Not_Resolved
+		return {}, 0, .Not_Resolved
 	}
-	return u.endpoint, .None
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	return u.endpoint, u.epoch, .None
+}
+
+/*
+Whether `stream` was dialled to the address held now, rather than one a refresh
+has since moved away from: a connection to the old address is not handed out or
+pooled again (`get_pipe`, `get_h2_conn`, `put_idle`, `take_idle`). Under `u.mu`.
+*/
+@(private)
+dialled_current_locked :: proc(u: ^Upstream, stream: Stream) -> bool {
+	return stream.epoch == u.epoch
+}
+
+// The part of an exchange's timeout a refresh of the address may spend: one in
+// this many.
+@(private)
+REFRESH_SHARE :: 4
+
+/*
+Whether this exchange is the one to ask for a held address again: its TTL is
+past, and no other exchange is asking. The caller clears `refreshing` after.
+*/
+@(private)
+refresh_due :: proc(u: ^Upstream) -> bool {
+	expires := sync.atomic_load(&u.expires)
+	if expires == 0 || loop.moment_since(expires) < 0 {
+		return false
+	}
+	if _, won := sync.atomic_compare_exchange_strong(&u.refreshing, false, true); !won {
+		return false
+	}
+	// Read again once claimed: a refresh that finished between the two reads
+	// has set a time still ahead.
+	if loop.moment_since(sync.atomic_load(&u.expires)) < 0 {
+		sync.atomic_store(&u.refreshing, false)
+		return false
+	}
+	return true
 }
 
 /*
@@ -898,6 +999,17 @@ servers to ask the refusal costs nothing, and is left unrecorded. A lookup this
 			}
 			return nil, rerr
 		}
+	} else if refresh_due(u) {
+		/*
+		One exchange asks; the rest dial the address held. Held to a share
+		of this exchange's time, so a bootstrap gone quiet does not cost the
+		query its answer from the address held. A failure keeps that address,
+		so only the time it spent shows, as `resolving` does.
+		*/
+		resolving = true
+		share := time.tick_add(entered, timeout / REFRESH_SHARE)
+		_ = resolve_endpoint(u, share, refresh = true, in_flight = timeout) // lint:allow a failed refresh keeps the address held, which resolve_endpoint logs
+		sync.atomic_store(&u.refreshing, false)
 	}
 
 	start := loop.tick_now()
@@ -1026,8 +1138,9 @@ take_idle :: proc(u: ^Upstream) -> (conn: Idle_Conn, ok: bool) {
 			return {}, false
 		}
 		conn = pop(&u.idle)
+		current := dialled_current_locked(u, conn.stream)
 		sync.mutex_unlock(&u.mu)
-		if time.Duration(now - conn.since) < u.idle_timeout {
+		if current && time.Duration(now - conn.since) < u.idle_timeout {
 			return conn, true
 		}
 		// Closed with the lock let go, for the reason `close_idle` gives.
@@ -1041,7 +1154,7 @@ put_idle :: proc(u: ^Upstream, stream: Stream) {
 		stream = stream,
 	}
 	sync.mutex_lock(&u.mu)
-	if len(u.idle) >= u.max_idle {
+	if len(u.idle) >= u.max_idle || !dialled_current_locked(u, stream) {
 		sync.mutex_unlock(&u.mu)
 		stream_close(&c.stream)
 		return
@@ -1080,7 +1193,24 @@ close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 	resize(&u.idle, kept)
 
 	stale_h2 := take_idle_h2_locked(u, all)
+	// Reserved whole; with no room, all are left for the next sweep rather
+	// than retired under the lock, which a TLS close_notify would park on.
+	drained, drained_listed := dns.alloc_list([dynamic]^H2_Conn, len(u.h2_draining), context.temp_allocator)
+	#reverse for hc, i in u.h2_draining {
+		if !drained_listed {
+			break
+		}
+		if _, busy := h2.client_idle_for(hc.client); busy && !h2.client_closed(hc.client) {
+			continue
+		}
+		unordered_remove(&u.h2_draining, i)
+		append(&drained, hc)
+	}
 	sync.mutex_unlock(&u.mu)
+	for hc in drained {
+		retire_h2_conn(hc)
+	}
+	closed += len(drained)
 	// Closed once the lock is let go, as `get_h2_conn` retires the h2
 	// connection it replaces: a TLS close writes a close_notify, nothing in
 	// closing needs `u.mu`, and every query on this upstream waits on it to

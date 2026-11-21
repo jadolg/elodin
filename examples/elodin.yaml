@@ -292,7 +292,8 @@ upstream:
   idle_timeout: 30s
 
   # Used to resolve upstream hostnames without going through the system
-  # resolver, which on this machine may well be elodin itself.
+  # resolver, which on this machine may well be elodin itself. An address is
+  # held for its record's TTL (10s to 1h), then asked for again.
   bootstrap: [1.1.1.1, 9.9.9.9]
 
   servers:

@@ -1,6 +1,7 @@
 package upstream
 
 import "core:net"
+import "core:mem"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -15,12 +16,20 @@ Hostname resolution that does not go through the system resolver.
 On a machine where elodin is the system resolver, asking libc to resolve an
 upstream's hostname during startup would come straight back to a server that is
 not listening yet. Bootstrap addresses are queried directly over plain UDP
-instead, and results are cached for BOOTSTRAP_TTL, at most
+instead, and results are cached for the answer's TTL (`bootstrap_ttl`), at most
 BOOTSTRAP_MAX_ENTRIES names at once.
 */
 
+// The longest an answer is kept, whatever its TTL.
 @(private)
 BOOTSTRAP_TTL :: 1 * time.Hour
+
+/*
+The shortest: a TTL of zero or one would send every exchange on an upstream
+named by it to the bootstrap servers first.
+*/
+@(private)
+BOOTSTRAP_MIN_TTL :: 10 * time.Second
 
 @(private)
 BOOTSTRAP_TIMEOUT :: 3 * time.Second
@@ -29,8 +38,8 @@ BOOTSTRAP_TIMEOUT :: 3 * time.Second
 At most this many hostnames cached at once. The sweep holds the map to what was
 resolved within `BOOTSTRAP_TTL`, but a short `blocking.refresh` fetches many
 times an hour, and each redirect is a name the list host chooses. A name
-resolved while the map is full is answered and not kept: an upstream publishes
-its endpoint once, and a list is fetched again a refresh later.
+resolved while the map is full is answered and not kept: an upstream holds its
+own address until the TTL, and a list is fetched again a refresh later.
 */
 @(private)
 BOOTSTRAP_MAX_ENTRIES :: 256
@@ -49,11 +58,27 @@ bootstrap_cache: struct {
 }
 
 /*
+How long a bootstrap answer is held: its record's TTL (RFC 1035 section 3.2.1),
+read as RFC 2181 section 8 asks (`dns.sane_ttl`), within `BOOTSTRAP_MIN_TTL` and
+`BOOTSTRAP_TTL`.
+*/
+@(private)
+bootstrap_ttl :: proc(ttl: u32) -> time.Duration {
+	return clamp(time.Duration(dns.sane_ttl(ttl)) * time.Second, BOOTSTRAP_MIN_TTL, BOOTSTRAP_TTL)
+}
+
+/*
 Resolve `hostname` using `servers` (plain "IP" or "IP:port" strings).
 
-A and AAAA are tried in that order; the first usable address wins. `Not_Resolved`
-where no server gave one, and `Out_Of_Memory` where this server could not build
-a query or read an answer, which says nothing about the bootstrap servers.
+A and AAAA are tried in that order; the first usable address wins. A refresh
+passes the address it holds as `keep`: its family is asked for first, and the
+other only when the name has none of it any more, so one failed lookup does not
+move a member to the other family; while the answer still gives `keep`, it is
+the address returned. `ttl` is how much longer the address may
+be used (`bootstrap_ttl`), zero for an IP literal, which never needs asking
+again. `Not_Resolved` where no server gave one, and
+`Out_Of_Memory` where this server could not build a query or read an answer,
+which says nothing about the bootstrap servers.
 */
 @(private)
 bootstrap_resolve :: proc(
@@ -67,31 +92,35 @@ bootstrap_resolve :: proc(
 	Zero, as at startup and for list downloads, is no deadline.
 	*/
 	deadline := time.Tick{},
+	keep: net.Address = nil,
 ) -> (
 	addr: net.Address,
+	ttl: time.Duration,
 	err: Error,
 ) {
 	if literal := netx.parse_address(hostname); literal != nil {
-		return literal, .None
+		return literal, 0, .None
 	}
 
 	// Keyed by the canonical name, which is the name asked: `Hop.example` and
 	// `hop.example.` are one entry, not two of `BOOTSTRAP_MAX_ENTRIES`.
 	key, canonical := dns.name_canonical(hostname, context.temp_allocator)
 	if !canonical {
-		return nil, .Out_Of_Memory
+		return nil, 0, .Out_Of_Memory
 	}
 	sync.mutex_lock(&bootstrap_cache.mu)
-	if entry, found := bootstrap_cache.entries[key]; found {
-		if loop.moment_since(entry.expires) < 0 {
+	// An entry that gives another address than `keep` may be one of several
+	// the name has; the bootstrap servers say whether `keep` is still one.
+	if entry, found := bootstrap_cache.entries[key]; found && (keep == nil || netx.addresses_equal(entry.address, keep)) {
+		if left := -loop.moment_since(entry.expires); left > 0 {
 			sync.mutex_unlock(&bootstrap_cache.mu)
-			return entry.address, .None
+			return entry.address, max(left, BOOTSTRAP_MIN_TTL), .None
 		}
 	}
 	sync.mutex_unlock(&bootstrap_cache.mu)
 
 	if len(servers) == 0 {
-		return nil, .Not_Resolved
+		return nil, 0, .Not_Resolved
 	}
 
 	for server, i in servers {
@@ -108,11 +137,22 @@ bootstrap_resolve :: proc(
 			now := loop.tick_now()
 			left := time.tick_diff(now, deadline)
 			if left <= 0 {
-				return nil, .Not_Resolved
+				return nil, 0, .Not_Resolved
 			}
 			share_end = time.tick_add(now, left / time.Duration(len(servers) - i))
 		}
-		for qtype in ([]dns.Type{.A, .AAAA}) {
+		// A refresh asks the family it holds first, and the other only when
+		// the name has none of that one any more (`empty`): a failure to answer
+		// is not a reason to change family.
+		qtypes := []dns.Type{.A, .AAAA}
+		if _, v6 := keep.(net.IP6_Address); v6 {
+			qtypes = []dns.Type{.AAAA, .A}
+		}
+		gone := true
+		for qtype, q in qtypes {
+			if keep != nil && q > 0 && !gone {
+				break
+			}
 			// Handed down as a deadline, not as what is left of it: one worked
 			// out again inside the query would run past the share by the time
 			// between the two readings of the clock.
@@ -126,16 +166,17 @@ bootstrap_resolve :: proc(
 					query_end = share_end
 				}
 			}
-			result, qerr := bootstrap_query(server, hostname, qtype, query_end)
+			result, held, empty, qerr := bootstrap_query(server, hostname, qtype, query_end, keep)
 			if qerr == .Out_Of_Memory {
-				return nil, qerr
+				return nil, 0, qerr
 			}
 			if qerr != .None {
+				gone = empty
 				continue
 			}
 			entry := Bootstrap_Entry {
 				address = result,
-				expires = loop.moment_add(loop.moment_now(), BOOTSTRAP_TTL),
+				expires = loop.moment_add(loop.moment_now(), held),
 			}
 			sync.mutex_lock(&bootstrap_cache.mu)
 			if bootstrap_cache.entries == nil {
@@ -149,7 +190,7 @@ bootstrap_resolve :: proc(
 			} else {
 				/*
 				A new key sweeps out the expired ones first, so the map holds
-				only what was resolved within the last `BOOTSTRAP_TTL` (#530).
+				only what is still within its TTL (#530).
 				The hostnames are not only the configured upstreams': every
 				redirect a blocklist download follows is resolved here, under
 				names the list host picks.
@@ -160,10 +201,10 @@ bootstrap_resolve :: proc(
 				}
 			}
 			sync.mutex_unlock(&bootstrap_cache.mu)
-			return result, .None
+			return result, held, .None
 		}
 	}
-	return nil, .Not_Resolved
+	return nil, 0, .Not_Resolved
 }
 
 /*
@@ -216,7 +257,7 @@ bootstrap_prune :: proc() {
 @(private)
 resolve_address :: proc(host: string, bootstrap: []string) -> (addr: net.Address, ok: bool) {
 	// An IP literal is returned as it stands, by `bootstrap_resolve` first.
-	if resolved, err := bootstrap_resolve(bootstrap, host); err == .None {
+	if resolved, _, err := bootstrap_resolve(bootstrap, host); err == .None {
 		return resolved, true
 	}
 	// Nothing configured to bootstrap with, or nothing the bootstrap servers
@@ -242,14 +283,22 @@ bootstrap_query :: proc(
 	qtype: dns.Type,
 	// When the query gives up, sent or not.
 	deadline: time.Tick,
+	// Returned in preference to the first listed while the answer still gives it.
+	keep: net.Address = nil,
 ) -> (
 	addr: net.Address,
+	// How long the address may be held (`bootstrap_ttl`).
+	ttl: time.Duration,
+	// With `Not_Resolved`: the server answered, NOERROR, with no address of
+	// the type asked, so the name has none of that family, rather than the
+	// server failing to say.
+	empty: bool,
 	err: Error,
 ) {
 	endpoint, parsed := netx.parse_endpoint(server)
 	if !parsed {
 		logx.warnf("bootstrap resolver %q is not an IP address", server)
-		return nil, .Not_Resolved
+		return nil, 0, false, .Not_Resolved
 	}
 	if endpoint.port == 0 {
 		endpoint.port = 53
@@ -257,13 +306,13 @@ bootstrap_query :: proc(
 
 	name, canonical := dns.name_canonical(hostname, context.temp_allocator)
 	if !canonical {
-		return nil, .Out_Of_Memory
+		return nil, 0, false, .Out_Of_Memory
 	}
 	query := dns.Message {
 		// From the entropy source rather than from the clock: the low bits of a
 		// timestamp carry only as much unpredictability as the platform's clock
 		// resolution puts there, and what this query's answer decides - the
-		// address every later query to this upstream is sent to, cached for
+		// address every later query to this upstream is sent to, up to
 		// BOOTSTRAP_TTL - is worth more than that.
 		id       = dns.random_id(),
 		question = []dns.Question{{name = name, type = qtype, class = .IN}},
@@ -272,32 +321,32 @@ bootstrap_query :: proc(
 
 	wire, _, enc_err := dns.encode_message(query, context.temp_allocator)
 	if enc_err == .Out_Of_Memory {
-		return nil, .Out_Of_Memory
+		return nil, 0, false, .Out_Of_Memory
 	}
 	if enc_err != .None {
-		return nil, .Not_Resolved
+		return nil, 0, false, .Not_Resolved
 	}
 	// Taken before the query is sent, as `exchange_udp` takes its own.
 	buf, built := dns.alloc_slice([]u8, 4096, context.temp_allocator)
 	if !built {
-		return nil, .Out_Of_Memory
+		return nil, 0, false, .Out_Of_Memory
 	}
 
 	socket, opened := open_udp(endpoint)
 	if !opened {
-		return nil, .Not_Resolved
+		return nil, 0, false, .Not_Resolved
 	}
 	defer net.close(socket)
 
 	if _, send_err := udp_send_until(socket, wire, deadline); send_err != nil {
-		return nil, .Not_Resolved
+		return nil, 0, false, .Not_Resolved
 	}
 
 	/*
 	Same checks the main exchange path applies in `exchange_udp`: the datagram
 	has to come from the server that was asked and answer the question that was
 	sent. The ID on its own is 16 bits an off-path attacker can guess inside the
-	receive window, and what it would land in is cached for BOOTSTRAP_TTL and
+	receive window, and what it would land in is cached for up to BOOTSTRAP_TTL and
 	consulted for blocklist hosts as well as upstream addresses.
 
 	A datagram that fails them is dropped and the wait resumes, so a forgery
@@ -318,7 +367,7 @@ bootstrap_query :: proc(
 		server's share of the timeout.
 		*/
 		if recv_err == .Would_Block {
-			return nil, .Not_Resolved
+			return nil, 0, false, .Not_Resolved
 		}
 		if recv_err != nil {
 			continue
@@ -335,22 +384,90 @@ bootstrap_query :: proc(
 
 		msg, dec_err := dns.decode_message(buf[:n], context.temp_allocator)
 		if dec_err == .Out_Of_Memory {
-			return nil, .Out_Of_Memory
+			return nil, 0, false, .Out_Of_Memory
 		}
 		if dec_err != .None {
-			return nil, .Not_Resolved
+			return nil, 0, false, .Not_Resolved
 		}
-		for rec in msg.answer {
-			#partial switch d in rec.data {
+		/*
+		`keep` while the answer gives it, so a server that rotates the order
+		of an RRset, or gives a different part of it each time, does not look
+		like a move on every refresh; else the first address of the type asked,
+		so instances spread over the RRset as the server orders it. Owned by
+		the name asked or by a CNAME followed from it; a record off that chain
+		is not about this name. Held for the shortest TTL on the chain: it is
+		only as good as its first record to expire.
+		*/
+		first: []u8
+		shortest := dns.TTL_MAX
+		kept := false
+		keep_raw, keep_len := address_raw(keep)
+		// The chain first, in whatever order its CNAMEs came, one hop per
+		// record at most so a loop ends.
+		owner := name
+		// What would make an answer with no address on the chain less than
+		// "the name has none of this type": a CNAME left unfollowed, or an
+		// address of the type under some other owner.
+		unsure := false
+		for _ in msg.answer {
+			next, found := "", false
+			for &rec in msg.answer {
+				if d, is_name := rec.data.(dns.Rdata_Name); is_name && rec.type == .CNAME && dns.name_equal_fold(rec.name, owner) {
+					next, found = d.name, true
+					shortest = min(shortest, dns.sane_ttl(rec.ttl))
+					break
+				}
+			}
+			if !found {
+				break
+			}
+			owner = next
+		}
+		for &rec in msg.answer {
+			if rec.type == .CNAME && dns.name_equal_fold(rec.name, owner) {
+				unsure = true
+			}
+			if !dns.name_equal_fold(rec.name, owner) {
+				if (rec.type == .A && qtype == .A) || (rec.type == .AAAA && qtype == .AAAA) {
+					unsure = true
+				}
+				continue
+			}
+			raw: []u8
+			#partial switch &d in rec.data {
 			case dns.Rdata_A:
-				return net.IP4_Address(d.addr), .None
+				if qtype == .A {
+					raw = d.addr[:]
+				}
 			case dns.Rdata_AAAA:
-				return netx.ip6_from_bytes(d.addr), .None
+				if qtype == .AAAA {
+					raw = d.addr[:]
+				}
+			}
+			if raw == nil {
+				continue
+			}
+			shortest = min(shortest, dns.sane_ttl(rec.ttl))
+			if len(raw) == keep_len && mem.compare(raw, keep_raw[:keep_len]) == 0 {
+				kept = true
+			}
+			if first == nil {
+				first = raw
 			}
 		}
-		return nil, .Not_Resolved
+		if kept {
+			return keep, bootstrap_ttl(shortest), false, .None
+		}
+		switch len(first) {
+		case 4:
+			return net.IP4_Address{first[0], first[1], first[2], first[3]}, bootstrap_ttl(shortest), false, .None
+		case 16:
+			return netx.ip6_from_bytes((^[16]u8)(raw_data(first))^), bootstrap_ttl(shortest), false, .None
+		}
+		// A truncated reply says nothing about what the name lacks.
+		return nil, 0, dns.rcode_of(msg) == .No_Error && !msg.flags.tc && !unsure, .Not_Resolved
 	}
-	return nil, .Not_Resolved
+	return nil, 0, false, .Not_Resolved
 }
 
 /*
@@ -383,4 +500,17 @@ split_http_url :: proc(url: string) -> (scheme, host, path: string, port: int, h
 		resolved_port = 443 if s == "https" else 80
 	}
 	return s, h, netx.origin_form(p), resolved_port, name, true
+}
+
+// An address's bytes in network order, and how many there are; none for nil.
+@(private)
+address_raw :: proc(a: net.Address) -> (raw: [16]u8, n: int) {
+	switch v in a {
+	case net.IP4_Address:
+		raw[0], raw[1], raw[2], raw[3] = v[0], v[1], v[2], v[3]
+		return raw, 4
+	case net.IP6_Address:
+		return transmute([16]u8)v, 16
+	}
+	return raw, 0
 }

@@ -64,6 +64,48 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 		}
 	}
 
+	// --- A server that starts to offer h2 is asked over h2 ---
+	{
+		upstream_port := next_port(r)
+		old := doh2_mock_make(upstream_port, "/dns-query", payload)
+		started := doh2_mock_start(old, r.cert_file, r.key_file, {"http/1.1"})
+		if !started {
+			doh2_mock_stop(old)
+			skip_case(r, "upstream: doh protocol relearned", "cannot start the mock")
+		} else {
+			udp_port := next_port(r)
+			config := base_config(udp_port, fmt.tprintf("[%s]", doh_upstream("relearn", upstream_port)), timeout = "5s")
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+			if !ok {
+				doh2_mock_stop(old)
+			} else {
+				start_case(r, "upstream: a DoH server that starts to choose h2 is asked over h2, not sent HTTP/1.1")
+				{
+					_, _, first := ask(r, udp_port, fix.qname, fix.qtype)
+					h2_before, h1_hits := doh2_mock_counts(old)
+					check(r, first && h1_hits >= 1, "the premise: the http/1.1-only server was asked over http/1.1")
+					check_eq_int(r, h2_before, 0, "the premise: the http/1.1-only server was asked over h2")
+					// The same address, now preferring h2: what a move to another
+					// server, or the server's own upgrade, looks like here.
+					doh2_mock_stop(old)
+					next := doh2_mock_make(upstream_port, "/dns-query", payload)
+					defer doh2_mock_stop(next)
+					if check(r, doh2_mock_start(next, r.cert_file, r.key_file), "cannot restart the mock with h2") {
+						res := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = 0x6915))
+						if check(r, res.ok, "no response once the server chose h2") {
+							check_eq_int(r, parse_header(r, res.wire).rcode, int(dns.Rcode.No_Error), "rcode once the server chose h2")
+						}
+						h2_hits, h1_after := doh2_mock_counts(next)
+						check(r, h2_hits >= 1, "the server that chose h2 was not asked over h2")
+						check_eq_int(r, h1_after, 0, "the server that chose h2 was sent HTTP/1.1")
+					}
+				}
+				end_case(r)
+				stop_server(&srv)
+			}
+		}
+	}
+
 	// --- ALPN falls back to http/1.1 against a resolver that lacks h2 ---
 	{
 		upstream_port := next_port(r)

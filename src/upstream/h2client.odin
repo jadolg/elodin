@@ -64,8 +64,8 @@ handshake it would otherwise have to throw away and repeat.
 */
 @(private)
 negotiate_https :: proc(u: ^Upstream, timeout: time.Duration) -> (stream: Stream, proto: Protocol, err: Error) {
-	endpoint := endpoint_of(u) or_return
-	stream, err = open_stream(endpoint, u.tls_ctx, u.spec.hostname, timeout, u)
+	endpoint, epoch := endpoint_of(u) or_return
+	stream, err = open_stream(endpoint, u.tls_ctx, u.spec.hostname, timeout, u, epoch = epoch)
 	if err != .None {
 		return {}, .Unknown, err
 	}
@@ -109,7 +109,7 @@ get_h2_conn :: proc(
 			sync.mutex_unlock(&u.mu)
 			return nil, false, .None
 		}
-		if u.h2 != nil && !h2.client_closed(u.h2.client) {
+		if u.h2 != nil && !h2.client_closed(u.h2.client) && dialled_current_locked(u, u.h2.stream) {
 			conn = u.h2.client
 			h2.client_ref(conn)
 			sync.mutex_unlock(&u.mu)
@@ -134,6 +134,18 @@ get_h2_conn :: proc(
 	u.connecting = true
 	stale := u.h2
 	u.h2 = nil
+	// One from before a move, still carrying streams: left to finish them.
+	if stale != nil && !h2.client_closed(stale.client) && !dialled_current_locked(u, stale.stream) {
+		if _, busy := h2.client_idle_for(stale.client); busy {
+			if u.h2_draining == nil {
+				u.h2_draining = make([dynamic]^H2_Conn, u.allocator)
+			}
+			// With no room it is retired, as it was before moves were let finish.
+			if _, aerr := append(&u.h2_draining, stale); aerr == nil {
+				stale = nil
+			}
+		}
+	}
 	sync.mutex_unlock(&u.mu)
 
 	// Handed to its reader rather than joined here (#454): the reader only
@@ -184,7 +196,11 @@ get_h2_conn :: proc(
 		sync.mutex_unlock(&u.mu)
 		return nil, false, derr
 	}
-	u.proto = proto
+	// Not from a dial that started before a move: that was the old
+	// address's choice, and the new one is to be asked.
+	if stream.epoch == u.epoch {
+		u.proto = proto
+	}
 	if proto != .H2 {
 		loop.cond_broadcast(&u.conn_cond)
 		sync.mutex_unlock(&u.mu)
@@ -350,12 +366,16 @@ release_h2_conn :: proc(hc: ^H2_Conn) {
 @(private)
 teardown_h2 :: proc(u: ^Upstream) {
 	sync.mutex_lock(&u.mu)
-	hc := u.h2
-	u.h2 = nil
+	hc, draining := u.h2, u.h2_draining
+	u.h2, u.h2_draining = nil, nil
 	sync.mutex_unlock(&u.mu)
 	if hc != nil {
 		retire_h2_conn(hc)
 	}
+	for d in draining {
+		retire_h2_conn(d)
+	}
+	delete(draining)
 	sync.mutex_lock(&u.mu)
 	for u.h2_readers > 0 {
 		loop.cond_wait(&u.h2_readers_done, &u.mu)

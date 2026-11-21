@@ -3,6 +3,7 @@ package upstream
 import "core:fmt"
 import "core:mem"
 import "core:net"
+import "core:sync"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
@@ -97,7 +98,14 @@ exchange_doh_h2 :: proc(
 			return nil, .Timeout
 		}
 		if !is_h2 {
-			return exchange_doh_h1(u, query, body, deadline, allocator)
+			resp, herr := exchange_doh_h1(u, query, body, deadline, allocator)
+			sync.mutex_lock(&u.mu)
+			renegotiate := herr == .Peer_Closed && u.proto == .Unknown
+			sync.mutex_unlock(&u.mu)
+			if renegotiate && attempt == 0 {
+				continue
+			}
+			return resp, herr
 		}
 
 		resp, herr := h2.client_request(
@@ -193,7 +201,7 @@ exchange_doh_h1 :: proc(
 	A `Tick` rather than a `Time`, because it is a bound on waiting rather than
 	a moment anyone reads off a clock, and the wall clock steps.
 	*/
-	endpoint := endpoint_of(u) or_return
+	endpoint, epoch := endpoint_of(u) or_return
 
 	// Pooled connection first, then a fresh one; see exchange_pipelined for why a
 	// dead pooled connection must not count as an upstream failure.
@@ -214,11 +222,24 @@ exchange_doh_h1 :: proc(
 			// had; `http_exchange` replaces them with this query's deadline
 			// before every write and read.
 		} else {
-			s, oerr := open_stream(endpoint, u.tls_ctx, u.spec.hostname, remaining, u)
+			s, oerr := open_stream(endpoint, u.tls_ctx, u.spec.hostname, remaining, u, epoch = epoch)
 			if oerr != .None {
 				return nil, oerr
 			}
 			stream = s
+			/*
+			A server that now picks h2 - another address after a move, or the
+			same one changed - would read HTTP/1.1 as a broken h2 preface. The
+			protocol is to be learned again; `exchange_doh` asks once more
+			through `get_h2_conn`.
+			*/
+			if stream.tls != nil && tlsx.alpn_protocol(stream.tls) == "h2" {
+				stream_close(&stream)
+				sync.mutex_lock(&u.mu)
+				u.proto = .Unknown
+				sync.mutex_unlock(&u.mu)
+				return nil, .Peer_Closed
+			}
 		}
 
 		resp, herr := http_exchange(
