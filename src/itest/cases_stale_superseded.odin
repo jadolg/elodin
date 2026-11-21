@@ -5,6 +5,10 @@ import "core:time"
 import "elodin:dns"
 
 /*
+Two cases on the expired copy `serve_stale` keeps: a late TTL-0 refresh that
+supersedes it (issue #419, below), and an RD=0 query that is refused rather than
+served it (issue #699, `run_stale_rd_cases`).
+
 Issue #419: an answer the cache will not keep still supersedes the expired copy.
 
 The upstream answers a refresh with TTL 0 - the zone saying "do not cache this"
@@ -108,10 +112,12 @@ run_stale_rd_cases :: proc(r: ^Runner) {
 	qname := "rd-stale.example."
 	upstream_port := next_port(r)
 	udp_port := next_port(r)
+	metrics_port := next_port(r)
 	config := base_config(
 		udp_port,
 		upstream_at(upstream_port),
 		cache = "{ enabled: true, max_entries: 100, max_ttl: 1, serve_stale: true, stale_timeout: 300ms }",
+		extra = fmt.tprintf(`metrics: {{ enabled: true, address: "127.0.0.1", port: %d }}`, metrics_port),
 	)
 	mock := mock_make("stale-rd", upstream_port)
 	mock_synth_all(mock, {203, 0, 113, 51})
@@ -134,6 +140,11 @@ run_stale_rd_cases :: proc(r: ^Runner) {
 	}
 	// Past `max_ttl`, which is what the entry was stored under.
 	time.sleep(1500 * time.Millisecond) // lint:allow the event awaited is the entry's expiry, which only the clock brings
+	// The premise: the expired copy is still held, so a refusal is not a plain miss.
+	held := superseded_entries(metrics_port)
+	if !check(r, held >= 1, "elodin_cache_entries read %d, so the expired copy is gone", held) {
+		return
+	}
 
 	before := mock_total(mock)
 	norec := build_query(qname, u16(dns.Type.A), id = 52)

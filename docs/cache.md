@@ -150,3 +150,6 @@ got:
   have failed.
 - An upstream that answers, SERVFAIL included, has answered: the client gets that
   reply. `serve_stale` covers an unreachable upstream, not a refusal.
+- A query with RD clear is never answered from an expired copy: it makes no
+  refresh for that copy to stand in for, and gets REFUSED as a miss does (RFC
+  8767 section 5).
