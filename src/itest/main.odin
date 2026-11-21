@@ -366,6 +366,7 @@ main :: proc() {
 	section(&r, "dns cookies")
 	run_cookie_cases(&r)
 	run_upstream_cookie_cases(&r)
+	section(&r, "bootstrap")
 	run_bootstrap_cases(&r)
 
 	section(&r, "metrics")

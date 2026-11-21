@@ -461,8 +461,10 @@ resolve_endpoint :: proc(
 		}
 		forget_cookie(u)
 		init_cookie(u)
-		// What ALPN chose was the old address's choice.
+		// What ALPN chose, and when idle connections were found hung up on,
+		// were the old address's.
 		u.proto = .Unknown
+		u.idle_died, u.idle_learned = 0, 0
 	}
 	u.endpoint = endpoint
 	sync.atomic_store(&u.expires, 0 if ttl == 0 else loop.moment_add(loop.moment_now(), ttl))
@@ -1183,19 +1185,18 @@ close_idle :: proc(u: ^Upstream, all := false) -> (closed: int) {
 	resize(&u.idle, kept)
 
 	stale_h2 := take_idle_h2_locked(u, all)
-	// Reserved whole, as `stale` is: with no room each is retired under the lock.
+	// Reserved whole; with no room, all are left for the next sweep rather
+	// than retired under the lock, which a TLS close_notify would park on.
 	drained, drained_listed := dns.alloc_list([dynamic]^H2_Conn, len(u.h2_draining), context.temp_allocator)
 	#reverse for hc, i in u.h2_draining {
+		if !drained_listed {
+			break
+		}
 		if _, busy := h2.client_idle_for(hc.client); busy && !h2.client_closed(hc.client) {
 			continue
 		}
 		unordered_remove(&u.h2_draining, i)
-		if drained_listed {
-			append(&drained, hc)
-		} else {
-			retire_h2_conn(hc)
-			closed += 1
-		}
+		append(&drained, hc)
 	}
 	sync.mutex_unlock(&u.mu)
 	for hc in drained {

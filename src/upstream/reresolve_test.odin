@@ -39,6 +39,8 @@ Ttl_Mock :: struct {
 	servfail_a: bool,
 	// A is answered NOERROR, empty and truncated: no answer either.
 	truncated_a: bool,
+	// A is answered with the CNAME alone, its target not followed.
+	cname_only: bool,
 }
 
 @(private = "file")
@@ -57,7 +59,7 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 		sync.mutex_lock(&m.mu)
 		m.asked += 1
 		silent, addr, ttl, delay, also, cname, stray, cname_last, turn := m.silent, m.addr, m.ttl, m.delay, m.also, m.cname, m.stray, m.cname_last, m.asked % 2 == 0
-		addr6, no_a, servfail_a, truncated_a := m.addr6, m.no_a, m.servfail_a, m.truncated_a
+		addr6, no_a, servfail_a, truncated_a, cname_only := m.addr6, m.no_a, m.servfail_a, m.truncated_a, m.cname_only
 		sync.mutex_unlock(&m.mu)
 		if silent {
 			continue
@@ -75,7 +77,12 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 		if q.type == .A && truncated_a {
 			resp.flags.tc = true
 		}
-		if q.type == .A && !no_a && !servfail_a && !truncated_a {
+		if q.type == .A && cname_only {
+			answer := make([]dns.Record, 1, context.temp_allocator)
+			answer[0] = dns.Record{name = q.name, type = .CNAME, class = .IN, ttl = ttl, data = dns.Rdata_Name{name = "unfollowed.invalid."}}
+			resp.answer = answer
+		}
+		if q.type == .A && !no_a && !servfail_a && !truncated_a && !cname_only {
 			answer := make([dynamic]dns.Record, context.temp_allocator)
 			if stray != {} {
 				append(&answer, dns.Record{name = "stray.invalid.", type = .A, class = .IN, ttl = 1, data = dns.Rdata_A{addr = stray}})
@@ -246,6 +253,7 @@ test_an_upstream_hostname_is_asked_again_once_its_ttl_is_past :: proc(t: ^testin
 		u.cookie.server_len = 8
 		client := u.cookie.client
 		u.proto = .H1
+		u.idle_died = 5 * time.Second
 		sync.mutex_unlock(&u.mu)
 		ttl_mock_set(&m, {127, 0, 0, 5} if moved else {127, 0, 0, 3})
 		expire_address(u, HOST + ".")
@@ -258,7 +266,7 @@ test_an_upstream_hostname_is_asked_again_once_its_ttl_is_past :: proc(t: ^testin
 		// address, so a move starts afresh.
 		sync.mutex_lock(&u.mu)
 		forgot, redrawn := u.cookie.server_len == 0, u.cookie.client != client
-		relearn := u.proto == .Unknown
+		relearn := u.proto == .Unknown && (u.idle_died == 0) == moved
 		sync.mutex_unlock(&u.mu)
 		testing.expectf(t, relearn == moved, "moved %v: the protocol is to be learned again %v", moved, relearn)
 		testing.expectf(t, forgot == moved && redrawn == moved, "moved %v: server cookie forgotten %v, client cookie drawn afresh %v", moved, forgot, redrawn)
@@ -693,7 +701,12 @@ test_a_refresh_keeps_to_the_family_it_holds :: proc(t: ^testing.T) {
 	_, _, truncated_err := bootstrap_resolve(servers, "truncated.invalid", deadline, net.IP4_Address{127, 0, 0, 1})
 	testing.expectf(t, truncated_err == .Not_Resolved, "a truncated empty A answer moved the refresh to AAAA (%v)", truncated_err)
 	sync.mutex_lock(&m.mu)
-	m.truncated_a, m.no_a = false, true
+	m.truncated_a, m.cname_only = false, true
+	sync.mutex_unlock(&m.mu)
+	_, _, cname_err := bootstrap_resolve(servers, "unfollowed.invalid", deadline, net.IP4_Address{127, 0, 0, 1})
+	testing.expectf(t, cname_err == .Not_Resolved, "an A answer with its CNAME unfollowed moved the refresh to AAAA (%v)", cname_err)
+	sync.mutex_lock(&m.mu)
+	m.cname_only, m.no_a = false, true
 	sync.mutex_unlock(&m.mu)
 	gone_addr, _, gone_err := bootstrap_resolve(servers, "gone.invalid", deadline, net.IP4_Address{127, 0, 0, 1})
 	_, gone_v6 := gone_addr.(net.IP6_Address)

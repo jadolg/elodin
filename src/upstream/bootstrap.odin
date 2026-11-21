@@ -405,6 +405,10 @@ bootstrap_query :: proc(
 		// The chain first, in whatever order its CNAMEs came, one hop per
 		// record at most so a loop ends.
 		owner := name
+		// What would make an answer with no address on the chain less than
+		// "the name has none of this type": a CNAME left unfollowed, or an
+		// address of the type under some other owner.
+		unsure := false
 		for _ in msg.answer {
 			next, found := "", false
 			for &rec in msg.answer {
@@ -420,7 +424,13 @@ bootstrap_query :: proc(
 			owner = next
 		}
 		for &rec in msg.answer {
+			if rec.type == .CNAME && dns.name_equal_fold(rec.name, owner) {
+				unsure = true
+			}
 			if !dns.name_equal_fold(rec.name, owner) {
+				if (rec.type == .A && qtype == .A) || (rec.type == .AAAA && qtype == .AAAA) {
+					unsure = true
+				}
 				continue
 			}
 			raw: []u8
@@ -455,7 +465,7 @@ bootstrap_query :: proc(
 			return netx.ip6_from_bytes((^[16]u8)(raw_data(first))^), bootstrap_ttl(shortest), false, .None
 		}
 		// A truncated reply says nothing about what the name lacks.
-		return nil, 0, dns.rcode_of(msg) == .No_Error && !msg.flags.tc, .Not_Resolved
+		return nil, 0, dns.rcode_of(msg) == .No_Error && !msg.flags.tc && !unsure, .Not_Resolved
 	}
 	return nil, 0, false, .Not_Resolved
 }
