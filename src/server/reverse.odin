@@ -165,6 +165,8 @@ apply_reverse_rewrite :: proc(
 	}
 
 	resp := dns.make_response(query, .No_Error, allocator)
+	// Inside a zone this server serves itself (RFC 6303 section 3: AA=1).
+	resp.flags.aa = true
 	resp.answer = answers[:]
 	soa: [1]dns.Record
 	if len(answers) == 0 {
@@ -179,7 +181,7 @@ apply_reverse_rewrite :: proc(
 		name's parent, `1.168.192.in-addr.arpa.` being a zone nobody was ever
 		authoritative for.
 		*/
-		soa[0] = synth_soa(q.name, ttl, zone)
+		soa[0] = local_zone_soa(zone, ttl)
 		resp.authority = soa[:]
 	}
 

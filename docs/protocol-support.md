@@ -14,7 +14,8 @@ validation on, an answer for a client that did not ask for DNSSEC records is
 rebuilt without them; every other answer goes back as the upstream sent it, bar the OPT
 record this server answers with, from the cache, TTLs counted down, and the header
 flags that describe this server rather than the data: AA and the reserved Z bit
-are cleared, RA is set, and RD and CD are the client's own (RFC 1035 section
+are cleared (AA is set only on answers from the zones elodin serves itself, see
+[reserved names](reserved-names.md)), RA is set, and RD and CD are the client's own (RFC 1035 section
 4.1.1, RFC 4035 section 3.2.2). The AD bit is covered under [DNSSEC](dnssec.md).
 
 A message with the QR bit set is a response (RFC 1035 section 4.1.1), and one

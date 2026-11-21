@@ -132,3 +132,56 @@ test_a_blocklist_entry_over_arpa_beats_the_ddr_answer :: proc(t: ^testing.T) {
 
 	free_all(context.temp_allocator)
 }
+
+/*
+`resolver.arpa` is a locally served zone per RFC 6303 (RFC 9462 section 6.4): its
+apex answers SOA and NS in the answer section, every other question in the zone
+is NODATA with the zone's SOA, and every answer is authoritative (AA=1).
+*/
+@(test)
+test_resolver_arpa_is_an_rfc_6303_zone :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := local_server(&cfg)
+
+	Ask :: struct {
+		name:   string,
+		type:   dns.Type,
+		answer: dns.Type,
+	}
+	ASKS := []Ask {
+		{name = "resolver.arpa.", type = .SOA, answer = .SOA},
+		{name = "RESOLVER.arpa.", type = .NS, answer = .NS},
+		{name = "resolver.arpa.", type = .A},
+		{name = "x.resolver.arpa.", type = .SOA},
+		{name = "_dns.resolver.arpa.", type = .SVCB},
+	}
+	for a in ASKS {
+		out, outcome, ok := handle_query(&s, test_query(a.name, a.type), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		if !testing.expectf(t, ok && outcome == .Local, "%s %v was not answered locally", a.name, a.type) {
+			continue
+		}
+		m, derr := dns.decode_message(out, context.temp_allocator)
+		if !testing.expectf(t, derr == .None, "%s %v: the answer does not decode: %v", a.name, a.type, derr) {
+			continue
+		}
+		testing.expectf(t, m.flags.aa, "%s %v: AA clear", a.name, a.type)
+		testing.expectf(t, dns.rcode_of(m) == .No_Error, "%s %v: rcode %v", a.name, a.type, dns.rcode_of(m))
+		if a.answer == dns.Type(0) {
+			testing.expectf(t, len(m.answer) == 0, "%s %v: %d answers, want NODATA", a.name, a.type, len(m.answer))
+			if testing.expectf(t, len(m.authority) == 1, "%s %v: no SOA in authority", a.name, a.type) {
+				expect_local_zone_soa(t, m.authority[0], RESOLVER_ARPA)
+			}
+			continue
+		}
+		if !testing.expectf(t, len(m.answer) == 1, "%s %v: %d answers, want the apex record", a.name, a.type, len(m.answer)) {
+			continue
+		}
+		testing.expectf(t, m.answer[0].type == a.answer, "%s %v: answered %v", a.name, a.type, m.answer[0].type)
+		testing.expectf(t, len(m.authority) == 0, "%s %v: an SOA in authority beside the answer", a.name, a.type)
+		expect_local_zone_soa(t, m.answer[0], RESOLVER_ARPA)
+		if ns, is_ns := m.answer[0].data.(dns.Rdata_Name); is_ns {
+			testing.expectf(t, dns.name_equal_fold(ns.name, RESOLVER_ARPA), "the NS names %q, want the zone", ns.name)
+		}
+	}
+	free_all(context.temp_allocator)
+}

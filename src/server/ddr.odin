@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "elodin:config"
@@ -145,8 +146,10 @@ is_resolver_arpa :: proc(name: string) -> bool {
 }
 
 /*
-The answer for a name in `resolver.arpa`: the designation for an SVCB question
-at `_dns.resolver.arpa` when there is one, and NODATA for everything else.
+The answer for a name in `resolver.arpa`, a locally served zone per RFC 6303
+(RFC 9462 section 6.4): the designation for an SVCB question at
+`_dns.resolver.arpa` when there is one, the zone's SOA and NS at its apex, and
+NODATA for everything else, all with AA set.
 
 The SOA names the zone itself rather than the question's parent - `synth_soa`
 would hand back `arpa.` for a query at the apex, which is not a zone this server
@@ -161,6 +164,15 @@ build_resolver_arpa_response :: proc(
 	limit: int,
 ) -> []u8 {
 	resp := dns.make_response(query, .No_Error, allocator)
+	// RFC 9462 section 6.4 makes this a locally served zone per RFC 6303, whose
+	// section 3 answers "authoritatively (AA=1)", SOA and NS at the apex.
+	resp.flags.aa = true
+	apex_buf: [2]dns.Record
+	if dns.name_equal_fold(q.name, RESOLVER_ARPA) {
+		apex := slice.into_dynamic(apex_buf[:])
+		append_apex_records(&apex, RESOLVER_ARPA, q.type, RESOLVER_ARPA_TTL)
+		resp.answer = apex[:]
+	}
 	if q.type == .SVCB && dns.name_equal_fold(q.name, DDR_QNAME) {
 		// Nothing where the designation could not be built whole: a lost record
 		// would go out as a NODATA the client caches, and lost params as a
@@ -173,7 +185,7 @@ build_resolver_arpa_response :: proc(
 	}
 	soa: [1]dns.Record
 	if len(resp.answer) == 0 {
-		soa[0] = synth_soa_for_zone(RESOLVER_ARPA, RESOLVER_ARPA_TTL)
+		soa[0] = local_zone_soa(RESOLVER_ARPA, RESOLVER_ARPA_TTL)
 		resp.authority = soa[:]
 	} else {
 		// Behind the client's OPT record rather than over it, so the encoder keeps

@@ -722,3 +722,38 @@ test_an_explicit_rule_for_a_reverse_name_outranks_the_synthesis :: proc(t: ^test
 
 	free_all(context.temp_allocator)
 }
+
+/*
+A PTR this server synthesises from a rewrite sits in a private reverse zone it
+serves itself, so it is answered with AA set (RFC 6303 section 3), and a type the
+name has nothing of is NODATA under that zone's SOA, with RFC 6303's names.
+*/
+@(test)
+test_a_reverse_rewrite_answers_authoritatively :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := local_server(&cfg)
+	cfg.rewrites = sample_rules()
+
+	Ask :: struct {
+		type: dns.Type,
+		ptr:  bool,
+	}
+	for a in ([]Ask{{type = .PTR, ptr = true}, {type = .TXT}}) {
+		query := test_query("50.1.168.192.in-addr.arpa.", a.type)
+		out, outcome, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+		if !testing.expectf(t, ok, "%v went unanswered", a.type) {
+			continue
+		}
+		m, derr := dns.decode_message(out, context.temp_allocator)
+		if !testing.expectf(t, derr == .None, "%v: the answer does not decode: %v", a.type, derr) {
+			continue
+		}
+		testing.expectf(t, outcome != .Forwarded, "%v was forwarded", a.type)
+		testing.expectf(t, m.flags.aa, "%v: AA clear on an answer from a zone served here", a.type)
+		testing.expectf(t, (len(m.answer) == 1) == a.ptr, "%v: %d answers", a.type, len(m.answer))
+		if !a.ptr && testing.expectf(t, len(m.authority) == 1, "%v: no SOA in authority", a.type) {
+			expect_local_zone_soa(t, m.authority[0], "168.192.in-addr.arpa.")
+		}
+	}
+	free_all(context.temp_allocator)
+}

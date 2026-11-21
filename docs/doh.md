@@ -74,7 +74,9 @@ ddr:
 - The answer has one SVCB record per enabled DoT and DoH listener, priority 1,
   target `name`, TTL 300: `alpn=dot` for DoT; `alpn=h2,http/1.1` and
   `dohpath=<listeners.doh.path>{?dns}` for DoH; `port` only when it is not 853 or
-  443. Every other question in `resolver.arpa` is NODATA.
+  443. `resolver.arpa` itself answers its SOA and NS; every other question in
+  the zone is NODATA. The zone is served as RFC 6303 describes (RFC 9462 section
+  6.4), so its answers set AA.
 - The additional section carries the A/AAAA records of the `rewrites` rule for
   `name`, if there is one. Otherwise the client looks the name up itself.
 - `name` must be a hostname, not an address, not the root and not in

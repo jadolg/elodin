@@ -183,6 +183,12 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		// The name exists, so a type it has nothing of is NODATA rather than
 		// NXDOMAIN, and there is no invented MX for a zone we do not have.
 		{name = "localhost.", type = .MX, want = .No_Data, soa = "localhost."},
+		// The apex answers its SOA and NS (RFC 6303 section 3) rather than a
+		// NODATA that carries the very SOA it denies.
+		{name = "localhost.", type = .SOA, want = .Zone_Soa},
+		{name = "localhost.", type = .NS, want = .Zone_Ns},
+		// Below the apex, NODATA as for any type the name has nothing of.
+		{name = "dev.localhost.", type = .SOA, want = .No_Data, soa = "localhost."},
 		// RFC 7686 section 2. The SOA sits at the apex of the reserved zone, not
 		// at the parent of the queried name, so a resolver downstream can cache
 		// the negative answer for the tree rather than for one hidden service.
@@ -297,6 +303,14 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		resp, derr := dns.decode_message(out, context.temp_allocator)
 		if !testing.expectf(t, derr == .None, "%s produced a response that will not decode: %v", c.name, derr) {
 			continue
+		}
+		// RFC 6303 section 3: a locally served zone answers "authoritatively (AA=1)".
+		testing.expectf(t, resp.flags.aa, "%s %v: AA clear on a locally served answer", c.name, c.type)
+		for rec in resp.answer {
+			expect_local_zone_soa(t, rec, c.name)
+		}
+		for rec in resp.authority {
+			expect_local_zone_soa(t, rec, c.soa)
 		}
 
 		switch c.want {
@@ -1149,4 +1163,19 @@ test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) 
 	)
 
 	free_all(context.temp_allocator)
+}
+
+/*
+That `rec`, where it is an SOA, has the RFC 6303 section 3 names for the zone
+`zone`: MNAME the zone itself, which has no address record, so an UPDATE client
+has nowhere to send its update, and RNAME `nobody.invalid.`.
+*/
+@(private)
+expect_local_zone_soa :: proc(t: ^testing.T, rec: dns.Record, zone: string, loc := #caller_location) {
+	soa, is_soa := rec.data.(dns.Rdata_SOA)
+	if !is_soa {
+		return
+	}
+	testing.expectf(t, dns.name_equal_fold(soa.ns, zone), "the SOA for %s names %q as MNAME, want the zone", zone, soa.ns, loc = loc)
+	testing.expectf(t, dns.name_equal_fold(soa.mbox, "nobody.invalid."), "the SOA for %s names %q as RNAME, want nobody.invalid.", zone, soa.mbox, loc = loc)
 }
