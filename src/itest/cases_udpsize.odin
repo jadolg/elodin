@@ -59,6 +59,24 @@ big_txt_answer :: proc(name: string, count: int, allocator := context.allocator)
 	return encode_reply(name, .TXT, {answer = answers, additional = []dns.Record{dns.make_opt(4096, false)}}, allocator)
 }
 
+// Additional records behind the empty TXT: at about 260 bytes each, more than a
+// 512-byte answer holds.
+@(private = "file")
+EMPTY_TXT_FILLER :: 3
+
+// One TXT of RDLENGTH 0 in the answer, behind enough additional records to be
+// over 512 bytes, so a client asking without EDNS gets it cut to fit.
+@(private = "file")
+empty_txt_answer :: proc(name: string, allocator := context.allocator) -> []u8 {
+	filler := big_txt_answer("filler.example.", EMPTY_TXT_FILLER, context.temp_allocator)
+	fm, derr := dns.decode_message(filler, context.temp_allocator)
+	if derr != .None || len(fm.answer) != EMPTY_TXT_FILLER {
+		panic("the filler for the empty TXT answer did not decode")
+	}
+	answer := []dns.Record{{name = name, type = .TXT, class = .IN, ttl = 300, data = dns.Rdata_Raw{}}}
+	return encode_reply(name, .TXT, {answer = answer, additional = fm.answer}, allocator)
+}
+
 run_udp_size_cases :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("udpsize", upstream_port)
@@ -67,6 +85,9 @@ run_udp_size_cases :: proc(r: ^Runner) {
 	big := big_txt_answer("big.example.", 10, context.allocator)
 	defer delete(big)
 	mock_reply(mock, "big.example.", u16(dns.Type.TXT), big)
+	empty_txt := empty_txt_answer("empty-txt.example.", context.allocator)
+	defer delete(empty_txt)
+	mock_reply(mock, "empty-txt.example.", u16(dns.Type.TXT), empty_txt)
 	// For the last case below, which is about the query going out rather than
 	// the answer coming back and wants a small one. Registered here with the
 	// rest: `mock_synth` appends to the rule list without a lock, and the
@@ -131,6 +152,33 @@ run_udp_size_cases :: proc(r: ^Runner) {
 					check(r, len(res.wire) > 1232, "tcp answered only %d bytes; the UDP ceiling leaked", len(res.wire))
 					h := parse_header(r, res.wire)
 					check(r, !h.tc, "a tcp answer was truncated")
+				}
+			}
+			end_case(r)
+
+			/*
+			An answer cut to fit is decoded and encoded again, and RFC 3597 section
+			3 has the RDATA come back exactly: a TXT with RDLENGTH 0, which RFC 1035
+			section 3.3.14 makes malformed, is not rewritten as one empty string.
+			*/
+			start_case(r, "max_udp_response: an empty TXT RDATA comes back empty from an answer cut to fit")
+			{
+				q := build_query("empty-txt.example.", u16(dns.Type.TXT), id = 0x61)
+				res := query_udp(udp_port, q, context.temp_allocator)
+				if check(r, res.ok, "no answer came back") {
+					m, derr := dns.decode_message(res.wire, context.temp_allocator)
+					if check(r, derr == .None, "the answer does not decode: %v", derr) &&
+					   check(r, len(m.answer) == 1, "%d answers, want the TXT", len(m.answer)) {
+						// The premise: filler was dropped, so the answer was cut and re-encoded.
+						check(
+							r,
+							len(m.additional) < EMPTY_TXT_FILLER,
+							"all %d filler records came back, so the answer was not cut to fit",
+							len(m.additional),
+						)
+						raw, is_raw := m.answer[0].data.(dns.Rdata_Raw)
+						check(r, is_raw && len(raw.data) == 0, "the empty TXT came back as %v", m.answer[0].data)
+					}
 				}
 			}
 			end_case(r)

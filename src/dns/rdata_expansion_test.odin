@@ -147,13 +147,25 @@ test_a_counted_list_decodes_to_what_it_always_did :: proc(t: ^testing.T) {
 		testing.expect_value(t, len(txt.strings[2]), 255)
 	}
 
-	// An empty TXT RDATA holds no strings at all.
-	empty := one_record_message(.TXT, {})
-	defer delete(empty)
-	em, eerr := decode_message(empty, a)
-	testing.expect_value(t, eerr, Decode_Error.None)
-	if etxt, ok := em.answer[0].data.(Rdata_TXT); testing.expect(t, ok, "expected a TXT record") {
-		testing.expect_value(t, len(etxt.strings), 0)
+	/*
+	An empty TXT or SPF RDATA is malformed - RFC 1035 section 3.3.14 asks for
+	"One or more <character-string>s" - so it is kept as raw bytes, which encode
+	back to RDLENGTH 0 as RFC 3597 section 3 has a server preserve them. Read as
+	a list of no strings, it would encode as one empty string, RDLENGTH 1.
+	*/
+	for type in ([]Type{.TXT, .SPF}) {
+		empty := one_record_message(type, {})
+		defer delete(empty)
+		em, eerr := decode_message(empty, a)
+		if !testing.expectf(t, eerr == .None, "%v: empty RDATA did not decode: %v", type, eerr) {
+			continue
+		}
+		raw, is_raw := em.answer[0].data.(Rdata_Raw)
+		testing.expectf(t, is_raw && len(raw.data) == 0, "%v: empty RDATA read as %v", type, em.answer[0].data)
+		out, _, encerr := encode_message(em, a)
+		if testing.expectf(t, encerr == .None, "%v: did not encode again: %v", type, encerr) {
+			testing.expectf(t, string(out) == string(empty), "%v: re-encoded as %v from %v", type, out, empty)
+		}
 	}
 
 	// A well-formed OPT of two options, one of them empty.
