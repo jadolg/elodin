@@ -8,6 +8,7 @@ dnssec:
   max_connection_walks: 0 # the same, from server.max_connections
   max_cached_zones: 0     # 0 is 4096
   trust_anchors: []       # empty uses the built-in root keys
+  trust_anchor_signaling: true
 ```
 
 elodin checks the signatures on the answers it forwards:
@@ -126,6 +127,24 @@ part of RFC 5011 it reads is the REVOKE bit, which makes a revoked key unusable.
   rollover, they validate.
 - A changed `trust_anchors` takes effect on [`SIGHUP`](install.md#signals),
   with no restart.
+
+## trust_anchor_signaling
+
+On, as in Unbound. When the validator fetches the DNSKEY set of a zone it holds
+an anchor for (the root, unless you configured others), it tells that zone's
+operators which anchor keys it trusts, the data they use to pace a KSK rollover
+(RFC 8145):
+
+- the DNSKEY query carries an `edns-key-tag` option (EDNS option 14) listing the
+  anchors' key tags (section 4);
+- a Key Tag query goes to the same upstreams beside it: type NULL, for
+  `_ta-<tags>.<zone>`, each tag as four lowercase hex digits, sorted (section 5).
+  For the built-in root anchors that is `_ta-4f66-9728.`. Its answer is not
+  read, and it is sent on its own so no client waits for it. It counts in
+  `server.max_pending` like a prefetch and is skipped when that is full.
+
+Other zones' DNSKEY lookups carry neither. Set `false` to send neither for
+anchored zones either.
 
 ## max_nsec3_iterations
 

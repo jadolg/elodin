@@ -1936,12 +1936,14 @@ load_dnssec :: proc(l: ^Loader, cfg: ^Config) {
 		"max_connection_walks",
 		"max_cached_zones",
 		"trust_anchors",
+		"trust_anchor_signaling",
 	)
 	opt_bool(l, n, "enabled", &cfg.dnssec.enabled, "dnssec")
 	opt_int(l, n, "max_nsec3_iterations", &cfg.dnssec.max_nsec3_iterations, "dnssec")
 	opt_int(l, n, "max_chain_walks", &cfg.dnssec.max_chain_walks, "dnssec")
 	opt_int(l, n, "max_connection_walks", &cfg.dnssec.max_connection_walks, "dnssec")
 	opt_int(l, n, "max_cached_zones", &cfg.dnssec.max_cached_zones, "dnssec")
+	opt_bool(l, n, "trust_anchor_signaling", &cfg.dnssec.trust_anchor_signaling, "dnssec")
 
 	opt_string_list(l, n, "trust_anchors", &cfg.dnssec.trust_anchors, "dnssec", "DS records")
 }

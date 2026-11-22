@@ -2,6 +2,7 @@ package itest
 
 import "core:fmt"
 import "core:net"
+import "core:slice"
 import "core:sync"
 import "core:thread"
 import "core:time"
@@ -144,6 +145,9 @@ Mock :: struct {
 	// The most recent query as it arrived, so tests can assert on what elodin
 	// actually forwarded rather than only on what came back.
 	last_query:  []u8,
+	// The most recent query of each type, by its QTYPE, for a case that needs
+	// one that a later query of another type would have replaced.
+	last_of_type: map[u16][]u8,
 	// The most recent reply as it went out, and how many have gone out. The
 	// parity check holds elodin's answer against these bytes, so it needs them
 	// exactly as this mock wrote them - not as anything downstream re-encoded
@@ -380,7 +384,30 @@ record_query :: proc(m: ^Mock, query: []u8) {
 	}
 	m.last_query = make([]u8, len(query))
 	copy(m.last_query, query)
+	if q, derr := dns.decode_message(query, context.temp_allocator); derr == .None && len(q.question) == 1 {
+		qtype := u16(q.question[0].type)
+		if old, had := m.last_of_type[qtype]; had {
+			delete(old)
+		}
+		m.last_of_type[qtype] = slice.clone(query)
+	}
 	sync.cond_broadcast(&m.changed)
+}
+
+// A copy of the last query of `qtype` the mock received, or nil if none came.
+mock_last_query_of :: proc(m: ^Mock, qtype: u16, allocator := context.temp_allocator) -> []u8 {
+	sync.mutex_lock(&m.mu)
+	defer sync.mutex_unlock(&m.mu)
+	q, had := m.last_of_type[qtype]
+	if !had {
+		return nil
+	}
+	return slice.clone(q, allocator)
+}
+
+// Whether a query of type `qtype` has arrived, for `mock_wait_until`.
+mock_saw_type :: proc(m: ^Mock, qtype: int) -> bool {
+	return u16(qtype) in m.last_of_type
 }
 
 /*
@@ -514,6 +541,10 @@ mock_stop :: proc(m: ^Mock) {
 	if m.last_query != nil {
 		delete(m.last_query)
 	}
+	for _, q in m.last_of_type {
+		delete(q)
+	}
+	delete(m.last_of_type)
 	if m.last_reply != nil {
 		delete(m.last_reply)
 	}

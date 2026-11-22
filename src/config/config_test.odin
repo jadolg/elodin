@@ -302,6 +302,15 @@ test_defaults_applied :: proc(t: ^testing.T) {
 	// A configuration that says nothing about DNSSEC still validates.
 	testing.expect(t, cfg.dnssec.enabled, "DNSSEC validation should be on by default")
 	testing.expect_value(t, cfg.dnssec.max_nsec3_iterations, 100)
+	testing.expect(t, cfg.dnssec.trust_anchor_signaling, "RFC 8145 trust anchor signalling should be on by default")
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_trust_anchor_signaling_can_be_turned_off :: proc(t: ^testing.T) {
+	cfg, err := load_string(MINIMAL + "dnssec:\n  trust_anchor_signaling: false\n", context.temp_allocator)
+	testing.expectf(t, err == nil, "the key was refused: %v", err)
+	testing.expect(t, !cfg.dnssec.trust_anchor_signaling, "trust_anchor_signaling: false left it on")
 	free_all(context.temp_allocator)
 }
 

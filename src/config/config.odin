@@ -419,6 +419,14 @@ Dnssec_Config :: struct {
 	so a smaller number costs upstream lookups and nothing else (issue #336).
 	*/
 	max_cached_zones:     int,
+	/*
+	Whether a DNSKEY lookup for a trust anchor's zone says which anchor keys
+	this server trusts: the `edns-key-tag` option on it and a `_ta-<tags>`
+	Key Tag query beside it, which RFC 8145 sections 4.2 and 5.2 say a
+	validating resolver SHOULD send. The zone's operators read them to pace a
+	key rollover. On, as in Unbound.
+	*/
+	trust_anchor_signaling: bool,
 }
 
 /*
@@ -1279,6 +1287,7 @@ default_config :: proc() -> Config {
 		max_connection_walks = 0,
 		// Zero takes `dnssec.DEFAULT_MAX_CACHED_ZONES`; see the field.
 		max_cached_zones     = 0,
+		trust_anchor_signaling = true,
 	}
 	c.cookies = Cookie_Config {
 		enabled  = true,

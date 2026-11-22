@@ -1,6 +1,7 @@
 package dnssec
 
 import "core:encoding/hex"
+import "core:slice"
 import "core:strings"
 import "elodin:dns"
 import "elodin:netx"
@@ -204,4 +205,62 @@ decode_hex :: proc(text: string, allocator := context.allocator) -> (out: []u8, 
 		return nil, false
 	}
 	return
+}
+
+/*
+The most key tags RFC 8145 signals for one zone: what a `_ta-` label holds (`_ta`
+and five characters a tag in `dns.MAX_LABEL_LEN`), and the limit section 4.2.2.1
+recommends on the `edns-key-tag` option, which carries no more.
+*/
+MAX_KEY_TAGS :: (dns.MAX_LABEL_LEN - len("_ta")) / len("-0000")
+
+/*
+The key tags of `v`'s trust anchors for `zone`, sorted from smallest to largest
+and without repeats, as RFC 8145 signals them; empty for a zone no anchor is for.
+*/
+anchor_key_tags :: proc(v: ^Validator, zone: string, allocator := context.allocator) -> []u16 {
+	tags := make([dynamic]u16, 0, len(v.anchors), allocator)
+	for a in v.anchors {
+		if dns.name_equal_fold(a.zone, zone) && !slice.contains(tags[:], a.ds.key_tag) {
+			append(&tags, a.ds.key_tag)
+		}
+	}
+	slice.sort(tags[:])
+	return tags[:]
+}
+
+/*
+RFC 8145 5.1: the Key Tag query's name for `tags` under `zone` - `_ta-`, then
+each tag as four zero-padded lowercase hex digits, joined with `-` in the order
+given (5.1 has them sorted), as the first label. False for no tags, or a name
+past what DNS allows, which section 1.1 notes the query cannot carry.
+*/
+key_tag_query_name :: proc(zone: string, tags: []u16, allocator := context.allocator) -> (name: string, ok: bool) {
+	if len(tags) == 0 {
+		return "", false
+	}
+	digits := "0123456789abcdef"
+	b := strings.builder_make(allocator)
+	strings.write_string(&b, "_ta")
+	for tag in tags {
+		strings.write_byte(&b, '-')
+		for shift: uint = 12; ; shift -= 4 {
+			strings.write_byte(&b, digits[(tag >> shift) & 0xf])
+			if shift == 0 {
+				break
+			}
+		}
+	}
+	strings.write_byte(&b, '.')
+	if zone != "." {
+		strings.write_string(&b, zone)
+	}
+	name = strings.to_string(b)
+	wire: [dns.MAX_NAME_WIRE]u8
+	_, err := dns.encode_name(name, wire[:])
+	if err != .None {
+		strings.builder_destroy(&b)
+		return "", false
+	}
+	return name, true
 }
