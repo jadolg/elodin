@@ -630,6 +630,31 @@ run_h2_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	// RFC 9113 8.1.1: a request whose content-length is not the sum of its
+	// DATA is malformed, a stream error of type PROTOCOL_ERROR, never answered.
+	start_case(r, "h2: a request whose content-length its DATA does not match is reset")
+	{
+		c, cok := h2_connect(doh_port)
+		if check(r, cok, "cannot open an h2 connection") {
+			defer h2_close(c)
+			long := fmt.tprint(len(query) + 100)
+			check(r, h2_send_request(c, 1, "POST", "/dns-query", query, extra = []H2_Field{{"content-length", long}}), "cannot send")
+			check(r, h2_send_request(c, 3, "POST", "/dns-query", query, extra = []H2_Field{{"content-length", fmt.tprint(len(query))}}), "cannot send")
+			if check(r, h2_collect(c, []u32{1, 3}), "the streams never ended") {
+				bad, bfound := h2_stream(c, 1)
+				if check(r, bfound && bad.reset, "a mismatched content-length was answered") {
+					check_eq_int(r, int(bad.reset_code), int(h2.Error_Code.Protocol_Error), "reset code")
+				}
+				good, gfound := h2_stream(c, 3)
+				if check(r, gfound, "no result for stream 3") {
+					check_eq_int(r, good.status, 200, "status for a matching content-length")
+				}
+			}
+			check(r, !c.goaway, "a malformed request took the connection down")
+		}
+	}
+	end_case(r)
+
 	start_case(r, "h2: unknown path is 404")
 	{
 		c, cok := h2_connect(doh_port)

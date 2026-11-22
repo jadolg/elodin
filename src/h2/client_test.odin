@@ -2820,3 +2820,38 @@ test_a_response_that_beat_an_unbuilt_body_is_kept :: proc(t: ^testing.T) {
 	testing.expect_value(t, log.rst_code, Error_Code.No_Error)
 	client_done(t, c, &track, "answer beat the body", &log)
 }
+
+/*
+A reply to a HEAD carries the `content-length` a GET would have, and no DATA
+(RFC 9110 9.3.2): `client_request` marks the stream as a HEAD's, so the reply is
+accepted rather than failed for content that was never to come.
+*/
+@(test)
+test_a_head_reply_is_not_held_to_its_content_length :: proc(t: ^testing.T) {
+	run_script :: proc(client: net.TCP_Socket, data: rawptr) {
+		h, ok := test_wait_for_frame_type(client, .Headers)
+		if !ok {
+			return
+		}
+		// :status 200 (static index 8), and content-length: 100 by its name's
+		// static index, 28.
+		block := []u8{0x88, 0x0f, 0x0d, 3, '1', '0', '0'}
+		out := make([dynamic]u8, 0, FRAME_HEADER_SIZE + len(block), context.temp_allocator)
+		write_frame_header(&out, len(block), .Headers, FLAG_END_HEADERS | FLAG_END_STREAM, h.stream_id)
+		append(&out, ..block)
+		_ = test_send(client, out[:]) // lint:allow a lost reply shows as the request's error below
+	}
+	p := Peer{script = run_script}
+	if !start_peer(t, &p) {
+		return
+	}
+	defer end_peer(&p)
+	resp, err := client_request(
+		p.c,
+		Client_Request{method = "HEAD", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
+		2 * time.Second,
+	)
+	testing.expect_value(t, err, Client_Error.None)
+	testing.expect_value(t, resp.status, 200)
+	free_all(context.temp_allocator)
+}
