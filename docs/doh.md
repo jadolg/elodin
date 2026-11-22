@@ -60,14 +60,37 @@ connection error of type PROTOCOL_ERROR.
 
 A request body is at most 65535 bytes, the most RFC 8484 section 6 allows a DNS
 message. Past it, HTTP/2 resets the stream with ENHANCE_YOUR_CALM, and HTTP/1.1
-answers a `Content-Length` that declares more with **413** and closes the
-connection, first discarding about 80 KiB of the body for up to a second so that
-the 413 is not lost to a reset. A client that streams more than that without
+answers a `Content-Length` or a chunk that declares more with **413** and closes
+the connection, first discarding about 80 KiB of the body for up to a second so
+that the 413 is not lost to a reset. A client that streams more than that without
 `Expect: 100-continue` can still see the reset instead. A missing, repeated or
 invalid `Host`, or a repeated `Content-Type`, is answered 400 ahead of the 413. A DNS message within
-the limit that has the QR bit set is a response rather than a query, and is answered 400. A `Content-Length` that is not
-plain decimal, or one beside a second `Content-Length` or a `Transfer-Encoding`,
-gets no answer at all, whatever else is wrong with the request.
+the limit that has the QR bit set is a response rather than a query, and is answered 400.
+
+HTTP/1.1 framing follows RFC 9112. Each refusal below is answered and the
+connection then closed, so nothing that follows on it is read as a request:
+
+- A chunked body is read, chunk extensions (held to their grammar) and trailer
+  fields included (section 7.1), and the connection closes after its answer,
+  once what the client sent behind it is drained. The chunk lines and trailer
+  fields are held to 16 KiB together, as a header block is, and past it are 400. A `Transfer-Encoding` whose last
+  coding is not `chunked` or that names no coding at all, `chunked` applied
+  twice or with a parameter, `Transfer-Encoding` beside a `Content-Length`, and
+  `Transfer-Encoding` on HTTP/1.0 are 400; another coding ahead of `chunked` is
+  501, as elodin decodes chunked alone.
+- A `Content-Length` that is not plain decimal, or a second one even with the
+  same value, is 400 (section 6.3).
+- A folded field line, whitespace before a field's colon, a field name that is
+  not a token, or a bare CR, bare LF or NUL in a line is 400 (sections 2.2, 5.1,
+  5.2).
+- `Expect: 100-continue` on a request whose body has not arrived yet is answered
+  `100 Continue` before the body is read (RFC 9110 section 10.1.1), on HTTP/2
+  too; refusals the header block already decides go out as the final status
+  instead. HTTP/1.0 is not sent one.
+- An absolute-form target (`GET https://host/dns-query?dns=… HTTP/1.1`) is
+  served like the path it names, and its authority stands in for `Host`, which
+  an HTTP/1.1 request still has to carry (section 3.2.2). An authority with
+  userinfo is 400.
 
 ## Discovery by clients (DDR)
 

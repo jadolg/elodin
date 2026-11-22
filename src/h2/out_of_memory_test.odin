@@ -1222,3 +1222,29 @@ test_credit_a_response_had_no_room_to_send_wakes_the_next :: proc(t: ^testing.T)
 	conn_unref(c)
 	expect_no_leaks(t, &track, "response credit passed on")
 }
+
+/*
+With no room for the interim 100, none is sent, and the connection carries on:
+the client sends its body when its own wait ends, and the other streams on the
+connection are not taken down with a GOAWAY for it.
+*/
+@(test)
+test_a_continue_with_no_room_is_skipped :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	log: Frame_Log
+	c := logged_conn(&log, drop_request, allocator)
+	f := Fail_Nth {
+		backing = context.temp_allocator,
+	}
+	arm(&f, 1, 1 << 20)
+	saved := context.temp_allocator
+	context.temp_allocator = fail_nth(&f)
+	carried := send_continue(c, 1)
+	context.temp_allocator = saved
+	testing.expect(t, refused_any(&f), "the premise: an allocation was refused")
+	testing.expect(t, carried, "the connection was given up for a 100 there was no room for")
+	testing.expect(t, !saw_frame(&log, .Goaway), "a GOAWAY for a 100 there was no room for")
+	testing.expect(t, !saw_frame(&log, .Headers), "a 100 went out with no room for it")
+	conn_done(t, c, &track, "a continue with no room", &log)
+}
