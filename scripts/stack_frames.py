@@ -1,29 +1,24 @@
 #!/usr/bin/env python3
-"""
-Fail a build whose stack frames could step over a fiber's guard.
-
-usage: scripts/stack_frames.py BINARY
-
-The compiler emits no stack probes, so a frame moves the stack pointer down in
-one step and its first stores land wherever that is. A fiber stack has
-`loop.STACK_GUARD` of PROT_NONE below it, and two frames can step over it
-together: a caller whose stack pointer ends inside the guard without writing
-there, and a callee whose own writes land below it - on arm64 a call writes
-nothing to the stack, and a leaf saves no frame record. So the two largest
-frames together must fit in the guard, outside `MAIN_THREAD`, the procedures
-that run on the process's own stack, which the kernel guards with a gap far
-larger than any frame.
-
-Frames are read from `objdump -d`: amd64 `sub $N,%rsp`, arm64 `sub sp, sp, #N`
-(a `lsl #12` one and the one after it are one frame) and the `sub xN, sp, #N`
-an over-aligned frame starts from, followed through the register it writes.
-Each procedure's largest such subtraction is its frame, which leaves out pushes,
-saved registers and call-argument space: `SLACK` is held back from the guard
-for them. A stack allocation of a size only known at run time - a register
-moved into the stack pointer, outside an epilogue's frame pointer and the fiber
-switch - is refused outright, since no guard bounds it. Only the binary's own
-code is read: a library linked at run time is not in it.
-"""
+"""usage: scripts/stack_frames.py BINARY - fail a build whose stack frames could step over a fiber's guard."""
+# The compiler emits no stack probes, so a frame moves the stack pointer down in
+# one step and its first stores land wherever that is. A fiber stack has
+# `loop.STACK_GUARD` of PROT_NONE below it, and two frames can step over it
+# together: a caller whose stack pointer ends inside the guard without writing
+# there, and a callee whose own writes land below it - on arm64 a call writes
+# nothing to the stack, and a leaf saves no frame record. So the two largest
+# frames together must fit in the guard, outside `MAIN_THREAD`, the procedures
+# that run on the process's own stack, which the kernel guards with a gap far
+# larger than any frame.
+#
+# Frames are read from `objdump -d`: amd64 `sub $N,%rsp`, arm64 `sub sp, sp, #N`
+# (a `lsl #12` one and the one after it are one frame) and the `sub xN, sp, #N`
+# an over-aligned frame starts from, followed through the register it writes.
+# Each procedure's largest such subtraction is its frame, which leaves out pushes,
+# saved registers and call-argument space: `SLACK` is held back from the guard
+# for them. A stack allocation of a size only known at run time - a register
+# moved into the stack pointer, outside an epilogue's frame pointer and the fiber
+# switch - is refused outright, since no guard bounds it. Only the binary's own
+# code is read: a library linked at run time is not in it.
 
 import pathlib
 import re
