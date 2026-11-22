@@ -207,6 +207,7 @@ start_validator :: proc(s: ^Server, l: ^Live) -> bool {
 			// The one dial on how much memory validation may hold. Zero here
 			// takes the validator's own default, as everywhere else.
 			max_cached_zones     = l.cfg.dnssec.max_cached_zones,
+			anchor_keys_cached   = key_tag_signal,
 		},
 	)
 	// The bound is named here because it is the number an operator watching
@@ -367,11 +368,6 @@ validator_query :: proc(
 			dns.name_trim_root(name),
 			rcode_text(rcode),
 		)
-	} else if len(tags) > 0 {
-		// After an answer, not a failure: an anchor's keys that could not be had
-		// are not cached, so every walk asks again, and one Key Tag query each
-		// would double what a failing upstream is sent.
-		send_key_tag_query(s, name, tags)
 	}
 	return response, true
 }
@@ -392,6 +388,21 @@ signalled_key_tags :: proc(s: ^Server, name: string, type: dns.Type) -> []u16 {
 	return dnssec.anchor_key_tags(l.validator, name, context.temp_allocator)
 }
 
+/*
+`dnssec.Options.anchor_keys_cached`: the Key Tag query RFC 8145 5.2 asks for,
+while `dnssec.trust_anchor_signaling` is on. Sent once the anchor's keys are
+established, not after every DNSKEY lookup: keys that could not be had or did
+not validate are not cached, so every walk fetches them again, and a Key Tag
+query each would double what a failing or broken upstream is sent.
+*/
+@(private)
+key_tag_signal :: proc(ctx: rawptr, zone: string, tags: []u16) {
+	s := cast(^Server)ctx
+	if live(s).cfg.dnssec.trust_anchor_signaling && len(tags) > 0 {
+		send_key_tag_query(s, zone, tags)
+	}
+}
+
 // A Key Tag query waiting to be sent; see `send_key_tag_query`.
 @(private)
 Key_Tag_Query :: struct {
@@ -403,7 +414,7 @@ Key_Tag_Query :: struct {
 /*
 RFC 8145 5.2: the Key Tag query (`_ta-<tags>.<zone>`, NULL) that a DNSKEY
 lookup for a trust anchor's zone SHOULD be accompanied by, asked of the group
-that lookup asks. Sent on a fiber of its own, counted among `server.max_pending`
+that lookup asks; see `key_tag_signal` for when. Sent on a fiber of its own, counted among `server.max_pending`
 and the upstream waits like a prefetch, so the walk that set it off does not wait
 on it; its answer is the zone operators' to count and is dropped. Not sent when
 either count is full, or when the name would not fit

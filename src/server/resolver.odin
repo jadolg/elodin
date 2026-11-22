@@ -1880,8 +1880,8 @@ shape_forwarded :: proc(st: ^Query_State) -> bool {
 /*
 A query this server sends upstream on its own account: `q` and nothing of anyone
 else's, RD set, a fresh transaction ID (RFC 5452 section 9.2), and one OPT record
-at `UPSTREAM_UDP_SIZE` with no options - the upstream cookie and the padding are
-put on by `src/upstream`. The name is folded to lower case as the cache key is,
+at `UPSTREAM_UDP_SIZE` carrying no option but `key_tags` - the upstream cookie and
+the padding are put on by `src/upstream`. The name is folded to lower case as the cache key is,
 so the bytes depend on the key and not the client; the answer's question is put
 back in the client's case before it goes out (`dns.copy_question_case`).
 */

@@ -313,6 +313,24 @@ test_a_reload_does_not_move_the_policy_for_chain_walks :: proc(t: ^testing.T) {
 	testing.expect_value(t, f.s.gens.current.policy, before)
 }
 
+// Nor does whether the anchors' key tags are signalled (RFC 8145), which no
+// verdict depends on.
+@(test)
+test_a_reload_does_not_move_the_policy_for_trust_anchor_signaling :: proc(t: ^testing.T) {
+	f, ok := boot_fixture(t, "policy-signaling", BASE)
+	if !ok {
+		return
+	}
+	defer close_fixture(f)
+	signalling := swap(BASE, "dnssec: { enabled: false }", "dnssec: { enabled: true, trust_anchor_signaling: true }")
+	if !testing.expect(t, reload_from(t, f, signalling).applied, "validation did not load") {
+		return
+	}
+	before := f.s.gens.current.policy
+	testing.expect(t, reload_from(t, f, swap(signalling, "trust_anchor_signaling: true", "trust_anchor_signaling: false")).applied, "the switch did not load")
+	testing.expect_value(t, f.s.gens.current.policy, before)
+}
+
 // Nor does the name a server is logged under.
 @(test)
 test_a_reload_does_not_move_the_policy_for_a_server_name :: proc(t: ^testing.T) {

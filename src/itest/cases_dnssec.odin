@@ -93,10 +93,13 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
-	start_case(r, "dnssec: the root DNSKEY lookup signals the anchors' key tags (RFC 8145, #715)")
+	start_case(r, "dnssec: the root DNSKEY lookup carries the anchors' key tags, and keys that do not validate set off no Key Tag query (RFC 8145, #715)")
 	{
 		// The built-in root anchors are tags 20326 and 38696: 4f66 and 9728.
-		check_key_tags_signalled(r, mock, []u8{0x4f, 0x66, 0x97, 0x28}, "_ta-4f66-9728.")
+		check_key_tag_option(r, mock, []u8{0x4f, 0x66, 0x97, 0x28})
+		// This mock has no root keys to validate, so none are cached and every
+		// walk fetches them again; a Key Tag query each would double the load.
+		check(r, !mock_wait_until(mock, mock_saw_type, int(dns.Type.NULL), KEY_TAG_QUIET), "a Key Tag query followed root keys that did not validate")
 	}
 	end_case(r)
 
@@ -426,15 +429,12 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	run_dnssec_config_cases(r)
 	run_key_tag_off_case(r)
 	run_key_tag_failed_lookup_case(r)
+	run_key_tag_anchored_case(r)
 }
 
-/*
-RFC 8145: the DNSKEY lookup for the root carried `tags` as its edns-key-tag
-option (section 4), and a Key Tag query for `ta_name` followed it (section 5),
-sent on a fiber of its own and so waited for.
-*/
+// RFC 8145 section 4: the last DNSKEY lookup carried `tags` as its edns-key-tag.
 @(private = "file")
-check_key_tags_signalled :: proc(r: ^Runner, mock: ^Mock, tags: []u8, ta_name: string) {
+check_key_tag_option :: proc(r: ^Runner, mock: ^Mock, tags: []u8) {
 	dnskey := mock_last_query_of(mock, u16(dns.Type.DNSKEY))
 	if check(r, dnskey != nil, "the validator never asked for a DNSKEY set") {
 		m, derr := dns.decode_message(dnskey, context.temp_allocator)
@@ -443,6 +443,14 @@ check_key_tags_signalled :: proc(r: ^Runner, mock: ^Mock, tags: []u8, ta_name: s
 			check(r, found && slice.equal(data, tags), "the DNSKEY lookup's edns-key-tag is %x (found %v), want %x", data, found, tags)
 		}
 	}
+}
+
+/*
+RFC 8145: a Key Tag query for `ta_name` followed keys that validated (section 5),
+sent on a fiber of its own and so waited for.
+*/
+@(private = "file")
+check_key_tag_query :: proc(r: ^Runner, mock: ^Mock, ta_name: string) {
 	if !check(r, mock_wait_until(mock, mock_saw_type, int(dns.Type.NULL), 5 * time.Second), "no Key Tag query reached the upstream") {
 		return
 	}
@@ -490,6 +498,41 @@ run_key_tag_off_case :: proc(r: ^Runner) {
 	// The Key Tag query would go out on a fiber of its own, within milliseconds
 	// of the DNSKEY answer in the case that sends one; a second is far past that.
 	check(r, !mock_wait_until(mock, mock_saw_type, int(dns.Type.NULL), KEY_TAG_QUIET), "a Key Tag query was sent with signalling off")
+}
+
+/*
+An anchor whose keys validate - the signed 168.192.in-addr.arpa, tag 18109
+(46bd) - has its DNSKEY lookup carry that tag and, once the keys are cached, a
+Key Tag query for `_ta-46bd.168.192.in-addr.arpa.` follow it.
+*/
+@(private = "file")
+run_key_tag_anchored_case :: proc(r: ^Runner) {
+	start_case(r, "dnssec: an anchor whose keys validate is followed by its Key Tag query (RFC 8145, #715)")
+	defer end_case(r)
+	upstream_port := next_port(r)
+	mock := mock_make("dnssec-anchored", upstream_port)
+	mock_synth_all(mock, {203, 0, 113, 58})
+	for f in ANCHORED_REVERSE_FIXTURES {
+		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+	}
+	if !mock_start_or_skip(r, mock, "dnssec-anchored") {
+		return
+	}
+	defer mock_stop(mock)
+	udp_port := next_port(r)
+	config := dnssec_config(udp_port, upstream_port, []string{ROOT_DS, ANCHORED_REVERSE_ANCHOR}, extra = "special_use: {private_reverse: false}\n")
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+	res := query_udp(udp_port, build_query("1.1.168.192.in-addr.arpa.", u16(dns.Type.PTR), edns_size = 1232, dnssec_ok = true))
+	if !check(r, res.ok, "no answer for the anchored name") {
+		return
+	}
+	check(r, parse_header(r, res.wire).ad, "the premise: the anchored name validated")
+	check_key_tag_option(r, mock, []u8{0x46, 0xbd})
+	check_key_tag_query(r, mock, "_ta-46bd.168.192.in-addr.arpa.")
 }
 
 // How long a case waits to be sure no Key Tag query is coming.

@@ -1,6 +1,7 @@
 package server
 
 import "core:slice"
+import "core:strings"
 import "core:testing"
 import "elodin:config"
 import "elodin:dns"
@@ -61,6 +62,27 @@ test_a_key_tag_query_holds_an_upstream_wait_place :: proc(t: ^testing.T) {
 
 	s.upstream_waits = 0
 	send_key_tag_query(&s, ".", tags)
+	testing.expect_value(t, s.upstream_waits, 0)
+	testing.expect_value(t, s.pending, 0)
+}
+
+/*
+A Key Tag query that was started gives back its upstream-wait place and its
+place among `max_pending` however it ends - here at once, on a zone no `_ta-`
+name fits under - and frees what it was handed.
+*/
+@(test)
+test_a_key_tag_query_job_gives_its_places_back :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := local_server(&cfg)
+	label := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa."
+	q := new(Key_Tag_Query)
+	q.server = &s
+	q.zone = strings.concatenate({label, label, label, label[:56]})
+	q.tags = slice.clone([]u16{1})
+	// As `send_key_tag_query` and `submit_query` leave them for the job.
+	s.upstream_waits, s.pending = 1, 1
+	key_tag_query_job(q)
 	testing.expect_value(t, s.upstream_waits, 0)
 	testing.expect_value(t, s.pending, 0)
 }

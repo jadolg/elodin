@@ -130,7 +130,7 @@ part of RFC 5011 it reads is the REVOKE bit, which makes a revoked key unusable.
 
 ## trust_anchor_signaling
 
-On, as in Unbound. When the validator fetches the DNSKEY set of a zone it holds
+On. When the validator fetches the DNSKEY set of a zone it holds
 an anchor for (the root, unless you configured others), it tells that zone's
 operators which anchor keys it trusts, the data they use to pace a KSK rollover
 (RFC 8145):
@@ -139,16 +139,21 @@ operators which anchor keys it trusts, the data they use to pace a KSK rollover
   anchors' key tags (section 4);
 - a Key Tag query goes to the same upstreams beside it: type NULL, for
   `_ta-<tags>.<zone>`, each tag as four lowercase hex digits, sorted (section 5).
-  For the built-in root anchors that is `_ta-4f66-9728.`. It follows only a
-  DNSKEY lookup the upstreams answered, since a failed one is not cached and
-  is asked again by every walk. Its answer is not read, and it is sent on its
-  own so no client waits for it. It counts in `server.max_pending` and the
+  For the built-in root anchors that is `_ta-4f66-9728.`. It is sent once the
+  zone's keys validate and are cached, so about once per key TTL (at most an
+  hour): keys that could not be had or did not validate are fetched again by
+  every walk, and are not followed by one. Its answer is not read, and it is
+  sent on its own so no client waits for it. It counts in `server.max_pending` and the
   upstream waits like a prefetch, and is skipped when either is full.
 
 Both carry at most 12 tags, the smallest, which is what a `_ta-` label holds.
 
 Other zones' DNSKEY lookups carry neither. Set `false` to send neither for
-anchored zones either.
+anchored zones either, for instance behind an upstream that answers FORMERR to
+an EDNS option it does not know, which RFC 6891 section 6.1.2 says it MUST
+ignore. Unbound's `trust-anchor-signaling`, which sends the Key Tag query, is
+on by default too. A reload that changes only this setting keeps the answer
+cache.
 
 ## max_nsec3_iterations
 
