@@ -222,8 +222,8 @@ run_transport_cases :: proc(r: ^Runner) {
 	A field name is an ASCII token (#432). With the long s (U+017F), which a
 	Unicode case fold takes for an `s`, `Tran\u017ffer-Encoding` is chunked framing
 	to a hop that folds that way and nothing to one that folds ASCII only - so it
-	is refused, not skipped: closed unanswered, as the other field lines this
-	reader cannot place are (see `read_http_request`).
+	is refused, not skipped: a 400 and a close, as the other field lines this
+	reader cannot place get (RFC 9112 5.1, see `read_http_request`).
 	*/
 	start_case(r, "doh: a field name that is not an ASCII token is refused")
 	{
@@ -235,7 +235,7 @@ run_transport_cases :: proc(r: ^Runner) {
 				string(query),
 			),
 		)
-		check(r, !res.ok, "answered %d; a field name outside the token grammar was read", res.status)
+		check(r, res.ok && res.status == 400, "answered %d (ok: %v), want 400: a field name outside the token grammar was read", res.status, res.ok)
 		after := doh_post(doh_port, "/dns-query", query)
 		if check(r, after.ok, "the next request got no response") {
 			check_eq_int(r, after.status, 200, "status of the next request")
@@ -712,7 +712,8 @@ run_transport_cases :: proc(r: ^Runner) {
 			string(query),
 		)
 		res := doh_raw(doh_port, req)
-		check(r, !res.ok || res.status != 200, "a hexadecimal Content-Length was answered (status %d)", res.status)
+		// RFC 9112 6.3: an invalid Content-Length is a 400, then a close.
+		check(r, res.ok && res.status == 400, "a hexadecimal Content-Length was answered %d (ok: %v), want 400", res.status, res.ok)
 	}
 	end_case(r)
 
@@ -728,8 +729,8 @@ run_transport_cases :: proc(r: ^Runner) {
 	the remainder as a request of its own - on a connection it is pipelining for
 	somebody else.
 
-	So what is checked is that nothing at all comes back. A reply means a framing
-	was chosen.
+	So what is checked is that the one reply is a 400 and nothing follows it: a
+	200, or a second reply, means a framing was chosen.
 	*/
 	start_case(r, "doh: a repeated Content-Length is refused rather than framed")
 	{
@@ -748,7 +749,82 @@ run_transport_cases :: proc(r: ^Runner) {
 			)
 			data, read := doh_raw_until_close(doh_port, req)
 			replies := strings.count(data, "HTTP/1.1 ") if read else 0
-			check(r, replies == 0, "%d reply(s) came back, so one of the two lengths was acted on", replies)
+			check(r, replies == 1 && strings.has_prefix(data, "HTTP/1.1 400 "), "%d reply(s) came back (%q), want one 400", replies, data[:min(len(data), 40)])
+		}
+	}
+	end_case(r)
+
+	/*
+	RFC 9112 6.1: "A recipient MUST be able to parse the chunked transfer
+	coding". A chunked POST is answered and the connection closed after it; a
+	final coding other than chunked is a 400 (6.3), and one this server does not
+	decode ahead of chunked a 501.
+	*/
+	start_case(r, "doh: a chunked POST is answered, and the connection closes after it")
+	{
+		half := len(query) / 2
+		req := fmt.tprintf(
+			"POST /dns-query HTTP/1.1\r\nHost: elodin.local\r\nContent-Type: application/dns-message\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n%x;ext=1\r\n%s\r\n0\r\n\r\n",
+			half,
+			string(query[:half]),
+			len(query) - half,
+			string(query[half:]),
+		)
+		data, read := doh_raw_until_close(doh_port, req)
+		check(r, read && strings.has_prefix(data, "HTTP/1.1 200 "), "a chunked POST was answered %q", data[:min(len(data), 40)])
+		check(r, strings.count(data, "HTTP/1.1 ") == 1, "more than one reply to one chunked POST")
+		check(r, strings.contains(data, "\r\nConnection: close\r\n"), "the connection is not closed after a chunked body")
+	}
+	end_case(r)
+
+	start_case(r, "doh: a transfer coding other than chunked is a 400 or a 501")
+	{
+		Case :: struct {
+			coding: string,
+			status: int,
+		}
+		for tc in ([]Case{{"gzip", 400}, {"chunked, gzip", 400}, {"gzip, chunked", 501}}) {
+			req := fmt.tprintf("POST /dns-query HTTP/1.1\r\nHost: elodin.local\r\nContent-Type: application/dns-message\r\nTransfer-Encoding: %s\r\n\r\n0\r\n\r\n", tc.coding)
+			res := doh_raw(doh_port, req)
+			check(r, res.ok && res.status == tc.status, "Transfer-Encoding: %s was answered %d (ok: %v), want %d", tc.coding, res.status, res.ok, tc.status)
+		}
+	}
+	end_case(r)
+
+	// RFC 9112 3.2.2: a server "MUST accept the absolute-form".
+	start_case(r, "doh: an absolute-form target is answered")
+	{
+		encoded, eerr := base64.encode(query, base64.ENC_URL_TABLE, context.temp_allocator)
+		if eerr != nil {
+			fail(r, "cannot encode the query")
+		} else {
+			req := fmt.tprintf(
+				"GET https://elodin.local:%d/dns-query?dns=%s HTTP/1.1\r\nHost: elodin.local\r\nConnection: close\r\n\r\n",
+				doh_port,
+				strings.trim_right(encoded, "="),
+			)
+			res := doh_raw(doh_port, req)
+			check(r, res.ok && res.status == 200, "an absolute-form GET was answered %d (ok: %v)", res.status, res.ok)
+		}
+	}
+	end_case(r)
+
+	// RFC 9110 10.1.1: "MUST NOT wait for the content before sending the 100".
+	start_case(r, "doh: Expect: 100-continue is answered with a 100 before the body")
+	{
+		conn, dialled := dial_tls(doh_port, []string{"http/1.1"})
+		if check(r, dialled, "cannot connect") {
+			defer close_tls(&conn)
+			head := fmt.tprintf("POST /dns-query HTTP/1.1\r\nHost: elodin.local\r\nContent-Type: application/dns-message\r\nContent-Length: %d\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n", len(query))
+			check(r, conn_write(&conn, transmute([]u8)head), "cannot send the header block")
+			got: [64]u8
+			n, read_ok := conn_read(&conn, got[:])
+			if check(r, read_ok && strings.has_prefix(string(got[:n]), "HTTP/1.1 100 Continue\r\n\r\n"), "%q came back before the body, want the 100", string(got[:n])) {
+				check(r, conn_write(&conn, query), "cannot send the body")
+				rest: [4096]u8
+				m, rok := conn_read(&conn, rest[:])
+				check(r, rok && strings.has_prefix(string(rest[:m]), "HTTP/1.1 200 "), "the answer after the 100 was %q", string(rest[:min(m, 40)]))
+			}
 		}
 	}
 	end_case(r)

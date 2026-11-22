@@ -461,6 +461,26 @@ run_h2_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	// RFC 9110 10.1.1: the 100 goes before the body is waited for.
+	start_case(r, "h2: Expect: 100-continue is answered with a 100 before the body")
+	{
+		c, cok := h2_connect(doh_port)
+		if check(r, cok, "cannot open an h2 connection") {
+			defer h2_close(c)
+			check(r, h2_send_request(c, 1, "POST", "/dns-query", query, extra = []H2_Field{{"expect", "100-continue"}}, open_only = true), "cannot send the header block")
+			if check(r, h2_await_interim(c, 1), "no 100 came back before the body was sent") {
+				check(r, h2_send_data(c, 1, query), "cannot send the body")
+				if check(r, h2_collect(c, []u32{1}), "stream 1 never completed") {
+					res, found := h2_stream(c, 1)
+					if check(r, found, "no result for stream 1") {
+						check_eq_int(r, res.status, 200, "status after the 100")
+					}
+				}
+			}
+		}
+	}
+	end_case(r)
+
 	start_case(r, "h2: PING is answered with an ACK")
 	{
 		c, cok := h2_connect(doh_port)

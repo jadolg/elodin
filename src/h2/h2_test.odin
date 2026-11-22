@@ -3198,3 +3198,66 @@ test_status_text_is_the_code :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+RFC 9110 10.1.1: a server "MUST NOT wait for the content before sending the 100
+(Continue) response". A request parked for a body it said it would send after a
+100 gets one, an interim HEADERS without END_STREAM (RFC 9113 8.1); a request
+with no body to come, or no expectation, gets none.
+*/
+@(test)
+test_an_expected_continue_is_sent_before_the_body :: proc(t: ^testing.T) {
+	Case :: struct {
+		what:      string,
+		expect:    string,
+		flags:     u8,
+		continue_: bool,
+	}
+	cases := []Case {
+		{"a body to come", "100-continue", 0, true},
+		{"in another case, in a list", "foo, 100-Continue", 0, true},
+		{"no body to come", "100-continue", FLAG_END_STREAM, false},
+		{"no expectation", "", 0, false},
+		{"another expectation", "something-else", 0, false},
+	}
+	for row in cases {
+		track: mem.Tracking_Allocator
+		allocator := track_allocations(&track)
+		h := Serve_Harness {
+			written = make([dynamic]u8, 0, 64, allocator),
+		}
+		// The request with no body to come is dispatched, and freed by it.
+		c := make_conn(IO{user = &h, read = no_read, write = serve_harness_write}, destroying_handler, nil, allocator)
+		block := make([dynamic]u8, 0, 64, context.temp_allocator)
+		append(&block, ..request_block())
+		if row.expect != "" {
+			put_field(&block, "expect", row.expect)
+		}
+		ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | row.flags, stream_id = 1}, block[:])
+		testing.expectf(t, ok, "%s: the connection was dropped", row.what)
+
+		interim := false
+		pos := 0
+		for pos + FRAME_HEADER_SIZE <= len(h.written) {
+			fh, fok := parse_frame_header(h.written[pos:])
+			if !fok || pos + FRAME_HEADER_SIZE + fh.length > len(h.written) {
+				break
+			}
+			if fh.type == .Headers && fh.stream_id == 1 {
+				table: Dynamic_Table
+				dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, context.temp_allocator)
+				fields, err := decode(&table, h.written[pos + FRAME_HEADER_SIZE:][:fh.length], context.temp_allocator)
+				interim =
+					err == .None &&
+					fh.flags & FLAG_END_STREAM == 0 &&
+					len(fields) == 1 &&
+					fields[0].name == ":status" &&
+					fields[0].value == "100"
+			}
+			pos += FRAME_HEADER_SIZE + fh.length
+		}
+		testing.expectf(t, interim == row.continue_, "%s: a 100 sent: %v, want %v", row.what, interim, row.continue_)
+		delete(h.written)
+		conn_done(t, c, &track, row.what)
+	}
+}

@@ -1079,9 +1079,12 @@ finish_headers :: proc(c: ^Conn, s: ^Stream, block: []u8) -> bool {
 		dry^ ||= len(dst^) != len(value)
 	}
 	dry := false
+	expect_continue := false
 
 	for f in headers {
 		switch f.name {
+		case "expect":
+			expect_continue ||= list_has_token(f.value, "100-continue")
 		case ":method":
 			take(&req.method, f.value, c.allocator, &dry)
 		case ":path":
@@ -1125,9 +1128,32 @@ finish_headers :: proc(c: ^Conn, s: ^Stream, block: []u8) -> bool {
 	if !complete {
 		// Park the request until the body arrives.
 		s.pending = req
+		/*
+		RFC 9110 10.1.1: a server "MUST NOT wait for the content before sending
+		the 100 (Continue) response", on HTTP/2 an interim HEADERS without
+		END_STREAM (RFC 9113 8.1). A client that waits for it before its DATA
+		would otherwise stall for its own timeout.
+		*/
+		if expect_continue {
+			return send_continue(c, s.id)
+		}
 		return true
 	}
 	return dispatch(c, s, req)
+}
+
+// The interim 100 (Continue) response, as a HEADERS frame of its own.
+@(private)
+send_continue :: proc(c: ^Conn, stream_id: u32) -> bool {
+	block := make([dynamic]u8, 0, 8, context.temp_allocator)
+	// Not through `status_text`, which holds a final response to 2xx-5xx.
+	encode_header(&block, ":status", "100")
+	frame := headers_frame(stream_id, block[:], end_stream = false) if len(block) > 0 else nil
+	if frame == nil {
+		goaway(c, .Internal_Error)
+		return false
+	}
+	return write_all(c, frame)
 }
 
 /*

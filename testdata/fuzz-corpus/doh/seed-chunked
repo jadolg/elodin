@@ -1,0 +1,11 @@
+POST /dns-query HTTP/1.1
+Host: a
+Transfer-Encoding: chunked
+
+2;x=y
+ab
+2
+cd
+0
+X-T: v
+

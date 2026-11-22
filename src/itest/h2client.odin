@@ -28,6 +28,8 @@ H2_Stream_Result :: struct {
 	// The code the server put in the first RST_STREAM, which is what says why
 	// the stream was refused rather than merely that it was.
 	reset_code:  h2.Error_Code,
+	// Interim (1xx) responses received ahead of the final one.
+	interim:     int,
 }
 
 // A request field beyond the four pseudo-headers every request carries.
@@ -186,6 +188,9 @@ h2_send_request :: proc(
 	// Frames sent behind the request in the same write, so that they reach the
 	// server with it rather than after it has answered.
 	then: []u8 = nil,
+	// The HEADERS alone, with no END_STREAM: the body is the caller's to send,
+	// with `h2_send_data`.
+	open_only := false,
 ) -> bool {
 	block := make([dynamic]u8, 0, 128, context.temp_allocator)
 	if table_update >= 0 {
@@ -203,7 +208,7 @@ h2_send_request :: proc(
 		h2_literal(&block, f.name, f.value, huffman)
 	}
 
-	end_stream: u8 = h2.FLAG_END_STREAM if len(body) == 0 && trailers == nil else 0
+	end_stream: u8 = h2.FLAG_END_STREAM if len(body) == 0 && trailers == nil && !open_only else 0
 	out := make([dynamic]u8, 0, len(block) + 32, context.temp_allocator)
 
 	if split_headers && len(block) > 4 {
@@ -217,7 +222,7 @@ h2_send_request :: proc(
 		append(&out, ..block[:])
 	}
 
-	if len(body) > 0 {
+	if len(body) > 0 && !open_only {
 		h2.write_frame_header(&out, len(body), .Data, h2.FLAG_END_STREAM if trailers == nil else 0, stream_id)
 		append(&out, ..body)
 	}
@@ -231,6 +236,30 @@ h2_send_request :: proc(
 	}
 	append(&out, ..then)
 	return conn_write(&c.conn, out[:])
+}
+
+// A request's body, ending its stream, for one sent with `open_only`.
+h2_send_data :: proc(c: ^H2_Client, stream_id: u32, body: []u8) -> bool {
+	out := make([dynamic]u8, 0, h2.FRAME_HEADER_SIZE + len(body), context.temp_allocator)
+	h2.write_frame_header(&out, len(body), .Data, h2.FLAG_END_STREAM, stream_id)
+	append(&out, ..body)
+	return conn_write(&c.conn, out[:])
+}
+
+// Read frames until `stream_id` has had an interim response, or the deadline
+// passes.
+h2_await_interim :: proc(c: ^H2_Client, stream_id: u32, timeout := 5 * time.Second) -> bool {
+	deadline := time.tick_add(time.tick_now(), timeout)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
+		if r, found := c.results[stream_id]; found && r.interim > 0 {
+			return true
+		}
+		if !h2_pump(c) {
+			break
+		}
+	}
+	r, found := c.results[stream_id]
+	return found && r.interim > 0
 }
 
 h2_send_get :: proc(c: ^H2_Client, stream_id: u32, path: string, query: []u8, huffman := false) -> bool {
@@ -394,12 +423,20 @@ h2_handle :: proc(c: ^H2_Client, header: h2.Frame_Header, payload: []u8) -> bool
 			return false
 		}
 		r := h2_result(c, header.stream_id)
-		r.headers = fields
+		status := 0
 		for f in fields {
 			if f.name == ":status" {
-				r.status = strconv.parse_int(f.value) or_else 0
+				status = strconv.parse_int(f.value) or_else 0
 			}
 		}
+		// An interim response is a field block of its own ahead of the final
+		// one (RFC 9113 8.1), which keeps its fields and status.
+		if status >= 100 && status < 200 {
+			r.interim += 1
+			return true
+		}
+		r.headers = fields
+		r.status = status
 		if header.flags & h2.FLAG_END_STREAM != 0 {
 			r.done = true
 		}

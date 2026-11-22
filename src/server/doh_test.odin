@@ -867,7 +867,7 @@ test_content_length_is_strict_decimal :: proc(t: ^testing.T) {
 		strings.write_string(&b, "\r\n")
 		strings.write_string(&b, c.body)
 
-		req, _, parsed, ok := read_request_over_loopback(t, strings.to_string(b), c.what)
+		req, status, parsed, ok := read_request_over_loopback(t, strings.to_string(b), c.what)
 		if !ok {
 			return
 		}
@@ -891,6 +891,9 @@ test_content_length_is_strict_decimal :: proc(t: ^testing.T) {
 				c.what,
 				len(req.body),
 			)
+			// RFC 9112 5.1, 5.2 and 6.3: each is answered with a 400, and the
+			// connection then closes.
+			testing.expectf(t, status == 400, "%s: answered %d, want 400", c.what, status)
 		}
 		free_all(context.temp_allocator)
 	}
@@ -898,14 +901,11 @@ test_content_length_is_strict_decimal :: proc(t: ^testing.T) {
 
 /*
 A `Content-Length` that is well formed but over `MAX_DOH_BODY` is a 413 (RFC 9110
-15.5.14), not the silent close an unreadable one gets.
+15.5.14), and one that is unreadable or repeated is a 400 (RFC 9112 6.3).
 
-The digits frame the request the same way to every hop, so the refusal cannot be
-attributed to some other request; only once the rest of the headers are read,
-though, since a `Transfer-Encoding` or a second `Content-Length` after it makes
-the framing what is wrong after all, and that is still answered with nothing.
-The 400s earned inside the header block wait for the end of it for the same
-reason.
+The 413 waits for the end of the header block, so that a `Transfer-Encoding`,
+a second `Content-Length` or a field line that cannot be read after it is
+answered for what it is: a 400.
 */
 @(test)
 test_content_length_over_the_limit_is_a_413 :: proc(t: ^testing.T) {
@@ -929,16 +929,16 @@ test_content_length_over_the_limit_is_a_413 :: proc(t: ^testing.T) {
 		// 2^64 + 4, which a wrapping parser reads as 4: still digits, still too large.
 		{"POST", HOST, "Content-Length: 18446744073709551620\r\n", 413, "a length past 64 bits"},
 		{"HEAD", HOST, OVER, 413, "a HEAD, which keeps its method for the reply"},
-		{"POST", HOST, "Content-Length: 0x100000\r\n", 0, "an over-limit length that is not decimal"},
-		{"POST", HOST, OVER + "Transfer-Encoding: chunked\r\n", 0, "chunked framing after it"},
-		{"POST", HOST, OVER + "Content-Length: 4\r\n", 0, "a second Content-Length after it"},
-		{"POST", HOST, OVER + "X-Fold: one\r\n two\r\n", 0, "a folded line after it"},
+		{"POST", HOST, "Content-Length: 0x100000\r\n", 400, "an over-limit length that is not decimal"},
+		{"POST", HOST, OVER + "Transfer-Encoding: chunked\r\n", 400, "chunked framing after it"},
+		{"POST", HOST, OVER + "Content-Length: 4\r\n", 400, "a second Content-Length after it"},
+		{"POST", HOST, OVER + "X-Fold: one\r\n two\r\n", 400, "a folded line after it"},
 		{"POST", "", OVER, 400, "1.1 with no Host, which is malformed before it is large"},
 		{"POST", HOST + HOST, OVER, 400, "a repeated Host, which is malformed before it is large"},
-		// The 400s in the header block wait for the end of it as well.
-		{"POST", HOST + HOST, "Transfer-Encoding: chunked\r\n", 0, "a repeated Host, then chunked framing"},
-		{"POST", "Host: a b\r\n", "Content-Length: 4\r\nContent-Length: 5\r\n", 0, "an invalid Host, then two lengths"},
-		{"POST", HOST, "Content-Type: a/b\r\nContent-Type: c/d\r\nTransfer-Encoding: chunked\r\n", 0, "a repeated Content-Type, then chunked framing"},
+		// A malformed header block is a 400 whatever framing comes with it.
+		{"POST", HOST + HOST, "Transfer-Encoding: chunked\r\n", 400, "a repeated Host, then chunked framing"},
+		{"POST", "Host: a b\r\n", "Content-Length: 4\r\nContent-Length: 5\r\n", 400, "an invalid Host, then two lengths"},
+		{"POST", HOST, "Content-Type: a/b\r\nContent-Type: c/d\r\nTransfer-Encoding: chunked\r\n", 400, "a repeated Content-Type, then chunked framing"},
 	}
 
 	for c in CASES {
@@ -2011,4 +2011,272 @@ test_doh_reader_stops_a_header_that_never_ends_within_one_read :: proc(t: ^testi
 	// The premise: the limit was reached, not the end of what was sent.
 	testing.expectf(t, len(r.buf) > MAX_HEADER_BYTES, "only %d bytes were read", len(r.buf))
 	testing.expectf(t, len(r.buf) <= MAX_HEADER_BYTES + HTTP_BUF_SIZE, "%d bytes read for a %d-byte header limit", len(r.buf), MAX_HEADER_BYTES)
+}
+
+/*
+RFC 9112 6.1: "A recipient MUST be able to parse the chunked transfer coding".
+A chunked body is read and de-chunked, whatever its chunk sizes, extensions and
+trailers, and the connection closes after it is answered; a body whose framing
+is in doubt is a 400, one past `MAX_DOH_BODY` a 413, and a coding this server
+does not understand a 501.
+*/
+@(test)
+test_a_chunked_request_body_is_read :: proc(t: ^testing.T) {
+	Case :: struct {
+		what:    string,
+		version: string,
+		headers: string, // after Host and before the blank line
+		body:    string,
+		status:  int, // 0 for a request read
+		want:    string,
+	}
+	CHUNKED :: "Transfer-Encoding: chunked\r\n"
+	// On the stack: the loop below frees the temp allocator after every case.
+	over_buf: [32]u8
+	over := fmt.bprintf(over_buf[:], "%x\r\n", MAX_DOH_BODY + 1)
+	CASES := []Case {
+		{"one chunk", "HTTP/1.1", CHUNKED, "4\r\nabcd\r\n0\r\n\r\n", 0, "abcd"},
+		{"two chunks, an extension and a trailer", "HTTP/1.1", CHUNKED, "2;x=y\r\nab\r\n2 ;z\r\ncd\r\n0\r\nX-T: v\r\n\r\n", 0, "abcd"},
+		{"an upper-case size", "HTTP/1.1", CHUNKED, "A\r\n0123456789\r\n0\r\n\r\n", 0, "0123456789"},
+		{"the coding name in another case, split over two lines", "HTTP/1.1", "Transfer-Encoding: \r\nTransfer-Encoding: CHUNKED\r\n", "1\r\nz\r\n0\r\n\r\n", 0, "z"},
+		{"an empty body", "HTTP/1.1", CHUNKED, "0\r\n\r\n", 0, ""},
+		{"a final coding other than chunked", "HTTP/1.1", "Transfer-Encoding: chunked, gzip\r\n", "", 400, ""},
+		{"gzip alone", "HTTP/1.1", "Transfer-Encoding: gzip\r\n", "", 400, ""},
+		{"chunked twice", "HTTP/1.1", "Transfer-Encoding: chunked, chunked\r\n", "", 400, ""},
+		{"chunked with a parameter", "HTTP/1.1", "Transfer-Encoding: chunked;q=1\r\n", "", 400, ""},
+		{"a coding that is not a token", "HTTP/1.1", "Transfer-Encoding: chun ked\r\n", "", 400, ""},
+		{"a coding that is not a token, before chunked", "HTTP/1.1", "Transfer-Encoding: g zip, chunked\r\n", "", 400, ""},
+		{"a coding this server does not decode before chunked", "HTTP/1.1", "Transfer-Encoding: gzip, chunked\r\n", "", 501, ""},
+		{"the same over two field lines", "HTTP/1.1", "Transfer-Encoding: gzip\r\n" + CHUNKED, "", 501, ""},
+		{"a Content-Length beside it", "HTTP/1.1", CHUNKED + "Content-Length: 4\r\n", "", 400, ""},
+		{"HTTP/1.0", "HTTP/1.0", CHUNKED, "4\r\nabcd\r\n0\r\n\r\n", 400, ""},
+		{"a size that is not hex", "HTTP/1.1", CHUNKED, "g\r\nabcd\r\n0\r\n\r\n", 400, ""},
+		{"a size with no digits", "HTTP/1.1", CHUNKED, ";x\r\n\r\n0\r\n\r\n", 400, ""},
+		{"junk after the size", "HTTP/1.1", CHUNKED, "4 x\r\nabcd\r\n0\r\n\r\n", 400, ""},
+		{"no CRLF after the data", "HTTP/1.1", CHUNKED, "4\r\nabcdX\r\n0\r\n\r\n", 400, ""},
+		// Two bytes that are not CRLF, with a last chunk right after them.
+		{"other bytes where the CRLF goes", "HTTP/1.1", CHUNKED, "4\r\nabcdXY0\r\n\r\n", 400, ""},
+		{"a trailer that is not a field line", "HTTP/1.1", CHUNKED, "4\r\nabcd\r\n0\r\nno colon\r\n\r\n", 400, ""},
+		{"a chunk past the limit", "HTTP/1.1", CHUNKED, over, 413, ""},
+		{"a size with more digits than any limit", "HTTP/1.1", CHUNKED, "10000000000000000000004\r\n", 413, ""},
+	}
+	for c in CASES {
+		raw := fmt.tprintf("POST /dns-query %s\r\nHost: dns.example\r\n%s\r\n%s", c.version, c.headers, c.body)
+		req, status, parsed, ok := read_request_over_loopback(t, raw, c.what)
+		if !ok {
+			return
+		}
+		if c.status == 0 {
+			if testing.expectf(t, parsed, "%s was refused with %d", c.what, status) {
+				testing.expectf(t, string(req.body) == c.want, "%s: body %q, want %q", c.what, string(req.body), c.want)
+				testing.expectf(t, !req.keep_alive, "%s: the connection is kept open after a chunked body", c.what)
+			}
+		} else {
+			testing.expectf(t, !parsed, "%s was accepted", c.what)
+			testing.expectf(t, status == c.status, "%s: answered %d, want %d", c.what, status, c.status)
+		}
+		free_all(context.temp_allocator)
+	}
+	// Two chunks under the limit each that are over it together.
+	half := MAX_DOH_BODY / 2 + 1
+	b := strings.builder_make(context.temp_allocator)
+	fmt.sbprintf(&b, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n%s\r\n%x\r\n", CHUNKED, half)
+	for _ in 0 ..< half {
+		strings.write_byte(&b, 'a')
+	}
+	fmt.sbprintf(&b, "\r\n%x\r\n", half)
+	_, status, parsed, ok := read_request_over_loopback(t, strings.to_string(b), "two chunks over the limit together")
+	if ok {
+		testing.expect(t, !parsed, "two chunks over the limit together were accepted")
+		testing.expect_value(t, status, 413)
+	}
+	testing.expect_value(t, http_refusal_message(501), "not implemented")
+	free_all(context.temp_allocator)
+}
+
+/*
+RFC 9112 3.2.2: a server "MUST accept the absolute-form", and takes the host
+from the target rather than from `Host` (3.2), which a 1.1 request still has to
+carry. An authority with userinfo, or none, is a 400.
+*/
+@(test)
+test_an_absolute_form_target_is_accepted :: proc(t: ^testing.T) {
+	Case :: struct {
+		what:   string,
+		target: string,
+		host:   string,
+		status: int,
+		path:   string,
+		query:  string,
+		want:   string, // the host kept
+	}
+	CASES := []Case {
+		{"https", "https://dns.example/dns-query?dns=AAAB", "Host: other.example\r\n", 0, "/dns-query", "dns=AAAB", "dns.example"},
+		{"http, the scheme in another case", "HTTP://dns.example:8443/dns-query", "Host: dns.example:8443\r\n", 0, "/dns-query", "", "dns.example:8443"},
+		{"no path", "https://dns.example", "Host: dns.example\r\n", 0, "/", "", "dns.example"},
+		{"a query and no path", "https://dns.example?dns=AAAB", "Host: dns.example\r\n", 0, "/", "dns=AAAB", "dns.example"},
+		{"origin-form, as before", "/dns-query?dns=AAAB", "Host: dns.example\r\n", 0, "/dns-query", "dns=AAAB", "dns.example"},
+		{"userinfo", "https://user@dns.example/dns-query", "Host: dns.example\r\n", 400, "", "", ""},
+		{"no authority", "https:///dns-query", "Host: dns.example\r\n", 400, "", "", ""},
+		{"no Host field", "https://dns.example/dns-query", "", 400, "", "", ""},
+	}
+	for c in CASES {
+		raw := fmt.tprintf("GET %s HTTP/1.1\r\n%s\r\n", c.target, c.host)
+		req, status, parsed, ok := read_request_over_loopback(t, raw, c.what)
+		if !ok {
+			return
+		}
+		if c.status == 0 {
+			if testing.expectf(t, parsed, "%s was refused with %d", c.what, status) {
+				testing.expectf(t, req.path == c.path, "%s: path %q, want %q", c.what, req.path, c.path)
+				testing.expectf(t, req.query == c.query, "%s: query %q, want %q", c.what, req.query, c.query)
+				testing.expectf(t, req.host == c.want, "%s: host %q, want %q", c.what, req.host, c.want)
+			}
+		} else {
+			testing.expectf(t, !parsed, "%s was accepted", c.what)
+			testing.expectf(t, status == c.status, "%s: answered %d, want %d", c.what, status, c.status)
+		}
+		free_all(context.temp_allocator)
+	}
+}
+
+// A line that ends in a bare LF or holds a bare CR is answered with a 400, not
+// closed on (RFC 9112 2.2).
+@(test)
+test_a_line_with_a_bare_cr_or_lf_is_a_400 :: proc(t: ^testing.T) {
+	CASES := [][2]string {
+		{"a bare LF after the request line", "GET /dns-query HTTP/1.1\nHost: dns.example\r\n\r\n"},
+		{"a bare CR in a field line", "GET /dns-query HTTP/1.1\r\nHost: dns.example\r\nX-A: b\rc\r\n\r\n"},
+		{"a NUL in a field line", "GET /dns-query HTTP/1.1\r\nHost: dns.example\r\nX-A: b\x00c\r\n\r\n"},
+	}
+	for c in CASES {
+		_, status, parsed, ok := read_request_over_loopback(t, c[1], c[0])
+		if !ok {
+			return
+		}
+		testing.expectf(t, !parsed, "%s was accepted", c[0])
+		testing.expectf(t, status == 400, "%s: answered %d, want 400", c[0], status)
+		free_all(context.temp_allocator)
+	}
+}
+
+@(private = "file")
+Continue_Reader :: struct {
+	r:      Http_Reader,
+	req:    Http_Request_In,
+	status: int,
+	parsed: bool,
+}
+
+/*
+RFC 9110 10.1.1: a server "MUST NOT wait for the content before sending the 100
+(Continue) response". The header block alone gets a 100 back; the body sent
+after it is then read. HTTP/1.0 is not answered one, and neither is a request
+whose body is already here.
+*/
+@(test)
+test_expect_100_continue_is_answered_before_the_body :: proc(t: ^testing.T) {
+	Case :: struct {
+		what:     string,
+		version:  string,
+		early:    bool, // the body sent with the header block
+		chunked:  bool,
+		continue_: bool,
+	}
+	CASES := []Case {
+		{"a Content-Length body", "HTTP/1.1", false, false, true},
+		{"a chunked body", "HTTP/1.1", false, true, true},
+		{"a body already sent", "HTTP/1.1", true, false, false},
+	}
+	for c in CASES {
+		client, accepted, paired := loopback_tcp_pair(t)
+		if !testing.expectf(t, paired, "%s: no loopback connection", c.what) {
+			return
+		}
+		body := "4\r\nabcd\r\n0\r\n\r\n" if c.chunked else "abcd"
+		framing := "Transfer-Encoding: chunked\r\n" if c.chunked else "Content-Length: 4\r\n"
+		head := fmt.tprintf("POST /dns-query %s\r\nHost: dns.example\r\n%sExpect: 100-continue\r\n\r\n%s", c.version, framing, body if c.early else "")
+		_, serr := net.send_tcp(client, transmute([]u8)head)
+		testing.expectf(t, serr == nil, "%s: cannot send the header block: %v", c.what, serr)
+		testing.expectf(t, net.set_option(accepted, .Receive_Timeout, 3 * time.Second) == nil, "%s: cannot bound the reader", c.what)
+		testing.expectf(t, net.set_option(client, .Receive_Timeout, 3 * time.Second) == nil, "%s: cannot bound the client", c.what)
+
+		cr := Continue_Reader {
+			r = Http_Reader {
+				conn = Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}},
+				buf = make([dynamic]u8, 0, HTTP_BUF_SIZE),
+			},
+		}
+		reader := thread.create_and_start_with_poly_data(&cr, proc(cr: ^Continue_Reader) {
+			cr.req, cr.status, cr.parsed = read_http_request(&cr.r)
+		})
+		if !testing.expectf(t, reader != nil, "%s: cannot start the reader", c.what) {
+			delete(cr.r.buf)
+			net.close(client)
+			net.close(accepted)
+			return
+		}
+		if c.continue_ {
+			// The 100, read before the body goes: what the reader wrote with
+			// nothing to wait for.
+			got: [len(HTTP_CONTINUE)]u8
+			n, rerr := net.recv_tcp(client, got[:])
+			testing.expectf(t, rerr == nil && string(got[:n]) == HTTP_CONTINUE, "%s: got %q (%v), want the 100", c.what, string(got[:n]), rerr)
+		}
+		if !c.early {
+			_, berr := net.send_tcp(client, transmute([]u8)body)
+			testing.expectf(t, berr == nil, "%s: cannot send the body: %v", c.what, berr)
+		}
+		thread.join(reader)
+		thread.destroy(reader)
+		if testing.expectf(t, cr.parsed, "%s was refused with %d", c.what, cr.status) {
+			testing.expectf(t, string(cr.req.body) == "abcd", "%s: body %q", c.what, string(cr.req.body))
+		}
+		if !c.continue_ {
+			// Nothing was written: the reader is done, so a 100 it sent would
+			// be waiting to be read. Closed, so the read ends with nothing.
+			net.close(accepted)
+			stray: [64]u8
+			// The end of the stream, not an error: anything else is no evidence
+			// either way.
+			n, rerr := net.recv_tcp(client, stray[:])
+			testing.expectf(t, rerr == nil && n == 0, "%s: %q was written (%v), want nothing", c.what, string(stray[:n]), rerr)
+		} else {
+			net.close(accepted)
+		}
+		net.close(client)
+		delete(cr.r.buf)
+		free_all(context.temp_allocator)
+	}
+
+	/*
+	HTTP/1.0 gets no 100 (10.1.1: "MUST ignore" the expectation there). The
+	header block alone is sent and the sending side shut, so the reader reaches
+	the body and ends there on the end of the stream: a 100 it wrote on the
+	way would be waiting to be read.
+	*/
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !testing.expect(t, paired, "HTTP/1.0: no loopback connection") {
+		return
+	}
+	defer net.close(client)
+	head := "POST /dns-query HTTP/1.0\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n"
+	_, serr := net.send_tcp(client, transmute([]u8)head)
+	testing.expectf(t, serr == nil, "HTTP/1.0: cannot send the header block: %v", serr)
+	testing.expect(t, net.shutdown(client, .Send) == nil, "HTTP/1.0: cannot end the stream")
+	testing.expect(t, net.set_option(accepted, .Receive_Timeout, 3 * time.Second) == nil, "HTTP/1.0: cannot bound the reader")
+	testing.expect(t, net.set_option(client, .Receive_Timeout, 3 * time.Second) == nil, "HTTP/1.0: cannot bound the client")
+	r := Http_Reader {
+		conn = Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}},
+		buf = make([dynamic]u8, 0, HTTP_BUF_SIZE),
+	}
+	defer delete(r.buf)
+	_, status, parsed := read_http_request(&r)
+	// The premise: it read the header block and then waited for the body.
+	testing.expect(t, !parsed && status == 0, "HTTP/1.0: the reader did not end at the body")
+	net.close(accepted)
+	stray: [64]u8
+	n, rerr := net.recv_tcp(client, stray[:])
+	testing.expectf(t, rerr == nil && n == 0, "HTTP/1.0: %q was written (%v), want nothing", string(stray[:n]), rerr)
+	free_all(context.temp_allocator)
 }

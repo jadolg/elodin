@@ -171,39 +171,44 @@ http_fill :: proc(r: ^Http_Reader) -> bool {
 /*
 One line, up to CRLF.
 
-A bare LF, a bare CR or a NUL before it refuses the request (#432). RFC 9112 2.2
-lets a recipient take a bare LF for a line end, so a hop in front may read
+A bare LF, a bare CR or a NUL before it refuses the request (#432), and says so
+with `malformed`, which the caller answers with a 400. RFC 9112 2.2 lets a
+recipient take a bare LF for a line end, so a hop in front may read
 `X: a\nTransfer-Encoding: chunked` as two fields where this one would read one,
 and frame the body by chunks where this one framed it by Content-Length. The
 same goes for the request line, and a bare CR or NUL is what some hops split on
 or cut at. Nothing that speaks DoH sends any of them, and HTTP/2 already refuses
 them in a value (`field_value_is_valid`).
 
+`from` is where the bytes `MAX_HEADER_BYTES` bounds start: the request, for its
+header block, or the line, for a chunk's. A line past it, or a read that fails,
+is `ok` false and not `malformed`.
+
 Every byte before the first CRLF is looked at on the pass that finds it, so a
 byte is judged once it has a successor to be read against.
 */
 @(private)
-http_line :: proc(r: ^Http_Reader) -> (line: string, ok: bool) {
+http_line :: proc(r: ^Http_Reader, from := 0) -> (line: string, ok: bool, malformed: bool) {
 	for {
 		region := r.buf[r.pos:]
 		for i in 0 ..< max(0, len(region) - 1) {
 			switch region[i] {
 			case '\r':
 				if region[i + 1] != '\n' {
-					return "", false
+					return "", false, true
 				}
 				start := r.pos
 				r.pos += i + 2
-				return string(r.buf[start:start + i]), true
+				return string(r.buf[start:start + i]), true, false
 			case '\n', 0:
-				return "", false
+				return "", false, true
 			}
 		}
-		if len(r.buf) > MAX_HEADER_BYTES {
-			return "", false
+		if len(r.buf) - from > MAX_HEADER_BYTES {
+			return "", false, false
 		}
 		if !http_fill(r) {
-			return "", false
+			return "", false, false
 		}
 	}
 }
@@ -284,23 +289,17 @@ http_version_status :: proc(version: string) -> int {
 Read one request off `r`.
 
 `status` says what the caller is to answer a request this refuses with, and 0
-says to answer nothing and close. What decides between the two is whether this
-hop and the hop in front agree on where the message ends, not how far into the
-request the refusal happened. Nothing is answered where the framing is what was
-wrong - an unreadable `Content-Length`, a folded field line, a chunked body:
-those are requests the two hops may cut in different places, and a reply on a
-connection whose next byte this server cannot place would be a reply the front
-end may attribute to the next request on it.
-
-The rest are framed the way both hops read them, so the refusals the RFC asks
-for are safe to send: a request line is either read whole or not read at all, a
-missing, repeated or invalid `Host` or a repeated `Content-Type` - refused once
-the header block is read, so that framing anywhere in it still decides - has no
-bearing on where the body ends, and a `Content-Length` over `MAX_DOH_BODY` says
-exactly where it ends, only too far away. Each of those closes the connection
-after answering, and drains what the client had already sent before it does, so
-that the answer is not lost to the RST that closing on unread bytes would send -
-see `http_linger`.
+says to answer nothing and close: a read that failed, or a header block past
+`MAX_HEADER_BYTES`, where there is no whole request to answer. Every other
+refusal is answered and the connection then closes, which is what RFC 9112
+asks for the requests whose framing is in doubt - a `Transfer-Encoding` whose
+final coding is not chunked or a `Content-Length` that is invalid or repeated
+(6.3), an obs-fold (5.2), whitespace before a field's colon (5.1) - and what
+makes answering them safe: nothing more is read on the connection, so there is
+no next request for a front end and this hop to cut in different places. The
+caller drains what the client had already sent before it closes, so that the
+answer is not lost to the RST that closing on unread bytes would send - see
+`http_linger`.
 
 A refusal after the request line is read hands back the method alone, so that
 the refusal to a HEAD can go without content (RFC 9110 9.3.2).
@@ -323,7 +322,10 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 		held^ &&= err == nil && len(out) == len(s)
 		return out
 	}
-	line := http_line(r) or_return
+	line, lok, lbad := http_line(r)
+	if !lok {
+		return {}, 400 if lbad else 0, false
+	}
 
 	// "METHOD SP request-target SP HTTP-version", three tokens and nothing else
 	// (RFC 9112 3).
@@ -375,15 +377,32 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 		return {}, 400, false
 	}
 	req.method = hold(line[:first], &held)
+	refused := Http_Request_In {
+		method = req.method,
+	}
 	http_1_0 := version == "HTTP/1.0"
 	req.keep_alive = !http_1_0
 
-	if q := strings.index_byte(target, '?'); q >= 0 {
-		req.path = hold(target[:q], &held)
-		req.query = hold(target[q + 1:], &held)
-	} else {
-		req.path = hold(target, &held)
+	/*
+	RFC 9112 3.2.2: a server "MUST accept the absolute-form", and takes the
+	host from it rather than from `Host` (3.2). Its authority is held to what
+	`Host` is, userinfo included (RFC 9110 4.2.4), and what follows it is the
+	origin-form target the rest of this reads.
+	*/
+	authority, absolute := absolute_form_authority(target)
+	if absolute {
+		if authority == "" || !h2.authority_is_valid(authority) {
+			return refused, 400, false
+		}
+		target = target[strings.index(target, "//") + 2 + len(authority):]
 	}
+	path := target
+	if q := strings.index_byte(target, '?'); q >= 0 {
+		path = target[:q]
+		req.query = hold(target[q + 1:], &held)
+	}
+	// An absolute-form target with no path names the root (RFC 9110 4.2.3).
+	req.path = hold(path if path != "" || !absolute else "/", &held)
 
 	// -1 rather than 0, so a second Content-Length can be told from the first.
 	content_length := -1
@@ -391,15 +410,19 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	// client sent, and a second one has to be told from it.
 	hosts := 0
 	content_types := 0
+	codings: Transfer_Codings
+	expect_continue := false
 	/*
-	A 400 earned inside the header block is answered only once the block is
-	read, as the 413 below is: a `Transfer-Encoding` or a second
-	`Content-Length` further down makes the framing what is wrong, and that is
-	answered with nothing wherever in the block it appears.
+	A 400 earned by a field's value is answered only once the block is read, as
+	the 413 below is, so that every field line is still judged as one: a field
+	line that cannot be read is answered at once.
 	*/
 	malformed := false
 	for {
-		header := http_line(r) or_return
+		header, hok, hbad := http_line(r)
+		if !hok {
+			return refused, 400 if hbad else 0, false
+		}
 		if header == "" {
 			break
 		}
@@ -412,47 +435,44 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 		the colon is not a field name (RFC 9112 5.1). Read here as "no header of
 		that name", either one leaves the body unread while the front end that
 		unfolded or trimmed it forwards a body length elodin never applied - the
-		remainder becomes the next request on the connection. Both RFCs ask a
-		server to reject rather than guess, and nothing that speaks DoH sends
-		either.
+		remainder becomes the next request on the connection. Both sections have
+		a server answer them with a 400, and nothing that speaks DoH sends either.
 		*/
 		if header[0] == ' ' || header[0] == '\t' {
-			return {}, 0, false
+			return refused, 400, false
 		}
 		colon := strings.index_byte(header, ':')
 		if colon <= 0 {
-			return {}, 0, false
+			return refused, 400, false
 		}
 		if header[colon - 1] == ' ' || header[colon - 1] == '\t' {
-			return {}, 0, false
+			return refused, 400, false
 		}
 		/*
 		And a name is a token (RFC 9110 5.1), compared without regard to ASCII
 		case and no other. `strings.equal_fold` folds Unicode, where the long s
-		(U+017F) is an `s`, so `Ho\u017ft` would count as Host; and a name outside
+		(U+017F) is an `s`, so `Hoſt` would count as Host; and a name outside
 		the token grammar, once folded ASCII only, would be skipped here while a
-		hop that folds the other way reads `Tran\u017ffer-Encoding` as framing
+		hop that folds the other way reads `Tranſfer-Encoding` as framing
 		(#432). Refused, as the two shapes above are.
 		*/
 		name := header[:colon]
 		if !h2.is_token(name) {
-			return {}, 0, false
+			return refused, 400, false
 		}
 		// `OWS` off it and nothing more: see `h2.trim_ows`.
 		value := h2.trim_ows(header[colon + 1:])
 		switch {
 		case dns.name_equal_fold(name, "content-length"):
-			// RFC 9112 6.3: a message with more than one of these is invalid,
-			// whether or not they agree, because the hop in front is entitled to
-			// resolve the pair differently from the way this one would.
-			if content_length >= 0 {
-				return {}, 0, false
-			}
+			// RFC 9112 6.3: more than one of these, whether or not they agree,
+			// or one that is not a length is an invalid message, since the hop
+			// in front is entitled to resolve them differently from this one.
 			// Too large is not refused here but after the headers: see the 413
-			// below. Not a length at all is framing, and answered with nothing.
+			// below.
 			v, vok := h2.parse_content_length(value, MAX_DOH_BODY)
-			if !vok {
-				return {}, 0, false
+			if content_length >= 0 || !vok {
+				malformed = true
+				continue
 			}
 			content_length = v
 		case dns.name_equal_fold(name, "connection"):
@@ -487,9 +507,13 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			}
 			req.host = hold(value, &held)
 		case dns.name_equal_fold(name, "transfer-encoding"):
-			// Chunked request bodies are not accepted; DoH clients send a
-			// Content-Length.
-			return {}, 0, false
+			if !transfer_codings_add(&codings, value) {
+				malformed = true
+			}
+		case dns.name_equal_fold(name, "expect"):
+			// RFC 9110 10.1.1: ignored on HTTP/1.0, and any other expectation
+			// is one a server may ignore.
+			expect_continue ||= !http_1_0 && h2.list_has_token(value, "100-continue")
 		}
 	}
 
@@ -498,34 +522,232 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	if !held {
 		return {}, 0, false
 	}
+	if absolute {
+		req.host = hold(authority, &held)
+		if !held {
+			return {}, 0, false
+		}
+	}
 
-	// RFC 9112 3.2 again: Host carries the authority for an origin-form target,
-	// so an HTTP/1.1 request without one is a 400. HTTP/1.0 predates the field
-	// and is allowed to leave it out.
+	// RFC 9112 3.2 again: Host carries the authority, so an HTTP/1.1 request
+	// without one is a 400 even where the target carries it too. HTTP/1.0
+	// predates the field and is allowed to leave it out.
 	if malformed || (hosts == 0 && !http_1_0) {
-		return {method = req.method}, 400, false
+		return refused, 400, false
+	}
+
+	chunked := false
+	if codings.count > 0 {
+		switch {
+		/*
+		RFC 9112 6.1: an HTTP/1.0 message with a Transfer-Encoding is one whose
+		framing is faulty, and a request with both it and a Content-Length is
+		one a server may reject; this one does, since the pair is the shape
+		request smuggling takes. 6.3: a final coding other than chunked leaves
+		the length unknowable, which is a 400; chunked twice is a coding no
+		sender may apply.
+		*/
+		case http_1_0, content_length >= 0, !codings.final_chunked, codings.chunked > 1:
+			return refused, 400, false
+		// 6.1: a coding this server does not understand (it decodes chunked
+		// alone) is a 501.
+		case codings.count > 1:
+			return refused, 501, false
+		}
+		chunked = true
 	}
 
 	/*
 	RFC 9110 15.5.14: a body larger than the server will process is a 413. Digits
 	frame the request the same way to every hop - `parse_content_length` has
 	checked all of them, and too many is no ambiguity about where it ends - so this
-	is safe to answer, where an unreadable length is not. Only once every header is
-	read, though: a `Transfer-Encoding` or a second `Content-Length` further down
-	makes the framing what is wrong after all, and those are still closed on
-	unanswered. The body is not read, and the caller closes after the answer.
+	is safe to answer, as everything above is. The body is not read, and the caller
+	closes after the answer.
 	*/
 	if content_length > MAX_DOH_BODY {
-		return {method = req.method}, 413, false
+		return refused, 413, false
 	}
 
-	if content_length > 0 {
+	if (content_length > 0 || chunked) && expect_continue {
+		/*
+		RFC 9110 10.1.1: a server "MUST NOT wait for the content before sending
+		the 100 (Continue) response". Everything this reader refuses on the
+		header block is answered above with a final status instead; what is left
+		is decided on the body, so it gets the 100 - unless the body is already
+		here, which 10.1.1 lets a server leave unanswered.
+		*/
+		here := len(r.buf) - r.pos
+		if (chunked && here == 0) || (!chunked && here < content_length) {
+			if !conn_write_all(r.conn, transmute([]u8)string(HTTP_CONTINUE)) {
+				return {}, 0, false
+			}
+		}
+	}
+
+	if chunked {
+		body, bstatus, bok := read_chunked_body(r)
+		if !bok {
+			return refused, bstatus, false
+		}
+		req.body = body
+		/*
+		Closed after it is answered: the chunked framing this hop read is one a
+		front end may have cut differently, and closing leaves it no next request
+		on this connection to attribute anything to. RFC 9112 9.6 lets a server
+		close after any response.
+		*/
+		req.keep_alive = false
+	} else if content_length > 0 {
 		// A view, where everything above is a copy: the body is the last thing
 		// read, so nothing grows the buffer under it before the caller's
 		// `http_compact`, which is what ends it.
 		req.body = http_exact(r, content_length) or_return
 	}
 	return req, 0, true
+}
+
+// The interim response RFC 9110 10.1.1 has a server send to `Expect: 100-continue`.
+@(private)
+HTTP_CONTINUE :: "HTTP/1.1 100 Continue\r\n\r\n"
+
+/*
+The authority of an absolute-form request target (RFC 9112 3.2.2), for an
+`http` or `https` URI, the scheme compared without regard to ASCII case. Empty
+when the target has none; `absolute` false for an origin-form target or another
+scheme, which then reads as a path no endpoint serves.
+*/
+@(private)
+absolute_form_authority :: proc(target: string) -> (authority: string, absolute: bool) {
+	rest: string
+	switch {
+	case len(target) >= 7 && dns.name_equal_fold(target[:7], "http://"):
+		rest = target[7:]
+	case len(target) >= 8 && dns.name_equal_fold(target[:8], "https://"):
+		rest = target[8:]
+	case:
+		return "", false
+	}
+	end := strings.index_any(rest, "/?")
+	return rest if end < 0 else rest[:end], true
+}
+
+/*
+What the `Transfer-Encoding` field lines of a request say, as one list (RFC 9110
+5.3): how many codings, how many of them are chunked, and whether the last is.
+*/
+@(private)
+Transfer_Codings :: struct {
+	count:         int,
+	chunked:       int,
+	final_chunked: bool,
+}
+
+/*
+Add a `Transfer-Encoding` value's codings to `t`. False for a value that is not
+a list of codings (RFC 9112 7: a token, then parameters), or chunked with a
+parameter, which it has none of.
+*/
+@(private)
+transfer_codings_add :: proc(t: ^Transfer_Codings, value: string) -> bool {
+	rest := value
+	for element in strings.split_iterator(&rest, ",") {
+		coding := h2.trim_ows(element)
+		// RFC 9110 5.6.1: empty elements of a list are ignored.
+		if coding == "" {
+			continue
+		}
+		name := coding
+		params := false
+		if semi := strings.index_byte(coding, ';'); semi >= 0 {
+			name = h2.trim_ows(coding[:semi])
+			params = true
+		}
+		if !h2.is_token(name) {
+			return false
+		}
+		t.count += 1
+		t.final_chunked = dns.name_equal_fold(name, "chunked")
+		if t.final_chunked {
+			t.chunked += 1
+			if params {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+/*
+Read a chunked body (RFC 9112 7.1) and hand back the content, de-chunked in
+place in the reader's buffer: a view that ends at the caller's `http_compact`,
+as a Content-Length body's does.
+
+`status` is the answer to a body this refuses: 413 for content past
+`MAX_DOH_BODY`, 400 for a chunk that does not read as one, and 0 for a read that
+failed. A chunk-size is hex digits alone, bounded before it can overflow; a
+chunk extension is skipped, as 7.1.1 lets a recipient do; trailer fields are read
+as field lines and dropped (7.1.2), nothing this endpoint serves reading one.
+*/
+@(private)
+read_chunked_body :: proc(r: ^Http_Reader) -> (body: []u8, status: int, ok: bool) {
+	start := r.pos
+	end := start
+	for {
+		line, lok, lbad := http_line(r, from = r.pos)
+		if !lok {
+			return nil, 400 if lbad else 0, false
+		}
+		size := 0
+		digits := 0
+		for digits < len(line) {
+			v, hex := hex_nibble(line[digits])
+			if !hex {
+				break
+			}
+			size = size * 16 + int(v)
+			digits += 1
+			if size > MAX_DOH_BODY {
+				return nil, 413, false
+			}
+		}
+		// What follows the size is nothing, or an extension after optional
+		// whitespace (`BWS ";"`).
+		after := h2.trim_ows(line[digits:])
+		if digits == 0 || (after != "" && after[0] != ';') {
+			return nil, 400, false
+		}
+		if size == 0 {
+			break
+		}
+		if end - start + size > MAX_DOH_BODY {
+			return nil, 413, false
+		}
+		// Indices, not views: a read may move the buffer.
+		at := r.pos
+		_ = http_exact(r, size + 2) or_return
+		if r.buf[at + size] != '\r' || r.buf[at + size + 1] != '\n' {
+			return nil, 400, false
+		}
+		copy(r.buf[end:], r.buf[at:at + size])
+		end += size
+	}
+	// The trailer section: field lines up to an empty one, held to what a
+	// header block's lines are, and to `MAX_HEADER_BYTES` between them.
+	trailers := r.pos
+	for {
+		line, lok, lbad := http_line(r, from = trailers)
+		if !lok {
+			return nil, 400 if lbad else 0, false
+		}
+		if line == "" {
+			break
+		}
+		colon := strings.index_byte(line, ':')
+		if colon <= 0 || !h2.is_token(line[:colon]) {
+			return nil, 400, false
+		}
+	}
+	return r.buf[start:end], 0, true
 }
 
 /*
@@ -1029,6 +1251,8 @@ http_refusal_message :: proc(status: int) -> string {
 	switch status {
 	case 413:
 		return "content too large"
+	case 501:
+		return "not implemented"
 	case 505:
 		return "http version not supported"
 	}
