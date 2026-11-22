@@ -35,14 +35,26 @@ COOKIE_SERVER_MAX :: 32
 
 @(private)
 Cookie :: struct {
-	client:     [COOKIE_CLIENT_LEN]u8,
+	client:        [COOKIE_CLIENT_LEN]u8,
 	// What the server last gave us, empty until it has.
-	server:     [COOKIE_SERVER_MAX]u8,
-	server_len: int,
-	// Until when a move's forgotten server cookie may still be on queries
-	// waiting for replies, which owe one (`cookie_matches`); zero once a cookie
-	// is learned from the address moved to. See `cookie_moved_locked`.
-	moved_until: loop.Moment,
+	server:        [COOKIE_SERVER_MAX]u8,
+	server_len:    int,
+	/*
+	Whether this server has issued a cookie since it was last parked or moved:
+	one that does cookies, whose replies owe one (RFC 7873 section 5.3).
+	Outlives a rollover, which only forgets the server cookie bound to the old
+	client cookie: the server is the same and does cookies still.
+	*/
+	speaks:        bool,
+	// Until when a server cookie forgotten with the client cookie, on a move or
+	// a rollover, may still be on queries waiting for replies, which owe one
+	// (`cookie_matches`); zero once a cookie is learned again. See
+	// `cookie_renewed_locked`.
+	renewed_until: loop.Moment,
+	// When the client cookie is next drawn afresh (`attach_cookie`).
+	roll_at:       loop.Moment,
+	// The furthest any query that took a cookie may still wait for its reply.
+	out_until:     loop.Moment,
 }
 
 /*
@@ -67,6 +79,10 @@ cookies_wanted :: proc(u: ^Upstream) -> bool {
 /*
 Put our cookie for this upstream into a copy of the query.
 
+The client cookie is drawn afresh first once its lifetime is up (RFC 7873
+section 7.1 holds a client's secret to the same lifetime as a server's), unless
+`roll` is false. `in_flight` is the longest this query may wait for its reply.
+
 `ok` is false when the query has no OPT record to carry it, and the query goes
 out as it is. Every query the server forwards carries one
 (`server.upstream_query`); this is for one built by hand. `dry` is true where
@@ -74,11 +90,27 @@ the copy failed for want of memory instead, and the query must not go out
 without the cookie for that.
 */
 @(private)
-attach_cookie :: proc(u: ^Upstream, query: []u8, allocator: mem.Allocator) -> (out: []u8, ok: bool, dry: bool) {
+attach_cookie :: proc(
+	u: ^Upstream,
+	query: []u8,
+	in_flight: time.Duration,
+	allocator: mem.Allocator,
+	// False for the retries within one exchange, which answer a refusal with
+	// the server cookie the refusal carried and must not drop it.
+	roll := true,
+) -> (
+	out: []u8,
+	ok: bool,
+	dry: bool,
+) {
 	option: [COOKIE_CLIENT_LEN + COOKIE_SERVER_MAX]u8
 	n := 0
 
 	sync.mutex_lock(&u.mu)
+	if roll && loop.moment_since(u.cookie.roll_at) >= 0 {
+		renew_cookie_locked(u, in_flight, moved = false)
+	}
+	u.cookie.out_until = max(u.cookie.out_until, loop.moment_add(loop.moment_now(), in_flight))
 	n += copy(option[:], u.cookie.client[:])
 	n += copy(option[n:], u.cookie.server[:u.cookie.server_len])
 	sync.mutex_unlock(&u.mu)
@@ -125,8 +157,8 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	}
 	sync.mutex_lock(&u.mu)
 	echoed := u.cookie.client
-	held := u.cookie.server_len > 0
-	moved := cookie_moved_locked(u)
+	held := u.cookie.server_len > 0 || u.cookie.speaks
+	moved := cookie_renewed_locked(u)
 	sync.mutex_unlock(&u.mu)
 
 	/*
@@ -158,22 +190,24 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	// upstream this server holds no cookie for - every cookie-less one - this
 	// would otherwise re-walk the query for each datagram of a spoofing flood
 	// to reach a verdict `held` had already settled.
-	// Just after a move a query may have gone out with the server cookie the
-	// move forgot: its reply owes one all the same.
+	// Just after a move or a rollover a query may have gone out to a server
+	// known to do cookies, with a client cookie since drawn afresh and with or
+	// without the server cookie forgotten: its reply owes one all the same.
 	expected := false
 	sent: []u8
 	carried := false
 	if held || moved {
 		sent, carried = dns.peek_edns_option(query, .Cookie)
-		expected = carried && (held || len(sent) > COOKIE_CLIENT_LEN)
+		earlier := carried && len(sent) >= COOKIE_CLIENT_LEN && mem.compare(sent[:COOKIE_CLIENT_LEN], echoed[:]) != 0
+		expected = carried && (held || len(sent) > COOKIE_CLIENT_LEN || (moved && earlier))
 	}
 
 	raw, found := reply_cookie(response)
 	if !found {
 		return !expected
 	}
-	// The client cookie the query went out with, which a move may since have
-	// drawn afresh (`resolve_endpoint`): the reply echoes that one. Read only
+	// The client cookie the query went out with, which a move or a rollover may
+	// since have drawn afresh (`renew_cookie_locked`): the reply echoes that one. Read only
 	// for a reply that carries a cookie, for the reason `held` gives above.
 	if !held && !moved {
 		sent, carried = dns.peek_edns_option(query, .Cookie)
@@ -193,10 +227,38 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	return true
 }
 
-// Whether a move's forgotten server cookie may still be out. Under `u.mu`.
+// Whether a server cookie forgotten on a move or a rollover may still be out.
+// Under `u.mu`.
 @(private)
-cookie_moved_locked :: proc(u: ^Upstream) -> bool {
-	return u.cookie.moved_until != 0 && loop.moment_since(u.cookie.moved_until) < 0
+cookie_renewed_locked :: proc(u: ^Upstream) -> bool {
+	return u.cookie.renewed_until != 0 && loop.moment_since(u.cookie.renewed_until) < 0
+}
+
+/*
+Draw a new client cookie and forget the server cookie bound to the old one.
+Replies to queries already out under the old one are still held to the cookie
+they owe for as long as any of them, or one asked with `in_flight` to spare,
+may wait. Under `u.mu`.
+*/
+@(private)
+renew_cookie_locked :: proc(
+	u: ^Upstream,
+	in_flight: time.Duration,
+	// True for a move, to an address that may be another server and is judged
+	// afresh; false for a rollover, which leaves `speaks` as it is.
+	moved: bool,
+) {
+	if u.cookie.server_len > 0 || u.cookie.speaks {
+		// The furthest wait of any query out, not only the caller's: one
+		// with more budget left may outlive the caller's.
+		u.cookie.renewed_until = max(u.cookie.renewed_until, u.cookie.out_until, loop.moment_add(loop.moment_now(), in_flight))
+	}
+	if moved {
+		forget_cookie(u)
+	} else {
+		u.cookie.server_len = 0
+	}
+	init_cookie(u)
 }
 
 /*
@@ -213,6 +275,7 @@ The caller holds `u.mu`.
 @(private)
 forget_cookie :: proc(u: ^Upstream) {
 	u.cookie.server_len = 0
+	u.cookie.speaks = false
 }
 
 /*
@@ -250,7 +313,8 @@ learn_cookie :: proc(u: ^Upstream, response: []u8) {
 		return
 	}
 	u.cookie.server_len = copy(u.cookie.server[:], server)
-	u.cookie.moved_until = 0
+	u.cookie.speaks = true
+	u.cookie.renewed_until = 0
 }
 
 /*
@@ -277,7 +341,7 @@ exchange_with_cookie :: proc(
 	response: []u8,
 	err: Error,
 ) {
-	asked, attached, dry := attach_cookie(u, query, context.temp_allocator)
+	asked, attached, dry := attach_cookie(u, query, timeout, context.temp_allocator)
 	if dry && !attached {
 		return nil, .Out_Of_Memory
 	}
@@ -293,7 +357,7 @@ exchange_with_cookie :: proc(
 		// moment ago at the top of this proc, and nothing about it has changed
 		// since. A refusal rather than an assertion because the alternative is
 		// sending the query on without the cookie the server has just insisted on.
-		retry, retried, retry_dry := attach_cookie(u, query, context.temp_allocator)
+		retry, retried, retry_dry := attach_cookie(u, query, timeout, context.temp_allocator, roll = false)
 		if !retried {
 			// `response` came out of `allocator`, which on the race path is the
 			// process heap: dropping it here would leak it for the life of the
@@ -315,7 +379,7 @@ exchange_with_cookie :: proc(
 			logx.debugf("upstream %s: BADCOOKIE after a fresh cookie, asking over TCP", u.spec.name)
 			delete(response, allocator)
 			response = nil
-			over_tcp, attached_tcp, tcp_dry := attach_cookie(u, query, context.temp_allocator)
+			over_tcp, attached_tcp, tcp_dry := attach_cookie(u, query, timeout, context.temp_allocator, roll = false)
 			if !attached_tcp {
 				return nil, .Out_Of_Memory if tcp_dry else .Bad_Response
 			}
@@ -411,4 +475,5 @@ init_cookie :: proc(u: ^Upstream) {
 	// for a client cookie that cannot be used to recognise this resolver from
 	// one server to the next.
 	crypto.rand_bytes(u.cookie.client[:])
+	u.cookie.roll_at = loop.moment_add(loop.moment_now(), time.Duration(dns.cookie_secret_lifetime()) * time.Second)
 }

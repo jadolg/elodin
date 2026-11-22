@@ -23,13 +23,16 @@ config_cookies :: proc(
 	// On by default, as shipped, so every case runs through the read loop's
 	// cookie check ahead of the limiter.
 	rate_limit := "enabled: true",
+	secret := "e5e973e5a6b2a43f48e7dc849e37bfcf",
 ) -> string {
 	return base_config(
 		udp_port,
 		upstream_at(upstream_port),
+		// Info, for the line that says a reload is over.
+		log = "{ level: info }",
 		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
 		timeout = "3s",
-		extra = fmt.tprintf("server:\n  rate_limit: {{ %s }}\ncookies:\n  enabled: true\n  require: %v\n  secret: e5e973e5a6b2a43f48e7dc849e37bfcf", rate_limit, require),
+		extra = fmt.tprintf("server:\n  rate_limit: {{ %s }}\ncookies:\n  enabled: true\n  require: %v\n  secret: %s", rate_limit, require, secret),
 	)
 }
 
@@ -658,6 +661,26 @@ run_cookie_require_cases :: proc(r: ^Runner, mock: ^Mock, upstream_port: int) {
 			h := parse_header(r, res.wire)
 			check_eq_int(r, h.rcode, int(dns.Rcode.No_Error), "rcode")
 			check(r, h.ancount > 0, "a TCP client was refused")
+		}
+	}
+	end_case(r)
+
+	start_case(r, "cookies: a reload that changes the secret still accepts the cookie issued under the old one")
+	{
+		// RFC 7873 section 7.1's grace after a rollover: `require` does not
+		// turn away a client that was issued a cookie a moment ago.
+		issued := check_primed(r, query_udp(udp_port, priming_query(CLIENT_COOKIE)), .No_Error)
+		changed := config_cookies(udp_port, upstream_port, true, secret = "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
+		if issued != nil && check(r, reload_to(r, &srv, changed, "msg=reloaded"), "the reload was not applied") {
+			query := build_query(f.qname, f.qtype, id = 0x4245, edns_size = 1232, cookie = issued)
+			res := query_udp(udp_port, query)
+			if check(r, res.ok, "no response") {
+				msg, decoded := decode_reply(r, res.wire)
+				if decoded {
+					check_eq_int(r, int(dns.rcode_of(msg)), int(dns.Rcode.No_Error), "rcode for the cookie under the old secret")
+					check(r, len(msg.answer) > 0, "the client holding the old secret's cookie was not answered")
+				}
+			}
 		}
 	}
 	end_case(r)

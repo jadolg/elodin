@@ -245,7 +245,7 @@ harness_start :: proc(
 
 @(private)
 harness_stop :: proc(h: ^Harness) {
-	stop_cookies(&h.srv)
+	release_parts(&h.srv, {.Cookie_Secrets, .Cookies})
 	if h.srv.validator != nil {
 		dnssec.destroy_validator(h.srv.validator)
 		h.srv.validator = nil
@@ -1080,4 +1080,11 @@ expect_refused_unforwarded :: proc(t: ^testing.T, h: ^Harness, query: []u8, what
 	testing.expect_value(t, outcome, Outcome.Failed, loc = loc)
 	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Form_Err, loc = loc)
 	return out
+}
+
+// A keeper issuing under `key` alone, its secrets on the temp allocator.
+secret_keeper :: proc(key: [COOKIE_SECRET_LEN]u8) -> Cookie_Keeper {
+	k := Cookie_Keeper{secrets = new(Cookie_Secrets, context.temp_allocator)}
+	k.secrets.slots[0].key = key
+	return k
 }

@@ -3,9 +3,11 @@ package server
 import "core:encoding/hex"
 import "core:mem"
 import "core:testing"
+import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 
 // RFC 9018 appendix A's server secret, client cookie and client.
 @(private = "file")
@@ -25,9 +27,9 @@ unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
 
 @(private = "file")
 keeper :: proc(secret_hex: string) -> Cookie_Keeper {
-	k: Cookie_Keeper
-	copy(k.secret[:], unhex(secret_hex))
-	return k
+	key: [COOKIE_SECRET_LEN]u8
+	copy(key[:], unhex(secret_hex))
+	return secret_keeper(key)
 }
 
 @(private = "file")
@@ -103,7 +105,7 @@ test_cookie_rfc9018_a4_ipv6 :: proc(t: ^testing.T) {
 	want := unhex("22681ab97d52c298010000005cf7c609a6bb79d16625507a")
 	testing.expect(t, mem.compare(got[:], want) == 0, "the server cookie does not match RFC 9018 A.4")
 
-	// The secret has rolled since this one was issued, and we keep no history.
+	// Issued under a secret this keeper does not hold.
 	stale := unhex("22681ab97d52c298010000005cf7c57926556bd0934c72f8")
 	testing.expect(t, !verify_cookie(&k, stale, req, 1559741961), "a cookie from a retired secret verified")
 	free_all(context.temp_allocator)
@@ -290,7 +292,7 @@ roundtrip :: proc(t: ^testing.T, c: Roundtrip) -> (out: []u8, ok: bool) {
 		testing.expect(t, false, "the cookie keeper would not start")
 		return nil, false
 	}
-	defer stop_cookies(&s)
+	defer release_parts(&s, {.Cookie_Secrets, .Cookies})
 
 	if !seed_cache(t, answers, "example.com.", stored_wire) {
 		return nil, false
@@ -710,5 +712,78 @@ test_cookie_priming_needs_a_cookie_and_no_question :: proc(t: ^testing.T) {
 			testing.expectf(t, rcode == .Form_Err, "case %d: rcode %v", i, rcode)
 		}
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+A drawn secret is replaced once its lifetime is up (RFC 7873 section 7.1). The
+cookie issued after that is under the new secret, the one issued before it is
+still correct for `COOKIE_ROLLOVER_GRACE` seconds and not a second more, and
+the next rollover is a lifetime away, less the jitter.
+*/
+@(test)
+test_a_drawn_secret_rolls_over :: proc(t: ^testing.T) {
+	ROLL :: u32(1_000_000)
+	k := keeper(SECRET)
+	k.secrets.next_roll = loop.moment_add(loop.moment_now(), time.Hour)
+	req := request(CLIENT_COOKIE, CLIENT)
+
+	// Due an hour from now on the boot clock: the wall clock reading a day
+	// later, as after a step, does not bring it forward.
+	before := make_cookie(&k, req, ROLL - 1)
+	testing.expect_value(t, k.secrets.epoch, 0)
+	_ = make_cookie(&k, req, ROLL - 1 + 86_400) // lint:allow only the epoch it leaves is under test
+	testing.expect_value(t, k.secrets.epoch, 0)
+
+	k.secrets.next_roll = loop.moment_add(loop.moment_now(), -time.Second)
+	after := make_cookie(&k, req, ROLL)
+	testing.expect_value(t, k.secrets.epoch, 1)
+	unrolled := keeper(SECRET)
+	under_old := make_cookie(&unrolled, req, ROLL)
+	testing.expect(t, mem.compare(after[16:], under_old[16:]) != 0, "the cookie after the rollover is under the old secret")
+
+	lifetime := time.Duration(dns.COOKIE_SECRET_LIFETIME) * time.Second
+	shortest := lifetime * (100 - dns.COOKIE_SECRET_JITTER) / 100
+	next := time.Duration(k.secrets.next_roll - loop.moment_now())
+	testing.expectf(t, next >= shortest - time.Minute && next <= lifetime, "the next rollover is %v away", next)
+
+	testing.expect(t, verify_cookie(&k, before[:], req, ROLL + COOKIE_ROLLOVER_GRACE), "a cookie under the previous secret failed inside the grace")
+	testing.expect(t, !verify_cookie(&k, before[:], req, ROLL + COOKIE_ROLLOVER_GRACE + 1), "a cookie under the previous secret verified past the grace")
+	testing.expect(t, verify_cookie(&k, after[:], req, ROLL + COOKIE_ROLLOVER_GRACE + 1), "a cookie under the new secret failed")
+	// A thread whose clock read came a moment before the rolling thread's.
+	testing.expect(t, verify_cookie(&k, before[:], req, ROLL - 1), "a cookie under the previous secret failed for a reader a second behind the rollover")
+	// A clock stepped back further than the skew cookies allow does not
+	// stretch the grace.
+	testing.expect(t, !verify_cookie(&k, before[:], req, ROLL - COOKIE_MAX_SKEW - 1), "the grace stretched over a clock stepped back")
+
+	// A configured secret has no rollover scheduled, and is never replaced.
+	configured := keeper(SECRET)
+	far := make_cookie(&configured, req, ROLL * 4000)
+	testing.expect_value(t, configured.secrets.epoch, 0)
+	far_unrolled := make_cookie(&unrolled, req, ROLL * 4000)
+	testing.expect(t, mem.compare(far[:], far_unrolled[:]) == 0, "a configured secret was replaced")
+	free_all(context.temp_allocator)
+}
+
+/*
+`cookies.previous_secret` is accepted on the cookies clients return and never
+issued under: RFC 9018 section 5's stages 1 and 2 of a shared secret's change.
+*/
+@(test)
+test_a_previous_secret_is_accepted_and_not_issued :: proc(t: ^testing.T) {
+	req := request(CLIENT_COOKIE, CLIENT)
+	other := keeper("000102030405060708090a0b0c0d0e0f")
+	from_other := make_cookie(&other, req, 1_000_000)
+
+	k := keeper(SECRET)
+	testing.expect(t, !verify_cookie(&k, from_other[:], req, 1_000_000), "the premise: a cookie under another secret verified")
+	copy(k.accepted[:], unhex("000102030405060708090a0b0c0d0e0f"))
+	k.has_accepted = true
+	testing.expect(t, verify_cookie(&k, from_other[:], req, 1_000_000), "a cookie under the previous secret was refused")
+
+	issued := make_cookie(&k, req, 1_000_000)
+	plain := keeper(SECRET)
+	want := make_cookie(&plain, req, 1_000_000)
+	testing.expect(t, mem.compare(issued[:], want[:]) == 0, "a cookie was issued under the previous secret")
 	free_all(context.temp_allocator)
 }

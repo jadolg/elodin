@@ -133,7 +133,7 @@ answer_once :: proc(t: ^testing.T, stored_wire: []u8, advertised: u16) -> (out: 
 		testing.expect(t, false, "the cookie keeper would not start")
 		return nil, false
 	}
-	defer stop_cookies(&s)
+	defer release_parts(&s, {.Cookie_Secrets, .Cookies})
 
 	if !seed_cache(t, answers, QNAME, stored_wire) {
 		return nil, false

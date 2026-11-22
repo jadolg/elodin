@@ -163,7 +163,7 @@ test_a_reload_hands_unchanged_parts_to_the_new_generation :: proc(t: ^testing.T)
 	testing.expect(t, cur.cookies == old.cookies, "an unchanged cookie section rebuilt the keeper")
 	testing.expect(t, cur.limiter == old.limiter, "an unchanged rate limit rebuilt the limiter")
 	testing.expect_value(t, cur.policy, old.policy)
-	testing.expect_value(t, cur.owns, Parts{.Upstreams, .Cookies, .Limiter, .Answers})
+	testing.expect_value(t, cur.owns, Parts{.Upstreams, .Cookies, .Cookie_Secrets, .Limiter, .Answers})
 	testing.expect_value(t, old.owns, Parts{})
 	testing.expect_value(t, len(cur.cfg.rewrites), 1)
 }
@@ -345,7 +345,8 @@ test_a_reload_keeps_the_cookie_secret_unless_the_file_changes_it :: proc(t: ^tes
 	}
 	defer close_fixture(f)
 	old := f.s.gens.current.cookies
-	secret := old.secret
+	secret := old.secrets.slots[old.secrets.epoch % COOKIE_SECRET_SLOTS].key
+	testing.expect(t, old.secrets.next_roll != 0, "a drawn secret has no rollover scheduled")
 
 	reload_from(t, f, swap(BASE, "cookies: { enabled: true }", "cookies: { enabled: true, require: true }"))
 	cur := f.s.gens.current.cookies
@@ -353,7 +354,28 @@ test_a_reload_keeps_the_cookie_secret_unless_the_file_changes_it :: proc(t: ^tes
 		return
 	}
 	testing.expect(t, cur.require, "require was not applied")
-	testing.expect(t, cur.secret == secret, "a reload that left the secret alone drew a new one")
+	// Shared, not copied: the retiring generation answers on under the same
+	// secrets, and a rollover either of them makes is the other's too.
+	testing.expect(t, cur.secrets == old.secrets, "a reload that left the secret alone did not share the secrets")
+	testing.expect(t, .Cookie_Secrets in f.s.gens.current.owns, "the secrets were not handed to the new generation")
+
+	/*
+	A rollover, then two reloads that change the secret, all inside one grace:
+	the secrets the rollover and the first reload retired keep the rest of
+	their grace, and the one the second replaces gets its own (RFC 7873
+	section 7.1).
+	*/
+	req: Cookie_Request
+	copy(req.client[:], "clientck")
+	req.ip_len = 4
+	req.ip[0] = 192
+	now := cookie_now()
+	under_first := make_cookie(cur, req, now)
+	sync.atomic_store(&cur.secrets.next_roll, loop.moment_add(loop.moment_now(), -time.Second))
+	under_second := make_cookie(cur, req, now)
+	if !testing.expect_value(t, cur.secrets.epoch, 1) {
+		return
+	}
 
 	reload_from(
 		t,
@@ -363,7 +385,70 @@ test_a_reload_keeps_the_cookie_secret_unless_the_file_changes_it :: proc(t: ^tes
 			"cookies: { enabled: true }",
 			"cookies: { enabled: true, secret: \"000102030405060708090a0b0c0d0e0f\" }"),
 	)
-	testing.expect(t, f.s.gens.current.cookies.secret != secret, "a configured secret did not replace the drawn one")
+	/*
+	The replaced keeper stops rolling, and issues under the new secrets from
+	the swap on: the retiring generation answers on while it drains, and a
+	cookie it handed out under its own secrets after their grace, or under one
+	it drew now, is one the new generation would refuse.
+	*/
+	replaced := cur
+	testing.expect_value(t, sync.atomic_load(&replaced.secrets.next_roll), 0)
+	cur = f.s.gens.current.cookies
+	testing.expect(t, sync.atomic_load(&replaced.secrets.successor) == cur.secrets, "the replaced keeper does not issue under the new secrets")
+	from_retiring := make_cookie(replaced, req, now)
+	testing.expect(t, verify_cookie(cur, from_retiring[:], req, cookie_now() + COOKIE_ROLLOVER_GRACE + 1), "a cookie the retiring generation issued is refused once the grace is over")
+	// So does an older generation sharing them since a reload that kept them,
+	// and each checks the new generation's cookies as well.
+	from_oldest := make_cookie(old, req, now)
+	testing.expect(t, verify_cookie(cur, from_oldest[:], req, cookie_now() + COOKIE_ROLLOVER_GRACE + 1), "a cookie an older generation sharing the replaced secrets issued is refused once the grace is over")
+	from_new := make_cookie(cur, req, now)
+	testing.expect(t, verify_cookie(old, from_new[:], req, now), "a retiring generation refused a cookie the new one issued")
+	testing.expect(t, verify_cookie(replaced, from_new[:], req, now), "the replaced generation refused a cookie the new one issued")
+	issued := cur.secrets.slots[cur.secrets.epoch % COOKIE_SECRET_SLOTS]
+	testing.expect(t, issued.key != secret, "a configured secret did not replace the drawn one")
+	testing.expect_value(t, cur.secrets.next_roll, 0)
+	under_third := make_cookie(cur, req, now)
+
+	reload_from(
+		t,
+		f,
+		swap(
+			BASE,
+			"cookies: { enabled: true }",
+			"cookies: { enabled: true, secret: \"101112131415161718191a1b1c1d1e1f\" }"),
+	)
+	cur = f.s.gens.current.cookies
+	testing.expect(t, verify_cookie(cur, under_third[:], req, now), "the secret the second reload replaced was refused inside its grace")
+	testing.expect(t, verify_cookie(cur, under_second[:], req, now), "the secret the first reload replaced was refused inside its grace")
+	testing.expect(t, verify_cookie(cur, under_first[:], req, now), "the secret the rollover retired was refused inside its grace")
+	later := cookie_now() + COOKIE_ROLLOVER_GRACE + 1
+	testing.expect(t, !verify_cookie(cur, under_third[:], req, later), "the replaced secret was accepted past the grace")
+	// Replaced twice now: the oldest keeper issues under the latest secrets.
+	from_oldest_again := make_cookie(old, req, now)
+	testing.expect(t, verify_cookie(cur, from_oldest_again[:], req, later), "a keeper two replacements back does not issue under the latest secrets")
+
+	reload_from(
+		t,
+		f,
+		swap(
+			BASE,
+			"cookies: { enabled: true }",
+			"cookies: { enabled: true, secret: \"000102030405060708090a0b0c0d0e0f\" }"),
+	)
+	cur = f.s.gens.current.cookies
+
+	// `previous_secret` alone changing keeps the secret issued under.
+	reload_from(
+		t,
+		f,
+		swap(
+			BASE,
+			"cookies: { enabled: true }",
+			"cookies: { enabled: true, secret: \"000102030405060708090a0b0c0d0e0f\", previous_secret: \"f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff\" }"),
+	)
+	staged := f.s.gens.current.cookies
+	testing.expect(t, staged.has_accepted, "previous_secret was not applied")
+	testing.expect(t, staged.secrets == cur.secrets, "a change to previous_secret alone replaced the secrets")
 }
 
 @(test)
