@@ -553,14 +553,20 @@ serve_one_list :: proc(one: ^One_List) {
 		}
 		// A fetcher that connects and then never sends fails its test rather
 		// than hanging the run: shutting the listener down wakes an accept,
-		// not this read. Where it cannot be set, the connection closes
-		// unanswered and the fetch under test fails.
+		// not this read. A connection with no request on it is closed
+		// unanswered, and one this cannot bound stops the server, the listener
+		// shut so that the fetches after it are refused rather than left to
+		// wait out their timeout.
 		if net.set_option(client, .Receive_Timeout, 3 * time.Second) != nil {
 			net.close(client)
+			net.shutdown(one.listener, .Both)
 			return
 		}
 		buf: [1024]u8
-		_, _ = net.recv_tcp(client, buf[:])
+		if n, rerr := net.recv_tcp(client, buf[:]); rerr != nil || n == 0 {
+			net.close(client)
+			continue
+		}
 		head := fmt.tprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len(one.body))
 		_, _ = net.send_tcp(client, transmute([]u8)head)
 		_, _ = net.send_tcp(client, transmute([]u8)one.body)
