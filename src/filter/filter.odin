@@ -290,7 +290,6 @@ covers :: proc(s: ^Set, name: string, flag: Rule_Flag, qtype: dns.Type) -> Cover
 	return .None
 }
 
-
 /*
 Whether a `$dnstype` rule covers `normalised` for some type, whichever it is: its
 own entry's apex, or a parent's subdomains.

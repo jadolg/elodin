@@ -6,6 +6,7 @@
 # instances that are correct where they stand. A line carrying `lint:allow`
 # followed by a reason is exempt from both. `testing.expect` calls are read
 # whole, across lines, since the format sits in the last argument.
+import collections
 import os
 import re
 import subprocess  # nosec B404: fixed argument lists, no shell
@@ -135,29 +136,45 @@ def expect_formats(path, source, hits):
             hits.append(f"{path}:{n}: expect-format: testing.expect does not format its message; use testing.expectf\n    {line.strip()}")
 
 
+# A procedure declaration, `#force_inline` and other directives allowed.
+PROC = re.compile(r"^([a-z_][a-z0-9_]*)\s*::\s*(?:#\w+\s+)*proc\b")
+# What the runtime or the linker calls, with no Odin caller.
+UNCALLED = ("@(private", "@(init", "@(fini", "@(export")
+# Comments and string literals, whose words call nothing.
+NOT_CODE = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|`[^`]*`|\'(?:\\.|[^\'\\\n])+\'', re.S)
+WORD = re.compile(r"\b[a-z_][a-z0-9_]*\b")
+DEFINITION = re.compile(r"\b([a-z_][a-z0-9_]*)\s*::")
+
+
 def test_only_procs(sources, hits):
     """Exported procedures outside test files that nothing outside test files calls.
 
     A procedure only tests use lives in a test file of its package. The itest
     and fuzz packages are callers in their own right: they cannot reach another
-    package's test files. `@(private)` procedures and `@(init)` ones the runtime
-    calls are left out, and a cross-package test seam says why with lint:allow.
+    package's test files. Procedures under an attribute in `UNCALLED` are left
+    out, and a cross-package test seam says why with lint:allow. A use is the
+    name as a word in code, outside comments, strings and `name ::` declarations.
     """
+    uses = collections.Counter()
     callers = {path: src for path, src in sources.items() if not path.endswith("_test.odin")}
+    for source in callers.values():
+        code = NOT_CODE.sub(" ", source)
+        uses.update(WORD.findall(code))
+        uses.subtract(DEFINITION.findall(code))
     for path, source in callers.items():
         if is_test(path):
             continue
         lines = source.splitlines()
         for i, line in enumerate(lines):
-            m = re.match(r"^([a-z_][a-z0-9_]*) :: proc\b", line)
+            m = PROC.match(line)
             if not m or ALLOW.search(line):
                 continue
-            attrs = "\n".join(lines[max(0, i - 3):i])
-            if "@(private" in attrs or "@(init" in attrs:
+            above = i
+            while above > 0 and lines[above - 1].startswith("@("):
+                above -= 1
+            if any(a.startswith(UNCALLED) for a in lines[above:i]):
                 continue
-            word = re.compile(r"\b" + re.escape(m.group(1)) + r"\b")
-            uses = sum(len(word.findall(src)) for src in callers.values())
-            if uses <= 1:
+            if uses[m.group(1)] <= 0:
                 hits.append(f"{path}:{i + 1}: test-only: {m.group(1)} has no caller outside test files; "
                             f"move it to a test file of its package\n    {line.strip()}")
 

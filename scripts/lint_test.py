@@ -75,6 +75,13 @@ PROCS = [
     ({"src/dns/a.odin": "@(private)\nhelper :: proc() {}\n"}, []),
     ({"src/dns/a.odin": "@(init)\nstart :: proc() {}\n"}, []),
     ({"src/dns/a_test.odin": "fixture :: proc() {}\n"}, []),
+    ({"src/dns/a.odin": "fast :: #force_inline proc() {}\n", "src/dns/a_test.odin": "fast()\n"}, ["fast"]),
+    ({"src/dns/a.odin": "twin :: proc() {}\n", "src/cache/b.odin": "twin :: proc() {}\n"}, ["twin", "twin"]),
+    ({"src/dns/a.odin": "named :: proc() {}\n", "src/dns/b.odin": "// see named\nx := \"named\"\n"}, ["named"]),
+    ({"src/dns/a.odin": "@(private, thread_local)\ntl: int\n\nopen :: proc() {}\n"}, ["open"]),
+    ({"src/dns/a.odin": "@(fini)\nstop :: proc() {}\n"}, []),
+    ({"src/dns/a.odin": '@(export, link_name = "elodin_cb")\ncb :: proc "c" () {}\n'}, []),
+    ({"src/dns/a.odin": "handler :: proc() {}\n", "src/dns/b.odin": "h := handler\n"}, []),
 ]
 for sources, want in PROCS:
     hits = []

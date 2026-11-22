@@ -68,9 +68,9 @@ test_a_list_badfilter_does_not_cancel_the_operators_own_rules :: proc(t: ^testin
 	defer filter.set_destroy(block)
 	defer filter.set_destroy(allow)
 
-	testing.expect(t, (filter.set_cover(block, "www.pl.ua", .A) != .None), "the operator's block survives a list's badfilter")
-	testing.expect(t, (filter.set_cover(allow, "ok.example", .A) != .None), "and so does the operator's allow")
-	testing.expect(t, !(filter.set_cover(block, "listed.example", .A) != .None), "and the operator's badfilter cancels a list's rule")
+	testing.expect(t, filter.set_cover(block, "www.pl.ua", .A) != .None, "the operator's block survives a list's badfilter")
+	testing.expect(t, filter.set_cover(allow, "ok.example", .A) != .None, "and so does the operator's allow")
+	testing.expect(t, filter.set_cover(block, "listed.example", .A) == .None, "and the operator's badfilter cancels a list's rule")
 }
 
 @(test)
@@ -390,16 +390,16 @@ test_a_cache_named_by_a_query_moves :: proc(t: ^testing.T) {
 	block, allow := build_filter_sets(&cfg, false)
 	defer filter.set_destroy(block)
 	defer filter.set_destroy(allow)
-	testing.expect(t, (filter.set_cover(block, "moved.example", .A) != .None), "the old copy did not stand in offline")
-	testing.expect(t, (filter.set_cover(block, "current.example", .A) != .None), "the current copy was replaced")
+	testing.expect(t, filter.set_cover(block, "moved.example", .A) != .None, "the old copy did not stand in offline")
+	testing.expect(t, filter.set_cover(block, "current.example", .A) != .None, "the current copy was replaced")
 	testing.expect(t, !os.exists(moved_old), "the old copy is still under its url")
 	testing.expect(t, os.exists(list_cache_path(&cfg, moved)), "the old copy did not move to the list's name")
 	testing.expect(t, !os.exists(stale_old), "the old copy beside a current one was kept")
 	testing.expect(t, os.exists(kept_own), "another list's own cache was touched")
-	testing.expect(t, !(filter.set_cover(block, "off.example", .A) != .None), "a disabled list's old copy loaded as another list")
+	testing.expect(t, filter.set_cover(block, "off.example", .A) == .None, "a disabled list's old copy loaded as another list")
 	testing.expect(t, os.exists(off_old), "a disabled list's old copy moved")
-	testing.expect(t, (filter.set_cover(block, "over.example", .A) != .None), "the old copy was removed for another url's")
-	testing.expect(t, !(filter.set_cover(block, "bare.example", .A) != .None), "the url with no query's copy loaded as the list")
+	testing.expect(t, filter.set_cover(block, "over.example", .A) != .None, "the old copy was removed for another url's")
+	testing.expect(t, filter.set_cover(block, "bare.example", .A) == .None, "the url with no query's copy loaded as the list")
 	testing.expect(t, !os.exists(over_old), "the old copy is still under its url")
 }
 
