@@ -1525,7 +1525,7 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		// A private reverse zone is not counted: every LAN PTR lands there, and
 		// folded in it would drown the `.onion` and `localhost.` signal the
 		// counter exists for. The query log still tells them apart.
-		private_reverse := kind == .Empty_Nonterminal || (kind == .Empty_Zone && zone != "home.arpa.")
+		private_reverse := dns.name_at_or_below(zone, "arpa.") && zone != "home.arpa."
 		if len(out) == 0 {
 			// Nothing built is a failure, as for a rewrite, whichever zone.
 			count_answer(&st.s.stats.failed)
@@ -2685,8 +2685,11 @@ below the name denied: the question's name, or the end of its CNAME chain (RFC
 it would have an RFC 8020 cache deny the rewrite's names below it as well. The
 SOA stays, so the answer is NODATA as RFC 2308 section 2.2 shapes it.
 
-A validated denial is left alone: its NSEC or NSEC3 records prove a name error,
-which the AD bit vouches for.
+A signed denial is left alone: an NSEC or NSEC3 record proves a name error,
+which a validator downstream would hold against a NOERROR, and a denial this
+server validated (AD) is one even where its proofs were stripped. So is a reply
+whose chain cannot be followed to its end, or that is longer than
+`dns.MAX_ALIAS_REFERRAL_RECORDS`, the bound `peek_referral` walks chains to.
 */
 @(private)
 nodata_over_rewrite :: proc(st: ^Query_State) {
@@ -2697,8 +2700,24 @@ nodata_over_rewrite :: proc(st: ^Query_State) {
 	if st.validating && resp[3] & 0x20 != 0 {
 		return
 	}
+	if int(resp[6]) << 8 | int(resp[7]) > dns.MAX_ALIAS_REFERRAL_RECORDS {
+		return
+	}
+	m, err := dns.decode_message(resp, st.allocator, st.spent)
+	if err != .None {
+		return
+	}
+	for rec in m.authority {
+		if rec.type == .NSEC || rec.type == .NSEC3 {
+			return
+		}
+	}
 	name := st.q.name
-	if target, aliased := dns.peek_alias_target(resp); aliased {
+	if len(m.answer) > 0 {
+		_, target, aliased, unreadable := dns.alias_chain(resp)
+		if unreadable || !aliased {
+			return
+		}
 		name = target
 	}
 	if rewrite_at_or_below(st.s, name) {

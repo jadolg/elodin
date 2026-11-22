@@ -542,12 +542,14 @@ synthesises from its address.
 */
 @(private)
 rewrite_at_or_below :: proc(s: ^Server, name: string) -> bool {
+	// A synthesised PTR is only ever below `arpa.`.
+	reverse := dns.name_at_or_below("arpa.", name) || dns.name_at_or_below(name, "arpa.")
 	for r in live(s).cfg.rewrites {
 		// "*.x." is held as "x." and answers below it.
 		if dns.name_at_or_below(r.domain, name) || (r.wildcard && dns.name_below(name, r.domain)) {
 			return true
 		}
-		if r.wildcard || !r.ptr {
+		if r.wildcard || !r.ptr || !reverse {
 			continue
 		}
 		for a in r.answers {

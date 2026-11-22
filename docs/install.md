@@ -470,7 +470,8 @@ rules in effect` when turned off), or keep the rules in effect;
 
 A change to which upstreams are asked (`upstream.servers`, `upstream.bootstrap`,
 `upstream.zones` and their servers), to `dnssec.enabled`, `trust_anchors` or
-`max_nsec3_iterations`, to `rebind`, or to `cache.min_ttl`,
+`max_nsec3_iterations`, to `rebind`, to `rewrites` (which decide when an
+upstream NXDOMAIN is stored as NODATA), or to `cache.min_ttl`,
 `max_ttl` or `negative_ttl` empties the answer cache, since each decides what was
 stored and how it was checked first. An answer a query already in flight stores afterwards is not served
 either. Unchanged sections keep what they built: the upstream connections and

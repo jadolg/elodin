@@ -1,5 +1,7 @@
 package server
 
+import "core:fmt"
+import "core:sync"
 import "core:testing"
 import "elodin:config"
 import "elodin:dns"
@@ -20,12 +22,12 @@ ent_rules :: proc() -> []config.Rewrite {
 	return rules
 }
 
-// An upstream's NXDOMAIN for `name`, with the zone's SOA and, before it, the
-// CNAMEs in `chain`.
+// An upstream's NXDOMAIN for `name`, with the zone's SOA, an NSEC after it when
+// `signed`, and before it the records in `chain`.
 @(private = "file")
-nx_reply :: proc(name: string, chain: ..dns.Record) -> []u8 {
+nx_reply :: proc(name: string, chain: ..dns.Record, signed := false) -> []u8 {
 	question := [1]dns.Question{{name = name, type = .A, class = .IN}}
-	soa := [1]dns.Record {
+	soa := [2]dns.Record {
 		{
 			name = "example.",
 			type = .SOA,
@@ -33,11 +35,13 @@ nx_reply :: proc(name: string, chain: ..dns.Record) -> []u8 {
 			ttl = 3600,
 			data = dns.Rdata_SOA{ns = "ns.example.", mbox = "h.example.", serial = 1, refresh = 2, retry = 3, expire = 4, minimum = 3600},
 		},
+		// Next name the root, a bitmap of window 0 holding A.
+		{name = "example.", type = .NSEC, class = .IN, ttl = 3600, data = dns.Rdata_Raw{data = []u8{0, 0, 1, 0x40}}},
 	}
 	m := dns.Message {
 		question  = question[:],
 		answer    = chain,
-		authority = soa[:],
+		authority = soa[:2 if signed else 1],
 	}
 	m.flags.qr = true
 	m.flags.rd = true
@@ -55,8 +59,16 @@ test_an_nxdomain_above_a_rewrite_goes_out_as_nodata :: proc(t: ^testing.T) {
 	Row :: struct {
 		name:   string,
 		chain:  []dns.Record,
+		signed: bool,
 		want:   dns.Rcode,
 		reason: string,
+	}
+	// One link past `dns.MAX_ALIAS_REFERRAL_RECORDS`, ending above a rule.
+	long := make([]dns.Record, dns.MAX_ALIAS_REFERRAL_RECORDS + 1, context.temp_allocator)
+	for &rec, i in long {
+		owner := "long.example." if i == 0 else fmt.tprintf("l%d.example.", i)
+		target := "b.rw.example." if i == len(long) - 1 else fmt.tprintf("l%d.example.", i + 1)
+		rec = cname_record(owner, target)
 	}
 	rows := []Row {
 		{name = "b.rw.example.", want = .No_Error, reason = "an empty non-terminal above a rule"},
@@ -80,6 +92,14 @@ test_an_nxdomain_above_a_rewrite_goes_out_as_nodata :: proc(t: ^testing.T) {
 			want = .NX_Domain,
 			reason = "a chain from above a rule to a name that is not",
 		},
+		{name = "b.rw.example.", signed = true, want = .NX_Domain, reason = "a signed denial: its NSEC proves a name error"},
+		{name = "long.example.", chain = long, want = .NX_Domain, reason = "a chain past the bound it is followed to"},
+		{
+			name = "b.rw.example.",
+			chain = []dns.Record{cname_record("b.rw.example.", "x.example."), cname_record("x.example.", "b.rw.example.")},
+			want = .NX_Domain,
+			reason = "a chain that loops, so has no end",
+		},
 	}
 	h: Harness
 	if !harness_start(t, &h) {
@@ -91,8 +111,9 @@ test_an_nxdomain_above_a_rewrite_goes_out_as_nodata :: proc(t: ^testing.T) {
 	h.cfg.special_use.private_reverse = false
 
 	for row, i in rows {
-		reply := nx_reply(row.name, ..row.chain)
-		out, outcome, served, asked := harness_ask(&h, test_query(row.name, id = u16(0x7020 + i)), reply)
+		reply := nx_reply(row.name, ..row.chain, signed = row.signed)
+		// EDNS, so the long chain fits a datagram.
+		out, outcome, served, asked := harness_ask(&h, test_query(row.name, id = u16(0x7020 + i), opt = dns.make_opt(4096, false)), reply)
 		if !testing.expectf(t, served && asked, "%s (%s): served %v, upstream asked %v", row.name, row.reason, served, asked) {
 			continue
 		}
@@ -102,7 +123,7 @@ test_an_nxdomain_above_a_rewrite_goes_out_as_nodata :: proc(t: ^testing.T) {
 			continue
 		}
 		testing.expectf(t, dns.rcode_of(m) == row.want, "%s (%s): rcode %v, want %v", row.name, row.reason, dns.rcode_of(m), row.want)
-		testing.expectf(t, len(m.authority) == 1 && m.authority[0].type == .SOA, "%s (%s): authority %v, want the SOA", row.name, row.reason, m.authority)
+		testing.expectf(t, len(m.authority) >= 1 && m.authority[0].type == .SOA, "%s (%s): authority %v, want the SOA", row.name, row.reason, m.authority)
 		testing.expectf(t, len(m.answer) == len(row.chain), "%s (%s): %d answers, want %d", row.name, row.reason, len(m.answer), len(row.chain))
 	}
 	free_all(context.temp_allocator)
@@ -162,6 +183,7 @@ test_a_validated_nxdomain_above_a_rewrite_is_left_alone :: proc(t: ^testing.T) {
 			q          = {name = "b.rw.example.", type = .A, class = .IN},
 			validating = row.validating,
 			resp       = resp,
+			allocator  = context.temp_allocator,
 		}
 		nodata_over_rewrite(&st)
 		testing.expectf(t, dns.peek_rcode(resp) == row.want, "%v: rcode %v, want %v", row, dns.peek_rcode(resp), row.want)
@@ -206,12 +228,17 @@ test_a_rewrite_makes_its_names_exist_in_the_special_use_zones :: proc(t: ^testin
 		{name = "y.invalid.", want = .No_Error},
 		{name = "z.invalid.", want = .NX_Domain},
 	}
+	before := sync.atomic_load(&s.stats.special_use)
 	for row in rows {
 		m := ask_message(t, &s, row.name, .AAAA)
 		testing.expectf(t, dns.rcode_of(m) == row.want, "%s AAAA: rcode %v, want %v", row.name, dns.rcode_of(m), row.want)
 		testing.expectf(t, len(m.answer) == 0, "%s AAAA: %d answers", row.name, len(m.answer))
 		testing.expectf(t, len(m.authority) == 1 && m.authority[0].type == .SOA, "%s AAAA: authority %v, want the SOA", row.name, m.authority)
 	}
+	// Every one is a special-use answer, logged and counted as one, not as a
+	// private reverse zone's.
+	counted := sync.atomic_load(&s.stats.special_use) - before
+	testing.expectf(t, counted == u64(len(rows)), "special_use counted %d of %d", counted, len(rows))
 	// The premise: the rules answer their own types.
 	for q in ([]struct {
 			name: string,
@@ -220,5 +247,17 @@ test_a_rewrite_makes_its_names_exist_in_the_special_use_zones :: proc(t: ^testin
 		m := ask_message(t, &s, q.name, q.type)
 		testing.expectf(t, len(m.answer) == 1, "%s %v: %d answers, want the rule's", q.name, q.type, len(m.answer))
 	}
+	free_all(context.temp_allocator)
+}
+
+// A reload that changes the rewrites moves the cache's policy, since an entry
+// may hold an NXDOMAIN `nodata_over_rewrite` turned into NODATA, or left alone.
+@(test)
+test_a_rewrite_change_moves_the_cache_policy :: proc(t: ^testing.T) {
+	a := config.default_config()
+	b := config.default_config()
+	testing.expect(t, !policy_changed(&a, &b), "two equal configurations moved the policy")
+	b.rewrites = []config.Rewrite{{domain = "nas.lan.", ttl = 300, answers = answers_of({kind = .A, v4 = {192, 168, 1, 9}})}}
+	testing.expect(t, policy_changed(&a, &b), "a rewrite added did not move the policy")
 	free_all(context.temp_allocator)
 }

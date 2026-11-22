@@ -59,6 +59,7 @@ run_rewrite_ent_cases :: proc(r: ^Runner) {
 		payloads[i] = nx_with_soa(row.name)
 		if payloads[i] == nil {
 			skip_case(r, GROUP, "cannot build the NXDOMAIN reply")
+			mock_stop(mock)
 			return
 		}
 		mock_reply(mock, row.name, u16(dns.Type.A), payloads[i])

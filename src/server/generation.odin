@@ -602,7 +602,9 @@ policy_changed :: proc(prev, cfg: ^config.Config) -> bool {
 		((prev.rebind.enabled || cfg.rebind.enabled) && differs(prev.rebind, cfg.rebind)) ||
 		prev.cache.min_ttl != cfg.cache.min_ttl ||
 		prev.cache.max_ttl != cfg.cache.max_ttl ||
-		prev.cache.negative_ttl != cfg.cache.negative_ttl \
+		prev.cache.negative_ttl != cfg.cache.negative_ttl ||
+		// `nodata_over_rewrite` stores what it turns an NXDOMAIN into.
+		differs(prev.rewrites, cfg.rewrites) \
 	)
 }
 
