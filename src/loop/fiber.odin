@@ -122,14 +122,17 @@ STACK_SIZE :: #config(ELODIN_FIBER_STACK, 1024 * 1024 when ASAN else 256 * 1024)
 The unmapped-in-effect space below every fiber stack: `PROT_NONE`, so a stack
 that overruns faults. As large as it is because the compiler emits no stack
 probes: a frame moves the stack pointer down in one step and its first stores
-land wherever that is, so a guard smaller than the largest frame lets such a
-frame step over it into the mapping below, another fiber's stack. It costs
-address space, not memory. `scripts/stack_frames.py`, run by `mise run itest`
-and `mise run itest-release`, fails a build with a frame this size or larger
-outside the procedures that run on the process's own stack. A multiple of every
-kernel page size, so `mprotect` takes it whole.
+land wherever that is, so a guard smaller than a frame - or than a caller's
+and a leaf callee's together, since a call writes nothing to the stack on
+arm64 - lets them step over it into the mapping below, another fiber's stack.
+It costs address space, not memory. `scripts/stack_frames.py`, run by `mise
+run itest`, `mise run itest-release` and CI's release build on each
+architecture, fails a build whose two largest frames come to this, outside the
+procedures that run on the process's own stack. Four times as large under
+AddressSanitizer, whose redzones grow every frame as they grow `STACK_SIZE`. A
+multiple of every kernel page size, so `mprotect` takes it whole.
 */
-STACK_GUARD :: 64 * 1024
+STACK_GUARD :: 256 * 1024 when ASAN else 64 * 1024
 
 @(private)
 PAGE :: 4096

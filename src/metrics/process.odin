@@ -84,7 +84,7 @@ descriptor_limit :: proc() -> int {
 
 /*
 `vm.max_map_count`: the memory mappings this process may hold, every fiber's
-stack and guard page among them. Zero when it cannot be read.
+stack and guard among them. Zero when it cannot be read.
 */
 map_count_limit :: proc() -> int {
 	buf: [32]u8

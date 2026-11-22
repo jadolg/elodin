@@ -805,6 +805,9 @@ connection_memory_warning :: proc(cfg: ^config.Config) -> (text: string, say: bo
 	return config.connection_memory_warning(cfg.server.max_connections, m)
 }
 
+// Runs on the process's own stack, never a fiber's: `scripts/stack_frames.py`
+// leaves its frame out of the fiber stack guard's bound by this name, so a
+// rename has to be made there as well.
 run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	/*
 	The event loops, one thread each, as many as `listeners.udp.readers` says:
