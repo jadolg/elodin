@@ -11,17 +11,19 @@ Audit the Odin code in `src/` that changed since the last audit, the way #638 au
 
 ## 1. Scope
 
+- First look for another audit run: `$(dirname $ROOT)/elodin-audit-*` worktrees, or a `brief.md` under `$(dirname $ROOT)/elodin-review-scratch/*/audit/`. If its session is still running, stop and say so; two runs share the worktrees and would file the issue twice. If it died, take over: reuse its brief and slices and its clean worktrees at `origin/main`, and move its half-done `repro-*` folders aside so new readers start empty.
 - `git fetch origin`. The audit runs at `origin/main`; note its short sha as `$HEAD`.
 - The base is `$ARGUMENTS` if given. Otherwise take the newest issue labelled `audit` (`gh issue list --label audit --state all --limit 1 --json number,body`) and the sha on its `Audited at <sha>` line.
 - The packages in scope: `git diff --name-only <base>..origin/main -- src | cut -d/ -f2 | sort -u`. Within each, read whole files that changed, not only the diff: stale comments and duplicates sit next to the change, not in it.
-- Split the scope into slices of about 20k lines (`wc -l`), keeping a package's tests apart from its production code when that package is large.
+- Split the scope into slices of about 12k lines (`wc -l`), small enough for one reader to read whole, keeping a package's tests apart from its production code when that package is large. Start at most 18 readers at once: the harness runs 20 agents at a time, and readers that try to split their slice further find no room, then fall back to skimming.
 
 ## 2. Mechanical inputs (run these yourself, before the readers start)
 
 - `python3 scripts/lint.py` with `LINT_BASE=<base>`: the rule set for lines added since the base.
-- Production procs nothing calls, and production procs only tests call:
+- Production procs nothing calls, and production procs only tests call (an `@(init)` proc runs without a caller, so it is skipped):
   ```
   for p in $(grep -rhoE '^[a-z_][a-z0-9_]* :: (#force_inline )?proc' src/<pkg> --include='*.odin' --exclude='*_test.odin' | cut -d' ' -f1 | sort -u); do
+    grep -rhB1 -E "^$p :: " src/<pkg> --include='*.odin' --exclude='*_test.odin' | grep -q '^@(.*\binit\b' && continue
     n=$(grep -rwE "$p" src --include='*.odin' --exclude='*_test.odin' | wc -l); t=$(grep -rwE "$p" src --include='*_test.odin' | wc -l)
     [ "$n" -le 1 ] && echo "$p prod=$n tests=$t"
   done
@@ -39,8 +41,12 @@ One `Agent` per slice, all started together, each in its own detached worktree a
   - **PATTERN**: anything `/solve`'s test rules and code rules (steps 3 and 4) forbid.
   - **DEAD**: unreachable code, or production code only tests call.
   - **BUG**: a defect. Prove it: a failing test or a command with its output, as `/solve` step 10.5 requires of a review finding. An unproven bug is not filed.
-- don't edit the tree; repro fixtures go under the scratch dir, not the session scratchpad;
-- kill processes by PID only, and use ports from 30000 + 1000*N.
+- read the slice yourself; start no sub-agents;
+- don't edit the tree; repro tests, and the files they write, go under the scratch dir's `repro-NN/`, never `/tmp` or the session scratchpad; remove what you build in the worktree;
+- kill processes by PID only, and use ports from 30000 + 1000*N;
+- return the findings as the text of your final message, starting at the `# Slice NN` heading: the harness refuses report files from a subagent.
+
+Save each reader's final message as `findings-NN.md` in the scratch dir yourself. Take it from the message, not from a file write the reader tried: a refused write is a draft, and the message is what the reader stands behind.
 
 Then check each reader's work yourself: re-read every BUG's proof and a sample of each slice's STALE and DUP claims against the code. A reader's mistakes come back sounding as sure as its findings.
 
