@@ -587,8 +587,6 @@ start_one_list :: proc(
 		net.close(listener)
 		return
 	}
-	// So a test that returns before dialling ends the accept, not the suite.
-	_ = net.set_option(listener, .Receive_Timeout, 3 * time.Second)
 	one^ = One_List{listener, body, count}
 	server = thread.create_and_start_with_poly_data(one, serve_one_list)
 	return server, fmt.tprintf("http://127.0.0.1:%d/l.txt", bound.port), true
@@ -596,6 +594,10 @@ start_one_list :: proc(
 
 @(private = "file")
 stop_one_list :: proc(one: ^One_List, server: ^thread.Thread) {
+	// Wakes an accept still waiting, for a test that returned before dialling
+	// every request: an event, not a deadline the fetches between dials race.
+	// Ignored on a listener every accept is already done with.
+	_ = net.shutdown(one.listener, .Both) // lint:allow discard: see above
 	thread.join(server)
 	thread.destroy(server)
 	net.close(one.listener)
