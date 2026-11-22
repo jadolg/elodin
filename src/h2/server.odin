@@ -3,6 +3,7 @@ package h2
 import "core:mem"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:loop"
@@ -197,7 +198,17 @@ Conn :: struct {
 	// The highest stream a handler has been given: what a GOAWAY for this
 	// end's own memory names as the last stream it may have acted on.
 	last_dispatched: u32,
+	// Written under `mu`, atomically, so `serve` can ask it after every frame
+	// without the lock.
 	goaway_sent:    bool,
+	// The peer sent GOAWAY: the connection ends once its streams are answered.
+	// Under `mu`.
+	peer_goaway:    bool,
+	// The last stream id this end's GOAWAY names, and whether that GOAWAY is
+	// claimed but not yet written, which `serve` waits out before it closes the
+	// connection under the writer. Both under `mu`.
+	goaway_last:    u32,
+	goaway_writing: bool,
 	/*
 	How many more DATA frames for a stream that was opened and has since
 	closed still draw a courteous RST_STREAM(STREAM_CLOSED), rather than just
@@ -351,6 +362,13 @@ running; they hold their own references.
 serve :: proc(c: ^Conn) {
 	defer {
 		loop.lock(&c.mu)
+		// A GOAWAY claimed on a handler's fiber goes out before the close would
+		// refuse it, bounded as any write is.
+		for c.goaway_writing {
+			if !loop.cond_wait_with_timeout(&c.cond, &c.mu, c.write_timeout) {
+				break
+			}
+		}
 		c.closed = true
 		loop.cond_broadcast(&c.cond)
 		loop.unlock(&c.mu)
@@ -375,7 +393,12 @@ serve :: proc(c: ^Conn) {
 			goaway(c, .Protocol_Error)
 			return
 		}
-		if !handle_frame(c, h, payload) {
+		/*
+		Nothing is acted on past a GOAWAY this end has sent (RFC 9113 6.8), asked
+		on both sides of the frame: before it, for one sent from a handler's own
+		fiber while this read was waiting, and after it, for one this frame drew.
+		*/
+		if sync.atomic_load(&c.goaway_sent) || !handle_frame(c, h, payload) || sync.atomic_load(&c.goaway_sent) {
 			return
 		}
 		free_all(context.temp_allocator)
@@ -486,7 +509,30 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return true
 
 	case .Goaway:
-		return false
+		/*
+		RFC 9113 6.8: a GOAWAY stops the streams its receiver would open, which
+		on this end is none, and "activity on streams numbered lower than or
+		equal to the last stream identifier might still complete". So the
+		requests the peer has sent are still read and answered, and this end
+		says GOAWAY(NO_ERROR) once the last of them is (`close_stream`).
+		*/
+		// One with an error code is the peer closing (6.8): answered, and ended.
+		if Error_Code(read_u32(payload[4:])) != .No_Error {
+			goaway(c, .No_Error)
+			return false
+		}
+		loop.lock(&c.mu)
+		c.peer_goaway = true
+		frame: [FRAME_HEADER_SIZE + GOAWAY_FIXED_SIZE]u8
+		drained := len(c.streams) == 0
+		if drained {
+			frame, drained = goaway_claim_locked(c, .No_Error)
+		}
+		loop.unlock(&c.mu)
+		if drained {
+			goaway_write(c, frame[:])
+		}
+		return !drained
 
 	case .Push_Promise:
 		// A client may not push.
@@ -1445,13 +1491,22 @@ dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
 	// the stream, and a reset arriving for an answered stream must not be read
 	// as one nobody was ever given.
 	loop.lock(&c.mu)
-	s.dispatched = true
-	c.last_dispatched = max(c.last_dispatched, s.id)
+	// Nothing above this end's GOAWAY is acted on (RFC 9113 6.8), including a
+	// stream read before a drain claimed on another fiber named its last.
+	past := c.goaway_sent && s.id > c.goaway_last
+	if !past {
+		s.dispatched = true
+		c.last_dispatched = max(c.last_dispatched, s.id)
+	}
 	loop.unlock(&c.mu)
+	if past {
+		request_destroy(c, req)
+		close_stream(c, s.id)
+		return false
+	}
 	c.handler(c, req)
-	// A handler can end the connection too, through `shutdown`, and nothing is
-	// read past a GOAWAY this end has sent. Asked here, once per request, rather
-	// than once per frame in `serve`: the handler runs inline on the reader.
+	// A handler can end the connection too, through `shutdown`. `serve` asks the
+	// same after every frame; this tells the frame handler that dispatched it.
 	loop.lock(&c.mu)
 	defer loop.unlock(&c.mu)
 	return !c.goaway_sent
@@ -1550,29 +1605,51 @@ was_reset_here :: proc(c: ^Conn, stream_id: u32, forget := false) -> bool {
 @(private)
 goaway :: proc(c: ^Conn, code: Error_Code) {
 	loop.lock(&c.mu)
+	frame, claimed := goaway_claim_locked(c, code)
+	loop.unlock(&c.mu)
+	if claimed {
+		goaway_write(c, frame[:])
+	}
+}
+
+/*
+The one GOAWAY this end sends, claimed under `c.mu`: false when one already was.
+Its last stream id is read in the same hold, so a caller that decided under the
+lock to send it names no stream the reader opened after that decision.
+*/
+@(private)
+goaway_claim_locked :: proc(c: ^Conn, code: Error_Code) -> (frame: [FRAME_HEADER_SIZE + GOAWAY_FIXED_SIZE]u8, claimed: bool) {
 	if c.goaway_sent {
-		loop.unlock(&c.mu)
 		return
 	}
-	c.goaway_sent = true
+	sync.atomic_store(&c.goaway_sent, true)
 	/*
 	INTERNAL_ERROR is this end with no room to go on. A stream that was only
 	read, or parked for its body, was not acted on, and the last stream id
 	leaves it out so the client may retry it (RFC 9113 6.8).
 	*/
-	last := c.last_dispatched if code == .Internal_Error else c.last_stream_id
+	c.goaway_last = c.last_dispatched if code == .Internal_Error else c.last_stream_id
+	c.goaway_writing = true
+	return goaway_frame(c.goaway_last, code), true
+}
+
+// Write the GOAWAY `goaway_claim_locked` claimed, and let `serve` close.
+@(private)
+goaway_write :: proc(c: ^Conn, frame: []u8) {
+	_ = write_all(c, frame)
+	loop.lock(&c.mu)
+	c.goaway_writing = false
+	loop.cond_broadcast(&c.cond)
 	loop.unlock(&c.mu)
-	frame := goaway_frame(last, code)
-	_ = write_all(c, frame[:])
 }
 
 /*
 End the connection from a handler: GOAWAY(NO_ERROR), which RFC 9113 6.8 says an
-endpoint SHOULD send before closing. Called inline, from the handler `dispatch`
-runs on the reader, `serve` reads nothing after it; `dispatch` is where that is
-checked, so from a fiber of the handler's own it takes effect only at the next
-request the reader dispatches. Streams already started are not waited for: once
-`serve` returns their writes are refused. 6.8 says such streams "might still
+endpoint SHOULD send before closing. `serve` stops once the frame it is handling
+when the GOAWAY goes out is done: for a handler called inline from `dispatch`,
+the request's own; from a fiber of the handler's own, whichever frame the reader
+is on or reads next, of any type. Streams already started are not waited for:
+once `serve` returns their writes are refused. 6.8 says such streams "might still
 complete", which does not oblige them to, and the peer is told only that they may
 have been processed.
 */
@@ -1757,15 +1834,17 @@ Retire a stream and release it.
 The free happens under the lock, not after it. The reader looks streams
 up while holding `c.mu` and acts on what it finds; releasing one outside the
 lock would let this run between that lookup and the use, leaving the reader
-writing into memory that has already gone back to the allocator. Nothing here
-does I/O or takes another lock, so holding `c.mu` across it costs nothing.
+writing into memory that has already gone back to the allocator. Nothing done
+under it does I/O or takes another lock, so holding `c.mu` across it costs
+nothing. The last stream of a connection the peer has sent GOAWAY on is followed
+by this end's GOAWAY(NO_ERROR), outside the lock.
 */
 @(private)
 close_stream :: proc(c: ^Conn, stream_id: u32, peer_sending := false) {
 	loop.lock(&c.mu)
-	defer loop.unlock(&c.mu)
 	s, found := c.streams[stream_id]
 	if !found {
+		loop.unlock(&c.mu)
 		return
 	}
 	// Reset by this end with the peer still sending: see Conn.reset_ids.
@@ -1778,6 +1857,16 @@ close_stream :: proc(c: ^Conn, stream_id: u32, peer_sending := false) {
 		c.closed_held -= 1
 	}
 	stream_destroy(c, s)
+	// Claimed in this hold: see `goaway_claim_locked`.
+	frame: [FRAME_HEADER_SIZE + GOAWAY_FIXED_SIZE]u8
+	drained := false
+	if c.peer_goaway && len(c.streams) == 0 {
+		frame, drained = goaway_claim_locked(c, .No_Error)
+	}
+	loop.unlock(&c.mu)
+	if drained {
+		goaway_write(c, frame[:])
+	}
 }
 
 /*

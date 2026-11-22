@@ -61,6 +61,9 @@ Doh2_Mock :: struct {
 	// Over h2, a 200 carrying this `content-length`, whatever the body's is.
 	// Empty for none.
 	content_length: string,
+	// Over h2, GOAWAY(NO_ERROR) naming each stream just before it is answered,
+	// as a resolver draining its connections sends.
+	goaway:         bool,
 }
 
 doh2_mock_make :: proc(port: int, path: string, payload: []u8) -> ^Doh2_Mock {
@@ -254,6 +257,9 @@ doh2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 		return
 	}
 	body := doh2_reply_body(m, req.body, context.temp_allocator)
+	if m.goaway {
+		h2.shutdown(hc)
+	}
 	if m.trailer_head != 0 {
 		doh2_respond_raw(hc, req.stream_id, m.trailer_head, body, nil, m.trailers, with_trailers = true)
 		return

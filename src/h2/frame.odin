@@ -304,6 +304,15 @@ frame_shape_error :: proc(h: Frame_Header) -> (code: Error_Code, bad: bool) {
 		case h.length != PRIORITY_SIZE:
 			return .Frame_Size_Error, true
 		}
+	case .Goaway:
+		// RFC 9113 6.8, and 4.2 for a frame too short for its fixed fields: the
+		// last stream id and the error code.
+		switch {
+		case h.stream_id != 0:
+			return .Protocol_Error, true
+		case h.length < GOAWAY_FIXED_SIZE:
+			return .Frame_Size_Error, true
+		}
 	}
 	return .No_Error, false
 }
@@ -511,9 +520,12 @@ rst_stream_frame :: proc(stream_id: u32, code: Error_Code) -> (f: [FRAME_HEADER_
 	return
 }
 
+// A GOAWAY's last stream id and error code, before any debug data (RFC 9113 6.8).
+GOAWAY_FIXED_SIZE :: 8
+
 @(private)
-goaway_frame :: proc(last_stream_id: u32, code: Error_Code) -> (f: [FRAME_HEADER_SIZE + 8]u8) {
-	put_frame_header(f[:], 8, .Goaway, 0, 0)
+goaway_frame :: proc(last_stream_id: u32, code: Error_Code) -> (f: [FRAME_HEADER_SIZE + GOAWAY_FIXED_SIZE]u8) {
+	put_frame_header(f[:], GOAWAY_FIXED_SIZE, .Goaway, 0, 0)
 	put_u32(f[FRAME_HEADER_SIZE:], last_stream_id & 0x7fff_ffff)
 	put_u32(f[FRAME_HEADER_SIZE + 4:], u32(code))
 	return

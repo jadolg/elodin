@@ -109,7 +109,7 @@ get_h2_conn :: proc(
 			sync.mutex_unlock(&u.mu)
 			return nil, false, .None
 		}
-		if u.h2 != nil && !h2.client_closed(u.h2.client) && dialled_current_locked(u, u.h2.stream) {
+		if u.h2 != nil && !h2.client_closed(u.h2.client) && !h2.client_going_away(u.h2.client) && dialled_current_locked(u, u.h2.stream) {
 			conn = u.h2.client
 			h2.client_ref(conn)
 			sync.mutex_unlock(&u.mu)
@@ -134,8 +134,9 @@ get_h2_conn :: proc(
 	u.connecting = true
 	stale := u.h2
 	u.h2 = nil
-	// One from before a move, still carrying streams: left to finish them.
-	if stale != nil && !h2.client_closed(stale.client) && !dialled_current_locked(u, stale.stream) {
+	// One from before a move, or one the peer sent GOAWAY on, still carrying
+	// streams: left to finish them.
+	if stale != nil && !h2.client_closed(stale.client) && (h2.client_going_away(stale.client) || !dialled_current_locked(u, stale.stream)) {
 		if _, busy := h2.client_idle_for(stale.client); busy {
 			if u.h2_draining == nil {
 				u.h2_draining = make([dynamic]^H2_Conn, u.allocator)
@@ -279,8 +280,9 @@ start_h2_reader :: proc(u: ^Upstream, hc: ^H2_Conn) {
 
 /*
 The h2 half of `close_idle`, under `u.mu`: take `u.h2` off the upstream if the
-peer has closed it, or nobody has used it for `idle_timeout`, or whatever its
-age if `all`, for the caller to retire once the lock is let go.
+peer has closed it, or nobody has used it for `idle_timeout`, or it is going
+away (`h2.client_going_away`) with nothing on it, or whatever its age if `all`,
+for the caller to retire once the lock is let go.
 
 A connection somebody holds is left alone even when `all`, as a busy pipe is:
 retiring it would cut short the requests on it, and a retired generation is
@@ -296,7 +298,7 @@ take_idle_h2_locked :: proc(u: ^Upstream, all: bool) -> (stale: ^H2_Conn) {
 	}
 	if !h2.client_closed(u.h2.client) {
 		idle, busy := h2.client_idle_for(u.h2.client)
-		if busy || (!all && idle < u.idle_timeout) {
+		if busy || (!all && idle < u.idle_timeout && !h2.client_going_away(u.h2.client)) {
 			return nil
 		}
 	}

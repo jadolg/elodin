@@ -2,14 +2,6 @@ package h2
 
 import "core:testing"
 
-@(private = "file")
-frame_bytes :: proc(type: Frame_Type, flags: u8, stream_id: u32, payload: []u8) -> []u8 {
-	out := make([dynamic]u8, 0, FRAME_HEADER_SIZE + len(payload), context.temp_allocator)
-	write_frame_header(&out, len(payload), type, flags, stream_id)
-	append(&out, ..payload)
-	return out[:]
-}
-
 /*
 RFC 9113 6.10: a header block left open by HEADERS without END_HEADERS takes
 nothing but CONTINUATION frames on its own stream, a connection error of type

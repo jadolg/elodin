@@ -106,6 +106,41 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 		}
 	}
 
+	// --- A GOAWAY naming the stream in flight lets it finish (#711) ---
+	{
+		upstream_port := next_port(r)
+		mock := doh2_mock_make(upstream_port, "/dns-query", payload)
+		mock.goaway = true
+		started := doh2_mock_start(mock, r.cert_file, r.key_file)
+		defer doh2_mock_stop(mock)
+		if !started {
+			skip_case(r, "upstream: doh goaway", "cannot start the mock")
+		} else {
+			udp_port := next_port(r)
+			config := base_config(udp_port, fmt.tprintf("[%s]", doh_upstream("goaway", upstream_port)), timeout = "5s")
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+			if ok {
+				start_case(r, "upstream: a DoH/h2 answer behind a GOAWAY naming its stream is taken, not asked again (#711)")
+				{
+					QUERIES :: 3
+					for i in 0 ..< QUERIES {
+						res := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = u16(0x7110 + i)))
+						if check(r, res.ok, "no response to query %d", i) {
+							check_eq_int(r, parse_header(r, res.wire).rcode, int(dns.Rcode.No_Error), "rcode")
+						}
+					}
+					// One stream per query: an answer the GOAWAY let through is not
+					// thrown away and asked for again on a fresh connection.
+					h2_hits, h1_hits := doh2_mock_counts(mock)
+					check_eq_int(r, h2_hits, QUERIES, "streams the upstream answered")
+					check_eq_int(r, h1_hits, 0, "queries asked over http/1.1")
+				}
+				end_case(r)
+				stop_server(&srv)
+			}
+		}
+	}
+
 	// --- ALPN falls back to http/1.1 against a resolver that lacks h2 ---
 	{
 		upstream_port := next_port(r)

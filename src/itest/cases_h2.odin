@@ -33,12 +33,20 @@ config_h2 :: proc(r: ^Runner, udp_port, doh_port, upstream_port: int, upstream_s
 	)
 }
 
+// A name the upstream answers after `GOAWAY_DELAY`, for the GOAWAY case.
+@(private = "file")
+GOAWAY_QNAME :: "goaway.example."
+@(private = "file")
+GOAWAY_DELAY :: 300 * time.Millisecond
+
 run_h2_cases :: proc(r: ^Runner) {
 	fix := fixture("a")
 	upstream_port := next_port(r)
 	mock := mock_make("h2", upstream_port)
 	mock_reply(mock, fix.qname, fix.qtype, from_hex(fix.response, context.allocator))
 	mock_synth_all(mock, {203, 0, 113, 5})
+	// Answered late enough that the client's GOAWAY behind it is read first.
+	mock_delay(mock, GOAWAY_QNAME, u16(dns.Type.A), GOAWAY_DELAY, nil)
 	if !mock_start_or_skip(r, mock, "doh/h2") {
 		return
 	}
@@ -61,6 +69,29 @@ run_h2_cases :: proc(r: ^Runner) {
 
 	query := build_query(fix.qname, fix.qtype, id = 0x2222, allocator = context.allocator)
 	defer delete(query)
+
+	start_case(r, "h2: a client's GOAWAY lets the request before it be answered, and draws a GOAWAY back (#711)")
+	{
+		c, cok := h2_connect(doh_port)
+		if check(r, cok, "cannot open an h2 connection") {
+			defer h2_close(c)
+			// GOAWAY(NO_ERROR) naming stream 0: a server opens no stream here.
+			goaway := make([dynamic]u8, 0, h2.FRAME_HEADER_SIZE + 8, context.temp_allocator)
+			h2.write_frame_header(&goaway, 8, .Goaway, 0, 0)
+			h2.append_u32(&goaway, 0)
+			h2.append_u32(&goaway, u32(h2.Error_Code.No_Error))
+			slow := build_query(GOAWAY_QNAME, u16(dns.Type.A), id = 0x3333, allocator = context.temp_allocator)
+			check(r, h2_send_request(c, 1, "POST", "/dns-query", slow, then = goaway[:]), "cannot send the request and the GOAWAY")
+			if check(r, h2_collect(c, []u32{1}), "the request was not answered after the client's GOAWAY") {
+				res, found := h2_stream(c, 1)
+				check(r, found && res.status == 200, "stream 1 (found %v) is not a 200", found)
+			}
+			deadline := time.tick_add(time.tick_now(), 5 * time.Second)
+			for !c.goaway && time.tick_diff(time.tick_now(), deadline) > 0 && h2_pump(c) {}
+			check(r, c.goaway && c.goaway_code == .No_Error, "no GOAWAY(NO_ERROR) answered the client's (seen %v, code %v)", c.goaway, c.goaway_code)
+		}
+	}
+	end_case(r)
 
 	start_case(r, "h2: ALPN selects h2 when the client offers it")
 	{

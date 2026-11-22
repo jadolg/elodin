@@ -46,6 +46,10 @@ Client :: struct {
 	*/
 	refs:      int,
 	closed:    bool,
+	// No new request goes on the connection, after the peer's GOAWAY or once its
+	// stream ids are used up; it closes once those on it are done. Atomic, as
+	// `closed` is.
+	going_away: bool,
 	// The connection ended with INTERNAL_ERROR, for want of memory on this
 	// end: what a request it cut short reports. Under `mu`.
 	dry:       bool,
@@ -163,13 +167,15 @@ Client_Response :: struct {
 
 Client_Error :: enum u8 {
 	None,
-	// The connection is dead: a read/write failure, GOAWAY, or a protocol
-	// violation. The caller should dial a fresh connection.
+	// The connection is dead - a read/write failure or a protocol violation -
+	// or takes no new request after the peer's GOAWAY. The caller should dial
+	// a fresh connection.
 	Closed,
 	// The peer reset our stream.
 	Reset,
-	// The peer reset it with REFUSED_STREAM: not processed, and safe to ask
-	// again (RFC 9113 8.7).
+	// The peer reset it with REFUSED_STREAM, or it was above the last stream
+	// id of the peer's GOAWAY: not processed, and safe to ask again (RFC 9113
+	// 8.7, 6.8).
 	Refused,
 	Timeout,
 	// This end reset the stream: the response ran past MAX_BODY, or
@@ -249,6 +255,12 @@ client_closed :: proc(c: ^Client) -> bool {
 	return sync.atomic_load(&c.closed)
 }
 
+// The connection takes no new request - after the peer's GOAWAY, or once its
+// stream ids are used up - though those already on it may still be answered.
+client_going_away :: proc(c: ^Client) -> bool {
+	return sync.atomic_load(&c.going_away)
+}
+
 /*
 How long the connection has gone unused, and whether anybody besides its owner -
 the reference `client_make` returns - holds it now. Every request holds one for
@@ -294,6 +306,11 @@ client_serve :: proc(c: ^Client) {
 			return
 		}
 		free_all(context.temp_allocator)
+		// RFC 9113 6.8: a GOAWAY before closing, once the peer's own is honoured.
+		if sync.atomic_load(&c.going_away) && !client_in_flight(c) {
+			client_goaway(c, .No_Error)
+			return
+		}
 	}
 }
 
@@ -384,7 +401,7 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 		return true
 
 	case .Goaway:
-		return false
+		return client_handle_goaway(c, payload)
 
 	case .Push_Promise:
 		client_goaway(c, .Protocol_Error)
@@ -404,6 +421,48 @@ c.streams is odd and below `next_stream_id`. Caller holds c.mu.
 @(private)
 client_stream_is_idle :: proc(c: ^Client, stream_id: u32) -> bool {
 	return stream_id >= c.next_stream_id || stream_id % 2 == 0
+}
+
+/*
+RFC 9113 6.8: the peer took no action on streams above the GOAWAY's last stream
+id, so those fail as `Refused`, safe to ask again elsewhere; "activity on streams
+numbered lower than or equal to the last stream identifier might still complete
+successfully", so those are read to their end. No new request is taken, and
+`client_serve` closes the connection once nothing is left in flight.
+*/
+@(private)
+client_handle_goaway :: proc(c: ^Client, payload: []u8) -> bool {
+	// One with an error code is the peer closing (6.8): answered, and ended, so
+	// every request on it fails at once as `Closed` and is asked again.
+	if Error_Code(read_u32(payload[4:])) != .No_Error {
+		client_goaway(c, .No_Error)
+		return false
+	}
+	last := read_u32(payload) & 0x7fff_ffff
+	loop.lock(&c.mu)
+	defer loop.unlock(&c.mu)
+	sync.atomic_store(&c.going_away, true)
+	for id, s in c.streams {
+		if id > last && !s.done && !s.reset {
+			s.reset, s.refused = true, true
+		}
+	}
+	loop.cond_broadcast(&c.cond)
+	loop.cond_broadcast(&c.slot_cond)
+	return true
+}
+
+// A stream still waiting on the peer: not done, and reset by neither end.
+@(private)
+client_in_flight :: proc(c: ^Client) -> bool {
+	loop.lock(&c.mu)
+	defer loop.unlock(&c.mu)
+	for _, s in c.streams {
+		if !s.done && !s.reset && !s.rst_sent {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
@@ -1032,7 +1091,7 @@ client_request :: proc(
 	Streams still in the table count, done or not: one is only freed by its
 	caller's cleanup below, and waiting that little longer is the safe side.
 	*/
-	for len(c.streams) >= c.peer_max_streams && !c.closed {
+	for len(c.streams) >= c.peer_max_streams && !c.closed && !c.going_away {
 		/*
 		A limit of zero with nothing open frees no slot: only another SETTINGS
 		would, and nothing says one is coming. Give the connection up, as on id
@@ -1058,22 +1117,18 @@ client_request :: proc(
 		}
 		loop.cond_wait_with_timeout(&c.slot_cond, &c.mu, remaining)
 	}
-	if c.closed {
+	// RFC 9113 6.8: no new stream after the peer's GOAWAY.
+	if c.closed || c.going_away {
 		loop.unlock(&c.mu)
 		return {}, .Closed
 	}
 	// RFC 9113 §5.1.1: an endpoint that has exhausted the stream id space must
-	// not open further streams on this connection. Close it so get_h2_conn
-	// dials a fresh one instead of wrapping the id and colliding with a
-	// stream still keyed on the unmasked value in c.streams. The RFC only
-	// requires refusing *new* streams, not tearing down ones already open; a
-	// draining state that let in-flight streams finish would be more
-	// faithful. Closing is a simplification that also cuts short whatever is
-	// still in flight - acceptable because doh.odin retries and this is
-	// 2^30 requests away, not because there is nothing to cut short.
+	// not open further streams on this connection. It goes away as after a
+	// peer's GOAWAY: `get_h2_conn` dials a fresh one instead of wrapping the id
+	// and colliding with a stream still keyed on the unmasked value in
+	// c.streams, and the streams already open finish.
 	if c.next_stream_id > 0x7fff_ffff {
-		sync.atomic_store(&c.closed, true)
-		loop.cond_broadcast(&c.cond)
+		sync.atomic_store(&c.going_away, true)
 		loop.cond_broadcast(&c.slot_cond)
 		loop.unlock(&c.mu)
 		return {}, .Closed

@@ -1105,11 +1105,6 @@ close_on_write :: proc(user: rawptr, buf: []u8) -> bool {
 	return true
 }
 
-@(private = "file")
-destroying_handler :: proc(conn: ^Conn, req: ^Request) {
-	request_destroy(conn, req)
-}
-
 @(test)
 test_data_frame_cannot_touch_a_closed_stream :: proc(t: ^testing.T) {
 	/*

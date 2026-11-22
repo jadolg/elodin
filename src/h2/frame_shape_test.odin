@@ -4,8 +4,8 @@ import "core:mem"
 import "core:testing"
 
 /*
-RFC 9113 sections 6.3, 6.5 and 6.7: the error a PING, SETTINGS or PRIORITY
-frame of the wrong shape draws, from the server and the client alike.
+RFC 9113 sections 6.3, 6.5, 6.7 and 6.8: the error a PING, SETTINGS, PRIORITY
+or GOAWAY frame of the wrong shape draws, from the server and the client alike.
 */
 @(private = "file")
 Shape_Case :: struct {
@@ -28,6 +28,8 @@ SHAPE_CASES := []Shape_Case {
 	{name = "PRIORITY on stream 0", h = {length = 5, type = .Priority}, goaway = .Protocol_Error},
 	// A stream error in 6.3, made a connection error as 5.4 allows.
 	{name = "PRIORITY of 4 bytes", h = {length = 4, type = .Priority, stream_id = 1}, goaway = .Frame_Size_Error},
+	{name = "GOAWAY on a stream", h = {length = 8, type = .Goaway, stream_id = 1}, goaway = .Protocol_Error},
+	{name = "GOAWAY of 7 bytes", h = {length = 7, type = .Goaway}, goaway = .Frame_Size_Error},
 	// The shapes that are right, so the cases above fail for their shape.
 	{name = "PRIORITY of 5 bytes", h = {length = 5, type = .Priority, stream_id = 1}, carries = true},
 	{name = "SETTINGS ACK, empty", h = {type = .Settings, flags = FLAG_ACK}, carries = true},

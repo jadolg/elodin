@@ -518,8 +518,11 @@ expect_client_reset_as :: proc(t: ^testing.T, code: Error_Code, want: Client_Err
 	free_all(context.temp_allocator)
 }
 
+// A GOAWAY naming stream 0 says the request on stream 1 was never processed
+// (RFC 9113 6.8): it fails as `Refused`, safe to ask again, and the connection
+// takes no other.
 @(test)
-test_client_goaway_closes_the_connection :: proc(t: ^testing.T) {
+test_client_goaway_refuses_a_stream_it_does_not_name :: proc(t: ^testing.T) {
 	run_script :: proc(client: net.TCP_Socket, _: rawptr) {
 		_, ok := test_wait_for_frame_type(client, .Headers)
 		if !ok {
@@ -543,16 +546,14 @@ test_client_goaway_closes_the_connection :: proc(t: ^testing.T) {
 		Client_Request{method = "GET", scheme = "https", authority = "mock.invalid", path = "/dns-query"},
 		2 * time.Second,
 	)
-	testing.expect_value(t, err, Client_Error.Closed)
-
-	// The reader loop has already returned by the time client_request's own
-	// wait unblocks on `c.closed`, so this should not need to wait further.
-	testing.expect(t, client_closed(c), "the connection was not marked closed after GOAWAY")
+	testing.expect_value(t, err, Client_Error.Refused)
+	// Set before the stream was refused, under the same lock.
+	testing.expect(t, client_going_away(c), "the connection still takes requests after GOAWAY")
 	free_all(context.temp_allocator)
 }
 
 @(test)
-test_client_closes_connection_once_stream_ids_are_exhausted :: proc(t: ^testing.T) {
+test_client_takes_no_request_once_stream_ids_are_exhausted :: proc(t: ^testing.T) {
 	// RFC 9113 5.1.1: an endpoint that has used up the 31-bit stream id space
 	// must not open another stream on the connection. Rather than run 2^30
 	// real requests, this drives the counter to the boundary directly and
@@ -576,24 +577,21 @@ test_client_closes_connection_once_stream_ids_are_exhausted :: proc(t: ^testing.
 		2 * time.Second,
 	)
 	testing.expect_value(t, err, Client_Error.Closed)
-	testing.expect(t, client_closed(c), "the connection was not marked closed once stream ids were exhausted")
+	testing.expect(t, client_going_away(c), "the connection still takes requests once stream ids were exhausted")
 	free_all(context.temp_allocator)
 }
 
 @(test)
-test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^testing.T) {
+test_client_lets_a_pending_request_finish_when_stream_ids_are_exhausted :: proc(t: ^testing.T) {
 	// A request already blocked waiting for its response is exactly the state
 	// a connection busy enough to exhaust its stream ids will be in: another
-	// caller trips the RFC 9113 5.1.1 close while this one sits in
-	// client_request's wait loop. That waiter must be woken by the close, not
-	// left to fall through on its own deadline and come back as a
-	// misclassified Timeout.
+	// caller trips RFC 9113 5.1.1 while this one sits in client_request's wait
+	// loop. 5.1.1 forbids new streams, not the ones open, so the waiter is
+	// left waiting for its answer; only the connection's end releases it.
 
 	// The mock holds the accepted socket open until the test explicitly
-	// releases it, rather than closing it after a fixed sleep: closing it
-	// early would let client_serve's own read-error path close and broadcast
-	// the connection, waking stream A for a reason unrelated to the one this
-	// test checks and masking a missing broadcast in the exhaustion branch.
+	// releases it, so that nothing but exhaustion can be what ends stream A
+	// early.
 	Script :: struct {
 		headers_seen: bool,
 		stop:         bool,
@@ -665,14 +663,15 @@ test_client_wakes_a_pending_request_when_stream_ids_are_exhausted :: proc(t: ^te
 		time.Second,
 	)
 	testing.expect_value(t, berr, Client_Error.Closed)
+	testing.expect(t, client_going_away(c), "the connection still takes requests once stream ids were exhausted")
+	testing.expect(t, !client_closed(c), "exhaustion closed the connection under the stream still open")
+	testing.expect(t, wait_for_waiter(&c.cond), "stream A stopped waiting for its response")
 
+	// The peer hangs up; that, and not the exhaustion, ends stream A.
+	sync.atomic_store(&srv.stop, true)
 	thread.join(a)
 	testing.expect_value(t, w.err, Client_Error.Closed)
-	testing.expect(
-		t,
-		w.elapsed < 2 * time.Second,
-		"the pending request was not woken by the close and instead rode out its own deadline",
-	)
+	testing.expect(t, w.elapsed < 2 * time.Second, "the pending request rode out its own deadline after the peer hung up")
 	free_all(context.temp_allocator)
 }
 
