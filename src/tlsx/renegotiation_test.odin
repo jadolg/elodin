@@ -47,6 +47,8 @@ Reneg_Server :: struct {
 	listener: net.TCP_Socket,
 	ctx:      ^Context,
 	conn:     ^Conn,
+	// Whether `SSL_renegotiate` took: the HelloRequest went out.
+	asked:    bool,
 	// What the server read back after asking to renegotiate.
 	got:      [4]u8,
 	got_n:    int,
@@ -68,7 +70,7 @@ reneg_server_worker :: proc(s: ^Reneg_Server) {
 		return
 	}
 	s.conn = conn
-	SSL_renegotiate(conn.ssl)
+	s.asked = SSL_renegotiate(conn.ssl) == 1
 	if _, werr := write(conn, transmute([]u8)string("ping")); werr != .None {
 		s.read_err = werr
 		return
@@ -79,7 +81,8 @@ reneg_server_worker :: proc(s: ^Reneg_Server) {
 /*
 RFC 9113 9.2.1: "A deployment of HTTP/2 over TLS 1.2 MUST disable
 renegotiation." A TLS 1.2 server's HelloRequest is not followed: the client
-reads on, the data after it arrives, and no renegotiation happens.
+reads on, the data after it arrives, and no renegotiation happens. An OpenSSL
+server that insists on it then ends the session, which is the server's choice.
 */
 @(test)
 test_the_client_does_not_renegotiate_at_the_servers_request :: proc(t: ^testing.T) {
@@ -117,6 +120,11 @@ test_the_client_does_not_renegotiate_at_the_servers_request :: proc(t: ^testing.
 	if !testing.expect(t, worker != nil, "cannot start the server") {
 		return
 	}
+	// Run in reverse: the worker is joined before its connection is closed,
+	// on every path out.
+	defer if s.conn != nil {
+		close(s.conn)
+	}
 	defer thread.destroy(worker)
 
 	sock, derr := net.dial_tcp_from_endpoint(bound)
@@ -143,8 +151,9 @@ test_the_client_does_not_renegotiate_at_the_servers_request :: proc(t: ^testing.
 	_, werr := write(client, transmute([]u8)string("pong"))
 	testing.expectf(t, werr == .None, "cannot answer: %v", werr)
 	thread.join(worker)
-	if s.conn != nil {
-		defer close(s.conn)
-	}
+	// The premise: the server did ask.
+	testing.expect(t, s.asked, "the server sent no HelloRequest")
 	testing.expect_value(t, total_renegotiations(client.ssl), 0)
+	// And the OpenSSL server, refused, ended the session rather than read on.
+	testing.expectf(t, s.read_err != .None, "the server read %q after the refusal", string(s.got[:s.got_n]))
 }
