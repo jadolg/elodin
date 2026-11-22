@@ -417,12 +417,17 @@ Idle accepts only HEADERS and PRIORITY; anything else on one is a connection
 error of type PROTOCOL_ERROR. A tracked stream is never idle: every id in
 c.streams is odd and below `next_stream_id`. Caller holds c.mu.
 */
+@(private)
+client_stream_is_idle :: proc(c: ^Client, stream_id: u32) -> bool {
+	return stream_id >= c.next_stream_id || stream_id % 2 == 0
+}
+
 /*
 RFC 9113 6.8: the peer took no action on streams above the GOAWAY's last stream
 id, so those fail as `Refused`, safe to ask again elsewhere; "activity on streams
 numbered lower than or equal to the last stream identifier might still complete
-successfully", so those are read to their end. No new request is taken, and `client_serve` closes the connection once nothing
-is left in flight.
+successfully", so those are read to their end. No new request is taken, and
+`client_serve` closes the connection once nothing is left in flight.
 */
 @(private)
 client_handle_goaway :: proc(c: ^Client, payload: []u8) -> bool {
@@ -451,11 +456,6 @@ client_in_flight :: proc(c: ^Client) -> bool {
 		}
 	}
 	return false
-}
-
-@(private)
-client_stream_is_idle :: proc(c: ^Client, stream_id: u32) -> bool {
-	return stream_id >= c.next_stream_id || stream_id % 2 == 0
 }
 
 @(private)

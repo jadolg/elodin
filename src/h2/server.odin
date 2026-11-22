@@ -381,9 +381,12 @@ serve :: proc(c: ^Conn) {
 			goaway(c, .Protocol_Error)
 			return
 		}
-		// A GOAWAY this end sent, from here or from the handler that answered a
-		// drained connection's last stream, is the last thing it reads past.
-		if !handle_frame(c, h, payload) || sync.atomic_load(&c.goaway_sent) {
+		/*
+		Nothing is acted on past a GOAWAY this end has sent (RFC 9113 6.8), asked
+		on both sides of the frame: before it, for one sent from a handler's own
+		fiber while this read was waiting, and after it, for one this frame drew.
+		*/
+		if sync.atomic_load(&c.goaway_sent) || !handle_frame(c, h, payload) || sync.atomic_load(&c.goaway_sent) {
 			return
 		}
 		free_all(context.temp_allocator)

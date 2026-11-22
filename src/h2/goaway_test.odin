@@ -182,3 +182,70 @@ test_no_request_goes_out_after_a_server_goaway :: proc(t: ^testing.T) {
 
 	client_done(t, c, &track, "request after goaway", &log)
 }
+
+// The serve harness, with an answer to stream 1 sent - as from the handler's
+// own fiber - the moment the reader asks for the bytes at `answer_at`.
+@(private = "file")
+Answering_Harness :: struct {
+	using h:   Serve_Harness,
+	conn:      ^Conn,
+	answer_at: int,
+	answered:  bool,
+}
+
+@(private = "file")
+answering_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
+	a := cast(^Answering_Harness)user
+	if !a.answered && a.in_pos == a.answer_at {
+		a.answered = true
+		respond(a.conn, 1, Response{status = 200, body = []u8{1}})
+	}
+	return serve_harness_read(&a.h, buf)
+}
+
+@(private = "file")
+answering_write :: proc(user: rawptr, buf: []u8) -> bool {
+	return serve_harness_write(&(cast(^Answering_Harness)user).h, buf)
+}
+
+/*
+A drain whose GOAWAY goes out from a handler's own fiber while the reader waits
+for its next frame: that frame is not acted on. The HEADERS of a stream above
+the GOAWAY's last stream id is not dispatched, and the PING behind it is not
+answered.
+*/
+@(test)
+test_serve_acts_on_no_frame_read_after_a_goaway_sent_from_another_fiber :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+
+	block := request_block()
+	input := make([dynamic]u8, 0, 256, context.temp_allocator)
+	append(&input, ..transmute([]u8)string(PREFACE))
+	append(&input, ..frame_bytes(.Settings, 0, 0, nil))
+	append(&input, ..frame_bytes(.Headers, FLAG_END_HEADERS | FLAG_END_STREAM, 1, block))
+	append(&input, ..frame_bytes(.Goaway, 0, 0, goaway_payload(0)))
+	answer_at := len(input)
+	append(&input, ..frame_bytes(.Headers, FLAG_END_HEADERS | FLAG_END_STREAM, 3, block))
+	append(&input, ..frame_bytes(.Ping, 0, 0, make([]u8, 8, context.temp_allocator)))
+	script := slice.clone(input[:])
+	defer delete(script)
+
+	log: Request_Log
+	a := Answering_Harness {
+		h = {in_data = script, written = make([dynamic]u8, 0, 256, allocator)},
+		answer_at = answer_at,
+	}
+	c := make_conn(IO{user = &a, read = answering_read, write = answering_write}, counting_handler, &log, allocator)
+	// Stream 1 is left to the "fiber": the handler counts it and answers nothing.
+	a.conn = c
+	serve(c)
+
+	testing.expect(t, a.answered, "the premise: stream 1 was answered while the reader waited")
+	testing.expect(t, a.saw_goaway && a.code == .No_Error && a.last == 1, "the drain sent no GOAWAY(NO_ERROR) naming stream 1")
+	testing.expect_value(t, log.dispatched, 1)
+	testing.expectf(t, ping_acks(a.written[:]) == 0, "%d PINGs were answered after this end's GOAWAY", ping_acks(a.written[:]))
+
+	delete(a.written)
+	conn_done(t, c, &track, "goaway from another fiber")
+}
