@@ -357,12 +357,16 @@ serve :: proc(c: ^Conn) {
 		return
 	}
 
-	for {
+	for first := true; ; first = false {
 		h, payload, refuse, ok := read_frame(c.io, c.continuation_on)
 		if !ok {
 			if code, bad := refuse.?; bad {
 				goaway(c, code)
 			}
+			return
+		}
+		if first && !opens_connection(h) {
+			goaway(c, .Protocol_Error)
 			return
 		}
 		if !handle_frame(c, h, payload) {
@@ -406,6 +410,10 @@ send_initial_settings :: proc(c: ^Conn) -> bool {
 
 @(private)
 handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
+	if code, bad := frame_shape_error(h); bad {
+		goaway(c, code)
+		return false
+	}
 	if (h.type == .Ping || h.type == .Settings) && h.flags & FLAG_ACK == 0 && !spend_control_budget(c) {
 		return false
 	}
@@ -414,10 +422,6 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return handle_settings(c, h, payload)
 
 	case .Ping:
-		if h.stream_id != 0 || len(payload) != 8 {
-			goaway(c, .Protocol_Error)
-			return false
-		}
 		if h.flags & FLAG_ACK != 0 {
 			return true
 		}
@@ -471,8 +475,8 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return true
 
 	case .Priority:
-		// Parsed and ignored: RFC 9113 deprecates the scheme and a resolver has
-		// nothing useful to do with it.
+		// Its shape checked and its values ignored: RFC 9113 deprecates the
+		// scheme and a resolver has nothing useful to do with it.
 		return true
 
 	case .Goaway:
@@ -572,16 +576,13 @@ stream_is_idle :: proc(c: ^Conn, stream_id: u32) -> bool {
 
 @(private)
 handle_settings :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
+	// The shape is `frame_shape_error`'s.
 	if h.flags & FLAG_ACK != 0 {
-		return len(payload) == 0
-	}
-	if h.stream_id != 0 || len(payload) % 6 != 0 {
-		goaway(c, .Protocol_Error)
-		return false
+		return true
 	}
 
 	loop.lock(&c.mu)
-	for i := 0; i + 6 <= len(payload); i += 6 {
+	for i := 0; i + SETTING_SIZE <= len(payload); i += SETTING_SIZE {
 		id := Setting(read_u16(payload[i:]))
 		value := read_u32(payload[i + 2:])
 		if code, bad := setting_error(id, value); bad {

@@ -552,6 +552,64 @@ run_h2_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	/*
+	RFC 9113 sections 6.3, 6.5 and 6.7: a PING, SETTINGS or PRIORITY frame of
+	the wrong shape draws the error its section names, on the wire.
+	*/
+	start_case(r, "h2: a frame of the wrong shape draws the error its section names")
+	{
+		Case :: struct {
+			what:      string,
+			type:      h2.Frame_Type,
+			flags:     u8,
+			stream_id: u32,
+			payload:   []u8,
+			goaway:    h2.Error_Code,
+		}
+		cases := []Case {
+			{"a PING of 7 bytes", .Ping, 0, 0, {1, 2, 3, 4, 5, 6, 7}, .Frame_Size_Error},
+			{"a SETTINGS ACK with a payload", .Settings, h2.FLAG_ACK, 0, {0, 3, 0, 0, 0, 1}, .Frame_Size_Error},
+			{"a SETTINGS of 5 bytes", .Settings, 0, 0, {0, 3, 0, 0, 0}, .Frame_Size_Error},
+			{"a PRIORITY on stream 0", .Priority, 0, 0, {0, 0, 0, 1, 16}, .Protocol_Error},
+			// A stream error in RFC 9113 6.3, made a connection error as 5.4
+			// allows: a reset on a stream that may be idle is one 6.4 forbids.
+			{"a PRIORITY of 4 bytes", .Priority, 0, 1, {0, 0, 0, 0}, .Frame_Size_Error},
+		}
+		for tc in cases {
+			c, cok := h2_connect(doh_port)
+			if !check(r, cok, "cannot open an h2 connection for %s", tc.what) {
+				continue
+			}
+			defer h2_close(c)
+			c.no_ack = true
+			check(r, h2_send_frame(c, tc.type, tc.flags, tc.stream_id, tc.payload), "cannot send %s", tc.what)
+			// The connection ends, so this returns once the read fails; no
+			// stream is open for it to complete, so only the GOAWAY is judged.
+			_ = h2_collect(c, []u32{1}, 3 * time.Second) // lint:allow no stream is open; the GOAWAY below is the outcome
+			if check(r, c.goaway, "no GOAWAY for %s", tc.what) {
+				check_eq_int(r, int(c.goaway_code), int(tc.goaway), fmt.tprintf("GOAWAY code for %s", tc.what))
+			}
+		}
+	}
+	end_case(r)
+
+	// RFC 9113 section 3.4: the client's preface ends in a SETTINGS frame.
+	start_case(r, "h2: a preface with no SETTINGS after it is a PROTOCOL_ERROR")
+	{
+		c, cok := h2_connect(doh_port, H2_Settings{omit = true})
+		if check(r, cok, "cannot open an h2 connection") {
+			defer h2_close(c)
+			c.no_ack = true
+			check(r, h2_send_ping(c, {1, 2, 3, 4, 5, 6, 7, 8}), "cannot send a ping")
+			_ = h2_collect(c, []u32{1}, 3 * time.Second) // lint:allow no stream is open; the GOAWAY below is the outcome
+			check(r, c.pings == 0, "a PING ahead of the client's SETTINGS was answered")
+			if check(r, c.goaway, "no GOAWAY for a preface with no SETTINGS") {
+				check_eq_int(r, int(c.goaway_code), int(h2.Error_Code.Protocol_Error), "GOAWAY code")
+			}
+		}
+	}
+	end_case(r)
+
 	start_case(r, "h2: unknown path is 404")
 	{
 		c, cok := h2_connect(doh_port)
