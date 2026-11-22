@@ -106,7 +106,9 @@ whose every check passed.
 finding. Some rules hold for the whole tree (`strings.equal_fold` and
 `strings.to_lower` outside tests, `strings.trim_space` in HTTP code, `strconv`'s
 integer parsers on config and wire input, a format in `testing.expect`, a
-`.odin:<line>` reference); others only for
+`.odin:<line>` reference, and an exported procedure nothing outside test files
+calls, which belongs in a test file - the itest and fuzz packages count as
+callers); others only for
 lines a branch adds, diffed against `LINT_BASE` (default: the merge base with
 `origin/main`): a discarded error or `ok` in a test, `time.sleep` and `time.now`
 in tests, and comments narrating history. A deliberate exception carries

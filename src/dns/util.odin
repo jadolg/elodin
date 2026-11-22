@@ -1124,10 +1124,6 @@ negative_ttl :: proc(m: Message) -> (ttl: u32, has_soa: bool) {
 	return 0, false
 }
 
-set_rcode :: proc(m: ^Message, rcode: Rcode) {
-	m.flags.rcode = u8(rcode) & 0xf
-}
-
 rcode_of :: proc(m: Message) -> Rcode {
 	base := u16(m.flags.rcode)
 	if opt, found := find_opt(m); found {

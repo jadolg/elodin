@@ -392,7 +392,7 @@ test_a_forged_unsigned_answer_past_the_ceiling_is_not_served :: proc(t: ^testing
 
 	msg, err := dns.decode_message(scenario_fixture(N3_FIXTURES, "n3_nx"), context.temp_allocator)
 	testing.expect(t, err == .None, "the fixture should decode")
-	dns.set_rcode(&msg, .No_Error)
+	msg.flags.rcode = u8(dns.Rcode.No_Error)
 	msg.authority = nil
 	answer := make([]dns.Record, 1, context.temp_allocator)
 	answer[0] = dns.Record{name = N3_QNAME, type = .A, class = .IN, ttl = 60, data = dns.Rdata_A{addr = {203, 0, 113, 66}}}
@@ -430,7 +430,7 @@ test_an_unsigned_denial_past_the_ceiling_is_not_called_forged :: proc(t: ^testin
 	for rc in ([]dns.Rcode{.No_Error, .NX_Domain}) {
 		msg, err := dns.decode_message(scenario_fixture(N3_FIXTURES, "n3_nx"), context.temp_allocator)
 		testing.expect(t, err == .None, "the fixture should decode")
-		dns.set_rcode(&msg, rc)
+		msg.flags.rcode = u8(rc)
 		msg.authority = nil
 		msg.answer = nil
 		wire, _, encode_err := dns.encode_message(msg, context.temp_allocator)

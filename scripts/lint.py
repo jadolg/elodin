@@ -135,6 +135,33 @@ def expect_formats(path, source, hits):
             hits.append(f"{path}:{n}: expect-format: testing.expect does not format its message; use testing.expectf\n    {line.strip()}")
 
 
+def test_only_procs(sources, hits):
+    """Exported procedures outside test files that nothing outside test files calls.
+
+    A procedure only tests use lives in a test file of its package. The itest
+    and fuzz packages are callers in their own right: they cannot reach another
+    package's test files. `@(private)` procedures and `@(init)` ones the runtime
+    calls are left out, and a cross-package test seam says why with lint:allow.
+    """
+    callers = {path: src for path, src in sources.items() if not path.endswith("_test.odin")}
+    for path, source in callers.items():
+        if is_test(path):
+            continue
+        lines = source.splitlines()
+        for i, line in enumerate(lines):
+            m = re.match(r"^([a-z_][a-z0-9_]*) :: proc\b", line)
+            if not m or ALLOW.search(line):
+                continue
+            attrs = "\n".join(lines[max(0, i - 3):i])
+            if "@(private" in attrs or "@(init" in attrs:
+                continue
+            word = re.compile(r"\b" + re.escape(m.group(1)) + r"\b")
+            uses = sum(len(word.findall(src)) for src in callers.values())
+            if uses <= 1:
+                hits.append(f"{path}:{i + 1}: test-only: {m.group(1)} has no caller outside test files; "
+                            f"move it to a test file of its package\n    {line.strip()}")
+
+
 def resolve_base():
     base = os.environ.get("LINT_BASE")
     if not base:
@@ -147,12 +174,15 @@ def resolve_base():
 
 def main():
     hits = []
+    sources = {}
     for path in odin_files():
         with open(os.path.join(ROOT, path), encoding="utf-8", errors="replace") as f:
             source = f.read()
+        sources[path] = source
         for n, text in enumerate(source.splitlines(), 1):
             check(TREE, path, n, text, hits)
         expect_formats(path, source, hits)
+    test_only_procs(sources, hits)
     for path, n, text in added_lines(resolve_base()):
         check(ADDED, path, n, text, hits)
     for h in hits:
