@@ -394,9 +394,16 @@ test_a_reload_keeps_the_cookie_secret_unless_the_file_changes_it :: proc(t: ^tes
 	replaced := cur
 	testing.expect_value(t, sync.atomic_load(&replaced.secrets.next_roll), 0)
 	cur = f.s.gens.current.cookies
-	testing.expect(t, sync.atomic_load(&replaced.successor) == cur.secrets, "the replaced keeper does not issue under the new secrets")
+	testing.expect(t, sync.atomic_load(&replaced.secrets.successor) == cur.secrets, "the replaced keeper does not issue under the new secrets")
 	from_retiring := make_cookie(replaced, req, now)
 	testing.expect(t, verify_cookie(cur, from_retiring[:], req, cookie_now() + COOKIE_ROLLOVER_GRACE + 1), "a cookie the retiring generation issued is refused once the grace is over")
+	// So does an older generation sharing them since a reload that kept them,
+	// and each checks the new generation's cookies as well.
+	from_oldest := make_cookie(old, req, now)
+	testing.expect(t, verify_cookie(cur, from_oldest[:], req, cookie_now() + COOKIE_ROLLOVER_GRACE + 1), "a cookie an older generation sharing the replaced secrets issued is refused once the grace is over")
+	from_new := make_cookie(cur, req, now)
+	testing.expect(t, verify_cookie(old, from_new[:], req, now), "a retiring generation refused a cookie the new one issued")
+	testing.expect(t, verify_cookie(replaced, from_new[:], req, now), "the replaced generation refused a cookie the new one issued")
 	issued := cur.secrets.slots[cur.secrets.epoch % COOKIE_SECRET_SLOTS]
 	testing.expect(t, issued.key != secret, "a configured secret did not replace the drawn one")
 	testing.expect_value(t, cur.secrets.next_roll, 0)
@@ -416,6 +423,9 @@ test_a_reload_keeps_the_cookie_secret_unless_the_file_changes_it :: proc(t: ^tes
 	testing.expect(t, verify_cookie(cur, under_first[:], req, now), "the secret the rollover retired was refused inside its grace")
 	later := cookie_now() + COOKIE_ROLLOVER_GRACE + 1
 	testing.expect(t, !verify_cookie(cur, under_third[:], req, later), "the replaced secret was accepted past the grace")
+	// Replaced twice now: the oldest keeper issues under the latest secrets.
+	from_oldest_again := make_cookie(old, req, now)
+	testing.expect(t, verify_cookie(cur, from_oldest_again[:], req, later), "a keeper two replacements back does not issue under the latest secrets")
 
 	reload_from(
 		t,

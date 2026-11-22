@@ -124,7 +124,7 @@ reload_config :: proc(s: ^Server, path: string) -> (out: Reload_Outcome) {
 	if .Cookie_Secrets in built && cur.cookies != nil {
 		// Only now: before the swap, a cookie under the new secrets handed out
 		// here would be refused by the generation still current.
-		sync.atomic_store(&cur.cookies.successor, g.cookies.secrets)
+		sync.atomic_store(&cur.cookies.secrets.successor, g.cookies.secrets)
 	}
 	keep = true
 	out.applied = true

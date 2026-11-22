@@ -92,17 +92,18 @@ Cookie_Secrets :: struct {
 	next_roll: loop.Moment,
 	// Held by the thread replacing the secret. Atomic.
 	rolling:   bool,
+	/*
+	Set by a reload that replaced these: the new generation's, which every
+	keeper still holding these issues under from then on and checks as well, so
+	a query a retiring generation answers after the grace here neither hands
+	out a cookie the new generation refuses nor refuses one it issued. Not
+	owned: a newer generation outlives an older one. Atomic.
+	*/
+	successor: ^Cookie_Secrets,
 }
 
 Cookie_Keeper :: struct {
 	secrets:      ^Cookie_Secrets,
-	/*
-	Set by a reload that replaced `secrets`: the new generation's, which
-	cookies are issued under from then on, so a query still answering here when
-	the replaced secrets' grace ends does not hand out a cookie the new
-	generation refuses. Not owned. Atomic.
-	*/
-	successor:    ^Cookie_Secrets,
 	// `cookies.previous_secret`: accepted, never issued.
 	accepted:     [COOKIE_SECRET_LEN]u8,
 	has_accepted: bool,
@@ -207,8 +208,8 @@ nothing can read yet, and stop the old ones rolling: the secret the old
 generation issues under is accepted for `COOKIE_ROLLOVER_GRACE` from now, and
 the ones before it for the rest of their own grace (RFC 7873 section 7.1).
 Called once the reload can no longer fail, so a reload that is refused leaves
-the running secrets rolling; the old keeper's `successor` is set once the new
-generation is current.
+the running secrets rolling; their `successor` is set once the new generation
+is current.
 
 Stopped, because the old generation answers on until its queries drain, and a
 secret it drew after this would be one the new generation never learns.
@@ -474,10 +475,7 @@ make_cookie :: proc(k: ^Cookie_Keeper, req: Cookie_Request, now: u32) -> (out: [
 	out[14] = u8(now >> 8)
 	out[15] = u8(now)
 
-	sec := sync.atomic_load(&k.successor)
-	if sec == nil {
-		sec = k.secrets
-	}
+	sec := latest_secrets(k.secrets)
 	hash := cookie_hash(issuing_secret(sec, now, loop.moment_now()).key, out[:16], binding.ip[:binding.ip_len])
 	copy(out[16:], hash[:])
 	return out
@@ -535,7 +533,29 @@ verify_cookie :: proc(k: ^Cookie_Keeper, raw: []u8, req: Cookie_Request, now: u3
 	// have set them, and this one is not the judge of that.
 	binding := req // As in `make_cookie`: the parameter's arrays are not sliceable.
 	ip := binding.ip[:binding.ip_len]
-	sec := k.secrets
+	for sec := k.secrets; sec != nil; sec = sync.atomic_load(&sec.successor) {
+		if cookie_signed_under(sec, raw, ip, now) {
+			return true
+		}
+	}
+	return k.has_accepted && cookie_signed_by(k.accepted, raw, ip)
+}
+
+// The secrets `sec` hands issuing on to, `sec` itself until a reload has
+// replaced them.
+@(private)
+latest_secrets :: proc(sec: ^Cookie_Secrets) -> ^Cookie_Secrets {
+	sec := sec
+	for next := sync.atomic_load(&sec.successor); next != nil; next = sync.atomic_load(&sec.successor) {
+		sec = next
+	}
+	return sec
+}
+
+// Whether a cookie is signed by the secret `sec` issues under, or by one it
+// retired that is still inside its grace.
+@(private)
+cookie_signed_under :: proc(sec: ^Cookie_Secrets, raw: []u8, ip: []u8, now: u32) -> bool {
 	epoch := sync.atomic_load(&sec.epoch)
 	if cookie_signed_by(sec.slots[epoch % COOKIE_SECRET_SLOTS].key, raw, ip) {
 		return true
@@ -556,7 +576,7 @@ verify_cookie :: proc(k: ^Cookie_Keeper, raw: []u8, req: Cookie_Request, now: u3
 			return true
 		}
 	}
-	return k.has_accepted && cookie_signed_by(k.accepted, raw, ip)
+	return false
 }
 
 // Whether a 24-byte cookie's hash is the one `secret` gives it for `ip`.

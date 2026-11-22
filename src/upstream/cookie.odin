@@ -190,14 +190,16 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	// upstream this server holds no cookie for - every cookie-less one - this
 	// would otherwise re-walk the query for each datagram of a spoofing flood
 	// to reach a verdict `held` had already settled.
-	// Just after a move or a rollover a query may have gone out with the server
-	// cookie it forgot: its reply owes one all the same.
+	// Just after a move or a rollover a query may have gone out to a server
+	// known to do cookies, with a client cookie since drawn afresh and with or
+	// without the server cookie forgotten: its reply owes one all the same.
 	expected := false
 	sent: []u8
 	carried := false
 	if held || moved {
 		sent, carried = dns.peek_edns_option(query, .Cookie)
-		expected = carried && (held || len(sent) > COOKIE_CLIENT_LEN)
+		earlier := carried && len(sent) >= COOKIE_CLIENT_LEN && mem.compare(sent[:COOKIE_CLIENT_LEN], echoed[:]) != 0
+		expected = carried && (held || len(sent) > COOKIE_CLIENT_LEN || (moved && earlier))
 	}
 
 	raw, found := reply_cookie(response)
@@ -246,7 +248,7 @@ renew_cookie_locked :: proc(
 	// afresh; false for a rollover, which leaves `speaks` as it is.
 	moved: bool,
 ) {
-	if u.cookie.server_len > 0 {
+	if u.cookie.server_len > 0 || u.cookie.speaks {
 		// The furthest wait of any query out, not only the caller's: one
 		// with more budget left may outlive the caller's.
 		u.cookie.renewed_until = max(u.cookie.renewed_until, u.cookie.out_until, loop.moment_add(loop.moment_now(), in_flight))

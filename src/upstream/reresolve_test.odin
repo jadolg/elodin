@@ -775,3 +775,62 @@ test_a_rollover_keeps_a_server_held_to_cookies :: proc(t: ^testing.T) {
 	}
 	free_all(context.temp_allocator)
 }
+
+/*
+A move just after a rollover, before the server has taught a new cookie: the
+queries out carry the rolled client cookie alone, to a server known to do
+cookies, and their replies still owe one while the window for queries from
+before the move is open.
+*/
+@(test)
+test_a_move_after_a_rollover_keeps_the_queries_out_held_to_cookies :: proc(t: ^testing.T) {
+	u, uerr := make_upstream(config.Upstream_Spec{name = "rolled", kind = .UDP, address = "127.0.0.1", port = 9}, 0, time.Second, cookies = true)
+	if !testing.expectf(t, uerr == .None, "cannot build the member: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+	first, fok := cookied_query(t, u)
+	if !fok {
+		return
+	}
+	sync.mutex_lock(&u.mu)
+	client := u.cookie.client
+	sync.mutex_unlock(&u.mu)
+	taught, tok := cookied_reply(t, first, client)
+	if !tok {
+		return
+	}
+	learn_cookie(u, taught)
+	sync.mutex_lock(&u.mu)
+	u.cookie.roll_at = loop.moment_add(loop.moment_now(), -time.Second)
+	sync.mutex_unlock(&u.mu)
+	query, qok := cookied_query(t, u)
+	if !qok {
+		return
+	}
+	sent, carried := dns.peek_edns_option(query, .Cookie)
+	if !testing.expect(t, carried && len(sent) == COOKIE_CLIENT_LEN, "the premise: the query after the rollover carries the new client cookie alone") {
+		return
+	}
+	// The rollover's own window over, as it would be a while later; the query
+	// itself is still out.
+	sync.mutex_lock(&u.mu)
+	u.cookie.renewed_until = 0
+	u.cookie.out_until = 0
+	sync.mutex_unlock(&u.mu)
+
+	delete(u.spec.address, u.allocator)
+	u.spec.address = strings.clone("127.0.0.2", u.allocator)
+	testing.expect_value(t, resolve_endpoint(u, refresh = true, in_flight = time.Minute), Error.None)
+	bare, _, bare_err := dns.encode_message(dns.Message{id = 0x6914, flags = {qr = true}, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}, context.temp_allocator)
+	if testing.expectf(t, bare_err == .None, "cannot encode the reply: %v", bare_err) {
+		testing.expect(t, !cookie_matches(u, query, bare), "a cookie-less reply to a query from before the move was taken")
+		// A query to the address moved to is judged afresh: that server may
+		// not do cookies.
+		after, aok := cookied_query(t, u)
+		if aok {
+			testing.expect(t, cookie_matches(u, after, bare), "a cookie-less reply to a query sent after the move was refused")
+		}
+	}
+	free_all(context.temp_allocator)
+}
