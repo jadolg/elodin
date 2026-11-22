@@ -207,6 +207,7 @@ start_validator :: proc(s: ^Server, l: ^Live) -> bool {
 			// The one dial on how much memory validation may hold. Zero here
 			// takes the validator's own default, as everywhere else.
 			max_cached_zones     = l.cfg.dnssec.max_cached_zones,
+			anchor_keys_cached   = key_tag_signal,
 		},
 	)
 	// The bound is named here because it is the number an operator watching
@@ -296,7 +297,8 @@ validator_query :: proc(
 ) {
 	s := cast(^Server)ctx
 
-	asked, built := upstream_query({name = name, type = type, class = .IN}, true, true, allocator)
+	tags := signalled_key_tags(s, name, type)
+	asked, built := upstream_query({name = name, type = type, class = .IN}, true, true, allocator, key_tags = tags)
 	if !built {
 		return nil, false
 	}
@@ -368,6 +370,112 @@ validator_query :: proc(
 		)
 	}
 	return response, true
+}
+
+/*
+The key tags RFC 8145 signals on a lookup of `name`'s `type`: the trust anchors'
+for `name`, on a DNSKEY lookup for an anchored zone while
+`dnssec.trust_anchor_signaling` is on (sections 4.2 and 5.2, which say a
+validating resolver SHOULD send them there and SHOULD NOT for other zones).
+Empty otherwise.
+*/
+@(private)
+signalled_key_tags :: proc(s: ^Server, name: string, type: dns.Type) -> []u16 {
+	l := live(s)
+	if type != .DNSKEY || !l.cfg.dnssec.trust_anchor_signaling || l.validator == nil {
+		return nil
+	}
+	return dnssec.anchor_key_tags(l.validator, name, context.temp_allocator)
+}
+
+/*
+`dnssec.Options.anchor_keys_cached`: the Key Tag query RFC 8145 5.2 asks for,
+while `dnssec.trust_anchor_signaling` is on. Sent once the anchor's keys are
+established, not after every DNSKEY lookup: keys that could not be had or did
+not validate are not cached, so every walk fetches them again, and a Key Tag
+query each would double what a failing or broken upstream is sent.
+*/
+@(private)
+key_tag_signal :: proc(ctx: rawptr, zone: string, tags: []u16) {
+	s := cast(^Server)ctx
+	if live(s).cfg.dnssec.trust_anchor_signaling && len(tags) > 0 {
+		send_key_tag_query(s, zone, tags)
+	}
+}
+
+// A Key Tag query waiting to be sent; see `send_key_tag_query`.
+@(private)
+Key_Tag_Query :: struct {
+	server: ^Server,
+	zone:   string,
+	tags:   []u16,
+}
+
+/*
+RFC 8145 5.2: the Key Tag query (`_ta-<tags>.<zone>`, NULL) that a DNSKEY
+lookup for a trust anchor's zone SHOULD be accompanied by, asked of the group
+that lookup asks; see `key_tag_signal` for when. Sent on a fiber of its own, counted among `server.max_pending`
+and the upstream waits like a prefetch, so the walk that set it off does not wait
+on it; its answer is the zone operators' to count and is dropped. Not sent when
+either count is full, or when the name would not fit
+(`dnssec.key_tag_query_name`).
+*/
+@(private)
+send_key_tag_query :: proc(s: ^Server, zone: string, tags: []u16) {
+	// Held for the job's whole wait, so Key Tag queries cannot fill the quarter
+	// of `max_pending` kept back from upstream waits (`upstream_wait_ceiling`).
+	if !upstream_wait_begin(s, upstream_wait_ceiling(s)) {
+		return
+	}
+	q := new(Key_Tag_Query)
+	if q == nil {
+		upstream_wait_end(s)
+		return
+	}
+	zone_err: mem.Allocator_Error
+	tags_built: bool
+	q.server = s
+	q.zone, zone_err = strings.clone(zone)
+	q.tags, tags_built = dns.alloc_slice([]u16, len(tags), context.allocator)
+	if zone_err != nil || !tags_built {
+		key_tag_query_free(q)
+		upstream_wait_end(s)
+		return
+	}
+	copy(q.tags, tags)
+	if submit_query(s, key_tag_query_job, q, live(s).cfg.server.max_pending) != .Accepted {
+		key_tag_query_free(q)
+		upstream_wait_end(s)
+	}
+}
+
+@(private)
+key_tag_query_free :: proc(q: ^Key_Tag_Query) {
+	delete(q.zone)
+	delete(q.tags)
+	free(q)
+}
+
+@(private)
+key_tag_query_job :: proc(data: rawptr) {
+	q := cast(^Key_Tag_Query)data
+	s := q.server
+	// Last of all, as in `refresh_job`.
+	defer query_done(s)
+	defer upstream_wait_end(s)
+	pin_scope(s)
+	defer key_tag_query_free(q)
+	qname, named := dnssec.key_tag_query_name(q.zone, q.tags, context.temp_allocator)
+	if !named {
+		return
+	}
+	asked, built := upstream_query({name = qname, type = .NULL, class = .IN}, false, false, context.temp_allocator)
+	if !built {
+		return
+	}
+	// The group the DNSKEY lookup it goes with asked; see `validator_query`.
+	group := route_group(s, q.zone, .DNSKEY) if covered_by_local_anchor(s, q.zone) else live(s).group
+	_, _, _ = upstream.resolve_answerable(group, asked, context.temp_allocator)
 }
 
 /*

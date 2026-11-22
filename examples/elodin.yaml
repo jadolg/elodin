@@ -493,6 +493,12 @@ dnssec:
   # trust_anchors:
   #   - ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
 
+  # Tell an anchored zone's operators which of its keys this server trusts,
+  # when fetching that zone's DNSKEY set: an edns-key-tag option on the query
+  # and a _ta-<tags> query beside it (RFC 8145). Root operators use this to
+  # pace a key rollover. On by default, as Unbound's trust-anchor-signaling is.
+  trust_anchor_signaling: true
+
   # NSEC3 records asking for more hashing than this are not computed, so a
   # denial made only of them is served insecure, without the AD bit, as
   # Unbound and BIND do past their own ceilings, rather than handing the

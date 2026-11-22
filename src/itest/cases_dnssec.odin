@@ -2,6 +2,7 @@ package itest
 
 import "core:fmt"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:time"
 import "elodin:dns"
@@ -92,6 +93,16 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "dnssec: the root DNSKEY lookup carries the anchors' key tags, and keys that do not validate set off no Key Tag query (RFC 8145, #715)")
+	{
+		// The built-in root anchors are tags 20326 and 38696: 4f66 and 9728.
+		check_key_tag_option(r, mock, []u8{0x4f, 0x66, 0x97, 0x28})
+		// This mock has no root keys to validate, so none are cached and every
+		// walk fetches them again; a Key Tag query each would double the load.
+		check(r, !mock_wait_until(mock, mock_saw_type, int(dns.Type.NULL), KEY_TAG_QUIET), "a Key Tag query followed root keys that did not validate")
+	}
+	end_case(r)
+
 	start_case(r, "dnssec: the refusal is logged with a reason")
 	{
 		check(r, log_contains(&srv, "did not validate"), "the log does not explain the refusal:\n%s", read_log(&srv))
@@ -177,7 +188,9 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		mock_reset_counts(mock)
 		_ = query_udp(udp_port, build_query("signatures.test.", u16(dns.Type.A)))
 
-		forwarded := mock_last_query(mock)
+		// The client's question by its type: the chain walk's own lookups and the
+		// Key Tag query it sends on a fiber of its own can land after it.
+		forwarded := mock_last_query_of(mock, u16(dns.Type.A))
 		if check(r, len(forwarded) > 12, "the mock saw no query") {
 			check(r, parse_header(r, forwarded).cd, "the forwarded query does not set CD")
 
@@ -211,7 +224,9 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		check(r, res.ok, "no response")
 		// The query this case sent, not one left over from an earlier case.
 		check(r, mock_total(mock) >= 1, "the CD query was not forwarded")
-		forwarded := mock_last_query(mock)
+		// The client's question by its type: the chain walk's own lookups and the
+		// Key Tag query it sends on a fiber of its own can land after it.
+		forwarded := mock_last_query_of(mock, u16(dns.Type.A))
 		if check(r, len(forwarded) > 12, "the mock saw no query") {
 			if msg, ok := decode_reply(r, forwarded); ok {
 				asked := len(msg.question) == 1 && dns.name_equal_fold(msg.question[0].name, "cd-no-do.test.")
@@ -412,6 +427,163 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	end_case(r)
 
 	run_dnssec_config_cases(r)
+	run_key_tag_off_case(r)
+	run_key_tag_failed_lookup_case(r)
+	run_key_tag_anchored_case(r)
+}
+
+// RFC 8145 section 4: the last DNSKEY lookup carried `tags` as its edns-key-tag.
+@(private = "file")
+check_key_tag_option :: proc(r: ^Runner, mock: ^Mock, tags: []u8) {
+	dnskey := mock_last_query_of(mock, u16(dns.Type.DNSKEY))
+	if check(r, dnskey != nil, "the validator never asked for a DNSKEY set") {
+		m, derr := dns.decode_message(dnskey, context.temp_allocator)
+		if check(r, derr == .None, "the DNSKEY lookup does not decode: %v", derr) {
+			data, found := dns.find_edns_option(m, .Key_Tag)
+			check(r, found && slice.equal(data, tags), "the DNSKEY lookup's edns-key-tag is %x (found %v), want %x", data, found, tags)
+		}
+	}
+}
+
+/*
+RFC 8145: a Key Tag query for `ta_name` followed keys that validated (section 5),
+sent on a fiber of its own and so waited for.
+*/
+@(private = "file")
+check_key_tag_query :: proc(r: ^Runner, mock: ^Mock, ta_name: string) {
+	if !check(r, mock_wait_until(mock, mock_saw_type, int(dns.Type.NULL), 5 * time.Second), "no Key Tag query reached the upstream") {
+		return
+	}
+	m, derr := dns.decode_message(mock_last_query_of(mock, u16(dns.Type.NULL)), context.temp_allocator)
+	if check(r, derr == .None && len(m.question) == 1, "the Key Tag query does not decode to one question: %v", derr) {
+		check(r, dns.name_equal_fold(m.question[0].name, ta_name), "the Key Tag query asks %q, want %q", m.question[0].name, ta_name)
+		check_eq_int(r, int(m.question[0].class), int(dns.Class.IN), "the Key Tag query's class")
+	}
+}
+
+/*
+`dnssec.trust_anchor_signaling: false`: an anchor whose keys validate - so one
+that draws a Key Tag query with the switch on (`run_key_tag_anchored_case`) -
+has its DNSKEY lookup carry no edns-key-tag option, and no Key Tag query follows.
+*/
+@(private = "file")
+run_key_tag_off_case :: proc(r: ^Runner) {
+	start_case(r, "dnssec: trust_anchor_signaling off sends neither RFC 8145 signal (#715)")
+	defer end_case(r)
+	upstream_port := next_port(r)
+	mock := mock_make("dnssec-quiet", upstream_port)
+	mock_synth_all(mock, {203, 0, 113, 56})
+	for f in ANCHORED_REVERSE_FIXTURES {
+		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+	}
+	if !mock_start_or_skip(r, mock, "dnssec-quiet") {
+		return
+	}
+	defer mock_stop(mock)
+	udp_port := next_port(r)
+	config := dnssec_config(
+		udp_port,
+		upstream_port,
+		[]string{ROOT_DS, ANCHORED_REVERSE_ANCHOR},
+		extra = "  trust_anchor_signaling: false\nspecial_use: {private_reverse: false}\n",
+	)
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+	res := query_udp(udp_port, build_query("1.1.168.192.in-addr.arpa.", u16(dns.Type.PTR), edns_size = 1232, dnssec_ok = true))
+	if !check(r, res.ok, "no answer for the anchored name") {
+		return
+	}
+	check(r, parse_header(r, res.wire).ad, "the premise: the anchored name validated, so its keys were cached")
+	dnskey := mock_last_query_of(mock, u16(dns.Type.DNSKEY))
+	if check(r, dnskey != nil, "the validator never asked for a DNSKEY set") {
+		m, derr := dns.decode_message(dnskey, context.temp_allocator)
+		if check(r, derr == .None, "the DNSKEY lookup does not decode: %v", derr) {
+			_, found := dns.find_edns_option(m, .Key_Tag)
+			check(r, !found, "the DNSKEY lookup carries edns-key-tag with signalling off")
+		}
+	}
+	// With the switch on, the Key Tag query arrives within milliseconds of the
+	// answer; a second is far past that.
+	check(r, !mock_wait_until(mock, mock_saw_type, int(dns.Type.NULL), KEY_TAG_QUIET), "a Key Tag query was sent with signalling off")
+}
+
+/*
+An anchor whose keys validate - the signed 168.192.in-addr.arpa, tag 18109
+(46bd) - has its DNSKEY lookup carry that tag and, once the keys are cached, a
+Key Tag query for `_ta-46bd.168.192.in-addr.arpa.` follow it.
+*/
+@(private = "file")
+run_key_tag_anchored_case :: proc(r: ^Runner) {
+	start_case(r, "dnssec: an anchor whose keys validate is followed by its Key Tag query (RFC 8145, #715)")
+	defer end_case(r)
+	upstream_port := next_port(r)
+	mock := mock_make("dnssec-anchored", upstream_port)
+	mock_synth_all(mock, {203, 0, 113, 58})
+	for f in ANCHORED_REVERSE_FIXTURES {
+		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+	}
+	if !mock_start_or_skip(r, mock, "dnssec-anchored") {
+		return
+	}
+	defer mock_stop(mock)
+	udp_port := next_port(r)
+	config := dnssec_config(udp_port, upstream_port, []string{ROOT_DS, ANCHORED_REVERSE_ANCHOR}, extra = "special_use: {private_reverse: false}\n")
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+	res := query_udp(udp_port, build_query("1.1.168.192.in-addr.arpa.", u16(dns.Type.PTR), edns_size = 1232, dnssec_ok = true))
+	if !check(r, res.ok, "no answer for the anchored name") {
+		return
+	}
+	check(r, parse_header(r, res.wire).ad, "the premise: the anchored name validated")
+	check_key_tag_option(r, mock, []u8{0x46, 0xbd})
+	check_key_tag_query(r, mock, "_ta-46bd.168.192.in-addr.arpa.")
+}
+
+// How long a case waits to be sure no Key Tag query is coming.
+@(private = "file")
+KEY_TAG_QUIET :: time.Second
+
+/*
+A root DNSKEY lookup the upstream answers with SERVFAIL still carries the
+anchors' key tags, but sets off no Key Tag query: such a lookup is not cached,
+so every walk repeats it, and a Key Tag query each would double what a failing
+upstream is sent.
+*/
+@(private = "file")
+run_key_tag_failed_lookup_case :: proc(r: ^Runner) {
+	start_case(r, "dnssec: a failed root DNSKEY lookup sets off no Key Tag query (#715)")
+	defer end_case(r)
+	upstream_port := next_port(r)
+	mock := mock_make("dnssec-failing", upstream_port)
+	mock_rcode(mock, ".", u16(dns.Type.DNSKEY), .Serv_Fail)
+	mock_synth_all(mock, {203, 0, 113, 57})
+	if !mock_start_or_skip(r, mock, "dnssec-failing") {
+		return
+	}
+	defer mock_stop(mock)
+	udp_port := next_port(r)
+	srv, ok := start_server(r, Server_Options{config = dnssec_config(udp_port, upstream_port), udp_port = udp_port})
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+	_, _, answered := ask(r, udp_port, "failing.test.", u16(dns.Type.A))
+	check(r, answered, "no answer")
+	dnskey := mock_last_query_of(mock, u16(dns.Type.DNSKEY))
+	if check(r, dnskey != nil, "the validator never asked for a DNSKEY set") {
+		m, derr := dns.decode_message(dnskey, context.temp_allocator)
+		if check(r, derr == .None, "the DNSKEY lookup does not decode: %v", derr) {
+			_, found := dns.find_edns_option(m, .Key_Tag)
+			check(r, found, "the premise: the failed DNSKEY lookup carried the anchors' key tags")
+		}
+	}
+	check(r, !mock_wait_until(mock, mock_saw_type, int(dns.Type.NULL), KEY_TAG_QUIET), "a Key Tag query followed a failed DNSKEY lookup")
 }
 
 @(private = "file")

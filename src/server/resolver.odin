@@ -1880,13 +1880,22 @@ shape_forwarded :: proc(st: ^Query_State) -> bool {
 /*
 A query this server sends upstream on its own account: `q` and nothing of anyone
 else's, RD set, a fresh transaction ID (RFC 5452 section 9.2), and one OPT record
-at `UPSTREAM_UDP_SIZE` with no options - the upstream cookie and the padding are
-put on by `src/upstream`. The name is folded to lower case as the cache key is,
+at `UPSTREAM_UDP_SIZE` carrying no option but `key_tags` - the upstream cookie and
+the padding are put on by `src/upstream`. The name is folded to lower case as the cache key is,
 so the bytes depend on the key and not the client; the answer's question is put
 back in the client's case before it goes out (`dns.copy_question_case`).
 */
 @(private)
-upstream_query :: proc(q: dns.Question, dnssec_ok, checking_disabled: bool, allocator: mem.Allocator) -> (wire: []u8, ok: bool) {
+upstream_query :: proc(
+	q: dns.Question,
+	dnssec_ok, checking_disabled: bool,
+	allocator: mem.Allocator,
+	// Sent as an `edns-key-tag` option (RFC 8145 section 4) when there are any.
+	key_tags: []u16 = nil,
+) -> (
+	wire: []u8,
+	ok: bool,
+) {
 	question := [1]dns.Question{q}
 	folded, ferr := dns.name_fold(q.name, allocator)
 	if ferr != nil {
@@ -1894,6 +1903,15 @@ upstream_query :: proc(q: dns.Question, dnssec_ok, checking_disabled: bool, allo
 	}
 	question[0].name = folded
 	additional := [1]dns.Record{dns.make_opt(UPSTREAM_UDP_SIZE, dnssec_ok)}
+	tags: [dnssec.MAX_KEY_TAGS * 2]u8
+	options: [1]dns.EDNS_Option
+	if n := min(len(key_tags), dnssec.MAX_KEY_TAGS); n > 0 {
+		for tag, i in key_tags[:n] {
+			tags[2 * i], tags[2 * i + 1] = u8(tag >> 8), u8(tag)
+		}
+		options[0] = {code = u16(dns.EDNS_Option_Code.Key_Tag), data = tags[:2 * n]}
+		additional[0].data = dns.Rdata_OPT{options = options[:]}
+	}
 	m := dns.Message {
 		id         = dns.random_id(),
 		question   = question[:],
