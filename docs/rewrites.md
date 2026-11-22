@@ -83,7 +83,7 @@ it too (RFC 8020). A signed NXDOMAIN (one carrying NSEC or NSEC3, or validated
 here) is passed on as it is, as is one whose CNAME chain cannot be followed to
 its end or runs past 32 records. A reload that changes `rewrites` keeps the
 answer cache, so such an answer already cached keeps its rcode until it expires,
-at most `cache.negative_ttl`.
+as any cached answer does (see [cache](cache.md)).
 
 **CNAME constraints.** A CNAME must be the only record in its rule, and there may
 be only one (RFC 2181 section 10.1). Put other records on the name it points at.

@@ -35,7 +35,8 @@ instead of a hosts file.
 A `rewrites` rule outranks everything on this page. A name above a rule
 (`lan.home.arpa` for a rule on `nas.lan.home.arpa`), and the types an additive
 rule leaves out at its own name, exist, so in these zones they are NODATA with
-the zone's SOA, not NXDOMAIN; so are names above a route or a trust anchor.
+the zone's SOA, not NXDOMAIN; so are names above a trust anchor, and in the
+private reverse zones names above a route.
 
 ## private_reverse
 
