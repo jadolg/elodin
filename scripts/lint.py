@@ -139,7 +139,7 @@ def expect_formats(path, source, hits):
 # A procedure declaration, `#force_inline` and other directives allowed.
 PROC = re.compile(r"^([a-z_][a-z0-9_]*)\s*::\s*(?:#\w+\s+)*proc\b")
 # What the runtime or the linker calls, with no Odin caller.
-UNCALLED = ("@(private", "@(init", "@(fini", "@(export")
+UNCALLED = ("@(private", "@(init", "@(fini", "@(export", "@(test")
 ENTRY = "main"
 # Comments and string literals, whose words call nothing.
 NOT_CODE = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|`[^`]*`|\'(?:\\.|[^\'\\\n])+\'', re.S)
@@ -148,6 +148,8 @@ UNQUALIFIED = re.compile(r"(?<![.\w])([a-z_][a-z0-9_]*)\b")
 QUALIFIED = re.compile(r"\b([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\b")
 DEFINITION = re.compile(r"\b([a-z_][a-z0-9_]*)\s*::")
 PACKAGE = re.compile(r"^package\s+(\w+)", re.M)
+# An elodin package imported under an alias of its own.
+ALIAS = re.compile(r'^import\s+(\w+)\s+"elodin:(\w+)"', re.M)
 
 
 def test_only_procs(sources, hits):
@@ -160,6 +162,11 @@ def test_only_procs(sources, hits):
     lint:allow. A use is the bare name in code of its own package, or
     `package.name` in another's - outside comments, strings and `name ::`
     declarations.
+
+    shortcut: names are matched, not resolved, so a parameter, local or field of
+    the same name in its package, or a call from its own body, counts as a use
+    and hides a test-only procedure; it never flags one with a real caller.
+    Upgrade to a parser if one slips through.
     """
     local = collections.defaultdict(collections.Counter)
     qualified = collections.Counter()
@@ -169,7 +176,8 @@ def test_only_procs(sources, hits):
         uses = local[os.path.dirname(path)]
         uses.update(UNQUALIFIED.findall(code))
         uses.subtract(DEFINITION.findall(code))
-        qualified.update(QUALIFIED.findall(code))
+        aliases = dict(ALIAS.findall(source))
+        qualified.update((aliases.get(pkg, pkg), name) for pkg, name in QUALIFIED.findall(code))
     for path, source in callers.items():
         if is_test(path):
             continue
@@ -180,8 +188,9 @@ def test_only_procs(sources, hits):
             m = PROC.match(line)
             if not m or m.group(1) == ENTRY or ALLOW.search(line):
                 continue
+            # The attributes above it, past its doc comment.
             above = i
-            while above > 0 and lines[above - 1].startswith("@("):
+            while above > 0 and lines[above - 1].startswith(("@(", "//", "/*", " *", "*/")):
                 above -= 1
             if any(a.startswith(UNCALLED) for a in lines[above:i]):
                 continue
