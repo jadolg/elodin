@@ -197,7 +197,9 @@ that; `cookies.upstream: false` is the test, and the fix if it is.
   cooldown, and the group moves on to its next member as for any other failure.
 - `https://` picks HTTP/2 or HTTP/1.1 by ALPN, preferring h2, and remembers the
   choice from the first connection. h2 multiplexes onto one connection; HTTP/1.1
-  pools up to `max_idle` idle connections.
+  pools up to `max_idle` idle connections. An h2 connection the upstream sends
+  GOAWAY on, or that has used up its stream ids, takes no new query and closes
+  once its open queries are answered (RFC 9113 sections 6.8 and 5.1.1).
 - Idle connections are swept every 30 seconds: pooled HTTP/1.1 connections and
   the shared h2 or pipelined connection are closed at the first sweep after
   they have gone unused for `idle_timeout`, so they can live up to 30 seconds

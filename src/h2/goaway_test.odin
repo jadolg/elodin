@@ -1,0 +1,184 @@
+package h2
+
+import "core:mem"
+import "core:slice"
+import "core:testing"
+import "core:time"
+
+// A GOAWAY payload: the last stream id and NO_ERROR.
+@(private = "file")
+goaway_payload :: proc(last: u32) -> []u8 {
+	p := make([]u8, 8, context.temp_allocator)
+	put_u32(p, last)
+	return p
+}
+
+// How many PING ACKs `written` holds: what a reader still reading answers.
+@(private = "file")
+ping_acks :: proc(written: []u8) -> int {
+	n, pos := 0, 0
+	for pos + FRAME_HEADER_SIZE <= len(written) {
+		h, ok := parse_frame_header(written[pos:])
+		if !ok {
+			break
+		}
+		if h.type == .Ping && h.flags & FLAG_ACK != 0 {
+			n += 1
+		}
+		pos += FRAME_HEADER_SIZE + h.length
+	}
+	return n
+}
+
+/*
+RFC 9113 6.8: a client's GOAWAY does not cancel the requests it already sent.
+The stream dispatched before it is still answered, the connection keeps being
+read, and this end's GOAWAY(NO_ERROR), naming that stream, follows the answer.
+*/
+@(test)
+test_a_peer_goaway_lets_the_open_stream_be_answered :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	log: Frame_Log
+	c := logged_conn(&log, destroying_handler, allocator)
+
+	block := request_block()
+	opened := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+	testing.expect(t, opened, "handle_headers failed")
+	payload := goaway_payload(0)
+	reading := handle_frame(c, Frame_Header{length = len(payload), type = .Goaway}, payload)
+	testing.expect(t, reading, "the connection stopped being read with a stream still to answer")
+	testing.expect(t, !saw_frame(&log, .Goaway), "a GOAWAY went out before the open stream was answered")
+
+	answered := respond(c, 1, Response{status = 200, content_type = "application/dns-message", body = []u8{1, 2, 3, 4}})
+	testing.expect(t, answered, "the answer to the open stream was not written")
+	testing.expect(t, saw_frame(&log, .Headers, 1) && saw_frame(&log, .Data, 1), "the open stream's answer did not go out")
+	testing.expect(t, len(log.frames) > 0 && log.frames[len(log.frames) - 1].type == .Goaway, "no GOAWAY followed the last answer")
+	testing.expect_value(t, log.goaway_code, Error_Code.No_Error)
+	testing.expect_value(t, log.goaway_last, 1)
+
+	conn_done(t, c, &track, "peer goaway, one stream open", &log)
+}
+
+// With nothing open, the peer's GOAWAY is answered with this end's at once.
+@(test)
+test_a_peer_goaway_on_an_idle_connection_is_answered_at_once :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	log: Frame_Log
+	c := logged_conn(&log, destroying_handler, allocator)
+
+	payload := goaway_payload(0)
+	reading := handle_frame(c, Frame_Header{length = len(payload), type = .Goaway}, payload)
+	testing.expect(t, !reading, "an idle connection was still read after the peer's GOAWAY")
+	testing.expect(t, saw_frame(&log, .Goaway), "no GOAWAY answered the peer's")
+	testing.expect_value(t, log.goaway_code, Error_Code.No_Error)
+
+	conn_done(t, c, &track, "peer goaway, idle", &log)
+}
+
+/*
+`serve` reads nothing past a GOAWAY this end has sent, even when the frame that
+drained the connection was not a request: here the peer resets the one stream
+left, and the PING behind it is never answered.
+*/
+@(test)
+test_serve_stops_reading_after_the_goaway_a_drain_sends :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+
+	block := request_block()
+	input := make([dynamic]u8, 0, 256, context.temp_allocator)
+	append(&input, ..transmute([]u8)string(PREFACE))
+	append(&input, ..frame_bytes(.Settings, 0, 0, nil))
+	append(&input, ..frame_bytes(.Headers, FLAG_END_HEADERS, 1, block))
+	append(&input, ..frame_bytes(.Goaway, 0, 0, goaway_payload(0)))
+	cancel := []u8{0, 0, 0, u8(Error_Code.Cancel)}
+	append(&input, ..frame_bytes(.Rst_Stream, 0, 1, cancel))
+	append(&input, ..frame_bytes(.Ping, 0, 0, make([]u8, 8, context.temp_allocator)))
+
+	// Off the temp allocator, which the reader frees after every frame.
+	script := slice.clone(input[:])
+	defer delete(script)
+	h := Serve_Harness {
+		in_data = script,
+		written = make([dynamic]u8, 0, 256, allocator),
+	}
+	c := make_conn(IO{user = &h, read = serve_harness_read, write = serve_harness_write}, destroying_handler, nil, allocator)
+	serve(c)
+
+	testing.expect(t, h.saw_goaway, "the drained connection sent no GOAWAY")
+	testing.expect_value(t, h.code, Error_Code.No_Error)
+	testing.expect_value(t, h.last, 1)
+	testing.expectf(t, ping_acks(h.written[:]) == 0, "%d PINGs were answered after this end's GOAWAY", ping_acks(h.written[:]))
+
+	delete(h.written)
+	conn_done(t, c, &track, "serve after drain")
+}
+
+/*
+RFC 9113 6.8 on the client: a stream above the GOAWAY's last stream id was not
+processed and fails as `Refused`; one at or below it is read to its end. Then
+the client says GOAWAY(NO_ERROR) and stops reading - the PING behind the answer
+is never answered.
+*/
+@(test)
+test_a_server_goaway_lets_streams_it_names_finish :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+
+	input := make([dynamic]u8, 0, 256, context.temp_allocator)
+	append(&input, ..frame_bytes(.Settings, 0, 0, nil))
+	append(&input, ..frame_bytes(.Goaway, 0, 0, goaway_payload(1)))
+	// `:status: 200`, static table index 8.
+	append(&input, ..frame_bytes(.Headers, FLAG_END_HEADERS, 1, []u8{0x88}))
+	append(&input, ..frame_bytes(.Data, FLAG_END_STREAM, 1, []u8{'o', 'k'}))
+	append(&input, ..frame_bytes(.Ping, 0, 0, make([]u8, 8, context.temp_allocator)))
+
+	// Off the temp allocator, which the reader frees after every frame.
+	script := slice.clone(input[:])
+	defer delete(script)
+	h := Serve_Harness {
+		in_data = script,
+		written = make([dynamic]u8, 0, 256, allocator),
+	}
+	c := client_make(IO{user = &h, read = serve_harness_read, write = serve_harness_write}, allocator)
+	// The preface is not a frame, and the harness reads frames from the start.
+	clear(&h.written)
+	named := open_test_stream(c, 1, allocator)
+	above := open_test_stream(c, 3, allocator)
+	client_serve(c)
+
+	testing.expect(t, named.done && string(named.body[:]) == "ok", "the stream the GOAWAY named did not finish")
+	testing.expect(t, above.reset && above.refused, "the stream above the GOAWAY's last id was not refused")
+	testing.expect(t, client_going_away(c), "the connection does not say it is going away")
+	testing.expect(t, h.saw_goaway, "the client sent no GOAWAY once the named stream finished")
+	testing.expect_value(t, h.code, Error_Code.No_Error)
+	testing.expectf(t, ping_acks(h.written[:]) == 0, "%d PINGs were answered after the drain", ping_acks(h.written[:]))
+
+	delete_key(&c.streams, 1)
+	delete_key(&c.streams, 3)
+	client_stream_destroy(c, named)
+	client_stream_destroy(c, above)
+	delete(h.written)
+	client_done(t, c, &track, "server goaway")
+}
+
+// No new request goes on a connection the peer has sent GOAWAY on: it fails
+// as `Closed` at once, so the caller dials afresh.
+@(test)
+test_no_request_goes_out_after_a_server_goaway :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	log: Frame_Log
+	c := logged_client(&log, allocator)
+
+	payload := goaway_payload(0)
+	testing.expect(t, client_handle_frame(c, Frame_Header{length = len(payload), type = .Goaway}, payload), "the GOAWAY was refused")
+	clear(&log.frames)
+	_, err := client_request(c, Client_Request{method = "GET", scheme = "https", authority = "a.example", path = "/dns-query"}, 50 * time.Millisecond)
+	testing.expect_value(t, err, Client_Error.Closed)
+	testing.expect(t, !saw_frame(&log, .Headers), "a request went out after the peer's GOAWAY")
+
+	client_done(t, c, &track, "request after goaway", &log)
+}

@@ -332,3 +332,40 @@ test_a_busy_h2_conn_from_before_a_move_is_let_finish :: proc(t: ^testing.T) {
 	sync.mutex_unlock(&f.u.mu)
 	testing.expect_value(t, left, 0)
 }
+
+/*
+A connection the peer has sent GOAWAY on takes no new request (RFC 9113 6.8),
+so it is not handed out again; one still carrying streams is set aside to
+finish them, as one from before a move is, rather than cut off.
+*/
+@(test)
+test_an_h2_conn_the_peer_sent_goaway_on_is_set_aside :: proc(t: ^testing.T) {
+	f: H2_Idle_Fixture
+	if !h2_idle_setup(t, &f) {
+		return
+	}
+	defer h2_idle_teardown(&f)
+
+	// A caller still holding it is a stream still open.
+	held, ok, err := get_h2_conn(f.u, time.Second, 200 * time.Millisecond)
+	if !testing.expectf(t, ok && held == f.hc.client, "the premise: the current connection is handed out (%v)", err) {
+		return
+	}
+	sync.atomic_store(&f.hc.client.going_away, true)
+	next, next_ok, _ := get_h2_conn(f.u, time.Second, 200 * time.Millisecond) // lint:allow the listener speaks no TLS; only what became of the old connection is checked
+	testing.expect(t, !(next_ok && next == f.hc.client), "a connection the peer sent GOAWAY on was handed out")
+	if next_ok && next != nil {
+		h2.client_unref(next)
+	}
+	sync.mutex_lock(&f.u.mu)
+	set_aside := false
+	for d in f.u.h2_draining {
+		set_aside ||= d == f.hc
+	}
+	sync.mutex_unlock(&f.u.mu)
+	testing.expect(t, set_aside, "the busy connection was not set aside to finish")
+	testing.expect(t, !sync.atomic_load(&f.hc.stopping), "the busy connection was cut off")
+
+	h2.client_unref(held)
+	close_idle(f.u)
+}

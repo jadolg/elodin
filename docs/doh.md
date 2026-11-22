@@ -59,6 +59,13 @@ still fails it; a refusal whose body misses its length keeps its status and
 PROTOCOL_ERROR; a conformant `CONNECT` gets a 404. HTTP/1.1 refuses the same
 shapes.
 
+A GOAWAY ends a connection only once what it lets through is done (RFC 9113
+section 6.8). A client's GOAWAY leaves the requests it has sent to be
+answered; then the listener sends GOAWAY(NO_ERROR) and closes. An upstream's
+GOAWAY takes the connection out of use for new queries, lets the queries at or
+below its last stream id finish, and fails those above it as refused, which are
+asked again on a fresh connection.
+
 A request may end with trailers after its body (RFC 9113 section 8.1). Their
 fields are ignored; trailers that do not carry END_STREAM, or that hold a
 pseudo-header or a field section 8.2 refuses, are the same PROTOCOL_ERROR. A

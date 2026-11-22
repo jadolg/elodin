@@ -3,6 +3,7 @@ package h2
 import "core:mem"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:loop"
@@ -197,7 +198,12 @@ Conn :: struct {
 	// The highest stream a handler has been given: what a GOAWAY for this
 	// end's own memory names as the last stream it may have acted on.
 	last_dispatched: u32,
+	// Written under `mu`, atomically, so `serve` can ask it after every frame
+	// without the lock.
 	goaway_sent:    bool,
+	// The peer sent GOAWAY: the connection ends once its streams are answered.
+	// Under `mu`.
+	peer_goaway:    bool,
 	/*
 	How many more DATA frames for a stream that was opened and has since
 	closed still draw a courteous RST_STREAM(STREAM_CLOSED), rather than just
@@ -375,7 +381,9 @@ serve :: proc(c: ^Conn) {
 			goaway(c, .Protocol_Error)
 			return
 		}
-		if !handle_frame(c, h, payload) {
+		// A GOAWAY this end sent, from here or from the handler that answered a
+		// drained connection's last stream, is the last thing it reads past.
+		if !handle_frame(c, h, payload) || sync.atomic_load(&c.goaway_sent) {
 			return
 		}
 		free_all(context.temp_allocator)
@@ -486,7 +494,21 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		return true
 
 	case .Goaway:
-		return false
+		/*
+		RFC 9113 6.8: a GOAWAY stops the streams its receiver would open, which
+		on this end is none, and "activity on streams numbered lower than or
+		equal to the last stream identifier might still complete". So the
+		requests the peer has sent are still read and answered, and this end
+		says GOAWAY(NO_ERROR) once the last of them is (`close_stream`).
+		*/
+		loop.lock(&c.mu)
+		c.peer_goaway = true
+		drained := len(c.streams) == 0
+		loop.unlock(&c.mu)
+		if drained {
+			goaway(c, .No_Error)
+		}
+		return !drained
 
 	case .Push_Promise:
 		// A client may not push.
@@ -1554,7 +1576,7 @@ goaway :: proc(c: ^Conn, code: Error_Code) {
 		loop.unlock(&c.mu)
 		return
 	}
-	c.goaway_sent = true
+	sync.atomic_store(&c.goaway_sent, true)
 	/*
 	INTERNAL_ERROR is this end with no room to go on. A stream that was only
 	read, or parked for its body, was not acted on, and the last stream id
@@ -1757,15 +1779,17 @@ Retire a stream and release it.
 The free happens under the lock, not after it. The reader looks streams
 up while holding `c.mu` and acts on what it finds; releasing one outside the
 lock would let this run between that lookup and the use, leaving the reader
-writing into memory that has already gone back to the allocator. Nothing here
-does I/O or takes another lock, so holding `c.mu` across it costs nothing.
+writing into memory that has already gone back to the allocator. Nothing done
+under it does I/O or takes another lock, so holding `c.mu` across it costs
+nothing. The last stream of a connection the peer has sent GOAWAY on is followed
+by this end's GOAWAY(NO_ERROR), outside the lock.
 */
 @(private)
 close_stream :: proc(c: ^Conn, stream_id: u32, peer_sending := false) {
 	loop.lock(&c.mu)
-	defer loop.unlock(&c.mu)
 	s, found := c.streams[stream_id]
 	if !found {
+		loop.unlock(&c.mu)
 		return
 	}
 	// Reset by this end with the peer still sending: see Conn.reset_ids.
@@ -1778,6 +1802,11 @@ close_stream :: proc(c: ^Conn, stream_id: u32, peer_sending := false) {
 		c.closed_held -= 1
 	}
 	stream_destroy(c, s)
+	drained := c.peer_goaway && len(c.streams) == 0
+	loop.unlock(&c.mu)
+	if drained {
+		goaway(c, .No_Error)
+	}
 }
 
 /*

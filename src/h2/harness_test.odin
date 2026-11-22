@@ -440,6 +440,21 @@ gate_proc :: proc(
 	return g.backing.procedure(g.backing.data, mode, size, alignment, old_memory, old_size, loc)
 }
 
+// One frame, header and payload, in the temp allocator.
+@(private)
+frame_bytes :: proc(type: Frame_Type, flags: u8, stream_id: u32, payload: []u8) -> []u8 {
+	out := make([dynamic]u8, 0, FRAME_HEADER_SIZE + len(payload), context.temp_allocator)
+	write_frame_header(&out, len(payload), type, flags, stream_id)
+	append(&out, ..payload)
+	return out[:]
+}
+
+// A handler that releases its request and leaves the stream unanswered.
+@(private)
+destroying_handler :: proc(conn: ^Conn, req: ^Request) {
+	request_destroy(conn, req)
+}
+
 // A handler that does nothing with its request.
 @(private)
 ignore_request :: proc(conn: ^Conn, req: ^Request) {
