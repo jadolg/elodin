@@ -145,7 +145,7 @@ Resolve `query` through the group.
 Returns the upstream response bytes, allocated from `allocator`, along with the
 upstream that produced them for logging.
 */
-resolve :: proc(
+resolve :: proc( // lint:allow the server package's route tests ask a group across packages
 	g: ^Group,
 	query: []u8,
 	allocator := context.allocator,

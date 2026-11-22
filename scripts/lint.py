@@ -140,10 +140,14 @@ def expect_formats(path, source, hits):
 PROC = re.compile(r"^([a-z_][a-z0-9_]*)\s*::\s*(?:#\w+\s+)*proc\b")
 # What the runtime or the linker calls, with no Odin caller.
 UNCALLED = ("@(private", "@(init", "@(fini", "@(export")
+ENTRY = "main"
 # Comments and string literals, whose words call nothing.
 NOT_CODE = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|`[^`]*`|\'(?:\\.|[^\'\\\n])+\'', re.S)
-WORD = re.compile(r"\b[a-z_][a-z0-9_]*\b")
+# A name as its own package uses it, and as another package does.
+UNQUALIFIED = re.compile(r"(?<![.\w])([a-z_][a-z0-9_]*)\b")
+QUALIFIED = re.compile(r"\b([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\b")
 DEFINITION = re.compile(r"\b([a-z_][a-z0-9_]*)\s*::")
+PACKAGE = re.compile(r"^package\s+(\w+)", re.M)
 
 
 def test_only_procs(sources, hits):
@@ -151,31 +155,39 @@ def test_only_procs(sources, hits):
 
     A procedure only tests use lives in a test file of its package. The itest
     and fuzz packages are callers in their own right: they cannot reach another
-    package's test files. Procedures under an attribute in `UNCALLED` are left
-    out, and a cross-package test seam says why with lint:allow. A use is the
-    name as a word in code, outside comments, strings and `name ::` declarations.
+    package's test files. `main`, and procedures under an attribute in
+    `UNCALLED`, are left out, and a cross-package test seam says why with
+    lint:allow. A use is the bare name in code of its own package, or
+    `package.name` in another's - outside comments, strings and `name ::`
+    declarations.
     """
-    uses = collections.Counter()
+    local = collections.defaultdict(collections.Counter)
+    qualified = collections.Counter()
     callers = {path: src for path, src in sources.items() if not path.endswith("_test.odin")}
-    for source in callers.values():
+    for path, source in callers.items():
         code = NOT_CODE.sub(" ", source)
-        uses.update(WORD.findall(code))
+        uses = local[os.path.dirname(path)]
+        uses.update(UNQUALIFIED.findall(code))
         uses.subtract(DEFINITION.findall(code))
+        qualified.update(QUALIFIED.findall(code))
     for path, source in callers.items():
         if is_test(path):
             continue
+        package = PACKAGE.search(source)
+        package = package.group(1) if package else os.path.basename(os.path.dirname(path))
         lines = source.splitlines()
         for i, line in enumerate(lines):
             m = PROC.match(line)
-            if not m or ALLOW.search(line):
+            if not m or m.group(1) == ENTRY or ALLOW.search(line):
                 continue
             above = i
             while above > 0 and lines[above - 1].startswith("@("):
                 above -= 1
             if any(a.startswith(UNCALLED) for a in lines[above:i]):
                 continue
-            if uses[m.group(1)] <= 0:
-                hits.append(f"{path}:{i + 1}: test-only: {m.group(1)} has no caller outside test files; "
+            name = m.group(1)
+            if local[os.path.dirname(path)][name] + qualified[(package, name)] <= 0:
+                hits.append(f"{path}:{i + 1}: test-only: {name} has no caller outside test files; "
                             f"move it to a test file of its package\n    {line.strip()}")
 
 

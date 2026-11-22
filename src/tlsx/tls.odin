@@ -1218,7 +1218,7 @@ write :: proc(conn: ^Conn, buf: []u8) -> (n: int, err: Error) {
 }
 
 // Read exactly len(buf) bytes, or fail.
-read_full :: proc(conn: ^Conn, buf: []u8) -> Error {
+read_full :: proc(conn: ^Conn, buf: []u8) -> Error { // lint:allow the server and upstream packages' tests read whole frames across packages
 	got := 0
 	for got < len(buf) {
 		n, err := read(conn, buf[got:])
