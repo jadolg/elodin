@@ -74,6 +74,8 @@ Response :: struct {
 	allow:         string,
 	// The `server` field (RFC 9110 10.2.4); empty sends none.
 	server:        string,
+	// The `date` field (RFC 9110 6.6.1), an IMF-fixdate; empty sends none.
+	date:          string,
 	// A reply to HEAD: no content (RFC 9110 9.3.2), and no content-length,
 	// which RFC 9110 8.6 allows only when it is what GET would have sent.
 	head:          bool,
@@ -1628,6 +1630,9 @@ respond :: proc(c: ^Conn, stream_id: u32, resp: Response) -> bool {
 	}
 	if resp.server != "" {
 		encode_header(&block, "server", resp.server)
+	}
+	if resp.date != "" {
+		encode_header(&block, "date", resp.date)
 	}
 
 	frame := headers_frame(stream_id, block[:], end_stream = len(resp.body) == 0)

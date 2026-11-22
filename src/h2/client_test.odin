@@ -1641,32 +1641,6 @@ test_client_empty_continuation_flood_is_refused :: proc(t: ^testing.T) {
 	client_done(t, c, &track, "empty continuation flood")
 }
 
-@(private = "file")
-Client_Header_Log :: struct {
-	block: [dynamic]u8,
-}
-
-// Keeps the header block of the first HEADERS frame the client writes.
-@(private = "file")
-client_log_headers :: proc(user: rawptr, buf: []u8) -> bool {
-	log := cast(^Client_Header_Log)user
-	pos := 0
-	if len(buf) >= len(PREFACE) && string(buf[:len(PREFACE)]) == PREFACE {
-		pos = len(PREFACE)
-	}
-	for pos + FRAME_HEADER_SIZE <= len(buf) {
-		h, ok := parse_frame_header(buf[pos:])
-		if !ok || pos + FRAME_HEADER_SIZE + h.length > len(buf) {
-			break
-		}
-		if h.type == .Headers && len(log.block) == 0 {
-			append(&log.block, ..buf[pos + FRAME_HEADER_SIZE:pos + FRAME_HEADER_SIZE + h.length])
-		}
-		pos += FRAME_HEADER_SIZE + h.length
-	}
-	return true
-}
-
 /*
 A request with a body says how long the body is.
 
@@ -1678,10 +1652,10 @@ carries the header. Found by the live parity run with a DoH upstream.
 */
 @(test)
 test_client_request_sends_content_length :: proc(t: ^testing.T) {
-	log := Client_Header_Log {
+	log := Header_Log {
 		block = make([dynamic]u8, 0, 128, context.temp_allocator),
 	}
-	c := client_make(IO{user = &log, read = no_read, write = client_log_headers})
+	c := client_make(IO{user = &log, read = no_read, write = log_headers})
 	defer client_unref(c)
 
 	body := []u8{0xde, 0xad, 0xbe, 0xef, 0x00}
@@ -1698,16 +1672,8 @@ test_client_request_sends_content_length :: proc(t: ^testing.T) {
 		10 * time.Millisecond,
 	)
 
-	table: Dynamic_Table
-	dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, context.temp_allocator)
-	headers, err := decode(&table, log.block[:], context.temp_allocator)
-	testing.expectf(t, err == .None, "the request's header block does not decode: %v", err)
-	length := ""
-	for f in headers {
-		if f.name == "content-length" {
-			length = f.value
-		}
-	}
+	length, decoded := logged_field(&log, "content-length")
+	testing.expect(t, decoded, "the request's header block does not decode")
 	testing.expectf(t, length == "5", "content-length is %q, not the body's 5 bytes", length)
 	free_all(context.temp_allocator)
 }

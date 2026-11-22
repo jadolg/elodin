@@ -245,6 +245,7 @@ main :: proc() {
 		run_tls_cipher_cases(&r)
 		run_ddr_cases(&r)
 		run_identity_cases(&r)
+		run_http_date_cases(&r)
 		run_openssl_conf_cases(&r)
 	} else {
 		skip_case(&r, "listeners", "no certificate")
