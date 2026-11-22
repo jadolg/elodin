@@ -182,6 +182,12 @@ test_the_client_holds_the_server_preface_to_a_settings_frame :: proc(t: ^testing
 			}
 		} else {
 			testing.expectf(t, !saw_frame(&log, .Goaway), "%s: a GOAWAY (%v) after a SETTINGS preface", row.name, log.goaway_code)
+			// And the SETTINGS was taken: the client acknowledged it.
+			acked := false
+			for f in log.frames {
+				acked ||= f.type == .Settings && f.flags & FLAG_ACK != 0
+			}
+			testing.expectf(t, acked, "%s: the server's SETTINGS was not acknowledged", row.name)
 		}
 		delete(log.frames)
 		delete(h.written)

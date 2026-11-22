@@ -264,6 +264,7 @@ Whether `h` may be the first frame a peer sends after its preface: RFC 9113
 section 3.4 has both ends' prefaces end in a SETTINGS frame, and an invalid
 preface is a connection error of type PROTOCOL_ERROR.
 */
+@(private)
 opens_connection :: proc(h: Frame_Header) -> bool {
 	return h.type == .Settings && h.flags & FLAG_ACK == 0
 }
@@ -279,6 +280,7 @@ stream error as a connection error"): as a stream error it would be a reset on a
 stream that may be idle, which 6.4 forbids, or one this end is still answering.
 Go's frame parser does the same.
 */
+@(private)
 frame_shape_error :: proc(h: Frame_Header) -> (code: Error_Code, bad: bool) {
 	#partial switch h.type {
 	case .Ping:

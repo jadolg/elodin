@@ -558,7 +558,7 @@ test_client_closes_connection_once_stream_ids_are_exhausted :: proc(t: ^testing.
 	// real requests, this drives the counter to the boundary directly and
 	// checks client_request refuses to allocate past it instead of wrapping
 	// the id and reusing one still live in c.streams.
-	// The peer takes the preface and nothing else.
+	// The peer takes the preface, sends its SETTINGS and nothing else.
 	p := Peer{script = proc(client: net.TCP_Socket, _: rawptr) {}}
 	if !start_peer(t, &p) {
 		return
