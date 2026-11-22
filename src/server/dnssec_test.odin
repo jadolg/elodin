@@ -2,7 +2,6 @@ package server
 
 import "core:mem"
 import "core:testing"
-import "core:time"
 import "elodin:cache"
 import "elodin:dns"
 import "elodin:dnssec"
@@ -57,41 +56,6 @@ here and the `signer` on the `Authenticated_Set` below have to be the same name,
 and a test whose fixture quietly disagreed with its verdict would drop the
 signature and look like a prune bug.
 */
-@(private = "file")
-TEST_SIGNER :: "example.com."
-
-/*
-An RRSIG's RDATA, far enough along to be read as one.
-
-What is read of it is the covered type, the signer and the validity window -
-`dnssec.strip_unauthenticated` keeps a signature for the RRset it covers, so a
-record whose first two bytes say nothing is a signature over nothing and is
-dropped. The rest is filler: no signature is verified anywhere in this file,
-which is `src/dnssec`'s work against captured chains.
-*/
-@(private = "file")
-rrsig_over :: proc(covered: dns.Type) -> dns.Rdata_Raw {
-	// 18 bytes of fixed fields, the signer name, then a signature.
-	name_buf: [dns.MAX_NAME_WIRE]u8
-	n, err := dns.encode_name(TEST_SIGNER, name_buf[:])
-	if err != .None {
-		panic("cannot encode the test signer")
-	}
-	rdata := make([]u8, 18 + n + 8, context.temp_allocator)
-	rdata[0] = u8(u16(covered) >> 8)
-	rdata[1] = u8(u16(covered))
-	rdata[2] = 13 // ECDSA P-256, so the algorithm at least names something real
-	rdata[3] = 3 // labels
-	// A window around now, so a cache that will not keep an answer past its
-	// signatures (#165) keeps this one: expiration a day ahead, inception a day
-	// behind.
-	now := u32(time.time_to_unix(time.now()))
-	dns.write_ttl_at(rdata, 8, now + 86400)
-	dns.write_ttl_at(rdata, 12, now - 86400)
-	copy(rdata[18:], name_buf[:n])
-	return dns.Rdata_Raw{data = rdata}
-}
-
 @(private = "file")
 signed_response :: proc() -> dns.Message {
 	answer := make([]dns.Record, 2, context.temp_allocator)

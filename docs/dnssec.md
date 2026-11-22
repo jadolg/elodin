@@ -24,8 +24,9 @@ every signed zone would stop resolving.
 
 As a forwarder, elodin fetches what it validates against: every DS and DNSKEY
 down from the root, or from the closest trust anchor, through the configured
-upstreams, with DO and CD set. Zone keys are cached, so the cost falls on the
-first query into a zone.
+upstreams, with DO and CD set. Every query it forwards carries DO too, whatever
+the client set (RFC 4035 section 3.2.1). Zone keys are cached, so the cost falls
+on the first query into a zone.
 
 ## What is checked
 
@@ -56,7 +57,7 @@ never changes the verdict on the answer.
 
 A client that sets CD gets the data whatever the verdict; those answers are
 cached under a separate key, so they never reach a client that wanted the check.
-A client that did not set DO gets the DNSSEC records stripped.
+A client that did not set DO gets the DNSSEC records stripped, CD or not.
 
 ## Logging
 

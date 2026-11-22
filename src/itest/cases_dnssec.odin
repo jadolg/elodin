@@ -204,6 +204,25 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 
+	start_case(r, "dnssec: a CD query without DO is forwarded with DO (RFC 4035 section 3.2.1)")
+	{
+		mock_reset_counts(mock)
+		res := query_udp(udp_port, build_query("cd-no-do.test.", u16(dns.Type.A), checking_disabled = true))
+		check(r, res.ok, "no response")
+		forwarded := mock_last_query(mock)
+		if check(r, len(forwarded) > 12, "the mock saw no query") {
+			if msg, ok := decode_reply(r, forwarded); ok {
+				check(r, dns.edns_do(msg), "the forwarded query does not set DO")
+			}
+		}
+		if res.ok {
+			if msg, ok := decode_reply(r, res.wire); ok {
+				check(r, !dns.edns_do(msg), "the answer sets DO for a client that did not")
+			}
+		}
+	}
+	end_case(r)
+
 	start_case(r, "dnssec: a private reverse name is served without validation")
 	{
 		// 20.2.168.192.in-addr.arpa is the reverse name for 192.168.2.20, an RFC
