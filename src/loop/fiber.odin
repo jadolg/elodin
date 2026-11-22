@@ -113,10 +113,23 @@ checks; a DoT or DoH upstream adds an OpenSSL handshake on the same stack. 256 K
 is an order of magnitude over the deepest of those. Under AddressSanitizer every
 frame carries redzones, so the figure is four times that there.
 
-A fiber that runs past the end hits the guard page below it and the process stops
-with SIGSEGV - a crash, never a write into a neighbour.
+A fiber that runs past the end hits the `STACK_GUARD` below it and the process
+stops with SIGSEGV - a crash, never a write into a neighbour.
 */
 STACK_SIZE :: #config(ELODIN_FIBER_STACK, 1024 * 1024 when ASAN else 256 * 1024)
+
+/*
+The unmapped-in-effect space below every fiber stack: `PROT_NONE`, so a stack
+that overruns faults. As large as it is because the compiler emits no stack
+probes: a frame moves the stack pointer down in one step and its first stores
+land wherever that is, so a guard smaller than the largest frame lets such a
+frame step over it into the mapping below, another fiber's stack. It costs
+address space, not memory. `scripts/stack_frames.py`, run by `mise run itest`
+and `mise run itest-release`, fails a build with a frame this size or larger
+outside the procedures that run on the process's own stack. A multiple of every
+kernel page size, so `mprotect` takes it whole.
+*/
+STACK_GUARD :: 64 * 1024
 
 @(private)
 PAGE :: 4096
@@ -156,7 +169,7 @@ ASAN :: .Address in ODIN_SANITIZER_FLAGS
 
 @(private)
 Stack :: struct {
-	// The whole mapping, guard page included.
+	// The whole mapping, guard included.
 	base: rawptr,
 	size: uint,
 }
@@ -194,13 +207,13 @@ when ASAN {
 
 @(private)
 stack_map :: proc() -> (s: Stack, ok: bool) {
-	size := uint(STACK_SIZE) + PAGE
+	size := uint(STACK_SIZE) + STACK_GUARD
 	base, err := linux.mmap(0, size, {.READ, .WRITE}, {.PRIVATE, .ANONYMOUS, .NORESERVE, .STACK})
 	if err != .NONE {
 		return {}, false
 	}
-	// The guard: the lowest page, since the stack grows down into it.
-	if linux.mprotect(base, PAGE, {}) != .NONE {
+	// The guard: the lowest pages, since the stack grows down into them.
+	if linux.mprotect(base, STACK_GUARD, {}) != .NONE {
 		linux.munmap(base, size)
 		return {}, false
 	}
@@ -217,7 +230,7 @@ stack_unmap :: proc(s: Stack) {
 		same addresses, and its locals would sit on that stale poison.
 		*/
 		when ASAN {
-			__asan_unpoison_memory_region(rawptr(uintptr(s.base) + PAGE), s.size - PAGE)
+			__asan_unpoison_memory_region(rawptr(uintptr(s.base) + STACK_GUARD), s.size - STACK_GUARD)
 		}
 		linux.munmap(s.base, s.size)
 	}
@@ -231,12 +244,12 @@ has returned from, so the range is dead until the fiber goes deeper again, and
 `MADV_DONTNEED` on private anonymous memory makes each of its pages read as zero
 when next touched. Done from the timer heap while the fiber is parked - nothing
 on its stack is running while its pages go.
-The guard page is left alone, and so is the page the stack pointer is in.
+The guard is left alone, and so is the page the stack pointer is in.
 */
 @(private)
 stack_release :: proc "contextless" (f: ^Fiber) {
 	page := kernel_page
-	low := (uintptr(f.stack.base) + PAGE + page - 1) &~ (page - 1)
+	low := (uintptr(f.stack.base) + STACK_GUARD + page - 1) &~ (page - 1)
 	high := uintptr(f.sp) &~ (page - 1)
 	if high > low {
 		_ = linux.madvise(rawptr(low), uint(high - low), .DONTNEED)

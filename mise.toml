@@ -338,14 +338,14 @@ run = [
 [tasks.itest]
 description = "Integration tests: run the built binary against mock upstreams"
 depends = ["build", "prepare"]
-run = "odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES && ./bin/itest"
+run = "python3 scripts/stack_frames.py bin/elodin && odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES && ./bin/itest"
 
 # The same suite against the optimised build, which is what ships: a guard that
 # holds only in one of the two (inlining, frame size) is otherwise ungated.
 [tasks.itest-release]
 description = "Integration tests against the optimised build"
 depends = ["release", "prepare"]
-run = "odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES && ./bin/itest"
+run = "python3 scripts/stack_frames.py bin/elodin && odin build src/itest -collection:elodin=src -out:bin/itest -extra-linker-flags:\"$ELODIN_LDFLAGS\" $ELODIN_DEFINES && ./bin/itest"
 
 # Does the answer that reaches the client say what the upstream's answer said?
 # A generator makes queries nobody wrote down and every field of every reply is

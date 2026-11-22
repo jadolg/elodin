@@ -2,6 +2,9 @@
 package loop
 
 import "base:intrinsics"
+import "core:os"
+import "core:strconv"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:time"
@@ -176,4 +179,46 @@ test_an_idle_parks_timer_fires_at_its_trim_or_its_deadline :: proc(t: ^testing.T
 	expire_timers(l, time.tick_add(base, 3 * IDLE_TRIM_AFTER))
 	testing.expect(t, len(l.ready) == 2 && l.ready[1] == &late, "the trimmed park was not woken on its deadline")
 	testing.expect_value(t, len(l.timers), 0)
+}
+
+/*
+The guard under a fiber stack is `STACK_GUARD` of `PROT_NONE`, the whole of it:
+the compiler emits no stack probes, so a frame up to that size that overruns the
+stack lands in the guard and faults rather than in the mapping below. Read from
+`/proc/self/maps`, where the guard is a mapping of its own once `mprotect` has
+split it off: its start is the stack's base and its permissions `---p`.
+*/
+@(test)
+test_a_fiber_stack_has_its_whole_guard_below_it :: proc(t: ^testing.T) {
+	s, mapped := stack_map()
+	if !testing.expect(t, mapped, "cannot map a stack") {
+		return
+	}
+	defer stack_unmap(s)
+	testing.expect_value(t, s.size, uint(STACK_SIZE + STACK_GUARD))
+
+	data, err := os.read_entire_file("/proc/self/maps", context.allocator)
+	if !testing.expectf(t, err == nil, "cannot read /proc/self/maps: %v", err) {
+		return
+	}
+	defer delete(data)
+	base := uintptr(s.base)
+	found := false
+	text := string(data)
+	for line in strings.split_lines_iterator(&text) {
+		dash := strings.index_byte(line, '-')
+		space := strings.index_byte(line, ' ')
+		if dash <= 0 || space <= dash {
+			continue
+		}
+		start, sok := strconv.parse_u64_of_base(line[:dash], 16)
+		end, eok := strconv.parse_u64_of_base(line[dash + 1:space], 16)
+		if !sok || !eok || uintptr(start) != base {
+			continue
+		}
+		found = true
+		testing.expectf(t, strings.has_prefix(line[space + 1:], "---p"), "the lowest mapping of the stack is %q, want no access", line[space + 1:][:4])
+		testing.expectf(t, end - start == STACK_GUARD, "the guard is %d bytes, want %d", end - start, STACK_GUARD)
+	}
+	testing.expect(t, found, "the stack's base is not the start of any mapping")
 }
