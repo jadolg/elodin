@@ -1,6 +1,7 @@
 package itest
 
 import "core:fmt"
+import "core:time"
 import "elodin:dns"
 import "elodin:h2"
 
@@ -40,7 +41,7 @@ run_http_date_cases :: proc(r: ^Runner) {
 		res := doh_post(doh_port, p.path, query, context.temp_allocator)
 		if check(r, res.ok && res.status == p.status, "DoH/1.1 %s: status %d (ok %v), want %d", p.path, res.status, res.ok, p.status) {
 			date := header_value(res.headers, "Date")
-			check(r, is_imf_fixdate(date), "DoH/1.1 %s: Date %q is not an IMF-fixdate", p.path, date)
+			check(r, is_current_date(date), "DoH/1.1 %s: Date %q is not the current IMF-fixdate", p.path, date)
 		}
 	}
 
@@ -58,14 +59,30 @@ run_http_date_cases :: proc(r: ^Runner) {
 		res, found := h2_stream(c, id)
 		if check(r, found && res.status == p.status, "DoH/2 %s: stream %d (found %v) is not a %d", p.path, id, found, p.status) {
 			date := h2_header_value(res, "date")
-			check(r, is_imf_fixdate(date), "DoH/2 %s: date %q is not an IMF-fixdate", p.path, date)
+			check(r, is_current_date(date), "DoH/2 %s: date %q is not the current IMF-fixdate", p.path, date)
 		}
 	}
 }
 
-// IMF-fixdate is the only form of the three of fixed length 29.
+// How far a response's Date may be from the wall clock when it is read.
 @(private = "file")
-is_imf_fixdate :: proc(value: string) -> bool {
-	_, ok := h2.parse_http_date(value, {})
-	return ok && len(value) == len("Sun, 06 Nov 1994 08:49:37 GMT")
+DATE_SLACK :: 60 * time.Second
+
+/*
+An IMF-fixdate (RFC 9110 5.6.7) with the weekday its date falls on, within
+`DATE_SLACK` of the wall clock. IMF-fixdate is the only one of the three forms
+that is 29 bytes long.
+*/
+@(private = "file")
+is_current_date :: proc(value: string) -> bool {
+	if len(value) != len("Sun, 06 Nov 1994 08:49:37 GMT") {
+		return false
+	}
+	moment, parsed := h2.parse_http_date(value, {})
+	if !parsed || h2.format_http_date(moment, context.temp_allocator) != value {
+		return false
+	}
+	at, converted := time.datetime_to_time(moment)
+	now := time.now() // lint:allow a Date is wall-clock time, so the wall clock is what it is checked against
+	return converted && abs(time.diff(at, now)) < DATE_SLACK
 }

@@ -1146,6 +1146,7 @@ test_a_refusal_writes_its_fields_in_one_order :: proc(t: ^testing.T) {
 		testing.expectf(t, err == nil, "the refusal was not read: %v", err)
 		testing.expectf(t, mask_date(got) == c.want, "status %d:\n got %q\nwant %q", c.status, mask_date(got), c.want)
 	}
+	free_all(context.temp_allocator)
 }
 
 @(private = "file")

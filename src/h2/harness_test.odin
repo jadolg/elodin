@@ -184,19 +184,16 @@ log_headers :: proc(user: rawptr, buf: []u8) -> bool {
 
 // The value of `name` in the logged header block; "" when it is absent.
 @(private)
-logged_field :: proc(log: ^Header_Log, name: string) -> (value: string, decoded: bool) {
+logged_field :: proc(log: ^Header_Log, name: string) -> (value: string, err: Hpack_Error) {
 	table: Dynamic_Table
 	dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, context.temp_allocator)
-	headers, err := decode(&table, log.block[:], context.temp_allocator)
-	if err != .None {
-		return "", false
-	}
+	headers := decode(&table, log.block[:], context.temp_allocator) or_return
 	for f in headers {
 		if f.name == name {
-			return f.value, true
+			return f.value, .None
 		}
 	}
-	return "", true
+	return "", .None
 }
 
 // Ends a tracked server test: the log, the connection, then the leak check.

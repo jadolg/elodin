@@ -1672,8 +1672,8 @@ test_client_request_sends_content_length :: proc(t: ^testing.T) {
 		10 * time.Millisecond,
 	)
 
-	length, decoded := logged_field(&log, "content-length")
-	testing.expect(t, decoded, "the request's header block does not decode")
+	length, err := logged_field(&log, "content-length")
+	testing.expectf(t, err == .None, "the request's header block does not decode: %v", err)
 	testing.expectf(t, length == "5", "content-length is %q, not the body's 5 bytes", length)
 	free_all(context.temp_allocator)
 }

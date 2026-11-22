@@ -431,8 +431,8 @@ test_a_response_carries_the_date_it_is_given :: proc(t: ^testing.T) {
 		}
 		conn := make_conn(IO{user = &log, read = no_read, write = log_headers}, ignore_request, nil, allocator)
 		testing.expect(t, respond(conn, 1, Response{status = 404, date = c.date}), "the response was not written")
-		got, decoded := logged_field(&log, "date")
-		testing.expect(t, decoded, "the response's header block does not decode")
+		got, err := logged_field(&log, "date")
+		testing.expectf(t, err == .None, "the response's header block does not decode: %v", err)
 		testing.expectf(t, got == c.want, "date field %q, want %q", got, c.want)
 		conn_done(t, conn, &track, "dated response")
 	}
