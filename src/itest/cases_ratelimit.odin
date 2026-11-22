@@ -618,12 +618,10 @@ run_rate_limit_cases :: proc(r: ^Runner) {
 	while the *dial* fails. That is the distinction the probe could not make: a
 	connect refused by the kernel is a listener that has not bound yet and costs no
 	arrival, while a connection accepted and then closed is this budget refusing
-	one - so the retry waits out the udp-before-tcp bind gap and still spends
-	exactly the one token the case is entitled to. Left as a timing argument it
-	would not have been sound: `start_udp` binds *and* starts its readers before
-	`start_tcp` runs, so `wait_ready` answering over UDP says nothing about the
-	stream listener, and a dial in that gap would have failed as though the pools
-	had been merged.
+	one - so the retry spends exactly the one token the case is entitled to. Every
+	listener is bound before any is read (`start_listeners`, then
+	`arm_listeners`), so once `wait_ready` has an answer over UDP the dial is not
+	refused; the retry holds that without the case depending on the order.
 
 	The UDP result is checked first, because what follows means nothing if the flood
 	did not arrive: two hundred datagrams answered a handful of times is the budget

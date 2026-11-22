@@ -45,9 +45,9 @@ stop_test_loop :: proc(tl: ^Test_Loop) {
 }
 
 /*
-A server on `cfg` with one test loop and its listeners started, which is what a
-case about the listeners needs from the server. False, with nothing left running,
-when the loop or the listeners would not start.
+A server on `cfg` with one test loop and its listeners started and armed, which
+is what a case about the listeners needs from the server. False, with nothing
+left running, when the loop or the listeners would not start.
 */
 @(private)
 start_test_listeners :: proc(
@@ -70,6 +70,11 @@ start_test_listeners :: proc(
 		// anything, and `stop_listeners` is what gives it back.
 		stop_test_listeners(l, tl)
 		testing.expect(t, false, "could not start the listeners", loc = loc)
+		return false
+	}
+	if !arm_listeners(s, l) {
+		stop_test_listeners(l, tl)
+		testing.expect(t, false, "could not arm the listeners", loc = loc)
 		return false
 	}
 	return true

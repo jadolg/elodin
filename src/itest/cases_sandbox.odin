@@ -5,6 +5,7 @@ import "core:os"
 import "core:strings"
 import "core:slice"
 import "core:sys/linux"
+import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
 
@@ -434,4 +435,61 @@ sandbox_relative_log_reload_case :: proc(r: ^Runner) {
 		return
 	}
 	check(r, wait_ready(&srv, 2 * time.Second), "the server stopped answering after the reload:\n%s", read_log(&srv))
+}
+
+/*
+Nothing is read from a listener before the process is as narrow as it gets
+(#681): every line that says a listener is being read - UDP, TCP and the metrics
+endpoint - comes after the sandbox line and, started as root, after the drop to
+`nobody`. The listeners are bound before both, so a client's bytes wait in the
+kernel instead. This orders `run`; that a line is written only once its
+listener reads is `test_a_bound_listener_reads_nothing_until_armed`.
+*/
+run_listener_arming_case :: proc(r: ^Runner) {
+	NAME :: "listeners: nothing is read before the privilege drop and the sandbox (#681)"
+	mode := suite_sandbox(r)
+	start_case(r, NAME)
+	defer end_case(r)
+	// Without a `nobody` account the drop cannot be asked for; the sandbox
+	// line still orders the case.
+	root := posix.geteuid() == 0 && posix.getpwnam("nobody") != nil
+	udp_port, tcp_port, metrics_port := next_port(r), next_port(r), next_port(r)
+	user := "\n  user: nobody" if root else ""
+	config := base_config(
+		udp_port,
+		upstream_at(next_port(r)),
+		log = "{ level: info }",
+		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		extra = fmt.tprintf("server:\n  sandbox: %s%s\nmetrics: {{ enabled: true, address: \"127.0.0.1\", port: %d }}", mode, user, metrics_port),
+	)
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, tcp_port = tcp_port})
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+	if !check(r, wait_for_log(&srv, "msg=ready", 5 * time.Second), "the server never logged ready:\n%s", read_log(&srv)) {
+		return
+	}
+	log := read_log(&srv)
+	markers := [2]string{"msg=sandbox ", "running as nobody" if root else ""}
+	narrowed := 0
+	for m in markers {
+		if m == "" {
+			continue
+		}
+		at := strings.index(log, m)
+		if !check(r, at >= 0, "no %q in the log:\n%s", m, log) {
+			return
+		}
+		narrowed = max(narrowed, at)
+	}
+	reading := [3]string {
+		fmt.tprintf("listening for DNS on 127.0.0.1:%d/udp", udp_port),
+		fmt.tprintf("listening for DNS on 127.0.0.1:%d/tcp", tcp_port),
+		fmt.tprintf("serving metrics on 127.0.0.1:%d", metrics_port),
+	}
+	for line in reading {
+		at := strings.index(log, line)
+		check(r, at > narrowed, "%q is at %d, not after the process was narrowed at %d:\n%s", line, at, narrowed, log)
+	}
 }
