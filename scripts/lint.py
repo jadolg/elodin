@@ -153,7 +153,8 @@ ALIAS = re.compile(r'^import\s+(\w+)\s+"elodin:(\w+)"', re.M)
 
 
 def test_only_procs(sources, hits):
-    """Exported procedures outside test files that nothing outside test files calls.
+    """
+    Exported procedures outside test files that nothing outside test files calls.
 
     A procedure only tests use lives in a test file of its package. The itest
     and fuzz packages are callers in their own right: they cannot reach another
@@ -168,9 +169,26 @@ def test_only_procs(sources, hits):
     and hides a test-only procedure; it never flags one with a real caller.
     Upgrade to a parser if one slips through.
     """
+    callers = {path: src for path, src in sources.items() if not path.endswith("_test.odin")}
+    local, qualified = count_uses(callers)
+    for path, source in callers.items():
+        if is_test(path):
+            continue
+        package = PACKAGE.search(source)
+        package = package.group(1) if package else os.path.basename(os.path.dirname(path))
+        uses = local[os.path.dirname(path)]
+        lines = source.splitlines()
+        for i, line in enumerate(lines):
+            name = checked_proc(lines, i)
+            if name and uses[name] + qualified[(package, name)] <= 0:
+                hits.append(f"{path}:{i + 1}: test-only: {name} has no caller outside test files; "
+                            f"move it to a test file of its package\n    {line.strip()}")
+
+
+def count_uses(callers):
+    """Each directory's bare uses of a name, and every `package.name` use, aliases resolved."""
     local = collections.defaultdict(collections.Counter)
     qualified = collections.Counter()
-    callers = {path: src for path, src in sources.items() if not path.endswith("_test.odin")}
     for path, source in callers.items():
         code = NOT_CODE.sub(" ", source)
         uses = local[os.path.dirname(path)]
@@ -178,26 +196,21 @@ def test_only_procs(sources, hits):
         uses.subtract(DEFINITION.findall(code))
         aliases = dict(ALIAS.findall(source))
         qualified.update((aliases.get(pkg, pkg), name) for pkg, name in QUALIFIED.findall(code))
-    for path, source in callers.items():
-        if is_test(path):
-            continue
-        package = PACKAGE.search(source)
-        package = package.group(1) if package else os.path.basename(os.path.dirname(path))
-        lines = source.splitlines()
-        for i, line in enumerate(lines):
-            m = PROC.match(line)
-            if not m or m.group(1) == ENTRY or ALLOW.search(line):
-                continue
-            # The attributes above it, past its doc comment.
-            above = i
-            while above > 0 and lines[above - 1].startswith(("@(", "//", "/*", " *", "*/")):
-                above -= 1
-            if any(a.startswith(UNCALLED) for a in lines[above:i]):
-                continue
-            name = m.group(1)
-            if local[os.path.dirname(path)][name] + qualified[(package, name)] <= 0:
-                hits.append(f"{path}:{i + 1}: test-only: {name} has no caller outside test files; "
-                            f"move it to a test file of its package\n    {line.strip()}")
+    return local, qualified
+
+
+def checked_proc(lines, i):
+    """The procedure declared on `lines[i]` that the rule holds to a caller, or None."""
+    m = PROC.match(lines[i])
+    if not m or m.group(1) == ENTRY or ALLOW.search(lines[i]):
+        return None
+    # The attributes above it, past its doc comment.
+    above = i
+    while above > 0 and lines[above - 1].startswith(("@(", "//", "/*", " *", "*/")):
+        above -= 1
+    if any(a.startswith(UNCALLED) for a in lines[above:i]):
+        return None
+    return m.group(1)
 
 
 def resolve_base():
