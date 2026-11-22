@@ -216,7 +216,8 @@ MAX_KEY_TAGS :: (dns.MAX_LABEL_LEN - len("_ta")) / len("-0000")
 
 /*
 The key tags of `v`'s trust anchors for `zone`, sorted from smallest to largest
-and without repeats, as RFC 8145 signals them; empty for a zone no anchor is for.
+and without repeats, as RFC 8145 signals them - the smallest `MAX_KEY_TAGS` of
+them; empty for a zone no anchor is for.
 */
 anchor_key_tags :: proc(v: ^Validator, zone: string, allocator := context.allocator) -> []u16 {
 	tags := make([dynamic]u16, 0, len(v.anchors), allocator)
@@ -226,7 +227,9 @@ anchor_key_tags :: proc(v: ^Validator, zone: string, allocator := context.alloca
 		}
 	}
 	slice.sort(tags[:])
-	return tags[:]
+	// Both signals carry the same set: the option holds no more, and the
+	// `_ta-` label could not.
+	return tags[:min(len(tags), MAX_KEY_TAGS)]
 }
 
 /*

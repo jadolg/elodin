@@ -2,7 +2,6 @@ package server
 
 import "core:mem"
 import "core:strings"
-import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:dnssec"
@@ -326,9 +325,6 @@ validator_query :: proc(
 	*/
 	group := route_group(s, name, type) if covered_by_local_anchor(s, name) else live(s).group
 	response, _, uerr := upstream.resolve_answerable(group, asked, allocator, deadline)
-	if len(tags) > 0 {
-		send_key_tag_query(s, name, tags)
-	}
 	if uerr != .None {
 		report_chain_fetch_failed(type, name, uerr)
 		return nil, false
@@ -371,6 +367,11 @@ validator_query :: proc(
 			dns.name_trim_root(name),
 			rcode_text(rcode),
 		)
+	} else if len(tags) > 0 {
+		// After an answer, not a failure: an anchor's keys that could not be had
+		// are not cached, so every walk asks again, and one Key Tag query each
+		// would double what a failing upstream is sent.
+		send_key_tag_query(s, name, tags)
 	}
 	return response, true
 }
@@ -403,18 +404,21 @@ Key_Tag_Query :: struct {
 RFC 8145 5.2: the Key Tag query (`_ta-<tags>.<zone>`, NULL) that a DNSKEY
 lookup for a trust anchor's zone SHOULD be accompanied by, asked of the group
 that lookup asks. Sent on a fiber of its own, counted among `server.max_pending`
-like a prefetch, so the walk that set it off does not wait on it; its answer is
-the zone operators' to count and is dropped. Not sent when that count is full,
-when every place to wait on an upstream is taken, or when the name would not
-fit (`dnssec.key_tag_query_name`).
+and the upstream waits like a prefetch, so the walk that set it off does not wait
+on it; its answer is the zone operators' to count and is dropped. Not sent when
+either count is full, or when the name would not fit
+(`dnssec.key_tag_query_name`).
 */
 @(private)
 send_key_tag_query :: proc(s: ^Server, zone: string, tags: []u16) {
-	if ceiling := upstream_wait_ceiling(s); ceiling > 0 && sync.atomic_load(&s.upstream_waits) >= ceiling {
+	// Held for the job's whole wait, so Key Tag queries cannot fill the quarter
+	// of `max_pending` kept back from upstream waits (`upstream_wait_ceiling`).
+	if !upstream_wait_begin(s, upstream_wait_ceiling(s)) {
 		return
 	}
 	q := new(Key_Tag_Query)
 	if q == nil {
+		upstream_wait_end(s)
 		return
 	}
 	zone_err: mem.Allocator_Error
@@ -424,11 +428,13 @@ send_key_tag_query :: proc(s: ^Server, zone: string, tags: []u16) {
 	q.tags, tags_built = dns.alloc_slice([]u16, len(tags), context.allocator)
 	if zone_err != nil || !tags_built {
 		key_tag_query_free(q)
+		upstream_wait_end(s)
 		return
 	}
 	copy(q.tags, tags)
 	if submit_query(s, key_tag_query_job, q, live(s).cfg.server.max_pending) != .Accepted {
 		key_tag_query_free(q)
+		upstream_wait_end(s)
 	}
 }
 
@@ -445,6 +451,7 @@ key_tag_query_job :: proc(data: rawptr) {
 	s := q.server
 	// Last of all, as in `refresh_job`.
 	defer query_done(s)
+	defer upstream_wait_end(s)
 	pin_scope(s)
 	defer key_tag_query_free(q)
 	qname, named := dnssec.key_tag_query_name(q.zone, q.tags, context.temp_allocator)

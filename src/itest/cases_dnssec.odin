@@ -425,6 +425,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 
 	run_dnssec_config_cases(r)
 	run_key_tag_off_case(r)
+	run_key_tag_failed_lookup_case(r)
 }
 
 /*
@@ -486,9 +487,50 @@ run_key_tag_off_case :: proc(r: ^Runner) {
 			check(r, !found, "the DNSKEY lookup carries edns-key-tag with signalling off")
 		}
 	}
-	// One decision, `signalled_key_tags`, governs both: a lookup without the
-	// option was given no tags and so set off no Key Tag query.
-	check(r, mock_last_query_of(mock, u16(dns.Type.NULL)) == nil, "a Key Tag query was sent with signalling off")
+	// The Key Tag query would go out on a fiber of its own, within milliseconds
+	// of the DNSKEY answer in the case that sends one; a second is far past that.
+	check(r, !mock_wait_until(mock, mock_saw_type, int(dns.Type.NULL), KEY_TAG_QUIET), "a Key Tag query was sent with signalling off")
+}
+
+// How long a case waits to be sure no Key Tag query is coming.
+@(private = "file")
+KEY_TAG_QUIET :: time.Second
+
+/*
+A root DNSKEY lookup the upstream answers with SERVFAIL still carries the
+anchors' key tags, but sets off no Key Tag query: such a lookup is not cached,
+so every walk repeats it, and a Key Tag query each would double what a failing
+upstream is sent.
+*/
+@(private = "file")
+run_key_tag_failed_lookup_case :: proc(r: ^Runner) {
+	start_case(r, "dnssec: a failed root DNSKEY lookup sets off no Key Tag query (#715)")
+	defer end_case(r)
+	upstream_port := next_port(r)
+	mock := mock_make("dnssec-failing", upstream_port)
+	mock_rcode(mock, ".", u16(dns.Type.DNSKEY), .Serv_Fail)
+	mock_synth_all(mock, {203, 0, 113, 57})
+	if !mock_start_or_skip(r, mock, "dnssec-failing") {
+		return
+	}
+	defer mock_stop(mock)
+	udp_port := next_port(r)
+	srv, ok := start_server(r, Server_Options{config = dnssec_config(udp_port, upstream_port), udp_port = udp_port})
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+	_, _, answered := ask(r, udp_port, "failing.test.", u16(dns.Type.A))
+	check(r, answered, "no answer")
+	dnskey := mock_last_query_of(mock, u16(dns.Type.DNSKEY))
+	if check(r, dnskey != nil, "the validator never asked for a DNSKEY set") {
+		m, derr := dns.decode_message(dnskey, context.temp_allocator)
+		if check(r, derr == .None, "the DNSKEY lookup does not decode: %v", derr) {
+			_, found := dns.find_edns_option(m, .Key_Tag)
+			check(r, found, "the premise: the failed DNSKEY lookup carried the anchors' key tags")
+		}
+	}
+	check(r, !mock_wait_until(mock, mock_saw_type, int(dns.Type.NULL), KEY_TAG_QUIET), "a Key Tag query followed a failed DNSKEY lookup")
 }
 
 @(private = "file")

@@ -139,9 +139,13 @@ operators which anchor keys it trusts, the data they use to pace a KSK rollover
   anchors' key tags (section 4);
 - a Key Tag query goes to the same upstreams beside it: type NULL, for
   `_ta-<tags>.<zone>`, each tag as four lowercase hex digits, sorted (section 5).
-  For the built-in root anchors that is `_ta-4f66-9728.`. Its answer is not
-  read, and it is sent on its own so no client waits for it. It counts in
-  `server.max_pending` like a prefetch and is skipped when that is full.
+  For the built-in root anchors that is `_ta-4f66-9728.`. It follows only a
+  DNSKEY lookup the upstreams answered, since a failed one is not cached and
+  is asked again by every walk. Its answer is not read, and it is sent on its
+  own so no client waits for it. It counts in `server.max_pending` and the
+  upstream waits like a prefetch, and is skipped when either is full.
+
+Both carry at most 12 tags, the smallest, which is what a `_ta-` label holds.
 
 Other zones' DNSKEY lookups carry neither. Set `false` to send neither for
 anchored zones either.

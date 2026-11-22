@@ -86,3 +86,22 @@ test_anchor_key_tags_are_sorted_and_unique :: proc(t: ^testing.T) {
 	testing.expectf(t, len(anchor_key_tags(&v, "other.", context.temp_allocator)) == 0, "a zone with no anchor has tags")
 	free_all(context.temp_allocator)
 }
+
+// Past `MAX_KEY_TAGS` anchors for one zone, the smallest that many are
+// signalled, so the option and the `_ta-` name carry the same set.
+@(test)
+test_anchor_key_tags_stop_at_the_most_a_name_holds :: proc(t: ^testing.T) {
+	anchors := make([]Trust_Anchor, MAX_KEY_TAGS + 1, context.temp_allocator)
+	for &a, i in anchors {
+		a = {zone = ".", ds = {key_tag = u16(len(anchors) - i)}}
+	}
+	v := Validator {
+		anchors = anchors,
+	}
+	got := anchor_key_tags(&v, ".", context.temp_allocator)
+	testing.expect_value(t, len(got), MAX_KEY_TAGS)
+	testing.expectf(t, len(got) > 0 && got[0] == 1 && got[len(got) - 1] == u16(MAX_KEY_TAGS), "the tags kept are %v, want 1 to %d", got, MAX_KEY_TAGS)
+	_, named := key_tag_query_name(".", got, context.temp_allocator)
+	testing.expect(t, named, "the tags kept do not fit a Key Tag query name")
+	free_all(context.temp_allocator)
+}

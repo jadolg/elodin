@@ -2,6 +2,7 @@ package server
 
 import "core:slice"
 import "core:testing"
+import "elodin:config"
 import "elodin:dns"
 
 /*
@@ -34,4 +35,32 @@ test_an_upstream_query_carries_the_key_tags_it_is_given :: proc(t: ^testing.T) {
 		}
 	}
 	free_all(context.temp_allocator)
+}
+
+/*
+A Key Tag query takes a place among the upstream waits before it is started
+and gives it back when it cannot be: with every place taken it is not started
+at all, and one turned away by `submit_query` (here a server with no loop to
+run it on) leaves both counts as it found them.
+*/
+@(test)
+test_a_key_tag_query_holds_an_upstream_wait_place :: proc(t: ^testing.T) {
+	cfg: config.Config
+	s := local_server(&cfg)
+	cfg.server.max_pending = 8
+	ceiling := upstream_wait_ceiling(&s)
+	if !testing.expect(t, ceiling > 0, "the premise: max_pending sets a ceiling") {
+		return
+	}
+	tags := []u16{20326}
+
+	s.upstream_waits = ceiling
+	send_key_tag_query(&s, ".", tags)
+	testing.expect_value(t, s.upstream_waits, ceiling)
+	testing.expect_value(t, s.pending, 0)
+
+	s.upstream_waits = 0
+	send_key_tag_query(&s, ".", tags)
+	testing.expect_value(t, s.upstream_waits, 0)
+	testing.expect_value(t, s.pending, 0)
 }

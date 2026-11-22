@@ -304,6 +304,10 @@ mock_reset_counts :: proc(m: ^Mock) {
 	sync.mutex_lock(&m.mu)
 	defer sync.mutex_unlock(&m.mu)
 	m.udp_queries, m.tcp_queries, m.tls_queries = 0, 0, 0
+	for _, q in m.last_of_type {
+		delete(q)
+	}
+	clear(&m.last_of_type)
 }
 
 // Close connections that have been idle this long, so a pooled connection goes
