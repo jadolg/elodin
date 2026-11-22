@@ -410,10 +410,7 @@ send_initial_settings :: proc(c: ^Conn) -> bool {
 
 @(private)
 handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
-	if code, on_stream, bad := frame_shape_error(h); bad {
-		if on_stream {
-			return stream_error(c, h.stream_id, code)
-		}
+	if code, bad := frame_shape_error(h); bad {
 		goaway(c, code)
 		return false
 	}

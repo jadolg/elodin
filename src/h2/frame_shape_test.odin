@@ -11,10 +11,9 @@ frame of the wrong shape draws, from the server and the client alike.
 Shape_Case :: struct {
 	name:    string,
 	h:       Frame_Header,
-	// Written back: a GOAWAY with this code, a RST_STREAM with this code, or
-	// neither (`.No_Error`), and whether the connection carries on.
+	// Written back: a GOAWAY with this code, or none (`.No_Error`), and
+	// whether the connection carries on.
 	goaway:  Error_Code,
-	rst:     Error_Code,
 	carries: bool,
 }
 
@@ -27,7 +26,8 @@ SHAPE_CASES := []Shape_Case {
 	{name = "SETTINGS ACK on a stream", h = {type = .Settings, flags = FLAG_ACK, stream_id = 1}, goaway = .Protocol_Error},
 	{name = "SETTINGS on a stream", h = {length = 6, type = .Settings, stream_id = 1}, goaway = .Protocol_Error},
 	{name = "PRIORITY on stream 0", h = {length = 5, type = .Priority}, goaway = .Protocol_Error},
-	{name = "PRIORITY of 4 bytes", h = {length = 4, type = .Priority, stream_id = 1}, rst = .Frame_Size_Error, carries = true},
+	// A stream error in 6.3, made a connection error as 5.4 allows.
+	{name = "PRIORITY of 4 bytes", h = {length = 4, type = .Priority, stream_id = 1}, goaway = .Frame_Size_Error},
 	// The shapes that are right, so the cases above fail for their shape.
 	{name = "PRIORITY of 5 bytes", h = {length = 5, type = .Priority, stream_id = 1}, carries = true},
 	{name = "SETTINGS ACK, empty", h = {type = .Settings, flags = FLAG_ACK}, carries = true},
@@ -55,13 +55,7 @@ check_shape :: proc(t: ^testing.T, end: string, row: Shape_Case, carried: bool, 
 	} else {
 		testing.expectf(t, !saw_frame(log, .Goaway), "%s, %s: a GOAWAY (%v) for a frame of the right shape", end, row.name, log.goaway_code)
 	}
-	if row.rst != .No_Error {
-		if testing.expectf(t, saw_frame(log, .Rst_Stream, row.h.stream_id), "%s, %s: no RST_STREAM", end, row.name) {
-			testing.expectf(t, log.rst_code == row.rst, "%s, %s: RST_STREAM %v, want %v", end, row.name, log.rst_code, row.rst)
-		}
-	} else {
-		testing.expectf(t, !saw_frame(log, .Rst_Stream), "%s, %s: a RST_STREAM", end, row.name)
-	}
+	testing.expectf(t, !saw_frame(log, .Rst_Stream), "%s, %s: a RST_STREAM", end, row.name)
 }
 
 @(test)

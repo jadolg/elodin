@@ -571,6 +571,9 @@ run_h2_cases :: proc(r: ^Runner) {
 			{"a SETTINGS ACK with a payload", .Settings, h2.FLAG_ACK, 0, {0, 3, 0, 0, 0, 1}, .Frame_Size_Error},
 			{"a SETTINGS of 5 bytes", .Settings, 0, 0, {0, 3, 0, 0, 0}, .Frame_Size_Error},
 			{"a PRIORITY on stream 0", .Priority, 0, 0, {0, 0, 0, 1, 16}, .Protocol_Error},
+			// A stream error in RFC 9113 6.3, made a connection error as 5.4
+			// allows: a reset on a stream that may be idle is one 6.4 forbids.
+			{"a PRIORITY of 4 bytes", .Priority, 0, 1, {0, 0, 0, 0}, .Frame_Size_Error},
 		}
 		for tc in cases {
 			c, cok := h2_connect(doh_port)
@@ -586,26 +589,6 @@ run_h2_cases :: proc(r: ^Runner) {
 			if check(r, c.goaway, "no GOAWAY for %s", tc.what) {
 				check_eq_int(r, int(c.goaway_code), int(tc.goaway), fmt.tprintf("GOAWAY code for %s", tc.what))
 			}
-		}
-
-		// A PRIORITY of the wrong length is a stream error, and the connection
-		// carries on.
-		c, cok := h2_connect(doh_port)
-		if check(r, cok, "cannot open an h2 connection") {
-			defer h2_close(c)
-			check(r, h2_send_frame(c, .Priority, 0, 1, {0, 0, 0, 0}), "cannot send a short PRIORITY")
-			check(r, h2_send_request(c, 3, "POST", "/dns-query", query), "cannot send stream 3")
-			if check(r, h2_collect(c, []u32{1, 3}), "stream 3 never completed after a short PRIORITY") {
-				short, short_found := h2_stream(c, 1)
-				if check(r, short_found && short.reset, "a PRIORITY of 4 bytes drew no RST_STREAM") {
-					check_eq_int(r, int(short.reset_code), int(h2.Error_Code.Frame_Size_Error), "RST_STREAM code for a PRIORITY of 4 bytes")
-				}
-				res, found := h2_stream(c, 3)
-				if check(r, found, "no result for stream 3") {
-					check_eq_int(r, res.status, 200, "status on the stream after a short PRIORITY")
-				}
-			}
-			check(r, !c.goaway, "a short PRIORITY took the connection down")
 		}
 	}
 	end_case(r)

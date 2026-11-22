@@ -317,17 +317,9 @@ client_send_preface :: proc(c: ^Client) -> bool {
 
 @(private)
 client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
-	if code, on_stream, bad := frame_shape_error(h); bad {
-		if !on_stream {
-			client_goaway(c, code)
-			return false
-		}
-		// Drawn by the peer, so charged as the server charges its own.
-		if !control_budget_spend(&c.control) {
-			client_goaway(c, .Enhance_Your_Calm)
-			return false
-		}
-		return client_rst_stream(c, h.stream_id, code)
+	if code, bad := frame_shape_error(h); bad {
+		client_goaway(c, code)
+		return false
 	}
 	// The server's rule, for the same reason: see MAX_CONTROL_FRAMES_PER_SECOND.
 	if (h.type == .Ping || h.type == .Settings) && h.flags & FLAG_ACK == 0 && !control_budget_spend(&c.control) {

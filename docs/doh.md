@@ -43,8 +43,8 @@ a client preface not followed by SETTINGS (and a server's that does not open
 with one) is a PROTOCOL_ERROR (section 3.4); a PING not 8 bytes long, a SETTINGS
 not a multiple of 6, or a SETTINGS ACK with a payload is a FRAME_SIZE_ERROR; a
 PING or SETTINGS on a stream, or a PRIORITY on stream 0, is a PROTOCOL_ERROR;
-and a PRIORITY not 5 bytes long resets its stream with FRAME_SIZE_ERROR and the
-connection carries on. An HPACK table size update after a field in the same
+and a PRIORITY not 5 bytes long is a FRAME_SIZE_ERROR for the connection, where
+section 6.3 names a stream error (section 5.4 allows the stronger one). An HPACK table size update after a field in the same
 header block is a COMPRESSION_ERROR (RFC 7541 section 4.2). A
 header list that breaks RFC 9113 sections 8.2 or 8.3 is a stream error of type
 PROTOCOL_ERROR; a conformant `CONNECT` gets a 404. HTTP/1.1 refuses the same

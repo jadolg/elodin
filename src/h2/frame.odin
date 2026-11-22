@@ -269,36 +269,41 @@ opens_connection :: proc(h: Frame_Header) -> bool {
 }
 
 /*
-The error a PING, SETTINGS or PRIORITY frame's shape draws, checked the same
-by both ends ahead of what the frame says (RFC 9113 sections 6.3, 6.5, 6.7).
-`on_stream` is a stream error on `h.stream_id`; otherwise it is a connection
-error.
+The connection error a PING, SETTINGS or PRIORITY frame's shape draws, checked
+the same by both ends ahead of what the frame says (RFC 9113 sections 6.3, 6.5,
+6.7).
+
+A PRIORITY of the wrong length is a stream error in 6.3, and is made a
+connection error here, which 5.4 allows ("An endpoint MAY choose to treat a
+stream error as a connection error"): as a stream error it would be a reset on a
+stream that may be idle, which 6.4 forbids, or one this end is still answering.
+Go's frame parser does the same.
 */
-frame_shape_error :: proc(h: Frame_Header) -> (code: Error_Code, on_stream: bool, bad: bool) {
+frame_shape_error :: proc(h: Frame_Header) -> (code: Error_Code, bad: bool) {
 	#partial switch h.type {
 	case .Ping:
 		switch {
 		case h.stream_id != 0:
-			return .Protocol_Error, false, true
+			return .Protocol_Error, true
 		case h.length != 8:
-			return .Frame_Size_Error, false, true
+			return .Frame_Size_Error, true
 		}
 	case .Settings:
 		switch {
 		case h.stream_id != 0:
-			return .Protocol_Error, false, true
+			return .Protocol_Error, true
 		case h.flags & FLAG_ACK != 0 && h.length != 0, h.length % SETTING_SIZE != 0:
-			return .Frame_Size_Error, false, true
+			return .Frame_Size_Error, true
 		}
 	case .Priority:
 		switch {
 		case h.stream_id == 0:
-			return .Protocol_Error, false, true
+			return .Protocol_Error, true
 		case h.length != PRIORITY_SIZE:
-			return .Frame_Size_Error, true, true
+			return .Frame_Size_Error, true
 		}
 	}
-	return .No_Error, false, false
+	return .No_Error, false
 }
 
 /*
