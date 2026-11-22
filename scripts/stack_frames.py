@@ -15,8 +15,12 @@ larger than any frame.
 
 Frames are read from `objdump -d`: amd64 `sub $N,%rsp`, arm64 `sub sp, sp, #N`
 (a `lsl #12` one and the one after it are one frame) and the `sub xN, sp, #N`
-an over-aligned frame starts from. A stack allocation of a size only known at
-run time is refused outright, since no guard bounds it. Only the binary's own
+an over-aligned frame starts from, followed through the register it writes.
+Each procedure's largest such subtraction is its frame, which leaves out pushes,
+saved registers and call-argument space: `SLACK` is held back from the guard
+for them. A stack allocation of a size only known at run time - a register
+moved into the stack pointer, outside an epilogue's frame pointer and the fiber
+switch - is refused outright, since no guard bounds it. Only the binary's own
 code is read: a library linked at run time is not in it.
 """
 
@@ -32,25 +36,31 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # the note on `run` in src/main/main.odin.
 MAIN_THREAD = {"main::run"}
 
+# Held back from the guard for what a frame's largest subtraction leaves out:
+# pushes, the arm64 callee-save area (at most 512 bytes), alignment padding and
+# call-argument space.
+SLACK = 4096
+
+# The fiber switch moves the stack pointer between stacks by design.
+SWITCH = "elodin_fiber_switch"
+
 IMM = r"#(?:0x([0-9a-f]+)|(\d+))"
 AMD64 = re.compile(r"\bsub[q]?\s+\$0x([0-9a-f]+),%rsp\b")
-AMD64_VARIABLE = re.compile(r"\bsub[q]?\s+%r[a-z0-9]+,%rsp\b")
-ARM64 = re.compile(r"\bsub\s+(?:sp|x\d+),\s*sp,\s*" + IMM + r"(,\s*lsl\s+#12)?")
-ARM64_VARIABLE = re.compile(r"\bsub\s+sp,\s*sp,\s*x\d+")
+# A register moved into the stack pointer, other than the frame pointer; and the
+# subtraction of a register from it.
+AMD64_VARIABLE = re.compile(r"\b(?:mov[q]?\s+%r(?!bp\b)[a-z0-9]+,%rsp|sub[q]?\s+%r[a-z0-9]+,%rsp)\b")
+ARM64 = re.compile(r"\bsub\s+(sp|x\d+),\s*(sp|x\d+),\s*" + IMM + r"(,\s*lsl\s+#12)?")
+ARM64_VARIABLE = re.compile(r"\b(?:mov\s+sp,\s*x(?!29\b)\d+|sub\s+sp,\s*sp,\s*x\d+)\b")
 SYMBOL = re.compile(r"^[0-9a-f]+ <(.+)>:$")
 
 
 def guard() -> int:
     src = (ROOT / "src/loop/fiber.odin").read_text()
     # The figure outside AddressSanitizer, which is what these builds are.
-    m = re.search(r"^STACK_GUARD :: .*?(\d+) \* 1024$", src, re.M)
+    m = re.search(r"^STACK_GUARD :: \d+ \* 1024 when ASAN else (\d+) \* 1024$", src, re.M)
     if not m:
-        sys.exit("stack_frames: STACK_GUARD not found in src/loop/fiber.odin")
+        sys.exit("stack_frames: STACK_GUARD in src/loop/fiber.odin is not `N * 1024 when ASAN else M * 1024`")
     return int(m.group(1)) * 1024
-
-
-def immediate(m: re.Match) -> int:
-    return int(m.group(1), 16) if m.group(1) is not None else int(m.group(2))
 
 
 def frames(binary: str) -> tuple[dict[str, int], list[str]]:
@@ -62,18 +72,25 @@ def frames(binary: str) -> tuple[dict[str, int], list[str]]:
         capture_output=True,
         text=True,
     ).stdout
+    return parse(out)
+
+
+def parse(out: str) -> tuple[dict[str, int], list[str]]:
+    """Each procedure's frame, and the procedures that allocate at run time, from `objdump -d` text."""
     sizes: dict[str, int] = {}
     variable: list[str] = []
     current = None
-    shifted = 0  # an arm64 `lsl #12` subtraction waiting for the one after it
+    # An arm64 frame being built across subtractions: its size so far, and the
+    # register it is in.
+    shifted, into = 0, None
     for line in out.splitlines():
         sym = SYMBOL.match(line)
         if sym:
-            current, shifted = sym.group(1), 0
+            current, shifted, into = sym.group(1), 0, None
             continue
         if current is None:
             continue
-        if AMD64_VARIABLE.search(line) or ARM64_VARIABLE.search(line):
+        if (AMD64_VARIABLE.search(line) or ARM64_VARIABLE.search(line)) and current != SWITCH:
             variable.append(current)
             continue
         m = AMD64.search(line)
@@ -82,16 +99,17 @@ def frames(binary: str) -> tuple[dict[str, int], list[str]]:
             continue
         m = ARM64.search(line)
         if m:
-            n = immediate(m)
-            if m.group(3):
-                shifted = n << 12
-                n = shifted
-            else:
-                n += shifted
-                shifted = 0
-            sizes[current] = max(sizes.get(current, 0), n)
-            continue
-        shifted = 0
+            dst, src = m.group(1), m.group(2)
+            n = int(m.group(3), 16) if m.group(3) is not None else int(m.group(4))
+            # A subtraction from the stack pointer starts a frame; one from the
+            # register the last wrote carries it on.
+            if src == "sp" or src == into:
+                base = shifted if src == into else 0
+                n = base + (n << 12 if m.group(5) else n)
+                sizes[current] = max(sizes.get(current, 0), n)
+                shifted, into = n, dst
+                continue
+        shifted, into = 0, None
     return sizes, variable
 
 
@@ -109,14 +127,14 @@ def main() -> int:
     fiber = sorted(((n, name) for name, n in sizes.items() if name not in MAIN_THREAD), reverse=True)
     top = fiber[:2]
     pair = sum(n for n, _ in top)
-    if pair >= limit:
+    if pair + SLACK >= limit:
         names = " and ".join(f"{name} ({n} bytes)" for n, name in top)
-        print(f"stack_frames: {names} come to {pair} bytes together, past the {limit}-byte fiber stack guard")
+        print(f"stack_frames: {names} come to {pair} bytes together, with {SLACK} held back past the {limit}-byte fiber stack guard")
         print("stack_frames: shrink the frame (move the large local to the scratch arena), or raise loop.STACK_GUARD")
         failed = True
     if failed:
         return 1
-    print(f"stack_frames: the two largest frames come to {pair} bytes ({', '.join(name for _, name in top)}), under the {limit}-byte guard")
+    print(f"stack_frames: the two largest frames come to {pair} bytes ({', '.join(name for _, name in top)}), with {SLACK} held back under the {limit}-byte guard")
     return 0
 
 
