@@ -551,6 +551,14 @@ serve_one_list :: proc(one: ^One_List) {
 		if err != nil {
 			return
 		}
+		// A fetcher that connects and then never sends fails its test rather
+		// than hanging the run: shutting the listener down wakes an accept,
+		// not this read. Where it cannot be set, the connection closes
+		// unanswered and the fetch under test fails.
+		if net.set_option(client, .Receive_Timeout, 3 * time.Second) != nil {
+			net.close(client)
+			return
+		}
 		buf: [1024]u8
 		_, _ = net.recv_tcp(client, buf[:])
 		head := fmt.tprintf("HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len(one.body))
@@ -564,7 +572,8 @@ serve_one_list :: proc(one: ^One_List) {
 /*
 `serve_one_list` answering `count` requests with `body` on a loopback listener,
 and the URL that reaches it. `one` is the caller's, so it outlives the thread;
-`stop_one_list` joins the thread and closes the listener.
+`stop_one_list` shuts the listener down, which wakes an accept still waiting,
+joins the thread and closes the listener.
 */
 @(private = "file")
 start_one_list :: proc(
@@ -589,6 +598,10 @@ start_one_list :: proc(
 	}
 	one^ = One_List{listener, body, count}
 	server = thread.create_and_start_with_poly_data(one, serve_one_list)
+	if !testing.expect(t, server != nil, "cannot start the list server", loc = loc) {
+		net.close(listener)
+		return
+	}
 	return server, fmt.tprintf("http://127.0.0.1:%d/l.txt", bound.port), true
 }
 
@@ -597,7 +610,7 @@ stop_one_list :: proc(one: ^One_List, server: ^thread.Thread) {
 	// Wakes an accept still waiting, for a test that returned before dialling
 	// every request: an event, not a deadline the fetches between dials race.
 	// Ignored on a listener every accept is already done with.
-	_ = net.shutdown(one.listener, .Both) // lint:allow discard: see above
+	net.shutdown(one.listener, .Both)
 	thread.join(server)
 	thread.destroy(server)
 	net.close(one.listener)
