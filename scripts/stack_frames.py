@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Fail a build whose stack frames could step over a fiber's guard.
+"""
+Fail a build whose stack frames could step over a fiber's guard.
 
 usage: scripts/stack_frames.py BINARY
 
@@ -27,7 +28,7 @@ code is read: a library linked at run time is not in it.
 import pathlib
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404: a fixed argument list, no shell
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -66,7 +67,7 @@ def guard() -> int:
 def frames(binary: str) -> tuple[dict[str, int], list[str]]:
     if shutil.which("objdump") is None:
         sys.exit("stack_frames: objdump not found; install binutils")
-    out = subprocess.run(
+    out = subprocess.run(  # nosec B603 B607: objdump on the binary the build just made
         ["objdump", "-d", "--no-show-raw-insn", binary],
         check=True,
         capture_output=True,
@@ -97,20 +98,28 @@ def parse(out: str) -> tuple[dict[str, int], list[str]]:
         if m:
             sizes[current] = max(sizes.get(current, 0), int(m.group(1), 16))
             continue
-        m = ARM64.search(line)
-        if m:
-            dst, src = m.group(1), m.group(2)
-            n = int(m.group(3), 16) if m.group(3) is not None else int(m.group(4))
-            # A subtraction from the stack pointer starts a frame; one from the
-            # register the last wrote carries it on.
-            if src == "sp" or src == into:
-                base = shifted if src == into else 0
-                n = base + (n << 12 if m.group(5) else n)
-                sizes[current] = max(sizes.get(current, 0), n)
-                shifted, into = n, dst
-                continue
+        step = arm64_step(line, shifted, into)
+        if step:
+            shifted, into = step
+            sizes[current] = max(sizes.get(current, 0), shifted)
+            continue
         shifted, into = 0, None
     return sizes, variable
+
+
+def arm64_step(line: str, shifted: int, into):
+    """The frame so far and the register it is in, after an arm64 subtraction that builds one; None for any other line."""
+    m = ARM64.search(line)
+    if not m:
+        return None
+    dst, src = m.group(1), m.group(2)
+    # A subtraction from the stack pointer starts a frame; one from the
+    # register the last wrote carries it on.
+    if src != "sp" and src != into:
+        return None
+    n = int(m.group(3), 16) if m.group(3) is not None else int(m.group(4))
+    base = shifted if src == into else 0
+    return base + (n << 12 if m.group(5) else n), dst
 
 
 def main() -> int:
@@ -120,22 +129,27 @@ def main() -> int:
     sizes, variable = frames(sys.argv[1])
     if not sizes:
         sys.exit(f"stack_frames: no frames read from {sys.argv[1]}")
-    failed = False
-    for name in sorted(set(variable) - MAIN_THREAD):
+    unbounded = sorted(set(variable) - MAIN_THREAD)
+    for name in unbounded:
         print(f"stack_frames: {name} makes a stack allocation of a size known only at run time, which no guard bounds")
-        failed = True
+    fits = pair_fits(sizes, limit)
+    return 0 if fits and not unbounded else 1
+
+
+def pair_fits(sizes: dict[str, int], limit: int) -> bool:
+    """Whether the two largest fiber frames, with `SLACK`, stay under `limit`; says which either way."""
     fiber = sorted(((n, name) for name, n in sizes.items() if name not in MAIN_THREAD), reverse=True)
     top = fiber[:2]
     pair = sum(n for n, _ in top)
     if pair + SLACK >= limit:
         names = " and ".join(f"{name} ({n} bytes)" for n, name in top)
-        print(f"stack_frames: {names} come to {pair} bytes together, with {SLACK} held back past the {limit}-byte fiber stack guard")
+        print(f"stack_frames: {names} come to {pair} bytes together, "
+              f"with {SLACK} held back past the {limit}-byte fiber stack guard")
         print("stack_frames: shrink the frame (move the large local to the scratch arena), or raise loop.STACK_GUARD")
-        failed = True
-    if failed:
-        return 1
-    print(f"stack_frames: the two largest frames come to {pair} bytes ({', '.join(name for _, name in top)}), with {SLACK} held back under the {limit}-byte guard")
-    return 0
+        return False
+    print(f"stack_frames: the two largest frames come to {pair} bytes ({', '.join(name for _, name in top)}), "
+          f"with {SLACK} held back under the {limit}-byte guard")
+    return True
 
 
 if __name__ == "__main__":
