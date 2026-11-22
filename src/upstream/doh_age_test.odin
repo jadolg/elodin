@@ -62,6 +62,8 @@ test_age_ttls_takes_the_age_off_every_ttl :: proc(t: ^testing.T) {
 		additional = []dns.Record{dns.make_opt(1232, true)},
 	}
 	m.flags.qr = true
+	// A denial, so its SOA is held to MINIMUM.
+	m.flags.rcode = u8(dns.Rcode.NX_Domain)
 	wire, _, err := dns.encode_message(m, context.temp_allocator)
 	if !testing.expectf(t, err == .None, "the reply does not encode: %v", err) {
 		return
@@ -115,5 +117,37 @@ test_age_ttls_holds_only_an_authority_soa_to_its_minimum :: proc(t: ^testing.T) 
 	}
 	testing.expect_value(t, got.answer[0].ttl, u32(3350))
 	testing.expect_value(t, got.answer[1].ttl, dns.TTL_MAX - 250)
+	free_all(context.temp_allocator)
+}
+
+// An answer with data keeps its authority SOA's own TTL less the age: only a
+// denial's SOA is held to its MINIMUM.
+@(test)
+test_age_ttls_holds_a_soa_to_minimum_only_in_a_denial :: proc(t: ^testing.T) {
+	m := dns.Message {
+		question  = []dns.Question{{name = "age.example.", type = .A, class = .IN}},
+		answer    = []dns.Record{{name = "age.example.", type = .A, class = .IN, ttl = 600, data = dns.Rdata_A{addr = {10, 9, 9, 9}}}},
+		authority = []dns.Record {
+			{
+				name = "example.",
+				type = .SOA,
+				class = .IN,
+				ttl = 3600,
+				data = dns.Rdata_SOA{ns = "ns.example.", mbox = "h.example.", serial = 1, refresh = 2, retry = 3, expire = 4, minimum = 300},
+			},
+		},
+	}
+	m.flags.qr = true
+	wire, _, err := dns.encode_message(m, context.temp_allocator)
+	if !testing.expectf(t, err == .None, "the reply does not encode: %v", err) {
+		return
+	}
+	dns.age_ttls(wire, 250)
+	got, derr := dns.decode_message(wire, context.temp_allocator)
+	if !testing.expectf(t, derr == .None && len(got.authority) == 1, "the aged reply does not decode: %v", derr) {
+		return
+	}
+	testing.expect_value(t, got.answer[0].ttl, u32(350))
+	testing.expect_value(t, got.authority[0].ttl, u32(3350))
 	free_all(context.temp_allocator)
 }
