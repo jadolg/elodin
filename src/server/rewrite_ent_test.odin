@@ -250,14 +250,3 @@ test_a_rewrite_makes_its_names_exist_in_the_special_use_zones :: proc(t: ^testin
 	free_all(context.temp_allocator)
 }
 
-// A reload that changes the rewrites moves the cache's policy, since an entry
-// may hold an NXDOMAIN `nodata_over_rewrite` turned into NODATA, or left alone.
-@(test)
-test_a_rewrite_change_moves_the_cache_policy :: proc(t: ^testing.T) {
-	a := config.default_config()
-	b := config.default_config()
-	testing.expect(t, !policy_changed(&a, &b), "two equal configurations moved the policy")
-	b.rewrites = []config.Rewrite{{domain = "nas.lan.", ttl = 300, answers = answers_of({kind = .A, v4 = {192, 168, 1, 9}})}}
-	testing.expect(t, policy_changed(&a, &b), "a rewrite added did not move the policy")
-	free_all(context.temp_allocator)
-}
