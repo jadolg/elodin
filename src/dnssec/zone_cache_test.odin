@@ -499,3 +499,18 @@ test_a_walk_reads_the_zone_cache_at_its_own_instant :: proc(t: ^testing.T) {
 	testing.expect(t, !found, "the entry should have expired for a walk that begins now")
 	free_all(context.temp_allocator)
 }
+
+/*
+`cache_put` says whether it kept the entry, which is what the Key Tag query
+(`Options.anchor_keys_cached`) is sent on: a set it declined is fetched again
+by the next walk, so sending on it would send again with every walk.
+*/
+@(test)
+test_cache_put_says_whether_it_kept_the_entry :: proc(t: ^testing.T) {
+	v := make_validator(counting_query, nil, Options{})
+	defer destroy_validator(v)
+	now := loop.moment_now()
+	testing.expect(t, cache_put(v, nil, "example.com.", .Secure, []Dnskey{sized_key(4 + 256)}, MAX_ZONE_TTL, now), "a set the cache took was reported refused")
+	testing.expect(t, !cache_put(v, nil, "example.org.", .Secure, huge_key_set(), MAX_ZONE_TTL, now), "an oversized set the cache refused was reported kept")
+	free_all(context.temp_allocator)
+}

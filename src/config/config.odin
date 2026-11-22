@@ -420,10 +420,10 @@ Dnssec_Config :: struct {
 	*/
 	max_cached_zones:     int,
 	/*
-	Whether a DNSKEY lookup for a trust anchor's zone says which anchor keys
-	this server trusts: the `edns-key-tag` option on it and a `_ta-<tags>`
-	Key Tag query beside it, which RFC 8145 sections 4.2 and 5.2 say a
-	validating resolver SHOULD send, once that zone's keys are established. The
+	Whether this server tells a trust anchor's zone which anchor keys it
+	trusts, as RFC 8145 sections 4.2 and 5.2 say a validating resolver SHOULD:
+	an `edns-key-tag` option on every DNSKEY lookup for that zone, and a
+	`_ta-<tags>` Key Tag query once its keys validate and are cached. The
 	zone's operators read them to pace a key rollover. On; Unbound's
 	`trust-anchor-signaling`, which sends the Key Tag query, is on by default.
 	*/

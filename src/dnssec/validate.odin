@@ -4815,8 +4815,10 @@ zone_keys :: proc(
 	if fstatus != .Secure {
 		return fstatus, nil
 	}
-	cache_put(v, budget, zone, .Secure, fetched, min(keys_ttl, vouched.original_ttl), walk_began(budget), sig_lapses(vouched, unix))
-	if v.anchor_keys_cached != nil {
+	kept := cache_put(v, budget, zone, .Secure, fetched, min(keys_ttl, vouched.original_ttl), walk_began(budget), sig_lapses(vouched, unix))
+	// Only keys that were kept: ones that were not are fetched again by the next
+	// walk, which would send the query again with them.
+	if kept && v.anchor_keys_cached != nil {
 		v.anchor_keys_cached(v.query_ctx, zone, anchor_key_tags(v, zone, allocator))
 	}
 	return .Secure, fetched
@@ -5050,9 +5052,9 @@ clear_non_cuts :: proc(v: ^Validator) {
 // outrun is stored expired to every later walk and to `sweep`. Nothing is
 // stored for a question that has run dry (`ran_dry`), but the name is still
 // taken out of the non-cut memo, which needs no memory and costs at most a
-// lookup.
+// lookup. True when the entry was stored.
 @(private)
-cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, keys: []Dnskey, ttl: u32, now: loop.Moment, lapses := max(u32)) {
+cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, keys: []Dnskey, ttl: u32, now: loop.Moment, lapses := max(u32)) -> (kept: bool) {
 	fold_buf: [dns.MAX_NAME_PRESENTATION]u8
 	key, key_ok := dns.fold_into(zone, fold_buf[:])
 	if !key_ok {
@@ -5180,7 +5182,7 @@ cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, 
 		free_entry(v, old)
 		v.zones[entry.zone] = entry
 		zone_push_front(v, entry)
-		return
+		return true
 	}
 	// The coldest entries, and only as many as it takes to make room. A
 	// wholesale flush would throw out everyone else's root and TLD keys; see
@@ -5196,6 +5198,7 @@ cache_put :: proc(v: ^Validator, budget: ^Budget, zone: string, status: Status, 
 		return
 	}
 	zone_push_front(v, entry)
+	return true
 }
 
 /*

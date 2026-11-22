@@ -626,7 +626,9 @@ The keys a DNSSEC verdict turns on: whether there is one, the anchors it starts
 from, and the NSEC3 iteration ceiling past which a zone is served insecure. Not
 the chain-walk bounds or the zone-key cache size, which decide how much work
 validation may do at once and how much it remembers, and nothing about what it
-concludes. The validator is rebuilt for those too; only the answers stay.
+concludes; nor `trust_anchor_signaling`, which decides what the server tells an
+anchored zone's operators. The validator is rebuilt for those too; only the
+answers stay.
 
 Read off the type the other way round, as `rules_changed` is, so a key added to
 the section later moves the policy until it is listed here as one that does
@@ -640,7 +642,6 @@ dnssec_verdicts_changed :: proc(a, b: config.Dnssec_Config) -> bool {
 	}
 	x := a
 	x.max_chain_walks, x.max_connection_walks, x.max_cached_zones = b.max_chain_walks, b.max_connection_walks, b.max_cached_zones
-	// What the server tells anchored zones' operators, not what it concludes.
 	x.trust_anchor_signaling = b.trust_anchor_signaling
 	return differs(x, b)
 }

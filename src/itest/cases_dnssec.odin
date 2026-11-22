@@ -462,8 +462,9 @@ check_key_tag_query :: proc(r: ^Runner, mock: ^Mock, ta_name: string) {
 }
 
 /*
-`dnssec.trust_anchor_signaling: false`: the root DNSKEY lookup carries no
-edns-key-tag option, and no Key Tag query is sent beside it.
+`dnssec.trust_anchor_signaling: false`: an anchor whose keys validate - so one
+that draws a Key Tag query with the switch on (`run_key_tag_anchored_case`) -
+has its DNSKEY lookup carry no edns-key-tag option, and no Key Tag query follows.
 */
 @(private = "file")
 run_key_tag_off_case :: proc(r: ^Runner) {
@@ -472,21 +473,30 @@ run_key_tag_off_case :: proc(r: ^Runner) {
 	upstream_port := next_port(r)
 	mock := mock_make("dnssec-quiet", upstream_port)
 	mock_synth_all(mock, {203, 0, 113, 56})
+	for f in ANCHORED_REVERSE_FIXTURES {
+		mock_reply(mock, f.qname, f.qtype, from_hex(f.response, context.allocator))
+	}
 	if !mock_start_or_skip(r, mock, "dnssec-quiet") {
 		return
 	}
 	defer mock_stop(mock)
 	udp_port := next_port(r)
-	srv, ok := start_server(
-		r,
-		Server_Options{config = dnssec_config(udp_port, upstream_port, extra = "  trust_anchor_signaling: false\n"), udp_port = udp_port},
+	config := dnssec_config(
+		udp_port,
+		upstream_port,
+		[]string{ROOT_DS, ANCHORED_REVERSE_ANCHOR},
+		extra = "  trust_anchor_signaling: false\nspecial_use: {private_reverse: false}\n",
 	)
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
 		return
 	}
 	defer stop_server(&srv)
-	_, _, answered := ask(r, udp_port, "quiet.test.", u16(dns.Type.A))
-	check(r, answered, "no answer")
+	res := query_udp(udp_port, build_query("1.1.168.192.in-addr.arpa.", u16(dns.Type.PTR), edns_size = 1232, dnssec_ok = true))
+	if !check(r, res.ok, "no answer for the anchored name") {
+		return
+	}
+	check(r, parse_header(r, res.wire).ad, "the premise: the anchored name validated, so its keys were cached")
 	dnskey := mock_last_query_of(mock, u16(dns.Type.DNSKEY))
 	if check(r, dnskey != nil, "the validator never asked for a DNSKEY set") {
 		m, derr := dns.decode_message(dnskey, context.temp_allocator)
@@ -495,8 +505,8 @@ run_key_tag_off_case :: proc(r: ^Runner) {
 			check(r, !found, "the DNSKEY lookup carries edns-key-tag with signalling off")
 		}
 	}
-	// The Key Tag query would go out on a fiber of its own, within milliseconds
-	// of the DNSKEY answer in the case that sends one; a second is far past that.
+	// With the switch on, the Key Tag query arrives within milliseconds of the
+	// answer; a second is far past that.
 	check(r, !mock_wait_until(mock, mock_saw_type, int(dns.Type.NULL), KEY_TAG_QUIET), "a Key Tag query was sent with signalling off")
 }
 

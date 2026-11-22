@@ -141,7 +141,8 @@ operators which anchor keys it trusts, the data they use to pace a KSK rollover
   `_ta-<tags>.<zone>`, each tag as four lowercase hex digits, sorted (section 5).
   For the built-in root anchors that is `_ta-4f66-9728.`. It is sent once the
   zone's keys validate and are cached, so about once per key TTL (at most an
-  hour): keys that could not be had or did not validate are fetched again by
+  hour), and once for each walk that fetched them at that moment: keys that
+  could not be had, did not validate or were not cached are fetched again by
   every walk, and are not followed by one. Its answer is not read, and it is
   sent on its own so no client waits for it. It counts in `server.max_pending` and the
   upstream waits like a prefetch, and is skipped when either is full.
