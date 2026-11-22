@@ -1042,6 +1042,46 @@ signatures_lapse :: proc(msg: []u8, now: u32) -> (left: u32, signed: bool) {
 	return
 }
 
+/*
+`age` seconds off every TTL in `msg`, in place, floored at zero: a reply that
+has sat that long in a cache (RFC 8484 section 5.1). OPT's TTL field is the
+extended rcode and flags and is left alone. A SOA's MINIMUM loses the age too,
+since the negative TTL is the lesser of it and the SOA's TTL (RFC 2308 section
+5). Allocates nothing; a record that runs off the end ends the walk, its TTL
+aged if its fixed fields are inside the message.
+*/
+age_ttls :: proc(msg: []u8, age: u32) {
+	if age == 0 {
+		return
+	}
+	pos, total, ok := records_start(msg)
+	if !ok {
+		return
+	}
+	lessen :: proc(msg: []u8, off: int, age: u32) {
+		v := read_ttl_at(msg, off)
+		write_ttl_at(msg, off, v - age if v > age else 0)
+	}
+	for _ in 0 ..< total {
+		type, fixed, next, rec_ok := skip_record(msg, pos)
+		if fixed == 0 {
+			return
+		}
+		if type != .OPT {
+			lessen(msg, fixed + 4, age)
+		}
+		if !rec_ok {
+			return
+		}
+		// MINIMUM is the RDATA's last four bytes; two root names and five
+		// 32-bit fields are the least a SOA holds.
+		if type == .SOA && next - (fixed + 10) >= 22 {
+			lessen(msg, next - 4, age)
+		}
+		pos = next
+	}
+}
+
 // Rewrites each TTL to `original - elapsed`, floored at `floor_ttl`.
 patch_ttls :: proc(msg: []u8, offsets: []u16, originals: []u32, elapsed: u32, floor_ttl: u32 = 0) {
 	for o, i in offsets {

@@ -206,6 +206,8 @@ test_age_of_reads_delta_seconds :: proc(t: ^testing.T) {
 		{value = "250", seconds = 250, ok = true},
 		{value = "0", seconds = 0, ok = true},
 		{value = "250, 10", seconds = 250, ok = true},
+		{value = "250 , 10", seconds = 250, ok = true},
+		{value = " 250\t", seconds = 250, ok = true},
 		{value = "99999999999", seconds = max(u32), ok = true},
 		{value = "", ok = false},
 		{value = "soon", ok = false},

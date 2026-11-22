@@ -365,7 +365,9 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 		for tc, i in age_cases {
 			upstream_port := next_port(r)
 			mock := doh2_mock_make(upstream_port, "/dns-query", age_payload)
-			mock.age = fmt.tprint(AGE_SECONDS)
+			// A literal: the mock's threads read it after `end_case` frees the
+			// temporary allocator.
+			mock.age = AGE_HEADER
 			if age_payload == nil || !doh2_mock_start(mock, r.cert_file, r.key_file, tc.alpn) {
 				skip_case(r, tc.what, "cannot start the mock")
 				doh2_mock_stop(mock)
@@ -463,6 +465,9 @@ AGE_TTL :: u32(600)
 
 @(private = "file")
 AGE_SECONDS :: u32(250)
+
+@(private = "file")
+AGE_HEADER :: "250"
 
 // An answer to `AGE_QNAME` A at TTL `AGE_TTL`.
 @(private = "file")

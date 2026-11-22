@@ -40,13 +40,24 @@ test_age_is_read_from_the_final_response :: proc(t: ^testing.T) {
 	}
 }
 
-// Every TTL loses the age, floored at zero; the OPT record's flags do not.
+// Every TTL loses the age, floored at zero, and so does a SOA's MINIMUM, which
+// bounds the negative TTL; the OPT record's flags do not. No allocator is
+// involved, so none can run dry.
 @(test)
 test_age_ttls_takes_the_age_off_every_ttl :: proc(t: ^testing.T) {
 	m := dns.Message {
 		question   = []dns.Question{{name = "age.example.", type = .A, class = .IN}},
 		answer     = []dns.Record{{name = "age.example.", type = .A, class = .IN, ttl = 600, data = dns.Rdata_A{addr = {10, 9, 9, 9}}}},
-		authority  = []dns.Record{{name = "example.", type = .NS, class = .IN, ttl = 100, data = dns.Rdata_Name{name = "ns.example."}}},
+		authority  = []dns.Record {
+			{name = "example.", type = .NS, class = .IN, ttl = 100, data = dns.Rdata_Name{name = "ns.example."}},
+			{
+				name = "example.",
+				type = .SOA,
+				class = .IN,
+				ttl = 3600,
+				data = dns.Rdata_SOA{ns = "ns.example.", mbox = "h.example.", serial = 1, refresh = 2, retry = 3, expire = 4, minimum = 300},
+			},
+		},
 		additional = []dns.Record{dns.make_opt(1232, true)},
 	}
 	m.flags.qr = true
@@ -54,13 +65,21 @@ test_age_ttls_takes_the_age_off_every_ttl :: proc(t: ^testing.T) {
 	if !testing.expectf(t, err == .None, "the reply does not encode: %v", err) {
 		return
 	}
-	age_ttls(wire, 250, context.allocator)
+	dns.age_ttls(wire, 250)
 	got, derr := dns.decode_message(wire, context.temp_allocator)
-	if !testing.expectf(t, derr == .None && len(got.answer) == 1 && len(got.authority) == 1, "the aged reply does not decode: %v", derr) {
+	if !testing.expectf(t, derr == .None && len(got.answer) == 1 && len(got.authority) == 2, "the aged reply does not decode: %v", derr) {
 		return
 	}
 	testing.expect_value(t, got.answer[0].ttl, u32(350))
 	testing.expect_value(t, got.authority[0].ttl, u32(0))
+	testing.expect_value(t, got.authority[1].ttl, u32(3350))
+	soa, is_soa := got.authority[1].data.(dns.Rdata_SOA)
+	if testing.expect(t, is_soa, "the SOA did not decode as one") {
+		testing.expect_value(t, soa.minimum, u32(50))
+		testing.expect_value(t, soa.expire, u32(4))
+	}
+	negative, has_soa := dns.negative_ttl(got)
+	testing.expect(t, has_soa && negative == 50, "the negative TTL is not the SOA's less the age")
 	testing.expect(t, dns.edns_do(got), "the OPT record's DO bit was taken as a TTL")
 	free_all(context.temp_allocator)
 }

@@ -252,25 +252,25 @@ doh2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	}
 	body := doh2_reply_body(m, req.body, context.temp_allocator)
 	if m.trailer_head != 0 {
-		doh2_respond_raw(hc, req.stream_id, m.trailer_head, body, nil, m.trailers)
+		doh2_respond_raw(hc, req.stream_id, m.trailer_head, body, nil, m.trailers, with_trailers = true)
 		return
 	}
 	if m.age != "" {
-		doh2_respond_raw(hc, req.stream_id, 200, body, []h2.Header_Field{{name = "age", value = m.age}}, nil)
+		doh2_respond_raw(hc, req.stream_id, 200, body, []h2.Header_Field{{name = "age", value = m.age}}, nil, with_trailers = false)
 		return
 	}
 	h2.respond(hc, req.stream_id, h2.Response{status = 200, content_type = "application/dns-message", body = body})
 }
 
 /*
-A response with header fields `extra` or a trailer section `trailers` (nil for
-none), which `h2.respond` never sends, written as raw frames under the
+A response with header fields `extra` and, when `with_trailers`, a trailer
+section of `trailers` (empty or not), which `h2.respond` never sends, written as raw frames under the
 connection's lock as `respond` writes its own. Literals without indexing, so the
 client's HPACK table is left as the server's encoder expects. The stream stays
 in the mock's table until the connection goes.
 */
 @(private = "file")
-doh2_respond_raw :: proc(hc: ^h2.Conn, stream_id: u32, status: int, body: []u8, extra, trailers: []h2.Header_Field) {
+doh2_respond_raw :: proc(hc: ^h2.Conn, stream_id: u32, status: int, body: []u8, extra, trailers: []h2.Header_Field, with_trailers: bool) {
 	head := make([dynamic]u8, 0, 64, context.temp_allocator)
 	h2.encode_header(&head, ":status", fmt.tprint(status))
 	h2.encode_header(&head, "content-type", "application/dns-message")
@@ -284,9 +284,9 @@ doh2_respond_raw :: proc(hc: ^h2.Conn, stream_id: u32, status: int, body: []u8, 
 	out := make([dynamic]u8, 0, len(head) + len(body) + len(tail) + 27, context.temp_allocator)
 	h2.write_frame_header(&out, len(head), .Headers, h2.FLAG_END_HEADERS, stream_id)
 	append(&out, ..head[:])
-	h2.write_frame_header(&out, len(body), .Data, 0 if trailers != nil else h2.FLAG_END_STREAM, stream_id)
+	h2.write_frame_header(&out, len(body), .Data, 0 if with_trailers else h2.FLAG_END_STREAM, stream_id)
 	append(&out, ..body)
-	if trailers != nil {
+	if with_trailers {
 		h2.write_frame_header(&out, len(tail), .Headers, h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM, stream_id)
 		append(&out, ..tail[:])
 	}
