@@ -70,12 +70,14 @@ the limit that has the QR bit set is a response rather than a query, and is answ
 HTTP/1.1 framing follows RFC 9112. Each refusal below is answered and the
 connection then closed, so nothing that follows on it is read as a request:
 
-- A chunked body is read, chunk extensions and trailer fields included (section
-  7.1), and the connection closes after its answer. A `Transfer-Encoding` whose
-  last coding is not `chunked`, `chunked` applied twice or with a parameter,
-  `Transfer-Encoding` beside a `Content-Length`, and `Transfer-Encoding` on
-  HTTP/1.0 are 400; another coding ahead of `chunked` is 501, as elodin decodes
-  chunked alone.
+- A chunked body is read, chunk extensions (held to their grammar) and trailer
+  fields included (section 7.1), and the connection closes after its answer,
+  once what the client sent behind it is drained. The chunk lines are held to
+  16 KiB together, as a header block is. A `Transfer-Encoding` whose last
+  coding is not `chunked` or that names no coding at all, `chunked` applied
+  twice or with a parameter, `Transfer-Encoding` beside a `Content-Length`, and
+  `Transfer-Encoding` on HTTP/1.0 are 400; another coding ahead of `chunked` is
+  501, as elodin decodes chunked alone.
 - A `Content-Length` that is not plain decimal, or a second one even with the
   same value, is 400 (section 6.3).
 - A folded field line, whitespace before a field's colon, a field name that is

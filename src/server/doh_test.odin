@@ -2059,6 +2059,16 @@ test_a_chunked_request_body_is_read :: proc(t: ^testing.T) {
 		{"a trailer that is not a field line", "HTTP/1.1", CHUNKED, "4\r\nabcd\r\n0\r\nno colon\r\n\r\n", 400, ""},
 		{"a chunk past the limit", "HTTP/1.1", CHUNKED, over, 413, ""},
 		{"a size with more digits than any limit", "HTTP/1.1", CHUNKED, "10000000000000000000004\r\n", 413, ""},
+		// RFC 9112 7.1.1's extension grammar.
+		{"an extension with a quoted value", "HTTP/1.1", CHUNKED, "4 ; a = \"q\\\"x\" ; b\r\nabcd\r\n0\r\n\r\n", 0, "abcd"},
+		{"whitespace after the size and no extension", "HTTP/1.1", CHUNKED, "4 \r\nabcd\r\n0\r\n\r\n", 400, ""},
+		{"an extension name that is not a token", "HTTP/1.1", CHUNKED, "4;\x7f\r\nabcd\r\n0\r\n\r\n", 400, ""},
+		{"an extension with an empty value", "HTTP/1.1", CHUNKED, "4;a=\r\nabcd\r\n0\r\n\r\n", 400, ""},
+		{"an unterminated quoted value", "HTTP/1.1", CHUNKED, "4;a=\"q\r\nabcd\r\n0\r\n\r\n", 400, ""},
+		{"whitespace after an extension", "HTTP/1.1", CHUNKED, "4;a \r\nabcd\r\n0\r\n\r\n", 400, ""},
+		// A Transfer-Encoding with no coding in it is framing all the same.
+		{"an empty Transfer-Encoding beside a Content-Length", "HTTP/1.1", "Transfer-Encoding: \r\nContent-Length: 4\r\n", "abcd", 400, ""},
+		{"a Transfer-Encoding of commas", "HTTP/1.1", "Transfer-Encoding: , ,\r\n", "", 400, ""},
 	}
 	for c in CASES {
 		raw := fmt.tprintf("POST /dns-query %s\r\nHost: dns.example\r\n%s\r\n%s", c.version, c.headers, c.body)
@@ -2091,6 +2101,77 @@ test_a_chunked_request_body_is_read :: proc(t: ^testing.T) {
 		testing.expect_value(t, status, 413)
 	}
 	testing.expect_value(t, http_refusal_message(501), "not implemented")
+
+	/*
+	The chunk lines stay in the buffer until it is compacted, so they are
+	bounded together as well as one by one: one-byte chunks with long
+	extensions, each line well inside `MAX_HEADER_BYTES`, are refused once
+	their framing is past it, with the content far inside its own limit.
+	*/
+	long := strings.builder_make(context.temp_allocator)
+	fmt.sbprintf(&long, "POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n%s\r\n", CHUNKED)
+	ext := strings.repeat("a", 1000, context.temp_allocator)
+	for _ in 0 ..< MAX_HEADER_BYTES / 1000 + 2 {
+		fmt.sbprintf(&long, "1;%s\r\nx\r\n", ext)
+	}
+	strings.write_string(&long, "0\r\n\r\n")
+	_, lstatus, lparsed, lok := read_request_over_loopback(t, strings.to_string(long), "framing past the limit")
+	if lok {
+		testing.expect(t, !lparsed, "a body whose framing is past the limit was accepted")
+		testing.expect_value(t, lstatus, 400)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The close after a chunked request's answer is this server's choice, so what the
+client pipelined behind it is drained before the close: closing on unread bytes
+sends an RST, and the client's kernel drops the answer it had not read yet.
+The request behind it is longer than one read, so bytes are left for the close.
+*/
+@(test)
+test_the_close_after_a_chunked_request_keeps_its_answer :: proc(t: ^testing.T) {
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
+		return
+	}
+	defer net.close(client)
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_string(&b, "POST /not-served HTTP/1.1\r\nHost: dns.example\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n0\r\n\r\n")
+	strings.write_string(&b, "GET /not-served HTTP/1.1\r\nHost: dns.example\r\nX-Pad: ")
+	for _ in 0 ..< 2 * HTTP_BUF_SIZE {
+		strings.write_byte(&b, 'p')
+	}
+	strings.write_string(&b, "\r\n\r\n")
+	if _, serr := net.send_tcp(client, b.buf[:]); !testing.expectf(t, serr == nil, "cannot send the requests: %v", serr) {
+		net.close(accepted)
+		return
+	}
+	// The drain ends on the end of the data rather than on its timeout.
+	testing.expect(t, net.shutdown(client, .Send) == nil, "cannot end the stream")
+	testing.expect(t, net.set_option(client, .Receive_Timeout, 3 * time.Second) == nil, "cannot bound the client")
+
+	cfg := config.default_config()
+	s := Server {
+		cfg = &cfg,
+	}
+	serve_doh(&s, Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}}, "test")
+	// The listener's close, which is what an RST would come from.
+	net.close(accepted)
+
+	reply := make([dynamic]u8, 0, 4096, context.temp_allocator)
+	for len(reply) < 4096 {
+		chunk: [512]u8
+		n, rerr := net.recv_tcp(client, chunk[:])
+		if !testing.expectf(t, rerr == nil, "the answer did not survive the close: %v", rerr) {
+			return
+		}
+		if n == 0 {
+			break
+		}
+		append(&reply, ..chunk[:n])
+	}
+	testing.expectf(t, strings.count(string(reply[:]), "HTTP/1.1 ") == 1 && strings.has_prefix(string(reply[:]), "HTTP/1.1 404 "), "the client read %q, want one 404", string(reply[:min(len(reply), 60)]))
 	free_all(context.temp_allocator)
 }
 

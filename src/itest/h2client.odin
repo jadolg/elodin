@@ -435,8 +435,11 @@ h2_handle :: proc(c: ^H2_Client, header: h2.Frame_Header, payload: []u8) -> bool
 			r.interim += 1
 			return true
 		}
-		r.headers = fields
-		r.status = status
+		// A trailer block carries no `:status`, and keeps the response's.
+		if status != 0 {
+			r.headers = fields
+			r.status = status
+		}
 		if header.flags & h2.FLAG_END_STREAM != 0 {
 			r.done = true
 		}

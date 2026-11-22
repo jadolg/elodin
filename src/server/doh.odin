@@ -120,6 +120,9 @@ Http_Request_In :: struct {
 	// next `http_compact`, so callers compact only once they are done with it.
 	body:         []u8,
 	keep_alive:   bool,
+	// The close after it is this server's choice and not the client's (a
+	// chunked body): what the client pipelined behind it is drained first.
+	closing:      bool,
 	content_type: string,
 	// The Host header, used only to build the DoH URL the .mobileconfig endpoint
 	// hands back. An HTTP/1.1 request that sent no Host at all is refused before
@@ -411,6 +414,9 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	hosts := 0
 	content_types := 0
 	codings: Transfer_Codings
+	// Field lines, apart from the codings they hold: one with none is a
+	// Transfer-Encoding all the same to a hop that reads it as framing.
+	te_fields := 0
 	expect_continue := false
 	/*
 	A 400 earned by a field's value is answered only once the block is read, as
@@ -507,6 +513,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			}
 			req.host = hold(value, &held)
 		case dns.name_equal_fold(name, "transfer-encoding"):
+			te_fields += 1
 			if !transfer_codings_add(&codings, value) {
 				malformed = true
 			}
@@ -537,15 +544,15 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	}
 
 	chunked := false
-	if codings.count > 0 {
+	if te_fields > 0 {
 		switch {
 		/*
 		RFC 9112 6.1: an HTTP/1.0 message with a Transfer-Encoding is one whose
 		framing is faulty, and a request with both it and a Content-Length is
 		one a server may reject; this one does, since the pair is the shape
-		request smuggling takes. 6.3: a final coding other than chunked leaves
-		the length unknowable, which is a 400; chunked twice is a coding no
-		sender may apply.
+		request smuggling takes. 6.3: a final coding other than chunked, or a
+		field with no coding at all, leaves the length unknowable, which is a
+		400; chunked twice is a coding no sender may apply.
 		*/
 		case http_1_0, content_length >= 0, !codings.final_chunked, codings.chunked > 1:
 			return refused, 400, false
@@ -590,6 +597,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			return refused, bstatus, false
 		}
 		req.body = body
+		req.closing = true
 		/*
 		Closed after it is answered: the chunked framing this hop read is one a
 		front end may have cut differently, and closing leaves it no next request
@@ -683,16 +691,26 @@ place in the reader's buffer: a view that ends at the caller's `http_compact`,
 as a Content-Length body's does.
 
 `status` is the answer to a body this refuses: 413 for content past
-`MAX_DOH_BODY`, 400 for a chunk that does not read as one, and 0 for a read that
-failed. A chunk-size is hex digits alone, bounded before it can overflow; a
-chunk extension is skipped, as 7.1.1 lets a recipient do; trailer fields are read
-as field lines and dropped (7.1.2), nothing this endpoint serves reading one.
+`MAX_DOH_BODY`, 400 for a chunk that does not read as one or framing past
+`MAX_HEADER_BYTES` all told, and 0 for a read that failed. A chunk-size is hex
+digits alone, bounded before it can overflow; a chunk extension is held to its
+grammar (7.1.1) and then ignored; trailer fields are read as field lines and
+dropped (7.1.2), nothing this endpoint serves reading one.
 */
 @(private)
 read_chunked_body :: proc(r: ^Http_Reader) -> (body: []u8, status: int, ok: bool) {
 	start := r.pos
 	end := start
 	for {
+		/*
+		What the chunk lines and CRLFs have taken so far, which stays in the
+		buffer until the caller compacts it: bounded all told, or a stream of
+		one-byte chunks with long extensions holds the content's limit in data
+		and as much again, many times over, in framing.
+		*/
+		if r.pos - end > MAX_HEADER_BYTES {
+			return nil, 400, false
+		}
 		line, lok, lbad := http_line(r, from = r.pos)
 		if !lok {
 			return nil, 400 if lbad else 0, false
@@ -710,10 +728,7 @@ read_chunked_body :: proc(r: ^Http_Reader) -> (body: []u8, status: int, ok: bool
 				return nil, 413, false
 			}
 		}
-		// What follows the size is nothing, or an extension after optional
-		// whitespace (`BWS ";"`).
-		after := h2.trim_ows(line[digits:])
-		if digits == 0 || (after != "" && after[0] != ';') {
+		if digits == 0 || !chunk_ext_is_valid(line[digits:]) {
 			return nil, 400, false
 		}
 		if size == 0 {
@@ -751,7 +766,86 @@ read_chunked_body :: proc(r: ^Http_Reader) -> (body: []u8, status: int, ok: bool
 }
 
 /*
-Read requests off `conn` the way `serve_doh` does, and answer none of them.
+Whether what follows a chunk-size is a chunk extension list as RFC 9112 7.1.1
+writes it, or nothing:
+`*( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`, a name a
+token and a value a token or a quoted-string. Whitespace with no `;` after it is
+not one.
+*/
+@(private)
+chunk_ext_is_valid :: proc(ext: string) -> bool {
+	rest := ext
+	for {
+		rest = strings.trim_left(rest, " \t")
+		if rest == "" {
+			// Whitespace alone, with no extension behind it, is not BWS.
+			return len(ext) == 0 || ext[len(ext) - 1] != ' ' && ext[len(ext) - 1] != '\t'
+		}
+		if rest[0] != ';' {
+			return false
+		}
+		rest = strings.trim_left(rest[1:], " \t")
+		n := token_prefix(rest)
+		if n == 0 {
+			return false
+		}
+		rest = strings.trim_left(rest[n:], " \t")
+		if rest == "" || rest[0] == ';' {
+			continue
+		}
+		if rest[0] != '=' {
+			return false
+		}
+		rest = strings.trim_left(rest[1:], " \t")
+		if v := token_prefix(rest); v > 0 {
+			rest = rest[v:]
+		} else if q := quoted_string_prefix(rest); q > 0 {
+			rest = rest[q:]
+		} else {
+			return false
+		}
+	}
+}
+
+// How many bytes at the start of `s` are a token (RFC 9110 5.6.2).
+@(private)
+token_prefix :: proc(s: string) -> int {
+	for i in 0 ..< len(s) {
+		if !h2.is_token(s[i:i + 1]) {
+			return i
+		}
+	}
+	return len(s)
+}
+
+// How many bytes at the start of `s` are a quoted-string (RFC 9110 5.6.4), 0 if
+// it does not start with one.
+@(private)
+quoted_string_prefix :: proc(s: string) -> int {
+	if len(s) == 0 || s[0] != '"' {
+		return 0
+	}
+	for i := 1; i < len(s); i += 1 {
+		switch c := s[i]; {
+		case c == '"':
+			return i + 1
+		case c == '\\':
+			// A quoted-pair: HTAB, SP or a visible character after the backslash.
+			if i + 1 >= len(s) || (s[i + 1] < ' ' && s[i + 1] != '\t') || s[i + 1] == 0x7f {
+				return 0
+			}
+			i += 1
+		case c < ' ' && c != '\t', c == 0x7f:
+			return 0
+		}
+	}
+	return 0
+}
+
+/*
+Read requests off `conn` the way `serve_doh` does, and answer none of them: the
+interim 100 `read_http_request` itself writes to an `Expect: 100-continue` is
+all that goes back.
 
 For the fuzz target, which lives in a package of its own and cannot reach the
 reader: every request line, header loop and body this server would read, one
@@ -834,6 +928,7 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 			return
 		}
 		keep_alive := req.keep_alive
+		closing := req.closing
 		asked := false
 		handled := serve_doh_request(s, conn, req, path, client, &asked)
 		// After the answer, since `req.body` is a view into the reader's buffer,
@@ -848,6 +943,12 @@ serve_doh :: proc(s: ^Server, conn: Conn, client: string) {
 			last_question = loop.tick_now()
 		}
 		if !handled || !keep_alive {
+			// A close the client did not ask for may come with a request it
+			// already pipelined, unread here, and closing on unread bytes sends
+			// an RST that takes the answer with it: see `http_linger`.
+			if closing {
+				http_linger(conn, STREAM_LINGER_IDLE)
+			}
 			return
 		}
 	}
