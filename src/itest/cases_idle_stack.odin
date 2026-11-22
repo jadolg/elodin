@@ -233,7 +233,7 @@ idle_hold_one :: proc(transport: Idle_Transport, tcp_port, dot_port, doh_port: i
 /*
 The server's fiber stacks, and how many of them are resident past
 `bound_kib`: anonymous mappings of `STACK_KIB`, read from smaps. Nothing else
-the server maps is that size and anonymous; the guard page below each is a
+the server maps is that size and anonymous; the guard below each is a
 mapping of its own.
 
 `rest_kib` is what every other anonymous mapping has resident, less what huge

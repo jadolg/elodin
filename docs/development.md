@@ -17,7 +17,7 @@ mise trust
 mise run build            # bin/elodin, with debug info
 mise run release          # bin/elodin, optimised
 mise run test             # unit tests
-mise run itest            # integration tests against the built binary
+mise run itest            # integration tests against the built binary (after scripts/stack_frames.py)
 mise run itest-release    # the same suite against the optimised build
 mise run release-static   # bin/static/elodin: musl and OpenSSL linked in (needs docker)
 mise run itest-static     # the suite against it, inside Alpine (needs docker)

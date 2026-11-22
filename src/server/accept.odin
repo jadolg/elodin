@@ -586,7 +586,7 @@ race_width :: proc(cfg: config.Upstream_Config) -> int {
 
 /*
 Memory mappings one fiber costs while it holds a query whose scratch fits one
-block, which an ordinary one's does: its stack and the guard page under it,
+block, which an ordinary one's does: its stack and the guard under it,
 which `mprotect` splits in two, and that block. A query taking more scratch maps
 one more per further block (`loop.SCRATCH_FIRST_BLOCK`, 16 KiB), so this is the figure for a
 server under ordinary load, not a ceiling.
