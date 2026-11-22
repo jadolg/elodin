@@ -122,7 +122,7 @@ ensure_certs :: proc() -> (cert, key: string, ok: bool) {
 }
 
 // A listener on a loopback port the kernel picks, and that port.
-@(private = "file")
+@(private)
 listen_loopback :: proc(t: ^testing.T, loc := #caller_location) -> (listener: net.TCP_Socket, bound: net.Endpoint, ok: bool) {
 	sock, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Loopback, port = 0})
 	if !testing.expectf(t, lerr == nil, "cannot listen on loopback: %v", lerr, loc = loc) {

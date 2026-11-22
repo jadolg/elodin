@@ -467,7 +467,7 @@ client_context :: proc(
 
 /*
 A fresh `SSL_CTX` for either end, held to `hold_to_floor`, or the reason there
-is none. A server picks the suite by its own order.
+is none. A server picks the suite by its own order, and neither end renegotiates.
 
 Idle connections hand their record buffers back. Without the mode OpenSSL keeps
 its record buffers, ~17 KB each, for the connection's whole life; with it a
@@ -493,6 +493,14 @@ new_ssl_ctx :: proc(server: bool) -> (^SSL_CTX, Error) {
 		SSL_CTX_free(ptr)
 		return nil, err
 	}
+	/*
+	RFC 9113 9.2.1: "A deployment of HTTP/2 over TLS 1.2 MUST disable
+	renegotiation". Set on every context, the server's as well as the
+	client's: a client ignores a HelloRequest, answering it with a
+	no_renegotiation alert, and a server refuses a client's ClientHello rather
+	than relying on OpenSSL's default. Nothing elodin speaks needs one.
+	*/
+	SSL_CTX_set_options(ptr, SSL_OP_NO_RENEGOTIATION)
 	if server {
 		// RFC 9325 section 4.2 asks a server to prefer the suites above; a
 		// client that puts ChaCha20 first, as one without AES instructions
