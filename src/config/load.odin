@@ -201,7 +201,8 @@ opt_bool :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^bool, path: strin
 	} else if text, scalar := yaml.as_string(child); scalar {
 		// Named, and with why where it is a form that read as a boolean to
 		// YAML 1.1 and to earlier versions of this reader.
-		errorf(l, "%s.%s: expected true or false, not %q%s", path, key, text, yaml_1_1_hint(child, yaml.yaml_1_1_bool(text)))
+		_, bool_text := yaml.core_bool(text)
+		errorf(l, "%s.%s: expected true or false, not %q%s", path, key, text, yaml_1_1_hint(child.quoted && bool_text, yaml.yaml_1_1_bool(text)))
 	} else {
 		errorf(l, "%s.%s: expected true or false", path, key)
 	}
@@ -209,12 +210,13 @@ opt_bool :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^bool, path: strin
 
 /*
 Why a refused scalar is refused, where the reason is that YAML 1.2 types it as
-a string: it is quoted, or `form` says it is a YAML 1.1 boolean or integer.
+a string: `quoted` is a quoted scalar that would read as the type unquoted, and
+`form` a YAML 1.1 boolean or integer.
 */
 @(private)
-yaml_1_1_hint :: proc(n: ^yaml.Node, form: bool) -> string {
+yaml_1_1_hint :: proc(quoted, form: bool) -> string {
 	switch {
-	case n != nil && n.quoted:
+	case quoted:
 		return " (quoted, so a string in YAML 1.2)"
 	case form:
 		return " (a YAML 1.1 form, a string in YAML 1.2)"
@@ -232,7 +234,8 @@ opt_int :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^int, path: string)
 		dst^ = int(v)
 	} else if text, scalar := yaml.as_string(child); scalar {
 		// Named for the same reason as `opt_bool`.
-		errorf(l, "%s.%s: expected an integer, not %q%s", path, key, text, yaml_1_1_hint(child, yaml.yaml_1_1_int(text)))
+		_, int_text := yaml.core_int(text)
+		errorf(l, "%s.%s: expected an integer, not %q%s", path, key, text, yaml_1_1_hint(child.quoted && int_text, yaml.yaml_1_1_int(text)))
 	} else {
 		errorf(l, "%s.%s: expected an integer", path, key)
 	}
@@ -262,8 +265,12 @@ opt_ttl :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^u32, path: string)
 		secs = i64(d / time.Second)
 	}
 	if !ok || secs < 0 || secs > MAX_TTL {
-		text, _ := yaml.as_string(child)
-		errorf(l, "%s.%s: expected a TTL of whole seconds from 0 to %d, or a duration such as 5m (RFC 2181 section 8), not %q%s", path, key, MAX_TTL, text, yaml_1_1_hint(child, yaml.yaml_1_1_int(text)))
+		// A TTL may be a duration, quoted or not, so quoting is never why.
+		if text, scalar := yaml.as_string(child); scalar {
+			errorf(l, "%s.%s: expected a TTL of whole seconds from 0 to %d, or a duration such as 5m (RFC 2181 section 8), not %q%s", path, key, MAX_TTL, text, yaml_1_1_hint(false, yaml.yaml_1_1_int(text)))
+		} else {
+			errorf(l, "%s.%s: expected a TTL of whole seconds from 0 to %d, or a duration such as 5m (RFC 2181 section 8)", path, key, MAX_TTL)
+		}
 		return
 	}
 	dst^ = u32(secs)

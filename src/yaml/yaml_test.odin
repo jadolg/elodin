@@ -1102,6 +1102,13 @@ test_a_leading_byte_order_mark_is_not_content :: proc(t: ^testing.T) {
 		b, ok := as_int(get(joined, "b"))
 		testing.expectf(t, ok && b == 2, "b read as %d (%v) behind a BOM after ---", b, ok)
 	}
+	// Or ahead of the `---`, as a file saved with one and run on behind another
+	// with `cat` has it.
+	catted, cerr := parse("a: 1\n" + BYTE_ORDER_MARK + "---\nk: 1\n", context.temp_allocator)
+	if testing.expectf(t, cerr == nil, "a BOM ahead of a document marker was refused: %v", cerr) {
+		k, ok := as_int(get(catted, "k"))
+		testing.expectf(t, ok && k == 1, "k read as %d (%v) after a BOM-led ---", k, ok)
+	}
 	// After a comment it is content: 9.1.1 puts the BOM ahead of the comments.
 	commented, _ := parse("# c\n" + BYTE_ORDER_MARK + "b: 2\n", context.temp_allocator) // lint:allow either outcome but a key named b is the point
 	_, plain_b := as_int(get(commented, "b"))

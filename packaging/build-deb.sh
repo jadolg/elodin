@@ -216,6 +216,28 @@ if [ ! -d /run/systemd/system ]; then
     takeover=false
 fi
 
+# An upgrade of a running elodin whose file the new release refuses leaves the
+# running process alone, whichever way the takeover went: it carries on, the
+# old binary still mapped, until the file is corrected, where restarting it -
+# or failing the upgrade, as the takeover's first-install check does - would
+# stop the machine's DNS. The file is the one the shipped unit names; a
+# drop-in that points ExecStart elsewhere is the operator's to check.
+if [ -n "${2:-}" ] && [ -d /run/systemd/system ] \
+   && systemctl is-active elodin.service >/dev/null 2>&1 \
+   && ! /usr/bin/elodin --config /etc/elodin/elodin.yaml --check >/dev/null 2>&1; then
+    db_stop
+    cat >&2 <<'MSG'
+
+elodin has been upgraded, but the running one was not restarted: the new
+version will not start with /etc/elodin/elodin.yaml. See why with:
+
+  /usr/bin/elodin --config /etc/elodin/elodin.yaml --check
+
+then correct the file and run: sudo systemctl restart elodin
+MSG
+    exit 0
+fi
+
 if [ "$takeover" = true ]; then
     # Nothing is touched until elodin agrees the configuration it is about to
     # be started with is usable. Stopping the resolver first and finding out
@@ -341,23 +363,8 @@ if [ "$takeover" = true ]; then
     fi
 elif [ -d /run/systemd/system ] && systemctl is-active elodin.service >/dev/null 2>&1; then
     # Not ours to start, but it is running and the binary underneath it has
-    # just been replaced. Restarted only once the new binary accepts the
-    # configuration: one a newer release refuses would otherwise stop a
-    # machine's DNS at the upgrade, where the running process can carry on
-    # until the file is corrected.
-    if /usr/bin/elodin --config /etc/elodin/elodin.yaml --check >/dev/null 2>&1; then
-        systemctl restart elodin.service
-    else
-        cat >&2 <<'MSG'
-
-elodin has been upgraded, but the running one was not restarted: the new
-version will not start with /etc/elodin/elodin.yaml. See why with:
-
-  /usr/bin/elodin --config /etc/elodin/elodin.yaml --check
-
-then correct the file and run: sudo systemctl restart elodin
-MSG
-    fi
+    # just been replaced; the check above has passed the file it will read.
+    systemctl restart elodin.service
 elif [ -z "${2:-}" ]; then
     cat <<'MSG'
 elodin is installed but not running. Review /etc/elodin/elodin.yaml, then:

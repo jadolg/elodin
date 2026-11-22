@@ -1790,14 +1790,32 @@ test_yaml_1_1_forms_are_refused_and_a_bom_is_not :: proc(t: ^testing.T) {
 		}) {
 		expect_refused(t, strings.concatenate({MINIMAL, c.doc}, context.temp_allocator), c.path, c.want)
 	}
-	// A value that is no form of a boolean or integer is named, with no YAML
-	// 1.1 or quoting hint it would be wrong about.
-	for doc in ([]string{"listeners:\n  udp: {port: abc}\n", "listeners:\n  tcp: {enabled: maybe}\n"}) {
+	// A value that is no form of a boolean or integer, quoted or not, is named
+	// with no YAML 1.1 or quoting hint it would be wrong about; nor is a quoted
+	// TTL, which may be a duration.
+	for doc in ([]string {
+			"listeners:\n  udp: {port: abc}\n",
+			"listeners:\n  udp: {port: \"abc\"}\n",
+			"listeners:\n  udp: {port: ab_cd}\n",
+			"listeners:\n  udp: {port: 0bad}\n",
+			"listeners:\n  tcp: {enabled: maybe}\n",
+			"listeners:\n  tcp: {enabled: tRUE}\n",
+			"listeners:\n  tcp: {enabled: \"maybe\"}\n",
+			"cache:\n  min_ttl: \"500ms\"\n",
+			"cache:\n  min_ttl: \"99999999999\"\n",
+		}) {
 		_, err := load_string(strings.concatenate({MINIMAL, doc}, context.temp_allocator), context.temp_allocator)
 		if e, has := err.?; testing.expectf(t, has, "%s loaded", doc) {
 			for m in e.messages {
 				testing.expectf(t, !strings.contains(m, "YAML 1.1") && !strings.contains(m, "quoted"), "a hint that does not hold: %s", m)
 			}
+		}
+	}
+	// A TTL that is not a scalar names no value it does not have.
+	_, merr := load_string(strings.concatenate({MINIMAL, "cache:\n  min_ttl: {a: 1}\n"}, context.temp_allocator), context.temp_allocator)
+	if e, has := merr.?; testing.expect(t, has, "a mapping TTL loaded") {
+		for m in e.messages {
+			testing.expectf(t, !strings.contains(m, "not \"\""), "an empty value named: %s", m)
 		}
 	}
 	// The 1.2 forms of each load.

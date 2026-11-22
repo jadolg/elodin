@@ -28,7 +28,9 @@ takes a duration such as `5m`, quoted or not. A byte order mark at the start of
 the file, or of a document after `---`, is ignored.
 
 An upgrade of the `.deb` runs `--check` on `/etc/elodin/elodin.yaml` before it
-restarts a running elodin, and leaves the running one alone if the check fails.
+restarts a running elodin, and if the check fails leaves the running one alone
+and the upgrade complete, with a message saying how to see why. A drop-in that
+points the unit at another file is not what it checks.
 
 `--check` shows what a file means on your machine: the derived sizes,
 who may ask, the connection table and its per-client share, and a warning for

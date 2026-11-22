@@ -57,63 +57,51 @@ as_bool :: proc(n: ^Node) -> (bool, bool) {
 	if !ok || n.quoted {
 		return false, false
 	}
-	switch s {
-	case "true", "True", "TRUE":
-		return true, true
-	case "false", "False", "FALSE":
-		return false, true
-	}
-	return false, false
+	return core_bool(s)
 }
 
 /*
-Whether `s` is one of YAML 1.1's booleans that 1.2 reads as a string (1.1's
-`bool` type: `y`, `yes`, `on` and their kin), for a refusal to say so.
+Whether `s` is one of YAML 1.1's booleans that 1.2 reads as a string, for a
+refusal to say so: 1.1's `bool` type less 1.2's six spellings.
 */
 yaml_1_1_bool :: proc(s: string) -> bool {
-	folded: [len("false")]u8
-	if len(s) > len(folded) {
-		return false
-	}
-	for c, i in transmute([]u8)s {
-		folded[i] = c + 32 if c >= 'A' && c <= 'Z' else c
-	}
-	switch string(folded[:len(s)]) {
-	case "y", "yes", "on", "n", "no", "off", "true", "false":
+	switch s {
+	case "y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO", "on", "On", "ON", "off", "Off", "OFF":
 		return true
 	}
 	return false
 }
 
 /*
-Whether `s` is one of YAML 1.1's integers that 1.2 reads as a string: `_`
-separators, `0b` binary, an upper-case base prefix, or a sign before one.
+Whether `s` is one of YAML 1.1's integers that 1.2 reads as a string, for a
+refusal to say so: 1.1's `int` type written with `_` separators or as `0b`
+binary, or with a sign before `0x` (1.1's other forms are 1.2 integers too, or
+1.2 reads them as the same decimal).
 */
 yaml_1_1_int :: proc(s: string) -> bool {
-	t := strings.trim_left(s, "+-")
-	if len(t) == 0 {
-		return false
+	t := s
+	signed := strings.has_prefix(t, "+") || strings.has_prefix(t, "-")
+	if signed {
+		t = t[1:]
 	}
-	return(
-		strings.contains_rune(t, '_') && strings.trim(t, "0123456789abcdefABCDEFxXoObB_") == "" ||
-		strings.has_prefix(t, "0b") ||
-		strings.has_prefix(t, "0B") ||
-		strings.has_prefix(t, "0X") ||
-		strings.has_prefix(t, "0O") ||
-		(len(t) < len(s) && (strings.has_prefix(t, "0x") || strings.has_prefix(t, "0o"))) 	)
+	only :: proc(s, set: string) -> bool {
+		return len(s) > 0 && strings.trim_left(s, set) == ""
+	}
+	switch {
+	case strings.has_prefix(t, "0b"):
+		return only(t[2:], "01_")
+	case strings.has_prefix(t, "0x"):
+		return only(t[2:], "0123456789abcdefABCDEF_") && (signed || strings.contains_rune(t, '_'))
+	}
+	return only(t, "0123456789_") && t[0] != '_' && strings.contains_rune(t, '_')
 }
 
 /*
-An integer as YAML 1.2's core schema has it (1.2.2 section 10.3.2), plain:
-`[-+]? [0-9]+`, `0o [0-7]+` or `0x [0-9a-fA-F]+`, and no wider than an i64.
-YAML 1.1's `_` separators, `0b` and a sign before a base prefix are strings in
-1.2, and so is anything quoted.
+Whether `s` reads as an integer under the core schema, as `as_int` would read
+it from a plain scalar.
 */
-as_int :: proc(n: ^Node) -> (i64, bool) {
-	s, ok := as_string(n)
-	if !ok || n.quoted {
-		return 0, false
-	}
+core_int :: proc(s: string) -> (i64, bool) {
+	s := s
 	neg := false
 	base := 10
 	switch {
@@ -143,6 +131,31 @@ as_int :: proc(n: ^Node) -> (i64, bool) {
 		v = v * u64(base) + d
 	}
 	return -i64(v) if neg else i64(v), true
+}
+
+// Whether `s` is one of the core schema's six booleans, and which.
+core_bool :: proc(s: string) -> (value: bool, ok: bool) {
+	switch s {
+	case "true", "True", "TRUE":
+		return true, true
+	case "false", "False", "FALSE":
+		return false, true
+	}
+	return false, false
+}
+
+/*
+An integer as YAML 1.2's core schema has it (1.2.2 section 10.3.2), plain:
+`[-+]? [0-9]+`, `0o [0-7]+` or `0x [0-9a-fA-F]+`, and no wider than an i64.
+YAML 1.1's `_` separators, `0b` and a sign before a base prefix are strings in
+1.2, and so is anything quoted.
+*/
+as_int :: proc(n: ^Node) -> (i64, bool) {
+	s, ok := as_string(n)
+	if !ok || n.quoted {
+		return 0, false
+	}
+	return core_int(s)
 }
 
 /*
