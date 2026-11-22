@@ -54,12 +54,12 @@ test_a_ttl_outside_rfc_2181_range_is_refused :: proc(t: ^testing.T) {
 	expect_refused(t, rw("4294967295"), "rewrites[0].ttl", "0 to 2147483647")
 	expect_loads(t, rw("2147483647"))
 	expect_loads(t, rw("0"))
-	// Written as a duration, as every other TTL key can be, or as any YAML
+	// Written as a duration, as every other TTL key can be, or as any YAML 1.2
 	// integer, and read as the seconds it says.
 	for c in ([]struct {
 			v:    string,
 			secs: u32,
-		}{{"5m", 300}, {"3_600", 3600}, {"0x12c", 300}, {"1.5m", 90}, {"2.3h", 8280}}) {
+		}{{"5m", 300}, {"3600", 3600}, {"0x12c", 300}, {"0o454", 300}, {"+300", 300}, {"1.5m", 90}, {"2.3h", 8280}, {"\"0x12c\"", 300}, {"\"+300\"", 300}, {"\"300\"", 300}}) {
 		cfg, err := load_string(rw(c.v), context.temp_allocator)
 		if testing.expectf(t, err == nil, "%s refused: %v", c.v, err) {
 			testing.expectf(t, cfg.rewrites[0].ttl == c.secs, "%s read as %d", c.v, cfg.rewrites[0].ttl)

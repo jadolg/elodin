@@ -47,53 +47,73 @@ as_string :: proc(n: ^Node) -> (string, bool) {
 	return n.scalar, true
 }
 
+/*
+A boolean as YAML 1.2's core schema has it (1.2.2 section 10.3.2): `true`,
+`True`, `TRUE`, `false`, `False` or `FALSE`, plain. YAML 1.1's `yes`, `on` and
+`y` are strings in 1.2, and so is anything quoted.
+*/
 as_bool :: proc(n: ^Node) -> (bool, bool) {
 	s, ok := as_string(n)
-	if !ok {
+	if !ok || n.quoted {
 		return false, false
 	}
-	// An ASCII fold: `strings.to_lower` maps other letters (`İ`, U+0130) onto ASCII ones.
-	folded: [len("false")]u8
-	if len(s) > len(folded) {
-		return false, false
-	}
-	for c, i in transmute([]u8)s {
-		folded[i] = c + 32 if c >= 'A' && c <= 'Z' else c
-	}
-	switch string(folded[:len(s)]) {
-	case "true", "yes", "on", "y":
-		return true, true
-	case "false", "no", "off", "n":
-		return false, true
-	}
-	return false, false
+	return core_bool(s)
 }
 
-as_int :: proc(n: ^Node) -> (i64, bool) {
-	s, ok := as_string(n)
-	if !ok {
-		return 0, false
+/*
+Whether `s` is one of YAML 1.1's booleans that 1.2 reads as a string, for a
+refusal to say so: 1.1's `bool` type less 1.2's six spellings.
+*/
+yaml_1_1_bool :: proc(s: string) -> bool {
+	switch s {
+	case "y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO", "on", "On", "ON", "off", "Off", "OFF":
+		return true
 	}
-	s = strings.trim_space(s)
+	return false
+}
+
+/*
+Whether `s` is one of YAML 1.1's integers that 1.2 reads as a string, for a
+refusal to say so: 1.1's `int` type written with `_` separators or as `0b`
+binary, or with a sign before `0x`. Two more 1.1 forms are not caught: its
+`0`-led octal, which 1.2 reads as the decimal it looks like (`0755` is 755),
+and its sexagesimal `1:30`, a string in 1.2 that is refused with no hint.
+*/
+yaml_1_1_int :: proc(s: string) -> bool {
+	t := s
+	signed := strings.has_prefix(t, "+") || strings.has_prefix(t, "-")
+	if signed {
+		t = t[1:]
+	}
+	only :: proc(s, set: string) -> bool {
+		return len(s) > 0 && strings.trim_left(s, set) == ""
+	}
+	switch {
+	case strings.has_prefix(t, "0b"):
+		return only(t[2:], "01_")
+	case strings.has_prefix(t, "0x"):
+		return only(t[2:], "0123456789abcdefABCDEF_") && (signed || strings.contains_rune(t, '_'))
+	}
+	return only(t, "0123456789_") && t[0] != '_' && strings.contains_rune(t, '_')
+}
+
+/*
+Whether `s` reads as an integer under the core schema, as `as_int` would read
+it from a plain scalar.
+*/
+core_int :: proc(s: string) -> (i64, bool) {
+	s := s
 	neg := false
-	if strings.has_prefix(s, "-") {
-		neg = true
-		s = s[1:]
-	} else if strings.has_prefix(s, "+") {
-		s = s[1:]
-	}
 	base := 10
 	switch {
-	case strings.has_prefix(s, "0x"), strings.has_prefix(s, "0X"):
+	case strings.has_prefix(s, "0x"):
 		base, s = 16, s[2:]
-	case strings.has_prefix(s, "0o"), strings.has_prefix(s, "0O"):
+	case strings.has_prefix(s, "0o"):
 		base, s = 8, s[2:]
-	case strings.has_prefix(s, "0b"), strings.has_prefix(s, "0B"):
-		base, s = 2, s[2:]
-	}
-	// YAML allows digit grouping with underscores.
-	if strings.contains(s, "_") {
-		s, _ = strings.remove_all(s, "_", context.temp_allocator)
+	case strings.has_prefix(s, "-"):
+		neg, s = true, s[1:]
+	case strings.has_prefix(s, "+"):
+		s = s[1:]
 	}
 	// Guarded before each step, as `as_bytes` is: strconv wraps silently, which
 	// reads "18446744073709551617" as 1 and lets it past any range a caller
@@ -112,6 +132,31 @@ as_int :: proc(n: ^Node) -> (i64, bool) {
 		v = v * u64(base) + d
 	}
 	return -i64(v) if neg else i64(v), true
+}
+
+// Whether `s` is one of the core schema's six booleans, and which.
+core_bool :: proc(s: string) -> (value: bool, ok: bool) {
+	switch s {
+	case "true", "True", "TRUE":
+		return true, true
+	case "false", "False", "FALSE":
+		return false, true
+	}
+	return false, false
+}
+
+/*
+An integer as YAML 1.2's core schema has it (1.2.2 section 10.3.2), plain:
+`[-+]? [0-9]+`, `0o [0-7]+` or `0x [0-9a-fA-F]+`, and no wider than an i64.
+YAML 1.1's `_` separators, `0b` and a sign before a base prefix are strings in
+1.2, and so is anything quoted.
+*/
+as_int :: proc(n: ^Node) -> (i64, bool) {
+	s, ok := as_string(n)
+	if !ok || n.quoted {
+		return 0, false
+	}
+	return core_int(s)
 }
 
 /*

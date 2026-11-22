@@ -43,7 +43,10 @@ starts elodin. elodin reaches its blocklists and upstreams through
 
 Nothing is disabled until `elodin --check` has passed. If elodin then fails to
 stay up, the package puts systemd-resolved and the old `/etc/resolv.conf` back
-and fails the install; `apt remove` restores them the same way.
+and fails the install; `apt remove` restores them the same way. An upgrade
+restarts a running elodin only once the new version's `--check` passes; if it
+fails, the running one is left alone and the upgrade fails until the file is
+corrected and `sudo dpkg --configure -a` is run.
 `sudo dpkg-reconfigure elodin` asks again. For unattended installs, preseed it:
 
 ```sh

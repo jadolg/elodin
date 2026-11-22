@@ -76,6 +76,15 @@ Parser :: struct {
 	err:       Maybe(Error),
 }
 
+// U+FEFF in UTF-8.
+BYTE_ORDER_MARK :: "\xef\xbb\xbf"
+
+// A `---` or `...` line, which this parser reads as the edge of a document.
+@(private)
+is_document_marker :: proc(line: string) -> bool {
+	return line == "---" || line == "..."
+}
+
 parse :: proc(src: string, allocator := context.allocator) -> (root: ^Node, err: Maybe(Error)) {
 	p := Parser {
 		allocator = allocator,
@@ -119,10 +128,20 @@ leading_spaces :: proc(s: string) -> int {
 scan_lines :: proc(p: ^Parser, src: string) -> Maybe(Error) {
 	num := 0
 	rest := src
+	// The first line, and the one after a `---` or `...`, may open a document.
+	document_start := true
 	for len(rest) > 0 || num == 0 {
 		num += 1
 		line: string
 		line, rest = take_line(rest)
+		// YAML 1.2.2 section 9.1.1: each document may open with a byte order
+		// mark, which is not content. One anywhere else is.
+		// And one may sit ahead of a `---`, as a file run on behind another
+		// with `cat` has it.
+		if document_start || is_document_marker(strings.trim_right(strings.trim_prefix(line, BYTE_ORDER_MARK), "\r \t")) {
+			line = strings.trim_prefix(line, BYTE_ORDER_MARK)
+			document_start = false
+		}
 		line = strings.trim_right(line, "\r \t")
 
 		indent := leading_spaces(line)
@@ -134,7 +153,8 @@ scan_lines :: proc(p: ^Parser, src: string) -> Maybe(Error) {
 		if len(body) == 0 || body[0] == '#' {
 			continue
 		}
-		if body == "---" || body == "..." {
+		if is_document_marker(body) {
+			document_start = true
 			continue
 		}
 

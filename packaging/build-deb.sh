@@ -216,6 +216,32 @@ if [ ! -d /run/systemd/system ]; then
     takeover=false
 fi
 
+# A running elodin is restarted below, on either branch, only once the new
+# binary accepts the file it will read: one this release refuses fails the
+# configure step instead, loudly, so apt and unattended-upgrades report it.
+# The running process is left alone and carries on, the old binary still
+# mapped, until the file is corrected - where restarting it, or completing the
+# upgrade quietly and leaving the next reboot to find out, would stop the
+# machine's DNS. The file is the one the shipped unit names; a drop-in that
+# points ExecStart elsewhere is the operator's to check.
+if [ -d /run/systemd/system ] && systemctl is-active elodin.service >/dev/null 2>&1 \
+   && ! /usr/bin/elodin --config /etc/elodin/elodin.yaml --check; then
+    db_stop
+    cat >&2 <<'MSG'
+
+The running elodin has been left alone, because this version of elodin fails
+its check above with /etc/elodin/elodin.yaml. Correct what it names, then run
+whichever was under way: an upgrade or install is finished with
+
+  sudo dpkg --configure -a
+
+and a reconfiguration is run again with
+
+  sudo dpkg-reconfigure elodin
+MSG
+    exit 1
+fi
+
 if [ "$takeover" = true ]; then
     # Nothing is touched until elodin agrees the configuration it is about to
     # be started with is usable. Stopping the resolver first and finding out
@@ -341,7 +367,7 @@ if [ "$takeover" = true ]; then
     fi
 elif [ -d /run/systemd/system ] && systemctl is-active elodin.service >/dev/null 2>&1; then
     # Not ours to start, but it is running and the binary underneath it has
-    # just been replaced.
+    # just been replaced; the check above has passed the file it will read.
     systemctl restart elodin.service
 elif [ -z "${2:-}" ]; then
     cat <<'MSG'

@@ -1762,3 +1762,74 @@ test_keywords_fold_ascii_only :: proc(t: ^testing.T) {
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+YAML 1.2's core schema decides what is a boolean and what is an integer (1.2.2
+section 10.3.2): `yes`, `on`, `3_000`, `0b...` and anything quoted are strings,
+so where a boolean or a number belongs they are refused, and the refusal names
+what was written. A file an editor saved with a byte order mark loads.
+*/
+@(test)
+test_yaml_1_1_forms_are_refused_and_a_bom_is_not :: proc(t: ^testing.T) {
+	Case :: struct {
+		doc:  string,
+		path: string,
+		want: string,
+	}
+	for c in ([]Case {
+			{"listeners:\n  tcp: {enabled: n}\n", "listeners.tcp.enabled", "not \"n\""},
+			{"listeners:\n  tcp: {enabled: yes}\n", "listeners.tcp.enabled", "not \"yes\""},
+			{"listeners:\n  tcp: {enabled: \"false\"}\n", "listeners.tcp.enabled", "not \"false\""},
+			{"listeners:\n  udp: {port: 3_8053}\n", "listeners.udp.port", "not \"3_8053\""},
+			{"listeners:\n  udp: {port: \"53\"}\n", "listeners.udp.port", "not \"53\""},
+			{"cache:\n  max_entries: 0b10011100010000\n", "cache.max_entries", "a YAML 1.1 form"},
+			{"cache:\n  max_entries: +0x10\n", "cache.max_entries", "a YAML 1.1 form"},
+			{"listeners:\n  udp: {port: \"53\"}\n", "listeners.udp.port", "quoted or a block scalar, so a string"},
+			{"listeners:\n  udp:\n    port: |-\n      53\n", "listeners.udp.port", "quoted or a block scalar, so a string"},
+			{"listeners:\n  udp: {port: 0X35}\n", "listeners.udp.port", "read by earlier versions of elodin"},
+			{"listeners:\n  tcp: {enabled: tRUE}\n", "listeners.tcp.enabled", "read by earlier versions of elodin"},
+			{"listeners:\n  tcp: {enabled: yes}\n", "listeners.tcp.enabled", "a YAML 1.1 form"},
+			{"rewrites:\n  - {domain: a.test, answer: 192.0.2.1, ttl: 3_600}\n", "rewrites[0].ttl", "not \"3_600\" (a YAML 1.1 form"},
+		}) {
+		expect_refused(t, strings.concatenate({MINIMAL, c.doc}, context.temp_allocator), c.path, c.want)
+	}
+	// A value that is no form of a boolean or integer, quoted or not, is named
+	// with no YAML 1.1 or quoting hint it would be wrong about; nor is a quoted
+	// TTL, which may be a duration.
+	for doc in ([]string {
+			"listeners:\n  udp: {port: abc}\n",
+			"listeners:\n  udp: {port: \"abc\"}\n",
+			"listeners:\n  udp: {port: ab_cd}\n",
+			"listeners:\n  udp: {port: 0bad}\n",
+			"listeners:\n  tcp: {enabled: maybe}\n",
+			"listeners:\n  tcp: {enabled: \"maybe\"}\n",
+			// Quoted 1.1 forms were strings in 1.1 as well: unquoting them is
+			// no fix, so neither hint is given.
+			"listeners:\n  tcp: {enabled: \"yes\"}\n",
+			"listeners:\n  udp: {port: \"3_000\"}\n",
+			"cache:\n  min_ttl: \"500ms\"\n",
+			"cache:\n  min_ttl: \"99999999999\"\n",
+		}) {
+		_, err := load_string(strings.concatenate({MINIMAL, doc}, context.temp_allocator), context.temp_allocator)
+		if e, has := err.?; testing.expectf(t, has, "%s loaded", doc) {
+			for m in e.messages {
+				testing.expectf(t, !strings.contains(m, "YAML 1.1") && !strings.contains(m, "quoted"), "a hint that does not hold: %s", m)
+			}
+		}
+	}
+	// A TTL that is not a scalar names no value it does not have.
+	_, merr := load_string(strings.concatenate({MINIMAL, "cache:\n  min_ttl: {a: 1}\n"}, context.temp_allocator), context.temp_allocator)
+	if e, has := merr.?; testing.expect(t, has, "a mapping TTL loaded") {
+		for m in e.messages {
+			testing.expectf(t, !strings.contains(m, "not \"\""), "an empty value named: %s", m)
+		}
+	}
+	// The 1.2 forms of each load.
+	expect_loads(t, MINIMAL + "listeners:\n  tcp: {enabled: False}\n  udp: {port: 0x35}\n")
+
+	cfg, err := load_string("\xef\xbb\xbf" + MINIMAL + "listeners:\n  udp: {port: 5353}\n", context.temp_allocator)
+	if testing.expectf(t, err == nil, "a file opening with a BOM was refused: %v", err) {
+		testing.expect_value(t, cfg.listeners.udp.port, 5353)
+	}
+	free_all(context.temp_allocator)
+}
