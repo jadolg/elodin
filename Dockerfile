@@ -83,7 +83,7 @@ RUN mise exec -- sh -c 'odin build src/itest -out:bin/itest -collection:elodin=s
 # SSL_CERT_FILE to its CA bundle, where upstream TLS and list downloads are
 # checked: Debian's OpenSSL would otherwise look under /usr/lib/ssl, which the
 # base does not have.
-FROM gcr.io/distroless/base-debian13:nonroot@sha256:a08d9054afbaf1af9b90fd02cdc7b32236319b5376d374505a41548d42b0c5db AS image
+FROM gcr.io/distroless/base-debian13:nonroot@sha256:83e67481ae9fc8c7a6d211113431fb8085619bed49672e583261111bac184f0d AS image
 COPY --from=build /src/bin/elodin /usr/bin/elodin
 COPY examples/docker.yaml /etc/elodin/elodin.yaml
 # The blocklist cache (`blocking.cache_dir`), the account's, so a named volume
