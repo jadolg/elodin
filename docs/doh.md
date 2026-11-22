@@ -48,9 +48,11 @@ section 6.3 names a stream error (section 5.4 allows the stronger one). An HPACK
 table size update after a field in the same header block is a COMPRESSION_ERROR
 (RFC 7541 section 4.2). A request whose `content-length` is repeated, is not
 digits, or is not the sum of its DATA is a stream error of type PROTOCOL_ERROR
-(section 8.1.1); so is such a response from an HTTP/2 upstream, which is not
-taken as an answer, unless it defines no content (a reply to HEAD, a 204 or a
-304). A header list that breaks RFC 9113 sections 8.2 or 8.3 is a stream error of type
+(section 8.1.1), and so is such a response from an HTTP/2 upstream, which is
+not taken as an answer. A response that defines no content (a reply to HEAD, a
+204 or a 304) is not held to the sum, though a repeated or non-numeric length
+still fails it; a refusal whose body misses its length keeps its status and
+`Retry-After` for the upstream's backoff. A header list that breaks RFC 9113 sections 8.2 or 8.3 is a stream error of type
 PROTOCOL_ERROR; a conformant `CONNECT` gets a 404. HTTP/1.1 refuses the same
 shapes.
 

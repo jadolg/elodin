@@ -1298,20 +1298,24 @@ ignored.
 		s.received += len(payload)
 		// The second bound is on the window, not the body: see RECV_WINDOW.
 		oversized := need > MAX_BODY || s.received > RECV_WINDOW / 2
+		// Past its own `content-length`: malformed already (RFC 9113 8.1.1),
+		// so refused now rather than buffered to its end.
+		past := s.has_length && need > s.declared
 		grow := 0
 		if need > cap(s.body) {
 			grow = min(max(need, 2 * cap(s.body)), MAX_BODY) - cap(s.body)
 		}
 		refused := c.request_bytes + grow > MAX_CONN_REQUEST
 		// A body there is no room for is refused as one over the budget is.
-		if !oversized && !refused && grow > 0 {
+		if !oversized && !past && !refused && grow > 0 {
 			refused = reserve(&s.body, cap(s.body) + grow) != nil
 		}
-		if oversized || refused {
+		if oversized || past || refused {
 			loop.unlock(&c.mu)
 			// No handler behind this reset either, so it is budgeted like a refused
 			// HEADERS: see stream_error.
-			sent := stream_error(c, h.stream_id, oversized ? .Enhance_Your_Calm : .Refused_Stream)
+			code: Error_Code = .Protocol_Error if past else .Enhance_Your_Calm if oversized else .Refused_Stream
+			sent := stream_error(c, h.stream_id, code)
 			// The stream is over. Without this it would hold its body, its parked
 			// request and one of MAX_HELD_STREAMS slots until the connection went.
 			close_stream(c, h.stream_id, peer_sending = h.flags & FLAG_END_STREAM == 0)

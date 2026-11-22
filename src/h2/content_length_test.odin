@@ -135,12 +135,92 @@ test_a_response_is_held_to_its_content_length :: proc(t: ^testing.T) {
 		if row.accepted {
 			testing.expectf(t, s.done && !s.reset, "%s: done %v, reset %v; want it accepted", row.what, s.done, s.reset)
 		} else {
-			testing.expectf(t, s.reset && !s.done && s.malformed, "%s: done %v, reset %v, malformed %v; want it failed", row.what, s.done, s.reset, s.malformed)
+			testing.expectf(t, s.reset && !s.done, "%s: done %v, reset %v; want it failed", row.what, s.done, s.reset)
 			testing.expectf(t, saw_frame(&log, .Rst_Stream, 1) && log.rst_code == .Protocol_Error, "%s: no RST_STREAM(PROTOCOL_ERROR)", row.what)
 		}
 		delete(s.body)
 		delete_key(&c.streams, 1)
 		free(s, allocator)
 		client_done(t, c, &track, row.what, &log)
+	}
+
+	/*
+	A refusal whose body misses its length fails the stream and keeps its head:
+	a 503's `retry-after` is still what the server asked for, as under failed
+	trailers. A head that is itself malformed has none to keep.
+	*/
+	Head_Case :: struct {
+		what:      string,
+		length:    string,
+		data:      string,
+		malformed: bool,
+	}
+	for row in ([]Head_Case {
+			{"a 503 short of its length", "100", "0123456789", false},
+			{"a 503 past its length", "2", "0123456789", false},
+			{"a 503 with a length that is not digits", "x", "0123456789", true},
+		}) {
+		track: mem.Tracking_Allocator
+		allocator := track_allocations(&track)
+		log: Frame_Log
+		c := logged_client(&log, allocator)
+		s := open_test_stream(c, 1, allocator)
+		block := make([dynamic]u8, 0, 64, context.temp_allocator)
+		encode_header(&block, ":status", "503")
+		encode_header(&block, "retry-after", "30")
+		encode_header(&block, "content-length", row.length)
+		ok := client_handle_frame(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block[:])
+		ok = ok && client_handle_frame(c, Frame_Header{length = len(row.data), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, transmute([]u8)row.data)
+		testing.expectf(t, ok, "%s: the connection was dropped", row.what)
+		testing.expectf(t, s.reset && !s.done, "%s: done %v, reset %v; want it failed", row.what, s.done, s.reset)
+		testing.expectf(t, s.malformed == row.malformed, "%s: malformed %v, want %v", row.what, s.malformed, row.malformed)
+		if !row.malformed {
+			testing.expectf(t, s.status == 503 && s.retry_after == 30, "%s: head %d, retry-after %d, want 503 and 30 kept", row.what, s.status, s.retry_after)
+		}
+		delete(s.body)
+		delete_key(&c.streams, 1)
+		free(s, allocator)
+		client_done(t, c, &track, row.what, &log)
+	}
+}
+
+/*
+DATA that runs past the declared `content-length` makes the message malformed
+then and there (RFC 9113 8.1.1), so it is reset at once rather than buffered to
+an END_STREAM that may never come - at both ends.
+*/
+@(test)
+test_data_past_the_content_length_is_refused_at_once :: proc(t: ^testing.T) {
+	{
+		track: mem.Tracking_Allocator
+		allocator := track_allocations(&track)
+		log: Request_Log
+		c := make_conn(IO{user = &log, read = no_read, write = request_log_write}, counting_handler, &log, allocator)
+		block := post_block("2")
+		ok := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
+		ok = ok && handle_data(c, Frame_Header{length = 3, type = .Data, stream_id = 1}, transmute([]u8)string("abc"))
+		testing.expect(t, ok, "server: the connection was dropped")
+		testing.expectf(t, log.rsts == 1 && log.rst_code == .Protocol_Error, "server: %d resets (%v) before the stream ended, want one PROTOCOL_ERROR", log.rsts, log.rst_code)
+		testing.expect_value(t, log.dispatched, 0)
+		conn_done(t, c, &track, "server")
+	}
+	{
+		track: mem.Tracking_Allocator
+		allocator := track_allocations(&track)
+		log: Frame_Log
+		c := logged_client(&log, allocator)
+		s := open_test_stream(c, 1, allocator)
+		block := make([dynamic]u8, 0, 64, context.temp_allocator)
+		encode_header(&block, ":status", "200")
+		encode_header(&block, "content-length", "2")
+		ok := client_handle_frame(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block[:])
+		ok = ok && client_handle_frame(c, Frame_Header{length = 3, type = .Data, stream_id = 1}, transmute([]u8)string("abc"))
+		testing.expect(t, ok, "client: the connection was dropped")
+		testing.expectf(t, s.reset && !s.done, "client: done %v, reset %v before the stream ended; want it failed", s.done, s.reset)
+		testing.expect(t, saw_frame(&log, .Rst_Stream, 1) && log.rst_code == .Protocol_Error, "client: no RST_STREAM(PROTOCOL_ERROR)")
+		delete(s.body)
+		delete_key(&c.streams, 1)
+		free(s, allocator)
+		client_done(t, c, &track, "client", &log)
 	}
 }

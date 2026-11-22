@@ -744,8 +744,8 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 				if client_content_matches(s) {
 					s.done = true
 				} else {
+					// The head stands, as it does under failed trailers.
 					malformed = true
-					s.malformed = true
 					s.reset = true
 				}
 				loop.cond_broadcast(&c.cond)
@@ -821,6 +821,9 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	// before any response, or behind an interim (1xx) one - is malformed, a
 	// stream error of type PROTOCOL_ERROR the client MUST NOT accept.
 	early := found && !already_ended && !s.final
+	// Past the response's own `content-length`: malformed already (RFC 9113
+	// 8.1.1), so failed now rather than buffered to its end.
+	early ||= found && !already_ended && s.has_length && client_content_defined(s) && len(s.body) + len(data) > s.declared
 	if early {
 		s.reset = true
 		loop.cond_broadcast(&c.cond)
@@ -910,7 +913,7 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	if matches {
 		live.done = true
 	} else {
-		live.malformed = true
+		// The head stands: a 503's `retry-after` is still the server's word.
 		live.reset = true
 	}
 	loop.cond_broadcast(&c.cond)
@@ -929,10 +932,17 @@ Whether a response's DATA adds up to its `content-length`, at its end (RFC 9113
 */
 @(private)
 client_content_matches :: proc(s: ^Client_Stream) -> bool {
-	if !s.has_length || s.head || s.status == 204 || s.status == 304 {
+	if !s.has_length || !client_content_defined(s) {
 		return true
 	}
 	return s.declared == len(s.body)
+}
+
+// Whether a response has content to be held to its `content-length`: not one
+// to a HEAD, nor a 204 or 304 (RFC 9110 9.3.2, 6.4.1). The caller holds `c.mu`.
+@(private)
+client_content_defined :: proc(s: ^Client_Stream) -> bool {
+	return !s.head && s.status != 204 && s.status != 304
 }
 
 // Owe connection-level receive window for bytes already read, whatever became
