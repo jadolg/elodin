@@ -209,15 +209,15 @@ run_dnssec_cases :: proc(r: ^Runner) {
 		mock_reset_counts(mock)
 		res := query_udp(udp_port, build_query("cd-no-do.test.", u16(dns.Type.A), checking_disabled = true))
 		check(r, res.ok, "no response")
+		// The query this case sent, not one left over from an earlier case.
+		check(r, mock_total(mock) >= 1, "the CD query was not forwarded")
 		forwarded := mock_last_query(mock)
 		if check(r, len(forwarded) > 12, "the mock saw no query") {
 			if msg, ok := decode_reply(r, forwarded); ok {
-				check(r, dns.edns_do(msg), "the forwarded query does not set DO")
-			}
-		}
-		if res.ok {
-			if msg, ok := decode_reply(r, res.wire); ok {
-				check(r, !dns.edns_do(msg), "the answer sets DO for a client that did not")
+				asked := len(msg.question) == 1 && dns.name_equal_fold(msg.question[0].name, "cd-no-do.test.")
+				if check(r, asked, "the mock's last query is not this case's: %v", msg.question) {
+					check(r, dns.edns_do(msg), "the forwarded query does not set DO")
+				}
 			}
 		}
 	}

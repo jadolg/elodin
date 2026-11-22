@@ -47,15 +47,6 @@ auth_set :: proc(name: string, type: dns.Type) -> dnssec.Authenticated_Set {
 	return dnssec.Authenticated_Set{name = name, type = type, class = .IN, signer = TEST_SIGNER, ttl = 86400}
 }
 
-/*
-The signer these synthetic signatures name.
-
-Written out rather than left as the root, because the prune keeps a signature
-only when its signer is the one the verdict was reached against - so the name in
-here and the `signer` on the `Authenticated_Set` below have to be the same name,
-and a test whose fixture quietly disagreed with its verdict would drop the
-signature and look like a prune bug.
-*/
 @(private = "file")
 signed_response :: proc() -> dns.Message {
 	answer := make([]dns.Record, 2, context.temp_allocator)

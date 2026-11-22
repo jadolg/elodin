@@ -57,7 +57,8 @@ never changes the verdict on the answer.
 
 A client that sets CD gets the data whatever the verdict; those answers are
 cached under a separate key, so they never reach a client that wanted the check.
-A client that did not set DO gets the DNSSEC records stripped, CD or not.
+A client that did not set DO gets the DNSSEC records stripped, CD or not, except
+those of a type it asked for (ANY asks for all of them, RFC 4035 section 3.2.1).
 
 ## Logging
 

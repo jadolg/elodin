@@ -1,6 +1,7 @@
 package server
 
 import "core:testing"
+import "core:time"
 import "elodin:dns"
 
 /*
@@ -102,5 +103,37 @@ test_do_is_set_upstream_whenever_validation_is_on :: proc(t: ^testing.T) {
 		testing.expectf(t, sigs == row.want_sigs, "%s: %d RRSIGs to the client, want %d", row.what, sigs, row.want_sigs)
 		testing.expectf(t, dns.edns_do(m) == (row.edns && row.dnssec_ok), "%s: DO in the answer %v", row.what, dns.edns_do(m))
 	}
+	free_all(context.temp_allocator)
+}
+
+/*
+The copy a DO=0 client gets with the signatures stripped is still held to them
+(RFC 4034 section 3.1.5): no longer than the RRSIG has left, as the copy that
+keeps them is.
+*/
+@(test)
+test_a_stripped_answer_is_held_to_its_signatures :: proc(t: ^testing.T) {
+	name := "www.example.com."
+	sig := rrsig_over(.A)
+	// Ten minutes left on a record that claims a day.
+	dns.write_ttl_at(sig.data, 8, u32(time.time_to_unix(time.now())) + 600) // lint:allow wall-clock: an RRSIG's expiration is an instant on it
+	reply := test_reply(name, .A, a_record(name, {192, 0, 2, 7}, 86400), dns.Record{name = name, type = .RRSIG, class = .IN, ttl = 86400, data = sig})
+	h: Harness
+	if !harness_start(t, &h, validating = true) {
+		return
+	}
+	x := Canned_Mock {
+		reply = reply,
+	}
+	out, _, served := harness_exchange(&h, &x, query_with(name, cd = true, edns = false, dnssec_ok = false))
+	harness_stop(&h)
+	if !testing.expect(t, served && x.got, "nothing served") {
+		return
+	}
+	m, err := dns.decode_message(out, context.temp_allocator)
+	if !testing.expectf(t, err == .None && len(m.answer) == 1, "the answer: %v, %d records", err, len(m.answer)) {
+		return
+	}
+	testing.expectf(t, m.answer[0].ttl <= 600, "TTL %d, past the RRSIG's 600 seconds", m.answer[0].ttl)
 	free_all(context.temp_allocator)
 }

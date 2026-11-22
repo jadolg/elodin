@@ -467,6 +467,15 @@ test_query :: proc(
 	return wire
 }
 
+/*
+The signer these synthetic signatures name.
+
+Written out rather than left as the root, because the prune keeps a signature
+only when its signer is the one the verdict was reached against - so the name in
+here and the `signer` on a test's `Authenticated_Set` have to be the same name,
+and a test whose fixture quietly disagreed with its verdict would drop the
+signature and look like a prune bug.
+*/
 @(private)
 TEST_SIGNER :: "example.com."
 

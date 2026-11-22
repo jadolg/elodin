@@ -2649,6 +2649,12 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 		st.answer_ede = ceiling_ede(result)
 		st.ede = st.answer_ede
 	} else if live(st.s).validator != nil && !dns.edns_do(st.msg) {
+		// Held to the signatures first (RFC 4034 section 3.1.5), as
+		// `finish_answer` holds a copy that keeps them: past the strip there
+		// is nothing left to read the expiry from.
+		if left, signed := dns.signatures_lapse(st.resp, u32(time.time_to_unix(loop.now()))); signed {
+			dns.cap_ttls(st.resp, left)
+		}
 		// At full size, as `present_response` strips: this copy is the one the
 		// cache keeps.
 		st.resp = strip_dnssec_records(st.resp, st.msg, st.q.type, st.spent, st.allocator, dns.MAX_MESSAGE)
