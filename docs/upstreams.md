@@ -35,6 +35,12 @@ and a member that stops answering - its losers waiting out the timeout - can.
 Past it a race asks as many servers at once as there is room for, and with no
 room asks them in turn, as `failover` does.
 
+The certificate name (`hostname`, a `tls://` address's `#name`, or an `https`
+url's host) is sent as SNI and checked against the certificate. An IP address
+there (`hostname: 9.9.9.9`, `https://1.1.1.1/dns-query`)
+is checked against the certificate's IP addresses and sent no SNI, which may not
+carry an address (RFC 6066 section 3).
+
 `bootstrap` resolves upstream hostnames. elodin does not use the system resolver
 for them, since on a machine where elodin *is* the system resolver that would
 loop back to a server that has not started yet. Each entry is an IP address with
