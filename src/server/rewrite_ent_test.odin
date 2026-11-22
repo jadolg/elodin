@@ -100,6 +100,16 @@ test_an_nxdomain_above_a_rewrite_goes_out_as_nodata :: proc(t: ^testing.T) {
 			want = .NX_Domain,
 			reason = "a chain that loops, so has no end",
 		},
+		{
+			name = "alias.example.",
+			chain = []dns.Record {
+				cname_record("alias.example.", "b.rw.example."),
+				cname_record("b.rw.example.", "x.example."),
+				cname_record("x.example.", "b.rw.example."),
+			},
+			want = .NX_Domain,
+			reason = "a chain that loops past the question's name",
+		},
 	}
 	h: Harness
 	if !harness_start(t, &h) {
@@ -154,21 +164,23 @@ test_the_nodata_over_a_rewrite_is_what_is_cached :: proc(t: ^testing.T) {
 }
 
 /*
-A validated NXDOMAIN keeps its rcode: its NSEC or NSEC3 records prove a name
-error. The AD bit counts only when this server validated; an upstream's own bit
-on an answer nothing here checked is not a proof of anything.
+A NXDOMAIN this server proved Secure keeps its rcode, AD or not; an upstream's
+own AD on an answer nothing here checked is not a proof of anything.
 */
 @(test)
 test_a_validated_nxdomain_above_a_rewrite_is_left_alone :: proc(t: ^testing.T) {
 	Row :: struct {
-		validating: bool,
-		ad:         bool,
-		want:       dns.Rcode,
+		proven: bool,
+		ad:     bool,
+		want:   dns.Rcode,
 	}
 	rows := []Row {
-		{validating = true, ad = true, want = .NX_Domain},
-		{validating = true, ad = false, want = .No_Error},
-		{validating = false, ad = true, want = .No_Error},
+		{proven = true, ad = true, want = .NX_Domain},
+		// Proved, but AD cleared for an answer that could not be rebuilt, and
+		// the NSEC stripped for a DO=0 client: still proved.
+		{proven = true, ad = false, want = .NX_Domain},
+		// An upstream's AD on an answer nothing here checked proves nothing.
+		{proven = false, ad = true, want = .No_Error},
 	}
 	cfg: config.Config
 	cfg.rewrites = ent_rules()
@@ -181,7 +193,7 @@ test_a_validated_nxdomain_above_a_rewrite_is_left_alone :: proc(t: ^testing.T) {
 		st := Query_State {
 			s          = &s,
 			q          = {name = "b.rw.example.", type = .A, class = .IN},
-			validating = row.validating,
+			proven     = row.proven,
 			resp       = resp,
 			allocator  = context.temp_allocator,
 		}

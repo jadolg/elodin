@@ -375,10 +375,11 @@ Special_Use :: enum u8 {
 	// as RFC 6303 section 3 asks; the argument for why `home.arpa.` is not
 	// simply `Nonexistent` is above.
 	Empty_Zone,
-	// NODATA: a name inside an empty zone with a route, anchor or rewrite below
-	// it. The zone down there exists, so this name does too, and a name error
-	// for it would deny the routed zone to an RFC 8020 cache. Also the `DS` at a
-	// route's apex whose parent is the empty zone.
+	// NODATA: a name in an `Empty_Zone` or `Nonexistent` zone with a route or
+	// anchor below it, or a rewrite at or below it (`denial_unless_zone_below`).
+	// That name exists, and a name error for it would deny what is below to an
+	// RFC 8020 cache. Also the `DS` at a route's apex whose parent is the empty
+	// zone.
 	Empty_Nonterminal,
 }
 

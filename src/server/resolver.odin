@@ -1202,6 +1202,8 @@ Query_State :: struct {
 	unproven_apex_ds: bool,
 	// The validator's extended error, which the store keeps with the answer.
 	answer_ede:       u16,
+	// The validator proved this answer Secure, whatever AD ends up saying.
+	proven:           bool,
 
 	// The answer, once a stage has one.
 	using result:     Resolution,
@@ -2640,6 +2642,7 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 			return answered(st, out, .Failed, built)
 		case .Secure:
 			sync.atomic_add(&st.s.stats.secure, 1)
+			st.proven = true
 		}
 		presented, built := present_response(st.resp, st.msg, st.q.type, result, st.spent, st.allocator)
 		if !built {
@@ -2687,7 +2690,8 @@ SOA stays, so the answer is NODATA as RFC 2308 section 2.2 shapes it.
 
 A signed denial is left alone: an NSEC or NSEC3 record proves a name error,
 which a validator downstream would hold against a NOERROR, and a denial this
-server validated (AD) is one even where its proofs were stripped. So is a reply
+server proved Secure is one even where its proofs were stripped and AD
+cleared. So is a reply
 whose chain cannot be followed to its end, or that is longer than
 `dns.MAX_ALIAS_REFERRAL_RECORDS`, the bound `peek_referral` walks chains to.
 */
@@ -2697,7 +2701,7 @@ nodata_over_rewrite :: proc(st: ^Query_State) {
 	if len(resp) < dns.HEADER_SIZE || resp[3] & 0x0f != u8(dns.Rcode.NX_Domain) || len(live(st.s).cfg.rewrites) == 0 {
 		return
 	}
-	if st.validating && resp[3] & 0x20 != 0 {
+	if st.proven {
 		return
 	}
 	if int(resp[6]) << 8 | int(resp[7]) > dns.MAX_ALIAS_REFERRAL_RECORDS {
@@ -2717,6 +2721,13 @@ nodata_over_rewrite :: proc(st: ^Query_State) {
 		_, target, aliased, unreadable := dns.alias_chain(resp)
 		if unreadable || !aliased {
 			return
+		}
+		// A chain that ends there has no CNAME on from its target: one that
+		// does is a loop `alias_chain` ran its steps out in.
+		for rec in m.answer {
+			if rec.type == .CNAME && dns.name_equal_fold(rec.name, target) {
+				return
+			}
 		}
 		name = target
 	}
