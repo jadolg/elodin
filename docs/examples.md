@@ -19,12 +19,16 @@ changes, with a comment on why; anything they leave out is the shipped default.
 ./bin/elodin --config examples/lan.yaml --check
 ```
 
-The file is YAML 1.2, read with its core schema: a boolean is `true` or `false`
-(`True`, `TRUE` and the like too), and a number is plain digits, `0x` hex or
-`0o` octal, unquoted. YAML 1.1's `yes`, `no`, `on`, `off`, `3_000` and `0b1010`,
-and a quoted number or boolean, are strings, so where a boolean or a number
-belongs they are refused, naming the value. A byte order mark at the start of the
-file is ignored.
+The file is YAML 1.2, read with its core schema: a boolean is `true`, `True`,
+`TRUE`, `false`, `False` or `FALSE`, and an integer is plain digits with an
+optional sign, `0x` hex or `0o` octal, unquoted. YAML 1.1's `yes`, `no`, `on`,
+`off`, `3_000` and `0b1010`, and a quoted number or boolean, are strings, so a
+boolean or integer setting refuses them, naming the value and why. A TTL also
+takes a duration such as `5m`, quoted or not. A byte order mark at the start of
+the file, or of a document after `---`, is ignored.
+
+An upgrade of the `.deb` runs `--check` on `/etc/elodin/elodin.yaml` before it
+restarts a running elodin, and leaves the running one alone if the check fails.
 
 `--check` shows what a file means on your machine: the derived sizes,
 who may ask, the connection table and its per-client share, and a warning for

@@ -1096,6 +1096,16 @@ test_a_leading_byte_order_mark_is_not_content :: proc(t: ^testing.T) {
 		port, ok := as_int(get(get(doc, "listeners"), "port"))
 		testing.expectf(t, ok && port == 53, "listeners.port read as %d (%v) behind a BOM", port, ok)
 	}
+	// Each document may open with one, as files run together with `cat` do.
+	joined, jerr := parse("a: 1\n---\n" + BYTE_ORDER_MARK + "b: 2\n", context.temp_allocator)
+	if testing.expectf(t, jerr == nil, "a BOM after a document marker was refused: %v", jerr) {
+		b, ok := as_int(get(joined, "b"))
+		testing.expectf(t, ok && b == 2, "b read as %d (%v) behind a BOM after ---", b, ok)
+	}
+	// After a comment it is content: 9.1.1 puts the BOM ahead of the comments.
+	commented, _ := parse("# c\n" + BYTE_ORDER_MARK + "b: 2\n", context.temp_allocator) // lint:allow either outcome but a key named b is the point
+	_, plain_b := as_int(get(commented, "b"))
+	testing.expect(t, !plain_b, "a BOM after a comment was taken out")
 	inner, ierr := parse("k: " + BYTE_ORDER_MARK + "v\n", context.temp_allocator)
 	if testing.expectf(t, ierr == nil, "a BOM in a value was refused: %v", ierr) {
 		v, ok := as_string(get(inner, "k"))

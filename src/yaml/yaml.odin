@@ -86,9 +86,7 @@ parse :: proc(src: string, allocator := context.allocator) -> (root: ^Node, err:
 	}
 	defer delete(p.lines)
 
-	// YAML 1.2.2 section 9.1.1: a document may open with a byte order mark,
-	// which is not content. One elsewhere is.
-	scan_lines(&p, strings.trim_prefix(src, BYTE_ORDER_MARK)) or_return
+	scan_lines(&p, src) or_return
 
 	if len(p.lines) == 0 {
 		return new_mapping(&p), nil
@@ -124,10 +122,18 @@ leading_spaces :: proc(s: string) -> int {
 scan_lines :: proc(p: ^Parser, src: string) -> Maybe(Error) {
 	num := 0
 	rest := src
+	// The first line, and the one after a `---` or `...`, may open a document.
+	document_start := true
 	for len(rest) > 0 || num == 0 {
 		num += 1
 		line: string
 		line, rest = take_line(rest)
+		// YAML 1.2.2 section 9.1.1: each document may open with a byte order
+		// mark, which is not content. One anywhere else is.
+		if document_start {
+			line = strings.trim_prefix(line, BYTE_ORDER_MARK)
+			document_start = false
+		}
 		line = strings.trim_right(line, "\r \t")
 
 		indent := leading_spaces(line)
@@ -140,6 +146,7 @@ scan_lines :: proc(p: ^Parser, src: string) -> Maybe(Error) {
 			continue
 		}
 		if body == "---" || body == "..." {
+			document_start = true
 			continue
 		}
 

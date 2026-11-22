@@ -67,6 +67,43 @@ as_bool :: proc(n: ^Node) -> (bool, bool) {
 }
 
 /*
+Whether `s` is one of YAML 1.1's booleans that 1.2 reads as a string (1.1's
+`bool` type: `y`, `yes`, `on` and their kin), for a refusal to say so.
+*/
+yaml_1_1_bool :: proc(s: string) -> bool {
+	folded: [len("false")]u8
+	if len(s) > len(folded) {
+		return false
+	}
+	for c, i in transmute([]u8)s {
+		folded[i] = c + 32 if c >= 'A' && c <= 'Z' else c
+	}
+	switch string(folded[:len(s)]) {
+	case "y", "yes", "on", "n", "no", "off", "true", "false":
+		return true
+	}
+	return false
+}
+
+/*
+Whether `s` is one of YAML 1.1's integers that 1.2 reads as a string: `_`
+separators, `0b` binary, an upper-case base prefix, or a sign before one.
+*/
+yaml_1_1_int :: proc(s: string) -> bool {
+	t := strings.trim_left(s, "+-")
+	if len(t) == 0 {
+		return false
+	}
+	return(
+		strings.contains_rune(t, '_') && strings.trim(t, "0123456789abcdefABCDEFxXoObB_") == "" ||
+		strings.has_prefix(t, "0b") ||
+		strings.has_prefix(t, "0B") ||
+		strings.has_prefix(t, "0X") ||
+		strings.has_prefix(t, "0O") ||
+		(len(t) < len(s) && (strings.has_prefix(t, "0x") || strings.has_prefix(t, "0o"))) 	)
+}
+
+/*
 An integer as YAML 1.2's core schema has it (1.2.2 section 10.3.2), plain:
 `[-+]? [0-9]+`, `0o [0-7]+` or `0x [0-9a-fA-F]+`, and no wider than an i64.
 YAML 1.1's `_` separators, `0b` and a sign before a base prefix are strings in

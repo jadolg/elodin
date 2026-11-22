@@ -1782,10 +1782,23 @@ test_yaml_1_1_forms_are_refused_and_a_bom_is_not :: proc(t: ^testing.T) {
 			{"listeners:\n  tcp: {enabled: \"false\"}\n", "listeners.tcp.enabled", "not \"false\""},
 			{"listeners:\n  udp: {port: 3_8053}\n", "listeners.udp.port", "not \"3_8053\""},
 			{"listeners:\n  udp: {port: \"53\"}\n", "listeners.udp.port", "not \"53\""},
-			{"cache:\n  max_entries: 0b10011100010000\n", "cache.max_entries", "expected an integer"},
-			{"cache:\n  max_entries: +0x10\n", "cache.max_entries", "expected an integer"},
+			{"cache:\n  max_entries: 0b10011100010000\n", "cache.max_entries", "a YAML 1.1 form"},
+			{"cache:\n  max_entries: +0x10\n", "cache.max_entries", "a YAML 1.1 form"},
+			{"listeners:\n  udp: {port: \"53\"}\n", "listeners.udp.port", "quoted, so a string"},
+			{"listeners:\n  tcp: {enabled: yes}\n", "listeners.tcp.enabled", "a YAML 1.1 form"},
+			{"rewrites:\n  - {domain: a.test, answer: 192.0.2.1, ttl: 3_600}\n", "rewrites[0].ttl", "not \"3_600\" (a YAML 1.1 form"},
 		}) {
 		expect_refused(t, strings.concatenate({MINIMAL, c.doc}, context.temp_allocator), c.path, c.want)
+	}
+	// A value that is no form of a boolean or integer is named, with no YAML
+	// 1.1 or quoting hint it would be wrong about.
+	for doc in ([]string{"listeners:\n  udp: {port: abc}\n", "listeners:\n  tcp: {enabled: maybe}\n"}) {
+		_, err := load_string(strings.concatenate({MINIMAL, doc}, context.temp_allocator), context.temp_allocator)
+		if e, has := err.?; testing.expectf(t, has, "%s loaded", doc) {
+			for m in e.messages {
+				testing.expectf(t, !strings.contains(m, "YAML 1.1") && !strings.contains(m, "quoted"), "a hint that does not hold: %s", m)
+			}
+		}
 	}
 	// The 1.2 forms of each load.
 	expect_loads(t, MINIMAL + "listeners:\n  tcp: {enabled: False}\n  udp: {port: 0x35}\n")
