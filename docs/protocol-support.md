@@ -72,7 +72,10 @@ order, keeping ChaCha20 for a client that puts it first. TLS 1.3 follows the
 same order: AES-128-GCM, AES-256-GCM, then ChaCha20-Poly1305. A peer that speaks
 TLS 1.2 only, with none of those suites, cannot connect: static RSA, CBC and
 finite-field DHE are not offered (RFC 9325 sections 4.1 and 4.2, and RFC 9113
-Appendix A for DoH over HTTP/2).
+Appendix A for DoH over HTTP/2). TLS 1.2 renegotiation is off at both ends (RFC 9113
+section 9.2.1): a server's request for one is answered with a no_renegotiation
+alert and no renegotiation happens (a server that insists then ends the
+connection), and a client's is refused.
 
 A UDP answer leaves from the address its query was sent to, also on a
 wildcard bind (`0.0.0.0` or `::`), as RFC 1123 section 2.3 asks of a
