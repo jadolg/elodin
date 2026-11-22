@@ -7,7 +7,8 @@ cookies:
   enabled: true          # answer clients that send a cookie
   require: false         # demand a valid one from UDP clients that send any
   upstream: true         # present a cookie of our own to plain upstreams
-  secret: ""             # 32 hex characters; empty draws a random one at startup, kept across reloads
+  secret: ""             # 32 hex characters; empty draws a random one, replaced about daily
+  previous_secret: ""    # 32 hex characters, accepted and never issued under; for changing a shared secret
 ```
 
 Cookies (RFC 7873, RFC 9018) add 64 bits a forger off the path cannot see to the
@@ -17,7 +18,7 @@ UDP transaction ID and source port.
 |---|---|---|
 | setting | `cookies.enabled` | `cookies.upstream` |
 | default | on | on |
-| secret | `cookies.secret`, or random at startup | random per upstream |
+| secret | `cookies.secret`, or random and replaced about daily | random per upstream, replaced about daily |
 | server cookie | recomputed per query, nothing stored | learned and held per upstream |
 | transports | UDP, TCP, DoT, DoH | UDP and TCP only |
 | a cookie that does not check out | answered anyway, or BADCOOKIE with `require` | ignored, and the wait continues |
@@ -46,11 +47,25 @@ section 5.2.2).
   charged to a budget of its own instead, so a flood spoofing the client's prefix
   does not get it dropped. BIND and Knot exempt such a query from RRL entirely.
 - `require: true` with `enabled: false` is rejected at startup.
+- A random secret is replaced after a day less up to 40% jitter (RFC 7873
+  §7.1), and reloads keep it. Cookies issued under the one it replaced are
+  still accepted for 150 seconds; a client that sends one gets a cookie under
+  the new secret back.
 - Set `secret` when several elodin instances answer on one address; otherwise
-  each rejects the cookies the others issued.
+  each rejects the cookies the others issued. elodin never replaces a
+  configured secret, since every member has to change it in step: change it
+  at least every 36 days (RFC 7873 §7.1). A reload that changes `secret` keeps
+  accepting cookies under the old one for 150 seconds.
+- `previous_secret` is accepted on returned cookies and never issued under. It
+  is how a shared secret is changed without turning clients away, in RFC 9018
+  §5's three stages, each a reload on every member before the next begins:
+  1. put the new secret in `previous_secret`;
+  2. swap the two, so `secret` is the new one and `previous_secret` the old;
+  3. remove `previous_secret`.
 
 **Upstream.** elodin sends a random client cookie per server plus the server
-cookie that server last issued.
+cookie that server last issued. The client cookie is drawn afresh after a day
+less up to 40% jitter (RFC 7873 §7.1), and the server cookie is learned again.
 
 - A reply whose cookie is not ours is ignored and elodin keeps waiting for the
   real one; answering SERVFAIL would reward the spoofer.

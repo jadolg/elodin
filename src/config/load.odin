@@ -1897,11 +1897,12 @@ load_cookies :: proc(l: ^Loader, cfg: ^Config) {
 	if n == nil {
 		return
 	}
-	check_keys(l, n, "cookies", "enabled", "require", "upstream", "secret")
+	check_keys(l, n, "cookies", "enabled", "require", "upstream", "secret", "previous_secret")
 	opt_bool(l, n, "enabled", &cfg.cookies.enabled, "cookies")
 	opt_bool(l, n, "require", &cfg.cookies.require, "cookies")
 	opt_bool(l, n, "upstream", &cfg.cookies.upstream, "cookies")
 	opt_string(l, n, "secret", &cfg.cookies.secret, "cookies")
+	opt_string(l, n, "previous_secret", &cfg.cookies.previous_secret, "cookies")
 }
 
 @(private)
@@ -3159,11 +3160,12 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	// Same reasoning: a secret that will not parse should fail `--check`, not
 	// leave a machine handing out cookies its neighbours reject. Read with the
 	// parser the server itself uses, so the two cannot disagree.
-	if cfg.cookies.secret != "" {
-		scratch: [COOKIE_SECRET_LEN]u8
-		if !parse_cookie_secret(cfg.cookies.secret, &scratch) {
-			errorf(l, "cookies.secret must be %d hexadecimal characters", COOKIE_SECRET_LEN * 2)
-		}
+	scratch: [COOKIE_SECRET_LEN]u8
+	if cfg.cookies.secret != "" && !parse_cookie_secret(cfg.cookies.secret, &scratch) {
+		errorf(l, "cookies.secret must be %d hexadecimal characters", COOKIE_SECRET_LEN * 2)
+	}
+	if cfg.cookies.previous_secret != "" && !parse_cookie_secret(cfg.cookies.previous_secret, &scratch) {
+		errorf(l, "cookies.previous_secret must be %d hexadecimal characters", COOKIE_SECRET_LEN * 2)
 	}
 	/*
 	`require` is enforced against cookies this server issues, and it issues none

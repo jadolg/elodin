@@ -8,6 +8,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 
 /*
 A cookie-aware responder on loopback.
@@ -719,5 +720,58 @@ test_a_tcp_member_refusing_twice_is_not_asked_a_third_time :: proc(t: ^testing.T
 	_, err := exchange(u, edns_query("example.com."), time.Second, context.temp_allocator)
 	testing.expect_value(t, err, Error.Bad_Response)
 	testing.expectf(t, sync.atomic_load(&tcp.answered) == 2, "%d TCP answers, want the query and its retry", sync.atomic_load(&tcp.answered))
+	free_all(context.temp_allocator)
+}
+
+/*
+The client cookie is drawn afresh once its lifetime is up (RFC 7873 section
+7.1): the exchange after that goes out with a new client cookie and without the
+server cookie bound to the old one, and the next rollover is a lifetime away,
+less the jitter.
+*/
+@(test)
+test_the_client_cookie_rolls_over :: proc(t: ^testing.T) {
+	m := Cookie_Mock {
+		server = {1, 2, 3, 4, 5, 6, 7, 8},
+	}
+	u, worker, ok := start_cookie_mock(t, &m)
+	if !ok {
+		return
+	}
+	defer stop_udp_mock(&m, worker, u)
+	lifetime := time.Duration(dns.COOKIE_SECRET_LIFETIME) * time.Second
+	shortest := lifetime * (100 - dns.COOKIE_SECRET_JITTER) / 100
+
+	sync.mutex_lock(&u.mu)
+	first_roll := time.Duration(u.cookie.roll_at - loop.moment_now())
+	sync.mutex_unlock(&u.mu)
+	testing.expectf(t, first_roll >= shortest - time.Minute && first_roll <= lifetime, "the first rollover is %v away", first_roll)
+
+	for name in ([]string{"example.com.", "example.org."}) {
+		_, err := exchange(u, edns_query(name), time.Second, context.temp_allocator)
+		testing.expectf(t, err == .None, "exchange for %s failed: %v", name, err)
+	}
+	before, had := seen_cookie(&m)
+	if !testing.expect(t, had && len(before) == COOKIE_CLIENT_LEN + 8, "the premise: a server cookie was learned and sent") {
+		return
+	}
+	old: [COOKIE_CLIENT_LEN]u8
+	copy(old[:], before[:COOKIE_CLIENT_LEN])
+
+	sync.mutex_lock(&u.mu)
+	u.cookie.roll_at = loop.moment_add(loop.moment_now(), -time.Second)
+	sync.mutex_unlock(&u.mu)
+	_, err := exchange(u, edns_query("example.net."), time.Second, context.temp_allocator)
+	testing.expectf(t, err == .None, "the exchange after the rollover failed: %v", err)
+
+	after, had_after := seen_cookie(&m)
+	if testing.expect(t, had_after, "the query after the rollover carried no cookie") {
+		testing.expectf(t, len(after) == COOKIE_CLIENT_LEN, "the query after the rollover carried %d bytes of cookie, want the client cookie alone", len(after))
+		testing.expect(t, mem.compare(after[:COOKIE_CLIENT_LEN], old[:]) != 0, "the client cookie did not roll over")
+	}
+	sync.mutex_lock(&u.mu)
+	next := time.Duration(u.cookie.roll_at - loop.moment_now())
+	sync.mutex_unlock(&u.mu)
+	testing.expectf(t, next >= shortest - time.Minute && next <= lifetime, "the next rollover is %v away", next)
 	free_all(context.temp_allocator)
 }

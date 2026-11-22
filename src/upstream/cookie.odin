@@ -35,14 +35,17 @@ COOKIE_SERVER_MAX :: 32
 
 @(private)
 Cookie :: struct {
-	client:     [COOKIE_CLIENT_LEN]u8,
+	client:        [COOKIE_CLIENT_LEN]u8,
 	// What the server last gave us, empty until it has.
-	server:     [COOKIE_SERVER_MAX]u8,
-	server_len: int,
-	// Until when a move's forgotten server cookie may still be on queries
-	// waiting for replies, which owe one (`cookie_matches`); zero once a cookie
-	// is learned from the address moved to. See `cookie_moved_locked`.
-	moved_until: loop.Moment,
+	server:        [COOKIE_SERVER_MAX]u8,
+	server_len:    int,
+	// Until when a server cookie forgotten with the client cookie, on a move or
+	// a rollover, may still be on queries waiting for replies, which owe one
+	// (`cookie_matches`); zero once a cookie is learned again. See
+	// `cookie_renewed_locked`.
+	renewed_until: loop.Moment,
+	// When the client cookie is next drawn afresh (`roll_cookie`).
+	roll_at:       loop.Moment,
 }
 
 /*
@@ -126,7 +129,7 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	sync.mutex_lock(&u.mu)
 	echoed := u.cookie.client
 	held := u.cookie.server_len > 0
-	moved := cookie_moved_locked(u)
+	moved := cookie_renewed_locked(u)
 	sync.mutex_unlock(&u.mu)
 
 	/*
@@ -158,8 +161,8 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	// upstream this server holds no cookie for - every cookie-less one - this
 	// would otherwise re-walk the query for each datagram of a spoofing flood
 	// to reach a verdict `held` had already settled.
-	// Just after a move a query may have gone out with the server cookie the
-	// move forgot: its reply owes one all the same.
+	// Just after a move or a rollover a query may have gone out with the server
+	// cookie it forgot: its reply owes one all the same.
 	expected := false
 	sent: []u8
 	carried := false
@@ -172,8 +175,8 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	if !found {
 		return !expected
 	}
-	// The client cookie the query went out with, which a move may since have
-	// drawn afresh (`resolve_endpoint`): the reply echoes that one. Read only
+	// The client cookie the query went out with, which a move or a rollover may
+	// since have drawn afresh (`renew_cookie_locked`): the reply echoes that one. Read only
 	// for a reply that carries a cookie, for the reason `held` gives above.
 	if !held && !moved {
 		sent, carried = dns.peek_edns_option(query, .Cookie)
@@ -193,10 +196,38 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	return true
 }
 
-// Whether a move's forgotten server cookie may still be out. Under `u.mu`.
+// Whether a server cookie forgotten on a move or a rollover may still be out.
+// Under `u.mu`.
 @(private)
-cookie_moved_locked :: proc(u: ^Upstream) -> bool {
-	return u.cookie.moved_until != 0 && loop.moment_since(u.cookie.moved_until) < 0
+cookie_renewed_locked :: proc(u: ^Upstream) -> bool {
+	return u.cookie.renewed_until != 0 && loop.moment_since(u.cookie.renewed_until) < 0
+}
+
+/*
+Draw a new client cookie and forget the server cookie bound to the old one.
+Replies to queries already out under the old one, for up to `in_flight`, are
+still held to the cookie they owe. Under `u.mu`.
+*/
+@(private)
+renew_cookie_locked :: proc(u: ^Upstream, in_flight: time.Duration) {
+	if u.cookie.server_len > 0 {
+		u.cookie.renewed_until = max(u.cookie.renewed_until, loop.moment_add(loop.moment_now(), in_flight))
+	}
+	forget_cookie(u)
+	init_cookie(u)
+}
+
+/*
+Draw the client cookie afresh once its lifetime is up: RFC 7873 section 7.1
+holds a client's secret to the same lifetime as a server's.
+*/
+@(private)
+roll_cookie :: proc(u: ^Upstream, in_flight: time.Duration) {
+	sync.mutex_lock(&u.mu)
+	defer sync.mutex_unlock(&u.mu)
+	if loop.moment_since(u.cookie.roll_at) >= 0 {
+		renew_cookie_locked(u, in_flight)
+	}
 }
 
 /*
@@ -250,7 +281,7 @@ learn_cookie :: proc(u: ^Upstream, response: []u8) {
 		return
 	}
 	u.cookie.server_len = copy(u.cookie.server[:], server)
-	u.cookie.moved_until = 0
+	u.cookie.renewed_until = 0
 }
 
 /*
@@ -277,6 +308,7 @@ exchange_with_cookie :: proc(
 	response: []u8,
 	err: Error,
 ) {
+	roll_cookie(u, timeout)
 	asked, attached, dry := attach_cookie(u, query, context.temp_allocator)
 	if dry && !attached {
 		return nil, .Out_Of_Memory
@@ -411,4 +443,5 @@ init_cookie :: proc(u: ^Upstream) {
 	// for a client cookie that cannot be used to recognise this resolver from
 	// one server to the next.
 	crypto.rand_bytes(u.cookie.client[:])
+	u.cookie.roll_at = loop.moment_add(loop.moment_now(), time.Duration(dns.cookie_secret_lifetime()) * time.Second)
 }

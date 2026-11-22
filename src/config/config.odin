@@ -447,7 +447,7 @@ Cookie_Config :: struct {
 	value you were never shown". Clients that do not use cookies are unaffected;
 	nothing is added to an answer whose query did not ask for it.
 	*/
-	enabled: bool,
+	enabled:         bool,
 	/*
 	Whether a UDP query carrying a cookie must show a valid server cookie
 	before it is answered.
@@ -463,7 +463,7 @@ Cookie_Config :: struct {
 	since it is turned on while an attack is under way and that is the wrong
 	moment to find out it was never in force.
 	*/
-	require:  bool,
+	require:         bool,
 	/*
 	Whether elodin presents a cookie of its own to plain UDP and TCP upstreams.
 
@@ -487,22 +487,36 @@ Cookie_Config :: struct {
 	DoT and DoH upstreams are left out: the transport already authenticates the
 	server, which is more than a cookie establishes.
 	*/
-	upstream: bool,
+	upstream:        bool,
 	/*
 	The secret cookies are keyed by, as 32 hex characters. Empty draws a random
-	one at startup, which is right for a single instance and wrong for several
-	behind one address: each would reject the cookies the others handed out.
+	one at startup and replaces it about daily (RFC 7873 section 7.1), which is
+	right for a single instance and wrong for several behind one address: each
+	would reject the cookies the others handed out.
+
+	A configured secret is never replaced by elodin, since the other members of
+	the set have to change it in step; RFC 7873 section 7.1 has it changed at
+	least every 36 days. A reload that changes it still accepts cookies under
+	the one before for `COOKIE_ROLLOVER_GRACE` seconds.
 
 	Applies to the cookies handed to clients. The client cookies sent upstream
 	are drawn at random per upstream and are not derived from this.
 	*/
-	secret:   string,
+	secret:          string,
+	/*
+	A second secret, accepted on the cookies clients return and never issued
+	under, in the same form as `secret`. It is what RFC 9018 section 5's
+	three-stage change of a shared secret needs: the new secret goes here on
+	every member first, then swaps places with `secret`, then the old one is
+	removed.
+	*/
+	previous_secret: string,
 }
 
 COOKIE_SECRET_LEN :: 16
 
 /*
-Read `cookies.secret` into the bytes it stands for.
+Read `cookies.secret` or `cookies.previous_secret` into the bytes it stands for.
 
 Lives here rather than beside the server that uses it so that `--check` and
 startup agree by construction. Two parsers written to the same rule are two

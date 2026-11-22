@@ -456,11 +456,7 @@ resolve_endpoint :: proc(
 		// asked again (`exchange_with_cookie`).
 		// A second move with no cookie learned since leaves the first's
 		// window as it is: it is a time, not a flag the move could clear.
-		if u.cookie.server_len > 0 {
-			u.cookie.moved_until = max(u.cookie.moved_until, loop.moment_add(loop.moment_now(), in_flight))
-		}
-		forget_cookie(u)
-		init_cookie(u)
+		renew_cookie_locked(u, in_flight)
 		// What ALPN chose, and when idle connections were found hung up on,
 		// were the old address's.
 		u.proto = .Unknown

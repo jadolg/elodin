@@ -354,12 +354,13 @@ test_cookies_defaults_and_overrides :: proc(t: ^testing.T) {
 
 	// `require` is set with `enabled` left on, since the two disagree by
 	// definition; that pairing has its own case below.
-	src := MINIMAL + "cookies:\n  require: true\n  upstream: false\n  secret: e5e973e5a6b2a43f48e7dc849e37bfcf\n"
+	src := MINIMAL + "cookies:\n  require: true\n  upstream: false\n  secret: e5e973e5a6b2a43f48e7dc849e37bfcf\n  previous_secret: 000102030405060708090a0b0c0d0e0f\n"
 	tuned, terr := load_string(src, context.temp_allocator)
 	testing.expect(t, terr == nil, "expected a clean load")
 	testing.expect(t, tuned.cookies.require, "cookies.require: true should be honoured")
 	testing.expect(t, !tuned.cookies.upstream, "cookies.upstream: false should be honoured")
 	testing.expect_value(t, tuned.cookies.secret, "e5e973e5a6b2a43f48e7dc849e37bfcf")
+	testing.expect_value(t, tuned.cookies.previous_secret, "000102030405060708090a0b0c0d0e0f")
 
 	off, oerr := load_string(MINIMAL + "cookies:\n  enabled: false\n", context.temp_allocator)
 	testing.expect(t, oerr == nil, "expected a clean load")
@@ -371,11 +372,15 @@ test_cookies_defaults_and_overrides :: proc(t: ^testing.T) {
 test_cookie_secret_must_be_hex :: proc(t: ^testing.T) {
 	// Caught here rather than at startup, so `--check` says so instead of a
 	// resolver that comes up and refuses to start.
-	src := MINIMAL + "cookies:\n  secret: not-a-secret\n"
-	_, err := load_string(src, context.temp_allocator)
-	e, has := err.?
-	testing.expect(t, has, "expected an error for a secret that is not hex")
-	testing.expect_value(t, len(e.messages), 1)
+	for key in ([]string{"secret", "previous_secret"}) {
+		src := fmt.tprintf("%scookies:\n  %s: not-a-secret\n", MINIMAL, key)
+		_, err := load_string(src, context.temp_allocator)
+		e, has := err.?
+		if testing.expectf(t, has, "expected an error for a %s that is not hex", key) {
+			testing.expect_value(t, len(e.messages), 1)
+			testing.expectf(t, strings.contains(e.messages[0], fmt.tprintf("cookies.%s must be", key)), "the error names another key: %s", e.messages[0])
+		}
+	}
 	free_all(context.temp_allocator)
 }
 

@@ -638,7 +638,7 @@ test_replies_to_queries_from_before_a_move_keep_their_cookie :: proc(t: ^testing
 		// Past the time any query from before the move could still wait, the
 		// query is not walked for it any more.
 		sync.mutex_lock(&u.mu)
-		u.cookie.moved_until = loop.moment_add(loop.moment_now(), -time.Second)
+		u.cookie.renewed_until = loop.moment_add(loop.moment_now(), -time.Second)
 		sync.mutex_unlock(&u.mu)
 		testing.expect(t, cookie_matches(u, query, bare), "the window after a move did not close")
 	}

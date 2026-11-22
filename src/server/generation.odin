@@ -493,13 +493,13 @@ build_live :: proc(s: ^Server, l: ^Live, prev: ^Live) -> (built, carried: Parts,
 		if prev == nil ||
 		   prev.cookies == nil ||
 		   prev.cfg.cookies.require != cfg.cookies.require ||
-		   prev.cfg.cookies.secret != cfg.cookies.secret {
-			// The same secret, configured or drawn at startup, is kept across a
-			// reload that only changes `require`: every client holds a cookie
-			// under it, and a new one would cost each of them a round trip.
-			reuse :=
-				prev.cookies if prev != nil && prev.cookies != nil && prev.cfg.cookies.secret == cfg.cookies.secret else nil
-			if !start_cookies(l, reuse) {
+		   prev.cfg.cookies.secret != cfg.cookies.secret ||
+		   prev.cfg.cookies.previous_secret != cfg.cookies.previous_secret {
+			// The same secrets, configured or drawn, are kept across a reload
+			// that leaves `secret` alone: every client holds a cookie under
+			// them, and a new one would cost each of them a round trip.
+			running := prev.cookies if prev != nil else nil
+			if !start_cookies(l, running, keep = running != nil && prev.cfg.cookies.secret == cfg.cookies.secret) {
 				return
 			}
 			built += {.Cookies}
