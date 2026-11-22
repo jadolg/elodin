@@ -3,9 +3,11 @@ package server
 import "core:encoding/hex"
 import "core:mem"
 import "core:testing"
+import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:loop"
 
 // RFC 9018 appendix A's server secret, client cookie and client.
 @(private = "file")
@@ -723,20 +725,27 @@ the next rollover is a lifetime away, less the jitter.
 test_a_drawn_secret_rolls_over :: proc(t: ^testing.T) {
 	ROLL :: u32(1_000_000)
 	k := keeper(SECRET)
-	k.secrets.next_roll = ROLL
+	k.secrets.next_roll = loop.moment_add(loop.moment_now(), time.Hour)
 	req := request(CLIENT_COOKIE, CLIENT)
 
+	// Due an hour from now on the boot clock: the wall clock reading a day
+	// later, as after a step, does not bring it forward.
 	before := make_cookie(&k, req, ROLL - 1)
 	testing.expect_value(t, k.secrets.epoch, 0)
+	_ = make_cookie(&k, req, ROLL - 1 + 86_400) // lint:allow only the epoch it leaves is under test
+	testing.expect_value(t, k.secrets.epoch, 0)
+
+	k.secrets.next_roll = loop.moment_add(loop.moment_now(), -time.Second)
 	after := make_cookie(&k, req, ROLL)
 	testing.expect_value(t, k.secrets.epoch, 1)
 	unrolled := keeper(SECRET)
 	under_old := make_cookie(&unrolled, req, ROLL)
 	testing.expect(t, mem.compare(after[16:], under_old[16:]) != 0, "the cookie after the rollover is under the old secret")
 
-	shortest := ROLL + u32(dns.COOKIE_SECRET_LIFETIME * (100 - dns.COOKIE_SECRET_JITTER) / 100)
-	next := k.secrets.next_roll
-	testing.expectf(t, next >= shortest && next <= ROLL + dns.COOKIE_SECRET_LIFETIME, "the next rollover is at %d", next)
+	lifetime := time.Duration(dns.COOKIE_SECRET_LIFETIME) * time.Second
+	shortest := lifetime * (100 - dns.COOKIE_SECRET_JITTER) / 100
+	next := time.Duration(k.secrets.next_roll - loop.moment_now())
+	testing.expectf(t, next >= shortest - time.Minute && next <= lifetime, "the next rollover is %v away", next)
 
 	testing.expect(t, verify_cookie(&k, before[:], req, ROLL + COOKIE_ROLLOVER_GRACE), "a cookie under the previous secret failed inside the grace")
 	testing.expect(t, !verify_cookie(&k, before[:], req, ROLL + COOKIE_ROLLOVER_GRACE + 1), "a cookie under the previous secret verified past the grace")

@@ -451,7 +451,8 @@ ts=2026-10-19T19:35:57Z level=info msg=reloaded changed=upstream,rewrites rebuil
 ```
 
 `changed` is the sections that differ; `rebuilt` the parts built afresh
-(`upstreams`, `validator`, `cookies`, `limiter`, `answers`, or `none`); rule
+(`upstreams`, `validator`, `cookies`, `cookie_secrets`, `limiter`, `answers`,
+or `none`; `cookie_secrets` is a changed `cookies.secret`); rule
 sets rebuilt after it log their own `filter:` line (`filter: blocking is off; no
 rules in effect` when turned off), or keep the rules in effect;
 `cache` is `kept`, `flushed`, `new` or `off`.

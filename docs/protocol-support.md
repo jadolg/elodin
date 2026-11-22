@@ -88,7 +88,7 @@ came from accepts it.
 - TCP, DoT and DoH hold a fiber per connection, capped by `server.max_connections` and per prefix by `server.max_connections_per_prefix` (UDP holds no per-client state); see [sizing](sizing.md#transports).
 - Past what the UDP readers can drain, the kernel drops datagrams before any budget sees them; see [how fast datagrams can be read](connections.md#how-fast-datagrams-can-be-read).
 - The handshake bound is per /24 and /64, and a refusal is cheap rather than free; see [a connection rate limit in front](public-resolver.md#a-connection-rate-limit-in-front).
-- The upstream client cookie is drawn afresh about daily (RFC 7873 §7.1), and on a restart, each costing the peer one round trip. See [DNS cookies](edns.md#dns-cookies).
+- The upstream client cookie is drawn afresh about daily (RFC 7873 §7.1) and on a restart; the next query carries the new client cookie alone, and the server cookie is learned from its answer. See [DNS cookies](edns.md#dns-cookies).
 - [DDR](doh.md#discovery-by-clients-ddr) designates one name, and clients only use it automatically if the certificate has the Do53 address as an IP SAN, or the server is on a private address that `ddr.name` resolves to. Otherwise point clients at the encrypted listeners by configuration or the [Apple profile](doh.md#apple-devices-ios-ipados-macos).
 - EDNS Client Subnet is not implemented: a client's option is dropped upstream and cannot be forwarded, since the cache is not keyed per network (RFC 7871 section 7.3).
 - No per-client rules, query log database, or web/API surface; statistics go to the [log](logging.md#stats) and [metrics](metrics.md#metrics).

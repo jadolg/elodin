@@ -39,6 +39,13 @@ Cookie :: struct {
 	// What the server last gave us, empty until it has.
 	server:        [COOKIE_SERVER_MAX]u8,
 	server_len:    int,
+	/*
+	Whether this server has issued a cookie since it was last parked or moved:
+	one that does cookies, whose replies owe one (RFC 7873 section 5.3).
+	Outlives a rollover, which only forgets the server cookie bound to the old
+	client cookie: the server is the same and does cookies still.
+	*/
+	speaks:        bool,
 	// Until when a server cookie forgotten with the client cookie, on a move or
 	// a rollover, may still be on queries waiting for replies, which owe one
 	// (`cookie_matches`); zero once a cookie is learned again. See
@@ -101,7 +108,7 @@ attach_cookie :: proc(
 
 	sync.mutex_lock(&u.mu)
 	if roll && loop.moment_since(u.cookie.roll_at) >= 0 {
-		renew_cookie_locked(u, in_flight)
+		renew_cookie_locked(u, in_flight, moved = false)
 	}
 	u.cookie.out_until = max(u.cookie.out_until, loop.moment_add(loop.moment_now(), in_flight))
 	n += copy(option[:], u.cookie.client[:])
@@ -150,7 +157,7 @@ cookie_matches :: proc(u: ^Upstream, query, response: []u8) -> bool {
 	}
 	sync.mutex_lock(&u.mu)
 	echoed := u.cookie.client
-	held := u.cookie.server_len > 0
+	held := u.cookie.server_len > 0 || u.cookie.speaks
 	moved := cookie_renewed_locked(u)
 	sync.mutex_unlock(&u.mu)
 
@@ -232,13 +239,23 @@ they owe for as long as any of them, or one asked with `in_flight` to spare,
 may wait. Under `u.mu`.
 */
 @(private)
-renew_cookie_locked :: proc(u: ^Upstream, in_flight: time.Duration) {
+renew_cookie_locked :: proc(
+	u: ^Upstream,
+	in_flight: time.Duration,
+	// True for a move, to an address that may be another server and is judged
+	// afresh; false for a rollover, which leaves `speaks` as it is.
+	moved: bool,
+) {
 	if u.cookie.server_len > 0 {
 		// The furthest wait of any query out, not only the caller's: one
 		// with more budget left may outlive the caller's.
 		u.cookie.renewed_until = max(u.cookie.renewed_until, u.cookie.out_until, loop.moment_add(loop.moment_now(), in_flight))
 	}
-	forget_cookie(u)
+	if moved {
+		forget_cookie(u)
+	} else {
+		u.cookie.server_len = 0
+	}
 	init_cookie(u)
 }
 
@@ -256,6 +273,7 @@ The caller holds `u.mu`.
 @(private)
 forget_cookie :: proc(u: ^Upstream) {
 	u.cookie.server_len = 0
+	u.cookie.speaks = false
 }
 
 /*
@@ -293,6 +311,7 @@ learn_cookie :: proc(u: ^Upstream, response: []u8) {
 		return
 	}
 	u.cookie.server_len = copy(u.cookie.server[:], server)
+	u.cookie.speaks = true
 	u.cookie.renewed_until = 0
 }
 

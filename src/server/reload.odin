@@ -4,6 +4,7 @@ import "core:mem/virtual"
 import "core:os"
 import "core:reflect"
 import "core:strings"
+import "core:sync"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
@@ -120,6 +121,11 @@ reload_config :: proc(s: ^Server, path: string) -> (out: Reload_Outcome) {
 	log_file_moved := g.cfg.log.file != cur.cfg.log.file
 
 	swap_generation(s, g, carried)
+	if .Cookie_Secrets in built && cur.cookies != nil {
+		// Only now: before the swap, a cookie under the new secrets handed out
+		// here would be refused by the generation still current.
+		sync.atomic_store(&cur.cookies.successor, g.cookies.secrets)
+	}
 	keep = true
 	out.applied = true
 	// After the swap: a query that pinned the old generation in between would

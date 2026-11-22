@@ -55,8 +55,9 @@ section 5.2.2).
   each rejects the cookies the others issued. elodin never replaces a
   configured secret, since every member has to change it in step: change it
   at least every 36 days (RFC 7873 §7.1). A reload that changes `secret` keeps
-  accepting cookies under the old one for 150 seconds, and under one a
-  rollover retired for the rest of its 150.
+  accepting cookies under the old one for 150 seconds, and under the ones a
+  rollover or an earlier reload retired for the rest of their 150; a fourth
+  secret inside one grace ends the first's early.
 - `previous_secret` is accepted on returned cookies and never issued under. It
   is how a shared secret is changed without turning clients away, in RFC 9018
   §5's three stages, each a reload on every member before the next begins:
@@ -70,7 +71,8 @@ section 5.2.2).
 
 **Upstream.** elodin sends a random client cookie per server plus the server
 cookie that server last issued. The client cookie is drawn afresh after a day
-less up to 40% jitter (RFC 7873 §7.1), and the server cookie is learned again.
+less up to 40% jitter (RFC 7873 §7.1), and the server cookie is learned again;
+until it is, replies from a server that has issued one still owe a cookie.
 
 - A reply whose cookie is not ours is ignored and elodin keeps waiting for the
   real one; answering SERVFAIL would reward the spoofer.

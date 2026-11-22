@@ -726,3 +726,52 @@ test_a_refresh_keeps_to_the_family_it_holds :: proc(t: ^testing.T) {
 	testing.expectf(t, held_err == .None && held >= BOOTSTRAP_MIN_TTL, "a cached address was held %v (%v)", held, held_err)
 	free_all(context.temp_allocator)
 }
+
+/*
+A rollover forgets the server cookie bound to the old client cookie, and not
+that the server does cookies: a query that then goes out with the new client
+cookie alone still owes a cookie on its reply (RFC 7873 section 5.3), where a
+move, to an address that may be another server, is judged afresh.
+*/
+@(test)
+test_a_rollover_keeps_a_server_held_to_cookies :: proc(t: ^testing.T) {
+	u, uerr := make_upstream(config.Upstream_Spec{name = "rolled", kind = .UDP, address = "127.0.0.1", port = 9}, 0, time.Second, cookies = true)
+	if !testing.expectf(t, uerr == .None, "cannot build the member: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+	first, fok := cookied_query(t, u)
+	if !fok {
+		return
+	}
+	sync.mutex_lock(&u.mu)
+	client := u.cookie.client
+	sync.mutex_unlock(&u.mu)
+	taught, tok := cookied_reply(t, first, client)
+	if !tok {
+		return
+	}
+	learn_cookie(u, taught)
+	sync.mutex_lock(&u.mu)
+	u.cookie.roll_at = loop.moment_add(loop.moment_now(), -time.Second)
+	u.cookie.out_until = 0
+	sync.mutex_unlock(&u.mu)
+
+	query, qok := cookied_query(t, u)
+	if !qok {
+		return
+	}
+	sent, carried := dns.peek_edns_option(query, .Cookie)
+	if !testing.expect(t, carried && len(sent) == COOKIE_CLIENT_LEN, "the premise: the query after the rollover carries the new client cookie alone") {
+		return
+	}
+	// Past the window for queries from before the rollover.
+	sync.mutex_lock(&u.mu)
+	u.cookie.renewed_until = 0
+	sync.mutex_unlock(&u.mu)
+	bare, _, bare_err := dns.encode_message(dns.Message{id = 0x6914, flags = {qr = true}, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}, context.temp_allocator)
+	if testing.expectf(t, bare_err == .None, "cannot encode the reply: %v", bare_err) {
+		testing.expect(t, !cookie_matches(u, query, bare), "a cookie-less reply was taken from a server that does cookies, after a rollover")
+	}
+	free_all(context.temp_allocator)
+}
