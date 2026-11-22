@@ -202,7 +202,7 @@ opt_bool :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^bool, path: strin
 		// Named, and with why where it is a form that read as a boolean to
 		// YAML 1.1 and to earlier versions of this reader.
 		_, bool_text := yaml.core_bool(text)
-		errorf(l, "%s.%s: expected true or false, not %q%s", path, key, text, yaml_1_1_hint(child.quoted && bool_text, yaml.yaml_1_1_bool(text)))
+		errorf(l, "%s.%s: expected true or false, not %q%s", path, key, text, yaml_1_1_hint(child.quoted && bool_text, !child.quoted && yaml.yaml_1_1_bool(text)))
 	} else {
 		errorf(l, "%s.%s: expected true or false", path, key)
 	}
@@ -235,7 +235,7 @@ opt_int :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^int, path: string)
 	} else if text, scalar := yaml.as_string(child); scalar {
 		// Named for the same reason as `opt_bool`.
 		_, int_text := yaml.core_int(text)
-		errorf(l, "%s.%s: expected an integer, not %q%s", path, key, text, yaml_1_1_hint(child.quoted && int_text, yaml.yaml_1_1_int(text)))
+		errorf(l, "%s.%s: expected an integer, not %q%s", path, key, text, yaml_1_1_hint(child.quoted && int_text, !child.quoted && yaml.yaml_1_1_int(text)))
 	} else {
 		errorf(l, "%s.%s: expected an integer", path, key)
 	}
@@ -267,7 +267,7 @@ opt_ttl :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^u32, path: string)
 	if !ok || secs < 0 || secs > MAX_TTL {
 		// A TTL may be a duration, quoted or not, so quoting is never why.
 		if text, scalar := yaml.as_string(child); scalar {
-			errorf(l, "%s.%s: expected a TTL of whole seconds from 0 to %d, or a duration such as 5m (RFC 2181 section 8), not %q%s", path, key, MAX_TTL, text, yaml_1_1_hint(false, yaml.yaml_1_1_int(text)))
+			errorf(l, "%s.%s: expected a TTL of whole seconds from 0 to %d, or a duration such as 5m (RFC 2181 section 8), not %q%s", path, key, MAX_TTL, text, yaml_1_1_hint(false, !child.quoted && yaml.yaml_1_1_int(text)))
 		} else {
 			errorf(l, "%s.%s: expected a TTL of whole seconds from 0 to %d, or a duration such as 5m (RFC 2181 section 8)", path, key, MAX_TTL)
 		}

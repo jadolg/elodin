@@ -1801,6 +1801,10 @@ test_yaml_1_1_forms_are_refused_and_a_bom_is_not :: proc(t: ^testing.T) {
 			"listeners:\n  tcp: {enabled: maybe}\n",
 			"listeners:\n  tcp: {enabled: tRUE}\n",
 			"listeners:\n  tcp: {enabled: \"maybe\"}\n",
+			// Quoted 1.1 forms were strings in 1.1 as well: unquoting them is
+			// no fix, so neither hint is given.
+			"listeners:\n  tcp: {enabled: \"yes\"}\n",
+			"listeners:\n  udp: {port: \"3_000\"}\n",
 			"cache:\n  min_ttl: \"500ms\"\n",
 			"cache:\n  min_ttl: \"99999999999\"\n",
 		}) {

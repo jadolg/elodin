@@ -75,8 +75,9 @@ yaml_1_1_bool :: proc(s: string) -> bool {
 /*
 Whether `s` is one of YAML 1.1's integers that 1.2 reads as a string, for a
 refusal to say so: 1.1's `int` type written with `_` separators or as `0b`
-binary, or with a sign before `0x` (1.1's other forms are 1.2 integers too, or
-1.2 reads them as the same decimal).
+binary, or with a sign before `0x`. Two more 1.1 forms are not caught: its
+`0`-led octal, which 1.2 reads as the decimal it looks like (`0755` is 755),
+and its sexagesimal `1:30`, a string in 1.2 that is refused with no hint.
 */
 yaml_1_1_int :: proc(s: string) -> bool {
 	t := s
