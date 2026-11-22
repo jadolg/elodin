@@ -5,11 +5,12 @@ import "core:slice"
 import "core:testing"
 import "core:time"
 
-// A GOAWAY payload: the last stream id and NO_ERROR.
+// A GOAWAY payload: the last stream id and `code`.
 @(private = "file")
-goaway_payload :: proc(last: u32) -> []u8 {
-	p := make([]u8, 8, context.temp_allocator)
+goaway_payload :: proc(last: u32, code := Error_Code.No_Error) -> []u8 {
+	p := make([]u8, GOAWAY_FIXED_SIZE, context.temp_allocator)
 	put_u32(p, last)
+	put_u32(p[4:], u32(code))
 	return p
 }
 
@@ -248,4 +249,41 @@ test_serve_acts_on_no_frame_read_after_a_goaway_sent_from_another_fiber :: proc(
 
 	delete(a.written)
 	conn_done(t, c, &track, "goaway from another fiber")
+}
+
+/*
+RFC 9113 6.8: a GOAWAY with an error code is the peer closing on a failure, not
+draining. Each end answers it and ends the connection at once, open streams or
+not, so the client's requests fail as `Closed` and are asked again elsewhere.
+*/
+@(test)
+test_a_goaway_with_an_error_code_ends_the_connection_at_once :: proc(t: ^testing.T) {
+	{
+		track: mem.Tracking_Allocator
+		allocator := track_allocations(&track)
+		log: Frame_Log
+		c := logged_conn(&log, destroying_handler, allocator)
+		block := request_block()
+		opened := handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 1}, block)
+		testing.expect(t, opened, "handle_headers failed")
+		payload := goaway_payload(1, .Protocol_Error)
+		reading := handle_frame(c, Frame_Header{length = len(payload), type = .Goaway}, payload)
+		testing.expect(t, !reading, "the server kept reading after a GOAWAY with an error code")
+		testing.expect(t, saw_frame(&log, .Goaway) && log.goaway_code == .No_Error, "the server did not answer the GOAWAY")
+		conn_done(t, c, &track, "server, error goaway", &log)
+	}
+	{
+		track: mem.Tracking_Allocator
+		allocator := track_allocations(&track)
+		log: Frame_Log
+		c := logged_client(&log, allocator)
+		s := open_test_stream(c, 1, allocator)
+		payload := goaway_payload(1, .Protocol_Error)
+		reading := client_handle_frame(c, Frame_Header{length = len(payload), type = .Goaway}, payload)
+		testing.expect(t, !reading, "the client kept reading after a GOAWAY with an error code")
+		testing.expect(t, !client_going_away(c), "a GOAWAY with an error code was taken for a drain")
+		delete_key(&c.streams, 1)
+		client_stream_destroy(c, s)
+		client_done(t, c, &track, "client, error goaway", &log)
+	}
 }

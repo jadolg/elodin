@@ -65,7 +65,8 @@ answered; then the listener sends GOAWAY(NO_ERROR) and reads nothing more, and
 the connection closes when the client closes it or at `server.client_timeout`. An upstream's
 GOAWAY takes the connection out of use for new queries, lets the queries at or
 below its last stream id finish, and fails those above it as refused, which are
-asked again on a fresh connection.
+asked again on a fresh connection. A GOAWAY carrying an error code is the peer
+closing on a failure, and ends the connection at once at either end.
 
 A request may end with trailers after its body (RFC 9113 section 8.1). Their
 fields are ignored; trailers that do not carry END_STREAM, or that hold a

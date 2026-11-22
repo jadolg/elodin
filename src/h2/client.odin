@@ -46,8 +46,9 @@ Client :: struct {
 	*/
 	refs:      int,
 	closed:    bool,
-	// The peer sent GOAWAY: no new request goes on the connection, and it
-	// closes once those it may still answer are done. Atomic, as `closed` is.
+	// No new request goes on the connection, after the peer's GOAWAY or once its
+	// stream ids are used up; it closes once those on it are done. Atomic, as
+	// `closed` is.
 	going_away: bool,
 	// The connection ended with INTERNAL_ERROR, for want of memory on this
 	// end: what a request it cut short reports. Under `mu`.
@@ -254,8 +255,8 @@ client_closed :: proc(c: ^Client) -> bool {
 	return sync.atomic_load(&c.closed)
 }
 
-// The peer has sent GOAWAY: the connection takes no new request, though those
-// already on it may still be answered.
+// The connection takes no new request - after the peer's GOAWAY, or once its
+// stream ids are used up - though those already on it may still be answered.
 client_going_away :: proc(c: ^Client) -> bool {
 	return sync.atomic_load(&c.going_away)
 }
@@ -431,6 +432,12 @@ successfully", so those are read to their end. No new request is taken, and
 */
 @(private)
 client_handle_goaway :: proc(c: ^Client, payload: []u8) -> bool {
+	// One with an error code is the peer closing (6.8): answered, and ended, so
+	// every request on it fails at once as `Closed` and is asked again.
+	if Error_Code(read_u32(payload[4:])) != .No_Error {
+		client_goaway(c, .No_Error)
+		return false
+	}
 	last := read_u32(payload) & 0x7fff_ffff
 	loop.lock(&c.mu)
 	defer loop.unlock(&c.mu)

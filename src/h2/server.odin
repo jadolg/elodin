@@ -504,12 +504,21 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		requests the peer has sent are still read and answered, and this end
 		says GOAWAY(NO_ERROR) once the last of them is (`close_stream`).
 		*/
+		// One with an error code is the peer closing (6.8): answered, and ended.
+		if Error_Code(read_u32(payload[4:])) != .No_Error {
+			goaway(c, .No_Error)
+			return false
+		}
 		loop.lock(&c.mu)
 		c.peer_goaway = true
+		frame: [FRAME_HEADER_SIZE + GOAWAY_FIXED_SIZE]u8
 		drained := len(c.streams) == 0
+		if drained {
+			frame, drained = goaway_claim_locked(c, .No_Error)
+		}
 		loop.unlock(&c.mu)
 		if drained {
-			goaway(c, .No_Error)
+			_ = write_all(c, frame[:])
 		}
 		return !drained
 
@@ -1574,8 +1583,21 @@ was_reset_here :: proc(c: ^Conn, stream_id: u32, forget := false) -> bool {
 @(private)
 goaway :: proc(c: ^Conn, code: Error_Code) {
 	loop.lock(&c.mu)
+	frame, claimed := goaway_claim_locked(c, code)
+	loop.unlock(&c.mu)
+	if claimed {
+		_ = write_all(c, frame[:])
+	}
+}
+
+/*
+The one GOAWAY this end sends, claimed under `c.mu`: false when one already was.
+Its last stream id is read in the same hold, so a caller that decided under the
+lock to send it names no stream the reader opened after that decision.
+*/
+@(private)
+goaway_claim_locked :: proc(c: ^Conn, code: Error_Code) -> (frame: [FRAME_HEADER_SIZE + GOAWAY_FIXED_SIZE]u8, claimed: bool) {
 	if c.goaway_sent {
-		loop.unlock(&c.mu)
 		return
 	}
 	sync.atomic_store(&c.goaway_sent, true)
@@ -1585,9 +1607,7 @@ goaway :: proc(c: ^Conn, code: Error_Code) {
 	leaves it out so the client may retry it (RFC 9113 6.8).
 	*/
 	last := c.last_dispatched if code == .Internal_Error else c.last_stream_id
-	loop.unlock(&c.mu)
-	frame := goaway_frame(last, code)
-	_ = write_all(c, frame[:])
+	return goaway_frame(last, code), true
 }
 
 /*
@@ -1804,10 +1824,15 @@ close_stream :: proc(c: ^Conn, stream_id: u32, peer_sending := false) {
 		c.closed_held -= 1
 	}
 	stream_destroy(c, s)
-	drained := c.peer_goaway && len(c.streams) == 0
+	// Claimed in this hold: see `goaway_claim_locked`.
+	frame: [FRAME_HEADER_SIZE + GOAWAY_FIXED_SIZE]u8
+	drained := false
+	if c.peer_goaway && len(c.streams) == 0 {
+		frame, drained = goaway_claim_locked(c, .No_Error)
+	}
 	loop.unlock(&c.mu)
 	if drained {
-		goaway(c, .No_Error)
+		_ = write_all(c, frame[:])
 	}
 }
 
