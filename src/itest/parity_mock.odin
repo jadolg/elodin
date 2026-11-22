@@ -292,8 +292,9 @@ pm_answer :: proc(
 		// TTLs at both ends: zero is legal and means "do not cache", and the
 		// top of the range is where a signed-vs-unsigned slip shows up. For odd
 		// types the second record has the top bit set instead of zero, which
-		// RFC 8767 section 4 reads as positive: next to a zero, the RRset goes
-		// out at zero whichever way it is read.
+		// RFC 8767 section 4 reads as positive, so the RRset goes out at 300; a
+		// zero beside it would take the set to zero however the top bit is
+		// read. Even types keep the zero.
 		ttl := u32(300)
 		switch i {
 		case 1:

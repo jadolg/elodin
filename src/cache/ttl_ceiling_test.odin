@@ -72,6 +72,21 @@ test_a_ttl_with_the_high_bit_set_is_cached_at_max_ttl :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// `cache.min_ttl` still raises a TTL of zero: the operator has said how long
+// the shortest answer this cache keeps is good for.
+@(test)
+test_a_zero_ttl_is_still_raised_by_min_ttl :: proc(t: ^testing.T) {
+	c := make_cache(Options{max_entries = 8, min_ttl = 300, max_ttl = 3600})
+	defer destroy(c)
+
+	ttl, ok := served_ttl(t, c, "floored.example.", 0)
+	if !ok {
+		return
+	}
+	testing.expect_value(t, ttl, u32(300))
+	free_all(context.temp_allocator)
+}
+
 // With no cache, the ceiling is the RFC 8767 section 4 cap.
 @(test)
 test_no_cache_caps_at_the_rfc_8767_figure :: proc(t: ^testing.T) {
