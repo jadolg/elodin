@@ -213,9 +213,8 @@ start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 			return false
 		}
 	}
-	// Last, so that a port clash on an endpoint nobody queries cannot stop the
-	// ones they do from coming up first — and still fatal, because an operator
-	// who turned it on is about to be told the resolver is unmonitored.
+	// Fatal, as nothing is read before every bind has worked: an operator who
+	// turned it on would otherwise be told the resolver is unmonitored.
 	if cfg.metrics.enabled {
 		if !start_metrics(s, l) {
 			return false

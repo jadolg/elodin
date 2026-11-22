@@ -67,7 +67,7 @@ test_a_permanent_entry_leaving_keeps_the_count_honest :: proc(t: ^testing.T) {
 	conn_manager_init(&cm, 1, 0)
 	defer conn_manager_shutdown(&cm)
 
-	// A listener loop, as `start_udp` and `start_stream_listener` register one,
+	// A listener loop, as `arm_udp` and `arm_stream_listener` register one,
 	// that then finishes - which is what shutdown does to all of them.
 	testing.expect_value(t, conn_spawn(&cm, nil, returns_immediately, counted = false), Spawn_Result.Started)
 	testing.expect_value(t, wait_for_active(&cm, 0), 0)
@@ -292,7 +292,7 @@ test_spawn_after_shutdown_is_refused :: proc(t: ^testing.T) {
 	cm: Conn_Manager
 	conn_manager_init(&cm, 4, 0)
 
-	// A listener loop, registered the way start_udp/start_stream_listener do.
+	// A listener loop, registered the way `arm_udp` and `arm_stream_listener` do.
 	listener := Held{}
 	testing.expect_value(t, conn_spawn(&cm, &listener, holds_until_released, counted = false), Spawn_Result.Started)
 

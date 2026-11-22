@@ -12,6 +12,7 @@ import "elodin:filter"
 import "elodin:logx"
 import "elodin:loop"
 import "elodin:metrics"
+import "elodin:netx"
 import "elodin:upstream"
 
 /*
@@ -166,22 +167,6 @@ start_metrics :: proc(s: ^Server, l: ^Listeners) -> bool {
 	l.metrics_socket = sock
 	l.metrics_open = true
 
-	/*
-	Said once, at the volume it deserves.
-
-	Nothing on this endpoint is a secret in the way an answer is, but together
-	the numbers describe a network: how much it queries, how much of that is
-	blocked, which upstreams are reachable, how close the process is to its
-	connection limit. There is no authentication in front of them, so a bind
-	beyond loopback is a decision, and an operator who reached it by copying an
-	address from the DNS listeners above should read this line.
-	*/
-	if !is_loopback(endpoint.address) {
-		logx.warnf(
-			"metrics.address is %s rather than a loopback address: the endpoint is served to anything that can reach it, without authentication",
-			cfg.address,
-		)
-	}
 	return true
 }
 
@@ -207,6 +192,22 @@ arm_metrics :: proc(s: ^Server, l: ^Listeners) -> bool {
 
 	cfg := startup_config(s).metrics
 	logx.infof("serving metrics on %s:%d%s", cfg.address, cfg.port, cfg.path)
+	/*
+	Said once, at the volume it deserves.
+
+	Nothing on this endpoint is a secret in the way an answer is, but together
+	the numbers describe a network: how much it queries, how much of that is
+	blocked, which upstreams are reachable, how close the process is to its
+	connection limit. There is no authentication in front of them, so a bind
+	beyond loopback is a decision, and an operator who reached it by copying an
+	address from the DNS listeners should read this line.
+	*/
+	if !is_loopback(netx.parse_address(cfg.address)) {
+		logx.warnf(
+			"metrics.address is %s rather than a loopback address: the endpoint is served to anything that can reach it, without authentication",
+			cfg.address,
+		)
+	}
 	return true
 }
 

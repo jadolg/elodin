@@ -442,18 +442,17 @@ Nothing is read from a listener before the process is as narrow as it gets
 (#681): every line that says a listener is being read - UDP, TCP and the metrics
 endpoint - comes after the sandbox line and, started as root, after the drop to
 `nobody`. The listeners are bound before both, so a client's bytes wait in the
-kernel instead.
+kernel instead. This orders `run`; that a line is written only once its
+listener reads is `test_a_bound_listener_reads_nothing_until_armed`.
 */
 run_listener_arming_case :: proc(r: ^Runner) {
 	NAME :: "listeners: nothing is read before the privilege drop and the sandbox (#681)"
 	mode := suite_sandbox(r)
-	if mode == "off" {
-		skip_case(r, NAME, "the suite runs with the sandbox off, so there is no sandbox line to order by")
-		return
-	}
 	start_case(r, NAME)
 	defer end_case(r)
-	root := posix.geteuid() == 0
+	// Without a `nobody` account the drop cannot be asked for; the sandbox
+	// line still orders the case.
+	root := posix.geteuid() == 0 && posix.getpwnam("nobody") != nil
 	udp_port, tcp_port, metrics_port := next_port(r), next_port(r), next_port(r)
 	user := "\n  user: nobody" if root else ""
 	config := base_config(

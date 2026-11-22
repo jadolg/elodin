@@ -383,9 +383,9 @@ suite neither races the process nor pays for a fixed delay.
 One probe per endpoint the case named, because the listeners come up in
 sequence and not together: `arm_listeners` starts reading udp, then tcp, then
 dot, then doh, so an answer over UDP says only that the first of them is serving.
-Whichever endpoint a case dials first is the one that decides whether it is
-racing that start, and for the TLS endpoints losing that race is not a lone red
-case - the dial fails, and every case behind it in the group fails with it.
+Every port is bound before any is read, so a case that dials an endpoint not yet
+read is queued rather than refused, and its handshake or query waits on the
+start.
 */
 start_server :: proc(r: ^Runner, opts: Server_Options) -> (srv: Server, ok: bool) {
 	srv = start_server_raw(r, opts.config, opts.udp_port, opts.allow_fetch, opts.verbatim, opts.env, opts.wrap) or_return
