@@ -1,5 +1,6 @@
 package tlsx
 
+import "core:bytes"
 import "core:c"
 import "core:fmt"
 import "core:mem"
@@ -1633,4 +1634,163 @@ test_idle_connections_release_their_record_buffers :: proc(t: ^testing.T) {
 		}
 		testing.expectf(t, slice.equal(out, back), "round %d: the bytes did not come back intact", round)
 	}
+}
+
+/*
+RFC 6066 section 3: "Literal IPv4 and IPv6 addresses are not permitted in
+"HostName"." A name goes out as SNI; an address does not, and is still checked
+against the certificate's IP SAN.
+*/
+
+@(private = "file")
+Hello_Capture :: struct {
+	listener: net.TCP_Socket,
+	hello:    [4096]u8,
+	n:        int,
+}
+
+// Reads the first TLS record a client sends, its ClientHello, and hangs up.
+@(private = "file")
+capture_hello :: proc(c: ^Hello_Capture) {
+	sock, _, err := net.accept_tcp(c.listener)
+	if err != nil {
+		return
+	}
+	defer net.close(sock)
+	_ = net.set_option(sock, .Receive_Timeout, 10 * time.Second) // lint:allow discard: a failed timeout only lengthens a failing test
+	for c.n < len(c.hello) {
+		got, rerr := net.recv_tcp(sock, c.hello[c.n:])
+		if rerr != nil || got == 0 {
+			return
+		}
+		c.n += got
+		// A record header is 5 bytes, its length in the last two.
+		if c.n >= 5 && c.n >= 5 + (int(c.hello[3]) << 8 | int(c.hello[4])) {
+			return
+		}
+	}
+}
+
+// Whether a ClientHello record carries the server_name extension (type 0,
+// RFC 6066 section 3); `ok` false when the record does not parse that far.
+@(private = "file")
+has_server_name :: proc(record: []u8) -> (found, ok: bool) {
+	u16_at :: proc(b: []u8, i: int) -> int {
+		return int(b[i]) << 8 | int(b[i + 1])
+	}
+	// Record header 5, handshake header 4, version 2, random 32.
+	i := 5 + 4 + 2 + 32
+	if len(record) < i + 1 {
+		return
+	}
+	i += 1 + int(record[i]) // session id
+	if len(record) < i + 2 {
+		return
+	}
+	i += 2 + u16_at(record, i) // cipher suites
+	if len(record) < i + 1 {
+		return
+	}
+	i += 1 + int(record[i]) // compression methods
+	if len(record) < i + 2 {
+		return
+	}
+	end := i + 2 + u16_at(record, i)
+	i += 2
+	if end > len(record) {
+		return
+	}
+	for i + 4 <= end {
+		if u16_at(record, i) == 0 {
+			return true, true
+		}
+		i += 4 + u16_at(record, i + 2)
+	}
+	return false, i == end
+}
+
+// The ClientHello `client_connect` sends for `hostname`.
+@(private = "file")
+hello_for :: proc(t: ^testing.T, hostname: string) -> (hello: []u8, ok: bool) {
+	listener, bound, listening := listen_loopback(t)
+	if !listening {
+		return nil, false
+	}
+	defer net.close(listener)
+	cctx, cerr := client_context(false)
+	if !testing.expectf(t, cerr == .None, "client_context: %v", cerr) {
+		return nil, false
+	}
+	defer context_destroy(cctx)
+
+	// So a dial that never arrives cannot hold the accept forever.
+	if !testing.expect(t, net.set_option(listener, .Receive_Timeout, 10 * time.Second) == nil, "cannot bound the accept") {
+		return nil, false
+	}
+	capture := new(Hello_Capture, context.temp_allocator)
+	capture.listener = listener
+	worker := thread.create_and_start_with_poly_data(capture, capture_hello)
+	sock, derr := net.dial_tcp_from_endpoint(bound)
+	if !testing.expectf(t, derr == nil, "cannot dial: %v", derr) {
+		thread.join(worker)
+		thread.destroy(worker)
+		return nil, false
+	}
+	_ = net.set_option(sock, .Receive_Timeout, 10 * time.Second) // lint:allow discard: a failed timeout only lengthens a failing test
+	// The peer hangs up after the ClientHello, so the handshake fails; only
+	// what was sent matters.
+	if conn, err := client_connect(cctx, sock, hostname); err == .None {
+		close(conn)
+	} else {
+		net.close(sock)
+	}
+	thread.join(worker)
+	thread.destroy(worker)
+	if !testing.expectf(t, capture.n > 5 && capture.hello[0] == 22, "%s: no ClientHello arrived (%d bytes)", hostname, capture.n) {
+		return nil, false
+	}
+	return capture.hello[:capture.n], true
+}
+
+@(test)
+test_an_address_is_sent_no_sni :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+	Row :: struct {
+		hostname: string,
+		sni:      bool,
+	}
+	rows := []Row{{hostname = "localhost", sni = true}, {hostname = "127.0.0.1", sni = false}, {hostname = "::1", sni = false}}
+	for row in rows {
+		hello, ok := hello_for(t, row.hostname)
+		if !ok {
+			continue
+		}
+		sent, parsed := has_server_name(hello)
+		if !testing.expectf(t, parsed, "%s: the ClientHello does not parse", row.hostname) {
+			continue
+		}
+		testing.expectf(t, sent == row.sni, "%s: server_name sent %v, want %v", row.hostname, sent, row.sni)
+		// And the control's extension is the name itself.
+		if row.sni {
+			testing.expectf(t, bytes.contains(hello, transmute([]u8)row.hostname), "%s: server_name sent without the name", row.hostname)
+		}
+	}
+	free_all(context.temp_allocator)
+}
+
+// The certificate carries IP:127.0.0.1 (`ELODIN_SAN`): an address is still
+// verified, and one the certificate does not carry is refused.
+@(test)
+test_an_address_is_still_verified_against_the_certificate :: proc(t: ^testing.T) {
+	posix.sigignore(.SIGPIPE)
+	right, ran := verified_handshake(t, "127.0.0.1")
+	if !ran {
+		return
+	}
+	testing.expect_value(t, right, Error.None)
+	wrong, ran2 := verified_handshake(t, "127.0.0.2")
+	if !ran2 {
+		return
+	}
+	testing.expectf(t, wrong != .None, "a certificate without 127.0.0.2 was accepted for it")
 }

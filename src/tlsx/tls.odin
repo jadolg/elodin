@@ -12,6 +12,7 @@ import "core:sys/linux"
 import "core:sys/posix"
 import "core:time"
 import "elodin:loop"
+import "elodin:netx"
 
 Error :: enum u8 {
 	None,
@@ -815,7 +816,8 @@ socket_fd :: proc(s: net.TCP_Socket) -> c.int {
 Wrap a connected socket in a TLS client session.
 
 `hostname` is used both for SNI and, when the context verifies, for certificate
-name checking. Pass "" only for an unverified context.
+name checking; an IP address is checked against the certificate and sent no
+SNI. Pass "" only for an unverified context.
 */
 client_connect :: proc(ctx: ^Context, socket: net.TCP_Socket, hostname: string, allocator := context.allocator) -> (conn: ^Conn, err: Error) {
 	/*
@@ -856,10 +858,14 @@ client_connect :: proc(ctx: ^Context, socket: net.TCP_Socket, hostname: string, 
 		}
 		chost := strings.clone_to_cstring(hostname, context.temp_allocator)
 
-		// Fatal rather than best-effort: a server that picks its certificate by
-		// SNI sends the wrong one when the extension is missing, and the name
-		// check below then fails in a way that reads as the peer's fault.
-		if !ssl_set_tlsext_host_name(ssl, chost) {
+		// No SNI for an address: "Literal IPv4 and IPv6 addresses are not
+		// permitted in "HostName"" (RFC 6066 section 3). `SSL_set1_host` below
+		// still checks the address against the certificate's IP SAN. For a
+		// name, fatal rather than best-effort: a server that picks its
+		// certificate by SNI sends the wrong one when the extension is missing,
+		// and the name check below then fails in a way that reads as the peer's
+		// fault.
+		if netx.parse_address(hostname) == nil && !ssl_set_tlsext_host_name(ssl, chost) {
 			SSL_free(ssl)
 			return nil, .Handshake_Failed
 		}
