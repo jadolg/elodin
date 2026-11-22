@@ -198,6 +198,10 @@ opt_bool :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^bool, path: strin
 	}
 	if v, ok := yaml.as_bool(child); ok {
 		dst^ = v
+	} else if text, scalar := yaml.as_string(child); scalar {
+		// Named, since `yes`, `on` and quoted forms read as booleans to YAML
+		// 1.1 and to earlier versions of this reader.
+		errorf(l, "%s.%s: expected true or false, unquoted, not %q (YAML 1.2)", path, key, text)
 	} else {
 		errorf(l, "%s.%s: expected true or false", path, key)
 	}
@@ -211,6 +215,10 @@ opt_int :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^int, path: string)
 	}
 	if v, ok := yaml.as_int(child); ok {
 		dst^ = int(v)
+	} else if text, scalar := yaml.as_string(child); scalar {
+		// Named for the same reason as `opt_bool`: `3_000`, `0b...` and a
+		// quoted number are YAML 1.1 integers, and strings in 1.2.
+		errorf(l, "%s.%s: expected an integer, unquoted, not %q (YAML 1.2)", path, key, text)
 	} else {
 		errorf(l, "%s.%s: expected an integer", path, key)
 	}
@@ -229,7 +237,7 @@ opt_ttl :: proc(l: ^Loader, n: ^yaml.Node, key: string, dst: ^u32, path: string)
 	if yaml.is_null(child) {
 		return
 	}
-	// A YAML integer of seconds ("3_600" and "0x12c" included), or a duration
+	// A YAML 1.2 integer of seconds ("0x12c" included), or a duration
 	// such as "5m" that comes to whole seconds: a fraction has no TTL to be, and
 	// cut off it sends "500ms" as 0.
 	secs, ok := yaml.as_int(child)

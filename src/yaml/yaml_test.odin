@@ -1009,3 +1009,97 @@ test_hex_escapes_are_code_points_of_hex_digits :: proc(t: ^testing.T) {
 		free_all(context.temp_allocator)
 	}
 }
+
+/*
+YAML 1.2.2 section 10.3.2, the core schema: a boolean is `true`, `True`,
+`TRUE`, `false`, `False` or `FALSE`, and an integer `[-+]? [0-9]+`, `0o [0-7]+`
+or `0x [0-9a-fA-F]+`, plain. YAML 1.1's forms and anything quoted are strings.
+*/
+@(test)
+test_booleans_and_integers_are_yaml_1_2_core :: proc(t: ^testing.T) {
+	Bool_Case :: struct {
+		src:  string,
+		want: bool,
+		ok:   bool,
+	}
+	for c in ([]Bool_Case {
+			{"true", true, true},
+			{"True", true, true},
+			{"TRUE", true, true},
+			{"false", false, true},
+			{"False", false, true},
+			{"FALSE", false, true},
+			{"tRUE", false, false},
+			{"yes", false, false},
+			{"no", false, false},
+			{"on", false, false},
+			{"off", false, false},
+			{"y", false, false},
+			{"n", false, false},
+			{"\"true\"", false, false},
+			{"'false'", false, false},
+		}) {
+		doc, err := parse(strings.concatenate({"k: ", c.src, "\n"}, context.temp_allocator), context.temp_allocator)
+		if !testing.expectf(t, err == nil, "%s: %v", c.src, err) {
+			continue
+		}
+		v, ok := as_bool(get(doc, "k"))
+		testing.expectf(t, ok == c.ok && v == c.want, "%s read as %v (%v), want %v (%v)", c.src, v, ok, c.want, c.ok)
+	}
+
+	Int_Case :: struct {
+		src:  string,
+		want: i64,
+		ok:   bool,
+	}
+	for c in ([]Int_Case {
+			{"38053", 38053, true},
+			{"+5", 5, true},
+			{"-7", -7, true},
+			{"007", 7, true},
+			{"0x12c", 300, true},
+			{"0x12C", 300, true},
+			{"0o454", 300, true},
+			{"3_8053", 0, false},
+			{"0b101", 0, false},
+			{"+0x35", 0, false},
+			{"-0o7", 0, false},
+			{"0X12c", 0, false},
+			{"0O454", 0, false},
+			{"\"53\"", 0, false},
+			{"'0x35'", 0, false},
+			{"0x", 0, false},
+			{"+", 0, false},
+			{"9223372036854775807", max(i64), true},
+			{"-9223372036854775808", min(i64), true},
+			{"9223372036854775808", 0, false},
+		}) {
+		doc, err := parse(strings.concatenate({"k: ", c.src, "\n"}, context.temp_allocator), context.temp_allocator)
+		if !testing.expectf(t, err == nil, "%s: %v", c.src, err) {
+			continue
+		}
+		v, ok := as_int(get(doc, "k"))
+		testing.expectf(t, ok == c.ok && v == c.want, "%s read as %d (%v), want %d (%v)", c.src, v, ok, c.want, c.ok)
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
+YAML 1.2.2 section 9.1.1: a document may open with a byte order mark, which is
+not content, so a file an editor saved with one reads as the same mapping. A
+BOM anywhere else is content still.
+*/
+@(test)
+test_a_leading_byte_order_mark_is_not_content :: proc(t: ^testing.T) {
+	doc, err := parse(BYTE_ORDER_MARK + "listeners:\n  port: 53\n", context.temp_allocator)
+	if testing.expectf(t, err == nil, "a BOM-led document was refused: %v", err) {
+		port, ok := as_int(get(get(doc, "listeners"), "port"))
+		testing.expectf(t, ok && port == 53, "listeners.port read as %d (%v) behind a BOM", port, ok)
+	}
+	inner, ierr := parse("k: " + BYTE_ORDER_MARK + "v\n", context.temp_allocator)
+	if testing.expectf(t, ierr == nil, "a BOM in a value was refused: %v", ierr) {
+		v, ok := as_string(get(inner, "k"))
+		testing.expectf(t, ok && v == BYTE_ORDER_MARK + "v", "a BOM inside a value was taken out: %q", v)
+	}
+	free_all(context.temp_allocator)
+}

@@ -47,53 +47,47 @@ as_string :: proc(n: ^Node) -> (string, bool) {
 	return n.scalar, true
 }
 
+/*
+A boolean as YAML 1.2's core schema has it (1.2.2 section 10.3.2): `true`,
+`True`, `TRUE`, `false`, `False` or `FALSE`, plain. YAML 1.1's `yes`, `on` and
+`y` are strings in 1.2, and so is anything quoted.
+*/
 as_bool :: proc(n: ^Node) -> (bool, bool) {
 	s, ok := as_string(n)
-	if !ok {
+	if !ok || n.quoted {
 		return false, false
 	}
-	// An ASCII fold: `strings.to_lower` maps other letters (`İ`, U+0130) onto ASCII ones.
-	folded: [len("false")]u8
-	if len(s) > len(folded) {
-		return false, false
-	}
-	for c, i in transmute([]u8)s {
-		folded[i] = c + 32 if c >= 'A' && c <= 'Z' else c
-	}
-	switch string(folded[:len(s)]) {
-	case "true", "yes", "on", "y":
+	switch s {
+	case "true", "True", "TRUE":
 		return true, true
-	case "false", "no", "off", "n":
+	case "false", "False", "FALSE":
 		return false, true
 	}
 	return false, false
 }
 
+/*
+An integer as YAML 1.2's core schema has it (1.2.2 section 10.3.2), plain:
+`[-+]? [0-9]+`, `0o [0-7]+` or `0x [0-9a-fA-F]+`, and no wider than an i64.
+YAML 1.1's `_` separators, `0b` and a sign before a base prefix are strings in
+1.2, and so is anything quoted.
+*/
 as_int :: proc(n: ^Node) -> (i64, bool) {
 	s, ok := as_string(n)
-	if !ok {
+	if !ok || n.quoted {
 		return 0, false
 	}
-	s = strings.trim_space(s)
 	neg := false
-	if strings.has_prefix(s, "-") {
-		neg = true
-		s = s[1:]
-	} else if strings.has_prefix(s, "+") {
-		s = s[1:]
-	}
 	base := 10
 	switch {
-	case strings.has_prefix(s, "0x"), strings.has_prefix(s, "0X"):
+	case strings.has_prefix(s, "0x"):
 		base, s = 16, s[2:]
-	case strings.has_prefix(s, "0o"), strings.has_prefix(s, "0O"):
+	case strings.has_prefix(s, "0o"):
 		base, s = 8, s[2:]
-	case strings.has_prefix(s, "0b"), strings.has_prefix(s, "0B"):
-		base, s = 2, s[2:]
-	}
-	// YAML allows digit grouping with underscores.
-	if strings.contains(s, "_") {
-		s, _ = strings.remove_all(s, "_", context.temp_allocator)
+	case strings.has_prefix(s, "-"):
+		neg, s = true, s[1:]
+	case strings.has_prefix(s, "+"):
+		s = s[1:]
 	}
 	// Guarded before each step, as `as_bytes` is: strconv wraps silently, which
 	// reads "18446744073709551617" as 1 and lets it past any range a caller

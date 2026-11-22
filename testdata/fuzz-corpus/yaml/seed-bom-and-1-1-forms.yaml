@@ -1,0 +1,3 @@
+﻿listeners:
+  udp: {port: 0x35, enabled: True}
+  tcp: {enabled: "yes", port: 3_8053}

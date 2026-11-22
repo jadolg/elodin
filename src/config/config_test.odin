@@ -1762,3 +1762,37 @@ test_keywords_fold_ascii_only :: proc(t: ^testing.T) {
 	)
 	free_all(context.temp_allocator)
 }
+
+/*
+YAML 1.2's core schema decides what is a boolean and what is an integer (1.2.2
+section 10.3.2): `yes`, `on`, `3_000`, `0b...` and anything quoted are strings,
+so where a boolean or a number belongs they are refused, and the refusal names
+what was written. A file an editor saved with a byte order mark loads.
+*/
+@(test)
+test_yaml_1_1_forms_are_refused_and_a_bom_is_not :: proc(t: ^testing.T) {
+	Case :: struct {
+		doc:  string,
+		path: string,
+		want: string,
+	}
+	for c in ([]Case {
+			{"listeners:\n  tcp: {enabled: n}\n", "listeners.tcp.enabled", "not \"n\""},
+			{"listeners:\n  tcp: {enabled: yes}\n", "listeners.tcp.enabled", "not \"yes\""},
+			{"listeners:\n  tcp: {enabled: \"false\"}\n", "listeners.tcp.enabled", "not \"false\""},
+			{"listeners:\n  udp: {port: 3_8053}\n", "listeners.udp.port", "not \"3_8053\""},
+			{"listeners:\n  udp: {port: \"53\"}\n", "listeners.udp.port", "not \"53\""},
+			{"cache:\n  max_entries: 0b10011100010000\n", "cache.max_entries", "expected an integer"},
+			{"cache:\n  max_entries: +0x10\n", "cache.max_entries", "expected an integer"},
+		}) {
+		expect_refused(t, strings.concatenate({MINIMAL, c.doc}, context.temp_allocator), c.path, c.want)
+	}
+	// The 1.2 forms of each load.
+	expect_loads(t, MINIMAL + "listeners:\n  tcp: {enabled: False}\n  udp: {port: 0x35}\n")
+
+	cfg, err := load_string("\xef\xbb\xbf" + MINIMAL + "listeners:\n  udp: {port: 5353}\n", context.temp_allocator)
+	if testing.expectf(t, err == nil, "a file opening with a BOM was refused: %v", err) {
+		testing.expect_value(t, cfg.listeners.udp.port, 5353)
+	}
+	free_all(context.temp_allocator)
+}

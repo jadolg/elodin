@@ -76,6 +76,9 @@ Parser :: struct {
 	err:       Maybe(Error),
 }
 
+// U+FEFF in UTF-8.
+BYTE_ORDER_MARK :: "\xef\xbb\xbf"
+
 parse :: proc(src: string, allocator := context.allocator) -> (root: ^Node, err: Maybe(Error)) {
 	p := Parser {
 		allocator = allocator,
@@ -83,7 +86,9 @@ parse :: proc(src: string, allocator := context.allocator) -> (root: ^Node, err:
 	}
 	defer delete(p.lines)
 
-	scan_lines(&p, src) or_return
+	// YAML 1.2.2 section 9.1.1: a document may open with a byte order mark,
+	// which is not content. One elsewhere is.
+	scan_lines(&p, strings.trim_prefix(src, BYTE_ORDER_MARK)) or_return
 
 	if len(p.lines) == 0 {
 		return new_mapping(&p), nil
