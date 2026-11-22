@@ -230,10 +230,14 @@ if [ -d /run/systemd/system ] && systemctl is-active elodin.service >/dev/null 2
     cat >&2 <<'MSG'
 
 The running elodin has been left alone, because this version of elodin fails
-its check above with /etc/elodin/elodin.yaml. Correct what it names, then
-finish the upgrade with:
+its check above with /etc/elodin/elodin.yaml. Correct what it names, then run
+whichever was under way: an upgrade or install is finished with
 
   sudo dpkg --configure -a
+
+and a reconfiguration is run again with
+
+  sudo dpkg-reconfigure elodin
 MSG
     exit 1
 fi

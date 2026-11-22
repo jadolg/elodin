@@ -1784,7 +1784,10 @@ test_yaml_1_1_forms_are_refused_and_a_bom_is_not :: proc(t: ^testing.T) {
 			{"listeners:\n  udp: {port: \"53\"}\n", "listeners.udp.port", "not \"53\""},
 			{"cache:\n  max_entries: 0b10011100010000\n", "cache.max_entries", "a YAML 1.1 form"},
 			{"cache:\n  max_entries: +0x10\n", "cache.max_entries", "a YAML 1.1 form"},
-			{"listeners:\n  udp: {port: \"53\"}\n", "listeners.udp.port", "quoted, so a string"},
+			{"listeners:\n  udp: {port: \"53\"}\n", "listeners.udp.port", "quoted or a block scalar, so a string"},
+			{"listeners:\n  udp:\n    port: |-\n      53\n", "listeners.udp.port", "quoted or a block scalar, so a string"},
+			{"listeners:\n  udp: {port: 0X35}\n", "listeners.udp.port", "read by earlier versions of elodin"},
+			{"listeners:\n  tcp: {enabled: tRUE}\n", "listeners.tcp.enabled", "read by earlier versions of elodin"},
 			{"listeners:\n  tcp: {enabled: yes}\n", "listeners.tcp.enabled", "a YAML 1.1 form"},
 			{"rewrites:\n  - {domain: a.test, answer: 192.0.2.1, ttl: 3_600}\n", "rewrites[0].ttl", "not \"3_600\" (a YAML 1.1 form"},
 		}) {
@@ -1799,7 +1802,6 @@ test_yaml_1_1_forms_are_refused_and_a_bom_is_not :: proc(t: ^testing.T) {
 			"listeners:\n  udp: {port: ab_cd}\n",
 			"listeners:\n  udp: {port: 0bad}\n",
 			"listeners:\n  tcp: {enabled: maybe}\n",
-			"listeners:\n  tcp: {enabled: tRUE}\n",
 			"listeners:\n  tcp: {enabled: \"maybe\"}\n",
 			// Quoted 1.1 forms were strings in 1.1 as well: unquoting them is
 			// no fix, so neither hint is given.
