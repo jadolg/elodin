@@ -1095,16 +1095,58 @@ test_a_200_writes_its_fields_in_one_order :: proc(t: ^testing.T) {
 		net.close(accepted)
 		testing.expect(t, written, "the 200 was not written")
 
-		// The date is the clock's; `http_date` has a test of its own.
 		got, _ := read_until_close(client, 3 * time.Second)
-		if at := strings.index(got, "\r\nDate: "); at >= 0 {
-			end := strings.index(got[at + 2:], "\r\n")
-			if end >= 0 {
-				got = strings.concatenate({got[:at], "\r\nDate: D", got[at + 2 + end:]}, context.temp_allocator)
-			}
-		}
+		got = mask_date(got)
 		testing.expectf(t, got == c.want, "head=%v:\n got %q\nwant %q", c.head, got, c.want)
 	}
+}
+
+// `reply` with its Date field's value replaced by `D`: the date is the clock's,
+// and `http_date` has a test of its own.
+@(private = "file")
+mask_date :: proc(reply: string) -> string {
+	at := strings.index(reply, "\r\nDate: ")
+	if at < 0 {
+		return reply
+	}
+	end := strings.index(reply[at + 2:], "\r\n")
+	if end < 0 {
+		return reply
+	}
+	return strings.concatenate({reply[:at], "\r\nDate: D", reply[at + 2 + end:]}, context.temp_allocator)
+}
+
+/*
+A refusal - from DoH or the metrics endpoint - in one order of fields, with a
+Date (RFC 9110 6.6.1) on a GET and a HEAD alike, and to a HEAD the fields alone.
+*/
+@(test)
+test_a_refusal_writes_its_fields_in_one_order :: proc(t: ^testing.T) {
+	Case :: struct {
+		status:           int,
+		message, allow:   string,
+		keep_alive, head: bool,
+		want:             string,
+	}
+	cases := []Case {
+		{status = 404, message = "not found", keep_alive = true, want = "HTTP/1.1 404 not found\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nDate: D\r\nConnection: keep-alive\r\n\r\nnot found\n"},
+		{status = 405, message = "method not allowed", allow = "GET, HEAD", head = true, want = "HTTP/1.1 405 method not allowed\r\nContent-Type: text/plain\r\nDate: D\r\nConnection: close\r\nAllow: GET, HEAD\r\n\r\n"},
+	}
+	for c in cases {
+		client, accepted, paired := loopback_tcp_pair(t)
+		if !paired {
+			return
+		}
+		defer net.close(client)
+		// What it returns is whether the connection stays open.
+		kept := send_http_error(Conn{socket = accepted}, "doh", c.status, c.message, c.keep_alive, allow = c.allow, head = c.head)
+		net.close(accepted)
+		testing.expectf(t, kept == c.keep_alive, "status %d: kept %v, want %v", c.status, kept, c.keep_alive)
+		got, err := read_until_close(client, 3 * time.Second)
+		testing.expectf(t, err == nil, "the refusal was not read: %v", err)
+		testing.expectf(t, mask_date(got) == c.want, "status %d:\n got %q\nwant %q", c.status, mask_date(got), c.want)
+	}
+	free_all(context.temp_allocator)
 }
 
 @(private = "file")

@@ -1557,6 +1557,8 @@ send_http_ok :: proc(
 // `head` is its fields alone (RFC 9112 6.3): text after them would be read as
 // the start of the next reply on the connection. It carries no Content-Length
 // either, which RFC 9110 8.6 allows only when it is what GET would have sent.
+// Every refusal carries a Date, which RFC 9110 6.6.1 requires on a 4xx from a
+// server with a clock, and allows on a 5xx.
 @(private)
 send_http_error :: proc(
 	conn: Conn,
@@ -1577,6 +1579,8 @@ send_http_error :: proc(
 		strings.write_string(&b, "\r\nContent-Length: ")
 		strings.write_int(&b, len(message) + 1)
 	}
+	strings.write_string(&b, "\r\nDate: ")
+	strings.write_string(&b, now_http_date(context.temp_allocator))
 	strings.write_string(&b, "\r\nConnection: ")
 	strings.write_string(&b, "keep-alive" if keep_alive else "close")
 	if allow != "" {

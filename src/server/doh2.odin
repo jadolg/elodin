@@ -432,11 +432,14 @@ h2_answer :: proc(data: rawptr, pool := dnssec.Walk_Pool.Shared) {
 
 /*
 `h2.respond`, with the `server` field `server.identity` decides: `H2_SERVER_FIELD`
-on every response under `version`, and none under any other setting.
+on every response under `version`, and none under any other setting. Every
+response carries a `date`, which RFC 9110 6.6.1 requires on a 2xx, 3xx or 4xx
+from a server with a clock.
 */
 @(private)
 h2_respond :: proc(ctx: ^H2_Context, hc: ^h2.Conn, stream_id: u32, resp: h2.Response) {
 	resp := resp
+	resp.date = now_http_date(context.temp_allocator)
 	if server_field(ctx.server) != "" {
 		resp.server = H2_SERVER_FIELD
 	}

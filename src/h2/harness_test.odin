@@ -156,6 +156,46 @@ logged_client :: proc(log: ^Frame_Log, allocator := context.allocator) -> ^Clien
 	return client_make(IO{user = log, read = no_read, write = log_write}, allocator)
 }
 
+@(private)
+Header_Log :: struct {
+	block: [dynamic]u8,
+}
+
+// Keeps the header block of the first HEADERS frame written.
+@(private)
+log_headers :: proc(user: rawptr, buf: []u8) -> bool {
+	log := cast(^Header_Log)user
+	pos := 0
+	if len(buf) >= len(PREFACE) && string(buf[:len(PREFACE)]) == PREFACE {
+		pos = len(PREFACE)
+	}
+	for pos + FRAME_HEADER_SIZE <= len(buf) {
+		h, ok := parse_frame_header(buf[pos:])
+		if !ok || pos + FRAME_HEADER_SIZE + h.length > len(buf) {
+			break
+		}
+		if h.type == .Headers && len(log.block) == 0 {
+			append(&log.block, ..buf[pos + FRAME_HEADER_SIZE:pos + FRAME_HEADER_SIZE + h.length])
+		}
+		pos += FRAME_HEADER_SIZE + h.length
+	}
+	return true
+}
+
+// The value of `name` in the logged header block; "" when it is absent.
+@(private)
+logged_field :: proc(log: ^Header_Log, name: string) -> (value: string, err: Hpack_Error) {
+	table: Dynamic_Table
+	dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, context.temp_allocator)
+	headers := decode(&table, log.block[:], context.temp_allocator) or_return
+	for f in headers {
+		if f.name == name {
+			return f.value, .None
+		}
+	}
+	return "", .None
+}
+
 // Ends a tracked server test: the log, the connection, then the leak check.
 @(private)
 conn_done :: proc(t: ^testing.T, c: ^Conn, track: ^mem.Tracking_Allocator, what: string, log: ^Frame_Log = nil, loc := #caller_location) {

@@ -26,6 +26,9 @@ listeners:
   `cache.max_ttl` (7 days with the cache off). For a denial (NXDOMAIN, NODATA, or NODATA after a CNAME) it
   is also capped by the SOA's MINIMUM (RFC 8484 section 5.1), and it is 0 when
   there is no SOA.
+- Every final response, on either version and from the metrics endpoint too,
+  carries a `Date` (RFC 9110 section 6.6.1), refusals included. The interim
+  `100 Continue` does not; the RFC leaves that optional.
 
 HTTP/2 limits, per connection:
 

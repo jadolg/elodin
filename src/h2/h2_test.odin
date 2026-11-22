@@ -414,6 +414,32 @@ test_answered_request_gives_its_charge_back :: proc(t: ^testing.T) {
 }
 
 /*
+A response's `date` goes out as the `date` field (RFC 9110 6.6.1), and a
+response without one sends none.
+*/
+@(test)
+test_a_response_carries_the_date_it_is_given :: proc(t: ^testing.T) {
+	Case :: struct {
+		date, want: string,
+	}
+	cases := []Case{{date = "Sun, 22 Nov 2026 08:49:37 GMT", want = "Sun, 22 Nov 2026 08:49:37 GMT"}, {date = "", want = ""}}
+	for c in cases {
+		track: mem.Tracking_Allocator
+		allocator := track_allocations(&track)
+		log := Header_Log {
+			block = make([dynamic]u8, 0, 128, context.temp_allocator),
+		}
+		conn := make_conn(IO{user = &log, read = no_read, write = log_headers}, ignore_request, nil, allocator)
+		testing.expect(t, respond(conn, 1, Response{status = 404, date = c.date}), "the response was not written")
+		got, err := logged_field(&log, "date")
+		testing.expectf(t, err == .None, "the response's header block does not decode: %v", err)
+		testing.expectf(t, got == c.want, "date field %q, want %q", got, c.want)
+		conn_done(t, conn, &track, "dated response")
+	}
+	free_all(context.temp_allocator)
+}
+
+/*
 RFC 9113 6.1: DATA is only ever sent on a stream, never on the connection
 control stream, so one arriving with stream_id 0 is a connection error of
 type PROTOCOL_ERROR. `handle_headers` already checks this; `handle_data` did
