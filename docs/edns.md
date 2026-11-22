@@ -55,7 +55,8 @@ section 5.2.2).
   each rejects the cookies the others issued. elodin never replaces a
   configured secret, since every member has to change it in step: change it
   at least every 36 days (RFC 7873 §7.1). A reload that changes `secret` keeps
-  accepting cookies under the old one for 150 seconds.
+  accepting cookies under the old one for 150 seconds, and under one a
+  rollover retired for the rest of its 150.
 - `previous_secret` is accepted on returned cookies and never issued under. It
   is how a shared secret is changed without turning clients away, in RFC 9018
   §5's three stages, each a reload on every member before the next begins:

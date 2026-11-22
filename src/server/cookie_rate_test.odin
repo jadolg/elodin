@@ -56,7 +56,7 @@ issued_to :: proc(k: ^Cookie_Keeper, client: net.Endpoint) -> [COOKIE_REPLY_LEN]
 test_a_cookie_client_is_not_dropped_with_a_flood_naming_its_prefix :: proc(t: ^testing.T) {
 	r := make_rate_limiter(RATE, 0)
 	defer destroy_rate_limiter(r)
-	k := Cookie_Keeper{slots = {0 = {key = SECRET}}}
+	k := secret_keeper(SECRET)
 
 	client := net.Endpoint{address = net.IP4_Address{203, 0, 113, 7}, port = 30000}
 	spoofed := net.Endpoint{address = net.IP4_Address{203, 0, 113, 99}, port = 40000}
@@ -105,7 +105,7 @@ empty the slip's verdict stands.
 test_a_cookie_client_spends_the_datagram_pool_first :: proc(t: ^testing.T) {
 	r := make_rate_limiter(RATE, 2)
 	defer destroy_rate_limiter(r)
-	k := Cookie_Keeper{slots = {0 = {key = SECRET}}}
+	k := secret_keeper(SECRET)
 
 	client := net.Endpoint{address = net.IP4_Address{198, 51, 100, 5}, port = 30000}
 	cookie := issued_to(&k, client)
@@ -176,7 +176,7 @@ test_a_rescued_answer_is_billed_to_the_proven_pool :: proc(t: ^testing.T) {
 // a cookie issued with an answer verifies in the read loop.
 @(test)
 test_a_mapped_cookie_client_proves_its_source :: proc(t: ^testing.T) {
-	k := Cookie_Keeper{slots = {0 = {key = SECRET}}}
+	k := secret_keeper(SECRET)
 	addr: net.IP6_Address
 	addr[5] = 0xffff
 	addr[6] = u16be(0xc633)
@@ -196,7 +196,7 @@ the stream pool a datagram cannot reach.
 test_a_replayed_cookie_cannot_refuse_the_prefix_connections :: proc(t: ^testing.T) {
 	r := make_rate_limiter(RATE, 0)
 	defer destroy_rate_limiter(r)
-	k := Cookie_Keeper{slots = {0 = {key = SECRET}}}
+	k := secret_keeper(SECRET)
 
 	victim := net.Endpoint{address = net.IP4_Address{203, 0, 113, 7}, port = 30000}
 	cookie := issued_to(&k, victim)

@@ -571,7 +571,7 @@ cookied_query :: proc(t: ^testing.T, u: ^Upstream) -> (query: []u8, ok: bool) {
 	if !testing.expectf(t, eerr == .None, "cannot encode the query: %v", eerr) {
 		return nil, false
 	}
-	attached, attach_ok, dry := attach_cookie(u, wire, context.temp_allocator)
+	attached, attach_ok, dry := attach_cookie(u, wire, time.Minute, context.temp_allocator)
 	return attached, testing.expectf(t, attach_ok, "cannot attach the cookie (out of memory: %v)", dry)
 }
 

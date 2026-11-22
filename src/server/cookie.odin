@@ -61,36 +61,46 @@ still accepted: RFC 7873 section 7.1's default, within its range of 1 to 300.
 COOKIE_ROLLOVER_GRACE :: 150
 
 /*
-How many secrets a keeper holds: the one issued, the one before it, and room
-for a rollover to write the next without touching either. A rollover writes the
-slot three behind the one in use, which only a reader that loaded the epoch a
-whole rollover ago could still be reading.
+How many secrets are held: the one issued, the two before it while their grace
+runs, and room for a rollover to write the next without touching any of them. A
+rollover writes the slot three behind the one in use, which only a reader that
+loaded the epoch a whole rollover ago could still be reading.
 */
 COOKIE_SECRET_SLOTS :: 4
 
 Cookie_Secret :: struct {
 	key:   [COOKIE_SECRET_LEN]u8,
-	// When cookies started being issued under it, in the cookies' own seconds;
-	// zero for a slot never filled.
-	since: u32,
+	// Until when, in the cookies' own seconds, cookies under it are accepted
+	// once it is no longer issued (RFC 7873 section 7.1); zero for the one
+	// issued and for a slot never filled. Atomic.
+	until: u32,
+}
+
+/*
+The secrets themselves and their rollover, apart from the keeper so that a
+reload which leaves `cookies.secret` alone shares them with the generation it
+replaces: two copies would each roll on their own while both were answering.
+*/
+Cookie_Secrets :: struct {
+	slots:     [COOKIE_SECRET_SLOTS]Cookie_Secret,
+	// Counts the rollovers; the slot issued under is this modulo the slots.
+	// Atomic.
+	epoch:     u32,
+	// When a drawn secret is next replaced, in the cookies' seconds; zero for a
+	// configured one, which the operator rolls. Atomic.
+	next_roll: u32,
+	// Held by the thread replacing the secret. Atomic.
+	rolling:   bool,
 }
 
 Cookie_Keeper :: struct {
-	slots:        [COOKIE_SECRET_SLOTS]Cookie_Secret,
-	// Counts the rollovers; the slot issued under is this modulo the slots.
-	// Read and written atomically.
-	epoch:        u32,
-	// When a drawn secret is next replaced, in the cookies' seconds; zero for a
-	// configured one, which the operator rolls. Atomic.
-	next_roll:    u32,
-	// Held by the thread replacing the secret. Atomic.
-	rolling:      bool,
+	secrets:      ^Cookie_Secrets,
 	// `cookies.previous_secret`: accepted, never issued.
 	accepted:     [COOKIE_SECRET_LEN]u8,
 	has_accepted: bool,
 	// Answer a UDP query that cannot show a valid server cookie with BADCOOKIE
 	// instead of an answer.
-	require: bool,
+	require:      bool,
 }
 
 Cookie_Verdict :: enum u8 {
@@ -123,7 +133,7 @@ Cookie_Request :: struct {
 }
 
 /*
-Set the server's cookie secrets up.
+Set the server's cookie keeper up, and its secrets unless it shares `prev`'s.
 
 Returns false when a configured secret cannot be read, which is worth refusing
 to start over: silently falling back to a random one would leave the members of
@@ -133,10 +143,11 @@ start_cookies :: proc(
 	l: ^Live,
 	// The running keeper, on a reload.
 	prev: ^Cookie_Keeper = nil,
-	// Whether `cookies.secret` is what it was when `prev` was built. Its secrets
-	// are then kept as they stand, so no client has to be issued a new cookie;
-	// otherwise the one it issues under is accepted for `COOKIE_ROLLOVER_GRACE`
-	// more (RFC 7873 section 7.1).
+	// Whether `cookies.secret` is what it was when `prev` was built. Its
+	// secrets are then shared, so no client has to be issued a new cookie;
+	// otherwise the ones it accepts go on being accepted until their grace
+	// ends, the one it issues under for `COOKIE_ROLLOVER_GRACE` from now (RFC
+	// 7873 section 7.1).
 	keep := false,
 ) -> bool {
 	if !l.cfg.cookies.enabled {
@@ -154,29 +165,34 @@ start_cookies :: proc(
 		k.has_accepted = true
 	}
 
-	now := cookie_now()
 	if prev != nil && keep {
-		k.slots = prev.slots
-		k.epoch = sync.atomic_load(&prev.epoch)
-		k.next_roll = sync.atomic_load(&prev.next_roll)
+		k.secrets = prev.secrets
 	} else {
+		sec := new(Cookie_Secrets)
+		now := cookie_now()
 		if prev != nil {
-			k.slots[0] = prev.slots[sync.atomic_load(&prev.epoch) % COOKIE_SECRET_SLOTS]
-			k.epoch = 1
+			old := prev.secrets
+			epoch := sync.atomic_load(&old.epoch)
+			sec.slots[0] = old.slots[epoch % COOKIE_SECRET_SLOTS]
+			sec.slots[0].until = now + COOKIE_ROLLOVER_GRACE
+			sec.slots[COOKIE_SECRET_SLOTS - 1] = old.slots[(epoch - 1) % COOKIE_SECRET_SLOTS]
+			sec.epoch = 1
 		}
-		issued := &k.slots[k.epoch]
-		issued.since = now
+		issued := &sec.slots[sec.epoch]
 		if l.cfg.cookies.secret != "" {
 			if !config.parse_cookie_secret(l.cfg.cookies.secret, &issued.key) {
 				logx.errorf("cookies.secret must be %d hex characters", COOKIE_SECRET_LEN * 2)
+				mem.zero_explicit(sec, size_of(Cookie_Secrets))
+				free(sec)
 				mem.zero_explicit(k, size_of(Cookie_Keeper))
 				free(k)
 				return false
 			}
 		} else {
 			crypto.rand_bytes(issued.key[:])
-			k.next_roll = now + dns.cookie_secret_lifetime()
+			sec.next_roll = now + dns.cookie_secret_lifetime()
 		}
+		k.secrets = sec
 	}
 
 	l.cookies = k
@@ -184,6 +200,7 @@ start_cookies :: proc(
 	return true
 }
 
+// Free the keeper. Its secrets are a part of their own; see `stop_cookie_secrets`.
 stop_cookies :: proc(l: ^Live) {
 	if l.cookies == nil {
 		return
@@ -191,6 +208,16 @@ stop_cookies :: proc(l: ^Live) {
 	mem.zero_explicit(l.cookies, size_of(Cookie_Keeper))
 	free(l.cookies)
 	l.cookies = nil
+}
+
+// Free the keeper's secrets, ahead of `stop_cookies`.
+stop_cookie_secrets :: proc(l: ^Live) {
+	if l.cookies == nil || l.cookies.secrets == nil {
+		return
+	}
+	mem.zero_explicit(l.cookies.secrets, size_of(Cookie_Secrets))
+	free(l.cookies.secrets)
+	l.cookies.secrets = nil
 }
 
 /*
@@ -408,7 +435,7 @@ make_cookie :: proc(k: ^Cookie_Keeper, req: Cookie_Request, now: u32) -> (out: [
 	out[14] = u8(now >> 8)
 	out[15] = u8(now)
 
-	hash := cookie_hash(issuing_secret(k, now).key, out[:16], binding.ip[:binding.ip_len])
+	hash := cookie_hash(issuing_secret(k.secrets, now).key, out[:16], binding.ip[:binding.ip_len])
 	copy(out[16:], hash[:])
 	return out
 }
@@ -419,22 +446,23 @@ its lifetime is up. One thread does the replacing; the others go on issuing
 under the secret in force until it is done.
 */
 @(private)
-issuing_secret :: proc(k: ^Cookie_Keeper, now: u32) -> ^Cookie_Secret {
-	due := sync.atomic_load(&k.next_roll)
+issuing_secret :: proc(sec: ^Cookie_Secrets, now: u32) -> ^Cookie_Secret {
+	due := sync.atomic_load(&sec.next_roll)
 	if due != 0 && i32(now - due) >= 0 {
-		if _, won := sync.atomic_compare_exchange_strong(&k.rolling, false, true); won {
-			if sync.atomic_load(&k.next_roll) == due {
-				epoch := sync.atomic_load(&k.epoch) + 1
-				next := &k.slots[epoch % COOKIE_SECRET_SLOTS]
+		if _, won := sync.atomic_compare_exchange_strong(&sec.rolling, false, true); won {
+			if sync.atomic_load(&sec.next_roll) == due {
+				epoch := sync.atomic_load(&sec.epoch)
+				next := &sec.slots[(epoch + 1) % COOKIE_SECRET_SLOTS]
 				crypto.rand_bytes(next.key[:])
-				next.since = now
-				sync.atomic_store(&k.epoch, epoch)
-				sync.atomic_store(&k.next_roll, now + dns.cookie_secret_lifetime())
+				sync.atomic_store(&next.until, 0)
+				sync.atomic_store(&sec.slots[epoch % COOKIE_SECRET_SLOTS].until, now + COOKIE_ROLLOVER_GRACE)
+				sync.atomic_store(&sec.epoch, epoch + 1)
+				sync.atomic_store(&sec.next_roll, now + dns.cookie_secret_lifetime())
 			}
-			sync.atomic_store(&k.rolling, false)
+			sync.atomic_store(&sec.rolling, false)
 		}
 	}
-	return &k.slots[sync.atomic_load(&k.epoch) % COOKIE_SECRET_SLOTS]
+	return &sec.slots[sync.atomic_load(&sec.epoch) % COOKIE_SECRET_SLOTS]
 }
 
 @(private)
@@ -462,17 +490,25 @@ verify_cookie :: proc(k: ^Cookie_Keeper, raw: []u8, req: Cookie_Request, now: u3
 	// have set them, and this one is not the judge of that.
 	binding := req // As in `make_cookie`: the parameter's arrays are not sliceable.
 	ip := binding.ip[:binding.ip_len]
-	epoch := sync.atomic_load(&k.epoch)
-	issued := &k.slots[epoch % COOKIE_SECRET_SLOTS]
-	if cookie_signed_by(issued.key, raw, ip) {
+	sec := k.secrets
+	epoch := sync.atomic_load(&sec.epoch)
+	if cookie_signed_by(sec.slots[epoch % COOKIE_SECRET_SLOTS].key, raw, ip) {
 		return true
 	}
-	// RFC 7873 section 7.1: the previous secret's cookies stay correct for a
-	// grace period after a rollover. Unsigned, so a clock stepped back past the
-	// rollover does not stretch it.
-	previous := &k.slots[(epoch - 1) % COOKIE_SECRET_SLOTS]
-	if previous.since != 0 && now - issued.since <= COOKIE_ROLLOVER_GRACE && cookie_signed_by(previous.key, raw, ip) {
-		return true
+	/*
+	RFC 7873 section 7.1: a secret's cookies stay correct for a grace after it
+	is replaced. Two back, for a reload that changes the secret inside the grace
+	of a rollover. Signed, so a reader whose `now` was taken a moment before the
+	rollover's still finds it; bounded, so a clock stepped back by more than the
+	skew cookies already allow does not stretch it.
+	*/
+	for back in u32(1) ..= 2 {
+		retired := &sec.slots[(epoch - back) % COOKIE_SECRET_SLOTS]
+		until := sync.atomic_load(&retired.until)
+		left := i32(until - now)
+		if until != 0 && left >= 0 && left <= COOKIE_ROLLOVER_GRACE + COOKIE_MAX_SKEW && cookie_signed_by(retired.key, raw, ip) {
+			return true
+		}
 	}
 	return k.has_accepted && cookie_signed_by(k.accepted, raw, ip)
 }

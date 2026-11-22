@@ -570,10 +570,17 @@ cookies:
   upstream: true
 
   # The key cookies are derived from, as 32 hex characters. Empty draws a random
-  # one at each startup and keeps it across reloads, which is right for a
-  # single instance. Set it when several elodins answer on one address, or they
-  # will reject each other's cookies.
+  # one, kept across reloads and replaced about daily (RFC 7873 section 7.1),
+  # which is right for a single instance. Set it when several elodins answer on
+  # one address, or they will reject each other's cookies; elodin never
+  # replaces a configured one, so change it at least every 36 days.
   # secret: e5e973e5a6b2a43f48e7dc849e37bfcf
+  #
+  # A second key, accepted on returned cookies and never issued under: how a
+  # shared secret is changed without turning clients away (RFC 9018 section
+  # 5). Put the new key here on every member, then swap the two, then remove
+  # this. See docs/edns.md.
+  # previous_secret: 000102030405060708090a0b0c0d0e0f
 
 rebind:
   # Refuse an upstream answer that points a public name into private address

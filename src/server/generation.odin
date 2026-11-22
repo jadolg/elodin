@@ -103,6 +103,9 @@ Part :: enum u8 {
 	Upstreams,
 	Validator,
 	Cookies,
+	// The secrets a keeper signs with, shared by the keepers of generations
+	// whose `cookies.secret` is the same (`Cookie_Secrets`).
+	Cookie_Secrets,
 	Limiter,
 	Answers,
 }
@@ -426,6 +429,9 @@ release_parts :: proc(l: ^Live, parts: Parts) {
 	if .Validator in parts {
 		stop_validator(l)
 	}
+	if .Cookie_Secrets in parts {
+		stop_cookie_secrets(l)
+	}
 	if .Cookies in parts {
 		stop_cookies(l)
 	}
@@ -499,13 +505,19 @@ build_live :: proc(s: ^Server, l: ^Live, prev: ^Live) -> (built, carried: Parts,
 			// that leaves `secret` alone: every client holds a cookie under
 			// them, and a new one would cost each of them a round trip.
 			running := prev.cookies if prev != nil else nil
-			if !start_cookies(l, running, keep = running != nil && prev.cfg.cookies.secret == cfg.cookies.secret) {
+			keep := running != nil && prev.cfg.cookies.secret == cfg.cookies.secret
+			if !start_cookies(l, running, keep = keep) {
 				return
 			}
 			built += {.Cookies}
+			if keep {
+				carried += {.Cookie_Secrets}
+			} else {
+				built += {.Cookie_Secrets}
+			}
 		} else {
 			l.cookies = prev.cookies
-			carried += {.Cookies}
+			carried += {.Cookies, .Cookie_Secrets}
 		}
 	}
 

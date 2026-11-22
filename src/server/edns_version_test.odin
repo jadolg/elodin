@@ -135,7 +135,7 @@ test_badvers_still_carries_a_cookie_back :: proc(t: ^testing.T) {
 	if !testing.expect(t, start_cookies(&s), "the cookie keeper would not start") {
 		return
 	}
-	defer stop_cookies(&s)
+	defer release_parts(&s, {.Cookie_Secrets, .Cookies})
 
 	client_cookie := make([]u8, 8, context.temp_allocator)
 	copy(client_cookie, []u8{0x24, 0x64, 0xc4, 0xab, 0xcf, 0x10, 0xc9, 0x57})

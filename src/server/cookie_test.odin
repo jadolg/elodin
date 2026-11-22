@@ -25,9 +25,9 @@ unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
 
 @(private = "file")
 keeper :: proc(secret_hex: string) -> Cookie_Keeper {
-	k: Cookie_Keeper
-	copy(k.slots[0].key[:], unhex(secret_hex))
-	return k
+	key: [COOKIE_SECRET_LEN]u8
+	copy(key[:], unhex(secret_hex))
+	return secret_keeper(key)
 }
 
 @(private = "file")
@@ -290,7 +290,7 @@ roundtrip :: proc(t: ^testing.T, c: Roundtrip) -> (out: []u8, ok: bool) {
 		testing.expect(t, false, "the cookie keeper would not start")
 		return nil, false
 	}
-	defer stop_cookies(&s)
+	defer release_parts(&s, {.Cookie_Secrets, .Cookies})
 
 	if !seed_cache(t, answers, "example.com.", stored_wire) {
 		return nil, false
@@ -723,29 +723,34 @@ the next rollover is a lifetime away, less the jitter.
 test_a_drawn_secret_rolls_over :: proc(t: ^testing.T) {
 	ROLL :: u32(1_000_000)
 	k := keeper(SECRET)
-	k.slots[0].since = ROLL - 3600
-	k.next_roll = ROLL
+	k.secrets.next_roll = ROLL
 	req := request(CLIENT_COOKIE, CLIENT)
 
 	before := make_cookie(&k, req, ROLL - 1)
-	testing.expect_value(t, k.epoch, 0)
+	testing.expect_value(t, k.secrets.epoch, 0)
 	after := make_cookie(&k, req, ROLL)
-	testing.expect_value(t, k.epoch, 1)
+	testing.expect_value(t, k.secrets.epoch, 1)
 	unrolled := keeper(SECRET)
 	under_old := make_cookie(&unrolled, req, ROLL)
 	testing.expect(t, mem.compare(after[16:], under_old[16:]) != 0, "the cookie after the rollover is under the old secret")
 
 	shortest := ROLL + u32(dns.COOKIE_SECRET_LIFETIME * (100 - dns.COOKIE_SECRET_JITTER) / 100)
-	testing.expectf(t, k.next_roll >= shortest && k.next_roll <= ROLL + dns.COOKIE_SECRET_LIFETIME, "the next rollover is at %d", k.next_roll)
+	next := k.secrets.next_roll
+	testing.expectf(t, next >= shortest && next <= ROLL + dns.COOKIE_SECRET_LIFETIME, "the next rollover is at %d", next)
 
 	testing.expect(t, verify_cookie(&k, before[:], req, ROLL + COOKIE_ROLLOVER_GRACE), "a cookie under the previous secret failed inside the grace")
 	testing.expect(t, !verify_cookie(&k, before[:], req, ROLL + COOKIE_ROLLOVER_GRACE + 1), "a cookie under the previous secret verified past the grace")
 	testing.expect(t, verify_cookie(&k, after[:], req, ROLL + COOKIE_ROLLOVER_GRACE + 1), "a cookie under the new secret failed")
+	// A thread whose clock read came a moment before the rolling thread's.
+	testing.expect(t, verify_cookie(&k, before[:], req, ROLL - 1), "a cookie under the previous secret failed for a reader a second behind the rollover")
+	// A clock stepped back further than the skew cookies allow does not
+	// stretch the grace.
+	testing.expect(t, !verify_cookie(&k, before[:], req, ROLL - COOKIE_MAX_SKEW - 1), "the grace stretched over a clock stepped back")
 
 	// A configured secret has no rollover scheduled, and is never replaced.
 	configured := keeper(SECRET)
 	far := make_cookie(&configured, req, ROLL * 4000)
-	testing.expect_value(t, configured.epoch, 0)
+	testing.expect_value(t, configured.secrets.epoch, 0)
 	far_unrolled := make_cookie(&unrolled, req, ROLL * 4000)
 	testing.expect(t, mem.compare(far[:], far_unrolled[:]) == 0, "a configured secret was replaced")
 	free_all(context.temp_allocator)
