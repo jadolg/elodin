@@ -153,22 +153,19 @@ ALIAS = re.compile(r'^import\s+(\w+)\s+"elodin:(\w+)"', re.M)
 
 
 def test_only_procs(sources, hits):
-    """
-    Exported procedures outside test files that nothing outside test files calls.
-
-    A procedure only tests use lives in a test file of its package. The itest
-    and fuzz packages are callers in their own right: they cannot reach another
-    package's test files. `main`, and procedures under an attribute in
-    `UNCALLED`, are left out, and a cross-package test seam says why with
-    lint:allow. A use is the bare name in code of its own package, or
-    `package.name` in another's - outside comments, strings and `name ::`
-    declarations.
-
-    shortcut: names are matched, not resolved, so a parameter, local or field of
-    the same name in its package, or a call from its own body, counts as a use
-    and hides a test-only procedure; it never flags one with a real caller.
-    Upgrade to a parser if one slips through.
-    """
+    """Exported procedures outside test files that nothing outside test files calls."""
+    # A procedure only tests use lives in a test file of its package. The itest
+    # and fuzz packages are callers in their own right: they cannot reach another
+    # package's test files. `main`, and procedures under an attribute in
+    # `UNCALLED`, are left out, and a cross-package test seam says why with
+    # lint:allow. A use is the bare name in code of its own package, or
+    # `package.name` in another's - outside comments, strings and `name ::`
+    # declarations.
+    #
+    # shortcut: names are matched, not resolved, so a parameter, local or field of
+    # the same name in its package, or a call from its own body, counts as a use
+    # and hides a test-only procedure; it never flags one with a real caller.
+    # Upgrade to a parser if one slips through.
     callers = {path: src for path, src in sources.items() if not path.endswith("_test.odin")}
     local, qualified = count_uses(callers)
     for path, source in callers.items():
