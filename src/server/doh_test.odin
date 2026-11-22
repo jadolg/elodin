@@ -2072,6 +2072,9 @@ test_a_chunked_request_body_is_read :: proc(t: ^testing.T) {
 		{"a malformed parameter on a coding ahead of chunked", "HTTP/1.1", "Transfer-Encoding: gzip;;=, chunked\r\n", "", 400, ""},
 		{"a parameter with no value", "HTTP/1.1", "Transfer-Encoding: gzip;level, chunked\r\n", "", 400, ""},
 		{"well-formed parameters ahead of chunked", "HTTP/1.1", "Transfer-Encoding: gzip; level = 9 ;q=\"x y\", chunked\r\n", "", 501, ""},
+		// A comma inside a quoted parameter value does not end the coding.
+		{"a quoted parameter holding a comma", "HTTP/1.1", "Transfer-Encoding: gzip;x=\"a,b\", chunked\r\n", "", 501, ""},
+		{"an unterminated quoted parameter", "HTTP/1.1", "Transfer-Encoding: gzip;x=\"a, chunked\r\n", "", 400, ""},
 		{"a Transfer-Encoding of commas", "HTTP/1.1", "Transfer-Encoding: , ,\r\n", "", 400, ""},
 	}
 	for c in CASES {

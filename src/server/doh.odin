@@ -64,11 +64,11 @@ The size is a request this endpoint would have read in full anyway - the header
 limit plus the largest body it accepts - so draining one costs no more than
 serving one would have.
 
-The idle wait applies per read. `HTTP_LINGER_BODY_IDLE` is what every drain here
-passes, because every refusal that drains is one `read_http_request` handed back,
-decided on the request line or on the header block - a `Host`, a repeated
-`Content-Type`, a `Content-Length` over the limit - before the body those headers
-declared has been read. What is unread there is not something the client has
+The idle wait applies per read. `HTTP_LINGER_BODY_IDLE` is what every refusal's
+drain passes, because every refusal is one `read_http_request` handed back,
+decided on the request line, on the header block - a `Host`, a repeated
+`Content-Type`, a `Content-Length` over the limit - or partway through a chunked
+body, before the rest of the body has been read. What is unread there is not something the client has
 already put on the wire but a body still on its way, and over any distance the
 next segment of it is a round trip away rather than in the queue: a wait of
 only the time a queued byte takes to arrive drains the first congestion window,
@@ -79,9 +79,11 @@ line this reader will not read costs a client no more than a query does - which
 is why it is a quarter of a second rather than a second, that being the bound
 `stream_linger` accepts against the same abuse.
 
-Passed by the caller rather than defaulted, though there is one value to pass, so
-that a path added later has to answer where its unread bytes are rather than
-inherit an answer. The 429 in `serve_doh_request` is the one path that drains
+Passed by the caller rather than defaulted, so that a path added later has to
+answer where its unread bytes are rather than inherit an answer. The close
+after a chunked request that was answered passes `STREAM_LINGER_IDLE`: the
+body was read whole, and what is unread is what the client had already
+pipelined behind it. The 429 in `serve_doh_request` is the one path that drains
 nothing: it keeps the connection, and where the
 client asked for `Connection: close` the request it refused was read in full, so
 neither case leaves the close anything to trip over.
@@ -124,11 +126,13 @@ Http_Request_In :: struct {
 	// chunked body): what the client pipelined behind it is drained first.
 	closing:      bool,
 	content_type: string,
-	// The Host header, used only to build the DoH URL the .mobileconfig endpoint
-	// hands back. An HTTP/1.1 request that sent no Host at all is refused before
-	// it gets here, so this is empty only on an HTTP/1.0 request, which predates
-	// the field, or where the field arrived with an empty value - which is a Host
-	// the client sent and `valid_mobileconfig_host` still has to turn away.
+	// The Host header, or for an absolute-form target the target's authority,
+	// which RFC 9112 3.2.2 has stand in for it; used only to build the DoH URL
+	// the .mobileconfig endpoint hands back. An HTTP/1.1 request that sent no
+	// Host at all is refused before it gets here, so this is empty only on an
+	// HTTP/1.0 request, which predates the field, or where the field arrived
+	// with an empty value - which is a Host the client sent and
+	// `valid_mobileconfig_host` still has to turn away.
 	host:         string,
 }
 
@@ -658,7 +662,23 @@ parameter, which it has none of.
 @(private)
 transfer_codings_add :: proc(t: ^Transfer_Codings, value: string) -> bool {
 	rest := value
-	for element in strings.split_iterator(&rest, ",") {
+	for len(rest) > 0 {
+		// The next element, up to a comma that is not inside a quoted-string
+		// (RFC 9110 5.6.1, 5.6.4): a parameter's value may hold one.
+		at := 0
+		for at < len(rest) && rest[at] != ',' {
+			if rest[at] == '"' {
+				q := quoted_string_prefix(rest[at:])
+				if q == 0 {
+					return false
+				}
+				at += q
+			} else {
+				at += 1
+			}
+		}
+		element := rest[:at]
+		rest = rest[min(at + 1, len(rest)):]
 		coding := h2.trim_ows(element)
 		// RFC 9110 5.6.1: empty elements of a list are ignored.
 		if coding == "" {
