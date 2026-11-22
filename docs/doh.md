@@ -36,7 +36,16 @@ HTTP/2 limits, per connection:
 | HPACK table (also the ceiling on a peer's table size update) | 4096 bytes | yes |
 | CONTINUATION frames per header block | 128 | no |
 
-Server push is refused and stream priority is ignored (RFC 9113 allows both). A
+Server push is refused and stream priority is ignored (RFC 9113 allows both),
+though a PRIORITY frame's shape is still checked. The frame errors are the ones
+RFC 9113 names, at both ends of an HTTP/2 connection, DoH listener and upstream:
+a client preface not followed by SETTINGS (and a server's that does not open
+with one) is a PROTOCOL_ERROR (section 3.4); a PING not 8 bytes long, a SETTINGS
+not a multiple of 6, or a SETTINGS ACK with a payload is a FRAME_SIZE_ERROR; a
+PING or SETTINGS on a stream, or a PRIORITY on stream 0, is a PROTOCOL_ERROR;
+and a PRIORITY not 5 bytes long resets its stream with FRAME_SIZE_ERROR and the
+connection carries on. An HPACK table size update after a field in the same
+header block is a COMPRESSION_ERROR (RFC 7541 section 4.2). A
 header list that breaks RFC 9113 sections 8.2 or 8.3 is a stream error of type
 PROTOCOL_ERROR; a conformant `CONNECT` gets a 404. HTTP/1.1 refuses the same
 shapes.

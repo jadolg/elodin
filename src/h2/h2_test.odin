@@ -228,10 +228,6 @@ test_decode_error_releases_partial_list :: proc(t: ^testing.T) {
 	expect_no_leaks(t, &track, "decode error")
 }
 
-@(private = "file")
-ignore_request :: proc(conn: ^Conn, req: ^Request) {
-}
-
 @(test)
 test_teardown_releases_parked_request :: proc(t: ^testing.T) {
 	track: mem.Tracking_Allocator

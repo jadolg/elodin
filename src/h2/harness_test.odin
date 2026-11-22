@@ -228,6 +228,8 @@ Serve_Harness :: struct {
 	code:       Error_Code,
 	// The last GOAWAY's last stream id.
 	last:       u32,
+	// Whatever a test's own write hook needs.
+	user:       rawptr,
 }
 
 @(private)
@@ -396,4 +398,9 @@ gate_proc :: proc(
 		}
 	}
 	return g.backing.procedure(g.backing.data, mode, size, alignment, old_memory, old_size, loc)
+}
+
+// A handler that does nothing with its request.
+@(private)
+ignore_request :: proc(conn: ^Conn, req: ^Request) {
 }

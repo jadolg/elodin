@@ -308,7 +308,10 @@ decode :: proc(
 			state per connection that this end never agreed to.
 			*/
 			size := read_integer(&r, 5) or_return
-			if size > table.limit {
+			// 4.2: "MUST occur at the beginning of the first header block
+			// following the change" - after a field it is a decoding error, as
+			// in Go's decoder. Every field decoded is in `out` by now.
+			if size > table.limit || len(out) > 0 {
 				return nil, .Bad_Update
 			}
 			dynamic_table_set_max(table, size)

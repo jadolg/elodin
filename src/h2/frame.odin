@@ -164,10 +164,10 @@ strip_priority :: proc(payload: []u8, flags: u8) -> (out: []u8, ok: bool) {
 	if flags & FLAG_PRIORITY == 0 {
 		return payload, true
 	}
-	if len(payload) < 5 {
+	if len(payload) < PRIORITY_SIZE {
 		return nil, false
 	}
-	return payload[5:], true
+	return payload[PRIORITY_SIZE:], true
 }
 
 /*
@@ -257,6 +257,48 @@ read_frame :: proc(
 		return h, nil, .Protocol_Error, false
 	}
 	return h, payload, nil, true
+}
+
+/*
+Whether `h` may be the first frame a peer sends after its preface: RFC 9113
+section 3.4 has both ends' prefaces end in a SETTINGS frame, and an invalid
+preface is a connection error of type PROTOCOL_ERROR.
+*/
+opens_connection :: proc(h: Frame_Header) -> bool {
+	return h.type == .Settings && h.flags & FLAG_ACK == 0
+}
+
+/*
+The error a PING, SETTINGS or PRIORITY frame's shape draws, checked the same
+by both ends ahead of what the frame says (RFC 9113 sections 6.3, 6.5, 6.7).
+`on_stream` is a stream error on `h.stream_id`; otherwise it is a connection
+error.
+*/
+frame_shape_error :: proc(h: Frame_Header) -> (code: Error_Code, on_stream: bool, bad: bool) {
+	#partial switch h.type {
+	case .Ping:
+		switch {
+		case h.stream_id != 0:
+			return .Protocol_Error, false, true
+		case h.length != 8:
+			return .Frame_Size_Error, false, true
+		}
+	case .Settings:
+		switch {
+		case h.stream_id != 0:
+			return .Protocol_Error, false, true
+		case h.flags & FLAG_ACK != 0 && h.length != 0, h.length % SETTING_SIZE != 0:
+			return .Frame_Size_Error, false, true
+		}
+	case .Priority:
+		switch {
+		case h.stream_id == 0:
+			return .Protocol_Error, false, true
+		case h.length != PRIORITY_SIZE:
+			return .Frame_Size_Error, true, true
+		}
+	}
+	return .No_Error, false, false
 }
 
 /*
@@ -500,6 +542,8 @@ Setting_Value :: struct {
 // The bytes one SETTINGS entry takes (RFC 9113 6.5.1).
 @(private)
 SETTING_SIZE :: 6
+// A PRIORITY frame, and the priority section a HEADERS frame may carry.
+PRIORITY_SIZE :: 5
 
 /*
 What each end opens a connection with, into `buf`: `prefix` (the client's

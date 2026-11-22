@@ -271,12 +271,16 @@ client_serve :: proc(c: ^Client) {
 		loop.unlock(&c.mu)
 	}
 
-	for {
+	for first := true; ; first = false {
 		h, payload, refuse, ok := read_frame(c.io, c.continuation_on)
 		if !ok {
 			if code, bad := refuse.?; bad {
 				client_goaway(c, code)
 			}
+			return
+		}
+		if first && !opens_connection(h) {
+			client_goaway(c, .Protocol_Error)
 			return
 		}
 		if !client_handle_frame(c, h, payload) {
@@ -313,6 +317,18 @@ client_send_preface :: proc(c: ^Client) -> bool {
 
 @(private)
 client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
+	if code, on_stream, bad := frame_shape_error(h); bad {
+		if !on_stream {
+			client_goaway(c, code)
+			return false
+		}
+		// Drawn by the peer, so charged as the server charges its own.
+		if !control_budget_spend(&c.control) {
+			client_goaway(c, .Enhance_Your_Calm)
+			return false
+		}
+		return client_rst_stream(c, h.stream_id, code)
+	}
 	// The server's rule, for the same reason: see MAX_CONTROL_FRAMES_PER_SECOND.
 	if (h.type == .Ping || h.type == .Settings) && h.flags & FLAG_ACK == 0 && !control_budget_spend(&c.control) {
 		client_goaway(c, .Enhance_Your_Calm)
@@ -323,10 +339,6 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 		return client_handle_settings(c, h, payload)
 
 	case .Ping:
-		if h.stream_id != 0 || len(payload) != 8 {
-			client_goaway(c, .Protocol_Error)
-			return false
-		}
 		if h.flags & FLAG_ACK != 0 {
 			return true
 		}
@@ -368,8 +380,8 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 		return true
 
 	case .Priority:
-		// Parsed and ignored: RFC 9113 deprecates the scheme and a DNS client
-		// has nothing useful to do with it.
+		// Its shape checked and its values ignored: RFC 9113 deprecates the
+		// scheme and a DNS client has nothing useful to do with it.
 		return true
 
 	case .Goaway:
@@ -397,16 +409,13 @@ client_stream_is_idle :: proc(c: ^Client, stream_id: u32) -> bool {
 
 @(private)
 client_handle_settings :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
+	// The shape is `frame_shape_error`'s.
 	if h.flags & FLAG_ACK != 0 {
-		return len(payload) == 0
-	}
-	if h.stream_id != 0 || len(payload) % 6 != 0 {
-		client_goaway(c, .Protocol_Error)
-		return false
+		return true
 	}
 
 	loop.lock(&c.mu)
-	for i := 0; i + 6 <= len(payload); i += 6 {
+	for i := 0; i + SETTING_SIZE <= len(payload); i += SETTING_SIZE {
 		id := Setting(read_u16(payload[i:]))
 		value := read_u32(payload[i + 2:])
 		if code, bad := setting_error(id, value); bad {

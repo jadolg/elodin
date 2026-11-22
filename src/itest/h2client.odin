@@ -52,6 +52,8 @@ H2_Settings :: struct {
 	max_frame:      int,
 	// Sent when above 0; 0 and 1 are the legal values.
 	enable_push:    int,
+	// The preface alone, with no SETTINGS frame after it.
+	omit:           bool,
 }
 
 h2_connect :: proc(port: int, settings: H2_Settings = {}, allocator := context.temp_allocator) -> (c: ^H2_Client, ok: bool) {
@@ -72,6 +74,9 @@ h2_connect :: proc(port: int, settings: H2_Settings = {}, allocator := context.t
 		return nil, false
 	}
 
+	if settings.omit {
+		return c, true
+	}
 	payload := make([dynamic]u8, 0, 12, allocator)
 	if settings.initial_window > 0 {
 		append(&payload, 0, u8(h2.Setting.Initial_Window_Size))
@@ -249,6 +254,14 @@ h2_send_ping :: proc(c: ^H2_Client, payload: [8]u8) -> bool {
 	h2.write_frame_header(&out, 8, .Ping, 0, 0)
 	data := payload
 	append(&out, ..data[:])
+	return conn_write(&c.conn, out[:])
+}
+
+// Any frame, shaped as the caller says.
+h2_send_frame :: proc(c: ^H2_Client, type: h2.Frame_Type, flags: u8, stream_id: u32, payload: []u8) -> bool {
+	out := make([dynamic]u8, 0, h2.FRAME_HEADER_SIZE + len(payload), context.temp_allocator)
+	h2.write_frame_header(&out, len(payload), type, flags, stream_id)
+	append(&out, ..payload)
 	return conn_write(&c.conn, out[:])
 }
 

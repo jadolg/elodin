@@ -159,8 +159,12 @@ run_peer :: proc(p: ^Peer) {
 		serve_socket(socket, p.handler)
 		return
 	}
+	// A server's preface is its SETTINGS frame (RFC 9113 section 3.4), which
+	// every script's server sends before anything of its own.
 	preface: [len(PREFACE)]u8
-	if test_recv_full(socket, preface[:]) {
+	settings: [FRAME_HEADER_SIZE]u8
+	put_frame_header(settings[:], 0, .Settings, 0, 0)
+	if test_recv_full(socket, preface[:]) && test_send(socket, settings[:]) {
 		p.script(socket, p.data)
 	}
 }
@@ -875,6 +879,7 @@ test_client_serve_takes_turns :: proc(t: ^testing.T) {
 		sent:    int,
 		ran_at:  int,
 		started: bool,
+		opened:  bool,
 	}
 	feed := Feed {
 		ran_at = -1,
@@ -889,6 +894,13 @@ test_client_serve_takes_turns :: proc(t: ^testing.T) {
 				f := (^Feed)(data)
 				f.ran_at = f.frames
 			}, f)
+		}
+		if !f.opened {
+			// The server's preface: an empty SETTINGS, whole, into the frame
+			// header read that asks for it.
+			f.opened = true
+			preface := [FRAME_HEADER_SIZE]u8{0, 0, 0, u8(Frame_Type.Settings), 0, 0, 0, 0, 0}
+			return copy(buf, preface[:]), true
 		}
 		if f.frames >= FRAMES {
 			return 0, false
