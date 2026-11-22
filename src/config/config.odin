@@ -508,7 +508,8 @@ Cookie_Config :: struct {
 	under, in the same form as `secret`. It is what RFC 9018 section 5's
 	three-stage change of a shared secret needs: the new secret goes here on
 	every member first, then swaps places with `secret`, then the old one is
-	removed.
+	removed once every member has issued under the new one for
+	`COOKIE_MAX_AGE`. Needs `secret`.
 	*/
 	previous_secret: string,
 }

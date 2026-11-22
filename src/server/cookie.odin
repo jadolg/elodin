@@ -145,9 +145,8 @@ start_cookies :: proc(
 	prev: ^Cookie_Keeper = nil,
 	// Whether `cookies.secret` is what it was when `prev` was built. Its
 	// secrets are then shared, so no client has to be issued a new cookie;
-	// otherwise the ones it accepts go on being accepted until their grace
-	// ends, the one it issues under for `COOKIE_ROLLOVER_GRACE` from now (RFC
-	// 7873 section 7.1).
+	// otherwise new ones are built with room for `take_over_cookie_secrets` to
+	// carry `prev`'s in once the reload can no longer fail.
 	keep := false,
 ) -> bool {
 	if !l.cfg.cookies.enabled {
@@ -171,11 +170,6 @@ start_cookies :: proc(
 		sec := new(Cookie_Secrets)
 		now := cookie_now()
 		if prev != nil {
-			old := prev.secrets
-			epoch := sync.atomic_load(&old.epoch)
-			sec.slots[0] = old.slots[epoch % COOKIE_SECRET_SLOTS]
-			sec.slots[0].until = now + COOKIE_ROLLOVER_GRACE
-			sec.slots[COOKIE_SECRET_SLOTS - 1] = old.slots[(epoch - 1) % COOKIE_SECRET_SLOTS]
 			sec.epoch = 1
 		}
 		issued := &sec.slots[sec.epoch]
@@ -198,6 +192,32 @@ start_cookies :: proc(
 	l.cookies = k
 	logx.infof("cookies: enabled (require=%v)", k.require)
 	return true
+}
+
+/*
+Carry the secrets of the generation a reload replaces into the new one's, which
+nothing can read yet, and stop the old ones rolling: the secret the old
+generation issues under is accepted for `COOKIE_ROLLOVER_GRACE` from now, and
+the one before it for the rest of its own grace (RFC 7873 section 7.1). Called
+once the reload can no longer fail, so a reload that is refused leaves the
+running secrets rolling.
+
+Stopped, because the old generation answers on until its queries drain, and a
+secret it drew after this would be one the new generation never learns.
+*/
+take_over_cookie_secrets :: proc(sec, old: ^Cookie_Secrets) {
+	for {
+		if _, won := sync.atomic_compare_exchange_strong(&old.rolling, false, true); won {
+			break
+		}
+		sync.cpu_relax()
+	}
+	sync.atomic_store(&old.next_roll, 0)
+	epoch := sync.atomic_load(&old.epoch)
+	sec.slots[0] = old.slots[epoch % COOKIE_SECRET_SLOTS]
+	sec.slots[0].until = cookie_now() + COOKIE_ROLLOVER_GRACE
+	sec.slots[COOKIE_SECRET_SLOTS - 1] = old.slots[(epoch - 1) % COOKIE_SECRET_SLOTS]
+	sync.atomic_store(&old.rolling, false)
 }
 
 // Free the keeper. Its secrets are a part of their own; see `stop_cookie_secrets`.

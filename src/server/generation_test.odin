@@ -384,6 +384,11 @@ test_a_reload_keeps_the_cookie_secret_unless_the_file_changes_it :: proc(t: ^tes
 			"cookies: { enabled: true }",
 			"cookies: { enabled: true, secret: \"000102030405060708090a0b0c0d0e0f\" }"),
 	)
+	// The replaced secrets stop rolling: the retiring generation answers on
+	// while it drains, and a secret it drew now is one the new generation
+	// would never learn.
+	replaced := cur.secrets
+	testing.expect_value(t, sync.atomic_load(&replaced.next_roll), 0)
 	cur = f.s.gens.current.cookies
 	issued := cur.secrets.slots[cur.secrets.epoch % COOKIE_SECRET_SLOTS]
 	testing.expect(t, issued.key != secret, "a configured secret did not replace the drawn one")

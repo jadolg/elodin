@@ -96,6 +96,9 @@ reload_config :: proc(s: ^Server, path: string) -> (out: Reload_Outcome) {
 		return
 	}
 	g.owns = built
+	if .Cookie_Secrets in built && cur.cookies != nil {
+		take_over_cookie_secrets(g.cookies.secrets, cur.cookies.secrets)
+	}
 
 	// The cache is shared with the generation it came from, so it is brought in
 	// line only now that nothing can fail.

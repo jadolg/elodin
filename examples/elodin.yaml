@@ -578,8 +578,9 @@ cookies:
   #
   # A second key, accepted on returned cookies and never issued under: how a
   # shared secret is changed without turning clients away (RFC 9018 section
-  # 5). Put the new key here on every member, then swap the two, then remove
-  # this. See docs/edns.md.
+  # 5). Put the new key here on every member, then swap the two, then, an
+  # hour after the last member swapped, remove this. Needs `secret`. See
+  # docs/edns.md.
   # previous_secret: 000102030405060708090a0b0c0d0e0f
 
 rebind:

@@ -775,3 +775,49 @@ test_the_client_cookie_rolls_over :: proc(t: ^testing.T) {
 	testing.expectf(t, next >= shortest - time.Minute && next <= lifetime, "the next rollover is %v away", next)
 	free_all(context.temp_allocator)
 }
+
+/*
+A rollover holds replies to the queries already out to the cookie they owe for
+as long as any of them may wait, not only as long as the query that happened to
+roll it over (whose budget may be the shortest), and the retries inside one
+exchange do not roll it over: they answer a refusal with the server cookie it
+carried.
+*/
+@(test)
+test_a_rollover_covers_every_query_out :: proc(t: ^testing.T) {
+	u, uerr := make_upstream(config.Upstream_Spec{name = "rolled", kind = .UDP, address = "127.0.0.1", port = 9}, 0, time.Second, cookies = true)
+	if !testing.expectf(t, uerr == .None, "cannot build the member: %v", uerr) {
+		return
+	}
+	defer destroy(u)
+	sync.mutex_lock(&u.mu)
+	u.cookie.server_len = copy(u.cookie.server[:], []u8{1, 2, 3, 4, 5, 6, 7, 8})
+	sync.mutex_unlock(&u.mu)
+
+	_, long_ok, long_dry := attach_cookie(u, edns_query("example.com."), time.Minute, context.temp_allocator)
+	if !testing.expectf(t, long_ok, "the premise: the long query took a cookie (out of memory: %v)", long_dry) {
+		return
+	}
+	sync.mutex_lock(&u.mu)
+	u.cookie.roll_at = loop.moment_add(loop.moment_now(), -time.Second)
+	old := u.cookie.client
+	sync.mutex_unlock(&u.mu)
+
+	_, kept_ok, kept_dry := attach_cookie(u, edns_query("example.org."), time.Second, context.temp_allocator, roll = false)
+	testing.expectf(t, kept_ok, "the retry took no cookie (out of memory: %v)", kept_dry)
+	sync.mutex_lock(&u.mu)
+	kept := u.cookie.client == old && u.cookie.server_len == 8
+	sync.mutex_unlock(&u.mu)
+	testing.expect(t, kept, "a retry rolled the cookie over")
+
+	_, short_ok, short_dry := attach_cookie(u, edns_query("example.net."), time.Second, context.temp_allocator)
+	testing.expectf(t, short_ok, "the short query took no cookie (out of memory: %v)", short_dry)
+	sync.mutex_lock(&u.mu)
+	rolled := u.cookie.client != old
+	window := time.Duration(u.cookie.renewed_until - loop.moment_now())
+	sync.mutex_unlock(&u.mu)
+	if testing.expect(t, rolled, "the premise: the short query rolled the cookie over") {
+		testing.expectf(t, window > 30 * time.Second, "replies are held to their cookie for %v, short of the long query's minute", window)
+	}
+	free_all(context.temp_allocator)
+}

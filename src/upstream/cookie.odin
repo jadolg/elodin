@@ -46,6 +46,8 @@ Cookie :: struct {
 	renewed_until: loop.Moment,
 	// When the client cookie is next drawn afresh (`attach_cookie`).
 	roll_at:       loop.Moment,
+	// The furthest any query that took a cookie may still wait for its reply.
+	out_until:     loop.Moment,
 }
 
 /*
@@ -71,8 +73,8 @@ cookies_wanted :: proc(u: ^Upstream) -> bool {
 Put our cookie for this upstream into a copy of the query.
 
 The client cookie is drawn afresh first once its lifetime is up (RFC 7873
-section 7.1 holds a client's secret to the same lifetime as a server's), with
-`in_flight` the longest a query already out may still wait for its reply.
+section 7.1 holds a client's secret to the same lifetime as a server's), unless
+`roll` is false. `in_flight` is the longest this query may wait for its reply.
 
 `ok` is false when the query has no OPT record to carry it, and the query goes
 out as it is. Every query the server forwards carries one
@@ -86,6 +88,9 @@ attach_cookie :: proc(
 	query: []u8,
 	in_flight: time.Duration,
 	allocator: mem.Allocator,
+	// False for the retries within one exchange, which answer a refusal with
+	// the server cookie the refusal carried and must not drop it.
+	roll := true,
 ) -> (
 	out: []u8,
 	ok: bool,
@@ -95,9 +100,10 @@ attach_cookie :: proc(
 	n := 0
 
 	sync.mutex_lock(&u.mu)
-	if loop.moment_since(u.cookie.roll_at) >= 0 {
+	if roll && loop.moment_since(u.cookie.roll_at) >= 0 {
 		renew_cookie_locked(u, in_flight)
 	}
+	u.cookie.out_until = max(u.cookie.out_until, loop.moment_add(loop.moment_now(), in_flight))
 	n += copy(option[:], u.cookie.client[:])
 	n += copy(option[n:], u.cookie.server[:u.cookie.server_len])
 	sync.mutex_unlock(&u.mu)
@@ -221,19 +227,20 @@ cookie_renewed_locked :: proc(u: ^Upstream) -> bool {
 
 /*
 Draw a new client cookie and forget the server cookie bound to the old one.
-Replies to queries already out under the old one, for up to `in_flight`, are
-still held to the cookie they owe. Under `u.mu`.
+Replies to queries already out under the old one are still held to the cookie
+they owe for as long as any of them, or one asked with `in_flight` to spare,
+may wait. Under `u.mu`.
 */
 @(private)
 renew_cookie_locked :: proc(u: ^Upstream, in_flight: time.Duration) {
 	if u.cookie.server_len > 0 {
-		u.cookie.renewed_until = max(u.cookie.renewed_until, loop.moment_add(loop.moment_now(), in_flight))
+		// The furthest wait of any query out, not only the caller's: one
+		// with more budget left may outlive the caller's.
+		u.cookie.renewed_until = max(u.cookie.renewed_until, u.cookie.out_until, loop.moment_add(loop.moment_now(), in_flight))
 	}
 	forget_cookie(u)
 	init_cookie(u)
 }
-
-
 
 /*
 Forget the server cookie held for this upstream.
@@ -329,7 +336,7 @@ exchange_with_cookie :: proc(
 		// moment ago at the top of this proc, and nothing about it has changed
 		// since. A refusal rather than an assertion because the alternative is
 		// sending the query on without the cookie the server has just insisted on.
-		retry, retried, retry_dry := attach_cookie(u, query, timeout, context.temp_allocator)
+		retry, retried, retry_dry := attach_cookie(u, query, timeout, context.temp_allocator, roll = false)
 		if !retried {
 			// `response` came out of `allocator`, which on the race path is the
 			// process heap: dropping it here would leak it for the life of the
@@ -351,7 +358,7 @@ exchange_with_cookie :: proc(
 			logx.debugf("upstream %s: BADCOOKIE after a fresh cookie, asking over TCP", u.spec.name)
 			delete(response, allocator)
 			response = nil
-			over_tcp, attached_tcp, tcp_dry := attach_cookie(u, query, timeout, context.temp_allocator)
+			over_tcp, attached_tcp, tcp_dry := attach_cookie(u, query, timeout, context.temp_allocator, roll = false)
 			if !attached_tcp {
 				return nil, .Out_Of_Memory if tcp_dry else .Bad_Response
 			}

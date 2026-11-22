@@ -3167,6 +3167,11 @@ validate :: proc(l: ^Loader, cfg: ^Config) {
 	if cfg.cookies.previous_secret != "" && !parse_cookie_secret(cfg.cookies.previous_secret, &scratch) {
 		errorf(l, "cookies.previous_secret must be %d hexadecimal characters", COOKIE_SECRET_LEN * 2)
 	}
+	// Without `secret` the secret issued under is drawn and rolls over, and a
+	// fixed key beside it would be accepted for ever (RFC 7873 section 7.1).
+	if cfg.cookies.previous_secret != "" && cfg.cookies.secret == "" {
+		errorf(l, "cookies.previous_secret needs cookies.secret: it is the other half of changing a shared secret")
+	}
 	/*
 	`require` is enforced against cookies this server issues, and it issues none
 	with `enabled` off - so the pair is a setting that quietly does nothing.

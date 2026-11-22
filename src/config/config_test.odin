@@ -373,13 +373,28 @@ test_cookie_secret_must_be_hex :: proc(t: ^testing.T) {
 	// Caught here rather than at startup, so `--check` says so instead of a
 	// resolver that comes up and refuses to start.
 	for key in ([]string{"secret", "previous_secret"}) {
-		src := fmt.tprintf("%scookies:\n  %s: not-a-secret\n", MINIMAL, key)
+		other := "previous_secret" if key == "secret" else "secret"
+		src := fmt.tprintf("%scookies:\n  %s: not-a-secret\n  %s: e5e973e5a6b2a43f48e7dc849e37bfcf\n", MINIMAL, key, other)
 		_, err := load_string(src, context.temp_allocator)
 		e, has := err.?
 		if testing.expectf(t, has, "expected an error for a %s that is not hex", key) {
 			testing.expect_value(t, len(e.messages), 1)
 			testing.expectf(t, strings.contains(e.messages[0], fmt.tprintf("cookies.%s must be", key)), "the error names another key: %s", e.messages[0])
 		}
+	}
+	free_all(context.temp_allocator)
+}
+
+// A fixed key accepted beside a drawn secret that rolls over would outlive
+// every rollover, so the key is refused without `secret`.
+@(test)
+test_cookie_previous_secret_needs_a_secret :: proc(t: ^testing.T) {
+	src := MINIMAL + "cookies:\n  previous_secret: e5e973e5a6b2a43f48e7dc849e37bfcf\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	if testing.expect(t, has, "expected an error for previous_secret without secret") {
+		testing.expect_value(t, len(e.messages), 1)
+		testing.expectf(t, strings.contains(e.messages[0], "cookies.previous_secret needs cookies.secret"), "another error: %s", e.messages[0])
 	}
 	free_all(context.temp_allocator)
 }

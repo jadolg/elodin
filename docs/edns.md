@@ -62,7 +62,11 @@ section 5.2.2).
   §5's three stages, each a reload on every member before the next begins:
   1. put the new secret in `previous_secret`;
   2. swap the two, so `secret` is the new one and `previous_secret` the old;
-  3. remove `previous_secret`.
+  3. remove `previous_secret`, once every member has issued under the new
+     secret for an hour: cookies are good for an hour, and the old secret's
+     have no grace once it is gone.
+
+  `previous_secret` without `secret` is rejected at startup.
 
 **Upstream.** elodin sends a random client cookie per server plus the server
 cookie that server last issued. The client cookie is drawn afresh after a day
