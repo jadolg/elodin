@@ -1854,7 +1854,10 @@ asking for less only costs a TCP retry upstream.
 */
 @(private)
 shape_forwarded :: proc(st: ^Query_State) -> bool {
-	wire, built := upstream_query(st.q, st.validating || dns.edns_do(st.msg), st.validating || st.msg.flags.cd, st.allocator)
+	// RFC 4035 section 3.2.1: a security-aware resolver "MUST set the DO bit
+	// when sending requests, regardless of the state of the DO bit in the
+	// initiating request", validating this one or not (CD, a route).
+	wire, built := upstream_query(st.q, live(st.s).validator != nil || dns.edns_do(st.msg), st.validating || st.msg.flags.cd, st.allocator)
 	if !built {
 		// The question decoded, so its encoding failing is not a shape a client
 		// can send; failing closed rather than forwarding its bytes as they stand.
@@ -2565,7 +2568,9 @@ answered_dry :: proc(st: ^Query_State, reason: string) -> bool {
 
 /*
 DNSSEC validation of the reply, when this query is validating. Answers only to
-refuse a Bogus or Indeterminate one.
+refuse a Bogus or Indeterminate one. A reply this server asked for with DO and
+did not validate goes to a client that left DO clear without its DNSSEC records
+(RFC 4035 section 3.2.1), as `present_response` does for a validated one.
 */
 @(private)
 validate_reply :: proc(st: ^Query_State) -> bool {
@@ -2643,6 +2648,16 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 		st.resp = presented
 		st.answer_ede = ceiling_ede(result)
 		st.ede = st.answer_ede
+	} else if live(st.s).validator != nil && !dns.edns_do(st.msg) {
+		// Held to the signatures first (RFC 4034 section 3.1.5), as
+		// `finish_answer` holds a copy that keeps them: past the strip there
+		// is nothing left to read the expiry from.
+		if left, signed := dns.signatures_lapse(st.resp, u32(time.time_to_unix(loop.now()))); signed {
+			dns.cap_ttls(st.resp, left)
+		}
+		// At full size, as `present_response` strips: this copy is the one the
+		// cache keeps.
+		st.resp = strip_dnssec_records(st.resp, st.msg, st.q.type, st.spent, st.allocator, dns.MAX_MESSAGE)
 	}
 	return false
 }
