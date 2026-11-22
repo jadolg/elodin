@@ -383,6 +383,9 @@ Http_Response :: struct {
 	// status is one `h2.status_asks_to_wait` names; zero for none, or one that
 	// did not parse. See `h2.retry_after_of`.
 	retry_after: u32,
+	// The final response's `Age` (RFC 9111 5.1) in seconds; zero for none, or one
+	// that did not parse. See `h2.age_of`.
+	age:         u32,
 	// The final response's header section was read to its end and its framing
 	// accepted, so `status` and its fields are the server's whole word whatever
 	// became of the body.
@@ -544,7 +547,7 @@ http_exchange :: proc(
 	content_length: int
 	chunked: bool
 	headers := 0
-	seen_retry := false
+	seen_retry, seen_age := false, false
 	// A close announced by any response of the exchange, interim ones included,
 	// holds for the connection: keeping it costs a dial at most.
 	resp.keep_alive = true
@@ -624,6 +627,15 @@ http_exchange :: proc(
 				// An interim response's Location is not the answer's.
 				if resp.location == "" && resp.status >= 200 {
 					resp.location = strings.clone(value, context.temp_allocator)
+				}
+			case dns.name_equal_fold(name, "age"):
+				// A singleton (RFC 9111 5.1): the first one is the one, as for
+				// Retry-After below. One that does not parse is ignored.
+				if !seen_age && resp.status >= 200 {
+					seen_age = true
+					if seconds, parsed := h2.age_of(value); parsed {
+						resp.age = seconds
+					}
 				}
 			case dns.name_equal_fold(name, "retry-after"):
 				// Not a list (RFC 9110 10.2.3), so the first one is the one. An

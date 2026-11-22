@@ -136,6 +136,7 @@ exchange_doh_h2 :: proc(
 				delete(resp.body, allocator)
 				return nil, .Bad_Response
 			}
+			age_ttls(resp.body, resp.age, allocator)
 			return resp.body, .None
 		case .Closed, .Refused:
 			// A refusal's head that came before the connection went is the
@@ -271,6 +272,7 @@ exchange_doh_h1 :: proc(
 			} else {
 				stream_close(&stream)
 			}
+			age_ttls(resp.body, resp.age, allocator)
 			return resp.body, .None
 		}
 
@@ -527,4 +529,29 @@ doh_reply_matches :: proc(query, body: []u8) -> bool {
 	id, _ := dns.peek_id(query)
 	dns.set_id_in_place(body, id)
 	return response_matches(query, body)
+}
+
+/*
+RFC 8484 section 5.1: "DoH clients MUST account for the Age response header
+field's value [RFC7234] when calculating the DNS TTL of a response". Each TTL in
+`reply` loses `age` seconds, in place, floored at zero; OPT's is not a TTL and is
+left alone. A reply the TTL walk refuses is left as it came: `cache.put` refuses
+it too, and the forwarded copy is still bounded by `cache.max_ttl`.
+*/
+@(private)
+age_ttls :: proc(reply: []u8, age: u32, allocator: mem.Allocator) {
+	if age == 0 {
+		return
+	}
+	offsets, ok := dns.scan_ttl_offsets(reply, allocator)
+	if !ok {
+		return
+	}
+	defer delete(offsets, allocator)
+	ttls := dns.read_ttls(reply, offsets, allocator)
+	defer delete(ttls, allocator)
+	if len(ttls) != len(offsets) {
+		return
+	}
+	dns.patch_ttls(reply, offsets, ttls, age)
 }

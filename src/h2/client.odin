@@ -119,6 +119,8 @@ Client_Stream :: struct {
 	final:       bool,
 	// The `retry-after` of the section that set `status`; see Client_Response.
 	retry_after: u32,
+	// The `age` of the section that set `status`; see Client_Response.
+	age:         u32,
 	// This end failed the response's head as malformed (RFC 9113 8.1.1), so it
 	// has no status a caller may act on; see client_finish_headers.
 	malformed:   bool,
@@ -147,6 +149,9 @@ Client_Response :: struct {
 	// arrival, when its status is one `status_asks_to_wait` names; zero for none,
 	// or one that did not parse. See `parse_retry_after`.
 	retry_after: u32,
+	// The final response's `age` (RFC 9111 5.1) in seconds; zero for none, or
+	// one that did not parse. See `age_of`.
+	age:         u32,
 }
 
 Client_Error :: enum u8 {
@@ -593,6 +598,21 @@ section_retry_after :: proc(headers: []Header_Field) -> u32 {
 	return 0
 }
 
+// The first `age` a header section carries, in seconds, or zero.
+@(private = "file")
+section_age :: proc(headers: []Header_Field) -> u32 {
+	for f in headers {
+		if f.name == "age" {
+			// One that does not parse is ignored (RFC 9111 5.1).
+			if seconds, ok := age_of(f.value); ok {
+				return seconds
+			}
+			return 0
+		}
+	}
+	return 0
+}
+
 /*
 Decode a completed response header block and, if the stream is still tracked,
 record its status and completion.
@@ -604,8 +624,8 @@ encoder, or every header block after it would fail to decode too.
 */
 @(private)
 client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
-	// Into the reader's per-frame arena: `:status` and `retry-after` are all that
-	// is read of it, and both are parsed before the frame ends.
+	// Into the reader's per-frame arena: `:status`, `retry-after` and `age` are
+	// all that is read of it, and each is parsed before the frame ends.
 	headers, err := decode(&c.decoder, c.header_scratch[:], context.temp_allocator)
 	clear(&c.header_scratch)
 	if err != .None {
@@ -618,6 +638,7 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 
 	// Read before the lock every stream on the connection waits on.
 	retry_after := section_retry_after(headers)
+	age := section_age(headers)
 
 	loop.lock(&c.mu)
 	s, found := c.streams[stream_id]
@@ -677,6 +698,7 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 				}
 			}
 			s.retry_after = retry_after
+			s.age = age
 			// A missing or malformed `:status` reads as 0, which is no interim
 			// response; nor is a 101, which HTTP/2 has no use for (8.6). Final,
 			// so no later block supplies the status, and malformed (8.3.2).
@@ -1119,7 +1141,7 @@ client_request :: proc(
 		return head, .Closed
 	}
 
-	status, retry_after := s.status, s.retry_after
+	status, retry_after, age := s.status, s.retry_after, s.age
 	body, room := dns.alloc_slice([]u8, len(s.body), allocator)
 	if room {
 		copy(body, s.body[:])
@@ -1128,7 +1150,7 @@ client_request :: proc(
 	if !room {
 		return {}, .Out_Of_Memory
 	}
-	return Client_Response{status = status, body = body, retry_after = retry_after}, .None
+	return Client_Response{status = status, body = body, retry_after = retry_after, age = age}, .None
 }
 
 // Write a request body, honouring flow control and the peer's frame size

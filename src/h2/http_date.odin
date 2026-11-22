@@ -1,6 +1,7 @@
 package h2
 
 import "core:fmt"
+import "core:strings"
 import "core:time"
 import dt "core:time/datetime"
 import "elodin:loop"
@@ -72,6 +73,20 @@ date_retry_after :: proc(value: string, now: dt.DateTime) -> (seconds: u32, ok: 
 	// Days are bounded by year 9999 against year 1, so this does not overflow.
 	total := delta.days * 86_400 + delta.seconds
 	return u32(clamp(total, 0, i64(max(u32)))), true
+}
+
+/*
+An `Age` field value (RFC 9111 5.1), in seconds; `ok` false for one that does
+not parse, which "a cache SHOULD ignore". Of a list, the first member: "a cache
+encountering a message with a list-based Age field value SHOULD use the first
+member".
+*/
+age_of :: proc(value: string) -> (seconds: u32, ok: bool) {
+	first := value
+	if i := strings.index_byte(value, ','); i >= 0 {
+		first = value[:i]
+	}
+	return delay_seconds(first)
 }
 
 /*
