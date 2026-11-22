@@ -2679,6 +2679,34 @@ counts_as_bogus :: proc(result: dnssec.Result) -> bool {
 }
 
 /*
+Turns an upstream NXDOMAIN into NODATA, in place, where a rewrite answers at or
+below the name denied: the question's name, or the end of its CNAME chain (RFC
+6604 section 2.1). That name exists (RFC 1034 section 3.1), and a name error for
+it would have an RFC 8020 cache deny the rewrite's names below it as well. The
+SOA stays, so the answer is NODATA as RFC 2308 section 2.2 shapes it.
+
+A validated denial is left alone: its NSEC or NSEC3 records prove a name error,
+which the AD bit vouches for.
+*/
+@(private)
+nodata_over_rewrite :: proc(st: ^Query_State) {
+	resp := st.resp
+	if len(resp) < dns.HEADER_SIZE || resp[3] & 0x0f != u8(dns.Rcode.NX_Domain) || len(live(st.s).cfg.rewrites) == 0 {
+		return
+	}
+	if st.validating && resp[3] & 0x20 != 0 {
+		return
+	}
+	name := st.q.name
+	if target, aliased := dns.peek_alias_target(resp); aliased {
+		name = target
+	}
+	if rewrite_at_or_below(st.s, name) {
+		resp[3] &~= 0x0f
+	}
+}
+
+/*
 The last of the answer path: the TTL bounds, the rebinding and cloaking checks,
 the store and the flight's landing. Always answers.
 */
@@ -2747,6 +2775,8 @@ finish_answer :: proc(st: ^Query_State) {
 	// `signatures_lapse` reads no bound at all for a message that carries none.
 	signed_left, signed := dns.signatures_lapse(st.resp, u32(time.time_to_unix(loop.now())))
 	dns.cap_ttls(st.resp, min(cache.ttl_ceiling(live(st.s).answers), signed_left))
+	// Above the decode, so the cache stores what the client is sent.
+	nodata_over_rewrite(st)
 
 	/*
 	Decoded once for the three things below that read it: the rebinding check

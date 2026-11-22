@@ -835,6 +835,19 @@ local_server :: proc(cfg: ^config.Config) -> Server {
 	return Server{cfg = cfg}
 }
 
+// `name`'s `type` asked of `s` with RD set, and `opt` on it when there is one;
+// a zero message, and a failed case, when nothing readable came back.
+@(private)
+ask_message :: proc(t: ^testing.T, s: ^Server, name: string, type: dns.Type, opt: Maybe(dns.Record) = nil, loc := #caller_location) -> dns.Message {
+	out, _, ok := handle_query(s, test_query(name, type, id = 0x4243, opt = opt), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	if !testing.expectf(t, ok, "%s %v went unanswered", name, type, loc = loc) {
+		return {}
+	}
+	decoded, derr := dns.decode_message(out, context.temp_allocator)
+	testing.expectf(t, derr == .None, "the answer to %s %v does not decode: %v", name, type, derr, loc = loc)
+	return decoded
+}
+
 /*
 A `local_server`, with no validator either, that answers `domain` from one
 rewrite rule: A 192.0.2.1, TTL 300. What it sends is then something this
