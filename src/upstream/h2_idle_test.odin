@@ -369,3 +369,23 @@ test_an_h2_conn_the_peer_sent_goaway_on_is_set_aside :: proc(t: ^testing.T) {
 	h2.client_unref(held)
 	close_idle(f.u)
 }
+
+/*
+An idle connection that is going away - after the peer's GOAWAY, or with its
+stream ids used up - takes no new query, so the sweep retires it at once rather
+than after `idle_timeout`.
+*/
+@(test)
+test_close_idle_retires_an_idle_h2_conn_that_is_going_away :: proc(t: ^testing.T) {
+	f: H2_Idle_Fixture
+	if !h2_idle_setup(t, &f) {
+		return
+	}
+	defer h2_idle_teardown(&f)
+
+	testing.expect_value(t, close_idle(f.u), 0)
+	testing.expect(t, h2_idle_kept(&f), "the premise: a fresh connection survives the sweep")
+	sync.atomic_store(&f.hc.client.going_away, true)
+	testing.expect_value(t, close_idle(f.u), 1)
+	testing.expect(t, !h2_idle_kept(&f), "an idle connection that is going away survived the sweep")
+}

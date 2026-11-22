@@ -1471,9 +1471,8 @@ dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
 	c.last_dispatched = max(c.last_dispatched, s.id)
 	loop.unlock(&c.mu)
 	c.handler(c, req)
-	// A handler can end the connection too, through `shutdown`, and nothing is
-	// read past a GOAWAY this end has sent. Asked here, once per request, rather
-	// than once per frame in `serve`: the handler runs inline on the reader.
+	// A handler can end the connection too, through `shutdown`. `serve` asks the
+	// same after every frame; this tells the frame handler that dispatched it.
 	loop.lock(&c.mu)
 	defer loop.unlock(&c.mu)
 	return !c.goaway_sent
@@ -1590,11 +1589,11 @@ goaway :: proc(c: ^Conn, code: Error_Code) {
 
 /*
 End the connection from a handler: GOAWAY(NO_ERROR), which RFC 9113 6.8 says an
-endpoint SHOULD send before closing. Called inline, from the handler `dispatch`
-runs on the reader, `serve` reads nothing after it; `dispatch` is where that is
-checked, so from a fiber of the handler's own it takes effect only at the next
-request the reader dispatches. Streams already started are not waited for: once
-`serve` returns their writes are refused. 6.8 says such streams "might still
+endpoint SHOULD send before closing. `serve` stops once the frame it is handling
+when the GOAWAY goes out is done: for a handler called inline from `dispatch`,
+the request's own; from a fiber of the handler's own, whichever frame the reader
+is on or reads next, of any type. Streams already started are not waited for:
+once `serve` returns their writes are refused. 6.8 says such streams "might still
 complete", which does not oblige them to, and the peer is told only that they may
 have been processed.
 */
