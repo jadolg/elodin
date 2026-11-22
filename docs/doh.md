@@ -72,8 +72,8 @@ connection then closed, so nothing that follows on it is read as a request:
 
 - A chunked body is read, chunk extensions (held to their grammar) and trailer
   fields included (section 7.1), and the connection closes after its answer,
-  once what the client sent behind it is drained. The chunk lines are held to
-  16 KiB together, as a header block is. A `Transfer-Encoding` whose last
+  once what the client sent behind it is drained. The chunk lines and trailer
+  fields are held to 16 KiB together, as a header block is, and past it are 400. A `Transfer-Encoding` whose last
   coding is not `chunked` or that names no coding at all, `chunked` applied
   twice or with a parameter, `Transfer-Encoding` beside a `Content-Length`, and
   `Transfer-Encoding` on HTTP/1.0 are 400; another coding ahead of `chunked` is

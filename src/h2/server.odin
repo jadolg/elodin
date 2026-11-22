@@ -1149,9 +1149,10 @@ send_continue :: proc(c: ^Conn, stream_id: u32) -> bool {
 	// Not through `status_text`, which holds a final response to 2xx-5xx.
 	encode_header(&block, ":status", "100")
 	frame := headers_frame(stream_id, block[:], end_stream = false) if len(block) > 0 else nil
+	// With no room for it, no 100: a client waiting on one sends its body when
+	// its own wait ends, and the other streams on the connection go on.
 	if frame == nil {
-		goaway(c, .Internal_Error)
-		return false
+		return true
 	}
 	return write_all(c, frame)
 }

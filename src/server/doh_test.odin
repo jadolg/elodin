@@ -2068,6 +2068,10 @@ test_a_chunked_request_body_is_read :: proc(t: ^testing.T) {
 		{"whitespace after an extension", "HTTP/1.1", CHUNKED, "4;a \r\nabcd\r\n0\r\n\r\n", 400, ""},
 		// A Transfer-Encoding with no coding in it is framing all the same.
 		{"an empty Transfer-Encoding beside a Content-Length", "HTTP/1.1", "Transfer-Encoding: \r\nContent-Length: 4\r\n", "abcd", 400, ""},
+		// RFC 9112 7: a transfer-parameter is token "=" token / quoted-string.
+		{"a malformed parameter on a coding ahead of chunked", "HTTP/1.1", "Transfer-Encoding: gzip;;=, chunked\r\n", "", 400, ""},
+		{"a parameter with no value", "HTTP/1.1", "Transfer-Encoding: gzip;level, chunked\r\n", "", 400, ""},
+		{"well-formed parameters ahead of chunked", "HTTP/1.1", "Transfer-Encoding: gzip; level = 9 ;q=\"x y\", chunked\r\n", "", 501, ""},
 		{"a Transfer-Encoding of commas", "HTTP/1.1", "Transfer-Encoding: , ,\r\n", "", 400, ""},
 	}
 	for c in CASES {
@@ -2119,6 +2123,21 @@ test_a_chunked_request_body_is_read :: proc(t: ^testing.T) {
 	if lok {
 		testing.expect(t, !lparsed, "a body whose framing is past the limit was accepted")
 		testing.expect_value(t, lstatus, 400)
+	}
+	// One line past it is a 400 as well, answered rather than closed on, and
+	// the trailers count with the chunk lines rather than starting afresh.
+	half_ext := strings.repeat("a", MAX_HEADER_BYTES / 2 + 100, context.temp_allocator)
+	whole_ext := strings.repeat("a", MAX_HEADER_BYTES + 10, context.temp_allocator)
+	for c in ([][2]string {
+			{"one chunk line past the limit", fmt.tprintf("1;%s\r\nx\r\n0\r\n\r\n", whole_ext)},
+			{"chunk lines and trailers past it together", fmt.tprintf("1;%s\r\nx\r\n0\r\nX-T: %s\r\n\r\n", half_ext, half_ext)},
+		}) {
+		raw := fmt.tprintf("POST /dns-query HTTP/1.1\r\nHost: dns.example\r\n%s\r\n%s", CHUNKED, c[1])
+		_, ostatus, oparsed, ook := read_request_over_loopback(t, raw, c[0])
+		if ook {
+			testing.expectf(t, !oparsed, "%s was accepted", c[0])
+			testing.expectf(t, ostatus == 400, "%s: answered %d, want 400", c[0], ostatus)
+		}
 	}
 	free_all(context.temp_allocator)
 }
@@ -2360,4 +2379,58 @@ test_expect_100_continue_is_answered_before_the_body :: proc(t: ^testing.T) {
 	n, rerr := net.recv_tcp(client, stray[:])
 	testing.expectf(t, rerr == nil && n == 0, "HTTP/1.0: %q was written (%v), want nothing", string(stray[:n]), rerr)
 	free_all(context.temp_allocator)
+}
+
+/*
+An absolute-form target's authority is kept as a copy taken when the request
+line is read: a view into it would point into the buffer the header lines read
+after it may move. Enough header lines to grow the buffer, read through an
+allocator that poisons what it frees, so a stale view reads as garbage.
+*/
+@(test)
+test_an_absolute_form_host_survives_the_buffer_growing :: proc(t: ^testing.T) {
+	b := strings.builder_make(context.allocator)
+	defer strings.builder_destroy(&b)
+	strings.write_string(&b, "GET https://dns.example/dns-query?dns=AAAB HTTP/1.1\r\nHost: dns.example\r\n")
+	for i in 0 ..< 3 * HTTP_BUF_SIZE / 100 {
+		fmt.sbprintf(&b, "X-Pad-%d: %s\r\n", i, strings.repeat("p", 90, context.temp_allocator))
+	}
+	strings.write_string(&b, "\r\n")
+
+	client, accepted, paired := loopback_tcp_pair(t)
+	if !paired {
+		return
+	}
+	defer net.close(client)
+	defer net.close(accepted)
+	_, serr := net.send_tcp(client, b.buf[:])
+	if !testing.expectf(t, serr == nil, "cannot send the request: %v", serr) {
+		return
+	}
+	testing.expect(t, net.shutdown(client, .Send) == nil, "cannot end the stream")
+	testing.expect(t, net.set_option(accepted, .Receive_Timeout, 3 * time.Second) == nil, "cannot bound the reader")
+
+	arena: virtual.Arena
+	if aerr := virtual.arena_init_growing(&arena); !testing.expectf(t, aerr == nil, "cannot create an arena: %v", aerr) {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	poison := Poisoning_Allocator {
+		backing = virtual.arena_allocator(&arena),
+	}
+	saved := context.temp_allocator
+	context.temp_allocator = poisoning_allocator(&poison)
+	defer context.temp_allocator = saved
+
+	r := Http_Reader {
+		conn = Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}},
+		buf  = make([dynamic]u8, 0, HTTP_BUF_SIZE, context.temp_allocator),
+	}
+	req, status, parsed := read_http_request(&r)
+	// The premise: the buffer did grow past its first block.
+	testing.expectf(t, cap(r.buf) > HTTP_BUF_SIZE, "the buffer never grew (cap %d)", cap(r.buf))
+	if testing.expectf(t, parsed, "refused with %d", status) {
+		testing.expect_value(t, req.host, "dns.example")
+		testing.expect_value(t, req.path, "/dns-query")
+	}
 }

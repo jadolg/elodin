@@ -398,6 +398,9 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 			return refused, 400, false
 		}
 		target = target[strings.index(target, "//") + 2 + len(authority):]
+		// A copy now: `authority` is a view into the request line, and the
+		// header lines read next may move the buffer it points into.
+		authority = hold(authority, &held)
 	}
 	path := target
 	if q := strings.index_byte(target, '?'); q >= 0 {
@@ -530,10 +533,7 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 		return {}, 0, false
 	}
 	if absolute {
-		req.host = hold(authority, &held)
-		if !held {
-			return {}, 0, false
-		}
+		req.host = authority
 	}
 
 	// RFC 9112 3.2 again: Host carries the authority, so an HTTP/1.1 request
@@ -669,6 +669,10 @@ transfer_codings_add :: proc(t: ^Transfer_Codings, value: string) -> bool {
 		if semi := strings.index_byte(coding, ';'); semi >= 0 {
 			name = h2.trim_ows(coding[:semi])
 			params = true
+			// RFC 9112 7: each a token, "=", and a token or quoted-string.
+			if !transfer_params_are_valid(coding[semi:]) {
+				return false
+			}
 		}
 		if !h2.is_token(name) {
 			return false
@@ -703,17 +707,15 @@ read_chunked_body :: proc(r: ^Http_Reader) -> (body: []u8, status: int, ok: bool
 	end := start
 	for {
 		/*
-		What the chunk lines and CRLFs have taken so far, which stays in the
-		buffer until the caller compacts it: bounded all told, or a stream of
-		one-byte chunks with long extensions holds the content's limit in data
-		and as much again, many times over, in framing.
+		Measured from the end of the content moved down so far: what lies past
+		it is framing - chunk lines and CRLFs - or not yet read, and it stays
+		in the buffer until the caller compacts it. Bounded all told, or a
+		stream of one-byte chunks with long extensions holds the content's
+		limit in data and as much again, many times over, in framing.
 		*/
-		if r.pos - end > MAX_HEADER_BYTES {
-			return nil, 400, false
-		}
-		line, lok, lbad := http_line(r, from = r.pos)
+		line, lok, lbad := http_line(r, from = end)
 		if !lok {
-			return nil, 400 if lbad else 0, false
+			return nil, chunk_line_status(r, end, lbad), false
 		}
 		size := 0
 		digits := 0
@@ -747,12 +749,17 @@ read_chunked_body :: proc(r: ^Http_Reader) -> (body: []u8, status: int, ok: bool
 		end += size
 	}
 	// The trailer section: field lines up to an empty one, held to what a
-	// header block's lines are, and to `MAX_HEADER_BYTES` between them.
-	trailers := r.pos
+	// header block's lines are, and inside the same bound as the chunk lines.
 	for {
-		line, lok, lbad := http_line(r, from = trailers)
+		line, lok, lbad := http_line(r, from = end)
 		if !lok {
-			return nil, 400 if lbad else 0, false
+			return nil, chunk_line_status(r, end, lbad), false
+		}
+		// `http_line` holds a line it has to wait for to the bound; what was
+		// already in the buffer, chunk lines included, is held to it here,
+		// before the body is handed back.
+		if r.pos - end > MAX_HEADER_BYTES {
+			return nil, 400, false
 		}
 		if line == "" {
 			break
@@ -763,6 +770,16 @@ read_chunked_body :: proc(r: ^Http_Reader) -> (body: []u8, status: int, ok: bool
 		}
 	}
 	return r.buf[start:end], 0, true
+}
+
+/*
+The answer to a chunk or trailer line `http_line` refused: 400 for a malformed
+one or for framing past `MAX_HEADER_BYTES`, measured from `end` as the lines
+are, and 0 for a read that failed.
+*/
+@(private)
+chunk_line_status :: proc(r: ^Http_Reader, end: int, malformed: bool) -> int {
+	return 400 if malformed || len(r.buf) - end > MAX_HEADER_BYTES else 0
 }
 
 /*
@@ -794,6 +811,41 @@ chunk_ext_is_valid :: proc(ext: string) -> bool {
 			continue
 		}
 		if rest[0] != '=' {
+			return false
+		}
+		rest = strings.trim_left(rest[1:], " \t")
+		if v := token_prefix(rest); v > 0 {
+			rest = rest[v:]
+		} else if q := quoted_string_prefix(rest); q > 0 {
+			rest = rest[q:]
+		} else {
+			return false
+		}
+	}
+}
+
+/*
+Whether `s` is a list of transfer-parameters as RFC 9112 7 writes them:
+`*( OWS ";" OWS token BWS "=" BWS ( token / quoted-string ) )`.
+*/
+@(private)
+transfer_params_are_valid :: proc(s: string) -> bool {
+	rest := s
+	for {
+		rest = strings.trim_left(rest, " \t")
+		if rest == "" {
+			return true
+		}
+		if rest[0] != ';' {
+			return false
+		}
+		rest = strings.trim_left(rest[1:], " \t")
+		n := token_prefix(rest)
+		if n == 0 {
+			return false
+		}
+		rest = strings.trim_left(rest[n:], " \t")
+		if rest == "" || rest[0] != '=' {
 			return false
 		}
 		rest = strings.trim_left(rest[1:], " \t")

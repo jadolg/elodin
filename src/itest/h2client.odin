@@ -433,10 +433,17 @@ h2_handle :: proc(c: ^H2_Client, header: h2.Frame_Header, payload: []u8) -> bool
 		// one (RFC 9113 8.1), which keeps its fields and status.
 		if status >= 100 && status < 200 {
 			r.interim += 1
+			// One that ends the stream is malformed, and ends it all the same,
+			// so a case sees it rather than a timeout.
+			if header.flags & h2.FLAG_END_STREAM != 0 {
+				r.done = true
+			}
 			return true
 		}
-		// A trailer block carries no `:status`, and keeps the response's.
-		if status != 0 {
+		// A trailer block carries no `:status`, and keeps the response's; a
+		// block with none before any final status is kept, status 0, for a
+		// case to see.
+		if status != 0 || r.status == 0 {
 			r.headers = fields
 			r.status = status
 		}
