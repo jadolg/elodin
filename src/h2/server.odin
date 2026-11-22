@@ -168,6 +168,10 @@ Stream :: struct {
 	// DATA payload taken on this stream, padding included: what it has spent of
 	// its flow-control window. See RECV_WINDOW.
 	received:     int,
+	// The request's `content-length`, which its DATA has to add up to (RFC
+	// 9113 8.1.1), saturated at MAX_BODY + 1; `has_length` false for none.
+	declared:     int,
+	has_length:   bool,
 }
 
 Conn :: struct {
@@ -798,6 +802,7 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 	// Set by the first ordinary field, which is where the pseudo-headers end.
 	seen_regular: bool
 	have_content_type: bool
+	have_content_length: bool
 	host: string
 	have_host: bool
 
@@ -878,6 +883,20 @@ request_is_malformed :: proc(headers: []Header_Field) -> bool {
 				return true
 			}
 			have_content_type = true
+		case "content-length":
+			/*
+			RFC 9113 8.1.1 frames the content by DATA, and holds this field to
+			it; RFC 9110 8.6 makes it digits alone. A repeat, even an equal
+			one, or a value that is not a length is malformed, as on HTTP/1.1:
+			a hop in front may have framed the body by whichever it read.
+			*/
+			if have_content_length {
+				return true
+			}
+			have_content_length = true
+			if _, ok := parse_content_length(f.value, MAX_BODY); !ok {
+				return true
+			}
 		}
 	}
 
@@ -1100,6 +1119,9 @@ finish_headers :: proc(c: ^Conn, s: ^Stream, block: []u8) -> bool {
 			take(&req.content_type, f.value, c.allocator, &dry)
 		case "accept":
 			take(&req.accept, f.value, c.allocator, &dry)
+		case "content-length":
+			// One, and a length: `request_is_malformed` has seen to both.
+			s.declared, s.has_length = parse_content_length(f.value, MAX_BODY)
 		}
 	}
 	if dry {
@@ -1395,6 +1417,18 @@ refuse_stream :: proc(c: ^Conn, s: ^Stream) -> bool {
 
 @(private)
 dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
+	/*
+	RFC 9113 8.1.1: a request whose `content-length` is not the sum of its
+	DATA is malformed, a stream error of type PROTOCOL_ERROR. Checked here, the
+	one place every request's content is complete - HEADERS ending the stream,
+	the DATA that ends it, or trailers - and before a handler is given it.
+	*/
+	if s.has_length && s.declared != len(s.body) {
+		request_destroy(c, req)
+		sent := stream_error(c, s.id, .Protocol_Error)
+		close_stream(c, s.id)
+		return sent
+	}
 	// Handed over rather than copied, so it is held once; the stream keeps the
 	// charge until it goes. Both use c.allocator.
 	if len(s.body) > 0 {

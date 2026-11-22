@@ -2974,10 +2974,6 @@ test_headers_reach_the_connection_allocator_only_for_kept_fields :: proc(t: ^tes
 // Trailers (RFC 9113 8.1)
 // ---------------------------------------------------------------------------
 
-// x-t: 1, a literal with incremental indexing: it becomes dynamic index 62, so
-// a decoder that skipped it falls out of step with the peer's encoder.
-@(private = "file")
-TRAILER := [?]u8{0x40, 0x03, 'x', '-', 't', 0x01, '1'}
 
 /*
 Send `block` on `id` as HEADERS with `flags`, split across a CONTINUATION when

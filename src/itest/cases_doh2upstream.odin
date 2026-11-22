@@ -272,6 +272,58 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 		}
 	}
 
+	// --- an h2 response held to its content-length ---
+	/*
+	RFC 9113 8.1.1: a response whose `content-length` is not the sum of its
+	DATA is malformed, and "Clients MUST NOT accept a malformed response". One
+	that matches is the answer; one that does not is no answer at all.
+	*/
+	{
+		Length_Case :: struct {
+			what:   string,
+			length: string,
+			rcode:  int,
+		}
+		// Literals the mock's threads read after the case: on the heap, freed
+		// once the mock is stopped.
+		matching := fmt.aprint(len(payload))
+		short := fmt.aprint(len(payload) + 100)
+		defer delete(matching)
+		defer delete(short)
+		length_cases := []Length_Case {
+			{"upstream: an h2 answer whose content-length matches is taken", matching, int(dns.Rcode.No_Error)},
+			{"upstream: an h2 answer short of its content-length is no answer", short, int(dns.Rcode.Serv_Fail)},
+		}
+		for tc, i in length_cases {
+			upstream_port := next_port(r)
+			mock := doh2_mock_make(upstream_port, "/dns-query", payload)
+			mock.content_length = tc.length
+			if !doh2_mock_start(mock, r.cert_file, r.key_file, {"h2"}) {
+				skip_case(r, tc.what, "cannot start the mock")
+				doh2_mock_stop(mock)
+				continue
+			}
+			udp_port := next_port(r)
+			config := base_config(udp_port, fmt.tprintf("[%s]", doh_upstream("length", upstream_port)), timeout = "5s")
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+			if ok {
+				start_case(r, tc.what)
+				{
+					res := query_udp(udp_port, build_query(fix.qname, fix.qtype, id = u16(0x5270 + i)))
+					if check(r, res.ok, "no response") {
+						h := parse_header(r, res.wire)
+						check_eq_int(r, h.rcode, tc.rcode, "rcode")
+					}
+					h2_hits, h1_hits := doh2_mock_counts(mock)
+					check(r, h2_hits >= 1 && h1_hits == 0, "the upstream was reached over h2 %d times and http/1.1 %d", h2_hits, h1_hits)
+				}
+				end_case(r)
+				stop_server(&srv)
+			}
+			doh2_mock_stop(mock)
+		}
+	}
+
 	// --- an upstream answering 429 or 503 asks to be left alone ---
 	/*
 	RFC 6585 4 and RFC 9110 15.6.4: a 429 is the upstream refusing this server,

@@ -124,6 +124,13 @@ Client_Stream :: struct {
 	// This end failed the response's head as malformed (RFC 9113 8.1.1), so it
 	// has no status a caller may act on; see client_finish_headers.
 	malformed:   bool,
+	// The final head's `content-length`, which its DATA has to add up to (RFC
+	// 9113 8.1.1), saturated at MAX_BODY + 1; `has_length` false for none.
+	declared:    int,
+	has_length:  bool,
+	// The request was a HEAD, whose response has no content whatever its
+	// `content-length` says (RFC 9110 9.3.2).
+	head:        bool,
 }
 
 Client_Request :: struct {
@@ -682,6 +689,7 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 			ordinary fields are held to 8.2 as the trailers are.
 			*/
 			s.status = 0
+			s.has_length = false
 			seen_status, seen_regular := false, false
 			for f in headers {
 				if len(f.name) > 0 && f.name[0] == ':' {
@@ -695,6 +703,12 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 					seen_regular = true
 					if field_is_malformed(f) {
 						malformed = true
+					}
+					// One, and a length (RFC 9110 8.6), as a request's is.
+					if f.name == "content-length" {
+						n, ok := parse_content_length(f.value, MAX_BODY)
+						malformed ||= !ok || s.has_length
+						s.declared, s.has_length = n, true
 					}
 				}
 			}
@@ -727,7 +741,13 @@ client_finish_headers :: proc(c: ^Client, stream_id: u32) -> bool {
 				control_budget_refund(&c.control)
 			}
 			if s.end_stream {
-				s.done = true
+				if client_content_matches(s) {
+					s.done = true
+				} else {
+					malformed = true
+					s.malformed = true
+					s.reset = true
+				}
 				loop.cond_broadcast(&c.cond)
 			}
 		}
@@ -885,10 +905,34 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 		loop.unlock(&c.mu)
 		return true
 	}
-	live.done = true
+	// A stream already reset has had its RST_STREAM, and is failed already.
+	matches := live.reset || client_content_matches(live)
+	if matches {
+		live.done = true
+	} else {
+		live.malformed = true
+		live.reset = true
+	}
 	loop.cond_broadcast(&c.cond)
 	loop.unlock(&c.mu)
+	if !matches {
+		return client_rst_stream(c, h.stream_id, .Protocol_Error)
+	}
 	return true
+}
+
+/*
+Whether a response's DATA adds up to its `content-length`, at its end (RFC 9113
+8.1.1): a response that defines no content - to a HEAD, or a 204 or 304 (RFC
+9110 6.4.1) - is not held to it, nor is one without the field. The caller holds
+`c.mu`.
+*/
+@(private)
+client_content_matches :: proc(s: ^Client_Stream) -> bool {
+	if !s.has_length || s.head || s.status == 204 || s.status == 304 {
+		return true
+	}
+	return s.declared == len(s.body)
 }
 
 // Owe connection-level receive window for bytes already read, whatever became
@@ -1037,6 +1081,7 @@ client_request :: proc(
 	sync.atomic_add(&c.refs, 1)
 	c.next_stream_id += 2
 	s.id = stream_id
+	s.head = req.method == "HEAD"
 	s.send_window = c.peer_initial_window
 	s.body = make([dynamic]u8, 0, 512, c.allocator)
 
