@@ -534,4 +534,3 @@ doh_reply_matches :: proc(query, body: []u8) -> bool {
 	dns.set_id_in_place(body, id)
 	return response_matches(query, body)
 }
-

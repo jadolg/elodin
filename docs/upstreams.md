@@ -59,8 +59,9 @@ An `https` upstream is sent its url from the path on, query included
 (`https://dns.example/dns-query?profile=ab12`), as the target of each POST. A
 url with no path is sent to `/`.
 An `Age` on the reply (a proxy or CDN that held it) is taken off every TTL in
-it and off a denial's SOA MINIMUM, floored at zero, before it is cached or
-forwarded (RFC 8484 section 5.1).
+it, floored at zero, before it is cached or forwarded (RFC 8484 section 5.1). A
+denial's SOA has its TTL held to its MINIMUM first, so the negative TTL loses the
+age too; the SOA's data, which its signature covers, is not changed.
 
 A server's `name` is what the log and the `upstream` label on
 [`/metrics`](metrics.md) call it. Without one it is `udp://`, `tcp://` or

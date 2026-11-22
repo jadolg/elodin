@@ -1044,11 +1044,13 @@ signatures_lapse :: proc(msg: []u8, now: u32) -> (left: u32, signed: bool) {
 
 /*
 `age` seconds off every TTL in `msg`, in place, floored at zero: a reply that
-has sat that long in a cache (RFC 8484 section 5.1). OPT's TTL field is the
-extended rcode and flags and is left alone. A SOA's MINIMUM loses the age too,
-since the negative TTL is the lesser of it and the SOA's TTL (RFC 2308 section
-5). Allocates nothing; a record that runs off the end ends the walk, its TTL
-aged if its fixed fields are inside the message.
+has sat that long in a cache (RFC 8484 section 5.1). Each TTL is read through
+`sane_ttl` first. OPT's TTL field is the extended rcode and flags and is left
+alone. A SOA in the authority section is first brought down to its MINIMUM, so
+the negative TTL, the lesser of the two (RFC 2308 section 5), loses the age as
+well; the MINIMUM itself is RDATA under the SOA's RRSIG and is not touched.
+Allocates nothing; a record that runs off the end ends the walk, its TTL aged if
+its fixed fields are inside the message.
 */
 age_ttls :: proc(msg: []u8, age: u32) {
 	if age == 0 {
@@ -1058,25 +1060,24 @@ age_ttls :: proc(msg: []u8, age: u32) {
 	if !ok {
 		return
 	}
-	lessen :: proc(msg: []u8, off: int, age: u32) {
-		v := read_ttl_at(msg, off)
-		write_ttl_at(msg, off, v - age if v > age else 0)
-	}
-	for _ in 0 ..< total {
+	answers := int(u16(msg[6]) << 8 | u16(msg[7]))
+	authority := answers + int(u16(msg[8]) << 8 | u16(msg[9]))
+	for i in 0 ..< total {
 		type, fixed, next, rec_ok := skip_record(msg, pos)
 		if fixed == 0 {
 			return
 		}
 		if type != .OPT {
-			lessen(msg, fixed + 4, age)
+			ttl := sane_ttl(read_ttl_at(msg, fixed + 4))
+			// MINIMUM is the RDATA's last four bytes; two root names and five
+			// 32-bit fields are the least a SOA holds.
+			if rec_ok && type == .SOA && i >= answers && i < authority && next - (fixed + 10) >= 22 {
+				ttl = min(ttl, sane_ttl(read_ttl_at(msg, next - 4)))
+			}
+			write_ttl_at(msg, fixed + 4, ttl - age if ttl > age else 0)
 		}
 		if !rec_ok {
 			return
-		}
-		// MINIMUM is the RDATA's last four bytes; two root names and five
-		// 32-bit fields are the least a SOA holds.
-		if type == .SOA && next - (fixed + 10) >= 22 {
-			lessen(msg, next - 4, age)
 		}
 		pos = next
 	}
