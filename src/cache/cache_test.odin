@@ -819,10 +819,10 @@ test_a_denial_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// A SOA TTL with its top bit set is zero (RFC 2181 section 8), so the denial it
-// sits beside has no lifetime and is not kept - not `negative_ttl`'s worth.
+// A SOA TTL with its top bit set is positive (RFC 8767 section 4), so the
+// denial it sits beside is kept, not refused as having no lifetime.
 @(test)
-test_a_denial_whose_soa_ttl_has_the_top_bit_set_is_not_cached :: proc(t: ^testing.T) {
+test_a_denial_whose_soa_ttl_has_the_top_bit_set_is_kept :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 8, max_ttl = 86400, negative_ttl = 300})
 	defer destroy(c)
 	kb: [KEY_MAX]u8
@@ -834,7 +834,20 @@ test_a_denial_whose_soa_ttl_has_the_top_bit_set_is_not_cached :: proc(t: ^testin
 	nx.authority = nx_target_soa("example.test.")
 	nx.authority[0].ttl = 0x8000_0e10
 	w, m := wire_and_msg(nx)
-	testing.expect(t, !put(c, key_for(kb[:], "nx.example.test."), w, m), "a denial with a top-bit SOA TTL was cached")
+	key := key_for(kb[:], "nx.example.test.")
+	if !testing.expect(t, put(c, key, w, m), "a denial with a top-bit SOA TTL was not cached") {
+		return
+	}
+	got, _, found := get(c, key, context.temp_allocator)
+	if !testing.expect(t, found, "the denial was stored but not served") {
+		return
+	}
+	served, derr := dns.decode_message(got, context.temp_allocator)
+	if !testing.expect(t, derr == .None && len(served.authority) == 1, "the served denial lost its SOA") {
+		return
+	}
+	// Each record goes out at its own TTL up to `max_ttl`: positive and capped.
+	testing.expect_value(t, served.authority[0].ttl, u32(86400))
 	free_all(context.temp_allocator)
 }
 

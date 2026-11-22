@@ -290,11 +290,15 @@ pm_answer :: proc(
 	count := u16(1 + pg_int(r, 3))
 	for i in 0 ..< count {
 		// TTLs at both ends: zero is legal and means "do not cache", and the
-		// top of the range is where a signed-vs-unsigned slip shows up.
+		// top of the range is where a signed-vs-unsigned slip shows up. For odd
+		// types the second record has the top bit set instead of zero, which
+		// RFC 8767 section 4 reads as positive, so the RRset goes out at 300; a
+		// zero beside it would take the set to zero however the top bit is
+		// read. Even types keep the zero.
 		ttl := u32(300)
 		switch i {
 		case 1:
-			ttl = 0
+			ttl = 0x8000_0010 if qtype % 2 == 1 else 0
 		case 2:
 			ttl = 0x7fffffff
 		}

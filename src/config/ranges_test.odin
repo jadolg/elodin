@@ -35,8 +35,8 @@ test_a_listener_port_outside_1_to_65535_is_refused :: proc(t: ^testing.T) {
 }
 
 /*
-RFC 2181 section 8: a TTL is 0 to 2^31-1, and a receiver treats one with the top
-bit set as zero, so a rewrite TTL of -1 cast to 4294967295 is no TTL at all
+RFC 2181 section 8: a TTL is 0 to 2^31-1, and a receiver that follows it treats
+one with the top bit set as zero, so a rewrite TTL of -1 cast to 4294967295 is no TTL at all
 (#316), and the same holds for every other TTL this file sets - the cache's and
 the block answers'. Each is refused, at both ends, by name, and so is a fraction
 of a second, which no TTL can carry.

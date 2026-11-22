@@ -15,7 +15,7 @@ import "elodin:upstream"
 An answer `cache.put` refuses still supersedes the expired copy (issue #419).
 
 The upstream has spoken: a TTL-0 answer is the zone saying "do not cache this"
-(RFC 1035 section 3.2.1, RFC 2181 section 8), and a denial without a SOA is one
+(RFC 1035 section 3.2.1), and a denial without a SOA is one
 RFC 2308 section 5 says not to cache - but both are answers, and the expired
 bytes no longer stand for anything. Left in place, every later query whose
 upstream is slower than `stale_timeout` is lent those bytes again, for the rest

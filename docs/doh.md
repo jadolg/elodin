@@ -23,7 +23,7 @@ listeners:
   its own counted against `server.max_pending`, so a browser's A and AAAA
   lookups run at the same time.
 - `Cache-Control: max-age` is the smallest TTL in the response as sent, after
-  `cache.max_ttl`. For a denial (NXDOMAIN, NODATA, or NODATA after a CNAME) it
+  `cache.max_ttl` (7 days with the cache off). For a denial (NXDOMAIN, NODATA, or NODATA after a CNAME) it
   is also capped by the SOA's MINIMUM (RFC 8484 section 5.1), and it is 0 when
   there is no SOA.
 

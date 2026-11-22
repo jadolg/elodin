@@ -38,7 +38,9 @@ rewritten in place on each hit.
   length of the move.
 - **`max_ttl`** caps every upstream answer, forwarded or cached, and how long an
   entry is kept. It does not touch answers elodin writes itself, which carry
-  `blocking.block_ttl` or a rewrite's own `ttl`.
+  `blocking.block_ttl` or a rewrite's own `ttl`. With `enabled: false`,
+  forwarded answers are capped at 7 days (604800 seconds), the cap RFC 8767
+  section 4 recommends.
 - **`min_ttl`** is a floor on the copies served from an entry.
 - **Entry lifetime.** An entry lives for the smallest TTL in its message; a
   negative one for the SOA's figure, capped by `negative_ttl` and by any
@@ -47,8 +49,8 @@ rewritten in place on each hit.
   with no SOA is not kept (RFC 2308 section 5). Each record still goes out with
   its own TTL up to the ceiling, so a client's copy need not expire when this
   cache's does.
-- A TTL with its top bit set is read as zero (RFC 2181 section 8), forwarded
-  answers included, so it is uncacheable unless `min_ttl` raises it.
+- A TTL with its top bit set is read as a positive number, not as zero (RFC
+  8767 section 4), and capped like any other.
 - An RRset whose records arrive with different TTLs goes out, and is cached,
   with the lowest of them on every record (RFC 2181 section 5.2), forwarded
   answers included. An RRset is the records next to each other with one owner,

@@ -156,8 +156,9 @@ expires_in :: proc(u: ^Upstream) -> time.Duration {
 
 /*
 RFC 1035 section 3.2.1: a record's TTL is how long it "may be cached before the
-source of the information should again be consulted". Read as RFC 2181
-section 8 asks, within `BOOTSTRAP_MIN_TTL` and `BOOTSTRAP_TTL`.
+source of the information should again be consulted". Read through
+`dns.sane_ttl` (RFC 8767 section 4), within `BOOTSTRAP_MIN_TTL` and
+`BOOTSTRAP_TTL`.
 */
 @(test)
 test_a_bootstrap_answer_is_held_for_its_ttl_within_bounds :: proc(t: ^testing.T) {
@@ -170,8 +171,8 @@ test_a_bootstrap_answer_is_held_for_its_ttl_within_bounds :: proc(t: ^testing.T)
 		{ttl = 1, want = BOOTSTRAP_MIN_TTL},
 		{ttl = 300, want = 300 * time.Second},
 		{ttl = u32(BOOTSTRAP_TTL / time.Second) + 1, want = BOOTSTRAP_TTL},
-		// The top bit set reads as zero (RFC 2181 section 8), not as 68 years.
-		{ttl = 0x8000_012c, want = BOOTSTRAP_MIN_TTL},
+		// The top bit set is positive (RFC 8767 section 4), so held at the cap.
+		{ttl = 0x8000_012c, want = BOOTSTRAP_TTL},
 	}
 	for row in rows {
 		testing.expectf(t, bootstrap_ttl(row.ttl) == row.want, "TTL %d is held %v, want %v", row.ttl, bootstrap_ttl(row.ttl), row.want)

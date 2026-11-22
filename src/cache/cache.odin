@@ -1130,12 +1130,12 @@ The ceiling this cache puts on a TTL, for an answer that is not coming out of it
 already; a forwarded answer is bounded by the caller, and this is the figure to
 bound it by. Reported rather than read off the configuration because the two are
 not the same number: `make_cache` reads an unset `max_ttl` as a day, and a
-caller that went to the configuration would apply zero. No cache means no
-ceiling - `cache.enabled: false` leaves nothing of this setting in play.
+caller that went to the configuration would apply zero. With no cache the
+setting is not in play, and the ceiling is `dns.TTL_CAP` (RFC 8767 section 4).
 */
 ttl_ceiling :: proc(c: ^Cache) -> u32 {
 	if c == nil {
-		return dns.TTL_MAX
+		return dns.TTL_CAP
 	}
 	// Atomic, being read outside the shard locks `reconfigure` writes it under.
 	return sync.atomic_load(&c.max_ttl)
@@ -1490,7 +1490,7 @@ thing in both directions.
 			the rest of the SOA figure. The answer section alone: the SOA's own
 			TTL already bounds `soa_ttl`, and a short-lived record elsewhere -
 			a zero-TTL one in additional, say - is no reason to forget the
-			denial. Read off the decoded records, through RFC 2181 section 8
+			denial. Read off the decoded records, through `dns.sane_ttl`
 			as `read_ttls` reads them, so nothing depends on where in `ttls`
 			the section starts; an OPT there is transport, not a TTL.
 			*/

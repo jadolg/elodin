@@ -59,7 +59,7 @@ bootstrap_cache: struct {
 
 /*
 How long a bootstrap answer is held: its record's TTL (RFC 1035 section 3.2.1),
-read as RFC 2181 section 8 asks (`dns.sane_ttl`), within `BOOTSTRAP_MIN_TTL` and
+read as RFC 8767 section 4 asks (`dns.sane_ttl`), within `BOOTSTRAP_MIN_TTL` and
 `BOOTSTRAP_TTL`.
 */
 @(private)

@@ -1305,8 +1305,8 @@ pc_dnssec_type :: proc(t: u16) -> bool {
 /*
 The lowest TTL among the records of `u`'s RRset in the section `recs` holds,
 as `dns.cap_ttls` reads one: the run of records next to each other with one
-owner (case aside), type and class, RRSIG and OPT never part of one, each TTL read as
-RFC 2181 section 8 asks. `grouped` is false for a record alone in its run. For
+owner (case aside), type and class, RRSIG and OPT never part of one, each TTL read
+through `dns.sane_ttl`. `grouped` is false for a record alone in its run. For
 an RRSIG, the lowest of the run it follows and covers, which `cap_ttls` holds
 it to.
 */
@@ -1314,9 +1314,6 @@ it to.
 pc_rrset_lowest_ttl :: proc(u: Pw_RR, recs: []Pw_RR) -> (lowest: u32, grouped: bool) {
 	same :: proc(a, b: Pw_RR) -> bool {
 		return a.type != 46 && a.type != 41 && a.type == b.type && a.class == b.class && pw_names_equal_fold(a.name, b.name)
-	}
-	sane :: proc(ttl: u32) -> u32 {
-		return 0 if ttl & 0x8000_0000 != 0 else ttl
 	}
 	for r, i in recs {
 		if r.start != u.start {
@@ -1352,7 +1349,7 @@ pc_rrset_lowest_ttl :: proc(u: Pw_RR, recs: []Pw_RR) -> (lowest: u32, grouped: b
 		}
 		lowest = max(u32)
 		for k in first ..= last {
-			lowest = min(lowest, sane(recs[k].ttl))
+			lowest = min(lowest, dns.sane_ttl(recs[k].ttl))
 		}
 		return lowest, true
 	}
@@ -1394,6 +1391,9 @@ pc_ttl :: proc(
 	}
 	if reason == "" {
 		reason = pc_lapsing_ttl(c, ref, e, policy)
+	}
+	if reason == "" && !policy.cache && ref.ttl > dns.TTL_CAP && e.ttl == dns.TTL_CAP {
+		reason = "with the cache off, a ttl is capped at dns.TTL_CAP, seven days (RFC 8767 section 4)"
 	}
 	if reason == "" {
 		if policy.cache {
@@ -1523,7 +1523,7 @@ pc_lapsing_ttl :: proc(c: ^Parity_Compare, u, e: Pw_RR, policy: Parity_Policy) -
 	if !signed || left >= u.ttl {
 		return ""
 	}
-	ceiling := min(u.ttl, PARITY_CACHE_MAX_TTL) if policy.cache else u.ttl
+	ceiling := min(u.ttl, PARITY_CACHE_MAX_TTL) if policy.cache else min(u.ttl, dns.TTL_CAP)
 	ceiling = min(ceiling, left)
 	if e.ttl > ceiling + 2 || e.ttl + policy.cache_age + 1 < ceiling {
 		return ""
