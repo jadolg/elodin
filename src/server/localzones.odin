@@ -375,10 +375,11 @@ Special_Use :: enum u8 {
 	// as RFC 6303 section 3 asks; the argument for why `home.arpa.` is not
 	// simply `Nonexistent` is above.
 	Empty_Zone,
-	// NODATA: a name inside an empty zone with a route, anchor or rewrite below
-	// it. The zone down there exists, so this name does too, and a name error
-	// for it would deny the routed zone to an RFC 8020 cache. Also the `DS` at a
-	// route's apex whose parent is the empty zone.
+	// NODATA: a name in an `Empty_Zone` or `Nonexistent` zone with a route or
+	// anchor below it, or a rewrite at or below it (`denial_unless_zone_below`).
+	// That name exists, and a name error for it would deny what is below to an
+	// RFC 8020 cache. Also the `DS` at a route's apex whose parent is the empty
+	// zone.
 	Empty_Nonterminal,
 }
 
@@ -438,18 +439,18 @@ special_use_zone :: proc(
 		return "localhost.", .Loopback
 	}
 	if dns.name_at_or_below(name, "invalid.") {
-		return "invalid.", .Nonexistent
+		return denial_unless_zone_below(s, name, "invalid.", .Nonexistent)
 	}
 	// The three an operator can hand back to the upstream, each for a
 	// deployment that really is served there.
 	if live(s).cfg.special_use.onion && dns.name_at_or_below(name, "onion.") {
-		return "onion.", .Nonexistent
+		return denial_unless_zone_below(s, name, "onion.", .Nonexistent)
 	}
 	if live(s).cfg.special_use.local && dns.name_at_or_below(name, "local.") {
-		return "local.", .Nonexistent
+		return denial_unless_zone_below(s, name, "local.", .Nonexistent)
 	}
 	if live(s).cfg.special_use.test && dns.name_at_or_below(name, "test.") {
-		return "test.", .Nonexistent
+		return denial_unless_zone_below(s, name, "test.", .Nonexistent)
 	}
 	if live(s).cfg.special_use.home_arpa && dns.name_at_or_below(name, "home.arpa.") {
 		// The delegation's own DS, and only at the apex: a DS below it is a
@@ -458,7 +459,7 @@ special_use_zone :: proc(
 		if type == .DS && dns.name_equal_fold(name, "home.arpa.") {
 			return "", .None
 		}
-		return "home.arpa.", .Empty_Zone
+		return denial_unless_zone_below(s, name, "home.arpa.", .Empty_Zone)
 	}
 	// The RFC 6303 reverse zones (issue #321). Not in `config.check_route_reachable`'s
 	// copy, because a route is exactly what stands this down: a router answering
@@ -488,37 +489,35 @@ special_use_zone :: proc(
 				if type == .DS && at_apex {
 					return "", .None
 				}
-				if !at_apex && has_zone_below(s, name) {
-					return z, .Empty_Nonterminal
-				}
-				return z, .Empty_Zone
+				return denial_unless_zone_below(s, name, z, .Empty_Zone)
 			}
 		}
 	}
 	return "", .None
 }
 
-// Whether a route, an anchor or a rewrite puts a name strictly below `name`,
-// making it an empty non-terminal rather than a name that does not exist. A
-// rewrite counts by its own domain and by the PTR `reverse.odin` synthesises
-// from its address; erring wide only turns an NXDOMAIN into a NODATA.
+/*
+`zone` and `kind`, a zone whose names do not exist, unless `has_zone_below`
+finds a name at or below `name`: then `name` exists, and is an
+`.Empty_Nonterminal` (NODATA, not a name error that would deny that name to an
+RFC 8020 cache). An `.Empty_Zone` apex keeps its own answer, the SOA and NS.
+*/
+@(private = "file")
+denial_unless_zone_below :: proc(s: ^Server, name, zone: string, kind: Special_Use) -> (string, Special_Use) {
+	if !(kind == .Empty_Zone && dns.name_equal_fold(name, zone)) && has_zone_below(s, name) {
+		return zone, .Empty_Nonterminal
+	}
+	return zone, kind
+}
+
+// Whether a route, an anchor or a rewrite puts a name below `name`, making it
+// an empty non-terminal rather than a name that does not exist. A rewrite counts
+// at `name` too (`rewrite_at_or_below`); erring wide only turns an NXDOMAIN into
+// a NODATA.
 @(private)
 has_zone_below :: proc(s: ^Server, name: string) -> bool {
-	for r in live(s).cfg.rewrites {
-		// "*.x." is held as "x." and answers below it, so "x." is above a name.
-		if dns.name_below(r.domain, name) || (r.wildcard && dns.name_equal_fold(r.domain, name)) {
-			return true
-		}
-		if r.wildcard || !r.ptr {
-			continue
-		}
-		for a in r.answers {
-			local := (a.kind == .A && address_is_local_v4(a.v4)) || (a.kind == .AAAA && address_is_local_v6(a.v6))
-			buf: [80]u8
-			if local && dns.name_below(reverse_name_of(a, buf[:]), name) {
-				return true
-			}
-		}
+	if rewrite_at_or_below(s, name) {
+		return true
 	}
 	for route in live(s).routes {
 		for domain in route.domains {
@@ -530,6 +529,36 @@ has_zone_below :: proc(s: ^Server, name: string) -> bool {
 	for zone in live(s).anchor_zones {
 		if dns.name_below(zone, name) {
 			return true
+		}
+	}
+	return false
+}
+
+/*
+Whether a rewrite answers data at `name` or below it, so that `name` exists (RFC
+1034 section 3.1) and a name error for it is untrue. A rule counts by its own
+domain, by every name a wildcard rule matches (an additive rule leaves other
+types at such a name to the upstream), and by the PTR `reverse.odin`
+synthesises from its address.
+*/
+@(private)
+rewrite_at_or_below :: proc(s: ^Server, name: string) -> bool {
+	// A synthesised PTR is only ever below `arpa.`.
+	reverse := dns.name_at_or_below("arpa.", name) || dns.name_at_or_below(name, "arpa.")
+	for r in live(s).cfg.rewrites {
+		// "*.x." is held as "x." and answers below it.
+		if dns.name_at_or_below(r.domain, name) || (r.wildcard && dns.name_below(name, r.domain)) {
+			return true
+		}
+		if r.wildcard || !r.ptr || !reverse {
+			continue
+		}
+		for a in r.answers {
+			local := (a.kind == .A && address_is_local_v4(a.v4)) || (a.kind == .AAAA && address_is_local_v6(a.v6))
+			buf: [80]u8
+			if local && dns.name_at_or_below(reverse_name_of(a, buf[:]), name) {
+				return true
+			}
 		}
 	}
 	return false

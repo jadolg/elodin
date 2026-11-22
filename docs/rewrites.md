@@ -74,9 +74,16 @@ and `--txt-record`: a real domain keeps its website while you add mail records.
 Add an address, a name or `block` to the rule and it answers for the whole name,
 so types it has no record of are NODATA.
 
-For an internal-only name that nothing else resolves, an additive rule makes its
-other types NXDOMAIN rather than NODATA, and a client that caches that stops
-asking for the MX or SRV too (RFC 8020). Give such a rule an address or `block`.
+**Names a rule makes exist.** A name above a rule (`b.example` for a rule on
+`a.b.example`), a wildcard rule's own domain (`example` for `*.example`), and
+the types an additive rule does not answer are looked up upstream. If the
+upstream answers NXDOMAIN, the client gets NODATA with the upstream's SOA: the
+name exists here, and a client that caches a name error drops every name below
+it too (RFC 8020). A signed NXDOMAIN (one carrying NSEC or NSEC3, or validated
+here) is passed on as it is, as is one whose CNAME chain cannot be followed to
+its end or runs past 32 records. A reload that changes `rewrites` keeps the
+answer cache, so such an answer already cached keeps its rcode until it expires,
+as any cached answer does (see [cache](cache.md)).
 
 **CNAME constraints.** A CNAME must be the only record in its rule, and there may
 be only one (RFC 2181 section 10.1). Put other records on the name it points at.

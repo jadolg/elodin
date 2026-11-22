@@ -1202,6 +1202,8 @@ Query_State :: struct {
 	unproven_apex_ds: bool,
 	// The validator's extended error, which the store keeps with the answer.
 	answer_ede:       u16,
+	// The validator proved this answer Secure, whatever AD ends up saying.
+	proven:           bool,
 
 	// The answer, once a stage has one.
 	using result:     Resolution,
@@ -1525,7 +1527,7 @@ answer_locally :: proc(st: ^Query_State) -> bool {
 		// A private reverse zone is not counted: every LAN PTR lands there, and
 		// folded in it would drown the `.onion` and `localhost.` signal the
 		// counter exists for. The query log still tells them apart.
-		private_reverse := kind == .Empty_Nonterminal || (kind == .Empty_Zone && zone != "home.arpa.")
+		private_reverse := dns.name_at_or_below(zone, "arpa.") && zone != "home.arpa."
 		if len(out) == 0 {
 			// Nothing built is a failure, as for a rewrite, whichever zone.
 			count_answer(&st.s.stats.failed)
@@ -2640,6 +2642,7 @@ validate_reply :: proc(st: ^Query_State) -> bool {
 			return answered(st, out, .Failed, built)
 		case .Secure:
 			sync.atomic_add(&st.s.stats.secure, 1)
+			st.proven = true
 		}
 		presented, built := present_response(st.resp, st.msg, st.q.type, result, st.spent, st.allocator)
 		if !built {
@@ -2676,6 +2679,61 @@ counts_as_bogus :: proc(result: dnssec.Result) -> bool {
 		return true
 	}
 	return !result.shed && !reading_refused_verdict(result)
+}
+
+/*
+Turns an upstream NXDOMAIN into NODATA, in place, where a rewrite answers at or
+below the name denied: the question's name, or the end of its CNAME chain (RFC
+6604 section 2.1). That name exists (RFC 1034 section 3.1), and a name error for
+it would have an RFC 8020 cache deny the rewrite's names below it as well. The
+SOA stays, so the answer is NODATA as RFC 2308 section 2.2 shapes it.
+
+A signed denial is left alone: an NSEC or NSEC3 record proves a name error,
+which a validator downstream would hold against a NOERROR, and a denial this
+server proved Secure is one even where its proofs were stripped and AD
+cleared. So is a reply
+whose chain cannot be followed to its end, or that is longer than
+`dns.MAX_ALIAS_REFERRAL_RECORDS`, the bound `peek_referral` walks chains to.
+*/
+@(private)
+nodata_over_rewrite :: proc(st: ^Query_State) {
+	resp := st.resp
+	if len(resp) < dns.HEADER_SIZE || resp[3] & 0x0f != u8(dns.Rcode.NX_Domain) || len(live(st.s).cfg.rewrites) == 0 {
+		return
+	}
+	if st.proven {
+		return
+	}
+	if int(resp[6]) << 8 | int(resp[7]) > dns.MAX_ALIAS_REFERRAL_RECORDS {
+		return
+	}
+	m, err := dns.decode_message(resp, st.allocator, st.spent)
+	if err != .None {
+		return
+	}
+	for rec in m.authority {
+		if rec.type == .NSEC || rec.type == .NSEC3 {
+			return
+		}
+	}
+	name := st.q.name
+	if len(m.answer) > 0 {
+		_, target, aliased, unreadable := dns.alias_chain(resp)
+		if unreadable || !aliased {
+			return
+		}
+		// A chain that ends there has no CNAME on from its target: one that
+		// does is a loop `alias_chain` ran its steps out in.
+		for rec in m.answer {
+			if rec.type == .CNAME && dns.name_equal_fold(rec.name, target) {
+				return
+			}
+		}
+		name = target
+	}
+	if rewrite_at_or_below(st.s, name) {
+		resp[3] &~= 0x0f
+	}
 }
 
 /*
@@ -2747,6 +2805,8 @@ finish_answer :: proc(st: ^Query_State) {
 	// `signatures_lapse` reads no bound at all for a message that carries none.
 	signed_left, signed := dns.signatures_lapse(st.resp, u32(time.time_to_unix(loop.now())))
 	dns.cap_ttls(st.resp, min(cache.ttl_ceiling(live(st.s).answers), signed_left))
+	// Above the decode, so the cache stores what the client is sent.
+	nodata_over_rewrite(st)
 
 	/*
 	Decoded once for the three things below that read it: the rebinding check

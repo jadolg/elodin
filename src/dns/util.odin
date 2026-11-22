@@ -574,11 +574,10 @@ skip_record :: proc(msg: []u8, pos: int) -> (type: Type, fixed: int, next: int, 
 	return type, fixed, end, true
 }
 
-// The most answer or authority records `peek_referral` follows a chain through:
-// a chain as long as the validator follows (`dnssec.MAX_CNAME_CHAIN`), each link
-// beside its RRSIG. It bounds both the decode and the walk, which is quadratic
-// in the answer.
-@(private)
+// The most answer or authority records a chain is followed through, by
+// `peek_referral` and the server's `nodata_over_rewrite`: a chain as long as the
+// validator follows (`dnssec.MAX_CNAME_CHAIN`), each link beside its RRSIG. It
+// bounds both the decode and the walk, which is quadratic in the answer.
 MAX_ALIAS_REFERRAL_RECORDS :: 32
 
 /*
@@ -601,9 +600,9 @@ peek_alias_target :: proc(msg: []u8) -> (target: string, aliased: bool) {
 `unreadable` where a link on the chain was kept raw (`decode_record`): the chain
 goes somewhere and nobody here can say where, so `aliased` is false beside it.
 Every CNAME at an owner is looked at, not just the first, so where a second one
-sits in the section does not decide whether the chain can be read.
+sits in the section does not decide whether the chain can be read. Unbounded:
+the caller holds the answer to `MAX_ALIAS_REFERRAL_RECORDS`.
 */
-@(private)
 alias_chain :: proc(msg: []u8) -> (asked, target: string, aliased, unreadable: bool) {
 	decoded, err := decode_through_answer(msg, context.temp_allocator)
 	// A chain this server had no memory to read goes nobody here knows where.

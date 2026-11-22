@@ -28,19 +28,6 @@ designating_server :: proc(cfg: ^config.Config) -> Server {
 @(private = "file")
 DOH_PARAMS :: "\x00\x01\x00\x0c\x02h2\x08http/1.1" + "\x00\x03\x00\x02\x20\xfb" + "\x00\x07\x00\x10/dns-query{?dns}"
 
-// `name`'s `type` asked of `s` with RD set, and `opt` on it when there is one;
-// a zero message, and a failed case, when nothing readable came back.
-@(private = "file")
-ask :: proc(t: ^testing.T, s: ^Server, name: string, type: dns.Type, opt: Maybe(dns.Record) = nil, loc := #caller_location) -> dns.Message {
-	out, _, ok := handle_query(s, test_query(name, type, id = 0x4243, opt = opt), .UDP, "127.0.0.1:5555", context.temp_allocator)
-	if !testing.expectf(t, ok, "%s %v went unanswered", name, type, loc = loc) {
-		return {}
-	}
-	decoded, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expectf(t, derr == .None, "the answer to %s %v does not decode: %v", name, type, derr, loc = loc)
-	return decoded
-}
-
 // `n` AAAA answers for the designated name, more than a 512-byte answer holds.
 @(private = "file")
 rewrite_many_addresses :: proc(cfg: ^config.Config, n: int) {
@@ -58,7 +45,7 @@ test_ddr_designates_each_encrypted_listener :: proc(t: ^testing.T) {
 	cfg: config.Config
 	s := designating_server(&cfg)
 
-	resp := ask(t, &s, "_dns.resolver.arpa.", .SVCB)
+	resp := ask_message(t, &s, "_dns.resolver.arpa.", .SVCB)
 	testing.expect_value(t, dns.rcode_of(resp), dns.Rcode.No_Error)
 	if !testing.expect_value(t, len(resp.answer), 2) {
 		return
@@ -87,12 +74,12 @@ test_ddr_designates_nothing_without_a_covered_listener :: proc(t: ^testing.T) {
 	s := designating_server(&cfg)
 	s.ddr = {}
 
-	resp := ask(t, &s, "_dns.resolver.arpa.", .SVCB)
+	resp := ask_message(t, &s, "_dns.resolver.arpa.", .SVCB)
 	testing.expect_value(t, len(resp.answer), 0)
 	testing.expect_value(t, len(resp.authority), 1)
 
 	s.ddr = {doh = true}
-	resp = ask(t, &s, "_dns.resolver.arpa.", .SVCB)
+	resp = ask_message(t, &s, "_dns.resolver.arpa.", .SVCB)
 	if testing.expect_value(t, len(resp.answer), 1) {
 		doh := resp.answer[0].data.(dns.Rdata_SVCB)
 		testing.expectf(t, string(doh.params) == DOH_PARAMS, "the DoH designation alone has SvcParams % x", doh.params)
@@ -113,11 +100,11 @@ test_ddr_designates_only_the_svcb_probe :: proc(t: ^testing.T) {
 		type: dns.Type,
 	}{{"_dns.resolver.arpa.", .A}, {"_dns.resolver.arpa.", .HTTPS}, {"resolver.arpa.", .SVCB}, {"x._dns.resolver.arpa.", .SVCB}}
 	for p in probes {
-		resp := ask(t, &s, p.name, p.type)
+		resp := ask_message(t, &s, p.name, p.type)
 		testing.expectf(t, len(resp.answer) == 0, "%s %v was designated", p.name, p.type)
 		testing.expectf(t, len(resp.authority) == 1, "%s %v has no SOA", p.name, p.type)
 	}
-	resp := ask(t, &s, "_DNS.Resolver.ARPA.", .SVCB)
+	resp := ask_message(t, &s, "_DNS.Resolver.ARPA.", .SVCB)
 	testing.expect_value(t, len(resp.answer), 2)
 
 	free_all(context.temp_allocator)
@@ -142,7 +129,7 @@ test_ddr_additional_addresses_come_from_the_rewrite :: proc(t: ^testing.T) {
 	}
 	cfg.rewrites = rules
 
-	resp := ask(t, &s, "_dns.resolver.arpa.", .SVCB)
+	resp := ask_message(t, &s, "_dns.resolver.arpa.", .SVCB)
 	testing.expect_value(t, len(resp.answer), 2)
 	if !testing.expect_value(t, len(resp.additional), 2) {
 		return
@@ -161,7 +148,7 @@ test_ddr_drops_the_addresses_before_the_designation :: proc(t: ^testing.T) {
 	s := designating_server(&cfg)
 	rewrite_many_addresses(&cfg, 40)
 
-	resp := ask(t, &s, "_dns.resolver.arpa.", .SVCB)
+	resp := ask_message(t, &s, "_dns.resolver.arpa.", .SVCB)
 	testing.expect_value(t, len(resp.answer), 2)
 	testing.expectf(t, len(resp.additional) < 40, "all %d addresses fit in 512 bytes", len(resp.additional))
 	testing.expect(t, !resp.flags.tc, "the designation came back truncated")
@@ -186,18 +173,18 @@ test_ddr_addresses_follow_the_rewrite_precedence :: proc(t: ^testing.T) {
 		{domain = "lan.", wildcard = true, ttl = 60, answers = []config.Rewrite_Answer{{kind = .A, v4 = {10, 0, 0, 5}}}},
 	}
 
-	direct := ask(t, &s, "dns.lan.", .A)
+	direct := ask_message(t, &s, "dns.lan.", .A)
 	if !testing.expect_value(t, len(direct.answer), 1) {
 		return
 	}
-	resp := ask(t, &s, "_dns.resolver.arpa.", .SVCB)
+	resp := ask_message(t, &s, "_dns.resolver.arpa.", .SVCB)
 	if testing.expect_value(t, len(resp.additional), 1) {
 		testing.expect_value(t, resp.additional[0].data.(dns.Rdata_A).addr, direct.answer[0].data.(dns.Rdata_A).addr)
 	}
 
 	// A rule that sinks the name has no address of the resolver to give.
 	cfg.rewrites = []config.Rewrite{{domain = "dns.lan.", ttl = 60, answers = []config.Rewrite_Answer{{kind = .Block}}}}
-	resp = ask(t, &s, "_dns.resolver.arpa.", .SVCB)
+	resp = ask_message(t, &s, "_dns.resolver.arpa.", .SVCB)
 	testing.expect_value(t, len(resp.additional), 0)
 	testing.expect_value(t, len(resp.answer), 2)
 
@@ -235,7 +222,7 @@ test_ddr_addresses_keep_the_opt_record :: proc(t: ^testing.T) {
 		s := designating_server(&cfg)
 		rewrite_many_addresses(&cfg, c.addresses)
 
-		resp := ask(t, &s, "_dns.resolver.arpa.", .SVCB, dns.make_opt(1232, false))
+		resp := ask_message(t, &s, "_dns.resolver.arpa.", .SVCB, dns.make_opt(1232, false))
 
 		testing.expect_value(t, len(resp.answer), 2)
 		testing.expectf(t, dns.edns_present(resp), "%d addresses took the OPT record's place", c.addresses)
@@ -265,11 +252,11 @@ test_ddr_addresses_go_only_with_the_designation :: proc(t: ^testing.T) {
 	}
 
 	// The premise: the designation carries the address.
-	designation := ask(t, &s, "_dns.resolver.arpa.", .SVCB)
+	designation := ask_message(t, &s, "_dns.resolver.arpa.", .SVCB)
 	testing.expect_value(t, len(designation.additional), 1)
 
 	for type in ([]dns.Type{.SOA, .NS, .ANY}) {
-		resp := ask(t, &s, "resolver.arpa.", type)
+		resp := ask_message(t, &s, "resolver.arpa.", type)
 		testing.expectf(t, len(resp.answer) > 0, "resolver.arpa. %v: no apex answer", type)
 		testing.expectf(t, len(resp.additional) == 0, "resolver.arpa. %v: additional %v", type, resp.additional)
 	}

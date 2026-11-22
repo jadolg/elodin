@@ -588,8 +588,11 @@ because validation runs before the answer is stored and not when it is served;
 `rebind`, for the same reason. And the lifetimes the cache stamps on an entry when it stores it.
 
 Not the blocking rules, which the filter engine's own generation already covers
-(see `rules_generation`), and not the rewrites, the reserved names or the
-access list, which are all answered ahead of the cache. Not `dnssec` or `rebind`
+(see `rules_generation`), and not the reserved names or the access list, which
+are answered ahead of the cache. Nor the rewrites, which are too, though
+`nodata_over_rewrite` decides by them what an upstream NXDOMAIN is stored as:
+an entry stored under the old rules lives out its lifetime rather than every
+answer being thrown away for a rule edit. Not `dnssec` or `rebind`
 keys edited while that feature is off before and after, which judged nothing
 then and judge nothing now. Each flush is a cold cache for every client, so a
 reload that only retunes a timeout does not pay for one.
