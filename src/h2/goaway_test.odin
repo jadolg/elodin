@@ -3,7 +3,9 @@ package h2
 import "core:mem"
 import "core:slice"
 import "core:testing"
+import "core:thread"
 import "core:time"
+import "elodin:loop"
 
 // A GOAWAY payload: the last stream id and `code`.
 @(private = "file")
@@ -286,4 +288,84 @@ test_a_goaway_with_an_error_code_ends_the_connection_at_once :: proc(t: ^testing
 		client_stream_destroy(c, s)
 		client_done(t, c, &track, "client, error goaway", &log)
 	}
+}
+
+/*
+A stream read before another fiber claimed this end's drain GOAWAY, and above
+the last stream id it names, is not given to a handler: the client was told it
+was not processed and will ask for it again (RFC 9113 6.8).
+*/
+@(test)
+test_a_stream_past_this_ends_goaway_is_not_dispatched :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+	log: Request_Log
+	c := make_conn(IO{read = no_read, write = discard_write}, counting_handler, &log, allocator)
+	// As `goaway_claim_locked` leaves it, naming stream 1.
+	loop.lock(&c.mu)
+	_, claimed := goaway_claim_locked(c, .No_Error)
+	c.goaway_last = 1
+	c.goaway_writing = false
+	loop.unlock(&c.mu)
+	testing.expect(t, claimed, "the premise: the GOAWAY was claimed")
+
+	block := request_block()
+	handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS | FLAG_END_STREAM, stream_id = 3}, block)
+	testing.expect_value(t, log.dispatched, 0)
+	_, kept := c.streams[3]
+	testing.expect(t, !kept, "the refused stream was left in the table")
+	conn_done(t, c, &track, "stream past goaway")
+}
+
+@(private = "file")
+Late_Goaway :: struct {
+	conn: ^Conn,
+	ok:   bool,
+}
+
+// Writes the GOAWAY claimed before `serve` began closing, once `serve` waits on it.
+@(private = "file")
+write_late_goaway :: proc(l: ^Late_Goaway) {
+	l.ok = wait_for_waiter(&l.conn.cond)
+	frame := goaway_frame(1, .No_Error)
+	goaway_write(l.conn, frame[:])
+}
+
+/*
+A drain GOAWAY claimed on a handler's fiber is written even when `serve` is
+already on its way out: its close waits for the write rather than refusing it.
+*/
+@(test)
+test_serve_waits_for_a_goaway_claimed_elsewhere_before_closing :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	allocator := track_allocations(&track)
+
+	input := make([dynamic]u8, 0, 64, context.temp_allocator)
+	append(&input, ..transmute([]u8)string(PREFACE))
+	append(&input, ..frame_bytes(.Settings, 0, 0, nil))
+	script := slice.clone(input[:])
+	defer delete(script)
+	h := Serve_Harness {
+		in_data = script,
+		written = make([dynamic]u8, 0, 128, allocator),
+	}
+	c := make_conn(IO{user = &h, read = serve_harness_read, write = serve_harness_write}, ignore_request, nil, allocator)
+	c.write_timeout = 5 * time.Second
+	loop.lock(&c.mu)
+	_, claimed := goaway_claim_locked(c, .No_Error)
+	loop.unlock(&c.mu)
+	testing.expect(t, claimed, "the premise: the GOAWAY was claimed")
+
+	l := Late_Goaway {
+		conn = c,
+	}
+	writer := thread.create_and_start_with_poly_data(&l, write_late_goaway)
+	serve(c)
+	thread.join(writer)
+	thread.destroy(writer)
+
+	testing.expect(t, l.ok, "serve did not wait for the claimed GOAWAY")
+	testing.expect(t, h.saw_goaway && h.code == .No_Error, "the claimed GOAWAY was refused by the close")
+	delete(h.written)
+	conn_done(t, c, &track, "goaway claimed elsewhere")
 }

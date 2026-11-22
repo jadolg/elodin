@@ -204,6 +204,11 @@ Conn :: struct {
 	// The peer sent GOAWAY: the connection ends once its streams are answered.
 	// Under `mu`.
 	peer_goaway:    bool,
+	// The last stream id this end's GOAWAY names, and whether that GOAWAY is
+	// claimed but not yet written, which `serve` waits out before it closes the
+	// connection under the writer. Both under `mu`.
+	goaway_last:    u32,
+	goaway_writing: bool,
 	/*
 	How many more DATA frames for a stream that was opened and has since
 	closed still draw a courteous RST_STREAM(STREAM_CLOSED), rather than just
@@ -357,6 +362,13 @@ running; they hold their own references.
 serve :: proc(c: ^Conn) {
 	defer {
 		loop.lock(&c.mu)
+		// A GOAWAY claimed on a handler's fiber goes out before the close would
+		// refuse it, bounded as any write is.
+		for c.goaway_writing {
+			if !loop.cond_wait_with_timeout(&c.cond, &c.mu, c.write_timeout) {
+				break
+			}
+		}
 		c.closed = true
 		loop.cond_broadcast(&c.cond)
 		loop.unlock(&c.mu)
@@ -518,7 +530,7 @@ handle_frame :: proc(c: ^Conn, h: Frame_Header, payload: []u8) -> bool {
 		}
 		loop.unlock(&c.mu)
 		if drained {
-			_ = write_all(c, frame[:])
+			goaway_write(c, frame[:])
 		}
 		return !drained
 
@@ -1479,9 +1491,19 @@ dispatch :: proc(c: ^Conn, s: ^Stream, req: ^Request) -> bool {
 	// the stream, and a reset arriving for an answered stream must not be read
 	// as one nobody was ever given.
 	loop.lock(&c.mu)
-	s.dispatched = true
-	c.last_dispatched = max(c.last_dispatched, s.id)
+	// Nothing above this end's GOAWAY is acted on (RFC 9113 6.8), including a
+	// stream read before a drain claimed on another fiber named its last.
+	past := c.goaway_sent && s.id > c.goaway_last
+	if !past {
+		s.dispatched = true
+		c.last_dispatched = max(c.last_dispatched, s.id)
+	}
 	loop.unlock(&c.mu)
+	if past {
+		request_destroy(c, req)
+		close_stream(c, s.id)
+		return false
+	}
 	c.handler(c, req)
 	// A handler can end the connection too, through `shutdown`. `serve` asks the
 	// same after every frame; this tells the frame handler that dispatched it.
@@ -1586,7 +1608,7 @@ goaway :: proc(c: ^Conn, code: Error_Code) {
 	frame, claimed := goaway_claim_locked(c, code)
 	loop.unlock(&c.mu)
 	if claimed {
-		_ = write_all(c, frame[:])
+		goaway_write(c, frame[:])
 	}
 }
 
@@ -1606,8 +1628,19 @@ goaway_claim_locked :: proc(c: ^Conn, code: Error_Code) -> (frame: [FRAME_HEADER
 	read, or parked for its body, was not acted on, and the last stream id
 	leaves it out so the client may retry it (RFC 9113 6.8).
 	*/
-	last := c.last_dispatched if code == .Internal_Error else c.last_stream_id
-	return goaway_frame(last, code), true
+	c.goaway_last = c.last_dispatched if code == .Internal_Error else c.last_stream_id
+	c.goaway_writing = true
+	return goaway_frame(c.goaway_last, code), true
+}
+
+// Write the GOAWAY `goaway_claim_locked` claimed, and let `serve` close.
+@(private)
+goaway_write :: proc(c: ^Conn, frame: []u8) {
+	_ = write_all(c, frame)
+	loop.lock(&c.mu)
+	c.goaway_writing = false
+	loop.cond_broadcast(&c.cond)
+	loop.unlock(&c.mu)
 }
 
 /*
@@ -1832,7 +1865,7 @@ close_stream :: proc(c: ^Conn, stream_id: u32, peer_sending := false) {
 	}
 	loop.unlock(&c.mu)
 	if drained {
-		_ = write_all(c, frame[:])
+		goaway_write(c, frame[:])
 	}
 }
 
