@@ -1042,6 +1042,49 @@ signatures_lapse :: proc(msg: []u8, now: u32) -> (left: u32, signed: bool) {
 	return
 }
 
+/*
+`age` seconds off every TTL in `msg`, in place, floored at zero: a reply that
+has sat that long in a cache (RFC 8484 section 5.1). Each TTL is read through
+`sane_ttl` first. OPT's TTL field is the extended rcode and flags and is left
+alone. In a denial (NXDOMAIN, or no answer records), a SOA in the authority
+section is first brought down to its MINIMUM, so the negative TTL, the lesser of
+the two (RFC 2308 section 5), loses the age as well; the MINIMUM itself is
+RDATA under the SOA's RRSIG and is not touched.
+Allocates nothing; a record that runs off the end ends the walk, its TTL aged if
+its fixed fields are inside the message.
+*/
+age_ttls :: proc(msg: []u8, age: u32) {
+	if age == 0 {
+		return
+	}
+	pos, total, ok := records_start(msg)
+	if !ok {
+		return
+	}
+	answers := int(u16(msg[6]) << 8 | u16(msg[7]))
+	authority := answers + int(u16(msg[8]) << 8 | u16(msg[9]))
+	denial := answers == 0 || msg[3] & 0x0f == u8(Rcode.NX_Domain)
+	for i in 0 ..< total {
+		type, fixed, next, rec_ok := skip_record(msg, pos)
+		if fixed == 0 {
+			return
+		}
+		if type != .OPT {
+			ttl := sane_ttl(read_ttl_at(msg, fixed + 4))
+			// MINIMUM is the RDATA's last four bytes; two root names and five
+			// 32-bit fields are the least a SOA holds.
+			if denial && rec_ok && type == .SOA && i >= answers && i < authority && next - (fixed + 10) >= 22 {
+				ttl = min(ttl, sane_ttl(read_ttl_at(msg, next - 4)))
+			}
+			write_ttl_at(msg, fixed + 4, ttl - age if ttl > age else 0)
+		}
+		if !rec_ok {
+			return
+		}
+		pos = next
+	}
+}
+
 // Rewrites each TTL to `original - elapsed`, floored at `floor_ttl`.
 patch_ttls :: proc(msg: []u8, offsets: []u16, originals: []u32, elapsed: u32, floor_ttl: u32 = 0) {
 	for o, i in offsets {

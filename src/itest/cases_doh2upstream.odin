@@ -350,6 +350,57 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 		}
 	}
 
+	// --- a DoH reply's Age is taken off its TTLs (RFC 8484 section 5.1) ---
+	{
+		age_payload := age_answer()
+		defer delete(age_payload)
+		Age_Case :: struct {
+			what: string,
+			alpn: []string,
+		}
+		age_cases := []Age_Case {
+			{what = "upstream: an h2 DoH reply's Age is taken off its TTLs, forwarded and cached", alpn = {"h2"}},
+			{what = "upstream: an http/1.1 DoH reply's Age is taken off its TTLs, forwarded and cached", alpn = {"http/1.1"}},
+		}
+		for tc, i in age_cases {
+			upstream_port := next_port(r)
+			mock := doh2_mock_make(upstream_port, "/dns-query", age_payload)
+			// A literal: the mock's threads read it after `end_case` frees the
+			// temporary allocator.
+			mock.age = AGE_HEADER
+			if age_payload == nil || !doh2_mock_start(mock, r.cert_file, r.key_file, tc.alpn) {
+				skip_case(r, tc.what, "cannot start the mock")
+				doh2_mock_stop(mock)
+				continue
+			}
+			udp_port := next_port(r)
+			config := base_config(udp_port, fmt.tprintf("[%s]", doh_upstream("aged", upstream_port)), timeout = "5s", cache = "{ enabled: true }")
+			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+			if ok {
+				start_case(r, tc.what)
+				want := u32(AGE_TTL - AGE_SECONDS)
+				for q in 0 ..< 2 {
+					res := query_udp(udp_port, build_query(AGE_QNAME, u16(dns.Type.A), id = u16(0x5290 + 2 * i + q)))
+					if !check(r, res.ok, "query %d: no response", q) {
+						continue
+					}
+					msg, decoded := decode_reply(r, res.wire)
+					if !decoded || !check(r, len(msg.answer) == 1, "query %d: %d answers", q, len(msg.answer)) {
+						continue
+					}
+					// A cache hit counts down from there by the seconds it was held.
+					ttl := msg.answer[0].ttl
+					check(r, ttl <= want && ttl + 5 >= want, "query %d: TTL %d, want %d (%d less the Age %d)", q, ttl, want, AGE_TTL, AGE_SECONDS)
+				}
+				h2_hits, h1_hits := doh2_mock_counts(mock)
+				check_eq_int(r, h2_hits + h1_hits, 1, "upstream queries")
+				end_case(r)
+				stop_server(&srv)
+			}
+			doh2_mock_stop(mock)
+		}
+	}
+
 	// --- a mock that cannot bind its port can still be stopped ---
 	/*
 	Another run on the box holding the port is how a parity scenario's mock
@@ -404,4 +455,33 @@ run_upstream_doh2_cases :: proc(r: ^Runner) {
 	}
 
 	delete(payload)
+}
+
+@(private = "file")
+AGE_QNAME :: "age.example."
+
+@(private = "file")
+AGE_TTL :: u32(600)
+
+@(private = "file")
+AGE_SECONDS :: u32(250)
+
+@(private = "file")
+AGE_HEADER :: "250"
+
+// An answer to `AGE_QNAME` A at TTL `AGE_TTL`.
+@(private = "file")
+age_answer :: proc() -> []u8 {
+	m := dns.Message {
+		question = []dns.Question{{name = AGE_QNAME, type = .A, class = .IN}},
+		answer   = []dns.Record{{name = AGE_QNAME, type = .A, class = .IN, ttl = AGE_TTL, data = dns.Rdata_A{addr = {10, 9, 9, 9}}}},
+	}
+	m.flags.qr = true
+	m.flags.rd = true
+	m.flags.ra = true
+	wire, _, err := dns.encode_message(m, context.allocator)
+	if err != .None {
+		return nil
+	}
+	return wire
 }

@@ -136,6 +136,9 @@ exchange_doh_h2 :: proc(
 				delete(resp.body, allocator)
 				return nil, .Bad_Response
 			}
+			// RFC 8484 section 5.1: "DoH clients MUST account for the Age response
+			// header field's value [RFC7234] when calculating the DNS TTL".
+			dns.age_ttls(resp.body, resp.age)
 			return resp.body, .None
 		case .Closed, .Refused:
 			// A refusal's head that came before the connection went is the
@@ -271,6 +274,9 @@ exchange_doh_h1 :: proc(
 			} else {
 				stream_close(&stream)
 			}
+			// RFC 8484 section 5.1: "DoH clients MUST account for the Age response
+			// header field's value [RFC7234] when calculating the DNS TTL".
+			dns.age_ttls(resp.body, resp.age)
 			return resp.body, .None
 		}
 

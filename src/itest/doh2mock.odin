@@ -56,6 +56,8 @@ Doh2_Mock :: struct {
 	// section of `trailers` after the body (RFC 9113 8.1). Zero for none.
 	trailer_head: int,
 	trailers:     []h2.Header_Field,
+	// With a 200, the `Age` value to send with it (RFC 9111 5.1). Empty for none.
+	age:          string,
 }
 
 doh2_mock_make :: proc(port: int, path: string, payload: []u8) -> ^Doh2_Mock {
@@ -250,23 +252,31 @@ doh2_handler :: proc(hc: ^h2.Conn, req: ^h2.Request) {
 	}
 	body := doh2_reply_body(m, req.body, context.temp_allocator)
 	if m.trailer_head != 0 {
-		doh2_respond_with_trailers(hc, req.stream_id, m.trailer_head, body, m.trailers)
+		doh2_respond_raw(hc, req.stream_id, m.trailer_head, body, nil, m.trailers, with_trailers = true)
+		return
+	}
+	if m.age != "" {
+		doh2_respond_raw(hc, req.stream_id, 200, body, []h2.Header_Field{{name = "age", value = m.age}}, nil, with_trailers = false)
 		return
 	}
 	h2.respond(hc, req.stream_id, h2.Response{status = 200, content_type = "application/dns-message", body = body})
 }
 
 /*
-A response with a trailer section, which `h2.respond` never sends, written as
-raw frames under the connection's lock as `respond` writes its own. Literals
-without indexing, so the client's HPACK table is left as the server's encoder
-expects. The stream stays in the mock's table until the connection goes.
+A response with header fields `extra` and, when `with_trailers`, a trailer
+section of `trailers` (empty or not), which `h2.respond` never sends, written as raw frames under the
+connection's lock as `respond` writes its own. Literals without indexing, so the
+client's HPACK table is left as the server's encoder expects. The stream stays
+in the mock's table until the connection goes.
 */
 @(private = "file")
-doh2_respond_with_trailers :: proc(hc: ^h2.Conn, stream_id: u32, status: int, body: []u8, trailers: []h2.Header_Field) {
+doh2_respond_raw :: proc(hc: ^h2.Conn, stream_id: u32, status: int, body: []u8, extra, trailers: []h2.Header_Field, with_trailers: bool) {
 	head := make([dynamic]u8, 0, 64, context.temp_allocator)
 	h2.encode_header(&head, ":status", fmt.tprint(status))
 	h2.encode_header(&head, "content-type", "application/dns-message")
+	for f in extra {
+		h2.encode_header(&head, f.name, f.value)
+	}
 	tail := make([dynamic]u8, 0, 64, context.temp_allocator)
 	for f in trailers {
 		h2.encode_header(&tail, f.name, f.value)
@@ -274,10 +284,12 @@ doh2_respond_with_trailers :: proc(hc: ^h2.Conn, stream_id: u32, status: int, bo
 	out := make([dynamic]u8, 0, len(head) + len(body) + len(tail) + 27, context.temp_allocator)
 	h2.write_frame_header(&out, len(head), .Headers, h2.FLAG_END_HEADERS, stream_id)
 	append(&out, ..head[:])
-	h2.write_frame_header(&out, len(body), .Data, 0, stream_id)
+	h2.write_frame_header(&out, len(body), .Data, 0 if with_trailers else h2.FLAG_END_STREAM, stream_id)
 	append(&out, ..body)
-	h2.write_frame_header(&out, len(tail), .Headers, h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM, stream_id)
-	append(&out, ..tail[:])
+	if with_trailers {
+		h2.write_frame_header(&out, len(tail), .Headers, h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM, stream_id)
+		append(&out, ..tail[:])
+	}
 	loop.lock(&hc.mu)
 	hc.io.write(hc.io.user, out[:])
 	loop.unlock(&hc.mu)
@@ -285,7 +297,7 @@ doh2_respond_with_trailers :: proc(hc: ^h2.Conn, stream_id: u32, status: int, bo
 
 /*
 A bodiless `status`, with `retry-after` when that is not empty, which
-`h2.Response` has no field for: raw frames, as `doh2_respond_with_trailers`
+`h2.Response` has no field for: raw frames, as `doh2_respond_raw`
 writes them.
 */
 @(private = "file")
@@ -395,6 +407,10 @@ doh2_serve_http1 :: proc(conn: ^Doh2_Conn) {
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: ")
 	strings.write_int(&b, len(reply))
+	if m.age != "" {
+		strings.write_string(&b, "\r\nAge: ")
+		strings.write_string(&b, m.age)
+	}
 	strings.write_string(&b, "\r\nConnection: close\r\n\r\n")
 	out := transmute([]u8)strings.to_string(b)
 

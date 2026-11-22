@@ -192,3 +192,32 @@ test_a_malformed_429_carries_no_status :: proc(t: ^testing.T) {
 	client_done(t, c, &track, "malformed 429", &log)
 	free_all(context.temp_allocator)
 }
+
+// RFC 9111 5.1: `Age` is delta-seconds; of a list, the first member; anything
+// else does not parse, and is ignored by the caller.
+@(test)
+test_age_of_reads_delta_seconds :: proc(t: ^testing.T) {
+	Row :: struct {
+		value:   string,
+		seconds: u32,
+		ok:      bool,
+	}
+	rows := []Row {
+		{value = "250", seconds = 250, ok = true},
+		{value = "0", seconds = 0, ok = true},
+		{value = "250, 10", seconds = 250, ok = true},
+		{value = "250 , 10", seconds = 250, ok = true},
+		{value = " 250\t", seconds = 250, ok = true},
+		{value = "99999999999", seconds = max(u32), ok = true},
+		{value = "", ok = false},
+		{value = "soon", ok = false},
+		{value = "-5", ok = false},
+		{value = "+5", ok = false},
+		{value = "2.5", ok = false},
+		{value = ", 250", ok = false},
+	}
+	for row in rows {
+		seconds, ok := age_of(row.value)
+		testing.expectf(t, ok == row.ok && seconds == row.seconds, "%q: %d %v, want %d %v", row.value, seconds, ok, row.seconds, row.ok)
+	}
+}
