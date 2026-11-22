@@ -337,7 +337,7 @@ sema_post :: proc(s: ^Sema, n := 1) {
 	}
 }
 
-sema_wait :: proc(s: ^Sema) {
+sema_wait :: proc(s: ^Sema) { // lint:allow the server package's tests wait on a loop semaphore across packages
 	_ = sema_wait_until(s, {})
 }
 

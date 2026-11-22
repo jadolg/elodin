@@ -290,11 +290,6 @@ covers :: proc(s: ^Set, name: string, flag: Rule_Flag, qtype: dns.Type) -> Cover
 	return .None
 }
 
-// Whether a rule covers `normalised` for `qtype`.
-set_lookup :: proc(s: ^Set, normalised: string, qtype: dns.Type) -> bool {
-	return set_cover(s, normalised, qtype) != .None
-}
-
 /*
 Whether a `$dnstype` rule covers `normalised` for some type, whichever it is: its
 own entry's apex, or a parent's subdomains.

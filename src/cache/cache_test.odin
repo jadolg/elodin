@@ -795,7 +795,7 @@ test_a_denial_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
 	// NXDOMAIN, empty authority.
 	nx := nodata
 	nx.question = []dns.Question{{name = "nx.example.test.", type = .A, class = .IN}}
-	dns.set_rcode(&nx, .NX_Domain)
+	nx.flags.rcode = u8(dns.Rcode.NX_Domain)
 	w2, m2 := wire_and_msg(nx)
 	testing.expect(t, !put(c, key_for(kb[:], "nx.example.test."), w2, m2), "an NXDOMAIN without a SOA was cached")
 
@@ -830,7 +830,7 @@ test_a_denial_whose_soa_ttl_has_the_top_bit_set_is_kept :: proc(t: ^testing.T) {
 	nx := dns.Message{id = 1, question = []dns.Question{{name = "nx.example.test.", type = .A, class = .IN}}}
 	nx.flags.qr = true
 	nx.flags.ra = true
-	dns.set_rcode(&nx, .NX_Domain)
+	nx.flags.rcode = u8(dns.Rcode.NX_Domain)
 	nx.authority = nx_target_soa("example.test.")
 	nx.authority[0].ttl = 0x8000_0e10
 	w, m := wire_and_msg(nx)

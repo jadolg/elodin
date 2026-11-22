@@ -285,7 +285,7 @@ ticket_key_cb :: proc "c" (
 // The name of the key sealing `ctx`'s tickets now, which a ticket carries in
 // its first 16 bytes; false on a client context. For tests outside this
 // package, which cannot see the keys themselves.
-ticket_key_name :: proc(ctx: ^Context) -> (name: [TLSEXT_KEYNAME_LENGTH]u8, ok: bool) {
+ticket_key_name :: proc(ctx: ^Context) -> (name: [TLSEXT_KEYNAME_LENGTH]u8, ok: bool) { // lint:allow the server's reload tests read it across packages, which a test file cannot export to
 	k := ticket_keys_of(ctx.ptr) if ctx != nil else nil
 	if k == nil {
 		return

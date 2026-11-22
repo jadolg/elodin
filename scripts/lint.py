@@ -6,6 +6,7 @@
 # instances that are correct where they stand. A line carrying `lint:allow`
 # followed by a reason is exempt from both. `testing.expect` calls are read
 # whole, across lines, since the format sits in the last argument.
+import collections
 import os
 import re
 import subprocess  # nosec B404: fixed argument lists, no shell
@@ -135,6 +136,80 @@ def expect_formats(path, source, hits):
             hits.append(f"{path}:{n}: expect-format: testing.expect does not format its message; use testing.expectf\n    {line.strip()}")
 
 
+# A procedure declaration, `#force_inline` and other directives allowed.
+PROC = re.compile(r"^([a-z_][a-z0-9_]*)\s*::\s*(?:#\w+\s+)*proc\b")
+# What the runtime or the linker calls, with no Odin caller.
+UNCALLED = ("@(private", "@(init", "@(fini", "@(export", "@(test")
+ENTRY = "main"
+# Comments and string literals, whose words call nothing.
+NOT_CODE = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|`[^`]*`|\'(?:\\.|[^\'\\\n])+\'', re.S)
+# A name as its own package uses it, and as another package does.
+UNQUALIFIED = re.compile(r"(?<![.\w])([a-z_][a-z0-9_]*)\b")
+QUALIFIED = re.compile(r"\b([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\b")
+DEFINITION = re.compile(r"\b([a-z_][a-z0-9_]*)\s*::")
+PACKAGE = re.compile(r"^package\s+(\w+)", re.M)
+# An elodin package imported under an alias of its own.
+ALIAS = re.compile(r'^import\s+(\w+)\s+"elodin:(\w+)"', re.M)
+
+
+def test_only_procs(sources, hits):
+    """Exported procedures outside test files that nothing outside test files calls."""
+    # A procedure only tests use lives in a test file of its package. The itest
+    # and fuzz packages are callers in their own right: they cannot reach another
+    # package's test files. `main`, and procedures under an attribute in
+    # `UNCALLED`, are left out, and a cross-package test seam says why with
+    # lint:allow. A use is the bare name in code of its own package, or
+    # `package.name` in another's - outside comments, strings and `name ::`
+    # declarations.
+    #
+    # shortcut: names are matched, not resolved, so a parameter, local or field of
+    # the same name in its package, or a call from its own body, counts as a use
+    # and hides a test-only procedure; it never flags one with a real caller.
+    # Upgrade to a parser if one slips through.
+    callers = {path: src for path, src in sources.items() if not path.endswith("_test.odin")}
+    local, qualified = count_uses(callers)
+    for path, source in callers.items():
+        if is_test(path):
+            continue
+        package = PACKAGE.search(source)
+        package = package.group(1) if package else os.path.basename(os.path.dirname(path))
+        uses = local[os.path.dirname(path)]
+        lines = source.splitlines()
+        for i, line in enumerate(lines):
+            name = checked_proc(lines, i)
+            if name and uses[name] + qualified[(package, name)] <= 0:
+                hits.append(f"{path}:{i + 1}: test-only: {name} has no caller outside test files; "
+                            f"move it to a test file of its package\n    {line.strip()}")
+
+
+def count_uses(callers):
+    """Each directory's bare uses of a name, and every `package.name` use, aliases resolved."""
+    local = collections.defaultdict(collections.Counter)
+    qualified = collections.Counter()
+    for path, source in callers.items():
+        code = NOT_CODE.sub(" ", source)
+        uses = local[os.path.dirname(path)]
+        uses.update(UNQUALIFIED.findall(code))
+        uses.subtract(DEFINITION.findall(code))
+        aliases = dict(ALIAS.findall(source))
+        qualified.update((aliases.get(pkg, pkg), name) for pkg, name in QUALIFIED.findall(code))
+    return local, qualified
+
+
+def checked_proc(lines, i):
+    """The procedure declared on `lines[i]` that the rule holds to a caller, or None."""
+    m = PROC.match(lines[i])
+    if not m or m.group(1) == ENTRY or ALLOW.search(lines[i]):
+        return None
+    # The attributes above it, past its doc comment.
+    above = i
+    while above > 0 and lines[above - 1].startswith(("@(", "//", "/*", " *", "*/")):
+        above -= 1
+    if any(a.startswith(UNCALLED) for a in lines[above:i]):
+        return None
+    return m.group(1)
+
+
 def resolve_base():
     base = os.environ.get("LINT_BASE")
     if not base:
@@ -147,12 +222,15 @@ def resolve_base():
 
 def main():
     hits = []
+    sources = {}
     for path in odin_files():
         with open(os.path.join(ROOT, path), encoding="utf-8", errors="replace") as f:
             source = f.read()
+        sources[path] = source
         for n, text in enumerate(source.splitlines(), 1):
             check(TREE, path, n, text, hits)
         expect_formats(path, source, hits)
+    test_only_procs(sources, hits)
     for path, n, text in added_lines(resolve_base()):
         check(ADDED, path, n, text, hits)
     for h in hits:

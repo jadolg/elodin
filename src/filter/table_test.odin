@@ -3,6 +3,7 @@ package filter
 import "base:runtime"
 import "core:fmt"
 import "core:testing"
+import "elodin:dns"
 
 @(test)
 test_table_holds_every_name_through_growth_and_trim :: proc(t: ^testing.T) {
@@ -99,4 +100,10 @@ test_table_offsets_stay_in_a_u32 :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.count, 0)
 	testing.expect_value(t, s.names.used, 0)
 	raw.len = held
+}
+
+// Whether a rule covers `normalised` for `qtype`, as the tests ask it.
+@(private)
+set_lookup :: proc(s: ^Set, normalised: string, qtype: dns.Type) -> bool {
+	return set_cover(s, normalised, qtype) != .None
 }

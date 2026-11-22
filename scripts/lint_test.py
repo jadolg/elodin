@@ -66,6 +66,36 @@ for source, want in SOURCES:
     if bool(hits) != want:
         failures.append(f"expect-format on {source!r}: got {bool(hits)}, want {want}")
 
+# (sources, procedures the test-only rule should name)
+PROCS = [
+    ({"src/dns/a.odin": "used :: proc() {}\n", "src/dns/b.odin": "x := used()\n"}, []),
+    ({"src/dns/a.odin": "lonely :: proc() {}\n", "src/dns/a_test.odin": "lonely()\n"}, ["lonely"]),
+    ({"src/dns/a.odin": "package dns\nharness :: proc() {}\n", "src/itest/c.odin": "dns.harness()\n"}, []),
+    ({"src/loop/a.odin": "package loop\nwait :: proc() {}\n", "src/loop/b.odin": "sync.wait()\n"}, ["wait"]),
+    ({"src/tlsx/a.odin": "package tlsx\nread :: proc() {}\n", "src/itest/c.odin": "read()\n"}, ["read"]),
+    ({"src/main/main.odin": "package main\nmain :: proc() {}\n"}, []),
+    ({"src/dns/a.odin": "@(private)\n// what it does\nhelper :: proc() {}\n"}, []),
+    ({"src/dns/a.odin": "@(test)\ncheck :: proc() {}\n"}, []),
+    ({"src/dns/a.odin": "package dns\nopt :: proc() {}\n", "src/server/x.odin": 'import d "elodin:dns"\nx := d.opt()\n'}, []),
+    ({"src/dns/a.odin": "seam :: proc() {} // lint:allow read by another package's tests\n"}, []),
+    ({"src/dns/a.odin": "@(private)\nhelper :: proc() {}\n"}, []),
+    ({"src/dns/a.odin": "@(init)\nstart :: proc() {}\n"}, []),
+    ({"src/dns/a_test.odin": "fixture :: proc() {}\n"}, []),
+    ({"src/dns/a.odin": "fast :: #force_inline proc() {}\n", "src/dns/a_test.odin": "fast()\n"}, ["fast"]),
+    ({"src/dns/a.odin": "twin :: proc() {}\n", "src/cache/b.odin": "twin :: proc() {}\n"}, ["twin", "twin"]),
+    ({"src/dns/a.odin": "named :: proc() {}\n", "src/dns/b.odin": "// see named\nx := \"named\"\n"}, ["named"]),
+    ({"src/dns/a.odin": "@(private, thread_local)\ntl: int\n\nopen :: proc() {}\n"}, ["open"]),
+    ({"src/dns/a.odin": "@(fini)\nstop :: proc() {}\n"}, []),
+    ({"src/dns/a.odin": '@(export, link_name = "elodin_cb")\ncb :: proc "c" () {}\n'}, []),
+    ({"src/dns/a.odin": "handler :: proc() {}\n", "src/dns/b.odin": "h := handler\n"}, []),
+]
+for sources, want in PROCS:
+    hits = []
+    lint.test_only_procs(sources, hits)
+    got = sorted(h.split("test-only: ")[1].split(" ")[0] for h in hits)
+    if got != want:
+        failures.append(f"test-only on {sources!r}: got {got}, want {want}")
+
 for f in failures:
     print(f, file=sys.stderr)
 sys.exit(1 if failures else 0)
