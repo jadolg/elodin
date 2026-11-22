@@ -1678,6 +1678,10 @@ has_server_name :: proc(record: []u8) -> (found, ok: bool) {
 	u16_at :: proc(b: []u8, i: int) -> int {
 		return int(b[i]) << 8 | int(b[i + 1])
 	}
+	// A ClientHello: handshake type 1 after the record header.
+	if len(record) <= 5 || record[5] != 1 {
+		return
+	}
 	// Record header 5, handshake header 4, version 2, random 32.
 	i := 5 + 4 + 2 + 32
 	if len(record) < i + 1 {
