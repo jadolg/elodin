@@ -166,23 +166,6 @@ start_metrics :: proc(s: ^Server, l: ^Listeners) -> bool {
 	l.metrics_socket = sock
 	l.metrics_open = true
 
-	ctx := new(Metrics_Context)
-	ctx.server = s
-	ctx.listeners = l
-	// Not `conn_spawn`: that would put it in `l.conns`, waited on by
-	// `conn_manager_shutdown` along with every client connection, which is
-	// exactly the wait this loop is meant to survive. See `stop_metrics`.
-	t := loop.spawn_thread(rawptr(ctx), metrics_accept_loop)
-	if t == nil {
-		logx.errorf("metrics: cannot start the accept loop")
-		// Nothing was ever handed it, so it is ours to release.
-		free(ctx)
-		return false
-	}
-	l.metrics_loop_ctx = ctx
-	l.metrics_thread = t
-
-	logx.infof("serving metrics on %s:%d%s", cfg.address, cfg.port, cfg.path)
 	/*
 	Said once, at the volume it deserves.
 
@@ -199,6 +182,31 @@ start_metrics :: proc(s: ^Server, l: ^Listeners) -> bool {
 			cfg.address,
 		)
 	}
+	return true
+}
+
+// Start the accept loop of the endpoint `start_metrics` bound, on a thread of
+// its own.
+@(private)
+arm_metrics :: proc(s: ^Server, l: ^Listeners) -> bool {
+	ctx := new(Metrics_Context)
+	ctx.server = s
+	ctx.listeners = l
+	// Not `conn_spawn`: that would put it in `l.conns`, waited on by
+	// `conn_manager_shutdown` along with every client connection, which is
+	// exactly the wait this loop is meant to survive. See `stop_metrics`.
+	t := loop.spawn_thread(rawptr(ctx), metrics_accept_loop)
+	if t == nil {
+		logx.errorf("metrics: cannot start the accept loop")
+		// Nothing was ever handed it, so it is ours to release.
+		free(ctx)
+		return false
+	}
+	l.metrics_loop_ctx = ctx
+	l.metrics_thread = t
+
+	cfg := startup_config(s).metrics
+	logx.infof("serving metrics on %s:%d%s", cfg.address, cfg.port, cfg.path)
 	return true
 }
 

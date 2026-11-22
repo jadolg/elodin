@@ -382,6 +382,9 @@ test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
 		return
 	}
 	defer stop_test_listeners(&l, &tl)
+	if !testing.expect(t, arm_listeners(&s, &l), "could not arm the listener") {
+		return
+	}
 	testing.expect_value(t, len(l.udp), READERS)
 
 	// The second server is the one this is about: a whole listener of its own,
@@ -457,6 +460,10 @@ test_a_reader_lets_its_queries_run_between_batches :: proc(t: ^testing.T) {
 		return
 	}
 	defer stop_test_listeners(&l, &tl)
+	if !testing.expect(t, arm_listeners(&s, &l), "could not arm the UDP listener") {
+		sync.sema_post(&gate.go)
+		return
+	}
 
 	client, cerr := net.make_unbound_udp_socket(.IP4)
 	if !testing.expectf(t, cerr == nil, "no client socket: %v", cerr) {

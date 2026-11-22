@@ -267,7 +267,10 @@ network.
 user. Leave `server.user` empty.
 
 **Start as root and put it down.** Name an account and elodin switches to it the
-moment the listeners have their ports:
+moment the listeners have their ports. Nothing is read from them before the
+switch, nor, under `server.sandbox: strict`, before the syscall filter: a query
+that arrives in between waits in the kernel, and the lines saying where elodin
+listens come after both.
 
 ```yaml
 server:
@@ -339,7 +342,7 @@ server:
 |---|---|
 | `off` | nothing |
 | `basic` | `no_new_privs`, and [Landlock](https://docs.kernel.org/userspace-api/landlock.html) on writes: the process can create, write and remove files only in `blocking.cache_dir` (with blocking on, or when the directory exists at startup), and create and write them only there and in the directory `log.file` is in (the directory of the file it resolves to, not of a symlink's name). Only for a regular file: a log on a device, FIFO or socket, such as `/dev/stdout`, is written through the descriptor already open, and a `SIGHUP` keeps it. Nothing can be executed. Reads are not confined. On Landlock ABI 6 kernels it also cannot signal another process or connect to an abstract unix socket outside itself |
-| `strict` | `basic`, with Landlock on reads too, and a seccomp allowlist of system calls installed after the privilege drop |
+| `strict` | `basic`, with Landlock on reads too, and a seccomp allowlist of system calls installed after the privilege drop and before any listener is read |
 
 Both layers are set before the event loops start, so every thread has them,
 and they last for the life of the process: `server.sandbox` takes a restart.

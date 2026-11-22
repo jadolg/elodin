@@ -949,6 +949,10 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 
 	drop_privileges(cfg, service, opts.config_path)
 	filter_process(cfg, landlock_abi)
+	if !server.arm_listeners(&s, &listeners) {
+		logx.errorf("could not start reading from every listener, shutting down")
+		os.exit(1)
+	}
 
 	logx.eventf(
 		.Info,
@@ -974,10 +978,10 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 Put root down now that the listeners hold their ports.
 
 This is the last moment a privilege is needed and the first moment it can go:
-binding below 1024 is the only thing on the way up that root was for, and
-everything from here on is parsing whatever arrives on those sockets. The
-sockets themselves are already open, so the process keeps serving on them
-whoever it becomes.
+binding below 1024 is the only thing on the way up that root was for. The
+sockets are bound but not yet read: `arm_listeners` starts reading them after
+this and the syscall filter, so nothing a client sends is parsed with root's
+privileges, and the process keeps serving on them whoever it becomes.
 
 The blocklist cache goes over first: it is elodin's own output and opened by
 name afterwards - the lists were downloaded above, as root, and a refresh some

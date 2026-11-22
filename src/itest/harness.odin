@@ -381,10 +381,10 @@ Readiness is established by querying the server rather than by sleeping, so the
 suite neither races the process nor pays for a fixed delay.
 
 One probe per endpoint the case named, because the listeners come up in
-sequence and not together: `start_listeners` binds udp, then tcp, then dot,
-then doh, so an answer over UDP says only that the first of them is serving.
+sequence and not together: `arm_listeners` starts reading udp, then tcp, then
+dot, then doh, so an answer over UDP says only that the first of them is serving.
 Whichever endpoint a case dials first is the one that decides whether it is
-racing a bind, and for the TLS endpoints losing that race is not a lone red
+racing that start, and for the TLS endpoints losing that race is not a lone red
 case - the dial fails, and every case behind it in the group fails with it.
 */
 start_server :: proc(r: ^Runner, opts: Server_Options) -> (srv: Server, ok: bool) {
@@ -687,8 +687,8 @@ PROBE_RETRY_PAUSE :: 10 * time.Millisecond
 /*
 Probe until the server answers over DoT.
 
-The same argument as `wait_tcp`, one listener further along: `start_listeners`
-binds udp, then tcp, then dot, then doh, so neither probe above says anything
+The same argument as `wait_tcp`, one listener further along: `arm_listeners`
+starts udp, then tcp, then dot, then doh, so neither probe above says anything
 yet about the two TLS listeners. A case that dials DoT passes `dot_port` in
 `Server_Options` and this establishes the endpoint serves before the case leans
 on it - a CHAOS version.bind query, answered locally, so no upstream has to be

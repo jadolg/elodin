@@ -33,6 +33,10 @@ Listeners :: struct {
 	// datagram, and asking the kernel each time is a syscall per query for an
 	// answer that cannot change.
 	udp_bound:      net.Endpoint,
+	// The receive buffer asked for and granted, for the line `arm_listeners`
+	// writes.
+	udp_buffer:     int,
+	udp_granted:    int,
 	tcp_socket:     net.TCP_Socket,
 	dot_socket:     net.TCP_Socket,
 	doh_socket:     net.TCP_Socket,
@@ -136,6 +140,11 @@ report_bind_failure :: proc(setting: string, address: string, port: int, err: ne
 	}
 }
 
+/*
+Bind every listener the configuration turns on, and load the TLS contexts,
+without reading from any of them: `arm_listeners` starts that. False when one
+could not be bound; what was bound is left to `stop_listeners`.
+*/
 start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 	cfg := startup_config(s)
 	conn_manager_init(&l.conns, cfg.server.max_connections, cfg.server.max_connections_per_prefix)
@@ -211,6 +220,51 @@ start_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
 		if !start_metrics(s, l) {
 			return false
 		}
+	}
+	return true
+}
+
+/*
+Start reading what `start_listeners` bound: a reader per UDP socket, an accept
+loop per stream listener and the metrics endpoint's thread, each saying where it
+listens once started. `run` calls it after the privilege drop and the syscall
+filter, so no client's bytes are read before either; the kernel queues what
+arrives in between. False when one could not be started; the ones started are
+left to `stop_listeners`.
+*/
+arm_listeners :: proc(s: ^Server, l: ^Listeners) -> bool {
+	if len(l.udp) > 0 && !arm_udp(s, l) {
+		return false
+	}
+	cfg := startup_config(s).listeners
+	if l.tcp_open {
+		if !arm_stream_listener(s, l, .TCP) {
+			return false
+		}
+		logx.infof("listening for DNS on %s:%d/tcp", cfg.tcp.address, cfg.tcp.port)
+	}
+	if l.dot_open {
+		if !arm_stream_listener(s, l, .DoT) {
+			return false
+		}
+		logx.infof("listening for DNS-over-TLS on %s:%d", cfg.dot.address, cfg.dot.port)
+	}
+	if l.doh_open {
+		if !arm_stream_listener(s, l, .DoH) {
+			return false
+		}
+		logx.infof("listening for DNS-over-HTTPS on %s:%d%s", cfg.doh.address, cfg.doh.port, cfg.doh.path)
+		if cfg.doh.mobileconfig_path != "" {
+			logx.infof(
+				"serving the Apple .mobileconfig profile on %s:%d%s",
+				cfg.doh.address,
+				cfg.doh.port,
+				cfg.doh.mobileconfig_path,
+			)
+		}
+	}
+	if l.metrics_open {
+		return arm_metrics(s, l)
 	}
 	return true
 }
@@ -524,6 +578,14 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 		l.udp[i].holds = 1
 	}
 
+	l.udp_buffer = buffer
+	l.udp_granted = granted
+	return true
+}
+
+// Start a reader on each UDP socket `start_udp` bound, one to a loop.
+@(private)
+arm_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 	for i in 0 ..< len(l.udp) {
 		ctx := new(Udp_Context)
 		ctx.server = s
@@ -553,9 +615,9 @@ start_udp :: proc(s: ^Server, l: ^Listeners) -> bool {
 	// this line is then the only place the chosen one is said.
 	logx.infof(
 		"listening for DNS on %s:%d/udp (%s)",
-		cfg.address,
+		startup_config(s).listeners.udp.address,
 		l.udp_bound.port,
-		udp_readers_line(len(l.udp), buffer, granted),
+		udp_readers_line(len(l.udp), l.udp_buffer, l.udp_granted),
 	)
 	return true
 }
@@ -1486,7 +1548,7 @@ start_stream_listener :: proc(
 		report_bind_failure(fmt.tprintf("listeners.%s", name), cfg.address, cfg.port, err)
 		return false
 	}
-	// So the accept loop below wakes up now and then and can see `stop`.
+	// So the accept loop wakes up now and then and can see `stop`.
 	_ = net.set_option(sock, .Receive_Timeout, LISTENER_POLL)
 	socket^ = sock
 	open^ = true
@@ -1495,7 +1557,14 @@ start_stream_listener :: proc(
 		logx.errorf("listeners.%s: cannot make the listening socket non-blocking", name)
 		return false
 	}
+	return true
+}
 
+// Start the accept loop of the stream listener `start_stream_listener` bound
+// for `proto`.
+@(private)
+arm_stream_listener :: proc(s: ^Server, l: ^Listeners, proto: Protocol) -> bool {
+	name := proto_name(proto)
 	ctx := new(Stream_Context)
 	ctx.server = s
 	ctx.listeners = l
@@ -1520,12 +1589,7 @@ start_stream_listener :: proc(
 
 @(private)
 start_tcp :: proc(s: ^Server, l: ^Listeners) -> bool {
-	cfg := startup_config(s).listeners.tcp
-	if !start_stream_listener(s, l, cfg, .TCP, &l.tcp_socket, &l.tcp_open) {
-		return false
-	}
-	logx.infof("listening for DNS on %s:%d/tcp", cfg.address, cfg.port)
-	return true
+	return start_stream_listener(s, l, startup_config(s).listeners.tcp, .TCP, &l.tcp_socket, &l.tcp_open)
 }
 
 @(private)
@@ -1548,11 +1612,7 @@ start_dot :: proc(s: ^Server, l: ^Listeners) -> bool {
 	l.dot_ctx = ctx
 	// Not designated, rather than not started: see `ddr_designate`.
 	ddr_designate(s, .DoT, ctx)
-	if !start_stream_listener(s, l, cfg, .DoT, &l.dot_socket, &l.dot_open) {
-		return false
-	}
-	logx.infof("listening for DNS-over-TLS on %s:%d", cfg.address, cfg.port)
-	return true
+	return start_stream_listener(s, l, cfg, .DoT, &l.dot_socket, &l.dot_open)
 }
 
 @(private)
@@ -1570,19 +1630,7 @@ start_doh :: proc(s: ^Server, l: ^Listeners) -> bool {
 		s.profiles = make_profile_signer(ctx, cfg.path, cfg.port)
 		warn_unsigned_profiles(s.profiles)
 	}
-	if !start_stream_listener(s, l, cfg, .DoH, &l.doh_socket, &l.doh_open) {
-		return false
-	}
-	logx.infof("listening for DNS-over-HTTPS on %s:%d%s", cfg.address, cfg.port, cfg.path)
-	if cfg.mobileconfig_path != "" {
-		logx.infof(
-			"serving the Apple .mobileconfig profile on %s:%d%s",
-			cfg.address,
-			cfg.port,
-			cfg.mobileconfig_path,
-		)
-	}
-	return true
+	return start_stream_listener(s, l, cfg, .DoH, &l.doh_socket, &l.doh_open)
 }
 
 /*
