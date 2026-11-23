@@ -24,7 +24,7 @@
 # that the binary runs on them; CI builds it), `itest` (the integration suite
 # beside the same binary; `mise run itest-image` runs it).
 
-FROM jdxcode/mise:2026.11.8@sha256:5c6e71a86c8c997c32d30a169b4269bec9d4681a804e29078bac8f44109f2edc AS mise
+FROM jdxcode/mise:2026.11.10@sha256:80aa2afb17ba760cabe74ac90771ca2d1470773d514cc2bb79c69c8d3f92f150 AS mise
 
 # The compiler and the libraries elodin links against: what `build` and
 # `itest` share, and nothing a commit's source changes.
