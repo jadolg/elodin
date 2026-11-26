@@ -168,8 +168,8 @@ question. While `trust_anchor_signaling` is on, elodin forwards it upstream
   when it lists the same tags; with validation off, as it came;
 - only on a DNSKEY question. On any other type the option is dropped (section
   4.2), and so it is for the target a [rewrite](rewrites.md)'s CNAME leads to;
-- not a list that is empty or not whole two-byte tags, nor a second copy of
-  one already sent;
+- not a list that is empty or not whole two-byte tags, nor one with the same
+  tags in the same order as one already sent;
 - 12 tags at most across the client's lists: the list that crosses that is cut,
   and later ones are dropped.
 

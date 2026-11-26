@@ -1831,7 +1831,8 @@ the upstream as one message bar the ID and those tags, and the upstream's answer
 or its failure, is about the question rather than about one client's spelling of
 it. That is what the cache already assumes when it hands one client's answer to
 another, and what lets a follower share its leader's outcome (`inflight.odin`),
-which for a different set of key tags is a NOERROR or NXDOMAIN alone.
+which for a different set of key tags is a NOERROR or NXDOMAIN with the cache
+on, and nothing with it off.
 
 The key tags (RFC 8145 section 4.2.2): this server's own (`signalled_key_tags`)
 and, beside them, the client's `edns-key-tag` lists, which section 4.2.2.1 asks
