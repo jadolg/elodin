@@ -175,9 +175,10 @@ per scrape.
 
 Bounded, because the length of this table is not this process's to decide: it is
 every UDP socket on the host, and a scrape is what pays to read it. The cap is
-some twenty-five thousand sockets, past which the answer is "cannot say" - which
-withholds the drop counters rather than misreporting them, since the readers'
-lines may be anywhere in a file that was cut short.
+some twenty-five thousand sockets, past which, or where memory runs out first,
+the answer is "cannot say" - which withholds the drop counters rather than
+misreporting them, since the readers' lines may be anywhere in a file that was
+cut short.
 */
 @(private)
 MAX_PROC_FILE :: 4 * 1024 * 1024
@@ -196,8 +197,8 @@ read_proc_file :: proc(path: string, allocator := context.temp_allocator) -> (te
 	chunk: [4096]u8
 	for {
 		n, read_err := os.read(f, chunk[:])
-		if n > 0 {
-			append(&buf, ..chunk[:n])
+		if _, aerr := append(&buf, ..chunk[:n]); aerr != nil {
+			return "", false
 		}
 		// The end arrives as `io.EOF` rather than as a zero-length read, the
 		// same as it does in `read_small_file`.

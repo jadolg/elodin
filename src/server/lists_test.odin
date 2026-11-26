@@ -3,6 +3,7 @@ package server
 import "base:runtime"
 import "core:fmt"
 import "core:log"
+import "core:mem"
 import "core:net"
 import "core:os"
 import "core:strings"
@@ -13,6 +14,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
+import "elodin:upstream"
 
 /*
 The default configuration with its list cache in a directory of its own, made
@@ -949,4 +951,51 @@ test_a_copy_that_cannot_be_given_is_kept :: proc(t: ^testing.T) {
 	kept, kerr := os.read_entire_file(path, context.temp_allocator)
 	testing.expect_value(t, kerr, nil)
 	testing.expect_value(t, string(kept), "0.0.0.0 kept.example\n")
+}
+
+/*
+A cached copy is read whole or not at all: an allocator that runs dry, a copy
+larger than any download elodin writes, and a file that holds more than its
+size said are each refused with a reason, never handed on cut short (#757).
+*/
+@(test)
+test_a_cached_copy_is_read_whole_or_refused :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path := fmt.tprintf("/tmp/elodin-server-lists-test-whole-%d.txt", os.get_pid())
+	body := make([]u8, 40000, context.temp_allocator)
+	for &b in body {
+		b = 'a'
+	}
+	if !testing.expect(t, os.write_entire_file(path, body) == nil, "cannot write the copy") {
+		return
+	}
+	defer os.remove(path)
+
+	// Room for the whole copy: read, all of it.
+	data, why, read := read_cache_file(path, context.temp_allocator, owner = {})
+	testing.expectf(t, read && len(data) == len(body), "a copy with room was not read whole: %v %q, %d of %d bytes", read, why, len(data), len(body))
+
+	// Room for half of it: refused, not cut short.
+	backing := make([]u8, len(body) / 2)
+	defer delete(backing)
+	arena: mem.Arena
+	mem.arena_init(&arena, backing)
+	data, why, read = read_cache_file(path, mem.arena_allocator(&arena), owner = {})
+	testing.expectf(t, !read && why == "there is no memory to read it", "a copy with no room for it: %v %q, %d of %d bytes", read, why, len(data), len(body))
+
+	// Larger than any download, as a sparse file: refused before any allocation.
+	big := fmt.tprintf("/tmp/elodin-server-lists-test-big-%d.txt", os.get_pid())
+	if !testing.expect(t, os.write_entire_file(big, "0.0.0.0 a.example\n") == nil, "cannot write the large copy") {
+		return
+	}
+	defer os.remove(big)
+	if !testing.expect(t, posix.truncate(strings.clone_to_cstring(big, context.temp_allocator), upstream.MAX_HTTP_BODY + 1) == .OK, "cannot grow the large copy") {
+		return
+	}
+	data, why, read = read_cache_file(big, context.temp_allocator, owner = {})
+	testing.expectf(t, !read && why == "it is larger than any download", "a copy past the download cap: %v %q, %d bytes", read, why, len(data))
+
+	// More than its size said: a /proc file says 0 and holds lines.
+	data, why, read = read_cache_file("/proc/self/status", context.temp_allocator, owner = {})
+	testing.expectf(t, !read && why == "it grew while it was read", "a file past its stat size: %v %q, %d bytes", read, why, len(data))
 }

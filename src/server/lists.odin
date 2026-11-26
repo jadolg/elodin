@@ -533,28 +533,41 @@ read_cache_file :: proc(path: string, allocator := context.allocator, owner := c
 	if refusal := cache_refusal(st, owner); refusal != "" {
 		return nil, refusal, false
 	}
+	// No download is larger, so neither is a copy elodin wrote.
+	if st.st_size > upstream.MAX_HTTP_BODY {
+		return nil, "it is larger than any download", false
+	}
 	/*
 	Read from the descriptor itself. `os.new_file` would wrap it, but panics
 	where it cannot name it through /proc - a chroot without one - which would
-	stop the start over a copy it can do without.
+	stop the start over a copy it can do without. One byte past the size fstat
+	gave tells a file that holds more, which is refused rather than cut short.
 	*/
-	out := make([dynamic]byte, 0, int(st.st_size) + 1, allocator)
-	chunk: [16 * 1024]byte
-	for {
-		n := posix.read(fd, &chunk[0], len(chunk))
-		if n < 0 && posix.errno() == .EINTR {
+	out, merr := make([]byte, int(st.st_size) + 1, allocator)
+	if merr != nil {
+		return nil, "there is no memory to read it", false
+	}
+	n := 0
+	for n < len(out) {
+		rest := len(out) - n
+		got := int(posix.read(fd, &out[n], uint(rest)))
+		if got < 0 && posix.errno() == .EINTR {
 			continue
 		}
-		if n < 0 {
-			delete(out)
+		if got < 0 {
+			delete(out, allocator)
 			return nil, fmt.tprintf("it cannot be read (%v)", posix.errno()), false
 		}
-		if n == 0 {
+		if got == 0 {
 			break
 		}
-		append(&out, ..chunk[:n])
+		n += got
 	}
-	return out[:], "", true
+	if n == len(out) {
+		delete(out, allocator)
+		return nil, "it grew while it was read", false
+	}
+	return out[:n], "", true
 }
 
 /*

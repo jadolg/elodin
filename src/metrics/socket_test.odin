@@ -1,5 +1,6 @@
 package metrics
 
+import "core:mem"
 import "core:net"
 import "core:os"
 import "core:testing"
@@ -124,4 +125,23 @@ test_socket_inode_says_nothing_about_what_is_not_a_socket :: proc(t: ^testing.T)
 	}
 	defer os.close(f)
 	testing.expect_value(t, socket_inode(int(os.fd(f))), 0)
+}
+
+// A table the allocator has no room for is "cannot say", not the part of it
+// that fit (#757).
+@(test)
+test_read_proc_file_refuses_what_it_cannot_hold :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	path :: "/proc/self/smaps"
+	whole, read := read_proc_file(path, context.temp_allocator)
+	room :: 4096
+	if !testing.expectf(t, read && len(whole) > room, "the premise: %s holds more than %d bytes, read %v with %d", path, room, read, len(whole)) {
+		return
+	}
+	backing := make([]u8, room)
+	defer delete(backing)
+	arena: mem.Arena
+	mem.arena_init(&arena, backing)
+	text, ok := read_proc_file(path, mem.arena_allocator(&arena))
+	testing.expectf(t, !ok, "read %d bytes of %s with room for %d", len(text), path, room)
 }
