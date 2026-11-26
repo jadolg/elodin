@@ -326,6 +326,33 @@ def algorithm_downgrade():
 
 
 @scenario
+def dname_to_root():
+    """Cover a signed DNAME whose target is the root."""
+    # RFC 6672 section 2.2 puts no restriction on the target, so `a.drtest.`
+    # under `drtest. DNAME .` becomes `a.`, synthesized unsigned (section
+    # 3.4.1). `dr_answer_mismatched` is the same DNAME beside a CNAME it could
+    # not have produced.
+    root = Key(".", "dname-root")
+    child = Key("drtest.", "dname-root-child")
+
+    root_keys = [RR(".", DNSKEY, root.rdata)]
+    print("// anchor: %s" % root.ds_text())
+    emit("dr_root_dnskey", ".", "DNSKEY", message(".", DNSKEY, root_keys + [sign(root_keys, root)]))
+    ds_set = [RR("drtest.", DS, child.ds())]
+    emit("dr_ds", "drtest.", "DS", message("drtest.", DS, ds_set + [sign(ds_set, root)]))
+    child_keys = [RR("drtest.", DNSKEY, child.rdata)]
+    emit("dr_dnskey", "drtest.", "DNSKEY",
+         message("drtest.", DNSKEY, child_keys + [sign(child_keys, child)]))
+
+    dname = [RR("drtest.", DNAME, wire_name("."))]
+    signed = dname + [sign(dname, child)]
+    emit("dr_answer", "a.drtest.", "A",
+         message("a.drtest.", A, signed + [RR("a.drtest.", CNAME, wire_name("a."))]))
+    emit("dr_answer_mismatched", "a.drtest.", "A",
+         message("a.drtest.", A, signed + [RR("a.drtest.", CNAME, wire_name("b."))]))
+
+
+@scenario
 def unsupported_algorithm_only():
     """Cover the same delegation with only the unknown-algorithm DS left."""
     # Nothing in the chain can be followed past this point, and RFC 6840 section

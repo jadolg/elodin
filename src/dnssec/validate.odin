@@ -5396,8 +5396,9 @@ dname_synthesizes :: proc(owner, target, cname_owner, cname_target: string, allo
 	if !ok {
 		return false
 	}
-	// The same prefix, over the target this time.
-	want := strings.concatenate({cname_owner[:cut], target}, allocator)
+	// The same prefix, over the target this time. The prefix keeps its
+	// trailing dot, so a root target (RFC 6672 section 2.2) adds nothing.
+	want := cname_owner[:cut] if target == "." else strings.concatenate({cname_owner[:cut], target}, allocator)
 	return dns.name_equal_fold(cname_target, want)
 }
 
