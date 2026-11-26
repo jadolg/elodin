@@ -3,7 +3,6 @@ package itest
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
-import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
@@ -453,47 +452,6 @@ config_for_shutdown :: proc(udp_port, upstream_port: int) -> string {
 		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
 		cache = "{ enabled: true }",
 	)
-}
-
-/*
-Which of the server's threads would take SIGTERM, SIGINT or SIGHUP (#416).
-
-The kernel hands a process-directed signal to any thread that has it unblocked,
-and one taken in a timed socket read fails that read with EINTR: a list
-download, or an upstream read and the query behind it. Only the main thread,
-whose reads are none of those, is to take them, so every other is started with
-them blocked (`loop.spawn_thread`). Read from each thread's SigBlk, the mask the kernel
-consults.
-*/
-@(private = "file")
-STOP_AND_RELOAD_MASK :: u64(1) << (u64(posix.Signal.SIGHUP) - 1) | u64(1) << (u64(posix.Signal.SIGINT) - 1) | u64(1) << (u64(posix.Signal.SIGTERM) - 1)
-
-@(private = "file")
-threads_taking_signals :: proc(pid: int) -> (main_takes: bool, others, taking: int, ok: bool) {
-	ids, listed := task_ids(pid)
-	if !listed {
-		return
-	}
-	for id in ids {
-		mask, read := proc_status_field(fmt.tprintf("/proc/%d/task/%s/status", pid, id), "SigBlk")
-		if !read {
-			continue // a thread that has just ended
-		}
-		blocked, parsed := strconv.parse_u64_of_base(mask, 16)
-		if !parsed {
-			return
-		}
-		takes := blocked & STOP_AND_RELOAD_MASK != STOP_AND_RELOAD_MASK
-		if id == fmt.tprintf("%d", pid) {
-			main_takes = takes
-			continue
-		}
-		others += 1
-		if takes {
-			taking += 1
-		}
-	}
-	return main_takes, others, taking, true
 }
 
 run_shutdown_cases :: proc(r: ^Runner) {

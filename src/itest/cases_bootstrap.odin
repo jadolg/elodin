@@ -84,7 +84,9 @@ run_bootstrap_cases :: proc(r: ^Runner) {
 A stop during the startup lookups of the upstreams' hostnames ends the process
 at once, before anything is read from the listeners, rather than once every
 lookup has timed out in turn: three hostnames against a bootstrap server that
-never answers hold a start for `upstream.BOOTSTRAP_TIMEOUT` each, and more.
+never answers hold a start for `upstream.BOOTSTRAP_TIMEOUT` each, and more. The
+thread they run on, like every other, leaves the signal to the main thread
+(`threads_taking_signals`).
 */
 run_bootstrap_stop_case :: proc(r: ^Runner) {
 	NAME :: "bootstrap: SIGTERM is not held by the startup lookups"
@@ -107,6 +109,12 @@ run_bootstrap_stop_case :: proc(r: ^Runner) {
 	// The premise: the start is waiting on a lookup.
 	if !check(r, mock_wait_until(boot, mock_saw_type, int(dns.Type.A), 5 * time.Second), "the bootstrap server was never asked") {
 		return
+	}
+	main_takes, others, taking, read := threads_taking_signals(srv.process.pid)
+	if check(r, read, "cannot read the server's thread masks") {
+		check(r, main_takes, "the main thread blocks the signals, so no handler would run")
+		check(r, others > 0, "the server runs no other thread to check")
+		check(r, taking == 0, "%d of %d other threads would take the signals during the startup lookups", taking, others)
 	}
 	state, exited := signal_shutdown(&srv, 5 * time.Second)
 	if check(r, exited, "the server did not exit within 5s of SIGTERM during the startup lookups") {

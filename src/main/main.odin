@@ -957,11 +957,11 @@ them to this one.
 */
 @(private)
 resolve_upstreams :: proc(s: ^server.Server) {
-	worker := thread.create_and_start_with_poly_data(s, proc(s: ^server.Server) {
+	worker := loop.spawn_thread(s, proc(s: ^server.Server) {
 		server.pin(s)
 		server.resolve_upstreams(s)
 		server.unpin(s)
-	})
+	}, context)
 	if worker == nil {
 		server.resolve_upstreams(s)
 		return
