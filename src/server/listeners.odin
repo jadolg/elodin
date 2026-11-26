@@ -80,7 +80,7 @@ Listeners :: struct {
 	once there is nothing left that could be holding one.
 
 	The UDP loops' contexts are held the same way and in the same place as their
-	sockets, in `udp` above, since there is now one of each per reader.
+	sockets, in `udp` above: one of each per reader.
 	*/
 	stream_loop_ctx:  [dynamic]^Stream_Context,
 	metrics_loop_ctx: ^Metrics_Context,
@@ -780,15 +780,13 @@ udp_loop :: proc(data: rawptr) {
 	// `bind_udp_reader`.
 	wildcard := is_wildcard(l.udp_bound.address)
 
-	// Labelled for the submit below, whose `break` would otherwise leave only
-	// the switch it sits in.
 	/*
 	A reader under a flood never waits - its socket always has the next datagram -
 	so it would read for ever with every query it started queued behind it on the
 	same loop. `loop.recv_udp` steps aside every `loop.TURN_BATCH` calls that did
 	not wait, which bounds how far reading can get ahead of answering.
 	*/
-	reading: for !sync.atomic_load(&l.stop) {
+	for !sync.atomic_load(&l.stop) {
 		local: loop.Udp_Local
 		n, client, err := loop.recv_udp(socket, buf, &local if wildcard else nil)
 		if err != nil {
@@ -859,36 +857,8 @@ udp_loop :: proc(data: rawptr) {
 			continue
 		}
 
-		/*
-		Charged before the work rather than after the answer.
-
-		A response this server will not send is a query it need not resolve, and
-		under a flood the upstream round trips and the cache churn are as much of
-		the damage as the traffic. It costs a strictly conservative limiter: the
-		reply that never gets built is charged for anyway, and a query that turns
-		out to be answerable from cache costs the same as one that is not.
-
-		The server cookie is read here and not left to `udp_job`, because which
-		budget pays can depend on it: a datagram the datagram pool would refuse
-		is charged to a pool of its own if it proves its source, out of reach of
-		a flood spoofing the same prefix. See `datagram_rate_check`.
-		*/
-		verdict, proven := datagram_rate_check(
-			live(ctx.server).limiter,
-			live(ctx.server).cookies,
-			buf[:n],
-			client,
-			loop.tick_now(),
-		)
-		switch verdict {
-		case .Allow:
-		case .Truncate:
-			if tc, built := dns.truncated_response(buf[:n], udp_advertised(ctx.server), context.temp_allocator); built {
-				_, _ = loop.send_udp(socket, tc, client, local)
-			}
-			free_all(context.temp_allocator)
-			continue
-		case .Drop:
+		proven, admitted := udp_rate_admit(ctx, socket, buf[:n], client, local)
+		if !admitted {
 			continue
 		}
 
@@ -898,7 +868,7 @@ udp_loop :: proc(data: rawptr) {
 		the effort spent on it is taken from queries that could still have been
 		answered in time.
 
-		Asked here as well as at the submit below, which is where it is decided:
+		Asked here as well as at `start_udp_query`'s submit, which decides it:
 		this loop is what a flood arrives at, and the copy of the datagram the
 		query needs is worth not making for a query about to be shed.
 		*/
@@ -909,50 +879,99 @@ udp_loop :: proc(data: rawptr) {
 			continue
 		}
 
-		job, datagram := new_with_bytes(Udp_Job, buf[:n])
-		if job == nil {
-			sync.atomic_add(&ctx.server.stats.dropped, 1)
-			continue
-		}
-		job.data = datagram
-		job.ctx = ctx
-		job.client = client
-		job.socket = socket
-		job.local = local
-		job.proven = proven
-
-		// The query's use of the socket, given back once it has answered on it.
-		sync.atomic_add(&ctx.reader.holds, 1)
-		result := submit_query(ctx.server, udp_job, job, limit)
-		if result != .Accepted {
-			release_udp_reader(ctx.reader)
-		}
-		switch result {
-		case .Accepted:
-		case .Full:
-			// The bound was reached between the check above and here, by another
-			// loop's reader or a DoH connection's.
-			sync.atomic_add(&ctx.server.stats.dropped, 1)
-			report_shed(client, limit)
-			free(job)
-		case .Stopped:
-			free(job)
-			/*
-			Not the server stopping unless `stop` says so: the readers are gone
-			before the loops stop, so what refused this start is a stack that
-			could not be mapped - memory, or the process's mapping count. That
-			datagram is dropped as a shed one is, and the reader reads on;
-			leaving here would take the loop off UDP until the next restart.
-			*/
-			if sync.atomic_load(&l.stop) {
-				break reading
-			}
-			sync.atomic_add(&ctx.server.stats.dropped, 1)
-			report_query_spawn_failure(.UDP)
+		if !start_udp_query(ctx, socket, buf[:n], client, local, proven, limit) {
+			break
 		}
 	}
 	// `ctx` is not released here: queries started above still hold it, and they
 	// run on while the server drains. `destroy_listeners` has it.
+}
+
+/*
+Charge `datagram` to the rate limiter, and send the truncated answer its verdict
+may call for. `admitted` says the query is to be answered; `proven` is whether
+its server cookie proved its source, for the query to carry.
+*/
+@(private)
+udp_rate_admit :: proc(ctx: ^Udp_Context, socket: net.UDP_Socket, datagram: []u8, client: net.Endpoint, local: loop.Udp_Local) -> (proven, admitted: bool) {
+	/*
+	Charged before the work rather than after the answer.
+
+	A response this server will not send is a query it need not resolve, and
+	under a flood the upstream round trips and the cache churn are as much of
+	the damage as the traffic. It costs a strictly conservative limiter: the
+	reply that never gets built is charged for anyway, and a query that turns
+	out to be answerable from cache costs the same as one that is not.
+
+	The server cookie is read here and not left to `udp_job`, because which
+	budget pays can depend on it: a datagram the datagram pool would refuse
+	is charged to a pool of its own if it proves its source, out of reach of
+	a flood spoofing the same prefix. See `datagram_rate_check`.
+	*/
+	verdict: Rate_Verdict
+	verdict, proven = datagram_rate_check(live(ctx.server).limiter, live(ctx.server).cookies, datagram, client, loop.tick_now())
+	switch verdict {
+	case .Allow:
+		return proven, true
+	case .Truncate:
+		if tc, built := dns.truncated_response(datagram, udp_advertised(ctx.server), context.temp_allocator); built {
+			_, _ = loop.send_udp(socket, tc, client, local)
+		}
+		free_all(context.temp_allocator)
+	case .Drop:
+	}
+	return proven, false
+}
+
+/*
+Start the query `datagram` carries, as a job holding a copy of it and a hold on
+the reader's socket, or drop it as shed. False when the server is stopping and
+the reader is to stop reading.
+*/
+@(private)
+start_udp_query :: proc(ctx: ^Udp_Context, socket: net.UDP_Socket, datagram: []u8, client: net.Endpoint, local: loop.Udp_Local, proven: bool, limit: int) -> bool {
+	job, data := new_with_bytes(Udp_Job, datagram)
+	if job == nil {
+		sync.atomic_add(&ctx.server.stats.dropped, 1)
+		return true
+	}
+	job.data = data
+	job.ctx = ctx
+	job.client = client
+	job.socket = socket
+	job.local = local
+	job.proven = proven
+
+	// The query's use of the socket, given back once it has answered on it.
+	sync.atomic_add(&ctx.reader.holds, 1)
+	result := submit_query(ctx.server, udp_job, job, limit)
+	if result != .Accepted {
+		release_udp_reader(ctx.reader)
+	}
+	switch result {
+	case .Accepted:
+	case .Full:
+		// The bound was reached between `udp_loop`'s check and here, by
+		// another loop's reader or a DoH connection's.
+		sync.atomic_add(&ctx.server.stats.dropped, 1)
+		report_shed(client, limit)
+		free(job)
+	case .Stopped:
+		free(job)
+		/*
+		Not the server stopping unless `stop` says so: the readers are gone
+		before the loops stop, so what refused this start is a stack that
+		could not be mapped - memory, or the process's mapping count. That
+		datagram is dropped as a shed one is, and the reader reads on;
+		leaving here would take the loop off UDP until the next restart.
+		*/
+		if sync.atomic_load(&ctx.listeners.stop) {
+			return false
+		}
+		sync.atomic_add(&ctx.server.stats.dropped, 1)
+		report_query_spawn_failure(.UDP)
+	}
+	return true
 }
 
 /*

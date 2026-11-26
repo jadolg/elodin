@@ -492,19 +492,7 @@ build_h2_response :: proc(
 
 	mc_path := startup_config(ctx.server).listeners.doh.mobileconfig_path
 	if mc_path != "" && path == mc_path {
-		// The HTTP/1.1 endpoint's twin, the host read from `:authority` - the
-		// HTTP/2 spelling of `Host`. See `doh_profile`.
-		profile, status, why, is_profile := doh_profile(ctx.server, req.method, req.authority, "missing or invalid :authority")
-		if !is_profile {
-			return h2_error(status, why, MOBILECONFIG_METHODS if status == 405 else ""), true
-		}
-		return h2.Response {
-				status = 200,
-				content_type = DOH_MOBILECONFIG_CONTENT_TYPE,
-				content_disposition = PROFILE_DISPOSITION,
-				body = profile,
-			},
-			true
+		return h2_profile_response(ctx, req), true
 	}
 	if path != ctx.path {
 		return h2_error(404, "not found"), true
@@ -542,6 +530,25 @@ build_h2_response :: proc(
 			body = answer,
 		},
 		true
+}
+
+/*
+The answer to a request for the .mobileconfig profile: the HTTP/1.1 endpoint's
+twin, the host read from `:authority`, the HTTP/2 spelling of `Host`. See
+`doh_profile`.
+*/
+@(private)
+h2_profile_response :: proc(ctx: ^H2_Context, req: ^h2.Request) -> h2.Response {
+	profile, status, why, is_profile := doh_profile(ctx.server, req.method, req.authority, "missing or invalid :authority")
+	if !is_profile {
+		return h2_error(status, why, MOBILECONFIG_METHODS if status == 405 else "")
+	}
+	return h2.Response {
+		status = 200,
+		content_type = DOH_MOBILECONFIG_CONTENT_TYPE,
+		content_disposition = PROFILE_DISPOSITION,
+		body = profile,
+	}
 }
 
 // The :path pseudo-header carries the query string too.

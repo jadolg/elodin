@@ -487,76 +487,20 @@ build_live :: proc(s: ^Server, l: ^Live, prev: ^Live) -> (built, carried: Parts,
 		carried += {.Upstreams}
 	}
 
-	if cfg.dnssec.enabled {
-		if prev == nil || prev.validator == nil || differs(prev.cfg.dnssec, cfg.dnssec) {
-			if !start_validator(s, l) {
-				return
-			}
-			built += {.Validator}
-		} else {
-			l.validator, l.anchors, l.anchor_zones = prev.validator, prev.anchors, prev.anchor_zones
-			carried += {.Validator}
-		}
+	if cfg.dnssec.enabled && !build_validator(s, l, prev, &built, &carried) {
+		return
 	}
 
-	if cfg.cookies.enabled {
-		if prev == nil ||
-		   prev.cookies == nil ||
-		   prev.cfg.cookies.require != cfg.cookies.require ||
-		   prev.cfg.cookies.secret != cfg.cookies.secret ||
-		   prev.cfg.cookies.previous_secret != cfg.cookies.previous_secret {
-			// The same secrets, configured or drawn, are kept across a reload
-			// that leaves `secret` alone: every client holds a cookie under
-			// them, and a new one would cost each of them a round trip.
-			running := prev.cookies if prev != nil else nil
-			keep := running != nil && prev.cfg.cookies.secret == cfg.cookies.secret
-			if !start_cookies(l, running, keep = keep) {
-				return
-			}
-			built += {.Cookies}
-			if keep {
-				carried += {.Cookie_Secrets}
-			} else {
-				built += {.Cookie_Secrets}
-			}
-		} else {
-			l.cookies = prev.cookies
-			carried += {.Cookies, .Cookie_Secrets}
-		}
+	if cfg.cookies.enabled && !build_cookies(l, prev, &built, &carried) {
+		return
 	}
 
-	if cfg.server.rate_limit.enabled {
-		/*
-		Rebuilt when its figures change, and with it every prefix's budget: the
-		buckets name their tier by an index into the figures, which a changed list
-		of overrides renumbers. What that costs is one full bucket per prefix at
-		the moment of the reload, an operator's act and not a client's. Left
-		alone otherwise, so a reload of anything else hands nobody a fresh one.
-		*/
-		if prev == nil || prev.limiter == nil || differs(prev.cfg.server.rate_limit, cfg.server.rate_limit) {
-			if !start_rate_limiter(l) {
-				return
-			}
-			built += {.Limiter}
-		} else {
-			l.limiter = prev.limiter
-			carried += {.Limiter}
-			// Kept, but the lines describing it name the cookie rescue pool or
-			// not, so they are said again when that changes.
-			if prev.cfg.cookies.enabled != cfg.cookies.enabled {
-				report_rate_limiter(l)
-			}
-		}
+	if cfg.server.rate_limit.enabled && !build_limiter(l, prev, &built, &carried) {
+		return
 	}
 
 	if cfg.cache.enabled {
-		if prev == nil || prev.answers == nil {
-			l.answers = cache.make_cache(cache_options(cfg.cache))
-			built += {.Answers}
-		} else {
-			l.answers = prev.answers
-			carried += {.Answers}
-		}
+		build_cache(l, prev, &built, &carried)
 	}
 
 	if prev != nil {
@@ -588,6 +532,105 @@ build_live :: proc(s: ^Server, l: ^Live, prev: ^Live) -> (built, carried: Parts,
 		}
 	}
 	return built, carried, true
+}
+
+/*
+Make `l`'s cache, or take `prev`'s, which the caller resizes once the build has
+succeeded, adding what it did to `built` or `carried` as `build_live` counts
+them.
+*/
+@(private)
+build_cache :: proc(l: ^Live, prev: ^Live, built, carried: ^Parts) {
+	if prev == nil || prev.answers == nil {
+		l.answers = cache.make_cache(cache_options(l.cfg.cache))
+		built^ += {.Answers}
+	} else {
+		l.answers = prev.answers
+		carried^ += {.Answers}
+	}
+}
+
+/*
+Start `l`'s validator, or take `prev`'s where its section is unchanged, adding
+what it did to `built` or `carried` as `build_live` counts them. False if it
+cannot be started.
+*/
+@(private)
+build_validator :: proc(s: ^Server, l: ^Live, prev: ^Live, built, carried: ^Parts) -> bool {
+	if prev == nil || prev.validator == nil || differs(prev.cfg.dnssec, l.cfg.dnssec) {
+		if !start_validator(s, l) {
+			return false
+		}
+		built^ += {.Validator}
+	} else {
+		l.validator, l.anchors, l.anchor_zones = prev.validator, prev.anchors, prev.anchor_zones
+		carried^ += {.Validator}
+	}
+	return true
+}
+
+/*
+Start `l`'s rate limiter, or take `prev`'s where its figures are unchanged,
+adding what it did to `built` or `carried` as `build_live` counts them. False if
+it cannot be started.
+*/
+@(private)
+build_limiter :: proc(l: ^Live, prev: ^Live, built, carried: ^Parts) -> bool {
+	/*
+	Rebuilt when its figures change, and with it every prefix's budget: the
+	buckets name their tier by an index into the figures, which a changed list
+	of overrides renumbers. What that costs is one full bucket per prefix at
+	the moment of the reload, an operator's act and not a client's. Left
+	alone otherwise, so a reload of anything else hands nobody a fresh one.
+	*/
+	if prev == nil || prev.limiter == nil || differs(prev.cfg.server.rate_limit, l.cfg.server.rate_limit) {
+		if !start_rate_limiter(l) {
+			return false
+		}
+		built^ += {.Limiter}
+	} else {
+		l.limiter = prev.limiter
+		carried^ += {.Limiter}
+		// Kept, but the lines describing it name the cookie rescue pool or
+		// not, so they are said again when that changes.
+		if prev.cfg.cookies.enabled != l.cfg.cookies.enabled {
+			report_rate_limiter(l)
+		}
+	}
+	return true
+}
+
+/*
+Start `l`'s cookies, or take `prev`'s where nothing they are built from has
+changed, adding what it did to `built` or `carried` as `build_live` counts them.
+False if they cannot be started.
+*/
+@(private)
+build_cookies :: proc(l: ^Live, prev: ^Live, built, carried: ^Parts) -> bool {
+	if prev == nil ||
+	   prev.cookies == nil ||
+	   prev.cfg.cookies.require != l.cfg.cookies.require ||
+	   prev.cfg.cookies.secret != l.cfg.cookies.secret ||
+	   prev.cfg.cookies.previous_secret != l.cfg.cookies.previous_secret {
+		// The same secrets, configured or drawn, are kept across a reload
+		// that leaves `secret` alone: every client holds a cookie under
+		// them, and a new one would cost each of them a round trip.
+		running := prev.cookies if prev != nil else nil
+		keep := running != nil && prev.cfg.cookies.secret == l.cfg.cookies.secret
+		if !start_cookies(l, running, keep = keep) {
+			return false
+		}
+		built^ += {.Cookies}
+		if keep {
+			carried^ += {.Cookie_Secrets}
+		} else {
+			built^ += {.Cookie_Secrets}
+		}
+	} else {
+		l.cookies = prev.cookies
+		carried^ += {.Cookies, .Cookie_Secrets}
+	}
+	return true
 }
 
 /*

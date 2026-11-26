@@ -50,6 +50,19 @@ split_port :: proc(s: string) -> (addr_or_host: string, port: int, ok: bool) {
 	return
 }
 
+// A hex digit's value, either case; `ok` is false for any other byte.
+hex_digit :: proc(c: u8) -> (v: u8, ok: bool) {
+	switch c {
+	case '0' ..= '9':
+		return c - '0', true
+	case 'a' ..= 'f':
+		return c - 'a' + 10, true
+	case 'A' ..= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
 /*
 A decimal number no greater than `max`: one or more digits and nothing else.
 

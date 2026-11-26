@@ -59,7 +59,8 @@ ADDED = [
      "wait on an event (sema, cond, wait_for_log), not a duration"),
     ("wall-clock", r"\btime\.now\(", is_test,
      "measure durations with time.tick_now, not the wall clock"),
-    ("narration", r"\b(before this (change|fix|PR)|the fix\b|this (change|PR)\b|today\b)", lambda p: True,
+    ("narration", r"\b(before this (change|fix|PR)|the fix\b|this (change|PR)\b|today\b|there is now\b|the finding\b)",
+     lambda p: True,
      "describe the code as it is, not its history or this PR"),
 ]
 

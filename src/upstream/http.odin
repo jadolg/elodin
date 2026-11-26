@@ -574,7 +574,7 @@ http_exchange :: proc(
 			if headers > MAX_HTTP_HEADERS {
 				return resp, .HTTP_Error
 			}
-			name, value, ok := split_header(line)
+			name, value, ok := h2.split_field_line(line)
 			if !ok {
 				return resp, .HTTP_Error
 			}
@@ -746,22 +746,6 @@ parse_status :: proc(line: string) -> (status: int, http_1_0: bool, err: Error) 
 }
 
 @(private)
-split_header :: proc(line: string) -> (name, value: string, ok: bool) {
-	/*
-	A line starting with whitespace is obs-fold (RFC 9112 5.2), and whitespace
-	before the colon makes no field name (5.1). Skipped, either one would hide a
-	field the unfolded or trimmed reading has: `Transfer-Encoding: chunked` then
-	` , gzip` would frame a gzip body as chunks (#437). Refused by the caller, as is
-	a line with no name at all.
-	*/
-	idx := strings.index_byte(line, ':')
-	if idx <= 0 || line[0] == ' ' || line[0] == '\t' || line[idx - 1] == ' ' || line[idx - 1] == '\t' {
-		return "", "", false
-	}
-	return line[:idx], h2.trim_ows(line[idx + 1:]), true
-}
-
-@(private)
 read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator, limit: int) -> (body: []u8, err: Error) {
 	// Never more than `limit` from the start, as never more than it on the way.
 	out := make([dynamic]u8, 0, min(HTTP_READ_CHUNK, limit), allocator)
@@ -772,49 +756,21 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator, limit: int) -> (b
 	}
 	for {
 		line := reader_line(r) or_return
-		/*
-		`1*HEXDIG`, then optionally BWS and a `;` extension (RFC 9112 7.1.1).
-		The BWS is spaces and tabs and only in front of the `;`: trimmed off
-		both ends regardless, ` 5` and `5 ` would be chunk sizes (#437).
-		*/
-		digits := line
-		if idx := strings.index_byte(line, ';'); idx >= 0 {
-			digits = strings.trim_right(line[:idx], " \t")
-		}
-		/*
-		Parsed here rather than by `strconv.parse_u64_of_base`, which takes a
-		sign and skips `_` - so `+5` and `0_5` would be five - and has no
-		overflow check: a size longer than a u64 would wrap to some unrelated
-		number, zero among them, which would be read as the end of the body. Sixteen
-		significant hex digits is exactly what fits.
-		*/
-		for len(digits) > 1 && digits[0] == '0' {
-			digits = digits[1:]
-		}
-		if len(digits) == 0 || len(digits) > 16 {
+		size, chunk := h2.parse_chunk_line(line, limit)
+		if !chunk {
 			return nil, .HTTP_Error
 		}
-		size: u64
-		for i in 0 ..< len(digits) {
-			c := digits[i]
-			switch c {
-			case '0' ..= '9':
-				size = size << 4 | u64(c - '0')
-			case 'a' ..= 'f':
-				size = size << 4 | u64(c - 'a' + 10)
-			case 'A' ..= 'F':
-				size = size << 4 | u64(c - 'A' + 10)
-			case:
-				return nil, .HTTP_Error
-			}
-		}
 		if size == 0 {
-			// Trailers, then the final CRLF. Counted like the headers they are.
+			// Trailers, then the final CRLF: field lines (RFC 9112 7.1.2), counted
+			// like the headers they are.
 			trailers := 0
 			for {
 				trailer := reader_line(r) or_return
 				if trailer == "" {
 					break
+				}
+				if _, _, field := h2.split_field_line(trailer); !field {
+					return nil, .HTTP_Error
 				}
 				trailers += 1
 				if trailers > MAX_HTTP_HEADERS {
@@ -823,10 +779,7 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator, limit: int) -> (b
 			}
 			break
 		}
-		// Bounded before it is narrowed. A size past the body limit is refused
-		// whatever it is, so the `int` below is always a number this build can
-		// hold and the sum below it cannot overflow.
-		if size > u64(limit) || len(out) + int(size) > limit {
+		if len(out) + size > limit {
 			return nil, .Too_Large
 		}
 		/*
@@ -834,7 +787,7 @@ read_chunked :: proc(r: ^Buf_Reader, allocator: mem.Allocator, limit: int) -> (b
 		piece rather than the chunk: a list sent as one chunk is held once, in
 		`out`, not twice (#414).
 		*/
-		for left := int(size); left > 0; {
+		for left := size; left > 0; {
 			data := reader_exact(r, min(left, CHUNK_PIECE)) or_return
 			// Doubled, but never past `limit`: `append` grows by more than twice,
 			// which would hold a body just under the limit in more than it allows.

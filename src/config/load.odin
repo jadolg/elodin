@@ -2063,18 +2063,18 @@ uri_template_literal :: proc(s: string) -> bool {
 		case 0 ..= ' ', 0x7f ..= 0xff, '"', '\'', '<', '>', '\\', '^', '`', '{', '|', '}':
 			return false
 		case '%':
-			if i + 2 >= len(s) || !is_hex(s[i + 1]) || !is_hex(s[i + 2]) {
+			if i + 2 >= len(s) {
+				return false
+			}
+			_, hi := netx.hex_digit(s[i + 1])
+			_, lo := netx.hex_digit(s[i + 2])
+			if !hi || !lo {
 				return false
 			}
 			i += 2
 		}
 	}
 	return true
-}
-
-@(private)
-is_hex :: proc(c: u8) -> bool {
-	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
 /*

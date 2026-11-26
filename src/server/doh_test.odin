@@ -22,7 +22,7 @@ the method, the path, the query string and the content type from those views
 while it goes on reading the headers and then the body. Every one of those reads
 can grow the buffer past its capacity, and a grown buffer is a different block.
 
-So every field it keeps but the body is copied out (`hold`), and this pins that
+So every field it keeps but the body is copied out (`http_hold`), and this pins that
 the copies survive a buffer that moves. The arena behind `context.temp_allocator`
 would hide a view into a released block - it copies the old contents forward and
 does not reclaim the block until `free_all` - so the test swaps in an allocator
