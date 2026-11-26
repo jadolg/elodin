@@ -125,9 +125,8 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 	}
 
 	/*
-	A download after the drop, under the suite's strict sandbox: the account
-	writes its own copy, so nothing calls `fchown`, which the sandbox kills the
-	process for.
+	A download a reload adds, under the suite's strict sandbox: the account
+	writes its own copy.
 	*/
 	later := base_config(
 		udp_port,
@@ -146,8 +145,7 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 		if check(r, res.ok, "no answer after a download as the account; log:\n%s", read_log(&srv)) {
 			check(r, parse_header(r, res.wire).rcode == int(dns.Rcode.NX_Domain), "the list downloaded after the drop was not applied")
 		}
-		// The copy was written, by the account: the write after the drop is
-		// what reached the `fchown` this case exists for.
+		// The copy was written, by the account.
 		cached := false
 		after, aerr := os.read_directory_by_path(cache_dir, -1, context.temp_allocator)
 		if check(r, aerr == nil, "cannot list %s: %v", cache_dir, aerr) {

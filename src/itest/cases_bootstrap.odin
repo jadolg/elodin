@@ -79,3 +79,38 @@ run_bootstrap_cases :: proc(r: ^Runner) {
 	}
 	end_case(r)
 }
+
+/*
+A stop during the startup lookups of the upstreams' hostnames ends the process
+at once, before anything is read from the listeners, rather than once every
+lookup has timed out in turn: three hostnames against a bootstrap server that
+never answers hold a start for `upstream.BOOTSTRAP_TIMEOUT` each, and more.
+*/
+run_bootstrap_stop_case :: proc(r: ^Runner) {
+	NAME :: "bootstrap: SIGTERM is not held by the startup lookups"
+	boot := mock_make("silent-bootstrap", next_port(r))
+	defer mock_stop(boot)
+	mock_silent(boot)
+	if !mock_start_or_skip(r, boot, NAME) {
+		return
+	}
+	start_case(r, NAME)
+	defer end_case(r)
+	udp_port := next_port(r)
+	servers := `[{ name: a, type: udp, address: "a.stop.test", port: 53 }, { name: b, type: udp, address: "b.stop.test", port: 53 }, { name: c, type: udp, address: "c.stop.test", port: 53 }]`
+	config := base_config(udp_port, servers, log = "{ level: info }", upstream_extra = fmt.tprintf(`  bootstrap: ["127.0.0.1:%d"]`, boot.port))
+	srv, ok := start_server_raw(r, config, udp_port)
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+	// The premise: the start is waiting on a lookup.
+	if !check(r, mock_wait_until(boot, mock_saw_type, int(dns.Type.A), 5 * time.Second), "the bootstrap server was never asked") {
+		return
+	}
+	state, exited := signal_shutdown(&srv, 5 * time.Second)
+	if check(r, exited, "the server did not exit within 5s of SIGTERM during the startup lookups") {
+		check(r, state.success && state.exit_code == 0, "exited with code %d (success=%v)", state.exit_code, state.success)
+		check(r, !log_contains(&srv, "msg=ready"), "the stop waited for the lookups to end")
+	}
+}

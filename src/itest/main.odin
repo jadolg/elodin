@@ -375,6 +375,7 @@ main :: proc() {
 	run_upstream_cookie_cases(&r)
 	section(&r, "bootstrap")
 	run_bootstrap_cases(&r)
+	run_bootstrap_stop_case(&r)
 
 	section(&r, "metrics")
 	run_metrics_cases(&r)

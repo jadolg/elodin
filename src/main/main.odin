@@ -920,7 +920,7 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	// The first bytes from the network at startup, read only now that the
 	// process is as narrow as it gets (#755): the bootstrap lookups, then the
 	// lists, before any query can be answered without them.
-	server.resolve_upstreams(&s)
+	resolve_upstreams(&s)
 	if cfg.blocking.enabled {
 		lists_current = build_lists(&s, &rebuild, opts)
 	}
@@ -950,6 +950,40 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 }
 
 /*
+Look up the upstream hostnames at startup (`server.resolve_upstreams`) on a
+thread of their own, so a stop is acted on at once rather than once every
+bootstrap lookup has timed out in turn. A thread that cannot be started leaves
+them to this one.
+*/
+@(private)
+resolve_upstreams :: proc(s: ^server.Server) {
+	worker := thread.create_and_start_with_poly_data(s, proc(s: ^server.Server) {
+		server.pin(s)
+		server.resolve_upstreams(s)
+		server.unpin(s)
+	})
+	if worker == nil {
+		server.resolve_upstreams(s)
+		return
+	}
+	for !thread.is_done(worker) {
+		exit_if_stopped()
+		time.sleep(10 * time.Millisecond)
+	}
+	thread.destroy(worker)
+}
+
+// End the process on a stop asked for while startup waits on the network:
+// nothing is read from the listeners yet, so there is nothing to drain.
+@(private)
+exit_if_stopped :: proc() {
+	if sync.atomic_load(&stop_requested) {
+		logx.infof("signal received, shutting down")
+		os.exit(0)
+	}
+}
+
+/*
 Build the rule sets at startup, on the rebuild thread as at every refresh, so a
 SIGTERM is not held by the downloads and no signal cuts one short (#416).
 Whether the lists in effect are current; see `maintenance_loop`. The listeners
@@ -966,10 +1000,7 @@ build_lists :: proc(s: ^server.Server, rebuild: ^server.Rebuild, opts: Options) 
 		if collected, over := server.rebuild_collect(rebuild); over {
 			return collected
 		}
-		if sync.atomic_load(&stop_requested) {
-			logx.infof("signal received, shutting down")
-			os.exit(0)
-		}
+		exit_if_stopped()
 		// Short, as the listeners wait on it: lists loaded from the cache are
 		// over in a moment.
 		time.sleep(10 * time.Millisecond)

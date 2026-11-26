@@ -421,8 +421,8 @@ up to `server.client_timeout` (ten seconds by default). A second signal
 terminates immediately. Blocklists are downloaded and the rule sets built on a
 thread of their own, so a signal is acted on at once whatever a download is
 waiting for; a stop does not wait for a rebuild in progress (`blocklists: not
-waiting for the rebuild in progress`), and one during the downloads at startup
-exits before anything is read from the listeners.
+waiting for the rebuild in progress`), and one during the downloads or the
+bootstrap lookups at startup exits before anything is read from the listeners.
 
 `SIGHUP` (`systemctl reload elodin`) reloads without dropping a connection or a
 cached answer it has no reason to, in this order:

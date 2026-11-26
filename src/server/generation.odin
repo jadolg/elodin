@@ -705,8 +705,7 @@ boot_generation :: proc(s: ^Server, cfg: ^config.Config) -> bool {
 /*
 Look up the hostnames of the upstreams `boot_generation` built, which it leaves
 unresolved so that no bootstrap answer is read before the privilege drop and the
-syscall filter (#755). On the main thread, pinned, before the listeners are
-armed.
+syscall filter (#755). Pinned, before the listeners are armed.
 */
 resolve_upstreams :: proc(s: ^Server) {
 	l := live(s)
