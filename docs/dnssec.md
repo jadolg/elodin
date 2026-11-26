@@ -151,7 +151,8 @@ operators which anchor keys it trusts, the data they use to pace a KSK rollover
 Both carry at most 12 tags, the smallest, which is what a `_ta-` label holds.
 
 Other zones' DNSKEY lookups carry neither. Set `false` to send neither for
-anchored zones either, for instance behind an upstream that answers FORMERR to
+anchored zones either, nor to forward a client's own option ([below](#clients-key-tags)),
+for instance behind an upstream that answers FORMERR to
 an EDNS option it does not know, which RFC 6891 section 6.1.2 says it MUST
 ignore. Unbound's `trust-anchor-signaling`, which sends the Key Tag query, is
 on by default too. A reload that changes only this setting keeps the answer
@@ -160,14 +161,15 @@ cache.
 ### Clients' key tags
 
 A client that validates may send its own `edns-key-tag` option on a DNSKEY
-question. elodin forwards it upstream (RFC 8145 section 4.2.2), whatever
-`trust_anchor_signaling` says:
+question. While `trust_anchor_signaling` is on, elodin forwards it upstream
+(RFC 8145 section 4.2.2):
 
 - validating, beside elodin's own list in an option of its own, and not again
   when it lists the same tags; with validation off, as it came;
 - only on a DNSKEY question. On any other type the option is dropped (section
   4.2), and so it is for the target a [rewrite](rewrites.md)'s CNAME leads to;
-- not a list that is empty or not whole two-byte tags;
+- not a list that is empty or not whole two-byte tags, nor a second copy of
+  one already sent;
 - 12 tags at most across the client's lists: the list that crosses that is cut,
   and later ones are dropped.
 

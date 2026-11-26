@@ -475,8 +475,7 @@ upstream_also_says :: proc(
 	/*
 	Built as `server.upstream_query` builds the forwarded query, because it
 	differs from the client's in more than CD: RD, one OPT record at
-	`server.UPSTREAM_UDP_SIZE` with no options whatever the client sent (bar a
-	DNSKEY question's edns-key-tag, which the generator never sends), and DO
+	`server.UPSTREAM_UDP_SIZE` with no options whatever the client sent, and DO
 	and CD forced on when validating - and DO is as much a part of what a
 	resolver answers from as CD is, which elodin's own cache says out loud by
 	keying on both. The generator sets DO on well under half the queries it
@@ -496,6 +495,9 @@ upstream_also_says :: proc(
 		forwarded.cd = true
 		forwarded.do_bit = true
 	}
+	// Bar the edns-key-tag elodin sends with a DNSKEY question, left off: the
+	// generator sends no client's, and RFC 8145 section 4.3 gives a responder no
+	// use for the anchors' but to "log or otherwise collect" them.
 	forwarded.options = nil
 	asked := pg_encode(forwarded, context.temp_allocator)
 	seen := make([dynamic][]u8, 0, 5, context.temp_allocator)

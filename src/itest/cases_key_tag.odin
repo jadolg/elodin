@@ -13,6 +13,7 @@ of its own when it validates (4.2.2.1) and as it came when it does not
 run_client_key_tag_cases :: proc(r: ^Runner) {
 	run_client_key_tag_validating_case(r)
 	run_client_key_tag_forwarding_case(r)
+	run_client_key_tag_off_case(r)
 }
 
 // The data of every edns-key-tag option in `wire`'s OPT record, in order; nil
@@ -165,4 +166,37 @@ run_client_key_tag_forwarding_case :: proc(r: ^Runner) {
 		check(r, dns.name_equal_fold(m.question[0].name, "target.key-tag.test."), "the premise: the rewrite's target was asked, not %q", m.question[0].name)
 	}
 	check_key_tag_lists(r, chased, "the chased DNSKEY query", nil)
+}
+
+/*
+`dnssec.trust_anchor_signaling: false` keeps a client's edns-key-tag off the
+upstream too: the switch is for an upstream that answers the option FORMERR.
+*/
+@(private = "file")
+run_client_key_tag_off_case :: proc(r: ^Runner) {
+	start_case(r, "upstream: trust_anchor_signaling off forwards no client's edns-key-tag (#753)")
+	defer end_case(r)
+	upstream_port := next_port(r)
+	mock := mock_make("key-tag-off", upstream_port)
+	mock_synth_all(mock, {203, 0, 113, 60})
+	if !mock_start_or_skip(r, mock, "key-tag-off") {
+		return
+	}
+	defer mock_stop(mock)
+	udp_port := next_port(r)
+	config := base_config(udp_port, fmt.tprintf("[udp://127.0.0.1:%d]", upstream_port), extra = "dnssec: { enabled: false, trust_anchor_signaling: false }\n")
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+	res := query_udp(udp_port, build_query("off.key-tag.test.", u16(dns.Type.DNSKEY), edns_size = 1232, key_tags = {{0x12, 0x34}}), context.temp_allocator)
+	if !check(r, res.ok, "no answer to the DNSKEY question") {
+		return
+	}
+	forwarded := mock_last_query_of(mock, u16(dns.Type.DNSKEY))
+	if m, derr := dns.decode_message(forwarded, context.temp_allocator); check(r, derr == .None && len(m.question) == 1, "the forwarded DNSKEY query does not decode: %v", derr) {
+		check(r, dns.name_equal_fold(m.question[0].name, "off.key-tag.test."), "the premise: the client's question was forwarded, not %q", m.question[0].name)
+	}
+	check_key_tag_lists(r, forwarded, "the forwarded DNSKEY query", nil)
 }

@@ -1865,8 +1865,10 @@ shape_forwarded :: proc(st: ^Query_State) -> bool {
 	// RFC 4035 section 3.2.1: a security-aware resolver "MUST set the DO bit
 	// when sending requests, regardless of the state of the DO bit in the
 	// initiating request", validating this one or not (CD, a route).
+	// The switch is also what keeps the option off an upstream that answers it
+	// FORMERR, whose ever it is.
 	client: []dns.EDNS_Option
-	if opt, has_opt := dns.find_opt(st.msg); has_opt {
+	if opt, has_opt := dns.find_opt(st.msg); has_opt && live(st.s).cfg.dnssec.trust_anchor_signaling {
 		if rdata, is_opt := opt.data.(dns.Rdata_OPT); is_opt {
 			client = rdata.options
 		}
@@ -1953,10 +1955,11 @@ KEY_TAG_OPTIONS :: 1 + dnssec.MAX_KEY_TAGS
 The `edns-key-tag` options (RFC 8145 section 4) a `type` question goes upstream
 with, written to `options`, and how many: `key_tags` in one when there are any,
 its bytes in `tags`, then, for a DNSKEY question, each of `client_options` that
-is a list of one or more whole two-byte tags (section 4.1) and not the same set
-as `key_tags`, in an option of its own (section 4.2.2.1). Each list is cut to
-`dnssec.MAX_KEY_TAGS`, and the client's lists to that many between them, the
-limit section 4.2.2.1 recommends. The client's options are sliced, not copied.
+is a list of one or more whole two-byte tags (section 4.1), not the same set as
+`key_tags` and not one the client sent before, in an option of its own (section
+4.2.2.1). Each list is cut to `dnssec.MAX_KEY_TAGS`, and the client's lists to
+that many between them, the limit section 4.2.2.1 recommends. The client's
+options are sliced, not copied.
 */
 @(private = "file")
 key_tag_options :: proc(
@@ -1986,12 +1989,26 @@ key_tag_options :: proc(
 		if o.code != u16(dns.EDNS_Option_Code.Key_Tag) || n == 0 || len(o.data) % 2 != 0 || same_key_tags(o.data, own) {
 			continue
 		}
+		if repeated(o.data, options[1 if len(own) > 0 else 0:count]) {
+			continue
+		}
 		take := min(n, budget)
 		options[count] = {code = o.code, data = o.data[:2 * take]}
 		count += 1
 		budget -= take
 	}
 	return count
+}
+
+// Whether `data` is the data of one of `taken`.
+@(private = "file")
+repeated :: proc(data: []u8, taken: []dns.EDNS_Option) -> bool {
+	for o in taken {
+		if slice.equal(o.data, data) {
+			return true
+		}
+	}
+	return false
 }
 
 // Whether `data`, an `edns-key-tag` option's two-byte tags, holds the tags of

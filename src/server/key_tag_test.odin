@@ -117,9 +117,9 @@ key_tag_option :: proc(data: ..u8) -> dns.EDNS_Option {
 RFC 8145 section 4.2.2.1: a client's Key Tag list that differs from this
 server's goes upstream beside it, each in an `edns-key-tag` option of its own,
 and section 4.2.2.2 has a non-validating server copy the client's. A client
-list holding the same tags as this server's is not sent twice; one that is
-empty or not whole two-byte tags (section 4.1) is not sent at all, and nor is
-any other option of the client's.
+list holding the same tags as this server's is not sent twice, nor one the
+client repeated; one that is empty or not whole two-byte tags (section 4.1) is
+not sent at all, and nor is any other option of the client's.
 */
 @(test)
 test_a_dnskey_query_carries_the_clients_key_tags_beside_this_servers :: proc(t: ^testing.T) {
@@ -133,6 +133,7 @@ test_a_dnskey_query_carries_the_clients_key_tags_beside_this_servers :: proc(t: 
 		key_tag_option(0xab, 0xcd, 0x12, 0x34),
 		// As long as a two-tag list of this server's, and inside it, but not all of it.
 		key_tag_option(0x12, 0x34, 0x12, 0x34),
+		key_tag_option(0x12, 0x34),
 	}
 	cases := []struct {
 		own:  []u16,
@@ -221,26 +222,36 @@ test_a_clients_key_tags_are_capped :: proc(t: ^testing.T) {
 
 /*
 `shape_forwarded` hands the client's own `edns-key-tag` option on with its
-DNSKEY question. With no validator, as here, there is no list of this
-server's beside it (RFC 8145 section 4.2.2.2).
+DNSKEY question while `dnssec.trust_anchor_signaling` is on, and not while it
+is off: the switch is for an upstream that answers FORMERR to the option. With
+no validator, as here, there is no list of this server's beside it (RFC 8145
+section 4.2.2.2).
 */
 @(test)
 test_a_forwarded_dnskey_query_carries_the_clients_key_tags :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	cfg: config.Config
-	s := local_server(&cfg)
 	wire := test_query("example.", .DNSKEY, opt = opt_with(.Key_Tag, []u8{0x12, 0x34}, do_bit = true))
 	msg, derr := dns.decode_message(wire, context.temp_allocator)
 	if !testing.expectf(t, derr == .None, "the client's query does not decode: %v", derr) {
 		return
 	}
-	spent: int
-	st := stage_state(&s, msg, &spent, context.temp_allocator)
-	if !testing.expect(t, !shape_forwarded(&st), "the query was answered rather than forwarded") {
-		return
-	}
-	got, _, ok := sent_key_tags(t, st.forwarded)
-	if ok && testing.expectf(t, len(got) == 1, "%d edns-key-tag options went upstream, want the client's", len(got)) {
-		testing.expectf(t, slice.equal(got[0], []u8{0x12, 0x34}), "the option holds %x, want 1234", got[0])
+	for signalling in ([]bool{true, false}) {
+		cfg: config.Config
+		s := local_server(&cfg)
+		cfg.dnssec.trust_anchor_signaling = signalling
+		spent: int
+		st := stage_state(&s, msg, &spent, context.temp_allocator)
+		if !testing.expectf(t, !shape_forwarded(&st), "signalling %v: the query was answered rather than forwarded", signalling) {
+			continue
+		}
+		got, _, ok := sent_key_tags(t, st.forwarded)
+		if !ok {
+			continue
+		}
+		if !signalling {
+			testing.expectf(t, len(got) == 0, "signalling off: %d edns-key-tag options went upstream (%x)", len(got), got[:])
+		} else if testing.expectf(t, len(got) == 1, "%d edns-key-tag options went upstream, want the client's", len(got)) {
+			testing.expectf(t, slice.equal(got[0], []u8{0x12, 0x34}), "the option holds %x, want 1234", got[0])
+		}
 	}
 }
