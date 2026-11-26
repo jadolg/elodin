@@ -179,22 +179,25 @@ split_field_line :: proc(header: string) -> (name, value: string, ok: bool) {
 An HTTP/1.1 chunk line (RFC 9112 7.1): `chunk-size [ chunk-ext ]`, the size one
 or more hex digits and the extensions held to the 7.1.1 grammar, then ignored.
 
-A size past `limit` comes back as `limit + 1` with the rest of the line unread,
-so nothing wraps on the way to the caller's range check. `ok` is false for a
-line that is not a chunk line.
+A size past `limit` comes back as `limit + 1`, so nothing wraps on the way to
+the caller's range check, and the rest of the line is still checked: too large
+and not a chunk line at all are different refusals, as `parse_content_length`'s
+are. `ok` is false for a line that is not a chunk line.
 */
 parse_chunk_line :: proc(line: string, limit: int) -> (size: int, ok: bool) {
+	// A step is taken only from `size <= limit`, so it stays under
+	// `limit * 16 + 15`, which this keeps inside an int.
+	assert(limit >= 0 && limit < max(int) / 16)
 	digits := 0
 	for digits < len(line) {
 		v, hex := netx.hex_digit(line[digits])
 		if !hex {
 			break
 		}
-		size = size * 16 + int(v)
-		digits += 1
-		if size > limit {
-			return limit + 1, true
+		if size <= limit {
+			size = min(size * 16 + int(v), limit + 1)
 		}
+		digits += 1
 	}
 	// `chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`
 	if digits == 0 || !params_are_valid(line[digits:], value_optional = true) {

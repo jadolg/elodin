@@ -2884,7 +2884,9 @@ test_http1_chunk_line_is_hex_then_extensions :: proc(t: ^testing.T) {
 		// Past the limit is the limit plus one, whatever follows it.
 		{"101", 256, true},
 		{"FFFFFFFFFFFFFFFFFFFF", 256, true},
-		{"101;\x7f", 256, true},
+		{"101;ext", 256, true},
+		{"101;\x7f", 0, false},
+		{"FFFFFFFFFFFFFFFFFFFF ", 0, false},
 		{"", 0, false},
 		{" 5", 0, false},
 		{"5 ", 0, false},
@@ -2903,6 +2905,10 @@ test_http1_chunk_line_is_hex_then_extensions :: proc(t: ^testing.T) {
 		size, ok := parse_chunk_line(c.line, 255)
 		testing.expectf(t, ok == c.ok && size == c.size, "%q: got %d %v, want %d %v", c.line, size, ok, c.size, c.ok)
 	}
+	// The largest limit the assert takes: a step from `limit + 1` would wrap.
+	top := max(int) / 16 - 1
+	size, ok := parse_chunk_line("8000000000000000", top)
+	testing.expectf(t, ok && size == top + 1, "at the top limit: got %d %v, want %d", size, ok, top + 1)
 }
 
 // A transfer-coding's parameters need a value (RFC 9112 7); a chunk extension's do not (7.1.1).

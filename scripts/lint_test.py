@@ -35,7 +35,7 @@ LINES = [
     (lint.ADDED, PROD, "// the fix makes this hold", "narration"),
     (lint.ADDED, PROD, "// it holds no longer than max_ttl", None),
     (lint.ADDED, TEST, "// a reader, since there is now one per socket", "narration"),
-    (lint.ADDED, TEST, "// read as before: the idle wait", "narration"),
+    (lint.ADDED, TEST, "// the same bytes as before", None),
     (lint.ADDED, TEST, "// the shape of the finding", "narration"),
     (lint.ADDED, PROD, "// there is no finding", None),
 ]

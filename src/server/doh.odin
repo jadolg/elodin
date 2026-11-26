@@ -804,8 +804,8 @@ read_chunked_body :: proc(r: ^Http_Reader) -> (body: []u8, status: int, ok: bool
 		if line == "" {
 			break
 		}
-		colon := strings.index_byte(line, ':')
-		if colon <= 0 || !h2.is_token(line[:colon]) {
+		// Held as the header block's field lines are: see `read_field_lines`.
+		if name, _, field := h2.split_field_line(line); !field || !h2.is_token(name) {
 			return nil, 400, false
 		}
 	}
