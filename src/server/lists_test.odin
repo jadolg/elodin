@@ -2,7 +2,6 @@ package server
 
 import "base:runtime"
 import "core:fmt"
-import "core:log"
 import "core:mem"
 import "core:net"
 import "core:os"
@@ -778,13 +777,11 @@ test_a_disabled_entry_does_not_lend_its_source_a_history :: proc(t: ^testing.T) 
 }
 
 /*
-The cache directory is the service account's, and a root start that drops to it
-writes and reads the lists there before the drop (#688). The write follows no
-symlink whoever writes: a `.tmp` planted as a link to another file is replaced,
-not written through. With a cache owner - that root start - a copy is read, and
-fresh, only as a regular file with one link that belongs to the owner, never
-through a symlink; without one, any regular file is, however it is linked or
-owned, as a process that is not root reads nothing more through a link.
+The write follows no symlink: a `.tmp` planted as a link to another file is
+replaced, not written through. A copy is read, and fresh, as any regular file,
+however it is linked or owned: the cache is read only by the account that owns
+it (#755), which reads nothing more through a link than it could by name. A
+FIFO is neither waited on nor read.
 */
 @(test)
 test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
@@ -802,13 +799,6 @@ test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
 	cpath := proc(p: string) -> cstring {
 		return strings.clone_to_cstring(p, context.temp_allocator)
 	}
-	// A root start's rules, with this process as the owner it writes for.
-	strict := Cache_Owner {
-		uid = posix.geteuid(),
-		gid = posix.getegid(),
-		set = true,
-	}
-
 	// The write.
 	if !testing.expect(t, posix.symlink(cpath(victim), cpath(fmt.tprintf("%s.tmp", path))) == .OK, "cannot plant the .tmp link") {
 		return
@@ -821,55 +811,40 @@ test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
 	testing.expect_value(t, werr, nil)
 	testing.expect_value(t, string(written), "0.0.0.0 new.example\n")
 
-	// A plain copy: read and fresh, under either rule.
-	for owner in ([]Cache_Owner{{}, strict}) {
-		_, why, read := read_cache_file(path, context.temp_allocator, owner)
-		testing.expectf(t, read, "a plain copy was not read (owner set %v): %q", owner.set, why)
-		_, fresh := plain_cache_file(path, owner)
-		testing.expectf(t, fresh, "a plain copy is not fresh (owner set %v)", owner.set)
-	}
+	// A plain copy: read and fresh.
+	_, why, read := read_cache_file(path, context.temp_allocator)
+	testing.expectf(t, read, "a plain copy was not read: %q", why)
+	_, fresh := plain_cache_file(path)
+	testing.expect(t, fresh, "a plain copy is not fresh")
 
-	// Linked copies: refused, and not fresh, by a root start; read by any other.
+	// Linked copies: read, and fresh, as the file they link to.
 	links := []struct {
 		name: string,
 		make: proc "c" (target, at: cstring) -> posix.result,
-		why:  string,
 	} {
-		{name = "symlink", make = posix.symlink, why = "it is a symlink"},
-		{name = "hard link", make = posix.link, why = "it is a hard link"},
+		{name = "symlink", make = posix.symlink},
+		{name = "hard link", make = posix.link},
 	}
 	for l in links {
 		testing.expect_value(t, os.remove(path), nil)
 		if !testing.expectf(t, l.make(cpath(victim), cpath(path)) == .OK, "cannot plant the %s", l.name) {
 			return
 		}
-		_, why, read := read_cache_file(path, context.temp_allocator, strict)
-		testing.expectf(t, !read && why == l.why, "a root start read the %s: %v %q", l.name, read, why)
-		_, fresh := plain_cache_file(path, strict)
-		testing.expectf(t, !fresh, "a root start took the %s as fresh", l.name)
-		data, owhy, oread := read_cache_file(path, context.temp_allocator)
-		testing.expectf(t, oread && string(data) == "0.0.0.0 secret.example\n", "a start with no owner did not read the %s: %q", l.name, owhy)
+		data, lwhy, lread := read_cache_file(path, context.temp_allocator)
+		testing.expectf(t, lread && string(data) == "0.0.0.0 secret.example\n", "the %s was not read: %q", l.name, lwhy)
+		_, lfresh := plain_cache_file(path)
+		testing.expectf(t, lfresh, "the %s is not fresh", l.name)
 	}
-
-	// Another uid's copy: refused by a root start, read by any other.
-	testing.expect_value(t, os.remove(path), nil)
-	testing.expect(t, os.write_entire_file(path, "0.0.0.0 mine.example\n") == nil)
-	other := strict
-	other.uid += 1
-	_, owner_why, owner_read := read_cache_file(path, context.temp_allocator, other)
-	testing.expectf(t, !owner_read && strings.has_prefix(owner_why, "it belongs to uid"), "a root start read another uid's copy: %v %q", owner_read, owner_why)
-	_, fresh_for_other := plain_cache_file(path, other)
-	testing.expect(t, !fresh_for_other, "a root start took another uid's copy as fresh")
 
 	// A FIFO in the copy's place is neither waited on nor read, by anyone.
 	testing.expect_value(t, os.remove(path), nil)
 	if !testing.expect(t, posix.mkfifo(cpath(path), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {
 		return
 	}
-	for owner in ([]Cache_Owner{{}, strict}) {
-		_, fifo_why, fifo_read := read_cache_file(path, context.temp_allocator, owner)
-		testing.expectf(t, !fifo_read && fifo_why == "it is not a regular file", "a FIFO was read (owner set %v): %q", owner.set, fifo_why)
-	}
+	_, fifo_why, fifo_read := read_cache_file(path, context.temp_allocator)
+	testing.expectf(t, !fifo_read && fifo_why == "it is not a regular file", "a FIFO was read: %q", fifo_why)
+	_, fifo_fresh := plain_cache_file(path)
+	testing.expect(t, !fifo_fresh, "a FIFO is fresh")
 
 	// The list loads no copy that is refused - the FIFO, still in place - nor
 	// one that is missing.
@@ -881,78 +856,6 @@ test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
 	testing.expectf(t, load == .Unavailable && text == "", "a missing copy loaded: %v %q", load, text)
 	delete(text)
 }
-
-/*
-A copy written for an account is the account's from the moment it exists: a
-root start gives each one it caches to the account it drops to, through the
-descriptor that created it, rather than chowning what it later finds there
-(#688). Handed to its own owner, which any user can do; as root, to another.
-*/
-@(test)
-test_a_cached_copy_is_written_for_its_owner :: proc(t: ^testing.T) {
-	defer free_all(context.temp_allocator)
-	_, dir := list_test_dir(t, "owner")
-	defer os.remove_all(dir)
-	path := fmt.tprintf("%s/owned.list", dir)
-	owner := Cache_Owner {
-		uid = posix.geteuid(),
-		gid = posix.getegid(),
-		set = true,
-	}
-	if posix.geteuid() == 0 {
-		owner = {uid = 65534, gid = 65534, set = true}
-		// Not where no chown to 65534 can succeed - a user namespace mapping
-		// no such uid - which `test_a_copy_that_cannot_be_given_is_kept` is for.
-		probe := fmt.tprintf("%s/probe", dir)
-		if !testing.expect(t, os.write_entire_file(probe, "x") == nil, "cannot write the probe") {
-			return
-		}
-		if posix.chown(strings.clone_to_cstring(probe, context.temp_allocator), owner.uid, owner.gid) != .OK {
-			log.info("skipped: a chown to 65534 fails here")
-			return
-		}
-	}
-	testing.expect_value(t, write_cache_file(path, transmute([]byte)string("0.0.0.0 o.example\n"), owner), nil)
-	st: posix.stat_t
-	if !testing.expect(t, posix.stat(strings.clone_to_cstring(path, context.temp_allocator), &st) == .OK, "cannot stat the copy") {
-		return
-	}
-	testing.expectf(t, st.st_uid == owner.uid && st.st_gid == owner.gid, "the copy is %d:%d's, want %d:%d", st.st_uid, st.st_gid, owner.uid, owner.gid)
-	testing.expect(t, !os.exists(fmt.tprintf("%s.tmp", path)), "the temporary copy was left behind")
-}
-
-/*
-Where a root start cannot give a copy to the account - a filesystem with no
-owners (vfat, an NFS export that squashes root), or a user namespace that maps
-no such uid - the copy is kept for this start rather than thrown away. Runs
-only where such a chown fails, which the test probes for first: in a user
-namespace (`unshare -U -r`), say.
-*/
-@(test)
-test_a_copy_that_cannot_be_given_is_kept :: proc(t: ^testing.T) {
-	defer free_all(context.temp_allocator)
-	_, dir := list_test_dir(t, "unowned")
-	defer os.remove_all(dir)
-	owner := Cache_Owner {
-		uid = 65534,
-		gid = 65534,
-		set = true,
-	}
-	probe := fmt.tprintf("%s/probe", dir)
-	if !testing.expect(t, os.write_entire_file(probe, "x") == nil, "cannot write the probe") {
-		return
-	}
-	if posix.geteuid() != 0 || posix.chown(strings.clone_to_cstring(probe, context.temp_allocator), owner.uid, owner.gid) == .OK {
-		log.info("skipped: a chown to 65534 does not fail here")
-		return
-	}
-	path := fmt.tprintf("%s/kept.list", dir)
-	testing.expect_value(t, write_cache_file(path, transmute([]byte)string("0.0.0.0 kept.example\n"), owner), nil)
-	kept, kerr := os.read_entire_file(path, context.temp_allocator)
-	testing.expect_value(t, kerr, nil)
-	testing.expect_value(t, string(kept), "0.0.0.0 kept.example\n")
-}
-
 /*
 A cached copy is read whole or not at all: an allocator that runs dry, a copy
 larger than any download elodin writes, and a file that holds more or less
@@ -972,7 +875,7 @@ test_a_cached_copy_is_read_whole_or_refused :: proc(t: ^testing.T) {
 	defer os.remove(path)
 
 	// Room for the whole copy: read, all of it.
-	data, why, read := read_cache_file(path, context.temp_allocator, owner = {})
+	data, why, read := read_cache_file(path, context.temp_allocator)
 	testing.expectf(t, read && len(data) == len(body), "a copy with room was not read whole: %v %q, %d of %d bytes", read, why, len(data), len(body))
 
 	// Room for half of it: refused, not cut short.
@@ -980,7 +883,7 @@ test_a_cached_copy_is_read_whole_or_refused :: proc(t: ^testing.T) {
 	defer delete(backing)
 	arena: mem.Arena
 	mem.arena_init(&arena, backing)
-	data, why, read = read_cache_file(path, mem.arena_allocator(&arena), owner = {})
+	data, why, read = read_cache_file(path, mem.arena_allocator(&arena))
 	testing.expectf(t, !read && why == "there is no memory to read it", "a copy with no room for it: %v %q, %d of %d bytes", read, why, len(data), len(body))
 
 	// Larger than any download, as a sparse file: refused before any allocation.
@@ -992,11 +895,11 @@ test_a_cached_copy_is_read_whole_or_refused :: proc(t: ^testing.T) {
 	if !testing.expect(t, posix.truncate(strings.clone_to_cstring(big, context.temp_allocator), upstream.MAX_HTTP_BODY + 1) == .OK, "cannot grow the large copy") {
 		return
 	}
-	data, why, read = read_cache_file(big, context.temp_allocator, owner = {})
+	data, why, read = read_cache_file(big, context.temp_allocator)
 	testing.expectf(t, !read && why == "it is larger than any download", "a copy past the download cap: %v %q, %d bytes", read, why, len(data))
 
 	// More than its size said: a /proc file says 0 and holds lines.
-	data, why, read = read_cache_file("/proc/self/status", context.temp_allocator, owner = {})
+	data, why, read = read_cache_file("/proc/self/status", context.temp_allocator)
 	testing.expectf(t, !read && why == "its size changed while it was read", "a file past its stat size: %v %q, %d bytes", read, why, len(data))
 
 	// Less than its size said: a sysfs attribute says a page and holds a line.
@@ -1006,6 +909,6 @@ test_a_cached_copy_is_read_whole_or_refused :: proc(t: ^testing.T) {
 	if !testing.expectf(t, rerr == nil && serr == nil && fi.size > i64(len(held)), "the premise: %s holds less than its size, %v %v", short, rerr, serr) {
 		return
 	}
-	data, why, read = read_cache_file(short, context.temp_allocator, owner = {})
+	data, why, read = read_cache_file(short, context.temp_allocator)
 	testing.expectf(t, !read && why == "its size changed while it was read", "a file short of its stat size: %v %q, %d bytes", read, why, len(data))
 }

@@ -364,7 +364,7 @@ stop and the answer least likely to be noticed, since the public resolver
 replies rather than failing.
 */
 @(private)
-build_upstreams :: proc(s: ^Server, l: ^Live) -> bool {
+build_upstreams :: proc(s: ^Server, l: ^Live, resolve: bool) -> bool {
 	cfg := l.cfg
 	outstanding := connection_outstanding(cfg)
 	// The budget's figure is set by `build_live` once the whole generation is built.
@@ -373,6 +373,7 @@ build_upstreams :: proc(s: ^Server, l: ^Live) -> bool {
 		cookies = cfg.cookies.upstream,
 		outstanding = outstanding,
 		racers = &s.racers,
+		resolve = resolve,
 	)
 	if gerr != .None {
 		logx.errorf("no usable upstream servers")
@@ -385,6 +386,7 @@ build_upstreams :: proc(s: ^Server, l: ^Live) -> bool {
 			cookies = cfg.cookies.upstream,
 			outstanding = outstanding,
 			racers = &s.racers,
+			resolve = resolve,
 		)
 		if zerr != .None {
 			logx.errorf("upstream.zones[%d]: no usable servers for %s", i, zone.domains[0])
@@ -474,7 +476,9 @@ build_live :: proc(s: ^Server, l: ^Live, prev: ^Live) -> (built, carried: Parts,
 		if prev != nil && upstreams_asked_changed(prev.cfg.upstream, cfg.upstream) {
 			upstream.bootstrap_forget()
 		}
-		if !build_upstreams(s, l) {
+		// Not at startup, which is before the privilege drop and the syscall
+		// filter: `resolve_upstreams` looks those up once they are in place.
+		if !build_upstreams(s, l, resolve = prev != nil) {
 			return
 		}
 		built += {.Upstreams}
@@ -696,6 +700,20 @@ boot_generation :: proc(s: ^Server, cfg: ^config.Config) -> bool {
 	s.gens.boot = cfg
 	sync.atomic_store(&s.gens.current, g)
 	return true
+}
+
+/*
+Look up the hostnames of the upstreams `boot_generation` built, which it leaves
+unresolved so that no bootstrap answer is read before the privilege drop and the
+syscall filter (#755). On the main thread, pinned, before the listeners are
+armed.
+*/
+resolve_upstreams :: proc(s: ^Server) {
+	l := live(s)
+	upstream.resolve_group(l.group)
+	for route in l.routes {
+		upstream.resolve_group(route.group)
+	}
 }
 
 /*

@@ -46,8 +46,9 @@ for them, since on a machine where elodin *is* the system resolver that would
 loop back to a server that has not started yet. Each entry is an IP address with
 an optional port (`9.9.9.9`, `[2620:fe::fe]:53`); a name there is a config error.
 
-An upstream's hostname is resolved at startup to the first address the
-answer gives for it (following CNAMEs), and held for the shortest TTL on that
+An upstream's hostname is resolved at startup, after the
+[privilege drop](install.md#privileges) and before the first query is read, to
+the first address the answer gives for it (following CNAMEs), and held for the shortest TTL on that
 chain, no less than 10
 seconds and no more than an hour. The first query after that asks `bootstrap`
 again, spending at most a quarter of its `timeout` on it, while the others go

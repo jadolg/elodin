@@ -855,38 +855,6 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 	// Here rather than in the loop, as a rebuild a stop leaves running writes
 	// to it until the process ends; see the deferred stop below.
 	rebuild: server.Rebuild
-	// A root start downloads the lists before the drop; each copy it caches is
-	// the account's as it is written, so the refreshes after the drop can
-	// replace it (see `privdrop.hand_over`).
-	// The writer gives copies away only while euid is 0; see `write_cache_file`.
-	if posix.geteuid() == 0 && service.uid != 0 {
-		server.set_cache_owner(service.uid, service.gid)
-	}
-	if cfg.blocking.enabled {
-		/*
-		On the rebuild thread, as at every refresh, so a SIGTERM is not held by
-		the downloads and no signal cuts one short (#416). Nothing listens yet,
-		so a stop has nothing to drain. A SIGHUP waits for the loop.
-		*/
-		if !server.rebuild_start(&rebuild, &s, !opts.no_fetch) {
-			// Here, then: nothing listens yet for a stop to drain.
-			logx.warnf("blocklists: cannot start a thread to build the rules; building them here")
-			lists_current = server.rebuild_rules(&s, server.live_config(&s), !opts.no_fetch)
-		}
-		for server.rebuild_busy(&rebuild) {
-			if current, over := server.rebuild_collect(&rebuild); over {
-				lists_current = current
-				break
-			}
-			if sync.atomic_load(&stop_requested) {
-				logx.infof("signal received, shutting down")
-				os.exit(0)
-			}
-			// Short, as the listeners wait on it: lists loaded from the cache are
-			// over in a moment.
-			time.sleep(10 * time.Millisecond)
-		}
-	}
 
 	/*
 	A rebuild still downloading at a stop is not waited for: it is held by the
@@ -949,6 +917,13 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 
 	drop_privileges(cfg, service, opts.config_path)
 	filter_process(cfg, landlock_abi)
+	// The first bytes from the network at startup, read only now that the
+	// process is as narrow as it gets (#755): the bootstrap lookups, then the
+	// lists, before any query can be answered without them.
+	server.resolve_upstreams(&s)
+	if cfg.blocking.enabled {
+		lists_current = build_lists(&s, &rebuild, opts)
+	}
 	if !server.arm_listeners(&s, &listeners) {
 		logx.errorf("could not start reading from every listener, shutting down")
 		os.exit(1)
@@ -975,23 +950,51 @@ run :: proc(cfg: ^config.Config, opts: Options, service: privdrop.Identity) {
 }
 
 /*
+Build the rule sets at startup, on the rebuild thread as at every refresh, so a
+SIGTERM is not held by the downloads and no signal cuts one short (#416).
+Whether the lists in effect are current; see `maintenance_loop`. The listeners
+are bound and not yet read, so a stop has nothing to drain, and a query that
+arrives meanwhile waits in the kernel. A SIGHUP waits for the loop.
+*/
+@(private)
+build_lists :: proc(s: ^server.Server, rebuild: ^server.Rebuild, opts: Options) -> (current: bool) {
+	if !server.rebuild_start(rebuild, s, !opts.no_fetch) {
+		logx.warnf("blocklists: cannot start a thread to build the rules; building them here")
+		return server.rebuild_rules(s, server.live_config(s), !opts.no_fetch)
+	}
+	for {
+		if collected, over := server.rebuild_collect(rebuild); over {
+			return collected
+		}
+		if sync.atomic_load(&stop_requested) {
+			logx.infof("signal received, shutting down")
+			os.exit(0)
+		}
+		// Short, as the listeners wait on it: lists loaded from the cache are
+		// over in a moment.
+		time.sleep(10 * time.Millisecond)
+	}
+}
+
+/*
 Put root down now that the listeners hold their ports.
 
 This is the last moment a privilege is needed and the first moment it can go:
 binding below 1024 is the only thing on the way up that root was for. The
 sockets are bound but not yet read: `arm_listeners` starts reading them after
 this and the syscall filter, so nothing a client sends is parsed with root's
-privileges, and the process keeps serving on them whoever it becomes.
+privileges, and the process keeps serving on them whoever it becomes. Nothing
+else from the network is read before it either: the bootstrap lookups and the
+lists come after (#755).
 
-The blocklist cache goes over first: it is elodin's own output and opened by
-name afterwards - the lists were downloaded above, as root, and a refresh some
-hours later reopens them - so without this the cache would silently stop being
-written the moment its owner changed. A log file this process created was given
-to the account when it was made (`logx.init`). Files that were there already
-are not taken over; `warn_out_of_reach` names those the new account cannot
-open. The cache only with blocking on, so a directory that is not elodin's - a
-shared one, named but unused - is not taken over for nothing. A reload that turns blocking on later finds it as it is; see
-`docs/install.md`.
+The blocklist cache goes over first, made if it is missing: the lists are
+downloaded and cached after this, as the account, which has to be able to
+write there. A log file this process created was given to the account when it
+was made (`logx.init`). Files that were there already are not taken over;
+`warn_out_of_reach` names those the new account cannot open. The cache only
+with blocking on, so a directory that is not elodin's - a shared one, named but
+unused - is not taken over for nothing. A reload that turns blocking on later
+finds it as it is; see `docs/install.md`.
 
 A drop that was asked for and did not happen ends the process. Carrying on
 would leave it as root while the log said otherwise, which is worse than not
@@ -1012,16 +1015,17 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 	}
 
 	if cfg.blocking.enabled && cfg.blocking.cache_dir != "" {
+		server.make_directories(cfg.blocking.cache_dir)
 		handed := privdrop.hand_over(cfg.blocking.cache_dir, service)
 		if !handed && is_symlink(cfg.blocking.cache_dir) {
 			logx.warnf(
-				"blocking.cache_dir %q is a symlink, which is not followed when it is given to %s; name the directory it points at, or the refreshes after the drop cannot update the cached lists",
+				"blocking.cache_dir %q is a symlink, which is not followed when it is given to %s; name the directory it points at, or the account may not be able to cache the lists",
 				cfg.blocking.cache_dir,
 				cfg.server.user,
 			)
 		} else if !handed {
 			logx.warnf(
-				"could not give %q to %s; the lists are in effect, but the refreshes after the drop cannot update the cached copies",
+				"could not give %q to %s, so the account may not be able to cache the lists there",
 				cfg.blocking.cache_dir,
 				cfg.server.user,
 			)
@@ -1032,7 +1036,6 @@ drop_privileges :: proc(cfg: ^config.Config, service: privdrop.Identity, config_
 		logx.errorf("cannot drop privileges to %s: %s", cfg.server.user, privdrop.explain(err))
 		os.exit(1)
 	}
-	server.clear_cache_owner()
 	logx.infof("running as %s (uid=%d gid=%d)", cfg.server.user, service.uid, service.gid)
 	warn_out_of_reach(cfg, config_path)
 }
@@ -1049,9 +1052,9 @@ operator is looking, rather than at the first reload weeks later. Not an error:
 the process serves correctly as it is, and a reload logs its own failure too.
 
 Lists only with blocking on; one turned on later by a reload says so itself. A
-`file:` list is read again by every rebuild, a scheduled refresh as well as a
-SIGHUP, and one it cannot read has its rules lifted rather than kept (see
-`reload_filters_from`), so that is what its warning says.
+`file:` list is first read after the drop (#755), so one out of reach is out of
+reach from the start, and every rebuild builds the rules without it (see
+`reload_filters_from`).
 */
 @(private)
 warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
@@ -1074,8 +1077,8 @@ warn_out_of_reach :: proc(cfg: ^config.Config, config_path: string) {
 	}
 }
 
-// A file a SIGHUP or a list refresh reads again by name, the setting that
-// names it, and what follows when it cannot be read.
+// A file a SIGHUP or a list rebuild reads by name after the drop, the setting
+// that names it, and what follows when it cannot be read.
 @(private)
 Reread :: struct {
 	setting, path, consequence: string,
@@ -1109,7 +1112,7 @@ reread_files :: proc(cfg: ^config.Config, config_path: string, allocator := cont
 			for list in set {
 				if (list.enabled || !in_use_only) && list.file != "" {
 					setting := fmt.aprintf("list %s", list.name, allocator = allocator)
-					append(&out, Reread{setting, list.file, "the next refresh or SIGHUP will drop the rules built from it"})
+					append(&out, Reread{setting, list.file, "the rules are built without it"})
 				}
 			}
 		}

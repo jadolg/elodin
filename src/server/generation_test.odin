@@ -1305,3 +1305,75 @@ test_a_reload_holds_pin_loops :: proc(t: ^testing.T) {
 	testing.expectf(t, len(named) == 1 && named[0] == "server.pin_loops", "named %v", named)
 	testing.expect(t, !cfg.server.pin_loops, "a reload turned pinning on for loops already running")
 }
+
+/*
+The first generation asks no bootstrap server for an upstream's hostname, in
+the default group or a route's: it is built before the privilege drop and the
+syscall filter, and `resolve_upstreams` asks once they are in place (#755).
+*/
+@(test)
+test_the_first_generation_looks_up_no_upstream_hostname :: proc(t: ^testing.T) {
+	Boot :: struct {
+		host:   string,
+		socket: net.UDP_Socket,
+		port:   int,
+		mock:   Canned_Mock,
+		bound:  bool,
+	}
+	boots := [2]Boot{{host = "up.boot.test"}, {host = "route.boot.test"}}
+	defer for b in boots {
+		if b.bound {
+			net.close(b.socket)
+		}
+	}
+	for &b in boots {
+		sock, spec, bound := bind_mock(t, "bootstrap")
+		if !bound {
+			return
+		}
+		b.socket, b.port, b.bound = sock, spec.port, true
+	}
+	named := fmt.tprintf(
+		`servers: [{{ name: named, type: udp, address: %q, port: 53 }}], bootstrap: ["127.0.0.1:%d"], zones: [{{ domains: [corp.example], servers: [{{ name: routed, type: udp, address: %q, port: 53 }}], bootstrap: ["127.0.0.1:%d"] }}]`,
+		boots[0].host,
+		boots[0].port,
+		boots[1].host,
+		boots[1].port,
+	)
+	if !testing.expect(t, strings.contains(BASE, `servers: ["127.0.0.1:1"]`), "BASE names no servers to replace") {
+		return
+	}
+	f, ok := boot_fixture(t, "boot-unresolved", swap(BASE, `servers: ["127.0.0.1:1"]`, named))
+	if !ok {
+		return
+	}
+	defer close_fixture(f)
+	// The entries `resolve_upstreams` puts in the bootstrap cache.
+	defer upstream.bootstrap_destroy()
+	for b in boots {
+		testing.expectf(t, mock_untouched(b.socket), "the first generation asked the bootstrap server for %s", b.host)
+	}
+
+	threads: [2]^thread.Thread
+	for &b, i in boots {
+		name := fmt.tprintf("%s.", b.host)
+		b.mock = Canned_Mock{socket = b.socket, reply = test_reply(name, .A, a_record(name, {127, 0, 0, 1}))}
+		threads[i] = thread.create_and_start_with_poly_data(&b.mock, serve_canned)
+	}
+	pin(&f.s)
+	resolve_upstreams(&f.s)
+	l := live(&f.s)
+	groups := [2]^upstream.Group{l.group, l.routes[0].group if len(l.routes) == 1 else nil}
+	unpin(&f.s)
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	for b, i in boots {
+		testing.expectf(t, b.mock.got, "resolve_upstreams did not ask the bootstrap server for %s", b.host)
+		g := groups[i]
+		if testing.expectf(t, g != nil && len(g.servers) == 1, "no single server for %s", b.host) {
+			testing.expectf(t, sync.atomic_load(&g.servers[0].resolved), "%s is not resolved after resolve_upstreams", b.host)
+		}
+	}
+}

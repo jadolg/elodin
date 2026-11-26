@@ -484,43 +484,32 @@ fingerprint_refusal :: proc(cache_path: string) -> string {
 	return why
 }
 
-// When the file at `path` was modified, if it is one `read_cache_file` reads.
+// When the file at `path` was modified, if it is a regular file.
 @(private)
-plain_cache_file :: proc(path: string, owner := cache_owner) -> (modified: time.Time, ok: bool) {
+plain_cache_file :: proc(path: string) -> (modified: time.Time, ok: bool) {
 	st: posix.stat_t
-	cpath := strings.clone_to_cstring(path, context.temp_allocator)
-	if (posix.lstat(cpath, &st) if owner.set else posix.stat(cpath, &st)) != .OK {
-		return {}, false
-	}
-	if cache_refusal(st, owner) != "" {
+	if posix.stat(strings.clone_to_cstring(path, context.temp_allocator), &st) != .OK || !posix.S_ISREG(st.st_mode) {
 		return {}, false
 	}
 	return time.unix(i64(st.st_mtim.tv_sec), i64(st.st_mtim.tv_nsec)), true
 }
 
 /*
-Read a file of the list cache, if `cache_refusal` takes it. O_NONBLOCK so a FIFO
-put there does not hold the start. With a cache owner - a root start that drops
-to the account whose directory it is (#688) - the name may not be a symlink
-either: a link there to a file only root can read would load that file as a
-list. `why` says why a file that is there was not read, and is empty for one
-that is not there.
+Read a file of the list cache, if it is a regular file. O_NONBLOCK so a FIFO put
+there does not hold the start. `why` says why a file that is there was not
+read, and is empty for one that is not there. A root start that drops reads
+the cache only after the drop (#755), so a link there reads nothing the
+process could not open by name.
 */
 @(private)
-read_cache_file :: proc(path: string, allocator := context.allocator, owner := cache_owner) -> (data: []byte, why: string, ok: bool) {
+read_cache_file :: proc(path: string, allocator := context.allocator) -> (data: []byte, why: string, ok: bool) {
 	// `core:sys/linux`'s flags, not `core:sys/posix`'s: those are the x86
-	// values on every architecture, and arm64's O_NOFOLLOW is another bit.
-	flags := linux.Open_Flags{.NONBLOCK, .CLOEXEC}
-	if owner.set {
-		flags += {.NOFOLLOW}
-	}
-	lfd, errno := linux.open(strings.clone_to_cstring(path, context.temp_allocator), flags)
+	// values on every architecture.
+	lfd, errno := linux.open(strings.clone_to_cstring(path, context.temp_allocator), {.NONBLOCK, .CLOEXEC})
 	#partial switch errno {
 	case .NONE:
 	case .ENOENT:
 		return nil, "", false
-	case .ELOOP:
-		return nil, "it is a symlink", false
 	case:
 		return nil, fmt.tprintf("it cannot be opened (%v)", errno), false
 	}
@@ -530,8 +519,8 @@ read_cache_file :: proc(path: string, allocator := context.allocator, owner := c
 	if posix.fstat(fd, &st) != .OK {
 		return nil, "it cannot be read", false
 	}
-	if refusal := cache_refusal(st, owner); refusal != "" {
-		return nil, refusal, false
+	if !posix.S_ISREG(st.st_mode) {
+		return nil, "it is not a regular file", false
 	}
 	// No download is larger, so neither is a copy elodin wrote.
 	if st.st_size > upstream.MAX_HTTP_BODY {
@@ -569,33 +558,6 @@ read_cache_file :: proc(path: string, allocator := context.allocator, owner := c
 		return nil, "its size changed while it was read", false
 	}
 	return out[:n], "", true
-}
-
-/*
-Why a file in the list cache is not one of its copies, or "" for one that is: a
-regular file and, with a cache owner, one with a single link that belongs to
-the owner. Those two are a root start's (#688), which reads what the account
-put in its own directory before the drop: a hard link is the file it links to,
-and one whose other name was replaced since has a single link left, but is
-still its original owner's. A process that is not root reads nothing more
-through a link than it could by name, so it reads a copy however it is linked
-or owned.
-*/
-@(private)
-cache_refusal :: proc(st: posix.stat_t, owner: Cache_Owner) -> string {
-	if !posix.S_ISREG(st.st_mode) {
-		return "it is not a regular file"
-	}
-	if !owner.set {
-		return ""
-	}
-	if st.st_nlink != 1 {
-		return "it is a hard link"
-	}
-	if st.st_uid != owner.uid {
-		return fmt.tprintf("it belongs to uid %d, not %d", st.st_uid, owner.uid)
-	}
-	return ""
 }
 
 @(private)
@@ -661,14 +623,13 @@ rename(2) replaces the name atomically. The temporary name ends in
 cannot be another list's.
 */
 @(private)
-write_cache_file :: proc(path: string, body: []byte, owner := cache_owner) -> (err: os.Error) {
+write_cache_file :: proc(path: string, body: []byte) -> (err: os.Error) {
 	tmp := fmt.tprintf("%s.tmp", path)
 	/*
-	Created afresh, O_EXCL: the directory is the service account's, and a root
-	start writes here before the drop (#688). An O_EXCL create fails on a symlink
-	rather than following it. One already there - left by a stop mid-write, or
-	planted - is removed and the create tried once more, which fails, writing
-	nothing elsewhere, if one is put back in between.
+	Created afresh, O_EXCL, which fails on a symlink rather than following it.
+	One already there - left by a stop mid-write, or planted - is removed and
+	the create tried once more, which fails, writing nothing elsewhere, if one
+	is put back in between.
 	*/
 	flags :: os.File_Flags{.Write, .Create, .Excl}
 	perms :: os.Permissions_Read_All + {.Write_User}
@@ -678,16 +639,6 @@ write_cache_file :: proc(path: string, body: []byte, owner := cache_owner) -> (e
 		f = os.open(tmp, flags, perms) or_return
 	} else if oerr != nil {
 		return oerr
-	}
-	// Given to the account through the descriptor that created it, so it is
-	// this copy and nothing else that changes owner; see `privdrop.hand_over`.
-	// Only while still root: after the drop the account writes its own, and
-	// the strict sandbox does not allow `fchown`.
-	if owner.set && posix.geteuid() == 0 && posix.fchown(posix.FD(os.fd(f)), owner.uid, owner.gid) != .OK {
-		// Kept, and said once: a filesystem with no owners (vfat, an NFS
-		// export that squashes root) cannot give it, and the copy still
-		// serves this start; the next root start reads it as another's.
-		warn_cache_unowned(path, os.Platform_Error(posix.errno()))
 	}
 	_, err = os.write(f, body)
 	if err == nil {
@@ -703,48 +654,6 @@ write_cache_file :: proc(path: string, body: []byte, owner := cache_owner) -> (e
 		os.remove(tmp)
 	}
 	return
-}
-
-/*
-Who the files of the list cache are given to as `write_cache_file` writes them:
-the account a root start drops to, which `main` names before the startup
-downloads run, as root. Unset, a file stays whoever wrote it.
-*/
-Cache_Owner :: struct {
-	uid: posix.uid_t,
-	gid: posix.gid_t,
-	set: bool,
-}
-
-// Written once at startup, before any list is loaded, and only read after.
-@(private)
-cache_owner: Cache_Owner
-
-@(private)
-cache_unowned_warned: bool
-
-// Report a copy that could not be given to the cache owner once, not per list.
-@(private)
-warn_cache_unowned :: proc(path: string, err: os.Error) {
-	if sync.atomic_exchange(&cache_unowned_warned, true) {
-		return
-	}
-	logx.warnf("the cached list %s cannot be given to the account (%v), as no copy on this filesystem can; the next root start will download the lists again rather than read them", path, err)
-}
-
-// Name the account the list cache's files are given to; see `Cache_Owner`.
-set_cache_owner :: proc(uid: posix.uid_t, gid: posix.gid_t) {
-	cache_owner = {uid = uid, gid = gid, set = true}
-}
-
-/*
-Forget the cache owner, once the process has become it: from then on it writes
-copies that are its own and reads nothing through a link that it could not by
-name, so its own copies are read however they are linked or owned. Called after
-the drop, before anything else reads the cache.
-*/
-clear_cache_owner :: proc() {
-	cache_owner = {}
 }
 
 @(private)

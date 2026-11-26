@@ -230,6 +230,7 @@ main :: proc() {
 	run_sandbox_cases(&r)
 	run_sandbox_path_cases(&r)
 	run_listener_arming_case(&r)
+	run_startup_fetch_order_case(&r)
 
 	section(&r, "log format")
 	run_logfmt_cases(&r)
