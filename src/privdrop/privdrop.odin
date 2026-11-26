@@ -279,17 +279,16 @@ already :: proc(id: Identity) -> bool {
 /*
 Hand a directory the process keeps writing to over to `id`.
 
-The blocklist cache is elodin's own output and written by name after the drop:
-the lists are downloaded before the listeners bind, so the files land under
-whoever started the process, and a refresh hours later would then fail on every
-one of them. Ownership moves with the process; a log file the process creates is
-the account's from the start (`logx.init`). The files an operator names and SIGHUP reads again are
-not taken over; see `can_reopen`.
+The blocklist cache is elodin's own output, and every list is downloaded and
+cached after the drop, by the account, so the directory has to be the
+account's first. Ownership moves with the process; a log file the process
+creates is the account's from the start (`logx.init`). The files an operator
+names and SIGHUP reads again are not taken over; see `can_reopen`.
 
-The directory alone, and nothing in it. Owning the directory is what a refresh
-needs - it writes each copy afresh and renames it into place - and the files
-elodin writes there are given to the account as they are written
-(`server.set_cache_owner`). Anything else in there, once the directory is the
+The directory alone, and nothing in it. Owning the directory is what the
+account needs - it writes each copy afresh and renames it into place - and a
+copy left by an earlier start that was not the account's is replaced, not
+written through. Anything else in there, once the directory is the
 account's, may be anything at all: a hard link is the same inode as a file
 elsewhere, and no test of what is found there - its type, its links, its owner,
 its name - tells a copy elodin wrote from a file the account linked in. Opened

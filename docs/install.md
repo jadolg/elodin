@@ -268,9 +268,11 @@ user. Leave `server.user` empty.
 
 **Start as root and put it down.** Name an account and elodin switches to it the
 moment the listeners have their ports. Nothing is read from them before the
-switch, nor, under `server.sandbox: strict`, before the syscall filter: a query
-that arrives in between waits in the kernel, and the lines saying where elodin
-listens come after both.
+switch, nor, under `server.sandbox: strict`, before the syscall filter, and
+nothing else from the network either: the bootstrap lookups of upstreams named
+by hostname and the blocklist downloads come after both. A query that arrives
+before the lists are built waits in the kernel, and the lines saying where
+elodin listens come after the lists.
 
 ```yaml
 server:
@@ -282,35 +284,27 @@ Supplementary groups go first, then the gid, then the uid — real, effective an
 saved — and the real and effective ids are read back from the kernel before the
 drop is reported. A drop that was configured and did not happen ends the
 process. A misspelt account name fails `--check`; running as root with no
-`server.user` logs a warning. `blocking.cache_dir` changes owner along with the
-process, since a refresh hours later has to write there: the directory itself,
-and each list elodin caches as it writes it. Nothing else in the directory
-changes owner, since a chown as root of a hard link the account put there would
-hand over the file it links to, wherever that file is. For the same reason a
-root start reads a cached list only as a plain file with one link that belongs
-to the account, never through a symlink; any other is not read (the log says
-why) and is downloaded again. A copy an earlier version cached as root is one of
-those, once: the first root start after upgrading has no cached lists to fall
-back on, so if it cannot download them it serves without them until a refresh
-succeeds (`chown -R` the directory to the account before upgrading to avoid it). On a filesystem with no owners (vfat, including one mounted
-`quiet`, or an NFS export that squashes root) no copy can belong to the account:
-each start uses what it downloads and downloads the lists again at the next
-start rather than read them, so a start with no network has none. Started as
-anyone but root, and after the drop, elodin reads its copies however they are
-linked or owned, since it reads nothing more through a link than by name. A `cache_dir` that is itself
-a symlink is not followed, and so not handed over: name the directory it points
-at. Started this way, elodin downloads and parses the blocklists before it
-binds, so that much happens as root; the first arrangement avoids it.
+`server.user` logs a warning. `blocking.cache_dir` is made if it is missing and changes owner before the
+drop, since the account downloads and caches the lists after it: the directory
+itself, and nothing in it, since a chown as root of a hard link the account put
+there would hand over the file it links to, wherever that file is. elodin reads
+its copies only as the account, however they are linked or owned, since it
+reads nothing more through a link than by name, and replaces a copy it cannot
+read at its next download. Where the directory cannot change owner (vfat, or an
+NFS export that squashes root), the account caches there only if the mount lets
+it write; if not, the log says the cache is not writable and each start
+downloads the lists again. A `cache_dir` that is itself a symlink is not
+followed, and so not handed over: name the directory it points at.
 
 The files a [`SIGHUP`](#signals) opens again by name are opened as that account,
 not as root: the configuration file, the DoT/DoH `cert_file` and `key_file`,
 `file:` lists and `log.file` (for writing; a log file elodin creates is
-given to the account as it is made, see [Logs](logging.md)). Startup reads them as root, so a
-root-only file — certbot's `privkey.pem` is root's and `0600` — starts fine and
+given to the account as it is made, see [Logs](logging.md)). Startup reads all but the `file:`
+lists as root, so a root-only file — certbot's `privkey.pem` is root's and `0600` — starts fine and
 then fails at every reload: the certificate is not renewed in place, and the
 listener goes on serving the old one until it expires. A `file:` list is read
-again by every scheduled refresh as well, and one the account cannot read has
-its rules lifted then. elodin does not take
+only as the account, at startup and at every refresh, and one it cannot read
+leaves the rules built without it. elodin does not take
 these files over. Give the account read access in a way that survives a
 renewal, which writes a new `privkeyN.pem` under `archive/`: certbot carries the
 previous key's group and group-read bit over to the new one, but not an ACL on
@@ -427,8 +421,8 @@ up to `server.client_timeout` (ten seconds by default). A second signal
 terminates immediately. Blocklists are downloaded and the rule sets built on a
 thread of their own, so a signal is acted on at once whatever a download is
 waiting for; a stop does not wait for a rebuild in progress (`blocklists: not
-waiting for the rebuild in progress`), and one during the downloads at startup
-exits before anything is listening.
+waiting for the rebuild in progress`), and one during the downloads or the
+bootstrap lookups at startup exits before anything is read from the listeners.
 
 `SIGHUP` (`systemctl reload elodin`) reloads without dropping a connection or a
 cached answer it has no reason to, in this order:

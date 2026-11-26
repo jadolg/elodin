@@ -292,6 +292,9 @@ make_upstream :: proc(
 	cookies := false,
 	// `max_outstanding`; zero takes `PIPELINE_MAX_OUTSTANDING`.
 	outstanding := 0,
+	// Whether a hostname is looked up here; otherwise by `resolve_group` or
+	// the first exchange.
+	resolve := true,
 ) -> (
 	u: ^Upstream,
 	err: Error,
@@ -321,7 +324,9 @@ make_upstream :: proc(
 		u.tls_ctx = ctx
 	}
 
-	resolve_endpoint(u)
+	if resolve {
+		resolve_endpoint(u)
+	}
 	return u, .None
 }
 

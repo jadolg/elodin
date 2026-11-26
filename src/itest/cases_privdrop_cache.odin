@@ -13,7 +13,7 @@ cache directory to the account before the drop. The directory is the account's
 after the first start, so anything running as it can put a hard link to a file
 elsewhere in there, and a chown of that link as root would hand the file over
 too. The directory alone is handed over, and each copy elodin caches is the
-account's as it is written.
+account's, as the account writes it after the drop (#755).
 
 The link is made as root here, which `fs.protected_hardlinks` allows; the
 account making it is not what the case is about.
@@ -56,6 +56,18 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 	if !check(r, posix.link(strings.clone_to_cstring(outside, context.temp_allocator), link) == .OK, "cannot link %s into the cache", outside) {
 		return
 	}
+	/*
+	A fresh copy of hosts.txt that only root can read: the account, which
+	reads the cache (#755), cannot load it, so the list is downloaded over it
+	rather than lost.
+	*/
+	unreadable := fmt.tprintf("%s/http___127.0.0.1_%d_hosts.txt.list", cache_dir, http_port)
+	if !write_fixture(r, unreadable, transmute([]u8)string("0.0.0.0 stale.test\n")) {
+		return
+	}
+	if !check(r, posix.chmod(strings.clone_to_cstring(unreadable, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK, "cannot make %s root's alone", unreadable) {
+		return
+	}
 
 	udp_port := next_port(r)
 	conf := base_config(
@@ -84,6 +96,11 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 		}
 		return st.st_uid, true
 	}
+	check(r, http_mock_hits(http, "/hosts.txt") == 1, "a copy the account cannot read was taken as fresh:\n%s", read_log(&srv))
+	blocked := query_udp(udp_port, build_query("cached.test.", u16(dns.Type.A)))
+	if check(r, blocked.ok, "no answer for cached.test") {
+		check(r, parse_header(r, blocked.wire).rcode == int(dns.Rcode.NX_Domain), "the list downloaded in place of the unreadable copy was not applied")
+	}
 	// The positive half: the directory itself was handed over.
 	if dir_uid, read := owner(cache_dir); check(r, read, "cannot stat %s", cache_dir) {
 		check(r, dir_uid == nobody_uid, "the cache directory is uid %d's, not nobody's (%d)", dir_uid, nobody_uid)
@@ -108,9 +125,8 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 	}
 
 	/*
-	A download after the drop, under the suite's strict sandbox: the account
-	writes its own copy, so nothing calls `fchown`, which the sandbox kills the
-	process for.
+	A download a reload adds, under the suite's strict sandbox: the account
+	writes its own copy.
 	*/
 	later := base_config(
 		udp_port,
@@ -129,8 +145,7 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 		if check(r, res.ok, "no answer after a download as the account; log:\n%s", read_log(&srv)) {
 			check(r, parse_header(r, res.wire).rcode == int(dns.Rcode.NX_Domain), "the list downloaded after the drop was not applied")
 		}
-		// The copy was written, by the account: the write after the drop is
-		// what reached the `fchown` this case exists for.
+		// The copy was written, by the account.
 		cached := false
 		after, aerr := os.read_directory_by_path(cache_dir, -1, context.temp_allocator)
 		if check(r, aerr == nil, "cannot list %s: %v", cache_dir, aerr) {
@@ -151,7 +166,7 @@ run_privdrop_cache_cases :: proc(r: ^Runner) {
 	After the drop the process is the account, and reads nothing through a
 	link it could not by name: a copy that is a hard link - as a backup tool
 	that links its snapshots leaves - still stands in for a list whose download
-	fails. The root start's rules would refuse it.
+	fails.
 	*/
 	linked := filepath.join({r.work_dir, "privcache-gone"}, context.temp_allocator) or_else ""
 	if !write_fixture(r, linked, transmute([]u8)string("0.0.0.0 gone.test\n")) {

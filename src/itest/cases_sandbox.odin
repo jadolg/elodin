@@ -471,17 +471,9 @@ run_listener_arming_case :: proc(r: ^Runner) {
 		return
 	}
 	log := read_log(&srv)
-	markers := [2]string{"msg=sandbox ", "running as nobody" if root else ""}
-	narrowed := 0
-	for m in markers {
-		if m == "" {
-			continue
-		}
-		at := strings.index(log, m)
-		if !check(r, at >= 0, "no %q in the log:\n%s", m, log) {
-			return
-		}
-		narrowed = max(narrowed, at)
+	narrowed, found := narrowed_at(r, log, root)
+	if !found {
+		return
 	}
 	reading := [3]string {
 		fmt.tprintf("listening for DNS on 127.0.0.1:%d/udp", udp_port),
@@ -489,6 +481,91 @@ run_listener_arming_case :: proc(r: ^Runner) {
 		fmt.tprintf("serving metrics on 127.0.0.1:%d", metrics_port),
 	}
 	for line in reading {
+		at := strings.index(log, line)
+		check(r, at > narrowed, "%q is at %d, not after the process was narrowed at %d:\n%s", line, at, narrowed, log)
+	}
+}
+
+/*
+Where in `log` the process is as narrow as it gets: the later of the sandbox
+line and, with `dropped`, the line saying it runs as `nobody`. Fails the case
+when either is missing.
+*/
+@(private = "file")
+narrowed_at :: proc(r: ^Runner, log: string, dropped: bool) -> (at: int, ok: bool) {
+	markers := [2]string{"msg=sandbox ", "running as nobody" if dropped else ""}
+	for m in markers {
+		if m == "" {
+			continue
+		}
+		i := strings.index(log, m)
+		if !check(r, i >= 0, "no %q in the log:\n%s", m, log) {
+			return 0, false
+		}
+		at = max(at, i)
+	}
+	return at, true
+}
+
+/*
+Nothing the network sends is parsed at startup before the process is as narrow
+as it gets (#755): the bootstrap lookup of an upstream named by hostname and the
+download of a blocklist both come after the sandbox line and, started as root,
+after the drop to `nobody`. The bootstrap server answers NXDOMAIN, so the line
+saying its answer was read is the one to order by.
+*/
+run_startup_fetch_order_case :: proc(r: ^Runner) {
+	NAME :: "startup: no bootstrap lookup or list download before the privilege drop and the sandbox (#755)"
+	HOST :: "up.order.test"
+	boot := mock_make("order-bootstrap", next_port(r))
+	defer mock_stop(boot)
+	mock_rcode(boot, HOST + ".", u16(dns.Type.A), .NX_Domain)
+	mock_rcode(boot, HOST + ".", u16(dns.Type.AAAA), .NX_Domain)
+	if !mock_start_or_skip(r, boot, NAME) {
+		return
+	}
+	http_port := next_port(r)
+	http := http_mock_make(http_port)
+	http_mock_serve(http, "/order.txt", "0.0.0.0 order.test\n")
+	http_ok := http_mock_start(http)
+	defer http_mock_stop(http)
+	if !http_ok {
+		skip_case(r, NAME, "cannot start the HTTP mock")
+		return
+	}
+	start_case(r, NAME)
+	defer end_case(r)
+	root := posix.geteuid() == 0 && posix.getpwnam("nobody") != nil
+	udp_port := next_port(r)
+	user := "\n  user: nobody" if root else ""
+	config := base_config(
+		udp_port,
+		fmt.tprintf(`[{{ name: named, type: udp, address: %q, port: 53 }}]`, HOST),
+		log = "{ level: info }",
+		upstream_extra = fmt.tprintf(`  bootstrap: ["127.0.0.1:%d"]`, boot.port),
+		blocking = fmt.tprintf(
+			`{{ enabled: true, cache_dir: %q, lists: ["http://127.0.0.1:%d/order.txt"] }}`,
+			fmt.tprintf("%s/order-cache", r.work_dir),
+			http_port,
+		),
+		extra = fmt.tprintf("server:\n  sandbox: %s%s", suite_sandbox(r), user),
+	)
+	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, allow_fetch = true})
+	if !ok {
+		return
+	}
+	defer stop_server(&srv)
+	if !check(r, wait_for_log(&srv, "msg=ready", 5 * time.Second), "the server never logged ready:\n%s", read_log(&srv)) {
+		return
+	}
+	log := read_log(&srv)
+	narrowed, found := narrowed_at(r, log, root)
+	if !found {
+		return
+	}
+	// The log escapes the quotes around the name.
+	fetched := [2]string{`cannot resolve \"` + HOST + `\" via bootstrap resolvers`, "order.txt: downloading"}
+	for line in fetched {
 		at := strings.index(log, line)
 		check(r, at > narrowed, "%q is at %d, not after the process was narrowed at %d:\n%s", line, at, narrowed, log)
 	}

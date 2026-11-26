@@ -87,6 +87,8 @@ make_group :: proc(
 	outstanding := 0,
 	// What the group's racers are counted in; see `Racer_Budget`.
 	racers: ^Racer_Budget = nil,
+	// Whether each server's hostname is looked up here; see `make_upstream`.
+	resolve := true,
 ) -> (
 	g: ^Group,
 	err: Error,
@@ -100,7 +102,7 @@ make_group :: proc(
 
 	servers := make([dynamic]^Upstream, 0, len(cfg.servers), allocator)
 	for spec in cfg.servers {
-		u, uerr := make_upstream(spec, cfg.max_idle, cfg.idle_timeout, allocator, cookies = cookies, outstanding = outstanding)
+		u, uerr := make_upstream(spec, cfg.max_idle, cfg.idle_timeout, allocator, cookies = cookies, outstanding = outstanding, resolve = resolve)
 		if uerr != .None {
 			logx.errorf("upstream %s: not usable (%v)", spec.name, uerr)
 			continue
@@ -116,6 +118,17 @@ make_group :: proc(
 	}
 	g.servers = servers[:]
 	return g, .None
+}
+
+// Look up the hostname of each server in `g` that has no address yet, through
+// the bootstrap servers; one that cannot be is looked up again by its first
+// exchange.
+resolve_group :: proc(g: ^Group) {
+	for u in g.servers {
+		if !sync.atomic_load_explicit(&u.resolved, .Acquire) {
+			resolve_endpoint(u)
+		}
+	}
 }
 
 /*
