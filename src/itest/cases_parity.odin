@@ -495,6 +495,9 @@ upstream_also_says :: proc(
 		forwarded.cd = true
 		forwarded.do_bit = true
 	}
+	// Bar the edns-key-tag elodin sends with a DNSKEY question, left off: the
+	// generator sends no client's, and RFC 8145 section 4.3 gives a responder no
+	// use for the anchors' but to "log or otherwise collect" them.
 	forwarded.options = nil
 	asked := pg_encode(forwarded, context.temp_allocator)
 	seen := make([dynamic][]u8, 0, 5, context.temp_allocator)

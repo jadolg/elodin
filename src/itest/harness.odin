@@ -982,6 +982,8 @@ build_query :: proc(
 	// section 3.1 gives OPTION-LENGTH 0 in a query, the TIMEOUT being the
 	// server's to state.
 	keepalive := false,
+	// edns-key-tag options (RFC 8145 section 4.1), same again: each one's data.
+	key_tags: [][]u8 = nil,
 	allocator := context.temp_allocator,
 ) -> []u8 {
 	buf := make([dynamic]u8, 0, 64, allocator)
@@ -1013,6 +1015,9 @@ build_query :: proc(
 		if keepalive {
 			rdlength += 4
 		}
+		for tags in key_tags {
+			rdlength += 4 + len(tags)
+		}
 		append(&buf, u8(rdlength >> 8), u8(rdlength))
 		if cookie != nil {
 			append(&buf, 0, 10) // COOKIE
@@ -1027,6 +1032,11 @@ build_query :: proc(
 		if keepalive {
 			append(&buf, 0, 11) // edns-tcp-keepalive
 			append(&buf, 0, 0) // no TIMEOUT, which is the only shape a client sends
+		}
+		for tags in key_tags {
+			append(&buf, 0, 14) // edns-key-tag
+			append(&buf, u8(len(tags) >> 8), u8(len(tags)))
+			append(&buf, ..tags)
 		}
 	}
 	return buf[:]

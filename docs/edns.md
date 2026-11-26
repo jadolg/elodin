@@ -130,8 +130,8 @@ The option is sent only when:
 - `client_timeout` is at least 100ms. Under that the figure rounds to 0, which
   means "close now" (§3.4).
 
-The option is hop-by-hop, and like every other client option it is not
-forwarded.
+The option is hop-by-hop, and like every other client option but
+`edns-key-tag` it is not forwarded.
 
 ## What reaches the upstream
 
@@ -149,5 +149,10 @@ bytes, bar the transaction ID:
   not fit.
 - no EDNS options of the client's: not its cookie, client subnet (RFC 7871
   §7.5), keepalive, NSID, padding or any other. The upstream cookie and padding
-  above are elodin's own.
+  above are elodin's own, as is the `edns-key-tag` listing its anchors' key
+  tags on a DNSKEY question for an anchored zone
+  ([trust_anchor_signaling](dnssec.md#trust_anchor_signaling)). The one
+  exception is a client's own `edns-key-tag` on a DNSKEY question, which goes on
+  as [Clients' key tags](dnssec.md#clients-key-tags) says, so those bytes also
+  differ between clients that send different tags.
 - no other records, and a fresh random transaction ID (RFC 5452 §9.2).

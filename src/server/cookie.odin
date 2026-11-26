@@ -28,7 +28,7 @@ timestamp bounds how long a cookie stays usable if it does leak.
 
 Cookies on the upstream side are a separate matter and are not done here; a
 client's cookie is never forwarded - `upstream_query` carries none of the
-client's options - since it belongs to the client and this server, and would
+client's options but `edns-key-tag` - since it belongs to the client and this server, and would
 fail against anyone else's secret.
 */
 

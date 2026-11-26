@@ -1826,13 +1826,20 @@ cannot be built.
 Built from the cache key rather than patched out of the client's message
 (issue #423): the question, folded to the key's case, and whether this query
 wants DO and CD - both forced on when validating. Nothing else of the client's
-goes out, so two queries for one key reach the upstream as one message bar the
-ID, and the upstream's answer, or its failure, is about the question rather than
-about one client's spelling of it. That is what the cache already assumes when it
-hands one client's answer to another, and what lets a follower share its
-leader's outcome (`inflight.odin`).
+goes out but its key tags on a DNSKEY question, so two queries for one key reach
+the upstream as one message bar the ID and those tags, and the upstream's answer,
+or its failure, is about the question rather than about one client's spelling of
+it. That is what the cache already assumes when it hands one client's answer to
+another, and what lets a follower share its leader's outcome (`inflight.odin`),
+which for a different set of key tags is a NOERROR or NXDOMAIN with the cache
+on, and nothing with it off.
 
-What is dropped by that: the client's EDNS options - its cookie, a shared secret
+The key tags (RFC 8145 section 4.2.2): this server's own (`signalled_key_tags`)
+and, beside them, the client's `edns-key-tag` lists, which section 4.2.2.1 asks
+a validating server to forward and section 4.2.2.2 asks one that does not
+validate to copy. `upstream_query` shapes them.
+
+What is dropped: the client's other EDNS options - its cookie, a shared secret
 with this server that an upstream would answer BADCOOKIE to (RFC 7873 section
 5.2); its client-subnet option, which RFC 7871 section 7.5 forbids forwarding
 without the per-network caching of section 7.3 that this server's key does not
@@ -1859,7 +1866,22 @@ shape_forwarded :: proc(st: ^Query_State) -> bool {
 	// RFC 4035 section 3.2.1: a security-aware resolver "MUST set the DO bit
 	// when sending requests, regardless of the state of the DO bit in the
 	// initiating request", validating this one or not (CD, a route).
-	wire, built := upstream_query(st.q, live(st.s).validator != nil || dns.edns_do(st.msg), st.validating || st.msg.flags.cd, st.allocator)
+	// The switch is also what keeps the option off an upstream that answers it
+	// FORMERR, whose ever it is.
+	client: []dns.EDNS_Option
+	if opt, has_opt := dns.find_opt(st.msg); has_opt && live(st.s).cfg.dnssec.trust_anchor_signaling {
+		if rdata, is_opt := opt.data.(dns.Rdata_OPT); is_opt {
+			client = rdata.options
+		}
+	}
+	wire, built := upstream_query(
+		st.q,
+		live(st.s).validator != nil || dns.edns_do(st.msg),
+		st.validating || st.msg.flags.cd,
+		st.allocator,
+		key_tags = signalled_key_tags(st.s, st.q.name, st.q.type),
+		client_options = client,
+	)
 	if !built {
 		// The question decoded, so its encoding failing is not a shape a client
 		// can send; failing closed rather than forwarding its bytes as they stand.
@@ -1878,20 +1900,23 @@ shape_forwarded :: proc(st: ^Query_State) -> bool {
 }
 
 /*
-A query this server sends upstream on its own account: `q` and nothing of anyone
-else's, RD set, a fresh transaction ID (RFC 5452 section 9.2), and one OPT record
-at `UPSTREAM_UDP_SIZE` carrying no option but `key_tags` - the upstream cookie and
-the padding are put on by `src/upstream`. The name is folded to lower case as the cache key is,
-so the bytes depend on the key and not the client; the answer's question is put
-back in the client's case before it goes out (`dns.copy_question_case`).
+A query this server sends upstream: `q`, RD set, a fresh transaction ID (RFC
+5452 section 9.2), and one OPT record at `UPSTREAM_UDP_SIZE` carrying no option
+but `edns-key-tag` ones - the upstream cookie and the padding are put on by
+`src/upstream`. The name is folded to lower case as the cache key is, so the
+bytes depend on the key and, for a DNSKEY question alone, the client's key tags;
+the answer's question is put back in the client's case before it goes out
+(`dns.copy_question_case`). Which `edns-key-tag` options go on is
+`key_tag_options`' to say.
 */
 @(private)
 upstream_query :: proc(
 	q: dns.Question,
 	dnssec_ok, checking_disabled: bool,
 	allocator: mem.Allocator,
-	// Sent as an `edns-key-tag` option (RFC 8145 section 4) when there are any.
 	key_tags: []u16 = nil,
+	// The client's EDNS options, of which only `edns-key-tag` ones are read.
+	client_options: []dns.EDNS_Option = nil,
 ) -> (
 	wire: []u8,
 	ok: bool,
@@ -1904,13 +1929,9 @@ upstream_query :: proc(
 	question[0].name = folded
 	additional := [1]dns.Record{dns.make_opt(UPSTREAM_UDP_SIZE, dnssec_ok)}
 	tags: [dnssec.MAX_KEY_TAGS * 2]u8
-	options: [1]dns.EDNS_Option
-	if n := min(len(key_tags), dnssec.MAX_KEY_TAGS); n > 0 {
-		for tag, i in key_tags[:n] {
-			tags[2 * i], tags[2 * i + 1] = u8(tag >> 8), u8(tag)
-		}
-		options[0] = {code = u16(dns.EDNS_Option_Code.Key_Tag), data = tags[:2 * n]}
-		additional[0].data = dns.Rdata_OPT{options = options[:]}
+	options: [KEY_TAG_OPTIONS]dns.EDNS_Option
+	if count := key_tag_options(q.type, key_tags, client_options, &tags, &options); count > 0 {
+		additional[0].data = dns.Rdata_OPT{options = options[:count]}
 	}
 	m := dns.Message {
 		id         = dns.random_id(),
@@ -1924,6 +1945,99 @@ upstream_query :: proc(
 		return nil, false
 	}
 	return encoded, true
+}
+
+// The most `edns-key-tag` options `key_tag_options` writes: this server's list,
+// and the client's, each holding a tag at least of their `dnssec.MAX_KEY_TAGS`.
+@(private = "file")
+KEY_TAG_OPTIONS :: 1 + dnssec.MAX_KEY_TAGS
+
+/*
+The `edns-key-tag` options (RFC 8145 section 4) a `type` question goes upstream
+with, written to `options`, and how many: `key_tags` in one when there are any,
+its bytes in `tags`, then, for a DNSKEY question, each of `client_options` that
+is a list of one or more whole two-byte tags (section 4.1), not the same set as
+`key_tags` and not one the client sent before, in an option of its own (section
+4.2.2.1). Each list is cut to `dnssec.MAX_KEY_TAGS`, and the client's lists to
+that many between them, the limit section 4.2.2.1 recommends. The client's
+options are sliced, not copied.
+*/
+@(private = "file")
+key_tag_options :: proc(
+	type: dns.Type,
+	key_tags: []u16,
+	client_options: []dns.EDNS_Option,
+	tags: ^[dnssec.MAX_KEY_TAGS * 2]u8,
+	options: ^[KEY_TAG_OPTIONS]dns.EDNS_Option,
+) -> (
+	count: int,
+) {
+	own := key_tags[:min(len(key_tags), dnssec.MAX_KEY_TAGS)]
+	if len(own) > 0 {
+		for tag, i in own {
+			tags[2 * i], tags[2 * i + 1] = u8(tag >> 8), u8(tag)
+		}
+		options[0] = {code = u16(dns.EDNS_Option_Code.Key_Tag), data = tags[:2 * len(own)]}
+		count = 1
+	}
+	// Section 4.2: a client MUST NOT send the option on any other type.
+	budget := dnssec.MAX_KEY_TAGS if type == .DNSKEY else 0
+	for o in client_options {
+		if budget == 0 {
+			break
+		}
+		n := len(o.data) / 2
+		if o.code != u16(dns.EDNS_Option_Code.Key_Tag) || n == 0 || len(o.data) % 2 != 0 || same_key_tags(o.data, own) {
+			continue
+		}
+		if repeated(o.data, options[1 if len(own) > 0 else 0:count]) {
+			continue
+		}
+		take := min(n, budget)
+		options[count] = {code = o.code, data = o.data[:2 * take]}
+		count += 1
+		budget -= take
+	}
+	return count
+}
+
+// Whether `data` is the data of one of `taken`.
+@(private = "file")
+repeated :: proc(data: []u8, taken: []dns.EDNS_Option) -> bool {
+	for o in taken {
+		if slice.equal(o.data, data) {
+			return true
+		}
+	}
+	return false
+}
+
+// Whether `data`, an `edns-key-tag` option's two-byte tags, holds the tags of
+// `own` and no others, in any order.
+@(private = "file")
+same_key_tags :: proc(data: []u8, own: []u16) -> bool {
+	if len(data) != 2 * len(own) {
+		return false
+	}
+	holds :: proc(data: []u8, tag: u16) -> bool {
+		for i := 0; i < len(data); i += 2 {
+			if u16(data[i]) << 8 | u16(data[i + 1]) == tag {
+				return true
+			}
+		}
+		return false
+	}
+	for i := 0; i < len(data); i += 2 {
+		if !slice.contains(own, u16(data[i]) << 8 | u16(data[i + 1])) {
+			return false
+		}
+	}
+	for tag in own {
+		if !holds(data, tag) {
+			return false
+		}
+	}
+	return true
 }
 
 /*
@@ -4487,6 +4601,27 @@ apply_rewrite :: proc(
 	return out, true, alias
 }
 
+// `additional` with every `edns-key-tag` option taken out of its OPT record,
+// in a copy; false where `allocator` ran dry.
+@(private = "file")
+without_key_tags :: proc(additional: []dns.Record, allocator: mem.Allocator) -> (out: []dns.Record, ok: bool) {
+	out = dns.alloc_slice([]dns.Record, len(additional), allocator) or_return
+	copy(out, additional)
+	for &rec in out {
+		rdata := rec.data.(dns.Rdata_OPT) or_continue
+		kept := dns.alloc_slice([]dns.EDNS_Option, len(rdata.options), allocator) or_return
+		n := 0
+		for o in rdata.options {
+			if o.code != u16(dns.EDNS_Option_Code.Key_Tag) {
+				kept[n] = o
+				n += 1
+			}
+		}
+		rec.data = dns.Rdata_OPT{options = kept[:n]}
+	}
+	return out, true
+}
+
 // The SERVFAIL `chase_rewrite_alias` answers where its allocator ran dry, or
 // nothing where there is not room even for that. Counted failed unless the
 // target's lookup already counted the query, so it is never a rewrite.
@@ -4563,6 +4698,16 @@ chase_rewrite_alias :: proc(
 	append(&chain, alias)
 	next := msg
 	next.question = questions
+	// A client's key tags are for the zone it asked about, not the target's, and
+	// RFC 8145 section 4.2: "A DNS client MUST NOT include Key Tag(s) for keys
+	// that are not learned via either a trust anchor or DS records."
+	if q.type == .DNSKEY {
+		additional, stripped := without_key_tags(msg.additional, allocator)
+		if !stripped {
+			return chase_ran_dry(s, msg, limit, allocator, false)
+		}
+		next.additional = additional
+	}
 	rest: dns.Message
 	outcome := Outcome.Rewritten
 	code: u16
