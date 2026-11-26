@@ -1,0 +1,9 @@
+POST /dns-query HTTP/1.1
+Host: x
+Transfer-Encoding: gzip; level = 9 ;q="x y", chunked
+
+4 ; a = "q\"x" ; b
+abcd
+0
+X-T: v
+

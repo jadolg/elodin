@@ -5,6 +5,7 @@ import "core:slice"
 import "core:strconv"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:netx"
 
 /*
 The other half of a `rewrites` rule: the PTR for an address it hands out.
@@ -470,7 +471,9 @@ parse_reverse_v6 :: proc(name: string) -> (addr: [16]u8, ok: bool) {
 		if i > 0 && rest[i * 2 - 1] != '.' {
 			return {}, false
 		}
-		nibble, valid := hex_nibble(rest[i * 2])
+		// Either case: names compare without regard to it, a nibble label included
+		// (RFC 4343).
+		nibble, valid := netx.hex_digit(rest[i * 2])
 		if !valid {
 			return {}, false
 		}
@@ -511,17 +514,3 @@ decimal_octet :: proc(label: string) -> (v: u8, ok: bool) {
 	return u8(n), true
 }
 
-// Case-folded, DNS names being compared without regard to it and a nibble label
-// being no exception (RFC 4343).
-@(private)
-hex_nibble :: proc(c: u8) -> (v: u8, ok: bool) {
-	switch c {
-	case '0' ..= '9':
-		return c - '0', true
-	case 'a' ..= 'f':
-		return c - 'a' + 10, true
-	case 'A' ..= 'F':
-		return c - 'A' + 10, true
-	}
-	return 0, false
-}

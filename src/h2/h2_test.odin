@@ -2867,6 +2867,71 @@ test_http1_content_length_is_digits_only :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_http1_chunk_line_is_hex_then_extensions :: proc(t: ^testing.T) {
+	Case :: struct {
+		line: string,
+		size: int,
+		ok:   bool,
+	}
+	cases := []Case {
+		{"0", 0, true},
+		{"fF", 255, true},
+		{"0005", 5, true},
+		{"5;ext", 5, true},
+		{"5 ;ext", 5, true},
+		{"5\t; a = 1 ;b", 5, true},
+		{"5;a=\"q;\\\"x\"", 5, true},
+		// Past the limit is the limit plus one, whatever follows it.
+		{"101", 256, true},
+		{"FFFFFFFFFFFFFFFFFFFF", 256, true},
+		{"101;\x7f", 256, true},
+		{"", 0, false},
+		{" 5", 0, false},
+		{"5 ", 0, false},
+		{"5;ext ", 0, false},
+		{"5 5", 0, false},
+		{"+5", 0, false},
+		{"0_5", 0, false},
+		{"0x5", 0, false},
+		{"5;", 0, false},
+		{"5;a=", 0, false},
+		{"5;a b", 0, false},
+		{"5;a=\"q", 0, false},
+		{"5;\x7f", 0, false},
+	}
+	for c in cases {
+		size, ok := parse_chunk_line(c.line, 255)
+		testing.expectf(t, ok == c.ok && size == c.size, "%q: got %d %v, want %d %v", c.line, size, ok, c.size, c.ok)
+	}
+}
+
+// A transfer-coding's parameters need a value (RFC 9112 7); a chunk extension's do not (7.1.1).
+@(test)
+test_http1_params_value_is_required_unless_optional :: proc(t: ^testing.T) {
+	Case :: struct {
+		params:   string,
+		required: bool,
+		optional: bool,
+	}
+	cases := []Case {
+		{"", true, true},
+		{";a=1", true, true},
+		{" ; a = \"x y\" ;b=c", true, true},
+		{";a", false, true},
+		{";a;b=1", false, true},
+		{";a=1 ", false, false},
+		{" ", false, false},
+		{";", false, false},
+		{";=1", false, false},
+		{"a=1", false, false},
+	}
+	for c in cases {
+		testing.expectf(t, params_are_valid(c.params, value_optional = false) == c.required, "%q with a value required", c.params)
+		testing.expectf(t, params_are_valid(c.params, value_optional = true) == c.optional, "%q with the value optional", c.params)
+	}
+}
+
+@(test)
 test_http1_version_is_eight_bytes :: proc(t: ^testing.T) {
 	major, minor, ok := http1_version("HTTP/1.1")
 	testing.expect(t, ok && major == 1 && minor == 1, "HTTP/1.1 was not 1.1")

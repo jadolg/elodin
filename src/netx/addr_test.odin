@@ -1,6 +1,7 @@
 package netx
 
 import "core:net"
+import "core:strings"
 import "core:testing"
 
 /*
@@ -171,6 +172,18 @@ test_unmap_takes_only_the_mapped_prefix :: proc(t: ^testing.T) {
 	testing.expect(t, addresses_equal(net.parse_address("::ffff:10.0.0.1"), net.IP4_Address{10, 0, 0, 1}), "a mapped address is not its IPv4 one")
 	testing.expect(t, !addresses_equal(net.parse_address("::10.0.0.1"), net.IP4_Address{10, 0, 0, 1}), "a compat address is its IPv4 one")
 	testing.expect(t, !addresses_equal(nil, nil), "no address equals no address")
+}
+
+@(test)
+test_hex_digit_is_either_case_and_nothing_else :: proc(t: ^testing.T) {
+	DIGITS :: "0123456789abcdef"
+	for b in 0 ..= 255 {
+		c := u8(b)
+		lower := c | 0x20 if c >= 'A' && c <= 'Z' else c
+		want := strings.index_byte(DIGITS, lower)
+		v, ok := hex_digit(c)
+		testing.expectf(t, ok == (want >= 0) && (!ok || int(v) == want), "%q: got %d %v, want %d", rune(c), v, ok, want)
+	}
 }
 
 @(test)

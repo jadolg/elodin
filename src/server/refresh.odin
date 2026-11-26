@@ -269,49 +269,18 @@ start_refresh :: proc(
 	ceiling := refresh_ceiling(s)
 
 	sync.mutex_lock(&s.refreshes.mu)
-	free_slot := -1
-	in_flight := 0
-	for i in 0 ..< REFRESH_SLOTS {
-		held := s.refreshes.slots[i]
-		if held == nil {
-			if free_slot < 0 {
-				free_slot = i
-			}
-			continue
-		}
-		in_flight += 1
-		// Already being refreshed. The keys are the cache's own, so this is the
-		// same question with the same DO and CD bits and nothing else.
-		if held.key == key {
-			sync.mutex_unlock(&s.refreshes.mu)
-			return nil
-		}
-	}
-	if free_slot < 0 || in_flight >= ceiling {
+	free_slot := free_refresh_slot(s, key, ceiling)
+	if free_slot < 0 {
 		sync.mutex_unlock(&s.refreshes.mu)
 		return nil
 	}
-
 	// Declined, like a full table, where the heap has no room for what the job
 	// holds: a refresh of an empty query would be charged to the upstream.
-	r := new(Refresh)
+	r := new_refresh(key, query, client)
 	if r == nil {
 		sync.mutex_unlock(&s.refreshes.mu)
 		return nil
 	}
-	r.allocator = context.allocator
-	key_err, client_err: mem.Allocator_Error
-	query_built: bool
-	r.key, key_err = strings.clone(key, r.allocator)
-	r.query, query_built = dns.alloc_slice([]u8, len(query), r.allocator)
-	r.client, client_err = strings.clone(client, r.allocator)
-	if key_err != nil || !query_built || client_err != nil {
-		sync.mutex_unlock(&s.refreshes.mu)
-		r.refs = 1
-		refresh_release(r)
-		return nil
-	}
-	copy(r.query, query)
 	r.server = s
 	r.proto = proto
 	r.limit = limit
@@ -337,6 +306,58 @@ start_refresh :: proc(
 		refresh_release(r)
 		return nil
 	}
+	return r
+}
+
+/*
+The slot a refresh for `key` is to take, read under `s.refreshes.mu`: -1 when
+one for the key is already running, every slot is taken, or `ceiling` are in
+flight.
+*/
+@(private)
+free_refresh_slot :: proc(s: ^Server, key: string, ceiling: int) -> int {
+	free_slot := -1
+	in_flight := 0
+	for i in 0 ..< REFRESH_SLOTS {
+		held := s.refreshes.slots[i]
+		if held == nil {
+			if free_slot < 0 {
+				free_slot = i
+			}
+			continue
+		}
+		in_flight += 1
+		// Already being refreshed. The keys are the cache's own, so this is the
+		// same question with the same DO and CD bits and nothing else.
+		if held.key == key {
+			return -1
+		}
+	}
+	return free_slot if in_flight < ceiling else -1
+}
+
+/*
+A refresh holding its own copies of `key`, `query` and `client`, on
+`context.allocator`; nil, with nothing held, when they do not fit.
+*/
+@(private)
+new_refresh :: proc(key: string, query: []u8, client: string) -> ^Refresh {
+	r := new(Refresh)
+	if r == nil {
+		return nil
+	}
+	r.allocator = context.allocator
+	key_err, client_err: mem.Allocator_Error
+	query_built: bool
+	r.key, key_err = strings.clone(key, r.allocator)
+	r.query, query_built = dns.alloc_slice([]u8, len(query), r.allocator)
+	r.client, client_err = strings.clone(client, r.allocator)
+	if key_err != nil || !query_built || client_err != nil {
+		r.refs = 1
+		refresh_release(r)
+		return nil
+	}
+	copy(r.query, query)
 	return r
 }
 

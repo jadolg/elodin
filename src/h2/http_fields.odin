@@ -2,6 +2,7 @@ package h2
 
 import "core:strings"
 import "elodin:dns"
+import "elodin:netx"
 
 /*
 HTTP field and message grammar (RFC 9110, RFC 9112), shared by both versions of
@@ -138,6 +139,145 @@ http1_version :: proc(s: string) -> (major, minor: u8, ok: bool) {
 		return
 	}
 	return s[5] - '0', s[7] - '0', true
+}
+
+/*
+The name and value of an HTTP/1 field line, `ok` false for one whose shape is
+to be refused rather than read. The name is not checked to be a token, which
+each end decides for itself.
+*/
+split_field_line :: proc(header: string) -> (name, value: string, ok: bool) {
+	/*
+	A field line this end cannot read is a field line it must not skip.
+
+	Both of these are ways to write a Content-Length that this end does not see
+	and another hop might: a line beginning with whitespace is an obs-fold
+	continuation of the one before it (RFC 9112 5.2), and whitespace before
+	the colon is not a field name (RFC 9112 5.1). Read here as "no header of
+	that name", either one leaves the body unread while the hop that unfolded
+	or trimmed it framed the message by a length this end never applied - the
+	remainder becomes the next message on the connection. Both sections have
+	a server answer them with a 400, and nothing that speaks DoH sends either.
+	*/
+	if header == "" || header[0] == ' ' || header[0] == '\t' {
+		return "", "", false
+	}
+	colon := strings.index_byte(header, ':')
+	if colon <= 0 {
+		return "", "", false
+	}
+	if header[colon - 1] == ' ' || header[colon - 1] == '\t' {
+		return "", "", false
+	}
+	name = header[:colon]
+	// `OWS` off it and nothing more: see `h2.trim_ows`.
+	value = trim_ows(header[colon + 1:])
+	return name, value, true
+}
+
+/*
+An HTTP/1.1 chunk line (RFC 9112 7.1): `chunk-size [ chunk-ext ]`, the size one
+or more hex digits and the extensions held to the 7.1.1 grammar, then ignored.
+
+A size past `limit` comes back as `limit + 1` with the rest of the line unread,
+so nothing wraps on the way to the caller's range check. `ok` is false for a
+line that is not a chunk line.
+*/
+parse_chunk_line :: proc(line: string, limit: int) -> (size: int, ok: bool) {
+	digits := 0
+	for digits < len(line) {
+		v, hex := netx.hex_digit(line[digits])
+		if !hex {
+			break
+		}
+		size = size * 16 + int(v)
+		digits += 1
+		if size > limit {
+			return limit + 1, true
+		}
+	}
+	// `chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`
+	if digits == 0 || !params_are_valid(line[digits:], value_optional = true) {
+		return 0, false
+	}
+	return size, true
+}
+
+/*
+Whether `s` is empty or a list of `;` parameters, each `name [ "=" value ]` with
+whitespace allowed around the `;` and the `=`: a name is a token and a value a
+token or a quoted-string. RFC 9112 7 writes a transfer-coding's parameters this
+way with the value required, and 7.1.1 a chunk extension's with it optional.
+Whitespace with no parameter after it is in neither grammar and is refused.
+*/
+params_are_valid :: proc(s: string, value_optional: bool) -> bool {
+	if len(s) > 0 && (s[len(s) - 1] == ' ' || s[len(s) - 1] == '\t') {
+		return false
+	}
+	rest := s
+	for {
+		rest = strings.trim_left(rest, " \t")
+		if rest == "" {
+			return true
+		}
+		if rest[0] != ';' {
+			return false
+		}
+		rest = strings.trim_left(rest[1:], " \t")
+		n := token_prefix(rest)
+		if n == 0 {
+			return false
+		}
+		rest = strings.trim_left(rest[n:], " \t")
+		if value_optional && (rest == "" || rest[0] == ';') {
+			continue
+		}
+		if rest == "" || rest[0] != '=' {
+			return false
+		}
+		rest = strings.trim_left(rest[1:], " \t")
+		if v := token_prefix(rest); v > 0 {
+			rest = rest[v:]
+		} else if q := quoted_string_prefix(rest); q > 0 {
+			rest = rest[q:]
+		} else {
+			return false
+		}
+	}
+}
+
+// How many bytes at the start of `s` are a quoted-string (RFC 9110 5.6.4), 0 if
+// it does not start with one.
+quoted_string_prefix :: proc(s: string) -> int {
+	if len(s) == 0 || s[0] != '"' {
+		return 0
+	}
+	for i := 1; i < len(s); i += 1 {
+		switch c := s[i]; {
+		case c == '"':
+			return i + 1
+		case c == '\\':
+			// A quoted-pair: HTAB, SP or a visible character after the backslash.
+			if i + 1 >= len(s) || (s[i + 1] < ' ' && s[i + 1] != '\t') || s[i + 1] == 0x7f {
+				return 0
+			}
+			i += 1
+		case c < ' ' && c != '\t', c == 0x7f:
+			return 0
+		}
+	}
+	return 0
+}
+
+// How many bytes at the start of `s` are a token (RFC 9110 5.6.2).
+@(private)
+token_prefix :: proc(s: string) -> int {
+	for i in 0 ..< len(s) {
+		if !is_token(s[i:i + 1]) {
+			return i
+		}
+	}
+	return len(s)
 }
 
 /*

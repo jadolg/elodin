@@ -324,26 +324,104 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	// A field this server has no room to keep ends the request unanswered,
 	// rather than reading as an empty one the client sent.
 	held := true
-	hold :: proc(s: string, held: ^bool) -> string {
-		out, err := strings.clone(s, context.temp_allocator)
-		held^ &&= err == nil && len(out) == len(s)
-		return out
+	authority, absolute, http_1_0, lstatus, lok := read_request_line(r, &req, &held)
+	if !lok {
+		return {method = req.method}, lstatus, false
 	}
+	refused := Http_Request_In {
+		method = req.method,
+	}
+	f, fstatus, fok := read_field_lines(r, &req, http_1_0, &held)
+	if !fok {
+		return refused, fstatus, false
+	}
+
+	// Before the body is waited for: a request this server cannot keep is not
+	// answered whatever follows.
+	if !held {
+		return {}, 0, false
+	}
+	if absolute {
+		req.host = authority
+	}
+	chunked, framing_status := request_framing(f, http_1_0)
+	if framing_status != 0 {
+		return refused, framing_status, false
+	}
+
+	if (f.content_length > 0 || chunked) && f.expect_continue {
+		/*
+		RFC 9110 10.1.1: a server "MUST NOT wait for the content before sending
+		the 100 (Continue) response". Everything this reader refuses on the
+		header block is answered above with a final status instead; what is left
+		is decided on the body, so it gets the 100 - unless the body is already
+		here, which 10.1.1 lets a server leave unanswered.
+		*/
+		here := len(r.buf) - r.pos
+		if (chunked && here == 0) || (!chunked && here < f.content_length) {
+			if !conn_write_all(r.conn, transmute([]u8)string(HTTP_CONTINUE)) {
+				return {}, 0, false
+			}
+		}
+	}
+
+	if chunked {
+		body, bstatus, bok := read_chunked_body(r)
+		if !bok {
+			return refused, bstatus, false
+		}
+		req.body = body
+		req.closing = true
+		/*
+		Closed after it is answered: the chunked framing this hop read is one a
+		front end may have cut differently, and closing leaves it no next request
+		on this connection to attribute anything to. RFC 9112 9.6 lets a server
+		close after any response.
+		*/
+		req.keep_alive = false
+	} else if f.content_length > 0 {
+		// A view, where everything above is a copy: the body is the last thing
+		// read, so nothing grows the buffer under it before the caller's
+		// `http_compact`, which is what ends it.
+		req.body = http_exact(r, f.content_length) or_return
+	}
+	return req, 0, true
+}
+
+/*
+A copy of `s` in the scratch space; `held` goes false, for good, once one cannot
+be made whole.
+*/
+@(private)
+http_hold :: proc(s: string, held: ^bool) -> string {
+	out, err := strings.clone(s, context.temp_allocator)
+	held^ &&= err == nil && len(out) == len(s)
+	return out
+}
+
+/*
+Read the request line into `req`: its method, path and query, and whether it
+keeps the connection alive. `authority` is an absolute-form target's, which
+stands in for `Host`. `status` is the refusal when `ok` is false, as
+`read_http_request` gives it.
+*/
+@(private)
+read_request_line :: proc(r: ^Http_Reader, req: ^Http_Request_In, held: ^bool) -> (authority: string, absolute, http_1_0: bool, status: int, ok: bool) {
 	line, lok, lbad := http_line(r)
 	if !lok {
-		return {}, 400 if lbad else 0, false
+		return "", false, false, 400 if lbad else 0, false
 	}
 
 	// "METHOD SP request-target SP HTTP-version", three tokens and nothing else
 	// (RFC 9112 3).
 	first := strings.index_byte(line, ' ')
 	if first <= 0 {
-		return {}, 400, false
+		return "", false, false, 400, false
 	}
 	rest := line[first + 1:]
 	second := strings.index_byte(rest, ' ')
 	if second <= 0 {
-		return {}, 400, false
+		return "", false, false, 400, false
 	}
 	target := rest[:second]
 	version := rest[second + 1:]
@@ -366,10 +444,10 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	at all, see `http_version_status`.
 	*/
 	if len(version) == 0 || strings.index_byte(version, ' ') >= 0 {
-		return {}, 400, false
+		return "", false, false, 400, false
 	}
 	if vstatus := http_version_status(version); vstatus != 0 {
-		return {}, vstatus, false
+		return "", false, false, vstatus, false
 	}
 	/*
 	The method is a token (RFC 9110 9.1) and the target visible ASCII (RFC 9112
@@ -381,13 +459,10 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	never gets this far - see `http_line`.
 	*/
 	if !h2.is_token(line[:first]) || !h2.target_is_valid(target) {
-		return {}, 400, false
+		return "", false, false, 400, false
 	}
-	req.method = hold(line[:first], &held)
-	refused := Http_Request_In {
-		method = req.method,
-	}
-	http_1_0 := version == "HTTP/1.0"
+	req.method = http_hold(line[:first], held)
+	http_1_0 = version == "HTTP/1.0"
 	req.keep_alive = !http_1_0
 
 	/*
@@ -396,159 +471,154 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	`Host` is, userinfo included (RFC 9110 4.2.4), and what follows it is the
 	origin-form target the rest of this reads.
 	*/
-	authority, absolute := absolute_form_authority(target)
+	authority, absolute = absolute_form_authority(target)
 	if absolute {
 		if authority == "" || !h2.authority_is_valid(authority) {
-			return refused, 400, false
+			return "", false, false, 400, false
 		}
 		target = target[strings.index(target, "//") + 2 + len(authority):]
 		// A copy now: `authority` is a view into the request line, and the
 		// header lines read next may move the buffer it points into.
-		authority = hold(authority, &held)
+		authority = http_hold(authority, held)
 	}
 	path := target
 	if q := strings.index_byte(target, '?'); q >= 0 {
 		path = target[:q]
-		req.query = hold(target[q + 1:], &held)
+		req.query = http_hold(target[q + 1:], held)
 	}
 	// An absolute-form target with no path names the root (RFC 9110 4.2.3).
-	req.path = hold(path if path != "" || !absolute else "/", &held)
+	req.path = http_hold(path if path != "" || !absolute else "/", held)
+	return authority, absolute, http_1_0, 0, true
+}
 
-	// -1 rather than 0, so a second Content-Length can be told from the first.
-	content_length := -1
+// What `read_field_lines` reads from a header block, beyond what it puts in the request.
+@(private)
+Http_Fields :: struct {
+	// -1 for none, so a second Content-Length can be told from the first.
+	content_length:  int,
 	// Counted rather than flagged off `req.host`: an empty Host is a field the
 	// client sent, and a second one has to be told from it.
-	hosts := 0
-	content_types := 0
-	codings: Transfer_Codings
+	hosts:           int,
+	content_types:   int,
+	codings:         Transfer_Codings,
 	// Field lines, apart from the codings they hold: one with none is a
 	// Transfer-Encoding all the same to a hop that reads it as framing.
-	te_fields := 0
-	expect_continue := false
+	te_fields:       int,
+	expect_continue: bool,
 	/*
 	A 400 earned by a field's value is answered only once the block is read, as
-	the 413 below is, so that every field line is still judged as one: a field
-	line that cannot be read is answered at once.
+	the 413 is, so that every field line is still judged as one: a field line
+	that cannot be read is answered at once.
 	*/
-	malformed := false
+	malformed:       bool,
+}
+
+/*
+Read the header block's field lines up to the empty one, keeping Host,
+Content-Type and `Connection: close` in `req`. `status` is the refusal when `ok`
+is false, a field line that cannot be read, as `read_http_request` gives it.
+*/
+@(private)
+read_field_lines :: proc(r: ^Http_Reader, req: ^Http_Request_In, http_1_0: bool, held: ^bool) -> (f: Http_Fields, status: int, ok: bool) {
+	f.content_length = -1
 	for {
 		header, hok, hbad := http_line(r)
 		if !hok {
-			return refused, 400 if hbad else 0, false
+			return f, 400 if hbad else 0, false
 		}
 		if header == "" {
 			break
 		}
-		/*
-		A field line this server cannot read is a field line it must not skip.
-
-		Both of these are ways to write a Content-Length that elodin does not see
-		and a hop in front might: a line beginning with whitespace is an obs-fold
-		continuation of the one before it (RFC 9112 5.2), and whitespace before
-		the colon is not a field name (RFC 9112 5.1). Read here as "no header of
-		that name", either one leaves the body unread while the front end that
-		unfolded or trimmed it forwards a body length elodin never applied - the
-		remainder becomes the next request on the connection. Both sections have
-		a server answer them with a 400, and nothing that speaks DoH sends either.
-		*/
-		if header[0] == ' ' || header[0] == '\t' {
-			return refused, 400, false
-		}
-		colon := strings.index_byte(header, ':')
-		if colon <= 0 {
-			return refused, 400, false
-		}
-		if header[colon - 1] == ' ' || header[colon - 1] == '\t' {
-			return refused, 400, false
-		}
+		name, value, field := h2.split_field_line(header)
 		/*
 		And a name is a token (RFC 9110 5.1), compared without regard to ASCII
 		case and no other. `strings.equal_fold` folds Unicode, where the long s
 		(U+017F) is an `s`, so `Hoſt` would count as Host; and a name outside
-		the token grammar, once folded ASCII only, would be skipped here while a
-		hop that folds the other way reads `Tranſfer-Encoding` as framing
-		(#432). Refused, as the two shapes above are.
+		the token grammar, once folded ASCII only, would be skipped here while
+		a hop that folds the other way reads `Tranſfer-Encoding` as framing
+		(#432). Refused, as the shapes `split_field_line` refuses are.
 		*/
-		name := header[:colon]
-		if !h2.is_token(name) {
-			return refused, 400, false
+		if !field || !h2.is_token(name) {
+			return f, 400, false
 		}
-		// `OWS` off it and nothing more: see `h2.trim_ows`.
-		value := h2.trim_ows(header[colon + 1:])
-		switch {
-		case dns.name_equal_fold(name, "content-length"):
-			// RFC 9112 6.3: more than one of these, whether or not they agree,
-			// or one that is not a length is an invalid message, since the hop
-			// in front is entitled to resolve them differently from this one.
-			// Too large is not refused here but after the headers: see the 413
-			// below.
-			v, vok := h2.parse_content_length(value, MAX_DOH_BODY)
-			if content_length >= 0 || !vok {
-				malformed = true
-				continue
-			}
-			content_length = v
-		case dns.name_equal_fold(name, "connection"):
-			if h2.list_has_token(value, "close") {
-				req.keep_alive = false
-			}
-		case dns.name_equal_fold(name, "content-type"):
-			// RFC 9110 5.3: a singleton field, and the loop keeps the last of a
-			// repeat while a hop in front may judge the first. So a repeat is a
-			// 400, as Host's is, rather than a media type picked for the check.
-			content_types += 1
-			if content_types > 1 {
-				malformed = true
-				continue
-			}
-			req.content_type = hold(value, &held)
-		case dns.name_equal_fold(name, "host"):
-			/*
-			RFC 9112 3.2: a request carrying more than one Host is a 400, whether
-			or not the two agree - the same argument a repeated Content-Length
-			gets. The loop kept the last one it saw, and the .mobileconfig
-			endpoint builds a URL out of it: given two, the profile a device
-			installs names whichever of them this hop happened to keep, which is
-			not necessarily the one the front end routed the request by.
-			*/
-			hosts += 1
-			// And an invalid one is a 400 too (RFC 9112 3.2): held to what a
-			// host may hold, as `:authority` is on HTTP/2 (#438).
-			if hosts > 1 || !h2.authority_is_valid(value) {
-				malformed = true
-				continue
-			}
-			req.host = hold(value, &held)
-		case dns.name_equal_fold(name, "transfer-encoding"):
-			te_fields += 1
-			if !transfer_codings_add(&codings, value) {
-				malformed = true
-			}
-		case dns.name_equal_fold(name, "expect"):
-			// RFC 9110 10.1.1: ignored on HTTP/1.0, and any other expectation
-			// is one a server may ignore.
-			expect_continue ||= !http_1_0 && h2.list_has_token(value, "100-continue")
+		keep_field(&f, req, name, value, http_1_0, held)
+	}
+	return f, 0, true
+}
+
+// Keep what `read_http_request` reads from one field: in `req`, or in `f`.
+@(private)
+keep_field :: proc(f: ^Http_Fields, req: ^Http_Request_In, name, value: string, http_1_0: bool, held: ^bool) {
+	switch {
+	case dns.name_equal_fold(name, "content-length"):
+		// RFC 9112 6.3: more than one of these, whether or not they agree,
+		// or one that is not a length is an invalid message, since the hop
+		// in front is entitled to resolve them differently from this one.
+		// Too large is not refused here but after the headers: see
+		// `request_framing`.
+		v, vok := h2.parse_content_length(value, MAX_DOH_BODY)
+		if f.content_length >= 0 || !vok {
+			f.malformed = true
+			return
 		}
+		f.content_length = v
+	case dns.name_equal_fold(name, "connection"):
+		if h2.list_has_token(value, "close") {
+			req.keep_alive = false
+		}
+	case dns.name_equal_fold(name, "content-type"):
+		// RFC 9110 5.3: a singleton field, and the loop keeps the last of a
+		// repeat while a hop in front may judge the first. So a repeat is a
+		// 400, as Host's is, rather than a media type picked for the check.
+		f.content_types += 1
+		if f.content_types > 1 {
+			f.malformed = true
+			return
+		}
+		req.content_type = http_hold(value, held)
+	case dns.name_equal_fold(name, "host"):
+		/*
+		RFC 9112 3.2: a request carrying more than one Host is a 400, whether
+		or not the two agree - the same argument a repeated Content-Length
+		gets. The loop kept the last one it saw, and the .mobileconfig
+		endpoint builds a URL out of it: given two, the profile a device
+		installs names whichever of them this hop happened to keep, which is
+		not necessarily the one the front end routed the request by.
+		*/
+		f.hosts += 1
+		// And an invalid one is a 400 too (RFC 9112 3.2): held to what a
+		// host may hold, as `:authority` is on HTTP/2 (#438).
+		if f.hosts > 1 || !h2.authority_is_valid(value) {
+			f.malformed = true
+			return
+		}
+		req.host = http_hold(value, held)
+	case dns.name_equal_fold(name, "transfer-encoding"):
+		f.te_fields += 1
+		if !transfer_codings_add(&f.codings, value) {
+			f.malformed = true
+		}
+	case dns.name_equal_fold(name, "expect"):
+		// RFC 9110 10.1.1: ignored on HTTP/1.0, and any other expectation
+		// is one a server may ignore.
+		f.expect_continue ||= !http_1_0 && h2.list_has_token(value, "100-continue")
 	}
+}
 
-	// Before the body is waited for: a request this server cannot keep is not
-	// answered whatever follows.
-	if !held {
-		return {}, 0, false
-	}
-	if absolute {
-		req.host = authority
-	}
-
+/*
+Whether the body is chunked, from the fields `read_field_lines` read, and the
+status to refuse the request with: 0 for none.
+*/
+@(private)
+request_framing :: proc(f: Http_Fields, http_1_0: bool) -> (chunked: bool, status: int) {
 	// RFC 9112 3.2 again: Host carries the authority, so an HTTP/1.1 request
 	// without one is a 400 even where the target carries it too. HTTP/1.0
 	// predates the field and is allowed to leave it out.
-	if malformed || (hosts == 0 && !http_1_0) {
-		return refused, 400, false
+	if f.malformed || (f.hosts == 0 && !http_1_0) {
+		return false, 400
 	}
 
-	chunked := false
-	if te_fields > 0 {
+	if f.te_fields > 0 {
 		switch {
 		/*
 		RFC 9112 6.1: an HTTP/1.0 message with a Transfer-Encoding is one whose
@@ -558,12 +628,12 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 		field with no coding at all, leaves the length unknowable, which is a
 		400; chunked twice is a coding no sender may apply.
 		*/
-		case http_1_0, content_length >= 0, !codings.final_chunked, codings.chunked > 1:
-			return refused, 400, false
+		case http_1_0, f.content_length >= 0, !f.codings.final_chunked, f.codings.chunked > 1:
+			return false, 400
 		// 6.1: a coding this server does not understand (it decodes chunked
 		// alone) is a 501.
-		case codings.count > 1:
-			return refused, 501, false
+		case f.codings.count > 1:
+			return false, 501
 		}
 		chunked = true
 	}
@@ -575,47 +645,10 @@ read_http_request :: proc(r: ^Http_Reader) -> (req: Http_Request_In, status: int
 	is safe to answer, as everything above is. The body is not read, and the caller
 	closes after the answer.
 	*/
-	if content_length > MAX_DOH_BODY {
-		return refused, 413, false
+	if f.content_length > MAX_DOH_BODY {
+		return false, 413
 	}
-
-	if (content_length > 0 || chunked) && expect_continue {
-		/*
-		RFC 9110 10.1.1: a server "MUST NOT wait for the content before sending
-		the 100 (Continue) response". Everything this reader refuses on the
-		header block is answered above with a final status instead; what is left
-		is decided on the body, so it gets the 100 - unless the body is already
-		here, which 10.1.1 lets a server leave unanswered.
-		*/
-		here := len(r.buf) - r.pos
-		if (chunked && here == 0) || (!chunked && here < content_length) {
-			if !conn_write_all(r.conn, transmute([]u8)string(HTTP_CONTINUE)) {
-				return {}, 0, false
-			}
-		}
-	}
-
-	if chunked {
-		body, bstatus, bok := read_chunked_body(r)
-		if !bok {
-			return refused, bstatus, false
-		}
-		req.body = body
-		req.closing = true
-		/*
-		Closed after it is answered: the chunked framing this hop read is one a
-		front end may have cut differently, and closing leaves it no next request
-		on this connection to attribute anything to. RFC 9112 9.6 lets a server
-		close after any response.
-		*/
-		req.keep_alive = false
-	} else if content_length > 0 {
-		// A view, where everything above is a copy: the body is the last thing
-		// read, so nothing grows the buffer under it before the caller's
-		// `http_compact`, which is what ends it.
-		req.body = http_exact(r, content_length) or_return
-	}
-	return req, 0, true
+	return chunked, 0
 }
 
 // The interim response RFC 9110 10.1.1 has a server send to `Expect: 100-continue`.
@@ -668,7 +701,7 @@ transfer_codings_add :: proc(t: ^Transfer_Codings, value: string) -> bool {
 		at := 0
 		for at < len(rest) && rest[at] != ',' {
 			if rest[at] == '"' {
-				q := quoted_string_prefix(rest[at:])
+				q := h2.quoted_string_prefix(rest[at:])
 				if q == 0 {
 					return false
 				}
@@ -690,7 +723,7 @@ transfer_codings_add :: proc(t: ^Transfer_Codings, value: string) -> bool {
 			name = h2.trim_ows(coding[:semi])
 			params = true
 			// RFC 9112 7: each a token, "=", and a token or quoted-string.
-			if !transfer_params_are_valid(coding[semi:]) {
+			if !h2.params_are_valid(coding[semi:], value_optional = false) {
 				return false
 			}
 		}
@@ -716,10 +749,9 @@ as a Content-Length body's does.
 
 `status` is the answer to a body this refuses: 413 for content past
 `MAX_DOH_BODY`, 400 for a chunk that does not read as one or framing past
-`MAX_HEADER_BYTES` all told, and 0 for a read that failed. A chunk-size is hex
-digits alone, bounded before it can overflow; a chunk extension is held to its
-grammar (7.1.1) and then ignored; trailer fields are read as field lines and
-dropped (7.1.2), nothing this endpoint serves reading one.
+`MAX_HEADER_BYTES` all told, and 0 for a read that failed. Chunk lines are read
+by `h2.parse_chunk_line`; trailer fields are read as field lines and dropped
+(7.1.2), nothing this endpoint serves reading one.
 */
 @(private)
 read_chunked_body :: proc(r: ^Http_Reader) -> (body: []u8, status: int, ok: bool) {
@@ -737,20 +769,8 @@ read_chunked_body :: proc(r: ^Http_Reader) -> (body: []u8, status: int, ok: bool
 		if !lok {
 			return nil, chunk_line_status(r, end, lbad), false
 		}
-		size := 0
-		digits := 0
-		for digits < len(line) {
-			v, hex := hex_nibble(line[digits])
-			if !hex {
-				break
-			}
-			size = size * 16 + int(v)
-			digits += 1
-			if size > MAX_DOH_BODY {
-				return nil, 413, false
-			}
-		}
-		if digits == 0 || !chunk_ext_is_valid(line[digits:]) {
+		size, chunk := h2.parse_chunk_line(line, MAX_DOH_BODY)
+		if !chunk {
 			return nil, 400, false
 		}
 		if size == 0 {
@@ -800,118 +820,6 @@ are, and 0 for a read that failed.
 @(private)
 chunk_line_status :: proc(r: ^Http_Reader, end: int, malformed: bool) -> int {
 	return 400 if malformed || len(r.buf) - end > MAX_HEADER_BYTES else 0
-}
-
-/*
-Whether what follows a chunk-size is a chunk extension list as RFC 9112 7.1.1
-writes it, or nothing:
-`*( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`, a name a
-token and a value a token or a quoted-string. Whitespace with no `;` after it is
-not one.
-*/
-@(private)
-chunk_ext_is_valid :: proc(ext: string) -> bool {
-	rest := ext
-	for {
-		rest = strings.trim_left(rest, " \t")
-		if rest == "" {
-			// Whitespace alone, with no extension behind it, is not BWS.
-			return len(ext) == 0 || ext[len(ext) - 1] != ' ' && ext[len(ext) - 1] != '\t'
-		}
-		if rest[0] != ';' {
-			return false
-		}
-		rest = strings.trim_left(rest[1:], " \t")
-		n := token_prefix(rest)
-		if n == 0 {
-			return false
-		}
-		rest = strings.trim_left(rest[n:], " \t")
-		if rest == "" || rest[0] == ';' {
-			continue
-		}
-		if rest[0] != '=' {
-			return false
-		}
-		rest = strings.trim_left(rest[1:], " \t")
-		if v := token_prefix(rest); v > 0 {
-			rest = rest[v:]
-		} else if q := quoted_string_prefix(rest); q > 0 {
-			rest = rest[q:]
-		} else {
-			return false
-		}
-	}
-}
-
-/*
-Whether `s` is a list of transfer-parameters as RFC 9112 7 writes them:
-`*( OWS ";" OWS token BWS "=" BWS ( token / quoted-string ) )`.
-*/
-@(private)
-transfer_params_are_valid :: proc(s: string) -> bool {
-	rest := s
-	for {
-		rest = strings.trim_left(rest, " \t")
-		if rest == "" {
-			return true
-		}
-		if rest[0] != ';' {
-			return false
-		}
-		rest = strings.trim_left(rest[1:], " \t")
-		n := token_prefix(rest)
-		if n == 0 {
-			return false
-		}
-		rest = strings.trim_left(rest[n:], " \t")
-		if rest == "" || rest[0] != '=' {
-			return false
-		}
-		rest = strings.trim_left(rest[1:], " \t")
-		if v := token_prefix(rest); v > 0 {
-			rest = rest[v:]
-		} else if q := quoted_string_prefix(rest); q > 0 {
-			rest = rest[q:]
-		} else {
-			return false
-		}
-	}
-}
-
-// How many bytes at the start of `s` are a token (RFC 9110 5.6.2).
-@(private)
-token_prefix :: proc(s: string) -> int {
-	for i in 0 ..< len(s) {
-		if !h2.is_token(s[i:i + 1]) {
-			return i
-		}
-	}
-	return len(s)
-}
-
-// How many bytes at the start of `s` are a quoted-string (RFC 9110 5.6.4), 0 if
-// it does not start with one.
-@(private)
-quoted_string_prefix :: proc(s: string) -> int {
-	if len(s) == 0 || s[0] != '"' {
-		return 0
-	}
-	for i := 1; i < len(s); i += 1 {
-		switch c := s[i]; {
-		case c == '"':
-			return i + 1
-		case c == '\\':
-			// A quoted-pair: HTAB, SP or a visible character after the backslash.
-			if i + 1 >= len(s) || (s[i + 1] < ' ' && s[i + 1] != '\t') || s[i + 1] == 0x7f {
-				return 0
-			}
-			i += 1
-		case c < ' ' && c != '\t', c == 0x7f:
-			return 0
-		}
-	}
-	return 0
 }
 
 /*

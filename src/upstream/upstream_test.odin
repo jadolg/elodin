@@ -3489,9 +3489,9 @@ test_http_transfer_encoding_is_exactly_chunked :: proc(t: ^testing.T) {
 }
 
 /*
-A chunk size is `1*HEXDIG`, and the only whitespace RFC 9112 7.1.1 allows near it
-is BWS before a `;` extension. Trimmed off both ends regardless, ` 5` and `5 `
-were read as five (#437), and so were `+5` and `0_5`, which `strconv` reads.
+A chunk line is `1*HEXDIG` and then RFC 9112 7.1.1's extensions, whose BWS is
+the only whitespace it holds: ` 5` and `5 ` are no chunk size (#437), nor are
+`+5` and `0_5`, which `strconv` reads, nor is an extension outside the grammar.
 */
 @(test)
 test_http_chunk_size_takes_bws_only_before_an_extension :: proc(t: ^testing.T) {
@@ -3514,6 +3514,11 @@ test_http_chunk_size_takes_bws_only_before_an_extension :: proc(t: ^testing.T) {
 		{"+5", true},
 		{"0_5", true},
 		{"_5", true},
+		{"5;", true},
+		{"5;a=", true},
+		{"5;a b", true},
+		{"5;ext ", true},
+		{"5;a=\"q\"", false},
 	}
 	for c in CASES {
 		track: mem.Tracking_Allocator
@@ -3545,7 +3550,8 @@ not read some other way (#437 review).
 - A field line starting with whitespace is obs-fold (RFC 9112 5.2), and space
   before the colon makes no field name (5.1). Skipped, `chunked` + ` , gzip`
   read as chunked alone and `keep-alive` + ` close` was pooled; a line with no
-  colon at all is no field line either.
+  colon at all is no field line either, in the header block or the trailer
+  section (7.1.2).
 - A bare LF, a bare CR or a NUL inside a line (RFC 9112 2.2, RFC 9110 5.5):
   `keep-alive\nConnection: close` was one value holding no `close` element,
   where a peer taking the LF for a line end sent two fields.
@@ -3577,6 +3583,8 @@ test_http_response_malformed_framing_is_refused :: proc(t: ^testing.T) {
 		"HTTP/1.1 200 OK\r\nX: a\x00b\r\nContent-Length: 5\r\n\r\nhello",
 		"HTTP/1.1 200 O\nK\r\nContent-Length: 5\r\n\r\nhello",
 		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\x00\r\nhello\r\n0\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nno colon here\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n X-T: v\r\n\r\n",
 	}
 	for reply in CASES {
 		track: mem.Tracking_Allocator

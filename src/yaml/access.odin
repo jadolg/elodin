@@ -4,6 +4,7 @@ import "core:math"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "elodin:netx"
 
 // Look a key up in a mapping. Returns nil for a missing key or a non-mapping.
 get :: proc(n: ^Node, key: string) -> ^Node {
@@ -124,7 +125,7 @@ core_int :: proc(s: string) -> (i64, bool) {
 	limit := u64(max(i64)) + (1 if neg else 0)
 	v: u64
 	for c in transmute([]u8)s {
-		digit, is_digit := hex_digit(c)
+		digit, is_digit := netx.hex_digit(c)
 		d := u64(digit)
 		if !is_digit || d >= u64(base) || v > (limit - d) / u64(base) {
 			return 0, false
