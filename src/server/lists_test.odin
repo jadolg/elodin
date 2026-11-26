@@ -955,8 +955,8 @@ test_a_copy_that_cannot_be_given_is_kept :: proc(t: ^testing.T) {
 
 /*
 A cached copy is read whole or not at all: an allocator that runs dry, a copy
-larger than any download elodin writes, and a file that holds more than its
-size said are each refused with a reason, never handed on cut short (#757).
+larger than any download elodin writes, and a file that holds more or less
+than its size said are each refused with a reason, never handed on cut short (#757).
 */
 @(test)
 test_a_cached_copy_is_read_whole_or_refused :: proc(t: ^testing.T) {
@@ -997,5 +997,15 @@ test_a_cached_copy_is_read_whole_or_refused :: proc(t: ^testing.T) {
 
 	// More than its size said: a /proc file says 0 and holds lines.
 	data, why, read = read_cache_file("/proc/self/status", context.temp_allocator, owner = {})
-	testing.expectf(t, !read && why == "it grew while it was read", "a file past its stat size: %v %q, %d bytes", read, why, len(data))
+	testing.expectf(t, !read && why == "its size changed while it was read", "a file past its stat size: %v %q, %d bytes", read, why, len(data))
+
+	// Less than its size said: a sysfs attribute says a page and holds a line.
+	short :: "/sys/kernel/mm/transparent_hugepage/enabled"
+	held, rerr := os.read_entire_file(short, context.temp_allocator)
+	fi, serr := os.stat(short, context.temp_allocator)
+	if !testing.expectf(t, rerr == nil && serr == nil && fi.size > i64(len(held)), "the premise: %s holds less than its size, %v %v", short, rerr, serr) {
+		return
+	}
+	data, why, read = read_cache_file(short, context.temp_allocator, owner = {})
+	testing.expectf(t, !read && why == "its size changed while it was read", "a file short of its stat size: %v %q, %d bytes", read, why, len(data))
 }

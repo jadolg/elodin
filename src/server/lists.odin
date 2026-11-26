@@ -540,8 +540,9 @@ read_cache_file :: proc(path: string, allocator := context.allocator, owner := c
 	/*
 	Read from the descriptor itself. `os.new_file` would wrap it, but panics
 	where it cannot name it through /proc - a chroot without one - which would
-	stop the start over a copy it can do without. One byte past the size fstat
-	gave tells a file that holds more, which is refused rather than cut short.
+	stop the start over a copy it can do without. A file that holds more or less
+	than the size fstat gave is being written in place, and is refused rather
+	than loaded part-written; the byte past that size is what shows more.
 	*/
 	out, merr := make([]byte, int(st.st_size) + 1, allocator)
 	if merr != nil {
@@ -563,9 +564,9 @@ read_cache_file :: proc(path: string, allocator := context.allocator, owner := c
 		}
 		n += got
 	}
-	if n == len(out) {
+	if n != int(st.st_size) {
 		delete(out, allocator)
-		return nil, "it grew while it was read", false
+		return nil, "its size changed while it was read", false
 	}
 	return out[:n], "", true
 }

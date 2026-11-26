@@ -57,7 +57,7 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   adds nothing. A cached copy that is a web page, is empty or cannot be read
   whole is not used, and is downloaded over even inside the refresh window:
   one larger than any download (64 MiB), one there is no memory to hold, and
-  one that grows while it is read are each refused, never loaded cut short.
+  one whose size changes while it is read are each refused, never loaded cut short.
 - The cached copy is replaced by writing a temporary file beside it, syncing
   it, then renaming it over the old one. A power cut mid-write leaves the old
   copy or the new one, never a truncated list.
