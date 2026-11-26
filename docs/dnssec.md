@@ -136,7 +136,8 @@ operators which anchor keys it trusts, the data they use to pace a KSK rollover
 (RFC 8145):
 
 - the DNSKEY query carries an `edns-key-tag` option (EDNS option 14) listing the
-  anchors' key tags (section 4);
+  anchors' key tags (section 4). So does a client's DNSKEY question for that
+  zone when elodin forwards it;
 - a Key Tag query goes to the same upstreams beside it: type NULL, for
   `_ta-<tags>.<zone>`, each tag as four lowercase hex digits, sorted (section 5).
   For the built-in root anchors that is `_ta-4f66-9728.`. It is sent once the
@@ -155,6 +156,24 @@ an EDNS option it does not know, which RFC 6891 section 6.1.2 says it MUST
 ignore. Unbound's `trust-anchor-signaling`, which sends the Key Tag query, is
 on by default too. A reload that changes only this setting keeps the answer
 cache.
+
+### Clients' key tags
+
+A client that validates may send its own `edns-key-tag` option on a DNSKEY
+question. elodin forwards it upstream (RFC 8145 section 4.2.2), whatever
+`trust_anchor_signaling` says:
+
+- validating, beside elodin's own list in an option of its own, and not again
+  when it lists the same tags; with validation off, as it came;
+- only on a DNSKEY question. On any other type the option is dropped (section
+  4.2), and so it is for the target a [rewrite](rewrites.md)'s CNAME leads to;
+- not a list that is empty or not whole two-byte tags;
+- 12 tags at most across the client's lists: the list that crosses that is cut,
+  and later ones are dropped.
+
+An answer from the cache, or shared with the same question already in flight,
+sends nothing upstream, so its tags go nowhere. No answer to a client carries
+the option.
 
 ## max_nsec3_iterations
 

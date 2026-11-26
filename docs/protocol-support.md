@@ -38,7 +38,8 @@ kept as the bytes it arrived as like any record data that does not decode; with
 blocking on, a CNAME kept that way has the answer refused.
 
 Also handled: EDNS0 — elodin forwards a query of its own built from the
-question, with an OPT record at 1232 bytes and none of the client's options, and
+question, with an OPT record at 1232 bytes and none of the client's options
+but its `edns-key-tag` on a DNSKEY question, and
 fits the answer to the client's payload size on the way back (see [What reaches
 the upstream](edns.md#what-reaches-the-upstream)); a query with two OPT records,
 one outside the additional section, one owned by a name other than the root, or

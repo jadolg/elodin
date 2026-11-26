@@ -497,6 +497,7 @@ dnssec:
   # when fetching that zone's DNSKEY set: an edns-key-tag option on the query
   # and a _ta-<tags> query beside it (RFC 8145). Root operators use this to
   # pace a key rollover. On by default, as Unbound's trust-anchor-signaling is.
+  # A client's own edns-key-tag on its DNSKEY question is forwarded either way.
   trust_anchor_signaling: true
 
   # NSEC3 records asking for more hashing than this are not computed, so a

@@ -26,8 +26,9 @@ cache does with one - and so, with the cache off, only as the rest below is. Wha
 upstream giving it nothing after `upstream.attempts` rounds over every server,
 where a lost datagram is retried - is shared only with a follower whose outgoing
 message is the leader's, byte for byte bar the ID. `upstream_query` builds that
-message from the key and nothing of the client's (issue #423), so it is every
-follower bar one whose query was shaped under different settings - a reload
+message from the key and nothing of the client's but a DNSKEY question's key
+tags (issue #423), so it is every follower bar one whose query was shaped under
+different settings or, on a DNSKEY question, sent different key tags - a reload
 between the two that changed whether the question is validated: the validator,
 a trust anchor, an `upstream.zones` route or the special-use table. A follower
 given a failure takes the expired entry or SERVFAIL as the leader did, rather

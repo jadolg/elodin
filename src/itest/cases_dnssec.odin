@@ -50,7 +50,6 @@ dnssec_config :: proc(
 }
 
 // The root's DS, the anchor a validating server holds when none is configured.
-@(private = "file")
 ROOT_DS :: ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"
 
 run_dnssec_cases :: proc(r: ^Runner) {
@@ -430,6 +429,7 @@ run_dnssec_cases :: proc(r: ^Runner) {
 	run_key_tag_off_case(r)
 	run_key_tag_failed_lookup_case(r)
 	run_key_tag_anchored_case(r)
+	run_client_key_tag_cases(r)
 }
 
 // RFC 8145 section 4: the last DNSKEY lookup carried `tags` as its edns-key-tag.
