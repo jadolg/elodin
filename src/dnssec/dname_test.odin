@@ -191,6 +191,27 @@ test_dname_synthesis_is_recomputed_exactly :: proc(t: ^testing.T) {
 		check("dnametest.", "target.example.", "A.DNAMETEST.", "a.TARGET.example."),
 		"names should match case-insensitively",
 	)
+	// RFC 6672 section 2.2 puts no restriction on the target, the root included.
+	testing.expect(
+		t,
+		check("example.", ".", "a.example.", "a."),
+		"a DNAME to the root should leave the prefix alone",
+	)
+	testing.expect(
+		t,
+		check("example.", ".", "x.y.example.", "x.y."),
+		"a multi-label prefix under a DNAME to the root should carry over whole",
+	)
+	testing.expect(
+		t,
+		check(".", "target.example.", "a.", "a.target.example."),
+		"a DNAME at the root should redirect what is below it",
+	)
+	testing.expect(
+		t,
+		!check("example.", ".", "a.example.", "b."),
+		"a DNAME to the root must still refuse a prefix it did not produce",
+	)
 
 	// The redirect an attacker would want.
 	testing.expect(
@@ -327,5 +348,96 @@ test_a_synthesized_cname_keeps_its_ttl :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect_value(t, cnames, 1)
+	free_all(context.temp_allocator)
+}
+
+/*
+The same redirection with the root as the DNAME's target: `drtest. DNAME .`,
+and `a.drtest.` synthesized to `a.` (RFC 6672 section 2.2 puts no restriction
+on the target). Generated - `testdata/gen/sign_fixtures.py`, scenario
+`dname_to_root`.
+*/
+
+@(private = "file")
+DNAME_ROOT_ANCHOR :: ". IN DS 38011 15 2 9F36BC8BBE370FB49D208DB0E2E102AC7F52EE2727B7DE33100CE52BAB1738B2"
+
+@(private = "file")
+DNAME_ROOT_FIXTURES := []Fixture{
+	{
+		key   = "dr_root_dnskey",
+		name  = ".",
+		type  = .DNSKEY,
+		wire  = "1234858000010002000000000000300001000030000100000e1000240101030f25507178926f8a6e8349f1621f6d6c59" +
+			"ae8cd552bd7c7bdc5b661a3b6d243c5300002e000100000e10005300300f0000000e107d3b18206a478820947b005797" +
+			"ead9ffb0bed0f9dc1ca7269fd80da2deeb67842f497c2d70ca734dfb5cc0cca73fc3222cf7428f01d65ba2e628a4ce82" +
+			"75abfb4b1d8d50aad3d5b61fef0c",
+	},
+	{
+		key   = "dr_ds",
+		name  = "drtest.",
+		type  = .DS,
+		wire  = "1234858000010002000000000664727465737400002b00010664727465737400002b000100000e1000248caa0f02263d" +
+			"0e6094fafd9e33ee754b2afccc181fd90915777bf075f0976b8ccf2c41c10664727465737400002e000100000e100053" +
+			"002b0f0100000e107d3b18206a478820947b00ce97b7173133293059bdc107be6b3a162407c623fc91ed341838594cb4" +
+			"b8ca4ce95ce7a4cdb99f0fed41f41458d22fadd178e4ca5e16bc19d7d536eca340bc04",
+	},
+	{
+		key   = "dr_dnskey",
+		name  = "drtest.",
+		type  = .DNSKEY,
+		wire  = "12348580000100020000000006647274657374000030000106647274657374000030000100000e1000240101030f87d9" +
+			"37ab655d1be48be7e8e31b7563e40ebf8f5d2cec690319a4903c148b61370664727465737400002e000100000e10005a" +
+			"00300f0100000e107d3b18206a4788208caa06647274657374004e5e99d45a6c1ec293b1e1d7a4e4878ef3a2f558790d" +
+			"d15a16498ff11b386731a0492d9ccd97ef4e4b4753df8b775ba64c9268467a244efff42c9cbad943f509",
+	},
+	{
+		key   = "dr_answer",
+		name  = "a.drtest.",
+		type  = .A,
+		wire  = "123485800001000300000000016106647274657374000001000106647274657374000027000100000e10000100066472" +
+			"7465737400002e000100000e10005a00270f0100000e107d3b18206a4788208caa0664727465737400dc7411eb334c97" +
+			"42708845a61c8253bc12f43956c7926f4f4a3489c1e8edb0d85cc37dd321708e4d51396eaba67b5b44dfa9444519e059" +
+			"5d44b3c072024d990c016106647274657374000005000100000e100003016100",
+	},
+	{
+		key   = "dr_answer_mismatched",
+		name  = "a.drtest.",
+		type  = .A,
+		wire  = "123485800001000300000000016106647274657374000001000106647274657374000027000100000e10000100066472" +
+			"7465737400002e000100000e10005a00270f0100000e107d3b18206a4788208caa0664727465737400dc7411eb334c97" +
+			"42708845a61c8253bc12f43956c7926f4f4a3489c1e8edb0d85cc37dd321708e4d51396eaba67b5b44dfa9444519e059" +
+			"5d44b3c072024d990c016106647274657374000005000100000e100003016200",
+	},
+}
+
+@(test)
+test_dname_to_the_root_validates :: proc(t: ^testing.T) {
+	v := scenario_validator(&DNAME_ROOT_FIXTURES, DNAME_ROOT_ANCHOR)
+	defer destroy_validator(v)
+
+	result := validate(v, "a.drtest.", .A, scenario_fixture(DNAME_ROOT_FIXTURES, "dr_answer"), fixture_now())
+	testing.expectf(
+		t,
+		result.status == .Secure,
+		"a DNAME to the root should validate, got %v (%q)",
+		result.status,
+		result.reason,
+	)
+	free_all(context.temp_allocator)
+}
+
+@(test)
+test_dname_to_the_root_refuses_a_cname_it_did_not_produce :: proc(t: ^testing.T) {
+	v := scenario_validator(&DNAME_ROOT_FIXTURES, DNAME_ROOT_ANCHOR)
+	defer destroy_validator(v)
+
+	result := validate(v, "a.drtest.", .A, scenario_fixture(DNAME_ROOT_FIXTURES, "dr_answer_mismatched"), fixture_now())
+	testing.expectf(
+		t,
+		result.status != .Secure,
+		"a CNAME a DNAME to the root could not have produced was accepted (%v, %q)",
+		result.status,
+		result.reason,
+	)
 	free_all(context.temp_allocator)
 }
