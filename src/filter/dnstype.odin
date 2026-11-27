@@ -162,7 +162,8 @@ A filter stays once interned, including each step a name's filter takes on
 its way to the last: a name named by 64 rules adding a type each holds 64
 filters. So a set keeps at most MAX_TYPE_FILTERS, and false past them skips the
 rule, which bounds what a list built to make every step distinct can make this
-hold, at about 300 bytes each, where lists in use narrow names to a few.
+hold, at about 300 bytes each, where lists in use narrow names to a few. False
+too, setting `out_of_memory`, when there is no memory to keep `f`.
 */
 MAX_TYPE_FILTERS :: 4096
 
@@ -179,8 +180,17 @@ type_intern :: proc(s: ^Set, f: Type_Filter) -> (id: u32, ok: bool) {
 		return
 	}
 	id = u32(len(s.filters))
-	append(&s.filters, Type_Filter{slice.clone(f.types, s.allocator) if len(f.types) > 0 else nil, f.negated})
-	s.filter_ids[strings.clone(key, s.allocator)] = id
+	types, terr := slice.clone(f.types, s.allocator)
+	held, kerr := strings.clone(key, s.allocator)
+	if terr != nil || kerr != nil {
+		s.out_of_memory = true
+		return
+	}
+	// The filter before its id, so no id names a filter `filters` lacks.
+	if _, err := append(&s.filters, Type_Filter{types, f.negated}); err != nil || map_insert(&s.filter_ids, held, id) == nil {
+		s.out_of_memory = true
+		return
+	}
 	return id, true
 }
 

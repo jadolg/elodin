@@ -13,6 +13,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
+import "elodin:testkit"
 import "elodin:upstream"
 
 /*
@@ -941,4 +942,90 @@ test_a_cached_copy_is_read_whole_or_refused :: proc(t: ^testing.T) {
 	}
 	data, why, read = read_cache_file(short, context.temp_allocator)
 	testing.expectf(t, !read && why == "its size changed while it was read", "a file short of its stat size: %v %q, %d bytes", read, why, len(data))
+}
+
+/*
+A rebuild with no memory to build the rule sets whole is dropped, and the rules
+already in effect are kept (#765): whichever allocation is refused - the sets,
+the list's text, a rule, the record of what loaded - every rule the list holds
+still matches after it, and the refresh is not current, so it is tried again.
+*/
+@(test)
+test_a_rebuild_without_memory_keeps_the_rules_in_effect :: proc(t: ^testing.T) {
+	N :: 300
+	path := fmt.tprintf("/tmp/elodin-server-lists-test-oom-%d.txt", os.get_pid())
+	b := strings.builder_make(context.temp_allocator)
+	for i in 0 ..< N {
+		fmt.sbprintf(&b, "0.0.0.0 oom-%d.example\n", i)
+	}
+	if !testing.expect(t, os.write_entire_file(path, strings.to_string(b)) == nil, "cannot write the list") {
+		return
+	}
+	defer os.remove(path)
+
+	cfg := config.default_config()
+	cfg.blocking.lists = []config.Block_List{{name = "l", file = path, format = .Hosts, enabled = true}}
+	s := list_server(&cfg)
+	defer close_list_server(&s)
+	if !testing.expect(t, reload_filters(&s, false), "the list did not load") {
+		return
+	}
+	key := list_key(cfg.blocking.lists[0], false)
+
+	// One for every run, so the allocator a swapped-in set keeps stays good.
+	f: testkit.Fail_Nth
+	f.backing = context.allocator
+	dropped := 0
+	for fail_at := 1; ; fail_at += 1 {
+		f.seen, f.fail_at, f.fail_for = 0, fail_at, 1
+		generation := filter.engine_generation(s.filters)
+		current: bool
+		{
+			context.allocator = testkit.fail_nth(&f)
+			current = reload_filters(&s, false)
+		}
+		swapped := filter.engine_generation(s.filters) != generation
+		if !swapped {
+			dropped += 1
+			testing.expectf(t, !current, "run %d: a dropped rebuild is current", fail_at)
+		}
+		testing.expectf(t, s.lists_loaded[key], "run %d: the list is no longer recorded as loaded", fail_at)
+		for i in 0 ..< N {
+			name := fmt.tprintf("oom-%d.example.", i)
+			if !testing.expectf(t, filter.engine_match(s.filters, name, .A) == .Blocked, "run %d: %s is not blocked", fail_at, name) {
+				return
+			}
+		}
+		if f.seen < fail_at {
+			// Nothing was refused: every allocation has been.
+			testing.expect(t, current && swapped, "a rebuild with every allocation granted did not take")
+			break
+		}
+	}
+	// The premise: refusals reached the build, not only what follows the swap.
+	testing.expectf(t, dropped >= 5, "only %d rebuilds were dropped", dropped)
+}
+
+/*
+A list's key is spelt without allocating, so a temp allocator that cannot grow
+gives it the key it has, not one cut short that `lists_loaded` holds no entry
+for (#765). Each part of the list it is drawn from tells it from another.
+*/
+@(test)
+test_a_list_key_needs_no_memory :: proc(t: ^testing.T) {
+	list := config.Block_List{url = "https://lists.example/ads.txt"}
+	want := list_key(list, false)
+	// Every request refused, as a temp arena that cannot grow refuses them.
+	f := testkit.Fail_Nth{fail_at = 1, fail_for = 1 << 30}
+	got: u64
+	{
+		context.allocator = testkit.fail_nth(&f)
+		context.temp_allocator = context.allocator
+		got = list_key(list, false)
+	}
+	testing.expect_value(t, f.seen, 0)
+	testing.expect_value(t, got, want)
+	testing.expect(t, list_key(list, true) != want, "an allowlist shares a blocklist's key")
+	testing.expect(t, list_key({file = list.url}, false) != want, "a file shares a url's key")
+	testing.expect(t, list_key({url = "https://lists.example/ads.tx", file = "t"}, false) != want, "the url and file run together")
 }

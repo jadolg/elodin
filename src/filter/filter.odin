@@ -82,6 +82,9 @@ Set :: struct {
 	allocator: mem.Allocator,
 	// Names any rule covers, for any type, plus the regex patterns held.
 	count:     int,
+	// An allocation building the set failed, so it lacks a rule or a
+	// `$badfilter` it was given; see `set_whole`.
+	out_of_memory: bool,
 }
 
 Engine :: struct {
@@ -117,20 +120,44 @@ Stats :: struct {
 	allow_rules: int,
 }
 
+// An empty set, or nil when there is no memory for one.
 set_make :: proc() -> ^Set {
-	s := new(Set)
-	if err := virtual.arena_init_growing(&s.arena); err != nil {
-		panic("filter: cannot create arena")
+	s, err := new(Set)
+	if err != nil {
+		return nil
+	}
+	if virtual.arena_init_growing(&s.arena) != nil {
+		free(s)
+		return nil
 	}
 	s.allocator = virtual.arena_allocator(&s.arena)
-	table_init(&s.names, context.allocator)
+	if !table_init(&s.names, context.allocator) || !set_init(s) {
+		set_destroy(s)
+		return nil
+	}
+	return s
+}
+
+// The containers `s` keeps in `s.allocator`; false when there is no memory for
+// them.
+@(private)
+set_init :: proc(s: ^Set) -> bool {
 	s.cancelled = make(map[string]Rule_Flags, s.allocator)
-	s.filters = make([dynamic]Type_Filter, 1, s.allocator)
 	s.filter_ids = make(map[string]u32, s.allocator)
-	s.filter_ids["\x00"] = 0
 	s.regexes = make([dynamic]Regex_Rule, s.allocator)
 	s.regex_held = make(map[string]^Type_Filter, s.allocator)
-	return s
+	// The zero filter, which a `.Typed` entry's id 0 names.
+	err: mem.Allocator_Error
+	s.filters, err = make([dynamic]Type_Filter, 1, s.allocator)
+	return err == nil && map_insert(&s.filter_ids, "\x00", 0) != nil
+}
+
+/*
+Whether `s` holds every rule and `$badfilter` it was given: false once an
+allocation building it has failed, when it must not be swapped in.
+*/
+set_whole :: proc(s: ^Set) -> bool {
+	return !s.out_of_memory && !s.names.out_of_memory
 }
 
 set_destroy :: proc(s: ^Set) {
@@ -149,7 +176,8 @@ Add a rule for `domain`, reporting whether the set now covers it.
 `domain` is taken as written by the list author; it is lowercased and stripped
 of any trailing dot before being stored. A name no query can spell is refused,
 and so is a rule a `$badfilter` has wholly cancelled, and a name past the 4 GiB
-of names a set holds (`table_insert`). A rule for only some query types
+of names a set holds (`table_insert`), or one there is no memory to hold, which
+leaves the set not whole (`set_whole`). A rule for only some query types
 (`types`, from `$dnstype`) is refused when the name's rules would then list more
 than MAX_RULE_TYPES of them.
 */
@@ -202,7 +230,7 @@ set_cancel :: proc(s: ^Set, domain: string, flags: Rule_Flags) {
 	if existing, found := s.cancelled[key]; found {
 		s.cancelled[key] = existing + flags
 	} else {
-		s.cancelled[strings.clone(key, s.allocator)] = flags
+		cancel_store(s, key, flags)
 	}
 	if existing := table_entry(&s.names, key); existing != nil {
 		held := entry_held(existing, len(key))
@@ -262,6 +290,16 @@ typed_add :: proc(s: ^Set, key: string, entry: ^Rule_Flags, flags: Rule_Flags, t
 	entry^ += every
 	typed_ids_store(entry, len(key), ids)
 	return true
+}
+
+// Record that `key` is cancelled for `flags`; with no memory to, set
+// `out_of_memory` instead.
+@(private)
+cancel_store :: proc(s: ^Set, key: string, flags: Rule_Flags) {
+	held, err := strings.clone(key, s.allocator)
+	if err != nil || map_insert(&s.cancelled, held, flags) == nil {
+		s.out_of_memory = true
+	}
 }
 
 // Whether any rule covers the name of `entry` (nil for none), for any type:

@@ -38,20 +38,25 @@ Table :: struct {
 	used:      int,
 	// Per table, as Odin's own maps seed theirs, so a list cannot be written to
 	// collide on every machine.
-	seed:      u64,
-	allocator: mem.Allocator,
+	seed:          u64,
+	allocator:     mem.Allocator,
+	// An insert found no memory, so the table lacks a name it was given.
+	out_of_memory: bool,
 }
 
 // The most a table holds before it grows, in fifths: 4 is 80%.
 @(private)
 TABLE_LOAD_FIFTHS :: 4
 
+// False when there is no memory for the first blob.
 @(private)
-table_init :: proc(t: ^Table, allocator: mem.Allocator) {
+table_init :: proc(t: ^Table, allocator: mem.Allocator) -> bool {
 	t.allocator = allocator
 	t.seed = rand.uint64()
-	t.blob = make([dynamic]u8, 0, 1024, allocator)
-	append(&t.blob, 0)
+	// The pad byte first.
+	err: mem.Allocator_Error
+	t.blob, err = make([dynamic]u8, 1, 1024, allocator)
+	return err == nil
 }
 
 @(private)
@@ -124,39 +129,52 @@ blob_fits :: proc(blob_len, key_len: int) -> bool {
 Add `key`, which the caller has found absent, with `flags`, and the zeroed ids
 that follow a `.Typed` entry. False when the blob can take no more: 4 GiB of
 names is no list a resolver can be asked to hold, and refusing it is what keeps
-every offset in a u32.
+every offset in a u32. False too, setting `out_of_memory` and leaving the table
+as it was, when the slots or the blob cannot grow.
 */
 @(private)
 table_insert :: proc(t: ^Table, key: string, flags: Rule_Flags) -> bool {
 	if !blob_fits(len(t.blob), len(key) + TYPED_IDS) {
 		return false
 	}
-	if (t.used + 1) * 5 > len(t.slots) * TABLE_LOAD_FIFTHS {
-		table_resize(t, max(len(t.slots) * 2, 64))
+	if (t.used + 1) * 5 > len(t.slots) * TABLE_LOAD_FIFTHS && !table_resize(t, max(len(t.slots) * 2, 64)) {
+		t.out_of_memory = true
+		return false
 	}
-	table_place(t.slots, Slot{hash = table_hash(t, key), off = table_write(t, key, flags)})
+	off := table_write(t, key, flags) or_return
+	table_place(t.slots, Slot{hash = table_hash(t, key), off = off})
 	t.used += 1
 	return true
 }
 
-// Append an entry for `key` to the blob, returning where it starts.
+/*
+Append an entry for `key` to the blob, returning where it starts. False, setting
+`out_of_memory` and leaving the blob as it was, when it cannot grow.
+*/
 @(private)
-table_write :: proc(t: ^Table, key: string, flags: Rule_Flags) -> u32 {
-	off := u32(len(t.blob))
-	append(&t.blob, transmute(u8)flags)
-	append(&t.blob, key)
-	append(&t.blob, 0)
-	if .Typed in flags {
-		resize(&t.blob, len(t.blob) + TYPED_IDS)
+table_write :: proc(t: ^Table, key: string, flags: Rule_Flags) -> (off: u32, ok: bool) {
+	off = u32(len(t.blob))
+	size := len(key) + 2 + (TYPED_IDS if .Typed in flags else 0)
+	// Grown for the whole entry before any byte is written, doubling as
+	// `append` does: an `append` that cannot grow copies what fits, and a name
+	// cut short is stored as another.
+	if len(t.blob) + size > cap(t.blob) && reserve(&t.blob, max(2 * cap(t.blob), len(t.blob) + size)) != nil {
+		t.out_of_memory = true
+		return 0, false
 	}
-	return off
+	// Inside the capacity, so it cannot fail, and zeroes the NUL and the ids.
+	resize(&t.blob, len(t.blob) + size)
+	t.blob[off] = transmute(u8)flags
+	copy(t.blob[off + 1:], key)
+	return off, true
 }
 
 /*
 Give `key`'s entry the room for its `$dnstype` filters, returning it: written
 again at the end of the blob with `.Typed` set, and its slot pointed there. The
 old bytes stay, unreachable; a name is moved once, since `.Typed` is never taken
-away. Nil when `key` is absent or the blob is full.
+away. Nil, leaving the entry as it was, when `key` is absent or the blob is full
+or cannot grow.
 */
 @(private)
 table_retype :: proc(t: ^Table, key: string) -> ^Rule_Flags {
@@ -165,7 +183,11 @@ table_retype :: proc(t: ^Table, key: string) -> ^Rule_Flags {
 		return nil
 	}
 	flags := (transmute(Rule_Flags)t.blob[t.slots[i].off]) + {.Typed}
-	t.slots[i].off = table_write(t, key, flags)
+	off, written := table_write(t, key, flags)
+	if !written {
+		return nil
+	}
+	t.slots[i].off = off
 	return (^Rule_Flags)(&t.blob[t.slots[i].off])
 }
 
@@ -219,9 +241,14 @@ table_place :: proc(slots: []Slot, slot: Slot) {
 	}
 }
 
+// Rehash into `n` slots; false, leaving the table as it was, when there is no
+// memory for them.
 @(private)
-table_resize :: proc(t: ^Table, n: int) {
-	slots := make([]Slot, n, t.allocator)
+table_resize :: proc(t: ^Table, n: int) -> bool {
+	slots, err := make([]Slot, n, t.allocator)
+	if err != nil {
+		return false
+	}
 	for slot in t.slots {
 		if slot.off != 0 {
 			table_place(slots, slot)
@@ -229,6 +256,7 @@ table_resize :: proc(t: ^Table, n: int) {
 	}
 	delete(t.slots, t.allocator)
 	t.slots = slots
+	return true
 }
 
 /*
@@ -240,6 +268,7 @@ this is what makes a loaded list cost its 80% figure whatever its size.
 table_trim :: proc(t: ^Table) {
 	n := t.used * 5 / TABLE_LOAD_FIFTHS + 1
 	if t.used > 0 && n < len(t.slots) {
+		// With no memory for the smaller slots the larger still hold every name.
 		table_resize(t, n)
 	}
 	shrink(&t.blob)

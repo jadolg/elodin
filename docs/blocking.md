@@ -67,8 +67,18 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   effect`). This happens with an unwritable or cleared `cache_dir`. A list that
   has never loaded does not hold the other lists back, and neither does a
   `file:` list: delete one and its rules go at the next refresh.
+- If there is no memory to build the rule sets whole (to read a `file:` list,
+  to hold a rule, `$badfilter` or regex, or to record which lists loaded), the
+  load is dropped and every rule already in effect is kept, whatever the kind
+  of list (`filter: there is no memory to build the rule sets; keeping the
+  rules already in effect`, after `list NAME: there is no memory to read
+  "PATH"` for a `file:` list). Lists after the one that ran out are not tried,
+  and a download that was being read is not cached. At startup there are no
+  rules in effect yet, so none apply until a retry succeeds. Sets missing a
+  rule are never swapped in.
 - A refresh where some downloaded list is unavailable, or was served from its
-  cached copy because the download failed or held no rules, is retried after 1
+  cached copy because the download failed or held no rules, or that was dropped
+  for want of memory, is retried after 1
   minute, then 2, 4 and so on, up to 1 hour or `refresh`, whichever is shorter
   (`blocklists: not every list is current; trying again in 1m0s`). A start that
   could not load every list is retried the same way. A missing `file:` list is

@@ -62,7 +62,13 @@ List_Load :: enum u8 {
 	// The download arrived holding no rules and there is no copy: it adds
 	// nothing, but is empty rather than lost, so it holds nothing back.
 	Empty,
+	// There was no memory to read it or to hold its rules: the sets are not
+	// whole, and the load is dropped.
+	No_Memory,
 }
+
+// What a rebuild says when there is no memory to build the rule sets whole.
+NO_MEMORY_FOR_RULES :: "filter: there is no memory to build the rule sets; keeping the rules already in effect"
 
 /*
 Build a fresh pair of rule sets from the configuration.
@@ -71,16 +77,33 @@ Returns them ready to hand to `filter.engine_swap`; the caller is responsible
 for destroying whatever that swap displaces. When `loads` is given it has one
 slot per list, `blocking.lists` then `blocking.allowlists`, and says how each
 one fared.
+
+Both nil when there is no memory to build them whole: to make them, to read a
+`file:` list, or to hold a rule. Lists after the one that ran out are not tried.
 */
 build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool, loads: []List_Load = nil) -> (block, allow: ^filter.Set) {
+	move_query_named_caches(cfg)
 	block = filter.set_make()
 	allow = filter.set_make()
-	move_query_named_caches(cfg)
+	if block == nil || allow == nil || !load_lists(cfg, block, allow, allow_network, loads) || !add_operator_rules(cfg, block, allow) {
+		filter.set_destroy(block)
+		filter.set_destroy(allow)
+		return nil, nil
+	}
+	return
+}
 
+// Load every list into the sets, saying in `loads` how each fared; false at the
+// first that is `.No_Memory`.
+@(private)
+load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network: bool, loads: []List_Load) -> bool {
 	for list, i in cfg.blocking.lists {
 		load := load_one_list(cfg, list, block, allow, allow_network, false)
 		if loads != nil {
 			loads[i] = load
+		}
+		if load == .No_Memory {
+			return false
 		}
 	}
 	for list, i in cfg.blocking.allow_lists {
@@ -88,8 +111,17 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool, loads: []Lis
 		if loads != nil {
 			loads[len(cfg.blocking.lists) + i] = load
 		}
+		if load == .No_Memory {
+			return false
+		}
 	}
+	return true
+}
 
+// Add `blocking.rules` and `blocking.allow_rules`; false when there was no
+// memory to hold them, and the sets are not whole.
+@(private)
+add_operator_rules :: proc(cfg: ^config.Config, block, allow: ^filter.Set) -> bool {
 	// A list's `$badfilter` takes back rules lists carry, not the operator's
 	// own: forget them before those are added. The operator's `$badfilter`
 	// still cancels what the lists added.
@@ -110,8 +142,7 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool, loads: []Lis
 			warn_rule_adds_nothing(rule)
 		}
 	}
-
-	return
+	return filter.set_whole(block) && filter.set_whole(allow)
 }
 
 /*
@@ -219,8 +250,11 @@ load_one_list :: proc(
 	}
 
 	text, load, downloaded := list_contents(cfg, list, allow_network)
-	if load == .Unavailable {
+	#partial switch load {
+	case .Unavailable:
 		logx.warnf("list %s: unavailable, skipping it", list.name)
+		return load
+	case .No_Memory:
 		return load
 	}
 	defer delete(text)
@@ -233,6 +267,11 @@ load_one_list :: proc(
 	}
 
 	added, held_rules, not_ascii := parse_list_text(target_block, target_allow, text, list.format)
+	// What the text holds is not known, so a download neither replaces the
+	// copy nor is said to hold no rules.
+	if !filter.set_whole(block) || !filter.set_whole(allow) {
+		return .No_Memory
+	}
 	if downloaded {
 		/*
 		A download replaces the cached copy only once it has been parsed and
@@ -258,6 +297,9 @@ load_one_list :: proc(
 				return .Empty
 			}
 			added, _, not_ascii = parse_list_text(target_block, target_allow, text, list.format)
+			if !filter.set_whole(block) || !filter.set_whole(allow) {
+				return .No_Memory
+			}
 		}
 	}
 	logx.infof("list %s: %d rules", list.name, added)
@@ -320,6 +362,10 @@ list_contents :: proc(
 ) {
 	if list.file != "" {
 		data, err := os.read_entire_file(list.file, context.allocator)
+		if err == .Out_Of_Memory {
+			logx.warnf("list %s: there is no memory to read %q", list.name, list.file)
+			return "", .No_Memory, false
+		}
 		if err != nil {
 			logx.warnf("list %s: cannot read %q (%v)%s", list.name, list.file, err, sandbox.refusal_hint(err, write = false))
 			return "", .Unavailable, false
@@ -726,13 +772,26 @@ runs on. A list that never loaded does not hold the others back, and neither doe
 a `file:` list: that one is the operator's own, and one deleted to lift its
 blocks has to lift them, where a download is lost to the network.
 
+The new sets are dropped too when there was no memory to build them whole, or to
+record which lists loaded (#765): a set missing rules its lists hold is never
+swapped in, whatever kind of list they came from.
+
 `current` is false when some list is unavailable or stood in for by a stale copy,
-so the caller retries sooner than the interval; see `refresh_retry`.
+or the sets were dropped for want of memory, so the caller retries sooner than
+the interval; see `refresh_retry`.
 */
 reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool) -> (current: bool) {
 	lists := len(cfg.blocking.lists)
-	loads := make([]List_Load, lists + len(cfg.blocking.allow_lists))
-	block, allow := build_filter_sets(cfg, allow_network, loads)
+	loads, err := make([]List_Load, lists + len(cfg.blocking.allow_lists))
+	defer delete(loads)
+	block, allow: ^filter.Set
+	if err == nil {
+		block, allow = build_filter_sets(cfg, allow_network, loads)
+	}
+	if block == nil {
+		logx.warnf("%s", NO_MEMORY_FOR_RULES)
+		return false
+	}
 
 	current = true
 	for load, i in loads {
@@ -750,21 +809,27 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 			logx.warnf("list %s: loaded before and unavailable now; keeping the rules already in effect", list.name)
 			filter.set_destroy(block)
 			filter.set_destroy(allow)
-			delete(loads)
 			return false
 		}
 	}
-	clear(&s.lists_loaded)
+	// Built aside and swapped in whole: a list missing from it would not hold
+	// a later refresh back when it is unavailable.
+	loaded: map[u64]bool
 	for load, i in loads {
 		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
 		// An empty or disabled list contributed nothing, so it has nothing to
 		// keep later. Only a load is recorded: two entries for one source share
 		// a key, and the one that loaded is the one whose rules are in effect.
-		if list.enabled && (load == .Current || load == .Stale) {
-			s.lists_loaded[list_key(list, i >= lists)] = true
+		if list.enabled && (load == .Current || load == .Stale) && map_insert(&loaded, list_key(list, i >= lists), true) == nil {
+			logx.warnf("%s", NO_MEMORY_FOR_RULES)
+			delete(loaded)
+			filter.set_destroy(block)
+			filter.set_destroy(allow)
+			return false
 		}
 	}
-	delete(loads)
+	delete(s.lists_loaded)
+	s.lists_loaded = loaded
 
 	old_block, old_allow := filter.engine_swap(s.filters, block, allow)
 
@@ -796,7 +861,12 @@ list it is. A list keeps its history wherever a reload moves it, and a new one
 starts with none, which is what it would have at startup.
 */
 list_key :: proc(list: config.Block_List, allow: bool) -> u64 {
-	return hash.fnv64a(transmute([]byte)fmt.tprintf("%v\x00%s\x00%s", allow, list.url, list.file))
+	// Hashed a part at a time, which needs no memory to spell the key.
+	kind := [2]u8{u8(allow), 0}
+	h := hash.fnv64a(kind[:])
+	h = hash.fnv64a(transmute([]byte)list.url, h)
+	h = hash.fnv64a([]byte{0}, h)
+	return hash.fnv64a(transmute([]byte)list.file, h)
 }
 
 /*
