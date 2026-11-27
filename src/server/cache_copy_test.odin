@@ -26,7 +26,7 @@ test_a_stale_lookup_copies_nothing_until_it_is_lent :: proc(t: ^testing.T) {
 		return
 	}
 	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
+	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, checking_disabled = false)
 
 	held, found := stored_answer(&s, key, 0, mem.panic_allocator())
 	testing.expect(t, found && held.stale && held.wire == nil, "the lookup of an expired entry copied it")
@@ -77,7 +77,7 @@ test_a_stale_lend_reads_the_rules_in_force :: proc(t: ^testing.T) {
 		return
 	}
 	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
+	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, checking_disabled = false)
 	if !testing.expect(t, expire_entry(answers, key), "the answer is not stored under its question's key") {
 		return
 	}
@@ -113,7 +113,7 @@ test_a_standing_refusal_copies_nothing :: proc(t: ^testing.T) {
 		return
 	}
 	kb: [cache.KEY_MAX]u8
-	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
+	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, checking_disabled = false)
 	generation := rules_generation(&s)
 	_, first, cached := cache.get(answers, key, context.temp_allocator)
 	if !testing.expect(t, cached, "the answer is not stored under its question's key") {

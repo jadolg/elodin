@@ -71,11 +71,11 @@ test_a_miss_past_the_upstream_waits_fails_and_a_hit_is_served :: proc(t: ^testin
 		return
 	}
 
-	_, outcome, ok := handle_query(&s, test_query(hit, id = 0x2345), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	_, outcome, ok := handle_query(&s, test_query(hit, id = 0x2345), .UDP, TEST_CLIENT, context.temp_allocator)
 	testing.expect(t, ok, "the hit went unanswered")
 	testing.expect_value(t, outcome, Outcome.Cached)
 
-	out, missed, answered_miss := handle_query(&s, test_query("miss.example.", id = 0x2345), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, missed, answered_miss := handle_query(&s, test_query("miss.example.", id = 0x2345), .UDP, TEST_CLIENT, context.temp_allocator)
 	if testing.expect(t, answered_miss, "the miss went unanswered") {
 		testing.expect_value(t, missed, Outcome.Failed)
 		testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Serv_Fail)
@@ -90,7 +90,7 @@ test_a_miss_past_the_upstream_waits_fails_and_a_hit_is_served :: proc(t: ^testin
 		return
 	}
 	spent := 0
-	r := resolve_query(&s, refresh, msg, .UDP, "", 512, {}, {}, &spent, context.temp_allocator, refresh = true)
+	r := resolve_query(&s, refresh, msg, .UDP, "", dns.MAX_UDP_SIZE, {}, {}, &spent, context.temp_allocator, refresh = true)
 	testing.expect(t, r.unanswered, "a refresh with no place counted as a client's failure")
 	testing.expect_value(t, s.stats.failed, 1)
 	testing.expect_value(t, s.stats.upstream_shed, 2)
@@ -133,7 +133,7 @@ test_a_wait_on_a_refresh_holds_a_place :: proc(t: ^testing.T) {
 		s.upstream_waits = ceiling - left
 		before := s.stats.upstream_shed
 		begun := time.tick_now()
-		_, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		_, outcome, ok := handle_query(&s, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 		testing.expectf(t, ok && outcome == .Cached, "%d left: the expired entry was not served (%v)", left, outcome)
 		testing.expectf(t, time.tick_since(begun) < 2 * time.Second, "%d left: the client waited %v", left, time.tick_since(begun))
 		// None with none left: the client is served as when `start_refresh`

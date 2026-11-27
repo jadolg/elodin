@@ -92,7 +92,7 @@ ask_kept :: proc(
 	if limit, has := timeout.?; has {
 		cfg.server.client_timeout = limit
 	}
-	out, outcome, ok = handle_query(&s, keepalive_query(KEPT, ask), proto, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok = handle_query(&s, keepalive_query(KEPT, ask), proto, TEST_CLIENT, context.temp_allocator)
 	testing.expectf(t, ok, "%v: the query went unanswered", proto, loc = loc)
 	return
 }

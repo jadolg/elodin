@@ -171,8 +171,8 @@ fixture_start :: proc(t: ^testing.T, f: ^Fixture, answer_keys: bool, serve_stale
 		return false
 	}
 	f.validator = f.h.srv.validator
-	f.key = cache.make_key(f.key_buf[:], BOGUS_NAME, .A, .IN, false, false)
-	f.vkey = cache.make_key(f.vkey_buf[:], BOGUS_NAME, .A, .IN, false, false, verdict = true)
+	f.key = cache.make_key(f.key_buf[:], BOGUS_NAME, .A, .IN, false, checking_disabled = false)
+	f.vkey = cache.make_key(f.vkey_buf[:], BOGUS_NAME, .A, .IN, false, checking_disabled = false, verdict = true)
 
 	f.worker = thread.create_and_start_with_poly_data(&f.mock, counting_mock_serve)
 	return true

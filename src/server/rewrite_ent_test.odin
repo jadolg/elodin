@@ -26,7 +26,6 @@ ent_rules :: proc() -> []config.Rewrite {
 // `signed`, and before it the records in `chain`.
 @(private = "file")
 nx_reply :: proc(name: string, chain: ..dns.Record, signed := false) -> []u8 {
-	question := [1]dns.Question{{name = name, type = .A, class = .IN}}
 	soa := [2]dns.Record {
 		{
 			name = "example.",
@@ -38,20 +37,7 @@ nx_reply :: proc(name: string, chain: ..dns.Record, signed := false) -> []u8 {
 		// Next name the root, a bitmap of window 0 holding A.
 		{name = "example.", type = .NSEC, class = .IN, ttl = 3600, data = dns.Rdata_Raw{data = []u8{0, 0, 1, 0x40}}},
 	}
-	m := dns.Message {
-		question  = question[:],
-		answer    = chain,
-		authority = soa[:2 if signed else 1],
-	}
-	m.flags.qr = true
-	m.flags.rd = true
-	m.flags.ra = true
-	m.flags.rcode = u8(dns.Rcode.NX_Domain)
-	wire, _, err := dns.encode_message(m, context.temp_allocator)
-	if err != .None {
-		panic("the NXDOMAIN reply does not encode")
-	}
-	return wire
+	return test_reply(name, .A, ..chain, rcode = .NX_Domain, authority = soa[:2 if signed else 1])
 }
 
 @(test)

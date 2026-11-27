@@ -26,14 +26,19 @@ forwarded, served from cache, and re-encoded afterwards to carry a cookie.
 @(private = "file")
 QNAME :: "www.example.com."
 
+// Larger than the shipped ceiling and smaller than the raised one, so a
+// client's figure and this server's are never the same number and echoing one
+// for the other is a visible failure.
 @(private = "file")
-CLIENT_ID :: u16(0x4242)
+CLIENT_ADVERTISED :: u16(2048)
 
-// Larger than the shipped ceiling, so a client's figure and this server's are
-// never the same number and echoing one for the other is a visible failure.
+// What the mock upstream advertises in its own OPT record: neither the client's
+// figure nor a ceiling of this server's.
 @(private = "file")
-CLIENT_ADVERTISED :: u16(4096)
+UPSTREAM_ADVERTISED :: u16(4096)
 
+// The client's query, with an OPT record advertising `advertised` (carrying a
+// client cookie with `cookie`) unless `edns` is off.
 @(private = "file")
 client_query :: proc(
 	advertised: u16,
@@ -43,81 +48,30 @@ client_query :: proc(
 	edns := true,
 	cookie := false,
 ) -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = name,
-		type  = type,
-		class = class,
+	if !edns {
+		return test_query(name, type, class = class)
 	}
-	msg := dns.Message {
-		id       = CLIENT_ID,
-		question = questions,
-	}
-	msg.flags.rd = true
-
-	if edns {
-		opt := dns.make_opt(advertised, false)
-		if cookie {
-			half := make([]u8, 8, context.temp_allocator)
-			for i in 0 ..< len(half) {
-				half[i] = u8(0xa0 + i)
-			}
-			opt = opt_with(.Cookie, half, advertised)
-		}
-		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = opt
-		msg.additional = additional
-	}
-
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	opt := opt_with(.Cookie, test_client_cookie(), advertised) if cookie else opt_record(advertised)
+	return test_query(name, type, opt = opt, class = class)
 }
 
 /*
 An upstream answer carrying an OPT record of the upstream's own.
 
-4096 rather than the ceiling, because a forwarded answer's OPT is the upstream's
-and passes through untouched: whatever it says is what the client reads unless
-something on the way out replaces it.
+Not the ceiling, because a forwarded answer's OPT is the upstream's and passes
+through untouched: whatever it says is what the client reads unless something
+on the way out replaces it.
 */
 @(private = "file")
 mock_reply :: proc() -> []u8 {
-	questions := make([]dns.Question, 1, context.temp_allocator)
-	questions[0] = dns.Question {
-		name  = QNAME,
-		type  = .A,
-		class = .IN,
-	}
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = a_record(QNAME, {192, 0, 2, 1}, 300)
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(4096, false)
-
-	msg := dns.Message {
-		id         = CLIENT_ID,
-		question   = questions,
-		answer     = answer,
-		additional = additional,
-	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return edns_reply(QNAME, {192, 0, 2, 1}, udp_size = UPSTREAM_ADVERTISED)
 }
 
 /*
 A locally built answer is the plainest case: `make_response` echoes the client's
 own advertised size straight into the OPT record it puts back, so left at that,
-a client asking with 4096 under the shipped ceiling would be told 4096 and given
-1232.
+a client asking with more than the shipped ceiling would be told its own figure
+and given the ceiling.
 
 Asked over CHAOS, which is answered from this process without a cache, a filter
 or an upstream - so what the OPT says is the only thing under test.
@@ -130,17 +84,19 @@ test_a_local_answer_advertises_the_ceiling :: proc(t: ^testing.T) {
 	}
 
 	query := client_query(CLIENT_ADVERTISED, "version.bind.", .TXT, .CH)
-	out, outcome, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, query, .UDP, TEST_CLIENT, context.temp_allocator)
 	testing.expect(t, ok, "the chaos query went unanswered")
 	testing.expect_value(t, outcome, Outcome.Local)
 	testing.expect_value(t, int(dns.peek_udp_size(out)), config.DEFAULT_MAX_UDP_RESPONSE)
 
-	// And the round trip the other way: raise the ceiling and the client's own
-	// figure is the one that binds, so that is what the answer reports.
+	// And raised past the client's own figure, the answer reports the raised
+	// ceiling: the field is `max_udp_response`, not the client's number.
 	cfg.server.max_udp_response = config.MAX_UDP_RESPONSE
-	raised, _, raised_ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
-	testing.expect(t, raised_ok, "the chaos query went unanswered at the raised ceiling")
-	testing.expect_value(t, int(dns.peek_udp_size(raised)), int(CLIENT_ADVERTISED))
+	raised, _, raised_ok := handle_query(&s, query, .UDP, TEST_CLIENT, context.temp_allocator)
+	if !testing.expect(t, raised_ok, "the chaos query went unanswered at the raised ceiling") {
+		return
+	}
+	testing.expect_value(t, int(dns.peek_udp_size(raised)), config.MAX_UDP_RESPONSE)
 
 	free_all(context.temp_allocator)
 }
@@ -151,8 +107,8 @@ A client that asked for less than the ceiling is still told the ceiling.
 The field is what this server can deliver, not the size of the reply in hand -
 that is bounded separately, by `response_limit`, and the two only agree when the
 client asked for at least the ceiling. Reporting the smaller number here would be
-the same defect the ticket is about, inverted: a downstream forwarder that
-advertised a conservative 512 would read 512 back, conclude this server cannot
+the same defect inverted: a downstream forwarder that advertised a conservative
+512 would read 512 back, conclude this server cannot
 deliver more, and go on paying for TC bits and TCP retries the 1232 ceiling would
 have spared it.
 */
@@ -163,12 +119,14 @@ test_a_client_below_the_ceiling_is_still_told_the_ceiling :: proc(t: ^testing.T)
 		cfg = &cfg,
 	}
 
-	query := client_query(512, "version.bind.", .TXT, .CH)
-	out, _, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
-	testing.expect(t, ok, "the chaos query went unanswered")
+	query := client_query(dns.MAX_UDP_SIZE, "version.bind.", .TXT, .CH)
+	out, _, ok := handle_query(&s, query, .UDP, TEST_CLIENT, context.temp_allocator)
+	if !testing.expect(t, ok, "the chaos query went unanswered") {
+		return
+	}
 	testing.expect_value(t, int(dns.peek_udp_size(out)), config.DEFAULT_MAX_UDP_RESPONSE)
 	// And the answer itself is still held to what the client asked for.
-	testing.expectf(t, len(out) <= 512, "the answer is %d bytes, past the client's own buffer", len(out))
+	testing.expectf(t, len(out) <= dns.MAX_UDP_SIZE, "the answer is %d bytes, past the client's own buffer", len(out))
 
 	free_all(context.temp_allocator)
 }
@@ -183,11 +141,15 @@ test_a_query_without_edns_gets_no_opt_back :: proc(t: ^testing.T) {
 	}
 
 	query := client_query(0, "version.bind.", .TXT, .CH, edns = false)
-	out, _, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
-	testing.expect(t, ok, "the chaos query went unanswered")
+	out, _, ok := handle_query(&s, query, .UDP, TEST_CLIENT, context.temp_allocator)
+	if !testing.expect(t, ok, "the chaos query went unanswered") {
+		return
+	}
 
 	m, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect(t, !dns.edns_present(m), "an OPT record was invented for a client that sent none")
 
 	free_all(context.temp_allocator)
@@ -210,7 +172,7 @@ test_a_forwarded_answer_advertises_the_ceiling :: proc(t: ^testing.T) {
 	if !testing.expect(t, ok, "the query went unanswered") {
 		return
 	}
-	// The mock said 4096, which is both its own figure and the client's.
+	// The mock said its own figure, which is neither the client's nor the ceiling.
 	testing.expect_value(t, int(dns.peek_udp_size(out)), config.DEFAULT_MAX_UDP_RESPONSE)
 
 	free_all(context.temp_allocator)
@@ -230,19 +192,19 @@ test_a_cached_answer_advertises_the_ceiling_of_the_request :: proc(t: ^testing.T
 	}
 	defer harness_stop(&h)
 
-	// Fills the cache; the entry stores the upstream's 4096.
+	// Fills the cache; the entry stores the upstream's own figure.
 	if _, ok := forward_once(t, &h, client_query(CLIENT_ADVERTISED), mock_reply()); !ok {
 		return
 	}
 
-	hit, outcome, ok := handle_query(&h.srv, client_query(CLIENT_ADVERTISED), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	hit, outcome, ok := handle_query(&h.srv, client_query(CLIENT_ADVERTISED), .UDP, TEST_CLIENT, context.temp_allocator)
 	testing.expect(t, ok, "the cached query went unanswered")
 	testing.expect_value(t, outcome, Outcome.Cached)
 	testing.expect_value(t, int(dns.peek_udp_size(hit)), config.DEFAULT_MAX_UDP_RESPONSE)
 
 	// The same entry served to a client that asked for less reports the same
 	// number: the field is this server's, and it did not change between the two.
-	small, small_outcome, small_ok := handle_query(&h.srv, client_query(512), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	small, small_outcome, small_ok := handle_query(&h.srv, client_query(dns.MAX_UDP_SIZE), .UDP, TEST_CLIENT, context.temp_allocator)
 	testing.expect(t, small_ok, "the second cached query went unanswered")
 	testing.expect_value(t, small_outcome, Outcome.Cached)
 	testing.expect_value(t, int(dns.peek_udp_size(small)), config.DEFAULT_MAX_UDP_RESPONSE)
@@ -269,7 +231,9 @@ test_an_answer_carrying_a_cookie_advertises_the_ceiling :: proc(t: ^testing.T) {
 	}
 
 	m, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	_, has_cookie := dns.find_edns_option(m, .Cookie)
 	testing.expect(t, has_cookie, "no cookie came back, so the re-encode is not what is under test")
 	testing.expect_value(t, int(dns.peek_udp_size(out)), config.DEFAULT_MAX_UDP_RESPONSE)
@@ -295,7 +259,7 @@ test_a_stream_answer_leaves_a_local_opt_alone :: proc(t: ^testing.T) {
 
 	query := client_query(CLIENT_ADVERTISED, "version.bind.", .TXT, .CH)
 	for proto in ([]Protocol{.TCP, .DoT, .DoH}) {
-		out, _, ok := handle_query(&s, query, proto, "127.0.0.1:5555", context.temp_allocator)
+		out, _, ok := handle_query(&s, query, proto, TEST_CLIENT, context.temp_allocator)
 		testing.expectf(t, ok, "%v: the chaos query went unanswered", proto)
 		testing.expectf(
 			t,
@@ -316,8 +280,8 @@ client's.
 
 Worth its own case because the two are the same number on the chaos query above
 and would stay the same if the stream path started rewriting the field. The mock
-answers with 4096 against a client that asked for 1232, so only one of the two
-can be there.
+answers with its own figure against a client that asked for the shipped ceiling,
+so only one of the two can be there.
 */
 @(test)
 test_a_forwarded_stream_answer_keeps_the_upstream_opt :: proc(t: ^testing.T) {
@@ -327,11 +291,11 @@ test_a_forwarded_stream_answer_keeps_the_upstream_opt :: proc(t: ^testing.T) {
 	}
 	defer harness_stop(&h)
 
-	out, ok := forward_once(t, &h, client_query(1232), mock_reply(), .TCP)
+	out, ok := forward_once(t, &h, client_query(config.DEFAULT_MAX_UDP_RESPONSE), mock_reply(), .TCP)
 	if !testing.expect(t, ok, "the query went unanswered") {
 		return
 	}
-	testing.expect_value(t, int(dns.peek_udp_size(out)), 4096)
+	testing.expect_value(t, dns.peek_udp_size(out), UPSTREAM_ADVERTISED)
 
 	free_all(context.temp_allocator)
 }
@@ -352,7 +316,7 @@ test_an_error_response_advertises_the_ceiling :: proc(t: ^testing.T) {
 
 	// A zone transfer is refused outright, and the refusal carries the OPT back.
 	query := client_query(CLIENT_ADVERTISED, QNAME, .AXFR, .IN)
-	out, outcome, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, query, .UDP, TEST_CLIENT, context.temp_allocator)
 	testing.expect(t, ok, "the transfer request went unanswered")
 	testing.expect_value(t, outcome, Outcome.Refused)
 	testing.expect_value(t, int(dns.peek_udp_size(out)), config.DEFAULT_MAX_UDP_RESPONSE)

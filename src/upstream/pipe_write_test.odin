@@ -117,34 +117,6 @@ stall_peer_loop :: proc(p: ^Stall_Peer) {
 	}
 }
 
-// A loopback listener whose connections advertise a window of a few KB.
-@(private = "file")
-stall_listener :: proc() -> (listener: net.TCP_Socket, port: int, ok: bool) {
-	fd, serr := linux.socket(.INET, .STREAM, {.CLOEXEC}, .TCP)
-	if serr != .NONE {
-		return
-	}
-	listener = net.TCP_Socket(fd)
-	// Set before `listen`, so the handshake advertises it.
-	if !stall_set_buffer(listener, .RCVBUF) {
-		net.close(listener)
-		return
-	}
-	if net.bind(listener, net.Endpoint{address = net.IP4_Loopback, port = 0}) != nil ||
-	   linux.listen(fd, 4) != .NONE {
-		net.close(listener)
-		return
-	}
-	// So the peer's `accept` comes back to look at `stop`.
-	_ = net.set_option(listener, .Receive_Timeout, 50 * time.Millisecond)
-	bound, berr := net.bound_endpoint(listener)
-	if berr != nil {
-		net.close(listener)
-		return
-	}
-	return listener, bound.port, true
-}
-
 @(private = "file")
 Stall_Rig :: struct {
 	peer:      Stall_Peer,
@@ -160,7 +132,9 @@ socket's own send timeout, and the cap on `pipe_framing_deadline`.
 */
 @(private = "file")
 stall_rig :: proc(t: ^testing.T, r: ^Stall_Rig, mode: Stall_Mode, drain_at, timeout: time.Duration) -> bool {
-	listener, port, ok := stall_listener()
+	// Short, so the peer's `accept` comes back to look at `stop`.
+	listener, bound, ok := testkit.stall_listener(50 * time.Millisecond)
+	port := bound.port
 	if !ok {
 		testing.expectf(t, false, "cannot listen on loopback")
 		return false
@@ -188,36 +162,11 @@ stall_rig :: proc(t: ^testing.T, r: ^Stall_Rig, mode: Stall_Mode, drain_at, time
 		return false
 	}
 	r.c = c
-	if !stall_set_buffer(c.stream.socket, .SNDBUF) {
+	if !testkit.shrink_buffer(c.stream.socket, .SNDBUF) {
 		testing.expectf(t, false, "cannot shrink the pipe's send buffer")
 		return false
 	}
 	return true
-}
-
-/*
-Shrink a socket buffer to the kernel's floor, and say whether it took.
-
-Through `setsockopt` rather than `net.set_option`, whose buffer-size option
-binds the value in a `case` listing several types, where it stays an `any`,
-and hands the kernel the `any`'s data pointer as the size - megabytes, with
-which no `send` here ever waits.
-Read back for the same reason: a setting that did not take reads as a test
-that passes with nothing blocked.
-*/
-@(private = "file")
-stall_set_buffer :: proc(socket: net.TCP_Socket, option: posix.Sock_Option) -> bool {
-	want: i32 = 2048
-	if posix.setsockopt(posix.FD(socket), i32(posix.SOL_SOCKET), option, &want, posix.socklen_t(size_of(want))) != .OK {
-		return false
-	}
-	got: i32
-	size := posix.socklen_t(size_of(got))
-	if posix.getsockopt(posix.FD(socket), i32(posix.SOL_SOCKET), option, &got, &size) != .OK {
-		return false
-	}
-	// Linux doubles what it is given and holds it at a floor of a few KB.
-	return got <= 16 * 1024
 }
 
 @(private = "file")

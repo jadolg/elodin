@@ -167,7 +167,7 @@ test_a_cached_answer_carries_no_option_the_upstream_sent :: proc(t: ^testing.T) 
 	// leak here and a leak on the hit are the same leak seen twice.
 	expect_no_upstream_options(t, filled, "the forwarded answer")
 
-	hit, outcome, ok := handle_query(&h.srv, client_query(), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	hit, outcome, ok := handle_query(&h.srv, client_query(), .UDP, TEST_CLIENT, context.temp_allocator)
 	testing.expect(t, ok, "the cached query went unanswered")
 	testing.expect_value(t, outcome, Outcome.Cached)
 

@@ -136,7 +136,8 @@ OOM_SWEEP_MAX :: 16384
 
 /*
 An allocator that refuses `fail_for` requests from its `fail_at`th on and
-grants every other one from `arena`.
+grants every other one from `arena`. `testkit.Fail_Nth` is the other packages'
+copy; `testkit` imports this package, so its tests cannot import `testkit`.
 
 An arena that runs dry refuses everything after the first refusal too, so a
 check missing at one allocation is covered by whichever check comes next. This

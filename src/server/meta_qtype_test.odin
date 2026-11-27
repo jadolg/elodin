@@ -25,7 +25,7 @@ expect_meta_answer :: proc(t: ^testing.T, h: ^Harness, c: Meta_Case) {
 	if c.forwarded {
 		out, outcome, ok, asked = harness_ask(h, query, test_reply("example.com.", c.type))
 	} else {
-		out, outcome, ok = handle_query(&h.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+		out, outcome, ok = handle_query(&h.srv, query, .UDP, TEST_CLIENT, context.temp_allocator)
 		asked = !mock_untouched(h.socket, query)
 	}
 	testing.expectf(t, asked == c.forwarded, "type %d: forwarded = %v", u16(c.type), asked)

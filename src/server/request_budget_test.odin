@@ -3,6 +3,7 @@ package server
 import "core:mem"
 import "core:testing"
 import "elodin:dns"
+import "elodin:dnssec"
 
 /*
 Issue #354: a request reads far more than one message, so the decoder's budget
@@ -26,7 +27,7 @@ here is that the request's own procedures charge the one counter.
 // What one request can hold: two readings in `decode_answer`, one in
 // `fit_response`, and `dnssec.MAX_LOOKUPS_PER_QUERY` chain lookups.
 @(private = "file")
-READINGS :: 35
+READINGS :: 2 + 1 + dnssec.MAX_LOOKUPS_PER_QUERY
 
 /*
 A reply that spends a whole reading's budget out of a few kilobytes of wire.
@@ -53,7 +54,10 @@ budget_bomb :: proc(answer_records := 0) -> []u8 {
 	// What one of these names costs once escaped, read rather than written
 	// down, so the fixture follows `dns.NAME_BUDGET` wherever the escaping
 	// goes. Two a record, and one record past the budget.
-	owner, _, _ := dns.decode_name(msg[dns.HEADER_SIZE:], 0)
+	owner, _, nerr := dns.decode_name(msg[dns.HEADER_SIZE:], 0)
+	if nerr != .None {
+		panic("the bomb's owner name does not decode")
+	}
 	defer delete(owner)
 
 	count := 0
@@ -112,11 +116,11 @@ test_the_readings_of_one_request_share_one_name_budget :: proc(t: ^testing.T) {
 
 	spent: int
 	// Each call reads the whole message, fails, and reads the answer section
-	// again: two of the thirty-five, and `fit_response` is the last one.
+	// again: two of `READINGS`, and `fit_response` is the last one.
 	for _ in 0 ..< (READINGS - 1) / 2 {
 		decode_answer(msg, true, &spent, a)
 	}
-	fit_response(msg, 512, dns.Message{question = BOMB_QUESTION}, &spent, a)
+	fit_response(msg, dns.MAX_UDP_SIZE, dns.Message{question = BOMB_QUESTION}, &spent, a)
 
 	testing.expectf(
 		t,

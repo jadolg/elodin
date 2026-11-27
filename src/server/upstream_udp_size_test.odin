@@ -77,11 +77,11 @@ forward_and_read_size :: proc(t: ^testing.T, query: []u8) -> (advertised: u16, o
 }
 
 /*
-The reproducer: a client advertising 65000, and what the upstream is told.
+A client advertising 65000, and what the upstream is told.
 
 65000 is a figure no stub has any business sending and every stub is free to
-send - `dig +bufsize` caps itself, so the report that found this used a raw
-socket, and so does this by building the message directly.
+send - `dig +bufsize` caps itself, so this builds the message directly, as a raw
+socket would send it.
 */
 @(test)
 test_a_clients_edns_payload_size_is_not_forwarded_upstream :: proc(t: ^testing.T) {
@@ -99,7 +99,7 @@ test_a_clients_edns_payload_size_is_not_forwarded_upstream :: proc(t: ^testing.T
 	}
 	// The literal rather than `UPSTREAM_UDP_SIZE`: the figure is RFC 9715's and
 	// a case reading the constant back would pass at any value the constant
-	// took, including the 4096 this is here to have moved off.
+	// took, 4096 among them.
 	testing.expectf(
 		t,
 		advertised == 1232,
@@ -118,7 +118,7 @@ for 512 instead turns every answer over it into a TC=1 and a TCP retry upstream.
 */
 @(test)
 test_a_smaller_client_payload_size_is_asked_for_with_ours :: proc(t: ^testing.T) {
-	for query in ([][]u8{client_query(512), client_query(0, edns = false)}) {
+	for query in ([][]u8{client_query(dns.MAX_UDP_SIZE), client_query(0, edns = false)}) {
 		if !testing.expect(t, len(query) > dns.HEADER_SIZE, "the query did not encode") {
 			return
 		}
@@ -149,7 +149,9 @@ test_the_validating_query_advertises_the_flag_day_size :: proc(t: ^testing.T) {
 		dns.peek_udp_size(wire),
 	)
 	out, oerr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, oerr, dns.Decode_Error.None)
+	if !testing.expect_value(t, oerr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect(t, out.flags.cd, "the validating query lost CD")
 	testing.expect(t, dns.edns_do(out), "the validating query lost DO")
 	if testing.expect(t, len(out.question) == 1, "the validating query lost the question") {
@@ -181,7 +183,9 @@ test_a_client_cannot_push_the_upstream_payload_size_down :: proc(t: ^testing.T) 
 	// that went out without one.
 	testing.expect_value(t, dns.peek_udp_size(query), u16(0))
 	msg, derr := dns.decode_message(query, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect(t, dns.edns_present(msg), "the fixture lost its opt record")
 
 	advertised, ok := forward_and_read_size(t, query)
@@ -256,7 +260,7 @@ test_a_query_carrying_an_opt_outside_the_additional_section_is_refused :: proc(t
 
 	// No mock thread: nothing may be forwarded, and `mock_untouched` reads the
 	// socket after the call has returned rather than racing it.
-	out, outcome, answered := handle_query(&h.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, answered := handle_query(&h.srv, query, .UDP, TEST_CLIENT, context.temp_allocator)
 	testing.expect(t, mock_untouched(h.socket, query), "the decoy was forwarded to the upstream")
 	if !testing.expect(t, answered, "nothing came back at all") {
 		return
@@ -269,7 +273,9 @@ test_a_query_carrying_an_opt_outside_the_additional_section_is_refused :: proc(t
 		dns.peek_rcode(out),
 	)
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect_value(t, decoded.id, CLIENT_ID)
 
 	free_all(context.temp_allocator)

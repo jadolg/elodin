@@ -59,12 +59,12 @@ test_cache_keys_are_as_long_as_the_name :: proc(t: ^testing.T) {
 		testing.expect(t, !answer_from_cache(&st), "an RD=1 miss with no cache was not handed on")
 
 		want_buf: [cache.KEY_MAX]u8
-		want := cache.make_key(want_buf[:], name, .AAAA, .IN, false, true, policy = live(&s).policy)
+		want := cache.make_key(want_buf[:], name, .AAAA, .IN, false, checking_disabled = true, policy = live(&s).policy)
 		testing.expect_value(t, st.key, want)
 		testing.expect_value(t, len(st.key), len(name) + cache.KEY_TAIL)
 
 		want_verdict_buf: [cache.KEY_MAX]u8
-		want_verdict := cache.make_key(want_verdict_buf[:], name, .AAAA, .IN, false, true, verdict = true, policy = live(&s).policy)
+		want_verdict := cache.make_key(want_verdict_buf[:], name, .AAAA, .IN, false, checking_disabled = true, verdict = true, policy = live(&s).policy)
 		testing.expect_value(t, st.verdict_key, want_verdict)
 	}
 }

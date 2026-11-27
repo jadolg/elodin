@@ -10,6 +10,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 RST_STREAM(REFUSED_STREAM) says the server never processed the request - RFC
@@ -277,12 +278,12 @@ the upstream, and not an empty answer.
 */
 @(test)
 test_a_doh_answer_without_room_is_this_servers :: proc(t: ^testing.T) {
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		backing  = context.temp_allocator,
 		fail_at  = 1,
 		fail_for = 1,
 	}
-	err, headers := exchange_with_refusals(t, 0, fail_nth(&f))
+	err, headers := exchange_with_refusals(t, 0, testkit.fail_nth(&f))
 	testing.expect_value(t, err, Error.Out_Of_Memory)
 	testing.expect_value(t, headers, 1)
 	testing.expect_value(t, f.seen, 1)

@@ -1,8 +1,10 @@
 package server
 
+import "base:runtime"
 import "core:bytes"
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "elodin:tlsx"
@@ -17,8 +19,12 @@ sign the same thing twice, sign at a rate an attacker chooses, or hand out
 anything at all once the certificate it would be signed with has expired.
 */
 
+// This run's own directory for the pairs below, by pid, so two runs at once do
+// not race `openssl` over one set of files. It and the paths
+// in it are on the heap, not a test's tracked allocator: they outlive the test
+// that happens to make them.
 @(private = "file")
-CERT_DIR :: "/tmp/elodin-server-profile-test"
+cert_dir: string
 
 @(private = "file")
 cert_once: sync.Once
@@ -58,23 +64,25 @@ wild_key_path: string
 
 @(private = "file")
 generate_certs :: proc() {
-	if !os.exists(CERT_DIR) {
-		if err := os.make_directory(CERT_DIR); err != nil {
+	sweep_ended_runs()
+	cert_dir = fmt.aprintf("%s%d", CERT_DIR_PREFIX, os.get_pid(), allocator = runtime.heap_allocator())
+	if !os.exists(cert_dir) {
+		if err := os.make_directory(cert_dir); err != nil {
 			return
 		}
 	}
-	cert_path = CERT_DIR + "/cert.pem"
-	key_path = CERT_DIR + "/key.pem"
-	second_cert_path = CERT_DIR + "/cert2.pem"
-	second_key_path = CERT_DIR + "/key2.pem"
+	cert_path = fmt.aprintf("%s/cert.pem", cert_dir, allocator = runtime.heap_allocator())
+	key_path = fmt.aprintf("%s/key.pem", cert_dir, allocator = runtime.heap_allocator())
+	second_cert_path = fmt.aprintf("%s/cert2.pem", cert_dir, allocator = runtime.heap_allocator())
+	second_key_path = fmt.aprintf("%s/key2.pem", cert_dir, allocator = runtime.heap_allocator())
 	if !make_cert(cert_path, key_path) {
 		return
 	}
 	if !make_cert(second_cert_path, second_key_path) {
 		return
 	}
-	wild_cert_path = CERT_DIR + "/wild.pem"
-	wild_key_path = CERT_DIR + "/wild-key.pem"
+	wild_cert_path = fmt.aprintf("%s/wild.pem", cert_dir, allocator = runtime.heap_allocator())
+	wild_key_path = fmt.aprintf("%s/wild-key.pem", cert_dir, allocator = runtime.heap_allocator())
 	if !make_cert(wild_cert_path, wild_key_path, "*.elodin.test") {
 		return
 	}
@@ -131,12 +139,35 @@ make_cert :: proc(cert, key: string, name := "") -> bool {
 }
 
 // Generated once per run: `mobileconfig_test` and `metrics_test` drive the same
-// certificate through `make_test_profile_signer`, and `reload_tls_test` loads
-// it directly, and a second copy of the generation would be a second `openssl`
+// certificate through `make_test_profile_signer`, and `reload_tls_test` and
+// `stream_queries_test` load it directly, and a second copy of the generation would be a second `openssl`
 // racing this one over its own output files.
 ensure_profile_certs :: proc() -> (cert, key: string, ok: bool) {
 	sync.once_do(&cert_once, generate_certs)
 	return cert_path, key_path, cert_ok
+}
+
+// Where each run's certificate directory goes, its pid appended.
+@(private = "file")
+CERT_DIR_PREFIX :: "/tmp/elodin-server-profile-test-"
+
+/*
+Remove the certificate directories of runs that have ended. The test runner
+leaves through `exit`, which runs neither `@(fini)` nor `atexit` handlers, so a
+run cannot remove its own; the next one removes every one whose pid is gone.
+*/
+@(private = "file")
+sweep_ended_runs :: proc() {
+	entries, err := os.read_all_directory_by_path("/tmp", context.temp_allocator)
+	if err != nil {
+		return
+	}
+	for e in entries {
+		if !strings.has_prefix(e.fullpath, CERT_DIR_PREFIX) || os.exists(fmt.tprintf("/proc/%s", e.fullpath[len(CERT_DIR_PREFIX):])) {
+			continue
+		}
+		_ = os.remove_all(e.fullpath) // lint:allow a directory left behind is only the next sweep's
+	}
 }
 
 // How many profiles `p`'s cache holds.
@@ -318,7 +349,10 @@ test_profile_cache_is_dropped_when_the_certificate_rotates :: proc(t: ^testing.T
 	defer tlsx.context_destroy(ctx)
 	defer destroy_profile_signer(p)
 
-	before, _ := profile_for_host(p, "elodin.local", at(0), context.temp_allocator)
+	before, bstatus := profile_for_host(p, "elodin.local", at(0), context.temp_allocator)
+	if !testing.expect_value(t, bstatus, Profile_Status.OK) {
+		return
+	}
 	testing.expect_value(t, sync.atomic_load(&p.signed_total), u64(1))
 
 	fresh, ferr := tlsx.server_context(second_cert_path, second_key_path)

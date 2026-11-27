@@ -1,6 +1,7 @@
 package server
 
 import "core:net"
+import "core:slice"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -71,62 +72,67 @@ superseded_cases :: proc() -> []Superseded_Case {
 	tracker :: "tracker.evil.example."
 	chain := dns.Record{name = STALE_NAME, type = .CNAME, class = .IN, data = dns.Rdata_Name{name = tracker}}
 	private := a_record(STALE_NAME, {10, 0, 0, 1}, 300)
-	cases := make([]Superseded_Case, 14, context.temp_allocator)
-	cases[0] = {name = "a TTL-0 answer", reply = test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR, 0))}
-	cases[1] = {name = "a NODATA without a SOA", reply = test_reply(STALE_NAME, .A)}
-	cases[2] = {name = "an NXDOMAIN without a SOA", reply = test_reply(STALE_NAME, .A, rcode = .NX_Domain)}
-	cases[3] = {name = "a SERVFAIL", reply = test_reply(STALE_NAME, .A, rcode = .Serv_Fail), kept = true}
-	cases[4] = {name = "a REFUSED", reply = test_reply(STALE_NAME, .A, rcode = .Refused), kept = true}
-	cases[5] = {
-		name  = "a TTL-0 chain to a listed name",
-		reply = test_reply(STALE_NAME, .A, chain, a_record(tracker, LIVE_ADDR, 0)),
-		block = "tracker.evil.example",
-	}
-	cases[6] = {name = "a private address", reply = test_reply(STALE_NAME, .A, private), rebind = true}
-	// RFC 2308 section 2.1: a name error carries the chain and nothing else, so
-	// this one contradicts itself and is no answer to supersede anything with.
-	cases[7] = {
-		name  = "an NXDOMAIN carrying an address",
-		reply = test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR, 300), rcode = .NX_Domain),
-		kept  = true,
-	}
-	cases[8] = {
-		name   = "an NXDOMAIN carrying a private address",
-		reply  = test_reply(STALE_NAME, .A, private, rcode = .NX_Domain),
-		kept   = true,
-		rebind = true,
-	}
-	// Neither is read in full, which is no answer to supersede anything with.
-	cases[9] = {
-		name  = "a TTL-0 answer with junk after it",
-		reply = superseded_junk(test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR, 0))),
-		kept  = true,
-	}
-	cases[10] = {
-		name   = "a private address with junk after it",
-		reply  = superseded_junk(test_reply(STALE_NAME, .A, private)),
-		kept   = true,
-		rebind = true,
-	}
-	// RFC 4034 section 3.1.5: not to be used, so no answer either.
-	cases[11] = {
-		name   = "a private address whose signature lapsed",
-		reply  = test_reply(STALE_NAME, .A, private, superseded_lapsed_rrsig()),
-		kept   = true,
-		rebind = true,
-	}
-	// An answer section with nothing at the question name answers nothing
-	// that was asked, which the cache reads as a denial and rebind refuses.
-	cases[12] = {
-		name  = "a NOERROR about another name",
-		reply = test_reply(STALE_NAME, .A, a_record("other.example.", LIVE_ADDR, 300)),
-		kept  = true,
-	}
-	cases[13] = {
-		name   = "a private address at another name",
-		reply  = test_reply(STALE_NAME, .A, a_record("other.example.", {10, 0, 0, 1}, 300)),
-		kept   = true,
-		rebind = true,
+	// Copied out of this frame, where the literal lives.
+	cases, err := slice.clone([]Superseded_Case {
+		{name = "a TTL-0 answer", reply = test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR, 0))},
+		{name = "a NODATA without a SOA", reply = test_reply(STALE_NAME, .A)},
+		{name = "an NXDOMAIN without a SOA", reply = test_reply(STALE_NAME, .A, rcode = .NX_Domain)},
+		{name = "a SERVFAIL", reply = test_reply(STALE_NAME, .A, rcode = .Serv_Fail), kept = true},
+		{name = "a REFUSED", reply = test_reply(STALE_NAME, .A, rcode = .Refused), kept = true},
+		{
+			name  = "a TTL-0 chain to a listed name",
+			reply = test_reply(STALE_NAME, .A, chain, a_record(tracker, LIVE_ADDR, 0)),
+			block = "tracker.evil.example",
+		},
+		{name = "a private address", reply = test_reply(STALE_NAME, .A, private), rebind = true},
+		// RFC 2308 section 2.1: a name error carries the chain and nothing else, so
+		// this one contradicts itself and is no answer to supersede anything with.
+		{
+			name  = "an NXDOMAIN carrying an address",
+			reply = test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR, 300), rcode = .NX_Domain),
+			kept  = true,
+		},
+		{
+			name   = "an NXDOMAIN carrying a private address",
+			reply  = test_reply(STALE_NAME, .A, private, rcode = .NX_Domain),
+			kept   = true,
+			rebind = true,
+		},
+		// Neither is read in full, which is no answer to supersede anything with.
+		{
+			name  = "a TTL-0 answer with junk after it",
+			reply = superseded_junk(test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR, 0))),
+			kept  = true,
+		},
+		{
+			name   = "a private address with junk after it",
+			reply  = superseded_junk(test_reply(STALE_NAME, .A, private)),
+			kept   = true,
+			rebind = true,
+		},
+		// RFC 4034 section 3.1.5: not to be used, so no answer either.
+		{
+			name   = "a private address whose signature lapsed",
+			reply  = test_reply(STALE_NAME, .A, private, superseded_lapsed_rrsig()),
+			kept   = true,
+			rebind = true,
+		},
+		// An answer section with nothing at the question name answers nothing
+		// that was asked, which the cache reads as a denial and rebind refuses.
+		{
+			name  = "a NOERROR about another name",
+			reply = test_reply(STALE_NAME, .A, a_record("other.example.", LIVE_ADDR, 300)),
+			kept  = true,
+		},
+		{
+			name   = "a private address at another name",
+			reply  = test_reply(STALE_NAME, .A, a_record("other.example.", {10, 0, 0, 1}, 300)),
+			kept   = true,
+			rebind = true,
+		},
+	}, context.temp_allocator)
+	if err != nil {
+		panic("the cases could not be copied")
 	}
 	return cases
 }
@@ -157,13 +163,16 @@ run_superseded :: proc(t: ^testing.T, c: Superseded_Case, detached: bool) {
 	// On the detached road the reply waits for the client to have been lent
 	// the copy, so it reaches the cache alone; prompt where the client waits.
 	lent: sync.Sema
-	x := Stale_Exchange {
+	x := Canned_Mock {
 		socket = f.socket,
 		reply  = c.reply,
 		hold   = &lent if detached else nil,
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
-	_, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
+	if !testing.expectf(t, mock != nil, "%s: no mock thread", c.name) {
+		return
+	}
+	_, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	sync.sema_post(&lent)
 	thread.join(mock)
 	thread.destroy(mock)
@@ -207,6 +216,8 @@ Tcp_Superseded :: struct {
 	listener: net.TCP_Socket,
 	reply:    []u8,
 	got:      bool,
+	// Whether the reply went out, so a lost send is not read as the store's doing.
+	served:   bool,
 }
 
 // Answer one query over TCP, with the TC bit set on the reply.
@@ -217,12 +228,14 @@ serve_one_truncated :: proc(x: ^Tcp_Superseded) {
 		return
 	}
 	defer net.close(conn)
-	_ = net.set_option(conn, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	if net.set_option(conn, .Receive_Timeout, MOCK_RECV_TIMEOUT) != nil {
+		return
+	}
 	length: [2]u8
 	if n, err := net.recv_tcp(conn, length[:]); err != nil || n != 2 {
 		return
 	}
-	buf: [512]u8
+	buf: [dns.MAX_UDP_SIZE]u8
 	want := int(length[0]) << 8 | int(length[1])
 	got := 0
 	for got < want && want <= len(buf) {
@@ -236,12 +249,16 @@ serve_one_truncated :: proc(x: ^Tcp_Superseded) {
 		return
 	}
 	x.got = true
-	out: [514]u8
+	out: [2 + dns.MAX_UDP_SIZE]u8
+	if len(x.reply) > dns.MAX_UDP_SIZE {
+		return
+	}
 	out[0], out[1] = u8(len(x.reply) >> 8), u8(len(x.reply))
 	copy(out[2:], x.reply)
 	out[2], out[3] = buf[0], buf[1]
 	out[4] |= 0x02 // TC
-	_, _ = net.send_tcp(conn, out[:2 + len(x.reply)])
+	_, serr := net.send_tcp(conn, out[:2 + len(x.reply)])
+	x.served = serr == nil
 }
 
 
@@ -271,7 +288,9 @@ run_truncated :: proc(t: ^testing.T, reply: []u8, rebind: bool) {
 	defer net.close(listener)
 	// Bounds the accept, so a resolver that never connects fails the test
 	// rather than hanging the join.
-	_ = net.set_option(listener, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	if !set_wait(t, listener, .Receive_Timeout, MOCK_RECV_TIMEOUT) {
+		return
+	}
 	bound, berr := net.bound_endpoint(listener)
 	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
 		return
@@ -296,15 +315,15 @@ run_truncated :: proc(t: ^testing.T, reply: []u8, rebind: bool) {
 		return
 	}
 
-	x := Tcp_Superseded {
-		listener = listener,
-		reply    = reply,
-	}
+	x := Tcp_Superseded{listener = listener, reply = reply}
 	mock := thread.create_and_start_with_poly_data(&x, serve_one_truncated)
-	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	if !testing.expect(t, mock != nil, "no mock thread") {
+		return
+	}
+	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
-	testing.expectf(t, x.got, "rebind=%v: the upstream was never asked", rebind)
+	testing.expectf(t, x.got && x.served, "rebind=%v: the upstream was never asked, or its reply never went out", rebind)
 	// The premise: the TC reply reached the guard, or the client and so the store.
 	if rebind {
 		testing.expectf(t, outcome == .Blocked, "the truncated private address was not refused (%v)", outcome)

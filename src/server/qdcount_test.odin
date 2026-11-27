@@ -46,7 +46,7 @@ test_two_questions_are_formerr_with_one_echoed :: proc(t: ^testing.T) {
 		if !built {
 			return
 		}
-		out, _, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+		out, _, ok := handle_query(&s, query, .UDP, TEST_CLIENT, context.temp_allocator)
 		if !testing.expectf(t, ok && out != nil, "%s: no answer", row.what) {
 			continue
 		}

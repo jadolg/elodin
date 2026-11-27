@@ -7,6 +7,7 @@ import "core:thread"
 import "core:time"
 
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 What a refused allocation does to a connection, client and server alike: the
@@ -16,25 +17,9 @@ arena that runs dry fails every later allocation too and one check then covers
 for a missing other.
 */
 
-// Refuses `fail_for` requests from its `fail_at`th on and hands every other to
-// `backing`. src/server/out_of_memory_test.odin keeps its own copy: test files
-// cannot be shared across packages.
-@(private)
-Fail_Nth :: struct {
-	backing:  mem.Allocator,
-	seen:     int,
-	fail_at:  int,
-	fail_for: int,
-}
-
-@(private)
-fail_nth :: proc(f: ^Fail_Nth) -> mem.Allocator {
-	return {procedure = fail_nth_proc, data = f}
-}
-
 // Refuses `fail_for` requests from the `fail_at`th after this call on.
 @(private)
-arm :: proc(f: ^Fail_Nth, fail_at, fail_for: int) {
+arm :: proc(f: ^testkit.Fail_Nth, fail_at, fail_for: int) {
 	f.seen = 0
 	f.fail_at = fail_at
 	f.fail_for = fail_for
@@ -43,31 +28,8 @@ arm :: proc(f: ^Fail_Nth, fail_at, fail_for: int) {
 // Whether a refusal fell inside the armed run: past it, a sweep has refused
 // every allocation once.
 @(private)
-refused_any :: proc(f: ^Fail_Nth) -> bool {
+refused_any :: proc(f: ^testkit.Fail_Nth) -> bool {
 	return f.seen >= f.fail_at
-}
-
-@(private)
-fail_nth_proc :: proc(
-	data: rawptr,
-	mode: mem.Allocator_Mode,
-	size, alignment: int,
-	old_memory: rawptr,
-	old_size: int,
-	loc := #caller_location,
-) -> (
-	[]byte,
-	mem.Allocator_Error,
-) {
-	f := cast(^Fail_Nth)data
-	#partial switch mode {
-	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
-		f.seen += 1
-		if f.seen >= f.fail_at && f.seen < f.fail_at + f.fail_for {
-			return nil, .Out_Of_Memory
-		}
-	}
-	return f.backing.procedure(f.backing.data, mode, size, alignment, old_memory, old_size, loc)
 }
 
 // The runs of refusals each sweep is made with.
@@ -99,17 +61,17 @@ test_a_frame_with_no_room_for_its_payload_is_not_read :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	wire := [FRAME_HEADER_SIZE + 8]u8{0, 0, 8, u8(Frame_Type.Ping), 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8}
 
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		backing = context.temp_allocator,
 	}
-	h, payload, refuse, ok, unread := read_with(wire[:], fail_nth(&f))
+	h, payload, refuse, ok, unread := read_with(wire[:], testkit.fail_nth(&f))
 	testing.expectf(t, ok && refuse == nil, "a PING with room for it was not read: %v", refuse)
 	testing.expect_value(t, h.type, Frame_Type.Ping)
 	testing.expectf(t, string(payload) == string(wire[FRAME_HEADER_SIZE:]), "payload %v", payload)
 	testing.expect_value(t, unread, 0)
 
 	arm(&f, 1, 1)
-	dry_h, dry_payload, dry_refuse, dry_ok, dry_unread := read_with(wire[:], fail_nth(&f))
+	dry_h, dry_payload, dry_refuse, dry_ok, dry_unread := read_with(wire[:], testkit.fail_nth(&f))
 	testing.expectf(t, !dry_ok && dry_payload == nil, "a %v without room for its payload was read, %d bytes left", dry_h.type, dry_unread)
 	code, bad := dry_refuse.?
 	testing.expectf(t, bad && code == .Internal_Error, "drew %v", dry_refuse)
@@ -153,12 +115,12 @@ test_a_frame_with_no_room_is_not_built :: proc(t: ^testing.T) {
 	}
 
 	for end_stream in ([]bool{true, false}) {
-		f := Fail_Nth {
+		f := testkit.Fail_Nth {
 			backing = context.temp_allocator,
 		}
 		data, headers, refused_data, refused_headers: []u8
 		{
-			context.temp_allocator = fail_nth(&f)
+			context.temp_allocator = testkit.fail_nth(&f)
 			data = data_frame(1, chunk, end_stream = end_stream)
 			headers = headers_frame(3, chunk, end_stream = end_stream)
 			arm(&f, 1, 1)
@@ -181,10 +143,10 @@ block decoded without it would leave HPACK out of step with the peer's encoder.
 @(test)
 test_a_continuation_with_no_room_is_not_added :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		backing = context.temp_allocator,
 	}
-	block := make([dynamic]u8, 0, 0, fail_nth(&f))
+	block := make([dynamic]u8, 0, 0, testkit.fail_nth(&f))
 	payload := []u8{0x82, 0x86}
 	h := Frame_Header {
 		length    = len(payload),
@@ -225,13 +187,13 @@ test_an_entry_the_table_has_no_room_for_fails_the_block :: proc(t: ^testing.T) {
 	refusals := 0
 	for run in RUNS {
 		for at in 1 ..= MAX_SWEEP {
-			f := Fail_Nth {
+			f := testkit.Fail_Nth {
 				backing = allocator,
 			}
 			table: Dynamic_Table
 			// Built with no room for its entry list, so the add has to grow it.
 			arm(&f, 1, 1)
-			dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, fail_nth(&f))
+			dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE, testkit.fail_nth(&f))
 			testing.expect_value(t, cap(table.entries), 0)
 
 			arm(&f, at, run)
@@ -283,11 +245,11 @@ test_a_header_list_with_no_room_is_not_decoded :: proc(t: ^testing.T) {
 			for at in 1 ..= MAX_SWEEP {
 				table: Dynamic_Table
 				dynamic_table_init(&table, DEFAULT_HEADER_TABLE_SIZE)
-				f := Fail_Nth {
+				f := testkit.Fail_Nth {
 					backing = context.temp_allocator,
 				}
 				arm(&f, at, run)
-				headers, err := decode(&table, block, fail_nth(&f))
+				headers, err := decode(&table, block, testkit.fail_nth(&f))
 				dynamic_table_destroy(&table)
 				if refused_any(&f) {
 					refusals += 1
@@ -362,10 +324,10 @@ serve_one :: proc(
 	refused: bool,
 ) {
 	block := request_block()
-	hf := Fail_Nth {
+	hf := testkit.Fail_Nth {
 		backing = allocator,
 	}
-	tf := Fail_Nth {
+	tf := testkit.Fail_Nth {
 		backing = context.temp_allocator,
 	}
 	log: Frame_Log
@@ -374,7 +336,7 @@ serve_one :: proc(
 	seen: Seen_Requests
 
 	arm(&hf, setup[0], setup[1])
-	c := make_conn(IO{user = &log, read = no_read, write = log_write}, check_request, &seen, fail_nth(&hf))
+	c := make_conn(IO{user = &log, read = no_read, write = log_write}, check_request, &seen, testkit.fail_nth(&hf))
 	if c == nil {
 		return .Not_Made, false
 	}
@@ -386,7 +348,7 @@ serve_one :: proc(
 	flags := u8(FLAG_END_STREAM) | (u8(FLAG_END_HEADERS) if end_headers else 0)
 	ok: bool
 	{
-		context.temp_allocator = fail_nth(&tf)
+		context.temp_allocator = testkit.fail_nth(&tf)
 		ok = handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = flags, stream_id = 1}, block)
 	}
 	refused = heap[1] > 0 && refused_any(&hf) || temp[1] > 0 && refused_any(&tf)
@@ -473,13 +435,13 @@ test_a_request_body_without_room_is_refused :: proc(t: ^testing.T) {
 	body := make([]u8, CREDIT_BATCH, context.temp_allocator)
 
 	for refuse in ([]bool{false, true}) {
-		f := Fail_Nth {
+		f := testkit.Fail_Nth {
 			backing = allocator,
 		}
 		log: Frame_Log
 		log.frames = make([dynamic]Frame_Header, 0, 8, allocator)
 		seen: Seen_Requests
-		c := make_conn(IO{user = &log, read = no_read, write = log_write}, check_request, &seen, fail_nth(&f))
+		c := make_conn(IO{user = &log, read = no_read, write = log_write}, check_request, &seen, testkit.fail_nth(&f))
 		if !testing.expect(t, c != nil, "cannot make the connection") {
 			delete(log.frames)
 			return
@@ -569,13 +531,13 @@ test_a_response_without_room_is_reset_not_cut_short :: proc(t: ^testing.T) {
 				return
 			}
 			clear(&h.written)
-			f := Fail_Nth {
+			f := testkit.Fail_Nth {
 				backing = context.temp_allocator,
 			}
 			arm(&f, at, run if at > 0 else 0)
 			sent: bool
 			{
-				context.temp_allocator = fail_nth(&f)
+				context.temp_allocator = testkit.fail_nth(&f)
 				sent = respond(c, 1, resp)
 			}
 			frames, parsed := written_frames(&h)
@@ -637,14 +599,14 @@ test_a_client_without_room_is_not_made :: proc(t: ^testing.T) {
 		read  = no_read,
 		write = log_write,
 	}
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		backing = allocator,
 	}
 	arm(&f, 1, 1)
-	testing.expect(t, client_make(io, fail_nth(&f)) == nil, "a client with no room for itself was made")
+	testing.expect(t, client_make(io, testkit.fail_nth(&f)) == nil, "a client with no room for itself was made")
 	testing.expect_value(t, len(log.frames), 0)
 
-	c := client_make(io, fail_nth(&f))
+	c := client_make(io, testkit.fail_nth(&f))
 	if !testing.expect(t, c != nil, "a client with room was not made") {
 		delete(log.frames)
 		return
@@ -682,17 +644,17 @@ test_a_response_without_room_fails_as_this_ends :: proc(t: ^testing.T) {
 	for sweep_temp in ([]bool{false, true}) {
 		for run in RUNS {
 			for at in 1 ..= MAX_SWEEP {
-				hf := Fail_Nth {
+				hf := testkit.Fail_Nth {
 					backing = allocator,
 				}
-				tf := Fail_Nth {
+				tf := testkit.Fail_Nth {
 					backing = context.temp_allocator,
 				}
 				log: Frame_Log
 				log.frames = make([dynamic]Frame_Header, 0, 8, allocator)
 				// The header scratch is the client's third allocation.
 				arm(&hf, 3, 1)
-				c := client_make(IO{user = &log, read = no_read, write = log_write}, fail_nth(&hf))
+				c := client_make(IO{user = &log, read = no_read, write = log_write}, testkit.fail_nth(&hf))
 				if !testing.expect(t, c != nil && cap(c.header_scratch) == 0, "cannot make a client short of its scratch") {
 					delete(log.frames)
 					return
@@ -701,7 +663,7 @@ test_a_response_without_room_fails_as_this_ends :: proc(t: ^testing.T) {
 				s := open_test_stream(c, 1, allocator)
 				// The stream's body grows into the client's allocator.
 				delete(s.body)
-				s.body = make([dynamic]u8, 0, 0, fail_nth(&hf))
+				s.body = make([dynamic]u8, 0, 0, testkit.fail_nth(&hf))
 
 				arm(&hf, 0, 0)
 				arm(&tf, 0, 0)
@@ -712,7 +674,7 @@ test_a_response_without_room_fails_as_this_ends :: proc(t: ^testing.T) {
 				}
 				headers_ok, data_ok: bool
 				{
-					context.temp_allocator = fail_nth(&tf)
+					context.temp_allocator = testkit.fail_nth(&tf)
 					headers_ok = client_handle_headers(c, Frame_Header{length = len(block), type = .Headers, flags = FLAG_END_HEADERS, stream_id = 1}, block)
 					if headers_ok {
 						data_ok = client_handle_data(c, Frame_Header{length = len(body), type = .Data, flags = FLAG_END_STREAM, stream_id = 1}, body)
@@ -799,10 +761,10 @@ test_a_request_without_room_is_not_sent_short :: proc(t: ^testing.T) {
 	for sweep_temp in ([]bool{false, true}) {
 		for run in RUNS {
 			for at in 0 ..= MAX_SWEEP {
-				hf := Fail_Nth {
+				hf := testkit.Fail_Nth {
 					backing = allocator,
 				}
-				tf := Fail_Nth {
+				tf := testkit.Fail_Nth {
 					backing = context.temp_allocator,
 				}
 				w: Tracked_Log
@@ -810,7 +772,7 @@ test_a_request_without_room_is_not_sent_short :: proc(t: ^testing.T) {
 				log.frames = make([dynamic]Frame_Header, 0, 8, allocator)
 				// The stream table is the client's second allocation.
 				arm(&hf, 2, 1)
-				c := client_make(IO{user = &w, read = no_read, write = tracked_write}, fail_nth(&hf))
+				c := client_make(IO{user = &w, read = no_read, write = tracked_write}, testkit.fail_nth(&hf))
 				if !testing.expect(t, c != nil, "cannot make the client") {
 					delete(log.frames)
 					return
@@ -823,7 +785,7 @@ test_a_request_without_room_is_not_sent_short :: proc(t: ^testing.T) {
 				}
 				err: Client_Error
 				{
-					context.temp_allocator = fail_nth(&tf)
+					context.temp_allocator = testkit.fail_nth(&tf)
 					_, err = client_request(c, req, 0, allocator)
 				}
 				refused := at > 0 && (refused_any(&tf) if sweep_temp else refused_any(&hf))
@@ -891,7 +853,7 @@ test_hpack_state_without_room_ends_the_connection_as_this_ends :: proc(t: ^testi
 			dry:   bool,
 			want:  Error_Code,
 		}{{good, true, .Internal_Error}, {bad, false, .Compression_Error}}) {
-		f := Fail_Nth {
+		f := testkit.Fail_Nth {
 			backing = allocator,
 		}
 		if c.dry {
@@ -906,7 +868,7 @@ test_hpack_state_without_room_ends_the_connection_as_this_ends :: proc(t: ^testi
 
 		slog: Frame_Log
 		sc := logged_conn(&slog, drop_request, allocator)
-		sc.decoder.allocator = fail_nth(&f)
+		sc.decoder.allocator = testkit.fail_nth(&f)
 		testing.expectf(t, !handle_headers(sc, h, c.block), "server: %v kept the connection", c.want)
 		testing.expect_value(t, slog.goaway_code, c.want)
 		// A request this end had no room to decode was not acted on, and may be
@@ -921,7 +883,7 @@ test_hpack_state_without_room_ends_the_connection_as_this_ends :: proc(t: ^testi
 		clog: Frame_Log
 		cc := logged_client(&clog, allocator)
 		s := open_test_stream(cc, 1, allocator)
-		cc.decoder.allocator = fail_nth(&f)
+		cc.decoder.allocator = testkit.fail_nth(&f)
 		testing.expectf(t, !client_handle_headers(cc, h, c.block), "client: %v kept the connection", c.want)
 		testing.expect_value(t, clog.goaway_code, c.want)
 		testing.expect_value(t, cc.dry, c.dry)
@@ -945,7 +907,7 @@ test_control_frames_need_no_room :: proc(t: ^testing.T) {
 	allocator := track_allocations(&track)
 	defer free_all(context.temp_allocator)
 	ping := [8]u8{1, 2, 3, 4, 5, 6, 7, 8}
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		backing  = context.temp_allocator,
 		fail_at  = 1,
 		fail_for = max(int) / 2,
@@ -957,7 +919,7 @@ test_control_frames_need_no_room :: proc(t: ^testing.T) {
 	cc: ^Client
 	server_ok, client_ok: [5]bool
 	{
-		context.temp_allocator = fail_nth(&f)
+		context.temp_allocator = testkit.fail_nth(&f)
 		server_ok = {
 			send_initial_settings(sc),
 			handle_frame(sc, Frame_Header{length = 8, type = .Ping}, ping[:]),
@@ -1009,13 +971,13 @@ test_a_header_block_continued_without_room_can_be_retried :: proc(t: ^testing.T)
 	block := request_block()
 	half := len(block) / 2
 	for refuse in ([]bool{false, true}) {
-		f := Fail_Nth {
+		f := testkit.Fail_Nth {
 			backing = allocator,
 		}
 		log: Frame_Log
 		log.frames = make([dynamic]Frame_Header, 0, 8, allocator)
 		seen: Seen_Requests
-		c := make_conn(IO{user = &log, read = no_read, write = log_write}, check_request, &seen, fail_nth(&f))
+		c := make_conn(IO{user = &log, read = no_read, write = log_write}, check_request, &seen, testkit.fail_nth(&f))
 		if !testing.expect(t, c != nil, "cannot make the connection") {
 			delete(log.frames)
 			return
@@ -1082,12 +1044,12 @@ test_a_frame_the_server_has_no_room_to_read_leaves_its_request_retryable :: proc
 				delete(input)
 				return
 			}
-			f := Fail_Nth {
+			f := testkit.Fail_Nth {
 				backing = context.temp_allocator,
 			}
 			arm(&f, at, run)
 			{
-				context.temp_allocator = fail_nth(&f)
+				context.temp_allocator = testkit.fail_nth(&f)
 				serve(c)
 			}
 			refused := refused_any(&f)
@@ -1114,10 +1076,10 @@ test_a_frame_the_server_has_no_room_to_read_leaves_its_request_retryable :: proc
 @(test)
 test_a_fragment_without_room_leaves_no_part_of_it :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		backing = context.temp_allocator,
 	}
-	block := make([dynamic]u8, 0, 4, fail_nth(&f))
+	block := make([dynamic]u8, 0, 4, testkit.fail_nth(&f))
 	append(&block, 1, 2)
 	arm(&f, 1, 1)
 	testing.expect(t, !append_whole(&block, []u8{3, 4, 5, 6, 7, 8}), "a fragment without room was taken")
@@ -1234,12 +1196,12 @@ test_a_continue_with_no_room_is_skipped :: proc(t: ^testing.T) {
 	allocator := track_allocations(&track)
 	log: Frame_Log
 	c := logged_conn(&log, drop_request, allocator)
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		backing = context.temp_allocator,
 	}
 	arm(&f, 1, 1 << 20)
 	saved := context.temp_allocator
-	context.temp_allocator = fail_nth(&f)
+	context.temp_allocator = testkit.fail_nth(&f)
 	carried := send_continue(c, 1)
 	context.temp_allocator = saved
 	testing.expect(t, refused_any(&f), "the premise: an allocation was refused")

@@ -7,7 +7,6 @@ import "core:sys/linux"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
-import "elodin:logx"
 import "elodin:loop"
 
 /*
@@ -24,9 +23,8 @@ with `Address_In_Use`.
 READERS :: 4
 
 // Datagrams sent, from a source port each. Enough that the kernel's 4-tuple
-// hash landing all of them on one reader is not something that happens: it is
-// `READERS * (1 - 1/READERS)^SOURCES`, which is about one run in twenty
-// million here.
+// hash landing all of them on one reader, the one way the spread below fails, is
+// not something that happens: `READERS^(1 - SOURCES)`, about 1e-38 here.
 @(private = "file")
 SOURCES :: 64
 
@@ -141,7 +139,9 @@ test_the_kernel_spreads_datagrams_over_the_readers :: proc(t: ^testing.T) {
 		}
 		clients[i] = socket
 		opened += 1
-		_ = net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+		if !set_wait(t, socket, .Receive_Timeout, 2 * time.Second) {
+			return
+		}
 	}
 
 	query: [dns.HEADER_SIZE]u8
@@ -173,7 +173,7 @@ test_the_kernel_spreads_datagrams_over_the_readers :: proc(t: ^testing.T) {
 	)
 
 	answered := 0
-	reply: [512]u8
+	reply: [dns.MAX_UDP_SIZE]u8
 	for i in 0 ..< opened {
 		n, _, err := net.recv_udp(clients[i], reply[:])
 		if err == nil && n >= dns.HEADER_SIZE {
@@ -213,13 +213,17 @@ test_one_reader_is_a_whole_listener :: proc(t: ^testing.T) {
 		return
 	}
 	defer net.close(client)
-	_ = net.set_option(client, .Receive_Timeout, 2 * time.Second)
+	if !set_wait(t, client, .Receive_Timeout, 2 * time.Second) {
+		return
+	}
 
 	query: [dns.HEADER_SIZE]u8
 	_, serr := net.send_udp(client, query[:], l.udp_bound)
-	testing.expectf(t, serr == nil, "cannot send the query: %v", serr)
+	if !testing.expectf(t, serr == nil, "cannot send the query: %v", serr) {
+		return
+	}
 
-	reply: [512]u8
+	reply: [dns.MAX_UDP_SIZE]u8
 	n, _, rerr := net.recv_udp(client, reply[:])
 	testing.expectf(t, rerr == nil, "the lone reader did not answer: %v", rerr)
 	testing.expect(t, n >= dns.HEADER_SIZE, "the answer is not a DNS message")
@@ -273,7 +277,9 @@ test_a_refused_start_drops_the_datagram_and_keeps_the_reader :: proc(t: ^testing
 		listeners = &l,
 	}
 	for i in 1 ..= 2 {
-		_, _ = net.send_udp(client, query[:], l.udp_bound)
+		if _, serr := net.send_udp(client, query[:], l.udp_bound); !testing.expectf(t, serr == nil, "datagram %d: cannot send: %v", i, serr) {
+			return
+		}
 		probe.received, probe.dropped = u64(i), u64(i)
 		if !testing.expectf(
 			t,
@@ -288,7 +294,7 @@ test_a_refused_start_drops_the_datagram_and_keeps_the_reader :: proc(t: ^testing
 	}
 	// And said, once, at warn: dropped= alone reads as the in-flight bound, whose
 	// remedy - raising max_pending - is the wrong one here.
-	testing.expect(t, sync.atomic_load(&query_spawn_reported), "a query refused a stack was not reported")
+	testing.expect(t, sync.atomic_load(&query_spawn_reported[.UDP]), "a query refused a stack was not reported")
 }
 
 /*
@@ -337,32 +343,20 @@ to itself it would let a second elodin share one with them: same effective uid,
 same address, and the kernel takes the newcomer into the group and gives it a
 quarter of the datagrams. A stale process or a unit started twice would then be
 answering production queries from whatever configuration it was handed, with
-nothing said anywhere. Before the readers existed that second start was refused,
-and this is the case that says it still is.
+nothing said anywhere. That second start is refused, and this is the case that
+says so.
 
 Asked of a listener that is running rather than of a bare socket, because the
 first half of the claim matters as much as the second: the readers have to be
 able to share the port with each other while nobody else can join them.
+
+The running one binds port 0, so no other case can hold its port first, and the
+second asks for the number the kernel gave it: `port: 0` is the one case the
+check cannot apply to, there being no port to ask about until a reader has one.
 */
 @(test)
 test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
-	// A port the kernel says is free, given up again before it is asked for by
-	// name. `port: 0` is the one case the check cannot apply to - there is no
-	// port to ask about until a reader has one - so this test needs a number.
-	probe, perr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
-	if perr != nil {
-		testing.expectf(t, false, "cannot find a free port: %v", perr)
-		return
-	}
-	bound, berr := net.bound_endpoint(probe)
-	net.close(probe)
-	if berr != nil {
-		testing.expectf(t, false, "cannot read the free port: %v", berr)
-		return
-	}
-
 	cfg := udp_listener_config(READERS)
-	cfg.listeners.udp.port = bound.port
 	tl: Test_Loop
 	if !testing.expect(t, start_test_loop(&tl), "no loop") {
 		return
@@ -374,11 +368,10 @@ test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
 
 	l: Listeners
 	if !start_listeners(&s, &l) {
-		// The port was taken between the probe and here, which is nobody's bug.
 		// The connection manager was built before the bind failed, and is given
 		// back with the rest.
 		stop_test_listeners(&l, &tl)
-		logx.infof("the free port %d was taken before the listener could bind it", bound.port)
+		testing.expect(t, false, "the running listener could not bind port 0")
 		return
 	}
 	defer stop_test_listeners(&l, &tl)
@@ -390,7 +383,7 @@ test_a_port_already_held_is_refused :: proc(t: ^testing.T) {
 	// The second server is the one this is about: a whole listener of its own,
 	// asking for a port the first one is holding.
 	second_cfg := udp_listener_config(READERS)
-	second_cfg.listeners.udp.port = bound.port
+	second_cfg.listeners.udp.port = l.udp_bound.port
 	second_tl: Test_Loop
 	if !testing.expect(t, start_test_loop(&second_tl), "no loop") {
 		return
@@ -441,12 +434,12 @@ test_a_reader_lets_its_queries_run_between_batches :: proc(t: ^testing.T) {
 		started, go: sync.Sema,
 	}
 	gate: Gate
-	_, _ = loop.spawn(tl.loops[0], proc(data: rawptr) {
+	_, spawned := loop.spawn(tl.loops[0], proc(data: rawptr) {
 		g := (^Gate)(data)
 		sync.sema_post(&g.started)
 		sync.sema_wait(&g.go)
 	}, &gate)
-	if !testing.expect(t, sync.sema_wait_with_timeout(&gate.started, 5 * time.Second), "the loop never ran") {
+	if !testing.expect(t, spawned && sync.sema_wait_with_timeout(&gate.started, 5 * time.Second), "the loop never ran") {
 		sync.sema_post(&gate.go)
 		stop_test_loop(&tl)
 		return
@@ -473,10 +466,14 @@ test_a_reader_lets_its_queries_run_between_batches :: proc(t: ^testing.T) {
 	defer net.close(client)
 	// A header and no question, answered FORMERR without a lookup.
 	query: [dns.HEADER_SIZE]u8
+	unsent := 0
 	for _ in 0 ..< SENT {
-		_, _ = net.send_udp(client, query[:], l.udp_bound)
+		if _, serr := net.send_udp(client, query[:], l.udp_bound); serr != nil {
+			unsent += 1
+		}
 	}
 	sync.sema_post(&gate.go)
+	testing.expect_value(t, unsent, 0)
 
 	// Until the reader has taken everything the kernel kept and every query it
 	// started has been answered. The queue was built before the loop was let
@@ -503,7 +500,7 @@ test_a_reader_lets_its_queries_run_between_batches :: proc(t: ^testing.T) {
 A UDP socket closes when nothing will read or answer on it any more: at once
 when its reader stops with no query of its own in flight, and otherwise when the
 last such query lets go - not after every client connection has drained, which
-left the port bound and unread, and not before, which would hand the number to
+would leave the port bound and unread, and not before, which would hand the number to
 the next socket opened while an answer was still to be written to it.
 
 Whether the port is still held is read the way a client would meet it: a plain

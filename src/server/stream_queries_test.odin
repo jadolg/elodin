@@ -2,13 +2,12 @@ package server
 
 import "core:mem"
 import "core:net"
-import "core:sys/linux"
 import "core:sync"
-import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:loop"
+import "elodin:testkit"
 import "elodin:tlsx"
 
 /*
@@ -40,57 +39,6 @@ write_job :: proc(data: rawptr) {
 	job := cast(^Write_Job)data
 	context.temp_allocator = mem.nil_allocator() if job.dry else context.temp_allocator
 	stream_write_answer(job.session, job.response)
-}
-
-// Shrink a socket buffer to the kernel's floor, and say whether it took: read
-// back, since one that did not leaves a test that stalls nothing.
-@(private = "file")
-shrink_buffer :: proc(socket: net.TCP_Socket, option: posix.Sock_Option) -> bool {
-	want: i32 = 2048
-	if posix.setsockopt(posix.FD(socket), i32(posix.SOL_SOCKET), option, &want, posix.socklen_t(size_of(want))) != .OK {
-		return false
-	}
-	got: i32
-	size := posix.socklen_t(size_of(got))
-	if posix.getsockopt(posix.FD(socket), i32(posix.SOL_SOCKET), option, &got, &size) != .OK {
-		return false
-	}
-	// Linux doubles what it is given and holds it at a floor of a few KB.
-	return got <= 16 * 1024
-}
-
-// A loopback listener whose connections advertise a window of a few KB.
-@(private = "file")
-stall_listener :: proc(t: ^testing.T) -> (listener: net.TCP_Socket, bound: net.Endpoint, ok: bool) {
-	fd, serr := linux.socket(.INET, .STREAM, {.CLOEXEC}, .TCP)
-	if !testing.expectf(t, serr == .NONE, "socket: %v", serr) {
-		return
-	}
-	listener = net.TCP_Socket(fd)
-	// Set before `listen`, so the handshake advertises it.
-	ok = testing.expect(t, shrink_buffer(listener, .RCVBUF), "cannot shrink the receive buffer")
-	if ok {
-		berr := net.bind(listener, net.Endpoint{address = net.IP4_Loopback, port = 0})
-		ok = testing.expectf(t, berr == nil, "bind: %v", berr)
-	}
-	if ok {
-		// So the accepting thread gives up on a dial that never came.
-		oerr := net.set_option(listener, .Receive_Timeout, STALL_TIMEOUT)
-		ok = testing.expectf(t, oerr == nil, "cannot bound the accept: %v", oerr)
-	}
-	if ok {
-		lerr := linux.listen(fd, 1)
-		ok = testing.expectf(t, lerr == .NONE, "listen: %v", lerr)
-	}
-	if ok {
-		berr: net.Network_Error
-		bound, berr = net.bound_endpoint(listener)
-		ok = testing.expectf(t, berr == nil, "bound_endpoint: %v", berr)
-	}
-	if !ok {
-		net.close(listener)
-	}
-	return
 }
 
 @(private = "file")
@@ -137,8 +85,8 @@ stall_pair :: proc(t: ^testing.T, p: ^Stall_Pair) -> bool {
 	if !testing.expect(t, have, "no certificate available and openssl could not make one") {
 		return false
 	}
-	listener, bound, listening := stall_listener(t)
-	if !listening {
+	listener, bound, listening := testkit.stall_listener(STALL_TIMEOUT, backlog = 1)
+	if !testing.expect(t, listening, "cannot set a stalling listener up") {
 		return false
 	}
 	defer net.close(listener)
@@ -177,7 +125,7 @@ stall_pair :: proc(t: ^testing.T, p: ^Stall_Pair) -> bool {
 	p.reader = accept.conn
 	return connected &&
 		testing.expect(t, p.reader != nil, "the accepting end never completed its handshake") &&
-		testing.expect(t, shrink_buffer(socket, .SNDBUF), "cannot shrink the send buffer")
+		testing.expect(t, testkit.shrink_buffer(socket, .SNDBUF), "cannot shrink the send buffer")
 }
 
 @(private = "file")

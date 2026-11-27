@@ -581,7 +581,7 @@ test_an_answer_stored_under_a_replaced_policy_is_not_served :: proc(t: ^testing.
 		testing.expect(t, cache.put(c, key, wire, msg), "the answer was not stored")
 	}
 	served :: proc(t: ^testing.T, s: ^Server, name: string) -> int {
-		out, _, ok := handle_query(s, test_query(name, id = 7), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		out, _, ok := handle_query(s, test_query(name, id = 7), .UDP, TEST_CLIENT, context.temp_allocator)
 		if !ok {
 			return -1
 		}

@@ -9,6 +9,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 A cookie-aware responder on loopback.
@@ -515,9 +516,9 @@ test_a_cookie_retry_without_memory_is_not_a_bad_response :: proc(t: ^testing.T) 
 		}
 		defer stop_udp_mock(&m, worker, u)
 		query := edns_query("retry.example.")
-		f := Fail_Nth{backing = context.temp_allocator, fail_at = n, fail_for = 1}
+		f := testkit.Fail_Nth{backing = context.temp_allocator, fail_at = n, fail_for = 1}
 		temp := context.temp_allocator
-		context.temp_allocator = fail_nth(&f)
+		context.temp_allocator = testkit.fail_nth(&f)
 		_, err := exchange(u, query, time.Second, temp)
 		context.temp_allocator = temp
 		free_all(context.temp_allocator)

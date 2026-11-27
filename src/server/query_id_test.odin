@@ -135,12 +135,13 @@ test_forwarded_query_id_is_not_the_client_id :: proc(t: ^testing.T) {
 	enough to be a surprise in CI and certain enough to turn up eventually. It
 	is not what this test is for. An ID carried across from the client is
 	carried across every time, so the failure being watched for is DRAWS of
-	these rather than one - and two by chance is about one run in ten million.
-	Counting them separates the two; asserting on each draw cannot.
+	these rather than one. Three or more by chance is C(32,3) / 65536^3, about
+	2e-11 of runs, under the 1e-9 this suite allows a random check. Counting
+	them separates the two; asserting on each draw cannot.
 	*/
 	testing.expectf(
 		t,
-		coincidences <= 1,
+		coincidences <= 2,
 		"%d of %d queries went upstream with the client's own transaction id %04x",
 		coincidences,
 		DRAWS,
@@ -150,12 +151,13 @@ test_forwarded_query_id_is_not_the_client_id :: proc(t: ^testing.T) {
 	/*
 	Distinctness is what makes the ID worth anything: a single fresh value
 	reused for every query afterwards is as good as the client's to an attacker
-	who has seen one answer. 32 draws from 16 bits collide about 0.8% of the
-	time, so a couple of repeats is not a failure - a handful is.
+	who has seen one answer. 32 draws from 16 bits hold C(32,2) / 65536, about
+	0.0076, colliding pairs on average; four or more is about 0.0076^4 / 24, or
+	1.4e-10 of runs, so a few repeats is not a failure - a handful is.
 	*/
 	testing.expectf(
 		t,
-		len(seen) >= DRAWS - 2,
+		len(seen) >= DRAWS - 3,
 		"only %d distinct transaction ids across %d queries",
 		len(seen),
 		DRAWS,

@@ -39,7 +39,7 @@ test_stages_hand_on_what_they_do_not_answer :: proc(t: ^testing.T) {
 	testing.expect_value(t, st.outcome, Outcome.Refused)
 	testing.expect_value(t, dns.peek_rcode(st.response), dns.Rcode.Refused)
 
-	got := resolve_query(&s, wire, msg, .UDP, "127.0.0.1:5555", 512, {}, time.tick_now(), &spent, context.temp_allocator)
+	got := resolve_query(&s, wire, msg, .UDP, TEST_CLIENT, dns.MAX_UDP_SIZE, {}, time.tick_now(), &spent, context.temp_allocator)
 	testing.expect(t, got.ok, "resolve_query built no answer")
 	testing.expect_value(t, got.outcome, Outcome.Refused)
 

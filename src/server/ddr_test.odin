@@ -26,7 +26,7 @@ test_ddr_query_is_answered_locally :: proc(t: ^testing.T) {
 	cfg: config.Config
 	s := local_server(&cfg)
 
-	out, outcome, ok := handle_query(&s, test_query("_dns.resolver.arpa.", .SVCB), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, test_query("_dns.resolver.arpa.", .SVCB), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expect(t, ok, "a DDR query went unanswered") {
 		return
 	}
@@ -51,7 +51,7 @@ test_ddr_covers_the_whole_zone :: proc(t: ^testing.T) {
 
 	names := []string{"resolver.arpa.", "_dns.resolver.arpa.", "_dNS.RESolVER.arpA.", "anything.else.resolver.arpa."}
 	for name in names {
-		out, outcome, ok := handle_query(&s, test_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		out, outcome, ok := handle_query(&s, test_query(name), .UDP, TEST_CLIENT, context.temp_allocator)
 		testing.expectf(t, ok && outcome == .Local, "%s was not answered locally", name)
 		decoded, derr := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr, dns.Decode_Error.None)
@@ -105,7 +105,7 @@ test_a_blocklist_entry_over_arpa_beats_the_ddr_answer :: proc(t: ^testing.T) {
 		&s,
 		test_query("_dns.resolver.arpa.", .SVCB),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	testing.expect(t, ok, "the blocked DDR query went unanswered")
@@ -124,7 +124,7 @@ test_a_blocklist_entry_over_arpa_beats_the_ddr_answer :: proc(t: ^testing.T) {
 		&c,
 		test_query("_dns.resolver.arpa.", .SVCB),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	testing.expect(t, plain_ok, "an unlisted DDR query went unanswered")
@@ -156,7 +156,7 @@ test_resolver_arpa_is_an_rfc_6303_zone :: proc(t: ^testing.T) {
 		{name = "_dns.resolver.arpa.", type = .SVCB},
 	}
 	for a in ASKS {
-		out, outcome, ok := handle_query(&s, test_query(a.name, a.type), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		out, outcome, ok := handle_query(&s, test_query(a.name, a.type), .UDP, TEST_CLIENT, context.temp_allocator)
 		if !testing.expectf(t, ok && outcome == .Local, "%s %v was not answered locally", a.name, a.type) {
 			continue
 		}

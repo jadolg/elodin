@@ -40,16 +40,6 @@ record_rules :: proc() -> []config.Rewrite {
 	return rules
 }
 
-// `name`'s `type` asked of a `local_server` answering from `rules`, with RD
-// clear: see `ask_local`.
-@(private = "file")
-ask :: proc(rules: []config.Rewrite, name: string, type: dns.Type) -> (dns.Message, Outcome, bool) {
-	cfg: config.Config
-	s := local_server(&cfg)
-	cfg.rewrites = rules
-	return ask_local(&s, name, type)
-}
-
 /*
 Two MX records for one name, which is the ordinary shape of an MX answer: the
 preference is what a sender sorts on, so a rule that could hold only one would
@@ -57,7 +47,7 @@ be a rule nobody with a backup mail server could use.
 */
 @(test)
 test_rewrite_answers_mx :: proc(t: ^testing.T) {
-	resp, outcome, ok := ask(record_rules(), "mail.example.", .MX)
+	resp, outcome, ok := ask_rules(record_rules(), "mail.example.", .MX)
 	if !testing.expect(t, ok, "the MX query went unanswered") {
 		return
 	}
@@ -83,7 +73,7 @@ test_rewrite_answers_mx :: proc(t: ^testing.T) {
 
 @(test)
 test_rewrite_answers_txt :: proc(t: ^testing.T) {
-	resp, _, ok := ask(record_rules(), "mail.example.", .TXT)
+	resp, _, ok := ask_rules(record_rules(), "mail.example.", .TXT)
 	if !testing.expect(t, ok, "the TXT query went unanswered") {
 		return
 	}
@@ -111,7 +101,7 @@ wire is invisible to a test that uses the same number twice.
 */
 @(test)
 test_rewrite_answers_srv :: proc(t: ^testing.T) {
-	resp, _, ok := ask(record_rules(), "mail.example.", .SRV)
+	resp, _, ok := ask_rules(record_rules(), "mail.example.", .SRV)
 	if !testing.expect(t, ok, "the SRV query went unanswered") {
 		return
 	}
@@ -137,7 +127,7 @@ A type the rule has no record of is NODATA with an SOA, the same answer
 */
 @(test)
 test_rewrite_records_are_answered_by_type :: proc(t: ^testing.T) {
-	resp, outcome, ok := ask(record_rules(), "mail.example.", .AAAA)
+	resp, outcome, ok := ask_rules(record_rules(), "mail.example.", .AAAA)
 	if !testing.expect(t, ok, "the AAAA query went unanswered") {
 		return
 	}
@@ -150,7 +140,7 @@ test_rewrite_records_are_answered_by_type :: proc(t: ^testing.T) {
 
 	// And the A the same rule does carry is still answered, so it is the type
 	// that decided this rather than the rule having been passed over.
-	a_resp, _, a_ok := ask(record_rules(), "mail.example.", .A)
+	a_resp, _, a_ok := ask_rules(record_rules(), "mail.example.", .A)
 	if testing.expect(t, a_ok, "the A query went unanswered") {
 		if testing.expect(t, len(a_resp.answer) == 1, "expected the A record") {
 			testing.expect_value(t, a_resp.answer[0].type, dns.Type.A)
@@ -160,11 +150,10 @@ test_rewrite_records_are_answered_by_type :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// ANY is every record the rule holds, which is what the existing kinds already
-// do and what a rule mixing types has to keep doing.
+// ANY is every record the rule holds, of whichever kinds the rule mixes.
 @(test)
 test_rewrite_records_answer_any :: proc(t: ^testing.T) {
-	resp, _, ok := ask(record_rules(), "mail.example.", .ANY)
+	resp, _, ok := ask_rules(record_rules(), "mail.example.", .ANY)
 	if !testing.expect(t, ok, "the ANY query went unanswered") {
 		return
 	}
@@ -201,11 +190,12 @@ test_a_record_only_rule_leaves_other_types_alone :: proc(t: ^testing.T) {
 		ptr     = true,
 	}
 
-	_, forwarded, _ := ask(rules, "example.com.", .A)
+	_, forwarded, refused := ask_rules(rules, "example.com.", .A)
+	testing.expect(t, refused, "the A query went unanswered")
 	testing.expect_value(t, forwarded, Outcome.Refused)
 
 	// The types it does hold are still answered here.
-	resp, answered, ok := ask(rules, "example.com.", .MX)
+	resp, answered, ok := ask_rules(rules, "example.com.", .MX)
 	if testing.expect(t, ok, "the MX query went unanswered") {
 		testing.expect_value(t, answered, Outcome.Rewritten)
 		testing.expect_value(t, len(resp.answer), 1)
@@ -233,7 +223,7 @@ test_an_address_in_the_rule_still_claims_the_whole_name :: proc(t: ^testing.T) {
 		ptr     = true,
 	}
 
-	resp, outcome, ok := ask(rules, "example.com.", .AAAA)
+	resp, outcome, ok := ask_rules(rules, "example.com.", .AAAA)
 	if !testing.expect(t, ok, "the AAAA query went unanswered") {
 		return
 	}
@@ -257,7 +247,8 @@ test_an_address_in_the_rule_still_claims_the_whole_name :: proc(t: ^testing.T) {
 		ttl     = 300,
 		ptr     = true,
 	}
-	_, alias_outcome, _ := ask(alias, "other.example.", .AAAA)
+	_, alias_outcome, alias_ok := ask_rules(alias, "other.example.", .AAAA)
+	testing.expect(t, alias_ok, "the alias went unanswered")
 	testing.expect_value(t, alias_outcome, Outcome.Rewritten)
 
 	sunk := make([]config.Rewrite, 1, context.temp_allocator)
@@ -270,7 +261,7 @@ test_an_address_in_the_rule_still_claims_the_whole_name :: proc(t: ^testing.T) {
 	// Counted as a rewrite rather than as a block, `apply_rewrite` being what
 	// answered; the rcode is what says the name was sunk and not merely found to
 	// have no AAAA.
-	sunk_resp, sunk_outcome, sunk_ok := ask(sunk, "sunk.example.", .AAAA)
+	sunk_resp, sunk_outcome, sunk_ok := ask_rules(sunk, "sunk.example.", .AAAA)
 	testing.expect_value(t, sunk_outcome, Outcome.Rewritten)
 	if testing.expect(t, sunk_ok, "the sunk name went unanswered") {
 		testing.expect_value(t, sunk_resp.flags.rcode, u8(dns.Rcode.NX_Domain))
@@ -306,7 +297,7 @@ test_a_record_only_rule_steps_aside_for_the_rules_below_it :: proc(t: ^testing.T
 		ptr      = true,
 	}
 
-	resp, outcome, ok := ask(rules, "mail.lan.", .A)
+	resp, outcome, ok := ask_rules(rules, "mail.lan.", .A)
 	if !testing.expect(t, ok, "the A query went unanswered") {
 		return
 	}
@@ -319,14 +310,15 @@ test_a_record_only_rule_steps_aside_for_the_rules_below_it :: proc(t: ^testing.T
 	testing.expect_value(t, a.addr, [4]u8{192, 168, 1, 10})
 
 	// The record-only rule still answers its own type, and first.
-	mx_resp, _, mx_ok := ask(rules, "mail.lan.", .MX)
+	mx_resp, _, mx_ok := ask_rules(rules, "mail.lan.", .MX)
 	if testing.expect(t, mx_ok, "the MX query went unanswered") {
 		testing.expect_value(t, len(mx_resp.answer), 1)
 		testing.expect_value(t, mx_resp.answer[0].type, dns.Type.MX)
 	}
 
 	// With nothing below it, the name is still the upstream's business.
-	alone, alone_outcome, _ := ask(rules[:1], "mail.lan.", .A)
+	alone, alone_outcome, alone_ok := ask_rules(rules[:1], "mail.lan.", .A)
+	testing.expect(t, alone_ok, "the lone MX rule's name went unanswered")
 	testing.expect_value(t, alone_outcome, Outcome.Refused)
 	testing.expect_value(t, len(alone.answer), 0)
 
@@ -363,17 +355,18 @@ test_the_walk_will_not_reach_an_alias_past_records :: proc(t: ^testing.T) {
 
 	// Nothing here can answer it: the MX rule has no A and the alias may not
 	// apply, so the name goes on down the pipeline.
-	_, outcome, _ := ask(rules, "mail.lan.", .A)
+	_, outcome, refused := ask_rules(rules, "mail.lan.", .A)
+	testing.expect(t, refused, "the A query went unanswered")
 	testing.expect_value(t, outcome, Outcome.Refused)
 
 	// The MX is still answered, and the alias still answers every other name
 	// under the wildcard.
-	mx, _, mx_ok := ask(rules, "mail.lan.", .MX)
+	mx, _, mx_ok := ask_rules(rules, "mail.lan.", .MX)
 	if testing.expect(t, mx_ok, "the MX query went unanswered") {
 		testing.expect_value(t, len(mx.answer), 1)
 		testing.expect_value(t, mx.answer[0].type, dns.Type.MX)
 	}
-	other, _, other_ok := ask(rules, "www.lan.", .A)
+	other, _, other_ok := ask_rules(rules, "www.lan.", .A)
 	if testing.expect(t, other_ok, "the wildcard went unanswered") {
 		if testing.expect(t, len(other.answer) == 1, "the alias should have answered") {
 			testing.expect_value(t, other.answer[0].type, dns.Type.CNAME)
@@ -443,6 +436,10 @@ test_the_reverse_walk_follows_the_forward_one :: proc(t: ^testing.T) {
 A rule with an MX and nothing else claims no address, so it supplies no reverse
 either - the PTR synthesis reads addresses out of `answers`, and there is none
 here to read.
+
+Nor does an MX beside an address of another kind: only answers of the address's
+own kind are read, whatever an MX answer's unused address bytes hold, so the
+PTR names the rule after it, which holds the address.
 */
 @(test)
 test_a_record_only_rule_supplies_no_reverse :: proc(t: ^testing.T) {
@@ -453,9 +450,24 @@ test_a_record_only_rule_supplies_no_reverse :: proc(t: ^testing.T) {
 		ttl     = 300,
 		ptr     = true,
 	}
-
 	_, _, found := reverse_rewrite_target(rules, "50.1.168.192.in-addr.arpa.")
 	testing.expect(t, !found, "a rule with no address can be the reverse of nothing")
+
+	mixed := make([]config.Rewrite, 2, context.temp_allocator)
+	mixed[0] = config.Rewrite {
+		domain  = "mail.example.",
+		answers = answers_of({kind = .MX, preference = 10, name = "mx1.example.", v4 = {192, 168, 1, 50}}, {kind = .A, v4 = {10, 0, 0, 9}}),
+		ttl     = 300,
+		ptr     = true,
+	}
+	mixed[1] = config.Rewrite {
+		domain  = "nas.example.",
+		answers = answers_of({kind = .A, v4 = {192, 168, 1, 50}}),
+		ttl     = 300,
+		ptr     = true,
+	}
+	domain, _, named := reverse_rewrite_target(mixed, "50.1.168.192.in-addr.arpa.")
+	testing.expectf(t, named && domain == "nas.example.", "the PTR names %q, not the rule that holds the address", domain)
 
 	free_all(context.temp_allocator)
 }

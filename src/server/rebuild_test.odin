@@ -38,7 +38,9 @@ test_a_rebuild_does_not_take_the_signals_main_acts_on :: proc(t: ^testing.T) {
 	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
 		return
 	}
-	_ = net.set_option(listener, .Receive_Timeout, 5 * time.Second)
+	if !set_wait(t, listener, .Receive_Timeout, 5 * time.Second) {
+		return
+	}
 
 	// Process-wide, and the suite runs in parallel: harmless while no other test
 	// sends SIGHUP, and put back as this one ends.
@@ -78,11 +80,13 @@ test_a_rebuild_does_not_take_the_signals_main_acts_on :: proc(t: ^testing.T) {
 			}
 			append(&request, ..buf[:n])
 		}
-		time.sleep(50 * time.Millisecond)
+		// Nothing says the download is parked in its read, so it is given a
+		// moment to reach it.
+		time.sleep(50 * time.Millisecond) // lint:allow no event marks the read starting
 
 		testing.expect_value(t, posix.pthread_kill(r.thread.unix_thread, .SIGHUP), posix.Errno.NONE)
 		// Interrupted, the download fails and the rebuild is over at once.
-		time.sleep(300 * time.Millisecond)
+		time.sleep(300 * time.Millisecond) // lint:allow the window an interrupted download would end in
 		testing.expect(t, !rebuild_done(&r), "the signal cut the download short")
 		net.close(client)
 	}
@@ -96,9 +100,15 @@ test_a_rebuild_does_not_take_the_signals_main_acts_on :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, rebuild_done(&r), "the rebuild did not end once its host was gone")
 	// Its thread reads `s` and the engine, which are this frame's: it is
-	// waited for even past the deadline, as `FETCH_DEADLINE` bounds it.
-	for !rebuild_done(&r) {
-		time.sleep(10 * time.Millisecond)
+	// waited for even past the deadline, up to the `FETCH_DEADLINE` that bounds
+	// it, and past that the frame cannot be given back, so the run stops.
+	if !rebuild_done(&r) {
+		ended := wait_until(proc(data: rawptr) -> bool {
+				return rebuild_done((^Rebuild)(data))
+			}, &r, FETCH_DEADLINE + 10 * time.Second)
+		if !ended {
+			panic("the rebuild outlived FETCH_DEADLINE, and its thread holds this frame")
+		}
 	}
 	current, over := rebuild_collect(&r)
 	testing.expect(t, over, "a rebuild that is over was not collected")

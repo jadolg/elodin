@@ -7,6 +7,7 @@ import "core:thread"
 import "core:time"
 import "elodin:dns"
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 Issue #636: a validation whose memory runs dry is undecided, not judged on what
@@ -15,40 +16,6 @@ leaves a smaller set to judge, and judged it reads as a forgery - or as an
 unsigned delegation, which serves a forgery as insecure. Neither is a statement
 about the zone.
 */
-
-// Fails `fail_for` requests from its `fail_at`th on and hands every other to
-// `backing`. src/dns/out_of_memory_test.odin and src/server/out_of_memory_test.odin
-// keep their own copies: test files cannot be shared across packages.
-@(private = "file")
-Fail_Nth :: struct {
-	backing:  mem.Allocator,
-	seen:     int,
-	fail_at:  int,
-	fail_for: int,
-}
-
-@(private = "file")
-fail_nth_proc :: proc(
-	data: rawptr,
-	mode: mem.Allocator_Mode,
-	size, alignment: int,
-	old_memory: rawptr,
-	old_size: int,
-	loc := #caller_location,
-) -> (
-	[]byte,
-	mem.Allocator_Error,
-) {
-	f := cast(^Fail_Nth)data
-	#partial switch mode {
-	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
-		f.seen += 1
-		if f.seen >= f.fail_at && f.seen < f.fail_at + f.fail_for {
-			return nil, .Out_Of_Memory
-		}
-	}
-	return f.backing.procedure(f.backing.data, mode, size, alignment, old_memory, old_size, loc)
-}
 
 /*
 The captured chain, read out of the heap and copied into the allocator the
@@ -104,10 +71,10 @@ test_a_validation_that_runs_dry_is_undecided :: proc(t: ^testing.T) {
 		for run in ([]int{1, 2, 3}) do for n := 1; ; n += 1 {
 			v := make_validator(copying_query, nil, Options{})
 			defer destroy_validator(v)
-			f := Fail_Nth{backing = context.temp_allocator, fail_at = n, fail_for = run}
+			f := testkit.Fail_Nth{backing = context.temp_allocator, fail_at = n, fail_for = run}
 			result: Result
 			{
-				failing := mem.Allocator{procedure = fail_nth_proc, data = &f}
+				failing := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
 				context.temp_allocator = failing
 				result = validate(v, c.qname, c.qtype, wire, fixture_now(), failing)
 			}
@@ -210,10 +177,10 @@ test_a_prune_that_runs_dry_is_not_a_prune :: proc(t: ^testing.T) {
 		}
 		refused := 0
 		for run in ([]int{1, 2, 3}) do for n := 1; ; n += 1 {
-			f := Fail_Nth{backing = context.temp_allocator, fail_at = n, fail_for = run}
+			f := testkit.Fail_Nth{backing = context.temp_allocator, fail_at = n, fail_for = run}
 			ok: bool
 			{
-				failing := mem.Allocator{procedure = fail_nth_proc, data = &f}
+				failing := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
 				context.temp_allocator = failing
 				_, ok = strip_unauthenticated(wire, result, failing)
 			}
@@ -300,8 +267,8 @@ test_a_key_set_the_heap_refuses_is_not_cached_short :: proc(t: ^testing.T) {
 			cache_put(v, nil, "com.", .Secure, keys[:], MAX_ZONE_TTL, loop.moment_now())
 		}
 		heap := v.allocator
-		f := Fail_Nth{backing = heap, fail_at = n, fail_for = run}
-		v.allocator = mem.Allocator{procedure = fail_nth_proc, data = &f}
+		f := testkit.Fail_Nth{backing = heap, fail_at = n, fail_for = run}
+		v.allocator = mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
 		cache_put(v, nil, "com.", .Secure, keys[:], MAX_ZONE_TTL, loop.moment_now())
 		v.allocator = heap
 		entry, found := v.zones["com."]
@@ -446,10 +413,10 @@ test_a_lookup_that_runs_dry_on_a_loop_is_this_servers :: proc(t: ^testing.T) {
 		for n := 1; ; n += 1 {
 			v := make_validator(scratch_taking_query, nil, Options{})
 			defer destroy_validator(v)
-			f := Fail_Nth{backing = scratch, fail_at = n, fail_for = 1}
+			f := testkit.Fail_Nth{backing = scratch, fail_at = n, fail_for = 1}
 			result: Result
 			{
-				failing := mem.Allocator{procedure = fail_nth_proc, data = &f}
+				failing := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
 				context.temp_allocator = failing
 				result = validate(v, "www.example.com.", .A, wire, fixture_now(), failing)
 			}
@@ -493,8 +460,8 @@ test_a_zone_that_cannot_be_named_evicts_nothing :: proc(t: ^testing.T) {
 	refused := 0
 	for n := 1; ; n += 1 {
 		heap := v.allocator
-		f := Fail_Nth{backing = heap, fail_at = n, fail_for = 1}
-		v.allocator = mem.Allocator{procedure = fail_nth_proc, data = &f}
+		f := testkit.Fail_Nth{backing = heap, fail_at = n, fail_for = 1}
+		v.allocator = mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
 		cache_put(v, nil, "new.example.", .Insecure, nil, MAX_ZONE_TTL, now)
 		v.allocator = heap
 		_, stored, _ := cache_get(v, "new.example.", now, context.temp_allocator)
@@ -548,8 +515,8 @@ test_a_zone_the_heap_cannot_cache_still_ends_its_memo :: proc(t: ^testing.T) {
 		return
 	}
 	heap := v.allocator
-	f := Fail_Nth{backing = heap, fail_at = 1, fail_for = 1}
-	v.allocator = mem.Allocator{procedure = fail_nth_proc, data = &f}
+	f := testkit.Fail_Nth{backing = heap, fail_at = 1, fail_for = 1}
+	v.allocator = mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
 	cache_put(v, nil, "sub.example.", .Insecure, nil, MAX_ZONE_TTL, now)
 	v.allocator = heap
 	_, cached, still := cache_get(v, "sub.example.", now, context.temp_allocator)

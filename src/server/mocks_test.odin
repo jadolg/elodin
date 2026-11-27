@@ -4,6 +4,7 @@ import "core:encoding/hex"
 import "core:mem"
 import "core:net"
 import "core:strings"
+import "core:sync"
 import "core:sys/linux"
 import "core:testing"
 import "core:thread"
@@ -52,6 +53,11 @@ and does not use it: `mock_untouched` below reads the socket after the call has
 returned rather than racing it, which is both exact and quick.
 */
 MOCK_RECV_TIMEOUT :: 10 * time.Second
+
+// The client address the cases here ask from, where who asked is no part of
+// what they test.
+@(private)
+TEST_CLIENT :: "127.0.0.1:5555"
 
 /*
 Whether the upstream was left alone, read once `handle_query` has returned.
@@ -135,11 +141,14 @@ bind_mock :: proc(
 	return sock, config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = bound.port}, true
 }
 
-// One UDP upstream on loopback at `port`, as `upstream.servers` would name it.
+// A UDP upstream on loopback at each of `ports`, in order, as `upstream.servers`
+// would name them; every one is called `name`.
 @(private)
-loopback_upstream :: proc(port: int, name := "mock") -> []config.Upstream_Spec {
-	servers := make([]config.Upstream_Spec, 1, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = port}
+loopback_upstream :: proc(ports: ..int, name := "mock") -> []config.Upstream_Spec {
+	servers := make([]config.Upstream_Spec, len(ports), context.temp_allocator)
+	for port, i in ports {
+		servers[i] = config.Upstream_Spec{name = name, kind = .UDP, address = "127.0.0.1", port = port}
+	}
 	return servers
 }
 
@@ -166,12 +175,12 @@ test_config :: proc(servers: []config.Upstream_Spec = nil) -> config.Config {
 	return cfg
 }
 
-// A group of one UDP upstream on loopback at `port`, with `cfg`'s settings; nil,
-// with the failure reported, when it cannot be built.
+// A group of a UDP upstream on loopback at each of `ports`, in order, with
+// `cfg`'s settings; nil, with the failure reported, when it cannot be built.
 @(private)
-mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, port: int, loc := #caller_location) -> ^upstream.Group {
+mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, ports: ..int, loc := #caller_location) -> ^upstream.Group {
 	one := cfg
-	one.servers = loopback_upstream(port)
+	one.servers = loopback_upstream(..ports)
 	group, gerr := upstream.make_group(one, context.allocator)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr, loc = loc) {
 		return nil
@@ -226,7 +235,7 @@ harness_bind :: proc(t: ^testing.T, h: ^Harness, name := "mock", wait := MOCK_RE
 	}
 	h^ = {}
 	h.socket = socket
-	h.cfg = test_config(loopback_upstream(spec.port, name))
+	h.cfg = test_config(loopback_upstream(spec.port, name = name))
 	return true
 }
 
@@ -383,7 +392,7 @@ One query through the harness's server, with a `Canned_Mock` answering it with
 harness_ask :: proc(
 	h: ^Harness,
 	query, reply: []u8,
-	client := "127.0.0.1:5555",
+	client := TEST_CLIENT,
 ) -> (
 	out: []u8,
 	outcome: Outcome,
@@ -405,7 +414,7 @@ harness_exchange :: proc(
 	x: ^Canned_Mock,
 	query: []u8,
 	proto := Protocol.UDP,
-	client := "127.0.0.1:5555",
+	client := TEST_CLIENT,
 ) -> (
 	out: []u8,
 	outcome: Outcome,
@@ -424,7 +433,7 @@ exchange_with :: proc(
 	serve: proc(x: ^T),
 	query: []u8,
 	proto := Protocol.UDP,
-	client := "127.0.0.1:5555",
+	client := TEST_CLIENT,
 ) -> (
 	out: []u8,
 	outcome: Outcome,
@@ -519,6 +528,15 @@ Canned_Mock :: struct {
 	// buffer `serve_canned` reads into, so nothing read is cut short here.
 	seen:     [4096]u8,
 	seen_len: int,
+	// Wait for any question naming `want`, whatever its type, rather than for
+	// `reply`'s own: for a route or a rewrite whose upstream is asked another
+	// name than the client's.
+	want:     string,
+	// How long to wait, or what to wait for (bounded by `MOCK_RECV_TIMEOUT`),
+	// between the question and the answer, so the client's own deadline or a
+	// case's ordering is what decides the race.
+	delay:    time.Duration,
+	hold:     ^sync.Sema,
 }
 
 @(private)
@@ -527,13 +545,83 @@ serve_canned :: proc(x: ^Canned_Mock) {
 	if len(x.reply) > len(buf) {
 		return
 	}
-	n, remote, asked := recv_question(x.socket, x.reply, buf[:])
+	n: int
+	remote: net.Endpoint
+	asked: bool
+	if x.want != "" {
+		n, remote, asked = recv_named(x.socket, x.want, buf[:])
+	} else {
+		n, remote, asked = recv_question(x.socket, x.reply, buf[:])
+	}
 	if !asked {
 		return
 	}
 	x.got = true
 	x.seen_len = copy(x.seen[:], buf[:n])
+	if x.delay > 0 {
+		time.sleep(x.delay) // lint:allow the delay is what the case times its deadline against
+	}
+	if x.hold != nil && !sync.sema_wait_with_timeout(x.hold, MOCK_RECV_TIMEOUT) {
+		return
+	}
 	x.served = send_reply_as(x.socket, x.reply, buf[:n], remote)
+}
+
+/*
+The next datagram on `socket` asking any question about `name`, read into `buf`;
+runts and other names are skipped, as `recv_question` skips them. The question
+is peeked into an arena on this thread's own stack: a mock thread's decode must
+not reach the temp arena the test thread frees.
+*/
+@(private)
+recv_named :: proc(socket: net.UDP_Socket, name: string, buf: []u8) -> (n: int, remote: net.Endpoint, ok: bool) {
+	backing: [1024]u8
+	scratch: mem.Arena
+	mem.arena_init(&scratch, backing[:])
+	for {
+		got, from, err := net.recv_udp(socket, buf)
+		if err != nil {
+			return 0, {}, false
+		}
+		if got < dns.HEADER_SIZE {
+			continue
+		}
+		free_all(mem.arena_allocator(&scratch))
+		if q, peeked := dns.peek_question(buf[:got], mem.arena_allocator(&scratch)); peeked && dns.name_equal_fold(q.name, name) {
+			return got, from, true
+		}
+	}
+}
+
+/*
+How many datagrams are sitting unread in `socket` asking any question about
+`name`, or how many datagrams at all for an empty `name`; -1 when the read
+cannot be bounded. Read once the call that may have sent them has returned, as
+`mock_untouched` reads, and left with the harnesses' `MOCK_RECV_TIMEOUT`.
+*/
+@(private)
+mock_heard :: proc(socket: net.UDP_Socket, name := "") -> (heard: int) {
+	if net.set_option(socket, .Receive_Timeout, 20 * time.Millisecond) != nil {
+		return -1
+	}
+	defer _ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT) // lint:allow a restore left undone only shortens a later wait
+	buf: [4096]u8
+	for {
+		n, _, err := net.recv_udp(socket, buf[:])
+		if err != nil {
+			return
+		}
+		if name == "" {
+			heard += 1
+			continue
+		}
+		if n < dns.HEADER_SIZE {
+			continue
+		}
+		if q, ok := dns.peek_question(buf[:n], context.temp_allocator); ok && dns.name_equal_fold(q.name, name) {
+			heard += 1
+		}
+	}
 }
 
 /*
@@ -645,15 +733,27 @@ rrsig_over :: proc(covered: dns.Type) -> dns.Rdata_Raw {
 	return dns.Rdata_Raw{data = rdata}
 }
 
-// An upstream's answer to `name`'s `type`, with QR, RD and RA set.
+// An upstream's answer to `name`'s `type`, with QR, RD and RA set, AA as `aa`
+// says, and `authority` and `additional` as given.
 @(private)
-test_reply :: proc(name: string, type: dns.Type, answers: ..dns.Record, rcode := dns.Rcode.No_Error) -> []u8 {
+test_reply :: proc(
+	name: string,
+	type: dns.Type,
+	answers: ..dns.Record,
+	rcode := dns.Rcode.No_Error,
+	authority: []dns.Record = nil,
+	additional: []dns.Record = nil,
+	aa := false,
+) -> []u8 {
 	question := [1]dns.Question{{name = name, type = type, class = .IN}}
 	m := dns.Message {
-		question = question[:],
-		answer   = answers,
+		question   = question[:],
+		answer     = answers,
+		authority  = authority,
+		additional = additional,
 	}
 	m.flags.qr = true
+	m.flags.aa = aa
 	m.flags.rd = true
 	m.flags.ra = true
 	m.flags.rcode = u8(rcode)
@@ -980,7 +1080,7 @@ local_server :: proc(cfg: ^config.Config) -> Server {
 // a zero message, and a failed case, when nothing readable came back.
 @(private)
 ask_message :: proc(t: ^testing.T, s: ^Server, name: string, type: dns.Type, opt: Maybe(dns.Record) = nil, loc := #caller_location) -> dns.Message {
-	out, _, ok := handle_query(s, test_query(name, type, id = 0x4243, opt = opt), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, _, ok := handle_query(s, test_query(name, type, id = 0x4243, opt = opt), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expectf(t, ok, "%s %v went unanswered", name, type, loc = loc) {
 		return {}
 	}
@@ -1057,7 +1157,7 @@ ask_local :: proc(
 	outcome: Outcome,
 	ok: bool,
 ) {
-	out, how, answered := handle_query(s, test_query(name, type, rd = rd, class = class), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, how, answered := handle_query(s, test_query(name, type, rd = rd, class = class), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !answered {
 		return {}, how, false
 	}
@@ -1081,7 +1181,7 @@ stage_state :: proc(s: ^Server, msg: dns.Message, spent: ^int, allocator: mem.Al
 		msg = msg,
 		q = msg.question[0],
 		proto = .UDP,
-		client = "127.0.0.1:5555",
+		client = TEST_CLIENT,
 		limit = dns.MAX_UDP_SIZE,
 		started = time.tick_now(),
 		spent = spent,
@@ -1110,11 +1210,11 @@ query_with_records :: proc(name: string, additional: ..dns.Record) -> []u8 {
 	return wire
 }
 
-// An upstream's A answer for `name`, with an OPT record of its own as an EDNS
-// upstream writes one.
+// An upstream's A answer for `name`, with an OPT record of its own advertising
+// `udp_size`, as an EDNS upstream writes one.
 @(private)
-edns_reply :: proc(name: string, addr: [4]u8) -> []u8 {
-	wire, ok := dns.ensure_opt(test_reply(name, .A, a_record(name, addr, 300)), 1232, context.temp_allocator)
+edns_reply :: proc(name: string, addr: [4]u8, udp_size: u16 = config.DEFAULT_MAX_UDP_RESPONSE) -> []u8 {
+	wire, ok := dns.ensure_opt(test_reply(name, .A, a_record(name, addr, 300)), udp_size, context.temp_allocator)
 	if !ok {
 		panic("the test reply took no OPT record")
 	}
@@ -1186,7 +1286,7 @@ harness_sniff :: proc(
 	x: ^Option_Mock,
 	query: []u8,
 	proto := Protocol.UDP,
-	client := "127.0.0.1:5555",
+	client := TEST_CLIENT,
 ) -> (
 	out: []u8,
 	outcome: Outcome,
@@ -1203,7 +1303,7 @@ was forwarded. Returns the answer for any further check.
 */
 @(private)
 expect_refused_unforwarded :: proc(t: ^testing.T, h: ^Harness, query: []u8, what: string, loc := #caller_location) -> []u8 {
-	out, outcome, ok := handle_query(&h.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&h.srv, query, .UDP, TEST_CLIENT, context.temp_allocator)
 	testing.expect(t, mock_untouched(h.socket, query), what, loc = loc)
 	testing.expect(t, ok, "the client was left with nothing at all", loc = loc)
 	testing.expect_value(t, outcome, Outcome.Failed, loc = loc)

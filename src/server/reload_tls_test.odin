@@ -174,7 +174,9 @@ test_reload_tls_waits_for_a_connection_holding_the_context :: proc(t: ^testing.T
 		sync.atomic_store(&race.finished, true)
 	})
 
-	time.sleep(200 * time.Millisecond)
+	// What is checked is that nothing happens, which no event can say: the
+	// window is the reload's chance to run through the lock it must wait on.
+	time.sleep(200 * time.Millisecond) // lint:allow a window for something that must not happen
 	testing.expect(
 		t,
 		!sync.atomic_load(&race.finished),
@@ -207,8 +209,11 @@ test_rotate_ticket_keys_reaches_dot_and_doh :: proc(t: ^testing.T) {
 		return
 	}
 	l.dot_ctx, l.doh_ctx = dot, doh
-	dot_before, _ := tlsx.ticket_key_name(dot)
-	doh_before, _ := tlsx.ticket_key_name(doh)
+	dot_before, dbok := tlsx.ticket_key_name(dot)
+	doh_before, hbok := tlsx.ticket_key_name(doh)
+	if !testing.expect(t, dbok && hbok, "the contexts carry no ticket key to rotate from") {
+		return
+	}
 
 	rotate_ticket_keys(&l, loop.moment_add(loop.moment_now(), tlsx.TICKET_KEY_INTERVAL))
 	dot_after, dok := tlsx.ticket_key_name(dot)

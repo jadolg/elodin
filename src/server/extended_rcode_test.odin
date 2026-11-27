@@ -144,7 +144,7 @@ rcode_ask :: proc(
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&mocks[i], serve_canned)
 	}
-	out, outcome, served = handle_query(&f.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, served = handle_query(&f.srv, query, .UDP, TEST_CLIENT, context.temp_allocator)
 	for th in threads {
 		if th != nil {
 			thread.join(th)
