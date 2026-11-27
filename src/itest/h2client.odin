@@ -2,7 +2,6 @@ package itest
 
 import "core:encoding/base64"
 import "core:mem"
-import "core:strconv"
 import "core:strings"
 import "core:time"
 import "elodin:h2"
@@ -426,7 +425,7 @@ h2_handle :: proc(c: ^H2_Client, header: h2.Frame_Header, payload: []u8) -> bool
 		status := 0
 		for f in fields {
 			if f.name == ":status" {
-				status = strconv.parse_int(f.value) or_else 0
+				status = h2.parse_status(f.value)
 			}
 		}
 		// An interim response is a field block of its own ahead of the final

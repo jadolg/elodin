@@ -58,7 +58,7 @@ config_drip :: proc(r: ^Runner, udp_port, tcp_port, doh_port, upstream_port: int
 		upstream_at(upstream_port),
 		log = "{ level: info }",
 		timeout = "3s",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		tcp = tcp_at(tcp_port),
 		listeners_extra = doh_listener(r, doh_port),
 		extra = "server:\n  client_timeout: 1s",
 	)

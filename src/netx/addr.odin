@@ -278,3 +278,9 @@ addresses_equal :: proc(a, b: net.Address) -> bool {
 	}
 	return false
 }
+
+// Whether a socket call ran out of time: a socket timeout expiring is EAGAIN,
+// which core:net reports as `.Would_Block` rather than `.Timeout`.
+timed_out :: proc(err: $E) -> bool {
+	return err == .Timeout || err == .Would_Block
+}

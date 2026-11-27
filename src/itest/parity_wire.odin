@@ -16,9 +16,8 @@ RDATA or drops a record loses it identically on both sides of the comparison and
 reports agreement. The same reasoning `fixtures.odin` gives for freezing captured
 wire data as hex rather than generating it with our own encoder.
 
-So this walks the bytes itself, and it is the suite's only reader of whole
-messages.
-What it produces is a canonical form - names expanded, sections as multisets,
+So this walks the bytes itself: the parity check reads no message through the
+codec it judges. What it produces is a canonical form - names expanded, sections as multisets,
 rcode reassembled from both of the places it is written - in which two messages
 that say the same thing compare equal however they were laid out.
 */
@@ -760,9 +759,7 @@ pw_lower_name :: proc(name: []u8) {
 			return
 		}
 		for i in pos + 1 ..< pos + 1 + n {
-			if name[i] >= 'A' && name[i] <= 'Z' {
-				name[i] += 32
-			}
+			name[i] = pw_fold_byte(name[i])
 		}
 		pos += 1 + n
 	}
@@ -775,18 +772,16 @@ pw_names_equal_fold :: proc(a, b: []u8) -> bool {
 		return false
 	}
 	for i in 0 ..< len(a) {
-		x, y := a[i], b[i]
-		if x >= 'A' && x <= 'Z' {
-			x += 32
-		}
-		if y >= 'A' && y <= 'Z' {
-			y += 32
-		}
-		if x != y {
+		if pw_fold_byte(a[i]) != pw_fold_byte(b[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+// `b` with an ASCII capital lowered, every other byte as it stands.
+pw_fold_byte :: proc(b: u8) -> u8 {
+	return b + 32 if b >= 'A' && b <= 'Z' else b
 }
 
 /*

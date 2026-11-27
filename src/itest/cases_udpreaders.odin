@@ -19,21 +19,7 @@ impossible, and what the kernel dropped is published.
 
 @(private = "file")
 config_readers :: proc(udp_port, upstream_port: int, extra: string) -> string {
-	return fmt.tprintf(
-		`log: {{ level: info }}
-listeners:
-  udp: {{ enabled: true, address: "127.0.0.1", port: %d, readers: 4 }}
-  tcp: {{ enabled: false }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-%s`,
-		udp_port,
-		upstream_port,
-		extra,
-	)
+	return base_config(udp_port, upstream_at(upstream_port), log = "{ level: info }", timeout = "3s", readers = 4, extra = extra)
 }
 
 run_udp_reader_cases :: proc(r: ^Runner) {
@@ -110,8 +96,8 @@ run_udp_reader_cases :: proc(r: ^Runner) {
 				what a single socket could not have done: without `SO_REUSEPORT`
 				a second bind is refused.
 
-				The kernel could in principle hash all 32 onto one reader; at
-				four readers that is 4 x (1/4)^32, about 2e-19. Retried nowhere, because a failure
+				The kernel could in principle hash all `QUERIES` onto one reader;
+				at 32 over four readers that is 4 x (1/4)^32, about 2e-19. Retried nowhere, because a failure
 				here is far more likely to be the sharing having stopped
 				working.
 				*/

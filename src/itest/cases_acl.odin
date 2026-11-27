@@ -29,7 +29,7 @@ config_acl :: proc(udp_port, tcp_port, upstream_port: int, allow_from: string) -
 		// listeners print when they bind, since they cannot ask a question.
 		log = "{ level: info }",
 		timeout = "3s",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		tcp = tcp_at(tcp_port),
 		extra = fmt.tprintf("server:\n  %s", allow_from),
 	)
 }

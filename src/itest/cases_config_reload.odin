@@ -32,7 +32,7 @@ config_reload_text :: proc(
 		upstream_at(upstream_port),
 		log = log,
 		upstream_extra = "  attempts: 1",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		tcp = tcp_at(udp_port),
 		cache = "{ enabled: true }",
 		extra = fmt.tprintf("server:\n  rate_limit: {{ enabled: %v }}\n%s", rate_limit, extra),
 	)

@@ -33,7 +33,7 @@ config_cookies :: proc(
 		upstream_at(upstream_port),
 		// Info, for the line that says a reload is over.
 		log = "{ level: info }",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		tcp = tcp_at(udp_port),
 		timeout = "3s",
 		extra = fmt.tprintf("server:\n  rate_limit: {{ %s }}\ncookies:\n  enabled: true\n  require: %v\n  secret: %s", rate_limit, require, secret),
 	)
@@ -364,7 +364,7 @@ config_upstream_cookies :: proc(udp_port, upstream_port: int, upstream_cookies: 
 	return base_config(
 		udp_port,
 		upstream_at(upstream_port),
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		tcp = tcp_at(udp_port),
 		timeout = "3s",
 		extra = fmt.tprintf("cookies:\n  enabled: %v\n  upstream: %v", client_cookies, upstream_cookies),
 	)

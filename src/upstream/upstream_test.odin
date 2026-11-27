@@ -14,6 +14,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:loop"
+import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -3101,7 +3102,7 @@ stall_mock_loop :: proc(m: ^Stall_Mock) {
 	for !sync.atomic_load(&m.stop) {
 		client, _, aerr := net.accept_tcp(m.listener)
 		if aerr != nil {
-			if aerr == .Timeout || aerr == .Would_Block {
+			if netx.timed_out(aerr) {
 				continue
 			}
 			return
@@ -3111,7 +3112,7 @@ stall_mock_loop :: proc(m: ^Stall_Mock) {
 		buf: [4096]u8
 		for !sync.atomic_load(&m.stop) {
 			n, rerr := net.recv_tcp(client, buf[:])
-			if rerr == .Timeout || rerr == .Would_Block {
+			if netx.timed_out(rerr) {
 				continue
 			}
 			if rerr != nil || n <= 0 {

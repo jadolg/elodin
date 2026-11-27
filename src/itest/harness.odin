@@ -428,7 +428,8 @@ the loader refuses a key given twice. `servers` is the `upstream.servers` value
 (`upstream_at` for one loopback mock); `listeners_extra` and `upstream_extra` are
 more keys inside those sections, indented two spaces; `extra` is more top-level
 sections. An empty `timeout` leaves the key out, and a zero `readers` leaves
-`listeners.udp.readers` at its default.
+`listeners.udp.readers` at its default. `udp`, when set, is the whole UDP
+listener in place of the loopback one on `udp_port`.
 */
 base_config :: proc(
 	udp_port: int,
@@ -442,10 +443,15 @@ base_config :: proc(
 	blocking := "{ enabled: false }",
 	extra := "",
 	readers := 0,
+	udp := "",
 ) -> string {
 	b := strings.builder_make(context.temp_allocator)
-	udp_readers := fmt.tprintf(", readers: %d", readers) if readers > 0 else ""
-	fmt.sbprintf(&b, "log: %s\nlisteners:\n  udp: {{ enabled: true, address: \"127.0.0.1\", port: %d%s }}\n  tcp: %s\n", log, udp_port, udp_readers, tcp)
+	udp_line := udp
+	if udp_line == "" {
+		udp_readers := fmt.tprintf(", readers: %d", readers) if readers > 0 else ""
+		udp_line = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d%s }}`, udp_port, udp_readers)
+	}
+	fmt.sbprintf(&b, "log: %s\nlisteners:\n  udp: %s\n  tcp: %s\n", log, udp_line, tcp)
 	write_lines(&b, listeners_extra)
 	strings.write_string(&b, "upstream:\n")
 	if timeout != "" {
@@ -496,6 +502,11 @@ dot_listener :: proc(r: ^Runner, port: int, extra := "", cert := "", key := "") 
 	)
 }
 
+// A stream listener on loopback at `port`, as a `tcp` value for `base_config`.
+tcp_at :: proc(port: int) -> string {
+	return fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, port)
+}
+
 // One loopback upstream, as a `servers` value for `base_config`.
 upstream_at :: proc(port: int) -> string {
 	return fmt.tprintf(`["127.0.0.1:%d"]`, port)
@@ -523,10 +534,38 @@ test validation write their own `dnssec:` block, which this leaves alone.
 */
 @(private)
 without_dnssec :: proc(config: string, allocator := context.temp_allocator) -> string {
-	if strings.contains(config, "dnssec:") {
+	if names_key(config, "dnssec") {
 		return config
 	}
 	return strings.concatenate({config, "\ndnssec:\n  enabled: false\n"}, allocator)
+}
+
+/*
+Whether `config` sets `key` anywhere: `key:` at the start of a line or after a
+flow's `{` or `,`, outside a comment. A comment that mentions it, or a longer key
+that ends in it, does not count.
+
+shortcut: a `#` inside a quoted value is read as a comment; no suite config has
+one, so revisit if a case quotes one.
+*/
+@(private = "file")
+names_key :: proc(config, key: string) -> bool {
+	for line in strings.split_lines(config, context.temp_allocator) {
+		text := line
+		if hash := strings.index_byte(text, '#'); hash >= 0 {
+			text = text[:hash]
+		}
+		for at := strings.index(text, key); at >= 0; {
+			end := at + len(key)
+			before := strings.trim_right_space(text[:at])
+			if end < len(text) && text[end] == ':' && (before == "" || strings.has_suffix(before, "{") || strings.has_suffix(before, ",")) {
+				return true
+			}
+			next := strings.index(text[end:], key)
+			at = end + next if next >= 0 else -1
+		}
+	}
+	return false
 }
 
 /*
@@ -536,7 +575,7 @@ every path the server takes (#417). Added to the `server:` section the case
 wrote, in the block or flow style it wrote it in, or as a section of its own.
 */
 with_sandbox :: proc(config, mode: string, allocator := context.temp_allocator) -> string {
-	if strings.contains(config, "sandbox:") {
+	if names_key(config, "sandbox") {
 		return config
 	}
 	lines := strings.split_lines(config, context.temp_allocator)
@@ -847,7 +886,7 @@ the suite.
 */
 stop_server :: proc(srv: ^Server) {
 	if srv.running && srv.graceful {
-		_, _ = signal_shutdown(srv, GRACEFUL_STOP_TIMEOUT)
+		_, _ = signal_shutdown(srv, GRACEFUL_STOP_TIMEOUT) // lint:allow the kill below is the fallback
 	}
 	if srv.running {
 		_ = os.process_kill(srv.process)
@@ -1180,7 +1219,7 @@ encode_reply :: proc(name: string, qtype: dns.Type, msg: dns.Message, allocator 
 // The info-code of the extended error a response carries (RFC 8914), or -1 if
 // it has none.
 extended_error :: proc(r: ^Runner, wire: []u8) -> int {
-	code, _ := extended_error_with_text(r, wire)
+	code, _ := extended_error_with_text(r, wire) // lint:allow only the info-code is asked for
 	return code
 }
 
@@ -1632,33 +1671,23 @@ config_rate_limit :: proc(
 	// case has to be read out of and not about the volume a flood produces.
 	log_level := "warn",
 ) -> string {
-	tcp := "{ enabled: false }"
-	if tcp_port > 0 {
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port)
-	}
-	return fmt.tprintf(
-		`log: {{ level: %s }}
-listeners:
-  udp: {{ enabled: true, address: "%s", port: %d }}
-  tcp: %s
-server:
+	return base_config(
+		udp_port,
+		upstream_at(upstream_port),
+		log = fmt.tprintf("{{ level: %s }}", log_level),
+		timeout = "3s",
+		tcp = tcp_at(tcp_port) if tcp_port > 0 else "{ enabled: false }",
+		cache = "{ enabled: true, max_entries: 100 }",
+		udp = fmt.tprintf(`{{ enabled: true, address: "%s", port: %d }}`, udp_address, udp_port),
+		extra = fmt.tprintf(
+			`server:
   # Pinned rather than derived from whatever machine the suite is running on:
   # the flood below has to fit inside max_pending for the unlimited run to be
   # the baseline it claims to be. Otherwise the case measures this machine's
   # shed threshold instead of the limiter.
   max_pending: 256
-  rate_limit: {{ %s }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: true, max_entries: 100 }}
-blocking: {{ enabled: false }}
-`,
-		log_level,
-		udp_address,
-		udp_port,
-		tcp,
-		limit,
-		upstream_port,
+  rate_limit: {{ %s }}`,
+			limit,
+		),
 	)
 }

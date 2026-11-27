@@ -4,6 +4,7 @@ import "core:net"
 import "core:strings"
 import "core:sync"
 import "core:thread"
+import "elodin:netx"
 
 /*
 A tiny HTTP/1.1 file server, so the blocklist download path can be tested
@@ -138,10 +139,7 @@ http_mock_conn :: proc(conn: ^Http_Mock_Conn) {
 		}
 		chunk: [1024]u8
 		n, err := net.recv_tcp(conn.socket, chunk[:])
-		// SO_RCVTIMEO expiring on a blocking recv() is EAGAIN on Linux,
-		// which core:net reports as .Would_Block, not .Timeout - see
-		// `timed_out` in src/upstream/http.odin.
-		if err == .Timeout || err == .Would_Block {
+		if netx.timed_out(err) {
 			continue
 		}
 		if err != nil || n <= 0 {
@@ -197,5 +195,5 @@ http_mock_conn :: proc(conn: ^Http_Mock_Conn) {
 	}
 
 	// `send_tcp` writes it all or fails; a failure leaves the client nothing to read.
-	_, _ = net.send_tcp(conn.socket, transmute([]u8)strings.to_string(b))
+	_, _ = net.send_tcp(conn.socket, transmute([]u8)strings.to_string(b)) // lint:allow a failure leaves the client nothing to read, which it reports
 }

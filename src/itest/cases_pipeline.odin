@@ -320,7 +320,7 @@ pipeline_config :: proc(r: ^Runner, udp_port, tcp_port, dot_port, upstream_port:
 		upstream_at(upstream_port),
 		timeout = "5s",
 		upstream_extra = "  attempts: 1",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		tcp = tcp_at(tcp_port),
 		cache = "{ enabled: true }",
 		listeners_extra = dot_listener(r, dot_port),
 		extra = fmt.tprintf("server:\n  client_timeout: %s\n%s", PIPELINE_CLIENT_TIMEOUT, extra),

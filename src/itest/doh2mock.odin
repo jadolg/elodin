@@ -442,7 +442,7 @@ doh2_serve_http1 :: proc(conn: ^Doh2_Conn) {
 
 	// `tlsx.write` writes the whole slice or fails.
 	if _, err := tlsx.write(conn.tls, out); err == .None {
-		_, _ = tlsx.write(conn.tls, reply)
+		_, _ = tlsx.write(conn.tls, reply) // lint:allow a body that fails leaves the client a short read, which it reports
 	}
 }
 

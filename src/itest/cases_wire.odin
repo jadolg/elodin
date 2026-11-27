@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:slice"
 import "core:time"
 import "elodin:dns"
+import "elodin:server"
 
 /*
 Wire-level coverage.
@@ -50,6 +51,10 @@ empty_character_strings_answer :: proc(name: string, allocator := context.alloca
 	return wire
 }
 
+@(private = "file")
+GROWING_QNAME :: "srvgrow.wire.test."
+@(private = "file")
+GROWING_SRVS :: 3200
 
 /*
 An SRV answer near 64 KiB whose re-encode does not fit a stream message.
@@ -61,13 +66,8 @@ it out for a client that asked without EDNS has to decode and encode the whole
 message again rather than cut bytes off the end.
 */
 @(private = "file")
-GROWING_QNAME :: "srvgrow.wire.test."
-@(private = "file")
-GROWING_SRVS :: 3200
-
-@(private = "file")
 growing_srv_answer :: proc(allocator := context.allocator) -> []u8 {
-	buf := make([dynamic]u8, 0, 65535, allocator)
+	buf := make([dynamic]u8, 0, dns.MAX_MESSAGE, allocator)
 	append(&buf, 0, 0, 0x81, 0x80, 0, 1, u8(GROWING_SRVS >> 8), u8(GROWING_SRVS & 0xff), 0, 0, 0, 2)
 	append(&buf, 7, 's', 'r', 'v', 'g', 'r', 'o', 'w', 4, 'w', 'i', 'r', 'e', 4, 't', 'e', 's', 't', 0, 0, 33, 0, 1)
 	for _ in 0 ..< GROWING_SRVS {
@@ -184,7 +184,7 @@ config_passthrough :: proc(udp_port, upstream_port: int, cache := "{ enabled: fa
 	return base_config(
 		udp_port,
 		upstream_at(upstream_port),
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		tcp = tcp_at(udp_port),
 		timeout = "3s",
 		cache = cache,
 	)
@@ -436,7 +436,7 @@ run_wire_cases :: proc(r: ^Runner) {
 				msg, decoded := decode_reply(r, seen)
 				if decoded {
 					check(r, dns.edns_present(msg), "the OPT record was dropped on the way upstream")
-					check_eq_int(r, int(dns.edns_udp_size(msg)), 1232, "advertised buffer size")
+					check_eq_int(r, int(dns.edns_udp_size(msg)), server.UPSTREAM_UDP_SIZE, "advertised buffer size")
 					check(r, dns.edns_do(msg), "the DO bit was dropped on the way upstream")
 				}
 			}

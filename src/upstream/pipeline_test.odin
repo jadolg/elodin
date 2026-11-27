@@ -8,6 +8,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:loop"
+import "elodin:netx"
 
 /*
 A TCP responder that answers nothing until two queries have arrived on one
@@ -98,7 +99,7 @@ pipe_mock_read :: proc(m: ^Pipe_Mock, socket: net.TCP_Socket, buf: []u8) -> bool
 			return false
 		}
 		n, err := net.recv_tcp(socket, buf[got:])
-		if err == .Timeout || err == .Would_Block {
+		if netx.timed_out(err) {
 			continue
 		}
 		if err != nil || n <= 0 {
@@ -299,7 +300,7 @@ silent_conn_loop :: proc(conn: ^Silent_Conn) {
 	buf: [4096]u8
 	for !sync.atomic_load(&conn.mock.stop) {
 		n, err := net.recv_tcp(conn.socket, buf[:])
-		if err == .Timeout || err == .Would_Block {
+		if netx.timed_out(err) {
 			continue
 		}
 		if err != nil || n <= 0 {
@@ -455,7 +456,7 @@ handoff_mock_loop :: proc(m: ^Handoff_Mock) {
 		got := 0
 		for got < 2 {
 			n, err := net.recv_tcp(client, length_buf[got:])
-			if err == .Timeout || err == .Would_Block {
+			if netx.timed_out(err) {
 				if sync.atomic_load(&m.stop) {
 					return
 				}
@@ -474,7 +475,7 @@ handoff_mock_loop :: proc(m: ^Handoff_Mock) {
 		got = 0
 		for got < length {
 			n, err := net.recv_tcp(client, queries[i][got:])
-			if err == .Timeout || err == .Would_Block {
+			if netx.timed_out(err) {
 				continue
 			}
 			if err != nil || n <= 0 {
@@ -758,7 +759,7 @@ wedge_read :: proc(conn: ^Wedge_Conn, buf: []u8) -> bool {
 			return false
 		}
 		n, err := net.recv_tcp(conn.socket, buf[got:])
-		if err == .Timeout || err == .Would_Block {
+		if netx.timed_out(err) {
 			continue
 		}
 		if err != nil || n <= 0 {
@@ -986,7 +987,7 @@ split_read :: proc(m: ^Split_Mock, client: net.TCP_Socket, buf: []u8) -> bool {
 			return false
 		}
 		n, err := net.recv_tcp(client, buf[got:])
-		if err == .Timeout || err == .Would_Block {
+		if netx.timed_out(err) {
 			continue
 		}
 		if err != nil || n <= 0 {
@@ -1501,7 +1502,7 @@ stall_read :: proc(m: ^Stall_Mock, client: net.TCP_Socket, buf: []u8) -> bool {
 			return false
 		}
 		n, err := net.recv_tcp(client, buf[got:])
-		if err == .Timeout || err == .Would_Block {
+		if netx.timed_out(err) {
 			continue
 		}
 		if err != nil || n <= 0 {
@@ -1832,7 +1833,7 @@ recycle_mock_loop :: proc(m: ^Recycle_Mock) {
 	for !sync.atomic_load(&m.stop) {
 		client, _, aerr := net.accept_tcp(m.listener)
 		if aerr != nil {
-			if aerr == .Timeout || aerr == .Would_Block {
+			if netx.timed_out(aerr) {
 				continue
 			}
 			return
@@ -1884,7 +1885,7 @@ recycle_read :: proc(m: ^Recycle_Mock, socket: net.TCP_Socket, buf: []u8) -> boo
 			return false
 		}
 		n, err := net.recv_tcp(socket, buf[got:])
-		if err == .Timeout || err == .Would_Block {
+		if netx.timed_out(err) {
 			continue
 		}
 		if err != nil || n <= 0 {
@@ -2336,7 +2337,7 @@ truncate_mock_loop :: proc(m: ^Truncate_Mock) {
 	for !sync.atomic_load(&m.stop) {
 		client, _, aerr := net.accept_tcp(m.listener)
 		if aerr != nil {
-			if aerr == .Timeout || aerr == .Would_Block {
+			if netx.timed_out(aerr) {
 				continue
 			}
 			return
@@ -2381,7 +2382,7 @@ truncate_read :: proc(m: ^Truncate_Mock, socket: net.TCP_Socket, buf: []u8) -> b
 			return false
 		}
 		n, err := net.recv_tcp(socket, buf[got:])
-		if err == .Timeout || err == .Would_Block {
+		if netx.timed_out(err) {
 			continue
 		}
 		if err != nil || n <= 0 {

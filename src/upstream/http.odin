@@ -9,6 +9,7 @@ import "elodin:dns"
 import "elodin:h2"
 import "elodin:logx"
 import "elodin:loop"
+import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -44,16 +45,9 @@ stream_read :: proc(s: ^Stream, buf: []u8) -> (n: int, err: Error) {
 	}
 	got, nerr := loop.recv_tcp(s.socket, buf)
 	if nerr != nil {
-		return 0, .Timeout if timed_out(nerr) else .IO_Error
+		return 0, .Timeout if netx.timed_out(nerr) else .IO_Error
 	}
 	return got, .None
-}
-
-// Whether a `loop` socket call ran out of time: its socket timeout expiring is
-// EAGAIN, which core:net reports as `.Would_Block` rather than `.Timeout`.
-@(private)
-timed_out :: proc(err: $E) -> bool {
-	return err == .Timeout || err == .Would_Block
 }
 
 /*
@@ -80,7 +74,7 @@ stream_write :: proc(s: ^Stream, buf: []u8, deadline := time.Tick{}, idle := tim
 	// One call: `loop.send_tcp` writes the whole buffer or says why not.
 	_, err := loop.send_tcp(s.socket, buf)
 	if err != nil {
-		return .Timeout if timed_out(err) else .IO_Error
+		return .Timeout if netx.timed_out(err) else .IO_Error
 	}
 	return .None
 }

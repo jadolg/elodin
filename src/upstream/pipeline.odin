@@ -6,6 +6,7 @@ import "core:time"
 import "elodin:dns"
 import "elodin:logx"
 import "elodin:loop"
+import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -1389,7 +1390,7 @@ pipe_write_framed :: proc(c: ^Pipe_Conn, framed: []u8, deadline: time.Tick) -> (
 		}
 		// A send timeout is the peer not reading, which is a different thing
 		// from the peer closing and is counted as such.
-		if !timed_out(werr) {
+		if !netx.timed_out(werr) {
 			return sent, .IO_Error
 		}
 		if n <= 0 {

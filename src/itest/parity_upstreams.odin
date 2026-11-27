@@ -193,7 +193,7 @@ down since.
 */
 Parity_Cached :: struct {
 	reply: []u8,
-	at:    time.Time,
+	at:    time.Tick,
 }
 
 /*
@@ -221,7 +221,7 @@ parity_cache_key :: proc(q: Parity_Query, allocator := context.temp_allocator) -
 	return string(key)
 }
 
-parity_cache_store :: proc(store: ^map[string]Parity_Cached, q: Parity_Query, reply: []u8, at: time.Time) {
+parity_cache_store :: proc(store: ^map[string]Parity_Cached, q: Parity_Query, reply: []u8, at: time.Tick) {
 	key := parity_cache_key(q)
 	if old, found := store[key]; found {
 		delete(old.reply)

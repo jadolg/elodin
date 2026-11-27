@@ -231,3 +231,13 @@ test_ip6_from_bytes_reverses_address_bytes :: proc(t: ^testing.T) {
 	testing.expect_value(t, b[15], 0x42)
 	testing.expect_value(t, ip6_from_bytes(b), a)
 }
+
+// A socket timeout is read as one whichever way core:net spells it, and nothing
+// else is.
+@(test)
+test_timed_out_is_timeout_or_would_block :: proc(t: ^testing.T) {
+	testing.expect(t, timed_out(net.TCP_Recv_Error.Timeout), "Timeout was not a timeout")
+	testing.expect(t, timed_out(net.TCP_Recv_Error.Would_Block), "Would_Block was not a timeout")
+	testing.expect(t, !timed_out(net.TCP_Recv_Error.Connection_Closed), "Connection_Closed was a timeout")
+	testing.expect(t, !timed_out(net.TCP_Recv_Error.None), "None was a timeout")
+}

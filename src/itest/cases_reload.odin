@@ -23,7 +23,7 @@ config_for_reload :: proc(r: ^Runner, udp_port, dot_port, doh_port: int, cert_fi
 		udp_port,
 		`["127.0.0.1:1"]`,
 		log = "{ level: debug }",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		tcp = tcp_at(udp_port),
 		listeners_extra = strings.concatenate(
 			[]string{dot_listener(r, dot_port, cert = cert_file, key = key_file), "\n", doh_listener(r, doh_port, cert = cert_file, key = key_file)},
 			context.temp_allocator,

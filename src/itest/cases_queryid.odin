@@ -68,7 +68,7 @@ run_query_id_cases :: proc(r: ^Runner) {
 	// ID on its own.
 	config := base_config(
 		udp_port,
-		fmt.tprintf(`["udp://127.0.0.1:%d"]`, upstream_port),
+		upstreams_at({upstream_port}, scheme = "udp://"),
 		timeout = "3s",
 		extra = "cookies: { enabled: false, upstream: false }",
 	)

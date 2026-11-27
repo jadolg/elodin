@@ -185,7 +185,7 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 	}
 	// Before the drain: the server's entry dates from its answer, and an entry
 	// stamped up to the drain's guard later would read younger than it is.
-	answered_at := time.now()
+	answered_at := time.tick_now()
 	reference, from, asked := parity_upstreams_reference(run.ups, q)
 	/*
 	The race's losers have to be in before the next ask resets the mocks; see
@@ -254,7 +254,7 @@ parity_settle :: proc(run: ^Parity_Mock_Run, q: Parity_Query, index: int) {
 			return
 		}
 		reference = entry.reply
-		age = u32(time.duration_seconds(time.since(entry.at))) + 1
+		age = u32(time.duration_seconds(time.tick_since(entry.at))) + 1
 	}
 
 	/*

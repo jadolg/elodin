@@ -452,7 +452,7 @@ config_for_shutdown :: proc(udp_port, upstream_port: int) -> string {
 		udp_port,
 		upstream_at(upstream_port),
 		log = "{ level: info }",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		tcp = tcp_at(udp_port),
 		cache = "{ enabled: true }",
 	)
 }

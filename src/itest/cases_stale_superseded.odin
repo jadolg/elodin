@@ -59,7 +59,7 @@ run_stale_superseded_cases :: proc(r: ^Runner) {
 
 	// Past `max_ttl`, which is what the entry was stored under: the clock is
 	// what this waits for.
-	time.sleep(1500 * time.Millisecond)
+	time.sleep(1500 * time.Millisecond) // lint:allow the event awaited is the entry's expiry, which only the clock brings
 
 	after := mock_make("superseded-after", upstream_port)
 	mock_delay_all(after, 800 * time.Millisecond, make_a_response(qname, {203, 0, 113, 42}, 0, context.allocator))

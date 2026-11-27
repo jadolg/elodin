@@ -37,7 +37,7 @@ run_prefetch_cases :: proc(r: ^Runner) {
 		upstream_at(upstream_port),
 		timeout = "3s",
 		upstream_extra = "  attempts: 1",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		tcp = tcp_at(tcp_port),
 		cache = "{ enabled: true, max_entries: 100, prefetch_min_ttl: 0 }",
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, tcp_port = tcp_port})
