@@ -76,11 +76,15 @@ ADDED = [
 ]
 
 
-# Added code only: comments and strings may name the figure. A constant's own
-# declaration (`NAME :: 512`, `NAME : u16 : 512`) is where it is named.
+# Added code only: comments and strings may name the figure. A scalar
+# constant's own declaration (`NAME :: 512`, `NAME : T : 512`, T one token) is
+# where it is named; a type, a procedure or a composite literal is not one.
 SIZE_LITERAL = ("size-literal", r"(?<!\w)(?<!\d\.)(512|1232|65535)(?!\w|\.\d)", lambda p: True,
                 "name the size: dns.MAX_UDP_SIZE, config.DEFAULT_MAX_UDP_RESPONSE, server.UPSTREAM_UDP_SIZE, dns.MAX_MESSAGE")
-CONSTANT = re.compile(r"^\s*[A-Za-z_]\w*\s*:[^=:,(\[{]*:(?!\s*(#\w+\s+)*(proc|struct|union|enum|bit_set|bit_field)\b)")
+CONSTANT = re.compile(r"^\s*[A-Za-z_]\w*\s*:(\s*[^\s:=]+\s*)?:(?!=)"
+                      r"(?!\s*(#\w+\s+)*(proc|struct|union|enum|bit_set|bit_field|distinct|matrix|map)\b|\s*[\[{^])")
+# `65_535` is 65535.
+SEPARATOR = re.compile(r"(?<=\d)_(?=\d)")
 
 
 def code_only(source):
@@ -118,7 +122,7 @@ def check_code(path, n, text, code, hits):
     name, pattern, applies, message = SIZE_LITERAL
     if n > len(code) or not applies(path) or ALLOW.search(text) or CONSTANT.match(code[n - 1]):
         return
-    if re.search(pattern, code[n - 1]):
+    if re.search(pattern, SEPARATOR.sub("", code[n - 1])):
         hits.append(f"{path}:{n}: {name}: {message}\n    {text.strip()}")
 
 
