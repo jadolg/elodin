@@ -56,8 +56,9 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   publisher empties on purpose therefore keeps its last copy; with no copy it
   adds nothing. A cached copy that is a web page, is empty or cannot be read
   whole is not used, and is downloaded over even inside the refresh window:
-  one larger than any download (64 MiB), one there is no memory to hold, and
-  one whose size changes while it is read are each refused, never loaded cut short.
+  one larger than any download (64 MiB) and one whose size changes while it is
+  read are each refused, never loaded cut short. One there is no memory to hold
+  drops the load, as below.
 - The cached copy is replaced by writing a temporary file beside it, syncing
   it, then renaming it over the old one. A power cut mid-write leaves the old
   copy or the new one, never a truncated list.
@@ -67,22 +68,24 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   effect`). This happens with an unwritable or cleared `cache_dir`. A list that
   has never loaded does not hold the other lists back, and neither does a
   `file:` list: delete one and its rules go at the next refresh.
-- If there is no memory to build the rule sets whole (to read a `file:` list,
-  to hold a rule, `$badfilter` or regex, or to record which lists loaded), the
-  load is dropped and every rule already in effect is kept, whatever the kind
-  of list (`filter: there is no memory to build the rule sets; keeping the
-  rules already in effect`, after `list NAME: there is no memory to read
-  "PATH"` for a `file:` list). Lists after the one that ran out are not tried,
-  and a download that was being read is not cached. At startup there are no
-  rules in effect yet, so none apply until a retry succeeds. Sets missing a
-  rule are never swapped in.
+- If there is no memory to build the rule sets whole (to read a `file:` list
+  or a cached copy, to hold a rule, `$badfilter` or regex, or to record which
+  lists loaded), the load is dropped and every rule already in effect is kept,
+  whatever the kind of list (`filter: there is no memory to build the rule
+  sets; keeping the rules already in effect`, after `list NAME: there is no
+  memory to read "PATH"` for a `file:` list, or `list NAME: the cached copy at
+  PATH is not read: there is no memory to read it`). Lists after the one that
+  ran out are not tried, and a download that was being read is not cached. At
+  startup there are no rules in effect yet, so none apply until a retry
+  succeeds. Sets missing a rule are never swapped in.
 - A refresh where some downloaded list is unavailable, or was served from its
   cached copy because the download failed or held no rules, or that was dropped
   for want of memory, is retried after 1
   minute, then 2, 4 and so on, up to 1 hour or `refresh`, whichever is shorter
   (`blocklists: not every list is current; trying again in 1m0s`). A start that
   could not load every list is retried the same way. A missing `file:` list is
-  not retried.
+  not retried. A load dropped for want of memory is retried the same way even
+  under `--no-fetch` or `refresh: 0`, at most 1 hour apart, until it succeeds.
 - A rule costs about 35 bytes resident: its name, a flags byte and an 8-byte
   slot in a table kept at most 80% full. A load or refresh builds the new rule
   sets beside the ones in use and frees the old ones once they are swapped out,

@@ -1072,3 +1072,129 @@ test_an_operator_allow_rule_without_memory_drops_the_build :: proc(t: ^testing.T
 	filter.set_destroy(block)
 	filter.set_destroy(allow)
 }
+
+/*
+A rebuild dropped for want of memory is tried again whether or not the server
+fetches or refreshes (#765): what it lacked was memory, not a list the network
+could bring back, and the rules in effect may be none. One that was not current
+for want of a download is retried only where downloads and refreshes happen.
+*/
+@(test)
+test_a_rebuild_without_memory_is_retried_whatever_the_refresh :: proc(t: ^testing.T) {
+	day := 24 * time.Hour
+	Case :: struct {
+		current, no_memory, no_fetch: bool,
+		refresh:                      time.Duration,
+		want:                         time.Duration,
+	}
+	cases := []Case {
+		{current = true, refresh = day, want = 0},
+		{refresh = day, want = REFRESH_RETRY_FIRST},
+		{no_fetch = true, refresh = day, want = 0},
+		{refresh = 0, want = 0},
+		{no_memory = true, refresh = day, want = REFRESH_RETRY_FIRST},
+		{no_memory = true, no_fetch = true, refresh = day, want = REFRESH_RETRY_FIRST},
+		{no_memory = true, refresh = 0, want = REFRESH_RETRY_FIRST},
+		{no_memory = true, no_fetch = true, refresh = 0, want = REFRESH_RETRY_FIRST},
+	}
+	for c in cases {
+		got := retry_after(c.current, c.no_memory, c.no_fetch, c.refresh, 0)
+		testing.expectf(t, got == c.want, "%v: waits %v", c, got)
+	}
+	// With no refresh interval to stop at, the doubling stops at the cap.
+	testing.expect_value(t, retry_after(false, true, true, 0, REFRESH_RETRY_MAX), REFRESH_RETRY_MAX)
+
+	// A retry is due once waited, whether or not refreshes run; the interval
+	// only where they do.
+	testing.expect(t, refresh_due(true, 0, REFRESH_RETRY_FIRST, REFRESH_RETRY_FIRST), "a retry without refreshes is never due")
+	testing.expect(t, !refresh_due(true, 0, REFRESH_RETRY_FIRST, REFRESH_RETRY_FIRST - time.Second), "a retry is due before its wait")
+	testing.expect(t, !refresh_due(true, day, 0, 2 * day), "a refresh is due without the network")
+	testing.expect(t, !refresh_due(false, 0, 0, 2 * day), "a refresh is due with refreshes off")
+	testing.expect(t, refresh_due(false, day, 0, day), "the interval's refresh is not due")
+	testing.expect(t, !refresh_due(false, day, 0, day - time.Second), "the interval's refresh is due early")
+}
+
+// A cached copy there is no memory to read drops the rebuild, as a `file:` list
+// does, rather than leaving its list out of a set swapped in (#765).
+@(test)
+test_a_cached_copy_with_no_memory_to_read_drops_the_rebuild :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg, dir := list_test_dir(t, "no-memory-copy")
+	defer os.remove(dir)
+	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt", format = .Hosts, enabled = true}
+	path := list_cache_path(&cfg, list)
+	if !testing.expect(t, os.write_entire_file(path, "0.0.0.0 a.example\n") == nil, "cannot write the copy") {
+		return
+	}
+	defer os.remove(path)
+	// The premise: with memory, the copy loads.
+	text, load := cached_copy(&cfg, list, .Stale)
+	testing.expect_value(t, load, List_Load.Stale)
+	delete(text)
+
+	f := testkit.Fail_Nth{backing = context.allocator, fail_at = 1, fail_for = 1 << 30}
+	{
+		context.allocator = testkit.fail_nth(&f)
+		text, load = cached_copy(&cfg, list, .Stale)
+	}
+	testing.expect(t, f.seen > 0, "the allocator was not asked")
+	testing.expect_value(t, load, List_Load.No_Memory)
+	testing.expect_value(t, text, "")
+}
+
+/*
+The operator's rules stop at the first there is no memory for: the build is
+dropped, and the rules after it are neither added nor warned of as adding
+nothing (#765).
+*/
+@(test)
+test_operator_rules_stop_at_the_first_without_memory :: proc(t: ^testing.T) {
+	N :: 150
+	rules: [N]string
+	for &rule, i in rules {
+		rule = fmt.tprintf("||operator-%d.example^", i)
+	}
+	cfg := config.default_config()
+	cfg.blocking.rules = rules[:]
+	refused := 0
+	for fail_at := 1; ; fail_at += 1 {
+		f := testkit.Fail_Nth{backing = context.allocator, fail_at = fail_at, fail_for = 1}
+		block, allow: ^filter.Set
+		whole: bool
+		{
+			context.allocator = testkit.fail_nth(&f)
+			block, allow = filter.set_make(), filter.set_make()
+			if block != nil && allow != nil {
+				whole = add_operator_rules(&cfg, block, allow)
+			}
+		}
+		defer filter.set_destroy(block)
+		defer filter.set_destroy(allow)
+		if f.seen < fail_at {
+			testing.expect(t, whole, "a run with every allocation granted is not whole")
+			testing.expect_value(t, block.count, N)
+			break
+		}
+		if block == nil || allow == nil {
+			continue
+		}
+		refused += 1
+		testing.expectf(t, !whole, "run %d: a refusal reads as whole", fail_at)
+		// What was added is the rules before the refused one, and none after.
+		first := N
+		for i in 0 ..< N {
+			if filter.set_cover(block, fmt.tprintf("operator-%d.example", i), .A) == .None {
+				first = i
+				break
+			}
+		}
+		if !testing.expectf(t, first < N, "run %d: every rule was added", fail_at) {
+			continue
+		}
+		for i in first + 1 ..< N {
+			name := fmt.tprintf("operator-%d.example", i)
+			testing.expectf(t, filter.set_cover(block, name, .A) == .None, "run %d: %s was added after the refusal at %d", fail_at, name, first)
+		}
+	}
+	testing.expect(t, refused > 0, "no refusal reached the operator's rules")
+}

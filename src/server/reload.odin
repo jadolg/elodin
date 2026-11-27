@@ -182,6 +182,7 @@ On any thread, one at a time.
 */
 rebuild_rules :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool) -> (lists_current: bool) {
 	if !cfg.blocking.enabled {
+		s.rules_no_memory = false
 		clear_filters(s)
 		// The line a rebuild ends with, as `reload_filters_from` logs its own.
 		logx.infof("filter: blocking is off; no rules in effect")

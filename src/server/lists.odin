@@ -67,6 +67,9 @@ List_Load :: enum u8 {
 	No_Memory,
 }
 
+// Why `read_cache_file` refuses a copy there is no memory to hold.
+NO_MEMORY_TO_READ :: "there is no memory to read it"
+
 // What a rebuild says when there is no memory to build the rule sets whole.
 NO_MEMORY_FOR_RULES :: "filter: there is no memory to build the rule sets; keeping the rules already in effect"
 
@@ -128,7 +131,12 @@ add_operator_rules :: proc(cfg: ^config.Config, block, allow: ^filter.Set) -> bo
 	clear(&block.cancelled)
 	clear(&allow.cancelled)
 	for rule in cfg.blocking.rules {
-		if !operator_rule_takes(block, allow, rule) {
+		takes := operator_rule_takes(block, allow, rule)
+		// A rule refused for want of memory is no rule to warn of.
+		if !filter.set_whole(block) || !filter.set_whole(allow) {
+			return false
+		}
+		if !takes {
 			warn_rule_adds_nothing(rule)
 		}
 	}
@@ -142,11 +150,15 @@ add_operator_rules :: proc(cfg: ^config.Config, block, allow: ^filter.Set) -> bo
 			}
 			text = prefixed
 		}
-		if !operator_rule_takes(block, allow, text) {
+		takes := operator_rule_takes(block, allow, text)
+		if !filter.set_whole(block) || !filter.set_whole(allow) {
+			return false
+		}
+		if !takes {
 			warn_rule_adds_nothing(rule)
 		}
 	}
-	return filter.set_whole(block) && filter.set_whole(allow)
+	return true
 }
 
 /*
@@ -430,7 +442,8 @@ cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Loa
 		if why != "" {
 			logx.warnf("list %s: the cached copy at %s is not read: %s", list.name, cache_path, why)
 		}
-		return "", .Unavailable
+		// Not a copy lost: the rebuild is dropped and tried again.
+		return "", .No_Memory if why == NO_MEMORY_TO_READ else .Unavailable
 	}
 	// A page an earlier build cached before downloads were checked (#317).
 	if begins_with_markup(string(data)) {
@@ -585,7 +598,7 @@ read_cache_file :: proc(path: string, allocator := context.allocator) -> (data: 
 	*/
 	out, merr := make([]byte, int(st.st_size) + 1, allocator)
 	if merr != nil {
-		return nil, "there is no memory to read it", false
+		return nil, NO_MEMORY_TO_READ, false
 	}
 	n := 0
 	for n < len(out) {
@@ -785,6 +798,7 @@ or the sets were dropped for want of memory, so the caller retries sooner than
 the interval; see `refresh_retry`.
 */
 reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool) -> (current: bool) {
+	s.rules_no_memory = false
 	lists := len(cfg.blocking.lists)
 	loads, err := make([]List_Load, lists + len(cfg.blocking.allow_lists))
 	defer delete(loads)
@@ -794,6 +808,7 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 	}
 	if block == nil {
 		logx.warnf("%s", NO_MEMORY_FOR_RULES)
+		s.rules_no_memory = true
 		return false
 	}
 
@@ -826,6 +841,7 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 		// a key, and the one that loaded is the one whose rules are in effect.
 		if list.enabled && (load == .Current || load == .Stale) && map_insert(&loaded, list_key(list, i >= lists), true) == nil {
 			logx.warnf("%s", NO_MEMORY_FOR_RULES)
+			s.rules_no_memory = true
 			delete(loaded)
 			filter.set_destroy(block)
 			filter.set_destroy(allow)
@@ -886,7 +902,40 @@ refresh_retry :: proc(retry, interval: time.Duration) -> time.Duration {
 	return min(retry * 2, interval, REFRESH_RETRY_MAX)
 }
 
+/*
+The wait before the next rebuild after one that was `current` or not: zero for
+none sooner than the interval. One that was not current is tried again only
+where a list it lacked can come back, which needs the network (`no_fetch`
+false) and refreshes (`refresh` above zero); one dropped for want of memory
+(`no_memory`) is tried again whatever those say, at most REFRESH_RETRY_MAX
+apart, since what it lacked was memory and the rules in effect may be none.
+`retry` is the wait just served, as `refresh_retry` takes it.
+*/
+retry_after :: proc(current, no_memory, no_fetch: bool, refresh, retry: time.Duration) -> time.Duration {
+	switch {
+	case current:
+		return 0
+	case no_memory:
+		return refresh_retry(retry, refresh if refresh > 0 else REFRESH_RETRY_MAX)
+	case no_fetch || refresh <= 0:
+		return 0
+	}
+	return refresh_retry(retry, refresh)
+}
+
 // How long after the last refresh the next one is due.
 refresh_wait :: proc(retry, interval: time.Duration) -> time.Duration {
 	return retry if retry > 0 else interval
+}
+
+/*
+Whether a refresh is due `since` the last one: a retry `retry_after` set is due
+once it has been waited, whether or not refreshes run; the interval only where
+they do, with the network (`no_fetch` false) and `refresh` above zero.
+*/
+refresh_due :: proc(no_fetch: bool, refresh, retry, since: time.Duration) -> bool {
+	if retry <= 0 && (no_fetch || refresh <= 0) {
+		return false
+	}
+	return since >= refresh_wait(retry, refresh)
 }
