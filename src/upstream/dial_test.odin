@@ -66,7 +66,10 @@ test_a_tcp_dial_reset_before_it_connected_is_retried :: proc(t: ^testing.T) {
 		return
 	}
 	defer net.close(listener)
-	bound, _ := net.bound_endpoint(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
 	u, uerr := make_upstream(
 		config.Upstream_Spec{name = "reset", kind = .TCP, address = "127.0.0.1", port = bound.port},
 		8,

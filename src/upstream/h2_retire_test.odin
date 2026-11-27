@@ -76,8 +76,14 @@ start_reader :: proc(t: ^testing.T, u: ^Upstream, stream: Stream) -> (r: Reader_
 	}, &st)
 	ok = testing.expect(t, spawned, "cannot start a fiber") && testing.expect(t, sync.sema_wait_with_timeout(&st.started, 5 * time.Second), "the reader never started")
 	if !ok {
-		// Stopped here, while `st` is still in scope for the fiber.
+		// Stopped here, while `st` is still in scope for the fiber. A stream no
+		// connection took is closed too, so a failed start leaves the caller
+		// nothing to clean up.
 		stop_reader(&r)
+		if st.hc == nil {
+			stream := stream
+			stream_close(&stream)
+		}
 		return {}, false
 	}
 	r.hc = st.hc
@@ -96,11 +102,7 @@ stop_reader :: proc(r: ^Reader_Loop) {
 // Waits up to five seconds for every reader counted against `u` to have gone.
 @(private = "file")
 readers_gone :: proc(u: ^Upstream) -> bool {
-	start := time.tick_now()
-	for h2_readers_running(u) > 0 && time.tick_since(start) < 5 * time.Second {
-		time.sleep(time.Millisecond)
-	}
-	return h2_readers_running(u) == 0
+	return wait_until(u, proc(u: ^Upstream) -> bool {return h2_readers_running(u) == 0}, 5 * time.Second)
 }
 
 @(private = "file")
@@ -187,7 +189,7 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 		u = u,
 	}
 	th := thread.create_and_start_with_poly_data(&rep, proc(rep: ^Replacement) {
-		rep.conn, _, _ = get_h2_conn(rep.u, 200 * time.Millisecond, 20 * time.Millisecond)
+		rep.conn, _, _ = get_h2_conn(rep.u, 200 * time.Millisecond, 20 * time.Millisecond) // lint:allow what the redial comes to is beside the point: it is refused
 		sync.sema_post(&rep.done)
 	})
 	returned := sync.sema_wait_with_timeout(&rep.done, 5 * time.Second)
@@ -260,48 +262,17 @@ test_finished_h2_readers_leave_no_count_behind :: proc(t: ^testing.T) {
 			retire_h2_conn(old)
 		}
 		_ = net.shutdown(socket, .Receive)
-		_ = readers_gone(u)
+		testing.expect(t, readers_gone(u), "a reader did not leave when the peer hung up")
 	}
 	testing.expect_value(t, h2_readers_running(u), 0)
 }
 
 // Readers counted against `u` and not yet gone.
+@(private)
 h2_readers_running :: proc(u: ^Upstream) -> int {
 	sync.mutex_lock(&u.mu)
 	defer sync.mutex_unlock(&u.mu)
 	return u.h2_readers
-}
-
-@(private = "file")
-Close_Notify_Peer :: struct {
-	listener: net.TCP_Socket,
-	ctx:      ^tlsx.Context,
-	// How the peer's reading ended: `.Closed` for a close_notify, an error
-	// for a bare EOF.
-	ended:    tlsx.Error,
-}
-
-@(private = "file")
-read_until_closed :: proc(p: ^Close_Notify_Peer) {
-	p.ended = .IO_Error
-	socket, _, aerr := net.accept_tcp(p.listener)
-	if aerr != nil {
-		return
-	}
-	_ = net.set_option(socket, .Receive_Timeout, 3 * time.Second)
-	conn, terr := tlsx.server_accept(p.ctx, socket)
-	if terr != .None {
-		net.close(socket)
-		return
-	}
-	defer tlsx.close(conn)
-	buf: [1024]u8
-	for {
-		if _, err := tlsx.read(conn, buf[:]); err != .None {
-			p.ended = err
-			return
-		}
-	}
 }
 
 /*
@@ -319,11 +290,16 @@ test_retiring_a_tls_h2_conn_sends_close_notify :: proc(t: ^testing.T) {
 	defer dot_fixture_destroy(&f)
 	listener, bound, sctx, cctx := f.listener, f.bound, f.sctx, f.cctx
 
-	peer := Close_Notify_Peer {
+	peer := Tls_Peer {
 		listener = listener,
 		ctx      = sctx,
+		conns    = 1,
 	}
-	peer_thread := thread.create_and_start_with_poly_data(&peer, read_until_closed)
+	peer_thread := thread.create_and_start_with_poly_data(&peer, tls_peer_run)
+	if !testing.expect(t, peer_thread != nil, "cannot start the peer") {
+		return
+	}
+	defer tls_peer_free(&peer)
 	defer {
 		// A return before `open_stream` connected leaves the peer in `accept`,
 		// and the join would hang the run instead of failing it.
@@ -360,7 +336,7 @@ test_retiring_a_tls_h2_conn_sends_close_notify :: proc(t: ^testing.T) {
 
 	retire_h2_conn(r.hc)
 	thread.join(peer_thread)
-	testing.expect_value(t, peer.ended, tlsx.Error.Closed)
+	testing.expect_value(t, peer.ended[0], tlsx.Error.Closed)
 	testing.expect(t, readers_gone(u), "the retired reader was never woken from its read")
 }
 

@@ -74,11 +74,8 @@ pipe_mock_loop :: proc(m: ^Pipe_Mock) {
 	// Second first: out of order, as RFC 7766 section 7 lets a server answer.
 	for i in 0 ..< 2 {
 		q := queries[1 - i]
-		framed := make([]u8, 2 + len(q), context.allocator)
+		framed := frame_tcp(q, context.allocator)
 		defer delete(framed)
-		framed[0] = u8(len(q) >> 8)
-		framed[1] = u8(len(q))
-		copy(framed[2:], q)
 		// The query echoed back with QR set is everything `response_matches`
 		// asks for, and keeps an encoder out of this responder.
 		framed[4] |= 0x80
@@ -1000,11 +997,8 @@ split_read :: proc(m: ^Split_Mock, client: net.TCP_Socket, buf: []u8) -> bool {
 
 @(private = "file")
 split_write :: proc(client: net.TCP_Socket, query: []u8, whole: bool, m: ^Split_Mock) -> bool {
-	framed := make([]u8, 2 + len(query), context.allocator)
+	framed := frame_tcp(query, context.allocator)
 	defer delete(framed)
-	framed[0] = u8(len(query) >> 8)
-	framed[1] = u8(len(query))
-	copy(framed[2:], query)
 	framed[4] |= 0x80
 	return write_all_tcp(client, framed) == .None
 }
@@ -1447,11 +1441,8 @@ stall_mock_loop :: proc(m: ^Stall_Mock) {
 		return
 	}
 	defer delete(warm)
-	framed := make([]u8, 2 + len(warm), context.allocator)
+	framed := frame_tcp(warm, context.allocator)
 	defer delete(framed)
-	framed[0] = u8(len(warm) >> 8)
-	framed[1] = u8(len(warm))
-	copy(framed[2:], warm)
 	framed[4] |= 0x80
 	if write_all_tcp(client, framed) != .None {
 		return

@@ -46,25 +46,11 @@ referral_loop :: proc(m: ^Referral_Mock) {
 	}
 }
 
-// A normal recursive answer: the query echoed back with QR and RA set.
-@(private = "file")
-echo_loop :: proc(m: ^Referral_Mock) {
-	buf: [512]u8
-	for !sync.atomic_load(&m.stop) {
-		n, client, err := net.recv_udp(m.socket, buf[:])
-		if err != nil || n < dns.HEADER_SIZE {
-			continue
-		}
-		sync.atomic_add(&m.hits, 1)
-		buf[2] |= 0x80
-		buf[3] |= 0x80
-		_, _ = net.send_udp(m.socket, buf[:n], client)
-	}
-}
-
 @(test)
 test_a_referral_is_not_taken_as_an_answer :: proc(t: ^testing.T) {
-	referrer, answerer: Referral_Mock
+	referrer: Referral_Mock
+	// A normal recursive answer: the query echoed back with QR and RA set.
+	answerer: Echo_Mock
 	// Neither started means neither closed: a zero socket here is fd 0, which
 	// under `odin test` is another test's.
 	bad, bad_thread, bad_ok := start_udp_mock(t, &referrer, referral_loop, "referrer")
@@ -72,7 +58,7 @@ test_a_referral_is_not_taken_as_an_answer :: proc(t: ^testing.T) {
 		return
 	}
 	defer stop_udp_mock(&referrer, bad_thread, bad)
-	good, good_thread, good_ok := start_udp_mock(t, &answerer, echo_loop, "answerer")
+	good, good_thread, good_ok := start_udp_mock(t, &answerer, echo_mock_loop, "answerer")
 	if !good_ok {
 		return
 	}

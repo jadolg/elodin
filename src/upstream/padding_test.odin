@@ -81,10 +81,7 @@ dot_padding_serve :: proc(m: ^Dot_Padding_Mock) {
 	if !padded {
 		return
 	}
-	framed := make([]u8, 2 + len(reply), context.temp_allocator)
-	framed[0] = u8(len(reply) >> 8)
-	framed[1] = u8(len(reply))
-	copy(framed[2:], reply)
+	framed := frame_tcp(reply)
 	/*
 	Counted before the write rather than after it, because after it is a race the
 	case can lose: `exchange` returns as soon as the client has read this reply,

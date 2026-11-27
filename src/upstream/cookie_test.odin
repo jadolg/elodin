@@ -88,7 +88,7 @@ cookie_mock_reply :: proc(m: ^Cookie_Mock, query: []u8, count: int) -> (reply: [
 	sent, has_cookie := dns.find_edns_option(msg, .Cookie)
 
 	rcode := dns.Rcode.No_Error
-	if (m.demand && len(sent) < 16) || m.always_bad {
+	if (m.demand && len(sent) < COOKIE_CLIENT_LEN + COOKIE_SERVER_MIN) || m.always_bad {
 		rcode = .Bad_Cookie
 	}
 	resp := dns.make_response(msg, rcode, context.temp_allocator)
@@ -189,7 +189,7 @@ test_upstream_cookie_is_sent_and_learned :: proc(t: ^testing.T) {
 
 	again, had_again := seen_cookie(&m)
 	if testing.expect(t, had_again, "the second query carried no cookie") {
-		testing.expect_value(t, len(again), COOKIE_CLIENT_LEN + 8)
+		testing.expect_value(t, len(again), COOKIE_CLIENT_LEN + COOKIE_SERVER_MIN)
 		testing.expect(t, mem.compare(again[8:], m.server[:]) == 0, "the server cookie was not sent back")
 		testing.expect(t, mem.compare(again[:8], asked) == 0, "the client cookie changed between queries")
 	}
@@ -561,17 +561,6 @@ tcp_answerer_serve :: proc(m: ^Tcp_Answerer) {
 	if net.set_option(conn, .Receive_Timeout, 2 * time.Second) != nil {
 		return
 	}
-	read_exact :: proc(conn: net.TCP_Socket, buf: []u8) -> bool {
-		got := 0
-		for got < len(buf) {
-			n, err := net.recv_tcp(conn, buf[got:])
-			if err != nil || n == 0 {
-				return false
-			}
-			got += n
-		}
-		return true
-	}
 	answer := Cookie_Mock {
 		server     = m.server,
 		always_bad = m.bad,
@@ -579,28 +568,26 @@ tcp_answerer_serve :: proc(m: ^Tcp_Answerer) {
 	for {
 		defer free_all(context.temp_allocator)
 		size: [2]u8
-		if !read_exact(conn, size[:]) {
+		if read_full_tcp(conn, size[:]) != .None {
 			return
 		}
 		query := make([]u8, int(size[0]) << 8 | int(size[1]), context.temp_allocator)
-		if !read_exact(conn, query) {
+		if read_full_tcp(conn, query) != .None {
 			return
 		}
 		wire, ok := cookie_mock_reply(&answer, query, 1)
 		if !ok {
 			return
 		}
-		framed := make([]u8, 2 + len(wire), context.temp_allocator)
-		framed[0], framed[1] = u8(len(wire) >> 8), u8(len(wire))
-		copy(framed[2:], wire)
+		framed := frame_tcp(wire)
 		// Before the send: the client reads these as soon as it has the reply.
 		msg, derr := dns.decode_message(query, context.temp_allocator)
 		if derr != .None {
 			return
 		}
-		if sent, found := dns.find_edns_option(msg, .Cookie); found && len(sent) == 16 {
+		if sent, found := dns.find_edns_option(msg, .Cookie); found && len(sent) == COOKIE_CLIENT_LEN + COOKIE_SERVER_MIN {
 			sync.mutex_lock(&m.mu)
-			copy(m.seen[:], sent[8:])
+			copy(m.seen[:], sent[COOKIE_CLIENT_LEN:])
 			sync.mutex_unlock(&m.mu)
 		}
 		sync.atomic_add(&m.answered, 1)
@@ -753,7 +740,7 @@ test_the_client_cookie_rolls_over :: proc(t: ^testing.T) {
 		testing.expectf(t, err == .None, "exchange for %s failed: %v", name, err)
 	}
 	before, had := seen_cookie(&m)
-	if !testing.expect(t, had && len(before) == COOKIE_CLIENT_LEN + 8, "the premise: a server cookie was learned and sent") {
+	if !testing.expect(t, had && len(before) == COOKIE_CLIENT_LEN + COOKIE_SERVER_MIN, "the premise: a server cookie was learned and sent") {
 		return
 	}
 	old: [COOKIE_CLIENT_LEN]u8
@@ -807,7 +794,7 @@ test_a_rollover_covers_every_query_out :: proc(t: ^testing.T) {
 	_, kept_ok, kept_dry := attach_cookie(u, edns_query("example.org."), time.Second, context.temp_allocator, roll = false)
 	testing.expectf(t, kept_ok, "the retry took no cookie (out of memory: %v)", kept_dry)
 	sync.mutex_lock(&u.mu)
-	kept := u.cookie.client == old && u.cookie.server_len == 8
+	kept := u.cookie.client == old && u.cookie.server_len == COOKIE_SERVER_MIN
 	sync.mutex_unlock(&u.mu)
 	testing.expect(t, kept, "a retry rolled the cookie over")
 

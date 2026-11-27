@@ -45,7 +45,7 @@ Ttl_Mock :: struct {
 
 @(private = "file")
 ttl_mock_loop :: proc(m: ^Ttl_Mock) {
-	buf: [512]u8
+	buf: [dns.MAX_UDP_SIZE]u8
 	for !sync.atomic_load(&m.stop) {
 		defer free_all(context.temp_allocator)
 		n, client, err := net.recv_udp(m.socket, buf[:])
@@ -56,63 +56,70 @@ ttl_mock_loop :: proc(m: ^Ttl_Mock) {
 		if derr != .None || len(msg.question) != 1 {
 			continue
 		}
+		// The settings as they stand, read once under the lock.
 		sync.mutex_lock(&m.mu)
 		m.asked += 1
-		silent, addr, ttl, delay, also, cname, stray, cname_last, turn := m.silent, m.addr, m.ttl, m.delay, m.also, m.cname, m.stray, m.cname_last, m.asked % 2 == 0
-		addr6, no_a, servfail_a, truncated_a, cname_only := m.addr6, m.no_a, m.servfail_a, m.truncated_a, m.cname_only
+		now := m^
 		sync.mutex_unlock(&m.mu)
-		if silent {
+		if now.silent {
 			continue
 		}
-		if delay > 0 {
-			time.sleep(delay) // lint:allow stands in for a slow bootstrap server; nothing is ordered on it
+		if now.delay > 0 {
+			time.sleep(now.delay) // lint:allow stands in for a slow bootstrap server; nothing is ordered on it
 		}
-		resp := dns.make_response(msg, .Serv_Fail if servfail_a && msg.question[0].type == .A else .No_Error, context.temp_allocator)
 		q := msg.question[0]
-		if q.type == .AAAA && addr6 != {} {
-			answer := make([]dns.Record, 1, context.temp_allocator)
-			answer[0] = dns.Record{name = q.name, type = .AAAA, class = .IN, ttl = ttl, data = dns.Rdata_AAAA{addr = addr6}}
-			resp.answer = answer
-		}
-		if q.type == .A && truncated_a {
-			resp.flags.tc = true
-		}
-		if q.type == .A && cname_only {
-			answer := make([]dns.Record, 1, context.temp_allocator)
-			answer[0] = dns.Record{name = q.name, type = .CNAME, class = .IN, ttl = ttl, data = dns.Rdata_Name{name = "unfollowed.invalid."}}
-			resp.answer = answer
-		}
-		if q.type == .A && !no_a && !servfail_a && !truncated_a && !cname_only {
-			answer := make([dynamic]dns.Record, context.temp_allocator)
-			if stray != {} {
-				append(&answer, dns.Record{name = "stray.invalid.", type = .A, class = .IN, ttl = 1, data = dns.Rdata_A{addr = stray}})
-			}
-			owner := q.name
-			if cname != 0 {
-				owner = "target.invalid."
-				if !cname_last {
-					append(&answer, dns.Record{name = q.name, type = .CNAME, class = .IN, ttl = cname, data = dns.Rdata_Name{name = owner}})
-				}
-			}
-			first, second := addr, also
-			if also != {} && turn {
-				first, second = also, addr
-			}
-			append(&answer, dns.Record{name = owner, type = .A, class = .IN, ttl = ttl, data = dns.Rdata_A{addr = first}})
-			if also != {} {
-				append(&answer, dns.Record{name = owner, type = .A, class = .IN, ttl = ttl, data = dns.Rdata_A{addr = second}})
-			}
-			if cname != 0 && cname_last {
-				append(&answer, dns.Record{name = q.name, type = .CNAME, class = .IN, ttl = cname, data = dns.Rdata_Name{name = owner}})
-			}
-			resp.answer = answer[:]
-		}
+		resp := dns.make_response(msg, .Serv_Fail if now.servfail_a && q.type == .A else .No_Error, context.temp_allocator)
+		resp.flags.tc = q.type == .A && now.truncated_a
+		resp.answer = ttl_mock_answer(&now, q, turn = now.asked % 2 == 0)
 		wire, _, eerr := dns.encode_message(resp, context.temp_allocator)
 		if eerr != .None {
 			continue
 		}
 		_, _ = net.send_udp(m.socket, wire, client) // lint:allow an answer lost here fails the lookup the test checks
 	}
+}
+
+// The answer section the settings in `s` give `q`, in the temp arena; `turn`
+// swaps the order of two addresses.
+@(private = "file")
+ttl_mock_answer :: proc(s: ^Ttl_Mock, q: dns.Question, turn: bool) -> []dns.Record {
+	switch {
+	case q.type == .AAAA && s.addr6 != {}:
+		answer := make([]dns.Record, 1, context.temp_allocator)
+		answer[0] = dns.Record{name = q.name, type = .AAAA, class = .IN, ttl = s.ttl, data = dns.Rdata_AAAA{addr = s.addr6}}
+		return answer
+	case q.type != .A:
+		return nil
+	case s.cname_only:
+		answer := make([]dns.Record, 1, context.temp_allocator)
+		answer[0] = dns.Record{name = q.name, type = .CNAME, class = .IN, ttl = s.ttl, data = dns.Rdata_Name{name = "unfollowed.invalid."}}
+		return answer
+	case s.no_a || s.servfail_a || s.truncated_a:
+		return nil
+	}
+	answer := make([dynamic]dns.Record, context.temp_allocator)
+	if s.stray != {} {
+		append(&answer, dns.Record{name = "stray.invalid.", type = .A, class = .IN, ttl = 1, data = dns.Rdata_A{addr = s.stray}})
+	}
+	owner := q.name
+	if s.cname != 0 {
+		owner = "target.invalid."
+		if !s.cname_last {
+			append(&answer, dns.Record{name = q.name, type = .CNAME, class = .IN, ttl = s.cname, data = dns.Rdata_Name{name = owner}})
+		}
+	}
+	first, second := s.addr, s.also
+	if s.also != {} && turn {
+		first, second = s.also, s.addr
+	}
+	append(&answer, dns.Record{name = owner, type = .A, class = .IN, ttl = s.ttl, data = dns.Rdata_A{addr = first}})
+	if s.also != {} {
+		append(&answer, dns.Record{name = owner, type = .A, class = .IN, ttl = s.ttl, data = dns.Rdata_A{addr = second}})
+	}
+	if s.cname != 0 && s.cname_last {
+		append(&answer, dns.Record{name = q.name, type = .CNAME, class = .IN, ttl = s.cname, data = dns.Rdata_Name{name = owner}})
+	}
+	return answer[:]
 }
 
 @(private = "file")
@@ -251,7 +258,7 @@ test_an_upstream_hostname_is_asked_again_once_its_ttl_is_past :: proc(t: ^testin
 		sync.mutex_lock(&u.mu)
 		epoch := u.epoch
 		// A server cookie learned from the address held.
-		u.cookie.server_len = 8
+		u.cookie.server_len = COOKIE_SERVER_MIN
 		client := u.cookie.client
 		u.proto = .H1
 		u.idle_died = 5 * time.Second
@@ -362,8 +369,10 @@ test_one_exchange_refreshes_an_expired_address :: proc(t: ^testing.T) {
 		wire = wire,
 	}
 	workers: [8]^thread.Thread
+	started := 0
 	for &w in workers {
 		w = thread.create_and_start_with_poly_data(&r, refresher_worker)
+		started += 1 if w != nil else 0
 	}
 	for w in workers {
 		if w != nil {
@@ -371,6 +380,8 @@ test_one_exchange_refreshes_an_expired_address :: proc(t: ^testing.T) {
 			thread.destroy(w)
 		}
 	}
+	// Fewer workers would be fewer exchanges arriving together.
+	testing.expect_value(t, started, len(workers))
 	testing.expect_value(t, ttl_mock_asked(&m), 2)
 	testing.expect(t, address_of(u) == net.Address(net.IP4_Address{127, 0, 0, 3}), "the address was not refreshed")
 	testing.expect(t, !sync.atomic_load(&u.refreshing), "the refresh was left marked in progress")
@@ -586,10 +597,10 @@ cookied_reply :: proc(t: ^testing.T, query: []u8, client: [COOKIE_CLIENT_LEN]u8)
 	if !testing.expectf(t, eerr == .None, "cannot encode the reply: %v", eerr) {
 		return nil, false
 	}
-	option: [16]u8
+	option: [COOKIE_CLIENT_LEN + COOKIE_SERVER_MIN]u8
 	echoed := client
 	copy(option[:COOKIE_CLIENT_LEN], echoed[:])
-	option[8], option[15] = 0x5e, 0x5e
+	option[COOKIE_CLIENT_LEN], option[len(option) - 1] = 0x5e, 0x5e
 	out, set_ok := dns.set_edns_option(wire, .Cookie, option[:], context.temp_allocator)
 	return out, testing.expect(t, set_ok, "cannot set the reply's cookie")
 }
@@ -618,22 +629,17 @@ test_replies_to_queries_from_before_a_move_keep_their_cookie :: proc(t: ^testing
 		return
 	}
 	// The move: the literal changes, which a refresh publishes.
-	delete(u.spec.address, u.allocator)
-	u.spec.address = strings.clone("127.0.0.2", u.allocator)
-	testing.expect_value(t, resolve_endpoint(u, refresh = true, in_flight = time.Minute), Error.None)
+	move_literal(t, u, "127.0.0.2")
 	sync.mutex_lock(&u.mu)
 	redrawn, forgot := u.cookie.client != old, u.cookie.server_len == 0
 	sync.mutex_unlock(&u.mu)
 	if !testing.expect(t, redrawn && forgot, "the premise: the move drew the cookies afresh") {
 		return
 	}
-	bare, _, bare_err := dns.encode_message(dns.Message{id = 0x6914, flags = {qr = true}, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}, context.temp_allocator)
-	if testing.expectf(t, bare_err == .None, "cannot encode the reply: %v", bare_err) {
+	if bare, bare_ok := bare_reply(t); bare_ok {
 		testing.expect(t, !cookie_matches(u, query, bare), "a cookie-less reply to a query that carried a server cookie was taken")
 		// A second move before any cookie is learned keeps that open.
-		delete(u.spec.address, u.allocator)
-		u.spec.address = strings.clone("127.0.0.3", u.allocator)
-		testing.expect_value(t, resolve_endpoint(u, refresh = true, in_flight = time.Minute), Error.None)
+		move_literal(t, u, "127.0.0.3")
 		testing.expect(t, !cookie_matches(u, query, bare), "a second move let a cookie-less reply through")
 		// Past the time any query from before the move could still wait, the
 		// query is not walked for it any more.
@@ -665,7 +671,7 @@ test_replies_to_queries_from_before_a_move_keep_their_cookie :: proc(t: ^testing
 	sync.mutex_lock(&u.mu)
 	learned = u.cookie.server_len
 	sync.mutex_unlock(&u.mu)
-	testing.expect_value(t, learned, 8)
+	testing.expect_value(t, learned, COOKIE_SERVER_MIN)
 	free_all(context.temp_allocator)
 }
 
@@ -728,6 +734,69 @@ test_a_refresh_keeps_to_the_family_it_holds :: proc(t: ^testing.T) {
 }
 
 /*
+A cookied member that has learned a server cookie and then rolled its client
+cookie over, and the query it sends next, checked to carry the new client cookie
+alone. `close_window` also closes the window for queries from before the
+rollover before that query goes out. On false nothing is left to destroy.
+*/
+@(private = "file")
+rolled_over_member :: proc(t: ^testing.T, close_window: bool) -> (u: ^Upstream, query: []u8, ok: bool) {
+	uerr: Error
+	u, uerr = make_upstream(config.Upstream_Spec{name = "rolled", kind = .UDP, address = "127.0.0.1", port = 9}, 0, time.Second, cookies = true)
+	if !testing.expectf(t, uerr == .None, "cannot build the member: %v", uerr) {
+		return nil, nil, false
+	}
+	first, fok := cookied_query(t, u)
+	if !fok {
+		destroy(u)
+		return nil, nil, false
+	}
+	sync.mutex_lock(&u.mu)
+	client := u.cookie.client
+	sync.mutex_unlock(&u.mu)
+	taught, tok := cookied_reply(t, first, client)
+	if !tok {
+		destroy(u)
+		return nil, nil, false
+	}
+	learn_cookie(u, taught)
+	sync.mutex_lock(&u.mu)
+	u.cookie.roll_at = loop.moment_add(loop.moment_now(), -time.Second)
+	if close_window {
+		u.cookie.out_until = 0
+	}
+	sync.mutex_unlock(&u.mu)
+	qok: bool
+	query, qok = cookied_query(t, u)
+	if !qok {
+		destroy(u)
+		return nil, nil, false
+	}
+	sent, carried := dns.peek_edns_option(query, .Cookie)
+	if !testing.expect(t, carried && len(sent) == COOKIE_CLIENT_LEN, "the premise: the query after the rollover carries the new client cookie alone") {
+		destroy(u)
+		return nil, nil, false
+	}
+	return u, query, true
+}
+
+// A reply to `example.com.` A carrying no cookie at all.
+@(private = "file")
+bare_reply :: proc(t: ^testing.T) -> (wire: []u8, ok: bool) {
+	err: dns.Encode_Error
+	wire, _, err = dns.encode_message(dns.Message{id = 0x6914, flags = {qr = true}, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}, context.temp_allocator)
+	return wire, testing.expectf(t, err == .None, "cannot encode the reply: %v", err)
+}
+
+// Moves `u` to the literal `address`, as a changed hostname's refresh would.
+@(private = "file")
+move_literal :: proc(t: ^testing.T, u: ^Upstream, address: string) {
+	delete(u.spec.address, u.allocator)
+	u.spec.address = strings.clone(address, u.allocator)
+	testing.expect_value(t, resolve_endpoint(u, refresh = true, in_flight = time.Minute), Error.None)
+}
+
+/*
 A rollover forgets the server cookie bound to the old client cookie, and not
 that the server does cookies: a query that then goes out with the new client
 cookie alone still owes a cookie on its reply (RFC 7873 section 5.3), where a
@@ -735,42 +804,16 @@ move, to an address that may be another server, is judged afresh.
 */
 @(test)
 test_a_rollover_keeps_a_server_held_to_cookies :: proc(t: ^testing.T) {
-	u, uerr := make_upstream(config.Upstream_Spec{name = "rolled", kind = .UDP, address = "127.0.0.1", port = 9}, 0, time.Second, cookies = true)
-	if !testing.expectf(t, uerr == .None, "cannot build the member: %v", uerr) {
+	u, query, ok := rolled_over_member(t, close_window = true)
+	if !ok {
 		return
 	}
 	defer destroy(u)
-	first, fok := cookied_query(t, u)
-	if !fok {
-		return
-	}
-	sync.mutex_lock(&u.mu)
-	client := u.cookie.client
-	sync.mutex_unlock(&u.mu)
-	taught, tok := cookied_reply(t, first, client)
-	if !tok {
-		return
-	}
-	learn_cookie(u, taught)
-	sync.mutex_lock(&u.mu)
-	u.cookie.roll_at = loop.moment_add(loop.moment_now(), -time.Second)
-	u.cookie.out_until = 0
-	sync.mutex_unlock(&u.mu)
-
-	query, qok := cookied_query(t, u)
-	if !qok {
-		return
-	}
-	sent, carried := dns.peek_edns_option(query, .Cookie)
-	if !testing.expect(t, carried && len(sent) == COOKIE_CLIENT_LEN, "the premise: the query after the rollover carries the new client cookie alone") {
-		return
-	}
 	// Past the window for queries from before the rollover.
 	sync.mutex_lock(&u.mu)
 	u.cookie.renewed_until = 0
 	sync.mutex_unlock(&u.mu)
-	bare, _, bare_err := dns.encode_message(dns.Message{id = 0x6914, flags = {qr = true}, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}, context.temp_allocator)
-	if testing.expectf(t, bare_err == .None, "cannot encode the reply: %v", bare_err) {
+	if bare, bare_ok := bare_reply(t); bare_ok {
 		testing.expect(t, !cookie_matches(u, query, bare), "a cookie-less reply was taken from a server that does cookies, after a rollover")
 	}
 	free_all(context.temp_allocator)
@@ -784,34 +827,11 @@ before the move is open.
 */
 @(test)
 test_a_move_after_a_rollover_keeps_the_queries_out_held_to_cookies :: proc(t: ^testing.T) {
-	u, uerr := make_upstream(config.Upstream_Spec{name = "rolled", kind = .UDP, address = "127.0.0.1", port = 9}, 0, time.Second, cookies = true)
-	if !testing.expectf(t, uerr == .None, "cannot build the member: %v", uerr) {
+	u, query, ok := rolled_over_member(t, close_window = false)
+	if !ok {
 		return
 	}
 	defer destroy(u)
-	first, fok := cookied_query(t, u)
-	if !fok {
-		return
-	}
-	sync.mutex_lock(&u.mu)
-	client := u.cookie.client
-	sync.mutex_unlock(&u.mu)
-	taught, tok := cookied_reply(t, first, client)
-	if !tok {
-		return
-	}
-	learn_cookie(u, taught)
-	sync.mutex_lock(&u.mu)
-	u.cookie.roll_at = loop.moment_add(loop.moment_now(), -time.Second)
-	sync.mutex_unlock(&u.mu)
-	query, qok := cookied_query(t, u)
-	if !qok {
-		return
-	}
-	sent, carried := dns.peek_edns_option(query, .Cookie)
-	if !testing.expect(t, carried && len(sent) == COOKIE_CLIENT_LEN, "the premise: the query after the rollover carries the new client cookie alone") {
-		return
-	}
 	// The rollover's own window over, as it would be a while later; the query
 	// itself is still out.
 	sync.mutex_lock(&u.mu)
@@ -819,11 +839,8 @@ test_a_move_after_a_rollover_keeps_the_queries_out_held_to_cookies :: proc(t: ^t
 	u.cookie.out_until = 0
 	sync.mutex_unlock(&u.mu)
 
-	delete(u.spec.address, u.allocator)
-	u.spec.address = strings.clone("127.0.0.2", u.allocator)
-	testing.expect_value(t, resolve_endpoint(u, refresh = true, in_flight = time.Minute), Error.None)
-	bare, _, bare_err := dns.encode_message(dns.Message{id = 0x6914, flags = {qr = true}, question = []dns.Question{{name = "example.com.", type = .A, class = .IN}}}, context.temp_allocator)
-	if testing.expectf(t, bare_err == .None, "cannot encode the reply: %v", bare_err) {
+	move_literal(t, u, "127.0.0.2")
+	if bare, bare_ok := bare_reply(t); bare_ok {
 		testing.expect(t, !cookie_matches(u, query, bare), "a cookie-less reply to a query from before the move was taken")
 		// A query to the address moved to is judged afresh: that server may
 		// not do cookies.

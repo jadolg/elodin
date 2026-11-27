@@ -1,6 +1,7 @@
 package tlsx
 
 import "core:fmt"
+import "core:log"
 import "core:os"
 import "core:strings"
 import "core:sys/posix"
@@ -37,7 +38,10 @@ sign_dir :: proc(loc := #caller_location) -> string {
 
 @(private = "file")
 remove_sign_dir :: proc(dir: string) {
-	_ = os.remove_all(dir)
+	// Said, since what is left is a private key on the tmpfs.
+	if err := os.remove_all(dir); err != nil {
+		log.warnf("cannot remove %s: %v", dir, err)
+	}
 	delete(dir)
 }
 
@@ -61,8 +65,8 @@ ELODIN_SAN :: "DNS:elodin.local,DNS:localhost,IP:127.0.0.1"
 // if missing; `san` is the subjectAltName, or none when empty.
 @(private)
 self_signed :: proc(dir, cert, key, days, subject, san: string) -> bool {
-	// Tests running beside this one make the same directory; one of them
-	// making it first is not a failure.
+	// Another run may make the same directory; it making it first is not a
+	// failure.
 	if !os.exists(dir) && os.make_directory(dir) != nil && !os.exists(dir) {
 		return false
 	}

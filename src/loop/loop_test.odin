@@ -45,27 +45,39 @@ start :: proc(t: ^testing.T, clock: proc "contextless" () -> Tick = nil, loc := 
 	return r, true
 }
 
+// Polls `ready` until it holds or `WAIT` passes, and says whether it held.
+@(private)
+wait_until :: proc(ready: proc(l: ^Loop) -> bool, l: ^Loop) -> bool {
+	start := time.tick_now()
+	for !ready(l) && time.tick_since(start) < WAIT {
+		time.sleep(time.Millisecond) // lint:allow a loop's counts move on its own thread; nothing signals them
+	}
+	return ready(l)
+}
+
 // Waits up to `WAIT` for every fiber on `l` to have finished and been put back
 // on a free list.
 @(private)
 fibers_gone :: proc(l: ^Loop) -> bool {
-	start := time.tick_now()
-	for fibers_alive(l) != 0 && time.tick_since(start) < WAIT {
-		time.sleep(time.Millisecond)
-	}
-	return fibers_alive(l) == 0
+	return wait_until(proc(l: ^Loop) -> bool {return fibers_alive(l) == 0}, l)
 }
 
+// How long `wait_until_asleep` waits.
+@(private = "file")
+ASLEEP_WAIT :: WAIT
+
 /*
-Waits up to `WAIT` for thread `tid` of this process to be asleep, as `/proc`
-reports it; the caller knows where the thread can block, so asleep is there.
+Waits up to `ASLEEP_WAIT` for thread `tid` of this process to be asleep, as
+`/proc` reports it; the caller knows where the thread can block, so asleep is
+there. tlsx_test.odin holds the same procedure: a package's tests cannot reach
+another's.
 */
 @(private = "file")
 wait_until_asleep :: proc(tid: linux.Pid) -> bool {
 	path_buf: [64]u8
 	path := fmt.bprintf(path_buf[:], "/proc/self/task/%d/stat", tid)
 	start := time.tick_now()
-	for time.tick_since(start) < WAIT {
+	for time.tick_since(start) < ASLEEP_WAIT {
 		if data, err := os.read_entire_file(path, context.temp_allocator); err == nil {
 			// The state follows the command name, which may hold anything but
 			// ends at the last ')'.
@@ -74,7 +86,7 @@ wait_until_asleep :: proc(tid: linux.Pid) -> bool {
 				return true
 			}
 		}
-		time.sleep(time.Millisecond)
+		time.sleep(time.Millisecond) // lint:allow /proc reports a thread's state; there is no event to wait on
 	}
 	return false
 }

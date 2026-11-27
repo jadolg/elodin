@@ -151,11 +151,8 @@ test_an_idle_loop_gives_back_its_warm_stacks :: proc(t: ^testing.T) {
 			return
 		}
 	}
-	start := time.tick_now()
-	for warm_count(l) > WARM_IDLE_KEEP && time.tick_since(start) < 5 * time.Second {
-		time.sleep(time.Millisecond)
-	}
-	testing.expectf(t, warm_count(l) <= WARM_IDLE_KEEP, "%d stacks still warm after an idle window", warm_count(l))
+	trimmed := wait_until(proc(l: ^Loop) -> bool {return warm_count(l) <= WARM_IDLE_KEEP}, l)
+	testing.expectf(t, trimmed, "%d stacks still warm after an idle window", warm_count(l))
 }
 
 /*

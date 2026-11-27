@@ -125,7 +125,34 @@ generate_certs :: proc() {
 		cert_ok = true
 		return
 	}
-	cert_ok = self_signed(CERT_DIR, cert_path, key_path, CERT_DAYS, "/CN=elodin.local", ELODIN_SAN)
+	/*
+	Published whole, since a run in another checkout may be reading or making
+	the same pair: it is made in a directory of this process's own and renamed
+	into place, and a rename refuses a target another run has already filled, so
+	no run reads one run's certificate beside another's key. A pair past its
+	date is moved aside first, by a rename only one run can win.
+
+	shortcut: two runs that both find the pair expired at the same moment can
+	still move a fresh one aside; upgrade to renameat2's RENAME_EXCHANGE if that
+	is ever seen.
+	*/
+	pid := posix.getpid()
+	if os.exists(CERT_DIR) && !usable_pair(cert_path, key_path) {
+		aside := fmt.tprintf("%s-stale-%d", CERT_DIR, pid)
+		if os.rename(CERT_DIR, aside) == nil {
+			_ = os.remove_all(aside) // lint:allow a stale pair left behind is only litter in the temp directory
+		}
+	}
+	made := fmt.tprintf("%s-%d", CERT_DIR, pid)
+	if !self_signed(made, fmt.tprintf("%s/cert.pem", made), fmt.tprintf("%s/key.pem", made), CERT_DAYS, "/CN=elodin.local", ELODIN_SAN) {
+		_ = os.remove_all(made) // lint:allow a failed attempt left behind is only litter in the temp directory
+		return
+	}
+	if os.rename(made, CERT_DIR) != nil {
+		// Another run published first: its pair is whole, and this one goes.
+		_ = os.remove_all(made) // lint:allow a pair left behind is only litter in the temp directory
+	}
+	cert_ok = usable_pair(cert_path, key_path)
 }
 
 @(private)
@@ -464,19 +491,23 @@ idle_worker :: proc(i: ^Idle_Ctx) {
 	i.n, i.err = read(i.conn, buf[:])
 }
 
+// How long `wait_until_asleep` waits.
+@(private = "file")
+ASLEEP_WAIT :: 5 * time.Second
+
 /*
-Waits for thread `tid` of this process to be asleep, as `/proc` reports it:
-nothing it runs before the wait blocks, so asleep is in the wait. False after
-five seconds.
+Waits up to `ASLEEP_WAIT` for thread `tid` of this process to be asleep, as
+`/proc` reports it: nothing it runs before the wait blocks, so asleep is in the
+wait. loop_test.odin holds the same procedure: a package's tests cannot reach
+another's.
 */
 @(private = "file")
 wait_until_asleep :: proc(tid: linux.Pid) -> bool {
 	path_buf: [64]u8
 	path := fmt.bprintf(path_buf[:], "/proc/self/task/%d/stat", tid)
-	deadline := time.tick_add(time.tick_now(), 5 * time.Second)
-	for time.tick_diff(time.tick_now(), deadline) > 0 {
-		data, err := os.read_entire_file(path, context.temp_allocator)
-		if err == nil {
+	start := time.tick_now()
+	for time.tick_since(start) < ASLEEP_WAIT {
+		if data, err := os.read_entire_file(path, context.temp_allocator); err == nil {
 			// The state follows the command name, which may hold anything but
 			// ends at the last ')'.
 			stat := string(data)
@@ -484,7 +515,7 @@ wait_until_asleep :: proc(tid: linux.Pid) -> bool {
 				return true
 			}
 		}
-		time.sleep(time.Millisecond)
+		time.sleep(time.Millisecond) // lint:allow /proc reports a thread's state; there is no event to wait on
 	}
 	return false
 }
@@ -1649,12 +1680,6 @@ test_idle_connections_release_their_record_buffers :: proc(t: ^testing.T) {
 	}
 }
 
-/*
-RFC 6066 section 3: "Literal IPv4 and IPv6 addresses are not permitted in
-"HostName"." A name goes out as SNI; an address does not, and is still checked
-against the certificate's IP SAN.
-*/
-
 @(private = "file")
 Hello_Capture :: struct {
 	listener: net.TCP_Socket,
@@ -1747,6 +1772,9 @@ hello_for :: proc(t: ^testing.T, hostname: string) -> (hello: []u8, ok: bool) {
 	capture := new(Hello_Capture, context.temp_allocator)
 	capture.listener = listener
 	worker := thread.create_and_start_with_poly_data(capture, capture_hello)
+	if !testing.expect(t, worker != nil, "no thread to capture the ClientHello") {
+		return nil, false
+	}
 	sock, derr := net.dial_tcp_from_endpoint(bound)
 	if !testing.expectf(t, derr == nil, "cannot dial: %v", derr) {
 		thread.join(worker)
@@ -1769,6 +1797,11 @@ hello_for :: proc(t: ^testing.T, hostname: string) -> (hello: []u8, ok: bool) {
 	return capture.hello[:capture.n], true
 }
 
+/*
+RFC 6066 section 3: "Literal IPv4 and IPv6 addresses are not permitted in
+"HostName"." A name goes out as SNI; an address does not, and is still checked
+against the certificate's IP SAN.
+*/
 @(test)
 test_an_address_is_sent_no_sni :: proc(t: ^testing.T) {
 	posix.sigignore(.SIGPIPE)

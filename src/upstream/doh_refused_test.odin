@@ -234,7 +234,9 @@ exchange_with_peer :: proc(
 	}
 	query.flags.rd = true
 	wire, _, enc := dns.encode_message(query, context.temp_allocator)
-	testing.expect_value(t, enc, dns.Encode_Error.None)
+	if !testing.expect_value(t, enc, dns.Encode_Error.None) {
+		return
+	}
 	body := make([]u8, len(wire), context.temp_allocator)
 	copy(body, wire)
 	dns.set_id_in_place(body, 0)
@@ -322,50 +324,54 @@ ask_a_refusing_member_and_a_silent_one :: proc(t: ^testing.T, retry_after: strin
 	}
 	p := Refusing_Peer{listener = listener, head = head[:]}
 	peer := thread.create_and_start_with_poly_data(&p, refusing_peer_run)
-	a, aerr := make_upstream(config.Upstream_Spec{name = "refusing", kind = .HTTPS, address = "127.0.0.1", port = bound.port, hostname = "doh.invalid", path = "/dns-query", url = "https://doh.invalid/dns-query"}, 8, 30 * time.Second)
-	if !testing.expectf(t, aerr == .None, "cannot make the upstream: %v", aerr) {
-		thread.join(peer)
-		thread.destroy(peer)
+	if !testing.expect(t, peer != nil, "cannot start the refusing peer") {
 		return
 	}
-	socket, derr := dial_tcp_timeout(bound, time.Second)
-	if !testing.expectf(t, derr == .None, "cannot dial the peer: %v", derr) {
-		destroy(a)
+	defer {
 		thread.join(peer)
 		thread.destroy(peer)
+	}
+	a, aerr := make_upstream(config.Upstream_Spec{name = "refusing", kind = .HTTPS, address = "127.0.0.1", port = bound.port, hostname = "doh.invalid", path = "/dns-query", url = "https://doh.invalid/dns-query"}, 8, 30 * time.Second)
+	if !testing.expectf(t, aerr == .None, "cannot make the upstream: %v", aerr) {
+		return
+	}
+	defer destroy(a)
+	socket, derr := dial_tcp_timeout(bound, time.Second)
+	if !testing.expectf(t, derr == .None, "cannot dial the peer: %v", derr) {
 		return
 	}
 	if serr := net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond); !testing.expectf(t, serr == nil, "cannot bound the reader: %v", serr) {
 		net.close(socket)
-		destroy(a)
-		thread.join(peer)
-		thread.destroy(peer)
 		return
 	}
 	sync.mutex_lock(&a.mu)
 	a.proto = .H2
 	a.h2 = start_h2_conn(a, Stream{socket = socket})
 	sync.mutex_unlock(&a.mu)
+	if !testing.expect(t, a.h2 != nil, "cannot start the h2 connection") {
+		net.close(socket)
+		return
+	}
 
 	m: Echo_Mock
 	m.mute = true
 	b, worker, ok := start_udp_mock(t, &m, echo_mock_loop, "silent", 300 * time.Millisecond)
-	if ok {
-		msg := dns.Message{id = 0x3272, question = []dns.Question{{name = "r5.example.test.", type = .A, class = .IN}}}
-		msg.flags.rd = true
-		query, _, enc := dns.encode_message(msg, context.temp_allocator)
-		testing.expect_value(t, enc, dns.Encode_Error.None)
-		ups := []^Upstream{a, b}
-		g := failover_group(ups, 300 * time.Millisecond, attempts = 2)
-		resp, _, rerr := resolve(&g, query, context.allocator)
-		delete(resp, context.allocator)
-		testing.expectf(t, rerr != .None, "a group of a refusing and a silent member answered")
-		asked = sync.atomic_load(&p.headers)
-		stop_udp_mock(&m, worker, b)
+	if !ok {
+		return
 	}
-	destroy(a)
-	thread.join(peer)
-	thread.destroy(peer)
+	defer stop_udp_mock(&m, worker, b)
+	msg := dns.Message{id = 0x3272, question = []dns.Question{{name = "r5.example.test.", type = .A, class = .IN}}}
+	msg.flags.rd = true
+	query, _, enc := dns.encode_message(msg, context.temp_allocator)
+	if !testing.expect_value(t, enc, dns.Encode_Error.None) {
+		return
+	}
+	ups := []^Upstream{a, b}
+	g := failover_group(ups, 300 * time.Millisecond, attempts = 2)
+	resp, _, rerr := resolve(&g, query, context.allocator)
+	delete(resp, context.allocator)
+	testing.expectf(t, rerr != .None, "a group of a refusing and a silent member answered")
+	asked = sync.atomic_load(&p.headers)
 	free_all(context.temp_allocator)
 	return
 }

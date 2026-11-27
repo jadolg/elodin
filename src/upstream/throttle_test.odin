@@ -1,7 +1,6 @@
 package upstream
 
 import "core:fmt"
-import "core:mem"
 import "core:net"
 import "core:sync"
 import "core:testing"
@@ -39,6 +38,9 @@ throttle_on_h1_reply :: proc(t: ^testing.T, reply: string, allocator := context.
 		reply    = reply,
 	}
 	server := thread.create_and_start_with_poly_data(&m, http_mock_once)
+	if !testing.expect(t, server != nil, "cannot start the mock") {
+		return
+	}
 	defer {
 		thread.join(server)
 		thread.destroy(server)
@@ -219,17 +221,8 @@ test_retry_after_is_read_only_where_the_status_asks_to_wait :: proc(t: ^testing.
 		{reply = "HTTP/1.1 200 OK\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", want = 0},
 	}
 	for row in rows {
-		track: mem.Tracking_Allocator
-		mem.tracking_allocator_init(&track, context.allocator)
-		defer mem.tracking_allocator_destroy(&track)
-		resp, err, ok := exchange_against(t, row.reply, &track)
-		if !ok {
-			continue
-		}
-		testing.expectf(t, err == .None, "%q: %v", row.reply[:12], err)
-		testing.expectf(t, resp.retry_after == row.want, "%q: Retry-After read as %d, want %d", row.reply[:12], resp.retry_after, row.want)
-		if len(resp.body) > 0 {
-			delete(resp.body, mem.tracking_allocator(&track))
+		if resp, ok := response_head(t, row.reply); ok {
+			testing.expectf(t, resp.retry_after == row.want, "%q: Retry-After read as %d, want %d", row.reply[:12], resp.retry_after, row.want)
 		}
 	}
 }
