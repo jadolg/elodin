@@ -81,8 +81,7 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   out, to make room for the lists already in effect and the operator's
   rules`). A list is never in effect cut short. A build after the first
   downloads only the lists no earlier one reached, reading the copies the
-  earlier ones saved, and a list read that way keeps what its download found
-  (a copy standing in for a failed download is still stale). A download there
+  earlier ones saved, which count as stale. A download there
   is no memory to fetch counts as a failed one, which the cached copy stands
   in for; one fetched there is no memory to hold is not cached, and its list is
   left out or holds the refresh back as above. The list says why first (`list
@@ -103,8 +102,9 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   could not load every list is retried the same way. A missing `file:` list is
   not retried. A load that ran out of memory is retried the same way even
   under `--no-fetch` or `refresh: 0`, at most 1 hour apart, until it succeeds;
-  under `refresh: 0` that retry reads the cached copies and downloads nothing
-  (`blocklists: there was no memory to build the rules; trying again in 1m0s`).
+  (`blocklists: there was no memory to build the rules; trying again in
+  1m0s`). Under `refresh: 0` that retry reads the cached copies and downloads
+  nothing, so a list with no copy stays out until a reload.
 - A rule costs about 35 bytes resident: its name, a flags byte and an 8-byte
   slot in a table kept at most 80% full. A load or refresh builds the new rule
   sets beside the ones in use and frees the old ones once they are swapped out,

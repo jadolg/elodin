@@ -1571,11 +1571,10 @@ test_a_retry_with_refreshes_off_downloads_nothing :: proc(t: ^testing.T) {
 }
 
 /*
-A list a later build of one rebuild reads again from its copy keeps what the
-first build found (#765): a download that failed, with a copy standing in, is
-`.Stale` in every build, never taken for current because the copy was read
-without the network. Each allocation is refused in turn; where the new list
-after it is left out, the downloaded one is read again.
+A list a later build of one rebuild reads again from its copy is `.Stale`, never
+taken for current because the copy was read without the network (#765): here a
+download that failed, with a copy standing in. Each allocation is refused in
+turn; where the new list after it is left out, the downloaded one is read again.
 */
 @(test)
 test_a_list_read_again_keeps_its_load :: proc(t: ^testing.T) {
@@ -1688,4 +1687,104 @@ test_operator_rules_without_memory_leave_a_new_list_out :: proc(t: ^testing.T) {
 	// The premise: the list's own refusals were reached.
 	testing.expectf(t, none > 0, "the list was never left out")
 	testing.expectf(t, with > none, "%d builds made room for the operator's rules, %d left the list out with none", with, none)
+}
+
+/*
+A build's `loads` say what that build did, whatever an earlier build of the same
+rebuild found (#765): a list after the one that ran out is `.No_Memory`, never
+the load an earlier build gave it, so `leave_out_newest` can only pick a list
+this build loaded. Each allocation of a build of two lists read before is
+refused in turn.
+*/
+@(test)
+test_a_build_says_only_what_it_loaded :: proc(t: ^testing.T) {
+	paths: [2]string
+	for &path, l in paths {
+		path = fmt.tprintf("/tmp/elodin-server-lists-test-said-%d-%d.txt", l, os.get_pid())
+		b := strings.builder_make(context.temp_allocator)
+		for i in 0 ..< 200 {
+			fmt.sbprintf(&b, "0.0.0.0 said-%d-%d.example\n", l, i)
+		}
+		if !testing.expect(t, os.write_entire_file(path, strings.to_string(b)) == nil, "cannot write a list") {
+			return
+		}
+	}
+	defer os.remove(paths[0])
+	defer os.remove(paths[1])
+	cfg := config.default_config()
+	cfg.blocking.lists = []config.Block_List {
+		{name = "a", file = paths[0], format = .Hosts, enabled = true},
+		{name = "b", file = paths[1], format = .Hosts, enabled = true},
+	}
+	ran_out_first := 0
+	for fail_at := 1; ; fail_at += 1 {
+		// As an earlier build of the rebuild left them.
+		loads := [2]List_Load{.Current, .Current}
+		passes := [2]List_Pass{{read = true, found = .Current}, {read = true, found = .Current}}
+		f := testkit.Fail_Nth{backing = context.allocator, fail_at = fail_at, fail_for = 1}
+		block, allow: ^filter.Set
+		{
+			context.allocator = testkit.fail_nth(&f)
+			block, allow, _ = build_filter_sets(&cfg, false, loads[:], passes[:]) // lint:allow whole is what `loads` says here
+		}
+		filter.set_destroy(block)
+		filter.set_destroy(allow)
+		if f.seen < fail_at {
+			break
+		}
+		if loads[0] == .No_Memory {
+			ran_out_first += 1
+			testing.expectf(t, loads[1] == .No_Memory, "run %d: the list after the one that ran out says %v", fail_at, loads[1])
+		}
+	}
+	testing.expect(t, ran_out_first > 0, "no build ran out on the first list")
+}
+
+/*
+A rebuild that leaves a list out for want of memory is marked for a retry
+whatever else holds the refresh back, and wherever the list is in the order
+(#765): here a list in effect whose copy is a web page comes first.
+*/
+@(test)
+test_a_list_left_out_is_retried_whatever_holds_the_refresh_back :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg, dir := list_test_dir(t, "left-out-held")
+	defer os.remove(dir)
+	page := config.Block_List{name = "page", url = "http://192.0.2.1/page.txt", format = .Hosts, enabled = true}
+	page_path := list_cache_path(&cfg, page)
+	if !testing.expect(t, os.write_entire_file(page_path, "<html>no list</html>\n") == nil, "cannot write the copy") {
+		return
+	}
+	defer os.remove(page_path)
+	path := fmt.tprintf("/tmp/elodin-server-lists-test-left-out-held-%d.txt", os.get_pid())
+	b := strings.builder_make(context.temp_allocator)
+	for i in 0 ..< 200 {
+		fmt.sbprintf(&b, "0.0.0.0 held-%d.example\n", i)
+	}
+	if !testing.expect(t, os.write_entire_file(path, strings.to_string(b)) == nil, "cannot write the list") {
+		return
+	}
+	defer os.remove(path)
+	cfg.blocking.lists = []config.Block_List{page, {name = "new", file = path, format = .Hosts, enabled = true}}
+
+	held_back := 0
+	for fail_at := 1; ; fail_at += 1 {
+		s := list_server(&cfg)
+		defer close_list_server(&s)
+		// As if the page's list had loaded at the last refresh.
+		s.lists_loaded[list_key(page, false)] = true
+		f := testkit.Fail_Nth{backing = context.allocator, fail_at = fail_at, fail_for = 1}
+		{
+			context.allocator = testkit.fail_nth(&f)
+			reload_filters(&s, false)
+		}
+		if f.seen < fail_at {
+			break
+		}
+		// Every refused run is held back, by the page or for want of memory.
+		testing.expectf(t, filter.engine_generation(s.filters) == 0, "run %d: the refresh went ahead", fail_at)
+		testing.expectf(t, s.rules_no_memory, "run %d: a refusal is not marked for a retry", fail_at)
+		held_back += 1
+	}
+	testing.expect(t, held_back > 0, "no run was refused")
 }

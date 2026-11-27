@@ -93,12 +93,8 @@ build_filter_sets :: proc(
 	whole: bool,
 ) {
 	move_query_named_caches(cfg)
-	for &load, i in loads {
-		// A list an earlier build read keeps what that one found until it is
-		// read again (`load_lists`).
-		if passes == nil || !passes[i].read || passes[i].left_out {
-			load = .No_Memory
-		}
+	for &load in loads {
+		load = .No_Memory
 	}
 	block = filter.set_make()
 	allow = filter.set_make()
@@ -115,18 +111,19 @@ build_filter_sets :: proc(
 List_Pass :: struct {
 	// There was no memory for it: it is not loaded again in this rebuild.
 	left_out: bool,
-	// An earlier build read it, downloading as that one could. A later one
-	// reads the copy it saved rather than download again, and keeps the load
-	// it found: a copy read again is not a download.
+	// An earlier build read it, downloading as that one could, and found
+	// `found`. A later one reads its copy rather than download again.
 	read:     bool,
+	found:    List_Load,
 }
 
 /*
-Load every list not left out into the sets, saying in `loads` how each fared;
-false at the first that is `.No_Memory`. One no earlier build read downloads as
-`allow_network` says; one read before reads its copy, and keeps the load that
-read found where this one only reads that copy again: a download that did not
-fit, with an older copy that does, is `.Stale`.
+Load every list not left out into the sets, saying in `loads` how each fared
+in this build; false at the first that is `.No_Memory`. One no earlier build
+read downloads as `allow_network` says. One read before reads its copy, which is
+`.Stale`: whether it is the download the earlier read saved cannot be told, and
+it may be older. One whose download held no rules and had no copy stays
+`.Empty`.
 */
 @(private)
 load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network: bool, loads: []List_Load, passes: []List_Pass) -> bool {
@@ -138,20 +135,18 @@ load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network
 		}
 		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
 		load := load_one_list(cfg, list, block, allow, allow_network && !read, i >= lists)
-		if read && loads != nil {
-			before := loads[i]
-			switch {
-			case load == .Current && before == .No_Memory:
-				load = .Stale
-			case load == .Current && (before == .Current || before == .Stale), load == .Unavailable && before == .Empty:
-				load = before
+		switch {
+		case !read:
+			if passes != nil {
+				passes[i].read, passes[i].found = true, load
 			}
+		case load == .Current:
+			load = .Stale
+		case load == .Unavailable && passes[i].found == .Empty:
+			load = .Empty
 		}
 		if loads != nil {
 			loads[i] = load
-		}
-		if passes != nil {
-			passes[i].read = true
 		}
 		if load == .No_Memory {
 			return false
@@ -906,14 +901,16 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 	}
 
 	current = true
-	for load, i in loads {
-		if load == .Current {
-			continue
-		}
+	// Left out: retried whatever kind of list it is, and whatever holds the
+	// refresh back below.
+	for load in loads {
 		if load == .No_Memory {
-			// Left out: retried whatever kind of list it is.
 			s.rules_no_memory = true
 			current = false
+		}
+	}
+	for load, i in loads {
+		if load == .Current || load == .No_Memory {
 			continue
 		}
 		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
