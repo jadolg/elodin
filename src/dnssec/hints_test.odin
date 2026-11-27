@@ -334,7 +334,7 @@ sh_prune :: proc(
 	ok: bool,
 ) {
 	result = validate(v, qname, qtype, wire, fixture_now())
-	out, stripped := strip_unauthenticated(wire, result, context.temp_allocator, dns.MAX_MESSAGE)
+	out, stripped := strip_unauthenticated(wire, result, context.temp_allocator)
 	if !testing.expect(t, stripped, "the pruned response should rebuild") {
 		return result, {}, false
 	}

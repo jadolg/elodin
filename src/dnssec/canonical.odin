@@ -38,18 +38,8 @@ label_count :: proc "contextless" (name: string) -> int {
 		return 0
 	}
 	n := 0
-	i := 0
-	for i < len(name) {
-		if name[i] == '\\' {
-			// Both escape forms (\X and \DDD) continue with characters that
-			// cannot be an unescaped separator, so skipping two is enough.
-			i += 2
-			continue
-		}
-		if name[i] == '.' {
-			n += 1
-		}
-		i += 1
+	for i := dns.label_end(name, 0); i < len(name); i = dns.label_end(name, i + 1) {
+		n += 1
 	}
 	return n
 }
@@ -194,32 +184,18 @@ write_downcased_raw :: proc(out: ^[dynamic]u8, type: dns.Type, rdata: []u8) {
 	append(out, ..rdata[:pos])
 
 	for _ in 0 ..< layout.names {
-		for {
-			if pos >= len(rdata) {
-				fail(out, mark, rdata)
-				return
-			}
-			l := rdata[pos]
-			if l & 0xc0 != 0 {
-				fail(out, mark, rdata)
-				return
-			}
-			if l == 0 {
-				pos += 1
-				break
-			}
-			if pos + 1 + int(l) > len(rdata) {
-				fail(out, mark, rdata)
-				return
-			}
-			at := len(out^) + 1
-			append(out, ..rdata[pos:pos + 1 + int(l)])
-			// Only what landed is folded: an append that ran dry adds nothing.
-			label := out[min(at, len(out^)):]
-			dns.fold_into(string(label), label)
-			pos += 1 + int(l)
+		end, pointer, named := dns.raw_name_end(rdata, pos)
+		if pointer || !named {
+			fail(out, mark, rdata)
+			return
 		}
-		append(out, 0)
+		at := len(out^)
+		append(out, ..rdata[pos:end])
+		// Length octets are under 64, never a letter, so the whole name folds at
+		// once; only what landed is folded, an append that ran dry adding nothing.
+		landed := out[min(at, len(out^)):]
+		dns.fold_into(string(landed), landed) // in place: never short of room
+		pos = end
 	}
 
 	append(out, ..rdata[pos:])
@@ -267,7 +243,7 @@ write_canonical_rdata :: proc(out: ^[dynamic]u8, rec: dns.Record) -> bool {
 		return write_name(out, buf[:], d.exchange, down)
 	case dns.Rdata_TXT:
 		for s in d.strings {
-			if len(s) > 255 {
+			if len(s) > dns.MAX_CHARACTER_STRING {
 				return false
 			}
 			append(out, u8(len(s)))
@@ -280,7 +256,7 @@ write_canonical_rdata :: proc(out: ^[dynamic]u8, rec: dns.Record) -> bool {
 		return write_name(out, buf[:], d.target, down)
 	case dns.Rdata_CAA:
 		append(out, d.flags)
-		if len(d.tag) > 255 {
+		if len(d.tag) > dns.MAX_CHARACTER_STRING {
 			return false
 		}
 		append(out, u8(len(d.tag)))
@@ -410,7 +386,7 @@ render_rdatas :: proc(scratch: ^Signing_Scratch, records: []dns.Record, allocato
 	charged := 2 * STORE_START
 	for rec, i in records {
 		start := len(store)
-		rendered := write_canonical_rdata(&store, rec) && len(store) - start <= 0xffff
+		rendered := write_canonical_rdata(&store, rec) && len(store) - start <= dns.MAX_RDLENGTH
 		// Before the verdict: the arena has paid for this record either way.
 		if 2 * cap(store) > charged {
 			if !charge_scratch(scratch, 2 * cap(store) - charged) {

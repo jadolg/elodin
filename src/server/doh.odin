@@ -832,7 +832,7 @@ reader: every request line, header loop and body this server would read, one
 after another as a client pipelining them sends them, with the `dns` parameter
 of each decoded as a GET would. Nothing else calls it.
 */
-fuzz_http_requests :: proc(conn: Conn) {
+fuzz_http_requests :: proc(conn: Conn) { // lint:allow the doh fuzz target's way into the reader, by design
 	r := Http_Reader {
 		conn = conn,
 		buf  = make([dynamic]u8, 0, HTTP_BUF_SIZE),

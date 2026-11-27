@@ -682,7 +682,7 @@ make_key :: proc(
 	verdict := false,
 	policy: u64 = 0,
 ) -> string {
-	folded, _ := dns.fold_into(name[:min(len(name), len(buf) - KEY_TAIL)], buf)
+	folded, _ := dns.fold_into(name[:min(len(name), len(buf) - KEY_TAIL)], buf) // fits: sliced to the buffer
 	n := len(folded)
 	buf[n] = u8(u16(type) >> 8)
 	buf[n + 1] = u8(u16(type))

@@ -394,7 +394,7 @@ r_u16 :: proc(r: ^Reader) -> (v: u16, err: Decode_Error) {
 	if r.pos + 2 > len(r.msg) {
 		return 0, .Short_Buffer
 	}
-	v = u16(r.msg[r.pos]) << 8 | u16(r.msg[r.pos + 1])
+	v = be16(r.msg, r.pos)
 	r.pos += 2
 	return
 }
@@ -404,11 +404,7 @@ r_u32 :: proc(r: ^Reader) -> (v: u32, err: Decode_Error) {
 	if r.pos + 4 > len(r.msg) {
 		return 0, .Short_Buffer
 	}
-	v =
-		u32(r.msg[r.pos]) << 24 |
-		u32(r.msg[r.pos + 1]) << 16 |
-		u32(r.msg[r.pos + 2]) << 8 |
-		u32(r.msg[r.pos + 3])
+	v = be32(r.msg, r.pos)
 	r.pos += 4
 	return
 }
@@ -550,7 +546,7 @@ decode_sections :: proc(
 	// a question at least 5. Reject counts that cannot possibly fit so a tiny
 	// hostile datagram cannot make us allocate 64k records.
 	remaining := len(msg) - HEADER_SIZE
-	if int(qdcount) * 5 + (int(ancount) + int(nscount) + int(arcount)) * 11 > remaining {
+	if int(qdcount) * MIN_QUESTION_WIRE + (int(ancount) + int(nscount) + int(arcount)) * MIN_RECORD_WIRE > remaining {
 		return {}, .Short_Buffer
 	}
 
@@ -787,7 +783,7 @@ decode_rdata :: proc(
 		// by doubling would take that to twelve times the wire.
 		count := 0
 		for p := start; p + 4 <= end; count += 1 {
-			p += 4 + (int(r.msg[p + 2]) << 8 | int(r.msg[p + 3]))
+			p += 4 + int(be16(r.msg, p + 2))
 			if p > end {
 				return nil, .Bad_Rdata
 			}
@@ -815,7 +811,7 @@ peek_id :: proc(msg: []u8) -> (id: u16, ok: bool) {
 	if len(msg) < 2 {
 		return 0, false
 	}
-	return u16(msg[0]) << 8 | u16(msg[1]), true
+	return be16(msg, 0), true
 }
 
 /*
@@ -838,7 +834,7 @@ peek_question :: proc(msg: []u8, allocator := context.allocator) -> (q: Question
 	if len(msg) < HEADER_SIZE {
 		return {}, false
 	}
-	qdcount := u16(msg[4]) << 8 | u16(msg[5])
+	qdcount := be16(msg, 4)
 	if qdcount == 0 {
 		return {}, false
 	}

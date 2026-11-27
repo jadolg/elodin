@@ -143,20 +143,14 @@ message left to point into.
 */
 @(private)
 rd_name :: proc(r: ^Rd, allocator: mem.Allocator) -> (name: string, err: Parse_Error) {
-	pos := r.pos
-	for {
-		if pos >= len(r.buf) {
-			return "", .Short_Rdata
-		}
-		l := r.buf[pos]
-		if l & 0xc0 != 0 {
-			return "", .Bad_Name
-		}
-		if l == 0 {
-			pos += 1
-			break
-		}
-		pos += 1 + int(l)
+	pos, pointer, ended := dns.raw_name_end(r.buf, r.pos)
+	if pointer {
+		return "", .Bad_Name
+	}
+	if !ended {
+		// An `end` of 0 over bytes that are there is a reserved label type; any
+		// other is a name that ran off the end.
+		return "", .Bad_Name if pos == 0 && len(r.buf) > 0 else .Short_Rdata
 	}
 
 	decoded, _, derr := dns.decode_name(r.buf[r.pos:pos], 0, allocator)

@@ -3,6 +3,7 @@ package config
 import "core:encoding/hex"
 import "core:time"
 import "elodin:cache"
+import "elodin:dns"
 import "elodin:logx"
 import "elodin:sandbox"
 
@@ -200,12 +201,12 @@ MIN_CACHE_BYTES :: 1024 * 1024
 The bounds on `server.max_udp_response`, and where it sits by default.
 
 512 is what a client that sent no OPT record gets and the smallest response any
-resolver has to be able to send, so there is nothing below it to choose. 4096 is
-the largest buffer this server will believe a client's OPT record about, and so
-the largest ceiling there is any point setting.
+resolver has to be able to send, so there is nothing below it to choose.
+`dns.MAX_EDNS_UDP_SIZE` (4096) is the largest buffer this server will believe a
+client's OPT record about, and so the largest ceiling there is any point setting.
 */
-MIN_UDP_RESPONSE :: 512
-MAX_UDP_RESPONSE :: 4096
+MIN_UDP_RESPONSE :: dns.MAX_UDP_SIZE
+MAX_UDP_RESPONSE :: dns.MAX_EDNS_UDP_SIZE
 DEFAULT_MAX_UDP_RESPONSE :: 1232
 
 /*

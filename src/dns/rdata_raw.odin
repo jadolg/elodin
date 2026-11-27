@@ -87,7 +87,7 @@ raw_rdata_layout :: proc "contextless" (t: Type, rdata: []u8) -> (layout: Raw_La
 		if len(rdata) < 4 {
 			break
 		}
-		fixed := 4 + int(rdata[0]) + (int(rdata[2]) << 8 | int(rdata[3]))
+		fixed := 4 + int(rdata[0]) + int(be16(rdata, 2))
 		if names, counted := count_names(rdata, fixed); counted {
 			return {fixed, 0, names}, true
 		}
@@ -123,21 +123,37 @@ raw_rdata_layout :: proc "contextless" (t: Type, rdata: []u8) -> (layout: Raw_La
 count_names :: proc "contextless" (rdata: []u8, pos: int) -> (n: int, ok: bool) {
 	pos := pos
 	for pos < len(rdata) {
-		l := rdata[pos]
-		switch {
-		case l & 0xc0 == 0xc0:
-			pos += 2
-			n += 1
-		case l & 0xc0 != 0:
-			return 0, false
-		case l == 0:
-			pos += 1
-			n += 1
-		case:
-			pos += 1 + int(l)
+		end, _, named := raw_name_end(rdata, pos)
+		if !named {
+			return n, end == len(rdata)
 		}
+		pos = end
+		n += 1
 	}
 	return n, pos == len(rdata)
+}
+
+/*
+Where the wire name at `pos` in `rdata` ends, and whether it ends in a
+compression pointer, whose two octets `end` counts whether or not both are
+there. False on a reserved label type (`end` then 0), and for a name that runs
+off the end without a root label, with `end` where its labels stopped.
+*/
+raw_name_end :: proc "contextless" (rdata: []u8, pos: int) -> (end: int, pointer: bool, ok: bool) {
+	p := pos
+	for p < len(rdata) {
+		l := rdata[p]
+		switch {
+		case l & 0xc0 == 0xc0:
+			return p + 2, true, true
+		case l & 0xc0 != 0:
+			return 0, false, false
+		case l == 0:
+			return p + 1, false, true
+		}
+		p += 1 + int(l)
+	}
+	return p, false, false
 }
 
 /*
@@ -256,7 +272,7 @@ expand_rdata_names :: proc(
 	}
 
 	total += end - pos
-	if total > 0xffff {
+	if total > MAX_RDLENGTH {
 		return nil, false
 	}
 
@@ -335,24 +351,13 @@ raw_rdata_holds_pointer :: proc "contextless" (layout: Raw_Layout, rdata: []u8) 
 	}
 
 	for _ in 0 ..< layout.names {
-		for {
-			if pos >= len(rdata) {
-				return false
-			}
-			l := rdata[pos]
-			if l & 0xc0 == 0xc0 {
-				return true
-			}
-			if l & 0xc0 != 0 {
-				// A reserved label type: not a pointer, and not something whose
-				// length is known well enough to walk past.
-				return false
-			}
-			pos += 1 + int(l)
-			if l == 0 {
-				break
-			}
+		// A reserved label type is not a pointer, and not something whose length
+		// is known well enough to walk past.
+		end, pointer, named := raw_name_end(rdata, pos)
+		if pointer || !named {
+			return pointer
 		}
+		pos = end
 	}
 	return false
 }

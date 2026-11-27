@@ -581,7 +581,7 @@ present_response :: proc(
 		name that validated perfectly well.
 		*/
 		dry: bool
-		pruned, pruned_ok := dnssec.strip_unauthenticated(out, result, allocator, dns.MAX_MESSAGE, spent, &dry)
+		pruned, pruned_ok := dnssec.strip_unauthenticated(out, result, allocator, spent = spent, refused = &dry)
 		if dry {
 			return nil, false
 		}

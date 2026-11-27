@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:mem"
 import "core:slice"
 import "core:strings"
+import "elodin:dns"
 
 /*
 An independent reader for the DNS messages the parity check compares.
@@ -69,7 +70,8 @@ Pw_Opt :: struct {
 	duplicate: bool,
 }
 
-PW_DO :: 0x8000
+// The DO bit in an OPT record's flags (RFC 3225 section 3).
+PW_DO :: u16(dns.EDNS_DO)
 
 Pw_RR :: struct {
 	/*

@@ -110,8 +110,8 @@ finding. Some rules hold for the whole tree (`strings.equal_fold` and
 integer parsers on config and wire input, a format in `testing.expect`, an
 import of `elodin:testkit` outside tests, a receive timeout tested by hand
 rather than through `netx.timed_out`, a `.odin:<line>` reference, and an exported procedure nothing outside test files
-calls, which belongs in a test file - the itest and fuzz packages count as
-callers); others only for
+calls, which belongs in a test file - the itest counts as a caller, a fuzz
+target does not); others only for
 lines a branch adds, diffed against `LINT_BASE` (default: the merge base with
 `origin/main`): a discarded error or `ok` in a test, `time.sleep` and `time.now`
 in tests, `strconv`'s integer parsers in tests and the itest, and comments

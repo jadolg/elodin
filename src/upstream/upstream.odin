@@ -1109,10 +1109,8 @@ response_matches :: proc(query, response: []u8) -> bool {
 	if len(response) < dns.HEADER_SIZE || len(query) < dns.HEADER_SIZE {
 		return false
 	}
-	if response[0] != query[0] || response[1] != query[1] {
-		return false
-	}
-	if response[2] & 0x80 == 0 {
+	query_id, _ := dns.peek_id(query)
+	if response_id, _ := dns.peek_id(response); response_id != query_id || !dns.peek_is_response(response) {
 		return false
 	}
 

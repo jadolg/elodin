@@ -165,7 +165,7 @@ w_name_at :: proc(w: ^Writer, at: int, folded: []u8) -> bool {
 			if pos + 1 >= len(w.buf) {
 				return false
 			}
-			pos = int(b & 0x3f) << 8 | int(w.buf[pos + 1])
+			pos = int(be16(w.buf[:], pos) & 0x3fff)
 			hops += 1
 			continue
 		}
@@ -304,7 +304,7 @@ w_record :: proc(w: ^Writer, rec: Record) -> Encode_Error {
 		return .Out_Of_Memory
 	}
 	rdlen := len(w.buf) - rdata_start
-	if rdlen > 0xffff {
+	if rdlen > MAX_RDLENGTH {
 		return .Too_Large
 	}
 	w.buf[len_pos] = u8(rdlen >> 8)
@@ -431,7 +431,7 @@ rrsig_covers :: proc(sig: Record) -> Type {
 	if !is_raw || len(raw.data) < 2 {
 		return Type(0)
 	}
-	return Type(u16(raw.data[0]) << 8 | u16(raw.data[1]))
+	return Type(be16(raw.data, 0))
 }
 
 // How many RRsets left out of the additional section `encode_message` keeps

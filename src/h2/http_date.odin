@@ -43,7 +43,7 @@ retry_after_now :: proc(value: string) -> (seconds: u32, ok: bool) {
 		return s, true
 	}
 	now := time.time_to_datetime(loop.now()) or_return // wall-clock: an HTTP-date is an instant on it
-	return date_retry_after(value, now)
+	return parse_retry_after(value, now)
 }
 
 /*

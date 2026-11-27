@@ -13,15 +13,19 @@ the record: every question has to be turned into a hash first, with the salt and
 iteration count the record itself carries, and answered by comparing hashes.
 */
 
+// The length of an NSEC3 hash: a SHA-1 digest, the one algorithm RFC 5155
+// section 11 defines.
+NSEC3_HASH_LEN :: 20
+
 /*
 The iterated hash of RFC 5155 section 5.
 
-`out` takes the 20 bytes of a SHA-1 digest. The first round hashes the canonical
+`out` takes the `NSEC3_HASH_LEN` bytes of a SHA-1 digest. The first round hashes the canonical
 wire name with the salt appended; each further round rehashes the digest with
 the salt appended again.
 */
 nsec3_hash :: proc(name: string, salt: []u8, iterations: u16, out: []u8) -> bool {
-	if len(out) < 20 || len(salt) > 255 {
+	if len(out) < NSEC3_HASH_LEN || len(salt) > dns.MAX_CHARACTER_STRING {
 		return false
 	}
 	wire: [dns.MAX_NAME_WIRE]u8
@@ -30,18 +34,19 @@ nsec3_hash :: proc(name: string, salt: []u8, iterations: u16, out: []u8) -> bool
 		return false
 	}
 
-	buf: [dns.MAX_NAME_WIRE + 256]u8
+	// The salt, a <character-string>'s worth, after the name or the digest.
+	buf: [dns.MAX_NAME_WIRE + dns.MAX_CHARACTER_STRING]u8
 	copy(buf[:], wire[:n])
 	copy(buf[n:], salt)
 
-	hash: [20]u8
+	hash: [NSEC3_HASH_LEN]u8
 	if !digest(DIGEST_SHA1, buf[:n + len(salt)], hash[:]) {
 		return false
 	}
 	for _ in 0 ..< int(iterations) {
 		copy(buf[:], hash[:])
-		copy(buf[20:], salt)
-		if !digest(DIGEST_SHA1, buf[:20 + len(salt)], hash[:]) {
+		copy(buf[NSEC3_HASH_LEN:], salt)
+		if !digest(DIGEST_SHA1, buf[:NSEC3_HASH_LEN + len(salt)], hash[:]) {
 			return false
 		}
 	}
@@ -316,7 +321,7 @@ spend_nsec3_rounds :: proc(budget: ^Nsec3_Budget, rr: Nsec3, name: string) -> bo
 	// The wire name is the presentation name's length plus the root label, or
 	// shorter where an escape stood for one byte - so this is an upper bound
 	// and never an undercharge.
-	cost := sha1_blocks(len(name) + 1 + len(rr.salt)) + int(rr.iterations) * sha1_blocks(20 + len(rr.salt))
+	cost := sha1_blocks(len(name) + 1 + len(rr.salt)) + int(rr.iterations) * sha1_blocks(NSEC3_HASH_LEN + len(rr.salt))
 	if budget.rounds + cost > MAX_NSEC3_ROUNDS_PER_QUERY {
 		budget.spent += 1
 		return false
@@ -414,7 +419,7 @@ Nsec3_Hash :: struct {
 	name:       string,
 	salt:       []u8,
 	iterations: u16,
-	hash:       [20]u8,
+	hash:       [NSEC3_HASH_LEN]u8,
 	have:       bool,
 }
 

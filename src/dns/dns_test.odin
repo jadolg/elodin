@@ -1610,3 +1610,50 @@ test_make_response_echoes_one_question_at_most :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(none.question), 0)
 	free_all(context.temp_allocator)
 }
+
+// A label ends at its unescaped dot, or at the name's end; an escape, `\X` or
+// `\DDD`, never ends one.
+@(test)
+test_a_label_ends_at_its_unescaped_dot :: proc(t: ^testing.T) {
+	Row :: struct {
+		name: string,
+		from: int,
+		want: int,
+	}
+	rows := []Row {
+		{name = "www.example.", from = 0, want = 3},
+		{name = "www.example.", from = 4, want = 11},
+		{name = `a\.b.c.`, from = 0, want = 4},
+		{name = `a\046b.c.`, from = 0, want = 6},
+		{name = "tail", from = 0, want = 4},
+		{name = `odd\`, from = 0, want = 4},
+		{name = "", from = 0, want = 0},
+	}
+	for row in rows {
+		testing.expectf(t, label_end(row.name, row.from) == row.want, "%q from %d: ended at %d, want %d", row.name, row.from, label_end(row.name, row.from), row.want)
+	}
+}
+
+// Where a wire name in RDATA ends: past its root label, past a pointer's two
+// octets, and nowhere for a reserved label type or one that runs off the end.
+@(test)
+test_a_raw_name_ends_at_its_root_or_its_pointer :: proc(t: ^testing.T) {
+	Row :: struct {
+		rdata:   []u8,
+		end:     int,
+		pointer: bool,
+		ok:      bool,
+	}
+	rows := []Row {
+		{rdata = {0}, end = 1, pointer = false, ok = true},
+		{rdata = {1, 'a', 0, 9}, end = 3, pointer = false, ok = true},
+		{rdata = {1, 'a', 0xc0, 12}, end = 4, pointer = true, ok = true},
+		{rdata = {0x40}, end = 0, pointer = false, ok = false},
+		{rdata = {5, 'a'}, end = 6, pointer = false, ok = false},
+		{rdata = {1, 'a'}, end = 2, pointer = false, ok = false},
+	}
+	for row, i in rows {
+		end, pointer, ok := raw_name_end(row.rdata, 0)
+		testing.expectf(t, end == row.end && pointer == row.pointer && ok == row.ok, "row %d: (%d, %v, %v), want (%d, %v, %v)", i, end, pointer, ok, row.end, row.pointer, row.ok)
+	}
+}
