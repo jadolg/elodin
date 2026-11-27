@@ -1,5 +1,6 @@
 package server
 
+import "base:runtime"
 import "core:fmt"
 import "core:hash"
 import "core:os"
@@ -244,7 +245,7 @@ move_query_named_caches :: proc(cfg: ^config.Config) {
 				continue
 			}
 			old := config.list_cache_name(list.url)
-			old_path, _ := filepath.join({cfg.blocking.cache_dir, old}, context.temp_allocator) // lint:allow a refusal sets `dry`
+			old_path := cache_file_path(cfg, old)
 			if dry {
 				break moves
 			}
@@ -604,7 +605,13 @@ save_cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, text: str
 		warn_cache_unwritable(cfg, names.copy, werr)
 		return
 	}
-	mark_copy_source(cfg, list, names)
+	// Another url's fingerprint left beside this url's copy would make the copy
+	// that url's download.
+	if !mark_copy_source(cfg, list, names) && os.exists(names.source) && !copy_is_of(list, names) {
+		if rerr := os.remove(names.source); rerr != nil {
+			logx.warnf("list %s: cannot remove the old fingerprint at %s (%v)", list.name, names.source, rerr)
+		}
+	}
 }
 
 // Put the fingerprint of `list`'s url beside its copy, or none for a url with no
@@ -876,8 +883,20 @@ write_cache_file :: proc(path: string, body: []byte) -> (err: os.Error) {
 
 @(private)
 list_cache_path :: proc(cfg: ^config.Config, list: config.Block_List) -> string {
-	joined, _ := filepath.join({cfg.blocking.cache_dir, config.list_cache_file(list)}, context.temp_allocator)
-	return joined
+	return cache_file_path(cfg, config.list_cache_file(list))
+}
+
+/*
+`file` in `cache_dir`, spelt in the temp allocator, so that a refusal is one a
+`dns.Dry_Watch` over it sees: `filepath.join` spells in `core:os`'s own arena,
+and returns "" when that arena cannot grow.
+*/
+@(private)
+cache_file_path :: proc(cfg: ^config.Config, file: string) -> string {
+	if cfg.blocking.cache_dir == "" {
+		return file
+	}
+	return strings.concatenate({strings.trim_right(cfg.blocking.cache_dir, "/"), "/", file}, context.temp_allocator)
 }
 
 /*
@@ -893,6 +912,11 @@ cache_warned: bool
 
 @(private)
 warn_cache_unwritable :: proc(cfg: ^config.Config, cache_path: string, err: os.Error) {
+	// No memory to name a file says nothing of the directory.
+	if _, no_memory := err.(runtime.Allocator_Error); no_memory {
+		logx.warnf("list cache: there is no memory to write %s", cache_path)
+		return
+	}
 	if sync.atomic_exchange(&cache_warned, true) {
 		return
 	}
