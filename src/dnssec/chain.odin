@@ -449,7 +449,7 @@ delegation_step :: proc(
 	ds_records, _, ds_sig, verified, exhausted, ds_lapsed := verified_rrset(budget, msg.answer, child, .DS, class, parent, parent_keys, unix, allocator)
 	// A step this server ran out of allowance on is one it did not read,
 	// which is `Indeterminate` territory rather than a broken delegation -
-	// the same distinction the denial path below makes.
+	// the same distinction the denial path (`ds_denial_step`) makes.
 	if exhausted {
 		return walk_gave_up(budget, exhausted_reason(budget)), nil
 	}
@@ -459,8 +459,8 @@ delegation_step :: proc(
 		up here, and the one that arrives with records rather than without:
 		the first name below the new cut is itself a signed zone, so its DS
 		is served and signed by the new zone, and no signature over it
-		names the parent the walk established. Same answer as the two
-		returns below - give the skipped name back to the lookup.
+		names the parent the walk established. Same answer as
+		`ds_denial_step`'s - give the skipped name back to the lookup.
 		*/
 		forget_skipped_non_cut(v, parent, child)
 		broke_at(budget, child, "the DS set is not signed by any key of its parent, or its signature expanded a wildcard", allocator, ds_lapsed)

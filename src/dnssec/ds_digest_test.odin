@@ -330,3 +330,12 @@ dd_supported :: proc() -> bool {
 	}
 	return true
 }
+
+// `ds_matches` hashes into a buffer of `MAX_DIGEST_SIZE`: a digest type that
+// outgrew it would never match its DS, and every zone using it would be Bogus.
+@(test)
+test_every_digest_fits_the_ds_buffer :: proc(t: ^testing.T) {
+	for d in 0 ..= 255 {
+		testing.expectf(t, digest_size(u8(d)) <= MAX_DIGEST_SIZE, "digest type %d is %d bytes, past MAX_DIGEST_SIZE", d, digest_size(u8(d)))
+	}
+}

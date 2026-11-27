@@ -542,8 +542,8 @@ judge_answer :: proc(
 		if status != .Secure {
 			// The reason belongs to the verdict that is being returned, so it
 			// moves only when the verdict does, or when a forgery joins a lapse
-			// (`takes_reason`) - the same rule the wildcard proofs below
-			// follow. `Insecure` ranks under `Indeterminate`, so
+			// (`takes_reason`) - the same rule the wildcard proofs
+			// (`prove_expansions`) follow. `Insecure` ranks under `Indeterminate`, so
 			// a later unsigned RRset would otherwise leave "unsigned zone"
 			// standing beside a verdict reached because a chain could not be
 			// walked: the benign reason reported, in the log and in the
@@ -1039,7 +1039,7 @@ validate_rrset :: proc(
 			// A signature this server never looked at, because it refused
 			// itself the lookup that would have reached the signer. Remembered
 			// so the verdict below cannot call the set forged on the strength
-			// of one that was not tried; see that return.
+			// of one that was not tried; see `signed_zone_verdict`.
 			trial.skipped_for_shed ||= walk.shed
 			if walk.status == .Indeterminate && !walk.shed && trial.unreached == "" {
 				trial.unreached = walk.stopped

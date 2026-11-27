@@ -43,7 +43,7 @@ retry_after_now :: proc(value: string) -> (seconds: u32, ok: bool) {
 		return s, true
 	}
 	now := time.time_to_datetime(loop.now()) or_return // wall-clock: an HTTP-date is an instant on it
-	return date_retry_after(value, now)
+	return parse_retry_after(value, now)
 }
 
 /*
@@ -55,7 +55,7 @@ A date already past is zero, and a wait past what a `u32` holds comes back as
 `max(u32)`, so a caller's own bound sees it and nothing wraps on the way. A value
 that is neither form is refused.
 */
-parse_retry_after :: proc(value: string, now: dt.DateTime) -> (seconds: u32, ok: bool) { // lint:allow the seam the tests and the retry_after fuzz target read with a chosen clock
+parse_retry_after :: proc(value: string, now: dt.DateTime) -> (seconds: u32, ok: bool) {
 	if s, is_delay := delay_seconds(value); is_delay {
 		return s, true
 	}
