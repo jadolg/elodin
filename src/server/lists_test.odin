@@ -2077,8 +2077,9 @@ save_refused_in_turn :: proc(t: ^testing.T, f: ^Save_Fixture, old: Before, run_l
 		}
 		delete(text)
 		if old == .Other_Url {
+			// Cleared only for the new copy to land: a save that does not leaves it.
 			text, load = cached_copy(&f.cfg, f.before, .Stale)
-			testing.expectf(t, load == .Unavailable || (load == .Stale && text == SAVE_OLD), "%s: the other query reads as %v %q", run, load, text)
+			testing.expectf(t, (saved && load == .Unavailable) || (!saved && load == .Stale && text == SAVE_OLD), "%s: the other query reads as %v %q", run, load, text)
 			delete(text)
 		}
 		if !expect_nothing_stray(t, f, files, run) {
@@ -2113,7 +2114,7 @@ expect_nothing_stray :: proc(t: ^testing.T, f: ^Save_Fixture, files: []string, r
 A copy whose fingerprint cannot be written, for a reason other than memory, is
 not saved (#780): a named list's copy with no fingerprint is read as the copy of
 any url the list is given, so written alone it would stand in for the url
-before.
+before, or for one the list is given later. Another url's copy is left as it was.
 */
 @(test)
 test_a_copy_without_its_fingerprint_is_not_saved :: proc(t: ^testing.T) {
@@ -2130,19 +2131,26 @@ test_a_copy_without_its_fingerprint_is_not_saved :: proc(t: ^testing.T) {
 	defer for p in ([]string{path, source_path(path), inside, blocker}) {
 		os.remove(p)
 	}
-	save_cached_copy(&cfg, before, SAVE_OLD)
-	text, load := cached_copy(&cfg, before, .Stale)
-	testing.expectf(t, load == .Stale && text == SAVE_OLD, "the premise: the other query's copy reads as %v %q", load, text)
-	delete(text)
 	if !testing.expect(t, os.make_directory(blocker) == nil && os.write_entire_file(inside, "x") == nil, "cannot plant the blocker") {
 		return
 	}
 
+	// The list's first save.
+	save_cached_copy(&cfg, list, SAVE_NEW)
+	testing.expect(t, !os.exists(path), "a first copy was written with no fingerprint")
+
+	// Over another url's copy, which is a save's to clear only for its own.
+	src, sourced := source_of(before)
+	if !testing.expect(t, sourced && os.write_entire_file(path, SAVE_OLD) == nil && os.write_entire_file(source_path(path), src) == nil, "cannot plant the other url's copy") {
+		return
+	}
+	text, load := cached_copy(&cfg, before, .Stale)
+	testing.expectf(t, load == .Stale && text == SAVE_OLD, "the premise: the other query's copy reads as %v %q", load, text)
+	delete(text)
 	save_cached_copy(&cfg, list, SAVE_NEW)
 	text, load = cached_copy(&cfg, before, .Stale)
-	testing.expectf(t, text != SAVE_NEW, "the other query reads the new copy as its own: %v", load)
+	testing.expectf(t, load == .Stale && text == SAVE_OLD, "the other query's copy reads as %v %q", load, text)
 	delete(text)
-	testing.expect(t, !os.exists(path) || os.exists(source_path(path)), "a copy was written with no fingerprint")
 }
 
 /*
@@ -2297,4 +2305,15 @@ test_a_move_whose_fingerprint_cannot_be_written_drops_the_key :: proc(t: ^testin
 		testing.expectf(t, load == .Unavailable, "load %d: the moved copy reads as the other query's: %v %q", i, load, text)
 		delete(text)
 	}
+}
+
+// Replace the file at `path` with `body` as a save does: staged whole on disk,
+// then renamed over it.
+@(private = "file")
+write_cache_file :: proc(path: string, body: []byte) -> (err: os.Error) {
+	tmp := stage_cache_file(path, body) or_return
+	if err = os.rename(tmp, path); err != nil {
+		os.remove(tmp)
+	}
+	return
 }

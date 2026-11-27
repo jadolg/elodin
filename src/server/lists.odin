@@ -237,30 +237,29 @@ move_query_named_caches :: proc(cfg: ^config.Config) {
 			current[config.list_cache_file(list)] = true
 		}
 	}
-	// Each name is checked before the rename or remove it steers, which are not
-	// undone.
+	// Whether a copy that may be due to move was held back for want of memory.
+	held: bool
 	moves: for set in lists {
 		for list in set {
 			if list.url == "" || list.file != "" || !list.enabled || list.named {
 				continue
 			}
+			// Spelt short, a name may read as some list's current copy, or as
+			// none there: either skips the list, and nothing is done before the
+			// check below.
 			old := config.list_cache_name(list.url)
 			old_path := cache_file_path(cfg, old)
-			if dry {
-				break moves
-			}
 			if current[old] || !cache_file_exists(old_path) {
 				continue
 			}
-			names, named := cache_names(cfg, list)
-			if !named {
-				break moves
-			}
+			names, _ := cache_names(cfg, list) // lint:allow a refusal sets `dry`, checked below
 			// A copy under the current name that is of another url - one with no
 			// query an earlier build cached there - is moved over, not kept.
 			ours := copy_is_of(list, names)
 			kept := ours && cache_file_exists(names.copy)
+			// Before the remove or rename the names steer, which are not undone.
 			if dry {
+				held = true
 				break moves
 			}
 			if kept {
@@ -269,22 +268,22 @@ move_query_named_caches :: proc(cfg: ^config.Config) {
 				}
 				continue
 			}
-			if !ours && !clear_other_copy(list, names) {
-				continue
+			// Named by this very url, so it is this url's copy. Unmarked for want of
+			// memory, it moves at the next load; for any other reason it moves all
+			// the same, so the key leaves `cache_dir`, and reads as no url's
+			// download.
+			source_tmp, ferr := stage_source(names)
+			if ferr != nil {
+				warn_cache_unwritable(cfg, names.source, ferr)
+				if no_memory(ferr) {
+					held = true
+					break moves
+				}
 			}
-			// Named by this very url, so it is this url's copy, marked before it
-			// moves. Unmarked for want of memory, it moves at the next load; for
-			// any other reason it moves all the same, so the key leaves
-			// `cache_dir`, and reads as no url's download.
-			if no_memory(mark_copy_source(cfg, list, names)) {
-				continue
-			}
-			if err := os.rename(old_path, names.copy); err != nil {
-				logx.warnf("list %s: cannot move the cached copy to %s (%v)", list.name, names.copy, err)
-			}
+			land_copy(cfg, list, names, ours, old_path, source_tmp)
 		}
 	}
-	if dry {
+	if held {
 		logx.warnf("blocking: there is no memory to name the cached copies; those named by a url's query move at the next load")
 	}
 }
@@ -610,29 +609,56 @@ save_cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, text: str
 	if dir := filepath.dir(names.copy); dir != "" {
 		make_directories(dir)
 	}
-	// On disk before anything there goes, so a write that fails leaves the copy
-	// there as it was, beside its own fingerprint.
+	// Both on disk before anything there goes, so a write that fails leaves the
+	// copy there as it was, beside its own fingerprint.
 	tmp, serr := stage_cache_file(names.copy, transmute([]byte)text)
 	if serr != nil {
 		warn_cache_unwritable(cfg, names.copy, serr)
 		return
 	}
-	// The fingerprint goes before the copy, so the copy never lands without it:
-	// a named list's copy with none reads as the copy of any url the list is
-	// given. A write that fails leaves the one before, which is this url's, or,
-	// another url's copy and fingerprint cleared first, none.
-	placed := ours || clear_other_copy(list, names)
-	if placed && mark_copy_source(cfg, list, names) != nil {
-		placed = ours
-	}
-	if placed {
-		rerr := os.rename(tmp, names.copy)
-		if rerr == nil {
+	source_tmp, ferr := stage_source(names)
+	// With no fingerprint of its own, the copy lands only beside this url's one
+	// there: a named list's copy with none reads as the copy of any url the list
+	// is given.
+	if ferr != nil {
+		warn_cache_unwritable(cfg, names.source, ferr)
+		if !ours || !cache_file_exists(names.source) {
+			os.remove(tmp)
 			return
 		}
-		warn_cache_unwritable(cfg, names.copy, rerr)
 	}
-	os.remove(tmp)
+	if !land_copy(cfg, list, names, ours, tmp, source_tmp) {
+		os.remove(tmp)
+	}
+}
+
+/*
+Put this url's copy, at `from`, and its fingerprint, staged at `source_tmp` (""
+for none), at `names`. Another url's copy and fingerprint there, where `ours` is
+false, are cleared first, and the fingerprint lands before the copy, so that a
+stop at any point leaves no copy beside another url's fingerprint. False where
+the copy did not land; the staged fingerprint is removed where it did not.
+*/
+@(private)
+land_copy :: proc(cfg: ^config.Config, list: config.Block_List, names: Cache_Names, ours: bool, from, source_tmp: string) -> bool {
+	landed := ours || clear_other_copy(list, names)
+	if landed && source_tmp != "" {
+		if err := os.rename(source_tmp, names.source); err != nil {
+			warn_cache_unwritable(cfg, names.source, err)
+			landed = false
+		}
+	}
+	if !landed {
+		if source_tmp != "" {
+			os.remove(source_tmp)
+		}
+		return false
+	}
+	if err := os.rename(from, names.copy); err != nil {
+		warn_cache_unwritable(cfg, names.copy, err)
+		return false
+	}
+	return true
 }
 
 /*
@@ -652,20 +678,14 @@ clear_other_copy :: proc(list: config.Block_List, names: Cache_Names) -> bool {
 	return true
 }
 
-/*
-Put the fingerprint of `list`'s url where its copy goes, for a url with a query,
-and return why it is not there. A write that fails leaves the one before.
-*/
+// Stage the fingerprint of `names`' url beside where it goes, for a url with a
+// query; "" for a url with none.
 @(private)
-mark_copy_source :: proc(cfg: ^config.Config, list: config.Block_List, names: Cache_Names) -> (err: os.Error) {
+stage_source :: proc(names: Cache_Names) -> (tmp: string, err: os.Error) {
 	if !names.fingerprinted {
-		return nil
+		return "", nil
 	}
-	err = write_cache_file(names.source, transmute([]byte)names.fingerprint)
-	if err != nil {
-		warn_cache_unwritable(cfg, names.source, err)
-	}
-	return
+	return stage_cache_file(names.source, transmute([]byte)names.fingerprint)
 }
 
 // Where `list`'s cached copy and its fingerprint are, and the fingerprint of its url.
@@ -878,28 +898,18 @@ begins_with_markup :: proc(body: string) -> bool {
 }
 
 /*
-Replace a cached copy so that a crash at any point leaves the old one or the new
-one whole on disk, never a truncated file (#411).
+Write `body` whole to the temporary file beside `path`, on disk, and return its
+name, for a rename over `path` to replace the copy there so that a crash at any
+point leaves the old one or the new one whole on disk, never a truncated file
+(#411). Nothing is left there where it fails.
 
 A write in place truncates the copy first, and a power cut mid-write - on the
 router or SD-card board `small-device.yaml` is for - leaves a partial list the
-next start without a network would load as the whole of it. So the new copy goes
-to a temporary file beside the old, reaches the disk, and is renamed over it;
-rename(2) replaces the name atomically. The temporary name ends in
-`.tmp`, which no `config.list_cache_file` result or fingerprint file does, so it
-cannot be another list's.
+next start without a network would load as the whole of it. rename(2) replaces
+the name atomically. The temporary name ends in `.tmp`, which no
+`config.list_cache_file` result or fingerprint file does, so it cannot be another
+list's.
 */
-@(private)
-write_cache_file :: proc(path: string, body: []byte) -> (err: os.Error) {
-	tmp := stage_cache_file(path, body) or_return
-	if err = os.rename(tmp, path); err != nil {
-		os.remove(tmp)
-	}
-	return
-}
-
-// Write `body` whole to the temporary file beside `path`, on disk, and return its
-// name, to be renamed over `path`. Nothing is left there where it fails.
 @(private)
 stage_cache_file :: proc(path: string, body: []byte) -> (tmp: string, err: os.Error) {
 	// Spelt short, it would be another file, in the cache or the working
