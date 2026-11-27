@@ -465,7 +465,7 @@ run_upstream_transport_cases :: proc(r: ^Runner) {
 			config := base_config(
 				udp_port,
 				upstreams_at(ports[:3]),
-				timeout = "500ms", // `HOLE_TIMEOUT`
+				timeout = fmt.tprintf("%dms", int(HOLE_TIMEOUT / time.Millisecond)),
 				upstream_extra = "  strategy: failover\n  attempts: 2",
 			)
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})

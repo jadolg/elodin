@@ -5,6 +5,7 @@ import "core:encoding/base64"
 import "core:fmt"
 import "core:mem"
 import "core:net"
+import "core:os"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
@@ -70,7 +71,9 @@ query_udp :: proc(
 			return {}
 		}
 		if match_id && (len(query) < 2 || buf[0] != query[0] || buf[1] != query[1]) {
-			if time.tick_diff(time.tick_now(), deadline) < 0 {
+			// The next read waits only for what is left of the one deadline.
+			left := time.tick_diff(time.tick_now(), deadline)
+			if left <= 0 || net.set_option(socket, .Receive_Timeout, max(left, time.Millisecond)) != nil {
 				return {}
 			}
 			continue
@@ -739,14 +742,18 @@ Whether a `::` listener here takes IPv4 as well: not where
 which asks over IPv4.
 */
 dual_stack_available :: proc() -> bool {
+	// The host setting that keeps IPv4 off `::`, read rather than waited out.
+	if v6only, rerr := os.read_entire_file("/proc/sys/net/ipv6/bindv6only", context.temp_allocator); rerr == nil && strings.trim_space(string(v6only)) == "1" {
+		return false
+	}
 	server, err := net.make_bound_udp_socket(net.IP6_Address{}, 0)
 	if err != nil {
 		return false
 	}
 	defer net.close(server)
-	// A loopback datagram either lands at once or never does, which is what a
-	// host that keeps IPv4 off `::` looks like: no reason to wait it out longer.
-	if net.set_option(server, .Receive_Timeout, PROBE_TIMEOUT) != nil {
+	// Anywhere else the datagram is let take as long as any client's would, so
+	// a loaded host does not read as one without dual stack and skip the cases.
+	if net.set_option(server, .Receive_Timeout, CLIENT_TIMEOUT) != nil {
 		return false
 	}
 	bound, berr := net.bound_endpoint(server)

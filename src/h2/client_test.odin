@@ -43,7 +43,7 @@ test_io_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 		if err == nil {
 			return got, true
 		}
-		// See upstream's `timed_out` (http.odin): on Linux, SO_RCVTIMEO expiring on a
+		// See `netx.timed_out`: on Linux, SO_RCVTIMEO expiring on a
 		// blocking recv() is EAGAIN, which core:net reports as .Would_Block,
 		// not .Timeout. Only continuing on .Timeout made every poll tick race
 		// with client_request's own deadline as a spurious connection close.
