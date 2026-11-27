@@ -312,6 +312,8 @@ test_a_busy_h2_conn_from_before_a_move_is_let_finish :: proc(t: ^testing.T) {
 	f.u.h2 = second_hc
 	sync.mutex_unlock(&f.u.mu)
 	if !testing.expect(t, second_hc != nil, "cannot start the second connection") {
+		// No connection took the socket.
+		net.close(socket)
 		return
 	}
 	second := second_hc.client

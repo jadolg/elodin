@@ -27,7 +27,10 @@ start_fixed :: proc(t: ^testing.T, fg: ^Mock_Set(3), rcodes: []dns.Rcode) -> boo
 fixed_query :: proc() -> []u8 {
 	query := dns.Message{id = 0x0245, question = []dns.Question{{name = "corp.example.", type = .DS, class = .IN}}}
 	query.flags.rd = true
-	wire, _, _ := dns.encode_message(query, context.temp_allocator)
+	wire, _, err := dns.encode_message(query, context.temp_allocator)
+	if err != .None {
+		panic("the proving query does not encode")
+	}
 	return wire
 }
 

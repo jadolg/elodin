@@ -77,17 +77,21 @@ start_reader :: proc(t: ^testing.T, u: ^Upstream, stream: Stream) -> (r: Reader_
 		sync.sema_post(&st.started)
 	}, &st)
 	ok = testing.expect(t, spawned, "cannot start a fiber") && testing.expect(t, sync.sema_wait_with_timeout(&st.started, 5 * time.Second), "the reader never started")
+	ok = ok && testing.expect(t, st.hc != nil, "no connection was made for the stream")
 	if !ok {
-		// Stopped here, while `st` is still in scope for the fiber. A stream no
-		// connection took is closed too, so a failed start leaves the caller
-		// nothing to clean up.
+		/*
+		A failed start leaves the caller nothing to clean up. A connection that
+		took the stream is retired while the loop still runs, so its reader can
+		wake and give its count and reference back; a stream no connection took
+		is closed. The loop stops while `st` is still in scope for the fiber.
+		*/
+		if st.hc != nil {
+			retire_h2_conn(st.hc)
+		}
 		stop_reader(&r)
 		if st.hc == nil {
 			stream := stream
 			stream_close(&stream)
-		} else {
-			// The connection took the stream before the wait ran out.
-			retire_h2_conn(st.hc)
 		}
 		return {}, false
 	}

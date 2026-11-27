@@ -82,14 +82,10 @@ key_path: string
 cert_ok: bool
 
 /*
-Whether a certificate already on disk can still be handshaken with.
-
-The reuse above it is the point of the cache, and without a look at the date it
-is a time bomb: the generated certificate lives for `CERT_DAYS` and the files
-are reused whenever they exist. Reusing an expired pair would fail
-`test_verifying_context_refuses_a_name_it_cannot_bind` on its *control* case -
-the name the certificate carries, refused - on every run, until somebody
-deleted the directory by hand.
+Whether a certificate on disk can still be handshaken with: a developer's own
+`certs/` pair, which may have expired since it was made, and the fresh one.
+An expired pair would fail `test_verifying_context_refuses_a_name_it_cannot_bind`
+on its *control* case - the name the certificate carries, refused.
 
 `-checkend` asks the question directly, and asks it about an hour from now rather
 than about this instant, so a certificate cannot expire between this check and
