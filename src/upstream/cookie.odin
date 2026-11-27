@@ -26,7 +26,6 @@ Held per upstream: a different server learns a different client cookie, so the
 cookie cannot be used to correlate this resolver across the servers it asks.
 */
 
-@(private)
 COOKIE_CLIENT_LEN :: 8
 @(private)
 COOKIE_SERVER_MIN :: 8

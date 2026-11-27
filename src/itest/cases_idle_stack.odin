@@ -216,6 +216,14 @@ idle_hold_one :: proc(transport: Idle_Transport, tcp_port, dot_port, doh_port: i
 	return
 }
 
+// A kB figure from smaps, digits only: a field that is not one is a reading
+// that cannot be trusted, not a zero.
+@(private = "file")
+kib_of :: proc(field: string) -> (kib: int, ok: bool) {
+	n := netx.parse_decimal(field, u64(max(i32))) or_return
+	return int(n), true
+}
+
 /*
 The server's fiber stacks, and how many of them are resident past
 `bound_kib`: anonymous mappings of `STACK_KIB`, read from smaps. Nothing else
@@ -226,14 +234,6 @@ mapping of its own.
 pages back: a glibc arena that THP backs jumps 2 MiB at once, which is the
 kernel's choice and not what a connection holds.
 */
-// A kB figure from smaps, digits only: a field that is not one is a reading
-// that cannot be trusted, not a zero.
-@(private = "file")
-kib_of :: proc(field: string) -> (kib: int, ok: bool) {
-	n := netx.parse_decimal(field, u64(max(i32))) or_return
-	return int(n), true
-}
-
 @(private = "file")
 fiber_stacks :: proc(pid: int, bound_kib: int) -> (count, over, rest_kib: int, ok: bool) {
 	// Polled until the stacks go back, and the temp allocator is reset only when

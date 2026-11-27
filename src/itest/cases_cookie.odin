@@ -7,6 +7,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:server"
+import "elodin:upstream"
 
 /*
 DNS cookies on the client-facing path (RFC 7873, RFC 9018).
@@ -60,7 +61,8 @@ priming_query :: proc(cookie: []u8, id: u16 = 0x5151) -> []u8 {
 	m.flags.rd = true
 	wire, _, err := dns.encode_message(m, context.temp_allocator)
 	if err != .None {
-		panic("the priming query does not encode")
+		// Nil fails the caller's query, and the case with it, not the run.
+		return nil
 	}
 	return wire
 }
@@ -393,7 +395,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 				sent, found := find_cookie(r, mock_last_query(mock))
 				if check(r, found, "the upstream saw no cookie") {
 					// Nothing learned yet, so this is a client cookie alone.
-					check_eq_int(r, len(sent), server.COOKIE_CLIENT_LEN, "cookie length on the first query")
+					check_eq_int(r, len(sent), upstream.COOKIE_CLIENT_LEN, "cookie length on the first query")
 				}
 
 				// The second query should carry what the first one learned.
@@ -402,7 +404,7 @@ run_upstream_cookie_cases :: proc(r: ^Runner) {
 					again, had := find_cookie(r, mock_last_query(mock))
 					if check(r, had, "the second query carried no cookie") {
 						// The client's own and the mock's eight-byte server cookie.
-						check_eq_int(r, len(again), server.COOKIE_CLIENT_LEN + 8, "cookie length on the second query")
+						check_eq_int(r, len(again), upstream.COOKIE_CLIENT_LEN + 8, "cookie length on the second query")
 						check(r, slice.equal(again[:8], sent), "the client cookie changed between queries")
 					}
 				}

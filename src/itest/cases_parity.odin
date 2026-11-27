@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:slice"
 import "core:strings"
 import "core:time"
-import "elodin:config"
 import "elodin:dns"
 import "elodin:server"
 
@@ -38,8 +37,9 @@ put behind a bare `mise run`:
 */
 
 // The datagram ceiling the parity configuration pins, kept next to the
-// comparison that depends on it rather than only in the yaml that sets it.
-PARITY_MAX_UDP_RESPONSE :: config.DEFAULT_MAX_UDP_RESPONSE
+// comparison that depends on it rather than only in the yaml that sets it. A
+// literal, so a change to the shipped default does not move the parity run.
+PARITY_MAX_UDP_RESPONSE :: 1232
 
 Parity_Options :: struct {
 	// Queries to send. One is enough to reproduce a known failure; a nightly
