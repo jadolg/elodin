@@ -27,7 +27,7 @@ run_upstream_wait_cases :: proc(r: ^Runner) {
 	}
 	defer mock_stop(mock)
 
-	udp_port := next_port(r)
+	udp_port, metrics_port := next_port(r), next_port(r)
 	config := base_config(
 		udp_port,
 		upstream_at(upstream_port),
@@ -35,7 +35,10 @@ run_upstream_wait_cases :: proc(r: ^Runner) {
 		timeout = "5s",
 		upstream_extra = "  attempts: 1",
 		cache = "{ enabled: true, max_entries: 100, serve_stale: true, stale_timeout: 3s }",
-		extra = "server:\n  max_pending: 8\n  rate_limit: { enabled: false }",
+		extra = fmt.tprintf(
+			"server:\n  max_pending: 8\n  rate_limit: {{ enabled: false }}\nmetrics: {{ enabled: true, address: \"127.0.0.1\", port: %d }}",
+			metrics_port,
+		),
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 	if !ok {
@@ -70,6 +73,13 @@ run_upstream_wait_cases :: proc(r: ^Runner) {
 		}
 		check(r, mock_wait_until(mock, asked_more_than, 5, 3 * time.Second), "fewer than six misses reached the silent upstream")
 		check_eq_int(r, mock_total(mock), 6, "misses that reached the silent upstream")
+		/*
+		The ten past the bound are each settled before the hit goes out: refused at
+		once, or dropped while `max_pending` is full of the others' refusals. Until
+		then a hit can meet that full count and be shed for a reason this case is
+		not about; which way each one goes is the readers' timing.
+		*/
+		check(r, misses_settled(flood, metrics_port, 10, 5 * time.Second), "the misses past the bound were not all refused or dropped")
 
 		res := query_udp(udp_port, build_query(hit, u16(dns.Type.A), id = 3), timeout = time.Second)
 		if check(r, res.ok, "the cache hit was shed with the misses") {
@@ -94,4 +104,29 @@ run_upstream_wait_cases :: proc(r: ^Runner) {
 		check_eq_int(r, mock_total(mock), 6, "queries that reached the silent upstream in all")
 	}
 	end_case(r)
+}
+
+/*
+Whether `want` misses have been settled before `within` is over: each one either
+refused, a SERVFAIL read from `socket`, or dropped, which `elodin_queries_dropped_total`
+on the metrics endpoint counts.
+*/
+@(private = "file")
+misses_settled :: proc(socket: net.UDP_Socket, metrics_port: int, want: int, within: time.Duration) -> bool {
+	deadline := time.tick_add(time.tick_now(), within)
+	refused := 0
+	buf: [512]u8
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
+		// Short reads, so the dropped count is looked at between them.
+		if net.set_option(socket, .Receive_Timeout, 50 * time.Millisecond) != nil {
+			return false
+		}
+		if n, _, err := net.recv_udp(socket, buf[:]); err == nil && n >= dns.HEADER_SIZE && dns.peek_rcode(buf[:n]) == .Serv_Fail {
+			refused += 1
+		}
+		if refused + metric_value(metrics_page(metrics_port), "elodin_queries_dropped_total") >= want {
+			return true
+		}
+	}
+	return false
 }
