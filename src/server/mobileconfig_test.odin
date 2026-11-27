@@ -183,8 +183,9 @@ mc_roundtrip :: proc(t: ^testing.T, request: string, signer: ^Profile_Signer = n
 	if !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
 		return "", false
 	}
-	reply, _ = read_until_close(client, 2 * time.Second)
-	return reply, true
+	rerr: net.Network_Error
+	reply, rerr = read_until_close(client, 2 * time.Second)
+	return reply, testing.expectf(t, rerr == nil, "the read did not end at the close: %v", rerr)
 }
 
 // The response body, which for a signed profile is DER and so cannot be read as

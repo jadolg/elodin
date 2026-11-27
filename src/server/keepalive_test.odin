@@ -29,10 +29,12 @@ on its own, with nothing in the path that could have echoed it.
 @(private = "file")
 KEPT :: "kept.example."
 
-// The default `client_timeout` is ten seconds, which is a hundred units of the
-// 100ms the TIMEOUT field is counted in (RFC 7828 section 3.1).
+// The default `client_timeout` in the 100ms units the TIMEOUT field is counted
+// in (RFC 7828 section 3.1).
 @(private = "file")
-DEFAULT_UNITS :: u16(10 * time.Second / (100 * time.Millisecond))
+default_units :: proc() -> u16 {
+	return u16(config.default_config().server.client_timeout / (100 * time.Millisecond))
+}
 
 /*
 An A query for `name`, with an OPT record that carries a keepalive option when
@@ -121,7 +123,7 @@ test_a_connected_client_that_asks_is_told_the_idle_timeout :: proc(t: ^testing.T
 		if testing.expectf(t, found, "%v: the answer carries no keepalive option", proto) {
 			testing.expectf(
 				t,
-				units == DEFAULT_UNITS,
+				units == default_units(),
 				"%v: the answer states a %d00ms idle timeout and the socket holds one for %v",
 				proto,
 				units,
@@ -321,7 +323,7 @@ test_a_client_keepalive_does_not_reach_the_upstream :: proc(t: ^testing.T) {
 	// which is the half the strip does not take away.
 	units, found := answer_keepalive(t, out)
 	if testing.expect(t, found, "the forwarded answer carries no keepalive option") {
-		testing.expect_value(t, units, DEFAULT_UNITS)
+		testing.expect_value(t, units, default_units())
 	}
 	free_all(context.temp_allocator)
 }

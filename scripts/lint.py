@@ -17,7 +17,7 @@ ALLOW = re.compile(r"lint:allow\s+\S")
 
 
 def is_test(path):
-    return path.endswith("_test.odin") or path.startswith(("src/itest/", "src/fuzz/"))
+    return path.endswith("_test.odin") or path.startswith(("src/itest/", "src/fuzz/", "src/testkit/"))
 
 
 def is_http(path):
@@ -30,17 +30,22 @@ def is_http(path):
 # Files that read integers the kernel wrote (/proc, cgroup), not config or wire.
 KERNEL_READERS = ("src/metrics/", "src/config/sizing.odin")
 
+# strconv's integer parsers, which take + and _ and wrap on overflow.
+STRCONV_INT = r"\bstrconv\.(parse_(int|uint|i(8|16|32|64|128)|u(8|16|32|64|128))(_of_base|_maybe_prefixed)?|atoi)\("
+
 # (name, pattern, applies-to-path, message)
 TREE = [
     ("equal-fold", r"\bstrings\.equal_fold\(", lambda p: not is_test(p),
      "strings.equal_fold folds Unicode (ſ matches s); use dns.name_equal_fold"),
     ("trim-space-http", r"\bstrings\.trim_space\(", is_http,
      "strings.trim_space strips NBSP, VT and FF, which are not HTTP OWS; use trim_ows"),
-    ("strconv-int", r"\bstrconv\.(parse_(int|uint|i(8|16|32|64|128)|u(8|16|32|64|128))(_of_base|_maybe_prefixed)?|atoi)\(",
+    ("strconv-int", STRCONV_INT,
      lambda p: not is_test(p) and not p.startswith(KERNEL_READERS),
      "strconv's integer parsers take + and _ and wrap on overflow; read digits-only and bounded (parse_rdata_u16)"),
     ("case-map", r"\bstrings\.to_(lower|upper)\(", lambda p: not is_test(p),
      "strings.to_lower maps non-ASCII letters onto ASCII ones (U+0130 to i); use dns.name_fold"),
+    ("testkit-import", r'^import\s+(\w+\s+)?"(elodin:|(\.\./)+)testkit"', lambda p: not is_test(p),
+     "elodin:testkit is test code, held only to the test rules; production code does not import it"),
     ("line-number", r"\.odin:[0-9]+", lambda p: True,
      "name the symbol, not a line number, which goes stale"),
     ("posix-open-flags",
@@ -59,6 +64,10 @@ ADDED = [
      "wait on an event (sema, cond, wait_for_log), not a duration"),
     ("wall-clock", r"\btime\.now\(", is_test,
      "measure durations with time.tick_now, not the wall clock"),
+    # Tests and the itest read the server's output and the wire too, where a
+    # signed or underscored number is a bug the test would miss.
+    ("strconv-int-test", STRCONV_INT, is_test,
+     "strconv's integer parsers take + and _ and wrap on overflow; read digits-only (netx.parse_decimal)"),
     ("narration", r"\b(before this (change|fix|PR)|the fix\b|this (change|PR)\b|today\b|there is now\b|the finding\b)",
      lambda p: True,
      "describe the code as it is, not its history or this PR"),

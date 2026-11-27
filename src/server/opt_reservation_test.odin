@@ -362,7 +362,7 @@ test_a_client_without_edns_is_cut_to_its_own_datagram :: proc(t: ^testing.T) {
 	// without EDNS can read, which is what makes this a truncation.
 	if !testing.expectf(
 		t,
-		len(stored) - OPT_RR_LEN - OPTION_LEN > 512,
+		len(stored) - dns.EMPTY_OPT_SIZE - OPTION_LEN > 512,
 		"the answer is %d bytes, so a 512-byte datagram holds it and nothing is cut",
 		len(stored),
 	) {

@@ -84,7 +84,9 @@ test_doh_max_age_is_charged_to_the_request :: proc(t: ^testing.T) {
 	}
 	m.flags.qr = true
 	wire, _, err := dns.encode_message(m, context.temp_allocator)
-	testing.expect_value(t, err, dns.Encode_Error.None)
+	if !testing.expect_value(t, err, dns.Encode_Error.None) {
+		return
+	}
 
 	spent := 0
 	testing.expect_value(t, doh_max_age(wire, context.temp_allocator, &spent), u32(600))

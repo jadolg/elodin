@@ -127,7 +127,9 @@ test_strip_removes_dnssec_records :: proc(t: ^testing.T) {
 
 	stripped := strip_dnssec_records(wire, client_query(false), .A, nil, context.temp_allocator, dns.MAX_MESSAGE)
 	msg, derr := dns.decode_message(stripped, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 
 	testing.expect_value(t, len(msg.answer), 1)
 	testing.expect_value(t, msg.answer[0].type, dns.Type.A)
@@ -151,7 +153,9 @@ test_strip_keeps_records_that_were_asked_for :: proc(t: ^testing.T) {
 	stripped := strip_dnssec_records(wire, client_query(false), .RRSIG, nil, context.temp_allocator, dns.MAX_MESSAGE)
 
 	msg, derr := dns.decode_message(stripped, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect_value(t, len(msg.answer), 2)
 	free_all(context.temp_allocator)
 }
@@ -172,7 +176,9 @@ test_strip_omits_opt_for_a_client_without_edns :: proc(t: ^testing.T) {
 	)
 
 	msg, derr := dns.decode_message(stripped, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect(t, !dns.edns_present(msg), "a client that sent no OPT should get none back")
 	free_all(context.temp_allocator)
 }
@@ -184,7 +190,10 @@ test_ad_bit_records_the_verdict :: proc(t: ^testing.T) {
 	if !encoded {
 		return
 	}
-	secure := present_response(wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
+	secure, secure_ok := present_response(wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
+	if !testing.expect(t, secure_ok, "the response was not presented") {
+		return
+	}
 	testing.expect(t, secure[3] & 0x20 != 0, "AD should record a secure verdict")
 
 	// Not secure: the bit must come off even though the upstream may have set it.
@@ -193,7 +202,7 @@ test_ad_bit_records_the_verdict :: proc(t: ^testing.T) {
 		return
 	}
 	insecure_wire[3] |= 0x20
-	insecure := present_response(
+	insecure, insecure_ok := present_response(
 		insecure_wire,
 		client_query(true),
 		.A,
@@ -201,6 +210,9 @@ test_ad_bit_records_the_verdict :: proc(t: ^testing.T) {
 		nil,
 		context.temp_allocator,
 	)
+	if !testing.expect(t, insecure_ok, "the response was not presented") {
+		return
+	}
 	testing.expect(t, insecure[3] & 0x20 == 0, "AD must not survive an unauthenticated answer")
 	free_all(context.temp_allocator)
 }
@@ -243,7 +255,10 @@ test_cd_bit_is_not_echoed_back :: proc(t: ^testing.T) {
 	}
 	wire[3] |= 0x10
 
-	out := present_response(wire, client_query(true), .A, secure_verdict(), nil, context.temp_allocator)
+	out, out_ok := present_response(wire, client_query(true), .A, secure_verdict(), nil, context.temp_allocator)
+	if !testing.expect(t, out_ok, "the response was not presented") {
+		return
+	}
 	testing.expect(t, out[3] & 0x10 == 0, "CD should be clear for a client that did not set it")
 
 	stripped_wire, stripped_encoded := encode(t, signed_response())
@@ -251,7 +266,10 @@ test_cd_bit_is_not_echoed_back :: proc(t: ^testing.T) {
 		return
 	}
 	stripped_wire[3] |= 0x10
-	stripped := present_response(stripped_wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
+	stripped, stripped_ok := present_response(stripped_wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
+	if !testing.expect(t, stripped_ok, "the response was not presented") {
+		return
+	}
 	testing.expect(t, stripped[3] & 0x10 == 0, "CD should be clear on a stripped answer too")
 	free_all(context.temp_allocator)
 }
@@ -319,11 +337,16 @@ test_ad_never_goes_out_over_records_the_verdict_missed :: proc(t: ^testing.T) {
 		return
 	}
 
-	out := present_response(wire, client_query(true), .A, secure_verdict(), nil, context.temp_allocator)
+	out, out_ok := present_response(wire, client_query(true), .A, secure_verdict(), nil, context.temp_allocator)
+	if !testing.expect(t, out_ok, "the response was not presented") {
+		return
+	}
 	testing.expect(t, out[3] & 0x20 != 0, "AD should record the secure verdict")
 
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 
 	for rec in decoded.authority {
 		testing.expectf(t, rec.type != .NS, "an unsigned NS RRset went out under AD as %v", rec.name)
@@ -365,11 +388,16 @@ test_a_pruned_answer_survives_the_strip_for_a_client_without_do :: proc(t: ^test
 		return
 	}
 
-	out := present_response(wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
+	out, out_ok := present_response(wire, client_query(false), .A, secure_verdict(), nil, context.temp_allocator)
+	if !testing.expect(t, out_ok, "the response was not presented") {
+		return
+	}
 	testing.expect(t, out[3] & 0x20 != 0, "AD should record the secure verdict")
 
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 
 	// The answer the client asked for, with the DNSSEC records it did not ask
 	// for taken back out - and the forged NS gone, which only the prune does.
@@ -408,6 +436,25 @@ cname_nodata_response :: proc() -> dns.Message {
 		ttl = 600,
 		data = rrsig_over(.CNAME),
 	}
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = dns.make_opt(4096, true)
+
+	msg := dns.Message {
+		id         = 0x2b2b,
+		question   = question(.AAAA),
+		answer     = answer,
+		authority  = cname_nodata_authority(),
+		additional = additional,
+	}
+	msg.flags.qr = true
+	msg.flags.ra = true
+	return msg
+}
+
+// `cname_nodata_response`'s authority section: the target zone's SOA, its
+// NSEC, and the SOA's signature.
+@(private = "file")
+cname_nodata_authority :: proc() -> []dns.Record {
 	authority := make([]dns.Record, 3, context.temp_allocator)
 	authority[0] = dns.Record {
 		name = "example.net.",
@@ -438,19 +485,7 @@ cname_nodata_response :: proc() -> dns.Message {
 		ttl = 900,
 		data = rrsig_over(.SOA),
 	}
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(4096, true)
-
-	msg := dns.Message {
-		id         = 0x2b2b,
-		question   = question(.AAAA),
-		answer     = answer,
-		authority  = authority,
-		additional = additional,
-	}
-	msg.flags.qr = true
-	msg.flags.ra = true
-	return msg
+	return authority
 }
 
 /*
@@ -485,9 +520,14 @@ test_a_pruned_denial_after_a_cname_is_not_cached :: proc(t: ^testing.T) {
 			answer = covered,
 		}
 
-		out := present_response(wire, client_query(true, type = .AAAA), .AAAA, verdict, nil, context.temp_allocator)
+		out, out_ok := present_response(wire, client_query(true, type = .AAAA), .AAAA, verdict, nil, context.temp_allocator)
+		if !testing.expect(t, out_ok, "the response was not presented") {
+			continue
+		}
 		decoded, derr := dns.decode_message(out, context.temp_allocator)
-		testing.expect_value(t, derr, dns.Decode_Error.None)
+		if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+			continue
+		}
 		testing.expect_value(t, dns.rcode_of(decoded), rcode)
 		testing.expect_value(t, len(decoded.answer), 2)
 		testing.expect_value(t, len(decoded.authority), 0)
@@ -504,7 +544,9 @@ test_a_pruned_denial_after_a_cname_is_not_cached :: proc(t: ^testing.T) {
 		// The same message unpruned, SOA and all, is kept: the refusal is the
 		// missing SOA and not the shape.
 		full, ferr := dns.decode_message(wire, context.temp_allocator)
-		testing.expect_value(t, ferr, dns.Decode_Error.None)
+		if !testing.expect_value(t, ferr, dns.Decode_Error.None) {
+			continue
+		}
 		testing.expectf(t, cache.put(answers, key, wire, full), "cache.put refused an unpruned %v after a CNAME", rcode)
 	}
 	free_all(context.temp_allocator)
@@ -518,33 +560,10 @@ to every later client - with the stored AD bit, for one that set DO.
 */
 @(test)
 test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
-	msg := cname_nodata_response()
-	answer := make([]dns.Record, len(msg.answer) + 1, context.temp_allocator)
-	copy(answer, msg.answer)
-	answer[len(msg.answer)] = dns.Record {
-		name = "cdn.example.net.",
-		type = .AAAA,
-		class = .IN,
-		ttl = 600,
-		data = dns.Rdata_AAAA{addr = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
-	}
-	msg.answer = answer
-	wire, encoded := encode(t, msg)
-	if !encoded {
+	out, decoded, presented := pruned_cname_aaaa(t)
+	if !presented {
 		return
 	}
-
-	covered := make([]dnssec.Authenticated_Set, 2, context.temp_allocator)
-	covered[0] = auth_set("www.example.com.", .CNAME)
-	covered[1] = auth_set("cdn.example.net.", .AAAA)
-	verdict := dnssec.Result {
-		status = .Secure,
-		answer = covered,
-	}
-
-	out := present_response(wire, client_query(true, type = .AAAA), .AAAA, verdict, nil, context.temp_allocator)
-	decoded, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect_value(t, len(decoded.answer), 3)
 	testing.expect_value(t, len(decoded.authority), 0)
 
@@ -580,10 +599,53 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, served[3] & 0x20 != 0, "the stored verdict should reach a client that set DO")
 	hit, hderr := dns.decode_message(served, context.temp_allocator)
-	testing.expect_value(t, hderr, dns.Decode_Error.None)
+	if !testing.expect_value(t, hderr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect_value(t, len(hit.answer), 3)
 	testing.expect_value(t, len(hit.authority), 0)
 	free_all(context.temp_allocator)
+}
+
+// `cname_nodata_response` reaching the AAAA it asked for, presented to a client
+// that set DO under a verdict covering both RRsets.
+@(private = "file")
+pruned_cname_aaaa :: proc(t: ^testing.T) -> (out: []u8, decoded: dns.Message, ok: bool) {
+	msg := cname_nodata_response()
+	answer := make([]dns.Record, len(msg.answer) + 1, context.temp_allocator)
+	copy(answer, msg.answer)
+	answer[len(msg.answer)] = dns.Record {
+		name = "cdn.example.net.",
+		type = .AAAA,
+		class = .IN,
+		ttl = 600,
+		data = dns.Rdata_AAAA{addr = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
+	}
+	msg.answer = answer
+	wire, encoded := encode(t, msg)
+	if !encoded {
+		return nil, {}, false
+	}
+
+	covered := make([]dnssec.Authenticated_Set, 2, context.temp_allocator)
+	covered[0] = auth_set("www.example.com.", .CNAME)
+	covered[1] = auth_set("cdn.example.net.", .AAAA)
+	verdict := dnssec.Result {
+		status = .Secure,
+		answer = covered,
+	}
+
+	out_ok: bool
+	out, out_ok = present_response(wire, client_query(true, type = .AAAA), .AAAA, verdict, nil, context.temp_allocator)
+	if !testing.expect(t, out_ok, "the response was not presented") {
+		return nil, {}, false
+	}
+	derr: dns.Decode_Error
+	decoded, derr = dns.decode_message(out, context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return nil, {}, false
+	}
+	return out, decoded, true
 }
 
 /*
@@ -647,7 +709,9 @@ serve_cached_with_ad :: proc(t: ^testing.T, c: Ad_Case) -> (response: []u8, ok: 
 	key_buf: [cache.KEY_MAX]u8
 	key := key_of(key_buf[:], query)
 	decoded, derr := dns.decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return nil, false
+	}
 	if !cache.put(answers, key, wire, decoded) {
 		testing.expectf(t, false, "%s: the answer was not cached, so the served path was never taken", c.name)
 		return nil, false
@@ -869,9 +933,14 @@ test_a_served_ttl_is_held_to_the_signature :: proc(t: ^testing.T) {
 	}
 	verdict := secure_verdict()
 	verdict.answer[0].ttl = 300
-	out := present_response(wire, client_query(true), .A, verdict, nil, context.temp_allocator)
+	out, out_ok := present_response(wire, client_query(true), .A, verdict, nil, context.temp_allocator)
+	if !testing.expect(t, out_ok, "the response was not presented") {
+		return
+	}
 	served, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect(t, served.flags.ad, "a secure verdict lost its AD bit")
 	testing.expect_value(t, len(served.answer), 2)
 	for rec in served.answer {
@@ -931,9 +1000,14 @@ test_an_unrebuildable_answer_still_has_its_ttl_held :: proc(t: ^testing.T) {
 	sets[1] = verdict.answer[0]
 	sets[1].type = .MX
 	verdict.answer = sets
-	out := present_response(broken[:], client_query(true), .A, verdict, nil, context.temp_allocator)
+	out, out_ok := present_response(broken[:], client_query(true), .A, verdict, nil, context.temp_allocator)
+	if !testing.expect(t, out_ok, "the response was not presented") {
+		return
+	}
 	served, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect(t, !served.flags.ad, "the fallback should not claim AD")
 	for rec in served.answer {
 		testing.expectf(t, rec.ttl <= 300, "%v went out with TTL %d over a ceiling of 300", rec.type, rec.ttl)

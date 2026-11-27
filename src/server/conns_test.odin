@@ -44,7 +44,7 @@ wait_for_active :: proc(cm: ^Conn_Manager, want: int) -> int {
 		want: int,
 	}
 	a := Active{cm, want}
-	_ = wait_until(proc(data: rawptr) -> bool {
+	_ = wait_until(proc(data: rawptr) -> bool { // lint:allow the caller asserts the count returned
 			a := (^Active)(data)
 			return active_connections(a.cm) == a.want
 		}, &a, 2 * time.Second)
@@ -435,6 +435,9 @@ test_stopping_the_listener_loops_cancels_them :: proc(t: ^testing.T) {
 		conn_manager_stop_permanent(st.cm)
 		sync.sema_post(&st.done)
 	})
+	// On a failure the loop is not stopped, the manager not shut down and the
+	// stopper not joined: each waits for the parked fiber, which is what failed
+	// to end, and the case would hang for its hour instead of failing.
 	if !testing.expect(t, sync.sema_wait_with_timeout(&st.done, 5 * time.Second), "the listener loop was not cancelled") {
 		return
 	}

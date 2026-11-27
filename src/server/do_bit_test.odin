@@ -86,24 +86,31 @@ test_do_is_set_upstream_whenever_validation_is_on :: proc(t: ^testing.T) {
 		}
 		testing.expectf(t, dns.edns_do(sent) == row.want_do, "%s: DO upstream %v, want %v", row.what, dns.edns_do(sent), row.want_do)
 
-		m, err := dns.decode_message(out, context.temp_allocator)
-		if !testing.expectf(t, err == .None, "%s: the answer does not decode: %v", row.what, err) {
-			continue
-		}
-		sigs, addrs := 0, 0
-		for rec in m.answer {
-			#partial switch rec.type {
-			case .RRSIG:
-				sigs += 1
-			case .A:
-				addrs += 1
-			}
-		}
-		testing.expectf(t, addrs == 1, "%s: %d addresses, want the one", row.what, addrs)
-		testing.expectf(t, sigs == row.want_sigs, "%s: %d RRSIGs to the client, want %d", row.what, sigs, row.want_sigs)
-		testing.expectf(t, dns.edns_do(m) == (row.edns && row.dnssec_ok), "%s: DO in the answer %v", row.what, dns.edns_do(m))
+		expect_client_answer(t, row.what, out, want_sigs = row.want_sigs, want_do = row.edns && row.dnssec_ok)
 	}
 	free_all(context.temp_allocator)
+}
+
+// The answer `out` the client got: the one address, `want_sigs` RRSIGs beside
+// it, and DO as `want_do`.
+@(private = "file")
+expect_client_answer :: proc(t: ^testing.T, what: string, out: []u8, want_sigs: int, want_do: bool) {
+	m, err := dns.decode_message(out, context.temp_allocator)
+	if !testing.expectf(t, err == .None, "%s: the answer does not decode: %v", what, err) {
+		return
+	}
+	sigs, addrs := 0, 0
+	for rec in m.answer {
+		#partial switch rec.type {
+		case .RRSIG:
+			sigs += 1
+		case .A:
+			addrs += 1
+		}
+	}
+	testing.expectf(t, addrs == 1, "%s: %d addresses, want the one", what, addrs)
+	testing.expectf(t, sigs == want_sigs, "%s: %d RRSIGs to the client, want %d", what, sigs, want_sigs)
+	testing.expectf(t, dns.edns_do(m) == want_do, "%s: DO in the answer %v", what, dns.edns_do(m))
 }
 
 /*

@@ -107,10 +107,6 @@ PC_COOKIE_OPTION :: 4 + 24
 // The shipped `cache.max_ttl`, which no scenario moves.
 PARITY_CACHE_MAX_TTL :: 86400
 
-// The smallest an OPT record can be on the wire: a root owner name, the type,
-// the class carrying the payload size, the four TTL bytes and an empty RDATA.
-PC_MIN_OPT :: 1 + 2 + 2 + 4 + 2
-
 Parity_Kind :: enum u8 {
 	Parse,
 	Identity,
@@ -1164,7 +1160,7 @@ pc_opt_cost :: proc(m: Pw_Msg) -> int {
 	if !m.opt.present {
 		return 0
 	}
-	n := PC_MIN_OPT
+	n := dns.EMPTY_OPT_SIZE
 	for o in m.opt.options {
 		n += 4 + len(o.data)
 	}
@@ -1587,7 +1583,7 @@ pc_edns :: proc(
 		that loses it states a different rcode, and `opt_holds_extended_rcode`
 		is what forces the record to stay.
 		*/
-		if first_dropped < 0 && el.rcode <= 0xf && el.size + PC_MIN_OPT > policy.client_udp_limit {
+		if first_dropped < 0 && el.rcode <= 0xf && el.size + dns.EMPTY_OPT_SIZE > policy.client_udp_limit {
 			pc_add(
 				c,
 				.Edns,

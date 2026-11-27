@@ -5,12 +5,13 @@ import "core:strings"
 import "core:testing"
 import "elodin:dns"
 import "elodin:dnssec"
+import "elodin:testkit"
 
 @(private = "file")
 APEX :: "corp.example.com."
 
 @(private = "file")
-BASE32HEX := [32]byte {
+BASE32HEX :: [32]byte {
 	'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
 	'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
 }
@@ -31,7 +32,7 @@ nsec3_at :: proc(from, to: []u8, flags: u8, iterations: u16, types: ..dns.Type) 
 	rdata := make([dynamic]u8, context.temp_allocator)
 	append(&rdata, 1, flags, u8(iterations >> 8), u8(iterations), 0, 20)
 	append(&rdata, ..to)
-	append(&rdata, ..type_bitmap(..types))
+	append(&rdata, ..testkit.type_bitmap(..types))
 	label := base32.encode(owner, BASE32HEX, context.temp_allocator)
 	return dns.Record {
 		name = strings.concatenate({label, ".example.com."}, context.temp_allocator),
@@ -67,10 +68,11 @@ test_an_apex_ds_nodata_is_the_proof_unless_the_denial_shows_no_delegation :: pro
 		reply:  []u8,
 		proved: bool,
 	}
+	without_ns := ds_nodata(APEX, nsec_at(APEX, "example.", .A, .RRSIG, .NSEC))
 	cases := []Case {
 		{"no denial records", ds_nodata(APEX), true},
 		{"an NSEC with NS", ds_nodata(APEX, nsec_at(APEX, "example.", .NS, .RRSIG, .NSEC)), true},
-		{"an NSEC without NS", ds_nodata(APEX, nsec_at(APEX, "example.", .A, .RRSIG, .NSEC)), false},
+		{"an NSEC without NS", without_ns, false},
 		{"the child's apex NSEC", ds_nodata(APEX, nsec_at(APEX, "example.", .NS, .SOA, .RRSIG, .NSEC, .DNSKEY)), false},
 		{"an empty non-terminal", ds_nodata(APEX, nsec_at("example.com.", "vpn.corp.example.com.", .NS, .SOA, .RRSIG, .NSEC)), false},
 		{"an NSEC3 with NS", ds_nodata(APEX, nsec3_at(nil, zero, 0, 0, .NS)), true},
@@ -82,16 +84,9 @@ test_an_apex_ds_nodata_is_the_proof_unless_the_denial_shows_no_delegation :: pro
 		{"an OPT record in authority", ds_nodata(APEX, nsec_at(APEX, "example.", .NS, .RRSIG, .NSEC), dns.make_opt(4096, false)), false},
 	}
 
-	// The premise: each reply is a NODATA whose authority the decoder hands over.
-	for c in cases {
-		m, err := dns.decode_message(c.reply, context.temp_allocator)
-		if !testing.expectf(t, err == .None, "%s: %v", c.what, err) {
-			return
-		}
-		testing.expectf(t, len(m.answer) == 0 && dns.Rcode(m.flags.rcode) == .No_Error, "%s is not a NODATA", c.what)
-	}
-	m, derr := dns.decode_message(cases[2].reply, context.temp_allocator)
-	if !testing.expectf(t, derr == .None && len(m.authority) == 1, "%s: %v", cases[2].what, derr) {
+	// The premise of the row without NS: its NSEC's bitmap says so.
+	m, derr := dns.decode_message(without_ns, context.temp_allocator)
+	if !testing.expectf(t, derr == .None && len(m.authority) == 1, "the NSEC without NS: %v", derr) {
 		return
 	}
 	// The bitmap follows the next name, `example.`, written out in full.
@@ -110,7 +105,13 @@ test_an_apex_ds_nodata_is_the_proof_unless_the_denial_shows_no_delegation :: pro
 		// The proof is settled; what is not the proof is no fact to store against.
 		testing.expectf(t, settled == c.proved, "%s: settled %v", c.what, settled)
 	}
+	free_all(context.temp_allocator)
+}
 
+// The apex DS answers that are not a table row: a compact denial, and a
+// configured iteration ceiling of zero.
+@(test)
+test_a_compact_denial_and_a_zero_ceiling_at_the_apex :: proc(t: ^testing.T) {
 	/*
 	RFC 9824's compact denial: an NSEC at the name with only RRSIG, NSEC and
 	NXNAME, which a parent sends for a name it does not have. Not the proof, and
@@ -132,8 +133,9 @@ test_an_apex_ds_nodata_is_the_proof_unless_the_denial_shows_no_delegation :: pro
 
 	// A configured ceiling of zero is the validator's default, not zero: a
 	// record at ten iterations is read.
+	zero := make([]u8, 20, context.temp_allocator)
 	spent := 0
-	proved, _ := parent_answers_apex_ds(ds_nodata(APEX, nsec3_at(nil, zero, 0, 10, .A, .RRSIG)), APEX, true, &spent, 0, context.temp_allocator)
-	testing.expect(t, !proved, "a ceiling of zero refused a ten-iteration NSEC3 the validator would read")
+	proved, settled := parent_answers_apex_ds(ds_nodata(APEX, nsec3_at(nil, zero, 0, 10, .A, .RRSIG)), APEX, true, &spent, 0, context.temp_allocator)
+	testing.expect(t, !proved && !settled, "a ceiling of zero refused a ten-iteration NSEC3 the validator would read")
 	free_all(context.temp_allocator)
 }

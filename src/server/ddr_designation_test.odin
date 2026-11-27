@@ -141,7 +141,8 @@ test_ddr_additional_addresses_come_from_the_rewrite :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// Addresses that will not fit are left out; the designation still arrives.
+// Addresses that will not fit are left out, all of them since they are one RRset
+// (RFC 2181 section 9); the designation still arrives.
 @(test)
 test_ddr_drops_the_addresses_before_the_designation :: proc(t: ^testing.T) {
 	cfg: config.Config
@@ -150,7 +151,7 @@ test_ddr_drops_the_addresses_before_the_designation :: proc(t: ^testing.T) {
 
 	resp := ask_message(t, &s, "_dns.resolver.arpa.", .SVCB)
 	testing.expect_value(t, len(resp.answer), 2)
-	testing.expectf(t, len(resp.additional) < 40, "all %d addresses fit in 512 bytes", len(resp.additional))
+	testing.expectf(t, len(resp.additional) == 0, "%d of the 40 addresses went in, where the RRset goes whole or not at all", len(resp.additional))
 	testing.expect(t, !resp.flags.tc, "the designation came back truncated")
 
 	free_all(context.temp_allocator)

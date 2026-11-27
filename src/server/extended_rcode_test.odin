@@ -1,12 +1,9 @@
 package server
 
-import "core:net"
 import "core:testing"
 import "core:thread"
-import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
-import "elodin:upstream"
 
 /*
 An upstream reply whose rcode a client cannot read is not handed to the client.
@@ -121,66 +118,13 @@ expect_reads_as_noerror :: proc(t: ^testing.T, reply: []u8) -> bool {
 }
 
 /*
-A server whose group is one mock upstream per name, asked in that order. The
-caller keeps the fixture where it declared it: `srv` points at `cfg`.
-*/
-@(private = "file")
-Rcode_Fixture :: struct {
-	sockets: [2]net.UDP_Socket,
-	bound:   int,
-	cfg:     config.Config,
-	group:   ^upstream.Group,
-	srv:     Server,
-}
-
-@(private = "file")
-rcode_fixture_start :: proc(t: ^testing.T, f: ^Rcode_Fixture, names: ..string, loc := #caller_location) -> bool {
-	assert(len(names) <= len(f.sockets))
-	specs := make([]config.Upstream_Spec, len(names), context.temp_allocator)
-	for name, i in names {
-		socket, spec, ok := bind_mock(t, name, loc = loc)
-		if !ok {
-			rcode_fixture_stop(f)
-			return false
-		}
-		f.sockets[i] = socket
-		f.bound += 1
-		specs[i] = spec
-	}
-	f.cfg = test_config(specs)
-	group, gerr := upstream.make_group(f.cfg.upstream)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr, loc = loc) {
-		rcode_fixture_stop(f)
-		return false
-	}
-	f.group = group
-	f.srv = Server {
-		cfg   = &f.cfg,
-		group = f.group,
-	}
-	return true
-}
-
-@(private = "file")
-rcode_fixture_stop :: proc(f: ^Rcode_Fixture) {
-	if f.group != nil {
-		upstream.destroy_group(f.group)
-		f.group = nil
-	}
-	for socket in f.sockets[:f.bound] {
-		net.close(socket)
-	}
-	f.bound = 0
-}
-
-/*
 One query through the fixture, the mock at each position answering the reply at
 the same position. A nil reply starts no mock there, for a member that must be
 left alone: it is read with `mock_untouched` once this has returned.
 */
 @(private = "file")
 rcode_ask :: proc(
-	f: ^Rcode_Fixture,
+	f: ^Mocks,
 	query: []u8,
 	replies: ..[]u8,
 ) -> (
@@ -221,11 +165,11 @@ the header's would still be a NODATA to everything that receives it.
 */
 @(test)
 test_an_extended_rcode_is_not_forwarded_to_the_client :: proc(t: ^testing.T) {
-	f: Rcode_Fixture
-	if !rcode_fixture_start(t, &f, "broken") {
+	f: Mocks
+	if !mocks_start(t, &f, "broken") {
 		return
 	}
-	defer rcode_fixture_stop(&f)
+	defer mocks_stop(&f)
 
 	reply := tlsa_reply(ext = 1)
 	if !expect_reads_as_noerror(t, reply) {
@@ -268,7 +212,7 @@ test_an_extended_rcode_is_not_forwarded_to_the_client :: proc(t: ^testing.T) {
 	unreachable authority - would say something untrue about an upstream that
 	answered.
 	*/
-	code, _ := extended_error(out)
+	code, _ := extended_error(out) // lint:allow only the info-code is checked
 	testing.expect_value(t, code, 0)
 
 	counters := stats_of(&f.srv)
@@ -297,11 +241,11 @@ four bits spell.
 */
 @(test)
 test_an_extended_rcode_with_a_nonzero_nibble_is_not_forwarded_either :: proc(t: ^testing.T) {
-	f: Rcode_Fixture
-	if !rcode_fixture_start(t, &f, "broken") {
+	f: Mocks
+	if !mocks_start(t, &f, "broken") {
 		return
 	}
-	defer rcode_fixture_stop(&f)
+	defer mocks_stop(&f)
 
 	// 16 | 7: an extended rcode this server has no reading for either, and one
 	// whose header half is a rcode in its own right.
@@ -334,7 +278,7 @@ test_an_extended_rcode_with_a_nonzero_nibble_is_not_forwarded_either :: proc(t: 
 	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.Serv_Fail)
 	testing.expect_value(t, decoded.id, CLIENT_ID)
 	testing.expect_value(t, len(decoded.answer), 0)
-	code, _ := extended_error(out)
+	code, _ := extended_error(out) // lint:allow only the info-code is checked
 	testing.expect_value(t, code, -1)
 
 	free_all(context.temp_allocator)
@@ -353,11 +297,11 @@ The client gets the answer the second server had all along.
 */
 @(test)
 test_a_broken_upstream_is_asked_past_for_an_extended_rcode :: proc(t: ^testing.T) {
-	f: Rcode_Fixture
-	if !rcode_fixture_start(t, &f, "broken", "good") {
+	f: Mocks
+	if !mocks_start(t, &f, "broken", "good") {
 		return
 	}
-	defer rcode_fixture_stop(&f)
+	defer mocks_stop(&f)
 
 	reply := tlsa_reply(ext = 1)
 	if !expect_reads_as_noerror(t, reply) {
@@ -411,11 +355,11 @@ returned rather than raced, which is both exact and quick. See `mock_untouched`.
 */
 @(test)
 test_a_readable_rcode_is_still_the_clients_answer :: proc(t: ^testing.T) {
-	f: Rcode_Fixture
-	if !rcode_fixture_start(t, &f, "declining", "spare") {
+	f: Mocks
+	if !mocks_start(t, &f, "declining", "spare") {
 		return
 	}
-	defer rcode_fixture_stop(&f)
+	defer mocks_stop(&f)
 
 	query := tlsa_query()
 	out, outcome, ok, mocks := rcode_ask(&f, query, tlsa_reply(u8(dns.Rcode.NX_Domain)))
@@ -452,11 +396,11 @@ test_a_group_with_a_spare_is_asked_past_a_servfail :: proc(t: ^testing.T) {
 
 @(private = "file")
 asked_past :: proc(t: ^testing.T, rcode: dns.Rcode) {
-	f: Rcode_Fixture
-	if !rcode_fixture_start(t, &f, "broken", "good") {
+	f: Mocks
+	if !mocks_start(t, &f, "broken", "good") {
 		return
 	}
-	defer rcode_fixture_stop(&f)
+	defer mocks_stop(&f)
 
 	out, outcome, ok, mocks := rcode_ask(&f, tlsa_query(), tlsa_reply(u8(rcode)), tlsa_reply(answer = true))
 	testing.expectf(t, mocks[0].got, "%v: the first upstream was never asked", rcode)
@@ -498,11 +442,11 @@ the client has to be told is the number.
 */
 @(test)
 test_an_unnamed_extended_rcode_is_reported_as_a_number :: proc(t: ^testing.T) {
-	f: Rcode_Fixture
-	if !rcode_fixture_start(t, &f, "broken") {
+	f: Mocks
+	if !mocks_start(t, &f, "broken") {
 		return
 	}
-	defer rcode_fixture_stop(&f)
+	defer mocks_stop(&f)
 
 	reply := tlsa_reply(ext = 2)
 	// The premise: a composed rcode of 32, which is not a value `Rcode` names.
@@ -544,11 +488,11 @@ the same reasoning `cases_queryid.odin` gives for the ID beside it.
 */
 @(test)
 test_a_clients_extended_rcode_byte_is_not_forwarded :: proc(t: ^testing.T) {
-	f: Rcode_Fixture
-	if !rcode_fixture_start(t, &f, "echoing") {
+	f: Mocks
+	if !mocks_start(t, &f, "echoing") {
 		return
 	}
-	defer rcode_fixture_stop(&f)
+	defer mocks_stop(&f)
 
 	// Extended byte 4 on the client's own query: composed rcode 64 to anything
 	// that reads the OPT record, and nothing at all to the version gate. And a
@@ -592,11 +536,31 @@ test_a_clients_extended_rcode_byte_is_not_forwarded :: proc(t: ^testing.T) {
 }
 
 /*
-Which extended error a DNSSEC refusal carries, and why the third one exists.
+The client query the refusals below answer. With an OPT record, because an
+extended error has nowhere else to go: `attach_extended_error` writes into the
+response's OPT, and a client that did not send one gets the bare SERVFAIL and no
+reason at all.
+*/
+@(private = "file")
+refusal_query :: proc() -> dns.Message {
+	additional := make([]dns.Record, 1, context.temp_allocator)
+	additional[0] = dns.make_opt(1232, false)
+	question := make([]dns.Question, 1, context.temp_allocator)
+	question[0] = {name = "nx.n3test.", type = .A, class = .IN}
+	return dns.Message {
+		id         = 0x1234,
+		flags      = dns.Flags{rd = true},
+		question   = question,
+		additional = additional,
+	}
+}
+
+/*
+Which extended error a DNSSEC refusal carries.
 
 SERVFAIL is all a client gets when an answer cannot be authenticated, so the
-extended error is the whole of what it is told about why. Three refusals reach
-here and they want a client to do different things: a forged answer is a
+extended error is the whole of what it is told about why. The refusals that
+reach here want a client to do different things: a forged answer is a
 forgery, an unreachable parent zone is worth retrying, and a zone whose NSEC3
 records ask for more hashing than this server does is neither - it is this
 resolver declining work over a number the zone chose, and RFC 8914 section 4.28
@@ -607,17 +571,7 @@ look at connectivity, which is the one thing that is fine.
 */
 @(test)
 test_a_dnssec_refusal_names_which_refusal_it_was :: proc(t: ^testing.T) {
-	// With an OPT record, because an extended error has nowhere else to go:
-	// `attach_extended_error` writes into the response's OPT, and a client that
-	// did not send one gets the bare SERVFAIL and no reason at all.
-	additional := make([]dns.Record, 1, context.temp_allocator)
-	additional[0] = dns.make_opt(1232, false)
-	query := dns.Message {
-		id         = 0x1234,
-		flags      = dns.Flags{rd = true},
-		question   = {{name = "nx.n3test.", type = .A, class = .IN}},
-		additional = additional,
-	}
+	query := refusal_query()
 	cases := []struct {
 		result: dnssec.Result,
 		code:   int,

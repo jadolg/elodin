@@ -5,6 +5,7 @@ import "core:mem"
 import "core:slice"
 import "core:testing"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 A fresh hashing allowance, held to `max_iterations` per record.
@@ -68,7 +69,7 @@ nsec3_zone :: proc(nodes: []Node, salt := D_SALT, iterations: u16 = 0) -> []Nsec
 				hash_algorithm = NSEC3_HASH_SHA1,
 				salt = salt,
 				iterations = iterations,
-				types = types_bitmap(node.types),
+				types = testkit.type_bitmap(..node.types),
 			},
 		}
 	}

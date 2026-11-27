@@ -53,24 +53,14 @@ test_only_the_idle_and_transient_accept_errors_are_not_failures :: proc(t: ^test
 }
 
 /*
-The two errors the back-off is for, named on their own.
-
-A descriptor shortage has to be waited out or the loop spins; a pending network
-error - `EPROTO`, `EHOSTUNREACH` and the rest of the set `accept(2)` says to
-treat like `EAGAIN` - reaches `core:net` as `Unknown`, and must not cost a
-listener a second of deafness on its own. Both are failures, and it is
-`ACCEPT_FAST_RETRIES` that separates them.
+The two failures the back-off is for, both rows of the table above: a descriptor
+shortage has to be waited out or the loop spins, and a pending network error -
+`EPROTO`, `EHOSTUNREACH` and the rest of the set `accept(2)` says to treat like
+`EAGAIN` - reaches `core:net` as `Unknown`, and must not cost a listener a second
+of deafness on its own. `ACCEPT_FAST_RETRIES` separates them, and one immediate
+retry is not enough for a network event that queues more than one.
 */
-@(test)
-test_a_shortage_and_a_pending_network_error_are_both_failures :: proc(t: ^testing.T) {
-	testing.expect(t, accept_failed(.Insufficient_Resources), "EMFILE/ENFILE must not be retried forever at once")
-	testing.expect(t, accept_failed(.Unknown), "a pending network error is a failure, and clears by itself")
-	testing.expect(
-		t,
-		ACCEPT_FAST_RETRIES > 1,
-		"one immediate retry is not enough for a network event that queues more than one",
-	)
-}
+#assert(ACCEPT_FAST_RETRIES > 1)
 
 /*
 The two shapes, held side by side.
@@ -128,10 +118,10 @@ test_descriptors_wanted_counts_everything_that_holds_one :: proc(t: ^testing.T) 
 	testing.expect_value(t, descriptors_wanted(d), 512 + 16 + 1024 + 1024 + 4 + 2 * 4 + DESCRIPTOR_RESERVE)
 
 	// The readers are a term of their own because an operator may set up to
-	// `MAX_UDP_READERS` (64) of them, more than `DESCRIPTOR_RESERVE` could absorb.
+	// `MAX_UDP_READERS` of them, more than `DESCRIPTOR_RESERVE` could absorb.
 	many := d
-	many.udp_readers = 64
-	testing.expect_value(t, descriptors_wanted(many) - descriptors_wanted(d), 60)
+	many.udp_readers = config.MAX_UDP_READERS
+	testing.expect_value(t, descriptors_wanted(many) - descriptors_wanted(d), config.MAX_UDP_READERS - d.udp_readers)
 }
 
 @(test)

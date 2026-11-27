@@ -1,5 +1,6 @@
 package server
 
+import "core:mem"
 import "core:slice"
 import "core:strings"
 import "core:testing"
@@ -43,7 +44,9 @@ test_an_upstream_query_carries_the_key_tags_it_is_given :: proc(t: ^testing.T) {
 A Key Tag query takes a place among the upstream waits before it is started
 and gives it back when it cannot be: with every place taken it is not started
 at all, and one turned away by `submit_query` (here a server with no loop to
-run it on) leaves both counts as it found them.
+run it on) leaves both counts as it found them. What it allocates says which
+happened: nothing for the one never started, and the query built and freed
+again for the one turned away.
 */
 @(test)
 test_a_key_tag_query_holds_an_upstream_wait_place :: proc(t: ^testing.T) {
@@ -56,15 +59,28 @@ test_a_key_tag_query_holds_an_upstream_wait_place :: proc(t: ^testing.T) {
 	}
 	tags := []u16{20326}
 
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+
 	s.upstream_waits = ceiling
-	send_key_tag_query(&s, ".", tags)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		send_key_tag_query(&s, ".", tags)
+	}
 	testing.expect_value(t, s.upstream_waits, ceiling)
 	testing.expect_value(t, s.pending, 0)
+	testing.expectf(t, track.total_allocation_count == 0, "a query with no place to wait in was built: %d allocations", track.total_allocation_count)
 
 	s.upstream_waits = 0
-	send_key_tag_query(&s, ".", tags)
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		send_key_tag_query(&s, ".", tags)
+	}
 	testing.expect_value(t, s.upstream_waits, 0)
 	testing.expect_value(t, s.pending, 0)
+	testing.expect(t, track.total_allocation_count > 0, "a query with a place to wait in was never built")
+	testing.expectf(t, len(track.allocation_map) == 0, "the query turned away kept %d allocations", len(track.allocation_map))
 }
 
 /*

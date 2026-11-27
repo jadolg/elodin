@@ -2,7 +2,6 @@ package server
 
 import "core:mem"
 import "core:net"
-import "core:strconv"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -10,6 +9,7 @@ import "core:time"
 import "elodin:dns"
 import "elodin:h2"
 import "elodin:loop"
+import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -53,6 +53,40 @@ barrier_started :: proc(data: rawptr) -> bool {
 }
 
 /*
+Send a bare header to `l`'s first reader from a client of its own, closed again
+by the time this returns, and wait for the reader to take it off its socket.
+`sent` is false, and said, when nothing could be sent; `queued` is whether the
+reader took it.
+*/
+@(private = "file")
+send_bare_header :: proc(t: ^testing.T, l: ^Listeners) -> (queued, sent: bool) {
+	bound, berr := net.bound_endpoint(l.udp[0].socket)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return false, false
+	}
+
+	/*
+	A bare header with no question. It reaches the read loop, is admitted, and is
+	answered with FORMERR — which is all this needs, and it keeps the query off
+	the cache, the filters and the upstream group, none of which are wired up
+	here.
+	*/
+	client, cerr := net.make_unbound_udp_socket(net.family_from_endpoint(bound))
+	if cerr != nil {
+		// No send and no close: the handle is zero, which under `odin test` can
+		// be another test's socket, since fd 0 is closed.
+		testing.expectf(t, false, "cannot open a client socket: %v", cerr)
+		return false, false
+	}
+	defer net.close(client)
+	query: [dns.HEADER_SIZE]u8
+	if _, serr := net.send_udp(client, query[:], bound); !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
+		return false, false
+	}
+	return wait_until(datagram_read, l, 2 * time.Second), true
+}
+
+/*
 The read loop must not release the context its queued jobs are still holding.
 
 Detected by identity: `stop_listeners` has joined the loop by the time this
@@ -87,32 +121,11 @@ test_read_loop_does_not_release_a_context_its_jobs_hold :: proc(t: ^testing.T) {
 		return
 	}
 
-	bound, berr := net.bound_endpoint(l.udp[0].socket)
-	if berr != nil {
+	queued, sent := send_bare_header(t, &l)
+	if !sent {
 		abandon(&barrier, &l, &tl)
-		testing.expectf(t, false, "cannot read the listener's port: %v", berr)
 		return
 	}
-
-	/*
-	A bare header with no question. It reaches the read loop, is admitted, and is
-	answered with FORMERR — which is all this needs, and it keeps the query off
-	the cache, the filters and the upstream group, none of which are wired up
-	here.
-	*/
-	client, cerr := net.make_unbound_udp_socket(net.family_from_endpoint(bound))
-	if cerr != nil {
-		// No send and no close: the handle is zero, which under `odin test` can
-		// be another test's socket, since fd 0 is closed.
-		abandon(&barrier, &l, &tl)
-		testing.expectf(t, false, "cannot open a client socket: %v", cerr)
-		return
-	}
-	query: [dns.HEADER_SIZE]u8
-	_, _ = net.send_udp(client, query[:], bound)
-
-	queued := wait_until(datagram_read, &l, 2 * time.Second)
-	net.close(client)
 
 	// Sockets closed, read loop joined. Anything it releases, it has released.
 	stop_listeners(&l)
@@ -341,7 +354,9 @@ test_a_connection_accepted_during_shutdown_is_dropped :: proc(t: ^testing.T) {
 		return
 	}
 	defer net.close(conn)
-	_ = net.set_option(conn, .Receive_Timeout, 2 * time.Second)
+	if !set_wait(t, conn, .Receive_Timeout, 2 * time.Second) {
+		return
+	}
 
 	buf: [1]u8
 	n, rerr := net.recv_tcp(conn, buf[:])
@@ -385,12 +400,13 @@ test_now_http_date_weekday_matches_the_date :: proc(t: ^testing.T) {
 		return
 	}
 
-	day, day_ok := strconv.parse_int(got[5:7])
+	// Digits only: `strconv.parse_int` would take a sign or an underscore.
+	day, day_ok := netx.parse_decimal(got[5:7], 31)
 	month := month_number(got[8:11])
-	year, year_ok := strconv.parse_int(got[12:16])
-	hour, hour_ok := strconv.parse_int(got[17:19])
-	minute, minute_ok := strconv.parse_int(got[20:22])
-	second, second_ok := strconv.parse_int(got[23:25])
+	year, year_ok := netx.parse_decimal(got[12:16], 9999)
+	hour, hour_ok := netx.parse_decimal(got[17:19], 23)
+	minute, minute_ok := netx.parse_decimal(got[20:22], 59)
+	second, second_ok := netx.parse_decimal(got[23:25], 60)
 	if !testing.expectf(
 		t,
 		day_ok && month != 0 && year_ok && hour_ok && minute_ok && second_ok,
@@ -400,7 +416,7 @@ test_now_http_date_weekday_matches_the_date :: proc(t: ^testing.T) {
 		return
 	}
 
-	parsed, ok := time.components_to_time(year, month, day, hour, minute, second)
+	parsed, ok := time.components_to_time(int(year), month, int(day), int(hour), int(minute), int(second))
 	if !testing.expectf(t, ok, "the Date header's own date does not parse as a valid time: %q", got) {
 		return
 	}
@@ -473,25 +489,18 @@ test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T)
 	defer if accepted_open {
 		net.close(accepted)
 	}
-	_ = net.set_option(client, .Receive_Timeout, 3 * time.Second)
-
-	// Bare DNS headers behind the two-byte length prefix, all of them sent before
-	// any is answered, each with a transaction ID of its own as a real client's
-	// would have.
-	STRIDE :: 2 + dns.HEADER_SIZE
-	PIPELINE :: 64
-	pipeline: [PIPELINE * STRIDE]u8
-	for i in 0 ..< PIPELINE {
-		message := pipeline[i * STRIDE:][:STRIDE]
-		message[1] = u8(dns.HEADER_SIZE)
-		message[2], message[3] = u8(i >> 8), u8(i)
+	if !set_wait(t, client, .Receive_Timeout, 3 * time.Second) {
+		return
 	}
-	if _, serr := net.send_tcp(client, pipeline[:]); !testing.expectf(t, serr == nil, "cannot send the pipeline: %v", serr) {
+
+	if !send_pipeline(t, client) {
 		return
 	}
 	_ = net.shutdown(client, .Send)
 
-	_ = net.set_option(accepted, .Receive_Timeout, 3 * time.Second)
+	if !set_wait(t, accepted, .Receive_Timeout, 3 * time.Second) {
+		return
+	}
 	conn := Conn {
 		socket = accepted,
 	}
@@ -519,18 +528,8 @@ test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T)
 	accepted_open = false
 
 	reply: [STRIDE]u8
-	got := 0
-	for got < len(reply) {
-		n, rerr := net.recv_tcp(client, reply[got:])
-		if rerr != nil {
-			testing.expectf(t, false, "the answer did not survive the close: %v", rerr)
-			return
-		}
-		if n == 0 {
-			testing.expect(t, false, "the connection ended before the answer arrived")
-			return
-		}
-		got += n
+	if !read_whole(t, client, reply[:]) {
+		return
 	}
 	testing.expectf(t, reply == answer, "the client read % x, expected the answer that was written", reply)
 
@@ -542,6 +541,48 @@ test_a_refused_pipeline_keeps_the_answers_already_written :: proc(t: ^testing.T)
 	*/
 	n, rerr := net.recv_tcp(client, reply[:])
 	testing.expectf(t, n == 0 && rerr == nil, "the close was not graceful: %d bytes, %v", n, rerr)
+}
+
+// One message of `send_pipeline`'s: a bare DNS header behind its length prefix.
+@(private = "file")
+STRIDE :: 2 + dns.HEADER_SIZE
+
+/*
+Bare DNS headers behind the two-byte length prefix, all of them sent before any
+is answered, each with a transaction ID of its own as a real client's would
+have. False, and said, when the send failed.
+*/
+@(private = "file")
+send_pipeline :: proc(t: ^testing.T, client: net.TCP_Socket) -> bool {
+	PIPELINE :: 64
+	pipeline: [PIPELINE * STRIDE]u8
+	for i in 0 ..< PIPELINE {
+		message := pipeline[i * STRIDE:][:STRIDE]
+		message[1] = u8(dns.HEADER_SIZE)
+		message[2], message[3] = u8(i >> 8), u8(i)
+	}
+	_, serr := net.send_tcp(client, pipeline[:])
+	return testing.expectf(t, serr == nil, "cannot send the pipeline: %v", serr)
+}
+
+// `out` filled from `client`; false, and said, on an error or the end of the
+// stream first.
+@(private = "file")
+read_whole :: proc(t: ^testing.T, client: net.TCP_Socket, out: []u8) -> bool {
+	got := 0
+	for got < len(out) {
+		n, rerr := net.recv_tcp(client, out[got:])
+		if rerr != nil {
+			testing.expectf(t, false, "the answer did not survive the close: %v", rerr)
+			return false
+		}
+		if n == 0 {
+			testing.expect(t, false, "the connection ended before the answer arrived")
+			return false
+		}
+		got += n
+	}
+	return true
 }
 
 /*
@@ -699,6 +740,34 @@ test_loopback_is_127_over_8_in_both_forms :: proc(t: ^testing.T) {
 }
 
 /*
+`message` sent to `client` a byte at a time, each byte followed by one read
+that waits out the client's receive timeout; `sent` bytes went out before the
+connection was seen to close, if `closed`.
+*/
+@(private = "file")
+drip :: proc(client: net.TCP_Socket, message: []u8) -> (sent: int, closed: bool) {
+	for sent < len(message) && !closed {
+		n, serr := net.send_tcp(client, message[sent:][:1])
+		if serr != nil || n != 1 {
+			// The server closed and the RST came back before this byte went out,
+			// which is the same outcome noticed one byte later.
+			return sent, true
+		}
+		sent += 1
+
+		reply: [1]u8
+		rn, rerr := net.recv_tcp(client, reply[:])
+		// A graceful close is no bytes and no error; a reset is
+		// `Connection_Closed`. `Would_Block` is the drip's own wait expiring with
+		// the connection still up, which is the loop doing its job.
+		if (rn == 0 && rerr == nil) || (rerr != nil && rerr != net.TCP_Recv_Error.Would_Block) {
+			closed = true
+		}
+	}
+	return sent, closed
+}
+
+/*
 A message trickled a byte at a time is given up on at `client_timeout`, not held
 for as long as the client keeps trickling.
 
@@ -752,32 +821,14 @@ test_a_drip_fed_message_is_reclaimed_at_the_deadline :: proc(t: ^testing.T) {
 	// waits a drip's worth for something the server has no reason to send, so the
 	// loop turns over at the drip interval whether or not the connection is still
 	// there.
-	_ = net.set_option(client, .Receive_Timeout, DRIP)
+	if !set_wait(t, client, .Receive_Timeout, DRIP) {
+		return
+	}
 
 	message: [2 + dns.HEADER_SIZE]u8
 	message[1] = u8(dns.HEADER_SIZE)
 
-	sent := 0
-	closed := false
-	for sent < len(message) && !closed {
-		n, serr := net.send_tcp(client, message[sent:][:1])
-		if serr != nil || n != 1 {
-			// The server closed and the RST came back before this byte went out,
-			// which is the same outcome noticed one byte later.
-			closed = true
-			break
-		}
-		sent += 1
-
-		reply: [1]u8
-		rn, rerr := net.recv_tcp(client, reply[:])
-		// A graceful close is no bytes and no error; a reset is
-		// `Connection_Closed`. `Would_Block` is the drip's own wait expiring with
-		// the connection still up, which is the loop doing its job.
-		if (rn == 0 && rerr == nil) || (rerr != nil && rerr != net.TCP_Recv_Error.Would_Block) {
-			closed = true
-		}
-	}
+	sent, closed := drip(client, message[:])
 
 	testing.expectf(
 		t,
@@ -801,6 +852,8 @@ Late_Sender :: struct {
 	message:  []u8,
 	split:    int,
 	wait:     time.Duration,
+	// What the dial or a send failed with, read once the thread is joined.
+	err:      net.Network_Error,
 }
 
 // Connect, wait, send the front of the message, wait again, send the rest. Both
@@ -810,17 +863,18 @@ Late_Sender :: struct {
 send_late_and_split :: proc(s: ^Late_Sender) {
 	socket, err := net.dial_tcp_from_endpoint(s.endpoint)
 	if err != nil {
+		s.err = err
 		return
 	}
 	defer net.close(socket)
 	time.sleep(s.wait)
-	if _, serr := net.send_tcp(socket, s.message[:s.split]); serr != nil {
+	if _, s.err = net.send_tcp(socket, s.message[:s.split]); s.err != nil {
 		return
 	}
 	time.sleep(s.wait)
 	// The close behind the send is a FIN after the bytes, which the reader takes
 	// in order.
-	_, _ = net.send_tcp(socket, s.message[s.split:])
+	_, s.err = net.send_tcp(socket, s.message[s.split:])
 }
 
 /*
@@ -864,6 +918,7 @@ test_the_wait_for_a_message_is_not_spent_on_reading_it :: proc(t: ^testing.T) {
 	defer {
 		thread.join(client)
 		thread.destroy(client)
+		testing.expectf(t, sender.err == nil, "the message was not sent: %v", sender.err)
 	}
 
 	accepted, _, aerr := net.accept_tcp(listener)
@@ -872,7 +927,9 @@ test_the_wait_for_a_message_is_not_spent_on_reading_it :: proc(t: ^testing.T) {
 	}
 	defer net.close(accepted)
 	// Long, so that what ends a read here is the budget and never the socket.
-	_ = net.set_option(accepted, .Receive_Timeout, 5 * time.Second)
+	if !set_wait(t, accepted, .Receive_Timeout, 5 * time.Second) {
+		return
+	}
 	conn := Conn {
 		socket = accepted,
 	}
@@ -1020,6 +1077,36 @@ test_udp_job_is_one_allocation :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(track.allocation_map), 0)
 }
 
+// Each of `frames`, a length and the byte that fills it, behind its two-byte
+// length prefix, one after another. The caller deletes it.
+@(private = "file")
+stream_frames :: proc(frames: [][2]int) -> (wire: [dynamic]u8) {
+	for f in frames {
+		length := f[0]
+		append(&wire, u8(length >> 8), u8(length))
+		for _ in 0 ..< length {
+			append(&wire, u8(f[1]))
+		}
+	}
+	return wire
+}
+
+/*
+That the next message `reader` assembles from `conn` is `length` bytes of
+`fill`, read with the budget's deadline cleared first as for a new message.
+False, and said, when it never arrives.
+*/
+@(private = "file")
+read_next :: proc(t: ^testing.T, conn: Conn, reader: ^Stream_Reader, budget: ^Read_Budget, what: string, length: int, fill: u8) -> bool {
+	budget.deadline = {}
+	msg, ok := stream_read_message(conn, reader, budget)
+	if !testing.expectf(t, ok, "the %s never arrived", what) {
+		return false
+	}
+	testing.expectf(t, len(msg) == length && msg[0] == fill && msg[length - 1] == fill, "the %s was not read whole: %d bytes", what, len(msg))
+	return true
+}
+
 /*
 A stream query is one read, with its length prefix, and what a client pipelined
 behind it waits in the reader for the next message (#594).
@@ -1040,20 +1127,13 @@ test_a_stream_query_and_its_prefix_are_one_read :: proc(t: ^testing.T) {
 	}
 	defer net.close(client)
 	defer net.close(accepted)
-	_ = net.set_option(accepted, .Receive_Timeout, 5 * time.Second)
+	if !set_wait(t, accepted, .Receive_Timeout, 5 * time.Second) {
+		return
+	}
 
 	LONG :: STREAM_READ_AHEAD + 100
-	wire: [dynamic]u8
+	wire := stream_frames({{dns.HEADER_SIZE, 'a'}, {LONG, 'b'}, {dns.HEADER_SIZE + 4, 'c'}})
 	defer delete(wire)
-	frame :: proc(wire: ^[dynamic]u8, length: int, fill: u8) {
-		append(wire, u8(length >> 8), u8(length))
-		for _ in 0 ..< length {
-			append(wire, fill)
-		}
-	}
-	frame(&wire, dns.HEADER_SIZE, 'a')
-	frame(&wire, LONG, 'b')
-	frame(&wire, dns.HEADER_SIZE + 4, 'c')
 	tail := len(wire) - 8
 	_, serr := net.send_tcp(client, wire[:tail])
 	if !testing.expectf(t, serr == nil, "cannot send: %v", serr) {
@@ -1067,12 +1147,9 @@ test_a_stream_query_and_its_prefix_are_one_read :: proc(t: ^testing.T) {
 	budget := Read_Budget {
 		idle = 5 * time.Second,
 	}
-	first, ok := stream_read_message(conn, &reader, &budget)
-	if !testing.expect(t, ok, "the first query never arrived") {
+	if !read_next(t, conn, &reader, &budget, "first query", dns.HEADER_SIZE, 'a') {
 		return
 	}
-	testing.expect_value(t, len(first), dns.HEADER_SIZE)
-	testing.expect_value(t, first[0], 'a')
 	testing.expectf(
 		t,
 		reader.end == STREAM_READ_AHEAD,
@@ -1081,23 +1158,15 @@ test_a_stream_query_and_its_prefix_are_one_read :: proc(t: ^testing.T) {
 		STREAM_READ_AHEAD,
 	)
 
-	budget.deadline = {}
-	second, ok2 := stream_read_message(conn, &reader, &budget)
-	if !testing.expect(t, ok2, "the long message never arrived") {
+	if !read_next(t, conn, &reader, &budget, "long message", LONG, 'b') {
 		return
 	}
-	testing.expect_value(t, len(second), LONG)
-	testing.expect(t, second[0] == 'b' && second[LONG - 1] == 'b', "the long message was not read whole")
 
 	_, serr = net.send_tcp(client, wire[tail:])
 	testing.expectf(t, serr == nil, "cannot send the tail: %v", serr)
-	budget.deadline = {}
-	third, ok3 := stream_read_message(conn, &reader, &budget)
-	if !testing.expect(t, ok3, "the split message never arrived") {
+	if !read_next(t, conn, &reader, &budget, "split message", dns.HEADER_SIZE + 4, 'c') {
 		return
 	}
-	testing.expect_value(t, len(third), dns.HEADER_SIZE + 4)
-	testing.expect(t, third[0] == 'c' && third[len(third) - 1] == 'c', "the split message was not read whole")
 	free_all(context.temp_allocator)
 }
 

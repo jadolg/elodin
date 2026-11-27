@@ -143,6 +143,13 @@ response_status :: proc(block: []u8) -> string {
 	return ""
 }
 
+// The `:status` of the first response in `out`, decoded; "" when there is none.
+@(private = "file")
+first_status :: proc(out: []u8) -> string {
+	_, headers := frames_of(out, .Headers)
+	return response_status(headers)
+}
+
 @(private = "file")
 Gate :: struct {
 	open:   loop.Sema,
@@ -234,31 +241,15 @@ serve_one :: proc(
 	gate := Gate{}
 	if occupy {
 		gate.server = &s
-		submit_query(&s, gate_job, &gate, 0)
+		testing.expect(t, submit_query(&s, gate_job, &gate, 0) == .Accepted, "the gate was not started", loc = loc)
 	}
 
 	input := one_get_request(path, requests)
 	defer delete(input)
 
-	script := Script {
-		input  = input[:],
-		await  = await,
-		output = make([dynamic]u8, 0, 256, context.allocator),
-	}
-
-	ctx := H2_Context {
-		server = &s,
-		client = "127.0.0.1",
-		peer   = peer,
-		path   = cfg.listeners.doh.path,
-	}
-	io := h2.IO {
-		user  = &script,
-		read  = script_read,
-		write = script_write,
-	}
-	hc := h2.make_conn(io, h2_handler, &ctx)
-	h2.serve(hc)
+	script: Script
+	ctx: H2_Context
+	hc := serve_script(&script, &ctx, &s, input[:], await, peer)
 
 	// Read before the gate opens: until then the gate's place is counted in it,
 	// and is taken back off below.
@@ -273,8 +264,15 @@ serve_one :: proc(
 	h2.conn_unref(hc)
 	stop_test_loop(&tl)
 
+	return result_of(&s, &ctx, script.output, queued, opened)
+}
+
+// What `serve_one` reports of `s` and `ctx` once the connection is idle, the
+// gate having opened at `opened`.
+@(private = "file")
+result_of :: proc(s: ^Server, ctx: ^H2_Context, output: [dynamic]u8, queued: int, opened: time.Tick) -> Result {
 	return Result {
-		output = script.output,
+		output = output,
 		dropped = sync.atomic_load(&s.stats.dropped),
 		refused = sync.atomic_load(&s.stats.refused),
 		queued = queued,
@@ -282,6 +280,42 @@ serve_one :: proc(
 		pending = ctx.pending,
 		stamped_after_gate = time.tick_diff(opened, ctx.last_question) > 0,
 	}
+}
+
+/*
+An HTTP/2 connection to `s` from `peer` reading `input` until `await`, served
+until the input is spent. `script` and `ctx` are filled here and outlive the
+connection, which the caller waits idle and unrefs; the caller owns
+`script.output`.
+*/
+@(private = "file")
+serve_script :: proc(
+	script: ^Script,
+	ctx: ^H2_Context,
+	s: ^Server,
+	input: []u8,
+	await: string,
+	peer: net.Endpoint,
+) -> ^h2.Conn {
+	script^ = Script {
+		input  = input,
+		await  = await,
+		output = make([dynamic]u8, 0, 256, context.allocator),
+	}
+	ctx^ = H2_Context {
+		server = s,
+		client = "127.0.0.1",
+		peer   = peer,
+		path   = s.cfg.listeners.doh.path,
+	}
+	io := h2.IO {
+		user  = script,
+		read  = script_read,
+		write = script_write,
+	}
+	hc := h2.make_conn(io, h2_handler, ctx)
+	h2.serve(hc)
+	return hc
 }
 
 // The default configuration serving DoH at /dns-query, with nothing behind the
@@ -342,7 +376,7 @@ test_doh2_sheds_a_request_it_cannot_start :: proc(t: ^testing.T) {
 	got := serve_one(t, &cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = false, refuse_starts = true)
 	defer delete(got.output)
 
-	testing.expect(t, strings.contains(string(got.output[:]), "503"), "the request was not shed")
+	testing.expect_value(t, first_status(got.output[:]), "503")
 	testing.expect(t, !wrote_a_body(got.output[:]), "the shed answer carried a body")
 	testing.expect_value(t, got.dropped, u64(1))
 }
@@ -372,11 +406,7 @@ test_doh2_sheds_when_max_pending_is_full :: proc(t: ^testing.T) {
 
 	// The status is the whole answer: a shed carries no body, so that it cannot
 	// park the reader on flow control. See `h2_shed`.
-	testing.expect(
-		t,
-		strings.contains(string(got.output[:]), "503"),
-		"the shed request was not answered 503 (nothing was shed)",
-	)
+	testing.expectf(t, first_status(got.output[:]) == "503", "the shed request was answered %q, not 503 (nothing was shed)", first_status(got.output[:]))
 	testing.expect(
 		t,
 		!wrote_a_body(got.output[:]),
@@ -402,7 +432,7 @@ test_doh2_queues_while_max_pending_has_room :: proc(t: ^testing.T) {
 		strings.contains(answer, "not found"),
 		"the request was not answered",
 	)
-	testing.expect(t, !strings.contains(answer, "503"), "an idle server shed a request")
+	testing.expect_value(t, first_status(got.output[:]), "404")
 	// Also what says `wrote_a_body` can tell: this answer has one.
 	testing.expect(t, wrote_a_body(got.output[:]), "the 404 went out without its body")
 	testing.expect_value(t, got.dropped, u64(0))
@@ -437,10 +467,8 @@ test_doh2_refuses_a_request_over_the_rate_limit :: proc(t: ^testing.T) {
 	got := serve_one(t, &cfg, "/dns-query?dns=AAAAAAAAAAAAAAAA", "", occupy = true, limiter = limiter)
 	defer delete(got.output)
 
-	answer := string(got.output[:])
 	testing.expectf(t, got.queued == 0, "%d over-budget requests were queued", got.queued)
-	testing.expect(t, strings.contains(answer, "429"), "the over-budget request was not answered 429")
-	testing.expect(t, !strings.contains(answer, "503"), "the request was shed rather than rate limited")
+	testing.expectf(t, first_status(got.output[:]) == "429", "the over-budget request was answered %q, not 429", first_status(got.output[:]))
 	// The status is the whole answer, for the reason `h2_shed` sends none either:
 	// a body can park the reader on flow control.
 	testing.expect(
@@ -482,7 +510,7 @@ test_doh2_rate_limit_charges_only_queries :: proc(t: ^testing.T) {
 
 	answer := string(got.output[:])
 	testing.expect(t, strings.contains(answer, "not found"), "the request was refused rather than answered 404")
-	testing.expect(t, !strings.contains(answer, "429"), "a request that is not a query was charged to the budget")
+	testing.expectf(t, first_status(got.output[:]) == "404", "a request that is not a query was answered %q, not 404", first_status(got.output[:]))
 
 	limited, _, _ := rate_limit_stats(limiter)
 	testing.expect_value(t, limited, u64(0))
@@ -504,11 +532,7 @@ test_doh2_shed_counts_only_queries :: proc(t: ^testing.T) {
 	defer delete(got.output)
 
 	testing.expectf(t, got.queued == 0, "%d requests were queued past max_pending", got.queued)
-	testing.expect(
-		t,
-		strings.contains(string(got.output[:]), "503"),
-		"the request was not shed",
-	)
+	testing.expect_value(t, first_status(got.output[:]), "503")
 	testing.expect_value(t, got.dropped, u64(0))
 }
 
@@ -552,7 +576,7 @@ test_doh2_rate_limit_charges_only_well_formed_queries :: proc(t: ^testing.T) {
 		strings.contains(answer, "malformed dns parameter"),
 		"the request was not answered 400",
 	)
-	testing.expect(t, !strings.contains(answer, "429"), "a request that is not a query was charged to the budget")
+	testing.expectf(t, first_status(got.output[:]) == "400", "a request that is not a query was answered %q, not 400", first_status(got.output[:]))
 
 	limited, _, _ := rate_limit_stats(limiter)
 	testing.expect_value(t, limited, u64(0))

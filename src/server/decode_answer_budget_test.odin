@@ -77,7 +77,10 @@ expect_within_ceiling :: proc(t: ^testing.T, msg: []u8, arena: ^mem.Arena, loc :
 
 @(private = "file")
 read_answer :: proc(msg: []u8, arena: ^mem.Arena) -> Decoded_Answer {
-	backing := make([]u8, 16 << 20)
+	backing, err := make([]u8, 16 << 20)
+	if err != nil {
+		panic("the answer's arena could not be made")
+	}
 	mem.arena_init(arena, backing)
 	return decode_answer(msg, answer_section = true, spent = nil, allocator = mem.arena_allocator(arena))
 }

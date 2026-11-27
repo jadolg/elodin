@@ -164,7 +164,7 @@ stale_query :: proc(rd: bool) -> []u8 {
 @(private)
 stale_entry :: proc(answers: ^cache.Cache) -> ^cache.Entry {
 	kb: [cache.KEY_MAX]u8
-	return answers.shards[0].entries[cache.make_key(kb[:], STALE_NAME, .A, .IN, false)]
+	return cached_entry(answers, cache.make_key(kb[:], STALE_NAME, .A, .IN, false))
 }
 
 // What a lookup of `STALE_NAME` finds in `answers`.
@@ -174,14 +174,7 @@ stale_get :: proc(answers: ^cache.Cache) -> (wire: []u8, hit: cache.Hit, found: 
 	return cache.get(answers, cache.make_key(kb[:], STALE_NAME, .A, .IN, false), context.temp_allocator)
 }
 
-/*
-Store an answer for `STALE_NAME`, expired if `expired` says so.
-
-The cache has no public way to age an entry, so the deadline is written
-directly. The alternative - storing a one-second answer and sleeping past it -
-would spend a second of real time in every run of the suite on a clock that is
-not what any of this is about.
-*/
+// Store an answer for `STALE_NAME`, expired (`expire_entry`) if `expired` says so.
 @(private)
 cache_an_answer :: proc(answers: ^cache.Cache, expired: bool) -> bool {
 	wire := test_reply(STALE_NAME, .A, a_record(STALE_NAME, {192, 0, 2, 1}, 300))
@@ -190,18 +183,11 @@ cache_an_answer :: proc(answers: ^cache.Cache, expired: bool) -> bool {
 		return false
 	}
 	key_buf: [cache.KEY_MAX]u8
-	if !cache.put(answers, cache.make_key(key_buf[:], STALE_NAME, .A, .IN, false), wire, decoded) {
+	key := cache.make_key(key_buf[:], STALE_NAME, .A, .IN, false)
+	if !cache.put(answers, key, wire, decoded) {
 		return false
 	}
-	if expired {
-		e := stale_entry(answers)
-		if e == nil {
-			return false
-		}
-		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
-		e.inserted = loop.moment_add(loop.moment_now(), -3600 * time.Second)
-	}
-	return true
+	return !expired || expire_entry(answers, key)
 }
 
 @(private)

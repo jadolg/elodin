@@ -1,5 +1,6 @@
 package server
 
+import "core:encoding/hex"
 import "core:mem"
 import "core:net"
 import "core:strings"
@@ -12,6 +13,8 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:filter"
+import "elodin:loop"
+import "elodin:testkit"
 import "elodin:upstream"
 
 /*
@@ -35,10 +38,9 @@ wire.
 So this is a bound on a hang and nothing else, the same job `Send_Timeout`
 does for the sender in `test_a_refusal_outlives_a_body_that_is_still_arriving`.
 A value tight enough to double as a deadline on the exchange asserts a property
-of the machine instead of one of the resolver: two seconds was enough to fail
-`Tests (arm64)` at random, on a loaded shared runner where the whole package
-took 5.1s against ~3.3s locally, with `the upstream was never asked` - a
-statement about the scheduler dressed up as one about forwarding (#191).
+of the machine instead of one of the resolver: on a loaded runner the scheduler
+alone can spend it, and the case then fails with `the upstream was never asked`,
+a statement about the scheduler dressed up as one about forwarding.
 
 Well past every `upstream.timeout` the harnesses here configure, so the resolver
 is what gives up first: a query that genuinely never comes fails the exchange on
@@ -63,8 +65,9 @@ leak the test reports as absence.
 
 Not zero milliseconds: `SO_RCVTIMEO` reads zero as "no timeout", which on a socket
 nothing is going to send to is the one value that hangs. `nothing_reached` in
-special_use_test.odin is this same reading, kept there because it also wants the
-question the leaked query asked.
+special_use_test.odin reads the socket the same way but matches differently: any
+datagram naming the query's name counts, whatever type it asks, and it reports
+the question that arrived.
 
 With `query`, only a datagram asking its question counts, and any other is
 skipped as `Canned_Mock` skips it: for a socket whose port may have been another
@@ -72,10 +75,15 @@ case's a moment ago, whose server can still be retrying to it.
 */
 @(private)
 mock_untouched :: proc(socket: net.UDP_Socket, query: []u8 = nil) -> bool {
-	_ = net.set_option(socket, .Receive_Timeout, 20 * time.Millisecond)
+	// A read the short bound did not reach would wait out `MOCK_RECV_TIMEOUT`
+	// for nothing; reported as touched, the case fails instead.
+	if net.set_option(socket, .Receive_Timeout, 20 * time.Millisecond) != nil {
+		return false
+	}
 	// Left as the harnesses set it, so a fixture socket can be read this way in
-	// the middle of a test that goes on to expect an exchange.
-	defer _ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
+	// the middle of a test that goes on to expect an exchange. Left short, the
+	// next exchange fails early rather than hangs.
+	defer _ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT) // lint:allow a restore left undone only shortens a later wait
 	buf: [4096]u8
 	for {
 		n, _, err := net.recv_udp(socket, buf[:])
@@ -158,32 +166,20 @@ test_config :: proc(servers: []config.Upstream_Spec = nil) -> config.Config {
 	return cfg
 }
 
-// A group of one UDP upstream on loopback at `port`, with `cfg`'s settings.
+// A group of one UDP upstream on loopback at `port`, with `cfg`'s settings; nil,
+// with the failure reported, when it cannot be built.
 @(private)
 mock_group :: proc(t: ^testing.T, cfg: config.Upstream_Config, port: int, loc := #caller_location) -> ^upstream.Group {
 	one := cfg
 	one.servers = loopback_upstream(port)
 	group, gerr := upstream.make_group(one, context.allocator)
-	testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr, loc = loc)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr, loc = loc) {
+		return nil
+	}
 	return group
 }
 
-/*
-A server forwarding to one mock upstream on loopback.
-
-`cfg` is `test_config` pointed at the mock and `srv` points into it, so the
-caller keeps the harness where it put it, and changes `cfg` in place - turning
-blocking on, say - between `harness_start` and the first query.
-
-The cache, when there is one, takes its TTL bounds from `cfg` rather than from
-literals, and `negative_ttl` is the reason: a cache made without one stores no denial at
-all, so a case about what is or is not remembered could not fail.
-
-`cookies` hands clients server cookies (`start_cookies`); the group never sends
-one upstream, which would add an option to every forwarded query. `validating`
-puts a validator in front of the answers that can fetch no chain (`no_chain`),
-so whatever it judges comes out unproven without reaching the network.
-*/
+// A server forwarding to one mock upstream on loopback; see `harness_start`.
 @(private)
 Harness :: struct {
 	socket:  net.UDP_Socket,
@@ -193,6 +189,15 @@ Harness :: struct {
 	srv:     Server,
 }
 
+/*
+Start `h`: `harness_bind`, then `harness_build`.
+
+`cfg` is `test_config` pointed at the mock and `srv` points into it, so the
+caller keeps the harness where it put it, and changes `cfg` in place - turning
+blocking on, say - between `harness_start` and the first query. A setting the
+group or the cache is built from is set between `harness_bind` and
+`harness_build` instead.
+*/
 @(private)
 harness_start :: proc(
 	t: ^testing.T,
@@ -202,22 +207,64 @@ harness_start :: proc(
 	validating := false,
 	loc := #caller_location,
 ) -> bool {
-	socket, spec, ok := bind_mock(t, loc = loc)
+	if !harness_bind(t, h, loc = loc) {
+		return false
+	}
+	return harness_build(t, h, caching = caching, cookies = cookies, validating = validating, loc = loc)
+}
+
+/*
+Bind `h`'s mock, waiting `wait` as `bind_mock` does, and set `h.cfg` to
+`test_config` pointed at it. Nothing else is built, so the caller can change the
+settings `harness_build` reads first. Nothing is left to clean up on false.
+*/
+@(private)
+harness_bind :: proc(t: ^testing.T, h: ^Harness, name := "mock", wait := MOCK_RECV_TIMEOUT, loc := #caller_location) -> bool {
+	socket, spec, ok := bind_mock(t, name, wait = wait, loc = loc)
 	if !ok {
 		return false
 	}
-	h.cfg = test_config(loopback_upstream(spec.port))
+	h^ = {}
+	h.socket = socket
+	h.cfg = test_config(loopback_upstream(spec.port, name))
+	return true
+}
+
+/*
+The group, the cache and the server for `h.cfg`, on a mock `harness_bind` bound.
+On false the mock is closed too, and nothing is left to clean up.
+
+The cache, when there is one, takes its TTL bounds and `serve_stale` from `cfg`
+rather than from literals, and `negative_ttl` is the reason: a cache made
+without one stores no denial at all, so a case about what is or is not
+remembered could not fail.
+
+`cookies` hands clients server cookies (`start_cookies`); the group never sends
+one upstream, which would add an option to every forwarded query. `validating`
+puts a validator in front of the answers: one that can fetch no chain
+(`no_chain`), so whatever it judges comes out unproven without reaching the
+network, or with `chain_lookups` the server's own `validator_query`, which asks
+the mock.
+*/
+@(private)
+harness_build :: proc(
+	t: ^testing.T,
+	h: ^Harness,
+	caching := false,
+	cookies := false,
+	validating := false,
+	chain_lookups := false,
+	loc := #caller_location,
+) -> bool {
 	h.cfg.cache.enabled = caching
 	h.cfg.cookies.enabled = cookies
 	h.cfg.dnssec.enabled = validating
 	group, gerr := upstream.make_group(h.cfg.upstream, context.allocator)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr, loc = loc) {
-		net.close(socket)
+		net.close(h.socket)
 		return false
 	}
-	h.socket = socket
 	h.group = group
-	h.answers = nil
 	if caching {
 		h.answers = cache.make_cache(
 			cache.Options {
@@ -225,6 +272,7 @@ harness_start :: proc(
 				max_ttl = h.cfg.cache.max_ttl,
 				min_ttl = h.cfg.cache.min_ttl,
 				negative_ttl = h.cfg.cache.negative_ttl,
+				serve_stale = h.cfg.cache.serve_stale,
 			},
 		)
 	}
@@ -233,7 +281,9 @@ harness_start :: proc(
 		group   = h.group,
 		answers = h.answers,
 	}
-	if validating {
+	if validating && chain_lookups {
+		h.srv.validator = dnssec.make_validator(validator_query, &h.srv, dnssec.Options{})
+	} else if validating {
 		h.srv.validator = dnssec.make_validator(no_chain, nil, dnssec.Options{})
 	}
 	if !testing.expect(t, start_cookies(&h.srv), "cannot set the cookie secret up", loc = loc) {
@@ -241,6 +291,74 @@ harness_start :: proc(
 		return false
 	}
 	return true
+}
+
+/*
+A server whose group is one mock upstream per name, asked in that order. The
+caller keeps the fixture where it declared it: `srv` points at `cfg`.
+`timeout` and `attempts`, when set, replace `test_config`'s before the group is
+built from them.
+*/
+@(private)
+Mocks :: struct {
+	sockets: [2]net.UDP_Socket,
+	bound:   int,
+	cfg:     config.Config,
+	group:   ^upstream.Group,
+	srv:     Server,
+}
+
+@(private)
+mocks_start :: proc(
+	t: ^testing.T,
+	f: ^Mocks,
+	names: ..string,
+	timeout: time.Duration = 0,
+	attempts := 0,
+	loc := #caller_location,
+) -> bool {
+	assert(len(names) <= len(f.sockets))
+	specs := make([]config.Upstream_Spec, len(names), context.temp_allocator)
+	for name, i in names {
+		socket, spec, ok := bind_mock(t, name, loc = loc)
+		if !ok {
+			mocks_stop(f)
+			return false
+		}
+		f.sockets[i] = socket
+		f.bound += 1
+		specs[i] = spec
+	}
+	f.cfg = test_config(specs)
+	if timeout > 0 {
+		f.cfg.upstream.timeout = timeout
+	}
+	if attempts > 0 {
+		f.cfg.upstream.attempts = attempts
+	}
+	group, gerr := upstream.make_group(f.cfg.upstream)
+	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr, loc = loc) {
+		mocks_stop(f)
+		return false
+	}
+	f.group = group
+	f.srv = Server {
+		cfg   = &f.cfg,
+		group = f.group,
+	}
+	return true
+}
+
+@(private)
+mocks_stop :: proc(f: ^Mocks) {
+	if f.group != nil {
+		upstream.destroy_group(f.group)
+		f.group = nil
+	}
+	for socket in f.sockets[:f.bound] {
+		net.close(socket)
+	}
+	f.bound = 0
 }
 
 @(private)
@@ -259,7 +377,7 @@ harness_stop :: proc(h: ^Harness) {
 
 /*
 One query through the harness's server, with a `Canned_Mock` answering it with
-`reply`; `asked` is whether the mock saw the question at all.
+`reply`; `asked` is whether the mock saw the question and its reply went out.
 */
 @(private)
 harness_ask :: proc(
@@ -276,7 +394,7 @@ harness_ask :: proc(
 		reply = reply,
 	}
 	out, outcome, served = harness_exchange(h, &x, query, client = client)
-	return out, outcome, served, x.got
+	return out, outcome, served, x.got && x.served
 }
 
 // As `harness_ask`, with the caller's own mock, for a case that reads what the
@@ -394,9 +512,12 @@ Canned_Mock :: struct {
 	socket:   net.UDP_Socket,
 	reply:    []u8,
 	got:      bool,
+	// Whether the reply went out, so a lost send is not read as a timeout.
+	served:   bool,
 	// The query as it arrived, so a case can assert on what this server
-	// actually forwarded. Read after the thread is joined.
-	seen:     [512]u8,
+	// actually forwarded. Read after the thread is joined. As long as the
+	// buffer `serve_canned` reads into, so nothing read is cut short here.
+	seen:     [4096]u8,
 	seen_len: int,
 }
 
@@ -412,12 +533,25 @@ serve_canned :: proc(x: ^Canned_Mock) {
 	}
 	x.got = true
 	x.seen_len = copy(x.seen[:], buf[:n])
+	x.served = send_reply_as(x.socket, x.reply, buf[:n], remote)
+}
+
+/*
+Send `reply` to `remote` as the answer to `query`: under the ID it was asked
+with, which the resolver draws fresh for every query it forwards, so nothing
+here can know it in advance. False when either is too short to hold an ID, the
+reply is past a datagram buffer here, or the send fails.
+*/
+@(private)
+send_reply_as :: proc(socket: net.UDP_Socket, reply, query: []u8, remote: net.Endpoint) -> bool {
 	out: [4096]u8
-	copy(out[:], x.reply)
-	// Echo the ID it was asked with. The resolver draws a fresh one for every
-	// query it forwards, so nothing here can know it in advance.
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
+	if len(reply) < 2 || len(query) < 2 || len(reply) > len(out) {
+		return false
+	}
+	copy(out[:], reply)
+	out[0], out[1] = query[0], query[1]
+	_, err := net.send_udp(socket, out[:len(reply)], remote)
+	return err == nil
 }
 
 /*
@@ -542,10 +676,19 @@ cname_record :: proc(name, target: string, ttl: u32 = 60) -> dns.Record {
 
 // An OPT record carrying one option.
 @(private)
-opt_with :: proc(code: dns.EDNS_Option_Code, data: []u8, udp_size: u16 = 1232, do_bit := false) -> dns.Record {
-	opt := dns.make_opt(udp_size, do_bit)
+opt_with :: proc(code: dns.EDNS_Option_Code, data: []u8, udp_size: u16 = 1232, do_bit := false, version: u8 = 0) -> dns.Record {
 	options := make([]dns.EDNS_Option, 1, context.temp_allocator)
 	options[0] = dns.EDNS_Option{code = u16(code), data = data}
+	return opt_record(udp_size, version, do_bit, options)
+}
+
+// An OPT record in EDNS `version` carrying `options`, with the DO bit as given.
+// The version is the TTL's second byte (RFC 6891 section 6.1.3); the extended
+// rcode above it stays zero.
+@(private)
+opt_record :: proc(udp_size: u16 = 1232, version: u8 = 0, do_bit := false, options: []dns.EDNS_Option = nil) -> dns.Record {
+	opt := dns.make_opt(udp_size, do_bit)
+	opt.ttl |= u32(version) << 16
 	opt.data = dns.Rdata_OPT{options = options}
 	return opt
 }
@@ -590,24 +733,9 @@ wait_until :: proc(predicate: proc(data: rawptr) -> bool, data: rawptr, within: 
 		if predicate(data) {
 			return true
 		}
-		time.sleep(time.Millisecond)
+		time.sleep(time.Millisecond) // lint:allow the poll interval of a deadline-bounded wait
 	}
 	return predicate(data)
-}
-
-// A window-0 type bitmap (RFC 4034 section 4.1.2) holding `types`.
-@(private)
-type_bitmap :: proc(types: ..dns.Type) -> []u8 {
-	bits := make([]u8, 32, context.temp_allocator)
-	top := 0
-	for t in types {
-		bits[int(t) / 8] |= 0x80 >> (uint(t) % 8)
-		top = max(top, int(t) / 8 + 1)
-	}
-	out := make([dynamic]u8, context.temp_allocator)
-	append(&out, 0, u8(top))
-	append(&out, ..bits[:top])
-	return out[:]
 }
 
 // An NSEC at `owner` whose next name is `next`.
@@ -620,7 +748,7 @@ nsec_at :: proc(owner, next: string, types: ..dns.Type) -> dns.Record {
 	}
 	rdata := make([dynamic]u8, context.temp_allocator)
 	append(&rdata, ..name[:n])
-	append(&rdata, ..type_bitmap(..types))
+	append(&rdata, ..testkit.type_bitmap(..types))
 	return dns.Record{name = owner, type = .NSEC, class = .IN, ttl = 300, data = dns.Rdata_Raw{data = rdata[:]}}
 }
 
@@ -672,6 +800,29 @@ test_filters :: proc(
 }
 
 /*
+The lists a case runs under: `block` and `allow` as domains, and `rules` as
+blocklist lines, each of which has to parse or the case would pass on an empty
+list.
+*/
+@(private)
+make_engine :: proc(t: ^testing.T, block, allow: []string, rules: []string = nil) -> ^filter.Engine {
+	engine := filter.engine_make()
+	block_set := filter.set_make()
+	allow_set := filter.set_make()
+	for d in block {
+		filter.set_add(block_set, d, {.Apex, .Subdomains})
+	}
+	for d in allow {
+		filter.set_add(allow_set, d, {.Apex, .Subdomains})
+	}
+	for r in rules {
+		testing.expectf(t, filter.parse_rule(block_set, allow_set, r) > 0, "rule %q did not parse", r)
+	}
+	filter.engine_swap(engine, block_set, allow_set)
+	return engine
+}
+
+/*
 A `Server` with counters and nothing else behind them, configured from `cfg`.
 
 `render_metrics` reaches for the cache, the filter engine and the upstream
@@ -685,7 +836,7 @@ metrics_fixture :: proc(cfg: ^config.Config, stats: Stats) -> Server {
 	cfg^ = config.default_config()
 	cfg.server.max_connections = 512
 	cfg.metrics.enabled = true
-	return Server{cfg = cfg, stats = stats, started = time.now()}
+	return Server{cfg = cfg, stats = stats, started = time.now()} // lint:allow wall-clock: `started` is an epoch instant
 }
 
 /*
@@ -749,7 +900,9 @@ loopback_tcp_pair :: proc(
 // with nothing new; `err` is what ended the read, nil for a clean close.
 @(private)
 read_until_close :: proc(client: net.TCP_Socket, timeout: time.Duration) -> (got: string, err: net.Network_Error) {
-	_ = net.set_option(client, .Receive_Timeout, timeout)
+	if err = net.set_option(client, .Receive_Timeout, timeout); err != nil {
+		return
+	}
 	b := strings.builder_make(context.temp_allocator)
 	for {
 		chunk: [4096]u8
@@ -786,18 +939,6 @@ unread_bytes :: proc(fd: linux.Fd) -> int {
 	FIONREAD :: 0x541B
 	n: i32
 	if i32(linux.ioctl(fd, FIONREAD, uintptr(&n))) < 0 {
-		return -1
-	}
-	return int(n)
-}
-
-// Bytes `fd` sent that its peer has not acknowledged: `SIOCOUTQ`. -1 when the
-// kernel will not say.
-@(private)
-unacked_bytes :: proc(fd: linux.Fd) -> int {
-	SIOCOUTQ :: 0x5411
-	n: i32
-	if i32(linux.ioctl(fd, SIOCOUTQ, uintptr(&n))) < 0 {
 		return -1
 	}
 	return int(n)
@@ -941,7 +1082,7 @@ stage_state :: proc(s: ^Server, msg: dns.Message, spent: ^int, allocator: mem.Al
 		q = msg.question[0],
 		proto = .UDP,
 		client = "127.0.0.1:5555",
-		limit = 512,
+		limit = dns.MAX_UDP_SIZE,
 		started = time.tick_now(),
 		spent = spent,
 		allocator = allocator,
@@ -979,11 +1120,6 @@ edns_reply :: proc(name: string, addr: [4]u8) -> []u8 {
 	}
 	return wire
 }
-
-// An OPT record's encoded length with no options: a root owner name, TYPE,
-// CLASS, TTL and RDLENGTH.
-@(private)
-OPT_RR_LEN :: 11
 
 /*
 A mock upstream that answers one question and reports whether the query carried
@@ -1037,14 +1173,7 @@ serve_option_sniffer :: proc(x: ^Option_Mock) {
 	free_all(context.temp_allocator)
 
 	reply := x.reply_seen if x.saw && x.reply_seen != nil else x.reply
-	if len(reply) > len(buf) {
-		return
-	}
-	out: [4096]u8
-	copy(out[:], reply)
-	out[0], out[1] = buf[0], buf[1]
-	_, serr := net.send_udp(x.socket, out[:len(reply)], remote)
-	x.served = serr == nil
+	x.served = send_reply_as(x.socket, reply, buf[:n], remote)
 }
 
 /*
@@ -1087,4 +1216,132 @@ secret_keeper :: proc(key: [COOKIE_SECRET_LEN]u8) -> Cookie_Keeper {
 	k := Cookie_Keeper{secrets = new(Cookie_Secrets, context.temp_allocator)}
 	k.secrets.slots[0].key = key
 	return k
+}
+
+// RFC 9018 appendix A's server secret, as configured and as the key it decodes
+// to, and its client cookie and client.
+@(private)
+RFC9018_SECRET :: "e5e973e5a6b2a43f48e7dc849e37bfcf"
+
+@(private)
+RFC9018_SECRET_KEY :: [COOKIE_SECRET_LEN]u8{0xe5, 0xe9, 0x73, 0xe5, 0xa6, 0xb2, 0xa4, 0x3f, 0x48, 0xe7, 0xdc, 0x84, 0x9e, 0x37, 0xbf, 0xcf}
+
+@(private)
+RFC9018_CLIENT_COOKIE :: "2464c4abcf10c957"
+
+@(private)
+RFC9018_CLIENT :: "198.51.100.100:9999"
+
+// The bytes `text` spells in hex. A literal that does not decode is a broken
+// fixture, so it panics rather than hand back a short or empty key.
+@(private)
+unhex :: proc(text: string, allocator := context.temp_allocator) -> []u8 {
+	out, ok := hex.decode(transmute([]u8)text, allocator)
+	if !ok {
+		panic("a test's hex literal does not decode")
+	}
+	return out
+}
+
+// An eight-byte client cookie no server has answered yet, so its verdict is
+// `Unproven` and a server cookie is minted for it.
+@(private)
+test_client_cookie :: proc() -> []u8 {
+	cookie := make([]u8, 8, context.temp_allocator)
+	for i in 0 ..< len(cookie) {
+		cookie[i] = u8(0xa0 + i)
+	}
+	return cookie
+}
+
+/*
+Answer `query` from a cache holding `stored` for `name`, with cookies under
+the RFC 9018 secret, so the whole client-facing path runs with no upstream
+behind it. `ok` is false when the fixture could not be set up or nothing was
+served.
+*/
+@(private)
+cookie_roundtrip :: proc(
+	t: ^testing.T,
+	name: string,
+	stored, query: []u8,
+	proto: Protocol,
+	client: string,
+	enabled := true,
+	require := false,
+	loc := #caller_location,
+) -> (
+	out: []u8,
+	ok: bool,
+) {
+	cfg := test_config()
+	cfg.cache.enabled = true
+	cfg.cookies.enabled = enabled
+	cfg.cookies.require = require
+	cfg.cookies.secret = RFC9018_SECRET
+
+	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	defer cache.destroy(answers)
+
+	s := Server {
+		cfg     = &cfg,
+		answers = answers,
+	}
+	if !testing.expect(t, start_cookies(&s), "the cookie keeper would not start", loc = loc) {
+		return nil, false
+	}
+	defer release_parts(&s, {.Cookie_Secrets, .Cookies})
+
+	if !seed_cache(t, answers, name, stored, loc = loc) {
+		return nil, false
+	}
+	response, _, served := handle_query(&s, query, proto, client, context.temp_allocator)
+	return response, served
+}
+
+// The entry `answers` holds under `key`, or nil. Every shard is looked in:
+// which one a key lands in is the cache's own seeded hash.
+@(private)
+cached_entry :: proc(answers: ^cache.Cache, key: string) -> ^cache.Entry {
+	for &shard in answers.shards {
+		if e, found := shard.entries[key]; found {
+			return e
+		}
+	}
+	return nil
+}
+
+/*
+Age the entry under `key` past its TTL, stored an hour ago, which is how
+`serve_stale` finds an answer kept through an outage. False when nothing is
+stored under `key`.
+
+The cache has no public way to age an entry, so the deadline is written
+directly; storing a one-second answer and sleeping past it would spend real
+time on a clock that is not what these cases are about.
+*/
+@(private)
+expire_entry :: proc(answers: ^cache.Cache, key: string) -> bool {
+	e := cached_entry(answers, key)
+	if e == nil {
+		return false
+	}
+	e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
+	e.inserted = loop.moment_add(loop.moment_now(), -3600 * time.Second)
+	return true
+}
+
+// A rate limiter's clock `ms` milliseconds in. Not from zero: a bucket's
+// `last_ns` of zero means "never used".
+@(private)
+limiter_tick :: proc(ms: i64) -> time.Tick {
+	return time.Tick{_nsec = (3600 + ms) * i64(time.Millisecond)}
+}
+
+// Bound `socket`'s `option` wait to `d`, so a case cannot block for good on a
+// peer that never comes. False, with the failure reported, when it did not take.
+@(private)
+set_wait :: proc(t: ^testing.T, socket: net.Any_Socket, option: net.Socket_Option, d: time.Duration, loc := #caller_location) -> bool {
+	err := net.set_option(socket, option, d)
+	return testing.expectf(t, err == nil, "cannot bound the wait with %v: %v", option, err, loc = loc)
 }

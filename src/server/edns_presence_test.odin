@@ -300,7 +300,8 @@ type OPT anywhere else - or a second one, or one whose options do not parse -
 walks past `match_client_opt`: handed on, it gives a client that asked without
 EDNS an OPT record it never negotiated, and one that asked with EDNS two.
 
-The four shapes are the four `edns_opt_readable` refuses on the query side.
+The shapes are the ones `edns_opt_readable` refuses on the query side, with a
+record outside the additional section tried in the answer and in authority.
 */
 @(test)
 test_an_upstream_opt_this_server_cannot_account_for_is_refused :: proc(t: ^testing.T) {
@@ -329,19 +330,12 @@ test_an_upstream_opt_this_server_cannot_account_for_is_refused :: proc(t: ^testi
 	doubled.additional[0] = dns.make_opt(4096, false)
 	doubled.additional[1] = dns.make_opt(1232, false)
 
-	// One option, four bytes of data, last in the message - its length is then
-	// rewritten to run past the RDATA.
-	unparsed := reply
-	unparsed.additional = make([]dns.Record, 1, context.temp_allocator)
-	unparsed.additional[0] = dns.make_opt(4096, false)
-	options := make([]dns.EDNS_Option, 1, context.temp_allocator)
-	options[0] = dns.EDNS_Option {
-		code = 65001,
-		data = {1, 2, 3, 4},
-	}
-	unparsed.additional[0].data = dns.Rdata_OPT {
-		options = options,
-	}
+	owned := reply
+	owned.additional = make([]dns.Record, 1, context.temp_allocator)
+	owned.additional[0] = dns.make_opt(4096, false)
+	owned.additional[0].name = "example.com."
+
+	unparsed := with_one_option(reply)
 
 	shapes := [?]struct {
 		label:   string,
@@ -352,6 +346,7 @@ test_an_upstream_opt_this_server_cannot_account_for_is_refused :: proc(t: ^testi
 		{"opt in the answer", in_answer, false},
 		{"opt in authority", in_authority, false},
 		{"two opt records", doubled, false},
+		{"opt not owned by the root", owned, false},
 		{"unparsed options", unparsed, true},
 	}
 
@@ -363,35 +358,63 @@ test_an_upstream_opt_this_server_cannot_account_for_is_refused :: proc(t: ^testi
 		if shape.corrupt {
 			wire[len(wire) - 5] = 9
 		}
-		for edns in ([]bool{false, true}) {
-			out, outcome, served, asked := harness_ask(&h, client_query(edns), wire)
-			if !testing.expectf(t, asked && served, "%s, edns=%v: asked=%v answered=%v", shape.label, edns, asked, served) {
-				continue
-			}
-
-			m, derr := dns.decode_message(out, context.temp_allocator)
-			if !testing.expectf(t, derr == .None, "%s, edns=%v: the reply does not decode: %v", shape.label, edns, derr) {
-				continue
-			}
-			opts := 0
-			for section in ([][]dns.Record{m.answer, m.authority, m.additional}) {
-				for rec in section {
-					if rec.type == .OPT {
-						opts += 1
-					}
-				}
-			}
-			testing.expectf(t, opts == (edns ? 1 : 0), "%s, edns=%v: %d OPT records in the reply, want %d", shape.label, edns, opts, edns ? 1 : 0)
-			testing.expectf(t, dns.peek_rcode(out) == .Serv_Fail, "%s, edns=%v: answered %v, not SERVFAIL", shape.label, edns, dns.peek_rcode(out))
-			testing.expectf(t, outcome == .Failed, "%s, edns=%v: outcome %v", shape.label, edns, outcome)
-			testing.expectf(t, len(m.answer) == 0, "%s, edns=%v: the refused answer was handed on", shape.label, edns)
-			// RFC 8914 extended error 0 says why, to a client with somewhere to put it.
-			ede, has_ede := dns.peek_edns_option(out, .Ext_Error)
-			testing.expectf(t, has_ede == edns, "%s, edns=%v: extended error present=%v", shape.label, edns, has_ede)
-			if has_ede {
-				testing.expectf(t, len(ede) >= 2 && ede[0] == 0 && ede[1] == 0, "%s: extended error %v, not 0", shape.label, ede)
-			}
-		}
+		expect_opt_refused(t, &h, shape.label, wire)
 	}
 	free_all(context.temp_allocator)
+}
+
+// `reply` with one option, four bytes of data, last in the message - its length
+// is then rewritten to run past the RDATA.
+@(private = "file")
+with_one_option :: proc(reply: dns.Message) -> dns.Message {
+	unparsed := reply
+	unparsed.additional = make([]dns.Record, 1, context.temp_allocator)
+	unparsed.additional[0] = dns.make_opt(4096, false)
+	options := make([]dns.EDNS_Option, 1, context.temp_allocator)
+	options[0] = dns.EDNS_Option {
+		code = 65001,
+		data = {1, 2, 3, 4},
+	}
+	unparsed.additional[0].data = dns.Rdata_OPT {
+		options = options,
+	}
+	return unparsed
+}
+
+/*
+Hand `wire` to a client asking without EDNS and to one asking with it, and
+expect SERVFAIL each time: no answer handed on, the client's own OPT record
+only, and extended error 0 where it has somewhere to go.
+*/
+@(private = "file")
+expect_opt_refused :: proc(t: ^testing.T, h: ^Harness, label: string, wire: []u8) {
+	for edns in ([]bool{false, true}) {
+		out, outcome, served, asked := harness_ask(h, client_query(edns), wire)
+		if !testing.expectf(t, asked && served, "%s, edns=%v: asked=%v answered=%v", label, edns, asked, served) {
+			continue
+		}
+
+		m, derr := dns.decode_message(out, context.temp_allocator)
+		if !testing.expectf(t, derr == .None, "%s, edns=%v: the reply does not decode: %v", label, edns, derr) {
+			continue
+		}
+		opts := 0
+		for section in ([][]dns.Record{m.answer, m.authority, m.additional}) {
+			for rec in section {
+				if rec.type == .OPT {
+					opts += 1
+				}
+			}
+		}
+		testing.expectf(t, opts == (edns ? 1 : 0), "%s, edns=%v: %d OPT records in the reply, want %d", label, edns, opts, edns ? 1 : 0)
+		testing.expectf(t, dns.peek_rcode(out) == .Serv_Fail, "%s, edns=%v: answered %v, not SERVFAIL", label, edns, dns.peek_rcode(out))
+		testing.expectf(t, outcome == .Failed, "%s, edns=%v: outcome %v", label, edns, outcome)
+		testing.expectf(t, len(m.answer) == 0, "%s, edns=%v: the refused answer was handed on", label, edns)
+		// RFC 8914 extended error 0 says why, to a client with somewhere to put it.
+		ede, has_ede := dns.peek_edns_option(out, .Ext_Error)
+		testing.expectf(t, has_ede == edns, "%s, edns=%v: extended error present=%v", label, edns, has_ede)
+		if has_ede {
+			testing.expectf(t, len(ede) >= 2 && ede[0] == 0 && ede[1] == 0, "%s: extended error %v, not 0", label, ede)
+		}
+	}
 }
