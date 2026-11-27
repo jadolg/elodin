@@ -48,8 +48,10 @@ unacked_bytes :: proc(fd: linux.Fd) -> int {
 
 /*
 An allocator that refuses `fail_for` requests from its `fail_at`th on, counting
-every allocation and resize in `seen`, and hands every other to `backing`: the
-temp arena when that is left zero.
+every allocation and resize in `seen`, and hands every other to `backing`. Left
+zero, `backing` is the temp allocator in force when `fail_nth` makes the
+allocator, so installing it as `context.temp_allocator` does not hand requests
+back to itself.
 
 An arena that runs dry refuses everything after the first refusal too, so a
 check missing at one allocation is covered by whichever check comes next. This
@@ -64,6 +66,9 @@ Fail_Nth :: struct {
 
 // `f` as an allocator.
 fail_nth :: proc(f: ^Fail_Nth) -> mem.Allocator {
+	if f.backing.procedure == nil {
+		f.backing = context.temp_allocator
+	}
 	return {procedure = fail_nth_proc, data = f}
 }
 
@@ -87,6 +92,7 @@ fail_nth_proc :: proc(
 		}
 	}
 	backing := f.backing if f.backing.procedure != nil else context.temp_allocator
+	assert(backing.data != data, "a Fail_Nth is its own backing; build it with `fail_nth` or give it one")
 	return backing.procedure(backing.data, mode, size, alignment, old_memory, old_size, loc)
 }
 

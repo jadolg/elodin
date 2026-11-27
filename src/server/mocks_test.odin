@@ -532,9 +532,9 @@ Canned_Mock :: struct {
 	// `reply`'s own: for a route or a rewrite whose upstream is asked another
 	// name than the client's.
 	want:     string,
-	// How long to wait, or what to wait for (bounded by `MOCK_RECV_TIMEOUT`),
-	// between the question and the answer, so the client's own deadline or a
-	// case's ordering is what decides the race.
+	// How long to wait, or what to wait for (bounded by `MOCK_RECV_TIMEOUT`, and
+	// answered when that runs out too), between the question and the answer, so
+	// the client's own deadline or a case's ordering is what decides the race.
 	delay:    time.Duration,
 	hold:     ^sync.Sema,
 }
@@ -561,8 +561,10 @@ serve_canned :: proc(x: ^Canned_Mock) {
 	if x.delay > 0 {
 		time.sleep(x.delay) // lint:allow the delay is what the case times its deadline against
 	}
-	if x.hold != nil && !sync.sema_wait_with_timeout(x.hold, MOCK_RECV_TIMEOUT) {
-		return
+	if x.hold != nil {
+		// Answered either way, so a case whose release came late still sees the
+		// answer arrive late rather than never.
+		_ = sync.sema_wait_with_timeout(x.hold, MOCK_RECV_TIMEOUT) // lint:allow late is still answered
 	}
 	x.served = send_reply_as(x.socket, x.reply, buf[:n], remote)
 }
