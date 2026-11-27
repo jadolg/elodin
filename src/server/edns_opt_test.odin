@@ -28,11 +28,7 @@ SERVED :: [4]u8{192, 0, 2, 7}
 // An OPT record carrying one eight-byte client cookie.
 @(private = "file")
 cookie_opt :: proc() -> dns.Record {
-	payload := make([]u8, 8, context.temp_allocator)
-	for i in 0 ..< len(payload) {
-		payload[i] = u8(0xa0 + i)
-	}
-	return opt_with(.Cookie, payload)
+	return opt_with(.Cookie, test_client_cookie())
 }
 
 // A query for `name` with two OPT records, the client's cookie in the second.
@@ -178,7 +174,7 @@ test_a_second_opt_record_is_refused_whatever_the_cache_holds :: proc(t: ^testing
 
 	// A plain query for the name first, so there is an entry to be tempted by.
 	warm := cookie_mock("warm.example.")
-	_, first, _ := harness_sniff(&h, &warm, query_with_records("warm.example.", dns.make_opt(1232, false)))
+	_, first, _ := harness_sniff(&h, &warm, query_with_records("warm.example.", dns.make_opt(1232, false))) // lint:allow `served` and the outcome are asserted below
 	if !testing.expect(t, warm.served, "the mock upstream never answered the first query") {
 		return
 	}

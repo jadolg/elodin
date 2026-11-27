@@ -66,6 +66,8 @@ src/itest/     integration suite: harness, mock upstreams (DNS, HTTP, DoH/h2), c
                and the upstream-parity check with its own independent wire walker
 src/fuzz/      libFuzzer targets for the DNS, DNSSEC, HPACK, h2, HTTP/1.1, DoH, blocklist,
                regex, url, Retry-After and YAML parsers, and their shared harness
+src/testkit/   fixtures the unit tests of more than one package share; only test files
+               import it, and the lint holds it to the test rules
 testdata/      fuzz corpus and dictionary, committed so a found crash stays
                found, the parity seeds that have found a divergence, plus
                gen/ - the generator behind the DNSSEC fixtures
@@ -111,7 +113,8 @@ calls, which belongs in a test file - the itest and fuzz packages count as
 callers); others only for
 lines a branch adds, diffed against `LINT_BASE` (default: the merge base with
 `origin/main`): a discarded error or `ok` in a test, `time.sleep` and `time.now`
-in tests, and comments narrating history. A deliberate exception carries
+in tests, `strconv`'s integer parsers in tests and the itest, and comments
+narrating history. A deliberate exception carries
 `lint:allow <reason>` on its line. `scripts/lint_test.py` holds each rule to what
 it refuses and allows, and `.claude/hooks/guard_test.py` does the same for the
 Claude Code hook; `check` runs both.

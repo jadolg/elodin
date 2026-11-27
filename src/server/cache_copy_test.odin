@@ -2,12 +2,10 @@ package server
 
 import "core:mem"
 import "core:testing"
-import "core:time"
 import "elodin:cache"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:filter"
-import "elodin:loop"
 
 /*
 The answer path copies an entry only where it serves it (issue #532).
@@ -64,9 +62,8 @@ test_a_stale_lend_reads_the_rules_in_force :: proc(t: ^testing.T) {
 	group := down_upstream()
 	s := stale_server(&cfg, answers, &group)
 	cfg.blocking.enabled = true
-	engine := filter.engine_make()
+	engine := make_engine(t, nil, nil)
 	defer filter.engine_destroy(engine)
-	filter.engine_swap(engine, filter.set_make(), filter.set_make())
 	s.filters = engine
 
 	wire := test_reply(
@@ -81,10 +78,7 @@ test_a_stale_lend_reads_the_rules_in_force :: proc(t: ^testing.T) {
 	}
 	kb: [cache.KEY_MAX]u8
 	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
-	if e, found := answers.shards[0].entries[key]; found {
-		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
-	} else {
-		testing.expect(t, false, "the answer went in under another key")
+	if !testing.expect(t, expire_entry(answers, key), "the answer is not stored under its question's key") {
 		return
 	}
 
@@ -111,9 +105,8 @@ test_a_standing_refusal_copies_nothing :: proc(t: ^testing.T) {
 	cfg.blocking.enabled = true
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
 	defer cache.destroy(answers)
-	engine := filter.engine_make()
+	engine := make_engine(t, nil, nil)
 	defer filter.engine_destroy(engine)
-	filter.engine_swap(engine, filter.set_make(), filter.set_make())
 	s := Server{cfg = &cfg, answers = answers, filters = engine}
 
 	if !testing.expect(t, cache_an_answer(answers, expired = false), "the answer was not cached") {
@@ -122,7 +115,10 @@ test_a_standing_refusal_copies_nothing :: proc(t: ^testing.T) {
 	kb: [cache.KEY_MAX]u8
 	key := cache.make_key(kb[:], STALE_NAME, .A, .IN, false, false)
 	generation := rules_generation(&s)
-	_, first, _ := cache.get(answers, key, context.temp_allocator)
+	_, first, cached := cache.get(answers, key, context.temp_allocator)
+	if !testing.expect(t, cached, "the answer is not stored under its question's key") {
+		return
+	}
 	cache.note_checked(answers, key, first.serial, generation, u8(Cloak_Verdict.Listed))
 
 	held, found := stored_answer(&s, key, generation, mem.panic_allocator())
@@ -137,17 +133,7 @@ test_a_standing_refusal_copies_nothing :: proc(t: ^testing.T) {
 		return
 	}
 	spent: int
-	st := Query_State {
-		s         = &s,
-		query     = query,
-		msg       = msg,
-		q         = msg.question[0],
-		proto     = .UDP,
-		client    = "127.0.0.1:5555",
-		limit     = dns.MAX_UDP_SIZE,
-		spent     = &spent,
-		allocator = context.temp_allocator,
-	}
+	st := stage_state(&s, msg, &spent, context.temp_allocator)
 	_, outcome, ok := serve_from_cache(&st, held)
 	testing.expect(t, ok, "nothing came back at all")
 	testing.expect_value(t, outcome, Outcome.Blocked)

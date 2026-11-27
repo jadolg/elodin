@@ -52,6 +52,8 @@ Mock :: struct {
 	others:     bool,
 	queries:    int,
 	lookups:    int,
+	// Replies that did not go out, which would leave a client waiting for one.
+	unsent:     int,
 	// Set once every client has been joined: the loop drains what is left in
 	// the socket and returns at its next quiet poll.
 	stop:       bool,
@@ -137,7 +139,9 @@ serve_mock :: proc(m: ^Mock) {
 				m.lookups += 1
 				buf[2] |= 0x80 // QR
 				buf[3] |= 0x80 // RA
-				_, _ = net.send_udp(m.socket, buf[:n], remote)
+				if _, serr := net.send_udp(m.socket, buf[:n], remote); serr != nil {
+					m.unsent += 1
+				}
 			}
 			continue
 		}
@@ -145,7 +149,7 @@ serve_mock :: proc(m: ^Mock) {
 		if m.queries == 1 {
 			// Bounded under the upstream timeout, so that without coalescing
 			// every client is still answered and it is the count that fails.
-			_ = wait_until(proc(data: rawptr) -> bool {
+			_ = wait_until(proc(data: rawptr) -> bool { // lint:allow the count judges the hold
 					m := (^Mock)(data)
 					return waiting_on(m.srv) >= m.hold_for
 				}, m, HOLD_LIMIT)
@@ -154,7 +158,9 @@ serve_mock :: proc(m: ^Mock) {
 			continue
 		}
 		reply := coalesce_reply(buf[0], buf[1], m.ttl, m.first if m.queries == 1 else .No_Error, m.cloak)
-		_, _ = net.send_udp(m.socket, reply, remote)
+		if _, serr := net.send_udp(m.socket, reply, remote); serr != nil {
+			m.unsent += 1
+		}
 	}
 }
 
@@ -219,192 +225,248 @@ ask :: proc(c: ^Client) {
 	c.ok = true
 }
 
-/*
-Everything a case needs: a mock on a loopback socket, a server pointed at it,
-and `CLIENTS` threads asking the same question at once. Returns how many queries
-the mock saw.
-*/
+// What `run_burst` sets up; the zero value of each field is the usual burst.
 @(private = "file")
-run_burst :: proc(
-	t: ^testing.T,
-	clients: ^[CLIENTS]Client,
-	ttl: u32 = 300,
-	silent := false,
-	timeout := 4 * time.Second,
-	first := dns.Rcode.No_Error,
-	drop_first := false,
-	attempts := 1,
-	edns := true,
-	// Client 0 asks as `edns` says and leads; the rest ask the other way and
+Burst :: struct {
+	// The answer's TTL; nil is 300.
+	ttl:            Maybe(u32),
+	silent:         bool,
+	// The upstream timeout; zero is four seconds.
+	timeout:        time.Duration,
+	first:          dns.Rcode,
+	drop_first:     bool,
+	// The upstream attempts; zero is one.
+	attempts:       int,
+	// Ask without an OPT record.
+	plain:          bool,
+	// Client 0 asks as `plain` says and leads; the rest ask the other way and
 	// follow it.
-	mixed := false,
+	mixed:          bool,
 	/*
 	Lead the burst by hand with a message no client sends, which a reload that
 	changed the DNSSEC settings between a leader and its followers is the one way
 	to reach, and land it with `first` for an answer - or with nothing, `silent`.
 	*/
-	other_message := false,
-	cache_on := true,
+	other_message:  bool,
+	no_cache:       bool,
 	// A real validator, which the mock's empty key sets turn into a Bogus
 	// verdict for the unsigned answer.
-	validating := false,
+	validating:     bool,
 	// Blocking on, with `TRACKER` listed and the answer a CNAME into it.
-	cloak := false,
-	// How many of the validator's own lookups reached the mock.
-	lookups: ^int = nil,
-	// How many followers the mock holds the first query for, and how many
-	// clients ask at all.
-	hold_for := CLIENTS - 1,
-	clients_asking := CLIENTS,
-	// The cache's counters once the burst is over.
-	cache_stats: ^cache.Stats = nil,
-	// The server's counters once the burst is over.
-	stats: ^Stats = nil,
+	cloak:          bool,
+	// How many followers the mock holds the first query for; nil is every
+	// client but the first.
+	hold_for:       Maybe(int),
+	// How many clients ask at all; zero is `CLIENTS`.
+	clients_asking: int,
 	// Lead the burst by hand and land it with this verdict stored, which the
 	// cache does not hold: evicted between the leader's store and its
 	// followers' reads.
-	evicted: Stored_Verdict = .None,
+	evicted:        Stored_Verdict,
 	// And lead the exchange its followers go round for by hand too, landing it
 	// the same way.
-	evicted_twice := false,
+	evicted_twice:  bool,
 	// How long the hand-made leader holds its followers before it lands.
-	land_after: time.Duration = 0,
-) -> int {
+	land_after:     time.Duration,
+}
+
+// What a burst came to, read once it is over.
+@(private = "file")
+Burst_Result :: struct {
+	// How many of the client's questions reached the mock.
+	queries:     int,
+	// How many of the validator's own lookups reached the mock.
+	lookups:     int,
+	stats:       Stats,
+	cache_stats: cache.Stats,
+}
+
+// The mock, the server pointed at it, and what the server owns. The caller keeps
+// it where it declared it: `srv` points at `cfg`.
+@(private = "file")
+Burst_Fixture :: struct {
+	socket:  net.UDP_Socket,
+	cfg:     config.Config,
+	group:   ^upstream.Group,
+	answers: ^cache.Cache,
+	engine:  ^filter.Engine,
+	srv:     Server,
+}
+
+// Bind the mock and build the server `b` describes. On false nothing is left to
+// clean up; otherwise `burst_stop` tears it down.
+@(private = "file")
+burst_start :: proc(t: ^testing.T, f: ^Burst_Fixture, b: Burst) -> bool {
 	// Short, because it is how the mock's loop gets to look at `stop`.
 	socket, spec, bound := bind_mock(t, wait = 100 * time.Millisecond)
 	if !bound {
-		return -1
+		return false
 	}
-	defer net.close(socket)
-
-	cfg := test_config(loopback_upstream(spec.port))
-	cfg.blocking.enabled = cloak
-	cfg.cache.enabled = cache_on
-	cfg.dnssec.enabled = validating
-	cfg.upstream.attempts = attempts
-	cfg.upstream.timeout = timeout
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator)
+	f.socket = socket
+	f.cfg = test_config(loopback_upstream(spec.port))
+	f.cfg.blocking.enabled = b.cloak
+	f.cfg.cache.enabled = !b.no_cache
+	f.cfg.dnssec.enabled = b.validating
+	f.cfg.upstream.attempts = b.attempts if b.attempts > 0 else 1
+	f.cfg.upstream.timeout = b.timeout if b.timeout > 0 else 4 * time.Second
+	group, gerr := upstream.make_group(f.cfg.upstream, context.allocator)
 	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
-		return -1
+		net.close(socket)
+		return false
 	}
-	defer upstream.destroy_group(group)
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	defer cache.destroy(answers)
-	srv := Server {
-		cfg     = &cfg,
-		group   = group,
-		answers = answers,
+	f.group = group
+	f.answers = cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
+	f.srv = Server {
+		cfg     = &f.cfg,
+		group   = f.group,
+		answers = f.answers,
 	}
-	if validating {
-		srv.validator = dnssec.make_validator(validator_query, &srv, dnssec.Options{})
+	if b.validating {
+		f.srv.validator = dnssec.make_validator(validator_query, &f.srv, dnssec.Options{})
 	}
-	defer if srv.validator != nil {
-		dnssec.destroy_validator(srv.validator)
+	if b.cloak {
+		f.engine = make_engine(t, {"tracker.evil.test"}, nil)
+		f.srv.filters = f.engine
 	}
-	engine: ^filter.Engine
-	if cloak {
-		engine = filter.engine_make()
-		block := filter.set_make()
-		filter.set_add(block, "tracker.evil.test", {.Apex, .Subdomains})
-		filter.engine_swap(engine, block, filter.set_make())
-		srv.filters = engine
-	}
-	defer if engine != nil {
-		filter.engine_destroy(engine)
-	}
+	return true
+}
 
-	m := Mock {
-		socket     = socket,
-		ttl        = ttl,
-		hold_for   = hold_for,
-		srv        = &srv,
-		silent     = silent,
-		first      = first,
-		drop_first = drop_first,
-		cloak      = cloak,
-		others     = validating,
+@(private = "file")
+burst_stop :: proc(f: ^Burst_Fixture) {
+	if f.engine != nil {
+		filter.engine_destroy(f.engine)
 	}
-	mock := thread.create_and_start_with_poly_data(&m, serve_mock)
-	key_buf: [cache.KEY_MAX]u8
-	leaders: [2]Flight
-	leading := false
-	if evicted != .None || other_message {
-		key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
-		joined, _ := flight_join(&srv, key, &leaders[0])
-		leading = testing.expect(t, joined == &leaders[0], "the hand-made leader did not get the flight")
+	if f.srv.validator != nil {
+		dnssec.destroy_validator(f.srv.validator)
 	}
-	if other_message {
-		leaders[0].forwarded = []u8{0, 0, 0xff}
-		if silent {
-			leaders[0].failed = true
+	cache.destroy(f.answers)
+	upstream.destroy_group(f.group)
+	net.close(f.socket)
+}
+
+// Put the hand-made leader of `b` in the table, ready to land, under a key made
+// in `key_buf`, which outlives the flight; false when `b` leads nothing by hand
+// or the leader did not get the flight.
+@(private = "file")
+lead_by_hand :: proc(t: ^testing.T, srv: ^Server, b: Burst, ttl: u32, leader: ^Flight, key_buf: []u8) -> bool {
+	if b.evicted == .None && !b.other_message {
+		return false
+	}
+	key := cache.make_key(key_buf, QNAME, .A, .IN, false, false)
+	joined, _ := flight_join(srv, key, leader) // lint:allow an uncounted join counts nothing
+	leading := testing.expect(t, joined == leader, "the hand-made leader did not get the flight")
+	if b.other_message {
+		leader.forwarded = []u8{0, 0, 0xff}
+		if b.silent {
+			leader.failed = true
 		} else {
-			leaders[0].answer = coalesce_reply(0, 0, ttl, first)
+			leader.answer = coalesce_reply(0, 0, ttl, b.first)
 		}
 	}
-	threads: [CLIENTS]^thread.Thread
-	for i in 0 ..< clients_asking {
+	return leading
+}
+
+// Start `asking` clients on threads of their own, the first registered as the
+// leader before the rest ask when `b.mixed`.
+@(private = "file")
+start_clients :: proc(t: ^testing.T, srv: ^Server, b: Burst, clients: ^[CLIENTS]Client, threads: ^[CLIENTS]^thread.Thread, asking: int) {
+	for i in 0 ..< asking {
 		clients[i] = Client {
-			srv  = &srv,
+			srv  = srv,
 			id   = u16(0x1000 + i),
-			edns = edns if !mixed || i == 0 else !edns,
+			edns = !b.plain if !b.mixed || i == 0 else b.plain,
 		}
 		threads[i] = thread.create_and_start_with_poly_data(&clients[i], ask)
 		// Let the leader register before anybody else asks.
-		if mixed && i == 0 {
-			_ = wait_until(proc(data: rawptr) -> bool {
+		if b.mixed && i == 0 {
+			registered := wait_until(proc(data: rawptr) -> bool {
 					return flight_open((^Server)(data))
-				}, &srv, HOLD_LIMIT)
+				}, srv, HOLD_LIMIT)
+			testing.expect(t, registered, "the leader never registered its flight")
 		}
 	}
-	for round in 0 ..< (2 if evicted_twice else 1) {
-		if !leading {
-			break
-		}
+}
+
+// Land the hand-made leaders once every client is waiting on them: once, or
+// twice with `b.evicted_twice`, the first then leading its followers into the
+// second.
+@(private = "file")
+land_by_hand :: proc(t: ^testing.T, srv: ^Server, b: Burst, leaders: ^[2]Flight, asking: int) {
+	for round in 0 ..< (2 if b.evicted_twice else 1) {
 		Waiting :: struct {
 			srv:   ^Server,
 			count: int,
 		}
-		w := Waiting{&srv, clients_asking}
-		_ = wait_until(proc(data: rawptr) -> bool {
+		w := Waiting{srv, asking}
+		_ = wait_until(proc(data: rawptr) -> bool { // lint:allow asserted by the expect_value below
 				w := (^Waiting)(data)
 				return waiting_on(w.srv) >= w.count
 			}, &w, HOLD_LIMIT)
-		testing.expect_value(t, waiting_on(&srv), clients_asking)
-		time.sleep(land_after)
-		leaders[round].stored = evicted
-		if evicted_twice && round == 0 {
-			land_into(&srv, &leaders[0], &leaders[1])
+		testing.expect_value(t, waiting_on(srv), asking)
+		time.sleep(b.land_after) // lint:allow the landing is timed against real deadlines
+		leaders[round].stored = b.evicted
+		if b.evicted_twice && round == 0 {
+			land_into(srv, &leaders[0], &leaders[1])
 		} else {
-			flight_land(&srv, &leaders[round])
+			flight_land(srv, &leaders[round])
 		}
 	}
-	for th in threads[:clients_asking] {
+}
+
+/*
+Everything a case needs: a mock on a loopback socket, a server pointed at it,
+and `CLIENTS` threads asking the same question at once, as `b` describes. `queries`
+is -1 when the fixture could not be set up.
+*/
+@(private = "file")
+run_burst :: proc(t: ^testing.T, clients: ^[CLIENTS]Client, b: Burst = {}) -> (r: Burst_Result) {
+	f: Burst_Fixture
+	if !burst_start(t, &f, b) {
+		return {queries = -1}
+	}
+	defer burst_stop(&f)
+	ttl := b.ttl.? or_else 300
+	asking := b.clients_asking if b.clients_asking > 0 else CLIENTS
+
+	m := Mock {
+		socket     = f.socket,
+		ttl        = ttl,
+		hold_for   = b.hold_for.? or_else CLIENTS - 1,
+		srv        = &f.srv,
+		silent     = b.silent,
+		first      = b.first,
+		drop_first = b.drop_first,
+		cloak      = b.cloak,
+		others     = b.validating,
+	}
+	mock := thread.create_and_start_with_poly_data(&m, serve_mock)
+	key_buf: [cache.KEY_MAX]u8
+	leaders: [2]Flight
+	leading := lead_by_hand(t, &f.srv, b, ttl, &leaders[0], key_buf[:])
+	threads: [CLIENTS]^thread.Thread
+	start_clients(t, &f.srv, b, clients, &threads, asking)
+	if leading {
+		land_by_hand(t, &f.srv, b, &leaders, asking)
+	}
+	for th in threads[:asking] {
 		thread.join(th)
 		thread.destroy(th)
 	}
 	sync.atomic_store(&m.stop, true)
 	thread.join(mock)
 	thread.destroy(mock)
+	testing.expect_value(t, m.unsent, 0)
 	// Every place taken among the queries waiting on an upstream - leaders,
 	// followers, the validator's walks - is given back (issue #623).
-	testing.expect_value(t, srv.upstream_waits, 0)
-	if stats != nil {
-		stats^ = srv.stats
-	}
-	if lookups != nil {
-		lookups^ = m.lookups
-	}
-	if cache_stats != nil {
-		cache_stats^ = cache.stats(answers)
-	}
-	return m.queries
+	testing.expect_value(t, f.srv.upstream_waits, 0)
+	return {queries = m.queries, lookups = m.lookups, stats = f.srv.stats, cache_stats = cache.stats(f.answers)}
 }
 
 @(test)
 test_identical_inflight_queries_are_one_upstream_exchange :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	st: Stats
-	queries := run_burst(t, &clients, stats = &st)
+	r := run_burst(t, &clients)
+	queries, st := r.queries, r.stats
 	testing.expectf(t, queries == 1, "the upstream saw %d queries for %d identical clients, want 1", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .No_Error, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
@@ -423,7 +485,7 @@ it.
 @(test)
 test_an_uncacheable_answer_is_shared_with_the_queries_waiting_on_it :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, ttl = 0)
+	queries := run_burst(t, &clients, {ttl = u32(0)}).queries
 	testing.expectf(t, queries == 1, "the upstream saw %d queries for %d identical clients, want 1", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.addr == {192, 0, 2, 7}, "client %d: ok=%v answer %v", i, c.ok, c.addr)
@@ -439,7 +501,7 @@ keeping its client waiting twice as long as the leader did.
 @(test)
 test_followers_of_a_failed_exchange_do_not_ask_again :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, silent = true, timeout = 3 * time.Second)
+	queries := run_burst(t, &clients, {silent = true, timeout = 3 * time.Second}).queries
 	testing.expectf(t, queries == 1, "the upstream saw %d queries for %d identical clients, want 1", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .Serv_Fail, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
@@ -454,7 +516,7 @@ waiting client's SERVFAIL.
 @(test)
 test_a_lost_datagram_is_retried_for_the_followers_too :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, drop_first = true, timeout = 1 * time.Second, attempts = 2)
+	queries := run_burst(t, &clients, {drop_first = true, timeout = 1 * time.Second, attempts = 2}).queries
 	testing.expectf(t, queries == 2, "the upstream saw %d queries for %d identical clients, want 2", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.addr == {192, 0, 2, 7}, "client %d: ok=%v rcode=%v answer %v", i, c.ok, c.rcode, c.addr)
@@ -469,7 +531,7 @@ the leader's failure rather than each wait out the same nothing again.
 @(test)
 test_followers_that_asked_another_way_share_the_leaders_failure :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, silent = true, timeout = 1 * time.Second, mixed = true)
+	queries := run_burst(t, &clients, {silent = true, timeout = 1 * time.Second, mixed = true}).queries
 	testing.expectf(t, queries == 1, "the upstream saw %d queries for %d clients, want 1", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .Serv_Fail, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
@@ -484,7 +546,7 @@ failure.
 @(test)
 test_followers_of_another_message_ask_for_themselves :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, other_message = true, silent = true, timeout = 1 * time.Second, hold_for = 0)
+	queries := run_burst(t, &clients, {other_message = true, silent = true, timeout = 1 * time.Second, hold_for = 0}).queries
 	testing.expectf(t, queries == CLIENTS, "the upstream saw %d queries for %d clients, want %d", queries, CLIENTS, CLIENTS)
 }
 
@@ -500,7 +562,7 @@ timeouts and then two more of its own.
 test_a_follower_forwards_on_what_its_wait_left_of_the_deadline :: proc(t: ^testing.T) {
 	TIMEOUT :: 400 * time.Millisecond
 	clients: [CLIENTS]Client
-	run_burst(t, &clients, silent = true, timeout = TIMEOUT, attempts = 2, other_message = true, hold_for = 0, land_after = 2 * TIMEOUT)
+	run_burst(t, &clients, {silent = true, timeout = TIMEOUT, attempts = 2, other_message = true, hold_for = 0, land_after = 2 * TIMEOUT})
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .Serv_Fail, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
 		// The leader's two timeouts and the one that crosses the line, with
@@ -531,12 +593,12 @@ test_a_refusal_is_shared_only_between_identical_messages :: proc(t: ^testing.T) 
 
 	for rcode in ([]dns.Rcode{.Form_Err, .Refused}) {
 		mixed: [CLIENTS]Client
-		queries := run_burst(t, &mixed, first = rcode, edns = false, mixed = true)
-		refused, _ := count(mixed, rcode)
+		queries := run_burst(t, &mixed, {first = rcode, plain = true, mixed = true}).queries
+		refused, _ := count(mixed, rcode) // lint:allow only the refusals are counted here
 		testing.expectf(t, queries == 1 && refused == CLIENTS, "%v asked both ways: %d queries and %d refusals, want 1 and %d", rcode, queries, refused, CLIENTS)
 
 		other: [CLIENTS]Client
-		queries = run_burst(t, &other, first = rcode, other_message = true, hold_for = 0)
+		queries = run_burst(t, &other, {first = rcode, other_message = true, hold_for = 0}).queries
 		// The mock answers the first query to reach it with `rcode` too: one
 		// follower's own, not the leader's handed on.
 		answered: int
@@ -759,10 +821,10 @@ its answer - which clients asking with and without EDNS both are.
 @(test)
 test_with_the_cache_off_only_identical_messages_share_an_answer :: proc(t: ^testing.T) {
 	alike: [CLIENTS]Client
-	queries := run_burst(t, &alike, cache_on = false, mixed = true)
+	queries := run_burst(t, &alike, {no_cache = true, mixed = true}).queries
 	testing.expectf(t, queries == 1, "identical: the upstream saw %d queries, want 1", queries)
 	apart: [CLIENTS]Client
-	queries = run_burst(t, &apart, cache_on = false, other_message = true, hold_for = 0)
+	queries = run_burst(t, &apart, {no_cache = true, other_message = true, hold_for = 0}).queries
 	testing.expectf(t, queries == CLIENTS, "different: the upstream saw %d queries, want %d", queries, CLIENTS)
 	for c, i in apart {
 		testing.expectf(t, c.ok && c.addr == {192, 0, 2, 7}, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
@@ -778,16 +840,13 @@ walks the chain again.
 test_followers_of_a_bogus_leader_are_refused_from_its_verdict :: proc(t: ^testing.T) {
 	// What one query's walk costs, so the burst can be held to it.
 	single: [CLIENTS]Client
-	one_walk: int
-	run_burst(t, &single, validating = true, lookups = &one_walk, hold_for = 0, clients_asking = 1)
+	one_walk := run_burst(t, &single, {validating = true, hold_for = 0, clients_asking = 1}).lookups
 	testing.expectf(t, single[0].ok && single[0].rcode == .Serv_Fail, "a lone query: ok=%v rcode=%v", single[0].ok, single[0].rcode)
 	testing.expect(t, one_walk > 0, "the validator never asked for the chain, so the answer was not validated")
 
 	clients: [CLIENTS]Client
-	walked: int
-	st: Stats
-	cs: cache.Stats
-	queries := run_burst(t, &clients, validating = true, lookups = &walked, stats = &st, cache_stats = &cs)
+	r := run_burst(t, &clients, {validating = true})
+	queries, walked, st, cs := r.queries, r.lookups, r.stats, r.cache_stats
 	testing.expectf(t, queries == 1, "the upstream saw the question %d times for %d clients, want 1", queries, CLIENTS)
 	testing.expectf(t, walked == one_walk, "the chain was asked for %d times, want one walk's %d", walked, one_walk)
 	for c, i in clients {
@@ -803,9 +862,8 @@ test_followers_of_a_bogus_leader_are_refused_from_its_verdict :: proc(t: ^testin
 @(test)
 test_followers_of_a_cloaked_leader_are_blocked_from_its_verdict :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
-	st: Stats
-	cs: cache.Stats
-	queries := run_burst(t, &clients, cloak = true, stats = &st, cache_stats = &cs)
+	r := run_burst(t, &clients, {cloak = true})
+	queries, st, cs := r.queries, r.stats, r.cache_stats
 	testing.expectf(t, queries == 1, "the upstream saw the question %d times for %d clients, want 1", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.outcome == .Blocked, "client %d: ok=%v outcome=%v", i, c.ok, c.outcome)
@@ -828,7 +886,7 @@ forwarding on its own (issue #428).
 test_followers_of_an_evicted_verdict_rejoin_the_flight :: proc(t: ^testing.T) {
 	for verdict in ([]Stored_Verdict{.Bogus, .Cloak}) {
 		clients: [CLIENTS]Client
-		queries := run_burst(t, &clients, evicted = verdict)
+		queries := run_burst(t, &clients, {evicted = verdict}).queries
 		testing.expectf(t, queries == 1, "%v: the upstream saw the question %d times for %d clients, want 1", verdict, queries, CLIENTS)
 		for c, i in clients {
 			testing.expectf(t, c.ok && c.rcode == .No_Error, "%v: client %d: ok=%v rcode=%v", verdict, i, c.ok, c.rcode)
@@ -851,7 +909,7 @@ timeouts apart before the first one gives up.
 test_a_follower_going_round_leads_on_a_deadline_of_its_own :: proc(t: ^testing.T) {
 	TIMEOUT :: 250 * time.Millisecond
 	clients: [CLIENTS]Client
-	queries := run_burst(t, &clients, timeout = TIMEOUT, evicted = .Bogus, land_after = 2 * TIMEOUT + 20 * time.Millisecond)
+	queries := run_burst(t, &clients, {timeout = TIMEOUT, evicted = .Bogus, land_after = 2 * TIMEOUT + 20 * time.Millisecond}).queries
 	testing.expectf(t, queries == 1, "the upstream saw the question %d times for %d clients, want 1", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .No_Error, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
@@ -867,7 +925,7 @@ again (issue #428).
 test_followers_rejoin_an_evicted_verdict_once_only :: proc(t: ^testing.T) {
 	clients: [CLIENTS]Client
 	// Nobody follows the forwards at the end, so the mock holds none of them.
-	queries := run_burst(t, &clients, evicted = .Bogus, evicted_twice = true, hold_for = 0)
+	queries := run_burst(t, &clients, {evicted = .Bogus, evicted_twice = true, hold_for = 0}).queries
 	testing.expectf(t, queries == CLIENTS, "the upstream saw the question %d times for %d clients, want one each", queries, CLIENTS)
 	for c, i in clients {
 		testing.expectf(t, c.ok && c.rcode == .No_Error, "client %d: ok=%v rcode=%v", i, c.ok, c.rcode)
@@ -889,46 +947,25 @@ two.
 @(test)
 test_a_follower_waits_no_longer_than_its_deadline_allows :: proc(t: ^testing.T) {
 	TIMEOUT :: 100 * time.Millisecond
-	sockets: [2]net.UDP_Socket
-	bound := 0
-	defer for socket in sockets[:bound] {
-		net.close(socket)
-	}
-	servers := make([]config.Upstream_Spec, 2, context.temp_allocator)
-	for i in 0 ..< 2 {
-		socket, spec, ok := bind_mock(t, "silent")
-		if !ok {
-			return
-		}
-		sockets[i] = socket
-		bound += 1
-		servers[i] = spec
-	}
-	cfg := test_config(servers)
-	cfg.upstream.attempts = 2
-	cfg.upstream.timeout = TIMEOUT
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+	f: Mocks
+	if !mocks_start(t, &f, "silent", "silent", timeout = TIMEOUT, attempts = 2) {
 		return
 	}
-	defer upstream.destroy_group(group)
-	srv := Server {
-		cfg   = &cfg,
-		group = group,
-	}
+	defer mocks_stop(&f)
+	srv := &f.srv
 
 	// The leader: in the table under the follower's key, and never landing
 	// until the follower has given up on it.
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
 	leader: Flight
-	if joined, _ := flight_join(&srv, key, &leader); !testing.expect(t, joined == &leader, "the leader did not get the flight") {
+	if joined, _ := flight_join(srv, key, &leader); !testing.expect(t, joined == &leader, "the leader did not get the flight") { // lint:allow an uncounted join counts nothing
 		return
 	}
-	defer flight_land(&srv, &leader)
+	defer flight_land(srv, &leader)
 
 	started := time.tick_now()
-	out, _, ok := handle_query(&srv, test_query(QNAME, id = 0x4460), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, _, ok := handle_query(srv, test_query(QNAME, id = 0x4460), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	took := time.tick_since(started)
 
 	testing.expect(t, ok, "the follower got no answer at all")
@@ -939,7 +976,7 @@ test_a_follower_waits_no_longer_than_its_deadline_allows :: proc(t: ^testing.T) 
 	// with slack; a patience sized for an unbounded forward would wait ten.
 	testing.expectf(t, took < 6 * TIMEOUT, "the follower waited %v on a leader, where its deadline is %v", took, 2 * TIMEOUT)
 	// And it forwarded on nothing: the deadline was spent on the wait.
-	for socket in sockets {
+	for socket in f.sockets[:f.bound] {
 		testing.expect(t, mock_untouched(socket), "the follower asked an upstream after its deadline")
 	}
 	free_all(context.temp_allocator)
@@ -958,7 +995,7 @@ Late_Leader :: struct {
 @(private = "file")
 land_late :: proc(l: ^Late_Leader) {
 	if left := time.tick_diff(time.tick_now(), l.at); left > 0 {
-		time.sleep(left)
+		time.sleep(left) // lint:allow the landing is timed against real deadlines
 	}
 	l.flight.answer = l.answer
 	flight_land(l.srv, l.flight)
@@ -973,42 +1010,32 @@ nobody left to ask.
 @(test)
 test_a_follower_still_takes_an_answer_landing_just_past_its_deadline :: proc(t: ^testing.T) {
 	TIMEOUT :: 400 * time.Millisecond
-	socket, spec, bound := bind_mock(t, "silent")
-	if !bound {
+	h: Harness
+	if !harness_bind(t, &h, "silent") {
 		return
 	}
-	defer net.close(socket)
-	cfg := test_config(loopback_upstream(spec.port, "silent"))
-	cfg.cache.enabled = true
-	cfg.upstream.timeout = TIMEOUT
-	group, gerr := upstream.make_group(cfg.upstream, context.allocator)
-	if !testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr) {
+	h.cfg.upstream.timeout = TIMEOUT
+	if !harness_build(t, &h, caching = true) {
 		return
 	}
-	defer upstream.destroy_group(group)
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	defer cache.destroy(answers)
-	srv := Server {
-		cfg     = &cfg,
-		group   = group,
-		answers = answers,
-	}
+	defer harness_stop(&h)
+	srv := &h.srv
 
 	answer := test_reply(QNAME, .A, a_record(QNAME, {192, 0, 2, 46}, ttl = 300))
 
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
 	leader: Flight
-	if joined, _ := flight_join(&srv, key, &leader); !testing.expect(t, joined == &leader, "the leader did not get the flight") {
+	if joined, _ := flight_join(srv, key, &leader); !testing.expect(t, joined == &leader, "the leader did not get the flight") { // lint:allow an uncounted join counts nothing
 		return
 	}
 	// A timeout and a half past the follower's deadline of two - a UDP reply
 	// that crossed the line truncated and was asked again over TCP - give or
 	// take the moment between this and its join.
-	late := Late_Leader{srv = &srv, flight = &leader, answer = answer, at = time.tick_add(time.tick_now(), 7 * TIMEOUT / 2)}
+	late := Late_Leader{srv = srv, flight = &leader, answer = answer, at = time.tick_add(time.tick_now(), 7 * TIMEOUT / 2)}
 	lander := thread.create_and_start_with_poly_data(&late, land_late)
 
-	out, outcome, ok := handle_query(&srv, test_query(QNAME, id = 0x4462), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(srv, test_query(QNAME, id = 0x4462), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	thread.join(lander)
 	thread.destroy(lander)
 

@@ -60,32 +60,6 @@ UPSTREAM_NSID :: "probe-upstream"
 @(private = "file")
 CLIENT_ADVERTISED :: u16(4096)
 
-/*
-An OPT record built field by field rather than through `dns.make_opt`, which
-states version 0 and takes no options - the two things every case here needs to
-vary.
-
-The TTL is the three windows onto one number RFC 6891 section 6.1.3 defines: the
-extended rcode in the top byte, the version below it, and sixteen flag bits with
-DO at the top of them. The extended rcode is left at zero throughout; an answer
-carrying one never reaches the client at all (`unreadable_rcode_refusal`), and
-`extended_rcode_test.odin` is where that is pinned.
-*/
-@(private = "file")
-opt_record :: proc(udp_size: u16, version: u8, do_bit: bool, options: []dns.EDNS_Option) -> dns.Record {
-	ttl := u32(version) << 16
-	if do_bit {
-		ttl |= 0x0000_8000
-	}
-	return dns.Record {
-		name  = ".",
-		type  = .OPT,
-		class = dns.Class(udp_size),
-		ttl   = ttl,
-		data  = dns.Rdata_OPT{options = options},
-	}
-}
-
 // Version 0 and no options: the client asks in the one version this server
 // implements, and asks for nothing else.
 @(private = "file")
@@ -122,7 +96,8 @@ mock_reply :: proc(version: u8, do_bit: bool, options: []dns.EDNS_Option) -> []u
 
 	wire, _, err := dns.encode_message(msg, context.temp_allocator)
 	if err != .None {
-		return nil
+		// A nil reply would surface much later as an upstream never asked.
+		panic("the mock's reply does not encode")
 	}
 	return wire
 }
@@ -255,7 +230,9 @@ test_a_forwarded_answer_states_version_0_and_the_clients_do_bit :: proc(t: ^test
 	// The premise, read off the fixture rather than assumed: without this the
 	// case could pass against a mock that answered in version 0 all along.
 	fixture, ferr := dns.decode_message(reply, context.temp_allocator)
-	testing.expect_value(t, ferr, dns.Decode_Error.None)
+	if !testing.expect_value(t, ferr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect_value(t, dns.edns_version(fixture), u8(1))
 	testing.expect(t, dns.edns_do(fixture), "the fixture's DO bit is clear, so this case tests nothing")
 
@@ -265,7 +242,9 @@ test_a_forwarded_answer_states_version_0_and_the_clients_do_bit :: proc(t: ^test
 	}
 
 	m, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	if testing.expect(t, dns.edns_present(m), "the EDNS client got no OPT record back") {
 		testing.expectf(
 			t,
@@ -303,7 +282,9 @@ test_a_forwarded_answer_copies_a_do_bit_the_client_set :: proc(t: ^testing.T) {
 	}
 
 	m, derr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	if testing.expect(t, dns.edns_present(m), "the EDNS client got no OPT record back") {
 		testing.expect(t, dns.edns_do(m), "the client set DO and was answered with it clear")
 	}
@@ -451,9 +432,13 @@ test_a_strip_that_rebuilds_still_holds_the_udp_ceiling :: proc(t: ^testing.T) {
 	*/
 	testing.expectf(t, len(reply) <= CEILING, "the fixture is %d bytes, so it is over the limit before anything runs", len(reply))
 	decoded, derr := dns.decode_message(reply, context.temp_allocator)
-	testing.expect_value(t, derr, dns.Decode_Error.None)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	reencoded, _, eerr := dns.encode_message(decoded, context.temp_allocator, dns.MAX_MESSAGE)
-	testing.expect_value(t, eerr, dns.Encode_Error.None)
+	if !testing.expect_value(t, eerr, dns.Encode_Error.None) {
+		return
+	}
 	testing.expectf(
 		t,
 		len(reencoded) > CEILING,
@@ -472,7 +457,9 @@ test_a_strip_that_rebuilds_still_holds_the_udp_ceiling :: proc(t: ^testing.T) {
 	testing.expect(t, !still_there, "the upstream's NSID survived the refit")
 
 	m, merr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, merr, dns.Decode_Error.None)
+	if !testing.expect_value(t, merr, dns.Decode_Error.None) {
+		return
+	}
 	expect_the_answer_survived(t, m, "the refitted answer", ANSWER_ADDR, CLIENT_ID)
 
 	free_all(context.temp_allocator)

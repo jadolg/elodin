@@ -3,6 +3,7 @@ package dnssec
 import "core:mem"
 import "core:testing"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 The NSEC3 machinery on its own, against the worked example of RFC 5155
@@ -115,7 +116,7 @@ n3 :: proc(owner, next: string, types: []dns.Type, flags: u8 = 0, iterations: u1
 			iterations = iterations,
 			salt = A_SALT,
 			next_hash = next_hash[:nn],
-			types = types_bitmap(types),
+			types = testkit.type_bitmap(..types),
 		},
 	}
 }
@@ -531,7 +532,7 @@ test_nsec3_no_data_lets_a_zone_with_no_parent_deny_its_own_ds :: proc(t: ^testin
 				iterations = A_ITERATIONS,
 				salt = A_SALT,
 				next_hash = hash,
-				types = types_bitmap({.NS, .SOA, .RRSIG, .DNSKEY, .NSEC3PARAM}),
+				types = testkit.type_bitmap(.NS, .SOA, .RRSIG, .DNSKEY, .NSEC3PARAM),
 			},
 		},
 	}
@@ -958,10 +959,10 @@ test_nsec3_wildcard_no_data_reads_the_wildcard_as_the_name :: proc(t: ^testing.T
 	parent side holds. SOA is a zone apex, which says nothing about a DS.
 	*/
 	zone := a_zone()
-	zone[9].rr.types = types_bitmap({.NS}) // *.w.example.
+	zone[9].rr.types = testkit.type_bitmap(.NS) // *.w.example.
 	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .A, budget_at(A_ITERATIONS)), Proof.Failed)
 	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .DS, budget_at(A_ITERATIONS)), Proof.Proven)
-	zone[9].rr.types = types_bitmap({.NS, .SOA})
+	zone[9].rr.types = testkit.type_bitmap(.NS, .SOA)
 	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .DS, budget_at(A_ITERATIONS)), Proof.Failed)
 	free_all(context.temp_allocator)
 }
@@ -976,11 +977,11 @@ test_nsec3_a_delegation_or_dname_encloses_nothing :: proc(t: ^testing.T) {
 	zone := a_zone()
 	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .A, budget_at(A_ITERATIONS)), Proof.Proven)
 	testing.expect_value(t, nsec3_proves_name_error(zone, "nx.ai.example.", "example.", budget_at(A_ITERATIONS)), Proof.Proven)
-	zone[7].rr.types = types_bitmap({.NS}) // w.example.
+	zone[7].rr.types = testkit.type_bitmap(.NS) // w.example.
 	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .A, budget_at(A_ITERATIONS)), Proof.Failed)
-	zone[7].rr.types = types_bitmap({.DNAME})
+	zone[7].rr.types = testkit.type_bitmap(.DNAME)
 	testing.expect_value(t, nsec3_proves_no_data(zone, "foo.w.example.", "example.", .A, budget_at(A_ITERATIONS)), Proof.Failed)
-	zone[5].rr.types = types_bitmap({.A, .DNAME}) // ai.example.
+	zone[5].rr.types = testkit.type_bitmap(.A, .DNAME) // ai.example.
 	testing.expect_value(t, nsec3_proves_name_error(zone, "nx.ai.example.", "example.", budget_at(A_ITERATIONS)), Proof.Failed)
 	free_all(context.temp_allocator)
 }

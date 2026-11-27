@@ -313,5 +313,17 @@ test_a_repeated_client_subnet_in_one_opt_is_stripped_whole :: proc(t: ^testing.T
 	}
 	_, survived := dns.find_edns_option(after, .Client_Subnet)
 	testing.expect(t, !survived, "a second copy of the subnet survived the strip")
+
+	// And through the server: forwarded, with neither copy.
+	h: Harness
+	if !harness_start(t, &h) {
+		return
+	}
+	defer harness_stop(&h)
+	x := ecs_mock("cdn.example.")
+	_, outcome, served := harness_sniff(&h, &x, wire)
+	testing.expect(t, served && x.served, "the query with a repeated subnet was not answered")
+	testing.expect_value(t, outcome, Outcome.Forwarded)
+	testing.expect(t, !x.saw, "a copy of the repeated subnet was forwarded")
 	free_all(context.temp_allocator)
 }

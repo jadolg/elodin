@@ -11,7 +11,6 @@ import "core:thread"
 import "core:time"
 import "elodin:cache"
 import "elodin:config"
-import "elodin:sandbox"
 import "elodin:dns"
 import "elodin:filter"
 import "elodin:upstream"
@@ -23,7 +22,7 @@ A server booted from one configuration, reloadable from a file of its own.
 What `main` does, minus the listeners: the first generation is built from a
 configuration the fixture keeps, and every reload reads `path`.
 */
-@(private = "file")
+@(private)
 Gen_Fixture :: struct {
 	s:     Server,
 	arena: virtual.Arena,
@@ -31,7 +30,7 @@ Gen_Fixture :: struct {
 	path:  string,
 }
 
-@(private = "file")
+@(private)
 BASE :: `log: { level: info }
 upstream: { servers: ["127.0.0.1:1"], timeout: 1s }
 dnssec: { enabled: false }
@@ -41,7 +40,7 @@ server:
   rate_limit: { enabled: true, responses_per_second: 100 }
 `
 
-@(private = "file")
+@(private)
 boot_fixture :: proc(t: ^testing.T, name: string, text: string) -> (f: ^Gen_Fixture, ok: bool) {
 	f = new(Gen_Fixture)
 	if err := virtual.arena_init_growing(&f.arena); err != nil {
@@ -71,7 +70,7 @@ boot_fixture :: proc(t: ^testing.T, name: string, text: string) -> (f: ^Gen_Fixt
 	return f, true
 }
 
-@(private = "file")
+@(private)
 close_fixture :: proc(f: ^Gen_Fixture) {
 	destroy_generations(&f.s)
 	filter.engine_destroy(f.s.filters)
@@ -84,7 +83,7 @@ close_fixture :: proc(f: ^Gen_Fixture) {
 
 // `text` as the loader reads it, into `arena`; `ok` false, and said, when it
 // does not load.
-@(private = "file")
+@(private)
 load :: proc(t: ^testing.T, text: string, arena: ^virtual.Arena, loc := #caller_location) -> (cfg: config.Config, ok: bool) {
 	loaded, err := config.load_string(text, virtual.arena_allocator(arena))
 	if e, has := err.?; has {
@@ -108,23 +107,33 @@ unbuildable :: proc(text: string) -> string {
 	)
 }
 
-// `text` with `old` replaced, in the temp arena.
-@(private = "file")
+// `text` with `old` replaced, in the temp arena. A needle that is not there is
+// a fixture that changes nothing, so it panics rather than reload the same text.
+@(private)
 swap :: proc(text, old, new: string) -> string {
-	out, _ := strings.replace_all(text, old, new, context.temp_allocator)
+	if !strings.contains(text, old) {
+		fmt.panicf("swap: %q is not in the configuration", old)
+	}
+	out, _ := strings.replace_all(text, old, new, context.temp_allocator) // lint:allow whether it allocated says nothing here
 	return out
 }
 
 // A reload and the rebuild of the rules it asks for, as the maintenance loop
 // runs them one after the other.
-@(private = "file")
+@(private)
 Reloaded :: struct {
 	using outcome: Reload_Outcome,
 	lists_current: bool,
 	rules:         bool,
 }
 
-@(private = "file")
+// `reload_from`, expected to apply; false, with the failure reported, otherwise.
+@(private)
+reload_applied :: proc(t: ^testing.T, f: ^Gen_Fixture, text: string, loc := #caller_location) -> bool {
+	return testing.expect(t, reload_from(t, f, text).applied, "the reload was not applied", loc = loc)
+}
+
+@(private)
 reload_from :: proc(t: ^testing.T, f: ^Gen_Fixture, text: string) -> (out: Reloaded) {
 	testing.expect(t, os.write_entire_file(f.path, text) == nil, "cannot write the reloaded configuration")
 	out.outcome = reload_config(&f.s, f.path)
@@ -191,7 +200,9 @@ test_a_reload_that_changes_the_upstreams_rebuilds_them_and_moves_the_policy :: p
 	}
 	msg.flags.qr = true
 	wire, _, enc := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, enc, dns.Encode_Error.None)
+	if !testing.expect_value(t, enc, dns.Encode_Error.None) {
+		return
+	}
 	old_buf: [cache.KEY_MAX]u8
 	old_key := cache.make_key(old_buf[:], "cached.test.", .A, .IN, false, policy = old.policy)
 	testing.expect(t, cache.put(old.answers, old_key, wire, msg), "the answer was not stored")
@@ -350,333 +361,6 @@ test_a_reload_does_not_move_the_policy_for_a_server_name :: proc(t: ^testing.T) 
 	testing.expect_value(t, f.s.gens.current.policy, before)
 }
 
-@(test)
-test_a_reload_keeps_the_cookie_secret_unless_the_file_changes_it :: proc(t: ^testing.T) {
-	/*
-	A drawn secret is what every client holds its cookie under; a reload that
-	only changes `require` must not draw another, or each client pays a round
-	trip for an edit that had nothing to do with it.
-	*/
-	f, ok := boot_fixture(t, "cookies", BASE)
-	if !ok {
-		return
-	}
-	defer close_fixture(f)
-	old := f.s.gens.current.cookies
-	secret := old.secrets.slots[old.secrets.epoch % COOKIE_SECRET_SLOTS].key
-	testing.expect(t, old.secrets.next_roll != 0, "a drawn secret has no rollover scheduled")
-
-	reload_from(t, f, swap(BASE, "cookies: { enabled: true }", "cookies: { enabled: true, require: true }"))
-	cur := f.s.gens.current.cookies
-	if !testing.expect(t, cur != nil, "no keeper after the reload") {
-		return
-	}
-	testing.expect(t, cur.require, "require was not applied")
-	// Shared, not copied: the retiring generation answers on under the same
-	// secrets, and a rollover either of them makes is the other's too.
-	testing.expect(t, cur.secrets == old.secrets, "a reload that left the secret alone did not share the secrets")
-	testing.expect(t, .Cookie_Secrets in f.s.gens.current.owns, "the secrets were not handed to the new generation")
-
-	/*
-	A rollover, then two reloads that change the secret, all inside one grace:
-	the secrets the rollover and the first reload retired keep the rest of
-	their grace, and the one the second replaces gets its own (RFC 7873
-	section 7.1).
-	*/
-	req: Cookie_Request
-	copy(req.client[:], "clientck")
-	req.ip_len = 4
-	req.ip[0] = 192
-	now := cookie_now()
-	under_first := make_cookie(cur, req, now)
-	sync.atomic_store(&cur.secrets.next_roll, loop.moment_add(loop.moment_now(), -time.Second))
-	under_second := make_cookie(cur, req, now)
-	if !testing.expect_value(t, cur.secrets.epoch, 1) {
-		return
-	}
-
-	reload_from(
-		t,
-		f,
-		swap(
-			BASE,
-			"cookies: { enabled: true }",
-			"cookies: { enabled: true, secret: \"000102030405060708090a0b0c0d0e0f\" }"),
-	)
-	/*
-	The replaced keeper stops rolling, and issues under the new secrets from
-	the swap on: the retiring generation answers on while it drains, and a
-	cookie it handed out under its own secrets after their grace, or under one
-	it drew now, is one the new generation would refuse.
-	*/
-	replaced := cur
-	testing.expect_value(t, sync.atomic_load(&replaced.secrets.next_roll), 0)
-	cur = f.s.gens.current.cookies
-	testing.expect(t, sync.atomic_load(&replaced.secrets.successor) == cur.secrets, "the replaced keeper does not issue under the new secrets")
-	from_retiring := make_cookie(replaced, req, now)
-	testing.expect(t, verify_cookie(cur, from_retiring[:], req, cookie_now() + COOKIE_ROLLOVER_GRACE + 1), "a cookie the retiring generation issued is refused once the grace is over")
-	// So does an older generation sharing them since a reload that kept them,
-	// and each checks the new generation's cookies as well.
-	from_oldest := make_cookie(old, req, now)
-	testing.expect(t, verify_cookie(cur, from_oldest[:], req, cookie_now() + COOKIE_ROLLOVER_GRACE + 1), "a cookie an older generation sharing the replaced secrets issued is refused once the grace is over")
-	from_new := make_cookie(cur, req, now)
-	testing.expect(t, verify_cookie(old, from_new[:], req, now), "a retiring generation refused a cookie the new one issued")
-	testing.expect(t, verify_cookie(replaced, from_new[:], req, now), "the replaced generation refused a cookie the new one issued")
-	issued := cur.secrets.slots[cur.secrets.epoch % COOKIE_SECRET_SLOTS]
-	testing.expect(t, issued.key != secret, "a configured secret did not replace the drawn one")
-	testing.expect_value(t, cur.secrets.next_roll, 0)
-	under_third := make_cookie(cur, req, now)
-
-	reload_from(
-		t,
-		f,
-		swap(
-			BASE,
-			"cookies: { enabled: true }",
-			"cookies: { enabled: true, secret: \"101112131415161718191a1b1c1d1e1f\" }"),
-	)
-	cur = f.s.gens.current.cookies
-	testing.expect(t, verify_cookie(cur, under_third[:], req, now), "the secret the second reload replaced was refused inside its grace")
-	testing.expect(t, verify_cookie(cur, under_second[:], req, now), "the secret the first reload replaced was refused inside its grace")
-	testing.expect(t, verify_cookie(cur, under_first[:], req, now), "the secret the rollover retired was refused inside its grace")
-	later := cookie_now() + COOKIE_ROLLOVER_GRACE + 1
-	testing.expect(t, !verify_cookie(cur, under_third[:], req, later), "the replaced secret was accepted past the grace")
-	// Replaced twice now: the oldest keeper issues under the latest secrets.
-	from_oldest_again := make_cookie(old, req, now)
-	testing.expect(t, verify_cookie(cur, from_oldest_again[:], req, later), "a keeper two replacements back does not issue under the latest secrets")
-
-	reload_from(
-		t,
-		f,
-		swap(
-			BASE,
-			"cookies: { enabled: true }",
-			"cookies: { enabled: true, secret: \"000102030405060708090a0b0c0d0e0f\" }"),
-	)
-	cur = f.s.gens.current.cookies
-
-	// `previous_secret` alone changing keeps the secret issued under.
-	reload_from(
-		t,
-		f,
-		swap(
-			BASE,
-			"cookies: { enabled: true }",
-			"cookies: { enabled: true, secret: \"000102030405060708090a0b0c0d0e0f\", previous_secret: \"f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff\" }"),
-	)
-	staged := f.s.gens.current.cookies
-	testing.expect(t, staged.has_accepted, "previous_secret was not applied")
-	testing.expect(t, staged.secrets == cur.secrets, "a change to previous_secret alone replaced the secrets")
-}
-
-@(test)
-test_a_reload_of_an_unusable_file_keeps_the_running_configuration :: proc(t: ^testing.T) {
-	f, ok := boot_fixture(t, "unusable", BASE)
-	if !ok {
-		return
-	}
-	defer close_fixture(f)
-	old := f.s.gens.current
-
-	out := reload_from(t, f, "upstream: { servers: [\n")
-	testing.expect(t, !out.applied, "an unparseable file was applied")
-	testing.expect(t, f.s.gens.current == old, "an unparseable file replaced the running generation")
-
-	// Parses, and is refused by the loader's own checks: a cookie secret that is
-	// not hex. A file that loads and then cannot be built is
-	// `test_a_reload_that_cannot_be_built_releases_what_it_built`.
-	out = reload_from(
-		t,
-		f,
-		swap(
-			BASE,
-			"cookies: { enabled: true }",
-			"cookies: { enabled: true, secret: \"not hex at all, not hex at all!\" }"),
-	)
-	testing.expect(t, !out.applied, "a configuration that could not be built was applied")
-	testing.expect(t, f.s.gens.current == old, "a half-built configuration replaced the running one")
-	testing.expect(t, f.s.gens.retired == nil, "a refused reload retired the running generation")
-}
-
-@(test)
-test_a_reload_holds_restart_only_keys_at_their_starting_values :: proc(t: ^testing.T) {
-	f, ok := boot_fixture(t, "restart", BASE + "listeners: { udp: { port: 5300 } }\n")
-	if !ok {
-		return
-	}
-	defer close_fixture(f)
-	old := f.s.gens.current
-	table := old.cfg.server.max_connections
-
-	// Only keys that need a restart: nothing a reload can apply has changed.
-	out := reload_from(
-		t,
-		f,
-		strings.concatenate(
-			{
-				swap(BASE, "server:\n", fmt.tprintf("server:\n  max_connections: %d\n", table + 3)),
-				"listeners: { udp: { port: 5301 } }\n",
-			},
-			context.temp_allocator,
-		),
-	)
-	testing.expect(t, !out.applied, "a change to restart-only keys alone made a new generation")
-	testing.expect(t, f.s.gens.current == old, "the running generation was replaced")
-
-	// With something else beside them, the rest is applied and they are held.
-	out = reload_from(
-		t,
-		f,
-		strings.concatenate(
-			{
-				swap(BASE, "blocking: { enabled: false }", "blocking: { enabled: false, cache_dir: /var/tmp/elsewhere }"),
-				"listeners: { udp: { port: 5301 } }\nrewrites:\n  - { domain: h.test, answer: 192.0.2.1 }\n",
-			},
-			context.temp_allocator,
-		),
-	)
-	testing.expect(t, out.applied, "the reloadable part was not applied")
-	testing.expect_value(t, f.s.gens.current.cfg.listeners.udp.port, 5300)
-	testing.expect_value(t, f.s.gens.current.cfg.blocking.cache_dir, old.cfg.blocking.cache_dir)
-	testing.expect_value(t, f.s.gens.current.cfg.server.max_connections, table)
-	testing.expect_value(t, len(f.s.gens.current.cfg.rewrites), 1)
-}
-
-// A share the starting file wrote and the new one leaves to be derived is held,
-// and so is said: only one derived both times goes unnamed.
-@(test)
-test_a_restart_only_key_dropped_from_the_file_is_named :: proc(t: ^testing.T) {
-	arena: virtual.Arena
-	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
-		return
-	}
-	defer virtual.arena_destroy(&arena)
-	boot, boot_ok := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n  max_connections_per_prefix: 97\n"), &arena)
-	cfg, cfg_ok := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n"), &arena)
-	if !boot_ok || !cfg_ok {
-		return
-	}
-	testing.expect(t, cfg.server.max_connections_per_prefix != 97, "the derived figure is the written one, so nothing is tested")
-
-	named := keep_restart_only(&boot, &cfg, context.temp_allocator)
-	testing.expectf(t, len(named) == 1 && named[0] == "server.max_connections_per_prefix", "named %v", named)
-	testing.expect_value(t, cfg.server.max_connections_per_prefix, 97)
-}
-
-// Derived both times, and from the same `max_connections`: nothing to say.
-@(test)
-test_a_restart_only_key_derived_both_times_is_not_named :: proc(t: ^testing.T) {
-	arena: virtual.Arena
-	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
-		return
-	}
-	defer virtual.arena_destroy(&arena)
-	first, first_ok := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n"), &arena)
-	again, again_ok := load(t, swap(BASE, "server:\n", "server:\n  max_connections: 512\n"), &arena)
-	if !first_ok || !again_ok {
-		return
-	}
-	testing.expect_value(t, len(keep_restart_only(&first, &again, context.temp_allocator)), 0)
-}
-
-// The sandbox went on before the first loop started and cannot come off, so a
-// reload that changes it is named and held.
-@(test)
-test_a_changed_sandbox_is_held_and_named :: proc(t: ^testing.T) {
-	arena: virtual.Arena
-	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
-		return
-	}
-	defer virtual.arena_destroy(&arena)
-	boot, boot_ok := load(t, swap(BASE, "server:\n", "server:\n  sandbox: strict\n"), &arena)
-	cfg, cfg_ok := load(t, swap(BASE, "server:\n", "server:\n  sandbox: off\n"), &arena)
-	if !boot_ok || !cfg_ok {
-		return
-	}
-	testing.expect_value(t, cfg.server.sandbox, sandbox.Mode.Off)
-
-	named := keep_restart_only(&boot, &cfg, context.temp_allocator)
-	testing.expectf(t, len(named) == 1 && named[0] == "server.sandbox", "named %v", named)
-	testing.expect_value(t, cfg.server.sandbox, sandbox.Mode.Strict)
-}
-
-// A moved log is applied by a reload under any sandbox: a reopen Landlock
-// refuses fails as any other does, and logging stays where it was.
-@(test)
-test_a_moved_log_is_not_held_under_a_sandbox :: proc(t: ^testing.T) {
-	arena: virtual.Arena
-	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
-		return
-	}
-	defer virtual.arena_destroy(&arena)
-	sandboxed := swap(BASE, "server:\n", "server:\n  sandbox: strict\n")
-	boot, boot_ok := load(t, swap(sandboxed, "log: { level: info }", "log: { level: info, file: /var/log/a.log }"), &arena)
-	cfg, cfg_ok := load(t, swap(sandboxed, "log: { level: info }", "log: { level: info, file: /srv/b.log }"), &arena)
-	if !boot_ok || !cfg_ok {
-		return
-	}
-	named := keep_restart_only(&boot, &cfg, context.temp_allocator)
-	testing.expectf(t, len(named) == 0 && cfg.log.file == "/srv/b.log", "named %v, log %q", named, cfg.log.file)
-}
-
-/*
-A bound the file never sized, loaded on a machine whose memory limit moved since
-startup: derived again from the starting machine, and nothing the operator wrote
-to name. And UDP readers left to the machine, which shows more CPUs than at
-startup: held, and nothing to name either.
-*/
-@(test)
-test_a_restart_only_key_the_machine_moved_is_held_unnamed :: proc(t: ^testing.T) {
-	arena: virtual.Arena
-	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
-		return
-	}
-	defer virtual.arena_destroy(&arena)
-	derived, derived_ok := load(t, BASE, &arena)
-	moved, moved_ok := load(t, BASE, &arena)
-	readers, readers_ok := load(t, BASE, &arena)
-	more, more_ok := load(t, BASE, &arena)
-	if !derived_ok || !moved_ok || !readers_ok || !more_ok {
-		return
-	}
-
-	testing.expect(t, derived.server.sizing.derived_max_pending, "BASE names max_pending, so nothing is tested")
-	moved.server.sizing.machine.memory = derived.server.sizing.machine.memory * 2 + config.QUERY_MEMORY_BYTES * 64
-	moved.server.max_pending = config.derive_max_pending(moved.server.sizing.machine)
-	named := keep_restart_only(&derived, &moved, context.temp_allocator)
-	testing.expectf(t, len(named) == 0, "named %v for a file that names no max_pending", named)
-	testing.expect_value(t, moved.server.max_pending, derived.server.max_pending)
-
-	testing.expect(t, readers.server.sizing.derived_udp_readers, "BASE names a reader count, so nothing is tested")
-	more.listeners.udp.readers = readers.listeners.udp.readers + 1
-	named = keep_restart_only(&readers, &more, context.temp_allocator)
-	testing.expectf(t, len(named) == 0, "named %v for a file that names no reader count", named)
-	testing.expect_value(t, more.listeners.udp.readers, readers.listeners.udp.readers)
-}
-
-// A per-prefix share neither file writes moves with `max_connections`, which is
-// the one key the operator changed and the one to name.
-@(test)
-test_a_restart_only_share_moved_by_max_connections_names_it :: proc(t: ^testing.T) {
-	arena: virtual.Arena
-	if !testing.expect(t, virtual.arena_init_growing(&arena) == nil, "cannot reserve an arena") {
-		return
-	}
-	defer virtual.arena_destroy(&arena)
-	table, table_ok := load(t, BASE, &arena)
-	if !table_ok {
-		return
-	}
-	halved, halved_ok := load(t, swap(BASE, "server:\n", fmt.tprintf("server:\n  max_connections: %d\n", table.server.max_connections / 2)), &arena)
-	if !halved_ok {
-		return
-	}
-	testing.expect(t, halved.server.max_connections_per_prefix != table.server.max_connections_per_prefix, "the share did not move, so nothing is tested")
-	named := keep_restart_only(&table, &halved, context.temp_allocator)
-	testing.expectf(t, len(named) == 1 && named[0] == "server.max_connections", "named %v", named)
-	testing.expect_value(t, halved.server.max_connections_per_prefix, table.server.max_connections_per_prefix)
-}
-
 @(private = "file")
 Holder :: struct {
 	s:        ^Server,
@@ -724,8 +408,8 @@ test_a_retired_generation_waits_for_its_requests_and_goes_oldest_first :: proc(t
 		sync.sema_wait(&h.pinned)
 	}
 
-	reload_from(t, f, BASE + "rewrites:\n  - { domain: one.test, answer: 192.0.2.1 }\n")
-	reload_from(t, f, swap(BASE, "127.0.0.1:1", "127.0.0.1:2"))
+	reload_applied(t, f, BASE + "rewrites:\n  - { domain: one.test, answer: 192.0.2.1 }\n")
+	reload_applied(t, f, swap(BASE, "127.0.0.1:1", "127.0.0.1:2"))
 	testing.expect(t, f.s.gens.current != first, "no reload landed")
 
 	for &h in hs {
@@ -830,7 +514,7 @@ test_a_reload_rebuilds_the_rules_and_takes_them_away_with_blocking :: proc(t: ^t
 	testing.expect(t, out.rules, "the rules put into effect were not reported")
 	testing.expect_value(t, filter.engine_match(f.s.filters, "first.example", .A), filter.Decision.Blocked)
 
-	reload_from(t, f, blocking(`"||second.example^"`))
+	reload_applied(t, f, blocking(`"||second.example^"`))
 	testing.expect_value(t, filter.engine_match(f.s.filters, "second.example", .A), filter.Decision.Blocked)
 	testing.expect(t, filter.engine_match(f.s.filters, "first.example", .A) != .Blocked, "a removed rule still blocks")
 
@@ -849,7 +533,7 @@ test_a_reload_rebuilds_the_rules_and_takes_them_away_with_blocking :: proc(t: ^t
 	testing.expect(t, out.applied && !out.blocking, "a new custom address rebuilt the rule sets")
 	testing.expect_value(t, f.s.gens.current.cfg.blocking.custom_ipv4, [4]u8{192, 0, 2, 9})
 
-	reload_from(t, f, BASE)
+	reload_applied(t, f, BASE)
 	testing.expect(t, filter.engine_match(f.s.filters, "second.example", .A) != .Blocked, "turning blocking off left the rules in the engine")
 
 	// Rules edited while blocking stays off have no sets to build or take away.
@@ -889,7 +573,9 @@ test_an_answer_stored_under_a_replaced_policy_is_not_served :: proc(t: ^testing.
 		msg.flags.rd = true
 		msg.flags.ra = true
 		wire, _, enc := dns.encode_message(msg, context.temp_allocator)
-		testing.expect_value(t, enc, dns.Encode_Error.None)
+		if !testing.expect_value(t, enc, dns.Encode_Error.None) {
+			return
+		}
 		buf: [cache.KEY_MAX]u8
 		key := cache.make_key(buf[:], name, .A, .IN, false, policy = policy)
 		testing.expect(t, cache.put(c, key, wire, msg), "the answer was not stored")
@@ -925,7 +611,7 @@ test_a_retired_group_is_kept_while_a_race_worker_still_asks_it :: proc(t: ^testi
 	}
 	defer close_fixture(f)
 	old := f.s.gens.current
-	reload_from(t, f, swap(BASE, "127.0.0.1:1", "127.0.0.1:2"))
+	reload_applied(t, f, swap(BASE, "127.0.0.1:1", "127.0.0.1:2"))
 	if !testing.expect(t, f.s.gens.retired == old, "the upstream change did not retire the generation") {
 		return
 	}
@@ -1090,9 +776,9 @@ blocking: { enabled: false }
 	}
 	defer close_fixture(f)
 
-	reload_from(t, f, ROUTED)
+	reload_applied(t, f, ROUTED)
 	built := f.s.gens.current
-	reload_from(t, f, ROUTED + "rewrites:\n  - { domain: o.test, answer: 192.0.2.1 }\n")
+	reload_applied(t, f, ROUTED + "rewrites:\n  - { domain: o.test, answer: 192.0.2.1 }\n")
 	cur := f.s.gens.current
 	if !testing.expect(t, cur != built && cur.group == built.group, "the group was not handed on") {
 		return
@@ -1156,7 +842,7 @@ test_a_retired_group_still_in_use_closes_its_idle_connections :: proc(t: ^testin
 	}
 	holder := thread.create_and_start_with_poly_data(&h, hold_a_request)
 	sync.sema_wait(&h.pinned)
-	reload_from(t, f, swap(BASE, "127.0.0.1:1", "127.0.0.1:2"))
+	reload_applied(t, f, swap(BASE, "127.0.0.1:1", "127.0.0.1:2"))
 
 	socket, serr := net.create_socket(.IP4, .TCP)
 	if testing.expectf(t, serr == nil, "cannot make a socket: %v", serr) {
@@ -1246,7 +932,9 @@ test_a_rebuild_holds_no_generation_a_reload_replaces :: proc(t: ^testing.T) {
 	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
 		return
 	}
-	_ = net.set_option(listener, .Receive_Timeout, 5 * time.Second)
+	if !set_wait(t, listener, .Receive_Timeout, 5 * time.Second) {
+		return
+	}
 
 	stalled := swap(
 		BASE,
@@ -1313,13 +1001,6 @@ syscall filter, and `resolve_upstreams` asks once they are in place (#755).
 */
 @(test)
 test_the_first_generation_looks_up_no_upstream_hostname :: proc(t: ^testing.T) {
-	Boot :: struct {
-		host:   string,
-		socket: net.UDP_Socket,
-		port:   int,
-		mock:   Canned_Mock,
-		bound:  bool,
-	}
 	boots := [2]Boot{{host = "up.boot.test"}, {host = "route.boot.test"}}
 	defer for b in boots {
 		if b.bound {
@@ -1333,17 +1014,10 @@ test_the_first_generation_looks_up_no_upstream_hostname :: proc(t: ^testing.T) {
 		}
 		b.socket, b.port, b.bound = sock, spec.port, true
 	}
-	named := fmt.tprintf(
-		`servers: [{{ name: named, type: udp, address: %q, port: 53 }}], bootstrap: ["127.0.0.1:%d"], zones: [{{ domains: [corp.example], servers: [{{ name: routed, type: udp, address: %q, port: 53 }}], bootstrap: ["127.0.0.1:%d"] }}]`,
-		boots[0].host,
-		boots[0].port,
-		boots[1].host,
-		boots[1].port,
-	)
 	if !testing.expect(t, strings.contains(BASE, `servers: ["127.0.0.1:1"]`), "BASE names no servers to replace") {
 		return
 	}
-	f, ok := boot_fixture(t, "boot-unresolved", swap(BASE, `servers: ["127.0.0.1:1"]`, named))
+	f, ok := boot_fixture(t, "boot-unresolved", bootstrap_config(boots))
 	if !ok {
 		return
 	}
@@ -1354,6 +1028,47 @@ test_the_first_generation_looks_up_no_upstream_hostname :: proc(t: ^testing.T) {
 		testing.expectf(t, mock_untouched(b.socket), "the first generation asked the bootstrap server for %s", b.host)
 	}
 
+	groups := resolve_through(f, &boots)
+	for b, i in boots {
+		testing.expectf(t, b.mock.got, "resolve_upstreams did not ask the bootstrap server for %s", b.host)
+		g := groups[i]
+		if testing.expectf(t, g != nil && len(g.servers) == 1, "no single server for %s", b.host) {
+			testing.expectf(t, sync.atomic_load(&g.servers[0].resolved), "%s is not resolved after resolve_upstreams", b.host)
+		}
+	}
+}
+
+// A mock bootstrap server for one upstream hostname.
+@(private = "file")
+Boot :: struct {
+	host:   string,
+	socket: net.UDP_Socket,
+	port:   int,
+	mock:   Canned_Mock,
+	bound:  bool,
+}
+
+// BASE with a named upstream in the default group and one in a route, each
+// looked up through its own bootstrap server in `boots`.
+@(private = "file")
+bootstrap_config :: proc(boots: [2]Boot) -> string {
+	named := fmt.tprintf(
+		`servers: [{{ name: named, type: udp, address: %q, port: 53 }}], bootstrap: ["127.0.0.1:%d"], zones: [{{ domains: [corp.example], servers: [{{ name: routed, type: udp, address: %q, port: 53 }}], bootstrap: ["127.0.0.1:%d"] }}]`,
+		boots[0].host,
+		boots[0].port,
+		boots[1].host,
+		boots[1].port,
+	)
+	return swap(BASE, `servers: ["127.0.0.1:1"]`, named)
+}
+
+/*
+`resolve_upstreams` on `f`, with each of `boots` answering its hostname with
+loopback; the default group and the route's group it left live, nil for a route
+that is not there.
+*/
+@(private = "file")
+resolve_through :: proc(f: ^Gen_Fixture, boots: ^[2]Boot) -> (groups: [2]^upstream.Group) {
 	threads: [2]^thread.Thread
 	for &b, i in boots {
 		name := fmt.tprintf("%s.", b.host)
@@ -1363,17 +1078,11 @@ test_the_first_generation_looks_up_no_upstream_hostname :: proc(t: ^testing.T) {
 	pin(&f.s)
 	resolve_upstreams(&f.s)
 	l := live(&f.s)
-	groups := [2]^upstream.Group{l.group, l.routes[0].group if len(l.routes) == 1 else nil}
+	groups = {l.group, l.routes[0].group if len(l.routes) == 1 else nil}
 	unpin(&f.s)
 	for th in threads {
 		thread.join(th)
 		thread.destroy(th)
 	}
-	for b, i in boots {
-		testing.expectf(t, b.mock.got, "resolve_upstreams did not ask the bootstrap server for %s", b.host)
-		g := groups[i]
-		if testing.expectf(t, g != nil && len(g.servers) == 1, "no single server for %s", b.host) {
-			testing.expectf(t, sync.atomic_load(&g.servers[0].resolved), "%s is not resolved after resolve_upstreams", b.host)
-		}
-	}
+	return groups
 }

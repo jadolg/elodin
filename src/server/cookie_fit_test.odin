@@ -1,7 +1,6 @@
 package server
 
 import "core:testing"
-import "elodin:cache"
 import "elodin:dns"
 
 /*
@@ -34,11 +33,6 @@ Both cases are pinned here, along with the ordinary one where the cookie fits.
 @(private = "file")
 QNAME :: "probe.example.com."
 
-@(private = "file")
-CLIENT :: "198.51.100.100:9999"
-
-@(private = "file")
-SECRET :: "e5e973e5a6b2a43f48e7dc849e37bfcf"
 
 // Option header plus a 24-byte reply cookie, which is what `attach_cookie` adds.
 @(private = "file")
@@ -100,47 +94,14 @@ big_answer :: proc() -> (wire: []u8, records: int) {
 	return encoded, len(answer)
 }
 
-@(private = "file")
-client_query :: proc(advertised: u16) -> []u8 {
-	// Eight bytes, which is a client that has not been here before: the verdict
-	// is `Unproven` and a cookie is minted for it.
-	half := make([]u8, 8, context.temp_allocator)
-	for i in 0 ..< len(half) {
-		half[i] = u8(0xa0 + i)
-	}
-	return test_query(QNAME, id = 0x1234, opt = opt_with(.Cookie, half, advertised))
-}
-
 /*
 Answer one cookie-carrying query from the cache, so the client-facing path runs
 end to end with no upstream behind it and the answer's size chosen here.
 */
 @(private = "file")
 answer_once :: proc(t: ^testing.T, stored_wire: []u8, advertised: u16) -> (out: []u8, ok: bool) {
-	cfg := test_config()
-	cfg.cache.enabled = true
-	cfg.cookies.enabled = true
-	cfg.cookies.secret = SECRET
-
-	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600})
-	defer cache.destroy(answers)
-
-	s := Server {
-		cfg     = &cfg,
-		answers = answers,
-	}
-	if !start_cookies(&s) {
-		testing.expect(t, false, "the cookie keeper would not start")
-		return nil, false
-	}
-	defer release_parts(&s, {.Cookie_Secrets, .Cookies})
-
-	if !seed_cache(t, answers, QNAME, stored_wire) {
-		return nil, false
-	}
-
-	response, _, served := handle_query(&s, client_query(advertised), .UDP, CLIENT, context.temp_allocator)
-	return response, served
+	query := test_query(QNAME, id = 0x1234, opt = opt_with(.Cookie, test_client_cookie(), advertised))
+	return cookie_roundtrip(t, QNAME, stored_wire, query, .UDP, RFC9018_CLIENT)
 }
 
 // What the cases below read off a reply.
@@ -256,7 +217,7 @@ test_an_answer_over_the_buffer_is_truncated_and_keeps_its_opt :: proc(t: ^testin
 	if !testing.expect(t, len(stored) > 0, "the answer would not encode") {
 		return
 	}
-	if !testing.expectf(t, len(stored) > dns.MAX_UDP_SIZE + OPT_RR_LEN, "the answer is only %d bytes", len(stored)) {
+	if !testing.expectf(t, len(stored) > dns.MAX_UDP_SIZE + dns.EMPTY_OPT_SIZE, "the answer is only %d bytes", len(stored)) {
 		return
 	}
 

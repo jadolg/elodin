@@ -224,7 +224,8 @@ test_a_cached_copy_is_replaced_whole :: proc(t: ^testing.T) {
 	testing.expect_value(t, write_cache_file(path, transmute([]byte)string("||new.example^\n")), nil)
 
 	buf: [64]u8
-	n, _ := os.read(old, buf[:])
+	n, read_err := os.read(old, buf[:])
+	testing.expect_value(t, read_err, nil)
 	testing.expect_value(t, string(buf[:n]), "||old.example^\n")
 	now, rerr := os.read_entire_file(path, context.temp_allocator)
 	testing.expect_value(t, rerr, nil)
@@ -335,6 +336,20 @@ test_a_cached_copy_that_is_no_list_is_not_loaded :: proc(t: ^testing.T) {
 	}
 }
 
+// Every copy `test_a_cache_named_by_a_query_moves` planted or moved, and their
+// fingerprints.
+@(private = "file")
+remove_copies :: proc(cfg: ^config.Config, files: []string, moved, other, on: config.Block_List) {
+	for f in ([]string{list_cache_path(cfg, moved), list_cache_path(cfg, other), list_cache_path(cfg, on)}) {
+		os.remove(f)
+	}
+	for f in files {
+		os.remove(f)
+		os.remove(source_path(f))
+	}
+	os.remove(source_path(list_cache_path(cfg, moved)))
+}
+
 /*
 A copy an earlier build cached under a list's whole url, query and key included,
 moves to the name the list goes by now, so an offline start still loads it and
@@ -375,18 +390,11 @@ test_a_cache_named_by_a_query_moves :: proc(t: ^testing.T) {
 		testing.expect(t, os.write_entire_file(f, bodies[i]) == nil)
 	}
 	// The current copy is the stale list's own, by its fingerprint.
-	src, _ := source_of(stale)
-	testing.expect(t, os.write_entire_file(source_path(stale_current), src) == nil)
-	defer {
-		for f in ([]string{list_cache_path(&cfg, moved), list_cache_path(&cfg, other), list_cache_path(&cfg, on)}) {
-			os.remove(f)
-		}
-		for f in files {
-			os.remove(f)
-			os.remove(source_path(f))
-		}
-		os.remove(source_path(list_cache_path(&cfg, moved)))
+	src, sourced := source_of(stale)
+	if testing.expect(t, sourced, "the stale list has no fingerprint") {
+		testing.expect(t, os.write_entire_file(source_path(stale_current), src) == nil)
 	}
+	defer remove_copies(&cfg, files, moved, other, on)
 
 	block, allow := build_filter_sets(&cfg, false)
 	defer filter.set_destroy(block)
@@ -450,7 +458,8 @@ test_a_changed_query_is_not_fresh :: proc(t: ^testing.T) {
 	delete(text)
 
 	testing.expect(t, !strings.contains(path, "SECRET"), "the query is in the file name")
-	src, _ := os.read_entire_file(source_path(path), context.temp_allocator)
+	src, serr := os.read_entire_file(source_path(path), context.temp_allocator)
+	testing.expect_value(t, serr, nil)
 	testing.expectf(t, len(src) > 0 && !strings.contains(string(src), "SECRET"), "the fingerprint is %q", string(src))
 
 	// The query dropped from the url: the copy of the query is not fresh for it,
@@ -796,20 +805,9 @@ test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
 	}
 	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt", format = .Hosts, enabled = true}
 	path := list_cache_path(&cfg, list)
-	cpath := proc(p: string) -> cstring {
-		return strings.clone_to_cstring(p, context.temp_allocator)
-	}
-	// The write.
-	if !testing.expect(t, posix.symlink(cpath(victim), cpath(fmt.tprintf("%s.tmp", path))) == .OK, "cannot plant the .tmp link") {
+	if !expect_written_through_no_link(t, path, victim) {
 		return
 	}
-	testing.expect_value(t, write_cache_file(path, transmute([]byte)string("0.0.0.0 new.example\n")), nil)
-	after, verr := os.read_entire_file(victim, context.temp_allocator)
-	testing.expect_value(t, verr, nil)
-	testing.expectf(t, string(after) == "0.0.0.0 secret.example\n", "the file the .tmp linked to was written: %q", string(after))
-	written, werr := os.read_entire_file(path, context.temp_allocator)
-	testing.expect_value(t, werr, nil)
-	testing.expect_value(t, string(written), "0.0.0.0 new.example\n")
 
 	// A plain copy: read and fresh.
 	_, why, read := read_cache_file(path, context.temp_allocator)
@@ -836,7 +834,39 @@ test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
 		testing.expectf(t, lfresh, "the %s is not fresh", l.name)
 	}
 
-	// A FIFO in the copy's place is neither waited on nor read, by anyone.
+	expect_a_fifo_refused(t, &cfg, list, path)
+}
+
+// `p` as a C string, in the temp arena.
+@(private = "file")
+cpath :: proc(p: string) -> cstring {
+	return strings.clone_to_cstring(p, context.temp_allocator)
+}
+
+/*
+That `write_cache_file` replaces a `.tmp` planted beside `path` as a link to
+`victim` rather than writing through it. False, and said, when the link could
+not be planted.
+*/
+@(private = "file")
+expect_written_through_no_link :: proc(t: ^testing.T, path, victim: string) -> bool {
+	if !testing.expect(t, posix.symlink(cpath(victim), cpath(fmt.tprintf("%s.tmp", path))) == .OK, "cannot plant the .tmp link") {
+		return false
+	}
+	testing.expect_value(t, write_cache_file(path, transmute([]byte)string("0.0.0.0 new.example\n")), nil)
+	after, verr := os.read_entire_file(victim, context.temp_allocator)
+	testing.expect_value(t, verr, nil)
+	testing.expectf(t, string(after) == "0.0.0.0 secret.example\n", "the file the .tmp linked to was written: %q", string(after))
+	written, werr := os.read_entire_file(path, context.temp_allocator)
+	testing.expect_value(t, werr, nil)
+	testing.expect_value(t, string(written), "0.0.0.0 new.example\n")
+	return true
+}
+
+// That a FIFO in place of `list`'s copy at `path` is neither waited on nor read,
+// by anyone, and that the list then loads no copy, nor once it is gone.
+@(private = "file")
+expect_a_fifo_refused :: proc(t: ^testing.T, cfg: ^config.Config, list: config.Block_List, path: string) {
 	testing.expect_value(t, os.remove(path), nil)
 	if !testing.expect(t, posix.mkfifo(cpath(path), {.IRUSR, .IWUSR}) == .OK, "cannot make the FIFO") {
 		return
@@ -848,11 +878,11 @@ test_the_list_cache_follows_no_symlink :: proc(t: ^testing.T) {
 
 	// The list loads no copy that is refused - the FIFO, still in place - nor
 	// one that is missing.
-	text, load := cached_copy(&cfg, list, .Stale)
+	text, load := cached_copy(cfg, list, .Stale)
 	testing.expectf(t, load == .Unavailable && text == "", "a refused copy loaded: %v %q", load, text)
 	delete(text)
 	testing.expect_value(t, os.remove(path), nil)
-	text, load = cached_copy(&cfg, list, .Stale)
+	text, load = cached_copy(cfg, list, .Stale)
 	testing.expectf(t, load == .Unavailable && text == "", "a missing copy loaded: %v %q", load, text)
 	delete(text)
 }

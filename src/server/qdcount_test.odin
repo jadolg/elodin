@@ -16,10 +16,8 @@ two_question_query :: proc(t: ^testing.T, edns: bool, version: u8 = 0) -> (wire:
 	}
 	q.flags.rd = true
 	if edns {
-		opt := dns.make_opt(1232, false)
-		opt.ttl |= u32(version) << 16
 		additional := make([]dns.Record, 1, context.temp_allocator)
-		additional[0] = opt
+		additional[0] = opt_record(version = version)
 		q.additional = additional
 	}
 	out, _, err := dns.encode_message(q, context.temp_allocator)

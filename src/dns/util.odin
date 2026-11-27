@@ -181,7 +181,6 @@ truncated_response :: proc(query_bytes: []u8, udp_size: u16, allocator := contex
 }
 
 // An OPT record with no options: the root, TYPE, CLASS, TTL and RDLENGTH.
-@(private)
 EMPTY_OPT_SIZE :: 1 + 2 + 2 + 4 + 2
 
 /*

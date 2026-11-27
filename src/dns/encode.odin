@@ -345,8 +345,7 @@ opt_wire_len :: proc(m: Message) -> (n: int, ok: bool) {
 		if rec.name != "." {
 			return 0, false
 		}
-		// The root name, TYPE, CLASS, TTL and RDLENGTH.
-		n = 11
+		n = EMPTY_OPT_SIZE
 		if rdata, is_opt := rec.data.(Rdata_OPT); is_opt {
 			for o in rdata.options {
 				n += 4 + len(o.data)

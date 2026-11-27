@@ -35,8 +35,7 @@ version_query :: proc(version: u8, edns := true, cookie: []u8 = nil) -> []u8 {
 	if !edns {
 		return test_query(REWRITTEN, id = 0x4321)
 	}
-	opt := opt_with(.Cookie, cookie) if cookie != nil else dns.make_opt(1232, false)
-	opt.ttl |= u32(version) << 16
+	opt := opt_with(.Cookie, cookie, version = version) if cookie != nil else opt_record(version = version)
 	return test_query(REWRITTEN, id = 0x4321, opt = opt)
 }
 
@@ -131,20 +130,17 @@ test_badvers_still_carries_a_cookie_back :: proc(t: ^testing.T) {
 	cfg: config.Config
 	s := rewrite_server(&cfg, REWRITTEN)
 	cfg.cookies.enabled = true
-	cfg.cookies.secret = "e5e973e5a6b2a43f48e7dc849e37bfcf"
+	cfg.cookies.secret = RFC9018_SECRET
 	if !testing.expect(t, start_cookies(&s), "the cookie keeper would not start") {
 		return
 	}
 	defer release_parts(&s, {.Cookie_Secrets, .Cookies})
 
-	client_cookie := make([]u8, 8, context.temp_allocator)
-	copy(client_cookie, []u8{0x24, 0x64, 0xc4, 0xab, 0xcf, 0x10, 0xc9, 0x57})
-
 	out, outcome, ok := handle_query(
 		&s,
-		version_query(1, cookie = client_cookie),
+		version_query(1, cookie = unhex(RFC9018_CLIENT_COOKIE)),
 		.UDP,
-		"198.51.100.100:9999",
+		RFC9018_CLIENT,
 		context.temp_allocator,
 	)
 	if !testing.expect(t, ok, "a request in EDNS version 1 with a cookie went unanswered") {

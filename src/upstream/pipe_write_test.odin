@@ -9,6 +9,7 @@ import "core:thread"
 import "core:time"
 import "elodin:config"
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 The bounds on the pipelined write, held against a peer that really does stop a
@@ -524,7 +525,7 @@ test_a_cancelled_writer_does_not_spin_on_its_loop :: proc(t: ^testing.T) {
 	queued := 0
 	for start := time.tick_now(); queued == 0 && time.tick_since(start) < 5 * time.Second; {
 		time.sleep(time.Millisecond)
-		queued = stall_queued(r.c)
+		queued = testkit.unacked_bytes(linux.Fd(r.c.stream.socket))
 	}
 	testing.expectf(t, queued > 0 && queued < 2 + STALL_QUERY_SIZE, "%v bytes queued: the writer is not partway through", queued)
 
@@ -557,17 +558,6 @@ test_a_cancelled_writer_does_not_spin_on_its_loop :: proc(t: ^testing.T) {
 	werr, dead := pipe_dead(r.c)
 	testing.expectf(t, w.err == .Timeout, "the cancelled writer ended as %v, expected a timeout", w.err)
 	testing.expectf(t, dead && werr == .Timeout, "a message left half written did not take the connection down (%v)", werr)
-}
-
-// What the pipe's socket holds that the peer has not acknowledged: `SIOCOUTQ`.
-@(private = "file")
-stall_queued :: proc(c: ^Pipe_Conn) -> int {
-	SIOCOUTQ :: 0x5411
-	n: i32
-	if i32(linux.ioctl(linux.Fd(c.stream.socket), SIOCOUTQ, uintptr(&n))) < 0 {
-		return 0
-	}
-	return int(n)
 }
 
 /*

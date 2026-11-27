@@ -7,6 +7,7 @@ import "core:testing"
 import "core:time"
 import "elodin:dns"
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 Real signed DNS traffic, captured from a public resolver and frozen here.
@@ -189,28 +190,9 @@ rrsig_mutant :: proc(real: dns.Record, damage: bit_set[Rrsig_Damage], allocator 
 	return dns.Record{name = real.name, type = .RRSIG, class = real.class, ttl = real.ttl, data = dns.Rdata_Raw{data = out}}
 }
 
-// A type bit map with just these types set. Every type the tests use is below
-// 256, so one window holds them all.
-types_bitmap :: proc(types: []dns.Type) -> []u8 {
-	if len(types) == 0 {
-		return nil
-	}
-	high := 0
-	for type in types {
-		high = max(high, int(type))
-	}
-	length := high / 8 + 1
-	out := make([]u8, 2 + length, context.temp_allocator)
-	out[1] = u8(length)
-	for type in types {
-		out[2 + int(type) / 8] |= 0x80 >> u8(int(type) % 8)
-	}
-	return out
-}
-
 // An NSEC record at `owner` naming `next` and holding `types`.
 nsec_rr :: proc(owner, next: string, types: []dns.Type) -> Nsec_Rr {
-	return Nsec_Rr{owner = owner, rr = Nsec{next = next, types = types_bitmap(types)}}
+	return Nsec_Rr{owner = owner, rr = Nsec{next = next, types = testkit.type_bitmap(..types)}}
 }
 
 // What the temporary arena has handed out so far, for a test that measures

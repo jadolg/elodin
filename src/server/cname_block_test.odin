@@ -20,29 +20,6 @@ holds it to that - through a mock upstream for the forwarding path, and through
 an answer put straight into the cache for the hit path.
 */
 
-/*
-The lists a case runs under: `block` and `allow` as domains, and `rules` as
-blocklist lines, each of which has to parse or the case would pass on an empty
-list.
-*/
-@(private = "file")
-make_engine :: proc(t: ^testing.T, block, allow: []string, rules: []string = nil) -> ^filter.Engine {
-	engine := filter.engine_make()
-	block_set := filter.set_make()
-	allow_set := filter.set_make()
-	for d in block {
-		filter.set_add(block_set, d, {.Apex, .Subdomains})
-	}
-	for d in allow {
-		filter.set_add(allow_set, d, {.Apex, .Subdomains})
-	}
-	for r in rules {
-		testing.expectf(t, filter.parse_rule(block_set, allow_set, r) > 0, "rule %q did not parse", r)
-	}
-	filter.engine_swap(engine, block_set, allow_set)
-	return engine
-}
-
 // A server forwarding to a mock upstream with blocking on under `block` and
 // `allow`. Torn down with `blocking_harness_stop`.
 @(private = "file")
@@ -99,12 +76,12 @@ test_a_blocked_name_reached_through_a_cname_is_still_blocked :: proc(t: ^testing
 	// The tracker is on the list: asked for directly, it is blocked.
 	testing.expect_value(t, filter.engine_match(engine, "tracker.evil.example.", .A), filter.Decision.Blocked)
 
-	out, outcome, ok, _ := harness_ask(
+	out, outcome, ok, asked := harness_ask(
 		&h,
 		test_query("www.brand.example."),
 		chain_reply({"www.brand.example.", "tracker.evil.example."}),
 	)
-	if !testing.expect(t, ok, "nothing came back at all") {
+	if !testing.expect(t, ok && asked, "the upstream was not asked, or nothing came back at all") {
 		return
 	}
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
@@ -359,7 +336,7 @@ test_a_decoy_branch_does_not_end_the_walk_before_the_other_one :: proc(t: ^testi
 The budget is spent on names, so repeating one does not spend it.
 
 The answer comes from whoever runs the cloaked zone, and the same CNAME written
-out sixteen times is sixteen records to scan but one name to look up. Counting
+out `MAX_CHAIN_NAMES` times is that many records to scan but one name to look up. Counting
 the records instead would let a padded answer use the whole budget up before the
 walk reached the record that mattered, which is the cheapest evasion there is:
 no chain to build, no second zone to run, just the same line repeated.
@@ -445,25 +422,25 @@ test_a_clean_answer_is_walked_once_per_reload_and_not_once_per_hit :: proc(t: ^t
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], hops[0], .A, .IN, false, false)
 
-	_, first, _ := cache.get(answers, key, context.temp_allocator, checked_against = filter.engine_generation(engine))
-	testing.expect(t, first.recheck, "an entry from before the reload was not flagged for a second look")
+	_, first, found := cache.get(answers, key, context.temp_allocator, checked_against = filter.engine_generation(engine))
+	testing.expect(t, found && first.recheck, "an entry from before the reload was not flagged for a second look")
 
 	_, outcome, ok := handle_query(&s, test_query(hops[0]), .UDP, "127.0.0.1:5555", context.temp_allocator)
 	testing.expect(t, ok, "nothing came back at all")
 	testing.expect_value(t, outcome, Outcome.Cached)
 
-	_, second, _ := cache.get(answers, key, context.temp_allocator, checked_against = filter.engine_generation(engine))
-	testing.expect(t, !second.recheck, "the walk was not recorded, so every later hit pays for it again")
+	_, second, kept := cache.get(answers, key, context.temp_allocator, checked_against = filter.engine_generation(engine))
+	testing.expect(t, kept && !second.recheck, "the walk was not recorded, so every later hit pays for it again")
 	free_all(context.temp_allocator)
 }
 
 /*
-Sixteen distinct decoys, and then the tracker.
+`MAX_CHAIN_NAMES` distinct decoys, and then the tracker.
 
 The budget is spent on distinct names, so distinct decoys spend it - which the
-repeated-CNAME case above cannot show, its decoys all being one name. Sixteen of
-them use the walk up before it reaches the seventeenth record, and what the
-walk has not reached it has not cleared.
+repeated-CNAME case above cannot show, its decoys all being one name. They use
+the walk up before it reaches the record after them, and what the walk has not
+reached it has not cleared.
 */
 @(test)
 test_distinct_decoys_do_not_bury_the_listed_name :: proc(t: ^testing.T) {
@@ -493,13 +470,15 @@ the end and arrives at the tracker. Bounding the walk and then serving whatever
 the walk did not reach is not a bound on anything an attacker cares about - it
 is a length they have to exceed, and exceeding it was free.
 
-So the answer is refused. The chain is eighteen names where a real one is two,
-and an answer this server could not finish checking is not one to hand over.
+So the answer is refused. The chain is `MAX_CHAIN_NAMES` + 2 names where a real
+one is two, and an answer this server could not finish checking is not one to
+hand over.
 */
 @(test)
 test_a_chain_longer_than_the_budget_is_refused :: proc(t: ^testing.T) {
-	// The question plus seventeen targets: one more than the walk admits, so it
-	// is the first length that is refused rather than merely a long one.
+	// The question plus `MAX_CHAIN_NAMES` + 1 targets: one more than the walk
+	// admits, so it is the first length that is refused rather than merely a
+	// long one.
 	hops := make([dynamic]string, 0, MAX_CHAIN_NAMES + 3, context.temp_allocator)
 	append(&hops, "www.brand.example.")
 	for i in 0 ..< MAX_CHAIN_NAMES {
@@ -523,12 +502,12 @@ test_a_chain_longer_than_the_budget_is_refused :: proc(t: ^testing.T) {
 A chain of exactly the budget is walked to the end and served.
 
 The boundary in the other direction, and it has to be the *exact* one, on a
-number that decides whether ordinary answers are withheld. Sixteen targets here
-and seventeen in the test above pin `MAX_CHAIN_NAMES` exactly.
+number that decides whether ordinary answers are withheld. `MAX_CHAIN_NAMES`
+targets here and one more in the test above pin it exactly.
 */
 @(test)
 test_a_chain_that_fits_the_budget_is_answered :: proc(t: ^testing.T) {
-	// The question plus sixteen targets, which is the most the walk will follow.
+	// The question plus `MAX_CHAIN_NAMES` targets, the most the walk will follow.
 	hops := make([dynamic]string, 0, MAX_CHAIN_NAMES + 2, context.temp_allocator)
 	append(&hops, "www.brand.example.")
 	for i in 0 ..< MAX_CHAIN_NAMES {
@@ -555,12 +534,12 @@ test_a_cloaked_answer_is_fetched_from_the_upstream_only_once :: proc(t: ^testing
 	}
 	defer blocking_harness_stop(&h)
 
-	_, first, _, asked := harness_ask(
+	_, first, first_served, asked := harness_ask(
 		&h,
 		test_query("www.brand.example."),
 		chain_reply({"www.brand.example.", "tracker.evil.example."}),
 	)
-	testing.expect(t, asked, "the upstream was never asked for the first query")
+	testing.expect(t, asked && first_served, "the upstream was never asked for the first query")
 	testing.expect_value(t, first, Outcome.Blocked)
 
 	// No mock is listening now. A second upstream query would time out and the
@@ -594,13 +573,14 @@ test_a_refused_answer_is_not_cached_with_the_upstream_ad_bit :: proc(t: ^testing
 	reply := chain_reply({"www.brand.example.", "tracker.evil.example."})
 	reply[3] |= 0x20
 
-	_, outcome, _, _ := harness_ask(&h, test_query("www.brand.example."), reply)
+	_, outcome, served, asked := harness_ask(&h, test_query("www.brand.example."), reply)
+	testing.expect(t, asked && served, "the upstream was not asked, or nothing came back")
 	testing.expect_value(t, outcome, Outcome.Blocked)
 
 	key_buf: [cache.KEY_MAX]u8
 	key := cache.make_key(key_buf[:], "www.brand.example.", .A, .IN, false, false)
-	entry, found := h.answers.shards[0].entries[key]
-	if !testing.expect(t, found, "the refused answer was not stored, so nothing can re-walk it later") {
+	entry := cached_entry(h.answers, key)
+	if !testing.expect(t, entry != nil, "the refused answer was not stored, so nothing can re-walk it later") {
 		return
 	}
 	testing.expect(
@@ -664,11 +644,12 @@ test_junk_outside_the_answer_section_does_not_withhold_the_answer :: proc(t: ^te
 	}
 	defer blocking_harness_stop(&h)
 
-	_, outcome, _, _ := harness_ask(&h, test_query("www.brand.example."), wire)
+	_, outcome, served, asked := harness_ask(&h, test_query("www.brand.example."), wire)
 
+	testing.expect(t, asked && served, "the upstream was not asked, or nothing came back")
 	testing.expectf(
 		t,
-		outcome != .Failed,
+		outcome == .Forwarded,
 		"a clean answer section was refused for junk in a section the walk never reads (outcome=%v)",
 		outcome,
 	)
@@ -745,7 +726,8 @@ test_a_refusal_on_a_partial_decode_is_released_by_a_reload :: proc(t: ^testing.T
 	}
 	defer blocking_harness_stop(&h)
 
-	_, first, _, _ := harness_ask(&h, test_query("www.brand.example."), wire)
+	_, first, first_served, first_asked := harness_ask(&h, test_query("www.brand.example."), wire)
+	testing.expect(t, first_asked && first_served, "the upstream was not asked, or nothing came back")
 	testing.expect_value(t, first, Outcome.Blocked)
 
 	// The operator writes the documented escape hatch and reloads.
@@ -757,9 +739,9 @@ test_a_refusal_on_a_partial_decode_is_released_by_a_reload :: proc(t: ^testing.T
 	filter.set_destroy(ob)
 	filter.set_destroy(oa)
 
-	_, second, _, asked := harness_ask(&h, test_query("www.brand.example."), wire, client = "127.0.0.2:5555")
+	_, second, served, asked := harness_ask(&h, test_query("www.brand.example."), wire, client = "127.0.0.2:5555")
 	// Asked, or an outcome other than Blocked is a timeout and releases nothing.
-	testing.expect(t, asked, "the upstream was not asked again after the reload")
+	testing.expect(t, asked && served, "the upstream was not asked again after the reload")
 
 	testing.expectf(
 		t,
@@ -849,17 +831,19 @@ test_an_unreadable_refusal_does_not_outlive_the_answer_that_caused_it :: proc(t:
 	}
 	defer blocking_harness_stop(&h)
 
-	_, first, _, _ := harness_ask(&h, test_query("www.brand.example."), unreadable_cname_reply())
+	_, first, first_served, first_asked := harness_ask(&h, test_query("www.brand.example."), unreadable_cname_reply())
+	// Asked, or the SERVFAIL is a timeout and says nothing of the record.
+	testing.expect(t, first_asked && first_served, "the upstream was not asked, or nothing came back")
 	testing.expect_value(t, first, Outcome.Failed)
 
 	// The upstream stops sending the malformed record. It must be asked.
-	_, second, _, asked := harness_ask(
+	_, second, served, asked := harness_ask(
 		&h,
 		test_query("www.brand.example."),
 		chain_reply({"www.brand.example.", "good.brand.example."}),
 		client = "127.0.0.2:5555",
 	)
-	testing.expect(t, asked, "the upstream was never re-asked: the parse failure was memoised")
+	testing.expect(t, asked && served, "the upstream was never re-asked: the parse failure was memoised")
 	testing.expectf(t, second != .Failed, "the name stayed broken after a good answer was available (outcome=%v)", second)
 	free_all(context.temp_allocator)
 }
@@ -896,7 +880,8 @@ test_an_entry_that_turns_unreadable_on_a_later_walk_is_dropped :: proc(t: ^testi
 	CNAME's target is unreadable, so no name past this one is there to hold it,
 	and the walk that refuses the entry later never reads the A.
 	*/
-	_, first, _, _ := harness_ask(&h, test_query("www.brand.example."), unreadable_cname_reply(extra_a = true))
+	_, first, first_served, first_asked := harness_ask(&h, test_query("www.brand.example."), unreadable_cname_reply(extra_a = true))
+	testing.expect(t, first_asked && first_served, "the upstream was not asked, or nothing came back")
 	// Allowlisted, so it was served and stored rather than refused.
 	testing.expect_value(t, first, Outcome.Forwarded)
 	// Stored, or the refusal below is the dead mock's timeout and not the re-walk.
@@ -909,19 +894,20 @@ test_an_entry_that_turns_unreadable_on_a_later_walk_is_dropped :: proc(t: ^testi
 
 	// The re-walk now reaches the malformed record: refused, and the entry goes.
 	query := test_query("www.brand.example.")
-	_, second, _ := handle_query(&h.srv, query, .UDP, "127.0.0.2:5555", context.temp_allocator)
+	_, second, second_served := handle_query(&h.srv, query, .UDP, "127.0.0.2:5555", context.temp_allocator)
+	testing.expect(t, second_served, "the second query was not answered")
 	testing.expect_value(t, second, Outcome.Failed)
 	// From the entry, or the refusal above is the dead mock's timeout.
 	testing.expect(t, mock_untouched(h.socket, query), "the second query went upstream rather than to the stored entry")
 
 	// The upstream stops sending the malformed record. It must be asked again.
-	_, third, _, asked := harness_ask(
+	_, third, served, asked := harness_ask(
 		&h,
 		test_query("www.brand.example."),
 		chain_reply({"www.brand.example.", "good.brand.example."}),
 		client = "127.0.0.3:5555",
 	)
-	testing.expect(t, asked, "the upstream was never re-asked: the parse failure was pinned onto the entry")
+	testing.expect(t, asked && served, "the upstream was never re-asked: the parse failure was pinned onto the entry")
 	testing.expectf(t, third != .Failed, "the name stayed broken after a good answer was available (outcome=%v)", third)
 	free_all(context.temp_allocator)
 }
@@ -1031,17 +1017,7 @@ test_a_recheck_read_without_memory_keeps_the_entry :: proc(t: ^testing.T) {
 		return
 	}
 	spent: int
-	st := Query_State {
-		s         = &s,
-		query     = query,
-		msg       = msg,
-		q         = msg.question[0],
-		proto     = .UDP,
-		client    = "127.0.0.1:5555",
-		limit     = dns.MAX_UDP_SIZE,
-		spent     = &spent,
-		allocator = mem.nil_allocator(),
-	}
+	st := stage_state(&s, msg, &spent, mem.nil_allocator())
 	_, outcome, _ := serve_from_cache(&st, hit)
 	testing.expect_value(t, outcome, Outcome.Failed)
 

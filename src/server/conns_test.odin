@@ -44,7 +44,7 @@ wait_for_active :: proc(cm: ^Conn_Manager, want: int) -> int {
 		want: int,
 	}
 	a := Active{cm, want}
-	_ = wait_until(proc(data: rawptr) -> bool {
+	_ = wait_until(proc(data: rawptr) -> bool { // lint:allow the caller asserts the count returned
 			a := (^Active)(data)
 			return active_connections(a.cm) == a.want
 		}, &a, 2 * time.Second)
@@ -408,6 +408,7 @@ test_stopping_the_listener_loops_cancels_them :: proc(t: ^testing.T) {
 	if !testing.expect(t, start_test_loop(&tl), "no loop") {
 		return
 	}
+	defer stop_test_loop(&tl)
 	cm: Conn_Manager
 	conn_manager_init(&cm, 4, 0)
 	Parked :: struct {
@@ -435,6 +436,8 @@ test_stopping_the_listener_loops_cancels_them :: proc(t: ^testing.T) {
 		conn_manager_stop_permanent(st.cm)
 		sync.sema_post(&st.done)
 	})
+	// On a failure the manager is not shut down, nor the stopper joined: both
+	// wait for the parked fiber, which is what failed to end.
 	if !testing.expect(t, sync.sema_wait_with_timeout(&st.done, 5 * time.Second), "the listener loop was not cancelled") {
 		return
 	}
@@ -442,5 +445,4 @@ test_stopping_the_listener_loops_cancels_them :: proc(t: ^testing.T) {
 	thread.destroy(stopper)
 	testing.expect(t, sync.atomic_load(&p.finished), "the loop fiber never returned")
 	conn_manager_shutdown(&cm)
-	stop_test_loop(&tl)
 }

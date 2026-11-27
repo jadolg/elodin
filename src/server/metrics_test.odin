@@ -89,24 +89,43 @@ on a coincidence.
 test_every_counter_reaches_the_endpoint :: proc(t: ^testing.T) {
 	page := render_fixture(DISTINCT_STATS)
 
-	expect_line(t, page, "elodin_queries_total 1")
-	expect_line(t, page, `elodin_answers_total{outcome="blocked"} 2`)
-	expect_line(t, page, `elodin_answers_total{outcome="cached"} 3`)
-	expect_line(t, page, `elodin_answers_total{outcome="forwarded"} 4`)
-	expect_line(t, page, `elodin_answers_total{outcome="failed"} 5`)
-	expect_line(t, page, `elodin_answers_total{outcome="rewritten"} 6`)
-	expect_line(t, page, "elodin_queries_dropped_total 7")
-	expect_line(t, page, "elodin_accept_backoffs_total 16")
-	expect_line(t, page, "elodin_queries_refused_total 8")
-	expect_line(t, page, "elodin_connections_refused_total 9")
-	expect_line(t, page, "elodin_connections_failed_total 10")
-	expect_line(t, page, "elodin_tls_handshakes_total 11")
-	expect_line(t, page, `elodin_dnssec_answers_total{result="secure"} 12`)
-	expect_line(t, page, `elodin_dnssec_answers_total{result="bogus"} 13`)
-	expect_line(t, page, "elodin_rebind_refused_total 14")
-	expect_line(t, page, "elodin_special_use_total 15")
-	expect_line(t, page, "elodin_answers_coalesced_total 18")
-	expect_line(t, page, "elodin_queries_upstream_shed_total 19")
+	// Each field of `Stats` and its series, read from the endpoint below. The
+	// walk after it holds the table to every field there is.
+	series := []struct {
+		field, line: string,
+	} {
+		{field = "queries", line = "elodin_queries_total 1"},
+		{field = "blocked", line = `elodin_answers_total{outcome="blocked"} 2`},
+		{field = "cached", line = `elodin_answers_total{outcome="cached"} 3`},
+		{field = "forwarded", line = `elodin_answers_total{outcome="forwarded"} 4`},
+		{field = "failed", line = `elodin_answers_total{outcome="failed"} 5`},
+		{field = "rewritten", line = `elodin_answers_total{outcome="rewritten"} 6`},
+		{field = "dropped", line = "elodin_queries_dropped_total 7"},
+		{field = "refused", line = "elodin_queries_refused_total 8"},
+		{field = "conn_refused", line = "elodin_connections_refused_total 9"},
+		{field = "conn_failed", line = "elodin_connections_failed_total 10"},
+		{field = "handshakes", line = "elodin_tls_handshakes_total 11"},
+		{field = "secure", line = `elodin_dnssec_answers_total{result="secure"} 12`},
+		{field = "bogus", line = `elodin_dnssec_answers_total{result="bogus"} 13`},
+		{field = "rebind", line = "elodin_rebind_refused_total 14"},
+		{field = "special_use", line = "elodin_special_use_total 15"},
+		{field = "accept_backoff", line = "elodin_accept_backoffs_total 16"},
+		{field = "coalesced", line = "elodin_answers_coalesced_total 18"},
+		{field = "upstream_shed", line = "elodin_queries_upstream_shed_total 19"},
+	}
+	for name in reflect.struct_field_names(Stats) {
+		if name == "unreadable_rcode" {
+			continue
+		}
+		listed := false
+		for row in series {
+			if row.field == name {
+				expect_line(t, page, row.line)
+				listed = true
+			}
+		}
+		testing.expectf(t, listed, "Stats.%s has no series in this table", name)
+	}
 	/*
 	`unreadable_rcode` is the one counter whose series is not here, and
 	deliberately: it is published per upstream, because "which of the group is
