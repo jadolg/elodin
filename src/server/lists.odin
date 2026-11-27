@@ -67,9 +67,6 @@ List_Load :: enum u8 {
 	No_Memory,
 }
 
-// Why `read_cache_file` refuses a copy there is no memory to hold.
-NO_MEMORY_TO_READ :: "there is no memory to read it"
-
 // What a rebuild says when there is no memory to build the rule sets whole.
 NO_MEMORY_FOR_RULES :: "filter: there is no memory to build the rule sets; keeping the rules already in effect"
 
@@ -305,6 +302,9 @@ load_one_list :: proc(
 			warn_not_ascii(list.name, not_ascii)
 			delete(text)
 			text, load = cached_copy(cfg, list, .Stale)
+			if load == .No_Memory {
+				return load
+			}
 			if load == .Unavailable {
 				// The download arrived and holds nothing, and there is no copy
 				// to stand in: the list is empty, not lost, so it does not hold
@@ -378,6 +378,10 @@ list_contents :: proc(
 ) {
 	if list.file != "" {
 		data, err := os.read_entire_file(list.file, context.allocator)
+		if err != nil {
+			// What was read before the error is handed back with it.
+			delete(data)
+		}
 		if err == .Out_Of_Memory {
 			logx.warnf("list %s: there is no memory to read %q", list.name, list.file)
 			return "", .No_Memory, false
@@ -420,9 +424,35 @@ list_contents :: proc(
 	return
 }
 
-// The cached copy of a downloaded list, as `load` when it can be read.
+/*
+The cached copy of a downloaded list, as `load` when it can be read, and
+`.No_Memory` when an allocation naming, fingerprinting or reading it was
+refused: what those find with no memory - a path cut short, a fingerprint not
+read - is no verdict on the copy.
+*/
 @(private)
 cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Load) -> (string, List_Load) {
+	dry: bool
+	heap := dns.Dry_Watch{context.allocator, &dry}
+	temp := dns.Dry_Watch{context.temp_allocator, &dry}
+	text: string
+	got: List_Load
+	{
+		context.allocator = dns.dry_watch_allocator(&heap)
+		context.temp_allocator = dns.dry_watch_allocator(&temp)
+		text, got = read_cached_copy(cfg, list, load)
+	}
+	if dry {
+		delete(text)
+		logx.warnf("list %s: there is no memory to read the cached copy", list.name)
+		return "", .No_Memory
+	}
+	return text, got
+}
+
+// `cached_copy`, on the allocators it watches.
+@(private)
+read_cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Load) -> (string, List_Load) {
 	cache_path := list_cache_path(cfg, list)
 	// A copy of another query is another list: `?category=ads` does not stand
 	// in for `?category=malware`.
@@ -442,8 +472,7 @@ cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Loa
 		if why != "" {
 			logx.warnf("list %s: the cached copy at %s is not read: %s", list.name, cache_path, why)
 		}
-		// Not a copy lost: the rebuild is dropped and tried again.
-		return "", .No_Memory if why == NO_MEMORY_TO_READ else .Unavailable
+		return "", .Unavailable
 	}
 	// A page an earlier build cached before downloads were checked (#317).
 	if begins_with_markup(string(data)) {
@@ -598,7 +627,7 @@ read_cache_file :: proc(path: string, allocator := context.allocator) -> (data: 
 	*/
 	out, merr := make([]byte, int(st.st_size) + 1, allocator)
 	if merr != nil {
-		return nil, NO_MEMORY_TO_READ, false
+		return nil, "there is no memory to read it", false
 	}
 	n := 0
 	for n < len(out) {

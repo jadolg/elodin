@@ -73,8 +73,8 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   lists loaded), the load is dropped and every rule already in effect is kept,
   whatever the kind of list (`filter: there is no memory to build the rule
   sets; keeping the rules already in effect`, after `list NAME: there is no
-  memory to read "PATH"` for a `file:` list, or `list NAME: the cached copy at
-  PATH is not read: there is no memory to read it`). Lists after the one that
+  memory to read "PATH"` for a `file:` list, or `list NAME: there is no memory
+  to read the cached copy`). Lists after the one that
   ran out are not tried, and a download that was being read is not cached. At
   startup there are no rules in effect yet, so none apply until a retry
   succeeds. Sets missing a rule are never swapped in.
@@ -85,7 +85,8 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   (`blocklists: not every list is current; trying again in 1m0s`). A start that
   could not load every list is retried the same way. A missing `file:` list is
   not retried. A load dropped for want of memory is retried the same way even
-  under `--no-fetch` or `refresh: 0`, at most 1 hour apart, until it succeeds.
+  under `--no-fetch` or `refresh: 0`, at most 1 hour apart, until it succeeds
+  (`blocklists: there was no memory to build the rules; trying again in 1m0s`).
 - A rule costs about 35 bytes resident: its name, a flags byte and an 8-byte
   slot in a table kept at most 80% full. A load or refresh builds the new rule
   sets beside the ones in use and frees the old ones once they are swapped out,

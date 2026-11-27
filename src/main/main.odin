@@ -1227,7 +1227,7 @@ maintenance_loop :: proc(
 	refresh := server.live_config(s).blocking.refresh
 	m.retry = server.retry_after(lists_current, s.rules_no_memory, opts.no_fetch, refresh, 0)
 	if m.retry > 0 {
-		logx.warnf("blocklists: not every list is current; trying again in %v", m.retry)
+		warn_retry(s, m.retry)
 	}
 
 	for sync.atomic_load(&s.running) {
@@ -1328,6 +1328,16 @@ reload :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m
 	server.reload_tls(s, listeners)
 }
 
+// Say that the rules are built again after `retry`, and why.
+@(private)
+warn_retry :: proc(s: ^server.Server, retry: time.Duration) {
+	if s.rules_no_memory {
+		logx.warnf("blocklists: there was no memory to build the rules; trying again in %v", retry)
+		return
+	}
+	logx.warnf("blocklists: not every list is current; trying again in %v", retry)
+}
+
 // Take in a rebuild that is over, and start the one a reload asked for
 // meanwhile.
 @(private)
@@ -1346,7 +1356,7 @@ collect :: proc(s: ^server.Server, opts: Options, m: ^Maintenance) {
 	refresh := server.live_config(s).blocking.refresh
 	m.retry = server.retry_after(current, s.rules_no_memory, opts.no_fetch, refresh, 0 if m.after_reload else m.retry)
 	if m.retry > 0 {
-		logx.warnf("blocklists: not every list is current; trying again in %v", m.retry)
+		warn_retry(s, m.retry)
 	}
 	m.after_reload = false
 }

@@ -1114,32 +1114,86 @@ test_a_rebuild_without_memory_is_retried_whatever_the_refresh :: proc(t: ^testin
 	testing.expect(t, !refresh_due(false, day, 0, day - time.Second), "the interval's refresh is due early")
 }
 
-// A cached copy there is no memory to read drops the rebuild, as a `file:` list
-// does, rather than leaving its list out of a set swapped in (#765).
+/*
+A cached copy there is no memory to name, fingerprint or read drops the
+rebuild, as a `file:` list does, rather than leaving its list out of a set
+swapped in (#765). Each allocation `cached_copy` makes, in either allocator, is
+refused in turn: the copy is read whole or the load is `.No_Memory`, never
+taken for one of another url or a copy that is not there.
+*/
 @(test)
 test_a_cached_copy_with_no_memory_to_read_drops_the_rebuild :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	cfg, dir := list_test_dir(t, "no-memory-copy")
 	defer os.remove(dir)
-	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt", format = .Hosts, enabled = true}
+	// A query, so the copy is read only beside its fingerprint.
+	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt?key=k", format = .Hosts, enabled = true}
+	BODY :: "0.0.0.0 a.example\n"
+	save_cached_copy(&cfg, list, BODY)
 	path := list_cache_path(&cfg, list)
-	if !testing.expect(t, os.write_entire_file(path, "0.0.0.0 a.example\n") == nil, "cannot write the copy") {
-		return
-	}
 	defer os.remove(path)
+	defer os.remove(source_path(path))
 	// The premise: with memory, the copy loads.
 	text, load := cached_copy(&cfg, list, .Stale)
 	testing.expect_value(t, load, List_Load.Stale)
+	testing.expect_value(t, text, BODY)
 	delete(text)
 
-	f := testkit.Fail_Nth{backing = context.allocator, fail_at = 1, fail_for = 1 << 30}
-	{
-		context.allocator = testkit.fail_nth(&f)
-		text, load = cached_copy(&cfg, list, .Stale)
+	for temp in ([]bool{false, true}) {
+		refused := 0
+		for fail_at := 1; ; fail_at += 1 {
+			f := testkit.Fail_Nth{backing = context.temp_allocator if temp else context.allocator, fail_at = fail_at, fail_for = 1}
+			{
+				// Each scoped to this block: one allocator refuses, the other is as it was.
+				context.temp_allocator = testkit.fail_nth(&f) if temp else context.temp_allocator
+				context.allocator = context.allocator if temp else testkit.fail_nth(&f)
+				text, load = cached_copy(&cfg, list, .Stale)
+			}
+			if f.seen < fail_at {
+				testing.expectf(t, load == .Stale && text == BODY, "temp %v: with every allocation granted, %v %q", temp, load, text)
+				delete(text)
+				break
+			}
+			refused += 1
+			testing.expectf(t, load == .No_Memory || (load == .Stale && text == BODY), "temp %v, run %d: %v %q", temp, fail_at, load, text)
+			delete(text)
+		}
+		testing.expectf(t, refused > 0, "temp %v: no allocation was refused", temp)
 	}
-	testing.expect(t, f.seen > 0, "the allocator was not asked")
-	testing.expect_value(t, load, List_Load.No_Memory)
-	testing.expect_value(t, text, "")
+}
+
+/*
+A `file:` list whose read runs out of memory frees what was read before the
+refusal (#765): a file whose size reads as nothing is read a piece at a time,
+and the pieces read come back with the error.
+*/
+@(test)
+test_a_file_list_with_no_memory_to_read_frees_what_it_read :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	// Its size reads as nothing, and it holds more than one piece.
+	list := config.Block_List{name = "l", file = "/proc/self/status", format = .Hosts, enabled = true}
+	refused := 0
+	for fail_at := 1; ; fail_at += 1 {
+		f := testkit.Fail_Nth{backing = context.allocator, fail_at = fail_at, fail_for = 1}
+		text: string
+		load: List_Load
+		downloaded: bool
+		{
+			context.allocator = testkit.fail_nth(&f)
+			text, load, downloaded = list_contents(&cfg, list, false)
+		}
+		defer delete(text)
+		testing.expectf(t, !downloaded, "run %d: a file: list was downloaded", fail_at)
+		if f.seen < fail_at {
+			testing.expect_value(t, load, List_Load.Current)
+			break
+		}
+		refused += 1
+		testing.expectf(t, load == .No_Memory || load == .Current, "run %d: %v", fail_at, load)
+	}
+	// The premise: more than the first piece was asked for, so a refusal came
+	// with some already read.
+	testing.expectf(t, refused >= 2, "only %d allocations were refused", refused)
 }
 
 /*
