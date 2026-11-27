@@ -28,7 +28,7 @@ expect_loads :: proc(t: ^testing.T, src: string, loc := #caller_location) -> (cf
 /*
 Whether loading `src` is refused with a message holding every one of `wanted`
 (starting with each, given `prefix`, or equal to it, given `exact`);
-`exactly_one` also wants that message to be the only one. `tls_files` is
+`count`, when not 0, is how many refusals there are in all. `tls_files` is
 `load_string`'s.
 */
 @(private)
@@ -38,7 +38,7 @@ expect_refused :: proc(
 	wanted: ..string,
 	prefix := false,
 	exact := false,
-	exactly_one := false,
+	count := 0,
 	tls_files := true,
 	loc := #caller_location,
 ) -> bool {
@@ -47,7 +47,7 @@ expect_refused :: proc(
 	if !testing.expectf(t, has, "accepted, wanted a refusal naming %v, from:\n%s", wanted, src, loc = loc) {
 		return false
 	}
-	if exactly_one && !testing.expectf(t, len(e.messages) == 1, "wanted one refusal naming %v: %v", wanted, e.messages, loc = loc) {
+	if count != 0 && !testing.expectf(t, len(e.messages) == count, "wanted %d refusals, one naming %v: %v", count, wanted, e.messages, loc = loc) {
 		return false
 	}
 	matched: for m in e.messages {

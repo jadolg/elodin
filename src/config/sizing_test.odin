@@ -104,7 +104,7 @@ refused like any other. The connection walk bound is not one of them.
 test_the_worker_keys_are_refused :: proc(t: ^testing.T) {
 	for key in ([]string{"workers", "upstream_workers", "running_workers"}) {
 		doc := fmt.tprintf(MINIMAL + "server:\n  %s: 8\n", key)
-		expect_refused(t, doc, fmt.tprintf("server.%s: unknown key", key), exact = true, exactly_one = true)
+		expect_refused(t, doc, fmt.tprintf("server.%s: unknown key", key), exact = true, count = 1)
 	}
 	if cfg, ok := expect_loads(t, MINIMAL + "dnssec:\n  max_connection_walks: 24\n"); ok {
 		testing.expect_value(t, cfg.dnssec.max_connection_walks, 24)

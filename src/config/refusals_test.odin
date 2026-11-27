@@ -1,6 +1,8 @@
 package config
 
 import "core:fmt"
+import "core:slice"
+import "core:strings"
 import "core:testing"
 import "elodin:dns"
 
@@ -65,26 +67,44 @@ that names none is still told it needs one.
 @(test)
 test_a_refused_server_is_reported_once :: proc(t: ^testing.T) {
 	ROUTE :: MINIMAL + "  zones:\n    - domains: [corp.example]\n      servers: "
-	expect_refused(t, ROUTE + "10.0.0.1\n", "upstream.zones[0].servers: expected a list", prefix = true, exactly_one = true)
-	expect_refused(t, ROUTE + "[\"tls://\"]\n", "upstream.zones[0].servers[0]: cannot parse", prefix = true, exactly_one = true)
-	expect_refused(t, "upstream:\n  servers: 1.1.1.1\n", "upstream.servers: expected a list", prefix = true, exactly_one = true)
+	expect_refused(t, ROUTE + "10.0.0.1\n", "upstream.zones[0].servers: expected a list", prefix = true, count = 1)
+	expect_refused(t, ROUTE + "[\"tls://\"]\n", "upstream.zones[0].servers[0]: cannot parse", prefix = true, count = 1)
+	expect_refused(t, "upstream:\n  servers: 1.1.1.1\n", "upstream.servers: expected a list", prefix = true, count = 1)
 	expect_refused(
 		t,
 		"upstream:\n  servers: [\"tls://1.1.1.1:853\"]\n",
 		"upstream.servers[0]: verify is on",
 		prefix = true,
-		exactly_one = true,
+		count = 1,
 	)
 	expect_refused(
 		t,
 		"upstream:\n  servers: [\"tls://1.1.1.1:853\", 9.9.9.9]\n",
 		"upstream.servers[0]: verify is on",
 		prefix = true,
-		exactly_one = true,
+		count = 1,
 	)
-	expect_refused(t, "log:\n  level: info\n", "upstream.servers: at least one upstream server is required", exact = true, exactly_one = true)
-	expect_refused(t, "upstream:\n  servers: []\n", "upstream.servers: at least one upstream server is required", exact = true, exactly_one = true)
-	expect_refused(t, ROUTE + "[]\n", "upstream.zones: the route for corp.example. needs at least one server", exact = true, exactly_one = true)
+	expect_refused(t, "log:\n  level: info\n", "upstream.servers: at least one upstream server is required", exact = true, count = 1)
+	expect_refused(t, "upstream:\n  servers: []\n", "upstream.servers: at least one upstream server is required", exact = true, count = 1)
+	expect_refused(t, ROUTE + "[]\n", "upstream.zones: the route for corp.example. needs at least one server", exact = true, count = 1)
+	free_all(context.temp_allocator)
+}
+
+// A route whose every server is refused is still checked for its other
+// mistakes, so a second --check finds nothing the first one could have said.
+@(test)
+test_a_route_with_no_server_left_is_still_validated :: proc(t: ^testing.T) {
+	src := MINIMAL + "  zones:\n    - domains: [corp.example]\n      attempts: 0\n      servers: [\"tls://\"]\n"
+	_, err := load_string(src, context.temp_allocator)
+	e, has := err.?
+	if !testing.expectf(t, has, "accepted:\n%s", src) {
+		return
+	}
+	testing.expectf(t, len(e.messages) == 2, "wanted the server and the attempts, nothing else: %v", e.messages)
+	testing.expectf(t, slice.any_of_proc(e.messages, proc(m: string) -> bool {
+		return strings.has_prefix(m, "upstream.zones[0].servers[0]: cannot parse")
+	}), "the server is not reported: %v", e.messages)
+	testing.expectf(t, slice.contains(e.messages, "upstream.zones: the route for corp.example. needs attempts of at least 1"), "the attempts are not reported: %v", e.messages)
 	free_all(context.temp_allocator)
 }
 

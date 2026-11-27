@@ -102,7 +102,7 @@ test_a_misshapen_entry_is_one_error :: proc(t: ^testing.T) {
 			MINIMAL + "blocking:\n  lists:\n    - [a, b]\n",
 			"upstream:\n  servers:\n    - 1.1.1.1\n    - [9.9.9.9]\n",
 		}) {
-		expect_refused(t, src, "expected a mapping", exactly_one = true)
+		expect_refused(t, src, "expected a mapping", count = 1)
 	}
 	free_all(context.temp_allocator)
 }

@@ -327,7 +327,7 @@ test_a_bad_inherited_attempts_is_reported_once :: proc(t: ^testing.T) {
 		"    - domains: [lab.example]\n      servers: [10.0.0.2]\n",
 		"upstream.attempts must be at least 1",
 		exact = true,
-		exactly_one = true,
+		count = 1,
 	)
 
 	// A route that writes the number itself is still its own error.
@@ -466,7 +466,7 @@ test_a_trust_anchor_set_without_the_root_is_refused :: proc(t: ^testing.T) {
 		src("  trust_anchors:\n    - \". IN DS 20326 8 2 NOTHEXATALL\"\n"),
 		"dnssec.trust_anchors[0]:",
 		"is not a DS record",
-		exactly_one = true,
+		count = 1,
 	)
 
 	/*

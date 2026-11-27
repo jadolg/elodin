@@ -360,7 +360,7 @@ test_cookie_secret_must_be_hex :: proc(t: ^testing.T) {
 	for key in ([]string{"secret", "previous_secret"}) {
 		other := "previous_secret" if key == "secret" else "secret"
 		src := fmt.tprintf("%scookies:\n  %s: not-a-secret\n  %s: e5e973e5a6b2a43f48e7dc849e37bfcf\n", MINIMAL, key, other)
-		expect_refused(t, src, fmt.tprintf("cookies.%s must be", key), prefix = true, exactly_one = true)
+		expect_refused(t, src, fmt.tprintf("cookies.%s must be", key), prefix = true, count = 1)
 	}
 	free_all(context.temp_allocator)
 }
@@ -370,7 +370,7 @@ test_cookie_secret_must_be_hex :: proc(t: ^testing.T) {
 @(test)
 test_cookie_previous_secret_needs_a_secret :: proc(t: ^testing.T) {
 	src := MINIMAL + "cookies:\n  previous_secret: e5e973e5a6b2a43f48e7dc849e37bfcf\n"
-	expect_refused(t, src, "cookies.previous_secret needs cookies.secret", prefix = true, exactly_one = true)
+	expect_refused(t, src, "cookies.previous_secret needs cookies.secret", prefix = true, count = 1)
 	free_all(context.temp_allocator)
 }
 
@@ -380,7 +380,7 @@ test_cookie_require_needs_the_client_facing_side :: proc(t: ^testing.T) {
 	// are a setting that does nothing. Said at `--check` rather than left to be
 	// discovered when the attack it was turned on for arrives.
 	src := MINIMAL + "cookies:\n  enabled: false\n  require: true\n"
-	expect_refused(t, src, "cookies.require needs cookies.enabled", prefix = true, exactly_one = true)
+	expect_refused(t, src, "cookies.require needs cookies.enabled", prefix = true, count = 1)
 	free_all(context.temp_allocator)
 }
 
@@ -429,14 +429,14 @@ test_special_use_extras_need_the_table :: proc(t: ^testing.T) {
 	// Nothing looks at `local` or `test` with `enabled` off, so the pair reads
 	// as a leak that was stopped and was not. Said at `--check`.
 	src := MINIMAL + "special_use:\n  enabled: false\n  local: true\n"
-	expect_refused(t, src, "special_use.local needs special_use.enabled", prefix = true, exactly_one = true)
+	expect_refused(t, src, "special_use.local needs special_use.enabled", prefix = true, count = 1)
 
 	// `home_arpa` is in the same check, and is the one where the misreading
 	// costs the most: it exists to stop a leak, so an operator who wrote it down
 	// under `enabled: false` believes their own hostnames are staying on the
 	// network while they are being forwarded.
 	hsrc := MINIMAL + "special_use:\n  enabled: false\n  home_arpa: true\n"
-	expect_refused(t, hsrc, "special_use.home_arpa needs special_use.enabled", prefix = true, exactly_one = true)
+	expect_refused(t, hsrc, "special_use.home_arpa needs special_use.enabled", prefix = true, count = 1)
 
 	// `onion` is not part of that check and must not be: it is on by default, so
 	// turning the table off without mentioning it is the ordinary way to do it
@@ -451,7 +451,7 @@ test_special_use_extras_need_the_table :: proc(t: ^testing.T) {
 
 @(test)
 test_missing_upstream_is_an_error :: proc(t: ^testing.T) {
-	expect_refused(t, "log:\n  level: info\n", "upstream.servers: at least one upstream server is required", exact = true, exactly_one = true)
+	expect_refused(t, "log:\n  level: info\n", "upstream.servers: at least one upstream server is required", exact = true, count = 1)
 	free_all(context.temp_allocator)
 }
 
@@ -460,7 +460,7 @@ test_unknown_enum_values_reported :: proc(t: ^testing.T) {
 	src := "upstream:\n  strategy: teleport\n  servers: [1.1.1.1]\nblocking:\n  response: explode\n"
 	// Both, not only the first.
 	expect_refused(t, src, "upstream.strategy: unknown strategy \"teleport\"", prefix = true)
-	expect_refused(t, src, "blocking.response: unknown mode \"explode\"", prefix = true)
+	expect_refused(t, src, "blocking.response: unknown mode \"explode\"", prefix = true, count = 2)
 	free_all(context.temp_allocator)
 }
 
@@ -472,7 +472,7 @@ Left to a caching server that has switched caching off, it is nothing at all.
 @(test)
 test_cache_byte_budget_is_checked :: proc(t: ^testing.T) {
 	too_small := MINIMAL + "cache:\n  max_bytes: 64KiB\n"
-	expect_refused(t, too_small, "cache.max_bytes must be at least", prefix = true, exactly_one = true)
+	expect_refused(t, too_small, "cache.max_bytes must be at least", prefix = true, count = 1)
 
 	// A cache that is switched off is not sized.
 	expect_loads(t, MINIMAL + "cache:\n  enabled: false\n  max_bytes: 64KiB\n")
@@ -489,7 +489,7 @@ and a limiter that is switched off is not sized at all.
 @(test)
 test_rate_limit_settings_are_checked :: proc(t: ^testing.T) {
 	zero := MINIMAL + "server:\n  rate_limit:\n    responses_per_second: 0\n"
-	expect_refused(t, zero, "server.rate_limit.responses_per_second must be at least 1", exact = true, exactly_one = true)
+	expect_refused(t, zero, "server.rate_limit.responses_per_second must be at least 1", exact = true, count = 1)
 
 	negative := MINIMAL + "server:\n  rate_limit:\n    slip: -1\n"
 	expect_refused(t, negative, "server.rate_limit.slip must not be negative", exact = true)
@@ -544,7 +544,7 @@ test_a_response_size_estimate_out_of_bounds_is_refused :: proc(t: ^testing.T) {
 	tiny := MINIMAL + "server:\n  rate_limit:\n    response_size_estimate: 8\n"
 	BOUNDS :: "server.rate_limit.response_size_estimate must be between"
 	NOT_A_SIZE :: "server.rate_limit.response_size_estimate: expected a size"
-	expect_refused(t, tiny, BOUNDS, prefix = true, exactly_one = true)
+	expect_refused(t, tiny, BOUNDS, prefix = true, count = 1)
 
 	huge := MINIMAL + "server:\n  rate_limit:\n    response_size_estimate: 64KiB\n"
 	expect_refused(t, huge, BOUNDS, prefix = true)
@@ -572,7 +572,7 @@ test_a_response_size_estimate_out_of_bounds_is_refused :: proc(t: ^testing.T) {
 	beside the message that already says what is actually wrong with it.
 	*/
 	unparseable := MINIMAL + "server:\n  rate_limit:\n    response_size_estimate: abc\n"
-	expect_refused(t, unparseable, NOT_A_SIZE, prefix = true, exactly_one = true)
+	expect_refused(t, unparseable, NOT_A_SIZE, prefix = true, count = 1)
 
 	/*
 	None of which applies with the limiter off.
@@ -736,7 +736,7 @@ test_rate_limit_overrides_are_checked :: proc(t: ^testing.T) {
 		with_overrides("      - 198.51.100.0/24\n"),
 		"server.rate_limit.overrides[0]: expected a network and the figures it gets",
 		prefix = true,
-		exactly_one = true,
+		count = 1,
 	)
 
 	// And overrides beside a limiter that is switched off, which is an operator
@@ -837,10 +837,10 @@ not want checking.
 test_verifying_dot_upstream_requires_a_hostname :: proc(t: ^testing.T) {
 	SHORTHAND :: "upstream:\n  servers: [tls://1.1.1.1:853]\n"
 	NO_NAME :: "upstream.servers[0]: verify is on but there is no hostname to check the certificate against"
-	expect_refused(t, SHORTHAND, NO_NAME, prefix = true, exactly_one = true)
+	expect_refused(t, SHORTHAND, NO_NAME, prefix = true, count = 1)
 
 	MAPPING :: "upstream:\n  servers:\n    - type: tls\n      address: 1.1.1.1\n"
-	expect_refused(t, MAPPING, NO_NAME, prefix = true, exactly_one = true)
+	expect_refused(t, MAPPING, NO_NAME, prefix = true, count = 1)
 
 	free_all(context.temp_allocator)
 }
@@ -970,7 +970,7 @@ test_allow_from_empty_is_a_public_resolver :: proc(t: ^testing.T) {
 test_allow_from_reports_every_bad_entry :: proc(t: ^testing.T) {
 	src := MINIMAL + "server:\n  allow_from: [\"10.0.0.0/8\", \"nonsense\", \"::1/999\"]\n"
 	expect_refused(t, src, "server.allow_from[1]: \"nonsense\"", prefix = true)
-	expect_refused(t, src, "server.allow_from[2]: \"::1/999\"", prefix = true)
+	expect_refused(t, src, "server.allow_from[2]: \"::1/999\"", prefix = true, count = 2)
 	free_all(context.temp_allocator)
 }
 
@@ -1523,7 +1523,7 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 		{MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"SRV 1 1 53 192.0.2.1\"\n", "rewrites[0].answers: SRV host \"192.0.2.1\" is an address, and an SRV points at a name"},
 	}
 	for c in SOURCES {
-		expect_refused(t, c.src, c.want, exact = true, exactly_one = true)
+		expect_refused(t, c.src, c.want, exact = true, count = 1)
 	}
 	_, network := parse_prefix("]:53")
 	testing.expect(t, !network, "nor is it a network")
@@ -1537,24 +1537,24 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 			MINIMAL + "listeners:\n  udp: { enabled: true, address: \"127.0.0.1:5353\" }\n",
 			MINIMAL + "metrics:\n  enabled: true\n  address: \"127.0.0.1:9100\"\n",
 		}) {
-		expect_refused(t, src, "a port goes in port:", exactly_one = true)
+		expect_refused(t, src, "a port goes in port:", count = 1)
 	}
 	// On https the authority's port is the url's, so that is where a hostname's goes.
 	expect_refused(
 		t,
 		"upstream:\n  servers:\n    - { url: \"https://1.1.1.1/dns-query\", hostname: \"dns.example:8443\" }\n",
 		"a port goes in the url",
-		exactly_one = true,
+		count = 1,
 	)
 	// An address where a name goes is called one.
-	expect_refused(t, MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 1.2.3.4\"\n", "is an address", exactly_one = true)
+	expect_refused(t, MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"CNAME 1.2.3.4\"\n", "is an address", count = 1)
 	// A bracketed literal is told to drop the brackets, on each source.
 	for src in ([]string {
 			"upstream:\n  servers:\n    - { address: \"[2606:4700::1111]\" }\n",
 			MINIMAL + "listeners:\n  udp: { enabled: true, address: \"[::]\" }\n",
 			MINIMAL + "metrics:\n  enabled: true\n  address: \"[::1]\"\n",
 		}) {
-		expect_refused(t, src, "without brackets", exactly_one = true)
+		expect_refused(t, src, "without brackets", count = 1)
 	}
 
 	// And only when there is one: a bracketed literal has no port to move, and
@@ -1564,7 +1564,7 @@ test_an_address_or_port_out_of_shape_is_a_config_error :: proc(t: ^testing.T) {
 			MINIMAL + "listeners:\n  udp: { enabled: true, address: \"[::]\" }\n",
 			MINIMAL + "rewrites:\n  - domain: example.com\n    answers: \"[::1]\"\n",
 		}) {
-		expect_refused(t, src, "brackets", exactly_one = true)
+		expect_refused(t, src, "brackets", count = 1)
 	}
 
 	// A listener that does not bind is not held to an address it never uses.

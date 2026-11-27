@@ -43,7 +43,7 @@ test_a_doh_upstream_keeps_its_query :: proc(t: ^testing.T) {
 		"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{url: \"dns.example/dns-query\"}]\n",
 		"upstream.servers[0].url: expected an https:// url",
 		exact = true,
-		exactly_one = true,
+		count = 1,
 	)
 	free_all(context.temp_allocator)
 }

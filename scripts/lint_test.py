@@ -94,6 +94,12 @@ CODE = [
     ('s := "512 bytes"\n', 1, False),
     ("/*\nthe 1232 ceiling\n*/\n", 2, False),
     ("x := 5120 + 0.512 + v512\n", 1, False),
+    ("MAX : u16 : 65535\n", 1, False),
+    ("read_reply :: proc(buf: []u8, limit := 1232) -> int {\n", 1, True),
+    ("Frame :: struct { data: [512]u8 }\n", 1, True),
+    ("/* outer /* inner */ replies over 512 bytes */\n", 1, False),
+    ("/* a /* b */ c */ n := 512\n", 1, True),
+    ("c := '\"' // 512\n", 1, False),
 ]
 for source, n, want in CODE:
     hits = []

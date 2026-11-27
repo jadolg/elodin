@@ -19,7 +19,7 @@ of a timeout past about 1.28 million hours overflow into a spent budget.
 test_an_upstream_timeout_outside_1ms_to_24h_is_refused :: proc(t: ^testing.T) {
 	// The bound's refusal and nothing else: a parse error names the key too.
 	refused :: proc(t: ^testing.T, doc, key: string, loc := #caller_location) {
-		expect_refused(t, doc, key, "1ms to 24h:", exactly_one = true, loc = loc)
+		expect_refused(t, doc, key, "1ms to 24h:", count = 1, loc = loc)
 	}
 	refused(t, "upstream:\n  timeout: 0s\n  servers: [1.1.1.1]\n", "upstream.timeout")
 	refused(t, "upstream:\n  timeout: 0.5ms\n  servers: [1.1.1.1]\n", "upstream.timeout")

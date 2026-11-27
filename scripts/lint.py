@@ -76,21 +76,49 @@ ADDED = [
 ]
 
 
-# Added code only: comments and strings may name the figure. A `::` line is the
-# constant declaring it.
-SIZE_LITERAL = ("size-literal", r"^(?!.*::).*?(?<![\w.])(512|1232|65535)(?![\w.])", lambda p: True,
+# Added code only: comments and strings may name the figure. A constant's own
+# declaration (`NAME :: 512`, `NAME : u16 : 512`) is where it is named.
+SIZE_LITERAL = ("size-literal", r"(?<![\w.])(512|1232|65535)(?![\w.])", lambda p: True,
                 "name the size: dns.MAX_UDP_SIZE, config.DEFAULT_MAX_UDP_RESPONSE, server.UPSTREAM_UDP_SIZE, dns.MAX_MESSAGE")
+CONSTANT = re.compile(r"^\s*[A-Za-z_]\w*\s*:[^=:]*:(?!\s*(#\w+\s+)*(proc|struct|union|enum|bit_set|bit_field)\b)")
 
 
 def code_only(source):
-    """`source` with its comments and literals blanked, line breaks kept."""
-    return NOT_CODE.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), source).splitlines()
+    """`source` with its comments and literals blanked, line breaks kept. Block comments nest, as Odin's do."""
+    out = list(source)
+
+    def blank(a, b):
+        for k in range(a, min(b, len(out))):
+            if out[k] != "\n":
+                out[k] = " "
+
+    i = 0
+    while i < len(source):
+        if source.startswith("//", i):
+            end = source.find("\n", i)
+            end = len(source) if end < 0 else end
+        elif source.startswith("/*", i):
+            depth, end = 1, i + 2
+            while end < len(source) and depth:
+                step = source[end:end + 2]
+                depth += 1 if step == "/*" else -1 if step == "*/" else 0
+                end += 2 if step in ("/*", "*/") else 1
+        elif source[i] in "\"'`":
+            end = skip_literal(source, i) + 1
+        else:
+            i += 1
+            continue
+        blank(i, end)
+        i = end
+    return "".join(out).splitlines()
 
 
 def check_code(path, n, text, code, hits):
     """The rules that read code, not comments or literals, on added line `n` (`text` as written)."""
     name, pattern, applies, message = SIZE_LITERAL
-    if n <= len(code) and applies(path) and not ALLOW.search(text) and re.search(pattern, code[n - 1]):
+    if n > len(code) or not applies(path) or ALLOW.search(text) or CONSTANT.match(code[n - 1]):
+        return
+    if re.search(pattern, code[n - 1]):
         hits.append(f"{path}:{n}: {name}: {message}\n    {text.strip()}")
 
 

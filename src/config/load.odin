@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:mem"
 import "core:net"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:time"
 import "core:unicode"
@@ -29,6 +30,8 @@ Loader :: struct {
 	tls_files:       bool,
 	// `upstream.servers` named servers, and every one was refused and reported.
 	servers_refused: bool,
+	// The same, for these indexes into `upstream.zones`.
+	routes_refused:  [dynamic]int,
 }
 
 @(private)
@@ -69,10 +72,11 @@ load_string :: proc(src: string, allocator := context.allocator, tls_files := tr
 	}
 
 	l := Loader {
-		root      = root,
-		errors    = make([dynamic]string, 0, 4, allocator),
-		allocator = allocator,
-		tls_files = tls_files,
+		root           = root,
+		errors         = make([dynamic]string, 0, 4, allocator),
+		allocator      = allocator,
+		tls_files      = tls_files,
+		routes_refused = make([dynamic]int, allocator),
 	}
 	cfg = default_config()
 
@@ -1034,7 +1038,8 @@ load_upstream :: proc(l: ^Loader, cfg: ^Config) {
 		"zones",
 	)
 	load_group_fields(l, n, &cfg.upstream, "upstream")
-	l.servers_refused = !load_servers(l, n, &cfg.upstream, "upstream")
+	_, kept := load_servers(l, n, &cfg.upstream, "upstream")
+	l.servers_refused = !kept
 	load_upstream_zones(l, cfg, n)
 }
 
@@ -1057,17 +1062,17 @@ load_group_fields :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Upstream_Config, path
 
 /*
 A group's `servers`, each with the group's bootstrap as its default. Left out or
-empty, `dst.servers` keeps what it held. False when the key holds something
-other than a list: as in `load_block_lists`, `items` answers nil for one server
-written without its "-", which would be reported as no server at all. False too
-when it lists servers and every one is refused: each is reported here, and a
-group with none left is not worth a second line.
+empty, `dst.servers` keeps what it held. `listed` is false when the key holds
+something other than a list: as in `load_block_lists`, `items` answers nil for
+one server written without its "-", which would be reported as no server at
+all. `kept` is false too when it lists servers and every one is refused: each is
+reported here, and a group with none left is not worth a second line.
 */
 @(private)
-load_servers :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Upstream_Config, path: string) -> bool {
+load_servers :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Upstream_Config, path: string) -> (listed, kept: bool) {
 	if s := yaml.get(n, "servers"); !yaml.is_null(s) && s.kind != .Sequence {
 		errorf(l, "%s.servers: expected a list of servers, with a \"-\" in front of each one", path)
-		return false
+		return false, false
 	}
 	if servers := yaml.items(yaml.get(n, "servers")); len(servers) > 0 {
 		out := make([dynamic]Upstream_Spec, 0, len(servers), l.allocator)
@@ -1078,9 +1083,9 @@ load_servers :: proc(l: ^Loader, n: ^yaml.Node, dst: ^Upstream_Config, path: str
 			}
 		}
 		dst.servers = out[:]
-		return len(out) > 0
+		return true, len(out) > 0
 	}
-	return true
+	return true, true
 }
 
 /*
@@ -1167,13 +1172,17 @@ load_upstream_zones :: proc(l: ^Loader, cfg: ^Config, n: ^yaml.Node) {
 
 		load_group_fields(l, entry, &route.upstream, path)
 		route.domains = load_route_domains(l, entry, path, i, &claimed)
-		// A route whose `servers` is not a list, or whose every server is
-		// refused, is refused outright rather than appended to be reported by
-		// `validate` as a route with no servers.
-		if !load_servers(l, entry, &route.upstream, path) {
+		// A route whose `servers` is not a list is refused outright rather than
+		// appended to be reported by `validate` as a route with no servers. One
+		// whose every server is refused is kept, so `validate` still reports
+		// the route's other mistakes, but not that it has no servers.
+		listed, kept := load_servers(l, entry, &route.upstream, path)
+		if !listed {
 			continue
 		}
-
+		if !kept {
+			append(&l.routes_refused, len(routes))
+		}
 		append(&routes, route)
 	}
 	cfg.upstream.zones = routes[:]
@@ -1555,26 +1564,26 @@ check_spec_hostname :: proc(l: ^Loader, spec: Upstream_Spec, path: string) -> bo
 // `type`, or the kind `url` implies; false where `type` names none.
 @(private)
 load_upstream_kind :: proc(l: ^Loader, n: ^yaml.Node, path: string, spec: ^Upstream_Spec) -> bool {
-kind_str: string
-if opt_string(l, n, "type", &kind_str, path) {
-	switch dns.name_fold(kind_str, l.allocator) {
-	case "udp", "plain", "dns":
-		spec.kind = .UDP
-	case "tcp":
-		spec.kind = .TCP
-	case "tls", "dot", "dns-over-tls":
-		spec.kind = .TLS
-	case "https", "doh", "dns-over-https":
+	kind_str: string
+	if opt_string(l, n, "type", &kind_str, path) {
+		switch dns.name_fold(kind_str, l.allocator) {
+		case "udp", "plain", "dns":
+			spec.kind = .UDP
+		case "tcp":
+			spec.kind = .TCP
+		case "tls", "dot", "dns-over-tls":
+			spec.kind = .TLS
+		case "https", "doh", "dns-over-https":
+			spec.kind = .HTTPS
+		case:
+			errorf(l, "%s.type: unknown type %q (want udp, tcp, tls or https)", path, kind_str)
+			return false
+		}
+	} else if spec.url != "" {
 		spec.kind = .HTTPS
-	case:
-		errorf(l, "%s.type: unknown type %q (want udp, tcp, tls or https)", path, kind_str)
-		return false
+	} else {
+		spec.kind = .UDP
 	}
-} else if spec.url != "" {
-	spec.kind = .HTTPS
-} else {
-	spec.kind = .UDP
-}
 	return true
 }
 
@@ -3032,13 +3041,13 @@ that points at the wrong route is worse than no index at all.
 */
 @(private)
 validate_routes :: proc(l: ^Loader, cfg: ^Config) {
-	for route in cfg.upstream.zones {
+	for route, i in cfg.upstream.zones {
 		if len(route.domains) == 0 {
 			// Already reported by the loader, which refused every domain it was
 			// given; a second line saying the route is empty adds nothing.
 			continue
 		}
-		if len(route.upstream.servers) == 0 {
+		if len(route.upstream.servers) == 0 && !slice.contains(l.routes_refused[:], i) {
 			errorf(l, "upstream.zones: the route for %s needs at least one server", route.domains[0])
 		}
 		// Only where the route is the one that said so. `attempts` is inherited,
