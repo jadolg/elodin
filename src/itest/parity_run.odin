@@ -3,9 +3,8 @@ package itest
 import "core:encoding/hex"
 import "core:fmt"
 import "core:net"
-import "core:strconv"
 import "core:strings"
-import "core:time"
+import "elodin:netx"
 
 /*
 Driving one parity query and reporting on a run of them.
@@ -79,10 +78,15 @@ make it too or the two are not being asked the same thing.
 */
 @(private)
 parity_ask_reference :: proc(host: string, port: int, query: []u8) -> (answer: []u8, ok: bool) {
-	answer, ok = parity_ask_udp(host, port, query)
-	if !ok {
+	address := net.parse_address(host)
+	if address == nil {
 		return nil, false
 	}
+	res := query_udp(port, query, context.temp_allocator, address = address, match_id = true)
+	if !res.ok {
+		return nil, false
+	}
+	answer = res.wire
 	m := pw_parse(answer, context.temp_allocator)
 	if !m.ok || !m.tc {
 		return answer, true
@@ -101,58 +105,6 @@ parity_ask_tcp :: proc(host: string, port: int, query: []u8) -> (answer: []u8, o
 	defer net.close(conn.socket)
 	res := stream_query(&conn, query, context.temp_allocator)
 	return res.wire, res.ok
-}
-
-// One query straight to a resolver somewhere else, over UDP only.
-@(private = "file")
-parity_ask_udp :: proc(host: string, port: int, query: []u8) -> (answer: []u8, ok: bool) {
-	address := net.parse_address(host)
-	if address == nil {
-		return nil, false
-	}
-	family: net.Address_Family = .IP4
-	if _, is_v6 := address.(net.IP6_Address); is_v6 {
-		family = .IP6
-	}
-	socket, err := net.make_unbound_udp_socket(family)
-	if err != nil {
-		return nil, false
-	}
-	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, CLIENT_TIMEOUT)
-	_ = net.set_option(socket, .Send_Timeout, CLIENT_TIMEOUT)
-
-	endpoint := net.Endpoint {
-		address = address,
-		port    = port,
-	}
-	if _, serr := net.send_udp(socket, query, endpoint); serr != nil {
-		return nil, false
-	}
-
-	buf := make([]u8, 65535, context.temp_allocator)
-	// One deadline over the whole sweep, not one per datagram. The receive
-	// timeout restarts on every `recv_udp`, so a stream of datagrams carrying
-	// other transaction ids would keep this loop alive indefinitely; the
-	// equivalent loop in src/upstream/plain.odin is bounded the same way.
-	deadline := time.tick_add(time.tick_now(), CLIENT_TIMEOUT)
-	for {
-		if time.tick_diff(time.tick_now(), deadline) < 0 {
-			return nil, false
-		}
-		n, _, rerr := net.recv_udp(socket, buf)
-		if rerr != nil || n < 12 {
-			return nil, false
-		}
-		// A datagram carrying somebody else's transaction id is not this
-		// query's answer, whoever sent it.
-		if pw_u16(buf, 0) != pw_u16(query, 0) {
-			continue
-		}
-		out := make([]u8, n, context.temp_allocator)
-		copy(out, buf[:n])
-		return out, true
-	}
 }
 
 /*
@@ -443,8 +395,9 @@ parity_split_host_port :: proc(s: string) -> (host: string, port: int, ok: bool)
 		if !strings.has_prefix(rest, ":") {
 			return "", 0, false
 		}
-		port, ok = strconv.parse_int(rest[1:])
-		if !ok || port < 1 || port > 65535 {
+		p, digits := netx.parse_decimal(rest[1:], 65535)
+		port = int(p)
+		if !digits || port < 1 {
 			return "", 0, false
 		}
 		return host, port, true
@@ -455,8 +408,9 @@ parity_split_host_port :: proc(s: string) -> (host: string, port: int, ok: bool)
 		// No colon at all, or several - a bare address either way.
 		return s, 53, true
 	}
-	port, ok = strconv.parse_int(s[i + 1:])
-	if !ok || port < 1 || port > 65535 {
+	p, digits := netx.parse_decimal(s[i + 1:], 65535)
+	port = int(p)
+	if !digits || port < 1 {
 		return "", 0, false
 	}
 	return s[:i], port, true

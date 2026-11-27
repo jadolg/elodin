@@ -45,6 +45,9 @@ DEFAULT_DNSSEC :: `dnssec:
   enabled: true
 `
 
+// Validation off, for a case about routing alone.
+DNSSEC_OFF :: "dnssec: { enabled: false }\n"
+
 /*
 A `DS` answer for `name`, as a parent that signs its delegation gives one.
 
@@ -385,7 +388,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 			denied_port,
 			{public_port},
 			zone_route("denied.example", internal_port),
-			dnssec = "dnssec: { enabled: false }\n",
+			dnssec = DNSSEC_OFF,
 			rebind = false,
 		)
 		denied, started := start_server(r, Server_Options{config = config, udp_port = denied_port})
@@ -423,7 +426,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 			signed_port,
 			{public_port},
 			zone_route("signed.example", internal_port),
-			dnssec = "dnssec: { enabled: false }\n",
+			dnssec = DNSSEC_OFF,
 			rebind = false,
 		)
 		signed, started := start_server(r, Server_Options{config = config, udp_port = signed_port})
@@ -472,7 +475,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 				split_port,
 				{dissent_port, public_port},
 				zone_route("split.example, split-signed.example", internal_port),
-				dnssec = "dnssec: { enabled: false }\n",
+				dnssec = DNSSEC_OFF,
 				rebind = false,
 				strategy = "round_robin",
 			)
@@ -529,7 +532,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 				spare_port,
 				{public_port, silent_port},
 				zone_route("denied.example", internal_port),
-				dnssec = "dnssec: { enabled: false }\n",
+				dnssec = DNSSEC_OFF,
 				rebind = false,
 				strategy = "failover",
 			)
@@ -561,7 +564,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 		at the parent.
 		*/
 		held_port := next_port(r)
-		config := routed_config(held_port, {public_port}, zone_route("held.example", internal_port), dnssec = "dnssec: { enabled: false }\n")
+		config := routed_config(held_port, {public_port}, zone_route("held.example", internal_port), dnssec = DNSSEC_OFF)
 		held, started := start_server(r, Server_Options{config = config, udp_port = held_port})
 		if started {
 			defer stop_server(&held)
@@ -680,7 +683,7 @@ run_zone_route_cases :: proc(r: ^Runner) {
 			nested_port,
 			{public_port},
 			strings.concatenate({zone_route("corp.example", internal_port), zone_route("dev.corp.example", public_port)}, context.temp_allocator),
-			dnssec = "dnssec: { enabled: false }\n",
+			dnssec = DNSSEC_OFF,
 			rebind = false,
 		)
 		nested, started := start_server(r, Server_Options{config = config, udp_port = nested_port})

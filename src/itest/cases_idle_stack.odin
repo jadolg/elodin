@@ -91,7 +91,7 @@ run_idle_stack_cases :: proc(r: ^Runner) {
 		upstream_at(1),
 		log = "{ level: info }",
 		timeout = "",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		tcp = tcp_at(tcp_port),
 		listeners_extra = fmt.tprintf("%s\n%s", dot_listener(r, dot_port), doh_listener(r, doh_port)),
 		extra = fmt.tprintf(
 			"server:\n  client_timeout: 60s\n  max_connections: %d\n  max_connections_per_prefix: %d\n  rate_limit: {{ enabled: false }}",

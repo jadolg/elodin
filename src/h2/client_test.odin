@@ -7,6 +7,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:loop"
+import "elodin:netx"
 import "elodin:testkit"
 
 /*
@@ -46,7 +47,7 @@ test_io_read :: proc(user: rawptr, buf: []u8) -> (n: int, ok: bool) {
 		// blocking recv() is EAGAIN, which core:net reports as .Would_Block,
 		// not .Timeout. Only continuing on .Timeout made every poll tick race
 		// with client_request's own deadline as a spurious connection close.
-		if err == .Timeout || err == .Would_Block {
+		if netx.timed_out(err) {
 			continue
 		}
 		return 0, false

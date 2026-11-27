@@ -422,23 +422,11 @@ pg_label :: proc(r: ^Pg_Rand, n: int, allocator: mem.Allocator) -> []u8 {
 
 @(private)
 pg_encode_name :: proc(text: string, allocator: mem.Allocator) -> []u8 {
-	trimmed := strings.trim_suffix(text, ".")
-	if trimmed == "" {
-		out := make([]u8, 1, allocator)
-		return out
-	}
 	// One length byte per label plus the root's zero: the dots become length
-	// bytes one for one, so the wire form is the text plus two.
-	out := make([]u8, len(trimmed) + 2, allocator)
-	pos := 0
-	rest := trimmed
-	for label in strings.split_iterator(&rest, ".") {
-		out[pos] = u8(len(label))
-		copy(out[pos + 1:], label)
-		pos += 1 + len(label)
-	}
-	out[pos] = 0
-	return out
+	// bytes one for one, so the wire form is at most the text plus two.
+	out := make([dynamic]u8, 0, len(text) + 2, allocator)
+	append_name(&out, text)
+	return out[:]
 }
 
 /*

@@ -1,7 +1,9 @@
 package itest
 
 import "core:fmt"
+import "elodin:config"
 import "elodin:dns"
+import "elodin:server"
 
 /*
 The ceiling on a UDP response, against the running binary.
@@ -24,10 +26,10 @@ config_udp_size :: proc(udp_port, tcp_port, upstream_port: int, ceiling: string)
 		udp_port,
 		// TCP, so the mock's oversized answer reaches us whole rather than being
 		// clipped on the way in by the thing under test.
-		fmt.tprintf(`["tcp://127.0.0.1:%d"]`, upstream_port),
+		upstreams_at({upstream_port}, scheme = "tcp://"),
 		log = "{ level: info }",
 		timeout = "3s",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		tcp = tcp_at(tcp_port),
 		extra = ceiling == "" ? "" : fmt.tprintf("server:\n  %s", ceiling),
 	)
 }
@@ -117,9 +119,10 @@ run_udp_size_cases :: proc(r: ^Runner) {
 				if check(r, res.ok, "no answer came back") {
 					check(
 						r,
-						len(res.wire) <= 1232,
-						"the answer is %d bytes, past the 1232 default ceiling",
+						len(res.wire) <= config.DEFAULT_MAX_UDP_RESPONSE,
+						"the answer is %d bytes, past the %d default ceiling",
 						len(res.wire),
+						config.DEFAULT_MAX_UDP_RESPONSE,
 					)
 					h := parse_header(r, res.wire)
 					check(r, h.tc, "the truncated answer does not carry TC, so no client would retry")
@@ -149,7 +152,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 			{
 				res := query_tcp(tcp_port, query, context.temp_allocator)
 				if check(r, res.ok, "no answer came back over tcp") {
-					check(r, len(res.wire) > 1232, "tcp answered only %d bytes; the UDP ceiling leaked", len(res.wire))
+					check(r, len(res.wire) > config.DEFAULT_MAX_UDP_RESPONSE, "tcp answered only %d bytes; the UDP ceiling leaked", len(res.wire))
 					h := parse_header(r, res.wire)
 					check(r, !h.tc, "a tcp answer was truncated")
 				}
@@ -198,7 +201,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 			{
 				res := query_udp(udp_port, query, context.temp_allocator)
 				if check(r, res.ok, "no answer came back") {
-					check_eq_int(r, int(dns.peek_udp_size(res.wire)), 1232, "the payload size the answer advertises")
+					check_eq_int(r, int(dns.peek_udp_size(res.wire)), config.DEFAULT_MAX_UDP_RESPONSE, "the payload size the answer advertises")
 				}
 			}
 			end_case(r)
@@ -219,7 +222,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 			{
 				res := query_udp(udp_port, query, context.temp_allocator)
 				if check(r, res.ok, "no answer came back") {
-					check(r, len(res.wire) > 1232, "the answer is only %d bytes; the ceiling was not lifted", len(res.wire))
+					check(r, len(res.wire) > config.DEFAULT_MAX_UDP_RESPONSE, "the answer is only %d bytes; the ceiling was not lifted", len(res.wire))
 					h := parse_header(r, res.wire)
 					check(r, !h.tc, "the answer carries TC even though it fits")
 					check_eq_int(r, h.ancount, 10, "answer count")
@@ -268,7 +271,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 				// The reply is held to the client's 512, but the OPT record still
 				// reports the ceiling: the field is what this server can deliver,
 				// not the size of the datagram it happens to be riding on.
-				check_eq_int(r, int(dns.peek_udp_size(res.wire)), 1232, "the payload size the answer advertises")
+				check_eq_int(r, int(dns.peek_udp_size(res.wire)), config.DEFAULT_MAX_UDP_RESPONSE, "the payload size the answer advertises")
 			}
 			// Read once, and soundly: the line is written in `fit_response`,
 			// one write(2) before the answer goes to the socket, so an answer in
@@ -303,7 +306,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 	start_case(r, "upstream: a client's 65000-byte edns buffer is not forwarded upstream")
 	{
 		udp_port := next_port(r)
-		config := base_config(udp_port, fmt.tprintf(`["udp://127.0.0.1:%d"]`, upstream_port), timeout = "3s")
+		config := base_config(udp_port, upstreams_at({upstream_port}, scheme = "udp://"), timeout = "3s")
 		srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 		if ok {
 			defer stop_server(&srv)
@@ -324,7 +327,7 @@ run_udp_size_cases :: proc(r: ^Runner) {
 					check_eq_int(
 						r,
 						int(dns.peek_udp_size(forwarded)),
-						1232,
+						server.UPSTREAM_UDP_SIZE,
 						"the payload size the upstream was asked with",
 					)
 				}

@@ -52,7 +52,7 @@ run_upstream_wait_cases :: proc(r: ^Runner) {
 			return
 		}
 		// Past `old`'s one-second TTL, so `serve_stale` is all that keeps it.
-		time.sleep(1200 * time.Millisecond)
+		time.sleep(1200 * time.Millisecond) // lint:allow a TTL runs out on the server's clock; no event marks it
 		mock_go_silent(mock)
 		mock_reset_counts(mock)
 
@@ -68,9 +68,7 @@ run_upstream_wait_cases :: proc(r: ^Runner) {
 		for i in 0 ..< 16 {
 			_, _ = net.send_udp(flood, build_query(fmt.tprintf("miss%d.waits.example.", i), u16(dns.Type.A), id = u16(100 + i)), to)
 		}
-		for start := time.tick_now(); mock_total(mock) < 6 && time.tick_since(start) < 3 * time.Second; {
-			time.sleep(10 * time.Millisecond)
-		}
+		check(r, mock_wait_until(mock, asked_more_than, 5, 3 * time.Second), "fewer than six misses reached the silent upstream")
 		check_eq_int(r, mock_total(mock), 6, "misses that reached the silent upstream")
 
 		res := query_udp(udp_port, build_query(hit, u16(dns.Type.A), id = 3), timeout = time.Second)

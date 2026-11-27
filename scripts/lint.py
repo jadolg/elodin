@@ -46,6 +46,8 @@ TREE = [
      "strings.to_lower maps non-ASCII letters onto ASCII ones (U+0130 to i); use dns.name_fold"),
     ("testkit-import", r'^import\s+(\w+\s+)?"(elodin:|(\.\./)+)testkit"', lambda p: not is_test(p),
      "elodin:testkit is test code, held only to the test rules; production code does not import it"),
+    ("timed-out", r"\.Timeout\s*\|\|.*\.Would_Block|\.Would_Block\s*\|\|.*\.Timeout", lambda p: p != "src/netx/addr.odin",
+     "a receive timeout reads as either error; call netx.timed_out"),
     ("line-number", r"\.odin:[0-9]+", lambda p: True,
      "name the symbol, not a line number, which goes stale"),
     ("posix-open-flags",

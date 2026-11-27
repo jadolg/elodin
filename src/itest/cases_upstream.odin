@@ -312,7 +312,7 @@ run_upstream_transport_cases :: proc(r: ^Runner) {
 		if mock_start_or_skip(r, mock, "upstream: tcp") {
 			defer mock_stop(mock)
 			udp_port := next_port(r)
-			config := base_config(udp_port, fmt.tprintf(`["tcp://127.0.0.1:%d"]`, upstream_port), timeout = "3s")
+			config := base_config(udp_port, upstreams_at({upstream_port}, scheme = "tcp://"), timeout = "3s")
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
 			if ok {
 				start_case(r, "upstream: forwards over TCP")
@@ -390,20 +390,7 @@ run_upstream_transport_cases :: proc(r: ^Runner) {
 		if mock_start_or_skip(r, mock, "upstream: udp to tcp retry") {
 			defer mock_stop(mock)
 			tcp_port := next_port(r)
-			config := fmt.tprintf(
-				`log: {{ level: warn }}
-listeners:
-  udp: {{ enabled: false }}
-  tcp: {{ enabled: true, address: "127.0.0.1", port: %d }}
-upstream:
-  timeout: 3s
-  servers: ["127.0.0.1:%d"]
-cache: {{ enabled: false }}
-blocking: {{ enabled: false }}
-`,
-				tcp_port,
-				upstream_port,
-			)
+			config := base_config(0, upstream_at(upstream_port), timeout = "3s", udp = "{ enabled: false }", tcp = tcp_at(tcp_port))
 			// The readiness probe uses UDP, so this server is checked directly.
 			srv, ok := start_server_tcp_only(r, config, tcp_port)
 			if ok {
@@ -458,6 +445,7 @@ blocking: {{ enabled: false }}
 	query.
 	*/
 	{
+		HOLE_TIMEOUT :: 500 * time.Millisecond
 		ports: [3]int
 		holes: [3]^Mock
 		started_all := true
@@ -476,8 +464,8 @@ blocking: {{ enabled: false }}
 			udp_port := next_port(r)
 			config := base_config(
 				udp_port,
-				fmt.tprintf(`["127.0.0.1:%d", "127.0.0.1:%d", "127.0.0.1:%d"]`, ports[0], ports[1], ports[2]),
-				timeout = "500ms",
+				upstreams_at(ports[:3]),
+				timeout = "500ms", // `HOLE_TIMEOUT`
 				upstream_extra = "  strategy: failover\n  attempts: 2",
 			)
 			srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port})
@@ -494,7 +482,14 @@ blocking: {{ enabled: false }}
 						h := parse_header(r, res.wire)
 						check(r, h.rcode == int(dns.Rcode.Serv_Fail), "rcode %d, want SERVFAIL", h.rcode)
 					}
-					check(r, spent < 1600 * time.Millisecond, "the query took %v, where two timeouts are 1s", spent)
+					// Two timeouts spent on the first two members, each of which was
+					// asked: a server refusing at once without forwarding is
+					// quicker and asks nobody. The floor allows the timers a little
+					// early; the ceiling, the gap to a third timeout.
+					check(r, spent >= 2 * HOLE_TIMEOUT - 100 * time.Millisecond, "the query took %v, short of the two timeouts of %v", spent, HOLE_TIMEOUT)
+					check(r, spent < 2 * HOLE_TIMEOUT + 600 * time.Millisecond, "the query took %v, where two timeouts are %v", spent, 2 * HOLE_TIMEOUT)
+					check(r, mock_total(holes[0]) >= 1, "the first upstream was never asked")
+					check(r, mock_total(holes[1]) >= 1, "the second upstream was never asked")
 					check_eq_int(r, mock_total(holes[2]), 0, "queries reaching the third upstream")
 				}
 				end_case(r)
@@ -649,7 +644,7 @@ run_upstream_header_cases :: proc(r: ^Runner) {
 	config := base_config(
 		udp_port,
 		upstream_at(upstream_port),
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		tcp = tcp_at(udp_port),
 		cache = "{ enabled: true }",
 		extra = "dnssec: { enabled: false }",
 	)

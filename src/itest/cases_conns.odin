@@ -45,7 +45,7 @@ config_conn_limits :: proc(udp_port, tcp_port, metrics_port, upstream_port, max_
 		upstream_at(upstream_port),
 		log = "{ level: info }",
 		timeout = "3s",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		tcp = tcp_at(tcp_port),
 		extra = fmt.tprintf(
 			`server:
   max_connections: %d

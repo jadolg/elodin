@@ -8,6 +8,7 @@ import "core:thread"
 import "core:time"
 import "elodin:dns"
 import "elodin:metrics"
+import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -89,8 +90,9 @@ Mock :: struct {
 	// When set, a connection is closed after this much idle time, the way a
 	// public DoT resolver drops connections a client has stopped using.
 	idle_close:  time.Duration,
-	// Connections `idle_close` has closed, counted once each is closed.
-	// Atomic: the connection threads bump it while a case reads it.
+	// Connections `idle_close` has closed, counted once each is closed. Bumped
+	// under `mu` with a broadcast on `changed`, so `mock_wait_until` sees it;
+	// read atomically outside it.
 	idle_closes: int,
 
 	// How this mock treats DNS cookies (RFC 7873).
@@ -329,14 +331,7 @@ mock_close_idle_after :: proc(m: ^Mock, d: time.Duration) {
 
 // Wait until `idle_close` has closed `want` connections in all, or give up.
 mock_wait_idle_closes :: proc(m: ^Mock, want: int, timeout: time.Duration) -> bool {
-	start := time.tick_now()
-	for time.tick_since(start) < timeout {
-		if sync.atomic_load(&m.idle_closes) >= want {
-			return true
-		}
-		time.sleep(PROBE_RETRY_PAUSE)
-	}
-	return false
+	return mock_wait_until(m, proc(m: ^Mock, want: int) -> bool {return m.idle_closes >= want}, want, timeout)
 }
 
 // A copy of the last query the mock received, or nil if it has had none.
@@ -426,8 +421,9 @@ mock_saw_type :: proc(m: ^Mock, qtype: int) -> bool {
 }
 
 /*
-Wait until `ready(m, want)` holds, rechecked each time a query arrives or a reply
-is held, for at most `timeout`; true when it held in time. `ready` runs under
+Wait until `ready(m, want)` holds, rechecked each time a query arrives, a reply
+is held or an idle connection is closed, for at most `timeout`; true when it
+held in time. `ready` runs under
 `m.mu`, so it reads the counts directly.
 */
 mock_wait_until :: proc(m: ^Mock, ready: proc(m: ^Mock, want: int) -> bool, want: int, timeout: time.Duration) -> bool {
@@ -809,11 +805,11 @@ build_rcode_reply :: proc(query: []u8, rcode: dns.Rcode, allocator := context.al
 			return wire
 		}
 	}
-	// A header alone, carrying the query's ID, QR and the rcode, for a query
+	// A header alone, carrying the query's ID, QR, RD and the rcode, for a query
 	// that cannot be decoded or a response that cannot be encoded.
 	out := make([]u8, dns.HEADER_SIZE, allocator)
 	copy(out, query[:min(len(query), dns.HEADER_SIZE)])
-	out[2] = 0x81
+	out[2] = 0x81 // QR and RD
 	out[3] = u8(rcode) & 0xf
 	for i in 4 ..< dns.HEADER_SIZE {
 		out[i] = 0
@@ -823,7 +819,7 @@ build_rcode_reply :: proc(query: []u8, rcode: dns.Rcode, allocator := context.al
 
 @(private = "file")
 mock_udp_loop :: proc(m: ^Mock) {
-	buf := make([]u8, 65535)
+	buf := make([]u8, dns.MAX_MESSAGE)
 	defer delete(buf)
 
 	/*
@@ -982,7 +978,10 @@ mock_tcp_conn :: proc(conn: ^Mock_Conn) {
 	// the connection is closed, not about to be.
 	idled := false
 	defer if idled {
+		sync.mutex_lock(&m.mu)
 		sync.atomic_add(&m.idle_closes, 1)
+		sync.cond_broadcast(&m.changed)
+		sync.mutex_unlock(&m.mu)
 	}
 
 	tls_conn: ^tlsx.Conn
@@ -1038,10 +1037,7 @@ mock_tcp_conn :: proc(conn: ^Mock_Conn) {
 				n = v
 			} else {
 				v, err := net.recv_tcp(conn.socket, buf[got:])
-				// SO_RCVTIMEO expiring on a blocking recv() is EAGAIN on
-				// Linux, which core:net reports as .Would_Block, not
-				// .Timeout - see `timed_out` in src/upstream/http.odin.
-				if err == .Timeout || err == .Would_Block {
+				if netx.timed_out(err) {
 					continue
 				}
 				if err != nil {

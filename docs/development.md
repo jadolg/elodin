@@ -108,7 +108,8 @@ whose every check passed.
 finding. Some rules hold for the whole tree (`strings.equal_fold` and
 `strings.to_lower` outside tests, `strings.trim_space` in HTTP code, `strconv`'s
 integer parsers on config and wire input, a format in `testing.expect`, an
-import of `elodin:testkit` outside tests, a `.odin:<line>` reference, and an exported procedure nothing outside test files
+import of `elodin:testkit` outside tests, a receive timeout tested by hand
+rather than through `netx.timed_out`, a `.odin:<line>` reference, and an exported procedure nothing outside test files
 calls, which belongs in a test file - the itest and fuzz packages count as
 callers); others only for
 lines a branch adds, diffed against `LINT_BASE` (default: the merge base with

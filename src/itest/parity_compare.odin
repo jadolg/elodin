@@ -205,31 +205,40 @@ parity_compare :: proc(
 	return c
 }
 
-// Whether two records are of one RRset: one owner, case aside, type and class,
-// and for signatures one type covered (RDATA's first two bytes), as the
-// encoder groups them.
+/*
+Whether two records are of one RRset: one owner, case aside, type and class,
+and for signatures one type covered (RDATA's first two bytes), as the encoder
+groups them. With `runs`, as `dns.cap_ttls` reads a run instead: a signature
+or an OPT record is never part of one.
+*/
 @(private = "file")
-pc_same_rrset :: proc(a, b: Pw_RR) -> bool {
-	if a.type != b.type || a.class != b.class || len(a.name) != len(b.name) {
+pc_same_rrset :: proc(a, b: Pw_RR, runs := false) -> bool {
+	if runs && (a.type == PC_RRSIG || a.type == PC_OPT) {
 		return false
 	}
-	if a.type == 46 && (len(a.rdata) < 2 || len(b.rdata) < 2 || a.rdata[0] != b.rdata[0] || a.rdata[1] != b.rdata[1]) {
+	if a.type != b.type || a.class != b.class {
 		return false
 	}
-	for i in 0 ..< len(a.name) {
-		x, y := a.name[i], b.name[i]
-		if x >= 'A' && x <= 'Z' {
-			x += 'a' - 'A'
-		}
-		if y >= 'A' && y <= 'Z' {
-			y += 'a' - 'A'
-		}
-		if x != y {
-			return false
-		}
+	if a.type == PC_RRSIG && (len(a.rdata) < 2 || len(b.rdata) < 2 || a.rdata[0] != b.rdata[0] || a.rdata[1] != b.rdata[1]) {
+		return false
 	}
-	return true
+	return pw_names_equal_fold(a.name, b.name)
 }
+
+// RFC 8767 section 4: a TTL is unsigned, so one with the top bit set is a large
+// positive value, held to RFC 2181 section 8's largest, 2^31 - 1.
+@(private = "file")
+PC_TTL_MAX :: u32(0x7fff_ffff)
+
+// The record types the comparison reads, in the wire's u16.
+@(private = "file")
+PC_NS :: u16(dns.Type.NS)
+@(private = "file")
+PC_SOA :: u16(dns.Type.SOA)
+@(private = "file")
+PC_OPT :: u16(dns.Type.OPT)
+@(private = "file")
+PC_RRSIG :: u16(dns.Type.RRSIG)
 
 /*
 What a record would have cost the message that left it out, in bytes.
@@ -881,7 +890,7 @@ pc_missing :: proc(
 	dropped is still reported: there is nothing in its section carrying the same
 	identity for this to find.
 	*/
-	if policy.mode == .Live && rec.type == 46 && pc_signed_again(rec, el_recs) {
+	if policy.mode == .Live && rec.type == PC_RRSIG && pc_signed_again(rec, el_recs) {
 		pc_add(
 			c,
 			kind,
@@ -905,7 +914,7 @@ pc_missing :: proc(
 	what a client reads the negative ttl from (RFC 2308 section 5), and a SOA
 	whose timers moved is still a difference.
 	*/
-	if policy.mode == .Live && rec.type == 6 && pc_serial_moved(rec, el_recs) {
+	if policy.mode == .Live && rec.type == PC_SOA && pc_serial_moved(rec, el_recs) {
 		pc_add(
 			c,
 			kind,
@@ -1062,7 +1071,7 @@ pc_referral :: proc(m: Pw_Msg) -> bool {
 		return false
 	}
 	for ns in m.authority {
-		if ns.type == 2 {
+		if ns.type == PC_NS {
 			return true
 		}
 	}
@@ -1195,7 +1204,7 @@ pc_added_record_allowance :: proc(
 	if pc_dnssec_type(rec.type) {
 		return "a dnssec record: this server asked its upstream with do set so it could validate, and the reference query did not have to"
 	}
-	if kind == .Authority && rec.type == 6 {
+	if kind == .Authority && rec.type == PC_SOA {
 		return "the soa that anchors a denial of existence, which comes back with the proof this server asked for"
 	}
 	return ""
@@ -1290,9 +1299,8 @@ pc_same_signed_set :: proc(a, b: []u8) -> bool {
 
 @(private = "file")
 pc_dnssec_type :: proc(t: u16) -> bool {
-	// RRSIG, NSEC, NSEC3, NSEC3PARAM, DNSKEY, DS.
-	switch t {
-	case 46, 47, 50, 51, 48, 43:
+	#partial switch dns.Type(t) {
+	case .RRSIG, .NSEC, .NSEC3, .NSEC3PARAM, .DNSKEY, .DS:
 		return true
 	}
 	return false
@@ -1302,42 +1310,40 @@ pc_dnssec_type :: proc(t: u16) -> bool {
 The lowest TTL among the records of `u`'s RRset in the section `recs` holds,
 as `dns.cap_ttls` reads one: the run of records next to each other with one
 owner (case aside), type and class, RRSIG and OPT never part of one, each TTL read
-through `dns.sane_ttl`. `grouped` is false for a record alone in its run. For
+as RFC 8767 section 4 reads it (`PC_TTL_MAX`), here rather than through the
+server's own `dns.sane_ttl`, which is the code under judgement. `grouped` is false for a record alone in its run. For
 an RRSIG, the lowest of the run it follows and covers, which `cap_ttls` holds
 it to.
 */
 @(private = "file")
 pc_rrset_lowest_ttl :: proc(u: Pw_RR, recs: []Pw_RR) -> (lowest: u32, grouped: bool) {
-	same :: proc(a, b: Pw_RR) -> bool {
-		return a.type != 46 && a.type != 41 && a.type == b.type && a.class == b.class && pw_names_equal_fold(a.name, b.name)
-	}
 	for r, i in recs {
 		if r.start != u.start {
 			continue
 		}
 		first, last := i, i
-		for first > 0 && same(recs[first - 1], r) {
+		for first > 0 && pc_same_rrset(recs[first - 1], r, runs = true) {
 			first -= 1
 		}
-		for last + 1 < len(recs) && same(recs[last + 1], r) {
+		for last + 1 < len(recs) && pc_same_rrset(recs[last + 1], r, runs = true) {
 			last += 1
 		}
 		// An RRSIG takes the run just before it (past any other RRSIGs) when it
 		// covers that run's type on its owner (RFC 4034 section 3).
-		if r.type == 46 {
+		if r.type == PC_RRSIG {
 			if len(r.rdata) < 2 {
 				return 0, false
 			}
 			covered := u16(r.rdata[0]) << 8 | u16(r.rdata[1])
 			k := i - 1
-			for k >= 0 && recs[k].type == 46 {
+			for k >= 0 && recs[k].type == PC_RRSIG {
 				k -= 1
 			}
 			if k < 0 || recs[k].type != covered || recs[k].class != r.class || !pw_names_equal_fold(recs[k].name, r.name) {
 				return 0, false
 			}
 			first, last = k, k
-			for first > 0 && same(recs[first - 1], recs[k]) {
+			for first > 0 && pc_same_rrset(recs[first - 1], recs[k], runs = true) {
 				first -= 1
 			}
 		} else if first == last {
@@ -1345,7 +1351,7 @@ pc_rrset_lowest_ttl :: proc(u: Pw_RR, recs: []Pw_RR) -> (lowest: u32, grouped: b
 		}
 		lowest = max(u32)
 		for k in first ..= last {
-			lowest = min(lowest, dns.sane_ttl(recs[k].ttl))
+			lowest = min(lowest, recs[k].ttl, PC_TTL_MAX)
 		}
 		return lowest, true
 	}
@@ -1457,13 +1463,13 @@ signatures, so the floor reaches down to that too.
 @(private = "file")
 pc_signed_ttl :: proc(u, e: Pw_RR, up_recs, el_recs: []Pw_RR, policy: Parity_Policy) -> string {
 	covered := e.type
-	if e.type == 46 && len(e.rdata) >= 2 {
+	if e.type == PC_RRSIG && len(e.rdata) >= 2 {
 		covered = pw_u16(e.rdata, 0)
 	}
 	now := u32(time.time_to_unix(time.now()))
 	lo, hi := max(u32), u32(0)
 	for r in el_recs {
-		if r.type != 46 || r.class != e.class || len(r.rdata) < 12 || !pw_names_equal_fold(r.name, e.name) {
+		if r.type != PC_RRSIG || r.class != e.class || len(r.rdata) < 12 || !pw_names_equal_fold(r.name, e.name) {
 			continue
 		}
 		if pw_u16(r.rdata, 0) != covered {
@@ -1482,7 +1488,7 @@ pc_signed_ttl :: proc(u, e: Pw_RR, up_recs, el_recs: []Pw_RR, policy: Parity_Pol
 		if r.class != e.class || !pw_names_equal_fold(r.name, e.name) {
 			continue
 		}
-		if r.type == covered || (r.type == 46 && len(r.rdata) >= 2 && pw_u16(r.rdata, 0) == covered) {
+		if r.type == covered || (r.type == PC_RRSIG && len(r.rdata) >= 2 && pw_u16(r.rdata, 0) == covered) {
 			received = min(received, r.ttl)
 		}
 	}
@@ -1534,7 +1540,7 @@ pc_lapsing_ttl :: proc(c: ^Parity_Compare, u, e: Pw_RR, policy: Parity_Policy) -
 pc_stray_opt :: proc(m: Pw_Msg) -> bool {
 	for section in ([][]Pw_RR{m.answer, m.authority}) {
 		for rec in section {
-			if rec.type == 41 {
+			if rec.type == PC_OPT {
 				return true
 			}
 		}

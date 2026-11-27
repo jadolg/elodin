@@ -446,7 +446,7 @@ run_listener_arming_case :: proc(r: ^Runner) {
 		udp_port,
 		upstream_at(next_port(r)),
 		log = "{ level: info }",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		tcp = tcp_at(tcp_port),
 		extra = fmt.tprintf("server:\n  sandbox: %s%s\nmetrics: {{ enabled: true, address: \"127.0.0.1\", port: %d }}", mode, user, metrics_port),
 	)
 	srv, ok := start_server(r, Server_Options{config = config, udp_port = udp_port, tcp_port = tcp_port})

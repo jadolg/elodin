@@ -386,7 +386,7 @@ run_connection_memory_cases :: proc(r: ^Runner) {
 		`["127.0.0.1:1"]`,
 		log = "{ level: info }",
 		timeout = "",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, tcp_port),
+		tcp = tcp_at(tcp_port),
 		extra = fmt.tprintf("server:\n  max_connections: %d\n  max_connections_per_prefix: %d\n  rate_limit: {{ enabled: false }}", CONN_BURST * 2, CONN_BURST * 2),
 	)
 	srv, started := start_server(

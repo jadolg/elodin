@@ -5,11 +5,11 @@ import "core:encoding/base64"
 import "core:fmt"
 import "core:mem"
 import "core:net"
-import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
 import "core:time"
 import "elodin:dns"
+import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -29,20 +29,30 @@ Query_Result :: struct {
 	from: net.Endpoint,
 }
 
+/*
+`query` to `address` at `udp_port`, and the first datagram back. With
+`match_id`, a datagram carrying another transaction ID is skipped rather than
+taken as the answer, for a resolver whose socket others may also answer to, and
+the wait is one deadline of `timeout` over every datagram: the receive timeout
+restarts on each `recv_udp`, so a stream of strangers' replies would otherwise
+keep it alive.
+*/
 query_udp :: proc(
 	udp_port: int,
 	query: []u8,
 	allocator := context.allocator,
 	timeout := CLIENT_TIMEOUT,
 	address: net.Address = net.IP4_Loopback,
+	match_id := false,
 ) -> Query_Result {
 	socket, err := net.make_unbound_udp_socket(net.family_from_address(address))
 	if err != nil {
 		return {}
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, timeout)
-	_ = net.set_option(socket, .Send_Timeout, timeout)
+	if net.set_option(socket, .Receive_Timeout, timeout) != nil || net.set_option(socket, .Send_Timeout, timeout) != nil {
+		return {}
+	}
 
 	endpoint := net.Endpoint {
 		address = address,
@@ -53,13 +63,22 @@ query_udp :: proc(
 	}
 
 	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
-	n, from, rerr := net.recv_udp(socket, buf)
-	if rerr != nil || n < dns.HEADER_SIZE {
-		return {}
+	deadline := time.tick_add(time.tick_now(), timeout)
+	for {
+		n, from, rerr := net.recv_udp(socket, buf)
+		if rerr != nil || n < dns.HEADER_SIZE {
+			return {}
+		}
+		if match_id && (len(query) < 2 || buf[0] != query[0] || buf[1] != query[1]) {
+			if time.tick_diff(time.tick_now(), deadline) < 0 {
+				return {}
+			}
+			continue
+		}
+		out := make([]u8, n, allocator)
+		copy(out, buf[:n])
+		return Query_Result{wire = out, ok = true, from = from}
 	}
-	out := make([]u8, n, allocator)
-	copy(out, buf[:n])
-	return Query_Result{wire = out, ok = true, from = from}
 }
 
 // Confirms the server sends nothing at all, which is the correct answer to some
@@ -297,7 +316,7 @@ send_burst :: proc(socket: net.UDP_Socket, query: []u8, count: int, to: net.Endp
 // are in when it is set.
 @(private = "file")
 drain_answers :: proc(socket: net.UDP_Socket, drain: time.Duration, want := 0) -> (res: Flood_Result) {
-	buf := make([]u8, 65535, context.temp_allocator)
+	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
 	deadline := time.tick_add(time.tick_now(), drain)
 	for time.tick_diff(time.tick_now(), deadline) > 0 && (want == 0 || res.answered < want) {
 		n, _, rerr := net.recv_udp(socket, buf)
@@ -353,7 +372,7 @@ tcp_pipeline_flood :: proc(tcp_port: int, query: []u8, count: int, drain := 700 
 		message[2], message[3] = u8(i >> 8), u8(i)
 	}
 	// What did not go out is read as what was not answered.
-	_, _ = net.send_tcp(socket, framed)
+	_, _ = net.send_tcp(socket, framed) // lint:allow a send that fails is read as the answers that never came
 
 	res: Flood_Result
 	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
@@ -647,13 +666,14 @@ parse_status_line :: proc(head: string) -> (status: int, ok: bool) {
 	if space < 0 || space + 4 > len(line) {
 		return 0, false
 	}
-	return strconv.parse_int(line[space + 1:space + 4])
+	code := netx.parse_decimal(line[space + 1:space + 4], 999) or_return
+	return int(code), true
 }
 
 @(private)
 header_int :: proc(head: string, name: string) -> int {
-	v, ok := strconv.parse_int(header_value(head, name))
-	return v if ok else 0
+	v, ok := netx.parse_decimal(header_value(head, name), u64(max(i32)))
+	return int(v) if ok else 0
 }
 
 // The first field called `name`, trimmed; "" when there is none.
@@ -724,7 +744,9 @@ dual_stack_available :: proc() -> bool {
 		return false
 	}
 	defer net.close(server)
-	if net.set_option(server, .Receive_Timeout, CLIENT_TIMEOUT) != nil {
+	// A loopback datagram either lands at once or never does, which is what a
+	// host that keeps IPv4 off `::` looks like: no reason to wait it out longer.
+	if net.set_option(server, .Receive_Timeout, PROBE_TIMEOUT) != nil {
 		return false
 	}
 	bound, berr := net.bound_endpoint(server)
@@ -815,7 +837,7 @@ wildcard_flood :: proc(udp_port: int, query: []u8, count: int, drain := 700 * ti
 	res.v6_sent = true
 
 	res.v4_answered = drain_answers(v4, drain).answered
-	buf := make([]u8, 65535, context.temp_allocator)
+	buf := make([]u8, dns.MAX_MESSAGE, context.temp_allocator)
 	if n, _, rerr := net.recv_udp(v6, buf); rerr == nil && n >= dns.HEADER_SIZE {
 		res.v6_answered = true
 	}

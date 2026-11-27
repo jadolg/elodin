@@ -766,7 +766,7 @@ run_cache_cases :: proc(r: ^Runner) {
 		udp_port,
 		upstream_at(upstream_port),
 		timeout = "3s",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		tcp = tcp_at(udp_port),
 		cache = "{ enabled: true, max_entries: 100, min_ttl: 30, negative_ttl: 60 }",
 	)
 
@@ -1171,7 +1171,7 @@ run_cache_bytes_cases :: proc(r: ^Runner) {
 		udp_port,
 		upstream_at(upstream_port),
 		timeout = "3s",
-		tcp = fmt.tprintf(`{{ enabled: true, address: "127.0.0.1", port: %d }}`, udp_port),
+		tcp = tcp_at(udp_port),
 		cache = "{ enabled: true, max_entries: 100000, max_bytes: 1MiB }",
 	)
 
