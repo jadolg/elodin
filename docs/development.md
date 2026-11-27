@@ -115,8 +115,9 @@ target does not); others only for
 lines a branch adds, diffed against `LINT_BASE` (default: the merge base with
 `origin/main`): a discarded error or `ok` in a test, `time.sleep` and `time.now`
 in tests, `strconv`'s integer parsers in tests and the itest, comments
-narrating history, and a bare `512`, `1232` or `65535` in code outside a `::`
-declaration, where a named size belongs. A deliberate exception carries
+narrating history, and a bare `512`, `1232` or `65535` in code, where a named
+size belongs, outside a constant's own declaration (`NAME :: 512`,
+`NAME : T : 512`); a procedure or struct declaration is not exempt. A deliberate exception carries
 `lint:allow <reason>` on its line. `scripts/lint_test.py` holds each rule to what
 it refuses and allows, and `.claude/hooks/guard_test.py` does the same for the
 Claude Code hook; `check` runs both.

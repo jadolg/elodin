@@ -26,8 +26,9 @@ expect_loads :: proc(t: ^testing.T, src: string, loc := #caller_location) -> (cf
 }
 
 /*
-Whether loading `src` is refused with a message holding every one of `wanted`
-(starting with each, given `prefix`, or equal to it, given `exact`);
+Whether loading `src` is refused with a message holding every one of `wanted`,
+at least one (starting with each, given `prefix`, or equal to the one, given
+`exact`);
 `count`, when not 0, is how many refusals there are in all. `tls_files` is
 `load_string`'s.
 */
@@ -42,6 +43,8 @@ expect_refused :: proc(
 	tls_files := true,
 	loc := #caller_location,
 ) -> bool {
+	// No reason passes on any refusal, and two reasons cannot both equal one message.
+	assert(len(wanted) > 0 && (!exact || len(wanted) == 1), "expect_refused wants a reason, and one when exact")
 	_, err := load_string(src, context.temp_allocator, tls_files = tls_files)
 	e, has := err.?
 	if !testing.expectf(t, has, "accepted, wanted a refusal naming %v, from:\n%s", wanted, src, loc = loc) {

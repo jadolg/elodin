@@ -78,9 +78,9 @@ ADDED = [
 
 # Added code only: comments and strings may name the figure. A constant's own
 # declaration (`NAME :: 512`, `NAME : u16 : 512`) is where it is named.
-SIZE_LITERAL = ("size-literal", r"(?<![\w.])(512|1232|65535)(?![\w.])", lambda p: True,
+SIZE_LITERAL = ("size-literal", r"(?<!\w)(?<!\d\.)(512|1232|65535)(?!\w|\.\d)", lambda p: True,
                 "name the size: dns.MAX_UDP_SIZE, config.DEFAULT_MAX_UDP_RESPONSE, server.UPSTREAM_UDP_SIZE, dns.MAX_MESSAGE")
-CONSTANT = re.compile(r"^\s*[A-Za-z_]\w*\s*:[^=:]*:(?!\s*(#\w+\s+)*(proc|struct|union|enum|bit_set|bit_field)\b)")
+CONSTANT = re.compile(r"^\s*[A-Za-z_]\w*\s*:[^=:,(\[{]*:(?!\s*(#\w+\s+)*(proc|struct|union|enum|bit_set|bit_field)\b)")
 
 
 def code_only(source):
