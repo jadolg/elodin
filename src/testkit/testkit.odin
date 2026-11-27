@@ -1,8 +1,8 @@
 /*
 Fixtures the unit tests of more than one package share. A package's tests cannot
 reach another package's `_test.odin` files, so a helper two packages' tests need
-lives here, and only test files import it. It imports `dns`, so `dns`'s own tests
-cannot import it and keep their own copies.
+lives here, and only test files import it. It imports `dns`, `loop` and `netx`,
+so their own tests cannot import it: they keep their own copies, each saying so.
 */
 package testkit
 
