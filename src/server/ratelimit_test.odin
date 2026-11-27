@@ -455,13 +455,18 @@ ever reports the unmapped form instead.
 
 Skipped, out loud, where `::` cannot be bound: that is a property of the machine
 (a container without IPv6) rather than of the code, and a hard failure there
-would be a false alarm. The line in the log is so that a runner where this never
-executes is visible rather than quietly green. A `::` bind that IPv4 cannot reach
-(`net.ipv6.bindv6only`) is a send or a read that fails, and fails the case: a
-skip there would also hide a socket that is simply broken.
+would be a false alarm, and so is a host whose `net.ipv6.bindv6only` keeps IPv4
+off a `::` socket (`bindv6only`), which the listeners leave at the kernel's
+default too. The line in the log is so that a runner where this never executes
+is visible rather than quietly green. Anywhere else a send or a read that fails
+fails the case: a skip there would hide a socket that is simply broken.
 */
 @(test)
 test_a_real_v4_client_on_a_wildcard_bind_is_judged_by_its_v4_address :: proc(t: ^testing.T) {
+	if bindv6only() {
+		log.info("skipped: net.ipv6.bindv6only keeps IPv4 clients off a `::` socket here")
+		return
+	}
 	server_socket, serr := net.make_bound_udp_socket(net.IP6_Any, 0)
 	if serr != nil {
 		log.infof("skipped: this machine cannot bind `::` (%v)", serr)

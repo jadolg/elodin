@@ -7,6 +7,8 @@ import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:testing"
+import "core:time"
+import "elodin:netx"
 import "elodin:tlsx"
 
 /*
@@ -154,21 +156,38 @@ CERT_DIR_PREFIX :: "/tmp/elodin-server-profile-test-"
 /*
 Remove the certificate directories of runs that have ended. The test runner
 leaves through `exit`, which runs neither `@(fini)` nor `atexit` handlers, so a
-run cannot remove its own; the next one removes every one whose pid is gone.
+run cannot remove its own; the next one removes each one named by a pid that is
+gone and untouched for `CERT_DIR_STALE`. The age is what keeps a run in another
+pid namespace sharing this /tmp, whose pid this /proc cannot see, from losing
+its directory mid-run.
 */
 @(private = "file")
 sweep_ended_runs :: proc() {
+	if !os.exists("/proc/self") {
+		return
+	}
 	entries, err := os.read_all_directory_by_path("/tmp", context.temp_allocator)
 	if err != nil {
 		return
 	}
 	for e in entries {
-		if !strings.has_prefix(e.fullpath, CERT_DIR_PREFIX) || os.exists(fmt.tprintf("/proc/%s", e.fullpath[len(CERT_DIR_PREFIX):])) {
+		if !strings.has_prefix(e.fullpath, CERT_DIR_PREFIX) {
+			continue
+		}
+		pid := e.fullpath[len(CERT_DIR_PREFIX):]
+		if _, numeric := netx.parse_decimal(pid, u64(max(i32))); !numeric || os.exists(fmt.tprintf("/proc/%s", pid)) {
+			continue
+		}
+		if time.diff(e.modification_time, time.now()) < CERT_DIR_STALE { // lint:allow wall-clock: a file's mtime is an instant on it
 			continue
 		}
 		_ = os.remove_all(e.fullpath) // lint:allow a directory left behind is only the next sweep's
 	}
 }
+
+// How long an ended run's certificate directory is left before a sweep takes it.
+@(private = "file")
+CERT_DIR_STALE :: time.Hour
 
 // How many profiles `p`'s cache holds.
 @(private = "file")

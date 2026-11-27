@@ -1179,8 +1179,13 @@ test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) 
 	)
 
 	// And the label boundary holds here too: an anchor over `onion.` is not an
-	// anchor over somebody else's `notonion.`.
+	// anchor over somebody else's `notonion.`, and with the bypass on that name is
+	// not one to defer.
 	testing.expect(t, !covered_by_local_anchor(&s, "x.notonion."), "notonion. was treated as being inside onion.")
+	ocfg := test_config()
+	ocfg.special_use.onion = false
+	os_ := Server{cfg = &ocfg}
+	testing.expect(t, !special_use_deferred(&os_, "x.notonion."), "notonion. was deferred as being inside onion.")
 
 	free_all(context.temp_allocator)
 }
