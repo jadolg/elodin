@@ -179,6 +179,10 @@ exchange_with_peer :: proc(
 		return .IO_Error, 0, 0
 	}
 	defer net.close(listener)
+	// Bounds the peer's accept, so a case that never dials it still joins.
+	if oerr := net.set_option(listener, .Receive_Timeout, 5 * time.Second); !testing.expectf(t, oerr == nil, "cannot bound the peer's accept: %v", oerr) {
+		return .IO_Error, 0, 0
+	}
 	bound, berr := net.bound_endpoint(listener)
 	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
 		return .IO_Error, 0, 0
@@ -225,11 +229,18 @@ exchange_with_peer :: proc(
 		return .IO_Error, 0, 0
 	}
 	// What `get_h2_conn` builds once ALPN says h2, minus the TLS.
-	_ = net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond)
+	_ = net.set_option(socket, .Receive_Timeout, 100 * time.Millisecond) // lint:allow a read the bound missed only waits out the peer's own 3 s
 	sync.mutex_lock(&u.mu)
 	u.proto = .H2
 	u.h2 = start_h2_conn(u, Stream{socket = socket})
 	sync.mutex_unlock(&u.mu)
+	if !testing.expect(t, u.h2 != nil, "cannot start the h2 connection") {
+		net.close(socket)
+		destroy(u)
+		thread.join(peer)
+		thread.destroy(peer)
+		return .IO_Error, 0, 0
+	}
 
 	query := dns.Message {
 		id       = 0x3260,
@@ -320,6 +331,10 @@ ask_a_refusing_member_and_a_silent_one :: proc(t: ^testing.T, retry_after: strin
 		return
 	}
 	defer net.close(listener)
+	// Bounds the peer's accept, so a case that never dials it still joins.
+	if oerr := net.set_option(listener, .Receive_Timeout, 5 * time.Second); !testing.expectf(t, oerr == nil, "cannot bound the peer's accept: %v", oerr) {
+		return
+	}
 	bound, berr := net.bound_endpoint(listener)
 	if !testing.expectf(t, berr == nil, "cannot read the port: %v", berr) {
 		return

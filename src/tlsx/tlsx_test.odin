@@ -158,6 +158,11 @@ generate_certs :: proc() {
 		_ = os.remove_all(made) // lint:allow a pair left behind is only litter in the temp directory
 	}
 	cert_ok = usable_pair(cert_path, key_path)
+	if !cert_ok {
+		// What holds the name is no pair at all: half of one, say, left by a
+		// run that was killed. Made in place, as nothing whole stands there.
+		cert_ok = self_signed(CERT_DIR, cert_path, key_path, CERT_DAYS, "/CN=elodin.local", ELODIN_SAN) && usable_pair(cert_path, key_path)
+	}
 }
 
 @(private)

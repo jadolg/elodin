@@ -201,6 +201,7 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 		sync.sema_post(&rep.done)
 	})
 	if !testing.expect(t, th != nil, "cannot start the redial") {
+		sync.sema_post(&hold.release)
 		return
 	}
 	returned := sync.sema_wait_with_timeout(&rep.done, 5 * time.Second)
