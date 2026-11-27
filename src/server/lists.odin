@@ -123,8 +123,8 @@ in this build; false at the first that is `.No_Memory`. One no earlier build
 read downloads as `allow_network` says. One read before reads its copy, which is
 `.Stale`: whether it is the download the earlier read saved cannot be told, and
 it may be older. One whose download held no rules and had no copy stays
-`.Empty`; one with no copy to read again, which the earlier read could not save
-(a `cache_dir` that cannot be written), is downloaded again.
+`.Empty`; one the earlier read downloaded with no copy to read again, which it
+could not save (a `cache_dir` that cannot be written), is downloaded again.
 */
 @(private)
 load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network: bool, loads: []List_Load, passes: []List_Pass) -> bool {
@@ -135,7 +135,9 @@ load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network
 			continue
 		}
 		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
-		load := load_one_list(cfg, list, block, allow, allow_network && !read, i >= lists, again = read)
+		// One that ran out the first time has not been said of yet.
+		again := read && passes[i].found != .No_Memory
+		load := load_one_list(cfg, list, block, allow, allow_network && !read, i >= lists, again = again)
 		switch {
 		case !read:
 			if passes != nil {
@@ -145,7 +147,7 @@ load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network
 			load = .Stale
 		case load == .Unavailable && passes[i].found == .Empty:
 			load = .Empty
-		case load == .Unavailable && allow_network && passes[i].found != .Unavailable:
+		case load == .Unavailable && allow_network && passes[i].found == .Current:
 			load = load_one_list(cfg, list, block, allow, true, i >= lists)
 		}
 		if loads != nil {

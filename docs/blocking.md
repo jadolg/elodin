@@ -102,7 +102,7 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   (`blocklists: not every list is current; trying again in 1m0s`). A start that
   could not load every list is retried the same way. A missing `file:` list is
   not retried. A load that ran out of memory is retried the same way even
-  under `--no-fetch` or `refresh: 0`, at most 1 hour apart, until it succeeds;
+  under `--no-fetch` or `refresh: 0`, at most 1 hour apart, until it succeeds
   (`blocklists: there was no memory to build the rules; trying again in
   1m0s`). Under `refresh: 0` that retry reads the cached copies and downloads
   nothing, so a list with no copy stays out until a reload.

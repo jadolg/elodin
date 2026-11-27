@@ -1405,7 +1405,11 @@ tick :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m: 
 		case m.rebuild_again:
 			start_rebuild(s, opts, m, after_reload = true)
 		case cfg.blocking.enabled && server.refresh_due(opts.no_fetch, s.rules_no_memory, cfg.blocking.refresh, m.retry, loop.since(m.last_refresh)):
-			logx.infof("refreshing blocklists")
+			if server.rebuild_fetches(opts.no_fetch, false, cfg.blocking.refresh) {
+				logx.infof("refreshing blocklists")
+			} else {
+				logx.infof("building the blocklists again from the cached copies")
+			}
 			start_rebuild(s, opts, m, after_reload = false)
 		}
 	}
