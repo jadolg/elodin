@@ -136,7 +136,11 @@ add_operator_rules :: proc(cfg: ^config.Config, block, allow: ^filter.Set) -> bo
 		// Entries here are allow rules whether or not they carry the @@ prefix.
 		text := rule
 		if !strings.has_prefix(text, "@@") {
-			text = fmt.tprintf("@@%s", text)
+			prefixed, err := strings.concatenate({"@@", rule}, context.temp_allocator)
+			if err != nil {
+				return false
+			}
+			text = prefixed
 		}
 		if !operator_rule_takes(block, allow, text) {
 			warn_rule_adds_nothing(rule)

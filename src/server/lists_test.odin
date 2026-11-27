@@ -965,6 +965,13 @@ test_a_rebuild_without_memory_keeps_the_rules_in_effect :: proc(t: ^testing.T) {
 
 	cfg := config.default_config()
 	cfg.blocking.lists = []config.Block_List{{name = "l", file = path, format = .Hosts, enabled = true}}
+	// Enough that the operator's rules take the table past the list's 80%.
+	OPERATOR :: 150
+	rules: [OPERATOR]string
+	for &rule, i in rules {
+		rule = fmt.tprintf("||operator-%d.example^", i)
+	}
+	cfg.blocking.rules = rules[:]
 	s := list_server(&cfg)
 	defer close_list_server(&s)
 	if !testing.expect(t, reload_filters(&s, false), "the list did not load") {
@@ -993,6 +1000,12 @@ test_a_rebuild_without_memory_keeps_the_rules_in_effect :: proc(t: ^testing.T) {
 		for i in 0 ..< N {
 			name := fmt.tprintf("oom-%d.example.", i)
 			if !testing.expectf(t, filter.engine_match(s.filters, name, .A) == .Blocked, "run %d: %s is not blocked", fail_at, name) {
+				return
+			}
+		}
+		for i in 0 ..< OPERATOR {
+			name := fmt.tprintf("operator-%d.example.", i)
+			if !testing.expectf(t, filter.engine_match(s.filters, name, .A) == .Blocked, "run %d: the operator's %s is not blocked", fail_at, name) {
 				return
 			}
 		}
@@ -1028,4 +1041,34 @@ test_a_list_key_needs_no_memory :: proc(t: ^testing.T) {
 	testing.expect(t, list_key(list, true) != want, "an allowlist shares a blocklist's key")
 	testing.expect(t, list_key({file = list.url}, false) != want, "a file shares a url's key")
 	testing.expect(t, list_key({url = "https://lists.example/ads.tx", file = "t"}, false) != want, "the url and file run together")
+}
+
+/*
+An operator's allow rule written without `@@` is spelt with it in the temp
+allocator; one that cannot grow drops the rebuild rather than the rule (#765).
+*/
+@(test)
+test_an_operator_allow_rule_without_memory_drops_the_build :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.blocking.rules = []string{"||ok.example^"}
+	cfg.blocking.allow_rules = []string{"||ok.example^"}
+	block, allow := build_filter_sets(&cfg, false)
+	if !testing.expect(t, block != nil && allow != nil, "no sets with memory to spare") {
+		return
+	}
+	// The premise: with memory, the allow rule takes.
+	testing.expect(t, filter.set_cover(allow, "ok.example", .A) != .None, "the allow rule did not take")
+	filter.set_destroy(block)
+	filter.set_destroy(allow)
+
+	// Every request refused, as a temp arena that cannot grow refuses them.
+	f := testkit.Fail_Nth{fail_at = 1, fail_for = 1 << 30}
+	{
+		context.temp_allocator = testkit.fail_nth(&f)
+		block, allow = build_filter_sets(&cfg, false)
+	}
+	testing.expect(t, f.seen > 0, "the temp allocator was not asked")
+	testing.expect(t, block == nil && allow == nil, "sets without the allow rule were built")
+	filter.set_destroy(block)
+	filter.set_destroy(allow)
 }
