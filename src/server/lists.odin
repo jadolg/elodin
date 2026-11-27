@@ -62,8 +62,8 @@ List_Load :: enum u8 {
 	// The download arrived holding no rules and there is no copy: it adds
 	// nothing, but is empty rather than lost, so it holds nothing back.
 	Empty,
-	// There was no memory to read it or to hold its rules: the sets are not
-	// whole, and the load is dropped.
+	// There was no memory to read it or to hold its rules, or it was left out
+	// for that: it adds nothing, and is retried.
 	No_Memory,
 }
 
@@ -75,12 +75,22 @@ for destroying whatever that swap displaces. When `loads` is given it has one
 slot per list, `blocking.lists` then `blocking.allowlists`, and says how each
 one fared.
 
-`whole` is false when there was no memory to build them whole: to read a list,
-or to hold a rule. The lists after the one that ran out, and the operator's
-rules, are not tried; the one that ran out is `.No_Memory` in `loads`, and so
-is each not tried. Both sets are nil when there is no memory to make them.
+A list `left_out` (by the same slots, when given) is not loaded, and is
+`.No_Memory` in `loads`. `whole` is false when there was no memory to build the
+sets whole: to read a list, or to hold a rule. The lists after the one that ran
+out, and the operator's rules, are not tried; the one that ran out is
+`.No_Memory` in `loads` and so is each not tried (`ran_out_of_memory` finds
+it). Both sets are nil when there is no memory to make them.
 */
-build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool, loads: []List_Load = nil) -> (block, allow: ^filter.Set, whole: bool) {
+build_filter_sets :: proc(
+	cfg: ^config.Config,
+	allow_network: bool,
+	loads: []List_Load = nil,
+	left_out: []bool = nil,
+) -> (
+	block, allow: ^filter.Set,
+	whole: bool,
+) {
 	move_query_named_caches(cfg)
 	for &load in loads {
 		load = .No_Memory
@@ -92,16 +102,21 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool, loads: []Lis
 		filter.set_destroy(allow)
 		return nil, nil, false
 	}
-	whole = load_lists(cfg, block, allow, allow_network, loads) && add_operator_rules(cfg, block, allow)
+	whole = load_lists(cfg, block, allow, allow_network, loads, left_out) && add_operator_rules(cfg, block, allow)
 	return
 }
 
-// Load every list into the sets, saying in `loads` how each fared; false at the
-// first that is `.No_Memory`.
+// Load every list not `left_out` into the sets, saying in `loads` how each
+// fared; false at the first that is `.No_Memory`.
 @(private)
-load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network: bool, loads: []List_Load) -> bool {
-	for list, i in cfg.blocking.lists {
-		load := load_one_list(cfg, list, block, allow, allow_network, false)
+load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network: bool, loads: []List_Load, left_out: []bool) -> bool {
+	lists := len(cfg.blocking.lists)
+	for i in 0 ..< lists + len(cfg.blocking.allow_lists) {
+		if left_out != nil && left_out[i] {
+			continue
+		}
+		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
+		load := load_one_list(cfg, list, block, allow, allow_network, i >= lists)
 		if loads != nil {
 			loads[i] = load
 		}
@@ -109,16 +124,20 @@ load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network
 			return false
 		}
 	}
-	for list, i in cfg.blocking.allow_lists {
-		load := load_one_list(cfg, list, block, allow, allow_network, true)
-		if loads != nil {
-			loads[len(cfg.blocking.lists) + i] = load
-		}
-		if load == .No_Memory {
-			return false
+	return true
+}
+
+// The slot of the list a build that was not whole ran out of memory on, or -1
+// when it ran out elsewhere: the first `.No_Memory` not `left_out`, since every
+// list before it was loaded.
+@(private)
+ran_out_of_memory :: proc(loads: []List_Load, left_out: []bool) -> int {
+	for load, i in loads {
+		if load == .No_Memory && !left_out[i] {
+			return i
 		}
 	}
-	return true
+	return -1
 }
 
 // Add `blocking.rules` and `blocking.allow_rules`; false when there was no
@@ -821,10 +840,12 @@ runs on. A list that never loaded does not hold the others back, and neither doe
 a `file:` list: that one is the operator's own, and one deleted to lift its
 blocks has to lift them, where a download is lost to the network.
 
-The new sets are dropped too when there was no memory to build them whole, or to
-record which lists loaded (#765): a set missing rules its lists hold never takes
-rules out of effect, whatever kind of list they came from. Where no rule is in
-effect, what fitted is swapped in instead (`no_memory_swaps`).
+A list there is no memory to read or hold is taken the same way, whatever its
+kind (#765): one that loaded before holds the refresh back, and one that never
+did is left out and the others built again without it (`build_what_fits`), so
+no list is ever in effect cut short. With no memory for the operator's rules or
+the sets themselves, the rebuild is dropped; with none to record which lists
+loaded, too, unless no rule is in effect.
 
 `current` is false when some list is unavailable or stood in for by a stale copy,
 or the sets could not be built whole for want of memory, so the caller retries
@@ -833,25 +854,31 @@ sooner than the interval; see `retry_after`.
 reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool) -> (current: bool) {
 	s.rules_no_memory = false
 	lists := len(cfg.blocking.lists)
-	loads, err := make([]List_Load, lists + len(cfg.blocking.allow_lists))
+	loads, lerr := make([]List_Load, lists + len(cfg.blocking.allow_lists))
 	defer delete(loads)
+	left_out, oerr := make([]bool, len(loads))
+	defer delete(left_out)
 	block, allow: ^filter.Set
 	whole: bool
-	if err == nil {
-		block, allow, whole = build_filter_sets(cfg, allow_network, loads)
+	if lerr == nil && oerr == nil {
+		block, allow, whole = build_what_fits(s, cfg, allow_network, loads, left_out)
 	}
 	if !whole {
 		s.rules_no_memory = true
-		if !no_memory_swaps(s, block) {
-			filter.set_destroy(block)
-			filter.set_destroy(allow)
-			return false
-		}
+		filter.set_destroy(block)
+		filter.set_destroy(allow)
+		return false
 	}
 
-	current = whole
+	current = true
 	for load, i in loads {
 		if load == .Current {
+			continue
+		}
+		if load == .No_Memory {
+			// Left out: retried whatever kind of list it is.
+			s.rules_no_memory = true
+			current = false
 			continue
 		}
 		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
@@ -868,25 +895,18 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 			return false
 		}
 	}
-	// Built aside and swapped in whole: a list missing from it would not hold
-	// a later refresh back when it is unavailable.
-	loaded: map[u64]bool
-	for load, i in loads {
-		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
-		// An empty or disabled list contributed nothing, so it has nothing to
-		// keep later. Only a load is recorded: two entries for one source share
-		// a key, and the one that loaded is the one whose rules are in effect.
-		if list.enabled && (load == .Current || load == .Stale) && map_insert(&loaded, list_key(list, i >= lists), true) == nil {
-			s.rules_no_memory = true
+	if !record_loaded(s, cfg, loads) {
+		s.rules_no_memory = true
+		current = false
+		// With no rule in effect the sets are better in effect than not, and
+		// the retry records them.
+		if rules_in_effect(s) {
 			warn_no_memory(s)
-			delete(loaded)
 			filter.set_destroy(block)
 			filter.set_destroy(allow)
 			return false
 		}
 	}
-	delete(s.lists_loaded)
-	s.lists_loaded = loaded
 
 	old_block, old_allow := filter.engine_swap(s.filters, block, allow)
 
@@ -913,19 +933,71 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 }
 
 /*
-Whether sets `block` (with its allow set) built without the memory to be whole
-are swapped in, saying what is done instead. Only where no rule is in effect:
-then what fits blocks what it can until a retry builds the rest, as AdGuard
-Home and blocky go on with the lists that loaded. Where rules are in effect,
-they are kept, since a set missing rules would take them out of effect.
+Build the sets, leaving out each list there is no memory for that never loaded
+(`lists_loaded`) and building the others again without it, as AdGuard Home goes
+on with the filters that load. `left_out` says which were. Not `whole`, saying
+why, when one that loaded before ran out, or the operator's rules or the sets
+themselves did; the sets are then the caller's to destroy.
 */
 @(private)
-no_memory_swaps :: proc(s: ^Server, block: ^filter.Set) -> bool {
-	if block == nil || rules_in_effect(s) {
-		warn_no_memory(s)
-		return false
+build_what_fits :: proc(
+	s: ^Server,
+	cfg: ^config.Config,
+	allow_network: bool,
+	loads: []List_Load,
+	left_out: []bool,
+) -> (
+	block, allow: ^filter.Set,
+	whole: bool,
+) {
+	lists := len(cfg.blocking.lists)
+	for {
+		block, allow, whole = build_filter_sets(cfg, allow_network, loads, left_out)
+		if whole || block == nil {
+			break
+		}
+		i := ran_out_of_memory(loads, left_out)
+		if i < 0 {
+			break
+		}
+		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
+		if s.lists_loaded[list_key(list, i >= lists)] {
+			logx.warnf("list %s: loaded before and there is no memory to hold it now; keeping the rules already in effect", list.name)
+			return
+		}
+		logx.warnf("list %s: there is no memory to hold it; building the other lists without it", list.name)
+		left_out[i] = true
+		filter.set_destroy(block)
+		filter.set_destroy(allow)
 	}
-	logx.warnf("filter: there is no memory to build the rule sets whole; with no rules in effect, the ones that fit are used until a retry builds the rest")
+	if !whole {
+		warn_no_memory(s)
+	}
+	return
+}
+
+/*
+Record in `lists_loaded` which lists are in the sets about to be swapped in,
+built aside and swapped whole: a list missing from it would not hold a later
+refresh back when it is unavailable. False, leaving it as it was, when there is
+no memory to.
+*/
+@(private)
+record_loaded :: proc(s: ^Server, cfg: ^config.Config, loads: []List_Load) -> bool {
+	lists := len(cfg.blocking.lists)
+	loaded: map[u64]bool
+	for load, i in loads {
+		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
+		// An empty or disabled list contributed nothing, so it has nothing to
+		// keep later. Only a load is recorded: two entries for one source share
+		// a key, and the one that loaded is the one whose rules are in effect.
+		if list.enabled && (load == .Current || load == .Stale) && map_insert(&loaded, list_key(list, i >= lists), true) == nil {
+			delete(loaded)
+			return false
+		}
+	}
+	delete(s.lists_loaded)
+	s.lists_loaded = loaded
 	return true
 }
 

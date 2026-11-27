@@ -1260,14 +1260,14 @@ test_operator_rules_stop_at_the_first_without_memory :: proc(t: ^testing.T) {
 }
 
 /*
-With no rule in effect - the first build, or blocking just turned on - a build
-without the memory to be whole swaps in what fitted rather than nothing (#765),
-as AdGuard Home and blocky go on with the lists that loaded. It is not current,
-and is marked for a retry. Lists load in order, so a list before the one that
-ran out is in effect whole.
+A list there is no memory to hold that never loaded is left out, and the others
+are built again without it (#765), as AdGuard Home goes on with the filters that
+load: no list is ever in effect cut short, and the operator's own rules - here
+an allow rule for a name a list blocks - are in effect whole or not at all. Each
+allocation of a first build is refused in turn, from an empty engine.
 */
 @(test)
-test_a_first_build_without_memory_uses_what_fitted :: proc(t: ^testing.T) {
+test_a_list_without_memory_that_never_loaded_is_left_out :: proc(t: ^testing.T) {
 	N :: 200
 	paths: [2]string
 	for &path, l in paths {
@@ -1287,15 +1287,21 @@ test_a_first_build_without_memory_uses_what_fitted :: proc(t: ^testing.T) {
 		{name = "a", file = paths[0], format = .Hosts, enabled = true},
 		{name = "b", file = paths[1], format = .Hosts, enabled = true},
 	}
-	blocked :: proc(s: ^Server, l, i: int) -> bool {
-		return filter.engine_match(s.filters, fmt.tprintf("first-%d-%d.example.", l, i), .A) == .Blocked
+	cfg.blocking.rules = []string{"||operator.example^"}
+	// The first list's first name, which the operator allows.
+	cfg.blocking.allow_rules = []string{"||first-0-0.example^"}
+	held :: proc(s: ^Server, l: int) -> (n: int) {
+		for i in 0 ..< N {
+			n += int(filter.engine_match(s.filters, fmt.tprintf("first-%d-%d.example.", l, i), .A) == .Blocked)
+		}
+		return
 	}
 
 	// One for every run, so the allocator a swapped-in set keeps stays good
 	// until the server holding it is closed.
 	f: testkit.Fail_Nth
 	f.backing = context.allocator
-	used := 0
+	left_out, unrecorded := 0, 0
 	for fail_at := 1; ; fail_at += 1 {
 		s := list_server(&cfg)
 		defer close_list_server(&s)
@@ -1305,30 +1311,98 @@ test_a_first_build_without_memory_uses_what_fitted :: proc(t: ^testing.T) {
 			context.allocator = testkit.fail_nth(&f)
 			current = reload_filters(&s, false)
 		}
+		a, b := held(&s, 0), held(&s, 1)
+		swapped := filter.engine_generation(s.filters) != 0
 		if f.seen < fail_at {
-			testing.expect(t, current && !s.rules_no_memory, "a build with every allocation granted is not current")
+			testing.expect(t, current && !s.rules_no_memory && a == N - 1 && b == N, "a build with every allocation granted is not whole")
 			break
 		}
-		first_whole, second_any, second_whole := true, false, true
-		for i in 0 ..< N {
-			first_whole &&= blocked(&s, 0, i)
-			second_any ||= blocked(&s, 1, i)
-			second_whole &&= blocked(&s, 1, i)
-		}
-		if !s.rules_no_memory {
-			// Refused after the sets were whole, where a smaller copy was all
-			// it would have bought (`table_trim`).
-			testing.expectf(t, current && first_whole && second_whole, "run %d: a build not marked out of memory is not whole", fail_at)
+		if !swapped {
+			testing.expectf(t, !current && s.rules_no_memory, "run %d: a dropped build is not marked for a retry", fail_at)
 			continue
 		}
-		testing.expectf(t, !current, "run %d: a build that ran out is current", fail_at)
-		testing.expectf(t, !second_any || first_whole, "run %d: the second list took effect with the first cut short", fail_at)
-		// One not tried, or cut short, does not hold a later refresh back.
-		testing.expectf(t, !s.lists_loaded[list_key(cfg.blocking.lists[1], false)], "run %d: the second list is recorded as loaded", fail_at)
-		if first_whole && !second_any {
-			used += 1
+		// Each list whole (but the name the operator allows) or not at all.
+		testing.expectf(t, a == 0 || a == N - 1, "run %d: the first list is in effect cut short, %d of %d", fail_at, a, N - 1)
+		testing.expectf(t, b == 0 || b == N, "run %d: the second list is in effect cut short, %d of %d", fail_at, b, N)
+		testing.expectf(t, filter.engine_match(s.filters, "operator.example.", .A) == .Blocked, "run %d: the operator's block rule is not in effect", fail_at)
+		testing.expectf(t, filter.engine_match(s.filters, "first-0-0.example.", .A) != .Blocked, "run %d: the operator's allow rule is not in effect", fail_at)
+		// A list is recorded as loaded only if in effect; and each in effect is,
+		// unless there was no memory to record them, which a retry does.
+		for l in 0 ..< 2 {
+			in_effect := (a if l == 0 else b) > 0
+			recorded := s.lists_loaded[list_key(cfg.blocking.lists[l], false)]
+			testing.expectf(t, in_effect || !recorded, "run %d: list %d recorded and not in effect", fail_at, l)
+			testing.expectf(t, recorded == in_effect || s.rules_no_memory, "run %d: list %d in effect and not recorded, with no retry", fail_at, l)
+			unrecorded += int(in_effect && !recorded)
+		}
+		if a == 0 || b == 0 {
+			left_out += 1
+			testing.expectf(t, !current && s.rules_no_memory, "run %d: a build that left a list out is not marked for a retry", fail_at)
 		}
 	}
-	// The premise: runs that ran out on the second list kept the first in effect.
-	testing.expectf(t, used > 0, "no run used the first list alone")
+	// The premise: some runs left a list out and swapped in the rest, and some
+	// had no memory to record the lists and swapped them in all the same.
+	testing.expectf(t, left_out > 0, "no run left a list out")
+	testing.expectf(t, unrecorded > 0, "no run swapped in lists it could not record")
+}
+
+/*
+With rules in effect, a list added since that there is no memory to hold is left
+out too, and the refresh of the lists that loaded before goes ahead (#765): a
+list too big to ever fit does not hold every refresh back for good.
+*/
+@(test)
+test_a_new_list_without_memory_does_not_hold_the_others_back :: proc(t: ^testing.T) {
+	N :: 200
+	paths: [2]string
+	for &path, l in paths {
+		path = fmt.tprintf("/tmp/elodin-server-lists-test-new-%d-%d.txt", l, os.get_pid())
+		b := strings.builder_make(context.temp_allocator)
+		for i in 0 ..< N {
+			fmt.sbprintf(&b, "0.0.0.0 new-%d-%d.example\n", l, i)
+		}
+		if !testing.expect(t, os.write_entire_file(path, strings.to_string(b)) == nil, "cannot write a list") {
+			return
+		}
+	}
+	defer os.remove(paths[0])
+	defer os.remove(paths[1])
+	old := config.Block_List{name = "old", file = paths[0], format = .Hosts, enabled = true}
+	added := config.Block_List{name = "added", file = paths[1], format = .Hosts, enabled = true}
+	held :: proc(s: ^Server, l: int) -> (n: int) {
+		for i in 0 ..< N {
+			n += int(filter.engine_match(s.filters, fmt.tprintf("new-%d-%d.example.", l, i), .A) == .Blocked)
+		}
+		return
+	}
+
+	f: testkit.Fail_Nth
+	f.backing = context.allocator
+	went_ahead := 0
+	for fail_at := 1; ; fail_at += 1 {
+		cfg := config.default_config()
+		cfg.blocking.lists = []config.Block_List{old}
+		s := list_server(&cfg)
+		defer close_list_server(&s)
+		if !testing.expect(t, reload_filters(&s, false), "the old list did not load") {
+			return
+		}
+		// The added list first, so running out on it leaves the old one untried.
+		cfg.blocking.lists = []config.Block_List{added, old}
+		generation := filter.engine_generation(s.filters)
+		f.seen, f.fail_at, f.fail_for = 0, fail_at, 1
+		{
+			context.allocator = testkit.fail_nth(&f)
+			reload_filters(&s, false)
+		}
+		testing.expectf(t, held(&s, 0) == N, "run %d: the old list is out of effect", fail_at)
+		if f.seen < fail_at {
+			break
+		}
+		if filter.engine_generation(s.filters) != generation && held(&s, 1) == 0 {
+			went_ahead += 1
+			testing.expectf(t, s.rules_no_memory, "run %d: the added list left out is not retried", fail_at)
+		}
+	}
+	testing.expectf(t, went_ahead > 0, "no refresh went ahead without the added list")
 }

@@ -68,32 +68,30 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   effect`). This happens with an unwritable or cleared `cache_dir`. A list that
   has never loaded does not hold the other lists back, and neither does a
   `file:` list: delete one and its rules go at the next refresh.
-- If there is no memory to build the rule sets whole (to read a `file:` list
-  or a cached copy, to hold a rule, `$badfilter` or regex, or to record which
-  lists loaded), the lists after the one that ran out and the operator's own
-  rules are not tried, a download that was being read is not cached, and:
-  - where rules are in effect, the load is dropped and they are kept, whatever
-    the kind of list (`filter: there is no memory to build the rule sets;
-    keeping the rules already in effect`);
-  - where none are (at startup, or when a reload turns blocking on), the rules
-    that fitted are used until a retry builds the rest (`filter: there is no
-    memory to build the rule sets whole; with no rules in effect, the ones that
-    fit are used until a retry builds the rest`), as AdGuard Home and blocky go
-    on with the lists that loaded. Lists load in order, so those before the one
-    that ran out are in effect whole. With no memory to make the sets at all,
-    none are (`filter: there is no memory to build the rule sets; no rules are
-    in effect until a retry succeeds`).
-
-  The list that ran out says so first (`list NAME: there is no memory to read
-  "PATH"` for a `file:` list, `list NAME: there is no memory to read the cached
-  copy` for a downloaded one).
+- A list there is no memory to read (a `file:` list or a cached copy) or to
+  hold (its rules, `$badfilter`s or regexes) is taken as an unavailable one is,
+  whatever its kind: one that loaded before holds the refresh back and every
+  rule already in effect is kept (`list NAME: loaded before and there is no
+  memory to hold it now; keeping the rules already in effect`); one that never
+  loaded is left out, and the other lists are built again without it (`list
+  NAME: there is no memory to hold it; building the other lists without it`),
+  as AdGuard Home goes on with the filters that load. A list is never in
+  effect cut short. A download that was being read when memory ran out is not
+  cached. The list says why first (`list NAME: there is no memory to read
+  "PATH"`, `list NAME: there is no memory to read the cached copy`).
+- With no memory for the operator's own rules or for the rule sets themselves,
+  the load is dropped and the rules already in effect are kept (`filter: there
+  is no memory to build the rule sets; keeping the rules already in effect`, or
+  `...; no rules are in effect until a retry succeeds` where there are none).
+  With none to record which lists loaded, it is dropped too, unless no rule is
+  in effect: then the sets are used, and the retry records them.
 - A refresh where some downloaded list is unavailable, or was served from its
-  cached copy because the download failed or held no rules, or that had no
-  memory to build the sets whole, is retried after 1
+  cached copy because the download failed or held no rules, or that left a
+  list out or was dropped for want of memory, is retried after 1
   minute, then 2, 4 and so on, up to 1 hour or `refresh`, whichever is shorter
   (`blocklists: not every list is current; trying again in 1m0s`). A start that
   could not load every list is retried the same way. A missing `file:` list is
-  not retried. A load without the memory to be whole is retried the same way even
+  not retried. A load that ran out of memory is retried the same way even
   under `--no-fetch` or `refresh: 0`, at most 1 hour apart, until it succeeds
   (`blocklists: there was no memory to build the rules; trying again in 1m0s`).
 - A rule costs about 35 bytes resident: its name, a flags byte and an 8-byte
