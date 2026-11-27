@@ -1,9 +1,9 @@
 package tlsx
 
+import "base:runtime"
 import "core:bytes"
 import "core:c"
 import "core:fmt"
-import "core:math/rand"
 import "core:mem"
 import "core:net"
 import "core:os"
@@ -16,6 +16,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 Tests run a real TLS session over loopback against a self-signed pair. Nothing
@@ -55,21 +56,18 @@ ssl_ctx_sess_number :: proc(ctx: ^SSL_CTX) -> int {
 Provide a certificate, the same way the integration suite does.
 
 `certs/` is gitignored, so a developer usually has one and CI never does. When
-it is missing, one is generated into the system temp directory and left there to
-be reused by later runs, which keeps key generation off the clock for everything
-but the first.
+it is missing, each run makes its own pair in a `testkit.private_dir` under
+this prefix: no run reads a directory another is writing, and the sweep takes
+the pairs of runs that have ended.
 */
 @(private = "file")
-CERT_DIR :: "/tmp/elodin-tlsx-test"
+CERT_DIR_PREFIX :: "/tmp/elodin-tlsx-test-"
 
 /*
 How long a generated certificate lives.
 
-Thirty days, since an expired one is noticed rather than handshaken with (see
-`cert_still_valid`): the reuse is there to keep key generation off the clock,
-and a lifetime of a day or two would spend it again every other day for no
-reason. Still short enough that a forgotten key in the system temp directory is
-not a permanent one.
+Thirty days: each run makes its own, so the length only has to outlast the run,
+and a key a sweep has not yet taken is not a permanent one.
 */
 @(private = "file")
 CERT_DAYS :: "30"
@@ -120,49 +118,14 @@ generate_certs :: proc() {
 		return
 	}
 
-	cert_path = CERT_DIR + "/cert.pem"
-	key_path = CERT_DIR + "/key.pem"
-	if usable_pair(cert_path, key_path) {
-		cert_ok = true
+	testkit.sweep_private_dirs(CERT_DIR_PREFIX)
+	dir, made := testkit.private_dir(CERT_DIR_PREFIX)
+	if !made {
 		return
 	}
-	/*
-	Published whole, since a run in another checkout may be reading or making
-	the same pair: it is made in a directory of this process's own and renamed
-	into place, and a rename refuses a target another run has already filled, so
-	no run reads one run's certificate beside another's key. A pair past its
-	date is moved aside first, by a rename only one run can win.
-
-	shortcut: two runs that both find the pair expired at the same moment can
-	still move a fresh one aside; upgrade to renameat2's RENAME_EXCHANGE if that
-	is ever seen.
-	*/
-	// The pid and a random suffix: two runs in different pid namespaces sharing
-	// /tmp can have the same pid.
-	run := fmt.tprintf("%d-%x", posix.getpid(), rand.uint64())
-	// Only a pair openssl calls expired is moved aside. A directory with no pair
-	// yet may be one an older checkout's run is still filling.
-	if os.exists(cert_path) && os.exists(key_path) && !cert_still_valid(cert_path) {
-		aside := fmt.tprintf("%s-stale-%s", CERT_DIR, run)
-		if os.rename(CERT_DIR, aside) == nil {
-			_ = os.remove_all(aside) // lint:allow a stale pair left behind is only litter in the temp directory
-		}
-	}
-	made := fmt.tprintf("%s-%s", CERT_DIR, run)
-	if !self_signed(made, fmt.tprintf("%s/cert.pem", made), fmt.tprintf("%s/key.pem", made), CERT_DAYS, "/CN=elodin.local", ELODIN_SAN) {
-		_ = os.remove_all(made) // lint:allow a failed attempt left behind is only litter in the temp directory
-		return
-	}
-	if os.rename(made, CERT_DIR) != nil {
-		// Another run published first: its pair is whole, and this one goes.
-		_ = os.remove_all(made) // lint:allow a pair left behind is only litter in the temp directory
-	}
-	cert_ok = usable_pair(cert_path, key_path)
-	if !cert_ok {
-		// What holds the name is no pair at all: half of one, say, left by a
-		// run that was killed. Made in place, as nothing whole stands there.
-		cert_ok = self_signed(CERT_DIR, cert_path, key_path, CERT_DAYS, "/CN=elodin.local", ELODIN_SAN) && usable_pair(cert_path, key_path)
-	}
+	cert_path = fmt.aprintf("%s/cert.pem", dir, allocator = runtime.heap_allocator())
+	key_path = fmt.aprintf("%s/key.pem", dir, allocator = runtime.heap_allocator())
+	cert_ok = self_signed(dir, cert_path, key_path, CERT_DAYS, "/CN=elodin.local", ELODIN_SAN) && usable_pair(cert_path, key_path)
 }
 
 @(private)

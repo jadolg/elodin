@@ -15,6 +15,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:loop"
 import "elodin:netx"
+import "elodin:testkit"
 import "elodin:tlsx"
 
 /*
@@ -1727,7 +1728,7 @@ Package-private rather than file-private: `padding_test.odin` stands up a DoT
 mock of its own and there is one key generation to share between them.
 */
 @(private)
-DOT_CERT_DIR :: "/tmp/elodin-upstream-test"
+DOT_CERT_DIR_PREFIX :: "/tmp/elodin-upstream-test-"
 
 @(private)
 dot_cert_once: sync.Once
@@ -1738,9 +1739,9 @@ dot_key_path: string
 @(private)
 dot_cert_ok: bool
 
-// Generated into the system temp directory and left there, so only the first
-// run of the suite pays for key generation. `certs/` is used when a developer
-// already has one; CI never does.
+// Generated into a `testkit.private_dir` of this run's own, so no run reads a
+// pair another is writing; the sweep takes the pairs of runs that have ended.
+// `certs/` is used when a developer already has one; CI never does.
 @(private)
 generate_dot_certs :: proc() {
 	if os.exists("certs/cert.pem") && os.exists("certs/key.pem") {
@@ -1748,17 +1749,13 @@ generate_dot_certs :: proc() {
 		return
 	}
 
-	dot_cert_path = DOT_CERT_DIR + "/cert.pem"
-	dot_key_path = DOT_CERT_DIR + "/key.pem"
-	if os.exists(dot_cert_path) && os.exists(dot_key_path) {
-		dot_cert_ok = true
+	testkit.sweep_private_dirs(DOT_CERT_DIR_PREFIX)
+	dir, made := testkit.private_dir(DOT_CERT_DIR_PREFIX)
+	if !made {
 		return
 	}
-	if !os.exists(DOT_CERT_DIR) {
-		if err := os.make_directory(DOT_CERT_DIR); err != nil {
-			return
-		}
-	}
+	dot_cert_path = fmt.aprintf("%s/cert.pem", dir, allocator = runtime.heap_allocator())
+	dot_key_path = fmt.aprintf("%s/key.pem", dir, allocator = runtime.heap_allocator())
 
 	process, perr := os.process_start(
 		os.Process_Desc {

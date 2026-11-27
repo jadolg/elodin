@@ -42,7 +42,10 @@ referral_loop :: proc(m: ^Referral_Mock) {
 		reply.flags.rd = q.flags.rd
 		wire, _, enc := dns.encode_message(reply, context.temp_allocator)
 		if enc != .None {
-			panic("the referral does not encode")
+			// Not answered: the case fails on the referral never coming, on its
+			// own thread, rather than this mock taking the whole run down.
+			free_all(context.temp_allocator)
+			continue
 		}
 		_, _ = net.send_udp(m.socket, wire, client) // lint:allow a reply that does not go out reads as the referral never coming
 		free_all(context.temp_allocator)

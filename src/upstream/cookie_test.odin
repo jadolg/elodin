@@ -103,16 +103,17 @@ cookie_mock_reply :: proc(m: ^Cookie_Mock, query: []u8, count: int) -> (reply: [
 		return wire, true
 	}
 
-	option: [16]u8
-	copy(option[:8], sent[:min(8, len(sent))])
+	option: [COOKIE_CLIENT_LEN + len(m.server)]u8
+	copy(option[:COOKIE_CLIENT_LEN], sent[:min(COOKIE_CLIENT_LEN, len(sent))])
 	if m.forge {
 		option[0] ~= 0xff
 	}
-	copy(option[8:], m.server[:])
+	copy(option[COOKIE_CLIENT_LEN:], m.server[:])
 	if m.rotate {
-		option[15] = u8(count)
+		option[len(option) - 1] = u8(count)
 	}
-	written := option[:12] if m.short else option[:]
+	// A server cookie shorter than any RFC 7873 section 4 allows.
+	written := option[:COOKIE_CLIENT_LEN + COOKIE_SERVER_MIN / 2] if m.short else option[:]
 	out, set_ok := dns.set_edns_option(wire, .Cookie, written, context.temp_allocator)
 	if !set_ok {
 		return wire, true

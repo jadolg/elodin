@@ -3,14 +3,10 @@ package server
 import "base:runtime"
 import "core:bytes"
 import "core:fmt"
-import "core:math/rand"
 import "core:os"
-import "core:strings"
 import "core:sync"
-import "core:sys/linux"
 import "core:testing"
-import "core:time"
-import "elodin:netx"
+import "elodin:testkit"
 import "elodin:tlsx"
 
 /*
@@ -68,9 +64,9 @@ wild_key_path: string
 
 @(private = "file")
 generate_certs :: proc() {
-	sweep_ended_runs()
+	testkit.sweep_private_dirs(CERT_DIR_PREFIX)
 	made: bool
-	if cert_dir, made = make_private_dir(); !made {
+	if cert_dir, made = testkit.private_dir(CERT_DIR_PREFIX); !made {
 		return
 	}
 	cert_path = fmt.aprintf("%s/cert.pem", cert_dir, allocator = runtime.heap_allocator())
@@ -153,76 +149,6 @@ ensure_profile_certs :: proc() -> (cert, key: string, ok: bool) {
 // appended.
 @(private = "file")
 CERT_DIR_PREFIX :: "/tmp/elodin-server-profile-test-"
-
-/*
-A directory of this run's own, `CERT_DIR_PREFIX` with the pid and a random
-suffix: made by this call, mode 0700, so nothing can already be there and nobody
-else can plant anything in it, and the keys written into it are this user's to
-read. "" and false when none could be made.
-*/
-@(private = "file")
-make_private_dir :: proc() -> (dir: string, ok: bool) {
-	for _ in 0 ..< 8 {
-		dir = fmt.aprintf("%s%d-%x", CERT_DIR_PREFIX, os.get_pid(), rand.uint64(), allocator = runtime.heap_allocator())
-		#partial switch linux.mkdir(strings.clone_to_cstring(dir, context.temp_allocator), {.IRUSR, .IWUSR, .IXUSR}) {
-		case .NONE:
-			return dir, true
-		case .EEXIST:
-			delete(dir, runtime.heap_allocator())
-		case:
-			delete(dir, runtime.heap_allocator())
-			return "", false
-		}
-	}
-	return "", false
-}
-
-/*
-Remove the certificate directories of runs that have ended. The test runner
-leaves through `exit`, which runs neither `@(fini)` nor `atexit` handlers, so a
-run cannot remove its own; the next one removes each that is a real directory of
-this user's, named by a pid that is gone, and untouched for `CERT_DIR_STALE`.
-
-Read with `lstat`, which does not follow a link: `os.remove_all` would, and a
-link planted under the prefix would have it empty whatever it points at. The age
-is what keeps a run in another pid namespace sharing this /tmp, whose pid this
-/proc cannot see, from losing its directory mid-run.
-*/
-@(private = "file")
-sweep_ended_runs :: proc() {
-	if !os.exists("/proc/self") {
-		return
-	}
-	entries, err := os.read_all_directory_by_path("/tmp", context.temp_allocator)
-	if err != nil {
-		return
-	}
-	for e in entries {
-		if !strings.has_prefix(e.fullpath, CERT_DIR_PREFIX) {
-			continue
-		}
-		st: linux.Stat
-		if linux.lstat(strings.clone_to_cstring(e.fullpath, context.temp_allocator), &st) != .NONE ||
-		   !linux.S_ISDIR(st.mode) ||
-		   st.uid != linux.getuid() {
-			continue
-		}
-		name := e.fullpath[len(CERT_DIR_PREFIX):]
-		pid := name[:strings.index_byte(name, '-')] if strings.contains_rune(name, '-') else name
-		if _, numeric := netx.parse_decimal(pid, u64(max(i32))); !numeric || os.exists(fmt.tprintf("/proc/%s", pid)) {
-			continue
-		}
-		age := time.diff(time.unix(i64(st.mtime.time_sec), 0), time.now()) // lint:allow wall-clock: a file's mtime is an instant on it
-		if age < CERT_DIR_STALE {
-			continue
-		}
-		_ = os.remove_all(e.fullpath) // lint:allow a directory left behind is only the next sweep's
-	}
-}
-
-// How long an ended run's certificate directory is left before a sweep takes it.
-@(private = "file")
-CERT_DIR_STALE :: time.Hour
 
 // How many profiles `p`'s cache holds.
 @(private = "file")
