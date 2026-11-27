@@ -258,7 +258,8 @@ move_query_named_caches :: proc(cfg: ^config.Config) {
 			}
 			// A copy under the current name that is of another url - one with no
 			// query an earlier build cached there - is moved over, not kept.
-			kept := os.exists(names.copy) && copy_is_of(list, names)
+			ours := copy_is_of(list, names)
+			kept := ours && os.exists(names.copy)
 			if dry {
 				break moves
 			}
@@ -272,9 +273,10 @@ move_query_named_caches :: proc(cfg: ^config.Config) {
 				logx.warnf("list %s: cannot move the cached copy to %s (%v)", list.name, names.copy, err)
 				continue
 			}
-			// Named by this very url, so it is this url's copy. Unmarked, it would
-			// read as another url's: it goes back, to move at the next load.
-			if !mark_copy_source(cfg, list, names) {
+			// Named by this very url, so it is this url's copy. Unmarked for want of
+			// memory, it goes back, to move at the next load; for any other reason
+			// it stays, unmarked, so the key leaves `cache_dir` all the same.
+			if merr := mark_copy_source(cfg, list, names, ours); no_memory(merr) {
 				if err := os.rename(names.copy, old_path); err != nil {
 					logx.warnf("list %s: cannot move the cached copy back to the name its url's query gave it (%v)", list.name, err)
 				}
@@ -582,14 +584,22 @@ read_cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: Lis
 
 /*
 Write `text` as `list`'s cached copy, beside its url's fingerprint. Where there is
-no memory to spell their names whole nothing is written, and the copy before it,
-if any, is left as it was: a name spelt short is another list's file, or one
-outside `cache_dir`.
+no memory to spell their names whole, or to read the fingerprint there, nothing
+is written, and the copy before it, if any, is left as it was: a name spelt
+short is another list's file, or one outside `cache_dir`.
 */
 @(private)
 save_cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, text: string) {
 	names, named := cache_names(cfg, list)
-	if !named {
+	// Read before anything is written: after a refusal, whose it is is not known.
+	dry: bool
+	temp := dns.Dry_Watch{context.temp_allocator, &dry}
+	ours: bool
+	{
+		context.temp_allocator = dns.dry_watch_allocator(&temp)
+		ours = named && copy_is_of(list, names)
+	}
+	if !named || dry {
 		logx.warnf("list %s: there is no memory to name the cached copy; it is not saved", list.name)
 		return
 	}
@@ -605,33 +615,36 @@ save_cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, text: str
 		warn_cache_unwritable(cfg, names.copy, werr)
 		return
 	}
-	// Another url's fingerprint left beside this url's copy would make the copy
-	// that url's download.
-	if !mark_copy_source(cfg, list, names) && os.exists(names.source) && !copy_is_of(list, names) {
-		if rerr := os.remove(names.source); rerr != nil {
-			logx.warnf("list %s: cannot remove the old fingerprint at %s (%v)", list.name, names.source, rerr)
-		}
-	}
+	mark_copy_source(cfg, list, names, ours)
 }
 
-// Put the fingerprint of `list`'s url beside its copy, or none for a url with no
-// query, and say whether it is there.
+/*
+Put the fingerprint of `list`'s url beside its copy, or none for a url with no
+query, and return why it is not there. A write that fails leaves the one before,
+which stays only where `ours` says it is this url's: another url's beside this
+url's copy would make the copy that url's download.
+*/
 @(private)
-mark_copy_source :: proc(cfg: ^config.Config, list: config.Block_List, names: Cache_Names) -> (marked: bool) {
+mark_copy_source :: proc(cfg: ^config.Config, list: config.Block_List, names: Cache_Names, ours: bool) -> (err: os.Error) {
 	if names.fingerprinted {
-		// Replaced whole, so a write that fails leaves the one before.
-		if werr := write_cache_file(names.source, transmute([]byte)names.fingerprint); werr != nil {
-			warn_cache_unwritable(cfg, names.copy, werr)
-			return false
+		err = write_cache_file(names.source, transmute([]byte)names.fingerprint)
+		if err == nil {
+			return nil
 		}
-	} else if os.exists(names.source) {
-		// Left in place, it marks the copy as another url's for good.
-		if rerr := os.remove(names.source); rerr != nil {
-			logx.warnf("list %s: cannot remove the old fingerprint at %s (%v)", list.name, names.source, rerr)
-			return false
+		warn_cache_unwritable(cfg, names.copy, err)
+		if ours {
+			return
+		}
+	} else if !os.exists(names.source) {
+		return nil
+	}
+	if rerr := os.remove(names.source); rerr != nil && rerr != .Not_Exist {
+		logx.warnf("list %s: cannot remove the old fingerprint at %s (%v)", list.name, names.source, rerr)
+		if err == nil {
+			err = rerr
 		}
 	}
-	return true
+	return
 }
 
 // Where `list`'s cached copy and its fingerprint are, and the fingerprint of its url.
@@ -910,10 +923,17 @@ warning per list that reads like a failure to block anything.
 @(private)
 cache_warned: bool
 
+// Whether `err` is a refused allocation, which says nothing of the file or the
+// directory it was for.
+@(private)
+no_memory :: proc(err: os.Error) -> bool {
+	_, refused := err.(runtime.Allocator_Error)
+	return refused
+}
+
 @(private)
 warn_cache_unwritable :: proc(cfg: ^config.Config, cache_path: string, err: os.Error) {
-	// No memory to name a file says nothing of the directory.
-	if _, no_memory := err.(runtime.Allocator_Error); no_memory {
+	if no_memory(err) {
 		logx.warnf("list cache: there is no memory to write %s", cache_path)
 		return
 	}

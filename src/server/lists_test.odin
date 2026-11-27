@@ -6,7 +6,6 @@ import "core:mem"
 import "core:net"
 import "core:os"
 import "core:strings"
-import "core:sync"
 import "core:sys/posix"
 import "core:testing"
 import "core:thread"
@@ -1958,13 +1957,13 @@ filepath_base :: proc(path: string) -> string {
 }
 
 /*
-A copy saved while the temp allocator refuses one request is read back as the
-list's own, new or the one before, and never as another url's: a copy of
+A copy saved while the temp allocator refuses a run of requests is read back as
+the list's own, new or the one before, and never as another url's: a copy of
 another query saved before is read as that query's only while it is that copy.
 Nothing is written but the copy and its fingerprint, beside each other in
 `cache_dir` (#780): a name spelt short is another list's file, or one outside
 the cache, and is never written. The cache directory, made by the save, is made
-where it is named and nowhere else. A refusal is no verdict on the directory.
+where it is named and nowhere else.
 */
 @(test)
 test_a_copy_saved_without_memory_is_its_own :: proc(t: ^testing.T) {
@@ -2000,70 +1999,69 @@ test_a_copy_saved_without_memory_is_its_own :: proc(t: ^testing.T) {
 		return
 	}
 	defer os.remove(".tmp")
-	if !testing.expect(t, !sync.atomic_load(&cache_warned), "the premise: the cache was not reported unwritable") {
-		return
-	}
 
 	Before :: enum {
 		None,
 		Same_Url,
 		Other_Url,
 	}
+	// A run longer than one refuses the fingerprint's write and the read after.
 	for old in Before {
-		refused := 0
-		for fail_at := 1; ; fail_at += 1 {
-			clear_copies(path)
-			os.remove(cfg.blocking.cache_dir)
-			if old != .None {
-				saved := list if old == .Same_Url else before
-				save_cached_copy(&cfg, saved, OLD)
-				text, load := cached_copy(&cfg, saved, .Stale)
-				ok := testing.expectf(t, load == .Stale && text == OLD, "the premise: the old copy reads as %v %q", load, text)
+		for run_length in 1 ..= 3 {
+			refused := 0
+			for fail_at := 1; ; fail_at += 1 {
+				clear_copies(path)
+				os.remove(cfg.blocking.cache_dir)
+				if old != .None {
+					saved := list if old == .Same_Url else before
+					save_cached_copy(&cfg, saved, OLD)
+					text, load := cached_copy(&cfg, saved, .Stale)
+					ok := testing.expectf(t, load == .Stale && text == OLD, "the premise: the old copy reads as %v %q", load, text)
+					delete(text)
+					if !ok {
+						return
+					}
+				}
+				f := testkit.Fail_Nth{fail_at = fail_at, fail_for = run_length}
+				{
+					context.temp_allocator = testkit.fail_nth(&f)
+					save_cached_copy(&cfg, list, NEW)
+				}
+				run := fmt.tprintf("old %v, %d refused from %d", old, run_length, fail_at)
+				text, load := cached_copy(&cfg, list, .Stale)
+				saved := load == .Stale && text == NEW
+				switch old {
+				case .None, .Other_Url:
+					testing.expectf(t, saved || load == .Unavailable, "%s: read back as %v %q", run, load, text)
+				case .Same_Url:
+					testing.expectf(t, saved || (load == .Stale && text == OLD), "%s: read back as %v %q", run, load, text)
+				}
 				delete(text)
-				if !ok {
+				if old == .Other_Url {
+					text, load = cached_copy(&cfg, before, .Stale)
+					testing.expectf(t, load == .Unavailable || (load == .Stale && text == OLD), "%s: the other query reads as %v %q", run, load, text)
+					delete(text)
+				}
+				expect_only_entries(t, dir, {SUB}, run)
+				if os.exists(cfg.blocking.cache_dir) {
+					expect_only_entries(t, cfg.blocking.cache_dir, files, run)
+				}
+				testing.expectf(t, !os.exists(".src"), "%s: a fingerprint written to the working directory", run)
+				os.remove(".src")
+				sentinel, rerr := os.read_entire_file(".tmp", context.temp_allocator)
+				testing.expectf(t, rerr == nil && string(sentinel) == SENTINEL, "%s: the working directory's .tmp was replaced (%v)", run, rerr)
+				if string(sentinel) != SENTINEL && !testing.expect(t, os.write_entire_file(".tmp", SENTINEL) == nil, "cannot plant .tmp again") {
 					return
 				}
+				if f.seen < fail_at {
+					testing.expectf(t, saved, "old %v, runs of %d: with every allocation granted, the new copy was not read back", old, run_length)
+					break
+				}
+				refused += 1
 			}
-			f := testkit.Fail_Nth{fail_at = fail_at, fail_for = 1}
-			{
-				context.temp_allocator = testkit.fail_nth(&f)
-				save_cached_copy(&cfg, list, NEW)
-			}
-			run := fmt.tprintf("old %v, run %d", old, fail_at)
-			text, load := cached_copy(&cfg, list, .Stale)
-			saved := load == .Stale && text == NEW
-			switch old {
-			case .None, .Other_Url:
-				testing.expectf(t, saved || load == .Unavailable, "%s: read back as %v %q", run, load, text)
-			case .Same_Url:
-				testing.expectf(t, saved || (load == .Stale && text == OLD), "%s: read back as %v %q", run, load, text)
-			}
-			delete(text)
-			if old == .Other_Url {
-				text, load = cached_copy(&cfg, before, .Stale)
-				testing.expectf(t, load == .Unavailable || (load == .Stale && text == OLD), "%s: the other query reads as %v %q", run, load, text)
-				delete(text)
-			}
-			expect_only_entries(t, dir, {SUB}, run)
-			if os.exists(cfg.blocking.cache_dir) {
-				expect_only_entries(t, cfg.blocking.cache_dir, files, run)
-			}
-			testing.expectf(t, !os.exists(".src"), "%s: a fingerprint written to the working directory", run)
-			os.remove(".src")
-			sentinel, rerr := os.read_entire_file(".tmp", context.temp_allocator)
-			testing.expectf(t, rerr == nil && string(sentinel) == SENTINEL, "%s: the working directory's .tmp was replaced (%v)", run, rerr)
-			if string(sentinel) != SENTINEL && !testing.expect(t, os.write_entire_file(".tmp", SENTINEL) == nil, "cannot plant .tmp again") {
-				return
-			}
-			if f.seen < fail_at {
-				testing.expectf(t, saved, "old %v: with every allocation granted, the new copy was not read back", old)
-				break
-			}
-			refused += 1
+			testing.expectf(t, refused > 0, "old %v, runs of %d: no allocation was refused", old, run_length)
 		}
-		testing.expectf(t, refused > 0, "old %v: no allocation was refused", old)
 	}
-	testing.expect(t, !sync.atomic_load(&cache_warned), "a refused allocation reported the cache as unwritable")
 }
 
 /*
@@ -2153,5 +2151,59 @@ test_a_cache_file_is_in_the_cache_directory :: proc(t: ^testing.T) {
 		}) {
 		cfg.blocking.cache_dir = c.dir
 		testing.expect_value(t, cache_file_path(&cfg, "l.list"), c.want)
+	}
+}
+
+// A refused allocation is no verdict on the cache: only an error of the file or
+// the directory reports `cache_dir` unwritable.
+@(test)
+test_no_memory_is_told_from_an_unwritable_cache :: proc(t: ^testing.T) {
+	testing.expect(t, no_memory(mem.Allocator_Error.Out_Of_Memory), "a refused allocation is not no memory")
+	testing.expect(t, !no_memory(os.General_Error.Not_Exist), "a missing directory is no memory")
+	testing.expect(t, !no_memory(os.Platform_Error(posix.Errno.EACCES)), "a refused write is no memory")
+	testing.expect(t, !no_memory(nil), "no error is no memory")
+}
+
+/*
+A copy named by a query whose fingerprint cannot be written, for a reason other
+than memory, still moves (#780): the key leaves `cache_dir`, and a load after it
+does not move it back and forth. Another query's fingerprint at the list's name
+goes, so the moved copy is never read as that query's download.
+*/
+@(test)
+test_a_move_whose_fingerprint_cannot_be_written_drops_the_key :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg, dir := list_test_dir(t, "move-unmarked")
+	defer os.remove(dir)
+	moved := config.Block_List{name = "http://192.0.2.1/a", url = "http://192.0.2.1/a?key=SECRET", format = .Hosts, enabled = true}
+	// The same name before the query changed, whose copy and fingerprint are at it.
+	before := config.Block_List{name = "http://192.0.2.1/a", url = "http://192.0.2.1/a?key=old", format = .Hosts, enabled = true}
+	cfg.blocking.lists = []config.Block_List{moved}
+	old := strings.concatenate({dir, "/", config.list_cache_name(moved.url)}, context.temp_allocator)
+	path := list_cache_path(&cfg, moved)
+	// A directory with a file in it where the fingerprint's temporary file goes:
+	// its create finds one there and cannot remove it.
+	blocker := strings.concatenate({source_path(path), ".tmp"}, context.temp_allocator)
+	inside := strings.concatenate({blocker, "/x"}, context.temp_allocator)
+	defer for f in ([]string{old, path, source_path(path), inside, blocker}) {
+		os.remove(f)
+	}
+	save_cached_copy(&cfg, before, "0.0.0.0 before.example\n")
+	ok := os.make_directory(blocker) == nil && os.write_entire_file(inside, "x") == nil && os.write_entire_file(old, "0.0.0.0 moved.example\n") == nil
+	if !testing.expect(t, ok, "cannot plant the copies") {
+		return
+	}
+	text, load := cached_copy(&cfg, before, .Stale)
+	testing.expectf(t, load == .Stale && text == "0.0.0.0 before.example\n", "the premise: the other query's copy reads as %v %q", load, text)
+	delete(text)
+
+	for i in 1 ..= 2 {
+		move_query_named_caches(&cfg)
+		testing.expectf(t, !os.exists(old), "load %d: the copy named by its query is still there", i)
+		body, rerr := os.read_entire_file(path, context.temp_allocator)
+		testing.expectf(t, rerr == nil && string(body) == "0.0.0.0 moved.example\n", "load %d: the moved copy is %q (%v)", i, body, rerr)
+		text, load = cached_copy(&cfg, before, .Stale)
+		testing.expectf(t, load == .Unavailable, "load %d: the moved copy reads as the other query's: %v %q", i, load, text)
+		delete(text)
 	}
 }
