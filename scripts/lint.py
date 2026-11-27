@@ -87,32 +87,40 @@ CONSTANT = re.compile(r"^\s*[A-Za-z_]\w*\s*:(\s*[^\s:=]+\s*)?:(?!=)"
 SEPARATOR = re.compile(r"(?<=\d)_(?=\d)")
 
 
+def block_end(source, i):
+    """The index past the block comment opened at `i`, nested ones counted, as Odin's nest."""
+    depth, end = 1, i + 2
+    while end < len(source) and depth:
+        step = source[end:end + 2]
+        depth += 1 if step == "/*" else -1 if step == "*/" else 0
+        end += 2 if step in ("/*", "*/") else 1
+    return end
+
+
+def token_end(source, i):
+    """The index past the comment or literal that opens at `i`, or None where code does."""
+    if source.startswith("//", i):
+        end = source.find("\n", i)
+        return len(source) if end < 0 else end
+    if source.startswith("/*", i):
+        return block_end(source, i)
+    if source[i] in "\"'`":
+        return skip_literal(source, i) + 1
+    return None
+
+
 def code_only(source):
-    """`source` with its comments and literals blanked, line breaks kept. Block comments nest, as Odin's do."""
+    """`source` with its comments and literals blanked, line breaks kept."""
     out = list(source)
-
-    def blank(a, b):
-        for k in range(a, min(b, len(out))):
-            if out[k] != "\n":
-                out[k] = " "
-
     i = 0
     while i < len(source):
-        if source.startswith("//", i):
-            end = source.find("\n", i)
-            end = len(source) if end < 0 else end
-        elif source.startswith("/*", i):
-            depth, end = 1, i + 2
-            while end < len(source) and depth:
-                step = source[end:end + 2]
-                depth += 1 if step == "/*" else -1 if step == "*/" else 0
-                end += 2 if step in ("/*", "*/") else 1
-        elif source[i] in "\"'`":
-            end = skip_literal(source, i) + 1
-        else:
+        end = token_end(source, i)
+        if end is None:
             i += 1
             continue
-        blank(i, end)
+        for k in range(i, min(end, len(out))):
+            if out[k] != "\n":
+                out[k] = " "
         i = end
     return "".join(out).splitlines()
 
