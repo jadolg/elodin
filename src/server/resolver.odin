@@ -225,7 +225,7 @@ Server :: struct {
 	// running rebuild. Nil before the first load. The caller that built this
 	// `Server` frees it. See `reload_filters_from`.
 	lists_loaded: map[u64]bool,
-	// The last rebuild was dropped for want of memory, so it is retried
+	// The last rebuild had no memory to build the sets whole, so it is retried
 	// whatever the network and the refresh interval say (`retry_after`).
 	// Written by the rebuild, read once it is collected.
 	rules_no_memory: bool,

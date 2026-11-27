@@ -67,9 +67,6 @@ List_Load :: enum u8 {
 	No_Memory,
 }
 
-// What a rebuild says when there is no memory to build the rule sets whole.
-NO_MEMORY_FOR_RULES :: "filter: there is no memory to build the rule sets; keeping the rules already in effect"
-
 /*
 Build a fresh pair of rule sets from the configuration.
 
@@ -78,18 +75,24 @@ for destroying whatever that swap displaces. When `loads` is given it has one
 slot per list, `blocking.lists` then `blocking.allowlists`, and says how each
 one fared.
 
-Both nil when there is no memory to build them whole: to make them, to read a
-`file:` list, or to hold a rule. Lists after the one that ran out are not tried.
+`whole` is false when there was no memory to build them whole: to read a list,
+or to hold a rule. The lists after the one that ran out, and the operator's
+rules, are not tried; the one that ran out is `.No_Memory` in `loads`, and so
+is each not tried. Both sets are nil when there is no memory to make them.
 */
-build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool, loads: []List_Load = nil) -> (block, allow: ^filter.Set) {
+build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool, loads: []List_Load = nil) -> (block, allow: ^filter.Set, whole: bool) {
 	move_query_named_caches(cfg)
+	for &load in loads {
+		load = .No_Memory
+	}
 	block = filter.set_make()
 	allow = filter.set_make()
-	if block == nil || allow == nil || !load_lists(cfg, block, allow, allow_network, loads) || !add_operator_rules(cfg, block, allow) {
+	if block == nil || allow == nil {
 		filter.set_destroy(block)
 		filter.set_destroy(allow)
-		return nil, nil
+		return nil, nil, false
 	}
+	whole = load_lists(cfg, block, allow, allow_network, loads) && add_operator_rules(cfg, block, allow)
 	return
 }
 
@@ -819,12 +822,13 @@ a `file:` list: that one is the operator's own, and one deleted to lift its
 blocks has to lift them, where a download is lost to the network.
 
 The new sets are dropped too when there was no memory to build them whole, or to
-record which lists loaded (#765): a set missing rules its lists hold is never
-swapped in, whatever kind of list they came from.
+record which lists loaded (#765): a set missing rules its lists hold never takes
+rules out of effect, whatever kind of list they came from. Where no rule is in
+effect, what fitted is swapped in instead (`no_memory_swaps`).
 
 `current` is false when some list is unavailable or stood in for by a stale copy,
-or the sets were dropped for want of memory, so the caller retries sooner than
-the interval; see `refresh_retry`.
+or the sets could not be built whole for want of memory, so the caller retries
+sooner than the interval; see `retry_after`.
 */
 reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool) -> (current: bool) {
 	s.rules_no_memory = false
@@ -832,16 +836,20 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 	loads, err := make([]List_Load, lists + len(cfg.blocking.allow_lists))
 	defer delete(loads)
 	block, allow: ^filter.Set
+	whole: bool
 	if err == nil {
-		block, allow = build_filter_sets(cfg, allow_network, loads)
+		block, allow, whole = build_filter_sets(cfg, allow_network, loads)
 	}
-	if block == nil {
-		logx.warnf("%s", NO_MEMORY_FOR_RULES)
+	if !whole {
 		s.rules_no_memory = true
-		return false
+		if !no_memory_swaps(s, block) {
+			filter.set_destroy(block)
+			filter.set_destroy(allow)
+			return false
+		}
 	}
 
-	current = true
+	current = whole
 	for load, i in loads {
 		if load == .Current {
 			continue
@@ -869,8 +877,8 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 		// keep later. Only a load is recorded: two entries for one source share
 		// a key, and the one that loaded is the one whose rules are in effect.
 		if list.enabled && (load == .Current || load == .Stale) && map_insert(&loaded, list_key(list, i >= lists), true) == nil {
-			logx.warnf("%s", NO_MEMORY_FOR_RULES)
 			s.rules_no_memory = true
+			warn_no_memory(s)
 			delete(loaded)
 			filter.set_destroy(block)
 			filter.set_destroy(allow)
@@ -905,6 +913,40 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 }
 
 /*
+Whether sets `block` (with its allow set) built without the memory to be whole
+are swapped in, saying what is done instead. Only where no rule is in effect:
+then what fits blocks what it can until a retry builds the rest, as AdGuard
+Home and blocky go on with the lists that loaded. Where rules are in effect,
+they are kept, since a set missing rules would take them out of effect.
+*/
+@(private)
+no_memory_swaps :: proc(s: ^Server, block: ^filter.Set) -> bool {
+	if block == nil || rules_in_effect(s) {
+		warn_no_memory(s)
+		return false
+	}
+	logx.warnf("filter: there is no memory to build the rule sets whole; with no rules in effect, the ones that fit are used until a retry builds the rest")
+	return true
+}
+
+// Whether any rule is in effect, from a list or the operator's own.
+@(private)
+rules_in_effect :: proc(s: ^Server) -> bool {
+	stats := filter.engine_stats(s.filters)
+	return stats.block_rules + stats.allow_rules > 0
+}
+
+// Say that a rebuild was dropped for want of memory, and what is in effect.
+@(private)
+warn_no_memory :: proc(s: ^Server) {
+	if rules_in_effect(s) {
+		logx.warnf("filter: there is no memory to build the rule sets; keeping the rules already in effect")
+	} else {
+		logx.warnf("filter: there is no memory to build the rule sets; no rules are in effect until a retry succeeds")
+	}
+}
+
+/*
 A list as `lists_loaded` knows it: where it is fetched from, and which kind of
 list it is. A list keeps its history wherever a reload moves it, and a new one
 starts with none, which is what it would have at startup.
@@ -935,7 +977,7 @@ refresh_retry :: proc(retry, interval: time.Duration) -> time.Duration {
 The wait before the next rebuild after one that was `current` or not: zero for
 none sooner than the interval. One that was not current is tried again only
 where a list it lacked can come back, which needs the network (`no_fetch`
-false) and refreshes (`refresh` above zero); one dropped for want of memory
+false) and refreshes (`refresh` above zero); one without the memory to be whole
 (`no_memory`) is tried again whatever those say, at most REFRESH_RETRY_MAX
 apart, since what it lacked was memory and the rules in effect may be none.
 `retry` is the wait just served, as `refresh_retry` takes it.
@@ -958,12 +1000,14 @@ refresh_wait :: proc(retry, interval: time.Duration) -> time.Duration {
 }
 
 /*
-Whether a refresh is due `since` the last one: a retry `retry_after` set is due
-once it has been waited, whether or not refreshes run; the interval only where
-they do, with the network (`no_fetch` false) and `refresh` above zero.
+Whether a refresh is due `since` the last one. Where refreshes run, with the
+network (`no_fetch` false) and `refresh` above zero, once the retry or the
+interval has been waited; where they do not, only a retry for want of memory
+(`no_memory`, `retry_after`), so a retry a download's failure left pending
+before a reload turned refreshes off does not run.
 */
-refresh_due :: proc(no_fetch: bool, refresh, retry, since: time.Duration) -> bool {
-	if retry <= 0 && (no_fetch || refresh <= 0) {
+refresh_due :: proc(no_fetch, no_memory: bool, refresh, retry, since: time.Duration) -> bool {
+	if (no_fetch || refresh <= 0) && !(no_memory && retry > 0) {
 		return false
 	}
 	return since >= refresh_wait(retry, refresh)

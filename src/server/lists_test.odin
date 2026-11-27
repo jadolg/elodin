@@ -66,7 +66,8 @@ test_a_list_badfilter_does_not_cancel_the_operators_own_rules :: proc(t: ^testin
 	cfg.blocking.rules = []string{"||pl.ua^", "||listed.example^$badfilter"}
 	cfg.blocking.allow_rules = []string{"||ok.example^"}
 	cfg.blocking.lists = []config.Block_List{{name = "l", file = path, format = .Adblock, enabled = true}}
-	block, allow := build_filter_sets(&cfg, false)
+	block, allow, whole := build_filter_sets(&cfg, false)
+	testing.expect(t, whole, "the sets were not built whole")
 	defer filter.set_destroy(block)
 	defer filter.set_destroy(allow)
 
@@ -397,7 +398,8 @@ test_a_cache_named_by_a_query_moves :: proc(t: ^testing.T) {
 	}
 	defer remove_copies(&cfg, files, moved, other, on)
 
-	block, allow := build_filter_sets(&cfg, false)
+	block, allow, whole := build_filter_sets(&cfg, false)
+	testing.expect(t, whole, "the sets were not built whole")
 	defer filter.set_destroy(block)
 	defer filter.set_destroy(allow)
 	testing.expect(t, filter.set_cover(block, "moved.example", .A) != .None, "the old copy did not stand in offline")
@@ -704,7 +706,8 @@ test_a_refresh_leaves_no_download_in_scratch :: proc(t: ^testing.T) {
 	scratch := &runtime.global_default_temp_allocator_data.arena
 	before := int(scratch.total_used)
 	loads: [LISTS]List_Load
-	block, allow := build_filter_sets(&cfg, true, loads[:])
+	block, allow, whole := build_filter_sets(&cfg, true, loads[:])
+	testing.expect(t, whole, "the sets were not built whole")
 	defer filter.set_destroy(block)
 	defer filter.set_destroy(allow)
 	held := int(scratch.total_used) - before
@@ -1052,8 +1055,8 @@ test_an_operator_allow_rule_without_memory_drops_the_build :: proc(t: ^testing.T
 	cfg := config.default_config()
 	cfg.blocking.rules = []string{"||ok.example^"}
 	cfg.blocking.allow_rules = []string{"||ok.example^"}
-	block, allow := build_filter_sets(&cfg, false)
-	if !testing.expect(t, block != nil && allow != nil, "no sets with memory to spare") {
+	block, allow, whole := build_filter_sets(&cfg, false)
+	if !testing.expect(t, whole, "no whole sets with memory to spare") {
 		return
 	}
 	// The premise: with memory, the allow rule takes.
@@ -1065,10 +1068,10 @@ test_an_operator_allow_rule_without_memory_drops_the_build :: proc(t: ^testing.T
 	f := testkit.Fail_Nth{fail_at = 1, fail_for = 1 << 30}
 	{
 		context.temp_allocator = testkit.fail_nth(&f)
-		block, allow = build_filter_sets(&cfg, false)
+		block, allow, whole = build_filter_sets(&cfg, false)
 	}
 	testing.expect(t, f.seen > 0, "the temp allocator was not asked")
-	testing.expect(t, block == nil && allow == nil, "sets without the allow rule were built")
+	testing.expect(t, !whole, "sets without the allow rule were built whole")
 	filter.set_destroy(block)
 	filter.set_destroy(allow)
 }
@@ -1104,14 +1107,17 @@ test_a_rebuild_without_memory_is_retried_whatever_the_refresh :: proc(t: ^testin
 	// With no refresh interval to stop at, the doubling stops at the cap.
 	testing.expect_value(t, retry_after(false, true, true, 0, REFRESH_RETRY_MAX), REFRESH_RETRY_MAX)
 
-	// A retry is due once waited, whether or not refreshes run; the interval
-	// only where they do.
-	testing.expect(t, refresh_due(true, 0, REFRESH_RETRY_FIRST, REFRESH_RETRY_FIRST), "a retry without refreshes is never due")
-	testing.expect(t, !refresh_due(true, 0, REFRESH_RETRY_FIRST, REFRESH_RETRY_FIRST - time.Second), "a retry is due before its wait")
-	testing.expect(t, !refresh_due(true, day, 0, 2 * day), "a refresh is due without the network")
-	testing.expect(t, !refresh_due(false, 0, 0, 2 * day), "a refresh is due with refreshes off")
-	testing.expect(t, refresh_due(false, day, 0, day), "the interval's refresh is not due")
-	testing.expect(t, !refresh_due(false, day, 0, day - time.Second), "the interval's refresh is due early")
+	// A retry for want of memory is due once waited, whether or not refreshes
+	// run; any other retry, and the interval, only where they do.
+	testing.expect(t, refresh_due(true, true, 0, REFRESH_RETRY_FIRST, REFRESH_RETRY_FIRST), "a retry for memory without refreshes is never due")
+	testing.expect(t, !refresh_due(true, true, 0, REFRESH_RETRY_FIRST, REFRESH_RETRY_FIRST - time.Second), "a retry is due before its wait")
+	testing.expect(t, !refresh_due(false, false, 0, REFRESH_RETRY_FIRST, 2 * day), "a download's retry left pending runs with refreshes off")
+	testing.expect(t, !refresh_due(true, false, day, REFRESH_RETRY_FIRST, 2 * day), "a download's retry left pending runs without the network")
+	testing.expect(t, refresh_due(false, false, day, REFRESH_RETRY_FIRST, REFRESH_RETRY_FIRST), "a download's retry is not due where refreshes run")
+	testing.expect(t, !refresh_due(true, false, day, 0, 2 * day), "a refresh is due without the network")
+	testing.expect(t, !refresh_due(false, false, 0, 0, 2 * day), "a refresh is due with refreshes off")
+	testing.expect(t, refresh_due(false, false, day, 0, day), "the interval's refresh is not due")
+	testing.expect(t, !refresh_due(false, false, day, 0, day - time.Second), "the interval's refresh is due early")
 }
 
 /*
@@ -1251,4 +1257,78 @@ test_operator_rules_stop_at_the_first_without_memory :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, refused > 0, "no refusal reached the operator's rules")
+}
+
+/*
+With no rule in effect - the first build, or blocking just turned on - a build
+without the memory to be whole swaps in what fitted rather than nothing (#765),
+as AdGuard Home and blocky go on with the lists that loaded. It is not current,
+and is marked for a retry. Lists load in order, so a list before the one that
+ran out is in effect whole.
+*/
+@(test)
+test_a_first_build_without_memory_uses_what_fitted :: proc(t: ^testing.T) {
+	N :: 200
+	paths: [2]string
+	for &path, l in paths {
+		path = fmt.tprintf("/tmp/elodin-server-lists-test-first-%d-%d.txt", l, os.get_pid())
+		b := strings.builder_make(context.temp_allocator)
+		for i in 0 ..< N {
+			fmt.sbprintf(&b, "0.0.0.0 first-%d-%d.example\n", l, i)
+		}
+		if !testing.expect(t, os.write_entire_file(path, strings.to_string(b)) == nil, "cannot write a list") {
+			return
+		}
+	}
+	defer os.remove(paths[0])
+	defer os.remove(paths[1])
+	cfg := config.default_config()
+	cfg.blocking.lists = []config.Block_List {
+		{name = "a", file = paths[0], format = .Hosts, enabled = true},
+		{name = "b", file = paths[1], format = .Hosts, enabled = true},
+	}
+	blocked :: proc(s: ^Server, l, i: int) -> bool {
+		return filter.engine_match(s.filters, fmt.tprintf("first-%d-%d.example.", l, i), .A) == .Blocked
+	}
+
+	// One for every run, so the allocator a swapped-in set keeps stays good
+	// until the server holding it is closed.
+	f: testkit.Fail_Nth
+	f.backing = context.allocator
+	used := 0
+	for fail_at := 1; ; fail_at += 1 {
+		s := list_server(&cfg)
+		defer close_list_server(&s)
+		f.seen, f.fail_at, f.fail_for = 0, fail_at, 1
+		current: bool
+		{
+			context.allocator = testkit.fail_nth(&f)
+			current = reload_filters(&s, false)
+		}
+		if f.seen < fail_at {
+			testing.expect(t, current && !s.rules_no_memory, "a build with every allocation granted is not current")
+			break
+		}
+		first_whole, second_any, second_whole := true, false, true
+		for i in 0 ..< N {
+			first_whole &&= blocked(&s, 0, i)
+			second_any ||= blocked(&s, 1, i)
+			second_whole &&= blocked(&s, 1, i)
+		}
+		if !s.rules_no_memory {
+			// Refused after the sets were whole, where a smaller copy was all
+			// it would have bought (`table_trim`).
+			testing.expectf(t, current && first_whole && second_whole, "run %d: a build not marked out of memory is not whole", fail_at)
+			continue
+		}
+		testing.expectf(t, !current, "run %d: a build that ran out is current", fail_at)
+		testing.expectf(t, !second_any || first_whole, "run %d: the second list took effect with the first cut short", fail_at)
+		// One not tried, or cut short, does not hold a later refresh back.
+		testing.expectf(t, !s.lists_loaded[list_key(cfg.blocking.lists[1], false)], "run %d: the second list is recorded as loaded", fail_at)
+		if first_whole && !second_any {
+			used += 1
+		}
+	}
+	// The premise: runs that ran out on the second list kept the first in effect.
+	testing.expectf(t, used > 0, "no run used the first list alone")
 }
