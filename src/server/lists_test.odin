@@ -2077,7 +2077,8 @@ save_refused_in_turn :: proc(t: ^testing.T, f: ^Save_Fixture, old: Before, run_l
 		}
 		delete(text)
 		if old == .Other_Url {
-			// Cleared only for the new copy to land: a save that does not leaves it.
+			// Cleared only for the new copy to land: a save refused for want of
+			// memory leaves it.
 			text, load = cached_copy(&f.cfg, f.before, .Stale)
 			testing.expectf(t, (saved && load == .Unavailable) || (!saved && load == .Stale && text == SAVE_OLD), "%s: the other query reads as %v %q", run, load, text)
 			delete(text)
@@ -2150,6 +2151,17 @@ test_a_copy_without_its_fingerprint_is_not_saved :: proc(t: ^testing.T) {
 	save_cached_copy(&cfg, list, SAVE_NEW)
 	text, load = cached_copy(&cfg, before, .Stale)
 	testing.expectf(t, load == .Stale && text == SAVE_OLD, "the other query's copy reads as %v %q", load, text)
+	delete(text)
+
+	// Over this url's own copy, beside its own fingerprint, which stands for the
+	// new copy too; nothing else lands as the fingerprint.
+	src, sourced = source_of(list)
+	if !testing.expect(t, sourced && os.write_entire_file(source_path(path), src) == nil, "cannot plant this url's fingerprint") {
+		return
+	}
+	save_cached_copy(&cfg, list, SAVE_NEW)
+	text, load = cached_copy(&cfg, list, .Stale)
+	testing.expectf(t, load == .Stale && text == SAVE_NEW, "this url's new copy reads as %v %q", load, text)
 	delete(text)
 }
 
@@ -2304,6 +2316,7 @@ test_a_move_whose_fingerprint_cannot_be_written_drops_the_key :: proc(t: ^testin
 		text, load = cached_copy(&cfg, before, .Stale)
 		testing.expectf(t, load == .Unavailable, "load %d: the moved copy reads as the other query's: %v %q", i, load, text)
 		delete(text)
+		testing.expectf(t, !os.exists(source_path(path)), "load %d: something landed as the fingerprint", i)
 	}
 }
 

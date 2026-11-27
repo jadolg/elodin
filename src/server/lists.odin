@@ -241,15 +241,18 @@ move_query_named_caches :: proc(cfg: ^config.Config) {
 	held: bool
 	moves: for set in lists {
 		for list in set {
-			if list.url == "" || list.file != "" || !list.enabled || list.named {
+			// A url with neither query nor fragment is the list's name: its copy
+			// is under the name it goes by now.
+			if list.url == "" || list.file != "" || !list.enabled || list.named || config.url_name(list.url) == list.url {
 				continue
 			}
 			// Spelt short, a name may read as some list's current copy, or as
 			// none there: either skips the list, and nothing is done before the
-			// check below.
+			// check below, but its copy may be one held back.
 			old := config.list_cache_name(list.url)
 			old_path := cache_file_path(cfg, old)
 			if current[old] || !cache_file_exists(old_path) {
+				held ||= dry
 				continue
 			}
 			names, _ := cache_names(cfg, list) // lint:allow a refusal sets `dry`, checked below
@@ -911,10 +914,13 @@ the name atomically. The temporary name ends in `.tmp`, which no
 list's.
 */
 @(private)
-stage_cache_file :: proc(path: string, body: []byte) -> (tmp: string, err: os.Error) {
+stage_cache_file :: proc(path: string, body: []byte) -> (string, os.Error) {
 	// Spelt short, it would be another file, in the cache or the working
 	// directory, which the create below removes when it is there.
-	tmp = strings.concatenate({path, ".tmp"}, context.temp_allocator) or_return
+	tmp, aerr := strings.concatenate({path, ".tmp"}, context.temp_allocator)
+	if aerr != nil {
+		return "", aerr
+	}
 	/*
 	Created afresh, O_EXCL, which fails on a symlink rather than following it.
 	One already there - left by a stop mid-write, or planted - is removed and
@@ -923,14 +929,19 @@ stage_cache_file :: proc(path: string, body: []byte) -> (tmp: string, err: os.Er
 	*/
 	flags :: os.File_Flags{.Write, .Create, .Excl}
 	perms :: os.Permissions_Read_All + {.Write_User}
+	// No name is returned with an error: what is there is not this write's,
+	// and a caller would rename it in.
 	f, oerr := os.open(tmp, flags, perms)
 	if oerr == .Exist {
-		os.remove(tmp) or_return
-		f = os.open(tmp, flags, perms) or_return
-	} else if oerr != nil {
+		if rerr := os.remove(tmp); rerr != nil {
+			return "", rerr
+		}
+		f, oerr = os.open(tmp, flags, perms)
+	}
+	if oerr != nil {
 		return "", oerr
 	}
-	_, err = os.write(f, body)
+	_, err := os.write(f, body)
 	if err == nil {
 		err = os.sync(f)
 	}
@@ -941,7 +952,7 @@ stage_cache_file :: proc(path: string, body: []byte) -> (tmp: string, err: os.Er
 		os.remove(tmp)
 		return "", err
 	}
-	return
+	return tmp, nil
 }
 
 @(private)
