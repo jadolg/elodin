@@ -107,8 +107,8 @@ whose every check passed.
 **Lint** (`scripts/lint.py`, part of `check`) refuses patterns that reviews kept
 finding. Some rules hold for the whole tree (`strings.equal_fold` and
 `strings.to_lower` outside tests, `strings.trim_space` in HTTP code, `strconv`'s
-integer parsers on config and wire input, a format in `testing.expect`, a
-`.odin:<line>` reference, and an exported procedure nothing outside test files
+integer parsers on config and wire input, a format in `testing.expect`, an
+import of `elodin:testkit` outside tests, a `.odin:<line>` reference, and an exported procedure nothing outside test files
 calls, which belongs in a test file - the itest and fuzz packages count as
 callers); others only for
 lines a branch adds, diffed against `LINT_BASE` (default: the merge base with

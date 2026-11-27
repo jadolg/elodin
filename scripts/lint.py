@@ -44,6 +44,8 @@ TREE = [
      "strconv's integer parsers take + and _ and wrap on overflow; read digits-only and bounded (parse_rdata_u16)"),
     ("case-map", r"\bstrings\.to_(lower|upper)\(", lambda p: not is_test(p),
      "strings.to_lower maps non-ASCII letters onto ASCII ones (U+0130 to i); use dns.name_fold"),
+    ("testkit-import", r'^import\s+(\w+\s+)?"elodin:testkit"', lambda p: not is_test(p),
+     "elodin:testkit is test code, held only to the test rules; production code does not import it"),
     ("line-number", r"\.odin:[0-9]+", lambda p: True,
      "name the symbol, not a line number, which goes stale"),
     ("posix-open-flags",

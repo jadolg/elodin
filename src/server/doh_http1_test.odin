@@ -885,7 +885,10 @@ test_the_close_after_a_chunked_request_keeps_its_answer :: proc(t: ^testing.T) {
 	}
 	// The drain ends on the end of the data rather than on its timeout.
 	testing.expect(t, net.shutdown(client, .Send) == nil, "cannot end the stream")
-	testing.expect(t, net.set_option(client, .Receive_Timeout, 3 * time.Second) == nil, "cannot bound the client")
+	if !set_wait(t, client, .Receive_Timeout, 3 * time.Second) {
+		net.close(accepted)
+		return
+	}
 
 	cfg := config.default_config()
 	s := Server {
@@ -1033,9 +1036,12 @@ expect_continue :: proc(t: ^testing.T, c: Continue_Case) -> bool {
 	framing := "Transfer-Encoding: chunked\r\n" if c.chunked else "Content-Length: 4\r\n"
 	head := fmt.tprintf("POST /dns-query %s\r\nHost: dns.example\r\n%sExpect: 100-continue\r\n\r\n%s", c.version, framing, body if c.early else "")
 	_, serr := net.send_tcp(client, transmute([]u8)head)
-	testing.expectf(t, serr == nil, "%s: cannot send the header block: %v", c.what, serr)
-	testing.expectf(t, net.set_option(accepted, .Receive_Timeout, 3 * time.Second) == nil, "%s: cannot bound the reader", c.what)
-	testing.expectf(t, net.set_option(client, .Receive_Timeout, 3 * time.Second) == nil, "%s: cannot bound the client", c.what)
+	sent := testing.expectf(t, serr == nil, "%s: cannot send the header block: %v", c.what, serr)
+	if !sent || !set_wait(t, accepted, .Receive_Timeout, 3 * time.Second) || !set_wait(t, client, .Receive_Timeout, 3 * time.Second) {
+		net.close(client)
+		net.close(accepted)
+		return false
+	}
 
 	cr := Continue_Reader {
 		r = Http_Reader {
@@ -1098,8 +1104,10 @@ expect_no_continue_on_1_0 :: proc(t: ^testing.T) {
 	_, serr := net.send_tcp(client, transmute([]u8)head)
 	testing.expectf(t, serr == nil, "HTTP/1.0: cannot send the header block: %v", serr)
 	testing.expect(t, net.shutdown(client, .Send) == nil, "HTTP/1.0: cannot end the stream")
-	testing.expect(t, net.set_option(accepted, .Receive_Timeout, 3 * time.Second) == nil, "HTTP/1.0: cannot bound the reader")
-	testing.expect(t, net.set_option(client, .Receive_Timeout, 3 * time.Second) == nil, "HTTP/1.0: cannot bound the client")
+	if !set_wait(t, accepted, .Receive_Timeout, 3 * time.Second) || !set_wait(t, client, .Receive_Timeout, 3 * time.Second) {
+		net.close(accepted)
+		return
+	}
 	r := Http_Reader {
 		conn = Conn{socket = accepted, peer = net.Endpoint{address = net.IP4_Loopback, port = 1}},
 		buf = make([dynamic]u8, 0, HTTP_BUF_SIZE),
@@ -1151,7 +1159,9 @@ test_an_absolute_form_host_survives_the_buffer_growing :: proc(t: ^testing.T) {
 		return
 	}
 	testing.expect(t, net.shutdown(client, .Send) == nil, "cannot end the stream")
-	testing.expect(t, net.set_option(accepted, .Receive_Timeout, 3 * time.Second) == nil, "cannot bound the reader")
+	if !set_wait(t, accepted, .Receive_Timeout, 3 * time.Second) {
+		return
+	}
 
 	arena: virtual.Arena
 	if aerr := virtual.arena_init_growing(&arena); !testing.expectf(t, aerr == nil, "cannot create an arena: %v", aerr) {
