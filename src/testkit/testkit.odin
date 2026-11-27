@@ -96,7 +96,8 @@ fail_nth_proc :: proc(
 	#partial switch mode {
 	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
 		f.seen += 1
-		if f.seen >= f.fail_at && f.seen < f.fail_at + f.fail_for {
+		// Not `seen < fail_at + fail_for`, which wraps for a `fail_for` of `max(int)`.
+		if f.seen >= f.fail_at && f.seen - f.fail_at < f.fail_for {
 			return nil, .Out_Of_Memory
 		}
 	}

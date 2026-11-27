@@ -1,6 +1,7 @@
 package config
 
 import "core:strings"
+import "elodin:dns"
 
 /*
 The name a server or list goes by when the file gives it none: its url up to the
@@ -97,13 +98,17 @@ file name cannot hold them - would read each other's copy whenever a download
 fails. Refused at load, by the name that would be shared. A disabled list, or
 any list while blocking is off, is never downloaded, nor is one with a `file:`,
 which is read in place of its url. Two entries for one url are one list, the
-fragment aside, which is never sent.
+fragment aside, which is never sent. With no memory to spell the names whole
+the load is refused: a name spelt short is told apart from the one it shares.
 */
 @(private)
 check_list_cache_names :: proc(l: ^Loader, cfg: ^Config) {
 	if !cfg.blocking.enabled {
 		return
 	}
+	dry: bool
+	temp := dns.Dry_Watch{context.temp_allocator, &dry}
+	context.temp_allocator = dns.dry_watch_allocator(&temp)
 	seen := make(map[string]Block_List, context.temp_allocator)
 	for lists in ([][]Block_List{cfg.blocking.lists, cfg.blocking.allow_lists}) {
 		for bl in lists {
@@ -114,7 +119,12 @@ check_list_cache_names :: proc(l: ^Loader, cfg: ^Config) {
 			prev, found := seen[file]
 			if !found {
 				seen[file] = bl
-			} else if url_sent(prev.url) != url_sent(bl.url) {
+			}
+			if dry {
+				errorf(l, "blocking: there is no memory to check the lists' cache files")
+				return
+			}
+			if found && url_sent(prev.url) != url_sent(bl.url) {
 				errorf(l, "blocking: the lists named %q and %q would share the cache file %s; give one a different 'name:'", prev.name, bl.name, file)
 			}
 		}

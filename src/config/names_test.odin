@@ -3,6 +3,7 @@ package config
 import "core:fmt"
 import "core:strings"
 import "core:testing"
+import "elodin:testkit"
 
 /*
 A name the file does not give is the url up to its query, in both spellings of
@@ -102,4 +103,39 @@ test_a_default_name_names_one_thing :: proc(t: ^testing.T) {
 		}
 	}
 	free_all(context.temp_allocator)
+}
+
+/*
+Two lists that would share a cache file are refused whichever allocation of the
+temp allocator spelling their names is refused (#780): a name spelt short is told
+apart from the other, so the check would pass the pair.
+*/
+@(test)
+test_lists_sharing_a_cache_file_are_refused_without_memory :: proc(t: ^testing.T) {
+	cfg := default_config()
+	cfg.blocking.enabled = true
+	cfg.blocking.lists = []Block_List {
+		{name = "https://l.example/a_b", url = "https://l.example/a_b", enabled = true},
+		{name = "https://l.example/a/b", url = "https://l.example/a/b", enabled = true},
+	}
+	refused := 0
+	for fail_at := 1; ; fail_at += 1 {
+		l := Loader{allocator = context.allocator}
+		f := testkit.Fail_Nth{fail_at = fail_at, fail_for = 1}
+		{
+			context.temp_allocator = testkit.fail_nth(&f)
+			check_list_cache_names(&l, &cfg)
+		}
+		testing.expectf(t, len(l.errors) == 1, "run %d: %d errors %v", fail_at, len(l.errors), l.errors[:])
+		for e in l.errors {
+			delete(e)
+		}
+		delete(l.errors)
+		free_all(context.temp_allocator)
+		if f.seen < fail_at {
+			break
+		}
+		refused += 1
+	}
+	testing.expect(t, refused > 0, "no allocation was refused")
 }
