@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:sync"
 import "core:testing"
 import "core:thread"
+import "core:time"
 import "elodin:dns"
 
 // A cache the default size is split; one too small for a working share in each
@@ -66,14 +67,14 @@ test_a_flood_fills_every_shard_within_the_limits :: proc(t: ^testing.T) {
 	for i in 0 ..< 3 * MAX {
 		name := fmt.tprintf("f%d.example.", i)
 		wire, msg := build_nxdomain(name, 300, context.temp_allocator)
-		put(c, key_for(kb[:], name), wire, msg)
+		testing.expect(t, put(c, key_for(kb[:], name), wire, msg), "the entry was not stored")
 		free_all(context.temp_allocator)
 	}
-	testing.expectf(t, len_entries(c) <= MAX, "%d entries held under a limit of %d", len_entries(c), MAX)
-	testing.expectf(t, len_entries(c) >= MAX * 99 / 100, "%d entries held under a limit of %d", len_entries(c), MAX)
 	for &s in c.shards {
 		testing.expect_value(t, len(s.entries), s.max_entries)
 	}
+	// And the shards together hold the operator's limit, not more.
+	testing.expect_value(t, len_entries(c), MAX)
 	testing.expect_value(t, stats(c).inserts, u64(3 * MAX))
 	testing.expect_value(t, stats(c).evictions, u64(3 * MAX - len_entries(c)))
 }
@@ -163,7 +164,10 @@ test_a_reload_to_a_small_budget_keeps_room_for_a_large_answer :: proc(t: ^testin
 	defer free_all(context.temp_allocator)
 	kb: [KEY_MAX]u8
 	key := key_for(kb[:], "big.example.")
-	offsets, _ := dns.scan_ttl_offsets(wire, context.temp_allocator)
+	offsets, scanned := dns.scan_ttl_offsets(wire, context.temp_allocator)
+	if !testing.expect(t, scanned, "the answer's TTLs could not be found") {
+		return
+	}
 	size := sizeof_entry(len(key), len(wire), len(offsets))
 	testing.expectf(t, size > MIN_SHARD_BYTES / MAX_SHARDS, "the premise: an entry of %d bytes", size)
 	testing.expect(t, put(c, key, wire, msg), "a large answer the budget has room for was refused")
@@ -180,24 +184,30 @@ test_a_reload_hands_no_serial_out_twice :: proc(t: ^testing.T) {
 	highest: u64
 	key: string
 	for i in 0 ..< 200 {
+		defer free_all(context.temp_allocator)
 		name := fmt.tprintf("q%d.example.", i)
 		wire, msg := build_answer(name, 300, context.temp_allocator)
 		key = key_for(kb[:], name)
-		put(c, key, wire, msg)
-		_, hit, _ := get(c, key, context.temp_allocator)
+		testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
+		_, hit, hit_found := get(c, key, context.temp_allocator)
+		if !testing.expect(t, hit_found, "the entry was not found") {
+			continue
+		}
 		highest = max(highest, hit.serial)
-		free_all(context.temp_allocator)
 	}
 	opts.max_entries = 300
 	reconfigure(c, opts)
 	for i in 0 ..< 200 {
+		defer free_all(context.temp_allocator)
 		name := fmt.tprintf("q%d.example.", i)
 		wire, msg := build_answer(name, 300, context.temp_allocator)
 		key = key_for(kb[:], name)
-		put(c, key, wire, msg)
-		_, hit, _ := get(c, key, context.temp_allocator)
+		testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
+		_, hit, hit_found := get(c, key, context.temp_allocator)
+		if !testing.expect(t, hit_found, "the entry was not found") {
+			continue
+		}
 		testing.expectf(t, hit.serial > highest, "serial %d handed out again after a reload", hit.serial)
-		free_all(context.temp_allocator)
 	}
 }
 
@@ -247,7 +257,7 @@ test_the_split_is_keyed :: proc(t: ^testing.T) {
 Probe :: struct {
 	c:    ^Cache,
 	key:  string,
-	done: bool,
+	done: sync.Sema,
 }
 
 /*
@@ -276,15 +286,16 @@ test_a_lookup_does_not_wait_on_another_shard :: proc(t: ^testing.T) {
 	sync.mutex_lock(&held.mu)
 	th := thread.create_and_start_with_data(p, proc(data: rawptr) {
 		p := (^Probe)(data)
-		_, _, _ = get(p.c, p.key)
-		sync.atomic_store(&p.done, true)
+		_, _, _ = get(p.c, p.key) // lint:allow the read is the touch the case is about, not its result
+		sync.sema_post(&p.done)
 	})
-	// Bounded, and a passing run leaves at once; a failing one is let go below
-	// rather than left hanging.
-	for i := 0; i < 100_000_000 && !sync.atomic_load(&p.done); i += 1 {
-		thread.yield()
+	if !testing.expect(t, th != nil, "cannot start the probe") {
+		sync.mutex_unlock(&held.mu)
+		return
 	}
-	done := sync.atomic_load(&p.done)
+	// A passing run leaves at once; a failing one is let go below, once the
+	// lock is, rather than left hanging.
+	done := sync.sema_wait_with_timeout(&p.done, 5 * time.Second)
 	sync.mutex_unlock(&held.mu)
 	thread.join(th)
 	thread.destroy(th)
@@ -322,7 +333,7 @@ test_shards_account_under_concurrency :: proc(t: ^testing.T) {
 				name := fmt.tprintf("r%d.example.", (i * 7 + r.id) % 3000)
 				key := key_for(kb[:], name)
 				wire, msg := build_nxdomain(name, 300, context.temp_allocator)
-				put(r.c, key, wire, msg)
+				_ = put(r.c, key, wire, msg) // lint:allow a store the race refuses is part of the race; the counts are checked after
 				if _, hit, ok := get(r.c, key, context.temp_allocator); ok && i % 5 == 0 {
 					forget(r.c, key, hit.serial)
 				}

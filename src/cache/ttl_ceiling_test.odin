@@ -4,11 +4,9 @@ import "core:testing"
 import "elodin:dns"
 
 /*
-What the client is told a record is good for.
-
-`cache.max_ttl` bounds how long an entry lives here. It does not bound the TTL
-written into the copy handed to the client, so a downstream resolver or stub
-goes on holding the record long after this cache has dropped it.
+What the client is told a record is good for: `cache.max_ttl` bounds both how
+long an entry lives here and the TTL written into the copy handed to the client,
+so a downstream resolver or stub holds a record no longer than this cache does.
 */
 
 @(private = "file")
@@ -34,10 +32,9 @@ served_ttl :: proc(t: ^testing.T, c: ^Cache, name: string, ttl: u32) -> (u32, bo
 }
 
 /*
-`cache.min_ttl` is applied to the TTL that goes out - `patch_ttls` takes it as a
-floor - and `cache.max_ttl` was not applied to it at all. The two settings read
-as a pair in the configuration and only one of them was a statement about what
-anybody else is told.
+`cache.max_ttl` is applied to the TTL that goes out, as `cache.min_ttl` is
+(`patch_ttls` takes them as a ceiling and a floor): both settings are statements
+about what anybody else is told.
 */
 @(test)
 test_max_ttl_bounds_the_ttl_the_client_is_given :: proc(t: ^testing.T) {
@@ -48,8 +45,8 @@ test_max_ttl_bounds_the_ttl_the_client_is_given :: proc(t: ^testing.T) {
 	if !ok {
 		return
 	}
-	// The entry expires in 60 seconds and the client is told 60, rather than the
-	// 86400 that had it holding the record long after this cache had dropped it.
+	// The entry expires in 60 seconds and the client is told 60, not the 86400
+	// the upstream gave.
 	testing.expect_value(t, ttl, u32(60))
 	free_all(context.temp_allocator)
 }
@@ -72,10 +69,10 @@ test_a_ttl_with_the_high_bit_set_is_cached_at_max_ttl :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// `cache.min_ttl` still raises a TTL of zero: the operator has said how long
-// the shortest answer this cache keeps is good for.
+// `cache.min_ttl` raises a TTL of zero: the operator has said how long the
+// shortest answer this cache keeps is good for.
 @(test)
-test_a_zero_ttl_is_still_raised_by_min_ttl :: proc(t: ^testing.T) {
+test_min_ttl_raises_a_zero_ttl :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 8, min_ttl = 300, max_ttl = 3600})
 	defer destroy(c)
 
@@ -90,8 +87,9 @@ test_a_zero_ttl_is_still_raised_by_min_ttl :: proc(t: ^testing.T) {
 // With no cache, the ceiling is the RFC 8767 section 4 cap.
 @(test)
 test_no_cache_caps_at_the_rfc_8767_figure :: proc(t: ^testing.T) {
-	testing.expect_value(t, ttl_ceiling(nil), dns.TTL_CAP)
+	// The figure itself, seven days: what the RFC sets, pinned here.
 	testing.expect_value(t, dns.TTL_CAP, u32(7 * 24 * 60 * 60))
+	testing.expect_value(t, ttl_ceiling(nil), dns.TTL_CAP)
 }
 
 /*
@@ -114,7 +112,7 @@ test_a_stale_answer_is_bounded_by_max_ttl :: proc(t: ^testing.T) {
 	if !testing.expect(t, put(c, key, wire, msg), "the answer was not stored") {
 		return
 	}
-	sync_expire(c, key)
+	sync_expire(t, c, key)
 
 	got, hit, ok := get(c, key, context.temp_allocator)
 	if !testing.expect(t, ok && hit.stale, "the expired entry was not lent out") {

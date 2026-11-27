@@ -95,7 +95,6 @@ are the tail and the strip is a shorter copy with RDLENGTH zeroed.
 @(test)
 test_strip_edns_options_cuts_a_trailing_option_list :: proc(t: ^testing.T) {
 	wire := answer_with_options(two_options())
-	testing.expect(t, wire != nil, "could not build the answer")
 	// The premise: without options in it there is nothing for this to strip.
 	_, present := peek_edns_option(wire, .NSID)
 	testing.expect(t, present, "the fixture carries no NSID, so this case tests nothing")
@@ -118,7 +117,6 @@ a rebuild that dropped it would pass every assertion about the OPT record.
 @(test)
 test_strip_edns_options_rebuilds_around_a_record_behind_the_opt :: proc(t: ^testing.T) {
 	wire := answer_with_options(two_options(), trailing = 1)
-	testing.expect(t, wire != nil, "could not build the answer")
 
 	before, berr := decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, berr, Decode_Error.None)
@@ -145,7 +143,6 @@ holds to for the whole record.
 @(test)
 test_strip_edns_options_leaves_the_callers_bytes_alone :: proc(t: ^testing.T) {
 	wire := answer_with_options(two_options())
-	testing.expect(t, wire != nil, "could not build the answer")
 
 	original := make([]u8, len(wire), context.temp_allocator)
 	copy(original, wire)
@@ -167,19 +164,12 @@ first and without paying for a copy in the common case.
 @(test)
 test_strip_edns_options_is_a_no_op_with_nothing_to_strip :: proc(t: ^testing.T) {
 	empty := answer_with_options(nil)
-	testing.expect(t, empty != nil, "could not build the answer")
 	out, ok := strip_edns_options(empty, context.temp_allocator)
 	testing.expect(t, ok, "an empty option list was reported as a failure")
 	testing.expect(t, raw_data(out) == raw_data(empty), "an empty option list was copied")
 
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = NAME,
-		type  = .A,
-		class = .IN,
-	}
-	bare, _, err := encode_message(Message{id = 1, question = questions}, context.temp_allocator)
-	testing.expect_value(t, err, Encode_Error.None)
+	questions := []Question{{name = NAME, type = .A, class = .IN}}
+	bare := test_wire({id = 1, question = questions})
 	out, ok = strip_edns_options(bare, context.temp_allocator)
 	testing.expect(t, ok, "a message with no OPT record was reported as a failure")
 	testing.expect(t, raw_data(out) == raw_data(bare), "a message with no OPT record was copied")
@@ -197,12 +187,7 @@ answer - or on the flags.
 */
 @(test)
 test_set_edns_version_and_flags_writes_only_its_own_two_fields :: proc(t: ^testing.T) {
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = NAME,
-		type  = .A,
-		class = .IN,
-	}
+	questions := []Question{{name = NAME, type = .A, class = .IN}}
 	// An upstream's record: version 1, DO set, a reserved flag bit set, and the
 	// top half of a BADVERS in the extended rcode.
 	opt := make_opt(1232, true, u8(u16(Rcode.Bad_Vers) >> 4))
@@ -259,12 +244,7 @@ covers the whole of what is left.
 */
 @(test)
 test_strip_edns_options_drops_a_second_opt_record :: proc(t: ^testing.T) {
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = NAME,
-		type  = .A,
-		class = .IN,
-	}
+	questions := []Question{{name = NAME, type = .A, class = .IN}}
 	answer := make([]Record, 1, context.temp_allocator)
 	answer[0] = answer_record()
 
@@ -289,13 +269,7 @@ test_strip_edns_options_drops_a_second_opt_record :: proc(t: ^testing.T) {
 	// The premise: two records went in, or this case is about nothing.
 	before, berr := decode_message(wire, context.temp_allocator)
 	testing.expect_value(t, berr, Decode_Error.None)
-	opts_in := 0
-	for rec in before.additional {
-		if rec.type == .OPT {
-			opts_in += 1
-		}
-	}
-	testing.expect_value(t, opts_in, 2)
+	testing.expect_value(t, count_opt_records(before.additional), 2)
 
 	out, ok := strip_edns_options(wire, context.temp_allocator)
 	testing.expect(t, ok, "strip_edns_options failed")
@@ -303,12 +277,7 @@ test_strip_edns_options_drops_a_second_opt_record :: proc(t: ^testing.T) {
 
 	after, aerr := decode_message(out, context.temp_allocator)
 	testing.expect_value(t, aerr, Decode_Error.None)
-	opts_out := 0
-	for rec in after.additional {
-		if rec.type == .OPT {
-			opts_out += 1
-		}
-	}
+	opts_out := count_opt_records(after.additional)
 	testing.expectf(t, opts_out == 1, "%d OPT records came back, not 1", opts_out)
 
 	// And the one left is the one a writer reaches, so writing over it covers
@@ -338,12 +307,7 @@ same one.
 */
 @(test)
 test_strip_edns_options_drops_a_second_opt_behind_an_empty_first :: proc(t: ^testing.T) {
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = NAME,
-		type  = .A,
-		class = .IN,
-	}
+	questions := []Question{{name = NAME, type = .A, class = .IN}}
 	answer := make([]Record, 1, context.temp_allocator)
 	answer[0] = answer_record()
 
@@ -372,12 +336,7 @@ test_strip_edns_options_drops_a_second_opt_behind_an_empty_first :: proc(t: ^tes
 
 	after, aerr := decode_message(out, context.temp_allocator)
 	testing.expect_value(t, aerr, Decode_Error.None)
-	opts_out := 0
-	for rec in after.additional {
-		if rec.type == .OPT {
-			opts_out += 1
-		}
-	}
+	opts_out := count_opt_records(after.additional)
 	testing.expectf(t, opts_out == 1, "%d OPT records came back, not 1", opts_out)
 	testing.expect_value(t, len(after.answer), 1)
 

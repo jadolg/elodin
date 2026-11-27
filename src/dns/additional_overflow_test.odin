@@ -1,5 +1,7 @@
 package dns
 
+import "core:fmt"
+import "core:strings"
 import "core:testing"
 
 /*
@@ -14,7 +16,7 @@ and a client told to throw the datagram away and ask again gets the same records
 one round trip later.
 
 So the encoder splits the two. An answer or authority record dropped sets
-`truncated` and the TC bit, as it always did; an additional record dropped is
+`truncated` and the TC bit; an additional record dropped is
 left out quietly. The OPT record is the everyday case - it is the last thing in
 the section and eleven bytes long before any option is written into it - and the
 one that reaches a client, through `server.attach_cookie` and
@@ -24,21 +26,32 @@ one that reaches a client, through `server.attach_cookie` and
 @(private = "file")
 QNAME :: "example.com."
 
+// A 200-byte TXT at `owner`: big enough that no message under test has room for
+// it behind its answer.
 @(private = "file")
-a_record :: proc(last: u8) -> Record {
-	return a_answer(QNAME, 300, last)
+txt_at :: proc(owner: string) -> Record {
+	strs := make([]string, 1, context.temp_allocator)
+	strs[0] = strings.repeat("x", 200, context.temp_allocator)
+	return Record{name = owner, type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = strs}}
 }
 
-// Big enough that no message under test has room for it behind its answer.
+// `DROPPED_RRSETS` + 1 of `txt_at`, at owners r0 .. under `suffix`: one RRset past
+// what the encoder tracks.
 @(private = "file")
-big_txt :: proc() -> Record {
-	text := make([]u8, 200, context.temp_allocator)
-	for i in 0 ..< len(text) {
-		text[i] = 'x'
+txt_rrsets_past_the_bound :: proc(suffix: string) -> [dynamic]Record {
+	out := make([dynamic]Record, 0, DROPPED_RRSETS + 2, context.temp_allocator)
+	for i in 0 ..= DROPPED_RRSETS {
+		append(&out, txt_at(fmt.tprintf("r%d.%s", i, suffix)))
 	}
-	strs := make([]string, 1, context.temp_allocator)
-	strs[0] = string(text)
-	return Record{name = QNAME, type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = strs}}
+	return out
+}
+
+// An RRSIG at QNAME covering `covered`, `size` bytes of RDATA.
+@(private = "file")
+rrsig_over :: proc(covered: Type, size := 20) -> Record {
+	rdata := make([]u8, size, context.temp_allocator)
+	rdata[0], rdata[1] = u8(u16(covered) >> 8), u8(covered)
+	return Record{name = QNAME, type = .RRSIG, class = .IN, ttl = 300, data = Rdata_Raw{data = rdata}}
 }
 
 @(private = "file")
@@ -50,8 +63,8 @@ message_with :: proc(additional: []Record) -> Message {
 		class = .IN,
 	}
 	answer := make([]Record, 2, context.temp_allocator)
-	answer[0] = a_record(1)
-	answer[1] = a_record(2)
+	answer[0] = a_answer(QNAME, 300, 1)
+	answer[1] = a_answer(QNAME, 300, 2)
 	authority := make([]Record, 1, context.temp_allocator)
 	authority[0] = Record {
 		name = QNAME,
@@ -95,25 +108,34 @@ one_answer :: proc() -> Message {
 }
 
 // The size the message needs to hold everything in it, which is what the cases
-// below then subtract from.
+// below then subtract from. A fixture that does not encode whole is a broken
+// test, so it panics as `test_wire` does.
 @(private = "file")
-encoded_size :: proc(t: ^testing.T, m: Message) -> int {
-	wire, truncated, err := encode_message(m, context.temp_allocator, MAX_MESSAGE)
-	testing.expect_value(t, err, Encode_Error.None)
-	testing.expect(t, !truncated, "the message did not fit at MAX_MESSAGE")
+encoded_size :: proc(m: Message) -> int {
+	wire, truncated, err := encode_message(m, context.temp_allocator)
+	if err != .None || truncated {
+		panic("a test message did not encode whole")
+	}
 	return len(wire)
 }
 
 // Encodes `whole` into `room` and reads it back, failing `t` on an encode or
-// decode error or a message longer than `room`.
+// decode error or a message longer than `room`; `ok` is false on any of them,
+// and the caller returns.
 @(private = "file")
-encode_within :: proc(t: ^testing.T, whole: Message, room: int, loc := #caller_location) -> (got: Message, truncated: bool) {
+encode_within :: proc(t: ^testing.T, whole: Message, room: int, loc := #caller_location) -> (got: Message, truncated: bool, ok: bool) {
 	wire, trunc, err := encode_message(whole, context.temp_allocator, room)
-	testing.expect_value(t, err, Encode_Error.None, loc = loc)
-	testing.expectf(t, len(wire) <= room, "the message is %d bytes, past the %d it was given", len(wire), room, loc = loc)
+	if !testing.expect_value(t, err, Encode_Error.None, loc = loc) {
+		return
+	}
+	if !testing.expectf(t, len(wire) <= room, "the message is %d bytes, past the %d it was given", len(wire), room, loc = loc) {
+		return
+	}
 	decoded, derr := decode_message(wire, context.temp_allocator)
-	testing.expect_value(t, derr, Decode_Error.None, loc = loc)
-	return decoded, trunc
+	if !testing.expect_value(t, derr, Decode_Error.None, loc = loc) {
+		return
+	}
+	return decoded, trunc, true
 }
 
 /*
@@ -126,12 +148,16 @@ would lose the record it negotiated to the glue it never asked for.
 */
 @(test)
 test_an_additional_record_that_will_not_fit_leaves_tc_clear :: proc(t: ^testing.T) {
-	whole := message_with(opt_records(before = []Record{big_txt()}))
+	defer free_all(context.temp_allocator)
+	whole := message_with(opt_records(before = []Record{txt_at(QNAME)}))
 	// Room for everything but the TXT record, which is the only thing that has
 	// to be dropped to make this fit.
-	room := encoded_size(t, message_with(opt_records()))
+	room := encoded_size(message_with(opt_records()))
 
-	got, truncated := encode_within(t, whole, room)
+	got, truncated, ok := encode_within(t, whole, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, !truncated, "an additional record that would not fit reported a truncation")
 	testing.expect(t, !got.flags.tc, "TC is set on an answer nothing was dropped from")
 	testing.expect_value(t, len(got.answer), 2)
@@ -140,8 +166,6 @@ test_an_additional_record_that_will_not_fit_leaves_tc_clear :: proc(t: ^testing.
 	// is the one the client negotiated.
 	testing.expect_value(t, len(got.additional), 1)
 	testing.expect(t, edns_present(got), "the OPT record went out with the record that overflowed")
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -156,19 +180,21 @@ has.
 */
 @(test)
 test_an_opt_record_that_will_not_fit_leaves_tc_clear :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	whole := message_with(opt_records())
 	// One byte short of the OPT record, so the answer and authority sections
 	// fit and nothing else does.
-	room := encoded_size(t, whole) - 1
+	room := encoded_size(whole) - 1
 
-	got, truncated := encode_within(t, whole, room)
+	got, truncated, ok := encode_within(t, whole, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, !truncated, "an OPT record that would not fit reported a truncation")
 	testing.expect(t, !got.flags.tc, "TC is set on an answer nothing was dropped from")
 	testing.expect_value(t, len(got.answer), 2)
 	testing.expect_value(t, len(got.authority), 1)
 	testing.expect_value(t, len(got.additional), 0)
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -178,22 +204,24 @@ too.
 */
 @(test)
 test_an_answer_record_that_will_not_fit_still_sets_tc :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	whole := message_with(opt_records())
 	/*
 	Room for the first answer record and eleven bytes behind it: the second
 	needs sixteen, so the cut lands in the answer section, and an OPT record is
 	eleven, so the re-add behind the cut fits exactly.
 	*/
-	room := encoded_size(t, one_answer()) + 11
+	room := encoded_size(one_answer()) + 11
 
-	got, truncated := encode_within(t, whole, room)
+	got, truncated, ok := encode_within(t, whole, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, truncated, "an answer record was dropped without a truncation being reported")
 	testing.expect(t, got.flags.tc, "TC is clear on an answer that lost records")
 	testing.expect(t, len(got.answer) < 2, "nothing was dropped after all")
-	// The client's EDNS parameters survive the cut, as they always did.
+	// The client's EDNS parameters survive the cut.
 	testing.expect(t, edns_present(got), "the OPT record was not re-added after the truncation")
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -208,26 +236,24 @@ leaves the whole section unwritten.
 */
 @(test)
 test_an_overflowing_additional_section_re_adds_one_opt :: proc(t: ^testing.T) {
-	whole := message_with(opt_records(after = []Record{big_txt()}))
+	defer free_all(context.temp_allocator)
+	whole := message_with(opt_records(after = []Record{txt_at(QNAME)}))
 	/*
 	A hundred bytes of slack behind the OPT record: enough for a second one to
 	be appended where nothing stops it, and nowhere near the two hundred and
 	fifteen the TXT record needs. A room measured exactly to the OPT would hide
 	the fault, since the duplicate would not fit either.
 	*/
-	room := encoded_size(t, message_with(opt_records())) + 100
+	room := encoded_size(message_with(opt_records())) + 100
 
-	got, _ := encode_within(t, whole, room)
-	opts := 0
-	for rec in got.additional {
-		if rec.type == .OPT {
-			opts += 1
-		}
+	got, truncated, ok := encode_within(t, whole, room)
+	if !ok {
+		return
 	}
-	testing.expect_value(t, opts, 1)
+	// Only an additional record was dropped, which sets nothing.
+	testing.expect(t, !truncated, "dropping an additional record reported a truncation")
+	testing.expect_value(t, count_opt_records(got.additional), 1)
 	testing.expect_value(t, len(got.additional), 1)
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -248,10 +274,14 @@ record goes back too.
 */
 @(test)
 test_a_truncation_drops_a_record_to_keep_the_opt_record :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	whole := message_with(opt_records())
-	room := encoded_size(t, one_answer()) + 21
+	room := encoded_size(one_answer()) + 21
 
-	got, truncated := encode_within(t, whole, room)
+	got, truncated, ok := encode_within(t, whole, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, truncated, "an answer record was dropped without a truncation being reported")
 	testing.expect(t, got.flags.tc, "TC is clear on an answer that lost records")
 	testing.expect(t, edns_present(got), "the OPT record was dropped rather than made room for")
@@ -259,8 +289,6 @@ test_a_truncation_drops_a_record_to_keep_the_opt_record :: proc(t: ^testing.T) {
 	// record left out.
 	testing.expect_value(t, len(got.answer), 1)
 	testing.expect_value(t, len(got.authority), 0)
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -277,6 +305,7 @@ trying to improve, so no room is kept for one at all.
 */
 @(test)
 test_a_non_root_opt_owner_keeps_no_room :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	named := make_opt(1232, false)
 	named.name = QNAME
 	additional := make([]Record, 1, context.temp_allocator)
@@ -284,16 +313,17 @@ test_a_non_root_opt_owner_keeps_no_room :: proc(t: ^testing.T) {
 	whole := message_with(additional)
 
 	// The room the root-owner case sheds a record at; see the case above.
-	room := encoded_size(t, one_answer()) + 21
+	room := encoded_size(one_answer()) + 21
 
-	got, truncated := encode_within(t, whole, room)
+	got, truncated, ok := encode_within(t, whole, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, truncated, "an answer record was dropped without a truncation being reported")
 	// Both, where the root-owner case keeps one: the record that would not fit
 	// took nothing with it.
 	testing.expect_value(t, len(got.answer), 2)
 	testing.expect_value(t, len(got.additional), 0)
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -307,10 +337,11 @@ declined to use, and the client would get neither the records nor the record.
 */
 @(test)
 test_an_opt_in_the_answer_section_is_not_the_messages_own :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	answer := make([]Record, 3, context.temp_allocator)
 	answer[0] = make_opt(1232, false)
-	answer[1] = a_record(1)
-	answer[2] = a_record(2)
+	answer[1] = a_answer(QNAME, 300, 1)
+	answer[2] = a_answer(QNAME, 300, 2)
 	whole := message_with(opt_records())
 	whole.answer = answer
 
@@ -321,16 +352,17 @@ test_an_opt_in_the_answer_section_is_not_the_messages_own :: proc(t: ^testing.T)
 	head.answer = answer[:2]
 	head.authority = nil
 	head.additional = nil
-	room := encoded_size(t, head) + 11
+	room := encoded_size(head) + 11
 
-	got, truncated := encode_within(t, whole, room)
+	got, truncated, ok := encode_within(t, whole, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, truncated, "an answer record was dropped without a truncation being reported")
 	testing.expect(t, got.flags.tc, "TC is clear on an answer that lost records")
 	testing.expect_value(t, len(got.answer), 2)
 	// The message's own record, from the section `find_opt` reads.
 	testing.expect(t, edns_present(got), "the additional section's OPT record was taken for written")
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -345,6 +377,7 @@ where the record fits and the rcode it was answered with arrives.
 */
 @(test)
 test_an_extended_rcode_is_not_dropped_quietly :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	// BADVERS: rcode 16, so the header's four bits are zero and the extended
 	// byte in the TTL is one.
 	badvers := make_opt(1232, false)
@@ -367,9 +400,12 @@ test_an_extended_rcode_is_not_dropped_quietly :: proc(t: ^testing.T) {
 	testing.expect_value(t, rcode_of(m), Rcode.Bad_Vers)
 
 	// One byte short of the record the top bits live in.
-	room := encoded_size(t, m) - 1
+	room := encoded_size(m) - 1
 
-	got, truncated := encode_within(t, m, room)
+	got, truncated, ok := encode_within(t, m, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, truncated, "a refusal that lost its rcode reported no truncation")
 	testing.expect(t, got.flags.tc, "the client was not told to ask again for the rcode it lost")
 
@@ -382,8 +418,6 @@ test_an_extended_rcode_is_not_dropped_quietly :: proc(t: ^testing.T) {
 	_, plain_truncated, plain_err := encode_message(plain, context.temp_allocator, room)
 	testing.expect_value(t, plain_err, Encode_Error.None)
 	testing.expect(t, !plain_truncated, "an OPT record with nothing in its TTL was reported as a truncation")
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -398,6 +432,7 @@ both.
 */
 @(test)
 test_the_additional_section_is_filled_past_a_record_that_will_not_fit :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	glue := Record {
 		name  = "ns1.example.com.",
 		type  = .A,
@@ -405,16 +440,19 @@ test_the_additional_section_is_filled_past_a_record_that_will_not_fit :: proc(t:
 		ttl   = 300,
 		data  = Rdata_A{addr = {192, 0, 2, 53}},
 	}
-	whole := message_with(opt_records(before = []Record{big_txt(), glue}))
+	whole := message_with(opt_records(before = []Record{txt_at(QNAME), glue}))
 	/*
 	Room for everything but the TXT record, and thirty-two bytes over: the drop
 	takes the compression map with it, so the glue's owner name goes out in full
 	where the measurement below had it as a two-byte pointer. Nowhere near the
 	two hundred and fifteen the TXT record needs.
 	*/
-	room := encoded_size(t, message_with(opt_records(before = []Record{glue}))) + 32
+	room := encoded_size(message_with(opt_records(before = []Record{glue}))) + 32
 
-	got, truncated := encode_within(t, whole, room)
+	got, truncated, ok := encode_within(t, whole, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, !truncated, "an additional record that would not fit reported a truncation")
 	testing.expect(t, !got.flags.tc, "TC is set on an answer nothing was dropped from")
 	testing.expect_value(t, len(got.answer), 2)
@@ -422,8 +460,6 @@ test_the_additional_section_is_filled_past_a_record_that_will_not_fit :: proc(t:
 	// overflowed and both of which fit.
 	testing.expect_value(t, len(got.additional), 2)
 	testing.expect(t, edns_present(got), "the OPT record went out with the record that overflowed")
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -441,6 +477,7 @@ sections fit and only the OPT record does not.
 */
 @(test)
 test_an_extended_rcode_is_kept_at_the_cost_of_a_record :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	// BADVERS: rcode 16, four zero bits in the header and a one in the TTL.
 	badvers := make_opt(1232, false)
 	badvers.ttl = 1 << 24
@@ -449,9 +486,12 @@ test_an_extended_rcode_is_kept_at_the_cost_of_a_record :: proc(t: ^testing.T) {
 	whole := message_with(additional)
 	testing.expect_value(t, rcode_of(whole), Rcode.Bad_Vers)
 
-	room := encoded_size(t, whole) - 1
+	room := encoded_size(whole) - 1
 
-	got, truncated := encode_within(t, whole, room)
+	got, truncated, ok := encode_within(t, whole, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, truncated, "records were dropped without a truncation being reported")
 	testing.expect(t, got.flags.tc, "records went missing without the client being told")
 	testing.expect(t, edns_present(got), "the record the rcode lives in was dropped")
@@ -461,8 +501,6 @@ test_an_extended_rcode_is_kept_at_the_cost_of_a_record :: proc(t: ^testing.T) {
 	// back reaches; the answer is untouched.
 	testing.expect_value(t, len(got.answer), 2)
 	testing.expect_value(t, len(got.authority), 0)
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -482,6 +520,7 @@ client that advertised less than the entry was stored for.
 */
 @(test)
 test_the_records_ahead_of_the_opt_do_not_spend_its_room :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	glue := Record {
 		name  = "ns1.example.com.",
 		type  = .A,
@@ -491,9 +530,12 @@ test_the_records_ahead_of_the_opt_do_not_spend_its_room :: proc(t: ^testing.T) {
 	}
 	whole := message_with(opt_records(before = []Record{glue}))
 	// One byte short of the two of them, so exactly one can be sent.
-	room := encoded_size(t, whole) - 1
+	room := encoded_size(whole) - 1
 
-	got, truncated := encode_within(t, whole, room)
+	got, truncated, ok := encode_within(t, whole, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, !truncated, "an additional record that would not fit reported a truncation")
 	testing.expect(t, !got.flags.tc, "TC is set on an answer nothing was dropped from")
 	testing.expect_value(t, len(got.answer), 2)
@@ -501,8 +543,6 @@ test_the_records_ahead_of_the_opt_do_not_spend_its_room :: proc(t: ^testing.T) {
 	// The OPT record, and the glue is what paid for it.
 	testing.expect_value(t, len(got.additional), 1)
 	testing.expect(t, edns_present(got), "the glue was sent and the OPT record was not")
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -548,23 +588,20 @@ referral :: proc(glue: []Record) -> Message {
 	return m
 }
 
-@(private = "file")
-address :: proc(name: string, last: u8) -> Record {
-	return Record{name = name, type = .A, class = .IN, ttl = 300, data = Rdata_A{addr = {192, 0, 2, last}}}
-}
-
 @(test)
 test_a_referral_that_drops_in_domain_glue_is_truncated :: proc(t: ^testing.T) {
-	two := referral([]Record{address("ns1.sub.example.com.", 1), address("ns1.sub.example.com.", 2)})
+	defer free_all(context.temp_allocator)
+	two := referral([]Record{a_answer("ns1.sub.example.com.", 300, 1), a_answer("ns1.sub.example.com.", 300, 2)})
 	// One byte short of the second address, so the glue set goes out partial or
 	// not at all.
-	room := encoded_size(t, two) - 1
+	room := encoded_size(two) - 1
 
-	got, truncated := encode_within(t, two, room)
+	got, truncated, ok := encode_within(t, two, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, truncated, "a referral short of its own glue reported no truncation")
 	testing.expect(t, got.flags.tc, "the resolver was handed a partial glue set with nothing to say so")
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -574,17 +611,19 @@ leaving it out is the ordinary quiet drop - as is any other additional record.
 */
 @(test)
 test_a_referral_that_drops_out_of_domain_glue_is_not :: proc(t: ^testing.T) {
-	two := referral([]Record{address("ns1.elsewhere.test.", 1), address("ns1.elsewhere.test.", 2)})
-	room := encoded_size(t, two) - 1
+	defer free_all(context.temp_allocator)
+	two := referral([]Record{a_answer("ns1.elsewhere.test.", 300, 1), a_answer("ns1.elsewhere.test.", 300, 2)})
+	room := encoded_size(two) - 1
 
-	got, truncated := encode_within(t, two, room)
+	got, truncated, ok := encode_within(t, two, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, !truncated, "a referral was truncated for glue the resolver can resolve itself")
 	testing.expect(t, !got.flags.tc, "TC over a referral whose own glue is complete")
 	testing.expect_value(t, len(got.authority), 1)
 	// The OPT record still keeps its room against the glue ahead of it.
 	testing.expect(t, edns_present(got), "the OPT record was spent on glue")
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -594,16 +633,18 @@ any of it out is a truncation like the one above.
 */
 @(test)
 test_a_root_referral_that_drops_glue_is_truncated :: proc(t: ^testing.T) {
-	two := referral([]Record{address("a.root-servers.net.", 1), address("a.root-servers.net.", 2)})
+	defer free_all(context.temp_allocator)
+	two := referral([]Record{a_answer("a.root-servers.net.", 300, 1), a_answer("a.root-servers.net.", 300, 2)})
 	two.authority[0].name = "."
 	two.authority[0].data = Rdata_Name{name = "a.root-servers.net."}
-	room := encoded_size(t, two) - 1
+	room := encoded_size(two) - 1
 
-	got, truncated := encode_within(t, two, room)
+	got, truncated, ok := encode_within(t, two, room)
+	if !ok {
+		return
+	}
 	testing.expect(t, truncated, "a root referral short of its glue reported no truncation")
 	testing.expect(t, got.flags.tc, "the resolver was handed a partial root glue set with nothing to say so")
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -616,18 +657,11 @@ An RRset is the run of records with one owner, type and class.
 */
 @(test)
 test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	mail := proc(last: u8) -> Record {
-		return address("mail.example.com.", last)
+		return a_answer("mail.example.com.", 300, last)
 	}
-	other := address("other.example.com.", 9)
-	// An RRSIG at the TXT records' owner covering `covered`: the type covered
-	// is its RDATA's first two bytes, and the rest is padding to a size that
-	// fits where a long TXT record was taken back from.
-	rrsig_over := proc(covered: Type) -> Record {
-		rdata := make([]u8, 20, context.temp_allocator)
-		rdata[0], rdata[1] = u8(u16(covered) >> 8), u8(covered)
-		return Record{name = QNAME, type = .RRSIG, class = .IN, ttl = 300, data = Rdata_Raw{data = rdata}}
-	}
+	other := a_answer("other.example.com.", 300, 9)
 	// One TXT RRset: a short record, one past the room, and a short one again,
 	// which would fit where the long one was taken back to.
 	txt := proc(text: string) -> Record {
@@ -659,27 +693,27 @@ test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing
 		},
 		{
 			name = "the rest of an RRset that will not fit, short enough to",
-			whole = {txt("a"), big_txt(), txt("b"), other},
+			whole = {txt("a"), txt_at(QNAME), txt("b"), other},
 			fits = {txt("a"), txt("b"), other},
 			kept = {other},
 		},
 		{
 			name = "a later record of an RRset left out, not next to it",
-			whole = {txt("a"), big_txt(), other, txt("b")},
+			whole = {txt("a"), txt_at(QNAME), other, txt("b")},
 			fits = {txt("a"), other, txt("b")},
 			kept = {other},
 		},
 		{
 			name = "a signature over an RRset left out",
-			whole = {txt("a"), big_txt(), rrsig_over(.TXT), other},
+			whole = {txt("a"), txt_at(QNAME), rrsig_over(.TXT), other},
 			fits = {txt("a"), rrsig_over(.TXT), other},
 			kept = {other},
 		},
 		{
 			name = "another type at the same owner is another RRset",
-			whole = {address(QNAME, 7), big_txt()},
-			fits = {address(QNAME, 7)},
-			kept = {address(QNAME, 7)},
+			whole = {a_answer(QNAME, 300, 7), txt_at(QNAME)},
+			fits = {a_answer(QNAME, 300, 7)},
+			kept = {a_answer(QNAME, 300, 7)},
 		},
 		{
 			name = "an RRset that will not fit ahead of the OPT record",
@@ -690,8 +724,11 @@ test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing
 		},
 	}
 	for c in cases {
-		room := encoded_size(t, message_with(c.fits))
-		got, truncated := encode_within(t, message_with(c.whole), room)
+		room := encoded_size(message_with(c.fits))
+		got, truncated, ok := encode_within(t, message_with(c.whole), room)
+		if !ok {
+			continue
+		}
 		testing.expectf(t, !truncated && !got.flags.tc, "%s: TC set for additional data", c.name)
 		testing.expectf(t, len(got.answer) == 2, "%s: %d answer records", c.name, len(got.answer))
 		addresses := 0
@@ -716,94 +753,58 @@ test_an_additional_rrset_that_will_not_fit_is_left_out_whole :: proc(t: ^testing
 		}
 		testing.expectf(t, edns_present(got) == c.with_opt, "%s: the OPT record is %v, want %v", c.name, edns_present(got), c.with_opt)
 	}
-	free_all(context.temp_allocator)
 }
 
 /*
 The RRsets left out are held up to `DROPPED_RRSETS`, as every record behind a
 drop is compared against each; one more, and the rest of the additional section
 but its OPT record is left out with them, which is the reply's to do without.
-Each of these RRsets is one address too big for the room behind the one before.
+Each of these TXT RRsets is too big for the room.
 */
 @(test)
 test_past_the_rrsets_it_tracks_the_rest_of_the_section_goes :: proc(t: ^testing.T) {
-	OWNERS :: [?]string {
-		"r0.example.com.",
-		"r1.example.com.",
-		"r2.example.com.",
-		"r3.example.com.",
-		"r4.example.com.",
-		"r5.example.com.",
-		"r6.example.com.",
-		"r7.example.com.",
-		"r8.example.com.",
-	}
-	#assert(len(OWNERS) == DROPPED_RRSETS + 1)
-	owners := OWNERS
-	text := make([]u8, 200, context.temp_allocator)
-	for j in 0 ..< len(text) {
-		text[j] = 'x'
-	}
-	strs := make([]string, 1, context.temp_allocator)
-	strs[0] = string(text)
-	whole := make([dynamic]Record, 0, len(owners) + 1, context.temp_allocator)
-	for owner in owners {
-		append(&whole, Record{name = owner, type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = strs}})
-	}
-	small := address("last.example.com.", 1)
+	defer free_all(context.temp_allocator)
+	whole := txt_rrsets_past_the_bound("example.com.")
+	small := a_answer("last.example.com.", 300, 1)
 	append(&whole, small)
-	room := encoded_size(t, message_with([]Record{small})) + 32
+	room := encoded_size(message_with([]Record{small})) + 32
 
-	got, truncated := encode_within(t, message_with(whole[:]), room)
+	got, truncated, ok := encode_within(t, message_with(whole[:]), room)
+	if !ok {
+		return
+	}
 	testing.expect(t, !truncated && !got.flags.tc, "TC set for additional data")
 	// One RRset past the bound left out: the address behind them, which would
 	// have fitted, goes with them.
 	testing.expectf(t, len(got.additional) == 0, "past %d RRsets left out, %v still went out", DROPPED_RRSETS, got.additional)
 
 	// The premise: one RRset fewer, and the address goes out.
-	got, truncated = encode_within(t, message_with(whole[1:]), room)
+	got, truncated, ok = encode_within(t, message_with(whole[1:]), room)
+	if !ok {
+		return
+	}
 	testing.expectf(t, !truncated && len(got.additional) == 1, "at %d RRsets left out, the address did not go out: %v", DROPPED_RRSETS, got.additional)
-	free_all(context.temp_allocator)
 }
 
 /*
 Past `DROPPED_RRSETS` the rest of the additional section is left out, but glue
 a referral cannot be read without still truncates (RFC 9471 section 3.3): a
-referral whose in-domain glue sits behind nine RRsets too big to fit goes out
-with TC set, not as a delegation the client cannot follow.
+referral whose in-domain glue sits behind `DROPPED_RRSETS` + 1 RRsets too big to
+fit goes out with TC set, not as a delegation the client cannot follow.
 */
 @(test)
 test_glue_past_the_tracked_rrsets_still_truncates :: proc(t: ^testing.T) {
-	text := make([]u8, 200, context.temp_allocator)
-	for j in 0 ..< len(text) {
-		text[j] = 'x'
-	}
-	strs := make([]string, 1, context.temp_allocator)
-	strs[0] = string(text)
-	OWNERS :: [?]string {
-		"r0.elsewhere.test.",
-		"r1.elsewhere.test.",
-		"r2.elsewhere.test.",
-		"r3.elsewhere.test.",
-		"r4.elsewhere.test.",
-		"r5.elsewhere.test.",
-		"r6.elsewhere.test.",
-		"r7.elsewhere.test.",
-		"r8.elsewhere.test.",
-	}
-	#assert(len(OWNERS) == DROPPED_RRSETS + 1)
-	owners := OWNERS
-	glue := make([dynamic]Record, 0, len(owners) + 1, context.temp_allocator)
-	for owner in owners {
-		append(&glue, Record{name = owner, type = .TXT, class = .IN, ttl = 300, data = Rdata_TXT{strings = strs}})
-	}
-	in_domain := address("ns1.sub.example.com.", 53)
+	defer free_all(context.temp_allocator)
+	glue := txt_rrsets_past_the_bound("elsewhere.test.")
+	in_domain := a_answer("ns1.sub.example.com.", 300, 53)
 	append(&glue, in_domain)
-	room := encoded_size(t, referral([]Record{in_domain})) + 32
+	room := encoded_size(referral([]Record{in_domain})) + 32
 
-	got, truncated := encode_within(t, referral(glue[:]), room)
+	got, truncated, ok := encode_within(t, referral(glue[:]), room)
+	if !ok {
+		return
+	}
 	testing.expect(t, truncated && got.flags.tc, "in-domain glue past the tracked RRsets went missing with TC clear")
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -812,15 +813,14 @@ takes none of the other's with it.
 */
 @(test)
 test_a_signature_over_another_type_is_another_rrset :: proc(t: ^testing.T) {
-	sig := proc(covered: Type, size: int) -> Record {
-		rdata := make([]u8, size, context.temp_allocator)
-		rdata[0], rdata[1] = u8(u16(covered) >> 8), u8(covered)
-		return Record{name = QNAME, type = .RRSIG, class = .IN, ttl = 300, data = Rdata_Raw{data = rdata}}
+	defer free_all(context.temp_allocator)
+	small := rrsig_over(.A)
+	whole := []Record{a_answer(QNAME, 300, 7), small, rrsig_over(.AAAA, size = 300)}
+	room := encoded_size(message_with([]Record{a_answer(QNAME, 300, 7), small}))
+	got, truncated, ok := encode_within(t, message_with(whole), room)
+	if !ok {
+		return
 	}
-	small := sig(.A, 20)
-	whole := []Record{address(QNAME, 7), small, sig(.AAAA, 300)}
-	room := encoded_size(t, message_with([]Record{address(QNAME, 7), small}))
-	got, truncated := encode_within(t, message_with(whole), room)
 	testing.expect(t, !truncated && !got.flags.tc, "TC set for additional data")
 	signed := 0
 	for rec in got.additional {
@@ -829,5 +829,4 @@ test_a_signature_over_another_type_is_another_rrset :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, signed == 1, "%d signatures went out, want the one over A: %v", signed, got.additional)
-	free_all(context.temp_allocator)
 }

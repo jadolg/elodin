@@ -57,24 +57,7 @@ chain_response :: proc(c: Chain) -> ([]u8, dns.Message) {
 	authority: [dynamic]dns.Record
 	authority.allocator = context.temp_allocator
 	if c.soa {
-		append(
-			&authority,
-			dns.Record {
-				name = "example.net.",
-				type = .SOA,
-				class = .IN,
-				ttl = 900,
-				data = dns.Rdata_SOA {
-					ns = "ns.example.net.",
-					mbox = "hostmaster.example.net.",
-					serial = 1,
-					refresh = 7200,
-					retry = 3600,
-					expire = 1209600,
-					minimum = 300,
-				},
-			},
-		)
+		append(&authority, ..nx_target_soa("example.net.", ttl = 900, minimum = 300))
 	} else {
 		// What an upstream that does not recurse leaves there instead.
 		append(&authority, dns.Record{name = "example.com.", type = .NS, class = .IN, ttl = 86400, data = dns.Rdata_Name{"ns1.example.com."}})
@@ -100,7 +83,10 @@ held_for :: proc(c: ^Cache, ch: Chain) -> (time.Duration, bool) {
 	if !put(c, key, wire, msg) {
 		return 0, false
 	}
-	e := c.shards[0].entries[key]
+	e := entry_of(c, key)
+	if e == nil {
+		return 0, false
+	}
 	return time.Duration(e.expires - e.inserted), true
 }
 
@@ -131,11 +117,10 @@ test_a_bare_cname_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
 		},
 	}
 	later.flags.qr = true
-	wire, _, err := dns.encode_message(later, context.temp_allocator)
-	testing.expect_value(t, err, dns.Encode_Error.None)
+	wire, msg := wire_and_msg(later)
 	kb: [KEY_MAX]u8
 	key := make_key(kb[:], "www.example.com.", .DNAME, .IN, false)
-	testing.expect(t, !put(c, key, wire, later), "a DNAME question answered by a DNAME above a later link was cached")
+	testing.expect(t, !put(c, key, wire, msg), "a DNAME question answered by a DNAME above a later link was cached")
 
 	// A record of the type asked for at a name the chain never reaches is not
 	// the answer: the walk, not a scan for the type.
@@ -151,10 +136,9 @@ test_a_bare_cname_without_a_soa_is_not_cached :: proc(t: ^testing.T) {
 		},
 	}
 	loop.flags.qr = true
-	wire, _, err = dns.encode_message(loop, context.temp_allocator)
-	testing.expect_value(t, err, dns.Encode_Error.None)
+	wire, msg = wire_and_msg(loop)
 	key = make_key(kb[:], "a.example.com.", .A, .IN, false)
-	testing.expect(t, !put(c, key, wire, loop), "a CNAME loop with no SOA was cached")
+	testing.expect(t, !put(c, key, wire, msg), "a CNAME loop with no SOA was cached")
 	free_all(context.temp_allocator)
 }
 
@@ -222,11 +206,10 @@ test_a_chain_that_answers_is_not_a_denial :: proc(t: ^testing.T) {
 		answer = []dns.Record{{name = "example.com.", type = .DNAME, class = .IN, ttl = 3600, data = dns.Rdata_Name{"example.net."}}},
 	}
 	at.flags.qr = true
-	wire, _, err := dns.encode_message(at, context.temp_allocator)
-	testing.expect_value(t, err, dns.Encode_Error.None)
+	wire, msg := wire_and_msg(at)
 	kb: [KEY_MAX]u8
 	key := make_key(kb[:], "example.com.", .DNAME, .IN, false)
-	testing.expect(t, put(c, key, wire, at), "the DNAME asked for, at the question name, was not cached")
+	testing.expect(t, put(c, key, wire, msg), "the DNAME asked for, at the question name, was not cached")
 
 	// QCLASS ANY is answered in IN, which is still the answer.
 	any_class := dns.Message {
@@ -234,9 +217,8 @@ test_a_chain_that_answers_is_not_a_denial :: proc(t: ^testing.T) {
 		answer = []dns.Record{{name = "www.example.com.", type = .A, class = .IN, ttl = 3600, data = dns.Rdata_A{addr = {203, 0, 113, 7}}}},
 	}
 	any_class.flags.qr = true
-	wire, _, err = dns.encode_message(any_class, context.temp_allocator)
-	testing.expect_value(t, err, dns.Encode_Error.None)
+	wire, msg = wire_and_msg(any_class)
 	key = make_key(kb[:], "www.example.com.", .A, .ANY, false)
-	testing.expect(t, put(c, key, wire, any_class), "an IN answer to a QCLASS ANY question was not cached")
+	testing.expect(t, put(c, key, wire, msg), "an IN answer to a QCLASS ANY question was not cached")
 	free_all(context.temp_allocator)
 }

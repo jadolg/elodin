@@ -24,9 +24,8 @@ path rather than cut bytes off the end.
 */
 @(private = "file")
 growing_answer :: proc(with_opt: bool, option := false, srvs := GROWING_SRVS) -> []u8 {
-	buf := make([dynamic]u8, 0, 65535, context.temp_allocator)
-	arcount := 1 + (1 if with_opt else 0)
-	append(&buf, 0x42, 0x42, 0x81, 0x80, 0, 1, u8(srvs >> 8), u8(srvs & 0xff), 0, 0, 0, u8(arcount))
+	buf := make([dynamic]u8, 0, MAX_MESSAGE, context.temp_allocator)
+	put_header(&buf, ancount = u16(srvs), arcount = 2 if with_opt else 1)
 	append(&buf, 1, 'a', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0, 0, 33, 0, 1)
 	for _ in 0 ..< srvs {
 		// owner, SRV IN, TTL 300, RDLENGTH 8, priority 1 weight 1 port 53, target
@@ -72,7 +71,7 @@ test_every_rebuild_refuses_a_reencode_that_outgrew_the_message :: proc(t: ^testi
 	testing.expectf(t, len(plain) <= MAX_MESSAGE, "the input is %d bytes, over the limit", len(plain))
 	m, derr := decode_message(plain, context.temp_allocator)
 	testing.expect_value(t, derr, Decode_Error.None)
-	_, truncated, eerr := encode_message(m, context.temp_allocator, MAX_MESSAGE)
+	_, truncated, eerr := encode_message(m, context.temp_allocator)
 	testing.expect_value(t, eerr, Encode_Error.None)
 	testing.expect(t, truncated, "the re-encode fits, so this test proves nothing")
 
@@ -114,7 +113,7 @@ test_a_rebuild_that_drops_its_opt_record_is_refused :: proc(t: ^testing.T) {
 	if testing.expect(t, len(pm.additional) == 2 && pm.additional[0].type == .OPT, "the fixture's OPT record is not first") {
 		options := []EDNS_Option{{code = u16(EDNS_Option_Code.NSID), data = data}}
 		pm.additional[0].data = Rdata_OPT{options = options}
-		encoded, truncated, eerr := encode_message(pm, context.temp_allocator, MAX_MESSAGE)
+		encoded, truncated, eerr := encode_message(pm, context.temp_allocator)
 		testing.expect_value(t, eerr, Encode_Error.None)
 		testing.expect(t, !truncated, "the re-encode is cut, so this is the other test's shape")
 		if eerr == .None {
@@ -143,7 +142,8 @@ test_a_rebuild_that_drops_its_opt_record_is_refused :: proc(t: ^testing.T) {
 	opt, has_opt := find_opt(m)
 	testing.expect(t, has_opt, "set_edns_option came back ok with no OPT record")
 	if has_opt {
-		rdata, _ := opt.data.(Rdata_OPT)
+		rdata, is_opt := opt.data.(Rdata_OPT)
+		testing.expect(t, is_opt, "the OPT record's data is not Rdata_OPT")
 		testing.expectf(t, len(rdata.options) == 1, "set_edns_option came back ok with options %v", rdata.options)
 	}
 	free_all(context.temp_allocator)

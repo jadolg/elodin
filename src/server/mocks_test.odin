@@ -710,12 +710,22 @@ What is read of it is the covered type, the signer and the validity window -
 record whose first two bytes say nothing is a signature over nothing and is
 dropped. The rest is filler: no signature is verified anywhere in this file,
 which is `src/dnssec`'s work against captured chains.
+
+The window is a day either side of now unless `expiration` is given, with
+inception thirty days before it; `original_ttl`, `signer` and `labels` (the
+owner's label count, RFC 4034 section 3.1.3) are written as given.
 */
 @(private)
-rrsig_over :: proc(covered: dns.Type) -> dns.Rdata_Raw {
+rrsig_over :: proc(
+	covered: dns.Type,
+	expiration: Maybe(u32) = nil,
+	original_ttl: u32 = 0,
+	signer := TEST_SIGNER,
+	labels: u8 = 3,
+) -> dns.Rdata_Raw {
 	// 18 bytes of fixed fields, the signer name, then a signature.
 	name_buf: [dns.MAX_NAME_WIRE]u8
-	n, err := dns.encode_name(TEST_SIGNER, name_buf[:])
+	n, err := dns.encode_name(signer, name_buf[:])
 	if err != .None {
 		panic("cannot encode the test signer")
 	}
@@ -723,13 +733,19 @@ rrsig_over :: proc(covered: dns.Type) -> dns.Rdata_Raw {
 	rdata[0] = u8(u16(covered) >> 8)
 	rdata[1] = u8(u16(covered))
 	rdata[2] = 13 // ECDSA P-256, so the algorithm at least names something real
-	rdata[3] = 3 // labels
+	rdata[3] = labels
 	// A window around now, so a cache that will not keep an answer past its
 	// signatures (#165) keeps this one: expiration a day ahead, inception a day
 	// behind.
 	now := u32(time.time_to_unix(time.now())) // lint:allow wall-clock: an RRSIG's validity window is an instant on it
-	dns.write_ttl_at(rdata, 8, now + 86400)
-	dns.write_ttl_at(rdata, 12, now - 86400)
+	dns.write_ttl_at(rdata, 4, original_ttl)
+	if until, given := expiration.?; given {
+		dns.write_ttl_at(rdata, 8, until)
+		dns.write_ttl_at(rdata, 12, until - 30 * 86400)
+	} else {
+		dns.write_ttl_at(rdata, 8, now + 86400)
+		dns.write_ttl_at(rdata, 12, now - 86400)
+	}
 	copy(rdata[18:], name_buf[:n])
 	return dns.Rdata_Raw{data = rdata}
 }

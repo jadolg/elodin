@@ -87,17 +87,12 @@ test_a_frame_of_the_wrong_shape_draws_the_error_its_section_names :: proc(t: ^te
 @(private = "file")
 pings_written :: proc(written: []u8) -> (n: int) {
 	pos := 0
-	for pos + FRAME_HEADER_SIZE <= len(written) {
-		fh, ok := parse_frame_header(written[pos:])
-		if !ok {
-			break
-		}
+	for fh in next_frame(written, &pos) {
 		if fh.type == .Ping {
 			n += 1
 		}
-		pos += FRAME_HEADER_SIZE + fh.length
 	}
-	return n
+	return
 }
 
 /*
@@ -194,12 +189,9 @@ test_the_client_holds_the_server_preface_to_a_settings_frame :: proc(t: ^testing
 			}
 			testing.expectf(t, acked, "%s: the server's SETTINGS was not acknowledged", row.name)
 		}
-		delete(log.frames)
 		delete(h.written)
 		delete(input)
-		client_unref(c)
-		free_all(context.temp_allocator)
-		expect_no_leaks(t, &track, row.name)
+		client_done(t, c, &track, row.name, &log)
 	}
 }
 

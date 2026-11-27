@@ -16,6 +16,7 @@ import "core:os"
 import "core:strings"
 import "core:sys/linux"
 import "core:sys/posix"
+import "core:testing"
 import "core:time"
 import "elodin:dns"
 import "elodin:loop"
@@ -233,4 +234,15 @@ sweep_private_dirs :: proc(prefix: string) {
 		}
 		_ = os.remove_all(e.fullpath) // lint:allow a directory left behind is only the next sweep's
 	}
+}
+
+// Fails `t` for every allocation `track` still holds and for any bad free,
+// each message led by `what`. `dns`'s tests keep their own copy (see the
+// package doc).
+expect_no_leaks :: proc(t: ^testing.T, track: ^mem.Tracking_Allocator, what := "", loc := #caller_location) {
+	sep := ": " if what != "" else ""
+	for _, entry in track.allocation_map {
+		testing.expectf(t, false, "%s%s%d bytes leaked, allocated at %v", what, sep, entry.size, entry.location, loc = loc)
+	}
+	testing.expectf(t, len(track.bad_free_array) == 0, "%s%s%d bad frees", what, sep, len(track.bad_free_array), loc = loc)
 }

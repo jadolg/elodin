@@ -2,10 +2,12 @@ package cache
 
 import "core:fmt"
 import "core:mem"
+import "core:sync"
 import "core:testing"
 import "core:time"
 import "elodin:dns"
 import "elodin:loop"
+import "elodin:testkit"
 
 // Encodes `m` and decodes it back: the wire a cache entry stores, and the
 // message `put` is handed beside it.
@@ -20,6 +22,43 @@ wire_and_msg :: proc(m: dns.Message, allocator := context.temp_allocator) -> ([]
 		panic("failed to decode a test message")
 	}
 	return wire, decoded
+}
+
+// An RRSIG over `covered` at `name`, expiring at `expiration`, carried with
+// `section_ttl` and stating `original_ttl`; signed by example.com., algorithm 8,
+// with a signature nothing verifies.
+@(private)
+rrsig_record :: proc(name: string, covered: dns.Type, expiration: u32, section_ttl: u32, original_ttl: u32 = 86400) -> dns.Record {
+	data := make([]u8, 35, context.temp_allocator)
+	data[0], data[1], data[2], data[3] = u8(u16(covered) >> 8), u8(u16(covered)), 8, 2
+	dns.write_ttl_at(data, 4, original_ttl)
+	dns.write_ttl_at(data, 8, expiration)
+	dns.write_ttl_at(data, 12, expiration - 30 * 86400) // inception
+	copy(data[16:], []u8{0x12, 0x34, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0xde, 0xad, 0xbe, 0xef})
+	return {name = name, type = .RRSIG, class = .IN, ttl = section_ttl, data = dns.Rdata_Raw{data = data}}
+}
+
+// An authority section holding `zone`'s SOA, which is what a denial carries
+// (RFC 2308 section 2.1) and what the cache reads its lifetime from.
+@(private)
+nx_target_soa :: proc(zone: string, ttl: u32 = 3600, minimum: u32 = 600) -> []dns.Record {
+	soa := make([]dns.Record, 1, context.temp_allocator)
+	soa[0] = dns.Record {
+		name = zone,
+		type = .SOA,
+		class = .IN,
+		ttl = ttl,
+		data = dns.Rdata_SOA {
+			ns = "ns.example.net.",
+			mbox = "hostmaster.example.net.",
+			serial = 1,
+			refresh = 7200,
+			retry = 3600,
+			expire = 1209600,
+			minimum = minimum,
+		},
+	}
+	return soa
 }
 
 @(private)
@@ -42,23 +81,7 @@ build_nxdomain :: proc(name: string, soa_min: u32, allocator := context.allocato
 	m := dns.Message {
 		id        = 0x2222,
 		question  = []dns.Question{{name = name, type = .A, class = .IN}},
-		authority = []dns.Record {
-			{
-				name = "example.com.",
-				type = .SOA,
-				class = .IN,
-				ttl = 3600,
-				data = dns.Rdata_SOA {
-					ns = "ns.example.com.",
-					mbox = "hostmaster.example.com.",
-					serial = 1,
-					refresh = 7200,
-					retry = 3600,
-					expire = 1209600,
-					minimum = soa_min,
-				},
-			},
-		},
+		authority = nx_target_soa("example.com.", minimum = soa_min),
 	}
 	m.flags.qr = true
 	m.flags.ra = true
@@ -118,7 +141,10 @@ test_ttl_clamping :: proc(t: ^testing.T) {
 
 	got, _, ok := get(c, key, context.temp_allocator)
 	testing.expect(t, ok, "expected a hit")
-	decoded, _ := dns.decode_message(got, context.temp_allocator)
+	decoded, derr := dns.decode_message(got, context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	// And handed out no longer either: the stored figure is clamped with the
 	// lifetime, so what the client is told cannot outlast the entry it came
 	// from. See `ttl_ceiling_test.odin` for what that is worth.
@@ -150,7 +176,10 @@ test_negative_caching_uses_soa_minimum :: proc(t: ^testing.T) {
 
 	got, _, ok := get(c, key, context.temp_allocator)
 	testing.expect(t, ok, "expected a hit")
-	decoded, _ := dns.decode_message(got, context.temp_allocator)
+	decoded, derr := dns.decode_message(got, context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect_value(t, dns.rcode_of(decoded), dns.Rcode.NX_Domain)
 	free_all(context.temp_allocator)
 }
@@ -191,7 +220,7 @@ test_a_bogus_verdict_is_kept_for_its_own_minute :: proc(t: ^testing.T) {
 		return
 	}
 
-	e := c.shards[0].entries[key]
+	e := entry_of(c, key)
 	if !testing.expect(t, e != nil, "the entry went in under another key") {
 		return
 	}
@@ -233,15 +262,15 @@ test_lru_eviction :: proc(t: ^testing.T) {
 	kb: [KEY_MAX]u8
 
 	w1, m1 := build_answer("a.example.", 300, context.temp_allocator)
-	put(c, key_for(kb[:], "a.example."), w1, m1)
+	testing.expect(t, put(c, key_for(kb[:], "a.example."), w1, m1), "the entry was not stored")
 	w2, m2 := build_answer("b.example.", 300, context.temp_allocator)
-	put(c, key_for(kb[:], "b.example."), w2, m2)
+	testing.expect(t, put(c, key_for(kb[:], "b.example."), w2, m2), "the entry was not stored")
 
 	// Touch "a" so "b" becomes the least recently used entry.
-	_, _, _ = get(c, key_for(kb[:], "a.example."), context.temp_allocator)
+	_, _, _ = get(c, key_for(kb[:], "a.example."), context.temp_allocator) // lint:allow the read is the touch the case is about, not its result
 
 	w3, m3 := build_answer("c.example.", 300, context.temp_allocator)
-	put(c, key_for(kb[:], "c.example."), w3, m3)
+	testing.expect(t, put(c, key_for(kb[:], "c.example."), w3, m3), "the entry was not stored")
 
 	testing.expect_value(t, len_entries(c), 2)
 	_, _, a_ok := get(c, key_for(kb[:], "a.example."), context.temp_allocator)
@@ -261,10 +290,10 @@ test_expiry_and_sweep :: proc(t: ^testing.T) {
 
 	wire, msg := build_answer("short.example.", 1, context.temp_allocator)
 	key := key_for(kb[:], "short.example.")
-	put(c, key, wire, msg)
+	testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
 
 	// Force expiry without waiting for real time to pass.
-	sync_expire(c, key)
+	sync_expire(t, c, key)
 
 	_, _, ok := get(c, key, context.temp_allocator)
 	testing.expect(t, !ok, "expired entry should miss")
@@ -280,13 +309,16 @@ test_serve_stale :: proc(t: ^testing.T) {
 
 	wire, msg := build_answer("stale.example.", 60, context.temp_allocator)
 	key := key_for(kb[:], "stale.example.")
-	put(c, key, wire, msg)
-	sync_expire(c, key)
+	testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
+	sync_expire(t, c, key)
 
 	got, hit, ok := get(c, key, context.temp_allocator)
 	testing.expect(t, ok, "stale serving should still hit")
 	testing.expect(t, hit.stale, "hit should be flagged stale")
-	decoded, _ := dns.decode_message(got, context.temp_allocator)
+	decoded, derr := dns.decode_message(got, context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect_value(t, decoded.answer[0].ttl, u32(STALE_TTL))
 	free_all(context.temp_allocator)
 }
@@ -296,15 +328,14 @@ The sweep leaves alone the entries stale serving exists to keep.
 
 `main.maintenance_loop` sweeps every thirty seconds, so an entry the sweep drops
 the moment it expires is gone long before an outage has been noticed - and an
-outage is the only thing `serve_stale` is for. That left the setting a window of
-0 to 30 seconds after expiry to work in, which is precisely the window in which
-an upstream that has just stopped answering still looks fine, and an upstream
-down for two minutes found the cache already emptied of everything it would have
-served.
+outage is the only thing `serve_stale` is for. Such a sweep leaves the setting a
+window of 0 to 30 seconds after expiry to work in, which is precisely the window
+in which an upstream that has just stopped answering still looks fine, and an
+upstream down for two minutes finds the cache already emptied of everything it
+would have served.
 
-With the setting off nothing changes: the entry goes at expiry, as it always
-has, because keeping expired answers nobody will serve is only memory held for
-no reason.
+With the setting off the entry goes at expiry, because keeping expired answers
+nobody will serve is only memory held for no reason.
 */
 @(test)
 test_sweep_keeps_stale_entries :: proc(t: ^testing.T) {
@@ -315,7 +346,7 @@ test_sweep_keeps_stale_entries :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 8, max_ttl = 3600, serve_stale = true})
 	defer destroy(c)
 	testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
-	sync_expire(c, key)
+	sync_expire(t, c, key)
 
 	testing.expect_value(t, sweep(c), 0)
 	_, hit, ok := get(c, key, context.temp_allocator)
@@ -325,7 +356,7 @@ test_sweep_keeps_stale_entries :: proc(t: ^testing.T) {
 	off := make_cache(Options{max_entries = 8, max_ttl = 3600})
 	defer destroy(off)
 	testing.expect(t, put(off, key, wire, msg), "the entry was not stored")
-	sync_expire(off, key)
+	sync_expire(t, off, key)
 	testing.expect_value(t, sweep(off), 1)
 	free_all(context.temp_allocator)
 }
@@ -353,18 +384,18 @@ test_stale_entries_do_not_outlive_max_stale :: proc(t: ^testing.T) {
 	wire, msg := build_answer("ancient.example.", 60, context.temp_allocator)
 
 	testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
-	sync_expire(c, key, MAX_STALE + time.Minute)
+	sync_expire(t, c, key, MAX_STALE + time.Minute)
 	_, _, ok := get(c, key, context.temp_allocator)
 	testing.expect(t, !ok, "an entry a day past its expiry was still served")
 	testing.expect_value(t, len_entries(c), 0)
 
 	testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
-	sync_expire(c, key, MAX_STALE + time.Minute)
+	sync_expire(t, c, key, MAX_STALE + time.Minute)
 	testing.expect_value(t, sweep(c), 1)
 
 	// Still inside the window, so both leave it where it is.
 	testing.expect(t, put(c, key, wire, msg), "the entry was not stored")
-	sync_expire(c, key, MAX_STALE - time.Minute)
+	sync_expire(t, c, key, MAX_STALE - time.Minute)
 	testing.expect_value(t, sweep(c), 0)
 	_, _, fresh_enough := get(c, key, context.temp_allocator)
 	testing.expect(t, fresh_enough, "an entry inside the stale window was refused")
@@ -397,7 +428,7 @@ test_a_stale_lookup_is_counted_as_a_miss :: proc(t: ^testing.T) {
 	testing.expect(t, fresh, "expected a hit while the entry was fresh")
 	testing.expect_value(t, stats(c).hits, u64(1))
 
-	sync_expire(c, key)
+	sync_expire(t, c, key)
 	_, hit, ok := get(c, key, context.temp_allocator)
 	testing.expect(t, ok && hit.stale, "expected a stale hit")
 
@@ -464,16 +495,15 @@ build_bulky_answer :: proc(
 }
 
 /*
-The entry count was the only bound, and a count is not a bound on memory.
+A count of entries is not a bound on memory, so the cache holds to a byte
+budget as well.
 
 An entry holds the response as it arrived - up to 64 KiB, since a query over
 TCP, DoT or DoH is answered with a whole message rather than a 512-byte UDP one
 - plus an offset and a TTL for each of its records, which for a response packed
-with minimal records is about twice the wire size again. So the default ten
-thousand entries stood for something in the region of 640 MB, and an attacker
-serving maximal answers from a zone it controls needs only distinct names to
-walk elodin there. What ends it is the resolver being killed for the memory it
-took.
+with minimal records is a little under half the wire size again. Bounded by
+count alone, an attacker serving maximal answers from a zone it controls would
+need only distinct names to walk the resolver's memory up until it is killed.
 
 Both halves are checked, because one without the other proves little: the byte
 total the eviction loop reads, and what the allocator was actually asked for.
@@ -482,7 +512,7 @@ this is here to catch.
 */
 @(test)
 test_cache_holds_to_its_byte_budget :: proc(t: ^testing.T) {
-	RECORDS :: 2000 // ~32 KB of wire, ~56 KB accounted, per entry
+	RECORDS :: 2000 // ~32 KB of wire, ~44 KB accounted, per entry
 	INSERTS :: 40
 	BUDGET :: 512 * 1024
 
@@ -585,60 +615,67 @@ test_byte_accounting_comes_back_to_the_table :: proc(t: ^testing.T) {
 	c := make_cache(Options{max_entries = 8, max_ttl = 3600}, mem.tracking_allocator(&track))
 	kb: [KEY_MAX]u8
 
-	put_one :: proc(c: ^Cache, kb: []u8, name: string) {
+	put_one :: proc(t: ^testing.T, c: ^Cache, kb: []u8, name: string) {
 		wire, msg := build_answer(name, 300, context.temp_allocator)
-		put(c, key_for(kb, name), wire, msg)
+		testing.expect(t, put(c, key_for(kb, name), wire, msg), "the entry was not stored")
 	}
 
 	// Replaced in place: the total must count the new entry, not both.
-	put_one(c, kb[:], "a.example.")
+	put_one(t, c, kb[:], "a.example.")
 	one := bytes_used(c)
-	put_one(c, kb[:], "a.example.")
+	put_one(t, c, kb[:], "a.example.")
 	testing.expect_value(t, bytes_used(c), one)
 	testing.expect_value(t, len_entries(c), 1)
 
 	// Dropped by `get`, which is what an expired entry meets first.
-	sync_expire(c, key_for(kb[:], "a.example."))
-	_, _, _ = get(c, key_for(kb[:], "a.example."), context.temp_allocator)
+	sync_expire(t, c, key_for(kb[:], "a.example."))
+	_, _, _ = get(c, key_for(kb[:], "a.example."), context.temp_allocator) // lint:allow the read is the touch the case is about, not its result
 	// The table stays, at its least, and is all that is counted.
 	testing.expect_value(t, bytes_used(c), tables(c))
 
 	// Dropped by `sweep`.
-	put_one(c, kb[:], "b.example.")
-	sync_expire(c, key_for(kb[:], "b.example."))
+	put_one(t, c, kb[:], "b.example.")
+	sync_expire(t, c, key_for(kb[:], "b.example."))
 	testing.expect_value(t, sweep(c), 1)
 	testing.expect_value(t, bytes_used(c), tables(c))
 
 	// Dropped by eviction, with the count as the bound this time.
 	small := make_cache(Options{max_entries = 1, max_ttl = 3600}, mem.tracking_allocator(&track))
-	put_one(small, kb[:], "c.example.")
+	put_one(t, small, kb[:], "c.example.")
 	after_one := bytes_used(small)
-	put_one(small, kb[:], "d.example.")
+	put_one(t, small, kb[:], "d.example.")
 	testing.expect_value(t, len_entries(small), 1)
 	testing.expect_value(t, bytes_used(small), after_one)
 	destroy(small)
 
 	// Dropped by `clear_all`, as a reload does it.
-	put_one(c, kb[:], "e.example.")
+	put_one(t, c, kb[:], "e.example.")
 	clear_all(c)
 	testing.expect_value(t, bytes_used(c), tables(c))
 
 	destroy(c)
 	free_all(context.temp_allocator)
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%d bytes still held, allocated at %v", entry.size, entry.location)
-	}
+	testkit.expect_no_leaks(t, &track)
+}
+
+// The entry under `key`, in whichever shard holds it, or nil.
+@(private)
+entry_of :: proc(c: ^Cache, key: string) -> ^Entry {
+	return shard_for(c, key, sync.atomic_load(&c.shard_bits)).entries[key]
 }
 
 // Test helper: age an entry out without sleeping. `ago` is how far past its
 // expiry the entry should land, which the stale-lifetime tests need to push
-// beyond a day.
+// beyond a day. A missing entry fails `t`: a case that ages nothing would read
+// a fresh entry as the expired one.
 @(private)
-sync_expire :: proc(c: ^Cache, key: string, ago := 1 * time.Second) {
-	if e, ok := c.shards[0].entries[key]; ok {
-		e.expires = loop.moment_add(loop.moment_now(), -ago)
-		e.inserted = loop.moment_add(loop.moment_now(), -ago - 3600 * time.Second)
+sync_expire :: proc(t: ^testing.T, c: ^Cache, key: string, ago := 1 * time.Second, loc := #caller_location) {
+	e := entry_of(c, key)
+	if !testing.expect(t, e != nil, "there is no entry to age", loc = loc) {
+		return
 	}
+	e.expires = loop.moment_add(loop.moment_now(), -ago)
+	e.inserted = loop.moment_add(loop.moment_now(), -ago - 3600 * time.Second)
 }
 
 /*
@@ -724,15 +761,24 @@ test_a_redirecting_entry_is_flagged_until_it_is_looked_at_again :: proc(t: ^test
 
 	// Every hit until somebody says otherwise: a flag that cleared itself would
 	// be one look, not one look per change.
-	_, again, _ := get(c, key, context.temp_allocator, checked_against = 2)
+	_, again, again_found := get(c, key, context.temp_allocator, checked_against = 2)
+	if !testing.expect(t, again_found, "the entry was not found") {
+		return
+	}
 	testing.expect(t, again.recheck, "the flag cleared itself without anything having looked")
 
 	note_checked(c, key, hit.serial, 2, 0)
-	_, settled, _ := get(c, key, context.temp_allocator, checked_against = 2)
+	_, settled, settled_found := get(c, key, context.temp_allocator, checked_against = 2)
+	if !testing.expect(t, settled_found, "the entry was not found") {
+		return
+	}
 	testing.expect(t, !settled.recheck, "the entry was looked at and still asks to be looked at again")
 
 	// And the next change puts it back.
-	_, moved_on, _ := get(c, key, context.temp_allocator, checked_against = 3)
+	_, moved_on, moved_on_found := get(c, key, context.temp_allocator, checked_against = 3)
+	if !testing.expect(t, moved_on_found, "the entry was not found") {
+		return
+	}
 	testing.expect(t, moved_on.recheck, "the rules changed again and the entry did not notice")
 	free_all(context.temp_allocator)
 }
@@ -766,7 +812,10 @@ test_a_verdict_does_not_land_on_an_answer_that_replaced_the_one_it_was_reached_o
 
 	note_checked(c, key, hit.serial, 3, 0)
 
-	_, after, _ := get(c, key, context.temp_allocator, checked_against = 3)
+	_, after, after_found := get(c, key, context.temp_allocator, checked_against = 3)
+	if !testing.expect(t, after_found, "the entry was not found") {
+		return
+	}
 	testing.expect(t, after.recheck, "a verdict reached on bytes that are gone cleared the answer that replaced them")
 	free_all(context.temp_allocator)
 }
@@ -882,7 +931,10 @@ test_a_lookup_that_will_not_read_the_bytes_takes_no_copy :: proc(t: ^testing.T) 
 	kb: [KEY_MAX]u8
 	key := make_key(kb[:], "www.example.com.", .A, .IN, false)
 	testing.expect(t, put(c, key, wire, msg, 1), "the entry was not stored")
-	_, first, _ := get(c, key, context.temp_allocator, checked_against = 1)
+	_, first, first_found := get(c, key, context.temp_allocator, checked_against = 1)
+	if !testing.expect(t, first_found, "the entry was not found") {
+		return
+	}
 	note_checked(c, key, first.serial, 2, 1)
 
 	none := mem.panic_allocator()
@@ -893,9 +945,7 @@ test_a_lookup_that_will_not_read_the_bytes_takes_no_copy :: proc(t: ^testing.T) 
 	moved, owed, _ := get(c, key, context.temp_allocator, checked_against = 3, copy_refused = false)
 	testing.expect(t, owed.recheck && len(moved) == len(wire), "an entry owed a re-walk came back without its bytes")
 
-	if e, found := c.shards[0].entries[key]; found {
-		e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
-	}
+	sync_expire(t, c, key)
 	held, stale, sok := get(c, key, none, checked_against = 2, copy_stale = false)
 	testing.expect(t, sok && held == nil && stale.stale, "an expired entry came back without its flag or with bytes")
 

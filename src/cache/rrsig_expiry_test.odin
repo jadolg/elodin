@@ -9,18 +9,6 @@ import "elodin:loop"
 // Issue #165: an entry carrying signatures is not kept, or served stale, past
 // the moment the first of them stops verifying (RFC 4034 section 3.1.5).
 
-// An RRSIG over `covered` at `name`, expiring at `expiration`.
-@(private = "file")
-rrsig_record :: proc(name: string, covered: dns.Type, expiration: u32, section_ttl: u32) -> dns.Record {
-	data := make([]u8, 35, context.temp_allocator)
-	data[0], data[1], data[2], data[3] = u8(u16(covered) >> 8), u8(u16(covered)), 8, 2
-	dns.write_ttl_at(data, 4, 86400) // original TTL
-	dns.write_ttl_at(data, 8, expiration)
-	dns.write_ttl_at(data, 12, expiration - 30 * 86400) // inception
-	copy(data[16:], []u8{0x12, 0x34, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0xde, 0xad, 0xbe, 0xef})
-	return {name = name, type = .RRSIG, class = .IN, ttl = section_ttl, data = dns.Rdata_Raw{data = data}}
-}
-
 @(private = "file")
 stored :: proc(c: ^Cache, m: dns.Message, qtype: dns.Type) -> (e: ^Entry, ok: bool) {
 	wire, msg := wire_and_msg(m)
@@ -29,7 +17,8 @@ stored :: proc(c: ^Cache, m: dns.Message, qtype: dns.Type) -> (e: ^Entry, ok: bo
 	if !put(c, key, wire, msg) {
 		return nil, false
 	}
-	return c.shards[0].entries[key]
+	e = entry_of(c, key)
+	return e, e != nil
 }
 
 // A signed A answer with a one-day TTL whose RRSIG lapses at `expiration`.
@@ -141,7 +130,10 @@ test_min_ttl_does_not_hold_an_entry_past_its_rrsig :: proc(t: ^testing.T) {
 	// Nor does it raise what a copy is told past the signature.
 	wire, _, hit := get(c, key_of(e), context.temp_allocator)
 	testing.expect(t, hit, "the entry was not served")
-	msg, _ := dns.decode_message(wire, context.temp_allocator)
+	msg, derr := dns.decode_message(wire, context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	for rec in msg.answer {
 		testing.expectf(t, rec.ttl <= 60, "%v went out with TTL %d under min_ttl, its RRSIG has 60 s left", rec.type, rec.ttl)
 	}
@@ -202,7 +194,10 @@ test_a_served_copy_is_told_no_more_than_the_rrsig_allows :: proc(t: ^testing.T) 
 	}
 	wire, _, hit := get(c, key_of(e), context.temp_allocator)
 	testing.expect(t, hit, "the entry was not served")
-	msg, _ := dns.decode_message(wire, context.temp_allocator)
+	msg, derr := dns.decode_message(wire, context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect_value(t, len(msg.answer), 2)
 	for rec in msg.answer {
 		testing.expectf(t, rec.ttl <= 60, "%v went out with TTL %d, its RRSIG has 60 s left", rec.type, rec.ttl)
@@ -223,10 +218,13 @@ test_a_stale_copy_is_told_no_more_than_the_rrsig_allows :: proc(t: ^testing.T) {
 		return
 	}
 	// Expired, with the signature still ten seconds from lapsing.
-	e.expires = loop.moment_add(loop.moment_now(), -time.Second)
+	sync_expire(t, c, key_of(e))
 	wire, hit, served := get(c, key_of(e), context.temp_allocator)
 	testing.expect(t, served && hit.stale, "the expired entry was not served stale")
-	msg, _ := dns.decode_message(wire, context.temp_allocator)
+	msg, derr := dns.decode_message(wire, context.temp_allocator)
+	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
+		return
+	}
 	for rec in msg.answer {
 		testing.expectf(t, rec.ttl <= 10, "%v went out stale with TTL %d, its RRSIG has 10 s left", rec.type, rec.ttl)
 	}

@@ -4,13 +4,13 @@ import "core:mem"
 import "core:testing"
 
 /*
-Minting an OPT record by appending it to the bytes (issue #598).
+Minting an OPT record by appending it to the bytes.
 
 Each case is checked three ways: the bytes ahead of the record are the bytes
 handed in, so nothing was decoded and encoded again; nothing was charged to the
 request's decode budget, which is the decode not happening seen from the side
-that pays for one; and the result decodes to the message `rebuild_with_opt`, the
-decode and re-encode it replaces, makes of the same input.
+that pays for one; and the result decodes to the message `rebuild_with_opt`,
+which decodes and encodes again, makes of the same input.
 */
 
 @(private = "file")
@@ -55,18 +55,19 @@ append_fixture_of_size :: proc(size: int) -> []u8 {
 expect_same_message :: proc(t: ^testing.T, got, want: []u8, loc := #caller_location) {
 	a, aerr := decode_message(got, context.temp_allocator)
 	b, berr := decode_message(want, context.temp_allocator)
-	testing.expect_value(t, aerr, Decode_Error.None, loc)
-	testing.expect_value(t, berr, Decode_Error.None, loc)
-	ae, _, _ := encode_message(a, context.temp_allocator, compress = false)
-	be, _, _ := encode_message(b, context.temp_allocator, compress = false)
+	if !testing.expect_value(t, aerr, Decode_Error.None, loc) || !testing.expect_value(t, berr, Decode_Error.None, loc) {
+		return
+	}
+	ae, _, aeerr := encode_message(a, context.temp_allocator, compress = false)
+	be, _, beerr := encode_message(b, context.temp_allocator, compress = false)
+	if !testing.expect_value(t, aeerr, Encode_Error.None, loc) || !testing.expect_value(t, beerr, Encode_Error.None, loc) {
+		return
+	}
 	testing.expect(t, mem.compare(ae, be) == 0, "the appended message differs from the rebuilt one", loc = loc)
 }
 
 @(private = "file")
 expect_appended :: proc(t: ^testing.T, wire: []u8, options: []EDNS_Option = nil, loc := #caller_location) {
-	if !testing.expect(t, wire != nil, "could not build the fixture", loc = loc) {
-		return
-	}
 	spent := 0
 	out, ok := add_opt_record(wire, 1232, options, context.temp_allocator, &spent)
 	if !testing.expect(t, ok, "add_opt_record failed", loc = loc) {
@@ -89,7 +90,10 @@ expect_appended :: proc(t: ^testing.T, wire: []u8, options: []EDNS_Option = nil,
 	testing.expect(t, rok, "rebuild_with_opt failed", loc = loc)
 	expect_same_message(t, out, rebuilt, loc)
 
-	m, _ := decode_message(out, context.temp_allocator)
+	m, derr := decode_message(out, context.temp_allocator)
+	if !testing.expect_value(t, derr, Decode_Error.None, loc) {
+		return
+	}
 	testing.expect_value(t, int(edns_udp_size(m)), 1232, loc)
 	testing.expect(t, !edns_do(m), "DO was set on a minted record", loc = loc)
 	testing.expect_value(t, int(edns_version(m)), 0, loc)

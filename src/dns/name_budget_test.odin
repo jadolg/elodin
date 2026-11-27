@@ -36,14 +36,8 @@ px_pointer_record :: proc() -> []u8 {
 	append(&msg, ..name)
 	put_u16(&msg, u16(Type.PX))
 	put_u16(&msg, u16(Class.IN))
-	append(&msg, 0xc0, 0x0c)
-	put_u16(&msg, u16(Type.PX))
-	put_u16(&msg, u16(Class.IN))
-	append(&msg, 0, 0, 0x0e, 0x10)
-	put_u16(&msg, 6) // rdlength
-	put_u16(&msg, 10) // preference
-	append(&msg, 0xc0, 0x0c)
-	append(&msg, 0xc0, 0x0c)
+	// Preference 10, then both names a pointer at the question's.
+	put_pointer_record(&msg, .PX, {0, 10, 0xc0, 0x0c, 0xc0, 0x0c})
 	return msg[:]
 }
 
@@ -51,19 +45,14 @@ px_pointer_record :: proc() -> []u8 {
 // `name`: one name written out once and pointed at by a whole RRset.
 @(private)
 pointer_owned_rrset :: proc(name: []u8) -> []u8 {
-	msg := make([dynamic]u8, 0, 65535)
+	msg := make([dynamic]u8, 0, MAX_MESSAGE)
 	put_header(&msg, 0)
 	append(&msg, ..name)
 	put_u16(&msg, u16(Type.A))
 	put_u16(&msg, u16(Class.IN))
 	count := 0
-	for len(msg) + 16 <= 65535 {
-		append(&msg, 0xc0, 0x0c)
-		put_u16(&msg, u16(Type.A))
-		put_u16(&msg, u16(Class.IN))
-		append(&msg, 0, 0, 0x0e, 0x10)
-		put_u16(&msg, 4)
-		append(&msg, 93, 184, 216, 34)
+	for len(msg) + 16 <= MAX_MESSAGE {
+		put_pointer_record(&msg, .A, {93, 184, 216, 34})
 		count += 1
 	}
 	msg[6], msg[7] = u8(count >> 8), u8(count)
@@ -75,6 +64,30 @@ put_u16 :: proc(buf: ^[dynamic]u8, v: u16) {
 	append(buf, u8(v >> 8), u8(v))
 }
 
+// A record of `type` owned by a pointer at the question's name, with a TTL of
+// an hour and `rdata` as it is.
+@(private)
+put_pointer_record :: proc(buf: ^[dynamic]u8, type: Type, rdata: []u8) {
+	append(buf, 0xc0, 0x0c)
+	put_u16(buf, u16(type))
+	put_u16(buf, u16(Class.IN))
+	append(buf, 0, 0, 0x0e, 0x10)
+	put_u16(buf, u16(len(rdata)))
+	append(buf, ..rdata)
+}
+
+// A response asking `x.` `type`, answered by one record of it carrying `rdata`.
+@(private)
+one_record_message :: proc(type: Type, rdata: []u8) -> []u8 {
+	msg := make([dynamic]u8, 0, 512)
+	put_header(&msg, 1)
+	append(&msg, 1, 'x', 0)
+	put_u16(&msg, u16(type))
+	put_u16(&msg, u16(Class.IN))
+	put_pointer_record(&msg, type, rdata)
+	return msg[:]
+}
+
 // An answer of MX records whose owner and exchange are both two-byte pointers
 // to one 255-octet name, which is the shape reported in issue #298.
 @(private = "file")
@@ -83,20 +96,15 @@ pointer_mx_answer :: proc() -> []u8 {
 	defer delete(name)
 
 	// 16 bytes a record: pointer owner, type, class, ttl, rdlength, rdata.
-	count := u16((65535 - 12 - len(name) - 4) / 16)
-	msg := make([dynamic]u8, 0, 65535)
+	count := u16((MAX_MESSAGE - 12 - len(name) - 4) / 16)
+	msg := make([dynamic]u8, 0, MAX_MESSAGE)
 	put_header(&msg, count)
 	append(&msg, ..name)
 	put_u16(&msg, u16(Type.MX))
 	put_u16(&msg, u16(Class.IN))
 	for _ in 0 ..< count {
-		append(&msg, 0xc0, 0x0c) // owner: the question's name
-		put_u16(&msg, u16(Type.MX))
-		put_u16(&msg, u16(Class.IN))
-		append(&msg, 0, 0, 0x0e, 0x10)
-		put_u16(&msg, 4) // rdlength
-		put_u16(&msg, 10) // preference
-		append(&msg, 0xc0, 0x0c) // exchange: the same name again
+		// Preference 10, and the exchange the question's name again.
+		put_pointer_record(&msg, .MX, {0, 10, 0xc0, 0x0c})
 	}
 	return msg[:]
 }
@@ -114,11 +122,11 @@ pointer_px_answer :: proc() -> []u8 {
 	name := long_wire_name()
 	defer delete(name)
 
-	msg := make([dynamic]u8, 0, 65535)
+	msg := make([dynamic]u8, 0, MAX_MESSAGE)
 	// Header (12) + question "x." (3) + qtype/qclass (4): the long name then
 	// starts at offset 19 as the first record's owner.
 	long_at := u16(19)
-	count := u16((65535 - 19 - (len(name) + 16) - 1) / 18 + 1)
+	count := u16((MAX_MESSAGE - 19 - (len(name) + 16) - 1) / 18 + 1)
 	put_header(&msg, count)
 	append(&msg, 1, 'x', 0)
 	put_u16(&msg, u16(Type.PX))
@@ -151,22 +159,17 @@ and no more.
 */
 @(private = "file")
 unwalkable_raw_answer :: proc() -> []u8 {
-	msg := make([dynamic]u8, 0, 65535)
+	msg := make([dynamic]u8, 0, MAX_MESSAGE)
 	put_header(&msg, 0)
 	append(&msg, 1, 'x', 0)
 	put_u16(&msg, u16(Type.NXT))
 	put_u16(&msg, u16(Class.IN))
 	count := 0
-	for len(msg) + 14 <= 65535 {
-		append(&msg, 0xc0, 0x0c)
-		put_u16(&msg, u16(Type.NXT))
-		put_u16(&msg, u16(Class.IN))
-		append(&msg, 0, 0, 0x0e, 0x10)
-		put_u16(&msg, 2) // rdlength
+	for len(msg) + 14 <= MAX_MESSAGE {
 		// A pointer where the name belongs, so the walk is attempted, aimed at
 		// the header's flags byte 0x81: a reserved label type, so the name it
 		// names does not decode.
-		append(&msg, 0xc0, 0x02)
+		put_pointer_record(&msg, .NXT, {0xc0, 0x02})
 		count += 1
 	}
 	msg[6] = u8(count >> 8)
@@ -311,12 +314,7 @@ answer_ending_in :: proc(type: Type, rdata: []u8, records: int) -> []u8 {
 
 	// This one's owner is the short question name, so the only thing left that
 	// can cross the budget is its RDATA.
-	append(&msg, 0xc0, 0x0c)
-	put_u16(&msg, u16(type))
-	put_u16(&msg, u16(Class.IN))
-	append(&msg, 0, 0, 0x0e, 0x10)
-	put_u16(&msg, u16(len(rdata)))
-	append(&msg, ..rdata)
+	put_pointer_record(&msg, type, rdata)
 	count += 1
 
 	msg[6] = u8(count >> 8)
@@ -381,7 +379,7 @@ on the way in would fail to decode on the way out: `fit_response` re-reads that
 wire whenever it passes the client's limit, and would answer TC for a message it
 had already read.
 
-The fixture is the one that found it: 100 PX records whose two RDATA names are
+The fixture is 100 PX records whose two RDATA names are
 pointers, with 300 A records behind them, 6871 bytes on the wire and 57471 once
 the names are expanded. The name octets are 0xc0, which a scan for pointer bytes
 would take for pointers; `raw_rdata_holds_pointer` walks the labels instead, so
@@ -457,14 +455,11 @@ whether or not a single name grew. Both names here are pointers, so the walk is
 taken, but they point at the root, which comes out a byte shorter than the
 pointer to it.
 
-A thousand of those fit in 20 KB, and the reply is well formed. Reserved at the
-most the type might need, it was refused at 1280 records and cost 37.8 times
-its own length in arena, which is a long way from the full-length bomb the
-budget exists for.
+A thousand of those fit in 20 KB, and the reply is well formed.
 */
 @(test)
 test_a_record_whose_names_do_not_expand_is_barely_charged :: proc(t: ^testing.T) {
-	msg := make([dynamic]u8, 0, 65535)
+	msg := make([dynamic]u8, 0, MAX_MESSAGE)
 	defer delete(msg)
 	put_header(&msg, 0)
 	append(&msg, 1, 'x', 0)
@@ -472,14 +467,9 @@ test_a_record_whose_names_do_not_expand_is_barely_charged :: proc(t: ^testing.T)
 	put_u16(&msg, u16(Class.IN))
 	count := 0
 	for len(msg) + 18 <= 30000 {
-		append(&msg, 0xc0, 0x0c)
-		put_u16(&msg, u16(Type.PX))
-		put_u16(&msg, u16(Class.IN))
-		append(&msg, 0, 0, 0x0e, 0x10)
-		put_u16(&msg, 6)
-		put_u16(&msg, 10) // preference
-		// Both names point at the root that ends the question's "x.".
-		append(&msg, 0xc0, 0x0e, 0xc0, 0x0e)
+		// Preference 10, and both names point at the root that ends the
+		// question's "x.".
+		put_pointer_record(&msg, .PX, {0, 10, 0xc0, 0x0e, 0xc0, 0x0e})
 		count += 1
 	}
 	msg[6] = u8(count >> 8)
@@ -498,17 +488,16 @@ test_a_record_whose_names_do_not_expand_is_barely_charged :: proc(t: ^testing.T)
 }
 
 /*
-A record of a two-name layout takes its expansion buffer once.
+A record of a two-name layout takes one buffer, at its final size.
 
-`expand_rdata_names` reserves the buffer before it walks, and PX, SOA, MINFO and
-RP carry two names - each of which may expand from a two-byte pointer to a whole
-`MAX_NAME_WIRE`. Reserved for one name the buffer outgrows its block on the
-second, and under an arena the block it abandons is never given back and was
-never charged: one PX record whose two names point at a 255-octet name costs
-4,648 bytes with the reserve right and 5,170 with it wrong.
+PX, SOA, MINFO and RP carry two names, each of which may expand from a two-byte
+pointer to a whole `MAX_NAME_WIRE`. `expand_rdata_names` expands them onto the
+stack and takes one blob for the lot, so one PX record whose two names point at
+a 255-octet name costs under 5000 bytes of arena.
 
-A tight figure on purpose. The gap is one abandoned block, not an order of
-magnitude, and nothing else here would notice it.
+A tight figure on purpose: a buffer that grew between the names would leave a
+block behind in the arena, which is not an order of magnitude and which nothing
+else here would notice.
 */
 @(test)
 test_a_two_name_layout_does_not_outgrow_its_buffer :: proc(t: ^testing.T) {
@@ -527,14 +516,13 @@ decodes.
 The shape that costs the most and is still something a server would send: one
 name written out once and pointed at by every record of an RRset under it, at
 the largest a reply gets. A hundred characters is a long hostname and 4000 A
-records is a large RRset; together they come to 404 KB of names against the
-640 KB budget.
+records is a large RRset; together they come to 404 KB of names against
+`NAME_BUDGET`, so the test is a real hold on the figure rather than a shape that
+could never reach it.
 
-The names here come to 404 KB against the 640 KB budget, so the test is a real
-hold on the figure rather than a shape that could never reach it. The boundary
-is a good way further out: a pointer-owned record costs 16 wire bytes for about
-101 of name here, and it takes around 160 characters of name before a
-full-length reply of them is refused.
+The boundary is a good way further out: a pointer-owned record costs 16 wire
+bytes for about 101 of name here, and it takes around 160 characters of name
+before a full-length reply of them is refused.
 */
 @(test)
 test_long_name_pointed_at_by_a_whole_rrset_still_decodes :: proc(t: ^testing.T) {

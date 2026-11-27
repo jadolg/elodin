@@ -4,24 +4,14 @@ import "core:mem"
 import "core:testing"
 
 /*
-Issue #354: the decoder's budgets were per reading, and one request holds many
-of them.
+Every reading of a request charges one counter, the request's.
 
-`NAME_BUDGET` lived on the `Reader`, so every `decode_message` started a fresh
-one - and what a reading allocates besides names was never bounded at all. A
-single query reads the upstream's reply for the cache, reads it again when only
+A single query reads the upstream's reply for the cache, reads it again when only
 the answer section will parse, reads it a third time in `fit_response` when it
 passes the client's limit, and the validator reads a reply of its own for every
-step of the chain. Thirty-five readings, all into the one arena the request is
-served from.
-
-Measured over those thirty-five, before the counter was the request's:
-
-	names, five kilobytes of pointers at one 255-octet name   23,989,840 B
-	65,504 empty character-strings in one TXT record          36,686,720 B
-	5,957 minimal records in one message                      18,554,196 B
-
-The first is what `NAME_BUDGET` bounds per reading; the other two it never sees.
+step of the chain: `READINGS` readings, all into the one arena the request is
+served from. `NAME_BUDGET` bounds one reading's names; the request's counter
+bounds everything its readings take, against `REQUEST_DECODE_BUDGET`.
 */
 
 // What one request can hold: two readings in `decode_answer`, one in
@@ -44,8 +34,11 @@ name_bomb :: proc() -> []u8 {
 	defer delete(name)
 	// What one of these costs once escaped, read rather than written down, so
 	// the fixture follows `NAME_BUDGET` and the escaping wherever they go.
-	owner, _, _ := decode_name(name, 0)
+	owner, _, err := decode_name(name, 0)
 	defer delete(owner)
+	if err != .None {
+		panic("the long name did not decode")
+	}
 
 	msg := make([dynamic]u8, 0, 8192)
 	put_header(&msg, 0)
@@ -57,13 +50,7 @@ name_bomb :: proc() -> []u8 {
 	// refused rather than land just inside it.
 	count := u16(0)
 	for int(count) * 2 * len(owner) <= NAME_BUDGET {
-		append(&msg, 0xc0, 0x0c)
-		put_u16(&msg, u16(Type.MX))
-		put_u16(&msg, u16(Class.IN))
-		append(&msg, 0, 0, 0x0e, 0x10)
-		put_u16(&msg, 4)
-		put_u16(&msg, 10)
-		append(&msg, 0xc0, 0x0c)
+		put_pointer_record(&msg, .MX, {0, 10, 0xc0, 0x0c})
 		count += 1
 	}
 	msg[6], msg[7] = u8(count >> 8), u8(count)
@@ -79,13 +66,13 @@ list; it is the record array itself, once per reading.
 */
 @(private = "file")
 record_count_bomb :: proc() -> []u8 {
-	msg := make([dynamic]u8, 0, 65535)
+	msg := make([dynamic]u8, 0, MAX_MESSAGE)
 	put_header(&msg, 0)
 	append(&msg, 1, 'x', 0)
 	put_u16(&msg, u16(Type.A))
 	put_u16(&msg, u16(Class.IN))
 	count := 0
-	for len(msg) + 11 <= 65535 {
+	for len(msg) + 11 <= MAX_MESSAGE {
 		append(&msg, 0)
 		put_u16(&msg, 999)
 		put_u16(&msg, u16(Class.IN))
@@ -120,6 +107,7 @@ read_many :: proc(msg: []u8, readings: int) -> (used: int, spent: int) {
 	mem.arena_init(&arena, backing)
 	a := mem.arena_allocator(&arena)
 
+	defer request_release(&spent)
 	for _ in 0 ..< readings {
 		decode_message(msg, a, &spent)
 	}
@@ -132,7 +120,7 @@ Every reading of a request charges the one budget the request owns.
 Three shapes, because the amplification has three ends and the budget has to
 hold for all of them: names, a repeated RDATA element, and the record array.
 Without the request's counter each is bounded per reading, which is to say
-bounded thirty-five times over.
+bounded `READINGS` times over.
 */
 @(test)
 test_the_readings_of_one_request_share_one_budget :: proc(t: ^testing.T) {
@@ -179,6 +167,7 @@ test_one_reading_of_a_request_still_stops_at_its_own_name_budget :: proc(t: ^tes
 	mem.arena_init(&arena, backing)
 
 	spent := 0
+	defer request_release(&spent)
 	_, err := decode_message(msg, mem.arena_allocator(&arena), &spent)
 	testing.expect_value(t, err, Decode_Error.Name_Budget)
 	testing.expectf(
@@ -212,31 +201,29 @@ test_a_reading_past_the_request_budget_is_not_blamed_on_the_message :: proc(t: ^
 	a := mem.arena_allocator(&arena)
 
 	spent := 0
-	for spent <= REQUEST_DECODE_BUDGET {
+	defer request_release(&spent)
+	// Bounded, so a reading that stops charging fails here rather than hangs.
+	for _ in 0 ..< READINGS * 64 {
+		if spent > REQUEST_DECODE_BUDGET {
+			break
+		}
 		decode_message(msg, a, &spent)
+	}
+	if !testing.expectf(t, spent > REQUEST_DECODE_BUDGET, "the readings stopped charging at %d of %d", spent, REQUEST_DECODE_BUDGET) {
+		return
 	}
 
 	// One plain MX record under a short name: nothing here is worth a budget.
-	plain := make([dynamic]u8, 0, 64)
+	plain := one_record_message(.MX, {0, 10, 0xc0, 0x0c})
 	defer delete(plain)
-	put_header(&plain, 1)
-	append(&plain, 1, 'x', 0)
-	put_u16(&plain, u16(Type.MX))
-	put_u16(&plain, u16(Class.IN))
-	append(&plain, 0xc0, 0x0c)
-	put_u16(&plain, u16(Type.MX))
-	put_u16(&plain, u16(Class.IN))
-	append(&plain, 0, 0, 0x0e, 0x10)
-	put_u16(&plain, 4)
-	put_u16(&plain, 10)
-	append(&plain, 0xc0, 0x0c)
 
-	_, err := decode_message(plain[:], a, &spent)
+	_, err := decode_message(plain, a, &spent)
 	testing.expect_value(t, err, Decode_Error.Request_Budget)
 
 	// And on its own, with a counter of its own, it is a message like any other.
 	fresh := 0
-	_, ferr := decode_message(plain[:], a, &fresh)
+	defer request_release(&fresh)
+	_, ferr := decode_message(plain, a, &fresh)
 	testing.expect_value(t, ferr, Decode_Error.None)
 }
 
@@ -256,15 +243,10 @@ chain_reply :: proc() -> []u8 {
 	append(&msg, ..name)
 	put_u16(&msg, u16(Type.DNSKEY))
 	put_u16(&msg, u16(Class.IN))
+	key: [512]u8
+	mem.set(&key, 0x2a, len(key))
 	for _ in 0 ..< 4 {
-		append(&msg, 0xc0, 0x0c)
-		put_u16(&msg, u16(Type.DNSKEY))
-		put_u16(&msg, u16(Class.IN))
-		append(&msg, 0, 0, 0x0e, 0x10)
-		put_u16(&msg, 512)
-		for _ in 0 ..< 512 {
-			append(&msg, 0x2a)
-		}
+		put_pointer_record(&msg, .DNSKEY, key[:])
 	}
 	return msg[:]
 }
@@ -274,7 +256,7 @@ A heavy request of the ordinary kind is nowhere near the budget.
 
 The worst shape a legitimate query reaches, and the figure the budget is sized
 against: a full-length answer read the three times the answer path reads one,
-and a DNSKEY reply for each of the thirty-two steps a chain walk may take. That
+and a DNSKEY reply for each of the `READINGS - 3` steps a chain walk may take. That
 is 1,356,752 bytes measured, against the eight megabytes a request may have -
 what the budget refuses costs that much out of a few kilobytes of wire, and what
 real traffic does costs this.
@@ -293,11 +275,12 @@ test_a_heavy_but_ordinary_request_stays_well_inside_the_budget :: proc(t: ^testi
 	a := mem.arena_allocator(&arena)
 
 	spent := 0
+	defer request_release(&spent)
 	for i in 0 ..< 3 {
 		_, err := decode_message(answer, a, &spent)
 		testing.expectf(t, err == .None, "reading %d of an ordinary answer was refused: %v", i, err)
 	}
-	for i in 0 ..< 32 {
+	for i in 0 ..< READINGS - 3 {
 		_, err := decode_message(chain, a, &spent)
 		testing.expectf(t, err == .None, "chain step %d was refused: %v", i, err)
 	}

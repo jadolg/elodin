@@ -1,5 +1,6 @@
 package dns
 
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
@@ -54,11 +55,7 @@ padded_query :: proc(name: string, options: []EDNS_Option, trailer := false) -> 
 		additional = additional,
 	}
 	m.flags.rd = true
-	wire, _, err := encode_message(m, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	return test_wire(m)
 }
 
 // A name of `labels` labels, each eight characters, so the caller can walk a
@@ -76,16 +73,6 @@ long_name :: proc(labels: int, tail: int) -> string {
 		strings.write_byte(&b, '.')
 	}
 	return strings.to_string(b)
-}
-
-@(private = "file")
-all_zero :: proc(data: []u8) -> bool {
-	for b in data {
-		if b != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 // Pads `wire` and checks the result: a whole number of blocks, no shorter than
@@ -110,7 +97,7 @@ expect_padded :: proc(t: ^testing.T, wire: []u8, name: string, loc := #caller_lo
 
 	data, found := option_in(out, .Padding)
 	testing.expect(t, found, "the padded query carries no padding option", loc = loc)
-	testing.expect(t, all_zero(data), "the padding is not zeroes", loc = loc)
+	testing.expect(t, mem.check_zero(data), "the padding is not zeroes", loc = loc)
 
 	// The question still has to survive all of this.
 	q, qok := peek_question(out, context.temp_allocator)
@@ -129,9 +116,6 @@ test_a_padded_query_lands_on_a_block_boundary :: proc(t: ^testing.T) {
 	*/
 	for tail in 0 ..< 24 {
 		wire := padded_query(long_name(3, tail), nil)
-		if !testing.expect(t, wire != nil, "could not build the query") {
-			return
-		}
 		if !expect_padded(t, wire, long_name(3, tail)) {
 			return
 		}
@@ -148,9 +132,6 @@ test_padding_survives_an_opt_record_that_is_not_last :: proc(t: ^testing.T) {
 	*/
 	for tail in 0 ..< 8 {
 		wire := padded_query(long_name(2, tail), nil, trailer = true)
-		if !testing.expect(t, wire != nil, "could not build the query") {
-			return
-		}
 		if !expect_padded(t, wire, long_name(2, tail)) {
 			return
 		}
@@ -177,9 +158,6 @@ test_padding_replaces_padding_that_was_already_there :: proc(t: ^testing.T) {
 		data = []u8{'x'},
 	}
 	wire := padded_query("example.com.", options)
-	if !testing.expect(t, wire != nil, "could not build the query") {
-		return
-	}
 
 	out, ok := pad_response(wire, PAD_RESPONSE_BLOCK, MAX_MESSAGE, 1232, context.temp_allocator)
 	if !testing.expect(t, ok, "an already-padded message was not repadded") {
@@ -212,18 +190,7 @@ test_a_query_with_no_opt_record_is_left_alone :: proc(t: ^testing.T) {
 	client into an EDNS negotiation it never asked for - so the query goes out
 	as it is and the caller is told it is unpadded.
 	*/
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-	}
-	m := Message {
-		id       = 0x0101,
-		question = questions,
-	}
-	wire, _, err := encode_message(m, context.temp_allocator)
-	testing.expect_value(t, err, Encode_Error.None)
+	wire := test_wire({id = 0x0101, question = []Question{{name = "example.com.", type = .A, class = .IN}}})
 
 	_, ok := pad_query(wire, PAD_QUERY_BLOCK, MAX_MESSAGE, context.temp_allocator)
 	testing.expect(t, !ok, "a query with no OPT record reported itself padded")
@@ -236,19 +203,12 @@ test_a_response_that_lost_its_opt_record_still_gets_padded :: proc(t: ^testing.T
 	// An upstream that does not do EDNS answers without an OPT record. The
 	// client asked with one - that is what made this response one to pad - so a
 	// record is minted to carry the option.
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-	}
 	m := Message {
 		id       = 0x0202,
-		question = questions,
+		question = []Question{{name = "example.com.", type = .A, class = .IN}},
 	}
 	m.flags.qr = true
-	wire, _, err := encode_message(m, context.temp_allocator)
-	testing.expect_value(t, err, Encode_Error.None)
+	wire := test_wire(m)
 
 	out, ok := pad_response(wire, PAD_RESPONSE_BLOCK, MAX_MESSAGE, 1232, context.temp_allocator)
 	if !testing.expect(t, ok, "a response with no OPT record was not padded") {
@@ -273,9 +233,6 @@ test_padding_that_does_not_fit_is_not_applied :: proc(t: ^testing.T) {
 	unpadded instead, and the caller sends what it had.
 	*/
 	wire := padded_query("example.com.", nil)
-	if !testing.expect(t, wire != nil, "could not build the query") {
-		return
-	}
 
 	_, ok := pad_query(wire, PAD_QUERY_BLOCK, PAD_QUERY_BLOCK - 1, context.temp_allocator)
 	testing.expect(t, !ok, "padding was applied past the limit it was given")
@@ -291,9 +248,6 @@ test_padding_that_does_not_fit_is_not_applied :: proc(t: ^testing.T) {
 @(test)
 test_a_block_this_file_does_not_implement_is_refused :: proc(t: ^testing.T) {
 	wire := padded_query("example.com.", nil)
-	if !testing.expect(t, wire != nil, "could not build the query") {
-		return
-	}
 
 	for block in ([]int{0, 1, -128, PAD_BLOCK_MAX + 1}) {
 		_, ok := pad_query(wire, block, MAX_MESSAGE, context.temp_allocator)

@@ -28,7 +28,6 @@ option_in :: proc(wire: []u8, code: EDNS_Option_Code) -> (data: []u8, found: boo
 @(test)
 test_edns_option_appended_to_empty_opt :: proc(t: ^testing.T) {
 	wire := opt_query(nil)
-	testing.expect(t, wire != nil, "could not build the query")
 
 	out, ok := set_edns_option(wire, .Cookie, []u8{1, 2, 3, 4, 5, 6, 7, 8}, context.temp_allocator)
 	testing.expect(t, ok, "set_edns_option failed")
@@ -49,7 +48,6 @@ test_edns_option_replaced_in_place :: proc(t: ^testing.T) {
 		{code = u16(EDNS_Option_Code.NSID), data = []u8{'x'}},
 	}
 	wire := opt_query(existing)
-	testing.expect(t, wire != nil, "could not build the query")
 
 	fresh := []u8{1, 2, 3, 4, 5, 6, 7, 8, 0xaa, 0xbb}
 	out, ok := set_edns_option(wire, .Cookie, fresh, context.temp_allocator)
@@ -74,7 +72,6 @@ test_edns_option_removed :: proc(t: ^testing.T) {
 		{code = u16(EDNS_Option_Code.Cookie), data = []u8{9, 9, 9, 9, 9, 9, 9, 9}},
 	}
 	wire := opt_query(existing)
-	testing.expect(t, wire != nil, "could not build the query")
 
 	out, ok := remove_edns_option(wire, .Cookie, context.temp_allocator)
 	testing.expect(t, ok, "remove_edns_option failed")
@@ -101,14 +98,7 @@ test_edns_option_remove_when_absent_is_a_no_op :: proc(t: ^testing.T) {
 
 @(test)
 test_edns_option_without_opt_record_fails :: proc(t: ^testing.T) {
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-	}
-	wire, _, err := encode_message(Message{id = 1, question = questions}, context.temp_allocator)
-	testing.expect_value(t, err, Encode_Error.None)
+	wire := test_wire({id = 1, question = []Question{{name = "example.com.", type = .A, class = .IN}}})
 
 	_, ok := set_edns_option(wire, .Cookie, []u8{1, 2, 3, 4, 5, 6, 7, 8}, context.temp_allocator)
 	testing.expect(t, !ok, "an option was written into a message with no OPT record")
@@ -123,26 +113,9 @@ intact.
 */
 @(test)
 test_edns_option_with_a_record_after_the_opt :: proc(t: ^testing.T) {
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-	}
-	additional := make([]Record, 2, context.temp_allocator)
-	additional[0] = make_opt(1232, false)
-	additional[1] = Record {
-		name  = "ns.example.com.",
-		type  = .A,
-		class = .IN,
-		ttl   = 60,
-		data  = Rdata_A{addr = {192, 0, 2, 1}},
-	}
-	wire, _, err := encode_message(
-		Message{id = 1, question = questions, additional = additional},
-		context.temp_allocator,
+	wire := test_wire(
+		{id = 1, question = []Question{{name = "example.com.", type = .A, class = .IN}}, additional = []Record{make_opt(1232, false), a_answer("ns.example.com.", 60)}},
 	)
-	testing.expect_value(t, err, Encode_Error.None)
 
 	out, ok := set_edns_option(wire, .Cookie, []u8{1, 2, 3, 4, 5, 6, 7, 8}, context.temp_allocator)
 	testing.expect(t, ok, "set_edns_option failed")
@@ -158,10 +131,11 @@ test_edns_option_with_a_record_after_the_opt :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-@(test)
-test_edns_option_rejects_a_truncated_option_list :: proc(t: ^testing.T) {
+// A query whose OPT record has RDLENGTH 4, holding a COOKIE option header that
+// claims eight bytes of data, none of them present.
+@(private = "file")
+truncated_option_list :: proc() -> []u8 {
 	wire := opt_query(nil)
-	// Claim eight bytes of option data that are not there.
 	bad := make([]u8, len(wire) + 4, context.temp_allocator)
 	copy(bad, wire)
 	bad[len(bad) - 6] = 0
@@ -170,7 +144,12 @@ test_edns_option_rejects_a_truncated_option_list :: proc(t: ^testing.T) {
 	bad[len(bad) - 3] = 10 // COOKIE
 	bad[len(bad) - 2] = 0
 	bad[len(bad) - 1] = 8 // option length 8, with no data behind it
+	return bad
+}
 
+@(test)
+test_edns_option_rejects_a_truncated_option_list :: proc(t: ^testing.T) {
+	bad := truncated_option_list()
 	_, ok := set_edns_option(bad, .Cookie, []u8{1, 2, 3, 4, 5, 6, 7, 8}, context.temp_allocator)
 	testing.expect(t, !ok, "a truncated option list was accepted")
 	free_all(context.temp_allocator)
@@ -187,13 +166,6 @@ the difference between the cookie being stripped and being sent on.
 */
 @(test)
 test_edns_option_ignores_an_opt_outside_the_additional_section :: proc(t: ^testing.T) {
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-	}
-
 	decoy := make([]Record, 1, context.temp_allocator)
 	decoy[0] = make_opt(1232, false)
 
@@ -206,11 +178,7 @@ test_edns_option_ignores_an_opt_outside_the_additional_section :: proc(t: ^testi
 	}
 	real[0].data = Rdata_OPT{options = options}
 
-	wire, _, err := encode_message(
-		Message{id = 1, question = questions, answer = decoy, additional = real},
-		context.temp_allocator,
-	)
-	testing.expect_value(t, err, Encode_Error.None)
+	wire := test_wire({id = 1, question = []Question{{name = "example.com.", type = .A, class = .IN}}, answer = decoy, additional = real})
 
 	// The reader sees the cookie in the additional section, so the writer has to
 	// be looking at that same record.
@@ -245,7 +213,6 @@ a client that asked with one, so `ensure_edns_option` adds the OPT record that
 @(test)
 test_ensure_edns_option_adds_a_missing_opt_record :: proc(t: ^testing.T) {
 	wire := plain_answer()
-	testing.expect(t, wire != nil, "could not build the answer")
 
 	_, none := set_edns_option(wire, .Cookie, []u8{1, 2, 3, 4, 5, 6, 7, 8}, context.temp_allocator)
 	testing.expect(t, !none, "set_edns_option invented an OPT record")
@@ -277,7 +244,6 @@ test_ensure_edns_option_adds_a_missing_opt_record :: proc(t: ^testing.T) {
 test_ensure_edns_option_uses_an_existing_opt_record :: proc(t: ^testing.T) {
 	existing := []EDNS_Option{{code = u16(EDNS_Option_Code.NSID), data = []u8{'x'}}}
 	wire := opt_query(existing)
-	testing.expect(t, wire != nil, "could not build the query")
 
 	cookie := []u8{1, 2, 3, 4, 5, 6, 7, 8}
 	out, ok := ensure_edns_option(wire, .Cookie, cookie, 4096, context.temp_allocator)
@@ -304,18 +270,7 @@ test_ensure_edns_option_uses_an_existing_opt_record :: proc(t: ^testing.T) {
 // A message that cannot be walked is not one to hand back half-changed.
 @(test)
 test_ensure_edns_option_refuses_a_message_it_cannot_read :: proc(t: ^testing.T) {
-	wire := opt_query(nil)
-	// Claim four bytes of option data that are not there, which the decoder
-	// rejects outright.
-	bad := make([]u8, len(wire) + 4, context.temp_allocator)
-	copy(bad, wire)
-	bad[len(bad) - 6] = 0
-	bad[len(bad) - 5] = 4 // rdlength = 4
-	bad[len(bad) - 4] = 0
-	bad[len(bad) - 3] = 10 // COOKIE
-	bad[len(bad) - 2] = 0
-	bad[len(bad) - 1] = 8 // option length 8, with no data behind it
-
+	bad := truncated_option_list()
 	_, ok := ensure_edns_option(bad, .Cookie, []u8{1, 2, 3, 4, 5, 6, 7, 8}, 1232, context.temp_allocator)
 	testing.expect(t, !ok, "a message that does not decode was rewritten")
 
@@ -335,18 +290,16 @@ header's four bits.
 */
 @(test)
 test_peek_rcode_reads_the_extended_bits :: proc(t: ^testing.T) {
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-	}
+	defer free_all(context.temp_allocator)
 	query := Message {
 		id       = 1,
-		question = questions,
+		question = []Question{{name = "example.com.", type = .A, class = .IN}},
 	}
 
-	resp := make_response(query, .Bad_Cookie, context.temp_allocator)
+	resp, merr := make_response(query, .Bad_Cookie, context.temp_allocator)
+	if !testing.expect_value(t, merr, mem.Allocator_Error.None) {
+		return
+	}
 	// make_response only echoes an OPT when the query had one, and this query
 	// has none, so the record is put there by hand.
 	additional := make([]Record, 1, context.temp_allocator)
@@ -359,12 +312,15 @@ test_peek_rcode_reads_the_extended_bits :: proc(t: ^testing.T) {
 	testing.expect_value(t, peek_rcode(wire), Rcode.Bad_Cookie)
 
 	// Without an OPT record the header is all there is.
-	plain, _, perr := encode_message(make_response(query, .NX_Domain, context.temp_allocator), context.temp_allocator)
+	nx, nx_err := make_response(query, .NX_Domain, context.temp_allocator)
+	if !testing.expect_value(t, nx_err, mem.Allocator_Error.None) {
+		return
+	}
+	plain, _, perr := encode_message(nx, context.temp_allocator)
 	testing.expect_value(t, perr, Encode_Error.None)
 	testing.expect_value(t, peek_rcode(plain), Rcode.NX_Domain)
 
 	testing.expect_value(t, peek_rcode([]u8{1, 2}), Rcode.No_Error)
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -381,7 +337,6 @@ it came with. So the two bytes are set in place.
 @(test)
 test_set_edns_udp_size_rewrites_the_opt_class :: proc(t: ^testing.T) {
 	wire := opt_query(nil)
-	testing.expect(t, wire != nil, "could not build the query")
 	testing.expect_value(t, int(peek_udp_size(wire)), 1232)
 
 	testing.expect(t, set_edns_udp_size(wire, 512), "set_edns_udp_size failed")
@@ -405,7 +360,6 @@ test_set_edns_udp_size_rewrites_the_opt_class :: proc(t: ^testing.T) {
 test_set_edns_udp_size_keeps_the_options :: proc(t: ^testing.T) {
 	existing := []EDNS_Option{{code = u16(EDNS_Option_Code.NSID), data = []u8{'x', 'y'}}}
 	wire := opt_query(existing)
-	testing.expect(t, wire != nil, "could not build the query")
 
 	testing.expect(t, set_edns_udp_size(wire, 1232), "set_edns_udp_size failed")
 	testing.expect_value(t, int(peek_udp_size(wire)), 1232)
@@ -427,7 +381,6 @@ message it could not walk, and neither is a reason to refuse the answer.
 @(test)
 test_set_edns_udp_size_reports_a_message_with_no_opt :: proc(t: ^testing.T) {
 	plain := plain_answer()
-	testing.expect(t, plain != nil, "could not build the answer")
 	before := make([]u8, len(plain), context.temp_allocator)
 	copy(before, plain)
 
@@ -437,33 +390,6 @@ test_set_edns_udp_size_reports_a_message_with_no_opt :: proc(t: ^testing.T) {
 	testing.expect(t, !set_edns_udp_size([]u8{1, 2, 3}, 1232), "a message too short to hold a header was accepted")
 
 	free_all(context.temp_allocator)
-}
-
-/*
-An answer whose AFSDB hostname is compressed into the message, with the pointer
-aimed at the NS target written before it.
-
-The twin of `message_prefix` in dns_test.odin, kept separate because both are
-file-private; either one on its own says too little about what the other tests
-build, and sharing them would put wire-format scaffolding in the package proper.
-*/
-@(private = "file")
-answer_with_compressed_afsdb :: proc() -> []u8 {
-	m := make([dynamic]u8, 0, 128, context.temp_allocator)
-	append(&m, 0x12, 0x34, 0x80, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00)
-	// Question: example.com. A IN, at offset 12.
-	append(&m, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0)
-	append(&m, 0x00, 0x01, 0x00, 0x01)
-	// Answer 1: example.com. NS ns1.example.com.
-	append(&m, 0xc0, 0x0c)
-	append(&m, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x06)
-	ns_target := len(m)
-	append(&m, 3, 'n', 's', '1', 0xc0, 0x0c)
-	// Answer 2: example.com. AFSDB 1 <pointer at the NS target above>
-	append(&m, 0xc0, 0x0c)
-	append(&m, 0x00, 0x12, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04)
-	append(&m, 0x00, 0x01, 0xc0 | u8(ns_target >> 8), u8(ns_target))
-	return m[:]
 }
 
 /*
@@ -479,7 +405,11 @@ cannot tell that its answer went through a second encoder at all.
 */
 @(test)
 test_raw_rdata_pointer_survives_cookie_attach :: proc(t: ^testing.T) {
-	original := answer_with_compressed_afsdb()
+	defer free_all(context.temp_allocator)
+	// The AFSDB hostname is a pointer at the NS target `message_prefix` writes.
+	prefix, ns_target := message_prefix(answers = 3)
+	append_answer(&prefix, .AFSDB, []u8{0x00, 0x01, 0xc0 | u8(ns_target >> 8), u8(ns_target)})
+	original := prefix[:]
 	cookie: [24]u8
 
 	out, ok := ensure_edns_option(original, .Cookie, cookie[:], 1232, context.temp_allocator)
@@ -507,8 +437,6 @@ test_raw_rdata_pointer_survives_cookie_attach :: proc(t: ^testing.T) {
 
 	_, has_cookie := option_in(out, .Cookie)
 	testing.expect(t, has_cookie, "the cookie was not attached")
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -562,12 +490,7 @@ they must not disagree.
 */
 @(test)
 test_badvers_needs_its_opt_record_to_read_as_a_refusal :: proc(t: ^testing.T) {
-	questions := make([]Question, 1, context.temp_allocator)
-	questions[0] = Question {
-		name  = "example.com.",
-		type  = .A,
-		class = .IN,
-	}
+	defer free_all(context.temp_allocator)
 	opt := make_opt(1232, false)
 	// Asked in version 1, which is what makes the version on the way back a
 	// statement rather than an echo.
@@ -576,11 +499,14 @@ test_badvers_needs_its_opt_record_to_read_as_a_refusal :: proc(t: ^testing.T) {
 	additional[0] = opt
 	query := Message {
 		id         = 0x4321,
-		question   = questions,
+		question   = []Question{{name = "example.com.", type = .A, class = .IN}},
 		additional = additional,
 	}
 
-	resp := make_response(query, .Bad_Vers, context.temp_allocator)
+	resp, merr := make_response(query, .Bad_Vers, context.temp_allocator)
+	if !testing.expect_value(t, merr, mem.Allocator_Error.None) {
+		return
+	}
 	wire, _, err := encode_message(resp, context.temp_allocator)
 	testing.expect_value(t, err, Encode_Error.None)
 
@@ -613,8 +539,6 @@ test_badvers_needs_its_opt_record_to_read_as_a_refusal :: proc(t: ^testing.T) {
 	bare_decoded, bare_derr := decode_message(bare_wire, context.temp_allocator)
 	testing.expect_value(t, bare_derr, Decode_Error.None)
 	testing.expect_value(t, rcode_of(bare_decoded), Rcode.Bad_Vers)
-
-	free_all(context.temp_allocator)
 }
 
 /*
@@ -831,7 +755,8 @@ test_peek_edns_option_ignores_an_opt_outside_the_additional_section :: proc(t: ^
 
 	m, derr := decode_message(both, context.temp_allocator)
 	testing.expect_value(t, derr, Decode_Error.None)
-	want, _ := find_edns_option(m, .Cookie)
+	want, want_found := find_edns_option(m, .Cookie)
+	testing.expect(t, want_found, "the decoded reader found no cookie")
 	testing.expect(t, mem.compare(want, got) == 0, "the walk and the decoded reader read different OPT records")
 	free_all(context.temp_allocator)
 }
@@ -840,6 +765,7 @@ test_peek_edns_option_ignores_an_opt_outside_the_additional_section :: proc(t: ^
 // way to show one of them a cookie the other never sees.
 @(test)
 test_peek_edns_option_takes_the_first_of_duplicates :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
 	first := []u8{1, 2, 3, 4, 5, 6, 7, 8}
 	second := []u8{9, 9, 9, 9, 9, 9, 9, 9}
 	wire := raw_reply(
@@ -853,12 +779,12 @@ test_peek_edns_option_takes_the_first_of_duplicates :: proc(t: ^testing.T) {
 	testing.expect(t, mem.compare(got, first) == 0, "the walk read the second copy")
 
 	m, derr := decode_message(wire, context.temp_allocator)
-	if derr == .None {
-		want, want_found := find_edns_option(m, .Cookie)
-		testing.expect(t, want_found, "the decoded reader lost the repeated option")
-		testing.expect(t, mem.compare(want, got) == 0, "the two readers picked different copies")
+	if !testing.expect_value(t, derr, Decode_Error.None) {
+		return
 	}
-	free_all(context.temp_allocator)
+	want, want_found := find_edns_option(m, .Cookie)
+	testing.expect(t, want_found, "the decoded reader lost the repeated option")
+	testing.expect(t, mem.compare(want, got) == 0, "the two readers picked different copies")
 }
 
 /*
@@ -873,7 +799,7 @@ otherwise. The spellings are the ones `dig` and BIND print.
 
 The unassigned values are checked as well, in both gaps: 12 to 15 between the
 header's own codes and the extended ones, and everything above 23. Both are
-things a responder may legitimately send - the field is eight bits wide - so
+things a responder may legitimately send - the field is twelve bits wide - so
 `known` false is the answer, and the caller prints the number.
 */
 @(test)

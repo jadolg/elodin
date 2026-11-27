@@ -405,13 +405,6 @@ exchange_against :: proc(
 	return resp, err, true
 }
 
-@(private = "file")
-expect_caller_holds_nothing :: proc(t: ^testing.T, track: ^mem.Tracking_Allocator, what: string) {
-	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%s: %d bytes still held, allocated at %v", what, entry.size, entry.location)
-	}
-}
-
 /*
 A body is held once while it is read, and afterwards in exactly its size: not in
 the reader's buffer and a copy of it (#414), nor in a buffer still holding every
@@ -512,7 +505,7 @@ test_an_empty_body_holds_nothing :: proc(t: ^testing.T) {
 		testing.expect_value(t, err, Error.None)
 		testing.expectf(t, resp.body == nil, "an empty body came back as %d bytes at %p", len(resp.body), raw_data(resp.body))
 	}
-	expect_caller_holds_nothing(t, &track, "empty body")
+	testkit.expect_no_leaks(t, &track, "empty body")
 	free_all(context.temp_allocator)
 }
 
@@ -538,7 +531,7 @@ test_a_body_read_with_its_fields_is_handed_over_whole :: proc(t: ^testing.T) {
 		testing.expect_value(t, track.current_memory_allocated, 5)
 		delete(resp.body)
 	}
-	expect_caller_holds_nothing(t, &track, "body read with its fields")
+	testkit.expect_no_leaks(t, &track, "body read with its fields")
 	free_all(context.temp_allocator)
 }
 
@@ -563,7 +556,7 @@ test_redirect_location_is_not_the_callers_to_free :: proc(t: ^testing.T) {
 	testing.expect_value(t, resp.location, "http://example.org/first")
 	testing.expect(t, resp.body == nil, "a zero-length body should be nil")
 
-	expect_caller_holds_nothing(t, &track, "redirect")
+	testkit.expect_no_leaks(t, &track, "redirect")
 	free_all(context.temp_allocator)
 }
 
@@ -586,7 +579,7 @@ test_truncated_chunked_body_is_released :: proc(t: ^testing.T) {
 	testing.expect(t, resp.body == nil, "a failed exchange returned a body")
 
 	// The half-assembled body is the reader's to drop, not the caller's.
-	expect_caller_holds_nothing(t, &track, "truncated chunked")
+	testkit.expect_no_leaks(t, &track, "truncated chunked")
 	free_all(context.temp_allocator)
 }
 
@@ -677,7 +670,7 @@ test_header_count_is_capped :: proc(t: ^testing.T) {
 		if resp.body != nil {
 			delete(resp.body, mem.tracking_allocator(&track))
 		}
-		expect_caller_holds_nothing(t, &track, c.what)
+		testkit.expect_no_leaks(t, &track, c.what)
 		free_all(context.temp_allocator)
 	}
 }
@@ -1413,7 +1406,7 @@ test_content_length_out_of_range_is_refused :: proc(t: ^testing.T) {
 		if resp.body != nil {
 			delete(resp.body, mem.tracking_allocator(&track))
 		}
-		expect_caller_holds_nothing(t, &track, "negative content-length")
+		testkit.expect_no_leaks(t, &track, "negative content-length")
 		free_all(context.temp_allocator)
 	}
 }
@@ -1475,7 +1468,7 @@ test_response_framing_fields_are_strict_decimal :: proc(t: ^testing.T) {
 		if resp.body != nil {
 			delete(resp.body, mem.tracking_allocator(&track))
 		}
-		expect_caller_holds_nothing(t, &track, c.what)
+		testkit.expect_no_leaks(t, &track, c.what)
 		free_all(context.temp_allocator)
 	}
 }
@@ -2556,7 +2549,7 @@ test_a_hang_up_is_not_filed_as_a_transport_error :: proc(t: ^testing.T) {
 	testing.expectf(t, err == .Peer_Closed, "a hang-up was reported as %v", err)
 	testing.expect(t, resp.body == nil, "a failed exchange returned a body")
 
-	expect_caller_holds_nothing(t, &track, "hang-up")
+	testkit.expect_no_leaks(t, &track, "hang-up")
 	free_all(context.temp_allocator)
 }
 
@@ -2732,7 +2725,7 @@ test_a_refused_doh_h1_reply_releases_its_body :: proc(t: ^testing.T) {
 				resp, err := exchange_doh_h1(u, query, query, time.tick_add(loop.tick_now(), 2 * time.Second), mem.tracking_allocator(&track))
 				testing.expectf(t, err == refusal.err, "%q pooled=%v: got %v, want %v", reply[:12], pooled, err, refusal.err)
 				testing.expect(t, resp == nil, "a refused reply came back as an answer")
-				expect_caller_holds_nothing(t, &track, reply[:12])
+				testkit.expect_no_leaks(t, &track, reply[:12])
 				destroy(u)
 			}
 			mem.tracking_allocator_destroy(&track)
@@ -2850,7 +2843,7 @@ test_doh_h1_reply_is_bounded_by_a_dns_message :: proc(t: ^testing.T) {
 						"%v %d pooled=%v: peak %d bytes in the caller's allocator", framing, size, pooled, caller.peak_memory_allocated)
 					testing.expectf(t, reader.peak_memory_allocated < 2 * dns.MAX_MESSAGE,
 						"%v %d pooled=%v: the reader's buffer peaked at %d bytes", framing, size, pooled, reader.peak_memory_allocated)
-					expect_caller_holds_nothing(t, &caller, "oversized")
+					testkit.expect_no_leaks(t, &caller, "oversized")
 					mem.tracking_allocator_destroy(&caller)
 					mem.tracking_allocator_destroy(&reader)
 					destroy(u)
@@ -2939,7 +2932,7 @@ test_a_doh_h1_408_on_a_pooled_connection_is_retried :: proc(t: ^testing.T) {
 				if resp != nil {
 					delete(resp, mem.tracking_allocator(&track))
 				}
-				expect_caller_holds_nothing(t, &track, "408")
+				testkit.expect_no_leaks(t, &track, "408")
 				destroy(u)
 			}
 			mem.tracking_allocator_destroy(&track)
@@ -2982,7 +2975,7 @@ test_a_redirect_without_a_location_releases_its_body :: proc(t: ^testing.T) {
 	body, err := fetch_url(url, nil, 2 * time.Second, 5 * time.Second, mem.tracking_allocator(&track))
 	testing.expect_value(t, err, Error.HTTP_Error)
 	testing.expect(t, body == nil, "a redirect with nowhere to go came back as the list")
-	expect_caller_holds_nothing(t, &track, "301 without a Location")
+	testkit.expect_no_leaks(t, &track, "301 without a Location")
 	free_all(context.temp_allocator)
 }
 
@@ -3016,7 +3009,7 @@ test_a_truncated_reply_is_not_a_hang_up :: proc(t: ^testing.T) {
 	testing.expectf(t, err == .IO_Error, "a truncated reply was reported as %v", err)
 	testing.expect(t, resp.body == nil, "a failed exchange returned a body")
 
-	expect_caller_holds_nothing(t, &track, "truncated reply")
+	testkit.expect_no_leaks(t, &track, "truncated reply")
 	free_all(context.temp_allocator)
 }
 
@@ -3427,7 +3420,7 @@ test_http_response_connection_is_a_list :: proc(t: ^testing.T) {
 			testing.expectf(t, err == .None, "%q: exchange failed: %v", c.head, err)
 			testing.expectf(t, resp.keep_alive == c.keep_alive, "%q: keep-alive %v, want %v", c.head, resp.keep_alive, c.keep_alive)
 			delete(resp.body, mem.tracking_allocator(&track))
-			expect_caller_holds_nothing(t, &track, c.head)
+			testkit.expect_no_leaks(t, &track, c.head)
 		}
 		mem.tracking_allocator_destroy(&track)
 		free_all(context.temp_allocator)
@@ -3486,7 +3479,7 @@ test_http_transfer_encoding_is_exactly_chunked :: proc(t: ^testing.T) {
 				testing.expectf(t, resp.keep_alive == c.pooled, "%q: keep-alive %v, want %v", reply, resp.keep_alive, c.pooled)
 			}
 			delete(resp.body, mem.tracking_allocator(&track))
-			expect_caller_holds_nothing(t, &track, reply)
+			testkit.expect_no_leaks(t, &track, reply)
 		}
 		mem.tracking_allocator_destroy(&track)
 		free_all(context.temp_allocator)
@@ -3538,7 +3531,7 @@ test_http_chunk_size_takes_bws_only_before_an_extension :: proc(t: ^testing.T) {
 				testing.expectf(t, string(resp.body) == "hello", "chunk size %q: body %q", c.size, string(resp.body))
 			}
 			delete(resp.body, mem.tracking_allocator(&track))
-			expect_caller_holds_nothing(t, &track, c.size)
+			testkit.expect_no_leaks(t, &track, c.size)
 		}
 		mem.tracking_allocator_destroy(&track)
 		free_all(context.temp_allocator)
@@ -3598,7 +3591,7 @@ test_http_response_malformed_framing_is_refused :: proc(t: ^testing.T) {
 		if ok {
 			testing.expectf(t, err == .HTTP_Error, "%q got %v, body %q, keep-alive %v", reply, err, string(resp.body), resp.keep_alive)
 			delete(resp.body, mem.tracking_allocator(&track))
-			expect_caller_holds_nothing(t, &track, reply)
+			testkit.expect_no_leaks(t, &track, reply)
 		}
 		mem.tracking_allocator_destroy(&track)
 		free_all(context.temp_allocator)
@@ -3677,7 +3670,7 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 				testing.expectf(t, resp.keep_alive == c.keep_alive, "%q: keep-alive %v, want %v", c.reply, resp.keep_alive, c.keep_alive)
 			}
 			delete(resp.body, mem.tracking_allocator(&track))
-			expect_caller_holds_nothing(t, &track, c.reply)
+			testkit.expect_no_leaks(t, &track, c.reply)
 		}
 		mem.tracking_allocator_destroy(&track)
 		free_all(context.temp_allocator)
@@ -3694,7 +3687,7 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 			testing.expectf(t, err == .None, "a 103 with a Location failed: %v", err)
 			testing.expectf(t, resp.location == "", "the 103's Location reached the answer: %q", resp.location)
 			delete(resp.body, mem.tracking_allocator(&track))
-			expect_caller_holds_nothing(t, &track, "interim Location")
+			testkit.expect_no_leaks(t, &track, "interim Location")
 		}
 		free_all(context.temp_allocator)
 	}
@@ -3722,7 +3715,7 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 		if ok {
 			testing.expectf(t, err == .HTTP_Error, "a 103 and a 200 over the shared budget got %v, status %d", err, resp.status)
 			delete(resp.body, mem.tracking_allocator(&track))
-			expect_caller_holds_nothing(t, &track, "shared budget")
+			testkit.expect_no_leaks(t, &track, "shared budget")
 		}
 		free_all(context.temp_allocator)
 	}
@@ -3740,7 +3733,7 @@ test_http_bodyless_statuses_end_at_the_fields :: proc(t: ^testing.T) {
 	if ok {
 		testing.expectf(t, err == .HTTP_Error, "%d interim responses got %v, status %d", MAX_HTTP_HEADERS + 1, err, resp.status)
 		delete(resp.body, mem.tracking_allocator(&track))
-		expect_caller_holds_nothing(t, &track, "endless interims")
+		testkit.expect_no_leaks(t, &track, "endless interims")
 	}
 	free_all(context.temp_allocator)
 }

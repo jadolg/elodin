@@ -49,14 +49,8 @@ supersede_a :: proc(ttl: u32) -> dns.Record {
 // An RRSIG over the A record that lapsed an hour ago.
 @(private = "file")
 lapsed_rrsig :: proc() -> dns.Record {
-	expiration := u32(time.time_to_unix(time.now())) - 3600
-	data := make([]u8, 35, context.temp_allocator)
-	data[0], data[1], data[2], data[3] = 0, 1, 8, 2
-	dns.write_ttl_at(data, 4, 300)
-	dns.write_ttl_at(data, 8, expiration)
-	dns.write_ttl_at(data, 12, expiration - 30 * 86400)
-	copy(data[16:], []u8{0x12, 0x34, 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0xde, 0xad, 0xbe, 0xef})
-	return {name = "example.com.", type = .RRSIG, class = .IN, ttl = 300, data = dns.Rdata_Raw{data = data}}
+	expiration := u32(time.time_to_unix(time.now())) - 3600 // lint:allow wall-clock: an RRSIG's expiration is an instant on it
+	return rrsig_record("example.com.", .A, expiration, 300, original_ttl = 300)
 }
 
 @(test)
@@ -86,7 +80,11 @@ test_a_refused_answer_forgets_the_entry_it_supersedes :: proc(t: ^testing.T) {
 		if !testing.expectf(t, put(answers, key, held_wire, held), "%s: the held answer was not stored", c.name) {
 			continue
 		}
-		serial := answers.shards[0].entries[key].serial
+		held_entry := entry_of(answers, key)
+		if !testing.expectf(t, held_entry != nil, "%s: the held answer is not under its key", c.name) {
+			continue
+		}
+		serial := held_entry.serial
 		if c.tiny {
 			sync.atomic_store(&answers.max_bytes, 1)
 		}
@@ -100,7 +98,8 @@ test_a_refused_answer_forgets_the_entry_it_supersedes :: proc(t: ^testing.T) {
 			continue
 		}
 		testing.expectf(t, !put(answers, key, wire, msg, supersedes = serial + c.off), "%s: the candidate was stored", c.name)
-		e, found := answers.shards[0].entries[key]
+		e := entry_of(answers, key)
+		found := e != nil
 		if c.forgotten {
 			testing.expectf(t, !found, "%s: the entry it supersedes is still there", c.name)
 		} else {
