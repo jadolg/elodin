@@ -249,7 +249,7 @@ move_query_named_caches :: proc(cfg: ^config.Config) {
 			if dry {
 				break moves
 			}
-			if current[old] || !os.exists(old_path) {
+			if current[old] || !cache_file_exists(old_path) {
 				continue
 			}
 			names, named := cache_names(cfg, list)
@@ -259,7 +259,7 @@ move_query_named_caches :: proc(cfg: ^config.Config) {
 			// A copy under the current name that is of another url - one with no
 			// query an earlier build cached there - is moved over, not kept.
 			ours := copy_is_of(list, names)
-			kept := ours && os.exists(names.copy)
+			kept := ours && cache_file_exists(names.copy)
 			if dry {
 				break moves
 			}
@@ -269,17 +269,18 @@ move_query_named_caches :: proc(cfg: ^config.Config) {
 				}
 				continue
 			}
-			if err := os.rename(old_path, names.copy); err != nil {
-				logx.warnf("list %s: cannot move the cached copy to %s (%v)", list.name, names.copy, err)
+			if !ours && !clear_other_copy(list, names) {
 				continue
 			}
-			// Named by this very url, so it is this url's copy. Unmarked for want of
-			// memory, it goes back, to move at the next load; for any other reason
-			// it stays, unmarked, so the key leaves `cache_dir` all the same.
-			if merr := mark_copy_source(cfg, list, names, ours); no_memory(merr) {
-				if err := os.rename(names.copy, old_path); err != nil {
-					logx.warnf("list %s: cannot move the cached copy back to the name its url's query gave it (%v)", list.name, err)
-				}
+			// Named by this very url, so it is this url's copy, marked before it
+			// moves. Unmarked for want of memory, it moves at the next load; for
+			// any other reason it moves all the same, so the key leaves
+			// `cache_dir`, and reads as no url's download.
+			if no_memory(mark_copy_source(cfg, list, names)) {
+				continue
+			}
+			if err := os.rename(old_path, names.copy); err != nil {
+				logx.warnf("list %s: cannot move the cached copy to %s (%v)", list.name, names.copy, err)
 			}
 		}
 	}
@@ -551,7 +552,7 @@ read_cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: Lis
 		// A fingerprint that is refused is not one of another url.
 		if why := fingerprint_refusal(names.source); why != "" {
 			logx.warnf("list %s: the fingerprint at %s is not read: %s", list.name, names.source, why)
-		} else if os.exists(cache_path) {
+		} else if cache_file_exists(cache_path) {
 			logx.infof("list %s: the cached copy at %s is of another url", list.name, cache_path)
 		}
 		return "", .Unavailable
@@ -591,7 +592,8 @@ short is another list's file, or one outside `cache_dir`.
 @(private)
 save_cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, text: string) {
 	names, named := cache_names(cfg, list)
-	// Read before anything is written: after a refusal, whose it is is not known.
+	// Read before anything is written: after a refusal, whose the fingerprint is
+	// is not known.
 	dry: bool
 	temp := dns.Dry_Watch{context.temp_allocator, &dry}
 	ours: bool
@@ -608,41 +610,60 @@ save_cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, text: str
 	if dir := filepath.dir(names.copy); dir != "" {
 		make_directories(dir)
 	}
-	// The copy goes first: a write that fails leaves the old copy beside its own
-	// fingerprint. A stop between the two leaves the new copy beside the old
-	// url's fingerprint.
-	if werr := write_cache_file(names.copy, transmute([]byte)text); werr != nil {
-		warn_cache_unwritable(cfg, names.copy, werr)
+	// On disk before anything there goes, so a write that fails leaves the copy
+	// there as it was, beside its own fingerprint.
+	tmp, serr := stage_cache_file(names.copy, transmute([]byte)text)
+	if serr != nil {
+		warn_cache_unwritable(cfg, names.copy, serr)
 		return
 	}
-	mark_copy_source(cfg, list, names, ours)
+	// The fingerprint goes before the copy, so the copy never lands without it:
+	// a named list's copy with none reads as the copy of any url the list is
+	// given. A write that fails leaves the one before, which is this url's, or,
+	// another url's copy and fingerprint cleared first, none.
+	placed := ours || clear_other_copy(list, names)
+	if placed && mark_copy_source(cfg, list, names) != nil {
+		placed = ours
+	}
+	if placed {
+		rerr := os.rename(tmp, names.copy)
+		if rerr == nil {
+			return
+		}
+		warn_cache_unwritable(cfg, names.copy, rerr)
+	}
+	os.remove(tmp)
 }
 
 /*
-Put the fingerprint of `list`'s url beside its copy, or none for a url with no
-query, and return why it is not there. A write that fails leaves the one before,
-which stays only where `ours` says it is this url's: another url's beside this
-url's copy would make the copy that url's download.
+Remove the copy at `names` and its fingerprint, which are not this url's, before
+this url's fingerprint and copy go there. The copy goes first, so a stop between
+the two leaves no copy beside that fingerprint. False where either is there
+still.
 */
 @(private)
-mark_copy_source :: proc(cfg: ^config.Config, list: config.Block_List, names: Cache_Names, ours: bool) -> (err: os.Error) {
-	if names.fingerprinted {
-		err = write_cache_file(names.source, transmute([]byte)names.fingerprint)
-		if err == nil {
-			return nil
+clear_other_copy :: proc(list: config.Block_List, names: Cache_Names) -> bool {
+	for path in ([]string{names.copy, names.source}) {
+		if err := os.remove(path); err != nil && err != .Not_Exist {
+			logx.warnf("list %s: cannot remove another url's cached copy at %s (%v)", list.name, path, err)
+			return false
 		}
-		warn_cache_unwritable(cfg, names.copy, err)
-		if ours {
-			return
-		}
-	} else if !os.exists(names.source) {
+	}
+	return true
+}
+
+/*
+Put the fingerprint of `list`'s url where its copy goes, for a url with a query,
+and return why it is not there. A write that fails leaves the one before.
+*/
+@(private)
+mark_copy_source :: proc(cfg: ^config.Config, list: config.Block_List, names: Cache_Names) -> (err: os.Error) {
+	if !names.fingerprinted {
 		return nil
 	}
-	if rerr := os.remove(names.source); rerr != nil && rerr != .Not_Exist {
-		logx.warnf("list %s: cannot remove the old fingerprint at %s (%v)", list.name, names.source, rerr)
-		if err == nil {
-			err = rerr
-		}
+	err = write_cache_file(names.source, transmute([]byte)names.fingerprint)
+	if err != nil {
+		warn_cache_unwritable(cfg, names.source, err)
 	}
 	return
 }
@@ -701,7 +722,7 @@ names: a build before #487 cached that under its name and wrote none.
 */
 @(private)
 copy_is_of :: proc(list: config.Block_List, names: Cache_Names) -> bool {
-	if !os.exists(names.source) {
+	if !cache_file_exists(names.source) {
 		return !names.fingerprinted || list.named
 	}
 	if !names.fingerprinted {
@@ -805,15 +826,8 @@ Fetch :: enum u8 {
 @(private)
 fetch_list :: proc(cfg: ^config.Config, list: config.Block_List, ignore_fresh := false) -> (text: string, fetch: Fetch) {
 	// Skip the download when the cached copy is still within the refresh window.
-	// A name spelt short for want of memory may be another list's fresh copy.
-	names, named := cache_names(cfg, list)
-	// Fresh only as a copy `read_cache_file` will read: one it would refuse,
-	// read as fresh, would be neither downloaded again nor loaded.
-	if modified, plain := plain_cache_file(names.copy); named && plain && !ignore_fresh {
-		age := time.diff(modified, loop.now())
-		if age < cfg.blocking.refresh && copy_is_of(list, names) {
-			return "", .Cache_Is_Fresh
-		}
+	if !ignore_fresh && cache_is_fresh(cfg, list) {
+		return "", .Cache_Is_Fresh
 	}
 
 	logx.infof("list %s: downloading %s", list.name, config.url_name(list.url))
@@ -831,6 +845,23 @@ fetch_list :: proc(cfg: ^config.Config, list: config.Block_List, ignore_fresh :=
 		return "", .Failed
 	}
 	return string(body), .Fetched
+}
+
+/*
+Whether `list`'s cached copy is its url's and within the refresh window. Fresh
+only as a copy `read_cache_file` will read: one it would refuse, read as fresh,
+would be neither downloaded again nor loaded. Not fresh where an allocation
+deciding it was refused: a name spelt short may be another list's fresh copy.
+*/
+@(private)
+cache_is_fresh :: proc(cfg: ^config.Config, list: config.Block_List) -> bool {
+	dry: bool
+	temp := dns.Dry_Watch{context.temp_allocator, &dry}
+	context.temp_allocator = dns.dry_watch_allocator(&temp)
+	names, named := cache_names(cfg, list)
+	modified, plain := plain_cache_file(names.copy)
+	fresh := named && plain && time.diff(modified, loop.now()) < cfg.blocking.refresh && copy_is_of(list, names)
+	return fresh && !dry
 }
 
 /*
@@ -860,9 +891,20 @@ cannot be another list's.
 */
 @(private)
 write_cache_file :: proc(path: string, body: []byte) -> (err: os.Error) {
+	tmp := stage_cache_file(path, body) or_return
+	if err = os.rename(tmp, path); err != nil {
+		os.remove(tmp)
+	}
+	return
+}
+
+// Write `body` whole to the temporary file beside `path`, on disk, and return its
+// name, to be renamed over `path`. Nothing is left there where it fails.
+@(private)
+stage_cache_file :: proc(path: string, body: []byte) -> (tmp: string, err: os.Error) {
 	// Spelt short, it would be another file, in the cache or the working
 	// directory, which the create below removes when it is there.
-	tmp := strings.concatenate({path, ".tmp"}, context.temp_allocator) or_return
+	tmp = strings.concatenate({path, ".tmp"}, context.temp_allocator) or_return
 	/*
 	Created afresh, O_EXCL, which fails on a symlink rather than following it.
 	One already there - left by a stop mid-write, or planted - is removed and
@@ -876,7 +918,7 @@ write_cache_file :: proc(path: string, body: []byte) -> (err: os.Error) {
 		os.remove(tmp) or_return
 		f = os.open(tmp, flags, perms) or_return
 	} else if oerr != nil {
-		return oerr
+		return "", oerr
 	}
 	_, err = os.write(f, body)
 	if err == nil {
@@ -885,11 +927,9 @@ write_cache_file :: proc(path: string, body: []byte) -> (err: os.Error) {
 	if cerr := os.close(f); err == nil {
 		err = cerr
 	}
-	if err == nil {
-		err = os.rename(tmp, path)
-	}
 	if err != nil {
 		os.remove(tmp)
+		return "", err
 	}
 	return
 }
@@ -910,6 +950,16 @@ cache_file_path :: proc(cfg: ^config.Config, file: string) -> string {
 		return file
 	}
 	return strings.concatenate({strings.trim_right(cfg.blocking.cache_dir, "/"), "/", file}, context.temp_allocator)
+}
+
+/*
+Whether a file of the cache is at `path`, its name spelt in the temp allocator,
+so that a refusal is one a `dns.Dry_Watch` over it sees: `os.exists` spells in
+`core:os`'s own arena, and reads false when that arena cannot grow.
+*/
+@(private)
+cache_file_exists :: proc(path: string) -> bool {
+	return linux.access(strings.clone_to_cstring(path, context.temp_allocator), linux.F_OK) == .NONE
 }
 
 /*

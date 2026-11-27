@@ -1956,6 +1956,34 @@ filepath_base :: proc(path: string) -> string {
 	return path[strings.last_index_byte(path, '/') + 1:]
 }
 
+// What is in the cache before `test_a_copy_saved_without_memory_is_its_own` saves.
+@(private = "file")
+Before :: enum {
+	None,
+	Same_Url,
+	Other_Url,
+}
+
+// What `test_a_copy_saved_without_memory_is_its_own` saves into.
+@(private = "file")
+Save_Fixture :: struct {
+	cfg:          config.Config,
+	dir:          string,
+	// The list, and the same list before its query changed.
+	list, before: config.Block_List,
+	path:         string,
+}
+
+@(private = "file")
+SAVE_OLD :: "0.0.0.0 old.example\n"
+@(private = "file")
+SAVE_NEW :: "0.0.0.0 new.example\n"
+// What the save test plants as `.tmp` in the working directory.
+@(private = "file")
+SAVE_SENTINEL :: "not the cache's"
+@(private = "file")
+SAVE_SUB :: "cache"
+
 /*
 A copy saved while the temp allocator refuses a run of requests is read back as
 the list's own, new or the one before, and never as another url's: a copy of
@@ -1963,112 +1991,166 @@ another query saved before is read as that query's only while it is that copy.
 Nothing is written but the copy and its fingerprint, beside each other in
 `cache_dir` (#780): a name spelt short is another list's file, or one outside
 the cache, and is never written. The cache directory, made by the save, is made
-where it is named and nowhere else.
+where it is named and nowhere else. Lists the file names, whose copy with no
+fingerprint is their own, and lists it does not, alike.
 */
 @(test)
 test_a_copy_saved_without_memory_is_its_own :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	cfg, dir := list_test_dir(t, "save-no-memory")
 	defer os.remove(dir)
-	SUB :: "cache"
-	cfg.blocking.cache_dir = strings.concatenate({dir, "/", SUB}, context.temp_allocator)
+	cfg.blocking.cache_dir = strings.concatenate({dir, "/", SAVE_SUB}, context.temp_allocator)
 	defer os.remove(cfg.blocking.cache_dir)
 	// A query, so the copy is read only beside its fingerprint.
-	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt?key=k", format = .Hosts, enabled = true}
-	// The same list before its query changed.
-	before := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt?key=old", format = .Hosts, enabled = true}
-	OLD :: "0.0.0.0 old.example\n"
-	NEW :: "0.0.0.0 new.example\n"
-	path := list_cache_path(&cfg, list)
-	files := []string{filepath_base(path), filepath_base(source_path(path))}
-	clear_copies :: proc(path: string) {
-		os.remove(path)
-		os.remove(source_path(path))
+	f := Save_Fixture {
+		cfg    = cfg,
+		dir    = dir,
+		list   = {name = "l", url = "http://192.0.2.1/l.txt?key=k", format = .Hosts, enabled = true},
+		before = {name = "l", url = "http://192.0.2.1/l.txt?key=old", format = .Hosts, enabled = true},
 	}
-	defer clear_copies(path)
+	f.path = list_cache_path(&f.cfg, f.list)
+	defer clear_save_copies(f.path)
 	// A fingerprint spelt short is ".src", and a temporary file ".tmp", in the
 	// working directory; a ".tmp" there is removed to make way for it. One
 	// holding the sentinel is this test's, left by a run stopped before its
 	// cleanup.
-	SENTINEL :: "not the cache's"
 	planted, _ := os.read_entire_file(".tmp", context.temp_allocator) // lint:allow absent reads as not planted
-	if !testing.expect(t, !os.exists(".src") && (!os.exists(".tmp") || string(planted) == SENTINEL), "the premise: no .src or .tmp in the working directory") {
+	if !testing.expect(t, !os.exists(".src") && (!os.exists(".tmp") || string(planted) == SAVE_SENTINEL), "the premise: no .src or .tmp in the working directory") {
 		return
 	}
-	if !testing.expect(t, os.write_entire_file(".tmp", SENTINEL) == nil, "cannot plant .tmp") {
+	if !testing.expect(t, os.write_entire_file(".tmp", SAVE_SENTINEL) == nil, "cannot plant .tmp") {
 		return
 	}
 	defer os.remove(".tmp")
 
-	Before :: enum {
-		None,
-		Same_Url,
-		Other_Url,
-	}
-	// A run longer than one refuses the fingerprint's write and the read after.
-	for old in Before {
-		for run_length in 1 ..= 3 {
-			refused := 0
-			for fail_at := 1; ; fail_at += 1 {
-				clear_copies(path)
-				os.remove(cfg.blocking.cache_dir)
-				if old != .None {
-					saved := list if old == .Same_Url else before
-					save_cached_copy(&cfg, saved, OLD)
-					text, load := cached_copy(&cfg, saved, .Stale)
-					ok := testing.expectf(t, load == .Stale && text == OLD, "the premise: the old copy reads as %v %q", load, text)
-					delete(text)
-					if !ok {
-						return
-					}
-				}
-				f := testkit.Fail_Nth{fail_at = fail_at, fail_for = run_length}
-				{
-					context.temp_allocator = testkit.fail_nth(&f)
-					save_cached_copy(&cfg, list, NEW)
-				}
-				run := fmt.tprintf("old %v, %d refused from %d", old, run_length, fail_at)
-				text, load := cached_copy(&cfg, list, .Stale)
-				saved := load == .Stale && text == NEW
-				switch old {
-				case .None, .Other_Url:
-					testing.expectf(t, saved || load == .Unavailable, "%s: read back as %v %q", run, load, text)
-				case .Same_Url:
-					testing.expectf(t, saved || (load == .Stale && text == OLD), "%s: read back as %v %q", run, load, text)
-				}
-				delete(text)
-				if old == .Other_Url {
-					text, load = cached_copy(&cfg, before, .Stale)
-					testing.expectf(t, load == .Unavailable || (load == .Stale && text == OLD), "%s: the other query reads as %v %q", run, load, text)
-					delete(text)
-				}
-				expect_only_entries(t, dir, {SUB}, run)
-				if os.exists(cfg.blocking.cache_dir) {
-					expect_only_entries(t, cfg.blocking.cache_dir, files, run)
-				}
-				testing.expectf(t, !os.exists(".src"), "%s: a fingerprint written to the working directory", run)
-				os.remove(".src")
-				sentinel, rerr := os.read_entire_file(".tmp", context.temp_allocator)
-				testing.expectf(t, rerr == nil && string(sentinel) == SENTINEL, "%s: the working directory's .tmp was replaced (%v)", run, rerr)
-				if string(sentinel) != SENTINEL && !testing.expect(t, os.write_entire_file(".tmp", SENTINEL) == nil, "cannot plant .tmp again") {
+	for named in ([]bool{false, true}) {
+		f.list.named, f.before.named = named, named
+		for old in Before {
+			// A run longer than one refuses the fingerprint's write and what follows.
+			for run_length in 1 ..= 3 {
+				if !save_refused_in_turn(t, &f, old, run_length) {
 					return
 				}
-				if f.seen < fail_at {
-					testing.expectf(t, saved, "old %v, runs of %d: with every allocation granted, the new copy was not read back", old, run_length)
-					break
-				}
-				refused += 1
 			}
-			testing.expectf(t, refused > 0, "old %v, runs of %d: no allocation was refused", old, run_length)
 		}
 	}
 }
 
+@(private = "file")
+clear_save_copies :: proc(path: string) {
+	os.remove(path)
+	os.remove(source_path(path))
+}
+
+// One case of `test_a_copy_saved_without_memory_is_its_own`, each allocation
+// refused in turn; false where the test cannot go on.
+@(private = "file")
+save_refused_in_turn :: proc(t: ^testing.T, f: ^Save_Fixture, old: Before, run_length: int) -> bool {
+	files := []string{filepath_base(f.path), filepath_base(source_path(f.path))}
+	refused := 0
+	for fail_at := 1; ; fail_at += 1 {
+		clear_save_copies(f.path)
+		os.remove(f.cfg.blocking.cache_dir)
+		if old != .None {
+			saved := f.list if old == .Same_Url else f.before
+			save_cached_copy(&f.cfg, saved, SAVE_OLD)
+			text, load := cached_copy(&f.cfg, saved, .Stale)
+			ok := testing.expectf(t, load == .Stale && text == SAVE_OLD, "the premise: the old copy reads as %v %q", load, text)
+			delete(text)
+			if !ok {
+				return false
+			}
+		}
+		fail := testkit.Fail_Nth{fail_at = fail_at, fail_for = run_length}
+		{
+			context.temp_allocator = testkit.fail_nth(&fail)
+			save_cached_copy(&f.cfg, f.list, SAVE_NEW)
+		}
+		run := fmt.tprintf("named %v, old %v, %d refused from %d", f.list.named, old, run_length, fail_at)
+		text, load := cached_copy(&f.cfg, f.list, .Stale)
+		saved := load == .Stale && text == SAVE_NEW
+		switch old {
+		case .None, .Other_Url:
+			testing.expectf(t, saved || load == .Unavailable, "%s: read back as %v %q", run, load, text)
+		case .Same_Url:
+			testing.expectf(t, saved || (load == .Stale && text == SAVE_OLD), "%s: read back as %v %q", run, load, text)
+		}
+		delete(text)
+		if old == .Other_Url {
+			text, load = cached_copy(&f.cfg, f.before, .Stale)
+			testing.expectf(t, load == .Unavailable || (load == .Stale && text == SAVE_OLD), "%s: the other query reads as %v %q", run, load, text)
+			delete(text)
+		}
+		if !expect_nothing_stray(t, f, files, run) {
+			return false
+		}
+		if fail.seen < fail_at {
+			testing.expectf(t, saved, "%s: with every allocation granted, the new copy was not read back", run)
+			break
+		}
+		refused += 1
+	}
+	testing.expectf(t, refused > 0, "named %v, old %v, runs of %d: no allocation was refused", f.list.named, old, run_length)
+	return true
+}
+
+// Whether nothing but the copy and its fingerprint was written, in the cache or
+// the working directory; false where the sentinel cannot be planted again.
+@(private = "file")
+expect_nothing_stray :: proc(t: ^testing.T, f: ^Save_Fixture, files: []string, run: string) -> bool {
+	expect_only_entries(t, f.dir, {SAVE_SUB}, run)
+	if os.exists(f.cfg.blocking.cache_dir) {
+		expect_only_entries(t, f.cfg.blocking.cache_dir, files, run)
+	}
+	testing.expectf(t, !os.exists(".src"), "%s: a fingerprint written to the working directory", run)
+	os.remove(".src")
+	sentinel, rerr := os.read_entire_file(".tmp", context.temp_allocator)
+	testing.expectf(t, rerr == nil && string(sentinel) == SAVE_SENTINEL, "%s: the working directory's .tmp was replaced (%v)", run, rerr)
+	return string(sentinel) == SAVE_SENTINEL || testing.expect(t, os.write_entire_file(".tmp", SAVE_SENTINEL) == nil, "cannot plant .tmp again")
+}
+
 /*
-A list whose cache name is spelt short for want of memory is not taken as fresh
-on another list's copy (#780): `ab` spelt short is `b`, whose copy is fresh, so
-a refused allocation would keep `ab` from being downloaded for the rest of the
-refresh window. The download goes to a port nothing listens on.
+A copy whose fingerprint cannot be written, for a reason other than memory, is
+not saved (#780): a named list's copy with no fingerprint is read as the copy of
+any url the list is given, so written alone it would stand in for the url
+before.
+*/
+@(test)
+test_a_copy_without_its_fingerprint_is_not_saved :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	cfg, dir := list_test_dir(t, "save-unmarked")
+	defer os.remove(dir)
+	list := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt?key=k", format = .Hosts, enabled = true, named = true}
+	before := config.Block_List{name = "l", url = "http://192.0.2.1/l.txt?key=old", format = .Hosts, enabled = true, named = true}
+	path := list_cache_path(&cfg, list)
+	// A directory with a file in it where the fingerprint's temporary file goes:
+	// its create finds one there and cannot remove it.
+	blocker := strings.concatenate({source_path(path), ".tmp"}, context.temp_allocator)
+	inside := strings.concatenate({blocker, "/x"}, context.temp_allocator)
+	defer for p in ([]string{path, source_path(path), inside, blocker}) {
+		os.remove(p)
+	}
+	save_cached_copy(&cfg, before, SAVE_OLD)
+	text, load := cached_copy(&cfg, before, .Stale)
+	testing.expectf(t, load == .Stale && text == SAVE_OLD, "the premise: the other query's copy reads as %v %q", load, text)
+	delete(text)
+	if !testing.expect(t, os.make_directory(blocker) == nil && os.write_entire_file(inside, "x") == nil, "cannot plant the blocker") {
+		return
+	}
+
+	save_cached_copy(&cfg, list, SAVE_NEW)
+	text, load = cached_copy(&cfg, before, .Stale)
+	testing.expectf(t, text != SAVE_NEW, "the other query reads the new copy as its own: %v", load)
+	delete(text)
+	testing.expect(t, !os.exists(path) || os.exists(source_path(path)), "a copy was written with no fingerprint")
+}
+
+/*
+A list is not taken as fresh where an allocation deciding it was refused (#780):
+`ab` spelt short is `b`, whose copy is fresh, and `q`'s fresh copy is beside
+another url's fingerprint, which a check refused would not find. Either would
+keep the list from being downloaded for the rest of the refresh window. The
+download goes to a port nothing listens on.
 */
 @(test)
 test_a_name_spelt_short_is_not_fresh :: proc(t: ^testing.T) {
@@ -2077,33 +2159,42 @@ test_a_name_spelt_short_is_not_fresh :: proc(t: ^testing.T) {
 	defer os.remove(dir)
 	b := config.Block_List{name = "b", url = "http://127.0.0.1:1/b", format = .Hosts, enabled = true}
 	ab := config.Block_List{name = "ab", url = "http://127.0.0.1:1/ab", format = .Hosts, enabled = true}
-	cfg.blocking.lists = []config.Block_List{b, ab}
+	q := config.Block_List{name = "q", url = "http://127.0.0.1:1/q", format = .Hosts, enabled = true}
+	cfg.blocking.lists = []config.Block_List{b, ab, q}
 	b_path := list_cache_path(&cfg, b)
-	if !testing.expect(t, os.write_entire_file(b_path, "0.0.0.0 b.example\n") == nil, "cannot write b's copy") {
+	q_path := list_cache_path(&cfg, q)
+	defer for p in ([]string{b_path, q_path, source_path(q_path)}) {
+		os.remove(p)
+	}
+	planted := os.write_entire_file(b_path, "0.0.0.0 b.example\n") == nil && os.write_entire_file(q_path, "0.0.0.0 q.example\n") == nil
+	if !testing.expect(t, planted && os.write_entire_file(source_path(q_path), "0123456789abcdef\n") == nil, "cannot write the copies") {
 		return
 	}
-	defer os.remove(b_path)
-	// The premise: b's copy is fresh for b.
+	// The premise: b's copy is fresh for b, and q's is another url's.
 	_, fetch := fetch_list(&cfg, b)
 	testing.expect_value(t, fetch, Fetch.Cache_Is_Fresh)
+	_, fetch = fetch_list(&cfg, q)
+	testing.expect_value(t, fetch, Fetch.Failed)
 
-	refused := 0
-	for fail_at := 1; ; fail_at += 1 {
-		f := testkit.Fail_Nth{fail_at = fail_at, fail_for = 1}
-		text: string
-		{
-			context.temp_allocator = testkit.fail_nth(&f)
-			text, fetch = fetch_list(&cfg, ab)
+	for list in ([]config.Block_List{ab, q}) {
+		refused := 0
+		for fail_at := 1; ; fail_at += 1 {
+			f := testkit.Fail_Nth{fail_at = fail_at, fail_for = 1}
+			text: string
+			{
+				context.temp_allocator = testkit.fail_nth(&f)
+				text, fetch = fetch_list(&cfg, list)
+			}
+			delete(text)
+			testing.expectf(t, fetch != .Cache_Is_Fresh, "%s, run %d: taken as fresh with no copy of its own", list.name, fail_at)
+			if f.seen < fail_at {
+				testing.expect_value(t, fetch, Fetch.Failed)
+				break
+			}
+			refused += 1
 		}
-		delete(text)
-		testing.expectf(t, fetch != .Cache_Is_Fresh, "run %d: ab was taken as fresh with no copy of its own", fail_at)
-		if f.seen < fail_at {
-			testing.expect_value(t, fetch, Fetch.Failed)
-			break
-		}
-		refused += 1
+		testing.expectf(t, refused > 0, "%s: no allocation was refused", list.name)
 	}
-	testing.expect(t, refused > 0, "no allocation was refused")
 }
 
 /*
