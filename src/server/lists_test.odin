@@ -1788,3 +1788,70 @@ test_a_list_left_out_is_retried_whatever_holds_the_refresh_back :: proc(t: ^test
 	}
 	testing.expect(t, held_back > 0, "no run was refused")
 }
+
+/*
+Where a later build of a rebuild has no copy to read a list again from - the
+first read could not save its download, `cache_dir` not being writable - it
+downloads the list again rather than leave out a list that loaded (#765). Each
+allocation of a first build is refused in turn; where the file list after the
+downloaded one is left out, the downloaded one is still in effect.
+*/
+@(test)
+test_a_list_with_no_copy_to_read_again_is_downloaded_again :: proc(t: ^testing.T) {
+	N :: 200
+	// Not in the temp allocator, which each run below frees.
+	body_b := strings.builder_make()
+	for i in 0 ..< N {
+		fmt.sbprintf(&body_b, "0.0.0.0 unsaved-%d.example\n", i)
+	}
+	body := strings.to_string(body_b)
+	defer delete(body)
+	path := fmt.aprintf("/tmp/elodin-server-lists-test-unsaved-%d.txt", os.get_pid())
+	defer delete(path)
+	file_b := strings.builder_make(context.temp_allocator)
+	for i in 0 ..< N {
+		fmt.sbprintf(&file_b, "0.0.0.0 unsaved-file-%d.example\n", i)
+	}
+	if !testing.expect(t, os.write_entire_file(path, strings.to_string(file_b)) == nil, "cannot write the list") {
+		return
+	}
+	defer os.remove(path)
+
+	f: testkit.Fail_Nth
+	f.backing = context.allocator
+	kept := 0
+	for fail_at := 1; ; fail_at += 1 {
+		defer free_all(context.temp_allocator)
+		one: One_List
+		server, url, ok := start_one_list(t, &one, body, 4)
+		if !ok {
+			return
+		}
+		cfg := config.default_config()
+		// Nothing can be saved there, by root either.
+		cfg.blocking.cache_dir = "/proc/elodin-lists-test-unsaved"
+		cfg.blocking.lists = []config.Block_List {
+			{name = "downloaded", url = url, format = .Hosts, enabled = true},
+			{name = "file", file = path, format = .Hosts, enabled = true},
+		}
+		s := list_server(&cfg)
+		defer close_list_server(&s)
+		f.seen, f.fail_at, f.fail_for = 0, fail_at, 1
+		{
+			context.allocator = testkit.fail_nth(&f)
+			reload_filters(&s, true)
+		}
+		stop_one_list(&one, server)
+		downloaded := filter.engine_match(s.filters, "unsaved-0.example.", .A) == .Blocked
+		file := filter.engine_match(s.filters, "unsaved-file-0.example.", .A) == .Blocked
+		if f.seen < fail_at {
+			testing.expect(t, downloaded && file, "a build with every allocation granted is not whole")
+			break
+		}
+		if filter.engine_generation(s.filters) != 0 && !file {
+			testing.expectf(t, downloaded, "run %d: the downloaded list is out with the file list left out", fail_at)
+			kept += int(downloaded)
+		}
+	}
+	testing.expect(t, kept > 0, "no build left the file list out")
+}

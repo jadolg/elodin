@@ -123,7 +123,8 @@ in this build; false at the first that is `.No_Memory`. One no earlier build
 read downloads as `allow_network` says. One read before reads its copy, which is
 `.Stale`: whether it is the download the earlier read saved cannot be told, and
 it may be older. One whose download held no rules and had no copy stays
-`.Empty`.
+`.Empty`; one with no copy to read again, which the earlier read could not save
+(a `cache_dir` that cannot be written), is downloaded again.
 */
 @(private)
 load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network: bool, loads: []List_Load, passes: []List_Pass) -> bool {
@@ -134,7 +135,7 @@ load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network
 			continue
 		}
 		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
-		load := load_one_list(cfg, list, block, allow, allow_network && !read, i >= lists)
+		load := load_one_list(cfg, list, block, allow, allow_network && !read, i >= lists, again = read)
 		switch {
 		case !read:
 			if passes != nil {
@@ -144,6 +145,8 @@ load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network
 			load = .Stale
 		case load == .Unavailable && passes[i].found == .Empty:
 			load = .Empty
+		case load == .Unavailable && allow_network && passes[i].found != .Unavailable:
+			load = load_one_list(cfg, list, block, allow, true, i >= lists)
 		}
 		if loads != nil {
 			loads[i] = load
@@ -300,12 +303,15 @@ warn_rule_adds_nothing :: proc(rule: string) {
 }
 
 @(private)
+// Load `list` into the sets, saying how it fared. `again` is a list an earlier
+// build of the rebuild read and said so of, which this does not say again.
 load_one_list :: proc(
 	cfg: ^config.Config,
 	list: config.Block_List,
 	block, allow: ^filter.Set,
 	allow_network: bool,
 	as_allowlist: bool,
+	again := false,
 ) -> List_Load {
 	// A disabled list is expected to add nothing, which is not a failure.
 	if !list.enabled {
@@ -315,7 +321,9 @@ load_one_list :: proc(
 	text, load, downloaded := list_contents(cfg, list, allow_network)
 	#partial switch load {
 	case .Unavailable:
-		logx.warnf("list %s: unavailable, skipping it", list.name)
+		if !again {
+			logx.warnf("list %s: unavailable, skipping it", list.name)
+		}
 		return load
 	case .No_Memory:
 		return load
@@ -368,8 +376,10 @@ load_one_list :: proc(
 			}
 		}
 	}
-	logx.infof("list %s: %d rules", list.name, added)
-	warn_not_ascii(list.name, not_ascii)
+	if !again {
+		logx.infof("list %s: %d rules", list.name, added)
+		warn_not_ascii(list.name, not_ascii)
+	}
 	return load
 }
 

@@ -81,7 +81,8 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   out, to make room for the lists already in effect and the operator's
   rules`). A list is never in effect cut short. A build after the first
   downloads only the lists no earlier one reached, reading the copies the
-  earlier ones saved, which count as stale. A download there
+  earlier ones saved, which count as stale; a list with no copy to read (a
+  `cache_dir` that cannot be written) is downloaded again. A download there
   is no memory to fetch counts as a failed one, which the cached copy stands
   in for; one fetched there is no memory to hold is not cached, and its list is
   left out or holds the refresh back as above. The list says why first (`list
