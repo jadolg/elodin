@@ -135,21 +135,9 @@ CLONE_THREAD :: 0x00010000
 @(private)
 CLONE_NAMESPACES :: 0x00000080 | 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x10000000 | 0x20000000 | 0x40000000
 
-@(private)
-AF_INET :: 2
-@(private)
-AF_INET6 :: 10
-@(private)
-SOCK_STREAM :: 1
-@(private)
-SOCK_DGRAM :: 2
 // The type's bits in `socket`'s second argument; the flags are above them.
 @(private)
 SOCK_TYPE_MASK :: 0xf
-@(private)
-IPPROTO_UDP :: 17
-@(private)
-SCHED_OTHER :: 0
 
 /*
 The socket options a serving process sets: the read and write timeouts in both
@@ -163,26 +151,12 @@ Socket_Option :: struct {
 }
 @(private)
 SOCKET_OPTIONS :: [?]Socket_Option {
-	{SOL_SOCKET, SO_RCVTIMEO_OLD},
-	{SOL_SOCKET, SO_SNDTIMEO_OLD},
-	{SOL_SOCKET, SO_RCVTIMEO_NEW},
-	{SOL_SOCKET, SO_SNDTIMEO_NEW},
-	{IPPROTO_TCP, TCP_NODELAY},
+	{u32(linux.Socket_API_Level.SOCKET), u32(linux.Socket_Option.RCVTIMEO_OLD)},
+	{u32(linux.Socket_API_Level.SOCKET), u32(linux.Socket_Option.SNDTIMEO_OLD)},
+	{u32(linux.Socket_API_Level.SOCKET), u32(linux.Socket_Option.RCVTIMEO_NEW)},
+	{u32(linux.Socket_API_Level.SOCKET), u32(linux.Socket_Option.SNDTIMEO_NEW)},
+	{u32(linux.Socket_API_Level.TCP), u32(linux.Socket_TCP_Option.NODELAY)},
 }
-@(private)
-SOL_SOCKET :: 1
-@(private)
-IPPROTO_TCP :: 6
-@(private)
-TCP_NODELAY :: 1
-@(private)
-SO_RCVTIMEO_OLD :: 20
-@(private)
-SO_SNDTIMEO_OLD :: 21
-@(private)
-SO_RCVTIMEO_NEW :: 66
-@(private)
-SO_SNDTIMEO_NEW :: 67
 
 // Two instructions per allowed call, five per socket option, and the fixed
 // head, tail and argument checks, which come to fewer than `PROGRAM_HEAD`; a
@@ -246,16 +220,16 @@ build_program :: proc(out: []Sock_Filter, pid: u32, policy: u32) -> int {
 	// module of its own, loaded on demand.
 	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_socket), jf = 14)
 	emit(out, &n, BPF_LD_W_ABS, DATA_ARG0_LOW)
-	emit(out, &n, BPF_JEQ_K, AF_INET, jt = 1)
-	emit(out, &n, BPF_JEQ_K, AF_INET6, jf = 9)
+	emit(out, &n, BPF_JEQ_K, u32(linux.Address_Family.INET), jt = 1)
+	emit(out, &n, BPF_JEQ_K, u32(linux.Address_Family.INET6), jf = 9)
 	emit(out, &n, BPF_LD_W_ABS, DATA_ARG1_LOW)
 	emit(out, &n, BPF_AND_K, SOCK_TYPE_MASK)
-	emit(out, &n, BPF_JEQ_K, SOCK_STREAM, jt = 1)
-	emit(out, &n, BPF_JEQ_K, SOCK_DGRAM, jf = 4)
+	emit(out, &n, BPF_JEQ_K, u32(linux.Socket_Type.STREAM), jt = 1)
+	emit(out, &n, BPF_JEQ_K, u32(linux.Socket_Type.DGRAM), jf = 4)
 	emit(out, &n, BPF_LD_W_ABS, DATA_ARG2_LOW)
 	emit(out, &n, BPF_JEQ_K, 0, jt = 4)
-	emit(out, &n, BPF_JEQ_K, IPPROTO_TCP, jt = 3)
-	emit(out, &n, BPF_JEQ_K, IPPROTO_UDP, jt = 2)
+	emit(out, &n, BPF_JEQ_K, u32(linux.Protocol.TCP), jt = 3)
+	emit(out, &n, BPF_JEQ_K, u32(linux.Protocol.UDP), jt = 2)
 	ret(out, &n, errno(.EPERM))
 	ret(out, &n, errno(.EAFNOSUPPORT))
 	ret(out, &n, RET_ALLOW)
@@ -283,7 +257,7 @@ build_program :: proc(out: []Sock_Filter, pid: u32, policy: u32) -> int {
 
 	emit(out, &n, BPF_JEQ_K, u32(linux.SYS_sched_setscheduler), jf = 5)
 	emit(out, &n, BPF_LD_W_ABS, DATA_ARG1_LOW)
-	emit(out, &n, BPF_JEQ_K, SCHED_OTHER, jt = 2)
+	emit(out, &n, BPF_JEQ_K, u32(linux.Sched_Policy.OTHER), jt = 2)
 	emit(out, &n, BPF_JEQ_K, policy, jt = 1)
 	ret(out, &n, errno(.EPERM))
 	ret(out, &n, RET_ALLOW)

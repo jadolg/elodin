@@ -27,8 +27,9 @@ expect_loads :: proc(t: ^testing.T, src: string, loc := #caller_location) -> (cf
 
 /*
 Whether loading `src` is refused with a message holding every one of `wanted`
-(or starting with each, given `prefix`); `exactly_one` also wants that message
-to be the only one.
+(starting with each, given `prefix`, or equal to it, given `exact`);
+`exactly_one` also wants that message to be the only one. `tls_files` is
+`load_string`'s.
 */
 @(private)
 expect_refused :: proc(
@@ -36,10 +37,12 @@ expect_refused :: proc(
 	src: string,
 	wanted: ..string,
 	prefix := false,
+	exact := false,
 	exactly_one := false,
+	tls_files := true,
 	loc := #caller_location,
 ) -> bool {
-	_, err := load_string(src, context.temp_allocator)
+	_, err := load_string(src, context.temp_allocator, tls_files = tls_files)
 	e, has := err.?
 	if !testing.expectf(t, has, "accepted, wanted a refusal naming %v, from:\n%s", wanted, src, loc = loc) {
 		return false
@@ -49,7 +52,8 @@ expect_refused :: proc(
 	}
 	matched: for m in e.messages {
 		for w in wanted {
-			if !(strings.has_prefix(m, w) if prefix else strings.contains(m, w)) {
+			names := m == w if exact else (strings.has_prefix(m, w) if prefix else strings.contains(m, w))
+			if !names {
 				continue matched
 			}
 		}

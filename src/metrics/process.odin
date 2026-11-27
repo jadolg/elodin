@@ -246,18 +246,18 @@ is_dot_entry :: proc(entry: ^posix.dirent) -> bool {
 Read a small pseudo-file into a caller-supplied buffer.
 
 `/sys` and `/proc` files report a size of zero, so the read-the-whole-file path
-cannot size a buffer from them and grows one on the heap instead. Everything
-read here is a line or two, so a stack buffer covers it: the scrape takes
+cannot size a buffer from them and grows one on the heap instead. The caller
+sizes the buffer to the file it reads, most on the stack: the scrape takes
 nothing from an allocator a query might be waiting on, and the config loader's
 cgroup and memory probes stay free of allocations it would have to own. This
 package imports only `core`, so the loader can share it.
 
 Read to the end rather than trusting one `read`, and refuse a buffer that filled
-completely: half of "10737418240" is "1073", which parses as cleanly as the whole
-of it and would be a limit off by seven orders of magnitude, and a stat line
-missing its tail has lost the half that holds the memory figures. Nothing read
-here is long enough for that to bind, so a truncation means something is not the
-file this expected, and no figure is a better answer than a wrong one.
+completely: a prefix of "10737418240", such as "1073", parses as cleanly as the
+whole of it and would be a limit off by seven orders of magnitude, and a stat
+line missing its tail has lost the half that holds the memory figures. Each
+buffer is sized past its file, so a truncation means something is not the file
+this expected, and no figure is a better answer than a wrong one.
 */
 read_small_file :: proc(path: string, buf: []u8) -> (text: string, ok: bool) {
 	f, err := os.open(path)

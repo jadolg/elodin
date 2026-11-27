@@ -41,20 +41,9 @@ test_non_string_scalar_keys_are_refused :: proc(t: ^testing.T) {
 	}
 	for c in cases {
 		for v in ([]string{"[x]", "{x: y}"}) {
-			src, _ := strings.replace_all(c.src, "%s", v, context.temp_allocator)
-			_, err := load_string(src, context.temp_allocator)
-			e, has := err.?
-			if !testing.expectf(t, has, "loaded clean:\n%s", src) {
-				continue
-			}
-			found := false
-			for m in e.messages {
-				if m == c.want {
-					found = true
-					break
-				}
-			}
-			testing.expectf(t, found, "no %q for:\n%s\ngot %v", c.want, src, e.messages)
+			src, replaced := strings.replace_all(c.src, "%s", v, context.temp_allocator)
+			testing.expectf(t, replaced, "no %%s to put the value in: %q", c.src)
+			expect_refused(t, src, c.want, exact = true)
 		}
 	}
 }
@@ -96,8 +85,12 @@ test_upstream_type_null_keeps_default :: proc(t: ^testing.T) {
 	testing.expect_value(t, cfg.upstream.servers[0].kind, Upstream_Kind.UDP)
 	testing.expect_value(t, cfg.upstream.servers[1].kind, Upstream_Kind.HTTPS)
 
-	_, err = load_string("upstream:\n  servers:\n    - address: 1.1.1.1\n      type: \"\"\n", context.temp_allocator)
-	testing.expect(t, err != nil, "type: \"\" loaded")
+	expect_refused(
+		t,
+		"upstream:\n  servers:\n    - address: 1.1.1.1\n      type: \"\"\n",
+		"upstream.servers[0].type: unknown type \"\"",
+		prefix = true,
+	)
 }
 
 // `null` is one of `blocking.response`'s names, and written bare it is that mode,

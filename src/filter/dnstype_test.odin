@@ -228,20 +228,18 @@ test_a_dnstype_regex_rule_blocks_only_its_types :: proc(t: ^testing.T) {
 	testing.expect_value(t, decide(plain_first, "v6.example.", .TXT), Decision.Blocked)
 
 	// Held once, so the regex budget is charged once.
-	block, allow := set_make(), set_make()
+	block, allow := build(two, .Adblock)
 	defer set_destroy(block)
 	defer set_destroy(allow)
-	parse_list(block, allow, two, .Adblock)
 	testing.expect_value(t, len(block.regexes), 1)
 	testing.expect_value(t, block.count, 1)
 }
 
 @(test)
 test_dnstype_rules_are_counted_once_a_name :: proc(t: ^testing.T) {
-	block, allow := set_make(), set_make()
+	block, allow := build("||a.example^$dnstype=A\n||a.example^$dnstype=AAAA\n||b.example^$dnstype=A\n", .Adblock)
 	defer set_destroy(block)
 	defer set_destroy(allow)
-	parse_list(block, allow, "||a.example^$dnstype=A\n||a.example^$dnstype=AAAA\n||b.example^$dnstype=A\n", .Adblock)
 	testing.expect_value(t, block.count, 2)
 	parse_list(block, allow, "||a.example^$badfilter\n", .Adblock)
 	testing.expect_value(t, block.count, 1)
@@ -308,8 +306,7 @@ test_the_dnstype_filters_a_set_keeps_are_bounded :: proc(t: ^testing.T) {
 test_a_typed_rule_joins_a_name_a_plain_rule_holds :: proc(t: ^testing.T) {
 	// The entry is written again with room for its filters; both rules hold.
 	list := "|v6.example^\n||*.v6.example^$dnstype=AAAA\n||other.example^\n"
-	block, allow := set_make(), set_make()
-	parse_list(block, allow, list, .Adblock)
+	block, allow := build(list, .Adblock)
 	testing.expect_value(t, block.count, 2)
 	set_destroy(block)
 	set_destroy(allow)

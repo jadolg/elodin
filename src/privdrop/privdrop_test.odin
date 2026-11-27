@@ -67,8 +67,9 @@ test_resolve_rejects_unknown_names :: proc(t: ^testing.T) {
 
 /*
 A numeric id is digits and nothing else, and fits the id type. Read by
-`strconv` and cut to 32 bits, each of these would be root or `(uid_t)-1`: a
-start as root would then find the drop already done and report success (#639).
+`strconv` and cut to 32 bits, each of these would be root, `(uid_t)-1`, or an
+id never written - the last wraps to 4135583743. A start as root on one of the
+first two would find the drop already done and report success (#639).
 `(uid_t)-1` is the set*id calls' "leave this id alone", never an identity.
 */
 @(test)
@@ -159,7 +160,10 @@ test_hand_over_to_its_own_owner_and_not_to_root :: proc(t: ^testing.T) {
 	}
 	defer os.remove_all(dir)
 
-	entry, _ := filepath.join({dir, "some.list"}, context.temp_allocator)
+	entry, eok := path_in(t, dir, "some.list")
+	if !eok {
+		return
+	}
 	if err := os.write_entire_file(entry, []u8{'x'}); err != nil {
 		testing.expectf(t, false, "cannot write %s: %v", entry, err)
 		return
@@ -339,10 +343,13 @@ test_can_reopen :: proc(t: ^testing.T) {
 	}
 	defer os.remove_all(dir)
 
-	open_one, _ := filepath.join({dir, "open"}, context.temp_allocator)
-	shut, _ := filepath.join({dir, "shut"}, context.temp_allocator)
-	read_only, _ := filepath.join({dir, "read-only"}, context.temp_allocator)
-	missing, _ := filepath.join({dir, "missing"}, context.temp_allocator)
+	open_one, o_ok := path_in(t, dir, "open")
+	shut, s_ok := path_in(t, dir, "shut")
+	read_only, r_ok := path_in(t, dir, "read-only")
+	missing, m_ok := path_in(t, dir, "missing")
+	if !o_ok || !s_ok || !r_ok || !m_ok {
+		return
+	}
 	testing.expect(t, os.write_entire_file(open_one, []byte{}, {.Read_User, .Write_User}) == nil, "cannot write the open file")
 	testing.expect(t, os.write_entire_file(shut, []byte{}, {}) == nil, "cannot write the shut file")
 	testing.expect(t, os.write_entire_file(read_only, []byte{}, {.Read_User}) == nil, "cannot write the read-only file")
@@ -365,11 +372,25 @@ scratch_dir :: proc(t: ^testing.T, name: string) -> (dir: string, ok: bool) {
 		testing.expectf(t, false, "no temporary directory: %v", terr)
 		return
 	}
-	dir, _ = filepath.join({tmp, fmt.tprintf("%s-%d", name, posix.getpid())}, context.temp_allocator)
-	os.remove_all(dir)
+	dir = path_in(t, tmp, fmt.tprintf("%s-%d", name, posix.getpid())) or_return
+	// A run that died under this pid left it behind.
+	if os.exists(dir) {
+		if err := os.remove_all(dir); err != nil {
+			testing.expectf(t, false, "cannot remove the leftover %s: %v", dir, err)
+			return
+		}
+	}
 	if err := os.make_directory(dir); err != nil {
 		testing.expectf(t, false, "cannot create %s: %v", dir, err)
 		return
 	}
 	return dir, true
+}
+
+// `name` under `dir`; a join that cannot allocate fails the test.
+@(private = "file")
+path_in :: proc(t: ^testing.T, dir, name: string, loc := #caller_location) -> (string, bool) {
+	path, err := filepath.join({dir, name}, context.temp_allocator)
+	testing.expectf(t, err == nil, "cannot join %s and %s: %v", dir, name, err, loc = loc)
+	return path, err == nil
 }

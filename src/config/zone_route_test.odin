@@ -1,7 +1,6 @@
 package config
 
 import "core:fmt"
-import "core:strings"
 import "core:testing"
 import "core:time"
 
@@ -85,9 +84,9 @@ test_zone_routes_are_read_with_their_own_servers :: proc(t: ^testing.T) {
 // the default upstream answering everything.
 @(test)
 test_no_zones_means_no_routes :: proc(t: ^testing.T) {
-	cfg, err := load_string(MINIMAL, context.temp_allocator)
-	testing.expect(t, err == nil, "expected a clean load")
-	testing.expect_value(t, len(cfg.upstream.zones), 0)
+	if cfg, ok := expect_loads(t, MINIMAL); ok {
+		testing.expect_value(t, len(cfg.upstream.zones), 0)
+	}
 	free_all(context.temp_allocator)
 }
 
@@ -95,9 +94,9 @@ test_no_zones_means_no_routes :: proc(t: ^testing.T) {
 // same statement as a malformed section and must not be refused as one.
 @(test)
 test_an_empty_zones_list_is_not_an_error :: proc(t: ^testing.T) {
-	cfg, err := load_string(MINIMAL + "  zones: []\n", context.temp_allocator)
-	testing.expect(t, err == nil, "an empty zones list was refused")
-	testing.expect_value(t, len(cfg.upstream.zones), 0)
+	if cfg, ok := expect_loads(t, MINIMAL + "  zones: []\n"); ok {
+		testing.expect_value(t, len(cfg.upstream.zones), 0)
+	}
 	free_all(context.temp_allocator)
 }
 
@@ -263,32 +262,22 @@ test_a_route_under_an_enabled_special_use_zone_is_refused :: proc(t: ^testing.T)
 		"would never be used",
 	)
 	// And the whole table off puts every one of them back within reach.
-	cfg, err := load_string(
-		MINIMAL + "  zones:\n    - domains: [home.arpa]\n      servers: [192.168.1.1]\n" +
-		"special_use:\n  enabled: false\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, err == nil, "a route under a table nothing consults was refused")
-	testing.expect_value(t, len(cfg.upstream.zones), 1)
+	off := MINIMAL + "  zones:\n    - domains: [home.arpa]\n      servers: [192.168.1.1]\n" + "special_use:\n  enabled: false\n"
+	if cfg, ok := expect_loads(t, off); ok {
+		testing.expect_value(t, len(cfg.upstream.zones), 1)
+	}
 	// `private_reverse` is on by default and is not in the list: a route under
 	// one of its reverse zones is how a router's PTRs are reached, and the table
 	// stands down for it. Refusing it would leave that network no way back.
-	routed, rerr := load_string(
-		MINIMAL + "  zones:\n    - domains: [168.192.in-addr.arpa]\n      servers: [192.168.1.1]\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, rerr == nil, "a route under a private reverse zone was refused")
-	testing.expect_value(t, len(routed.upstream.zones), 1)
+	if routed, ok := expect_loads(t, MINIMAL + "  zones:\n    - domains: [168.192.in-addr.arpa]\n      servers: [192.168.1.1]\n"); ok {
+		testing.expect_value(t, len(routed.upstream.zones), 1)
+	}
 	// `a\.test` is one label under the root, not a name under `test.`, and it
 	// is kept in the decoder's spelling, `a\046test.`, which is how a query for
 	// it reads off the wire - so the route is not refused, and it does fire.
-	escaped, eerr := load_string(
-		MINIMAL + "  zones:\n    - domains: ['a\\.test']\n      servers: [10.0.0.1]\n" +
-		"special_use:\n  test: true\n",
-		context.temp_allocator,
-	)
-	testing.expectf(t, eerr == nil, "a route whose dot is escaped was read as one under test.: %v", eerr)
-	if testing.expect_value(t, len(escaped.upstream.zones), 1) && testing.expect_value(t, len(escaped.upstream.zones[0].domains), 1) {
+	escaped_src := MINIMAL + "  zones:\n    - domains: ['a\\.test']\n      servers: [10.0.0.1]\n" + "special_use:\n  test: true\n"
+	escaped, eok := expect_loads(t, escaped_src)
+	if eok && testing.expect_value(t, len(escaped.upstream.zones), 1) && testing.expect_value(t, len(escaped.upstream.zones[0].domains), 1) {
 		testing.expect_value(t, escaped.upstream.zones[0].domains[0], "a\\046test.")
 	}
 	free_all(context.temp_allocator)
@@ -331,28 +320,15 @@ there afterwards. One line, about the key that was actually written.
 */
 @(test)
 test_a_bad_inherited_attempts_is_reported_once :: proc(t: ^testing.T) {
-	_, err := load_string(
+	expect_refused(
+		t,
 		"upstream:\n  attempts: 0\n  servers: [1.1.1.1]\n  zones:\n" +
 		"    - domains: [corp.example]\n      servers: [10.0.0.1]\n" +
 		"    - domains: [lab.example]\n      servers: [10.0.0.2]\n",
-		context.temp_allocator,
+		"upstream.attempts must be at least 1",
+		exact = true,
+		exactly_one = true,
 	)
-	e, has := err.?
-	if !testing.expect(t, has, "attempts of 0 was accepted") {
-		return
-	}
-	routes_named := 0
-	key_named := 0
-	for msg in e.messages {
-		if strings.contains(msg, "needs attempts of at least 1") {
-			routes_named += 1
-		}
-		if strings.contains(msg, "upstream.attempts must be at least 1") {
-			key_named += 1
-		}
-	}
-	testing.expectf(t, routes_named == 0, "the routes were named for an inherited number; got %v", e.messages)
-	testing.expect_value(t, key_named, 1)
 
 	// A route that writes the number itself is still its own error.
 	expect_refused(
@@ -362,6 +338,12 @@ test_a_bad_inherited_attempts_is_reported_once :: proc(t: ^testing.T) {
 	)
 	free_all(context.temp_allocator)
 }
+
+// The root's anchor as a YAML list item, and the DS fields after a zone's owner.
+@(private = "file")
+QUOTED_ROOT :: `"` + ROOT_ANCHOR + `"`
+@(private = "file")
+ZONE_DS :: `IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF`
 
 /*
 A route the operator anchored gives up no validation, and `--check` has to be
@@ -377,9 +359,6 @@ the routed zone, which leaves the rest of the zone insecure.
 */
 @(test)
 test_a_route_knows_whether_an_anchor_covers_it :: proc(t: ^testing.T) {
-	ROOT :: `"` + ROOT_ANCHOR + `"`
-	DS :: `IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF`
-
 	load :: proc(t: ^testing.T, anchors: string, domains := "[corp.example]") -> (Config, bool) {
 		src := fmt.tprintf(
 			MINIMAL + "  zones:\n    - domains: %s\n      servers: [10.0.0.1]\ndnssec:\n  enabled: true\n%s",
@@ -400,11 +379,11 @@ test_a_route_knows_whether_an_anchor_covers_it :: proc(t: ^testing.T) {
 	}
 	// The root alone is not an anchor over anything, which is what
 	// `start_validator` decides by leaving it out of `anchor_zones`.
-	if cfg, ok := load(t, "  trust_anchors:\n    - " + ROOT + "\n"); ok {
+	if cfg, ok := load(t, "  trust_anchors:\n    - " + QUOTED_ROOT + "\n"); ok {
 		testing.expect(t, !route_is_anchored(&cfg, cfg.upstream.zones[0]), "the root anchor was read as covering a zone")
 	}
 	// The zone itself, which is the case the warning has to keep quiet about.
-	if cfg, ok := load(t, "  trust_anchors:\n    - " + ROOT + "\n    - \"corp.example. " + DS + "\"\n"); ok {
+	if cfg, ok := load(t, "  trust_anchors:\n    - " + QUOTED_ROOT + "\n    - \"corp.example. " + ZONE_DS + "\"\n"); ok {
 		testing.expect(t, route_is_anchored(&cfg, cfg.upstream.zones[0]), "an anchor over the routed zone was ignored")
 	}
 	/*
@@ -416,14 +395,14 @@ test_a_route_knows_whether_an_anchor_covers_it :: proc(t: ^testing.T) {
 	starting at the root - and what is under test here is which zone an anchor
 	covers, not whether the set is one a server could start on.
 	*/
-	if cfg, ok := load(t, "  trust_anchors:\n    - " + ROOT + "\n    - \"dev.corp.example. " + DS + "\"\n"); ok {
+	if cfg, ok := load(t, "  trust_anchors:\n    - " + QUOTED_ROOT + "\n    - \"dev.corp.example. " + ZONE_DS + "\"\n"); ok {
 		testing.expect(t, !route_is_anchored(&cfg, cfg.upstream.zones[0]), "an anchor below the zone was read as covering it")
 	}
 	// One domain of a route anchored and the other not is the whole route still
 	// giving validation up, the line being one sentence about all of them.
 	if cfg, ok := load(
 		t,
-		"  trust_anchors:\n    - " + ROOT + "\n    - \"corp.example. " + DS + "\"\n",
+		"  trust_anchors:\n    - " + QUOTED_ROOT + "\n    - \"corp.example. " + ZONE_DS + "\"\n",
 		"[corp.example, lab.example]",
 	); ok {
 		testing.expect(t, !route_is_anchored(&cfg, cfg.upstream.zones[0]), "a half-anchored route was called anchored")
@@ -431,7 +410,8 @@ test_a_route_knows_whether_an_anchor_covers_it :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
-// The control for the case above: with the key at its default the route is the
+// The control for `test_a_route_under_an_enabled_special_use_zone_is_refused`:
+// with the key at its default the route is the
 // only thing claiming the zone, and the file loads.
 @(test)
 test_a_route_over_a_default_off_special_use_zone_is_kept :: proc(t: ^testing.T) {
@@ -459,18 +439,14 @@ configuration checked on one machine is often deployed on another.
 */
 @(test)
 test_a_trust_anchor_set_without_the_root_is_refused :: proc(t: ^testing.T) {
-	ROOT :: `"` + ROOT_ANCHOR + `"`
-	DS :: `IN DS 12345 8 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF`
-
-	src :: proc(anchors: string) -> string {
-		return fmt.tprintf(MINIMAL + "dnssec:\n  enabled: true\n%s", anchors)
+	src :: proc(anchors: string, enabled := true) -> string {
+		return fmt.tprintf(MINIMAL + "dnssec:\n  enabled: %v\n%s", enabled, anchors)
 	}
 
-	_, alone := load_string(src("  trust_anchors:\n    - \"corp.example. " + DS + "\"\n"), context.temp_allocator)
-	testing.expect(t, alone != nil, "a set anchoring only a zone below the root should be refused")
+	expect_refused(t, src("  trust_anchors:\n    - \"corp.example. " + ZONE_DS + "\"\n"), "dnssec.trust_anchors covers no root anchor", prefix = true)
 
 	_, with_root := load_string(
-		src("  trust_anchors:\n    - " + ROOT + "\n    - \"corp.example. " + DS + "\"\n"),
+		src("  trust_anchors:\n    - " + QUOTED_ROOT + "\n    - \"corp.example. " + ZONE_DS + "\"\n"),
 		context.temp_allocator,
 	)
 	testing.expect(t, with_root == nil, "the same set with the root anchored is a set a server can start on")
@@ -485,31 +461,20 @@ test_a_trust_anchor_set_without_the_root_is_refused :: proc(t: ^testing.T) {
 	does not contain it - it did not parse - so the root check would report it
 	missing to an operator looking straight at the line where they wrote it.
 	*/
-	typo := fmt.tprintf(
-		MINIMAL + "dnssec:\n  enabled: true\n%s",
-		"  trust_anchors:\n    - \". IN DS 20326 8 2 NOTHEXATALL\"\n",
+	expect_refused(
+		t,
+		src("  trust_anchors:\n    - \". IN DS 20326 8 2 NOTHEXATALL\"\n"),
+		"dnssec.trust_anchors[0]:",
+		"is not a DS record",
+		exactly_one = true,
 	)
-	_, malformed := load_string(typo, context.temp_allocator)
-	if e, has := malformed.?; has {
-		testing.expectf(
-			t,
-			len(e.messages) == 1,
-			"a mistyped root anchor should be one error, got %v",
-			e.messages,
-		)
-	} else {
-		testing.expect(t, false, "a mistyped root anchor should still be refused")
-	}
 
 	/*
 	And with validation off the question does not arise. Nothing reads these -
 	`start_validator` returns before it looks at them - so a set left behind by
 	an operator who turned DNSSEC off must not stop the file from loading.
 	*/
-	off := fmt.tprintf(
-		MINIMAL + "dnssec:\n  enabled: false\n%s",
-		"  trust_anchors:\n    - \"corp.example. " + DS + "\"\n",
-	)
+	off := src("  trust_anchors:\n    - \"corp.example. " + ZONE_DS + "\"\n", enabled = false)
 	_, disabled := load_string(off, context.temp_allocator)
 	testing.expect(t, disabled == nil, "anchors nothing reads should not stop a file loading")
 	free_all(context.temp_allocator)

@@ -126,9 +126,7 @@ test_the_plan_pins_files_directly_in_shared_directories :: proc(t: ^testing.T) {
 	cfg := config.default_config()
 	cfg.server.sandbox = .Strict
 	plan, pinned := sandbox_plan(&cfg, "/etc/elodin-test.yaml", "/elodin-test.log", context.temp_allocator)
-	for file in ([]string{"/etc/elodin-test.yaml"}) {
-		testing.expectf(t, slice.contains(plan.readable, file), "%v lacks the file itself", plan.readable)
-	}
+	testing.expectf(t, slice.contains(plan.readable, "/etc/elodin-test.yaml"), "%v lacks the file itself", plan.readable)
 	for dir in PINNED_DIRS {
 		testing.expectf(t, !slice.contains(plan.readable, dir), "%v grants %s", plan.readable, dir)
 		testing.expectf(t, plan.log_dir != dir, "the log grants %s", dir)
@@ -315,4 +313,66 @@ test_a_missing_resolver_file_is_not_granted :: proc(t: ^testing.T) {
 	pins := make([dynamic]string, context.temp_allocator)
 	add_file_rule(&out, &pins, fmt.tprintf("/tmp/elodin-absent-hosts-%d", posix.getpid()), context.temp_allocator)
 	testing.expectf(t, len(out) == 0 && len(pins) == 0, "grants %v, pins %v", out, pins)
+}
+
+// The list host a start resolves through the system: the first enabled list,
+// blocking or allow, whose URL names a host rather than an address.
+@(test)
+test_system_resolved_list_host_is_the_first_named_url :: proc(t: ^testing.T) {
+	cfg := config.default_config()
+	cfg.blocking.enabled = true
+	Case :: struct {
+		lists, allow: []config.Block_List,
+		want:         string,
+	}
+	named := config.Block_List{url = "https://lists.example:8443/hosts.txt", enabled = true}
+	cases := []Case {
+		{lists = {named}, want = "lists.example"},
+		{lists = {{url = "https://192.0.2.1/hosts.txt", enabled = true}, {url = "https://[2001:db8::1]:8443/x", enabled = true}}},
+		{lists = {{url = "https://192.0.2.1/hosts.txt", enabled = true}, {url = "https://first.example/x", enabled = true}, named}, want = "first.example"},
+		{lists = {{url = "https://off.example/x"}}},
+		{lists = {{file = "/etc/elodin/hosts.txt", enabled = true}}},
+		{lists = {{url = "https://192.0.2.1/x", enabled = true}}, allow = {{url = "https://allow.example/x", enabled = true}}, want = "allow.example"},
+	}
+	for c in cases {
+		cfg.blocking.lists, cfg.blocking.allow_lists = c.lists, c.allow
+		host, found := system_resolved_list_host(&cfg)
+		testing.expectf(t, found == (c.want != "") && host == c.want, "%v / %v: got %q (%v), want %q", c.lists, c.allow, host, found, c.want)
+	}
+	// Nothing is downloaded with blocking off, so nothing is resolved.
+	cfg.blocking.enabled = false
+	cfg.blocking.lists, cfg.blocking.allow_lists = {named}, nil
+	host, found := system_resolved_list_host(&cfg)
+	testing.expectf(t, !found, "blocking off still named %q", host)
+}
+
+// Each warning is said where a reload would hit it, and only there.
+@(test)
+test_unreachable_later_warnings :: proc(t: ^testing.T) {
+	missing := fmt.tprintf("/tmp/elodin-main-no-cache-%d", posix.getpid())
+	cfg := config.default_config()
+	cfg.server.sandbox = .Strict
+	cfg.blocking.enabled = false
+	cfg.blocking.cache_dir = missing
+
+	said := unreachable_later_warnings(&cfg, context.temp_allocator)
+	testing.expectf(t, strings.contains(said[0], missing), "a missing cache with blocking off: %q", said[0])
+	cfg.blocking.cache_dir = "/tmp"
+	said = unreachable_later_warnings(&cfg, context.temp_allocator)
+	testing.expectf(t, said[0] == "", "a cache that exists: %q", said[0])
+	cfg.blocking.enabled = true
+	cfg.blocking.cache_dir = missing
+	said = unreachable_later_warnings(&cfg, context.temp_allocator)
+	testing.expectf(t, said[0] == "", "blocking on, which makes the cache itself: %q", said[0])
+
+	cfg.blocking.lists = {{url = "https://lists.example/hosts.txt", enabled = true}}
+	said = unreachable_later_warnings(&cfg, context.temp_allocator)
+	testing.expectf(t, strings.contains(said[1], `"lists.example"`), "a named list under strict: %q", said[1])
+	cfg.upstream.bootstrap = {"1.1.1.1"}
+	said = unreachable_later_warnings(&cfg, context.temp_allocator)
+	testing.expectf(t, said[1] == "", "with a bootstrap: %q", said[1])
+	cfg.upstream.bootstrap = nil
+	cfg.server.sandbox = .Basic
+	said = unreachable_later_warnings(&cfg, context.temp_allocator)
+	testing.expectf(t, said[1] == "", "under basic, which reads resolv.conf afresh: %q", said[1])
 }

@@ -225,7 +225,7 @@ Queries in flight kept back from the chain walk.
 
 The chain walk waits on the network once per label of a name the client chose,
 so without a bound a flood of fresh names holds every query the server may have
-in flight, each for up to `MAX_LOOKUPS_PER_QUERY` round trips, and the resolver
+in flight, each for up to `dnssec.MAX_LOOKUPS_PER_QUERY` round trips, and the resolver
 stops answering anything at all (issue #356). What has to be guaranteed is that most of what may
 be in flight keeps *turning over* - and that is a *reservation* rather than a
 ceiling.
@@ -234,11 +234,11 @@ Turning over, not idle, and the difference is worth stating because the wrong
 reading oversells this. The reserved queries are free of the *walk*, not free of
 work: one may be waiting on its own upstream forward, which takes no slot and is
 not bounded here. What the reservation buys is that at most `max_chain_walks` of
-them can be inside a chain walk, and a walk is up to `MAX_LOOKUPS_PER_QUERY` round
+them can be inside a chain walk, and a walk is up to `dnssec.MAX_LOOKUPS_PER_QUERY` round
 trips against a forward's one - so the rest come back in a round trip rather than
 in a second, and new queries keep being admitted instead of shed. Enough of a
 flood will still fill `max_pending` and shed; what it cannot do is hold
-it for `MAX_LOOKUPS_PER_QUERY` round trips apiece, which is the whole of #356.
+it for `dnssec.MAX_LOOKUPS_PER_QUERY` round trips apiece, which is the whole of #356.
 
 Stated this way round on purpose. A ceiling of half the bound also caps honest
 throughput at half, and the walks past it are answered SERVFAIL: every

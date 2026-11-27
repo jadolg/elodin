@@ -41,11 +41,6 @@ rewrites:
 cookies:
   requires: true
 `
-	_, err := load_string(src, context.temp_allocator)
-	e, has := err.?
-	if !testing.expect(t, has, "a file full of misspelt keys loaded clean") {
-		return
-	}
 	for want in ([]string {
 			"rebind.enable",
 			"server.max_connection_per_prefix",
@@ -59,23 +54,16 @@ cookies:
 			"rewrites[0].tll",
 			"cookies.requires",
 		}) {
-		found := false
-		for m in e.messages {
-			if strings.has_prefix(m, want) && strings.contains(m, "unknown key") {
-				found = true
-				break
-			}
-		}
-		testing.expectf(t, found, "no unknown-key error for %s in %v", want, e.messages)
+		expect_refused(t, src, strings.concatenate({want, ": unknown key"}, context.temp_allocator), exact = true)
 	}
 }
 
 /*
 A section written as one value or a list, where its settings belong, is refused
-too: `yaml.keys` has nothing to offer for it, so `rebind: true` read as a
-section with no keys in it and left rebind protection off. And a list written
+too: `yaml.keys` has nothing to offer for it, so `rebind: true` would read as a
+section with no keys in it and leave rebind protection off. And a list written
 as one value or a mapping - a single URL for `blocking.lists`, one rule under
-`rewrites` with no `-` - read as an empty list.
+`rewrites` with no `-` - would read as an empty list.
 */
 @(test)
 test_misshapen_sections_are_refused :: proc(t: ^testing.T) {
@@ -114,15 +102,7 @@ test_a_misshapen_entry_is_one_error :: proc(t: ^testing.T) {
 			MINIMAL + "blocking:\n  lists:\n    - [a, b]\n",
 			"upstream:\n  servers:\n    - 1.1.1.1\n    - [9.9.9.9]\n",
 		}) {
-		_, err := load_string(src, context.temp_allocator)
-		e, _ := err.?
-		testing.expectf(
-			t,
-			len(e.messages) == 1 && strings.contains(e.messages[0], "expected a mapping"),
-			"%q: %v",
-			src,
-			e.messages,
-		)
+		expect_refused(t, src, "expected a mapping", exactly_one = true)
 	}
 	free_all(context.temp_allocator)
 }
@@ -130,7 +110,8 @@ test_a_misshapen_entry_is_one_error :: proc(t: ^testing.T) {
 // Every shipped example still loads: each key in them is one the loader reads.
 @(test)
 test_examples_load :: proc(t: ^testing.T) {
-	paths, _ := filepath.glob("examples/*.yaml", context.temp_allocator)
+	paths, gerr := filepath.glob("examples/*.yaml", context.temp_allocator)
+	testing.expectf(t, gerr == nil, "examples/*.yaml: %v", gerr)
 	testing.expect(t, len(paths) > 0, "no examples found; run from the repository root")
 	for p in paths {
 		// Docker Compose's files, which run the image with examples/docker.yaml
@@ -143,9 +124,10 @@ test_examples_load :: proc(t: ^testing.T) {
 		// "unknown key" would let a duplicate key (a parse error) or a section in
 		// the wrong shape through.
 		_, err := load_file(p, context.temp_allocator)
-		e, _ := err.?
-		for m in e.messages {
-			testing.expectf(t, strings.has_suffix(m, "does not exist"), "%s: %s", p, m)
+		if e, has := err.?; has {
+			for m in e.messages {
+				testing.expectf(t, strings.has_suffix(m, "does not exist"), "%s: %s", p, m)
+			}
 		}
 	}
 }

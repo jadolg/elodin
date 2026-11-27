@@ -83,6 +83,24 @@ for source, want in SOURCES:
     if bool(hits) != want:
         failures.append(f"expect-format on {source!r}: got {bool(hits)}, want {want}")
 
+# (source, line checked, size-literal expected)
+CODE = [
+    ("buf: [512]u8\n", 1, True),
+    ("n := 1232\n", 1, True),
+    ("if len(m) > 65535 {\n", 1, True),
+    ("MAX :: 65535\n", 1, False),
+    ("n := 1232 // lint:allow the RFC 9715 figure itself\n", 1, False),
+    ("n := f() // fits in 512 bytes\n", 1, False),
+    ('s := "512 bytes"\n', 1, False),
+    ("/*\nthe 1232 ceiling\n*/\n", 2, False),
+    ("x := 5120 + 0.512 + v512\n", 1, False),
+]
+for source, n, want in CODE:
+    hits = []
+    lint.check_code(TEST, n, source.splitlines()[n - 1], lint.code_only(source), hits)
+    if bool(hits) != want:
+        failures.append(f"size-literal on {source!r}: got {bool(hits)}, want {want}")
+
 # (sources, procedures the test-only rule should name)
 PROCS = [
     ({"src/dns/a.odin": "used :: proc() {}\n", "src/dns/b.odin": "x := used()\n"}, []),

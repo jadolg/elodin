@@ -1,13 +1,8 @@
 package config
 
 import "core:fmt"
-import "core:strings"
+import "core:mem"
 import "core:testing"
-
-@(private = "file")
-GIB :: i64(1024 * 1024 * 1024)
-@(private = "file")
-MIB :: i64(1024 * 1024)
 
 /*
 What may be in flight is sized by memory alone: a query waiting on an upstream
@@ -17,15 +12,15 @@ can come to hold (`QUERY_MEMORY_BYTES`), against an eighth of memory.
 @(test)
 test_derive_max_pending_is_sized_by_memory :: proc(t: ^testing.T) {
 	// A 1 GiB VPS: 128 MiB over 320 KiB.
-	testing.expect_value(t, derive_max_pending(Machine{cpus = 2, memory = GIB}), 409)
-	testing.expect_value(t, derive_max_pending(Machine{cpus = 64, memory = GIB}), 409)
+	testing.expect_value(t, derive_max_pending(Machine{cpus = 2, memory = mem.Gigabyte}), 409)
+	testing.expect_value(t, derive_max_pending(Machine{cpus = 64, memory = mem.Gigabyte}), 409)
 	// A small container on a large host.
-	testing.expect_value(t, derive_max_pending(Machine{cpus = 16, memory = 256 * MIB}), 102)
+	testing.expect_value(t, derive_max_pending(Machine{cpus = 16, memory = 256 * mem.Megabyte}), 102)
 	// Small enough that the share buys almost nothing: the floor answers
 	// instead, since a resolver that has stopped answering saved nobody memory.
-	testing.expect_value(t, derive_max_pending(Machine{cpus = 1, memory = 16 * MIB}), MIN_DERIVED_PENDING)
+	testing.expect_value(t, derive_max_pending(Machine{cpus = 1, memory = 16 * mem.Megabyte}), MIN_DERIVED_PENDING)
 	// And the ceiling, which is descriptors as much as memory.
-	testing.expect_value(t, derive_max_pending(Machine{cpus = 4, memory = 64 * GIB}), MAX_DERIVED_PENDING)
+	testing.expect_value(t, derive_max_pending(Machine{cpus = 4, memory = 64 * mem.Gigabyte}), MAX_DERIVED_PENDING)
 }
 
 /*
@@ -46,10 +41,10 @@ each: never fewer than `MIN_DERIVED_HEAVY_DECODES`, never more than
 */
 @(test)
 test_derive_heavy_decodes_is_sized_by_memory :: proc(t: ^testing.T) {
-	testing.expect_value(t, derive_heavy_decodes(Machine{memory = GIB}), 4)
-	testing.expect_value(t, derive_heavy_decodes(Machine{memory = 8 * GIB}), 32)
-	testing.expect_value(t, derive_heavy_decodes(Machine{memory = 256 * MIB}), MIN_DERIVED_HEAVY_DECODES)
-	testing.expect_value(t, derive_heavy_decodes(Machine{memory = 1024 * GIB}), MAX_DERIVED_HEAVY_DECODES)
+	testing.expect_value(t, derive_heavy_decodes(Machine{memory = mem.Gigabyte}), 4)
+	testing.expect_value(t, derive_heavy_decodes(Machine{memory = 8 * mem.Gigabyte}), 32)
+	testing.expect_value(t, derive_heavy_decodes(Machine{memory = 256 * mem.Megabyte}), MIN_DERIVED_HEAVY_DECODES)
+	testing.expect_value(t, derive_heavy_decodes(Machine{memory = 1024 * mem.Gigabyte}), MAX_DERIVED_HEAVY_DECODES)
 	testing.expect_value(t, derive_heavy_decodes(Machine{cpus = 4}), DEFAULT_HEAVY_DECODES)
 }
 
@@ -73,8 +68,10 @@ test_derive_chain_walks_reserves_a_quarter :: proc(t: ^testing.T) {
 
 @(test)
 test_chain_walks_are_derived_at_load :: proc(t: ^testing.T) {
-	cfg, err := load_string(MINIMAL + "server:\n  max_pending: 16\n", context.temp_allocator)
-	testing.expect(t, err == nil, "expected a clean load")
+	cfg, ok := expect_loads(t, MINIMAL + "server:\n  max_pending: 16\n")
+	if !ok {
+		return
+	}
 	// From the bound on queries in flight, derived at load rather than at
 	// start-up, so `--check` and the run that follows it name the same number.
 	testing.expect_value(t, cfg.dnssec.max_chain_walks, derive_chain_walks(16))
@@ -84,12 +81,9 @@ test_chain_walks_are_derived_at_load :: proc(t: ^testing.T) {
 	testing.expect(t, cfg.server.sizing.derived_chain_walks, "a derived bound was not marked so")
 
 	// A number in the file wins, as everywhere else in this file.
-	set, serr := load_string(
-		MINIMAL + "server:\n  max_pending: 16\ndnssec:\n  max_chain_walks: 3\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, serr == nil, "expected a clean load")
-	testing.expect_value(t, set.dnssec.max_chain_walks, 3)
+	if set, sok := expect_loads(t, MINIMAL + "server:\n  max_pending: 16\ndnssec:\n  max_chain_walks: 3\n"); sok {
+		testing.expect_value(t, set.dnssec.max_chain_walks, 3)
+	}
 	free_all(context.temp_allocator)
 }
 
@@ -98,32 +92,23 @@ test_a_negative_chain_walk_bound_is_refused :: proc(t: ^testing.T) {
 	// Not read as one more way of asking for the default: the bound is a
 	// denial-of-service guard, so a number that cannot be one is a mistake to
 	// report rather than to paper over.
-	_, err := load_string(
-		MINIMAL + "dnssec:\n  max_chain_walks: -1\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, err != nil, "a negative chain-walk bound should be refused")
+	expect_refused(t, MINIMAL + "dnssec:\n  max_chain_walks: -1\n", "dnssec.max_chain_walks must not be negative", prefix = true)
 	free_all(context.temp_allocator)
 }
 
 /*
-The worker keys #547 removed are unknown keys, refused like any other. The
-connection walk bound is not one of them.
+`server.workers`, `upstream_workers` and `running_workers` are unknown keys,
+refused like any other. The connection walk bound is not one of them.
 */
 @(test)
-test_the_removed_worker_keys_are_refused :: proc(t: ^testing.T) {
+test_the_worker_keys_are_refused :: proc(t: ^testing.T) {
 	for key in ([]string{"workers", "upstream_workers", "running_workers"}) {
-		_, err := load_string(fmt.tprintf(MINIMAL + "server:\n  %s: 8\n", key), context.temp_allocator)
-		e, refused := err.?
-		want := fmt.tprintf("server.%s: unknown key", key)
-		testing.expectf(t, refused && len(e.messages) == 1 && strings.has_prefix(e.messages[0], want), "server.%s: want only %q, got %v", key, want, e.messages)
+		doc := fmt.tprintf(MINIMAL + "server:\n  %s: 8\n", key)
+		expect_refused(t, doc, fmt.tprintf("server.%s: unknown key", key), exact = true, exactly_one = true)
 	}
-	cfg, err := load_string(
-		MINIMAL + "dnssec:\n  max_connection_walks: 24\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, err == nil, "dnssec.max_connection_walks was refused")
-	testing.expect_value(t, cfg.dnssec.max_connection_walks, 24)
+	if cfg, ok := expect_loads(t, MINIMAL + "dnssec:\n  max_connection_walks: 24\n"); ok {
+		testing.expect_value(t, cfg.dnssec.max_connection_walks, 24)
+	}
 	free_all(context.temp_allocator)
 }
 
@@ -160,7 +145,7 @@ test_parse_cpu_max :: proc(t: ^testing.T) {
 test_parse_memory_max :: proc(t: ^testing.T) {
 	bytes, ok := parse_memory_max("134217728\n")
 	testing.expect(t, ok, "a container limit should parse")
-	testing.expect_value(t, bytes, 128 * MIB)
+	testing.expect_value(t, bytes, 128 * mem.Megabyte)
 
 	_, ok = parse_memory_max("max\n")
 	testing.expect(t, !ok, "cgroup v2's unlimited should be ignored")
@@ -273,11 +258,10 @@ listener runs on the loops.
 */
 @(test)
 test_unset_sizes_are_derived_at_load :: proc(t: ^testing.T) {
-	cfg, err := load_string(
-		MINIMAL + "listeners:\n  udp: { enabled: false }\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, err == nil, "expected a clean load")
+	cfg, ok := expect_loads(t, MINIMAL + "listeners:\n  udp: { enabled: false }\n")
+	if !ok {
+		return
+	}
 	testing.expect(t, cfg.server.sizing.derived_max_pending, "max_pending should be marked as derived")
 	testing.expect_value(t, cfg.server.max_pending, derive_max_pending(cfg.server.sizing.machine))
 	testing.expect_value(t, cfg.server.heavy_decodes, derive_heavy_decodes(cfg.server.sizing.machine))
@@ -289,14 +273,15 @@ test_unset_sizes_are_derived_at_load :: proc(t: ^testing.T) {
 // A number in the file wins, and what is derived from it follows it.
 @(test)
 test_configured_max_pending_wins :: proc(t: ^testing.T) {
-	cfg, err := load_string(MINIMAL + "server:\n  max_pending: 40\n", context.temp_allocator)
-	testing.expect(t, err == nil, "expected a clean load")
+	cfg, ok := expect_loads(t, MINIMAL + "server:\n  max_pending: 40\n")
+	if !ok {
+		return
+	}
 	testing.expect_value(t, cfg.server.max_pending, 40)
 	testing.expect(t, !cfg.server.sizing.derived_max_pending, "a configured bound is not a derived one")
 	testing.expect_value(t, cfg.dnssec.max_chain_walks, derive_chain_walks(40))
 
-	_, nerr := load_string(MINIMAL + "server:\n  max_pending: -1\n", context.temp_allocator)
-	testing.expect(t, nerr != nil, "a negative max_pending should be refused")
+	expect_refused(t, MINIMAL + "server:\n  max_pending: -1\n", "server.max_pending must not be negative", exact = true)
 	free_all(context.temp_allocator)
 }
 
@@ -331,33 +316,26 @@ test_pooled_upstream_connections_counts_every_route :: proc(t: ^testing.T) {
 }
 
 /*
-Issue #336: the zone-key cache had a bound the configuration could not reach.
-
-`dnssec.Options.max_cached_zones` existed and nothing passed it, so the only
-number in use was the built-in one - on a box whose memory the operator knows
-and this server does not.
+The zone-key cache's bound is the configuration's: `dnssec.max_cached_zones` is
+passed as `dnssec.Options.max_cached_zones`, for a box whose memory the operator
+knows and this server does not.
 */
 @(test)
 test_the_zone_cache_bound_is_configurable :: proc(t: ^testing.T) {
-	cfg, err := load_string(MINIMAL, context.temp_allocator)
-	testing.expect(t, err == nil, "expected a clean load")
+	cfg, ok := expect_loads(t, MINIMAL)
+	if !ok {
+		return
+	}
 	// Zero here rather than a number of its own: the validator holds the
 	// default, so the two cannot drift apart.
 	testing.expect_value(t, cfg.dnssec.max_cached_zones, 0)
 
-	set, serr := load_string(
-		MINIMAL + "dnssec:\n  max_cached_zones: 512\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, serr == nil, "expected a clean load")
-	testing.expect_value(t, set.dnssec.max_cached_zones, 512)
+	if set, sok := expect_loads(t, MINIMAL + "dnssec:\n  max_cached_zones: 300\n"); sok {
+		testing.expect_value(t, set.dnssec.max_cached_zones, 300)
+	}
 
 	// Negative is not a cache without a bound, it is a number nobody meant.
-	_, nerr := load_string(
-		MINIMAL + "dnssec:\n  max_cached_zones: -1\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, nerr != nil, "a negative zone-cache bound should be refused")
+	expect_refused(t, MINIMAL + "dnssec:\n  max_cached_zones: -1\n", "dnssec.max_cached_zones must not be negative", prefix = true)
 	free_all(context.temp_allocator)
 }
 
@@ -368,20 +346,20 @@ machine that cannot hold it, and nothing where the memory is not known.
 */
 @(test)
 test_connection_memory_warning_at_a_quarter_of_memory :: proc(t: ^testing.T) {
-	_, say := connection_memory_warning(512, Machine{memory = 256 * MIB})
+	_, say := connection_memory_warning(DEFAULT_MAX_CONNECTIONS, Machine{memory = 256 * mem.Megabyte})
 	testing.expect(t, !say, "512 connections at a quarter of 256 MB")
 	text: string
-	text, say = connection_memory_warning(512, Machine{memory = 256 * MIB - 1})
+	text, say = connection_memory_warning(DEFAULT_MAX_CONNECTIONS, Machine{memory = 256 * mem.Megabyte - 1})
 	testing.expect(t, say, "512 connections past a quarter of 256 MB")
 	testing.expect_value(t, text, "server.max_connections is 512: with every connection open that is about 64.0 MiB, more than a quarter of the 256.0 MiB this process may use")
-	text, say = connection_memory_warning(4096, Machine{memory = 1 * GIB})
+	text, say = connection_memory_warning(4096, Machine{memory = 1 * mem.Gigabyte})
 	testing.expect(t, say, "4096 connections on 1 GiB")
 	testing.expect_value(t, text, "server.max_connections is 4096: with every connection open that is about 512.0 MiB, more than a quarter of the 1.0 GiB this process may use")
-	_, say = connection_memory_warning(512, Machine{memory = 1 * GIB})
+	_, say = connection_memory_warning(DEFAULT_MAX_CONNECTIONS, Machine{memory = 1 * mem.Gigabyte})
 	testing.expect(t, !say, "the default on 1 GiB")
 	_, say = connection_memory_warning(1 << 20, Machine{})
 	testing.expect(t, !say, "memory not measured")
-	text, say = connection_memory_warning(1 << 62, Machine{memory = 1 * GIB})
+	text, say = connection_memory_warning(1 << 62, Machine{memory = 1 * mem.Gigabyte})
 	testing.expect(t, say, "a table whose cost does not fit in an i64")
 	testing.expect_value(t, text, "server.max_connections is 4611686018427387904: with every connection open that is about 8.0 EiB, more than a quarter of the 1.0 GiB this process may use")
 }

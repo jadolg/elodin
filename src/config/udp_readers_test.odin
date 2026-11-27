@@ -1,6 +1,7 @@
 package config
 
-import "core:strings"
+import "core:fmt"
+import "core:mem"
 import "core:testing"
 
 /*
@@ -13,7 +14,7 @@ on every core it has.
 */
 @(test)
 test_derive_udp_readers_scales_with_cpus :: proc(t: ^testing.T) {
-	testing.expect_value(t, derive_udp_readers(Machine{cpus = 1, memory = 2 * 1024 * 1024 * 1024}), 1)
+	testing.expect_value(t, derive_udp_readers(Machine{cpus = 1, memory = 2 * mem.Gigabyte}), 1)
 	testing.expect_value(t, derive_udp_readers(Machine{cpus = 2}), 2)
 	testing.expect_value(t, derive_udp_readers(Machine{cpus = 4}), 4)
 	testing.expect_value(t, derive_udp_readers(Machine{cpus = 8}), MAX_DERIVED_UDP_READERS)
@@ -31,7 +32,7 @@ thread contending for the core the loop beside it is using.
 @(test)
 test_derive_udp_readers_does_not_guess :: proc(t: ^testing.T) {
 	testing.expect_value(t, derive_udp_readers(Machine{}), MIN_DERIVED_UDP_READERS)
-	testing.expect_value(t, derive_udp_readers(Machine{memory = 64 * 1024 * 1024 * 1024}), MIN_DERIVED_UDP_READERS)
+	testing.expect_value(t, derive_udp_readers(Machine{memory = 64 * mem.Gigabyte}), MIN_DERIVED_UDP_READERS)
 }
 
 // A figure in the file is the operator's, and is neither derived nor reported
@@ -39,8 +40,10 @@ test_derive_udp_readers_does_not_guess :: proc(t: ^testing.T) {
 @(test)
 test_configured_udp_readers_are_not_derived :: proc(t: ^testing.T) {
 	src := MINIMAL + "listeners:\n  udp:\n    readers: 3\n"
-	cfg, err := load_string(src, context.temp_allocator)
-	testing.expect(t, err == nil, "expected a clean load")
+	cfg, ok := expect_loads(t, src)
+	if !ok {
+		return
+	}
 	testing.expect_value(t, cfg.listeners.udp.readers, 3)
 	testing.expect(t, !cfg.server.sizing.derived_udp_readers, "a configured count is not a derived one")
 	free_all(context.temp_allocator)
@@ -50,8 +53,10 @@ test_configured_udp_readers_are_not_derived :: proc(t: ^testing.T) {
 // almost every installation runs.
 @(test)
 test_unset_udp_readers_are_derived :: proc(t: ^testing.T) {
-	cfg, err := load_string(MINIMAL, context.temp_allocator)
-	testing.expect(t, err == nil, "expected a clean load")
+	cfg, ok := expect_loads(t, MINIMAL)
+	if !ok {
+		return
+	}
 	testing.expect(t, cfg.server.sizing.derived_udp_readers, "an unset reader count should be derived")
 	testing.expect(
 		t,
@@ -61,13 +66,10 @@ test_unset_udp_readers_are_derived :: proc(t: ^testing.T) {
 	)
 	// With the UDP listener off the count is derived all the same: it is the
 	// number of event loops, and the stream listeners run on them (#547).
-	off, oerr := load_string(
-		MINIMAL + "listeners:\n  udp: { enabled: false }\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, oerr == nil, "expected a clean load")
-	testing.expect_value(t, off.listeners.udp.readers, cfg.listeners.udp.readers)
-	testing.expect(t, off.server.sizing.derived_udp_readers, "the loop count was left underived with UDP off")
+	if off, ook := expect_loads(t, MINIMAL + "listeners:\n  udp: { enabled: false }\n"); ook {
+		testing.expect_value(t, off.listeners.udp.readers, cfg.listeners.udp.readers)
+		testing.expect(t, off.server.sizing.derived_udp_readers, "the loop count was left underived with UDP off")
+	}
 	free_all(context.temp_allocator)
 }
 
@@ -80,40 +82,20 @@ is a file whose author should be told.
 */
 @(test)
 test_impossible_udp_reader_counts_are_refused :: proc(t: ^testing.T) {
-	_, negative := load_string(
-		MINIMAL + "listeners:\n  udp:\n    readers: -1\n",
-		context.temp_allocator,
-	)
-	e, has := negative.?
-	if testing.expect(t, has, "a negative reader count was accepted") {
-		testing.expect(t, strings.contains(e.messages[0], "listeners.udp.readers"), e.messages[0])
-	}
+	NEGATIVE :: "listeners.udp.readers must not be negative"
+	expect_refused(t, MINIMAL + "listeners:\n  udp:\n    readers: -1\n", NEGATIVE, exact = true)
+	past := fmt.tprintf(MINIMAL + "listeners:\n  udp:\n    readers: %d\n", MAX_UDP_READERS + 1)
+	expect_refused(t, past, "listeners.udp.readers must be at most", prefix = true)
 
-	_, huge := load_string(
-		MINIMAL + "listeners:\n  udp:\n    readers: 1000\n",
-		context.temp_allocator,
-	)
-	he, has_huge := huge.?
-	if testing.expect(t, has_huge, "a reader count past the ceiling was accepted") {
-		testing.expect(t, strings.contains(he.messages[0], "listeners.udp.readers"), he.messages[0])
+	// The ceiling itself is the largest figure allowed.
+	at := fmt.tprintf(MINIMAL + "listeners:\n  udp:\n    readers: %d\n", MAX_UDP_READERS)
+	if cfg, ok := expect_loads(t, at); ok {
+		testing.expect_value(t, cfg.listeners.udp.readers, MAX_UDP_READERS)
 	}
-
-	// The ceiling itself is allowed: it is the first figure that is not.
-	at, aerr := load_string(
-		MINIMAL + "listeners:\n  udp:\n    readers: 64\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, aerr == nil, "the ceiling itself should be accepted")
-	testing.expect_value(t, at.listeners.udp.readers, MAX_UDP_READERS)
 
 	// A reader count under a listener that is off is still a number somebody
 	// will turn on one day.
-	_, off := load_string(
-		MINIMAL + "listeners:\n  udp: { enabled: false, readers: -2 }\n",
-		context.temp_allocator,
-	)
-	_, has_off := off.?
-	testing.expect(t, has_off, "a bad reader count under a disabled listener was accepted")
+	expect_refused(t, MINIMAL + "listeners:\n  udp: { enabled: false, readers: -2 }\n", NEGATIVE, exact = true)
 
 	free_all(context.temp_allocator)
 }
@@ -122,32 +104,16 @@ test_impossible_udp_reader_counts_are_refused :: proc(t: ^testing.T) {
 // ends: below one datagram the socket drops traffic on an idle server.
 @(test)
 test_udp_receive_buffer_is_a_size :: proc(t: ^testing.T) {
-	cfg, err := load_string(
-		MINIMAL + "listeners:\n  udp:\n    receive_buffer: 4MiB\n",
-		context.temp_allocator,
-	)
-	testing.expect(t, err == nil, "expected a clean load")
-	testing.expect_value(t, cfg.listeners.udp.receive_buffer, 4 * 1024 * 1024)
-
-	base, berr := load_string(MINIMAL, context.temp_allocator)
-	testing.expect(t, berr == nil, "expected a clean load")
-	testing.expect_value(t, base.listeners.udp.receive_buffer, DEFAULT_UDP_RECEIVE_BUFFER)
-
-	_, small := load_string(
-		MINIMAL + "listeners:\n  udp:\n    receive_buffer: 1KiB\n",
-		context.temp_allocator,
-	)
-	e, has := small.?
-	if testing.expect(t, has, "a receive buffer under one datagram was accepted") {
-		testing.expect(t, strings.contains(e.messages[0], "listeners.udp.receive_buffer"), e.messages[0])
+	if cfg, ok := expect_loads(t, MINIMAL + "listeners:\n  udp:\n    receive_buffer: 4MiB\n"); ok {
+		testing.expect_value(t, cfg.listeners.udp.receive_buffer, 4 * mem.Megabyte)
+	}
+	if base, ok := expect_loads(t, MINIMAL); ok {
+		testing.expect_value(t, base.listeners.udp.receive_buffer, DEFAULT_UDP_RECEIVE_BUFFER)
 	}
 
-	_, huge := load_string(
-		MINIMAL + "listeners:\n  udp:\n    receive_buffer: 4GiB\n",
-		context.temp_allocator,
-	)
-	_, has_huge := huge.?
-	testing.expect(t, has_huge, "a receive buffer past the ceiling was accepted")
+	BOUNDS :: "listeners.udp.receive_buffer must be between"
+	expect_refused(t, MINIMAL + "listeners:\n  udp:\n    receive_buffer: 1KiB\n", BOUNDS, prefix = true)
+	expect_refused(t, MINIMAL + "listeners:\n  udp:\n    receive_buffer: 4GiB\n", BOUNDS, prefix = true)
 
 	free_all(context.temp_allocator)
 }

@@ -38,9 +38,13 @@ test_a_doh_upstream_keeps_its_query :: proc(t: ^testing.T) {
 		}
 	}
 	// And a url that is no url is told so, not read as a host.
-	_, err := load_string("upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{url: \"dns.example/dns-query\"}]\n", context.temp_allocator)
-	_, has := err.?
-	testing.expect(t, has, "a url with no scheme was accepted")
+	expect_refused(
+		t,
+		"upstream:\n  bootstrap: [1.1.1.1]\n  servers: [{url: \"dns.example/dns-query\"}]\n",
+		"upstream.servers[0].url: expected an https:// url",
+		exact = true,
+		exactly_one = true,
+	)
 	free_all(context.temp_allocator)
 }
 
@@ -58,12 +62,7 @@ test_a_scheme_is_read_in_any_case :: proc(t: ^testing.T) {
 		testing.expect_value(t, cfg.blocking.lists[0].file, "")
 	}
 	for list in ([]string{"{url: \"ftp://lists.example/hosts\"}", "{url: \"lists.example/hosts\"}"}) {
-		_, lerr := load_string(
-			fmt.tprintf(MINIMAL + "blocking:\n  lists:\n    - %s\n", list),
-			context.temp_allocator,
-		)
-		_, has := lerr.?
-		testing.expectf(t, has, "%s was accepted", list)
+		expect_refused(t, fmt.tprintf(MINIMAL + "blocking:\n  lists:\n    - %s\n", list), "blocking.lists[0].url: " + LIST_URL_RULE, exact = true)
 	}
 	free_all(context.temp_allocator)
 }

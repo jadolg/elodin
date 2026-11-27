@@ -262,8 +262,7 @@ test_format_prefix_round_trips :: proc(t: ^testing.T) {
 	for c in cases {
 		testing.expect_value(t, format_prefix(prefix(t, c), context.temp_allocator), c)
 	}
-	// The v6 text is whatever the standard shortening makes of it, so only the
-	// length is asserted literally.
+	// The v6 text is the standard shortening of it.
 	testing.expect_value(t, format_prefix(prefix(t, "fe80::/10"), context.temp_allocator), "fe80::/10")
 }
 
@@ -271,7 +270,7 @@ test_format_prefix_round_trips :: proc(t: ^testing.T) {
 `format_prefix` returns one string and keeps nothing.
 
 The IPv6 path builds the address text before the text with the length on it, and
-`aprintf` copies the first into the second. Both callers happen to pass an
+`aprintf` copies the first into the second. Its callers happen to pass an
 allocator that is thrown away wholesale, which is exactly the condition under
 which a leak in a procedure taking an arbitrary allocator goes unnoticed - so it
 is measured here rather than left to them.

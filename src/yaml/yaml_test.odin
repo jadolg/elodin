@@ -10,14 +10,7 @@ import "core:time"
 at :: proc(n: ^Node, path: string) -> ^Node {
 	cur := n
 	rest := path
-	for len(rest) > 0 && cur != nil {
-		key := rest
-		if idx := strings.index_byte(rest, '.'); idx >= 0 {
-			key = rest[:idx]
-			rest = rest[idx + 1:]
-		} else {
-			rest = ""
-		}
+	for key in strings.split_iterator(&rest, ".") {
 		cur = get(cur, key)
 	}
 	return cur
@@ -975,20 +968,20 @@ surrogate half, which is not a character.
 test_hex_escapes_are_code_points_of_hex_digits :: proc(t: ^testing.T) {
 	root, err := parse("a: \"caf\\xe9\"\nb: \"\\u00e9\\x41\"\nc: \"\\U0001F600\"\n", context.temp_allocator)
 	if testing.expectf(t, err == nil, "parse failed: %v", err) {
-		a, _ := as_string(get(root, "a"))
-		testing.expect_value(t, a, "café")
-		b, _ := as_string(get(root, "b"))
-		testing.expect_value(t, b, "éA")
-		c, _ := as_string(get(root, "c"))
-		testing.expect_value(t, c, "\U0001F600")
+		a, a_ok := as_string(get(root, "a"))
+		testing.expectf(t, a_ok && a == "café", "a read as %q (%v)", a, a_ok)
+		b, b_ok := as_string(get(root, "b"))
+		testing.expectf(t, b_ok && b == "éA", "b read as %q (%v)", b, b_ok)
+		c, c_ok := as_string(get(root, "c"))
+		testing.expectf(t, c_ok && c == "\U0001F600", "c read as %q (%v)", c, c_ok)
 	}
 	free_all(context.temp_allocator)
 
 	// The single-character escapes of section 5.7 beside them.
 	named, nerr := parse("a: \"\\a\\b\\e\\f\\v\\ \\\t\\N\\_\\L\\P\"\n", context.temp_allocator)
 	if testing.expectf(t, nerr == nil, "parse failed: %v", nerr) {
-		a, _ := as_string(get(named, "a"))
-		testing.expect_value(t, a, "\a\b\e\f\v \t\u0085\u00a0\u2028\u2029")
+		a, ok := as_string(get(named, "a"))
+		testing.expectf(t, ok && a == "\a\b\e\f\v \t\u0085\u00a0\u2028\u2029", "a read as %q (%v)", a, ok)
 	}
 	free_all(context.temp_allocator)
 

@@ -3,6 +3,7 @@ package filter
 import "core:strings"
 import "elodin:dns"
 import "elodin:netx"
+import "elodin:yaml"
 
 Format :: enum u8 {
 	Auto,
@@ -34,7 +35,7 @@ read as one, it drops that rule, or hides a line from `detect_format`. A list
 built by joining such files holds one at the start of each, so it is cut from
 every line.
 */
-BOM :: "\xef\xbb\xbf"
+BOM :: yaml.BYTE_ORDER_MARK
 
 @(private)
 is_housekeeping_name :: proc(s: string) -> bool {

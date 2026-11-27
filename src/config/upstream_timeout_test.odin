@@ -35,12 +35,11 @@ test_an_upstream_timeout_outside_1ms_to_24h_is_refused :: proc(t: ^testing.T) {
 	// A route whose timeout does not parse is reported once, as that, even
 	// when the figure it would otherwise inherit was refused.
 	{
-		_, err := load_string(
-			"upstream:\n  timeout: 0s\n  servers: [1.1.1.1]\n  zones:\n    - domains: [home.arpa]\n      timeout: soon\n      servers: [192.168.1.1]\n",
-			context.temp_allocator,
-		)
-		e, has := err.?
-		if testing.expect(t, has, "an unparsable route timeout was accepted") {
+		src := "upstream:\n  timeout: 0s\n  servers: [1.1.1.1]\n  zones:\n    - domains: [home.arpa]\n      timeout: soon\n      servers: [192.168.1.1]\n"
+		expect_refused(t, src, "upstream.timeout must be from 1ms to 24h", prefix = true)
+		expect_refused(t, src, "upstream.zones[0].timeout: expected a duration", prefix = true)
+		_, err := load_string(src, context.temp_allocator)
+		if e, has := err.?; has {
 			testing.expectf(t, len(e.messages) == 2, "want the top level's refusal and the route's parse error: %v", e.messages)
 		}
 	}

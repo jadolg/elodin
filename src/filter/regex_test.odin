@@ -472,7 +472,6 @@ through takes tens of them.
 */
 @(test)
 test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
-	MARK :: 0xa5
 	scratch := make([]u8, 1 << 20)
 	defer delete(scratch)
 	block, allow := set_make(), set_make()
@@ -499,17 +498,23 @@ test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
 		// tens of thousands of instructions.
 		"/(abcdefghijklmnopqrstuvwxyzabcdef){1000}/",
 	}
-	for rule in bombs {
-		// Past the arena's own header at the front of the buffer.
+	// Parses `rule` into a freshly marked scratch: what it added, and how far
+	// into the scratch it reached, past the arena's own header.
+	scratch_used :: proc(scratch: []u8, block, allow: ^Set, rule: string) -> (n, used: int) {
+		MARK :: 0xa5
 		body := scratch[size_of(virtual.Memory_Block):]
 		for &b in body {
 			b = MARK
 		}
-		n := parse_rule(block, allow, rule)
-		used := len(body)
+		n = parse_rule(block, allow, rule)
+		used = len(body)
 		for used > 0 && body[used - 1] == MARK {
 			used -= 1
 		}
+		return
+	}
+	for rule in bombs {
+		n, used := scratch_used(scratch, block, allow, rule)
 		testing.expectf(t, n == 0, "%q was added", rule)
 		testing.expectf(t, used < 8 * 1024, "%q took %d bytes of scratch to refuse", rule, used)
 	}
@@ -531,15 +536,7 @@ test_regex_repetition_is_bounded_before_compiling :: proc(t: ^testing.T) {
 		fmt.tprintf("/%s/", strings.repeat("[", MAX_REGEX_PATTERN, context.temp_allocator)),
 	}
 	for rule in deep {
-		body := scratch[size_of(virtual.Memory_Block):]
-		for &b in body {
-			b = MARK
-		}
-		parse_rule(block, allow, rule)
-		used := len(body)
-		for used > 0 && body[used - 1] == MARK {
-			used -= 1
-		}
+		_, used := scratch_used(scratch, block, allow, rule)
 		// Linear in the pattern: about 84 bytes of scratch per pattern byte at
 		// the deepest nesting. Anything that grows faster reaches the 1 MiB
 		// arena well before it reaches this.

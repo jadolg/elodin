@@ -126,32 +126,11 @@ errno_of :: proc(ret: int) -> linux.Errno {
 @(private = "file")
 CLONE_NEWUSER :: 0x10000000
 @(private = "file")
-SIGCHLD :: 17
-@(private = "file")
-AF_UNIX :: 1
-@(private = "file")
-SOCK_RAW :: 3
-@(private = "file")
-IPPROTO_ICMP :: 1
-@(private = "file")
-IPPROTO_SCTP :: 132
-@(private = "file")
 IPPROTO_UDPLITE :: 136
-@(private = "file")
-SCHED_IDLE :: 5
-@(private = "file")
-SCHED_BATCH :: 3
 @(private = "file")
 SOCK_NONBLOCK :: 0o4000
 @(private = "file")
 SOCK_CLOEXEC :: 0o2000000
-// An option off the list at both levels: SO_KEEPALIVE under SOL_SOCKET, and
-// TCP_DEFER_ACCEPT, the same number, under IPPROTO_TCP. TCP_NODELAY's
-// number under SOL_SOCKET is SO_DEBUG: an option on the list, at the wrong level.
-@(private = "file")
-SO_KEEPALIVE :: 9
-@(private = "file")
-RLIMIT_NOFILE :: 7
 
 // What the filter lets through, and how it refuses what it refuses with an
 // error rather than the kill.
@@ -164,41 +143,44 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 		failed: u8
 		self := uintptr(linux.getpid())
 		// Bit 1: the stream socket, or the options set on it.
-		if fd := linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_STREAM), uintptr(0)); fd < 0 {
+		if fd := linux.syscall(linux.SYS_socket, uintptr(linux.Address_Family.INET), uintptr(linux.Socket_Type.STREAM), uintptr(0)); fd < 0 {
 			failed |= 1 << 1
 		} else {
 			defer linux.close(linux.Fd(fd))
 			tv: [2]i64
 			one: i32 = 1
-			set :: proc(fd: int, level, name: u32, value: rawptr, size: int) -> linux.Errno {
+			set :: proc(fd: int, level: linux.Socket_API_Level, name: $N, value: rawptr, size: int) -> linux.Errno {
 				return errno_of(linux.syscall(linux.SYS_setsockopt, uintptr(fd), uintptr(level), uintptr(name), value, uintptr(size)))
 			}
-			if set(fd, SOL_SOCKET, SO_RCVTIMEO_OLD, &tv, size_of(tv)) != .NONE ||
-			   set(fd, IPPROTO_TCP, TCP_NODELAY, &one, size_of(one)) != .NONE ||
-			   set(fd, SOL_SOCKET, SO_KEEPALIVE, &one, size_of(one)) != .EPERM ||
-			   set(fd, IPPROTO_TCP, SO_KEEPALIVE, &one, size_of(one)) != .EPERM ||
-			   set(fd, SOL_SOCKET, TCP_NODELAY, &one, size_of(one)) != .EPERM {
+			// Off the list at both levels: SO_KEEPALIVE under SOL_SOCKET, and
+			// TCP_DEFER_ACCEPT, the same number, under IPPROTO_TCP. TCP_NODELAY's
+			// number under SOL_SOCKET is SO_DEBUG: an option on the list, at the wrong level.
+			if set(fd, .SOCKET, linux.Socket_Option.RCVTIMEO_OLD, &tv, size_of(tv)) != .NONE ||
+			   set(fd, .TCP, linux.Socket_TCP_Option.NODELAY, &one, size_of(one)) != .NONE ||
+			   set(fd, .SOCKET, linux.Socket_Option.KEEPALIVE, &one, size_of(one)) != .EPERM ||
+			   set(fd, .TCP, linux.Socket_Option.KEEPALIVE, &one, size_of(one)) != .EPERM ||
+			   set(fd, .SOCKET, linux.Socket_TCP_Option.NODELAY, &one, size_of(one)) != .EPERM {
 				failed |= 1 << 1
 			}
 		}
-		if errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_UNIX), uintptr(SOCK_DGRAM), uintptr(0))) != .EAFNOSUPPORT {
+		if errno_of(linux.syscall(linux.SYS_socket, uintptr(linux.Address_Family.UNIX), uintptr(linux.Socket_Type.DGRAM), uintptr(0))) != .EAFNOSUPPORT {
 			failed |= 1 << 2
 		}
 		// A protocol of its own module refused; TCP named outright allowed.
-		if errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_STREAM), uintptr(IPPROTO_SCTP))) != .EPERM ||
-		   errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_INET6), uintptr(SOCK_DGRAM), uintptr(IPPROTO_UDPLITE))) != .EPERM {
+		if errno_of(linux.syscall(linux.SYS_socket, uintptr(linux.Address_Family.INET), uintptr(linux.Socket_Type.STREAM), uintptr(linux.Protocol.SCTP))) != .EPERM ||
+		   errno_of(linux.syscall(linux.SYS_socket, uintptr(linux.Address_Family.INET6), uintptr(linux.Socket_Type.DGRAM), uintptr(IPPROTO_UDPLITE))) != .EPERM {
 			failed |= 1 << 2
 		}
-		if fd := linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_STREAM), uintptr(IPPROTO_TCP)); fd < 0 {
+		if fd := linux.syscall(linux.SYS_socket, uintptr(linux.Address_Family.INET), uintptr(linux.Socket_Type.STREAM), uintptr(linux.Protocol.TCP)); fd < 0 {
 			failed |= 1 << 2
 		} else {
 			linux.close(linux.Fd(fd))
 		}
 		// Raw refused whoever asks; a datagram socket with its flags allowed.
-		if errno_of(linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_RAW), uintptr(IPPROTO_ICMP))) != .EPERM {
+		if errno_of(linux.syscall(linux.SYS_socket, uintptr(linux.Address_Family.INET), uintptr(linux.Socket_Type.RAW), uintptr(linux.Protocol.ICMP))) != .EPERM {
 			failed |= 1 << 2
 		}
-		if fd := linux.syscall(linux.SYS_socket, uintptr(AF_INET6), uintptr(SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC), uintptr(0)); fd < 0 {
+		if fd := linux.syscall(linux.SYS_socket, uintptr(linux.Address_Family.INET6), uintptr(linux.Socket_Type.DGRAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, uintptr(0)); fd < 0 {
 			failed |= 1 << 2
 		} else {
 			linux.close(linux.Fd(fd))
@@ -208,7 +190,7 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 		}
 		// SIGCHLD as the exit signal; a filter that let it through would have
 		// made a child, which leaves at once.
-		ret := linux.syscall(linux.SYS_clone, uintptr(CLONE_NEWUSER | SIGCHLD), uintptr(0), uintptr(0), uintptr(0), uintptr(0))
+		ret := linux.syscall(linux.SYS_clone, CLONE_NEWUSER | uintptr(linux.Signal.SIGCHLD), uintptr(0), uintptr(0), uintptr(0), uintptr(0))
 		if ret == 0 {
 			linux.exit_group(0)
 		}
@@ -223,12 +205,19 @@ test_the_filter_answers_by_the_call_and_its_arguments :: proc(t: ^testing.T) {
 			failed |= 1 << 5
 		}
 		limit: [2]u64
-		if linux.syscall(linux.SYS_prlimit64, uintptr(0), uintptr(RLIMIT_NOFILE), uintptr(0), &limit) != 0 ||
-		   errno_of(linux.syscall(linux.SYS_prlimit64, uintptr(1), uintptr(RLIMIT_NOFILE), uintptr(0), &limit)) != .EPERM ||
-		   errno_of(linux.syscall(linux.SYS_prlimit64, self, uintptr(RLIMIT_NOFILE), uintptr(0), &limit)) != .EPERM {
+		if linux.syscall(linux.SYS_prlimit64, uintptr(0), uintptr(linux.RLimit_Kind.NOFILE), uintptr(0), &limit) != 0 ||
+		   errno_of(linux.syscall(linux.SYS_prlimit64, uintptr(1), uintptr(linux.RLimit_Kind.NOFILE), uintptr(0), &limit)) != .EPERM ||
+		   errno_of(linux.syscall(linux.SYS_prlimit64, self, uintptr(linux.RLimit_Kind.NOFILE), uintptr(0), &limit)) != .EPERM {
 			failed |= 1 << 6
 		}
 		return failed
+	}
+	// The raw socket's EPERM is the filter's only where this run opens one
+	// without it; without CAP_NET_RAW the kernel refuses it the same way.
+	if fd := linux.syscall(linux.SYS_socket, uintptr(linux.Address_Family.INET), uintptr(linux.Socket_Type.RAW), uintptr(linux.Protocol.ICMP)); fd < 0 {
+		fmt.eprintfln("sandbox: this run cannot open a raw socket (%v), so the raw-socket refusal is not the filter's here", linux.Errno(-fd))
+	} else {
+		linux.close(linux.Fd(fd))
 	}
 	if out, ok := run_child(t, body); ok {
 		expect_passed(t, out)
@@ -277,7 +266,7 @@ test_the_filter_lets_threads_start_and_refuses_a_fork :: proc(t: ^testing.T) {
 			return 1
 		}
 		failed: u8
-		ret := linux.syscall(linux.SYS_clone, uintptr(SIGCHLD), uintptr(0), uintptr(0), uintptr(0), uintptr(0))
+		ret := linux.syscall(linux.SYS_clone, uintptr(linux.Signal.SIGCHLD), uintptr(0), uintptr(0), uintptr(0), uintptr(0))
 		if ret == 0 {
 			linux.exit_group(0)
 		}
@@ -297,8 +286,8 @@ test_the_filter_lets_threads_start_and_refuses_a_fork :: proc(t: ^testing.T) {
 		}
 		// A thread's policy may be set as glibc sets it, and only to that.
 		param: [1]i32
-		if linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(SCHED_OTHER), &param) != 0 ||
-		   errno_of(linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(SCHED_IDLE), &param)) != .EPERM {
+		if linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(linux.Sched_Policy.OTHER), &param) != 0 ||
+		   errno_of(linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(linux.Sched_Policy.IDLE), &param)) != .EPERM {
 			failed |= 1 << 4
 		}
 		return failed
@@ -405,14 +394,8 @@ remove_scratch :: proc(t: ^testing.T, dir: string) {
 	if dir == "" {
 		return
 	}
-	entries, err := os.read_directory_by_path(dir, -1, context.temp_allocator)
-	testing.expectf(t, err == nil, "cannot list %s: %v", dir, err)
-	for e in entries {
-		rerr := os.remove(e.fullpath)
-		testing.expectf(t, rerr == nil, "cannot remove %s: %v", e.fullpath, rerr)
-	}
-	derr := os.remove(dir)
-	testing.expectf(t, derr == nil, "cannot remove %s: %v", dir, derr)
+	err := os.remove_all(dir)
+	testing.expectf(t, err == nil, "cannot remove %s: %v", dir, err)
 }
 
 @(private = "file")
@@ -599,7 +582,7 @@ test_the_refusal_hint_names_the_sandbox_only_when_it_may_be_why :: proc(t: ^test
 test_the_program_fits_its_buffer :: proc(t: ^testing.T) {
 	when AUDIT_ARCH != 0 {
 		program: [PROGRAM_MAX]Sock_Filter
-		n := build_program(program[:], 1, SCHED_OTHER)
+		n := build_program(program[:], 1, u32(linux.Sched_Policy.OTHER))
 		testing.expectf(t, n > 0 && n <= len(program), "%d instructions for a buffer of %d", n, len(program))
 	}
 }
@@ -613,7 +596,7 @@ allowed too; another still is not.
 test_the_filter_lets_threads_start_under_the_processs_policy :: proc(t: ^testing.T) {
 	body :: proc(_: []string) -> u8 {
 		param: [1]i32
-		if linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(SCHED_BATCH), &param) != 0 {
+		if linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(linux.Sched_Policy.BATCH), &param) != 0 {
 			return 4
 		}
 		if !install_filter() {
@@ -627,8 +610,8 @@ test_the_filter_lets_threads_start_under_the_processs_policy :: proc(t: ^testing
 			thread.join(started)
 			thread.destroy(started)
 		}
-		if linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(SCHED_BATCH), &param) != 0 ||
-		   errno_of(linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(SCHED_IDLE), &param)) != .EPERM {
+		if linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(linux.Sched_Policy.BATCH), &param) != 0 ||
+		   errno_of(linux.syscall(linux.SYS_sched_setscheduler, uintptr(0), uintptr(linux.Sched_Policy.IDLE), &param)) != .EPERM {
 			failed |= 1 << 2
 		}
 		return failed
@@ -659,15 +642,4 @@ test_the_filter_lets_a_directory_be_removed :: proc(t: ^testing.T) {
 		expect_passed(t, out)
 	}
 	testing.expect(t, !os.exists(dir), "the directory is still there")
-}
-
-// What the raw-socket check is about: without a filter, this run can open one.
-@(test)
-test_a_raw_socket_opens_without_the_filter :: proc(t: ^testing.T) {
-	fd := linux.syscall(linux.SYS_socket, uintptr(AF_INET), uintptr(SOCK_RAW), uintptr(IPPROTO_ICMP))
-	if fd < 0 {
-		fmt.eprintfln("sandbox: this run cannot open a raw socket (%v), so refusing one proves less here", linux.Errno(-fd))
-		return
-	}
-	linux.close(linux.Fd(fd))
 }

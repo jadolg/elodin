@@ -76,6 +76,24 @@ ADDED = [
 ]
 
 
+# Added code only: comments and strings may name the figure. A `::` line is the
+# constant declaring it.
+SIZE_LITERAL = ("size-literal", r"^(?!.*::).*?(?<![\w.])(512|1232|65535)(?![\w.])", lambda p: True,
+                "name the size: dns.MAX_UDP_SIZE, config.DEFAULT_MAX_UDP_RESPONSE, server.UPSTREAM_UDP_SIZE, dns.MAX_MESSAGE")
+
+
+def code_only(source):
+    """`source` with its comments and literals blanked, line breaks kept."""
+    return NOT_CODE.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), source).splitlines()
+
+
+def check_code(path, n, text, code, hits):
+    """The rules that read code, not comments or literals, on added line `n` (`text` as written)."""
+    name, pattern, applies, message = SIZE_LITERAL
+    if n <= len(code) and applies(path) and not ALLOW.search(text) and re.search(pattern, code[n - 1]):
+        hits.append(f"{path}:{n}: {name}: {message}\n    {text.strip()}")
+
+
 def odin_files():
     out = subprocess.run(["git", "ls-files", "src/*.odin", "scripts/*.odin"], cwd=ROOT,  # nosec B603 B607
                          capture_output=True, text=True, check=True).stdout
@@ -245,8 +263,13 @@ def main():
             check(TREE, path, n, text, hits)
         expect_formats(path, source, hits)
     test_only_procs(sources, hits)
+    code = {}
     for path, n, text in added_lines(resolve_base()):
         check(ADDED, path, n, text, hits)
+        if path in sources:
+            if path not in code:
+                code[path] = code_only(sources[path])
+            check_code(path, n, text, code[path], hits)
     for h in hits:
         print(h, file=sys.stderr)
     if hits:

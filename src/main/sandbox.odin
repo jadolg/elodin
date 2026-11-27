@@ -1,5 +1,6 @@
 package main
 
+import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:slice"
@@ -84,20 +85,34 @@ the old one.
 */
 @(private)
 warn_unreachable_later :: proc(cfg: ^config.Config) {
+	for text in unreachable_later_warnings(cfg, context.temp_allocator) {
+		if text != "" {
+			logx.warnf("%s", text)
+		}
+	}
+}
+
+// What `warn_unreachable_later` says, "" where it says nothing: the cache
+// directory first, then the list host.
+@(private)
+unreachable_later_warnings :: proc(cfg: ^config.Config, allocator := context.allocator) -> (said: [2]string) {
 	if cache := cfg.blocking.cache_dir; !cfg.blocking.enabled && cache != "" && !os.exists(cache) {
-		logx.warnf(
+		said[0] = fmt.aprintf(
 			"server.sandbox: blocking.cache_dir %q does not exist, so a reload that turns blocking on cannot keep copies of the lists until a restart",
 			cache,
+			allocator = allocator,
 		)
 	}
 	if cfg.server.sandbox == .Strict && len(cfg.upstream.bootstrap) == 0 {
 		if host, found := system_resolved_list_host(cfg); found {
-			logx.warnf(
+			said[1] = fmt.aprintf(
 				"server.sandbox: list host %q is resolved through /etc/resolv.conf, which strict reads only as it is now; set upstream.bootstrap so a resolver that rewrites it later does not stop the downloads",
 				host,
+				allocator = allocator,
 			)
 		}
 	}
+	return
 }
 
 // The first host of a list URL that is a name rather than an address: what

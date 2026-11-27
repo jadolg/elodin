@@ -2,6 +2,7 @@ package config
 
 import "core:strings"
 import "core:testing"
+import "elodin:sandbox"
 
 // Basic unless the file says otherwise; each mode by name, in any case.
 @(test)
@@ -11,7 +12,7 @@ test_server_sandbox_reads_its_three_modes :: proc(t: ^testing.T) {
 	}
 	Case :: struct {
 		value: string,
-		mode:  type_of(Server_Config{}.sandbox),
+		mode:  sandbox.Mode,
 	}
 	for c in ([]Case{{"off", .Off}, {"basic", .Basic}, {"strict", .Strict}, {"Strict", .Strict}, {"\"off\"", .Off}}) {
 		src := strings.concatenate({MINIMAL, "server:\n  sandbox: ", c.value, "\n"}, context.temp_allocator)
