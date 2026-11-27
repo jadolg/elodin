@@ -104,7 +104,7 @@ test_age_ttls_holds_a_soa_to_minimum_only_in_a_denial :: proc(t: ^testing.T) {
 	}
 	age_ttls(wire, 250)
 	got, derr := decode_message(wire, context.temp_allocator)
-	if !testing.expectf(t, derr == .None && len(got.authority) == 1, "the aged reply does not decode: %v", derr) {
+	if !testing.expectf(t, derr == .None && len(got.answer) == 1 && len(got.authority) == 1, "the aged reply does not decode: %v", derr) {
 		return
 	}
 	testing.expect_value(t, got.answer[0].ttl, u32(350))

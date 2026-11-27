@@ -1647,6 +1647,20 @@ test_udp_answer_over_the_advertised_size_falls_back_to_tcp :: proc(t: ^testing.T
 	}
 	udp_thread := thread.create_and_start_with_poly_data(&m.big, big_reply_loop)
 	tcp_thread := thread.create_and_start_with_poly_data(&m, overrun_tcp_once)
+	if !testing.expect(t, udp_thread != nil && tcp_thread != nil, "cannot start the mocks") {
+		sync.atomic_store(&m.stop, true)
+		if udp_thread != nil {
+			thread.join(udp_thread)
+			thread.destroy(udp_thread)
+		}
+		if tcp_thread != nil {
+			thread.join(tcp_thread)
+			thread.destroy(tcp_thread)
+		}
+		net.close(udp)
+		net.close(listener)
+		return
+	}
 	defer {
 		sync.atomic_store(&m.stop, true)
 		thread.join(udp_thread)

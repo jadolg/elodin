@@ -3,6 +3,7 @@ package tlsx
 import "core:bytes"
 import "core:c"
 import "core:fmt"
+import "core:math/rand"
 import "core:mem"
 import "core:net"
 import "core:os"
@@ -136,14 +137,18 @@ generate_certs :: proc() {
 	still move a fresh one aside; upgrade to renameat2's RENAME_EXCHANGE if that
 	is ever seen.
 	*/
-	pid := posix.getpid()
-	if os.exists(CERT_DIR) && !usable_pair(cert_path, key_path) {
-		aside := fmt.tprintf("%s-stale-%d", CERT_DIR, pid)
+	// The pid and a random suffix: two runs in different pid namespaces sharing
+	// /tmp can have the same pid.
+	run := fmt.tprintf("%d-%x", posix.getpid(), rand.uint64())
+	// Only a pair openssl calls expired is moved aside. A directory with no pair
+	// yet may be one an older checkout's run is still filling.
+	if os.exists(cert_path) && os.exists(key_path) && !cert_still_valid(cert_path) {
+		aside := fmt.tprintf("%s-stale-%s", CERT_DIR, run)
 		if os.rename(CERT_DIR, aside) == nil {
 			_ = os.remove_all(aside) // lint:allow a stale pair left behind is only litter in the temp directory
 		}
 	}
-	made := fmt.tprintf("%s-%d", CERT_DIR, pid)
+	made := fmt.tprintf("%s-%s", CERT_DIR, run)
 	if !self_signed(made, fmt.tprintf("%s/cert.pem", made), fmt.tprintf("%s/key.pem", made), CERT_DAYS, "/CN=elodin.local", ELODIN_SAN) {
 		_ = os.remove_all(made) // lint:allow a failed attempt left behind is only litter in the temp directory
 		return

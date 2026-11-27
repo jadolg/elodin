@@ -35,7 +35,10 @@ deadline_query :: proc() -> []u8 {
 		question = []dns.Question{{name = "hole.example.test.", type = .A, class = .IN}},
 	}
 	msg.flags.rd = true
-	wire, _, _ := dns.encode_message(msg, context.temp_allocator)
+	wire, _, err := dns.encode_message(msg, context.temp_allocator)
+	if err != .None {
+		panic("the deadline query does not encode")
+	}
 	return wire
 }
 

@@ -51,6 +51,8 @@ frozen_clock :: proc "contextless" () -> loop.Tick {
 start_reader :: proc(t: ^testing.T, u: ^Upstream, stream: Stream) -> (r: Reader_Loop, ok: bool) {
 	l, made := loop.make_loop()
 	if !testing.expect(t, made, "no loop") {
+		stream := stream
+		stream_close(&stream)
 		return
 	}
 	l.clock = frozen_clock
@@ -83,6 +85,9 @@ start_reader :: proc(t: ^testing.T, u: ^Upstream, stream: Stream) -> (r: Reader_
 		if st.hc == nil {
 			stream := stream
 			stream_close(&stream)
+		} else {
+			// The connection took the stream before the wait ran out.
+			retire_h2_conn(st.hc)
 		}
 		return {}, false
 	}
@@ -125,7 +130,10 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 		return
 	}
 	defer net.close(listener)
-	bound, _ := net.bound_endpoint(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
 
 	u, uerr := make_upstream(
 		config.Upstream_Spec{name = "retire", kind = .TCP, address = "127.0.0.1", port = bound.port, hostname = "doh.invalid", path = "/dns-query"},
@@ -192,6 +200,9 @@ replace_dead_h2 :: proc(t: ^testing.T, reader_gone: bool) {
 		rep.conn, _, _ = get_h2_conn(rep.u, 200 * time.Millisecond, 20 * time.Millisecond) // lint:allow what the redial comes to is beside the point: it is refused
 		sync.sema_post(&rep.done)
 	})
+	if !testing.expect(t, th != nil, "cannot start the redial") {
+		return
+	}
 	returned := sync.sema_wait_with_timeout(&rep.done, 5 * time.Second)
 	readers := h2_readers_running(u)
 	sync.sema_post(&hold.release)
@@ -238,7 +249,10 @@ test_finished_h2_readers_leave_no_count_behind :: proc(t: ^testing.T) {
 		return
 	}
 	defer net.close(listener)
-	bound, _ := net.bound_endpoint(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
 	u, uerr := make_upstream(
 		config.Upstream_Spec{name = "reap", kind = .TCP, address = "127.0.0.1", port = bound.port, hostname = "doh.invalid", path = "/dns-query"},
 		8,
@@ -358,7 +372,10 @@ test_a_cancelled_h2_reader_leaves_its_loop :: proc(t: ^testing.T) {
 		return
 	}
 	defer net.close(listener)
-	bound, _ := net.bound_endpoint(listener)
+	bound, berr := net.bound_endpoint(listener)
+	if !testing.expectf(t, berr == nil, "cannot read the listener's port: %v", berr) {
+		return
+	}
 	u, uerr := make_upstream(
 		config.Upstream_Spec{name = "cancelled", kind = .TCP, address = "127.0.0.1", port = bound.port, hostname = "doh.invalid", path = "/dns-query"},
 		8,

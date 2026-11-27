@@ -195,6 +195,9 @@ exchange_with_peer :: proc(
 		trailers = trailers,
 	}
 	peer := thread.create_and_start_with_poly_data(&p, refusing_peer_run)
+	if !testing.expect(t, peer != nil, "cannot start the peer") {
+		return .IO_Error, 0, 0
+	}
 
 	u, uerr := make_upstream(
 		config.Upstream_Spec {
@@ -235,7 +238,11 @@ exchange_with_peer :: proc(
 	query.flags.rd = true
 	wire, _, enc := dns.encode_message(query, context.temp_allocator)
 	if !testing.expect_value(t, enc, dns.Encode_Error.None) {
-		return
+		// The peer reads from this frame until the connection goes down.
+		destroy(u)
+		thread.join(peer)
+		thread.destroy(peer)
+		return .IO_Error, 0, 0
 	}
 	body := make([]u8, len(wire), context.temp_allocator)
 	copy(body, wire)

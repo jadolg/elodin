@@ -22,7 +22,7 @@ Referral_Mock :: struct {
 
 @(private = "file")
 referral_loop :: proc(m: ^Referral_Mock) {
-	buf: [512]u8
+	buf: [dns.MAX_UDP_SIZE]u8
 	for !sync.atomic_load(&m.stop) {
 		n, client, err := net.recv_udp(m.socket, buf[:])
 		if err != nil || n < dns.HEADER_SIZE {
@@ -40,8 +40,11 @@ referral_loop :: proc(m: ^Referral_Mock) {
 		}
 		reply.flags.qr = true
 		reply.flags.rd = q.flags.rd
-		wire, _, _ := dns.encode_message(reply, context.temp_allocator)
-		_, _ = net.send_udp(m.socket, wire, client)
+		wire, _, enc := dns.encode_message(reply, context.temp_allocator)
+		if enc != .None {
+			panic("the referral does not encode")
+		}
+		_, _ = net.send_udp(m.socket, wire, client) // lint:allow a reply that does not go out reads as the referral never coming
 		free_all(context.temp_allocator)
 	}
 }
@@ -68,7 +71,10 @@ test_a_referral_is_not_taken_as_an_answer :: proc(t: ^testing.T) {
 	g := failover_group(servers)
 	query := dns.Message{id = 0x4104, question = []dns.Question{{name = "www.example.com.", type = .A, class = .IN}}}
 	query.flags.rd = true
-	wire, _, _ := dns.encode_message(query, context.temp_allocator)
+	wire, _, enc := dns.encode_message(query, context.temp_allocator)
+	if !testing.expect_value(t, enc, dns.Encode_Error.None) {
+		return
+	}
 
 	// A client's own question.
 	plain, plain_winner, plain_err := resolve_readable(&g, wire, context.allocator)

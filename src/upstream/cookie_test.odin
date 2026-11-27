@@ -190,8 +190,8 @@ test_upstream_cookie_is_sent_and_learned :: proc(t: ^testing.T) {
 	again, had_again := seen_cookie(&m)
 	if testing.expect(t, had_again, "the second query carried no cookie") {
 		testing.expect_value(t, len(again), COOKIE_CLIENT_LEN + COOKIE_SERVER_MIN)
-		testing.expect(t, mem.compare(again[8:], m.server[:]) == 0, "the server cookie was not sent back")
-		testing.expect(t, mem.compare(again[:8], asked) == 0, "the client cookie changed between queries")
+		testing.expect(t, mem.compare(again[COOKIE_CLIENT_LEN:], m.server[:]) == 0, "the server cookie was not sent back")
+		testing.expect(t, mem.compare(again[:COOKIE_CLIENT_LEN], asked) == 0, "the client cookie changed between queries")
 	}
 	free_all(context.temp_allocator)
 }
