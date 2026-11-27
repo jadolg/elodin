@@ -85,6 +85,8 @@ test_a_headers_fragment_is_held_to_its_framing_and_the_list_bound :: proc(t: ^te
 // RFC 9113 6.5.2: the SETTINGS values neither end may accept.
 @(test)
 test_setting_values_out_of_range_are_refused :: proc(t: ^testing.T) {
+	// The ceiling itself, 2^24 - 1, pinned to the RFC rather than read back.
+	testing.expect_value(t, MAX_FRAME_SIZE_LIMIT, (1 << 24) - 1)
 	cases := []struct {
 		id:    Setting,
 		value: u32,

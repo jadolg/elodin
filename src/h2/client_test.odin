@@ -385,8 +385,11 @@ test_client_response_past_max_body_is_too_large :: proc(t: ^testing.T) {
 		if started {
 			// The peak from here on: the peer's thread and listener are tracked
 			// too, and are no part of what the response grows.
+			// Under the tracker's lock: the client's reader allocates through it.
+			sync.mutex_lock(&held.mutex)
 			base := held.current_memory_allocated
 			held.peak_memory_allocated = base
+			sync.mutex_unlock(&held.mutex)
 			request := []u8{1, 2}
 			resp, err := client_request(
 				p.c,

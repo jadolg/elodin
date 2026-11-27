@@ -240,9 +240,9 @@ sweep_private_dirs :: proc(prefix: string) {
 // each message led by `what`. `dns`'s tests keep their own copy (see the
 // package doc).
 expect_no_leaks :: proc(t: ^testing.T, track: ^mem.Tracking_Allocator, what := "", loc := #caller_location) {
-	lead := fmt.tprintf("%s: ", what) if what != "" else ""
+	sep := ": " if what != "" else ""
 	for _, entry in track.allocation_map {
-		testing.expectf(t, false, "%s%d bytes leaked, allocated at %v", lead, entry.size, entry.location, loc = loc)
+		testing.expectf(t, false, "%s%s%d bytes leaked, allocated at %v", what, sep, entry.size, entry.location, loc = loc)
 	}
-	testing.expectf(t, len(track.bad_free_array) == 0, "%s%d bad frees", lead, len(track.bad_free_array), loc = loc)
+	testing.expectf(t, len(track.bad_free_array) == 0, "%s%s%d bad frees", what, sep, len(track.bad_free_array), loc = loc)
 }

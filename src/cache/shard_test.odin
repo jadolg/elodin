@@ -184,6 +184,7 @@ test_a_reload_hands_no_serial_out_twice :: proc(t: ^testing.T) {
 	highest: u64
 	key: string
 	for i in 0 ..< 200 {
+		defer free_all(context.temp_allocator)
 		name := fmt.tprintf("q%d.example.", i)
 		wire, msg := build_answer(name, 300, context.temp_allocator)
 		key = key_for(kb[:], name)
@@ -193,11 +194,11 @@ test_a_reload_hands_no_serial_out_twice :: proc(t: ^testing.T) {
 			continue
 		}
 		highest = max(highest, hit.serial)
-		free_all(context.temp_allocator)
 	}
 	opts.max_entries = 300
 	reconfigure(c, opts)
 	for i in 0 ..< 200 {
+		defer free_all(context.temp_allocator)
 		name := fmt.tprintf("q%d.example.", i)
 		wire, msg := build_answer(name, 300, context.temp_allocator)
 		key = key_for(kb[:], name)
@@ -207,7 +208,6 @@ test_a_reload_hands_no_serial_out_twice :: proc(t: ^testing.T) {
 			continue
 		}
 		testing.expectf(t, hit.serial > highest, "serial %d handed out again after a reload", hit.serial)
-		free_all(context.temp_allocator)
 	}
 }
 

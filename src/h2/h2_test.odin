@@ -1175,6 +1175,8 @@ record.
 @(test)
 test_dynamic_table_update_is_bounded_by_the_advertised_limit :: proc(t: ^testing.T) {
 	LIMIT :: DEFAULT_HEADER_TABLE_SIZE
+	// RFC 7541 section 4.2's initial table size, pinned rather than read back.
+	testing.expect_value(t, LIMIT, 4096)
 
 	Case :: struct {
 		size:     int,
