@@ -78,11 +78,14 @@ exchange_once :: proc(
 		reply  = reply,
 	}
 	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
+	if !testing.expect(t, mock != nil, "no mock thread") {
+		return nil, .Failed, false
+	}
 	response, got_outcome, done := handle_query(
 		&s,
 		test_query(HOSTILE_NAME, id = 0x2468),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	thread.join(mock)
@@ -185,9 +188,8 @@ stored. What is left is the copy handed to the client, and the section that copy
 is read for - the answer - sits before the point the walk gives up at. So it is
 bounded: `max(u32)` goes out at `cache.max_ttl`.
 
-Refused outright for a round, and three tests in this package say why it is not:
-an upstream or a middlebox mangling a section this server never reads is not
-grounds for making the name unresolvable. See `dns.cap_ttls`.
+Not refused outright: an upstream or a middlebox mangling a section this server
+never reads is not grounds for making the name unresolvable. See `dns.cap_ttls`.
 
 The offset is taken from the intact reply, because once the header is mangled
 nothing will walk the message far enough to find it - which is exactly the

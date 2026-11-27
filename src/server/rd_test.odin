@@ -19,7 +19,7 @@ makes a mistake in the gate's placement loud instead of a timeout.
 @(private = "file")
 rd_query :: proc(rd: bool, name := "example.com.", edns := false) -> []u8 {
 	if edns {
-		return test_query(name, id = 0x1234, rd = rd, opt = dns.make_opt(1232, false))
+		return test_query(name, id = 0x1234, rd = rd, opt = dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, false))
 	}
 	return test_query(name, id = 0x1234, rd = rd)
 }
@@ -29,7 +29,7 @@ test_rd_zero_is_refused_without_forwarding :: proc(t: ^testing.T) {
 	cfg: config.Config
 	s := local_server(&cfg)
 
-	out, outcome, ok := handle_query(&s, rd_query(false), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, rd_query(false), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expect(t, ok, "an RD=0 query went unanswered") {
 		return
 	}
@@ -54,7 +54,7 @@ test_rd_zero_refusal_echoes_edns :: proc(t: ^testing.T) {
 	cfg: config.Config
 	s := local_server(&cfg)
 
-	out, outcome, ok := handle_query(&s, rd_query(false, edns = true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, rd_query(false, edns = true), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expect(t, ok, "an RD=0 query with EDNS went unanswered") {
 		return
 	}
@@ -86,39 +86,24 @@ test_rd_zero_is_still_served_from_cache :: proc(t: ^testing.T) {
 	s.answers = answers
 
 	name := "example.com."
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record {
-		name  = name,
-		type  = .A,
-		class = .IN,
-		ttl   = 300,
-		data  = dns.Rdata_A{addr = {192, 0, 2, 1}},
-	}
-	stored := dns.Message {
-		id       = 0x1234,
-		question = []dns.Question{{name = name, type = .A, class = .IN}},
-		answer   = answer,
-	}
-	stored.flags.qr = true
-	stored.flags.ra = true
-	wire, _, enc := dns.encode_message(stored, context.temp_allocator)
-	if !testing.expect_value(t, enc, dns.Encode_Error.None) {
-		return
-	}
+	// RA set, as the upstream answered it.
+	wire := test_reply(name, .A, a_record(name, {192, 0, 2, 1}, ttl = 300))
 	// RD plays no part in `cache.make_key` - stored under a key an RD=1 lookup
 	// would have made too, which is what makes this hit reachable at all.
 	if !seed_cache(t, answers, name, wire) {
 		return
 	}
 
-	out, outcome, ok := handle_query(&s, rd_query(false, name), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, rd_query(false, name), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expect(t, ok, "the cached answer went unserved") {
 		return
 	}
 	testing.expect_value(t, outcome, Outcome.Cached)
 
 	served, serr := dns.decode_message(out, context.temp_allocator)
-	testing.expect_value(t, serr, dns.Decode_Error.None)
+	if !testing.expect_value(t, serr, dns.Decode_Error.None) {
+		return
+	}
 	testing.expect(
 		t,
 		served.flags.ra,
@@ -161,7 +146,7 @@ test_rd_zero_still_gets_blocked_and_rewritten_answers :: proc(t: ^testing.T) {
 		&s,
 		rd_query(false, "blocked.example.com."),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	testing.expect(t, blocked_ok, "an RD=0 query for a blocked name went unanswered")
@@ -171,7 +156,7 @@ test_rd_zero_still_gets_blocked_and_rewritten_answers :: proc(t: ^testing.T) {
 		&s,
 		rd_query(false, "rewritten.example."),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	testing.expect(t, rewritten_ok, "an RD=0 query for a rewritten name went unanswered")

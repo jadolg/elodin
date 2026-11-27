@@ -5,6 +5,7 @@ import "core:mem"
 import "core:testing"
 import "elodin:config"
 import "elodin:dns"
+import "elodin:testkit"
 
 /*
 A CNAME rewrite is answered with its target's records, not with the alias
@@ -174,8 +175,8 @@ test_a_long_rewrite_chain_stops_at_the_bound :: proc(t: ^testing.T) {
 }
 
 // RD=0 asks for nothing to be looked up elsewhere, and a target that is no rule
-// of ours could only be looked up elsewhere: the alias alone is the answer, as
-// it always was, and not the RD gate's refusal of the target.
+// of ours could only be looked up elsewhere: the alias alone is the answer, and
+// not the RD gate's refusal of the target.
 @(test)
 test_a_cname_rewrite_without_recursion_desired_is_the_alias_alone :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
@@ -206,31 +207,29 @@ test_a_cname_rewrite_to_a_refused_target_is_the_alias_alone :: proc(t: ^testing.
 @(test)
 test_a_chased_target_that_cannot_be_read_back_is_servfail :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
+	cfg: config.Config
+	s := local_server(&cfg)
 	cfg.rewrites = chase_rules()
-	s := Server {
-		cfg = &cfg,
-	}
 	questions := make([]dns.Question, 1, context.temp_allocator)
 	questions[0] = dns.Question{name = "old.lan.", type = .A, class = .IN}
 	msg := dns.Message{id = 0x3201, question = questions}
 	msg.flags.rd = true
 
-	plain, matched, alias := apply_rewrite(&s, msg, questions[0], context.temp_allocator, 512)
+	plain, matched, alias := apply_rewrite(&s, msg, questions[0], context.temp_allocator, dns.MAX_UDP_SIZE)
 	cname, is_alias := alias.?
 	if !testing.expect(t, matched && is_alias, "old.lan. should be answered by its alias") {
 		return
 	}
 	spent := dns.REQUEST_DECODE_BUDGET + 1
 	st := stage_state(&s, msg, &spent, context.temp_allocator)
-	out, _ := chase_rewrite_alias(&st, plain, cname)
+	out, counted := chase_rewrite_alias(&st, plain, cname)
 	resp, derr := dns.decode_message(out, context.temp_allocator)
 	if !testing.expect_value(t, derr, dns.Decode_Error.None) {
 		return
 	}
 	testing.expect_value(t, dns.Rcode(resp.flags.rcode), dns.Rcode.Serv_Fail)
+	// The SERVFAIL is the target's failure, counted there, not a rewrite.
+	testing.expect(t, counted && s.stats.failed == 1, "the failed target was not counted as one failure")
 	testing.expect_value(t, len(resp.answer), 1)
 }
 
@@ -303,13 +302,9 @@ chase_dry_sweep :: proc(
 	edns := false,
 	final := dns.Rcode.No_Error,
 ) {
-	cfg := config.default_config()
-	cfg.log.queries = false
-	cfg.cache.enabled = false
+	cfg: config.Config
+	s := local_server(&cfg)
 	cfg.rewrites = rules
-	s := Server {
-		cfg = &cfg,
-	}
 	questions := []dns.Question{{name = name, type = .A, class = .IN}}
 	msg := dns.Message{id = 0x3202, question = questions}
 	msg.flags.rd = true
@@ -317,7 +312,7 @@ chase_dry_sweep :: proc(
 	if edns {
 		msg.additional = opt
 	}
-	plain, matched, alias := apply_rewrite(&s, msg, questions[0], context.temp_allocator, 512)
+	plain, matched, alias := apply_rewrite(&s, msg, questions[0], context.temp_allocator, dns.MAX_UDP_SIZE)
 	cname, is_alias := alias.?
 	if !testing.expectf(t, matched && is_alias, "%s should be answered by its alias", name) {
 		return
@@ -326,8 +321,8 @@ chase_dry_sweep :: proc(
 	// Runs as well as single refusals: a refused reservation is retried by the
 	// append behind it, so an encode fails only when the grow is refused too.
 	for run in ([]int{1, 3}) do for n := 1; ; n += 1 {
-		f := Fail_Nth{fail_at = n, fail_for = run}
-		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
+		f := testkit.Fail_Nth{fail_at = n, fail_for = run}
+		one := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
 		spent := 0
 		before := chase_answers_counted(&s)
 		st := stage_state(&s, msg, &spent, one)
@@ -370,19 +365,16 @@ follows it.
 @(test)
 test_a_rewrite_that_runs_dry_stays_matched :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	cfg := config.default_config()
-	cfg.log.queries = false
+	cfg: config.Config
+	s := local_server(&cfg)
 	cfg.rewrites = chase_rules()
-	s := Server {
-		cfg = &cfg,
-	}
 	questions := []dns.Question{{name = "old.lan.", type = .A, class = .IN}}
 	msg := dns.Message{id = 0x3203, question = questions}
 	for run in ([]int{1, 2, 3, 8}) {
 		for from := 1; ; from += 1 {
-			f := Fail_Nth{fail_at = from, fail_for = run}
-			dry := mem.Allocator{procedure = fail_nth_proc, data = &f}
-			out, matched, _ := apply_rewrite(&s, msg, questions[0], dry, 512)
+			f := testkit.Fail_Nth{fail_at = from, fail_for = run}
+			dry := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
+			out, matched, _ := apply_rewrite(&s, msg, questions[0], dry, dns.MAX_UDP_SIZE) // lint:allow the alias is no part of what runs dry
 			if f.seen < from {
 				break
 			}
@@ -410,12 +402,9 @@ query it could not build, and not as a rewrite answered.
 @(test)
 test_a_rewrite_that_built_nothing_is_counted_failed :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	cfg := config.default_config()
-	cfg.log.queries = false
+	cfg: config.Config
+	s := local_server(&cfg)
 	cfg.rewrites = chase_rules()
-	s := Server {
-		cfg = &cfg,
-	}
 	questions := []dns.Question{{name = "old.lan.", type = .A, class = .IN}}
 	msg := dns.Message{id = 0x3204, question = questions}
 	msg.flags.rd = true
@@ -435,8 +424,8 @@ table, which says it has no PTR.
 @(test)
 test_a_reverse_rewrite_that_runs_dry_stays_matched :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	cfg := config.default_config()
-	cfg.log.queries = false
+	cfg: config.Config
+	s := local_server(&cfg)
 	rules := make([]config.Rewrite, 1, context.temp_allocator)
 	rules[0] = config.Rewrite {
 		domain  = "nas.lan.",
@@ -445,19 +434,16 @@ test_a_reverse_rewrite_that_runs_dry_stays_matched :: proc(t: ^testing.T) {
 		ptr     = true,
 	}
 	cfg.rewrites = rules
-	s := Server {
-		cfg = &cfg,
-	}
 	questions := []dns.Question{{name = "50.1.168.192.in-addr.arpa.", type = .PTR, class = .IN}}
 	msg := dns.Message{id = 0x3204, question = questions}
-	whole, whole_matched := apply_reverse_rewrite(&s, msg, questions[0], context.temp_allocator, 512)
+	whole, whole_matched := apply_reverse_rewrite(&s, msg, questions[0], context.temp_allocator, dns.MAX_UDP_SIZE)
 	if !testing.expect(t, whole_matched && len(whole) > 0, "nas.lan.'s address should be answered by its PTR") {
 		return
 	}
 	for run in ([]int{1, 3}) do for from := 1; ; from += 1 {
-		f := Fail_Nth{fail_at = from, fail_for = run}
-		dry := mem.Allocator{procedure = fail_nth_proc, data = &f}
-		out, matched := apply_reverse_rewrite(&s, msg, questions[0], dry, 512)
+		f := testkit.Fail_Nth{fail_at = from, fail_for = run}
+		dry := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
+		out, matched := apply_reverse_rewrite(&s, msg, questions[0], dry, dns.MAX_UDP_SIZE)
 		if f.seen < from {
 			break
 		}

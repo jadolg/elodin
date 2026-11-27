@@ -206,7 +206,7 @@ ask :: proc(c: ^Client) {
 	}
 	query := test_query(QNAME, id = c.id, opt = opt)
 	started := time.tick_now()
-	out, outcome, served := handle_query(c.srv, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, served := handle_query(c.srv, query, .UDP, TEST_CLIENT, context.temp_allocator)
 	c.took = time.tick_since(started)
 	c.outcome = outcome
 	if !served {
@@ -352,7 +352,7 @@ lead_by_hand :: proc(t: ^testing.T, srv: ^Server, b: Burst, ttl: u32, leader: ^F
 	if b.evicted == .None && !b.other_message {
 		return false
 	}
-	key := cache.make_key(key_buf, QNAME, .A, .IN, false, false)
+	key := cache.make_key(key_buf, QNAME, .A, .IN, false, checking_disabled = false)
 	joined, _ := flight_join(srv, key, leader) // lint:allow an uncounted join counts nothing
 	leading := testing.expect(t, joined == leader, "the hand-made leader did not get the flight")
 	if b.other_message {
@@ -957,7 +957,7 @@ test_a_follower_waits_no_longer_than_its_deadline_allows :: proc(t: ^testing.T) 
 	// The leader: in the table under the follower's key, and never landing
 	// until the follower has given up on it.
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
+	key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, checking_disabled = false)
 	leader: Flight
 	if joined, _ := flight_join(srv, key, &leader); !testing.expect(t, joined == &leader, "the leader did not get the flight") { // lint:allow an uncounted join counts nothing
 		return
@@ -965,7 +965,7 @@ test_a_follower_waits_no_longer_than_its_deadline_allows :: proc(t: ^testing.T) 
 	defer flight_land(srv, &leader)
 
 	started := time.tick_now()
-	out, _, ok := handle_query(srv, test_query(QNAME, id = 0x4460), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, _, ok := handle_query(srv, test_query(QNAME, id = 0x4460), .UDP, TEST_CLIENT, context.temp_allocator)
 	took := time.tick_since(started)
 
 	testing.expect(t, ok, "the follower got no answer at all")
@@ -1024,7 +1024,7 @@ test_a_follower_still_takes_an_answer_landing_just_past_its_deadline :: proc(t: 
 	answer := test_reply(QNAME, .A, a_record(QNAME, {192, 0, 2, 46}, ttl = 300))
 
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, false)
+	key := cache.make_key(key_buf[:], QNAME, .A, .IN, false, checking_disabled = false)
 	leader: Flight
 	if joined, _ := flight_join(srv, key, &leader); !testing.expect(t, joined == &leader, "the leader did not get the flight") { // lint:allow an uncounted join counts nothing
 		return
@@ -1035,7 +1035,7 @@ test_a_follower_still_takes_an_answer_landing_just_past_its_deadline :: proc(t: 
 	late := Late_Leader{srv = srv, flight = &leader, answer = answer, at = time.tick_add(time.tick_now(), 7 * TIMEOUT / 2)}
 	lander := thread.create_and_start_with_poly_data(&late, land_late)
 
-	out, outcome, ok := handle_query(srv, test_query(QNAME, id = 0x4462), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(srv, test_query(QNAME, id = 0x4462), .UDP, TEST_CLIENT, context.temp_allocator)
 	thread.join(lander)
 	thread.destroy(lander)
 

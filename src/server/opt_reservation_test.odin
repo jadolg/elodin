@@ -18,7 +18,7 @@ is room the encoder had already spent, so an answer fitted before the record was
 settled is packed against a ceiling lower than the one it goes out under.
 
 Unless that room is handed back to the records it was taken from, the client
-pays for it. Two ways, and three cases below - the second way twice, once for
+pays for it. Two ways, and three cases below - the first way twice, once for
 each of the two things that hand the room back:
 
   - a TCP round trip for records that fitted. The answer is cut and TC set, the
@@ -104,7 +104,7 @@ upstream_answer :: proc(records: int, extra: bool) -> []u8 {
 		code = u16(dns.EDNS_Option_Code.NSID),
 		data = nsid,
 	}
-	opt := dns.make_opt(1232, false)
+	opt := dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, false)
 	opt.data = dns.Rdata_OPT{options = options}
 
 	additional := make([dynamic]dns.Record, 0, 2, context.temp_allocator)
@@ -257,7 +257,7 @@ test_a_truncated_answer_is_filled_to_the_clients_datagram :: proc(t: ^testing.T)
 	advertised := u16(600)
 	if !testing.expectf(
 		t,
-		int(advertised) > 512 &&
+		int(advertised) > dns.MAX_UDP_SIZE &&
 		int(advertised) <= config.DEFAULT_MAX_UDP_RESPONSE &&
 		len(stored) > int(advertised),
 		"the answer is %d bytes, so %d is not the ceiling this cuts it to",
@@ -307,7 +307,7 @@ test_an_additional_record_is_not_dropped_for_options_that_are_stripped :: proc(t
 	advertised := u16(len(stored) - OPTION_LEN)
 	if !testing.expectf(
 		t,
-		int(advertised) > 512 && int(advertised) <= config.DEFAULT_MAX_UDP_RESPONSE,
+		int(advertised) > dns.MAX_UDP_SIZE && int(advertised) <= config.DEFAULT_MAX_UDP_RESPONSE,
 		"the answer is %d bytes, so %d is not this client's limit",
 		len(stored),
 		int(advertised),
@@ -362,7 +362,7 @@ test_a_client_without_edns_is_cut_to_its_own_datagram :: proc(t: ^testing.T) {
 	// without EDNS can read, which is what makes this a truncation.
 	if !testing.expectf(
 		t,
-		len(stored) - dns.EMPTY_OPT_SIZE - OPTION_LEN > 512,
+		len(stored) - dns.EMPTY_OPT_SIZE - OPTION_LEN > dns.MAX_UDP_SIZE,
 		"the answer is %d bytes, so a 512-byte datagram holds it and nothing is cut",
 		len(stored),
 	) {
@@ -380,13 +380,13 @@ test_a_client_without_edns_is_cut_to_its_own_datagram :: proc(t: ^testing.T) {
 	testing.expect(t, r.answers > 0, "the whole answer section went, so this is not the case under test")
 	testing.expectf(
 		t,
-		r.answers == 33 || r.length + per_record > 512,
+		r.answers == 33 || r.length + per_record > dns.MAX_UDP_SIZE,
 		"the answer was cut to %d bytes with %d of its 33 records, and another %d-byte record would have fitted the client's 512",
 		r.length,
 		r.answers,
 		per_record,
 	)
-	testing.expectf(t, r.length <= 512, "the answer is %d bytes, past the 512 a client without EDNS can read", r.length)
+	testing.expectf(t, r.length <= dns.MAX_UDP_SIZE, "the answer is %d bytes, past the 512 a client without EDNS can read", r.length)
 
 	free_all(context.temp_allocator)
 }

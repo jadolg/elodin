@@ -12,6 +12,7 @@ import "core:time"
 import "elodin:config"
 import "elodin:dns"
 import "elodin:h2"
+import "elodin:testkit"
 import "elodin:tlsx"
 
 /*
@@ -99,45 +100,6 @@ test_a_reply_that_cannot_be_copied_is_not_an_empty_answer :: proc(t: ^testing.T)
 	}
 }
 
-// Fails `fail_for` requests from its `fail_at`th on and hands every other to
-// `backing`. The dns, dnssec and server packages keep their own copies: test
-// files cannot be shared across packages.
-@(private)
-Fail_Nth :: struct {
-	backing:  mem.Allocator,
-	seen:     int,
-	fail_at:  int,
-	fail_for: int,
-}
-
-@(private)
-fail_nth_proc :: proc(
-	data: rawptr,
-	mode: mem.Allocator_Mode,
-	size, alignment: int,
-	old_memory: rawptr,
-	old_size: int,
-	loc := #caller_location,
-) -> (
-	[]byte,
-	mem.Allocator_Error,
-) {
-	f := cast(^Fail_Nth)data
-	#partial switch mode {
-	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
-		f.seen += 1
-		if f.seen >= f.fail_at && f.seen < f.fail_at + f.fail_for {
-			return nil, .Out_Of_Memory
-		}
-	}
-	return f.backing.procedure(f.backing.data, mode, size, alignment, old_memory, old_size, loc)
-}
-
-@(private)
-fail_nth :: proc(f: ^Fail_Nth) -> mem.Allocator {
-	return {procedure = fail_nth_proc, data = f}
-}
-
 // A query with an OPT record, so a cookie and padding have somewhere to go, on
 // the heap: the tests run with the temp allocator refusing. The caller frees it.
 @(private = "file")
@@ -199,9 +161,9 @@ test_a_udp_query_without_room_is_not_sent :: proc(t: ^testing.T) {
 
 		// The first allocation alone: the cookie's copy where there is one, the
 		// reply buffer where not.
-		f := Fail_Nth{backing = context.temp_allocator, fail_at = 1, fail_for = 1}
+		f := testkit.Fail_Nth{backing = context.temp_allocator, fail_at = 1, fail_for = 1}
 		temp := context.temp_allocator
-		context.temp_allocator = fail_nth(&f)
+		context.temp_allocator = testkit.fail_nth(&f)
 		_, err := exchange(u, query, 300 * time.Millisecond, temp)
 		context.temp_allocator = temp
 		testing.expectf(t, err == .Out_Of_Memory, "cookies %v: %v", cookies, err)
@@ -275,9 +237,9 @@ test_an_encrypted_query_without_room_is_not_sent :: proc(t: ^testing.T) {
 		}
 		defer destroy(u)
 
-		f := Fail_Nth{backing = context.temp_allocator, fail_at = 1, fail_for = 1}
+		f := testkit.Fail_Nth{backing = context.temp_allocator, fail_at = 1, fail_for = 1}
 		temp := context.temp_allocator
-		context.temp_allocator = fail_nth(&f)
+		context.temp_allocator = testkit.fail_nth(&f)
 		_, err := exchange(u, query, time.Second, temp)
 		context.temp_allocator = temp
 		testing.expectf(t, err == .Out_Of_Memory, "%v: %v", kind, err)
@@ -345,9 +307,9 @@ test_a_group_without_room_asks_nobody :: proc(t: ^testing.T) {
 	for strategy in ([]config.Strategy{.Failover, .Race}) {
 		g := failover_group(servers, 50 * time.Millisecond)
 		g.strategy = strategy
-		f := Fail_Nth{backing = context.temp_allocator, fail_at = 1, fail_for = 2}
+		f := testkit.Fail_Nth{backing = context.temp_allocator, fail_at = 1, fail_for = 2}
 		temp := context.temp_allocator
-		context.temp_allocator = fail_nth(&f)
+		context.temp_allocator = testkit.fail_nth(&f)
 		_, _, err := resolve(&g, query, temp)
 		context.temp_allocator = temp
 		testing.expectf(t, err == .Out_Of_Memory, "%v: %v", strategy, err)
@@ -358,9 +320,9 @@ test_a_group_without_room_asks_nobody :: proc(t: ^testing.T) {
 	g := failover_group(servers, 50 * time.Millisecond)
 	g.strategy = .Race
 	for n in 1 ..= 3 {
-		f := Fail_Nth{backing = context.allocator, fail_at = n, fail_for = 1}
+		f := testkit.Fail_Nth{backing = context.allocator, fail_at = n, fail_for = 1}
 		heap := context.allocator
-		context.allocator = fail_nth(&f)
+		context.allocator = testkit.fail_nth(&f)
 		_, _, err := resolve_race(&g, query, time.Second, context.temp_allocator)
 		context.allocator = heap
 		testing.expectf(t, err == .Out_Of_Memory, "heap allocation %d refused: %v", n, err)
@@ -541,12 +503,12 @@ test_an_h2_connection_without_room_is_not_built :: proc(t: ^testing.T) {
 	// The connection, then its client: neither writes anything, so the stream
 	// is never touched.
 	for at in 1 ..= 2 {
-		f := Fail_Nth {
+		f := testkit.Fail_Nth {
 			backing  = mem.tracking_allocator(&track),
 			fail_at  = at,
 			fail_for = 1,
 		}
-		u.allocator = fail_nth(&f)
+		u.allocator = testkit.fail_nth(&f)
 		hc := make_h2_conn(u, Stream{})
 		u.allocator = heap
 		testing.expectf(t, hc == nil, "built with allocation %d refused", at)
@@ -651,12 +613,12 @@ test_an_h2_dial_without_room_is_closed :: proc(t: ^testing.T) {
 	u.tls_ctx = cctx
 
 	heap := u.allocator
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		backing  = heap,
 		fail_at  = 1,
 		fail_for = 1,
 	}
-	u.allocator = fail_nth(&f)
+	u.allocator = testkit.fail_nth(&f)
 	_, is_h2, err := get_h2_conn(u, 2 * time.Second, 2 * time.Second)
 	u.allocator = heap
 	testing.expect_value(t, err, Error.Out_Of_Memory)

@@ -31,7 +31,7 @@ EDNS client.
 */
 @(private = "file")
 padding_query :: proc(pad: bool) -> []u8 {
-	wire := test_query(PADDED, id = 0x7f7f, opt = dns.make_opt(1232, false))
+	wire := test_query(PADDED, id = 0x7f7f, opt = dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, false))
 	if !pad {
 		return wire
 	}
@@ -53,7 +53,7 @@ test_a_padded_query_is_answered_in_whole_blocks_on_the_encrypted_transports :: p
 			return
 		}
 
-		out, outcome, ok := handle_query(&s, query, proto, "127.0.0.1:5555", context.temp_allocator)
+		out, outcome, ok := handle_query(&s, query, proto, TEST_CLIENT, context.temp_allocator)
 		if !testing.expectf(t, ok, "%v: the padded query went unanswered", proto) {
 			return
 		}
@@ -101,7 +101,7 @@ test_the_clear_transports_are_not_padded :: proc(t: ^testing.T) {
 			return
 		}
 
-		out, _, ok := handle_query(&s, query, proto, "127.0.0.1:5555", context.temp_allocator)
+		out, _, ok := handle_query(&s, query, proto, TEST_CLIENT, context.temp_allocator)
 		if !testing.expectf(t, ok, "%v: the query went unanswered", proto) {
 			return
 		}
@@ -134,7 +134,7 @@ test_a_client_that_did_not_ask_for_padding_is_not_padded :: proc(t: ^testing.T) 
 			return
 		}
 
-		out, _, ok := handle_query(&s, query, proto, "127.0.0.1:5555", context.temp_allocator)
+		out, _, ok := handle_query(&s, query, proto, TEST_CLIENT, context.temp_allocator)
 		if !testing.expectf(t, ok, "%v: the query went unanswered", proto) {
 			return
 		}

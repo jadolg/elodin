@@ -18,8 +18,8 @@ An answer served insecure over the NSEC3 iteration ceiling says so, and goes on
 saying so out of the cache.
 
 RFC 9276 section 3.2 asks a resolver that answers insecure over such a record for
-extended error 27, and the SERVFAIL half already had it. The insecure half is
-harder than it looks: the OPT record of a forwarded or cached answer is emptied
+extended error 27, as the SERVFAIL half carries it. The insecure half is harder
+than it looks: the OPT record of a forwarded or cached answer is emptied
 on the way out, so nothing written into the upstream's bytes survives, and a
 cache hit has no verdict of its own to read the reason from. So the code is kept
 beside the entry (`cache.Entry.ede`) and attached after the strip.
@@ -228,10 +228,21 @@ ceiling_stop :: proc(f: ^Ceiling_Fixture) {
 	}
 }
 
+// Every entry in `answers` past its TTL, in every shard, since which one an
+// entry lands in is the cache's own hash.
+@(private = "file")
+expire_all :: proc(answers: ^cache.Cache) {
+	for &shard in answers.shards {
+		for _, e in shard.entries {
+			e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
+		}
+	}
+}
+
 // A client's query for `name` that offers an OPT record with DO set.
 @(private = "file")
 ceiling_query :: proc(name: string, id: u16 = 0x3131) -> []u8 {
-	return test_query(name, id = id, opt = dns.make_opt(1232, true))
+	return test_query(name, id = id, opt = dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, true))
 }
 
 // The extended error an insecure NXDOMAIN from the fixture zone carries.
@@ -243,7 +254,7 @@ ceiling_ede_of :: proc(t: ^testing.T, wire: []u8) -> (code: u16, found: bool) {
 	}
 	testing.expect_value(t, dns.rcode_of(msg), dns.Rcode.NX_Domain)
 	testing.expect(t, !msg.flags.ad, "an insecure answer carries no AD bit")
-	info, _ := extended_error(wire)
+	info, _ := extended_error(wire) // lint:allow the info-code is all this reads
 	if info < 0 {
 		return 0, false
 	}
@@ -290,13 +301,7 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	}
 	defer stop_test_loop(&tl)
 	f.srv.loops = tl.loops[:]
-	expire :: proc(answers: ^cache.Cache) {
-		for _, e in answers.shards[0].entries {
-			e.expires = loop.moment_add(loop.moment_now(), -1 * time.Second)
-		}
-	}
-
-	expire(answers)
+	expire_all(answers)
 	refreshed, refreshed_outcome, served_refresh := handle_query(&f.srv, wire, .UDP, "test", context.temp_allocator)
 	testing.expect(t, served_refresh, "no response for the refreshed query")
 	testing.expect_value(t, refreshed_outcome, Outcome.Forwarded)
@@ -304,7 +309,7 @@ test_an_answer_insecure_over_the_iteration_ceiling_carries_ede_27 :: proc(t: ^te
 	testing.expect(t, found, "the refreshed answer lost its extended error")
 	testing.expect_value(t, code, u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS))
 
-	expire(answers)
+	expire_all(answers)
 	sync.atomic_store(&f.mock.silent, true)
 	f.cfg.cache.stale_timeout = 100 * time.Millisecond
 	stale, stale_outcome, served_stale := handle_query(&f.srv, wire, .UDP, "test", context.temp_allocator)
@@ -329,12 +334,14 @@ test_ede_27_is_only_for_the_ceilings_insecure_answers :: proc(t: ^testing.T) {
 	}
 	answer.flags.qr = true
 	wire, _, err := dns.encode_message(answer, context.temp_allocator)
-	testing.expect_value(t, err, dns.Encode_Error.None)
+	if !testing.expect_value(t, err, dns.Encode_Error.None) {
+		return
+	}
 	plain := dns.Message {
 		question = answer.question,
 	}
 	spent: int
-	out := attach_answer_ede(wire, plain, .Forwarded, u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS), 512, 1232, &spent, context.temp_allocator)
+	out := attach_answer_ede(wire, plain, .Forwarded, u16(EDE_UNSUPPORTED_NSEC3_ITERATIONS), dns.MAX_UDP_SIZE, config.DEFAULT_MAX_UDP_RESPONSE, &spent, context.temp_allocator)
 	testing.expect(t, len(out) == len(wire), "a client that sent no OPT record is given none")
 	free_all(context.temp_allocator)
 }
@@ -391,8 +398,18 @@ test_the_chain_lookups_spend_what_is_left_of_the_query_budget :: proc(t: ^testin
 	defer ceiling_stop(&f)
 	wire := ceiling_query(C_QNAME, 0x4390)
 
-	_, _, served := handle_query(&f.srv, wire, .UDP, "test", context.temp_allocator)
-	testing.expect(t, served, "no response at all")
+	out, _, served := handle_query(&f.srv, wire, .UDP, "test", context.temp_allocator)
+	if !testing.expect(t, served, "no response at all") {
+		return
+	}
+	testing.expect_value(t, dns.peek_rcode(out), dns.Rcode.Serv_Fail)
+	// The client's question and the chain lookup that met it: a lookup did
+	// reach the silent member, so the count below is about the budget.
+	quiet, has_quiet := f.quiet.?
+	if testing.expect(t, has_quiet, "the fixture has no silent member") {
+		heard := mock_heard(quiet)
+		testing.expectf(t, heard >= 2, "the silent member heard %d datagrams, so no chain lookup reached it", heard)
+	}
 	/*
 	Counted rather than timed. The client's question is the one thing the
 	serving member hears: the first lookup meets the silent member with what is

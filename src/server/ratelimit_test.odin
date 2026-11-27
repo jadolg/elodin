@@ -17,33 +17,32 @@ kept per destination prefix, because that is the party being flooded and the
 only one whose rate means anything - the sender's address is fiction.
 */
 
-// How many of `n` datagrams from `client`, at `ms`, are given `want`.
+// Which of the limiter's checks `count_passed` makes.
 @(private = "file")
-count_verdict :: proc(r: ^Rate_Limiter, client: net.Endpoint, ms: i64, n: int, want: Rate_Verdict) -> (count: int) {
-	for _ in 0 ..< n {
-		if rate_check(r, client, limiter_tick(ms)) == want {
-			count += 1
-		}
-	}
-	return
+Limiter_Check :: enum {
+	Datagram,
+	Stream,
+	Conn,
 }
 
-// How many of `n` queries on a connection from `client`, at `ms`, are answered.
+/*
+How many of `n` checks from `client`, at `ms`, pass: a datagram given `want`
+(`rate_check`), a query on a connection answered (`stream_rate_check`), or a
+connection let in (`conn_rate_check`).
+*/
 @(private = "file")
-count_stream :: proc(r: ^Rate_Limiter, client: net.Endpoint, ms: i64, n: int) -> (count: int) {
+count_passed :: proc(r: ^Rate_Limiter, client: net.Endpoint, ms: i64, n: int, check := Limiter_Check.Datagram, want := Rate_Verdict.Allow) -> (count: int) {
 	for _ in 0 ..< n {
-		if stream_rate_check(r, client, limiter_tick(ms)) {
-			count += 1
+		passed: bool
+		switch check {
+		case .Datagram:
+			passed = rate_check(r, client, limiter_tick(ms)) == want
+		case .Stream:
+			passed = stream_rate_check(r, client, limiter_tick(ms))
+		case .Conn:
+			passed = conn_rate_check(r, client, limiter_tick(ms))
 		}
-	}
-	return
-}
-
-// How many of `n` connections from `client`, at `ms`, are let in.
-@(private = "file")
-count_conn :: proc(r: ^Rate_Limiter, client: net.Endpoint, ms: i64, n: int) -> (count: int) {
-	for _ in 0 ..< n {
-		if conn_rate_check(r, client, limiter_tick(ms)) {
+		if passed {
 			count += 1
 		}
 	}
@@ -61,7 +60,7 @@ overdraw :: proc(t: ^testing.T, r: ^Rate_Limiter, client: net.Endpoint, rate: in
 		testing.expect_value(t, rate_check(r, client, limiter_tick(0)), Rate_Verdict.Allow, loc = loc)
 	}
 	for _ in 0 ..< rate * RRL_BURST_SECONDS {
-		rate_charge_response(r, client, 1232, limiter_tick(0))
+		rate_charge_response(r, client, config.DEFAULT_MAX_UDP_RESPONSE, limiter_tick(0))
 	}
 }
 
@@ -129,8 +128,8 @@ v6_of :: proc(groups: [8]u16) -> net.Address {
 A prefix may spend its budget and no more, and it comes back with time.
 
 The numbers: a burst of `rate * RRL_BURST_SECONDS` is what a bucket holds, so
-that is what a quiet prefix may take at once and what a second of the limit
-refills a fifth of.
+that is what a quiet prefix may take at once, and a second of the limit refills
+`1 / RRL_BURST_SECONDS` of it.
 */
 @(test)
 test_rate_limit_spends_and_refills :: proc(t: ^testing.T) {
@@ -139,7 +138,7 @@ test_rate_limit_spends_and_refills :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(203, 0, 113, 7)
-	allowed := count_verdict(r, client, 0, 1000, .Allow)
+	allowed := count_passed(r, client, 0, 1000, want = .Allow)
 	testing.expectf(
 		t,
 		allowed == RATE * RRL_BURST_SECONDS,
@@ -152,11 +151,11 @@ test_rate_limit_spends_and_refills :: proc(t: ^testing.T) {
 	testing.expect_value(t, rate_check(r, client, limiter_tick(0)), Rate_Verdict.Drop)
 
 	// A quarter of a second is a quarter of the rate, and not a token more.
-	refilled := count_verdict(r, client, 250, 1000, .Allow)
+	refilled := count_passed(r, client, 250, 1000, want = .Allow)
 	testing.expectf(t, refilled == RATE / 4, "a quarter second refilled %d, expected %d", refilled, RATE / 4)
 
 	// Long enough to have refilled many times over, capped at the burst.
-	banked := count_verdict(r, client, 60_000, 10000, .Allow)
+	banked := count_passed(r, client, 60_000, 10000, want = .Allow)
 	testing.expectf(
 		t,
 		banked == RATE * RRL_BURST_SECONDS,
@@ -285,9 +284,7 @@ test_a_mapped_source_and_its_v4_form_are_one_prefix :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	// Mapped first, then charged unmapped.
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, mapped(203, 0, 113, 7), limiter_tick(0)), Rate_Verdict.Allow)
-	}
+	testing.expect_value(t, count_passed(r, mapped(203, 0, 113, 7), 0, RATE * RRL_BURST_SECONDS), RATE * RRL_BURST_SECONDS)
 	testing.expectf(
 		t,
 		rate_check(r, v4(203, 0, 113, 7), limiter_tick(0)) == .Drop,
@@ -300,9 +297,7 @@ test_a_mapped_source_and_its_v4_form_are_one_prefix :: proc(t: ^testing.T) {
 	)
 
 	// The other way about, on a prefix of its own.
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, v4(192, 0, 2, 5), limiter_tick(0)), Rate_Verdict.Allow)
-	}
+	testing.expect_value(t, count_passed(r, v4(192, 0, 2, 5), 0, RATE * RRL_BURST_SECONDS), RATE * RRL_BURST_SECONDS)
 	testing.expectf(
 		t,
 		rate_check(r, mapped(192, 0, 2, 5), limiter_tick(0)) == .Drop,
@@ -310,9 +305,7 @@ test_a_mapped_source_and_its_v4_form_are_one_prefix :: proc(t: ^testing.T) {
 	)
 
 	// The stream pool keys off the same address, so it answers the same way.
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect(t, stream_rate_check(r, mapped(198, 51, 100, 1), limiter_tick(0)), "the stream budget refused a query it had room for")
-	}
+	testing.expect(t, count_passed(r, mapped(198, 51, 100, 1), 0, RATE * RRL_BURST_SECONDS, check = .Stream) == RATE * RRL_BURST_SECONDS, "the stream budget refused a query it had room for")
 	testing.expectf(
 		t,
 		!stream_rate_check(r, v4(198, 51, 100, 2), limiter_tick(0)),
@@ -456,25 +449,33 @@ The address a v4 client actually arrives as, from the kernel rather than a liter
 Every other test here builds `::ffff:a.b.c.d` by hand, which proves the judgement
 and assumes the premise. This one binds `::`, sends a datagram to 127.0.0.1 from
 an IPv4 socket, and asks both questions of whatever address `recv_udp` reports -
-so the fix rests on what a client really arrives as rather than on a reading of
-`core:net`, and it stays honest if a platform or a future `core:net` ever reports
-the unmapped form instead.
+so the judgement rests on what a client really arrives as rather than on a
+reading of `core:net`, and it stays honest if a platform or a future `core:net`
+ever reports the unmapped form instead.
 
-Skipped, out loud, where `::` cannot be bound or is not dual-stack: that is a
-property of the machine (`net.ipv6.bindv6only`, a container without IPv6) rather
-than of the code, and a hard failure there would be a false alarm. The line in
-the log is so that a runner where this never executes is visible rather than
-quietly green.
+Skipped, out loud, where `::` cannot be bound: that is a property of the machine
+(a container without IPv6) rather than of the code, and a hard failure there
+would be a false alarm, and so is a host whose `net.ipv6.bindv6only` keeps IPv4
+off a `::` socket (`bindv6only`), which the listeners leave at the kernel's
+default too. The line in the log is so that a runner where this never executes
+is visible rather than quietly green. Anywhere else a send or a read that fails
+fails the case: a skip there would hide a socket that is simply broken.
 */
 @(test)
 test_a_real_v4_client_on_a_wildcard_bind_is_judged_by_its_v4_address :: proc(t: ^testing.T) {
+	if bindv6only() {
+		log.info("skipped: net.ipv6.bindv6only keeps IPv4 clients off a `::` socket here")
+		return
+	}
 	server_socket, serr := net.make_bound_udp_socket(net.IP6_Any, 0)
 	if serr != nil {
 		log.infof("skipped: this machine cannot bind `::` (%v)", serr)
 		return
 	}
 	defer net.close(server_socket)
-	_ = net.set_option(server_socket, .Receive_Timeout, 2 * time.Second)
+	if !set_wait(t, server_socket, .Receive_Timeout, 2 * time.Second) {
+		return
+	}
 
 	bound, berr := net.bound_endpoint(server_socket)
 	if berr != nil {
@@ -494,14 +495,12 @@ test_a_real_v4_client_on_a_wildcard_bind_is_judged_by_its_v4_address :: proc(t: 
 		address = net.IP4_Loopback,
 		port    = bound.port,
 	}
-	if _, err := net.send_udp(client_socket, payload[:], to); err != nil {
-		log.infof("skipped: a `::` bind is not reachable over IPv4 here (%v)", err)
+	if _, err := net.send_udp(client_socket, payload[:], to); !testing.expectf(t, err == nil, "cannot send to the `::` socket over IPv4: %v", err) {
 		return
 	}
 	buf: [4]u8
 	_, from, rerr := net.recv_udp(server_socket, buf[:])
-	if rerr != nil {
-		log.infof("skipped: nothing arrived on the `::` socket from an IPv4 client (%v)", rerr)
+	if !testing.expectf(t, rerr == nil, "nothing arrived on the `::` socket from an IPv4 client: %v", rerr) {
 		return
 	}
 
@@ -585,8 +584,8 @@ An unmapped source is keyed on its /24 exactly: all of it, and no more of it.
 
 Swept over every value of every octet, because "keyed on the /24" is two claims
 and a mistake in either is a real one. Too few bytes - a /16, say - and two
-unrelated networks share a budget, which is the collapse this fix is about in
-miniature. Too many - the whole address - and the budget is per host, so an
+unrelated networks share a budget, which is the collapse of every mapped
+address into `::/64` in miniature. Too many - the whole address - and the budget is per host, so an
 attacker aiming at one victim spreads a flood across the 256 addresses of its
 /24 and pays nothing for it, which is the reason the limit is kept per prefix at
 all.
@@ -643,9 +642,7 @@ test_rate_limit_slips_a_truncated_answer :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(192, 0, 2, 1)
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, client, limiter_tick(0)), Rate_Verdict.Allow)
-	}
+	testing.expect_value(t, count_passed(r, client, 0, RATE * RRL_BURST_SECONDS), RATE * RRL_BURST_SECONDS)
 
 	// Over the budget from here: one dropped, one truncated, alternating, for as
 	// long as the slip pool holds out - which is `SLIP` of these per token in it.
@@ -684,9 +681,7 @@ test_rate_limit_slips_a_truncated_answer :: proc(t: ^testing.T) {
 	// slip = 0 is "drop them all".
 	strict := make_rate_limiter(RATE, 0)
 	defer destroy_rate_limiter(strict)
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		rate_check(strict, client, limiter_tick(0))
-	}
+	testing.expect_value(t, count_passed(strict, client, 0, RATE * RRL_BURST_SECONDS), RATE * RRL_BURST_SECONDS)
 	for _ in 0 ..< 10 {
 		testing.expect_value(t, rate_check(strict, client, limiter_tick(0)), Rate_Verdict.Drop)
 	}
@@ -755,7 +750,7 @@ truncated_under_flood :: proc(rate, slip, offered: int) -> int {
 		rate_check(r, client, limiter_tick(0))
 	}
 
-	truncated := count_verdict(r, client, 0, offered, .Truncate)
+	truncated := count_passed(r, client, 0, offered, want = .Truncate)
 	return truncated
 }
 
@@ -791,17 +786,15 @@ test_the_slip_budget_is_a_pool_of_its_own :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(203, 0, 113, 5)
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, client, limiter_tick(0)), Rate_Verdict.Allow)
-	}
+	testing.expect_value(t, count_passed(r, client, 0, RATE * RRL_BURST_SECONDS), RATE * RRL_BURST_SECONDS)
 
 	// The pool, to the token, against a flood far larger than it.
-	truncated := count_verdict(r, client, 0, 10_000, .Truncate)
+	truncated := count_passed(r, client, 0, 10_000, want = .Truncate)
 	testing.expectf(t, truncated == SLIPS, "%d truncated answers came out of a pool holding %d", truncated, SLIPS)
 
 	// A second on, and the response budget is the whole of what an operator
 	// configured: the slips were not taken out of it.
-	allowed := count_verdict(r, client, 1000, RATE, .Allow)
+	allowed := count_passed(r, client, 1000, RATE, want = .Allow)
 	testing.expectf(
 		t,
 		allowed == RATE,
@@ -812,14 +805,12 @@ test_the_slip_budget_is_a_pool_of_its_own :: proc(t: ^testing.T) {
 
 	// Nor was the stream pool, which is the one the truncated answers send a
 	// client to.
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect(t, stream_rate_check(r, client, limiter_tick(1000)), "a connection was refused a query the stream pool had room for")
-	}
+	testing.expect(t, count_passed(r, client, 1000, RATE * RRL_BURST_SECONDS, check = .Stream) == RATE * RRL_BURST_SECONDS, "a connection was refused a query the stream pool had room for")
 	testing.expect(t, !stream_rate_check(r, client, limiter_tick(1000)), "the stream pool answered past what it holds")
 
 	// And the slip pool refills too: a second of it, and no more, for the flood
 	// that is still arriving.
-	refilled := count_verdict(r, client, 1000, 10_000, .Truncate)
+	refilled := count_passed(r, client, 1000, 10_000, want = .Truncate)
 	testing.expectf(
 		t,
 		refilled == RATE / RRL_SLIP_SHARE,
@@ -855,7 +846,7 @@ test_the_bytes_a_prefix_is_sent_do_not_depend_on_the_answer :: proc(t: ^testing.
 	// `config.MIN_RESPONSE_SIZE_ESTIMATE`, which is the smallest an operator can
 	// write.
 	ESTIMATE :: 128
-	LARGE :: 1232
+	LARGE :: config.DEFAULT_MAX_UDP_RESPONSE
 	SMALL :: 100
 
 	ceiling := RATE * RRL_BURST_SECONDS * ESTIMATE
@@ -994,7 +985,7 @@ test_without_an_estimate_the_budget_is_the_count_it_was :: proc(t: ^testing.T) {
 		if rate_check(big, client, limiter_tick(0)) != .Allow {
 			continue
 		}
-		rate_charge_response(big, client, 1232, limiter_tick(0))
+		rate_charge_response(big, client, config.DEFAULT_MAX_UDP_RESPONSE, limiter_tick(0))
 		answered += 1
 	}
 	testing.expectf(
@@ -1028,7 +1019,7 @@ test_an_oversized_answer_is_paid_for_by_the_next_query :: proc(t: ^testing.T) {
 
 	client := v4(203, 0, 113, 64)
 	testing.expect_value(t, rate_check(r, client, limiter_tick(0)), Rate_Verdict.Allow)
-	rate_charge_response(r, client, 1232, limiter_tick(0))
+	rate_charge_response(r, client, config.DEFAULT_MAX_UDP_RESPONSE, limiter_tick(0))
 
 	// 1232 bytes at 128 is ten tokens: the one the check took and nine more.
 	COST :: 10
@@ -1077,7 +1068,7 @@ test_the_size_charge_is_the_datagram_pool_alone :: proc(t: ^testing.T) {
 	overdraw(t, r, client, RATE)
 	testing.expect_value(t, rate_check(r, client, limiter_tick(0)), Rate_Verdict.Drop)
 
-	streamed := count_stream(r, client, 0, RATE * RRL_BURST_SECONDS)
+	streamed := count_passed(r, client, 0, RATE * RRL_BURST_SECONDS, check = .Stream)
 	testing.expectf(
 		t,
 		streamed == RATE * RRL_BURST_SECONDS,
@@ -1086,7 +1077,7 @@ test_the_size_charge_is_the_datagram_pool_alone :: proc(t: ^testing.T) {
 		RATE * RRL_BURST_SECONDS,
 	)
 
-	opened := count_conn(r, client, 0, RATE * RRL_BURST_SECONDS)
+	opened := count_passed(r, client, 0, RATE * RRL_BURST_SECONDS, check = .Conn)
 	testing.expectf(
 		t,
 		opened == RATE * RRL_BURST_SECONDS,
@@ -1139,7 +1130,7 @@ test_a_prefix_in_debt_is_still_offered_its_slip :: proc(t: ^testing.T) {
 
 	// A second later the prefix owes some sixteen more, so every one of these is
 	// over the budget - and one in `SLIP` of them comes back truncated anyway.
-	slipped := count_verdict(r, client, 1000, 10, .Truncate)
+	slipped := count_passed(r, client, 1000, 10, want = .Truncate)
 	testing.expectf(
 		t,
 		slipped == 10 / SLIP,
@@ -1220,22 +1211,42 @@ test_a_prefix_in_debt_keeps_its_bucket :: proc(t: ^testing.T) {
 	overdraw(t, r, victim, RATE)
 	testing.expect_value(t, rate_check(r, victim, limiter_tick(0)), Rate_Verdict.Drop)
 
-	/*
-	Four times as many distinct /24s as there are buckets, which is the flood
-	`test_a_flood_of_prefixes_does_not_reset_a_live_bucket` uses and the reason
-	it is that many: the property here is about what a stranger who lands on the
-	victim's bucket may do to it, so the flood has to be certain to produce one.
-	A /16's worth - 255 prefixes against `RRL_BUCKETS` - reaches it about once in
-	sixty runs, and the other fifty-nine assert only that the victim is still in
-	debt, which the line above already said.
-
-	Out of 10/8 rather than the victim's own /16: a query in its prefix would be
-	its bucket being charged again, not a stranger arriving beside it.
-	*/
-	for i in 0 ..< RRL_BUCKETS * 4 {
-		_ = rate_check(r, v4(10, u8(i >> 8), u8(i), 1), limiter_tick(10)) // lint:allow spending the pool, the verdict is the next line's
-	}
+	// Strangers who land on the victim's bucket, which is what the property is
+	// about: each shares what is left of it, which is nothing.
+	expect_strangers_share_nothing(t, r, victim, 10)
 	testing.expect_value(t, rate_check(r, victim, limiter_tick(10)), Rate_Verdict.Drop)
+}
+
+/*
+Up to `want` prefixes other than `victim`'s whose bucket is `victim`'s own. The
+bucket is a keyed hash, so they are found by search: out of sixteen /8s from
+10/8, about 64 of the million /24s land on any one bucket, so finding none has a
+chance near e^-64. Out of other /8s than the victim's, so a query in its prefix
+is never taken for a stranger arriving beside it.
+*/
+@(private = "file")
+bucket_strangers :: proc(r: ^Rate_Limiter, victim: net.Endpoint, want: int) -> []net.Endpoint {
+	own := prefix_key(r, victim.address)
+	out := make([dynamic]net.Endpoint, 0, want, context.temp_allocator)
+	for i := 0; i < 1 << 20 && len(out) < want; i += 1 {
+		stranger := v4(u8(10 + (i >> 16)), u8(i >> 8), u8(i), 1)
+		key := prefix_key(r, stranger.address)
+		if key != own && key % RRL_BUCKETS == own % RRL_BUCKETS {
+			append(&out, stranger)
+		}
+	}
+	return out[:]
+}
+
+// Strangers on `victim`'s live bucket, at `ms`, are each refused: they share
+// what is left of it rather than take it over.
+@(private = "file")
+expect_strangers_share_nothing :: proc(t: ^testing.T, r: ^Rate_Limiter, victim: net.Endpoint, ms: i64, loc := #caller_location) {
+	strangers := bucket_strangers(r, victim, 8)
+	testing.expect(t, len(strangers) > 0, "no prefix shares the victim's bucket", loc = loc)
+	for s in strangers {
+		testing.expectf(t, rate_check(r, s, limiter_tick(ms)) == .Drop, "a stranger on the victim's spent bucket was answered", loc = loc)
+	}
 }
 
 /*
@@ -1289,16 +1300,12 @@ test_a_flood_of_prefixes_does_not_reset_a_live_bucket :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	victim := v4(198, 51, 100, 10)
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, victim, limiter_tick(0)), Rate_Verdict.Allow)
-	}
+	testing.expect_value(t, count_passed(r, victim, 0, RATE * RRL_BURST_SECONDS), RATE * RRL_BURST_SECONDS)
 	testing.expect_value(t, rate_check(r, victim, limiter_tick(0)), Rate_Verdict.Drop)
 
-	// Four times as many distinct /24s as there are buckets, all at the same
-	// instant, so nothing has had a chance to refill.
-	for i in 0 ..< RRL_BUCKETS * 4 {
-		rate_check(r, v4(10, u8(i >> 8), u8(i), 1), limiter_tick(0))
-	}
+	// Strangers on the victim's own bucket, at the same instant, so nothing has
+	// had a chance to refill.
+	expect_strangers_share_nothing(t, r, victim, 0)
 
 	testing.expectf(
 		t,
@@ -1581,9 +1588,7 @@ test_stream_queries_are_refused_rather_than_truncated :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(198, 51, 100, 4)
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect(t, stream_rate_check(r, client, limiter_tick(0)), "a connection was refused a query the budget had room for")
-	}
+	testing.expect(t, count_passed(r, client, 0, RATE * RRL_BURST_SECONDS, check = .Stream) == RATE * RRL_BURST_SECONDS, "a connection was refused a query the budget had room for")
 	for _ in 0 ..< 20 {
 		testing.expect(t, !stream_rate_check(r, client, limiter_tick(0)), "an over-budget query was answered on a connection")
 	}
@@ -1594,10 +1599,8 @@ test_stream_queries_are_refused_rather_than_truncated :: proc(t: ^testing.T) {
 
 	// The same limiter, a prefix of its own, over UDP: still every SLIPth one.
 	over_udp := v4(198, 51, 101, 4)
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		rate_check(r, over_udp, limiter_tick(0))
-	}
-	truncated := count_verdict(r, over_udp, 0, 10, .Truncate)
+	testing.expect_value(t, count_passed(r, over_udp, 0, RATE * RRL_BURST_SECONDS), RATE * RRL_BURST_SECONDS)
+	truncated := count_passed(r, over_udp, 0, 10, want = .Truncate)
 	testing.expectf(t, truncated == 10 / SLIP, "%d of 10 over-limit datagrams were truncated, expected %d", truncated, 10 / SLIP)
 }
 
@@ -1627,12 +1630,8 @@ test_a_stream_refusal_does_not_advance_the_slip :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(198, 51, 102, 7)
-	for _ in 0 ..< RRL_BURST_SECONDS {
-		testing.expect(t, stream_rate_check(r, client, limiter_tick(0)), "the stream budget refused a query it had room for")
-	}
-	for _ in 0 ..< RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, client, limiter_tick(0)), Rate_Verdict.Allow)
-	}
+	testing.expect(t, count_passed(r, client, 0, RRL_BURST_SECONDS, check = .Stream) == RRL_BURST_SECONDS, "the stream budget refused a query it had room for")
+	testing.expect_value(t, count_passed(r, client, 0, RRL_BURST_SECONDS), RRL_BURST_SECONDS)
 
 	testing.expect(t, !stream_rate_check(r, client, limiter_tick(0)), "an over-budget query was answered on a connection")
 
@@ -1668,9 +1667,7 @@ test_a_stream_answer_does_not_reset_the_slip :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(198, 51, 103, 9)
-	for _ in 0 ..< RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, client, limiter_tick(0)), Rate_Verdict.Allow)
-	}
+	testing.expect_value(t, count_passed(r, client, 0, RRL_BURST_SECONDS), RRL_BURST_SECONDS)
 	for _ in 0 ..< SLIP - 1 {
 		testing.expect_value(t, rate_check(r, client, limiter_tick(0)), Rate_Verdict.Drop)
 	}
@@ -1719,16 +1716,14 @@ test_the_stream_budget_is_not_the_datagram_one :: proc(t: ^testing.T) {
 
 	// The flood: one prefix's datagram pool spent dry and held there.
 	victim := v4(203, 0, 113, 20)
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect_value(t, rate_check(r, victim, limiter_tick(0)), Rate_Verdict.Allow)
-	}
+	testing.expect_value(t, count_passed(r, victim, 0, RATE * RRL_BURST_SECONDS), RATE * RRL_BURST_SECONDS)
 	for _ in 0 ..< 50 {
 		testing.expect_value(t, rate_check(r, victim, limiter_tick(0)), Rate_Verdict.Drop)
 	}
 
 	// A real client in the same /24, over a connection: a budget of its own, and
 	// the whole of it.
-	answered := count_stream(r, v4(203, 0, 113, 21), 0, RATE * RRL_BURST_SECONDS)
+	answered := count_passed(r, v4(203, 0, 113, 21), 0, RATE * RRL_BURST_SECONDS, check = .Stream)
 	testing.expectf(
 		t,
 		answered == RATE * RRL_BURST_SECONDS,
@@ -1746,9 +1741,7 @@ test_the_stream_budget_is_not_the_datagram_one :: proc(t: ^testing.T) {
 	// The other way about, on a prefix of its own: a pipelining client spends the
 	// stream pool dry and its neighbours' datagrams are answered anyway.
 	stream_first := v6(0xcccc, 1)
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect(t, stream_rate_check(r, stream_first, limiter_tick(0)), "the stream budget refused a query it had room for")
-	}
+	testing.expect(t, count_passed(r, stream_first, 0, RATE * RRL_BURST_SECONDS, check = .Stream) == RATE * RRL_BURST_SECONDS, "the stream budget refused a query it had room for")
 	testing.expect(t, !stream_rate_check(r, stream_first, limiter_tick(0)), "the stream budget answered past what it holds")
 	testing.expect_value(t, rate_check(r, v6(0xcccc, 2), limiter_tick(0)), Rate_Verdict.Allow)
 }
@@ -1773,7 +1766,7 @@ test_connections_are_charged_to_a_budget_of_their_own :: proc(t: ^testing.T) {
 	defer destroy_rate_limiter(r)
 
 	client := v4(203, 0, 113, 40)
-	opened := count_conn(r, client, 0, 1000)
+	opened := count_passed(r, client, 0, 1000, check = .Conn)
 	testing.expectf(
 		t,
 		opened == RATE * RRL_BURST_SECONDS,
@@ -1784,7 +1777,7 @@ test_connections_are_charged_to_a_budget_of_their_own :: proc(t: ^testing.T) {
 	testing.expect(t, !conn_rate_check(r, client, limiter_tick(0)), "a connection was accepted past what the pool holds")
 
 	// A quarter of a second is a quarter of the rate, and not a connection more.
-	refilled := count_conn(r, client, 250, 1000)
+	refilled := count_passed(r, client, 250, 1000, check = .Conn)
 	testing.expectf(t, refilled == RATE / 4, "a quarter second refilled %d connections, expected %d", refilled, RATE / 4)
 
 	// Counted, and counted apart from the queries: nothing was asked here, so
@@ -1828,7 +1821,7 @@ test_a_datagram_flood_cannot_stop_a_prefix_connecting :: proc(t: ^testing.T) {
 	testing.expect_value(t, rate_check(r, victim, limiter_tick(0)), Rate_Verdict.Drop)
 
 	// A real client in the same /24 opens its prefix's whole allowance anyway.
-	opened := count_conn(r, v4(198, 51, 100, 31), 0, RATE * RRL_BURST_SECONDS)
+	opened := count_passed(r, v4(198, 51, 100, 31), 0, RATE * RRL_BURST_SECONDS, check = .Conn)
 	testing.expectf(
 		t,
 		opened == RATE * RRL_BURST_SECONDS,
@@ -1847,9 +1840,7 @@ test_a_datagram_flood_cannot_stop_a_prefix_connecting :: proc(t: ^testing.T) {
 	// spends the connection pool dry, and the prefix's datagrams and its queries
 	// on the connections it did get are answered regardless.
 	dialer := v6(0xdddd, 1)
-	for _ in 0 ..< RATE * RRL_BURST_SECONDS {
-		testing.expect(t, conn_rate_check(r, dialer, limiter_tick(0)), "a connection was refused that the pool had room for")
-	}
+	testing.expect(t, count_passed(r, dialer, 0, RATE * RRL_BURST_SECONDS, check = .Conn) == RATE * RRL_BURST_SECONDS, "a connection was refused that the pool had room for")
 	testing.expect(t, !conn_rate_check(r, dialer, limiter_tick(0)), "the connection budget accepted past what it holds")
 	testing.expect_value(t, rate_check(r, v6(0xdddd, 2), limiter_tick(0)), Rate_Verdict.Allow)
 	testing.expect(t, stream_rate_check(r, v6(0xdddd, 2), limiter_tick(0)), "dialling emptied the pool the queries are answered out of")
@@ -2058,7 +2049,7 @@ How many datagrams a prefix is answered in full, out of a bucket brought to
 */
 @(private = "file")
 drain :: proc(r: ^Rate_Limiter, client: net.Endpoint, ms: i64 = 0) -> int {
-	return count_verdict(r, client, ms, 20_000, .Allow)
+	return count_passed(r, client, ms, 20_000, want = .Allow)
 }
 
 /*
@@ -2484,7 +2475,7 @@ test_the_override_lines_say_what_the_estimate_makes_of_them :: proc(t: ^testing.
 	}
 	// 128 bytes under a 1232-byte ceiling, which is the shipped ceiling and the
 	// estimate the documentation works its example at.
-	lines := rate_limit_override_lines(overrides, 128, 1232, context.temp_allocator)
+	lines := rate_limit_override_lines(overrides, 128, config.DEFAULT_MAX_UDP_RESPONSE, context.temp_allocator)
 	if !testing.expect_value(t, len(lines), 3) {
 		return
 	}
@@ -2505,7 +2496,7 @@ test_the_override_lines_say_what_the_estimate_makes_of_them :: proc(t: ^testing.
 
 	// And nothing at all when the estimate is the ceiling, which is what a file
 	// that does not write one resolves to.
-	quiet := rate_limit_override_lines(overrides, 1232, 1232, context.temp_allocator)
+	quiet := rate_limit_override_lines(overrides, config.DEFAULT_MAX_UDP_RESPONSE, config.DEFAULT_MAX_UDP_RESPONSE, context.temp_allocator)
 	if testing.expect_value(t, len(quiet), 3) {
 		testing.expectf(
 			t,

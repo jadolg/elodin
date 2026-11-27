@@ -5,6 +5,7 @@ import "core:testing"
 import "elodin:cache"
 import "elodin:dns"
 import "elodin:dnssec"
+import "elodin:testkit"
 
 /*
 The parts of the DNSSEC path that shape what the client sees.
@@ -38,7 +39,7 @@ encode :: proc(t: ^testing.T, msg: dns.Message, loc := #caller_location) -> (wir
 // The cache key a client's query `q` is looked up under.
 @(private = "file")
 key_of :: proc(buf: []u8, q: dns.Message) -> string {
-	return cache.make_key(buf, q.question[0].name, q.question[0].type, q.question[0].class, dns.edns_do(q), q.flags.cd)
+	return cache.make_key(buf, q.question[0].name, q.question[0].type, q.question[0].class, dns.edns_do(q), checking_disabled = q.flags.cd)
 }
 
 // An RRset the validator vouched for, signed by `TEST_SIGNER`.
@@ -533,7 +534,7 @@ test_a_pruned_denial_after_a_cname_is_not_cached :: proc(t: ^testing.T) {
 		testing.expect_value(t, len(decoded.authority), 0)
 
 		key_buf: [cache.KEY_MAX]u8
-		key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, false)
+		key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, checking_disabled = false)
 
 		// Not even with a `min_ttl` floor to lift it: there is nothing left in
 		// it to read a lifetime from.
@@ -570,7 +571,7 @@ test_a_pruned_answer_is_still_cached_and_served :: proc(t: ^testing.T) {
 	answers := cache.make_cache(cache.Options{max_entries = 8, max_ttl = 3600, negative_ttl = 0})
 	defer cache.destroy(answers)
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, false)
+	key := cache.make_key(key_buf[:], "www.example.com.", .AAAA, .IN, true, checking_disabled = false)
 	if !testing.expect(t, cache.put(answers, key, out, decoded), "a pruned answer was not cacheable") {
 		return
 	}
@@ -1036,10 +1037,10 @@ test_a_prune_that_runs_dry_presents_nothing :: proc(t: ^testing.T) {
 	query, verdict := client_query(true), secure_verdict()
 	refused := 0
 	for n := 1; ; n += 1 {
-		// The request's arena; `Fail_Nth` hands what it passes on to the temp
+		// The request's arena; `testkit.Fail_Nth` hands what it passes on to the temp
 		// allocator, so that one is left alone.
-		f := Fail_Nth{fail_at = n, fail_for = 1}
-		out, ok := present_response(wire, query, .A, verdict, nil, mem.Allocator{procedure = fail_nth_proc, data = &f})
+		f := testkit.Fail_Nth{fail_at = n, fail_for = 1}
+		out, ok := present_response(wire, query, .A, verdict, nil, mem.Allocator{procedure = testkit.fail_nth_proc, data = &f})
 		if f.seen < n {
 			break
 		}

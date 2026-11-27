@@ -44,7 +44,7 @@ test_edns_version_above_zero_is_refused_with_badvers :: proc(t: ^testing.T) {
 	cfg: config.Config
 	s := rewrite_server(&cfg, REWRITTEN)
 
-	out, outcome, ok := handle_query(&s, version_query(1), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, version_query(1), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expect(t, ok, "a request in EDNS version 1 went unanswered") {
 		return
 	}
@@ -87,7 +87,7 @@ test_edns_version_zero_and_plain_queries_are_untouched :: proc(t: ^testing.T) {
 	cfg: config.Config
 	s := rewrite_server(&cfg, REWRITTEN)
 
-	out, outcome, ok := handle_query(&s, version_query(0), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, version_query(0), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expect(t, ok, "a request in EDNS version 0 went unanswered") {
 		return
 	}
@@ -98,7 +98,7 @@ test_edns_version_zero_and_plain_queries_are_untouched :: proc(t: ^testing.T) {
 		&s,
 		version_query(0, edns = false),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	if !testing.expect(t, plain_ok, "a request without EDNS went unanswered") {

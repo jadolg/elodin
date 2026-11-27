@@ -8,6 +8,7 @@ import "elodin:config"
 import "elodin:dns"
 import "elodin:dnssec"
 import "elodin:filter"
+import "elodin:testkit"
 
 /*
 Issue #620: an answer built in a request arena that cannot grow fails on its
@@ -22,7 +23,7 @@ oom_query :: proc(t: ^testing.T) -> (wire: []u8, msg: dns.Message, ok: bool) {
 		id         = 0x620,
 		flags      = {rd = true},
 		question   = []dns.Question{{name = "Example.COM.", type = .A, class = .IN}},
-		additional = []dns.Record{dns.make_opt(1232, false)},
+		additional = []dns.Record{dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, false)},
 	}
 	err: dns.Encode_Error
 	wire, _, err = dns.encode_message(msg, context.temp_allocator)
@@ -99,7 +100,7 @@ test_a_query_read_without_memory_is_not_a_format_error :: proc(t: ^testing.T) {
 		}
 		arena: mem.Arena
 		mem.arena_init(&arena, backing[:size])
-		out, _, built := handle_query(&s, wire, .UDP, "127.0.0.1:5555", mem.arena_allocator(&arena))
+		out, _, built := handle_query(&s, wire, .UDP, TEST_CLIENT, mem.arena_allocator(&arena))
 		if !built {
 			continue
 		}
@@ -133,21 +134,21 @@ test_local_answers_with_no_memory :: proc(t: ^testing.T) {
 	testing.expect(t, len(chaos.response) == 0 && !chaos.ok, "a CHAOS answer was built with no memory to build it")
 	testing.expect_value(t, chaos.outcome, Outcome.Local)
 
-	_, failed_built := dnssec_failure_response(msg, dnssec.Result{status = .Bogus}, none, 512)
+	_, failed_built := dnssec_failure_response(msg, dnssec.Result{status = .Bogus}, none, dns.MAX_UDP_SIZE)
 	testing.expect(t, !failed_built, "a DNSSEC failure was reported built with no memory to build it")
 
 	// The fast block answer is not reported built empty, so the encoder gets its turn.
-	_, block_built := block_wire(&s, msg, msg.question[0], context.temp_allocator, 512, false)
+	_, block_built := block_wire(&s, msg, msg.question[0], context.temp_allocator, dns.MAX_UDP_SIZE, false)
 	testing.expect(t, block_built, "the fast block answer did not take this query, so the dry case proves nothing")
-	_, block_dry_built := block_wire(&s, msg, msg.question[0], none, 512, false)
+	_, block_dry_built := block_wire(&s, msg, msg.question[0], none, dns.MAX_UDP_SIZE, false)
 	testing.expect(t, !block_dry_built, "a fast block answer was reported built with no memory to build it")
 
-	_, refusal_built := upstream_refusal(query_wire, msg, "test", 512, none)
+	_, refusal_built := upstream_refusal(query_wire, msg, "test", dns.MAX_UDP_SIZE, none)
 	testing.expect(t, !refusal_built, "a refusal was reported built with no memory to build it")
 
 	// The extended error is advice; the OPT record it would go in is left as it was.
 	resp := dns.make_response(msg, .Serv_Fail, context.temp_allocator)
-	attach_extended_error(&resp, 22, "why", none)
+	attach_extended_error(&resp, EDE_NO_REACHABLE_AUTHORITY, "why", none)
 	testing.expect_value(t, len(resp.additional), 1)
 	_, has_options := resp.additional[0].data.(dns.Rdata_OPT)
 	testing.expect(t, !has_options, "an extended error was attached with no memory to attach it")
@@ -191,15 +192,15 @@ test_local_answers_with_their_opt_record_refused :: proc(t: ^testing.T) {
 		return
 	}
 	defer free_all(context.temp_allocator)
-	f := Fail_Nth{fail_at = 1, fail_for = 1}
-	first := mem.Allocator{procedure = fail_nth_proc, data = &f}
-	_, first_built := dnssec_failure_response(msg, dnssec.Result{status = .Bogus}, first, 512)
+	f := testkit.Fail_Nth{fail_at = 1, fail_for = 1}
+	first := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
+	_, first_built := dnssec_failure_response(msg, dnssec.Result{status = .Bogus}, first, dns.MAX_UDP_SIZE)
 	testing.expect(t, f.seen >= 1, "the allocator was never asked for anything")
 	testing.expect(t, !first_built, "a DNSSEC failure was built without the client's OPT record")
 
 	// A refusal falls back to `error_response`, which builds it whole.
-	f = Fail_Nth{fail_at = 1, fail_for = 1}
-	refusal, refusal_first_built := upstream_refusal(query_wire, msg, "test", 512, first)
+	f = testkit.Fail_Nth{fail_at = 1, fail_for = 1}
+	refusal, refusal_first_built := upstream_refusal(query_wire, msg, "test", dns.MAX_UDP_SIZE, first)
 	testing.expect(t, f.seen >= 1, "the allocator was never asked for anything")
 	if testing.expect(t, refusal_first_built, "a refusal was not built once there was memory for it") {
 		testing.expect_value(t, dns.peek_rcode(refusal), dns.Rcode.Serv_Fail)
@@ -217,45 +218,12 @@ the root.
 @(test)
 test_an_upstream_query_whose_name_cannot_be_folded_is_not_built :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
-	f := Fail_Nth{fail_at = 1, fail_for = 1}
-	first := mem.Allocator{procedure = fail_nth_proc, data = &f}
+	f := testkit.Fail_Nth{fail_at = 1, fail_for = 1}
+	first := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
 	q := dns.Question{name = "Example.COM.", type = .A, class = .IN}
 	wire, built := upstream_query(q, false, false, first)
 	testing.expect(t, f.seen >= 1, "the allocator was never asked for anything")
 	testing.expectf(t, !built, "a query was built without its name: %v", wire)
-}
-
-// Fails `fail_for` requests from its `fail_at`th on and hands every other to
-// the temp arena. src/dns/out_of_memory_test.odin keeps its own copy over its own
-// arena: test files cannot be shared across packages.
-@(private)
-Fail_Nth :: struct {
-	seen:     int,
-	fail_at:  int,
-	fail_for: int,
-}
-
-@(private)
-fail_nth_proc :: proc(
-	data: rawptr,
-	mode: mem.Allocator_Mode,
-	size, alignment: int,
-	old_memory: rawptr,
-	old_size: int,
-	loc := #caller_location,
-) -> (
-	[]byte,
-	mem.Allocator_Error,
-) {
-	f := cast(^Fail_Nth)data
-	#partial switch mode {
-	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
-		f.seen += 1
-		if f.seen >= f.fail_at && f.seen < f.fail_at + f.fail_for {
-			return nil, .Out_Of_Memory
-		}
-	}
-	return context.temp_allocator.procedure(context.temp_allocator.data, mode, size, alignment, old_memory, old_size, loc)
 }
 
 /*
@@ -278,10 +246,10 @@ test_a_ddr_answer_keeps_its_opt_record_whatever_runs_dry :: proc(t: ^testing.T) 
 	query := dns.Message {
 		id         = 0x620,
 		question   = []dns.Question{{name = DDR_QNAME, type = .SVCB, class = .IN}},
-		additional = []dns.Record{dns.make_opt(1232, false)},
+		additional = []dns.Record{dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, false)},
 	}
 	q := query.question[0]
-	want, want_err := dns.decode_message(build_resolver_arpa_response(&s, query, q, context.temp_allocator, 1232), context.temp_allocator)
+	want, want_err := dns.decode_message(build_resolver_arpa_response(&s, query, q, context.temp_allocator, config.DEFAULT_MAX_UDP_RESPONSE), context.temp_allocator)
 	if !testing.expect_value(t, want_err, dns.Decode_Error.None) || !testing.expect_value(t, len(want.answer), 2) {
 		return
 	}
@@ -289,9 +257,9 @@ test_a_ddr_answer_keeps_its_opt_record_whatever_runs_dry :: proc(t: ^testing.T) 
 	// Runs as well as single refusals: a reserve refused alone is made up by
 	// the next append's grow.
 	for run in ([]int{1, 2, 3}) do for n := 1; ; n += 1 {
-		f := Fail_Nth{fail_at = n, fail_for = run}
-		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
-		out := build_resolver_arpa_response(&s, query, q, one, 1232)
+		f := testkit.Fail_Nth{fail_at = n, fail_for = run}
+		one := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
+		out := build_resolver_arpa_response(&s, query, q, one, config.DEFAULT_MAX_UDP_RESPONSE)
 		if f.seen < n {
 			break
 		}
@@ -309,15 +277,28 @@ test_a_ddr_answer_keeps_its_opt_record_whatever_runs_dry :: proc(t: ^testing.T) 
 		if !testing.expectf(t, len(read.answer) == len(want.answer), "refusing allocation %d sent %d of %d designations", n, len(read.answer), len(want.answer)) {
 			return
 		}
-		for rec, i in read.answer {
-			got, _ := rec.data.(dns.Rdata_SVCB)
-			full, _ := want.answer[i].data.(dns.Rdata_SVCB)
-			if !testing.expectf(t, string(got.params) == string(full.params), "refusing allocation %d cut designation %d's params", n, i) {
-				return
-			}
+		if !designations_whole(t, n, read, want) {
+			return
 		}
 	}
 	testing.expect(t, built_once, "no refusal left room for an answer, so the record went untested")
+}
+
+// Whether each SVCB designation in `read` carries `want`'s params whole, the
+// failure reported against refused allocation `n`.
+@(private = "file")
+designations_whole :: proc(t: ^testing.T, n: int, read, want: dns.Message) -> bool {
+	for rec, i in read.answer {
+		got, is_svcb := rec.data.(dns.Rdata_SVCB)
+		full, was_svcb := want.answer[i].data.(dns.Rdata_SVCB)
+		if !testing.expectf(t, is_svcb && was_svcb, "refusing allocation %d made designation %d something other than SVCB", n, i) {
+			return false
+		}
+		if !testing.expectf(t, string(got.params) == string(full.params), "refusing allocation %d cut designation %d's params", n, i) {
+			return false
+		}
+	}
+	return true
 }
 
 /*
@@ -329,15 +310,15 @@ test_a_loopback_answer_that_runs_dry_is_never_nodata :: proc(t: ^testing.T) {
 	query := dns.Message {
 		id         = 0x620,
 		question   = []dns.Question{{name = "localhost.", type = .A, class = .IN}},
-		additional = []dns.Record{dns.make_opt(1232, false)},
+		additional = []dns.Record{dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, false)},
 	}
 	q := query.question[0]
 	defer free_all(context.temp_allocator)
 	built_once := false
 	for n := 1; ; n += 1 {
-		f := Fail_Nth{fail_at = n, fail_for = 1}
-		one := mem.Allocator{procedure = fail_nth_proc, data = &f}
-		out := answer_special_use(query, q, LOCALHOST_ZONE, .Loopback, one, 1232)
+		f := testkit.Fail_Nth{fail_at = n, fail_for = 1}
+		one := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
+		out := answer_special_use(query, q, LOCALHOST_ZONE, .Loopback, one, config.DEFAULT_MAX_UDP_RESPONSE)
 		if f.seen < n {
 			break
 		}
@@ -376,20 +357,20 @@ test_a_dnssec_strip_that_runs_dry_is_whole_or_untouched :: proc(t: ^testing.T) {
 			{name = "example.com.", type = .A, class = .IN, ttl = 60, data = dns.Rdata_A{addr = {192, 0, 2, 1}}},
 			{name = "example.com.", type = .RRSIG, class = .IN, ttl = 60, data = dns.Rdata_Raw{data = make([]u8, 24, context.temp_allocator)}},
 		},
-		additional = []dns.Record{dns.make_opt(1232, true)},
+		additional = []dns.Record{dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, true)},
 	}
 	wire, _, err := dns.encode_message(reply, context.temp_allocator)
 	if !testing.expect_value(t, err, dns.Encode_Error.None) {
 		return
 	}
-	whole := strip_dnssec_records(wire, query, .A, nil, context.temp_allocator, 1232)
+	whole := strip_dnssec_records(wire, query, .A, nil, context.temp_allocator, config.DEFAULT_MAX_UDP_RESPONSE)
 	if !testing.expect(t, string(whole) != string(wire), "the strip took nothing out, so the sweep proves nothing") {
 		return
 	}
 	for run in ([]int{1, 2, 3}) do for n := 1; ; n += 1 {
-		f := Fail_Nth{fail_at = n, fail_for = run}
-		dry := mem.Allocator{procedure = fail_nth_proc, data = &f}
-		out := strip_dnssec_records(wire, query, .A, nil, dry, 1232)
+		f := testkit.Fail_Nth{fail_at = n, fail_for = run}
+		dry := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
+		out := strip_dnssec_records(wire, query, .A, nil, dry, config.DEFAULT_MAX_UDP_RESPONSE)
 		if f.seen < n {
 			break
 		}
@@ -444,7 +425,7 @@ test_an_upstream_option_that_cannot_be_stripped_is_not_forwarded :: proc(t: ^tes
 		return
 	}
 	marker := []u8{0xde, 0xad, 0xbe, 0xef, 0x62, 0x00}
-	opt := dns.make_opt(1232, false)
+	opt := dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, false)
 	opt.data = dns.Rdata_OPT{options = []dns.EDNS_Option{{code = u16(dns.EDNS_Option_Code.NSID), data = marker}}}
 	// The OPT record ahead of a glue record, so the strip has to rebuild.
 	reply := dns.Message {
@@ -458,9 +439,19 @@ test_an_upstream_option_that_cannot_be_stripped_is_not_forwarded :: proc(t: ^tes
 	if !testing.expect_value(t, err, dns.Encode_Error.None) {
 		return
 	}
+	// The baseline: with memory to spare the answer comes back, with an OPT
+	// record of its own and without the upstream's option.
+	whole_spent := 0
+	whole := normalise_client_opt(wire, query, .Forwarded, &whole_spent, context.temp_allocator)
+	read, rerr := dns.decode_message(whole, context.temp_allocator)
+	if !testing.expect(t, len(whole) > 0 && rerr == .None && dns.edns_present(read), "with memory to spare the answer did not come back with an OPT record") {
+		return
+	}
+	_, forwarded := dns.find_edns_option(read, .NSID)
+	testing.expect(t, !forwarded, "with memory to spare the upstream's option was forwarded")
 	for run in ([]int{1, 2, 3, 8}) do for n := 1; ; n += 1 {
-		f := Fail_Nth{fail_at = n, fail_for = run}
-		dry := mem.Allocator{procedure = fail_nth_proc, data = &f}
+		f := testkit.Fail_Nth{fail_at = n, fail_for = run}
+		dry := mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
 		spent := 0
 		out := normalise_client_opt(wire, query, .Forwarded, &spent, dry)
 		if f.seen < n {
@@ -512,7 +503,7 @@ test_a_rebind_check_read_without_memory_is_servfail_not_nodata :: proc(t: ^testi
 	}
 	for err, i in ([]dns.Decode_Error{.Out_Of_Memory, .Request_Budget}) {
 		decoded := Decoded_Answer{full_err = err, partial_err = err}
-		out, detail, refused := rebind_refusal(&s, msg, msg.question[0], decoded, 512, context.temp_allocator)
+		out, detail, refused := rebind_refusal(&s, msg, msg.question[0], decoded, dns.MAX_UDP_SIZE, context.temp_allocator)
 		testing.expect(t, refused)
 		testing.expect_value(t, detail, REBIND_UNREAD)
 		testing.expect_value(t, s.stats.rebind, 0)
@@ -686,9 +677,9 @@ test_a_refresh_without_room_is_declined :: proc(t: ^testing.T) {
 	defer stale_fixture_stop(&f)
 	query := stale_query(true)
 	for n in 1 ..= 4 {
-		fail := Fail_Nth{fail_at = n, fail_for = 1}
+		fail := testkit.Fail_Nth{fail_at = n, fail_for = 1}
 		heap := context.allocator
-		context.allocator = mem.Allocator{procedure = fail_nth_proc, data = &fail}
+		context.allocator = mem.Allocator{procedure = testkit.fail_nth_proc, data = &fail}
 		r := start_refresh(&f.srv, "refresh.example.", query, .UDP, "192.0.2.1", dns.MAX_UDP_SIZE, time.tick_now())
 		context.allocator = heap
 		if !testing.expectf(t, r == nil, "allocation %d refused: a refresh was started", n) {
@@ -714,12 +705,12 @@ test_a_doh2_connection_without_room_is_not_served :: proc(t: ^testing.T) {
 	cfg: config.Config
 	s := local_server(&cfg)
 	defer free_all(context.temp_allocator)
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		fail_at  = 1,
 		fail_for = 1,
 	}
 	{
-		context.allocator = mem.Allocator{procedure = fail_nth_proc, data = &f}
+		context.allocator = mem.Allocator{procedure = testkit.fail_nth_proc, data = &f}
 		// No TLS connection: one touched before the refusal would trap.
 		serve_doh2(&s, nil, "dry", {})
 	}

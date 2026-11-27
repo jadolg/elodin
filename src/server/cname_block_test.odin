@@ -180,7 +180,7 @@ serve_cached_answer :: proc(
 	outcome: Outcome
 	ok: bool
 	for _ in 0 ..< asks {
-		out, outcome, ok = handle_query(&s, test_query(qname), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		out, outcome, ok = handle_query(&s, test_query(qname), .UDP, TEST_CLIENT, context.temp_allocator)
 	}
 	testing.expect(t, ok, "nothing came back at all")
 	if response != nil {
@@ -420,12 +420,12 @@ test_a_clean_answer_is_walked_once_per_reload_and_not_once_per_hit :: proc(t: ^t
 		return
 	}
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], hops[0], .A, .IN, false, false)
+	key := cache.make_key(key_buf[:], hops[0], .A, .IN, false, checking_disabled = false)
 
 	_, first, found := cache.get(answers, key, context.temp_allocator, checked_against = filter.engine_generation(engine))
 	testing.expect(t, found && first.recheck, "an entry from before the reload was not flagged for a second look")
 
-	_, outcome, ok := handle_query(&s, test_query(hops[0]), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	_, outcome, ok := handle_query(&s, test_query(hops[0]), .UDP, TEST_CLIENT, context.temp_allocator)
 	testing.expect(t, ok, "nothing came back at all")
 	testing.expect_value(t, outcome, Outcome.Cached)
 
@@ -578,7 +578,7 @@ test_a_refused_answer_is_not_cached_with_the_upstream_ad_bit :: proc(t: ^testing
 	testing.expect_value(t, outcome, Outcome.Blocked)
 
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], "www.brand.example.", .A, .IN, false, false)
+	key := cache.make_key(key_buf[:], "www.brand.example.", .A, .IN, false, checking_disabled = false)
 	entry := cached_entry(h.answers, key)
 	if !testing.expect(t, entry != nil, "the refused answer was not stored, so nothing can re-walk it later") {
 		return
@@ -1005,7 +1005,7 @@ test_a_recheck_read_without_memory_keeps_the_entry :: proc(t: ^testing.T) {
 		return
 	}
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], hops[0], .A, .IN, false, false)
+	key := cache.make_key(key_buf[:], hops[0], .A, .IN, false, checking_disabled = false)
 	hit, stored := stored_answer(&s, key, rules_generation(&s), context.temp_allocator)
 	if !testing.expect(t, stored && hit.recheck, "an entry from before the reload was not flagged for a second look") {
 		return
@@ -1045,7 +1045,7 @@ test_a_cloak_refusal_that_built_nothing_is_counted_failed :: proc(t: ^testing.T)
 		msg,
 		msg.question[0],
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		dns.MAX_UDP_SIZE,
 		time.tick_now(),
 		mem.nil_allocator(),

@@ -40,14 +40,14 @@ test_response_limit_takes_the_smaller_of_the_two :: proc(t: ^testing.T) {
 	// Asked for more than the ceiling: held to the ceiling.
 	testing.expect_value(t, response_limit(&s, query_advertising(4096), .UDP), config.DEFAULT_MAX_UDP_RESPONSE)
 	// Asked for less: given what it asked for, not the ceiling.
-	testing.expect_value(t, response_limit(&s, query_advertising(512), .UDP), 512)
+	testing.expect_value(t, response_limit(&s, query_advertising(dns.MAX_UDP_SIZE), .UDP), dns.MAX_UDP_SIZE)
 	// No OPT record at all is 512 by RFC 1035, and the ceiling does not raise it.
-	testing.expect_value(t, response_limit(&s, dns.Message{}, .UDP), 512)
+	testing.expect_value(t, response_limit(&s, dns.Message{}, .UDP), dns.MAX_UDP_SIZE)
 
-	// Raised, and the client's larger number is now the one that binds.
+	// Raised, and the client's larger number is the one that binds.
 	cfg.server.max_udp_response = config.MAX_UDP_RESPONSE
 	testing.expect_value(t, response_limit(&s, query_advertising(4096), .UDP), config.MAX_UDP_RESPONSE)
-	testing.expect_value(t, response_limit(&s, query_advertising(1232), .UDP), 1232)
+	testing.expect_value(t, response_limit(&s, query_advertising(config.DEFAULT_MAX_UDP_RESPONSE), .UDP), config.DEFAULT_MAX_UDP_RESPONSE)
 	free_all(context.temp_allocator)
 }
 
@@ -313,7 +313,7 @@ test_a_stale_answer_waits_for_the_upstream_to_fail :: proc(t: ^testing.T) {
 		return
 	}
 
-	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expect(t, ok, "the stale answer went unserved") {
 		return
 	}
@@ -340,56 +340,6 @@ test_a_stale_answer_waits_for_the_upstream_to_fail :: proc(t: ^testing.T) {
 LIVE_ADDR :: [4]u8{192, 0, 2, 99}
 
 @(private)
-Stale_Exchange :: struct {
-	socket: net.UDP_Socket,
-	reply:  []u8,
-	got:    bool,
-	// How long to sit on the query before answering it. Zero answers at once,
-	// which is what every case but the response-timer ones wants; the others
-	// need an upstream that is slow rather than absent, so that the client
-	// gives up on it while it is still going to answer.
-	delay:  time.Duration,
-	// Held until posted, rather than for a duration, where the case needs the
-	// client answered before the upstream is; bounded by `MOCK_RECV_TIMEOUT`.
-	hold:   ^sync.Sema,
-}
-
-/*
-Serve exactly one query: the one asking `reply`'s question, skipping any other
-datagram as `Canned_Mock` does (a straggler from another case on a reused
-port), with the delay or hold `Canned_Mock` has no room for.
-
-One query per thread, joined by the caller before it reads `got`: there is no
-shared state to guard, and a query that never arrives leaves `got` false rather
-than hanging the suite - the socket carries a receive timeout.
-*/
-@(private)
-serve_one_stale :: proc(x: ^Stale_Exchange) {
-	buf: [4096]u8
-	if len(x.reply) > len(buf) {
-		return
-	}
-	_, remote, asked := recv_question(x.socket, x.reply, buf[:])
-	if !asked {
-		return
-	}
-	x.got = true
-	if x.delay > 0 {
-		time.sleep(x.delay)
-	}
-	if x.hold != nil {
-		_ = sync.sema_wait_with_timeout(x.hold, MOCK_RECV_TIMEOUT)
-	}
-
-	out: [4096]u8
-	copy(out[:], x.reply)
-	// Echo the ID it was asked with. The resolver draws a fresh one for every
-	// query it forwards, so nothing here can know it in advance.
-	out[0], out[1] = buf[0], buf[1]
-	_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
-}
-
-@(private)
 live_reply :: proc() -> []u8 {
 	return test_reply(STALE_NAME, .A, a_record(STALE_NAME, LIVE_ADDR))
 }
@@ -413,7 +363,7 @@ test_a_stale_copy_is_not_served_past_its_rrsig_after_the_wait :: proc(t: ^testin
 	// Live when `get` reads it, lapsed long before the upstream times out.
 	stale_entry(f.answers).signed_until = loop.moment_add(loop.moment_now(), 50 * time.Millisecond)
 
-	out, _, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, _, ok := handle_query(&f.srv, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	if testing.expect(t, ok, "nothing came back at all") {
 		served, derr := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr, dns.Decode_Error.None)
@@ -441,18 +391,18 @@ test_a_lapsed_stale_copy_waits_for_the_refresh :: proc(t: ^testing.T) {
 	defer stale_fixture_stop(&f)
 	stale_entry(f.answers).signed_until = loop.moment_add(loop.moment_now(), 50 * time.Millisecond)
 
-	x := Stale_Exchange {
+	x := Canned_Mock {
 		socket = f.socket,
 		reply  = live_reply(),
 		delay  = 400 * time.Millisecond,
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
 	defer {
 		thread.join(mock)
 		thread.destroy(mock)
 	}
 
-	out, _, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, _, ok := handle_query(&f.srv, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	if testing.expect(t, ok, "nothing came back at all") {
 		served, derr := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr, dns.Decode_Error.None)
@@ -489,12 +439,12 @@ test_a_live_upstream_beats_a_stale_entry :: proc(t: ^testing.T) {
 	}
 	defer stale_fixture_stop(&f)
 
-	x := Stale_Exchange {
+	x := Canned_Mock {
 		socket = f.socket,
 		reply  = live_reply(),
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
-	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
 
@@ -552,12 +502,12 @@ test_a_referral_falls_back_on_a_stale_entry :: proc(t: ^testing.T) {
 	if !testing.expect_value(t, enc, dns.Encode_Error.None) {
 		return
 	}
-	x := Stale_Exchange {
+	x := Canned_Mock {
 		socket = f.socket,
 		reply  = wire,
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
-	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
 
@@ -595,7 +545,7 @@ test_a_fresh_hit_is_answered_without_the_upstream :: proc(t: ^testing.T) {
 		return
 	}
 
-	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expect(t, ok, "the cached answer went unserved") {
 		return
 	}
@@ -633,7 +583,7 @@ test_an_expired_entry_is_no_fallback_without_serve_stale :: proc(t: ^testing.T) 
 		return
 	}
 
-	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
@@ -667,7 +617,7 @@ test_rd_zero_is_refused_from_a_stale_entry :: proc(t: ^testing.T) {
 		return
 	}
 
-	out, outcome, ok := handle_query(&s, stale_query(false), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, stale_query(false), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expect(t, ok, "an RD=0 query went unanswered") {
 		return
 	}
@@ -710,7 +660,7 @@ test_a_stale_answer_does_not_wait_out_the_upstream_budget :: proc(t: ^testing.T)
 	}
 	defer stale_fixture_stop(&f)
 
-	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	refreshing := queries_pending(&f.srv)
 
 	if !testing.expect(t, ok, "the stale answer went unserved") {
@@ -780,7 +730,7 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 			&f.srv,
 			stale_query(true),
 			.UDP,
-			"127.0.0.1:5555",
+			TEST_CLIENT,
 			context.temp_allocator,
 		)
 		testing.expectf(t, ok, "query %d went unanswered", i)
@@ -805,7 +755,7 @@ test_one_refresh_covers_every_client_waiting_on_a_name :: proc(t: ^testing.T) {
 	*/
 	stale_fixture_join(&f)
 
-	testing.expect_value(t, drain_datagrams(f.socket), 1)
+	testing.expect_value(t, mock_heard(f.socket, STALE_NAME), 1)
 	free_all(context.temp_allocator)
 }
 
@@ -833,14 +783,14 @@ test_a_refresh_outlives_the_client_that_started_it :: proc(t: ^testing.T) {
 	defer stale_fixture_stop(&f)
 
 	served_first: sync.Sema
-	x := Stale_Exchange {
+	x := Canned_Mock {
 		socket = f.socket,
 		reply  = live_reply(),
 		hold   = &served_first,
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
 
-	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	sync.sema_post(&served_first)
 	if !testing.expect(t, ok, "the stale answer went unserved") {
 		thread.join(mock)
@@ -902,12 +852,12 @@ test_a_refresh_that_beats_the_timer_answers_the_client :: proc(t: ^testing.T) {
 	}
 	defer stale_fixture_stop(&f)
 
-	x := Stale_Exchange {
+	x := Canned_Mock {
 		socket = f.socket,
 		reply  = live_reply(),
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_one_stale)
-	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
 
@@ -934,13 +884,12 @@ test_a_refresh_that_beats_the_timer_answers_the_client :: proc(t: ^testing.T) {
 /*
 And `cache.stale_timeout: 0` really is the escape hatch it is documented as.
 
-The setting promises an operator that zero restores what every release before
-the timer did: the client waits the whole upstream budget out and is served the
-expired entry only once that has failed. Everything else here asserts the timer
-firing, so without this the promise was held up by the loader parsing the figure
-and by nothing at all downstream of it - which is the half an operator actually
-relies on when they decide they would rather wait than be handed data known to
-be out of date.
+The setting promises an operator that with zero the client waits the whole
+upstream budget out and is served the expired entry only once that has failed.
+Everything else here asserts the timer firing, so without this the promise would
+rest on the loader parsing the figure and on nothing at all downstream of it -
+which is the half an operator actually relies on when they decide they would
+rather wait than be handed data known to be out of date.
 
 Asserted as where the attempt ran rather than as how long it took. The upstream
 is the same blackholed socket the case above uses, so only its timeout ends an
@@ -966,7 +915,7 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 	}
 	defer stale_fixture_stop(&f)
 
-	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&f.srv, stale_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	detached := queries_pending(&f.srv)
 
 	if !testing.expect(t, ok, "the stale answer went unserved") {
@@ -995,33 +944,8 @@ test_a_zero_timer_waits_the_upstream_out :: proc(t: ^testing.T) {
 	// Nothing was ever submitted, so this stops an idle loop; the count behind
 	// it is the one attempt this thread made for itself.
 	stale_fixture_join(&f)
-	testing.expect_value(t, drain_datagrams(f.socket), 1)
+	testing.expect_value(t, mock_heard(f.socket, STALE_NAME), 1)
 	free_all(context.temp_allocator)
-}
-
-/*
-How many datagrams are sitting in a socket nobody read.
-
-Exact rather than raced, and it is the caller that makes it so: every thread
-that could still send has been joined before this is called, so the timeout
-below only has to separate "the buffer is empty" from "the kernel has not
-finished handing over what it already has". It is not a window for a send to
-arrive in - a caller that needed one would be asserting about a scheduler.
-
-`SO_RCVTIMEO` reads zero as no timeout at all, which on an empty socket is the
-one value that hangs - the same trap `mock_untouched` documents.
-*/
-@(private = "file")
-drain_datagrams :: proc(socket: net.UDP_Socket) -> (count: int) {
-	_ = net.set_option(socket, .Receive_Timeout, 50 * time.Millisecond)
-	buf: [4096]u8
-	for {
-		n, _, err := net.recv_udp(socket, buf[:])
-		if err != nil || n == 0 {
-			return
-		}
-		count += 1
-	}
 }
 
 /*
@@ -1091,9 +1015,9 @@ test_wildcard_rewrite_excludes_the_apex_and_bare_suffixes :: proc(t: ^testing.T)
 }
 
 /*
-An exact rewrite is unaffected by any of this and has always folded case; it is
-pinned here beside the wildcard so that a change to one matcher that forgets the
-other shows up.
+An exact rewrite is unaffected by any of this and folds case; it is pinned
+here beside the wildcard so that a change to one matcher that forgets the other
+shows up.
 */
 @(test)
 test_exact_rewrite_matches_regardless_of_case :: proc(t: ^testing.T) {
@@ -1131,7 +1055,7 @@ test_mixed_case_query_is_answered_by_a_wildcard_rewrite :: proc(t: ^testing.T) {
 		cfg = &cfg,
 	}
 
-	out, outcome, ok := handle_query(&s, test_query("HOST.LaN.", id = 0x4d21, rd = false), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, outcome, ok := handle_query(&s, test_query("HOST.LaN.", id = 0x4d21, rd = false), .UDP, TEST_CLIENT, context.temp_allocator)
 	if !testing.expect(t, ok, "a mixed-case query under a wildcard rewrite went unanswered") {
 		return
 	}

@@ -1272,8 +1272,9 @@ spawn_failure_limit :: proc(why: Spawn_Result, cm: ^Conn_Manager) -> int {
 	return cm.prefix_limit if why == .Prefix_Limit_Reached else cm.limit
 }
 
+// Per transport, so the first refusal on each one is said.
 @(private)
-query_spawn_reported: bool
+query_spawn_reported: [Protocol]bool
 
 /*
 Say, once, that a query could not be given a fiber of its own.
@@ -1282,7 +1283,8 @@ The query-side twin of `report_spawn_failure`'s third cause: a UDP datagram or a
 HTTP/2 request that `submit_query` could not start because the OS would not map
 a stack. Counted as dropped=, which is also what `max_pending` shedding counts,
 and the two want opposite remedies - so the first one is said at `warn`, naming
-what to check. Once per process: the per-client detail is the debug lines' job.
+what to check. Once per transport for the life of the process: the per-client
+detail is the debug lines' job.
 Formats nothing out of the scratch, since the HTTP/2 caller's holds the frame
 `h2.serve` is still working through.
 */
@@ -1290,7 +1292,7 @@ Formats nothing out of the scratch, since the HTTP/2 caller's holds the frame
 report_query_spawn_failure :: proc(proto: Protocol) {
 	// `first`, not `say`: readers on several loops fail together, and only the
 	// one that turned the flag may speak.
-	if _, first := report_once(&query_spawn_reported, false); !first {
+	if _, first := report_once(&query_spawn_reported[proto], false); !first {
 		return
 	}
 	logx.warnf(

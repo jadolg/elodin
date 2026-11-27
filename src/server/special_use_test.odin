@@ -94,7 +94,7 @@ leak_server :: proc(
 	descriptor 0. That descriptor is stdin in an ordinary run and a *parallel
 	test's socket* under `odin test`, which closes stdin before the binary
 	starts: the victim then sees its own socket stop working for no reason it
-	can see. It cost an afternoon once; the copy is one line.
+	can see. The copy is one line.
 	*/
 	x := new(Canned_Mock, context.temp_allocator)
 	x^ = Canned_Mock {
@@ -125,8 +125,16 @@ the test's own temporary memory.
 */
 @(private = "file")
 nothing_reached :: proc(x: ^Canned_Mock, query: []u8) -> (clean: bool, asked: dns.Question) {
-	_ = net.set_option(x.socket, .Receive_Timeout, 20 * time.Millisecond)
-	want, _ := dns.peek_question(query, context.temp_allocator)
+	want, peeked := dns.peek_question(query, context.temp_allocator)
+	if !peeked {
+		// With no name to look for, every leak would pass as clean.
+		panic("the case's own query has no question to peek")
+	}
+	// A read the short bound did not reach would wait out `MOCK_RECV_TIMEOUT`;
+	// reported as reached, the case fails instead.
+	if net.set_option(x.socket, .Receive_Timeout, 20 * time.Millisecond) != nil {
+		return false, {}
+	}
 	buf: [4096]u8
 	for {
 		n, _, err := net.recv_udp(x.socket, buf[:])
@@ -294,7 +302,7 @@ test_special_use_names_are_not_sent_to_the_upstream :: proc(t: ^testing.T) {
 		defer upstream.destroy_group(s.group)
 
 		query := test_query(c.name, c.type)
-		out, outcome, ok := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+		out, outcome, ok := handle_query(&s, query, .UDP, TEST_CLIENT, context.temp_allocator)
 
 		clean, asked := nothing_reached(x, query)
 		testing.expectf(t, clean, "%s was sent to the public upstream, which was asked %s %v", c.name, asked.name, asked.type)
@@ -435,7 +443,8 @@ test_a_default_configuration_still_forwards_local_test_and_example :: proc(t: ^t
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		_, outcome, _ := exchange_with(&s, x, serve_canned, test_query(name))
+		_, outcome, answered := exchange_with(&s, x, serve_canned, test_query(name))
+		testing.expectf(t, answered, "%s went unanswered", name)
 
 		testing.expectf(t, x.got, "%s was answered locally by a default configuration", name)
 		testing.expectf(t, outcome == .Forwarded, "%s came back as %v rather than forwarded", name, outcome)
@@ -479,9 +488,10 @@ test_the_home_arpa_apex_ds_is_still_forwarded :: proc(t: ^testing.T) {
 
 		opt: Maybe(dns.Record)
 		if do_bit {
-			opt = dns.make_opt(1232, true)
+			opt = dns.make_opt(config.DEFAULT_MAX_UDP_RESPONSE, true)
 		}
-		_, outcome, _ := exchange_with(&s, x, serve_canned, test_query("home.arpa.", .DS, opt = opt))
+		_, outcome, answered := exchange_with(&s, x, serve_canned, test_query("home.arpa.", .DS, opt = opt))
+		testing.expect(t, answered, "the DS query for home.arpa. went unanswered")
 
 		testing.expectf(
 			t,
@@ -597,14 +607,16 @@ test_private_reverse_stands_down_where_it_must :: proc(t: ^testing.T) {
 			}
 
 			if pass == 0 {
-				_, outcome, _ := exchange_with(&s, x, serve_canned, test_query(name, type))
+				_, outcome, answered := exchange_with(&s, x, serve_canned, test_query(name, type))
+				testing.expectf(t, answered, "%s: %s %v went unanswered", c.what, name, type)
 				testing.expectf(t, x.got, "%s: %s %v was answered from the table", c.what, name, type)
 				testing.expectf(t, outcome == .Forwarded, "%s: %s came back as %v", c.what, name, outcome)
 			} else {
 				query := test_query(name, type)
-				_, outcome, _ := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
-				clean, _ := nothing_reached(x, query)
-				testing.expectf(t, clean, "%s: the sibling %s was sent to the upstream", c.what, name)
+				_, outcome, answered := handle_query(&s, query, .UDP, TEST_CLIENT, context.temp_allocator)
+				testing.expectf(t, answered, "%s: the sibling %s went unanswered", c.what, name)
+				clean, asked := nothing_reached(x, query)
+				testing.expectf(t, clean, "%s: the sibling %s was sent to the upstream as %v", c.what, name, asked)
 				testing.expectf(t, outcome == .Local, "%s: the sibling %s came back as %v", c.what, name, outcome)
 			}
 		}
@@ -656,9 +668,11 @@ test_private_reverse_name_above_a_route_is_nodata :: proc(t: ^testing.T) {
 			id       = 7,
 			question = questions,
 		}
-		wire := answer_special_use(query, questions[0], zone, kind, context.temp_allocator, 512)
+		wire := answer_special_use(query, questions[0], zone, kind, context.temp_allocator, dns.MAX_UDP_SIZE)
 		resp, err := dns.decode_message(wire, context.temp_allocator)
-		testing.expect_value(t, err, dns.Decode_Error.None)
+		if !testing.expect_value(t, err, dns.Decode_Error.None) {
+			continue
+		}
 		testing.expectf(t, dns.Rcode(resp.flags.rcode) == c.want, "%s: rcode %v, want %v", c.name, dns.Rcode(resp.flags.rcode), c.want)
 		testing.expect_value(t, len(resp.answer), 0)
 		if testing.expect_value(t, len(resp.authority), 1) {
@@ -769,13 +783,15 @@ test_a_tor_aware_upstream_can_be_given_onion_back :: proc(t: ^testing.T) {
 	defer net.close(x_socket)
 	defer upstream.destroy_group(s.group)
 
-	_, outcome, _ := exchange_with(&s, x, serve_canned, test_query("duskgytldkxiuqc6otgh4.onion."))
+	_, outcome, answered := exchange_with(&s, x, serve_canned, test_query("duskgytldkxiuqc6otgh4.onion."))
+	testing.expect(t, answered, "the .onion query went unanswered")
 
 	testing.expect(t, x.got, "special_use.onion: false did not hand the query to the upstream")
 	testing.expectf(t, outcome == .Forwarded, "the .onion query came back as %v rather than forwarded", outcome)
 
 	// The rest of the table is untouched by that key.
-	_, local_outcome, _ := handle_query(&s, test_query("localhost."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	_, local_outcome, local_answered := handle_query(&s, test_query("localhost."), .UDP, TEST_CLIENT, context.temp_allocator)
+	testing.expect(t, local_answered, "localhost. went unanswered")
 	testing.expectf(
 		t,
 		local_outcome == .Local,
@@ -802,8 +818,8 @@ setting. `onion: false` is the narrow claim about the upstream; `enabled: false`
 is the blunt key an operator with a local tor may well reach for instead, having
 no reason to read the difference off the names. Were only the first to stand the
 validator down, the second would be a SERVFAIL for every `.onion` name with a
-startup warning all that pointed at it. If `special_use_deferred` is ever narrowed
-back to `onion` alone, the second case here fails.
+startup warning all that pointed at it. A `special_use_deferred` reading `onion`
+alone fails the second case here.
 
 The mock answers with an address the way a local tor would, and the assertion is
 that the client sees it.
@@ -949,7 +965,7 @@ test_special_use_answers_do_not_enter_the_cache :: proc(t: ^testing.T) {
 			&s,
 			test_query("duskgytldkxiuqc6otgh4.onion."),
 			.UDP,
-			"127.0.0.1:5555",
+			TEST_CLIENT,
 			context.temp_allocator,
 		)
 		testing.expectf(t, ok, "the .onion query went unanswered on attempt %d", i + 1)
@@ -984,7 +1000,8 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		_, _, _ = handle_query(&s, test_query(name), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		_, _, answered := handle_query(&s, test_query(name), .UDP, TEST_CLIENT, context.temp_allocator)
+		testing.expectf(t, answered, "%s went unanswered", name)
 		testing.expectf(
 			t,
 			s.stats.special_use == 1,
@@ -1007,7 +1024,8 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		_, outcome, _ := handle_query(&s, test_query(name, .PTR), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		_, outcome, answered := handle_query(&s, test_query(name, .PTR), .UDP, TEST_CLIENT, context.temp_allocator)
+		testing.expectf(t, answered, "%s went unanswered", name)
 		testing.expectf(t, outcome == .Local, "%s came back as %v rather than local", name, outcome)
 		testing.expectf(t, s.stats.special_use == 0, "%s left the counter at %d, want 0", name, s.stats.special_use)
 	}
@@ -1028,7 +1046,8 @@ test_the_special_use_counter_counts_only_what_the_table_answered :: proc(t: ^tes
 		defer net.close(x_socket)
 		defer upstream.destroy_group(s.group)
 
-		_, outcome, _ := exchange_with(&s, x, serve_canned, test_query(name))
+		_, outcome, answered := exchange_with(&s, x, serve_canned, test_query(name))
+		testing.expectf(t, answered, "%s went unanswered", name)
 
 		testing.expectf(t, outcome == .Forwarded, "%s came back as %v rather than forwarded", name, outcome)
 		testing.expectf(
@@ -1050,10 +1069,9 @@ specific hidden service on a list gets the block response they configured and
 sees it in `blocked` rather than having the table quietly answer first and leave
 the list looking like it did nothing.
 
-It is also the half of the comparison with the DDR zone that could actually
-regress. DDR is answered *above* the block lists, deliberately, because nothing
-legitimately lists `resolver.arpa`; if that placement were ever copied onto this
-table to make the two look alike, this test is what would fail.
+The DDR zone sits in the same place, below the block lists, under the one
+ordering `answer_locally` keeps for both; this test is what fails if the table
+is moved above the lists.
 */
 @(test)
 test_a_blocklist_entry_for_a_reserved_name_wins :: proc(t: ^testing.T) {
@@ -1075,7 +1093,7 @@ test_a_blocklist_entry_for_a_reserved_name_wins :: proc(t: ^testing.T) {
 		&s,
 		test_query("duskgytldkxiuqc6otgh4.onion."),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	testing.expect(t, ok, "the blocked .onion name went unanswered")
@@ -1098,7 +1116,7 @@ test_a_blocklist_entry_for_a_reserved_name_wins :: proc(t: ^testing.T) {
 		&s,
 		test_query("unlisted.onion."),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	testing.expect(t, other_ok, "an unlisted .onion name went unanswered")
@@ -1161,22 +1179,13 @@ test_an_anchor_over_onion_beats_the_key_that_forwards_it :: proc(t: ^testing.T) 
 	)
 
 	// And the label boundary holds here too: an anchor over `onion.` is not an
-	// anchor over somebody else's `notonion.`, so that name keeps the bypass.
-	other := "x.notonion."
+	// anchor over somebody else's `notonion.`, and with the bypass on that name is
+	// not one to defer.
+	testing.expect(t, !covered_by_local_anchor(&s, "x.notonion."), "notonion. was treated as being inside onion.")
 	ocfg := test_config()
 	ocfg.special_use.onion = false
-	os_, ox, obuilt := leak_server(t, &ocfg, other)
-	if !obuilt {
-		return
-	}
-	ox_socket := ox.socket
-	defer net.close(ox_socket)
-	defer upstream.destroy_group(os_.group)
-	testing.expect(
-		t,
-		!special_use_deferred(&os_, other),
-		"notonion. was treated as being inside onion.",
-	)
+	os_ := Server{cfg = &ocfg}
+	testing.expect(t, !special_use_deferred(&os_, "x.notonion."), "notonion. was deferred as being inside onion.")
 
 	free_all(context.temp_allocator)
 }

@@ -7,6 +7,7 @@ import "core:testing"
 import "core:thread"
 import "core:time"
 import "elodin:loop"
+import "elodin:testkit"
 
 /*
 Client tests run over a plain loopback TCP socket, no TLS: ALPN selection
@@ -2475,11 +2476,11 @@ test_client_response_without_room_is_this_ends :: proc(t: ^testing.T) {
 	c := p.c
 
 	// The copy handed to the caller.
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		backing = allocator,
 	}
 	arm(&f, 1, 1)
-	_, err := client_request(c, DOH_REQUEST, 2 * time.Second, fail_nth(&f))
+	_, err := client_request(c, DOH_REQUEST, 2 * time.Second, testkit.fail_nth(&f))
 	testing.expect_value(t, err, Client_Error.Out_Of_Memory)
 	testing.expect(t, refused_any(&f), "nothing was refused")
 
@@ -2487,7 +2488,7 @@ test_client_response_without_room_is_this_ends :: proc(t: ^testing.T) {
 	heap := c.allocator
 	arm(&f, 2, 2)
 	f.backing = heap
-	c.allocator = fail_nth(&f)
+	c.allocator = testkit.fail_nth(&f)
 	_, err = client_request(c, DOH_REQUEST, 2 * time.Second, allocator)
 	c.allocator = heap
 	testing.expect_value(t, err, Client_Error.Out_Of_Memory)
@@ -2556,12 +2557,12 @@ test_client_request_cut_short_by_this_ends_memory_is_out_of_memory :: proc(t: ^t
 		return
 	}
 	c := p.c
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		backing = c.decoder.allocator,
 	}
 	arm(&f, 1, 1)
 	// Set before the request goes out, and so before the reader decodes its answer.
-	c.decoder.allocator = fail_nth(&f)
+	c.decoder.allocator = testkit.fail_nth(&f)
 
 	_, err := client_request(c, DOH_REQUEST, 2 * time.Second)
 	testing.expect_value(t, err, Client_Error.Out_Of_Memory)
@@ -2638,13 +2639,13 @@ test_a_request_with_no_room_passes_its_slot_on :: proc(t: ^testing.T) {
 	}
 
 	// Whichever wakes first has no room for its stream.
-	f := Fail_Nth {
+	f := testkit.Fail_Nth {
 		backing  = allocator,
 		fail_at  = 1,
 		fail_for = 1,
 	}
 	loop.lock(&c.mu)
-	c.allocator = fail_nth(&f)
+	c.allocator = testkit.fail_nth(&f)
 	// The slot freed as `client_request`'s cleanup frees it.
 	delete_key(&c.streams, u32(1))
 	client_stream_destroy(c, held)

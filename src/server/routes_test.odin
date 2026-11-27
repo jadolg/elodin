@@ -1,7 +1,6 @@
 package server
 
 import "core:fmt"
-import "core:mem"
 import "core:net"
 import "core:strings"
 import "core:testing"
@@ -25,137 +24,29 @@ below, because each is a different way for the sentence to be true while the
 deployment it was written for still does not work.
 */
 
-@(private = "file")
-Route_Mock :: struct {
-	socket:   net.UDP_Socket,
-	reply:    []u8,
-	asked:    bool,
-	// What was asked, for the test to read once the mock has been joined. It is
-	// held in `name_buf` rather than pointing at whatever memory the question
-	// was decoded into, that memory belonging to the mock thread.
-	name:     string,
-	// The question this mock is waiting for. Every case sets it: a mock that
-	// answers whatever arrives first is one another test's stray retry can be
-	// recorded by, which is the flake `serve_route` below describes.
-	want:     string,
-	name_buf: [512]u8,
-}
-
 /*
-Answer one query, recording the name it asked for.
+The name a route mock was asked about, read once it has been joined.
 
-The name is what separates this from the mocks in the other files: a test that
-only asks whether a socket was written to cannot tell a routed question from the
-chain lookups the validator makes on its own account, and those two go to
-different groups on purpose.
-
-`want` skips packets asking about anything else rather than answering them, and
-every case names one. The tests in this package run in parallel against sockets
-bound to port zero, and a port a finished test's mock has released is one the
-kernel can hand to the next test that asks - so a query another case's server is
-still retrying can arrive here, be recorded as the question this case asked, and
-fail it on a name it never mentioned. Waiting for the name turns that into a
-packet nobody answered, which is what it is. Nothing about how many sockets a
-case binds changes that, the stray packet coming from outside the case
-altogether, so there is no shape of case that wants the unfiltered reading.
-
-The name is copied into `name_buf` on the way out, and that is the part not to
-undo. `thread.create_and_start_with_poly_data` is called with no `init_context`,
-which per `thread.Thread.init_context` gives this procedure a temporary
-allocator of its own that the runtime destroys when the thread dies - so a name
-decoded into temp memory here is freed by `thread.join` returning, which is
-precisely when the test reads it. That read would be a use-after-free, one that
-can segfault the test runner on arm64 while passing on amd64, the way that class
-of bug does. `name_buf` lives in the caller's own frame, which outlives the mock
-by construction.
-
-The stack arena below keeps that honest: nothing this
-procedure decodes can outlive the arena it was decoded into, so the copy is the
-only way anything leaves. `peek_question` reads one name and stops, where a
-whole-message decode would allocate per record for a reply the mock never looks
-at.
+The name is what separates these cases from the others: a test that only asks
+whether a socket was written to cannot tell a routed question from the chain
+lookups the validator makes on its own account, and those two go to different
+groups on purpose. Every mock here waits for its `want`, so a question another
+case's server is still retrying to a reused port is a packet nobody answered.
+Peeked on the test's own thread, into its temp arena, from the bytes the mock
+copied into `seen`.
 */
 @(private = "file")
-serve_route :: proc(x: ^Route_Mock) {
-	scratch: mem.Arena
-	backing: [4096]u8
-	mem.arena_init(&scratch, backing[:])
-	buf: [4096]u8
-	if len(x.reply) > len(buf) {
-		return
-	}
-	for {
-		n, remote, err := net.recv_udp(x.socket, buf[:])
-		if err != nil {
-			// The receive timeout expiring, which is how this returns when the
-			// question it wants never arrives.
-			return
-		}
-		// A datagram too short to be a question is skipped rather than taken as
-		// the end of the wait: giving up on one would hand a stray runt from
-		// another parallel test the power to fail this case on "never asked",
-		// which is the flake the loop exists to close.
-		if n < dns.HEADER_SIZE {
-			continue
-		}
-		free_all(mem.arena_allocator(&scratch))
-		q, ok := dns.peek_question(buf[:n], mem.arena_allocator(&scratch))
-		if !ok || !dns.name_equal_fold(q.name, x.want) {
-			continue
-		}
-		x.name = string(x.name_buf[:copy(x.name_buf[:], q.name)])
-		x.asked = true
-		out: [4096]u8
-		copy(out[:], x.reply)
-		out[0], out[1] = buf[0], buf[1]
-		_, _ = net.send_udp(x.socket, out[:len(x.reply)], remote)
-		return
-	}
+asked_name :: proc(x: ^Canned_Mock) -> string {
+	q, ok := dns.peek_question(x.seen[:x.seen_len], context.temp_allocator)
+	return q.name if ok else ""
 }
 
-/*
-How many questions about `name` are sitting unread in `socket`.
-
-`mock_untouched` reads one packet and calls any packet at all a leak, which is
-sound for a socket nothing else in the process knows about and not for one whose
-port may have been another test's a moment ago - see `serve_route` above. This
-reads for as long as that one does and counts only the question this case asked.
-
-Counted rather than merely noticed because one case turns on the difference: a
-parent that never replies has to be asked once per query rather than once per
-cooldown, and "was asked at all" cannot tell those apart. One datagram per query
-per server, these fixtures running `attempts: 1` over one-server groups.
-*/
-@(private = "file")
-route_mock_heard :: proc(socket: net.UDP_Socket, name: string) -> (heard: int) {
-	_ = net.set_option(socket, .Receive_Timeout, 20 * time.Millisecond)
-	defer _ = net.set_option(socket, .Receive_Timeout, MOCK_RECV_TIMEOUT)
-	buf: [4096]u8
-	for {
-		n, _, err := net.recv_udp(socket, buf[:])
-		if err != nil {
-			return
-		}
-		// Skipped rather than read as silence, the same way `serve_route` skips
-		// it: a runt ahead of a real leak would otherwise report the socket
-		// quiet with the leaked query still sitting in its buffer.
-		if n < dns.HEADER_SIZE {
-			continue
-		}
-		// The temp allocator is safe here where it is not in `serve_route`: this
-		// runs on the test's own thread, and nothing decoded escapes the call.
-		if q, ok := dns.peek_question(buf[:n], context.temp_allocator);
-		   ok && dns.name_equal_fold(q.name, name) {
-			heard += 1
-		}
-	}
-}
-
-// Whether nothing asked `socket` about `name`, which is the reading most cases
-// want of the count above.
+// Whether nothing asked `socket` about `name` (`mock_heard`): a parent that never
+// replies is asked once per query, so the count matters to one case and the
+// silence to the rest.
 @(private = "file")
 route_mock_quiet :: proc(socket: net.UDP_Socket, name: string) -> bool {
-	return route_mock_heard(socket, name) == 0
+	return mock_heard(socket, name) == 0
 }
 
 /*
@@ -169,23 +60,10 @@ the test would read as the upstream never having answered.
 */
 @(private = "file")
 route_reply_nodata :: proc(name: string, type: dns.Type, rcode := dns.Rcode.No_Error) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = type, class = .IN}
 	// The SOA a real denial carries (RFC 2308 section 3), without which the
 	// cache would not keep it at all.
-	msg := dns.Message {
-		question  = question,
-		authority = []dns.Record{synth_soa_for_zone(name, 300)},
-	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	msg.flags.rcode = u8(rcode)
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	soa := [1]dns.Record{synth_soa_for_zone(name, 300)}
+	return test_reply(name, type, rcode = rcode, authority = soa[:])
 }
 
 /*
@@ -245,24 +123,8 @@ with no SOA beside it (RFC 2308 section 2.2, type 4; issue #410).
 */
 @(private = "file")
 route_reply_referral :: proc(name: string, type: dns.Type) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = type, class = .IN}
-	authority := make([]dns.Record, 1, context.temp_allocator)
-	authority[0] = dns.Record {
-		name  = name,
-		type  = .NS,
-		class = .IN,
-		ttl   = 3600,
-		data  = dns.Rdata_Name{name = "ns1.example."},
-	}
-	msg := dns.Message{question = question, authority = authority}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	ns := [1]dns.Record{{name = name, type = .NS, class = .IN, ttl = 3600, data = dns.Rdata_Name{name = "ns1.example."}}}
+	return without_ra(test_reply(name, type, authority = ns[:]))
 }
 
 /*
@@ -273,40 +135,17 @@ alias's own zone it is an authority that answered all it holds.
 */
 @(private = "file")
 route_reply_alias :: proc(name, target, zone: string) -> []u8 {
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = name, type = .A, class = .IN}
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.Record{name = name, type = .CNAME, class = .IN, ttl = 60, data = dns.Rdata_Name{name = target}}
-	authority := make([]dns.Record, 1, context.temp_allocator)
-	authority[0] = dns.Record{name = zone, type = .NS, class = .IN, ttl = 3600, data = dns.Rdata_Name{name = "ns1.example."}}
-	msg := dns.Message{question = question, answer = answer, authority = authority}
-	msg.flags.qr = true
-	msg.flags.aa = true
-	msg.flags.rd = true
-	wire, _, err := dns.encode_message(msg, context.temp_allocator)
-	if err != .None {
-		return nil
-	}
-	return wire
+	cname := dns.Record{name = name, type = .CNAME, class = .IN, ttl = 60, data = dns.Rdata_Name{name = target}}
+	ns := [1]dns.Record{{name = zone, type = .NS, class = .IN, ttl = 3600, data = dns.Rdata_Name{name = "ns1.example."}}}
+	return without_ra(test_reply(name, .A, cname, authority = ns[:], aa = true))
 }
 
-/*
-Two UDP upstreams in one group, in the order `upstream.servers` lists them.
-
-For the arrangement a single-server group cannot show: a group whose members
-disagree about the zone, which is the case `parent_answers_apex_ds` reads through
-`upstream.resolve_answerable` rather than through `resolve`.
-*/
+// `wire` with RA clear, as a server that does not recurse sends it: the flag's
+// bit in the header's fourth byte (RFC 1035 section 4.1.1).
 @(private = "file")
-mock_group_pair :: proc(t: ^testing.T, cfg: config.Upstream_Config, first, second: int) -> ^upstream.Group {
-	two := cfg
-	servers := make([]config.Upstream_Spec, 2, context.temp_allocator)
-	servers[0] = config.Upstream_Spec{name = "mock-a", kind = .UDP, address = "127.0.0.1", port = first}
-	servers[1] = config.Upstream_Spec{name = "mock-b", kind = .UDP, address = "127.0.0.1", port = second}
-	two.servers = servers
-	group, gerr := upstream.make_group(two)
-	testing.expectf(t, gerr == .None, "cannot build the upstream group: %v", gerr)
-	return group
+without_ra :: proc(wire: []u8) -> []u8 {
+	wire[3] &~= 0x80
+	return wire
 }
 
 /*
@@ -341,8 +180,8 @@ route_fixture_start :: proc(
 	f^ = Route_Fixture {
 		def_socket   = def_socket,
 		route_socket = route_socket,
-		group        = mock_group(t, cfg, def_spec.port, loc),
-		routed       = mock_group(t, cfg, route_spec.port, loc),
+		group        = mock_group(t, cfg, def_spec.port, loc = loc),
+		routed       = mock_group(t, cfg, route_spec.port, loc = loc),
 	}
 	if f.group == nil || f.routed == nil {
 		route_fixture_stop(f)
@@ -401,8 +240,8 @@ test_the_longest_route_wins :: proc(t: ^testing.T) {
 	// it - so the match has to fold case itself.
 	testing.expect(t, route_group(&s, "NAS.Corp.Example.", .A) == &broad, "the match did not fold case")
 
-	// A server with no routes configured at all is every deployment that
-	// existed before this feature: everything goes to the default group.
+	// A server with no routes configured at all sends everything to the default
+	// group.
 	plain := Server {
 		cfg   = &cfg,
 		group = &fallback,
@@ -501,21 +340,21 @@ test_a_routed_question_reaches_its_own_upstream_and_not_the_default :: proc(t: ^
 		routes = []Zone_Route{{domains = []string{"corp.example."}, group = f.routed}},
 	}
 
-	x := Route_Mock {
+	x := Canned_Mock {
 		socket = f.route_socket,
 		reply  = test_reply("nas.corp.example.", .A, a_record("nas.corp.example.", {10, 0, 0, 7})),
 		want   = "nas.corp.example.",
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_route)
-	out, _, ok := handle_query(&s, test_query("nas.corp.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
+	out, _, ok := handle_query(&s, test_query("nas.corp.example."), .UDP, TEST_CLIENT, context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
 
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
-	testing.expect(t, x.asked, "the routed upstream was never asked")
-	testing.expect_value(t, x.name, "nas.corp.example.")
+	testing.expect(t, x.got, "the routed upstream was never asked")
+	testing.expect_value(t, asked_name(&x), "nas.corp.example.")
 	testing.expect(
 		t,
 		route_mock_quiet(f.def_socket, "nas.corp.example."),
@@ -560,19 +399,19 @@ test_an_unrouted_question_still_goes_to_the_default_upstream :: proc(t: ^testing
 		routes = []Zone_Route{{domains = []string{"corp.example."}, group = f.routed}},
 	}
 
-	x := Route_Mock {
+	x := Canned_Mock {
 		socket = f.def_socket,
 		reply  = test_reply("www.example.com.", .A, a_record("www.example.com.", {93, 184, 216, 34})),
 		want   = "www.example.com.",
 	}
-	mock := thread.create_and_start_with_poly_data(&x, serve_route)
-	_, _, ok := handle_query(&s, test_query("www.example.com."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	mock := thread.create_and_start_with_poly_data(&x, serve_canned)
+	_, _, ok := handle_query(&s, test_query("www.example.com."), .UDP, TEST_CLIENT, context.temp_allocator)
 	thread.join(mock)
 	thread.destroy(mock)
 
 	testing.expect(t, ok, "nothing came back at all")
-	testing.expect(t, x.asked, "the default upstream was never asked")
-	testing.expect_value(t, x.name, "www.example.com.")
+	testing.expect(t, x.got, "the default upstream was never asked")
+	testing.expect_value(t, asked_name(&x), "www.example.com.")
 	testing.expect(
 		t,
 		route_mock_quiet(f.route_socket, "www.example.com."),
@@ -635,26 +474,26 @@ test_a_client_ds_query_at_a_routed_apex_leaves_the_route :: proc(t: ^testing.T) 
 			routes = []Zone_Route{{domains = []string{"home.arpa."}, group = f.routed}},
 		}
 
-		x := Route_Mock {
+		x := Canned_Mock {
 			socket = f.route_socket if c.to_route else f.def_socket,
 			reply  = route_reply_nodata(c.name, c.type),
 			want   = c.name,
 		}
-		mock := thread.create_and_start_with_poly_data(&x, serve_route)
-		_, _, ok := handle_query(&s, test_query(c.name, c.type), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		mock := thread.create_and_start_with_poly_data(&x, serve_canned)
+		_, _, ok := handle_query(&s, test_query(c.name, c.type), .UDP, TEST_CLIENT, context.temp_allocator)
 		thread.join(mock)
 		thread.destroy(mock)
 
 		testing.expectf(t, ok, "nothing came back at all for %s %s", dns.type_name(c.type), c.name)
 		testing.expectf(
 			t,
-			x.asked,
+			x.got,
 			"%s %s did not reach the %s upstream",
 			dns.type_name(c.type),
 			c.name,
 			"routed" if c.to_route else "default",
 		)
-		testing.expect_value(t, x.name, c.name)
+		testing.expect_value(t, asked_name(&x), c.name)
 		testing.expectf(
 			t,
 			route_mock_quiet(f.route_socket if !c.to_route else f.def_socket, c.name),
@@ -743,9 +582,10 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		*/
 		{what = "a hijacked NOERROR", parent = .No_Error, hijacked = true, to_route = true, client = .No_Error},
 		/*
-		And a referral, which is an empty NOERROR too and was read as the proof
-		(issue #410): the parent's group kept the question, and the client was
-		handed "no DS here" from a server that had only said who to ask.
+		And a referral, which is an empty NOERROR too and is not the proof (issue
+		#410): read as one, the parent's group would keep the question, and the
+		client would be handed "no DS here" from a server that had only said who
+		to ask.
 		*/
 		{what = "a referral", parent = .No_Error, referral = true, to_route = true, client = .No_Error},
 	}
@@ -773,17 +613,17 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		} else if c.referral {
 			parent_reply = route_reply_referral("corp.example.", .DS)
 		}
-		parent := Route_Mock {
+		parent := Canned_Mock {
 			socket = f.def_socket,
 			reply  = parent_reply,
 			want   = "corp.example.",
 		}
-		authority := Route_Mock {
+		authority := Canned_Mock {
 			socket = f.route_socket,
 			reply  = route_reply_nodata("corp.example.", .DS),
 			want   = "corp.example.",
 		}
-		parent_mock := thread.create_and_start_with_poly_data(&parent, serve_route)
+		parent_mock := thread.create_and_start_with_poly_data(&parent, serve_canned)
 		/*
 		The route's mock is only started for the case that expects it. A thread
 		blocked on a socket nothing sends to would hold the test open for
@@ -793,13 +633,13 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		*/
 		route_thread: ^thread.Thread
 		if c.to_route {
-			route_thread = thread.create_and_start_with_poly_data(&authority, serve_route)
+			route_thread = thread.create_and_start_with_poly_data(&authority, serve_canned)
 		}
 		out, _, ok := handle_query(
 			&s,
 			test_query("corp.example.", .DS),
 			.UDP,
-			"127.0.0.1:5555",
+			TEST_CLIENT,
 			context.temp_allocator,
 		)
 		thread.join(parent_mock)
@@ -812,10 +652,10 @@ test_an_apex_ds_goes_back_on_the_route_unless_the_parent_proves_no_ds :: proc(t:
 		if !testing.expectf(t, ok, "nothing came back at all for a parent that said %s", c.what) {
 			return
 		}
-		testing.expectf(t, parent.asked, "the parent's group was not asked at all (%s)", c.what)
+		testing.expectf(t, parent.got, "the parent's group was not asked at all (%s)", c.what)
 		testing.expectf(
 			t,
-			authority.asked == c.to_route,
+			authority.got == c.to_route,
 			"with the parent answering %s the route was %sasked",
 			c.what,
 			"not " if c.to_route else "",
@@ -877,34 +717,21 @@ test_a_referral_nobody_does_better_than_is_a_servfail :: proc(t: ^testing.T) {
 		{"a CNAME out of the zone", route_reply_alias("below.example.", "ghs.googlehosted.com.", "below.example."), false},
 	}
 	for c in cases {
-		socket, bound, bound_ok := bind_mock(t)
-		if !bound_ok {
+		h: Harness
+		if !harness_start(t, &h) {
 			return
 		}
-		defer net.close(socket)
+		defer harness_stop(&h)
 
-		cfg := test_config()
-		group := mock_group(t, cfg.upstream, bound.port)
-		defer upstream.destroy_group(group)
-		s := Server {
-			cfg   = &cfg,
-			group = group,
+		mock := Canned_Mock {
+			reply = c.reply,
+			want  = "below.example.",
 		}
-
-		mock := Route_Mock {
-			socket = socket,
-			reply  = c.reply,
-			want   = "below.example.",
-		}
-		mock_thread := thread.create_and_start_with_poly_data(&mock, serve_route)
-		out, _, ok := handle_query(&s, test_query("below.example."), .UDP, "127.0.0.1:5555", context.temp_allocator)
-		thread.join(mock_thread)
-		thread.destroy(mock_thread)
-
+		out, _, ok := harness_exchange(&h, &mock, test_query("below.example."))
 		if !testing.expect(t, ok, "nothing came back at all") {
 			return
 		}
-		testing.expect(t, mock.asked, "the upstream was not asked")
+		testing.expect(t, mock.got, "the upstream was not asked")
 		decoded, derr := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr, dns.Decode_Error.None)
 		if c.referral {
@@ -951,26 +778,29 @@ test_a_referral_past_a_cname_into_another_route_is_handed_on :: proc(t: ^testing
 	defer upstream.destroy_group(corp)
 	lab := mock_group(t, cfg.upstream, lab_bound.port)
 	defer upstream.destroy_group(lab)
+	if def == nil || corp == nil || lab == nil {
+		return
+	}
 	s := Server {
 		cfg    = &cfg,
 		group  = def,
 		routes = []Zone_Route{{domains = []string{"lab.corp."}, group = lab}, {domains = []string{"corp."}, group = corp}},
 	}
 
-	mock := Route_Mock {
+	mock := Canned_Mock {
 		socket = socket,
 		reply  = route_reply_alias("www.corp.", "host.lab.corp.", "lab.corp."),
 		want   = "www.corp.",
 	}
-	mock_thread := thread.create_and_start_with_poly_data(&mock, serve_route)
-	out, _, ok := handle_query(&s, test_query("www.corp."), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	mock_thread := thread.create_and_start_with_poly_data(&mock, serve_canned)
+	out, _, ok := handle_query(&s, test_query("www.corp."), .UDP, TEST_CLIENT, context.temp_allocator)
 	thread.join(mock_thread)
 	thread.destroy(mock_thread)
 
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
-	testing.expect(t, mock.asked, "the first route was not asked")
+	testing.expect(t, mock.got, "the first route was not asked")
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
@@ -997,22 +827,25 @@ test_a_referral_is_no_chain_lookup :: proc(t: ^testing.T) {
 	cfg := test_config()
 	group := mock_group(t, cfg.upstream, bound.port)
 	defer upstream.destroy_group(group)
+	if group == nil {
+		return
+	}
 	s := Server {
 		cfg   = &cfg,
 		group = group,
 	}
 
-	mock := Route_Mock {
+	mock := Canned_Mock {
 		socket = socket,
 		reply  = route_reply_referral("below.example.", .DS),
 		want   = "below.example.",
 	}
-	mock_thread := thread.create_and_start_with_poly_data(&mock, serve_route)
+	mock_thread := thread.create_and_start_with_poly_data(&mock, serve_canned)
 	_, ok := validator_query(&s, "below.example.", .DS, context.temp_allocator, nil)
 	thread.join(mock_thread)
 	thread.destroy(mock_thread)
 
-	testing.expect(t, mock.asked, "the upstream was not asked")
+	testing.expect(t, mock.got, "the upstream was not asked")
 	testing.expect(t, !ok, "a referral was handed to the chain walk as the DS lookup's reply")
 	free_all(context.temp_allocator)
 }
@@ -1033,38 +866,29 @@ test_a_malformed_opt_is_no_chain_lookup :: proc(t: ^testing.T) {
 	cfg := test_config()
 	group := mock_group(t, cfg.upstream, bound.port)
 	defer upstream.destroy_group(group)
+	if group == nil {
+		return
+	}
 	s := Server {
 		cfg   = &cfg,
 		group = group,
 	}
 
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = "stray.example.", type = .DS, class = .IN}
-	answer := make([]dns.Record, 1, context.temp_allocator)
-	answer[0] = dns.make_opt(4096, false)
-	msg := dns.Message {
-		question = question,
-		answer   = answer,
-	}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.ra = true
-	reply, _, eerr := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, eerr, dns.Encode_Error.None)
+	reply := test_reply("stray.example.", .DS, dns.make_opt(4096, false))
 	// The premise: the shape is the one the refusal reads.
 	testing.expect(t, dns.peek_opt_unreadable(reply), "the reply does not carry the stray OPT record")
 
-	mock := Route_Mock {
+	mock := Canned_Mock {
 		socket = socket,
 		reply  = reply,
 		want   = "stray.example.",
 	}
-	mock_thread := thread.create_and_start_with_poly_data(&mock, serve_route)
+	mock_thread := thread.create_and_start_with_poly_data(&mock, serve_canned)
 	_, ok := validator_query(&s, "stray.example.", .DS, context.temp_allocator, nil)
 	thread.join(mock_thread)
 	thread.destroy(mock_thread)
 
-	testing.expect(t, mock.asked, "the upstream was not asked")
+	testing.expect(t, mock.got, "the upstream was not asked")
 	testing.expect(t, !ok, "a reply with a stray OPT record was handed to the chain walk")
 	free_all(context.temp_allocator)
 }
@@ -1087,31 +911,27 @@ test_a_chain_lookup_answered_servfail_is_reported :: proc(t: ^testing.T) {
 	cfg := test_config()
 	group := mock_group(t, cfg.upstream, bound.port)
 	defer upstream.destroy_group(group)
+	if group == nil {
+		return
+	}
 	s := Server {
 		cfg   = &cfg,
 		group = group,
 	}
 
-	question := make([]dns.Question, 1, context.temp_allocator)
-	question[0] = dns.Question{name = "failing.example.", type = .DS, class = .IN}
-	msg := dns.Message{question = question}
-	msg.flags.qr = true
-	msg.flags.rd = true
-	msg.flags.rcode = u8(dns.Rcode.Serv_Fail)
-	reply, _, eerr := dns.encode_message(msg, context.temp_allocator)
-	testing.expect_value(t, eerr, dns.Encode_Error.None)
+	reply := without_ra(test_reply("failing.example.", .DS, rcode = .Serv_Fail))
 
-	mock := Route_Mock {
+	mock := Canned_Mock {
 		socket = socket,
 		reply  = reply,
 		want   = "failing.example.",
 	}
-	mock_thread := thread.create_and_start_with_poly_data(&mock, serve_route)
+	mock_thread := thread.create_and_start_with_poly_data(&mock, serve_canned)
 	_, ok := validator_query(&s, "failing.example.", .DS, context.temp_allocator, nil)
 	thread.join(mock_thread)
 	thread.destroy(mock_thread)
 
-	testing.expect(t, mock.asked, "the upstream was not asked")
+	testing.expect(t, mock.got, "the upstream was not asked")
 	testing.expect(t, ok, "the reply was not handed to the walk to read")
 	testing.expect(
 		t,
@@ -1125,10 +945,10 @@ test_a_chain_lookup_answered_servfail_is_reported :: proc(t: ^testing.T) {
 A parent's group that does not answer at all also puts the question on the route.
 
 The fourth arrangement, and the one that decides whether a routed zone still
-stands on its own. Before the carve-out the apex `DS` went to the local
-authority like every other question about the zone, so the public upstream being
-down, unreachable, or absent from the network entirely had no bearing on it. Read
-as an rcode test alone the carve-out would hand that dependency back: one outage
+stands on its own: the public upstream being down, unreachable, or absent from
+the network entirely must have no bearing on an internal zone whose own
+authority answers. Read as an rcode test alone the carve-out would hand that
+dependency to the public tree: one outage
 out there, and a validating client below here gets SERVFAIL for the apex `DS`,
 which is a broken chain and SERVFAIL for every name in an internal zone whose
 authority is answering perfectly well - the failure the carve-out exists to
@@ -1158,17 +978,17 @@ test_an_apex_ds_the_parent_could_not_answer_falls_back_to_the_route :: proc(t: ^
 		routes = []Zone_Route{{domains = []string{"corp.example."}, group = f.routed}},
 	}
 
-	authority := Route_Mock {
+	authority := Canned_Mock {
 		socket = f.route_socket,
 		reply  = route_reply_nodata("corp.example.", .DS),
 		want   = "corp.example.",
 	}
-	route_thread := thread.create_and_start_with_poly_data(&authority, serve_route)
+	route_thread := thread.create_and_start_with_poly_data(&authority, serve_canned)
 	out, _, ok := handle_query(
 		&s,
 		test_query("corp.example.", .DS),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	thread.join(route_thread)
@@ -1177,7 +997,7 @@ test_an_apex_ds_the_parent_could_not_answer_falls_back_to_the_route :: proc(t: ^
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
-	testing.expect(t, authority.asked, "the route was not asked after the parent's group went quiet")
+	testing.expect(t, authority.got, "the route was not asked after the parent's group went quiet")
 
 	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr2, dns.Decode_Error.None)
@@ -1264,26 +1084,26 @@ test_an_apex_ds_the_route_answered_unproven_is_not_cached :: proc(t: ^testing.T)
 		if c.foreign_ds {
 			parent_reply = route_reply_ds("corp.example.", owner = "other.example.")
 		}
-		parent := Route_Mock {
+		parent := Canned_Mock {
 			socket = f.def_socket,
 			reply  = parent_reply,
 			want   = "corp.example.",
 		}
-		authority := Route_Mock {
+		authority := Canned_Mock {
 			socket = f.route_socket,
 			reply  = route_reply_nodata("corp.example.", .DS),
 			want   = "corp.example.",
 		}
 		parent_mock: ^thread.Thread
 		if c.serve {
-			parent_mock = thread.create_and_start_with_poly_data(&parent, serve_route)
+			parent_mock = thread.create_and_start_with_poly_data(&parent, serve_canned)
 		}
-		route_thread := thread.create_and_start_with_poly_data(&authority, serve_route)
+		route_thread := thread.create_and_start_with_poly_data(&authority, serve_canned)
 		out, _, ok := handle_query(
 			&s,
 			test_query("corp.example.", .DS),
 			.UDP,
-			"127.0.0.1:5555",
+			TEST_CLIENT,
 			context.temp_allocator,
 		)
 		if parent_mock != nil {
@@ -1296,7 +1116,7 @@ test_an_apex_ds_the_route_answered_unproven_is_not_cached :: proc(t: ^testing.T)
 		if !testing.expectf(t, ok, "nothing came back at all with the parent saying %s", c.what) {
 			return
 		}
-		testing.expectf(t, authority.asked, "the route was not asked (%s)", c.what)
+		testing.expectf(t, authority.got, "the route was not asked (%s)", c.what)
 
 		// The client gets the route's answer either way; only the entry differs.
 		decoded, derr2 := dns.decode_message(out, context.temp_allocator)
@@ -1304,7 +1124,7 @@ test_an_apex_ds_the_route_answered_unproven_is_not_cached :: proc(t: ^testing.T)
 		testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
 
 		key_buf: [cache.KEY_MAX]u8
-		key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, false)
+		key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, checking_disabled = false)
 		_, _, cached := cache.get(answers, key, context.temp_allocator)
 		testing.expectf(
 			t,
@@ -1359,17 +1179,17 @@ test_an_apex_ds_neither_group_could_settle_is_a_servfail :: proc(t: ^testing.T) 
 		routes  = []Zone_Route{{domains = []string{"corp.example."}, group = f.routed}},
 	}
 
-	parent := Route_Mock {
+	parent := Canned_Mock {
 		socket = f.def_socket,
 		reply  = route_reply_nodata("corp.example.", .DS, .NX_Domain),
 		want   = "corp.example.",
 	}
-	parent_mock := thread.create_and_start_with_poly_data(&parent, serve_route)
+	parent_mock := thread.create_and_start_with_poly_data(&parent, serve_canned)
 	out, _, ok := handle_query(
 		&s,
 		test_query("corp.example.", .DS),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	thread.join(parent_mock)
@@ -1378,7 +1198,7 @@ test_an_apex_ds_neither_group_could_settle_is_a_servfail :: proc(t: ^testing.T) 
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
-	testing.expect(t, parent.asked, "the parent's group was not asked at all")
+	testing.expect(t, parent.got, "the parent's group was not asked at all")
 
 	// Not the parent's NXDOMAIN, which was never an answer to this question.
 	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
@@ -1387,7 +1207,7 @@ test_an_apex_ds_neither_group_could_settle_is_a_servfail :: proc(t: ^testing.T) 
 
 	// And nothing is kept, so the next query asks both again.
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, false)
+	key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, checking_disabled = false)
 	_, _, cached := cache.get(answers, key, context.temp_allocator)
 	testing.expect(t, !cached, "the parent's unchecked denial was stored against the routed zone")
 	free_all(context.temp_allocator)
@@ -1403,9 +1223,9 @@ timeout that is ten seconds, and a validating stub gives up
 in two to five - so the deployment the carve-out was written for would watch the
 zone fail anyway, having waited on an upstream this server already knew was down.
 
-Parked here the way the resolver parks one: `FAILURE_THRESHOLD` is 3, so three
-exchanges against a socket nobody answers puts the group in its cooldown. The
-three go to a name of their own, which keeps them out of the way of the
+Parked here the way the resolver parks one: `FAILURE_THRESHOLD` exchanges against
+a socket nobody answers put the group in its cooldown. They go to a name of their
+own, which keeps them out of the way of the
 assertion that the parent was never asked about `corp.example.` - the datagrams
 are still sitting unread in the socket's buffer, and `route_mock_quiet` holds
 only this case's question against it.
@@ -1438,10 +1258,13 @@ test_a_parked_parent_group_is_skipped_for_an_apex_ds :: proc(t: ^testing.T) {
 	}
 	defer route_fixture_stop(&f)
 
-	// Three failures is `FAILURE_THRESHOLD`, and the name is not the one the
-	// assertions below are about.
-	for _ in 0 ..< 3 {
-		_, _, _ = upstream.resolve(f.group, test_query("park.example."), context.temp_allocator)
+	// `FAILURE_THRESHOLD` failures, and the name is not the one the assertions
+	// below are about.
+	for _ in 0 ..< upstream.FAILURE_THRESHOLD {
+		_, _, _ = upstream.resolve(f.group, test_query("park.example."), context.temp_allocator) // lint:allow the failure is the fixture; the premise below reads its effect
+	}
+	if !testing.expect(t, !group_reachable(f.group), "the fixture did not park the parent's group") {
+		return
 	}
 
 	s := Server {
@@ -1451,17 +1274,17 @@ test_a_parked_parent_group_is_skipped_for_an_apex_ds :: proc(t: ^testing.T) {
 		routes  = []Zone_Route{{domains = []string{"corp.example."}, group = f.routed}},
 	}
 
-	authority := Route_Mock {
+	authority := Canned_Mock {
 		socket = f.route_socket,
 		reply  = route_reply_nodata("corp.example.", .DS),
 		want   = "corp.example.",
 	}
-	route_thread := thread.create_and_start_with_poly_data(&authority, serve_route)
+	route_thread := thread.create_and_start_with_poly_data(&authority, serve_canned)
 	out, _, ok := handle_query(
 		&s,
 		test_query("corp.example.", .DS),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	thread.join(route_thread)
@@ -1470,7 +1293,7 @@ test_a_parked_parent_group_is_skipped_for_an_apex_ds :: proc(t: ^testing.T) {
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
-	testing.expect(t, authority.asked, "the route was not asked while the parent's group was parked")
+	testing.expect(t, authority.got, "the route was not asked while the parent's group was parked")
 	testing.expect(
 		t,
 		route_mock_quiet(f.def_socket, "corp.example."),
@@ -1484,7 +1307,7 @@ test_a_parked_parent_group_is_skipped_for_an_apex_ds :: proc(t: ^testing.T) {
 	// And it is not kept: the parent was never asked, so nothing established
 	// what the public tree says and the entry would outlive the cooldown.
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, false)
+	key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, checking_disabled = false)
 	_, _, cached := cache.get(answers, key, context.temp_allocator)
 	testing.expect(t, !cached, "an answer given while the parent was skipped was stored")
 	free_all(context.temp_allocator)
@@ -1501,7 +1324,7 @@ route that is equally parked throws that try away and turns an apex `DS` the
 parent would have proved into a SERVFAIL for the whole zone. Nothing is bought
 by it either: with both groups parked the wait is spent either way.
 
-Both groups are parked the way the resolver parks one, three exchanges against a
+Both groups are parked the way the resolver parks one, failed exchanges against a
 socket nobody answers, and then the parent starts answering - which is the state
 an upstream is in for the rest of its cooldown after the network comes back. The
 assertion is that the parent was asked and its proof is what the client got.
@@ -1520,12 +1343,12 @@ test_a_parked_parent_is_still_asked_when_the_route_is_parked_too :: proc(t: ^tes
 	}
 	defer route_fixture_stop(&f)
 
-	// `FAILURE_THRESHOLD` is 3 and each attempt counts, so two of these park a
-	// group; three keeps it parked with room to spare. The name is not the one
-	// the assertions below are about.
-	for _ in 0 ..< 3 {
-		_, _, _ = upstream.resolve(f.group, test_query("park.example."), context.temp_allocator)
-		_, _, _ = upstream.resolve(f.routed, test_query("park.example."), context.temp_allocator)
+	// Each attempt counts towards `FAILURE_THRESHOLD`, so with two attempts half
+	// as many of these park a group, and `FAILURE_THRESHOLD` keep it parked with
+	// room to spare. The name is not the one the assertions below are about.
+	for _ in 0 ..< upstream.FAILURE_THRESHOLD {
+		_, _, _ = upstream.resolve(f.group, test_query("park.example."), context.temp_allocator) // lint:allow the failure is the fixture; the premise below reads its effect
+		_, _, _ = upstream.resolve(f.routed, test_query("park.example."), context.temp_allocator) // lint:allow the failure is the fixture; the premise below reads its effect
 	}
 
 	s := Server {
@@ -1544,17 +1367,17 @@ test_a_parked_parent_is_still_asked_when_the_route_is_parked_too :: proc(t: ^tes
 	testing.expect(t, !group_reachable(f.group), "the fixture did not park the parent's group")
 	testing.expect(t, !group_reachable(f.routed), "the fixture did not park the route's group")
 
-	parent := Route_Mock {
+	parent := Canned_Mock {
 		socket = f.def_socket,
 		reply  = route_reply_nodata("corp.example.", .DS),
 		want   = "corp.example.",
 	}
-	parent_mock := thread.create_and_start_with_poly_data(&parent, serve_route)
+	parent_mock := thread.create_and_start_with_poly_data(&parent, serve_canned)
 	out, _, ok := handle_query(
 		&s,
 		test_query("corp.example.", .DS),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	thread.join(parent_mock)
@@ -1572,13 +1395,13 @@ test_a_parked_parent_is_still_asked_when_the_route_is_parked_too :: proc(t: ^tes
 	// Counted only where the case has already failed: each count drains its
 	// socket on a twenty-millisecond timeout, which is a cost and a side effect
 	// that the passing path has no use for.
-	if !parent.asked {
+	if !parent.got {
 		testing.expectf(
 			t,
 			false,
 			"the parent was passed over for a route that was parked too (%d unread questions at the parent, %d at the route)",
-			route_mock_heard(f.def_socket, "corp.example."),
-			route_mock_heard(f.route_socket, "corp.example."),
+			mock_heard(f.def_socket, "corp.example."),
+			mock_heard(f.route_socket, "corp.example."),
 		)
 	}
 
@@ -1630,10 +1453,13 @@ test_an_apex_ds_sweeps_the_parents_group_past_a_refusal :: proc(t: ^testing.T) {
 	// sweep failed to find the proof.
 	cfg.upstream.timeout = 200 * time.Millisecond
 
-	group := mock_group_pair(t, cfg.upstream, refuser_bound.port, prover_bound.port)
+	group := mock_group(t, cfg.upstream, refuser_bound.port, prover_bound.port)
 	defer upstream.destroy_group(group)
 	routed := mock_group(t, cfg.upstream, route_bound.port)
 	defer upstream.destroy_group(routed)
+	if group == nil || routed == nil {
+		return
+	}
 
 	s := Server {
 		cfg    = &cfg,
@@ -1641,23 +1467,23 @@ test_an_apex_ds_sweeps_the_parents_group_past_a_refusal :: proc(t: ^testing.T) {
 		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
 	}
 
-	refused := Route_Mock {
+	refused := Canned_Mock {
 		socket = refuser,
 		reply  = route_reply_nodata("corp.example.", .DS, .Refused),
 		want   = "corp.example.",
 	}
-	proved := Route_Mock {
+	proved := Canned_Mock {
 		socket = prover,
 		reply  = route_reply_nodata("corp.example.", .DS),
 		want   = "corp.example.",
 	}
-	refused_mock := thread.create_and_start_with_poly_data(&refused, serve_route)
-	proved_mock := thread.create_and_start_with_poly_data(&proved, serve_route)
+	refused_mock := thread.create_and_start_with_poly_data(&refused, serve_canned)
+	proved_mock := thread.create_and_start_with_poly_data(&proved, serve_canned)
 	out, _, ok := handle_query(
 		&s,
 		test_query("corp.example.", .DS),
 		.UDP,
-		"127.0.0.1:5555",
+		TEST_CLIENT,
 		context.temp_allocator,
 	)
 	thread.join(refused_mock)
@@ -1668,8 +1494,8 @@ test_an_apex_ds_sweeps_the_parents_group_past_a_refusal :: proc(t: ^testing.T) {
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
-	testing.expect(t, refused.asked, "the first upstream in the group was never asked")
-	testing.expect(t, proved.asked, "the group's other member was never asked past the refusal")
+	testing.expect(t, refused.got, "the first upstream in the group was never asked")
+	testing.expect(t, proved.got, "the group's other member was never asked past the refusal")
 	testing.expect(
 		t,
 		route_mock_quiet(route_socket, "corp.example."),
@@ -1698,15 +1524,16 @@ as long as the configuration stands.
 Both arrangements run against one fixture and differ only in what the parent
 says, which is the assertion that matters: the memory is of the parent having
 settled nothing, and a parent that settles the question keeps its place. So the
-SERVFAIL is asked once for two queries and the proof is asked twice, and the
-second half is what keeps this from being "ask the parent less": a route whose
+SERVFAIL is asked on the first `FAILURE_THRESHOLD` of `FAILURE_THRESHOLD + 1`
+queries and the proof on every one, and the second half is what keeps this from
+being "ask the parent less": a route whose
 parent can prove the delegation carries no DS goes on getting that proof, per
 query, which is what issue #227 was about.
 
-The client's answer is asserted on both queries for the same reason. What the
+The client's answer is asserted on every query for the same reason. What the
 memory changes is which upstream is asked first, not what comes back - the route
 answers the unsettled case either way, exactly as it does when the parent's group
-is parked - so a second query that came back different would mean the memory had
+is parked - so a query past the threshold that came back different would mean the memory had
 started standing in for an answer rather than for a wait.
 
 The parent's mock is started once per query it is expected to take, the route's
@@ -1735,8 +1562,8 @@ test_a_parent_that_settles_nothing_is_not_re_asked_for_every_query :: proc(t: ^t
 
 	for c in cases {
 		cfg := test_config()
-		// Cut, so that a second query which should not have gone to the parent
-		// does not sit out three seconds before this case says so.
+		// Cut, so that a query past the threshold which should not have gone to
+		// the parent does not sit out three seconds before this case says so.
 		cfg.upstream.timeout = 200 * time.Millisecond
 
 		f: Route_Fixture
@@ -1758,29 +1585,29 @@ test_a_parent_that_settles_nothing_is_not_re_asked_for_every_query :: proc(t: ^t
 		// last is the one the memory is allowed to answer for.
 		for round in 0 ..< upstream.FAILURE_THRESHOLD + 1 {
 			serve_parent := round < upstream.FAILURE_THRESHOLD || c.asked_always
-			parent := Route_Mock {
+			parent := Canned_Mock {
 				socket = f.def_socket,
 				reply  = parent_reply,
 				want   = "corp.example.",
 			}
-			authority := Route_Mock {
+			authority := Canned_Mock {
 				socket = f.route_socket,
 				reply  = route_reply,
 				want   = "corp.example.",
 			}
 			parent_mock: ^thread.Thread
 			if serve_parent {
-				parent_mock = thread.create_and_start_with_poly_data(&parent, serve_route)
+				parent_mock = thread.create_and_start_with_poly_data(&parent, serve_canned)
 			}
 			route_thread: ^thread.Thread
 			if c.to_route {
-				route_thread = thread.create_and_start_with_poly_data(&authority, serve_route)
+				route_thread = thread.create_and_start_with_poly_data(&authority, serve_canned)
 			}
 			out, _, ok := handle_query(
 				&s,
 				test_query("corp.example.", .DS),
 				.UDP,
-				"127.0.0.1:5555",
+				TEST_CLIENT,
 				context.temp_allocator,
 			)
 			if parent_mock != nil {
@@ -1797,7 +1624,7 @@ test_a_parent_that_settles_nothing_is_not_re_asked_for_every_query :: proc(t: ^t
 			}
 			testing.expectf(
 				t,
-				parent.asked == serve_parent,
+				parent.got == serve_parent,
 				"on query %d the parent's group was %sasked (%s)",
 				round + 1,
 				"not " if serve_parent else "",
@@ -1813,7 +1640,7 @@ test_a_parent_that_settles_nothing_is_not_re_asked_for_every_query :: proc(t: ^t
 			}
 			testing.expectf(
 				t,
-				authority.asked == c.to_route,
+				authority.got == c.to_route,
 				"on query %d the route was %sasked (%s)",
 				round + 1,
 				"not " if c.to_route else "",
@@ -1829,7 +1656,7 @@ test_a_parent_that_settles_nothing_is_not_re_asked_for_every_query :: proc(t: ^t
 				)
 			}
 
-			// The same answer on both queries, from whichever upstream this
+			// The same answer on every query, from whichever upstream this
 			// arrangement leaves holding the question.
 			decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 			testing.expect_value(t, derr2, dns.Decode_Error.None)
@@ -1874,8 +1701,8 @@ parent's reply is used on the same terms the first exchange reads it on - only
 the proof is this client's answer - so what the fallback can do is hand over the
 one answer the carve-out went to fetch and nothing else.
 
-The first query is the fixture: a SERVFAIL from the parent is what writes the
-memory the second query is about. The timeout is cut so a route that is not
+The first `FAILURE_THRESHOLD` queries are the fixture: the parent's SERVFAILs are
+what write the memory the last query is about. The timeout is cut so a route that is not
 serving does not sit out `test_config`'s three seconds.
 */
 @(test)
@@ -1921,23 +1748,23 @@ test_the_memo_still_asks_the_parent_unless_the_route_answered_the_nodata :: proc
 		// settles the delegation, as many times running as the memory wants,
 		// and the route answers in its place.
 		for _ in 0 ..< upstream.FAILURE_THRESHOLD {
-			refusing := Route_Mock {
+			refusing := Canned_Mock {
 				socket = f.def_socket,
 				reply  = route_reply_nodata("corp.example.", .DS, .Serv_Fail),
 				want   = "corp.example.",
 			}
-			answering := Route_Mock {
+			answering := Canned_Mock {
 				socket = f.route_socket,
 				reply  = route_reply_nodata("corp.example.", .DS),
 				want   = "corp.example.",
 			}
-			arming_parent := thread.create_and_start_with_poly_data(&refusing, serve_route)
-			arming_route := thread.create_and_start_with_poly_data(&answering, serve_route)
+			arming_parent := thread.create_and_start_with_poly_data(&refusing, serve_canned)
+			arming_route := thread.create_and_start_with_poly_data(&answering, serve_canned)
 			_, _, arming_ok := handle_query(
 				&s,
 				test_query("corp.example.", .DS),
 				.UDP,
-				"127.0.0.1:5555",
+				TEST_CLIENT,
 				context.temp_allocator,
 			)
 			thread.join(arming_parent)
@@ -1947,7 +1774,7 @@ test_the_memo_still_asks_the_parent_unless_the_route_answered_the_nodata :: proc
 			if !testing.expectf(t, arming_ok, "nothing came back for a query that writes the memory (%s)", c.what) {
 				return
 			}
-			if !testing.expectf(t, refusing.asked, "the parent's group was not asked while the memory was being written (%s)", c.what) {
+			if !testing.expectf(t, refusing.got, "the parent's group was not asked while the memory was being written (%s)", c.what) {
 				return
 			}
 		}
@@ -1958,7 +1785,7 @@ test_the_memo_still_asks_the_parent_unless_the_route_answered_the_nodata :: proc
 		first, which is the whole of what it is for - and a route with no answer
 		in it leaves the question unanswered, with the parent right there.
 		*/
-		proving := Route_Mock {
+		proving := Canned_Mock {
 			socket = f.def_socket,
 			reply  = route_reply_nodata("corp.example.", .DS),
 			want   = "corp.example.",
@@ -1971,21 +1798,21 @@ test_the_memo_still_asks_the_parent_unless_the_route_answered_the_nodata :: proc
 			// DS denial.
 			route_reply = ds_nodata("corp.example.", nsec_at("corp.example.", "example.", .NS, .SOA, .RRSIG, .NSEC, .DNSKEY))
 		}
-		failing := Route_Mock {
+		failing := Canned_Mock {
 			socket = f.route_socket,
 			reply  = route_reply,
 			want   = "corp.example.",
 		}
-		second_parent := thread.create_and_start_with_poly_data(&proving, serve_route)
+		second_parent := thread.create_and_start_with_poly_data(&proving, serve_canned)
 		second_route: ^thread.Thread
 		if c.serve {
-			second_route = thread.create_and_start_with_poly_data(&failing, serve_route)
+			second_route = thread.create_and_start_with_poly_data(&failing, serve_canned)
 		}
 		out, _, ok := handle_query(
 			&s,
 			test_query("corp.example.", .DS),
 			.UDP,
-			"127.0.0.1:5555",
+			TEST_CLIENT,
 			context.temp_allocator,
 		)
 		thread.join(second_parent)
@@ -1995,12 +1822,12 @@ test_the_memo_still_asks_the_parent_unless_the_route_answered_the_nodata :: proc
 			thread.destroy(second_route)
 		}
 
-		if !testing.expectf(t, ok, "nothing came back at all for the second query (%s)", c.what) {
+		if !testing.expectf(t, ok, "nothing came back at all for the query after the memory was written (%s)", c.what) {
 			return
 		}
 		testing.expectf(
 			t,
-			proving.asked,
+			proving.got,
 			"a parent holding the proof was passed over for a route answering %s",
 			c.what,
 		)
@@ -2030,9 +1857,10 @@ query in the window rather than for the one that timed out; what bounds the
 repeated stall against a group that really is gone is the parking
 `group_reachable` reads, which needs no memory at all.
 
-So the count is the assertion: two queries, two datagrams at the parent. The
-parent's socket is bound and nobody serves it, which is what an upstream that has
-gone away looks like from here, and the route answers both queries in its place.
+So the count is the assertion: one datagram at the parent per query until the
+group parks itself. The parent's socket is bound and nobody serves it, which is
+what an upstream that has gone away looks like from here, and the route answers
+every query in its place.
 */
 @(test)
 test_a_parent_that_never_replied_is_asked_again :: proc(t: ^testing.T) {
@@ -2056,17 +1884,17 @@ test_a_parent_that_never_replied_is_asked_again :: proc(t: ^testing.T) {
 	// fired - and past the point the group parks itself, which is what actually
 	// stops the asking here.
 	for round in 0 ..< upstream.FAILURE_THRESHOLD + 1 {
-		authority := Route_Mock {
+		authority := Canned_Mock {
 			socket = f.route_socket,
 			reply  = route_reply_nodata("corp.example.", .DS),
 			want   = "corp.example.",
 		}
-		route_thread := thread.create_and_start_with_poly_data(&authority, serve_route)
+		route_thread := thread.create_and_start_with_poly_data(&authority, serve_canned)
 		out, _, ok := handle_query(
 			&s,
 			test_query("corp.example.", .DS),
 			.UDP,
-			"127.0.0.1:5555",
+			TEST_CLIENT,
 			context.temp_allocator,
 		)
 		thread.join(route_thread)
@@ -2075,7 +1903,7 @@ test_a_parent_that_never_replied_is_asked_again :: proc(t: ^testing.T) {
 		if !testing.expectf(t, ok, "nothing came back at all on query %d", round + 1) {
 			return
 		}
-		testing.expectf(t, authority.asked, "the route was not asked on query %d", round + 1)
+		testing.expectf(t, authority.got, "the route was not asked on query %d", round + 1)
 
 		decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 		testing.expect_value(t, derr2, dns.Decode_Error.None)
@@ -2087,10 +1915,11 @@ test_a_parent_that_never_replied_is_asked_again :: proc(t: ^testing.T) {
 	bounds the asking against a parent that has gone quiet is
 	`FAILURE_THRESHOLD` transport failures and the cooldown that follows them,
 	read by `group_reachable` in the skip above this memory. So the count is
-	exactly the threshold - three questions, then a parked group nobody asks -
+	exactly the threshold - `FAILURE_THRESHOLD` questions, then a parked group
+	nobody asks -
 	and not once, which is what a memory written by silence would have made it.
 	*/
-	testing.expect_value(t, route_mock_heard(f.def_socket, "corp.example."), upstream.FAILURE_THRESHOLD)
+	testing.expect_value(t, mock_heard(f.def_socket, "corp.example."), upstream.FAILURE_THRESHOLD)
 	free_all(context.temp_allocator)
 }
 
@@ -2133,19 +1962,19 @@ test_the_memo_fallback_keeps_what_the_parent_settled :: proc(t: ^testing.T) {
 
 	// The queries that write the memory, whose own answers are kept by nobody.
 	for _ in 0 ..< upstream.FAILURE_THRESHOLD {
-		refusing := Route_Mock {
+		refusing := Canned_Mock {
 			socket = f.def_socket,
 			reply  = route_reply_nodata("corp.example.", .DS, .Serv_Fail),
 			want   = "corp.example.",
 		}
-		answering := Route_Mock {
+		answering := Canned_Mock {
 			socket = f.route_socket,
 			reply  = route_reply_nodata("corp.example.", .DS),
 			want   = "corp.example.",
 		}
-		arming_parent := thread.create_and_start_with_poly_data(&refusing, serve_route)
-		arming_route := thread.create_and_start_with_poly_data(&answering, serve_route)
-		_, _, arming_ok := handle_query(&s, test_query("corp.example.", .DS), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		arming_parent := thread.create_and_start_with_poly_data(&refusing, serve_canned)
+		arming_route := thread.create_and_start_with_poly_data(&answering, serve_canned)
+		_, _, arming_ok := handle_query(&s, test_query("corp.example.", .DS), .UDP, TEST_CLIENT, context.temp_allocator)
 		thread.join(arming_parent)
 		thread.destroy(arming_parent)
 		thread.join(arming_route)
@@ -2158,36 +1987,36 @@ test_the_memo_fallback_keeps_what_the_parent_settled :: proc(t: ^testing.T) {
 	// And the one the fallback answers: the route says the name is not there,
 	// which is not the NODATA the memory bet on, and the parent says the same
 	// thing about the public tree - a fact that holds for as long as an entry.
-	denying := Route_Mock {
+	denying := Canned_Mock {
 		socket = f.def_socket,
 		reply  = route_reply_nodata("corp.example.", .DS, .NX_Domain),
 		want   = "corp.example.",
 	}
-	absent := Route_Mock {
+	absent := Canned_Mock {
 		socket = f.route_socket,
 		reply  = route_reply_nodata("corp.example.", .DS, .NX_Domain),
 		want   = "corp.example.",
 	}
-	second_parent := thread.create_and_start_with_poly_data(&denying, serve_route)
-	second_route := thread.create_and_start_with_poly_data(&absent, serve_route)
-	out, _, ok := handle_query(&s, test_query("corp.example.", .DS), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	second_parent := thread.create_and_start_with_poly_data(&denying, serve_canned)
+	second_route := thread.create_and_start_with_poly_data(&absent, serve_canned)
+	out, _, ok := handle_query(&s, test_query("corp.example.", .DS), .UDP, TEST_CLIENT, context.temp_allocator)
 	thread.join(second_parent)
 	thread.destroy(second_parent)
 	thread.join(second_route)
 	thread.destroy(second_route)
 
-	if !testing.expect(t, ok, "nothing came back at all for the second query") {
+	if !testing.expect(t, ok, "nothing came back at all for the query after the memory was written") {
 		return
 	}
-	testing.expect(t, denying.asked, "the parent was not asked after the route answered something that was not the NODATA")
-	testing.expect(t, absent.asked, "the route was not asked at all")
+	testing.expect(t, denying.got, "the parent was not asked after the route answered something that was not the NODATA")
+	testing.expect(t, absent.got, "the route was not asked at all")
 
 	decoded, derr2 := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr2, dns.Decode_Error.None)
 	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.NX_Domain)
 
 	key_buf: [cache.KEY_MAX]u8
-	key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, false)
+	key := cache.make_key(key_buf[:], "corp.example.", .DS, .IN, false, checking_disabled = false)
 	_, _, cached := cache.get(answers, key, context.temp_allocator)
 	testing.expect(t, cached, "an answer the parent settled was fetched by the fallback and thrown away")
 	free_all(context.temp_allocator)
@@ -2238,16 +2067,7 @@ test_the_apex_memory_counts_is_bounded_and_defers_to_an_anchor :: proc(t: ^testi
 	routed := upstream.Group{}
 
 	// One route per apex, and one more apex than there are slots.
-	domains := make([][]string, APEX_MEMO_SLOTS + 1, context.temp_allocator)
-	routes := make([]Zone_Route, APEX_MEMO_SLOTS + 1, context.temp_allocator)
-	for i in 0 ..< APEX_MEMO_SLOTS + 1 {
-		domains[i] = make([]string, 1, context.temp_allocator)
-		domains[i][0] = fmt.tprintf("z%d.example.", i)
-		routes[i] = Zone_Route {
-			domains = domains[i],
-			group   = &routed,
-		}
-	}
+	domains, routes := apex_routes(APEX_MEMO_SLOTS + 1, &routed)
 	s := Server {
 		cfg    = &cfg,
 		routes = routes,
@@ -2269,7 +2089,7 @@ test_the_apex_memory_counts_is_bounded_and_defers_to_an_anchor :: proc(t: ^testi
 		testing.expectf(t, !apex_ds_parent_unsettled(&s, first), "%d unsettled replies armed a memory that wants %d", i, upstream.FAILURE_THRESHOLD)
 	}
 	strike(&s, first, 1)
-	testing.expect(t, apex_ds_parent_unsettled(&s, first), "the parent that settled nothing three times running was not remembered")
+	testing.expect(t, apex_ds_parent_unsettled(&s, first), "the parent that settled nothing `FAILURE_THRESHOLD` times running was not remembered")
 	testing.expect(t, !apex_ds_parent_unsettled(&s, second), "one apex's unsettled parent was remembered against another")
 
 	// Case-insensitively, the question's name being whatever the client sent.
@@ -2289,9 +2109,9 @@ test_the_apex_memory_counts_is_bounded_and_defers_to_an_anchor :: proc(t: ^testi
 	testing.expect(t, !apex_ds_parent_unsettled(&s, second), "a settled parent took a slot of its own")
 
 	// And a reply that never arrived is not a memory. See `Apex_Memo`.
-	remember_apex_ds_parent(&s, second, false, false)
-	remember_apex_ds_parent(&s, second, false, false)
-	remember_apex_ds_parent(&s, second, false, false)
+	for _ in 0 ..< upstream.FAILURE_THRESHOLD {
+		remember_apex_ds_parent(&s, second, false, false)
+	}
 	testing.expect(t, !apex_ds_parent_unsettled(&s, second), "a parent that never replied was remembered as unhelpful")
 
 	/*
@@ -2361,6 +2181,23 @@ test_the_apex_memory_counts_is_bounded_and_defers_to_an_anchor :: proc(t: ^testi
 	free_all(context.temp_allocator)
 }
 
+// `n` routes to `routed`, each for an apex of its own (`z<i>.example.`), in the
+// temp arena.
+@(private = "file")
+apex_routes :: proc(n: int, routed: ^upstream.Group) -> (domains: [][]string, routes: []Zone_Route) {
+	domains = make([][]string, n, context.temp_allocator)
+	routes = make([]Zone_Route, n, context.temp_allocator)
+	for i in 0 ..< n {
+		domains[i] = make([]string, 1, context.temp_allocator)
+		domains[i][0] = fmt.tprintf("z%d.example.", i)
+		routes[i] = Zone_Route {
+			domains = domains[i],
+			group   = routed,
+		}
+	}
+	return
+}
+
 /*
 More failing apexes than slots, asked round-robin, still remembers the ones it can.
 
@@ -2381,16 +2218,7 @@ test_the_apex_memory_still_arms_past_its_slot_count :: proc(t: ^testing.T) {
 	routed := upstream.Group{}
 
 	apexes := APEX_MEMO_SLOTS + 1
-	domains := make([][]string, apexes, context.temp_allocator)
-	routes := make([]Zone_Route, apexes, context.temp_allocator)
-	for i in 0 ..< apexes {
-		domains[i] = make([]string, 1, context.temp_allocator)
-		domains[i][0] = fmt.tprintf("z%d.example.", i)
-		routes[i] = Zone_Route {
-			domains = domains[i],
-			group   = &routed,
-		}
-	}
+	domains, routes := apex_routes(apexes, &routed)
 	s := Server {
 		cfg    = &cfg,
 		routes = routes,
@@ -2446,8 +2274,7 @@ test_a_routed_zone_is_served_insecure_unless_the_operator_anchored_it :: proc(t:
 	testing.expect(t, !served_locally(&s, "example.com."), "an unrouted public name stopped being validated")
 	testing.expect(t, !served_locally(&s, "notcorp.example."), "a suffix match was treated as a subtree")
 
-	// The table's own entries still qualify with no route configured at all,
-	// which is what keeps every deployment that predates this feature working.
+	// The table's own entries still qualify with no route configured at all.
 	bare := Server {
 		cfg = &cfg,
 	}
@@ -2521,6 +2348,9 @@ test_a_routed_zone_may_answer_with_private_addresses :: proc(t: ^testing.T) {
 		defer upstream.destroy_group(group)
 		routed := mock_group(t, cfg.upstream, bound.port)
 		defer upstream.destroy_group(routed)
+		if group == nil || routed == nil {
+			return
+		}
 
 		s := Server {
 			cfg    = &cfg,
@@ -2528,13 +2358,13 @@ test_a_routed_zone_may_answer_with_private_addresses :: proc(t: ^testing.T) {
 			routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
 		}
 
-		x := Route_Mock {
+		x := Canned_Mock {
 			socket = socket,
 			reply  = test_reply(c.name, .A, a_record(c.name, {192, 168, 1, 50})),
 			want   = c.name,
 		}
-		mock := thread.create_and_start_with_poly_data(&x, serve_route)
-		out, outcome, ok := handle_query(&s, test_query(c.name), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		mock := thread.create_and_start_with_poly_data(&x, serve_canned)
+		out, outcome, ok := handle_query(&s, test_query(c.name), .UDP, TEST_CLIENT, context.temp_allocator)
 		thread.join(mock)
 		thread.destroy(mock)
 
@@ -2583,9 +2413,9 @@ test_routed_upstreams_are_reported_once_each :: proc(t: ^testing.T) {
 	cfg := config.default_config()
 
 	base := cfg.upstream
-	base.servers = loopback_upstream(15353, "router")
+	base.servers = loopback_upstream(15353, name = "router")
 	routed_cfg := cfg.upstream
-	routed_cfg.servers = loopback_upstream(15354, "dc1")
+	routed_cfg.servers = loopback_upstream(15354, name = "dc1")
 
 	group, gerr := upstream.make_group(base)
 	if !testing.expectf(t, gerr == .None, "cannot build the default group: %v", gerr) {
@@ -2640,10 +2470,9 @@ the endpoint reports their total.
 
 The traffic is failures against a port nothing is listening on, which is the
 cheapest way to move `queries` and `failures` at once: `record_failure`
-increments both. Three of them on one group and none on the other also sets up
-the `up` gauge's own claim - a name is up while any upstream wearing it is
-usable - since `FAILURE_THRESHOLD` is 3, so the first group is in cooldown and
-the second is not.
+increments both. `FAILURE_THRESHOLD` of them on one group and one on the other
+also sets up the `up` gauge's own claim - a name is up while any upstream wearing
+it is usable - since the first group is then in cooldown and the second is not.
 */
 @(test)
 test_two_upstreams_of_one_name_have_their_figures_added :: proc(t: ^testing.T) {
@@ -2651,7 +2480,7 @@ test_two_upstreams_of_one_name_have_their_figures_added :: proc(t: ^testing.T) {
 
 	// A port nothing is bound to, so every exchange fails inside the timeout.
 	spec := cfg.upstream
-	spec.servers = loopback_upstream(1, "router")
+	spec.servers = loopback_upstream(1, name = "router")
 	spec.attempts = 1
 	spec.timeout = 200 * time.Millisecond
 
@@ -2668,18 +2497,19 @@ test_two_upstreams_of_one_name_have_their_figures_added :: proc(t: ^testing.T) {
 
 	query := test_query("probe.example.")
 	/*
-	Three on one and one on the other, and neither number is arbitrary.
+	`FAILURE_THRESHOLD` on one and one on the other, and neither number is
+	arbitrary.
 
-	Three is `FAILURE_THRESHOLD`, so that copy of the name is parked while the
+	`FAILURE_THRESHOLD` parks that copy of the name while the
 	other stays usable - which is what makes the `up` assertion below
 	discriminate. And the second group has to contribute a non-zero count of its
 	own, or the total is the first group's total and the sum assertion would
 	hold just as well against the de-duplication that dropped it.
 	*/
-	for _ in 0 ..< 3 {
-		_, _, _ = upstream.resolve(failing, query, context.temp_allocator)
+	for _ in 0 ..< upstream.FAILURE_THRESHOLD {
+		_, _, _ = upstream.resolve(failing, query, context.temp_allocator) // lint:allow the failure is the fixture; the figures below read it
 	}
-	_, _, _ = upstream.resolve(idle, query, context.temp_allocator)
+	_, _, _ = upstream.resolve(idle, query, context.temp_allocator) // lint:allow the failure is the fixture; the figures below read it
 
 	s := Server {
 		cfg    = &cfg,
@@ -2732,53 +2562,29 @@ call returns; had it been asked, it would have spent its own timeout.
 */
 @(test)
 test_an_apex_ds_spends_one_budget_across_both_groups :: proc(t: ^testing.T) {
-	sockets: [3]net.UDP_Socket
-	ports: [3]int
-	bound_count := 0
-	defer for socket in sockets[:bound_count] {
-		net.close(socket)
-	}
-	for i in 0 ..< 3 {
-		socket, spec, bound := bind_mock(t)
-		if !bound {
-			return
-		}
-		sockets[i] = socket
-		bound_count += 1
-		ports[i] = spec.port
-	}
-
-	cfg := test_config()
-	cfg.upstream.timeout = 400 * time.Millisecond
-
+	f: Pair_Route
 	// The parent: two members, neither of which answers.
-	group := mock_group_pair(t, cfg.upstream, ports[0], ports[1])
-	defer upstream.destroy_group(group)
-	routed := mock_group(t, cfg.upstream, ports[2])
-	defer upstream.destroy_group(routed)
-
-	s := Server {
-		cfg    = &cfg,
-		group  = group,
-		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
+	if !pair_route_start(t, &f, 400 * time.Millisecond) {
+		return
 	}
+	defer pair_route_stop(&f)
 
 	started := time.tick_now()
-	out, _, ok := handle_query(&s, test_query("corp.example.", .DS), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, _, ok := handle_query(&f.s, test_query("corp.example.", .DS), .UDP, TEST_CLIENT, context.temp_allocator)
 	spent := time.tick_since(started)
 
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
-	testing.expect(t, route_mock_heard(sockets[0], "corp.example.") == 1, "the parent's first member was not asked")
-	testing.expect(t, route_mock_heard(sockets[1], "corp.example.") == 1, "the parent's second member was not asked")
-	testing.expect(t, route_mock_quiet(sockets[2], "corp.example."), "the route was asked after the query's budget had gone")
+	testing.expect(t, mock_heard(f.sockets[0], "corp.example.") == 1, "the parent's first member was not asked")
+	testing.expect(t, mock_heard(f.sockets[1], "corp.example.") == 1, "the parent's second member was not asked")
+	testing.expect(t, route_mock_quiet(f.sockets[2], "corp.example."), "the route was asked after the query's budget had gone")
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.Serv_Fail)
 	// Two timeouts and slack for a loaded runner; a fresh budget for the route
 	// waited three.
-	testing.expectf(t, spent < 5 * cfg.upstream.timeout / 2, "the query waited %v, where its budget is two timeouts of %v", spent, cfg.upstream.timeout)
+	testing.expectf(t, spent < 5 * f.cfg.upstream.timeout / 2, "the query waited %v, where its budget is two timeouts of %v", spent, f.cfg.upstream.timeout)
 	free_all(context.temp_allocator)
 }
 
@@ -2797,10 +2603,16 @@ test_the_question_span_is_the_longest_group_budget :: proc(t: ^testing.T) {
 	cfg.upstream.timeout = 5 * time.Second
 	group := mock_group(t, cfg.upstream, 9)
 	defer upstream.destroy_group(group)
+	if group == nil {
+		return
+	}
 	lan := cfg
 	lan.upstream.timeout = 200 * time.Millisecond
 	routed := mock_group(t, lan.upstream, 9)
 	defer upstream.destroy_group(routed)
+	if routed == nil {
+		return
+	}
 
 	s := Server {
 		cfg    = &cfg,
@@ -2882,77 +2694,116 @@ the fallback sweeps for it.
 */
 @(test)
 test_the_memo_fallback_holds_out_for_the_parents_proof :: proc(t: ^testing.T) {
-	sockets: [3]net.UDP_Socket
-	ports: [3]int
-	bound_count := 0
-	defer for socket in sockets[:bound_count] {
-		net.close(socket)
+	f: Pair_Route
+	if !pair_route_start(t, &f, 200 * time.Millisecond) {
+		return
 	}
-	for i in 0 ..< 3 {
-		socket, spec, bound := bind_mock(t)
-		if !bound {
-			return
-		}
-		sockets[i] = socket
-		bound_count += 1
-		ports[i] = spec.port
-	}
-
-	cfg := test_config()
-	cfg.upstream.timeout = 200 * time.Millisecond
-
-	group := mock_group_pair(t, cfg.upstream, ports[0], ports[1])
-	defer upstream.destroy_group(group)
-	routed := mock_group(t, cfg.upstream, ports[2])
-	defer upstream.destroy_group(routed)
-
-	s := Server {
-		cfg    = &cfg,
-		group  = group,
-		routes = []Zone_Route{{domains = []string{"corp.example."}, group = routed}},
-	}
+	defer pair_route_stop(&f)
 
 	// The queries that write the memory: both members SERVFAIL, the route
 	// answers in their place.
 	for _ in 0 ..< upstream.FAILURE_THRESHOLD {
-		first := Route_Mock{socket = sockets[0], reply = route_reply_nodata("corp.example.", .DS, .Serv_Fail), want = "corp.example."}
-		second := Route_Mock{socket = sockets[1], reply = route_reply_nodata("corp.example.", .DS, .Serv_Fail), want = "corp.example."}
-		route := Route_Mock{socket = sockets[2], reply = route_reply_nodata("corp.example.", .DS), want = "corp.example."}
-		_, ok := serve_corp_ds(&s, {&first, &second, &route})
+		first := Canned_Mock{socket = f.sockets[0], reply = route_reply_nodata("corp.example.", .DS, .Serv_Fail), want = "corp.example."}
+		second := Canned_Mock{socket = f.sockets[1], reply = route_reply_nodata("corp.example.", .DS, .Serv_Fail), want = "corp.example."}
+		route := Canned_Mock{socket = f.sockets[2], reply = route_reply_nodata("corp.example.", .DS), want = "corp.example."}
+		_, ok := serve_corp_ds(&f.s, {&first, &second, &route})
 		if !testing.expect(t, ok, "nothing came back for a query that writes the memory") {
 			return
 		}
-		if !testing.expect(t, first.asked && second.asked, "the parent's group was not swept while the memory was being written") {
+		if !testing.expect(t, first.got && second.got, "the parent's group was not swept while the memory was being written") {
 			return
 		}
 	}
 
-	denier := Route_Mock{socket = sockets[0], reply = route_reply_nodata("corp.example.", .DS, .NX_Domain), want = "corp.example."}
-	prover := Route_Mock{socket = sockets[1], reply = route_reply_nodata("corp.example.", .DS), want = "corp.example."}
-	failing := Route_Mock{socket = sockets[2], reply = route_reply_nodata("corp.example.", .DS, .Serv_Fail), want = "corp.example."}
-	out, ok := serve_corp_ds(&s, {&denier, &prover, &failing})
+	denier := Canned_Mock{socket = f.sockets[0], reply = route_reply_nodata("corp.example.", .DS, .NX_Domain), want = "corp.example."}
+	prover := Canned_Mock{socket = f.sockets[1], reply = route_reply_nodata("corp.example.", .DS), want = "corp.example."}
+	failing := Canned_Mock{socket = f.sockets[2], reply = route_reply_nodata("corp.example.", .DS, .Serv_Fail), want = "corp.example."}
+	out, ok := serve_corp_ds(&f.s, {&denier, &prover, &failing})
 	if !testing.expect(t, ok, "nothing came back at all") {
 		return
 	}
 	// The premise: the memory sent the question to the route first, and the
 	// route had nothing.
-	testing.expect(t, failing.asked, "the memory did not send the question to the route")
-	testing.expect(t, denier.asked, "the parent's first member was not asked after the route failed")
-	testing.expect(t, prover.asked, "the fallback stopped at the NXDOMAIN, short of the member holding the proof")
+	testing.expect(t, failing.got, "the memory did not send the question to the route")
+	testing.expect(t, denier.got, "the parent's first member was not asked after the route failed")
+	testing.expect(t, prover.got, "the fallback stopped at the NXDOMAIN, short of the member holding the proof")
 	decoded, derr := dns.decode_message(out, context.temp_allocator)
 	testing.expect_value(t, derr, dns.Decode_Error.None)
 	testing.expect_value(t, dns.Rcode(decoded.flags.rcode), dns.Rcode.No_Error)
 	free_all(context.temp_allocator)
 }
 
+/*
+Three mocks on loopback behind one server: a parent group of the first two and,
+for `corp.example.`, a route to the third, each waiting `timeout`. `s` points into
+the fixture, so the caller keeps it where it declared it. Nothing is left to
+clean up on false; `pair_route_stop` tears down the rest.
+*/
+@(private = "file")
+Pair_Route :: struct {
+	sockets: [3]net.UDP_Socket,
+	bound:   int,
+	cfg:     config.Config,
+	group:   ^upstream.Group,
+	routed:  ^upstream.Group,
+	domains: [1]string,
+	routes:  [1]Zone_Route,
+	s:       Server,
+}
+
+@(private = "file")
+pair_route_start :: proc(t: ^testing.T, f: ^Pair_Route, timeout: time.Duration, loc := #caller_location) -> bool {
+	ports: [3]int
+	for i in 0 ..< len(f.sockets) {
+		socket, spec, bound := bind_mock(t, loc = loc)
+		if !bound {
+			pair_route_stop(f)
+			return false
+		}
+		f.sockets[i] = socket
+		f.bound += 1
+		ports[i] = spec.port
+	}
+	f.cfg = test_config()
+	f.cfg.upstream.timeout = timeout
+	f.group = mock_group(t, f.cfg.upstream, ports[0], ports[1], loc = loc)
+	f.routed = mock_group(t, f.cfg.upstream, ports[2], loc = loc)
+	if f.group == nil || f.routed == nil {
+		pair_route_stop(f)
+		return false
+	}
+	f.domains[0] = "corp.example."
+	f.routes[0] = Zone_Route{domains = f.domains[:], group = f.routed}
+	f.s = Server {
+		cfg    = &f.cfg,
+		group  = f.group,
+		routes = f.routes[:],
+	}
+	return true
+}
+
+@(private = "file")
+pair_route_stop :: proc(f: ^Pair_Route) {
+	if f.routed != nil {
+		upstream.destroy_group(f.routed)
+	}
+	if f.group != nil {
+		upstream.destroy_group(f.group)
+	}
+	for socket in f.sockets[:f.bound] {
+		net.close(socket)
+	}
+	f^ = {}
+}
+
 // One apex `DS` query for `corp.example.`, with a mock thread per member asked.
 @(private = "file")
-serve_corp_ds :: proc(s: ^Server, mocks: []^Route_Mock) -> (out: []u8, ok: bool) {
+serve_corp_ds :: proc(s: ^Server, mocks: []^Canned_Mock) -> (out: []u8, ok: bool) {
 	threads := make([]^thread.Thread, len(mocks), context.temp_allocator)
 	for m, i in mocks {
-		threads[i] = thread.create_and_start_with_poly_data(m, serve_route)
+		threads[i] = thread.create_and_start_with_poly_data(m, serve_canned)
 	}
-	out, _, ok = handle_query(s, test_query("corp.example.", .DS), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	out, _, ok = handle_query(s, test_query("corp.example.", .DS), .UDP, TEST_CLIENT, context.temp_allocator)
 	for th in threads {
 		thread.join(th)
 		thread.destroy(th)

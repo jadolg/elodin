@@ -131,7 +131,7 @@ test_a_cached_answer_gives_a_non_edns_client_no_opt :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, int(dns.peek_udp_size(filled)), config.DEFAULT_MAX_UDP_RESPONSE)
 
-	hit, outcome, ok := handle_query(&h.srv, client_query(false), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	hit, outcome, ok := handle_query(&h.srv, client_query(false), .UDP, TEST_CLIENT, context.temp_allocator)
 	testing.expect(t, ok, "the cached query went unanswered")
 	testing.expect_value(t, outcome, Outcome.Cached)
 
@@ -173,7 +173,7 @@ test_a_cached_answer_gives_an_edns_client_the_ceiling :: proc(t: ^testing.T) {
 	testing.expect_value(t, bare_err, dns.Decode_Error.None)
 	testing.expect(t, !dns.edns_present(bare), "the non-EDNS client was given an OPT record")
 
-	hit, outcome, ok := handle_query(&h.srv, client_query(true), .UDP, "127.0.0.1:5555", context.temp_allocator)
+	hit, outcome, ok := handle_query(&h.srv, client_query(true), .UDP, TEST_CLIENT, context.temp_allocator)
 	testing.expect(t, ok, "the cached query went unanswered")
 	testing.expect_value(t, outcome, Outcome.Cached)
 

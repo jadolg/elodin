@@ -30,11 +30,11 @@ test_a_response_is_dropped_before_it_is_read :: proc(t: ^testing.T) {
 	garbled := []u8{0x42, 0x42, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 5, 'a', 'b', 'c'}
 	for query in ([][]u8{well_formed, garbled}) {
 		// The premise: sent as a query, each is answered.
-		_, _, answered := handle_query(&s, query, .UDP, "127.0.0.1:5555", context.temp_allocator)
+		_, _, answered := handle_query(&s, query, .UDP, TEST_CLIENT, context.temp_allocator)
 		testing.expect(t, answered, "the premise: the query was answered")
 
 		queries, dropped := sync.atomic_load(&s.stats.queries), sync.atomic_load(&s.stats.dropped)
-		out, _, ok := handle_query(&s, as_response(query), .UDP, "127.0.0.1:5555", context.temp_allocator)
+		out, _, ok := handle_query(&s, as_response(query), .UDP, TEST_CLIENT, context.temp_allocator)
 		testing.expectf(t, !ok && out == nil, "a response was answered with %d bytes", len(out))
 		testing.expect_value(t, sync.atomic_load(&s.stats.queries), queries)
 		testing.expect_value(t, sync.atomic_load(&s.stats.dropped), dropped + 1)
