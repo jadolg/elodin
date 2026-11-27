@@ -78,7 +78,6 @@ SSL_VERIFY_NONE :: 0x00
 SSL_VERIFY_PEER :: 0x01
 
 SSL_ERROR_NONE :: 0
-SSL_ERROR_SSL :: 1
 SSL_ERROR_WANT_READ :: 2
 SSL_ERROR_WANT_WRITE :: 3
 SSL_ERROR_SYSCALL :: 5
@@ -120,13 +119,11 @@ CMS_NOSMIMECAP :: 0x200
 
 TLSEXT_NAMETYPE_host_name :: 0
 
-SSL_OP_NO_TICKET :: u64(1) << 14
 SSL_OP_PRIORITIZE_CHACHA :: u64(1) << 21
 SSL_OP_CIPHER_SERVER_PREFERENCE :: u64(1) << 22
 SSL_OP_NO_RENEGOTIATION :: u64(1) << 30
 
 SSL_SESS_CACHE_OFF :: 0x0000
-SSL_SESS_CACHE_SERVER :: 0x0002
 
 TLS1_2_VERSION :: 0x0303
 TLS1_3_VERSION :: 0x0304
@@ -189,7 +186,6 @@ foreign libssl {
 	SSL_CTX_set_tlsext_ticket_key_evp_cb :: proc(ctx: ^SSL_CTX, cb: Ticket_Key_Cb) -> c.int ---
 	// Seconds; how long a session, and so a ticket, stays resumable.
 	SSL_CTX_set_timeout :: proc(ctx: ^SSL_CTX, t: c.long) -> c.long ---
-	SSL_CTX_get_timeout :: proc(ctx: ^SSL_CTX) -> c.long ---
 	SSL_get_SSL_CTX :: proc(ssl: ^SSL) -> ^SSL_CTX ---
 
 	SSL_new :: proc(ctx: ^SSL_CTX) -> ^SSL ---
@@ -217,9 +213,7 @@ foreign libssl {
 	SSL_CTX_set_cipher_list :: proc(ctx: ^SSL_CTX, list: cstring) -> c.int ---
 	SSL_CTX_set_ciphersuites :: proc(ctx: ^SSL_CTX, list: cstring) -> c.int ---
 	SSL_CTX_get_ciphers :: proc(ctx: ^SSL_CTX) -> ^OPENSSL_STACK ---
-	SSL_CTX_get_options :: proc(ctx: ^SSL_CTX) -> u64 ---
 	SSL_CIPHER_get_name :: proc(cipher: ^SSL_CIPHER) -> cstring ---
-	SSL_SESSION_get0_ticket :: proc(s: ^SSL_SESSION, tick: ^[^]u8, len: ^c.size_t) ---
 
 	// The material a context was loaded with, borrowed back out of it. `get0`
 	// means no reference is taken; see `signer_of`.

@@ -6,6 +6,7 @@ import "core:sync"
 import "core:time"
 import "elodin:dns"
 import "elodin:loop"
+import "elodin:netx"
 
 /*
 A multiplexed HTTP/2 client connection (RFC 9113), for talking to upstream DoH
@@ -189,7 +190,7 @@ Client_Error :: enum u8 {
 }
 
 // A client on `io`, its preface sent, or nil where `allocator` has no room for
-// one.
+// the client itself; its tables are grown as they are used.
 client_make :: proc(io: IO, allocator := context.allocator) -> ^Client {
 	c := new(Client, allocator)
 	if c == nil {
@@ -204,6 +205,9 @@ client_make :: proc(io: IO, allocator := context.allocator) -> ^Client {
 	c.peer_initial_window = DEFAULT_WINDOW
 	c.send_window = DEFAULT_WINDOW
 	c.peer_max_streams = max(int)
+	// Sized here and grown where they are used: one this allocator had no room
+	// for starts empty, and the request that needs it fails then as
+	// `Out_Of_Memory`.
 	c.streams = make(map[u32]^Client_Stream, 16, allocator)
 	c.header_scratch = make([dynamic]u8, 0, 256, allocator)
 	dynamic_table_init(&c.decoder, DEFAULT_HEADER_TABLE_SIZE, allocator)
@@ -374,10 +378,6 @@ client_handle_frame :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool 
 		return client_handle_data(c, h, payload)
 
 	case .Rst_Stream:
-		if h.stream_id == 0 || len(payload) != 4 {
-			client_goaway(c, .Protocol_Error if h.stream_id == 0 else .Frame_Size_Error)
-			return false
-		}
 		loop.lock(&c.mu)
 		if client_stream_is_idle(c, h.stream_id) {
 			loop.unlock(&c.mu)
@@ -620,14 +620,8 @@ parse_status :: proc(value: string) -> int {
 	if len(value) != 3 {
 		return 0
 	}
-	v := 0
-	for c in transmute([]u8)value {
-		if c < '0' || c > '9' {
-			return 0
-		}
-		v = v * 10 + int(c - '0')
-	}
-	return v
+	v, ok := netx.parse_decimal(value, 999)
+	return int(v) if ok else 0
 }
 
 /*
@@ -875,64 +869,22 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	if already_ended {
 		s.rst_sent = true
 	}
-	oversized, dry := false, false
-	// RFC 9113 8.1: DATA follows the final header section, so DATA ahead of it -
-	// before any response, or behind an interim (1xx) one - is malformed, a
-	// stream error of type PROTOCOL_ERROR the client MUST NOT accept.
-	early := found && !already_ended && !s.final
-	// Past the response's own `content-length`: malformed already (RFC 9113
-	// 8.1.1), so failed now rather than buffered to its end.
-	early ||= found && !already_ended && s.has_length && client_content_defined(s) && len(s.body) + len(data) > s.declared
-	if early {
-		s.reset = true
-		loop.cond_broadcast(&c.cond)
-	} else if found && !already_ended {
-		s.received += len(payload)
-		// The second bound is on the window, not the body: see RECV_WINDOW.
-		if len(s.body) + len(data) > MAX_BODY || s.received > RECV_WINDOW / 2 {
-			oversized = true
-			s.reset = true
-			s.oversized = true
-		} else {
-			// Doubled, but never past MAX_BODY: left to `append`, a
-			// 65535-byte body in 16 KiB frames is held in a 116 KiB buffer.
-			if need := len(s.body) + len(data); need > cap(s.body) {
-				dry = reserve(&s.body, min(max(2 * cap(s.body), need), MAX_BODY)) != nil
-			}
-			if dry {
-				s.reset = true
-				s.rst_sent = true
-				s.dry = true
-			} else {
-				append(&s.body, ..data)
-			}
-		}
-	}
-	if oversized || dry {
-		loop.cond_broadcast(&c.cond)
+	early, oversized, dry: bool
+	if found && !already_ended {
+		early, oversized, dry = client_store_data(c, s, data, len(payload))
 	}
 	loop.unlock(&c.mu)
 
-	// No room for the body: the stream fails, and the connection carries on.
-	if dry {
-		return client_rst_stream(c, h.stream_id, .Internal_Error) && client_give_connection_credit(c, len(payload))
-	}
-
-	if early {
-		return client_rst_stream(c, h.stream_id, .Protocol_Error) && client_give_connection_credit(c, len(payload))
-	}
-	if oversized {
-		/*
-		The stream is over as far as we are concerned; no point reading more of
-		a body we have already discarded. The connection is a different matter -
-		these bytes came off it and count against a receive window shared by
-		every stream on it, so the credit goes back even though the stream-level
-		update does not.
-		*/
-		if !client_rst_stream(c, h.stream_id, .Enhance_Your_Calm) {
-			return false
-		}
-		return client_give_connection_credit(c, len(payload))
+	/*
+	A stream failed here - no room for the body, DATA it may not take, or more
+	than is held - is over as far as we are concerned, and the connection
+	carries on. The connection is a different matter for credit: these bytes
+	came off it and count against a receive window shared by every stream on
+	it, so the credit goes back even though the stream-level update does not.
+	*/
+	if dry || early || oversized {
+		code := Error_Code.Internal_Error if dry else .Protocol_Error if early else .Enhance_Your_Calm
+		return client_rst_stream(c, h.stream_id, code) && client_give_connection_credit(c, len(payload))
 	}
 
 	if already_ended {
@@ -952,17 +904,69 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	if !found || h.flags & FLAG_END_STREAM == 0 {
 		return true
 	}
+	return client_end_data(c, h.stream_id)
+}
 
+/*
+Take a live stream's DATA (`data`, of a frame `frame_len` long with its
+padding) into its body, or fail the stream: `early` for DATA ahead of the final
+head or past its `content-length`, `oversized` past what is held, `dry` where the
+body had no room. The caller holds `c.mu`.
+*/
+@(private = "file")
+client_store_data :: proc(c: ^Client, s: ^Client_Stream, data: []u8, frame_len: int) -> (early, oversized, dry: bool) {
+	// RFC 9113 8.1: DATA follows the final header section, so DATA ahead of it -
+	// before any response, or behind an interim (1xx) one - is malformed, a
+	// stream error of type PROTOCOL_ERROR the client MUST NOT accept.
+	early = !s.final
+	// Past the response's own `content-length`: malformed already (RFC 9113
+	// 8.1.1), so failed now rather than buffered to its end.
+	early ||= s.has_length && client_content_defined(s) && len(s.body) + len(data) > s.declared
+	if early {
+		s.reset = true
+		loop.cond_broadcast(&c.cond)
+		return
+	}
+	s.received += frame_len
+	// The second bound is on the window, not the body: see RECV_WINDOW.
+	if len(s.body) + len(data) > MAX_BODY || s.received > RECV_WINDOW / 2 {
+		oversized = true
+		s.reset = true
+		s.oversized = true
+	} else {
+		// Doubled, but never past MAX_BODY: left to `append`, a
+		// 65535-byte body in 16 KiB frames is held in a 116 KiB buffer.
+		if need := len(s.body) + len(data); need > cap(s.body) {
+			dry = reserve(&s.body, min(max(2 * cap(s.body), need), MAX_BODY)) != nil
+		}
+		if dry {
+			s.reset = true
+			s.rst_sent = true
+			s.dry = true
+		} else {
+			append(&s.body, ..data)
+		}
+	}
+	if oversized || dry {
+		loop.cond_broadcast(&c.cond)
+	}
+	return
+}
+
+// A stream's END_STREAM: its response done, or failed where the DATA did not
+// add up to its `content-length`.
+@(private = "file")
+client_end_data :: proc(c: ^Client, stream_id: u32) -> bool {
 	/*
-	Looked up again rather than reusing the pointer from the top of this
-	procedure. The lock was released in between, and a caller that gives up on
+	Looked up again rather than reusing the pointer from the top of
+	`client_handle_data`. The lock was released in between, and a caller that gives up on
 	its stream - a timeout, or a reset - frees it in the deferred cleanup of
 	`client_request`, so the earlier pointer may refer to memory that is gone
 	by now. A response landing at the same moment the caller stops waiting for
 	it is all this needs.
 	*/
 	loop.lock(&c.mu)
-	live, still_open := c.streams[h.stream_id]
+	live, still_open := c.streams[stream_id]
 	if !still_open {
 		loop.unlock(&c.mu)
 		return true
@@ -978,7 +982,7 @@ client_handle_data :: proc(c: ^Client, h: Frame_Header, payload: []u8) -> bool {
 	loop.cond_broadcast(&c.cond)
 	loop.unlock(&c.mu)
 	if !matches {
-		return client_rst_stream(c, h.stream_id, .Protocol_Error)
+		return client_rst_stream(c, stream_id, .Protocol_Error)
 	}
 	return true
 }
@@ -1052,118 +1056,18 @@ client_request :: proc(
 	err: Client_Error,
 ) {
 	// Built before any lock is taken: it does not depend on the stream id.
-	block_dry := false
-	watch := dns.Dry_Watch {
-		backing = context.temp_allocator,
-		dry     = &block_dry,
-	}
-	block := make([dynamic]u8, 0, 128, dns.dry_watch_allocator(&watch))
-	encode_header(&block, ":method", req.method)
-	encode_header(&block, ":scheme", req.scheme)
-	encode_header(&block, ":authority", req.authority)
-	encode_header(&block, ":path", req.path)
-	if req.content_type != "" {
-		encode_header(&block, "content-type", req.content_type)
-	}
-	if req.accept != "" {
-		encode_header(&block, "accept", req.accept)
-	}
-	/*
-	Optional in HTTP/2 (RFC 9113 section 8.1.1), and sent anyway: Cloudflare's
-	DoH endpoint answers 400 to a POST without it, which made it unusable as an
-	upstream. RFC 8484's own example POST carries it.
-	*/
-	if len(req.body) > 0 {
-		digits: [20]u8
-		encode_header(&block, "content-length", strconv.write_int(digits[:], i64(len(req.body)), 10))
-	}
-	if block_dry {
+	block, built := request_header_block(req)
+	if !built {
 		return {}, .Out_Of_Memory
 	}
 	// A `Tick`, not a `Time`: this bounds waiting, and the wall clock steps.
 	deadline := time.tick_add(loop.tick_now(), timeout)
 
-	loop.lock(&c.mu)
-	/*
-	RFC 9113 5.1.2: no more open streams than the peer allows. Every query to
-	this upstream shares the one connection, so past the limit a request waits
-	for a slot - on its own deadline - rather than have the peer refuse it.
-	Streams still in the table count, done or not: one is only freed by its
-	caller's cleanup below, and waiting that little longer is the safe side.
-	*/
-	for len(c.streams) >= c.peer_max_streams && !c.closed && !c.going_away {
-		/*
-		A limit of zero with nothing open frees no slot: only another SETTINGS
-		would, and nothing says one is coming. Give the connection up, as on id
-		exhaustion below, so the next request dials afresh instead of every
-		query waiting out its timeout here.
-
-		The trade, settled so it is not reargued: RFC 9113 6.5.2 says zero
-		SHOULD NOT be special, and in the same paragraph that a server should
-		only advertise it briefly and close a connection it wants no requests
-		on. What a brief zero costs here is one handshake; what waiting costs is
-		every query's whole timeout, charged to the upstream as silence. Zero
-		with streams still open is not special: those free slots as usual.
-		*/
-		if len(c.streams) == 0 {
-			sync.atomic_store(&c.closed, true)
-			loop.cond_broadcast(&c.slot_cond)
-			break
-		}
-		remaining := time.tick_diff(loop.tick_now(), deadline)
-		if remaining <= 0 {
-			loop.unlock(&c.mu)
-			return {}, .Timeout
-		}
-		loop.cond_wait_with_timeout(&c.slot_cond, &c.mu, remaining)
+	s, sent, open_err := open_stream(c, req, block, deadline)
+	if open_err != .None {
+		return {}, open_err
 	}
-	// RFC 9113 6.8: no new stream after the peer's GOAWAY.
-	if c.closed || c.going_away {
-		loop.unlock(&c.mu)
-		return {}, .Closed
-	}
-	// RFC 9113 §5.1.1: an endpoint that has exhausted the stream id space must
-	// not open further streams on this connection. It goes away as after a
-	// peer's GOAWAY: `get_h2_conn` dials a fresh one instead of wrapping the id
-	// and colliding with a stream still keyed on the unmasked value in
-	// c.streams, and the streams already open finish.
-	if c.next_stream_id > 0x7fff_ffff {
-		sync.atomic_store(&c.going_away, true)
-		loop.cond_broadcast(&c.slot_cond)
-		loop.unlock(&c.mu)
-		return {}, .Closed
-	}
-	stream_id := c.next_stream_id
-	s := new(Client_Stream, c.allocator)
-	if s == nil || map_insert(&c.streams, stream_id, s) == nil {
-		free(s, c.allocator)
-		// Leaving without the slot, so the wake that may have let this request
-		// through goes to the next waiter rather than with it.
-		loop.cond_signal(&c.slot_cond)
-		loop.unlock(&c.mu)
-		return {}, .Out_Of_Memory
-	}
-	sync.atomic_add(&c.refs, 1)
-	c.next_stream_id += 2
-	s.id = stream_id
-	s.head = req.method == "HEAD"
-	s.send_window = c.peer_initial_window
-	s.body = make([dynamic]u8, 0, 512, c.allocator)
-
-	/*
-	The HEADERS write happens in the same critical section as the id
-	allocation above, rather than going through client_write_all after
-	releasing the lock. RFC 9113 requires a peer to see stream ids used in
-	increasing order; releasing the lock between assigning stream_id and
-	writing its HEADERS frame would let a second caller — assigned a higher
-	id — win the race to the socket, and the peer sees that as a protocol
-	violation and kills the whole connection out from under every stream on
-	it, not just the two that raced.
-	*/
-	frame := headers_frame(stream_id, block[:], end_stream = len(req.body) == 0)
-	s.dry = frame == nil
-	sent := !s.dry && c.io.write(c.io.user, frame)
-	loop.unlock(&c.mu)
+	stream_id := s.id
 
 	/*
 	The stream is released under the lock, not after it. The reader
@@ -1189,32 +1093,178 @@ client_request :: proc(
 	}
 
 	if !sent || (len(req.body) > 0 && !client_send_body(c, s, req.body, deadline)) {
-		loop.lock(&c.mu)
-		dead := c.closed
-		reset := s.reset
-		refused := s.refused
-		oversized := s.oversized
-		head := stream_head(s)
-		dry := s.dry || c.dry
-		loop.unlock(&c.mu)
-		switch {
-		// A response that overran while the body was still going up is the
-		// same `Too_Large` as one that overran after it; see below.
-		case oversized:
-			return head, .Too_Large
-		case dry:
-			return {}, .Out_Of_Memory
-		case dead:
-			return head, .Closed
-		case refused:
-			return {}, .Refused
-		case reset:
-			return head, .Reset
-		case:
-			return head, .Timeout
-		}
+		return send_failure(c, s)
 	}
+	return await_response(c, s, deadline, allocator)
+}
 
+// `req`'s HEADERS block, HPACK-encoded into the temp arena; false where it had
+// no room to be built whole.
+@(private = "file")
+request_header_block :: proc(req: Client_Request) -> (block: []u8, ok: bool) {
+	block_dry := false
+	watch := dns.Dry_Watch {
+		backing = context.temp_allocator,
+		dry     = &block_dry,
+	}
+	out := make([dynamic]u8, 0, 128, dns.dry_watch_allocator(&watch))
+	encode_header(&out, ":method", req.method)
+	encode_header(&out, ":scheme", req.scheme)
+	encode_header(&out, ":authority", req.authority)
+	encode_header(&out, ":path", req.path)
+	if req.content_type != "" {
+		encode_header(&out, "content-type", req.content_type)
+	}
+	if req.accept != "" {
+		encode_header(&out, "accept", req.accept)
+	}
+	/*
+	Optional in HTTP/2 (RFC 9113 section 8.1.1), and sent anyway: Cloudflare's
+	DoH endpoint answers 400 to a POST without it, which made it unusable as an
+	upstream. RFC 8484's own example POST carries it.
+	*/
+	if len(req.body) > 0 {
+		digits: [20]u8
+		encode_header(&out, "content-length", strconv.write_int(digits[:], i64(len(req.body)), 10))
+	}
+	return out[:], !block_dry
+}
+
+/*
+A stream of `c`'s for `req`, opened and its HEADERS (`block`) written: `sent`
+is whether that write went out. A stream comes back holding a reference on `c`
+the caller's cleanup gives back; with an error there is no stream and no
+reference. Takes and releases `c.mu`.
+*/
+@(private = "file")
+open_stream :: proc(c: ^Client, req: Client_Request, block: []u8, deadline: time.Tick) -> (s: ^Client_Stream, sent: bool, err: Client_Error) {
+	loop.lock(&c.mu)
+	if err = wait_for_slot(c, deadline); err != .None {
+		loop.unlock(&c.mu)
+		return nil, false, err
+	}
+	stream_id := c.next_stream_id
+	s = new(Client_Stream, c.allocator)
+	if s == nil || map_insert(&c.streams, stream_id, s) == nil {
+		free(s, c.allocator)
+		// Leaving without the slot, so the wake that may have let this request
+		// through goes to the next waiter rather than with it.
+		loop.cond_signal(&c.slot_cond)
+		loop.unlock(&c.mu)
+		return nil, false, .Out_Of_Memory
+	}
+	sync.atomic_add(&c.refs, 1)
+	c.next_stream_id += 2
+	s.id = stream_id
+	s.head = req.method == "HEAD"
+	s.send_window = c.peer_initial_window
+	s.body = make([dynamic]u8, 0, 512, c.allocator)
+
+	/*
+	The HEADERS write happens in the same critical section as the id
+	allocation above, rather than going through client_write_all after
+	releasing the lock. RFC 9113 requires a peer to see stream ids used in
+	increasing order; releasing the lock between assigning stream_id and
+	writing its HEADERS frame would let a second caller — assigned a higher
+	id — win the race to the socket, and the peer sees that as a protocol
+	violation and kills the whole connection out from under every stream on
+	it, not just the two that raced.
+	*/
+	frame := headers_frame(stream_id, block, end_stream = len(req.body) == 0)
+	s.dry = frame == nil
+	sent = !s.dry && c.io.write(c.io.user, frame)
+	loop.unlock(&c.mu)
+	return s, sent, .None
+}
+
+// Wait, until `deadline`, for room for one more stream on `c`, and for an id
+// to give it. Called and left with `c.mu` held.
+@(private = "file")
+wait_for_slot :: proc(c: ^Client, deadline: time.Tick) -> Client_Error {
+	/*
+	RFC 9113 5.1.2: no more open streams than the peer allows. Every query to
+	this upstream shares the one connection, so past the limit a request waits
+	for a slot - on its own deadline - rather than have the peer refuse it.
+	Streams still in the table count, done or not: one is only freed by its
+	caller's cleanup (`client_request`'s), and waiting that little longer is the
+	safe side.
+	*/
+	for len(c.streams) >= c.peer_max_streams && !c.closed && !c.going_away {
+		/*
+		A limit of zero with nothing open frees no slot: only another SETTINGS
+		would, and nothing says one is coming. Give the connection up, as on id
+		exhaustion below, so the next request dials afresh instead of every
+		query waiting out its timeout here.
+
+		The trade, settled so it is not reargued: RFC 9113 6.5.2 says zero
+		SHOULD NOT be special, and in the same paragraph that a server should
+		only advertise it briefly and close a connection it wants no requests
+		on. What a brief zero costs here is one handshake; what waiting costs is
+		every query's whole timeout, charged to the upstream as silence. Zero
+		with streams still open is not special: those free slots as usual.
+		*/
+		if len(c.streams) == 0 {
+			sync.atomic_store(&c.closed, true)
+			loop.cond_broadcast(&c.slot_cond)
+			break
+		}
+		remaining := time.tick_diff(loop.tick_now(), deadline)
+		if remaining <= 0 {
+			return .Timeout
+		}
+		loop.cond_wait_with_timeout(&c.slot_cond, &c.mu, remaining)
+	}
+	// RFC 9113 6.8: no new stream after the peer's GOAWAY.
+	if c.closed || c.going_away {
+		return .Closed
+	}
+	// RFC 9113 §5.1.1: an endpoint that has exhausted the stream id space must
+	// not open further streams on this connection. It goes away as after a
+	// peer's GOAWAY: `get_h2_conn` dials a fresh one instead of wrapping the id
+	// and colliding with a stream still keyed on the unmasked value in
+	// c.streams, and the streams already open finish.
+	if c.next_stream_id > 0x7fff_ffff {
+		sync.atomic_store(&c.going_away, true)
+		loop.cond_broadcast(&c.slot_cond)
+		return .Closed
+	}
+	return .None
+}
+
+// What a request whose HEADERS or body did not go out comes to, read off `s`
+// and `c` under `c.mu`.
+@(private = "file")
+send_failure :: proc(c: ^Client, s: ^Client_Stream) -> (Client_Response, Client_Error) {
+	loop.lock(&c.mu)
+	dead := c.closed
+	reset := s.reset
+	refused := s.refused
+	oversized := s.oversized
+	head := stream_head(s)
+	dry := s.dry || c.dry
+	loop.unlock(&c.mu)
+	switch {
+	// A response that overran while the body was still going up is the
+	// same `Too_Large` as one that overran after it; see `await_response`.
+	case oversized:
+		return head, .Too_Large
+	case dry:
+		return {}, .Out_Of_Memory
+	case dead:
+		return head, .Closed
+	case refused:
+		return {}, .Refused
+	case reset:
+		return head, .Reset
+	case:
+		return head, .Timeout
+	}
+}
+
+// Wait, until `deadline`, for `s`'s response, and hand it back with its body
+// copied into `allocator`; a stream cut short reports why.
+@(private = "file")
+await_response :: proc(c: ^Client, s: ^Client_Stream, deadline: time.Tick, allocator: mem.Allocator) -> (Client_Response, Client_Error) {
 	loop.lock(&c.mu)
 	for !s.done && !s.reset && !c.closed {
 		remaining := time.tick_diff(loop.tick_now(), deadline)
@@ -1222,7 +1272,7 @@ client_request :: proc(
 			// A final response's head may have come without its body.
 			head := stream_head(s)
 			loop.unlock(&c.mu)
-			client_rst_stream(c, stream_id, .Cancel)
+			client_rst_stream(c, s.id, .Cancel)
 			return head, .Timeout
 		}
 		loop.cond_wait_with_timeout(&c.cond, &c.mu, remaining)

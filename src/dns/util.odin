@@ -283,7 +283,7 @@ queries and responses" (RFC 1035 section 4.1.1).
 */
 @(private)
 patch_reply_flags :: proc(buf: []u8, tc: bool, rcode: u8) {
-	flags := transmute(Flags)(be16(buf, 2))
+	flags, _ := peek_flags(buf) // every caller hands it a whole header
 	flags.qr = true
 	flags.ra = true
 	flags.tc = tc

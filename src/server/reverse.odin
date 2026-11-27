@@ -500,17 +500,7 @@ decimal_octet :: proc(label: string) -> (v: u8, ok: bool) {
 	if len(label) > 1 && label[0] == '0' {
 		return 0, false
 	}
-	n := 0
-	for i in 0 ..< len(label) {
-		c := label[i]
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		n = n * 10 + int(c - '0')
-	}
-	if n > 255 {
-		return 0, false
-	}
+	n := netx.parse_decimal(label, 255) or_return
 	return u8(n), true
 }
 

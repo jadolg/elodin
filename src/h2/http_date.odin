@@ -5,6 +5,7 @@ import "core:strings"
 import "core:time"
 import dt "core:time/datetime"
 import "elodin:loop"
+import "elodin:netx"
 
 /*
 Whether a response with this status is the server declining the request for
@@ -195,7 +196,8 @@ parse_http_date :: proc(value: string, now: dt.DateTime) -> (moment: dt.DateTime
 valid date in years 0 to 9999, which is what the four digits hold.
 */
 format_http_date :: proc(at: dt.DateTime, allocator := context.allocator) -> string {
-	ordinal, _ := dt.date_to_ordinal(at.date)
+	ordinal, err := dt.date_to_ordinal(at.date)
+	assert(err == nil, "format_http_date was given a date that is not one")
 	day_names, month_names := DAY_NAMES, MONTH_NAMES
 	return fmt.aprintf(
 		"%s, %02d %s %04d %02d:%02d:%02d GMT",
@@ -244,13 +246,8 @@ month_number :: proc(s: string) -> (month: i64, ok: bool) {
 // A fixed-width run of digits, which no field here has more than four of.
 @(private = "file")
 digits :: proc(s: string) -> (v: i64, ok: bool) {
-	for i in 0 ..< len(s) {
-		if s[i] < '0' || s[i] > '9' {
-			return 0, false
-		}
-		v = v * 10 + i64(s[i] - '0')
-	}
-	return v, len(s) > 0
+	n := netx.parse_decimal(s, 9999) or_return
+	return i64(n), true
 }
 
 // Whether `s` has a space at each of `at`.

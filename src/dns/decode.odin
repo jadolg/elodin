@@ -814,6 +814,15 @@ peek_id :: proc(msg: []u8) -> (id: u16, ok: bool) {
 	return be16(msg, 0), true
 }
 
+// The header flags (RFC 1035 section 4.1.1), read off the header without
+// parsing anything; false for a message too short to hold them.
+peek_flags :: proc(msg: []u8) -> (flags: Flags, ok: bool) {
+	if len(msg) < 4 {
+		return {}, false
+	}
+	return transmute(Flags)(be16(msg, 2)), true
+}
+
 /*
 Whether `msg` is a response (QR=1, RFC 1035 section 4.1.1), read off the header
 without parsing anything; false for one too short to have the bit.

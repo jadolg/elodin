@@ -475,6 +475,35 @@ http_exchange :: proc(
 	resp: Http_Response,
 	err: Error,
 ) {
+	write_http_request(stream, req, deadline, idle) or_return
+
+	// On the heap rather than in scratch, which keeps every block the buffer
+	// outgrows until the caller's `free_all` - for a blocklist refresh, every
+	// list's download until the last one has loaded.
+	r := Buf_Reader {
+		stream   = stream,
+		buf      = make([dynamic]u8, 0, HTTP_READ_CHUNK),
+		deadline = deadline,
+		idle     = idle,
+	}
+	defer delete(r.buf)
+
+	head: Http_Head
+	if herr := read_http_head(&r, &resp, &head, max_body); herr != .None {
+		return resp, herr
+	}
+	// Called before the return: a `return resp, call()` would hand back the
+	// copy of `resp` taken before the body went into it.
+	berr := read_http_body(&r, &resp, head, allocator, max_body)
+	return resp, berr
+}
+
+/*
+Write `req` onto `stream`: the request line, its fields, and its body.
+`.HTTP_Error`, with nothing written, for a field the wire cannot carry as given.
+*/
+@(private)
+write_http_request :: proc(stream: ^Stream, req: Http_Request, deadline: time.Tick, idle: time.Duration) -> Error {
 	/*
 	Every field goes onto the wire verbatim, so a byte there the request line or
 	a header cannot hold is a request of this client's making that a server reads
@@ -489,7 +518,7 @@ http_exchange :: proc(
 	   !h2.authority_is_valid(req.host) ||
 	   !request_field_value_is_valid(req.accept) ||
 	   !request_field_value_is_valid(req.content_type) {
-		return {}, .HTTP_Error
+		return .HTTP_Error
 	}
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, req.method)
@@ -519,127 +548,51 @@ http_exchange :: proc(
 	if len(req.body) > 0 {
 		stream_write(stream, req.body, deadline, idle) or_return
 	}
+	return .None
+}
 
-	// On the heap rather than in scratch, which keeps every block the buffer
-	// outgrows until the caller's `free_all` - for a blocklist refresh, every
-	// list's download until the last one has loaded.
-	r := Buf_Reader {
-		stream   = stream,
-		buf      = make([dynamic]u8, 0, HTTP_READ_CHUNK),
-		deadline = deadline,
-		idle     = idle,
-	}
-	defer delete(r.buf)
+// What a response's head says about its framing, and the count of field lines
+// read so far across every response of the exchange.
+@(private)
+Http_Head :: struct {
+	http_1_0:       bool,
+	content_length: int,
+	chunked:        bool,
+	headers:        int,
+	seen_retry:     bool,
+	seen_age:       bool,
+}
 
+/*
+Read the response's head into `resp` and `head`: the status line and fields,
+past every interim response. On a refusal `resp` holds what was read so far.
+*/
+@(private)
+read_http_head :: proc(r: ^Buf_Reader, resp: ^Http_Response, head: ^Http_Head, max_body: int) -> Error {
 	/*
 	Interim (1xx) responses come first and are passed over: their fields are
 	read under the same rules, then dropped, and the next status line is the
 	response's own (RFC 9110 15.2). Each one counts against the field limit,
 	or a peer could send them forever (#442).
 	*/
-	http_1_0: bool
-	content_length: int
-	chunked: bool
-	headers := 0
-	seen_retry, seen_age := false, false
 	// A close announced by any response of the exchange, interim ones included,
 	// holds for the connection: keeping it costs a dial at most.
 	resp.keep_alive = true
 	for {
-		status_line := reader_line(&r) or_return
-		resp.status, http_1_0 = parse_status(status_line) or_return
+		status_line := reader_line(r) or_return
+		resp.status, head.http_1_0 = parse_status(status_line) or_return
 		// HTTP/1.0 closes unless it says otherwise (RFC 9112 9.3), and saying so
 		// is not worth honouring for one saved dial: only 1.1 and later are pooled.
-		if http_1_0 {
+		if head.http_1_0 {
 			resp.keep_alive = false
 		}
 		// A 101 is an answer to an upgrade this client never asks for.
 		if resp.status == 101 {
-			return resp, .HTTP_Error
+			return .HTTP_Error
 		}
-		content_length = -1
-		chunked = false
-		for {
-			line := reader_line(&r) or_return
-			if line == "" {
-				break
-			}
-			headers += 1
-			if headers > MAX_HTTP_HEADERS {
-				return resp, .HTTP_Error
-			}
-			name, value, ok := h2.split_field_line(line)
-			if !ok {
-				return resp, .HTTP_Error
-			}
-			switch {
-			/*
-			Names and the `close` option compare without regard to ASCII case and no
-			other: `strings.equal_fold` folds Unicode, where the long s (U+017F) is
-			an `s`, so `Tran\u017ffer-Encoding` would frame the body as chunked
-			(#432).
-			*/
-			case dns.name_equal_fold(name, "content-length"):
-				// RFC 9112 6.3: more than one of these and the message is invalid,
-				// agreeing or not.
-				if content_length >= 0 {
-					return resp, .HTTP_Error
-				}
-				v, cl_ok := h2.parse_content_length(value, max_body)
-				// A value that is not a length is refused here rather than left to
-				// fall past the `== 0` and `> 0` cases below onto the read-to-end
-				// path, which is not what the peer asked for.
-				if !cl_ok {
-					return resp, .HTTP_Error
-				}
-				// Past `max_body` it reads as `max_body + 1`, and is refused below
-				// once the status says a body follows: a 304's is its
-				// representation's length, and a 1xx's is refused for framing.
-				content_length = v
-			case dns.name_equal_fold(name, "transfer-encoding"):
-				/*
-				`chunked` alone, once, or the response is refused (#437). This
-				client asks for no codings, so any other is one it cannot undo -
-				`chunked, gzip` framed as chunks would hand the gzip on as the
-				answer - and RFC 9112 6.1 forbids chunked anywhere but last, or
-				twice. Read as a substring, `xchunked` would take chunk framing
-				out of a plain body.
-				*/
-				if chunked || !dns.name_equal_fold(value, "chunked") {
-					return resp, .HTTP_Error
-				}
-				chunked = true
-			case dns.name_equal_fold(name, "connection"):
-				// A list of options (RFC 9110 7.6.1): `keep-alive, close` closes.
-				if h2.list_has_token(value, "close") {
-					resp.keep_alive = false
-				}
-			case dns.name_equal_fold(name, "location"):
-				// Scratch, as the doc comment above promises: only the body is the
-				// caller's to free. Taking the first of a repeated header rather than
-				// the last also stops a server orphaning a string per copy.
-				// An interim response's Location is not the answer's.
-				if resp.location == "" && resp.status >= 200 {
-					resp.location = strings.clone(value, context.temp_allocator)
-				}
-			case dns.name_equal_fold(name, "age"):
-				// A singleton (RFC 9111 5.1): the first one is the one, as for
-				// Retry-After below. One that does not parse is ignored.
-				if !seen_age && resp.status >= 200 {
-					seen_age = true
-					if seconds, parsed := h2.age_of(value); parsed {
-						resp.age = seconds
-					}
-				}
-			case dns.name_equal_fold(name, "retry-after"):
-				// Not a list (RFC 9110 10.2.3), so the first one is the one. An
-				// interim response's has no status that asks to wait.
-				if !seen_retry && resp.status >= 200 {
-					seen_retry = true
-					resp.retry_after = h2.retry_after_of(resp.status, value)
-				}
-			}
-		}
+		head.content_length = -1
+		head.chunked = false
+		read_http_fields(r, resp, head, max_body) or_return
 		if resp.status >= 200 {
 			break
 		}
@@ -649,12 +602,12 @@ http_exchange :: proc(
 		peer's choosing - with the real one left on the connection for the next
 		query.
 		*/
-		if chunked || content_length >= 0 {
-			return resp, .HTTP_Error
+		if head.chunked || head.content_length >= 0 {
+			return .HTTP_Error
 		}
-		headers += 1
-		if headers > MAX_HTTP_HEADERS {
-			return resp, .HTTP_Error
+		head.headers += 1
+		if head.headers > MAX_HTTP_HEADERS {
+			return .HTTP_Error
 		}
 	}
 
@@ -664,15 +617,113 @@ http_exchange :: proc(
 	other framing would have ended is not a place to read another response
 	from, so the connection goes no further.
 	*/
-	if chunked && http_1_0 {
-		return resp, .HTTP_Error
+	if head.chunked && head.http_1_0 {
+		return .HTTP_Error
 	}
-	if chunked && content_length >= 0 {
+	if head.chunked && head.content_length >= 0 {
 		resp.keep_alive = false
 	}
 	// The head has been read and its framing accepted; what follows is the body.
 	resp.whole_head = true
+	return .None
+}
 
+// One response's field lines, up to the blank line that ends them.
+@(private)
+read_http_fields :: proc(r: ^Buf_Reader, resp: ^Http_Response, head: ^Http_Head, max_body: int) -> Error {
+	for {
+		line := reader_line(r) or_return
+		if line == "" {
+			return .None
+		}
+		head.headers += 1
+		if head.headers > MAX_HTTP_HEADERS {
+			return .HTTP_Error
+		}
+		name, value, ok := h2.split_field_line(line)
+		if !ok {
+			return .HTTP_Error
+		}
+		take_http_field(resp, head, name, value, max_body) or_return
+	}
+}
+
+// One field line of a response, into `resp` or `head`.
+@(private)
+take_http_field :: proc(resp: ^Http_Response, head: ^Http_Head, name, value: string, max_body: int) -> Error {
+	switch {
+	/*
+	Names and the `close` option compare without regard to ASCII case and no
+	other: `strings.equal_fold` folds Unicode, where the long s (U+017F) is
+	an `s`, so `Tran\u017ffer-Encoding` would frame the body as chunked
+	(#432).
+	*/
+	case dns.name_equal_fold(name, "content-length"):
+		// RFC 9112 6.3: more than one of these and the message is invalid,
+		// agreeing or not.
+		if head.content_length >= 0 {
+			return .HTTP_Error
+		}
+		v, cl_ok := h2.parse_content_length(value, max_body)
+		// A value that is not a length is refused here rather than left to
+		// fall past `read_http_body`'s `== 0` and `> 0` cases onto the
+		// read-to-end path, which is not what the peer asked for.
+		if !cl_ok {
+			return .HTTP_Error
+		}
+		// Past `max_body` it reads as `max_body + 1`, and is refused by
+		// `read_http_body` once the status says a body follows: a 304's is its
+		// representation's length, and a 1xx's is refused for framing.
+		head.content_length = v
+	case dns.name_equal_fold(name, "transfer-encoding"):
+		/*
+		`chunked` alone, once, or the response is refused (#437). This
+		client asks for no codings, so any other is one it cannot undo -
+		`chunked, gzip` framed as chunks would hand the gzip on as the
+		answer - and RFC 9112 6.1 forbids chunked anywhere but last, or
+		twice. Read as a substring, `xchunked` would take chunk framing
+		out of a plain body.
+		*/
+		if head.chunked || !dns.name_equal_fold(value, "chunked") {
+			return .HTTP_Error
+		}
+		head.chunked = true
+	case dns.name_equal_fold(name, "connection"):
+		// A list of options (RFC 9110 7.6.1): `keep-alive, close` closes.
+		if h2.list_has_token(value, "close") {
+			resp.keep_alive = false
+		}
+	case dns.name_equal_fold(name, "location"):
+		// Scratch, as `http_exchange`'s doc promises: only the body is the
+		// caller's to free. Taking the first of a repeated header rather than
+		// the last also stops a server orphaning a string per copy.
+		// An interim response's Location is not the answer's.
+		if resp.location == "" && resp.status >= 200 {
+			resp.location = strings.clone(value, context.temp_allocator)
+		}
+	case dns.name_equal_fold(name, "age"):
+		// A singleton (RFC 9111 5.1): the first one is the one, as for
+		// Retry-After. One that does not parse is ignored.
+		if !head.seen_age && resp.status >= 200 {
+			head.seen_age = true
+			if seconds, parsed := h2.age_of(value); parsed {
+				resp.age = seconds
+			}
+		}
+	case dns.name_equal_fold(name, "retry-after"):
+		// Not a list (RFC 9110 10.2.3), so the first one is the one. An
+		// interim response's has no status that asks to wait.
+		if !head.seen_retry && resp.status >= 200 {
+			head.seen_retry = true
+			resp.retry_after = h2.retry_after_of(resp.status, value)
+		}
+	}
+	return .None
+}
+
+// The body the head framed, into `allocator`.
+@(private)
+read_http_body :: proc(r: ^Buf_Reader, resp: ^Http_Response, head: Http_Head, allocator: mem.Allocator, max_body: int) -> Error {
 	switch {
 	case resp.status == 204 || resp.status == 304:
 		// No body, whatever the fields say (RFC 9112 6.3): read by them, a 204
@@ -681,25 +732,24 @@ http_exchange :: proc(
 		// A 204 may not frame a body (RFC 9110 8.6, 6.1); one that does may have
 		// sent it, and the next response would be read from inside it. A 304's
 		// framing fields describe its representation, and nothing follows it.
-		// No caller pools after a non-200 today; this is for the one that does.
-		if resp.status == 204 && (chunked || content_length >= 0) {
+		if resp.status == 204 && (head.chunked || head.content_length >= 0) {
 			resp.keep_alive = false
 		}
-	case chunked:
-		resp.body = read_chunked(&r, allocator, max_body) or_return
-	case content_length == 0:
+	case head.chunked:
+		resp.body = read_chunked(r, allocator, max_body) or_return
+	case head.content_length == 0:
 		resp.body = nil
-	case content_length > max_body:
+	case head.content_length > max_body:
 		// Before a byte of the body is read.
-		return resp, .Too_Large
-	case content_length > 0:
-		resp.body = reader_take(&r, reader_exact(&r, content_length) or_return, allocator) or_return
+		return .Too_Large
+	case head.content_length > 0:
+		resp.body = reader_take(r, reader_exact(r, head.content_length) or_return, allocator) or_return
 	case:
 		// No framing information: the body ends when the connection does.
-		resp.body = reader_take(&r, reader_to_end(&r, max_body) or_return, allocator) or_return
+		resp.body = reader_take(r, reader_to_end(r, max_body) or_return, allocator) or_return
 		resp.keep_alive = false
 	}
-	return resp, .None
+	return .None
 }
 
 /*
