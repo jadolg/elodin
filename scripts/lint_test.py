@@ -88,6 +88,8 @@ PROCS = [
     ({"src/dns/a.odin": "used :: proc() {}\n", "src/dns/b.odin": "x := used()\n"}, []),
     ({"src/dns/a.odin": "lonely :: proc() {}\n", "src/dns/a_test.odin": "lonely()\n"}, ["lonely"]),
     ({"src/dns/a.odin": "package dns\nharness :: proc() {}\n", "src/itest/c.odin": "dns.harness()\n"}, []),
+    ({"src/dns/a.odin": "package dns\nfuzzed :: proc() {}\n", "src/fuzz/dns/f.odin": "dns.fuzzed()\n"}, ["fuzzed"]),
+    ({"src/dns/a.odin": "package dns\nboth :: proc() {}\n", "src/fuzz/dns/f.odin": "dns.both()\n", "src/server/x.odin": "dns.both()\n"}, []),
     ({"src/loop/a.odin": "package loop\nwait :: proc() {}\n", "src/loop/b.odin": "sync.wait()\n"}, ["wait"]),
     ({"src/tlsx/a.odin": "package tlsx\nread :: proc() {}\n", "src/itest/c.odin": "read()\n"}, ["read"]),
     ({"src/main/main.odin": "package main\nmain :: proc() {}\n"}, []),

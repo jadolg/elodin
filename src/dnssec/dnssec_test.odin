@@ -386,8 +386,8 @@ A denial whose hashing allowance ran out is `Indeterminate`, not `Bogus`.
 records did wrong, and the two verdicts say different things about that:
 `Bogus` tells the client its answer was forged, with extended error 6 to say so,
 while `Indeterminate` says only that this server did not finish reading the
-proof. The same distinction every other allowance in
-`validate.odin` makes, made for the one that counts SHA-1.
+proof. The same distinction every other allowance in the validator makes, made
+for the one that counts SHA-1.
 
 The proof is real captured traffic - com's NSEC3 denial for a name that is not
 there - so the only difference between the two calls is the meter. What runs out

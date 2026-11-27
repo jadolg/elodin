@@ -1,6 +1,7 @@
 package dnssec
 
 import "core:encoding/hex"
+import "core:fmt"
 import "core:slice"
 import "core:strings"
 import "elodin:dns"
@@ -242,17 +243,10 @@ key_tag_query_name :: proc(zone: string, tags: []u16, allocator := context.alloc
 	if len(tags) == 0 {
 		return "", false
 	}
-	digits := "0123456789abcdef"
 	b := strings.builder_make(allocator)
 	strings.write_string(&b, "_ta")
 	for tag in tags {
-		strings.write_byte(&b, '-')
-		for shift: uint = 12; ; shift -= 4 {
-			strings.write_byte(&b, digits[(tag >> shift) & 0xf])
-			if shift == 0 {
-				break
-			}
-		}
+		fmt.sbprintf(&b, "-%04x", tag)
 	}
 	strings.write_byte(&b, '.')
 	if zone != "." {

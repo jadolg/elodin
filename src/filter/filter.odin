@@ -44,10 +44,10 @@ Decision :: enum u8 {
 	Allowed,
 }
 
-// Longest domain we will normalise on the stack: 255 wire bytes can expand to
-// four presentation characters each.
+// Longest domain normalised on the stack: the longest a name's presentation
+// form can be.
 @(private)
-MAX_NORMALISED :: 1024
+MAX_NORMALISED :: dns.MAX_NAME_PRESENTATION
 
 Set :: struct {
 	names:     Table,

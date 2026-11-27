@@ -258,7 +258,7 @@ append_opt :: proc(
 
 	out = alloc_slice([]u8, size, allocator) or_return
 	copy(out, msg)
-	arcount := int(u16(msg[10]) << 8 | u16(msg[11])) + 1
+	arcount := int(be16(msg, 10)) + 1
 	out[10] = u8(arcount >> 8)
 	out[11] = u8(arcount)
 
@@ -299,11 +299,11 @@ refused however much of it is left.
 */
 @(private)
 walk_to_end :: proc(msg: []u8) -> (end: int, has_opt: bool) {
-	pos, total, walked := records_start(msg)
+	pos, total, sections, walked := records_start(msg)
 	if !walked {
 		return -1, false
 	}
-	before := total - int(u16(msg[10]) << 8 | u16(msg[11]))
+	before := total - sections.additional
 	for i in 0 ..< total {
 		type, _, next, ok := skip_record(msg, pos)
 		if !ok {
@@ -419,7 +419,7 @@ remove_opt :: proc(
 	behind it whose names may well be pointed at, and those offsets do move,
 	which is why that case is rebuilt instead.
 	*/
-	arcount := u16(msg[10]) << 8 | u16(msg[11])
+	arcount := be16(msg, 10)
 	if arcount == 0 {
 		// Unreachable: the record was counted in ARCOUNT to be found at all.
 		// Read before the copy is made rather than after, so the one return that
@@ -549,7 +549,7 @@ Opt_Span :: struct {
 
 @(private)
 find_opt_span :: proc(msg: []u8) -> (span: Opt_Span, ok: bool) {
-	pos, total := records_start(msg) or_return
+	pos, total, sections := records_start(msg) or_return
 	/*
 	Only the additional section is looked in, because that is the only section
 	`find_opt` looks in. A record of type OPT anywhere else is not the message's
@@ -558,7 +558,7 @@ find_opt_span :: proc(msg: []u8) -> (span: Opt_Span, ok: bool) {
 	never consults quietly rewritten. A client can put one in its answer section
 	for the asking.
 	*/
-	before := total - int(u16(msg[10]) << 8 | u16(msg[11]))
+	before := total - sections.additional
 	for i in 0 ..< total {
 		type, fixed, next := skip_record(msg, pos) or_return
 		if type == .OPT && i >= before {
@@ -597,11 +597,11 @@ the point where the walk stops: `find_opt_span` cannot reach one there either,
 and nor can a client's decoder. Allocates nothing.
 */
 peek_opt_unreadable :: proc(msg: []u8) -> bool {
-	pos, total, walked := records_start(msg)
+	pos, total, sections, walked := records_start(msg)
 	if !walked {
 		return false
 	}
-	before := total - int(u16(msg[10]) << 8 | u16(msg[11]))
+	before := total - sections.additional
 	seen := false
 	for i in 0 ..< total {
 		type, fixed, next, ok := skip_record(msg, pos)
@@ -638,12 +638,12 @@ Option_Site :: struct {
 scan_edns_option :: proc(msg: []u8, span: Opt_Span, code: u16) -> (site: Option_Site, ok: bool) {
 	p := span.rd_start
 	for p + 4 <= span.rd_end {
-		olen := int(u16(msg[p + 2]) << 8 | u16(msg[p + 3]))
+		olen := int(be16(msg, p + 2))
 		end := p + 4 + olen
 		if end > span.rd_end {
 			return {}, false
 		}
-		if u16(msg[p]) << 8 | u16(msg[p + 1]) == code {
+		if be16(msg, p) == code {
 			if site.found {
 				site.dupes = true
 			} else {
@@ -675,7 +675,7 @@ rewrite_edns_option :: proc(
 	out: []u8,
 	ok: bool,
 ) {
-	if !remove && len(data) > 0xffff {
+	if !remove && len(data) > MAX_RDLENGTH {
 		return nil, false
 	}
 
@@ -695,7 +695,7 @@ rewrite_edns_option :: proc(
 	delta := written - (cut_end - cut_start)
 
 	rdlen := span.rd_end - span.rd_start + delta
-	if rdlen > 0xffff {
+	if rdlen > MAX_RDLENGTH {
 		return nil, false
 	}
 
@@ -939,7 +939,7 @@ encode_rebuilt :: proc(m: Message, allocator: mem.Allocator, every_opt := false)
 	if eerr != .None || truncated {
 		return nil, false
 	}
-	if int(u16(encoded[10]) << 8 | u16(encoded[11])) != len(m.additional) {
+	if int(be16(encoded, 10)) != len(m.additional) {
 		return nil, false
 	}
 	out = alloc_slice([]u8, len(encoded), allocator) or_return
@@ -1040,7 +1040,7 @@ encode_with_every_opt :: proc(
 	}
 	copy(out, wire)
 	copy(out[len(wire):], extra[:])
-	arcount := (int(wire[10]) << 8 | int(wire[11])) + extras
+	arcount := int(be16(wire, 10)) + extras
 	out[10] = u8(arcount >> 8)
 	out[11] = u8(arcount)
 	return out, truncated, .None

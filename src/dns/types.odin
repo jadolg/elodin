@@ -7,6 +7,15 @@ MAX_MESSAGE :: 65535
 // The longest <character-string>: one length octet's worth (RFC 1035 3.3).
 MAX_CHARACTER_STRING :: 255
 HEADER_SIZE :: 12
+// The most RDATA a record can carry: RDLENGTH is two octets (RFC 1035 3.2.1).
+MAX_RDLENGTH :: 0xffff
+// The largest payload an OPT record's figure is read as, and the most a
+// configuration may advertise: past it is fragments, not room.
+MAX_EDNS_UDP_SIZE :: 4096
+// The least a question (a root name, TYPE and CLASS) and a resource record (a
+// root name, TYPE, CLASS, TTL and RDLENGTH) take on the wire.
+MIN_QUESTION_WIRE :: 1 + 2 + 2
+MIN_RECORD_WIRE :: 1 + 2 + 2 + 4 + 2
 
 // The DO bit in an OPT record's TTL: the top bit of its flags, the low sixteen
 // bits (RFC 3225 section 3, RFC 6891 section 6.1.3).

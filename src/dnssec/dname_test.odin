@@ -300,7 +300,7 @@ test_a_second_cname_beside_a_dname_synthesis_is_not_authenticated :: proc(t: ^te
 	result := validate(v, "a.dnametest.", .A, tampered, fixture_now())
 	if result.status == .Secure {
 		// If the verdict stands, the planted record must not be in what it covers.
-		out, ok := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
+		out, ok := strip_unauthenticated(tampered, result, context.temp_allocator)
 		if !testing.expect(t, ok, "the pruned response should rebuild") {
 			return
 		}

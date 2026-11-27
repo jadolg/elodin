@@ -243,7 +243,7 @@ name_fold :: proc(name: string, allocator := context.allocator) -> (folded: stri
 	if !built {
 		return "", .Out_Of_Memory
 	}
-	fold_into(name, buf)
+	fold_into(name, buf) // fits: `buf` is the name's length
 	return string(buf), nil
 }
 
@@ -323,10 +323,7 @@ name_at_or_below :: proc(name, zone: string) -> bool {
 	// Then the label starts, so only a real break can begin the zone.
 	i := 0
 	for i < start {
-		for i < len(name) && name[i] != '.' {
-			i += 2 if name[i] == '\\' else 1
-		}
-		i += 1
+		i = label_end(name, i) + 1
 	}
 	return i == start
 }
@@ -336,19 +333,26 @@ name_parent :: proc(name: string) -> string {
 	if name == "" || name == "." {
 		return "."
 	}
-	i := 0
-	for i < len(name) {
-		if name[i] == '\\' {
-			i += 2
-			continue
-		}
-		if name[i] == '.' {
-			rest := name[i + 1:]
-			return rest if rest != "" else "."
-		}
-		i += 1
+	end := label_end(name, 0)
+	if end >= len(name) {
+		return "."
 	}
-	return "."
+	rest := name[end + 1:]
+	return rest if rest != "" else "."
+}
+
+/*
+Where the label that starts at `i` in presentation-form `name` ends: the index of
+the unescaped dot after it, or `len(name)` when there is none. Both escape forms
+(`\X` and `\DDD`) continue with characters that cannot be a separator, so a
+backslash steps over two.
+*/
+label_end :: proc "contextless" (name: string, i: int) -> int {
+	j := i
+	for j < len(name) && name[j] != '.' {
+		j += 2 if name[j] == '\\' else 1
+	}
+	return min(j, len(name))
 }
 
 // Drops the trailing root dot for display / config matching. "." becomes "".
@@ -381,14 +385,14 @@ name_canonical :: proc(name: string, allocator := context.allocator) -> (canonic
 			return "", false
 		}
 		if derr == .None {
-			fold_into(spelled, transmute([]u8)spelled)
+			fold_into(spelled, transmute([]u8)spelled) // in place: never short of room
 			return spelled, true
 		}
 	}
 	buf := alloc_slice([]u8, len(trimmed) + 1, allocator) or_return
 	copy(buf, trimmed)
 	buf[len(trimmed)] = '.'
-	fold_into(string(buf), buf)
+	fold_into(string(buf), buf) // in place: never short of room
 	return string(buf), true
 }
 

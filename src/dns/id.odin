@@ -27,5 +27,5 @@ is worth buffering or stretching with a userspace generator.
 random_id :: proc() -> u16 {
 	b: [2]u8
 	crypto.rand_bytes(b[:])
-	return u16(b[0]) << 8 | u16(b[1])
+	return be16(b[:], 0)
 }

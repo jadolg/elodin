@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:mem"
 import "core:slice"
 import "core:time"
+import "elodin:cache"
 import "elodin:dns"
 
 /*
@@ -105,7 +106,7 @@ Parity_Policy :: struct {
 PC_COOKIE_OPTION :: 4 + 24
 
 // The shipped `cache.max_ttl`, which no scenario moves.
-PARITY_CACHE_MAX_TTL :: 86400
+PARITY_CACHE_MAX_TTL :: cache.DEFAULT_MAX_TTL
 
 Parity_Kind :: enum u8 {
 	Parse,
@@ -845,7 +846,7 @@ pc_missing :: proc(
 	/*
 	A record the validator did not vouch for, on an answer it did vouch for.
 
-	`strip_unauthenticated` in src/dnssec/validate.odin prunes any RRset the
+	`strip_unauthenticated` in src/dnssec/prune.odin prunes any RRset the
 	chain did not cover before the AD bit goes on, so that the bit covers
 	everything left. The reference resolver was asked its own question and
 	serves what it received; this one serves what it authenticated, and the two
@@ -1447,7 +1448,7 @@ empty where it may not.
 
 RFC 4035 section 5.3.3: a validator serves an authenticated RRset, and its
 RRSIG, with no more than the RRSIG's Original TTL or the seconds left before it
-expires (`authenticated_only` in src/dnssec/validate.odin). The TTL field is the
+expires (`authenticated_only` in src/dnssec/prune.odin). The TTL field is the
 one part no signature covers, so an upstream's number above that is one elodin
 is required to lower. Bounded like the cache's allowance: the ceiling is the
 upstream's ttl under the signature's and `cache.max_ttl`, and the answer may sit

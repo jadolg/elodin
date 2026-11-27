@@ -1,5 +1,6 @@
 package fuzz_dns
 
+import "core:slice"
 import "elodin:dns"
 import "elodin:fuzz/harness"
 
@@ -208,13 +209,23 @@ edit_in_place :: proc(raw: []u8) {
 	// each one as the entry ages.
 	if offsets, ok := dns.scan_ttl_offsets(raw); ok {
 		ttls := dns.read_ttls(raw, offsets)
-		dns.patch_ttls(dns.clone_message_bytes(raw), offsets, ttls, 60, 5)
+		dns.patch_ttls(copy_of(raw), offsets, ttls, 60, 5)
 	}
-	dns.cap_ttls(dns.clone_message_bytes(raw), 300)
+	dns.cap_ttls(copy_of(raw), 300)
 	// Against the input itself, so the question names match and the copy runs,
 	// and against its second half, a different query as the cache meets one.
-	dns.copy_question_case(dns.clone_message_bytes(raw), raw)
-	dns.copy_question_case(dns.clone_message_bytes(raw), raw[len(raw) / 2:])
-	_ = dns.set_edns_udp_size(dns.clone_message_bytes(raw), 1232)
-	_ = dns.set_edns_version_and_flags(dns.clone_message_bytes(raw), 0, true)
+	dns.copy_question_case(copy_of(raw), raw)
+	dns.copy_question_case(copy_of(raw), raw[len(raw) / 2:])
+	_ = dns.set_edns_udp_size(copy_of(raw), 1232) // lint:allow the edit has to run, whatever it finds
+	_ = dns.set_edns_version_and_flags(copy_of(raw), 0, true) // lint:allow the edit has to run, whatever it finds
+}
+
+// A copy of `raw` for an editor that writes in place. A fuzz run that cannot
+// allocate one has nothing to report.
+copy_of :: proc(raw: []u8) -> []u8 {
+	out, err := slice.clone(raw)
+	if err != nil {
+		panic("the fuzz input could not be copied")
+	}
+	return out
 }

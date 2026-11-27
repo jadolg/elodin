@@ -377,7 +377,7 @@ test_forgeries_ahead_of_the_real_signature_do_not_evict_it :: proc(t: ^testing.T
 		return
 	}
 
-	out, ok := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
+	out, ok := strip_unauthenticated(tampered, result, context.temp_allocator)
 	if !testing.expect(t, ok, "the pruned response should rebuild") {
 		return
 	}
@@ -692,7 +692,7 @@ test_a_near_copy_does_not_evict_the_record_that_verified :: proc(t: ^testing.T) 
 		return
 	}
 
-	out, ok := strip_unauthenticated(tampered, result, context.temp_allocator, dns.MAX_MESSAGE)
+	out, ok := strip_unauthenticated(tampered, result, context.temp_allocator)
 	if !testing.expect(t, ok, "the pruned response should rebuild") {
 		return
 	}

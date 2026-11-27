@@ -18,7 +18,7 @@ edns_udp_size :: proc(m: Message) -> u16 {
 		return MAX_UDP_SIZE
 	}
 	size := u16(opt.class)
-	return clamp(size, MAX_UDP_SIZE, 4096)
+	return clamp(size, MAX_UDP_SIZE, MAX_EDNS_UDP_SIZE)
 }
 
 edns_present :: proc(m: Message) -> bool {
@@ -138,21 +138,9 @@ truncated_response :: proc(query_bytes: []u8, udp_size: u16, allocator := contex
 
 	end := HEADER_SIZE
 	questions: u16 = 0
+	// A pointer has nothing to point back to in a question's first name.
 	if query_bytes[4] == 0 && query_bytes[5] == 1 {
-		p := HEADER_SIZE
-		for p < len(query_bytes) {
-			n := int(query_bytes[p])
-			if n & 0xc0 != 0 {
-				// A pointer, or a reserved label type. Neither belongs here.
-				p = -1
-				break
-			}
-			p += 1 + n
-			if n == 0 {
-				break
-			}
-		}
-		if p >= 0 && p + 4 <= len(query_bytes) {
+		if p, named := skip_name(query_bytes, HEADER_SIZE, pointers = false); named && p + 4 <= len(query_bytes) {
 			end = p + 4
 			questions = 1
 		}
@@ -295,7 +283,7 @@ queries and responses" (RFC 1035 section 4.1.1).
 */
 @(private)
 patch_reply_flags :: proc(buf: []u8, tc: bool, rcode: u8) {
-	flags := transmute(Flags)(u16(buf[2]) << 8 | u16(buf[3]))
+	flags := transmute(Flags)(be16(buf, 2))
 	flags.qr = true
 	flags.ra = true
 	flags.tc = tc
@@ -308,8 +296,10 @@ patch_reply_flags :: proc(buf: []u8, tc: bool, rcode: u8) {
 	buf[3] = u8(fv)
 }
 
+// Where the wire name at `pos` ends; false when it runs off the end, uses a
+// reserved label type, or holds a compression pointer and `pointers` is false.
 @(private)
-skip_name :: proc(msg: []u8, pos: int) -> (next: int, ok: bool) {
+skip_name :: proc(msg: []u8, pos: int, pointers := true) -> (next: int, ok: bool) {
 	p := pos
 	for {
 		if p >= len(msg) {
@@ -323,7 +313,7 @@ skip_name :: proc(msg: []u8, pos: int) -> (next: int, ok: bool) {
 			}
 			p += 1 + int(n)
 		case 0xc0:
-			if p + 1 >= len(msg) {
+			if !pointers || p + 1 >= len(msg) {
 				return 0, false
 			}
 			return p + 2, true
@@ -344,7 +334,7 @@ owner.
 name_is_root :: proc(msg: []u8, pos: int) -> bool {
 	p := pos
 	for jumps := 0; p + 1 < len(msg) && msg[p] & 0xc0 == 0xc0; jumps += 1 {
-		target := int(msg[p] & 0x3f) << 8 | int(msg[p + 1])
+		target := int(be16(msg, p) & 0x3fff)
 		if target >= p || target < HEADER_SIZE || jumps == MAX_NAME_WIRE / 2 {
 			return false
 		}
@@ -371,7 +361,7 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 	if len(msg) > MAX_MESSAGE {
 		return nil, false
 	}
-	pos, total := records_start(msg) or_return
+	pos, total, _ := records_start(msg) or_return
 
 	/*
 	Counts that cannot possibly fit are refused before `total` is spent as a
@@ -385,7 +375,7 @@ scan_ttl_offsets :: proc(msg: []u8, allocator := context.allocator) -> (offsets:
 	guard that costs one comparison is not worth removing for a caller that
 	might hand it bytes nothing has checked.
 	*/
-	if total * 11 > len(msg) - pos {
+	if total * MIN_RECORD_WIRE > len(msg) - pos {
 		return nil, false
 	}
 
@@ -438,7 +428,7 @@ peek_udp_size :: proc(msg: []u8) -> u16 {
 	// OPT carries the payload size where every other type carries its class,
 	// where `set_edns_udp_size` writes it.
 	class_pos := span.rdlen_pos - 6
-	return u16(msg[class_pos]) << 8 | u16(msg[class_pos + 1])
+	return be16(msg, class_pos)
 }
 
 /*
@@ -492,9 +482,9 @@ peek_referral :: proc(msg: []u8) -> bool {
 	if len(msg) < HEADER_SIZE {
 		return false
 	}
-	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
-	ancount := int(u16(msg[6]) << 8 | u16(msg[7]))
-	nscount := int(u16(msg[8]) << 8 | u16(msg[9]))
+	qdcount := int(be16(msg, 4))
+	ancount := int(be16(msg, 6))
+	nscount := int(be16(msg, 8))
 	// A header rcode other than zero composes to something other than NOERROR
 	// whatever the OPT record adds, so only a zero one needs the walk below.
 	if nscount == 0 || msg[3] & 0x0f != 0 || (ancount == 0 && msg[2] & 0x04 != 0) {
@@ -505,7 +495,7 @@ peek_referral :: proc(msg: []u8) -> bool {
 		return false
 	}
 
-	pos, _, walked := records_start(msg)
+	pos, _, _, walked := records_start(msg)
 	if !walked {
 		return false
 	}
@@ -565,8 +555,8 @@ skip_record :: proc(msg: []u8, pos: int) -> (type: Type, fixed: int, next: int, 
 		return
 	}
 	fixed = at
-	type = Type(u16(msg[at]) << 8 | u16(msg[at + 1]))
-	end := at + 10 + int(u16(msg[at + 8]) << 8 | u16(msg[at + 9]))
+	type = Type(be16(msg, at))
+	end := at + 10 + int(be16(msg, at + 8))
 	if end > len(msg) {
 		return
 	}
@@ -724,14 +714,32 @@ check here would be dead in every caller; Odin's own bounds checks stay on in
 release builds and catch a caller that invents one.
 */
 read_ttl_at :: proc(msg: []u8, off: int) -> u32 {
-	return u32(msg[off]) << 24 | u32(msg[off + 1]) << 16 | u32(msg[off + 2]) << 8 | u32(msg[off + 3])
+	return be32(msg, off)
 }
 
 write_ttl_at :: proc(msg: []u8, off: int, v: u32) {
-	msg[off] = u8(v >> 24)
-	msg[off + 1] = u8(v >> 16)
-	msg[off + 2] = u8(v >> 8)
-	msg[off + 3] = u8(v)
+	put_be32(msg, off, v)
+}
+
+// The two-byte and four-byte network-order (big-endian) fields at `at`, as the
+// wire writes every count, length, type and TTL (RFC 1035 section 2.3.2). The
+// caller has bounds-checked `at`; Odin's own checks stay on in release builds.
+@(private)
+be16 :: #force_inline proc "contextless" (b: []u8, at: int) -> u16 {
+	return u16(b[at]) << 8 | u16(b[at + 1])
+}
+
+@(private)
+be32 :: #force_inline proc "contextless" (b: []u8, at: int) -> u32 {
+	return u32(b[at]) << 24 | u32(b[at + 1]) << 16 | u32(b[at + 2]) << 8 | u32(b[at + 3])
+}
+
+@(private)
+put_be32 :: #force_inline proc "contextless" (b: []u8, at: int, v: u32) {
+	b[at] = u8(v >> 24)
+	b[at + 1] = u8(v >> 16)
+	b[at + 2] = u8(v >> 8)
+	b[at + 3] = u8(v)
 }
 
 // Empty when the list cannot be allocated, which a caller tells from a message
@@ -748,19 +756,24 @@ read_ttls :: proc(msg: []u8, offsets: []u16, allocator := context.allocator) -> 
 }
 
 
-// Where the first resource record starts, past the header and the question
-// section, and how many the three sections after it claim; false when the
-// question section runs off the end. For the walks below that read the
-// records' fixed fields in place.
+// How many records each of the three sections after the question claims.
 @(private)
-records_start :: proc(msg: []u8) -> (pos: int, total: int, ok: bool) {
+Section_Counts :: struct {
+	answer, authority, additional: int,
+}
+
+// Where the first resource record starts, past the header and the question
+// section, how many the three sections after it claim in all, and in each;
+// false when the question section runs off the end. For the walks below that
+// read the records' fixed fields in place.
+@(private)
+records_start :: proc(msg: []u8) -> (pos: int, total: int, sections: Section_Counts, ok: bool) {
 	if len(msg) < HEADER_SIZE {
 		return
 	}
-	qdcount := int(u16(msg[4]) << 8 | u16(msg[5]))
-	total = int(u16(msg[6]) << 8 | u16(msg[7]))
-	total += int(u16(msg[8]) << 8 | u16(msg[9]))
-	total += int(u16(msg[10]) << 8 | u16(msg[11]))
+	qdcount := int(be16(msg, 4))
+	sections = {answer = int(be16(msg, 6)), authority = int(be16(msg, 8)), additional = int(be16(msg, 10))}
+	total = sections.answer + sections.authority + sections.additional
 	pos = HEADER_SIZE
 	for _ in 0 ..< qdcount {
 		next, name_ok := skip_name(msg, pos)
@@ -772,7 +785,7 @@ records_start :: proc(msg: []u8) -> (pos: int, total: int, ok: bool) {
 			return
 		}
 	}
-	return pos, total, true
+	return pos, total, sections, true
 }
 
 /*
@@ -814,13 +827,13 @@ collecting offsets first - so a reply claiming three sections of 65535 records
 costs the loop iterations it takes to fail on the first one and no memory at all.
 */
 cap_ttls :: proc(msg: []u8, ceiling: u32) {
-	pos, total, ok := records_start(msg)
+	pos, total, sections, ok := records_start(msg)
 	if !ok {
 		return
 	}
 	// Where each section ends, counted in records.
-	answers := int(u16(msg[6]) << 8 | u16(msg[7]))
-	authority := answers + int(u16(msg[8]) << 8 | u16(msg[9]))
+	answers := sections.answer
+	authority := answers + sections.authority
 	section_of :: proc(i, answers, authority: int) -> int {
 		return 0 if i < answers else 1 if i < authority else 2
 	}
@@ -856,7 +869,7 @@ cap_ttls :: proc(msg: []u8, ceiling: u32) {
 		// ends the walk.
 		if type != .OPT {
 			ttl := min(sane_ttl(read_ttl_at(msg, fixed + 4)), ceiling)
-			class := u16(msg[fixed + 2]) << 8 | u16(msg[fixed + 3])
+			class := be16(msg, fixed + 2)
 			section := section_of(i, answers, authority)
 			if type == .RRSIG {
 				if run.count > 0 {
@@ -864,7 +877,7 @@ cap_ttls :: proc(msg: []u8, ceiling: u32) {
 					signed, run = run, Ttl_Run{}
 				}
 				if rec_ok && fixed + 12 <= len(msg) && signed.count > 0 && class == signed.class && section == signed.section {
-					covered := Type(u16(msg[fixed + 10]) << 8 | u16(msg[fixed + 11]))
+					covered := Type(be16(msg, fixed + 10))
 					if covered == signed.type && wire_names_equal(msg, pos, signed.owner) {
 						ttl = min(ttl, signed.lowest)
 					}
@@ -952,7 +965,7 @@ wire_names_equal :: proc(msg: []u8, a, b: int) -> bool {
 			if pa + 1 >= len(msg) {
 				return false
 			}
-			target := int(msg[pa] & 0x3F) << 8 | int(msg[pa + 1])
+			target := int(be16(msg, pa) & 0x3fff)
 			if target >= pa || target < HEADER_SIZE {
 				return false
 			}
@@ -963,7 +976,7 @@ wire_names_equal :: proc(msg: []u8, a, b: int) -> bool {
 			if pb + 1 >= len(msg) {
 				return false
 			}
-			target := int(msg[pb] & 0x3F) << 8 | int(msg[pb + 1])
+			target := int(be16(msg, pb) & 0x3fff)
 			if target >= pb || target < HEADER_SIZE {
 				return false
 			}
@@ -1013,7 +1026,7 @@ it cannot read; nothing is allocated.
 */
 signatures_lapse :: proc(msg: []u8, now: u32) -> (left: u32, signed: bool) {
 	left = max(u32)
-	pos, total, ok := records_start(msg)
+	pos, total, _, ok := records_start(msg)
 	if !ok {
 		return
 	}
@@ -1056,12 +1069,12 @@ age_ttls :: proc(msg: []u8, age: u32) {
 	if age == 0 {
 		return
 	}
-	pos, total, ok := records_start(msg)
+	pos, total, sections, ok := records_start(msg)
 	if !ok {
 		return
 	}
-	answers := int(u16(msg[6]) << 8 | u16(msg[7]))
-	authority := answers + int(u16(msg[8]) << 8 | u16(msg[9]))
+	answers := sections.answer
+	authority := answers + sections.authority
 	denial := answers == 0 || msg[3] & 0x0f == u8(Rcode.NX_Domain)
 	for i in 0 ..< total {
 		type, fixed, next, rec_ok := skip_record(msg, pos)
@@ -1195,12 +1208,6 @@ same_question :: proc(a, b: []u8) -> bool {
 		return false
 	}
 	return a[p] == b[p] && a[p + 1] == b[p + 1] && a[p + 2] == b[p + 2] && a[p + 3] == b[p + 3]
-}
-
-clone_message_bytes :: proc(src: []u8, allocator := context.allocator) -> []u8 {
-	dst := make([]u8, len(src), allocator)
-	copy(dst, src)
-	return dst
 }
 
 /*
