@@ -22,6 +22,10 @@ fuzz_one :: proc "c" (data: [^]u8, size: uint) -> i32 {
 	defer filter.set_destroy(block)
 	allow := filter.set_make()
 	defer filter.set_destroy(allow)
+	// No memory for a set is no input's doing.
+	if block == nil || allow == nil {
+		return 0
+	}
 
 	if filter.parse_rule(block, allow, strings.concatenate({"/", text, "/"})) != 1 {
 		return 0

@@ -104,7 +104,8 @@ A pattern outside the RE2 subset `re2_parse` reads, or that would cost more than
 the limits above allow, is refused; one that no longer fits in the set's budget,
 and every one after it, is counted in `regex_refused` so the loader can say so.
 A pattern already held is not compiled again: `types` is added to the types it
-matches, which `type_union` may refuse.
+matches, which `type_union` may refuse. One there is no memory to keep is
+refused too, and leaves the set not whole (`set_whole`).
 */
 regex_add :: proc(s: ^Set, pattern: string, types := ANY_TYPE) -> (stored: bool) {
 	key_buf: [MAX_REGEX_PATTERN + 2]u8
@@ -164,13 +165,20 @@ regex_add :: proc(s: ^Set, pattern: string, types := ANY_TYPE) -> (stored: bool)
 		return false
 	}
 	kept_types := type_keep(s, types) or_return
-	re := regex_copy(trial, s.allocator)
-	shortcut := strings.clone(regex_shortcut(pattern, temp), s.allocator)
-	held := new(Type_Filter, s.allocator)
+	re, rerr := regex_copy(trial, s.allocator)
+	shortcut, serr := strings.clone(regex_shortcut(pattern, temp), s.allocator)
+	held, herr := new(Type_Filter, s.allocator)
+	kept_pattern, perr := strings.clone(pattern, s.allocator)
+	if rerr != nil || serr != nil || herr != nil || perr != nil {
+		s.out_of_memory = true
+		return false
+	}
 	held^ = kept_types
-	kept := Regex_Rule{strings.clone(pattern, s.allocator), re, cost, shortcut, held}
-	append(&s.regexes, kept)
-	s.regex_held[kept.pattern] = held
+	kept := Regex_Rule{kept_pattern, re, cost, shortcut, held}
+	if _, err := append(&s.regexes, kept); err != nil || map_insert(&s.regex_held, kept.pattern, held) == nil {
+		s.out_of_memory = true
+		return false
+	}
 	s.regex_bytes += kept.cost
 	s.count += 1
 	return true
@@ -196,21 +204,22 @@ regex_compile :: proc(tree: parser.Node, temp: mem.Allocator) -> (re: regex.Regu
 	return re, true
 }
 
-// `re`, copied into `allocator`, packed as `regex.create` packs it.
+// `re`, copied into `allocator`, packed as `regex.create` packs it; an error
+// when there is no memory for all of it.
 @(private)
-regex_copy :: proc(re: regex.Regular_Expression, allocator: mem.Allocator) -> (out: regex.Regular_Expression) {
+regex_copy :: proc(re: regex.Regular_Expression, allocator: mem.Allocator) -> (out: regex.Regular_Expression, err: mem.Allocator_Error) {
 	context.allocator = allocator
 	out.flags = re.flags
-	out.program = slice.clone(re.program)
+	out.program = slice.clone(re.program) or_return
 	if len(re.class_data) > 0 {
-		out.class_data = make([]virtual_machine.Rune_Class_Data, len(re.class_data))
+		out.class_data = make([]virtual_machine.Rune_Class_Data, len(re.class_data)) or_return
 	}
 	for c, i in re.class_data {
 		if len(c.runes) > 0 {
-			out.class_data[i].runes = slice.clone(c.runes)
+			out.class_data[i].runes = slice.clone(c.runes) or_return
 		}
 		if len(c.ranges) > 0 {
-			out.class_data[i].ranges = slice.clone(c.ranges)
+			out.class_data[i].ranges = slice.clone(c.ranges) or_return
 		}
 	}
 	return
@@ -228,7 +237,7 @@ regex_cancel :: proc(s: ^Set, pattern: string) {
 	key_buf: [MAX_REGEX_PATTERN + 2]u8
 	key := regex_key(pattern, key_buf[:])
 	if key not_in s.cancelled {
-		s.cancelled[strings.clone(key, s.allocator)] = {.Apex}
+		cancel_store(s, key, {.Apex})
 	}
 	for r, i in s.regexes {
 		if r.pattern == pattern {
@@ -250,11 +259,25 @@ regex_parses :: proc(s: ^Set, pattern: string) -> bool {
 	return parsed
 }
 
-// The set's scratch arena, set up on first use. The caller frees what it took
-// with `virtual.arena_free_all` once it is done.
+/*
+What one pattern's parse, compile and trial match may take, committed whole
+when the scratch arena is made: neither the parser nor the compiler checks an
+allocation, so one refused partway would leave a node or an instruction out.
+A pattern MAX_REGEX_PATTERN long takes about a tenth of it
+(`test_every_pattern_fits_the_regex_scratch`).
+*/
+@(private)
+REGEX_SCRATCH :: mem.Megabyte
+
+/*
+The set's scratch arena, set up on first use. The caller frees what it took
+with `virtual.arena_free_all` once it is done. False, setting `out_of_memory`,
+when there is no memory for it.
+*/
 @(private)
 regex_scratch_allocator :: proc(s: ^Set) -> (allocator: mem.Allocator, ok: bool) {
-	if s.regex_scratch.curr_block == nil && virtual.arena_init_growing(&s.regex_scratch) != nil {
+	if s.regex_scratch.curr_block == nil && virtual.arena_init_static(&s.regex_scratch, REGEX_SCRATCH, REGEX_SCRATCH) != nil {
+		s.out_of_memory = true
 		return {}, false
 	}
 	return virtual.arena_allocator(&s.regex_scratch), true

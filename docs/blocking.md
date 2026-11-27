@@ -56,8 +56,9 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   publisher empties on purpose therefore keeps its last copy; with no copy it
   adds nothing. A cached copy that is a web page, is empty or cannot be read
   whole is not used, and is downloaded over even inside the refresh window:
-  one larger than any download (64 MiB), one there is no memory to hold, and
-  one whose size changes while it is read are each refused, never loaded cut short.
+  one larger than any download (64 MiB) and one whose size changes while it is
+  read are each refused, never loaded cut short. One there is no memory to hold
+  is taken as below.
 - The cached copy is replaced by writing a temporary file beside it, syncing
   it, then renaming it over the old one. A power cut mid-write leaves the old
   copy or the new one, never a truncated list.
@@ -67,12 +68,44 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   effect`). This happens with an unwritable or cleared `cache_dir`. A list that
   has never loaded does not hold the other lists back, and neither does a
   `file:` list: delete one and its rules go at the next refresh.
+- A list there is no memory to read (a `file:` list or a cached copy) or to
+  hold (its rules, `$badfilter`s or regexes) is taken as an unavailable one is,
+  whatever its kind: one that loaded before holds the refresh back and every
+  rule already in effect is kept (`list NAME: loaded before and there is no
+  memory to hold it now; keeping the rules already in effect`); one that never
+  loaded is left out, and the other lists are built again without it (`list
+  NAME: there is no memory to hold it; building the other lists without it`),
+  as AdGuard Home goes on with the filters that load. Where one that loaded
+  before runs out, or the operator's own rules do, the lists that never loaded
+  are left out first, the last loaded first, to make room (`list NAME: left
+  out, to make room for the lists already in effect and the operator's
+  rules`). A list is never in effect cut short. A build after the first
+  downloads only the lists no earlier one reached, reading the copies the
+  earlier ones saved, which count as stale; a list with no copy to read (a
+  `cache_dir` that cannot be written) is downloaded again. A download there
+  is no memory to fetch counts as a failed one, which the cached copy stands
+  in for; one fetched there is no memory to hold is not cached, and its list is
+  left out or holds the refresh back as above. The list says why first (`list
+  NAME: there is no memory to read "PATH"`, `list NAME: there is no memory to
+  read the cached copy`).
+- With no memory for the operator's own rules (and no list left to leave out)
+  or for the rule sets themselves, the load is dropped and the rules already
+  in effect are kept (`filter: there is no memory to build the rule sets;
+  keeping the rules already in effect`, or `...; no rules are in effect until
+  a retry succeeds` where there are none).
+  With none to record which lists loaded, it is dropped too, unless no rule is
+  in effect: then the sets are used, and the retry records them.
 - A refresh where some downloaded list is unavailable, or was served from its
-  cached copy because the download failed or held no rules, is retried after 1
+  cached copy because the download failed or held no rules, or that left a
+  list out or was dropped for want of memory, is retried after 1
   minute, then 2, 4 and so on, up to 1 hour or `refresh`, whichever is shorter
   (`blocklists: not every list is current; trying again in 1m0s`). A start that
   could not load every list is retried the same way. A missing `file:` list is
-  not retried.
+  not retried. A load that ran out of memory is retried the same way even
+  under `--no-fetch` or `refresh: 0`, at most 1 hour apart, until it succeeds
+  (`blocklists: there was no memory to build the rules; trying again in
+  1m0s`). Under `refresh: 0` that retry reads the cached copies and downloads
+  nothing, so a list with no copy stays out until a reload.
 - A rule costs about 35 bytes resident: its name, a flags byte and an 8-byte
   slot in a table kept at most 80% full. A load or refresh builds the new rule
   sets beside the ones in use and frees the old ones once they are swapped out,

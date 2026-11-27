@@ -1225,9 +1225,9 @@ maintenance_loop :: proc(
 		last_report  = loop.tick_now(),
 	}
 	refresh := server.live_config(s).blocking.refresh
-	if !lists_current && !opts.no_fetch && refresh > 0 {
-		m.retry = server.refresh_retry(0, refresh)
-		logx.warnf("blocklists: not every list is current; trying again in %v", m.retry)
+	m.retry = server.retry_after(lists_current, s.rules_no_memory, opts.no_fetch, refresh, 0)
+	if m.retry > 0 {
+		warn_retry(s, m.retry)
 	}
 
 	for sync.atomic_load(&s.running) {
@@ -1271,8 +1271,8 @@ Maintenance :: struct {
 	// after a step back a timer on any other clock would find the copy fresh,
 	// skip the download and wait a whole further period.
 	last_refresh:   time.Time,
-	// Zero while the lists are current; otherwise the wait before the next
-	// attempt, which `refresh_retry` stretches on each failure (#411).
+	// The wait before the next attempt that `retry_after` set, stretched on
+	// each failure (#411); zero for none before the interval.
 	retry:          time.Duration,
 	// Monotonic, as `next_tick` is, so a step of the wall clock neither holds
 	// nor hurries the report.
@@ -1328,6 +1328,16 @@ reload :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m
 	server.reload_tls(s, listeners)
 }
 
+// Say that the rules are built again after `retry`, and why.
+@(private)
+warn_retry :: proc(s: ^server.Server, retry: time.Duration) {
+	if s.rules_no_memory {
+		logx.warnf("blocklists: there was no memory to build the rules; trying again in %v", retry)
+		return
+	}
+	logx.warnf("blocklists: not every list is current; trying again in %v", retry)
+}
+
 // Take in a rebuild that is over, and start the one a reload asked for
 // meanwhile.
 @(private)
@@ -1344,12 +1354,9 @@ collect :: proc(s: ^server.Server, opts: Options, m: ^Maintenance) {
 	}
 	m.last_refresh = loop.now()
 	refresh := server.live_config(s).blocking.refresh
-	switch {
-	case current || opts.no_fetch || refresh <= 0:
-		m.retry = 0
-	case:
-		m.retry = server.refresh_retry(0 if m.after_reload else m.retry, refresh)
-		logx.warnf("blocklists: not every list is current; trying again in %v", m.retry)
+	m.retry = server.retry_after(current, s.rules_no_memory, opts.no_fetch, refresh, 0 if m.after_reload else m.retry)
+	if m.retry > 0 {
+		warn_retry(s, m.retry)
 	}
 	m.after_reload = false
 }
@@ -1361,7 +1368,8 @@ the signals the loop acts on (#416). A refresh that cannot start is still due.
 */
 @(private)
 start_rebuild :: proc(s: ^server.Server, opts: Options, m: ^Maintenance, after_reload: bool) {
-	if server.rebuild_start(m.rebuild, s, !opts.no_fetch) {
+	network := server.rebuild_fetches(opts.no_fetch, after_reload, server.live_config(s).blocking.refresh)
+	if server.rebuild_start(m.rebuild, s, network) {
 		m.after_reload = after_reload
 		m.rebuild_again = false
 		return
@@ -1392,13 +1400,16 @@ tick :: proc(s: ^server.Server, listeners: ^server.Listeners, opts: Options, m: 
 	}
 	server.rotate_ticket_keys(listeners, loop.moment_now())
 
-	refreshing := cfg.blocking.enabled && !opts.no_fetch && cfg.blocking.refresh > 0
 	if !server.rebuild_busy(m.rebuild) {
 		switch {
 		case m.rebuild_again:
 			start_rebuild(s, opts, m, after_reload = true)
-		case refreshing && loop.since(m.last_refresh) >= server.refresh_wait(m.retry, cfg.blocking.refresh):
-			logx.infof("refreshing blocklists")
+		case cfg.blocking.enabled && server.refresh_due(opts.no_fetch, s.rules_no_memory, cfg.blocking.refresh, m.retry, loop.since(m.last_refresh)):
+			if server.rebuild_fetches(opts.no_fetch, false, cfg.blocking.refresh) {
+				logx.infof("refreshing blocklists")
+			} else {
+				logx.infof("building the blocklists again from the cached copies")
+			}
 			start_rebuild(s, opts, m, after_reload = false)
 		}
 	}

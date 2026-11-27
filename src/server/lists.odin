@@ -62,6 +62,9 @@ List_Load :: enum u8 {
 	// The download arrived holding no rules and there is no copy: it adds
 	// nothing, but is empty rather than lost, so it holds nothing back.
 	Empty,
+	// There was no memory to read it or to hold its rules, or it was left out
+	// for that: it adds nothing, and is retried.
+	No_Memory,
 }
 
 /*
@@ -71,32 +74,121 @@ Returns them ready to hand to `filter.engine_swap`; the caller is responsible
 for destroying whatever that swap displaces. When `loads` is given it has one
 slot per list, `blocking.lists` then `blocking.allowlists`, and says how each
 one fared.
+
+`passes`, by the same slots when given, carries what earlier builds of one
+rebuild did (`List_Pass`): a list left out is not loaded and is `.No_Memory` in
+`loads`. `whole` is false when there was no memory to build the sets whole: to
+read a list, or to hold a rule. The lists after the one that ran out, and the
+operator's rules, are not tried; the one that ran out is `.No_Memory` in `loads`
+(`ran_out_of_memory` finds it). Both sets are nil when there is no memory to
+make them.
 */
-build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool, loads: []List_Load = nil) -> (block, allow: ^filter.Set) {
+build_filter_sets :: proc(
+	cfg: ^config.Config,
+	allow_network: bool,
+	loads: []List_Load = nil,
+	passes: []List_Pass = nil,
+) -> (
+	block, allow: ^filter.Set,
+	whole: bool,
+) {
+	move_query_named_caches(cfg)
+	for &load in loads {
+		load = .No_Memory
+	}
 	block = filter.set_make()
 	allow = filter.set_make()
-	move_query_named_caches(cfg)
+	if block == nil || allow == nil {
+		filter.set_destroy(block)
+		filter.set_destroy(allow)
+		return nil, nil, false
+	}
+	whole = load_lists(cfg, block, allow, allow_network, loads, passes) && add_operator_rules(cfg, block, allow)
+	return
+}
 
-	for list, i in cfg.blocking.lists {
-		load := load_one_list(cfg, list, block, allow, allow_network, false)
+// What the builds of one rebuild have done with a list so far.
+List_Pass :: struct {
+	// There was no memory for it: it is not loaded again in this rebuild.
+	left_out: bool,
+	// An earlier build read it, downloading as that one could, and found
+	// `found`. A later one reads its copy rather than download again.
+	read:     bool,
+	found:    List_Load,
+}
+
+/*
+Load every list not left out into the sets, saying in `loads` how each fared
+in this build; false at the first that is `.No_Memory`. One no earlier build
+read downloads as `allow_network` says. One read before reads its copy, which is
+`.Stale`: whether it is the download the earlier read saved cannot be told, and
+it may be older. One whose download held no rules and had no copy stays
+`.Empty`; one the earlier read downloaded with no copy to read again, which it
+could not save (a `cache_dir` that cannot be written), is downloaded again.
+*/
+@(private)
+load_lists :: proc(cfg: ^config.Config, block, allow: ^filter.Set, allow_network: bool, loads: []List_Load, passes: []List_Pass) -> bool {
+	lists := len(cfg.blocking.lists)
+	for i in 0 ..< lists + len(cfg.blocking.allow_lists) {
+		read := passes != nil && passes[i].read
+		if passes != nil && passes[i].left_out {
+			continue
+		}
+		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
+		// One that ran out the first time has not been said of yet.
+		again := read && passes[i].found != .No_Memory
+		load := load_one_list(cfg, list, block, allow, allow_network && !read, i >= lists, again = again)
+		switch {
+		case !read:
+			if passes != nil {
+				passes[i].read, passes[i].found = true, load
+			}
+		case load == .Current:
+			load = .Stale
+		case load == .Unavailable && passes[i].found == .Empty:
+			load = .Empty
+		case load == .Unavailable && allow_network && passes[i].found == .Current:
+			load = load_one_list(cfg, list, block, allow, true, i >= lists)
+		}
 		if loads != nil {
 			loads[i] = load
 		}
-	}
-	for list, i in cfg.blocking.allow_lists {
-		load := load_one_list(cfg, list, block, allow, allow_network, true)
-		if loads != nil {
-			loads[len(cfg.blocking.lists) + i] = load
+		if load == .No_Memory {
+			return false
 		}
 	}
+	return true
+}
 
+// The slot of the list a build that was not whole ran out of memory on, or -1
+// when it ran out elsewhere: the first `.No_Memory` not left out, since every
+// list before it was loaded.
+@(private)
+ran_out_of_memory :: proc(loads: []List_Load, passes: []List_Pass) -> int {
+	for load, i in loads {
+		if load == .No_Memory && !passes[i].left_out {
+			return i
+		}
+	}
+	return -1
+}
+
+// Add `blocking.rules` and `blocking.allow_rules`; false when there was no
+// memory to hold them, and the sets are not whole.
+@(private)
+add_operator_rules :: proc(cfg: ^config.Config, block, allow: ^filter.Set) -> bool {
 	// A list's `$badfilter` takes back rules lists carry, not the operator's
 	// own: forget them before those are added. The operator's `$badfilter`
 	// still cancels what the lists added.
 	clear(&block.cancelled)
 	clear(&allow.cancelled)
 	for rule in cfg.blocking.rules {
-		if !operator_rule_takes(block, allow, rule) {
+		takes := operator_rule_takes(block, allow, rule)
+		// A rule refused for want of memory is no rule to warn of.
+		if !filter.set_whole(block) || !filter.set_whole(allow) {
+			return false
+		}
+		if !takes {
 			warn_rule_adds_nothing(rule)
 		}
 	}
@@ -104,14 +196,21 @@ build_filter_sets :: proc(cfg: ^config.Config, allow_network: bool, loads: []Lis
 		// Entries here are allow rules whether or not they carry the @@ prefix.
 		text := rule
 		if !strings.has_prefix(text, "@@") {
-			text = fmt.tprintf("@@%s", text)
+			prefixed, err := strings.concatenate({"@@", rule}, context.temp_allocator)
+			if err != nil {
+				return false
+			}
+			text = prefixed
 		}
-		if !operator_rule_takes(block, allow, text) {
+		takes := operator_rule_takes(block, allow, text)
+		if !filter.set_whole(block) || !filter.set_whole(allow) {
+			return false
+		}
+		if !takes {
 			warn_rule_adds_nothing(rule)
 		}
 	}
-
-	return
+	return true
 }
 
 /*
@@ -206,12 +305,15 @@ warn_rule_adds_nothing :: proc(rule: string) {
 }
 
 @(private)
+// Load `list` into the sets, saying how it fared. `again` is a list an earlier
+// build of the rebuild read and said so of, which this does not say again.
 load_one_list :: proc(
 	cfg: ^config.Config,
 	list: config.Block_List,
 	block, allow: ^filter.Set,
 	allow_network: bool,
 	as_allowlist: bool,
+	again := false,
 ) -> List_Load {
 	// A disabled list is expected to add nothing, which is not a failure.
 	if !list.enabled {
@@ -219,8 +321,13 @@ load_one_list :: proc(
 	}
 
 	text, load, downloaded := list_contents(cfg, list, allow_network)
-	if load == .Unavailable {
-		logx.warnf("list %s: unavailable, skipping it", list.name)
+	#partial switch load {
+	case .Unavailable:
+		if !again {
+			logx.warnf("list %s: unavailable, skipping it", list.name)
+		}
+		return load
+	case .No_Memory:
 		return load
 	}
 	defer delete(text)
@@ -233,6 +340,11 @@ load_one_list :: proc(
 	}
 
 	added, held_rules, not_ascii := parse_list_text(target_block, target_allow, text, list.format)
+	// What the text holds is not known, so a download neither replaces the
+	// copy nor is said to hold no rules.
+	if !filter.set_whole(block) || !filter.set_whole(allow) {
+		return .No_Memory
+	}
 	if downloaded {
 		/*
 		A download replaces the cached copy only once it has been parsed and
@@ -250,6 +362,9 @@ load_one_list :: proc(
 			warn_not_ascii(list.name, not_ascii)
 			delete(text)
 			text, load = cached_copy(cfg, list, .Stale)
+			if load == .No_Memory {
+				return load
+			}
 			if load == .Unavailable {
 				// The download arrived and holds nothing, and there is no copy
 				// to stand in: the list is empty, not lost, so it does not hold
@@ -258,10 +373,15 @@ load_one_list :: proc(
 				return .Empty
 			}
 			added, _, not_ascii = parse_list_text(target_block, target_allow, text, list.format)
+			if !filter.set_whole(block) || !filter.set_whole(allow) {
+				return .No_Memory
+			}
 		}
 	}
-	logx.infof("list %s: %d rules", list.name, added)
-	warn_not_ascii(list.name, not_ascii)
+	if !again {
+		logx.infof("list %s: %d rules", list.name, added)
+		warn_not_ascii(list.name, not_ascii)
+	}
 	return load
 }
 
@@ -321,6 +441,14 @@ list_contents :: proc(
 	if list.file != "" {
 		data, err := os.read_entire_file(list.file, context.allocator)
 		if err != nil {
+			// What was read before the error is handed back with it.
+			delete(data)
+		}
+		if err == .Out_Of_Memory {
+			logx.warnf("list %s: there is no memory to read %q", list.name, list.file)
+			return "", .No_Memory, false
+		}
+		if err != nil {
 			logx.warnf("list %s: cannot read %q (%v)%s", list.name, list.file, err, sandbox.refusal_hint(err, write = false))
 			return "", .Unavailable, false
 		}
@@ -358,9 +486,35 @@ list_contents :: proc(
 	return
 }
 
-// The cached copy of a downloaded list, as `load` when it can be read.
+/*
+The cached copy of a downloaded list, as `load` when it can be read, and
+`.No_Memory` when an allocation naming, fingerprinting or reading it was
+refused: what those find with no memory - a path cut short, a fingerprint not
+read - is no verdict on the copy.
+*/
 @(private)
 cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Load) -> (string, List_Load) {
+	dry: bool
+	heap := dns.Dry_Watch{context.allocator, &dry}
+	temp := dns.Dry_Watch{context.temp_allocator, &dry}
+	text: string
+	got: List_Load
+	{
+		context.allocator = dns.dry_watch_allocator(&heap)
+		context.temp_allocator = dns.dry_watch_allocator(&temp)
+		text, got = read_cached_copy(cfg, list, load)
+	}
+	if dry {
+		delete(text)
+		logx.warnf("list %s: there is no memory to read the cached copy", list.name)
+		return "", .No_Memory
+	}
+	return text, got
+}
+
+// `cached_copy`, on the allocators it watches.
+@(private)
+read_cached_copy :: proc(cfg: ^config.Config, list: config.Block_List, load: List_Load) -> (string, List_Load) {
 	cache_path := list_cache_path(cfg, list)
 	// A copy of another query is another list: `?category=ads` does not stand
 	// in for `?category=malware`.
@@ -726,17 +880,49 @@ runs on. A list that never loaded does not hold the others back, and neither doe
 a `file:` list: that one is the operator's own, and one deleted to lift its
 blocks has to lift them, where a download is lost to the network.
 
+A list there is no memory to read or hold is taken the same way, whatever its
+kind (#765): one that loaded before holds the refresh back, and one that never
+did is left out and the others built again without it (`build_what_fits`), so
+no list is ever in effect cut short. With no memory for the operator's rules or
+the sets themselves, the rebuild is dropped; with none to record which lists
+loaded, too, unless no rule is in effect.
+
 `current` is false when some list is unavailable or stood in for by a stale copy,
-so the caller retries sooner than the interval; see `refresh_retry`.
+or the sets could not be built whole for want of memory, so the caller retries
+sooner than the interval; see `retry_after`.
 */
 reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool) -> (current: bool) {
+	s.rules_no_memory = false
 	lists := len(cfg.blocking.lists)
-	loads := make([]List_Load, lists + len(cfg.blocking.allow_lists))
-	block, allow := build_filter_sets(cfg, allow_network, loads)
+	loads, lerr := make([]List_Load, lists + len(cfg.blocking.allow_lists))
+	defer delete(loads)
+	passes, perr := make([]List_Pass, len(loads))
+	defer delete(passes)
+	block, allow: ^filter.Set
+	whole: bool
+	if lerr == nil && perr == nil {
+		block, allow, whole = build_what_fits(s, cfg, allow_network, loads, passes)
+	} else {
+		warn_no_memory(s)
+	}
+	if !whole {
+		s.rules_no_memory = true
+		filter.set_destroy(block)
+		filter.set_destroy(allow)
+		return false
+	}
 
 	current = true
+	// Left out: retried whatever kind of list it is, and whatever holds the
+	// refresh back below.
+	for load in loads {
+		if load == .No_Memory {
+			s.rules_no_memory = true
+			current = false
+		}
+	}
 	for load, i in loads {
-		if load == .Current {
+		if load == .Current || load == .No_Memory {
 			continue
 		}
 		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
@@ -750,21 +936,21 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 			logx.warnf("list %s: loaded before and unavailable now; keeping the rules already in effect", list.name)
 			filter.set_destroy(block)
 			filter.set_destroy(allow)
-			delete(loads)
 			return false
 		}
 	}
-	clear(&s.lists_loaded)
-	for load, i in loads {
-		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
-		// An empty or disabled list contributed nothing, so it has nothing to
-		// keep later. Only a load is recorded: two entries for one source share
-		// a key, and the one that loaded is the one whose rules are in effect.
-		if list.enabled && (load == .Current || load == .Stale) {
-			s.lists_loaded[list_key(list, i >= lists)] = true
+	if !record_loaded(s, cfg, loads) {
+		s.rules_no_memory = true
+		current = false
+		// With no rule in effect the sets are better in effect than not, and
+		// the retry records them.
+		if rules_in_effect(s) {
+			warn_no_memory(s)
+			filter.set_destroy(block)
+			filter.set_destroy(allow)
+			return false
 		}
 	}
-	delete(loads)
 
 	old_block, old_allow := filter.engine_swap(s.filters, block, allow)
 
@@ -791,12 +977,134 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 }
 
 /*
+Build the sets, leaving out each list there is no memory for that never loaded
+(`lists_loaded`) and building the others again without it, as AdGuard Home goes
+on with the filters that load. Where one that loaded before ran out, or the
+operator's rules did, a list that never loaded is left out first, the last one
+loaded, since those hold no rule in effect and may be what took the memory.
+`passes` says which were. A build after the first downloads only the lists no
+earlier one reached (`load_lists`). Not `whole`, saying why, when one that
+loaded before or the operator's rules ran out with no list left to leave out,
+or the sets themselves did; the sets are then the caller's to destroy.
+*/
+@(private)
+build_what_fits :: proc(
+	s: ^Server,
+	cfg: ^config.Config,
+	allow_network: bool,
+	loads: []List_Load,
+	passes: []List_Pass,
+) -> (
+	block, allow: ^filter.Set,
+	whole: bool,
+) {
+	lists := len(cfg.blocking.lists)
+	for {
+		block, allow, whole = build_filter_sets(cfg, allow_network, loads, passes)
+		if whole || block == nil {
+			break
+		}
+		i := ran_out_of_memory(loads, passes)
+		list: config.Block_List
+		if i >= 0 {
+			list = cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
+		}
+		switch {
+		case i >= 0 && !s.lists_loaded[list_key(list, i >= lists)]:
+			logx.warnf("list %s: there is no memory to hold it; building the other lists without it", list.name)
+			passes[i].left_out = true
+		case leave_out_newest(s, cfg, loads, passes):
+		case i >= 0:
+			logx.warnf("list %s: loaded before and there is no memory to hold it now; keeping the rules already in effect", list.name)
+			return
+		case:
+			warn_no_memory(s)
+			return
+		}
+		filter.set_destroy(block)
+		filter.set_destroy(allow)
+	}
+	if !whole {
+		warn_no_memory(s)
+	}
+	return
+}
+
+/*
+Leave out the last list the last build loaded that has not loaded before,
+saying so, to make room for the ones that have and the operator's own rules;
+false when there is none.
+*/
+@(private)
+leave_out_newest :: proc(s: ^Server, cfg: ^config.Config, loads: []List_Load, passes: []List_Pass) -> bool {
+	lists := len(cfg.blocking.lists)
+	#reverse for load, i in loads {
+		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
+		// Only one that put rules in the sets takes memory from the others.
+		if (load != .Current && load != .Stale) || passes[i].left_out || !list.enabled || s.lists_loaded[list_key(list, i >= lists)] {
+			continue
+		}
+		logx.warnf("list %s: left out, to make room for the lists already in effect and the operator's rules", list.name)
+		passes[i].left_out = true
+		return true
+	}
+	return false
+}
+
+/*
+Record in `lists_loaded` which lists are in the sets about to be swapped in,
+built aside and swapped whole: a list missing from it would not hold a later
+refresh back when it is unavailable. False, leaving it as it was, when there is
+no memory to.
+*/
+@(private)
+record_loaded :: proc(s: ^Server, cfg: ^config.Config, loads: []List_Load) -> bool {
+	lists := len(cfg.blocking.lists)
+	loaded: map[u64]bool
+	for load, i in loads {
+		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
+		// An empty or disabled list contributed nothing, so it has nothing to
+		// keep later. Only a load is recorded: two entries for one source share
+		// a key, and the one that loaded is the one whose rules are in effect.
+		if list.enabled && (load == .Current || load == .Stale) && map_insert(&loaded, list_key(list, i >= lists), true) == nil {
+			delete(loaded)
+			return false
+		}
+	}
+	delete(s.lists_loaded)
+	s.lists_loaded = loaded
+	return true
+}
+
+// Whether any rule is in effect, from a list or the operator's own.
+@(private)
+rules_in_effect :: proc(s: ^Server) -> bool {
+	stats := filter.engine_stats(s.filters)
+	return stats.block_rules + stats.allow_rules > 0
+}
+
+// Say that a rebuild was dropped for want of memory, and what is in effect.
+@(private)
+warn_no_memory :: proc(s: ^Server) {
+	if rules_in_effect(s) {
+		logx.warnf("filter: there is no memory to build the rule sets; keeping the rules already in effect")
+	} else {
+		logx.warnf("filter: there is no memory to build the rule sets; no rules are in effect until a retry succeeds")
+	}
+}
+
+/*
 A list as `lists_loaded` knows it: where it is fetched from, and which kind of
 list it is. A list keeps its history wherever a reload moves it, and a new one
 starts with none, which is what it would have at startup.
 */
 list_key :: proc(list: config.Block_List, allow: bool) -> u64 {
-	return hash.fnv64a(transmute([]byte)fmt.tprintf("%v\x00%s\x00%s", allow, list.url, list.file))
+	// Hashed a part at a time, which needs no memory to spell the key.
+	kind := [2]u8{u8(allow), 0}
+	h := hash.fnv64a(kind[:])
+	h = hash.fnv64a(transmute([]byte)list.url, h)
+	h = hash.fnv64a([]byte{0}, h)
+	return hash.fnv64a(transmute([]byte)list.file, h)
 }
 
 /*
@@ -812,7 +1120,52 @@ refresh_retry :: proc(retry, interval: time.Duration) -> time.Duration {
 	return min(retry * 2, interval, REFRESH_RETRY_MAX)
 }
 
+/*
+The wait before the next rebuild after one that was `current` or not: zero for
+none sooner than the interval. One that was not current is tried again only
+where a list it lacked can come back, which needs the network (`no_fetch`
+false) and refreshes (`refresh` above zero); one without the memory to be whole
+(`no_memory`) is tried again whatever those say, at most REFRESH_RETRY_MAX
+apart, since what it lacked was memory and the rules in effect may be none.
+`retry` is the wait just served, as `refresh_retry` takes it.
+*/
+retry_after :: proc(current, no_memory, no_fetch: bool, refresh, retry: time.Duration) -> time.Duration {
+	switch {
+	case current:
+		return 0
+	case no_memory:
+		return refresh_retry(retry, refresh if refresh > 0 else REFRESH_RETRY_MAX)
+	case no_fetch || refresh <= 0:
+		return 0
+	}
+	return refresh_retry(retry, refresh)
+}
+
+/*
+Whether a rebuild the maintenance loop starts downloads: never under `no_fetch`,
+and where refreshes are off (`refresh` zero) only one a reload asks for. The
+loop starts no other there but a retry for want of memory (`refresh_due`),
+which reads the copies on disk, as refreshes off asks.
+*/
+rebuild_fetches :: proc(no_fetch, after_reload: bool, refresh: time.Duration) -> bool {
+	return !no_fetch && (after_reload || refresh > 0)
+}
+
 // How long after the last refresh the next one is due.
 refresh_wait :: proc(retry, interval: time.Duration) -> time.Duration {
 	return retry if retry > 0 else interval
+}
+
+/*
+Whether a refresh is due `since` the last one. Where refreshes run, with the
+network (`no_fetch` false) and `refresh` above zero, once the retry or the
+interval has been waited; where they do not, only a retry for want of memory
+(`no_memory`, `retry_after`), so a retry a download's failure left pending
+before a reload turned refreshes off does not run.
+*/
+refresh_due :: proc(no_fetch, no_memory: bool, refresh, retry, since: time.Duration) -> bool {
+	if (no_fetch || refresh <= 0) && !(no_memory && retry > 0) {
+		return false
+	}
+	return since >= refresh_wait(retry, refresh)
 }
