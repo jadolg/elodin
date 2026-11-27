@@ -527,6 +527,7 @@ test_a_cancelled_writer_does_not_spin_on_its_loop :: proc(t: ^testing.T) {
 		time.sleep(time.Millisecond)
 		queued = testkit.unacked_bytes(linux.Fd(r.c.stream.socket))
 	}
+	testing.expect(t, queued >= 0, "the kernel would not report the socket's send queue (SIOCOUTQ)")
 	testing.expectf(t, queued > 0 && queued < 2 + STALL_QUERY_SIZE, "%v bytes queued: the writer is not partway through", queued)
 
 	Stopper :: struct {

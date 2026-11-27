@@ -25,6 +25,7 @@ LINES = [
     (lint.TREE, PROD, 'import "elodin:testkit"', "testkit-import"),
     (lint.TREE, PROD, 'import tk "elodin:testkit"', "testkit-import"),
     (lint.TREE, TEST, 'import "elodin:testkit"', None),
+    (lint.TREE, PROD, 'import tk "../testkit"', "testkit-import"),
     (lint.TREE, PROD, "// see resolver.odin:12", "line-number"),
     (lint.TREE, PROD, "/* see resolver.odin:12 */", "line-number"),
     (lint.TREE, PROD, 'switch strings.to_lower(s, a) { // lint:allow names are ASCII', None),
