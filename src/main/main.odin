@@ -1368,7 +1368,8 @@ the signals the loop acts on (#416). A refresh that cannot start is still due.
 */
 @(private)
 start_rebuild :: proc(s: ^server.Server, opts: Options, m: ^Maintenance, after_reload: bool) {
-	if server.rebuild_start(m.rebuild, s, !opts.no_fetch) {
+	network := server.rebuild_fetches(opts.no_fetch, after_reload, server.live_config(s).blocking.refresh)
+	if server.rebuild_start(m.rebuild, s, network) {
 		m.after_reload = after_reload
 		m.rebuild_again = false
 		return

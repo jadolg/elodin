@@ -862,6 +862,8 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 	whole: bool
 	if lerr == nil && oerr == nil {
 		block, allow, whole = build_what_fits(s, cfg, allow_network, loads, left_out)
+	} else {
+		warn_no_memory(s)
 	}
 	if !whole {
 		s.rules_no_memory = true
@@ -935,9 +937,13 @@ reload_filters_from :: proc(s: ^Server, cfg: ^config.Config, allow_network: bool
 /*
 Build the sets, leaving out each list there is no memory for that never loaded
 (`lists_loaded`) and building the others again without it, as AdGuard Home goes
-on with the filters that load. `left_out` says which were. Not `whole`, saying
-why, when one that loaded before ran out, or the operator's rules or the sets
-themselves did; the sets are then the caller's to destroy.
+on with the filters that load. Where one that loaded before ran out, every list
+that never loaded is left out first, since those hold no rule in effect and may
+be what took the memory. `left_out` says which were. A build after the first
+downloads nothing, reading the copies the first one saved. Not `whole`, saying
+why, when one that loaded before ran out with none left to leave out, or the
+operator's rules or the sets themselves did; the sets are then the caller's to
+destroy.
 */
 @(private)
 build_what_fits :: proc(
@@ -951,8 +957,8 @@ build_what_fits :: proc(
 	whole: bool,
 ) {
 	lists := len(cfg.blocking.lists)
-	for {
-		block, allow, whole = build_filter_sets(cfg, allow_network, loads, left_out)
+	for network := allow_network; ; network = false {
+		block, allow, whole = build_filter_sets(cfg, network, loads, left_out)
 		if whole || block == nil {
 			break
 		}
@@ -961,17 +967,39 @@ build_what_fits :: proc(
 			break
 		}
 		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
-		if s.lists_loaded[list_key(list, i >= lists)] {
+		switch {
+		case !s.lists_loaded[list_key(list, i >= lists)]:
+			logx.warnf("list %s: there is no memory to hold it; building the other lists without it", list.name)
+			left_out[i] = true
+		case !leave_out_new(s, cfg, loads, left_out):
 			logx.warnf("list %s: loaded before and there is no memory to hold it now; keeping the rules already in effect", list.name)
 			return
 		}
-		logx.warnf("list %s: there is no memory to hold it; building the other lists without it", list.name)
-		left_out[i] = true
 		filter.set_destroy(block)
 		filter.set_destroy(allow)
 	}
 	if !whole {
 		warn_no_memory(s)
+	}
+	return
+}
+
+/*
+Leave out every list the last build loaded that has not loaded before, saying
+so, to make room for the ones that have; false when there was none.
+*/
+@(private)
+leave_out_new :: proc(s: ^Server, cfg: ^config.Config, loads: []List_Load, left_out: []bool) -> (any: bool) {
+	lists := len(cfg.blocking.lists)
+	for load, i in loads {
+		list := cfg.blocking.lists[i] if i < lists else cfg.blocking.allow_lists[i - lists]
+		// Only one that put rules in the sets takes memory from the others.
+		if (load != .Current && load != .Stale) || !list.enabled || s.lists_loaded[list_key(list, i >= lists)] {
+			continue
+		}
+		logx.warnf("list %s: left out, to make room for the lists already in effect", list.name)
+		left_out[i] = true
+		any = true
 	}
 	return
 }
@@ -1064,6 +1092,16 @@ retry_after :: proc(current, no_memory, no_fetch: bool, refresh, retry: time.Dur
 		return 0
 	}
 	return refresh_retry(retry, refresh)
+}
+
+/*
+Whether a rebuild the maintenance loop starts downloads: never under `no_fetch`,
+and where refreshes are off (`refresh` zero) only one a reload asks for. The
+loop starts no other there but a retry for want of memory (`refresh_due`),
+which reads the copies on disk, as refreshes off asks.
+*/
+rebuild_fetches :: proc(no_fetch, after_reload: bool, refresh: time.Duration) -> bool {
+	return !no_fetch && (after_reload || refresh > 0)
 }
 
 // How long after the last refresh the next one is due.

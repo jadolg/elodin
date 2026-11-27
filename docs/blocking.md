@@ -58,7 +58,7 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   whole is not used, and is downloaded over even inside the refresh window:
   one larger than any download (64 MiB) and one whose size changes while it is
   read are each refused, never loaded cut short. One there is no memory to hold
-  drops the load, as below.
+  is taken as below.
 - The cached copy is replaced by writing a temporary file beside it, syncing
   it, then renaming it over the old one. A power cut mid-write leaves the old
   copy or the new one, never a truncated list.
@@ -75,10 +75,15 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   memory to hold it now; keeping the rules already in effect`); one that never
   loaded is left out, and the other lists are built again without it (`list
   NAME: there is no memory to hold it; building the other lists without it`),
-  as AdGuard Home goes on with the filters that load. A list is never in
-  effect cut short. A download that was being read when memory ran out is not
-  cached. The list says why first (`list NAME: there is no memory to read
-  "PATH"`, `list NAME: there is no memory to read the cached copy`).
+  as AdGuard Home goes on with the filters that load. Where one that loaded
+  before runs out, the lists that never loaded are left out first, to make
+  room (`list NAME: left out, to make room for the lists already in effect`).
+  A list is never in effect cut short. A build after the first downloads
+  nothing, reading the copies the first saved; a download that was being read
+  when memory ran out is not cached, and a download that runs out of memory
+  counts as a failed one, which the cached copy stands in for. The list says
+  why first (`list NAME: there is no memory to read "PATH"`, `list NAME: there
+  is no memory to read the cached copy`).
 - With no memory for the operator's own rules or for the rule sets themselves,
   the load is dropped and the rules already in effect are kept (`filter: there
   is no memory to build the rule sets; keeping the rules already in effect`, or
@@ -92,7 +97,8 @@ digits, `-`, `_` and `.` become `_` in the file name, so `a/b` and `a_b` share o
   (`blocklists: not every list is current; trying again in 1m0s`). A start that
   could not load every list is retried the same way. A missing `file:` list is
   not retried. A load that ran out of memory is retried the same way even
-  under `--no-fetch` or `refresh: 0`, at most 1 hour apart, until it succeeds
+  under `--no-fetch` or `refresh: 0`, at most 1 hour apart, until it succeeds;
+  under `refresh: 0` that retry reads the cached copies and downloads nothing
   (`blocklists: there was no memory to build the rules; trying again in 1m0s`).
 - A rule costs about 35 bytes resident: its name, a flags byte and an 8-byte
   slot in a table kept at most 80% full. A load or refresh builds the new rule
